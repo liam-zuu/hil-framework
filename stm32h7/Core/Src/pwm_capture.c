@@ -131,16 +131,30 @@ void PWMCapture_Init(TIM_HandleTypeDef *ht5,
     }
 
     /*
-     * FIX 1: Do NOT call HAL_TIM_Base_Start(ht16) / HAL_TIM_Base_Start(ht17).
-     * HAL_TIM_Base_Start sets htim->State = HAL_TIM_STATE_BUSY.
-     * HAL_TIM_IC_Start_IT (called below via _arm) checks this state and
-     * returns HAL_BUSY silently — TIM16/17 channels never get their
-     * interrupt enabled. Same failure mode as encoder_gen Bug #2.
+     * FIX 1 (extended): Start all 4 timer bases via direct CR1 write.
      *
-     * TIM5 and TIM15 are not affected because they were not passed to
-     * HAL_TIM_Base_Start in the original code. TIM16/17 are single-channel
-     * timers that need explicit base start — use direct CR1 write instead.
+     * Do NOT call HAL_TIM_Base_Start() for any of these timers.
+     * HAL_TIM_Base_Start sets htim->State = HAL_TIM_STATE_BUSY, which
+     * silently blocks any subsequent HAL IC/OC calls (same as encoder_gen
+     * Bug #2).
+     *
+     * TIM16/TIM17 are single-channel timers — CubeMX does NOT call
+     * HAL_TIM_Base_Start for them, so their CNT is stopped at 0.
+     * Without CR1|=CEN the counter never runs → IC captures always read 0
+     * → period/width calculations are garbage.
+     *
+     * TIM5/TIM15 are multi-channel timers. CubeMX MspInit configures the
+     * GPIO and clock but does NOT start the counter. Explicitly start all
+     * four here for consistency and to guarantee a running CNT before
+     * the first _arm() call below.
+     *
+     * If TIM5/TIM15 counter was NOT running while CCxIE was armed, any
+     * stray edge on a floating pin would compute a nonsense period (CNT≈0,
+     * CCR≈0) and could fire continuously — a likely contributor to the
+     * SPI1 corruption observed in prior testing (Bug #7).
      */
+    ht5->Instance->CR1  |= TIM_CR1_CEN;
+    ht15->Instance->CR1 |= TIM_CR1_CEN;
     ht16->Instance->CR1 |= TIM_CR1_CEN;
     ht17->Instance->CR1 |= TIM_CR1_CEN;
 
@@ -186,7 +200,24 @@ void PWMCapture_IC_Callback(TIM_HandleTypeDef *htim)
     }
     if (!c) return;
 
+    /*
+     * Storm guard: if two captures arrive within 10 ticks (~10 µs at 1 MHz),
+     * the pin is bouncing or floating. Discard and re-arm for rising.
+     * This prevents a runaway ISR loop from starving SPI1 DMA callbacks
+     * when ESP32 is not yet driving the PWM pins (Bug #7 mitigation).
+     */
     uint32_t cap = HAL_TIM_ReadCapturedValue(htim, trig_ch);
+    if (c->state == 1) {
+        /* In WAIT_FALL: sanity check pulse width before accepting */
+        uint16_t tentative_width = (uint16_t)(cap - (uint16_t)c->t_rise);
+        if (tentative_width < 10u) {
+            /* Too narrow — noise/bounce. Reset to WAIT_RISE. */
+            c->state = 0;
+            _arm(c, LL_TIM_IC_POLARITY_RISING);
+            return;
+        }
+    }
+
     c->last_tick = HAL_GetTick();
 
     if (c->state == 0) {
