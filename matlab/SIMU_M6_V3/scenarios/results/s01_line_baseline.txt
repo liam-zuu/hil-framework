@@ -1,0 +1,31 @@
+================================================================
+HIL SIMULATION — SCENARIO REPORT
+================================================================
+Scenario: s01_line_baseline
+Date: 2026-04-20 01:15:01
+
+--- TRAJECTORY ---
+Type: line
+Hold: 0.50s, Ramp: 2.50s
+v: 0.3
+
+--- ACTIVE FAULTS ---
+(none)
+
+--- METRICS ---
+Metric                        PID         ADRC        Delta
+------------------------------------------------------------
+rms_pos_full                4.864        4.853        0.011  [mm]
+rms_pos_ss                  6.645        6.622        0.023  [mm]
+max_pos_err                10.970       10.754        0.216  [mm]
+t_peak                     10.000       10.000        0.000  [s]
+rms_theta                   0.249        0.247        0.001  [deg]
+max_theta_err               0.480        0.465        0.015  [deg]
+max_torque                  0.500        0.105        0.395  [N·m]
+sat_pct                     0.485        0.000        0.485  [%]
+slip_events              1091.000      554.000      537.000  [count]
+control_effort              3.516        1.247        2.269  [N·m·s]
+
+ADRC SS improvement over PID: +0.3%
+
+================================================================

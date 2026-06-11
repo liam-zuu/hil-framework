@@ -1,0 +1,44 @@
+================================================================
+HIL SIMULATION — SCENARIO REPORT
+================================================================
+Scenario: s14_industrial_nightmare
+Date: 2026-04-20 01:17:10
+
+--- TRAJECTORY ---
+Type: circle
+Hold: 0.50s, Ramp: 2.00s
+R: 1
+period: 20
+
+--- ACTIVE FAULTS ---
+fault.mass_bias:
+  t_start: 4
+  tau_bias: 0.04
+fault.battery_fade:
+  t_start: 8
+  t_end: 18
+  tau_max_nominal: 0.5
+  tau_max_final: 0.35
+disturbance (M6-style):
+  type: combined
+  magnitude: 0.06
+  start_time: 12
+slip: mu_static=0.60, mu_kinetic=0.35, p_spont=0.002
+
+--- METRICS ---
+Metric                        PID         ADRC        Delta
+------------------------------------------------------------
+rms_pos_full               39.884        9.033       30.851  [mm]
+rms_pos_ss                 43.047       10.374       32.673  [mm]
+max_pos_err                75.976       14.901       61.076  [mm]
+t_peak                      8.441       18.000       -9.559  [s]
+rms_theta                   3.007        0.396        2.612  [deg]
+max_theta_err               7.538        0.727        6.812  [deg]
+max_torque                  0.500        0.184        0.316  [N·m]
+sat_pct                    13.830        0.000       13.830  [%]
+slip_events             26227.000     1750.000    24477.000  [count]
+control_effort             23.813        2.144       21.669  [N·m·s]
+
+ADRC SS improvement over PID: +75.9%
+
+================================================================

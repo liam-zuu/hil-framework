@@ -1,0 +1,35 @@
+================================================================
+HIL SIMULATION — SCENARIO REPORT
+================================================================
+Scenario: s15_oily_floor
+Date: 2026-04-20 01:17:20
+
+--- TRAJECTORY ---
+Type: sinusoidal
+Hold: 0.50s, Ramp: 2.00s
+amplitude: 0.4
+frequency: 0.15
+v: 0.3
+
+--- ACTIVE FAULTS ---
+fault.grease_zone:
+  t_start: 12.5
+  t_end: 22.5
+
+--- METRICS ---
+Metric                        PID         ADRC        Delta
+------------------------------------------------------------
+rms_pos_full              391.585      378.034       13.550  [mm]
+rms_pos_ss                430.616      415.711       14.905  [mm]
+max_pos_err              1091.143     1145.541      -54.397  [mm]
+t_peak                     22.511       22.510        0.001  [s]
+rms_theta                  30.755       25.737        5.018  [deg]
+max_theta_err              99.261       88.112       11.148  [deg]
+max_torque                  0.500        0.500        0.000  [N·m]
+sat_pct                    38.374       36.728        1.645  [%]
+slip_events             38649.000    41029.000    -2380.000  [count]
+control_effort             30.757       22.034        8.722  [N·m·s]
+
+ADRC SS improvement over PID: +3.5%
+
+================================================================

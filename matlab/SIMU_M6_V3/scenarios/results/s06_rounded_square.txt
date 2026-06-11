@@ -1,0 +1,33 @@
+================================================================
+HIL SIMULATION — SCENARIO REPORT
+================================================================
+Scenario: s06_rounded_square
+Date: 2026-04-20 01:15:55
+
+--- TRAJECTORY ---
+Type: rounded_square
+Hold: 0.50s, Ramp: 2.50s
+side: 1
+R_corner: 0.2
+v: 0.3
+
+--- ACTIVE FAULTS ---
+(none)
+
+--- METRICS ---
+Metric                        PID         ADRC        Delta
+------------------------------------------------------------
+rms_pos_full                4.635        4.653       -0.018  [mm]
+rms_pos_ss                  5.279        5.301       -0.022  [mm]
+max_pos_err                10.961       10.746        0.215  [mm]
+t_peak                     19.172       19.158        0.014  [s]
+rms_theta                   1.078        0.917        0.161  [deg]
+max_theta_err               3.923        3.554        0.369  [deg]
+max_torque                  0.500        0.483        0.017  [N·m]
+sat_pct                     1.074        0.000        1.074  [%]
+slip_events              3531.000     3747.000     -216.000  [count]
+control_effort              9.746        3.295        6.451  [N·m·s]
+
+ADRC SS improvement over PID: -0.4%
+
+================================================================

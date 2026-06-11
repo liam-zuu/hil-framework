@@ -1,0 +1,32 @@
+================================================================
+HIL SIMULATION — SCENARIO REPORT
+================================================================
+Scenario: s04_circle_R20
+Date: 2026-04-20 01:15:39
+
+--- TRAJECTORY ---
+Type: circle
+Hold: 0.50s, Ramp: 2.50s
+R: 2
+period: 60
+
+--- ACTIVE FAULTS ---
+(none)
+
+--- METRICS ---
+Metric                        PID         ADRC        Delta
+------------------------------------------------------------
+rms_pos_full               68.784       68.554        0.230  [mm]
+rms_pos_ss                 71.592       71.353        0.239  [mm]
+max_pos_err                99.038       98.706        0.332  [mm]
+t_peak                     53.870       53.904       -0.034  [s]
+rms_theta                   1.735        1.730        0.004  [deg]
+max_theta_err               2.993        2.989        0.003  [deg]
+max_torque                  0.454        0.090        0.364  [N·m]
+sat_pct                     0.000        0.000        0.000  [%]
+slip_events              1353.000      634.000      719.000  [count]
+control_effort             48.737        5.002       43.734  [N·m·s]
+
+ADRC SS improvement over PID: +0.3%
+
+================================================================
