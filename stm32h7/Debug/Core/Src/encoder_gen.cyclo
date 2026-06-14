@@ -1,0 +1,8 @@
+../Core/Src/encoder_gen.c:37:17:_half_period	3
+../Core/Src/encoder_gen.c:48:13:_arm_ch	8
+../Core/Src/encoder_gen.c:76:13:_stop	1
+../Core/Src/encoder_gen.c:85:13:_start_wheel	3
+../Core/Src/encoder_gen.c:107:6:EncoderGen_Init	1
+../Core/Src/encoder_gen.c:122:6:EncoderGen_SetOmega	8
+../Core/Src/encoder_gen.c:149:6:EncoderGen_OC_Callback	18
+../Core/Src/encoder_gen.c:185:6:EncoderGen_GetDebug	3

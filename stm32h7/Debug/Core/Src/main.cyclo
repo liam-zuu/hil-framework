@@ -1,0 +1,6 @@
+../Core/Src/main.c:71:5:_write	1
+../Core/Src/main.c:79:6:HAL_SPI_TxRxCpltCallback	1
+../Core/Src/main.c:84:6:HAL_TIM_OC_DelayElapsedCallback	1
+../Core/Src/main.c:95:5:main	5
+../Core/Src/main.c:199:6:SystemClock_Config	4
+../Core/Src/main.c:261:6:Error_Handler	1
