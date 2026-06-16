@@ -32,10 +32,11 @@ static inline float _clampf(float v, float lo, float hi)
 /* ── Decode MOSI → _state ───────────────────────────────────────────────── */
 static void _decode(void)
 {
-    const float sc_omega = HIL_OMEGA_MAX / INT16_MAXF;
-    const float sc_pos   = HIL_POS_MAX   / INT16_MAXF;
-    const float sc_theta = HIL_THETA_MAX / INT16_MAXF;
-    const float sc_vel   = HIL_VEL_MAX   / INT16_MAXF;
+    const float sc_omega      = HIL_OMEGA_MAX      / INT16_MAXF;
+    const float sc_pos        = HIL_POS_MAX        / INT16_MAXF;
+    const float sc_theta      = HIL_THETA_MAX      / INT16_MAXF;
+    const float sc_vel        = HIL_VEL_MAX        / INT16_MAXF;
+    const float sc_omega_body = HIL_OMEGA_BODY_MAX / INT16_MAXF;
 
     _state.omega[0]   = _rd16(&_rx[0])  * sc_omega;
     _state.omega[1]   = _rd16(&_rx[2])  * sc_omega;
@@ -46,7 +47,7 @@ static void _decode(void)
     _state.theta      = _rd16(&_rx[12]) * sc_theta;
     _state.vx         = _rd16(&_rx[14]) * sc_vel;
     _state.vy         = _rd16(&_rx[16]) * sc_vel;
-    _state.omega_body = _rd16(&_rx[18]) * sc_vel;
+    _state.omega_body = _rd16(&_rx[18]) * sc_omega_body;
     _state.fault_flags = _rx[20];
     _state.seq         = _rx[21];
 }

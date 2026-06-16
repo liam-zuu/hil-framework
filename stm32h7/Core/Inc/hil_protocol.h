@@ -7,12 +7,13 @@
 #define SPI1_FRAME_LEN   24u   /* MOSI: RPi5→H7 (plant state), MISO: H7→RPi5 (ctrl output) */
 
 /* ── Physical ranges — MUST match RPi5 protocol.py ──────────────────────── */
-#define HIL_OMEGA_MAX    40.0f      /* rad/s, per wheel      */
-#define HIL_TORQUE_MAX    1.0f      /* N·m,  per wheel       */
-#define HIL_POS_MAX      10.0f      /* m                     */
-#define HIL_VEL_MAX       5.0f      /* m/s (body)            */
-#define HIL_THETA_MAX     3.14159265f /* rad                 */
-#define INT16_MAXF       32767.0f
+#define HIL_OMEGA_MAX      40.0f        /* rad/s, per wheel              */
+#define HIL_TORQUE_MAX      1.0f        /* N·m,  per wheel               */
+#define HIL_POS_MAX        10.0f        /* m                             */
+#define HIL_VEL_MAX         3.0f        /* m/s  — vx, vy  (body linear) */
+#define HIL_OMEGA_BODY_MAX 10.0f        /* rad/s — omega_body (body yaw) */
+#define HIL_THETA_MAX       3.14159265f /* rad                           */
+#define INT16_MAXF         32767.0f
 
 /* ────────────────────────────────────────────────────────────────────────────
  * MOSI layout  (RPi5 → H7),  24 bytes
@@ -26,7 +27,7 @@
  *  [12-13] theta       int16 BE   rad × INT16_MAXF/HIL_THETA_MAX
  *  [14-15] vx          int16 BE   m/s × INT16_MAXF/HIL_VEL_MAX
  *  [16-17] vy          int16 BE
- *  [18-19] omega_body  int16 BE   rad/s × INT16_MAXF/HIL_VEL_MAX
+ *  [18-19] omega_body  int16 BE   rad/s × INT16_MAXF/HIL_OMEGA_BODY_MAX
  *  [20]    fault_flags uint8
  *  [21]    seq         uint8   (frame counter, wraps)
  *  [22-23] reserved    0x00

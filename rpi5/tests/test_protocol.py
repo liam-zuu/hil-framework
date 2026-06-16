@@ -1,9 +1,13 @@
 """
-Tests: protocol.py — SPI encode/decode must match MATLAB spi_interface.m
+Tests: protocol.py — SPI encode/decode must match H7 hil_protocol.h
+
+MOSI field order: [ω1, ω2, ω3, ω4, x, y, θ, vx, vy, wz]
+  index:           0    1    2    3   4  5  6   7   8   9
 
 Run: pytest tests/test_protocol.py -v
 """
 import struct
+import math
 import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -81,28 +85,32 @@ class TestStateEncoding:
         assert frame[20:24] == b'\x00\x00\x00\x00'
 
     def test_big_endian_byte_order(self):
-        """Critical: H7 SPI DMA reads big-endian int16."""
+        """Critical: H7 SPI DMA reads big-endian int16.
+        Layout: index 0 = omega[0], range = HIL_OMEGA_MAX = 40.0 rad/s.
+        Full-scale omega[0] = 40.0 → raw int16 = 32767 at byte 0-1.
+        """
         state = [0.0] * 10
-        state[0] = STATE_RANGES[0]   # x = +5 m → raw = 32767
+        state[0] = STATE_RANGES[0]   # omega[0] = 40.0 rad/s → raw = 32767
         frame = encode_state(state)
         raw   = struct.unpack_from('>h', frame, 0)[0]
         assert raw == 32767
 
     def test_theta_range_pi(self):
-        """Heading uses ±π range."""
-        import math
+        """Heading uses ±π range. theta is at index 6 in new layout."""
         state = [0.0] * 10
-        state[2] = math.pi - 0.001   # just inside range
+        state[6] = math.pi - 0.001   # index 6 = theta, just inside range
         rec = decode_state(encode_state(state))
-        assert abs(rec[2] - state[2]) <= math.pi / 32767 + 1e-12
+        assert abs(rec[6] - state[6]) <= math.pi / 32767 + 1e-12
 
     def test_wrong_length_raises(self):
         with pytest.raises((ValueError, AssertionError)):
             encode_state([0.0] * 9)
 
     def test_typical_moving_state(self):
-        """Representative HIL state: forward 0.5 m/s, slight curve."""
-        state = [1.5, 0.1, 0.05, 0.5, 0.02, 0.1, 10.3, 10.3, 10.3, 10.3]
+        """Representative HIL state: forward 0.5 m/s, slight curve.
+        Layout: [ω1, ω2, ω3, ω4, x, y, θ, vx, vy, wz]
+        """
+        state = [10.3, 10.3, 10.3, 10.3, 1.5, 0.1, 0.05, 0.5, 0.02, 0.1]
         rec   = decode_state(encode_state(state))
         for orig, r, rng in zip(state, rec, STATE_RANGES):
             assert abs(r - orig) <= rng / 32767 * 1.1
@@ -136,7 +144,7 @@ class TestTorqueEncoding:
         assert frame[8:] == b'\x00' * 16
 
     def test_lsb_value(self):
-        """LSB ≈ 3.05e-5 N·m — matches MATLAB spi_interface.m validation."""
+        """LSB ≈ 3.05e-5 N·m — matches HIL_TORQUE_MAX/32767."""
         assert abs(LSB_TORQUE - 3.05e-5) < 1e-7
 
     def test_wrong_length_raises(self):
