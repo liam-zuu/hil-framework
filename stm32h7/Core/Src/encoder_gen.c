@@ -37,7 +37,7 @@ static Wheel_t _w[ENC_NUM_WHEELS];
 static uint32_t _half_period(float omega_abs)
 {
     /* half_period = ENC_TIMER_FREQ * pi / (omega_abs * ENC_PPR) */
-    float hp = ((float)ENC_TIMER_FREQ * (float)M_PI) /
+    float hp = (float)ENC_TIMER_FREQ /
                (omega_abs * (float)ENC_PPR);
     if (hp > 65535.0f) return 65535u;
     if (hp <     1.0f) return 1u;
@@ -190,8 +190,12 @@ void EncoderGen_GetDebug(EncoderGenDebug_t *dbg)
         dbg[i].half_period = _w[i].half_period;
         dbg[i].ch1_period  = _w[i].ch1_period;
 
+//        dbg[i].measured_freq = (_w[i].ch1_period > 0)
+//            ? (float)ENC_TIMER_FREQ / ((float)_w[i].ch1_period * 2.0f)
+//            : 0.0f;
+
         dbg[i].measured_freq = (_w[i].ch1_period > 0)
-            ? (float)ENC_TIMER_FREQ / (float)_w[i].ch1_period
+            ? (float)ENC_TIMER_FREQ / ((float)_w[i].ch1_period * 2.0f * (float)M_PI)
             : 0.0f;
 
         dbg[i].expected_freq = fabsf(_w[i].omega_cmd) / (2.0f * (float)M_PI)

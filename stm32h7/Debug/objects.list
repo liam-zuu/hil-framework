@@ -2,6 +2,7 @@
 "./Core/Src/encoder_gen.o"
 "./Core/Src/gpio.o"
 "./Core/Src/main.o"
+"./Core/Src/pwm_capture.o"
 "./Core/Src/spi.o"
 "./Core/Src/spi1_handler.o"
 "./Core/Src/stm32h7xx_hal_msp.o"

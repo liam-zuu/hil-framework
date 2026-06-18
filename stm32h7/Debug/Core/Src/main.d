@@ -40,7 +40,8 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
  ../Core/Inc/dma.h ../Core/Inc/main.h ../Core/Inc/spi.h ../Core/Inc/tim.h \
  ../Core/Inc/usart.h ../Core/Inc/gpio.h ../Core/Inc/hil_protocol.h \
  ../Core/Inc/spi1_handler.h ../Core/Inc/hil_protocol.h \
- ../Core/Inc/encoder_gen.h
+ ../Core/Inc/encoder_gen.h ../Core/Inc/pwm_capture.h \
+ C:/Users/liam/STM32Cube/Repository/STM32Cube_FW_H7_V1.13.0/Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_tim.h
 ../Core/Inc/main.h:
 C:/Users/liam/STM32Cube/Repository/STM32Cube_FW_H7_V1.13.0/Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal.h:
 ../Core/Inc/stm32h7xx_hal_conf.h:
@@ -90,3 +91,5 @@ C:/Users/liam/STM32Cube/Repository/STM32Cube_FW_H7_V1.13.0/Drivers/BSP/STM32H7xx
 ../Core/Inc/spi1_handler.h:
 ../Core/Inc/hil_protocol.h:
 ../Core/Inc/encoder_gen.h:
+../Core/Inc/pwm_capture.h:
+C:/Users/liam/STM32Cube/Repository/STM32Cube_FW_H7_V1.13.0/Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_ll_tim.h:

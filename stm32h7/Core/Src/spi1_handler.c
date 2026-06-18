@@ -107,10 +107,20 @@ void SPI1_SetOutput(const HIL_Output_t *out)
  * Re-arming inside the callback is safe on H7: HAL resets internal state
  * before invoking the callback, so no re-entrancy issue.
  */
+//void SPI1_Callback(SPI_HandleTypeDef *hspi)
+//{
+//    if (hspi->Instance != _hspi->Instance) return;
+//    _decode();
+//    HAL_SPI_TransmitReceive_DMA(_hspi, _tx, _rx, SPI1_FRAME_LEN);
+//    _frame_ready = 1;
+//}
+
+
 void SPI1_Callback(SPI_HandleTypeDef *hspi)
 {
     if (hspi->Instance != _hspi->Instance) return;
     _decode();
+    HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_14); /* LD3 — xanh dương */
     HAL_SPI_TransmitReceive_DMA(_hspi, _tx, _rx, SPI1_FRAME_LEN);
     _frame_ready = 1;
 }
