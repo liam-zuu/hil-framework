@@ -28,8 +28,8 @@ Firmware ESP32 nằm ở repo riêng `liam-zuu/AGV_MECANUM`.
 python rpi5/run_hil.py --mock --steps 5000
 # RPi5: phần cứng thật, quỹ đạo tròn 60 s
 sudo python rpi5/run_hil.py --traj circle --speed 0.3 --radius 0.5 --duration 60
-# Test RPi5
-python -m pytest rpi5/tests
+# Test RPi5 (chạy trong thư mục rpi5/ vì test import trực tiếp params, protocol...)
+cd rpi5 && python -m pytest tests
 ```
 
 - MATLAB: mở `matlab/SIMU_M6_V3/scripts/`, chạy `run_simulation.m`.
