@@ -1,2 +1,11 @@
+# STM32CubeIDE workspace and build output
 .metadata/
-.Debug/
+stm32h7/Debug/
+stm32h7/Release/
+
+# Office lock files
+~$*
+
+# Python
+__pycache__/
+*.pyc

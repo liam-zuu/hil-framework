@@ -1,8 +1,0 @@
-../Core/Src/encoder_gen.c:241:17:_half_period	24	static
-../Core/Src/encoder_gen.c:253:13:_arm_ch	32	static
-../Core/Src/encoder_gen.c:281:13:_stop	16	static
-../Core/Src/encoder_gen.c:290:13:_start_wheel	32	static
-../Core/Src/encoder_gen.c:312:6:EncoderGen_Init	24	static
-../Core/Src/encoder_gen.c:327:6:EncoderGen_SetOmega	32	static
-../Core/Src/encoder_gen.c:354:6:EncoderGen_OC_Callback	40	static
-../Core/Src/encoder_gen.c:387:6:EncoderGen_GetDebug	24	static
