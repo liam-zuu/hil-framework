@@ -1,79 +1,102 @@
+/* hil_protocol.h — HIL SPI frame definitions
+ * MOSI: RPi5 → H7  (36 bytes: plant state + trajectory reference)
+ * MISO: H7   → RPi5 (36 bytes: controller output + padding)
+ *
+ * History:
+ *   v1: 24 bytes (plant state only)
+ *   v2: 36 bytes (+ vx_ref, vy_ref, wz_ref, traj_flags)
+ */
+
 #ifndef HIL_PROTOCOL_H
 #define HIL_PROTOCOL_H
 
 #include <stdint.h>
 
-/* ── Frame sizes ─────────────────────────────────────────────────────────── */
-#define SPI1_FRAME_LEN   24u   /* MOSI: RPi5→H7 (plant state), MISO: H7→RPi5 (ctrl output) */
+/* ── Frame size ─────────────────────────────────────────────────────── */
+#define SPI1_FRAME_LEN      36          /* bytes, both directions */
 
-/* ── Physical ranges — MUST match RPi5 protocol.py ──────────────────────── */
-#define HIL_OMEGA_MAX      40.0f        /* rad/s, per wheel              */
-#define HIL_TORQUE_MAX      1.0f        /* N·m,  per wheel               */
-#define HIL_POS_MAX        10.0f        /* m                             */
-#define HIL_VEL_MAX         3.0f        /* m/s  — vx, vy  (body linear) */
-#define HIL_OMEGA_BODY_MAX 10.0f        /* rad/s — omega_body (body yaw) */
-#define HIL_THETA_MAX       3.14159265f /* rad                           */
-#define INT16_MAXF         32767.0f
+/* ── Scale factors (MOSI — plant state) ────────────────────────────── */
+#define HIL_OMEGA_MAX       40.0f       /* rad/s  — wheel speed  */
+#define HIL_POS_MAX         5.0f        /* m      — x, y         */
+#define HIL_THETA_MAX       3.14159265f /* rad    — heading      */
+#define HIL_VEL_MAX         3.0f        /* m/s    — vx, vy       */
+#define HIL_OMEGA_BODY_MAX  10.0f       /* rad/s  — wz body      */
 
-/* ────────────────────────────────────────────────────────────────────────────
- * MOSI layout  (RPi5 → H7),  24 bytes
- * ─────────────────────────────────────────────────────────────────────────
- *  [0-1]   omega[0]    int16 BE   rad/s × INT16_MAXF/HIL_OMEGA_MAX
- *  [2-3]   omega[1]    int16 BE
- *  [4-5]   omega[2]    int16 BE
- *  [6-7]   omega[3]    int16 BE
- *  [8-9]   pos_x       int16 BE   m × INT16_MAXF/HIL_POS_MAX
- *  [10-11] pos_y       int16 BE
- *  [12-13] theta       int16 BE   rad × INT16_MAXF/HIL_THETA_MAX
- *  [14-15] vx          int16 BE   m/s × INT16_MAXF/HIL_VEL_MAX
- *  [16-17] vy          int16 BE
- *  [18-19] omega_body  int16 BE   rad/s × INT16_MAXF/HIL_OMEGA_BODY_MAX
- *  [20]    fault_flags uint8
- *  [21]    seq         uint8   (frame counter, wraps)
- *  [22-23] reserved    0x00
- *
- * MISO layout  (H7 → RPi5),  24 bytes
- * ─────────────────────────────────────────────────────────────────────────
- *  [0-1]   torque[0]   int16 BE   N·m × INT16_MAXF/HIL_TORQUE_MAX
- *  [2-3]   torque[1]   int16 BE
- *  [4-5]   torque[2]   int16 BE
- *  [6-7]   torque[3]   int16 BE
- *  [8-9]   pwm[0]      int16 BE   duty [-1..1] × INT16_MAXF
- *  [10-11] pwm[1]      int16 BE
- *  [12-13] pwm[2]      int16 BE
- *  [14-15] pwm[3]      int16 BE
- *  [16]    status      uint8
- *  [17]    seq         uint8
- *  [18-23] reserved    0x00
- * ─────────────────────────────────────────────────────────────────────────*/
+/* ── Scale factors (MOSI — trajectory reference) ────────────────────── */
+#define HIL_REF_VEL_MAX     3.0f        /* m/s    — vx_ref, vy_ref */
+#define HIL_REF_OMEGA_MAX   10.0f       /* rad/s  — wz_ref         */
 
-/* ── Fault flag bits (MOSI byte 20) ─────────────────────────────────────── */
-#define HIL_FAULT_W1_JAM   (1u << 0)
-#define HIL_FAULT_W2_JAM   (1u << 1)
-#define HIL_FAULT_W3_JAM   (1u << 2)
-#define HIL_FAULT_W4_JAM   (1u << 3)
-#define HIL_FAULT_W1_ENC   (1u << 4)
-#define HIL_FAULT_W2_ENC   (1u << 5)
-#define HIL_FAULT_W3_ENC   (1u << 6)
-#define HIL_FAULT_W4_ENC   (1u << 7)
+/* ── Scale factors (MISO — controller output) ───────────────────────── */
+#define HIL_TORQUE_MAX      1.0f        /* N·m */
 
-/* ── Plant state (decoded from MOSI) ────────────────────────────────────── */
+/* ── Fixed-point helpers ─────────────────────────────────────────────── */
+#define INT16_MAXF          32767.0f
+
+/* ── MOSI layout (RPi5 → H7), 36 bytes ─────────────────────────────── */
+/* Byte  0– 1  omega[0]     int16 × (HIL_OMEGA_MAX / INT16_MAXF)        */
+/* Byte  2– 3  omega[1]                                                  */
+/* Byte  4– 5  omega[2]                                                  */
+/* Byte  6– 7  omega[3]                                                  */
+/* Byte  8– 9  pos_x        int16 × (HIL_POS_MAX / INT16_MAXF)          */
+/* Byte 10–11  pos_y                                                     */
+/* Byte 12–13  theta        int16 × (HIL_THETA_MAX / INT16_MAXF)        */
+/* Byte 14–15  vx           int16 × (HIL_VEL_MAX / INT16_MAXF)          */
+/* Byte 16–17  vy                                                        */
+/* Byte 18–19  omega_body   int16 × (HIL_OMEGA_BODY_MAX / INT16_MAXF)   */
+/* Byte 20     fault_flags  uint8                                        */
+/* Byte 21     seq          uint8                                        */
+/* Byte 22–23  reserved     0x00                                         */
+/* Byte 24–25  vx_ref       int16 × (HIL_REF_VEL_MAX / INT16_MAXF)  ←NEW */
+/* Byte 26–27  vy_ref                                                ←NEW */
+/* Byte 28–29  wz_ref       int16 × (HIL_REF_OMEGA_MAX / INT16_MAXF)←NEW */
+/* Byte 30     traj_flags   uint8  (bit0=valid, bit1=new)            ←NEW */
+/* Byte 31–35  reserved     0x00                                     ←NEW */
+
+/* ── MISO layout (H7 → RPi5), 36 bytes ─────────────────────────────── */
+/* Byte  0– 1  torque[0]    int16 × (HIL_TORQUE_MAX / INT16_MAXF)       */
+/* Byte  2– 3  torque[1]                                                 */
+/* Byte  4– 5  torque[2]                                                 */
+/* Byte  6– 7  torque[3]                                                 */
+/* Byte  8– 9  pwm[0]       int16 = duty × INT16_MAXF                   */
+/* Byte 10–11  pwm[1]                                                    */
+/* Byte 12–13  pwm[2]                                                    */
+/* Byte 14–15  pwm[3]                                                    */
+/* Byte 16     status       uint8                                        */
+/* Byte 17     seq          uint8                                        */
+/* Byte 18–35  reserved     0x00                                         */
+
+/* ── Fault flags (MOSI byte 20) ─────────────────────────────────────── */
+#define HIL_FAULT_PLANT     (1u << 0)
+#define HIL_FAULT_OVERRUN   (1u << 1)
+
+/* ── Traj flags (MOSI byte 30) ──────────────────────────────────────── */
+#define HIL_TRAJ_VALID      (1u << 0)   /* setpoint is valid            */
+#define HIL_TRAJ_NEW        (1u << 1)   /* new setpoint this frame      */
+
+/* ── Trajectory relay packet (H7 → ESP32 via USART2) ───────────────── */
+/* 14 bytes: identical format to WiFi UDP packet on ESP32               */
+/* 0xBB | vx_ref(4B LE float) | vy_ref(4B LE float)                    */
+/*       | wz_ref(4B LE float) | XOR checksum(1B)                       */
+#define TRAJ_UART_HEADER    0xBB
+#define TRAJ_UART_LEN       14
+
+/* ── Struct types ────────────────────────────────────────────────────── */
 typedef struct {
-    float   omega[4];      /* wheel angular velocity [rad/s] */
-    float   pos_x;         /* body position x [m]            */
-    float   pos_y;         /* body position y [m]            */
-    float   theta;         /* body heading [rad]             */
-    float   vx;            /* body velocity x [m/s]          */
-    float   vy;            /* body velocity y [m/s]          */
-    float   omega_body;    /* body angular velocity [rad/s]  */
+    float omega[4];
+    float pos_x, pos_y, theta;
+    float vx, vy, omega_body;
     uint8_t fault_flags;
     uint8_t seq;
 } HIL_State_t;
 
-/* ── Controller output (encoded to MISO) ────────────────────────────────── */
 typedef struct {
-    float   torque[4];     /* wheel torque command [N·m]     */
-    float   pwm[4];        /* raw PWM duty [-1..1]           */
+    float vx_ref, vy_ref, wz_ref;
+    uint8_t traj_flags;
+} HIL_TrajRef_t;
+
+typedef struct {
+    float torque[4];
+    float pwm[4];
     uint8_t status;
     uint8_t seq;
 } HIL_Output_t;

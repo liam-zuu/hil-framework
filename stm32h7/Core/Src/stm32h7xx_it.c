@@ -22,6 +22,8 @@
 #include "stm32h7xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <stdio.h>
+#include "pwm_capture.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -94,7 +96,7 @@ void NMI_Handler(void)
 void HardFault_Handler(void)
 {
   /* USER CODE BEGIN HardFault_IRQn 0 */
-
+//	printf("HARDFAULT!\r\n");
   /* USER CODE END HardFault_IRQn 0 */
   while (1)
   {
@@ -312,7 +314,13 @@ void SPI1_IRQHandler(void)
 void TIM5_IRQHandler(void)
 {
   /* USER CODE BEGIN TIM5_IRQn 0 */
+	uint32_t sr = TIM5->SR;
+	TIM5->SR = ~sr;  /* clear handled flags */
 
+	if (sr & TIM_SR_CC1IF) { htim5.Channel = HAL_TIM_ACTIVE_CHANNEL_1; PWMCapture_IC_Callback(&htim5); }
+	if (sr & TIM_SR_CC2IF) { htim5.Channel = HAL_TIM_ACTIVE_CHANNEL_2; PWMCapture_IC_Callback(&htim5); }
+	if (sr & TIM_SR_CC3IF) { htim5.Channel = HAL_TIM_ACTIVE_CHANNEL_3; PWMCapture_IC_Callback(&htim5); }
+	if (sr & TIM_SR_CC4IF) { htim5.Channel = HAL_TIM_ACTIVE_CHANNEL_4; PWMCapture_IC_Callback(&htim5); }
   /* USER CODE END TIM5_IRQn 0 */
   HAL_TIM_IRQHandler(&htim5);
   /* USER CODE BEGIN TIM5_IRQn 1 */
