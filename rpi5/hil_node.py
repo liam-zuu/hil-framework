@@ -4,14 +4,18 @@ HIL Node — Process 1 (Plant simulation, 1 kHz)
 Responsibility:
   - Wait for 1 ms tick (PrecisionTimer)
   - GPIO pulse → H7 (alert: SPI frame imminent)
-  - SPI full-duplex: send encoded state, receive encoded torques
+  - SPI full-duplex: send encoded state + trajectory setpoint, receive torques
   - Decode torques → plant.step() → update state
   - Expose state via shared multiprocessing.Array for Process 2
+  - Read the setpoint written by Process 2 (shared_ref); flag it VALID|NEW
+    only on the tick after it changes, so the H7 relays it at ~50 Hz
 
 Real-time requirements:
   - Must complete each tick in < 1 ms (1 ms period)
-  - Typical work: GPIO pulse (~10 μs) + SPI (~24 μs at 1 MHz) + plant (~50 μs)
-  - Total ≈ 100–150 μs → comfortable margin
+  - Typical work: GPIO pulse (~10 μs) + SPI 36 bytes (288 μs at 1 MHz,
+    72 μs at 4 MHz) + spidev overhead + plant (~50 μs)
+  - Total ≈ 400 μs at 1 MHz → still inside 1 ms; raise spi_speed_hz to
+    2–4 MHz after the link is validated to regain margin
 
 CPU allocation:
   - This process: core 0, SCHED_FIFO priority 90
@@ -31,7 +35,7 @@ from typing import Optional
 from timing import PrecisionTimer, set_realtime, pin_cpu
 from gpio_sync import GPIOSync
 from spi_master import SPIMaster
-from protocol import encode_state, decode_torques
+from protocol import encode_state, decode_torques, TRAJ_VALID, TRAJ_NEW
 from plant_interface import PlantInterface, MockPlant
 
 log = logging.getLogger('hil.node')
@@ -79,6 +83,7 @@ class HILNode:
         plant:         PlantInterface,
         config:        HILConfig          = None,
         shared_state:  Optional[mp.Array] = None,
+        shared_ref:    Optional[mp.Array] = None,
     ):
         """
         Args:
@@ -86,10 +91,16 @@ class HILNode:
             config:       HILConfig.  Defaults to simulate_hw=True, 1 kHz.
             shared_state: mp.Array('d', 10) for IPC with trajectory publisher.
                           Write-locked on each tick.  Optional.
+            shared_ref:   mp.Array('d', 4) [vx_ref, vy_ref, wz_ref, counter]
+                          written by the trajectory publisher.  Optional;
+                          None → no setpoint sent (traj_flags = 0).
         """
         self.plant        = plant
         self.cfg          = config or HILConfig(simulate_hw=True)
         self.shared_state = shared_state
+        self.shared_ref   = shared_ref
+        self._ref         = (0.0, 0.0, 0.0)
+        self._ref_count   = 0.0
 
         self._gpio  = GPIOSync(
             pin=self.cfg.gpio_pin,
@@ -158,9 +169,18 @@ class HILNode:
         # 1. Sync pulse — H7 EXTI fires, enables DMA receive
         self._gpio.pulse()
 
-        # 2. Encode current state, send MOSI, receive MISO (torques from H7)
+        # 2. Encode current state + setpoint, send MOSI, receive MISO (torques from H7)
+        traj_flags = 0
+        if self.shared_ref is not None:
+            with self.shared_ref.get_lock():
+                vx_r, vy_r, wz_r, count = self.shared_ref[:]
+            if count != self._ref_count:
+                self._ref_count = count
+                self._ref       = (vx_r, vy_r, wz_r)
+                traj_flags      = TRAJ_VALID | TRAJ_NEW
         state  = self.plant.get_state()
-        mosi   = encode_state(state)
+        mosi   = encode_state(state, traj_ref=self._ref, traj_flags=traj_flags,
+                              seq=self._step)
         miso   = self._spi.transfer(mosi)
         torques = decode_torques(miso)
 

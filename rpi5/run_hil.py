@@ -26,7 +26,9 @@ Notes
 ──────
 - sudo required for SCHED_FIFO (or grant cap_sys_nice).
 - Ensure SPI enabled: sudo raspi-config → Interface → SPI.
-- UART port /dev/ttyAMA0 may need: sudo raspi-config → Interface → Serial.
+- Trajectory setpoints go RPi5 → SPI → H7 → UART → ESP32 (HIL v2).
+  The direct RPi5 → ESP32 UART path is legacy (--traj-uart-direct);
+  it may need: sudo raspi-config → Interface → Serial.
 - multiprocessing start method is 'spawn' (avoids lgpio/spidev fork issues).
 """
 from __future__ import annotations
@@ -50,7 +52,7 @@ log = logging.getLogger('hil.main')
 
 # ── Process target functions ──────────────────────────────────────────────
 
-def _run_plant(cfg, shared_state: mp.Array, use_mock: bool) -> None:
+def _run_plant(cfg, shared_state: mp.Array, shared_ref: mp.Array, use_mock: bool) -> None:
     """Process 1 target: plant simulation loop."""
     import logging
     logging.basicConfig(
@@ -66,11 +68,11 @@ def _run_plant(cfg, shared_state: mp.Array, use_mock: bool) -> None:
     from plant_interface import MockPlant
 
     plant = MockPlant() if use_mock else MecanumPlant(dt=cfg.period_us / 1e6)
-    node  = HILNode(plant, config=cfg, shared_state=shared_state)
+    node  = HILNode(plant, config=cfg, shared_state=shared_state, shared_ref=shared_ref)
     node.run()
 
 
-def _run_traj(spec, port: str, simulate: bool) -> None:
+def _run_traj(spec, port: str, simulate: bool, shared_ref: mp.Array, uart_direct: bool) -> None:
     """Process 2 target: trajectory publisher."""
     import logging
     logging.basicConfig(
@@ -81,7 +83,8 @@ def _run_traj(spec, port: str, simulate: bool) -> None:
     os.sched_setaffinity(0, {2})   # pin to core 2 (away from plant loop)
 
     from trajectory_pub import TrajectoryPublisher
-    pub = TrajectoryPublisher(spec=spec, port=port, simulate=simulate)
+    pub = TrajectoryPublisher(spec=spec, port=port, simulate=simulate,
+                              shared_ref=shared_ref, uart_direct=uart_direct)
     pub.run()
 
 
@@ -151,7 +154,10 @@ def _parse_args() -> argparse.Namespace:
                    help='Run duration [s] (0 = forever)')
     # Hardware
     p.add_argument('--uart-port',     default='/dev/ttyAMA0',
-                   help='UART port for ESP32')
+                   help='UART port for ESP32 (legacy --traj-uart-direct only)')
+    p.add_argument('--traj-uart-direct', action='store_true',
+                   help='Legacy: also send 18-byte packet RPi5→ESP32 over UART '
+                        '(default path is SPI → H7 → UART relay)')
     p.add_argument('--spi-speed',     type=int,   default=1_000_000,
                    help='SPI clock [Hz]')
     p.add_argument('--rt-priority',   type=int,   default=90,
@@ -200,13 +206,16 @@ def main() -> int:
 
     # Shared state array: plant writes, trajectory pub can read (optional)
     shared_state = mp.Array('d', 10)
+    # Shared setpoint: trajectory pub writes [vx_ref, vy_ref, wz_ref, counter],
+    # plant loop packs it into the SPI frame for the H7 → ESP32 relay
+    shared_ref = mp.Array('d', 4)
 
     # Build process list
     procs = []
 
     p1 = mp.Process(
         target=_run_plant,
-        args=(hil_cfg, shared_state, args.mock),
+        args=(hil_cfg, shared_state, shared_ref, args.mock),
         name='HIL-Plant',
         daemon=True,
     )
@@ -215,7 +224,7 @@ def main() -> int:
     if not args.no_traj:
         p2 = mp.Process(
             target=_run_traj,
-            args=(traj_spec, args.uart_port, args.mock),
+            args=(traj_spec, args.uart_port, args.mock, shared_ref, args.traj_uart_direct),
             name='HIL-TrajPub',
             daemon=True,
         )

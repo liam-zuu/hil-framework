@@ -3,13 +3,24 @@ Trajectory Publisher — Process 2 (Mission computer, 50 Hz)
 
 Responsibility:
   - Compute trajectory reference at time t  (50 Hz)
-  - Pack into 18-byte UART packet
-  - Send to ESP32 via UART
+  - Default (HIL v2): write body-frame velocity setpoint (vx, vy, wz) into a
+    shared array. Process 1 packs it into the 36-byte SPI frame, the H7
+    relays it to the ESP32 as the 14-byte 0xBB UART packet.
+  - Legacy (uart_direct=True): pack the 18-byte packet below and send it to
+    the ESP32 over UART directly. The current ESP32 traj_receiver expects the
+    14-byte packet, so this path is kept only for old tests.
 
 This process is completely independent of Process 1 (plant loop).
 It uses wall-clock time — no synchronisation with the plant tick needed.
 
-UART Packet (18 bytes):
+Shared setpoint array (mp.Array('d', 4)):
+  [0] vx_ref  [m/s]    body frame
+  [1] vy_ref  [m/s]    body frame (0 for these trajectories)
+  [2] wz_ref  [rad/s]
+  [3] counter          incremented on every new setpoint (Process 1 sets
+                       TRAJ_VALID | TRAJ_NEW only when it changes)
+
+Legacy UART Packet (18 bytes):
   Offset  Field      Type        Description
   ─────── ─────────  ──────────  ──────────────────────────
   0       header     uint8       0xBB (sync byte)
@@ -35,7 +46,7 @@ import signal
 import struct
 import time
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 try:
     import serial as _serial
@@ -131,6 +142,31 @@ def get_reference(t: float, spec: TrajectorySpec) -> Tuple[float, float, float, 
     return fn(t, spec)
 
 
+def get_body_velocity(t: float, spec: TrajectorySpec) -> Tuple[float, float, float]:
+    """
+    Body-frame velocity setpoint (vx, vy, wz) at time t, for the ESP32.
+
+    The robot keeps its heading tangent to the path, so vy = 0 and
+    wz = path curvature × path speed.  Time scaling matches get_reference(),
+    so integrating these setpoints follows the same (x, y) path.
+    """
+    if spec.kind == 'line':
+        return spec.v, 0.0, 0.0
+    if spec.kind == 'circle':
+        return spec.v, 0.0, spec.v / spec.radius
+    if spec.kind == 'figure8':
+        A   = spec.radius
+        w   = 2.0 * math.pi / spec.period
+        tau = w * t
+        dx  = A * w * math.cos(tau)
+        dy  = A * w * math.cos(2.0 * tau)
+        ddx = -A * w * w * math.sin(tau)
+        ddy = -2.0 * A * w * w * math.sin(2.0 * tau)
+        speed2 = dx * dx + dy * dy + 1e-12
+        return math.sqrt(speed2), 0.0, (dx * ddy - dy * ddx) / speed2
+    return 0.0, 0.0, 0.0
+
+
 # ── UART packet encoding ──────────────────────────────────────────────────
 
 def _xor8(data: bytes) -> int:
@@ -184,22 +220,29 @@ class TrajectoryPublisher:
 
     def __init__(
         self,
-        spec:     TrajectorySpec,
-        port:     str   = '/dev/ttyAMA0',
-        rate_hz:  int   = 50,
-        simulate: bool  = False,
+        spec:        TrajectorySpec,
+        port:        str   = '/dev/ttyAMA0',
+        rate_hz:     int   = 50,
+        simulate:    bool  = False,
+        shared_ref                 = None,
+        uart_direct: Optional[bool] = None,
     ):
         """
         Args:
-            spec:     Trajectory specification.
-            port:     UART device (check: ls /dev/ttyAMA* /dev/serial*).
-            rate_hz:  Publish rate [Hz]. 50 Hz is ample for the outer loop.
-            simulate: Skip actual UART (for dev / CI testing).
+            spec:        Trajectory specification.
+            port:        UART device (check: ls /dev/ttyAMA* /dev/serial*).
+            rate_hz:     Publish rate [Hz]. 50 Hz is ample for the outer loop.
+            simulate:    Skip actual UART (for dev / CI testing).
+            shared_ref:  mp.Array('d', 4) read by Process 1 (HIL v2 path).
+            uart_direct: Also send the legacy 18-byte packet over UART.
+                         Default: True only when shared_ref is None.
         """
-        self.spec      = spec
-        self.port      = port
-        self.rate_hz   = rate_hz
-        self.simulate  = simulate
+        self.spec        = spec
+        self.port        = port
+        self.rate_hz     = rate_hz
+        self.simulate    = simulate
+        self.shared_ref  = shared_ref
+        self.uart_direct = (shared_ref is None) if uart_direct is None else uart_direct
 
         self._uart     = None
         self._running  = False
@@ -213,7 +256,7 @@ class TrajectoryPublisher:
         signal.signal(signal.SIGTERM, self._on_signal)
         signal.signal(signal.SIGINT,  self._on_signal)
 
-        if not self.simulate:
+        if self.uart_direct and not self.simulate:
             self._open_uart()
 
         period_s  = 1.0 / self.rate_hz
@@ -237,9 +280,16 @@ class TrajectoryPublisher:
                     log.info("Trajectory duration %.1f s reached.", self.spec.duration)
                     break
 
-                x, y, theta, vx = get_reference(t, self.spec)
-                pkt = encode_packet(x, y, theta, vx)
-                self._send(pkt)
+                if self.shared_ref is not None:
+                    vx_b, vy_b, wz_b = get_body_velocity(t, self.spec)
+                    with self.shared_ref.get_lock():
+                        self.shared_ref[0] = vx_b
+                        self.shared_ref[1] = vy_b
+                        self.shared_ref[2] = wz_b
+                        self.shared_ref[3] += 1.0
+                if self.uart_direct:
+                    x, y, theta, vx = get_reference(t, self.spec)
+                    self._send(encode_packet(x, y, theta, vx))
                 self._n_sent += 1
 
                 # Coarse sleep to next tick (50 Hz — jitter OK here)

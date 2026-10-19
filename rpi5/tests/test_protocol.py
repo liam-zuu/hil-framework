@@ -1,7 +1,7 @@
 """
 Tests: protocol.py — SPI encode/decode must match H7 hil_protocol.h
 
-MOSI field order: [ω1, ω2, ω3, ω4, x, y, θ, vx, vy, wz]
+MOSI field order: [ω1, ω2, ω3, ω4, x, y, θ, vx, vy, wz] + traj ref (v2, 36 bytes)
   index:           0    1    2    3   4  5  6   7   8   9
 
 Run: pytest tests/test_protocol.py -v
@@ -13,13 +13,17 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import pytest
+import re
 from protocol import (
-    encode_state, decode_state,
-    encode_torques, decode_torques,
+    encode_state, decode_state, decode_traj_ref,
+    encode_torques, decode_torques, decode_output,
     _to_int16, _from_int16,
-    STATE_RANGES, TORQUE_RANGE, FRAME_SIZE, N_STATES, N_TORQUES,
-    LSB_TORQUE,
+    STATE_RANGES, REF_RANGES, TORQUE_RANGE, FRAME_SIZE, N_STATES, N_TORQUES,
+    LSB_TORQUE, TRAJ_VALID, TRAJ_NEW,
 )
+
+H7_HEADER = os.path.join(os.path.dirname(__file__), '..', '..',
+                         'stm32h7', 'Core', 'Inc', 'hil_protocol.h')
 
 
 # ── int16 helpers ──────────────────────────────────────────────────────────
@@ -79,10 +83,17 @@ class TestStateEncoding:
         for r, rng in zip(rec, STATE_RANGES):
             assert abs(abs(r) - rng) <= rng / 32767 + 1e-12
 
-    def test_padding_bytes_are_zero(self):
-        frame = encode_state([0.0] * 10)
-        # bytes 20-23 are padding (states use bytes 0-19)
-        assert frame[20:24] == b'\x00\x00\x00\x00'
+    def test_reserved_bytes_are_zero(self):
+        frame = encode_state([0.0] * 10, traj_ref=(1.0, -1.0, 2.0),
+                             traj_flags=TRAJ_VALID, seq=7, fault_flags=1)
+        # bytes 22-23 and 31-35 are reserved in hil_protocol.h v2
+        assert frame[22:24] == b'\x00\x00'
+        assert frame[31:36] == b'\x00' * 5
+
+    def test_seq_and_fault_bytes(self):
+        frame = encode_state([0.0] * 10, seq=0x1FF, fault_flags=0x02)
+        assert frame[20] == 0x02
+        assert frame[21] == 0xFF   # seq stored modulo 256
 
     def test_big_endian_byte_order(self):
         """Critical: H7 SPI DMA reads big-endian int16.
@@ -138,10 +149,20 @@ class TestTorqueEncoding:
         for r in rec:
             assert abs(abs(r) - TORQUE_RANGE) <= TORQUE_RANGE / 32767 + 1e-12
 
-    def test_padding_16_bytes(self):
+    def test_unused_bytes_zero(self):
         frame = encode_torques([0.0] * 4)
-        # torques occupy bytes 0-7, padding = bytes 8-23
-        assert frame[8:] == b'\x00' * 16
+        # torques occupy bytes 0-7; pwm/status/seq default 0; bytes 18-35 reserved
+        assert frame[8:] == b'\x00' * (FRAME_SIZE - 8)
+
+    def test_full_output_round_trip(self):
+        frame = encode_torques([0.3, -0.2, 0.1, 0.0], pwm=[0.5, -0.5, 1.0, 0.0],
+                               status=3, seq=200)
+        out = decode_output(frame)
+        assert out['torque'] == pytest.approx([0.3, -0.2, 0.1, 0.0], abs=1e-4)
+        assert out['pwm'] == pytest.approx([0.5, -0.5, 1.0, 0.0], abs=1e-4)
+        assert out['status'] == 3
+        assert out['seq'] == 200
+        assert frame[18:] == b'\x00' * 18
 
     def test_lsb_value(self):
         """LSB ≈ 3.05e-5 N·m — matches HIL_TORQUE_MAX/32767."""
@@ -169,6 +190,70 @@ class TestProtocolRoundTrip:
             rec   = decode_state(miso)
             for orig, r, rng_ in zip(state, rec, STATE_RANGES):
                 assert abs(r - orig) <= rng_ / 32767 + 1e-12
+
+
+# ── Trajectory reference (MOSI bytes 24-30) ────────────────────────────────
+
+class TestTrajRef:
+    def test_default_is_zero_and_not_valid(self):
+        frame = encode_state([0.0] * 10)
+        assert decode_traj_ref(frame) == (0.0, 0.0, 0.0, 0)
+
+    def test_round_trip(self):
+        ref   = (0.3, -0.15, 0.6)
+        frame = encode_state([0.0] * 10, traj_ref=ref, traj_flags=TRAJ_VALID | TRAJ_NEW)
+        vx, vy, wz, flags = decode_traj_ref(frame)
+        for orig, r, rng in zip(ref, (vx, vy, wz), REF_RANGES):
+            assert abs(r - orig) <= rng / 32767 + 1e-12
+        assert flags == TRAJ_VALID | TRAJ_NEW
+
+    def test_byte_offsets_match_h7_decode(self):
+        """H7 _decode(): vx_ref at bytes 24-25, wz_ref at 28-29, flags at 30."""
+        frame = encode_state([0.0] * 10, traj_ref=(3.0, 0.0, -10.0), traj_flags=TRAJ_VALID)
+        assert struct.unpack_from('>h', frame, 24)[0] == 32767
+        assert struct.unpack_from('>h', frame, 28)[0] == -32767
+        assert frame[30] == TRAJ_VALID
+
+    def test_state_unchanged_by_traj_ref(self):
+        state = [10.0, -10.0, 5.0, -5.0, 1.0, -1.0, 0.5, 0.3, -0.3, 1.0]
+        a = encode_state(state)
+        b = encode_state(state, traj_ref=(1.0, 1.0, 1.0), traj_flags=TRAJ_VALID)
+        assert a[:20] == b[:20]
+
+    def test_wrong_ref_length_raises(self):
+        with pytest.raises(ValueError):
+            encode_state([0.0] * 10, traj_ref=(0.0, 0.0))
+
+
+# ── Consistency with the H7 header ─────────────────────────────────────────
+
+@pytest.mark.skipif(not os.path.exists(H7_HEADER), reason="stm32h7 sources not present")
+class TestMatchesH7Header:
+    """Fails when hil_protocol.h and protocol.py drift apart."""
+
+    @staticmethod
+    def _define(name: str) -> float:
+        with open(H7_HEADER, encoding='utf-8') as f:
+            text = f.read()
+        m = re.search(rf'#define\s+{name}\s+([0-9.]+)f?', text)
+        assert m, f"{name} not found in hil_protocol.h"
+        return float(m.group(1))
+
+    def test_frame_len(self):
+        assert self._define('SPI1_FRAME_LEN') == FRAME_SIZE
+
+    def test_state_ranges(self):
+        expected = ([self._define('HIL_OMEGA_MAX')] * 4
+                    + [self._define('HIL_POS_MAX')] * 2
+                    + [self._define('HIL_THETA_MAX')]
+                    + [self._define('HIL_VEL_MAX')] * 2
+                    + [self._define('HIL_OMEGA_BODY_MAX')])
+        assert STATE_RANGES == pytest.approx(expected, rel=1e-6)
+
+    def test_ref_and_torque_ranges(self):
+        assert REF_RANGES == pytest.approx([self._define('HIL_REF_VEL_MAX')] * 2
+                                           + [self._define('HIL_REF_OMEGA_MAX')])
+        assert TORQUE_RANGE == pytest.approx(self._define('HIL_TORQUE_MAX'))
 
 
 if __name__ == '__main__':

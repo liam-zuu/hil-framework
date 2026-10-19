@@ -12,7 +12,9 @@ from trajectory_pub import (
     encode_packet,
     decode_packet,
     get_reference,
+    get_body_velocity,
 )
+from protocol import decode_traj_ref, TRAJ_VALID, TRAJ_NEW
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +69,37 @@ class TestHILNodeSimulated:
         assert len(state) == 10
         for v in state:
             assert math.isfinite(v), f"Plant state non-finite: {state}"
+
+
+class TestHILNodeTrajRef:
+    """Setpoint from Process 2 is packed into MOSI; VALID|NEW only when it changes."""
+
+    def _run_capture(self, shared_ref, steps=4):
+        config = HILConfig(simulate_hw=True, max_steps=steps, period_us=1_000)
+        node   = HILNode(MockPlant(), config=config, shared_ref=shared_ref)
+        frames = []
+        real_transfer = node._spi.transfer
+        node._spi.transfer = lambda tx: (frames.append(tx), real_transfer(tx))[1]
+        node.run()
+        return frames
+
+    def test_no_shared_ref_sends_no_setpoint(self):
+        frames = self._run_capture(None, steps=3)
+        assert all(decode_traj_ref(f) == (0.0, 0.0, 0.0, 0) for f in frames)
+
+    def test_flags_set_only_on_new_setpoint(self):
+        ref = mp.Array('d', 4)
+        ref[:] = [0.3, 0.0, 0.6, 1.0]          # counter 1 → one new setpoint
+        frames = self._run_capture(ref, steps=4)
+        flags = [decode_traj_ref(f)[3] for f in frames]
+        assert flags == [TRAJ_VALID | TRAJ_NEW, 0, 0, 0]
+        vx, vy, wz, _ = decode_traj_ref(frames[-1])
+        assert vx == pytest.approx(0.3, abs=1e-3)
+        assert wz == pytest.approx(0.6, abs=1e-3)   # value kept, just not re-relayed
+
+    def test_seq_increments(self):
+        frames = self._run_capture(None, steps=3)
+        assert [f[21] for f in frames] == [0, 1, 2]
 
 
 # ---------------------------------------------------------------------------
@@ -172,3 +205,38 @@ class TestTrajectoryGenerator:
         for k in range(50):
             _, _, _, vx = get_reference(t=k * 0.1, spec=spec)
             assert vx >= -1e-9, f"vx={vx} negative at t={k*0.1}"
+
+
+# ---------------------------------------------------------------------------
+# 4. Body-frame velocity setpoint (sent to ESP32 via H7 relay)
+# ---------------------------------------------------------------------------
+
+class TestBodyVelocity:
+    def test_idle_is_zero(self):
+        assert get_body_velocity(1.0, TrajectorySpec(kind='idle')) == (0.0, 0.0, 0.0)
+
+    def test_line(self):
+        assert get_body_velocity(3.0, TrajectorySpec(kind='line', v=0.3)) == (0.3, 0.0, 0.0)
+
+    def test_circle_yaw_rate(self):
+        vx, vy, wz = get_body_velocity(2.0, TrajectorySpec(kind='circle', v=0.3, radius=0.5))
+        assert (vx, vy) == (0.3, 0.0)
+        assert wz == pytest.approx(0.6)
+
+    def test_figure8_speed_matches_path(self):
+        """Body speed equals the numerical speed of get_reference()'s (x, y)."""
+        spec = TrajectorySpec(kind='figure8', v=0.3, radius=0.5, period=8.0)
+        dt = 1e-5
+        for t in [0.3, 1.1, 2.0, 3.7, 5.2]:
+            x0, y0, *_ = get_reference(t - dt, spec)
+            x1, y1, *_ = get_reference(t + dt, spec)
+            speed_num = math.hypot(x1 - x0, y1 - y0) / (2 * dt)
+            vx, vy, _ = get_body_velocity(t, spec)
+            assert vx == pytest.approx(speed_num, rel=1e-4)
+            assert vy == 0.0
+
+    def test_figure8_within_protocol_range(self):
+        spec = TrajectorySpec(kind='figure8', v=0.3, radius=0.5, period=8.0)
+        for k in range(200):
+            vx, vy, wz = get_body_velocity(k * 0.04, spec)
+            assert abs(vx) <= 3.0 and abs(wz) <= 10.0
