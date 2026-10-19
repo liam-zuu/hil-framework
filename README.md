@@ -44,7 +44,12 @@ cd rpi5 && python -m pytest tests
 ## Việc cần làm tiếp
 
 1. ~~Cập nhật `rpi5/protocol.py` lên frame 36 byte~~ (xong 19/10). RPi5 gửi setpoint vận tốc thân xe `(vx, vy, wz)` trong frame SPI, H7 relay sang ESP32. `tests/test_protocol.py` so hằng số với `hil_protocol.h` để phát hiện lệch.
-2. **Nên sửa trên H7:** `UartRelay_Send()` đang relay mỗi khi cờ `VALID` bật. RPi5 hiện chỉ bật `VALID|NEW` ở frame có setpoint mới (50 Hz). Nên đổi điều kiện trên H7 sang kiểm tra `HIL_TRAJ_NEW`: mỗi lần gửi UART chặn khoảng 1,2 ms, dài hơn chu kỳ 1 ms.
+2. **UART relay không chặn (nhánh `h7-uart-fifo`, chưa build trên board):** `UartRelay_Send()` ghi 14 byte thẳng vào FIFO 16 byte của USART2 thay vì chờ `HAL_UART_Transmit()` (trước đây chặn khoảng 1,2 ms). Relay chỉ chạy khi có đủ cả `VALID` và `NEW`. Đã biên dịch thử bằng STM32CubeCLT, chưa nạp. Cách kiểm tra:
+   1. CubeIDE: Build, rồi nạp. Thư mục `Debug/` sẽ tự sinh lại.
+   2. Mở cổng ST-Link VCP (USART3, 115200): mỗi 0,5 s có dòng `Relay: sent=… dropped=…`.
+   3. Chạy `sudo python run_hil.py --traj circle --speed 0.3 --radius 0.5 --duration 30`: `sent` tăng khoảng 25 sau mỗi lần in, `dropped` giữ 0, `traj wz` khoảng 0.60.
+   4. Logic analyzer: PD5 (USART2 TX) có cụm 14 byte mỗi 20 ms. PE1 (toggle mỗi frame SPI) đều đặn, không có khoảng hở 1,2 ms. Đây là bằng chứng relay không chặn vòng chính.
+   5. Đạt thì gộp nhánh `h7-uart-fifo` vào `main`.
 3. Nối lại 8 dây PWM ESP32 → H7 (bảng mapping trong session summary 18/06), verify cả 8 kênh.
 4. Verify trajectory loop: chạy `sudo python run_hil.py --traj circle --speed 0.3 --radius 0.5 --duration 30`, xem ESP32 có nhận gói 0xBB qua UART không.
 5. Sau khi link ổn định, tăng `--spi-speed` lên 2–4 MHz. Frame 36 byte ở 1 MHz mất 288 µs trong chu kỳ 1 ms.

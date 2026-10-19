@@ -195,6 +195,11 @@ int main(void)
         printf("PWM: %.2f %.2f %.2f %.2f\r\n",
                (double)duty[0], (double)duty[1],
                (double)duty[2], (double)duty[3]);
+        uint32_t relay_sent, relay_dropped;
+        UartRelay_GetStats(&relay_sent, &relay_dropped);
+        printf("Relay: sent=%lu dropped=%lu  traj vx=%.2f vy=%.2f wz=%.2f\r\n",
+               (unsigned long)relay_sent, (unsigned long)relay_dropped,
+               (double)g_traj.vx_ref, (double)g_traj.vy_ref, (double)g_traj.wz_ref);
         printf("---\r\n");
 
         HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_0);
