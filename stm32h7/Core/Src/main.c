@@ -210,6 +210,11 @@ int main(void)
         uint32_t isr_now = PWMCapture_GetIsrCount();
         printf("ISR: %lu/s\r\n", (unsigned long)((isr_now - _isr_last) * 2u));
         _isr_last = isr_now;
+        uint32_t relay_sent, relay_dropped;
+        UartRelay_GetStats(&relay_sent, &relay_dropped);
+        printf("Relay: sent=%lu dropped=%lu  traj vx=%.2f vy=%.2f wz=%.2f\r\n",
+               (unsigned long)relay_sent, (unsigned long)relay_dropped,
+               (double)g_traj.vx_ref, (double)g_traj.vy_ref, (double)g_traj.wz_ref);
         printf("---\r\n");
 
         HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_0);

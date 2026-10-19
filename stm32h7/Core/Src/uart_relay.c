@@ -1,7 +1,8 @@
 /* uart_relay.c — Trajectory relay: SPI frame → USART2 → ESP32
  *
- * Called from main loop whenever SPI1_IsFrameReady() and
- * traj_flags & HIL_TRAJ_VALID.
+ * Called from main loop whenever SPI1_IsFrameReady(). Sends only when
+ * traj_flags has both HIL_TRAJ_VALID and HIL_TRAJ_NEW set, i.e. once per
+ * new setpoint from the RPi5 (~50 Hz), not on every 1 kHz SPI frame.
  *
  * Packet format (14 bytes, little-endian floats):
  *   [0]      0xBB  header
@@ -10,9 +11,10 @@
  *   [9..12]  wz_ref  float32 LE
  *   [13]     XOR checksum of bytes [1..12]
  *
- * Uses blocking HAL_UART_Transmit — 14 bytes @ 115200 = ~1.2ms.
- * At 50Hz relay rate (20ms period) this is acceptable (6% CPU).
- * Switch to DMA if 1kHz relay is ever needed.
+ * Non-blocking: the 14 bytes are written straight into the 16-byte USART
+ * TX FIFO and the hardware shifts them out (~1.2 ms @ 115200) while the
+ * main loop keeps running. The old HAL_UART_Transmit() version blocked the
+ * main loop for those 1.2 ms, longer than the 1 ms HIL period.
  */
 
 #include "uart_relay.h"
@@ -21,6 +23,10 @@
 
 /* ── Private ─────────────────────────────────────────────────────────── */
 static UART_HandleTypeDef *_huart;
+static volatile uint32_t   _n_sent;
+static volatile uint32_t   _n_dropped;
+
+#define _TRAJ_SEND_MASK  (HIL_TRAJ_VALID | HIL_TRAJ_NEW)
 
 /* Pack float as 4-byte little-endian into buf */
 static void _pack_float_le(uint8_t *buf, float f)
@@ -33,15 +39,33 @@ static void _pack_float_le(uint8_t *buf, float f)
 /* ── Public API ──────────────────────────────────────────────────────── */
 void UartRelay_Init(UART_HandleTypeDef *huart)
 {
-    _huart = huart;
+    _huart     = huart;
+    _n_sent    = 0;
+    _n_dropped = 0;
+
+    /* usart.c (CubeMX) calls HAL_UARTEx_DisableFifoMode(). Re-enable the
+     * FIFO here, in a user file, so regenerating CubeMX code keeps it. */
+    if (HAL_UARTEx_EnableFifoMode(_huart) != HAL_OK) {
+        _huart = NULL;   /* relay disabled; UartRelay_Send() becomes a no-op */
+    }
 }
 
 void UartRelay_Send(const HIL_TrajRef_t *traj)
 {
     if (_huart == NULL) return;
 
-    /* Only relay if setpoint is valid */
-    if (!(traj->traj_flags & HIL_TRAJ_VALID)) return;
+    /* Only relay a valid setpoint that is new in this frame */
+    if ((traj->traj_flags & _TRAJ_SEND_MASK) != _TRAJ_SEND_MASK) return;
+
+    USART_TypeDef *u = _huart->Instance;
+
+    /* Previous packet still in the FIFO → drop this one rather than wait.
+     * At 50 Hz (20 ms period) the 1.2 ms packet is long gone, so this only
+     * triggers if the RPi5 flags NEW far too often. */
+    if ((u->ISR & USART_ISR_TXFE) == 0u) {
+        _n_dropped++;
+        return;
+    }
 
     uint8_t pkt[TRAJ_UART_LEN];
 
@@ -57,6 +81,15 @@ void UartRelay_Send(const HIL_TrajRef_t *traj)
     }
     pkt[13] = cs;
 
-    /* Blocking transmit — timeout 5ms (generous for 14 bytes @ 115200) */
-    HAL_UART_Transmit(_huart, pkt, TRAJ_UART_LEN, 5);
+    /* FIFO is empty and 16 deep, so all 14 writes are accepted immediately */
+    for (int i = 0; i < TRAJ_UART_LEN; i++) {
+        u->TDR = pkt[i];
+    }
+    _n_sent++;
+}
+
+void UartRelay_GetStats(uint32_t *sent, uint32_t *dropped)
+{
+    if (sent)    *sent    = _n_sent;
+    if (dropped) *dropped = _n_dropped;
 }
