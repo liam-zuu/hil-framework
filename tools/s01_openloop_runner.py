@@ -92,11 +92,29 @@ class SerialDevice:
         except (ImportError, AttributeError):
             sys.exit('pyserial is missing (a different package named "serial" may be installed).\n'
                      'Fix:  python -m pip uninstall -y serial  &&  python -m pip install pyserial')
-        self.ser = serial.Serial(port, 921600, timeout=0.2)
+        # Open with DTR/RTS released: pyserial asserts both by default, which the
+        # board's auto-reset circuit (CH343) can turn into "enter download mode",
+        # and the ESP32 then never answers. Instead pulse RTS (= EN) to restart
+        # the firmware cleanly, wait for it to boot, then PING until it answers.
+        self.ser = serial.Serial()
+        self.ser.port, self.ser.baudrate, self.ser.timeout = port, 921600, 0.2
+        self.ser.dtr = False
+        self.ser.rts = False
+        self.ser.open()
         self.lock = threading.Lock()
-        time.sleep(0.3)
+        self.ser.rts = True
+        time.sleep(0.15)
+        self.ser.rts = False
+        time.sleep(1.5)                        # boot log at 115200 arrives as garbage here
         self.ser.reset_input_buffer()
-        self.cmd('PING', expect='PONG')
+        for _ in range(10):
+            self.write('PING')
+            t_end = time.time() + 0.5
+            while time.time() < t_end:
+                if b'PONG' in self.ser.readline():
+                    return
+        sys.exit(f'No PONG from ESP32 on {port}. Check: S01 firmware flashed '
+                 '(env s01_openloop), right COM port, no serial monitor open.')
 
     def write(self, line):
         with self.lock:
