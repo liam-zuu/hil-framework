@@ -20,6 +20,7 @@ function params = params_mecanum()
     %% --- Motor / Actuator ---
     params.tau_max   = 0.5;   % Max motor torque (N·m) [ASSUMPTION — not in spec]
     params.omega_max = 34.56; % Max wheel speed (rad/s) [from spec]
+    params.motor_polarity = [1; 1; 1; 1]; % Motor wiring polarity [FL FR RL RR]: sign of real wheel rotation for +torque. S01 trial 20/10/2026: FL turns backward on +PWM. Keep 1 until S01 run01 fixes it with ESP32 motor_dir.
     params.pwm_res   = 1024;  % PWM resolution (10-bit)
     params.deadband  = 0.02;  % PWM deadband fraction [ASSUMPTION]
 

@@ -32,6 +32,7 @@ import csv
 import math
 import os
 import random
+import subprocess
 import sys
 import threading
 import time
@@ -220,6 +221,23 @@ def qc(rows, omega, scenario):
     return missing_pct, steady_ok, w_ss
 
 
+def esp32_git_state(repo):
+    """Commit and working-tree state of AGV_FIRMWARE at run time.
+    .vscode/ is ignored (editor settings, not part of the build)."""
+    def git(*args):
+        out = subprocess.run(['git', '-C', repo] + list(args), capture_output=True,
+                             text=True, check=True).stdout
+        return out.rstrip('\n') if args[0] == 'status' else out.strip()   # keep porcelain column 1
+    try:
+        commit = git('rev-parse', '--short', 'HEAD')
+        branch = git('rev-parse', '--abbrev-ref', 'HEAD')
+        changed = [ln[3:] for ln in git('status', '--porcelain').splitlines()
+                   if ln[3:] and not ln[3:].startswith('.vscode/')]
+    except (OSError, subprocess.CalledProcessError) as e:
+        return {'commit': 'UNKNOWN', 'branch': 'UNKNOWN', 'dirty': True, 'modified': [f'git error: {e}']}
+    return {'commit': commit, 'branch': branch, 'dirty': bool(changed), 'modified': changed}
+
+
 def ask_voltage(prompt, dry):
     if dry:
         return 12.0
@@ -240,12 +258,21 @@ def main():
     ap.add_argument('--reps', type=int, default=5)
     ap.add_argument('--quick', action='store_true', help='3 step levels, 1 coast level (rehearsal)')
     ap.add_argument('--seed', type=int, default=1)
-    ap.add_argument('--esp32-commit', default='UNKNOWN')
+    ap.add_argument('--esp32-repo', default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                          '..', '..', 'AGV_FIRMWARE'),
+                    help='AGV_FIRMWARE checkout used to build the flashed firmware (git state is recorded)')
+    ap.add_argument('--esp32-commit', default=None, help='override the commit read from --esp32-repo')
     ap.add_argument('--operator', default='Liam')
     a = ap.parse_args()
     if not a.dry_run and not a.port:
         ap.error('--port is required unless --dry-run')
 
+    esp = esp32_git_state(a.esp32_repo)
+    if a.esp32_commit:
+        esp['commit'] = a.esp32_commit
+    print(f"ESP32 firmware: {esp['commit']} ({esp['branch']}), dirty={esp['dirty']} {esp['modified'] or ''}")
+    if esp['dirty'] and not a.dry_run:
+        print('  WARNING: AGV_FIRMWARE has uncommitted changes: this run cannot be a main result (03_CODE/CLAUDE.md).')
     raw_dir = os.path.join(a.out, 'raw')
     os.makedirs(raw_dir, exist_ok=True)
     plan = build_plan(a.wheels, a.reps, a.quick, a.seed)
@@ -313,7 +340,7 @@ operator: {a.operator}
 firmware:
   rpi5:  null               # not used (AGV only, wheels lifted)
   h7:    null
-  esp32: {{repo: AGV_MECANUM, commit: {a.esp32_commit}, build_flags: "-DTEST_MODE -DTEST_OPENLOOP", dirty: false}}
+  esp32: {{repo: AGV_MECANUM, commit: {esp['commit']}, branch: {esp['branch']}, pio_env: s01_openloop, build_flags: "-DTEST_MODE -DTEST_OPENLOOP", dirty: {str(esp['dirty']).lower()}, modified: {esp['modified']}}}   # read by the runner from git; must match the build that was flashed
 setup: real_agv_lifted
 dry_run: {str(a.dry_run).lower()}       # true = simulated motor, NOT a measurement
 config:

@@ -57,6 +57,7 @@ def plant_step(
 
     x   = np.asarray(x, dtype=float)
     tau = np.clip(np.asarray(tau, dtype=float), -params.tau_max, params.tau_max)
+    tau = tau * getattr(params, 'motor_polarity', 1.0)   # motor wiring polarity
 
     omega = x[6:10].copy()   # current wheel speeds
 

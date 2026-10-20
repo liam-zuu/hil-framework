@@ -71,6 +71,11 @@ class MecanumParams:
         self.b_w       = 0.002    # viscous friction [N·m·s/rad]
         self.tau_max   = 0.5      # max torque per wheel [N·m]
         self.omega_max = 34.56    # max wheel speed [rad/s]
+        # Motor wiring polarity per wheel [FL, FR, RL, RR]: sign of the real wheel
+        # rotation for a positive command torque. Models motors wired in reverse on
+        # the real AGV (spec S01 trial 20/10/2026: FL turns backward on +PWM).
+        # Keep +1 until S01 run01 fixes the values together with ESP32 motor_dir.
+        self.motor_polarity   = np.array([1.0, 1.0, 1.0, 1.0])
         self.g         = 9.81     # gravity [m/s²]
 
         # ── Encoder parameters ───────────────────────────────────────────

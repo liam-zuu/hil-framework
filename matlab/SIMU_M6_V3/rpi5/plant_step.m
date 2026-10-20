@@ -37,6 +37,9 @@ function x_new = plant_step(x, tau, params, dt)
     omega = x(7:10);  % wheel speeds [4x1]
 
     % --- Wheel slip model (M6) ---
+    if isfield(params, 'motor_polarity')
+        tau = tau .* params.motor_polarity(:);   % motor wiring polarity
+    end
     tau_eff = tau;  % default: full traction
 
     if isfield(params, 'slip') && params.slip.enabled
