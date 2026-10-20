@@ -276,9 +276,9 @@ Bước 4: Integration test H7 + RPi5
 
 **Encoder pulse format:**
 - Quadrature encoder: 2 kênh A và B, lệch pha 90°
-- PPR = 1024 → 4096 counts/rev (quadrature)
-- Frequency = ω × 1024 / (2π) pulses/second
-- Ở ω = 34.56 rad/s (max): f = 5632 Hz → TIM period = 177µs
+- PPR = 330 xung/kênh/vòng trục ra (motor GB37-520: encoder 11 xung × hộp số 30:1) → 1320 counts/rev khi đếm 4× (khớp `ENC_PPR 330u` của H7 và `PPR 1320` của ESP32). *(Sửa 20/10/2026; bản cũ ghi 1024 → 4096.)*
+- Frequency = ω × 330 / (2π) pulses/second trên mỗi kênh
+- Ở ω = 34.56 rad/s (max): f ≈ 1815 Hz → chu kỳ ≈ 551 µs
 
 **IMU packet format (phải khớp với ESP32):**
 ```c
