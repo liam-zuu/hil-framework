@@ -14,6 +14,14 @@ function [m_pid, m_adrc] = run_scenario(scenario_name, spec, params, T_sim, seed
 %
 % Outputs:
 %   m_pid, m_adrc : metrics structs (also saved to results/)
+%
+% Multi-seed override: if getappdata(0,'M6_RUN_OVERRIDE') holds a struct
+% with .seed and .out_dir (set by run_multiseed.m), that seed replaces the
+% scenario's own seed and only small metric files go to .out_dir.
+% results/ is not touched in that mode.
+
+    ov = getappdata(0, 'M6_RUN_OVERRIDE');
+    if ~isempty(ov), seed = ov.seed; end
 
     fprintf('\n========================================\n');
     fprintf('Scenario: %s\n', scenario_name);
@@ -56,6 +64,15 @@ function [m_pid, m_adrc] = run_scenario(scenario_name, spec, params, T_sim, seed
     t_start = tic;
     [m_adrc, log_adrc] = run_single_scenario_v2('adrc', traj, params, seed);
     fprintf('done (%.1fs)\n', toc(t_start));
+
+    %% Multi-seed mode (run_multiseed.m): save small metrics only, skip plots/.mat
+    if ~isempty(ov)
+        v2_pid  = rmfield(metrics_compute_v2(log_pid,  traj, params), 'ts');
+        v2_adrc = rmfield(metrics_compute_v2(log_adrc, traj, params), 'ts');
+        save(fullfile(ov.out_dir, sprintf('%s_seed%03d.mat', scenario_name, seed)), ...
+             'm_pid', 'm_adrc', 'v2_pid', 'v2_adrc', 'seed', 'spec', 'T_sim');
+        return;
+    end
 
     %% Plot
     fig = plot_comparison(log_pid, log_adrc, traj, m_pid, m_adrc, scenario_name);
