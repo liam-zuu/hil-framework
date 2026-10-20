@@ -78,5 +78,5 @@ function cfg = nightmare_config()
         'random_sigma', 0.04);
 
     % PPR degradation (applied from t=0, see limitation)
-    cfg.enc_ppr_override = 512;   % drop from 1024
+    cfg.enc_ppr_override = 512;   % drop from nominal 1320
 end

@@ -1,7 +1,7 @@
 %% RUN_M6_DISTURBANCE  M6 — Disturbance & Robustness: Multi-trial comparison (v3).
 %
 % Changes from v2:
-%   - Encoder noise sweep → Encoder PPR sweep (1024→512→256→128)
+%   - Encoder noise sweep → Encoder PPR sweep (1320 nominal→512→256→128)
 %     Reason: additive noise sigma had no effect due to round() in pulse_gen.
 %     Reducing PPR reduces counts/step, creating real quantization degradation.
 %   - Load disturbance magnitude increased 3-5×:
@@ -40,8 +40,8 @@ ci=ci+1; cond(ci).name = 'Wheel slip';
 cond(ci).setup = @(p) setfields(p, 'slip.enabled', true, 'disturbance.enabled', false);
 
 % --- 3-5. Encoder PPR sweep (quantization degradation) ---
-% Nominal PPR=1024. At omega=10 rad/s, dt=0.001:
-%   PPR 1024: 1.63 counts/step (ok)
+% Nominal enc_ppr=1320 (counts/rev, 4x; was 1024 before 2026-10-20). At omega=10 rad/s, dt=0.001:
+%   PPR 1320: 2.10 counts/step (ok)
 %   PPR 512:  0.81 counts/step (borderline)
 %   PPR 256:  0.41 counts/step (very coarse)
 %   PPR 128:  0.20 counts/step (extreme)
@@ -114,7 +114,7 @@ fprintf('  T_sim=%.0fs, dt=%.4fs, Seeds=%s\n', ...
 fprintf('  Total runs: %d conditions × %d ctrl × %d traj × %d trials = %d\n', ...
         n_cond, n_ctrl, n_traj, N_TRIALS, n_cond*n_ctrl*n_traj*N_TRIALS);
 fprintf('  Changes from v2:\n');
-fprintf('    - Encoder noise sweep → PPR sweep (1024/512/256/128)\n');
+fprintf('    - Encoder noise sweep → PPR sweep (1320/512/256/128)\n');
 fprintf('    - Load disturbance: step 0.15, ramp 0.05/s, random sigma=0.10\n');
 fprintf('    - Worst case: slip + PPR 256 + combined load\n');
 fprintf('====================================================================\n\n');

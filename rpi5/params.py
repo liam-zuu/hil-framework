@@ -74,7 +74,7 @@ class MecanumParams:
         self.g         = 9.81     # gravity [m/s²]
 
         # ── Encoder parameters ───────────────────────────────────────────
-        self.enc_ppr          = 1024    # pulses per revolution
+        self.enc_ppr          = 1320    # counts/rev, 4x (GB37-520: 11 PPR x 30:1 = 330/ch; x4). Not used by HIL path: H7 ENC_PPR=330 generates pulses
         self.enc_noise_sigma  = 0.02    # Gaussian noise σ on counts
         self.enc_filter_tau   = 0.005   # IIR filter τ [s]
 

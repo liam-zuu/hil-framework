@@ -155,9 +155,9 @@ hold off;
 %% ═══════════════════════════════════════════════════════════════════════════
 %%  FIG 3 — Encoder PPR degradation curve
 %% ═══════════════════════════════════════════════════════════════════════════
-% Conditions: 1=Nominal(PPR1024), 3=PPR512, 4=PPR256, 5=PPR128
+% Conditions: 1=Nominal(PPR1320), 3=PPR512, 4=PPR256, 5=PPR128
 ppr_idx    = [1, 3, 4, 5];
-ppr_values = [1024, 512, 256, 128];
+ppr_values = [1320, 512, 256, 128];
 
 figure('Name','M6 — Encoder PPR Degradation','NumberTitle','off', ...
        'Color','w','Position',[150 150 700 450]);
@@ -181,7 +181,7 @@ end
 ax3.XDir = 'reverse';   % high PPR on left = better hardware on left
 ax3.XScale = 'log';
 ax3.XTick = ppr_values;
-ax3.XTickLabel = {'1024 (nom)','512','256','128'};
+ax3.XTickLabel = {'1320 (nom)','512','256','128'};
 ax3.FontSize = 10;
 ax3.XLabel.String = 'Encoder PPR';
 ax3.YLabel.String = 'SS Position Error (mm)';

@@ -24,7 +24,7 @@ function params = params_mecanum()
     params.deadband  = 0.02;  % PWM deadband fraction [ASSUMPTION]
 
     %% --- Encoder ---
-    params.enc_ppr     = 1024;  % Pulses per revolution
+    params.enc_ppr     = 1320;  % Counts per wheel revolution, 4x decoding [from spec: GB37-520, 11 PPR x 30:1 = 330 pulses/ch/rev; x4 = 1320; matches H7 ENC_PPR=330 and ESP32 PPR=1320] (was 1024 until 2026-10-20)
     params.enc_noise_sigma = 0.02; % Encoder noise std dev (fraction of 1 pulse)
     params.enc_filter_tau  = 0.005; % Encoder reader low-pass filter time constant (s)
 
