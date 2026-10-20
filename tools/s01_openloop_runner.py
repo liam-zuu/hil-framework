@@ -274,6 +274,10 @@ def main():
     if esp['dirty'] and not a.dry_run:
         print('  WARNING: AGV_FIRMWARE has uncommitted changes: this run cannot be a main result (03_CODE/CLAUDE.md).')
     raw_dir = os.path.join(a.out, 'raw')
+    if os.path.exists(os.path.join(a.out, 'runs.csv')) or (os.path.isdir(raw_dir) and os.listdir(raw_dir)):
+        sys.exit(f'{a.out} already holds data. Raw data must never be overwritten:
+'
+                 f'use a new folder, e.g. ..._run02 (redoing one wheel: new folder + --wheels N).')
     os.makedirs(raw_dir, exist_ok=True)
     plan = build_plan(a.wheels, a.reps, a.quick, a.seed)
     with open(os.path.join(a.out, 'plan.csv'), 'w', newline='') as f:
@@ -285,11 +289,9 @@ def main():
     runs_path = os.path.join(a.out, 'runs.csv')
     fields = ['run_id', 'wheel', 'scenario', 'pwm_level', 'direction', 'rep', 'v_batt_start', 'v_batt_end',
               'file', 'order', 'n_samples', 'aborted', 'reason', 'missing_pct', 'steady_ok', 'omega_ss_rad_s', 'block_ok']
-    new = not os.path.exists(runs_path)
-    fruns = open(runs_path, 'a', newline='')
+    fruns = open(runs_path, 'w', newline='')
     wr = csv.DictWriter(fruns, fieldnames=fields)
-    if new:
-        wr.writeheader()
+    wr.writeheader()
 
     try:
         for w in a.wheels:
