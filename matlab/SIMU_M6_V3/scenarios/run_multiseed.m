@@ -12,8 +12,12 @@ function T = run_multiseed(seeds, out_dir, scenarios)
 
     scenario_setup_paths();
     if nargin < 3 || isempty(scenarios)
-        d = dir(fullfile(fileparts(mfilename('fullpath')), 's[0-9][0-9]_*.m'));
-        scenarios = sort(erase({d.name}, '.m'));
+        d = dir(fullfile(fileparts(mfilename('fullpath')), 's*_*.m'));   % dir() has no [0-9] class
+        scenarios = erase({d.name}, '.m');
+        scenarios = sort(scenarios(~cellfun(@isempty, regexp(scenarios, '^s\d\d_', 'once'))));
+    end
+    if isempty(scenarios)
+        error('run_multiseed: no scenario files found');
     end
     raw_dir = fullfile(out_dir, 'raw');
     if ~exist(raw_dir, 'dir'), mkdir(raw_dir); end
