@@ -39,7 +39,8 @@ function S = analyze_multiseed(out_dir)
     tl = tiledlayout(fig, 1, size(mets, 1), 'TileSpacing', 'compact', 'Padding', 'compact');
     title(tl, sprintf('ADRC relative to PID, paired over %d seeds (mean and 95%% CI)', S.n_seeds(1)), ...
         'FontWeight', 'bold', 'Color', INK);
-    subtitle(tl, 'left of 0 = ADRC lower (better); right of 0 = PID better', 'Color', INK);
+    subtitle(tl, {'left of 0 = ADRC lower (better); right of 0 = PID better', ...
+        'orange: 95% CI entirely below 0 (ADRC better)   blue: entirely above 0 (PID better)   gray: CI contains 0 (no clear difference)'}, 'Color', INK);
     y = (1:numel(scen))';
     isFault = cellfun(@(s) sscanf(s, 's%d') >= 11, scen);
     y(isFault) = y(isFault) + 0.8;
@@ -67,8 +68,6 @@ function S = analyze_multiseed(out_dir)
                 'FontSize', 8, 'HorizontalAlignment', 'left', 'Clipping', 'off');
         end
     end
-    annotation(fig, 'textbox', [0.01 0.005 0.98 0.04], 'EdgeColor', 'none', 'Color', INK, 'FontSize', 9, ...
-        'String', 'Orange: 95% CI entirely below 0 (ADRC better).  Blue: entirely above 0 (PID better).  Gray: CI contains 0 (no clear difference).');
     exportgraphics(fig, fullfile(out_dir, 'multiseed_forest.png'), 'Resolution', 150);
     close(fig);
 end
