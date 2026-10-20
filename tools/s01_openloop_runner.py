@@ -325,7 +325,7 @@ config:
   counts_per_rev: {COUNTS_PER_REV}
   motor_driver: "BTS7960 (IBT-2), EN shared on GPIO45, PWM 20 kHz"
   pwm_sign: "pwm_cmd > 0 = physical RPWM high, LPWM pulsed (motor.c swaps pins); off-phase = brake"
-  wheel_direction_at_positive_pwm: {FL: null, FR: null, RL: null, RR: null}   # edit after trial run: forward/backward, and count sign
+  wheel_direction_at_positive_pwm: {{FL: null, FR: null, RL: null, RR: null}}   # edit after trial run: forward/backward, and count sign
   motor_resistance_ohm: null   # edit later: R at driver OUT terminals, all readings + probe offset (see S01 guide)
 files:
   - runs.csv: "one row per run; v_batt in V; steady_ok = omega spread < 2% in last 0.5 s of hold"
