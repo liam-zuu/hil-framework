@@ -275,8 +275,7 @@ def main():
         print('  WARNING: AGV_FIRMWARE has uncommitted changes: this run cannot be a main result (03_CODE/CLAUDE.md).')
     raw_dir = os.path.join(a.out, 'raw')
     if os.path.exists(os.path.join(a.out, 'runs.csv')) or (os.path.isdir(raw_dir) and os.listdir(raw_dir)):
-        sys.exit(f'{a.out} already holds data. Raw data must never be overwritten:
-'
+        sys.exit(f'{a.out} already holds data. Raw data must never be overwritten: '
                  f'use a new folder, e.g. ..._run02 (redoing one wheel: new folder + --wheels N).')
     os.makedirs(raw_dir, exist_ok=True)
     plan = build_plan(a.wheels, a.reps, a.quick, a.seed)
