@@ -31,7 +31,10 @@ COLUMNS = [
     "ax", "ay", "az",
     "gx", "gy", "gz",
     "yaw", "pitch", "roll",
+    # AGV_MECANUM vel_ctrl metric counters (spec S02): tick, cumulative |dpwm|, saturated ticks
+    "tick", "dpwm_fl", "dpwm_fr", "dpwm_rl", "dpwm_rr", "sat_fl", "sat_fr", "sat_rl", "sat_rr",
 ]
+N_OLD = 28      # firmware before the counters: same columns without the last 9
 
 # ─────────────────────────────────────────
 # Main
@@ -84,6 +87,8 @@ def main():
 
             # Parse và validate
             fields = line.split(",")
+            if len(fields) == N_OLD:
+                fields += [""] * (len(COLUMNS) - N_OLD)
             if len(fields) != len(COLUMNS):
                 drop_count += 1
                 continue
