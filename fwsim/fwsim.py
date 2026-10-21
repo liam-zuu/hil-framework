@@ -56,11 +56,14 @@ class FirmwareSim:
         L.fwsim_reset.argtypes = [ctypes.c_int]
         L.fwsim_set_pid.argtypes = [ctypes.c_int] + [ctypes.c_float] * 5
         L.fwsim_get_pid.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_float)]
+        L.fwsim_set_ctrl_mode.argtypes = [ctypes.c_int]
+        L.fwsim_set_adrc.argtypes = [ctypes.c_int] + [ctypes.c_float] * 4
+        L.fwsim_get_adrc.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_float)]
         L.fwsim_tick.restype = ctypes.c_int
         L.fwsim_tick.argtypes = [ctypes.c_int64, ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_float),
                                  ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_float),
                                  ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_float)]
-        if L.fwsim_abi() != 1:
+        if L.fwsim_abi() != 2:
             sys.exit('fwsim.dll ABI mismatch: rebuild with build_fwsim.py')
         self._counts = (ctypes.c_int32 * 4)()
         self._sp = (ctypes.c_float * 3)()
@@ -77,6 +80,17 @@ class FirmwareSim:
 
     def reset(self, pcnt_mode='idf'):
         self.lib.fwsim_reset(PCNT_MODES[pcnt_mode])
+
+    def set_mode(self, mode):
+        self.lib.fwsim_set_ctrl_mode({'PID': 0, 'ADRC': 1}[mode])
+
+    def set_adrc(self, axis, omega_c, omega_o, b0, out_limit):
+        self.lib.fwsim_set_adrc(axis, omega_c, omega_o, b0, out_limit)
+
+    def get_adrc(self, axis):
+        out = (ctypes.c_float * 4)()
+        self.lib.fwsim_get_adrc(axis, out)
+        return dict(zip(['omega_c', 'omega_o', 'b0', 'out_limit'], [float(v) for v in out]))
 
     def set_pid(self, axis, kp, ki, kd, int_limit, out_limit):
         self.lib.fwsim_set_pid(axis, kp, ki, kd, int_limit, out_limit)
@@ -117,14 +131,20 @@ def make_setpoint(args):
 
 
 def simulate(fw, setpoint, duration, params=None, seed=0, sp_rate_hz=50.0, pcnt_mode='idf',
-             io_delay_ms=0, pid=None):
+             io_delay_ms=0, pid=None, mode=None, adrc=None):
     """Run one closed-loop simulation. Returns a dict of arrays sampled at the
-    firmware tick (100 Hz). pid: {axis: (kp, ki, kd, int_limit, out_limit)}."""
+    firmware tick (100 Hz). mode: 'PID' / 'ADRC' (None = firmware CTRL_MODE).
+    pid: {axis: (kp, ki, kd, int_limit, out_limit)};
+    adrc: {axis: (omega_c, omega_o, b0, out_limit)}; axis 0 vx, 1 vy, 2 wz."""
     p = params or MecanumParams()
     rng = np.random.default_rng(seed)
     fw.reset(pcnt_mode)
+    if mode:
+        fw.set_mode(mode)
     for axis, g in (pid or {}).items():
         fw.set_pid(axis, *g)
+    for axis, g in (adrc or {}).items():
+        fw.set_adrc(axis, *g)
 
     dt = 0.001
     n_plant = int(round(duration / dt))
@@ -227,6 +247,7 @@ def main():
     ap.add_argument('--sp-rate', type=float, default=50.0)
     ap.add_argument('--pcnt-mode', default='idf', choices=list(PCNT_MODES))
     ap.add_argument('--io-delay-ms', type=int, default=0)
+    ap.add_argument('--mode', choices=['PID', 'ADRC'], default=None, help='default: firmware CTRL_MODE')
     ap.add_argument('--out')
     a = ap.parse_args()
     sp = make_setpoint(a)
@@ -234,7 +255,7 @@ def main():
     fw = FirmwareSim()
     params = MecanumParams()
     t0 = time.time()
-    log = simulate(fw, sp, duration, params, a.seed, a.sp_rate, a.pcnt_mode, a.io_delay_ms)
+    log = simulate(fw, sp, duration, params, a.seed, a.sp_rate, a.pcnt_mode, a.io_delay_ms, mode=a.mode)
     met = metrics(log)
     print(f'{duration:.1f} s simulated in {time.time() - t0:.1f} s, controller {fw.ctrl_mode}')
     for k, v in met.items():

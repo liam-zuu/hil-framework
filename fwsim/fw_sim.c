@@ -1,7 +1,7 @@
 /* fw_sim.c: PC entry points around the ESP32 firmware (AGV_MECANUM).
  *
  * The DLL is built from the firmware's own encoder.c, motor.c, kinematics.c,
- * pid.c, vel_ctrl.c (unchanged) plus the shim in shim/. Only the scheduling
+ * pid.c, adrc.c, vel_ctrl.c (unchanged) plus the shim in shim/. Only the scheduling
  * glue of main.c is repeated here, because main.c needs FreeRTOS:
  *   encoder_task: encoder_get_rpm() and encoder_get_count() for every wheel,
  *   control_task: dt_actual from esp_timer, vel_ctrl_step(), motor_set() x 4.
@@ -16,7 +16,7 @@
 #include "vel_ctrl.h"
 
 #define FWSIM_API __declspec(dllexport)
-#define FWSIM_ABI 1
+#define FWSIM_ABI 2
 
 static const int rpwm_gpio[4] = { FL_RPWM, FR_RPWM, RL_RPWM, RR_RPWM };
 static const int lpwm_gpio[4] = { FL_LPWM, FR_LPWM, RL_LPWM, RR_LPWM };
@@ -24,7 +24,8 @@ static int64_t t_prev;
 static int32_t count_in[4];
 
 FWSIM_API int fwsim_abi(void) { return FWSIM_ABI; }
-FWSIM_API int fwsim_ctrl_mode(void) { return CTRL_MODE; }
+FWSIM_API int  fwsim_ctrl_mode(void) { return vel_ctrl_mode(); }
+FWSIM_API void fwsim_set_ctrl_mode(int mode) { vel_ctrl_set_mode(mode); }
 
 /* Boot: what app_main + control_task do before the first control tick. */
 FWSIM_API void fwsim_reset(int pcnt_mode) {
@@ -51,6 +52,21 @@ FWSIM_API void fwsim_get_pid(int axis, float out[5]) {
     pid_controller_t *c = vel_ctrl_pid();
     pid_t *p = axis == 0 ? &c->vx : axis == 1 ? &c->vy : &c->wz;
     out[0] = p->kp; out[1] = p->ki; out[2] = p->kd; out[3] = p->integral_limit; out[4] = p->output_limit;
+}
+
+static adrc_axis_t *adrc_axis(int axis) {
+    adrc_controller_t *c = vel_ctrl_adrc();
+    return axis == 0 ? &c->vx : axis == 1 ? &c->vy : &c->wz;
+}
+
+FWSIM_API void fwsim_set_adrc(int axis, float omega_c, float omega_o, float b0, float out_limit) {
+    adrc_set_params(adrc_axis(axis), omega_c, omega_o, b0, out_limit);
+}
+
+/* out: omega_c (= kp), omega_o (= beta1 / 2), b0, out_limit */
+FWSIM_API void fwsim_get_adrc(int axis, float out[4]) {
+    adrc_axis_t *a = adrc_axis(axis);
+    out[0] = a->kp; out[1] = a->eso.beta1 / 2.0f; out[2] = a->eso.b0; out[3] = a->output_limit;
 }
 
 /* One 10 ms tick at time t_us.

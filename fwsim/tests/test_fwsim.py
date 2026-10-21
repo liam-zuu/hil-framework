@@ -72,3 +72,27 @@ def test_pcnt_limit_spike(fw):
     w16 = fwsim.simulate(fw, sp, 9.0, pcnt_mode='wrap16')
     assert np.max(np.abs(idf['v_fw'][:, 0] - idf['sp'][:, 0])) > 10.0
     assert np.max(np.abs(w16['v_fw'][100:, 0] - w16['sp'][100:, 0])) < 0.5
+
+
+def test_adrc_defaults_match_adrc_c(fw):
+    fw.reset()
+    assert fw.get_adrc(0) == pytest.approx(dict(omega_c=8.0, omega_o=30.0, b0=5.9, out_limit=1.6))
+    assert fw.get_adrc(2) == pytest.approx(dict(omega_c=8.0, omega_o=30.0, b0=10.0, out_limit=6.5))
+
+
+def test_adrc_no_steady_error(fw):
+    """LADRC (body-velocity level, b0 from S01) removes the steady error PID leaves at low speed."""
+    for v in (0.1, 0.3):
+        log = fwsim.simulate(fw, const(vx=v), 4.0, mode='ADRC')
+        late = log['t'] > 3.0
+        assert np.mean(log['v_true'][late, 0]) == pytest.approx(v, abs=0.005)
+        assert np.max(log['v_true'][:, 0]) < 1.1 * v
+    log = fwsim.simulate(fw, const(wz=1.0), 4.0, mode='ADRC')
+    assert np.mean(log['v_true'][log['t'] > 3.0, 2]) == pytest.approx(1.0, abs=0.02)
+
+
+def test_mode_switch(fw):
+    a = fwsim.simulate(fw, const(vx=0.3), 1.0, mode='PID')
+    b = fwsim.simulate(fw, const(vx=0.3), 1.0, mode='ADRC')
+    assert fw.ctrl_mode == 'ADRC'
+    assert not np.allclose(a['duty'], b['duty'])

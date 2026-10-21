@@ -5,7 +5,7 @@ Windows DLL for the PC simulation (fwsim.py).
   python fwsim/build_fwsim.py [--fw ../AGV_FIRMWARE] [--gcc gcc]
 
 Firmware files compiled unchanged: encoder.c, motor.c, kinematics.c, pid.c,
-vel_ctrl.c. ESP-IDF calls are served by shim/. Output: fwsim/build/fwsim.dll and
+adrc.c, vel_ctrl.c. ESP-IDF calls are served by shim/. Output: fwsim/build/fwsim.dll and
 fwsim/build/fwsim_build.json (firmware commit, dirty state, compiler), which
 fwsim.py copies into every run's meta.yaml.
 """
@@ -17,7 +17,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FW_SOURCES = ['encoder/encoder.c', 'motor/motor.c', 'kinematics/kinematics.c',
-              'controller/pid.c', 'controller/vel_ctrl.c']
+              'controller/pid.c', 'controller/adrc.c', 'controller/vel_ctrl.c']
 FW_INCLUDES = ['motor', 'encoder', 'kinematics', 'controller']
 
 
