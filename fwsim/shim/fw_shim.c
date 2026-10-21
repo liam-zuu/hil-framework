@@ -18,7 +18,7 @@ esp_err_t gpio_set_level(int n, uint32_t level) { if (n >= 0 && n < FW_GPIO_MAX)
 uint32_t fw_gpio_level(int n) { return (n >= 0 && n < FW_GPIO_MAX) ? gpio_level[n] : 0; }
 
 /* ── PCNT ─────────────────────────────────────────────────────────────── */
-struct fw_pcnt_unit { int low, high, raw; };
+struct fw_pcnt_unit { int low, high, raw, accum, accum_flag, watch_low, watch_high; };
 struct fw_pcnt_chan { int dummy; };
 static struct fw_pcnt_unit units[FW_PCNT_MAX];
 static struct fw_pcnt_chan chans[2 * FW_PCNT_MAX];
@@ -28,7 +28,8 @@ int fw_pcnt_mode = FW_PCNT_IDF;
 esp_err_t pcnt_new_unit(const pcnt_unit_config_t *cfg, pcnt_unit_handle_t *ret) {
     if (n_units >= FW_PCNT_MAX) return -1;
     struct fw_pcnt_unit *u = &units[n_units++];
-    u->low = cfg->low_limit; u->high = cfg->high_limit; u->raw = 0;
+    memset(u, 0, sizeof *u);
+    u->low = cfg->low_limit; u->high = cfg->high_limit; u->accum_flag = cfg->flags.accum_count;
     *ret = u; return 0;
 }
 esp_err_t pcnt_new_channel(pcnt_unit_handle_t u, const pcnt_chan_config_t *c, pcnt_channel_handle_t *ret) {
@@ -38,13 +39,18 @@ esp_err_t pcnt_channel_set_edge_action(pcnt_channel_handle_t c, pcnt_channel_edg
 esp_err_t pcnt_channel_set_level_action(pcnt_channel_handle_t c, pcnt_channel_level_action_t a, pcnt_channel_level_action_t b) { (void)c; (void)a; (void)b; return 0; }
 esp_err_t pcnt_unit_set_glitch_filter(pcnt_unit_handle_t u, const pcnt_glitch_filter_config_t *c) { (void)u; (void)c; return 0; }
 esp_err_t pcnt_unit_enable(pcnt_unit_handle_t u) { (void)u; return 0; }
-esp_err_t pcnt_unit_clear_count(pcnt_unit_handle_t u) { u->raw = 0; return 0; }
+esp_err_t pcnt_unit_clear_count(pcnt_unit_handle_t u) { u->raw = 0; u->accum = 0; return 0; }
 esp_err_t pcnt_unit_start(pcnt_unit_handle_t u) { (void)u; return 0; }
-esp_err_t pcnt_unit_get_count(pcnt_unit_handle_t u, int *v) { *v = u->raw; return 0; }
+esp_err_t pcnt_unit_get_count(pcnt_unit_handle_t u, int *v) { *v = u->raw + (u->accum_flag ? u->accum : 0); return 0; }
+esp_err_t pcnt_unit_add_watch_point(pcnt_unit_handle_t u, int w) {
+    if (w == u->high) u->watch_high = 1; else if (w == u->low) u->watch_low = 1;
+    return 0;
+}
 
 /* Advance unit i by delta counts. FW_PCNT_IDF: the hardware counter is reset to
- * zero when it reaches high_limit or low_limit (ESP-IDF PCNT behaviour without
- * the accum_count flag). FW_PCNT_WRAP16: plain int16 wrap-around. */
+ * zero when it reaches high_limit or low_limit (ESP-IDF 5.5.3 pulse_cnt.c); with
+ * flags.accum_count and the limit registered as a watch point, the driver's ISR
+ * adds the limit to accum_value. FW_PCNT_WRAP16: plain int16 wrap-around. */
 void fw_pcnt_add(int i, int delta) {
     if (i < 0 || i >= n_units) return;
     struct fw_pcnt_unit *u = &units[i];
@@ -53,8 +59,8 @@ void fw_pcnt_add(int i, int delta) {
         return;
     }
     u->raw += delta;
-    while (u->raw >= u->high) u->raw -= u->high;
-    while (u->raw <= u->low)  u->raw -= u->low;
+    while (u->raw >= u->high) { u->raw -= u->high; if (u->watch_high) u->accum += u->high; }
+    while (u->raw <= u->low)  { u->raw -= u->low;  if (u->watch_low)  u->accum += u->low; }
 }
 
 /* ── MCPWM ────────────────────────────────────────────────────────────── */

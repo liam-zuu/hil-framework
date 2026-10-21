@@ -1,6 +1,7 @@
 /* fwsim shim: only what motor.c / encoder.c use. gpio_set_level() is recorded (motor EN). */
 #pragma once
 #include <stdint.h>
+#include <stdbool.h>
 typedef enum { GPIO_MODE_DISABLE = 0, GPIO_MODE_INPUT, GPIO_MODE_OUTPUT } gpio_mode_t;
 typedef enum { GPIO_PULLUP_DISABLE = 0, GPIO_PULLUP_ENABLE } gpio_pullup_t;
 typedef enum { GPIO_PULLDOWN_DISABLE = 0, GPIO_PULLDOWN_ENABLE } gpio_pulldown_t;

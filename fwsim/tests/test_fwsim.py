@@ -62,16 +62,14 @@ def test_pid_gain_change_takes_effect(fw):
     assert fw.get_pid(0)['kp'] == pytest.approx(1.5)      # reset restores pid.c defaults
 
 
-def test_pcnt_limit_spike(fw):
-    """ESP-IDF PCNT resets to 0 at high_limit (32767); encoder.c corrects as if it
-    wrapped by 65536, so one tick reads a huge speed. Seen in the real log
-    05_DATA/AGV_real_logs/2026-06-10/2026-06-10_210603_AGV_log.csv (count 32716 -> 41).
-    Plain int16 wrap (what encoder.c assumes) gives no spike."""
-    sp = const(vx=1.0)     # ~20.6 rad/s: 32767 counts after ~7.6 s
-    idf = fwsim.simulate(fw, sp, 9.0, pcnt_mode='idf')
-    w16 = fwsim.simulate(fw, sp, 9.0, pcnt_mode='wrap16')
-    assert np.max(np.abs(idf['v_fw'][:, 0] - idf['sp'][:, 0])) > 10.0
-    assert np.max(np.abs(w16['v_fw'][100:, 0] - w16['sp'][100:, 0])) < 0.5
+def test_pcnt_limit_no_spike(fw):
+    """ESP-IDF PCNT resets to 0 at high/low limit. Before 21/10 encoder.c corrected
+    as if it wrapped by 65536, so one tick read a huge speed (real log
+    05_DATA/AGV_real_logs/2026-06-10/2026-06-10_210603_AGV_log.csv: count 32716 -> 41).
+    Now accum_count + limit watch points: no spike in either direction."""
+    for v in (1.0, -1.0):          # ~20.6 rad/s: 32767 counts after ~7.6 s
+        log = fwsim.simulate(fw, const(vx=v), 9.0, pcnt_mode='idf')
+        assert np.max(np.abs(log['v_fw'][100:, 0] - log['sp'][100:, 0])) < 0.5
 
 
 def test_adrc_defaults_match_adrc_c(fw):
