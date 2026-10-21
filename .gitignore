@@ -9,3 +9,6 @@ stm32h7/Release/
 # Python
 __pycache__/
 *.pyc
+
+# fwsim DLL build output (rebuild with python fwsim/build_fwsim.py)
+fwsim/build/
