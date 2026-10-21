@@ -3,7 +3,14 @@ import math
 import pytest
 import numpy as np
 import random
-from params import PARAMS
+from params import MecanumParams
+
+# These tests describe the legacy M6 torque-input model (motor_model='torque',
+# polarity +1). The DC motor model has its own tests in test_motor_dc.py.
+PARAMS = MecanumParams()
+PARAMS.motor_model = 'torque'
+PARAMS.motor_polarity = np.ones(4)
+PARAMS.update_physical()
 from plant_step import plant_step
 from mecanum_plant import MecanumPlant
 

@@ -72,10 +72,35 @@ class MecanumParams:
         self.tau_max   = 0.5      # max torque per wheel [N·m]
         self.omega_max = 34.56    # max wheel speed [rad/s]
         # Motor wiring polarity per wheel [FL, FR, RL, RR]: sign of the real wheel
-        # rotation for a positive command torque. Models motors wired in reverse on
-        # the real AGV (spec S01 trial 20/10/2026: FL turns backward on +PWM).
-        # Keep +1 until S01 run01 fixes the values together with ESP32 motor_dir.
-        self.motor_polarity   = np.array([1.0, 1.0, 1.0, 1.0])
+        # rotation for a positive command (duty as H7 reads it: rpwm - lpwm).
+        # S01 run01 (05_DATA/results/S01/2026-10-20_run01, 20/10/2026): all four
+        # wheels turn backward for +PWM with ESP32 motor_dir = +1, so -1 here and
+        # ESP32 motor_dir = -1 (motor.c). Not yet checked on the HIL bench (wiring
+        # ESP32 -> H7): if the closed loop runs away on HIL, flip this sign.
+        self.motor_polarity   = np.array([-1.0, -1.0, -1.0, -1.0])
+
+        # ── Motor model ──────────────────────────────────────────────────
+        # 'dc'    : command = PWM duty u in [-1, 1] (what H7 sends in the SPI
+        #           torque field). Brushed DC motor + gearbox at the wheel shaft:
+        #             tau_m = (K/R) * (V * u_eff - K * omega),
+        #             u_eff = sign(u) * max(|u| - u0, 0)
+        #           friction  b*omega + Tc*sign(omega), static breakaway Ts.
+        # 'torque': legacy M6 model, command = torque [N.m], viscous b_w only.
+        # Values: spec S01 run01 identification, direction-averaged
+        # (05_DATA/results/S01/2026-10-20_run01/identification/plant_params_from_S01.csv,
+        # script matlab/identification/s01_derive_plant_params.py). R measured at the
+        # driver terminals with a multimeter, about +-15-25 % uncertain; J and b scale with 1/R.
+        self.motor_model  = 'dc'
+        self.motor_K      = np.array([0.30394, 0.32210, 0.30917, 0.28811])   # [V.s/rad] = [N.m/A]
+        self.motor_R      = np.array([3.31, 3.38, 3.73, 3.95])               # [ohm]
+        self.motor_u0     = np.array([0.05223, 0.03170, 0.03574, 0.05413])   # duty offset (brush drop etc.)
+        self.motor_Tc     = np.array([0.02394, 0.02738, 0.02347, 0.02433])   # Coulomb friction [N.m]
+        self.motor_Ts     = np.array([0.11878, 0.14760, 0.10489, 0.08129])   # static breakaway torque [N.m]
+        self.motor_b      = np.array([0.00062, 0.00081, 0.00074, 0.00175])   # viscous [N.m.s/rad]
+        self.J_wheels     = np.array([0.00209, 0.00236, 0.00204, 0.00249])   # wheel+gear+rotor [kg.m^2]
+        self.V_batt       = 12.4      # [V] (S01 run01 mean 12.435 V)
+        self.motor_enable = 1.0       # 1 = driver enabled; 0 = EN low, motor open (free coast)
+        self.wheels_lifted = False    # True: wheels off the ground, no body coupling (S01 bench)
         self.g         = 9.81     # gravity [m/s²]
 
         # ── Encoder parameters ───────────────────────────────────────────
@@ -153,7 +178,12 @@ class MecanumParams:
         #   M_eff = H_fwd.T @ diag(M, M, Iz) @ H_fwd + J_w * I₄
         # Off-diagonal coupling ≈ 29% of diagonal (body mass via kinematics)
         M_body = np.diag([self.M, self.M, self.Iz])
-        self.M_eff     = self.H_fwd.T @ M_body @ self.H_fwd + self.J_w * np.eye(4)
+        J_diag = (np.diag(self.J_wheels) if getattr(self, 'motor_model', 'torque') == 'dc'
+                  else self.J_w * np.eye(4))
+        if getattr(self, 'wheels_lifted', False):
+            self.M_eff = J_diag                      # wheels in the air: no body coupling
+        else:
+            self.M_eff = self.H_fwd.T @ M_body @ self.H_fwd + J_diag
         self.M_eff_inv = np.linalg.inv(self.M_eff)
 
         # ADRC b0 = 1 / J_eff (effective inertia in forward mode)

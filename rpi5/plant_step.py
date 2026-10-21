@@ -43,7 +43,9 @@ def plant_step(
 
     Args:
         x:      State vector (10,), will be copied (not mutated).
-        tau:    Wheel torques (4,) [N·m]. Clipped to ±tau_max internally.
+        tau:    Wheel command (4,). params.motor_model 'dc': PWM duty in [-1, 1]
+                (H7 sends duty in the SPI torque field). 'torque': torque [N·m],
+                clipped to ±tau_max.
         params: MecanumParams instance. Defaults to module singleton.
         dt:     Timestep [s]. Must match HIL loop period.
         rng:    numpy Generator for wheel slip randomness.
@@ -55,20 +57,30 @@ def plant_step(
     if rng is None:
         rng = _DEFAULT_RNG
 
-    x   = np.asarray(x, dtype=float)
-    tau = np.clip(np.asarray(tau, dtype=float), -params.tau_max, params.tau_max)
-    tau = tau * getattr(params, 'motor_polarity', 1.0)   # motor wiring polarity
-
+    x     = np.asarray(x, dtype=float)
     omega = x[6:10].copy()   # current wheel speeds
 
-    # ── 1. Effective torque (with optional slip) ──────────────────────────
-    tau_eff = _apply_slip(tau, omega, params, rng) if params.slip.enabled else tau
+    if getattr(params, 'motor_model', 'torque') == 'dc':
+        omega_new = _dc_wheel_step(omega, np.asarray(tau, dtype=float), params, rng, dt)
+    else:
+        tau = np.clip(np.asarray(tau, dtype=float), -params.tau_max, params.tau_max)
+        tau = tau * getattr(params, 'motor_polarity', 1.0)   # motor wiring polarity
 
-    # ── 2. Wheel dynamics: M_eff × dω/dt = τ_eff − b_w × ω ──────────────
-    d_omega = params.M_eff_inv @ (tau_eff - params.b_w * omega)
+        # ── 1. Effective torque (with optional slip) ──────────────────────
+        tau_eff = _apply_slip(tau, omega, params, rng) if params.slip.enabled else tau
 
-    # Semi-implicit: update omega first
-    omega_new = np.clip(omega + d_omega * dt, -params.omega_max, params.omega_max)
+        # ── 2. Wheel dynamics: M_eff × dω/dt = τ_eff − b_w × ω ──────────
+        d_omega = params.M_eff_inv @ (tau_eff - params.b_w * omega)
+
+        # Semi-implicit: update omega first
+        omega_new = np.clip(omega + d_omega * dt, -params.omega_max, params.omega_max)
+
+    if getattr(params, 'wheels_lifted', False):
+        # Wheels in the air: the body does not move.
+        x_new = x.copy()
+        x_new[3:6] = 0.0
+        x_new[6:10] = omega_new
+        return x_new
 
     # ── 3. Body velocities (no-slip kinematic constraint) ─────────────────
     v_body = params.H_fwd @ omega_new   # [vx_body, vy_body, wz]
@@ -93,6 +105,38 @@ def plant_step(
     x_new[6:10] = omega_new
 
     return x_new
+
+
+OMEGA_EPS = 1e-3   # [rad/s] below this a wheel counts as standing still
+
+
+def motor_torque(u, omega, params):
+    """DC motor torque at the wheel shaft for duty u (already polarity-corrected)."""
+    u = np.clip(u, -1.0, 1.0)
+    u_eff = np.sign(u) * np.maximum(np.abs(u) - params.motor_u0, 0.0)
+    tau = params.motor_K / params.motor_R * (params.V_batt * u_eff - params.motor_K * omega)
+    return tau * params.motor_enable      # EN = 0: open circuit, no torque, no braking
+
+
+def _dc_wheel_step(omega, u_cmd, params, rng, dt):
+    """One step of the 'dc' wheel model: DC motor, viscous + Coulomb + static friction."""
+    u = np.clip(u_cmd, -1.0, 1.0) * getattr(params, 'motor_polarity', 1.0)
+    tau_m = motor_torque(u, omega, params)
+    if params.slip.enabled and not getattr(params, 'wheels_lifted', False):
+        tau_m = _apply_slip(tau_m, omega, params, rng)
+
+    moving = np.abs(omega) > OMEGA_EPS
+    stuck = ~moving & (np.abs(tau_m) <= params.motor_Ts)       # static friction holds
+    tau_f = params.motor_b * omega + params.motor_Tc * np.sign(omega)
+    # Breaking away from rest: Coulomb opposes the drive torque
+    tau_f = np.where(~moving & ~stuck, params.motor_Tc * np.sign(tau_m), tau_f)
+    tau_net = np.where(stuck, 0.0, tau_m - tau_f)
+
+    omega_new = omega + (params.M_eff_inv @ tau_net) * dt
+    omega_new = np.where(stuck, 0.0, omega_new)
+    # Friction alone must not reverse a wheel within one step: stop it instead.
+    crossed = moving & (np.sign(omega_new) != np.sign(omega)) & (np.abs(tau_m) <= params.motor_Ts)
+    return np.where(crossed, 0.0, omega_new)
 
 
 def _apply_slip(
