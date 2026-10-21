@@ -16,14 +16,27 @@
 #include "vel_ctrl.h"
 
 #define FWSIM_API __declspec(dllexport)
-#define FWSIM_ABI 2
+#define FWSIM_ABI 3
 
 static const int rpwm_gpio[4] = { FL_RPWM, FR_RPWM, RL_RPWM, RR_RPWM };
 static const int lpwm_gpio[4] = { FL_LPWM, FR_LPWM, RL_LPWM, RR_LPWM };
 static int64_t t_prev;
 static int32_t count_in[4];
+static int32_t enc_count[4];        /* encoder_get_count() of the last tick */
+static vel_ctrl_out_t last_vc;      /* last vel_ctrl_step() output (metric counters) */
 
 FWSIM_API int fwsim_abi(void) { return FWSIM_ABI; }
+/* After a tick: encoder_get_count() per wheel and the vel_ctrl metric counters
+ * out[0] tick, out[1..4] dpwm_sum FL..RR, out[5..8] sat_ticks FL..RR (as logged by main.c). */
+FWSIM_API void fwsim_last(int32_t counts[4], uint32_t out[9]) {
+    out[0] = last_vc.tick;
+    for (int i = 0; i < 4; i++) {
+        counts[i] = enc_count[i];
+        out[1 + i] = last_vc.dpwm_sum[i];
+        out[5 + i] = last_vc.sat_ticks[i];
+    }
+}
+
 FWSIM_API int  fwsim_ctrl_mode(void) { return vel_ctrl_mode(); }
 FWSIM_API void fwsim_set_ctrl_mode(int mode) { vel_ctrl_set_mode(mode); }
 
@@ -86,7 +99,7 @@ FWSIM_API int fwsim_tick(int64_t t_us, const int32_t counts[4], const float sp[3
     float enc_rpm[4];
     for (int i = 0; i < ENC_COUNT; i++) {
         enc_rpm[i] = encoder_get_rpm((enc_id_t)i);
-        (void)encoder_get_count((enc_id_t)i);
+        enc_count[i] = encoder_get_count((enc_id_t)i);
     }
 
     /* control_task */
@@ -97,6 +110,7 @@ FWSIM_API int fwsim_tick(int64_t t_us, const int32_t counts[4], const float sp[3
 
     agv_velocity_t vel = { .vx = sp[0], .vy = sp[1], .wz = sp[2] };
     vel_ctrl_out_t vc = vel_ctrl_step(vel, enc_rpm, dt_actual);
+    last_vc = vc;
     for (int i = 0; i < 4; i++) motor_set((motor_id_t)i, vc.pwm[i]);
 
     for (int i = 0; i < 4; i++) {

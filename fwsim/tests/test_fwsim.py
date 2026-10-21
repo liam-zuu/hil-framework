@@ -94,3 +94,28 @@ def test_mode_switch(fw):
     b = fwsim.simulate(fw, const(vx=0.3), 1.0, mode='ADRC')
     assert fw.ctrl_mode == 'ADRC'
     assert not np.allclose(a['duty'], b['duty'])
+
+
+def test_s02_metrics_robust_to_dropped_lines(fw, tmp_path):
+    """Spec S02: PWM metrics come from the firmware's cumulative counters, so
+    dropping log lines changes missing_pct but not pwm_tv / sat_pct."""
+    import csv
+    sys.path.insert(0, os.path.join(fwsim.HERE, '..', 'tools'))
+    import s02_groupA_sim as g
+    import s02_metrics
+    from trajectory_pub import GROUP_A, get_body_velocity
+    spec = GROUP_A['A-L2']
+    log = fwsim.simulate(fw, lambda t: get_body_velocity(t, spec) if t < spec.duration else (0, 0, 0),
+                         spec.duration + 1.0, mode='ADRC')
+    rows = list(g.log_rows(log))
+    paths = []
+    for name, keep in (('full', rows), ('drop', [r for i, r in enumerate(rows) if i % 7 != 3])):
+        p = tmp_path / f'{name}.csv'
+        with open(p, 'w', newline='') as f:
+            w = csv.writer(f); w.writerow(g.COLUMNS); w.writerows(keep)
+        paths.append(p)
+    full, drop = (s02_metrics.compute(s02_metrics.load_log(p), 'A-L2') for p in paths)
+    assert full['missing_pct'] == pytest.approx(0.0)
+    assert drop['missing_pct'] == pytest.approx(100 / 7, abs=0.5)
+    assert drop['pwm_tv'] == pytest.approx(full['pwm_tv'], rel=0.02)
+    assert full['e_vx'] < 0.02

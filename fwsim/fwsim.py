@@ -63,7 +63,8 @@ class FirmwareSim:
         L.fwsim_tick.argtypes = [ctypes.c_int64, ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_float),
                                  ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_float),
                                  ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_float)]
-        if L.fwsim_abi() != 2:
+        L.fwsim_last.argtypes = [ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_uint32)]
+        if L.fwsim_abi() != 3:
             sys.exit('fwsim.dll ABI mismatch: rebuild with build_fwsim.py')
         self._counts = (ctypes.c_int32 * 4)()
         self._sp = (ctypes.c_float * 3)()
@@ -99,6 +100,13 @@ class FirmwareSim:
         out = (ctypes.c_float * 5)()
         self.lib.fwsim_get_pid(axis, out)
         return dict(zip(['kp', 'ki', 'kd', 'int_limit', 'out_limit'], [float(v) for v in out]))
+
+    def last(self):
+        """encoder_get_count() per wheel and the vel_ctrl counters of the last tick:
+        (counts[4], tick, dpwm_sum[4], sat_ticks[4])."""
+        c, o = (ctypes.c_int32 * 4)(), (ctypes.c_uint32 * 9)()
+        self.lib.fwsim_last(c, o)
+        return np.array(c[:]), o[0], np.array(o[1:5]), np.array(o[5:9])
 
     def tick(self, t_us, counts, sp):
         for i in range(4):
@@ -154,7 +162,8 @@ def simulate(fw, setpoint, duration, params=None, seed=0, sp_rate_hz=50.0, pcnt_
     duty_now = np.zeros(4)
     sp_period_us = int(round(1e6 / sp_rate_hz))
     sp_held, sp_next_us = (0.0, 0.0, 0.0), 0
-    log = {k: [] for k in ['t', 'sp', 'v_true', 'v_fw', 'duty', 'pwm', 'rpm', 'omega', 'pose', 'en']}
+    log = {k: [] for k in ['t', 'sp', 'v_true', 'v_fw', 'duty', 'pwm', 'rpm', 'omega', 'pose', 'en',
+                           'count', 'tick', 'dpwm', 'sat']}
 
     for k in range(n_plant + 1):
         t_us = k * 1000
@@ -170,6 +179,8 @@ def simulate(fw, setpoint, duration, params=None, seed=0, sp_rate_hz=50.0, pcnt_
             log['v_true'].append(p.H_fwd @ x[6:10]); log['duty'].append(duty); log['pwm'].append(pwm)
             log['rpm'].append(rpm); log['omega'].append(x[6:10].copy()); log['pose'].append(x[0:3].copy())
             log['en'].append(en)
+            cnt, tk, dp, sat = fw.last()
+            log['count'].append(cnt); log['tick'].append(tk); log['dpwm'].append(dp); log['sat'].append(sat)
         if k == n_plant:
             break
         duty_q = duty_q[1:] + [duty_now]
