@@ -57,8 +57,14 @@ function params = params_mecanum()
     params.enc_filter_tau  = 0.005; % Encoder reader low-pass filter time constant (s)
 
     %% --- IMU ---
-    params.imu_accel_noise  = 0.05;    % Accelerometer noise std dev (m/s²)
-    params.imu_gyro_noise   = 0.005;   % Gyroscope noise std dev (rad/s)
+    % Noise std per IMU sample at imu_rate_hz. [measured] BNO085 on the AGV, standing still,
+    % 600 samples / 30 s, TEST_IMU test 6, 11/06/2026 (recorded only in
+    % 00_OVERVIEW/Session_Logs/2026-06-11_Session_A_He_thong_hoa_code.md, no raw file yet).
+    % To be replaced by the raw IMU noise run (tools/imu_capture.py, 05_DATA/results/IMU_NOISE/).
+    % Before 21/10/2026: accel 0.05, gyro 0.005, updated every 1 ms (see use_torque_model.m).
+    params.imu_accel_noise  = 0.01254; % Accelerometer noise std dev (m/s²) [measured, accel_z]
+    params.imu_gyro_noise   = 0.00031; % Gyroscope noise std dev (rad/s) [measured]
+    params.imu_rate_hz      = 20;      % Output rate (Hz): imu.cpp enables reports at 50 ms; held between samples [from firmware]
     params.imu_accel_bias0  = 0.01;    % Initial accel bias (m/s²)
     params.imu_gyro_bias0   = 0.001;   % Initial gyro bias (rad/s)
     params.imu_bias_drift   = 1e-5;    % Bias random walk coefficient

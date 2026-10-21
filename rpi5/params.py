@@ -109,8 +109,12 @@ class MecanumParams:
         self.enc_filter_tau   = 0.005   # IIR filter τ [s]
 
         # ── IMU parameters ───────────────────────────────────────────────
-        self.imu_accel_noise       = 0.05          # [m/s²]
-        self.imu_gyro_noise        = 0.002         # [rad/s]
+        # Same values as params_mecanum.m: BNO085 measured 11/06/2026 (session log only,
+        # raw run pending: tools/imu_capture.py). Not used by the HIL plant: there is no
+        # IMU emulation, the ESP32 reads its real BNO085 on the bench.
+        self.imu_accel_noise       = 0.01254       # [m/s²]  (was 0.05 before 21/10)
+        self.imu_gyro_noise        = 0.00031       # [rad/s] (was 0.002 before 21/10)
+        self.imu_rate_hz           = 20            # BNO085 report rate in imu.cpp (50 ms)
         self.imu_accel_bias_drift  = 0.001
         self.imu_gyro_bias_drift   = 0.0001
         self.imu_filter_tau        = 0.003         # [s]

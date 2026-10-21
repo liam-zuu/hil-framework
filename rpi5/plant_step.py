@@ -160,13 +160,17 @@ def _apply_slip(
     tau_kinetic_base = params.slip.mu_kinetic * F_N * params.r  # 0.238 N·m
 
     tau_eff = tau.copy()
+    # Draw the same number of random numbers every step (2 per wheel), whatever the
+    # torque: the random stream, and so a seeded run, does not depend on the controller.
+    u_spont = rng.random(4)
+    z_noise = rng.standard_normal(4)
     for i in range(4):
         slip = (
             abs(tau[i]) > tau_friction_max
-            or rng.random() < params.slip.prob_spontaneous
+            or u_spont[i] < params.slip.prob_spontaneous
         )
         if slip:
-            noise = 1.0 + params.slip.noise_sigma * rng.standard_normal()
+            noise = 1.0 + params.slip.noise_sigma * z_noise[i]
             noise = float(np.clip(noise, 0.5, 1.5))
             tau_eff[i] = np.sign(tau[i]) * tau_kinetic_base * noise
 

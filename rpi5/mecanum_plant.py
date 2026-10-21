@@ -25,18 +25,19 @@ class MecanumPlant(PlantInterface):
     Args:
         params: MecanumParams instance.  Defaults to module singleton PARAMS.
         dt:     Timestep [s].  Must match HILConfig.period_us / 1e6.
-        seed:   RNG seed for reproducible wheel-slip noise.
-                None → non-reproducible (production mode).
+        seed:   RNG seed for reproducible wheel-slip noise (default 0, so runs
+                are reproducible; record it with the run). None → not reproducible.
     """
 
     def __init__(
         self,
         params: MecanumParams = PARAMS,
         dt:     float         = 0.001,
-        seed:   int           = None,
+        seed:   int           = 0,
     ):
         self._params = params
         self._dt     = dt
+        self._seed   = seed
         self._state  = np.zeros(10, dtype=float)
         self._rng    = np.random.default_rng(seed)
         self._ticks  = 0
@@ -61,12 +62,20 @@ class MecanumPlant(PlantInterface):
     def get_state(self) -> list:
         return self._state.tolist()
 
-    def reset(self, state: list = None) -> None:
+    def reset(self, state: list = None, seed: int = None) -> None:
+        """Reset state and restart the random stream (same seed unless a new one is given)."""
         if state is not None:
             self._state = np.array(state, dtype=float)
         else:
             self._state = np.zeros(10, dtype=float)
+        if seed is not None:
+            self._seed = seed
+        self._rng   = np.random.default_rng(self._seed)
         self._ticks = 0
+
+    @property
+    def seed(self):
+        return self._seed
 
     # ── Extras ───────────────────────────────────────────────────────────
 

@@ -52,7 +52,7 @@ log = logging.getLogger('hil.main')
 
 # ── Process target functions ──────────────────────────────────────────────
 
-def _run_plant(cfg, shared_state: mp.Array, shared_ref: mp.Array, use_mock: bool) -> None:
+def _run_plant(cfg, shared_state: mp.Array, shared_ref: mp.Array, use_mock: bool, seed: int = 0) -> None:
     """Process 1 target: plant simulation loop."""
     import logging
     logging.basicConfig(
@@ -67,7 +67,8 @@ def _run_plant(cfg, shared_state: mp.Array, shared_ref: mp.Array, use_mock: bool
     from mecanum_plant import MecanumPlant
     from plant_interface import MockPlant
 
-    plant = MockPlant() if use_mock else MecanumPlant(dt=cfg.period_us / 1e6)
+    plant = MockPlant() if use_mock else MecanumPlant(dt=cfg.period_us / 1e6, seed=seed)
+    logging.getLogger('hil.main').info('Plant RNG seed = %s', seed)
     node  = HILNode(plant, config=cfg, shared_state=shared_state, shared_ref=shared_ref)
     node.run()
 
@@ -138,6 +139,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument('--loopback-test', action='store_true',
                    help='SPI loopback test (short MOSI→MISO)')
     # Step/duration
+    p.add_argument('--seed',          type=int,   default=0,
+                   help='plant RNG seed (wheel-slip noise); record it with the run')
     p.add_argument('--steps',         type=int,   default=0,
                    help='Max plant steps (0 = forever)')
     p.add_argument('--jitter-n',      type=int,   default=2_000,
@@ -215,7 +218,7 @@ def main() -> int:
 
     p1 = mp.Process(
         target=_run_plant,
-        args=(hil_cfg, shared_state, shared_ref, args.mock),
+        args=(hil_cfg, shared_state, shared_ref, args.mock, args.seed),
         name='HIL-Plant',
         daemon=True,
     )

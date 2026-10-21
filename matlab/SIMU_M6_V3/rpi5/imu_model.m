@@ -57,4 +57,19 @@ function [accel, gyro, imu_state] = imu_model(x, x_prev, dt, imu_state, params)
     gyro  = true_gyro  + imu_state.gyro_bias + ...
             params.imu_gyro_noise  * randn(3,1);
 
+    % --- Output rate: BNO085 reports at imu_rate_hz (20 Hz in imu.cpp); hold between ---
+    if isfield(params, 'imu_rate_hz') && params.imu_rate_hz > 0 && params.imu_rate_hz < 1/dt
+        if ~isfield(imu_state, 't_since') || ~isfield(imu_state, 'accel_hold')
+            imu_state.t_since = inf;              % first call: take a sample now
+        end
+        imu_state.t_since = imu_state.t_since + dt;
+        if imu_state.t_since >= 1/params.imu_rate_hz - 1e-12
+            imu_state.t_since = 0;
+            imu_state.accel_hold = accel;
+            imu_state.gyro_hold  = gyro;
+        end
+        accel = imu_state.accel_hold;
+        gyro  = imu_state.gyro_hold;
+    end
+
 end
