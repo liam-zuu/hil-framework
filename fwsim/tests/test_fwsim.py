@@ -120,6 +120,7 @@ def test_s02_metrics_robust_to_dropped_lines(fw, tmp_path):
     assert drop['pwm_tv'] == pytest.approx(full['pwm_tv'], rel=0.02)
     assert full['e_vx'] < 0.02
     # quantization floor: one count on one wheel in a 10 ms window
-    assert full['floor_e_vx'] == pytest.approx(0.0485 / 4 * 2 * np.pi / 1320 / 0.01)
-    assert full['floor_e_wz'] == pytest.approx(full['floor_e_vx'] / 0.24)
-    assert full['below_floor_e_vy'] == 1          # straight line: vy error is only quantization
+    assert full['step_e_vx'] == pytest.approx(0.0485 / 4 * 2 * np.pi / 1320 / 0.01)
+    assert full['step_e_wz'] == pytest.approx(full['step_e_vx'] / 0.24)
+    # straight line: vy error is quantization only, so it sits near the theoretical qrms
+    assert 0.7 < full['e_vy'] / full['qrms_e_vy'] < 1.6

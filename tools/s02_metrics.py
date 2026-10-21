@@ -22,8 +22,13 @@ Lifted tests A-K1, A-K2, per setpoint step whose new level lasts >= 2 s:
 Quantization floor (THESIS 21/10): the firmware speed is a 10 ms count difference,
 so one count on one wheel moves omega by Q_W = 2*pi/1320/0.010 = 0.476 rad/s,
 vx and vy by r/4 * Q_W = 0.0058 m/s and wz by r/(4 L) * Q_W = 0.024 rad/s.
-Columns floor_<metric> hold that step; below_floor_<metric> = 1 when the metric
-is not larger than it (the value is then measurement resolution, not control error).
+  step_<metric>: that one-count step.
+  qrms_<metric>: RMS a perfect controller would still show from quantization
+    alone, if each wheel's count error is the difference of two independent
+    uniform phases (variance 1/6 count^2) and the 4 wheels are independent:
+    vx, vy: r/4 * Q_W * sqrt(4/6); wz: r/(4 L) * Q_W * sqrt(4/6); rms_w_err: Q_W / sqrt(6).
+  Metrics near qrms are measurement resolution, not control error. No pass/fail
+  flag: deciding how close is "near" is left to the analysis.
 
   python tools/s02_metrics.py <run_dir> [out_name]   # reads runs.csv, writes metrics.csv (or out_name)
 """
@@ -43,8 +48,10 @@ SEG_MIN_S = 2.0
 STEP_TESTS = ('A-K1', 'A-K2')
 COUNTS_PER_REV = 1320
 Q_W = 2 * math.pi / COUNTS_PER_REV / TICK_S                    # rad/s, one count in one window
-FLOORS = {'e_vx': R_WHEEL / 4 * Q_W, 'e_vy': R_WHEEL / 4 * Q_W,
-          'e_wz': R_WHEEL / (4 * L_SUM) * Q_W, 'rms_w_err': Q_W}
+STEPS = {'e_vx': R_WHEEL / 4 * Q_W, 'e_vy': R_WHEEL / 4 * Q_W,
+         'e_wz': R_WHEEL / (4 * L_SUM) * Q_W, 'rms_w_err': Q_W}
+QRMS = {'e_vx': STEPS['e_vx'] * math.sqrt(4 / 6), 'e_vy': STEPS['e_vy'] * math.sqrt(4 / 6),
+        'e_wz': STEPS['e_wz'] * math.sqrt(4 / 6), 'rms_w_err': Q_W / math.sqrt(6)}
 
 
 def load_log(path):
@@ -109,9 +116,9 @@ def compute(log, test_id):
     gz = log.get('gz')
     m['e_yaw_imu'] = rms(sp[win, 2] - gz[win]) if gz is not None and np.all(np.isfinite(gz[win])) else np.nan
     m['window_s'] = float(t1 - t0)
-    for k, q in FLOORS.items():
-        m[f'floor_{k}'] = q
-        m[f'below_floor_{k}'] = int(m[k] <= q)
+    for k in STEPS:
+        m[f'step_{k}'] = STEPS[k]
+        m[f'qrms_{k}'] = QRMS[k]
     if test_id in STEP_TESTS:
         for n, s in enumerate(step_segments(t, sp[:, 0], v[:, 0]), start=1):
             m[f'step_seg{n}'] = f"{s['from_']:+.2f}->{s['to']:+.2f}"
