@@ -1,6 +1,7 @@
 """Tests for hil_node.py and trajectory_pub.py (simulate_hw=True, no hardware)."""
 import math
 import multiprocessing as mp
+import numpy as np
 import pytest
 
 from params import PARAMS
@@ -240,3 +241,31 @@ class TestBodyVelocity:
         for k in range(200):
             vx, vy, wz = get_body_velocity(k * 0.04, spec)
             assert abs(vx) <= 3.0 and abs(wz) <= 10.0
+
+
+class TestGroupA:
+    """Spec S02 P2-1 test IDs."""
+
+    def test_ids_and_speeds(self):
+        from trajectory_pub import GROUP_A
+        assert sorted(GROUP_A) == sorted([f'A-{k}{i}' for k in 'LCFS' for i in (1, 2)] + ['A-K1', 'A-K2', 'A-K3'])
+        assert GROUP_A['A-L1'].v == 0.2 and GROUP_A['A-L2'].v == 0.5
+        assert GROUP_A['A-C1'].radius == 1.0
+
+    def test_strafe(self):
+        assert get_body_velocity(1.0, TrajectorySpec(kind='strafe', v=0.2)) == (0.0, 0.2, 0.0)
+
+    def test_figure8_mean_speed(self):
+        from trajectory_pub import GROUP_A
+        s = GROUP_A['A-F2']
+        t = np.arange(0.0, s.duration, 0.001)
+        sp = [np.hypot(*get_body_velocity(x, s)[:2]) for x in t]
+        assert np.mean(sp) == pytest.approx(0.5, rel=1e-3)
+
+    def test_lift_profiles(self):
+        from trajectory_pub import GROUP_A
+        k1, k2, k3 = GROUP_A['A-K1'], GROUP_A['A-K2'], GROUP_A['A-K3']
+        assert [get_body_velocity(t, k1)[0] for t in (1, 4, 7)] == [0.0, 0.3, 0.0]
+        assert [get_body_velocity(t, k2)[0] for t in (1, 4, 7)] == [0.3, -0.3, 0.3]
+        assert get_body_velocity(0.0, k3)[0] == pytest.approx(-0.2)
+        assert get_body_velocity(10.0, k3)[0] == pytest.approx(0.2)

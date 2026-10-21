@@ -52,7 +52,8 @@ log = logging.getLogger('hil.main')
 
 # ── Process target functions ──────────────────────────────────────────────
 
-def _run_plant(cfg, shared_state: mp.Array, shared_ref: mp.Array, use_mock: bool, seed: int = 0) -> None:
+def _run_plant(cfg, shared_state: mp.Array, shared_ref: mp.Array, use_mock: bool, seed: int = 0,
+               wheels_lifted: bool = False) -> None:
     """Process 1 target: plant simulation loop."""
     import logging
     logging.basicConfig(
@@ -67,8 +68,12 @@ def _run_plant(cfg, shared_state: mp.Array, shared_ref: mp.Array, use_mock: bool
     from mecanum_plant import MecanumPlant
     from plant_interface import MockPlant
 
-    plant = MockPlant() if use_mock else MecanumPlant(dt=cfg.period_us / 1e6, seed=seed)
-    logging.getLogger('hil.main').info('Plant RNG seed = %s', seed)
+    from params import MecanumParams
+    params = MecanumParams()
+    if wheels_lifted:
+        params.update_physical(wheels_lifted=True)     # spec S02 A-K: wheels off the ground
+    plant = MockPlant() if use_mock else MecanumPlant(params=params, dt=cfg.period_us / 1e6, seed=seed)
+    logging.getLogger('hil.main').info('Plant RNG seed = %s, wheels_lifted = %s', seed, wheels_lifted)
     node  = HILNode(plant, config=cfg, shared_state=shared_state, shared_ref=shared_ref)
     node.run()
 
@@ -147,7 +152,8 @@ def _parse_args() -> argparse.Namespace:
                    help='Number of ticks for jitter measurement')
     # Trajectory
     p.add_argument('--traj',          default='idle',
-                   choices=['idle', 'line', 'circle', 'figure8'],
+                   choices=['idle', 'line', 'circle', 'figure8', 'strafe',
+                            'lift_step', 'lift_reverse', 'lift_ramp'],
                    help='Reference trajectory type')
     p.add_argument('--speed',         type=float, default=0.3,
                    help='Nominal linear speed [m/s]')
@@ -155,6 +161,9 @@ def _parse_args() -> argparse.Namespace:
                    help='Circle/figure-8 radius [m]')
     p.add_argument('--duration',      type=float, default=0.0,
                    help='Run duration [s] (0 = forever)')
+    p.add_argument('--test',          default=None,
+                   help='Spec S02 group A test ID (A-L1 ... A-K3): sets trajectory, speed, '
+                        'duration; A-K* also put the plant in wheels-lifted mode')
     # Hardware
     p.add_argument('--uart-port',     default='/dev/ttyAMA0',
                    help='UART port for ESP32 (legacy --traj-uart-direct only)')
@@ -189,7 +198,7 @@ def main() -> int:
 
     # ── Normal HIL run ───────────────────────────────────────────────────
     from hil_node import HILConfig
-    from trajectory_pub import TrajectorySpec
+    from trajectory_pub import TrajectorySpec, GROUP_A, LIFTED_TESTS
 
     hil_cfg = HILConfig(
         period_us    = 1_000,
@@ -206,6 +215,14 @@ def main() -> int:
         radius   = args.radius,
         duration = args.duration,
     )
+    lifted = False
+    if args.test:
+        if args.test not in GROUP_A:
+            raise SystemExit(f'--test must be one of {sorted(GROUP_A)}')
+        traj_spec = GROUP_A[args.test]
+        lifted = args.test in LIFTED_TESTS
+        args.traj = traj_spec.kind
+        log.info('Group A test %s: %s', args.test, traj_spec)
 
     # Shared state array: plant writes, trajectory pub can read (optional)
     shared_state = mp.Array('d', 10)
@@ -218,7 +235,7 @@ def main() -> int:
 
     p1 = mp.Process(
         target=_run_plant,
-        args=(hil_cfg, shared_state, shared_ref, args.mock, args.seed),
+        args=(hil_cfg, shared_state, shared_ref, args.mock, args.seed, lifted),
         name='HIL-Plant',
         daemon=True,
     )

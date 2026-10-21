@@ -37,11 +37,19 @@ Supported trajectories (matching MATLAB trajectory_generator.m M5.2):
   line     — straight line along +X
   circle   — constant-radius circle starting at origin
   figure8  — figure-8 with curvature-based parametric form (no gradient spike)
+Body-velocity only (spec S02 group A, get_body_velocity):
+  strafe        — vy = v, vx = 0, heading held
+  lift_step     — wheels lifted: vx 0 -> v -> 0, 3 s each
+  lift_reverse  — wheels lifted: vx +v -> -v -> +v, 3 s each
+  lift_ramp     — wheels lifted: vx ramp -v -> +v over 10 s
+GROUP_A maps the spec S02 test IDs (A-L1 ... A-K3) to a TrajectorySpec.
 """
 from __future__ import annotations
 
 import logging
 import math
+
+import numpy as np
 import signal
 import struct
 import time
@@ -67,7 +75,7 @@ UART_BAUDRATE = 115_200
 @dataclass
 class TrajectorySpec:
     """Defines a reference trajectory for the run."""
-    kind:     str   = 'idle'   # 'idle'|'line'|'circle'|'figure8'
+    kind:     str   = 'idle'   # 'idle'|'line'|'circle'|'figure8'|'strafe'|'lift_*'
     v:        float = 0.3      # nominal linear speed [m/s]
     radius:   float = 0.5      # circle or figure-8 amplitude [m]
     period:   float = 8.0      # figure-8 full period [s]
@@ -152,6 +160,14 @@ def get_body_velocity(t: float, spec: TrajectorySpec) -> Tuple[float, float, flo
     """
     if spec.kind == 'line':
         return spec.v, 0.0, 0.0
+    if spec.kind == 'strafe':
+        return 0.0, spec.v, 0.0
+    if spec.kind == 'lift_step':
+        return (spec.v if 3.0 <= t < 6.0 else 0.0), 0.0, 0.0
+    if spec.kind == 'lift_reverse':
+        return (-spec.v if 3.0 <= t < 6.0 else spec.v) if t < 9.0 else 0.0, 0.0, 0.0
+    if spec.kind == 'lift_ramp':
+        return (-spec.v + 2.0 * spec.v * min(t, LIFT_RAMP_S) / LIFT_RAMP_S), 0.0, 0.0
     if spec.kind == 'circle':
         return spec.v, 0.0, spec.v / spec.radius
     if spec.kind == 'figure8':
@@ -165,6 +181,36 @@ def get_body_velocity(t: float, spec: TrajectorySpec) -> Tuple[float, float, flo
         speed2 = dx * dx + dy * dy + 1e-12
         return math.sqrt(speed2), 0.0, (dx * ddy - dy * ddx) / speed2
     return 0.0, 0.0, 0.0
+
+
+# ── Spec S02 group A ──────────────────────────────────────────────────────
+
+LIFT_RAMP_S = 10.0
+
+
+def figure8_period(A: float, v: float, n: int = 20000) -> float:
+    """Period giving mean path speed v on x = A sin(tau), y = (A/2) sin(2 tau)."""
+    tau = (np.arange(n) + 0.5) * (2.0 * math.pi / n)
+    ds = np.hypot(A * np.cos(tau), A * np.cos(2.0 * tau)) * (2.0 * math.pi / n)
+    return float(np.sum(ds)) / v
+
+
+def _group_a():
+    g = {}
+    for i, v in ((1, 0.2), (2, 0.5)):
+        g[f'A-L{i}'] = TrajectorySpec('line', v=v, duration=3.0 / v)                       # 3 m
+        g[f'A-C{i}'] = TrajectorySpec('circle', v=v, radius=1.0, duration=2 * math.pi * 1.0 / v)   # 1 lap
+        T8 = figure8_period(1.0, v)
+        g[f'A-F{i}'] = TrajectorySpec('figure8', v=v, radius=1.0, period=T8, duration=T8)  # 1 period
+        g[f'A-S{i}'] = TrajectorySpec('strafe', v=v, duration=2.0 / v)                     # 2 m
+    g['A-K1'] = TrajectorySpec('lift_step', v=0.3, duration=9.0)
+    g['A-K2'] = TrajectorySpec('lift_reverse', v=0.3, duration=9.0)
+    g['A-K3'] = TrajectorySpec('lift_ramp', v=0.2, duration=LIFT_RAMP_S)
+    return g
+
+
+GROUP_A = _group_a()          # test ID -> TrajectorySpec (spec S02 P2-1)
+LIFTED_TESTS = ('A-K1', 'A-K2', 'A-K3')
 
 
 # ── UART packet encoding ──────────────────────────────────────────────────
