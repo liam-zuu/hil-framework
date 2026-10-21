@@ -19,7 +19,13 @@ Lifted tests A-K1, A-K2, per setpoint step whose new level lasts >= 2 s:
   rise_s_segN (10-90 % of the step), overshoot_pct_segN (beyond the new level,
   % of the step size), e_ss_segN (mean setpoint - vx over the last 1 s).
 
-  python tools/s02_metrics.py <run_dir>        # reads runs.csv, writes metrics.csv
+Quantization floor (THESIS 21/10): the firmware speed is a 10 ms count difference,
+so one count on one wheel moves omega by Q_W = 2*pi/1320/0.010 = 0.476 rad/s,
+vx and vy by r/4 * Q_W = 0.0058 m/s and wz by r/(4 L) * Q_W = 0.024 rad/s.
+Columns floor_<metric> hold that step; below_floor_<metric> = 1 when the metric
+is not larger than it (the value is then measurement resolution, not control error).
+
+  python tools/s02_metrics.py <run_dir> [out_name]   # reads runs.csv, writes metrics.csv (or out_name)
 """
 import csv
 import math
@@ -35,6 +41,10 @@ TICK_S = 0.01
 WINDOW_SKIP_S = 1.0
 SEG_MIN_S = 2.0
 STEP_TESTS = ('A-K1', 'A-K2')
+COUNTS_PER_REV = 1320
+Q_W = 2 * math.pi / COUNTS_PER_REV / TICK_S                    # rad/s, one count in one window
+FLOORS = {'e_vx': R_WHEEL / 4 * Q_W, 'e_vy': R_WHEEL / 4 * Q_W,
+          'e_wz': R_WHEEL / (4 * L_SUM) * Q_W, 'rms_w_err': Q_W}
 
 
 def load_log(path):
@@ -99,6 +109,9 @@ def compute(log, test_id):
     gz = log.get('gz')
     m['e_yaw_imu'] = rms(sp[win, 2] - gz[win]) if gz is not None and np.all(np.isfinite(gz[win])) else np.nan
     m['window_s'] = float(t1 - t0)
+    for k, q in FLOORS.items():
+        m[f'floor_{k}'] = q
+        m[f'below_floor_{k}'] = int(m[k] <= q)
     if test_id in STEP_TESTS:
         for n, s in enumerate(step_segments(t, sp[:, 0], v[:, 0]), start=1):
             m[f'step_seg{n}'] = f"{s['from_']:+.2f}->{s['to']:+.2f}"
@@ -106,7 +119,7 @@ def compute(log, test_id):
     return m
 
 
-def run_dir_metrics(d):
+def run_dir_metrics(d, out_name='metrics.csv'):
     with open(os.path.join(d, 'runs.csv'), newline='') as f:
         runs = list(csv.DictReader(f))
     out = []
@@ -120,7 +133,7 @@ def run_dir_metrics(d):
     for o in out:
         keys += [k for k in o if k not in keys]
     fmt = lambda x: f'{x:.6g}' if isinstance(x, float) else x   # noqa: E731
-    with open(os.path.join(d, 'metrics.csv'), 'w', newline='') as f:
+    with open(os.path.join(d, out_name), 'w', newline='') as f:
         wr = csv.DictWriter(f, fieldnames=keys)
         wr.writeheader()
         wr.writerows({k: fmt(o.get(k, '')) for k in keys} for o in out)
@@ -128,7 +141,10 @@ def run_dir_metrics(d):
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 2:
+    if len(sys.argv) not in (2, 3):
         sys.exit(__doc__)
-    res = run_dir_metrics(sys.argv[1])
-    print(f'{len(res)} runs -> {os.path.join(sys.argv[1], "metrics.csv")}')
+    name = sys.argv[2] if len(sys.argv) == 3 else 'metrics.csv'
+    if os.path.exists(os.path.join(sys.argv[1], name)):
+        sys.exit(f'{name} already exists in {sys.argv[1]}: choose a new name (outputs are not overwritten).')
+    res = run_dir_metrics(sys.argv[1], name)
+    print(f'{len(res)} runs -> {os.path.join(sys.argv[1], name)}')

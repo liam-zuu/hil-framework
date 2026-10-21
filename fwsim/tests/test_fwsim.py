@@ -119,3 +119,7 @@ def test_s02_metrics_robust_to_dropped_lines(fw, tmp_path):
     assert drop['missing_pct'] == pytest.approx(100 / 7, abs=0.5)
     assert drop['pwm_tv'] == pytest.approx(full['pwm_tv'], rel=0.02)
     assert full['e_vx'] < 0.02
+    # quantization floor: one count on one wheel in a 10 ms window
+    assert full['floor_e_vx'] == pytest.approx(0.0485 / 4 * 2 * np.pi / 1320 / 0.01)
+    assert full['floor_e_wz'] == pytest.approx(full['floor_e_vx'] / 0.24)
+    assert full['below_floor_e_vy'] == 1          # straight line: vy error is only quantization
