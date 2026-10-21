@@ -15,6 +15,7 @@ clear; clc; close all;
 clear encoder_pulse_gen encoder_reader imu_reader;
 
 params = params_mecanum();
+params = use_torque_model(params);   % legacy torque-input script (DC model is default since 21/10/2026)
 dt = params.dt;
 n_pass = 0;
 n_fail = 0;

@@ -25,6 +25,7 @@ n_ctrl = length(controllers);
 n_traj = length(trajectories);
 
 params_base = params_mecanum();
+params_base = use_torque_model(params_base);   % legacy torque-input script
 % params_base.T_sim = 10;  % uncomment if default is not 10
 
 %% ===== DEFINE CONDITIONS =====

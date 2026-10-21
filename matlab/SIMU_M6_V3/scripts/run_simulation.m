@@ -26,6 +26,7 @@ clear position_controller; % Reset persistent integral state
 
 %% Load parameters
 params = params_mecanum();
+params = use_torque_model(params);   % legacy torque-input script (DC model is default since 21/10/2026)
 
 %% Configuration
 controller_type = 'pid';   % 'pid' or 'adrc'

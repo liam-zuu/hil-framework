@@ -146,17 +146,26 @@ function [metrics, log] = run_single_scenario_v2(ctrl_type, traj, params, seed)
         [tau_up, ~] = spi_interface('uplink', tau, params);
 
         %% ===== Load disturbance + FAULT injection (between H7 and plant) =====
-        % M6-style disturbance (params.disturbance.*)
+        % 'torque' model: added to the commanded torque as in M6.
+        % 'dc' model (default since 21/10/2026): tau_up is the PWM duty, so external
+        % torques go to plant_step as tau_ext and battery fade lowers V_batt.
+        is_dc = isfield(params, 'motor_model') && strcmp(params.motor_model, 'dc');
+        tau_ext = zeros(4, 1);
         if isfield(params, 'disturbance') && params.disturbance.enabled
             tau_dist = compute_disturbance(t_now, params);
-            tau_up = tau_up + tau_dist;
+            if is_dc, tau_ext = tau_ext + tau_dist; else, tau_up = tau_up + tau_dist; end
         end
 
         % Torque-level fault injection (wheel_jam, mass_bias, battery_fade)
-        [tau_up, state_fault] = inject_torque_faults(tau_up, omega_actual, t_now, params, state_fault);
+        if is_dc
+            [tau_ext, state_fault, v_scale] = inject_torque_faults_dc(tau_ext, omega_actual, t_now, params, state_fault);
+        else
+            [tau_up, state_fault] = inject_torque_faults(tau_up, omega_actual, t_now, params, state_fault);
+        end
 
         %% ===== GREASE ZONE: override slip params for plant_step only =====  % NEW
         p_plant = inject_grease_zone(params, t_now);                           % NEW
+        if is_dc, p_plant.V_batt = params.V_batt * v_scale; end
         log.grease_log(k) = p_plant.slip.enabled && ...                        % NEW
             isfield(params.fault,'grease_zone') && ...                          % NEW
             params.fault.grease_zone.enabled && ...                             % NEW
@@ -165,7 +174,7 @@ function [metrics, log] = run_single_scenario_v2(ctrl_type, traj, params, seed)
 
         %% ===== CLUSTER 3: RPi5 (plant + sensors) =====
         x_cur = sm.x;
-        x_new = plant_step(x_cur, tau_up, p_plant, dt);                       % CHANGED: p_plant
+        x_new = plant_step(x_cur, tau_up, p_plant, dt, tau_ext);             % tau_ext: dc model only
         [accel_sim, gyro_sim, imu_state] = imu_model(x_new, x_cur, dt, imu_state, params);
         sm = state_manager('update', sm, x_new);
 
@@ -290,6 +299,41 @@ function [tau_out, state_out] = inject_torque_faults(tau_in, omega_actual, t, pa
             tau_max_now = (1 - alpha)*BF.tau_max_nominal + alpha*BF.tau_max_final;
         end
         tau_out = max(-tau_max_now, min(tau_max_now, tau_out));
+        state_out.tau_max_current = tau_max_now;
+    end
+end
+
+
+function [tau_ext, state_out, v_scale] = inject_torque_faults_dc(tau_ext, omega_actual, t, params, state_in)
+% DC-model version of inject_torque_faults: wheel_jam and mass_bias become external
+% wheel torques; battery_fade scales the battery voltage by tau_max_now/tau_max_nominal
+% (the same relative loss of available torque as in the torque model).
+    state_out = state_in;
+    v_scale = 1;
+    if ~isfield(params, 'fault'), return; end
+    F = params.fault;
+    if isfield(F,'wheel_jam') && isstruct(F.wheel_jam) && isfield(F.wheel_jam,'enabled') && F.wheel_jam.enabled
+        if t >= F.wheel_jam.t_start
+            w = F.wheel_jam.wheel;
+            tau_ext(w) = tau_ext(w) - F.wheel_jam.b_extra * omega_actual(w);
+        end
+    end
+    if isfield(F,'mass_bias') && isstruct(F.mass_bias) && isfield(F.mass_bias,'enabled') && F.mass_bias.enabled
+        if t >= F.mass_bias.t_start
+            tau_ext = tau_ext - F.mass_bias.tau_bias * ones(4,1);
+        end
+    end
+    if isfield(F,'battery_fade') && isstruct(F.battery_fade) && isfield(F.battery_fade,'enabled') && F.battery_fade.enabled
+        BF = F.battery_fade;
+        if t < BF.t_start
+            tau_max_now = BF.tau_max_nominal;
+        elseif t > BF.t_end
+            tau_max_now = BF.tau_max_final;
+        else
+            alpha = (t - BF.t_start) / max(BF.t_end - BF.t_start, 1e-6);
+            tau_max_now = (1 - alpha)*BF.tau_max_nominal + alpha*BF.tau_max_final;
+        end
+        v_scale = tau_max_now / BF.tau_max_nominal;
         state_out.tau_max_current = tau_max_now;
     end
 end

@@ -9,6 +9,7 @@
 clear; clc; close all;
 
 params_base = params_mecanum();
+params_base = use_torque_model(params_base);   % legacy torque-input script
 dt = params_base.dt;
 T_sim = params_base.T_sim;
 N = round(T_sim / dt);

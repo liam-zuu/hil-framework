@@ -17,6 +17,7 @@ fprintf('  M6 UNIT TESTS — Disturbance & Robustness\n');
 fprintf('====================================================\n\n');
 
 params = params_mecanum();
+params = use_torque_model(params);   % legacy torque-input script (DC model is default since 21/10/2026)
 dt = params.dt;
 pass_count = 0;
 fail_count = 0;

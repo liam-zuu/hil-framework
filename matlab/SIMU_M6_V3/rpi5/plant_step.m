@@ -1,4 +1,4 @@
-function x_new = plant_step(x, tau, params, dt)
+function x_new = plant_step(x, tau, params, dt, tau_ext)
 % PLANT_STEP  Mecanum AGV dynamics — kinematics + dynamics + optional wheel slip.
 %
 % Model (Lagrangian, no-slip baseline):
@@ -26,7 +26,9 @@ function x_new = plant_step(x, tau, params, dt)
 %
 % Input:
 %   x      [10x1] state: [x,y,theta, vx,vy,wz, w1,w2,w3,w4]
-%   tau    [4x1]  applied torques (N.m), may include external disturbance
+%   tau    [4x1]  'torque' model: applied torques (N.m); 'dc' model (default since
+%                 21/10/2026): PWM duty in [-1,1] as H7 delivers it
+%   tau_ext [4x1] optional external wheel torques (load, faults) [N.m]
 %   params [struct] from params_mecanum (with optional .slip struct)
 %   dt     [scalar] timestep (s)
 % Output:
@@ -36,12 +38,93 @@ function x_new = plant_step(x, tau, params, dt)
     theta = x(3);
     omega = x(7:10);  % wheel speeds [4x1]
 
-    % --- Wheel slip model (M6) ---
-    if isfield(params, 'motor_polarity')
-        tau = tau .* params.motor_polarity(:);   % motor wiring polarity
+    if nargin < 5 || isempty(tau_ext)
+        tau_ext = zeros(4, 1);       % external torques at the wheels (load, faults) [N.m]
     end
-    tau_eff = tau;  % default: full traction
+    is_dc = isfield(params, 'motor_model') && strcmp(params.motor_model, 'dc');
+    lifted = is_dc && isfield(params, 'wheels_lifted') && params.wheels_lifted;
 
+    if is_dc
+        % --- DC motor model (spec S01): tau is the PWM duty u in [-1,1] ---
+        u = max(-1, min(1, tau(:))) .* params.motor_polarity(:);
+        m = params.motor;
+        u_eff = sign(u) .* max(abs(u) - m.u0, 0);
+        tau_m = m.K ./ m.R .* (params.V_batt * u_eff - m.K .* omega) * params.motor_enable;
+        tau_m = tau_m + tau_ext(:);
+        if ~lifted
+            tau_m = apply_slip(tau_m, params);
+        end
+        moving = abs(omega) > 1e-3;
+        stuck  = ~moving & (abs(tau_m) <= m.Ts);                   % static friction holds
+        tau_f  = m.b .* omega + m.Tc .* sign(omega);
+        tau_f(~moving & ~stuck) = m.Tc(~moving & ~stuck) .* sign(tau_m(~moving & ~stuck));
+        tau_net = tau_m - tau_f;
+        tau_net(stuck) = 0;
+        if lifted
+            Minv = params.M_eff_lifted_inv;
+        else
+            Minv = params.M_eff_dc_inv;
+        end
+        omega_new = omega + dt * (Minv * tau_net);
+        omega_new(stuck) = 0;
+        % friction alone must not reverse a wheel within one step: stop it
+        crossed = moving & (sign(omega_new) ~= sign(omega)) & (abs(tau_m) <= m.Ts);
+        omega_new(crossed) = 0;
+    else
+        % --- Legacy M6 torque model ---
+        if isfield(params, 'motor_polarity')
+            tau = tau .* params.motor_polarity(:);   % motor wiring polarity
+        end
+        tau = tau + tau_ext(:);
+        tau_eff = apply_slip(tau, params);
+        % M_eff * d(omega)/dt = tau_eff - b_w * omega
+        Minv = params.M_eff_inv;
+        if isfield(params, 'M_eff_torque_inv'), Minv = params.M_eff_torque_inv; end
+        domega = Minv * (tau_eff - params.b_w * omega);
+        omega_new = omega + dt * domega;
+        % Clamp to max wheel speed
+        omega_new = max(-params.omega_max, min(params.omega_max, omega_new));
+    end
+
+    if lifted
+        % Wheels in the air: body does not move
+        x_new = [x(1:3); 0; 0; 0; omega_new];
+        return;
+    end
+
+    % --- Step 2: Forward kinematics ---
+    % Body velocities from wheel speeds (kinematic constraint)
+    v_body = params.H_fwd * omega_new;  % [vx; vy; wz] in body frame
+    vx_new = v_body(1);
+    vy_new = v_body(2);
+    wz_new = v_body(3);
+
+    % --- Step 3: Pose integration (midpoint rotation) ---
+    theta_mid = theta + wz_new * dt / 2;
+    cos_t = cos(theta_mid);
+    sin_t = sin(theta_mid);
+
+    x_pos_new = x(1) + (vx_new * cos_t - vy_new * sin_t) * dt;
+    y_pos_new = x(2) + (vx_new * sin_t + vy_new * cos_t) * dt;
+    theta_new = theta + wz_new * dt;
+
+    % Normalize theta to [-pi, pi]
+    theta_new = mod(theta_new + pi, 2*pi) - pi;
+
+    % --- Assemble new state ---
+    x_new = [x_pos_new;
+             y_pos_new;
+             theta_new;
+             vx_new;
+             vy_new;
+             wz_new;
+             omega_new];
+
+end
+
+function tau_eff = apply_slip(tau, params)
+% Wheel slip model (M6), unchanged; returns tau when slip is disabled.
+    tau_eff = tau;  % default: full traction
     if isfield(params, 'slip') && params.slip.enabled
         F_N = params.M * params.g / 4;  % normal force per wheel (equal distribution)
         tau_static_max = params.slip.mu_static * F_N * params.r;  % max static friction torque
@@ -78,41 +161,4 @@ function x_new = plant_step(x, tau, params, dt)
             end
         end
     end
-
-    % --- Step 1: Wheel dynamics ---
-    % M_eff * d(omega)/dt = tau_eff - b_w * omega
-    domega = params.M_eff_inv * (tau_eff - params.b_w * omega);
-    omega_new = omega + dt * domega;
-
-    % Clamp to max wheel speed
-    omega_new = max(-params.omega_max, min(params.omega_max, omega_new));
-
-    % --- Step 2: Forward kinematics ---
-    % Body velocities from wheel speeds (kinematic constraint)
-    v_body = params.H_fwd * omega_new;  % [vx; vy; wz] in body frame
-    vx_new = v_body(1);
-    vy_new = v_body(2);
-    wz_new = v_body(3);
-
-    % --- Step 3: Pose integration (midpoint rotation) ---
-    theta_mid = theta + wz_new * dt / 2;
-    cos_t = cos(theta_mid);
-    sin_t = sin(theta_mid);
-
-    x_pos_new = x(1) + (vx_new * cos_t - vy_new * sin_t) * dt;
-    y_pos_new = x(2) + (vx_new * sin_t + vy_new * cos_t) * dt;
-    theta_new = theta + wz_new * dt;
-
-    % Normalize theta to [-pi, pi]
-    theta_new = mod(theta_new + pi, 2*pi) - pi;
-
-    % --- Assemble new state ---
-    x_new = [x_pos_new;
-             y_pos_new;
-             theta_new;
-             vx_new;
-             vy_new;
-             wz_new;
-             omega_new];
-
 end

@@ -14,6 +14,7 @@ clear; clc; close all;
 fprintf('===== M5 Integration Tests =====\n\n');
 
 params = params_mecanum();
+params = use_torque_model(params);   % legacy torque-input script (DC model is default since 21/10/2026)
 dt = params.dt;
 pass_count = 0;
 fail_count = 0;

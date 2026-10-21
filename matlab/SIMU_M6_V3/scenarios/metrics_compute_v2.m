@@ -50,7 +50,14 @@ function m = metrics_compute_v2(log, traj, params)
     m.rms_tau = sqrt(mean(tau(:, idx).^2, 'all'));
     dur = sum(idx) * dt;
     m.tv_tau  = sum(abs(diff(tau(:, idx), 1, 2)), 'all') / dur;
-    m.sat_pct = 100 * mean(abs(tau(:, idx)) > 0.98 * params.tau_max, 'all');
+    % 'dc' model (default since 21/10/2026): tau_log holds the PWM duty, so these are
+    % duty RMS / duty total variation [1/s] / % of samples with |duty| > 0.98.
+    if isfield(params, 'motor_model') && strcmp(params.motor_model, 'dc')
+        sat_level = 0.98;   m.effort_unit = 'duty';
+    else
+        sat_level = 0.98 * params.tau_max;   m.effort_unit = 'N.m';
+    end
+    m.sat_pct = 100 * mean(abs(tau(:, idx)) > sat_level, 'all');
 
     %% Position: decomposition
     xr = traj.x_ref(1:N);  yr = traj.y_ref(1:N);

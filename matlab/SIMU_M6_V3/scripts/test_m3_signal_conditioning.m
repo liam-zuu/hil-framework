@@ -14,6 +14,7 @@ clear encoder_pulse_gen;  % reset persistent accumulator
 % addpath('../rpi5');
 % addpath('../scripts');
 params = params_mecanum();
+params = use_torque_model(params);   % legacy torque-input script (DC model is default since 21/10/2026)
 dt = params.dt;
 
 fprintf('========================================\n');

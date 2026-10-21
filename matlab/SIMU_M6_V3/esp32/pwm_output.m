@@ -42,4 +42,9 @@ function pwm_signal = pwm_output(tau_cmd, params)
     %% Stage 3: Saturate
     pwm_signal = max(-1, min(1, pwm_signal));
 
+    % Firmware per-wheel command sign (AGV_FIRMWARE motor.c motor_dir)
+    if isfield(params, 'motor_dir')
+        pwm_signal = pwm_signal .* params.motor_dir(:);
+    end
+
 end

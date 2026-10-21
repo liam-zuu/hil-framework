@@ -20,7 +20,34 @@ function params = params_mecanum()
     %% --- Motor / Actuator ---
     params.tau_max   = 0.5;   % Max motor torque (N·m) [ASSUMPTION — not in spec]
     params.omega_max = 34.56; % Max wheel speed (rad/s) [from spec]
-    params.motor_polarity = [1; 1; 1; 1]; % Motor wiring polarity [FL FR RL RR]: sign of real wheel rotation for +torque. S01 trial 20/10/2026: FL turns backward on +PWM. Keep 1 until S01 run01 fixes it with ESP32 motor_dir.
+    % Motor wiring polarity [FL FR RL RR]: sign of real wheel rotation for a positive
+    % command as H7 reads it. S01 run01 (05_DATA/results/S01/2026-10-20_run01): every
+    % wheel turns backward for +PWM with firmware motor_dir = +1. [measured]
+    params.motor_polarity = [-1; -1; -1; -1];
+    % Firmware per-wheel command sign (AGV_FIRMWARE src/motor/motor.c motor_dir),
+    % applied in esp32/pwm_output.m. motor_dir .* motor_polarity = +1: wheels turn forward.
+    params.motor_dir      = [-1; -1; -1; -1];
+
+    %% --- DC motor model (spec S01 run01, 21/10/2026) ---
+    % 'dc'    : plant command = PWM duty u in [-1,1];
+    %           tau_m = K/R*(V*u_eff - K*omega), u_eff = sign(u)*max(|u|-u0,0);
+    %           friction b*omega + Tc*sign(omega), static breakaway Ts.
+    % 'torque': legacy M6 model (command = torque, viscous b_w only).
+    % Per-wheel values [FL FR RL RR], direction-averaged, from
+    % 05_DATA/results/S01/2026-10-20_run01/identification/plant_params_from_S01.csv
+    % (matlab/identification/s01_derive_plant_params.py). R measured with a
+    % multimeter at the driver terminals, about +-15-25 % uncertain; J, b scale with 1/R.
+    params.motor_model  = 'dc';
+    params.motor.K      = [0.30394; 0.32210; 0.30917; 0.28811];   % [V.s/rad] [measured]
+    params.motor.R      = [3.31; 3.38; 3.73; 3.95];               % [ohm] [measured]
+    params.motor.u0     = [0.05223; 0.03170; 0.03574; 0.05413];   % duty offset [measured]
+    params.motor.Tc     = [0.02394; 0.02738; 0.02347; 0.02433];   % Coulomb [N.m] [measured]
+    params.motor.Ts     = [0.11878; 0.14760; 0.10489; 0.08129];   % static breakaway [N.m] [measured]
+    params.motor.b      = [0.00062; 0.00081; 0.00074; 0.00175];   % viscous [N.m.s/rad] [measured]
+    params.J_wheels     = [0.00209; 0.00236; 0.00204; 0.00249];   % [kg.m^2] [measured]
+    params.V_batt       = 12.4;    % [V] S01 run01 mean 12.435 V [measured]
+    params.motor_enable = 1;       % 1 = driver enabled, 0 = EN low (free coast)
+    params.wheels_lifted = false;  % true = wheels off the ground (S01 bench)
     params.pwm_res   = 1024;  % PWM resolution (10-bit)
     params.deadband  = 0.02;  % PWM deadband fraction [ASSUMPTION]
 
@@ -96,8 +123,15 @@ function params = params_mecanum()
          -1  1  1 -1;
          -1/L_  1/L_  -1/L_  1/L_];
     M_body = diag([params.M, params.M, params.Iz]);
-    params.M_eff = (r_/4)^2 * (K_' * M_body * K_) + params.J_w * eye(4);
-    params.M_eff_inv = inv(params.M_eff);
+    M_body_wheel = (r_/4)^2 * (K_' * M_body * K_);
+    params.M_eff_torque = M_body_wheel + params.J_w * eye(4);          % legacy model
+    params.M_eff_dc     = M_body_wheel + diag(params.J_wheels);       % DC model, on ground
+    params.M_eff_lifted = diag(params.J_wheels);                      % DC model, wheels lifted
+    params.M_eff_torque_inv = inv(params.M_eff_torque);
+    params.M_eff_dc_inv     = inv(params.M_eff_dc);
+    params.M_eff_lifted_inv = inv(params.M_eff_lifted);
+    params.M_eff     = params.M_eff_torque;       % kept for code that reads M_eff (ADRC b0, scripts)
+    params.M_eff_inv = params.M_eff_torque_inv;
 
     %% --- Position Controller (outer loop) ---
     % Tuned via systematic sweep (tune_gains.m)

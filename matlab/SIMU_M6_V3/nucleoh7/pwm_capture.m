@@ -43,6 +43,10 @@ function tau = pwm_capture(pwm_signal, params)
     end
 
     % --- Step 4: Linear map to torque ---
-    tau = pwm * tau_max;
+    if isfield(params, 'motor_model') && strcmp(params.motor_model, 'dc')
+        tau = pwm;              % DC model: plant takes the duty itself (like the real H7 -> RPi5 frame)
+    else
+        tau = pwm * tau_max;    % legacy torque model
+    end
 
 end

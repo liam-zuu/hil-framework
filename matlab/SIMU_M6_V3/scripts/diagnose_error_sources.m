@@ -12,6 +12,7 @@
 clear; clc; close all;
 
 params = params_mecanum();
+params = use_torque_model(params);   % legacy torque-input script (DC model is default since 21/10/2026)
 dt = params.dt;
 T_sim = params.T_sim;
 N = round(T_sim / dt);

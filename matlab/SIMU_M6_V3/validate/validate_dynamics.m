@@ -26,6 +26,7 @@ function validate_dynamics()
     fprintf('=== VALIDATE DYNAMICS (Tầng 2) ===\n\n');
 
     params = params_mecanum();
+    params = use_torque_model(params);   % legacy torque-input script (DC model is default since 21/10/2026)
 
     % Ensure slip disabled for dynamics validation
     params.slip.enabled = false;

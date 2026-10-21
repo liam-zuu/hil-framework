@@ -24,6 +24,7 @@ function validate_cross_ode45()
     fprintf('=== VALIDATE CROSS ODE45 (Cross-validation Tầng 1) ===\n\n');
 
     params = params_mecanum();
+    params = use_torque_model(params);   % legacy torque-input script (DC model is default since 21/10/2026)
     params.slip.enabled = false;
 
     dt = params.dt;
