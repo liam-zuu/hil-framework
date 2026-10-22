@@ -22,6 +22,9 @@ sudo python run_hil.py --traj line --speed 0.3
 # 5. SPI loopback test (short MOSI pin 19 to MISO pin 21)
 python run_hil.py --loopback-test --steps 1000
 
+# 6. EncoderGen check: send constant wheel speeds (no dynamics), 15 s
+sudo python run_hil.py --fixed-omega 10,20,-10,-20 --steps 15000 --no-traj
+
 Notes
 ──────
 - sudo required for SCHED_FIFO (or grant cap_sys_nice).
@@ -52,8 +55,16 @@ log = logging.getLogger('hil.main')
 
 # ── Process target functions ──────────────────────────────────────────────
 
+def _parse_fixed_omega(text: str) -> list:
+    """'10,20,-10,-20' -> [10.0, 20.0, -10.0, -20.0] (wheel order 1-4, rad/s)."""
+    vals = [float(v) for v in text.split(',')]
+    if len(vals) != 4:
+        raise ValueError(f'--fixed-omega needs 4 comma-separated values, got {len(vals)}')
+    return vals
+
+
 def _run_plant(cfg, shared_state: mp.Array, shared_ref: mp.Array, use_mock: bool, seed: int = 0,
-               wheels_lifted: bool = False) -> None:
+               wheels_lifted: bool = False, fixed_omega: list = None) -> None:
     """Process 1 target: plant simulation loop."""
     import logging
     logging.basicConfig(
@@ -72,7 +83,13 @@ def _run_plant(cfg, shared_state: mp.Array, shared_ref: mp.Array, use_mock: bool
     params = MecanumParams()
     if wheels_lifted:
         params.update_physical(wheels_lifted=True)     # spec S02 A-K: wheels off the ground
-    plant = MockPlant() if use_mock else MecanumPlant(params=params, dt=cfg.period_us / 1e6, seed=seed)
+    if fixed_omega is not None:
+        # EncoderGen check: constant wheel speeds, no dynamics; SPI/GPIO path stays real
+        plant = MockPlant()
+        plant.reset(list(fixed_omega) + [0.0] * 6)
+        logging.getLogger('hil.main').info('Fixed wheel omega [rad/s] = %s (no plant dynamics)', fixed_omega)
+    else:
+        plant = MockPlant() if use_mock else MecanumPlant(params=params, dt=cfg.period_us / 1e6, seed=seed)
     logging.getLogger('hil.main').info('Plant RNG seed = %s, wheels_lifted = %s', seed, wheels_lifted)
     node  = HILNode(plant, config=cfg, shared_state=shared_state, shared_ref=shared_ref)
     node.run()
@@ -178,6 +195,9 @@ def _parse_args() -> argparse.Namespace:
                    help='BCM sync GPIO pin')
     p.add_argument('--no-traj',       action='store_true',
                    help='Skip trajectory publisher process')
+    p.add_argument('--fixed-omega',   default=None, metavar='W1,W2,W3,W4',
+                   help='EncoderGen check: send these constant wheel speeds [rad/s] instead of '
+                        'running the plant (use with --steps; implies --no-traj)')
     return p.parse_args()
 
 
@@ -216,6 +236,9 @@ def main() -> int:
         duration = args.duration,
     )
     lifted = False
+    fixed_omega = _parse_fixed_omega(args.fixed_omega) if args.fixed_omega else None
+    if fixed_omega is not None:
+        args.no_traj = True
     if args.test:
         if args.test not in GROUP_A:
             raise SystemExit(f'--test must be one of {sorted(GROUP_A)}')
@@ -235,7 +258,7 @@ def main() -> int:
 
     p1 = mp.Process(
         target=_run_plant,
-        args=(hil_cfg, shared_state, shared_ref, args.mock, args.seed, lifted),
+        args=(hil_cfg, shared_state, shared_ref, args.mock, args.seed, lifted, fixed_omega),
         name='HIL-Plant',
         daemon=True,
     )
