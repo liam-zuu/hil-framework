@@ -595,7 +595,19 @@ void HAL_TIM_Base_MspInit(TIM_HandleTypeDef* tim_baseHandle)
     HAL_NVIC_SetPriority(TIM17_IRQn, 0, 0);
     HAL_NVIC_EnableIRQ(TIM17_IRQn);
   /* USER CODE BEGIN TIM17_MspInit 1 */
-
+    /* PF7 -> TIM17_CH1 (LPWM wheel 4). The .ioc only enables the TIM17 clock, so
+     * CubeMX generates no pin (bug H7-TIM17-PIN, 22/10). Configured here (Liam,
+     * option A); when the .ioc gets PF7 = TIM17_CH1, delete this block. */
+    {
+      GPIO_InitTypeDef gpio17 = {0};
+      __HAL_RCC_GPIOF_CLK_ENABLE();
+      gpio17.Pin = GPIO_PIN_7;
+      gpio17.Mode = GPIO_MODE_AF_PP;
+      gpio17.Pull = GPIO_NOPULL;
+      gpio17.Speed = GPIO_SPEED_FREQ_LOW;
+      gpio17.Alternate = GPIO_AF1_TIM17;
+      HAL_GPIO_Init(GPIOF, &gpio17);
+    }
   /* USER CODE END TIM17_MspInit 1 */
   }
 }

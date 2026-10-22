@@ -14,6 +14,8 @@ typedef struct {
     uint8_t            state;      /* 0=WAIT_RISE, 1=WAIT_FALL */
     uint32_t           last_tick;
     float              duty;
+    GPIO_TypeDef      *port;       /* input pin, read when no edge arrives */
+    uint16_t           pin;
 } PwmCh_t;
 
 #define N_CHANNELS 8u
@@ -62,6 +64,16 @@ void PWMCapture_Init(TIM_HandleTypeDef *ht5,
     _ch[6].htim = ht16; _ch[6].hal_ch = TIM_CHANNEL_1;
     _ch[7].htim = ht17; _ch[7].hal_ch = TIM_CHANNEL_1;
 
+    /* Input pins (tim.c, pwm_capture.h) */
+    _ch[0].port = GPIOA; _ch[0].pin = GPIO_PIN_0;
+    _ch[1].port = GPIOA; _ch[1].pin = GPIO_PIN_1;
+    _ch[2].port = GPIOA; _ch[2].pin = GPIO_PIN_2;
+    _ch[3].port = GPIOA; _ch[3].pin = GPIO_PIN_3;
+    _ch[4].port = GPIOE; _ch[4].pin = GPIO_PIN_5;
+    _ch[5].port = GPIOE; _ch[5].pin = GPIO_PIN_6;
+    _ch[6].port = GPIOF; _ch[6].pin = GPIO_PIN_6;
+    _ch[7].port = GPIOF; _ch[7].pin = GPIO_PIN_7;
+
     printf("PWMCapture: resolve bits\r\n");
 
     /* Resolve ccer_bit, ccer_pol, dier_bit */
@@ -107,6 +119,15 @@ void PWMCapture_Init(TIM_HandleTypeDef *ht5,
                              TIM_DIER_CC3IE | TIM_DIER_CC4IE);
     NVIC->ISER[TIM5_IRQn >> 5] = (1u << (TIM5_IRQn & 0x1F));
 
+    /* TIM15 CH1-2 (LPWM wheels 1-2): was never started (bug H7-TIM15-ARM, 22/10).
+     * Rising edge first, start counter, drop stale flags, then enable interrupts.
+     * main.c enables the TIM15 NVIC line after this function. */
+    ht15->Instance->CCER &= ~(TIM_CCER_CC1P | TIM_CCER_CC2P);
+    ht15->Instance->CCER |=  (TIM_CCER_CC1E | TIM_CCER_CC2E);
+    ht15->Instance->CR1  |=  TIM_CR1_CEN;
+    ht15->Instance->SR    =  0;
+    ht15->Instance->DIER |=  (TIM_DIER_CC1IE | TIM_DIER_CC2IE);
+
     /* TIM16 CH1 */
     ht16->Instance->CCER &= ~TIM_CCER_CC1P;
     ht16->Instance->CCER |=  TIM_CCER_CC1E;
@@ -121,16 +142,22 @@ void PWMCapture_Init(TIM_HandleTypeDef *ht5,
 
 }
 
+/* Duty of one channel. Without an edge for PWM_TIMEOUT_MS the pin is held at a
+ * constant level (0 % or 100 %): return that level instead of 0 (bug H7-PWM-LEVEL,
+ * 22/10). The ESP32 holds the inactive BTS7960 input HIGH (motor.c motor_set). */
+static float _chan_duty(const PwmCh_t *c, uint32_t now)
+{
+    if ((now - c->last_tick) < PWM_TIMEOUT_MS)
+        return c->duty;
+    return (HAL_GPIO_ReadPin(c->port, c->pin) == GPIO_PIN_SET) ? 1.0f : 0.0f;
+}
+
 void PWMCapture_GetDuty(float *duty_out)
 {
     uint32_t now = HAL_GetTick();
     for (uint8_t w = 0; w < PWM_NUM_WHEELS; w++) {
-        float rpwm = 0.0f;
-        float lpwm = 0.0f;
-        if ((now - _ch[w].last_tick) < PWM_TIMEOUT_MS)
-            rpwm = _ch[w].duty;
-        if ((now - _ch[w + 4].last_tick) < PWM_TIMEOUT_MS)
-            lpwm = _ch[w + 4].duty;
+        float rpwm = _chan_duty(&_ch[w], now);
+        float lpwm = _chan_duty(&_ch[w + 4], now);
         duty_out[w] = rpwm - lpwm;
     }
 }

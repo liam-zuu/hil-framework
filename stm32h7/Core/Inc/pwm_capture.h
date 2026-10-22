@@ -40,7 +40,8 @@ void  PWMCapture_Init(TIM_HandleTypeDef *ht5,
 
 /* Returns net duty [-1..1] for each wheel.
  * Positive = RPWM dominates (forward), Negative = LPWM dominates (reverse).
- * Sets duty to 0 if no pulse seen within PWM_TIMEOUT_MS. */
+ * A channel with no edge within PWM_TIMEOUT_MS counts as its pin level
+ * (1.0 if held HIGH, 0.0 if held LOW). */
 void  PWMCapture_GetDuty(float *duty_out);  /* float[4] */
 
 /* Call from HAL_TIM_IC_CaptureCallback in main.c */
