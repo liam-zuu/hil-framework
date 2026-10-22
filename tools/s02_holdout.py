@@ -9,8 +9,11 @@ plant replay of the same plan (S01_PLANT run01 raw/, plant frozen at e18d217):
       crossing 0), t63 (63 % of the change to the new steady speed),
       overshoot beyond the new steady speed [%]
   H3  dead-zone extrapolation: |omega_ss| = s * (u - u_dz) fitted on levels
-      >= 400 only (per wheel x direction), predicted at 125 / 150 / 200; a level
-      where the wheel does not turn is compared as turns / does not turn
+      >= 400 only (per wheel x direction), predicted at 125 / 150 / 200. Two rows
+      per level (since 22/10, review R07): 'turns' (turning = |omega| > q_omega,
+      same threshold for the prediction and for the measurement, majority of
+      reps) and 'omega_ss' (speed, k * s criterion). H3 tests the linear
+      extrapolation from PWM >= 400, not the whole DC plant.
 
 Acceptance (spec S02 P1-3, fixed before the results): err = |model - mean(meas)|
 passes when err <= k * s_used, k = 3.04, s_used = max(sd of the 5 reps, q / sqrt(12)).
@@ -125,6 +128,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--out', required=True)
     ap.add_argument('--no-plots', action='store_true')
+    ap.add_argument('--run', type=int, default=1)
+    ap.add_argument('--notes', default='', help='why this run exists (written to meta.yaml)')
     a = ap.parse_args()
     if os.path.isdir(a.out) and os.listdir(a.out):
         sys.exit(f'{a.out} already holds data: use a new folder.')
@@ -163,16 +168,18 @@ def main():
             for lv in H3_LEVELS:
                 mv = [steady_omega(r) for r in sel(meas, wheel=w, scenario='step', direction=d, level=lv)]
                 pred = max(slope * (lv / 1000 - u_dz), 0.0)
+                # Same rule for measurement and model (R07, 22/10): turning = |omega| > TURN_THRESH,
+                # the measurement in a majority of reps. Two rows per level: state and speed.
                 turning = [x > TURN_THRESH for x in mv]
-                if all(turning) and pred > 0:
-                    rows.append(row('H3', w, d, lv, '', 'omega_ss', 'rad/s', mv, [pred], Q_W))
-                else:
-                    meas_turns = sum(turning) > len(turning) / 2
-                    rows.append(dict(test='H3', wheel=w, direction=d, pwm_level=lv, transition='', quantity='turns',
-                                     unit='fraction of reps', meas_mean=float(np.mean(turning)), meas_sd=np.nan,
-                                     n=len(turning), model=float(pred > 0), err=np.nan, k=K, s_used=np.nan,
-                                     err_over_s=np.nan, pass_=bool(meas_turns == (pred > 0)),
-                                     note=f'predicted omega {pred:.3g} rad/s; mean measured {np.mean(mv):.3g} rad/s'))
+                meas_turns = sum(turning) > len(turning) / 2
+                model_turns = pred > TURN_THRESH
+                rows.append(dict(test='H3', wheel=w, direction=d, pwm_level=lv, transition='', quantity='turns',
+                                 unit='fraction of reps', meas_mean=float(np.mean(turning)), meas_sd=np.nan,
+                                 n=len(turning), model=float(model_turns), err=np.nan, k=K, s_used=np.nan,
+                                 err_over_s=np.nan, pass_=bool(meas_turns == model_turns),
+                                 note=f'predicted omega {pred:.3g} rad/s; mean measured {np.mean(mv):.3g} rad/s; '
+                                      f'threshold {TURN_THRESH:.3f} rad/s'))
+                rows.append(row('H3', w, d, lv, '', 'omega_ss', 'rad/s', mv, [pred], Q_W))
 
     cols = ['test', 'wheel', 'direction', 'pwm_level', 'transition', 'quantity', 'unit', 'meas_mean', 'meas_sd',
             'n', 'model', 'err', 'k', 's_used', 'err_over_s', 'pass', 'note']
@@ -194,7 +201,8 @@ def main():
         for qty in sorted({r['quantity'] for r in rs}):
             rq = [r for r in rs if r['quantity'] == qty]
             rel = [100 * (r['model'] - r['meas_mean']) / r['meas_mean'] for r in rq
-                   if qty != 'turns' and r['meas_mean'] not in (0,) and not np.isnan(r['meas_mean'])]
+                   if qty != 'turns' and not np.isnan(r['meas_mean'])
+                   and abs(r['meas_mean']) > (TURN_THRESH if qty == 'omega_ss' else 0)]   # % of ~0 is meaningless
             e_s = [r['err_over_s'] for r in rq if not np.isnan(r['err_over_s'])]
             extra = (f', model - meas {min(rel):+.0f}..{max(rel):+.0f} %, err/s {min(e_s):.1f}..{max(e_s):.1f}'
                      if rel and qty != 'overshoot_pct' else '')
@@ -229,7 +237,7 @@ def main():
     with open(os.path.join(a.out, 'meta.yaml'), 'w', encoding='utf-8') as f:
         f.write(f"""spec: S02
 part: P1
-run: 1
+run: {a.run}
 date: {time.strftime('%Y-%m-%d')}
 setup: analysis_holdout          # re-analysis of existing data, no new measurement
 operator: Claude (phiên CODE)
@@ -242,7 +250,8 @@ resolution: {{q_time_s: {Q_T}, q_omega_rad_s: {Q_W:.4f}, note: "omega = 10 ms co
 definitions:
   H1: "tau_brake: time from brake command to |omega| <= 0.368 |omega at command| (mean of last 100 ms before)"
   H2: "per transition: t0 = to omega sign of new steady speed; t63 = to 63 % of change; overshoot = (peak - |w_new|)/|w_new|; w_new = mean of last 300 ms of the 2 s segment"
-  H3: "|omega_ss| (mean last 0.5 s of hold) = s (u - u_dz) fitted on levels >= {H3_FIT_MIN} only; predicted at {list(H3_LEVELS)}; turning = |omega_ss| > {Q_W:.3f} rad/s in a majority of reps"
+  H3: "|omega_ss| (mean last 0.5 s of hold) = s (u - u_dz) fitted on levels >= {H3_FIT_MIN} only; predicted at {list(H3_LEVELS)}; two rows per level: turns (turning = |omega| > {Q_W:.3f} rad/s, same threshold for prediction and measurement, measurement by majority of reps) and omega_ss (k * s). Tests the linear extrapolation, not the whole DC plant"
+notes: "{a.notes}"
 files:
   - holdout_metrics.csv: "one row per quantity x wheel x level (x transition), columns of spec P1-4 plus err_over_s, note"
   - holdout_summary.txt: "pass counts per test and quantity, range of model - measured"
