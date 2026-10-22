@@ -99,7 +99,18 @@ Vấn đề: host không có WAKE, nên **mỗi lần ghi cũng phải chờ INT
 - **Không dùng SPI2** như Outline ghi: MISO của SPI2 chỉ ra PB14 (đang là GPIO Output, LED trên Nucleo) hoặc PC2 (chân analog `_C`). Đổi sang SPI3 không ảnh hưởng quyết định nào khác.
 - Rủi ro chân: PB3, PB4, PA15 là chân JTAG (SWO, NJTRST, JTDI). ST-Link nạp bằng SWD nên dự kiến không vướng; kiểm ở G1.
 
-**Đường dữ liệu RPi5 → H7:** frame MOSI 36 byte hiện chỉ còn 7 byte trống (22–23, 31–35; `protocol.py:4-13`). Plant cần gửi: gz, ax, ay, az, yaw_imu (int16 mỗi giá trị = 10 byte) + cờ IMU. **Đề xuất: tăng frame lên 40 byte** (thêm byte 36–39), cờ IMU (`IMU_NEW`, bit bơm lỗi) đặt vào các bit trống của `traj_flags` (byte 30). Phương án thay thế: giữ 36 byte và gửi luân phiên (frame chẵn gz/ax/ay, frame lẻ yaw/az), phức tạp hơn và dễ lẫn mẫu cũ. *Cần Liam chọn.* Đổi kích thước frame phải sửa đồng thời `protocol.py`, `spi_master.py`, `spi1_handler.c` và test, trong cùng một commit.
+**Đường dữ liệu RPi5 → H7:** frame MOSI 36 byte hiện chỉ còn 7 byte trống (22–23, 31–35; `protocol.py:4-13`). Plant cần gửi: gz, ax, ay, az, yaw_imu (int16 mỗi giá trị = 10 byte) + cờ IMU. **Liam chốt 22/10: tăng frame lên 40 byte** (cả hai chiều). Đã kiểm: frame 36 byte hiện **không có trường IMU nào**; θ (byte 12–13) và wz (byte 18–19) là trạng thái thật của plant, không phải giá trị đo kiểu IMU (`hil_protocol.h:16-74`, `spi1_handler.c:41-59`, `protocol.py:4-20`). Bố cục MOSI đề xuất (int16 big-endian như các trường cũ):
+
+| Byte | Trường | Thang |
+|---|---|---|
+| 22–23 | gz_imu | ±`HIL_OMEGA_BODY_MAX` (10 rad/s) |
+| 31–32, 33–34, 35–36 | ax, ay, az | ±4 g (`imu_accel_range`, `params.py:124`) |
+| 37–38 | yaw_imu | ±π rad |
+| 39 | imu_seq | tăng 1 mỗi mẫu IMU mới của plant (H7 biết có mẫu mới) |
+
+Bit bơm lỗi IMU (mất, đóng băng, reset) dùng các bit trống của `traj_flags` (byte 30) hoặc `fault_flags` (byte 20), chốt ở G1. MISO: byte 36–39 để 0 (dành cho sau này).
+
+**Giới hạn phần cứng:** ở 1 MHz hiện dùng, 40 byte mất 320 µs so với 288 µs (thêm 32 µs); `hil_node.py:15-18` ước lượng cả chu kỳ khoảng 400 µs, nên vẫn dưới 1 ms (ước lượng, kiểm lại bằng `--jitter-only` trên Pi). Có thể nâng SPI lên 4 MHz như kế hoạch cũ nếu cần thêm biên. DMA của H7 không giới hạn ở độ dài này. Sửa đồng thời `hil_protocol.h`, `spi1_handler.c`, `protocol.py`, `spi_master.py` và test, trong cùng một commit; nhánh `h7-uart-fifo` không đụng các file này (chỉ `uart_relay.*`, `main.c`), nên không xung đột khi gộp.
 
 **Phần mềm H7:**
 - Lõi giả lập viết bằng **C thuần, không gọi HAL** (`bno_emu.c`): máy trạng thái reset → advertisement → reset complete → trả lệnh control → phát report. Cùng mã này chạy trên PC ở G1 (ghép với `sh2.c` thật qua HAL giả) và trên H7 ở G2.
@@ -126,7 +137,7 @@ Vấn đề: host không có WAKE, nên **mỗi lần ghi cũng phải chờ INT
 | R3 | Va chạm ghi/đọc (mục 4.3) | Có thể khác chip thật | Ghi khác biệt; đếm số lần |
 | R4 | Chính sách INT rỗng (mục 4.2) chưa đối chiếu chip thật | Nếu chip thật khác, G2 vẫn đạt nhưng mô tả "giống chip thật" yếu | Bản ghi logic analyzer (tùy chọn, dưới) |
 | R5 | SPI3 dùng chân JTAG | Có thể vướng debug | Kiểm ở G1 bằng CubeMX |
-| R6 | Đổi frame 36 → 40 byte | Sửa 3 file ở 2 board + test | Chờ Liam chọn; một commit |
+| R6 | Đổi frame 36 → 40 byte (Liam chốt 22/10) | Sửa 4 file ở 2 board + test | Một commit; pytest + biên dịch thử H7 trước khi nhờ Liam nạp |
 | R7 | Tải ngắt H7 tăng | EncoderGen/PWMCapture lệch | Ưu tiên thấp hơn; đo ở G3 |
 | R8 | `imu.cpp` gọi `xSemaphoreTakeFromISR` trong task callback | Sai API (hàm chỉ dành cho ngắt) | Sửa cùng spec controller–IMU |
 
