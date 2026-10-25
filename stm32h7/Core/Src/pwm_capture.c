@@ -20,6 +20,36 @@ typedef struct {
 
 #define N_CHANNELS 8u
 static PwmCh_t _ch[N_CHANNELS];
+static volatile uint32_t _isr_count;   /* capture interrupts handled (debug) */
+
+/* Arm the LPWM capture channels of TIM15 (2 channels) or TIM16/TIM17 (1 channel):
+ * input filter 0xF, rising edge, counter on, stale flags cleared while the
+ * channels are off, then interrupts enabled. NVIC stays off until main.c. */
+static void _arm_lpwm_timer(TIM_HandleTypeDef *ht, uint8_t n_ch)
+{
+    TIM_TypeDef *t = ht->Instance;
+    uint32_t ccer = TIM_CCER_CC1E;
+    uint32_t pol  = TIM_CCER_CC1P | TIM_CCER_CC1NP;
+    uint32_t dier = TIM_DIER_CC1IE;
+    uint32_t sr   = TIM_SR_CC1IF | TIM_SR_CC1OF;
+
+    t->DIER &= ~(TIM_DIER_CC1IE | TIM_DIER_CC2IE);
+    t->CCER &= ~(TIM_CCER_CC1E | TIM_CCER_CC2E);
+    t->CCMR1 = (t->CCMR1 & ~TIM_CCMR1_IC1F) | (0xFu << TIM_CCMR1_IC1F_Pos);
+    if (n_ch == 2u) {
+        t->CCMR1 = (t->CCMR1 & ~TIM_CCMR1_IC2F) | (0xFu << TIM_CCMR1_IC2F_Pos);
+        ccer |= TIM_CCER_CC2E;
+        pol  |= TIM_CCER_CC2P | TIM_CCER_CC2NP;
+        dier |= TIM_DIER_CC2IE;
+        sr   |= TIM_SR_CC2IF | TIM_SR_CC2OF;
+    }
+    t->CCER &= ~pol;            /* rising edge */
+    t->CR1  |= TIM_CR1_CEN;
+    t->SR    = ~sr;             /* rc_w0: clear capture and overcapture flags */
+    t->CCER |= ccer;
+    t->SR    = ~sr;
+    t->DIER |= dier;
+}
 
 static uint32_t _hal_active_to_ch(HAL_TIM_ActiveChannel ac)
 {
@@ -119,27 +149,24 @@ void PWMCapture_Init(TIM_HandleTypeDef *ht5,
                              TIM_DIER_CC3IE | TIM_DIER_CC4IE);
     NVIC->ISER[TIM5_IRQn >> 5] = (1u << (TIM5_IRQn & 0x1F));
 
-    /* TIM15 CH1-2 (LPWM wheels 1-2): was never started (bug H7-TIM15-ARM, 22/10).
-     * Rising edge first, start counter, drop stale flags, then enable interrupts.
-     * main.c enables the TIM15 NVIC line after this function. */
-    ht15->Instance->CCER &= ~(TIM_CCER_CC1P | TIM_CCER_CC2P);
-    ht15->Instance->CCER |=  (TIM_CCER_CC1E | TIM_CCER_CC2E);
-    ht15->Instance->CR1  |=  TIM_CR1_CEN;
-    ht15->Instance->SR    =  0;
-    ht15->Instance->DIER |=  (TIM_DIER_CC1IE | TIM_DIER_CC2IE);
+    printf("PWMCapture: TIM5 armed\r\n");
 
-    /* TIM16 CH1 */
-    ht16->Instance->CCER &= ~TIM_CCER_CC1P;
-    ht16->Instance->CCER |=  TIM_CCER_CC1E;
-    ht16->Instance->CR1  |= TIM_CR1_CEN;
-    ht16->Instance->DIER |=  TIM_DIER_CC1IE;
+    /* TIM15 CH1-2, TIM16 CH1, TIM17 CH1 (LPWM wheels 1-4).
+     * Same treatment as TIM5 (H7 hang after "resolve bits", 25/10):
+     *   input filter 0xF (CubeMX left ICFilter = 0, floating/noisy pins storm),
+     *   rising edge, start counter, drop stale flags with CCxE off, then enable
+     *   interrupts. main.c enables these NVIC lines only after this function. */
+    _arm_lpwm_timer(ht15, 2u);
+    printf("PWMCapture: TIM15 armed\r\n");
+    _arm_lpwm_timer(ht16, 1u);
+    _arm_lpwm_timer(ht17, 1u);
+    printf("PWMCapture: TIM16/17 armed\r\n");
+}
 
-    /* TIM17 CH1 */
-    ht17->Instance->CCER &= ~TIM_CCER_CC1P;
-    ht17->Instance->CCER |=  TIM_CCER_CC1E;
-    ht17->Instance->CR1  |= TIM_CR1_CEN;
-    ht17->Instance->DIER |=  TIM_DIER_CC1IE;
-
+/* Number of capture interrupts handled since boot (debug: interrupt load). */
+uint32_t PWMCapture_GetIsrCount(void)
+{
+    return _isr_count;
 }
 
 /* Duty of one channel. Without an edge for PWM_TIMEOUT_MS the pin is held at a
@@ -166,6 +193,7 @@ void PWMCapture_IC_Callback(TIM_HandleTypeDef *htim)
 {
 //	printf("IC!\r\n");  // thêm tạm
 
+    _isr_count++;
     uint32_t trig_ch = _hal_active_to_ch(htim->Channel);
     if (trig_ch == 0xFFFFFFFFu) return;
 

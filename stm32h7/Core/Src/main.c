@@ -135,10 +135,8 @@ int main(void)
   HAL_NVIC_SetPriority(TIM15_IRQn, 5, 0);
   HAL_NVIC_SetPriority(TIM16_IRQn, 5, 0);
   HAL_NVIC_SetPriority(TIM17_IRQn, 5, 0);
-  HAL_NVIC_EnableIRQ(TIM5_IRQn);
-  HAL_NVIC_EnableIRQ(TIM15_IRQn);
-  HAL_NVIC_EnableIRQ(TIM16_IRQn);
-  HAL_NVIC_EnableIRQ(TIM17_IRQn);
+  /* NVIC lines stay off until PWMCapture_Init has cleared stale flags (25/10:
+   * enabling them here first could hang the boot after "resolve bits"). */
 
   PWMCapture_Init(&htim5, &htim15, &htim16, &htim17);
 
@@ -195,6 +193,13 @@ int main(void)
         printf("PWM: %.2f %.2f %.2f %.2f\r\n",
                (double)duty[0], (double)duty[1],
                (double)duty[2], (double)duty[3]);
+
+        /* Capture interrupt rate (debug, 25/10): expected about 2 x 20 kHz per
+         * channel that has PWM edges, 0 when all PWM pins are idle. */
+        static uint32_t _isr_last = 0;
+        uint32_t isr_now = PWMCapture_GetIsrCount();
+        printf("ISR: %lu/s\r\n", (unsigned long)((isr_now - _isr_last) * 2u));
+        _isr_last = isr_now;
         printf("---\r\n");
 
         HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_0);

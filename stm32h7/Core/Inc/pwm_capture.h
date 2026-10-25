@@ -47,4 +47,7 @@ void  PWMCapture_GetDuty(float *duty_out);  /* float[4] */
 /* Call from HAL_TIM_IC_CaptureCallback in main.c */
 void  PWMCapture_IC_Callback(TIM_HandleTypeDef *htim);
 
+/* Capture interrupts handled since boot (debug: interrupt load). */
+uint32_t PWMCapture_GetIsrCount(void);
+
 #endif /* PWM_CAPTURE_H */
