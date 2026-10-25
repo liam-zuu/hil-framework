@@ -140,7 +140,11 @@ int main(void)
 
   PWMCapture_Init(&htim5, &htim15, &htim16, &htim17);
 
+  /* One line before each enable: if the boot stops right after a line, that
+   * timer's interrupt is the one that never lets main run (26/10). */
+  printf("NVIC: enabling TIM5\r\n");
   HAL_NVIC_EnableIRQ(TIM5_IRQn);
+  printf("NVIC: enabling TIM15/16/17\r\n");
   HAL_NVIC_EnableIRQ(TIM15_IRQn);
   HAL_NVIC_EnableIRQ(TIM16_IRQn);
   HAL_NVIC_EnableIRQ(TIM17_IRQn);

@@ -136,9 +136,15 @@ void PWMCapture_Init(TIM_HandleTypeDef *ht5,
 
     /* ── TIM5 CH1-4 ────────────────────────────────────────────────────────
      * Init order: CCER → CEN → disable CC2E to clear stuck CC2IF → SR=0
-     *             → re-enable CC2E → DIER → NVIC enable
-     * ICFilter=0xF in CubeMX required to suppress PA1 floating noise. */
+     *             → re-enable CC2E → DIER (NVIC: main.c, after this function)
+     * Input filter 0xF on all 4 channels, set here with the channels off:
+     * tim.c (CubeMX) leaves ICFilter = 0, and the 18/06 fix for the PA1
+     * interrupt storm was never committed (26/10). */
     ht5->Instance->CCER = 0;
+    ht5->Instance->CCMR1 = (ht5->Instance->CCMR1 & ~(TIM_CCMR1_IC1F | TIM_CCMR1_IC2F))
+                         | (0xFu << TIM_CCMR1_IC1F_Pos) | (0xFu << TIM_CCMR1_IC2F_Pos);
+    ht5->Instance->CCMR2 = (ht5->Instance->CCMR2 & ~(TIM_CCMR2_IC3F | TIM_CCMR2_IC4F))
+                         | (0xFu << TIM_CCMR2_IC3F_Pos) | (0xFu << TIM_CCMR2_IC4F_Pos);
     ht5->Instance->CCER  = (TIM_CCER_CC1E | TIM_CCER_CC2E |
                              TIM_CCER_CC3E | TIM_CCER_CC4E);
     ht5->Instance->CR1  |= TIM_CR1_CEN;
@@ -147,9 +153,8 @@ void PWMCapture_Init(TIM_HandleTypeDef *ht5,
     ht5->Instance->CCER |= TIM_CCER_CC2E;   /* re-enable CC2E */
     ht5->Instance->DIER  = (TIM_DIER_CC1IE | TIM_DIER_CC2IE |
                              TIM_DIER_CC3IE | TIM_DIER_CC4IE);
-    NVIC->ISER[TIM5_IRQn >> 5] = (1u << (TIM5_IRQn & 0x1F));
 
-    printf("PWMCapture: TIM5 armed\r\n");
+    printf("PWMCapture: TIM5 armed (filter 0xF, NVIC still off)\r\n");
 
     /* TIM15 CH1-2, TIM16 CH1, TIM17 CH1 (LPWM wheels 1-4).
      * Same treatment as TIM5 (H7 hang after "resolve bits", 25/10):
