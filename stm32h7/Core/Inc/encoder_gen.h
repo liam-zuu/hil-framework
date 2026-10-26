@@ -8,7 +8,7 @@
  *
  * Hardware (CubeMX-generated, OC Toggle CH1/CH2):
  *   TIM1 → Wheel 1 (CH1=PE9,  CH2=PE11)
- *   TIM2 → Wheel 2 (CH1=PA0,  CH2=PA1)
+ *   TIM2 → Wheel 2 (CH1=PA15, CH2=PB3)   (PA0/PA1 are PWMCapture inputs, tim.c)
  *   TIM3 → Wheel 3 (CH1=PC6,  CH2=PC7)
  *   TIM4 → Wheel 4 (CH1=PD12, CH2=PD13)
  *
@@ -32,20 +32,23 @@
  *
  * Each channel toggles independently every half_period_ticks once started;
  * the initial 90 deg offset between A and B encodes direction and is
- * preserved automatically as both channels advance by the same
- * half_period_ticks on every callback.
+ * preserved as both channels advance by the same half_period_ticks on every
+ * callback. At every start both pins are forced low first, so the first
+ * edge of each is rising and the lead/lag does not depend on the levels
+ * left by the previous run.
  *
  * ── Debug / verification ─────────────────────────────────────────────────
  * For each wheel, the time between two consecutive CH1 (channel A)
- * callbacks is measured in timer ticks. Two consecutive callbacks on the
- * same channel = one toggle pair = one full pulse period.
+ * callbacks is measured in timer ticks. One callback = one toggle, so
  *
- *   measured_period_ticks ≈ 2 * half_period_ticks   (if logic is correct)
- *   measured_freq_hz      = ENC_TIMER_FREQ / measured_period_ticks
- *   expected_freq_hz      = |omega| / (2*pi) * ENC_PPR
+ *   ch1_period_ticks ≈ half_period_ticks
+ *   measured_freq_hz = ENC_TIMER_FREQ / (2 * ch1_period_ticks)
+ *   expected_freq_hz = |omega| / (2*pi) * ENC_PPR
  *
- * Compare measured_freq_hz vs expected_freq_hz to check for the 2*pi-class
- * discrepancy seen previously. EncoderGen_GetDebug() exposes both per wheel.
+ * measured_freq_hz comes from the same timer that makes the pulses: it checks
+ * the scheduling, not the formula. The independent check is the ESP32 count
+ * (env enc_count) or a logic analyzer (26/10: the version without pi gave
+ * measured = pi x expected, and the ESP32 counted the same).
  */
 
 #define ENC_NUM_WHEELS  4u
@@ -57,7 +60,7 @@ typedef struct {
     int8_t   dir;             /* +1 fwd, -1 rev, 0 stopped                */
     uint32_t half_period;     /* current half-period [ticks]              */
     uint32_t ch1_period;      /* measured period between CH1 toggles [ticks] */
-    float    measured_freq;   /* ENC_TIMER_FREQ / ch1_period [Hz]         */
+    float    measured_freq;   /* ENC_TIMER_FREQ / (2 * ch1_period) [Hz]   */
     float    expected_freq;   /* |omega|/(2*pi) * ENC_PPR [Hz]            */
 } EncoderGenDebug_t;
 
