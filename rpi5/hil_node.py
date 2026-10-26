@@ -12,7 +12,7 @@ Responsibility:
 
 Real-time requirements:
   - Must complete each tick in < 1 ms (1 ms period)
-  - Typical work: GPIO pulse (~10 μs) + SPI 36 bytes (288 μs at 1 MHz,
+  - Typical work: GPIO pulse (~10 μs) + SPI 40 bytes (320 μs at 1 MHz,
     72 μs at 4 MHz) + spidev overhead + plant (~50 μs)
   - Total ≈ 400 μs at 1 MHz → still inside 1 ms; raise spi_speed_hz to
     2–4 MHz after the link is validated to regain margin

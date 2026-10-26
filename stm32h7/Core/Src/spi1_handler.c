@@ -1,5 +1,5 @@
 /* spi1_handler.c — SPI1 slave DMA handler (RPi5 ↔ H7)
- * Frame: 36 bytes full-duplex (v2 — includes trajectory reference)
+ * Frame: 40 bytes full-duplex (v3 — trajectory reference + IMU values)
  * Re-arm inside HAL_SPI_TxRxCpltCallback — safe on H7 HAL.
  */
 
@@ -15,6 +15,7 @@ static uint8_t _rx[SPI1_FRAME_LEN];
 static volatile uint8_t _frame_ready = 0;
 static HIL_State_t   _state;
 static HIL_TrajRef_t _traj;
+static HIL_Imu_t     _imu;
 static HIL_Output_t  _output;
 
 /* ── Helpers ─────────────────────────────────────────────────────────── */
@@ -50,14 +51,20 @@ static void _decode(void)
     _state.omega_body = _rd16(&_rx[18]) * (HIL_OMEGA_BODY_MAX / INT16_MAXF);
     _state.fault_flags = _rx[20];
     _state.seq         = _rx[21];
-    /* bytes 22–23: reserved */
+    _imu.gz           = _rd16(&_rx[22]) * (HIL_IMU_GYRO_MAX   / INT16_MAXF);
 
     /* Trajectory reference (bytes 24–30) — NEW in v2 */
     _traj.vx_ref      = _rd16(&_rx[24]) * (HIL_REF_VEL_MAX   / INT16_MAXF);
     _traj.vy_ref      = _rd16(&_rx[26]) * (HIL_REF_VEL_MAX   / INT16_MAXF);
     _traj.wz_ref      = _rd16(&_rx[28]) * (HIL_REF_OMEGA_MAX  / INT16_MAXF);
     _traj.traj_flags   = _rx[30];
-    /* bytes 31–35: reserved */
+
+    /* IMU values for the BNO085 emulator (bytes 22–23, 31–39) — v3 */
+    _imu.ax           = _rd16(&_rx[31]) * (HIL_IMU_ACCEL_MAX  / INT16_MAXF);
+    _imu.ay           = _rd16(&_rx[33]) * (HIL_IMU_ACCEL_MAX  / INT16_MAXF);
+    _imu.az           = _rd16(&_rx[35]) * (HIL_IMU_ACCEL_MAX  / INT16_MAXF);
+    _imu.yaw          = _rd16(&_rx[37]) * (HIL_IMU_YAW_MAX    / INT16_MAXF);
+    _imu.imu_seq      = _rx[39];
 }
 
 /* ── Encode MISO (H7 → RPi5) ────────────────────────────────────────── */
@@ -73,7 +80,7 @@ static void _encode(void)
     }
     _tx[16] = _output.status;
     _tx[17] = _output.seq;
-    /* bytes 18–35: remain 0x00 */
+    /* bytes 18–39: remain 0x00 */
 }
 
 /* ── Public API ──────────────────────────────────────────────────────── */
@@ -100,6 +107,12 @@ void SPI1_GetTrajRef(HIL_TrajRef_t *out)
 {
     *out = _traj;
     _frame_ready = 0;   /* clear after both state + traj consumed */
+}
+
+/* IMU values of the last frame (does not touch frame_ready) */
+void SPI1_GetImu(HIL_Imu_t *out)
+{
+    *out = _imu;
 }
 
 void SPI1_SetOutput(const HIL_Output_t *out)

@@ -1,10 +1,12 @@
 /* hil_protocol.h — HIL SPI frame definitions
- * MOSI: RPi5 → H7  (36 bytes: plant state + trajectory reference)
- * MISO: H7   → RPi5 (36 bytes: controller output + padding)
+ * MOSI: RPi5 → H7  (40 bytes: plant state + trajectory reference + IMU)
+ * MISO: H7   → RPi5 (40 bytes: controller output + padding)
  *
  * History:
  *   v1: 24 bytes (plant state only)
  *   v2: 36 bytes (+ vx_ref, vy_ref, wz_ref, traj_flags)
+ *   v3: 40 bytes (+ IMU values for the BNO085 emulator: gz, ax, ay, az, yaw,
+ *       imu_seq; G0 v1 §5, Liam chose 40 bytes 22/10/2026)
  */
 
 #ifndef HIL_PROTOCOL_H
@@ -13,7 +15,7 @@
 #include <stdint.h>
 
 /* ── Frame size ─────────────────────────────────────────────────────── */
-#define SPI1_FRAME_LEN      36          /* bytes, both directions */
+#define SPI1_FRAME_LEN      40          /* bytes, both directions */
 
 /* ── Scale factors (MOSI — plant state) ────────────────────────────── */
 #define HIL_OMEGA_MAX       40.0f       /* rad/s  — wheel speed  */
@@ -26,13 +28,18 @@
 #define HIL_REF_VEL_MAX     3.0f        /* m/s    — vx_ref, vy_ref */
 #define HIL_REF_OMEGA_MAX   10.0f       /* rad/s  — wz_ref         */
 
+/* ── Scale factors (MOSI — IMU values for the BNO085 emulator) ────────── */
+#define HIL_IMU_GYRO_MAX    34.906585f  /* rad/s  — gz, ±2000 deg/s (params.py imu_gyro_range)  */
+#define HIL_IMU_ACCEL_MAX   39.24f      /* m/s^2  — ax, ay, az, ±4 g (params.py imu_accel_range) */
+#define HIL_IMU_YAW_MAX     3.14159265f /* rad    — yaw                                          */
+
 /* ── Scale factors (MISO — controller output) ───────────────────────── */
 #define HIL_TORQUE_MAX      1.0f        /* N·m */
 
 /* ── Fixed-point helpers ─────────────────────────────────────────────── */
 #define INT16_MAXF          32767.0f
 
-/* ── MOSI layout (RPi5 → H7), 36 bytes ─────────────────────────────── */
+/* ── MOSI layout (RPi5 → H7), 40 bytes ─────────────────────────────── */
 /* Byte  0– 1  omega[0]     int16 × (HIL_OMEGA_MAX / INT16_MAXF)        */
 /* Byte  2– 3  omega[1]                                                  */
 /* Byte  4– 5  omega[2]                                                  */
@@ -45,14 +52,18 @@
 /* Byte 18–19  omega_body   int16 × (HIL_OMEGA_BODY_MAX / INT16_MAXF)   */
 /* Byte 20     fault_flags  uint8                                        */
 /* Byte 21     seq          uint8                                        */
-/* Byte 22–23  reserved     0x00                                         */
-/* Byte 24–25  vx_ref       int16 × (HIL_REF_VEL_MAX / INT16_MAXF)  ←NEW */
-/* Byte 26–27  vy_ref                                                ←NEW */
-/* Byte 28–29  wz_ref       int16 × (HIL_REF_OMEGA_MAX / INT16_MAXF)←NEW */
-/* Byte 30     traj_flags   uint8  (bit0=valid, bit1=new)            ←NEW */
-/* Byte 31–35  reserved     0x00                                     ←NEW */
+/* Byte 22–23  gz_imu       int16 × (HIL_IMU_GYRO_MAX / INT16_MAXF)  v3 */
+/* Byte 24–25  vx_ref       int16 × (HIL_REF_VEL_MAX / INT16_MAXF)   v2 */
+/* Byte 26–27  vy_ref                                                 v2 */
+/* Byte 28–29  wz_ref       int16 × (HIL_REF_OMEGA_MAX / INT16_MAXF) v2 */
+/* Byte 30     traj_flags   uint8  (bit0=valid, bit1=new)             v2 */
+/* Byte 31–32  ax_imu       int16 × (HIL_IMU_ACCEL_MAX / INT16_MAXF) v3 */
+/* Byte 33–34  ay_imu                                                 v3 */
+/* Byte 35–36  az_imu                                                 v3 */
+/* Byte 37–38  yaw_imu      int16 × (HIL_IMU_YAW_MAX / INT16_MAXF)   v3 */
+/* Byte 39     imu_seq      uint8, +1 for every new plant IMU sample  v3 */
 
-/* ── MISO layout (H7 → RPi5), 36 bytes ─────────────────────────────── */
+/* ── MISO layout (H7 → RPi5), 40 bytes ─────────────────────────────── */
 /* Byte  0– 1  torque[0]    int16 × (HIL_TORQUE_MAX / INT16_MAXF)       */
 /* Byte  2– 3  torque[1]                                                 */
 /* Byte  4– 5  torque[2]                                                 */
@@ -63,7 +74,7 @@
 /* Byte 14–15  pwm[3]                                                    */
 /* Byte 16     status       uint8                                        */
 /* Byte 17     seq          uint8                                        */
-/* Byte 18–35  reserved     0x00                                         */
+/* Byte 18–39  reserved     0x00                                         */
 
 /* ── Fault flags (MOSI byte 20) ─────────────────────────────────────── */
 #define HIL_FAULT_PLANT     (1u << 0)
@@ -93,6 +104,13 @@ typedef struct {
     float vx_ref, vy_ref, wz_ref;
     uint8_t traj_flags;
 } HIL_TrajRef_t;
+
+typedef struct {
+    float gz;                   /* rad/s */
+    float ax, ay, az;           /* m/s^2 */
+    float yaw;                  /* rad   */
+    uint8_t imu_seq;
+} HIL_Imu_t;
 
 typedef struct {
     float torque[4];
