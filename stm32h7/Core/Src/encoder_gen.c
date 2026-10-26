@@ -4,6 +4,15 @@
 
 #define ENC_OMEGA_MIN 0.3f  /* rad/s — below this magnitude, treat as stopped */
 
+/* Phase sign per wheel (FL, FR, RL, RR), so that the ESP32 decodes a forward
+ * wheel (omega > 0) as a positive count on all four wheels, as on the real
+ * AGV (S01 _thu4, 21/10: positive PWM -> positive speed on every wheel).
+ * AGV_MECANUM encoder.c swaps A/B for FL and RL (enc_cfg), and its PCNT setup
+ * counts "A leads B" as negative, so the right wheels need B leading A for a
+ * forward wheel. Measured on the bench 26/10 before this table: FR(+20) and
+ * RR(-20) came out with the wrong sign, RL(-10) right (ENC_PI run02). */
+static const int8_t ENC_DIR_SIGN[ENC_NUM_WHEELS] = { +1, -1, +1, -1 };
+
 /* ── Per-wheel state ────────────────────────────────────────────────────── */
 typedef struct {
     TIM_HandleTypeDef *htim;
@@ -69,15 +78,17 @@ static void _start_wheel(uint8_t i, int8_t dir)
     /*
      * Both pins start low (forced), then the first toggle of each is a
      * rising edge:
-     * Forward (dir>0): A leads B by 90 deg.
+     * phase = dir * ENC_DIR_SIGN[i]
+     * phase > 0: A leads B by 90 deg.
      *   A rises at cnt+hp,            B rises at cnt+hp + hp/2
-     * Reverse (dir<0): B leads A by 90 deg.
+     * phase < 0: B leads A by 90 deg.
      *   B rises at cnt+hp,            A rises at cnt+hp + hp/2
      * The compare values are written before toggle mode is restored, so an
      * old CCRx cannot toggle a pin in between.
      */
-    uint32_t a_off = (dir > 0) ? hp            : hp + (hp >> 1);
-    uint32_t b_off = (dir > 0) ? hp + (hp >> 1) : hp;
+    int8_t   phase = (int8_t)(dir * ENC_DIR_SIGN[i]);   /* +1: A leads B */
+    uint32_t a_off = (phase > 0) ? hp            : hp + (hp >> 1);
+    uint32_t b_off = (phase > 0) ? hp + (hp >> 1) : hp;
     uint32_t cnt   = t->CNT;
 
     t->CCR1 = (cnt + a_off) & 0xFFFFu;
