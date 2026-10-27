@@ -22,7 +22,8 @@ typedef struct {
 static PwmCh_t _ch[N_CHANNELS];
 static volatile uint32_t _isr_count;   /* capture interrupts handled (debug) */
 
-/* Arm the LPWM capture channels of TIM15 (2 channels) or TIM16/TIM17 (1 channel):
+/* Arm the capture channels of TIM15 (2 channels, LPWM) or of a 1-channel timer
+ * (TIM13 RPWM wheel 2, TIM16/TIM17 LPWM):
  * input filter 0xF, rising edge, counter on, stale flags cleared while the
  * channels are off, then interrupts enabled. NVIC stays off until main.c. */
 static void _arm_lpwm_timer(TIM_HandleTypeDef *ht, uint8_t n_ch)
@@ -78,6 +79,7 @@ static void _arm(PwmCh_t *c, uint8_t falling)
 }
 
 void PWMCapture_Init(TIM_HandleTypeDef *ht5,
+                     TIM_HandleTypeDef *ht13,
                      TIM_HandleTypeDef *ht15,
                      TIM_HandleTypeDef *ht16,
                      TIM_HandleTypeDef *ht17)
@@ -86,7 +88,7 @@ void PWMCapture_Init(TIM_HandleTypeDef *ht5,
     printf("PWMCapture: assign channels\r\n");
 
     _ch[0].htim = ht5;  _ch[0].hal_ch = TIM_CHANNEL_1;
-    _ch[1].htim = ht5;  _ch[1].hal_ch = TIM_CHANNEL_2;
+    _ch[1].htim = ht13; _ch[1].hal_ch = TIM_CHANNEL_1;   /* was TIM5 CH2 / PA1 */
     _ch[2].htim = ht5;  _ch[2].hal_ch = TIM_CHANNEL_3;
     _ch[3].htim = ht5;  _ch[3].hal_ch = TIM_CHANNEL_4;
     _ch[4].htim = ht15; _ch[4].hal_ch = TIM_CHANNEL_1;
@@ -96,7 +98,7 @@ void PWMCapture_Init(TIM_HandleTypeDef *ht5,
 
     /* Input pins (tim.c, pwm_capture.h) */
     _ch[0].port = GPIOA; _ch[0].pin = GPIO_PIN_0;
-    _ch[1].port = GPIOA; _ch[1].pin = GPIO_PIN_1;
+    _ch[1].port = GPIOF; _ch[1].pin = GPIO_PIN_8;
     _ch[2].port = GPIOA; _ch[2].pin = GPIO_PIN_2;
     _ch[3].port = GPIOA; _ch[3].pin = GPIO_PIN_3;
     _ch[4].port = GPIOE; _ch[4].pin = GPIO_PIN_5;
@@ -134,27 +136,27 @@ void PWMCapture_Init(TIM_HandleTypeDef *ht5,
         }
     }
 
-    /* ── TIM5 CH1-4 ────────────────────────────────────────────────────────
-     * Init order: CCER → CEN → disable CC2E to clear stuck CC2IF → SR=0
-     *             → re-enable CC2E → DIER (NVIC: main.c, after this function)
-     * Input filter 0xF on all 4 channels, set here with the channels off:
-     * tim.c (CubeMX) leaves ICFilter = 0, and the 18/06 fix for the PA1
-     * interrupt storm was never committed (26/10). */
+    /* ── TIM5 CH1, CH3, CH4 (CH2 / PA1 no longer used, 27/10) ─────────────
+     * Init order: channels off → input filter 0xF → CCER → CEN → SR = 0
+     *             → DIER (NVIC: main.c, after this function)
+     * Input filter 0xF set here with the channels off: tim.c (CubeMX) leaves
+     * ICFilter = 0 for TIM5. CCMR1 CH2 bits are left alone: CH2 is not an
+     * input any more (CC2S = 00), so IC2F would be the OC2 fields. */
+    ht5->Instance->DIER = 0;
     ht5->Instance->CCER = 0;
-    ht5->Instance->CCMR1 = (ht5->Instance->CCMR1 & ~(TIM_CCMR1_IC1F | TIM_CCMR1_IC2F))
-                         | (0xFu << TIM_CCMR1_IC1F_Pos) | (0xFu << TIM_CCMR1_IC2F_Pos);
+    ht5->Instance->CCMR1 = (ht5->Instance->CCMR1 & ~TIM_CCMR1_IC1F)
+                         | (0xFu << TIM_CCMR1_IC1F_Pos);
     ht5->Instance->CCMR2 = (ht5->Instance->CCMR2 & ~(TIM_CCMR2_IC3F | TIM_CCMR2_IC4F))
                          | (0xFu << TIM_CCMR2_IC3F_Pos) | (0xFu << TIM_CCMR2_IC4F_Pos);
-    ht5->Instance->CCER  = (TIM_CCER_CC1E | TIM_CCER_CC2E |
-                             TIM_CCER_CC3E | TIM_CCER_CC4E);
+    ht5->Instance->CCER  = (TIM_CCER_CC1E | TIM_CCER_CC3E | TIM_CCER_CC4E);
     ht5->Instance->CR1  |= TIM_CR1_CEN;
-    ht5->Instance->CCER &= ~TIM_CCER_CC2E;  /* disable CC2E tạm để clear CC2IF */
     ht5->Instance->SR    = 0;
-    ht5->Instance->CCER |= TIM_CCER_CC2E;   /* re-enable CC2E */
-    ht5->Instance->DIER  = (TIM_DIER_CC1IE | TIM_DIER_CC2IE |
-                             TIM_DIER_CC3IE | TIM_DIER_CC4IE);
+    ht5->Instance->DIER  = (TIM_DIER_CC1IE | TIM_DIER_CC3IE | TIM_DIER_CC4IE);
 
-    printf("PWMCapture: TIM5 armed (filter 0xF, NVIC still off)\r\n");
+    printf("PWMCapture: TIM5 armed (CH1/3/4, filter 0xF, NVIC still off)\r\n");
+
+    _arm_lpwm_timer(ht13, 1u);
+    printf("PWMCapture: TIM13 armed (PF8, wheel 2 RPWM)\r\n");
 
     /* TIM15 CH1-2, TIM16 CH1, TIM17 CH1 (LPWM wheels 1-4).
      * Same treatment as TIM5 (H7 hang after "resolve bits", 25/10):

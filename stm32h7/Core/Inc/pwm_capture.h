@@ -9,12 +9,16 @@
  * PWMCapture — Measure RPWM/LPWM duty cycles from ESP32 via TIM Input Capture
  *
  * Hardware:
- *   TIM5  CH1-4 → RPWM wheels 1-4  (PA0, PA1, PA2, PA3)
- *   TIM15 CH1-2 → LPWM wheels 1-2  (PE5, PE6)
- *   TIM16 CH1   → LPWM wheel 3     (PF6)
- *   TIM17 CH1   → LPWM wheel 4     (PF7)
+ *   TIM5  CH1, CH3, CH4 → RPWM wheels 1, 3, 4  (PA0, PA2, PA3)
+ *   TIM13 CH1           → RPWM wheel 2         (PF8)
+ *   TIM15 CH1-2         → LPWM wheels 1-2      (PE5, PE6)
+ *   TIM16 CH1           → LPWM wheel 3         (PF6)
+ *   TIM17 CH1           → LPWM wheel 4         (PF7)
+ * Wheel 2 RPWM moved off PA1 (TIM5_CH2) on 27/10: on the Nucleo something on
+ * the board drives PA1 (1.6 V with no wire, Liam's meter), so the ESP32 signal
+ * never reached the timer (05_DATA/results/PWM_CAPTURE/2026-10-27_run01).
  *
- * Timer clock: 1 MHz (PSC=239 on 240 MHz APB2 timers)
+ * Timer clock: 1 MHz (PSC=239 on 240 MHz timer clocks, APB1 and APB2)
  *
  * Duty cycle measurement (rising→falling→rising):
  *   Rising  edge: record t_rise
@@ -34,6 +38,7 @@
 
 /* Initialise all IC timers and arm first capture (rising edge) */
 void  PWMCapture_Init(TIM_HandleTypeDef *ht5,
+                      TIM_HandleTypeDef *ht13,
                       TIM_HandleTypeDef *ht15,
                       TIM_HandleTypeDef *ht16,
                       TIM_HandleTypeDef *ht17);

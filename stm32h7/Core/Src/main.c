@@ -113,12 +113,15 @@ int main(void)
   MX_TIM16_Init();
   MX_TIM17_Init();
   MX_USART2_UART_Init();
+  MX_SPI4_Init();
+  MX_TIM13_Init();
   /* USER CODE BEGIN 2 */
 
   HAL_NVIC_DisableIRQ(TIM5_IRQn);
   HAL_NVIC_DisableIRQ(TIM15_IRQn);
   HAL_NVIC_DisableIRQ(TIM16_IRQn);
   HAL_NVIC_DisableIRQ(TIM17_IRQn);
+  HAL_NVIC_DisableIRQ(TIM8_UP_TIM13_IRQn);   /* TIM13 = wheel 2 RPWM (PF8) */
 
   setvbuf(stdout, NULL, _IONBF, 0);
 
@@ -130,20 +133,23 @@ int main(void)
   SPI1_Handler_Init(&hspi1);
   UartRelay_Init(&huart2);     /* +++ NEW */
 
-  /* TIM5/15/16/17 priority lower than SPI1 DMA (priority 0) — Bug #7 fix */
+  /* TIM5/13/15/16/17 priority lower than SPI1 DMA (priority 0) — Bug #7 fix */
   HAL_NVIC_SetPriority(TIM5_IRQn,  5, 0);
+  HAL_NVIC_SetPriority(TIM8_UP_TIM13_IRQn, 5, 0);
   HAL_NVIC_SetPriority(TIM15_IRQn, 5, 0);
   HAL_NVIC_SetPriority(TIM16_IRQn, 5, 0);
   HAL_NVIC_SetPriority(TIM17_IRQn, 5, 0);
   /* NVIC lines stay off until PWMCapture_Init has cleared stale flags (25/10:
    * enabling them here first could hang the boot after "resolve bits"). */
 
-  PWMCapture_Init(&htim5, &htim15, &htim16, &htim17);
+  PWMCapture_Init(&htim5, &htim13, &htim15, &htim16, &htim17);
 
   /* One line before each enable: if the boot stops right after a line, that
    * timer's interrupt is the one that never lets main run (26/10). */
   printf("NVIC: enabling TIM5\r\n");
   HAL_NVIC_EnableIRQ(TIM5_IRQn);
+  printf("NVIC: enabling TIM13\r\n");
+  HAL_NVIC_EnableIRQ(TIM8_UP_TIM13_IRQn);
   printf("NVIC: enabling TIM15/16/17\r\n");
   HAL_NVIC_EnableIRQ(TIM15_IRQn);
   HAL_NVIC_EnableIRQ(TIM16_IRQn);
@@ -292,6 +298,13 @@ void Error_Handler(void)
   /* USER CODE END Error_Handler_Debug */
 }
 #ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
