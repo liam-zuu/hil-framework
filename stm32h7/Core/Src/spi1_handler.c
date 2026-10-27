@@ -13,6 +13,20 @@ static uint8_t _tx[SPI1_FRAME_LEN];
 static uint8_t _rx[SPI1_FRAME_LEN];
 
 static volatile uint8_t _frame_ready = 0;
+
+/* Link statistics and error recovery (27/10). Before, a SPI1 error stopped
+ * the DMA for good (no error callback) and the H7 ignored the RPi5 until a
+ * reset. The error callback only flags a restart; SPI1_Service() does it
+ * from the main loop while NSS (PA4) is high, i.e. between two RPi5 frames,
+ * so the new DMA transfer starts on a frame boundary. */
+#define _NSS_PORT  GPIOA
+#define _NSS_PIN   GPIO_PIN_4
+static volatile uint32_t _n_frames;
+static volatile uint32_t _n_errors;
+static volatile uint32_t _last_error;
+static volatile uint8_t  _rearm_pending;
+static uint32_t          _n_rearms;
+
 static HIL_State_t   _state;
 static HIL_TrajRef_t _traj;
 static HIL_Output_t  _output;
@@ -113,6 +127,41 @@ void SPI1_Callback(SPI_HandleTypeDef *hspi)
 {
     if (hspi->Instance != _hspi->Instance) return;
     _decode();
-    HAL_SPI_TransmitReceive_DMA(_hspi, _tx, _rx, SPI1_FRAME_LEN);
+    if (HAL_SPI_TransmitReceive_DMA(_hspi, _tx, _rx, SPI1_FRAME_LEN) != HAL_OK)
+        _rearm_pending = 1;
+    _n_frames++;
     _frame_ready = 1;
+}
+
+void SPI1_ErrorCallback(SPI_HandleTypeDef *hspi)
+{
+    if (hspi->Instance != _hspi->Instance) return;
+    _n_errors++;
+    _last_error = hspi->ErrorCode;
+    _rearm_pending = 1;
+}
+
+void SPI1_RequestRestart(void)
+{
+    _rearm_pending = 1;
+}
+
+void SPI1_Service(void)
+{
+    if (!_rearm_pending) return;
+    if (HAL_GPIO_ReadPin(_NSS_PORT, _NSS_PIN) != GPIO_PIN_SET) return;  /* frame in progress */
+
+    HAL_SPI_Abort(_hspi);
+    if (HAL_SPI_TransmitReceive_DMA(_hspi, _tx, _rx, SPI1_FRAME_LEN) == HAL_OK) {
+        _rearm_pending = 0;
+        _n_rearms++;
+    }
+}
+
+void SPI1_GetStats(SPI1_Stats_t *out)
+{
+    out->frames     = _n_frames;
+    out->errors     = _n_errors;
+    out->rearms     = _n_rearms;
+    out->last_error = _last_error;
 }

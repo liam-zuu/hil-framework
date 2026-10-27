@@ -70,6 +70,11 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
     SPI1_Callback(hspi);
 }
 
+void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
+{
+    SPI1_ErrorCallback(hspi);
+}
+
 void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef *htim)
 {
     EncoderGen_OC_Callback(htim);
@@ -199,9 +204,11 @@ int main(void)
         _n_link_lost++;
         for (int i = 0; i < ENC_NUM_WHEELS; i++)
             EncoderGen_SetOmega(i, 0.0f);
-        printf("SPI link lost (no frame for %lu ms): encoders stopped\r\n",
+        SPI1_RequestRestart();   /* covers a DMA stuck without an error */
+        printf("SPI link lost (no frame for %lu ms): encoders stopped, SPI1 restart\r\n",
                (unsigned long)SPI_LINK_TIMEOUT_MS);
     }
+    SPI1_Service();
 
     if ((HAL_GetTick() - _dbg_last) >= 500) {
         _dbg_last = HAL_GetTick();
@@ -234,8 +241,15 @@ int main(void)
         printf("Relay: sent=%lu dropped=%lu  traj vx=%.2f vy=%.2f wz=%.2f\r\n",
                (unsigned long)relay_sent, (unsigned long)relay_dropped,
                (double)g_traj.vx_ref, (double)g_traj.vy_ref, (double)g_traj.wz_ref);
-        printf("Link: %s lost=%lu\r\n", _link_up ? "up" : "down",
-               (unsigned long)_n_link_lost);
+        static uint32_t _frames_last = 0;
+        SPI1_Stats_t ss;
+        SPI1_GetStats(&ss);
+        printf("Link: %s lost=%lu  SPI frames=%lu/s err=%lu rearm=%lu last_err=0x%lx\r\n",
+               _link_up ? "up" : "down", (unsigned long)_n_link_lost,
+               (unsigned long)((ss.frames - _frames_last) * 2u),
+               (unsigned long)ss.errors, (unsigned long)ss.rearms,
+               (unsigned long)ss.last_error);
+        _frames_last = ss.frames;
         printf("---\r\n");
 
         HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_0);
