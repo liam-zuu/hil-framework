@@ -15,6 +15,7 @@ including gravity, so a vehicle at rest on flat ground reads az = +g.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import Optional, Sequence
 
 # MecanumPlant / plant_step state layout (see plant_step.py)
@@ -50,6 +51,26 @@ def imu_from_plant(state: Sequence[float], prev_state: Optional[Sequence[float]]
     ax = c * a_wx + s * a_wy
     ay = -s * a_wx + c * a_wy
     return (state[IDX_WZ], ax, ay, g, theta)
+
+
+@dataclass(frozen=True)
+class GyroInjection:
+    """
+    Controlled IMU–encoder inconsistency injection (QĐ 25 method C; spec
+    controller–IMU v2.2 §6.1, V2 (a)): during [t0, t0 + t_inj) the gyro model
+    reports (1 − s)·wz_body. The plant state is untouched, so the residual
+    r = wz_enc − gz the firmware sees is known exactly (s·wz_body) and does not
+    depend on any slip model. A test signal, not a physical slip model.
+    """
+    t0: float      # [s]
+    t_inj: float   # [s]
+    s: float       # fraction of the body yaw rate the gyro misses
+
+    def active(self, t: float) -> bool:
+        return self.t0 <= t < self.t0 + self.t_inj
+
+    def apply(self, gz: float, t: float) -> float:
+        return (1.0 - self.s) * gz if self.active(t) else gz
 
 
 def parse_imu_static(text: str) -> tuple:
