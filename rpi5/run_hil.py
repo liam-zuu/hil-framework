@@ -68,7 +68,7 @@ def _parse_fixed_omega(text: str) -> list:
 
 
 def _run_plant(cfg, shared_state: mp.Array, shared_ref: mp.Array, use_mock: bool, seed: int = 0,
-               wheels_lifted: bool = False, fixed_omega: list = None) -> None:
+               wheels_lifted: bool = False, fixed_omega: list = None, monitor=None) -> None:
     """Process 1 target: plant simulation loop."""
     import logging
     logging.basicConfig(
@@ -95,8 +95,43 @@ def _run_plant(cfg, shared_state: mp.Array, shared_ref: mp.Array, use_mock: bool
     else:
         plant = MockPlant() if use_mock else MecanumPlant(params=params, dt=cfg.period_us / 1e6, seed=seed)
     logging.getLogger('hil.main').info('Plant RNG seed = %s, wheels_lifted = %s', seed, wheels_lifted)
-    node  = HILNode(plant, config=cfg, shared_state=shared_state, shared_ref=shared_ref)
+    node  = HILNode(plant, config=cfg, shared_state=shared_state, shared_ref=shared_ref,
+                    monitor=monitor)
     node.run()
+
+
+def _report_plant_stats(p1, monitor, stats_interval: int) -> None:
+    """
+    Print the plant-loop lateness stats every stats_interval steps from this
+    (non real-time) process while the plant process runs, then once for the
+    whole run (THESIS H2: nothing printed or sorted inside the 1 kHz loop).
+    """
+    from rt_monitor import RTMonitor, I_STEP
+    try:
+        os.sched_setaffinity(0, {1, 3})        # stay off core 0 (plant loop)
+    except (AttributeError, OSError, ValueError):
+        pass
+    prev, next_step, t0 = None, stats_interval, None
+    while p1.is_alive():
+        p1.join(timeout=0.2)
+        snap = monitor.snapshot()
+        if t0 is None and snap[I_STEP] > 0:
+            t0 = time.monotonic() - snap[I_STEP] / 1_000.0
+        if snap[I_STEP] < next_step:
+            continue
+        while next_step <= snap[I_STEP]:
+            next_step += stats_interval
+        s = RTMonitor.window_stats(snap, prev)
+        prev = snap
+        el = time.monotonic() - t0
+        log.info('step=%-8d  t=%5.1f s  rate=%6.0f Hz  jitter (last %d ticks) p99=%s us  max=%s us  '
+                 '>warn: %d  overruns=%d',
+                 s['step'], el, s['step'] / el if el > 0 else 0, s['n'], s.get('p99_us'),
+                 s.get('max_us'), s['warn'], s['overruns'])
+    s = RTMonitor.window_stats(monitor.snapshot())
+    log.info('Plant loop jitter, whole run (n=%d): p99=%s us  p99.9=%s us  max=%.1f us  '
+             '>warn: %d  overruns=%d',
+             s['n'], s.get('p99_us'), s.get('p999_us'), s['max_all_us'], s['warn'], s['overruns'])
 
 
 def _run_traj(spec, port: str, simulate: bool, shared_ref: mp.Array, uart_direct: bool) -> None:
@@ -262,13 +297,16 @@ def main() -> int:
     # Shared setpoint: trajectory pub writes [vx_ref, vy_ref, wz_ref, counter],
     # plant loop packs it into the SPI frame for the H7 → ESP32 relay
     shared_ref = mp.Array('d', 4)
+    # Plant-loop lateness counters, read by this process (rt_monitor.py, THESIS H2)
+    from rt_monitor import RTMonitor
+    monitor = RTMonitor(warn_us=hil_cfg.jitter_warn_us)
 
     # Build process list
     procs = []
 
     p1 = mp.Process(
         target=_run_plant,
-        args=(hil_cfg, shared_state, shared_ref, args.mock, args.seed, lifted, fixed_omega),
+        args=(hil_cfg, shared_state, shared_ref, args.mock, args.seed, lifted, fixed_omega, monitor),
         name='HIL-Plant',
         daemon=True,
     )
@@ -302,7 +340,8 @@ def main() -> int:
     signal.signal(signal.SIGINT,  _stop)
     signal.signal(signal.SIGTERM, _stop)
 
-    # Primary: wait for plant loop
+    # Primary: wait for plant loop, printing its stats from here
+    _report_plant_stats(p1, monitor, hil_cfg.stats_interval)
     p1.join()
     log.info("Plant process exited (code=%s)", p1.exitcode)
 

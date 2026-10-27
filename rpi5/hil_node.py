@@ -40,6 +40,7 @@ from plant_interface import PlantInterface, MockPlant
 from mecanum_plant import MecanumPlant
 from imu_model import imu_from_plant
 from params import PARAMS
+from rt_monitor import RTMonitor
 
 log = logging.getLogger('hil.node')
 
@@ -100,6 +101,7 @@ class HILNode:
         config:        HILConfig          = None,
         shared_state:  Optional[mp.Array] = None,
         shared_ref:    Optional[mp.Array] = None,
+        monitor:       Optional[RTMonitor] = None,
     ):
         """
         Args:
@@ -110,11 +112,16 @@ class HILNode:
             shared_ref:   mp.Array('d', 4) [vx_ref, vy_ref, wz_ref, counter]
                           written by the trajectory publisher.  Optional;
                           None → no setpoint sent (traj_flags = 0).
+            monitor:      RTMonitor shared with a process outside the loop
+                          (run_hil.py). Given: the loop only records lateness
+                          counters, no logging and no statistics inside the
+                          1 kHz loop (THESIS H2). None: the old in-loop log.
         """
         self.plant        = plant
         self.cfg          = config or HILConfig(simulate_hw=True)
         self.shared_state = shared_state
         self.shared_ref   = shared_ref
+        self.monitor      = monitor
         self._ref         = (0.0, 0.0, 0.0)
         self._ref_count   = 0.0
 
@@ -218,6 +225,10 @@ class HILNode:
         self._step += 1
 
         # 5. Jitter monitoring
+        if self.monitor is not None:
+            # a few integer writes; the stats are printed by another process
+            self.monitor.record(self._step, jitter_ns, self._timer.overruns)
+            return
         if jitter_ns > self.cfg.jitter_warn_us * 1_000:
             log.warning(
                 "Jitter overrun: step=%d  jitter=%.0f μs",
