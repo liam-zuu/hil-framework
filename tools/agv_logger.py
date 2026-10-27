@@ -40,9 +40,12 @@ COLUMNS = [
     "wz_meas", "wz_cmd", "gz_fused", "yaw_rad", "age_g_ms", "age_r_ms", "gyro_n", "rv_n", "reset_n",
     "g_valid", "r_valid", "wz_src", "src_switch_count", "psi_ref", "e_psi", "head_on", "psi_reset_count",
     "slip_flag", "slip_on_count", "r", "bias_gz",
+    # Added 28/10 (Codex review of ctrl-imu #11, #8 (c)): slip_eval 0 = r could not be checked
+    # this tick (gyro invalid or wheels below omega_min), so slip_flag 0 does not mean "no slip".
+    "src_switch_dwz", "bias_updates", "slip_eval",
 ]
-N_OLD = 28      # firmware before the counters: same columns without the last 9 + 26
-N_S02 = 37      # firmware a6644a5 .. before ctrl-imu: without the last 26
+N_OLD = 28      # firmware before the counters: same columns without the last 9 + 29
+N_S02 = 37      # firmware a6644a5 .. before ctrl-imu: without the last 29
 
 # ─────────────────────────────────────────
 # Main

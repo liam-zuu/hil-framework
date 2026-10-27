@@ -52,7 +52,7 @@ FW_DT_US = 10_000
 IMU_COLS = ['g_valid', 'r_valid', 'wz_src', 'wz_meas', 'gz', 'yaw', 'age_g_ms', 'age_r_ms',
             'bias_gz', 'r', 'r_th', 'slip_flag', 'slip_on_count', 'src_switch_count',
             'src_switch_dwz', 'wz_cmd', 'head_on', 'psi_ref', 'psi_imu', 'e_psi',
-            'psi_reset_count', 'head_toggle_count', 'bias_updates']
+            'psi_reset_count', 'head_toggle_count', 'bias_updates', 'slip_eval']
 
 
 class FirmwareSim:
@@ -85,7 +85,7 @@ class FirmwareSim:
         L.fwsim_set_param.argtypes = [ctypes.c_char_p, ctypes.c_double]
         L.fwsim_imu_cols.restype = ctypes.c_int
         L.fwsim_imu_last.argtypes = [ctypes.POINTER(ctypes.c_double)]
-        if L.fwsim_abi() != 4:
+        if L.fwsim_abi() != 5 or L.fwsim_imu_cols() != len(IMU_COLS):
             sys.exit('fwsim.dll ABI mismatch: rebuild with build_fwsim.py')
         self._counts = (ctypes.c_int32 * 4)()
         self._sp = (ctypes.c_float * 3)()
@@ -137,6 +137,10 @@ class FirmwareSim:
     def motor_enable(self, on):
         """SWA: driver EN (reset() turns it on, as HIL_BYPASS_MOTOR_ENABLE)."""
         self.lib.fwsim_motor_enable(int(on))
+
+    def imu_init_fail(self):
+        """imu_init() failed at boot (spec section 7): motors stay disabled for the run."""
+        self.lib.fwsim_imu_init_fail()
 
     def set_param(self, name, value):
         if not self.lib.fwsim_set_param(name.encode(), float(value)):
@@ -194,8 +198,13 @@ def simulate(fw, setpoint, duration, params=None, seed=0, sp_rate_hz=50.0, pcnt_
     adrc: {axis: (omega_c, omega_o, b0, out_limit)}; axis 0 vx, 1 vy, 2 wz.
     imu: None = no IMU reports (imu_get() never succeeds: wz from the encoders,
     heading loop off), or a dict:
-      rate_hz     report rate of accel, gyro, game RV (default 20, IMU_REPORT_PERIOD_US)
-      boot_reset  time of the chip's SH2_RESET at boot [s] (default -1.0: before the run)
+      rate_hz     report rate of accel, gyro, game RV (default 20, IMU_REPORT_PERIOD_US);
+                  also sets imu_fusion's T_age = 2.5 report periods, as the firmware built
+                  with that IMU_REPORT_PERIOD_US has (fw_params can still override it)
+      boot_reset  time of the chip's SH2_RESET at boot [s] (default -1.0: before the run).
+                  On the chip, the boot reset comes while imu_init() opens it, before the
+                  first control tick; set this from the measured init_ms (IMU READY line)
+      init_fail   True: imu_init() failed (spec section 7), motors never turn on
       resets      further SH2_RESET times [s]
       injection   imu_model.GyroInjection (method C) or None
       hook        f(t, kind, value) -> value or None (drop the report): faults for tests
@@ -214,11 +223,15 @@ def simulate(fw, setpoint, duration, params=None, seed=0, sp_rate_hz=50.0, pcnt_
     if not motor_on:
         fw.motor_enable(False)
     fw.set_run(run_active, getattr(p, 'wheels_lifted', False))
-    for name, v in (fw_params or {}).items():
-        fw.set_param(name, v)
     use_imu = imu is not None
     imu = imu or {}
     imu_period_us = int(round(1e6 / imu.get('rate_hz', 20.0)))
+    if use_imu:
+        fw.set_param('t_age_us', imu_period_us * 5 // 2)    # imu_fusion.h: IMU_REPORT_PERIOD_US * 5 / 2
+        if imu.get('init_fail'):
+            fw.imu_init_fail()
+    for name, v in (fw_params or {}).items():
+        fw.set_param(name, v)
     imu_next_us = imu_period_us
     resets = sorted(imu.get('resets', []))
     inj = imu.get('injection')
@@ -356,6 +369,8 @@ def main():
     ap.add_argument('--io-delay-ms', type=int, default=0)
     ap.add_argument('--mode', choices=['PID', 'ADRC'], default=None, help='default: firmware CTRL_MODE')
     ap.add_argument('--imu-rate', type=float, default=20.0, help='BNO085 report rate [Hz] (IMU_REPORT_PERIOD_US)')
+    ap.add_argument('--imu-boot-reset', type=float, default=-1.0,
+                    help="time of the chip's boot SH2_RESET [s] (default -1: before the run); set from the measured init_ms")
     ap.add_argument('--no-imu', action='store_true', help='no IMU reports: only to re-run pre-28/10 runs (QD 23: every firmware has the IMU)')
     ap.add_argument('--out')
     a = ap.parse_args()
@@ -364,7 +379,7 @@ def main():
     fw = FirmwareSim()
     params = MecanumParams()
     t0 = time.time()
-    imu = None if a.no_imu else dict(rate_hz=a.imu_rate)
+    imu = None if a.no_imu else dict(rate_hz=a.imu_rate, boot_reset=a.imu_boot_reset)
     log = simulate(fw, sp, duration, params, a.seed, a.sp_rate, a.pcnt_mode, a.io_delay_ms, mode=a.mode, imu=imu)
     met = metrics(log)
     print(f'{duration:.1f} s simulated in {time.time() - t0:.1f} s, controller {fw.ctrl_mode}')

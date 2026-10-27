@@ -83,9 +83,11 @@ def test_20hz_sample_held_between_ticks(fw):
 
 def test_heading_loop_reduces_drift_on_straight_line(fw):
     """The plant's per-wheel parameters (S01) make the vehicle turn on a straight command;
-    the heading loop holds the start heading."""
-    a = fwsim.simulate(fw, const(vx=0.3), 6.0)
+    the heading loop holds the start heading. Both runs take wz from the IMU, only k_psi
+    differs, so the gain comes from the heading loop alone (Codex ctrl-imu N1)."""
+    a = fwsim.simulate(fw, const(vx=0.3), 6.0, imu={}, fw_params=dict(k_psi=0.0))
     b = fwsim.simulate(fw, const(vx=0.3), 6.0, imu={})
+    assert col(a, 'wz_src')[a['t'] > 0.5].all() and col(b, 'wz_src')[b['t'] > 0.5].all()
     assert abs(b['pose'][-1, 2]) < 0.5 * abs(a['pose'][-1, 2])
 
 
@@ -116,6 +118,64 @@ def test_nan_gyro_sample(fw):
     t_sw, v_sw = edges(log, 'wz_src')
     assert t_sw[(v_sw == 0) & (t_sw > 1.0)][0] == pytest.approx(2.0)
     assert t_sw[(v_sw == 1) & (t_sw > 1.0)][0] == pytest.approx(2.0 + 3 * P_REPORT)
+
+
+def test_gyro_loss_at_100hz_uses_t_age_of_that_rate(fw):
+    """--imu-rate 100: T_age = 2.5 x 10 ms, as the firmware built for 100 Hz (Codex ctrl-imu #9)."""
+    p, t_age = 0.01, 0.025
+    drop = lambda t, k, v: None if (k == 'gyro' and 2.0 <= t < 3.0) else v   # noqa: E731
+    log = fwsim.simulate(fw, const(vx=0.2, wz=0.5), 4.0, imu=dict(rate_hz=100.0, hook=drop))
+    t_sw, v_sw = edges(log, 'wz_src')
+    lost = t_sw[(v_sw == 0) & (t_sw > 1.0)][0]
+    assert 2.0 - p < lost <= 2.0 - p + t_age + TICK + 1e-9
+
+
+def test_accel_nan_breaks_standstill_window(fw):
+    """A non-finite accel sample makes the standstill window invalid until a good one
+    (Codex ctrl-imu #7): one NaN every 2 s window gives no bias update."""
+    hook = lambda t, k, v: ((math.nan,) * 3 if k == 'accel' and abs(t % 1.0 - 0.5) < 1e-9   # noqa: E731
+                            else v + 0.01 if k == 'gyro' else v)
+    prm = dict(sigma_gz=0.01, sigma_a=0.05)
+    log = fwsim.simulate(fw, const(), 9.0, imu=dict(hook=hook), fw_params=prm, motor_on=False)
+    assert col(log, 'bias_updates')[-1] == 0
+
+
+def test_gyro_saturation_threshold(fw):
+    """0.9 x 2000 deg/s = 31.4 rad/s (Codex ctrl-imu N2): a sample at 32 rad/s is not valid."""
+    sat = lambda t, k, v: 32.0 if (k == 'gyro' and abs(t - 2.0) < 1e-9) else v   # noqa: E731
+    log = fwsim.simulate(fw, const(vx=0.2, wz=0.5), 3.0, imu=dict(hook=sat))
+    t = log['t']
+    assert not col(log, 'g_valid')[(t >= 2.0 - 1e-9) & (t < 2.0 + P_REPORT - 1e-9)].any()
+
+
+def test_imu_init_fail_motors_stay_off(fw):
+    """imu_init() failed (spec section 7): EN stays low and no PWM reaches the plant, even
+    with a setpoint and SWA turned on during the run."""
+    log = fwsim.simulate(fw, const(vx=0.3), 2.0, imu=dict(init_fail=True))
+    assert not log['en'].any()
+    assert not np.abs(log['duty']).any()
+    fw.motor_enable(True)                 # SWA on: main.c keeps swa_on = false
+    _, _, _, _, en = fw.tick(2_010_000, [0, 0, 0, 0], (0.3, 0.0, 0.0))
+    assert en == 0
+    fw.reset()
+
+
+def test_slip_not_evaluable_column(fw):
+    """Codex ctrl-imu #8 = (c), Liam 28/10: slip_eval = 0 while the wheels stand or the gyro is
+    invalid; a flag that is on goes off T_slip after the check stops (spec section 13.1)."""
+    still = fwsim.simulate(fw, const(), 2.0, imu={})
+    assert not col(still, 'slip_eval').any()
+    inj = GyroInjection(t0=1.0, t_inj=3.0, s=0.3)
+    drop = lambda t, k, v: None if (k == 'gyro' and t >= 2.0) else v   # noqa: E731
+    log = fwsim.simulate(fw, const(wz=1.0), 3.0, imu=dict(injection=inj, hook=drop))
+    t = log['t']
+    assert col(log, 'slip_eval')[(t > 0.5) & (t < 2.0)].all()
+    assert col(log, 'slip_flag')[(t > 1.5) & (t < 2.0)].all()
+    t_off = edges(log, 'slip_eval')[0][-1]                 # gyro too old: check stops
+    assert not col(log, 'slip_eval')[t >= t_off].any()
+    t_flag = edges(log, 'slip_flag')[0][-1]
+    assert t_flag == pytest.approx(t_off + T_SLIP)
+    assert col(log, 'slip_on_count')[-1] == 1
 
 
 def test_yaw_loss_turns_heading_off_gyro_stays(fw):

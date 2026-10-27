@@ -24,7 +24,7 @@
 #include <string.h>
 
 #define FWSIM_API __declspec(dllexport)
-#define FWSIM_ABI 4
+#define FWSIM_ABI 5
 
 static const int rpwm_gpio[4] = { FL_RPWM, FR_RPWM, RL_RPWM, RR_RPWM };
 static const int lpwm_gpio[4] = { FL_LPWM, FR_LPWM, RL_LPWM, RR_LPWM };
@@ -35,6 +35,7 @@ static vel_ctrl_out_t last_vc;      /* last vel_ctrl_step() output (metric count
 static imu_data_t imu;              /* what imu.cpp keeps in g_data */
 static int imu_on;                  /* 0: no imu_get() copy yet (vel_ctrl gets NULL) */
 static int run_active = 1, wheels_lifted;
+static int imu_fail;                /* imu_init() failed at boot: g_imu_fail in main.c */
 
 FWSIM_API int fwsim_abi(void) { return FWSIM_ABI; }
 /* After a tick: encoder_get_count() per wheel and the vel_ctrl metric counters
@@ -60,6 +61,7 @@ FWSIM_API void fwsim_reset(int pcnt_mode) {
     imu_on = 0;
     run_active = 1;
     wheels_lifted = 0;
+    imu_fail = 0;
     motor_init();
     encoder_init();
     vel_ctrl_init();
@@ -92,8 +94,16 @@ FWSIM_API void fwsim_imu_reset(int64_t t_us) {
     imu.reset_t_us = t_us;
 }
 
-/* SWA / motor_enable() (fwsim_reset turns the driver on, as HIL_BYPASS_MOTOR_ENABLE). */
-FWSIM_API void fwsim_motor_enable(int on) { motor_enable(on != 0); }
+/* SWA / motor_enable() (fwsim_reset turns the driver on, as HIL_BYPASS_MOTOR_ENABLE).
+ * After an IMU init failure main.c forces swa_on = false: the driver never turns on. */
+FWSIM_API void fwsim_motor_enable(int on) { motor_enable(on != 0 && !imu_fail); }
+
+/* imu_init() failed (spec controller-IMU v2.2 section 7): call right after fwsim_reset(),
+ * before the first tick. main.c sets g_imu_fail and keeps the motors disabled for the run. */
+FWSIM_API void fwsim_imu_init_fail(void) {
+    imu_fail = 1;
+    motor_enable(false);
+}
 
 /* run_active: MODE_AUTO with a VALID trajectory (heading loop runs); wheels_lifted: bias off. */
 FWSIM_API void fwsim_set_run(int run, int lifted) { run_active = run; wheels_lifted = lifted; }
@@ -116,8 +126,8 @@ FWSIM_API int fwsim_set_param(const char *name, double v) {
  * out[0] g_valid, 1 r_valid, 2 wz_src, 3 wz_meas, 4 gz, 5 yaw, 6 age_g_ms, 7 age_r_ms,
  * 8 bias_gz, 9 r, 10 r_th, 11 slip_flag, 12 slip_on_count, 13 src_switch_count,
  * 14 src_switch_dwz, 15 wz_cmd, 16 head_on, 17 psi_ref, 18 psi_imu, 19 e_psi,
- * 20 psi_reset_count, 21 head_toggle_count, 22 bias_updates */
-#define FWSIM_IMU_COLS 23
+ * 20 psi_reset_count, 21 head_toggle_count, 22 bias_updates, 23 slip_eval */
+#define FWSIM_IMU_COLS 24
 FWSIM_API int fwsim_imu_cols(void) { return FWSIM_IMU_COLS; }
 FWSIM_API void fwsim_imu_last(double out[FWSIM_IMU_COLS]) {
     const imu_fusion_out_t *m = &last_vc.imu;
@@ -126,7 +136,7 @@ FWSIM_API void fwsim_imu_last(double out[FWSIM_IMU_COLS]) {
         m->g_valid, m->r_valid, m->wz_src, m->wz_meas, m->gz, m->yaw, m->age_g_ms, m->age_r_ms,
         m->bias_gz, m->r, m->r_th, m->slip_flag, m->slip_on_count, m->src_switch_count,
         m->src_switch_dwz, last_vc.wz_cmd, h->on, h->psi_ref, h->psi_imu, h->e_psi,
-        h->psi_reset_count, h->toggle_count, m->bias_updates };
+        h->psi_reset_count, h->toggle_count, m->bias_updates, m->slip_eval };
     memcpy(out, v, sizeof(v));
 }
 
