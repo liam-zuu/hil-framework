@@ -33,9 +33,11 @@ Ranges (hil_protocol.h defines):
     wz_ref         : HIL_REF_OMEGA_MAX = 10.0 rad/s
     torque : HIL_TORQUE_MAX     =  1.0  N·m
 
-The H7 relays the trajectory reference to the ESP32 over UART whenever
-traj_flags has VALID set. Each relay blocks the H7 for ~1.2 ms, so set
-VALID only on frames that carry a new setpoint (~50 Hz), never every 1 ms.
+The H7 relays the trajectory reference to the ESP32 over UART when
+traj_flags has both VALID and NEW set (uart_relay.c, non-blocking through the
+USART2 TX FIFO since branch h7-relay-wd). One packet takes ~1.2 ms on the wire,
+so set NEW only on frames that carry a new setpoint (~50 Hz), never every 1 ms;
+a packet that finds the FIFO still busy is dropped and counted on the H7.
 
 CRITICAL: If you change anything here, update the H7 firmware decode
           in spi1_handler.c accordingly. A 1-byte offset here → all states
