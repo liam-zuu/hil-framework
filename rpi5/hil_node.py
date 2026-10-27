@@ -44,6 +44,16 @@ from params import PARAMS
 log = logging.getLogger('hil.node')
 
 
+def plant_to_frame_state(state: list) -> list:
+    """
+    MecanumPlant state [x, y, θ, vx, vy, wz, ω1..ω4] (plant_step.py) → the
+    order protocol.encode_state expects [ω1..ω4, x, y, θ, vx, vy, wz].
+    Bug HIL-STATE-ORDER (27/10): the plant state went into the frame as is,
+    so the H7 took x, y, θ, vx as the four wheel speeds.
+    """
+    return list(state[6:10]) + list(state[0:6])
+
+
 @dataclass
 class HILConfig:
     """Runtime configuration for the HIL node."""
@@ -128,7 +138,9 @@ class HILNode:
         self._step      = 0
         self._imu_seq   = 0
         self._prev_state: Optional[list] = None
-        self._imu_from_plant = isinstance(plant, MecanumPlant)
+        # MecanumPlant keeps its own state order; MockPlant (--fixed-omega)
+        # already uses the frame order
+        self._mecanum   = isinstance(plant, MecanumPlant)
         self._t_start:  Optional[float] = None
 
     # ── Main loop ─────────────────────────────────────────────────────────
@@ -189,7 +201,8 @@ class HILNode:
                 traj_flags      = TRAJ_VALID | TRAJ_NEW
         state  = self.plant.get_state()
         imu, imu_seq = self._imu_sample(state)
-        mosi   = encode_state(state, traj_ref=self._ref, traj_flags=traj_flags,
+        frame_state = plant_to_frame_state(state) if self._mecanum else state
+        mosi   = encode_state(frame_state, traj_ref=self._ref, traj_flags=traj_flags,
                               seq=self._step, imu=imu, imu_seq=imu_seq)
         miso   = self._spi.transfer(mosi)
         torques = decode_torques(miso)
@@ -223,7 +236,7 @@ class HILNode:
         """
         if self.cfg.imu_static is not None:
             imu = self.cfg.imu_static
-        elif self._imu_from_plant:
+        elif self._mecanum:
             imu = imu_from_plant(state, self._prev_state,
                                  self.cfg.period_us / 1e6, PARAMS.g)
             self._prev_state = state
