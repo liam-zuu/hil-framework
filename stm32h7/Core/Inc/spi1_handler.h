@@ -38,6 +38,7 @@ typedef struct {
     uint32_t errors;       /* HAL_SPI_ErrorCallback calls since boot       */
     uint32_t rearms;       /* DMA restarts done by SPI1_Service()          */
     uint32_t last_error;   /* hspi->ErrorCode at the last error            */
+    uint32_t last_frame_ms;/* HAL_GetTick() in the callback of the last frame */
 } SPI1_Stats_t;
 
 void    SPI1_ErrorCallback  (SPI_HandleTypeDef *hspi);

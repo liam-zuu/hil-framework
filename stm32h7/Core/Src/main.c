@@ -171,6 +171,11 @@ int main(void)
   static uint32_t _dbg_last = 0;
   static uint32_t _last_frame_ms = 0;
   static uint8_t  _link_up = 0;        /* 0 until the first frame */
+  /* Clock check (27/10): first-frame tick and frame count of the current
+   * link-up period. The RPi5 sends one frame per 1 ms of its own clock, so
+   * N frames span N-1 Pi ms; compare with the H7 ms printed at link lost. */
+  static uint32_t _up_first_ms = 0;
+  static uint32_t _up_first_frames = 0;
   static uint32_t _n_link_lost = 0;
 
   while (1)
@@ -178,8 +183,12 @@ int main(void)
     if (SPI1_IsFrameReady()) {
         _last_frame_ms = HAL_GetTick();
         if (!_link_up) {
+            SPI1_Stats_t s0;
+            SPI1_GetStats(&s0);
             _link_up = 1;
-            printf("SPI link up\r\n");
+            _up_first_ms = s0.last_frame_ms;
+            _up_first_frames = s0.frames;
+            printf("SPI link up at t=%lu ms\r\n", (unsigned long)_up_first_ms);
         }
         SPI1_GetState(&g_state);
         SPI1_GetTrajRef(&g_traj);   /* +++ NEW — clears frame_ready */
@@ -205,8 +214,16 @@ int main(void)
         for (int i = 0; i < ENC_NUM_WHEELS; i++)
             EncoderGen_SetOmega(i, 0.0f);
         SPI1_RequestRestart();   /* covers a DMA stuck without an error */
+        SPI1_Stats_t s1;
+        SPI1_GetStats(&s1);
         printf("SPI link lost (no frame for %lu ms): encoders stopped, SPI1 restart\r\n",
                (unsigned long)SPI_LINK_TIMEOUT_MS);
+        /* Clock check: H7 ms between the first and the last frame of this
+         * period vs frame intervals (= Pi ms at 1 kHz) */
+        printf("Link period: %lu frames, H7 %lu ms from first to last frame (Pi: %lu ms at 1 kHz)\r\n",
+               (unsigned long)(s1.frames - _up_first_frames + 1u),
+               (unsigned long)(s1.last_frame_ms - _up_first_ms),
+               (unsigned long)(s1.frames - _up_first_frames));
     }
     SPI1_Service();
 

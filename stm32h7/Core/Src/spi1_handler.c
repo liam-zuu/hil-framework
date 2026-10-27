@@ -24,6 +24,7 @@ static volatile uint8_t _frame_ready = 0;
 static volatile uint32_t _n_frames;
 static volatile uint32_t _n_errors;
 static volatile uint32_t _last_error;
+static volatile uint32_t _last_frame_ms;   /* tick at the last completed frame (clock check) */
 static volatile uint8_t  _rearm_pending;
 static uint32_t          _n_rearms;
 
@@ -129,6 +130,7 @@ void SPI1_Callback(SPI_HandleTypeDef *hspi)
     _decode();
     if (HAL_SPI_TransmitReceive_DMA(_hspi, _tx, _rx, SPI1_FRAME_LEN) != HAL_OK)
         _rearm_pending = 1;
+    _last_frame_ms = HAL_GetTick();
     _n_frames++;
     _frame_ready = 1;
 }
@@ -160,8 +162,13 @@ void SPI1_Service(void)
 
 void SPI1_GetStats(SPI1_Stats_t *out)
 {
-    out->frames     = _n_frames;
     out->errors     = _n_errors;
     out->rearms     = _n_rearms;
     out->last_error = _last_error;
+    /* frames and last_frame_ms are read with interrupts masked (a few
+     * cycles) so both belong to the same frame */
+    __disable_irq();
+    out->frames        = _n_frames;
+    out->last_frame_ms = _last_frame_ms;
+    __enable_irq();
 }
