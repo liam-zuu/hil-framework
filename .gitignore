@@ -12,3 +12,6 @@ __pycache__/
 
 # fwsim DLL build output (rebuild with python fwsim/build_fwsim.py)
 fwsim/build/
+
+# bnoemu_pc build output (rebuild with python bnoemu_pc/build_bnoemu.py)
+bnoemu_pc/build/

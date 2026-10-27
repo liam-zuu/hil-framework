@@ -4,7 +4,7 @@ Trajectory Publisher — Process 2 (Mission computer, 50 Hz)
 Responsibility:
   - Compute trajectory reference at time t  (50 Hz)
   - Default (HIL v2): write body-frame velocity setpoint (vx, vy, wz) into a
-    shared array. Process 1 packs it into the 36-byte SPI frame, the H7
+    shared array. Process 1 packs it into the 40-byte SPI frame, the H7
     relays it to the ESP32 as the 14-byte 0xBB UART packet.
   - Legacy (uart_direct=True): pack the 18-byte packet below and send it to
     the ESP32 over UART directly. The current ESP32 traj_receiver expects the

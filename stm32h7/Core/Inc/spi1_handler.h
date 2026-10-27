@@ -5,7 +5,7 @@
 #include "hil_protocol.h"
 
 /*
- * SPI1 Handler — RPi5 ↔ H7 link (slave, DMA, 36-byte frames v2)
+ * SPI1 Handler — RPi5 ↔ H7 link (slave, DMA, 40-byte frames v3)
  *
  * Call order:
  *   1. SPI1_Handler_Init(&hspi1)           — in USER CODE BEGIN 2
@@ -23,6 +23,7 @@ void    SPI1_Handler_Init(SPI_HandleTypeDef *hspi);
 uint8_t SPI1_IsFrameReady(void);
 void    SPI1_GetState    (HIL_State_t *out);
 void    SPI1_GetTrajRef  (HIL_TrajRef_t *out);   /* clears frame_ready */
+void    SPI1_GetImu      (HIL_Imu_t *out);       /* IMU values, v3 frame */
 void    SPI1_SetOutput   (const HIL_Output_t *out);
 void    SPI1_Callback    (SPI_HandleTypeDef *hspi);
 
@@ -34,7 +35,7 @@ void    SPI1_Callback    (SPI_HandleTypeDef *hspi);
  *   9. SPI1_RequestRestart()               — e.g. from the link watchdog
  */
 typedef struct {
-    uint32_t frames;       /* completed 36-byte frames since boot          */
+    uint32_t frames;       /* completed 40-byte frames since boot          */
     uint32_t errors;       /* HAL_SPI_ErrorCallback calls since boot       */
     uint32_t rearms;       /* DMA restarts done by SPI1_Service()          */
     uint32_t last_error;   /* hspi->ErrorCode at the last error            */

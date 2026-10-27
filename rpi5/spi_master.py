@@ -9,7 +9,7 @@ Hardware config:
   Interface:  /dev/spidev0.0  (SPI bus 0, CE0)
   Mode:       SPI Mode 0 (CPOL=0, CPHA=0) — matches H7 SPI slave default
   Speed:      1 MHz initial  →  increase to 4 MHz after loopback validation
-  Frame:      36 bytes (see protocol.py for layout)
+  Frame:      40 bytes (see protocol.py for layout)
   CS:         Hardware (GPIO8 / CE0), active low
 
 Enable SPI on RPi5 (if not already):
@@ -103,7 +103,7 @@ class SPIMaster:
         Perform one full-duplex SPI transaction.
 
         Args:
-            tx: MOSI payload, exactly FRAME_SIZE (36) bytes.
+            tx: MOSI payload, exactly FRAME_SIZE (40) bytes.
 
         Returns:
             MISO payload, exactly FRAME_SIZE bytes.
