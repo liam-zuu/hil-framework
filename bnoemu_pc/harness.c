@@ -14,6 +14,12 @@
  *
  *   harness <scenario> [period_us] [seconds]
  *   scenarios: boot, run, collision, rst_mid, silent, stale
+ * Environment BNOEMU_H7_PORT=1 (G2, 28/10): the emulator is driven the way the
+ * H7 layer stm32h7/Core/Src/bno_emu_port.c drives it: core poll, new plant
+ * sample and INT pin only on a 100 us tick (TIM6); MISO comes from a DMA buffer
+ * armed ahead from bno_emu_peek_tx() while CS and INT are high (not from the
+ * cs_fall() return); INT goes low only for what is armed; after CS rise the
+ * buffer is armed again. The bytes clocked are what the host shifted.
  * Prints key=value lines and RESULT=PASS|FAIL; exit code 0 on PASS.
  */
 #include <math.h>
@@ -54,13 +60,89 @@ static bool plant_on = true;
 static uint8_t plant_seq;
 static uint32_t int_edges;
 
+static const uint8_t *zeros_port(void) { static const uint8_t z[(BNO_EMU_PKT_MAX + 4u + 16u)] = { 0 }; return z; }
+
+/* ── H7 port model (BNOEMU_H7_PORT=1), mirrors bno_emu_port.c ─────────── */
+#define PORT_TICK_US  100u
+#define PORT_ARM_LEN  (BNO_EMU_PKT_MAX + 4u + 16u)
+static bool port_mode;
+static uint64_t port_next_tick;
+static uint8_t port_tx[PORT_ARM_LEN];
+static bool port_armed, port_in_xfer, port_int_pin, port_have_imu;   /* port_int_pin: PG2 low */
+static const uint8_t *port_armed_src;
+static uint16_t port_armed_len;
+static uint8_t port_last_seq;
+static bno_emu_sample_t port_frame;      /* latest plant sample in the SPI1 frame */
+static uint32_t port_mismatch, port_rearms, port_ticks;
+
+static void port_rearm(void)
+{
+    uint16_t len;
+    const uint8_t *src = bno_emu_peek_tx(&emu, &len);
+    if (len > PORT_ARM_LEN) len = PORT_ARM_LEN;
+    memcpy(port_tx, src, len);
+    memset(port_tx + len, 0, PORT_ARM_LEN - len);
+    port_armed = true;
+    port_armed_src = src;
+    port_armed_len = len;
+    port_rearms++;
+}
+
+static void port_tick(void)
+{
+    port_ticks++;
+    if (port_have_imu ? (port_frame.seq != port_last_seq) : (port_frame.seq != 0u)) {
+        bno_emu_set_sample(&emu, &port_frame, (uint32_t)now);
+        port_have_imu = true;
+        port_last_seq = port_frame.seq;
+    }
+    bno_emu_poll(&emu, (uint32_t)now);
+    if (!port_in_xfer && !port_int_pin) {
+        uint16_t len;
+        const uint8_t *src = bno_emu_peek_tx(&emu, &len);
+        if (!port_armed || src != port_armed_src || len != port_armed_len) port_rearm();
+    }
+    bool want = bno_emu_int_low(&emu) && !port_in_xfer;
+    if (want && !port_int_pin) {
+        if (port_armed) port_int_pin = true;
+    } else if (!want && port_int_pin) {
+        port_int_pin = false;
+    }
+}
+
+/* CS fall: core bookkeeping; MISO is the armed buffer whatever the core says. */
+static const uint8_t *port_cs_fall(void)
+{
+    uint16_t txl;
+    const uint8_t *tx = bno_emu_cs_fall(&emu, (uint32_t)now, &txl);
+    port_in_xfer = true;
+    if (!port_armed || tx != port_armed_src || txl != port_armed_len) port_mismatch++;
+    port_int_pin = false;
+    return port_armed ? port_tx : zeros_port();
+}
+
+static void port_cs_rise(const uint8_t *mosi, uint16_t n)
+{
+    port_armed = false;
+    port_in_xfer = false;
+    bno_emu_cs_rise(&emu, mosi, n, (uint32_t)now);
+    port_rearm();
+}
+
+static void port_reset(bool low)
+{
+    bno_emu_set_reset(&emu, low, (uint32_t)now);
+    port_armed_src = NULL;
+    if (low) port_int_pin = false;
+}
+
 static jmp_buf abort_jmp;
 static bool guard_on;
 static uint64_t guard_until;
 
 static void sync_int(void)
 {
-    bool lo = bno_emu_int_low(&emu);
+    bool lo = port_mode ? port_int_pin : bno_emu_int_low(&emu);
     if (lo && !prev_int) { hint_flag = true; int_edges++; }
     prev_int = lo;
 }
@@ -93,7 +175,8 @@ static void plant_tick(void)
             plant_sample(&s, (double)now * 1e-6);
         }
         s.seq = plant_seq;                  /* frozen plant: same seq every frame */
-        bno_emu_set_sample(&emu, &s, (uint32_t)now);
+        if (port_mode) port_frame = s;      /* the H7 tick picks it up */
+        else bno_emu_set_sample(&emu, &s, (uint32_t)now);
     }
 }
 
@@ -104,7 +187,14 @@ static void advance(uint64_t us)
         uint64_t step = (end - now < STEP_US) ? (end - now) : STEP_US;
         now += step;
         plant_tick();
-        bno_emu_poll(&emu, (uint32_t)now);
+        if (port_mode) {
+            while (now >= port_next_tick) {
+                port_next_tick += PORT_TICK_US;
+                port_tick();
+            }
+        } else {
+            bno_emu_poll(&emu, (uint32_t)now);
+        }
         sync_int();
         if (guard_on && now >= guard_until) longjmp(abort_jmp, 1);
     }
@@ -119,10 +209,10 @@ static uint8_t zeros[512];
 
 static void toggle_reset(void)
 {
-    bno_emu_set_reset(&emu, true, (uint32_t)now);
+    if (port_mode) port_reset(true); else bno_emu_set_reset(&emu, true, (uint32_t)now);
     sync_int();
     advance(RST_LOW_US);
-    bno_emu_set_reset(&emu, false, (uint32_t)now);
+    if (port_mode) port_reset(false); else bno_emu_set_reset(&emu, false, (uint32_t)now);
     sync_int();
     advance(RST_WAIT_US);
 }
@@ -151,23 +241,29 @@ static int hal_read(sh2_Hal_t *self, uint8_t *pBuffer, unsigned len, uint32_t *t
     if (!wait_hint()) return 0;
 
     uint16_t txl = 0;
-    const uint8_t *tx = bno_emu_cs_fall(&emu, (uint32_t)now, &txl);
     uint8_t miso[BNO_EMU_PKT_MAX + 8];
     memset(miso, 0, sizeof(miso));
-    memcpy(miso, tx, txl > sizeof(miso) ? sizeof(miso) : txl);   /* DMA latches the buffer */
+    if (port_mode) {
+        memcpy(miso, port_cs_fall(), sizeof(miso));                /* armed DMA buffer */
+        sync_int();
+    } else {
+        const uint8_t *tx = bno_emu_cs_fall(&emu, (uint32_t)now, &txl);
+        memcpy(miso, tx, txl > sizeof(miso) ? sizeof(miso) : txl); /* DMA latches the buffer */
+    }
 
     memcpy(pBuffer, miso, 4);
     advance(xfer_us(4));
     uint16_t plen = (uint16_t)((miso[0] | (miso[1] << 8)) & 0x7FFF);
     if (plen == 0 || plen > len) {
-        bno_emu_cs_rise(&emu, zeros, 4, (uint32_t)now);
+        if (port_mode) port_cs_rise(zeros, 4); else bno_emu_cs_rise(&emu, zeros, 4, (uint32_t)now);
         sync_int();
         return 0;
     }
     for (unsigned i = 0; i < plen; i++)
         pBuffer[4 + i] = (4u + i < sizeof(miso)) ? miso[4 + i] : 0;
     advance(xfer_us(plen));
-    bno_emu_cs_rise(&emu, zeros, (uint16_t)(4u + plen), (uint32_t)now);
+    if (port_mode) port_cs_rise(zeros, (uint16_t)(4u + plen));
+    else bno_emu_cs_rise(&emu, zeros, (uint16_t)(4u + plen), (uint32_t)now);
     sync_int();
     return plen;
 }
@@ -177,9 +273,11 @@ static int hal_write(sh2_Hal_t *self, uint8_t *pBuffer, unsigned len)
     (void)self;
     if (!wait_hint()) return 0;
     uint16_t txl;
-    (void)bno_emu_cs_fall(&emu, (uint32_t)now, &txl);
+    if (port_mode) { (void)port_cs_fall(); sync_int(); }
+    else (void)bno_emu_cs_fall(&emu, (uint32_t)now, &txl);
     advance(xfer_us(len));
-    bno_emu_cs_rise(&emu, pBuffer, (uint16_t)len, (uint32_t)now);
+    if (port_mode) port_cs_rise(pBuffer, (uint16_t)len);
+    else bno_emu_cs_rise(&emu, pBuffer, (uint16_t)len, (uint32_t)now);
     sync_int();
     return (int)len;
 }
@@ -378,6 +476,8 @@ static void print_emu(void)
     printf("emu.get_features=%u\nemu.adverts=%u\nemu.q_drops=%u\n", s->get_features, s->adverts, s->q_drops);
     printf("host.hard_resets=%u\nhost.reset_events=%u\nhost.feature_resps=%u\nhost.int_edges=%u\n", hard_resets, reset_events, feature_resps, int_edges);
     printf("t_end_s=%.3f\n", (double)now * 1e-6);
+    if (port_mode)
+        printf("port.ticks=%u\nport.rearms=%u\nport.mismatch=%u\n", port_ticks, port_rearms, port_mismatch);
 }
 
 static bool check_init(const init_res_t *r, const char *tag)
@@ -565,10 +665,14 @@ int main(int argc, char **argv)
     uint32_t period = argc > 2 ? (uint32_t)strtoul(argv[2], NULL, 10) : 50000u;
     double seconds = argc > 3 ? atof(argv[3]) : 600.0;
 
+    const char *pm = getenv("BNOEMU_H7_PORT");
+    port_mode = pm && pm[0] == '1';
+
     bno_emu_cfg_t cfg;
     bno_emu_default_cfg(&cfg);
     bno_emu_init(&emu, &cfg, 0);
-    printf("scenario=%s\nperiod_us=%u\n", sc, period);
+    if (port_mode) { port_next_tick = PORT_TICK_US; port_rearm(); }
+    printf("scenario=%s\nperiod_us=%u\nh7_port=%d\n", sc, period, (int)port_mode);
 
     if (strcmp(sc, "boot") == 0)           sc_boot(period, argc > 3 ? atoi(argv[3]) : 20);
     else if (strcmp(sc, "run") == 0)       sc_run(period, seconds);

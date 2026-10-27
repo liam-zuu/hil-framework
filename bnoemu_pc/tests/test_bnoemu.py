@@ -12,10 +12,19 @@ EXE = os.path.join(HERE, '..', 'build', 'bnoemu_harness.exe')
 pytestmark = pytest.mark.skipif(not os.path.isfile(EXE), reason='bnoemu_harness.exe not built')
 
 RATES = [50_000, 10_000]          # 20 Hz and 100 Hz report period (IMU_REPORT_PERIOD_US)
+# 'core': emulator core called directly (G1). 'h7port': driven like the H7 layer
+# bno_emu_port.c (100 us tick, MISO from a DMA buffer armed ahead), G2 28/10.
+MODES = ['core', 'h7port']
 
 
-def run(*args):
-    r = subprocess.run([EXE] + [str(a) for a in args], capture_output=True, text=True, timeout=600)
+@pytest.fixture(params=MODES)
+def mode(request):
+    return request.param
+
+
+def run(*args, mode='core'):
+    env = dict(os.environ, BNOEMU_H7_PORT='1' if mode == 'h7port' else '0')
+    r = subprocess.run([EXE] + [str(a) for a in args], capture_output=True, text=True, timeout=600, env=env)
     kv = dict(l.split('=', 1) for l in r.stdout.splitlines() if '=' in l and not l.startswith('FAIL'))
     fails = [l for l in r.stdout.splitlines() if l.startswith('FAIL')]
     assert r.returncode == 0 and kv.get('RESULT') == 'PASS', '\n'.join(fails) or r.stdout[-2000:]
@@ -23,40 +32,40 @@ def run(*args):
 
 
 @pytest.mark.parametrize('period', RATES)
-def test_20_boots(period):
+def test_20_boots(period, mode):
     """sh2_open gets reset complete, getProdIds 4 entries, 3 reports flow, 20 times in a row."""
-    kv = run('boot', period, 20)
+    kv = run('boot', period, 20, mode=mode)
     assert kv['boots_ok'] == '20'
 
 
 @pytest.mark.parametrize('period', RATES)
-def test_10_min_run(period):
+def test_10_min_run(period, mode):
     """10 virtual minutes: report period error <= 1 %, values exact on the wire,
     quantization <= 0.5 LSB of Q8/Q9/Q14, no lost report, no host INT timeout."""
-    kv = run('run', period, 600)
+    kv = run('run', period, 600, mode=mode)
     for rid in ('01', '02', '08'):
         assert abs(float(kv[f'run.id{rid}.period_err_pct'])) <= 1.0
         assert int(kv[f'run.id{rid}.n']) >= 600 * 1e6 / period - 2
 
 
 @pytest.mark.parametrize('period', RATES)
-def test_host_write_while_packet_pending(period):
-    kv = run('collision', period, 10)
+def test_host_write_while_packet_pending(period, mode):
+    kv = run('collision', period, 10, mode=mode)
     assert int(kv['collision.collisions']) > 0
 
 
 @pytest.mark.parametrize('period', RATES)
-def test_rst_pulse_while_running(period):
-    run('rst_mid', period)
+def test_rst_pulse_while_running(period, mode):
+    run('rst_mid', period, mode=mode)
 
 
 @pytest.mark.parametrize('period', RATES)
-def test_host_silent_50ms(period):
-    kv = run('silent', period)
+def test_host_silent_50ms(period, mode):
+    kv = run('silent', period, mode=mode)
     assert int(kv['silent.int_timeouts']) > 0
 
 
 @pytest.mark.parametrize('period', RATES)
-def test_frozen_plant_stops_reports(period):
-    kv = run('stale', period)
+def test_frozen_plant_stops_reports(period, mode):
+    kv = run('stale', period, mode=mode)
     assert kv['stale.reports_while_frozen'] == '0'
