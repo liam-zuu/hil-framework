@@ -36,7 +36,7 @@ static uint32_t _half_period(float omega_abs)
      * The pi was removed on 17-18/06 because the debug print was wrong, not
      * because of the output; measured on board 26/10 (05_DATA/results/ENC_PI/
      * 2026-10-26_run01): without pi the ESP32 counted pi times too many edges. */
-    float hp = (float)ENC_TIMER_FREQ * (float)M_PI /
+    float hp = ENC_TICKS_PER_S * (float)M_PI /     /* ENC_CLOCK_CAL: encoder_gen.h */
                (omega_abs * (float)ENC_PPR);
     if (hp > 65535.0f) return 65535u;
     if (hp <     1.0f) return 1u;
@@ -195,12 +195,12 @@ void EncoderGen_GetDebug(EncoderGenDebug_t *dbg)
 
         /* measured_freq: each CH1 callback is one toggle, so ch1_period (time
          * between two callbacks) is half a pulse period:
-         *   freq = ENC_TIMER_FREQ / (2 * ch1_period)
+         *   freq = ENC_TICKS_PER_S / (2 * ch1_period)   (real Hz, ENC_CLOCK_CAL)
          * It comes from the same timer that makes the pulses, so it only
          * checks the scheduling, not the formula: an independent check needs
          * the ESP32 count (env enc_count) or a logic analyzer. */
         dbg[i].measured_freq = (_w[i].ch1_period > 0)
-            ? (float)ENC_TIMER_FREQ / ((float)_w[i].ch1_period * 2.0f)
+            ? ENC_TICKS_PER_S / ((float)_w[i].ch1_period * 2.0f)   /* real Hz */
             : 0.0f;
 
         dbg[i].expected_freq = fabsf(_w[i].omega_cmd) / (2.0f * (float)M_PI)
