@@ -31,7 +31,11 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+/* SPI1 link watchdog (27/10): no frame from the RPi5 for this long -> all
+ * wheel omegas set to 0 so EncoderGen stops instead of holding the last
+ * speed. The ESP32 drops its setpoint to 0 on its own after 200 ms without
+ * a relay packet (AGV_MECANUM traj_receiver.c, TRAJ_TIMEOUT_MS). */
+#define SPI_LINK_TIMEOUT_MS  50u
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -160,10 +164,18 @@ int main(void)
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   static uint32_t _dbg_last = 0;
+  static uint32_t _last_frame_ms = 0;
+  static uint8_t  _link_up = 0;        /* 0 until the first frame */
+  static uint32_t _n_link_lost = 0;
 
   while (1)
   {
     if (SPI1_IsFrameReady()) {
+        _last_frame_ms = HAL_GetTick();
+        if (!_link_up) {
+            _link_up = 1;
+            printf("SPI link up\r\n");
+        }
         SPI1_GetState(&g_state);
         SPI1_GetTrajRef(&g_traj);   /* +++ NEW — clears frame_ready */
 
@@ -182,6 +194,13 @@ int main(void)
         SPI1_SetOutput(&g_output);
 
         HAL_GPIO_TogglePin(GPIOE, GPIO_PIN_1);
+    } else if (_link_up && (HAL_GetTick() - _last_frame_ms) > SPI_LINK_TIMEOUT_MS) {
+        _link_up = 0;
+        _n_link_lost++;
+        for (int i = 0; i < ENC_NUM_WHEELS; i++)
+            EncoderGen_SetOmega(i, 0.0f);
+        printf("SPI link lost (no frame for %lu ms): encoders stopped\r\n",
+               (unsigned long)SPI_LINK_TIMEOUT_MS);
     }
 
     if ((HAL_GetTick() - _dbg_last) >= 500) {
@@ -215,6 +234,8 @@ int main(void)
         printf("Relay: sent=%lu dropped=%lu  traj vx=%.2f vy=%.2f wz=%.2f\r\n",
                (unsigned long)relay_sent, (unsigned long)relay_dropped,
                (double)g_traj.vx_ref, (double)g_traj.vy_ref, (double)g_traj.wz_ref);
+        printf("Link: %s lost=%lu\r\n", _link_up ? "up" : "down",
+               (unsigned long)_n_link_lost);
         printf("---\r\n");
 
         HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_0);
