@@ -87,7 +87,7 @@
 /* ── Trajectory relay packet (H7 → ESP32 via USART2) ───────────────── */
 /* 14 bytes: identical format to WiFi UDP packet on ESP32               */
 /* 0xBB | vx_ref(4B LE float) | vy_ref(4B LE float)                    */
-/*       | wz_ref(4B LE float) | XOR checksum(1B)                       */
+/*       | wz_ref(4B LE float) | XOR checksum(1B) of bytes 0..12       */
 #define TRAJ_UART_HEADER    0xBB
 #define TRAJ_UART_LEN       14
 
