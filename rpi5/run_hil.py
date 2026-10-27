@@ -25,6 +25,10 @@ python run_hil.py --loopback-test --steps 1000
 # 6. EncoderGen check: send constant wheel speeds (no dynamics), 15 s
 sudo python run_hil.py --fixed-omega 10,20,-10,-20 --steps 15000 --no-traj
 
+# 7. BNO085 emulator check (G2): constant IMU values, 60 s, no trajectory
+#    (gz,ax,ay,az,yaw in rad/s, m/s^2, m/s^2, m/s^2, rad)
+sudo python run_hil.py --imu-static 0.5,0.2,-0.1,9.81,1.0 --steps 60000 --no-traj
+
 Notes
 ──────
 - sudo required for SCHED_FIFO (or grant cap_sys_nice).
@@ -195,6 +199,10 @@ def _parse_args() -> argparse.Namespace:
                    help='BCM sync GPIO pin')
     p.add_argument('--no-traj',       action='store_true',
                    help='Skip trajectory publisher process')
+    p.add_argument('--imu-static',    default=None, metavar='GZ,AX,AY,AZ,YAW',
+                   help='BNO085 emulator check (G2): send these constant IMU values '
+                        '[rad/s, m/s^2, m/s^2, m/s^2, rad] in every frame instead of the '
+                        'plant values (imu_seq still changes every frame)')
     p.add_argument('--fixed-omega',   default=None, metavar='W1,W2,W3,W4',
                    help='EncoderGen check: send these constant wheel speeds [rad/s] instead of '
                         'running the plant (use with --steps; implies --no-traj)')
@@ -218,6 +226,7 @@ def main() -> int:
 
     # ── Normal HIL run ───────────────────────────────────────────────────
     from hil_node import HILConfig
+    from imu_model import parse_imu_static
     from trajectory_pub import TrajectorySpec, GROUP_A, LIFTED_TESTS
 
     hil_cfg = HILConfig(
@@ -228,6 +237,7 @@ def main() -> int:
         spi_speed_hz = args.spi_speed,
         max_steps    = args.steps,
         simulate_hw  = args.mock,
+        imu_static   = parse_imu_static(args.imu_static) if args.imu_static else None,
     )
     traj_spec = TrajectorySpec(
         kind     = args.traj,

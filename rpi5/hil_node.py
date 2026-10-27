@@ -37,6 +37,9 @@ from gpio_sync import GPIOSync
 from spi_master import SPIMaster
 from protocol import encode_state, decode_torques, TRAJ_VALID, TRAJ_NEW
 from plant_interface import PlantInterface, MockPlant
+from mecanum_plant import MecanumPlant
+from imu_model import imu_from_plant
+from params import PARAMS
 
 log = logging.getLogger('hil.node')
 
@@ -59,6 +62,9 @@ class HILConfig:
     # Loop control
     max_steps:         int   = 0           # 0 = run indefinitely
     simulate_hw:       bool  = False       # True = no GPIO/SPI hardware
+    # IMU for the BNO085 emulator (G2): (gz, ax, ay, az, yaw) sent in every
+    # frame instead of the plant values; None = plant values (MecanumPlant)
+    imu_static:        Optional[tuple] = None
     # Monitoring
     jitter_warn_us:    float = 500.0       # warn if jitter exceeds this
     stats_interval:    int   = 10_000      # print stats every N steps
@@ -120,6 +126,9 @@ class HILNode:
 
         self._running   = False
         self._step      = 0
+        self._imu_seq   = 0
+        self._prev_state: Optional[list] = None
+        self._imu_from_plant = isinstance(plant, MecanumPlant)
         self._t_start:  Optional[float] = None
 
     # ── Main loop ─────────────────────────────────────────────────────────
@@ -179,8 +188,9 @@ class HILNode:
                 self._ref       = (vx_r, vy_r, wz_r)
                 traj_flags      = TRAJ_VALID | TRAJ_NEW
         state  = self.plant.get_state()
+        imu, imu_seq = self._imu_sample(state)
         mosi   = encode_state(state, traj_ref=self._ref, traj_flags=traj_flags,
-                              seq=self._step)
+                              seq=self._step, imu=imu, imu_seq=imu_seq)
         miso   = self._spi.transfer(mosi)
         torques = decode_torques(miso)
 
@@ -204,6 +214,25 @@ class HILNode:
         # 6. Periodic stats log
         if self._step % self.cfg.stats_interval == 0:
             self._log_stats()
+
+    def _imu_sample(self, state: list):
+        """
+        IMU values for the BNO085 emulator (G2, Liam 27/10 Q3): the static
+        values if set, else noise-free values from a MecanumPlant. Other plants
+        (MockPlant, --fixed-omega) send no IMU (imu_seq stays 0).
+        """
+        if self.cfg.imu_static is not None:
+            imu = self.cfg.imu_static
+        elif self._imu_from_plant:
+            imu = imu_from_plant(state, self._prev_state,
+                                 self.cfg.period_us / 1e6, PARAMS.g)
+            self._prev_state = state
+        else:
+            return None, 0
+        # a new sample every frame: 1..255, skipping 0 (before its first
+        # sample the H7 takes imu_seq 0 as "no IMU yet")
+        self._imu_seq = self._imu_seq % 255 + 1
+        return imu, self._imu_seq
 
     # ── Cleanup & diagnostics ─────────────────────────────────────────────
 
