@@ -67,6 +67,7 @@ void TIM4_IRQHandler(void);
 void SPI1_IRQHandler(void);
 void TIM8_UP_TIM13_IRQHandler(void);
 void TIM5_IRQHandler(void);
+void TIM6_DAC_IRQHandler(void);
 void SPI4_IRQHandler(void);
 void TIM15_IRQHandler(void);
 void TIM16_IRQHandler(void);
