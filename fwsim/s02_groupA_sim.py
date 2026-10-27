@@ -42,7 +42,8 @@ def log_rows(log):
         yield ([int(round(log['t'][i] * 1e6))] + [int(c) for c in log['count'][i]] +
                [f'{x:.2f}' for x in rpm[i]] + [f'{x:.4f}' for x in log['v_fw'][i]] +
                [f'{x:.4f}' for x in log['sp'][i]] + [int(p) for p in log['pwm'][i]] +
-               [''] * 9 + [int(log['tick'][i])] + [int(x) for x in log['dpwm'][i]] + [int(x) for x in log['sat'][i]])
+               [''] * 9 + [int(log['tick'][i])] + [int(x) for x in log['dpwm'][i]] + [int(x) for x in log['sat'][i]] +
+               [''] * (len(COLUMNS) - 37))   # IMU / log-loss columns (AGV ctrl-imu): not filled here yet
 
 
 def main():

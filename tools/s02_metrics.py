@@ -59,6 +59,10 @@ def load_log(path):
         rows = list(csv.reader(f))
     head = rows[0]
     data = np.array([[float(x) if x != '' else np.nan for x in r] for r in rows[1:] if len(r) == len(head)])
+    if 'motor_on' in head:
+        # AGV ctrl-imu: 10 Hz lines while the motor is off carry no controller tick: drop them
+        mo = data[:, head.index('motor_on')]
+        data = data[np.isnan(mo) | (mo == 1)]
     return {h: data[:, i] for i, h in enumerate(head)}
 
 

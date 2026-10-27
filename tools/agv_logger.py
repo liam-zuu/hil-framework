@@ -19,7 +19,7 @@ import os
 # Config
 # ─────────────────────────────────────────
 DEFAULT_PORT = 5005
-BUFFER_SIZE  = 512
+BUFFER_SIZE  = 2048
 
 COLUMNS = [
     "timestamp_us",
@@ -33,8 +33,16 @@ COLUMNS = [
     "yaw", "pitch", "roll",
     # AGV_MECANUM vel_ctrl metric counters (spec S02): tick, cumulative |dpwm|, saturated ticks
     "tick", "dpwm_fl", "dpwm_fr", "dpwm_rl", "dpwm_rr", "sat_fl", "sat_fr", "sat_rl", "sat_rr",
+    # AGV_MECANUM ctrl-imu (controller-IMU spec v2.2 section 8): log loss counters, motor_on
+    # (0 = 10 Hz line while the motor is off), imu_init code, IMU fusion / heading loop.
+    # Old columns keep their meaning: wz = encoder wz, gz = raw chip gyro, yaw in degrees.
+    "log_seq", "log_qdrop", "log_send_err", "motor_on", "imu_init",
+    "wz_meas", "wz_cmd", "gz_fused", "yaw_rad", "age_g_ms", "age_r_ms", "gyro_n", "rv_n", "reset_n",
+    "g_valid", "r_valid", "wz_src", "src_switch_count", "psi_ref", "e_psi", "head_on", "psi_reset_count",
+    "slip_flag", "slip_on_count", "r", "bias_gz",
 ]
-N_OLD = 28      # firmware before the counters: same columns without the last 9
+N_OLD = 28      # firmware before the counters: same columns without the last 9 + 26
+N_S02 = 37      # firmware a6644a5 .. before ctrl-imu: without the last 26
 
 # ─────────────────────────────────────────
 # Main
@@ -78,6 +86,13 @@ def main():
 
             line = data.decode("utf-8", errors="ignore").strip()
 
+            # End-of-run summary (sent 3 times): keep it next to the CSV, not in it
+            if line.startswith("#"):
+                print(f"[RUN] {line}")
+                with open(filename + ".events.txt", "a") as ev:
+                    ev.write(f"{datetime.datetime.now().isoformat()} {line}\n")
+                continue
+
             # Skip header packet
             if "timestamp_us" in line:
                 if not header_passed:
@@ -87,8 +102,8 @@ def main():
 
             # Parse và validate
             fields = line.split(",")
-            if len(fields) == N_OLD:
-                fields += [""] * (len(COLUMNS) - N_OLD)
+            if len(fields) in (N_OLD, N_S02):
+                fields += [""] * (len(COLUMNS) - len(fields))
             if len(fields) != len(COLUMNS):
                 drop_count += 1
                 continue

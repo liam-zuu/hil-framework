@@ -75,8 +75,11 @@ def one_boot(s, period_us, ready_timeout, seconds):
     ready = None
     while time.time() - t0 < ready_timeout:
         line = s.readline().decode(errors='replace').strip()
+        if line.startswith('IMU INIT FAIL'):
+            print(f'ESP32: "{line}"')
+            break
         if line.startswith('IMU READY'):
-            got = int(line.split('period_us=')[1]) if 'period_us=' in line else -1
+            got = int(line.split('period_us=')[1].split()[0]) if 'period_us=' in line else -1
             if got != period_us:
                 sys.exit(f'ESP32 reports "{line}", --rate expects period_us={period_us}. Flash the matching env.')
             ready = time.time() - t0

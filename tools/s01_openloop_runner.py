@@ -159,13 +159,18 @@ class SerialDevice:
             stop_hb.set()
             hb.join()
         info = dict(kv.split('=') for kv in head.split()[1:])
-        rows = []
+        rows, imu = [], []
         while True:
             r = self.readline(timeout=5)
             if r == 'END':
                 break
+            if r.startswith('I,'):          # IMU report (firmware OL v2, AGV ctrl-imu)
+                _, t, kind, v0, v1, v2 = r.split(',')
+                imu.append((int(t), kind, float(v0), float(v1), float(v2)))
+                continue
             t, c, p, e = r.split(',')
             rows.append((int(t), int(c), int(p), int(e)))
+        info['imu_rows'] = imu
         return rows, info
 
     def stop(self):
@@ -201,7 +206,7 @@ class FakeDevice:
                 theta += w * dt
             count = int(math.floor(theta / (2 * math.pi) * COUNTS_PER_REV + 0.5))
             rows.append((k * 1000 + self.rng.randint(0, 20), count, pwm if en else 0, en))
-        return rows, {'n': str(len(rows)), 'aborted': '0', 'reason': 'ok'}
+        return rows, {'n': str(len(rows)), 'aborted': '0', 'reason': 'ok', 'imu_rows': []}
 
     def stop(self):
         pass
@@ -305,7 +310,8 @@ def main():
     dev = FakeDevice(a.seed) if a.dry_run else SerialDevice(a.port)
     runs_path = os.path.join(a.out, 'runs.csv')
     fields = ['run_id', 'wheel', 'scenario', 'pwm_level', 'direction', 'rep', 'v_batt_start', 'v_batt_end',
-              'file', 'order', 'n_samples', 'aborted', 'reason', 'missing_pct', 'steady_ok', 'omega_ss_rad_s', 'block_ok']
+              'file', 'order', 'n_samples', 'aborted', 'reason', 'missing_pct', 'steady_ok', 'omega_ss_rad_s', 'block_ok',
+              'imu_n', 'imu_overflow']
     fruns = open(runs_path, 'w', newline='')
     wr = csv.DictWriter(fruns, fieldnames=fields)
     wr.writeheader()
@@ -326,11 +332,17 @@ def main():
                     fw.writerow(['t_us', 'wheel', 'pwm_cmd', 'en', 'count', 'omega_rad_s'])
                     for r, om in zip(rows, omega):
                         fw.writerow([r[0], WHEELS[w], r[2], r[3], r[1], f'{om:.4f}'])
+                if info.get('imu_rows'):
+                    with open(os.path.join(a.out, 'raw', run_id + '_imu.csv'), 'w', newline='') as f:
+                        fw = csv.writer(f)
+                        fw.writerow(['t_us', 'kind', 'v0', 'v1', 'v2'])
+                        fw.writerows(info['imu_rows'])
                 miss, ok, wss = qc(rows, omega, p['scenario'])
                 done.append(dict(run_id=run_id, wheel=WHEELS[w], scenario=p['scenario'],
                                  pwm_level=p['pwm_level'], direction=p['direction'], rep=p['rep'],
                                  v_batt_start=v0, file=fname, order=p['order'], n_samples=len(rows),
                                  aborted=info.get('aborted'), reason=info.get('reason'),
+                                 imu_n=info.get('imu_n'), imu_overflow=info.get('imu_overflow'),
                                  missing_pct=f'{miss:.2f}', steady_ok=ok, omega_ss_rad_s=wss))
                 flag = '' if miss <= 1.0 and info.get('aborted') == '0' else '  <-- CHECK'
                 print(f'  [{i:3d}/{len(block)}] {run_id:28s} n={len(rows):5d} miss={miss:4.1f}% '
@@ -376,6 +388,7 @@ config:
 files:
   - runs.csv: "one row per run; v_batt in V; steady_ok = omega spread < 2% in last 0.5 s of hold"
   - raw/*.csv: "t_us from run start, pwm_cmd -1000..1000, en, count (1320/rev), omega_rad_s (+-5 ms central difference)"
+  - raw/*_imu.csv: "firmware OL v2 only: IMU reports during the run, t_us = host receive time from run start; kind A accel (m/s^2 x,y,z), G calibrated gyro (rad/s x,y,z), R game RV euler (deg roll,pitch,yaw)"
 notes: ""
 """)
     print(f'\nDone. Output in {a.out}')
