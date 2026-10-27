@@ -6,7 +6,7 @@
  * FreeRTOS:
  *   encoder_task: encoder_get_rpm() and encoder_get_count() for every wheel,
  *   control_task: dt_actual from esp_timer, imu_get() copy, vel_ctrl_step(),
- *                 motor_set() x 4.
+ *                 motor on: motor_set() x 4 + vel_ctrl_applied(); off: motor_stop_all().
  * Both tasks wake on the same 10 ms tick; encoder_task has the higher priority
  * so it runs first (main.c). Ultrasonic interlock, RC and mode logic are not
  * modelled: the setpoint goes straight in, as in MODE_AUTO with no obstacle.
@@ -208,8 +208,14 @@ FWSIM_API int fwsim_tick(int64_t t_us, const int32_t counts[4], const float sp[3
     };
     for (int i = 0; i < 4; i++) { in.enc_rpm[i] = enc_rpm[i]; in.enc_count[i] = enc_count[i]; }
     vel_ctrl_out_t vc = vel_ctrl_step(&in);
+    if (on) {
+        /* main.c: motor_set() then vel_ctrl_applied() with the PWM applied (no obstacle cutoff here) */
+        for (int i = 0; i < 4; i++) motor_set((motor_id_t)i, vc.pwm[i]);
+        vel_ctrl_applied(vc.pwm, &vc);
+    } else {
+        motor_stop_all();
+    }
     last_vc = vc;
-    for (int i = 0; i < 4; i++) motor_set((motor_id_t)i, vc.pwm[i]);
 
     for (int i = 0; i < 4; i++) {
         duty[i] = fw_gpio_duty(rpwm_gpio[i]) - fw_gpio_duty(lpwm_gpio[i]);

@@ -160,6 +160,29 @@ def test_imu_init_fail_motors_stay_off(fw):
     fw.reset()
 
 
+@pytest.mark.parametrize('mode', ['PID', 'ADRC'])
+def test_controller_reset_when_motor_reenabled(fw, mode):
+    """Codex ctrl-imu #1, Liam 28/10: wheels held (counts stay 0) with a setpoint winds up the
+    PID integral / ESO; SWA off, setpoint 0, SWA on again: the first PWM is 0, not the old state."""
+    fw.reset()
+    fw.set_mode(mode)
+    t = 0
+    for _ in range(100):
+        t += 10_000
+        _, _, pwm, _, _ = fw.tick(t, [0, 0, 0, 0], (0.3, 0.0, 0.0))
+    assert np.abs(pwm).max() > 0
+    fw.motor_enable(False)
+    for _ in range(5):
+        t += 10_000
+        fw.tick(t, [0, 0, 0, 0], (0.0, 0.0, 0.0))
+    fw.motor_enable(True)
+    t += 10_000
+    _, _, pwm, _, en = fw.tick(t, [0, 0, 0, 0], (0.0, 0.0, 0.0))
+    assert en == 1
+    assert not np.abs(pwm).any()
+    fw.reset()
+
+
 def test_slip_not_evaluable_column(fw):
     """Codex ctrl-imu #8 = (c), Liam 28/10: slip_eval = 0 while the wheels stand or the gyro is
     invalid; a flag that is on goes off T_slip after the check stops (spec section 13.1)."""

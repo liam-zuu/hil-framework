@@ -14,7 +14,11 @@ setpoint, i.e. initial transient and final stop excluded):
   pwm_tv             mean over wheels of (sum |du|) / T, u = pwm / 1000     1/s   (from dpwm counters)
   sat_pct            mean over wheels of saturated ticks / ticks * 100       %     (from sat counters)
   e_yaw_imu          RMS(wz setpoint - gz), only when gz is logged (REAL)   rad/s
-  missing_pct        1 - logged lines / ticks spanned (whole log)            %
+  missing_pct        1 - logged lines / lines expected (whole log)           %
+                     AGV ctrl-imu logs: from log_seq and the '#run_end' lines in
+                     <log>.events.txt (log_loss); older logs: from the tick span
+  missing_tail_known 1 when a '#run_end' line covers the end of the log, so a lost
+                     end of run is counted; 0 when it cannot be seen
 Lifted tests A-K1, A-K2, per setpoint step whose new level lasts >= 2 s:
   rise_s_segN (10-90 % of the step), overshoot_pct_segN (beyond the new level,
   % of the step size), e_ss_segN (mean setpoint - vx over the last 1 s).
@@ -59,11 +63,51 @@ def load_log(path):
         rows = list(csv.reader(f))
     head = rows[0]
     data = np.array([[float(x) if x != '' else np.nan for x in r] for r in rows[1:] if len(r) == len(head)])
+    seq_all = seq_on = None
+    if 'log_seq' in head:
+        seq_all = data[:, head.index('log_seq')]
     if 'motor_on' in head:
         # AGV ctrl-imu: 10 Hz lines while the motor is off carry no controller tick: drop them
         mo = data[:, head.index('motor_on')]
         data = data[np.isnan(mo) | (mo == 1)]
-    return {h: data[:, i] for i, h in enumerate(head)}
+    log = {h: data[:, i] for i, h in enumerate(head)}
+    if seq_all is not None and np.isfinite(seq_all).any():
+        log['_seq_all'] = seq_all[np.isfinite(seq_all)]          # every line, motor off ones too
+        log['_run_end_last'] = read_run_end(path + '.events.txt')
+    return log
+
+
+def read_run_end(events_path):
+    """last_data_seq of every '#run_end' line agv_logger.py kept next to the CSV (empty if none)."""
+    out = []
+    if os.path.isfile(events_path):
+        with open(events_path, encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                for part in line.strip().split(','):
+                    if part.startswith('last_data_seq='):
+                        out.append(int(part.split('=', 1)[1]))
+    return sorted(set(out))
+
+
+def log_loss(log):
+    """missing_pct and whether the end of the log is covered (Codex ctrl-imu #5, Liam 28/10).
+    New format: log_seq counts every logger_push from boot (data lines, 10 Hz motor-off lines,
+    3 '#run_end' copies with seq L+1..L+3 after the last data line L). Expected lines run from
+    the first received seq to max(last received seq, last_data_seq of the #run_end lines), less
+    the #run_end copies; so losing the end of a run counts too when a #run_end line arrived.
+    Lines lost before the first received one are not visible. Old format: tick span."""
+    if '_seq_all' not in log:
+        tick = log['tick']
+        return float((1 - len(tick) / (tick[-1] - tick[0] + 1)) * 100), 0
+    seq = np.unique(log['_seq_all'].astype(np.int64))
+    ends = [L for L in log['_run_end_last'] if L >= seq[0]]
+    s0, s1 = int(seq[0]), int(max([seq[-1]] + ends))
+    run_end = {L + k for L in ends for k in (1, 2, 3)}
+    expected = (s1 - s0 + 1) - sum(1 for s in run_end if s0 <= s <= s1)
+    got = int(np.sum([s not in run_end for s in seq]))
+    last_on = np.nanmax(log['log_seq']) if np.isfinite(log['log_seq']).any() else seq[-1]   # motor-on lines
+    tail_known = int(bool(ends) and max(ends) >= last_on)
+    return float((1 - got / expected) * 100), tail_known
 
 
 def ik(vx, vy, wz):
@@ -103,7 +147,7 @@ def compute(log, test_id):
     w = np.stack([log[f'{c}_rpm'] for c in ('fl', 'fr', 'rl', 'rr')], axis=1) * 2 * math.pi / 60
     tick = log['tick']
     m = {}
-    m['missing_pct'] = float((1 - len(tick) / (tick[-1] - tick[0] + 1)) * 100)
+    m['missing_pct'], m['missing_tail_known'] = log_loss(log)
 
     moving = np.flatnonzero(np.any(np.abs(sp) > 1e-9, axis=1))
     t0, t1 = t[moving[0]] + WINDOW_SKIP_S, t[moving[-1]]
