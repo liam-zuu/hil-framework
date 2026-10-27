@@ -21,6 +21,7 @@
 #include "encoder_gen.h"
 #include "pwm_capture.h"
 #include "uart_relay.h"         /* +++ NEW */
+#include "bno_emu_port.h"
 #include <stdio.h>
 /* USER CODE END Includes */
 
@@ -73,6 +74,18 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
 void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
 {
     SPI1_ErrorCallback(hspi);
+    BnoPort_SpiError(hspi);
+}
+
+/* BNO085 emulator (G2): TIM6 10 kHz tick and RST pin PG3 (EXTI3) */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM6) BnoPort_Tick();
+}
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    BnoPort_ExtiCallback(GPIO_Pin);
 }
 
 void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef *htim)
@@ -164,6 +177,8 @@ int main(void)
   HAL_NVIC_EnableIRQ(TIM15_IRQn);
   HAL_NVIC_EnableIRQ(TIM16_IRQn);
   HAL_NVIC_EnableIRQ(TIM17_IRQn);
+  printf("BNO: emulator on SPI4 (INT PG2, RST PG3), TIM6 tick\r\n");
+  BnoPort_Init(&hspi4, &htim6);
   printf("Init done, entering main loop\r\n");
   /* USER CODE END 2 */
 
@@ -268,6 +283,29 @@ int main(void)
                (unsigned long)ss.errors, (unsigned long)ss.rearms,
                (unsigned long)ss.last_error);
         _frames_last = ss.frames;
+        /* BNO085 emulator (G2): host init (adv, prod id, set features),
+         * transactions and reports per sensor (accel / gyro / game RV) */
+        BnoPort_Stats_t bs;
+        BnoPort_GetStats(&bs);
+        printf("BNO: st=%u rst=%lu adv=%lu pid=%lu sf=%lu gf=%lu rd=%lu empty=%lu wr=%lu col=%lu tmo=%lu\r\n",
+               (unsigned)bs.state, (unsigned long)bs.core.resets,
+               (unsigned long)bs.core.adverts, (unsigned long)bs.core.prod_id_reqs,
+               (unsigned long)bs.core.set_features, (unsigned long)bs.core.get_features,
+               (unsigned long)bs.core.reads, (unsigned long)bs.core.empty_reads,
+               (unsigned long)bs.core.writes, (unsigned long)bs.core.collisions,
+               (unsigned long)bs.core.int_timeouts);
+        printf("BNO: rpt=%lu/%lu/%lu per=%lu/%lu/%lu us ovr=%lu stale=%lu drop=%lu unk=%lu"
+               " | xfer=%lu mism=%lu miss=%lu armf=%lu err=%lu max=%lu smp=%lu\r\n",
+               (unsigned long)bs.reports[0], (unsigned long)bs.reports[1],
+               (unsigned long)bs.reports[2],
+               (unsigned long)bs.period_us[0], (unsigned long)bs.period_us[1],
+               (unsigned long)bs.period_us[2],
+               (unsigned long)bs.core.input_overruns, (unsigned long)bs.core.stale_skips,
+               (unsigned long)bs.core.q_drops, (unsigned long)bs.core.unknown_cmds,
+               (unsigned long)bs.xfers, (unsigned long)bs.arm_mismatch,
+               (unsigned long)bs.missed_edge, (unsigned long)bs.arm_fail,
+               (unsigned long)bs.spi_errors, (unsigned long)bs.max_clocked,
+               (unsigned long)bs.samples);
         printf("---\r\n");
 
         HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_0);

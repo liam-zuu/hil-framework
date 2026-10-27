@@ -483,6 +483,17 @@ void bno_emu_poll(bno_emu_t *e, uint32_t now_us)
 
 bool bno_emu_int_low(const bno_emu_t *e) { return e->int_low; }
 
+const uint8_t *bno_emu_peek_tx(const bno_emu_t *e, uint16_t *tx_len)
+{
+    if ((e->state != BNO_EMU_HELD) && (e->q_count > 0u)) {
+        const bno_emu_pkt_t *p = &e->q[e->q_head];
+        *tx_len = (uint16_t)(p->len + 4u);
+        return p->buf;
+    }
+    *tx_len = 4u;                           /* header with length 0 */
+    return k_zero;
+}
+
 const uint8_t *bno_emu_cs_fall(bno_emu_t *e, uint32_t now_us, uint16_t *tx_len)
 {
     e->in_xfer = true;
@@ -491,16 +502,10 @@ const uint8_t *bno_emu_cs_fall(bno_emu_t *e, uint32_t now_us, uint16_t *tx_len)
         e->t_int_us = now_us;
     }
     /* Remember what was offered: poll() may queue new packets while CS is low. */
-    e->xfer_offered = (e->state != BNO_EMU_HELD) && (e->q_count > 0u);
-    if (e->xfer_offered) {
-        const bno_emu_pkt_t *p = &e->q[e->q_head];
-        e->xfer_len = p->len;
-        *tx_len = (uint16_t)(p->len + 4u);
-        return p->buf;
-    }
-    e->xfer_len = 0;
-    *tx_len = 4u;                           /* header with length 0 */
-    return k_zero;
+    const uint8_t *tx = bno_emu_peek_tx(e, tx_len);
+    e->xfer_offered = (tx != k_zero);
+    e->xfer_len = e->xfer_offered ? (uint16_t)(*tx_len - 4u) : 0u;
+    return tx;
 }
 
 void bno_emu_cs_rise(bno_emu_t *e, const uint8_t *mosi, uint16_t n_clocked, uint32_t now_us)

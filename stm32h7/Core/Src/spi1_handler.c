@@ -124,10 +124,14 @@ void SPI1_GetTrajRef(HIL_TrajRef_t *out)
     _frame_ready = 0;   /* clear after both state + traj consumed */
 }
 
-/* IMU values of the last frame (does not touch frame_ready) */
+/* IMU values of the last frame (does not touch frame_ready). Copied with
+ * interrupts masked: the BNO085 emulator reads it from the TIM6 interrupt,
+ * which SPI1 (priority 0) can preempt in the middle of the copy. */
 void SPI1_GetImu(HIL_Imu_t *out)
 {
+    __disable_irq();
     *out = _imu;
+    __enable_irq();
 }
 
 void SPI1_SetOutput(const HIL_Output_t *out)

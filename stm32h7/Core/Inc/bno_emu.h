@@ -126,6 +126,10 @@ void bno_emu_set_sample(bno_emu_t *e, const bno_emu_sample_t *s, uint32_t now_us
 void bno_emu_poll(bno_emu_t *e, uint32_t now_us);
 bool bno_emu_int_low(const bno_emu_t *e);
 
+/* What bno_emu_cs_fall() would put on MISO now, without changing any state.
+ * The H7 copies it into its SPI DMA buffer before INT goes low, because the
+ * slave must have its first byte ready when the host pulls CS low. */
+const uint8_t *bno_emu_peek_tx(const bno_emu_t *e, uint16_t *tx_len);
 const uint8_t *bno_emu_cs_fall(bno_emu_t *e, uint32_t now_us, uint16_t *tx_len);
 void bno_emu_cs_rise(bno_emu_t *e, const uint8_t *mosi, uint16_t n_clocked, uint32_t now_us);
 
