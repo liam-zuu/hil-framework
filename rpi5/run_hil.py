@@ -25,6 +25,10 @@ python run_hil.py --loopback-test --steps 1000
 # 6. EncoderGen check: send constant wheel speeds (no dynamics), 15 s
 sudo python run_hil.py --fixed-omega 10,20,-10,-20 --steps 15000 --no-traj
 
+# 6b. EncoderGen check with speed changes in one run (bug H7-ENC-RETIME): 2 rad/s
+#     for 20 s, step to 39.2 for 30 s, stop 5 s ('~' = ramp from the previous speeds)
+sudo python run_hil.py --omega-steps 2,2,2,2:20/39.2,39.2,39.2,39.2:30/0,0,0,0:5
+
 # 7. BNO085 emulator check (G2): constant IMU values, 60 s, no trajectory
 #    (gz,ax,ay,az,yaw in rad/s, m/s^2, m/s^2, m/s^2, rad)
 sudo python run_hil.py --imu-static 0.5,0.2,-0.1,9.81,1.0 --steps 60000 --no-traj
@@ -67,8 +71,29 @@ def _parse_fixed_omega(text: str) -> list:
     return vals
 
 
+def _parse_omega_steps(text: str) -> list:
+    """'2,2,2,2:20/~39.2,39.2,39.2,39.2:0.3' -> [([2.0]*4, 20.0, False), ([39.2]*4, 0.3, True)].
+    Segments split by '/': W1,W2,W3,W4:seconds; a leading '~' ramps from the previous speeds."""
+    segs = []
+    for part in text.split('/'):
+        part = part.strip()
+        ramp = part.startswith('~')
+        w, sep, dur = part.lstrip('~').partition(':')
+        if not sep:
+            raise ValueError(f'--omega-steps segment "{part}" needs W1,W2,W3,W4:seconds')
+        omegas = _parse_fixed_omega(w)
+        d = float(dur)
+        if d <= 0:
+            raise ValueError(f'--omega-steps segment "{part}": duration must be > 0')
+        segs.append((omegas, d, ramp))
+    if not segs:
+        raise ValueError('--omega-steps needs at least one segment')
+    return segs
+
+
 def _run_plant(cfg, shared_state: mp.Array, shared_ref: mp.Array, use_mock: bool, seed: int = 0,
-               wheels_lifted: bool = False, fixed_omega: list = None) -> None:
+               wheels_lifted: bool = False, fixed_omega: list = None,
+               omega_steps: list = None) -> None:
     """Process 1 target: plant simulation loop."""
     import logging
     logging.basicConfig(
@@ -81,7 +106,7 @@ def _run_plant(cfg, shared_state: mp.Array, shared_ref: mp.Array, use_mock: bool
 
     from hil_node import HILNode
     from mecanum_plant import MecanumPlant
-    from plant_interface import MockPlant
+    from plant_interface import MockPlant, OmegaProfilePlant
 
     from params import MecanumParams
     params = MecanumParams()
@@ -92,6 +117,11 @@ def _run_plant(cfg, shared_state: mp.Array, shared_ref: mp.Array, use_mock: bool
         plant = MockPlant()
         plant.reset(list(fixed_omega) + [0.0] * 6)
         logging.getLogger('hil.main').info('Fixed wheel omega [rad/s] = %s (no plant dynamics)', fixed_omega)
+    elif omega_steps is not None:
+        # EncoderGen check with speed changes in one run (bug H7-ENC-RETIME)
+        plant = OmegaProfilePlant(omega_steps, dt=cfg.period_us / 1e6)
+        logging.getLogger('hil.main').info('Wheel omega profile (no plant dynamics): %s, %d steps, then 0',
+                                           omega_steps, plant.total_steps)
     else:
         plant = MockPlant() if use_mock else MecanumPlant(params=params, dt=cfg.period_us / 1e6, seed=seed)
     logging.getLogger('hil.main').info('Plant RNG seed = %s, wheels_lifted = %s', seed, wheels_lifted)
@@ -206,6 +236,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument('--fixed-omega',   default=None, metavar='W1,W2,W3,W4',
                    help='EncoderGen check: send these constant wheel speeds [rad/s] instead of '
                         'running the plant (use with --steps; implies --no-traj)')
+    p.add_argument('--omega-steps',   default=None, metavar='W1,W2,W3,W4:S/...',
+                   help='EncoderGen check: play this wheel-speed profile [rad/s, s] instead of the '
+                        'plant, segments split by "/", a leading "~" ramps from the previous speeds; '
+                        'implies --no-traj; --steps 0 = the profile length')
     return p.parse_args()
 
 
@@ -228,6 +262,14 @@ def main() -> int:
     from hil_node import HILConfig
     from imu_model import parse_imu_static
     from trajectory_pub import TrajectorySpec, GROUP_A, LIFTED_TESTS
+
+    omega_steps = _parse_omega_steps(args.omega_steps) if args.omega_steps else None
+    if omega_steps is not None:
+        if args.fixed_omega:
+            raise SystemExit('--omega-steps and --fixed-omega exclude each other')
+        args.no_traj = True
+        if not args.steps:
+            args.steps = int(round(sum(d for _, d, _ in omega_steps) * 1000))
 
     hil_cfg = HILConfig(
         period_us    = 1_000,
@@ -268,7 +310,7 @@ def main() -> int:
 
     p1 = mp.Process(
         target=_run_plant,
-        args=(hil_cfg, shared_state, shared_ref, args.mock, args.seed, lifted, fixed_omega),
+        args=(hil_cfg, shared_state, shared_ref, args.mock, args.seed, lifted, fixed_omega, omega_steps),
         name='HIL-Plant',
         daemon=True,
     )

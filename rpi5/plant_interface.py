@@ -78,3 +78,47 @@ class MockPlant(PlantInterface):
     @property
     def step_count(self) -> int:
         return self._step_count
+
+
+class OmegaProfilePlant(MockPlant):
+    """
+    Wheel speeds from a fixed profile, no dynamics (run_hil.py --omega-steps).
+
+    For checking EncoderGen with speed changes inside one run (bug H7-ENC-RETIME,
+    28/10/2026): --fixed-omega only holds one set of speeds. State uses the frame
+    order, like MockPlant: [omega1..omega4, 0 x 6].
+
+    segments: list of (omegas[4], duration_s, ramp). ramp False: hold the speeds;
+    True: go linearly from the previous segment's speeds (0 before the first) to
+    these over the segment. Played once, then all wheels 0.
+    """
+
+    def __init__(self, segments, dt: float = 0.001):
+        super().__init__()
+        self._seg = []
+        k, prev = 0, [0.0] * 4
+        for omegas, duration_s, ramp in segments:
+            n = max(1, int(round(duration_s / dt)))
+            self._seg.append((k, k + n, list(prev), [float(w) for w in omegas], bool(ramp)))
+            k += n
+            prev = [float(w) for w in omegas]
+        self._n_total = k
+
+    @property
+    def total_steps(self) -> int:
+        return self._n_total
+
+    def step(self, torques: list) -> list:
+        k = self._step_count
+        self._step_count += 1
+        w = [0.0] * 4
+        for a, b, w0, w1, ramp in self._seg:
+            if a <= k < b:
+                if ramp:
+                    f = (k - a + 1) / (b - a)
+                    w = [x + (y - x) * f for x, y in zip(w0, w1)]
+                else:
+                    w = w1
+                break
+        self._state[0:4] = w
+        return list(self._state)
