@@ -11,6 +11,12 @@ for "IMU READY", records the reports for --seconds and checks:
   period   mean report period per sensor within 2 % of the env period
   values   every report within one chip quantisation step (+ one SPI frame LSB)
            of the static values: A = (ax, ay, az), G = (0, 0, gz), R = (0, 0, yaw deg)
+  loss     (added 28/10, Codex #16 on spec S06 v3.1) no data lost on the host side:
+           qdrop = 0 at the end (ESP32 print queue never full since boot), no line that
+           fails to parse after IMU READY, host count n of each sensor starts at 1 and
+           steps by exactly 1. Before 28/10 PASS ignored these, so a boot could pass
+           with lost reports. Gaps in TIME (H7 sending late or skipping) are reported as
+           *_max_gap_us but not judged: G0 v1 S8 sets no threshold for them.
 
 Usage
   python tools/g2_bno_check.py --port COM4 --rate 20 --boots 10 --seconds 60 \\
@@ -75,8 +81,12 @@ def one_boot(s, period_us, ready_timeout, seconds):
     ready = None
     while time.time() - t0 < ready_timeout:
         line = s.readline().decode(errors='replace').strip()
+        if line.startswith('IMU INIT FAIL'):
+            print(f'ESP32: "{line}"')
+            break
         if line.startswith('IMU READY'):
-            got = int(line.split('period_us=')[1]) if 'period_us=' in line else -1
+            # ctrl-imu prints "... period_us=<n> init_ms=<m>" (Codex #13): take the first token
+            got = int(line.split('period_us=')[1].split()[0]) if 'period_us=' in line else -1
             if got != period_us:
                 sys.exit(f'ESP32 reports "{line}", --rate expects period_us={period_us}. Flash the matching env.')
             ready = time.time() - t0
@@ -109,10 +119,15 @@ def check_boot(rows, period_us, exp):
             out[f'{kind}_period_dev_pct'] = round(100.0 * (mean_p - period_us) / period_us, 3)
             out[f'{kind}_max_gap_us'] = max(gaps)
             out[f'{kind}_count_gaps'] = sum(1 for a, b in zip(rr, rr[1:]) if b[2] - a[2] != 1)
+        elif rr:
+            out[f'{kind}_period_dev_pct'] = ''
+            out[f'{kind}_max_gap_us'] = ''
+            out[f'{kind}_count_gaps'] = 0
         else:
             out[f'{kind}_period_dev_pct'] = ''
             out[f'{kind}_max_gap_us'] = ''
             out[f'{kind}_count_gaps'] = ''
+        out[f'{kind}_first_n'] = rr[0][2] if rr else ''
         if exp is not None and rr:
             want, tol = exp[kind]
             err = max(abs(r[3 + i] - want[i]) for r in rr for i in range(3))
@@ -121,21 +136,39 @@ def check_boot(rows, period_us, exp):
         else:
             out[f'{kind}_max_err'] = ''
             out[f'{kind}_tol'] = ''
-    out['qdrop'] = rows[-1][6] if rows else ''
+    out['qdrop'] = max(r[6] for r in rows) if rows else ''
     return out
 
 
-def boot_pass(b, exp):
+def fail_reasons(b, exp):
+    """Why a boot fails; empty list = PASS."""
     if b['ready_s'] == '':
-        return False
-    if exp is None:
-        return True
+        return ['no IMU READY']
+    why = []
+    if b['bad_lines']:
+        why.append(f"{b['bad_lines']} bad lines")
+    if b['qdrop'] not in ('', 0):
+        why.append(f"qdrop={b['qdrop']}")
     for k in ('A', 'G', 'R'):
-        if b[f'{k}_n'] < 2 or abs(b[f'{k}_period_dev_pct']) > 100 * PERIOD_TOL:
-            return False
+        if b[f'{k}_n'] and b[f'{k}_first_n'] != 1:
+            why.append(f"{k} first n={b[f'{k}_first_n']}")
+        if b[f'{k}_count_gaps'] not in ('', 0):
+            why.append(f"{k} count gaps={b[f'{k}_count_gaps']}")
+    if exp is None:
+        return why
+    for k in ('A', 'G', 'R'):
+        if b[f'{k}_n'] < 2:
+            why.append(f'{k} n<2')
+            continue
+        if abs(b[f'{k}_period_dev_pct']) > 100 * PERIOD_TOL:
+            why.append(f"{k} period {b[f'{k}_period_dev_pct']}%")
         if b[f'{k}_max_err'] == '' or b[f'{k}_max_err'] > b[f'{k}_tol']:
-            return False
-    return True
+            why.append(f'{k} value')
+    return why
+
+
+def boot_pass(b, exp):
+    return not fail_reasons(b, exp)
 
 
 def main():
@@ -169,11 +202,14 @@ def main():
             w.writerows(rows)
         b = {'boot': k, 'ready_s': '' if ready is None else round(ready, 3), 'bad_lines': bad}
         b.update(check_boot(rows, period_us, exp))
-        b['pass'] = boot_pass(b, exp)
+        why = fail_reasons(b, exp)
+        b['pass'] = not why
+        b['fail_reasons'] = '; '.join(why)
         boots.append(b)
         print(f"boot {k:2d}: ready={b['ready_s'] or 'NO'}  n A/G/R={b['A_n']}/{b['G_n']}/{b['R_n']}  "
               f"dev% {b['A_period_dev_pct']}/{b['G_period_dev_pct']}/{b['R_period_dev_pct']}  "
-              f"err {b['A_max_err']}/{b['G_max_err']}/{b['R_max_err']}  -> {'PASS' if b['pass'] else 'FAIL'}",
+              f"err {b['A_max_err']}/{b['G_max_err']}/{b['R_max_err']}  "
+              f"bad={bad} qdrop={b['qdrop']}  -> {'PASS' if b['pass'] else 'FAIL: ' + b['fail_reasons']}",
               flush=True)
     s.close()
 
@@ -195,6 +231,7 @@ def main():
         f.write(f"expect_gz_ax_ay_az_yaw: {'none' if exp_vals is None else list(exp_vals)}\n")
         f.write(f'period_tolerance_pct: {100 * PERIOD_TOL}  # G0 v1 S8 [DE XUAT]\n')
         f.write('value_tolerance: one chip quantisation step + one SPI frame LSB per channel\n')
+        f.write('loss_rule: bad_lines = 0, qdrop = 0, first n = 1, no count gaps  # 28/10, Codex #16\n')
         f.write(f'boots_pass: {n_pass}\nverdict: {verdict}\n')
         f.write('h7_firmware: FILL IN (commit flashed on the H7)\n')
         f.write(f'notes: "{a.notes}"\n')
