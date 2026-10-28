@@ -46,6 +46,8 @@ class SPIMaster:
 
     In simulate=True mode, MISO = MOSI echo (software loopback).
     This lets you test protocol framing without real hardware attached.
+    With a responder (e.g. fake_h7.FakeH7), simulate mode returns
+    responder(mosi) instead, a MISO frame with the real H7 layout.
     """
 
     def __init__(
@@ -54,22 +56,28 @@ class SPIMaster:
         device:    int   = 0,
         speed_hz:  int   = 1_000_000,
         simulate:  bool  = False,
+        responder        = None,
     ):
         """
         Args:
-            bus:      SPI bus index (0 → /dev/spidev0.x).
-            device:   SPI device index (0 → /dev/spidev0.0, CE0).
-            speed_hz: SPI clock [Hz]. Start at 1 MHz; increase after HW validation.
-            simulate: Loopback mode — no real hardware needed.
+            bus:       SPI bus index (0 → /dev/spidev0.x).
+            device:    SPI device index (0 → /dev/spidev0.0, CE0).
+            speed_hz:  SPI clock [Hz]. Start at 1 MHz; increase after HW validation.
+            simulate:  Loopback mode — no real hardware needed.
+            responder: Callable(mosi) -> miso used in simulate mode instead of the echo.
         """
         self.bus       = bus
         self.device    = device
         self.speed_hz  = speed_hz
         self.simulate  = simulate
+        self.responder = responder
 
         self._spi: Optional[object] = None
         self._n_transfers: int = 0
         self._n_errors:    int = 0
+
+        if responder is not None and not simulate:
+            raise ValueError("responder is only for simulate=True")
 
         if not simulate:
             self._open()
@@ -120,6 +128,11 @@ class SPIMaster:
         self._n_transfers += 1
 
         if self.simulate:
+            if self.responder is not None:
+                rx = bytes(self.responder(bytes(tx)))
+                if len(rx) != FRAME_SIZE:
+                    raise ValueError(f"responder returned {len(rx)} bytes, need {FRAME_SIZE}")
+                return rx
             # Loopback: H7 echoes MOSI back as MISO (for protocol tests)
             return bytes(tx)
 
