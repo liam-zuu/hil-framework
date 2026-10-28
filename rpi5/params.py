@@ -104,13 +104,17 @@ class MecanumParams:
         self.g         = 9.81     # gravity [m/s²]
 
         # ── Ground contact (QĐ 25 method A, docs/2026-10-28_Thiet_ke_cach_A_mo_hinh_truot.md) ──
-        # 'rigid'   : body follows the wheels (no-slip kinematic constraint), the plant used up to 28/10.
+        # 'rigid'   : body follows the wheels (no-slip kinematic constraint), the plant used up to 28/10
+        #             (with the rotating-frame term since 28/10, bug HIL-PLANT-ROTFRAME).
         # 'traction': body has its own dynamics (M, Iz); traction torque per wheel
         #             tau_c = C * sat((omega - omega_contact) / omega_s), C = mu_hd * (M g / 4) * r,
         #             omega_contact = row of H_inv times the body velocity.
         # Only for motor_model 'dc' with the wheels on the ground (wheels_lifted is unchanged).
         # 'traction' ignores slip.enabled (the stochastic _apply_slip model is not used with it).
-        self.ground_model = 'rigid'
+        # Default 'traction' since 28/10 (design note Q3 (a), Liam approved): T-A1..T-A7 passed,
+        # 05_DATA/results/SLIP_A/2026-10-28_run03 + rpi5/tests/test_slip_a.py. On the Pi the 1 kHz
+        # budget for it is not measured yet (plant_timing.py): run_hil.py --ground rigid falls back.
+        self.ground_model = 'traction'
         # Effective wheel-floor mu as the force-gauge test measures it: mu_hd = F_max / (m g),
         # pushing straight or sideways (spec controller-IMU v2.2 §1b.4). Not the material mu:
         # with ideal 45° rollers mu_hd ≈ mu_material / sqrt(2).

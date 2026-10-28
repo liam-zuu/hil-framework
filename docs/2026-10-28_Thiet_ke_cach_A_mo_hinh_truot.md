@@ -134,3 +134,23 @@ Sau khi có số liệu xe:
 - **Q5. MATLAB:** không port A, chỉ thêm dòng tham số vào `params_mecanum.m`. *Khuyến nghị: duyệt.*
 - **Q6. Ngưỡng kiểm mục 6:** khóa như bảng, hay sửa con số nào.
 - **Q7. Nhánh và worktree** như mục 8, và có commit ghi chú này lên nhánh đó không.
+
+## 10. Kết quả (28/10/2026, chỉ trên PC, chưa chạy trên Pi)
+
+- **Code:** nhánh `plant-slip-a`. `4ee47ed` mô hình (`ground_model = 'traction'`), `01a5bc3` `plant_timing.py`, `8b454f4` `fwsim/slip_a_check.py`, `b039b09` tùy chọn `--ground`/`--mu`, `ed096d4` sửa plant rigid (xem dưới). Sau đó đổi mặc định sang `'traction'` (Q3 a).
+- **T-A1, T-A3–T-A6** (`rpi5/tests/test_slip_a.py`): đạt. Lực kế ảo cho F/(M·g) = μ_hd ± 1 %, cả đẩy thẳng lẫn đẩy ngang, ở μ_hd = 0,2 / 0,5 / 0,8. Khi cả 4 bánh đều trượt thì không còn gì cản thân quay; đó là đặc tính của mô hình, không phải lỗi.
+- **T-A2, T-A7** (`05_DATA/results/SLIP_A/`):
+  - run01: T-A7 đạt 128/128 dòng; T-A2 trượt 2/128 dòng (A-F2, PID, `e_vy` 1,34× qrms).
+  - run02_diag: tìm ra nguyên nhân. Plant `'rigid'` thiếu số hạng hệ quay `M·wz × v_thân`, ghi vào bug log M7 là `HIL-PLANT-ROTFRAME`, sửa ở `ed096d4`.
+  - run03: T-A2 và T-A7 đều đạt 128/128 dòng.
+- **Thời gian trên PC [ĐO]:** một bước A mất 49 µs (μ 0,5, 8 bước con) và 60 µs (μ 0,8, 12 bước con); plant cũ mất 45–55 µs. Trên Pi chưa đo.
+- **Thông tin cho §10 spec controller–IMU** (test logic `fwsim/tests/test_fwsim_imu.py` nay ghim vào `'rigid'`, Liam duyệt 28/10). Trên `'traction'`, hai ca cho số khác do phản ứng động của plant, không do trượt (`r_true` < 0,001 rad/s):
+  - mất gyro rồi có lại: cú nhảy PWM khi chuyển về IMU là 36, giới hạn [ĐỀ XUẤT] là max(1,5 × 22, 20) = 33;
+  - bơm cách C với s = 0,3: cờ trượt tắt lúc 3,5 s, giới hạn là ≤ 3,26 s.
+  
+  Xét lại hai ngưỡng này khi khóa §10.
+- **Còn lại:**
+  - đo trên Pi bằng `plant_timing.py` của nhánh này (cần push), rồi áp luật ở mục 4;
+  - thay μ_hd [GĐ] bằng số đo MU_FLOOR, chạy lại T-A3;
+  - ca X3 (mặt trơn);
+  - T-A8 (cờ nghi trượt với μ thấp, chỉ mô tả).

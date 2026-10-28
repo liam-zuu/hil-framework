@@ -167,7 +167,7 @@ function params = params_mecanum()
     % PYTHON ONLY: rpi5/params.py + rpi5/plant_step.py (ground_model 'traction'); M6 MATLAB is
     % reference only since 21/10, method A is not ported (Liam 28/10, design note Q5).
     % Lines kept here so the two parameter files stay in step.
-    params.ground_model = 'rigid';         % 'rigid' (no-slip) | 'traction' (Python only)
+    params.ground_model = 'rigid';         % MATLAB has 'rigid' only; Python default is 'traction' since 28/10
     params.mu_hd        = 0.5 * ones(1,4); % effective mu = F_max/(m g) of the force-gauge test [ASSUMPTION — pending MU_FLOOR]
     params.slip_omega_s = 0.1;             % traction smoothing band (rad/s) [ASSUMPTION — numerical smoothing]
 
