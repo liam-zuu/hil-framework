@@ -65,6 +65,7 @@ def load_log(path):
     data = np.array([[float(x) if x != '' else np.nan for x in r] for r in rows[1:] if len(r) == len(head)])
     seq_all = seq_on = None
     if 'log_seq' in head:
+        data = in_seq_order(data, head)
         seq_all = data[:, head.index('log_seq')]
     if 'motor_on' in head:
         # AGV ctrl-imu: 10 Hz lines while the motor is off carry no controller tick: drop them
@@ -77,15 +78,43 @@ def load_log(path):
     return log
 
 
+REORDER_WINDOW = 64     # same value as tools/agv_logger.py
+
+
+def in_seq_order(data, head):
+    """The logger keeps lines as received (B0 review B4): drop exact duplicate datagrams and
+    undo UDP reordering by log_seq. Refuse a log that crosses a DUT restart (log_seq and
+    timestamp_us no longer grow together): split it per boot first, see the logger summary."""
+    s, t = head.index('log_seq'), head.index('timestamp_us')
+    rows = data[np.isfinite(data[:, s])]
+    if len(rows) != len(data):
+        return data                     # old format lines mixed in: keep the file order
+    _, keep = np.unique(rows, axis=0, return_index=True)
+    rows = rows[np.sort(keep)]
+    # in arrival (file) order, UDP reordering only goes back a few seqs (agv_logger.REORDER_WINDOW)
+    back = np.maximum.accumulate(rows[:, s]) - rows[:, s]
+    restart = np.any(back > REORDER_WINDOW)
+    rows = rows[np.argsort(rows[:, s], kind='stable')]
+    if restart or np.any(np.diff(rows[:, s]) == 0) or np.any(np.diff(rows[:, t]) < 0):
+        raise ValueError('log crosses a DUT restart (log_seq and timestamp_us do not grow together); '
+                         'split it per boot before computing metrics')
+    return rows
+
+
 def read_run_end(events_path):
-    """last_data_seq of every '#run_end' line agv_logger.py kept next to the CSV (empty if none)."""
+    """last_data_seq of every well-formed '#run_end' line agv_logger.py kept next to the CSV
+    (empty if none); a malformed value is skipped (B0 review B5)."""
     out = []
     if os.path.isfile(events_path):
         with open(events_path, encoding='utf-8', errors='ignore') as f:
             for line in f:
+                if '#run_end' not in line:
+                    continue
                 for part in line.strip().split(','):
                     if part.startswith('last_data_seq='):
-                        out.append(int(part.split('=', 1)[1]))
+                        v = part.split('=', 1)[1]
+                        if v.isdigit():
+                            out.append(int(v))
     return sorted(set(out))
 
 
