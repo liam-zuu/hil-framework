@@ -10,14 +10,21 @@ python fwsim/build_fwsim.py                      # gcc (Strawberry) -> fwsim/bui
 python -m pytest fwsim/tests -q
 python fwsim/fwsim.py --traj steps --mode ADRC   # one run; --out <dir> saves log.csv, metrics.json, meta.yaml
 python fwsim/tune_ga.py --mode ADRC --pop 24 --gen 20 --out <dir>
+python fwsim/s02_groupA_sim.py --controller ADRC --out <dir>   # spec S02 group A, ESP32 log format
 ```
+
+Plant and IMU options, the same in `fwsim.py`, `tune_ga.py` and `s02_groupA_sim.py`
+(28/10): the firmware gets BNO085 reports by default (QD 23; `--imu-rate 20|100`,
+`--no-imu` only to re-run pre-28/10 runs); the plant ground model is `params.py`'s
+default, slip method A `traction` (`--ground rigid`, `--mu <mu_hd>`).
 
 Rebuild the DLL after every firmware change. `fwsim_build.json` records the
 firmware commit and dirty state; every run copies it into `meta.yaml`.
 
 | Modelled as on the bench | Not modelled |
 |---|---|
-| plant 1 kHz, firmware tick 100 Hz, `encoder_get_rpm` over 10 ms | IMU (firmware only logs it) |
+| plant 1 kHz, firmware tick 100 Hz, `encoder_get_rpm` over 10 ms | BNO085 report latency, IMU noise (until K1) |
+| IMU reports from `rpi5/imu_model.py` into the firmware's `imu_data_t` (fusion, heading loop) | |
 | 1320 counts/rev, PCNT reset at ±limit like ESP-IDF 5.5.3 (`--pcnt-mode wrap16` to compare) | RC, ultrasonic interlock, modes |
 | `motor_set` → MCPWM compare → duty per GPIO, `rpwm − lpwm` as H7 reads it, plant `motor_polarity` | SPI/UART latency (`--io-delay-ms` adds a pure delay) |
 | setpoint held at 50 Hz (trajectory publisher) | H7 timing jitter |

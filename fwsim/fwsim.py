@@ -324,6 +324,34 @@ def plant_meta(params):
     return json.dumps(d)
 
 
+def add_plant_imu_args(ap):
+    """Plant ground contact and IMU options shared by fwsim.py, s02_groupA_sim.py and tune_ga.py."""
+    ap.add_argument('--imu-rate', type=float, default=20.0, help='BNO085 report rate [Hz] (IMU_REPORT_PERIOD_US)')
+    ap.add_argument('--imu-boot-reset', type=float, default=-1.0,
+                    help="time of the chip's boot SH2_RESET [s] (default -1: before the run); set from the measured init_ms")
+    ap.add_argument('--no-imu', action='store_true', help='no IMU reports: only to re-run pre-28/10 runs (QD 23: every firmware has the IMU)')
+    ap.add_argument('--ground', choices=['rigid', 'traction'], default=None,
+                    help='plant ground contact (default: params.py ground_model); traction = slip method A')
+    ap.add_argument('--mu', type=float, default=None, help='mu_hd of all four wheels for --ground traction')
+
+
+def plant_params(a, wheels_lifted=False):
+    """MecanumParams with the --ground / --mu options applied."""
+    params = MecanumParams()
+    if wheels_lifted:
+        params.update_physical(wheels_lifted=True)
+    if a.ground:
+        params.ground_model = a.ground
+    if a.mu is not None:
+        params.mu_hd = np.full(4, a.mu)
+    return params
+
+
+def imu_config(a):
+    """simulate(imu=...) from the --imu-rate / --imu-boot-reset / --no-imu options."""
+    return None if a.no_imu else dict(rate_hz=a.imu_rate, boot_reset=a.imu_boot_reset)
+
+
 def lib_versions():
     import numpy, scipy  # noqa: E401
     v = dict(python=sys.version.split()[0], numpy=numpy.__version__, scipy=scipy.__version__)
@@ -379,25 +407,15 @@ def main():
     ap.add_argument('--pcnt-mode', default='idf', choices=list(PCNT_MODES))
     ap.add_argument('--io-delay-ms', type=int, default=0)
     ap.add_argument('--mode', choices=['PID', 'ADRC'], default=None, help='default: firmware CTRL_MODE')
-    ap.add_argument('--imu-rate', type=float, default=20.0, help='BNO085 report rate [Hz] (IMU_REPORT_PERIOD_US)')
-    ap.add_argument('--imu-boot-reset', type=float, default=-1.0,
-                    help="time of the chip's boot SH2_RESET [s] (default -1: before the run); set from the measured init_ms")
-    ap.add_argument('--no-imu', action='store_true', help='no IMU reports: only to re-run pre-28/10 runs (QD 23: every firmware has the IMU)')
-    ap.add_argument('--ground', choices=['rigid', 'traction'], default=None,
-                    help='plant ground contact (default: params.py ground_model); traction = slip method A')
-    ap.add_argument('--mu', type=float, default=None, help='mu_hd of all four wheels for --ground traction')
+    add_plant_imu_args(ap)
     ap.add_argument('--out')
     a = ap.parse_args()
     sp = make_setpoint(a)
     duration = a.duration or sp.duration or 20.0
     fw = FirmwareSim()
-    params = MecanumParams()
-    if a.ground:
-        params.ground_model = a.ground
-    if a.mu is not None:
-        params.mu_hd = np.full(4, a.mu)
+    params = plant_params(a)
     t0 = time.time()
-    imu = None if a.no_imu else dict(rate_hz=a.imu_rate, boot_reset=a.imu_boot_reset)
+    imu = imu_config(a)
     log = simulate(fw, sp, duration, params, a.seed, a.sp_rate, a.pcnt_mode, a.io_delay_ms, mode=a.mode, imu=imu)
     met = metrics(log)
     print(f'{duration:.1f} s simulated in {time.time() - t0:.1f} s, controller {fw.ctrl_mode}')

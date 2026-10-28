@@ -73,7 +73,7 @@ def load_log(path):
     log = {h: data[:, i] for i, h in enumerate(head)}
     if seq_all is not None and np.isfinite(seq_all).any():
         log['_seq_all'] = seq_all[np.isfinite(seq_all)]          # every line, motor off ones too
-        log['_run_end_last'] = read_run_end(path + '.events.txt')
+        log['_run_end_last'] = read_run_end(str(path) + '.events.txt')   # path may be a pathlib.Path
     return log
 
 
