@@ -5,9 +5,11 @@ from params import MecanumParams
 from plant_step import plant_step
 
 
-def _run(polarity, steps=300):
+def _run(polarity, steps=300, lifted=False):
     p = MecanumParams()
     p.motor_polarity = np.array(polarity, dtype=float)
+    if lifted:
+        p.update_physical(wheels_lifted=True)
     x = np.zeros(10)
     u = np.array([0.5, 0.5, 0.5, 0.5])          # duty (dc model)
     rng = np.random.default_rng(0)
@@ -28,6 +30,11 @@ def test_reversed_wheel_turns_the_other_way():
 
 
 def test_all_reversed_mirrors_all_wheels():
-    w_pos = _run([1, 1, 1, 1])
-    w_neg = _run([-1, -1, -1, -1])
+    # Wheels lifted: on the ground the body's rotating-frame term M wz x v (bug
+    # HIL-PLANT-ROTFRAME, 28/10) is even in the velocity, so the ground response to a
+    # reversed drive is not an exact mirror (physically right); the polarity check is not about that.
+    w_pos = _run([1, 1, 1, 1], lifted=True)
+    w_neg = _run([-1, -1, -1, -1], lifted=True)
     assert np.allclose(w_neg, -w_pos, atol=1e-9)
+    g_pos, g_neg = _run([1, 1, 1, 1]), _run([-1, -1, -1, -1])
+    assert np.allclose(g_neg, -g_pos, rtol=0.05)       # on the ground: mirror within 5 %

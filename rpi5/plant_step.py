@@ -21,7 +21,8 @@ Integrator: semi-implicit Euler with midpoint rotation
   - midpoint angle avoids drift in constant-curvature turns
 
 Ground contact (params.ground_model, motor model 'dc', wheels on the ground):
-  'rigid'    body velocity = H_fwd @ omega (no-slip constraint), as up to 28/10
+  'rigid'    body velocity = H_fwd @ omega (no-slip constraint); with the body's
+             rotating-frame term since 28/10 (rotating_frame_torque, bug HIL-PLANT-ROTFRAME)
   'traction' QĐ 25 method A (docs/2026-10-28_Thiet_ke_cach_A_mo_hinh_truot.md): the
              body velocity [3:6] is its own state, wheels and body are coupled only by
              the traction torque, which saturates at mu_hd * N * r per wheel, so the
@@ -132,12 +133,29 @@ def motor_torque(u, omega, params):
     return tau * params.motor_enable      # EN = 0: open circuit, no torque, no braking
 
 
+def rotating_frame_torque(omega, params):
+    """Generalized wheel torque of the body's rotating-frame term, ground_model 'rigid'.
+
+    The body velocity v = H_fwd @ omega is in the body frame, so Newton reads
+    M (dv/dt + wz x v) = F, i.e. M (dvx/dt - wz vy) = Fx, M (dvy/dt + wz vx) = Fy
+    (the yaw row has no such term). M_eff covers M dv/dt only; the wz x v part
+    (centripetal / Coriolis) maps to the wheels as H_fwd^T [-M wz vy, M wz vx, 0].
+    Left out before 28/10 (M6 port): turning while moving needed no lateral force.
+    It does no work (v . (wz x v) = 0)."""
+    v = params.H_fwd @ omega
+    return params.H_fwd.T @ np.array([-params.M * v[2] * v[1], params.M * v[2] * v[0], 0.0])
+
+
 def _dc_wheel_step(omega, u_cmd, params, rng, dt):
     """One step of the 'dc' wheel model: DC motor, viscous + Coulomb + static friction."""
     u = np.clip(u_cmd, -1.0, 1.0) * getattr(params, 'motor_polarity', 1.0)
     tau_m = motor_torque(u, omega, params)
-    if params.slip.enabled and not getattr(params, 'wheels_lifted', False):
-        tau_m = _apply_slip(tau_m, omega, params, rng)
+    if not getattr(params, 'wheels_lifted', False):
+        if params.slip.enabled:
+            tau_m = _apply_slip(tau_m, omega, params, rng)
+        # Drive torque left after the body's rotating-frame term (bug HIL-PLANT-ROTFRAME):
+        # folded into tau_m so the static-friction test sees the net drive.
+        tau_m = tau_m - rotating_frame_torque(omega, params)
 
     moving = np.abs(omega) > OMEGA_EPS
     stuck = ~moving & (np.abs(tau_m) <= params.motor_Ts)       # static friction holds

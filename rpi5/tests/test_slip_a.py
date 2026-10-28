@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from params import MecanumParams
-from plant_step import plant_step, traction_nsub, _traction_step
+from plant_step import plant_step, traction_nsub, _traction_step, rotating_frame_torque
 from imu_model import imu_from_plant
 
 DT = 0.001
@@ -157,6 +157,30 @@ def test_large_mu_close_to_rigid():
             x = plant_step(x, u, p, DT, rng)
         v[model] = body_vel(x)
     assert np.all(np.abs(v['traction'] - v['rigid']) < 0.02 * abs(v['rigid'][0]))
+
+
+# Bug HIL-PLANT-ROTFRAME (28/10): turning while moving, the rigid plant must need the same
+# lateral force as the traction plant (which integrates the body in the world frame).
+# Without the rotating-frame term the rigid body vy was off by far more than 2 %.
+def test_turning_rigid_matches_traction():
+    p0 = MecanumParams()
+    sgn = np.sign(p0.H_inv @ np.array([1.0, 0.0, 0.0])) + 0.5 * np.sign(p0.H_inv @ np.array([0.0, 0.0, 1.0]))
+    u = 0.4 * sgn * p0.motor_polarity               # forward + yaw: an arc
+    v = {}
+    for model in ('rigid', 'traction'):
+        p = ground(5.0) if model == 'traction' else MecanumParams()
+        x, rng = np.zeros(10), np.random.default_rng(0)
+        for _ in range(1500):
+            x = plant_step(x, u, p, DT, rng)
+        v[model] = body_vel(x)
+    assert abs(v['rigid'][2]) > 0.5                   # it does turn
+    assert np.all(np.abs(v['traction'] - v['rigid']) < 0.02 * abs(v['rigid'][0]))
+
+
+def test_rotating_frame_term_does_no_work():
+    p = MecanumParams()
+    w = np.array([8.0, 3.0, 5.0, -2.0])
+    assert float(w @ rotating_frame_torque(w, p)) == pytest.approx(0.0, abs=1e-12)
 
 
 # Sanity (T-A7 proper is on fwsim): doubling the sub-steps changes the result by < 0.5 %
