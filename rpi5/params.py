@@ -103,6 +103,21 @@ class MecanumParams:
         self.wheels_lifted = False    # True: wheels off the ground, no body coupling (S01 bench)
         self.g         = 9.81     # gravity [m/s²]
 
+        # ── Ground contact (QĐ 25 method A, docs/2026-10-28_Thiet_ke_cach_A_mo_hinh_truot.md) ──
+        # 'rigid'   : body follows the wheels (no-slip kinematic constraint), the plant used up to 28/10.
+        # 'traction': body has its own dynamics (M, Iz); traction torque per wheel
+        #             tau_c = C * sat((omega - omega_contact) / omega_s), C = mu_hd * (M g / 4) * r,
+        #             omega_contact = row of H_inv times the body velocity.
+        # Only for motor_model 'dc' with the wheels on the ground (wheels_lifted is unchanged).
+        # 'traction' ignores slip.enabled (the stochastic _apply_slip model is not used with it).
+        self.ground_model = 'rigid'
+        # Effective wheel-floor mu as the force-gauge test measures it: mu_hd = F_max / (m g),
+        # pushing straight or sideways (spec controller-IMU v2.2 §1b.4). Not the material mu:
+        # with ideal 45° rollers mu_hd ≈ mu_material / sqrt(2).
+        self.mu_hd        = np.full(4, 0.5)   # [ASSUMPTION — pending MU_FLOOR measurement]
+        self.slip_omega_s = 0.1               # [rad/s] traction smoothing band [ASSUMPTION — numerical smoothing]
+        self.slip_nsub    = None              # sub-steps per dt; None = from the stability bound [calculated]
+
         # ── Encoder parameters ───────────────────────────────────────────
         self.enc_ppr          = 1320    # counts/rev, 4x (GB37-520: 11 PPR x 30:1 = 330/ch; x4). Not used by HIL path: H7 ENC_PPR=330 generates pulses
         self.enc_noise_sigma  = 0.02    # Gaussian noise σ on counts
@@ -189,6 +204,14 @@ class MecanumParams:
         else:
             self.M_eff = self.H_fwd.T @ M_body @ self.H_fwd + J_diag
         self.M_eff_inv = np.linalg.inv(self.M_eff)
+
+        # Ground contact 'traction': rows of H_inv as plain floats (inner loop), and the
+        # largest eigenvalue of J^-1 + H_inv diag(M, M, Iz)^-1 H_inv^T [1/(kg m^2)], which
+        # sets the fastest slip mode and so the explicit sub-step bound (plant_step.traction_nsub).
+        self.H_inv_rows = tuple(tuple(float(v) for v in row) for row in self.H_inv)
+        A_slip = (np.linalg.inv(J_diag)
+                  + self.H_inv @ np.diag([1.0 / self.M, 1.0 / self.M, 1.0 / self.Iz]) @ self.H_inv.T)
+        self.traction_lam_max = float(np.linalg.eigvalsh(A_slip).max())
 
         # ADRC b0 = 1 / J_eff (effective inertia in forward mode)
         self.adrc['b0'] = 1.0 / (self.M_eff[0, 0])

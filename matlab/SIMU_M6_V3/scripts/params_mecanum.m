@@ -163,6 +163,14 @@ function params = params_mecanum()
     params.slip.detect_threshold = 0.15;   % slip ratio threshold for detection (15%)
     params.slip.imu_wz_threshold = 0.5;    % IMU yaw rate mismatch threshold (rad/s)
 
+    %% --- Ground contact, QD 25 method A (28/10/2026) ---
+    % PYTHON ONLY: rpi5/params.py + rpi5/plant_step.py (ground_model 'traction'); M6 MATLAB is
+    % reference only since 21/10, method A is not ported (Liam 28/10, design note Q5).
+    % Lines kept here so the two parameter files stay in step.
+    params.ground_model = 'rigid';         % 'rigid' (no-slip) | 'traction' (Python only)
+    params.mu_hd        = 0.5 * ones(1,4); % effective mu = F_max/(m g) of the force-gauge test [ASSUMPTION — pending MU_FLOOR]
+    params.slip_omega_s = 0.1;             % traction smoothing band (rad/s) [ASSUMPTION — numerical smoothing]
+
     %% --- Load Disturbance (M6) ---
     % External torque disturbance applied to wheels (step/ramp/random)
     % Applied in simulation loop, not inside plant_step

@@ -19,7 +19,16 @@ State vector (10 elements):
 Integrator: semi-implicit Euler with midpoint rotation
   - velocity (omega) updated first, then pose
   - midpoint angle avoids drift in constant-curvature turns
+
+Ground contact (params.ground_model, motor model 'dc', wheels on the ground):
+  'rigid'    body velocity = H_fwd @ omega (no-slip constraint), as up to 28/10
+  'traction' QĐ 25 method A (docs/2026-10-28_Thiet_ke_cach_A_mo_hinh_truot.md): the
+             body velocity [3:6] is its own state, wheels and body are coupled only by
+             the traction torque, which saturates at mu_hd * N * r per wheel, so the
+             wheels can slip. Explicit sub-steps (traction_nsub), no randomness.
 """
+import math
+
 import numpy as np
 from params import MecanumParams, PARAMS
 
@@ -59,6 +68,11 @@ def plant_step(
 
     x     = np.asarray(x, dtype=float)
     omega = x[6:10].copy()   # current wheel speeds
+
+    if (getattr(params, 'motor_model', 'torque') == 'dc'
+            and getattr(params, 'ground_model', 'rigid') == 'traction'
+            and not getattr(params, 'wheels_lifted', False)):
+        return _traction_step(x, np.asarray(tau, dtype=float), params, dt)
 
     if getattr(params, 'motor_model', 'torque') == 'dc':
         omega_new = _dc_wheel_step(omega, np.asarray(tau, dtype=float), params, rng, dt)
@@ -137,6 +151,95 @@ def _dc_wheel_step(omega, u_cmd, params, rng, dt):
     # Friction alone must not reverse a wheel within one step: stop it instead.
     crossed = moving & (np.sign(omega_new) != np.sign(omega)) & (np.abs(tau_m) <= params.motor_Ts)
     return np.where(crossed, 0.0, omega_new)
+
+
+TRACTION_SAFETY = 2.0   # sub-steps per dt: this factor over the explicit-Euler stability bound
+
+
+def traction_nsub(params: MecanumParams, dt: float = 0.001) -> int:
+    """Sub-steps per dt for ground_model 'traction'.
+
+    params.slip_nsub if set; otherwise from the stiffest slip mode: the traction law
+    is linear with slope k = C / omega_s inside the band, so explicit Euler is stable for
+    h < 2 / (k * lam_max), lam_max = params.traction_lam_max. TRACTION_SAFETY x that.
+    """
+    if params.slip_nsub:
+        return int(params.slip_nsub)
+    c_max = float(np.max(params.mu_hd)) * params.M * params.g / 4.0 * params.r
+    k = c_max / params.slip_omega_s
+    return max(1, math.ceil(TRACTION_SAFETY * dt * k * params.traction_lam_max / 2.0))
+
+
+def _traction_step(x, u_cmd, params, dt, f_ext=None):
+    """One dt of ground_model 'traction' (method A), plain floats in the inner loop.
+
+    Per wheel i, at every sub-step h = dt / traction_nsub:
+      omega_c,i = H_inv[i] . v_body                     contact speed seen by wheel i
+      tau_c,i   = C_i * sat((omega_i - omega_c,i) / omega_s),  C_i = mu_hd,i * (M g / 4) * r
+      J_i domega_i/dt = tau_m,i - tau_f,i - tau_c,i      motor and friction as _dc_wheel_step,
+                                                        static friction holds when |tau_m - tau_c| <= Ts
+    Body: [Fx, Fy, Mz] = H_inv^T tau_c (body frame), integrated in the world frame
+    (no Coriolis term needed), then the pose. Power check: the wheels lose tau_c.omega,
+    the body gains tau_c.omega_c, the rest tau_c.(omega - omega_c) >= 0 is dissipated.
+
+    f_ext: tests only (virtual force gauge): f(x, y, vx_w, vy_w) -> (Fx_w, Fy_w) [N].
+    """
+    p = params
+    pol = p.motor_polarity.tolist()
+    u = [min(1.0, max(-1.0, float(u_cmd[i]))) * pol[i] for i in range(4)]
+    n_load = p.M * p.g / 4.0
+    cap = [float(m) * n_load * p.r for m in np.broadcast_to(p.mu_hd, (4,))]
+    inv_ws = 1.0 / p.slip_omega_s
+    rows = p.H_inv_rows
+    kr = (p.motor_K / p.motor_R).tolist()
+    kk, u0 = p.motor_K.tolist(), p.motor_u0.tolist()
+    tc_f, ts, bv, jw = p.motor_Tc.tolist(), p.motor_Ts.tolist(), p.motor_b.tolist(), p.J_wheels.tolist()
+    vb, en = p.V_batt, p.motor_enable
+    m, iz = p.M, p.Iz
+
+    xw, yw, th, vxw, vyw, wz = (float(v) for v in x[0:6])
+    w = [float(v) for v in x[6:10]]
+    n = traction_nsub(p, dt)
+    h = dt / n
+    for _ in range(n):
+        c, s = math.cos(th), math.sin(th)
+        vbx = c * vxw + s * vyw            # world -> body
+        vby = -s * vxw + c * vyw
+        fx = fy = mz = 0.0
+        for i in range(4):
+            wi = w[i]
+            hx, hy, hz = rows[i]
+            z = (wi - (hx * vbx + hy * vby + hz * wz)) * inv_ws
+            tc = cap[i] * (1.0 if z > 1.0 else -1.0 if z < -1.0 else z)
+            ui = u[i]
+            a = abs(ui) - u0[i]
+            ue = (a if ui > 0.0 else -a) if a > 0.0 else 0.0
+            drive = kr[i] * (vb * ue - kk[i] * wi) * en - tc
+            if abs(wi) > OMEGA_EPS:
+                wn = wi + h * (drive - bv[i] * wi - (tc_f[i] if wi > 0.0 else -tc_f[i])) / jw[i]
+                if (wn > 0.0) != (wi > 0.0) and abs(drive) <= ts[i]:
+                    wn = 0.0               # friction alone must not reverse the wheel
+            elif abs(drive) <= ts[i]:
+                wn = 0.0                   # static friction holds
+            else:
+                wn = wi + h * (drive - (tc_f[i] if drive > 0.0 else -tc_f[i])) / jw[i]
+            w[i] = wn
+            fx += hx * tc
+            fy += hy * tc
+            mz += hz * tc
+        axw = (c * fx - s * fy) / m        # body -> world
+        ayw = (s * fx + c * fy) / m
+        if f_ext is not None:
+            gx, gy = f_ext(xw, yw, vxw, vyw)
+            axw += gx / m
+            ayw += gy / m
+        vxw += h * axw
+        vyw += h * ayw
+        wz += h * mz / iz
+        xw += h * vxw
+        yw += h * vyw
+        th += h * wz
+    return np.array([xw, yw, _wrap_angle(th), vxw, vyw, wz, w[0], w[1], w[2], w[3]])
 
 
 def _apply_slip(
