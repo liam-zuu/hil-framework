@@ -59,17 +59,26 @@ QRMS = {'e_vx': STEPS['e_vx'] * math.sqrt(4 / 6), 'e_vy': STEPS['e_vy'] * math.s
 
 
 def load_log(path):
+    path = os.fspath(path)
     with open(path, newline='') as f:
         rows = list(csv.reader(f))
     head = rows[0]
-    data = np.array([[float(x) if x != '' else np.nan for x in r] for r in rows[1:] if len(r) == len(head)])
-    seq_all = seq_on = None
+    body = rows[1:]
+    bad = [i + 2 for i, r in enumerate(body) if len(r) != len(head)]
+    if bad:
+        raise ValueError(f'{path}: lines {bad[:5]} do not have {len(head)} columns (mixed formats)')
+    seq_all = None
     if 'log_seq' in head:
-        data = in_seq_order(data, head)
+        body = in_seq_order(body, head, path + '.segments.csv')
+    data = np.array([[float(x) if x != '' else np.nan for x in r] for r in body])
+    if 'log_seq' in head:
         seq_all = data[:, head.index('log_seq')]
     if 'motor_on' in head:
-        # AGV ctrl-imu: 10 Hz lines while the motor is off carry no controller tick: drop them
+        # AGV ctrl-imu: 10 Hz lines while the motor is off carry no controller tick: drop them.
+        # Any value other than 0/1 is refused, not dropped quietly (B0 review B36).
         mo = data[:, head.index('motor_on')]
+        if np.any(np.isfinite(mo) & (mo != 0) & (mo != 1)):
+            raise ValueError(f'{path}: motor_on outside {{0, 1}}')
         data = data[np.isnan(mo) | (mo == 1)]
     log = {h: data[:, i] for i, h in enumerate(head)}
     if seq_all is not None and np.isfinite(seq_all).any():
@@ -78,43 +87,89 @@ def load_log(path):
     return log
 
 
-REORDER_WINDOW = 64     # same value as tools/agv_logger.py
+# Same values as tools/agv_logger.py (MAX_US_PER_SEQ, RATE_SLACK_US): inside one DUT boot,
+# lines k seqs apart are at most MAX_US_PER_SEQ * k + RATE_SLACK_US apart in time
+MAX_US_PER_SEQ = 150_000
+RATE_SLACK_US = 50_000
 
 
-def in_seq_order(data, head):
-    """The logger keeps lines as received (B0 review B4): drop exact duplicate datagrams and
-    undo UDP reordering by log_seq. Refuse a log that crosses a DUT restart (log_seq and
-    timestamp_us no longer grow together): split it per boot first, see the logger summary."""
+def in_seq_order(body, head, segments_path=None):
+    """Text rows of one DUT boot in log_seq order (B0 review B4, B30, B31). The logger keeps
+    lines as received; drop duplicate lines and undo UDP reordering.
+      * With the logger's <csv>.segments.csv (one row per data row): drop rows marked
+        'duplicate'; refuse a log with a 'conflict' or 'ambiguous' row or with more than one
+        segment (a suspected DUT restart: split it per segment first).
+      * Without it: drop rows equal as text (so NaN fields do not matter); every row must
+        have a log_seq or none (old format: rows kept in file order, timestamps must not go
+        back); then, sorted by log_seq, seqs must be distinct and timestamps grow at a rate one
+        boot can produce. The arrival order is not used: lost lines make big seq jumps."""
     s, t = head.index('log_seq'), head.index('timestamp_us')
-    rows = data[np.isfinite(data[:, s])]
-    if len(rows) != len(data):
-        return data                     # old format lines mixed in: keep the file order
-    _, keep = np.unique(rows, axis=0, return_index=True)
-    rows = rows[np.sort(keep)]
-    # in arrival (file) order, UDP reordering only goes back a few seqs (agv_logger.REORDER_WINDOW)
-    back = np.maximum.accumulate(rows[:, s]) - rows[:, s]
-    restart = np.any(back > REORDER_WINDOW)
-    rows = rows[np.argsort(rows[:, s], kind='stable')]
-    if restart or np.any(np.diff(rows[:, s]) == 0) or np.any(np.diff(rows[:, t]) < 0):
-        raise ValueError('log crosses a DUT restart (log_seq and timestamp_us do not grow together); '
-                         'split it per boot before computing metrics')
-    return rows
+    if segments_path is not None and os.path.isfile(segments_path):
+        with open(segments_path, newline='') as f:
+            seg = list(csv.DictReader(f))
+        if len(seg) != len(body):
+            raise ValueError(f'{segments_path}: {len(seg)} rows for {len(body)} data lines')
+        bad = sorted({r['status'] for r in seg} & {'conflict', 'ambiguous'})
+        if bad:
+            raise ValueError(f'log has {"/".join(bad)} lines (see {segments_path}); not usable as is')
+        keep = [(r, m) for r, m in zip(body, seg) if m['status'] != 'duplicate']
+        if len({m['segment'] for _, m in keep}) > 1:
+            raise ValueError('log crosses a DUT restart (more than one logger segment); '
+                             'split it per segment before computing metrics')
+        body = [r for r, _ in keep]
+        if all(m['status'] == 'no_seq' for _, m in keep):
+            return _old_format(body, t)
+        if any(m['status'] == 'no_seq' for _, m in keep):
+            raise ValueError('log mixes lines with and without log_seq (mixed formats)')
+    else:
+        seen = set()
+        uniq = []
+        for r in body:
+            if tuple(r) not in seen:
+                seen.add(tuple(r))
+                uniq.append(r)
+        body = uniq
+        has = [r[s] != '' for r in body]
+        if not any(has):
+            return _old_format(body, t)
+        if not all(has):
+            raise ValueError('log mixes lines with and without log_seq (mixed formats)')
+    body = sorted(body, key=lambda r: int(r[s]))
+    seq = [int(r[s]) for r in body]
+    ts = [int(r[t]) for r in body]
+    for (s0, t0), (s1, t1) in zip(zip(seq, ts), zip(seq[1:], ts[1:])):
+        if s1 == s0 or not t0 <= t1 <= t0 + MAX_US_PER_SEQ * (s1 - s0) + RATE_SLACK_US:
+            raise ValueError(f'log crosses a DUT restart or has conflicting lines (seq {s0} -> {s1}, '
+                             f'timestamp_us {t0} -> {t1}); split it per boot before computing metrics')
+    return body
+
+
+def _old_format(body, t):
+    """Lines without log_seq (old firmware, fwsim SIM logs): file order, time must not go back."""
+    ts = [float(r[t]) for r in body]
+    if any(b < a for a, b in zip(ts, ts[1:])):
+        raise ValueError('old-format log: timestamp_us goes back in file order')
+    return body
 
 
 def read_run_end(events_path):
     """last_data_seq of every well-formed '#run_end' line agv_logger.py kept next to the CSV
-    (empty if none); a malformed value is skipped (B0 review B5)."""
+    (empty if none). Well formed as in agv_logger.parse_run_end (B0 review B5, B33): every
+    value an unsigned 32-bit number, seq one of L+1..L+3 for last_data_seq L."""
     out = []
     if os.path.isfile(events_path):
         with open(events_path, encoding='utf-8', errors='ignore') as f:
             for line in f:
-                if '#run_end' not in line:
+                i = line.find('#run_end,')
+                if i < 0:
                     continue
-                for part in line.strip().split(','):
-                    if part.startswith('last_data_seq='):
-                        v = part.split('=', 1)[1]
-                        if v.isdigit():
-                            out.append(int(v))
+                kv = {}
+                for part in line[i:].strip().split(',')[1:]:
+                    k, _, v = part.partition('=')
+                    kv[k] = int(v) if v.isascii() and v.isdigit() and int(v) < 2**32 else None
+                L, sq = kv.get('last_data_seq'), kv.get('seq')
+                if L is not None and sq is not None and 1 <= sq - L <= 3:
+                    out.append(L)
     return sorted(set(out))
 
 
