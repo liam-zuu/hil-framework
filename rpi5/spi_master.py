@@ -129,9 +129,16 @@ class SPIMaster:
 
         if self.simulate:
             if self.responder is not None:
-                rx = bytes(self.responder(bytes(tx)))
+                # Same error contract as the hardware path below (B0 review B13)
+                try:
+                    rx = bytes(self.responder(bytes(tx)))
+                except Exception as exc:
+                    self._n_errors += 1
+                    raise RuntimeError(f"SPI transfer failed: {exc}") from exc
                 if len(rx) != FRAME_SIZE:
-                    raise ValueError(f"responder returned {len(rx)} bytes, need {FRAME_SIZE}")
+                    self._n_errors += 1
+                    raise RuntimeError(f"SPI transfer failed: responder returned {len(rx)} bytes, "
+                                       f"need {FRAME_SIZE}")
                 return rx
             # Loopback: H7 echoes MOSI back as MISO (for protocol tests)
             return bytes(tx)

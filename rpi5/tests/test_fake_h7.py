@@ -1,10 +1,13 @@
 """fake_h7.FakeH7 + SPIMaster responder (workflow v3.1 section 9.1, Codex round 2 #32;
-Liam approved B0 29/10). No hardware."""
+Liam approved B0 29/10; B0 review round 1 B11-B14). No hardware.
+Expected sequences follow the H7 timeline worked out by hand from main.c / spi1_handler.c
+(one TX buffer, main loop takes the latest frame), not from the fake's code."""
 import multiprocessing as mp
+import struct
 
 import pytest
 
-from fake_h7 import FakeH7
+from fake_h7 import FakeH7, encode_miso_like_h7
 from hil_node import HILConfig, HILNode
 from plant_interface import MockPlant
 from protocol import (
@@ -13,6 +16,7 @@ from protocol import (
 from spi_master import SPIMaster
 
 ZERO_STATE = [0.0] * 10
+VN = TRAJ_VALID | TRAJ_NEW
 
 
 def mosi(seq, flags=0, ref=(0.0, 0.0, 0.0), imu_seq=0):
@@ -20,29 +24,47 @@ def mosi(seq, flags=0, ref=(0.0, 0.0, 0.0), imu_seq=0):
                         imu=(0.0, 0.0, 0.0, 9.81, 0.0), imu_seq=imu_seq)
 
 
-@pytest.mark.parametrize('lag', [1, 2, 3])
-def test_seq_echo_comes_lag_frames_later(lag):
-    fake = FakeH7(seq_lag=lag)
-    out = [decode_output(fake(mosi(s))) for s in range(10, 20)]
-    assert [o['seq'] for o in out[:lag]] == [0] * lag          # nothing prepared yet
-    assert [o['seq'] for o in out[lag:]] == list(range(10, 20 - lag))
+def seqs_out(fake, seqs, **kw):
+    return [decode_output(fake(mosi(s, **kw)))['seq'] for s in seqs]
 
 
-def test_duty_in_torque_field_pwm_and_status_zero_like_the_h7():
-    fake = FakeH7(duty_fn=lambda n, s, t: [0.1 * (n + 1), -0.5, 1.7, 0.0])
+def test_echo_one_frame_late():
+    # frame 0 clocks the empty buffer; after each frame the main loop writes that frame's seq
+    assert seqs_out(FakeH7(), range(1, 7)) == [0, 1, 2, 3, 4, 5]
+
+
+def test_slow_main_loop_takes_the_latest_frame_and_skips_seqs():
+    # main loop after frames 1, 3, 5 (0-based): handles seq 2, 4, 6
+    fake = FakeH7(main_every=2)
+    assert seqs_out(fake, range(1, 9)) == [0, 0, 2, 2, 4, 4, 6, 6]
+    assert fake.processed_seqs == [2, 4, 6, 8]
+
+
+def test_stall_keeps_the_last_prepared_frame():
+    """Codex B11: after seq 1, 2, 3 the buffer holds seq 3; frames 3-5 stalled clock seq 3;
+    the main loop then handles the latest frame (seq 7)."""
+    fake = FakeH7(faults=[(3, 6, 'stall')])
+    assert seqs_out(fake, range(1, 10), flags=VN) == [0, 1, 2, 3, 3, 3, 3, 7, 8]
+    assert fake.processed_seqs == [1, 2, 3, 7, 8, 9] and fake.relay_attempted == 6
+
+
+def test_duty_as_the_h7_encodes_it():
+    """Torque field = duty truncated like (int16_t)(d * 32767.0f); pwm field and status 0."""
+    fake = FakeH7(duty_fn=lambda n, s, t: [0.1, -0.5, 1.7, -0.00002])
     fake(mosi(1))
-    o = decode_output(fake(mosi(2)))
-    assert o['torque'] == pytest.approx([0.1, -0.5, 1.0, 0.0], abs=1e-4)   # clamped to 1
+    raw = fake(mosi(2))
+    assert struct.unpack_from('>4h', raw, 0) == (3276, -16383, 32767, 0)    # C truncates toward 0
+    o = decode_output(raw)
     assert o['pwm'] == [0.0] * 4 and o['status'] == 0 and o['seq'] == 1
 
 
-def test_relay_only_with_valid_and_new():
+def test_relay_attempted_only_with_valid_and_new():
     fake = FakeH7()
     fake(mosi(1, flags=TRAJ_VALID, ref=(0.3, 0.0, 0.0)))
     fake(mosi(2, flags=TRAJ_NEW, ref=(0.4, 0.0, 0.0)))
-    assert fake.relays == 0
-    fake(mosi(3, flags=TRAJ_VALID | TRAJ_NEW, ref=(0.5, -0.1, 1.0)))
-    assert fake.relays == 1
+    assert fake.relay_attempted == 0
+    fake(mosi(3, flags=VN, ref=(0.5, -0.1, 1.0)))
+    assert fake.relay_attempted == 1
     assert fake.last_relay == pytest.approx((0.5, -0.1, 1.0), abs=1e-3)
 
 
@@ -53,27 +75,35 @@ def test_imu_updates_counted_on_seq_change():
     assert fake.imu_updates == 3
 
 
-def test_stall_repeats_last_frame_and_skips_processing():
-    fake = FakeH7(faults=[(3, 6, 'stall')], duty_fn=lambda n, s, t: [0.0] * 4)
-    seqs = []
-    for s in range(1, 10):
-        seqs.append(decode_output(fake(mosi(s, flags=TRAJ_VALID | TRAJ_NEW)))['seq'])
-    # frames 0..2 normal (echo of 0, 1, 2), 3..5 stalled (repeat 2), then the H7 handles frame 6
-    assert seqs == [0, 1, 2, 2, 2, 2, 3, 7, 8]
-    assert fake.processed == 6 and fake.relays == 6
+def test_silent_loses_the_transaction_miso_bad_keeps_it():
+    fake = FakeH7(faults=[(1, 2, 'silent'), (3, 4, 'miso_bad')], silent_byte=0xFF)
+    out = [fake(mosi(s)) for s in range(1, 6)]
+    assert out[1] == b'\xff' * FRAME_SIZE and out[3] == b'\xff' * FRAME_SIZE
+    assert fake.processed_seqs == [1, 3, 4, 5]          # seq 2 never reached the H7
+    assert decode_output(out[4])['seq'] == 4
 
 
-def test_silent_returns_fill_byte():
-    fake = FakeH7(faults=[(1, 3, 'silent')], silent_byte=0xFF)
+def test_torn_frame_zeroes_the_tail():
+    fake = FakeH7(duty_fn=lambda n, s, t: [0.5] * 4, faults=[(2, 3, 'torn')], torn_at=4)
     fake(mosi(1))
-    assert fake(mosi(2)) == b'\xff' * FRAME_SIZE
-    assert fake(mosi(3)) == b'\xff' * FRAME_SIZE
-    assert decode_output(fake(mosi(4)))['seq'] == 1
+    fake(mosi(2))
+    raw = fake(mosi(3))
+    assert struct.unpack_from('>4h', raw, 0) == (16383, 16383, 0, 0)
+    assert raw[17] == 0                                   # seq byte lost too
+
+
+def test_transfer_error_goes_through_the_spi_error_path():
+    spi = SPIMaster(simulate=True, responder=FakeH7(faults=[(1, 2, 'xfer_error')]))
+    spi.transfer(mosi(1))
+    with pytest.raises(RuntimeError, match='SPI transfer failed'):
+        spi.transfer(mosi(2))
+    assert spi.stats['errors'] == 1 and spi.stats['transfers'] == 2
+    spi.transfer(mosi(3))                                 # recovers on the next frame
 
 
 def test_bad_arguments():
     with pytest.raises(ValueError):
-        FakeH7(seq_lag=0)
+        FakeH7(main_every=0)
     with pytest.raises(ValueError):
         FakeH7(faults=[(5, 5, 'stall')])
     with pytest.raises(ValueError):
@@ -88,8 +118,16 @@ def test_spi_master_uses_responder_and_echo_stays_default():
     spi = SPIMaster(simulate=True, responder=FakeH7())
     assert spi.transfer(frame) == bytes(FRAME_SIZE)
     assert decode_output(spi.transfer(mosi(8)))['seq'] == 7
-    with pytest.raises(ValueError):
-        SPIMaster(simulate=True, responder=lambda tx: b'\x00' * 3).transfer(frame)
+    bad = SPIMaster(simulate=True, responder=lambda tx: b'\x00' * 3)
+    with pytest.raises(RuntimeError):
+        bad.transfer(frame)
+    assert bad.stats['errors'] == 1
+
+
+def test_encode_matches_the_h7_byte_layout():
+    raw = encode_miso_like_h7([1.0, -1.0, 0.0, 0.25], seq=0x1A0 & 0xFF)
+    assert raw[:8] == bytes.fromhex('7fff8001 00001fff')
+    assert raw[8:16] == bytes(8) and raw[16] == 0 and raw[17] == 0xA0 and raw[18:] == bytes(22)
 
 
 class RecPlant(MockPlant):
@@ -104,7 +142,7 @@ class RecPlant(MockPlant):
 
 def test_hil_node_reads_duty_from_fake_h7_and_relays_new_setpoints():
     """The Pi loop with the fake H7 in place of the board: plant gets the duty, the H7
-    relays only frames where the publisher counter changed."""
+    sees VALID|NEW only on frames where the publisher counter changed."""
     plant = RecPlant()
     ref = mp.Array('d', 4)
     node = HILNode(plant, config=HILConfig(simulate_hw=True, max_steps=0), shared_ref=ref)
@@ -117,4 +155,4 @@ def test_hil_node_reads_duty_from_fake_h7_and_relays_new_setpoints():
         node._tick(0)
     assert plant.torques[0] == [0.0] * 4                 # first MISO: nothing prepared yet
     assert plant.torques[-1] == pytest.approx([0.25, -0.25, 0.5, -0.5], abs=1e-4)
-    assert fake.relays == 2 and fake.last_relay == pytest.approx((0.3, 0.0, 0.0), abs=1e-3)
+    assert fake.relay_attempted == 2 and fake.last_relay == pytest.approx((0.3, 0.0, 0.0), abs=1e-3)
