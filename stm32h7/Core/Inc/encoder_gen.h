@@ -33,7 +33,9 @@
  * Each channel toggles independently every half_period_ticks once started;
  * the initial 90 deg offset between A and B encodes direction and is
  * preserved as both channels advance by the same half_period_ticks on every
- * callback. At every start both pins are forced low first, so the first
+ * callback; when the speed changes, EncoderGen_SetOmega re-times both
+ * channels to the new half period (before 28/10 it did not, bug H7-ENC-RETIME).
+ * At every start both pins are forced low first, so the first
  * edge of each is rising and the lead/lag does not depend on the levels
  * left by the previous run.
  *
@@ -85,7 +87,10 @@ void EncoderGen_Init(TIM_HandleTypeDef *ht1,
 /* Set target angular velocity [rad/s].
  * omega = 0 (within ENC_OMEGA_MIN) stops the wheel (no toggling).
  * Direction change stops and restarts with the new 90 deg phase offset.
- * Same direction: only half_period is updated, picked up on next callback. */
+ * Same direction, new speed: both pending edges are re-timed (encoder_gen.c
+ * _retime, 28/10): the next edge comes within one NEW half period and B stays
+ * half a new half period from A, so the direction the ESP32 decodes holds.
+ * Called from the main loop; disables interrupts for a few hundred cycles. */
 void EncoderGen_SetOmega(uint8_t wheel, float omega_rad_s);
 
 /* Call from HAL_TIM_OC_DelayElapsedCallback in main.c.
