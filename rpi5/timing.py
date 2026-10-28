@@ -234,6 +234,29 @@ class PrecisionTimer:
 
 # ── Standalone jitter measurement ─────────────────────────────────────────
 
+def _save_sched():
+    """(policy, priority, affinity) of the calling process, None where the OS has no such call."""
+    def _try(fn):
+        try:
+            return fn()
+        except (AttributeError, OSError):
+            return None
+    policy = _try(lambda: os.sched_getscheduler(0))
+    prio = _try(lambda: os.sched_getparam(0).sched_priority)
+    return policy, prio, _try(lambda: os.sched_getaffinity(0))
+
+
+def _restore_sched(saved) -> None:
+    policy, prio, affinity = saved
+    try:
+        if policy is not None and prio is not None:
+            os.sched_setscheduler(0, policy, os.sched_param(prio))
+        if affinity is not None:
+            os.sched_setaffinity(0, affinity)
+    except (AttributeError, OSError) as exc:
+        print(f"[timing] could not restore scheduler/affinity: {exc}", flush=True)
+
+
 def measure_jitter(
     n_ticks:   int = 2_000,
     period_us: int = 1_000,
@@ -253,18 +276,27 @@ def measure_jitter(
 
     Returns:
         Jitter statistics dict (same keys as PrecisionTimer.jitter_stats).
+
+    With rt=True the calling process's scheduler and CPU affinity are changed for the
+    measurement and put back afterwards (B0 review B41: a pytest run on the Pi must not
+    leave the test process on SCHED_FIFO pinned to core 0).
     """
-    if rt:
-        set_realtime(priority=90)
-        pin_cpu(core=0)
+    saved = _save_sched() if rt else None
+    try:
+        if rt:
+            set_realtime(priority=90)
+            pin_cpu(core=0)
 
-    hz = 1_000_000 // period_us
-    print(f"[timing] Measuring jitter: {n_ticks} ticks @ {period_us} μs ({hz} Hz) …",
-          flush=True)
+        hz = 1_000_000 // period_us
+        print(f"[timing] Measuring jitter: {n_ticks} ticks @ {period_us} μs ({hz} Hz) …",
+              flush=True)
 
-    timer = PrecisionTimer(period_us=period_us, history_len=n_ticks + 100)
-    for _ in range(n_ticks):
-        timer.wait_next_tick()
+        timer = PrecisionTimer(period_us=period_us, history_len=n_ticks + 100)
+        for _ in range(n_ticks):
+            timer.wait_next_tick()
+    finally:
+        if saved is not None:
+            _restore_sched(saved)
 
     timer.print_jitter_report()
     s = timer.jitter_stats

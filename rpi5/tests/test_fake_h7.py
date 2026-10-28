@@ -58,6 +58,23 @@ def test_duty_as_the_h7_encodes_it():
     assert o['pwm'] == [0.0] * 4 and o['status'] == 0 and o['seq'] == 1
 
 
+@pytest.mark.parametrize('x,want', [
+    # Codex B37: the duty is a C float; float32(k/32767) * 32767.0f rounds to exactly k, while
+    # the double product (0.99999999907 for k = 1) would truncate to k - 1. Inputs are the
+    # float32 values written out; expected values from a float32 product (struct 'f') by hand.
+    (3.0518509447574615e-05, 1), (-3.0518509447574615e-05, -1), (6.103701889514923e-05, 2),
+    (0.0030518509447574615, 100), (-0.0030518509447574615, -100),
+    (0.99999, 32766), (-0.99999, -32766), (1.0, 32767), (-1.0, -32767), (0.0, 0)])
+def test_duty_cast_in_float32_next_to_a_step(x, want):
+    assert struct.unpack_from('>h', encode_miso_like_h7([x, 0, 0, 0], seq=0), 0)[0] == want
+
+
+@pytest.mark.parametrize('bad', [float('nan'), float('inf'), float('-inf')])
+def test_non_finite_duty_is_refused(bad):
+    with pytest.raises(ValueError):
+        encode_miso_like_h7([bad, 0, 0, 0], seq=0)
+
+
 def test_relay_attempted_only_with_valid_and_new():
     fake = FakeH7()
     fake(mosi(1, flags=TRAJ_VALID, ref=(0.3, 0.0, 0.0)))

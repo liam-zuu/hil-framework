@@ -40,6 +40,8 @@ from __future__ import annotations
 import struct
 from typing import Callable, Optional, Sequence
 
+import numpy as np
+
 from protocol import (
     FRAME_SIZE, OFS_MISO_SEQ, OFS_PWM, OFS_SEQ, OFS_STATUS, TRAJ_NEW, TRAJ_VALID,
     decode_imu, decode_state, decode_traj_ref,
@@ -54,8 +56,15 @@ class FakeH7TransferError(Exception):
 
 
 def _c_int16(x: float) -> int:
-    """(int16_t)(clamp(x, -1, 1) * 32767.0f) as in spi1_handler.c _encode: truncates toward 0."""
-    return int(max(-1.0, min(1.0, float(x))) * INT16_MAXF)
+    """(int16_t)(_clampf(x, -1, 1) * (32767.0f / 1.0f)) as in spi1_handler.c _encode: input,
+    clamp and product in float32 like the C (B0 review B37: a double product differs next to a
+    quantization step), then the cast truncates toward 0. Non-finite input is refused: the C
+    cast of NaN is undefined, so the fake does not pretend to know its result."""
+    xf = np.float32(x)
+    if not np.isfinite(xf):
+        raise ValueError(f'duty must be finite, got {x!r}')
+    xf = min(np.float32(1.0), max(np.float32(-1.0), xf))
+    return int(np.float32(xf * np.float32(INT16_MAXF)))
 
 
 def encode_miso_like_h7(duty, seq: int, status: int = 0) -> bytes:
