@@ -42,7 +42,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, '..', 'rpi5'))
 from params import MecanumParams              # noqa: E402
-from plant_step import plant_step             # noqa: E402
+from plant_step import plant_step, traction_nsub   # noqa: E402
 from trajectory_pub import TrajectorySpec, get_body_velocity   # noqa: E402
 from imu_model import imu_from_plant          # noqa: E402
 
@@ -313,6 +313,17 @@ def metrics(log, t_from=0.0):
     return out
 
 
+def plant_meta(params):
+    """Plant settings for meta.yaml (one YAML flow mapping)."""
+    d = dict(motor_model=params.motor_model, V_batt=params.V_batt,
+             wheels_lifted=bool(getattr(params, 'wheels_lifted', False)),
+             ground_model=params.ground_model, slip_legacy_enabled=bool(params.slip.enabled))
+    if params.ground_model == 'traction':
+        d.update(mu_hd=np.broadcast_to(params.mu_hd, (4,)).tolist(), slip_omega_s=params.slip_omega_s,
+                 slip_nsub=traction_nsub(params))
+    return json.dumps(d)
+
+
 def lib_versions():
     import numpy, scipy  # noqa: E401
     v = dict(python=sys.version.split()[0], numpy=numpy.__version__, scipy=scipy.__version__)
@@ -348,7 +359,7 @@ firmware:
   compiler: "{b.get('compiler')}"
   ctrl_mode: {fw.ctrl_mode}
 config: {json.dumps(args_dict)}
-plant: {{motor_model: {params.motor_model}, V_batt: {params.V_batt}, slip: {params.slip.enabled}}}
+plant: {plant_meta(params)}
 libraries: {json.dumps(lib_versions())}
 files:
   - log.csv: "100 Hz firmware ticks: setpoint, true body velocity (plant body state), firmware's encoder velocity, duty (rpwm-lpwm), pwm, wheel speed, pose, EN, IMU fusion / heading columns (imu_fusion.c, heading.c), r_true (wz from wheels - body wz), inj (method C window)"
@@ -372,12 +383,19 @@ def main():
     ap.add_argument('--imu-boot-reset', type=float, default=-1.0,
                     help="time of the chip's boot SH2_RESET [s] (default -1: before the run); set from the measured init_ms")
     ap.add_argument('--no-imu', action='store_true', help='no IMU reports: only to re-run pre-28/10 runs (QD 23: every firmware has the IMU)')
+    ap.add_argument('--ground', choices=['rigid', 'traction'], default=None,
+                    help='plant ground contact (default: params.py ground_model); traction = slip method A')
+    ap.add_argument('--mu', type=float, default=None, help='mu_hd of all four wheels for --ground traction')
     ap.add_argument('--out')
     a = ap.parse_args()
     sp = make_setpoint(a)
     duration = a.duration or sp.duration or 20.0
     fw = FirmwareSim()
     params = MecanumParams()
+    if a.ground:
+        params.ground_model = a.ground
+    if a.mu is not None:
+        params.mu_hd = np.full(4, a.mu)
     t0 = time.time()
     imu = None if a.no_imu else dict(rate_hz=a.imu_rate, boot_reset=a.imu_boot_reset)
     log = simulate(fw, sp, duration, params, a.seed, a.sp_rate, a.pcnt_mode, a.io_delay_ms, mode=a.mode, imu=imu)

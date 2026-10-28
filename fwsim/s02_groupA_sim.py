@@ -107,7 +107,8 @@ firmware:
   build_flags: "fwsim shim (no FreeRTOS); main.c glue repeated in fwsim/fw_sim.c"
   h7: null
   rpi5: null
-plant: {{motor_model: {p0.motor_model}, motor_polarity: {p0.motor_polarity.tolist()}, V_batt: {p0.V_batt}, slip_enabled: {str(p0.slip.enabled).lower()}, mu_static: {p0.slip.mu_static}, mu_kinetic: {p0.slip.mu_kinetic}, lifted_tests: {list(LIFTED_TESTS)}}}
+plant: {fwsim.plant_meta(p0)}
+plant_extra: {{motor_polarity: {p0.motor_polarity.tolist()}, lifted_tests: {list(LIFTED_TESTS)}}}
 reps: {a.reps}
 seeds: "seed = rep (1..{a.reps})"
 order_seed: {a.order_seed}
@@ -118,7 +119,7 @@ files:
   - raw/<run_id>.csv: "ESP32 logger format (tools/agv_logger.py COLUMNS), 100 Hz, IMU columns empty"
   - runs.csv: "spec P2-6 columns + test_id"
   - metrics.csv: "tools/s02_metrics.py, one line per run"
-notes: "slip model disabled (same default as the HIL plant), so the plant has no random input and the {a.reps} seeds give identical runs"
+notes: "the plant has no random input (legacy slip model off; ground_model traction is deterministic), so the {a.reps} seeds give identical runs"
 """)
     print(f'{len(runs)} runs in {time.time() - t_start:.0f} s -> {a.out}')
 
