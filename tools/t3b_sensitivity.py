@@ -116,7 +116,7 @@ def ideal_reads(t_apply, w_d, read_phase_us, read_span_us, seed, stress=False, r
 
 # ── (1), (2) harness ──
 
-def build(tmp, src_c, tag):
+def build(tmp, src_c, tag, defines=()):
     d = os.path.join(tmp, tag)
     os.makedirs(d)
     for f in (os.path.join(H7, 'Core', 'Inc', 'encoder_gen.h'), os.path.join(SIM, 'stm32h7xx_hal.h'),
@@ -124,7 +124,7 @@ def build(tmp, src_c, tag):
         shutil.copy(f, d)
     shutil.copy(src_c, os.path.join(d, 'encoder_gen.c'))
     exe = os.path.join(d, 'encgen_t3b.exe')
-    r = subprocess.run(['gcc', '-std=gnu11', '-O2', '-Wall', '-Werror', '-I', d,
+    r = subprocess.run(['gcc', '-std=gnu11', '-O2', '-Wall', '-Werror', *defines, '-I', d,
                         os.path.join(d, 'encgen_t3b_main.c'), os.path.join(d, 'encoder_gen.c'),
                         '-lm', '-o', exe], capture_output=True, text=True)
     if r.returncode != 0:
@@ -219,8 +219,10 @@ def main(argv=None) -> int:
         p_old = os.path.join(tmp, 'encoder_gen_old.c')
         with open(p_old, 'w', newline='\n') as f:
             f.write(old_src)
-        for tag, src in (('old', p_old), ('new', os.path.join(H7, 'Core', 'Src', 'encoder_gen.c'))):
-            exe = build(tmp, src, tag)
+        # old encoder_gen.c has no event hook: its calls are inferred from the dir change (harness)
+        for tag, src, dfn in (('old', p_old, ['-DENCGEN_NO_HOOK']),
+                              ('new', os.path.join(H7, 'Core', 'Src', 'encoder_gen.c'), [])):
+            exe = build(tmp, src, tag, dfn)
             tb, ta, c, rv, calls = run_harness(exe, frames_txt, a.sim_seed, a.read_phase_us, a.read_span_us)
             runs[tag] = (sc.Run(t_send, w_d, tb, ta, c, calls=calls), rv)
 

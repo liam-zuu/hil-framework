@@ -24,9 +24,11 @@
  *          against the applied omega (|omega| > 0.3), the per-edge truth,
  *          without the edges of pins forced low at a start
  *   C <wheel> <S|P> <t_ns> <cnt>                       _start_wheel / _stop
- *       call, inferred from the dir change seen by EncoderGen_GetDebug
- *       (SetOmega: 0 -> x start, x -> 0 stop, sign flip stop + start);
- *       cnt = timer CNT just before SetOmega (phase of _start_wheel, Y5)
+ *       call, from the EncoderGen event hook (encoder_gen.c with
+ *       ENCODER_GEN_HAS_EVENT_HOOK, 29/10): cnt = timer CNT at the call; built
+ *       with -DENCGEN_NO_HOOK (encoder_gen.c before the hook) the call is
+ *       inferred from the dir change seen by EncoderGen_GetDebug and cnt is
+ *       the CNT just before SetOmega
  *
  *   encgen_t3b <frames.txt> <seed> <read_phase_ns> <read_span_ns> [read_period_ns]
  */
@@ -86,6 +88,15 @@ static void run_isr(int w)
 
 static double urand(void) { return (double)rand() / ((double)RAND_MAX + 1.0); }
 
+#ifndef ENCGEN_NO_HOOK
+static double hook_t;                          /* real time of the frame being applied */
+static void enc_hook(uint8_t wheel, uint8_t ev, uint16_t cnt, uint32_t n)
+{
+    (void)n;
+    printf("C %u %c %.0f %u\n", wheel, ev == ENC_EV_START ? 'S' : 'P', hook_t, cnt);
+}
+#endif
+
 int main(int argc, char **argv)
 {
     if (argc != 5 && argc != 6) {
@@ -119,6 +130,9 @@ int main(int argc, char **argv)
         pend_at[w][0] = pend_at[w][1] = -1;
     }
     EncoderGen_Init(&H[0], &H[1], &H[2], &H[3]);
+#ifndef ENCGEN_NO_HOOK
+    EncoderGen_SetEventHook(enc_hook);
+#endif
 
     long k = 0;                                   /* next frame to apply */
     double rd_before = read_phase;                /* next read */
@@ -135,6 +149,9 @@ int main(int argc, char **argv)
             rd_sample = rd_before + urand() * read_span;
         }
         /* main loop: frames due */
+#ifndef ENCGEN_NO_HOOK
+        hook_t = t;
+#endif
         while (k < nf && t_apply[k] <= t) {
             EncoderGen_GetDebug(dbg);
             for (int w = 0; w < 4; w++) {
@@ -145,10 +162,15 @@ int main(int argc, char **argv)
                 EncoderGen_SetOmega((uint8_t)w, wf[k][w]);
                 flags[w] &= T[w].SR;
                 EncoderGen_GetDebug(d1);
+#ifdef ENCGEN_NO_HOOK
                 if (dir0 != 0 && d1[w].dir != dir0)
                     printf("C %d P %.0f %u\n", w, t, (unsigned)cnt0);
-                if (d1[w].dir != 0 && d1[w].dir != dir0) {
+                if (d1[w].dir != 0 && d1[w].dir != dir0)
                     printf("C %d S %.0f %u\n", w, t, (unsigned)cnt0);
+#else
+                (void)cnt0;                              /* C lines come from the hook */
+#endif
+                if (d1[w].dir != 0 && d1[w].dir != dir0) {
                     for (int c = 0; c < 2; c++)          /* start: pins forced low */
                         if (pin[w][c]) { pin[w][c] = 0; edge(w, 1); }
                 }
