@@ -7,6 +7,10 @@
  *   v2: 36 bytes (+ vx_ref, vy_ref, wz_ref, traj_flags)
  *   v3: 40 bytes (+ IMU values for the BNO085 emulator: gz, ax, ay, az, yaw,
  *       imu_seq; G0 v1 §5, Liam chose 40 bytes 22/10/2026)
+ *   MISO v4 (S06, 29/10/2026, Liam chose "inside MISO SPI1"): the unused
+ *       bytes 8-15 (pwm, never set by the H7) and 18-39 carry checksums,
+ *       the H7 cycle stamp of the answered frame and one S06 log record
+ *       per frame. MOSI unchanged except fault bit 2 (IMU loss injection).
  */
 
 #ifndef HIL_PROTOCOL_H
@@ -68,17 +72,34 @@
 /* Byte  2– 3  torque[1]                                                 */
 /* Byte  4– 5  torque[2]                                                 */
 /* Byte  6– 7  torque[3]                                                 */
-/* Byte  8– 9  pwm[0]       int16 = duty × INT16_MAXF                   */
-/* Byte 10–11  pwm[1]                                                    */
-/* Byte 12–13  pwm[2]                                                    */
-/* Byte 14–15  pwm[3]                                                    */
+/* v4 (S06): bytes 8-15 and 18-39 below; multi-byte fields little-endian */
+/* Byte  8– 9  miso_crc     CRC-16 of bytes 0-7 and 10-39 of this frame,  */
+/*                          computed when the frame is staged (Z3)        */
+/* Byte 10–11  mosi_crc     CRC-16 of the 40 raw MOSI bytes of the frame  */
+/*                          answered, on the main-loop copy (W3, Y9)      */
+/* Byte 12–15  rx_cyc       DWT CYCCNT in SPI1_Callback of that frame     */
 /* Byte 16     status       uint8                                        */
-/* Byte 17     seq          uint8                                        */
-/* Byte 18–39  reserved     0x00                                         */
+/* Byte 17     seq          uint8, seq of the frame answered             */
+/* Byte 18–19  rx_nf        low 16 bits of the H7 frame count of it      */
+/* Byte 20–21  age_us       callback -> main loop applied it, us (sat.)  */
+/* Byte 22     log_type     S06 log record type, 0 = none (s06_log.h)    */
+/* Byte 23–24  log_idx      continuous index of the H7 log record        */
+/* Byte 25–39  log_payload  15 bytes, by type                            */
+/* CRC-16: CCITT-FALSE (poly 0x1021, init 0xFFFF, no reflection, no XOR) */
+#define HIL_MISO_CRC        8
+#define HIL_MISO_MOSI_CRC   10
+#define HIL_MISO_RX_CYC     12
+#define HIL_MISO_STATUS     16
+#define HIL_MISO_SEQ        17
+#define HIL_MISO_RX_NF      18
+#define HIL_MISO_AGE        20
+#define HIL_MISO_LOG        22
+#define HIL_MISO_LOG_LEN    18          /* type + idx + 15-byte payload */
 
 /* ── Fault flags (MOSI byte 20) ─────────────────────────────────────── */
 #define HIL_FAULT_PLANT     (1u << 0)
 #define HIL_FAULT_OVERRUN   (1u << 1)
+#define HIL_FAULT_IMU_LOSS  (1u << 2)   /* S06 T8: emulator builds no report [ĐỀ XUẤT] */
 
 /* ── Traj flags (MOSI byte 30) ──────────────────────────────────────── */
 #define HIL_TRAJ_VALID      (1u << 0)   /* setpoint is valid            */
@@ -110,11 +131,16 @@ typedef struct {
     float ax, ay, az;           /* m/s^2 */
     float yaw;                  /* rad   */
     uint8_t imu_seq;
+    /* S06 (T1 Z3): raw MOSI bytes 22-23 and 31-38 (gz, ax, ay, az, yaw) of
+     * the same frame, and the H7 frame count of that frame, for the
+     * checksum and source frame in the report-build log */
+    uint8_t  raw[10];
+    uint32_t src_nf;
 } HIL_Imu_t;
 
 typedef struct {
     float torque[4];
-    float pwm[4];
+    float pwm[4];               /* not sent since MISO v4 (bytes 8-15 reused) */
     uint8_t status;
     uint8_t seq;
 } HIL_Output_t;

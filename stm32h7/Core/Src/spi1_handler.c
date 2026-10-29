@@ -18,10 +18,22 @@
  *    loop did not see (debug printing longer than 1 ms) is not lost silently.
  *    A newer NEW replaces a pending one (the DUT should follow the latest
  *    setpoint); replaced and dropped ones are counted.
+ *
+ * S06 (29/10, MISO v4, hil_protocol.h; design 2026-10-29_Thiet_ke_H7_S06.md):
+ *  - the callback stamps each frame with DWT CYCCNT (read directly, not through
+ *    a shared us clock: this runs at priority 0) and its frame count, and keeps
+ *    the raw MOSI bytes with the decoded copy;
+ *  - SPI1_GetFrameEx() hands the main loop the raw bytes, stamp and count of the
+ *    same frame, so the MOSI checksum is computed on the copy actually used;
+ *  - SPI1_SetOutputEx() puts that checksum, stamp, count and state age into the
+ *    MISO, adds one S06 log record and the MISO checksum of the staged bytes.
+ *    A log record leaves the ring only after the frame carrying the previous
+ *    one went to the DMA; a frame sent twice repeats its record (same index).
  */
 
 #include "spi1_handler.h"
 #include "hil_protocol.h"
+#include "s06_log.h"
 #include <string.h>
 
 /* ── Private state ───────────────────────────────────────────────────── */
@@ -30,8 +42,14 @@ static uint8_t _tx[SPI1_FRAME_LEN];       /* buffer handed to the DMA      */
 static uint8_t _tx_next[SPI1_FRAME_LEN];  /* staged by SPI1_SetOutput()    */
 static volatile uint8_t _tx_next_valid;
 static uint8_t _rx[SPI1_FRAME_LEN];
+static uint8_t _rx_raw[SPI1_FRAME_LEN];   /* raw MOSI bytes of _state/_traj/_imu */
+static uint32_t _rx_cyc;                  /* CYCCNT in the callback of that frame */
+static uint32_t _rx_nf;                   /* _n_frames counting that frame        */
 
 static volatile uint8_t _frame_ready = 0;
+/* S06 log record carried by the staged MISO frame */
+static S06_Rec_t _slot;
+static uint8_t   _slot_valid;
 static volatile uint32_t _n_unread;       /* frames decoded over an unread one */
 
 /* Setpoint waiting for the UART relay (Codex #23) */
@@ -109,22 +127,38 @@ static void _decode(void)
     _imu.az           = _rd16(&_rx[35]) * (HIL_IMU_ACCEL_MAX  / INT16_MAXF);
     _imu.yaw          = _rd16(&_rx[37]) * (HIL_IMU_YAW_MAX    / INT16_MAXF);
     _imu.imu_seq      = _rx[39];
+    /* S06: raw gz (22-23) and ax..yaw (31-38) for the report-build checksum */
+    _imu.raw[0] = _rx[22];
+    _imu.raw[1] = _rx[23];
+    memcpy(&_imu.raw[2], &_rx[31], 8);
+    memcpy(_rx_raw, _rx, SPI1_FRAME_LEN);
 }
 
-/* ── Encode MISO (H7 → RPi5) ────────────────────────────────────────── */
-static void _encode(uint8_t *buf)
+/* ── Encode MISO (H7 → RPi5), v4 ────────────────────────────────────── */
+static void _encode(uint8_t *buf, const SPI1_MisoInfo_t *info)
 {
     memset(buf, 0, SPI1_FRAME_LEN);
     for (int i = 0; i < 4; i++) {
         _wr16(&buf[i * 2],
               (int16_t)(_clampf(_output.torque[i], -HIL_TORQUE_MAX, HIL_TORQUE_MAX)
                         * (INT16_MAXF / HIL_TORQUE_MAX)));
-        _wr16(&buf[8 + i * 2],
-              (int16_t)(_clampf(_output.pwm[i], -1.0f, 1.0f) * INT16_MAXF));
     }
-    buf[16] = _output.status;
-    buf[17] = _output.seq;
-    /* bytes 18–39: remain 0x00 */
+    if (info) {
+        s06_put16(&buf[HIL_MISO_MOSI_CRC], info->mosi_crc);
+        s06_put32(&buf[HIL_MISO_RX_CYC], info->rx_cyc);
+        s06_put16(&buf[HIL_MISO_RX_NF], (uint16_t)info->rx_nf);
+        s06_put16(&buf[HIL_MISO_AGE], info->age_us);
+    }
+    buf[HIL_MISO_STATUS] = _output.status;
+    buf[HIL_MISO_SEQ]    = _output.seq;
+    if (_slot_valid) {
+        buf[HIL_MISO_LOG] = _slot.type;
+        s06_put16(&buf[HIL_MISO_LOG + 1], _slot.idx);
+        memcpy(&buf[HIL_MISO_LOG + 3], _slot.payload, S06_LOG_PAYLOAD);
+    }
+    uint16_t crc = S06_Crc16(0xFFFFu, buf, HIL_MISO_CRC);
+    crc = S06_Crc16(crc, &buf[HIL_MISO_CRC + 2], SPI1_FRAME_LEN - (HIL_MISO_CRC + 2));
+    s06_put16(&buf[HIL_MISO_CRC], crc);
 }
 
 /* Staged MISO bytes → DMA buffer. Only while the DMA is idle: in the frame
@@ -167,15 +201,26 @@ uint8_t SPI1_IsFrameReady(void)
     return _frame_ready;
 }
 
-/* State and traj of the same (latest) frame; clears frame_ready */
-void SPI1_GetFrame(HIL_State_t *state, HIL_TrajRef_t *traj)
+/* State and traj of the same (latest) frame; clears frame_ready. With info:
+ * also the raw bytes, CYCCNT stamp and frame count of that frame (S06). */
+void SPI1_GetFrameEx(HIL_State_t *state, HIL_TrajRef_t *traj, SPI1_FrameInfo_t *info)
 {
     uint32_t primask = __get_PRIMASK();
     __disable_irq();
     *state = _state;
     *traj  = _traj;
+    if (info) {
+        memcpy(info->raw, _rx_raw, SPI1_FRAME_LEN);
+        info->rx_cyc = _rx_cyc;
+        info->rx_nf  = _rx_nf;
+    }
     _frame_ready = 0;
     __set_PRIMASK(primask);
+}
+
+void SPI1_GetFrame(HIL_State_t *state, HIL_TrajRef_t *traj)
+{
+    SPI1_GetFrameEx(state, traj, NULL);
 }
 
 /* Latched VALID|NEW setpoint, if any: 1 and a copy (plus the seq of the frame
@@ -219,23 +264,41 @@ void SPI1_GetImu(HIL_Imu_t *out)
 }
 
 /* Stage the reply; the DMA buffer is only written while the DMA is idle */
-void SPI1_SetOutput(const HIL_Output_t *out)
+void SPI1_SetOutputEx(const HIL_Output_t *out, const SPI1_MisoInfo_t *info)
 {
     uint8_t buf[SPI1_FRAME_LEN];
-    _output = *out;
-    _encode(buf);
     uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    uint8_t taken = !_tx_next_valid;   /* the frame staged last went to the DMA */
+    __set_PRIMASK(primask);
+    /* Next log record only once the frame with the current one was taken;
+     * if the callback takes it right after this check, the record goes out
+     * twice (same index), never lost. */
+    if (taken || !_slot_valid)
+        _slot_valid = S06Log_Pop(&_slot);
+    _output = *out;
+    _encode(buf, info);
+    primask = __get_PRIMASK();
     __disable_irq();
     memcpy(_tx_next, buf, SPI1_FRAME_LEN);
     _tx_next_valid = 1;
     __set_PRIMASK(primask);
 }
 
+void SPI1_SetOutput(const HIL_Output_t *out)
+{
+    SPI1_SetOutputEx(out, NULL);
+}
+
 /* Re-arm inside callback — safe: HAL H7 resets state BEFORE calling callback */
 void SPI1_Callback(SPI_HandleTypeDef *hspi)
 {
     if (hspi->Instance != _hspi->Instance) return;
+    uint32_t cyc = DWT->CYCCNT;        /* S06 L7-4: raw stamp, priority 0 */
     _decode();
+    _rx_cyc = cyc;
+    _rx_nf  = _n_frames + 1u;          /* this frame, counted below */
+    _imu.src_nf = _rx_nf;
     _latch_new_traj();
     _take_staged_tx();
     if (HAL_SPI_TransmitReceive_DMA(_hspi, _tx, _rx, SPI1_FRAME_LEN) != HAL_OK)
@@ -272,6 +335,10 @@ void SPI1_Service(void)
     if (HAL_SPI_TransmitReceive_DMA(_hspi, _tx, _rx, SPI1_FRAME_LEN) == HAL_OK) {
         _rearm_pending = 0;
         _n_rearms++;
+        uint8_t p[6];                  /* S06: cuts the H7 -> RPi5 clock fit */
+        s06_put32(p, DWT->CYCCNT);
+        s06_put16(p + 4, (uint16_t)_n_rearms);
+        S06Log_Push(S06_REC_REARM, p, sizeof p);
     }
 }
 

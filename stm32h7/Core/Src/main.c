@@ -22,6 +22,7 @@
 #include "pwm_capture.h"
 #include "uart_relay.h"         /* +++ NEW */
 #include "bno_emu_port.h"
+#include "s06_log.h"
 #include <stdio.h>
 /* USER CODE END Includes */
 
@@ -152,6 +153,12 @@ int main(void)
   printf("pclk1=%lu  pclk2=%lu\r\n",
          HAL_RCC_GetPCLK1Freq(), HAL_RCC_GetPCLK2Freq());
 
+  /* S06: cycle counter and log ring before the first SPI1 frame can be
+   * stamped (BnoPort_Init no longer zeroes CYCCNT) */
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+  S06Log_Init();
+
   EncoderGen_Init(&htim1, &htim2, &htim3, &htim4);
   SPI1_Handler_Init(&hspi1);
   UartRelay_Init(&huart2);     /* +++ NEW */
@@ -193,6 +200,12 @@ int main(void)
   static uint32_t _up_first_ms = 0;
   static uint32_t _up_first_frames = 0;
   static uint32_t _n_link_lost = 0;
+  /* S06 T1 (V4): frames applied by this loop, frames received but never
+   * applied (overwritten before the loop read them, from the frame count),
+   * largest state age callback -> applied */
+  static uint32_t _n_applied = 0, _n_skipped = 0, _age_max_us = 0;
+  static uint32_t _last_applied_nf = 0;
+  const uint32_t cyc_per_us = SystemCoreClock / 1000000u;
 
   while (1)
   {
@@ -206,10 +219,23 @@ int main(void)
             _up_first_frames = s0.frames;
             printf("SPI link up at t=%lu ms\r\n", (unsigned long)_up_first_ms);
         }
-        SPI1_GetFrame(&g_state, &g_traj);   /* one frame; clears frame_ready */
-
+        SPI1_FrameInfo_t fi;
+        SPI1_GetFrameEx(&g_state, &g_traj, &fi);   /* one frame; clears frame_ready */
         for (int i = 0; i < ENC_NUM_WHEELS; i++)
             EncoderGen_SetOmega(i, g_state.omega[i]);
+        /* S06: state age at the moment the omegas were applied, and the
+         * checksum of the raw bytes of this very copy (W3, Y9) */
+        uint32_t age_us = (DWT->CYCCNT - fi.rx_cyc) / cyc_per_us;
+        SPI1_MisoInfo_t mi;
+        mi.mosi_crc = S06_Crc16(0xFFFFu, fi.raw, SPI1_FRAME_LEN);
+        mi.rx_cyc   = fi.rx_cyc;
+        mi.rx_nf    = fi.rx_nf;
+        mi.age_us   = (age_us > 0xFFFFu) ? 0xFFFFu : (uint16_t)age_us;
+        if (_n_applied > 0u && fi.rx_nf > _last_applied_nf + 1u)
+            _n_skipped += fi.rx_nf - _last_applied_nf - 1u;
+        _last_applied_nf = fi.rx_nf;
+        _n_applied++;
+        if (age_us > _age_max_us) _age_max_us = age_us;
 
         /* Relay the latched VALID|NEW setpoint (also one from a frame this
          * loop did not see), not just the flags of the latest frame */
@@ -224,7 +250,7 @@ int main(void)
             g_output.torque[i] = duty[i];
 
         g_output.seq = g_state.seq;
-        SPI1_SetOutput(&g_output);
+        SPI1_SetOutputEx(&g_output, &mi);
 
         HAL_GPIO_TogglePin(GPIOE, GPIO_PIN_1);
     } else if (_link_up && (HAL_GetTick() - _last_frame_ms) > SPI_LINK_TIMEOUT_MS) {
@@ -288,10 +314,15 @@ int main(void)
                (unsigned long)ss.last_error);
         /* Frames the main loop did not read, and the NEW setpoint path:
          * seen = taken + replaced + dropped (+1 if one is pending) */
-        printf("Frame: unread=%lu  new seen=%lu taken=%lu repl=%lu drop=%lu\r\n",
+        printf("Frame: unread=%lu  new seen=%lu taken=%lu repl=%lu drop=%lu"
+               "  applied=%lu skipped=%lu age_max=%luus\r\n",
                (unsigned long)ss.unread, (unsigned long)ss.new_seen,
                (unsigned long)ss.new_taken, (unsigned long)ss.new_replaced,
-               (unsigned long)ss.new_dropped);
+               (unsigned long)ss.new_dropped,
+               (unsigned long)_n_applied, (unsigned long)_n_skipped,
+               (unsigned long)_age_max_us);
+        printf("S06log: pushed=%lu dropped=%lu\r\n",
+               (unsigned long)S06Log_Pushed(), (unsigned long)S06Log_Dropped());
         _frames_last = ss.frames;
         /* BNO085 emulator (G2): host init (adv, prod id, set features),
          * transactions and reports per sensor (accel / gyro / game RV) */

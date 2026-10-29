@@ -18,8 +18,12 @@
 #include "stm32h7xx_hal.h"
 #include "hil_protocol.h"
 #include "spi1_handler.h"
+#ifndef OLD_API
+#include "s06_log.h"
+#endif
 
 GPIO_TypeDef fake_gpioa;
+DWT_Type     fake_dwt;
 int  fake_irq_disabled;
 long fake_irq_sections;
 
@@ -30,6 +34,9 @@ static uint8_t  _armed_copy[SPI1_FRAME_LEN];   /* tx bytes at arm time */
 static uint8_t  _sent[SPI1_FRAME_LEN];         /* tx bytes of the last frame */
 static int      _tx_changed_after_arm;
 static int      _fails;
+/* S06: MOSI bytes and CYCCNT of each frame k (k < 256), set in frame() */
+static uint8_t  _mosi_of[256][SPI1_FRAME_LEN];
+static uint32_t _cyc_of[256];
 
 HAL_StatusTypeDef HAL_SPI_TransmitReceive_DMA(SPI_HandleTypeDef *h, uint8_t *tx, uint8_t *rx, uint16_t n)
 {
@@ -63,9 +70,14 @@ static void frame(int k, int is_new)
     wr16(&m[28], (int16_t)(3000 + k));           /* wz_ref */
     m[30] = (uint8_t)(HIL_TRAJ_VALID | (is_new ? HIL_TRAJ_NEW : 0));
     m[39] = (uint8_t)k;
+    wr16(&m[22], (int16_t)(7 * k));              /* gz  */
+    for (int i = 0; i < 4; i++) wr16(&m[31 + 2 * i], (int16_t)(11 * k + i));   /* ax..yaw */
     if (memcmp(_armed_tx, _armed_copy, SPI1_FRAME_LEN) != 0) _tx_changed_after_arm++;
     memcpy(_sent, _armed_copy, SPI1_FRAME_LEN);
     memcpy(_armed_rx, m, SPI1_FRAME_LEN);
+    fake_dwt.CYCCNT += 480000u + (uint32_t)k;    /* 1 ms at 480 MHz, distinct per frame */
+    memcpy(_mosi_of[k & 0xFF], m, SPI1_FRAME_LEN);
+    _cyc_of[k & 0xFF] = fake_dwt.CYCCNT;
     SPI1_Callback(&_hspi);
 }
 
@@ -86,8 +98,50 @@ static void reply(int seq)
     SPI1_SetOutput(&o);
 }
 
+#ifndef OLD_API
+/* Reference CRC-16/CCITT-FALSE, bit by bit (independent of s06_log.c) */
+static uint16_t ref_crc(const uint8_t *d, int n)
+{
+    uint16_t c = 0xFFFF;
+    for (int i = 0; i < n; i++) {
+        c ^= (uint16_t)(d[i] << 8);
+        for (int b = 0; b < 8; b++) c = (c & 0x8000) ? (uint16_t)((c << 1) ^ 0x1021) : (uint16_t)(c << 1);
+    }
+    return c;
+}
+static uint16_t le16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+static uint32_t le32(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
+static int miso_crc_ok(const uint8_t *b)
+{
+    uint8_t t[SPI1_FRAME_LEN];
+    memcpy(t, b, sizeof t);
+    t[8] = t[9] = 0;
+    uint8_t u[SPI1_FRAME_LEN - 2];
+    memcpy(u, t, 8);
+    memcpy(u + 8, t + 10, SPI1_FRAME_LEN - 10);
+    return ref_crc(u, SPI1_FRAME_LEN - 2) == le16(b + 8);
+}
+/* Main loop as in main.c: one frame, checksum of its raw copy, reply */
+static void main_step(void)
+{
+    HIL_State_t s; HIL_TrajRef_t t; SPI1_FrameInfo_t fi; SPI1_MisoInfo_t mi;
+    HIL_Output_t o;
+    SPI1_GetFrameEx(&s, &t, &fi);
+    mi.mosi_crc = S06_Crc16(0xFFFF, fi.raw, SPI1_FRAME_LEN);
+    mi.rx_cyc = fi.rx_cyc;
+    mi.rx_nf = fi.rx_nf;
+    mi.age_us = 7;
+    memset(&o, 0, sizeof o);
+    o.seq = s.seq;
+    SPI1_SetOutputEx(&o, &mi);
+}
+#endif
+
 int main(void)
 {
+#ifndef OLD_API
+    S06Log_Init();
+#endif
     SPI1_Handler_Init(&_hspi);
 
 #ifdef OLD_API
@@ -180,6 +234,109 @@ int main(void)
         SPI1_TakeNewTraj(&r, NULL);
         check(fake_irq_disabled == 1, "nested_mask_kept", "a call re-enabled interrupts masked by its caller");
         __enable_irq();
+    }
+    /* 5. S06 CRC: table version equals the bit-by-bit reference; check value */
+    {
+        const uint8_t s9[] = "123456789";
+        uint8_t r[64];
+        for (int i = 0; i < 64; i++) r[i] = (uint8_t)(i * 37 + 5);
+        check(S06_Crc16(0xFFFF, s9, 9) == 0x29B1 && ref_crc(s9, 9) == 0x29B1, "crc_check_value", "CRC(123456789) != 0x29B1");
+        check(S06_Crc16(0xFFFF, r, 64) == ref_crc(r, 64), "crc_table_equals_ref", "table CRC differs from reference");
+    }
+    /* 6. MISO v4: frame k+2 carries checksum of frame k's raw MOSI, its
+     *    stamp and count; MISO checksum valid on every frame sent */
+    {
+        int ok_mosi = 1, ok_cyc = 1, ok_nf = 1, ok_crc = 1, ok_age = 1;
+        SPI1_Stats_t st0; SPI1_GetStats(&st0);
+        frame(60, 0); main_step();
+        frame(61, 0); main_step();
+        for (int k = 62; k < 90; k++) {
+            frame(k, 0);                         /* _sent = MISO clocked out in frame k */
+            const int a = k - 2;                 /* frame it answers */
+            if (!miso_crc_ok(_sent)) ok_crc = 0;
+            if (_sent[17] != (uint8_t)a) ok_mosi = 0;
+            if (le16(_sent + 10) != ref_crc(_mosi_of[a], SPI1_FRAME_LEN)) ok_mosi = 0;
+            if (le32(_sent + 12) != _cyc_of[a]) ok_cyc = 0;
+            if (le16(_sent + 18) != (uint16_t)(st0.frames + (uint32_t)(a - 60) + 1u)) ok_nf = 0;
+            if (le16(_sent + 20) != 7) ok_age = 0;
+            main_step();
+        }
+        check(ok_crc, "miso_crc_valid", "MISO checksum does not match its bytes");
+        check(ok_mosi, "mosi_crc_of_answered_frame", "mosi_crc/seq is not that of frame k-2");
+        check(ok_cyc, "rx_cyc_of_answered_frame", "rx_cyc is not the CYCCNT of frame k-2");
+        check(ok_nf, "rx_nf_of_answered_frame", "rx_nf is not the frame count of frame k-2");
+        check(ok_age, "age_field", "age_us not carried");
+        /* one byte flipped -> checksum catches it */
+        uint8_t bad[SPI1_FRAME_LEN];
+        memcpy(bad, _sent, sizeof bad);
+        bad[30] ^= 0x10;
+        check(!miso_crc_ok(bad), "miso_crc_catches_flip", "flipped byte not detected");
+    }
+    /* 7. IMU copy for the report log: raw bytes and source frame of the
+     *    same frame as the floats */
+    {
+        HIL_Imu_t im;
+        SPI1_Stats_t st;
+        frame(91, 0);
+        SPI1_GetStats(&st);
+        SPI1_GetImu(&im);
+        uint8_t want[10] = { _mosi_of[91][22], _mosi_of[91][23] };
+        memcpy(want + 2, &_mosi_of[91][31], 8);
+        check(memcmp(im.raw, want, 10) == 0 && im.imu_seq == 91 && im.src_nf == st.frames,
+              "imu_raw_same_frame", "IMU raw bytes / source frame not from frame 91");
+        main_step();
+    }
+    /* 8. log records: each one leaves exactly once, in order, whether the
+     *    main loop replies 0, 1 or 2 times between two frames */
+    {
+        enum { N = 60 };
+        uint8_t pl[S06_LOG_PAYLOAD];
+        uint16_t first = 0;
+        int have_first = 0, ok_order = 1, ok_payload = 1;
+        int n_seen = 0, last = -1;
+        for (int i = 0; i < N; i++) {
+            memset(pl, 0, sizeof pl);
+            pl[0] = (uint8_t)i; pl[14] = (uint8_t)(0xA0 ^ i);
+            S06Log_Push(S06_REC_TICK, pl, S06_LOG_PAYLOAD);
+        }
+        for (int k = 100; k < 100 + 3 * N && n_seen < N; k++) {
+            frame(k & 0xFF, 0);
+            if (_sent[22] == S06_REC_TICK) {
+                uint16_t idx = le16(_sent + 23);
+                if (!have_first) { first = idx; have_first = 1; }
+                int rel = (uint16_t)(idx - first);
+                if (rel != last) {                 /* new record (repeats keep the index) */
+                    if (rel != last + 1) ok_order = 0;
+                    if (_sent[25] != (uint8_t)rel || _sent[39] != (uint8_t)(0xA0 ^ rel)) ok_payload = 0;
+                    last = rel;
+                    n_seen++;
+                }
+            }
+            int calls = (k % 3);                   /* 0, 1 or 2 replies before the next frame */
+            for (int c = 0; c < calls; c++) main_step();
+        }
+        check(n_seen == N && ok_order, "log_each_record_once_in_order", "a record was lost, skipped or reordered");
+        check(ok_payload, "log_payload_intact", "record payload changed on the way");
+    }
+    /* 9. ring full: dropped records still use an index (gap), drop count */
+    {
+        S06_Rec_t r;
+        while (S06Log_Pop(&r)) { }
+        uint32_t d0 = S06Log_Dropped();
+        uint8_t pl[1] = { 0 };
+        S06Log_Push(S06_REC_TICK, pl, 1);
+        S06Log_Pop(&r);
+        uint16_t i0 = r.idx;
+        for (unsigned i = 0; i < S06_LOG_SLOTS + 10u; i++) S06Log_Push(S06_REC_TICK, pl, 1);
+        int n = 0; uint16_t last_idx = 0;
+        while (S06Log_Pop(&r)) { last_idx = r.idx; n++; }
+        S06Log_Push(S06_REC_TICK, pl, 1);
+        S06Log_Pop(&r);
+        check(n == (int)S06_LOG_SLOTS && S06Log_Dropped() - d0 == 10u, "log_full_drops_counted",
+              "ring did not keep 512 and count 10 drops");
+        check(last_idx == (uint16_t)(i0 + S06_LOG_SLOTS) && r.idx == (uint16_t)(i0 + S06_LOG_SLOTS + 11u),
+              "log_drop_leaves_index_gap", "dropped records did not consume an index");
+        check(fake_irq_disabled == 0, "log_restores_primask", "PRIMASK left set");
     }
 #endif
     return _fails ? 1 : 0;

@@ -19,15 +19,35 @@
  *
  * (29/10: SPI1_GetState() + SPI1_GetTrajRef() replaced by SPI1_GetFrame(),
  *  which copies both from the same frame with interrupts masked.)
+ *
+ * S06 (29/10, MISO v4): SPI1_GetFrameEx() also returns the raw MOSI bytes,
+ * the CYCCNT stamp and the frame count of that frame; SPI1_SetOutputEx()
+ * sends the MOSI checksum, stamp, count and state age of the frame it
+ * answers, plus one S06 log record (s06_log.h) and the MISO checksum.
  */
+
+typedef struct {
+    uint8_t  raw[SPI1_FRAME_LEN];  /* MOSI bytes as received                 */
+    uint32_t rx_cyc;               /* DWT CYCCNT in SPI1_Callback of it       */
+    uint32_t rx_nf;                /* H7 frame count of it (first frame = 1)  */
+} SPI1_FrameInfo_t;
+
+typedef struct {
+    uint16_t mosi_crc;             /* S06_Crc16 over SPI1_FrameInfo_t.raw     */
+    uint32_t rx_cyc;
+    uint32_t rx_nf;
+    uint16_t age_us;               /* callback -> applied, saturated          */
+} SPI1_MisoInfo_t;
 
 void    SPI1_Handler_Init(SPI_HandleTypeDef *hspi);
 uint8_t SPI1_IsFrameReady(void);
 void    SPI1_GetFrame    (HIL_State_t *state, HIL_TrajRef_t *traj); /* clears frame_ready */
+void    SPI1_GetFrameEx  (HIL_State_t *state, HIL_TrajRef_t *traj, SPI1_FrameInfo_t *info);
 uint8_t SPI1_TakeNewTraj (HIL_TrajRef_t *out, uint8_t *seq);       /* 1 = got one */
 void    SPI1_DropNewTraj (void);                 /* link lost: forget pending */
 void    SPI1_GetImu      (HIL_Imu_t *out);       /* IMU values, v3 frame */
 void    SPI1_SetOutput   (const HIL_Output_t *out);
+void    SPI1_SetOutputEx (const HIL_Output_t *out, const SPI1_MisoInfo_t *info);
 void    SPI1_Callback    (SPI_HandleTypeDef *hspi);
 
 /* Error recovery and link statistics (27/10):

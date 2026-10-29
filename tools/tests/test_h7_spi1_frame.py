@@ -8,6 +8,9 @@ holds, and a VALID|NEW setpoint is latched for the relay. The old file
 (fix/g2-check bbf3fb6) runs the checks its API allows, to show the test sees the
 problem there. Not covered: an interrupt inside one struct copy (only the
 masking is checked).
+
+S06 (29/10/2026): MISO v4 (checksums, CYCCNT stamp, frame count, state age) and
+the H7 log records carried one per MISO frame (s06_log.c).
 Run: python -m pytest tools/tests  (needs gcc and git on PATH)"""
 import os
 import shutil
@@ -25,7 +28,8 @@ pytestmark = pytest.mark.skipif(shutil.which('gcc') is None, reason='gcc not on 
 def build(tmp, src_c, src_h, old=False):
     """Copy next to the fake HAL header: a quoted #include looks in the including file's folder first."""
     for f in (os.path.join(H7, 'Core', 'Inc', 'hil_protocol.h'), os.path.join(SIM, 'stm32h7xx_hal.h'),
-              os.path.join(SIM, 'spi1_sim_main.c')):
+              os.path.join(SIM, 'spi1_sim_main.c'), os.path.join(H7, 'Core', 'Inc', 's06_log.h'),
+              os.path.join(H7, 'Core', 'Src', 's06_log.c')):
         shutil.copy(f, tmp)
     shutil.copy(src_c, os.path.join(tmp, 'spi1_handler.c'))
     shutil.copy(src_h, os.path.join(tmp, 'spi1_handler.h'))
@@ -33,7 +37,8 @@ def build(tmp, src_c, src_h, old=False):
     cmd = ['gcc', '-std=gnu11', '-O2', '-Wall', '-Werror', '-I', str(tmp)]
     if old:
         cmd.append('-DOLD_API')
-    cmd += [os.path.join(tmp, 'spi1_sim_main.c'), os.path.join(tmp, 'spi1_handler.c'), '-o', exe]
+    cmd += [os.path.join(tmp, 'spi1_sim_main.c'), os.path.join(tmp, 'spi1_handler.c'),
+            os.path.join(tmp, 's06_log.c'), '-o', exe]
     r = subprocess.run(cmd, capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     return exe
@@ -74,7 +79,12 @@ def old_result(tmp_path_factory):
 NEW_CHECKS = ['pair_same_frame', 'getframe_masked', 'getframe_clears_ready', 'unread_counted',
               'tx_untouched_while_armed', 'reply_lag_two_frames', 'setoutput_restores_primask',
               'new_not_lost', 'new_taken_once', 'new_latest_wins', 'new_dropped_at_link_lost',
-              'new_counters', 'take_restores_primask', 'nested_mask_kept']
+              'new_counters', 'take_restores_primask', 'nested_mask_kept',
+              # S06 (29/10): MISO v4 fields, checksums, H7 log records in the MISO
+              'crc_check_value', 'crc_table_equals_ref', 'miso_crc_valid', 'mosi_crc_of_answered_frame',
+              'rx_cyc_of_answered_frame', 'rx_nf_of_answered_frame', 'age_field', 'miso_crc_catches_flip',
+              'imu_raw_same_frame', 'log_each_record_once_in_order', 'log_payload_intact',
+              'log_full_drops_counted', 'log_drop_leaves_index_gap', 'log_restores_primask']
 
 
 @pytest.mark.parametrize('name', NEW_CHECKS)
