@@ -2,11 +2,13 @@
 Panel UART protocol — RPi5 daemon <-> panel ESP32 (WROOM + ST7796, QĐ 17, M2).
 
 Contract (workflow v3.1 section 9.6; Codex rounds 2-3 #15, #44, #45; Liam approved B0 29/10;
-B0 review round 1 B1, B15-B18; round 2 B23-B29; round 3 B52-B58, N12-N16, Liam approved
-29/10). The panel firmware (C) must mirror these layouts byte for byte (build the frame in a
-byte buffer, never send a C struct with padding) and the panel rules of PanelClient below
-(the reference the C code is checked against). The daemon runs in its own process, never
-inside the 1 kHz loop. Version 4: 16-bit command seq that never wraps inside a session.
+B0 review round 1 B1, B15-B18; round 2 B23-B29; round 3 B52-B58, N12-N16; round 4 V1-V5,
+Liam approved 29/10). The panel firmware (C) must mirror these layouts byte for byte (build
+the frame in a byte buffer, never send a C struct with padding) and the panel rules of
+PanelClient below (the reference the C code is checked against). The daemon runs in its own
+process, never inside the 1 kHz loop. Version 5: 16-bit command seq that never wraps inside
+a session; STATUS carries the command code of the last frame handled, so an ACK matches a
+command by seq AND code (V1, V3).
 
 Frames (multi-byte fields little-endian; every frame ends with CRC-16/CCITT-FALSE,
 poly 0x1021, init 0xFFFF, over all previous bytes of the frame, start byte included):
@@ -15,7 +17,7 @@ poly 0x1021, init 0xFFFF, over all previous bytes of the frame, start byte inclu
     0     0xCC
     1     version (PROTO_VERSION)
     2-5   sid        session id from the daemon; 0 in HELLO and only in HELLO
-    6-7   seq        command number in this session, 0..SEQ_END-1 (HELLO, PROFILES: 0, ignored)
+    6-7   seq        command number in this session (HELLO, PROFILES: 0, ignored)
     8     cmd        CMD_*
     9-10  arg        uint16 (HELLO: panel_boot; SELECT/START: profile index 0..PROFILE_MAX)
     11-12 crc
@@ -28,7 +30,8 @@ poly 0x1021, init 0xFFFF, over all previous bytes of the frame, start byte inclu
     8-9   panel_boot    echo of the HELLO this session answers
     10-11 last_cmd_seq  seq of the last command handled (meaningless while last_result is RES_NONE)
     12    last_result   RES_* of that command; RES_NONE: no command handled in this session
-    13-14 next_seq      the seq of the next command (SEQ_END: seqs used up, HELLO again)
+    13-14 next_seq      the seq of the next command (>= SEQ_END - 1: no seq left for
+                        SELECT/START, HELLO again)
     15    run_state     ST_*
     16-17 phase_ds      time in the current phase [0.1 s], saturates
     18    profile       selected profile index (PROFILE_NONE = none)
@@ -40,7 +43,7 @@ poly 0x1021, init 0xFFFF, over all previous bytes of the frame, start byte inclu
                         when no STATUS came for NO_LINK_MS
     25    links         L_* bits
     26    error_code    0 = none (table: decided with panel M2, B19)
-    27    reserved      0 (M3)
+    27    last_cmd      CMD_* of the last command handled (0 while last_result is RES_NONE)
     28-29 crc
 
   PROFILE daemon -> panel, 28 bytes, the list the panel scrolls with NAV
@@ -64,14 +67,17 @@ Daemon rules (DaemonSession):
     no copy of an old frame delivered later. Without it an old HELLO can open a new session;
     the panel then sees a sid it did not ask for and says HELLO again (PanelClient).
   * A command of another sid is dropped. Inside a session seqs are plain numbers, never
-    reused (N12): SELECT/START run only at seq == next_seq, then next_seq = seq + 1. STOP
-    runs at next_seq or next_seq + 1 (the panel pre-empts a command still waiting for its
-    ACK); next_seq then moves past it. Any other seq is refused and changes nothing, so an
-    old copy of a command (START, STOP, SELECT) never runs again.
+    reused (N12): SELECT/START run only at seq == next_seq and seq < SEQ_END - 1, then
+    next_seq = seq + 1. STOP and SYNC are taken at next_seq or next_seq + 1 (the panel
+    pre-empts a frame it sent that may still arrive) and up to seq SEQ_END - 1 (the last seq
+    is kept for them, V2); next_seq then moves past them. SYNC does nothing else: it lets the
+    panel skip the seq of a SELECT/START it gave up on. Any other seq is refused and changes
+    nothing, so an old copy of a command (START, STOP, SELECT) never runs again.
   * The same frame as the last one handled gets the stored result back and does not run
-    again; except a STOP whose result was RES_FAILED: its resend runs again (B27, B54/N14).
-    Callbacks fail by raising or by returning RES_FAILED: both are RES_FAILED (effect unknown).
-    last_cmd_seq / last_result are always those of that same last frame.
+    again; except a STOP whose result was not RES_OK / RES_NOT_IDLE: its resend runs again
+    (B27, B54/N14, V4). Callbacks fail by raising or by returning RES_FAILED: both are
+    RES_FAILED (effect unknown). last_cmd_seq / last_cmd / last_result are always those of
+    that same last frame.
   * PROFILES (any seq) asks for the PROFILE list again: no other effect. The daemon sends the
     list after every new session and on PROFILES; an empty list is one PROFILE with count 0.
   * run() is called synchronously: it must only request actions and return at once (never
@@ -88,7 +94,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-PROTO_VERSION = 4
+PROTO_VERSION = 5
 
 START_CMD     = 0xCC
 START_STATUS  = 0xDD
@@ -104,11 +110,12 @@ PROFILE_NONE = 0xFF
 NO_LINK_MS   = 500          # panel: no STATUS for this long -> NO LINK [ĐỀ XUẤT]
 EPOCH_MAX    = 0xFFFF
 SESSION_MAX  = 0xFFFF
-SEQ_END      = 0xFFFF       # next_seq == SEQ_END: no seq left in this session (HELLO again)
+SEQ_END      = 0xFFFF       # seqs are < SEQ_END; SEQ_END - 1 is kept for STOP / SYNC (V2)
 
 # Commands (NAV only moves the panel cursor, it is not sent)
 CMD_HELLO    = 0x01
 CMD_PROFILES = 0x02
+CMD_SYNC     = 0x03       # no effect: skips the seq of a frame the panel gave up on
 CMD_SELECT   = 0x10
 CMD_START    = 0x20
 CMD_STOP     = 0x21
@@ -197,6 +204,7 @@ class Status:
     data_age_ms: int = 0
     links: int = L_RPI
     error_code: int = 0
+    last_cmd: int = 0
 
 
 @dataclass
@@ -207,7 +215,7 @@ class Profile:
     name: str
 
 
-_STATUS_FMT = '<IHHHBHBHBBBHHBB'      # bytes 2..26
+_STATUS_FMT = '<IHHHBHBHBBBHHBBB'     # bytes 2..27
 
 
 def encode_status(s: Status) -> bytes:
@@ -217,7 +225,8 @@ def encode_status(s: Status) -> bytes:
                      s.sid & 0xFFFFFFFF, s.daemon_boot & 0xFFFF, s.panel_boot & 0xFFFF,
                      s.last_cmd_seq & 0xFFFF, s.last_result & 0xFF, s.next_seq & 0xFFFF, s.run_state & 0xFF,
                      _sat16(s.phase_ds), s.profile & 0xFF, s.outcome & 0xFF, s.quality & 0xFF,
-                     _sat16(s.lost), _sat16(s.data_age_ms), s.links & 0xFF, s.error_code & 0xFF)
+                     _sat16(s.lost), _sat16(s.data_age_ms), s.links & 0xFF, s.error_code & 0xFF,
+                     s.last_cmd & 0xFF)
     return _seal(buf)
 
 
@@ -249,8 +258,9 @@ class StreamParser:
     CRC drops one byte and resyncs. A partial frame whose last byte arrived more than stale_s
     ago is dropped before new bytes are added to it (B28: the age is that of the newest
     buffered byte, and dropping bytes does not make it younger). This is a timeout on the
-    silence between bytes, not a lifetime of a decoded command: how old a queued command may
-    be is the panel's resend rule (PanelClient)."""
+    silence between bytes, not a lifetime of a decoded command. Nothing bounds how long a
+    complete frame waits in the UART path: a frame the panel gave up on can still arrive and
+    run later (V1); the seq rules and PanelClient's STOP / SYNC handling account for it."""
 
     def __init__(self, accept=(START_CMD, START_STATUS, START_PROFILE), stale_s: float = 0.05,
                  clock: Callable[[], float] = time.monotonic):
@@ -390,9 +400,10 @@ class DaemonSession:
         self.sid = 0
         self.panel_boot = 0
         self.last_seq = 0
+        self.last_cmd = 0
         self.last_result = RES_NONE
         self._last_key: Optional[tuple] = None     # (seq, cmd, arg) of the frame last_seq/last_result belong to
-        self._last_retry = False                   # that frame was a failed STOP: its resend runs again
+        self._last_retry = False                   # that frame was a STOP not done: its resend runs again
         self.next_seq = 0
         self.last_error: Optional[str] = None
         self.counts = {}
@@ -415,7 +426,7 @@ class DaemonSession:
                 return self._count(self.HELLO)             # retry: same session back
             self.sid = self._new_sid()
             self.panel_boot = c.arg
-            self.last_seq, self.last_result = 0, RES_NONE
+            self.last_seq, self.last_cmd, self.last_result = 0, 0, RES_NONE
             self._last_key, self._last_retry = None, False
             self.next_seq = 0
             return self._count(self.HELLO)
@@ -426,31 +437,38 @@ class DaemonSession:
         key = (c.seq, c.cmd, c.arg)
         if key == self._last_key and not self._last_retry:
             return self._count(self.REPEATED)          # resent after a lost STATUS
-        ok_seqs = (self.next_seq, self.next_seq + 1) if c.cmd == CMD_STOP else (self.next_seq,)
-        if (c.seq not in ok_seqs and key != self._last_key) or c.seq >= SEQ_END:
+        skip = c.cmd in (CMD_STOP, CMD_SYNC)           # may pre-empt a frame still on its way
+        ok_seqs = (self.next_seq, self.next_seq + 1) if skip else (self.next_seq,)
+        limit = SEQ_END if skip else SEQ_END - 1       # last seq kept for STOP / SYNC (V2)
+        if (c.seq not in ok_seqs and key != self._last_key) or c.seq >= limit:
             return self._count(self.BAD_SEQ)           # not run, nothing changes (B24, N12)
         try:
-            result = run(c) if c.cmd in RUN_COMMANDS else RES_UNKNOWN
+            if c.cmd == CMD_SYNC:
+                result = RES_OK
+            else:
+                result = run(c) if c.cmd in RUN_COMMANDS else RES_UNKNOWN
         except Exception as exc:                       # noqa: BLE001 (any failure of the action)
             result = RES_FAILED
             self.last_error = f'{type(exc).__name__}: {exc}'
         failed = result == RES_FAILED
-        self.last_seq, self.last_result = c.seq, result
-        self._last_key, self._last_retry = key, failed and c.cmd == CMD_STOP
+        self.last_seq, self.last_cmd, self.last_result = c.seq, c.cmd, result
+        self._last_key = key
+        self._last_retry = c.cmd == CMD_STOP and result not in (RES_OK, RES_NOT_IDLE)   # V4
         self.next_seq = max(self.next_seq, c.seq + 1)
         return self._count(self.FAILED if failed else self.RAN)
 
     def fill(self, s: Status) -> Status:
         s.sid, s.daemon_boot, s.panel_boot = self.sid, self.daemon_boot, self.panel_boot
         s.last_cmd_seq, s.last_result, s.next_seq = self.last_seq, self.last_result, self.next_seq
+        s.last_cmd = self.last_cmd
         return s
 
 
-# ── panel side: reference state machine (B55, N14, N15) ───────────────────
+# ── panel side: reference state machine (B55, N14, N15, V1-V5) ────────────
 
 RESEND_MS        = 200      # resend a command not yet acknowledged [ĐỀ XUẤT]
 HELLO_RESEND_MS  = 200      # [ĐỀ XUẤT]
-CMD_MAX_AGE_MS   = 3_000    # SELECT/START not acknowledged by then: dropped, shown unverified [ĐỀ XUẤT]
+CMD_MAX_AGE_MS   = 3_000    # SELECT/START not acknowledged by then: given up, seq stays stale [ĐỀ XUẤT]
 PROFILE_WAIT_MS  = 1_000    # PROFILE list incomplete this long after a session starts: ask again [ĐỀ XUẤT]
 
 
@@ -460,27 +478,39 @@ class PanelClient:
 
       * Handshake: send HELLO(panel_boot = a random non-zero 16-bit nonce) every
         HELLO_RESEND_MS until a STATUS with sid != 0 and panel_boot == nonce arrives; other
-        STATUS frames are ignored until then. A nonce equal to the one of an old session
-        (panel reboot) gets that session back: harmless, because the panel always takes
-        next_seq from STATUS and never resends a command of before its reboot.
+        STATUS frames are ignored until then. A nonce equal to that of the current session
+        (a panel reboot, 1 in 65 535) joins that session: frames sent before the reboot and
+        still on their way run as sent (as they would with any nonce), the panel takes
+        next_seq from STATUS, and STOP still works because an ACK must match seq AND command
+        code (V3).
       * Session lost: a STATUS whose daemon_boot changed, or whose sid / panel_boot is not the
-        session's (a new session opened by another HELLO), or next_seq == SEQ_END -> new
-        nonce, HELLO again. A pending SELECT/START is then shown 'unverified'; a STOP stays
-        requested and is sent again in the new session.
+        session's (a new session opened by another HELLO), or no seq left (next_seq >=
+        SEQ_END - 1 with nothing of the panel still needing the last seq) -> new nonce, HELLO
+        again. A pending SELECT/START is then shown 'unverified'; a STOP stays requested and
+        is sent again in the new session; a stop already acknowledged or confirmed is
+        forgotten (V5).
       * NO LINK: no STATUS of the session for NO_LINK_MS. Commands are not sent while there
         is no link, except STOP, which keeps being resent.
-      * One command in flight: SELECT/START get seq = next_seq of the last STATUS and are
-        resent every RESEND_MS until the ACK (STATUS of the session with last_cmd_seq == seq
-        and last_result != RES_NONE): shown with its result. If next_seq moves past the seq
-        without an ACK, or CMD_MAX_AGE_MS passes, it is shown 'unverified' (it may or may
-        not have run: never 'not done'), and never resent under a new seq automatically.
-      * STOP pre-empts: a pending SELECT/START is given up ('unverified') and STOP goes out
-        with seq = pending seq + 1, else next_seq. STOP is resent until acknowledged with
-        RES_OK or RES_NOT_IDLE; RES_FAILED (or another result) counts a failure and the same
-        frame is resent (the daemon runs a failed STOP again); if next_seq moves past it
-        without an ACK, a new STOP goes out at the new next_seq. Acknowledged is not
-        stopped: stop_state becomes 'confirmed' only when a later STATUS shows a run_state
-        that is not active (ST_ACTIVE).
+      * ACK: a STATUS of the session with last_cmd_seq == seq, last_cmd == command code and
+        last_result != RES_NONE.
+      * One command in flight: SELECT/START get seq = next_seq of the last STATUS (refused if
+        next_seq >= SEQ_END - 1) and are resent every RESEND_MS until the ACK: shown with its
+        result. If next_seq moves past the seq without an ACK, it is shown 'unverified' (it
+        may or may not have run: never 'not done'). If CMD_MAX_AGE_MS passes first, it is
+        shown 'unverified' and its seq stays 'stale': the frame may still arrive and run, so
+        that seq is never used for another command (V1). While a seq is stale, SELECT/START
+        are refused and the panel sends SYNC at stale + 1 (resent until its ACK or until
+        next_seq passes it); once next_seq is past the stale seq, the old frame can no longer
+        run.
+      * STOP pre-empts: a pending SELECT/START is given up ('unverified', its seq stale) and
+        STOP goes out at pending seq + 1; a pending SYNC is replaced by STOP at the same seq;
+        with a stale seq STOP goes out at stale + 1; else at next_seq. STOP is resent until
+        acknowledged with RES_OK or RES_NOT_IDLE; another result counts a failure and the
+        same frame is resent (the daemon runs it again, V4); if next_seq moves past it without
+        an ACK, a new STOP goes out at the new next_seq. Acknowledged is not stopped:
+        stop_state becomes 'confirmed' only when a later STATUS shows a run_state that is not
+        active (ST_ACTIVE); a new START, an active run_state after that, or a lost session
+        clears it (V5).
       * PROFILE list: kept per session; if not all `count` entries arrived PROFILE_WAIT_MS
         after the session started (or the last request), send PROFILES.
     tick(now_ms) and the on_* methods return the frames to send now.
@@ -493,8 +523,9 @@ class PanelClient:
         self.daemon_boot: Optional[int] = None
         self.next_seq: Optional[int] = None
         self.last_status_ms: Optional[float] = None
-        self.pending: Optional[dict] = None         # SELECT/START in flight: seq, cmd, arg, t_first, t_sent
-        self.stop: Optional[dict] = None            # STOP in flight: seq (None until sent), t_sent
+        self.pending: Optional[dict] = None         # SELECT/START/SYNC in flight: seq, cmd, arg, t_first, t_sent
+        self.stale: Optional[int] = None            # seq of a SELECT/START given up that may still arrive
+        self.stop: Optional[dict] = None            # STOP in flight: seq (None until chosen), t_sent
         self.stop_state = 'none'                    # none / requested / acked / confirmed
         self.stop_failures = 0
         self.shown = []                             # what the screen reports: (what, cmd, result)
@@ -512,24 +543,37 @@ class PanelClient:
     def link(self, now_ms: float) -> bool:
         return self.last_status_ms is not None and now_ms - self.last_status_ms < NO_LINK_MS
 
+    def _give_up(self, p: dict) -> None:
+        """A SELECT/START is no longer waited for; its frame may still arrive unless next_seq
+        is already past it."""
+        self.shown.append(('unverified', p['cmd'], None))
+        if self.next_seq is None or self.next_seq <= p['seq']:
+            self.stale = p['seq'] if self.stale is None else max(self.stale, p['seq'])
+
     # ── user actions ──
     def press(self, cmd: int, arg: int, now_ms: float) -> list:
         if cmd == CMD_STOP:
             if self.stop is not None:                         # one STOP in flight already
                 return self.tick(now_ms)
             seq = None
-            if self.pending is not None:
-                self.shown.append(('unverified', self.pending['cmd'], None))
-                seq = self.pending['seq'] + 1
-                self.pending = None
+            p = self.pending
+            if p is not None and p['cmd'] == CMD_SYNC:
+                seq = p['seq']                                # STOP takes the SYNC's place
+            elif p is not None:
+                self._give_up(p)
+                seq = p['seq'] + 1
+            self.pending = None
             self.stop = dict(seq=seq, t_sent=None)
             self.stop_state = 'requested'
             self.stop_failures = 0
             return self.tick(now_ms)
         if not self.sid or self.next_seq is None or not self.link(now_ms) or \
-                self.pending is not None or self.stop is not None or self.next_seq >= SEQ_END:
+                self.pending is not None or self.stop is not None or self.stale is not None or \
+                self.next_seq >= SEQ_END - 1:
             self.shown.append(('refused', cmd, None))         # busy / no link: the user retries
             return []
+        if cmd == CMD_START:
+            self.stop_state = 'none'                          # V5: a new run, no stop yet
         self.pending = dict(seq=self.next_seq, cmd=cmd, arg=arg, t_first=now_ms, t_sent=now_ms)
         return [encode_cmd(self.sid, self.next_seq, cmd, arg)]
 
@@ -543,18 +587,21 @@ class PanelClient:
             return out
         if self.stop is not None and self.next_seq is not None:
             if self.stop['seq'] is None:
-                self.stop['seq'] = self.next_seq
+                self.stop['seq'] = self.next_seq if self.stale is None else self.stale + 1
             if self.stop['t_sent'] is None or now_ms - self.stop['t_sent'] >= RESEND_MS:
                 self.stop['t_sent'] = now_ms
                 out.append(encode_cmd(self.sid, self.stop['seq'], CMD_STOP, 0))
         p = self.pending
-        if p is not None:
-            if now_ms - p['t_first'] >= CMD_MAX_AGE_MS:
-                self.shown.append(('unverified', p['cmd'], None))
-                self.pending = None
-            elif self.link(now_ms) and now_ms - p['t_sent'] >= RESEND_MS:
-                p['t_sent'] = now_ms
-                out.append(encode_cmd(self.sid, p['seq'], p['cmd'], p['arg']))
+        if p is not None and p['cmd'] != CMD_SYNC and now_ms - p['t_first'] >= CMD_MAX_AGE_MS:
+            self._give_up(p)
+            self.pending = p = None
+        if p is None and self.stop is None and self.stale is not None and self.link(now_ms):
+            seq = self.stale + 1
+            self.pending = p = dict(seq=seq, cmd=CMD_SYNC, arg=0, t_first=now_ms, t_sent=now_ms)
+            out.append(encode_cmd(self.sid, seq, CMD_SYNC, 0))
+        elif p is not None and self.link(now_ms) and now_ms - p['t_sent'] >= RESEND_MS:
+            p['t_sent'] = now_ms
+            out.append(encode_cmd(self.sid, p['seq'], p['cmd'], p['arg']))
         incomplete = self.profile_count is None or len(self.profiles) < self.profile_count
         if incomplete and self._t_session is not None:
             if now_ms - self._t_session >= PROFILE_WAIT_MS:
@@ -564,11 +611,14 @@ class PanelClient:
 
     # ── frames from the daemon ──
     def _lose_session(self, now_ms: float) -> list:
-        if self.pending is not None:
+        if self.pending is not None and self.pending['cmd'] != CMD_SYNC:
             self.shown.append(('unverified', self.pending['cmd'], None))
-            self.pending = None
+        self.pending = None
+        self.stale = None                                   # frames of the old sid are dropped
         if self.stop is not None:
             self.stop = dict(seq=None, t_sent=None)        # sent again in the new session
+        elif self.stop_state in ('acked', 'confirmed'):
+            self.stop_state = 'none'
         self.boot = self._new_boot()
         self.sid, self.next_seq, self.daemon_boot = 0, None, None
         self.profiles, self.profile_count, self._t_session = {}, None, None
@@ -587,17 +637,25 @@ class PanelClient:
         self.last_status_ms = now_ms
         self.next_seq = st.next_seq
         acked = st.last_result != RES_NONE
+
+        def is_ack(seq, cmd):
+            return acked and st.last_cmd_seq == seq and st.last_cmd == cmd
+
         p = self.pending
         if p is not None:
-            if acked and st.last_cmd_seq == p['seq']:
-                self.shown.append(('done', p['cmd'], st.last_result))
+            if is_ack(p['seq'], p['cmd']):
+                if p['cmd'] != CMD_SYNC:
+                    self.shown.append(('done', p['cmd'], st.last_result))
                 self.pending = None
             elif st.next_seq > p['seq']:
-                self.shown.append(('unverified', p['cmd'], None))
+                if p['cmd'] != CMD_SYNC:
+                    self.shown.append(('unverified', p['cmd'], None))
                 self.pending = None
+        if self.stale is not None and st.next_seq > self.stale:
+            self.stale = None                               # the old frame can no longer run
         s = self.stop
         if s is not None and s['seq'] is not None:
-            if acked and st.last_cmd_seq == s['seq']:
+            if is_ack(s['seq'], CMD_STOP):
                 if st.last_result in (RES_OK, RES_NOT_IDLE):
                     self.stop = None
                     self.stop_state = 'acked'
@@ -609,8 +667,11 @@ class PanelClient:
                 self.stop = dict(seq=st.next_seq, t_sent=None)    # passed without ACK: new STOP
         if self.stop_state == 'acked' and st.run_state not in ST_ACTIVE:
             self.stop_state = 'confirmed'
-        if st.next_seq >= SEQ_END:                          # after the ACK of the last seq
-            return self._lose_session(now_ms)
+        elif self.stop_state == 'confirmed' and st.run_state in ST_ACTIVE:
+            self.stop_state = 'none'                        # V5: a new run is active
+        if st.next_seq >= SEQ_END or (st.next_seq >= SEQ_END - 1 and self.stop is None and
+                                      self.pending is None and self.stale is None):
+            return self._lose_session(now_ms)               # after the ACK of the last seq
         return self.tick(now_ms)
 
     def on_profile(self, pr: Profile) -> None:

@@ -33,9 +33,9 @@ def test_status_layout_and_roundtrip():
     s = pp.Status(sid=0x00071234, daemon_boot=0xBEEF, panel_boot=0x4321, last_cmd_seq=0x0309,
                   last_result=pp.RES_OK, next_seq=0x030A, run_state=pp.ST_RUN, phase_ds=123, profile=4,
                   outcome=pp.OUT_COMPLETED, quality=pp.Q_LOST | pp.Q_SPI_STALE, lost=17, data_age_ms=250,
-                  links=pp.L_RPI | pp.L_H7, error_code=7)
+                  links=pp.L_RPI | pp.L_H7, error_code=7, last_cmd=pp.CMD_START)
     f = pp.encode_status(s)
-    assert len(f) == pp.LEN_STATUS == 30 and f[0] == 0xDD and f[27] == 0
+    assert len(f) == pp.LEN_STATUS == 30 and f[0] == 0xDD and f[27] == pp.CMD_START
     assert f[2:6] == b'\x34\x12\x07\x00' and f[6:8] == b'\xef\xbe' and f[8:10] == b'\x21\x43'
     assert f[10:12] == b'\x09\x03' and f[12] == pp.RES_OK and f[13:15] == b'\x0a\x03' and f[15] == pp.ST_RUN
     assert f[16:18] == (123).to_bytes(2, 'little') and (f[18], f[19], f[20]) == (4, pp.OUT_COMPLETED, 5)
@@ -394,12 +394,46 @@ def test_failed_start_is_not_run_again():
 def test_session_seqs_used_up_need_a_new_hello():
     sess, run = pp.DaemonSession(epoch=EPOCH), Runner()
     hello(sess, run)
-    sess.next_seq = pp.SEQ_END - 1
-    assert sess.on_cmd(pp.Cmd(SID1, pp.SEQ_END - 1, pp.CMD_SELECT, 0), run) == 'ran'
+    sess.next_seq = pp.SEQ_END - 2
+    assert sess.on_cmd(pp.Cmd(SID1, pp.SEQ_END - 2, pp.CMD_SELECT, 0), run) == 'ran'
+    assert sess.on_cmd(pp.Cmd(SID1, pp.SEQ_END - 1, pp.CMD_START, 0), run) == 'bad_seq'   # kept for STOP (V2)
+    assert sess.on_cmd(pp.Cmd(SID1, pp.SEQ_END - 1, pp.CMD_STOP, 0), run) == 'ran'
     assert sess.fill(pp.Status()).next_seq == pp.SEQ_END
     assert sess.on_cmd(pp.Cmd(SID1, pp.SEQ_END, pp.CMD_STOP, 0), run) == 'bad_seq'
     hello(sess, run, boot=0x5151)
     assert sess.next_seq == 0 and sess.sid == EPOCH << 16 | 2
+
+
+def test_status_carries_the_code_of_the_last_command_codex_v1():
+    sess, run = pp.DaemonSession(epoch=EPOCH), Runner()
+    hello(sess, run)
+    assert sess.fill(pp.Status()).last_cmd == 0
+    sess.on_cmd(pp.Cmd(SID1, 0, pp.CMD_START, 1), run)
+    st = sess.fill(pp.Status())
+    assert (st.last_cmd_seq, st.last_cmd, st.last_result) == (0, pp.CMD_START, pp.RES_OK)
+
+
+def test_sync_skips_a_seq_and_does_nothing_else():
+    sess, run = pp.DaemonSession(epoch=EPOCH), Runner()
+    hello(sess, run)
+    assert sess.on_cmd(pp.Cmd(SID1, 1, pp.CMD_SYNC, 0), run) == 'ran'       # one ahead: skips 0
+    assert sess.next_seq == 2 and run.ran == []
+    assert sess.on_cmd(pp.Cmd(SID1, 0, pp.CMD_START, 1), run) == 'bad_seq'  # the skipped START
+    assert sess.on_cmd(pp.Cmd(SID1, 4, pp.CMD_SYNC, 0), run) == 'bad_seq'   # two ahead
+    st = sess.fill(pp.Status())
+    assert (st.last_cmd_seq, st.last_cmd, st.last_result) == (1, pp.CMD_SYNC, pp.RES_OK)
+
+
+@pytest.mark.parametrize('result', [pp.RES_BUSY, pp.RES_UNKNOWN, pp.RES_BAD_PROFILE, pp.RES_FAILED])
+def test_stop_not_done_runs_again_on_resend_codex_v4(result):
+    """Codex V4: STOP answered RES_BUSY (any result but OK / NOT_IDLE) was stored as done; the
+    panel kept resending and the callback never ran again."""
+    sess = pp.DaemonSession(epoch=EPOCH)
+    hello(sess, Runner())
+    assert sess.on_cmd(pp.Cmd(SID1, 0, pp.CMD_STOP, 0), Runner(result=result)) in ('ran', 'failed')
+    run = Runner()
+    assert sess.on_cmd(pp.Cmd(SID1, 0, pp.CMD_STOP, 0), run) == 'ran' and len(run.ran) == 1
+    assert sess.on_cmd(pp.Cmd(SID1, 0, pp.CMD_STOP, 0), run) == 'repeated'   # OK now: stored
 
 
 def test_profiles_request_changes_nothing():
@@ -498,6 +532,26 @@ class Bench:
 
     def press(self, cmd, arg=0):
         self.up += self.panel.press(cmd, arg, self.t)
+
+
+class HoldBench(Bench):
+    """Bench whose panel -> daemon link can hold frames in order (a FIFO that stalls, e.g. a
+    busy daemon) instead of dropping them; set hold = False to let them through."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.hold = False
+        self.held = []
+
+    def step(self, n=1):
+        for _ in range(n):
+            if self.hold:
+                self.held += self.up
+                self.up = []
+            elif self.held:
+                self.up = self.held + self.up
+                self.held = []
+            super().step(1)
 
 
 def _is(start, cmd=None):
@@ -629,12 +683,149 @@ def test_foreign_hello_moves_the_session_and_stop_still_runs_codex_n15():
 def test_used_up_session_reconnects_after_its_last_ack():
     b = Bench()
     b.step(10)
-    b.sess.next_seq = pp.SEQ_END - 1
+    b.sess.next_seq = pp.SEQ_END - 2
     b.step(10)
     b.press(pp.CMD_SELECT, 0)
     b.step(20)
     assert b.panel.shown == [('done', pp.CMD_SELECT, pp.RES_OK)]
     assert b.panel.sid == EPOCH << 16 | 2 and b.panel.next_seq == 0
+
+
+def test_stop_after_a_start_held_past_the_timeout_codex_v1():
+    """Codex V1: START0 is held in the FIFO for 3.2 s (the panel gives it up), then STOP. The
+    old panel reused seq 0 for STOP, START0 ran, STOP0 was refused and START0's ACK was taken
+    as STOP's. Now STOP goes at 1 (seq 0 stays stale), ACKs match seq and code: the STOP runs
+    after the START and the run ends."""
+    b = HoldBench()
+    b.step(10)
+    b.hold = True
+    b.press(pp.CMD_START, 0)
+    b.step(320)
+    assert ('unverified', pp.CMD_START, None) in b.panel.shown and b.panel.stale == 0
+    b.press(pp.CMD_STOP)
+    b.step(5)
+    b.hold = False
+    b.step(80)
+    assert [r[1] for r in b.ran] == [pp.CMD_START, pp.CMD_STOP]
+    assert b.run_state == pp.ST_END and b.panel.stop_state == 'confirmed' and b.panel.stale is None
+
+
+def test_stop_before_the_held_start_arrives_skips_it_codex_v1():
+    """Same, but START0 is lost for good: once given up, the panel skips its seq with SYNC1,
+    then STOP goes at 2, so a late copy of START0 can never run."""
+    b = HoldBench()
+    b.step(10)
+    b.drop_up = _is(pp.START_CMD, pp.CMD_START)
+    b.press(pp.CMD_START, 0)
+    b.step(320)
+    b.drop_up = lambda f: False
+    b.press(pp.CMD_STOP)
+    b.step(30)
+    assert [r[1] for r in b.ran] == [pp.CMD_STOP] and b.sess.next_seq == 3
+    assert [(s, c) for s, c, r in b.log if r == 'ran'] == [(1, pp.CMD_SYNC), (2, pp.CMD_STOP)]
+    assert b.sess.on_cmd(pp.Cmd(SID1, 0, pp.CMD_START, 0), b.run) == 'bad_seq'
+    assert b.panel.stop_state == 'confirmed'
+
+
+def test_given_up_select_is_skipped_with_sync_before_the_next_command():
+    """A SELECT given up after CMD_MAX_AGE_MS leaves its seq stale: SELECT/START are refused
+    until SYNC (at stale + 1) is acknowledged; then the next START runs at a fresh seq."""
+    b = Bench()
+    b.step(10)
+    b.drop_up = _is(pp.START_CMD, pp.CMD_SELECT)
+    b.press(pp.CMD_SELECT, 1)
+    b.step(310)
+    b.drop_up = lambda f: False
+    assert b.panel.press(pp.CMD_START, 1, b.t) == [] or b.panel.stale is None
+    b.step(20)
+    assert b.panel.stale is None and b.sess.next_seq == 2
+    b.press(pp.CMD_START, 1)
+    b.step(10)
+    assert b.ran == [(2, pp.CMD_START, 1)] and b.panel.shown[-1] == ('done', pp.CMD_START, pp.RES_OK)
+    assert b.sess.on_cmd(pp.Cmd(SID1, 0, pp.CMD_SELECT, 1), b.run) == 'bad_seq'
+
+
+def test_stop_with_a_lost_start_at_the_last_seq_codex_v2():
+    """Codex V2: at the end of the seqs a lost START left STOP refused forever. Now the last
+    seq is kept for STOP: STOP runs, then the panel opens a new session."""
+    b = Bench()
+    b.step(10)
+    b.sess.next_seq = pp.SEQ_END - 2
+    b.step(10)
+    b.drop_up = _is(pp.START_CMD, pp.CMD_START)
+    b.press(pp.CMD_START, 0)
+    b.step(3)
+    b.drop_up = lambda f: False
+    b.press(pp.CMD_STOP)
+    b.step(60)
+    assert [r for r in b.ran if r[1] == pp.CMD_STOP] == [(pp.SEQ_END - 1, pp.CMD_STOP, 0)]
+    assert b.panel.sid == EPOCH << 16 | 2 and b.panel.stop is None
+
+
+def test_panel_reboot_with_same_nonce_and_a_start_in_the_fifo_codex_v3():
+    """Codex V3: START0 still in the FIFO, the panel reboots and draws the same nonce, takes a
+    periodic STATUS as its handshake and sends STOP0. START0 runs first, STOP0 is refused; its
+    ACK is no longer taken for STOP's, the panel re-sends STOP at the new next_seq: it runs."""
+    b = HoldBench()
+    b.step(10)
+    b.hold = True
+    b.press(pp.CMD_START, 0)
+    b.step(1)
+    b.panel = pp.PanelClient(lambda: 0x1111)
+    b.step(15)
+    b.press(pp.CMD_STOP)
+    b.step(2)
+    b.hold = False
+    b.step(80)
+    assert [r[1] for r in b.ran] == [pp.CMD_START, pp.CMD_STOP]
+    assert b.run_state == pp.ST_END and b.panel.stop_state == 'confirmed'
+
+
+def test_stop_answered_busy_then_ok_codex_v4():
+    b = Bench()
+    b.step(10)
+    b.press(pp.CMD_START, 0)
+    b.step(10)
+    real = b.run
+    answers = [pp.RES_BUSY]
+
+    def run(c):
+        if c.cmd == pp.CMD_STOP and answers:
+            b.ran.append((c.seq, c.cmd, c.arg))
+            return answers.pop()
+        return real(c)
+    b.run = run
+    b.press(pp.CMD_STOP)
+    b.step(60)
+    assert len([r for r in b.ran if r[1] == pp.CMD_STOP]) == 2
+    assert b.panel.stop_state == 'confirmed' and b.run_state == pp.ST_END
+
+
+def test_confirmed_stop_does_not_carry_into_the_next_run_codex_v5():
+    b = Bench()
+    b.step(10)
+    b.press(pp.CMD_START, 0)
+    b.step(10)
+    b.press(pp.CMD_STOP)
+    b.step(30)
+    assert b.panel.stop_state == 'confirmed'
+    b.run_state = pp.ST_IDLE
+    b.press(pp.CMD_START, 0)
+    assert b.panel.stop_state == 'none'
+    b.step(10)
+    assert b.run_state == pp.ST_RUN and b.panel.stop_state == 'none'
+
+
+def test_confirmed_stop_cleared_when_a_run_becomes_active():
+    """V5: a run started by other means (another panel session, hil_ctl) clears 'confirmed'."""
+    b = Bench()
+    b.step(10)
+    b.press(pp.CMD_STOP)
+    b.step(30)
+    assert b.panel.stop_state == 'confirmed'
+    b.run_state = pp.ST_RUN
+    b.step(15)
+    assert b.panel.stop_state == 'none'
 
 
 def test_missing_profile_is_asked_again():
