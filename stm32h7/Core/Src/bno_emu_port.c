@@ -21,6 +21,7 @@
 #include "bno_emu_port.h"
 #include "spi1_handler.h"
 #include "s06_log.h"
+#include "s06_load.h"
 #include "encoder_gen.h"        /* ENC_CLOCK_CAL */
 #include <math.h>
 #include <string.h>
@@ -194,6 +195,7 @@ static void _cs_rise(uint32_t now)
 /* ── Interrupt entry points (all NVIC priority 6) ────────────────────── */
 void EXTI4_IRQHandler(void)
 {
+    S06_IRQ_ENTER();                     /* S06 T10 */
     __HAL_GPIO_EXTI_CLEAR_IT(_NSS_PIN);
     uint32_t now = _now_us();
     uint8_t high = _cs_high();
@@ -211,6 +213,7 @@ void EXTI4_IRQHandler(void)
         _cs_rise(now);
         _cs_fall(now);
     }
+    S06_IRQ_EXIT(S06_IRQ_EXTI4);
 }
 
 void BnoPort_Tick(void)

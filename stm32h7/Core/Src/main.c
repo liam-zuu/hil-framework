@@ -23,6 +23,7 @@
 #include "uart_relay.h"         /* +++ NEW */
 #include "bno_emu_port.h"
 #include "s06_log.h"
+#include "s06_load.h"
 #include <stdio.h>
 /* USER CODE END Includes */
 
@@ -61,10 +62,50 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/* Debug print (S06 V4, W16): blocking during init, so a boot hang still shows
+ * the last line; from the main loop on, through a 4 KB ring sent by the
+ * USART3 TXE interrupt, so the main loop never waits for the UART (before:
+ * HAL_UART_Transmit with 100 ms timeout, about 11 lines every 0.5 s at
+ * 115200 baud). Ring full: characters dropped and counted (S06log line). */
+#define _DBG_TX_LEN 4096u                       /* power of two */
+static uint8_t           _dbg_tx[_DBG_TX_LEN];
+static volatile uint32_t _dbg_h, _dbg_t;
+static volatile uint32_t _dbg_drop;
+static uint8_t           _dbg_async;
+
 int _write(int file, char *ptr, int len)
 {
-    HAL_UART_Transmit(&huart3, (uint8_t *)ptr, (uint16_t)len, 100);
+    (void)file;
+    if (!_dbg_async) {
+        HAL_UART_Transmit(&huart3, (uint8_t *)ptr, (uint16_t)len, 100);
+        return len;
+    }
+    for (int i = 0; i < len; i++) {             /* main loop only: one producer */
+        uint32_t n = (_dbg_h + 1u) & (_DBG_TX_LEN - 1u);
+        if (n == _dbg_t) { _dbg_drop += (uint32_t)(len - i); break; }
+        _dbg_tx[_dbg_h] = (uint8_t)ptr[i];
+        _dbg_h = n;
+    }
+    SET_BIT(USART3->CR1, USART_CR1_TXEIE_TXFNFIE);
     return len;
+}
+
+/* Not in stm32h7xx_it.c: the USART3 interrupt is off in the .ioc. If it is
+ * ever enabled there, CubeMX generates a second handler: remove this one. */
+void USART3_IRQHandler(void)
+{
+    S06_IRQ_ENTER();
+    if (READ_BIT(USART3->ISR, USART_ISR_TXE_TXFNF)) {
+        if (_dbg_t != _dbg_h) {
+            USART3->TDR = _dbg_tx[_dbg_t];
+            _dbg_t = (_dbg_t + 1u) & (_DBG_TX_LEN - 1u);
+        } else {
+            CLEAR_BIT(USART3->CR1, USART_CR1_TXEIE_TXFNFIE);
+            if (_dbg_t != _dbg_h)               /* main loop wrote meanwhile */
+                SET_BIT(USART3->CR1, USART_CR1_TXEIE_TXFNFIE);
+        }
+    }
+    S06_IRQ_EXIT(S06_IRQ_USART3);
 }
 
 void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
@@ -207,10 +248,32 @@ int main(void)
   static uint32_t _n_applied = 0, _n_skipped = 0, _age_max_us = 0;
   static uint32_t _last_applied_nf = 0;
   const uint32_t cyc_per_us = SystemCoreClock / 1000000u;
+  /* S06 T10: cost of the S06_IRQ_ENTER/EXIT pair; then (W10) the cost of one
+   * idle pass, measured on this very loop with every interrupt masked for
+   * 100 ms (no frame, no tick, so every pass is idle). Debug print turns
+   * non-blocking after that. */
+  static uint32_t _t10_last = 0;
+  S06Load_CalibrateOverhead();
+  uint8_t  _cal_on = 1;
+  _dbg_last = _t10_last = HAL_GetTick();
+  __disable_irq();
+  uint32_t _cal_t0 = DWT->CYCCNT;
+  uint32_t _cal_idle0 = S06Load_IdleCount();
 
   while (1)
   {
+    uint8_t _busy = 0;
+    if (_cal_on && (DWT->CYCCNT - _cal_t0) >= SystemCoreClock / 10u) {
+        S06Load_SetIdleCal(S06Load_IdleCount() - _cal_idle0, DWT->CYCCNT - _cal_t0);
+        _cal_on = 0;
+        HAL_NVIC_SetPriority(USART3_IRQn, 10, 0);   /* below every other handler */
+        HAL_NVIC_EnableIRQ(USART3_IRQn);
+        _dbg_async = 1;
+        __enable_irq();
+        _busy = 1;
+    }
     if (SPI1_IsFrameReady()) {
+        _busy = 1;
         _last_frame_ms = HAL_GetTick();
         if (!_link_up) {
             SPI1_Stats_t s0;
@@ -255,6 +318,7 @@ int main(void)
 
         HAL_GPIO_TogglePin(GPIOE, GPIO_PIN_1);
     } else if (_link_up && (HAL_GetTick() - _last_frame_ms) > SPI_LINK_TIMEOUT_MS) {
+        _busy = 1;
         _link_up = 0;
         _n_link_lost++;
         for (int i = 0; i < ENC_NUM_WHEELS; i++)
@@ -275,6 +339,7 @@ int main(void)
     SPI1_Service();
 
     if ((HAL_GetTick() - _dbg_last) >= 500) {
+        _busy = 1;
         _dbg_last = HAL_GetTick();
 
         EncoderGenDebug_t dbg[ENC_NUM_WHEELS];
@@ -322,8 +387,9 @@ int main(void)
                (unsigned long)ss.new_dropped,
                (unsigned long)_n_applied, (unsigned long)_n_skipped,
                (unsigned long)_age_max_us);
-        printf("S06log: pushed=%lu dropped=%lu\r\n",
-               (unsigned long)S06Log_Pushed(), (unsigned long)S06Log_Dropped());
+        printf("S06log: pushed=%lu dropped=%lu  print_drop=%lu\r\n",
+               (unsigned long)S06Log_Pushed(), (unsigned long)S06Log_Dropped(),
+               (unsigned long)_dbg_drop);
         _frames_last = ss.frames;
         /* BNO085 emulator (G2): host init (adv, prod id, set features),
          * transactions and reports per sensor (accel / gyro / game RV) */
@@ -352,6 +418,12 @@ int main(void)
 
         HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_0);
     }
+    if ((HAL_GetTick() - _t10_last) >= 10000u) {   /* S06 T10, every 10 s */
+        _busy = 1;
+        _t10_last = HAL_GetTick();
+        S06Load_Report();
+    }
+    if (!_busy) S06Load_CountIdle();   /* W10: idle pass (an SPI1 rearm counts as idle) */
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
