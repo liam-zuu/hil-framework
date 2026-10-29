@@ -147,6 +147,8 @@ class PrecisionTimer:
         self._next_ns:   int = time.monotonic_ns() + self.period_ns
         self._jitter:    collections.deque = collections.deque(maxlen=history_len)
         self._overruns:  int = 0
+        self.last_deadline_ns: int = 0          # S06 T2: deadline and wake-up of the last tick
+        self.last_wake_ns:     int = 0
 
     # ── Core method ───────────────────────────────────────────────────────
 
@@ -172,6 +174,8 @@ class PrecisionTimer:
 
         actual_ns  = time.monotonic_ns()
         jitter_ns  = actual_ns - deadline_ns
+        self.last_deadline_ns = deadline_ns
+        self.last_wake_ns     = actual_ns
         self._next_ns += self.period_ns
 
         if jitter_ns > self.period_ns:

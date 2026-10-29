@@ -41,6 +41,7 @@ from mecanum_plant import MecanumPlant
 from imu_model import imu_from_plant
 from params import PARAMS
 from rt_monitor import RTMonitor
+from step_log import StepLog
 
 log = logging.getLogger('hil.node')
 
@@ -102,6 +103,7 @@ class HILNode:
         shared_state:  Optional[mp.Array] = None,
         shared_ref:    Optional[mp.Array] = None,
         monitor:       Optional[RTMonitor] = None,
+        step_log:      Optional[StepLog]   = None,
     ):
         """
         Args:
@@ -116,12 +118,16 @@ class HILNode:
                           (run_hil.py). Given: the loop only records lateness
                           counters, no logging and no statistics inside the
                           1 kHz loop (THESIS H2). None: the old in-loop log.
+            step_log:     StepLog (S06 T2): t_sched, t_start, t_done, t_end of
+                          every step into a shared ring, read outside the loop.
         """
         self.plant        = plant
         self.cfg          = config or HILConfig(simulate_hw=True)
         self.shared_state = shared_state
         self.shared_ref   = shared_ref
         self.monitor      = monitor
+        self.step_log     = step_log
+        self._t_done_ns   = 0
         self._ref         = (0.0, 0.0, 0.0)
         self._ref_count   = 0.0
 
@@ -175,12 +181,19 @@ class HILNode:
             self.cfg.max_steps,
         )
 
+        # S06 Y16: schedule from here, not from when the timer was built (before,
+        # the first deadlines were already past and the first steps ran back to back)
+        self._timer.reset()
         try:
             while self._running:
                 if self.cfg.max_steps and self._step >= self.cfg.max_steps:
                     break
                 jitter_ns = self._timer.wait_next_tick()
                 self._tick(jitter_ns)
+                if self.step_log is not None:
+                    # S06 T2 (Z9): t_end is taken inside record, after its fields
+                    self.step_log.record(self._step - 1, self._timer.last_deadline_ns,
+                                         self._timer.last_wake_ns, self._t_done_ns)
         finally:
             self._shutdown()
 
@@ -221,6 +234,7 @@ class HILNode:
         if self.shared_state is not None:
             with self.shared_state.get_lock():
                 self.shared_state[:] = new_state
+        self._t_done_ns = time.monotonic_ns()      # S06 T2 t_done (Z9)
 
         self._step += 1
 

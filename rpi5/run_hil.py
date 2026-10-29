@@ -68,7 +68,8 @@ def _parse_fixed_omega(text: str) -> list:
 
 
 def _run_plant(cfg, shared_state: mp.Array, shared_ref: mp.Array, use_mock: bool, seed: int = 0,
-               wheels_lifted: bool = False, fixed_omega: list = None, monitor=None) -> None:
+               wheels_lifted: bool = False, fixed_omega: list = None, monitor=None,
+               step_log=None) -> None:
     """Process 1 target: plant simulation loop."""
     import logging
     logging.basicConfig(
@@ -96,15 +97,16 @@ def _run_plant(cfg, shared_state: mp.Array, shared_ref: mp.Array, use_mock: bool
         plant = MockPlant() if use_mock else MecanumPlant(params=params, dt=cfg.period_us / 1e6, seed=seed)
     logging.getLogger('hil.main').info('Plant RNG seed = %s, wheels_lifted = %s', seed, wheels_lifted)
     node  = HILNode(plant, config=cfg, shared_state=shared_state, shared_ref=shared_ref,
-                    monitor=monitor)
+                    monitor=monitor, step_log=step_log)
     node.run()
 
 
-def _report_plant_stats(p1, monitor, stats_interval: int) -> None:
+def _report_plant_stats(p1, monitor, stats_interval: int, step_csv=None) -> None:
     """
     Print the plant-loop lateness stats every stats_interval steps from this
     (non real-time) process while the plant process runs, then once for the
     whole run (THESIS H2: nothing printed or sorted inside the 1 kHz loop).
+    step_csv (S06 T2): drained here every 0.2 s.
     """
     from rt_monitor import RTMonitor, I_STEP
     try:
@@ -114,6 +116,8 @@ def _report_plant_stats(p1, monitor, stats_interval: int) -> None:
     prev, next_step, t0 = None, stats_interval, None
     while p1.is_alive():
         p1.join(timeout=0.2)
+        if step_csv is not None:
+            step_csv.drain()
         snap = monitor.snapshot()
         if t0 is None and snap[I_STEP] > 0:
             t0 = time.monotonic() - snap[I_STEP] / 1_000.0
@@ -238,6 +242,9 @@ def _parse_args() -> argparse.Namespace:
                    help='BNO085 emulator check (G2): send these constant IMU values '
                         '[rad/s, m/s^2, m/s^2, m/s^2, rad] in every frame instead of the '
                         'plant values (imu_seq still changes every frame)')
+    p.add_argument('--step-log',      default='', metavar='CSV',
+                   help='S06 T2: t_sched, t_start, t_done, t_end of every plant step to this CSV '
+                        '(shared ring, written outside the 1 kHz loop); counts in <CSV>.json')
     p.add_argument('--fixed-omega',   default=None, metavar='W1,W2,W3,W4',
                    help='EncoderGen check: send these constant wheel speeds [rad/s] instead of '
                         'running the plant (use with --steps; implies --no-traj)')
@@ -300,13 +307,20 @@ def main() -> int:
     # Plant-loop lateness counters, read by this process (rt_monitor.py, THESIS H2)
     from rt_monitor import RTMonitor
     monitor = RTMonitor(warn_us=hil_cfg.jitter_warn_us)
+    # S06 T2: per-step timestamps through a shared ring, drained by this process
+    step_log, step_csv = None, None
+    if args.step_log:
+        from step_log import StepLog, StepLogCSV
+        step_log = StepLog()
+        step_csv = StepLogCSV(step_log, args.step_log, period_ns=hil_cfg.period_us * 1_000)
 
     # Build process list
     procs = []
 
     p1 = mp.Process(
         target=_run_plant,
-        args=(hil_cfg, shared_state, shared_ref, args.mock, args.seed, lifted, fixed_omega, monitor),
+        args=(hil_cfg, shared_state, shared_ref, args.mock, args.seed, lifted, fixed_omega, monitor,
+              step_log),
         name='HIL-Plant',
         daemon=True,
     )
@@ -341,9 +355,16 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _stop)
 
     # Primary: wait for plant loop, printing its stats from here
-    _report_plant_stats(p1, monitor, hil_cfg.stats_interval)
+    _report_plant_stats(p1, monitor, hil_cfg.stats_interval, step_csv)
     p1.join()
     log.info("Plant process exited (code=%s)", p1.exitcode)
+    if step_csv is not None:
+        import json
+        meta = step_csv.close()
+        with open(args.step_log + '.json', 'w') as f:
+            json.dump(meta, f, indent=1)
+        log.info('Step log: %d rows -> %s; overflow=%d lost_or_torn=%d', meta['rows'], args.step_log,
+                 meta['overflow'], meta['lost_or_torn'])
 
     # Cleanup secondaries
     for proc in procs:
