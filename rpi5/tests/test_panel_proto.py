@@ -566,7 +566,7 @@ def test_panel_handshake_select_start_and_profiles():
     b.step(5)
     b.press(pp.CMD_START, 1)
     b.step(5)
-    assert b.ran == [(0, pp.CMD_SELECT, 1), (1, pp.CMD_START, 1)]
+    assert b.ran == [(1, pp.CMD_SELECT, 1), (2, pp.CMD_START, 1)]          # seq 0: fence SYNC (W1)
     assert b.panel.shown == [('done', pp.CMD_SELECT, pp.RES_OK), ('done', pp.CMD_START, pp.RES_OK)]
 
 
@@ -651,17 +651,17 @@ def test_daemon_restart_mid_command_codex_n15():
 
 def test_panel_reboot_with_the_same_nonce_continues_safely_codex_n15():
     """Nonce collision: the panel reboots and draws the nonce of its old session. The daemon
-    takes it as a retry; the panel uses next_seq from STATUS, so its first command runs."""
+    takes it as a retry; the panel sends its fence SYNC at next_seq, then its first command runs."""
     b = Bench()
     b.step(10)
     b.press(pp.CMD_SELECT, 1)
     b.step(10)
     b.panel = pp.PanelClient(lambda: 0x1111)
     b.step(10)
-    assert b.panel.sid == SID1 and b.panel.next_seq == 1
+    assert b.panel.sid == SID1 and b.panel.next_seq == 3 and not b.panel.fence    # SELECT 1, fence SYNC 2
     b.press(pp.CMD_START, 1)
     b.step(10)
-    assert b.ran[-1] == (1, pp.CMD_START, 1) and b.panel.shown == [('done', pp.CMD_START, pp.RES_OK)]
+    assert b.ran[-1] == (3, pp.CMD_START, 1) and b.panel.shown == [('done', pp.CMD_START, pp.RES_OK)]
 
 
 def test_foreign_hello_moves_the_session_and_stop_still_runs_codex_n15():
@@ -688,20 +688,20 @@ def test_used_up_session_reconnects_after_its_last_ack():
     b.press(pp.CMD_SELECT, 0)
     b.step(20)
     assert b.panel.shown == [('done', pp.CMD_SELECT, pp.RES_OK)]
-    assert b.panel.sid == EPOCH << 16 | 2 and b.panel.next_seq == 0
+    assert b.panel.sid == EPOCH << 16 | 2 and b.panel.next_seq == 1           # after the fence SYNC 0
 
 
 def test_stop_after_a_start_held_past_the_timeout_codex_v1():
     """Codex V1: START0 is held in the FIFO for 3.2 s (the panel gives it up), then STOP. The
     old panel reused seq 0 for STOP, START0 ran, STOP0 was refused and START0's ACK was taken
-    as STOP's. Now STOP goes at 1 (seq 0 stays stale), ACKs match seq and code: the STOP runs
-    after the START and the run ends."""
+    as STOP's. Now (START at 1 after the fence SYNC 0) STOP goes at 2 (seq 1 stays stale), ACKs
+    match seq and code: the STOP runs after the START and the run ends."""
     b = HoldBench()
     b.step(10)
     b.hold = True
     b.press(pp.CMD_START, 0)
     b.step(320)
-    assert ('unverified', pp.CMD_START, None) in b.panel.shown and b.panel.stale == 0
+    assert ('unverified', pp.CMD_START, None) in b.panel.shown and b.panel.stale == 1
     b.press(pp.CMD_STOP)
     b.step(5)
     b.hold = False
@@ -711,8 +711,8 @@ def test_stop_after_a_start_held_past_the_timeout_codex_v1():
 
 
 def test_stop_before_the_held_start_arrives_skips_it_codex_v1():
-    """Same, but START0 is lost for good: once given up, the panel skips its seq with SYNC1,
-    then STOP goes at 2, so a late copy of START0 can never run."""
+    """Same, but the START (seq 1) is lost for good: once given up, the panel skips its seq with
+    SYNC 2, then STOP goes at 3, so a late copy of the START can never run."""
     b = HoldBench()
     b.step(10)
     b.drop_up = _is(pp.START_CMD, pp.CMD_START)
@@ -721,9 +721,9 @@ def test_stop_before_the_held_start_arrives_skips_it_codex_v1():
     b.drop_up = lambda f: False
     b.press(pp.CMD_STOP)
     b.step(30)
-    assert [r[1] for r in b.ran] == [pp.CMD_STOP] and b.sess.next_seq == 3
-    assert [(s, c) for s, c, r in b.log if r == 'ran'] == [(1, pp.CMD_SYNC), (2, pp.CMD_STOP)]
-    assert b.sess.on_cmd(pp.Cmd(SID1, 0, pp.CMD_START, 0), b.run) == 'bad_seq'
+    assert [r[1] for r in b.ran] == [pp.CMD_STOP] and b.sess.next_seq == 4
+    assert [(s, c) for s, c, r in b.log if r == 'ran'] == [(0, pp.CMD_SYNC), (2, pp.CMD_SYNC), (3, pp.CMD_STOP)]
+    assert b.sess.on_cmd(pp.Cmd(SID1, 1, pp.CMD_START, 0), b.run) == 'bad_seq'
     assert b.panel.stop_state == 'confirmed'
 
 
@@ -738,11 +738,11 @@ def test_given_up_select_is_skipped_with_sync_before_the_next_command():
     b.drop_up = lambda f: False
     assert b.panel.press(pp.CMD_START, 1, b.t) == [] or b.panel.stale is None
     b.step(20)
-    assert b.panel.stale is None and b.sess.next_seq == 2
+    assert b.panel.stale is None and b.sess.next_seq == 3
     b.press(pp.CMD_START, 1)
     b.step(10)
-    assert b.ran == [(2, pp.CMD_START, 1)] and b.panel.shown[-1] == ('done', pp.CMD_START, pp.RES_OK)
-    assert b.sess.on_cmd(pp.Cmd(SID1, 0, pp.CMD_SELECT, 1), b.run) == 'bad_seq'
+    assert b.ran == [(3, pp.CMD_START, 1)] and b.panel.shown[-1] == ('done', pp.CMD_START, pp.RES_OK)
+    assert b.sess.on_cmd(pp.Cmd(SID1, 1, pp.CMD_SELECT, 1), b.run) == 'bad_seq'
 
 
 def test_stop_with_a_lost_start_at_the_last_seq_codex_v2():
@@ -826,6 +826,72 @@ def test_confirmed_stop_cleared_when_a_run_becomes_active():
     b.run_state = pp.ST_RUN
     b.step(15)
     assert b.panel.stop_state == 'none'
+
+
+@pytest.mark.parametrize('cmd', [pp.CMD_START, pp.CMD_SELECT])
+def test_reboot_same_nonce_old_command_in_fifo_new_command_other_arg_codex_w1(cmd):
+    """Codex W1: the old command (arg 0) is still in the FIFO, the panel reboots with the same
+    nonce and wants the same command with arg 1. Before, the old command's ACK (same seq, same
+    code) was shown as 'done' for the new one. Now the fence SYNC goes first and new commands
+    are refused until it is through, so the old result is never taken for the new command."""
+    b = HoldBench()
+    b.step(10)
+    b.hold = True
+    b.press(cmd, 0)
+    b.step(1)
+    b.panel = pp.PanelClient(lambda: 0x1111)
+    b.step(15)
+    assert b.panel.sid == SID1 and b.panel.fence
+    b.press(cmd, 1)
+    assert b.panel.shown == [('refused', cmd, None)]
+    b.step(2)
+    b.hold = False
+    b.step(40)
+    assert [r for r in b.ran if r[1] == cmd] == [(1, cmd, 0)] and not b.panel.fence
+    assert not any(s[0] == 'done' for s in b.panel.shown)
+    b.press(cmd, 1)
+    b.step(10)
+    assert b.ran[-1] == (b.sess.next_seq - 1, cmd, 1) and b.panel.shown[-1][0] == 'done'
+
+
+def test_stop_acked_at_the_last_seq_is_confirmed_in_the_next_session_codex_w2():
+    """Codex W2: the START at the last normal seq ran but its ACK was lost; STOP at the last
+    seq got OK while still STOPPING; the session changed at once. 'acked' was dropped, so the
+    stop was never confirmed. Now it is kept and confirmed by the new session's STATUS."""
+    b = Bench(stop_ms=300)
+    b.step(10)
+    b.sess.next_seq = pp.SEQ_END - 2
+    b.step(10)
+    b.drop_down = lambda f: f[0] == pp.START_STATUS and b.sess.last_cmd == pp.CMD_START
+    b.press(pp.CMD_START, 0)
+    b.step(5)
+    b.drop_down = lambda f: False
+    b.press(pp.CMD_STOP)
+    seen = set()
+    for _ in range(80):
+        b.step()
+        seen.add((b.panel.stop_state, b.run_state))
+    assert b.panel.sid == EPOCH << 16 | 2
+    assert not any(st == 'confirmed' and rs in pp.ST_ACTIVE for st, rs in seen)
+    assert b.run_state == pp.ST_END and b.panel.stop_state == 'confirmed'
+
+
+def test_stop_takes_the_place_of_a_pending_sync_codex_w3():
+    """Codex W3 (the written rule): a START lost, its seq stale, the SYNC that skips it lost
+    too; STOP pressed while that SYNC is pending goes at the SYNC's seq (not SYNC + 1, which
+    the daemon would refuse while next_seq has not moved), and runs."""
+    b = Bench()
+    b.step(10)
+    b.drop_up = lambda f: f[0] == pp.START_CMD and f[8] in (pp.CMD_START, pp.CMD_SYNC)
+    b.press(pp.CMD_START, 0)
+    b.step(310)
+    assert b.panel.stale == 1 and b.panel.pending['cmd'] == pp.CMD_SYNC and b.panel.pending['seq'] == 2
+    b.drop_up = lambda f: False
+    b.press(pp.CMD_STOP)
+    assert b.panel.stop['seq'] == 2
+    b.step(30)
+    assert [r for r in b.ran if r[1] == pp.CMD_STOP] == [(2, pp.CMD_STOP, 0)]
+    assert b.panel.stop_state == 'confirmed'
 
 
 def test_missing_profile_is_asked_again():

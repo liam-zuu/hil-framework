@@ -478,16 +478,20 @@ class PanelClient:
 
       * Handshake: send HELLO(panel_boot = a random non-zero 16-bit nonce) every
         HELLO_RESEND_MS until a STATUS with sid != 0 and panel_boot == nonce arrives; other
-        STATUS frames are ignored until then. A nonce equal to that of the current session
-        (a panel reboot, 1 in 65 535) joins that session: frames sent before the reboot and
-        still on their way run as sent (as they would with any nonce), the panel takes
-        next_seq from STATUS, and STOP still works because an ACK must match seq AND command
-        code (V3).
+        STATUS frames are ignored until then. Fence (W1): after every handshake the panel
+        first sends SYNC at next_seq (resent until its ACK or until next_seq passes it) and
+        refuses SELECT/START until then; frames are in order, so every frame sent before
+        (e.g. before a panel reboot) has been handled by then and its ACK can no longer be
+        taken for a new command. A nonce equal to that of the current session (a panel
+        reboot, 1 in 65 535) joins that session: frames sent before the reboot and still on
+        their way run as sent (as they would with any nonce); the fence keeps their results
+        apart from the new commands (V3, W1).
       * Session lost: a STATUS whose daemon_boot changed, or whose sid / panel_boot is not the
         session's (a new session opened by another HELLO), or no seq left (next_seq >=
         SEQ_END - 1 with nothing of the panel still needing the last seq) -> new nonce, HELLO
         again. A pending SELECT/START is then shown 'unverified'; a STOP stays requested and
-        is sent again in the new session; a stop already acknowledged or confirmed is
+        is sent again in the new session; a stop already acknowledged stays 'acked' and is
+        confirmed by the run_state of the new session's STATUS (W2); a confirmed stop is
         forgotten (V5).
       * NO LINK: no STATUS of the session for NO_LINK_MS. Commands are not sent while there
         is no link, except STOP, which keeps being resent.
@@ -533,6 +537,7 @@ class PanelClient:
         self.profile_count: Optional[int] = None
         self._t_session: Optional[float] = None
         self._t_hello: Optional[float] = None
+        self.fence = False                          # SYNC at next_seq still due after the handshake (W1)
 
     def _new_boot(self) -> int:
         while True:
@@ -569,6 +574,7 @@ class PanelClient:
             return self.tick(now_ms)
         if not self.sid or self.next_seq is None or not self.link(now_ms) or \
                 self.pending is not None or self.stop is not None or self.stale is not None or \
+                self.fence or \
                 self.next_seq >= SEQ_END - 1:
             self.shown.append(('refused', cmd, None))         # busy / no link: the user retries
             return []
@@ -595,8 +601,8 @@ class PanelClient:
         if p is not None and p['cmd'] != CMD_SYNC and now_ms - p['t_first'] >= CMD_MAX_AGE_MS:
             self._give_up(p)
             self.pending = p = None
-        if p is None and self.stop is None and self.stale is not None and self.link(now_ms):
-            seq = self.stale + 1
+        if p is None and self.stop is None and self.link(now_ms) and (self.stale is not None or self.fence):
+            seq = self.stale + 1 if self.stale is not None else self.next_seq
             self.pending = p = dict(seq=seq, cmd=CMD_SYNC, arg=0, t_first=now_ms, t_sent=now_ms)
             out.append(encode_cmd(self.sid, seq, CMD_SYNC, 0))
         elif p is not None and self.link(now_ms) and now_ms - p['t_sent'] >= RESEND_MS:
@@ -617,8 +623,9 @@ class PanelClient:
         self.stale = None                                   # frames of the old sid are dropped
         if self.stop is not None:
             self.stop = dict(seq=None, t_sent=None)        # sent again in the new session
-        elif self.stop_state in ('acked', 'confirmed'):
-            self.stop_state = 'none'
+        elif self.stop_state == 'confirmed':
+            self.stop_state = 'none'                       # 'acked' kept: confirmed in the new session (W2)
+        self.fence = False
         self.boot = self._new_boot()
         self.sid, self.next_seq, self.daemon_boot = 0, None, None
         self.profiles, self.profile_count, self._t_session = {}, None, None
@@ -630,6 +637,7 @@ class PanelClient:
             if st.sid and st.panel_boot == self.boot:
                 self.sid, self.daemon_boot = st.sid, st.daemon_boot
                 self._t_session = now_ms
+                self.fence = True
             else:
                 return []
         elif st.daemon_boot != self.daemon_boot or st.sid != self.sid or st.panel_boot != self.boot:
@@ -651,6 +659,8 @@ class PanelClient:
                 if p['cmd'] != CMD_SYNC:
                     self.shown.append(('unverified', p['cmd'], None))
                 self.pending = None
+            if self.pending is None and p['cmd'] == CMD_SYNC:
+                self.fence = False                          # every older frame is behind us
         if self.stale is not None and st.next_seq > self.stale:
             self.stale = None                               # the old frame can no longer run
         s = self.stop
@@ -659,6 +669,7 @@ class PanelClient:
                 if st.last_result in (RES_OK, RES_NOT_IDLE):
                     self.stop = None
                     self.stop_state = 'acked'
+                    self.fence = False                      # the STOP took the fence's place
                 elif s['t_sent'] is not None and now_ms - s['t_sent'] < RESEND_MS:
                     pass                                    # same ACK seen again: one failure only
                 else:
