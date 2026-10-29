@@ -32,7 +32,7 @@ Diễn giải của CODE (spec chưa định nghĩa chi tiết, cần THESIS xá
   start_cnt = CNT timer lúc `_start_wheel` (nhiều lần thì nối bằng ';').
 
 CLI (lượt thật; đồng bộ ESP32 → RPi5 chưa có chân đánh dấu nên phải nhập tay, ghi vào kết quả):
-  python tools/t3b_score.py --schedule T3b_schedule.csv --frames frames.npz \
+  python tools/t3b_score.py --schedule T3b_schedule.csv --frames frames.npz [--h7-calls] \
       --esp32-events esp32_events.txt --clock-affine <offset_us> <rate> --delta-sync-us <µs> --out <thư mục>
 Mã thoát: 0 mọi cửa sổ đạt; 1 có cửa sổ không đạt; 3 không có không đạt nhưng có chưa kết luận
 hoặc u_t vượt yêu cầu công cụ; 2 lỗi đầu vào.
@@ -286,13 +286,23 @@ def main(argv=None) -> int:
     ap.add_argument('--delta-sync-us', type=float, required=True, help='bất định đồng bộ ESP32 → RPi5, µs')
     ap.add_argument('--count-sign', default='1,1,1,1',
                     help='dấu count ESP32 theo bánh (ENC_PI 2026-10-27_run06: count cùng dấu ω cả 4 bánh)')
+    ap.add_argument('--h7-calls', action='store_true',
+                    help='lấy các lần gọi _start_wheel/_stop từ luồng log H7 trong frames.npz '
+                         '(bản ghi 0x35/0x36, cần H7 có EncoderGen với móc sự kiện)')
     ap.add_argument('--out', required=True)
     a = ap.parse_args(argv)
     try:
         sched = ts.read_csv(a.schedule)
         t_send, w_d = load_frames(a.frames)
         tb, ta, c = load_esp32_reads(a.esp32_events, *a.clock_affine)
-        run = Run(t_send, w_d, tb, ta, c, count_sign=[int(x) for x in a.count_sign.split(',')],
+        calls = None
+        if a.h7_calls:
+            import s06_frames_decode as fd
+            z = np.load(a.frames)
+            calls = fd.decode(z['t_send_ns'], z['mosi'], z['miso'])['_calls']
+            if any(t is None for v in calls.values() for _, t, *_ in v):
+                raise ValueError('có lần gọi H7 không quy được ra giờ Pi (thiếu khớp đồng hồ)')
+        run = Run(t_send, w_d, tb, ta, c, calls=calls, count_sign=[int(x) for x in a.count_sign.split(',')],
                   delta_sync_us=a.delta_sync_us)
         rows = score_run(run, sched)
     except (OSError, ValueError, KeyError) as ex:
@@ -305,7 +315,8 @@ def main(argv=None) -> int:
     for (kind, w), g in sorted(summarize(rows).items()):
         print(f'{kind:22s} bánh {w}: đạt {g["pass"]}, không đạt {g["fail"]}, chưa kết luận {g["inconclusive"]}, '
               f'u_t vượt {g["u_t_bad"]}')
-    print('Số lần gọi _start_wheel/_stop chưa có trong luồng đo (việc (5)): cột n_calls_actual để trống.')
+    if calls is None:
+        print('Không dùng --h7-calls: cột n_calls_actual, start_cnt để trống, không so số lần gọi với lịch.')
     return exit_code(rows)
 
 

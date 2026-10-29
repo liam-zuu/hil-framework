@@ -27,8 +27,11 @@ Bốn phần:
      `esp32_events.txt`) theo khóa (epoch, loại, số thứ tự mở vòng trong epoch); độ lệch epoch
      ESP32 − H7 chọn theo số cặp khớp nhiều nhất và báo ra.
 
-Chưa có (ghi rõ): đồng hồ ESP32 → RPi5 (cần chân đánh dấu); số lần gọi `_start_wheel`/`_stop`
-(việc (5)). Chưa thử với frame thật của H7 (chỉ dữ liệu tổng hợp, tools/tests/test_s06_frames_decode.py).
+Thêm (việc (5)): bản ghi 0x35/0x36 (mỗi lần gọi `_start_wheel`/`_stop`: bánh, CNT, số lần gọi, CYCCNT)
+→ danh sách lần gọi theo bánh trên giờ Pi cho tools/t3b_score.py; số lần gọi hở = thiếu bản ghi (lần
+gọi mất sau lần gọi cuối cùng của một loại thì không thấy được).
+Giờ Pi của mọi sự kiện H7 quy theo giờ GỬI frame: trễ cố định gửi → callback SPI1 nằm trong phần bù a.
+Chưa có (ghi rõ): đồng hồ ESP32 → RPi5 (cần chân đánh dấu). Chưa thử với frame thật của H7 (chỉ dữ liệu tổng hợp, tools/tests/test_s06_frames_decode.py).
 
 Usage:
   python tools/s06_frames_decode.py <frames.npz> [--esp32-events esp32_events.txt] --out <thư mục>
@@ -54,6 +57,7 @@ MISO_CRC, MISO_MOSI_CRC, MISO_RX_CYC, MISO_STATUS, MISO_SEQ, MISO_RX_NF, MISO_AG
     8, 10, 12, 16, 17, 18, 20, 22
 REC_REPORT, REC_PKT_READ, REC_RESET_DONE, REC_HOLD_ON, REC_HOLD_OFF = 0x10, 0x20, 0x30, 0x31, 0x32
 REC_RST_LOW, REC_RST_HIGH, REC_TICK, REC_REARM = 0x33, 0x34, 0x40, 0x50
+REC_ENC_START, REC_ENC_STOP = 0x35, 0x36            # feat/s06-h7 598a451, with EncoderGen b005aa7
 REPORT_KIND = {0: 'accel', 1: 'gyro', 2: 'game_rv'}
 ESP32_KIND = {1: 'accel', 2: 'gyro', 8: 'game_rv'}               # SH-2 report ids
 SEGMENT_GAP_US = 500_000.0
@@ -213,6 +217,8 @@ def parse_record(rec):
         return dict(cyc=u32(p, 0), cyc_total=u32(p, 4) | u32(p, 8) << 32, dropped=u16(p, 12))
     if t == REC_REARM:
         return dict(cyc=u32(p, 0), n_rearms=u16(p, 4))
+    if t in (REC_ENC_START, REC_ENC_STOP):
+        return dict(wheel=p[0], cnt=u16(p, 1), n=u32(p, 3), cyc=u32(p, 7), nf16=u16(p, 11))
     return dict(unknown=True)
 
 
@@ -245,6 +251,21 @@ def h7_reports(recs, fmap, mosi, carrier_nf):
             row['imu_seq_ok'] = f['imu_seq'] == m[MOSI_IMU_SEQ]
         out.append(row)
     return out
+
+
+def enc_calls(recs):
+    """EncoderGen _start_wheel/_stop records -> {wheel: [('S'|'P', t_pi_us, CNT, n)]} for
+    tools/t3b_score.py, and the number of calls missing from the per-wheel running count n."""
+    calls, last, gaps = {w: [] for w in range(4)}, {}, 0
+    for rec in recs:
+        if rec['type'] not in (REC_ENC_START, REC_ENC_STOP):
+            continue
+        f, k = rec['f'], 'S' if rec['type'] == REC_ENC_START else 'P'
+        calls.setdefault(f['wheel'], []).append((k, rec.get('t_pi_us'), f['cnt'], f['n']))
+        prev = last.get((f['wheel'], k))
+        gaps += (f['n'] - prev - 1) if prev is not None else f['n'] - 1
+        last[(f['wheel'], k)] = f['n']
+    return calls, gaps
 
 
 def esp32_lines(path):
@@ -337,15 +358,19 @@ def decode(t_send_ns, mosi, miso, esp32_events: Optional[str] = None) -> dict:
                    if (b['f']['cyc_total'] - a['f']['cyc_total']) != (b['cyc_full'] - a['cyc_full']))
     lst['h7_dropped'] = ticks[-1]['f']['dropped'] if ticks else None
     reps = h7_reports(recs, fmap, mosi, carrier_nf)
+    calls, call_gaps = enc_calls(recs)
     res = dict(frames=st, log=lst, clock=dict(segments=segs, tick_total_mismatch=tick_bad),
                reports=dict(n=len(reps), imu_crc_bad=sum(1 for r in reps if r.get('imu_crc_ok') is False),
                             imu_seq_bad=sum(1 for r in reps if r.get('imu_seq_ok') is False),
                             no_source_frame=sum(1 for r in reps if r['src_frame'] is None),
-                            per_kind=dict(Counter(r['kind'] for r in reps))))
+                            per_kind=dict(Counter(r['kind'] for r in reps))),
+               enc_calls=dict(per_wheel={w: dict(Counter(c[0] for c in v)) for w, v in calls.items()},
+                              count_gaps=call_gaps))
     if esp32_events:
         J, I = esp32_lines(esp32_events)
         res['esp32_match'] = match_esp32(reps, J, I)
     res['_records'] = recs
+    res['_calls'] = calls
     res['_reports'] = reps
     return res
 
@@ -368,6 +393,8 @@ def problems(res) -> List[str]:
     if rp['imu_crc_bad'] or rp['imu_seq_bad'] or rp['no_source_frame']:
         p.append(f"report: CRC IMU sai {rp['imu_crc_bad']}, imu_seq sai {rp['imu_seq_bad']}, "
                  f"không có frame nguồn {rp['no_source_frame']}")
+    if res['enc_calls']['count_gaps']:
+        p.append(f"số lần gọi _start_wheel/_stop hở {res['enc_calls']['count_gaps']} (thiếu bản ghi)")
     m = res.get('esp32_match')
     if m and (m['not_at_esp32_spi'] or m['esp32_without_h7']):
         p.append(f"ghép ESP32: {m['not_at_esp32_spi']} report H7 không tới cổng SPI ESP32, "

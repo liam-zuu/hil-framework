@@ -39,6 +39,10 @@ def build(n=N, faults=()):
     seqs = [0, 0, 0]
     for k in range(n):
         queue = produced[k]
+        for kk, w, ev, cnt_n in ENC_EVENTS:
+            if k == kk and ('drop_enc', kk) not in faults:
+                queue.append((0x35 if ev == 'S' else 0x36, bytes([w]) + struct.pack(
+                    '<HIIH', (k * 7) & 0xFFFF, cnt_n, cyc[k] & 0xFFFFFFFF, (k + 1) & 0xFFFF)))
         if k == 5:
             queue.append((0x30, bytes([1]) + struct.pack('<IH', cyc[k] & 0xFFFFFFFF, (k + 1) & 0xFFFF)))
         if k > 20 and k % 10 == 0:
@@ -80,6 +84,11 @@ def build(n=N, faults=()):
     return t_send_ns, mosi, miso, seqs
 
 
+# (frame, wheel, start/stop, running count of that kind on that wheel)
+ENC_EVENTS = [(1000, 0, 'S', 1), (3000, 0, 'P', 1), (3000, 0, 'S', 2), (9000, 2, 'S', 1), (15000, 0, 'P', 2),
+              (18000, 0, 'S', 3)]
+
+
 def esp32_file(tmp_path, seqs, epoch_off=1, skip=()):
     lines, q = [], 0
     for s, kind in enumerate((1, 2, 8)):
@@ -117,6 +126,12 @@ def test_clean_run(clean, tmp_path):
     # report build time on the Pi clock: frame k sent at ~k ms, cyc stamped D_1W_US after
     r = next(x for x in res['_reports'] if x['kind'] == 'gyro' and x['n'] == 100)
     assert dec.problems(res) == []
+    calls = res['_calls']
+    assert [c[0] for c in calls[0]] == ['S', 'P', 'S', 'P', 'S'] and [c[0] for c in calls[2]] == ['S']
+    assert calls[0][1][2] == (3000 * 7) & 0xFFFF and calls[0][2][3] == 2
+    t9000 = calls[2][0][1]
+    # CYCCNT -> Pi clock is fitted to the send times, so the constant send -> callback delay is absorbed
+    assert abs(t9000 - t[9000] / 1e3) < 1
     assert r['t_pi_us'] is not None
 
 
@@ -129,6 +144,12 @@ def test_faults_reported(tmp_path):
     assert res['reports']['imu_crc_bad'] == 1
     assert res['esp32_match']['not_at_esp32_spi'] == 1
     assert len(dec.problems(res)) >= 4
+
+
+def test_missing_enc_record_reported():
+    t, mosi, miso, _ = build(faults={('drop_enc', 3000)})       # stop + start of wheel 0 lost
+    res = dec.decode(t, mosi, miso)
+    assert res['enc_calls']['count_gaps'] == 2           # a loss after the last call would not show
 
 
 def test_mosi_crc_mismatch():
@@ -145,7 +166,7 @@ def test_unwrap_and_near():
     assert dec.near((1 << 32) - 3, (1 << 32) + 2) == (1 << 32) - 3
 
 
-H7_REV = '3235ec5'           # feat/s06-h7: MISO v4 + S06 log
+H7_REV = '598a451'           # feat/s06-h7: MISO v4 + S06 log + EncoderGen call records
 
 
 def _h7_defines(path):
@@ -168,5 +189,5 @@ def test_constants_match_h7_headers():
     s = _h7_defines('stm32h7/Core/Inc/s06_log.h')
     assert (s['S06_REC_REPORT'], s['S06_REC_PKT_READ'], s['S06_REC_RESET_DONE'], s['S06_REC_HOLD_ON'],
             s['S06_REC_HOLD_OFF'], s['S06_REC_RST_LOW'], s['S06_REC_RST_HIGH'], s['S06_REC_TICK'],
-            s['S06_REC_REARM']) == (dec.REC_REPORT, dec.REC_PKT_READ, dec.REC_RESET_DONE, dec.REC_HOLD_ON,
-                                    dec.REC_HOLD_OFF, dec.REC_RST_LOW, dec.REC_RST_HIGH, dec.REC_TICK, dec.REC_REARM)
+            s['S06_REC_REARM'], s['S06_REC_ENC_START'], s['S06_REC_ENC_STOP']) ==         (dec.REC_REPORT, dec.REC_PKT_READ, dec.REC_RESET_DONE, dec.REC_HOLD_ON, dec.REC_HOLD_OFF, dec.REC_RST_LOW,
+         dec.REC_RST_HIGH, dec.REC_TICK, dec.REC_REARM, dec.REC_ENC_START, dec.REC_ENC_STOP)
