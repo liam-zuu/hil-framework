@@ -134,6 +134,24 @@ void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef *htim)
 {
     EncoderGen_OC_Callback(htim);
 }
+
+#ifdef ENCODER_GEN_HAS_EVENT_HOOK
+/* S06 T3b (Y5, V2-6): one log record per _start_wheel / _stop call: wheel u8,
+ * timer CNT at the call u16, calls of that kind on that wheel u32, CYCCNT u32,
+ * H7 frame count u16 (little-endian). The Pi compares the calls with the
+ * scheduled starts and stops and reports the start phases. Needs the
+ * EncoderGen with the event hook (feat/encgen-events); without it no record. */
+static void _s06_enc_event(uint8_t wheel, uint8_t ev, uint16_t cnt, uint32_t n)
+{
+    uint8_t p[13];
+    p[0] = wheel;
+    s06_put16(p + 1, cnt);
+    s06_put32(p + 3, n);
+    s06_put32(p + 7, DWT->CYCCNT);
+    s06_put16(p + 11, (uint16_t)SPI1_GetFrameCount());
+    S06Log_Push(ev == ENC_EV_START ? S06_REC_ENC_START : S06_REC_ENC_STOP, p, sizeof p);
+}
+#endif
 /* USER CODE END 0 */
 
 /**
@@ -202,6 +220,9 @@ int main(void)
   S06Log_Init();
 
   EncoderGen_Init(&htim1, &htim2, &htim3, &htim4);
+#ifdef ENCODER_GEN_HAS_EVENT_HOOK
+  EncoderGen_SetEventHook(_s06_enc_event);
+#endif
   SPI1_Handler_Init(&hspi1);
   UartRelay_Init(&huart2);     /* +++ NEW */
 

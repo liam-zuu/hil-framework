@@ -29,6 +29,8 @@
 #define S06_REC_HOLD_OFF    0x32u   /* IMU loss injection ends                            */
 #define S06_REC_RST_LOW     0x33u   /* RST pin (PG3) falling edge                         */
 #define S06_REC_RST_HIGH    0x34u   /* RST pin rising edge                                */
+#define S06_REC_ENC_START   0x35u   /* EncoderGen _start_wheel (T3b Y5, V2-6)            */
+#define S06_REC_ENC_STOP    0x36u   /* EncoderGen _stop                                   */
 #define S06_REC_TICK        0x40u   /* CYCCNT + 64-bit cycle total + drop count (L7-4)    */
 #define S06_REC_REARM       0x50u   /* SPI1 DMA restarted                                 */
 
