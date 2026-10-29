@@ -60,6 +60,13 @@ def test_profile_plant_plays_the_schedule(tmp_path):
     assert first == s[0].omegas
 
 
+def test_logger_command_covers_schedule():
+    s = t5.make_schedule(1)
+    assert len(s) == 17 and s[-1].t_end_ms == 1_190_000
+    assert t5.logger_duration_s(s) == 1250
+    assert '--profile heavy --duration 1250 ' in t5.logger_command(s)
+
+
 def test_gap_in_schedule_rejected():
     s = t5.make_schedule(1)
     s[2].t_start_ms += 1

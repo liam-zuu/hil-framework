@@ -14,11 +14,13 @@ speeds (+1, -2, +10, -20 rad/s, all scored points, mixed signs) and the W15 visi
 each pass. No randomness: the schedule is fixed, there is no seed.
 
     python t5_schedule.py --pass 1 --out T5_pass1.csv     # then run_hil.py --omega-steps @T5_pass1.csv
+It also prints the s06_logger.py command (profile heavy, duration = schedule + 60 s).
 """
 from __future__ import annotations
 
 import argparse
 import csv
+import math
 from dataclasses import dataclass, asdict, fields
 from typing import List, Sequence
 
@@ -27,6 +29,7 @@ INDICATOR = 0.29                                    # omega_d 0.29054 <= deadban
 W15_OMEGAS = (1.0, -2.0, 10.0, -20.0)               # FL, FR, RL, RR [ĐỀ XUẤT]
 WINDOW_S = 10.0
 VISIT_WINDOWS = 7                                   # first and last dropped -> 5 scored [ĐỀ XUẤT]
+LOGGER_MARGIN_S = 60                                # s06_load run outlasts the schedule [ĐỀ XUẤT]
 
 
 @dataclass
@@ -104,7 +107,19 @@ def main() -> int:
     sched = make_schedule(a.run_pass)
     write_csv(a.out, sched)
     print(f'{a.out}: pass {a.run_pass}, {len(sched)} visits, {sched[-1].t_end_ms / 1000:.0f} s')
+    print('ESP32 run (start before run_hil.py):')
+    print('  ' + logger_command(sched))
     return 0
+
+
+def logger_duration_s(sched: Sequence[Visit]) -> int:
+    """s06_load run length: the whole schedule + LOGGER_MARGIN_S, so the run outlasts run_hil.py."""
+    return int(math.ceil(sched[-1].t_end_ms / 1000.0 + LOGGER_MARGIN_S))
+
+
+def logger_command(sched: Sequence[Visit]) -> str:
+    return (f'python tools/s06_logger.py --esp32 <ESP32_IP> --profile heavy '
+            f'--duration {logger_duration_s(sched)} --out <run dir>')
 
 
 if __name__ == '__main__':

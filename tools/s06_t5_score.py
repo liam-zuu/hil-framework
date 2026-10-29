@@ -25,6 +25,18 @@ Cách chấm:
     Không có lần đọc trong 100 ms sau một đầu cửa sổ (ngoài dữ liệu, mất dòng E) → `missing`.
   * Điểm chỉ báo 0,29 rad/s: không chấm H5, chỉ ghi số count (kỳ vọng 0).
 
+Thêm theo Liam 30/10 ("tôi đồng ý 3 đề xuất của bạn"):
+  * Điều kiện thời gian của spec (lần 1 bắt đầu trong 2 phút sau khi bật, lần 2 sau ≥ 30 phút chạy):
+    esp_timer của ESP32 đếm từ lúc ESP32 khởi động, nên offset = thời gian ESP32 đã chạy lúc lịch bắt
+    đầu. Lần 1 cần ≤ 120 s, lần 2 cần ≥ 1 800 s; không đạt → `run_condition_ok: false`, mã 3. Chỉ đúng
+    khi ESP32 cấp nguồn cùng lúc với H7 và không bị reset giữa chừng (`--no-uptime-check` để bỏ).
+  * Lệch nhịp ESP32 so với RPi5 (cho câu thạch anh, E6): t_rx (giờ Pi nhận gói, monotonic) − t_after
+    của dòng E; lấy chặn dưới mỗi bin 10 s (gói đến nhanh nhất), khớp đường thẳng → ppm. Chỉ là sai số
+    thạch anh ESP32 khi đồng hồ Pi được NTP giữ đúng nhịp (kiểm trên Pi); không tự cộng vào u.
+  * Nhiệt độ: `temp_esp32_c` = trung bình trường temp_c của dòng S (cảm biến trong chip ESP32-S3) trong
+    cửa sổ; `temp_pi_c` = trung bình `pi_temp.txt` của s06_logger.py (`--pi-temp`, đổi sang đồng hồ
+    ESP32 bằng đường khớp trên). Không có số thì để trống. Nhiệt độ H7 chưa có (ADC3, để sau).
+
 Diễn giải của CODE (spec chưa ghi, cần THESIS xác nhận khi khóa):
   (1) f_lệnh theo ω_d (ω đã lượng tử trong frame), không theo ω danh định; cột omega_cmd giữ ω danh định;
   (2) cửa sổ neo vào đầu lần ghé theo offset căn, chứ không neo vào lưới cố định của cả lượt;
@@ -34,9 +46,10 @@ Diễn giải của CODE (spec chưa ghi, cần THESIS xác nhận khi khóa):
 
 Usage:
   python tools/s06_t5_score.py --schedule T5_pass1.csv --esp32-events esp32_events.txt --out <thư mục>
-         [--offset-us <µs>] [--count-sign 1,1,1,1] [--xtal-ppm <ppm>]
-Mã thoát: 0 mọi cửa sổ chấm đạt; 1 có cửa sổ không đạt; 3 không có không đạt nhưng có chưa kết luận
-hoặc thiếu; 2 lỗi đầu vào.
+         [--offset-us <µs>] [--count-sign 1,1,1,1] [--xtal-ppm <ppm>] [--pi-temp pi_temp.txt]
+         [--no-uptime-check]
+Mã thoát: 0 mọi cửa sổ chấm đạt; 1 có cửa sổ không đạt; 3 không có không đạt nhưng có chưa kết luận,
+thiếu, hoặc lượt không đúng điều kiện thời gian; 2 lỗi đầu vào.
 """
 from __future__ import annotations
 
@@ -60,10 +73,13 @@ WINDOW_US = t5.WINDOW_S * 1e6
 ALIGN_BIN_US = 100_000.0
 MAX_READ_GAP_US = 100_000.0   # đầu cửa sổ phải có lần đọc trong 100 ms sau nó [ĐỀ XUẤT], không thì `missing`
 WHEELS = ('FL', 'FR', 'RL', 'RR')
+UPTIME_PASS1_MAX_US = 120e6   # spec: lần 1 bắt đầu trong 2 phút sau khi bật
+UPTIME_PASS2_MIN_US = 1800e6  # spec: lần 2 sau ≥ 30 phút chạy
+CLOCK_BIN_US = 10e6           # bin chặn dưới t_rx − t_esp
 
 COLUMNS = ['idx', 'run_pass', 'visit', 'kind', 'wheel', 'omega_cmd', 'omega_d', 'window',
            't_window_start_us', 't_window_end_us', 'counts', 'f_meas_hz', 'f_cmd_hz', 'err_rel',
-           'u_count', 'u_read', 'u_xtal', 'uncertainty', 'verdict']
+           'u_count', 'u_read', 'u_xtal', 'uncertainty', 'verdict', 'temp_esp32_c', 'temp_pi_c']
 
 
 def omega_eff(w: float) -> float:
@@ -125,7 +141,52 @@ def align_offset(reads: Reads, sched: Sequence[t5.Visit], bin_us: float = ALIGN_
     return t0 + lag * bin_us, (float(corr[k]) / norm if norm > 0 else 0.0)
 
 
-def score_visit(reads: Reads, v: t5.Visit, offset_us: float, xtal_ppm: Optional[float]) -> List[dict]:
+def clock_fit(t_rx_us, t_esp_us, bin_us: float = CLOCK_BIN_US) -> Optional[dict]:
+    """t_rx ≈ a + (1 + b)·t_esp trên chặn dưới mỗi bin (gói đến nhanh nhất); None khi < 3 bin."""
+    t_rx = np.asarray(t_rx_us, dtype=float)
+    t_esp = np.asarray(t_esp_us, dtype=float)
+    if len(t_esp) < 3:
+        return None
+    d = t_rx - t_esp
+    k = np.floor((t_esp - t_esp.min()) / bin_us).astype(np.int64)
+    xs, ys = [], []
+    for b in np.unique(k):
+        i = np.flatnonzero(k == b)
+        j = i[np.argmin(d[i])]
+        xs.append(t_esp[j])
+        ys.append(d[j])
+    if len(xs) < 3:
+        return None
+    xs, ys = np.array(xs), np.array(ys)
+    b, a = np.polyfit(xs - xs[0], ys, 1)
+    a -= b * xs[0]
+    resid = ys - (a + b * xs)
+    return dict(a_us=float(a), b=float(b), ppm=float(b * 1e6), n_bins=len(xs),
+                resid_max_us=float(np.max(np.abs(resid))), span_s=float((xs[-1] - xs[0]) / 1e6))
+
+
+def pi_to_esp(fit: dict, t_pi_us):
+    return (np.asarray(t_pi_us, dtype=float) - fit['a_us']) / (1.0 + fit['b'])
+
+
+def uptime_condition(run_pass: int, offset_us: float) -> bool:
+    return bool(offset_us <= UPTIME_PASS1_MAX_US if run_pass == 1 else offset_us >= UPTIME_PASS2_MIN_US)
+
+
+def window_mean(series, a: float, b: float):
+    """Trung bình giá trị (bỏ nan) có thời điểm trong [a; b); '' khi không có."""
+    if series is None:
+        return ''
+    t, v = series
+    i, j = np.searchsorted(t, a, side='left'), np.searchsorted(t, b, side='left')
+    x = v[i:j]
+    x = x[~np.isnan(x)]
+    return float(np.mean(x)) if len(x) else ''
+
+
+def score_visit(reads: Reads, v: t5.Visit, offset_us: float, xtal_ppm: Optional[float],
+                temps: Optional[dict] = None) -> List[dict]:
+    temps = temps or {}
     rows = []
     n_win = int(round((v.t_end_ms - v.t_start_ms) * 1000.0 / WINDOW_US))
     for k in range(1, n_win - 1):              # bỏ cửa sổ đầu và cuối
@@ -137,7 +198,8 @@ def score_visit(reads: Reads, v: t5.Visit, offset_us: float, xtal_ppm: Optional[
                      omega_cmd=v.omegas[w], omega_d=ts.quantize(v.omegas[w]), window=k,
                      t_window_start_us='', t_window_end_us='', counts='', f_meas_hz='',
                      f_cmd_hz=K * we, err_rel='', u_count='', u_read='', u_xtal='', uncertainty='',
-                     verdict='missing')
+                     verdict='missing', temp_esp32_c=window_mean(temps.get('esp32'), s, s + WINDOW_US),
+                     temp_pi_c=window_mean(temps.get('pi'), s, s + WINDOW_US))
             if ia is None or ib is None:
                 rows.append(r)
                 continue
@@ -167,10 +229,10 @@ def score_visit(reads: Reads, v: t5.Visit, offset_us: float, xtal_ppm: Optional[
 
 
 def score_run(reads: Reads, sched: Sequence[t5.Visit], offset_us: float,
-              xtal_ppm: Optional[float] = None) -> List[dict]:
+              xtal_ppm: Optional[float] = None, temps: Optional[dict] = None) -> List[dict]:
     rows = []
     for v in sched:
-        rows += score_visit(reads, v, offset_us, xtal_ppm)
+        rows += score_visit(reads, v, offset_us, xtal_ppm, temps)
     for i, r in enumerate(rows):
         r['idx'] = i
     return rows
@@ -224,25 +286,45 @@ def write_csv(path: str, rows: Sequence[dict], cols: Sequence[str]) -> None:
             w.writerow({c: r[c] for c in cols})
 
 
-def load_esp32_reads(path: str, count_sign=(1, 1, 1, 1)) -> Reads:
-    eseq, tb, ta, c = [], [], [], []
+def load_esp32_events(path: str, count_sign=(1, 1, 1, 1)):
+    """(Reads, (t_rx, t_after) của dòng E, (t_us, temp_c) của dòng S 16 trường hoặc None)."""
+    eseq, tb, ta, c, rx = [], [], [], [], []
+    st, sv = [], []
     with open(path, encoding='utf-8', errors='replace') as f:
         for raw in f:
-            _, sep, line = raw.rstrip('\n').partition('\t')
-            if not sep or not line.startswith('E,'):
+            t_rx, sep, line = raw.rstrip('\n').partition('\t')
+            if not sep:
                 continue
             p = line.split(',')
-            if len(p) != 8:
-                continue
-            eseq.append(int(p[1]))
-            tb.append(int(p[2]))
-            ta.append(int(p[3]))
-            c.append([int(x) for x in p[4:8]])
+            if p[0] == 'E' and len(p) == 8:
+                eseq.append(int(p[1]))
+                tb.append(int(p[2]))
+                ta.append(int(p[3]))
+                c.append([int(x) for x in p[4:8]])
+                rx.append(int(t_rx))
+            elif p[0] == 'S' and len(p) == 16:
+                st.append(int(p[2]))
+                sv.append(float(p[15]))
     if not tb:
         raise ValueError(f'{path}: không có dòng E')
     order = np.argsort(tb, kind='stable')
-    return Reads(np.array(tb)[order], np.array(ta)[order], np.array(c)[order], count_sign,
-                 np.array(eseq)[order])
+    reads = Reads(np.array(tb)[order], np.array(ta)[order], np.array(c)[order], count_sign,
+                  np.array(eseq)[order])
+    so = np.argsort(st, kind='stable')
+    s_temp = (np.array(st, dtype=float)[so], np.array(sv)[so]) if st else None
+    return reads, (np.array(rx, dtype=float), np.array(ta, dtype=float)), s_temp
+
+
+def load_pi_temp(path: str):
+    """pi_temp.txt của s06_logger.py: `<t_us>\\t<m°C>` → (t_pi_us, °C)."""
+    t, v = [], []
+    with open(path, encoding='utf-8') as f:
+        for raw in f:
+            a, sep, b = raw.strip().partition('\t')
+            if sep:
+                t.append(float(a))
+                v.append(int(b) / 1000.0)
+    return np.array(t), np.array(v)
 
 
 def main(argv=None) -> int:
@@ -255,30 +337,52 @@ def main(argv=None) -> int:
                     help='dấu count ESP32 theo bánh (ENC_PI 2026-10-27_run06: count cùng dấu ω cả 4 bánh)')
     ap.add_argument('--xtal-ppm', type=float, default=None,
                     help='sai số thạch anh ESP32, ppm (chưa có nguồn, E6); bỏ trống = không cộng')
+    ap.add_argument('--pi-temp', default=None, help='pi_temp.txt của s06_logger.py (nhiệt độ CPU RPi5)')
+    ap.add_argument('--no-uptime-check', action='store_true',
+                    help='bỏ kiểm thời gian từ lúc bật (ESP32 không cấp nguồn cùng H7, hoặc bị reset)')
     ap.add_argument('--out', required=True)
     a = ap.parse_args(argv)
     try:
         sched = t5.read_csv(a.schedule)
         t5.segments(sched)                      # kiểm lịch liền nhau
-        reads = load_esp32_reads(a.esp32_events, [int(x) for x in a.count_sign.split(',')])
+        reads, rx, s_temp = load_esp32_events(a.esp32_events, [int(x) for x in a.count_sign.split(',')])
         if a.offset_us is None:
             offset, corr = align_offset(reads, sched)
         else:
             offset, corr = a.offset_us, None
+        fit = clock_fit(*rx)
+        temps = {'esp32': s_temp}
+        if a.pi_temp:
+            if fit is None:
+                raise ValueError('không đổi được giờ pi_temp sang đồng hồ ESP32 (thiếu dữ liệu khớp đồng hồ)')
+            tp, vp = load_pi_temp(a.pi_temp)
+            temps['pi'] = (pi_to_esp(fit, tp), vp) if len(tp) else None
     except (OSError, ValueError, KeyError) as exc:
         print(f'lỗi đầu vào: {exc}', file=sys.stderr)
         return 2
-    rows = score_run(reads, sched, offset, a.xtal_ppm)
+    rows = score_run(reads, sched, offset, a.xtal_ppm, temps)
     pts = points(rows)
     os.makedirs(a.out, exist_ok=True)
     write_csv(os.path.join(a.out, 'T5.csv'), rows, COLUMNS)
     write_csv(os.path.join(a.out, 'T5_points.csv'), pts, list(pts[0]) if pts else ['visit'])
     summ = summarize(rows)
-    summ.update(run_pass=sched[0].run_pass, offset_us=offset, offset_source='manual' if corr is None else 'xcorr',
+    run_pass = sched[0].run_pass
+    cond = None if a.no_uptime_check else uptime_condition(run_pass, offset)
+    code = exit_code(rows)
+    if code == 0 and cond is False:
+        code = 3
+    offset = float(offset)
+    summ.update(run_pass=run_pass, offset_us=offset, offset_source='manual' if corr is None else 'xcorr',
                 align_corr=corr, n_reads=len(reads.tb), eseq_gaps=reads.eseq_gaps(),
+                esp32_uptime_at_start_s=offset / 1e6, run_condition_ok=cond,
+                run_condition_rule='lần 1: ≤ 120 s; lần 2: ≥ 1800 s (uptime ESP32 lúc lịch bắt đầu)',
+                clock_vs_pi=fit,
+                clock_note='ppm = nhịp đồng hồ Pi (monotonic) so với ESP32; chỉ là sai số thạch anh ESP32 '
+                           'khi Pi được NTP giữ nhịp; không cộng vào bất định',
+                temp_esp32=s_temp is not None, temp_pi=temps.get('pi') is not None,
                 xtal_ppm=a.xtal_ppm, xtal_note=None if a.xtal_ppm is not None else
                 'sai số thạch anh ESP32 chưa có nguồn (E6), không cộng vào bất định',
-                count_sign=a.count_sign, exit_code=exit_code(rows))
+                count_sign=a.count_sign, exit_code=code)
     with open(os.path.join(a.out, 'T5_summary.json'), 'w', encoding='utf-8') as f:
         json.dump(summ, f, ensure_ascii=False, indent=2)
     print(json.dumps(summ))
