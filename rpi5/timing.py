@@ -258,11 +258,12 @@ def _save_sched() -> dict:
                 affinity=_try(lambda: os.sched_getaffinity(0)))
 
 
-def _restore_sched(saved: dict, applied: dict) -> list:
-    """Put back each part that was changed, on its own (a failed scheduler restore does not
-    skip the affinity one), and read it back. Returns the errors, empty if all went back."""
+def _restore_sched(saved: dict, tried: dict) -> list:
+    """Put back each part whose change was tried (also when the helper raised after changing
+    it, round 4 V8), on its own (a failed scheduler restore does not skip the affinity one),
+    and read it back. Returns the errors, empty if all went back."""
     errors = []
-    if applied.get('scheduler'):
+    if tried.get('scheduler'):
         policy, prio = saved['scheduler']
         try:
             os.sched_setscheduler(0, policy, os.sched_param(prio))
@@ -271,7 +272,7 @@ def _restore_sched(saved: dict, applied: dict) -> list:
                 errors.append(f'scheduler: {back} after restore, expected {(policy, prio)}')
         except (AttributeError, OSError) as exc:
             errors.append(f'scheduler: {exc}')
-    if applied.get('affinity'):
+    if tried.get('affinity'):
         try:
             os.sched_setaffinity(0, saved['affinity'])
             back = os.sched_getaffinity(0)
@@ -311,18 +312,22 @@ def measure_jitter(
     With rt=True the calling thread's scheduler and CPU affinity are changed for the
     measurement only (B0 review B41: a pytest run on the Pi must not leave the test process
     on SCHED_FIFO pinned to core 0). A part whose old value cannot be read is not changed;
-    each part is restored on its own, also when the measurement raises (round 3 N17).
+    each part whose change was tried is restored on its own, also when the measurement or
+    the setup helper raises (round 3 N17, round 4 V8).
     """
     saved = _save_sched() if rt else None
-    applied = {'scheduler': False, 'affinity': False}
+    applied = {'scheduler': False, 'affinity': False}     # what the helpers report as done
+    tried = {'scheduler': False, 'affinity': False}       # restored even if a helper raised (V8)
     errors = []
     try:
         if rt:
             if saved['scheduler'] is not None:
+                tried['scheduler'] = True
                 applied['scheduler'] = bool(set_realtime(priority=90))
             else:
                 print("[timing] scheduler not readable: SCHED_FIFO not set", flush=True)
             if saved['affinity'] is not None:
+                tried['affinity'] = True
                 applied['affinity'] = bool(pin_cpu(core=0))
             else:
                 print("[timing] affinity not readable: CPU pin not set", flush=True)
@@ -336,7 +341,7 @@ def measure_jitter(
             timer.wait_next_tick()
     finally:
         if saved is not None:
-            errors = _restore_sched(saved, applied)
+            errors = _restore_sched(saved, tried)
 
     timer.print_jitter_report()
     s = timer.jitter_stats

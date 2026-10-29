@@ -213,6 +213,27 @@ class TestMeasureJitter:
         assert seen == {'policy': 0, 'aff': {0}}                 # only the affinity changed
         assert r['rt'] == {'scheduler': False, 'affinity': True} and state['aff'] == ORIGINAL['aff']
 
+    @pytest.mark.parametrize('which', ['scheduler', 'affinity'])
+    def test_helper_that_changes_then_raises_is_still_restored_codex_v8(self, monkeypatch, which):
+        """Codex V8: set_realtime() set SCHED_FIFO and then its print raised (broken stdout):
+        the flag was never set, so nothing was put back."""
+        state = _fake_sched(monkeypatch)
+
+        def rt_then_raise(priority):
+            state.update(policy=1, prio=priority)
+            raise BrokenPipeError('stdout gone')
+
+        def pin_then_raise(core):
+            state.update(aff={core})
+            raise BrokenPipeError('stdout gone')
+        if which == 'scheduler':
+            monkeypatch.setattr(timing, 'set_realtime', rt_then_raise)
+        else:
+            monkeypatch.setattr(timing, 'pin_cpu', pin_then_raise)
+        with pytest.raises(BrokenPipeError):
+            measure_jitter(n_ticks=2, period_us=10_000, rt=True)
+        assert state == ORIGINAL
+
     def test_exception_while_measuring_still_restores(self, monkeypatch):
         state = _fake_sched(monkeypatch)
 
