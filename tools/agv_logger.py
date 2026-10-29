@@ -23,7 +23,8 @@ never overwrites a file, its own or another run's (B0 review round 3 B49/N10):
     <out>.summary.json   "open" placeholder at start, replaced atomically (through
                          <out>.summary.json.tmp) at the end: run_id, stop reason, receive and
                          close errors, counters per segment, and the size and SHA-256 of the
-                         CSV, segment, events and raw files ('files'), which s02_metrics checks
+                         CSV, segment, events and raw files ('files'); s02_metrics checks the
+                         CSV and segment entries (the events and raw ones are for the run record)
     --ready-file         JSON {state: LOGGER_OPEN, pid, out, run_id}, published once every
                          output is open: written to <ready>.tmp, then hard-linked to <ready>
                          (never replaces an existing file); removed at exit only if it is still
@@ -45,10 +46,12 @@ error, not a proof:
     between lines of one boot only by their delay (network, the DUT queue of 32 lines while
     WiFi stalls, the logger reading late) and clock drift. A segment keeps the lowest and
     highest offset; a line joins only if all offsets stay within WINDOW_US of each other. A
-    restart moves the offset by about the old boot's uptime, so a restart after less than
-    WINDOW_US of uptime is NOT seen (two boots merge: B43/N1), and a delay longer than
-    WINDOW_US splits one boot. Offline (no receive time): sample time within LATE_MAX_US of
-    the newest sample of the segment.
+    restart moves the offset by about the old boot's uptime, so after a short uptime (below
+    about WINDOW_US) two boots CAN merge into one segment if their seq/time also fit
+    (B43/N1); a change of delay larger than WINDOW_US splits one boot. The DUT-queue trace
+    of N3 stays one segment; longer backlogs are only covered while they stay inside the
+    window. Offline (no receive time): sample time within LATE_MAX_US of the newest sample
+    of the segment.
   * Rate: a line further from its neighbours in time than MAX_US_PER_SEQ per seq (+ slack)
     stays in its segment and is counted as a timing violation (N3: the firmware does not
     guarantee that rate; a stalled control task is not a restart).
@@ -57,7 +60,8 @@ joins the nearest by seq and marks all of them ambiguous. The same (seq, time) t
 duplicate (same text) or a conflict (other text) only if the receive clock fits; otherwise it
 may be a repeat or a new boot printing the same line: ambiguous (N2).
 'consistent' in the summary means: no ambiguous, conflicting or footer-conflicting line, no
-header inside the segment and no footer that may belong to it but could not be assigned. It
+DUT header received while the segment already had data (also when only duplicates follow
+it, V7) and no footer that may belong to it but could not be assigned. It
 does not mean one boot ('boot_verified' is always false here): the run owner ties data to a
 reset with separate evidence (workflow 9.1, B38).
 """
@@ -477,6 +481,16 @@ class LoggerCore:
         self._header_since_data = self.header
         return ('header', None)
 
+    def _header_before_known_line(self, g):
+        """A DUT header arrived since the last data line and is followed by a line g already
+        holds (duplicate / conflict): g had data before the header, so the header is inside
+        it (V7: it was dropped when only duplicates followed)."""
+        if self._header_since_data is not None:
+            g.header_mid += 1
+            self._event(f'header_mid_segment,segment={g.index}')
+            g.header = self._header_since_data
+            self._header_since_data = None
+
     def _new_segment(self):
         g = _Segment(len(self.segments))
         self.segments.append(g)
@@ -497,6 +511,7 @@ class LoggerCore:
         same = [g for g in self.segments if g.ts.get(seq) == ts]
         for g in same:                           # same seq and time: the same line twice?
             if g.clock_ok(ts, t_rx):
+                self._header_before_known_line(g)
                 if g.key[seq] == key:
                     g.dup += 1
                     self._event(f'dup_seq,seq={seq},segment={g.index}')
@@ -685,8 +700,11 @@ def main(argv=None):
 
     # Piped stdout on Windows is cp1252 and cannot print Vietnamese (hil_session reads it)
     for stream in (sys.stdout, sys.stderr):
-        if not stream.isatty() and hasattr(stream, "reconfigure"):
-            stream.reconfigure(encoding="utf-8", errors="replace")
+        try:                                   # a closed or missing stream must not stop the logger (V11)
+            if not stream.isatty() and hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError, AttributeError):
+            pass
 
     # Tên file tự động nếu không chỉ định
     if args.out is None:
@@ -728,8 +746,8 @@ def main(argv=None):
     close_errors = []
     recv_error = None
     stop_reason = None
-    summary_made = ready_tmp_made = False
-    ready_id = None
+    summary_made = ready_tmp_made = ready_linked = False
+    ready_id = None                            # (dev, inode) of the ready file this logger wrote
     stop = {"flag": False}
 
     def _on_signal(signum, _frame):
@@ -767,8 +785,10 @@ def main(argv=None):
                                t_utc=datetime.datetime.now(datetime.timezone.utc).isoformat()), f)
                 f.flush()
                 os.fsync(f.fileno())
+                st = os.fstat(f.fileno())
+                ready_id = (st.st_dev, st.st_ino)       # known before publishing (V12)
             os.link(paths["ready_tmp"], paths["ready"])    # fails if the name exists (B49/N10)
-            ready_id = _file_id(paths["ready"])
+            ready_linked = True
             os.remove(paths["ready_tmp"])
             ready_tmp_made = False
         _say("LOGGER_OPEN", flush=True)
@@ -840,10 +860,10 @@ def main(argv=None):
             close_errors.append(f"socket: {exc}")
         if ready_id is not None:               # only the file this logger published
             try:
-                if _file_id(paths["ready"]) == ready_id:
+                if os.path.lexists(paths["ready"]) and _file_id(paths["ready"]) == ready_id:
                     os.remove(paths["ready"])
-                else:
-                    close_errors.append("ready: replaced by another file, left in place")
+                elif ready_linked:
+                    close_errors.append("ready: replaced or removed by another process")
             except OSError as exc:
                 close_errors.append(f"ready: {exc}")
         if ready_tmp_made:

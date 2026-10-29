@@ -18,9 +18,11 @@ order and timestamp_us must be finite and never go back.
 A DUT log next to the logger's <log>.segments.csv must also have <log>.summary.json
 (status closed) whose 'files' manifest matches the CSV and the segment file byte for
 byte; its segment must be 'consistent' in the summary, and only the '#run_end' groups
-the logger assigned to that segment count (B47-B50, N5, N7, N8). A DUT log without a
-segment file is checked from its rows and the '#run_end' lines of <log>.events.txt
-(same parser as the logger); a footer whose slots hold data lines is refused.
+the logger assigned to that segment count (B47-B50, N5, N7, N8). A log with the
+logger's summary but no segment file is refused (V6). A DUT log without any logger
+file is checked from its rows and the '#run_end' lines of <log>.events.txt (same
+parser as the logger); a footer whose slots hold data lines, or two footers with the
+same seq and other counters (V10), are refused.
 
 Per run (window: 1 s after the first non-zero setpoint to the last non-zero
 setpoint, i.e. initial transient and final stop excluded):
@@ -139,6 +141,10 @@ def dut_rows(body, path):
     seg_path = path + '.segments.csv'
     if os.path.isfile(seg_path):
         body, ends = _logger_rows(body, path, seg_path)
+    elif os.path.isfile(path + '.summary.json'):
+        # written by the logger but its segment file is missing: never fall back to the
+        # weaker plain-CSV checks (V6)
+        raise ValueError(f'{path}.summary.json exists but {seg_path} is missing: incomplete logger output')
     else:
         seen = set()
         uniq = []
@@ -241,8 +247,9 @@ def _old_format(body, t):
 
 def read_run_end(events_path):
     """last_data_seq of every '#run_end' line of the events file that agv_logger.parse_run_end
-    accepts (B50/N5: the same parser as the logger; empty if none)."""
-    out = set()
+    accepts (B50/N5: the same parser as the logger; empty if none). Two footers with the same
+    (seq, last_data_seq) but other counters are refused, as the logger flags them (V10)."""
+    seen = {}
     if os.path.isfile(events_path):
         with open(events_path, encoding='utf-8', errors='ignore') as f:
             for line in f:
@@ -250,9 +257,14 @@ def read_run_end(events_path):
                 if i < 0:
                     continue
                 kv = parse_run_end(line[i:].strip())
-                if kv is not None:
-                    out.add(kv['last_data_seq'])
-    return sorted(out)
+                if kv is None:
+                    continue
+                key = (kv['seq'], kv['last_data_seq'])
+                val = (kv['log_qdrop'], kv['log_send_err'])
+                if seen.setdefault(key, val) != val:
+                    raise ValueError(f'{events_path}: #run_end seq={key[0]} last_data_seq={key[1]} '
+                                     'with two different counter values; not usable as is')
+    return sorted({L for _, L in seen})
 
 
 def log_loss(log):

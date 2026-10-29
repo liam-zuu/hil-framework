@@ -307,6 +307,17 @@ def test_header_inside_a_segment_makes_it_not_consistent_codex_b43():
     assert g['header_mid_segment'] == 1 and g['consistent'] is False
 
 
+def test_header_followed_only_by_duplicates_codex_v7():
+    """Codex V7: data 1..10, a DUT header, then the same lines 1..10 again inside the clock
+    window. The duplicate branch returned before the header was noted: consistent stayed True."""
+    core = al.LoggerCore(strict=True)
+    feed_rx(core, [(dut_line(s), 6 * S + s * 10_000) for s in range(1, 11)])
+    core.feed(DUT_HEADER, '10.0.0.2', t_rx_us=6_200_000)
+    feed_rx(core, [(dut_line(s), 6_300_000 + s * 10_000) for s in range(1, 11)])
+    g = seg(core, 0)
+    assert g['duplicates'] == 10 and g['header_mid_segment'] == 1 and g['consistent'] is False
+
+
 def test_queue_flush_then_live_line_stays_one_segment_codex_n3():
     """Codex N3 (B44): seq 1..32 (5.01..5.32 s) received together from 6.000 s, 1 ms apart, then
     live seq 101 (6.01 s) at 6.04 s. The offset drops by 0.96 s: inside the window, one boot."""
@@ -559,6 +570,17 @@ def test_metrics_refuse_footer_slots_holding_data_codex_n5(tmp_path):
         s02_metrics.load_log(str(p))
 
 
+def test_metrics_refuse_two_footers_with_other_counters_codex_v10(tmp_path):
+    """Codex V10: without the logger's files, two footers (seq 11, L 10) with qdrop 0 and 5
+    were reduced to L = 10 and the log scored 0 % loss; the logger flags the same as a conflict."""
+    p = tmp_path / 'r.csv'
+    _write_csv(p, [dut_line(s) for s in range(1, 11)])
+    (tmp_path / 'r.csv.events.txt').write_text(f'x {run_end(10, 0, qdrop=0)}\nx {run_end(10, 0, qdrop=5)}\n',
+                                               encoding='utf-8')
+    with pytest.raises(ValueError, match='different counter'):
+        s02_metrics.load_log(str(p))
+
+
 @pytest.mark.parametrize('over,why', [({'log_seq': ''}, 'mixe'), ({'motor_on': ''}, 'mixe'),
                                       ({'motor_on': 2}, 'motor_on'), ({'motor_on': 'nan'}, 'motor_on'),
                                       ({'motor_on': 'inf'}, 'motor_on'), ({'log_seq': -1}, 'unsigned'),
@@ -618,13 +640,35 @@ def test_metrics_compute_on_a_clean_log(tmp_path):
     assert m['pwm_tv'] > 0 and m['sat_pct'] == 0
 
 
-@pytest.mark.parametrize('at', [{200: dict(dpwm_fl=5)}, {200: dict(tick=0)}, {200: dict(sat_rr=1000)}])
+@pytest.mark.parametrize('at', [{200: dict(dpwm_fl=5)}, {200: dict(tick=0)}])
 def test_metrics_refuse_counters_going_back_codex_n9(tmp_path, at):
-    """Codex N9: a counter going back (or more saturated ticks than ticks) inside the window
-    gave negative or meaningless PWM metrics."""
+    """Codex N9: a counter going back inside the window gave negative PWM metrics."""
     p = tmp_path / 'r.csv'
     _write_csv(p, _moving_log(at=at))
-    with pytest.raises(ValueError, match='counter|ticks'):
+    with pytest.raises(ValueError, match='going back'):
+        s02_metrics.compute(s02_metrics.load_log(str(p)), 'A-L2')
+
+
+def test_metrics_refuse_nonfinite_counter_codex_n9(tmp_path):
+    p = tmp_path / 'r.csv'
+    _write_csv(p, _moving_log(at={200: dict(dpwm_fl='nan')}))
+    with pytest.raises(ValueError, match='not finite'):
+        s02_metrics.compute(s02_metrics.load_log(str(p)), 'A-L2')
+
+
+def test_metrics_refuse_tick_not_advancing_codex_n9(tmp_path):
+    """Codex round 4 (N9 test gap): tick constant over the whole window."""
+    p = tmp_path / 'r.csv'
+    _write_csv(p, _moving_log(at={s: dict(tick=7) for s in range(400)}))
+    with pytest.raises(ValueError, match='does not advance'):
+        s02_metrics.compute(s02_metrics.load_log(str(p)), 'A-L2')
+
+
+def test_metrics_refuse_more_saturated_ticks_than_ticks_codex_n9(tmp_path):
+    """Codex round 4: the sat > dticks branch on its own (counters growing, never back)."""
+    p = tmp_path / 'r.csv'
+    _write_csv(p, _moving_log(at={s: dict(sat_rr=2 * s) for s in range(400)}))
+    with pytest.raises(ValueError, match='saturated ticks exceed'):
         s02_metrics.compute(s02_metrics.load_log(str(p)), 'A-L2')
 
 
@@ -711,6 +755,18 @@ def test_metrics_refuse_a_run_not_closed_cleanly(tmp_path, status):
     p = tmp_path / 'r.csv'
     _logger_run(p, [dut_line(s) for s in range(5)], status=status)
     with pytest.raises(ValueError, match='status'):
+        s02_metrics.load_log(str(p))
+
+
+@pytest.mark.parametrize('status,consistent', [('closed', False), ('failed', True), ('open', True)])
+def test_metrics_refuse_logger_output_without_its_segment_file_codex_v6(tmp_path, status, consistent):
+    """Codex V6: the logger's summary is there (segment not consistent, or run not closed) but
+    .segments.csv is missing: the plain-CSV branch used to compute metrics anyway."""
+    p = tmp_path / 'r.csv'
+    _logger_run(p, _moving_log(), status=status,
+                edit_summary=lambda s: s['segments'][0].update(consistent=consistent))
+    os.remove(str(p) + '.segments.csv')
+    with pytest.raises(ValueError, match='segments.csv is missing'):
         s02_metrics.load_log(str(p))
 
 
@@ -892,6 +948,37 @@ def test_broken_stdout_does_not_change_the_exit_code_codex_n11(tmp_path, monkeyp
     assert code == 0
     summ = json.loads((tmp_path / 'run.csv.summary.json').read_text(encoding='utf-8'))
     assert summ['status'] == 'closed'
+
+
+def test_closed_stdout_does_not_change_the_exit_code_codex_v11(tmp_path, monkeypatch):
+    """Codex V11: a closed stdout raised ValueError at isatty(), before any output was opened."""
+    import io
+    closed = io.StringIO()
+    closed.close()
+    monkeypatch.setattr(al.signal, 'signal', lambda *a: None)
+    monkeypatch.setattr(sys, 'stdout', closed)
+    code = al.main(['--bind', '127.0.0.1', '--port', str(_free_port()), '--out', str(tmp_path / 'run.csv'),
+                    '--duration', '0.2'])
+    assert code == 0
+    assert json.loads((tmp_path / 'run.csv.summary.json').read_text(encoding='utf-8'))['status'] == 'closed'
+
+
+def test_failure_right_after_publishing_ready_removes_it_codex_v12(tmp_path, monkeypatch):
+    """Codex V12: the hard link succeeded, then the next step failed: the ready file of a
+    logger that is no longer running must not stay behind."""
+    ready = tmp_path / 'ready.json'
+    real_link = os.link
+
+    def link_then_fail(src, dst):
+        real_link(src, dst)
+        raise OSError('failed right after link')
+
+    monkeypatch.setattr(al.os, 'link', link_then_fail)
+    monkeypatch.setattr(al.signal, 'signal', lambda *a: None)
+    code = al.main(['--bind', '127.0.0.1', '--port', str(_free_port()), '--out', str(tmp_path / 'run.csv'),
+                    '--ready-file', str(ready), '--duration', '0.2'])
+    assert code == 2
+    assert not ready.exists() and not (tmp_path / 'ready.json.tmp').exists()
 
 
 def test_failed_summary_write_leaves_no_tmp_codex_n11(tmp_path):
