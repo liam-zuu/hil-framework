@@ -28,14 +28,14 @@ COUNT_TOL = 6                              # counts, as the Python model of the 
 RESTART_TOL = 10                           # forcing both pins low at a restart costs a few counts
 
 
-def build(tmp, src_c):
+def build(tmp, src_c, defines=()):
     """Copy next to the fake HAL header: a quoted #include looks in the including file's folder first."""
     for f in (os.path.join(H7, 'Core', 'Inc', 'encoder_gen.h'), os.path.join(SIM, 'stm32h7xx_hal.h'),
               os.path.join(SIM, 'encgen_sim_main.c')):
         shutil.copy(f, tmp)
     shutil.copy(src_c, os.path.join(tmp, 'encoder_gen.c'))
     exe = os.path.join(tmp, 'encgen_sim.exe')
-    r = subprocess.run(['gcc', '-std=gnu11', '-O2', '-Wall', '-Werror', '-I', str(tmp),
+    r = subprocess.run(['gcc', '-std=gnu11', '-O2', '-Wall', '-Werror', *defines, '-I', str(tmp),
                         os.path.join(tmp, 'encgen_sim_main.c'), os.path.join(tmp, 'encoder_gen.c'),
                         '-lm', '-o', exe], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
@@ -55,7 +55,7 @@ def sim_old(tmp_path_factory):
     p = os.path.join(d, 'encoder_gen_old.c')
     with open(p, 'w', newline='\n') as f:
         f.write(src)
-    return build(d, p)
+    return build(d, p, ['-DENCGEN_NO_HOOK'])      # no event hook before 29/10
 
 
 def run(exe, scenario, seed):
@@ -112,3 +112,15 @@ def test_stop_holds_pin_level(sim_new):
 def test_old_stop_let_pins_float(sim_old):
     r = subprocess.run([sim_old, 'regs', '1'], capture_output=True, text=True)
     assert r.returncode == 1 and 'pin floats' in r.stdout, r.stdout
+
+
+def test_start_stop_events_reach_hook(sim_new):
+    """S06 T3b (Y5, V2-6): every _start_wheel/_stop call is counted and reported to the hook
+    with the timer CNT of the call; without a hook still counted (encgen_sim_main.c 'events')."""
+    r = subprocess.run([sim_new, 'events', '1'], capture_output=True, text=True)
+    assert r.returncode == 0 and 'EVENTS ok' in r.stdout, r.stdout
+    ev = [line.split() for line in r.stdout.splitlines() if line.startswith('EV ')]
+    assert len(ev) == 4 * 7
+    for w in range(4):
+        kinds = ''.join(e[2] for e in ev if e[1] == str(w))
+        assert kinds == 'SPSPSPS', kinds       # start, flip (stop + start), stop, start, stop, start
