@@ -60,8 +60,10 @@ joins the nearest by seq and marks all of them ambiguous. The same (seq, time) t
 duplicate (same text) or a conflict (other text) only if the receive clock fits; otherwise it
 may be a repeat or a new boot printing the same line: ambiguous (N2).
 'consistent' in the summary means: no ambiguous, conflicting or footer-conflicting line, no
-DUT header received while the segment already had data (also when only duplicates follow
-it, V7) and no footer that may belong to it but could not be assigned. It
+DUT header received while the segment already had data and no footer that may belong to it
+but could not be assigned. A header followed by lines a segment already holds (duplicates,
+maybe late copies from before a restart) waits for the next new line, which takes it as
+usual (W4); if none comes before the end, it counts inside that segment (V7). It
 does not mean one boot ('boot_verified' is always false here): the run owner ties data to a
 reset with separate evidence (workflow 9.1, B38).
 """
