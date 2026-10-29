@@ -1,10 +1,11 @@
 """agv_logger.py: strict schema, segments (suspected DUT restarts) vs UDP reordering, footers,
 files (workflow v3.1 section 9.5; Codex rounds 2-3 #25, #43; B0 review round 1 B3-B10, B20;
-round 2 B30-B36). Fixtures are written from the DUT source, not from agv_logger: the header and
-the printf conversions below are copied from AGV_MECANUM ctrl-imu 030a836
-src/logger/logger.c:92-161, the footers from main.c:305-308. The round 2 counter-examples are
-Codex's (codex_tra_loi_vong2.md, B30-B36); expected values are worked out by hand from the
-rules in the agv_logger docstring. Synthetic packets, no hardware. Run: python -m pytest tools/tests"""
+round 2 B30-B36; round 3 B43-B51, N1-N11). Fixtures are written from the DUT source, not from
+agv_logger: the header and the printf conversions below are copied from AGV_MECANUM ctrl-imu
+030a836 src/logger/logger.c:92-161, the footers from main.c:305-308. The counter-examples are
+Codex's (codex_tra_loi_vong2.md, codex_tra_loi_vong3.md, codex_tra_loi_vong3b.md); expected values
+are worked out by hand from the rules in the agv_logger docstring. Synthetic packets, no hardware.
+Run: python -m pytest tools/tests"""
 import base64
 import csv
 import json
@@ -163,6 +164,7 @@ def test_header_belongs_to_the_segment_it_precedes():
     feed_all(core, [DUT_HEADER] + [dut_line(s, ts=200 * S + s * 10_000) for s in range(100, 120)])
     feed_all(core, [DUT_HEADER] + [dut_line(s, ts=6 * S + s * 10_000) for s in range(0, 5)])
     assert [x['header'] for x in core.summary()['segments']] == ['match', 'match']
+    assert all(x['consistent'] for x in core.summary()['segments'])
 
 
 def test_source_filter_and_datagram_checks():
@@ -192,14 +194,26 @@ def test_same_seq_and_time_with_other_content_is_a_conflict():
     feed_all(core, [dut_line(10, pwm_fl=100), dut_line(11), dut_line(10, pwm_fl=250)])
     assert core.placement == (0, 'conflict')
     s = seg(core, 0)
-    assert s['conflicts'] == 1 and s['duplicates'] == 0 and s['usable'] is False
+    assert s['conflicts'] == 1 and s['duplicates'] == 0 and s['consistent'] is False
+
+
+def test_same_line_long_after_is_not_taken_as_duplicate_codex_n2():
+    """Codex N2: (5, 2 s) received at 10 s, (6, 2.01 s), then the same line 5 received at 500 s:
+    the receive clock does not fit the first segment, so it may be a new boot printing the same
+    line: ambiguous, not a sure duplicate."""
+    core = al.LoggerCore(strict=True)
+    feed_rx(core, [(dut_line(5, ts=2 * S), 10 * S), (dut_line(6, ts=2_010_000), 10_010_000),
+                   (dut_line(5, ts=2 * S), 500 * S)])
+    assert core.placement == (1, 'ambiguous')
+    s = core.summary()['segments']
+    assert [g['duplicates'] for g in s] == [0, 0] and [g['consistent'] for g in s] == [False, False]
 
 
 def test_reordered_line_stays_in_the_segment():
     core = al.LoggerCore(strict=True)
     feed_all(core, [dut_line(s) for s in (100, 101, 103, 102, 104)])
     b = core.summary()['segments']
-    assert len(b) == 1 and b[0]['reordered'] == 1 and b[0]['seq_holes'] == 0 and b[0]['usable']
+    assert len(b) == 1 and b[0]['reordered'] == 1 and b[0]['seq_holes'] == 0 and b[0]['consistent']
 
 
 def test_restart_with_larger_first_timestamp_is_detected():
@@ -222,7 +236,7 @@ def test_restart_with_smaller_timestamp_is_detected():
 
 def test_restart_lines_that_fit_old_seqs_still_split_codex_b30a():
     """Codex B30 (a): boot A seq 50..60 at ~20 s, then reboot B seq 1..10 at ~12 s. Sorted by seq
-    the time still grows, but the receive clock moves by ~8 s (> LATE_MAX_US): two segments."""
+    the time still grows, but the receive clock moves by ~8 s (> WINDOW_US): two segments."""
     core = al.LoggerCore(strict=True)
     a = [(dut_line(s, ts=20 * S + (s - 50) * 10_000), 1 * S + (s - 50) * 10_000) for s in range(50, 61)]
     b = [(dut_line(s, ts=12 * S + (s - 1) * 10_000), 1_200_000 + (s - 1) * 10_000) for s in range(1, 11)]
@@ -243,7 +257,7 @@ def test_late_line_of_old_boot_is_not_taken_by_the_new_one_codex_b30b():
     assert s['segments'][0]['first_seq'] == 100 and s['segments'][0]['last_seq'] == 101
     assert s['segments'][0]['late_lines'] == 1
     assert (s['segments'][1]['first_seq'], s['segments'][1]['last_seq']) == (1, 2)
-    assert all(g['usable'] for g in s['segments'])
+    assert all(g['consistent'] for g in s['segments'])
 
 
 def test_late_line_of_old_boot_after_restart_goes_to_old_segment():
@@ -260,20 +274,66 @@ def test_late_line_of_old_boot_after_restart_goes_to_old_segment():
 
 def test_line_that_fits_two_segments_is_marked_ambiguous():
     """B30: seq 10 at 20.1 s cannot follow seq 1000 at 20.0 s (time would go back), so it opens
-    segment 1; seq 1001 at 20.15 s fits both: placed in the nearest by seq, both unusable."""
+    segment 1; seq 1001 at 20.15 s fits both: placed in the nearest by seq, neither consistent."""
     core = al.LoggerCore(strict=True)
     feed_all(core, [dut_line(1000, ts=20 * S), dut_line(10, ts=20_100_000), dut_line(1001, ts=20_150_000)])
     assert core.placement == (0, 'ambiguous')
     s = core.summary()
     assert [g['ambiguous_lines'] for g in s['segments']] == [1, 1]
-    assert [g['usable'] for g in s['segments']] == [False, False]
+    assert [g['consistent'] for g in s['segments']] == [False, False]
 
 
-def test_slow_seq_rate_breaks_a_segment():
-    """B30 rate bound: 10 seqs in 3 s is slower than any boot pushes (0.15 s/seq + 0.05 s)."""
+def test_early_restart_merges_into_one_segment_codex_n1():
+    """Codex N1 (B43 the same in other numbers): A seq 11..200 received at 100 s + ts, reset,
+    B seq 1..10 received at 103.01 s + ts with the same timestamps per seq. The offset moves by
+    3.01 s < WINDOW_US: one segment, no hole. This is the known limit of the policy; the summary
+    must not claim a single boot."""
+    core = al.LoggerCore(strict=True)
+    feed_rx(core, [(dut_line(s, ts=1 * S + s * 10_000), 100 * S + 1 * S + s * 10_000) for s in range(11, 201)])
+    feed_rx(core, [(dut_line(s, ts=1 * S + s * 10_000), 103_010_000 + 1 * S + s * 10_000) for s in range(1, 11)])
+    s = core.summary()['segments']
+    assert len(s) == 1 and s[0]['seq_holes'] == 0 and s[0]['consistent'] is True
+    assert s[0]['boot_verified'] is False
+
+
+def test_header_inside_a_segment_makes_it_not_consistent_codex_b43():
+    """B43 with the new boot's header received: the header is sent once at boot, so a header
+    followed by a line of an existing segment is evidence of a restart inside it."""
+    core = al.LoggerCore(strict=True)
+    feed_rx(core, [(dut_line(s, ts=1 * S + s * 10_000), 101 * S + s * 10_000) for s in range(11, 201)])
+    core.feed(DUT_HEADER, '10.0.0.2', t_rx_us=104 * S)
+    feed_rx(core, [(dut_line(s, ts=1 * S + s * 10_000), 104_010_000 + s * 10_000) for s in range(1, 11)])
+    g = seg(core, 0)
+    assert g['header_mid_segment'] == 1 and g['consistent'] is False
+
+
+def test_queue_flush_then_live_line_stays_one_segment_codex_n3():
+    """Codex N3 (B44): seq 1..32 (5.01..5.32 s) received together from 6.000 s, 1 ms apart, then
+    live seq 101 (6.01 s) at 6.04 s. The offset drops by 0.96 s: inside the window, one boot."""
+    core = al.LoggerCore(strict=True)
+    feed_rx(core, [(dut_line(s, ts=5 * S + s * 10_000), 6 * S + (s - 1) * 1000) for s in range(1, 33)])
+    core.feed(dut_line(101, ts=6_010_000), '10.0.0.2', t_rx_us=6_040_000)
+    s = core.summary()
+    assert s['segment_breaks'] == 0 and s['segments'][0]['consistent']
+
+
+def test_delay_beyond_the_window_splits_one_boot():
+    """The other side of the policy: a line 6 s later than its neighbours (> WINDOW_US) opens a
+    segment even if it is the same boot (stated in the docstring)."""
+    core = al.LoggerCore(strict=True)
+    feed_rx(core, [(dut_line(s), 5 * S + s * 10_000 + 1 * S) for s in range(1, 11)])
+    core.feed(dut_line(11), '10.0.0.2', t_rx_us=5 * S + 11 * 10_000 + 7 * S)
+    assert core.summary()['segment_breaks'] == 1
+
+
+def test_slow_seq_rate_is_a_timing_violation_not_a_break():
+    """N3: 10 seqs in 3 s is slower than the rate policy (0.15 s/seq + 0.05 s), but the firmware
+    does not guarantee that rate (a stalled control task): kept in the segment, counted."""
     core = al.LoggerCore(strict=True)
     feed_all(core, [dut_line(1, ts=10 * S), dut_line(11, ts=13 * S)])
-    assert core.summary()['segment_breaks'] == 1
+    s = core.summary()
+    assert s['segment_breaks'] == 0 and s['segments'][0]['timing_violations'] == 1
+    assert any(e.startswith('#logger,rate_exceeded') for e in core.events)
 
 
 def test_counters_first_and_last_by_seq():
@@ -300,8 +360,8 @@ def test_footer_counters_and_seq_holes():
     b = seg(core, 0)
     assert b['counters']['log_qdrop'] == [0, 2] and b['counters']['log_send_err'] == [0, 1]
     assert b['run_end_groups'] == [dict(last_data_seq=19, footer_seqs=[20, 21, 22], footers_missing=0,
-                                        tail_missing=0)]
-    assert b['seq_holes'] == 0
+                                        tail_seq_distance=0, tail_data_missing=0)]
+    assert b['seq_holes'] == 0 and b['consistent']
 
 
 def test_lost_footers_are_not_seq_holes_codex_b33():
@@ -312,17 +372,30 @@ def test_lost_footers_are_not_seq_holes_codex_b33():
              [dut_line(14, ts=5 * S + 10 * 10_000 + 100_000, motor_on=0)])
     b = seg(core, 0)
     assert b['seq_holes'] == 0
-    assert b['run_end_groups'] == [dict(last_data_seq=10, footer_seqs=[11], footers_missing=2, tail_missing=0)]
+    assert b['run_end_groups'] == [dict(last_data_seq=10, footer_seqs=[11], footers_missing=2,
+                                        tail_seq_distance=0, tail_data_missing=0)]
 
 
 def test_lost_tail_is_counted_codex_b33():
     """Codex B33: data 1..10 arrive, 11..20 are lost, footer 21 (L = 20) arrives: the span
-    reaches 23, 10 data lines missing, tail_missing = 20 - 10."""
+    reaches 23, 10 data lines missing."""
     core = al.LoggerCore(strict=True)
     feed_all(core, [dut_line(s) for s in range(1, 11)] + [run_end(20, 0)])
     b = seg(core, 0)
     assert b['seq_holes'] == 10
-    assert b['run_end_groups'][0]['tail_missing'] == 10 and b['run_end_groups'][0]['footers_missing'] == 2
+    g = b['run_end_groups'][0]
+    assert (g['tail_seq_distance'], g['tail_data_missing'], g['footers_missing']) == (10, 10, 2)
+
+
+def test_tail_data_missing_leaves_out_earlier_footer_slots_codex_n6():
+    """Codex N6 (B46): data 1..10, footers of L10, data 14..20 lost, footer of L20: the seq
+    distance is 10 but only 7 data lines are missing (11..13 are footers)."""
+    core = al.LoggerCore(strict=True)
+    feed_all(core, [dut_line(s) for s in range(1, 11)] + [run_end(10, k) for k in range(3)] + [run_end(20, 0)])
+    b = seg(core, 0)
+    assert b['seq_holes'] == 7
+    g = b['run_end_groups'][1]
+    assert (g['last_data_seq'], g['tail_seq_distance'], g['tail_data_missing']) == (20, 10, 7)
 
 
 @pytest.mark.parametrize('line', [
@@ -334,7 +407,7 @@ def test_lost_tail_is_counted_codex_b33():
     '#run_end,seq=11,last_data_seq=10,log_qdrop=0'])                     # missing key
 def test_malformed_footers_are_refused(line):
     core = al.LoggerCore(strict=True)
-    assert core.feed(line)[0] == 'dut_event_bad' and core.footers == {}
+    assert core.feed(line)[0] == 'dut_event_bad' and core.footer_obs == []
 
 
 def test_footer_matching_two_segments_stays_unassigned():
@@ -343,8 +416,42 @@ def test_footer_matching_two_segments_stays_unassigned():
     feed_all(core, [dut_line(s, ts=200 * S + s * 10_000) for s in range(1, 21)])
     feed_all(core, [dut_line(s, ts=8 * S + s * 10_000) for s in range(1, 21)] + [run_end(20, 0)])
     s = core.summary()
-    assert s['run_end_unassigned'] == [dict(seq=21, last_data_seq=20)]
-    assert all(g['run_end_groups'] == [] for g in s['segments'])
+    assert s['run_end_unassigned'] == [dict(seq=21, last_data_seq=20, candidates=[0, 1])]
+    assert all(g['run_end_groups'] == [] and not g['consistent'] for g in s['segments'])
+
+
+def test_footer_is_not_given_to_the_segment_holding_L_codex_n4():
+    """Codex N4 (B45): A has data 1..10, B has 1..9 and lost 10; footer of L10 (from B) arrives.
+    Holding L does not exclude B: unassigned, both segments unresolved."""
+    core = al.LoggerCore(strict=True)
+    feed_all(core, [dut_line(s, ts=200 * S + s * 10_000) for s in range(1, 11)])
+    feed_all(core, [dut_line(s, ts=8 * S + s * 10_000) for s in range(1, 10)] + [run_end(10, 0)])
+    s = core.summary()
+    assert s['run_end_unassigned'] == [dict(seq=11, last_data_seq=10, candidates=[0, 1])]
+    assert [g['run_end_unresolved'] for g in s['segments']] == [1, 1]
+    assert [g['consistent'] for g in s['segments']] == [False, False]
+
+
+def test_footer_assigned_by_receive_clock():
+    """A: seq 1..10 and 30..40 at ~200 s, received at ~1 s; B: seq 1..20 at ~8 s, received at ~20 s.
+    The footer of L20 received at 20.021 s: A has no data at 21..23, but its sample time would
+    lie between A's lines 10 and 30 (200.1..200.3 s), far outside A's clock window: B only."""
+    core = al.LoggerCore(strict=True)
+    feed_rx(core, [(dut_line(s, ts=200 * S + s * 10_000), 1 * S + s * 1000) for s in list(range(1, 11)) + list(range(30, 41))])
+    feed_rx(core, [(dut_line(s, ts=8 * S + s * 10_000), 20 * S + s * 1000) for s in range(1, 21)])
+    core.feed(run_end(20, 0), '10.0.0.2', t_rx_us=20_021_000)
+    s = core.summary()
+    assert s['run_end_unassigned'] == []
+    assert s['segments'][1]['run_end_groups'][0]['last_data_seq'] == 20
+    assert s['segments'][0]['run_end_groups'] == [] and all(g['consistent'] for g in s['segments'])
+
+
+def test_footer_with_two_counter_values_is_a_conflict_codex_n4():
+    """Codex N4: two footers with the same (seq, L) but other counters are not merged quietly."""
+    core = al.LoggerCore(strict=True)
+    feed_all(core, [dut_line(s) for s in range(1, 11)] + [run_end(10, 0, qdrop=0), run_end(10, 0, qdrop=5)])
+    b = seg(core, 0)
+    assert b['run_end_conflicts'] == 1 and b['consistent'] is False
 
 
 def test_malformed_footer_is_escaped_and_skipped_by_metrics(tmp_path):
@@ -355,24 +462,52 @@ def test_malformed_footer_is_escaped_and_skipped_by_metrics(tmp_path):
     assert ev.startswith('#logger,bad_dut_event') and 'last_data_seq=' not in ev.split(',')
     p = tmp_path / 'ev.txt'
     p.write_text(f'2026 {ev}\n2026 #run_end,seq=1,last_data_seq=x\n2026 {run_end(9, 0)}\n'
-                 f'2026 #run_end,seq=15,last_data_seq=11,log_qdrop=0,log_send_err=0\n', encoding='utf-8')
-    assert s02_metrics.read_run_end(str(p)) == [9]
+                 f'2026 #run_end,seq=15,last_data_seq=11,log_qdrop=0,log_send_err=0\n'
+                 f'2026 #run_end,seq=13,last_data_seq=12,log_qdrop=0\n', encoding='utf-8')
+    assert s02_metrics.read_run_end(str(p)) == [9]          # same parser as the logger (N5)
 
 
 # ── s02_metrics on logs kept as received ──────────────────────────────────
 
-def _write_csv(path, lines, segments=None):
+def _write_csv(path, lines, header=DUT_HEADER):
     with open(path, 'w', newline='') as f:
-        f.write(DUT_HEADER + '\r\n')
+        f.write(header + '\r\n')
         for ln in lines:
             f.write(ln + '\r\n')
-    if segments is not None:
-        with open(str(path) + '.segments.csv', 'w', newline='') as f:
-            w = csv.writer(f)
-            w.writerow(al.SEGMENT_COLUMNS)
-            for i, (ln, (g, st)) in enumerate(zip(lines, segments), start=1):
-                v = ln.split(',')
-                w.writerow([i, v[al.COL['log_seq']], v[0], g, st])
+
+
+def _logger_run(path, items, status='closed', tamper=None, edit_summary=None):
+    """Write a log the way agv_logger.main does: items are lines or (line, receive time);
+    tamper(rows, marks) may change the CSV / segment rows before they are written (the
+    summary manifest is then taken from the written files, as an edited run would not be)."""
+    core = al.LoggerCore(strict=True)
+    rows, marks = [], []
+    for it in items:
+        line, rx = it if isinstance(it, tuple) else (it, None)
+        kind, payload = core.feed(line, '10.0.0.2', t_rx_us=rx)
+        if kind == 'data':
+            rows.append(list(payload))
+            g, st = core.placement
+            marks.append([str(len(rows)), payload[al.COL['log_seq']], payload[0], '' if g is None else str(g), st])
+    if tamper is not None:
+        tamper(rows, marks)
+    seg_path = str(path) + '.segments.csv'
+    with open(path, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(al.COLUMNS)
+        w.writerows(rows)
+    with open(seg_path, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(al.SEGMENT_COLUMNS)
+        w.writerows(marks)
+    summ = core.summary()
+    summ['status'] = status
+    summ['files'] = {'csv': al.file_digest(str(path)), 'segments': al.file_digest(seg_path)}
+    if edit_summary is not None:
+        edit_summary(summ)
+    with open(str(path) + '.summary.json', 'w', encoding='utf-8') as f:
+        json.dump(summ, f)
+    return summ
 
 
 def test_metrics_drop_duplicates_and_undo_reordering(tmp_path):
@@ -414,36 +549,186 @@ def test_metrics_refuse_codex_b30a_without_segment_file(tmp_path):
         s02_metrics.load_log(str(p))
 
 
-def test_metrics_refuse_mixed_formats(tmp_path):
+def test_metrics_refuse_footer_slots_holding_data_codex_n5(tmp_path):
+    """Codex N5 (B50): data 1, 2, 4 and a footer of L1: its slots 2..4 hold data, so the footer
+    is not of this log (or bad); the old reader dropped 2..4 and reported 0 % loss."""
     p = tmp_path / 'r.csv'
-    _write_csv(p, [dut_line(1), dut_line(2, log_seq='')])
-    with pytest.raises(ValueError, match='mixe'):
+    _write_csv(p, [dut_line(s) for s in (1, 2, 4)])
+    (tmp_path / 'r.csv.events.txt').write_text(f'2026 {run_end(1, 0)}\n', encoding='utf-8')
+    with pytest.raises(ValueError, match='footers must be'):
         s02_metrics.load_log(str(p))
 
 
-def test_metrics_refuse_motor_on_outside_0_1(tmp_path):
+@pytest.mark.parametrize('over,why', [({'log_seq': ''}, 'mixe'), ({'motor_on': ''}, 'mixe'),
+                                      ({'motor_on': 2}, 'motor_on'), ({'motor_on': 'nan'}, 'motor_on'),
+                                      ({'motor_on': 'inf'}, 'motor_on'), ({'log_seq': -1}, 'unsigned'),
+                                      ({'log_seq': 2**32}, 'unsigned'), ({'timestamp_us': 'nan'}, 'integer')])
+def test_metrics_refuse_bad_dut_rows_codex_n9(tmp_path, over, why):
     p = tmp_path / 'r.csv'
-    _write_csv(p, [dut_line(1), dut_line(2, motor_on=2)])
-    with pytest.raises(ValueError, match='motor_on'):
+    _write_csv(p, [dut_line(1), dut_line(2, **over)])
+    with pytest.raises(ValueError, match=why):
         s02_metrics.load_log(str(p))
+
+
+def test_metrics_check_time_order_of_37_column_logs_codex_n9(tmp_path):
+    """Codex N9 (B51): a real 37-column log has no log_seq; time going back is still refused."""
+    p = tmp_path / 'r.csv'
+    head = ','.join(NAMES[:al.N_S02])
+    _write_csv(p, [','.join(dut_line(1, ts=t).split(',')[:al.N_S02]) for t in (3 * S, 2 * S, 4 * S)], header=head)
+    with pytest.raises(ValueError, match='goes back'):
+        s02_metrics.load_log(str(p))
+
+
+def test_metrics_refuse_nonfinite_time_in_sim_logs(tmp_path):
+    p = tmp_path / 'r.csv'
+    _write_csv(p, [dut_line(1, log_seq='', motor_on=''), dut_line(2, log_seq='', motor_on='', timestamp_us='nan')])
+    with pytest.raises(ValueError, match='not finite'):
+        s02_metrics.load_log(str(p))
+
+
+def test_metrics_keep_sim_rows_in_file_order(tmp_path):
+    p = tmp_path / 'r.csv'
+    _write_csv(p, [dut_line(s, log_seq='', motor_on='') for s in range(3)])
+    log = s02_metrics.load_log(str(p))
+    assert len(log['timestamp_us']) == 3 and '_seq_all' not in log
+
+
+def test_metrics_refuse_an_unknown_header(tmp_path):
+    p = tmp_path / 'r.csv'
+    _write_csv(p, [dut_line(1)], header=DUT_HEADER.replace('vx', 'v_x', 1))
+    with pytest.raises(ValueError, match='header'):
+        s02_metrics.load_log(str(p))
+
+
+def _moving_log(n=400, at=None):
+    """n lines at 10 ms with a constant setpoint and counters growing by one per line;
+    at = {seq: {column: value}} overrides."""
+    out = []
+    for s in range(n):
+        v = dict(sp_vx=0.2, tick=s, dpwm_fl=10 * s, dpwm_fr=10 * s, dpwm_rl=10 * s, dpwm_rr=10 * s)
+        v.update((at or {}).get(s, {}))
+        out.append(dut_line(s, **v))
+    return out
+
+
+def test_metrics_compute_on_a_clean_log(tmp_path):
+    p = tmp_path / 'r.csv'
+    _write_csv(p, _moving_log())
+    m = s02_metrics.compute(s02_metrics.load_log(str(p)), 'A-L2')
+    assert m['pwm_tv'] > 0 and m['sat_pct'] == 0
+
+
+@pytest.mark.parametrize('at', [{200: dict(dpwm_fl=5)}, {200: dict(tick=0)}, {200: dict(sat_rr=1000)}])
+def test_metrics_refuse_counters_going_back_codex_n9(tmp_path, at):
+    """Codex N9: a counter going back (or more saturated ticks than ticks) inside the window
+    gave negative or meaningless PWM metrics."""
+    p = tmp_path / 'r.csv'
+    _write_csv(p, _moving_log(at=at))
+    with pytest.raises(ValueError, match='counter|ticks'):
+        s02_metrics.compute(s02_metrics.load_log(str(p)), 'A-L2')
 
 
 def test_metrics_use_the_logger_segment_file(tmp_path):
     p = tmp_path / 'r.csv'
     lines = [dut_line(s) for s in range(0, 6)]
-    _write_csv(p, lines + [lines[3]], segments=[(0, 'ok')] * 6 + [(0, 'duplicate')])
-    assert list(s02_metrics.load_log(str(p))['log_seq']) == list(range(6))
+    _logger_run(p, lines + [lines[3]] + [run_end(5, k) for k in range(3)])
+    log = s02_metrics.load_log(str(p))
+    assert list(log['log_seq']) == list(range(6)) and log['_run_end_last'] == [5]
 
 
-@pytest.mark.parametrize('marks,why', [
-    ([(0, 'ok'), (0, 'ok'), (1, 'ok')], 'restart'),
-    ([(0, 'ok'), (0, 'ambiguous'), (0, 'ok')], 'ambiguous'),
-    ([(0, 'ok'), (0, 'conflict'), (0, 'ok')], 'conflict')])
-def test_metrics_refuse_what_the_segment_file_flags(tmp_path, marks, why):
+@pytest.mark.parametrize('lines,why', [
+    ([dut_line(s, ts=200 * S + s * 10_000) for s in range(100, 110)] +
+     [dut_line(s, ts=8 * S + s * 10_000) for s in range(0, 5)], 'restart'),
+    ([dut_line(1000, ts=20 * S), dut_line(10, ts=20_100_000), dut_line(1001, ts=20_150_000)], 'ambiguous'),
+    ([dut_line(10, pwm_fl=100), dut_line(11), dut_line(10, pwm_fl=250)], 'conflict')])
+def test_metrics_refuse_what_the_logger_flags(tmp_path, lines, why):
     p = tmp_path / 'r.csv'
-    _write_csv(p, [dut_line(s) for s in range(0, 3)], segments=marks)
+    _logger_run(p, lines)
     with pytest.raises(ValueError, match=why):
         s02_metrics.load_log(str(p))
+
+
+def test_metrics_refuse_a_segment_flagged_in_the_summary_only_codex_n8(tmp_path):
+    """Codex N8 (B48): rows all 'ok' but the summary says the segment is not consistent (an
+    unresolved footer, a header inside it...): refused."""
+    p = tmp_path / 'r.csv'
+    _logger_run(p, [dut_line(s) for s in range(5)],
+                edit_summary=lambda s: s['segments'][0].update(consistent=False))
+    with pytest.raises(ValueError, match='not consistent'):
+        s02_metrics.load_log(str(p))
+
+
+def test_metrics_refuse_a_split_segment_codex_n8(tmp_path):
+    """Codex N8: split the 'fits two segments' log and keep only segment 1 (rows all 'ok'),
+    with the run's summary: the manifest no longer matches."""
+    full = tmp_path / 'full.csv'
+    _logger_run(full, [dut_line(1000, ts=20 * S), dut_line(10, ts=20_100_000), dut_line(1001, ts=20_150_000)])
+    with open(full, newline='') as f:
+        rows = list(csv.reader(f))
+    with open(str(full) + '.segments.csv', newline='') as f:
+        marks = list(csv.reader(f))
+    part = tmp_path / 'part.csv'
+    keep = [i for i, m in enumerate(marks[1:], start=1) if m[3] == '1']
+    with open(part, 'w', newline='') as f:
+        csv.writer(f).writerows([rows[0]] + [rows[i] for i in keep])
+    with open(str(part) + '.segments.csv', 'w', newline='') as f:
+        csv.writer(f).writerows([marks[0]] + [[str(k + 1)] + marks[i][1:] for k, i in enumerate(keep)])
+    with open(str(full) + '.summary.json', encoding='utf-8') as f:
+        (tmp_path / 'part.csv.summary.json').write_text(f.read(), encoding='utf-8')
+    with pytest.raises(ValueError, match='does not match'):
+        s02_metrics.load_log(str(part))
+
+
+def _set(rows_or_marks, i, j, v):
+    rows_or_marks[i][j] = v
+
+
+@pytest.mark.parametrize('tamper,why', [
+    (lambda r, m: _set(m, 2, 2, str(int(m[2][2]) + 1)), 'does not match CSV'),         # timestamp
+    (lambda r, m: _set(m, 2, 1, '99'), 'does not match CSV'),                            # log_seq
+    (lambda r, m: _set(m, 2, 0, '7'), 'does not match CSV'),                             # row number
+    (lambda r, m: _set(m, 2, 4, 'fine'), 'not valid'),                                   # unknown status
+    (lambda r, m: _set(m, 0, 4, 'duplicate'), 'no earlier equal')])                      # drops a real line
+def test_metrics_check_the_segment_file_row_by_row_codex_n7(tmp_path, tamper, why):
+    """Codex N7 (B47): the segment file is checked row by row against the CSV, not only counted."""
+    p = tmp_path / 'r.csv'
+    _logger_run(p, [dut_line(s) for s in range(5)], tamper=tamper)
+    with pytest.raises(ValueError, match=why):
+        s02_metrics.load_log(str(p))
+
+
+def test_metrics_refuse_an_edited_csv(tmp_path):
+    p = tmp_path / 'r.csv'
+    _logger_run(p, [dut_line(s) for s in range(5)])
+    text = p.read_text()
+    p.write_text(text.replace(',0.000,', ',0.001,', 1))
+    with pytest.raises(ValueError, match='does not match files.csv'):
+        s02_metrics.load_log(str(p))
+
+
+@pytest.mark.parametrize('status', ['failed', 'open'])
+def test_metrics_refuse_a_run_not_closed_cleanly(tmp_path, status):
+    p = tmp_path / 'r.csv'
+    _logger_run(p, [dut_line(s) for s in range(5)], status=status)
+    with pytest.raises(ValueError, match='status'):
+        s02_metrics.load_log(str(p))
+
+
+def test_metrics_refuse_a_segment_file_without_summary(tmp_path):
+    p = tmp_path / 'r.csv'
+    _logger_run(p, [dut_line(s) for s in range(5)])
+    os.remove(str(p) + '.summary.json')
+    with pytest.raises(ValueError, match='without'):
+        s02_metrics.load_log(str(p))
+
+
+def test_metrics_footers_from_the_logger_assignment_only(tmp_path):
+    """N5: with the logger's files, only footers the logger assigned count; the events file is
+    not read (a footer of another boot written there changes nothing)."""
+    p = tmp_path / 'r.csv'
+    _logger_run(p, [dut_line(s) for s in range(0, 20)])
+    (tmp_path / 'r.csv.events.txt').write_text(f'2026 {run_end(30, 0)}\n', encoding='utf-8')
+    assert s02_metrics.load_log(str(p))['_run_end_last'] == []
 
 
 def test_progress_reads_columns_by_name():
@@ -476,7 +761,7 @@ def test_udp_end_to_end(tmp_path):
     while not ready.exists():
         assert time.monotonic() - t0 < 10, proc.communicate()[0]
         time.sleep(0.05)
-    info = json.loads(ready.read_text(encoding='utf-8'))          # published whole (os.replace)
+    info = json.loads(ready.read_text(encoding='utf-8'))          # published whole (hard link)
     assert info['state'] == 'LOGGER_OPEN' and info['pid'] == proc.pid
     tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     pkts = [DUT_HEADER] + [dut_line(s) for s in range(0, 20)] + \
@@ -508,7 +793,11 @@ def test_udp_end_to_end(tmp_path):
     assert summ['status'] == 'closed' and summ['stop_reason'] == 'duration' and summ['recv_error'] is None
     assert summ['header'] == 'match' and summ['segment_breaks'] == 0
     assert summ['rejects'] == {'n_cols_37': 1, 'decode': 1} and summ['data_lines'] == 20
-    assert summ['segments'][0]['run_end_groups'][0]['footers_missing'] == 0
+    g = summ['segments'][0]
+    assert g['run_end_groups'][0]['footers_missing'] == 0 and g['consistent'] and g['boot_verified'] is False
+    assert summ['run_id'] == info['run_id']
+    assert set(summ['files']) == {'csv', 'segments', 'events', 'raw'}
+    assert summ['files']['csv']['sha256'] == al.file_digest(str(out))['sha256']
 
     log = s02_metrics.load_log(str(out))
     assert log['_run_end_last'] == [19]
@@ -536,6 +825,21 @@ def test_ready_file_equal_to_output_is_refused(tmp_path):
     assert os.listdir(tmp_path) == []
 
 
+def test_ready_file_aliasing_the_output_through_a_link_is_refused_codex_n10(tmp_path):
+    """Codex N10 (B49): --ready-file through a folder link names the CSV itself."""
+    real = tmp_path / 'real'
+    real.mkdir()
+    alias = tmp_path / 'alias'
+    try:
+        os.symlink(real, alias, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip('cannot create a folder symlink here (Windows without the privilege)')
+    proc = _run(real / 'run.csv', _free_port(), '--ready-file', str(alias / 'run.csv'), duration='1')
+    stdout, _ = proc.communicate(timeout=15)
+    assert proc.returncode == 2, stdout
+    assert os.listdir(real) == []
+
+
 def test_failure_while_opening_is_cleaned_up_and_recorded(tmp_path):
     """Codex B34: the ready file cannot be created (no such folder) after the outputs are open:
     every file is closed, the summary says why, exit code 2."""
@@ -547,6 +851,56 @@ def test_failure_while_opening_is_cleaned_up_and_recorded(tmp_path):
     assert summ['status'] == 'failed' and summ['stop_reason'] == 'init_failed'
     assert 'r.json' in summ['recv_error']
     assert not any(n.endswith('.tmp') for n in os.listdir(tmp_path))
+
+
+def test_ready_file_made_by_another_process_is_not_replaced_codex_n10(tmp_path, monkeypatch):
+    """Codex N10 (B49): another process creates the ready file after the logger's checks. The
+    logger must not replace it (hard link fails), must not remove it, and removes its tmp."""
+    ready = tmp_path / 'ready.json'
+    real_link = os.link
+
+    def racing_link(src, dst):
+        with open(dst, 'w', encoding='utf-8') as f:
+            f.write('other')
+        return real_link(src, dst)
+
+    monkeypatch.setattr(al.os, 'link', racing_link)
+    monkeypatch.setattr(al.signal, 'signal', lambda *a: None)
+    code = al.main(['--bind', '127.0.0.1', '--port', str(_free_port()), '--out', str(tmp_path / 'run.csv'),
+                    '--ready-file', str(ready), '--duration', '0.2'])
+    assert code == 2
+    assert ready.read_text(encoding='utf-8') == 'other'
+    assert not (tmp_path / 'ready.json.tmp').exists()
+
+
+class _BrokenStdout:
+    def write(self, s):
+        raise BrokenPipeError('stdout gone')
+
+    def flush(self):
+        raise BrokenPipeError('stdout gone')
+
+    def isatty(self):
+        return False
+
+
+def test_broken_stdout_does_not_change_the_exit_code_codex_n11(tmp_path, monkeypatch):
+    monkeypatch.setattr(al.signal, 'signal', lambda *a: None)
+    monkeypatch.setattr(sys, 'stdout', _BrokenStdout())
+    code = al.main(['--bind', '127.0.0.1', '--port', str(_free_port()), '--out', str(tmp_path / 'run.csv'),
+                    '--duration', '0.2'])
+    assert code == 0
+    summ = json.loads((tmp_path / 'run.csv.summary.json').read_text(encoding='utf-8'))
+    assert summ['status'] == 'closed'
+
+
+def test_failed_summary_write_leaves_no_tmp_codex_n11(tmp_path):
+    p = tmp_path / 's.json'
+    p.write_text('{"status": "open"}\n', encoding='utf-8')
+    with pytest.raises(TypeError):
+        al._write_json_atomic(str(p), {'x': object()})
+    assert not (tmp_path / 's.json.tmp').exists()
+    assert p.read_text(encoding='utf-8') == '{"status": "open"}\n'
 
 
 class _FailingSocket:

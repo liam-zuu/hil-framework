@@ -4,8 +4,23 @@ s02_metrics.py: spec S02 P2-3 metrics, one script for SIM (fwsim), HIL and REAL.
 Input: logs in the ESP32 logger format (tools/agv_logger.py COLUMNS, firmware
 AGV_MECANUM a6644a5 or later: 28 columns + tick, dpwm_*, sat_*). Every quantity
 is the firmware's own: vx/vy/wz from encoder_get_rpm over 10 ms, pwm from
-vel_ctrl, and the cumulative counters of vel_ctrl, so dropped log lines do not
-change the PWM metrics.
+vel_ctrl, and the cumulative counters of vel_ctrl, so dropped log lines inside
+the window do not change the PWM metrics; losing a line at either end of the
+window moves the window itself (B0 review round 3, question 3).
+
+Formats (B0 review round 3 B51/N9), told apart by the header and the rows:
+  DUT     66 columns, every row with log_seq and motor_on (AGV ctrl-imu firmware):
+          log_seq U32, motor_on exactly 0 or 1, timestamp_us an integer
+  SIM     66 columns, log_seq and motor_on empty in every row (fwsim/s02_groupA_sim.py)
+  legacy  the first 37 or 28 columns (older firmware)
+Anything else, or rows of two formats, is refused. SIM and legacy rows stay in file
+order and timestamp_us must be finite and never go back.
+A DUT log next to the logger's <log>.segments.csv must also have <log>.summary.json
+(status closed) whose 'files' manifest matches the CSV and the segment file byte for
+byte; its segment must be 'consistent' in the summary, and only the '#run_end' groups
+the logger assigned to that segment count (B47-B50, N5, N7, N8). A DUT log without a
+segment file is checked from its rows and the '#run_end' lines of <log>.events.txt
+(same parser as the logger); a footer whose slots hold data lines is refused.
 
 Per run (window: 1 s after the first non-zero setpoint to the last non-zero
 setpoint, i.e. initial transient and final stop excluded):
@@ -37,11 +52,16 @@ vx and vy by r/4 * Q_W = 0.0058 m/s and wz by r/(4 L) * Q_W = 0.024 rad/s.
   python tools/s02_metrics.py <run_dir> [out_name]   # reads runs.csv, writes metrics.csv (or out_name)
 """
 import csv
+import json
 import math
 import os
 import sys
 
 import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from agv_logger import (COLUMNS, MAX_US_PER_SEQ, N_OLD, N_S02, RATE_SLACK_US,  # noqa: E402
+                        SEGMENT_COLUMNS, SEGMENT_STATUSES, file_digest, parse_run_end)
 
 R_WHEEL = 0.0485
 L_SUM = 0.24          # LX + LY (kinematics.h)
@@ -64,113 +84,175 @@ def load_log(path):
         rows = list(csv.reader(f))
     head = rows[0]
     body = rows[1:]
+    if head not in (COLUMNS, COLUMNS[:N_S02], COLUMNS[:N_OLD]):
+        raise ValueError(f'{path}: header is not a logger format (agv_logger.COLUMNS, 66, 37 or 28 columns)')
     bad = [i + 2 for i, r in enumerate(body) if len(r) != len(head)]
     if bad:
         raise ValueError(f'{path}: lines {bad[:5]} do not have {len(head)} columns (mixed formats)')
-    seq_all = None
-    if 'log_seq' in head:
-        body = in_seq_order(body, head, path + '.segments.csv')
+    t = head.index('timestamp_us')
+    kind = 'legacy'
+    if head == COLUMNS:
+        s, mo = head.index('log_seq'), head.index('motor_on')
+        kinds = {('dut' if r[s] != '' and r[mo] != '' else
+                  'sim' if r[s] == '' and r[mo] == '' else 'bad') for r in body}
+        if 'bad' in kinds or len(kinds) > 1:
+            raise ValueError(f'{path}: log mixes lines with and without log_seq / motor_on (mixed formats)')
+        kind = kinds.pop() if kinds else 'sim'
+    run_end_last = None
+    if kind == 'dut':
+        body, run_end_last = dut_rows(body, path)
+    else:
+        body = _old_format(body, t)
     data = np.array([[float(x) if x != '' else np.nan for x in r] for r in body])
-    if 'log_seq' in head:
-        seq_all = data[:, head.index('log_seq')]
-    if 'motor_on' in head:
-        # AGV ctrl-imu: 10 Hz lines while the motor is off carry no controller tick: drop them.
-        # Any value other than 0/1 is refused, not dropped quietly (B0 review B36).
-        mo = data[:, head.index('motor_on')]
-        if np.any(np.isfinite(mo) & (mo != 0) & (mo != 1)):
-            raise ValueError(f'{path}: motor_on outside {{0, 1}}')
-        data = data[np.isnan(mo) | (mo == 1)]
+    log_seq_all = None
+    if kind == 'dut':
+        log_seq_all = data[:, head.index('log_seq')]
+        # 10 Hz lines while the motor is off carry no controller tick: drop them
+        data = data[data[:, head.index('motor_on')] == 1]
     log = {h: data[:, i] for i, h in enumerate(head)}
-    if seq_all is not None and np.isfinite(seq_all).any():
-        log['_seq_all'] = seq_all[np.isfinite(seq_all)]          # every line, motor off ones too
-        log['_run_end_last'] = read_run_end(path + '.events.txt')
+    if kind == 'dut':
+        log['_seq_all'] = log_seq_all                            # every line, motor off ones too
+        log['_run_end_last'] = run_end_last
     return log
 
 
-# Same values as tools/agv_logger.py (MAX_US_PER_SEQ, RATE_SLACK_US): inside one DUT boot,
-# lines k seqs apart are at most MAX_US_PER_SEQ * k + RATE_SLACK_US apart in time
-MAX_US_PER_SEQ = 150_000
-RATE_SLACK_US = 50_000
+def _check_dut_row(r, s, t, mo, where):
+    """A DUT row as the firmware prints it (B36, B51/N9): log_seq U32, integer timestamp,
+    motor_on exactly 0 or 1."""
+    if not (r[s].isascii() and r[s].isdigit() and int(r[s]) < 2**32):
+        raise ValueError(f'{where}: log_seq {r[s]!r} is not an unsigned 32-bit number')
+    try:
+        int(r[t])
+    except ValueError:
+        raise ValueError(f'{where}: timestamp_us {r[t]!r} is not an integer') from None
+    if r[mo] not in ('0', '1'):
+        raise ValueError(f'{where}: motor_on {r[mo]!r} outside {{0, 1}}')
 
 
-def in_seq_order(body, head, segments_path=None):
-    """Text rows of one DUT boot in log_seq order (B0 review B4, B30, B31). The logger keeps
-    lines as received; drop duplicate lines and undo UDP reordering.
-      * With the logger's <csv>.segments.csv (one row per data row): drop rows marked
-        'duplicate'; refuse a log with a 'conflict' or 'ambiguous' row or with more than one
-        segment (a suspected DUT restart: split it per segment first).
-      * Without it: drop rows equal as text (so NaN fields do not matter); every row must
-        have a log_seq or none (old format: rows kept in file order, timestamps must not go
-        back); then, sorted by log_seq, seqs must be distinct and timestamps grow at a rate one
-        boot can produce. The arrival order is not used: lost lines make big seq jumps."""
-    s, t = head.index('log_seq'), head.index('timestamp_us')
-    if segments_path is not None and os.path.isfile(segments_path):
-        with open(segments_path, newline='') as f:
-            seg = list(csv.DictReader(f))
-        if len(seg) != len(body):
-            raise ValueError(f'{segments_path}: {len(seg)} rows for {len(body)} data lines')
-        bad = sorted({r['status'] for r in seg} & {'conflict', 'ambiguous'})
-        if bad:
-            raise ValueError(f'log has {"/".join(bad)} lines (see {segments_path}); not usable as is')
-        keep = [(r, m) for r, m in zip(body, seg) if m['status'] != 'duplicate']
-        if len({m['segment'] for _, m in keep}) > 1:
-            raise ValueError('log crosses a DUT restart (more than one logger segment); '
-                             'split it per segment before computing metrics')
-        body = [r for r, _ in keep]
-        if all(m['status'] == 'no_seq' for _, m in keep):
-            return _old_format(body, t)
-        if any(m['status'] == 'no_seq' for _, m in keep):
-            raise ValueError('log mixes lines with and without log_seq (mixed formats)')
+def dut_rows(body, path):
+    """Text rows of one DUT log in log_seq order, and the last_data_seq of the '#run_end'
+    groups that belong to it (B0 review B4, B30-B33, B47-B51, N5, N7-N9). The logger keeps
+    lines as received; drop duplicate lines and undo UDP reordering."""
+    s, t, mo = COLUMNS.index('log_seq'), COLUMNS.index('timestamp_us'), COLUMNS.index('motor_on')
+    for i, r in enumerate(body):
+        _check_dut_row(r, s, t, mo, f'{path} line {i + 2}')
+    seg_path = path + '.segments.csv'
+    if os.path.isfile(seg_path):
+        body, ends = _logger_rows(body, path, seg_path)
     else:
         seen = set()
         uniq = []
-        for r in body:
+        for r in body:                      # equal as text: NaN fields do not matter (B31)
             if tuple(r) not in seen:
                 seen.add(tuple(r))
                 uniq.append(r)
-        body = uniq
-        has = [r[s] != '' for r in body]
-        if not any(has):
-            return _old_format(body, t)
-        if not all(has):
-            raise ValueError('log mixes lines with and without log_seq (mixed formats)')
+        body, ends = uniq, None
     body = sorted(body, key=lambda r: int(r[s]))
     seq = [int(r[s]) for r in body]
     ts = [int(r[t]) for r in body]
-    for (s0, t0), (s1, t1) in zip(zip(seq, ts), zip(seq[1:], ts[1:])):
-        if s1 == s0 or not t0 <= t1 <= t0 + MAX_US_PER_SEQ * (s1 - s0) + RATE_SLACK_US:
-            raise ValueError(f'log crosses a DUT restart or has conflicting lines (seq {s0} -> {s1}, '
-                             f'timestamp_us {t0} -> {t1}); split it per boot before computing metrics')
-    return body
+    if ends is None:
+        # no logger segment file: the stricter sample-time rule, rate bound included (a stalled
+        # control task is refused too), and the footers of the events file
+        for (s0, t0), (s1, t1) in zip(zip(seq, ts), zip(seq[1:], ts[1:])):
+            if s1 == s0 or not t0 <= t1 <= t0 + MAX_US_PER_SEQ * (s1 - s0) + RATE_SLACK_US:
+                raise ValueError(f'log crosses a DUT restart or has conflicting lines (seq {s0} -> {s1}, '
+                                 f'timestamp_us {t0} -> {t1}); split it per boot before computing metrics')
+        ends = read_run_end(path + '.events.txt')
+        data = set(seq)
+        for L in ends:
+            clash = [L + k for k in (1, 2, 3) if L + k in data]
+            if clash and L >= seq[0]:
+                raise ValueError(f'#run_end of last_data_seq {L}: data line(s) {clash} where its '
+                                 'footers must be (another boot, or a bad footer); not usable as is')
+    else:
+        for (s0, t0), (s1, t1) in zip(zip(seq, ts), zip(seq[1:], ts[1:])):
+            if s1 == s0 or t1 < t0:          # the logger's segment guarantees this; check anyway
+                raise ValueError(f'segment rows out of order (seq {s0} -> {s1}, timestamp_us {t0} -> {t1})')
+    return body, ends
+
+
+def _logger_rows(body, path, seg_path):
+    """Rows of a log written by agv_logger.py, checked against its segment file and summary."""
+    summ_path = path + '.summary.json'
+    if not os.path.isfile(summ_path):
+        raise ValueError(f'{seg_path} without {summ_path}: cannot check the logger output')
+    with open(summ_path, encoding='utf-8') as f:
+        summ = json.load(f)
+    if summ.get('status') != 'closed':
+        raise ValueError(f'{summ_path}: status {summ.get("status")!r}, the logger did not close cleanly')
+    files = summ.get('files') or {}
+    for name, p in (('csv', path), ('segments', seg_path)):
+        want = files.get(name) or {}
+        got = file_digest(p)
+        if (want.get('bytes'), want.get('sha256')) != (got['bytes'], got['sha256']):
+            raise ValueError(f'{p} does not match files.{name} of {summ_path}: edited, cut, split '
+                             'or from another run')
+    with open(seg_path, newline='') as f:
+        rows = list(csv.reader(f))
+    if not rows or rows[0] != SEGMENT_COLUMNS:
+        raise ValueError(f'{seg_path}: header is not {SEGMENT_COLUMNS}')
+    marks = rows[1:]
+    if len(marks) != len(body):
+        raise ValueError(f'{seg_path}: {len(marks)} rows for {len(body)} data lines')
+    s, t = COLUMNS.index('log_seq'), COLUMNS.index('timestamp_us')
+    keep, seen = [], set()
+    segs = set()
+    for i, (r, m) in enumerate(zip(body, marks), start=1):
+        if len(m) != len(SEGMENT_COLUMNS) or m[0] != str(i) or m[1] != r[s] or m[2] != r[t]:
+            raise ValueError(f'{seg_path} row {i} does not match CSV data line {i}')
+        status, g = m[4], m[3]
+        if status not in SEGMENT_STATUSES or status == 'no_seq' or not (g.isascii() and g.isdigit()):
+            raise ValueError(f'{seg_path} row {i}: segment {g!r} / status {status!r} not valid for a DUT line')
+        if status in ('conflict', 'ambiguous'):
+            raise ValueError(f'log has {status} lines (see {seg_path}); not usable as is')
+        if status == 'duplicate':
+            if tuple(r) not in seen:
+                raise ValueError(f'{seg_path} row {i}: marked duplicate but no earlier equal line')
+            continue
+        seen.add(tuple(r))
+        keep.append(r)
+        segs.add(int(g))
+    if len(segs) > 1:
+        raise ValueError('log crosses a DUT restart (more than one logger segment); '
+                         'compute metrics on one segment')
+    ends = []
+    if segs:
+        k = segs.pop()
+        segment = next((x for x in summ.get('segments', []) if x.get('segment') == k), None)
+        if segment is None or segment.get('consistent') is not True:
+            raise ValueError(f'segment {k} is not consistent in {summ_path} (ambiguous, conflicting '
+                             'or unresolved footer lines); not usable as is')
+        ends = sorted({grp['last_data_seq'] for grp in segment.get('run_end_groups', [])})
+    return keep, ends
 
 
 def _old_format(body, t):
-    """Lines without log_seq (old firmware, fwsim SIM logs): file order, time must not go back."""
-    ts = [float(r[t]) for r in body]
+    """SIM and legacy rows: file order, timestamps finite and never going back (B51/N9)."""
+    try:
+        ts = [float(r[t]) for r in body]
+    except ValueError:
+        raise ValueError('old-format log: timestamp_us not a number') from None
+    if not all(math.isfinite(x) for x in ts):
+        raise ValueError('old-format log: timestamp_us not finite')
     if any(b < a for a, b in zip(ts, ts[1:])):
         raise ValueError('old-format log: timestamp_us goes back in file order')
     return body
 
 
 def read_run_end(events_path):
-    """last_data_seq of every well-formed '#run_end' line agv_logger.py kept next to the CSV
-    (empty if none). Well formed as in agv_logger.parse_run_end (B0 review B5, B33): every
-    value an unsigned 32-bit number, seq one of L+1..L+3 for last_data_seq L."""
-    out = []
+    """last_data_seq of every '#run_end' line of the events file that agv_logger.parse_run_end
+    accepts (B50/N5: the same parser as the logger; empty if none)."""
+    out = set()
     if os.path.isfile(events_path):
         with open(events_path, encoding='utf-8', errors='ignore') as f:
             for line in f:
                 i = line.find('#run_end,')
                 if i < 0:
                     continue
-                kv = {}
-                for part in line[i:].strip().split(',')[1:]:
-                    k, _, v = part.partition('=')
-                    kv[k] = int(v) if v.isascii() and v.isdigit() and int(v) < 2**32 else None
-                L, sq = kv.get('last_data_seq'), kv.get('seq')
-                if L is not None and sq is not None and 1 <= sq - L <= 3:
-                    out.append(L)
-    return sorted(set(out))
+                kv = parse_run_end(line[i:].strip())
+                if kv is not None:
+                    out.add(kv['last_data_seq'])
+    return sorted(out)
 
 
 def log_loss(log):
@@ -240,9 +322,19 @@ def compute(log, test_id):
     m['e_vx'], m['e_vy'], m['e_wz'] = rms(e[:, 0]), rms(e[:, 1]), rms(e[:, 2])
     m['rms_w_err'] = float(np.mean([rms(c) for c in (ik(*sp[win].T) - w[win]).T]))
     i0, i1 = np.flatnonzero(win)[[0, -1]]
+    # cumulative counters (B51/N9): finite and never going back inside the window, or the
+    # differences below mean nothing (a reset, a bad line); refused, not computed
+    for name in ['tick'] + [f'{k}_{c}' for k in ('dpwm', 'sat') for c in ('fl', 'fr', 'rl', 'rr')]:
+        x = log[name][i0:i1 + 1]
+        if not np.all(np.isfinite(x)) or np.any(np.diff(x) < 0):
+            raise ValueError(f'counter {name} not finite or going back inside the metric window')
     dticks = tick[i1] - tick[i0]
+    if dticks <= 0:
+        raise ValueError('tick does not advance inside the metric window')
     dp = np.array([log[f'dpwm_{c}'][i1] - log[f'dpwm_{c}'][i0] for c in ('fl', 'fr', 'rl', 'rr')])
     sat = np.array([log[f'sat_{c}'][i1] - log[f'sat_{c}'][i0] for c in ('fl', 'fr', 'rl', 'rr')])
+    if np.any(sat > dticks):
+        raise ValueError('saturated ticks exceed controller ticks inside the metric window')
     m['pwm_tv'] = float(np.mean(dp / PWM_MAX / (dticks * TICK_S)))
     m['sat_pct'] = float(np.mean(sat / dticks * 100))
     gz = log.get('gz')

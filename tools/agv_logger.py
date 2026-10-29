@@ -10,8 +10,9 @@ Usage:
     python agv_logger.py --strict --src-ip 192.168.1.50 --out run.csv --ready-file run.ready
                                             # chế độ đo (luồng làm việc HIL bản 3.1, mục 9.5)
 
-Files next to the CSV. Every path (temporary ones too) is checked before anything is created
-and each output is created exclusively, so the logger never overwrites another run:
+Files next to the CSV. Every path (temporary ones too) is checked before anything is created,
+symbolic links in the folders resolved, and each output is created exclusively, so the logger
+never overwrites a file, its own or another run's (B0 review round 3 B49/N10):
     <out>                CSV, accepted data lines in arrival order (header = COLUMNS); kept as
                          received: duplicates, reordering and segments are reported, not fixed
     <out>.segments.csv   one row per CSV data row: row, log_seq, timestamp_us, segment, status
@@ -20,26 +21,45 @@ and each output is created exclusively, so the logger never overwrites another r
     <out>.raw.jsonl      every datagram as received (base64), rejected ones too, with source
                          ip/port, length, UTC and monotonic receive time
     <out>.summary.json   "open" placeholder at start, replaced atomically (through
-                         <out>.summary.json.tmp) at the end: stop reason, receive and close
-                         errors, counters per segment
-    --ready-file         JSON {state: LOGGER_OPEN, pid, out}, published atomically (through
-                         <ready>.tmp) once every output is open; removed at exit
+                         <out>.summary.json.tmp) at the end: run_id, stop reason, receive and
+                         close errors, counters per segment, and the size and SHA-256 of the
+                         CSV, segment, events and raw files ('files'), which s02_metrics checks
+    --ready-file         JSON {state: LOGGER_OPEN, pid, out, run_id}, published once every
+                         output is open: written to <ready>.tmp, then hard-linked to <ready>
+                         (never replaces an existing file); removed at exit only if it is still
+                         the file this logger made
 Exit code: 0 closed cleanly, 2 refused or could not open, 3 error while closing, 4 error while
 receiving. The run owner checks the exit code AND the summary (B0 review B35): status "closed"
-alone does not prove a complete run.
+alone does not prove a complete run, and no field of the summary proves a single DUT boot.
 
 --strict (measurement mode, Codex rounds 2-3 #25, #43; B0 review B3-B10, B36): only 66-column
 lines with the DUT's printf types, C type ranges and flag/enum values are kept; a header-like
 line that is not COLUMNS name by name blocks data until a matching header arrives. Without
 --strict, old 28/37-column lines are padded as before. LOGGER_OPEN is not DUT READY (#35).
 
-Segments, not boots (B0 review B30): without a boot id from the DUT a restart cannot be
-confirmed. Inside one boot log_seq and timestamp_us grow together at a bounded rate (the DUT
-pushes a line at least every ~0.1 s and every push takes the next seq), and receive time minus
-sample time stays near its lowest value (a restart moves it by the old boot's uptime; see the
-constants below). A line that fits one segment joins it; a line that fits
-none opens a new segment ('segment_break'); a line that fits several joins the nearest by seq
-and marks all of them ambiguous. Analysis must refuse segments that are not 'usable'.
+Segments, not boots (B0 review B30; round 3 B43-B45, N1-N4): the DUT sends no boot id, so the
+logger only groups lines that are consistent with one boot. It is a policy with both kinds of
+error, not a proof:
+  * Order: inside one boot timestamp_us grows with log_seq.
+  * Clock: receive time - sample time (logger monotonic clock - DUT timestamp_us) differs
+    between lines of one boot only by their delay (network, the DUT queue of 32 lines while
+    WiFi stalls, the logger reading late) and clock drift. A segment keeps the lowest and
+    highest offset; a line joins only if all offsets stay within WINDOW_US of each other. A
+    restart moves the offset by about the old boot's uptime, so a restart after less than
+    WINDOW_US of uptime is NOT seen (two boots merge: B43/N1), and a delay longer than
+    WINDOW_US splits one boot. Offline (no receive time): sample time within LATE_MAX_US of
+    the newest sample of the segment.
+  * Rate: a line further from its neighbours in time than MAX_US_PER_SEQ per seq (+ slack)
+    stays in its segment and is counted as a timing violation (N3: the firmware does not
+    guarantee that rate; a stalled control task is not a restart).
+A line that fits one segment joins it; none opens a new segment ('segment_break'); several
+joins the nearest by seq and marks all of them ambiguous. The same (seq, time) twice is a
+duplicate (same text) or a conflict (other text) only if the receive clock fits; otherwise it
+may be a repeat or a new boot printing the same line: ambiguous (N2).
+'consistent' in the summary means: no ambiguous, conflicting or footer-conflicting line, no
+header inside the segment and no footer that may belong to it but could not be assigned. It
+does not mean one boot ('boot_verified' is always false here): the run owner ties data to a
+reset with separate evidence (workflow 9.1, B38).
 """
 
 import argparse
@@ -47,6 +67,7 @@ import base64
 import bisect
 import csv
 import datetime
+import hashlib
 import json
 import math
 import os
@@ -54,6 +75,7 @@ import signal
 import socket
 import sys
 import time
+import uuid
 
 # ─────────────────────────────────────────
 # Config
@@ -88,6 +110,7 @@ N_OLD = 28      # firmware before the counters: same columns without the last 9 
 N_S02 = 37      # firmware a6644a5 .. before ctrl-imu: without the last 29
 KNOWN_NAMES = frozenset(COLUMNS)
 SEGMENT_COLUMNS = ["row", "log_seq", "timestamp_us", "segment", "status"]
+SEGMENT_STATUSES = frozenset(("ok", "duplicate", "conflict", "ambiguous", "no_seq"))
 
 # C type of each integer column in the DUT's log_data_t (AGV ctrl-imu 030a836 logger.h:17-62,
 # printed by logger.c:131-161); every other column is a float printed with %f.
@@ -118,23 +141,21 @@ COL = {c: i for i, c in enumerate(COLUMNS)}
 
 RUN_END_KEYS = ("seq", "last_data_seq", "log_qdrop", "log_send_err")   # logger.c:123
 CONFIRM_LINES = 10          # a segment with fewer data lines is flagged 'few_lines' [ĐỀ XUẤT]
-# Segment rules (B0 review B30).
+# Segment policy (module docstring). All four numbers are proposals, to be set from traces
+# measured on the HIL bench (WiFi backlog, motor-off 10 Hz, slow control ticks) before the
+# logger is used to judge a run (review round 3, section 5.2).
 #  * Rate: the DUT pushes a line every 10 ms with the motor on and every 100 ms with it off
-#    (AGV ctrl-imu main.c:515-526), and each push takes the next log_seq even when the queue
-#    drops it (logger.c:44-50): inside one boot, lines k seqs apart are at most
-#    MAX_US_PER_SEQ * k + RATE_SLACK_US apart in sample time.
-#  * Clock: inside one boot, receive time - sample time (logger monotonic clock - DUT
-#    timestamp_us) stays near its lowest value; it only grows by the delay of a datagram
-#    (network, or queued in the DUT while WiFi stalls) and slowly by clock drift. A line more
-#    than LATE_MAX_US above, or CLOCK_TOL_US below, a segment's lowest offset is not of that
-#    boot. A DUT restart moves the offset by about the old boot's uptime. A WiFi stall longer
-#    than LATE_MAX_US splits a segment: conservative, the analysis then refuses the log.
-#    Lines fed without a receive time (offline) use the sample time alone: not more than
-#    LATE_MAX_US older than the newest sample of the segment.
+#    (AGV ctrl-imu main.c:515-526) and each push takes the next log_seq even when the queue
+#    drops it (logger.c:44-50); vTaskDelay plus the work of a tick does not bound this hard.
+#  * Clock: the DUT queue holds 32 lines (logger.h:12); while WiFi stalls, pushes beyond that
+#    are dropped and the queued lines age, so a line can arrive about as late as the stall
+#    lasted. WINDOW_US bounds the spread of receive time - sample time inside one segment:
+#    LATE_MAX_US of delay plus CLOCK_TOL_US of drift (~100 ppm over an hour = 0.36 s).
 MAX_US_PER_SEQ = 150_000    # [ĐỀ XUẤT] 10 Hz line + 50 % for late control ticks
 RATE_SLACK_US = 50_000      # [ĐỀ XUẤT]
 LATE_MAX_US = 5_000_000     # [ĐỀ XUẤT]
-CLOCK_TOL_US = 500_000      # [ĐỀ XUẤT] drift (~100 ppm over an hour = 0.36 s) and jitter
+CLOCK_TOL_US = 500_000      # [ĐỀ XUẤT]
+WINDOW_US = LATE_MAX_US + CLOCK_TOL_US
 
 
 def _int(s):
@@ -163,7 +184,7 @@ def parse_run_end(line):
     """'#run_end,seq=..,last_data_seq=..,log_qdrop=..,log_send_err=..' -> dict, or None if
     malformed: a missing or repeated key, a value that is not U32, or seq not one of the three
     footers L+1..L+3 the firmware pushes after the last data line L (main.c:305-308,
-    logger.c:123; B0 review B33)."""
+    logger.c:123; B0 review B33). s02_metrics uses this same parser (B50/N5)."""
     parts = line.split(',')
     if parts[0] != '#run_end':
         return None
@@ -181,9 +202,9 @@ def parse_run_end(line):
     return kv
 
 
-def _rate_ok(seq_a, ts_a, seq_b, ts_b):
-    """Lines a (lower seq) and b of one boot: time grows with seq, at a bounded rate."""
-    return ts_a <= ts_b <= ts_a + MAX_US_PER_SEQ * (seq_b - seq_a) + RATE_SLACK_US
+def rate_ok(seq_a, ts_a, seq_b, ts_b):
+    """Lines a (lower seq) and b: not further apart in time than the rate policy allows."""
+    return ts_b - ts_a <= MAX_US_PER_SEQ * (seq_b - seq_a) + RATE_SLACK_US
 
 
 class _Segment:
@@ -196,31 +217,55 @@ class _Segment:
         self.cnt = {}               # seq -> (log_qdrop, log_send_err) of the data line
         self.seqs = []
         self.max_ts = None
-        self.min_off = None         # lowest receive time - sample time, us
+        self.min_off = None         # lowest / highest receive time - sample time, us
+        self.max_off = None
         self.n = 0
         self.dup = 0
         self.conflict = 0
         self.reorder = 0
         self.late = 0               # lines placed here after a later segment had started
         self.ambiguous = 0          # lines that fitted this and another segment
+        self.timing = 0             # lines beyond the rate policy (kept, N3)
+        self.header_mid = 0         # DUT header (sent once at boot) followed by a line of this segment
         self.peak = {}              # name -> highest loss counter seen so far (events only)
         self.header = 'not_seen'
 
-    def fits(self, seq, ts, t_rx=None):
-        if seq in self.ts:
-            return False
+    def clock_ok(self, ts, t_rx=None):
+        """Receive clock (or, offline, sample time) consistent with this segment."""
         if t_rx is not None and self.min_off is not None:
             off = t_rx - ts
-            if not self.min_off - CLOCK_TOL_US <= off <= self.min_off + LATE_MAX_US:
-                return False
-        elif self.max_ts is not None and ts < self.max_ts - LATE_MAX_US:
+            return self.max_off - WINDOW_US <= off <= self.min_off + WINDOW_US
+        return self.max_ts is None or ts >= self.max_ts - LATE_MAX_US
+
+    def fits(self, seq, ts, t_rx=None):
+        if seq in self.ts or not self.clock_ok(ts, t_rx):
             return False
         i = bisect.bisect_left(self.seqs, seq)
-        if i > 0 and not _rate_ok(self.seqs[i - 1], self.ts[self.seqs[i - 1]], seq, ts):
+        if i > 0 and self.ts[self.seqs[i - 1]] > ts:
             return False
-        if i < len(self.seqs) and not _rate_ok(seq, ts, self.seqs[i], self.ts[self.seqs[i]]):
+        if i < len(self.seqs) and ts > self.ts[self.seqs[i]]:
             return False
         return True
+
+    def rate_ok(self, seq, ts):
+        i = bisect.bisect_left(self.seqs, seq)
+        if i > 0 and not rate_ok(self.seqs[i - 1], self.ts[self.seqs[i - 1]], seq, ts):
+            return False
+        return i == len(self.seqs) or rate_ok(seq, ts, self.seqs[i], self.ts[self.seqs[i]])
+
+    def footer_fits(self, L, t_rx=None):
+        """Can a footer of last data line L, received at t_rx, belong here? Not if a data line
+        sits where its three footers must be (L+1..L+3). With receive times: the footer is
+        pushed right after data line L, so its sample time lies between the data lines around
+        L, and its receive time must fit the segment's clock window (B45/N4)."""
+        if any(L + k in self.ts for k in (1, 2, 3)):
+            return False
+        if t_rx is None or self.min_off is None:
+            return True
+        i = bisect.bisect_right(self.seqs, L)
+        lo = self.ts[self.seqs[i - 1]] if i else -math.inf
+        hi = self.ts[self.seqs[i]] if i < len(self.seqs) else math.inf
+        return max(lo, t_rx - self.min_off - WINDOW_US) <= min(hi, t_rx - self.max_off + WINDOW_US)
 
     def distance(self, seq):
         i = bisect.bisect_left(self.seqs, seq)
@@ -235,19 +280,26 @@ class _Segment:
         self.cnt[seq] = cnt
         self.max_ts = ts if self.max_ts is None else max(self.max_ts, ts)
         if t_rx is not None:
-            self.min_off = t_rx - ts if self.min_off is None else min(self.min_off, t_rx - ts)
+            off = t_rx - ts
+            self.min_off = off if self.min_off is None else min(self.min_off, off)
+            self.max_off = off if self.max_off is None else max(self.max_off, off)
         self.n += 1
 
-    def summary(self, footers):
-        """footers: valid '#run_end' lines assigned to this segment, (seq, L, qdrop, send_err)."""
+    def summary(self, footers, unresolved):
+        """footers: every '#run_end' received and assigned to this segment, (seq, L, qdrop,
+        send_err); unresolved: footers that may belong here but could not be assigned."""
         tss = [self.ts[s] for s in self.seqs]
         gaps = [b - a for a, b in zip(tss, tss[1:])]
+        fvals = {}
+        for f_seq, L, q, e in footers:
+            fvals.setdefault((f_seq, L), []).append((q, e))
+        f_conflicts = sum(1 for v in fvals.values() if len(set(v)) > 1)
         groups = {}
-        for f_seq, L, _, _ in footers:
+        for f_seq, L in fvals:
             groups.setdefault(L, set()).add(f_seq)
         data = set(self.seqs)
         # the three footer seqs L+1..L+3 are known from the firmware even when not received (B33)
-        slots = {L + k for L in groups for k in (1, 2, 3)} - data
+        slots = {L + k for L in groups for k in (1, 2, 3)}
         holes = 0
         if self.seqs:
             first = self.seqs[0]
@@ -256,26 +308,35 @@ class _Segment:
         group_rows = []
         for L in sorted(groups):
             i = bisect.bisect_right(self.seqs, L)
-            last_data = self.seqs[i - 1] if i else None
-            group_rows.append(dict(last_data_seq=L, footer_seqs=sorted(groups[L]),
-                                   footers_missing=3 - len(groups[L]),
-                                   tail_missing=None if last_data is None else L - last_data))
+            last = self.seqs[i - 1] if i else None
+            # B46/N6: the seq distance from the last data line to L holds footer slots of
+            # earlier groups too; tail_data_missing leaves them out
+            group_rows.append(dict(
+                last_data_seq=L, footer_seqs=sorted(groups[L]), footers_missing=3 - len(groups[L]),
+                tail_seq_distance=None if last is None else L - last,
+                tail_data_missing=None if last is None else
+                (L - last) - sum(1 for s in slots if last < s <= L)))
         # loss counters first/last by seq (B32), data lines and footers together
         by_seq = sorted([(s, c) for s, c in self.cnt.items() if c is not None] +
-                        [(f_seq, (q, e)) for f_seq, _, q, e in footers])
+                        [(f_seq, v[0]) for (f_seq, _), v in fvals.items()])
         counters = {}
         if by_seq:
             for k, name in enumerate(('log_qdrop', 'log_send_err')):
                 counters[name] = [by_seq[0][1][k], by_seq[-1][1][k]]
+        consistent = (self.ambiguous == 0 and self.conflict == 0 and f_conflicts == 0
+                      and self.header_mid == 0 and unresolved == 0)
         return dict(segment=self.index, data_lines=self.n,
                     first_seq=self.seqs[0] if self.seqs else None, last_seq=self.seqs[-1] if self.seqs else None,
                     first_ts=tss[0] if tss else None, last_ts=tss[-1] if tss else None,
                     max_gap_us=max(gaps) if gaps else 0,   # between timestamps sorted by seq
                     seq_holes=holes, duplicates=self.dup, conflicts=self.conflict,
                     reordered=self.reorder, late_lines=self.late, ambiguous_lines=self.ambiguous,
-                    run_end_groups=group_rows, counters=counters, header=self.header,
-                    few_lines=self.n < CONFIRM_LINES,
-                    usable=self.ambiguous == 0 and self.conflict == 0)
+                    timing_violations=self.timing, header=self.header, header_mid_segment=self.header_mid,
+                    run_end_groups=group_rows,
+                    run_end_duplicates=sum(len(v) - 1 for v in fvals.values()),
+                    run_end_conflicts=f_conflicts, run_end_unresolved=unresolved,
+                    counters=counters, few_lines=self.n < CONFIRM_LINES,
+                    consistent=consistent, boot_verified=False)
 
 
 class LoggerCore:
@@ -304,7 +365,7 @@ class LoggerCore:
         self.n_nonfinite = 0
         self.n_breaks = 0
         self.segments = []
-        self.footers = {}                   # (seq, last_data_seq) -> (log_qdrop, log_send_err)
+        self.footer_obs = []                # every valid '#run_end': (seq, L, qdrop, send_err, t_rx)
         self.placement = None
         self._last_ts_noseq = None
         self._header_since_data = None      # header seen after the last data line (belongs to the next segment)
@@ -358,7 +419,8 @@ class LoggerCore:
                 if kv is None:
                     self._event('bad_dut_event,raw=' + line.replace(',', ';'))
                     return ('dut_event_bad', line)
-                self._footer(kv)
+                self.footer_obs.append((kv['seq'], kv['last_data_seq'], kv['log_qdrop'],
+                                        kv['log_send_err'], t_rx_us))
             self.n_dut_events += 1
             return ('dut_event', line)
 
@@ -415,37 +477,13 @@ class LoggerCore:
         self._header_since_data = self.header
         return ('header', None)
 
-    def _footer(self, kv):
-        """Keep each valid '#run_end' once; it is assigned to a segment in summary(), after the
-        data around its last_data_seq has arrived (a footer carries no timestamp)."""
-        key = (kv['seq'], kv['last_data_seq'])
-        val = (kv['log_qdrop'], kv['log_send_err'])
-        old = self.footers.get(key)
-        if old is None:
-            self.footers[key] = val
-        elif old != val:
-            self._event(f'run_end_conflict,seq={key[0]},last_data_seq={key[1]}')
-
-    def _footer_segment(self, L):
-        """The one segment a footer of last data line L belongs to, or None ('unassigned', B33):
-        the segment holding data line L if exactly one does; otherwise the one segment whose
-        seq range covers L, or failing that the one whose data ends before L (lost tail).
-        A segment with a data line at L+1..L+3, where the footers must be, is refused."""
-        have = [g for g in self.segments if L in g.ts]
-        if not have:
-            have = [g for g in self.segments if g.seqs and g.seqs[0] <= L <= g.seqs[-1]] or \
-                   [g for g in self.segments if g.seqs and g.seqs[-1] < L]
-        if len(have) != 1 or any(L + k in have[0].ts for k in (1, 2, 3)):
-            return None
-        return have[0]
-
     def _new_segment(self):
         g = _Segment(len(self.segments))
         self.segments.append(g)
         return g
 
     def _track(self, fields, t_rx=None):
-        """Place a data line into a segment (B30-B32); returns (segment index or None, status)."""
+        """Place a data line into a segment (B30-B32, B43-B45); returns (segment index or None, status)."""
         ts = _int(fields[COL['timestamp_us']])
         seq = _int(fields[COL['log_seq']])
         if ts is None or seq is None:            # old formats: time order only
@@ -456,8 +494,9 @@ class LoggerCore:
             return (None, 'no_seq')
 
         key = tuple(fields)
-        for g in self.segments:                  # same seq and time: the same line twice?
-            if g.ts.get(seq) == ts:
+        same = [g for g in self.segments if g.ts.get(seq) == ts]
+        for g in same:                           # same seq and time: the same line twice?
+            if g.clock_ok(ts, t_rx):
                 if g.key[seq] == key:
                     g.dup += 1
                     self._event(f'dup_seq,seq={seq},segment={g.index}')
@@ -465,9 +504,11 @@ class LoggerCore:
                 g.conflict += 1
                 self._event(f'seq_conflict,seq={seq},ts_us={ts},segment={g.index}')
                 return (g.index, 'conflict')
+        # 'same' left: the receive clock does not fit, so a very late repeat or a new boot
+        # printing the same line; it cannot be told (N2)
 
         cands = [g for g in self.segments if g.fits(seq, ts, t_rx)]
-        status = 'ok'
+        doubt = list(same)
         if not cands:
             if self.segments:
                 prev = self.segments[-1]
@@ -479,21 +520,29 @@ class LoggerCore:
             g = cands[0]
         else:
             g = min(cands, key=lambda c: (c.distance(seq), -c.index))
-            for c in cands:
+            doubt += cands
+        status = 'ok'
+        if doubt:
+            hit = {c.index: c for c in doubt + [g]}
+            for c in hit.values():
                 c.ambiguous += 1
             status = 'ambiguous'
             self._event(f'ambiguous_line,seq={seq},ts_us={ts},'
-                        f'segments={"/".join(str(c.index) for c in cands)},placed={g.index}')
+                        f'segments={"/".join(str(i) for i in sorted(hit))},placed={g.index}')
         if g is not self.segments[-1]:
             g.late += 1
             self._event(f'late_line_of_earlier_segment,seq={seq},ts_us={ts},segment={g.index}')
         elif g.seqs and seq < g.seqs[-1]:
             self._event(f'seq_reorder,seq={seq},after_seq={g.seqs[-1]},segment={g.index}')
+        if not g.rate_ok(seq, ts):
+            g.timing += 1
+            self._event(f'rate_exceeded,seq={seq},ts_us={ts},segment={g.index}')
 
         q, e = _int(fields[COL['log_qdrop']]), _int(fields[COL['log_send_err']])
         g.add(seq, ts, key, (q, e) if q is not None and e is not None else None, t_rx)
         if self._header_since_data is not None:   # the DUT sends its header once, at boot
             if g.n > 1:
+                g.header_mid += 1
                 self._event(f'header_mid_segment,segment={g.index}')
             g.header = self._header_since_data
             self._header_since_data = None
@@ -502,15 +551,25 @@ class LoggerCore:
                 self._counter_event(g, name, v, seq)
         return (g.index, status)
 
-    def summary(self):
+    def assign_footers(self):
+        """Each '#run_end' received goes to the one segment it can belong to (footer_fits),
+        else it stays unassigned and every candidate segment counts it as unresolved
+        (B45/N4: a segment holding data line L is not preferred over one that lost it)."""
         per_seg = {g.index: [] for g in self.segments}
+        unresolved = {g.index: 0 for g in self.segments}
         unassigned = []
-        for (f_seq, L), (q, e) in sorted(self.footers.items()):
-            g = self._footer_segment(L)
-            if g is None:
-                unassigned.append(dict(seq=f_seq, last_data_seq=L))
-            else:
-                per_seg[g.index].append((f_seq, L, q, e))
+        for f_seq, L, q, e, t_rx in self.footer_obs:
+            cands = [g for g in self.segments if g.footer_fits(L, t_rx)]
+            if len(cands) == 1:
+                per_seg[cands[0].index].append((f_seq, L, q, e))
+                continue
+            for g in cands:
+                unresolved[g.index] += 1
+            unassigned.append(dict(seq=f_seq, last_data_seq=L, candidates=[g.index for g in cands]))
+        return per_seg, unresolved, unassigned
+
+    def summary(self):
+        per_seg, unresolved, unassigned = self.assign_footers()
         return dict(
             mode='strict' if self.strict else 'loose',
             src_ip=self.src_ip,
@@ -521,10 +580,13 @@ class LoggerCore:
             rejects=self.rejects,
             lines_with_nonfinite=self.n_nonfinite,
             segment_breaks=self.n_breaks,
-            segments=[g.summary(per_seg[g.index]) for g in self.segments],
+            segments=[g.summary(per_seg[g.index], unresolved[g.index]) for g in self.segments],
             run_end_unassigned=unassigned,
-            note=('segments split by seq/time consistency; no DUT boot id, so a break is a suspected '
-                  'restart, not a confirmed one; refuse segments that are not usable'),
+            policy=dict(max_us_per_seq=MAX_US_PER_SEQ, rate_slack_us=RATE_SLACK_US,
+                        late_max_us=LATE_MAX_US, clock_tol_us=CLOCK_TOL_US),
+            note=('segments group lines consistent with one boot by seq/time/receive clock; the DUT '
+                  'sends no boot id, so two boots can merge and one boot can split; consistent is '
+                  'not a proof of one boot (boot_verified is always false)'),
         )
 
 
@@ -555,15 +617,54 @@ def _fsync_dir(path):
         os.close(fd)
 
 
+def _real(path):
+    """Path with every symbolic link / junction of its folders resolved (B49/N10)."""
+    p = os.path.abspath(path)
+    return os.path.normcase(os.path.join(os.path.realpath(os.path.dirname(p)), os.path.basename(p)))
+
+
+def _file_id(path):
+    st = os.stat(path)
+    return (st.st_dev, st.st_ino)
+
+
+def file_digest(path):
+    """{bytes, sha256} of a file (the summary's manifest; s02_metrics checks it)."""
+    h = hashlib.sha256()
+    n = 0
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+            n += len(chunk)
+    return dict(bytes=n, sha256=h.hexdigest())
+
+
 def _write_json_atomic(path, obj):
-    """Write obj to path.tmp, fsync, then rename over path: a reader sees the old file or the
-    whole new one, never half a JSON (B34, B35)."""
+    """Write obj to path.tmp (created exclusively), fsync, then rename over path: a reader sees
+    the old file or the whole new one, never half a JSON (B34, B35). Only the logger's own
+    placeholder is replaced; path.tmp is removed if anything fails (N11)."""
     tmp = path + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(obj, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    f = open(tmp, 'x', encoding='utf-8')
+    try:
+        with f:
+            json.dump(obj, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _say(*args, **kw):
+    """print() that never raises: a closed or broken stdout must not change the exit code (N11)."""
+    try:
+        print(*args, **kw)
+    except (OSError, ValueError):
+        pass
 
 
 # ─────────────────────────────────────────
@@ -599,45 +700,48 @@ def main(argv=None):
     if args.ready_file:
         paths["ready"] = args.ready_file
         paths["ready_tmp"] = args.ready_file + ".tmp"
-    norm = [os.path.normcase(os.path.abspath(p)) for p in paths.values()]
-    if len(set(norm)) != len(norm):
-        print(f"[ERROR] Hai file output trùng đường dẫn: {paths}", file=sys.stderr)
+    real = [_real(p) for p in paths.values()]
+    if len(set(real)) != len(real):
+        _say(f"[ERROR] Hai file output trùng đường dẫn (kể cả qua symlink): {paths}", file=sys.stderr)
         return 2
-    existing = [p for p in paths.values() if os.path.exists(p)]
+    existing = [p for p in paths.values() if os.path.lexists(p)]
     if existing:
-        print(f"[ERROR] File đã có, không ghi đè: {existing}", file=sys.stderr)
+        _say(f"[ERROR] File đã có, không ghi đè: {existing}", file=sys.stderr)
         return 2
 
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     except OSError as exc:
-        print(f"[ERROR] Không mở được socket: {exc}", file=sys.stderr)
+        _say(f"[ERROR] Không mở được socket: {exc}", file=sys.stderr)
         return 2
     try:
         sock.bind((args.bind, args.port))
         sock.settimeout(0.5)
     except OSError as exc:
         sock.close()
-        print(f"[ERROR] Không bind được {args.bind}:{args.port}: {exc}", file=sys.stderr)
+        _say(f"[ERROR] Không bind được {args.bind}:{args.port}: {exc}", file=sys.stderr)
         return 2
 
+    run_id = uuid.uuid4().hex
     core = LoggerCore(strict=args.strict, src_ip=args.src_ip)
     files = {}
     close_errors = []
     recv_error = None
     stop_reason = None
-    summary_made = ready_made = False
+    summary_made = ready_tmp_made = False
+    ready_id = None
     stop = {"flag": False}
 
     def _on_signal(signum, _frame):
         stop["flag"] = True
 
-    # One cleanup covers everything from the first file on (B34): an error anywhere below
-    # still closes each file on its own, removes the ready file and writes the summary.
+    # One cleanup covers everything from the first file on (B34, N11): an error anywhere below
+    # still closes each file on its own, removes the ready files and writes the summary.
     try:
-        with open(paths["summary"], "x", encoding="utf-8") as f:     # exclusive placeholder
-            f.write('{"status": "open"}\n')
+        f = open(paths["summary"], "x", encoding="utf-8")         # exclusive placeholder
         summary_made = True
+        with f:
+            f.write('{"status": "open"}\n')
         files["csv"] = open(paths["csv"], "x", newline="")
         files["segments"] = open(paths["segments"], "x", newline="")
         files["events"] = open(paths["events"], "x", encoding="utf-8")
@@ -651,19 +755,24 @@ def main(argv=None):
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, _on_signal)
 
-        print(f"[INFO] Lắng nghe UDP {args.bind}:{args.port}  mode={'strict' if args.strict else 'loose'}"
-              f"  src_ip={args.src_ip or 'any'}")
-        print(f"[INFO] Lưu vào: {filename}")
+        _say(f"[INFO] Lắng nghe UDP {args.bind}:{args.port}  mode={'strict' if args.strict else 'loose'}"
+             f"  src_ip={args.src_ip or 'any'}")
+        _say(f"[INFO] Lưu vào: {filename}")
         if args.ready_file:
-            with open(paths["ready_tmp"], "x", encoding="utf-8") as f:
+            f = open(paths["ready_tmp"], "x", encoding="utf-8")
+            ready_tmp_made = True
+            with f:
                 json.dump(dict(state="LOGGER_OPEN", pid=os.getpid(), out=os.path.abspath(filename),
+                               run_id=run_id,
                                t_utc=datetime.datetime.now(datetime.timezone.utc).isoformat()), f)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(paths["ready_tmp"], paths["ready"])
-            ready_made = True
-        print("LOGGER_OPEN", flush=True)
-        print("[INFO] Ctrl+C để dừng\n", flush=True)
+            os.link(paths["ready_tmp"], paths["ready"])    # fails if the name exists (B49/N10)
+            ready_id = _file_id(paths["ready"])
+            os.remove(paths["ready_tmp"])
+            ready_tmp_made = False
+        _say("LOGGER_OPEN", flush=True)
+        _say("[INFO] Ctrl+C để dừng\n", flush=True)
         stop_reason = "running"
 
         t_end = None if args.duration is None else time.monotonic() + args.duration
@@ -679,11 +788,12 @@ def main(argv=None):
                 data, addr = sock.recvfrom(BUFFER_SIZE)
             except socket.timeout:
                 if time.monotonic() - last_wait > 5.0:
-                    print(f"[WAIT] Chưa nhận được data... ({core.n_data} lines saved)")
+                    _say(f"[WAIT] Chưa nhận được data... ({core.n_data} lines saved)")
                     last_wait = time.monotonic()
                 continue
             except InterruptedError:
                 continue
+            # taken after recvfrom: includes the time the datagram waited for the logger
             t_rx_ns = time.monotonic_ns()
             last_wait = time.monotonic()
             now = datetime.datetime.now().isoformat()
@@ -691,10 +801,10 @@ def main(argv=None):
 
             kind, payload = core.feed_datagram(data, addr[0], t_rx_ns // 1000)
             if kind == 'dut_event':
-                print(f"[RUN] {payload}")
+                _say(f"[RUN] {payload}")
                 files["events"].write(f"{now} {payload}\n")
             elif kind == 'header':
-                print(f"[INFO] Header từ {addr[0]}: {core.header}")
+                _say(f"[INFO] Header từ {addr[0]}: {core.header}")
             elif kind == 'data':
                 writer.writerow(payload)
                 seg, status = core.placement
@@ -703,9 +813,9 @@ def main(argv=None):
                 if core.n_data % 100 == 0:
                     p = _progress(payload)
                     if p:
-                        print(f"{p} | saved={core.n_data} rejects={sum(core.rejects.values())}")
+                        _say(f"{p} | saved={core.n_data} rejects={sum(core.rejects.values())}")
             for ev in core.events:             # malformed DUT events arrive here, escaped
-                print(f"[LOG] {ev}")
+                _say(f"[LOG] {ev}")
                 files["events"].write(f"{now} {ev}\n")
             core.events.clear()
             for f in files.values():
@@ -728,13 +838,29 @@ def main(argv=None):
             sock.close()
         except OSError as exc:
             close_errors.append(f"socket: {exc}")
-        if ready_made:
+        if ready_id is not None:               # only the file this logger published
             try:
-                os.remove(paths["ready"])
+                if _file_id(paths["ready"]) == ready_id:
+                    os.remove(paths["ready"])
+                else:
+                    close_errors.append("ready: replaced by another file, left in place")
             except OSError as exc:
                 close_errors.append(f"ready: {exc}")
+        if ready_tmp_made:
+            try:
+                os.remove(paths["ready_tmp"])
+            except OSError as exc:
+                close_errors.append(f"ready tmp: {exc}")
         if summary_made:
+            manifest = {}
+            for name in files:
+                try:
+                    manifest[name] = dict(file=os.path.basename(paths[name]), **file_digest(paths[name]))
+                except OSError as exc:
+                    close_errors.append(f"{name} digest: {exc}")
             summ = core.summary()
+            summ["run_id"] = run_id
+            summ["files"] = manifest
             summ["stop_reason"] = stop_reason
             summ["recv_error"] = recv_error
             summ["close_errors"] = list(close_errors)
@@ -745,23 +871,25 @@ def main(argv=None):
             except OSError as exc:              # not in the summary: the exit code carries it
                 close_errors.append(f"summary: {exc}")
 
-    print(f"\n[DONE] Dừng ({stop_reason}) — đã lưu {core.n_data} dòng, từ chối "
-          f"{sum(core.rejects.values())} {core.rejects or ''}")
-    print(f"[DONE] File: {filename}")
-    if recv_error is not None:
-        print(f"[ERROR] {stop_reason}: {recv_error}", file=sys.stderr)
-    if close_errors:
-        print(f"[ERROR] Lỗi khi đóng: {close_errors}", file=sys.stderr)
     if stop_reason == "init_failed":
-        return 2
+        code = 2
+    elif recv_error is not None:
+        code = 4
+    elif close_errors:
+        code = 3
+    else:
+        code = 0
+    _say(f"\n[DONE] Dừng ({stop_reason}) — đã lưu {core.n_data} dòng, từ chối "
+         f"{sum(core.rejects.values())} {core.rejects or ''}")
+    _say(f"[DONE] File: {filename}")
     if recv_error is not None:
-        return 4
+        _say(f"[ERROR] {stop_reason}: {recv_error}", file=sys.stderr)
     if close_errors:
-        return 3
-    if core.n_data > 0:
-        print("\n[NEXT] Plot data:")
-        print(f"       python plot_log.py {filename}")
-    return 0
+        _say(f"[ERROR] Lỗi khi đóng: {close_errors}", file=sys.stderr)
+    if code == 0 and core.n_data > 0:
+        _say("\n[NEXT] Plot data:")
+        _say(f"       python plot_log.py {filename}")
+    return code
 
 
 if __name__ == "__main__":
