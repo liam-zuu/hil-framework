@@ -74,5 +74,6 @@ void    SPI1_ErrorCallback  (SPI_HandleTypeDef *hspi);
 void    SPI1_Service        (void);
 void    SPI1_RequestRestart (void);
 void    SPI1_GetStats       (SPI1_Stats_t *out);
+uint32_t SPI1_GetFrameCount (void);              /* frames received so far (S06 log) */
 
 #endif /* SPI1_HANDLER_H */

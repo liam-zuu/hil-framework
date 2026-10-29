@@ -156,6 +156,7 @@ int main(void)
   /* S06: cycle counter and log ring before the first SPI1 frame can be
    * stamped (BnoPort_Init no longer zeroes CYCCNT) */
   CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->LAR = 0xC5ACCE55u;              /* unlock DWT (Cortex-M7), as in BnoPort_Init */
   DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
   S06Log_Init();
 

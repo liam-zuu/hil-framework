@@ -136,6 +136,7 @@ typedef struct {
      * checksum and source frame in the report-build log */
     uint8_t  raw[10];
     uint32_t src_nf;
+    uint8_t  fault_flags;       /* MOSI byte 20 of the same frame (IMU loss bit) */
 } HIL_Imu_t;
 
 typedef struct {

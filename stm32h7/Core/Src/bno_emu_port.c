@@ -9,10 +9,18 @@
  * starts a transaction only after INT goes low. At CS rise the number of
  * bytes clocked is read from the RX DMA counter, the transfer is aborted and
  * the DMA armed again for the next transaction.
+ *
+ * S06 (29/10): a core event hook writes the report-build log (spec S06 v3.4
+ * T1 Z3: sensor, rpt_seq, queued or dropped, epoch, imu_seq, source frame,
+ * frame at build time, checksum of the IMU bytes used, CYCCNT), packet-read
+ * events (Y14), reset-complete with the epoch (V3-2, V4-1), IMU loss
+ * injection on/off (V3-1, MOSI fault bit 2), RST edges and a TICK record
+ * every 0.5 s pairing CYCCNT with the 64-bit cycle total (L7-4).
  */
 
 #include "bno_emu_port.h"
 #include "spi1_handler.h"
+#include "s06_log.h"
 #include "encoder_gen.h"        /* ENC_CLOCK_CAL */
 #include <math.h>
 #include <string.h>
@@ -106,6 +114,53 @@ static void _sample_from_imu(const HIL_Imu_t *m, bno_emu_sample_t *s)
     s->qk = sinf(h);
     s->qr = cosf(h);
     s->seq = m->imu_seq;
+    s->src_nf = m->src_nf;
+    s->src_crc = S06_Crc16(0xFFFFu, m->raw, sizeof m->raw);
+}
+
+/* ── S06 log (TIM6, EXTI3, EXTI4: all priority 6) ───────────────────── */
+static uint8_t  _epoch;             /* reset-complete messages sent since boot */
+static uint32_t _tick_n;
+
+static void _s06_hook(void *ctx, const bno_emu_event_t *ev)
+{
+    (void)ctx;
+    uint8_t p[S06_LOG_PAYLOAD];
+    uint32_t cyc = DWT->CYCCNT;
+    uint16_t nf = (uint16_t)SPI1_GetFrameCount();
+    switch (ev->type) {
+    case BNO_EV_REPORT:
+        p[0] = ev->rpt_seq;
+        p[1] = (ev->flags & BNO_EV_QUEUED) ? S06_RPT_QUEUED : S06_RPT_QFULL;
+        p[2] = _epoch;
+        p[3] = ev->sample->seq;
+        s06_put16(p + 4, (uint16_t)ev->sample->src_nf);
+        s06_put16(p + 6, nf);
+        s06_put16(p + 8, ev->sample->src_crc);
+        s06_put32(p + 10, cyc);
+        S06Log_Push((uint8_t)(S06_REC_REPORT + ev->sensor), p, 14);
+        break;
+    case BNO_EV_PKT_READ:
+        p[0] = ev->mask;
+        memcpy(p + 1, ev->seqs, 3);
+        p[4] = _epoch;
+        s06_put32(p + 5, cyc);
+        S06Log_Push(S06_REC_PKT_READ, p, 9);
+        break;
+    case BNO_EV_RESET_DONE:
+        _epoch++;
+        p[0] = _epoch;
+        s06_put32(p + 1, cyc);
+        s06_put16(p + 5, nf);
+        S06Log_Push(S06_REC_RESET_DONE, p, 7);
+        break;
+    case BNO_EV_HOLD:
+        p[0] = _epoch;
+        s06_put32(p + 1, cyc);
+        s06_put16(p + 5, nf);
+        S06Log_Push(ev->flags ? S06_REC_HOLD_ON : S06_REC_HOLD_OFF, p, 7);
+        break;
+    }
 }
 
 static void _cs_fall(uint32_t now)
@@ -174,8 +229,22 @@ void BnoPort_Tick(void)
         _last_imu_seq = imu.imu_seq;
         _n_samples++;
     }
+    /* S06 T8: IMU loss injected by the RPi5 (latest frame) */
+    bno_emu_set_hold(&_emu, (imu.fault_flags & HIL_FAULT_IMU_LOSS) != 0u, now);
 
     bno_emu_poll(&_emu, now);
+
+    /* S06 L7-4: (CYCCNT, cycle total) pair every 0.5 s; _now_us() above set
+     * both, and only priority-6 code (no preemption among it) updates them */
+    if (++_tick_n >= 5000u) {
+        uint8_t p[14];
+        _tick_n = 0;
+        s06_put32(p, _cyc_last);
+        s06_put32(p + 4, (uint32_t)_cyc_total);
+        s06_put32(p + 8, (uint32_t)(_cyc_total >> 32));
+        s06_put16(p + 12, (uint16_t)S06Log_Dropped());
+        S06Log_Push(S06_REC_TICK, p, sizeof p);
+    }
 
     if (!_in_xfer && !_int_low && _cs_high()) {
         uint16_t len;
@@ -195,6 +264,10 @@ void BnoPort_ExtiCallback(uint16_t pin)
 {
     if (pin != _RST_PIN) return;
     uint8_t low = HAL_GPIO_ReadPin(_RST_PORT, _RST_PIN) == GPIO_PIN_RESET;
+    uint8_t p[6];
+    s06_put32(p, DWT->CYCCNT);
+    s06_put16(p + 4, (uint16_t)SPI1_GetFrameCount());
+    S06Log_Push(low ? S06_REC_RST_LOW : S06_REC_RST_HIGH, p, sizeof p);
     bno_emu_set_reset(&_emu, low, _now_us());
     _armed_src = NULL;                   /* queue cleared: tick arms again */
     if (low) _set_int(0);
@@ -215,7 +288,7 @@ void BnoPort_Init(SPI_HandleTypeDef *hspi, TIM_HandleTypeDef *htim)
 
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
     DWT->LAR = 0xC5ACCE55u;              /* unlock DWT (Cortex-M7) */
-    DWT->CYCCNT = 0;
+    /* not zeroed (S06): main.c started it before SPI1, frames are stamped */
     DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
     _cyc_last = DWT->CYCCNT;
     _cyc_total = 0;
@@ -225,6 +298,7 @@ void BnoPort_Init(SPI_HandleTypeDef *hspi, TIM_HandleTypeDef *htim)
     bno_emu_default_cfg(&cfg);
     uint32_t now = _now_us();
     bno_emu_init(&_emu, &cfg, now);
+    bno_emu_set_hook(&_emu, _s06_hook, NULL);
     if (HAL_GPIO_ReadPin(_RST_PORT, _RST_PIN) == GPIO_PIN_RESET)
         bno_emu_set_reset(&_emu, true, now);
 

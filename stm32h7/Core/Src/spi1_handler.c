@@ -131,6 +131,7 @@ static void _decode(void)
     _imu.raw[0] = _rx[22];
     _imu.raw[1] = _rx[23];
     memcpy(&_imu.raw[2], &_rx[31], 8);
+    _imu.fault_flags = _rx[20];
     memcpy(_rx_raw, _rx, SPI1_FRAME_LEN);
 }
 
@@ -340,6 +341,11 @@ void SPI1_Service(void)
         s06_put16(p + 4, (uint16_t)_n_rearms);
         S06Log_Push(S06_REC_REARM, p, sizeof p);
     }
+}
+
+uint32_t SPI1_GetFrameCount(void)
+{
+    return _n_frames;                  /* one aligned 32-bit read */
 }
 
 void SPI1_GetStats(SPI1_Stats_t *out)

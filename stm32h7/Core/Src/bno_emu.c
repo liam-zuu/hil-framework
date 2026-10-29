@@ -101,6 +101,7 @@ static bool q_push(bno_emu_t *e, uint8_t chan, const uint8_t *payload, uint16_t 
         return false;
     }
     bno_emu_pkt_t *p = &e->q[(e->q_head + e->q_count) % BNO_EMU_QUEUE_LEN];
+    p->rmask = 0;
     p->len = (uint16_t)(plen + 4u);
     put16(p->buf, p->len);
     p->buf[2] = chan;
@@ -109,6 +110,11 @@ static bool q_push(bno_emu_t *e, uint8_t chan, const uint8_t *payload, uint16_t 
     memset(p->buf + p->len, 0, 4);          /* host clocks 4 bytes past the packet */
     e->q_count++;
     return true;
+}
+
+static void emit(bno_emu_t *e, const bno_emu_event_t *ev)
+{
+    if (e->hook) e->hook(e->hook_ctx, ev);
 }
 
 static void q_pop(bno_emu_t *e)
@@ -409,6 +415,8 @@ void bno_emu_poll(bno_emu_t *e, uint32_t now_us)
         send_reset_complete(e);
         e->state = BNO_EMU_RUNNING;
         e->t_state_us = now_us;
+        bno_emu_event_t ev = { .type = BNO_EV_RESET_DONE, .now_us = now_us };
+        emit(e, &ev);
     }
 
     /* Report schedule: each sensor keeps its own cadence (next_due += period). */
@@ -432,7 +440,10 @@ void bno_emu_poll(bno_emu_t *e, uint32_t now_us)
     if (any_due) {
         bool stale = !e->have_sample ||
                      time_ge(now_us, e->t_seq_change_us + e->cfg.stale_periods * pmin);
-        if (stale) {
+        if (e->hold) {
+            e->st.hold_skips++;                         /* S06 T8: injected IMU loss */
+            memset(e->pend, 0, sizeof(e->pend));
+        } else if (stale) {
             e->st.stale_skips++;                        /* like a dead chip: send nothing */
             memset(e->pend, 0, sizeof(e->pend));
         } else {
@@ -451,15 +462,30 @@ void bno_emu_poll(bno_emu_t *e, uint32_t now_us)
     if (any_pend && !q_has_chan(e, CH_INPUT)) {
         uint8_t pkt[5u + 10u + 10u + 12u];
         uint16_t n = 0;
+        uint8_t mask = 0, seqs[BNO_EMU_N_SENSORS] = { 0 };
         pkt[n++] = RPT_BASE_TIMESTAMP;                  /* age of the plant sample, 100 us units */
         put32(pkt + n, (now_us - e->t_sample_us) / 100u);
         n = (uint16_t)(n + 4u);
         for (unsigned i = 0; i < BNO_EMU_N_SENSORS; i++) {
             if (!e->pend[i]) continue;
+            seqs[i] = e->rpt_seq[i];
+            mask |= (uint8_t)(1u << i);
             n = (uint16_t)(n + build_report(e, i, pkt + n, now_us));
             e->pend[i] = false;
         }
-        q_push(e, CH_INPUT, pkt, n);
+        bool queued = q_push(e, CH_INPUT, pkt, n);
+        if (queued) {
+            bno_emu_pkt_t *p = &e->q[(e->q_head + e->q_count - 1u) % BNO_EMU_QUEUE_LEN];
+            p->rmask = mask;
+            memcpy(p->rseq, seqs, sizeof seqs);
+        }
+        for (unsigned i = 0; i < BNO_EMU_N_SENSORS; i++) {
+            if (!(mask & (1u << i))) continue;
+            bno_emu_event_t ev = { .type = BNO_EV_REPORT, .sensor = (uint8_t)i, .rpt_seq = seqs[i],
+                                   .flags = queued ? BNO_EV_QUEUED : BNO_EV_QFULL,
+                                   .sample = &e->sample, .now_us = now_us };
+            emit(e, &ev);
+        }
     }
 
     /* INT (G0 v1 §4): packet waiting -> low; nothing for empty_int_period -> low
@@ -526,6 +552,29 @@ void bno_emu_cs_rise(bno_emu_t *e, const uint8_t *mosi, uint16_t n_clocked, uint
     } else {
         e->st.reads++;
         if (!offered) e->st.empty_reads++;
-        else if (n_clocked >= offered_len) q_pop(e);
+        else if (n_clocked >= offered_len) {
+            const bno_emu_pkt_t *p = &e->q[e->q_head];
+            if (p->rmask) {                     /* S06 Y14: the host has this report packet */
+                bno_emu_event_t ev = { .type = BNO_EV_PKT_READ, .mask = p->rmask, .now_us = now_us };
+                memcpy(ev.seqs, p->rseq, sizeof ev.seqs);
+                emit(e, &ev);
+            }
+            q_pop(e);
+        }
     }
+}
+
+void bno_emu_set_hook(bno_emu_t *e, bno_emu_hook_t fn, void *ctx)
+{
+    e->hook = fn;
+    e->hook_ctx = ctx;
+}
+
+void bno_emu_set_hold(bno_emu_t *e, bool hold, uint32_t now_us)
+{
+    if (hold == e->hold) return;
+    e->hold = hold;
+    if (hold) memset(e->pend, 0, sizeof(e->pend));   /* nothing due before it is built later */
+    bno_emu_event_t ev = { .type = BNO_EV_HOLD, .flags = hold ? 1u : 0u, .now_us = now_us };
+    emit(e, &ev);
 }
