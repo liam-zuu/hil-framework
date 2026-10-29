@@ -10,9 +10,14 @@ Report không tới callback là hành vi DUT: báo riêng, không làm phần H
 Chỉ phần ESP32. Phần cần luồng H7/RPi5 (ghép giá trị với frame nguồn, T1, T3, T6 MISO) chưa có:
 cột src_frame, value_src, err, ok của T4_imu_cb.csv để trống.
 
+Lượt không hợp lệ (đo lại, không tính bộ HIL không đạt; Liam duyệt 29/10 ở phiên THESIS, "Theo khuyến
+nghị", spec S06 T3b): số lần đọc count trong lượt ≠ thời lượng / 1 ms ± 1. Mục loại này có
+category "valid"; mục khác "check".
+
 Usage:
-    python tools/s06_esp32_check.py <thư mục lượt> [--out <thư mục kết quả>]
-Mã thoát: 0 đủ log và IMU ở cổng SPI đạt; 1 có mục không đạt; 2 thiếu dữ liệu để chấm.
+    python tools/s06_esp32_check.py <thư mục lượt> [<thư mục lượt> ...] [--out <thư mục kết quả>]
+Mã thoát (một lượt): 0 đạt; 1 có mục không đạt; 2 thiếu #run_start/#run_end; 3 lượt không hợp lệ
+(đo lại). Nhiều lượt: 0 khi mọi lượt đạt, ngược lại 1; in số lượt bị loại vì số lần đọc count.
 """
 
 import argparse
@@ -190,8 +195,8 @@ def check_run(run_dir):
     data, logger_text, data_bad, header_seen = parse_data(read_raw(os.path.join(run_dir, "esp32_data.txt")))
     res = {"run_dir": run_dir, "items": [], "notes": []}
 
-    def item(name, value, limit, ok):
-        res["items"].append(dict(item=name, value=value, limit=limit, ok=ok))
+    def item(name, value, limit, ok, category="check"):
+        res["items"].append(dict(item=name, value=value, limit=limit, ok=ok, category=category))
         return ok
 
     rs, re_ = first_text(ev, "run_start"), first_text(ev, "run_end")
@@ -211,6 +216,10 @@ def check_run(run_dir):
                end_reason=re_["kv"].get("reason"), imu_period_us=period_us)
     if not cfg:
         res["notes"].append("thiếu dòng #cfg: không biết chu kỳ IMU, encoder")
+    # T4 (1): kết quả khởi tạo IMU trong #run_start (s06_load 4f32de2; dòng "BNO085 init OK" chỉ ra serial)
+    ii = rs["kv"].get("imu_init")
+    item("imu_init", f"mã {ii}, {rs['kv'].get('imu_init_ms')} ms" if ii is not None else "thiếu trường",
+         "mã 0 = IMU_INIT_OK (T4 (1))", ii == "0")
 
     # §4.3 điều 2, 4: luồng DATA theo log_seq
     lo, hi = int(rs["kv"]["first_data_seq"]), int(re_["kv"]["last_data_seq"])
@@ -258,8 +267,10 @@ def check_run(run_dir):
         enc["gaps"] = (eq[-1] - eq[0] + 1) - len(set(eq))
     if enc_period_us:
         enc["expected"] = (t1 - t0) // enc_period_us
-    enc["ok"] = (enc["gaps"] == 0 and enc["dups"] == 0 and enc["overflow"] == 0
-                 and enc["expected"] is not None and abs(enc["received"] - enc["expected"]) <= ENC_COUNT_TOL)
+    enc["ok"] = enc["gaps"] == 0 and enc["dups"] == 0 and enc["overflow"] == 0
+    item("enc_reads_vs_duration", f"{enc['received']} lần đọc, kỳ vọng {enc['expected']}",
+         f"± {ENC_COUNT_TOL} (T3b; không đạt = lượt không hợp lệ, đo lại)",
+         enc["expected"] is not None and abs(enc["received"] - enc["expected"]) <= ENC_COUNT_TOL, "valid")
     if E:
         tb = sorted(e["t_before"] for e in E)
         res["enc_period_max_us"] = max([b - a for a, b in zip(tb, tb[1:])], default=0)
@@ -287,7 +298,15 @@ def check_run(run_dir):
     if any(r["n_overwritten"] for r in imu["kinds"]) or any(dut.values()):
         res["notes"].append("DUT: có report không tới callback hoặc bộ đếm bỏ > 0: thêm dòng bug log "
                             "bug_class DUT (luật 'đếm ở cổng SPI'); không làm phần HIL không đạt")
-    res["status"] = "pass" if all(i["ok"] for i in res["items"]) else "fail"
+    # Hở gyro do firmware tính ở callback: chỉ báo kèm, thông tin DUT (spec T4 (2), Liam duyệt 29/10)
+    res["dut_fw_gyro_gap_max_us"] = re_["kv"].get("gyro_gap_max_us")
+    failed = [i for i in res["items"] if not i["ok"]]
+    if any(i["category"] == "valid" for i in failed):
+        res["status"] = "invalid"
+        if any(i["category"] != "valid" for i in failed):
+            res["notes"].append("lượt không hợp lệ và còn mục không đạt khác: xem trước khi đo lại")
+    else:
+        res["status"] = "fail" if failed else "pass"
     return res, ev, imu
 
 
@@ -352,7 +371,7 @@ def write_csv(path, rows, cols, idx=True):
 
 def write_outputs(out_dir, res, ev, imu):
     os.makedirs(out_dir, exist_ok=True)
-    write_csv(os.path.join(out_dir, "run_check.csv"), res["items"], ["item", "value", "limit", "ok"])
+    write_csv(os.path.join(out_dir, "run_check.csv"), res["items"], ["item", "category", "value", "limit", "ok"])
     if "streams" in res:
         write_csv(os.path.join(out_dir, "streams_check.csv"), res["streams"],
                   ["stream", "expected", "received", "gaps", "dups", "overflow", "ok"])
@@ -392,20 +411,31 @@ def print_report(res):
                   f"  (bỏ tầng 1: {r['n_spi_queue_drop']}, callback lặp report: {r['cb_repeat']}, "
                   f"không áp: {r['cb_not_applied']})")
         print(f"  Bộ đếm bỏ trong lượt (DUT): {imu['dut']}")
+        print(f"  Hở gyro firmware tính ở callback (DUT, không chấm): {res.get('dut_fw_gyro_gap_max_us')} µs")
     for n in res["notes"]:
         print(f"  Ghi chú: {n}")
     print(f"  => {res['status']}")
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(description="Kiểm một lượt S06 từ log ESP32 s06_load")
-    p.add_argument("run_dir")
-    p.add_argument("--out", default=None, help="thư mục kết quả (mặc định <run_dir>/check)")
+    p = argparse.ArgumentParser(description="Kiểm lượt S06 từ log ESP32 s06_load")
+    p.add_argument("run_dirs", nargs="+")
+    p.add_argument("--out", default=None, help="thư mục kết quả, chỉ khi một lượt (mặc định <run_dir>/check)")
     a = p.parse_args(argv)
-    res, ev, imu = check_run(a.run_dir)
-    write_outputs(a.out or os.path.join(a.run_dir, "check"), res, ev, imu)
-    print_report(res)
-    return {"pass": 0, "fail": 1}.get(res["status"], 2)
+    if a.out and len(a.run_dirs) > 1:
+        p.error("--out chỉ dùng với một lượt")
+    status = []
+    for d in a.run_dirs:
+        res, ev, imu = check_run(d)
+        write_outputs(a.out or os.path.join(d, "check"), res, ev, imu)
+        print_report(res)
+        status.append(res["status"])
+    if len(status) == 1:
+        return {"pass": 0, "fail": 1, "insufficient": 2, "invalid": 3}[status[0]]
+    print(f"Tổng {len(status)} lượt: đạt {status.count('pass')}, không đạt {status.count('fail')}, "
+          f"thiếu #run_start/#run_end {status.count('insufficient')}, "
+          f"bị loại vì số lần đọc count (đo lại) {status.count('invalid')}")
+    return 0 if all(s == "pass" for s in status) else 1
 
 
 if __name__ == "__main__":

@@ -22,7 +22,8 @@ FIRST_SEQ = 101
 
 
 def make_run(tmp_path, dur_s=3, auto_end=1, drop_gyro=(), overwrite_gyro=(), drop_qseq=(), data_dup=False,
-             no_run_end=False, pre_start_report=False, rx_end_delay_us=None, name="run"):
+             no_run_end=False, pre_start_report=False, rx_end_delay_us=None, name="run",
+             imu_init="imu_init=0,imu_init_ms=412", enc_short=0):
     """Ghi esp32_events.txt, esp32_data.txt cho một lượt; trả thư mục."""
     t1 = T0 + dur_s * 1_000_000
     ev = []                                   # (t_us, dòng không có qseq, là text?)
@@ -47,7 +48,8 @@ def make_run(tmp_path, dur_s=3, auto_end=1, drop_gyro=(), overwrite_gyro=(), dro
         ev.append((T0 + (k + 1) * 1_000_000 - 1, "S,{q}," + f"{T0 + (k + 1) * 1_000_000 - 1}"
                    + ",1,0,0,0,0,0,10000,0,0,0,0,0", False))
     ev.append((T0, "#run_start,first_data_seq=%d,timestamp_us=%d,profile=heavy,duration_s=%d,auto_end=%d,"
-               "fw=abc123,dirty=0,env=s06_load,cfg_hash=deadbeef" % (FIRST_SEQ, T0, dur_s, auto_end), True))
+               "fw=abc123,dirty=0,env=s06_load,cfg_hash=deadbeef" % (FIRST_SEQ, T0, dur_s, auto_end)
+               + ("," + imu_init if imu_init else ""), True))
     ev.append((T0 + 1, "#cfg,profile=heavy;duration_us=%d;auto_end=%d;imu_period_us=%d;enc_period_us=1000;"
                "heavy_swap_us=15000000;t6_hold_us=1000000" % (dur_s * 1_000_000, auto_end, PERIOD), True))
     ev.append((T0 + 2, "P,{q},%d,%d,0,500,3,512,8,0" % (T0 + 2, T0 + 5), False))
@@ -70,7 +72,7 @@ def make_run(tmp_path, dur_s=3, auto_end=1, drop_gyro=(), overwrite_gyro=(), dro
             t_rx = rx_base + 3000 + rx_end_delay_us
         lines.append((t_rx, line))
     eseq = 0
-    for k in range((t1 - T0) // 1000):
+    for k in range((t1 - T0) // 1000 - enc_short):
         eseq += 1
         tb = T0 + 500 + k * 1000
         lines.append((rx_base + tb - T0 + 4000, f"E,{eseq},{tb},{tb + 12},{k},{-k},{k},{-k}"))
@@ -264,3 +266,39 @@ def test_logger_start_stop_with_fake_esp32(tmp_path, no_auto_end):
         assert time.monotonic() - t >= 1.0          # Pi gửi STOP sau đúng thời lượng
     else:
         assert "STOP" not in y
+
+
+def test_imu_init_field_checked(tmp_path):
+    res, _, _ = chk.check_run(make_run(tmp_path, name="ok"))
+    assert items(res)["imu_init"]["ok"] and items(res)["imu_init"]["value"] == "mã 0, 412 ms"
+    res, _, _ = chk.check_run(make_run(tmp_path, name="err", imu_init="imu_init=3,imu_init_ms=2000"))
+    assert not items(res)["imu_init"]["ok"] and res["status"] == "fail"
+    res, _, _ = chk.check_run(make_run(tmp_path, name="old", imu_init=""))
+    assert items(res)["imu_init"]["value"] == "thiếu trường" and res["status"] == "fail"
+
+
+def test_enc_read_count_makes_run_invalid_not_fail(tmp_path):
+    # đọc thiếu 1 lần: vẫn hợp lệ (± 1); thiếu 2 lần (eseq vẫn liên tục): lượt không hợp lệ, đo lại
+    res, _, _ = chk.check_run(make_run(tmp_path, name="one", enc_short=1))
+    assert res["status"] == "pass"
+    d = make_run(tmp_path, name="two", enc_short=2)
+    res, _, _ = chk.check_run(d)
+    assert res["status"] == "invalid"
+    assert items(res)["enc_reads_vs_duration"]["category"] == "valid"
+    assert {x["stream"]: x for x in res["streams"]}["esp32_enc"]["ok"]
+    assert chk.main([d]) == 3
+
+
+def test_multi_run_counts_excluded(tmp_path, capsys):
+    a = make_run(tmp_path, name="a")
+    b = make_run(tmp_path, name="b", enc_short=5)
+    c = make_run(tmp_path, name="c", drop_gyro=(100, 101))
+    assert chk.main([a, b, c]) == 1
+    out = capsys.readouterr().out
+    assert "đạt 1, không đạt 1" in out and "bị loại vì số lần đọc count (đo lại) 1" in out
+
+
+def test_firmware_gyro_gap_reported_not_scored(tmp_path):
+    res, _, _ = chk.check_run(make_run(tmp_path))
+    assert res["dut_fw_gyro_gap_max_us"] == "10000"
+    assert not any("fw" in i["item"] and "gap" in i["item"] for i in res["items"])
