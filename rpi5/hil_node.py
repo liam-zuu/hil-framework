@@ -76,6 +76,12 @@ class HILConfig:
     # frame instead of the plant values; None = plant values (MecanumPlant)
     imu_static:        Optional[tuple] = None
     # Monitoring
+    # S06 (29/10): raw MOSI + MISO of every frame and the send time, kept in
+    # preallocated arrays inside the loop (one index write per step) and
+    # saved to this .npz after the loop. '' = off. frame_log_max caps the
+    # memory when max_steps is 0 (88 bytes per frame).
+    frame_log:         str   = ''
+    frame_log_max:     int   = 1_200_000   # 20 min at 1 kHz
     jitter_warn_us:    float = 500.0       # warn if jitter exceeds this
     stats_interval:    int   = 10_000      # print stats every N steps
 
@@ -142,6 +148,17 @@ class HILNode:
         # already uses the frame order
         self._mecanum   = isinstance(plant, MecanumPlant)
         self._t_start:  Optional[float] = None
+        self._stop_reason = 'max_steps'
+        self._flog = None
+        if self.cfg.frame_log:
+            import numpy as np
+            n = self.cfg.max_steps or self.cfg.frame_log_max
+            self._flog = {
+                't_send_ns': np.zeros(n, dtype=np.int64),
+                'mosi':      np.zeros((n, 40), dtype=np.uint8),
+                'miso':      np.zeros((n, 40), dtype=np.uint8),
+            }
+            self._flog_n = n
 
     # ── Main loop ─────────────────────────────────────────────────────────
 
@@ -160,6 +177,9 @@ class HILNode:
 
         self._running = True
         self._t_start = time.monotonic()
+        # S06 W1/Y6: run start on the clock of t_send_ns (monotonic, us)
+        log.info('#run_start,timestamp_us=%d,max_steps=%d,frame_log=%s',
+                 time.monotonic_ns() // 1000, self.cfg.max_steps, self.cfg.frame_log or '-')
 
         log.info(
             "Plant loop start — %d Hz  simulate=%s  max_steps=%d",
@@ -171,6 +191,9 @@ class HILNode:
         try:
             while self._running:
                 if self.cfg.max_steps and self._step >= self.cfg.max_steps:
+                    break
+                if self._flog is not None and self._step >= self._flog_n:
+                    self._stop_reason = 'frame_log_full'
                     break
                 jitter_ns = self._timer.wait_next_tick()
                 self._tick(jitter_ns)
@@ -204,8 +227,14 @@ class HILNode:
         frame_state = plant_to_frame_state(state) if self._mecanum else state
         mosi   = encode_state(frame_state, traj_ref=self._ref, traj_flags=traj_flags,
                               seq=self._step, imu=imu, imu_seq=imu_seq)
+        t_send = time.monotonic_ns()
         miso   = self._spi.transfer(mosi)
         torques = decode_torques(miso)
+        if self._flog is not None:
+            k = self._step
+            self._flog['t_send_ns'][k] = t_send
+            self._flog['mosi'][k] = memoryview(bytes(mosi))
+            self._flog['miso'][k] = memoryview(bytes(miso))
 
         # 3. Advance plant dynamics
         new_state = self.plant.step(torques)
@@ -249,11 +278,23 @@ class HILNode:
 
     # ── Cleanup & diagnostics ─────────────────────────────────────────────
 
+    def _save_frame_log(self) -> None:
+        import numpy as np
+        n = self._step
+        np.savez(self.cfg.frame_log, t_send_ns=self._flog['t_send_ns'][:n],
+                 mosi=self._flog['mosi'][:n], miso=self._flog['miso'][:n])
+        log.info('Frame log: %d frames -> %s', n, self.cfg.frame_log)
+
     def _on_signal(self, signum: int, _frame) -> None:
         log.info("Signal %d received — stopping plant loop.", signum)
+        self._stop_reason = f'signal_{signum}'
         self._running = False
 
     def _shutdown(self) -> None:
+        log.info('#run_end,timestamp_us=%d,steps=%d,reason=%s',
+                 time.monotonic_ns() // 1000, self._step, self._stop_reason)
+        if self._flog is not None:
+            self._save_frame_log()
         elapsed = time.monotonic() - (self._t_start or time.monotonic())
         log.info(
             "Plant loop stopped — steps=%d  elapsed=%.1f s",

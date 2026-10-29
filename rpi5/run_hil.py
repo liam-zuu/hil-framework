@@ -93,7 +93,7 @@ def _parse_omega_steps(text: str) -> list:
 
 def _run_plant(cfg, shared_state: mp.Array, shared_ref: mp.Array, use_mock: bool, seed: int = 0,
                wheels_lifted: bool = False, fixed_omega: list = None,
-               omega_steps: list = None) -> None:
+               omega_steps: list = None, omega_schedule: str = None) -> None:
     """Process 1 target: plant simulation loop."""
     import logging
     logging.basicConfig(
@@ -117,6 +117,13 @@ def _run_plant(cfg, shared_state: mp.Array, shared_ref: mp.Array, use_mock: bool
         plant = MockPlant()
         plant.reset(list(fixed_omega) + [0.0] * 6)
         logging.getLogger('hil.main').info('Fixed wheel omega [rad/s] = %s (no plant dynamics)', fixed_omega)
+    elif omega_schedule is not None:
+        # S06 T3b: wheel speeds from T3b_schedule.csv (t3b_schedule.py), no dynamics
+        from t3b_schedule import read_csv, ScheduleOmegaPlant
+        sched = read_csv(omega_schedule)
+        plant = ScheduleOmegaPlant(sched)
+        logging.getLogger('hil.main').info('T3b schedule %s: %d transitions, %d steps, then 0',
+                                           omega_schedule, len(sched), plant.total_steps)
     elif omega_steps is not None:
         # EncoderGen check with speed changes in one run (bug H7-ENC-RETIME)
         plant = OmegaProfilePlant(omega_steps, dt=cfg.period_us / 1e6)
@@ -235,11 +242,20 @@ def _parse_args() -> argparse.Namespace:
                         'plant values (imu_seq still changes every frame)')
     p.add_argument('--fixed-omega',   default=None, metavar='W1,W2,W3,W4',
                    help='EncoderGen check: send these constant wheel speeds [rad/s] instead of '
-                        'running the plant (use with --steps; implies --no-traj)')
+                        'running the plant (use with --steps)')
     p.add_argument('--omega-steps',   default=None, metavar='W1,W2,W3,W4:S/...',
                    help='EncoderGen check: play this wheel-speed profile [rad/s, s] instead of the '
                         'plant, segments split by "/", a leading "~" ramps from the previous speeds; '
-                        'implies --no-traj; --steps 0 = the profile length')
+                        '--steps 0 = the profile length')
+    p.add_argument('--omega-schedule', default=None, metavar='CSV',
+                   help='S06 T3b: play the wheel speeds of T3b_schedule.csv (t3b_schedule.py) instead '
+                        'of the plant; --steps 0 = the schedule length')
+    p.add_argument('--traj-loop',     action='store_true',
+                   help='Trajectory publisher starts the trajectory again when --duration is '
+                        'reached (S06 V7), instead of stopping')
+    p.add_argument('--frame-log',     default='', metavar='NPZ',
+                   help='S06: save raw MOSI + MISO of every frame and its send time '
+                        '(time.monotonic_ns) to this .npz after the run')
     return p.parse_args()
 
 
@@ -263,13 +279,17 @@ def main() -> int:
     from imu_model import parse_imu_static
     from trajectory_pub import TrajectorySpec, GROUP_A, LIFTED_TESTS
 
+    # S06 (Y3, V7): the omega modes keep the trajectory publisher running
+    # (before: they forced --no-traj); --no-traj still turns it off.
     omega_steps = _parse_omega_steps(args.omega_steps) if args.omega_steps else None
-    if omega_steps is not None:
-        if args.fixed_omega:
-            raise SystemExit('--omega-steps and --fixed-omega exclude each other')
-        args.no_traj = True
-        if not args.steps:
-            args.steps = int(round(sum(d for _, d, _ in omega_steps) * 1000))
+    n_modes = sum(x is not None and x is not False for x in (args.fixed_omega, args.omega_steps, args.omega_schedule))
+    if n_modes > 1:
+        raise SystemExit('--fixed-omega, --omega-steps and --omega-schedule exclude each other')
+    if omega_steps is not None and not args.steps:
+        args.steps = int(round(sum(d for _, d, _ in omega_steps) * 1000))
+    if args.omega_schedule and not args.steps:
+        from t3b_schedule import read_csv
+        args.steps = max(r.slot_end_ms for r in read_csv(args.omega_schedule))
 
     hil_cfg = HILConfig(
         period_us    = 1_000,
@@ -280,17 +300,17 @@ def main() -> int:
         max_steps    = args.steps,
         simulate_hw  = args.mock,
         imu_static   = parse_imu_static(args.imu_static) if args.imu_static else None,
+        frame_log    = args.frame_log,
     )
     traj_spec = TrajectorySpec(
         kind     = args.traj,
         v        = args.speed,
         radius   = args.radius,
         duration = args.duration,
+        loop     = args.traj_loop,
     )
     lifted = False
     fixed_omega = _parse_fixed_omega(args.fixed_omega) if args.fixed_omega else None
-    if fixed_omega is not None:
-        args.no_traj = True
     if args.test:
         if args.test not in GROUP_A:
             raise SystemExit(f'--test must be one of {sorted(GROUP_A)}')
@@ -310,7 +330,8 @@ def main() -> int:
 
     p1 = mp.Process(
         target=_run_plant,
-        args=(hil_cfg, shared_state, shared_ref, args.mock, args.seed, lifted, fixed_omega, omega_steps),
+        args=(hil_cfg, shared_state, shared_ref, args.mock, args.seed, lifted, fixed_omega, omega_steps,
+              args.omega_schedule),
         name='HIL-Plant',
         daemon=True,
     )
