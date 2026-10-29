@@ -115,6 +115,25 @@ int main(int argc, char **argv)
     }
     EncoderGen_Init(&H[0], &H[1], &H[2], &H[3]);
 
+    /* 29/10 (fix/encgen-stop-hold): outputs driven from boot and held at their
+     * level after a stop (frozen mode, output still enabled) */
+    if (!strcmp(sc, "regs")) {
+        const uint32_t en = TIM_CCER_CC1E | TIM_CCER_CC2E, oc = TIM_CCMR1_OC1M | TIM_CCMR1_OC2M;
+        const uint32_t ie = TIM_DIER_CC1IE | TIM_DIER_CC2IE;
+        int ok = 1;
+        for (int w = 0; w < 4; w++) {
+            if ((T[w].CCER & en) != en) { printf("REGS FAIL init: wheel %d output not enabled\n", w); ok = 0; }
+            if ((T[w].CCMR1 & oc) != (TIM_CCMR1_OC1M_2 | TIM_CCMR1_OC2M_2)) { printf("REGS FAIL init: wheel %d not forced low\n", w); ok = 0; }
+            EncoderGen_SetOmega((uint8_t)w, 10.0f);
+            EncoderGen_SetOmega((uint8_t)w, 0.0f);
+            if ((T[w].CCER & en) != en) { printf("REGS FAIL stop: wheel %d output disabled (pin floats)\n", w); ok = 0; }
+            if ((T[w].CCMR1 & oc) != 0u) { printf("REGS FAIL stop: wheel %d not frozen\n", w); ok = 0; }
+            if (T[w].DIER & ie) { printf("REGS FAIL stop: wheel %d compare interrupts still on\n", w); ok = 0; }
+        }
+        if (ok) printf("REGS ok\n");
+        return ok ? 0 : 1;
+    }
+
     long n = (long)(duration(sc) * 1e6);
     long next_frame = rand() % 300;
     double omega[4] = { 0 };

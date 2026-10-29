@@ -99,3 +99,16 @@ def test_old_code_shows_the_bug(sim_old, scenario):
     assert any(r['rev'] > 0 and abs(r['count'] - r['ideal']) > 100 for r in rows), rows
     if scenario == 'step_up':
         assert max(r['wait_ex'] for r in rows) > 0
+
+
+def test_stop_holds_pin_level(sim_new):
+    """29/10 (Liam: "Sửa giữ mức"): outputs enabled and forced low from boot;
+    after a stop both channels are frozen with the output still enabled, so
+    the pins stay driven (before, CCxE was cleared and the pins floated)."""
+    r = subprocess.run([sim_new, 'regs', '1'], capture_output=True, text=True)
+    assert r.returncode == 0 and 'REGS ok' in r.stdout, r.stdout
+
+
+def test_old_stop_let_pins_float(sim_old):
+    r = subprocess.run([sim_old, 'regs', '1'], capture_output=True, text=True)
+    assert r.returncode == 1 and 'pin floats' in r.stdout, r.stdout

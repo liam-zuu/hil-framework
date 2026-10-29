@@ -60,11 +60,17 @@ static void _force_low_then_toggle(TIM_TypeDef *t)
     t->CCMR1 = m | OCM_TOGGLE_1 | OCM_TOGGLE_2;
 }
 
-/* ── Disable both channels, mark stopped ────────────────────────────────── */
+/* ── Stop both channels, pins held at their level, mark stopped ───────── */
+/* 29/10 (Liam: "Sửa giữ mức"): before, _stop cleared CCxE, so the timer no
+ * longer drove A and B; with GPIO_NOPULL the pins floated while the wheel was
+ * stopped and the ESP32 could count noise. Now both channels go to frozen
+ * mode (OCxM = 0000: a compare match no longer changes OCxREF) with the output
+ * still enabled, so each pin stays driven at the level of its last edge. */
 static void _stop(uint8_t i)
 {
-    _w[i].htim->Instance->DIER &= ~(TIM_DIER_CC1IE | TIM_DIER_CC2IE);
-    _w[i].htim->Instance->CCER &= ~(TIM_CCER_CC1E  | TIM_CCER_CC2E);
+    TIM_TypeDef *t = _w[i].htim->Instance;
+    t->DIER  &= ~(TIM_DIER_CC1IE | TIM_DIER_CC2IE);
+    t->CCMR1 &= ~(TIM_CCMR1_OC1M | TIM_CCMR1_OC2M);   /* frozen */
     _w[i].dir          = 0;
     _w[i].ch1_has_last = 0;
 }
@@ -174,7 +180,16 @@ void EncoderGen_Init(TIM_HandleTypeDef *ht1,
     _w[3].htim = ht4;
 
     /* No HAL_TIM_Base_Start / OC_Start_IT — counters started lazily by
-     * _start_wheel() via CR1 |= CEN. */
+     * _start_wheel() via CR1 |= CEN. Outputs driven low from boot (29/10):
+     * before, they were enabled only at the first start, so A and B floated
+     * until the first nonzero omega. */
+    for (int i = 0; i < ENC_NUM_WHEELS; i++) {
+        TIM_TypeDef *t = _w[i].htim->Instance;
+        uint32_t m = t->CCMR1 & ~(TIM_CCMR1_OC1M | TIM_CCMR1_OC2M);
+        t->CCMR1 = m | OCM_FORCE_INACTIVE_1 | OCM_FORCE_INACTIVE_2;
+        t->CCER |= TIM_CCER_CC1E | TIM_CCER_CC2E;
+        if (IS_TIM_BREAK_INSTANCE(t)) t->BDTR |= TIM_BDTR_MOE;
+    }
 }
 
 void EncoderGen_SetOmega(uint8_t wheel, float omega_rad_s)
