@@ -73,7 +73,11 @@ def _parse_fixed_omega(text: str) -> list:
 
 def _parse_omega_steps(text: str) -> list:
     """'2,2,2,2:20/~39.2,39.2,39.2,39.2:0.3' -> [([2.0]*4, 20.0, False), ([39.2]*4, 0.3, True)].
-    Segments split by '/': W1,W2,W3,W4:seconds; a leading '~' ramps from the previous speeds."""
+    Segments split by '/': W1,W2,W3,W4:seconds; a leading '~' ramps from the previous speeds.
+    '@T5_pass1.csv' reads the segments from a T5 schedule (t5_schedule.py, S06 T5)."""
+    if text.startswith('@'):
+        import t5_schedule
+        return t5_schedule.segments(t5_schedule.read_csv(text[1:]))
     segs = []
     for part in text.split('/'):
         part = part.strip()
@@ -249,7 +253,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument('--omega-steps',   default=None, metavar='W1,W2,W3,W4:S/...',
                    help='EncoderGen check: play this wheel-speed profile [rad/s, s] instead of the '
                         'plant, segments split by "/", a leading "~" ramps from the previous speeds; '
-                        '--steps 0 = the profile length')
+                        '"@CSV" plays a T5 schedule (t5_schedule.py); --steps 0 = the profile length')
     p.add_argument('--omega-schedule', default=None, metavar='CSV',
                    help='S06 T3b: play the wheel speeds of T3b_schedule.csv (t3b_schedule.py) instead '
                         'of the plant; --steps 0 = the schedule length')
