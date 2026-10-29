@@ -9,10 +9,12 @@ Strategy: sleep + busy-wait hybrid
 Real-time setup:
   - SCHED_FIFO via sched_setscheduler() syscall (requires root/CAP_SYS_NICE)
   - CPU affinity via os.sched_setaffinity()
+  Both act on the calling thread (pid 0 on Linux), i.e. the process's main thread when
+  called from it.
 
-Typical jitter on RPi5 with SCHED_FIFO:
-  - mean ≈ 10–30 μs
-  - max  ≈ 50–150 μs  (comfortable margin inside 1ms budget)
+Jitter on RPi5 with SCHED_FIFO: not measured with this code yet (19/10 setup log: max
+0.5 μs from the terminal, no saved file). The numbers once written here (mean 10–30 μs,
+max 50–150 μs) had no measurement behind them (B0 review round 3, question 5).
 
 Usage:
     from timing import set_realtime, pin_cpu, PrecisionTimer
@@ -137,14 +139,23 @@ class PrecisionTimer:
         overruns:    Number of ticks where actual time exceeded one full period.
     """
 
-    def __init__(self, period_us: int = 1_000, history_len: int = 5_000):
+    def __init__(self, period_us: int = 1_000, history_len: int = 5_000,
+                 clock=time.monotonic_ns, sleep=time.sleep):
         """
         Args:
             period_us:   Tick period [μs]. 1000 = 1 kHz.
             history_len: Size of the rolling jitter ring buffer.
+            clock, sleep: monotonic ns clock and sleep(seconds); tests pass fakes to check
+                         deadlines on any OS (B0 review round 3 N18).
+
+        Fixed rate: each deadline is the previous one plus the period, never "now + period",
+        so a late tick does not shift later ones; after an overrun the following ticks
+        return at once until the timer has caught up.
         """
+        self._clock = clock
+        self._sleep = sleep
         self.period_ns:  int = period_us * 1_000
-        self._next_ns:   int = time.monotonic_ns() + self.period_ns
+        self._next_ns:   int = clock() + self.period_ns
         self._jitter:    collections.deque = collections.deque(maxlen=history_len)
         self._overruns:  int = 0
 
@@ -156,21 +167,20 @@ class PrecisionTimer:
 
         Returns:
             Jitter in nanoseconds.  Positive = we woke up late.
-            Under normal operation on RPi5 with SCHED_FIFO: < 200 μs.
         """
         deadline_ns   = self._next_ns
         busy_start_ns = deadline_ns - BUSY_WAIT_NS
 
         # Phase 1: coarse sleep (OS can preempt here)
-        now_ns = time.monotonic_ns()
+        now_ns = self._clock()
         if now_ns < busy_start_ns:
-            time.sleep((busy_start_ns - now_ns) * 1e-9)
+            self._sleep((busy_start_ns - now_ns) * 1e-9)
 
         # Phase 2: busy-wait — burns CPU but gives precise wake
-        while time.monotonic_ns() < deadline_ns:
+        while self._clock() < deadline_ns:
             pass
 
-        actual_ns  = time.monotonic_ns()
+        actual_ns  = self._clock()
         jitter_ns  = actual_ns - deadline_ns
         self._next_ns += self.period_ns
 
@@ -184,7 +194,7 @@ class PrecisionTimer:
 
     def reset(self) -> None:
         """Re-arm timer from now. Clears jitter history."""
-        self._next_ns  = time.monotonic_ns() + self.period_ns
+        self._next_ns  = self._clock() + self.period_ns
         self._jitter.clear()
         self._overruns = 0
 
@@ -234,8 +244,9 @@ class PrecisionTimer:
 
 # ── Standalone jitter measurement ─────────────────────────────────────────
 
-def _save_sched():
-    """(policy, priority, affinity) of the calling process, None where the OS has no such call."""
+def _save_sched() -> dict:
+    """Scheduler (policy, priority) and CPU affinity of the calling thread; None for the part
+    the OS cannot report (then that part is not changed, B0 review round 3 N17)."""
     def _try(fn):
         try:
             return fn()
@@ -243,18 +254,34 @@ def _save_sched():
             return None
     policy = _try(lambda: os.sched_getscheduler(0))
     prio = _try(lambda: os.sched_getparam(0).sched_priority)
-    return policy, prio, _try(lambda: os.sched_getaffinity(0))
+    return dict(scheduler=None if policy is None or prio is None else (policy, prio),
+                affinity=_try(lambda: os.sched_getaffinity(0)))
 
 
-def _restore_sched(saved) -> None:
-    policy, prio, affinity = saved
-    try:
-        if policy is not None and prio is not None:
+def _restore_sched(saved: dict, applied: dict) -> list:
+    """Put back each part that was changed, on its own (a failed scheduler restore does not
+    skip the affinity one), and read it back. Returns the errors, empty if all went back."""
+    errors = []
+    if applied.get('scheduler'):
+        policy, prio = saved['scheduler']
+        try:
             os.sched_setscheduler(0, policy, os.sched_param(prio))
-        if affinity is not None:
-            os.sched_setaffinity(0, affinity)
-    except (AttributeError, OSError) as exc:
-        print(f"[timing] could not restore scheduler/affinity: {exc}", flush=True)
+            back = (os.sched_getscheduler(0), os.sched_getparam(0).sched_priority)
+            if back != (policy, prio):
+                errors.append(f'scheduler: {back} after restore, expected {(policy, prio)}')
+        except (AttributeError, OSError) as exc:
+            errors.append(f'scheduler: {exc}')
+    if applied.get('affinity'):
+        try:
+            os.sched_setaffinity(0, saved['affinity'])
+            back = os.sched_getaffinity(0)
+            if back != saved['affinity']:
+                errors.append(f'affinity: {sorted(back)} after restore, expected {sorted(saved["affinity"])}')
+        except (AttributeError, OSError) as exc:
+            errors.append(f'affinity: {exc}')
+    for e in errors:
+        print(f"[timing] could not restore {e}", flush=True)
+    return errors
 
 
 def measure_jitter(
@@ -267,25 +294,38 @@ def measure_jitter(
 
     Run this BEFORE connecting any hardware to verify RPi5 timing budget:
         python timing.py 2000
-    Expected result: max jitter < 200 μs on bare RPi5 with SCHED_FIFO.
+    Budget: max jitter < 500 μs (half the 1 ms period); the jitter on the Pi has not been
+    measured with this code yet.
 
     Args:
         n_ticks:   Number of ticks to collect.
         period_us: Timer period [μs].
-        rt:        If True, attempt to set SCHED_FIFO first.
+        rt:        If True, attempt to set SCHED_FIFO and pin to core 0 first.
 
     Returns:
-        Jitter statistics dict (same keys as PrecisionTimer.jitter_stats).
+        Jitter statistics dict (same keys as PrecisionTimer.jitter_stats) plus
+          'rt'             {'scheduler': bool, 'affinity': bool}: what was really applied
+                           (False: could not read the old value, or no privilege)
+          'restore_errors' list of parts that could not be put back (empty = all back)
 
-    With rt=True the calling process's scheduler and CPU affinity are changed for the
-    measurement and put back afterwards (B0 review B41: a pytest run on the Pi must not
-    leave the test process on SCHED_FIFO pinned to core 0).
+    With rt=True the calling thread's scheduler and CPU affinity are changed for the
+    measurement only (B0 review B41: a pytest run on the Pi must not leave the test process
+    on SCHED_FIFO pinned to core 0). A part whose old value cannot be read is not changed;
+    each part is restored on its own, also when the measurement raises (round 3 N17).
     """
     saved = _save_sched() if rt else None
+    applied = {'scheduler': False, 'affinity': False}
+    errors = []
     try:
         if rt:
-            set_realtime(priority=90)
-            pin_cpu(core=0)
+            if saved['scheduler'] is not None:
+                applied['scheduler'] = bool(set_realtime(priority=90))
+            else:
+                print("[timing] scheduler not readable: SCHED_FIFO not set", flush=True)
+            if saved['affinity'] is not None:
+                applied['affinity'] = bool(pin_cpu(core=0))
+            else:
+                print("[timing] affinity not readable: CPU pin not set", flush=True)
 
         hz = 1_000_000 // period_us
         print(f"[timing] Measuring jitter: {n_ticks} ticks @ {period_us} μs ({hz} Hz) …",
@@ -296,19 +336,26 @@ def measure_jitter(
             timer.wait_next_tick()
     finally:
         if saved is not None:
-            _restore_sched(saved)
+            errors = _restore_sched(saved, applied)
 
     timer.print_jitter_report()
     s = timer.jitter_stats
+    s['rt'] = dict(applied)
+    s['restore_errors'] = errors
 
     # HIL budget check: max jitter should be < 500 μs (50% of 1ms period)
     budget_ok = s.get('max_us', 9999) < 500
-    print(f"[timing] Budget check (max < 500 μs): {'PASS ✓' if budget_ok else 'FAIL ✗'}",
-          flush=True)
+    print(f"[timing] Budget check (max < 500 μs): {'PASS ✓' if budget_ok else 'FAIL ✗'}"
+          f"  rt={s['rt']}  restore_errors={errors or 'none'}", flush=True)
     return s
+
+
+def jitter_ok(stats: dict) -> bool:
+    """Exit criterion of --jitter-only / this script: within budget AND everything restored."""
+    return stats.get('max_us', 9999) < 500 and not stats.get('restore_errors')
 
 
 if __name__ == '__main__':
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 2_000
     stats = measure_jitter(n_ticks=n, period_us=1_000, rt=True)
-    sys.exit(0 if stats.get('max_us', 9999) < 500 else 1)
+    sys.exit(0 if jitter_ok(stats) else 1)

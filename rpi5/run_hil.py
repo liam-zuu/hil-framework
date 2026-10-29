@@ -216,9 +216,9 @@ def main() -> int:
 
     # ── Jitter-only mode ─────────────────────────────────────────────────
     if args.jitter_only:
-        from timing import measure_jitter
+        from timing import jitter_ok, measure_jitter
         stats = measure_jitter(n_ticks=args.jitter_n, period_us=1_000, rt=True)
-        return 0 if stats.get('max_us', 9999) < 500 else 1
+        return 0 if jitter_ok(stats) else 1         # a failed restore fails too (B0 round 3 N17)
 
     # ── Loopback test ────────────────────────────────────────────────────
     if args.loopback_test:
