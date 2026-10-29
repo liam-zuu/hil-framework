@@ -289,7 +289,7 @@ class _Segment:
             self.max_off = off if self.max_off is None else max(self.max_off, off)
         self.n += 1
 
-    def summary(self, footers, unresolved):
+    def summary(self, footers, unresolved, header_left=0):
         """footers: every '#run_end' received and assigned to this segment, (seq, L, qdrop,
         send_err); unresolved: footers that may belong here but could not be assigned."""
         tss = [self.ts[s] for s in self.seqs]
@@ -327,15 +327,16 @@ class _Segment:
         if by_seq:
             for k, name in enumerate(('log_qdrop', 'log_send_err')):
                 counters[name] = [by_seq[0][1][k], by_seq[-1][1][k]]
+        header_mid = self.header_mid + header_left
         consistent = (self.ambiguous == 0 and self.conflict == 0 and f_conflicts == 0
-                      and self.header_mid == 0 and unresolved == 0)
+                      and header_mid == 0 and unresolved == 0)
         return dict(segment=self.index, data_lines=self.n,
                     first_seq=self.seqs[0] if self.seqs else None, last_seq=self.seqs[-1] if self.seqs else None,
                     first_ts=tss[0] if tss else None, last_ts=tss[-1] if tss else None,
                     max_gap_us=max(gaps) if gaps else 0,   # between timestamps sorted by seq
                     seq_holes=holes, duplicates=self.dup, conflicts=self.conflict,
                     reordered=self.reorder, late_lines=self.late, ambiguous_lines=self.ambiguous,
-                    timing_violations=self.timing, header=self.header, header_mid_segment=self.header_mid,
+                    timing_violations=self.timing, header=self.header, header_mid_segment=header_mid,
                     run_end_groups=group_rows,
                     run_end_duplicates=sum(len(v) - 1 for v in fvals.values()),
                     run_end_conflicts=f_conflicts, run_end_unresolved=unresolved,
@@ -373,6 +374,7 @@ class LoggerCore:
         self.placement = None
         self._last_ts_noseq = None
         self._header_since_data = None      # header seen after the last data line (belongs to the next segment)
+        self._header_known_segs = set()     # segments whose known lines (duplicate / conflict) followed that header
 
     # ── helpers ───────────────────────────────────────────────────────────
     def _reject(self, reason):
@@ -483,13 +485,12 @@ class LoggerCore:
 
     def _header_before_known_line(self, g):
         """A DUT header arrived since the last data line and is followed by a line g already
-        holds (duplicate / conflict): g had data before the header, so the header is inside
-        it (V7: it was dropped when only duplicates followed)."""
-        if self._header_since_data is not None:
-            g.header_mid += 1
-            self._event(f'header_mid_segment,segment={g.index}')
-            g.header = self._header_since_data
-            self._header_since_data = None
+        holds (duplicate / conflict). That line may be a late copy from before a restart, so
+        the header is not given to g yet (W4): it stays pending for the next new line. If no
+        new line comes before the end, summary() counts it inside g (V7)."""
+        if self._header_since_data is not None and g.index not in self._header_known_segs:
+            self._header_known_segs.add(g.index)
+            self._event(f'header_then_known_line,segment={g.index}')
 
     def _new_segment(self):
         g = _Segment(len(self.segments))
@@ -561,6 +562,7 @@ class LoggerCore:
                 self._event(f'header_mid_segment,segment={g.index}')
             g.header = self._header_since_data
             self._header_since_data = None
+            self._header_known_segs.clear()
         for name, v in (('log_qdrop', q), ('log_send_err', e)):
             if v is not None:
                 self._counter_event(g, name, v, seq)
@@ -595,7 +597,9 @@ class LoggerCore:
             rejects=self.rejects,
             lines_with_nonfinite=self.n_nonfinite,
             segment_breaks=self.n_breaks,
-            segments=[g.summary(per_seg[g.index], unresolved[g.index]) for g in self.segments],
+            segments=[g.summary(per_seg[g.index], unresolved[g.index],
+                                int(self._header_since_data is not None and g.index in self._header_known_segs))
+                      for g in self.segments],
             run_end_unassigned=unassigned,
             policy=dict(max_us_per_seq=MAX_US_PER_SEQ, rate_slack_us=RATE_SLACK_US,
                         late_max_us=LATE_MAX_US, clock_tol_us=CLOCK_TOL_US),

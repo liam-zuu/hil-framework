@@ -318,6 +318,20 @@ def test_header_followed_only_by_duplicates_codex_v7():
     assert g['duplicates'] == 10 and g['header_mid_segment'] == 1 and g['consistent'] is False
 
 
+def test_header_then_late_duplicate_then_new_boot_codex_w4():
+    """Codex W4: A (100, 20 s) received at 100 s; B's header at 101 s; a late copy of A100 at
+    101.001 s; B1 (5 s) at 101.002 s. The V7 fix gave the header to A (A not consistent, B
+    without header). The header now waits for the next new line: it goes to B, A stays clean."""
+    core = al.LoggerCore(strict=True)
+    core.feed(dut_line(100, ts=20 * S), '10.0.0.2', t_rx_us=100 * S)
+    core.feed(DUT_HEADER, '10.0.0.2', t_rx_us=101 * S)
+    core.feed(dut_line(100, ts=20 * S), '10.0.0.2', t_rx_us=101_001_000)
+    core.feed(dut_line(1, ts=5 * S), '10.0.0.2', t_rx_us=101_002_000)
+    a, b = core.summary()['segments']
+    assert (a['duplicates'], a['header_mid_segment'], a['consistent']) == (1, 0, True)
+    assert (b['header'], b['header_mid_segment']) == ('match', 0)
+
+
 def test_queue_flush_then_live_line_stays_one_segment_codex_n3():
     """Codex N3 (B44): seq 1..32 (5.01..5.32 s) received together from 6.000 s, 1 ms apart, then
     live seq 101 (6.01 s) at 6.04 s. The offset drops by 0.96 s: inside the window, one boot."""
