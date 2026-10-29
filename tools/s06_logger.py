@@ -11,6 +11,8 @@ Gửi lệnh tới ESP32 (cổng 5011): `START <zero|heavy|t6> <s> <0|1>`, `STOP
 Ghi log thô nguyên văn: mỗi dòng nhận được ghi thành `<t_rx_us>\t<dòng>`, t_rx_us là
 time.monotonic_ns() // 1000 trên RPi5 lúc nhận gói (dùng cho luật T9: t_rx(#run_end) − t_rx(#run_start)).
 Không lọc, không sửa dòng; kiểm lượt bằng s06_esp32_check.py.
+Nhiệt độ CPU RPi5 (T5, Liam 30/10): mỗi 1 s đọc `--temp-path` (mặc định thermal_zone0, m°C), ghi
+`<t_us>\t<m°C>` vào `pi_temp.txt` cùng đồng hồ với t_rx_us; không đọc được thì capture.yaml ghi lý do.
 
 Usage:
     python tools/s06_logger.py --esp32 192.168.1.50 --profile heavy --duration 60 --out <thư mục lượt>
@@ -33,6 +35,8 @@ RCVBUF = 4 * 1024 * 1024  # bộ đệm nhận lớn: mất gói phía Pi cũng 
 START_TRIES = 5           # gửi lại START mỗi 1 s tới khi thấy #ack hoặc #run_start
 STOP_TRIES = 5            # gửi lại STOP mỗi 0,2 s tới khi thấy #run_end
 END_GRACE_S = 5.0         # lượt tự kết thúc: chờ #run_end tới thời lượng + chừng này, quá thì gửi STOP
+TEMP_PATH = "/sys/class/thermal/thermal_zone0/temp"
+TEMP_PERIOD_US = 1_000_000
 
 
 def now_us():
@@ -62,8 +66,13 @@ def text_field(line, key):
 class Capture:
     """Hai socket nhận, hai file thô, và trạng thái lượt đọc từ các dòng '#'."""
 
-    def __init__(self, out_dir, data_port, evt_port, bind="0.0.0.0"):
+    def __init__(self, out_dir, data_port, evt_port, bind="0.0.0.0", temp_path=TEMP_PATH):
         os.makedirs(out_dir, exist_ok=True)
+        self.temp_path = temp_path
+        self.temp_file = open(os.path.join(out_dir, "pi_temp.txt"), "w", encoding="utf-8", newline="\n")
+        self.temp_next = 0
+        self.temp_n = 0
+        self.temp_error = None    # lần đọc lỗi đầu tiên (ghi vào capture.yaml)
         self.out_dir = out_dir
         self.sel = selectors.DefaultSelector()
         self.files = {}
@@ -84,7 +93,23 @@ class Capture:
         self.run_end = None       # (t_rx_us, dòng) bản đầu tiên của luồng sự kiện
         self.fw = None
 
+    def sample_temp(self):
+        t = now_us()
+        if t < self.temp_next:
+            return
+        self.temp_next = t + TEMP_PERIOD_US
+        try:
+            with open(self.temp_path, encoding="ascii") as f:
+                mc = int(f.read().strip())
+        except (OSError, ValueError) as exc:
+            if self.temp_error is None:
+                self.temp_error = f"{type(exc).__name__}: {exc}"
+            return
+        self.temp_file.write(f"{t}\t{mc}\n")
+        self.temp_n += 1
+
     def poll(self, timeout_s):
+        self.sample_temp()
         for key, _ in self.sel.select(timeout_s):
             name = key.data
             while True:
@@ -119,6 +144,7 @@ class Capture:
             print(f"[ESP32] {line}")
 
     def close(self):
+        self.temp_file.close()
         for f in self.files.values():
             f.close()
         for s in self.socks:
@@ -132,7 +158,7 @@ def send_cmd(sock, addr, text):
 
 
 def run(args):
-    cap = Capture(args.out, args.data_port, args.evt_port, args.bind)
+    cap = Capture(args.out, args.data_port, args.evt_port, args.bind, args.temp_path)
     cmd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     dest = (args.esp32, args.cmd_port)
     auto_end = 0 if args.no_auto_end else 1
@@ -236,6 +262,8 @@ def write_capture_yaml(args, cap, sent, t0_wall, t0, result, stop_reason):
         f"run_end: {{t_rx_us: {cap.run_end[0] if cap.run_end else 'null'}, "
         f"line: {yq(cap.run_end[1] if cap.run_end else '')}}}",
         f"lines: {{data: {cap.lines['data']}, events: {cap.lines['events']}}}",
+        f"pi_temp: {{file: pi_temp.txt, path: {yq(cap.temp_path)}, samples: {cap.temp_n}, "
+        f"error: {yq(cap.temp_error or '')}}}",
         "commands:",
     ]
     out += [f"  - {{t_us: {t}, cmd: {yq(c)}}}" for t, c in sent]
@@ -262,6 +290,7 @@ def main(argv=None):
     p.add_argument("--evt-port", type=int, default=EVT_PORT)
     p.add_argument("--cmd-port", type=int, default=CMD_PORT)
     p.add_argument("--bind", default="0.0.0.0", help="địa chỉ nghe (test dùng 127.0.0.1)")
+    p.add_argument("--temp-path", default=TEMP_PATH, help="file nhiệt độ CPU RPi5 (m°C), đọc mỗi 1 s")
     args = p.parse_args(argv)
     if args.duration <= 0:
         p.error("--duration phải > 0")

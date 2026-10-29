@@ -23,7 +23,7 @@ FIRST_SEQ = 101
 
 def make_run(tmp_path, dur_s=3, auto_end=1, drop_gyro=(), overwrite_gyro=(), drop_qseq=(), data_dup=False,
              no_run_end=False, pre_start_report=False, rx_end_delay_us=None, name="run",
-             imu_init="imu_init=0,imu_init_ms=412", enc_short=0):
+             imu_init="imu_init=0,imu_init_ms=412", enc_short=0, s_temp=None):
     """Ghi esp32_events.txt, esp32_data.txt cho một lượt; trả thư mục."""
     t1 = T0 + dur_s * 1_000_000
     ev = []                                   # (t_us, dòng không có qseq, là text?)
@@ -46,7 +46,7 @@ def make_run(tmp_path, dur_s=3, auto_end=1, drop_gyro=(), overwrite_gyro=(), dro
         ev.append((T0 + 1000, "I,{q},%d,2,1,255,1,0,0,0.1,0.2,0.3" % (T0 + 1000), False))
     for k in range(dur_s):
         ev.append((T0 + (k + 1) * 1_000_000 - 1, "S,{q}," + f"{T0 + (k + 1) * 1_000_000 - 1}"
-                   + ",1,0,0,0,0,0,10000,0,0,0,0,0", False))
+                   + ",1,0,0,0,0,0,10000,0,0,0,0,0" + ("" if s_temp is None else f",{s_temp}"), False))
     ev.append((T0, "#run_start,first_data_seq=%d,timestamp_us=%d,profile=heavy,duration_s=%d,auto_end=%d,"
                "fw=abc123,dirty=0,env=s06_load,cfg_hash=deadbeef" % (FIRST_SEQ, T0, dur_s, auto_end)
                + ("," + imu_init if imu_init else ""), True))
@@ -246,7 +246,9 @@ def test_logger_start_stop_with_fake_esp32(tmp_path, no_auto_end):
     out = str(tmp_path / "cap")
     argv = ["--esp32", "127.0.0.1", "--profile", "zero", "--duration", "1", "--out", out,
             "--listen-before", "0.1", "--linger", "0.2", "--bind", "127.0.0.1",
-            "--cmd-port", str(cmd), "--data-port", str(data), "--evt-port", str(evt)]
+            "--cmd-port", str(cmd), "--data-port", str(data), "--evt-port", str(evt),
+            "--temp-path", str(tmp_path / "temp")]
+    (tmp_path / "temp").write_text("45123\n")
     if no_auto_end:
         argv.append("--no-auto-end")
     t = time.monotonic()
@@ -261,6 +263,9 @@ def test_logger_start_stop_with_fake_esp32(tmp_path, no_auto_end):
     assert any("\t#run_start," in l for l in evl) and any("\t#run_end," in l for l in evl)
     assert all(l.split("\t", 1)[0].isdigit() for l in evl)
     assert len(open(os.path.join(out, "esp32_data.txt"), encoding="utf-8").read().splitlines()) == 1
+    temps = open(os.path.join(out, "pi_temp.txt"), encoding="utf-8").read().splitlines()
+    assert temps and all(l.split("\t")[1] == "45123" for l in temps)
+    assert f"samples: {len(temps)}," in y and "error: \"\"" in y
     if no_auto_end:
         assert "STOP pi_stop" in y
         assert time.monotonic() - t >= 1.0          # Pi gửi STOP sau đúng thời lượng
@@ -302,3 +307,24 @@ def test_firmware_gyro_gap_reported_not_scored(tmp_path):
     res, _, _ = chk.check_run(make_run(tmp_path))
     assert res["dut_fw_gyro_gap_max_us"] == "10000"
     assert not any("fw" in i["item"] and "gap" in i["item"] for i in res["items"])
+
+
+@pytest.mark.parametrize("s_temp, want", [(None, None), ("41.5", 41.5), ("nan", "nan")])
+def test_s_line_with_esp32_temperature(tmp_path, s_temp, want):
+    """dòng S 16 trường (temp_c của s06_load, T5 30/10) vẫn là dòng đúng; bản 15 trường cũ vẫn đọc được"""
+    res, ev, imu = chk.check_run(make_run(tmp_path, s_temp=s_temp))
+    assert res["status"] == "pass" and ev["bad"] == 0 and len(ev["S"]) == 3
+    got = ev["S"][0]["temp_c"]
+    if want == "nan":
+        assert got != got
+    else:
+        assert got == want
+
+
+def test_logger_temperature_unreadable_is_recorded(tmp_path):
+    cap = lg.Capture(str(tmp_path / "cap"), free_port(), free_port(), "127.0.0.1",
+                     temp_path=str(tmp_path / "missing"))
+    cap.poll(0.01)
+    cap.close()
+    assert cap.temp_n == 0 and cap.temp_error.startswith("FileNotFoundError")
+    assert (tmp_path / "cap" / "pi_temp.txt").read_text() == ""

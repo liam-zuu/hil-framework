@@ -104,11 +104,13 @@ def parse_events(raw):
                 ev["E"].append(dict(eseq=int(f[1]), t_before=int(f[2]), t_after=int(f[3]),
                                     c=tuple(int(x) for x in f[4:8])))
                 continue
-            elif k == "S" and len(f) == 15:
+            elif k == "S" and len(f) in (15, 16):
+                # 16 trường từ s06_load có temp_c (nhiệt độ chip ESP32-S3, T5, 30/10); bản cũ 15 trường
                 r = dict(qseq=int(f[1]), t_us=int(f[2]), run=int(f[3]), ev_qdrop=int(f[4]),
                          enc_ovf=int(f[5]), imu_rx=int(f[6]), imu_cbq=int(f[7]), imu_mutex=int(f[8]),
                          gyro_gap_max_us=int(f[9]), relay_ok=int(f[10]), relay_bad=int(f[11]),
-                         log_qdrop=int(f[12]), log_send_err=int(f[13]), ev_send_err=int(f[14]))
+                         log_qdrop=int(f[12]), log_send_err=int(f[13]), ev_send_err=int(f[14]),
+                         temp_c=float(f[15]) if len(f) == 16 else None)
             else:
                 ev["bad"] += 1
                 continue
