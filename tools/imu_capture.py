@@ -82,9 +82,10 @@ class SerialSource:
         while time.time() < t_end:
             line = s.readline().decode(errors='replace').strip()
             if line.startswith('IMU READY'):
-                if 'v2' not in line:
+                if 'v2' not in line.split() and 'v3' not in line.split():
                     sys.exit(f'ESP32 prints "{line}": old firmware (v1). Flash env imu_log_20 or imu_log_100.')
-                got = int(line.split('period_us=')[1])
+                # v3 (29/10) adds " t_us=<n>", ctrl-imu adds " init_ms=<m>": take the first token
+                got = int(line.split('period_us=')[1].split()[0])
                 if got != period_us:
                     sys.exit(f'ESP32 reports period_us={got}, --rate expects {period_us}. Flash the matching env.')
                 return
