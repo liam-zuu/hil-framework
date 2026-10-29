@@ -39,6 +39,7 @@ from protocol import encode_state, decode_torques, TRAJ_VALID, TRAJ_NEW
 from plant_interface import PlantInterface, MockPlant
 from mecanum_plant import MecanumPlant
 from imu_model import imu_from_plant
+import t4_imu_profile
 from params import PARAMS
 
 log = logging.getLogger('hil.node')
@@ -75,6 +76,8 @@ class HILConfig:
     # IMU for the BNO085 emulator (G2): (gz, ax, ay, az, yaw) sent in every
     # frame instead of the plant values; None = plant values (MecanumPlant)
     imu_static:        Optional[tuple] = None
+    # S06 T4 (4): 't4' = locked IMU sequence of t4_imu_profile.py by frame time
+    imu_profile:       Optional[str]   = None
     # Monitoring
     # S06 (29/10): raw MOSI + MISO of every frame and the send time, kept in
     # preallocated arrays inside the loop (one index write per step) and
@@ -265,6 +268,8 @@ class HILNode:
         """
         if self.cfg.imu_static is not None:
             imu = self.cfg.imu_static
+        elif self.cfg.imu_profile == 't4':
+            imu = t4_imu_profile.sample(self._step * self.cfg.period_us / 1e6)
         elif self._mecanum:
             imu = imu_from_plant(state, self._prev_state,
                                  self.cfg.period_us / 1e6, PARAMS.g)

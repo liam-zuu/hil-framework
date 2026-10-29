@@ -240,6 +240,9 @@ def _parse_args() -> argparse.Namespace:
                    help='BNO085 emulator check (G2): send these constant IMU values '
                         '[rad/s, m/s^2, m/s^2, m/s^2, rad] in every frame instead of the '
                         'plant values (imu_seq still changes every frame)')
+    p.add_argument('--imu-profile',   default=None, choices=['t4'],
+                   help='S06 T4 (4): send the locked IMU sequence of t4_imu_profile.py '
+                        '(static levels then a 5 s ramp, 27 s cycle) instead of the plant values')
     p.add_argument('--fixed-omega',   default=None, metavar='W1,W2,W3,W4',
                    help='EncoderGen check: send these constant wheel speeds [rad/s] instead of '
                         'running the plant (use with --steps)')
@@ -291,6 +294,8 @@ def main() -> int:
         from t3b_schedule import read_csv
         args.steps = max(r.slot_end_ms for r in read_csv(args.omega_schedule))
 
+    if args.imu_static and args.imu_profile:
+        raise SystemExit('--imu-static and --imu-profile exclude each other')
     hil_cfg = HILConfig(
         period_us    = 1_000,
         rt_priority  = args.rt_priority,
@@ -300,6 +305,7 @@ def main() -> int:
         max_steps    = args.steps,
         simulate_hw  = args.mock,
         imu_static   = parse_imu_static(args.imu_static) if args.imu_static else None,
+        imu_profile  = args.imu_profile,
         frame_log    = args.frame_log,
     )
     traj_spec = TrajectorySpec(
