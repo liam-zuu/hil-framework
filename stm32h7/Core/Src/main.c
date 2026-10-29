@@ -206,13 +206,16 @@ int main(void)
             _up_first_frames = s0.frames;
             printf("SPI link up at t=%lu ms\r\n", (unsigned long)_up_first_ms);
         }
-        SPI1_GetState(&g_state);
-        SPI1_GetTrajRef(&g_traj);   /* +++ NEW — clears frame_ready */
+        SPI1_GetFrame(&g_state, &g_traj);   /* one frame; clears frame_ready */
 
         for (int i = 0; i < ENC_NUM_WHEELS; i++)
             EncoderGen_SetOmega(i, g_state.omega[i]);
 
-        UartRelay_Send(&g_traj);    /* +++ NEW — relay traj → ESP32 */
+        /* Relay the latched VALID|NEW setpoint (also one from a frame this
+         * loop did not see), not just the flags of the latest frame */
+        HIL_TrajRef_t relay_traj;
+        if (SPI1_TakeNewTraj(&relay_traj, NULL))
+            UartRelay_Send(&relay_traj);
 
         /* Read PWM duty → pack into output torque for RPi5 */
         float duty[4];
@@ -229,6 +232,7 @@ int main(void)
         _n_link_lost++;
         for (int i = 0; i < ENC_NUM_WHEELS; i++)
             EncoderGen_SetOmega(i, 0.0f);
+        SPI1_DropNewTraj();      /* no old setpoint relayed after reconnect */
         SPI1_RequestRestart();   /* covers a DMA stuck without an error */
         SPI1_Stats_t s1;
         SPI1_GetStats(&s1);
@@ -282,6 +286,12 @@ int main(void)
                (unsigned long)((ss.frames - _frames_last) * 2u),
                (unsigned long)ss.errors, (unsigned long)ss.rearms,
                (unsigned long)ss.last_error);
+        /* Frames the main loop did not read, and the NEW setpoint path:
+         * seen = taken + replaced + dropped (+1 if one is pending) */
+        printf("Frame: unread=%lu  new seen=%lu taken=%lu repl=%lu drop=%lu\r\n",
+               (unsigned long)ss.unread, (unsigned long)ss.new_seen,
+               (unsigned long)ss.new_taken, (unsigned long)ss.new_replaced,
+               (unsigned long)ss.new_dropped);
         _frames_last = ss.frames;
         /* BNO085 emulator (G2): host init (adv, prod id, set features),
          * transactions and reports per sensor (accel / gyro / game RV) */

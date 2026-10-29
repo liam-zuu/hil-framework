@@ -10,19 +10,22 @@
  * Call order:
  *   1. SPI1_Handler_Init(&hspi1)           — in USER CODE BEGIN 2
  *   2. SPI1_IsFrameReady()                 — poll in while(1)
- *   3. SPI1_GetState(&state)               — read plant state
- *   4. SPI1_GetTrajRef(&traj)              — read traj ref, clears ready flag
- *   5. SPI1_SetOutput(&output)             — update MISO before next frame
+ *   3. SPI1_GetFrame(&state, &traj)        — state + traj of one frame,
+ *                                            clears the ready flag
+ *   4. SPI1_TakeNewTraj(&traj, &seq)       — setpoint to relay, if one came
+ *   5. SPI1_SetOutput(&output)             — staged, sent from the frame
+ *                                            after next (see spi1_handler.c)
  *   6. SPI1_Callback(&hspi1)               — from HAL_SPI_TxRxCpltCallback
  *
- * NOTE: SPI1_GetTrajRef() MUST be called after SPI1_GetState() —
- *       it clears _frame_ready.
+ * (29/10: SPI1_GetState() + SPI1_GetTrajRef() replaced by SPI1_GetFrame(),
+ *  which copies both from the same frame with interrupts masked.)
  */
 
 void    SPI1_Handler_Init(SPI_HandleTypeDef *hspi);
 uint8_t SPI1_IsFrameReady(void);
-void    SPI1_GetState    (HIL_State_t *out);
-void    SPI1_GetTrajRef  (HIL_TrajRef_t *out);   /* clears frame_ready */
+void    SPI1_GetFrame    (HIL_State_t *state, HIL_TrajRef_t *traj); /* clears frame_ready */
+uint8_t SPI1_TakeNewTraj (HIL_TrajRef_t *out, uint8_t *seq);       /* 1 = got one */
+void    SPI1_DropNewTraj (void);                 /* link lost: forget pending */
 void    SPI1_GetImu      (HIL_Imu_t *out);       /* IMU values, v3 frame */
 void    SPI1_SetOutput   (const HIL_Output_t *out);
 void    SPI1_Callback    (SPI_HandleTypeDef *hspi);
@@ -40,6 +43,11 @@ typedef struct {
     uint32_t rearms;       /* DMA restarts done by SPI1_Service()          */
     uint32_t last_error;   /* hspi->ErrorCode at the last error            */
     uint32_t last_frame_ms;/* HAL_GetTick() in the callback of the last frame */
+    uint32_t unread;       /* frames decoded before the main loop read the last */
+    uint32_t new_seen;     /* VALID|NEW frames decoded                      */
+    uint32_t new_replaced; /* pending setpoint replaced by a newer one      */
+    uint32_t new_taken;    /* setpoints taken by the main loop for the relay */
+    uint32_t new_dropped;  /* pending setpoints forgotten at link lost      */
 } SPI1_Stats_t;
 
 void    SPI1_ErrorCallback  (SPI_HandleTypeDef *hspi);
