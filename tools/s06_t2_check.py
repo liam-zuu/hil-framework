@@ -35,6 +35,9 @@ Khớp spec 3.1 (Liam 30/10, "Duyệt, làm tiếp"):
     (so sánh với NaN luôn sai nên trước đây lọt như "không lỡ hạn").
   * X8: `uname` trong `.json` của lượt được chép vào kết quả; thiếu thì ghi chú.
 
+Sửa theo Codex Sol vòng 2/2 (Liam duyệt 30/10 "Duyệt, sửa hết"): C2-5 mọi dòng không hữu hạn cũng là mất dữ liệu
+đo (`fail_data_loss`), không còn là lỗi đầu vào, nên các lượt khác trong cùng lệnh không mất kết quả.
+
 Usage:
   python tools/s06_t2_check.py <steps.csv> [<steps.csv> ...] [--out summary.json]
 Mã thoát (spec 3.1, bảng mã kết quả): 0 mọi lượt đạt; 1 có lượt không đạt hoặc thất bại; 3 không có lượt không
@@ -87,9 +90,13 @@ def check_run(path, min_scored_s=MIN_SCORED_S, cluster_gap=CLUSTER_GAP_STEPS, pe
     a, meta = load(path)
     # C1-10: a row with NaN/Inf is lost data (every comparison with NaN is False, it would pass as "no miss")
     fin = np.all([np.isfinite(v) for v in a.values()], axis=0)
-    if not fin.any():
-        raise ValueError(f'{path}: no finite row')
     non_finite = int(np.sum(~fin))
+    if not fin.any():                  # C2-5: every row lost is lost data too, not an input fault
+        return dict(file=path, rows=0, notes=[f'{non_finite} dòng, không dòng nào hữu hạn: mất dữ liệu đo'],
+                    non_finite_rows=non_finite, status='fail_data_loss', steps_scored=0, scored_s=0.0, misses=0,
+                    miss_clusters=0, t_end_late=0, step_gaps=0, overflow=(meta or {}).get('overflow'),
+                    lost_or_torn=(meta or {}).get('lost_or_torn'), done_max_us=None, done_p99_us=None,
+                    done_p999_us=None, start_max_us=None)
     a = {k: v[fin] for k, v in a.items()}
     step = a['step'].astype(np.int64)
     ts, t0, td, te = (a[c].astype(float) for c in ('t_sched_us', 't_start_us', 't_done_us', 't_end_us'))

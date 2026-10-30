@@ -105,6 +105,20 @@ def test_c1_10_non_finite_row_is_data_loss(tmp_path, bad):
     assert r['status'] == 'fail_data_loss' and r['non_finite_rows'] == 1
 
 
+def test_c2_5_all_rows_non_finite_is_data_loss(tmp_path, capsys):
+    # every row NaN: a failure of that run, and the runs scored with it keep their result
+    p = write(tmp_path, name='nan.csv')
+    lines = open(p).read().splitlines()
+    open(p, 'w', newline='\n').write('\n'.join(lines[:1] + [','.join(['nan'] * 6)] * 3) + '\n')
+    r = t2.check_run(p)
+    assert r['status'] == 'fail_data_loss' and r['non_finite_rows'] == 3
+    good = write(tmp_path, name='ok.csv')
+    assert t2.main([good, p]) == 1
+    out = capsys.readouterr().out
+    assert 'ok.csv: pass' in out and 'nan.csv: fail_data_loss' in out and out.splitlines()[-1] == '#ket_qua,ma=1'
+    assert t2.main([p]) == 1
+
+
 def test_c1_10_non_finite_resolution_is_data_loss(tmp_path):
     p = write(tmp_path)
     m = json.load(open(p + '.json'))
