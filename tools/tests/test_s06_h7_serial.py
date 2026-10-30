@@ -99,6 +99,7 @@ def test_t10_lost_block_and_irq_line_found():
     # it shows in the PC times. A missing IRQ line shows in isr_us vs the sum of excl_us.
     s = _summary(drop_block=2)
     assert not s['complete'] and any('mất khối' in p for p in s['problems'])
+    assert any('khác 10 s sau khối' in p for p in s['problems'])     # the spacing check itself, not the count
     s = _summary(drop_block=3)                               # the last block of the run
     assert not s['complete'] and any('mất khối' in p for p in s['problems'])
     s = _summary(drop_irq=2)

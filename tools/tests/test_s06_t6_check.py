@@ -62,7 +62,7 @@ def esp(t_pi):
 
 
 def build(tmp_path, steps=STEPS, hold_s=1.0, gain=(1, 1, 1, 1), offset=None, bad_gpio=False, tau_frames=1.0,
-          corrupt=(), ppm=None, glitch=None, end_force=True):
+          corrupt=(), ppm=None, glitch=None, end_force=True, run_end=True):
     global PPM
     PPM = ppm if ppm is not None else 20e-6
     rng = np.random.default_rng(11)
@@ -111,7 +111,8 @@ def build(tmp_path, steps=STEPS, hold_s=1.0, gain=(1, 1, 1, 1), offset=None, bad
                 continue                                    # s06_apply writes only on change
             lines.append(p_line(i, tb, w, st[w], int(t_cmd[i] + rng.uniform(2000, 6000))))
     t_stop = t_cmd[-1] + hold_s * 1e6                       # end_run: #run_end, then every wheel forced to 0
-    lines.append(f'{int(t_stop + 3000)}\t#run_end,last_data_seq=9,timestamp_us={int(esp(t_stop))},qseq=1')
+    if run_end:
+        lines.append(f'{int(t_stop + 3000)}\t#run_end,last_data_seq=9,timestamp_us={int(esp(t_stop))},qseq=1')
     if end_force:
         for w in range(4):
             lines.append(p_line(len(steps), esp(t_stop + 1000), w, 0, int(t_stop + 5000)))
@@ -215,6 +216,12 @@ def test_forced_zero_after_run_end_is_not_a_level(tmp_path):
     # S22: the schedule ends on a non-zero level; end_run forces 0 after #run_end: no short segment
     code, s, _, p = run(tmp_path, steps=STEPS[:-1])
     assert code == 0 and s['levels']['short'] == 0, p.stdout[-1500:]
+    # the same duty written again (forced 0 after the last 0 level) continues the segment even without
+    # the #run_end mark
+    code, s, out, p = run(tmp_path, run_end=False)
+    n_seg = sum(len([1 for i, st in enumerate(STEPS) if i == 0 or STEPS[i - 1][w] != st[w]]) for w in range(4))
+    assert code == 0 and s['levels']['short'] == 0, p.stdout[-1500:]
+    assert len(open(out / 'T6_levels.csv').read().splitlines()) - 1 == n_seg       # no extra 0 segment
 
 
 def test_gain_error_fails_on_that_wheel(tmp_path):

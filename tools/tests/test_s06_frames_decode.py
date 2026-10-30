@@ -200,6 +200,16 @@ def test_epoch_step_on_one_side_only(clean, tmp_path):
     assert any('không neo được' in x for x in dec.problems(res))
 
 
+def test_epoch_offset_rules():
+    # S7: same number of epochs but not stepping together (H7 1 -> 2, ESP32 2 -> 4): not anchored
+    h7 = [dict(epoch=1), dict(epoch=2)]
+    assert dec.epoch_offset(h7, [dict(epoch=2, t_us=0), dict(epoch=3, t_us=1)]) == (1, '')
+    off, note = dec.epoch_offset(h7, [dict(epoch=2, t_us=0), dict(epoch=4, t_us=1)])
+    assert off is None and 'không cùng bước' in note
+    off, note = dec.epoch_offset(h7, [dict(epoch=2, t_us=0), dict(epoch=3, t_us=1), dict(epoch=2, t_us=2)])
+    assert off is None                                   # an epoch coming back: not one-to-one
+
+
 def test_seq_chain_rules():
     # S8: k ≥ 1, unwrap only below 128 periods, cut from 128 periods
     items = [(s % 256, 10 * i) for i, s in enumerate(range(300))]          # clean, period 10

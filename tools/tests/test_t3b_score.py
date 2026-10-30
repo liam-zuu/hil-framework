@@ -205,3 +205,23 @@ def test_sensitivity_quick(tmp_path):
     assert 'Z23 gate' in p.stdout and 'PASS' in p.stdout.splitlines()[-1]
     old = open(tmp_path / 'T3b_old.csv').read()
     assert ',fail\n' in old
+
+
+def test_truth_labels_from_the_ideal_generator(small):
+    # S29 (c): a harness window whose count deviates from the ideal generator by more than N_tol + u_t is
+    # labelled observable from the truth, before any verdict is read; the others are not
+    import t3b_sensitivity as sens
+    sched, t_send, w_d, tb, ta = small
+    c = exact_counts(t_send, w_d, tb, ta)
+    ideal = sc.Run(t_send, w_d, tb, ta, c)
+    r = _pick(sched, 'reverse_10_-10')
+    bad = c.copy()
+    i_mid = int(np.searchsorted(tb, t_send[r.t0_ms] + 300.0))
+    bad[i_mid:, r.wheel] += 500                                              # a jump of 500 counts on that wheel
+    harness = sc.Run(t_send, w_d, tb, ta, bad)
+    rows_i, rows_h = sc.score_run(ideal, sched), sc.score_run(harness, sched)
+    sens.truth_big(rows_h, rows_i, ideal, harness)
+    x = {y['id']: y for y in rows_h}[r.id]
+    assert x['obs_big'] and x['e_truth'] == 500
+    assert all(y['obs_big'] is not None for y in rows_h)
+    assert not any(y['obs_big'] for y in rows_h if y['wheel'] != r.wheel)
