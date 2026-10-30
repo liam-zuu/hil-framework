@@ -43,6 +43,9 @@ Sửa theo Codex Sol vòng 1/2 (Liam duyệt 30/10 "Duyệt, sửa hết"):
   * S18: không có cửa sổ nào → mã 3; lịch phải là lịch khóa `make_schedule(--locked-seed)` (seed 1).
 Sửa theo Codex Sol vòng 2/2 (Liam duyệt 30/10 "Duyệt, sửa hết"): C2-2 có cửa sổ không đạt thì giữ mã 1 dù thiếu
 bằng chứng; C2-14 u_t vượt yêu cầu công cụ ghi `khong_du_dieu_kien`, không phải `chua_ket_luan`.
+Sửa theo Codex Sol vòng 3 (Liam 30/10 "Làm cả gói, 0,2 %"): C3-1 cửa sổ thiếu frame hay lần đọc ở một đầu là
+`no_data`, không xóa kết quả các cửa sổ đã chấm (mất dữ liệu trong lượt vẫn mã 1, còn lại mã 3
+`khong_du_dieu_kien`); C3-14 CSV ghi mốc thời gian ba số lẻ để tính lại được u_t.
 Mã thoát: 0 mọi cửa sổ đạt và đủ bằng chứng; 1 có cửa sổ không đạt hoặc mất dữ liệu; 3 không có không đạt
 nhưng có chưa kết luận, u_t vượt yêu cầu công cụ, hoặc thiếu bằng chứng (lần gọi H7, giờ H7 hiệu chuẩn,
 #run_end, lịch khóa); 2 lỗi đầu vào (kể cả MOSI không theo lịch).
@@ -75,6 +78,12 @@ COLUMNS = ['idx', 'id', 'wheel', 'transition', 'rep', 'omega_from', 'omega_to',
            'n_tol', 'uncertainty', 'u_t_limit', 'u_t_ok', 'backward_steps', 'start_phase_counts',
            'stop_interval_counts', 'stop_meas_counts', 'n_calls_actual', 'n_calls_expected',
            'deadband_counts', 'h5_part', 'low_part', 'delay_part', 'fixed', 'verdict_b', 'verdict']
+TIME_COLUMNS = ('t_read_before_us', 't_read_after_us', 't_read_before_end_us', 't_read_after_end_us',
+                'window_start_us', 'window_end_us')      # C3-14: u_t must be computable again from the CSV
+
+
+class WindowNotScored(ValueError):
+    """C3-1: no frame or read at an end of a window: that window is `no_data`, the others keep their result."""
 
 
 def eff(v: float) -> float:
@@ -167,11 +176,11 @@ class Run:
     def score(self, r) -> dict:
         w = r.wheel
         if r.win_end_ms + self.frame_lag >= len(self.t_send):
-            raise ValueError(f'window {r.id} ends after the last frame')
+            raise WindowNotScored(f'window {r.id} ends after the last frame')
         Ts, Te = self.t_send[r.win_start_ms + self.frame_lag], self.t_send[r.win_end_ms + self.frame_lag]
         ia, ib = self.read_after(Ts), self.read_after(Te)
         if ia is None or ib is None:
-            raise ValueError(f'window {r.id}: no read after its start or end')
+            raise WindowNotScored(f'window {r.id}: no read after its start or end')
         t_a, t_b = self.t_read(ia), self.t_read(ib)
         meas = int(self.c[ib, w] - self.c[ia, w])
         cmd = K * self.integral(w, t_a, t_b)
@@ -234,7 +243,11 @@ def score_run(run: Run, sched: Sequence) -> List[dict]:
     for r in sorted(sched, key=lambda x: (x.wheel, x.t0_ms)):
         key = (r.wheel, r.kind)
         reps[key] = reps.get(key, 0) + 1
-        row = run.score(r)
+        try:
+            row = run.score(r)
+        except WindowNotScored:                # C3-1: the tail lost does not wipe out the windows already scored
+            row = dict(id=r.id, wheel=r.wheel, transition=r.kind, omega_from=r.w_from, omega_to=r.w_to,
+                       u_t_ok=True, verdict_b='no_data', verdict='no_data')
         row['rep'] = reps[key]
         out.append(row)
     out.sort(key=lambda x: x['id'])
@@ -246,7 +259,8 @@ def score_run(run: Run, sched: Sequence) -> List[dict]:
 def summarize(rows: Sequence[dict]) -> dict:
     groups: Dict[tuple, Dict[str, int]] = {}
     for x in rows:
-        g = groups.setdefault((x['transition'], x['wheel']), {'pass': 0, 'fail': 0, 'inconclusive': 0, 'u_t_bad': 0})
+        g = groups.setdefault((x['transition'], x['wheel']),
+                              {'pass': 0, 'fail': 0, 'inconclusive': 0, 'no_data': 0, 'u_t_bad': 0})
         g[x['verdict']] += 1
         g['u_t_bad'] += 0 if x['u_t_ok'] else 1
     return groups
@@ -255,7 +269,7 @@ def summarize(rows: Sequence[dict]) -> dict:
 def exit_code(rows: Sequence[dict]) -> int:
     if any(x['verdict'] == 'fail' for x in rows):
         return 1
-    if not rows or any(x['verdict'] == 'inconclusive' or not x['u_t_ok'] for x in rows):
+    if not rows or any(x['verdict'] in ('inconclusive', 'no_data') or not x['u_t_ok'] for x in rows):
         return 3                                    # S18: no window scored is no pass
     return 0
 
@@ -268,7 +282,8 @@ def code3_reasons(rows: Sequence[dict], sched_bad, rhythm: dict, evidence: bool)
     if exit_code(rows) == 1:
         return []
     reasons = ['chua_ket_luan'] if any(x['verdict'] == 'inconclusive' for x in rows) else []
-    if not rows or any(not x['u_t_ok'] for x in rows) or sched_bad or rhythm['ok'] is False:
+    if (not rows or any(not x['u_t_ok'] or x['verdict'] == 'no_data' for x in rows) or sched_bad
+            or rhythm['ok'] is False):
         reasons.append('khong_du_dieu_kien')
     if not evidence or not rhythm['known']:
         reasons.append('thieu_bang_chung')
@@ -308,7 +323,8 @@ def write_rows(path: str, rows: Sequence[dict]) -> None:
         wr = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction='ignore')
         wr.writeheader()
         for x in rows:
-            wr.writerow({k: (f'{v:.6g}' if isinstance(v, float) else v) for k, v in x.items()})
+            wr.writerow({k: (f'{v:.3f}' if k in TIME_COLUMNS else f'{v:.6g}') if isinstance(v, float) else v
+                         for k, v in x.items()})
 
 
 # ── real run ──
@@ -405,8 +421,9 @@ def main(argv=None) -> int:
         return 2
     # S4 (Z19): lost encoder reads inside the scored span, or an ESP32 overflow, is a failure
     off, rate = a.clock_affine
-    w0 = min(r['window_start_us'] for r in rows) if rows else 0.0
-    w1 = max(r['window_end_us'] for r in rows) if rows else 0.0
+    scored = [r for r in rows if r['verdict'] != 'no_data']
+    w0 = min(r['window_start_us'] for r in scored) if scored else 0.0
+    w1 = max(r['window_end_us'] for r in scored) if scored else 0.0
     stream = stm.enc_stream(eseq, tb_esp, (w0 - off) / rate - 1000.0, (w1 - off) / rate + 1000.0, marks)
     notes += stm.stream_notes(stream)
     if not stream['ok']:
@@ -426,7 +443,7 @@ def main(argv=None) -> int:
         f.write(' '.join(sys.argv) + '\n')
     for (kind, w), g in sorted(summarize(rows).items()):
         print(f'{kind:22s} bánh {w}: đạt {g["pass"]}, không đạt {g["fail"]}, chưa kết luận {g["inconclusive"]}, '
-              f'u_t vượt {g["u_t_bad"]}')
+              f'không có dữ liệu {g["no_data"]}, u_t vượt {g["u_t_bad"]}')
     print(f'trễ lịch → frame: {lag} frame (khớp {frac:.4f})')
     for x in fails:
         print(f'KHÔNG ĐẠT: {x}')

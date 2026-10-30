@@ -166,7 +166,40 @@ def test_empty_and_lag_and_locked_schedule(small):
     assert sc.schedule_matches_locked(sched) != []                           # a cut schedule is not the locked one
 
 
-def _cli_run(tmp_path, small, lost=None, lag=1, extra=(), manifest=None, every=1):
+def test_lost_tail_keeps_the_windows_already_scored(small):
+    # C3-1: reads end early: the windows with no read at an end are `no_data`, the others keep their result
+    sched, t_send, w_d, tb, ta = small
+    n = len(tb) // 2
+    c = exact_counts(t_send, w_d, tb, ta)
+    r0 = sorted(sched, key=lambda r: r.win_start_ms)[0]
+    x0 = {y['id']: y for y in sc.score_run(sc.Run(t_send, w_d, tb, ta, c), sched)}[r0.id]
+    ib = int(np.searchsorted(tb, t_send[r0.win_end_ms]))
+    c[ib:, r0.wheel] += int(np.ceil(x0['n_tol'])) + 1              # a count error over N_tol in the first window
+    rows = sc.score_run(sc.Run(t_send, w_d, tb[:n], ta[:n], c[:n]), sched)
+    st = {x['id']: x['verdict'] for x in rows}
+    assert st[r0.id] == 'fail' and 'no_data' in st.values()
+    assert sc.exit_code(rows) == 1 and sc.code3_reasons(rows, [], dict(ok=True, known=True), True) == []
+    only = [x for x in rows if x['verdict'] == 'no_data']
+    assert sc.exit_code(only) == 3
+    assert sc.code3_reasons(only, [], dict(ok=True, known=True), True) == ['khong_du_dieu_kien']
+    assert sum(g['no_data'] for g in sc.summarize(rows).values()) == len(only)
+
+
+def test_csv_keeps_the_read_times(tmp_path, small):
+    # C3-14: the two ends of a read 3 µs apart at 10 s must survive the CSV
+    sched, t_send, w_d, tb, ta = small
+    row = dict(id=1, t_read_before_us=10324300.0, t_read_after_us=10324303.25, uncertainty=0.0630273456,
+               window_start_us=10324301.625, verdict='pass')
+    p = str(tmp_path / 'x.csv')
+    sc.write_rows(p, [row])
+    import csv as _csv
+    r = next(_csv.DictReader(open(p)))
+    assert float(r['t_read_after_us']) - float(r['t_read_before_us']) == pytest.approx(3.25, abs=1e-6)
+    assert float(r['window_start_us']) == pytest.approx(10324301.625, abs=1e-6)
+    assert r['uncertainty'] == '0.0630273'
+
+
+def _cli_run(tmp_path, small, lost=None, lag=1, extra=(), manifest=None, every=1, cut=None):
     """A run as run_hil --omega-schedule writes it: frame k carries entry k - lag; ESP32 clock = Pi clock.
     `every`: the firmware reads only every n-th time, and reports that count itself (C1-13)."""
     from protocol import encode_state
@@ -181,7 +214,7 @@ def _cli_run(tmp_path, small, lost=None, lag=1, extra=(), manifest=None, every=1
     lines = [f'{int(tb[0])}\t#run_start,timestamp_us={int(tb[0])},qseq=0']
     read = range(0, len(tb), every)
     for n, j in enumerate(read):
-        if j != lost:
+        if j != lost and (cut is None or j < cut):
             lines.append(f'{int(ta[j])}\tE,{n + 1},{int(tb[j])},{int(ta[j])},' + ','.join(str(x) for x in c[j]))
     lines.append(f'{int(ta[-1]) + 10}\t#run_end,timestamp_us={int(ta[-1])},ev_qdrop_run=0,enc_ovf_run=0,qseq=1')
     lines.append(f'{int(ta[-1]) + 11}\t#run_stats,log_send_err_run=0,enc_reads_run={len(read)},qseq=2')
@@ -190,6 +223,13 @@ def _cli_run(tmp_path, small, lost=None, lag=1, extra=(), manifest=None, every=1
     return sc.main(['--schedule', str(tmp_path / 'sched.csv'), '--frames', str(tmp_path / 'frames.npz'),
                     '--esp32-events', str(tmp_path / 'ev.txt'), '--clock-affine', '0', '1', '--delta-sync-us', '0',
                     '--out', str(tmp_path / 'out'), *extra])
+
+
+def test_cli_lost_tail_is_a_result_not_an_input_fault(tmp_path, small, capsys):
+    # C3-1, Z19: the E lines stop half way; the producer read them all: lost data, mã 1, and the CSV is written
+    assert _cli_run(tmp_path, small, cut=len(small[3]) // 2) == 1
+    assert capsys.readouterr().out.splitlines()[-1] == '#ket_qua,ma=1'
+    assert 'no_data' in (tmp_path / 'out' / 'T3b.csv').read_text()
 
 
 def test_cli_read_rhythm_checked_without_the_firmware_count(tmp_path, small, capsys):

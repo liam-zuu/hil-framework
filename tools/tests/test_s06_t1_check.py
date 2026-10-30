@@ -262,6 +262,49 @@ def _last_scored(data):
     return int(np.flatnonzero(data[0] / 1e3 <= int(data[0][-1] / 1e3) - 1_200_000)[-1])
 
 
+def _first_scored(data):
+    return int(np.flatnonzero(data[0] / 1e3 >= run(data, skip_s=0.0)['_windows'][0]['t_start_us'])[0])
+
+
+def test_c3_5_scored_set_is_by_source_frame(clean):
+    # frame F of the run is answered in F + 2: the two MISO before that answer frames before the run
+    first = _first_scored(clean)
+    for j, ours in ((first, False), (first + 1, False), (first + 2, True)):
+        out = run(build(faults={'age': {j: 5000}}), skip_s=0.0)
+        assert out['frames']['age_max_us'] == (5000 if ours else 300), j
+    assert run(build(faults={'empty': {first + 1}}), skip_s=0.0)['frames']['miso_empty'] == 0
+    assert run(build(faults={'empty': {first + 2}}), skip_s=0.0)['frames']['miso_empty'] == 1
+
+
+def test_c3_6_log_stream_of_the_run(clean):
+    # X16: a hole in the log during the padding before #run_start is not this run's; one inside it is
+    out = run(build(faults={'log_gap': {100}}), skip_s=0.0)
+    assert out['stream']['log_gaps'] == 0 and out['verdict'] != 'fail', out['fails']
+    out = run(build(faults={'log_gap': {10_000}}), skip_s=0.0)
+    assert out['stream']['log_gaps'] == 1 and out['verdict'] == 'fail'
+    # no run marks: the whole log, as before
+    assert run(build(faults={'log_gap': {100}}), full=False, skip_s=0.0)['stream']['log_gaps'] == 1
+
+
+def test_c3_2_decoder_counts_empty_miso_of_the_run(clean):
+    # CB5 has no T1: the decoder itself must not pass a frame the H7 did not answer
+    t, mosi, miso = clean[:3]
+    assert t1.dec.problems(t1.dec.decode(t, mosi, miso)) == []
+    m = miso.copy()
+    m[5003] = 0                                                    # a frame with no log record on it
+    res = t1.dec.decode(t, mosi, m)
+    assert res['frames']['empty_in_run'] == 1 and any('toàn 0' in x for x in t1.dec.problems(res))
+    # inside the run marks only; the first frames of a log have nothing to answer
+    ev = esp32_events(clean)
+    m = miso.copy()
+    m[300] = 0
+    assert t1.dec.decode(t, mosi, m, ev)['frames']['empty_in_run'] == 0
+    assert t1.dec.decode(t, mosi, m)['frames']['empty_in_run'] == 1
+    m = miso.copy()
+    m[10_003] = 0
+    assert t1.dec.decode(t, mosi, m, ev)['frames']['empty_in_run'] == 1
+
+
 def test_c2_3_answers_to_the_last_frames_are_scored(clean):
     # frame N is answered in frame N + 2: the state age of the last two frames of the run lies after #run_end
     last = _last_scored(clean)
