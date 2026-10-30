@@ -94,10 +94,11 @@ def events(tmp_path, mosi, seqs, fault=None, skip=None, name='esp32_events.txt',
                     in_run.append(rv_n)
                 if not (drop_tick and drop_tick(rv_n)):
                     data.append(f'{t + 900}\t{t + 900},0,{math.radians(y):.4f},{rv_n},{tick_rv}')
+            q += 1
             lines.append(f'{t + 50}\tI,{q},{t + 50},{code},{applied},{nn % 256},2,'
                          f'{rv_n if (kind == "game_rv" and applied) else n},{n},'
                          + ','.join(f'{x:.9g}' for x in v))
-    lines.append(f'{marks[1]}\t#run_end,last_data_seq={max(in_run)},timestamp_us={marks[1]},qseq={q + 1}')
+    lines.append(f'{marks[1]}\t#run_end,last_data_seq={max(in_run)},timestamp_us={marks[1]},ev_qdrop_run=0,qseq={q + 1}')
     lines[0] = lines[0].replace('@FIRST@', str(min(in_run)))
     lines.sort(key=lambda x: int(x.split('\t')[0]))
     p = tmp_path / name
@@ -154,12 +155,6 @@ def test_schedule_not_covered_is_incomplete(frames, tmp_path):
     assert s['fail'] == 0 and 'gz=5' in s['coverage_missing']['gyro'] and t4.exit_code(s) == 3
 
 
-def test_data_yaw_mismatch_fails(frames, tmp_path):
-    # S28: the controller's DATA yaw for one rv_n differs from the callback's
-    rows, s = check(frames, tmp_path, fault=('game_rv', 1500, 'data_yaw'))
-    assert s['data_yaw']['bad'] == 1 and t4.exit_code(s) == 1
-
-
 def test_fault_at_run_start_is_scored(frames, tmp_path):
     # S38: a wrong gyro callback 0,1 s after #run_start used to fall in the 0,5 s left out at each end
     n = (T_START // 1000 + 100 - 30) // 10
@@ -183,12 +178,6 @@ def test_data_tick_lost_fails(frames, tmp_path):
     # S39: one DATA line of the run missing from the file (log_seq hole) = lost data, not "one tick is enough"
     rows, s = check(frames, tmp_path, drop_tick=lambda rv: rv == 1200)
     assert s['data_yaw']['seq_missing'] == 1 and s['data_yaw']['bad'] == 0 and t4.exit_code(s) == 1
-
-
-def test_data_tick_without_callback_fails(frames, tmp_path):
-    # S39: a tick that points at an rv_n no callback line has (Codex counter-example) fails
-    rows, s = check(frames, tmp_path, fault=('game_rv', 1500, 'data_no_cb'))
-    assert s['data_yaw']['no_callback'] == 1 and t4.exit_code(s) == 1
 
 
 def test_data_bad_line_fails(frames, tmp_path):
@@ -268,14 +257,51 @@ def test_start_packet_later_than_the_bound_is_incomplete(frames, tmp_path):
     assert any('S55' in c for c in s['run_conditions']) and t4.exit_code(s) == 3
 
 
-def test_two_runs_in_one_file_is_an_input_error(frames, tmp_path):
-    # S58, S71: the decoder scores one run per file, and stops before scoring anything
+def test_two_runs_in_one_file_is_not_scored(frames, tmp_path):
+    # S58, X18: the decoder scores one run per file, and stops before scoring anything
     t, mosi, miso, seqs = frames
     ev, data = events(tmp_path, mosi, seqs)
     with open(ev, 'a') as fh:
         fh.write(f'{T_END + 500}\t#run_start,first_data_seq=9,timestamp_us={T_END + 500},qseq=999\n')
-    with pytest.raises(ValueError, match='S58'):
+    with pytest.raises(dec.stm.RunProblem):
         t4.check(t, mosi, miso, ev, data, manifest=manifest())
+
+
+def test_callback_line_lost_fails(frames, tmp_path):
+    # C1-2: one I line lost on UDP: the report it carried is not scored, so only the qseq stream shows it
+    t, mosi, miso, seqs = frames
+    ev, data = events(tmp_path, mosi, seqs)
+    lines = open(ev).read().splitlines()
+    i = next(k for k, x in enumerate(lines) if '\tI,' in x and int(x.split('\t')[0]) > 20_000_000)
+    open(ev, 'w').write('\n'.join(lines[:i] + lines[i + 1:]) + '\n')
+    rows, s = t4.check(t, mosi, miso, ev, data, manifest=manifest())
+    assert s['qseq_stream']['missing'] == 1 and (s['fail'], s['decode_problems']) == (0, [])
+    assert t4.outcome(s) == (1, None)
+
+
+def test_dut_results_do_not_fail_the_hil(frames, tmp_path):
+    # C1-5: DATA yaw off, or a tick with no callback: results about the DUT, reported, T4 of the HIL stands
+    for fault in (('game_rv', 300, 'data_yaw'), ('game_rv', 300, 'data_no_cb')):
+        rows, s = check(frames, tmp_path, fault=fault, name=f'{fault[2]}.txt')
+        assert sum(s['dut'].values()) == 1 and (s['data_yaw']['bad'] or s['data_yaw']['no_callback'])
+        assert t4.outcome(s) == (0, None), s['run_conditions']
+
+
+def test_data_stream_loss_still_fails(frames, tmp_path):
+    # Z19: a DATA line lost is lost measurement data, not a DUT result
+    rows, s = check(frames, tmp_path, drop_tick=lambda n: n == 500)
+    assert s['data_yaw']['seq_missing'] == 1 and t4.outcome(s) == (1, None)
+
+
+def test_reasons_of_code_3(frames, tmp_path):
+    t, mosi, miso, seqs = frames
+    ev, data = events(tmp_path, mosi, seqs)
+    # no manifest, no DATA file: evidence missing
+    assert t4.outcome(t4.check(t, mosi, miso, ev, data, manifest=None)[1]) == (3, 'thieu_bang_chung')
+    assert t4.outcome(t4.check(t, mosi, miso, ev, None, manifest=manifest())[1]) == (3, 'thieu_bang_chung')
+    # manifest says the run had another IMU source: the run does not qualify
+    r = t4.check(t, mosi, miso, ev, data, manifest=manifest(profile=None))[1]
+    assert t4.outcome(r) == (3, 'khong_du_dieu_kien')
 
 
 def _with_run_ids(ev, start, end):

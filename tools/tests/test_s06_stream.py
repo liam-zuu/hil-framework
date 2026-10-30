@@ -151,6 +151,35 @@ def test_p_with_the_id_of_another_run_is_not_received(tmp_path):
     assert q['malformed'] == 1 and q['missing'] == 1 and not q['ok']
 
 
+def test_read_rhythm():
+    m = dict(run_start=dict(kv=dict(timestamp_us='1000')), run_end=dict(kv=dict(timestamp_us='6000')))
+    tb = [1000.0 + 1000 * k for k in range(5)]
+    r = stm.read_rhythm(tb, m)
+    assert r['known'] and r['ok'] and r['expected'] == 5 and r['gap_max_us'] == 1000.0
+    assert stm.read_rhythm(tb[:3], m)['ok'] is False                            # count off by more than 1
+    assert stm.read_rhythm(tb[:4], m)['ok'] is True
+    gap = tb[:2] + [4100.0 + 1000 * k for k in range(3)]                        # right count, a 2.1 ms hole
+    assert stm.read_rhythm(gap, m)['ok'] is False and stm.read_rhythm(gap, m)['gap_max_us'] == 2100.0
+    assert not stm.read_rhythm(tb, dict(run_start=m['run_start']))['known']
+
+
+def test_require_run(tmp_path):
+    stm.require_run(stm.run_marks(two_runs(tmp_path), run=2))
+    with pytest.raises(stm.RunProblem):
+        stm.require_run(stm.run_marks(two_runs(tmp_path)))
+    with pytest.raises(ValueError) as e:
+        stm.require_run(stm.run_marks(two_runs(tmp_path), run=7))
+    assert not isinstance(e.value, stm.RunProblem)                              # X18: an input fault, mã 2
+
+
+def test_report_result(capsys):
+    assert stm.report_result(3, ['chua_ket_luan', 'khong_du_dieu_kien']) == 3
+    assert capsys.readouterr().out == '#ket_qua,ma=3,ly_do=khong_du_dieu_kien\n'
+    assert stm.report_result(3, ['thieu_bang_chung', 'chua_ket_luan']) == 3
+    assert 'ly_do=thieu_bang_chung' in capsys.readouterr().out
+    assert stm.report_result(0) == 0 and capsys.readouterr().out == '#ket_qua,ma=0\n'
+
+
 def test_e_of_run(tmp_path):
     e_new, e_old = (1, 2, 3, [0, 0, 0, 0], 5), (1, 2, 3, [0, 0, 0, 0], None)
     assert stm.e_of_run(e_new, dict(run_start={}, _run=5)) and not stm.e_of_run(e_new, dict(run_start={}, _run=6))

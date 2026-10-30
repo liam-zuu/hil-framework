@@ -74,7 +74,10 @@ def test_t10_blocks_inside_run_drop_first():
     assert w['idle_rel_unc'] == pytest.approx(1 / 22500 + 1 / 900_000)
     assert w['meas_cost_us'] == pytest.approx(420_000 * 24 / 480.0)
     spi = [r for r in irq if r['irq'] == 'SPI1'][0]
-    assert spi['max_us'] == 35.5 and spi['max_us_real'] == pytest.approx(35.5 * 480 / 483.1)
+    assert spi['max_us'] == 35.5
+    assert (spi['max_us_real_lo'], spi['max_us_real_hi']) == pytest.approx((35.5 * 480 / 486, 35.5 * 480 / 478))   # X22
+    one = [r for r in ser.t10_rows(blocks, 483.1)[1] if r['irq'] == 'SPI1'][0]          # frequency of the run itself
+    assert one['max_us_real_lo'] == one['max_us_real_hi'] == pytest.approx(35.5 * 480 / 483.1)
     assert spi['pct'] == pytest.approx(3.0) and spi['gross_us'] == ''
     s = ser.t10_summary(blocks, win, irq, ev, span)
     assert s['complete'] and s['windows'] == 3 and s['per_irq'][0]['irq'] == 'TIM5'
@@ -143,7 +146,13 @@ def test_cli(tmp_path):
     assert open(out / 'T10.csv').readline().startswith('idx,window,irq,count,excl_us')          # S31
     assert open(out / 'T10_windows.csv').readline().startswith('idx,window,')
     log.write_text('\n'.join(make_log(print_drop_end=1)) + '\n', encoding='utf-8')
-    assert subprocess.run([sys.executable, script, str(log), '--out', str(out)], capture_output=True,
-                          text=True).returncode == 3
+    # C1-14: print_drop is lost data (Z19), not "not concluded"
+    p = subprocess.run([sys.executable, script, str(log), '--out', str(out)], capture_output=True, text=True,
+                       encoding='utf-8', errors='replace')
+    assert p.returncode == 1 and '#ket_qua,ma=1' in p.stdout
+    log.write_text('\n'.join(make_log(pc=False)) + '\n', encoding='utf-8')
+    p = subprocess.run([sys.executable, script, str(log), '--out', str(out)], capture_output=True, text=True,
+                       encoding='utf-8', errors='replace')
+    assert p.returncode == 3 and 'ly_do=thieu_bang_chung' in p.stdout
     assert subprocess.run([sys.executable, script, str(tmp_path / 'none.log'), '--out', str(out)],
                           capture_output=True, text=True).returncode == 2

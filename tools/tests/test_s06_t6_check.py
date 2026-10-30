@@ -15,7 +15,10 @@ import pytest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 sys.path[:0] = [os.path.join(ROOT, 'tools'), os.path.join(ROOT, 'rpi5')]
+import s06_stream as stm  # noqa: E402
 import s06_t6_check as t6  # noqa: E402
+
+U_DUTY = '1e-5'                               # a small number from Z11
 
 LV = [0, 30, 50, 100, 300, 330, 500, 550, 700, 770, 900, 950, 970, 1000]
 STEPS = [[v] * 4 for v in LV] + [[100, 330, 550, 770], [0] * 4] + [[-v] * 4 for v in LV[1:]] + \
@@ -164,7 +167,7 @@ def run(tmp_path, extra=None, accept=True, **kw):
     npz, ev = build(tmp_path, **kw)
     out = tmp_path / 'out'
     if extra is None:
-        extra = (*true_affine(), '--u-duty', '0') if accept else ()
+        extra = (*true_affine(), '--u-duty', U_DUTY) if accept else ()
     p = subprocess.run([sys.executable, os.path.join(ROOT, 'tools', 's06_t6_check.py'), npz, '--esp32-events', ev,
                         '--out', str(out), *extra], capture_output=True, text=True)
     summ = json.load(open(out / 'T6_summary.json', encoding='utf-8')) if p.returncode != 2 else None
@@ -268,12 +271,18 @@ def test_frame_row_repeated_fails(tmp_path):
 
 def test_run_that_cannot_be_chosen_stops_before_scoring(tmp_path):
     # S71: --run of a run not in the file, or an id that comes twice: input error, nothing written
-    code, s, out, p = run(tmp_path, extra=(*true_affine(), '--u-duty', '0', '--run', '7'))
+    code, s, out, p = run(tmp_path, extra=(*true_affine(), '--u-duty', U_DUTY, '--run', '7'))
     assert code == 2 and not os.path.exists(out / 'T6_summary.json')
     ev = tmp_path / 'esp32_events.txt'
     ev.write_text(ev.read_text() + '99000000\t#run_start,run=1,first_data_seq=9,timestamp_us=99000000,qseq=9000\n')
-    with pytest.raises(ValueError, match='2 lần'):
+    with pytest.raises(stm.RunProblem, match='2 lần'):
         t6.read_events(str(ev), {}, 1)
+
+
+def test_u_duty_zero_is_not_a_number_from_z11(tmp_path):
+    # X20, C1-8: a run with --u-duty 0 passes no level on that number: not concluded
+    code, s, _, p = run(tmp_path, extra=(*true_affine(), '--u-duty', '0'))
+    assert code == 3 and s['levels']['fail'] == 0 and '#ket_qua,ma=3,ly_do=thieu_bang_chung' in p.stdout
 
 
 def test_frame_log_cut_is_not_a_pass(tmp_path):
@@ -290,17 +299,17 @@ def test_frame_log_cut_is_not_a_pass(tmp_path):
 
 
 def test_run_id_selects_the_lines(tmp_path):
-    # S58, S71: a file with two runs: without --run an input error; with --run only that run's P count
+    # S58, X18: a file with two runs: without --run mã 3 khong_du_dieu_kien; with --run only that run's P count
     code, s, out, p = run(tmp_path)
     assert code == 0 and s['run'] == 1, p.stdout[-800:]
     ev = tmp_path / 'esp32_events.txt'
     ev.write_text(ev.read_text() + '99000000\t#run_start,run=2,first_data_seq=9,timestamp_us=99000000,qseq=9000\n')
     p = subprocess.run([sys.executable, os.path.join(ROOT, 'tools', 's06_t6_check.py'), str(tmp_path / 'frames.npz'),
-                        '--esp32-events', str(ev), '--out', str(out), *true_affine(), '--u-duty', '0'],
+                        '--esp32-events', str(ev), '--out', str(out), *true_affine(), '--u-duty', U_DUTY],
                        capture_output=True, text=True)
-    assert p.returncode == 2
+    assert p.returncode == 3 and 'ly_do=khong_du_dieu_kien' in p.stdout
     p = subprocess.run([sys.executable, os.path.join(ROOT, 'tools', 's06_t6_check.py'), str(tmp_path / 'frames.npz'),
-                        '--esp32-events', str(ev), '--run', '1', '--out', str(out), *true_affine(), '--u-duty', '0'],
+                        '--esp32-events', str(ev), '--run', '1', '--out', str(out), *true_affine(), '--u-duty', U_DUTY],
                        capture_output=True, text=True)
     assert p.returncode == 0, p.stdout[-800:]
 

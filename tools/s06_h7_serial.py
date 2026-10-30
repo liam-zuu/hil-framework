@@ -26,13 +26,16 @@ T10 (spec S06 dòng T10, Y11, W10): chỉ báo số, không có ngưỡng.
     vòng). Chi phí đo = Σn × ovh_cyc / f_danh_định (cặp DWT, mục 4.1).
   * Đơn vị thời gian: H7 chia số chu kỳ cho SystemCoreClock danh định (480 MHz), win_ms đếm tick HAL của
     cùng đồng hồ, nên mọi tỉ lệ % đúng dù đồng hồ H7 nhanh 0,64 %. µs của H7 là "µs danh định"; µs thật
-    = µs H7 × f_danh_định / f_thật (f_thật ≈ 483,1 MHz, Gia_tri_spec_S06 mục 1, số suy từ đo 27/10):
-    cột `max_us_real`.
+    = µs H7 × f_danh_định / f_thật: cột `max_us_real_lo`, `max_us_real_hi` (X22, C1-15: theo tần số đo của
+    chính lượt `--f-real-mhz`, không có thì theo dải [478; 486] MHz; 483,1 MHz là số suy từ đo 27/10, không
+    phải của lượt nghiệm thu).
   * Tổng gộp (cận trên) không có: H7 chỉ in thời gian độc quyền; cột để trống. Vào/ra ngắt: chưa đo.
   * Luồng đủ (§4.3 điều 6): print_drop không tăng trong khoảng dùng, win_ms ∈ [9 900; 10 100], và (S24,
     Codex Sol vòng 1/2, Liam duyệt 30/10) không mất dòng IRQ (Σ excl_us ≤ isr_us ≤ Σ excl_us + số dòng)
     và không mất khối (giờ PC đầu dòng: hai header cách 10 s ± 0,5 s, số khối khớp độ dài đoạn; log
-    không có giờ PC thì không kiểm được, ghi là thiếu). Thiếu → `complete: false`, mã 3.
+    không có giờ PC thì không kiểm được, ghi là thiếu). C1-14 (bảng mã kết quả): mất dữ liệu (print_drop
+    tăng, mất khối, thiếu dòng IRQ, cửa sổ sai) → mã 1; thiếu bằng chứng (không có khối, không có giờ PC,
+    thiếu S06log) → mã 3 `thieu_bang_chung`.
 
 Đơn vị: H7 in µs (đã chia f_cpu), nên cột CSV là µs thay cho "cycles" của danh sách cột spec
 (irq, count, total_cycles_exclusive, total_cycles_gross, max_cycles, idle_cycles) [diễn giải CODE].
@@ -51,8 +54,10 @@ import re
 import sys
 from typing import Dict, List, Optional
 
+import s06_stream as stm
+
 F_NOMINAL_MHZ = 480.0             # SystemCoreClock danh định (HSE 8 MHz, PLLN 120, PLLP 2): H7 chia cho số này
-F_REAL_MHZ = 483.1                # xung lõi thật suy từ đo 27/10 (H7 nhanh 0,64 %; Gia_tri_spec_S06 mục 1)
+F_BAND_MHZ = (478.0, 486.0)       # X22: dải tần số H7 khi chưa khớp đồng hồ của lượt
 WIN_MS_OK = (9_900, 10_100)
 T10_GAP_TOL_S = 0.5               # S24 [ĐỀ XUẤT CODE]: hai header T10 liên tiếp cách 10 s ± 0,5 s theo giờ PC
 
@@ -150,8 +155,10 @@ def t10_blocks(ev: List[dict], all_blocks: bool = False):
     return blocks, span
 
 
-def t10_rows(blocks, f_real_mhz: float = F_REAL_MHZ):
+def t10_rows(blocks, f_real_mhz: Optional[float] = None):
+    """X22, C1-15: `max_us_real_lo/hi` theo tần số đo của chính lượt, không có thì theo dải [478; 486] MHz."""
     win_rows, irq_rows = [], []
+    lo_f, hi_f = (f_real_mhz, f_real_mhz) if f_real_mhz else F_BAND_MHZ
     for k, bl in enumerate(blocks):
         h = bl['head']
         win_us = h['win_ms'] * 1000.0
@@ -169,7 +176,8 @@ def t10_rows(blocks, f_real_mhz: float = F_REAL_MHZ):
         for i in bl['irqs']:
             irq_rows.append(dict(window=k, irq=i['irq'], count=i['n'], excl_us=i['excl_us'],
                                  gross_us='', max_us=i['max_us'],
-                                 max_us_real=i['max_us'] * F_NOMINAL_MHZ / f_real_mhz,
+                                 max_us_real_lo=i['max_us'] * F_NOMINAL_MHZ / hi_f,
+                                 max_us_real_hi=i['max_us'] * F_NOMINAL_MHZ / lo_f,
                                  pct=100.0 * i['excl_us'] / win_us))
     # S31: common row index first; µs columns are what the H7 prints (cycles already divided and
     # rounded on the H7: the raw cycles of the spec column list are not recoverable, not filled in)
@@ -188,12 +196,13 @@ def t10_summary(blocks, win_rows, irq_rows, ev, span) -> dict:
         p['max_us'] = max(p['max_us'], r['max_us'])
     for p in per.values():
         p['pct'] = 100.0 * p['excl_us'] / (tot_ms * 1000.0) if tot_ms else None
-    problems = []
+    # C1-14: `data_lost` = measurement data lost (Z19, mã 1); `missing` = evidence missing (mã 3)
+    data_lost, missing = [], []
     if not blocks:
-        problems.append('không có khối T10 nào trong lượt')
+        missing.append('không có khối T10 nào trong lượt')
     bad_win = [r['window'] for r in win_rows if not WIN_MS_OK[0] <= r['win_ms'] <= WIN_MS_OK[1]]
     if bad_win:
-        problems.append(f'cửa sổ T10 không cỡ 10 s: {bad_win}')
+        data_lost.append(f'cửa sổ T10 không cỡ 10 s: {bad_win}')
     # S24: H7 đặt lại cửa sổ trước khi in, nên khối mất ở PC không làm win_ms của khối sau lớn ra.
     # (1) Mất dòng IRQ: isr_us = Σ chu kỳ của mọi handler / f (sàn), excl_us mỗi dòng cũng sàn, nên
     #     Σ excl_us ≤ isr_us ≤ Σ excl_us + số dòng; ra ngoài khoảng đó = thiếu dòng (hoặc dòng lạ).
@@ -203,7 +212,7 @@ def t10_summary(blocks, win_rows, irq_rows, ev, span) -> dict:
         if not s <= bl['head']['isr_us'] <= s + len(bl['irqs']):
             irq_bad.append(k)
     if irq_bad:
-        problems.append(f'khối T10 thiếu dòng IRQ (isr_us khác tổng excl_us): {irq_bad}')
+        data_lost.append(f'khối T10 thiếu dòng IRQ (isr_us khác tổng excl_us): {irq_bad}')
     # (2) Mất nguyên khối: theo giờ PC đầu dòng (tools/h7_serial_capture.py), hai header liên tiếp cách
     #     10 s ± T10_GAP_TOL_S, và số khối ≈ thời gian từ header đầu tới hết đoạn / 10 s. Log không có giờ
     #     PC (PuTTY) thì không kiểm được: báo, không coi là đủ.
@@ -212,22 +221,24 @@ def t10_summary(blocks, win_rows, irq_rows, ev, span) -> dict:
         gaps = [(b_['t_pc_us'] - a_['t_pc_us']) / 1e6 for a_, b_ in zip(heads, heads[1:])]
         lost = [i for i, g in enumerate(gaps) if abs(g - 10.0) > T10_GAP_TOL_S]
         if lost:
-            problems.append(f'khoảng giữa hai khối T10 (giờ PC) khác 10 s sau khối {lost}: mất khối')
+            data_lost.append(f'khoảng giữa hai khối T10 (giờ PC) khác 10 s sau khối {lost}: mất khối')
         a, b = span if span else (0, len(ev))
         ends = [e['t_pc_us'] for e in ev[a:b] if e.get('t_pc_us') is not None]
         if ends:
             expect = int((ends[-1] - heads[0]['t_pc_us']) / 1e6 // 10.0) + 1
             if len(heads) < expect:
-                problems.append(f'{len(heads)} khối T10, kỳ vọng {expect} theo giờ PC: mất khối cuối')
+                data_lost.append(f'{len(heads)} khối T10, kỳ vọng {expect} theo giờ PC: mất khối cuối')
     elif heads:
-        problems.append('log serial không có giờ PC đầu dòng (không ghi bằng h7_serial_capture.py): '
-                        'không kiểm được mất khối T10')
+        missing.append('log serial không có giờ PC đầu dòng (không ghi bằng h7_serial_capture.py): '
+                       'không kiểm được mất khối T10')
     a, b = span if span else (0, len(ev))
     pd = [e['print_drop'] for e in ev[a:b] if e['kind'] == 's06log']
     if len(pd) >= 2 and pd[-1] != pd[0]:
-        problems.append(f'H7 bỏ {pd[-1] - pd[0]} dòng in trong lượt (print_drop)')
+        data_lost.append(f'H7 bỏ {pd[-1] - pd[0]} dòng in trong lượt (print_drop)')
     if len(pd) < 2:
-        problems.append('không đủ dòng S06log để kiểm print_drop')
+        missing.append('không đủ dòng S06log để kiểm print_drop')
+    problems = data_lost + missing
+
     def mean(k):
         v = [r[k] for r in win_rows if r[k] is not None]
         return sum(v) / len(v) if v else None
@@ -241,7 +252,7 @@ def t10_summary(blocks, win_rows, irq_rows, ev, span) -> dict:
                           'phần kế toán sau dấu thời gian của con và vào/ra ngắt lồng vẫn tính cho cha '
                           '(s06_load.h:30–44); cận trên của phần lẫn = số lần lồng × chi phí cặp đo, '
                           'chưa tách được',
-                complete=not problems, problems=problems)
+                complete=not problems, problems=problems, data_lost=data_lost, missing=missing)
 
 
 def _bounding(ev, kind, a, b):
@@ -308,7 +319,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description='Đọc log serial H7 (S06 T1, T10)')
     ap.add_argument('log')
     ap.add_argument('--out', required=True)
-    ap.add_argument('--f-real-mhz', type=float, default=F_REAL_MHZ, help='xung lõi H7 thật, cho cột max_us_real')
+    ap.add_argument('--f-real-mhz', type=float, default=None,
+                    help='tần số H7 đo được của chính lượt; bỏ trống = dải X22 [478; 486] MHz')
     ap.add_argument('--all-blocks', action='store_true', help='lấy mọi khối T10, không cắt theo link up/lost')
     a = ap.parse_args(argv)
     try:
@@ -329,7 +341,7 @@ def main(argv=None) -> int:
     with open(os.path.join(a.out, 'T10_summary.json'), 'w', encoding='utf-8') as f:
         json.dump(summ, f, ensure_ascii=False, indent=1)
     print(json.dumps(summ))
-    return 0 if summ['complete'] else 3
+    return stm.report_result(1 if summ['data_lost'] else (3 if summ['missing'] else 0), ['thieu_bang_chung'])
 
 
 if __name__ == '__main__':

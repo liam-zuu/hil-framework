@@ -166,8 +166,9 @@ def test_empty_and_lag_and_locked_schedule(small):
     assert sc.schedule_matches_locked(sched) != []                           # a cut schedule is not the locked one
 
 
-def _cli_run(tmp_path, small, lost=None, lag=1, extra=(), manifest=None):
-    """A run as run_hil --omega-schedule writes it: frame k carries entry k - lag; ESP32 clock = Pi clock."""
+def _cli_run(tmp_path, small, lost=None, lag=1, extra=(), manifest=None, every=1):
+    """A run as run_hil --omega-schedule writes it: frame k carries entry k - lag; ESP32 clock = Pi clock.
+    `every`: the firmware reads only every n-th time, and reports that count itself (C1-13)."""
     from protocol import encode_state
     sched, t_send, w_d, tb, ta = small
     sent = np.vstack([np.zeros((lag, 4)), w_d[:len(w_d) - lag]]) if lag else w_d
@@ -178,16 +179,36 @@ def _cli_run(tmp_path, small, lost=None, lag=1, extra=(), manifest=None):
              miso=np.zeros_like(mosi), **log)
     c = exact_counts(t_send, sent, tb, ta)
     lines = [f'{int(tb[0])}\t#run_start,timestamp_us={int(tb[0])},qseq=0']
-    for j in range(len(tb)):
+    read = range(0, len(tb), every)
+    for n, j in enumerate(read):
         if j != lost:
-            lines.append(f'{int(ta[j])}\tE,{j + 1},{int(tb[j])},{int(ta[j])},' + ','.join(str(x) for x in c[j]))
-    lines.append(f'{int(ta[-1]) + 10}\t#run_end,ev_qdrop_run=0,enc_ovf_run=0,qseq=1')
-    lines.append(f'{int(ta[-1]) + 11}\t#run_stats,log_send_err_run=0,enc_reads_run={len(tb)},qseq=2')
+            lines.append(f'{int(ta[j])}\tE,{n + 1},{int(tb[j])},{int(ta[j])},' + ','.join(str(x) for x in c[j]))
+    lines.append(f'{int(ta[-1]) + 10}\t#run_end,timestamp_us={int(ta[-1])},ev_qdrop_run=0,enc_ovf_run=0,qseq=1')
+    lines.append(f'{int(ta[-1]) + 11}\t#run_stats,log_send_err_run=0,enc_reads_run={len(read)},qseq=2')
     (tmp_path / 'ev.txt').write_text('\n'.join(lines) + '\n')
     ts.write_csv(str(tmp_path / 'sched.csv'), sched)
     return sc.main(['--schedule', str(tmp_path / 'sched.csv'), '--frames', str(tmp_path / 'frames.npz'),
                     '--esp32-events', str(tmp_path / 'ev.txt'), '--clock-affine', '0', '1', '--delta-sync-us', '0',
                     '--out', str(tmp_path / 'out'), *extra])
+
+
+def test_cli_read_rhythm_checked_without_the_firmware_count(tmp_path, small, capsys):
+    # C1-13: reads every 3 ms; the firmware reports exactly that count, so the stream looks whole
+    assert _cli_run(tmp_path, small, every=3) == 3
+    out = capsys.readouterr().out
+    assert 'nhịp đọc lệch 1 ms' in out and '#ket_qua,ma=3,ly_do=khong_du_dieu_kien' in out, out[-1500:]
+    assert _cli_run(tmp_path, small) == 3
+    assert 'nhịp đọc lệch' not in capsys.readouterr().out
+
+
+def test_code3_reasons():
+    ok = dict(ok=True, known=True)
+    assert sc.code3_reasons(0, [], ok, True) == []
+    assert sc.code3_reasons(3, [], ok, True) == ['chua_ket_luan']
+    assert sc.code3_reasons(0, [], dict(ok=False, known=True), True) == ['khong_du_dieu_kien']    # C1-13
+    assert sc.code3_reasons(0, ['khác lịch'], ok, True) == ['khong_du_dieu_kien']
+    assert sc.code3_reasons(0, [], dict(ok=None, known=False), True) == ['thieu_bang_chung']
+    assert sc.code3_reasons(0, [], ok, False) == ['thieu_bang_chung']
 
 
 def test_cli_frame_log_checked(tmp_path, small, capsys):

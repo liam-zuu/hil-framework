@@ -240,8 +240,33 @@ def test_s6_whole_run_scored_and_length(clean):
     # a fault at second 5 is scored (T1 does not drop the first 10 s), and N frames = N ms
     out = run(build(faults={'mixed': {5000}}), skip_s=0.0)
     assert out['verdict'] == 'fail' and out['frames']['mixed'] == 1
-    out = run(clean, skip_s=0.0, min_s=N / 1000.0 - 0.01)       # send jitter ±12 µs at both ends
+    out = run(clean, full=False, skip_s=0.0, min_s=N / 1000.0 - 0.01)       # send jitter ±12 µs at both ends
     assert out['scored_s'] == pytest.approx(N / 1000.0, abs=0.001) and out['verdict'] != 'short'
+
+
+def test_c1_9_scored_span_is_the_run(clean):
+    # #run_start..#run_end of the events, not the frames logged around them: esp32_events() puts both marks
+    # 1.2 s inside the log, and the H7 window opens 100 ms early
+    out = run(clean, skip_s=0.0)
+    assert out['scored_s'] == pytest.approx(N / 1000.0 - 2.4 + 0.1, abs=0.01)
+    t = clean[0]
+    t_mid_lo, t_mid_hi = t[3000] / 1e3, t[17000] / 1e3
+    assert t[0] / 1e3 + 1.1e6 == pytest.approx(out['_windows'][0]['t_start_us'], abs=2000) and t_mid_lo < t_mid_hi
+    # a fault after #run_end is not this run's; one inside it is
+    data = build(faults={'mixed': {19_500}})
+    assert run(data, skip_s=0.0)['frames']['mixed'] == 0
+    assert run(build(faults={'mixed': {10_000}}), skip_s=0.0)['frames']['mixed'] == 1
+
+
+def test_reasons_of_code_3(clean, tmp_path):
+    assert run(clean, full=False)['reasons'] == ['thieu_bang_chung']
+    assert run(clean, min_s=1e6)['reasons'] == ['khong_du_dieu_kien']
+    assert run(clean)['reasons'] == []
+    ev = esp32_events(clean, str(tmp_path / 'ev.txt'))
+    with open(ev, 'a') as fh:
+        fh.write(f'{10 ** 12}\t#run_start,run=2,timestamp_us={10 ** 12},qseq=9\n')
+    with pytest.raises(t1.dec.stm.RunProblem):
+        t1.check(*clean[:3], esp32_events=ev)
 
 
 def test_s12_age_in_true_microseconds():

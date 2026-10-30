@@ -313,6 +313,7 @@ class HILNode:
 
     def _save_frame_log(self) -> None:
         import json
+        import platform
         import numpy as np
         n = self._step
         # Run manifest (S06 tools, Codex Sol round 3 S57/S64): what the Pi itself ran, saved with the frames
@@ -324,7 +325,7 @@ class HILNode:
         manifest = dict(step_first=0, step_last=n - 1, steps=n, period_us=self.cfg.period_us,
                         max_steps=self.cfg.max_steps, stop_reason=self._stop_reason,
                         imu_source=imu_source, imu_profile=self.cfg.imu_profile, imu_static=self.cfg.imu_static,
-                        rt=self._rt)
+                        rt=self._rt, uname=' '.join(platform.uname()))     # X8: the kernel the run ran on
         np.savez(self.cfg.frame_log, manifest=np.array(json.dumps(manifest)),
                  **{k: v[:n] for k, v in self._flog.items()})
         log.info('Frame log: %d frames -> %s', n, self.cfg.frame_log)

@@ -41,10 +41,17 @@ Manifest lượt (Codex Sol vòng 3, Liam 30/10 "Làm manifest lượt"):
   * S57: số frame khác manifest → mã 1.
   * S55: khung H7 và khung so kích thích mở sớm hơn #run_start 100 ms (cận trễ UDP, bộ giải mã).
 
+Khớp spec 3.1 (Liam 30/10, "Duyệt, làm tiếp"):
+  * C1-5 (ghi lỗi đúng bên): DATA `yaw_rad` lệch quá X23 hay tick trỏ tới callback không có là kết quả về DUT:
+    báo mọi lượt (`dut`), không làm T4 của bộ HIL không đạt. Luồng DATA hở, trùng, dòng hỏng vẫn là mất dữ
+    liệu đo (mã 1).
+  * C1-2: luồng `qseq` của cả lượt phải đủ (dòng I, J mất trên UDP là mất dữ liệu đo, mã 1).
+
 Usage:
   python tools/s06_t4_values.py <frames.npz> <esp32_events.txt> --esp32-data <esp32_data.txt> --out <thư mục>
-Mã thoát: 0 đạt đủ; 1 có report sai, NaN, không ghép được, yaw DATA lệch hoặc bộ giải mã báo vấn đề;
-3 thiếu bằng chứng (không có callback, chưa phủ đủ lịch, không có/không đọc được esp32_data.txt); 2 lỗi đầu vào.
+Mã thoát (spec 3.1, bảng mã kết quả): 0 đạt đủ; 1 có report sai, NaN, không ghép được, mất dữ liệu đo hoặc bộ
+giải mã báo vấn đề; 3 chưa ra kết luận, in lý do (không có callback, chưa phủ đủ lịch, không có
+esp32_data.txt, nhiều lượt một file); 2 lỗi đầu vào.
 """
 from __future__ import annotations
 
@@ -249,6 +256,8 @@ def check(t_send_ns, mosi, miso, events_path, data_path=None, cal=None, manifest
     text = res.get('_esp32_text', {})
     data = check_data_yaw(data_path, res['_esp32_I'], data_seq_span(text)) if data_path else None
     summary = dict(epoch_offset_esp32_minus_h7=off, epoch_note=m['epoch_note'], window_pi_us=win,
+                   qseq_stream=dec.stm.qseq_stream(events_path),
+                   dut=dict(data_yaw_bad=data['bad'], data_no_callback=data['no_callback']) if data else None,
                    window_esp32_us=esp, callback_reports=len(cb), manifest=manifest,
                    frame_log_faults=dec.manifest_check(manifest, t_send_ns, mosi, miso),
                    stimulus=dict(frames_checked=n_chk, frames_differ=n_diff, first_differ=k_diff),
@@ -259,30 +268,40 @@ def check(t_send_ns, mosi, miso, events_path, data_path=None, cal=None, manifest
     return rows, summary
 
 
-def exit_code(summary) -> int:
-    """1: a report wrong, not matched, NaN, a decoder problem (Z19 stream, epoch not anchored …), or a DATA
-    tick lost / wrong / pointing at no callback / not parsed (S39); 3: run not valid or evidence missing
-    (decoder conditions: V4-1, run marks, TICK, ± PAD_US cover (S38); no ESP32 run span; no callback;
-    the MOSI is not the locked schedule (S42) or a schedule point not covered (S18); no esp32_data.txt,
-    no data seq span in the run marks, or ticks without a game RV yet (S28, S39)); 0 otherwise."""
+def outcome(summary):
+    """(mã, lý do mã 3). 1: a report wrong, not matched, NaN, a decoder problem (Z19 stream, epoch not anchored
+    …), or measurement data lost: the qseq stream (C1-2), DATA lines lost, repeated, not parsed (S39). Not 1:
+    DATA yaw off or a tick with no callback (C1-5: results about the DUT, in `dut`). 3: run not valid or
+    evidence missing (decoder conditions: V4-1, run marks, TICK, ± PAD_US cover (S38); no ESP32 run span; no
+    callback; the MOSI is not the locked schedule (S42) or a schedule point not covered (S18); no
+    esp32_data.txt, no data seq span in the run marks, or ticks without a game RV yet (S28, S39)); 0 otherwise."""
     d = summary['data_yaw']
+    qs = summary['qseq_stream']
     if summary['fail'] or summary['decode_problems'] or summary['frame_log_faults']:
-        return 1
-    if d and (d['bad'] or d['no_callback'] or d['bad_lines'] or d['seq_missing'] or d['seq_dups']):
-        return 1
+        return 1, None
+    if not qs['ok'] or qs['malformed']:
+        return 1, None
+    if d and (d['bad_lines'] or d['seq_missing'] or d['seq_dups']):
+        return 1, None
     # S64: MOSI off the schedule while the manifest says the Pi ran `--imu-profile t4` is a fault of the HIL
     # (mã 1); a run without that profile, or a log with no manifest, is a run not valid for T4 (4) (mã 3).
     # S73: `imu_source` is the source hil_node really used (--imu-static wins over the profile)
     man = summary['manifest']
     profile_t4 = man is not None and man.get('imu_source') == 't4'
     if summary['stimulus']['frames_differ'] and profile_t4:
-        return 1
+        return 1, None
     if (summary['run_conditions'] or summary['window_esp32_us'] is None or summary['callback_reports'] == 0
-            or not profile_t4 or summary['stimulus']['frames_differ'] or summary['coverage_missing']):
-        return 3
-    if d is None or not d['header'] or d['seq_span'] is None or d['no_rv'] or not d['ok']:
-        return 3
-    return 0
+            or (man is not None and not profile_t4) or summary['stimulus']['frames_differ']
+            or summary['coverage_missing']):
+        return 3, 'khong_du_dieu_kien'
+    if (man is None or not qs['known'] or d is None or not d['header'] or d['seq_span'] is None or d['no_rv']
+            or not d['ok']):
+        return 3, 'thieu_bang_chung'
+    return 0, None
+
+
+def exit_code(summary) -> int:
+    return outcome(summary)[0]
 
 
 COLS = ['idx', 't_us', 'kind', 'epoch', 'seq', 'n', 'applied', 'src_frame', 'src_nf', 'v1', 'v2', 'v3',
@@ -303,7 +322,10 @@ def main(argv=None) -> int:
                               dec.load_cal(z, a), dec.load_manifest(z))
         for i, r in enumerate(rows):
             r['idx'] = i
-        summary['exit_code'] = exit_code(summary)
+        summary['exit_code'], summary['reason'] = outcome(summary)
+    except dec.stm.RunProblem as ex:
+        print(f'không chấm: {ex}', file=sys.stderr)
+        return dec.stm.report_result(3, ['khong_du_dieu_kien'])
     except (OSError, KeyError, ValueError) as ex:
         print(f'lỗi đầu vào: {ex}', file=sys.stderr)
         return 2
@@ -315,7 +337,7 @@ def main(argv=None) -> int:
     with open(os.path.join(a.out, 'T4_values_summary.json'), 'w', encoding='utf-8') as fh:
         json.dump(summary, fh, indent=1, ensure_ascii=False)
     print(json.dumps(summary, indent=1, ensure_ascii=False))
-    return summary['exit_code']
+    return dec.stm.report_result(summary['exit_code'], [summary['reason']])
 
 
 if __name__ == '__main__':

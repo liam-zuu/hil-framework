@@ -31,7 +31,8 @@ Sửa theo Codex Sol vòng 1/2 (Liam duyệt 30/10 "Duyệt, sửa hết"), thay
     trong 200 frame = mất dữ liệu (Z19) → mức đó `fail_data_loss`, không lấy frame sau bù vào; chuỗi
     "giữ 100 frame liền" của chỉ báo theo kịp cũng theo chỉ số thật, frame hỏng cắt chuỗi.
   * S18: phải có hai dòng W15 (mỗi bánh một duty khác nhau, cùng lúc: chỉ dòng này phân biệt được lẫn bánh).
-  * S19: `--u-duty` bỏ trống = bất định chuẩn chưa có: tính như 0 nhưng kết luận tối đa mã 3.
+  * S19, X20: `--u-duty` bỏ trống hoặc 0 = bất định chuẩn chưa có (lượt chính phải có số từ Z11): tính như 0
+    nhưng kết luận tối đa mã 3.
   * S21: không có `--clock-affine` (chân đánh dấu) thì đồng hồ theo chặn dưới UDP chỉ để khảo sát: tập 200
     frame chấm dịch theo trễ UDP, kết luận tối đa mã 3.
   * S22: lần ghi compare lặp lại cùng duty (s06_apply ép ghi lúc kết thúc lượt) nối tiếp đoạn cũ; đoạn bắt
@@ -105,8 +106,7 @@ def read_events(path, marks=None, run=None):
     P, rx, te = defaultdict(list), [], []
     if marks is not None:
         m = stm.run_marks(path, run)
-        if m['_problem']:
-            raise ValueError(m['_problem'])
+        stm.require_run(m)
         marks['_run'] = m.get('_run')
         for k in ('run_start', 'run_end'):
             if k in m and 'timestamp_us' in m[k]['kv']:
@@ -353,6 +353,9 @@ def main(argv=None) -> int:
                 cover_note = f'frame Pi không phủ lượt ± {dec.PAD_US / 1e6:g} s (log cắt sớm hoặc bắt đầu muộn)'
         else:
             run_bad = run_frames = None
+    except stm.RunProblem as exc:
+        print(f'không chấm: {exc}', file=sys.stderr)
+        return stm.report_result(3, ['khong_du_dieu_kien'])
     except (OSError, KeyError, ValueError) as exc:
         print(f'lỗi đầu vào: {exc}', file=sys.stderr)
         return 2
@@ -371,14 +374,20 @@ def main(argv=None) -> int:
                 run_frames_bad=run_bad, qseq_stream=qs, manifest=manifest, frame_log_faults=frame_faults,
                 frames_cover_note=cover_note, run=marks.get('_run'), sync=sync, run_end_esp_us=marks.get('run_end'),
                 follow=follow_summary(follow),
-                exit_code=verdict(levels, missing, synced=sync['kind'] == 'manual', u_known=a.u_duty is not None,
+                # X20: an acceptance run needs a number from Z11: `--u-duty` empty or 0 is not known
+                exit_code=verdict(levels, missing, synced=sync['kind'] == 'manual', u_known=bool(a.u_duty),
                                   stream_ok=qs['ok'] and not qs['malformed'] and not run_bad and not frame_faults,
                                   stream_known=(qs['known'] and run_bad is not None and manifest is not None
                                                 and not cover_note)))
+    lv = summ['levels']
+    reasons = (['khong_du_dieu_kien'] if missing or lv['short'] or cover_note else []) + \
+              (['chua_ket_luan'] if lv['inconclusive'] else []) + \
+              (['thieu_bang_chung'] if (sync['kind'] != 'manual' or not a.u_duty or not qs['known'] or run_bad is None
+                                        or manifest is None) else [])
     with open(os.path.join(a.out, 'T6_summary.json'), 'w', encoding='utf-8') as f:
         json.dump(summ, f, ensure_ascii=False, indent=1, default=lambda o: o.item() if hasattr(o, 'item') else str(o))
     print(json.dumps(summ, default=lambda o: o.item() if hasattr(o, 'item') else str(o)))
-    return summ['exit_code']
+    return stm.report_result(summ['exit_code'], reasons)
 
 
 if __name__ == '__main__':

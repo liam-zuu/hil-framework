@@ -4,6 +4,7 @@
 import gc
 import json
 import logging
+import platform
 import time
 import types
 
@@ -59,6 +60,7 @@ def test_frame_log_and_run_lines(tmp_path, caplog):
     assert m['period_us'] == 1_000 and m['stop_reason'] == 'max_steps' and m['imu_profile'] is None
     assert m['imu_source'] == 'none'                  # S73: the source really used, not the one requested
     assert m['rt']['gc_off'] is True and set(m['rt']) == {'sched_fifo', 'cpu_pinned', 'mem_locked', 'gc_off'}
+    assert platform.release() in m['uname']           # X8: the kernel of the run
 
 
 def _run_noting_gc(tmp_path, monkeypatch, **cfg):

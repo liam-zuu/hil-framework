@@ -28,7 +28,7 @@ Cách chấm:
 Thêm theo Liam 30/10 ("tôi đồng ý 3 đề xuất của bạn"):
   * Điều kiện thời gian của spec (lần 1 bắt đầu trong 2 phút sau khi bật, lần 2 sau ≥ 30 phút chạy):
     esp_timer của ESP32 đếm từ lúc ESP32 khởi động, nên offset = thời gian ESP32 đã chạy lúc lịch bắt
-    đầu. Lần 1 cần ≤ 120 s, lần 2 cần ≥ 1 800 s; không đạt → `run_condition_ok: false`, mã 3. Chỉ đúng
+    đầu. Lần 1 cần ≤ 120 s, lần 2 cần ≥ 1 812 s HAL ms (X14); không đạt → `run_condition_ok: false`, mã 3. Chỉ đúng
     khi ESP32 cấp nguồn cùng lúc với H7 và không bị reset giữa chừng (`--no-uptime-check` để bỏ).
   * Lệch nhịp ESP32 so với RPi5 (cho câu thạch anh, E6): t_rx (giờ Pi nhận gói, monotonic) − t_after
     của dòng E; lấy chặn dưới mỗi bin 10 s (gói đến nhanh nhất), khớp đường thẳng → ppm. Chỉ là sai số
@@ -83,7 +83,7 @@ ALIGN_BIN_US = 100_000.0
 MAX_READ_GAP_US = 100_000.0   # đầu cửa sổ phải có lần đọc trong 100 ms sau nó [ĐỀ XUẤT], không thì `missing`
 WHEELS = ('FL', 'FR', 'RL', 'RR')
 UPTIME_PASS1_MAX_US = 120e6   # spec: lần 1 bắt đầu trong 2 phút sau khi bật
-UPTIME_PASS2_MIN_US = 1800e6  # spec: lần 2 sau ≥ 30 phút chạy
+UPTIME_PASS2_MIN_US = 1812e6  # X14, C1-16: lần 2 sau ≥ 1 800 s thật = 1 800 × 1,0064 s HAL ms danh định, làm tròn lên
 CLOCK_BIN_US = 10e6           # bin chặn dưới t_rx − t_esp
 
 COLUMNS = ['idx', 'run_pass', 'visit', 'kind', 'wheel', 'omega_cmd', 'omega_d', 'window',
@@ -385,8 +385,7 @@ def main(argv=None) -> int:
         sched = t5.read_csv(a.schedule)
         t5.segments(sched)                      # kiểm lịch liền nhau
         marks = stm.run_marks(a.esp32_events, a.run)
-        if marks['_problem']:
-            raise ValueError(marks['_problem'])
+        stm.require_run(marks)
         reads, rx, s_temp = load_esp32_events(a.esp32_events, [int(x) for x in a.count_sign.split(',')], marks)
         h7_up = h7_uptime_us(ser.read_log(a.h7_serial)) if a.h7_serial else None
         if a.offset_us is None:
@@ -400,6 +399,9 @@ def main(argv=None) -> int:
                 raise ValueError('không đổi được giờ pi_temp sang đồng hồ ESP32 (thiếu dữ liệu khớp đồng hồ)')
             tp, vp = load_pi_temp(a.pi_temp)
             temps['pi'] = (pi_to_esp(fit, tp), vp) if len(tp) else None
+    except stm.RunProblem as exc:
+        print(f'không chấm: {exc}', file=sys.stderr)
+        return stm.report_result(3, ['khong_du_dieu_kien'])
     except (OSError, ValueError, KeyError) as exc:
         print(f'lỗi đầu vào: {exc}', file=sys.stderr)
         return 2
@@ -419,17 +421,22 @@ def main(argv=None) -> int:
     code = exit_code(rows)
     if not stream['ok']:
         code = 1
-    if code == 0 and (cond is not True or not stream['known'] or stream['multi_run'] or sched_bad
-                      or a.xtal_ppm is None):
-        code = 3                                  # S18, S19, S20: evidence missing, not a pass
+    reasons = ['chua_ket_luan'] if code == 3 else []
+    if cond is False or sched_bad:
+        reasons.append('khong_du_dieu_kien')
+    if cond is None or not stream['known'] or a.xtal_ppm is None:
+        reasons.append('thieu_bang_chung')        # S18, S19, S20: evidence missing, not a pass
+    if code != 1 and reasons:
+        code = 3
     offset = float(offset)
     summ.update(run_pass=run_pass, offset_us=offset, offset_source='manual' if corr is None else 'xcorr',
                 align_corr=corr, n_reads=len(reads.tb), eseq_gaps=reads.eseq_gaps(),
                 stream=stream, stream_notes=stm.stream_notes(stream), schedule_problems=sched_bad,
                 esp32_uptime_at_start_s=offset / 1e6,
                 h7_uptime_at_link_up_s=None if h7_up is None else h7_up / 1e6, run_condition_ok=cond,
-                run_condition_rule='lần 1: ≤ 120 s; lần 2: ≥ 1800 s (thời gian H7 đã chạy lúc link SPI lên, '
-                                   'log serial H7); không có log hoặc --no-uptime-check = chưa xác minh',
+                run_condition_rule='lần 1: ≤ 120 s; lần 2: ≥ 1 812 s HAL ms danh định = 1 800 s thật (X14) (thời '
+                                   'gian H7 đã chạy lúc link SPI lên, log serial H7); không có log hoặc '
+                                   '--no-uptime-check = chưa xác minh',
                 clock_vs_pi=fit,
                 clock_note='ppm = nhịp đồng hồ Pi (monotonic) so với ESP32; chỉ là sai số thạch anh ESP32 '
                            'khi Pi được NTP giữ nhịp; không cộng vào bất định',
@@ -440,7 +447,7 @@ def main(argv=None) -> int:
     with open(os.path.join(a.out, 'T5_summary.json'), 'w', encoding='utf-8') as f:
         json.dump(summ, f, ensure_ascii=False, indent=2)
     print(json.dumps(summ))
-    return summ['exit_code']
+    return stm.report_result(code, reasons)
 
 
 if __name__ == '__main__':

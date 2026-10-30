@@ -258,6 +258,17 @@ def exit_code(rows: Sequence[dict]) -> int:
     return 0
 
 
+def code3_reasons(code: int, sched_bad, rhythm: dict, evidence: bool) -> List[str]:
+    """Why a run with no failure is not a pass (spec 3.1, result table): windows not concluded, the run
+    conditions (locked schedule, read rhythm C1-13), the acceptance evidence. Empty = pass."""
+    reasons = ['chua_ket_luan'] if code == 3 else []
+    if sched_bad or rhythm['ok'] is False:
+        reasons.append('khong_du_dieu_kien')
+    if not evidence or not rhythm['known']:
+        reasons.append('thieu_bang_chung')
+    return reasons
+
+
 def schedule_lag(w_d, sched, max_lag: int = 3):
     """S16: frame lag of the schedule in the frames actually sent: entry k of the ω table (quantized) is
     in the MOSI of frame k + lag (run_hil --omega-schedule: lag 1, the frame carries the plant state
@@ -358,8 +369,7 @@ def main(argv=None) -> int:
         if manifest is None:
             notes.append('frames.npz không có manifest: không chứng minh được log frame đủ')
         marks = stm.run_marks(a.esp32_events, a.run)
-        if marks['_problem']:
-            raise ValueError(marks['_problem'])
+        stm.require_run(marks)
         tb, ta, c, eseq, tb_esp = load_esp32_reads(a.esp32_events, *a.clock_affine, marks=marks)
         lag, frac = schedule_lag(w_d, sched)
         if frac < LAG_MATCH_MIN:
@@ -382,6 +392,9 @@ def main(argv=None) -> int:
         run = Run(t_send, w_d, tb, ta, c, calls=calls, count_sign=[int(x) for x in a.count_sign.split(',')],
                   delta_sync_us=a.delta_sync_us, frame_lag=lag)
         rows = score_run(run, sched)
+    except stm.RunProblem as ex:
+        print(f'không chấm: {ex}', file=sys.stderr)
+        return stm.report_result(3, ['khong_du_dieu_kien'])
     except (OSError, ValueError, KeyError) as ex:
         print(f'lỗi đầu vào: {ex}', file=sys.stderr)
         return 2
@@ -395,6 +408,13 @@ def main(argv=None) -> int:
         fails.append('luồng đọc encoder ESP32 mất dữ liệu (Z19)')
     sched_bad = schedule_matches_locked(sched, a.locked_seed)
     notes += sched_bad
+    # C1-13: the 1 ms rhythm from the E lines themselves, not from the count the firmware reports
+    rhythm = stm.read_rhythm(tb_esp, marks)
+    if rhythm['ok'] is False:
+        notes.append(f"nhịp đọc lệch 1 ms: {rhythm['reads']} lần đọc, kỳ vọng {rhythm['expected']} ± "
+                     f"{rhythm['count_tol']}, khoảng lớn nhất {rhythm['gap_max_us']:.0f} µs: không đủ điều kiện đo")
+    elif not rhythm['known']:
+        notes.append('thiếu timestamp_us của mốc lượt: không kiểm được nhịp đọc độc lập (C1-13)')
     os.makedirs(a.out, exist_ok=True)
     write_rows(os.path.join(a.out, 'T3b.csv'), rows)
     with open(os.path.join(a.out, 'T3b_score_args.txt'), 'w') as f:
@@ -409,11 +429,11 @@ def main(argv=None) -> int:
         print(f'! {x}')
     code = exit_code(rows)
     if fails:
-        code = 1
-    elif code == 0 and (calls is None or sched_bad or manifest is None or not stream['known'] or stream['multi_run']
-                        or (calls is not None and any('chưa hiệu chuẩn' in x for x in notes))):
-        code = 3                                    # acceptance evidence missing: no pass
-    return code
+        return stm.report_result(1)
+    evidence = (calls is not None and manifest is not None and stream['known']
+                and not any('chưa hiệu chuẩn' in x for x in notes))
+    reasons = code3_reasons(code, sched_bad, rhythm, evidence)
+    return stm.report_result(3 if reasons else code, reasons)
 
 
 if __name__ == '__main__':

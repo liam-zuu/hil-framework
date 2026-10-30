@@ -359,11 +359,10 @@ def esp32_lines(path):
     """Dòng J (cổng SPI), I (callback), R (reset hoàn tất) và #run_start/#run_end của esp32_events.txt;
     `t_rx` = giờ Pi lúc logger nhận (monotonic, cùng đồng hồ với t_send_ns), `t_us` = giờ ESP32.
     S70 (vòng 4): mốc lấy qua `s06_stream.run_marks`, cùng bộ chọn với các công cụ khác: START và END ghép
-    theo số lượt. T1, T4 chấm một lượt mỗi file (S58): không xác định được một lượt là lỗi đầu vào."""
+    theo số lượt. T1, T4 chấm một lượt mỗi file (S58, X18): không xác định được một lượt thì `RunProblem`."""
     marks = stm.run_marks(path)
-    if marks['_problem']:
-        raise ValueError(f"esp32_events: {marks['_problem']}: mỗi file một lượt (S58)")
-    text = {k: marks[k] for k in ('run_start', 'run_end') if k in marks}
+    stm.require_run(marks)
+    text ={k: marks[k] for k in ('run_start', 'run_end') if k in marks}
     J, I, R = [], [], []
     with open(path, encoding='utf-8', errors='replace') as fh:
         for raw in fh:
@@ -789,6 +788,9 @@ def main(argv=None) -> int:
     try:
         z = np.load(a.frames)
         res = decode(z['t_send_ns'], z['mosi'], z['miso'], a.esp32_events, load_cal(z, a))
+    except stm.RunProblem as ex:
+        print(f'không chấm: {ex}', file=sys.stderr)
+        return stm.report_result(3, ['khong_du_dieu_kien'])
     except (OSError, KeyError, ValueError) as ex:
         print(f'lỗi đầu vào: {ex}', file=sys.stderr)
         return 2
@@ -812,7 +814,7 @@ def main(argv=None) -> int:
     with open(os.path.join(a.out, 'frames_summary.json'), 'w', encoding='utf-8') as fh:
         json.dump(summ, fh, indent=1, ensure_ascii=False, default=str)
     print(json.dumps(summ, indent=1, ensure_ascii=False, default=str))
-    return 1 if summ['problems'] else (3 if summ['conditions'] else 0)
+    return stm.report_result(1 if summ['problems'] else (3 if summ['conditions'] else 0), ['khong_du_dieu_kien'])
 
 
 if __name__ == '__main__':

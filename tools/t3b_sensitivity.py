@@ -303,13 +303,9 @@ def main(argv=None) -> int:
             if tag in ('old', 'new'):
                 ln += f'  {s["truth_bad"]:9d} {s["truth_bad_detected"]:3d} {s["big"]:4d} {s["big_detected"]:3d}'
             lines.append(ln)
-            if s['inconclusive'] > INCONCLUSIVE_MAX * s['n']:
-                if tag != 'new':
-                    ok = False
-                    lines.append(f'   ^ chưa kết luận > {INCONCLUSIVE_MAX:.0%}')
-                else:                                # S29 (a): spec wording unclear for (2), asked THESIS 30/10
-                    lines.append(f'   ^ chưa kết luận > {INCONCLUSIVE_MAX:.0%} ở đối tượng đo (2): chữ spec chưa '
-                                 f'rõ luật ≤ 10 % có áp cho (2) không, chờ THESIS; chưa tính vào cổng')
+            if s['inconclusive'] > INCONCLUSIVE_MAX * s['n']:    # C1-3, X1: the rule covers (0), (1) and (2)
+                ok = False
+                lines.append(f'   ^ chưa kết luận > {INCONCLUSIVE_MAX:.0%}')
         if tot['u_t_bad']:                            # S29 (b): the tool requirement u_t ≤ ¼(N_tol − fixed)
             ok = False
             lines.append(f'   KHÔNG ĐẠT: {tot["u_t_bad"]} cửa sổ u_t vượt yêu cầu công cụ')
@@ -347,7 +343,7 @@ def main(argv=None) -> int:
         lines.append(f'(delta_sync {a.delta_sync_alt_us} us, info) {tag}: inconclusive {n_inc}, '
                      f'u_t over limit {n_ut} of {len(rows)}')
     lines.append(f'\nZ23 gate ((0) all pass, (1) every window observable from the truth failed incl. the 4 large '
-                 f'kinds, inconclusive <= 10% in (0)/(1), u_t within the tool requirement in every group): '
+                 f'kinds, inconclusive <= 10% in (0), (1), (2), u_t within the tool requirement in every group): '
                  f'{"PASS" if ok else "FAIL"}')
     txt = '\n'.join(lines)
     with open(os.path.join(a.out, 'summary.txt'), 'w', encoding='utf-8') as f:

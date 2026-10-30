@@ -105,15 +105,20 @@ def check(t_send_ns, mosi, miso, esp32_events=None, serial_events=None, skip_s=0
     t_us = np.asarray(t_send_ns, dtype=np.float64) / 1000.0
     res = dec.decode(t_send_ns, mosi, miso, esp32_events, cal)
     rows = res.pop('_frames_rows')
-    t0 = t_us[0] + skip_s * 1e6
-    sel = np.flatnonzero(t_us >= t0)
+    # C1-9, X4b, X16: T1 scores the whole run, #run_start..#run_end (Pi clock), not the frames logged around
+    # it; without run marks (no events file, marks missing: mã 3 below) the whole log
+    win = res['esp32_match']['window_pi_us'] if 'esp32_match' in res else None
+    t0 = max(t_us[0], win[0] if win else t_us[0]) + skip_s * 1e6
+    t_last = win[1] if win else t_us[-1]
+    sel = np.flatnonzero((t_us >= t0) & (t_us <= t_last))
     # S6: same length rule as T2 (N frames at 1 ms = N ms)
     scored_s = ((t_us[sel[-1]] - t_us[sel[0]]) + PERIOD_US) / 1e6 if len(sel) >= 2 else 0.0
     # S1: an empty MISO is "no answer from the H7"; only the first `startup_empty` frames of the log
     # (the H7 answers frame N in frame N + answer_lag) may be empty
     n_start = answer_lag if startup_empty is None else startup_empty
     first_sc = int(sel[0]) if len(sel) else 0
-    miso_empty = sum(1 for r in rows if r['empty'] and r['j'] >= max(n_start, first_sc))
+    last_sc = int(sel[-1]) if len(sel) else -1
+    miso_empty = sum(1 for r in rows if r['empty'] and max(n_start, first_sc) <= r['j'] <= last_sc)
     # H1
     per = np.diff(t_us[sel]) if len(sel) >= 2 else np.array([])
     mean = slope = se = None
@@ -130,7 +135,7 @@ def check(t_send_ns, mosi, miso, esp32_events=None, serial_events=None, skip_s=0
               gaps_over_1p5ms=int(np.sum(per > GAP_US)), clock_res_us=clock_res_us,
               ok=slope is not None and abs(slope - PERIOD_US) <= clock_res_us + 3.0 * se)
     # per frame (MISO answers) in the scored part
-    good = [r for r in rows if r['j'] >= (sel[0] if len(sel) else 0) and not r['empty']]
+    good = [r for r in rows if first_sc <= r['j'] <= last_sc and not r['empty']]
     win_us = window_s * 1e6
     wins = {}
     steps_crc_h7 = {}
@@ -295,11 +300,18 @@ def check(t_send_ns, mosi, miso, esp32_events=None, serial_events=None, skip_s=0
         verdict = 'incomplete'
     else:
         verdict = 'pass'
+    # spec 3.1, result table: the reason of mã 3
+    rz = res.get('resets_near_run_start')
+    n_cond = 0 if m is None else bool(m.get('pad_note')) + bool(m.get('udp_note')) + bool(rz is not None and not rz['ok'])
+    n_open = int(age['verdict'] == 'inconclusive')
+    reasons = (['khong_du_dieu_kien'] if verdict == 'short' or n_cond else []) + \
+              (['chua_ket_luan'] if n_open else []) + \
+              (['thieu_bang_chung'] if len(incomplete) > n_cond + n_open else [])
     out = dict(h1=h1, frames=tot, answer_lag_expected=answer_lag, answer_lag_hist=lag_hist,
                coverage_pct=coverage, imu=imu, stream=stream, serial=serial, state_age=age,
                clock=dict(calibrated=res['clock']['calibrated'], f_h7_mhz=f_fit),
                scored_s=scored_s, enough=scored_s >= min_s, fails=fails, incomplete=incomplete,
-               verdict=verdict)
+               verdict=verdict, reasons=reasons)
     out['_windows'], out['_steps'], out['_reports'] = windows, steps, reps
     return out
 
@@ -342,6 +354,9 @@ def main(argv=None) -> int:
         out = check(z['t_send_ns'], z['mosi'], z['miso'], a.esp32_events, serial, a.skip_s, a.window_s,
                     a.min_s, a.clock_res_us, a.answer_lag, dec.load_cal(z, a), a.startup_empty,
                     dec.load_manifest(z))
+    except dec.stm.RunProblem as exc:
+        print(f'không chấm: {exc}', file=sys.stderr)
+        return dec.stm.report_result(3, ['khong_du_dieu_kien'])
     except (OSError, KeyError, ValueError) as exc:
         print(f'lỗi đầu vào: {exc}', file=sys.stderr)
         return 2
@@ -359,7 +374,7 @@ def main(argv=None) -> int:
     with open(os.path.join(a.out, 'T1_summary.json'), 'w', encoding='utf-8') as f:
         json.dump(summ, f, ensure_ascii=False, indent=1, default=_json)
     print(json.dumps(summ, default=_json))
-    return summ['exit_code']
+    return dec.stm.report_result(summ['exit_code'], out['reasons'])
 
 
 if __name__ == '__main__':

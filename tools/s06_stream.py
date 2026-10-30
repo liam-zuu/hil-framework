@@ -85,6 +85,7 @@ def run_marks(path: str, run: Optional[int] = None) -> dict:
         if len(idx) != 1:
             out['_problem'] = (f'không có lượt run={run} trong file' if not idx else
                                f'run={run} xuất hiện {len(idx)} lần (ESP32 khởi động lại giữa file?): không xác định lượt')
+            out['_not_found'] = not idx
             return out
         i0 = idx[0]
     else:
@@ -102,6 +103,51 @@ def run_marks(path: str, run: Optional[int] = None) -> dict:
             break                                    # S69: the next run begins, whatever its id
         if n not in out and m['kv'].get('run') == rid:
             out[n] = m
+    return out
+
+
+class RunProblem(ValueError):
+    """Spec X18: the file holds no single run to score (several #run_start, a repeated run id): a run
+    condition (mã 3, `khong_du_dieu_kien`), not an input fault."""
+
+
+def require_run(marks: dict) -> None:
+    """Stop before scoring when no run is selected: `--run` of a run not in the file is an input fault
+    (ValueError, mã 2), the other cases are RunProblem."""
+    if marks['_problem']:
+        raise (ValueError if marks.get('_not_found') else RunProblem)(marks['_problem'])
+
+
+REASONS = ('khong_du_dieu_kien', 'thieu_bang_chung', 'chua_ket_luan')   # spec 3.1, bảng mã kết quả (C1-14)
+
+
+def report_result(code: int, reasons=()) -> int:
+    """Print the result line every scoring tool ends with; mã 3 names one reason of the spec table, the
+    first of `REASONS` found in `reasons`. Returns `code`."""
+    why = next((r for r in REASONS if r in reasons), 'thieu_bang_chung')
+    print(f'#ket_qua,ma={code}' + (f',ly_do={why}' if code == 3 else ''))
+    return code
+
+
+READ_PERIOD_US = 1000.0            # s06_load: one encoder read every 1 ms (Q-S1)
+READ_COUNT_TOL = 1                 # số lần đọc = thời lượng / 1 ms ± 1 (spec T3b)
+READ_GAP_MAX_US = 2000.0           # C1-13 [ĐỀ XUẤT CODE]: hai lần đọc liền nhau cách ≤ 2 chu kỳ
+
+
+def read_rhythm(t_before, marks: dict) -> dict:
+    """C1-13: nhịp đọc 1 ms kiểm từ chính các dòng E nhận được (giờ ESP32 `t_before`), không dùng số firmware
+    tự báo (`enc_reads_run`): số lần đọc so với thời lượng #run_start..#run_end, và khoảng lớn nhất giữa hai
+    lần đọc liền nhau. `known` False khi thiếu timestamp_us của một mốc hay không có lần đọc nào."""
+    t0, t1 = _mark_int(marks, 'run_start', 'timestamp_us'), _mark_int(marks, 'run_end', 'timestamp_us')
+    tb = np.sort(np.asarray(t_before, dtype=float))
+    out = dict(reads=int(len(tb)), expected=None, gap_max_us=None, known=False, ok=None,
+               count_tol=READ_COUNT_TOL, gap_limit_us=READ_GAP_MAX_US)
+    if t0 is None or t1 is None or t1 <= t0 or len(tb) < 2:
+        return out
+    expected = (t1 - t0) // READ_PERIOD_US
+    gap = float(np.max(np.diff(tb)))
+    out.update(expected=int(expected), gap_max_us=gap, known=True,
+               ok=bool(abs(len(tb) - expected) <= READ_COUNT_TOL and gap <= READ_GAP_MAX_US))
     return out
 
 

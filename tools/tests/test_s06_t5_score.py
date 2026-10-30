@@ -154,7 +154,7 @@ def test_window_mean_skips_nan_and_empty():
 
 def test_uptime_condition():
     assert sc.uptime_condition(1, 119e6) and not sc.uptime_condition(1, 121e6)
-    assert sc.uptime_condition(2, 1800e6) and not sc.uptime_condition(2, 1799e6)
+    assert sc.uptime_condition(2, 1812e6) and not sc.uptime_condition(2, 1811e6)      # X14: HAL ms, H7 fast 0.64 %
 
 
 def test_clock_fit_recovers_rate_from_packet_lower_envelope():
@@ -290,6 +290,12 @@ def test_cli_missing_evidence_is_not_a_pass(run2):
     assert code == 3 and summ['run_condition_ok'] is False
     assert _cli(run2, 'nouptime', '--xtal-ppm', '20', '--no-uptime-check')[0] == 3
     assert _cli(run2, 'noend', '--xtal-ppm', '20', run_end=False)[0] == 3       # overflow unknown
+
+
+def test_cli_reasons_of_code_3(run2):
+    assert 'ly_do=thieu_bang_chung' in _cli(run2, 'r_noxtal')[3].stdout
+    assert 'ly_do=khong_du_dieu_kien' in _cli(run2, 'r_early', '--xtal-ppm', '20', h7_up_s=6.0)[3].stdout
+    assert '#ket_qua,ma=0' in _cli(run2, 'r_ok', '--xtal-ppm', '20')[3].stdout
 
 
 def test_cli_schedule_not_locked(run2, tmp_path):
