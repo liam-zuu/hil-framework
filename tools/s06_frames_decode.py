@@ -242,12 +242,15 @@ def h7_reports(recs, fmap, mosi, carrier_nf):
         prev = nseq[key]
         n = f['rpt_seq'] if prev is None else prev + ((f['rpt_seq'] - prev) % 256)
         nseq[key] = n
+        latest = nf_full(f['nf16'], ref)
         row = dict(log_idx=rec['idx'], kind=f['kind'], epoch=f['epoch'], rpt_seq=f['rpt_seq'], n=n,
-                   queued=f['queued'], imu_seq=f['imu_seq'], src_nf=src, t_pi_us=rec.get('t_pi_us'),
-                   src_frame=fr['i'] if fr else None)
+                   queued=f['queued'], qfull=f['qfull'], imu_seq=f['imu_seq'], src_nf=src, nf_latest=latest,
+                   imu_age_frames=latest - src, imu_crc_h7=f['imu_crc'], cyccnt=f['cyc'],
+                   t_pi_us=rec.get('t_pi_us'), src_frame=fr['i'] if fr else None)
         if fr is not None:
             m = mosi[fr['i']]
-            row['imu_crc_ok'] = f['imu_crc'] == crc16(bytes(m[k] for k in MOSI_IMU_BYTES))
+            row['imu_crc_pi'] = crc16(bytes(m[k] for k in MOSI_IMU_BYTES))
+            row['imu_crc_ok'] = f['imu_crc'] == row['imu_crc_pi']
             row['imu_seq_ok'] = f['imu_seq'] == m[MOSI_IMU_SEQ]
         out.append(row)
     return out
@@ -370,6 +373,7 @@ def decode(t_send_ns, mosi, miso, esp32_events: Optional[str] = None) -> dict:
         J, I = esp32_lines(esp32_events)
         res['esp32_match'] = match_esp32(reps, J, I)
     res['_records'] = recs
+    res['_frames_rows'] = rows
     res['_calls'] = calls
     res['_reports'] = reps
     return res
