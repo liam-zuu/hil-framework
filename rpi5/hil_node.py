@@ -156,10 +156,14 @@ class HILNode:
         if self.cfg.frame_log:
             import numpy as np
             n = self.cfg.max_steps or self.cfg.frame_log_max
+            # t_pulse0/1_ns: just before / just after raising the sync pulse (S06 spec line 111:
+            # P_send := t_pulse_rise, the same physical edge as d_1w; tools/s06_frames_decode.py)
             self._flog = {
-                't_send_ns': np.zeros(n, dtype=np.int64),
-                'mosi':      np.zeros((n, 40), dtype=np.uint8),
-                'miso':      np.zeros((n, 40), dtype=np.uint8),
+                't_send_ns':   np.zeros(n, dtype=np.int64),
+                't_pulse0_ns': np.zeros(n, dtype=np.int64),
+                't_pulse1_ns': np.zeros(n, dtype=np.int64),
+                'mosi':        np.zeros((n, 40), dtype=np.uint8),
+                'miso':        np.zeros((n, 40), dtype=np.uint8),
             }
             self._flog_n = n
 
@@ -214,7 +218,12 @@ class HILNode:
           4. Write shared state
         """
         # 1. Sync pulse — H7 EXTI fires, enables DMA receive
-        self._gpio.pulse()
+        if self._flog is not None:
+            t_p0 = time.monotonic_ns()
+            self._gpio.pulse()
+            t_p1 = time.monotonic_ns()
+        else:
+            self._gpio.pulse()
 
         # 2. Encode current state + setpoint, send MOSI, receive MISO (torques from H7)
         traj_flags = 0
@@ -236,6 +245,8 @@ class HILNode:
         if self._flog is not None:
             k = self._step
             self._flog['t_send_ns'][k] = t_send
+            self._flog['t_pulse0_ns'][k] = t_p0
+            self._flog['t_pulse1_ns'][k] = t_p1
             self._flog['mosi'][k] = memoryview(bytes(mosi))
             self._flog['miso'][k] = memoryview(bytes(miso))
 
@@ -286,8 +297,7 @@ class HILNode:
     def _save_frame_log(self) -> None:
         import numpy as np
         n = self._step
-        np.savez(self.cfg.frame_log, t_send_ns=self._flog['t_send_ns'][:n],
-                 mosi=self._flog['mosi'][:n], miso=self._flog['miso'][:n])
+        np.savez(self.cfg.frame_log, **{k: v[:n] for k, v in self._flog.items()})
         log.info('Frame log: %d frames -> %s', n, self.cfg.frame_log)
 
     def _on_signal(self, signum: int, _frame) -> None:

@@ -31,6 +31,9 @@ def test_frame_log_and_run_lines(tmp_path, caplog):
     assert d['mosi'].shape == (steps, 40) and d['miso'].shape == (steps, 40)
     t = d['t_send_ns']
     assert np.all(np.diff(t) >= 0)                    # one send time per frame (Windows clock: ~15 ms steps)
+    # sync pulse bracketed just before the send (S06 spec line 111, P_send := t_pulse_rise)
+    assert np.all(d['t_pulse0_ns'] <= d['t_pulse1_ns']) and np.all(d['t_pulse1_ns'] <= t)
+    assert np.all(d['t_pulse0_ns'] > 0)
     # the frame sent at step k carries the plant state before step k:
     # omega of the schedule at ms k-1 (0 at k = 0)
     table = t3.omega_table(sched)

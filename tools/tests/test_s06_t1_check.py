@@ -8,6 +8,7 @@ import os
 import struct
 import subprocess
 import sys
+import tempfile
 
 import numpy as np
 import pytest
@@ -38,13 +39,17 @@ def build(n=N, faults=None, period_us=1000.0):
         mosi[k] = np.frombuffer(encode_state(st, seq=k, imu=imu, imu_seq=k // 10), dtype=np.uint8)
     miso = np.zeros((n, 40), dtype=np.uint8)
     idx, seqs, rx_shift = 0, [0, 0, 0], 0
+    reps = []                                             # (kind 0..2, seq, Pi send time of the frame, µs)
     for j in range(2, n):
         i = j - 2
         if j in f.get('stale', ()):                       # main loop missed frame i: answer i-1 again
             i = j - 3
         if j >= f.get('h7_lost_from', n):                 # H7 never counted one frame
             rx_shift = 1
-        cyc = int((t_send_ns[i] / 1e3 + 45.0) * 1e-6 * F_H7) & 0xFFFFFFFF
+        cyc_full = int((t_send_ns[i] / 1e3 + 45.0) * 1e-6 * F_H7)
+        cyc = cyc_full & 0xFFFFFFFF
+        if j in f.get('empty', ()):                       # S1: the H7 did not answer this frame
+            continue
         b = bytearray(40)
         mc = crc(mosi[i]) ^ (1 if j in f.get('mixed', ()) else 0)
         b[10:12] = struct.pack('<H', mc)
@@ -60,7 +65,10 @@ def build(n=N, faults=None, period_us=1000.0):
             flags = 1 | (2 if i in f.get('qfull', ()) else 0)
             rec = (0x10 + s, bytes([seqs[s] & 0xFF, flags, 1, mosi[src][39]]) + struct.pack(
                 '<HHHI', (src + 1) & 0xFFFF, (i + 1) & 0xFFFF, crc(raw), cyc))
+            reps.append((s, seqs[s], t_send_ns[i] / 1e3))
             seqs[s] += 1
+        elif i % 500 == 499 and not f.get('no_tick'):      # TICK: CYCCNT, _cyc_total (64 bit), dropped
+            rec = (0x40, struct.pack('<IIIH', cyc, cyc_full & 0xFFFFFFFF, cyc_full >> 32, 0))
         if rec is not None:
             b[22] = rec[0]
             b[23:25] = struct.pack('<H', idx & 0xFFFF)
@@ -70,7 +78,50 @@ def build(n=N, faults=None, period_us=1000.0):
         if j in f.get('miso_bit', ()):
             b[30] ^= 0x10
         miso[j] = np.frombuffer(bytes(b), dtype=np.uint8)
-    return t_send_ns, mosi, miso
+    return t_send_ns, mosi, miso, reps
+
+
+def esp32_events(data, path=None, drop=()):
+    """esp32_events.txt for build(): each H7 report reaches the ESP32 SPI port 300 µs after its frame (J),
+    callback 50 µs later (I); ESP32 epoch = H7 epoch + 1; ESP32 clock = Pi clock; #run_start/#run_end
+    inside the frames."""
+    t = data[0]
+    path = path or os.path.join(tempfile.mkdtemp(), 'esp32_events.txt')
+    lines = [f'{int(t[0] / 1e3) + 200_000}\t#run_start,first_data_seq=1,timestamp_us=0,qseq=0']
+    q = 0
+    for s, seq, tp in sorted(data[3], key=lambda x: x[2]):
+        q += 1
+        if (s, seq) in drop:
+            continue
+        tj = int(tp) + 300
+        lines.append(f'{tj}\tJ,{q},{tj},{(1, 2, 8)[s]},1,{seq % 256},2')
+        lines.append(f'{tj + 50}\tI,{q},{tj + 50},{(1, 2, 8)[s]},1,{seq % 256},2,{seq},{seq},0,0,0')
+    lines.append(f'{int(t[-1] / 1e3) - 100_000}\t#run_end,last_data_seq=1,timestamp_us=0,qseq={q + 1}')
+    with open(path, 'w') as fh:
+        fh.write('\n'.join(lines) + '\n')
+    return path
+
+
+SERIAL = """--- H753 HIL boot ---
+Init done, entering main loop
+Link: down lost=0  SPI frames=0/s err={e0} rearm=0 last_err=0x0
+Frame: unread=0  new seen=0 taken=0 repl=0 drop=0  applied=0 skipped={s0} age_max=0us
+SPI link up at t=1200 ms
+Link: up lost=0  SPI frames=1000/s err={e0} rearm=0 last_err=0x0
+Frame: unread=0  new seen=10 taken=10 repl=0 drop=0  applied=500 skipped={s0} age_max=310us
+S06log: pushed=10 dropped=0  print_drop=0
+Link: up lost=0  SPI frames=1000/s err={e1} rearm=0 last_err=0x0
+Frame: unread=0  new seen=20 taken=20 repl=0 drop=0  applied=20500 skipped={s1} age_max=320us
+S06log: pushed=30 dropped=0  print_drop=0
+SPI link lost (no frame for 50 ms): encoders stopped, SPI1 restart
+Link period: 20001 frames, H7 20128 ms from first to last frame (Pi: 20000 ms at 1 kHz)
+Link: down lost=1  SPI frames=0/s err={e1} rearm=1 last_err=0x0
+Frame: unread=0  new seen=20 taken=20 repl=0 drop=0  applied=20501 skipped={s1} age_max=320us
+"""
+
+
+def serial(e0=0, e1=0, s0=0, s1=0, text=SERIAL):
+    return t1.ser.parse_lines(text.format(e0=e0, e1=e1, s0=s0, s1=s1).splitlines())
 
 
 @pytest.fixture(scope='module')
@@ -78,9 +129,11 @@ def clean():
     return build()
 
 
-def run(data, **kw):
-    t, mosi, miso = data
-    return t1.check(t, mosi, miso, **{**FAST, **kw})
+def run(data, full=True, **kw):
+    """Score with the serial log and esp32_events of the run (full=True), as a real T1 run has them."""
+    t, mosi, miso = data[:3]
+    extra = dict(serial_events=serial(), esp32_events=esp32_events(data)) if full else {}
+    return t1.check(t, mosi, miso, **{**FAST, **extra, **kw})
 
 
 def test_clean_run_passes(clean):
@@ -142,38 +195,75 @@ def test_short_run_is_short(clean):
     assert run(clean, min_s=60.0)['verdict'] == 'short'
 
 
-SERIAL = """--- H753 HIL boot ---
-Init done, entering main loop
-SPI link up at t=1200 ms
-Link: up lost=0  SPI frames=1000/s err={e0} rearm=0 last_err=0x0
-Frame: unread=0  new seen=10 taken=10 repl=0 drop=0  applied=500 skipped={s0} age_max=310us
-S06log: pushed=10 dropped=0  print_drop=0
-Link: up lost=0  SPI frames=1000/s err={e1} rearm=0 last_err=0x0
-Frame: unread=0  new seen=20 taken=20 repl=0 drop=0  applied=20500 skipped={s1} age_max=320us
-S06log: pushed=30 dropped=0  print_drop=0
-SPI link lost (no frame for 50 ms): encoders stopped, SPI1 restart
-Link period: 20001 frames, H7 20128 ms from first to last frame (Pi: 20000 ms at 1 kHz)
-"""
-
-
 @pytest.mark.parametrize('e1, s1, ok', [(0, 0, True), (2, 0, False), (0, 3, False)])
 def test_serial_link_counters(clean, e1, s1, ok):
-    ev = t1.ser.parse_lines(SERIAL.format(e0=0, e1=e1, s0=0, s1=s1).splitlines())
-    out = run(clean, serial_events=ev)
+    out = run(clean, serial_events=serial(e1=e1, s1=s1))
     assert (out['verdict'] == 'pass') == ok
     sr = out['serial']
-    assert sr['applied'] == 20000 and sr['link_periods'] == [dict(frames=20001, h7_ms=20128, pi_ms=20000)]
+    assert sr['applied'] == 20501 and sr['link_periods'] == [dict(frames=20001, h7_ms=20128, pi_ms=20000)]
+
+
+def test_s1_no_answer_is_not_a_pass():
+    # MISO all zero (MISO line held low, H7 never built an answer): no evidence, fails
+    t, mosi, miso, reps = build(n=12_000)
+    out = run((t, mosi, np.zeros_like(miso), []), full=False)
+    assert out['verdict'] == 'fail'
+    assert any('toàn 0' in m for m in out['fails']) and any('REPORT' in m for m in out['fails'])
+    # one empty answer in the middle of the run
+    out = run(build(faults={'empty': {9000}}))
+    assert out['verdict'] == 'fail' and out['frames']['miso_empty'] == 1
+    # no TICK: the H7 log stream is not shown to run
+    assert any('TICK' in m for m in run(build(n=12_000, faults={'no_tick': True}))['fails'])
+
+
+def test_s6_whole_run_scored_and_length(clean):
+    # a fault at second 5 is scored (T1 does not drop the first 10 s), and N frames = N ms
+    out = run(build(faults={'mixed': {5000}}), skip_s=0.0)
+    assert out['verdict'] == 'fail' and out['frames']['mixed'] == 1
+    out = run(clean, skip_s=0.0, min_s=N / 1000.0 - 0.01)       # send jitter ±12 µs at both ends
+    assert out['scored_s'] == pytest.approx(N / 1000.0, abs=0.001) and out['verdict'] != 'short'
+
+
+def test_s12_age_in_true_microseconds():
+    # 1004 nominal µs at 480 MHz is 997.6 µs at 483.1 MHz: passes; 1010 nominal fails
+    v = t1.age_verdict(1004, 483.1)
+    assert v['verdict'] == 'pass' and v['age_true_hi_us'] < 1000
+    assert t1.age_verdict(1010, 483.1)['verdict'] == 'fail'
+    assert t1.age_verdict(1004, None)['verdict'] == 'inconclusive'      # rate unknown: brackets 1000
+    out = run(build(faults={'age': {7000: 1004}}))
+    assert out['verdict'] == 'pass' and out['state_age']['verdict'] == 'pass', out['fails']
+
+
+def test_s25_serial_log_required_and_bounded(clean):
+    out = run(clean, serial_events=None)
+    assert out['verdict'] == 'incomplete' and t1.exit_code(out) == 3
+    cut = '\n'.join(SERIAL.splitlines()[:-2])                 # no line after the final loss
+    out = run(clean, serial_events=serial(text=cut))
+    assert out['verdict'] == 'incomplete' and any('bao hai đầu' in m for m in out['incomplete'])
+    reconnect = SERIAL.replace('S06log: pushed=30', 'SPI link lost (no frame for 50 ms): x\n'
+                                                    'SPI link up at t=9000 ms\nS06log: pushed=30')
+    out = run(clean, serial_events=serial(text=reconnect))
+    assert out['verdict'] == 'fail' and any('lên lại' in m for m in out['fails'])
+
+
+def test_report_missing_at_esp32_fails(clean):
+    out = run(clean, esp32_events=esp32_events(clean, drop={(1, 100)}))
+    assert out['verdict'] == 'fail' and out['imu']['not_at_esp32_spi'] == 1
 
 
 def test_cli(clean, tmp_path):
-    t, mosi, miso = clean
+    t, mosi, miso = clean[:3]
     npz = tmp_path / 'frames.npz'
     np.savez(npz, t_send_ns=t, mosi=mosi, miso=miso)
     out = tmp_path / 'out'
     script = os.path.join(ROOT, 'tools', 's06_t1_check.py')
+    log = tmp_path / 'h7.log'
+    log.write_text(SERIAL.format(e0=0, e1=0, s0=0, s1=0), encoding='utf-8')
+    ev = esp32_events(clean, str(tmp_path / 'esp32_events.txt'))
     p = subprocess.run([sys.executable, script, str(npz), '--out', str(out), '--skip-s', '1', '--window-s', '5',
-                        '--min-s', '10'], capture_output=True, text=True)
-    assert p.returncode == 0, p.stderr
+                        '--min-s', '10', '--h7-serial', str(log), '--esp32-events', ev], capture_output=True,
+                       text=True)
+    assert p.returncode == 0, p.stdout[-2000:]
     summ = json.load(open(out / 'T1_summary.json', encoding='utf-8'))
     assert summ['verdict'] == 'pass'
     for name, first in (('T1.csv', 'idx'), ('T1_steps.csv', 'step'), ('T1_imu_builds.csv', 'idx')):
