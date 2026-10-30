@@ -257,6 +257,16 @@ def test_start_packet_later_than_the_bound_is_incomplete(frames, tmp_path):
     assert any('S55' in c for c in s['run_conditions']) and t4.exit_code(s) == 3
 
 
+def test_two_runs_in_one_file_is_incomplete(frames, tmp_path):
+    # S58: the decoder scores one run per file
+    t, mosi, miso, seqs = frames
+    ev, data = events(tmp_path, mosi, seqs)
+    with open(ev, 'a') as fh:
+        fh.write(f'{T_END + 500}\t#run_start,first_data_seq=9,timestamp_us={T_END + 500},qseq=999\n')
+    rows, s = t4.check(t, mosi, miso, ev, data, manifest=manifest())
+    assert any('S58' in c for c in s['run_conditions']) and t4.exit_code(s) == 3
+
+
 def test_cli_exit_codes(frames, tmp_path):
     import numpy as np
     t, mosi, miso, seqs = frames

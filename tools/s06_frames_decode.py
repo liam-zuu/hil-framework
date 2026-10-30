@@ -374,9 +374,12 @@ def esp32_lines(path):
                                   v=(float(p[9]), float(p[10]), float(p[11]))))
                 elif p[0] == 'R' and len(p) == 4:
                     R.append(dict(t_rx=t_rx, t_us=int(p[2]), reset_count=int(p[3])))
-                elif p[0] in ('#run_start', '#run_end') and p[0][1:] not in text:
-                    kv = dict(x.partition('=')[::2] for x in p[1:] if '=' in x)
-                    text[p[0][1:]] = dict(t_rx=t_rx, kv=kv)
+                elif p[0] in ('#run_start', '#run_end'):
+                    if p[0] == '#run_start':
+                        text['_n_run_start'] = text.get('_n_run_start', 0) + 1
+                    if p[0][1:] not in text:
+                        kv = dict(x.partition('=')[::2] for x in p[1:] if '=' in x)
+                        text[p[0][1:]] = dict(t_rx=t_rx, kv=kv)
             except ValueError:
                 continue
     return J, I, R, text
@@ -653,7 +656,10 @@ def decode(t_send_ns, mosi, miso, esp32_events: Optional[str] = None, cal: Optio
         res['esp32_match'] = match_esp32(reps, J, I, win, span)
         res['esp32_match']['pad_note'] = pad_check(win, t_send_us, J, I)
         res['esp32_match']['udp_note'] = udp_note
-        res['esp32_run_marks'] = sorted(text)
+        if text.get('_n_run_start', 0) > 1:          # S58: T1, T4 score one run per file
+            res['esp32_match']['udp_note'] = (udp_note + '; ' if udp_note else '') + \
+                f"S58: esp32_events có {text['_n_run_start']} dòng #run_start: mỗi file một lượt"
+        res['esp32_run_marks'] = sorted(k for k in text if not k.startswith('_'))
         res['esp32_run_esp_us'] = esp_run_span(text)
         res['_esp32_text'] = text
         res['resets_near_run_start'] = resets_near_start(recs, R, text)
