@@ -20,10 +20,20 @@ Luật (spec T2: V1, W7, Z9, V10; mục 4 Z19):
   * Kiểm thêm: `t_sched` tăng đúng 1 chu kỳ mỗi bước (lịch không bị đặt lại giữa lượt), cột `miss`
     khớp giá trị tính lại.
 
+Sửa theo Codex Sol vòng 1/2 (Liam duyệt 30/10 "Duyệt, sửa hết"):
+  * S4: `rows`, `first_step`, `steps_written` của `.json` phải khớp CSV (CSV bị cắt hay thiếu dòng là
+    mất dữ liệu, thất bại); `.json` thiếu các trường đó cũng tính là không kiểm được = thất bại.
+  * S13: `t_end` của bước cuối so với hạn kế = hạn của nó + 1 chu kỳ; độ phân giải đồng hồ của `.json`
+    (`monotonic_resolution_s`) là bất định: lỡ chắc chắn khi vượt hạn quá độ phân giải, nằm trong độ phân
+    giải quanh hạn → `inconclusive` (mã 3). Giới hạn còn lại (diễn giải (4)): `t_end` lấy trước lệnh ghi dấu
+    hoàn tất (một lệnh ghi số nguyên) nên phần sau dấu đó không đo; `last_wake_ns` cập nhật trước khi
+    `wait_next_tick()` trả về (`timing.py`), nằm trước `t_done`.
+  * S14: cận quy tắc ba chỉ in khi tổng số lỡ hạn = 0; có lỡ thì in số và tỉ lệ quan sát.
+
 Usage:
   python tools/s06_t2_check.py <steps.csv> [<steps.csv> ...] [--out summary.json]
 Mã thoát: 0 mọi lượt đạt; 1 có lượt không đạt hoặc thất bại; 3 không có lượt không đạt nhưng có
-lượt không đủ thời lượng; 2 lỗi đầu vào.
+lượt không đủ thời lượng hoặc chưa kết luận; 2 lỗi đầu vào.
 """
 from __future__ import annotations
 
@@ -88,7 +98,19 @@ def check_run(path, min_scored_s=MIN_SCORED_S, cluster_gap=CLUSTER_GAP_STEPS, pe
                                                            for x in argv))
         if argv is None:
             res['notes'].append('file .json không có dòng lệnh (bản run_hil cũ): không biết lượt có --frame-log')
-    data_loss = bool(gaps or dup or order_bad or (meta is None) or meta.get('overflow') or meta.get('lost_or_torn'))
+    # S4: the CSV must be the whole drained log of the ring: rows, first step and steps written of the
+    # .json (rpi5/step_log.py StepLogReader.counters) must match the CSV, else rows were cut or lost
+    meta_bad = []
+    if meta is not None:
+        for k, want in (('rows', len(step)), ('first_step', int(step[0])), ('steps_written', int(step[-1]) + 1)):
+            if k not in meta:
+                meta_bad.append(f'.json thiếu {k}')
+            elif meta[k] != want:
+                meta_bad.append(f'.json {k} = {meta[k]}, CSV cho {want}')
+        res['notes'] += meta_bad
+    res['meta_mismatch'] = meta_bad
+    data_loss = bool(gaps or dup or order_bad or (meta is None) or meta.get('overflow') or meta.get('lost_or_torn')
+                     or meta_bad)
     # schedule continuity
     dts = np.diff(ts)
     res['t_sched_step_bad'] = int(np.sum(np.abs(dts - period_us) > 1e-3))
@@ -101,16 +123,25 @@ def check_run(path, min_scored_s=MIN_SCORED_S, cluster_gap=CLUSTER_GAP_STEPS, pe
     res['scored_s'] = float((ts[sc[-1]] - ts[sc[0]]) / 1e6 + period_us / 1e6) if n else 0.0
     lat = td[sc] - ts[sc]
     st = t0[sc] - ts[sc]
-    miss = lat > period_us
-    res['miss_col_mismatch'] = int(np.sum(a['miss'][sc].astype(int) != miss.astype(int)))
-    late_end = np.zeros(n, dtype=bool)
+    # S13: clock resolution of the timestamps (the .json) as the measurement uncertainty: definitely late
+    # beyond it, not concluded within it (mục 4)
+    res_us = float(meta.get('monotonic_resolution_s') or 0.0) * 1e6 if meta else 0.0
+    miss = lat > period_us + res_us
+    near = (np.abs(lat - period_us) <= res_us) & ~miss
+    res['miss_col_mismatch'] = int(np.sum(a['miss'][sc].astype(int) != (lat > period_us).astype(int)))
+    # S13: the deadline after the LAST step is its own deadline + one period (no next row to read it from)
+    nxt_deadline = np.empty(n)
     nxt = sc + 1
     ok_next = nxt < len(ts)
-    late_end[ok_next] = te[sc[ok_next]] > ts[nxt[ok_next]]
+    nxt_deadline[ok_next] = ts[nxt[ok_next]]
+    nxt_deadline[~ok_next] = ts[sc[~ok_next]] + period_us
+    late_end = te[sc] > nxt_deadline + res_us
+    near_end = (np.abs(te[sc] - nxt_deadline) <= res_us) & ~late_end
+    res.update(clock_resolution_us=res_us, near_deadline=int(near.sum() + near_end.sum()))
     res.update(misses=int(miss.sum()), t_end_late=int(late_end.sum()),
                done_max_us=float(lat.max()) if n else None, done_p99_us=pct(lat, 99), done_p999_us=pct(lat, 99.9),
                start_max_us=float(st.max()) if n else None, start_p99_us=pct(st, 99), start_p999_us=pct(st, 99.9),
-               end_margin_min_us=float(np.min(ts[nxt[ok_next]] - te[sc[ok_next]])) if ok_next.any() else None)
+               end_margin_min_us=float(np.min(nxt_deadline - te[sc])) if n else None)
     cl = clusters(step[sc][miss].tolist(), cluster_gap)
     res['miss_clusters'] = len(cl)
     res['miss_cluster_list'] = [dict(first_step=c[0], last_step=c[1], misses=c[2]) for c in cl[:50]]
@@ -121,6 +152,8 @@ def check_run(path, min_scored_s=MIN_SCORED_S, cluster_gap=CLUSTER_GAP_STEPS, pe
         res['status'] = 'fail'
     elif res['scored_s'] < min_scored_s:
         res['status'] = 'too_short'
+    elif res['near_deadline']:
+        res['status'] = 'inconclusive'
     else:
         res['status'] = 'pass'
     if res['t_sched_step_bad']:
@@ -142,26 +175,33 @@ def main(argv=None) -> int:
     except (OSError, ValueError, KeyError) as ex:
         print(f'lỗi đầu vào: {ex}', file=sys.stderr)
         return 2
-    n_sc = sum(r['steps_scored'] for r in runs if r['status'] in ('pass', 'fail'))
-    total = dict(runs=len(runs), steps_scored=n_sc,
-                 rule_of_three_upper_95=(3.0 / n_sc) if n_sc else None,
+    n_sc = sum(r['steps_scored'] for r in runs if r['status'] in ('pass', 'fail', 'inconclusive'))
+    n_miss = sum(r['misses'] for r in runs if r['status'] in ('pass', 'fail', 'inconclusive'))
+    # S14: the rule of three is an upper bound only when NO miss was seen; with misses report the rate
+    total = dict(runs=len(runs), steps_scored=n_sc, misses=n_miss,
+                 miss_rate_observed=(n_miss / n_sc) if n_sc else None,
+                 rule_of_three_upper_95=(3.0 / n_sc) if (n_sc and n_miss == 0) else None,
                  status={s: sum(1 for r in runs if r['status'] == s)
-                         for s in ('pass', 'fail', 'fail_data_loss', 'too_short')})
+                         for s in ('pass', 'fail', 'fail_data_loss', 'too_short', 'inconclusive')})
     for r in runs:
         print(f"{r['file']}: {r['status']}  chấm {r['steps_scored']} bước ({r['scored_s']:.1f} s), "
               f"lỡ hạn {r['misses']} ({r['miss_clusters']} cụm), t_end muộn {r['t_end_late']}, "
               f"t_done−t_sched max {r['done_max_us']} p99 {r['done_p99_us']} p99.9 {r['done_p999_us']} µs, "
               f"trễ bắt đầu max {r['start_max_us']} µs, tràn {r['overflow']}, mất {r['lost_or_torn']}, "
               f"hở step {r['step_gaps']}" + ''.join(f"\n  ! {x}" for x in r['notes']))
-    print(f"Tổng: {total['status']}; cận trên 95 % tỉ lệ lỡ hạn (quy tắc ba, chỉ dấu): "
-          f"{total['rule_of_three_upper_95']}")
+    if total['rule_of_three_upper_95'] is not None:
+        print(f"Tổng: {total['status']}; 0 lần lỡ hạn trên {n_sc} bước: cận trên 95 % tỉ lệ lỡ hạn (quy tắc ba, "
+              f"chỉ dấu) {total['rule_of_three_upper_95']}")
+    else:
+        print(f"Tổng: {total['status']}; {n_miss} lần lỡ hạn trên {n_sc} bước (tỉ lệ quan sát "
+              f"{total['miss_rate_observed']}); quy tắc ba không áp dụng khi đã có lần lỡ")
     if a.out:
         with open(a.out, 'w', encoding='utf-8') as f:
             json.dump(dict(total=total, runs=runs), f, indent=1, ensure_ascii=False)
     st = total['status']
     if st['fail'] or st['fail_data_loss']:
         return 1
-    if st['too_short']:
+    if st['too_short'] or st['inconclusive']:
         return 3
     return 0
 

@@ -14,22 +14,27 @@ N_OK = 620_000            # 620 s: 10 s discarded + 610 s scored
 
 
 def write(tmp_path, n=N_OK, late=(), end_late=(), skip=(), overflow=0, lost=0, name='steps.csv', meta=True,
-          argv=None):
+          argv=None, near=(), cut_last=0, res_s=1e-9):
+    """CSV + .json as run_hil --step-log writes them (counters of the whole drained ring); cut_last drops
+    that many rows from the CSV only (as a truncated copy)."""
     p = tmp_path / name
     with open(p, 'w', newline='\n') as f:
         f.write(CSV_HEADER + '\n')
         t_base = 5_000_000_000
-        for k in range(n):
+        for k in range(n - cut_last):
             if k in skip:
                 continue
             ts = t_base + k * 1_000_000
-            td = ts + (1_200_000 if k in late else 400_000)
+            td = ts + (1_200_000 if k in late else (1_000_500 if k in near else 400_000))
             te = ts + (1_100_000 if k in end_late else 600_000)
             if k in late:
                 te = max(te, td + 1000)
+            if k in near:
+                te = td + 100                       # 1000.6 µs: also within 1 µs of the next deadline
             f.write(format_row((k, ts, ts + 20_000, td, te)) + '\n')
     if meta:
-        m = dict(rows=n - len(skip), overflow=overflow, lost_or_torn=lost, monotonic_resolution_s=1e-9)
+        m = dict(rows=n - len(skip), first_step=0, steps_written=n, overflow=overflow, lost_or_torn=lost,
+                 monotonic_resolution_s=res_s)
         if argv is not None:
             m['argv'] = argv
         json.dump(m, open(str(p) + '.json', 'w'))
@@ -89,3 +94,28 @@ def test_rule_of_three(tmp_path, capsys):
     tot = json.load(open(out))['total']
     assert tot['steps_scored'] == 3 * (N_OK - 10_000)
     assert abs(tot['rule_of_three_upper_95'] - 3 / tot['steps_scored']) < 1e-15
+    # S14: with misses the rule of three is no upper bound: not reported, the observed rate is
+    t2.main([write(tmp_path, name='m.csv', late={100_000, 200_000}), '--out', str(out)])
+    tot = json.load(open(out))['total']
+    assert tot['rule_of_three_upper_95'] is None and tot['misses'] == 2
+    assert abs(tot['miss_rate_observed'] - 2 / (N_OK - 10_000)) < 1e-15
+
+
+def test_s4_csv_cut_against_json(tmp_path):
+    # the last row cut from the CSV: still continuous and long enough, but the .json counted it
+    r = t2.check_run(write(tmp_path, cut_last=1))
+    assert r['status'] == 'fail_data_loss' and r['meta_mismatch']
+    p = write(tmp_path, name='old.csv')
+    m = json.load(open(p + '.json'))
+    del m['steps_written']                               # .json of an older run_hil: not checkable
+    json.dump(m, open(p + '.json', 'w'))
+    assert t2.check_run(p)['status'] == 'fail_data_loss'
+
+
+def test_s13_last_step_and_resolution(tmp_path):
+    # t_end of the last step after its next deadline (= own deadline + 1 ms) fails
+    assert t2.check_run(write(tmp_path, end_late={N_OK - 1}))['status'] == 'fail'
+    # done 0.5 µs after the deadline with a 1 µs clock: cannot tell, not concluded
+    r = t2.check_run(write(tmp_path, near={300_000}, res_s=1e-6, name='n.csv'))
+    assert r['status'] == 'inconclusive' and r['misses'] == 0 and r['near_deadline'] == 2   # done + end
+    assert t2.main([write(tmp_path, near={300_000}, res_s=1e-6, name='n2.csv')]) == 3
