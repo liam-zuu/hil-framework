@@ -319,6 +319,22 @@ def test_multi_run_counts_excluded(tmp_path, capsys):
     assert "đạt 1, không đạt 1" in out and "bị loại vì số lần đọc count (đo lại) 1" in out
 
 
+def test_multi_run_ends_with_result_line(tmp_path, capsys):
+    # C2-16 (CB2): several runs end like one: mã 0 when all pass, mã 3 with no failure, a failure wins
+    a = make_run(tmp_path, name="a")
+    inv = make_run(tmp_path, name="inv", enc_short=5)
+    ins = make_run(tmp_path, name="ins", no_run_end=True)
+    bad = make_run(tmp_path, name="bad", drop_gyro=(100, 101))
+    for dirs, code, last in (([a, a], 0, "#ket_qua,ma=0"),
+                             ([a, inv], 3, "#ket_qua,ma=3,ly_do=khong_du_dieu_kien"),
+                             ([inv, inv], 3, "#ket_qua,ma=3,ly_do=khong_du_dieu_kien"),
+                             ([a, ins], 3, "#ket_qua,ma=3,ly_do=thieu_bang_chung"),
+                             ([ins, inv], 3, "#ket_qua,ma=3,ly_do=khong_du_dieu_kien"),
+                             ([inv, bad], 1, "#ket_qua,ma=1")):
+        assert chk.main(dirs) == code
+        assert capsys.readouterr().out.splitlines()[-1] == last
+
+
 def test_firmware_gyro_gap_reported_not_scored(tmp_path):
     res, _, _ = chk.check_run(make_run(tmp_path))
     assert res["dut_fw_gyro_gap_max_us"] == "10000"

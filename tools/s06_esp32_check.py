@@ -544,20 +544,23 @@ def main(argv=None):
     a = p.parse_args(argv)
     if a.out and len(a.run_dirs) > 1:
         p.error("--out chỉ dùng với một lượt")
-    status = []
+    status, reasons = [], []
     for d in a.run_dirs:
         res, ev, imu = check_run(d)
         write_outputs(a.out or os.path.join(d, "check"), res, ev, imu)
         print_report(res)
         status.append(res["status"])
-    if len(status) == 1:
-        code = {"pass": 0, "fail": 1, "insufficient": 3, "invalid": 3}[status[0]]
-        print(f"#ket_qua,ma={code}" + (f",ly_do={res.get('reason', 'khong_du_dieu_kien')}" if code == 3 else ""))
-        return code
-    print(f"Tổng {len(status)} lượt: đạt {status.count('pass')}, không đạt {status.count('fail')}, "
-          f"thiếu #run_start/#run_end {status.count('insufficient')}, "
-          f"bị loại vì số lần đọc count (đo lại) {status.count('invalid')}")
-    return 0 if all(s == "pass" for s in status) else 1
+        if res["status"] in ("insufficient", "invalid"):
+            reasons.append(res.get("reason", "khong_du_dieu_kien"))
+    if len(status) > 1:
+        print(f"Tổng {len(status)} lượt: đạt {status.count('pass')}, không đạt {status.count('fail')}, "
+              f"thiếu #run_start/#run_end {status.count('insufficient')}, "
+              f"bị loại vì số lần đọc count (đo lại) {status.count('invalid')}")
+    # CB2, C2-16: several runs end the same way: a failure wins, else mã 3 with the first reason of the spec table
+    code = 1 if "fail" in status else (3 if reasons else 0)
+    why = "khong_du_dieu_kien" if "khong_du_dieu_kien" in reasons else "thieu_bang_chung"
+    print(f"#ket_qua,ma={code}" + (f",ly_do={why}" if code == 3 else ""))
+    return code
 
 
 if __name__ == "__main__":
