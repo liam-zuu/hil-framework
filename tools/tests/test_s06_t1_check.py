@@ -266,7 +266,7 @@ def test_cli(clean, tmp_path):
     assert p.returncode == 0, p.stdout[-2000:]
     summ = json.load(open(out / 'T1_summary.json', encoding='utf-8'))
     assert summ['verdict'] == 'pass'
-    for name, first in (('T1.csv', 'idx'), ('T1_steps.csv', 'step'), ('T1_imu_builds.csv', 'idx')):
+    for name, first in (('T1.csv', 'idx'), ('T1_steps.csv', 'idx'), ('T1_imu_builds.csv', 'idx')):   # S31
         assert open(out / name).readline().split(',')[0].strip() == first
     assert subprocess.run([sys.executable, script, str(npz), '--out', str(out)], capture_output=True,
                           text=True).returncode == 3           # 19 s scored < 600 s

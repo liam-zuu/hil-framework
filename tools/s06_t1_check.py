@@ -72,7 +72,7 @@ FIELDS = [(f'w{i + 1}', (2 * i, 2 * i + 1)) for i in range(4)] + [
 
 WINDOW_COLS = ['idx', 'window', 't_start_us', 'pi_frames', 'frames_rx', 'frames_applied', 'seq_gaps',
                'max_state_age_us', 'miso_seq_bad', 'mixed_frames', 'miso_crc_bad']
-STEP_COLS = ['step', 'crc_sent', 'crc_h7', 'field_change_mask', 'miso_crc_ok']
+STEP_COLS = ['idx', 'step', 'crc_sent', 'crc_h7', 'field_change_mask', 'miso_crc_ok']
 IMU_COLS = ['idx', 'report_type', 'rpt_seq', 'queued', 'qfull', 'imu_seq_used', 'n_frames_src', 'n_frames_latest',
             'imu_crc_h7', 'imu_crc_pi', 'imu_crc_ok', 'imu_age_frames', 'cyccnt', 'esp32_spi']
 
@@ -275,8 +275,8 @@ def check(t_send_ns, mosi, miso, esp32_events=None, serial_events=None, skip_s=0
         W = {k: v for k, v in wins[w].items() if not k.startswith('_')}
         W['idx'] = i
         windows.append(W)
-    steps = [dict(step=int(k), crc_sent=dec.crc16(bytes(mosi[k])), crc_h7=steps_crc_h7.get(int(k), ''),
-                  field_change_mask=int(masks[k]), miso_crc_ok=int(k) in steps_crc_h7) for k in sel]
+    steps = [dict(idx=i, step=int(k), crc_sent=dec.crc16(bytes(mosi[k])), crc_h7=steps_crc_h7.get(int(k), ''),
+                  field_change_mask=int(masks[k]), miso_crc_ok=int(k) in steps_crc_h7) for i, k in enumerate(sel)]
     tot['miso_empty'] = miso_empty
     if fails:
         verdict = 'fail'

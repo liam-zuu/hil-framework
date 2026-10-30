@@ -171,6 +171,10 @@ def t10_rows(blocks, f_real_mhz: float = F_REAL_MHZ):
                                  gross_us='', max_us=i['max_us'],
                                  max_us_real=i['max_us'] * F_NOMINAL_MHZ / f_real_mhz,
                                  pct=100.0 * i['excl_us'] / win_us))
+    # S31: common row index first; µs columns are what the H7 prints (cycles already divided and
+    # rounded on the H7: the raw cycles of the spec column list are not recoverable, not filled in)
+    win_rows = [dict(idx=n, **r) for n, r in enumerate(win_rows)]
+    irq_rows = [dict(idx=n, **r) for n, r in enumerate(irq_rows)]
     return win_rows, irq_rows
 
 

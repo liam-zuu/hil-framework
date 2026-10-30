@@ -139,7 +139,8 @@ def test_cli(tmp_path):
     assert p.returncode == 0, p.stderr
     s = json.load(open(out / 'T10_summary.json', encoding='utf-8'))
     assert s['complete'] and s['windows'] == 3 and s['link']['applied'] == 40000
-    assert open(out / 'T10.csv').readline().startswith('window,irq,count,excl_us')
+    assert open(out / 'T10.csv').readline().startswith('idx,window,irq,count,excl_us')          # S31
+    assert open(out / 'T10_windows.csv').readline().startswith('idx,window,')
     log.write_text('\n'.join(make_log(print_drop_end=1)) + '\n', encoding='utf-8')
     assert subprocess.run([sys.executable, script, str(log), '--out', str(out)], capture_output=True,
                           text=True).returncode == 3

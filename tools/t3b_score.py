@@ -67,7 +67,7 @@ EVENT_EXCL_US = 1000.0        # (a): loại khoảng giao [sự kiện; + 1 ms]
 LOCKED_SEED = 1               # spec Phần D (đề xuất điền giá trị khóa, Liam "Theo khuyến nghị"): lịch T3b seed 1
 LAG_MATCH_MIN = 0.999         # S16: the frames must follow the schedule at the lag found
 
-COLUMNS = ['id', 'wheel', 'transition', 'rep', 'omega_from', 'omega_to',
+COLUMNS = ['idx', 'id', 'wheel', 'transition', 'rep', 'omega_from', 'omega_to',
            't_read_before_us', 't_read_after_us', 't_read_before_end_us', 't_read_after_end_us',
            'window_start_us', 'window_end_us', 'start_cnt', 'count_meas', 'count_cmd', 'err_counts',
            'n_tol', 'uncertainty', 'u_t_limit', 'u_t_ok', 'backward_steps', 'start_phase_counts',
@@ -236,6 +236,8 @@ def score_run(run: Run, sched: Sequence) -> List[dict]:
         row['rep'] = reps[key]
         out.append(row)
     out.sort(key=lambda x: x['id'])
+    for i, row in enumerate(out):              # S31: common row index of the S06 CSVs (spec mục 5)
+        row['idx'] = i
     return out
 
 
