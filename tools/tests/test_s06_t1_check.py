@@ -134,8 +134,26 @@ def clean():
 def run(data, full=True, **kw):
     """Score with the serial log and esp32_events of the run (full=True), as a real T1 run has them."""
     t, mosi, miso = data[:3]
-    extra = dict(serial_events=serial(), esp32_events=esp32_events(data)) if full else {}
+    extra = dict(serial_events=serial(), esp32_events=esp32_events(data), manifest=whole(t)) if full else {}
     return t1.check(t, mosi, miso, **{**FAST, **extra, **kw})
+
+
+def whole(t):
+    return dict(step_first=0, step_last=len(t) - 1, steps=len(t), period_us=1000)
+
+
+def test_s81_frame_log_checked(clean):
+    t, mosi, miso = clean[:3]
+    # the manifest says one step more than the file holds
+    out = run(clean, manifest=dict(whole(t), step_last=len(t), steps=len(t) + 1))
+    assert out['verdict'] == 'fail' and any('mất frame' in x for x in out['fails'])
+    # a row lost, its neighbour repeated: the row count still matches
+    m, mi = mosi.copy(), miso.copy()
+    m[9000], mi[9000] = m[9001], mi[9001]
+    assert any('seq MOSI' in x for x in t1.check(t, m, mi, **{**FAST, 'manifest': whole(t)})['fails'])
+    # no manifest: evidence missing, not a pass
+    out = run(clean, manifest=None)
+    assert out['verdict'] == 'incomplete' and any('manifest' in x for x in out['incomplete'])
 
 
 def test_clean_run_passes(clean):
@@ -265,7 +283,7 @@ def test_report_missing_just_after_run_start_fails(clean):
 def test_cli(clean, tmp_path):
     t, mosi, miso = clean[:3]
     npz = tmp_path / 'frames.npz'
-    np.savez(npz, t_send_ns=t, mosi=mosi, miso=miso)
+    np.savez(npz, t_send_ns=t, mosi=mosi, miso=miso, manifest=np.array(json.dumps(whole(t))))
     out = tmp_path / 'out'
     script = os.path.join(ROOT, 'tools', 's06_t1_check.py')
     log = tmp_path / 'h7.log'

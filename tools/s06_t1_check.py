@@ -99,7 +99,8 @@ def age_verdict(age_max_us, f_mhz):
 
 
 def check(t_send_ns, mosi, miso, esp32_events=None, serial_events=None, skip_s=0.0, window_s=10.0,
-          min_s=600.0, clock_res_us=0.001, answer_lag=ANSWER_LAG, cal=None, startup_empty=None) -> dict:
+          min_s=600.0, clock_res_us=0.001, answer_lag=ANSWER_LAG, cal=None, startup_empty=None,
+          manifest=None) -> dict:
     mosi = np.asarray(mosi, dtype=np.uint8)
     t_us = np.asarray(t_send_ns, dtype=np.float64) / 1000.0
     res = dec.decode(t_send_ns, mosi, miso, esp32_events, cal)
@@ -246,6 +247,10 @@ def check(t_send_ns, mosi, miso, esp32_events=None, serial_events=None, skip_s=0
             fails.append(f'{imu[k]} {msg}')
     if stream['log_gaps'] or stream['h7_dropped']:
         fails.append(f"luồng log H7 thiếu (hở {stream['log_gaps']}, H7 bỏ {stream['h7_dropped']}): Z19")
+    # S81 (vòng 5): the frame log itself, as in T3b, T4, T6
+    fails += dec.manifest_check(manifest, t_send_ns, mosi, miso)
+    if manifest is None:
+        incomplete.append('frames.npz không có manifest: không chứng minh được log frame đủ')
     rp = res['reports']
     if rp.get('seq_flags'):
         fails.append(f"số thứ tự report H7 bất thường {rp['seq_flags']}")
@@ -335,7 +340,8 @@ def main(argv=None) -> int:
         z = np.load(a.frames)
         serial = ser.read_log(a.h7_serial) if a.h7_serial else None
         out = check(z['t_send_ns'], z['mosi'], z['miso'], a.esp32_events, serial, a.skip_s, a.window_s,
-                    a.min_s, a.clock_res_us, a.answer_lag, dec.load_cal(z, a), a.startup_empty)
+                    a.min_s, a.clock_res_us, a.answer_lag, dec.load_cal(z, a), a.startup_empty,
+                    dec.load_manifest(z))
     except (OSError, KeyError, ValueError) as exc:
         print(f'lỗi đầu vào: {exc}', file=sys.stderr)
         return 2

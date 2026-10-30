@@ -351,6 +351,12 @@ def main(argv=None) -> int:
     try:
         sched = ts.read_csv(a.schedule)
         t_send, w_d = load_frames(a.frames)
+        z = np.load(a.frames)
+        # S81 (vòng 5): the frame log itself, as in T4, T6; with or without --h7-calls
+        manifest = fd.load_manifest(z)
+        fails += fd.manifest_check(manifest, z['t_send_ns'], z['mosi'], z['miso'])
+        if manifest is None:
+            notes.append('frames.npz không có manifest: không chứng minh được log frame đủ')
         marks = stm.run_marks(a.esp32_events, a.run)
         if marks['_problem']:
             raise ValueError(marks['_problem'])
@@ -360,7 +366,6 @@ def main(argv=None) -> int:
             raise ValueError(f'frame MOSI không theo lịch (khớp tốt nhất {frac:.4f} ở trễ {lag} frame)')
         calls = None
         if a.h7_calls:
-            z = np.load(a.frames)
             res = fd.decode(z['t_send_ns'], z['mosi'], z['miso'], cal=fd.load_cal(z, a))
             calls = res['_calls']
             if any(t is None for v in calls.values() for _, t, *_ in v):
@@ -405,7 +410,7 @@ def main(argv=None) -> int:
     code = exit_code(rows)
     if fails:
         code = 1
-    elif code == 0 and (calls is None or sched_bad or not stream['known'] or stream['multi_run']
+    elif code == 0 and (calls is None or sched_bad or manifest is None or not stream['known'] or stream['multi_run']
                         or (calls is not None and any('chưa hiệu chuẩn' in x for x in notes))):
         code = 3                                    # acceptance evidence missing: no pass
     return code

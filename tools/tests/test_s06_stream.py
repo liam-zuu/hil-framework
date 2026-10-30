@@ -140,6 +140,15 @@ def test_p_format_must_match_the_marks(tmp_path):
     assert q['malformed'] == 1 and not q['ok']
     q = stm.qseq_stream(write(tmp_path, ['#run_start,timestamp_us=100,qseq=1', old, end.format('')]))
     assert q['malformed'] == 0 and q['ok']
+    q = stm.qseq_stream(write(tmp_path, ['#run_start,run=1,timestamp_us=100,qseq=1', new, end.format('run=1,')]))
+    assert q['malformed'] == 0 and q['ok']
+
+
+def test_p_with_the_id_of_another_run_is_not_received(tmp_path):
+    # S75: right format, run 2 inside the qseq span of run 1: T6 would drop it, so it does not count here
+    q = stm.qseq_stream(write(tmp_path, ['#run_start,run=1,timestamp_us=100,qseq=1', 'P,2,1,2,0,30,3,970,8,1000,2',
+                                         '#run_end,run=1,timestamp_us=200,ev_qdrop_run=0,enc_ovf_run=0,qseq=3']))
+    assert q['malformed'] == 1 and q['missing'] == 1 and not q['ok']
 
 
 def test_e_of_run(tmp_path):

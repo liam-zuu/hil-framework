@@ -177,14 +177,21 @@ QSEQ_FIELDS = {'J': (7,), 'I': (12,), 'R': (4,), 'P': (10, 11), 'S': (15, 16)}  
 FLOAT_FROM = {'I': 9, 'S': 15}     # first field printed with %g/%f (s06_load.c); the fields before it are integers
 
 
-def _line_ok(p, p_fields=None) -> bool:
+def _p_of_run(p, marks: dict) -> bool:
+    """S71, S75: a P line that passed `_line_ok` belongs to the selected run: the run id of the marks (11
+    fields); marks without a run id: the old 10 fields. No START in `marks`: not decided here."""
+    if 'run_start' not in marks:
+        return True
+    rid = marks.get('_run')
+    return len(p) == 10 if rid is None else len(p) == 11 and int(p[10]) == rid
+
+
+def _line_ok(p) -> bool:
     """S56 (vòng 3): a line counts for the stream only if its payload is readable: the field count of its
     kind and every field a number (`nan` allowed: the values of an I line, the temperature of an S line).
     S67 (vòng 4): integer fields by the same rule as the scoring parsers (`int`), so a line counted as
-    received is never dropped later. S71: `p_fields` = the P format of the run (11 with a run id)."""
+    received is never dropped later."""
     if p[0] not in QSEQ_FIELDS or len(p) not in QSEQ_FIELDS[p[0]]:
-        return False
-    if p[0] == 'P' and p_fields not in (None, len(p)):
         return False
     n = FLOAT_FROM.get(p[0], len(p))
     try:
@@ -207,7 +214,6 @@ def qseq_stream(path: str, marks: Optional[dict] = None) -> dict:
     `ev_qdrop_run` > 0 là thất bại dù thiếu mốc khác."""
     m = marks if marks is not None else run_marks(path)
     q_start, q_end = _mark_int(m, 'run_start', 'qseq'), _mark_int(m, 'run_end', 'qseq')
-    p_fields = None if 'run_start' not in m else (11 if m.get('_run') is not None else 10)   # S71
     qdrop = _mark_int(m, 'run_end', 'ev_qdrop_run')
     got, bad = [], []
     with open(path, encoding='utf-8', errors='replace') as fh:
@@ -224,7 +230,7 @@ def qseq_stream(path: str, marks: Optional[dict] = None) -> dict:
                 q = int(p[1])
             except (KeyError, ValueError, IndexError):
                 continue
-            (got if _line_ok(p, p_fields) else bad).append(q)
+            (got if _line_ok(p) and (p[0] != 'P' or _p_of_run(p, m)) else bad).append(q)
     out = dict(q_start=q_start, q_end=q_end, expected=None, received=None, missing=None, dups=None,
                malformed=None, ev_qdrop_run=qdrop, multi_run=bool(m.get('_multi')), known=False,
                ok=(qdrop or 0) == 0)

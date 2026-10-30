@@ -5,6 +5,7 @@ same N_tol as rpi5/t3b_schedule.py (which matches the 4 spec examples, test_t3b_
 pass exact counts, and catch a backward step, a count error above N_tol, a wrong number of
 _start_wheel/_stop calls; a count error inside the time uncertainty is inconclusive.
 Run: python -m pytest tools/tests"""
+import json
 import os
 import shutil
 import subprocess
@@ -165,15 +166,16 @@ def test_empty_and_lag_and_locked_schedule(small):
     assert sc.schedule_matches_locked(sched) != []                           # a cut schedule is not the locked one
 
 
-def _cli_run(tmp_path, small, lost=None, lag=1, extra=()):
+def _cli_run(tmp_path, small, lost=None, lag=1, extra=(), manifest=None):
     """A run as run_hil --omega-schedule writes it: frame k carries entry k - lag; ESP32 clock = Pi clock."""
     from protocol import encode_state
     sched, t_send, w_d, tb, ta = small
     sent = np.vstack([np.zeros((lag, 4)), w_d[:len(w_d) - lag]]) if lag else w_d
     mosi = np.array([np.frombuffer(encode_state(list(sent[k]) + [0.0] * 6, seq=k), dtype=np.uint8)
                      for k in range(len(t_send))])
+    log = {} if manifest is None else dict(manifest=np.array(json.dumps(manifest)))
     np.savez(tmp_path / 'frames.npz', t_send_ns=(t_send * 1000).astype(np.int64), mosi=mosi,
-             miso=np.zeros_like(mosi))
+             miso=np.zeros_like(mosi), **log)
     c = exact_counts(t_send, sent, tb, ta)
     lines = [f'{int(tb[0])}\t#run_start,timestamp_us={int(tb[0])},qseq=0']
     for j in range(len(tb)):
@@ -186,6 +188,17 @@ def _cli_run(tmp_path, small, lost=None, lag=1, extra=()):
     return sc.main(['--schedule', str(tmp_path / 'sched.csv'), '--frames', str(tmp_path / 'frames.npz'),
                     '--esp32-events', str(tmp_path / 'ev.txt'), '--clock-affine', '0', '1', '--delta-sync-us', '0',
                     '--out', str(tmp_path / 'out'), *extra])
+
+
+def test_cli_frame_log_checked(tmp_path, small, capsys):
+    # S81: a manifest saying more steps than the file holds fails T3b, with or without --h7-calls
+    n = len(small[1])
+    assert _cli_run(tmp_path, small, manifest=dict(step_first=0, step_last=n, steps=n + 1)) == 1
+    assert 'mất frame' in capsys.readouterr().out
+    assert _cli_run(tmp_path, small, manifest=dict(step_first=0, step_last=n - 1, steps=n)) == 3   # no --h7-calls
+    assert 'không có manifest' not in capsys.readouterr().out
+    assert _cli_run(tmp_path, small) == 3
+    assert 'không có manifest' in capsys.readouterr().out
 
 
 def test_cli_run_that_cannot_be_chosen(tmp_path, small):
