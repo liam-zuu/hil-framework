@@ -35,6 +35,12 @@ Sửa theo Codex Sol vòng 2/2 (Liam 30/10 "Sửa P1 rồi vòng 3"):
   * S42: độ phủ chỉ tính khi MOSI thật bằng đúng lịch khóa (so int16 từng frame của lượt và frame nguồn);
     khác → mã 3 (Pi không phát lịch T4, ví dụ quên `--imu-profile t4`).
 
+Manifest lượt (Codex Sol vòng 3, Liam 30/10 "Làm manifest lượt"):
+  * S64 (P2, làm cùng vì manifest có sẵn): frames.npz phải có manifest của hil_node và `imu_profile` = t4;
+    thiếu → mã 3. Có t4 mà MOSI vẫn khác lịch → lỗi của bộ HIL, mã 1 (S42 trước đây xếp hết vào mã 3).
+  * S57: số frame khác manifest → mã 1.
+  * S55: khung H7 và khung so kích thích mở sớm hơn #run_start 100 ms (cận trễ UDP, bộ giải mã).
+
 Usage:
   python tools/s06_t4_values.py <frames.npz> <esp32_events.txt> --esp32-data <esp32_data.txt> --out <thư mục>
 Mã thoát: 0 đạt đủ; 1 có report sai, NaN, không ghép được, yaw DATA lệch hoặc bộ giải mã báo vấn đề;
@@ -191,7 +197,7 @@ def stimulus_check(t_send_us, mosi, window, src_frames, period_us=1000.0):
     return len(ks), bad, first
 
 
-def check(t_send_ns, mosi, miso, events_path, data_path=None, cal=None):
+def check(t_send_ns, mosi, miso, events_path, data_path=None, cal=None, manifest=None):
     """Score every callback line I that has a report identity (S33: also applied = 0, whose value was
     read before the mutex), S38: every callback inside #run_start..#run_end on the ESP32 clock (the same
     clock the I lines carry; no edge left out)."""
@@ -242,7 +248,8 @@ def check(t_send_ns, mosi, miso, events_path, data_path=None, cal=None):
     text = res.get('_esp32_text', {})
     data = check_data_yaw(data_path, res['_esp32_I'], data_seq_span(text)) if data_path else None
     summary = dict(epoch_offset_esp32_minus_h7=off, epoch_note=m['epoch_note'], window_pi_us=win,
-                   window_esp32_us=esp, callback_reports=len(cb),
+                   window_esp32_us=esp, callback_reports=len(cb), manifest=manifest,
+                   frame_log_faults=dec.manifest_check(manifest, len(t_send_ns)),
                    stimulus=dict(frames_checked=n_chk, frames_differ=n_diff, first_differ=k_diff),
                    per_kind={k: dict(v, tol=TOL.get(k), unit=UNIT.get(k)) for k, v in stats.items()},
                    fail=sum(s['fail'] for s in stats.values()),
@@ -258,12 +265,18 @@ def exit_code(summary) -> int:
     the MOSI is not the locked schedule (S42) or a schedule point not covered (S18); no esp32_data.txt,
     no data seq span in the run marks, or ticks without a game RV yet (S28, S39)); 0 otherwise."""
     d = summary['data_yaw']
-    if summary['fail'] or summary['decode_problems']:
+    if summary['fail'] or summary['decode_problems'] or summary['frame_log_faults']:
         return 1
     if d and (d['bad'] or d['no_callback'] or d['bad_lines'] or d['seq_missing'] or d['seq_dups']):
         return 1
+    # S64: MOSI off the schedule while the manifest says the Pi ran `--imu-profile t4` is a fault of the HIL
+    # (mã 1); a run without that profile, or a log with no manifest, is a run not valid for T4 (4) (mã 3)
+    man = summary['manifest']
+    profile_t4 = man is not None and man.get('imu_profile') == 't4'
+    if summary['stimulus']['frames_differ'] and profile_t4:
+        return 1
     if (summary['run_conditions'] or summary['window_esp32_us'] is None or summary['callback_reports'] == 0
-            or summary['stimulus']['frames_differ'] or summary['coverage_missing']):
+            or not profile_t4 or summary['stimulus']['frames_differ'] or summary['coverage_missing']):
         return 3
     if d is None or not d['header'] or d['seq_span'] is None or d['no_rv'] or not d['ok']:
         return 3
@@ -285,7 +298,7 @@ def main(argv=None) -> int:
     try:
         z = np.load(a.frames)
         rows, summary = check(z['t_send_ns'], z['mosi'], z['miso'], a.esp32_events, a.esp32_data,
-                              dec.load_cal(z, a))
+                              dec.load_cal(z, a), dec.load_manifest(z))
         for i, r in enumerate(rows):
             r['idx'] = i
         summary['exit_code'] = exit_code(summary)

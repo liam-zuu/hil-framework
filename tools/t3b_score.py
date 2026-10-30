@@ -304,23 +304,23 @@ def load_frames(path: str):
     return t_send_us, w_d
 
 
-def load_esp32_reads(path: str, offset_us: float, rate: float):
+def load_esp32_reads(path: str, offset_us: float, rate: float, run=None):
     """Reads on the Pi clock (t_pi = offset + rate·t_esp) and, for the Z19 check, eseq + t_before on the
-    ESP32 clock."""
+    ESP32 clock. `run` (manifest, S58): only the E lines of that run; None = every E line (no run field)."""
     tb, ta, c, eseq, tb_esp = [], [], [], [], []
     with open(path, encoding='utf-8', errors='replace') as f:
         for raw in f:
             _, sep, line = raw.rstrip('\n').partition('\t')
             if not sep or not line.startswith('E,'):
                 continue
-            p = line.split(',')
-            if len(p) != 8:
+            e = stm.parse_e(line.split(','))
+            if e is None or (run is not None and e[4] != run):
                 continue
-            tb.append(offset_us + rate * int(p[2]))
-            ta.append(offset_us + rate * int(p[3]))
-            c.append([int(x) for x in p[4:8]])
-            eseq.append(int(p[1]))
-            tb_esp.append(int(p[2]))
+            tb.append(offset_us + rate * e[1])
+            ta.append(offset_us + rate * e[2])
+            c.append(e[3])
+            eseq.append(e[0])
+            tb_esp.append(e[1])
     order = np.argsort(tb, kind='stable')
     return (np.array(tb)[order], np.array(ta)[order], np.array(c)[order],
             np.array(eseq)[order], np.array(tb_esp)[order])
@@ -331,6 +331,8 @@ def main(argv=None) -> int:
     ap.add_argument('--schedule', required=True)
     ap.add_argument('--frames', required=True, help='frames.npz của run_hil.py --frame-log')
     ap.add_argument('--esp32-events', required=True, help='esp32_events.txt của s06_logger.py (dòng E)')
+    ap.add_argument('--run', type=int, default=None,
+                    help='số lượt (run= của #run_start) khi file có nhiều lượt; bỏ trống = file một lượt (S58)')
     ap.add_argument('--clock-affine', nargs=2, type=float, required=True, metavar=('OFFSET_US', 'RATE'),
                     help='t_pi_us = OFFSET + RATE * t_esp_us (từ chân đánh dấu; chưa có công cụ tự tính)')
     ap.add_argument('--delta-sync-us', type=float, required=True, help='bất định đồng bộ ESP32 → RPi5, µs')
@@ -349,7 +351,8 @@ def main(argv=None) -> int:
     try:
         sched = ts.read_csv(a.schedule)
         t_send, w_d = load_frames(a.frames)
-        tb, ta, c, eseq, tb_esp = load_esp32_reads(a.esp32_events, *a.clock_affine)
+        marks = stm.run_marks(a.esp32_events, a.run)
+        tb, ta, c, eseq, tb_esp = load_esp32_reads(a.esp32_events, *a.clock_affine, run=marks.get('_run'))
         lag, frac = schedule_lag(w_d, sched)
         if frac < LAG_MATCH_MIN:
             raise ValueError(f'frame MOSI không theo lịch (khớp tốt nhất {frac:.4f} ở trễ {lag} frame)')
@@ -376,7 +379,6 @@ def main(argv=None) -> int:
         print(f'lỗi đầu vào: {ex}', file=sys.stderr)
         return 2
     # S4 (Z19): lost encoder reads inside the scored span, or an ESP32 overflow, is a failure
-    marks = stm.run_marks(a.esp32_events)
     off, rate = a.clock_affine
     w0 = min(r['window_start_us'] for r in rows) if rows else 0.0
     w1 = max(r['window_end_us'] for r in rows) if rows else 0.0
@@ -401,7 +403,7 @@ def main(argv=None) -> int:
     code = exit_code(rows)
     if fails:
         code = 1
-    elif code == 0 and (calls is None or sched_bad or not stream['known']
+    elif code == 0 and (calls is None or sched_bad or not stream['known'] or stream['multi_run']
                         or (calls is not None and any('chưa hiệu chuẩn' in x for x in notes))):
         code = 3                                    # acceptance evidence missing: no pass
     return code

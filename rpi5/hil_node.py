@@ -295,9 +295,16 @@ class HILNode:
     # ── Cleanup & diagnostics ─────────────────────────────────────────────
 
     def _save_frame_log(self) -> None:
+        import json
         import numpy as np
         n = self._step
-        np.savez(self.cfg.frame_log, **{k: v[:n] for k, v in self._flog.items()})
+        # Run manifest (S06 tools, Codex Sol round 3 S57/S64): what the Pi itself ran, saved with the frames
+        # so the scoring tools can tell a cut or partial log and which IMU source fed the MOSI
+        manifest = dict(step_first=0, step_last=n - 1, steps=n, period_us=self.cfg.period_us,
+                        max_steps=self.cfg.max_steps, stop_reason=self._stop_reason,
+                        imu_profile=self.cfg.imu_profile, imu_static=self.cfg.imu_static)
+        np.savez(self.cfg.frame_log, manifest=np.array(json.dumps(manifest)),
+                 **{k: v[:n] for k, v in self._flog.items()})
         log.info('Frame log: %d frames -> %s', n, self.cfg.frame_log)
 
     def _on_signal(self, signum: int, _frame) -> None:

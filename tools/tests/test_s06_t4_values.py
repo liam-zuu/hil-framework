@@ -3,6 +3,7 @@ the locked T4 schedule (rpi5/t4_imu_profile.py, one 27 s cycle): callback values
 source-frame IMU (within the report quantisation) pass; the faults the spec names (deg/rad, sign, 1 %
 scale, value of the previous report, no source frame) and the ones of Codex Sol round 1/2 (NaN on a later
 axis S3, sparse callbacks S9, applied = 0 S33, schedule not covered S18, DATA yaw S28) are found."""
+import json
 import math
 import os
 import sys
@@ -43,12 +44,12 @@ def frames():
 
 
 def events(tmp_path, mosi, seqs, fault=None, skip=None, name='esp32_events.txt', marks=(T_START, T_END),
-           drop_tick=None):
+           drop_tick=None, start_delay_us=0):
     """J/I lines (Pi clock = ESP32 clock), #run_start/#run_end; returns (events path, data path). The DATA
     file has one tick per game-RV callback with log_seq = its rv_n and yaw in rad (%.4f, as logger.c);
     first_data_seq/last_data_seq of the marks span the ticks inside the run. `drop_tick(rv_n)` True leaves
     that tick out of the file (lost DATA line)."""
-    lines = [f'{marks[0]}\t#run_start,first_data_seq=@FIRST@,timestamp_us={marks[0]},qseq=0']
+    lines = [f'{marks[0] + start_delay_us}\t#run_start,first_data_seq=@FIRST@,timestamp_us={marks[0]},qseq=0']
     data = ['1\ttimestamp_us,x,yaw_rad,log_seq,rv_n']
     in_run = []
     q, rv_n = 0, 0
@@ -105,10 +106,16 @@ def events(tmp_path, mosi, seqs, fault=None, skip=None, name='esp32_events.txt',
     return str(p), str(d)
 
 
+def manifest(n=N, profile='t4'):
+    """What hil_node._save_frame_log writes for a run with --imu-profile t4."""
+    return dict(step_first=0, step_last=n - 1, steps=n, period_us=1000, max_steps=n, stop_reason='max_steps',
+                imu_profile=profile, imu_static=None)
+
+
 def check(frames, tmp_path, **kw):
     t, mosi, miso, seqs = frames
     ev, data = events(tmp_path, mosi, seqs, **kw)
-    return t4.check(t, mosi, miso, ev, data)
+    return t4.check(t, mosi, miso, ev, data, manifest=manifest())
 
 
 def test_clean_all_pass(frames, tmp_path):
@@ -188,7 +195,7 @@ def test_data_bad_line_fails(frames, tmp_path):
     ev, data = events(tmp_path, mosi, seqs, name='badline.txt')
     with open(data, 'a') as fh:
         fh.write('29000000\t29000000,0,abc,1,1\n')
-    rows, s = t4.check(t, mosi, miso, ev, data)
+    rows, s = t4.check(t, mosi, miso, ev, data, manifest=manifest())
     assert s['data_yaw']['bad_lines'] == 1 and t4.exit_code(s) == 1
 
 
@@ -198,14 +205,62 @@ def test_stimulus_not_the_schedule_is_incomplete(tmp_path):
     fr = build(n=N, imu_fn=lambda k: (0.0, 0.0, 0.0, prof.AZ, 0.0))
     t, mosi, miso, seqs = fr
     ev, data = events(tmp_path, mosi, seqs)
-    rows, s = t4.check(t, mosi, miso, ev, data)
+    rows, s = t4.check(t, mosi, miso, ev, data, manifest=manifest(profile=None))
     assert s['fail'] == 0 and s['stimulus']['frames_differ'] > 0 and t4.exit_code(s) == 3
+    # S64: the manifest says the Pi DID run the t4 profile, yet the MOSI is off it: a fault of the HIL
+    rows, s = t4.check(t, mosi, miso, ev, data, manifest=manifest())
+    assert t4.exit_code(s) == 1
+    # no manifest (log written before it): evidence missing, not a pass
+    rows, s = t4.check(*frames_args(tmp_path), manifest=None)
+    assert s['fail'] == 0 and t4.exit_code(s) == 3
+
+
+def frames_args(tmp_path):
+    fr = build(n=N, imu_fn=lambda k: prof.sample(k / 1000.0))
+    t, mosi, miso, seqs = fr
+    ev, data = events(tmp_path, mosi, seqs, name='nomanifest.txt')
+    return t, mosi, miso, ev, data
+
+
+def test_one_stimulus_frame_off_fails(frames, tmp_path):
+    # S64 + S65: only ONE frame off the schedule, not the source of any report: the whole-run check sees it
+    t, mosi, miso, seqs = frames
+    m = mosi.copy()
+    m[20_001, 22] ^= 0x10                            # gz of a frame no report used (reports use 27, 37, …)
+    ev, data = events(tmp_path, mosi, seqs)
+    rows, s = t4.check(t, m, miso, ev, data, manifest=manifest())
+    assert s['stimulus']['frames_differ'] == 1 and s['stimulus']['first_differ'] == 20_001
+    assert t4.exit_code(s) == 1
+
+
+def test_frame_log_cut_fails(frames, tmp_path):
+    # S57: the manifest says more steps than the arrays hold
+    t, mosi, miso, seqs = frames
+    ev, data = events(tmp_path, mosi, seqs)
+    rows, s = t4.check(t, mosi, miso, ev, data, manifest=manifest(n=N + 500))
+    assert s['frame_log_faults'] and t4.exit_code(s) == 1
+
+
+def test_report_just_before_t_rx_of_start_is_scored_by_h7(frames, tmp_path):
+    # S55: #run_start reaches the Pi 80 ms late: the H7 window must still open before the true START
+    t, mosi, miso, seqs = frames
+    ev, data = events(tmp_path, mosi, seqs, start_delay_us=80_000)
+    rows, s = t4.check(t, mosi, miso, ev, data, manifest=manifest())
+    assert s['window_pi_us'][0] <= T_START - 20_000 and t4.exit_code(s) == 0, s['run_conditions']
+
+
+def test_start_packet_later_than_the_bound_is_incomplete(frames, tmp_path):
+    # S55: the #run_start packet 300 ms late, above the 100 ms bound: the window cannot be trusted
+    t, mosi, miso, seqs = frames
+    ev, data = events(tmp_path, mosi, seqs, start_delay_us=300_000)
+    rows, s = t4.check(t, mosi, miso, ev, data, manifest=manifest())
+    assert any('S55' in c for c in s['run_conditions']) and t4.exit_code(s) == 3
 
 
 def test_cli_exit_codes(frames, tmp_path):
     import numpy as np
     t, mosi, miso, seqs = frames
-    np.savez(tmp_path / 'frames.npz', t_send_ns=t, mosi=mosi, miso=miso)
+    np.savez(tmp_path / 'frames.npz', t_send_ns=t, mosi=mosi, miso=miso, manifest=np.array(json.dumps(manifest())))
     ok, data = events(tmp_path, mosi, seqs)
     assert t4.main([str(tmp_path / 'frames.npz'), ok, '--esp32-data', data, '--out', str(tmp_path / 'o')]) == 0
     assert t4.main([str(tmp_path / 'frames.npz'), ok, '--out', str(tmp_path / 'o1')]) == 3     # no DATA

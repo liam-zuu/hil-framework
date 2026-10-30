@@ -1,6 +1,7 @@
 """S06 on the RPi5 side (29/10): frame log of raw MOSI/MISO with send times,
 #run_start / #run_end lines, T3b schedule played through the real HIL loop
 (simulate_hw=True, no hardware), trajectory publisher loop mode."""
+import json
 import logging
 
 import numpy as np
@@ -47,6 +48,10 @@ def test_frame_log_and_run_lines(tmp_path, caplog):
     assert f'#run_end,timestamp_us=' in text and f'steps={steps},reason=max_steps' in text
     t_start = int(text.split('#run_start,timestamp_us=')[1].split(',')[0])
     assert t_start <= t[0] // 1000                    # same clock as t_send_ns
+    # run manifest saved with the frames (Codex Sol round 3 S57, S64): what the scoring tools check
+    m = json.loads(str(d['manifest']))
+    assert (m['step_first'], m['step_last'], m['steps']) == (0, steps - 1, steps)
+    assert m['period_us'] == 1_000 and m['stop_reason'] == 'max_steps' and m['imu_profile'] is None
 
 
 def test_frame_log_cap_stops_the_run(tmp_path, caplog):
@@ -55,7 +60,8 @@ def test_frame_log_cap_stops_the_run(tmp_path, caplog):
                     frame_log=str(tmp_path / 'f.npz'), frame_log_max=200)
     with caplog.at_level(logging.INFO):
         HILNode(plant, config=cfg).run()
-    assert np.load(str(tmp_path / 'f.npz'))['mosi'].shape[0] == 200
+    d = np.load(str(tmp_path / 'f.npz'))
+    assert d['mosi'].shape[0] == 200 and json.loads(str(d['manifest']))['stop_reason'] == 'frame_log_full'
     assert 'reason=frame_log_full' in caplog.text
 
 

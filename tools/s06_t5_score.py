@@ -315,8 +315,9 @@ def write_csv(path: str, rows: Sequence[dict], cols: Sequence[str]) -> None:
             w.writerow({c: r[c] for c in cols})
 
 
-def load_esp32_events(path: str, count_sign=(1, 1, 1, 1)):
-    """(Reads, (t_rx, t_after) của dòng E, (t_us, temp_c) của dòng S 16 trường hoặc None)."""
+def load_esp32_events(path: str, count_sign=(1, 1, 1, 1), run=None):
+    """(Reads, (t_rx, t_after) của dòng E, (t_us, temp_c) của dòng S 16 trường hoặc None). `run` (số lượt
+    của manifest, S58): chỉ giữ dòng E của lượt đó; None = mọi dòng E (firmware chưa có trường run)."""
     eseq, tb, ta, c, rx = [], [], [], [], []
     st, sv = [], []
     with open(path, encoding='utf-8', errors='replace') as f:
@@ -325,11 +326,14 @@ def load_esp32_events(path: str, count_sign=(1, 1, 1, 1)):
             if not sep:
                 continue
             p = line.split(',')
-            if p[0] == 'E' and len(p) == 8:
-                eseq.append(int(p[1]))
-                tb.append(int(p[2]))
-                ta.append(int(p[3]))
-                c.append([int(x) for x in p[4:8]])
+            e = stm.parse_e(p)
+            if e is not None:
+                if run is not None and e[4] != run:
+                    continue
+                eseq.append(e[0])
+                tb.append(e[1])
+                ta.append(e[2])
+                c.append(e[3])
                 rx.append(int(t_rx))
             elif p[0] == 'S' and len(p) == 16:
                 st.append(int(p[2]))
@@ -360,6 +364,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description='Chấm T5 (spec S06 v3.4)')
     ap.add_argument('--schedule', required=True, help='T5_pass<n>.csv của rpi5/t5_schedule.py')
     ap.add_argument('--esp32-events', required=True, help='esp32_events.txt của s06_logger.py (dòng E)')
+    ap.add_argument('--run', type=int, default=None,
+                    help='số lượt (run= của #run_start) khi file có nhiều lượt; bỏ trống = file một lượt (S58)')
     ap.add_argument('--offset-us', type=float, default=None,
                     help='t_esp_us = OFFSET + t_lịch_us; bỏ trống thì tự căn bằng tương quan chéo')
     ap.add_argument('--count-sign', default='1,1,1,1',
@@ -378,8 +384,9 @@ def main(argv=None) -> int:
             raise ValueError(f'--xtal-ppm phải hữu hạn, ≥ 0: {a.xtal_ppm}')
         sched = t5.read_csv(a.schedule)
         t5.segments(sched)                      # kiểm lịch liền nhau
-        reads, rx, s_temp = load_esp32_events(a.esp32_events, [int(x) for x in a.count_sign.split(',')])
-        marks = stm.run_marks(a.esp32_events)
+        marks = stm.run_marks(a.esp32_events, a.run)
+        reads, rx, s_temp = load_esp32_events(a.esp32_events, [int(x) for x in a.count_sign.split(',')],
+                                              marks.get('_run'))
         h7_up = h7_uptime_us(ser.read_log(a.h7_serial)) if a.h7_serial else None
         if a.offset_us is None:
             offset, corr = align_offset(reads, sched)
@@ -411,7 +418,8 @@ def main(argv=None) -> int:
     code = exit_code(rows)
     if not stream['ok']:
         code = 1
-    if code == 0 and (cond is not True or not stream['known'] or sched_bad or a.xtal_ppm is None):
+    if code == 0 and (cond is not True or not stream['known'] or stream['multi_run'] or sched_bad
+                      or a.xtal_ppm is None):
         code = 3                                  # S18, S19, S20: evidence missing, not a pass
     offset = float(offset)
     summ.update(run_pass=run_pass, offset_us=offset, offset_source='manual' if corr is None else 'xcorr',

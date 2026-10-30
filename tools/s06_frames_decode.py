@@ -74,6 +74,8 @@ SEQ_CUT_PERIODS = 128         # spec dòng 96: unwrap only below 128 report peri
 PAD_US = 1_000_000.0          # S38 [ĐỀ XUẤT CODE]: the Pi frames and the ESP32 IMU lines must reach this far
                               # beyond #run_start..#run_end, so every report scored inside the run has its
                               # counterpart in the files; the scored window itself is never shrunk
+UDP_MAX_US = 100_000.0        # S55 [ĐỀ XUẤT CODE]: bound on how much later than the best UDP packet near START
+                              # the #run_start packet may reach the Pi; the H7 window opens this much earlier
 RESET_NEAR_US = 1_000_000.0   # V4-1: no reset-complete within ±1 s of #run_start
 CARRY_MARGIN_CYC = 1_000_000  # a record's CYCCNT may be stamped up to ~2 ms after its carrier's callback
 
@@ -452,6 +454,28 @@ def common_window(t_send_us, text):
     return (lo, hi) if hi > lo else None
 
 
+def udp_widen(window, text, J, I):
+    """S55 (Codex Sol round 3): #run_start reaches the Pi (t_rx) one UDP delay after the ESP32 started the
+    run, so a window opening at t_rx leaves the first reports of the run out. Without a marker-pin clock,
+    the window opens UDP_MAX_US earlier (scored set ⊇ the true run: the J stream runs on and the ± PAD_US
+    cover is required, so this cannot fail a valid run), and the delay of the #run_start packet itself is
+    measured against the fastest J/I packet within 10 s (t_rx − t_us): above UDP_MAX_US the bound does not
+    hold → note (not concluded). Returns (window, note)."""
+    if window is None:
+        return None, ''
+    try:
+        ts = int(text['run_start']['kv']['timestamp_us'])
+    except (KeyError, ValueError):
+        return window, 'S55: #run_start không có timestamp_us: không kiểm được trễ UDP của mốc lượt'
+    near = [x['t_rx'] - x['t_us'] for x in list(J) + list(I) if abs(x['t_us'] - ts) <= 10_000_000]
+    if not near:
+        return window, 'S55: không có dòng J/I trong 10 s quanh #run_start: không kiểm được trễ UDP'
+    delay = (text['run_start']['t_rx'] - ts) - min(near)
+    note = '' if delay <= UDP_MAX_US else \
+        f'S55: gói #run_start tới Pi trễ {delay / 1e3:.1f} ms so với gói nhanh nhất, vượt cận {UDP_MAX_US / 1e3:g} ms'
+    return (window[0] - UDP_MAX_US, window[1]), note
+
+
 def esp_run_span(text):
     """#run_start..#run_end on the ESP32 clock (`timestamp_us` the firmware stamps): the scored span of
     ESP32-side lines (callbacks I, DATA ticks), which carry the same clock. None if missing."""
@@ -625,9 +649,10 @@ def decode(t_send_ns, mosi, miso, esp32_events: Optional[str] = None, cal: Optio
     if esp32_events:
         J, I, R, text = esp32_lines(esp32_events)
         span = (float(t_send_us[0]), float(t_send_us[-1]))
-        win = common_window(t_send_us, text)
+        win, udp_note = udp_widen(common_window(t_send_us, text), text, J, I)
         res['esp32_match'] = match_esp32(reps, J, I, win, span)
         res['esp32_match']['pad_note'] = pad_check(win, t_send_us, J, I)
+        res['esp32_match']['udp_note'] = udp_note
         res['esp32_run_marks'] = sorted(text)
         res['esp32_run_esp_us'] = esp_run_span(text)
         res['_esp32_text'] = text
@@ -686,6 +711,8 @@ def conditions(res) -> List[str]:
         c.append('esp32_events thiếu #run_start/#run_end: chấm ghép report trên cả luồng, không theo khung lượt')
     if m and m.get('pad_note'):
         c.append(f"S38: {m['pad_note']}: report ở đầu/cuối lượt có thể thiếu bản đối chiếu, ghi đo dài hơn")
+    if m and m.get('udp_note'):
+        c.append(m['udp_note'])
     rz = res.get('resets_near_run_start')
     if 'esp32_match' in res and rz is None:
         c.append('thiếu #run_start: không kiểm được điều kiện reset ±1 s (V4-1)')
@@ -702,6 +729,28 @@ def add_cal_args(ap):
     g.add_argument('--d1w-span-us', type=float, default=None, help='d_1w lớn nhất − nhỏ nhất, µs')
     g.add_argument('--delta-h-us', type=float, default=None, help='δ_H, µs')
     g.add_argument('--ts-us', type=float, default=None, help='chu kỳ lấy mẫu logic analyzer t_s, µs')
+
+
+def load_manifest(z):
+    """Run manifest hil_node.py saves in frames.npz (`manifest`, JSON: step_first, step_last, steps,
+    period_us, stop_reason, imu_profile, imu_static); None for a log written before the manifest."""
+    files = getattr(z, 'files', z)
+    if 'manifest' not in files:
+        return None
+    return json.loads(str(z['manifest']))
+
+
+def manifest_check(manifest, n_frames: int) -> List[str]:
+    """S57 (Codex Sol round 3): frames lost from the log itself: the arrays must hold every step the Pi
+    says it logged (step_first..step_last, row k = step k). Returns the faults ('' list = whole)."""
+    if manifest is None:
+        return []
+    out = []
+    if manifest.get('step_first') != 0 or manifest.get('steps') != n_frames or \
+            manifest.get('step_last') != n_frames - 1:
+        out.append(f"frames.npz có {n_frames} frame, manifest ghi bước {manifest.get('step_first')}.."
+                   f"{manifest.get('step_last')} ({manifest.get('steps')}): mất frame trong file (Z19)")
+    return out
 
 
 def load_cal(z, a) -> dict:

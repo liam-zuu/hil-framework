@@ -44,6 +44,14 @@ Sửa theo Codex Sol vòng 2/2 (Liam 30/10 "Sửa P1 rồi vòng 3"):
     (s06_stream.qseq_stream), `ev_qdrop_run` = 0, và không frame MISO nào sai CRC/rỗng trong lượt (giờ Pi);
     thiếu → mã 1 (Z19). Thiếu #run_start/#run_end (hay qseq của chúng) → mã 3.
 
+Manifest lượt (Codex Sol vòng 3, Liam 30/10 "Làm manifest lượt"):
+  * S56: dòng P có qseq mà nội dung hỏng (sai số trường, không phải số) là mất dữ liệu (mã 1), không được
+    tính là đã nhận.
+  * S57: frames.npz phải có manifest của hil_node (thiếu → mã 3), số frame khớp manifest (thiếu → mã 1), và
+    frame Pi phủ lượt ± 1 s (log cắt sớm/bắt đầu muộn → mã 3).
+  * S58: P và mốc lượt chọn theo `run` (s06_load ghi run= ở dòng P và các mốc); file nhiều lượt mà không
+    có `--run` → mã 3.
+
 Usage:
   python tools/s06_t6_check.py <frames.npz> --esp32-events esp32_events.txt --out <thư mục>
          --clock-affine OFFSET_US RATE --u-duty 0.0017
@@ -88,10 +96,19 @@ FOLLOW_COLS = ['idx', 'wheel', 'duty_from', 'duty_to', 't_cmd_us', 't_mark_span_
                'frame_settle', 'follow_ms', 'leave_ms', 'settled']
 
 
-def read_events(path, marks=None):
+def read_events(path, marks=None, run=None):
     """Dòng P theo bánh (giờ ESP32) và cặp (t_rx, t_esp) cho đồng hồ. `marks` (dict, tùy chọn) nhận
-    timestamp_us (giờ ESP32) của #run_start/#run_end."""
+    timestamp_us (giờ ESP32) của #run_start/#run_end của lượt đã chọn (s06_stream.run_marks, `run`).
+    Manifest lượt (S58): dòng P/E có trường run (s06_load) thì chỉ giữ dòng của lượt `run`; dòng P sai dạng
+    không bị bỏ im lặng: s06_stream.qseq_stream tính nó là hỏng (S56)."""
     P, rx, te = defaultdict(list), [], []
+    if marks is not None:
+        m = stm.run_marks(path, run)
+        marks['_run'], marks['_multi'] = m.get('_run'), m.get('_multi')
+        for k in ('run_start', 'run_end'):
+            if k in m and 'timestamp_us' in m[k]['kv']:
+                marks[k] = int(m[k]['kv']['timestamp_us'])
+        run = m.get('_run')
     with open(path, encoding='utf-8', errors='replace') as f:
         for raw in f:
             t_rx, sep, line = raw.rstrip('\n').partition('\t')
@@ -99,18 +116,18 @@ def read_events(path, marks=None):
                 continue
             p = line.split(',')
             try:
-                if p[0] in ('#run_start', '#run_end') and marks is not None:
-                    kv = dict(x.partition('=')[::2] for x in p[1:] if '=' in x)
-                    if 'timestamp_us' in kv:
-                        marks.setdefault(p[0][1:], int(kv['timestamp_us']))
-                elif p[0] == 'P' and len(p) == 10:
+                if p[0] == 'P' and len(p) in (10, 11):
+                    if run is not None and len(p) == 11 and int(p[10]) != run:
+                        continue
                     P[int(p[4])].append(dict(t_before=int(p[2]), t_after=int(p[3]), speed=int(p[5]),
                                              cmp={int(p[6]): int(p[7]), int(p[8]): int(p[9])}))
                     rx.append(int(t_rx))
                     te.append(int(p[3]))
-                elif p[0] == 'E' and len(p) == 8:
-                    rx.append(int(t_rx))
-                    te.append(int(p[3]))
+                elif p[0] == 'E':
+                    e = stm.parse_e(p)
+                    if e is not None:
+                        rx.append(int(t_rx))
+                        te.append(e[2])
             except ValueError:
                 continue
     for w in P:
@@ -290,6 +307,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description='Chấm T6 (spec S06 v3.4)')
     ap.add_argument('frames')
     ap.add_argument('--esp32-events', required=True)
+    ap.add_argument('--run', type=int, default=None,
+                    help='số lượt (run= của #run_start) khi file có nhiều lượt; bỏ trống = file một lượt (S58)')
     ap.add_argument('--out', required=True)
     ap.add_argument('--clock-affine', nargs=2, type=float, default=None, metavar=('OFFSET_US', 'RATE'),
                     help='t_pi_us = OFFSET + RATE * t_esp_us (chân đánh dấu); bỏ trống = chặn dưới UDP')
@@ -301,7 +320,7 @@ def main(argv=None) -> int:
             raise ValueError(f'--u-duty phải hữu hạn, ≥ 0: {a.u_duty}')
         z = np.load(a.frames)
         marks = {}
-        P, rx, te = read_events(a.esp32_events, marks)
+        P, rx, te = read_events(a.esp32_events, marks, a.run)
         if not P:
             raise ValueError('không có dòng P (env s06_load hồ sơ t6?)')
         if a.clock_affine:
@@ -318,10 +337,17 @@ def main(argv=None) -> int:
         scored, follow, levels, missing, good = check(z['t_send_ns'], z['mosi'], z['miso'], P, to_pi, a.u_duty,
                                                       run_end_esp=marks.get('run_end'))
         # S40: the whole run must be complete, not only the 200 scored frames of each level
-        qs = stm.qseq_stream(a.esp32_events)
+        qs = stm.qseq_stream(a.esp32_events, stm.run_marks(a.esp32_events, a.run))
+        # S57: the frame log itself: every step the manifest says was logged, and the frames cover the run
+        manifest = dec.load_manifest(z)
+        frame_faults = dec.manifest_check(manifest, len(z['t_send_ns']))
+        cover_note = ''
         if 'run_start' in marks and 'run_end' in marks:
-            run_bad, run_frames = run_frames_bad(z['t_send_ns'], good, float(to_pi(marks['run_start'])),
-                                                 float(to_pi(marks['run_end'])))
+            t0p, t1p = float(to_pi(marks['run_start'])), float(to_pi(marks['run_end']))
+            run_bad, run_frames = run_frames_bad(z['t_send_ns'], good, t0p, t1p)
+            ts = np.asarray(z['t_send_ns'], dtype=np.float64) / 1000.0
+            if ts[0] > t0p - dec.PAD_US or ts[-1] < t1p + dec.PAD_US:
+                cover_note = f'frame Pi không phủ lượt ± {dec.PAD_US / 1e6:g} s (log cắt sớm hoặc bắt đầu muộn)'
         else:
             run_bad = run_frames = None
     except (OSError, KeyError, ValueError) as exc:
@@ -339,11 +365,14 @@ def main(argv=None) -> int:
                 levels={v: sum(l['verdict'] == v for l in levels)
                         for v in ('pass', 'fail', 'fail_data_loss', 'inconclusive', 'short')},
                 levels_missing=missing, miso_crc_bad_frames=int(np.sum(~good)), run_frames=run_frames,
-                run_frames_bad=run_bad, qseq_stream=qs, sync=sync, run_end_esp_us=marks.get('run_end'),
+                run_frames_bad=run_bad, qseq_stream=qs, manifest=manifest, frame_log_faults=frame_faults,
+                frames_cover_note=cover_note, run=marks.get('_run'), multi_run=bool(marks.get('_multi')),
+                sync=sync, run_end_esp_us=marks.get('run_end'),
                 follow=follow_summary(follow),
                 exit_code=verdict(levels, missing, synced=sync['kind'] == 'manual', u_known=a.u_duty is not None,
-                                  stream_ok=qs['ok'] and not run_bad,
-                                  stream_known=qs['known'] and run_bad is not None))
+                                  stream_ok=qs['ok'] and not qs['malformed'] and not run_bad and not frame_faults,
+                                  stream_known=(qs['known'] and run_bad is not None and manifest is not None
+                                                and not cover_note and not marks.get('_multi'))))
     with open(os.path.join(a.out, 'T6_summary.json'), 'w', encoding='utf-8') as f:
         json.dump(summ, f, ensure_ascii=False, indent=1, default=lambda o: o.item() if hasattr(o, 'item') else str(o))
     print(json.dumps(summ, default=lambda o: o.item() if hasattr(o, 'item') else str(o)))
