@@ -74,9 +74,11 @@ _RE = {
     't10': re.compile(r'T10: win_ms=(\d+) isr_us=(\d+) idle_pass=(\d+) idle_us_est=(\d+) cal=(\d+)/(\d+) '
                       r'ovh_cyc=(\d+)'),
     't10_irq': re.compile(r'T10 (\S+)\s+n=(\d+) excl_us=(\d+) max_us=(\d+)\.(\d\d)'),
+    'relay': re.compile(r'Relay: sent=(\d+) dropped=(\d+)'),       # W8, tools/s06_relay_check.py
 }
 _FIELDS = {
     'link_up': ('t_ms',), 'link_lost': ('timeout_ms',), 'link_period': ('frames', 'h7_ms', 'pi_ms'),
+    'relay': ('sent', 'dropped'),
     'link': ('state', 'lost', 'fps', 'err', 'rearm', 'last_err'),
     'frame': ('unread', 'new_seen', 'taken', 'repl', 'drop', 'applied', 'skipped', 'age_max_us'),
     's06log': ('pushed', 'dropped', 'print_drop'),

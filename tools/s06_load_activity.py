@@ -16,7 +16,9 @@ hồ ESP32 → Pi (chân đánh dấu, chờ G2), số cạnh PWM mỗi 10 ms H7
 Usage:
   python tools/s06_load_activity.py <frames.npz> --schedule S06_load.csv --out <thư mục>
 Mã thoát và dòng cuối `#ket_qua` theo bảng mã kết quả (spec 3.1): 0 đúng lịch; 1 lượt không chạy đúng lịch hoặc
-frames.npz mất frame; 2 không đọc được đầu vào; 3 thiếu bằng chứng (không có manifest).
+frames.npz mất frame; 2 không đọc được đầu vào; 3 `thieu_bang_chung` không có manifest; 3 `khong_du_dieu_kien` lịch
+không có khối tải nặng (CB3 (9), C3-4: lượt T2 chính phải có `heavy`; lượt cấu hình S02 chạy `--no-heavy` thì chấm với
+`--allow-no-heavy`).
 """
 from __future__ import annotations
 
@@ -137,6 +139,7 @@ def main(argv=None) -> int:
     ap.add_argument('frames')
     ap.add_argument('--schedule', required=True)
     ap.add_argument('--out', required=True)
+    ap.add_argument('--allow-no-heavy', action='store_true', help='lượt cấu hình S02, lịch tạo bằng --no-heavy')
     a = ap.parse_args(argv)
     try:
         sched = read_schedule(a.schedule)
@@ -150,6 +153,8 @@ def main(argv=None) -> int:
     new = (np.asarray(mosi)[:, OFS_TRAJ_FLAGS] & TRAJ_NEW) != 0
     fails, missing = check_run(manifest, a.schedule, sched, omega)
     fails += dec.manifest_check(manifest, t_send, mosi, miso)
+    # C3-4: a schedule without a heavy block skips every check above, so it cannot close a main T2 run
+    conds = [] if a.allow_no_heavy or any(r['kind'] == 'heavy' for r in sched) else ['lịch không có khối tải nặng (Z8)']
     imu = imu_frames(t_send, mosi, miso)
     in_heavy = np.zeros(len(omega), dtype=bool)
     for r in sched:
@@ -161,12 +166,13 @@ def main(argv=None) -> int:
         w = csv.DictWriter(f, fieldnames=list(rows[0]))
         w.writeheader()
         w.writerows(rows)
-    summ = dict(frames=len(omega), fails=fails, missing=missing, segments=rows,
+    summ = dict(frames=len(omega), fails=fails, missing=missing, conditions=conds, segments=rows,
                 note='chỉ báo phía Pi; điều kiện đủ tải 10 ms của Z8 chưa kiểm ở đây')
     with open(os.path.join(a.out, 'S06_load_activity.json'), 'w', encoding='utf-8') as f:
         json.dump(summ, f, ensure_ascii=False, indent=1)
     print(json.dumps(summ, ensure_ascii=False))
-    return stm.report_result(1 if fails else (3 if missing else 0), ['thieu_bang_chung'])
+    return stm.report_result(1 if fails else (3 if missing or conds else 0),
+                             (['khong_du_dieu_kien'] if conds else []) + (['thieu_bang_chung'] if missing else []))
 
 
 if __name__ == '__main__':

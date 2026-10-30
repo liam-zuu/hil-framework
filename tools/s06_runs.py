@@ -8,11 +8,17 @@ File **chỉ nối thêm**: mỗi lệnh thêm một dòng, không sửa dòng c
   ket_qua     sau khi chấm: công cụ, mã, lý do, lấy nguyên văn dòng cuối `#ket_qua` của script chấm;
   nguyen_nhan người đo tự nhập (W5): nhóm nguyên nhân, bằng chứng. Công cụ không tự phân loại, không tự quyết
               thay lượt, không kết luận lượt đạt hay không.
-Lượt **đóng** (CB3 (6), C2-8) khi mọi công cụ bắt buộc của phép thử đã có dòng ket_qua (lần chấm lại thì lấy dòng
-mới nhất của công cụ đó) và không còn mã 3 (b) `khong_du_dieu_kien`, (c) `thieu_bang_chung` nào thiếu dòng
-nguyen_nhan. Mã 3 (a) `chua_ket_luan` đóng là chưa kết luận; không có bằng chứng ngoại sinh thì ghi
-`cause --nhom chua_xac_dinh`, W5 tính là không đạt. Danh sách công cụ bắt buộc ở `s06_required_tools.json` (cùng
-thư mục, spec CB3); phép thử chưa có trong đó thì chưa đóng được. Lượt chưa đóng chưa đưa vào mục 5 hay §6.1.
+Lượt **đóng** (CB3 (6), C2-8) khi mọi công cụ bắt buộc của phép thử đã có dòng ket_qua và kết quả có hiệu lực không
+còn mã 3 (b) `khong_du_dieu_kien`, (c) `thieu_bang_chung` nào thiếu dòng nguyen_nhan. Mã 3 (a) `chua_ket_luan` đóng
+là chưa kết luận; không có bằng chứng ngoại sinh thì ghi `cause --nhom chua_xac_dinh`, W5 tính là không đạt. Danh
+sách công cụ bắt buộc ở `s06_required_tools.json` (cùng thư mục, spec CB3); phép thử chưa có trong đó thì chưa đóng
+được. Lượt chưa đóng chưa đưa vào mục 5 hay §6.1.
+
+**Chấm lại** (CB3 (8), C3-7): một công cụ có nhiều dòng thì mã 1, mã 3 (b), (c) chỉ bị dòng sau thay khi dòng đó ghi
+`--cham-lai-ly-do` và `--da-doi` (commit công cụ, lệnh); không ghi thì giữ kết quả xấu hơn. Dữ liệu lượt không được
+đổi: công cụ không kiểm được việc này, người chấm chịu trách nhiệm. `status` in mọi dòng. Mã ngoài 0, 1, 3 hay lý do
+sai trong file thì từ chối đóng lượt (CB3 (10), C3-8).
+
 `status` liệt kê mọi lượt mở, còn lượt mở thì mã thoát 1: chưa lập `S06_summary.csv` (CB3 (7); công cụ lập bảng đó
 chưa có, phải gọi `status` trước).
 
@@ -23,6 +29,7 @@ Usage:
       --commit-pi <sha> --commit-h7 <sha> --commit-esp32 <sha> --cap st-link --nguon usb
   python tools/s06_t1_check.py ... | tee T1_out.txt
   python tools/s06_runs.py result --file S06_runs.csv --run 2026-11-10_run01 --tool s06_t1_check --from T1_out.txt
+      [--cham-lai-ly-do "<lý do>" --da-doi "<commit công cụ, lệnh>"]
   python tools/s06_runs.py cause --file S06_runs.csv --run 2026-11-10_run01 --nhom cap_thao_tac --bang-chung "<...>"
   python tools/s06_runs.py status --file S06_runs.csv [--required s06_required_tools.json]
 Mã thoát: 0 đã ghi (status: mọi lượt đã đóng); 1 status còn lượt chưa đóng; 2 lệnh hay file không dùng được,
@@ -40,7 +47,7 @@ import sys
 from typing import Dict, List, Tuple
 
 COLUMNS = ['ghi_luc', 'loai_dong', 'lan', 'phep_thu', 'commit_pi', 'commit_h7', 'commit_esp32', 'cap', 'nguon',
-           'cong_cu', 'ma', 'ly_do', 'nhom_nguyen_nhan', 'bang_chung', 'ghi_chu']
+           'cong_cu', 'ma', 'ly_do', 'nhom_nguyen_nhan', 'bang_chung', 'ghi_chu', 'cham_lai_ly_do', 'da_doi']
 CAPS = ('st-link', 'khong')                     # spec mục 2 điểm 6, CB5
 NGUONS = ('usb', 'buck')
 TESTS = ('T1', 'T2', 'T3', 'T3b', 'T4', 'T5', 'T6', 'T7', 'T8', 'T9', 'T10', 'T11', 'CB5')
@@ -124,18 +131,49 @@ def tool_name(tool: str) -> str:
     return tool[:-3] if tool.endswith('.py') else tool
 
 
+def valid_result(r: dict) -> bool:
+    """CB3 (10), C3-8: giá trị đọc từ file phải đúng như `last_result` đã cho phép ghi."""
+    return (r['ma'] in ('0', '1') and not r['ly_do']) or (r['ma'] == '3' and r['ly_do'] in REASONS)
+
+
+def needs_cause(r: dict) -> bool:
+    return r['ma'] == '3' and r['ly_do'] != 'chua_ket_luan'
+
+
+def severity(r: dict) -> int:
+    return 3 if r['ma'] == '1' else (2 if needs_cause(r) else (1 if r['ma'] == '3' else 0))
+
+
+def in_force(results: List[dict]) -> dict:
+    """CB3 (8), C3-7: kết quả có hiệu lực của một công cụ, theo thứ tự dòng trong file. Mã 1, mã 3 (b), (c) chỉ bị
+    dòng sau nhẹ hơn thay khi dòng đó ghi cả lý do lẫn thứ đã đổi."""
+    cur = results[0]
+    for r in results[1:]:
+        explained = bool(r['cham_lai_ly_do'].strip() and r['da_doi'].strip())
+        if explained or severity(cur) < 2 or severity(r) >= severity(cur):
+            cur = r
+    return cur
+
+
 def why_open(rows: List[dict], opened: dict, required: Dict[str, List[str]]) -> str:
     """CB3 (6): rỗng = lượt đã đóng, ngược lại là lý do lượt còn mở."""
     need = required.get(opened['phep_thu'])
     if need is None:
         return 'phép thử chưa có danh sách công cụ bắt buộc'
     rr = run_rows(rows, opened['lan'])
-    last = {tool_name(r['cong_cu']): r for r in rr if r['loai_dong'] == 'ket_qua'}
+    results = [r for r in rr if r['loai_dong'] == 'ket_qua']
+    wrong = [f"{r['cong_cu']}={r['ma']}" for r in results if not valid_result(r)]
+    if wrong:
+        return 'mã kết quả không hợp lệ trong file: ' + ', '.join(wrong)
+    by_tool: Dict[str, List[dict]] = {}
+    for r in results:
+        by_tool.setdefault(tool_name(r['cong_cu']), []).append(r)
+    last = {t: in_force(v) for t, v in by_tool.items()}
     need = [tool_name(t) for t in need]
     missing = [t for t in need if t not in last]
     if missing:
         return 'thiếu kết quả ' + ', '.join(missing)
-    open_b_c = [t for t in need if last[t]['ma'] == '3' and last[t]['ly_do'] != 'chua_ket_luan']
+    open_b_c = [t for t in need if needs_cause(last[t])]
     if open_b_c and not any(r['loai_dong'] == 'nguyen_nhan' for r in rr):
         return ('mã 3 (b), (c) ở ' + ', '.join(open_b_c) + ' chưa ghi nhóm nguyên nhân và bằng chứng '
                 '(không có thì ghi `chua_xac_dinh`: không đạt theo W5)')
@@ -154,10 +192,15 @@ def cmd_open(a, rows) -> int:
 
 def cmd_result(a, rows) -> int:
     opened = need_open(rows, a.run)
+    if bool(a.cham_lai_ly_do.strip()) != bool(a.da_doi.strip()):
+        raise Refused('chấm lại phải ghi cả --cham-lai-ly-do lẫn --da-doi (CB3 (8))')
+    earlier = [r for r in run_rows(rows, a.run) if r['loai_dong'] == 'ket_qua' and tool_name(r['cong_cu']) == tool_name(a.tool)]
+    if a.cham_lai_ly_do.strip() and not earlier:
+        raise Refused(f'{a.tool} chưa có dòng kết quả nào ở lượt {a.run}: không có gì để chấm lại')
     with open(a.source, encoding='utf-8', errors='replace') as f:
         code, why = last_result(f.read())
     append(a.file, dict(loai_dong='ket_qua', lan=a.run, phep_thu=opened['phep_thu'], cong_cu=a.tool,
-                        ma=str(code), ly_do=why, ghi_chu=a.ghi_chu))
+                        ma=str(code), ly_do=why, ghi_chu=a.ghi_chu, cham_lai_ly_do=a.cham_lai_ly_do, da_doi=a.da_doi))
     return 0
 
 
@@ -177,7 +220,9 @@ def cmd_status(a, rows) -> int:
     for op in runs:
         res = [r for r in run_rows(rows, op['lan']) if r['loai_dong'] == 'ket_qua']
         ca = [r for r in run_rows(rows, op['lan']) if r['loai_dong'] == 'nguyen_nhan']
-        marks = ', '.join(f"{r['cong_cu']}={r['ma']}" + (f"({r['ly_do']})" if r['ly_do'] else '') for r in res)
+        marks = ', '.join(f"{r['cong_cu']}={r['ma']}" + (f"({r['ly_do']})" if r['ly_do'] else '') +
+                          (f" [chấm lại: {r['cham_lai_ly_do']}; đã đổi: {r['da_doi']}]" if r['cham_lai_ly_do'] else '')
+                          for r in res)
         why = why_open(rows, op, required)
         if why:
             open_runs.append(op['lan'])
@@ -213,6 +258,8 @@ def parse(argv):
     p = add('result', cmd_result, True)
     p.add_argument('--tool', required=True)
     p.add_argument('--from', dest='source', required=True, help='file đầu ra của script chấm')
+    p.add_argument('--cham-lai-ly-do', default='', help='chấm lại: vì sao dòng này thay dòng trước (CB3 (8))')
+    p.add_argument('--da-doi', default='', help='chấm lại: thứ đã đổi (commit công cụ, lệnh), dữ liệu lượt giữ nguyên')
     p = add('cause', cmd_cause, True)
     p.add_argument('--nhom', required=True, choices=NHOMS)
     p.add_argument('--bang-chung', required=True)

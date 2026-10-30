@@ -117,7 +117,8 @@ def write_rows(path: str, rows: List[dict]) -> None:
         wr = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction='ignore')
         wr.writeheader()
         for i, r in enumerate(rows):
-            wr.writerow({k: (f'{v:.6g}' if isinstance(v, float) else v) for k, v in dict(r, idx=i).items()})
+            wr.writerow({k: (f'{v:.3f}' if k == 't_start_us' else f'{v:.6g}') if isinstance(v, float) else v
+                         for k, v in dict(r, idx=i).items()})
 
 
 def main(argv=None) -> int:

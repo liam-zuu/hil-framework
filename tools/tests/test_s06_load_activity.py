@@ -63,6 +63,16 @@ def seg(tmp_path):
     return {r['segment']: r for r in json.load(open(tmp_path / 'o' / 'S06_load_activity.json', encoding='utf-8'))['segments']}
 
 
+def test_schedule_without_heavy_is_not_a_main_t2_run(tmp_path, capsys):
+    # C3-4, CB3 (9): a self-consistent schedule with no heavy block skipped every load check
+    s = tmp_path / 'nh.csv'
+    s.write_text('idx,kind,test,start_ms,end_ms\n0,test,A-L1,0,3000\n')
+    f = frames(tmp_path, str(s))
+    assert la.main([f, '--schedule', str(s), '--out', str(tmp_path / 'o')]) == 3
+    assert capsys.readouterr().out.splitlines()[-1] == '#ket_qua,ma=3,ly_do=khong_du_dieu_kien'
+    assert la.main([f, '--schedule', str(s), '--out', str(tmp_path / 'o'), '--allow-no-heavy']) == 0
+
+
 def test_constants_match_the_schedule_module():
     """Bản sao hằng số trong công cụ PC phải trùng rpi5/s06_load_schedule.py."""
     assert (la.SWAP_MS, la.W_LOW, la.W_HIGH, la.PHASE_MS) == (ls.SWAP_MS, ls.W_LOW, ls.W_HIGH, ls.PHASE_MS)

@@ -125,7 +125,8 @@ def test_status_unclosed_run(f, tmp_path, capsys):
 
 def test_required_tools_are_the_spec_table():
     # spec 3.1 CB3 (Liam 30/10 "Ghi vào spec"); T1, T10 share the T2 run
-    t2 = ['s06_t2_check.py', 's06_t1_check.py', 's06_h7_serial.py', 's06_load_activity.py', 's06_esp32_check.py']
+    t2 = ['s06_t2_check.py', 's06_t1_check.py', 's06_h7_serial.py', 's06_load_activity.py', 's06_esp32_check.py',
+          's06_relay_check.py']
     assert sr.required_tools() == {
         'T1': t2, 'T2': t2, 'T10': t2, 'T3b': ['t3b_score.py', 's06_esp32_check.py'],
         'T4': ['s06_t4_values.py', 's06_esp32_check.py'], 'T5': ['s06_t5_score.py', 's06_esp32_check.py'],
@@ -186,17 +187,96 @@ def test_cause_of_another_run_does_not_count(f, tmp_path, capsys):
     assert code == 1 and 'chưa lập S06_summary.csv, còn lượt mở: r1' in out and 'r2' not in out.splitlines()[-1]
 
 
-def test_latest_result_of_a_tool_counts(f, tmp_path, capsys):
-    # a tool scored again: the file keeps both rows, the last one decides
+def rescore(f, tmp_path, text, tool='s06_t6_check', why='sửa bộ đọc', changed='abc123, lệnh mới'):
+    p = tmp_path / 'again.txt'
+    p.write_text(text, encoding='utf-8')
+    return sr.main(['result', '--file', f, '--run', 'r1', '--tool', tool, '--from', str(p),
+                    '--cham-lai-ly-do', why, '--da-doi', changed])
+
+
+def test_better_result_does_not_replace_a_bad_one_without_a_reason(f, tmp_path, capsys):
+    # C3-7, CB3 (8): both rows stay; with no reason the worse one holds
     opened(f, test='T6')
     all_tools(f, tmp_path, 'T6', text='#ket_qua,ma=3,ly_do=khong_du_dieu_kien\n')
     assert status(f, capsys)[0] == 1
     assert result(f, tmp_path, '#ket_qua,ma=0\n', tool='s06_t6_check.py') == 0
     assert result(f, tmp_path, '#ket_qua,ma=0\n', tool='s06_esp32_check') == 0
+    code, out = status(f, capsys)
+    assert code == 1 and 'chưa ghi nhóm nguyên nhân' in out and len(rows(f)) == 5
+    assert out.count('s06_t6_check') >= 2                                        # status prints every row
+
+
+def test_rescore_with_reason_and_change_replaces(f, tmp_path, capsys):
+    opened(f, test='T6')
+    all_tools(f, tmp_path, 'T6', text='#ket_qua,ma=3,ly_do=thieu_bang_chung\n')
+    assert rescore(f, tmp_path, '#ket_qua,ma=0\n') == 0
+    assert rescore(f, tmp_path, '#ket_qua,ma=0\n', tool='s06_esp32_check') == 0
+    code, out = status(f, capsys)
+    assert code == 0 and '[chấm lại: sửa bộ đọc; đã đổi: abc123, lệnh mới]' in out
+
+
+def test_code_1_stands_without_a_reason(f, tmp_path):
+    # the rule is about which result holds; mã 1 closes the run either way, but stays the result in force
+    r1 = dict(ma='1', ly_do='', cham_lai_ly_do='', da_doi='')
+    r0 = dict(ma='0', ly_do='', cham_lai_ly_do='', da_doi='')
+    r3 = dict(ma='3', ly_do='chua_ket_luan', cham_lai_ly_do='', da_doi='')
+    assert sr.in_force([r1, r0]) is r1 and sr.in_force([r1, r3]) is r1
+    ok = dict(r0, cham_lai_ly_do='x', da_doi='y')
+    assert sr.in_force([r1, ok]) is ok
+    half = dict(r0, cham_lai_ly_do='x')
+    assert sr.in_force([r1, half]) is r1
+    blank = dict(r0, cham_lai_ly_do=' ', da_doi=' ')
+    assert sr.in_force([r1, blank]) is r1
+
+
+def test_worse_result_always_holds(f, tmp_path, capsys):
+    opened(f, test='T6')
+    all_tools(f, tmp_path, 'T6')
     assert status(f, capsys)[0] == 0
-    assert len(rows(f)) == 5
     assert result(f, tmp_path, '#ket_qua,ma=3,ly_do=thieu_bang_chung\n', tool='s06_t6_check') == 0
     assert status(f, capsys)[0] == 1
+
+
+def test_as_bad_or_worse_replaces_a_protected_result(f):
+    b = dict(ma='3', ly_do='khong_du_dieu_kien', cham_lai_ly_do='', da_doi='')
+    c = dict(ma='3', ly_do='thieu_bang_chung', cham_lai_ly_do='', da_doi='')
+    r1 = dict(ma='1', ly_do='', cham_lai_ly_do='', da_doi='')
+    assert sr.in_force([b, r1]) is r1 and sr.in_force([b, c]) is c
+
+
+def test_inconclusive_needs_no_reason_to_be_replaced(f):
+    r3 = dict(ma='3', ly_do='chua_ket_luan', cham_lai_ly_do='', da_doi='')
+    r0 = dict(ma='0', ly_do='', cham_lai_ly_do='', da_doi='')
+    assert sr.in_force([r3, r0]) is r0
+
+
+@pytest.mark.parametrize('why, changed', [('x', ''), ('', 'y'), ('  ', 'y')])
+def test_rescore_needs_both_fields(f, tmp_path, why, changed):
+    opened(f, test='T6')
+    all_tools(f, tmp_path, 'T6')
+    n = len(rows(f))
+    assert rescore(f, tmp_path, '#ket_qua,ma=0\n', why=why, changed=changed) == 2
+    assert len(rows(f)) == n
+
+
+def test_rescore_needs_an_earlier_row(f, tmp_path):
+    opened(f, test='T6')
+    assert rescore(f, tmp_path, '#ket_qua,ma=0\n') == 2
+    assert len(rows(f)) == 1
+
+
+@pytest.mark.parametrize('ma, why', [('9', ''), ('2', ''), ('', ''), ('3', ''), ('3', 'khac'), ('0', 'chua_ket_luan'),
+                                     ('1', 'thieu_bang_chung')])
+def test_code_outside_the_table_refuses_to_close(f, tmp_path, capsys, ma, why):
+    # C3-8, CB3 (10): a cell edited by hand
+    opened(f, test='T6')
+    all_tools(f, tmp_path, 'T6')
+    text = open(f, encoding='utf-8', newline='').read()
+    assert text.count(',0,,,,') >= 2
+    text = text.replace(',0,,,,', f',{ma},{why},,,', 1)
+    open(f, 'w', encoding='utf-8', newline='').write(text)
+    code, out = status(f, capsys)
+    assert code == 1 and 'mã kết quả không hợp lệ' in out
 
 
 @pytest.mark.parametrize('text', ['{ khong phai json', '{"dung_chung": {"T1": "T2"}}'])
