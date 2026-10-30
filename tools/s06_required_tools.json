@@ -1,0 +1,10 @@
+{
+  "_nguon": "spec S06 muc 3.1 dong CB3, Liam 30/10 toi, phien local_32992edd, nguyen van: Ghi vao spec. T3, T7, T8, T9, T11 chua co cong cu, them khi khoa tieu chi tung phep.",
+  "T2": ["s06_t2_check.py", "s06_t1_check.py", "s06_h7_serial.py", "s06_load_activity.py", "s06_esp32_check.py"],
+  "T3b": ["t3b_score.py", "s06_esp32_check.py"],
+  "T4": ["s06_t4_values.py", "s06_esp32_check.py"],
+  "T5": ["s06_t5_score.py", "s06_esp32_check.py"],
+  "T6": ["s06_t6_check.py", "s06_esp32_check.py"],
+  "CB5": ["s06_t2_check.py", "s06_esp32_check.py", "s06_frames_decode.py"],
+  "dung_chung": {"T1": "T2", "T10": "T2"}
+}

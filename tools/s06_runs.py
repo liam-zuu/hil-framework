@@ -8,7 +8,13 @@ File **chỉ nối thêm**: mỗi lệnh thêm một dòng, không sửa dòng c
   ket_qua     sau khi chấm: công cụ, mã, lý do, lấy nguyên văn dòng cuối `#ket_qua` của script chấm;
   nguyen_nhan người đo tự nhập (W5): nhóm nguyên nhân, bằng chứng. Công cụ không tự phân loại, không tự quyết
               thay lượt, không kết luận lượt đạt hay không.
-Lượt có dòng mở mà chưa có dòng ket_qua là **chưa đóng**, chưa đưa vào mục 5 hay §6.1.
+Lượt **đóng** (CB3 (6), C2-8) khi mọi công cụ bắt buộc của phép thử đã có dòng ket_qua (lần chấm lại thì lấy dòng
+mới nhất của công cụ đó) và không còn mã 3 (b) `khong_du_dieu_kien`, (c) `thieu_bang_chung` nào thiếu dòng
+nguyen_nhan. Mã 3 (a) `chua_ket_luan` đóng là chưa kết luận; không có bằng chứng ngoại sinh thì ghi
+`cause --nhom chua_xac_dinh`, W5 tính là không đạt. Danh sách công cụ bắt buộc ở `s06_required_tools.json` (cùng
+thư mục, spec CB3); phép thử chưa có trong đó thì chưa đóng được. Lượt chưa đóng chưa đưa vào mục 5 hay §6.1.
+`status` liệt kê mọi lượt mở, còn lượt mở thì mã thoát 1: chưa lập `S06_summary.csv` (CB3 (7); công cụ lập bảng đó
+chưa có, phải gọi `status` trước).
 
 Mã 2 (CB1) không in `#ket_qua`, nên `ket_qua` từ chối và không ghi gì: sửa lệnh rồi chấm lại.
 
@@ -18,7 +24,7 @@ Usage:
   python tools/s06_t1_check.py ... | tee T1_out.txt
   python tools/s06_runs.py result --file S06_runs.csv --run 2026-11-10_run01 --tool s06_t1_check --from T1_out.txt
   python tools/s06_runs.py cause --file S06_runs.csv --run 2026-11-10_run01 --nhom cap_thao_tac --bang-chung "<...>"
-  python tools/s06_runs.py status --file S06_runs.csv
+  python tools/s06_runs.py status --file S06_runs.csv [--required s06_required_tools.json]
 Mã thoát: 0 đã ghi (status: mọi lượt đã đóng); 1 status còn lượt chưa đóng; 2 lệnh hay file không dùng được,
 không ghi gì.
 """
@@ -27,10 +33,11 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime
+import json
 import os
 import re
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 COLUMNS = ['ghi_luc', 'loai_dong', 'lan', 'phep_thu', 'commit_pi', 'commit_h7', 'commit_esp32', 'cap', 'nguon',
            'cong_cu', 'ma', 'ly_do', 'nhom_nguyen_nhan', 'bang_chung', 'ghi_chu']
@@ -41,6 +48,7 @@ REASONS = ('chua_ket_luan', 'khong_du_dieu_kien', 'thieu_bang_chung')      # spe
 # W5: danh sách ngoại sinh khóa trước (mục 4) + chưa xác định; `chua_xac_dinh` mặc định là lỗi bộ HIL
 NHOMS = ('cap_thao_tac', 'mat_dien', 'sai_quy_trinh', 'chua_xac_dinh')
 KET_QUA = re.compile(r'^#ket_qua,ma=(\d+)(?:,ly_do=(\w+))?\s*$')
+REQUIRED = os.path.join(os.path.dirname(os.path.abspath(__file__)), 's06_required_tools.json')
 
 
 class Refused(Exception):
@@ -100,10 +108,38 @@ def need_open(rows: List[dict], run: str) -> dict:
     return opens[0]
 
 
-def unclosed(rows: List[dict]) -> List[str]:
-    runs = [r['lan'] for r in rows if r['loai_dong'] == 'mo']
-    done = {r['lan'] for r in rows if r['loai_dong'] == 'ket_qua'}
-    return [r for r in runs if r not in done]
+def required_tools(path: str = REQUIRED) -> Dict[str, List[str]]:
+    """{phép thử: [công cụ bắt buộc]} của file cấu hình; `dung_chung` trỏ phép thử dùng chung lượt của phép khác."""
+    with open(path, encoding='utf-8') as f:
+        try:
+            cfg = json.load(f)
+        except ValueError as exc:
+            raise Refused(f'{path}: không đọc được: {exc}')
+    out = {k: v for k, v in cfg.items() if not k.startswith('_') and k != 'dung_chung'}
+    out.update({test: out[base] for test, base in cfg.get('dung_chung', {}).items()})
+    return out
+
+
+def tool_name(tool: str) -> str:
+    return tool[:-3] if tool.endswith('.py') else tool
+
+
+def why_open(rows: List[dict], opened: dict, required: Dict[str, List[str]]) -> str:
+    """CB3 (6): rỗng = lượt đã đóng, ngược lại là lý do lượt còn mở."""
+    need = required.get(opened['phep_thu'])
+    if need is None:
+        return 'phép thử chưa có danh sách công cụ bắt buộc'
+    rr = run_rows(rows, opened['lan'])
+    last = {tool_name(r['cong_cu']): r for r in rr if r['loai_dong'] == 'ket_qua'}
+    need = [tool_name(t) for t in need]
+    missing = [t for t in need if t not in last]
+    if missing:
+        return 'thiếu kết quả ' + ', '.join(missing)
+    open_b_c = [t for t in need if last[t]['ma'] == '3' and last[t]['ly_do'] != 'chua_ket_luan']
+    if open_b_c and not any(r['loai_dong'] == 'nguyen_nhan' for r in rr):
+        return ('mã 3 (b), (c) ở ' + ', '.join(open_b_c) + ' chưa ghi nhóm nguyên nhân và bằng chứng '
+                '(không có thì ghi `chua_xac_dinh`: không đạt theo W5)')
+    return ''
 
 
 def cmd_open(a, rows) -> int:
@@ -135,15 +171,22 @@ def cmd_cause(a, rows) -> int:
 
 
 def cmd_status(a, rows) -> int:
+    required = required_tools(a.required)
     runs = [r for r in rows if r['loai_dong'] == 'mo']
+    open_runs = []
     for op in runs:
         res = [r for r in run_rows(rows, op['lan']) if r['loai_dong'] == 'ket_qua']
         ca = [r for r in run_rows(rows, op['lan']) if r['loai_dong'] == 'nguyen_nhan']
         marks = ', '.join(f"{r['cong_cu']}={r['ma']}" + (f"({r['ly_do']})" if r['ly_do'] else '') for r in res)
+        why = why_open(rows, op, required)
+        if why:
+            open_runs.append(op['lan'])
         print(f"{op['lan']} {op['phep_thu']} cap={op['cap']} nguon={op['nguon']}: "
-              f"{marks if res else 'CHƯA ĐÓNG'}" + (f"; nguyên nhân: {ca[-1]['nhom_nguyen_nhan']}" if ca else ''))
-    open_runs = unclosed(rows)
+              f"{marks or 'chưa có kết quả'}" + (f"; nguyên nhân: {ca[-1]['nhom_nguyen_nhan']}" if ca else '') +
+              (f'; CHƯA ĐÓNG: {why}' if why else '; đã đóng'))
     print(f'{len(runs)} lượt, {len(open_runs)} chưa đóng')
+    if open_runs:
+        print('chưa lập S06_summary.csv, còn lượt mở: ' + ', '.join(open_runs))
     return 1 if open_runs else 0
 
 
@@ -173,7 +216,8 @@ def parse(argv):
     p = add('cause', cmd_cause, True)
     p.add_argument('--nhom', required=True, choices=NHOMS)
     p.add_argument('--bang-chung', required=True)
-    add('status', cmd_status)
+    p = add('status', cmd_status)
+    p.add_argument('--required', default=REQUIRED, help='file danh sách công cụ bắt buộc theo phép thử')
     return ap.parse_args(argv)
 
 
@@ -181,7 +225,7 @@ def main(argv=None) -> int:
     a = parse(argv)
     try:
         return a.fn(a, read_rows(a.file))
-    except (Refused, OSError) as exc:
+    except (Refused, OSError, KeyError) as exc:
         print(f'không ghi: {exc}', file=sys.stderr)
         return 2
 
