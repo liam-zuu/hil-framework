@@ -90,6 +90,7 @@ def events(tmp_path, mosi, seqs, fault=None, skip=None, name='esp32_events.txt',
                 if fault and fault[2] == 'data_yaw' and n == fault[1]:
                     y += 1.0
                 tick_rv = rv_n + 5000 if (fault and fault[2] == 'data_no_cb' and n == fault[1]) else rv_n
+                tick_rv = 0 if (fault and fault[2] == 'data_no_rv' and n == fault[1]) else tick_rv
                 if marks[0] <= t + 900 <= marks[1]:
                     in_run.append(rv_n)
                 if not (drop_tick and drop_tick(rv_n)):
@@ -300,9 +301,9 @@ def test_all_data_ticks_off_do_not_block_the_hil(frames, tmp_path):
 
 def test_tick_without_game_rv_does_not_block_the_hil(frames, tmp_path):
     # C3-9: rv_n = 0 is a snapshot of the DUT after the callback; reported, T4 of the HIL stands
-    rows, s = check(frames, tmp_path, name='rv.txt')
-    assert s['dut']['data_no_rv'] == s['data_yaw']['no_rv']
-    assert t4.outcome(dict(s, data_yaw=dict(s['data_yaw'], no_rv=2))) == (0, None)
+    rows, s = check(frames, tmp_path, fault=('game_rv', 300, 'data_no_rv'), name='rv.txt')
+    assert s['data_yaw']['no_rv'] == 1 and s['dut']['data_no_rv'] == 1
+    assert t4.outcome(s) == (0, None), s['run_conditions']
     all_no_rv = dict(s['data_yaw'], ok=0, no_rv=s['data_yaw']['ticks'])
     assert t4.outcome(dict(s, data_yaw=all_no_rv)) == (0, None)
 
