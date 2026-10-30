@@ -23,8 +23,11 @@ FIRST_SEQ = 101
 
 def make_run(tmp_path, dur_s=3, auto_end=1, drop_gyro=(), overwrite_gyro=(), drop_qseq=(), data_dup=False,
              no_run_end=False, pre_start_report=False, rx_end_delay_us=None, name="run",
-             imu_init="imu_init=0,imu_init_ms=412", enc_short=0, s_temp=None):
-    """Ghi esp32_events.txt, esp32_data.txt cho một lượt; trả thư mục."""
+             imu_init="imu_init=0,imu_init_ms=412", enc_short=0, s_temp=None, drop_e=(), resets=(),
+             relay_bad_end=0, run_stats=None):
+    """Ghi esp32_events.txt, esp32_data.txt cho một lượt; trả thư mục. drop_e: eseq của dòng E mất trên
+    đường UDP (ESP32 vẫn đọc); enc_short: ESP32 đọc ít lần hơn (nhịp đọc sai); resets: t_us của dòng R;
+    relay_bad_end: relay_bad của dòng S cuối; run_stats: log_send_err_run của dòng #run_stats."""
     t1 = T0 + dur_s * 1_000_000
     ev = []                                   # (t_us, dòng không có qseq, là text?)
     n_rep = dur_s * 1_000_000 // PERIOD
@@ -45,8 +48,12 @@ def make_run(tmp_path, dur_s=3, auto_end=1, drop_gyro=(), overwrite_gyro=(), dro
         ev.append((T0 - 500, "J,{q},%d,2,1,255,1" % (T0 - 500), False))
         ev.append((T0 + 1000, "I,{q},%d,2,1,255,1,0,0,0.1,0.2,0.3" % (T0 + 1000), False))
     for k in range(dur_s):
+        rb = relay_bad_end if k == dur_s - 1 else 0
         ev.append((T0 + (k + 1) * 1_000_000 - 1, "S,{q}," + f"{T0 + (k + 1) * 1_000_000 - 1}"
-                   + ",1,0,0,0,0,0,10000,0,0,0,0,0" + ("" if s_temp is None else f",{s_temp}"), False))
+                   + f",1,0,0,0,0,0,10000,{(k + 1) * 50},{rb},0,0,0" + ("" if s_temp is None else f",{s_temp}"),
+                   False))
+    for t in resets:
+        ev.append((t, "R,{q},%d,1" % t, False))
     ev.append((T0, "#run_start,first_data_seq=%d,timestamp_us=%d,profile=heavy,duration_s=%d,auto_end=%d,"
                "fw=abc123,dirty=0,env=s06_load,cfg_hash=deadbeef" % (FIRST_SEQ, T0, dur_s, auto_end)
                + ("," + imu_init if imu_init else ""), True))
@@ -59,6 +66,8 @@ def make_run(tmp_path, dur_s=3, auto_end=1, drop_gyro=(), overwrite_gyro=(), dro
         ev.append((t1, "#run_end,last_data_seq=%d,log_qdrop=0,log_send_err=0,timestamp_us=%d,reason=duration,"
                    "elapsed_us=%d,log_qdrop_run=0,ev_qdrop_run=0,enc_ovf_run=0,imu_drop_run=0/0/0,"
                    "gyro_gap_max_us=10000" % (last_seq, t1, t1 - T0), True))
+        if run_stats is not None:
+            ev.append((t1 + 1, "#run_stats,log_send_err_run=%d" % run_stats, True))
     ev.sort(key=lambda x: x[0])
     lines, q = [], 0
     rx_base = 50_000_000
@@ -75,6 +84,8 @@ def make_run(tmp_path, dur_s=3, auto_end=1, drop_gyro=(), overwrite_gyro=(), dro
     for k in range((t1 - T0) // 1000 - enc_short):
         eseq += 1
         tb = T0 + 500 + k * 1000
+        if eseq in drop_e:
+            continue
         lines.append((rx_base + tb - T0 + 4000, f"E,{eseq},{tb},{tb + 12},{k},{-k},{k},{-k}"))
     data = []
     for n in range(n_data):
@@ -328,3 +339,50 @@ def test_logger_temperature_unreadable_is_recorded(tmp_path):
     cap.close()
     assert cap.temp_n == 0 and cap.temp_error.startswith("FileNotFoundError")
     assert (tmp_path / "cap" / "pi_temp.txt").read_text() == ""
+
+
+def test_s26_lost_lines_stay_a_failure(tmp_path):
+    # two E lines lost on the way to the PC: the ESP32 made every read (count by eseq, not by lines
+    # received): the run is not "not valid", the lost data is a failure (Z19)
+    res, _, _ = chk.check_run(make_run(tmp_path, drop_e=(1000, 1001)))
+    it = items(res)
+    assert it["enc_reads_vs_duration"]["ok"] and not it["stream_esp32_enc"]["ok"]
+    assert res["status"] == "fail"
+    # the ESP32 itself read too few times: read rhythm wrong, run not valid (measure again)
+    res, _, _ = chk.check_run(make_run(tmp_path, enc_short=5, name="short"))
+    assert res["status"] == "invalid"
+    # both: still a failure
+    res, _, _ = chk.check_run(make_run(tmp_path, enc_short=5, drop_e=(1000,), name="both"))
+    assert res["status"] == "fail"
+
+
+def test_s7_reset_near_run_start_not_valid(tmp_path):
+    res, _, _ = chk.check_run(make_run(tmp_path, resets=(T0 + 400_000,)))
+    assert not items(res)["resets_near_run_start"]["ok"] and res["status"] == "invalid"
+    res, _, _ = chk.check_run(make_run(tmp_path, resets=(T0 + 1_500_000,), name="later"))
+    assert items(res)["resets_near_run_start"]["ok"] and res["status"] == "pass"
+
+
+def test_s27_gyro_gap_across_run_start(tmp_path):
+    # the last gyro before START at T0 - 500, the first four of the run lost: 45.5 ms without gyro;
+    # every 1 s window still has 96 reports (in [95; 105])
+    res, _, _ = chk.check_run(make_run(tmp_path, pre_start_report=True, drop_gyro=(0, 1, 2, 3)))
+    g = kind(res, "gyro")
+    assert g["windows_bad"] == 0 and g["gap_max_us"] == 45_500
+    assert not items(res)["imu_gyro_gap_max_us"]["ok"] and res["status"] == "fail"
+
+
+def test_s30_relay_bad_fails_and_load_reported(tmp_path):
+    res, _, _ = chk.check_run(make_run(tmp_path, relay_bad_end=1))
+    assert not items(res)["relay_bad_run"]["ok"] and res["status"] == "fail"
+    res, _, _ = chk.check_run(make_run(tmp_path, name="ok"))
+    assert res["load"]["relay_ok_run"] == 100 and res["load"]["encoder_moved"] == [True] * 4
+
+
+def test_s37_send_err_from_run_stats(tmp_path):
+    # the ESP32 counted 2 send errors from START (one before the first DATA the PC got): from #run_stats
+    res, _, _ = chk.check_run(make_run(tmp_path, run_stats=2))
+    it = items(res)["log_send_err_run"]
+    assert it["value"] == 2 and not it["ok"] and "#run_stats" in it["limit"]
+    res, _, _ = chk.check_run(make_run(tmp_path, name="old"))   # older firmware: fallback, noted
+    assert items(res)["log_send_err_run"]["ok"] and any("firmware cũ" in n for n in res["notes"])

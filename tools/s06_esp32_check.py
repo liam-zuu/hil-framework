@@ -14,6 +14,16 @@ Lượt không hợp lệ (đo lại, không tính bộ HIL không đạt; Liam 
 nghị", spec S06 T3b): số lần đọc count trong lượt ≠ thời lượng / 1 ms ± 1. Mục loại này có
 category "valid"; mục khác "check".
 
+Sửa theo Codex Sol vòng 1/2 (Liam duyệt 30/10 "Duyệt, sửa hết"):
+  * S26: số lần đọc encoder của nguồn tính theo dải `eseq` (không theo số dòng PC nhận); mất dòng hoặc lỗi
+    sản phẩm đã thấy luôn là "fail", "invalid" chỉ khi các mục điều kiện là mục duy nhất không đạt (Z19).
+  * S7: reset hoàn tất ±1 s quanh #run_start thành mục điều kiện (không hợp lệ, đo lại); phía H7 ở
+    tools/s06_frames_decode.py.
+  * S27: hở gyro tính cả khoảng qua hai biên lượt (report ngay trước #run_start, ngay sau #run_end).
+  * S30: relay_bad tăng trong lượt = không đạt; relay_ok và việc count encoder có đổi được báo (`load`).
+  * S37: log_send_err_run lấy từ dòng #run_stats của ESP32 (mốc lúc START, s06_load b9b3984); firmware
+    cũ thì lấy từ DATA đầu PC nhận và ghi chú.
+
 Usage:
     python tools/s06_esp32_check.py <thư mục lượt> [<thư mục lượt> ...] [--out <thư mục kết quả>]
 Mã thoát (một lượt): 0 đạt; 1 có mục không đạt; 2 thiếu #run_start/#run_end; 3 lượt không hợp lệ
@@ -230,14 +240,21 @@ def check_run(run_dir):
     ds = seq_stream([r["seq"] for r in data] + lt_seq, lo, hi)
     ds.update(stream="esp32_data", overflow=int(re_["kv"].get("log_qdrop_run", -1)))
     ds["ok"] = ds["gaps"] == 0 and ds["dups"] == 0 and ds["overflow"] == 0
-    send_err0 = min((r["send_err"] for r in d_in), default=None)
-    send_err_d = int(re_["kv"]["log_send_err"]) - send_err0 if send_err0 is not None else None
+    # S37: the run figure comes from the ESP32 itself (#run_stats after #run_end, baseline at START,
+    # s06_load b9b3984); older firmware: from the first DATA the PC got, which may be later than START
+    rst = first_text(ev, "run_stats")
+    if rst and "log_send_err_run" in rst["kv"]:
+        send_err_d, src = int(rst["kv"]["log_send_err_run"]), "từ START tới #run_end (#run_stats)"
+    else:
+        send_err0 = min((r["send_err"] for r in d_in), default=None)
+        send_err_d = int(re_["kv"]["log_send_err"]) - send_err0 if send_err0 is not None else None
+        src = "từ DATA đầu PC nhận tới #run_end: không gồm lỗi gửi trước DATA đầu (firmware cũ, không có #run_stats)"
+        res["notes"].append(f"log_send_err_run {src}")
     item("data_seq_range", f"{lo}..{hi}: nhận {ds['received']}/{ds['expected']}, hở {ds['gaps']}",
          "đủ, không hở (§4.3 điều 2)", ds["gaps"] == 0)
     item("data_seq_dups", ds["dups"], "0 (§4.3 điều 4)", ds["dups"] == 0)
     item("log_qdrop_run", ds["overflow"], "0 (§4.3 điều 4)", ds["overflow"] == 0)
-    item("log_send_err_run", send_err_d, "0 (§4.3 điều 4; từ DATA đầu trong lượt tới #run_end)",
-         send_err_d == 0)
+    item("log_send_err_run", send_err_d, f"0 (§4.3 điều 4; {src})", send_err_d == 0)
     if not header_seen:
         res["notes"].append("không bắt được dòng tiêu đề DATA: dùng vị trí cột mặc định của logger.c")
 
@@ -267,12 +284,16 @@ def check_run(run_dir):
     if E:
         eq = sorted(e["eseq"] for e in E)
         enc["gaps"] = (eq[-1] - eq[0] + 1) - len(set(eq))
+        # S26: reads the SOURCE made = span of eseq (independent of lines lost on the way to the PC)
+        enc["source_reads"] = eq[-1] - eq[0] + 1
+    else:
+        enc["source_reads"] = 0
     if enc_period_us:
         enc["expected"] = (t1 - t0) // enc_period_us
     enc["ok"] = enc["gaps"] == 0 and enc["dups"] == 0 and enc["overflow"] == 0
-    item("enc_reads_vs_duration", f"{enc['received']} lần đọc, kỳ vọng {enc['expected']}",
-         f"± {ENC_COUNT_TOL} (T3b; không đạt = lượt không hợp lệ, đo lại)",
-         enc["expected"] is not None and abs(enc["received"] - enc["expected"]) <= ENC_COUNT_TOL, "valid")
+    item("enc_reads_vs_duration", f"{enc['source_reads']} lần đọc ở ESP32 (theo eseq), kỳ vọng {enc['expected']}",
+         f"± {ENC_COUNT_TOL} (T3b; không đạt = nhịp đọc sai, lượt không hợp lệ, đo lại)",
+         enc["expected"] is not None and abs(enc["source_reads"] - enc["expected"]) <= ENC_COUNT_TOL, "valid")
     if E:
         tb = sorted(e["t_before"] for e in E)
         res["enc_period_max_us"] = max([b - a for a, b in zip(tb, tb[1:])], default=0)
@@ -292,10 +313,28 @@ def check_run(run_dir):
              r["windows"] > 0 and r["windows_bad"] == 0)
     g = next((r for r in imu["kinds"] if r["report_type"] == "gyro"), None)
     if g:
-        item("imu_gyro_gap_max_us", g["gap_max_us"], f"≤ T_age {g['t_age_us']}",
+        item("imu_gyro_gap_max_us", g["gap_max_us"], f"≤ T_age {g['t_age_us']} (gồm khoảng qua hai biên lượt, S27)",
              g["gap_max_us"] is not None and g["t_age_us"] is not None and g["gap_max_us"] <= g["t_age_us"])
+        if not g["gap_edges_known"]:
+            res["notes"].append("không có report gyro ngay trước #run_start hoặc ngay sau #run_end: khoảng hở qua "
+                                "biên lượt không kiểm được, không khẳng định hở gyro 'suốt lượt'")
     res["resets_in_run"] = [r for r in ev["R"] if t0 <= r["t_us"] <= t1]
     res["resets_near_start"] = [r for r in ev["R"] if abs(r["t_us"] - t0) <= RESET_NEAR_US]
+    # S7 / V4-1: a reset-complete within ±1 s of #run_start makes the run not valid (measure again);
+    # the H7 side of the condition is checked by tools/s06_frames_decode.py
+    item("resets_near_run_start", len(res["resets_near_start"]), "0 trong ±1 s quanh #run_start (V4-1)",
+         not res["resets_near_start"], "valid")
+    # S30: load condition of the run: the relay must not report bad frames; its good count and the
+    # encoder movement are reported so the scoring tools can tell a run without the load
+    S = [s for s in ev["S"] if t0 <= s["t_us"] <= t1]
+    if len(S) >= 2:
+        relay_ok_d, relay_bad_d = S[-1]["relay_ok"] - S[0]["relay_ok"], S[-1]["relay_bad"] - S[0]["relay_bad"]
+        item("relay_bad_run", relay_bad_d, "0 (relay H7 → ESP32 không có frame sai)", relay_bad_d == 0)
+    else:
+        relay_ok_d = relay_bad_d = None
+        item("relay_stats_in_run", len(S), "≥ 2 dòng S trong lượt (đọc bộ đếm relay)", False)
+    moved = [any(E[i]["c"][w] != E[0]["c"][w] for i in range(len(E))) for w in range(4)] if E else [False] * 4
+    res["load"] = dict(relay_ok_run=relay_ok_d, relay_bad_run=relay_bad_d, encoder_moved=moved)
     dut = imu["dut"]
     if any(r["n_overwritten"] for r in imu["kinds"]) or any(dut.values()):
         res["notes"].append("DUT: có report không tới callback hoặc bộ đếm bỏ > 0: thêm dòng bug log "
@@ -303,12 +342,16 @@ def check_run(run_dir):
     # Hở gyro do firmware tính ở callback: chỉ báo kèm, thông tin DUT (spec T4 (2), Liam duyệt 29/10)
     res["dut_fw_gyro_gap_max_us"] = re_["kv"].get("gyro_gap_max_us")
     failed = [i for i in res["items"] if not i["ok"]]
-    if any(i["category"] == "valid" for i in failed):
+    # S26 (Z19 order): lost data and product faults already seen stay a FAILURE; "not valid (measure
+    # again)" only when the condition items are the only ones failed
+    if any(i["category"] != "valid" for i in failed):
+        res["status"] = "fail"
+        if any(i["category"] == "valid" for i in failed):
+            res["notes"].append("có mục không đạt và cả điều kiện lượt không hợp lệ: vẫn tính là không đạt (Z19)")
+    elif failed:
         res["status"] = "invalid"
-        if any(i["category"] != "valid" for i in failed):
-            res["notes"].append("lượt không hợp lệ và còn mục không đạt khác: xem trước khi đo lại")
     else:
-        res["status"] = "fail" if failed else "pass"
+        res["status"] = "pass"
     return res, ev, imu
 
 
@@ -325,6 +368,13 @@ def imu_counts(ev, t0, t1, period_us):
     for kind, name in KINDS.items():
         jk = [j for j in J if j["kind"] == kind]
         ts = sorted(j["t_us"] for j in jk)
+        # S27: a gap crossing a run boundary counts too: add the report just before #run_start and the one
+        # just after #run_end (the logger keeps lines around the run) to the series of gaps
+        all_t = sorted(j["t_us"] for j in J_all if j["kind"] == kind)
+        before = [t for t in all_t if t < t0][-1:]
+        after = [t for t in all_t if t > t1][:1]
+        ts_gap = before + ts + after
+        edges_known = bool(before) and bool(after)
         wins = [0] * n_win
         for t in ts:
             w = (t - t0) // WIN_US
@@ -341,7 +391,8 @@ def imu_counts(ev, t0, t1, period_us):
             cb_not_applied=sum(1 for k in ik if not I[k]["applied"]),
             cb_unmatched=sum(1 for k in unmatched if I[k]["kind"] == kind and t0 <= I[k]["t_us"] <= t1),
             windows=n_win, windows_bad=len(bad), min_win=min(wins, default=None), max_win=max(wins, default=None),
-            gap_max_us=max([b - a for a, b in zip(ts, ts[1:])], default=None),
+            gap_max_us=max([b - a for a, b in zip(ts_gap, ts_gap[1:])], default=None),
+            gap_edges_known=edges_known,
             t_age_us=int(T_AGE_PERIODS * period_us) if period_us else None))
     re_ = first_text(ev, "run_end")
     drops = (re_["kv"].get("imu_drop_run", "-1/-1/-1") if re_ else "-1/-1/-1").split("/")
