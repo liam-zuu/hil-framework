@@ -140,8 +140,8 @@ def rotating_frame_torque(omega, params):
     M (dv/dt + wz x v) = F, i.e. M (dvx/dt - wz vy) = Fx, M (dvy/dt + wz vx) = Fy
     (the yaw row has no such term). M_eff covers M dv/dt only; the wz x v part
     (centripetal / Coriolis) maps to the wheels as H_fwd^T [-M wz vy, M wz vx, 0].
-    Left out before 28/10 (M6 port): turning while moving needed no lateral force.
-    It does no work (v . (wz x v) = 0)."""
+    Left out before 28/10 (M6 port): the body-frame velocity held constant with no
+    centripetal force. It does no work (v . (wz x v) = 0)."""
     v = params.H_fwd @ omega
     return params.H_fwd.T @ np.array([-params.M * v[2] * v[1], params.M * v[2] * v[0], 0.0])
 
