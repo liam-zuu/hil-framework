@@ -131,7 +131,7 @@ def report_result(code: int, reasons=()) -> int:
 
 READ_PERIOD_US = 1000.0            # s06_load: one encoder read every 1 ms (Q-S1)
 READ_COUNT_TOL = 1                 # số lần đọc = thời lượng / 1 ms ± 1 (spec T3b)
-READ_GAP_MAX_US = 2000.0           # C1-13 [ĐỀ XUẤT CODE]: hai lần đọc liền nhau cách ≤ 2 chu kỳ
+READ_GAP_MAX_US = 2000.0           # C1-13 (Liam chốt 30/10): hai lần đọc liền nhau cách ≤ 2 chu kỳ
 
 
 def read_rhythm(t_before, marks: dict) -> dict:
