@@ -1,4 +1,5 @@
 """t4_imu_profile.py (S06 T4 (4) IMU sequence) and run_hil.py --imu-profile t4 through HILNode."""
+import json
 import math
 import multiprocessing as mp
 
@@ -49,3 +50,13 @@ def test_hil_node_sends_the_profile(tmp_path):
         want = p.sample(k * 0.001)
         for g, w, rng in zip(got, want, IMU_RANGES):
             assert abs(g - w) <= rng / 32767 / 2 + 1e-12, (k, got, want)
+    assert json.loads(str(z['manifest']))['imu_source'] == 't4'
+
+
+def test_manifest_names_the_source_really_used(tmp_path):
+    # S73: imu_static has priority in _imu_sample, whatever imu_profile asks for
+    log = str(tmp_path / 'f.npz')
+    cfg = HILConfig(simulate_hw=True, max_steps=20, period_us=1_000, imu_profile='t4',
+                    imu_static=(0.0, 0.0, 0.0, 9.81, 0.0), frame_log=log)
+    HILNode(MockPlant(), config=cfg, shared_state=mp.Array('d', 10)).run()
+    assert json.loads(str(np.load(log)['manifest']))['imu_source'] == 'static'

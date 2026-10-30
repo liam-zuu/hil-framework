@@ -64,7 +64,7 @@ def esp(t_pi):
 
 def build(tmp_path, steps=STEPS, hold_s=1.0, gain=(1, 1, 1, 1), offset=None, bad_gpio=False, tau_frames=1.0,
           corrupt=(), ppm=None, glitch=None, end_force=True, run_end=True, drop_q=(), cut_q=(), run_id=1,
-          manifest='auto', frames_cut=0):
+          manifest='auto', frames_cut=0, float_q=(), no_id_q=(), repeat_row=None):
     global PPM
     PPM = ppm if ppm is not None else 20e-6
     rng = np.random.default_rng(11)
@@ -127,6 +127,15 @@ def build(tmp_path, steps=STEPS, hold_s=1.0, gain=(1, 1, 1, 1), offset=None, bad
     lines = [x for x in lines if not any(f'\tP,{d},' in x for d in drop_q)]
     # cut_q: the line arrived with its qseq but the payload lost (Codex S56)
     lines = [','.join(x.split(',')[:2]) if any(f'\tP,{d},' in x for d in cut_q) else x for x in lines]
+
+    def edit_p(x):
+        f = x.split(',')
+        if any(f'\tP,{d},' in x for d in float_q):      # S67: the speed printed as a float
+            f[5] += '.0'
+        if any(f'\tP,{d},' in x for d in no_id_q):      # S71: P without the run field of the marks
+            f = f[:10]
+        return ','.join(f)
+    lines = [edit_p(x) for x in lines]
     for t in np.arange(t_pi[0], t_pi[-1], 10e3):
         e = esp(t)
         lines.append(f'{int(t + rng.uniform(2000, 6000))}\tE,1,{int(e)},{int(e + 12)},0,0,0,0')
@@ -134,6 +143,8 @@ def build(tmp_path, steps=STEPS, hold_s=1.0, gain=(1, 1, 1, 1), offset=None, bad
     ev.write_text('\n'.join(lines) + '\n')
     npz = tmp_path / 'frames.npz'
     keep = n - frames_cut
+    if repeat_row is not None:                          # S68: row lost, the good neighbour written twice
+        mosi[repeat_row], miso[repeat_row] = mosi[repeat_row + 1], miso[repeat_row + 1]
     extra = {}
     if manifest == 'auto':
         extra['manifest'] = np.array(json.dumps(dict(step_first=0, step_last=keep - 1, steps=keep, period_us=1000)))
@@ -237,6 +248,34 @@ def test_p_lines_with_payload_lost_fail(tmp_path):
     assert code == 1 and s['qseq_stream']['malformed'] == 4 and s['qseq_stream']['missing'] == 4
 
 
+def test_p_lines_a_parser_would_drop_fail(tmp_path):
+    # S67: all fields and the qseq there, speed `0.0`: not counted as received, so the run cannot pass
+    code, s, _, _ = run(tmp_path, float_q=_zero_mid_qseq())
+    assert code == 1 and s['qseq_stream']['malformed'] == 4 and s['qseq_stream']['missing'] == 4
+
+
+def test_p_lines_without_the_run_field_fail(tmp_path):
+    # S71: the marks carry run=, four P lines do not: they are not lines of this run
+    code, s, _, _ = run(tmp_path, no_id_q=_zero_mid_qseq())
+    assert code == 1 and s['qseq_stream']['malformed'] == 4
+
+
+def test_frame_row_repeated_fails(tmp_path):
+    # S68: row count intact, no CRC bad, one scored row replaced by its neighbour
+    code, s, _, _ = run(tmp_path, repeat_row=PRE + 500)
+    assert code == 1 and any('seq MOSI' in x for x in s['frame_log_faults']), s['frame_log_faults']
+
+
+def test_run_that_cannot_be_chosen_stops_before_scoring(tmp_path):
+    # S71: --run of a run not in the file, or an id that comes twice: input error, nothing written
+    code, s, out, p = run(tmp_path, extra=(*true_affine(), '--u-duty', '0', '--run', '7'))
+    assert code == 2 and not os.path.exists(out / 'T6_summary.json')
+    ev = tmp_path / 'esp32_events.txt'
+    ev.write_text(ev.read_text() + '99000000\t#run_start,run=1,first_data_seq=9,timestamp_us=99000000,qseq=9000\n')
+    with pytest.raises(ValueError, match='2 lần'):
+        t6.read_events(str(ev), {}, 1)
+
+
 def test_frame_log_cut_is_not_a_pass(tmp_path):
     # S57: the frame log ends after the last scored frames, before #run_end + 1 s; every level still has
     # its 300 frames, no frame is bad
@@ -251,7 +290,7 @@ def test_frame_log_cut_is_not_a_pass(tmp_path):
 
 
 def test_run_id_selects_the_lines(tmp_path):
-    # S58: a file with two runs: without --run nothing is concluded; with --run only that run's P count
+    # S58, S71: a file with two runs: without --run an input error; with --run only that run's P count
     code, s, out, p = run(tmp_path)
     assert code == 0 and s['run'] == 1, p.stdout[-800:]
     ev = tmp_path / 'esp32_events.txt'
@@ -259,7 +298,7 @@ def test_run_id_selects_the_lines(tmp_path):
     p = subprocess.run([sys.executable, os.path.join(ROOT, 'tools', 's06_t6_check.py'), str(tmp_path / 'frames.npz'),
                         '--esp32-events', str(ev), '--out', str(out), *true_affine(), '--u-duty', '0'],
                        capture_output=True, text=True)
-    assert p.returncode == 3
+    assert p.returncode == 2
     p = subprocess.run([sys.executable, os.path.join(ROOT, 'tools', 's06_t6_check.py'), str(tmp_path / 'frames.npz'),
                         '--esp32-events', str(ev), '--run', '1', '--out', str(out), *true_affine(), '--u-duty', '0'],
                        capture_output=True, text=True)
@@ -279,6 +318,10 @@ def test_read_events_keeps_the_p_lines_of_the_run(tmp_path):
     marks = {}
     P, _, _ = t6.read_events(str(ev), marks, 1)
     assert len(P[0]) == 1 and marks['run_end'] == 3
+    # S71: a P line without the run field of the marks is not a line of this run
+    ev.write_text(ev.read_text().replace('P,2,2,2,0,30,3,970,8,1000,1', 'P,2,2,2,0,30,3,970,8,1000'))
+    P, _, _ = t6.read_events(str(ev), {}, 1)
+    assert len(P[0]) == 0
 
 
 def test_lost_p_lines_fail(tmp_path):

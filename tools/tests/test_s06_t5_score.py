@@ -242,6 +242,11 @@ def _cli(run2, name, *extra, lost=(), enc_ovf=0, run_end=True, sched_csv=None, h
     return p.returncode, summ, out, p
 
 
+def test_cli_run_that_cannot_be_chosen(run2):
+    # S71: --run of a run not in the file stops before scoring, it does not read every E line
+    assert _cli(run2, 'norun', '--run', '7')[0] == 2
+
+
 def test_cli_full_evidence_passes(run2):
     code, summ, out, p = _cli(run2, 'ok', '--xtal-ppm', '20')
     assert code == 0, p.stdout[-1500:] + p.stderr

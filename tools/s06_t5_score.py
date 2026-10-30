@@ -315,9 +315,9 @@ def write_csv(path: str, rows: Sequence[dict], cols: Sequence[str]) -> None:
             w.writerow({c: r[c] for c in cols})
 
 
-def load_esp32_events(path: str, count_sign=(1, 1, 1, 1), run=None):
-    """(Reads, (t_rx, t_after) của dòng E, (t_us, temp_c) của dòng S 16 trường hoặc None). `run` (số lượt
-    của manifest, S58): chỉ giữ dòng E của lượt đó; None = mọi dòng E (firmware chưa có trường run)."""
+def load_esp32_events(path: str, count_sign=(1, 1, 1, 1), marks=None):
+    """(Reads, (t_rx, t_after) của dòng E, (t_us, temp_c) của dòng S 16 trường hoặc None). `marks` (của
+    s06_stream.run_marks, S58, S71): chỉ giữ dòng E của lượt đó."""
     eseq, tb, ta, c, rx = [], [], [], [], []
     st, sv = [], []
     with open(path, encoding='utf-8', errors='replace') as f:
@@ -328,7 +328,7 @@ def load_esp32_events(path: str, count_sign=(1, 1, 1, 1), run=None):
             p = line.split(',')
             e = stm.parse_e(p)
             if e is not None:
-                if run is not None and e[4] != run:
+                if not stm.e_of_run(e, marks or {}):
                     continue
                 eseq.append(e[0])
                 tb.append(e[1])
@@ -385,8 +385,9 @@ def main(argv=None) -> int:
         sched = t5.read_csv(a.schedule)
         t5.segments(sched)                      # kiểm lịch liền nhau
         marks = stm.run_marks(a.esp32_events, a.run)
-        reads, rx, s_temp = load_esp32_events(a.esp32_events, [int(x) for x in a.count_sign.split(',')],
-                                              marks.get('_run'))
+        if marks['_problem']:
+            raise ValueError(marks['_problem'])
+        reads, rx, s_temp = load_esp32_events(a.esp32_events, [int(x) for x in a.count_sign.split(',')], marks)
         h7_up = h7_uptime_us(ser.read_log(a.h7_serial)) if a.h7_serial else None
         if a.offset_us is None:
             offset, corr = align_offset(reads, sched)

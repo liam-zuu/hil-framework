@@ -52,6 +52,7 @@ def test_frame_log_and_run_lines(tmp_path, caplog):
     m = json.loads(str(d['manifest']))
     assert (m['step_first'], m['step_last'], m['steps']) == (0, steps - 1, steps)
     assert m['period_us'] == 1_000 and m['stop_reason'] == 'max_steps' and m['imu_profile'] is None
+    assert m['imu_source'] == 'none'                  # S73: the source really used, not the one requested
 
 
 def test_frame_log_cap_stops_the_run(tmp_path, caplog):

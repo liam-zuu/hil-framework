@@ -202,6 +202,7 @@ def check(t_send_ns, mosi, miso, events_path, data_path=None, cal=None, manifest
     read before the mutex), S38: every callback inside #run_start..#run_end on the ESP32 clock (the same
     clock the I lines carry; no edge left out)."""
     res = dec.decode(t_send_ns, mosi, miso, events_path, cal)
+    period_us = float(manifest['period_us']) if manifest and manifest.get('period_us') else 1000.0   # S73
     m = res['esp32_match']
     off = m['epoch_offset_esp32_minus_h7']
     win = m['window_pi_us']
@@ -236,7 +237,7 @@ def check(t_send_ns, mosi, miso, events_path, data_path=None, cal=None, manifest
         if finite:
             s['max_ratio'] = max(s['max_ratio'], worst / tol)
         if ok:
-            p = stimulus_point(r['kind'], src['src_frame'])
+            p = stimulus_point(r['kind'], src['src_frame'], period_us)
             if p:
                 covered[r['kind']].add(p)
         row.update(src_frame=src['src_frame'], src_nf=src['src_nf'], exp1=exp[0], exp2=exp[1], exp3=exp[2],
@@ -244,12 +245,12 @@ def check(t_send_ns, mosi, miso, events_path, data_path=None, cal=None, manifest
         rows.append(row)
     missing = {k: sorted(required_points(k) - covered[k]) for k in TOL if required_points(k) - covered[k]}
     srcs = [r['src_frame'] for r in rows if r.get('src_frame') is not None]
-    n_chk, n_diff, k_diff = stimulus_check(np.asarray(t_send_ns, dtype=np.int64) / 1e3, mosi, win, srcs)
+    n_chk, n_diff, k_diff = stimulus_check(np.asarray(t_send_ns, dtype=np.int64) / 1e3, mosi, win, srcs, period_us)
     text = res.get('_esp32_text', {})
     data = check_data_yaw(data_path, res['_esp32_I'], data_seq_span(text)) if data_path else None
     summary = dict(epoch_offset_esp32_minus_h7=off, epoch_note=m['epoch_note'], window_pi_us=win,
                    window_esp32_us=esp, callback_reports=len(cb), manifest=manifest,
-                   frame_log_faults=dec.manifest_check(manifest, len(t_send_ns)),
+                   frame_log_faults=dec.manifest_check(manifest, t_send_ns, mosi, miso),
                    stimulus=dict(frames_checked=n_chk, frames_differ=n_diff, first_differ=k_diff),
                    per_kind={k: dict(v, tol=TOL.get(k), unit=UNIT.get(k)) for k, v in stats.items()},
                    fail=sum(s['fail'] for s in stats.values()),
@@ -270,9 +271,10 @@ def exit_code(summary) -> int:
     if d and (d['bad'] or d['no_callback'] or d['bad_lines'] or d['seq_missing'] or d['seq_dups']):
         return 1
     # S64: MOSI off the schedule while the manifest says the Pi ran `--imu-profile t4` is a fault of the HIL
-    # (mã 1); a run without that profile, or a log with no manifest, is a run not valid for T4 (4) (mã 3)
+    # (mã 1); a run without that profile, or a log with no manifest, is a run not valid for T4 (4) (mã 3).
+    # S73: `imu_source` is the source hil_node really used (--imu-static wins over the profile)
     man = summary['manifest']
-    profile_t4 = man is not None and man.get('imu_profile') == 't4'
+    profile_t4 = man is not None and man.get('imu_source') == 't4'
     if summary['stimulus']['frames_differ'] and profile_t4:
         return 1
     if (summary['run_conditions'] or summary['window_esp32_us'] is None or summary['callback_reports'] == 0

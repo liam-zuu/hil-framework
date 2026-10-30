@@ -304,9 +304,9 @@ def load_frames(path: str):
     return t_send_us, w_d
 
 
-def load_esp32_reads(path: str, offset_us: float, rate: float, run=None):
+def load_esp32_reads(path: str, offset_us: float, rate: float, marks: Optional[dict] = None):
     """Reads on the Pi clock (t_pi = offset + rate·t_esp) and, for the Z19 check, eseq + t_before on the
-    ESP32 clock. `run` (manifest, S58): only the E lines of that run; None = every E line (no run field)."""
+    ESP32 clock. `marks` (of s06_stream.run_marks, S58, S71): only the E lines of that run."""
     tb, ta, c, eseq, tb_esp = [], [], [], [], []
     with open(path, encoding='utf-8', errors='replace') as f:
         for raw in f:
@@ -314,7 +314,7 @@ def load_esp32_reads(path: str, offset_us: float, rate: float, run=None):
             if not sep or not line.startswith('E,'):
                 continue
             e = stm.parse_e(line.split(','))
-            if e is None or (run is not None and e[4] != run):
+            if e is None or not stm.e_of_run(e, marks or {}):
                 continue
             tb.append(offset_us + rate * e[1])
             ta.append(offset_us + rate * e[2])
@@ -352,7 +352,9 @@ def main(argv=None) -> int:
         sched = ts.read_csv(a.schedule)
         t_send, w_d = load_frames(a.frames)
         marks = stm.run_marks(a.esp32_events, a.run)
-        tb, ta, c, eseq, tb_esp = load_esp32_reads(a.esp32_events, *a.clock_affine, run=marks.get('_run'))
+        if marks['_problem']:
+            raise ValueError(marks['_problem'])
+        tb, ta, c, eseq, tb_esp = load_esp32_reads(a.esp32_events, *a.clock_affine, marks=marks)
         lag, frac = schedule_lag(w_d, sched)
         if frac < LAG_MATCH_MIN:
             raise ValueError(f'frame MOSI không theo lịch (khớp tốt nhất {frac:.4f} ở trễ {lag} frame)')

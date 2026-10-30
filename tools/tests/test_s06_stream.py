@@ -3,6 +3,8 @@ counted by their run field, a loss seen is a failure even when another mark is m
 import os
 import sys
 
+import pytest
+
 HERE = os.path.dirname(__file__)
 sys.path.insert(0, os.path.join(HERE, '..'))
 import s06_stream as stm  # noqa: E402
@@ -84,10 +86,70 @@ def test_qseq_hole_fails_without_the_drop_field(tmp_path):
 
 
 def test_line_with_qseq_but_no_payload_is_not_received(tmp_path):
-    p = write(tmp_path, ['#run_start,timestamp_us=100,qseq=1', 'P,2', 'P,3,1,2,0,30,3,970,8,1000,1', 'S,4,10,1,0,0,0,0,0,'
-                         '10000,0,0,0,0,0,nan', '#run_end,timestamp_us=200,ev_qdrop_run=0,enc_ovf_run=0,qseq=5'])
+    p = write(tmp_path, ['#run_start,run=1,timestamp_us=100,qseq=1', 'P,2', 'P,3,1,2,0,30,3,970,8,1000,1', 'S,4,10,1,0,0,0,0,'
+                         '0,10000,0,0,0,0,0,nan', '#run_end,run=1,timestamp_us=200,ev_qdrop_run=0,enc_ovf_run=0,qseq=5'])
     q = stm.qseq_stream(p)
     assert q['malformed'] == 1 and q['missing'] == 1 and q['received'] == 4 and not q['ok']
+
+
+def test_repeated_run_id_is_not_chosen(tmp_path):
+    # S69: the ESP32 rebooted inside the file, so run=1 comes twice: neither one is "the" run 1
+    p = write(tmp_path, [START.format(r=1, t=100, q=1), END.format(r=1, t=200, q=2),
+                         START.format(r=1, t=50, q=1), END.format(r=1, t=90, q=2), STATS.format(r=1, n=40, q=3)])
+    m = stm.run_marks(p, run=1)
+    assert m['_problem'] and m['_run'] is None and 'run_start' not in m and 'run_stats' not in m
+
+
+def test_search_for_marks_stops_at_the_next_start(tmp_path):
+    # S69: the id of the next START is different here, and a late mark with the old id must not cross it
+    p = write(tmp_path, [START.format(r=1, t=100, q=1), END.format(r=1, t=200, q=2), START.format(r=2, t=300, q=3),
+                         STATS.format(r=1, n=2999, q=4)])
+    m = stm.run_marks(p, run=1)
+    assert 'run_end' in m and 'run_stats' not in m
+
+
+def test_run_not_in_the_file_is_a_problem_of_its_own(tmp_path):
+    # S71: an absent run must not read as "no run field, take every line"
+    m = stm.run_marks(two_runs(tmp_path), run=7)
+    assert m['_problem'] and m['_run'] is None and not m['_multi']
+    m = stm.run_marks(two_runs(tmp_path))
+    assert m['_problem'] and m['_multi']
+    assert not stm.run_marks(two_runs(tmp_path), run=2)['_problem']
+
+
+def test_integer_fields_follow_the_scoring_parsers(tmp_path):
+    # S67: `0.0` in an integer field is not received: the scoring parsers would drop that line
+    ok = 'P,2,1,2,0,30,3,970,8,1000,1'
+    assert stm._line_ok(ok.split(','))
+    assert not stm._line_ok(ok.replace(',30,', ',0.0,').split(','))
+    assert not stm._line_ok('J,2,100,1,1,7.5,2'.split(','))
+    # the values of a callback and the temperature are floats, and may be nan
+    assert stm._line_ok('I,3,100,2,1,7,2,5,5,0.5,nan,1e-3'.split(','))
+    assert not stm._line_ok('I,3,100,2,1.0,7,2,5,5,0.5,0,0'.split(','))
+    assert stm._line_ok('S,4,10,1,0,0,0,0,0,10000,0,0,0,0,0,nan'.split(','))
+    assert not stm._line_ok('S,4,10,1,0,0,0,0,0,1e4,0,0,0,0,0,40.0'.split(','))
+
+
+def test_p_format_must_match_the_marks(tmp_path):
+    # S71: marks with a run id, P without one, and the other way round: not received
+    old, new = 'P,2,1,2,0,30,3,970,8,1000', 'P,2,1,2,0,30,3,970,8,1000,1'
+    end = '#run_end,{}timestamp_us=200,ev_qdrop_run=0,enc_ovf_run=0,qseq=3'
+    q = stm.qseq_stream(write(tmp_path, ['#run_start,run=1,timestamp_us=100,qseq=1', old, end.format('run=1,')]))
+    assert q['malformed'] == 1 and not q['ok']
+    q = stm.qseq_stream(write(tmp_path, ['#run_start,timestamp_us=100,qseq=1', new, end.format('')]))
+    assert q['malformed'] == 1 and not q['ok']
+    q = stm.qseq_stream(write(tmp_path, ['#run_start,timestamp_us=100,qseq=1', old, end.format('')]))
+    assert q['malformed'] == 0 and q['ok']
+
+
+def test_e_of_run(tmp_path):
+    e_new, e_old = (1, 2, 3, [0, 0, 0, 0], 5), (1, 2, 3, [0, 0, 0, 0], None)
+    assert stm.e_of_run(e_new, dict(run_start={}, _run=5)) and not stm.e_of_run(e_new, dict(run_start={}, _run=6))
+    assert not stm.e_of_run(e_old, dict(run_start={}, _run=5))        # S71: no id, no run
+    assert stm.e_of_run(e_old, dict(run_start={}, _run=None))
+    with pytest.raises(ValueError):
+        stm.e_of_run(e_new, dict(run_start={}, _run=None))            # S71: mixed format
+    assert stm.e_of_run(e_new, {})                                    # no START in the file: known False later
 
 
 def test_parse_e_accepts_both_formats():

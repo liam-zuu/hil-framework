@@ -165,7 +165,7 @@ def test_empty_and_lag_and_locked_schedule(small):
     assert sc.schedule_matches_locked(sched) != []                           # a cut schedule is not the locked one
 
 
-def _cli_run(tmp_path, small, lost=None, lag=1):
+def _cli_run(tmp_path, small, lost=None, lag=1, extra=()):
     """A run as run_hil --omega-schedule writes it: frame k carries entry k - lag; ESP32 clock = Pi clock."""
     from protocol import encode_state
     sched, t_send, w_d, tb, ta = small
@@ -185,7 +185,12 @@ def _cli_run(tmp_path, small, lost=None, lag=1):
     ts.write_csv(str(tmp_path / 'sched.csv'), sched)
     return sc.main(['--schedule', str(tmp_path / 'sched.csv'), '--frames', str(tmp_path / 'frames.npz'),
                     '--esp32-events', str(tmp_path / 'ev.txt'), '--clock-affine', '0', '1', '--delta-sync-us', '0',
-                    '--out', str(tmp_path / 'out')])
+                    '--out', str(tmp_path / 'out'), *extra])
+
+
+def test_cli_run_that_cannot_be_chosen(tmp_path, small):
+    # S71: --run of a run not in the file stops before scoring, it does not read every E line
+    assert _cli_run(tmp_path, small, extra=('--run', '7')) == 2
 
 
 def test_cli_lag_found_and_stream_checked(tmp_path, small, capsys):

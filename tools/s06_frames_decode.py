@@ -58,6 +58,8 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
+import s06_stream as stm
+
 FRAME = 40
 MOSI_SEQ, MOSI_IMU_SEQ = 21, 39
 MOSI_IMU_BYTES = list(range(22, 24)) + list(range(31, 39))      # gz, ax, ay, az, yaw (HIL_Imu_t.raw)
@@ -355,8 +357,14 @@ def enc_calls(recs):
 
 def esp32_lines(path):
     """Dòng J (cổng SPI), I (callback), R (reset hoàn tất) và #run_start/#run_end của esp32_events.txt;
-    `t_rx` = giờ Pi lúc logger nhận (monotonic, cùng đồng hồ với t_send_ns), `t_us` = giờ ESP32."""
-    J, I, R, text = [], [], [], {}
+    `t_rx` = giờ Pi lúc logger nhận (monotonic, cùng đồng hồ với t_send_ns), `t_us` = giờ ESP32.
+    S70 (vòng 4): mốc lấy qua `s06_stream.run_marks`, cùng bộ chọn với các công cụ khác: START và END ghép
+    theo số lượt. T1, T4 chấm một lượt mỗi file (S58): không xác định được một lượt là lỗi đầu vào."""
+    marks = stm.run_marks(path)
+    if marks['_problem']:
+        raise ValueError(f"esp32_events: {marks['_problem']}: mỗi file một lượt (S58)")
+    text = {k: marks[k] for k in ('run_start', 'run_end') if k in marks}
+    J, I, R = [], [], []
     with open(path, encoding='utf-8', errors='replace') as fh:
         for raw in fh:
             t_rx, sep, line = raw.rstrip('\n').partition('\t')
@@ -374,12 +382,6 @@ def esp32_lines(path):
                                   v=(float(p[9]), float(p[10]), float(p[11]))))
                 elif p[0] == 'R' and len(p) == 4:
                     R.append(dict(t_rx=t_rx, t_us=int(p[2]), reset_count=int(p[3])))
-                elif p[0] in ('#run_start', '#run_end'):
-                    if p[0] == '#run_start':
-                        text['_n_run_start'] = text.get('_n_run_start', 0) + 1
-                    if p[0][1:] not in text:
-                        kv = dict(x.partition('=')[::2] for x in p[1:] if '=' in x)
-                        text[p[0][1:]] = dict(t_rx=t_rx, kv=kv)
             except ValueError:
                 continue
     return J, I, R, text
@@ -656,10 +658,7 @@ def decode(t_send_ns, mosi, miso, esp32_events: Optional[str] = None, cal: Optio
         res['esp32_match'] = match_esp32(reps, J, I, win, span)
         res['esp32_match']['pad_note'] = pad_check(win, t_send_us, J, I)
         res['esp32_match']['udp_note'] = udp_note
-        if text.get('_n_run_start', 0) > 1:          # S58: T1, T4 score one run per file
-            res['esp32_match']['udp_note'] = (udp_note + '; ' if udp_note else '') + \
-                f"S58: esp32_events có {text['_n_run_start']} dòng #run_start: mỗi file một lượt"
-        res['esp32_run_marks'] = sorted(k for k in text if not k.startswith('_'))
+        res['esp32_run_marks'] = sorted(text)
         res['esp32_run_esp_us'] = esp_run_span(text)
         res['_esp32_text'] = text
         res['resets_near_run_start'] = resets_near_start(recs, R, text)
@@ -746,16 +745,28 @@ def load_manifest(z):
     return json.loads(str(z['manifest']))
 
 
-def manifest_check(manifest, n_frames: int) -> List[str]:
+def manifest_check(manifest, t_send_ns, mosi, miso) -> List[str]:
     """S57 (Codex Sol round 3): frames lost from the log itself: the arrays must hold every step the Pi
-    says it logged (step_first..step_last, row k = step k). Returns the faults ('' list = whole)."""
+    says it logged (step_first..step_last, row k = step k). S68 (round 4): the row count alone does not
+    prove it (a row lost, a neighbour repeated): row k must carry MOSI seq = k mod 256 (hil_node.py sends
+    seq = step) and t_send must rise strictly. Returns the faults ([] = whole)."""
     if manifest is None:
         return []
     out = []
+    n_frames = len(t_send_ns)
     if manifest.get('step_first') != 0 or manifest.get('steps') != n_frames or \
             manifest.get('step_last') != n_frames - 1:
         out.append(f"frames.npz có {n_frames} frame, manifest ghi bước {manifest.get('step_first')}.."
                    f"{manifest.get('step_last')} ({manifest.get('steps')}): mất frame trong file (Z19)")
+    if len(mosi) != n_frames or len(miso) != n_frames:
+        out.append(f'frames.npz: t_send {n_frames}, mosi {len(mosi)}, miso {len(miso)} hàng: mảng không cùng chiều dài')
+        return out
+    seq_off = np.nonzero(np.asarray(mosi)[:, MOSI_SEQ] != (np.arange(n_frames) & 0xFF))[0]
+    if len(seq_off):
+        out.append(f'{len(seq_off)} hàng có seq MOSI khác chỉ số bước, đầu tiên hàng {seq_off[0]}: mất hoặc lặp frame (Z19)')
+    t_back = np.nonzero(np.diff(np.asarray(t_send_ns, dtype=np.int64)) <= 0)[0]
+    if len(t_back):
+        out.append(f't_send không tăng ở {len(t_back)} chỗ, đầu tiên sau hàng {t_back[0]}: mất hoặc lặp frame (Z19)')
     return out
 
 

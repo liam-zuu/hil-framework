@@ -54,7 +54,11 @@ def run_marks(path: str, run: Optional[int] = None) -> dict:
     Manifest lượt (Codex Sol vòng 3 S58): s06_load ghi `run=` ở cả ba mốc, nên END và STATS được ghép với
     START bằng số lượt, không theo "lần đầu mỗi loại" (STATS của lượt kế từng bị lấy nhầm). File có hơn một
     `#run_start` mà không chỉ `run` → không chọn (chỉ có '_runs', '_multi' = True): công cụ báo thiếu bằng
-    chứng. Firmware cũ (không có run=): một lượt mỗi file, END/STATS là mốc đầu tiên sau START."""
+    chứng. Firmware cũ (không có run=): một lượt mỗi file, END/STATS là mốc đầu tiên sau START.
+
+    Vòng 4: S69 `run` không phải danh tính duy nhất (ESP32 khởi động lại thì đếm lại từ 1), nên END/STATS chỉ
+    tìm tới START kế, và số lượt xuất hiện hơn một lần không được chọn; S71 `_problem` khác rỗng = không chọn
+    được lượt (không có, trùng, chưa chỉ): công cụ dừng trước khi chấm, không đọc dòng của lượt nào."""
     marks = []
     with open(path, encoding='utf-8', errors='replace') as fh:
         for raw in fh:
@@ -71,13 +75,16 @@ def run_marks(path: str, run: Optional[int] = None) -> dict:
                 continue
     starts = [m for n, m in marks if n == 'run_start']
     runs = [m['kv'].get('run') for m in starts]
-    out = dict(_runs=runs, _run=None, _multi=False)
+    out = dict(_runs=runs, _run=None, _multi=False, _problem='')
     if run is None and len(starts) > 1:
         out['_multi'] = True
+        out['_problem'] = f'file có {len(starts)} dòng #run_start mà không chọn lượt (--run)'
         return out
     if run is not None:
         idx = [i for i, (n, m) in enumerate(marks) if n == 'run_start' and m['kv'].get('run') == str(run)]
-        if not idx:
+        if len(idx) != 1:
+            out['_problem'] = (f'không có lượt run={run} trong file' if not idx else
+                               f'run={run} xuất hiện {len(idx)} lần (ESP32 khởi động lại giữa file?): không xác định lượt')
             return out
         i0 = idx[0]
     else:
@@ -91,11 +98,22 @@ def run_marks(path: str, run: Optional[int] = None) -> dict:
     rid = start['kv'].get('run')
     out['run_start'], out['_run'] = start, (int(rid) if rid is not None else None)
     for n, m in marks[i0 + 1:]:
-        if n == 'run_start' and rid is None:
-            break                                    # old firmware: the next run begins
-        if n in ('run_end', 'run_stats') and n not in out and m['kv'].get('run') == rid:
+        if n == 'run_start':
+            break                                    # S69: the next run begins, whatever its id
+        if n not in out and m['kv'].get('run') == rid:
             out[n] = m
     return out
+
+
+def e_of_run(e, marks: dict) -> bool:
+    """S71: dòng E (của `parse_e`) có thuộc lượt đã chọn không. Mốc có `run=` thì so số lượt (dòng E không có
+    số lượt không thuộc lượt nào); mốc không có `run=` là firmware cũ, dòng E có số lượt là định dạng trộn."""
+    rid = marks.get('_run')
+    if rid is not None:
+        return e[4] == rid
+    if 'run_start' in marks and e[4] is not None:
+        raise ValueError('mốc lượt không có run= nhưng dòng E có: định dạng trộn (S71)')
+    return True
 
 
 def _mark_int(marks, name, key):
@@ -132,7 +150,7 @@ def enc_stream(eseq, t_before, t0_us: float, t1_us: float, marks: Optional[dict]
     m = marks or {}
     ovf, qdrop = _mark_int(m, 'run_end', 'enc_ovf_run'), _mark_int(m, 'run_end', 'ev_qdrop_run')
     reads_run, t_start = _mark_int(m, 'run_stats', 'enc_reads_run'), _mark_int(m, 'run_start', 'timestamp_us')
-    out.update(enc_ovf_run=ovf, ev_qdrop_run=qdrop, multi_run=bool(m.get('_multi')))
+    out.update(enc_ovf_run=ovf, ev_qdrop_run=qdrop, multi_run=bool(m.get('_multi')), run_problem=m.get('_problem', ''))
     # S63: a loss counter seen > 0 is a failure even when another mark is missing
     if (ovf or 0) > 0 or (qdrop or 0) > 0:
         out['ok'] = False
@@ -156,13 +174,23 @@ def enc_stream(eseq, t_before, t0_us: float, t1_us: float, marks: Optional[dict]
 QSEQ_FIELDS = {'J': (7,), 'I': (12,), 'R': (4,), 'P': (10, 11), 'S': (15, 16)}   # P 11: + run (manifest lượt)
 
 
-def _line_ok(p) -> bool:
+FLOAT_FROM = {'I': 9, 'S': 15}     # first field printed with %g/%f (s06_load.c); the fields before it are integers
+
+
+def _line_ok(p, p_fields=None) -> bool:
     """S56 (vòng 3): a line counts for the stream only if its payload is readable: the field count of its
-    kind and every field a number (`nan` allowed: the temperature of an S line)."""
+    kind and every field a number (`nan` allowed: the values of an I line, the temperature of an S line).
+    S67 (vòng 4): integer fields by the same rule as the scoring parsers (`int`), so a line counted as
+    received is never dropped later. S71: `p_fields` = the P format of the run (11 with a run id)."""
     if p[0] not in QSEQ_FIELDS or len(p) not in QSEQ_FIELDS[p[0]]:
         return False
+    if p[0] == 'P' and p_fields not in (None, len(p)):
+        return False
+    n = FLOAT_FROM.get(p[0], len(p))
     try:
-        for x in p[1:]:
+        for x in p[1:n]:
+            int(x)
+        for x in p[n:]:
             float(x)
     except ValueError:
         return False
@@ -179,6 +207,7 @@ def qseq_stream(path: str, marks: Optional[dict] = None) -> dict:
     `ev_qdrop_run` > 0 là thất bại dù thiếu mốc khác."""
     m = marks if marks is not None else run_marks(path)
     q_start, q_end = _mark_int(m, 'run_start', 'qseq'), _mark_int(m, 'run_end', 'qseq')
+    p_fields = None if 'run_start' not in m else (11 if m.get('_run') is not None else 10)   # S71
     qdrop = _mark_int(m, 'run_end', 'ev_qdrop_run')
     got, bad = [], []
     with open(path, encoding='utf-8', errors='replace') as fh:
@@ -195,7 +224,7 @@ def qseq_stream(path: str, marks: Optional[dict] = None) -> dict:
                 q = int(p[1])
             except (KeyError, ValueError, IndexError):
                 continue
-            (got if _line_ok(p) else bad).append(q)
+            (got if _line_ok(p, p_fields) else bad).append(q)
     out = dict(q_start=q_start, q_end=q_end, expected=None, received=None, missing=None, dups=None,
                malformed=None, ev_qdrop_run=qdrop, multi_run=bool(m.get('_multi')), known=False,
                ok=(qdrop or 0) == 0)
@@ -222,8 +251,8 @@ def stream_notes(s: dict) -> list:
     if s['run_reads_missing']:
         n.append(f"cả lượt: nhận {s['run_reads_received']} dòng E, producer đọc {s['run_reads_expected']} "
                  f"(enc_reads_run − enc_ovf_run): mất đầu/đuôi hoặc giữa lượt (S41, Z19)")
-    if s.get('multi_run'):
-        n.append('file có hơn một lượt (#run_start) mà không chọn lượt (--run): không chấm (S58)')
+    if s.get('run_problem'):
+        n.append(f"{s['run_problem']}: không chấm (S58, S71)")
     if not s['known']:
         n.append('thiếu #run_start timestamp_us, #run_end (enc_ovf_run, ev_qdrop_run) hoặc #run_stats '
                  '(enc_reads_run): không chứng minh được luồng E đủ cả lượt')

@@ -100,11 +100,14 @@ def read_events(path, marks=None, run=None):
     """Dòng P theo bánh (giờ ESP32) và cặp (t_rx, t_esp) cho đồng hồ. `marks` (dict, tùy chọn) nhận
     timestamp_us (giờ ESP32) của #run_start/#run_end của lượt đã chọn (s06_stream.run_marks, `run`).
     Manifest lượt (S58): dòng P/E có trường run (s06_load) thì chỉ giữ dòng của lượt `run`; dòng P sai dạng
-    không bị bỏ im lặng: s06_stream.qseq_stream tính nó là hỏng (S56)."""
+    không bị bỏ im lặng: s06_stream.qseq_stream tính nó là hỏng (S56). S71: không chọn được lượt thì dừng ở
+    đây, trước khi đọc dòng nào; mốc có số lượt thì dòng P không có số lượt không thuộc lượt này."""
     P, rx, te = defaultdict(list), [], []
     if marks is not None:
         m = stm.run_marks(path, run)
-        marks['_run'], marks['_multi'] = m.get('_run'), m.get('_multi')
+        if m['_problem']:
+            raise ValueError(m['_problem'])
+        marks['_run'] = m.get('_run')
         for k in ('run_start', 'run_end'):
             if k in m and 'timestamp_us' in m[k]['kv']:
                 marks[k] = int(m[k]['kv']['timestamp_us'])
@@ -117,7 +120,7 @@ def read_events(path, marks=None, run=None):
             p = line.split(',')
             try:
                 if p[0] == 'P' and len(p) in (10, 11):
-                    if run is not None and len(p) == 11 and int(p[10]) != run:
+                    if run is not None and (len(p) != 11 or int(p[10]) != run):
                         continue
                     P[int(p[4])].append(dict(t_before=int(p[2]), t_after=int(p[3]), speed=int(p[5]),
                                              cmp={int(p[6]): int(p[7]), int(p[8]): int(p[9])}))
@@ -340,7 +343,7 @@ def main(argv=None) -> int:
         qs = stm.qseq_stream(a.esp32_events, stm.run_marks(a.esp32_events, a.run))
         # S57: the frame log itself: every step the manifest says was logged, and the frames cover the run
         manifest = dec.load_manifest(z)
-        frame_faults = dec.manifest_check(manifest, len(z['t_send_ns']))
+        frame_faults = dec.manifest_check(manifest, z['t_send_ns'], z['mosi'], z['miso'])
         cover_note = ''
         if 'run_start' in marks and 'run_end' in marks:
             t0p, t1p = float(to_pi(marks['run_start'])), float(to_pi(marks['run_end']))
@@ -366,13 +369,12 @@ def main(argv=None) -> int:
                         for v in ('pass', 'fail', 'fail_data_loss', 'inconclusive', 'short')},
                 levels_missing=missing, miso_crc_bad_frames=int(np.sum(~good)), run_frames=run_frames,
                 run_frames_bad=run_bad, qseq_stream=qs, manifest=manifest, frame_log_faults=frame_faults,
-                frames_cover_note=cover_note, run=marks.get('_run'), multi_run=bool(marks.get('_multi')),
-                sync=sync, run_end_esp_us=marks.get('run_end'),
+                frames_cover_note=cover_note, run=marks.get('_run'), sync=sync, run_end_esp_us=marks.get('run_end'),
                 follow=follow_summary(follow),
                 exit_code=verdict(levels, missing, synced=sync['kind'] == 'manual', u_known=a.u_duty is not None,
                                   stream_ok=qs['ok'] and not qs['malformed'] and not run_bad and not frame_faults,
                                   stream_known=(qs['known'] and run_bad is not None and manifest is not None
-                                                and not cover_note and not marks.get('_multi'))))
+                                                and not cover_note)))
     with open(os.path.join(a.out, 'T6_summary.json'), 'w', encoding='utf-8') as f:
         json.dump(summ, f, ensure_ascii=False, indent=1, default=lambda o: o.item() if hasattr(o, 'item') else str(o))
     print(json.dumps(summ, default=lambda o: o.item() if hasattr(o, 'item') else str(o)))

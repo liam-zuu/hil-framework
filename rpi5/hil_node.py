@@ -299,10 +299,14 @@ class HILNode:
         import numpy as np
         n = self._step
         # Run manifest (S06 tools, Codex Sol round 3 S57/S64): what the Pi itself ran, saved with the frames
-        # so the scoring tools can tell a cut or partial log and which IMU source fed the MOSI
+        # so the scoring tools can tell a cut or partial log and which IMU source fed the MOSI.
+        # imu_source: the source _imu_sample really uses, in its order of priority (S73, Codex Sol round 4)
+        imu_source = ('static' if self.cfg.imu_static is not None else
+                      self.cfg.imu_profile if self.cfg.imu_profile == 't4' else
+                      'plant' if self._mecanum else 'none')
         manifest = dict(step_first=0, step_last=n - 1, steps=n, period_us=self.cfg.period_us,
                         max_steps=self.cfg.max_steps, stop_reason=self._stop_reason,
-                        imu_profile=self.cfg.imu_profile, imu_static=self.cfg.imu_static)
+                        imu_source=imu_source, imu_profile=self.cfg.imu_profile, imu_static=self.cfg.imu_static)
         np.savez(self.cfg.frame_log, manifest=np.array(json.dumps(manifest)),
                  **{k: v[:n] for k, v in self._flog.items()})
         log.info('Frame log: %d frames -> %s', n, self.cfg.frame_log)
