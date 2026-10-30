@@ -42,6 +42,7 @@ from mecanum_plant import MecanumPlant
 from imu_model import imu_from_plant
 import t4_imu_profile
 from params import PARAMS
+from s06_load_schedule import HeavyBlock
 
 log = logging.getLogger('hil.node')
 
@@ -89,6 +90,10 @@ class HILConfig:
     # memory when max_steps is 0 (88 bytes per frame).
     frame_log:         str   = ''
     frame_log_max:     int   = 1_200_000   # 20 min at 1 kHz
+    # S06 Z8: (first step, end step) of the heavy block of s06_load_schedule.py, None = no block;
+    # load_schedule = 'path sha256' of the schedule file, kept in the run manifest
+    heavy_block:       Optional[tuple] = None
+    load_schedule:     str   = ''
     jitter_warn_us:    float = 500.0       # warn if jitter exceeds this
     stats_interval:    int   = 10_000      # print stats every N steps
 
@@ -154,6 +159,7 @@ class HILNode:
         # MecanumPlant keeps its own state order; MockPlant (--fixed-omega)
         # already uses the frame order
         self._mecanum   = isinstance(plant, MecanumPlant)
+        self._heavy     = HeavyBlock(*self.cfg.heavy_block) if self.cfg.heavy_block else None
         self._t_start:  Optional[float] = None
         self._stop_reason = 'max_steps'
         self._flog = None
@@ -254,6 +260,8 @@ class HILNode:
         state  = self.plant.get_state()
         imu, imu_seq = self._imu_sample(state)
         frame_state = plant_to_frame_state(state) if self._mecanum else state
+        if self._heavy is not None:
+            self._heavy.apply(self._step, frame_state)   # S06 Z8: omega to the H7 only, the plant goes on
         mosi   = encode_state(frame_state, traj_ref=self._ref, traj_flags=traj_flags,
                               seq=self._step, imu=imu, imu_seq=imu_seq)
         t_send = time.monotonic_ns()
@@ -325,7 +333,8 @@ class HILNode:
         manifest = dict(step_first=0, step_last=n - 1, steps=n, period_us=self.cfg.period_us,
                         max_steps=self.cfg.max_steps, stop_reason=self._stop_reason,
                         imu_source=imu_source, imu_profile=self.cfg.imu_profile, imu_static=self.cfg.imu_static,
-                        rt=self._rt, uname=' '.join(platform.uname()))     # X8: the kernel the run ran on
+                        plant=type(self.plant).__name__, heavy_block=self.cfg.heavy_block,
+                        load_schedule=self.cfg.load_schedule, rt=self._rt, uname=' '.join(platform.uname()))     # X8: the kernel the run ran on
         np.savez(self.cfg.frame_log, manifest=np.array(json.dumps(manifest)),
                  **{k: v[:n] for k, v in self._flog.items()})
         log.info('Frame log: %d frames -> %s', n, self.cfg.frame_log)

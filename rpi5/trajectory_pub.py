@@ -81,6 +81,7 @@ class TrajectorySpec:
     period:   float = 8.0      # figure-8 full period [s]
     duration: float = 0.0      # 0 = run forever
     loop:     bool  = False    # S06 V7: at duration, start the trajectory again
+    sequence: tuple = ()       # kind 'load' (S06 V7): ((t_start_s, t_end_s, TrajectorySpec), ...)
 
 
 # ── Reference trajectory functions ───────────────────────────────────────
@@ -159,6 +160,11 @@ def get_body_velocity(t: float, spec: TrajectorySpec) -> Tuple[float, float, flo
     wz = path curvature × path speed.  Time scaling matches get_reference(),
     so integrating these setpoints follows the same (x, y) path.
     """
+    if spec.kind == 'load':
+        for t0, t1, sub in spec.sequence:
+            if t0 <= t < t1:
+                return get_body_velocity(t - t0, sub)
+        return 0.0, 0.0, 0.0
     if spec.kind == 'line':
         return spec.v, 0.0, 0.0
     if spec.kind == 'strafe':
