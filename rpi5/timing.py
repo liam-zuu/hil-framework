@@ -40,6 +40,8 @@ from typing import Optional
 # ── Linux scheduling constants ────────────────────────────────────────────
 _SCHED_FIFO  = 1
 _SCHED_OTHER = 0
+_MCL_CURRENT = 1
+_MCL_FUTURE  = 2
 
 class _sched_param(ctypes.Structure):
     _fields_ = [('sched_priority', ctypes.c_int)]
@@ -88,6 +90,26 @@ def set_realtime(priority: int = 90) -> bool:
         return False
 
     print(f"[timing] SCHED_FIFO priority={priority} OK", flush=True)
+    return True
+
+
+def lock_memory() -> bool:
+    """
+    mlockall(MCL_CURRENT | MCL_FUTURE): keep the pages of this process in RAM, so
+    the 1 kHz loop takes no page fault to swap or file-backed memory.
+
+    Requires root or CAP_IPC_LOCK.
+
+    Returns:
+        True on success; False without privileges or on a non-Linux host.
+    """
+    if not _HAS_LIBC:
+        print("[timing] libc unavailable — mlockall skipped", flush=True)
+        return False
+    if _libc.mlockall(_MCL_CURRENT | _MCL_FUTURE) != 0:
+        print(f"[timing] mlockall FAILED (errno={ctypes.get_errno()}). Run as root.", flush=True)
+        return False
+    print("[timing] mlockall OK", flush=True)
     return True
 
 

@@ -24,6 +24,7 @@ CPU allocation:
 """
 from __future__ import annotations
 
+import gc
 import logging
 import multiprocessing as mp
 import os
@@ -32,7 +33,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-from timing import PrecisionTimer, set_realtime, pin_cpu
+from timing import PrecisionTimer, set_realtime, pin_cpu, lock_memory
 from gpio_sync import GPIOSync
 from spi_master import SPIMaster
 from protocol import encode_state, decode_torques, TRAJ_VALID, TRAJ_NEW
@@ -78,6 +79,9 @@ class HILConfig:
     imu_static:        Optional[tuple] = None
     # S06 T4 (4): 't4' = locked IMU sequence of t4_imu_profile.py by frame time
     imu_profile:       Optional[str]   = None
+    # Timing of the 1 kHz loop: lock memory, stop the cyclic GC and touch the
+    # frame log before the loop. False = the run without them, to compare
+    rt_tune:           bool  = True
     # Monitoring
     # S06 (29/10): raw MOSI + MISO of every frame and the send time, kept in
     # preallocated arrays inside the loop (one index write per step) and
@@ -166,6 +170,10 @@ class HILNode:
                 'miso':        np.zeros((n, 40), dtype=np.uint8),
             }
             self._flog_n = n
+            # np.zeros maps pages lazily: without this, a page fault every ~100 frames inside the loop
+            if self.cfg.rt_tune:
+                for a in self._flog.values():
+                    a.fill(0)
 
     # ── Main loop ─────────────────────────────────────────────────────────
 
@@ -176,8 +184,14 @@ class HILNode:
         Sets SCHED_FIFO and pins to cpu_core before entering the loop.
         Installs SIGTERM / SIGINT for clean shutdown.
         """
-        set_realtime(priority=self.cfg.rt_priority)
-        pin_cpu(core=self.cfg.cpu_core)
+        self._rt = dict(sched_fifo=set_realtime(priority=self.cfg.rt_priority),
+                        cpu_pinned=pin_cpu(core=self.cfg.cpu_core),
+                        mem_locked=self.cfg.rt_tune and lock_memory(), gc_off=self.cfg.rt_tune)
+        if self.cfg.rt_tune:
+            # no GC pass inside the loop; freeze keeps what is alive now out of any later one
+            gc.collect()
+            gc.freeze()
+            gc.disable()
 
         signal.signal(signal.SIGTERM, self._on_signal)
         signal.signal(signal.SIGINT,  self._on_signal)
@@ -206,6 +220,9 @@ class HILNode:
                 self._tick(jitter_ns)
         finally:
             self._shutdown()
+            if self.cfg.rt_tune:
+                gc.enable()
+                gc.unfreeze()
 
     # ── Single tick ───────────────────────────────────────────────────────
 
@@ -306,7 +323,8 @@ class HILNode:
                       'plant' if self._mecanum else 'none')
         manifest = dict(step_first=0, step_last=n - 1, steps=n, period_us=self.cfg.period_us,
                         max_steps=self.cfg.max_steps, stop_reason=self._stop_reason,
-                        imu_source=imu_source, imu_profile=self.cfg.imu_profile, imu_static=self.cfg.imu_static)
+                        imu_source=imu_source, imu_profile=self.cfg.imu_profile, imu_static=self.cfg.imu_static,
+                        rt=self._rt)
         np.savez(self.cfg.frame_log, manifest=np.array(json.dumps(manifest)),
                  **{k: v[:n] for k, v in self._flog.items()})
         log.info('Frame log: %d frames -> %s', n, self.cfg.frame_log)

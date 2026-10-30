@@ -263,6 +263,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument('--frame-log',     default='', metavar='NPZ',
                    help='S06: save raw MOSI + MISO of every frame and its send time '
                         '(time.monotonic_ns) to this .npz after the run')
+    p.add_argument('--no-rt-tune',    action='store_true',
+                   help='Without mlockall, GC off and touching the frame log, to compare timing '
+                        '(the frame log manifest says which run was which)')
     return p.parse_args()
 
 
@@ -311,6 +314,7 @@ def main() -> int:
         imu_static   = parse_imu_static(args.imu_static) if args.imu_static else None,
         imu_profile  = args.imu_profile,
         frame_log    = args.frame_log,
+        rt_tune      = not args.no_rt_tune,
     )
     traj_spec = TrajectorySpec(
         kind     = args.traj,

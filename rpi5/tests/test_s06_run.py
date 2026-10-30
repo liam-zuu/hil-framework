@@ -1,12 +1,17 @@
 """S06 on the RPi5 side (29/10): frame log of raw MOSI/MISO with send times,
 #run_start / #run_end lines, T3b schedule played through the real HIL loop
 (simulate_hw=True, no hardware), trajectory publisher loop mode."""
+import gc
 import json
 import logging
+import time
+import types
 
 import numpy as np
 import pytest
 
+import gpio_sync
+import hil_node as hn
 from hil_node import HILConfig, HILNode
 from protocol import decode_state, encode_state
 from trajectory_pub import TrajectorySpec
@@ -53,6 +58,69 @@ def test_frame_log_and_run_lines(tmp_path, caplog):
     assert (m['step_first'], m['step_last'], m['steps']) == (0, steps - 1, steps)
     assert m['period_us'] == 1_000 and m['stop_reason'] == 'max_steps' and m['imu_profile'] is None
     assert m['imu_source'] == 'none'                  # S73: the source really used, not the one requested
+    assert m['rt']['gc_off'] is True and set(m['rt']) == {'sched_fifo', 'cpu_pinned', 'mem_locked', 'gc_off'}
+
+
+def _run_noting_gc(tmp_path, monkeypatch, **cfg):
+    seen = {}
+    plant = t3.ScheduleOmegaPlant(t3.make_schedule(seed=3))
+    node = HILNode(plant, config=HILConfig(simulate_hw=True, max_steps=20, period_us=1_000,
+                                           frame_log=str(tmp_path / 'f.npz'), **cfg))
+    tick = node._tick
+
+    def noted(jitter_ns):
+        seen['gc_on'], seen['frozen'] = gc.isenabled(), gc.get_freeze_count()
+        tick(jitter_ns)
+    monkeypatch.setattr(node, '_tick', noted)
+    calls = []
+    monkeypatch.setattr(hn, 'lock_memory', lambda: calls.append(1) or True)
+    freeze = gc.freeze
+    monkeypatch.setattr(gc, 'freeze', lambda: (seen.update(froze=True), freeze())[1])
+    node.run()
+    return seen, calls, json.loads(str(np.load(tmp_path / 'f.npz')['manifest']))
+
+
+def test_rt_tune_around_the_loop(tmp_path, monkeypatch):
+    # nhóm A: memory locked and no GC pass inside the loop, the GC back after it
+    assert gc.isenabled()
+    seen, calls, m = _run_noting_gc(tmp_path, monkeypatch)
+    assert calls == [1] and not seen['gc_on'] and seen.get('froze') and seen['frozen'] > 0
+    assert m['rt']['mem_locked'] is True and m['rt']['gc_off'] is True
+    assert gc.isenabled() and gc.get_freeze_count() == 0
+
+
+def test_rt_tune_off_for_comparison(tmp_path, monkeypatch):
+    seen, calls, m = _run_noting_gc(tmp_path, monkeypatch, rt_tune=False)
+    assert calls == [] and seen['gc_on'] and not seen.get('froze')
+    assert m['rt']['mem_locked'] is False and m['rt']['gc_off'] is False
+
+
+def test_frame_log_pages_touched_before_the_loop(monkeypatch):
+    # np.zeros maps pages lazily; fill(0) writes them
+    filled = []
+    zeros = np.zeros
+
+    class Arr(np.ndarray):
+        def fill(self, v):
+            filled.append(self.shape)
+            super().fill(v)
+    monkeypatch.setattr(np, 'zeros', lambda *a, **k: zeros(*a, **k).view(Arr))
+    plant = t3.ScheduleOmegaPlant(t3.make_schedule(seed=3))
+    HILNode(plant, config=HILConfig(simulate_hw=True, max_steps=10, period_us=1_000, frame_log='x.npz'))
+    assert sorted(filled) == [(10,), (10,), (10,), (10, 40), (10, 40)]
+
+
+def test_sync_pulse_busy_waits(monkeypatch):
+    # nhóm A: no time.sleep in the 1 kHz loop; the pin stays high for the whole pulse width
+    writes = []
+    fake = types.SimpleNamespace(gpio_write=lambda h, pin, v: writes.append((v, time.monotonic_ns())))
+    monkeypatch.setattr(gpio_sync, '_lgpio', fake)
+    monkeypatch.setattr(gpio_sync.time, 'sleep', lambda s: pytest.fail('time.sleep in the pulse'))
+    g = gpio_sync.GPIOSync(simulate=True)
+    g.simulate, g._handle = False, 1
+    g.pulse()
+    g._handle, g.simulate = None, True
+    assert [v for v, _ in writes] == [1, 0] and writes[1][1] - writes[0][1] >= gpio_sync._PULSE_WIDTH_US * 1_000
 
 
 def test_frame_log_cap_stops_the_run(tmp_path, caplog):
