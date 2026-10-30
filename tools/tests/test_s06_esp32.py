@@ -469,8 +469,29 @@ def test_s71_lines_must_have_the_format_of_the_marks(tmp_path):
     d = _with_run_ids(make_run(tmp_path, name="other"))
     _set_in_events(d, ",run=1,", ",")
     res, _, _ = chk.check_run(d)
-    assert res["status"] == "insufficient" and not items(res)["line_format"]["ok"]
+    assert res["status"] == "fail" and not items(res)["line_format"]["ok"]
     assert items(chk.check_run(_with_run_ids(make_run(tmp_path, name="same")))[0])["line_format"]["ok"]
+
+
+def test_s79_only_p_without_the_run_id_fails_on_that_item(tmp_path):
+    d = _with_run_ids(make_run(tmp_path))
+    p = os.path.join(d, "esp32_events.txt")
+    out = []
+    for raw in open(p, encoding="utf-8").read().splitlines():
+        out.append(raw[:raw.rfind(",")] if "\tP," in raw else raw)
+    open(p, "w", encoding="utf-8").write("\n".join(out) + "\n")
+    res, _, _ = chk.check_run(d)
+    assert res["status"] == "fail"
+    assert [i["item"] for i in res["items"] if not i["ok"]] == ["line_format"]
+
+
+def test_s78_send_errors_stay_a_failure_when_no_run_can_be_chosen(tmp_path):
+    d = _with_run_ids(make_run(tmp_path, run_stats=3))
+    with open(os.path.join(d, "esp32_events.txt"), "a", encoding="utf-8") as f:
+        f.write("99000000\t#run_start,run=2,first_data_seq=9,timestamp_us=99000000,profile=heavy,duration_s=3,"
+                "auto_end=1,qseq=999999\n")
+    res, _, _ = chk.check_run(d)
+    assert res["status"] == "fail" and "log_send_err_run=3" in items(res)["loss_counters_of_run_end"]["value"]
 
 
 def test_s7_reset_near_run_start_not_valid(tmp_path):

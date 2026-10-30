@@ -40,6 +40,10 @@ Sửa theo Codex Sol vòng 4 (Liam 30/10, phiên CODE `local_303aeaba…`):
   * S71: định dạng cả lượt phải nhất quán: mốc có `run=` thì dòng E/P phải có số lượt, mốc không có thì không
     (mục "line_format"); dòng E không có số lượt không được chọn theo thời gian khi mốc có `run=`.
 
+Sửa theo Codex Sol vòng 5 (Liam 30/10 "Duyệt, sửa bốn mục"):
+  * S78: `known_losses` thêm `log_send_err_run` của #run_stats.
+  * S79: dòng khác định dạng mốc lượt là dữ liệu hỏng ("fail"), không phải thiếu bằng chứng; khớp T6.
+
 Usage:
     python tools/s06_esp32_check.py <thư mục lượt> [<thư mục lượt> ...] [--out <thư mục kết quả>]
 Mã thoát (một lượt): 0 đạt; 1 có mục không đạt; 2 thiếu #run_start/#run_end; 3 lượt không hợp lệ
@@ -195,12 +199,12 @@ def first_text(ev, name, run=None):
 
 
 def known_losses(ev):
-    """S72: bộ đếm mất dữ liệu > 0 ở mọi #run_end của file, kể cả khi không chọn được một lượt để chấm."""
+    """S72, S78: bộ đếm mất dữ liệu > 0 ở mọi #run_end, #run_stats của file, kể cả khi không chọn được một lượt
+    để chấm."""
     out = []
+    keys = {"run_end": ("enc_ovf_run", "ev_qdrop_run", "log_qdrop_run"), "run_stats": ("log_send_err_run",)}
     for t in ev["text"]:
-        if t["name"] != "run_end":
-            continue
-        for k in ("enc_ovf_run", "ev_qdrop_run", "log_qdrop_run"):
+        for k in keys.get(t["name"], ()):
             v = t["kv"].get(k, "0")
             if v.lstrip("-").isdigit() and int(v) > 0:
                 out.append(f"run={t['kv'].get('run', '?')} {k}={v}")
@@ -324,7 +328,7 @@ def check_run(run_dir):
     # S71: the format of the lines must be that of the marks; the old fallback is only for a run all old
     mixed = sum(1 for x in ev["E"] + ev["P"] if (x["run_id"] is None) == (run_id is not None))
     item("line_format", f"{mixed} dòng E/P khác định dạng mốc lượt", "0: mốc có run= thì E/P có số lượt, và ngược lại (S71)",
-         mixed == 0, "evidence")
+         mixed == 0)
     enc = dict(stream="esp32_enc", expected=None, received=len({e["eseq"] for e in E}), gaps=None,
                dups=len(E) - len({e["eseq"] for e in E}), overflow=int(re_["kv"].get("enc_ovf_run", -1)))
     if E:
