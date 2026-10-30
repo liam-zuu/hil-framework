@@ -286,6 +286,25 @@ def test_c3_6_log_stream_of_the_run(clean):
     assert run(build(faults={'log_gap': {100}}), full=False, skip_s=0.0)['stream']['log_gaps'] == 1
 
 
+def _rec(idx, j, dropped=None):
+    return dict(idx=idx, carrier_j=j, type=t1.dec.REC_TICK if dropped is not None else 0x10, cyc_full=1,
+                f=dict(dropped=dropped))
+
+
+def test_c3_6_run_stream_edges_and_ticks():
+    # j 100..200 is the run. Drops before it are not this run's
+    recs = [_rec(1, 10, 0), _rec(2, 20, 5), _rec(3, 100, 5), _rec(4, 150), _rec(5, 200, 5), _rec(6, 210, 9)]
+    assert t1.dec.run_stream(recs, 100, 200) == dict(gaps=0, ticks=2, h7_dropped=0)
+    # a hole far before the run is not counted; a hole right at either edge cannot be put outside the run
+    assert t1.dec.run_stream([_rec(1, 10), _rec(5, 20), _rec(6, 100), _rec(7, 150)], 100, 200)['gaps'] == 0
+    assert t1.dec.run_stream([_rec(1, 90), _rec(4, 100), _rec(5, 150)], 100, 200)['gaps'] == 2
+    assert t1.dec.run_stream([_rec(1, 100), _rec(2, 150), _rec(6, 210)], 100, 200)['gaps'] == 3
+    # 16-bit counter of the H7, fewer than two TICK, no record in the run
+    assert t1.dec.run_stream([_rec(1, 100, 65535), _rec(2, 150, 2)], 100, 200)['h7_dropped'] == 3
+    assert t1.dec.run_stream([_rec(1, 100, 4)], 100, 200) == dict(gaps=0, ticks=1, h7_dropped=None)
+    assert t1.dec.run_stream([_rec(1, 10, 4)], 100, 200) == dict(gaps=0, ticks=0, h7_dropped=None)
+
+
 def test_c3_2_decoder_counts_empty_miso_of_the_run(clean):
     # CB5 has no T1: the decoder itself must not pass a frame the H7 did not answer
     t, mosi, miso = clean[:3]
