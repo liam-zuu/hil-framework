@@ -41,15 +41,22 @@ Diễn giải của CODE (spec chưa ghi, cần THESIS xác nhận khi khóa):
   (1) f_lệnh theo ω_d (ω đã lượng tử trong frame), không theo ω danh định; cột omega_cmd giữ ω danh định;
   (2) cửa sổ neo vào đầu lần ghé theo offset căn, chứ không neo vào lưới cố định của cả lượt;
   (3) luật đạt/không đạt/chưa kết luận theo mục 4 như T3b; `missing` tính như chưa kết luận;
-  (4) mất dòng E giữa hai đầu cửa sổ không ảnh hưởng số đo (count tích lũy); kiểm đủ log (§4.3)
-      thuộc tools/s06_esp32_check.py, ở đây chỉ báo số chỗ hở eseq.
+  ~~(4) mất dòng E chỉ báo~~ [ĐÃ THAY theo Codex Sol vòng 1/2, Liam duyệt 30/10 "Duyệt, sửa hết"]:
+  * S4 (Z19): hở/trùng `eseq` hoặc tràn ở #run_end (enc_ovf_run, ev_qdrop_run) trong khoảng lịch → mã 1;
+    thiếu #run_end → không biết, mã 3 (tools/s06_stream.py).
+  * S17: count int32 mở vòng 32 bit trước khi lấy hiệu.
+  * S18: lịch phải đúng lịch khóa `t5_schedule.make_schedule(run_pass)`, khác → mã 3.
+  * S19: không có `--xtal-ppm` (E6 chưa có nguồn) → kết luận tối đa mã 3.
+  * S20: điều kiện thời gian lấy theo H7 (`--h7-serial`: HAL ms của "SPI link up" đầu), uptime ESP32
+    chỉ báo; không có log hoặc `--no-uptime-check` → "chưa xác minh", mã 3.
 
 Usage:
   python tools/s06_t5_score.py --schedule T5_pass1.csv --esp32-events esp32_events.txt --out <thư mục>
-         [--offset-us <µs>] [--count-sign 1,1,1,1] [--xtal-ppm <ppm>] [--pi-temp pi_temp.txt]
-         [--no-uptime-check]
-Mã thoát: 0 mọi cửa sổ chấm đạt; 1 có cửa sổ không đạt; 3 không có không đạt nhưng có chưa kết luận,
-thiếu, hoặc lượt không đúng điều kiện thời gian; 2 lỗi đầu vào.
+         --xtal-ppm <ppm> --h7-serial h7_serial.log [--offset-us <µs>] [--count-sign 1,1,1,1]
+         [--pi-temp pi_temp.txt] [--no-uptime-check]
+Mã thoát: 0 mọi cửa sổ chấm đạt và đủ bằng chứng; 1 có cửa sổ không đạt hoặc mất dữ liệu (Z19); 3 không có
+không đạt nhưng có chưa kết luận, thiếu, lịch khác lịch khóa, thiếu --xtal-ppm/#run_end, hoặc điều kiện
+thời gian không đạt/chưa xác minh; 2 lỗi đầu vào.
 """
 from __future__ import annotations
 
@@ -63,7 +70,9 @@ from typing import Dict, List, Optional, Sequence
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, '..', 'rpi5'))
+sys.path[:0] = [HERE, os.path.join(HERE, '..', 'rpi5')]
+import s06_h7_serial as ser  # noqa: E402
+import s06_stream as stm  # noqa: E402
 import t3b_schedule as ts  # noqa: E402
 import t5_schedule as t5  # noqa: E402
 
@@ -93,7 +102,8 @@ class Reads:
     def __init__(self, t_before, t_after, counts, count_sign=(1, 1, 1, 1), eseq=None):
         self.tb = np.asarray(t_before, dtype=float)
         self.ta = np.asarray(t_after, dtype=float)
-        self.c = np.asarray(counts, dtype=np.int64) * np.asarray(count_sign, dtype=np.int64)
+        # S17: int32 cumulative counts unwrapped before any difference
+        self.c = stm.unwrap_i32(counts) * np.asarray(count_sign, dtype=np.int64)
         if len(self.tb) < 2 or np.any(np.diff(self.tb) < 0):
             raise ValueError('cần >= 2 lần đọc, t_before tăng dần')
         self.tm = 0.5 * (self.tb + self.ta)
@@ -171,6 +181,25 @@ def pi_to_esp(fit: dict, t_pi_us):
 
 def uptime_condition(run_pass: int, offset_us: float) -> bool:
     return bool(offset_us <= UPTIME_PASS1_MAX_US if run_pass == 1 else offset_us >= UPTIME_PASS2_MIN_US)
+
+
+def h7_uptime_us(serial_events) -> Optional[float]:
+    """S20: H7 time since boot at the start of the run = HAL ms of the first 'SPI link up at t=<ms> ms'
+    of the H7 serial log of the run (the Pi run starts the link). None without that line."""
+    ups = [e for e in serial_events if e['kind'] == 'link_up']
+    return float(ups[0]['t_ms']) * 1000.0 if ups else None
+
+
+def schedule_matches_locked(sched: Sequence[t5.Visit]) -> List[str]:
+    """S18: the schedule file must be the locked one of rpi5/t5_schedule.make_schedule (all points, both
+    directions, W15 visits, durations); a continuous but cut or edited file is not the acceptance run."""
+    run_pass = sched[0].run_pass
+    ref = t5.make_schedule(run_pass)
+    key = lambda v: (v.kind, tuple(round(w, 9) for w in v.omegas), v.t_start_ms, v.t_end_ms)  # noqa: E731
+    if [key(v) for v in sched] == [key(v) for v in ref]:
+        return []
+    return [f'lịch khác lịch khóa make_schedule({run_pass}) ({len(sched)} lần ghé so với {len(ref)}): '
+            f'thiếu điểm, chiều hoặc thời lượng']
 
 
 def window_mean(series, a: float, b: float):
@@ -338,14 +367,20 @@ def main(argv=None) -> int:
     ap.add_argument('--xtal-ppm', type=float, default=None,
                     help='sai số thạch anh ESP32, ppm (chưa có nguồn, E6); bỏ trống = không cộng')
     ap.add_argument('--pi-temp', default=None, help='pi_temp.txt của s06_logger.py (nhiệt độ CPU RPi5)')
+    ap.add_argument('--h7-serial', default=None,
+                    help='log serial H7 của lượt (h7_serial_capture.py): thời gian H7 đã chạy (S20)')
     ap.add_argument('--no-uptime-check', action='store_true',
-                    help='bỏ kiểm thời gian từ lúc bật (ESP32 không cấp nguồn cùng H7, hoặc bị reset)')
+                    help='bỏ kiểm thời gian từ lúc bật: điều kiện thành "chưa xác minh", kết luận tối đa mã 3')
     ap.add_argument('--out', required=True)
     a = ap.parse_args(argv)
     try:
+        if a.xtal_ppm is not None and not (np.isfinite(a.xtal_ppm) and a.xtal_ppm >= 0):
+            raise ValueError(f'--xtal-ppm phải hữu hạn, ≥ 0: {a.xtal_ppm}')
         sched = t5.read_csv(a.schedule)
         t5.segments(sched)                      # kiểm lịch liền nhau
         reads, rx, s_temp = load_esp32_events(a.esp32_events, [int(x) for x in a.count_sign.split(',')])
+        marks = stm.run_marks(a.esp32_events)
+        h7_up = h7_uptime_us(ser.read_log(a.h7_serial)) if a.h7_serial else None
         if a.offset_us is None:
             offset, corr = align_offset(reads, sched)
         else:
@@ -367,21 +402,31 @@ def main(argv=None) -> int:
     write_csv(os.path.join(a.out, 'T5_points.csv'), pts, list(pts[0]) if pts else ['visit'])
     summ = summarize(rows)
     run_pass = sched[0].run_pass
-    cond = None if a.no_uptime_check else uptime_condition(run_pass, offset)
+    # S20: the time condition is about the H7 clock: H7 uptime from its serial log; ESP32 uptime only reported
+    cond = None if (a.no_uptime_check or h7_up is None) else uptime_condition(run_pass, h7_up)
+    # S4 / Z19: lost encoder reads or an ESP32 overflow in the scored span is a failure
+    span_end = offset + sched[-1].t_end_ms * 1000.0
+    stream = stm.enc_stream(reads.eseq, reads.tb, offset, span_end, marks)
+    sched_bad = schedule_matches_locked(sched)
     code = exit_code(rows)
-    if code == 0 and cond is False:
-        code = 3
+    if not stream['ok']:
+        code = 1
+    if code == 0 and (cond is not True or not stream['known'] or sched_bad or a.xtal_ppm is None):
+        code = 3                                  # S18, S19, S20: evidence missing, not a pass
     offset = float(offset)
     summ.update(run_pass=run_pass, offset_us=offset, offset_source='manual' if corr is None else 'xcorr',
                 align_corr=corr, n_reads=len(reads.tb), eseq_gaps=reads.eseq_gaps(),
-                esp32_uptime_at_start_s=offset / 1e6, run_condition_ok=cond,
-                run_condition_rule='lần 1: ≤ 120 s; lần 2: ≥ 1800 s (uptime ESP32 lúc lịch bắt đầu)',
+                stream=stream, stream_notes=stm.stream_notes(stream), schedule_problems=sched_bad,
+                esp32_uptime_at_start_s=offset / 1e6,
+                h7_uptime_at_link_up_s=None if h7_up is None else h7_up / 1e6, run_condition_ok=cond,
+                run_condition_rule='lần 1: ≤ 120 s; lần 2: ≥ 1800 s (thời gian H7 đã chạy lúc link SPI lên, '
+                                   'log serial H7); không có log hoặc --no-uptime-check = chưa xác minh',
                 clock_vs_pi=fit,
                 clock_note='ppm = nhịp đồng hồ Pi (monotonic) so với ESP32; chỉ là sai số thạch anh ESP32 '
                            'khi Pi được NTP giữ nhịp; không cộng vào bất định',
                 temp_esp32=s_temp is not None, temp_pi=temps.get('pi') is not None,
                 xtal_ppm=a.xtal_ppm, xtal_note=None if a.xtal_ppm is not None else
-                'sai số thạch anh ESP32 chưa có nguồn (E6), không cộng vào bất định',
+                'sai số thạch anh ESP32 chưa có nguồn (E6): không có --xtal-ppm thì kết luận tối đa mã 3 (S19)',
                 count_sign=a.count_sign, exit_code=code)
     with open(os.path.join(a.out, 'T5_summary.json'), 'w', encoding='utf-8') as f:
         json.dump(summ, f, ensure_ascii=False, indent=2)

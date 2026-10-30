@@ -34,8 +34,16 @@ Diễn giải của CODE (spec chưa định nghĩa chi tiết, cần THESIS xá
 CLI (lượt thật; đồng bộ ESP32 → RPi5 chưa có chân đánh dấu nên phải nhập tay, ghi vào kết quả):
   python tools/t3b_score.py --schedule T3b_schedule.csv --frames frames.npz [--h7-calls] \
       --esp32-events esp32_events.txt --clock-affine <offset_us> <rate> --delta-sync-us <µs> --out <thư mục>
-Mã thoát: 0 mọi cửa sổ đạt; 1 có cửa sổ không đạt; 3 không có không đạt nhưng có chưa kết luận
-hoặc u_t vượt yêu cầu công cụ; 2 lỗi đầu vào.
+Sửa theo Codex Sol vòng 1/2 (Liam duyệt 30/10 "Duyệt, sửa hết"):
+  * S4 (Z19): hở `eseq`/tràn ở #run_end trong khoảng chấm → không đạt (tools/s06_stream.py).
+  * S15: `--h7-calls` bắt buộc ở chế độ nghiệm thu; hở số lần gọi hoặc luồng log H7 → không đạt; giờ H7
+    chưa hiệu chuẩn (mốc xung + d_1w) → kết luận tối đa mã 3.
+  * S16: trễ lịch → frame dò từ chính MOSI (run_hil --omega-schedule: 1 frame), cửa sổ neo theo đó.
+  * S17: count int32 mở vòng 32 bit.
+  * S18: không có cửa sổ nào → mã 3; lịch phải là lịch khóa `make_schedule(--locked-seed)` (seed 1).
+Mã thoát: 0 mọi cửa sổ đạt và đủ bằng chứng; 1 có cửa sổ không đạt hoặc mất dữ liệu; 3 không có không đạt
+nhưng có chưa kết luận, u_t vượt yêu cầu công cụ, hoặc thiếu bằng chứng (lần gọi H7, giờ H7 hiệu chuẩn,
+#run_end, lịch khóa); 2 lỗi đầu vào (kể cả MOSI không theo lịch).
 """
 from __future__ import annotations
 
@@ -50,11 +58,14 @@ from typing import Dict, List, Optional, Sequence
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, '..', 'rpi5'))
+sys.path[:0] = [HERE, os.path.join(HERE, '..', 'rpi5')]
+import s06_stream as stm  # noqa: E402
 import t3b_schedule as ts  # noqa: E402
 
 K = ts.K_COUNT
 EVENT_EXCL_US = 1000.0        # (a): loại khoảng giao [sự kiện; + 1 ms]
+LOCKED_SEED = 1               # spec Phần D (đề xuất điền giá trị khóa, Liam "Theo khuyến nghị"): lịch T3b seed 1
+LAG_MATCH_MIN = 0.999         # S16: the frames must follow the schedule at the lag found
 
 COLUMNS = ['id', 'wheel', 'transition', 'rep', 'omega_from', 'omega_to',
            't_read_before_us', 't_read_after_us', 't_read_before_end_us', 't_read_after_end_us',
@@ -72,7 +83,7 @@ class Run:
     """One run on one reference clock (µs)."""
 
     def __init__(self, t_send_us, w_d, t_before_us, t_after_us, counts, calls=None,
-                 count_sign=(1, 1, 1, 1), delta_sync_us: float = 0.0):
+                 count_sign=(1, 1, 1, 1), delta_sync_us: float = 0.0, frame_lag: int = 0):
         self.t_send = np.asarray(t_send_us, dtype=float)
         self.w_d = np.asarray(w_d, dtype=float)
         if len(self.t_send) < 2 or np.any(np.diff(self.t_send) <= 0):
@@ -81,7 +92,11 @@ class Run:
         self.w_eff = np.where(np.abs(self.w_d) <= ts.DEADBAND, 0.0, self.w_d)
         self.tb = np.asarray(t_before_us, dtype=float)
         self.ta = np.asarray(t_after_us, dtype=float)
-        self.c = np.asarray(counts, dtype=np.int64) * np.asarray(count_sign, dtype=np.int64)
+        # S17: int32 cumulative counts unwrapped before any difference
+        self.c = (stm.unwrap_i32(counts) if len(counts) else np.zeros((0, 4), dtype=np.int64)) \
+            * np.asarray(count_sign, dtype=np.int64)
+        # S16: schedule entry k is in the MOSI of frame k + frame_lag (main() finds it with schedule_lag)
+        self.frame_lag = int(frame_lag)
         if len(self.tb) and np.any(np.diff(self.tb) <= 0):
             raise ValueError('reads must be in strictly increasing t_before order')
         self.calls = calls          # None = not logged; else wheel -> [(kind 'S'|'P', t_us, cnt)]
@@ -149,9 +164,9 @@ class Run:
 
     def score(self, r) -> dict:
         w = r.wheel
-        if r.win_end_ms >= len(self.t_send):
+        if r.win_end_ms + self.frame_lag >= len(self.t_send):
             raise ValueError(f'window {r.id} ends after the last frame')
-        Ts, Te = self.t_send[r.win_start_ms], self.t_send[r.win_end_ms]
+        Ts, Te = self.t_send[r.win_start_ms + self.frame_lag], self.t_send[r.win_end_ms + self.frame_lag]
         ia, ib = self.read_after(Ts), self.read_after(Te)
         if ia is None or ib is None:
             raise ValueError(f'window {r.id}: no read after its start or end')
@@ -236,9 +251,37 @@ def summarize(rows: Sequence[dict]) -> dict:
 def exit_code(rows: Sequence[dict]) -> int:
     if any(x['verdict'] == 'fail' for x in rows):
         return 1
-    if any(x['verdict'] == 'inconclusive' or not x['u_t_ok'] for x in rows):
-        return 3
+    if not rows or any(x['verdict'] == 'inconclusive' or not x['u_t_ok'] for x in rows):
+        return 3                                    # S18: no window scored is no pass
     return 0
+
+
+def schedule_lag(w_d, sched, max_lag: int = 3):
+    """S16: frame lag of the schedule in the frames actually sent: entry k of the ω table (quantized) is
+    in the MOSI of frame k + lag (run_hil --omega-schedule: lag 1, the frame carries the plant state
+    before the step). Returns (lag, fraction of frames equal) of the best lag."""
+    tab = np.array(ts.omega_table(sched), dtype=float).T          # [ms, wheel]
+    q = np.vectorize(ts.quantize)(tab)
+    w_d = np.asarray(w_d, dtype=float)
+    best = (0, -1.0)
+    for lag in range(max_lag + 1):
+        n = min(len(q), len(w_d) - lag)
+        if n <= 0:
+            continue
+        frac = float(np.mean(np.all(np.abs(w_d[lag:lag + n] - q[:n]) < 1e-9, axis=1)))
+        if frac > best[1]:
+            best = (lag, frac)
+    return best
+
+
+def schedule_matches_locked(sched, seed: int = LOCKED_SEED) -> List[str]:
+    """S18: the schedule must be the locked one (rpi5/t3b_schedule.make_schedule(seed), spec Phần D:
+    seed 1): every kind, wheel, repetition and the random start delays."""
+    ref = ts.make_schedule(seed)
+    key = lambda r: (r.wheel, r.kind, r.t0_ms, r.win_start_ms, r.win_end_ms)  # noqa: E731
+    if sorted(key(r) for r in sched) == sorted(key(r) for r in ref):
+        return []
+    return [f'lịch khác lịch khóa make_schedule({seed}) ({len(sched)} chuyển tiếp so với {len(ref)})']
 
 
 def write_rows(path: str, rows: Sequence[dict]) -> None:
@@ -260,7 +303,9 @@ def load_frames(path: str):
 
 
 def load_esp32_reads(path: str, offset_us: float, rate: float):
-    tb, ta, c = [], [], []
+    """Reads on the Pi clock (t_pi = offset + rate·t_esp) and, for the Z19 check, eseq + t_before on the
+    ESP32 clock."""
+    tb, ta, c, eseq, tb_esp = [], [], [], [], []
     with open(path, encoding='utf-8', errors='replace') as f:
         for raw in f:
             _, sep, line = raw.rstrip('\n').partition('\t')
@@ -272,8 +317,11 @@ def load_esp32_reads(path: str, offset_us: float, rate: float):
             tb.append(offset_us + rate * int(p[2]))
             ta.append(offset_us + rate * int(p[3]))
             c.append([int(x) for x in p[4:8]])
+            eseq.append(int(p[1]))
+            tb_esp.append(int(p[2]))
     order = np.argsort(tb, kind='stable')
-    return np.array(tb)[order], np.array(ta)[order], np.array(c)[order]
+    return (np.array(tb)[order], np.array(ta)[order], np.array(c)[order],
+            np.array(eseq)[order], np.array(tb_esp)[order])
 
 
 def main(argv=None) -> int:
@@ -288,26 +336,54 @@ def main(argv=None) -> int:
                     help='dấu count ESP32 theo bánh (ENC_PI 2026-10-27_run06: count cùng dấu ω cả 4 bánh)')
     ap.add_argument('--h7-calls', action='store_true',
                     help='lấy các lần gọi _start_wheel/_stop từ luồng log H7 trong frames.npz '
-                         '(bản ghi 0x35/0x36, cần H7 có EncoderGen với móc sự kiện)')
+                         '(bản ghi 0x35/0x36, cần H7 có EncoderGen với móc sự kiện); bắt buộc ở chế độ '
+                         'nghiệm thu (S15), không có thì kết luận tối đa mã 3')
+    ap.add_argument('--locked-seed', type=int, default=LOCKED_SEED, help='seed của lịch khóa (S18)')
     ap.add_argument('--out', required=True)
+    import s06_frames_decode as fd
+    fd.add_cal_args(ap)
     a = ap.parse_args(argv)
+    notes, fails = [], []
     try:
         sched = ts.read_csv(a.schedule)
         t_send, w_d = load_frames(a.frames)
-        tb, ta, c = load_esp32_reads(a.esp32_events, *a.clock_affine)
+        tb, ta, c, eseq, tb_esp = load_esp32_reads(a.esp32_events, *a.clock_affine)
+        lag, frac = schedule_lag(w_d, sched)
+        if frac < LAG_MATCH_MIN:
+            raise ValueError(f'frame MOSI không theo lịch (khớp tốt nhất {frac:.4f} ở trễ {lag} frame)')
         calls = None
         if a.h7_calls:
-            import s06_frames_decode as fd
             z = np.load(a.frames)
-            calls = fd.decode(z['t_send_ns'], z['mosi'], z['miso'])['_calls']
+            res = fd.decode(z['t_send_ns'], z['mosi'], z['miso'], cal=fd.load_cal(z, a))
+            calls = res['_calls']
             if any(t is None for v in calls.values() for _, t, *_ in v):
                 raise ValueError('có lần gọi H7 không quy được ra giờ Pi (thiếu khớp đồng hồ)')
+            # S15: the stream of the call records must be whole (Z19), and the H7 times calibrated (S10)
+            if res['enc_calls']['count_gaps']:
+                fails.append(f"số lần gọi _start_wheel/_stop hở {res['enc_calls']['count_gaps']} bản ghi (Z19)")
+            if res['log']['gaps'] or res['log'].get('h7_dropped'):
+                fails.append(f"luồng log H7 hở {res['log']['gaps']}, H7 bỏ {res['log'].get('h7_dropped')} (Z19)")
+            if not res['clock']['calibrated']:
+                notes.append('giờ H7 chưa hiệu chuẩn (thiếu mốc xung/d_1w): giờ lần gọi chỉ tương đối')
+        else:
+            notes.append('không dùng --h7-calls: không so số lần gọi với lịch (S15)')
         run = Run(t_send, w_d, tb, ta, c, calls=calls, count_sign=[int(x) for x in a.count_sign.split(',')],
-                  delta_sync_us=a.delta_sync_us)
+                  delta_sync_us=a.delta_sync_us, frame_lag=lag)
         rows = score_run(run, sched)
     except (OSError, ValueError, KeyError) as ex:
         print(f'lỗi đầu vào: {ex}', file=sys.stderr)
         return 2
+    # S4 (Z19): lost encoder reads inside the scored span, or an ESP32 overflow, is a failure
+    marks = stm.run_marks(a.esp32_events)
+    off, rate = a.clock_affine
+    w0 = min(r['window_start_us'] for r in rows) if rows else 0.0
+    w1 = max(r['window_end_us'] for r in rows) if rows else 0.0
+    stream = stm.enc_stream(eseq, tb_esp, (w0 - off) / rate - 1000.0, (w1 - off) / rate + 1000.0, marks)
+    notes += stm.stream_notes(stream)
+    if not stream['ok']:
+        fails.append('luồng đọc encoder ESP32 mất dữ liệu (Z19)')
+    sched_bad = schedule_matches_locked(sched, a.locked_seed)
+    notes += sched_bad
     os.makedirs(a.out, exist_ok=True)
     write_rows(os.path.join(a.out, 'T3b.csv'), rows)
     with open(os.path.join(a.out, 'T3b_score_args.txt'), 'w') as f:
@@ -315,9 +391,18 @@ def main(argv=None) -> int:
     for (kind, w), g in sorted(summarize(rows).items()):
         print(f'{kind:22s} bánh {w}: đạt {g["pass"]}, không đạt {g["fail"]}, chưa kết luận {g["inconclusive"]}, '
               f'u_t vượt {g["u_t_bad"]}')
-    if calls is None:
-        print('Không dùng --h7-calls: cột n_calls_actual, start_cnt để trống, không so số lần gọi với lịch.')
-    return exit_code(rows)
+    print(f'trễ lịch → frame: {lag} frame (khớp {frac:.4f})')
+    for x in fails:
+        print(f'KHÔNG ĐẠT: {x}')
+    for x in notes:
+        print(f'! {x}')
+    code = exit_code(rows)
+    if fails:
+        code = 1
+    elif code == 0 and (calls is None or sched_bad or not stream['known']
+                        or (calls is not None and any('chưa hiệu chuẩn' in x for x in notes))):
+        code = 3                                    # acceptance evidence missing: no pass
+    return code
 
 
 if __name__ == '__main__':

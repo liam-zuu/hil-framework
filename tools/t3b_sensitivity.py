@@ -21,10 +21,19 @@ Giả định của mô hình (ghi vào summary): trễ áp frame d ~ U[d_lo; d_
 lần chấm lại với δ_sync khác 0 (chỉ báo). Harness không mô hình: chân thả nổi khi dừng ở code cũ, độ trễ
 ngắt thật, timer chạy trong lúc `_retime` (giới hạn Z24).
 
+Sửa theo Codex Sol vòng 1/2 (S29; Liam duyệt 30/10 "Duyệt, sửa hết"):
+  (b) u_t ≤ ¼·(N_tol − phần cố định) của MỌI nhóm vào cổng (trước chỉ báo);
+  (c) "lệch lớn quan sát được" gắn nhãn từ sự thật TRƯỚC khi đọc kết quả chấm: e_truth = Δcount của
+      harness − Δcount của bộ phát lý tưởng ở cùng hai lần đọc, quan sát được khi |e_truth| > N_tol + u_t
+      (`T3b_<tag>_truth.csv`); mọi ca quan sát được của code cũ phải không đạt, 4 loại lệch lớn phải có ca
+      quan sát được (trước: chọn theo err_counts > 100 của chính bộ chấm);
+  (a) luật ≤ 10 % "chưa kết luận" cho (2) đối tượng đo: chữ spec chưa rõ, hỏi THESIS 30/10; chưa vào cổng,
+      vượt thì in dòng ghi chú.
+
 Usage:
   python tools/t3b_sensitivity.py --out <thư mục> [--seed 1] [--old-rev cb91e7a]
-Mã thoát: 0 khi (0) đạt mọi ca, (1) phát hiện đủ 4 loại lệch lớn, và mọi nhóm "chưa kết luận" ≤ 10 %;
-ngược lại 1. Kết quả (2) không ảnh hưởng mã thoát (đối tượng đo, báo riêng).
+Mã thoát: 0 khi cổng Z23 đạt (dòng cuối summary.txt); ngược lại 1. Kết quả (2) không ảnh hưởng mã thoát
+(đối tượng đo, báo riêng), trừ u_t.
 """
 from __future__ import annotations
 
@@ -159,6 +168,27 @@ def truth_rev(rows, run, rv):
         x['truth_rev'] = int(rv[ib, x['wheel']] - rv[ia, x['wheel']])
 
 
+def truth_big(rows, ideal_rows, ideal_run, run):
+    """S29 (c): label BEFORE looking at the verdicts which windows of a harness run deviate from the
+    declared (ideal) generator by more than the T3b tolerance, from the truth: e_truth = Δcount of the
+    harness − Δcount of the ideal generator at the same two read indices (same read grid). Label
+    obs_big = |e_truth| > N_tol + u_t of that window (the threshold of the spec rule, not the scorer's
+    integral estimate). None when the two runs do not share the read indices of that window."""
+    by_id = {x['id']: x for x in ideal_rows}
+    for x in rows:
+        y = by_id[x['id']]
+        ia = int(np.searchsorted(run.tb, x['t_read_before_us'], side='left'))
+        ib = int(np.searchsorted(run.tb, x['t_read_before_end_us'], side='left'))
+        ja = int(np.searchsorted(ideal_run.tb, y['t_read_before_us'], side='left'))
+        jb = int(np.searchsorted(ideal_run.tb, y['t_read_before_end_us'], side='left'))
+        if ia != ja or ib != jb:
+            x['e_truth'], x['obs_big'] = None, None
+            continue
+        w = x['wheel']
+        e = int((run.c[ib, w] - run.c[ia, w]) - (ideal_run.c[jb, w] - ideal_run.c[ja, w]))
+        x['e_truth'], x['obs_big'] = e, abs(e) > x['n_tol'] + x['uncertainty']
+
+
 def group_stats(rows):
     g = defaultdict(lambda: defaultdict(int))
     for x in rows:
@@ -170,8 +200,9 @@ def group_stats(rows):
             bad = x['truth_rev'] > 0
             s['truth_bad'] += bad
             s['truth_bad_detected'] += bad and x['verdict'] == 'fail'
-            s['big'] += abs(x['err_counts']) > 100
-            s['big_detected'] += abs(x['err_counts']) > 100 and x['verdict'] == 'fail'
+            big = bool(x.get('obs_big'))             # S29 (c): truth label, not the scorer's err_counts
+            s['big'] += big
+            s['big_detected'] += big and x['verdict'] == 'fail'
         s['max_abs_err'] = max(s['max_abs_err'], abs(x['err_counts']))
         s['max_err_over_ntol'] = max(s.get('max_err_over_ntol', 0.0), abs(x['err_counts']) / x['n_tol'])
     return g
@@ -232,10 +263,14 @@ def main(argv=None) -> int:
             truth_rev(rows, run, rv)
         results[tag] = rows
         sc.write_rows(os.path.join(a.out, f'T3b_{tag}.csv'), rows)
-        if rv is not None:
-            with open(os.path.join(a.out, f'T3b_{tag}_truth.csv'), 'w', newline='') as f:
-                f.write('id,truth_rev\n')
-                f.writelines(f"{x['id']},{x['truth_rev']}\n" for x in rows)
+    # S29 (c): truth labels of the harness runs against the ideal generator, written before the gate reads
+    # any verdict
+    for tag in ('old', 'new'):
+        truth_big(results[tag], results['ideal'], runs['ideal'][0], runs[tag][0])
+        with open(os.path.join(a.out, f'T3b_{tag}_truth.csv'), 'w', newline='') as f:
+            f.write('id,truth_rev,e_truth,obs_big\n')
+            f.writelines(f"{x['id']},{x['truth_rev']},{'' if x['e_truth'] is None else x['e_truth']},"
+                         f"{'' if x['obs_big'] is None else int(x['obs_big'])}\n" for x in results[tag])
     # same reads, delta_sync != 0 (only u_t changes): inconclusive rate sensitivity
     alt = {}
     for tag in ('ideal', 'new'):
@@ -268,9 +303,16 @@ def main(argv=None) -> int:
             if tag in ('old', 'new'):
                 ln += f'  {s["truth_bad"]:9d} {s["truth_bad_detected"]:3d} {s["big"]:4d} {s["big_detected"]:3d}'
             lines.append(ln)
-            if s['inconclusive'] > INCONCLUSIVE_MAX * s['n'] and tag != 'new':
-                ok = False
-                lines.append(f'   ^ chưa kết luận > {INCONCLUSIVE_MAX:.0%}')
+            if s['inconclusive'] > INCONCLUSIVE_MAX * s['n']:
+                if tag != 'new':
+                    ok = False
+                    lines.append(f'   ^ chưa kết luận > {INCONCLUSIVE_MAX:.0%}')
+                else:                                # S29 (a): spec wording unclear for (2), asked THESIS 30/10
+                    lines.append(f'   ^ chưa kết luận > {INCONCLUSIVE_MAX:.0%} ở đối tượng đo (2): chữ spec chưa '
+                                 f'rõ luật ≤ 10 % có áp cho (2) không, chờ THESIS; chưa tính vào cổng')
+        if tot['u_t_bad']:                            # S29 (b): the tool requirement u_t ≤ ¼(N_tol − fixed)
+            ok = False
+            lines.append(f'   KHÔNG ĐẠT: {tot["u_t_bad"]} cửa sổ u_t vượt yêu cầu công cụ')
         if tag == 'ideal' and (tot['fail'] or tot['inconclusive']):
             ok = False
             lines.append('   KHÔNG ĐẠT: bộ phát lý tưởng phải đạt mọi ca')
@@ -278,14 +320,23 @@ def main(argv=None) -> int:
     lines.append('\n== (1) old code, 4 large-deviation start-up kinds of the 28/10 model')
     for kind in BIG_KINDS:
         rk = [x for x in old if x['transition'] == kind]
-        big = [x for x in rk if abs(x['err_counts']) > 100]
+        big = [x for x in rk if x['obs_big']]             # S29 (c): labelled from the truth, before the gate
         det = [x for x in big if x['verdict'] == 'fail']
         tb_ = [x for x in rk if x['truth_rev'] > 0]
         lines.append(f'{kind:22s}: {len(rk)} windows, truth reverse {len(tb_)} (detected '
-                     f'{sum(1 for x in tb_ if x["verdict"] == "fail")}), |e| > 100: {len(big)} (detected {len(det)})')
+                     f'{sum(1 for x in tb_ if x["verdict"] == "fail")}), truth |e| > N_tol + u_t: {len(big)} '
+                     f'(detected {len(det)})')
         if not big or len(det) < len(big):
             ok = False
             lines.append('   ^ KHÔNG ĐẠT: loại lệch lớn phải xuất hiện và bị phát hiện')
+    # S29 (c): every old-code window whose truth deviation is observable by the T3b rule must fail
+    obs_miss = [x for x in old if x['obs_big'] and x['verdict'] != 'fail']
+    unlabelled = sum(1 for x in old if x['obs_big'] is None)
+    lines.append(f'(1) observable by the rule (truth |e| > N_tol + u_t): {sum(1 for x in old if x["obs_big"])} '
+                 f'windows, not failed {len(obs_miss)}; not labelled (read grid differs) {unlabelled}')
+    if obs_miss or unlabelled:
+        ok = False
+        lines.append('   ^ KHÔNG ĐẠT: ca quan sát được phải báo không đạt; mọi ca phải gắn nhãn được')
     miss = [x for x in old if x['truth_rev'] > 0 and x['verdict'] != 'fail']
     lines.append(f'(1) detection limit: {len(miss)} old-code windows with per-edge reverse steps not failed by T3b'
                  + (': ' + ', '.join(f"{x['id']}({x['transition']},w{x['wheel']},rev {x['truth_rev']},"
@@ -295,7 +346,8 @@ def main(argv=None) -> int:
         n_ut = sum(1 for x in rows if not x['u_t_ok'])
         lines.append(f'(delta_sync {a.delta_sync_alt_us} us, info) {tag}: inconclusive {n_inc}, '
                      f'u_t over limit {n_ut} of {len(rows)}')
-    lines.append(f'\nZ23 gate ((0) all pass, (1) 4 large kinds detected, inconclusive <= 10%): '
+    lines.append(f'\nZ23 gate ((0) all pass, (1) every window observable from the truth failed incl. the 4 large '
+                 f'kinds, inconclusive <= 10% in (0)/(1), u_t within the tool requirement in every group): '
                  f'{"PASS" if ok else "FAIL"}')
     txt = '\n'.join(lines)
     with open(os.path.join(a.out, 'summary.txt'), 'w', encoding='utf-8') as f:

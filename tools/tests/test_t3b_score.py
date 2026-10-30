@@ -146,6 +146,56 @@ def test_calls_mismatch_fails(small):
     assert x['verdict'] == 'fail', x
 
 
+def test_int32_counts_unwrapped(small):
+    # S17: the int32 count crossing +2^31 inside a window is no backward step and no count error
+    sched, t_send, w_d, tb, ta = small
+    c = exact_counts(t_send, w_d, tb, ta) + (2**31 - 3000)
+    c = (c + 2**31) % 2**32 - 2**31                                          # as the firmware prints it
+    rows = sc.score_run(sc.Run(t_send, w_d, tb, ta, c), sched)
+    assert {x['verdict'] for x in rows} == {'pass'}
+
+
+def test_empty_and_lag_and_locked_schedule(small):
+    sched, t_send, w_d, tb, ta = small
+    assert sc.exit_code([]) == 3                                             # S18: nothing scored, no pass
+    assert sc.schedule_lag(w_d, sched) == (0, 1.0)
+    lagged = np.vstack([np.zeros((1, 4)), w_d[:-1]])                         # the HIL path: one frame later
+    assert sc.schedule_lag(lagged, sched)[0] == 1
+    assert sc.schedule_matches_locked(ts.make_schedule(1)) == []
+    assert sc.schedule_matches_locked(sched) != []                           # a cut schedule is not the locked one
+
+
+def _cli_run(tmp_path, small, lost=None, lag=1):
+    """A run as run_hil --omega-schedule writes it: frame k carries entry k - lag; ESP32 clock = Pi clock."""
+    from protocol import encode_state
+    sched, t_send, w_d, tb, ta = small
+    sent = np.vstack([np.zeros((lag, 4)), w_d[:len(w_d) - lag]]) if lag else w_d
+    mosi = np.array([np.frombuffer(encode_state(list(sent[k]) + [0.0] * 6, seq=k), dtype=np.uint8)
+                     for k in range(len(t_send))])
+    np.savez(tmp_path / 'frames.npz', t_send_ns=(t_send * 1000).astype(np.int64), mosi=mosi,
+             miso=np.zeros_like(mosi))
+    c = exact_counts(t_send, sent, tb, ta)
+    lines = [f'{int(tb[0])}\t#run_start,timestamp_us={int(tb[0])},qseq=0']
+    for j in range(len(tb)):
+        if j != lost:
+            lines.append(f'{int(ta[j])}\tE,{j + 1},{int(tb[j])},{int(ta[j])},' + ','.join(str(x) for x in c[j]))
+    lines.append(f'{int(ta[-1]) + 10}\t#run_end,ev_qdrop_run=0,enc_ovf_run=0,qseq=1')
+    (tmp_path / 'ev.txt').write_text('\n'.join(lines) + '\n')
+    ts.write_csv(str(tmp_path / 'sched.csv'), sched)
+    return sc.main(['--schedule', str(tmp_path / 'sched.csv'), '--frames', str(tmp_path / 'frames.npz'),
+                    '--esp32-events', str(tmp_path / 'ev.txt'), '--clock-affine', '0', '1', '--delta-sync-us', '0',
+                    '--out', str(tmp_path / 'out')])
+
+
+def test_cli_lag_found_and_stream_checked(tmp_path, small, capsys):
+    # S16: windows anchored on the lag seen in the MOSI; S15/S18: no H7 calls and a cut schedule -> 3
+    assert _cli_run(tmp_path, small) == 3
+    out = capsys.readouterr().out
+    assert 'trễ lịch → frame: 1 frame' in out and 'KHÔNG ĐẠT' not in out, out[-2000:]
+    # S4: one lost E line inside the windows is lost data
+    assert _cli_run(tmp_path, small, lost=5000) == 1
+
+
 @pytest.mark.skipif(shutil.which('gcc') is None, reason='gcc not on PATH')
 def test_sensitivity_quick(tmp_path):
     """Z23 on the first 20 s of the seed-1 schedule: (0) all pass, old code caught, gate PASS."""

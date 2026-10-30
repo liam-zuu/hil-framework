@@ -171,8 +171,9 @@ def test_clock_fit_recovers_rate_from_packet_lower_envelope():
 PI0, PPM = 9e9, 25e-6
 
 
-def write_events(path, reads, lost=(), temp_c=lambda t: 40.0 + t / 1e8):
-    """esp32_events.txt like s06_logger.py: Pi receive time, 10 E lines per packet, an S line each 1 s."""
+def write_events(path, reads, lost=(), temp_c=lambda t: 40.0 + t / 1e8, enc_ovf=0, run_end=True):
+    """esp32_events.txt like s06_logger.py: Pi receive time, 10 E lines per packet, an S line each 1 s,
+    #run_end with the overflow counters of s06_load end_run."""
     rng = np.random.default_rng(7)
     lines = ['1\t#run_start,t_us=0']
     t_s = reads.tb[0] - reads.tb[0] % 1e6 + 1e6
@@ -186,42 +187,105 @@ def write_events(path, reads, lost=(), temp_c=lambda t: 40.0 + t / 1e8):
         while t_s <= reads.ta[j]:
             lines.append(f'{t_rx}\tS,1,{int(t_s)},1,0,0,0,0,0,10000,0,0,0,0,0,{temp_c(t_s):.1f}')
             t_s += 1e6
+    if run_end:
+        lines.append(f'{t_rx + 1000}\t#run_end,last_data_seq=1,log_qdrop=0,log_send_err=0,timestamp_us='
+                     f'{int(reads.ta[-1])},reason=duration,elapsed_us=0,log_qdrop_run=0,ev_qdrop_run=0,'
+                     f'enc_ovf_run={enc_ovf},imu_drop_run=0/0/0,gyro_gap_max_us=0,qseq=9')
     with open(path, 'w') as f:
         f.write('\n'.join(lines) + '\n')
 
 
-def test_cli_end_to_end(tmp_path):
-    import json
-    s = t5.make_schedule(2)[:4]
-    sched_csv = os.path.join(tmp_path, 'T5_pass2.csv')
+def h7_log(path, up_s):
+    with open(path, 'w') as f:
+        f.write(f'Init done, entering main loop\nSPI link up at t={int(up_s * 1000)} ms\n')
+    return path
+
+
+def test_unwrap_int32_counts():
+    # S17: the int32 count of encoder.c crossing +2^31 is not a step back of 4.29e9 counts
+    c = np.array([[2147483640, 0, 0, 0], [2147483647, 0, 0, 0], [-2147483646, 0, 0, 0]], dtype=np.int64)
+    r = sc.Reads([0.0, 1.0, 2.0], [0.5, 1.5, 2.5], c)
+    assert list(r.c[:, 0]) == [2147483640, 2147483647, 2147483650]
+    c = -c                                                   # and the negative bound
+    assert list(sc.Reads([0.0, 1.0, 2.0], [0.5, 1.5, 2.5], c).c[:, 0]) == [-2147483640, -2147483647, -2147483650]
+
+
+@pytest.fixture(scope='module')
+def run2(tmp_path_factory):
+    """A full locked pass-2 schedule on the ESP32 clock, its events, a Pi temperature file."""
+    tmp = tmp_path_factory.mktemp('t5')
+    s = t5.make_schedule(2)
+    sched_csv = os.path.join(tmp, 'T5_pass2.csv')
     t5.write_csv(sched_csv, s)
     reads = synth(s, 6.2e6)
-    ev = os.path.join(tmp_path, 'esp32_events.txt')
-    write_events(ev, reads, lost=(500,))                     # one lost E line: reported, no effect
-    pi_temp = os.path.join(tmp_path, 'pi_temp.txt')
+    pi_temp = os.path.join(tmp, 'pi_temp.txt')
     with open(pi_temp, 'w') as f:                            # Pi clock; 55.000 + t_esp/1e8 °C
-        for t in np.arange(reads.tb[0], reads.tb[-1], 1e6):
+        for t in np.arange(reads.tb[0], reads.tb[-1], 5e6):
             f.write(f'{int(PI0 + t * (1 + PPM) + 3000)}\t{int(round(55000 + t / 1e5))}\n')
-    script = os.path.join(ROOT, 'tools', 's06_t5_score.py')
-    out = os.path.join(tmp_path, 'out')
-    base = [sys.executable, script, '--schedule', sched_csv, '--esp32-events', ev, '--out', out]
-    # pass 2 started 6 s after boot: windows pass, but the run breaks the >= 30 min condition
-    p = subprocess.run(base + ['--pi-temp', pi_temp], capture_output=True, text=True)
-    assert p.returncode == 3, p.stderr
-    summ = json.load(open(os.path.join(out, 'T5_summary.json'), encoding='utf-8'))
-    assert summ['run_pass'] == 2 and summ['eseq_gaps'] == 1 and summ['fail'] == 0 and summ['inconclusive'] == 0
-    assert summ['run_condition_ok'] is False and abs(summ['esp32_uptime_at_start_s'] - 6.2) <= 0.1
-    assert abs(summ['offset_us'] - 6.2e6) <= sc.ALIGN_BIN_US and summ['xtal_note']
+    return tmp, s, sched_csv, reads, pi_temp
+
+
+def _cli(run2, name, *extra, lost=(), enc_ovf=0, run_end=True, sched_csv=None, h7_up_s=1900.0):
+    import json
+    tmp, s, csv_path, reads, pi_temp = run2
+    ev = os.path.join(tmp, f'{name}_events.txt')
+    write_events(ev, reads, lost=lost, enc_ovf=enc_ovf, run_end=run_end)
+    out = os.path.join(tmp, name)
+    args = [sys.executable, os.path.join(ROOT, 'tools', 's06_t5_score.py'), '--schedule', sched_csv or csv_path,
+            '--esp32-events', ev, '--out', out, '--pi-temp', pi_temp, *extra]
+    if h7_up_s is not None:
+        args += ['--h7-serial', h7_log(os.path.join(tmp, f'{name}_h7.log'), h7_up_s)]
+    p = subprocess.run(args, capture_output=True, text=True)
+    summ = json.load(open(os.path.join(out, 'T5_summary.json'), encoding='utf-8')) if p.returncode != 2 else None
+    return p.returncode, summ, out, p
+
+
+def test_cli_full_evidence_passes(run2):
+    code, summ, out, p = _cli(run2, 'ok', '--xtal-ppm', '20')
+    assert code == 0, p.stdout[-1500:] + p.stderr
+    assert summ['run_pass'] == 2 and summ['fail'] == 0 and summ['inconclusive'] == 0 and summ['stream']['ok']
+    assert summ['run_condition_ok'] is True and summ['h7_uptime_at_link_up_s'] == 1900.0
+    assert abs(summ['esp32_uptime_at_start_s'] - 6.2) <= 0.1      # reported only (S20)
+    assert abs(summ['offset_us'] - 6.2e6) <= sc.ALIGN_BIN_US
     assert abs(summ['clock_vs_pi']['ppm'] - 25.0) < 1.0 and summ['temp_esp32'] and summ['temp_pi']
     with open(os.path.join(out, 'T5.csv')) as f:
         rows = list(csv.DictReader(f))
     assert list(rows[0])[:1] == ['idx'] and {'wheel', 'omega_cmd', 'window', 't_window_start_us', 'counts',
                                              'f_meas_hz', 'f_cmd_hz', 'err_rel'} <= set(rows[0])
-    for r in rows:                                           # window means of a linear temperature
+    for r in rows[:200]:                                     # window means of a linear temperature
         mid = float(r['t_window_start_us']) + 5e6
         assert abs(float(r['temp_esp32_c']) - (40.0 + mid / 1e8)) < 0.06
-        assert abs(float(r['temp_pi_c']) - (55.0 + mid / 1e8)) < 0.06
-    assert subprocess.run(base + ['--no-uptime-check'], capture_output=True, text=True).returncode == 0
-    bad = subprocess.run([sys.executable, script, '--schedule', sched_csv, '--esp32-events', sched_csv,
-                          '--out', out], capture_output=True, text=True)
+        assert abs(float(r['temp_pi_c']) - (55.0 + mid / 1e8)) < 0.1
+
+
+def test_cli_lost_read_or_overflow_fails(run2):
+    # S4: one lost E line inside the schedule is lost data (Z19), not a note
+    code, summ, _, _ = _cli(run2, 'lost', '--xtal-ppm', '20', lost=(100_000,))
+    assert code == 1 and summ['eseq_gaps'] == 1 and not summ['stream']['ok']
+    code, summ, _, _ = _cli(run2, 'ovf', '--xtal-ppm', '20', enc_ovf=2)
+    assert code == 1 and summ['stream']['enc_ovf_run'] == 2
+
+
+def test_cli_missing_evidence_is_not_a_pass(run2):
+    assert _cli(run2, 'noxtal')[0] == 3                                        # S19: no --xtal-ppm
+    assert _cli(run2, 'noh7', '--xtal-ppm', '20', h7_up_s=None)[0] == 3         # S20: H7 time unknown
+    code, summ, _, _ = _cli(run2, 'early', '--xtal-ppm', '20', h7_up_s=6.0)     # pass 2 run 6 s after H7 boot
+    assert code == 3 and summ['run_condition_ok'] is False
+    assert _cli(run2, 'nouptime', '--xtal-ppm', '20', '--no-uptime-check')[0] == 3
+    assert _cli(run2, 'noend', '--xtal-ppm', '20', run_end=False)[0] == 3       # overflow unknown
+
+
+def test_cli_schedule_not_locked(run2, tmp_path):
+    # S18: a continuous schedule that leaves points out is not the acceptance run
+    tmp, s, _, reads, _ = run2
+    cut = os.path.join(tmp_path, 'T5_pass2.csv')
+    t5.write_csv(cut, s[:4])
+    code, summ, _, _ = _cli(run2, 'cut', '--xtal-ppm', '20', sched_csv=cut)
+    assert code == 3 and summ['schedule_problems']
+
+
+def test_cli_input_error(run2, tmp_path):
+    tmp, s, csv_path, _, _ = run2
+    bad = subprocess.run([sys.executable, os.path.join(ROOT, 'tools', 's06_t5_score.py'), '--schedule', csv_path,
+                          '--esp32-events', csv_path, '--out', str(tmp_path)], capture_output=True, text=True)
     assert bad.returncode == 2
