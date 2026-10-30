@@ -154,7 +154,7 @@ def test_window_mean_skips_nan_and_empty():
 
 def test_uptime_condition():
     assert sc.uptime_condition(1, 119e6) and not sc.uptime_condition(1, 121e6)
-    assert sc.uptime_condition(2, 1812e6) and not sc.uptime_condition(2, 1811e6)      # X14: HAL ms, H7 fast 0.64 %
+    assert sc.uptime_condition(2, 1823e6) and not sc.uptime_condition(2, 1822e6)      # X14, C2-13: 1 800 s real at 486 MHz
 
 
 def test_clock_fit_recovers_rate_from_packet_lower_envelope():

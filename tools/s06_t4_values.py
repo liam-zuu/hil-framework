@@ -274,7 +274,8 @@ def outcome(summary):
     DATA yaw off or a tick with no callback (C1-5: results about the DUT, in `dut`). 3: run not valid or
     evidence missing (decoder conditions: V4-1, run marks, TICK, ± PAD_US cover (S38); no ESP32 run span; no
     callback; the MOSI is not the locked schedule (S42) or a schedule point not covered (S18); no
-    esp32_data.txt, no data seq span in the run marks, or ticks without a game RV yet (S28, S39)); 0 otherwise."""
+    esp32_data.txt, no data seq span or no DATA tick in the run, or ticks without a game RV yet (S28, S39, C2-7));
+    0 otherwise."""
     d = summary['data_yaw']
     qs = summary['qseq_stream']
     if summary['fail'] or summary['decode_problems'] or summary['frame_log_faults']:
@@ -294,8 +295,9 @@ def outcome(summary):
             or (man is not None and not profile_t4) or summary['stimulus']['frames_differ']
             or summary['coverage_missing']):
         return 3, 'khong_du_dieu_kien'
+    # C2-7: no DATA tick at all is evidence missing; ticks that all differ from the callback are a DUT result
     if (man is None or not qs['known'] or d is None or not d['header'] or d['seq_span'] is None or d['no_rv']
-            or not d['ok']):
+            or not d['ticks']):
         return 3, 'thieu_bang_chung'
     return 0, None
 
@@ -324,8 +326,7 @@ def main(argv=None) -> int:
             r['idx'] = i
         summary['exit_code'], summary['reason'] = outcome(summary)
     except dec.stm.RunProblem as ex:
-        print(f'không chấm: {ex}', file=sys.stderr)
-        return dec.stm.report_result(3, ['khong_du_dieu_kien'])
+        return dec.stm.report_run_problem(ex)
     except (OSError, KeyError, ValueError) as ex:
         print(f'lỗi đầu vào: {ex}', file=sys.stderr)
         return 2

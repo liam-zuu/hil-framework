@@ -41,6 +41,8 @@ Sửa theo Codex Sol vòng 1/2 (Liam duyệt 30/10 "Duyệt, sửa hết"):
   * S16: trễ lịch → frame dò từ chính MOSI (run_hil --omega-schedule: 1 frame), cửa sổ neo theo đó.
   * S17: count int32 mở vòng 32 bit.
   * S18: không có cửa sổ nào → mã 3; lịch phải là lịch khóa `make_schedule(--locked-seed)` (seed 1).
+Sửa theo Codex Sol vòng 2/2 (Liam duyệt 30/10 "Duyệt, sửa hết"): C2-2 có cửa sổ không đạt thì giữ mã 1 dù thiếu
+bằng chứng; C2-14 u_t vượt yêu cầu công cụ ghi `khong_du_dieu_kien`, không phải `chua_ket_luan`.
 Mã thoát: 0 mọi cửa sổ đạt và đủ bằng chứng; 1 có cửa sổ không đạt hoặc mất dữ liệu; 3 không có không đạt
 nhưng có chưa kết luận, u_t vượt yêu cầu công cụ, hoặc thiếu bằng chứng (lần gọi H7, giờ H7 hiệu chuẩn,
 #run_end, lịch khóa); 2 lỗi đầu vào (kể cả MOSI không theo lịch).
@@ -258,11 +260,15 @@ def exit_code(rows: Sequence[dict]) -> int:
     return 0
 
 
-def code3_reasons(code: int, sched_bad, rhythm: dict, evidence: bool) -> List[str]:
+def code3_reasons(rows: Sequence[dict], sched_bad, rhythm: dict, evidence: bool) -> List[str]:
     """Why a run with no failure is not a pass (spec 3.1, result table): windows not concluded, the run
-    conditions (locked schedule, read rhythm C1-13), the acceptance evidence. Empty = pass."""
-    reasons = ['chua_ket_luan'] if code == 3 else []
-    if sched_bad or rhythm['ok'] is False:
+    conditions (locked schedule, read rhythm C1-13, the tool requirement on u_t, no window scored), the
+    acceptance evidence. Empty = pass, or a failure: C2-2, a failure seen stays mã 1 whatever else is missing
+    (Z19 order). C2-14: `chua_ket_luan` only when an uncertainty really contains the limit."""
+    if exit_code(rows) == 1:
+        return []
+    reasons = ['chua_ket_luan'] if any(x['verdict'] == 'inconclusive' for x in rows) else []
+    if not rows or any(not x['u_t_ok'] for x in rows) or sched_bad or rhythm['ok'] is False:
         reasons.append('khong_du_dieu_kien')
     if not evidence or not rhythm['known']:
         reasons.append('thieu_bang_chung')
@@ -393,8 +399,7 @@ def main(argv=None) -> int:
                   delta_sync_us=a.delta_sync_us, frame_lag=lag)
         rows = score_run(run, sched)
     except stm.RunProblem as ex:
-        print(f'không chấm: {ex}', file=sys.stderr)
-        return stm.report_result(3, ['khong_du_dieu_kien'])
+        return stm.report_run_problem(ex)
     except (OSError, ValueError, KeyError) as ex:
         print(f'lỗi đầu vào: {ex}', file=sys.stderr)
         return 2
@@ -432,7 +437,7 @@ def main(argv=None) -> int:
         return stm.report_result(1)
     evidence = (calls is not None and manifest is not None and stream['known']
                 and not any('chưa hiệu chuẩn' in x for x in notes))
-    reasons = code3_reasons(code, sched_bad, rhythm, evidence)
+    reasons = code3_reasons(rows, sched_bad, rhythm, evidence)
     return stm.report_result(3 if reasons else code, reasons)
 
 

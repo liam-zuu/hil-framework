@@ -203,12 +203,28 @@ def test_cli_read_rhythm_checked_without_the_firmware_count(tmp_path, small, cap
 
 def test_code3_reasons():
     ok = dict(ok=True, known=True)
-    assert sc.code3_reasons(0, [], ok, True) == []
-    assert sc.code3_reasons(3, [], ok, True) == ['chua_ket_luan']
-    assert sc.code3_reasons(0, [], dict(ok=False, known=True), True) == ['khong_du_dieu_kien']    # C1-13
-    assert sc.code3_reasons(0, ['khác lịch'], ok, True) == ['khong_du_dieu_kien']
-    assert sc.code3_reasons(0, [], dict(ok=None, known=False), True) == ['thieu_bang_chung']
-    assert sc.code3_reasons(0, [], ok, False) == ['thieu_bang_chung']
+    good = [dict(verdict='pass', u_t_ok=True)]
+    assert sc.code3_reasons(good, [], ok, True) == []
+    inc = [dict(verdict='inconclusive', u_t_ok=True)]
+    assert sc.code3_reasons(inc, [], ok, True) == ['chua_ket_luan']
+    assert sc.code3_reasons(good, [], dict(ok=False, known=True), True) == ['khong_du_dieu_kien']    # C1-13
+    assert sc.code3_reasons(good, ['khác lịch'], ok, True) == ['khong_du_dieu_kien']
+    assert sc.code3_reasons(good, [], dict(ok=None, known=False), True) == ['thieu_bang_chung']
+    assert sc.code3_reasons(good, [], ok, False) == ['thieu_bang_chung']
+    # C2-14: u_t over the tool requirement in a window that passes is a run condition, the limit is not in doubt
+    ut = [dict(verdict='pass', u_t_ok=False)]
+    assert sc.exit_code(ut) == 3 and sc.code3_reasons(ut, [], ok, True) == ['khong_du_dieu_kien']
+    assert sc.code3_reasons([], [], ok, True) == ['khong_du_dieu_kien']          # S18: no window scored
+
+
+@pytest.mark.parametrize('sched_bad, rhythm, evidence', [
+    ([], dict(ok=True, known=True), False),
+    (['khác lịch'], dict(ok=True, known=True), True),
+    ([], dict(ok=False, known=True), True)])
+def test_failure_is_not_lowered_to_code_3(sched_bad, rhythm, evidence):
+    # C2-2 (Z19 order): a window that failed stays mã 1 whatever else is missing
+    rows = [dict(verdict='pass', u_t_ok=True), dict(verdict='fail', u_t_ok=True)]
+    assert sc.exit_code(rows) == 1 and sc.code3_reasons(rows, sched_bad, rhythm, evidence) == []
 
 
 def test_cli_frame_log_checked(tmp_path, small, capsys):

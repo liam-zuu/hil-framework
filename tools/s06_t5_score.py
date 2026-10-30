@@ -28,7 +28,7 @@ Cách chấm:
 Thêm theo Liam 30/10 ("tôi đồng ý 3 đề xuất của bạn"):
   * Điều kiện thời gian của spec (lần 1 bắt đầu trong 2 phút sau khi bật, lần 2 sau ≥ 30 phút chạy):
     esp_timer của ESP32 đếm từ lúc ESP32 khởi động, nên offset = thời gian ESP32 đã chạy lúc lịch bắt
-    đầu. Lần 1 cần ≤ 120 s, lần 2 cần ≥ 1 812 s HAL ms (X14); không đạt → `run_condition_ok: false`, mã 3. Chỉ đúng
+    đầu. Lần 1 cần ≤ 120 s, lần 2 cần ≥ 1 823 s HAL ms (X14); không đạt → `run_condition_ok: false`, mã 3. Chỉ đúng
     khi ESP32 cấp nguồn cùng lúc với H7 và không bị reset giữa chừng (`--no-uptime-check` để bỏ).
   * Lệch nhịp ESP32 so với RPi5 (cho câu thạch anh, E6): t_rx (giờ Pi nhận gói, monotonic) − t_after
     của dòng E; lấy chặn dưới mỗi bin 10 s (gói đến nhanh nhất), khớp đường thẳng → ppm. Chỉ là sai số
@@ -83,7 +83,7 @@ ALIGN_BIN_US = 100_000.0
 MAX_READ_GAP_US = 100_000.0   # đầu cửa sổ phải có lần đọc trong 100 ms sau nó [ĐỀ XUẤT], không thì `missing`
 WHEELS = ('FL', 'FR', 'RL', 'RR')
 UPTIME_PASS1_MAX_US = 120e6   # spec: lần 1 bắt đầu trong 2 phút sau khi bật
-UPTIME_PASS2_MIN_US = 1812e6  # X14, C1-16: lần 2 sau ≥ 1 800 s thật = 1 800 × 1,0064 s HAL ms danh định, làm tròn lên
+UPTIME_PASS2_MIN_US = 1823e6  # X14, C2-13: ≥ 1 800 s thật ở mọi tần số dải X22: 1 800 × 486/480 = 1 822,5 s HAL ms, làm tròn lên
 CLOCK_BIN_US = 10e6           # bin chặn dưới t_rx − t_esp
 
 COLUMNS = ['idx', 'run_pass', 'visit', 'kind', 'wheel', 'omega_cmd', 'omega_d', 'window',
@@ -400,8 +400,7 @@ def main(argv=None) -> int:
             tp, vp = load_pi_temp(a.pi_temp)
             temps['pi'] = (pi_to_esp(fit, tp), vp) if len(tp) else None
     except stm.RunProblem as exc:
-        print(f'không chấm: {exc}', file=sys.stderr)
-        return stm.report_result(3, ['khong_du_dieu_kien'])
+        return stm.report_run_problem(exc)
     except (OSError, ValueError, KeyError) as exc:
         print(f'lỗi đầu vào: {exc}', file=sys.stderr)
         return 2
@@ -434,7 +433,7 @@ def main(argv=None) -> int:
                 stream=stream, stream_notes=stm.stream_notes(stream), schedule_problems=sched_bad,
                 esp32_uptime_at_start_s=offset / 1e6,
                 h7_uptime_at_link_up_s=None if h7_up is None else h7_up / 1e6, run_condition_ok=cond,
-                run_condition_rule='lần 1: ≤ 120 s; lần 2: ≥ 1 812 s HAL ms danh định = 1 800 s thật (X14) (thời '
+                run_condition_rule='lần 1: ≤ 120 s; lần 2: ≥ 1 823 s HAL ms danh định, ≥ 1 800 s thật cả ở 486 MHz (X14) (thời '
                                    'gian H7 đã chạy lúc link SPI lên, log serial H7); không có log hoặc '
                                    '--no-uptime-check = chưa xác minh',
                 clock_vs_pi=fit,

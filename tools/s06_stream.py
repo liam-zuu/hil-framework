@@ -15,6 +15,7 @@ dùng chung một bản.
 """
 from __future__ import annotations
 
+import sys
 from typing import Optional
 
 import numpy as np
@@ -75,7 +76,7 @@ def run_marks(path: str, run: Optional[int] = None) -> dict:
                 continue
     starts = [m for n, m in marks if n == 'run_start']
     runs = [m['kv'].get('run') for m in starts]
-    out = dict(_runs=runs, _run=None, _multi=False, _problem='')
+    out = dict(_runs=runs, _run=None, _multi=False, _problem='', _losses=_known_losses(marks))
     if run is None and len(starts) > 1:
         out['_multi'] = True
         out['_problem'] = f'file có {len(starts)} dòng #run_start mà không chọn lượt (--run)'
@@ -106,16 +107,43 @@ def run_marks(path: str, run: Optional[int] = None) -> dict:
     return out
 
 
+LOSS_KEYS = {'run_end': ('enc_ovf_run', 'ev_qdrop_run', 'log_qdrop_run'), 'run_stats': ('log_send_err_run',)}
+
+
+def _known_losses(marks) -> list:
+    """C2-4: mọi bộ đếm mất dữ liệu > 0 ở #run_end, #run_stats của cả file, chưa cần chọn lượt (cùng bộ đếm
+    với `known_losses` của tools/s06_esp32_check.py)."""
+    out = []
+    for name, m in marks:
+        for k in LOSS_KEYS.get(name, ()):
+            try:
+                if int(m['kv'].get(k, '0')) > 0:
+                    out.append(f"run={m['kv'].get('run', '?')} {k}={m['kv'][k]}")
+            except ValueError:
+                continue
+    return out
+
+
 class RunProblem(ValueError):
     """Spec X18: the file holds no single run to score (several #run_start, a repeated run id): a run
     condition (mã 3, `khong_du_dieu_kien`), not an input fault."""
 
 
+class RunLoss(RunProblem):
+    """C2-4: no single run to score, but a loss counter > 0 was read in the file: lost data of the HIL seen in
+    the data at hand stays a failure (Z19 order, mã 1), X18 does not hide it."""
+
+
 def require_run(marks: dict) -> None:
     """Stop before scoring when no run is selected: `--run` of a run not in the file is an input fault
-    (ValueError, mã 2), the other cases are RunProblem."""
-    if marks['_problem']:
-        raise (ValueError if marks.get('_not_found') else RunProblem)(marks['_problem'])
+    (ValueError, mã 2), a loss counter already read is RunLoss, the other cases are RunProblem."""
+    if not marks['_problem']:
+        return
+    if marks.get('_not_found'):
+        raise ValueError(marks['_problem'])
+    if marks['_losses']:
+        raise RunLoss(f"{marks['_problem']}; bộ đếm mất dữ liệu: {', '.join(marks['_losses'])} (Z19)")
+    raise RunProblem(marks['_problem'])
 
 
 REASONS = ('khong_du_dieu_kien', 'thieu_bang_chung', 'chua_ket_luan')   # spec 3.1, bảng mã kết quả (C1-14)
@@ -127,6 +155,12 @@ def report_result(code: int, reasons=()) -> int:
     why = next((r for r in REASONS if r in reasons), 'thieu_bang_chung')
     print(f'#ket_qua,ma={code}' + (f',ly_do={why}' if code == 3 else ''))
     return code
+
+
+def report_run_problem(ex: RunProblem) -> int:
+    """The result of a run not scored: mã 1 for RunLoss (C2-4), else mã 3 `khong_du_dieu_kien` (X18)."""
+    print(f'không chấm: {ex}', file=sys.stderr)
+    return report_result(1) if isinstance(ex, RunLoss) else report_result(3, ['khong_du_dieu_kien'])
 
 
 READ_PERIOD_US = 1000.0            # s06_load: one encoder read every 1 ms (Q-S1)

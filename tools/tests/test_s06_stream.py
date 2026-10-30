@@ -172,6 +172,33 @@ def test_require_run(tmp_path):
     assert not isinstance(e.value, stm.RunProblem)                              # X18: an input fault, mã 2
 
 
+def test_require_run_loss_counter_wins_over_x18(tmp_path, capsys):
+    # C2-4: two START, one END with enc_ovf_run = 1: no run selected, but the loss was read (Z19 order)
+    for line in ('#run_end,run=1,timestamp_us=9,enc_ovf_run=1,ev_qdrop_run=0,log_qdrop_run=0,qseq=2',
+                 '#run_end,run=1,timestamp_us=9,enc_ovf_run=0,ev_qdrop_run=3,log_qdrop_run=0,qseq=2',
+                 '#run_end,run=1,timestamp_us=9,enc_ovf_run=0,ev_qdrop_run=0,log_qdrop_run=2,qseq=2',
+                 '#run_stats,run=1,log_send_err_run=4'):
+        p = tmp_path / 'ev.txt'
+        p.write_text('\n'.join(f'{i}\t{x}' for i, x in enumerate(
+            ['#run_start,run=1,timestamp_us=1,qseq=1', line, '#run_start,run=2,timestamp_us=20,qseq=3'])) + '\n')
+        with pytest.raises(stm.RunLoss) as e:
+            stm.require_run(stm.run_marks(str(p)))
+        assert stm.report_run_problem(e.value) == 1
+        assert capsys.readouterr().out.splitlines()[-1] == '#ket_qua,ma=1'
+    p.write_text('0\t#run_start,run=1,timestamp_us=1,qseq=1\n1\t#run_end,run=1,timestamp_us=9,enc_ovf_run=1,qseq=2\n'
+                 '2\t#run_start,run=2,timestamp_us=20,qseq=3\n')
+    with pytest.raises(ValueError) as e:                                        # CB1: a wrong --run stays mã 2
+        stm.require_run(stm.run_marks(str(p), run=7))
+    assert not isinstance(e.value, stm.RunProblem)
+    q = tmp_path / 'clean.txt'
+    q.write_text('0\t#run_start,run=1,timestamp_us=1,qseq=1\n1\t#run_end,run=1,timestamp_us=9,enc_ovf_run=0,qseq=2\n'
+                 '2\t#run_start,run=2,timestamp_us=20,qseq=3\n')
+    with pytest.raises(stm.RunProblem) as e:
+        stm.require_run(stm.run_marks(str(q)))
+    assert not isinstance(e.value, stm.RunLoss) and stm.report_run_problem(e.value) == 3
+    assert capsys.readouterr().out.splitlines()[-1] == '#ket_qua,ma=3,ly_do=khong_du_dieu_kien'
+
+
 def test_report_result(capsys):
     assert stm.report_result(3, ['chua_ket_luan', 'khong_du_dieu_kien']) == 3
     assert capsys.readouterr().out == '#ket_qua,ma=3,ly_do=khong_du_dieu_kien\n'

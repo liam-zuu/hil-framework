@@ -13,6 +13,10 @@ Sửa theo Codex Sol vòng 1/2 (Liam duyệt 30/10 "Duyệt, sửa hết"): S1 M
 frame đầu là lỗi, phải có frame trả lời, REPORT và ≥ 2 TICK; S6 như trên; S12 tuổi trạng thái quy đổi µs
 danh định (480 MHz) ra µs thật theo tần số H7 khớp được, luật ba trạng thái; S25 log serial bắt buộc,
 bộ đếm lấy bao hai đầu lượt, link nối lại giữa lượt là lỗi; thiếu bằng chứng → `incomplete` (mã 3).
+Sửa theo Codex Sol vòng 2/2 (Liam duyệt 30/10 "Duyệt, sửa hết"): C2-3 chấm thêm `--answer-lag` MISO sau frame
+cuối lượt, vì đó là các câu trả lời (tuổi, CRC, nội dung) của những frame cuối; C2-6 thống kê REPORT và cờ số thứ
+tự chỉ lấy report của lượt, theo frame nguồn (không có frame nguồn: theo frame mang bản ghi). Hở luồng log H7 và
+bộ đếm bỏ của H7 vẫn tính cả file.
   * H1 (đồng hồ RPi5, giờ gửi frame): chu kỳ trung bình = độ dốc hồi quy t_gửi theo chỉ số bước
     (không nhạy với dao động ở hai đầu, vẫn thấy vòng lặp trôi nhịp); đạt khi |dốc − 1 000 µs| ≤ độ
     phân giải đồng hồ (`--clock-res-us`, mặc định 0,001 µs = 1 ns của monotonic_ns, giả định) + 3 sai số
@@ -118,7 +122,9 @@ def check(t_send_ns, mosi, miso, esp32_events=None, serial_events=None, skip_s=0
     n_start = answer_lag if startup_empty is None else startup_empty
     first_sc = int(sel[0]) if len(sel) else 0
     last_sc = int(sel[-1]) if len(sel) else -1
-    miso_empty = sum(1 for r in rows if r['empty'] and max(n_start, first_sc) <= r['j'] <= last_sc)
+    # C2-3: frame N is answered in frame N + answer_lag, so the answers to the last frames of the run lie after it
+    last_ans = last_sc + answer_lag if len(sel) else last_sc
+    miso_empty = sum(1 for r in rows if r['empty'] and max(n_start, first_sc) <= r['j'] <= last_ans)
     # H1
     per = np.diff(t_us[sel]) if len(sel) >= 2 else np.array([])
     mean = slope = se = None
@@ -135,7 +141,7 @@ def check(t_send_ns, mosi, miso, esp32_events=None, serial_events=None, skip_s=0
               gaps_over_1p5ms=int(np.sum(per > GAP_US)), clock_res_us=clock_res_us,
               ok=slope is not None and abs(slope - PERIOD_US) <= clock_res_us + 3.0 * se)
     # per frame (MISO answers) in the scored part
-    good = [r for r in rows if first_sc <= r['j'] <= last_sc and not r['empty']]
+    good = [r for r in rows if first_sc <= r['j'] <= last_ans and not r['empty']]
     win_us = window_s * 1e6
     wins = {}
     steps_crc_h7 = {}
@@ -144,7 +150,7 @@ def check(t_send_ns, mosi, miso, esp32_events=None, serial_events=None, skip_s=0
     prev = None
     first_ok = last_ok = None
     for r in good:
-        w = int((t_us[r['j']] - t0) // win_us)
+        w = int((t_us[min(r['j'], last_sc)] - t0) // win_us)      # the answers after the run: last window
         W = wins.setdefault(w, dict(window=w, t_start_us=t0 + w * win_us, pi_frames=0, frames_rx=0,
                                     frames_applied=0, seq_gaps=0, max_state_age_us=0, miso_seq_bad=0,
                                     mixed_frames=0, miso_crc_bad=0, _nf=[], _ans=[]))
@@ -195,8 +201,9 @@ def check(t_send_ns, mosi, miso, esp32_events=None, serial_events=None, skip_s=0
     sm = masks[sel[1:]] if len(sel) >= 2 else np.array([], dtype=np.int64)
     coverage = {name: (float(np.mean((sm >> k) & 1)) * 100.0 if len(sm) else None)
                 for k, (name, _) in enumerate(FIELDS)}
-    # IMU builds
-    reps = res['_reports']
+    # IMU builds. C2-6: the reports of the run: by source frame; no source frame: by the frame that carried it
+    reps = [r for r in res['_reports'] if first_sc <= (r['carrier_j'] if r['src_frame'] is None else r['src_frame'])
+            <= last_sc]
     imu = dict(n=len(reps), imu_crc_bad=sum(1 for r in reps if r.get('imu_crc_ok') is False),
                imu_seq_bad=sum(1 for r in reps if r.get('imu_seq_ok') is False),
                no_source_frame=sum(1 for r in reps if r['src_frame'] is None),
@@ -256,9 +263,9 @@ def check(t_send_ns, mosi, miso, esp32_events=None, serial_events=None, skip_s=0
     fails += dec.manifest_check(manifest, t_send_ns, mosi, miso)
     if manifest is None:
         incomplete.append('frames.npz không có manifest: không chứng minh được log frame đủ')
-    rp = res['reports']
-    if rp.get('seq_flags'):
-        fails.append(f"số thứ tự report H7 bất thường {rp['seq_flags']}")
+    seq_flags = {f: sum(1 for r in reps if r['seq_flag'] == f) for f in {r['seq_flag'] for r in reps} if f}
+    if seq_flags:
+        fails.append(f"số thứ tự report H7 bất thường {seq_flags}")
     if m is not None:
         if m['epoch_offset_esp32_minus_h7'] is None:
             fails.append(f"ghép report với ESP32: {m['epoch_note']}")
@@ -355,8 +362,7 @@ def main(argv=None) -> int:
                     a.min_s, a.clock_res_us, a.answer_lag, dec.load_cal(z, a), a.startup_empty,
                     dec.load_manifest(z))
     except dec.stm.RunProblem as exc:
-        print(f'không chấm: {exc}', file=sys.stderr)
-        return dec.stm.report_result(3, ['khong_du_dieu_kien'])
+        return dec.stm.report_run_problem(exc)
     except (OSError, KeyError, ValueError) as exc:
         print(f'lỗi đầu vào: {exc}', file=sys.stderr)
         return 2

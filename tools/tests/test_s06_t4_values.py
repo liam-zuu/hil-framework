@@ -287,6 +287,17 @@ def test_dut_results_do_not_fail_the_hil(frames, tmp_path):
         assert t4.outcome(s) == (0, None), s['run_conditions']
 
 
+def test_all_data_ticks_off_do_not_block_the_hil(frames, tmp_path):
+    # C2-7: no tick matches (ok = 0) while every callback is right: a DUT result; no tick at all: evidence missing
+    rows, s = check(frames, tmp_path, name='base.txt')
+    assert t4.outcome(s) == (0, None), s['run_conditions']
+    all_off = dict(s, data_yaw=dict(s['data_yaw'], ok=0, bad=s['data_yaw']['ticks']))
+    assert t4.outcome(all_off) == (0, None)
+    no_cb = dict(s, data_yaw=dict(s['data_yaw'], ok=0, no_callback=s['data_yaw']['ticks']))
+    assert t4.outcome(no_cb) == (0, None)
+    assert t4.outcome(dict(s, data_yaw=dict(s['data_yaw'], ok=0, ticks=0))) == (3, 'thieu_bang_chung')
+
+
 def test_data_stream_loss_still_fails(frames, tmp_path):
     # Z19: a DATA line lost is lost measurement data, not a DUT result
     rows, s = check(frames, tmp_path, drop_tick=lambda n: n == 500)
