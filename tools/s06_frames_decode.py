@@ -71,6 +71,7 @@ REC_ENC_START, REC_ENC_STOP = 0x35, 0x36            # feat/s06-h7 598a451, with 
 REPORT_KIND = {0: 'accel', 1: 'gyro', 2: 'game_rv'}
 ESP32_KIND = {1: 'accel', 2: 'gyro', 8: 'game_rv'}               # SH-2 report ids
 SEGMENT_GAP_US = 500_000.0
+ANSWER_LAG = 2                # the H7 answers frame N in frame N + 2 (fix/h7-frame)
 F_PRED_HZ = 483.1e6           # CYCCNT rate used only to predict the count across gaps (spec value, Phần D)
 SEQ_CUT_PERIODS = 128         # spec dòng 96: unwrap only below 128 report periods, cut the chain from 128
 PAD_US = 1_000_000.0          # S38 [ĐỀ XUẤT CODE]: the Pi frames and the ESP32 IMU lines must reach this far
@@ -243,6 +244,19 @@ def log_records(rows):
         recs.append(dict(idx=idx, type=r['log_type'], payload=r['payload'], carrier_j=r['j']))
     gaps = (max(seen) - min(seen) + 1 - len(seen)) if seen else 0
     return recs, dict(records=len(recs), repeated_frames=dups, gaps=gaps)
+
+
+def run_stream(recs, j_lo, j_hi) -> dict:
+    """C3-6 (X16): hở luồng log và số H7 bỏ trong lượt, không tính phần đệm: bản ghi mang bởi frame j_lo..j_hi,
+    cộng một bản ghi liền trước và liền sau (hở ngay mép lượt không kết luận được là ngoài lượt)."""
+    rr = sorted(recs, key=lambda r: r['idx'])
+    ins = [i for i, r in enumerate(rr) if j_lo <= r['carrier_j'] <= j_hi]
+    if not ins:
+        return dict(gaps=0, ticks=0, h7_dropped=None)
+    idx = [r['idx'] for r in rr[max(ins[0] - 1, 0):ins[-1] + 2]]
+    ticks = [rr[i] for i in ins if rr[i]['type'] == REC_TICK and 'cyc_full' in rr[i]]
+    dropped = (ticks[-1]['f']['dropped'] - ticks[0]['f']['dropped']) & 0xFFFF if len(ticks) >= 2 else None
+    return dict(gaps=idx[-1] - idx[0] + 1 - len(idx), ticks=len(ticks), h7_dropped=dropped)
 
 
 def parse_record(rec):
@@ -662,6 +676,16 @@ def decode(t_send_ns, mosi, miso, esp32_events: Optional[str] = None, cal: Optio
         res['_esp32_text'] = text
         res['resets_near_run_start'] = resets_near_start(recs, R, text)
         res['_esp32_I'] = I
+        if win is not None:
+            in_run = np.flatnonzero((t_send_us >= win[0]) & (t_send_us <= win[1]))
+            if len(in_run):
+                res['log'] = dict(lst, gaps_file=lst['gaps'], h7_dropped_file=lst['h7_dropped'],
+                                  **run_stream(recs, int(in_run[0]), int(in_run[-1]) + ANSWER_LAG))
+    # C3-2: a frame of the run the H7 did not answer (answers come ANSWER_LAG frames later); the whole log
+    # when the run marks are not known. Only the first ANSWER_LAG frames of the log have nothing to answer.
+    lo, hi = (res.get('esp32_match') or {}).get('window_pi_us') or (t_send_us[0], t_send_us[-1])
+    st['empty_in_run'] = sum(1 for r in rows if r['empty'] and r['j'] >= ANSWER_LAG
+                             and lo <= t_send_us[r['j'] - ANSWER_LAG] <= hi)
     res['_records'] = recs
     res['_frames_rows'] = rows
     res['_calls'] = calls
@@ -672,6 +696,8 @@ def decode(t_send_ns, mosi, miso, esp32_events: Optional[str] = None, cal: Optio
 def problems(res) -> List[str]:
     p = []
     f, lg, rp = res['frames'], res['log'], res['reports']
+    if f['empty_in_run']:
+        p.append(f"{f['empty_in_run']} frame MISO toàn 0 trong lượt (H7 không trả lời)")
     if f['miso_crc_bad']:
         p.append(f"{f['miso_crc_bad']} frame MISO sai CRC")
     if f['mosi_crc_bad']:

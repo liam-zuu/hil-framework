@@ -7,7 +7,8 @@ gửi/áp, cùng các lần đọc 1 ms trên MỘT cơ sở thời gian; chấm
   (0)  bộ phát lý tưởng "như khai báo" (Python): cạnh đúng từ ω_eff theo thời gian thực kể từ lúc
        áp frame; mỗi lần khởi động đặt lại pha, cạnh đầu ra sau hp (= 2 count tích phân), mỗi lần
        dừng bỏ phần lẻ; không có cạnh thừa. PHẢI ĐẠT MỌI CA.
-  (0s) như (0) cộng 2 cạnh thừa ngược chiều cũ ở mỗi lần dừng (cận "tới 2 cạnh" của spec): chỉ báo.
+  (0s) như (0) cộng 2 cạnh thừa ngược chiều cũ ở mỗi lần dừng (cận "tới 2 cạnh" của spec): vào cổng ở luật
+       ≤ 10 % "chưa kết luận" và u_t; ca không đạt của nó không chặn cổng (C3-17).
   (1)  EncoderGen cũ (git `--old-rev`, mặc định cb91e7a = trước bản sửa retime) trên harness
        stm32h7/pc_tests/encgen/encgen_t3b_main.c: ca có lỗi A11 (bước giải mã ngược theo từng cạnh,
        cột truth_rev) phải bị báo không đạt; ca có lỗi mà T3b không thấy = giới hạn phát hiện;

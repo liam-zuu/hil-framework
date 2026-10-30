@@ -145,7 +145,8 @@ def check_data_yaw(data_path, callbacks, seq_span=None):
     producer (#run_start, #run_end of s06_load); a log_seq of that span missing or repeated, a line that
     does not parse, or a tick whose rv_n has no callback line is lost data / a wrong value (Z19), not a
     note. The events file covers the run ± PAD_US (bộ giải mã), so the callback a tick points at is there.
-    rv_n ≤ 0 inside the run (no game RV applied yet) cannot be compared: counted apart (mã 3)."""
+    rv_n ≤ 0 inside the run (no game RV applied yet) cannot be compared: counted apart as a result about the
+    DUT, after the callback (C3-9)."""
     rows, header, bad_lines = data_yaw_rows(data_path)
     if seq_span is not None:
         lo, hi = seq_span
@@ -257,7 +258,8 @@ def check(t_send_ns, mosi, miso, events_path, data_path=None, cal=None, manifest
     data = check_data_yaw(data_path, res['_esp32_I'], data_seq_span(text)) if data_path else None
     summary = dict(epoch_offset_esp32_minus_h7=off, epoch_note=m['epoch_note'], window_pi_us=win,
                    qseq_stream=dec.stm.qseq_stream(events_path),
-                   dut=dict(data_yaw_bad=data['bad'], data_no_callback=data['no_callback']) if data else None,
+                   dut=dict(data_yaw_bad=data['bad'], data_no_callback=data['no_callback'],
+                            data_no_rv=data['no_rv']) if data else None,
                    window_esp32_us=esp, callback_reports=len(cb), manifest=manifest,
                    frame_log_faults=dec.manifest_check(manifest, t_send_ns, mosi, miso),
                    stimulus=dict(frames_checked=n_chk, frames_differ=n_diff, first_differ=k_diff),
@@ -270,12 +272,12 @@ def check(t_send_ns, mosi, miso, events_path, data_path=None, cal=None, manifest
 
 def outcome(summary):
     """(mã, lý do mã 3). 1: a report wrong, not matched, NaN, a decoder problem (Z19 stream, epoch not anchored
-    …), or measurement data lost: the qseq stream (C1-2), DATA lines lost, repeated, not parsed (S39). Not 1:
-    DATA yaw off or a tick with no callback (C1-5: results about the DUT, in `dut`). 3: run not valid or
-    evidence missing (decoder conditions: V4-1, run marks, TICK, ± PAD_US cover (S38); no ESP32 run span; no
-    callback; the MOSI is not the locked schedule (S42) or a schedule point not covered (S18); no
-    esp32_data.txt, no data seq span or no DATA tick in the run, or ticks without a game RV yet (S28, S39, C2-7));
-    0 otherwise."""
+    …), or measurement data lost: the qseq stream (C1-2), DATA lines lost, repeated, not parsed (S39). Not 1, and
+    no bar to a conclusion on the HIL: DATA yaw off, a tick with no callback, a tick with no game RV yet (C1-5,
+    C2-7, C3-9: results about the DUT, in `dut`). 3: run not valid or evidence missing (decoder conditions:
+    V4-1, run marks, TICK, ± PAD_US cover (S38); no ESP32 run span; no callback; the MOSI is not the locked
+    schedule (S42) or a schedule point not covered (S18); no esp32_data.txt, no data seq span or no DATA tick
+    in the run (S28, S39, C2-7)); 0 otherwise."""
     d = summary['data_yaw']
     qs = summary['qseq_stream']
     if summary['fail'] or summary['decode_problems'] or summary['frame_log_faults']:
@@ -296,8 +298,7 @@ def outcome(summary):
             or summary['coverage_missing']):
         return 3, 'khong_du_dieu_kien'
     # C2-7: no DATA tick at all is evidence missing; ticks that all differ from the callback are a DUT result
-    if (man is None or not qs['known'] or d is None or not d['header'] or d['seq_span'] is None or d['no_rv']
-            or not d['ticks']):
+    if man is None or not qs['known'] or d is None or not d['header'] or d['seq_span'] is None or not d['ticks']:
         return 3, 'thieu_bang_chung'
     return 0, None
 
