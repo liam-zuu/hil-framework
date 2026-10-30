@@ -39,6 +39,11 @@ Sửa theo Codex Sol vòng 1/2 (Liam duyệt 30/10 "Duyệt, sửa hết"), thay
   * S23: cột `pin` = chân H7 của GPIO có compare khác 1000 (motor.c `motor_set_info`: chân không lái giữ
     compare = PWM_RESOLUTION); `-` khi duty 0.
 
+Sửa theo Codex Sol vòng 2/2 (Liam 30/10 "Sửa P1 rồi vòng 3"):
+  * S40: đủ luồng cả lượt, không chỉ 200 frame chấm: mọi qseq trong [#run_start; #run_end] phải có dòng
+    (s06_stream.qseq_stream), `ev_qdrop_run` = 0, và không frame MISO nào sai CRC/rỗng trong lượt (giờ Pi);
+    thiếu → mã 1 (Z19). Thiếu #run_start/#run_end (hay qseq của chúng) → mã 3.
+
 Usage:
   python tools/s06_t6_check.py <frames.npz> --esp32-events esp32_events.txt --out <thư mục>
          --clock-affine OFFSET_US RATE --u-duty 0.0017
@@ -61,6 +66,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path[:0] = [HERE, os.path.join(HERE, '..', 'rpi5')]
 import s06_frames_decode as dec  # noqa: E402
+import s06_stream as stm  # noqa: E402
 import s06_t5_score as t5s  # noqa: E402
 from protocol import decode_torques  # noqa: E402
 
@@ -236,7 +242,7 @@ def check(t_send_ns, mosi, miso, P, to_pi, u_duty=None, wiring=WIRING, run_end_e
         r['idx'] = i
     for i, r in enumerate(follow):
         r['idx'] = i
-    return scored, follow, levels, missing, int(np.sum(~good))
+    return scored, follow, levels, missing, good
 
 
 def follow_summary(follow):
@@ -251,16 +257,26 @@ def follow_summary(follow):
     return out
 
 
-def verdict(levels, missing, synced=True, u_known=True):
-    """1 any level fails (value or lost data, Z19); 3 a level missing (incl. W15), short or inconclusive,
-    or the acceptance evidence missing: no marker-pin clock (S21: the UDP envelope moves the 200 scored
-    frames) or no reference uncertainty `--u-duty` (S19); 0 otherwise."""
+def verdict(levels, missing, synced=True, u_known=True, stream_ok=True, stream_known=True):
+    """1 any level fails (value or lost data, Z19), or the run lost data anywhere (S40: a P/qseq line of the
+    run missing, an ESP32 queue drop, a bad/empty MISO frame inside the run, even outside the 200 scored
+    frames); 3 a level missing (incl. W15), short or inconclusive, or the acceptance evidence missing:
+    no #run_start/#run_end qseq marks (S40), no marker-pin clock (S21: the UDP envelope moves the 200
+    scored frames) or no reference uncertainty `--u-duty` (S19); 0 otherwise."""
     v = [l['verdict'] for l in levels]
-    if 'fail' in v or 'fail_data_loss' in v:
+    if 'fail' in v or 'fail_data_loss' in v or not stream_ok:
         return 1
-    if missing or 'short' in v or 'inconclusive' in v or not synced or not u_known:
+    if (missing or 'short' in v or 'inconclusive' in v or not synced or not u_known or not stream_known):
         return 3
     return 0
+
+
+def run_frames_bad(t_send_ns, good, t0_pi, t1_pi):
+    """S40: bad or empty MISO frames among the frames the Pi sent inside the run (Pi clock), the 200
+    scored ones or not: lost measurement data of the run (Z19)."""
+    t = np.asarray(t_send_ns, dtype=np.float64) / 1000.0
+    sel = (t >= t0_pi) & (t <= t1_pi)
+    return int(np.sum(sel & ~good)), int(np.sum(sel))
 
 
 def write_csv(path, rows, cols):
@@ -299,8 +315,15 @@ def main(argv=None) -> int:
             sync = dict(kind='udp_envelope', **fit,
                         note='khảo sát: giờ Pi suy ra trễ hơn thật bằng trễ UDP nhỏ nhất (chưa đo), tập 200 frame '
                              'chấm và follow_ms dịch theo; không cấp kết luận nghiệm thu (S21)')
-        scored, follow, levels, missing, crc_bad = check(z['t_send_ns'], z['mosi'], z['miso'], P, to_pi, a.u_duty,
-                                                         run_end_esp=marks.get('run_end'))
+        scored, follow, levels, missing, good = check(z['t_send_ns'], z['mosi'], z['miso'], P, to_pi, a.u_duty,
+                                                      run_end_esp=marks.get('run_end'))
+        # S40: the whole run must be complete, not only the 200 scored frames of each level
+        qs = stm.qseq_stream(a.esp32_events)
+        if 'run_start' in marks and 'run_end' in marks:
+            run_bad, run_frames = run_frames_bad(z['t_send_ns'], good, float(to_pi(marks['run_start'])),
+                                                 float(to_pi(marks['run_end'])))
+        else:
+            run_bad = run_frames = None
     except (OSError, KeyError, ValueError) as exc:
         print(f'lỗi đầu vào: {exc}', file=sys.stderr)
         return 2
@@ -315,9 +338,12 @@ def main(argv=None) -> int:
     summ = dict(max_abs_err=max(errs) if errs else None, u_duty=a.u_duty, limit=LIMIT,
                 levels={v: sum(l['verdict'] == v for l in levels)
                         for v in ('pass', 'fail', 'fail_data_loss', 'inconclusive', 'short')},
-                levels_missing=missing, miso_crc_bad_frames=crc_bad, sync=sync, run_end_esp_us=marks.get('run_end'),
+                levels_missing=missing, miso_crc_bad_frames=int(np.sum(~good)), run_frames=run_frames,
+                run_frames_bad=run_bad, qseq_stream=qs, sync=sync, run_end_esp_us=marks.get('run_end'),
                 follow=follow_summary(follow),
-                exit_code=verdict(levels, missing, synced=sync['kind'] == 'manual', u_known=a.u_duty is not None))
+                exit_code=verdict(levels, missing, synced=sync['kind'] == 'manual', u_known=a.u_duty is not None,
+                                  stream_ok=qs['ok'] and not run_bad,
+                                  stream_known=qs['known'] and run_bad is not None))
     with open(os.path.join(a.out, 'T6_summary.json'), 'w', encoding='utf-8') as f:
         json.dump(summ, f, ensure_ascii=False, indent=1, default=lambda o: o.item() if hasattr(o, 'item') else str(o))
     print(json.dumps(summ, default=lambda o: o.item() if hasattr(o, 'item') else str(o)))

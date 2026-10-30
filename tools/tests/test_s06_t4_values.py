@@ -17,8 +17,10 @@ import t4_imu_profile as prof  # noqa: E402
 from protocol import decode_imu  # noqa: E402
 from test_s06_frames_decode import build  # noqa: E402
 
-N = 28_500                                   # one full 27 s cycle of the T4 schedule + margins
+N = 30_500                                   # one full 27 s cycle of the T4 schedule + margins
 KINDS = ((0, 1, 'accel'), (1, 2, 'gyro'), (2, 8, 'game_rv'))
+T_START = 1_500_000                          # > 1 s after the reset and ≥ PAD_US after the first frame
+T_END = N * 1000 - 1_200_000                 # ≥ PAD_US before the last frame / last J, I line (S38)
 
 
 def report_frame(n):
@@ -40,11 +42,15 @@ def frames():
     return build(n=N, imu_fn=lambda k: prof.sample(k / 1000.0))
 
 
-def events(tmp_path, mosi, seqs, fault=None, skip=None, name='esp32_events.txt'):
+def events(tmp_path, mosi, seqs, fault=None, skip=None, name='esp32_events.txt', marks=(T_START, T_END),
+           drop_tick=None):
     """J/I lines (Pi clock = ESP32 clock), #run_start/#run_end; returns (events path, data path). The DATA
-    file has one tick per game-RV callback with its rv_n and yaw in rad (%.4f, as logger.c)."""
-    lines = ['1500000\t#run_start,first_data_seq=1,timestamp_us=1500000,qseq=0']   # > 1 s after the reset
-    data = ['1\ttimestamp_us,x,yaw_rad,rv_n']
+    file has one tick per game-RV callback with log_seq = its rv_n and yaw in rad (%.4f, as logger.c);
+    first_data_seq/last_data_seq of the marks span the ticks inside the run. `drop_tick(rv_n)` True leaves
+    that tick out of the file (lost DATA line)."""
+    lines = [f'{marks[0]}\t#run_start,first_data_seq=@FIRST@,timestamp_us={marks[0]},qseq=0']
+    data = ['1\ttimestamp_us,x,yaw_rad,log_seq,rv_n']
+    in_run = []
     q, rv_n = 0, 0
     for s, code, kind in KINDS:
         for n in range(seqs[s]):
@@ -81,11 +87,17 @@ def events(tmp_path, mosi, seqs, fault=None, skip=None, name='esp32_events.txt')
                 y = (v[2] + 180.0) % 360.0 - 180.0
                 if fault and fault[2] == 'data_yaw' and n == fault[1]:
                     y += 1.0
-                data.append(f'{t + 900}\t{t + 900},0,{math.radians(y):.4f},{rv_n}')
+                tick_rv = rv_n + 5000 if (fault and fault[2] == 'data_no_cb' and n == fault[1]) else rv_n
+                if marks[0] <= t + 900 <= marks[1]:
+                    in_run.append(rv_n)
+                if not (drop_tick and drop_tick(rv_n)):
+                    data.append(f'{t + 900}\t{t + 900},0,{math.radians(y):.4f},{rv_n},{tick_rv}')
             lines.append(f'{t + 50}\tI,{q},{t + 50},{code},{applied},{nn % 256},2,'
                          f'{rv_n if (kind == "game_rv" and applied) else n},{n},'
                          + ','.join(f'{x:.9g}' for x in v))
-    lines.append(f'{N * 1000 - 300_000}\t#run_end,last_data_seq=9,timestamp_us=0,qseq={q + 1}')
+    lines.append(f'{marks[1]}\t#run_end,last_data_seq={max(in_run)},timestamp_us={marks[1]},qseq={q + 1}')
+    lines[0] = lines[0].replace('@FIRST@', str(min(in_run)))
+    lines.sort(key=lambda x: int(x.split('\t')[0]))
     p = tmp_path / name
     p.write_text('\n'.join(lines) + '\n')
     d = tmp_path / ('data_' + name)
@@ -138,6 +150,56 @@ def test_data_yaw_mismatch_fails(frames, tmp_path):
     # S28: the controller's DATA yaw for one rv_n differs from the callback's
     rows, s = check(frames, tmp_path, fault=('game_rv', 1500, 'data_yaw'))
     assert s['data_yaw']['bad'] == 1 and t4.exit_code(s) == 1
+
+
+def test_fault_at_run_start_is_scored(frames, tmp_path):
+    # S38: a wrong gyro callback 0,1 s after #run_start used to fall in the 0,5 s left out at each end
+    n = (T_START // 1000 + 100 - 30) // 10
+    rows, s = check(frames, tmp_path, fault=('gyro', n, 'sign'))
+    assert s['per_kind']['gyro']['fail'] == 1 and t4.exit_code(s) == 1
+
+
+def test_fault_just_before_run_end_is_scored(frames, tmp_path):
+    n = (T_END // 1000 - 100 - 30) // 10
+    rows, s = check(frames, tmp_path, fault=('accel', n, 'scale'))
+    assert s['per_kind']['accel']['fail'] == 1 and t4.exit_code(s) == 1
+
+
+def test_recording_not_padded_is_incomplete(frames, tmp_path):
+    # S38: the run ends 0,3 s before the last frame: the reports at the end may lack their counterpart
+    rows, s = check(frames, tmp_path, marks=(T_START, N * 1000 - 300_000))
+    assert any('S38' in c for c in s['run_conditions']) and t4.exit_code(s) == 3
+
+
+def test_data_tick_lost_fails(frames, tmp_path):
+    # S39: one DATA line of the run missing from the file (log_seq hole) = lost data, not "one tick is enough"
+    rows, s = check(frames, tmp_path, drop_tick=lambda rv: rv == 1200)
+    assert s['data_yaw']['seq_missing'] == 1 and s['data_yaw']['bad'] == 0 and t4.exit_code(s) == 1
+
+
+def test_data_tick_without_callback_fails(frames, tmp_path):
+    # S39: a tick that points at an rv_n no callback line has (Codex counter-example) fails
+    rows, s = check(frames, tmp_path, fault=('game_rv', 1500, 'data_no_cb'))
+    assert s['data_yaw']['no_callback'] == 1 and t4.exit_code(s) == 1
+
+
+def test_data_bad_line_fails(frames, tmp_path):
+    t, mosi, miso, seqs = frames
+    ev, data = events(tmp_path, mosi, seqs, name='badline.txt')
+    with open(data, 'a') as fh:
+        fh.write('29000000\t29000000,0,abc,1,1\n')
+    rows, s = t4.check(t, mosi, miso, ev, data)
+    assert s['data_yaw']['bad_lines'] == 1 and t4.exit_code(s) == 1
+
+
+def test_stimulus_not_the_schedule_is_incomplete(tmp_path):
+    # S42: the Pi sent one static IMU value all run (profile not set) and every report carried it
+    # faithfully: values all right, but the schedule was not sent, so coverage must not be credited
+    fr = build(n=N, imu_fn=lambda k: (0.0, 0.0, 0.0, prof.AZ, 0.0))
+    t, mosi, miso, seqs = fr
+    ev, data = events(tmp_path, mosi, seqs)
+    rows, s = t4.check(t, mosi, miso, ev, data)
+    assert s['fail'] == 0 and s['stimulus']['frames_differ'] > 0 and t4.exit_code(s) == 3
 
 
 def test_cli_exit_codes(frames, tmp_path):

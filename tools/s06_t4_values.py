@@ -27,6 +27,14 @@ Sửa theo Codex Sol vòng 1/2 (Liam duyệt 30/10 "Duyệt, sửa hết"):
   * S28: `--esp32-data` (bắt buộc ở chế độ nghiệm thu): cột `yaw_rad` của mỗi tick DATA phải bằng yaw của
     callback game RV cùng `rv_n` (độ → rad, quấn), dung sai 6e-5 rad (%.4f + float32) [ĐỀ XUẤT CODE].
 
+Sửa theo Codex Sol vòng 2/2 (Liam 30/10 "Sửa P1 rồi vòng 3"):
+  * S38: không bớt 0,5 s mỗi đầu nữa: chấm MỌI callback trong #run_start..#run_end (giờ ESP32); frame Pi
+    và dòng J/I phải phủ lượt ± 1 s (PAD_US, bộ giải mã), thiếu → mã 3.
+  * S39: DATA phải đủ mọi log_seq trong [first_data_seq; last_data_seq] của lượt; thiếu, trùng, dòng không
+    đọc được, hay tick trỏ tới rv_n không có callback → mã 1 (không còn "một tick khớp là đủ").
+  * S42: độ phủ chỉ tính khi MOSI thật bằng đúng lịch khóa (so int16 từng frame của lượt và frame nguồn);
+    khác → mã 3 (Pi không phát lịch T4, ví dụ quên `--imu-profile t4`).
+
 Usage:
   python tools/s06_t4_values.py <frames.npz> <esp32_events.txt> --esp32-data <esp32_data.txt> --out <thư mục>
 Mã thoát: 0 đạt đủ; 1 có report sai, NaN, không ghép được, yaw DATA lệch hoặc bộ giải mã báo vấn đề;
@@ -48,7 +56,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path[:0] = [HERE, os.path.join(HERE, '..', 'rpi5')]
 import s06_frames_decode as dec  # noqa: E402
 import t4_imu_profile as prof  # noqa: E402
-from protocol import decode_imu  # noqa: E402
+from protocol import N_STATES, decode_imu, encode_state  # noqa: E402
 
 TOL = {'accel': 2.55e-3, 'gyro': 1.51e-3, 'game_rv': 2.2e-4}
 DATA_YAW_TOL = 6e-5           # S28: %.4f of logger.c (5e-5) + float32 of imu_fusion.c [ĐỀ XUẤT CODE]
@@ -94,8 +102,9 @@ def required_points(kind):
 
 
 def data_yaw_rows(path):
-    """DATA lines of esp32_data.txt (logger.c): (rv_n, yaw_rad); the header line gives the columns."""
-    out, cols = [], None
+    """DATA lines of esp32_data.txt (logger.c): (log_seq, rv_n, yaw_rad); the header line gives the columns.
+    A line that does not parse is counted (`bad_lines`), not dropped silently (S39)."""
+    out, cols, bad = [], None, 0
     with open(path, encoding='utf-8', errors='replace') as fh:
         for raw in fh:
             _, sep, line = raw.rstrip('\n').partition('\t')
@@ -103,28 +112,42 @@ def data_yaw_rows(path):
                 continue
             if line.startswith('timestamp_us'):
                 names = line.split(',')
-                cols = (names.index('rv_n'), names.index('yaw_rad'))
+                cols = (names.index('log_seq'), names.index('rv_n'), names.index('yaw_rad'))
                 continue
             if cols is None or line.startswith('#'):
                 continue
             f = line.split(',')
             try:
-                out.append((int(f[cols[0]]), float(f[cols[1]])))
+                out.append((int(f[cols[0]]), int(f[cols[1]]), float(f[cols[2]])))
             except (ValueError, IndexError):
-                continue
-    return out, cols is not None
+                bad += 1
+    return out, cols is not None, bad
 
 
-def check_data_yaw(data_path, callbacks):
+def check_data_yaw(data_path, callbacks, seq_span=None):
     """S28 (spec dòng 100, V3-5): yaw_rad of each DATA tick must equal the yaw of the game-RV callback
     with the same rv_n (callback I field n = ++rv_n when applied), deg → rad wrapped as imu_fusion.c
-    does, within the %.4f print of logger.c + float32 (DATA_YAW_TOL)."""
-    rows, header = data_yaw_rows(data_path)
+    does, within the %.4f print of logger.c + float32 (DATA_YAW_TOL).
+    S39: every tick of the run is required, not one: `seq_span` = (first_data_seq, last_data_seq) of the
+    producer (#run_start, #run_end of s06_load); a log_seq of that span missing or repeated, a line that
+    does not parse, or a tick whose rv_n has no callback line is lost data / a wrong value (Z19), not a
+    note. The events file covers the run ± PAD_US (bộ giải mã), so the callback a tick points at is there.
+    rv_n ≤ 0 inside the run (no game RV applied yet) cannot be compared: counted apart (mã 3)."""
+    rows, header, bad_lines = data_yaw_rows(data_path)
+    if seq_span is not None:
+        lo, hi = seq_span
+        rows = [r for r in rows if lo <= r[0] <= hi]
+        seen = [r[0] for r in rows]
+        missing = (hi - lo + 1) - len(set(seen)) if hi >= lo else 0
+        dups = len(seen) - len(set(seen))
+    else:
+        missing = dups = None
     by_n = {i['n_cb']: i for i in callbacks if i['kind'] == 'game_rv' and i['applied'] == 1}
-    n_ok = n_bad = n_nomatch = 0
+    n_ok = n_bad = n_nomatch = n_norv = 0
     worst = 0.0
-    for rv_n, y in rows:
+    for _, rv_n, y in rows:
         if rv_n <= 0:
+            n_norv += 1
             continue
         i = by_n.get(rv_n)
         if i is None:
@@ -136,19 +159,49 @@ def check_data_yaw(data_path, callbacks):
             n_ok += 1
         else:
             n_bad += 1
-    return dict(header=header, ticks=len(rows), ok=n_ok, bad=n_bad, no_callback=n_nomatch,
+    return dict(header=header, seq_span=seq_span, ticks=len(rows), seq_missing=missing, seq_dups=dups,
+                bad_lines=bad_lines, ok=n_ok, bad=n_bad, no_callback=n_nomatch, no_rv=n_norv,
                 max_err_rad=worst if (n_ok or n_bad) else None, tol=DATA_YAW_TOL)
+
+
+def data_seq_span(text):
+    """(first_data_seq, last_data_seq) of the run from the s06_load marks; None if not present."""
+    try:
+        return (int(text['run_start']['kv']['first_data_seq']), int(text['run_end']['kv']['last_data_seq']))
+    except (KeyError, ValueError):
+        return None
+
+
+def stimulus_check(t_send_us, mosi, window, src_frames, period_us=1000.0):
+    """S42: the coverage names a schedule point from the frame index, so first prove that the MOSI the Pi
+    really sent IS the locked schedule: every frame of the run (Pi clock `window`) and every source frame
+    of a scored report must carry exactly the int16 values of t4_imu_profile.sample(step × period)
+    (same encoder as hil_node.py). Returns (frames checked, frames that differ, first differing frame)."""
+    ks = set(src_frames)
+    if window is not None:
+        t = np.asarray(t_send_us, dtype=float)
+        ks |= set(np.nonzero((t >= window[0]) & (t <= window[1]))[0].tolist())
+    zero = [0.0] * N_STATES
+    bad, first = 0, None
+    for k in sorted(ks):
+        want = decode_imu(encode_state(zero, imu=prof.sample(k * period_us * 1e-6)))[:5]
+        if tuple(decode_imu(bytes(mosi[k]))[:5]) != tuple(want):
+            bad += 1
+            first = k if first is None else first
+    return len(ks), bad, first
 
 
 def check(t_send_ns, mosi, miso, events_path, data_path=None, cal=None):
     """Score every callback line I that has a report identity (S33: also applied = 0, whose value was
-    read before the mutex), inside the common run window (S32)."""
+    read before the mutex), S38: every callback inside #run_start..#run_end on the ESP32 clock (the same
+    clock the I lines carry; no edge left out)."""
     res = dec.decode(t_send_ns, mosi, miso, events_path, cal)
     m = res['esp32_match']
     off = m['epoch_offset_esp32_minus_h7']
     win = m['window_pi_us']
+    esp = res.get('esp32_run_esp_us')
     h7 = {} if off is None else {(r['epoch'] + off, r['kind'], r['n']): r for r in res['_reports']}
-    cb = [i for i in res['_esp32_I'] if win is None or win[0] <= i['t_rx'] <= win[1]]
+    cb = [i for i in res['_esp32_I'] if esp is None or esp[0] <= i['t_us'] <= esp[1]]
     rows, stats = [], defaultdict(lambda: dict(n=0, applied0=0, fail=0, no_source=0, non_finite=0, max_ratio=0.0))
     covered = defaultdict(set)
     for r in sorted(cb, key=lambda x: x['t_us']):
@@ -184,9 +237,13 @@ def check(t_send_ns, mosi, miso, events_path, data_path=None, cal=None):
                    err1=err[0], err2=err[1], err3=err[2], tol=tol, ok=ok, note='' if finite else 'NaN/Inf')
         rows.append(row)
     missing = {k: sorted(required_points(k) - covered[k]) for k in TOL if required_points(k) - covered[k]}
-    data = check_data_yaw(data_path, res['_esp32_I']) if data_path else None
+    srcs = [r['src_frame'] for r in rows if r.get('src_frame') is not None]
+    n_chk, n_diff, k_diff = stimulus_check(np.asarray(t_send_ns, dtype=np.int64) / 1e3, mosi, win, srcs)
+    text = res.get('_esp32_text', {})
+    data = check_data_yaw(data_path, res['_esp32_I'], data_seq_span(text)) if data_path else None
     summary = dict(epoch_offset_esp32_minus_h7=off, epoch_note=m['epoch_note'], window_pi_us=win,
-                   callback_reports=len(cb),
+                   window_esp32_us=esp, callback_reports=len(cb),
+                   stimulus=dict(frames_checked=n_chk, frames_differ=n_diff, first_differ=k_diff),
                    per_kind={k: dict(v, tol=TOL.get(k), unit=UNIT.get(k)) for k, v in stats.items()},
                    fail=sum(s['fail'] for s in stats.values()),
                    coverage={k: sorted(v) for k, v in covered.items()}, coverage_missing=missing,
@@ -195,15 +252,20 @@ def check(t_send_ns, mosi, miso, events_path, data_path=None, cal=None):
 
 
 def exit_code(summary) -> int:
-    """1: a report wrong, not matched, NaN, a DATA yaw that differs, or a decoder problem (Z19 stream,
-    epoch not anchored …); 3: run not valid or evidence missing (decoder conditions: V4-1, run marks,
-    TICK; no callback; schedule point not covered (S18); no esp32_data.txt or no matched tick (S28));
-    0 otherwise."""
+    """1: a report wrong, not matched, NaN, a decoder problem (Z19 stream, epoch not anchored …), or a DATA
+    tick lost / wrong / pointing at no callback / not parsed (S39); 3: run not valid or evidence missing
+    (decoder conditions: V4-1, run marks, TICK, ± PAD_US cover (S38); no ESP32 run span; no callback;
+    the MOSI is not the locked schedule (S42) or a schedule point not covered (S18); no esp32_data.txt,
+    no data seq span in the run marks, or ticks without a game RV yet (S28, S39)); 0 otherwise."""
     d = summary['data_yaw']
-    if summary['fail'] or summary['decode_problems'] or (d and d['bad']):
+    if summary['fail'] or summary['decode_problems']:
         return 1
-    if (summary['run_conditions'] or summary['callback_reports'] == 0 or summary['coverage_missing']
-            or d is None or not d['header'] or not d['ok']):
+    if d and (d['bad'] or d['no_callback'] or d['bad_lines'] or d['seq_missing'] or d['seq_dups']):
+        return 1
+    if (summary['run_conditions'] or summary['window_esp32_us'] is None or summary['callback_reports'] == 0
+            or summary['stimulus']['frames_differ'] or summary['coverage_missing']):
+        return 3
+    if d is None or not d['header'] or d['seq_span'] is None or d['no_rv'] or not d['ok']:
         return 3
     return 0
 

@@ -94,7 +94,7 @@ ENC_EVENTS = [(1000, 0, 'S', 1), (3000, 0, 'P', 1), (3000, 0, 'S', 2), (9000, 2,
               (18000, 0, 'S', 3)]
 
 
-def esp32_file(tmp_path, seqs, epoch_off=1, skip=(), marks=(1_500_000, N * 1000 - 500_000), extra=(), resets=()):
+def esp32_file(tmp_path, seqs, epoch_off=1, skip=(), marks=(1_500_000, N * 1000 - 1_500_000), extra=(), resets=()):
     """J/I lines of the reports of build(): report n of a kind is built at frame 30 + 10 n and reaches
     the ESP32 SPI port ~300 µs later; ESP32 clock = Pi clock here (t_us = t_rx)."""
     lines, q = [], 0

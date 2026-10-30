@@ -173,9 +173,10 @@ PI0, PPM = 9e9, 25e-6
 
 def write_events(path, reads, lost=(), temp_c=lambda t: 40.0 + t / 1e8, enc_ovf=0, run_end=True):
     """esp32_events.txt like s06_logger.py: Pi receive time, 10 E lines per packet, an S line each 1 s,
-    #run_end with the overflow counters of s06_load end_run."""
+    #run_end with the overflow counters of s06_load end_run, #run_stats with enc_reads_run (S41: the reads
+    the producer made in the run, incl. the ones the ring dropped)."""
     rng = np.random.default_rng(7)
-    lines = ['1\t#run_start,t_us=0']
+    lines = [f'1\t#run_start,timestamp_us={int(reads.tb[0]) - 500},qseq=0']
     t_s = reads.tb[0] - reads.tb[0] % 1e6 + 1e6
     for i in range(0, len(reads.tb), 10):
         t_rx = int(PI0 + reads.ta[min(i + 9, len(reads.tb) - 1)] * (1 + PPM) + rng.uniform(2000, 8000))
@@ -191,6 +192,7 @@ def write_events(path, reads, lost=(), temp_c=lambda t: 40.0 + t / 1e8, enc_ovf=
         lines.append(f'{t_rx + 1000}\t#run_end,last_data_seq=1,log_qdrop=0,log_send_err=0,timestamp_us='
                      f'{int(reads.ta[-1])},reason=duration,elapsed_us=0,log_qdrop_run=0,ev_qdrop_run=0,'
                      f'enc_ovf_run={enc_ovf},imu_drop_run=0/0/0,gyro_gap_max_us=0,qseq=9')
+        lines.append(f'{t_rx + 1001}\t#run_stats,log_send_err_run=0,enc_reads_run={len(reads.tb) + enc_ovf},qseq=10')
     with open(path, 'w') as f:
         f.write('\n'.join(lines) + '\n')
 
@@ -264,6 +266,16 @@ def test_cli_lost_read_or_overflow_fails(run2):
     assert code == 1 and summ['eseq_gaps'] == 1 and not summ['stream']['ok']
     code, summ, _, _ = _cli(run2, 'ovf', '--xtal-ppm', '20', enc_ovf=2)
     assert code == 1 and summ['stream']['enc_ovf_run'] == 2
+
+
+def test_cli_lost_head_or_tail_fails(run2):
+    # S41: every E line of the first 100 s (or the last 50) lost: no hole between the eseq received, but
+    # fewer lines than the producer read (enc_reads_run) = lost data
+    n = len(run2[3].tb)
+    code, summ, _, _ = _cli(run2, 'head', '--xtal-ppm', '20', lost=set(range(100_000)))
+    assert code == 1 and summ['stream']['run_reads_missing'] == 100_000 and summ['eseq_gaps'] == 0
+    code, summ, _, _ = _cli(run2, 'tail', '--xtal-ppm', '20', lost=set(range(n - 50_000, n)))
+    assert code == 1 and summ['stream']['run_reads_missing'] == 50_000
 
 
 def test_cli_missing_evidence_is_not_a_pass(run2):

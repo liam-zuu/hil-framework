@@ -71,8 +71,9 @@ ESP32_KIND = {1: 'accel', 2: 'gyro', 8: 'game_rv'}               # SH-2 report i
 SEGMENT_GAP_US = 500_000.0
 F_PRED_HZ = 483.1e6           # CYCCNT rate used only to predict the count across gaps (spec value, Phần D)
 SEQ_CUT_PERIODS = 128         # spec dòng 96: unwrap only below 128 report periods, cut the chain from 128
-EDGE_US = 500_000.0           # S32 [ĐỀ XUẤT CODE]: reports this close to an end of the common window
-                              # (Pi frames ∩ ESP32 #run_start..#run_end) are reported, not scored
+PAD_US = 1_000_000.0          # S38 [ĐỀ XUẤT CODE]: the Pi frames and the ESP32 IMU lines must reach this far
+                              # beyond #run_start..#run_end, so every report scored inside the run has its
+                              # counterpart in the files; the scored window itself is never shrunk
 RESET_NEAR_US = 1_000_000.0   # V4-1: no reset-complete within ±1 s of #run_start
 CARRY_MARGIN_CYC = 1_000_000  # a record's CYCCNT may be stamped up to ~2 ms after its carrier's callback
 
@@ -442,13 +443,38 @@ def epoch_offset(h7, J):
 
 
 def common_window(t_send_us, text):
-    """Window scored for report matching on the Pi clock: Pi frames ∩ ESP32 #run_start..#run_end
-    (t_rx), shrunk by EDGE_US at both ends (S32). None if the ESP32 run marks are missing."""
+    """Window scored for report matching on the Pi clock: exactly #run_start..#run_end of the ESP32
+    (receive time t_rx), not shrunk (S38: shrinking let wrong reports at the ends escape). None if the
+    ESP32 run marks are missing."""
     if 'run_start' not in text or 'run_end' not in text:
         return None
-    lo = max(float(t_send_us[0]), float(text['run_start']['t_rx'])) + EDGE_US
-    hi = min(float(t_send_us[-1]), float(text['run_end']['t_rx'])) - EDGE_US
+    lo, hi = float(text['run_start']['t_rx']), float(text['run_end']['t_rx'])
     return (lo, hi) if hi > lo else None
+
+
+def esp_run_span(text):
+    """#run_start..#run_end on the ESP32 clock (`timestamp_us` the firmware stamps): the scored span of
+    ESP32-side lines (callbacks I, DATA ticks), which carry the same clock. None if missing."""
+    try:
+        return (int(text['run_start']['kv']['timestamp_us']), int(text['run_end']['kv']['timestamp_us']))
+    except (KeyError, ValueError):
+        return None
+
+
+def pad_check(window, t_send_us, J, I):
+    """S38: the matching pools (all H7 reports of the frame log, all J/I of the events file) must cover
+    the scored window plus PAD_US on both sides; otherwise a report at an end may lack its counterpart
+    only because the recording stopped. Returns a note ('' = covered)."""
+    if window is None:
+        return ''
+    lo, hi = window
+    out = []
+    if float(t_send_us[0]) > lo - PAD_US or float(t_send_us[-1]) < hi + PAD_US:
+        out.append(f'frame Pi [{t_send_us[0]:.0f}; {t_send_us[-1]:.0f}] µs không phủ lượt ± {PAD_US / 1e6:g} s')
+    t_imu = [x['t_rx'] for x in list(J) + list(I)]
+    if not t_imu or min(t_imu) > lo - PAD_US or max(t_imu) < hi + PAD_US:
+        out.append(f'dòng J/I của ESP32 không phủ lượt ± {PAD_US / 1e6:g} s')
+    return '; '.join(out)
 
 
 def match_esp32(h7, J, I, window=None, span=None):
@@ -599,8 +625,12 @@ def decode(t_send_ns, mosi, miso, esp32_events: Optional[str] = None, cal: Optio
     if esp32_events:
         J, I, R, text = esp32_lines(esp32_events)
         span = (float(t_send_us[0]), float(t_send_us[-1]))
-        res['esp32_match'] = match_esp32(reps, J, I, common_window(t_send_us, text), span)
+        win = common_window(t_send_us, text)
+        res['esp32_match'] = match_esp32(reps, J, I, win, span)
+        res['esp32_match']['pad_note'] = pad_check(win, t_send_us, J, I)
         res['esp32_run_marks'] = sorted(text)
+        res['esp32_run_esp_us'] = esp_run_span(text)
+        res['_esp32_text'] = text
         res['resets_near_run_start'] = resets_near_start(recs, R, text)
         res['_esp32_I'] = I
     res['_records'] = recs
@@ -654,6 +684,8 @@ def conditions(res) -> List[str]:
     m = res.get('esp32_match')
     if m and m['window_pi_us'] is None:
         c.append('esp32_events thiếu #run_start/#run_end: chấm ghép report trên cả luồng, không theo khung lượt')
+    if m and m.get('pad_note'):
+        c.append(f"S38: {m['pad_note']}: report ở đầu/cuối lượt có thể thiếu bản đối chiếu, ghi đo dài hơn")
     rz = res.get('resets_near_run_start')
     if 'esp32_match' in res and rz is None:
         c.append('thiếu #run_start: không kiểm được điều kiện reset ±1 s (V4-1)')

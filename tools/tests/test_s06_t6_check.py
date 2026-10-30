@@ -62,7 +62,7 @@ def esp(t_pi):
 
 
 def build(tmp_path, steps=STEPS, hold_s=1.0, gain=(1, 1, 1, 1), offset=None, bad_gpio=False, tau_frames=1.0,
-          corrupt=(), ppm=None, glitch=None, end_force=True, run_end=True):
+          corrupt=(), ppm=None, glitch=None, end_force=True, run_end=True, drop_q=()):
     global PPM
     PPM = ppm if ppm is not None else 20e-6
     rng = np.random.default_rng(11)
@@ -96,26 +96,32 @@ def build(tmp_path, steps=STEPS, hold_s=1.0, gain=(1, 1, 1, 1), offset=None, bad
         if k in corrupt:
             b[0] ^= 0x40                                    # torque FL hit after the CRC: frame must be skipped
         miso[k] = np.frombuffer(bytes(b), dtype=np.uint8)
-    lines = [f'{int(t_pi[0])}\t#run_start,first_data_seq=1,timestamp_us={int(esp(t_pi[0]))},qseq=0']
+    # one qseq for every non-E line, in producer order (s06_load format_ev); `drop_q` = qseq lost on UDP
+    q = [0]
+    lines = [f'{int(t_pi[0] + 50e3)}\t#run_start,first_data_seq=1,timestamp_us={int(esp(t_pi[0] + 50e3))},qseq=0']
 
-    def p_line(i, tb, w, speed, t_rx):
+    def p_line(tb, w, speed, t_rx):
         (g0, c0), (g1, c1) = motor_set_info(w, speed)
         if bad_gpio and w == 2:
             g0 = 45
-        return f'{t_rx}\tP,{i},{int(tb + 20 * w)},{int(tb + 20 * w + 15)},{w},{speed},{g0},{c0},{g1},{c1}'
+        q[0] += 1
+        return f'{t_rx}\tP,{q[0]},{int(tb + 20 * w)},{int(tb + 20 * w + 15)},{w},{speed},{g0},{c0},{g1},{c1}'
 
     for i, st in enumerate(steps):
         tb = esp(t_cmd[i])
         for w in range(4):
             if i > 0 and steps[i - 1][w] == st[w]:
                 continue                                    # s06_apply writes only on change
-            lines.append(p_line(i, tb, w, st[w], int(t_cmd[i] + rng.uniform(2000, 6000))))
+            lines.append(p_line(tb, w, st[w], int(t_cmd[i] + rng.uniform(2000, 6000))))
     t_stop = t_cmd[-1] + hold_s * 1e6                       # end_run: #run_end, then every wheel forced to 0
     if run_end:
-        lines.append(f'{int(t_stop + 3000)}\t#run_end,last_data_seq=9,timestamp_us={int(esp(t_stop))},qseq=1')
+        q[0] += 1
+        lines.append(f'{int(t_stop + 3000)}\t#run_end,last_data_seq=9,timestamp_us={int(esp(t_stop))},'
+                     f'ev_qdrop_run=0,enc_ovf_run=0,qseq={q[0]}')
     if end_force:
         for w in range(4):
-            lines.append(p_line(len(steps), esp(t_stop + 1000), w, 0, int(t_stop + 5000)))
+            lines.append(p_line(esp(t_stop + 1000), w, 0, int(t_stop + 5000)))
+    lines = [x for x in lines if not any(f'\tP,{d},' in x for d in drop_q)]
     for t in np.arange(t_pi[0], t_pi[-1], 10e3):
         e = esp(t)
         lines.append(f'{int(t + rng.uniform(2000, 6000))}\tE,1,{int(e)},{int(e + 12)},0,0,0,0')
@@ -199,10 +205,22 @@ def test_crc_bad_frames(tmp_path):
     # S2: level i is commanded at frame 100 + 1000 i (+ 2 ms H7 hold); frames 1000 i + 200 … + 399 are scored.
     # Bad CRC among the 100 skipped frames does not matter; among the 200 scored it is lost data: fail,
     # and no later frame is taken to fill in
-    code, s, _, _ = run(tmp_path, corrupt=set(range(5120, 5140)))
-    assert code == 0 and s['miso_crc_bad_frames'] == 20 + 2     # + the 2 empty frames at the start
     code, s, _, _ = run(tmp_path, corrupt={5300})
     assert code == 1 and s['levels']['fail_data_loss'] == 4      # the 4 wheels of that level
+    # S40 (Codex Sol round 2/2): bad CRC among the 100 skipped frames is still lost data of the run (Z19):
+    # the levels are not marked, the run fails; the 2 empty frames before #run_start do not count
+    code, s, _, _ = run(tmp_path, corrupt=set(range(5120, 5140)))
+    assert code == 1 and s['levels']['fail_data_loss'] == 0
+    assert s['miso_crc_bad_frames'] == 20 + 2 and s['run_frames_bad'] == 20
+
+
+def test_lost_p_lines_fail(tmp_path):
+    # S40: the four P lines of the 0 level between the two signs lost on UDP: duty 0 still seen at the start
+    # and every level and W15 still there, so the per-level checks alone pass; the qseq hole fails the run
+    zero_mid = STEPS.index([0, 0, 0, 0], 1)
+    n_before = sum(len([1 for w in range(4) if i == 0 or STEPS[i - 1][w] != STEPS[i][w]]) for i in range(zero_mid))
+    code, s, _, _ = run(tmp_path, drop_q=range(n_before + 1, n_before + 5))
+    assert code == 1 and s['qseq_stream']['missing'] == 4 and s['levels_missing'] == {}
 
 
 def test_w15_rows_required(tmp_path):
@@ -217,10 +235,10 @@ def test_forced_zero_after_run_end_is_not_a_level(tmp_path):
     code, s, _, p = run(tmp_path, steps=STEPS[:-1])
     assert code == 0 and s['levels']['short'] == 0, p.stdout[-1500:]
     # the same duty written again (forced 0 after the last 0 level) continues the segment even without
-    # the #run_end mark
+    # the #run_end mark; without #run_end the run is not proven complete (S40): 3, not a pass
     code, s, out, p = run(tmp_path, run_end=False)
     n_seg = sum(len([1 for i, st in enumerate(STEPS) if i == 0 or STEPS[i - 1][w] != st[w]]) for w in range(4))
-    assert code == 0 and s['levels']['short'] == 0, p.stdout[-1500:]
+    assert code == 3 and s['levels']['short'] == 0 and not s['qseq_stream']['known'], p.stdout[-1500:]
     assert len(open(out / 'T6_levels.csv').read().splitlines()) - 1 == n_seg       # no extra 0 segment
 
 

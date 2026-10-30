@@ -180,6 +180,7 @@ def _cli_run(tmp_path, small, lost=None, lag=1):
         if j != lost:
             lines.append(f'{int(ta[j])}\tE,{j + 1},{int(tb[j])},{int(ta[j])},' + ','.join(str(x) for x in c[j]))
     lines.append(f'{int(ta[-1]) + 10}\t#run_end,ev_qdrop_run=0,enc_ovf_run=0,qseq=1')
+    lines.append(f'{int(ta[-1]) + 11}\t#run_stats,log_send_err_run=0,enc_reads_run={len(tb)},qseq=2')
     (tmp_path / 'ev.txt').write_text('\n'.join(lines) + '\n')
     ts.write_csv(str(tmp_path / 'sched.csv'), sched)
     return sc.main(['--schedule', str(tmp_path / 'sched.csv'), '--frames', str(tmp_path / 'frames.npz'),
@@ -194,6 +195,8 @@ def test_cli_lag_found_and_stream_checked(tmp_path, small, capsys):
     assert 'trễ lịch → frame: 1 frame' in out and 'KHÔNG ĐẠT' not in out, out[-2000:]
     # S4: one lost E line inside the windows is lost data
     assert _cli_run(tmp_path, small, lost=5000) == 1
+    # S41: the first E line of the run lost: no hole between the eseq received, but one read missing
+    assert _cli_run(tmp_path, small, lost=0) == 1
 
 
 @pytest.mark.skipif(shutil.which('gcc') is None, reason='gcc not on PATH')

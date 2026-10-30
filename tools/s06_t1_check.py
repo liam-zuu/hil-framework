@@ -256,6 +256,8 @@ def check(t_send_ns, mosi, miso, esp32_events=None, serial_events=None, skip_s=0
             fails.append(f"số thứ tự report ở cổng SPI ESP32 bất thường {m['esp32_seq_flags']}")
         if m['window_pi_us'] is None:
             incomplete.append('esp32_events thiếu #run_start/#run_end: không chấm ghép report theo khung lượt')
+        if m.get('pad_note'):
+            incomplete.append(f"S38: {m['pad_note']}: report ở đầu/cuối lượt có thể thiếu bản đối chiếu")
         rz = res.get('resets_near_run_start')
         if rz is not None and not rz['ok']:
             incomplete.append(f"reset trong ±1 s quanh #run_start (H7 {rz['h7']}, ESP32 {rz['esp32']}): "

@@ -87,7 +87,8 @@ def esp32_events(data, path=None, drop=()):
     inside the frames."""
     t = data[0]
     path = path or os.path.join(tempfile.mkdtemp(), 'esp32_events.txt')
-    lines = [f'{int(t[0] / 1e3) + 200_000}\t#run_start,first_data_seq=1,timestamp_us=0,qseq=0']
+    t0 = int(t[0] / 1e3) + 1_200_000                       # ≥ PAD_US inside the frames (S38)
+    lines = [f'{t0}\t#run_start,first_data_seq=1,timestamp_us={t0},qseq=0']
     q = 0
     for s, seq, tp in sorted(data[3], key=lambda x: x[2]):
         q += 1
@@ -96,7 +97,8 @@ def esp32_events(data, path=None, drop=()):
         tj = int(tp) + 300
         lines.append(f'{tj}\tJ,{q},{tj},{(1, 2, 8)[s]},1,{seq % 256},2')
         lines.append(f'{tj + 50}\tI,{q},{tj + 50},{(1, 2, 8)[s]},1,{seq % 256},2,{seq},{seq},0,0,0')
-    lines.append(f'{int(t[-1] / 1e3) - 100_000}\t#run_end,last_data_seq=1,timestamp_us=0,qseq={q + 1}')
+    t1 = int(t[-1] / 1e3) - 1_200_000
+    lines.append(f'{t1}\t#run_end,last_data_seq=1,timestamp_us={t1},qseq={q + 1}')
     with open(path, 'w') as fh:
         fh.write('\n'.join(lines) + '\n')
     return path
@@ -248,6 +250,15 @@ def test_s25_serial_log_required_and_bounded(clean):
 
 def test_report_missing_at_esp32_fails(clean):
     out = run(clean, esp32_events=esp32_events(clean, drop={(1, 100)}))
+    assert out['verdict'] == 'fail' and out['imu']['not_at_esp32_spi'] == 1
+
+
+def test_report_missing_just_after_run_start_fails(clean):
+    # S38: the first report after #run_start (inside the 0,5 s the old window left out) never reached
+    # the ESP32 SPI port
+    t0 = clean[0][0] / 1e3 + 1_200_000
+    s, seq, _ = min((r for r in clean[3] if r[2] > t0 + 1_000), key=lambda r: r[2])
+    out = run(clean, esp32_events=esp32_events(clean, drop={(s, seq)}))
     assert out['verdict'] == 'fail' and out['imu']['not_at_esp32_spi'] == 1
 
 
