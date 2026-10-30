@@ -27,13 +27,12 @@ Sửa theo Codex Sol vòng 1/2 (S29; Liam duyệt 30/10 "Duyệt, sửa hết"):
       harness − Δcount của bộ phát lý tưởng ở cùng hai lần đọc, quan sát được khi |e_truth| > N_tol + u_t
       (`T3b_<tag>_truth.csv`); mọi ca quan sát được của code cũ phải không đạt, 4 loại lệch lớn phải có ca
       quan sát được (trước: chọn theo err_counts > 100 của chính bộ chấm);
-  (a) luật ≤ 10 % "chưa kết luận" cho (2) đối tượng đo: chữ spec chưa rõ, hỏi THESIS 30/10; chưa vào cổng,
-      vượt thì in dòng ghi chú.
+  (a) luật ≤ 10 % "chưa kết luận" áp cả (0), (1), (2) (C1-3, X1), vượt ở nhóm nào thì cổng không đạt.
 
 Usage:
   python tools/t3b_sensitivity.py --out <thư mục> [--seed 1] [--old-rev cb91e7a]
-Mã thoát: 0 khi cổng Z23 đạt (dòng cuối summary.txt); ngược lại 1. Kết quả (2) không ảnh hưởng mã thoát
-(đối tượng đo, báo riêng), trừ u_t.
+Mã thoát: 0 khi cổng Z23 đạt (dòng cuối summary.txt); ngược lại 1. Ca không đạt của (2) không ảnh hưởng mã
+thoát (đối tượng đo, báo riêng); "chưa kết luận" và u_t của (2) thì có.
 """
 from __future__ import annotations
 

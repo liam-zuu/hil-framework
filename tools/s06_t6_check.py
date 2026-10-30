@@ -14,8 +14,8 @@ lần ghi compare; dòng E cho đồng hồ).
     Dòng P có GPIO không thuộc bánh đó trong bảng → lỗi ánh xạ, mã 2.
   * Đồng hồ ESP32 → RPi5: `--clock-affine OFFSET RATE` (từ chân đánh dấu, khi có), hoặc mặc định
     chặn dưới t_rx − t_esp của các dòng có giờ ESP32 (tools/s06_t5_score.clock_fit). Cách mặc định
-    trễ hơn giờ thật một khoảng bằng trễ UDP nhỏ nhất (cỡ ms, chưa đo): đủ cho phần tĩnh (bỏ 100 frame),
-    làm thời gian theo kịp **ngắn hơn thật** tối đa khoảng đó; ghi `sync` trong kết quả.
+    trễ hơn giờ thật một khoảng bằng trễ UDP nhỏ nhất (cỡ ms, chưa đo): chỉ để khảo sát, tập 200 frame chấm
+    dịch theo trễ đó, cả phần tĩnh lẫn thời gian theo kịp chưa kết luận (X19, S21, mã 3); ghi `sync` trong kết quả.
   * Mỗi đoạn ESP32 giữ duty của một bánh (giữa hai lần ghi compare ĐỔI duty của bánh đó): bỏ 100 frame
     đầu từ t_mốc = t_trước của lệnh ghi (V3-7), chấm đúng 200 frame kế tiếp theo chỉ số (S2); d =
     duty_MISO − duty_chuẩn. Đoạn không đủ 300 frame → `short`. Mục 4 với bất định chuẩn `--u-duty`
@@ -354,8 +354,7 @@ def main(argv=None) -> int:
         else:
             run_bad = run_frames = None
     except stm.RunProblem as exc:
-        print(f'không chấm: {exc}', file=sys.stderr)
-        return stm.report_result(3, ['khong_du_dieu_kien'])
+        return stm.report_run_problem(exc)
     except (OSError, KeyError, ValueError) as exc:
         print(f'lỗi đầu vào: {exc}', file=sys.stderr)
         return 2

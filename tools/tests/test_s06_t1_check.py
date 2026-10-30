@@ -66,7 +66,7 @@ def build(n=N, faults=None, period_us=1000.0):
             rec = (0x10 + s, bytes([seqs[s] & 0xFF, flags, 1, mosi[src][39]]) + struct.pack(
                 '<HHHI', (src + 1) & 0xFFFF, (i + 1) & 0xFFFF, crc(raw), cyc))
             reps.append((s, seqs[s], t_send_ns[i] / 1e3))
-            seqs[s] += 1
+            seqs[s] += 0 if i in f.get('seq_dup', ()) else 1
         elif i % 500 == 499 and not f.get('no_tick'):      # TICK: CYCCNT, _cyc_total (64 bit), dropped
             rec = (0x40, struct.pack('<IIIH', cyc, cyc_full & 0xFFFFFFFF, cyc_full >> 32, 0))
         if rec is not None:
@@ -256,6 +256,48 @@ def test_c1_9_scored_span_is_the_run(clean):
     data = build(faults={'mixed': {19_500}})
     assert run(data, skip_s=0.0)['frames']['mixed'] == 0
     assert run(build(faults={'mixed': {10_000}}), skip_s=0.0)['frames']['mixed'] == 1
+
+
+def _last_scored(data):
+    return int(np.flatnonzero(data[0] / 1e3 <= int(data[0][-1] / 1e3) - 1_200_000)[-1])
+
+
+def test_c2_3_answers_to_the_last_frames_are_scored(clean):
+    # frame N is answered in frame N + 2: the state age of the last two frames of the run lies after #run_end
+    last = _last_scored(clean)
+    for j, lost in ((last + 1, True), (last + 2, True), (last + 3, False)):
+        data = build(faults={'age': {j: 5000}})
+        out = run(data, skip_s=0.0)
+        assert out['frames']['age_max_us'] == (5000 if lost else 300), j
+        assert (out['verdict'] == 'fail') == lost, out['fails']
+    # no answer to the last frame is an empty MISO of the run; the answers fall in the last window
+    assert run(build(faults={'empty': {last + 2}}), skip_s=0.0)['frames']['miso_empty'] == 1
+    assert run(build(faults={'empty': {last + 3}}), skip_s=0.0)['frames']['miso_empty'] == 0
+    assert run(clean, skip_s=0.0)['_steps'][-1]['miso_crc_ok']
+    # a window edge just before frame last + 1: the answers stay in the last window of the run
+    t0 = run(clean, skip_s=0.0)['_windows'][0]['t_start_us']
+    win = (clean[0][last + 1] / 1e3 - t0) / 3 / 1e6 - 1e-7
+    assert [w['window'] for w in run(clean, skip_s=0.0, window_s=win)['_windows']] == [0, 1, 2]
+
+
+def test_c2_6_reports_of_the_run_only(clean):
+    # a REPORT fault before #run_start, while the run itself is clean, is not this run's; one inside it is
+    out = run(build(faults={'imu_age': {100: 3}}), skip_s=0.0)
+    assert out['imu']['age_over_1'] == 0 and out['verdict'] != 'fail', out['fails']
+    out = run(build(faults={'imu_age': {10_000: 3}}), skip_s=0.0)
+    assert out['imu']['age_over_1'] == 1 and out['verdict'] == 'fail'
+    assert run(clean, skip_s=0.0)['imu']['n'] < run(clean, full=False, skip_s=0.0)['imu']['n']
+    # a report is of the run by its source frame, even when the log record travels after #run_end
+    last = _last_scored(clean)
+    i = (last // 10 + 2) * 10
+    assert run(build(faults={'imu_age': {i: i - last}}), skip_s=0.0)['imu']['age_over_1'] == 1
+    assert run(build(faults={'imu_age': {i: i - last - 1}}), skip_s=0.0)['imu']['age_over_1'] == 0
+    # a report with no source frame counts by the frame that carried it
+    assert run(build(faults={'imu_age': {100: 15_000}}), skip_s=0.0)['imu']['no_source_frame'] == 0
+    assert run(build(faults={'imu_age': {10_000: 15_000}}), skip_s=0.0)['imu']['no_source_frame'] == 1
+    # the sequence flags too
+    assert not any('report H7 bất thường' in x for x in run(build(faults={'seq_dup': {100}}), skip_s=0.0)['fails'])
+    assert any('report H7 bất thường' in x for x in run(build(faults={'seq_dup': {10_000}}), skip_s=0.0)['fails'])
 
 
 def test_reasons_of_code_3(clean, tmp_path):

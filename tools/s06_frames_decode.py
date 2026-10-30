@@ -330,7 +330,7 @@ def h7_reports(recs, fmap, mosi, carrier_nf):
                    chain=chain, seq_flag=flag,
                    queued=f['queued'], qfull=f['qfull'], imu_seq=f['imu_seq'], src_nf=src, nf_latest=latest,
                    imu_age_frames=latest - src, imu_crc_h7=f['imu_crc'], cyccnt=f['cyc'],
-                   t_pi_us=rec.get('t_pi_us'), src_frame=fr['i'] if fr else None)
+                   t_pi_us=rec.get('t_pi_us'), src_frame=fr['i'] if fr else None, carrier_j=rec['carrier_j'])
         if fr is not None:
             m = mosi[fr['i']]
             row['imu_crc_pi'] = crc16(bytes(m[k] for k in MOSI_IMU_BYTES))
@@ -789,8 +789,7 @@ def main(argv=None) -> int:
         z = np.load(a.frames)
         res = decode(z['t_send_ns'], z['mosi'], z['miso'], a.esp32_events, load_cal(z, a))
     except stm.RunProblem as ex:
-        print(f'không chấm: {ex}', file=sys.stderr)
-        return stm.report_result(3, ['khong_du_dieu_kien'])
+        return stm.report_run_problem(ex)
     except (OSError, KeyError, ValueError) as ex:
         print(f'lỗi đầu vào: {ex}', file=sys.stderr)
         return 2
