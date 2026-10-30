@@ -171,11 +171,12 @@ def test_duplicate_data_seq_fails(tmp_path):
     assert res["status"] == "fail"
 
 
-def test_missing_run_end_is_insufficient(tmp_path):
+def test_missing_run_end_is_insufficient(tmp_path, capsys):
     d = make_run(tmp_path, no_run_end=True)
     res, _, _ = chk.check_run(d)
     assert res["status"] == "insufficient"
-    assert chk.main([d]) == 2
+    assert chk.main([d]) == 3
+    assert "#ket_qua,ma=3,ly_do=thieu_bang_chung" in capsys.readouterr().out
 
 
 def test_report_before_start_not_unmatched(tmp_path):

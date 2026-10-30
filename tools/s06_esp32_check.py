@@ -44,10 +44,14 @@ Sửa theo Codex Sol vòng 5 (Liam 30/10 "Duyệt, sửa bốn mục"):
   * S78: `known_losses` thêm `log_send_err_run` của #run_stats.
   * S79: dòng khác định dạng mốc lượt là dữ liệu hỏng ("fail"), không phải thiếu bằng chứng; khớp T6.
 
+Khớp spec 3.1, bảng mã kết quả (Liam 30/10, "Duyệt, làm tiếp"): dòng cuối in `#ket_qua,ma=…[,ly_do=…]`.
+"insufficient" và "invalid" đều là mã 3: nhiều lượt một thư mục, nhịp đọc sai, reset quanh START =
+`khong_du_dieu_kien`; thiếu mốc, thiếu số producer = `thieu_bang_chung`.
+
 Usage:
     python tools/s06_esp32_check.py <thư mục lượt> [<thư mục lượt> ...] [--out <thư mục kết quả>]
-Mã thoát (một lượt): 0 đạt; 1 có mục không đạt; 2 thiếu #run_start/#run_end; 3 lượt không hợp lệ
-(đo lại). Nhiều lượt: 0 khi mọi lượt đạt, ngược lại 1; in số lượt bị loại vì số lần đọc count.
+Mã thoát (một lượt): 0 đạt; 1 có mục không đạt; 3 không có mục không đạt nhưng chưa ra kết luận (in lý do).
+Nhiều lượt: 0 khi mọi lượt đạt, ngược lại 1; in số lượt bị loại vì số lần đọc count.
 """
 
 import argparse
@@ -261,6 +265,7 @@ def check_run(run_dir):
         lost = known_losses(ev)
         item("loss_counters_of_run_end", "; ".join(lost) or "0", "0 ở mọi #run_end (§4.3 điều 4, 6)", not lost)
         res["status"] = "fail" if lost else "insufficient"
+        res["reason"] = "khong_du_dieu_kien" if n_starts > 1 else "thieu_bang_chung"
         return res, ev, None
     t0, t1 = int(rs["kv"]["timestamp_us"]), int(re_["kv"]["timestamp_us"])
     dur_s, auto_end = int(rs["kv"]["duration_s"]), int(rs["kv"]["auto_end"])
@@ -409,6 +414,7 @@ def check_run(run_dir):
             res["notes"].append("có mục không đạt và cả điều kiện lượt không hợp lệ: vẫn tính là không đạt (Z19)")
     elif any(i["category"] == "evidence" for i in failed):
         res["status"] = "insufficient"            # S41: stream not proven complete: neither pass nor "invalid"
+        res["reason"] = "thieu_bang_chung"
     elif failed:
         res["status"] = "invalid"
     else:
@@ -545,7 +551,9 @@ def main(argv=None):
         print_report(res)
         status.append(res["status"])
     if len(status) == 1:
-        return {"pass": 0, "fail": 1, "insufficient": 2, "invalid": 3}[status[0]]
+        code = {"pass": 0, "fail": 1, "insufficient": 3, "invalid": 3}[status[0]]
+        print(f"#ket_qua,ma={code}" + (f",ly_do={res.get('reason', 'khong_du_dieu_kien')}" if code == 3 else ""))
+        return code
     print(f"Tổng {len(status)} lượt: đạt {status.count('pass')}, không đạt {status.count('fail')}, "
           f"thiếu #run_start/#run_end {status.count('insufficient')}, "
           f"bị loại vì số lần đọc count (đo lại) {status.count('invalid')}")
