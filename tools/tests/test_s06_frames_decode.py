@@ -25,12 +25,13 @@ def crc(b):
     return binascii.crc_hqx(bytes(b), 0xFFFF)
 
 
-def build(n=N, faults=()):
+def build(n=N, faults=(), imu_fn=None):
+    """imu_fn(k) -> (gz, ax, ay, az, yaw) of frame k (default: a slow sine on gz and a yaw ramp)."""
     rng = np.random.default_rng(3)
     t_send_ns = (np.arange(n) * 1e6 + rng.uniform(-20e3, 20e3, n)).astype(np.int64)
     mosi = np.zeros((n, 40), dtype=np.uint8)
     for k in range(n):
-        imu = (0.1 * np.sin(k / 50), 0.0, 0.0, 9.81, 0.01 * k % 3.0)
+        imu = imu_fn(k) if imu_fn else (0.1 * np.sin(k / 50), 0.0, 0.0, 9.81, 0.01 * k % 3.0)
         mosi[k] = np.frombuffer(encode_state([0.0] * 10, seq=k, imu=imu, imu_seq=k // 10), dtype=np.uint8)
     cyc0 = 4_000_000_000                                       # wraps after ~0.6 s
     cyc = [(cyc0 + int((t_send_ns[k] / 1e3 + D_1W_US) * 1e-6 * F_H7)) for k in range(n)]
@@ -140,7 +141,7 @@ def test_clean_run(clean, tmp_path):
     assert res['resets_near_run_start']['ok'] and res['clock']['calibrated'] is False
     # report build time on the Pi clock: frame k sent at ~k ms, cyc stamped D_1W_US after
     r = next(x for x in res['_reports'] if x['kind'] == 'gyro' and x['n'] == 100)
-    assert dec.problems(res) == []
+    assert dec.problems(res) == [] and dec.conditions(res) == []
     calls = res['_calls']
     assert [c[0] for c in calls[0]] == ['S', 'P', 'S', 'P', 'S'] and [c[0] for c in calls[2]] == ['S']
     assert calls[0][1][2] == (3000 * 7) & 0xFFFF and calls[0][2][3] == 2
@@ -254,7 +255,7 @@ def test_reset_near_run_start_reported(clean, tmp_path):
     t, mosi, miso, seqs = clean
     res = dec.decode(t, mosi, miso, esp32_file(tmp_path, seqs, resets=(1_800_000,)))
     assert res['resets_near_run_start'] == dict(h7=0, esp32=1, ok=False)
-    assert any('V4-1' in x for x in dec.problems(res))
+    assert any('V4-1' in x for x in dec.conditions(res)) and dec.problems(res) == []
 
 
 def test_report_outside_window_not_scored(clean, tmp_path):

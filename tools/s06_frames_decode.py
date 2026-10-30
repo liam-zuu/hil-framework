@@ -42,7 +42,8 @@ Chưa có (ghi rõ): đồng hồ ESP32 → RPi5 (cần chân đánh dấu). Ch�
 
 Usage:
   python tools/s06_frames_decode.py <frames.npz> [--esp32-events esp32_events.txt] --out <thư mục>
-Mã thoát: 0 không có lỗi; 1 có CRC sai, hở log, report không ghép được hoặc CRC IMU sai; 2 lỗi đầu vào.
+Mã thoát: 0 không có lỗi; 1 có CRC sai, hở log, report không ghép được hoặc CRC IMU sai; 3 không lỗi nhưng
+thiếu điều kiện/bằng chứng (`conditions`: < 2 TICK, thiếu #run_start/#run_end, reset ±1 s); 2 lỗi đầu vào.
 """
 from __future__ import annotations
 
@@ -366,7 +367,7 @@ def esp32_lines(path):
                                   seq=int(p[5]), epoch=int(p[6])))
                 elif p[0] == 'I' and len(p) == 12:
                     I.append(dict(t_rx=t_rx, t_us=int(p[2]), kind=ESP32_KIND.get(int(p[3]), p[3]), applied=int(p[4]),
-                                  seq=int(p[5]), epoch=int(p[6]),
+                                  seq=int(p[5]), epoch=int(p[6]), n_cb=int(p[7]), lib_n=int(p[8]),
                                   v=(float(p[9]), float(p[10]), float(p[11]))))
                 elif p[0] == 'R' and len(p) == 4:
                     R.append(dict(t_rx=t_rx, t_us=int(p[2]), reset_count=int(p[3])))
@@ -622,8 +623,6 @@ def problems(res) -> List[str]:
         p.append(f"luồng log H7 hở {lg['gaps']} bản ghi")
     if lg.get('h7_dropped'):
         p.append(f"H7 bỏ {lg['h7_dropped']} bản ghi vì đầy (hiệu TICK đầu–cuối)")
-    if lg.get('h7_dropped') is None:
-        p.append(f"chỉ có {lg.get('ticks', 0)} bản ghi TICK: không biết H7 có bỏ bản ghi trong lượt không")
     if rp.get('seq_flags'):
         p.append(f"số thứ tự report H7 bất thường {rp['seq_flags']} (dup = trùng, cut = cách ≥ 128 chu kỳ, "
                  f"seq_time_bad = bước ≥ 128)")
@@ -642,14 +641,26 @@ def problems(res) -> List[str]:
                  f"{m['esp32_without_h7']} report ESP32 không có ở H7")
     if m and m.get('esp32_seq_flags'):
         p.append(f"số thứ tự report ở cổng SPI ESP32 bất thường {m['esp32_seq_flags']}")
+    return p
+
+
+def conditions(res) -> List[str]:
+    """Run conditions and missing evidence (not product faults): the scoring tool reports them as
+    'not valid / not concluded' (mã 3), apart from `problems`."""
+    c = []
+    lg = res['log']
+    if lg.get('h7_dropped') is None:
+        c.append(f"chỉ có {lg.get('ticks', 0)} bản ghi TICK: không biết H7 có bỏ bản ghi trong lượt không")
+    m = res.get('esp32_match')
     if m and m['window_pi_us'] is None:
-        p.append('esp32_events thiếu #run_start/#run_end: chấm ghép report trên cả luồng, không theo khung lượt')
+        c.append('esp32_events thiếu #run_start/#run_end: chấm ghép report trên cả luồng, không theo khung lượt')
     rz = res.get('resets_near_run_start')
     if 'esp32_match' in res and rz is None:
-        p.append('thiếu #run_start: không kiểm được điều kiện reset ±1 s (V4-1)')
+        c.append('thiếu #run_start: không kiểm được điều kiện reset ±1 s (V4-1)')
     elif rz is not None and not rz['ok']:
-        p.append(f"reset hoàn tất trong ±1 s quanh #run_start (H7 {rz['h7']}, ESP32 {rz['esp32']}): lượt không hợp lệ (V4-1)")
-    return p
+        c.append(f"reset hoàn tất trong ±1 s quanh #run_start (H7 {rz['h7']}, ESP32 {rz['esp32']}): "
+                 f"lượt không hợp lệ (V4-1), đo lại")
+    return c
 
 
 def add_cal_args(ap):
@@ -699,10 +710,11 @@ def main(argv=None) -> int:
         w.writerows(res['_reports'])
     summ = {k: v for k, v in res.items() if not k.startswith('_')}
     summ['problems'] = problems(res)
+    summ['conditions'] = conditions(res)
     with open(os.path.join(a.out, 'frames_summary.json'), 'w', encoding='utf-8') as fh:
-        json.dump(summ, fh, indent=1, ensure_ascii=False)
-    print(json.dumps(summ, indent=1, ensure_ascii=False))
-    return 1 if summ['problems'] else 0
+        json.dump(summ, fh, indent=1, ensure_ascii=False, default=str)
+    print(json.dumps(summ, indent=1, ensure_ascii=False, default=str))
+    return 1 if summ['problems'] else (3 if summ['conditions'] else 0)
 
 
 if __name__ == '__main__':
