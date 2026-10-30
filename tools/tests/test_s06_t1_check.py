@@ -131,6 +131,13 @@ def test_h7_missing_frame_count():
     assert any(m.startswith('H7 nhận') for m in out['fails'])       # the count itself, not a side effect
 
 
+def test_constant_other_lag_points_at_h7_build(clean):
+    out = run(clean, answer_lag=1)                           # as if the old H7 (answer at N+1) were expected
+    assert out['verdict'] == 'fail' and out['answer_lag_hist'] == {2: N - 2}
+    assert any('kiểm bản H7' in m for m in out['fails'])
+    assert not any('kiểm bản H7' in m for m in run(build(faults={'stale': {5000}}))['fails'])
+
+
 def test_short_run_is_short(clean):
     assert run(clean, min_s=60.0)['verdict'] == 'short'
 

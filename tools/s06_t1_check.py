@@ -188,6 +188,10 @@ def check(t_send_ns, mosi, miso, esp32_events=None, serial_events=None, skip_s=1
                    ('unanswered', 'MISO không tìm thấy frame được trả lời')):
         if tot[k]:
             fails.append(f'{tot[k]} {msg}')
+    lag_hist = {int(k): v for k, v in res['frames']['answer_lag'].items()}
+    if len(lag_hist) == 1 and answer_lag not in lag_hist:
+        fails.append(f'mọi frame MISO trả lời trễ {next(iter(lag_hist))} frame, không phải {answer_lag}: '
+                     f'kiểm bản H7 đã nạp (fix/h7-frame: 2) hoặc --answer-lag')
     if tot['age_max_us'] > AGE_MAX_US:
         fails.append(f"tuổi trạng thái lớn nhất {tot['age_max_us']} µs > {AGE_MAX_US}")
     for k, msg in (('imu_crc_bad', 'CRC IMU sai'), ('imu_seq_bad', 'imu_seq sai'),
@@ -210,7 +214,8 @@ def check(t_send_ns, mosi, miso, esp32_events=None, serial_events=None, skip_s=1
         windows.append(W)
     steps = [dict(step=int(k), crc_sent=dec.crc16(bytes(mosi[k])), crc_h7=steps_crc_h7.get(int(k), ''),
                   field_change_mask=int(masks[k]), miso_crc_ok=int(k) in steps_crc_h7) for k in sel]
-    out = dict(h1=h1, frames=tot, coverage_pct=coverage, imu=imu, stream=stream, serial=serial,
+    out = dict(h1=h1, frames=tot, answer_lag_expected=answer_lag, answer_lag_hist=lag_hist,
+               coverage_pct=coverage, imu=imu, stream=stream, serial=serial,
                scored_s=scored_s, enough=scored_s >= min_s, fails=fails,
                verdict='fail' if fails else ('short' if scored_s < min_s else 'pass'))
     out['_windows'], out['_steps'], out['_reports'] = windows, steps, reps
