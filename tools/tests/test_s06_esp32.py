@@ -24,10 +24,12 @@ FIRST_SEQ = 101
 def make_run(tmp_path, dur_s=3, auto_end=1, drop_gyro=(), overwrite_gyro=(), drop_qseq=(), data_dup=False,
              no_run_end=False, pre_start_report=False, rx_end_delay_us=None, name="run",
              imu_init="imu_init=0,imu_init_ms=412", enc_short=0, s_temp=None, drop_e=(), resets=(),
-             relay_bad_end=0, run_stats=None):
+             relay_bad_end=0, run_stats=None, enc_reads=True):
     """Ghi esp32_events.txt, esp32_data.txt cho một lượt; trả thư mục. drop_e: eseq của dòng E mất trên
     đường UDP (ESP32 vẫn đọc); enc_short: ESP32 đọc ít lần hơn (nhịp đọc sai); resets: t_us của dòng R;
-    relay_bad_end: relay_bad của dòng S cuối; run_stats: log_send_err_run của dòng #run_stats."""
+    relay_bad_end: relay_bad của dòng S cuối; run_stats: log_send_err_run của dòng #run_stats (None = không
+    có trường này, firmware trước S37); enc_reads: dòng #run_stats có enc_reads_run = số lần ESP32 đọc (S41;
+    False = firmware trước S41)."""
     t1 = T0 + dur_s * 1_000_000
     ev = []                                   # (t_us, dòng không có qseq, là text?)
     n_rep = dur_s * 1_000_000 // PERIOD
@@ -66,8 +68,10 @@ def make_run(tmp_path, dur_s=3, auto_end=1, drop_gyro=(), overwrite_gyro=(), dro
         ev.append((t1, "#run_end,last_data_seq=%d,log_qdrop=0,log_send_err=0,timestamp_us=%d,reason=duration,"
                    "elapsed_us=%d,log_qdrop_run=0,ev_qdrop_run=0,enc_ovf_run=0,imu_drop_run=0/0/0,"
                    "gyro_gap_max_us=10000" % (last_seq, t1, t1 - T0), True))
-        if run_stats is not None:
-            ev.append((t1 + 1, "#run_stats,log_send_err_run=%d" % run_stats, True))
+        kv = ([f"log_send_err_run={run_stats}"] if run_stats is not None else []) + \
+             ([f"enc_reads_run={(t1 - T0) // 1000 - enc_short}"] if enc_reads else [])
+        if kv:
+            ev.append((t1 + 1, "#run_stats," + ",".join(kv), True))
     ev.sort(key=lambda x: x[0])
     lines, q = [], 0
     rx_base = 50_000_000
@@ -354,6 +358,22 @@ def test_s26_lost_lines_stay_a_failure(tmp_path):
     # both: still a failure
     res, _, _ = chk.check_run(make_run(tmp_path, enc_short=5, drop_e=(1000,), name="both"))
     assert res["status"] == "fail"
+
+
+def test_s41_head_tail_loss_is_a_failure(tmp_path):
+    # S41 (Codex Sol round 2/2): E lines 1 and 2 lost: no hole between the eseq received, the eseq span is
+    # 2 short of the duration; before, this read as a rhythm fault ("invalid"); the producer count proves
+    # the ESP32 read every time: lost data, a failure
+    res, _, _ = chk.check_run(make_run(tmp_path, drop_e=(1, 2)))
+    it = items(res)
+    assert not it["enc_lines_vs_producer"]["ok"] and it["enc_reads_vs_duration"]["ok"]
+    assert res["status"] == "fail"
+    n = 3000                                         # last two reads of a 3 s run lost
+    res, _, _ = chk.check_run(make_run(tmp_path, drop_e=(n - 1, n), name="tail"))
+    assert res["status"] == "fail"
+    # firmware without enc_reads_run: the stream cannot be proven complete: neither pass nor "invalid"
+    res, _, _ = chk.check_run(make_run(tmp_path, enc_reads=False, name="old"))
+    assert res["status"] == "insufficient" and not items(res)["enc_reads_run_known"]["ok"]
 
 
 def test_s7_reset_near_run_start_not_valid(tmp_path):

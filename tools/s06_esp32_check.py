@@ -24,6 +24,12 @@ Sửa theo Codex Sol vòng 1/2 (Liam duyệt 30/10 "Duyệt, sửa hết"):
   * S37: log_send_err_run lấy từ dòng #run_stats của ESP32 (mốc lúc START, s06_load b9b3984); firmware
     cũ thì lấy từ DATA đầu PC nhận và ghi chú.
 
+Sửa theo Codex Sol vòng 2/2 (Liam 30/10 "Sửa P1 rồi vòng 3"):
+  * S41: dải `eseq` nhận được không thấy mất đầu/đuôi, nên không phải số lần đọc của nguồn (thay ý S26 ở
+    trên). Số lần đọc của nguồn = `enc_reads_run` của #run_stats (producer đếm); số dòng E nhận phải bằng
+    enc_reads_run − enc_ovf_run, thiếu = mất dữ liệu (fail). Chỉ khi luồng đã chứng minh đủ, số lần đọc
+    lệch thời lượng mới là "nhịp đọc sai" (invalid). Firmware không có enc_reads_run → "insufficient".
+
 Usage:
     python tools/s06_esp32_check.py <thư mục lượt> [<thư mục lượt> ...] [--out <thư mục kết quả>]
 Mã thoát (một lượt): 0 đạt; 1 có mục không đạt; 2 thiếu #run_start/#run_end; 3 lượt không hợp lệ
@@ -284,16 +290,25 @@ def check_run(run_dir):
     if E:
         eq = sorted(e["eseq"] for e in E)
         enc["gaps"] = (eq[-1] - eq[0] + 1) - len(set(eq))
-        # S26: reads the SOURCE made = span of eseq (independent of lines lost on the way to the PC)
-        enc["source_reads"] = eq[-1] - eq[0] + 1
-    else:
-        enc["source_reads"] = 0
+    # S41 (Codex Sol vòng 2/2): the eseq span cannot see lines lost at the head or tail of the run, so it
+    # is not the number of reads the SOURCE made. The producer counts its reads of the run (incl. the ones
+    # the ring dropped): #run_stats enc_reads_run (s06_load after b9b3984). Lines received short of
+    # enc_reads_run − enc_ovf_run = lost data (fail); only with that proof is a read count off the
+    # duration a rhythm fault (not valid, measure again). Older firmware: not proven.
+    prod = int(rst["kv"]["enc_reads_run"]) if rst and "enc_reads_run" in rst["kv"] else None
+    enc["source_reads"] = prod
+    enc["lost"] = prod - enc["overflow"] - enc["received"] if prod is not None and enc["overflow"] >= 0 else None
     if enc_period_us:
         enc["expected"] = (t1 - t0) // enc_period_us
-    enc["ok"] = enc["gaps"] == 0 and enc["dups"] == 0 and enc["overflow"] == 0
-    item("enc_reads_vs_duration", f"{enc['source_reads']} lần đọc ở ESP32 (theo eseq), kỳ vọng {enc['expected']}",
+    # lost None (no producer count) is not a proven loss: the "evidence" item keeps such a run from passing
+    enc["ok"] = enc["gaps"] == 0 and enc["dups"] == 0 and enc["overflow"] == 0 and enc["lost"] in (0, None)
+    item("enc_reads_run_known", "có" if prod is not None else "thiếu (#run_stats enc_reads_run)",
+         "số lần đọc của producer trong lượt (S41)", prod is not None, "evidence")
+    item("enc_lines_vs_producer", f"nhận {enc['received']}, producer đọc {prod}, tràn {enc['overflow']}",
+         "nhận = enc_reads_run − enc_ovf_run (S41, §4.3 điều 6)", prod is None or enc["lost"] == 0)
+    item("enc_reads_vs_duration", f"{prod} lần đọc ở ESP32 (producer), kỳ vọng {enc['expected']}",
          f"± {ENC_COUNT_TOL} (T3b; không đạt = nhịp đọc sai, lượt không hợp lệ, đo lại)",
-         enc["expected"] is not None and abs(enc["source_reads"] - enc["expected"]) <= ENC_COUNT_TOL, "valid")
+         prod is None or (enc["expected"] is not None and abs(prod - enc["expected"]) <= ENC_COUNT_TOL), "valid")
     if E:
         tb = sorted(e["t_before"] for e in E)
         res["enc_period_max_us"] = max([b - a for a, b in zip(tb, tb[1:])], default=0)
@@ -344,10 +359,12 @@ def check_run(run_dir):
     failed = [i for i in res["items"] if not i["ok"]]
     # S26 (Z19 order): lost data and product faults already seen stay a FAILURE; "not valid (measure
     # again)" only when the condition items are the only ones failed
-    if any(i["category"] != "valid" for i in failed):
+    if any(i["category"] not in ("valid", "evidence") for i in failed):
         res["status"] = "fail"
         if any(i["category"] == "valid" for i in failed):
             res["notes"].append("có mục không đạt và cả điều kiện lượt không hợp lệ: vẫn tính là không đạt (Z19)")
+    elif any(i["category"] == "evidence" for i in failed):
+        res["status"] = "insufficient"            # S41: stream not proven complete: neither pass nor "invalid"
     elif failed:
         res["status"] = "invalid"
     else:
