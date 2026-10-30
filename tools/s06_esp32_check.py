@@ -30,6 +30,10 @@ Sửa theo Codex Sol vòng 2/2 (Liam 30/10 "Sửa P1 rồi vòng 3"):
     enc_reads_run − enc_ovf_run, thiếu = mất dữ liệu (fail). Chỉ khi luồng đã chứng minh đủ, số lần đọc
     lệch thời lượng mới là "nhịp đọc sai" (invalid). Firmware không có enc_reads_run → "insufficient".
 
+Manifest lượt (Codex Sol vòng 3, Liam 30/10 "Làm manifest lượt"):
+  * S58: mỗi thư mục một lượt (hơn một #run_start → "insufficient"); #run_end, #run_stats ghép với #run_start
+    bằng `run=`; dòng E của lượt lấy theo trường run (s06_load mới), nên lần đọc dở lúc END vẫn được tính.
+
 Usage:
     python tools/s06_esp32_check.py <thư mục lượt> [<thư mục lượt> ...] [--out <thư mục kết quả>]
 Mã thoát (một lượt): 0 đạt; 1 có mục không đạt; 2 thiếu #run_start/#run_end; 3 lượt không hợp lệ
@@ -112,13 +116,14 @@ def parse_events(raw):
                          v=(float(f[9]), float(f[10]), float(f[11])))
             elif k == "R" and len(f) == 4:
                 r = dict(qseq=int(f[1]), t_us=int(f[2]), reset_count=int(f[3]))
-            elif k == "P" and len(f) == 10:
+            elif k == "P" and len(f) in (10, 11):
                 r = dict(qseq=int(f[1]), t_before=int(f[2]), t_after=int(f[3]), wheel=int(f[4]),
                          speed=int(f[5]), gpio_a=int(f[6]), cmp_a=int(f[7]), gpio_b=int(f[8]),
-                         cmp_b=int(f[9]))
-            elif k == "E" and len(f) == 8:
+                         cmp_b=int(f[9]), run_id=int(f[10]) if len(f) == 11 else None)
+            elif k == "E" and len(f) in (8, 9):
+                # trường cuối: số lượt (manifest lượt, S58); bản 8 trường cũ: None
                 ev["E"].append(dict(eseq=int(f[1]), t_before=int(f[2]), t_after=int(f[3]),
-                                    c=tuple(int(x) for x in f[4:8])))
+                                    c=tuple(int(x) for x in f[4:8]), run_id=int(f[8]) if len(f) == 9 else None))
                 continue
             elif k == "S" and len(f) in (15, 16):
                 # 16 trường từ s06_load có temp_c (nhiệt độ chip ESP32-S3, T5, 30/10); bản cũ 15 trường
@@ -175,9 +180,10 @@ def seq_stream(values, lo, hi):
                 dups=len(inside) - len(uniq))
 
 
-def first_text(ev, name):
+def first_text(ev, name, run=None):
+    """Dòng '#name' đầu tiên; `run` (trường run= của #run_start, S58): chỉ dòng của đúng lượt đó."""
     for t in ev["text"]:
-        if t["name"] == name:
+        if t["name"] == name and (run is None or t["kv"].get("run") == run):
             return t
     return None
 
@@ -217,10 +223,18 @@ def check_run(run_dir):
         res["items"].append(dict(item=name, value=value, limit=limit, ok=ok, category=category))
         return ok
 
-    rs, re_ = first_text(ev, "run_start"), first_text(ev, "run_end")
+    # S58 (manifest lượt): mỗi thư mục một lượt; END và STATS ghép với START bằng run=, không theo "dòng đầu"
+    n_starts = sum(1 for t in ev["text"] if t["name"] == "run_start")
+    rs = first_text(ev, "run_start")
+    run_id = rs["kv"].get("run") if rs else None
+    re_ = first_text(ev, "run_end", run_id)
     cfg = first_text(ev, "cfg")
     item("run_start_and_run_end", f"run_start={'có' if rs else 'thiếu'}, run_end={'có' if re_ else 'thiếu'}",
          "có cả hai (§4.3 điều 1)", bool(rs and re_))
+    if n_starts > 1:
+        item("one_run_per_file", f"{n_starts} dòng #run_start", "một lượt mỗi thư mục (S58)", False, "evidence")
+        res["status"] = "insufficient"
+        return res, ev, None
     if not (rs and re_):
         res["status"] = "insufficient"
         return res, ev, None
@@ -248,7 +262,7 @@ def check_run(run_dir):
     ds["ok"] = ds["gaps"] == 0 and ds["dups"] == 0 and ds["overflow"] == 0
     # S37: the run figure comes from the ESP32 itself (#run_stats after #run_end, baseline at START,
     # s06_load b9b3984); older firmware: from the first DATA the PC got, which may be later than START
-    rst = first_text(ev, "run_stats")
+    rst = first_text(ev, "run_stats", run_id)
     if rst and "log_send_err_run" in rst["kv"]:
         send_err_d, src = int(rst["kv"]["log_send_err_run"]), "từ START tới #run_end (#run_stats)"
     else:
@@ -284,7 +298,9 @@ def check_run(run_dir):
     es = seq_stream(ev["qseq"], rs["qseq"], re_["qseq"])
     es.update(stream="esp32_events", overflow=int(re_["kv"].get("ev_qdrop_run", -1)))
     es["ok"] = es["gaps"] == 0 and es["dups"] == 0 and es["overflow"] == 0
-    E = [e for e in ev["E"] if t0 - 1000 <= e["t_before"] <= t1 + 1000]
+    # S58: dòng E của lượt theo trường run (cả lần đọc dở lúc END, S59); firmware cũ: theo thời gian
+    E = [e for e in ev["E"] if (e["run_id"] == int(run_id) if run_id is not None and e["run_id"] is not None
+                                else t0 - 1000 <= e["t_before"] <= t1 + 1000)]
     enc = dict(stream="esp32_enc", expected=None, received=len({e["eseq"] for e in E}), gaps=None,
                dups=len(E) - len({e["eseq"] for e in E}), overflow=int(re_["kv"].get("enc_ovf_run", -1)))
     if E:

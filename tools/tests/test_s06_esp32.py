@@ -376,6 +376,54 @@ def test_s41_head_tail_loss_is_a_failure(tmp_path):
     assert res["status"] == "insufficient" and not items(res)["enc_reads_run_known"]["ok"]
 
 
+def _with_run_ids(d, late_read=False):
+    """Rewrite a make_run directory in the manifest format: run=1 on the marks, run field on E and P."""
+    p = os.path.join(d, "esp32_events.txt")
+    out = []
+    for raw in open(p, encoding="utf-8").read().splitlines():
+        t, _, l = raw.partition("\t")
+        if l.startswith(("#run_start,", "#run_end,", "#run_stats,")):
+            name, _, rest = l.partition(",")
+            l = f"{name},run=1,{rest}"
+        elif l.startswith(("E,", "P,")):
+            l += ",1"
+        out.append(f"{t}\t{l}")
+    if late_read:                                    # the last read: counted before END, stamped 5 ms after it
+        i = max(k for k, x in enumerate(out) if "\tE," in x)
+        t, _, l = out[i].partition("\t")
+        f = l.split(",")
+        f[2], f[3] = str(T0 + 3_000_000 + 5000), str(T0 + 3_000_000 + 5012)
+        out[i] = t + "\t" + ",".join(f)
+    open(p, "w", encoding="utf-8").write("\n".join(out) + "\n")
+    return d
+
+
+def test_s58_run_id_pairs_marks_and_lines(tmp_path):
+    res, _, _ = chk.check_run(_with_run_ids(make_run(tmp_path)))
+    assert res["status"] == "pass"
+    # S59: the read in flight at END carries the run field: it counts, it is not "lost"
+    d = _with_run_ids(make_run(tmp_path, name="late", enc_short=-1), late_read=True)
+    res, _, _ = chk.check_run(d)
+    assert res["status"] == "pass", [i for i in res["items"] if not i["ok"]]
+    # Codex S58: run 1 lost its first E line and its #run_stats; the #run_stats of run 2 says 2999
+    d = make_run(tmp_path, name="two", drop_e=(1,), enc_reads=False)
+    _with_run_ids(d)
+    p = os.path.join(d, "esp32_events.txt")
+    with open(p, "a", encoding="utf-8") as f:
+        f.write(f"99000000\t#run_stats,run=2,enc_reads_run=2999,qseq=999999\n")
+    res, _, _ = chk.check_run(d)
+    assert res["status"] != "pass" and not items(res)["enc_reads_run_known"]["ok"]
+
+
+def test_s58_two_runs_in_one_directory(tmp_path):
+    d = _with_run_ids(make_run(tmp_path))
+    with open(os.path.join(d, "esp32_events.txt"), "a", encoding="utf-8") as f:
+        f.write("99000000\t#run_start,run=2,first_data_seq=9,timestamp_us=99000000,profile=heavy,duration_s=3,"
+                "auto_end=1,qseq=999999\n")
+    res, _, _ = chk.check_run(d)
+    assert res["status"] == "insufficient" and not items(res)["one_run_per_file"]["ok"]
+
+
 def test_s7_reset_near_run_start_not_valid(tmp_path):
     res, _, _ = chk.check_run(make_run(tmp_path, resets=(T0 + 400_000,)))
     assert not items(res)["resets_near_run_start"]["ok"] and res["status"] == "invalid"
