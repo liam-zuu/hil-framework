@@ -422,6 +422,55 @@ def test_s58_two_runs_in_one_directory(tmp_path):
                 "auto_end=1,qseq=999999\n")
     res, _, _ = chk.check_run(d)
     assert res["status"] == "insufficient" and not items(res)["one_run_per_file"]["ok"]
+    assert items(res)["loss_counters_of_run_end"]["ok"]
+
+
+def _set_in_events(d, old, new):
+    p = os.path.join(d, "esp32_events.txt")
+    txt = open(p, encoding="utf-8").read()
+    assert old in txt
+    open(p, "w", encoding="utf-8").write(txt.replace(old, new))
+
+
+@pytest.mark.parametrize("field", ["enc_ovf_run", "ev_qdrop_run", "log_qdrop_run"])
+def test_s72_two_starts_do_not_hide_a_known_loss(tmp_path, field):
+    # the first run's #run_end says data was lost; a second #run_start must not turn that into "insufficient"
+    d = _with_run_ids(make_run(tmp_path))
+    _set_in_events(d, f"{field}=0", f"{field}=2")
+    with open(os.path.join(d, "esp32_events.txt"), "a", encoding="utf-8") as f:
+        f.write("99000000\t#run_start,run=2,first_data_seq=9,timestamp_us=99000000,profile=heavy,duration_s=3,"
+                "auto_end=1,qseq=999999\n")
+    res, _, _ = chk.check_run(d)
+    assert res["status"] == "fail" and not items(res)["loss_counters_of_run_end"]["ok"]
+    assert chk.main([d, "--out", str(tmp_path / "o")]) == 1
+
+
+def test_s72_end_without_start_keeps_a_known_loss(tmp_path):
+    d = make_run(tmp_path)
+    p = os.path.join(d, "esp32_events.txt")
+    txt = "".join(x for x in open(p, encoding="utf-8").read().splitlines(True) if "#run_start" not in x)
+    open(p, "w", encoding="utf-8").write(txt.replace("ev_qdrop_run=0", "ev_qdrop_run=1"))
+    res, _, _ = chk.check_run(d)
+    assert res["status"] == "fail"
+
+
+def test_s71_lines_must_have_the_format_of_the_marks(tmp_path):
+    # marks with a run id, E lines without: no fallback by time, no pass
+    d = make_run(tmp_path)
+    p = os.path.join(d, "esp32_events.txt")
+    txt = open(p, encoding="utf-8").read()
+    for name in ("#run_start,", "#run_end,", "#run_stats,"):
+        txt = txt.replace(name, name + "run=1,")
+    open(p, "w", encoding="utf-8").write(txt)
+    res, _, _ = chk.check_run(d)
+    assert res["status"] == "fail" and not items(res)["line_format"]["ok"]
+    assert not items(res)["enc_lines_vs_producer"]["ok"]
+    # the other way round: marks without a run id, E and P with one
+    d = _with_run_ids(make_run(tmp_path, name="other"))
+    _set_in_events(d, ",run=1,", ",")
+    res, _, _ = chk.check_run(d)
+    assert res["status"] == "insufficient" and not items(res)["line_format"]["ok"]
+    assert items(chk.check_run(_with_run_ids(make_run(tmp_path, name="same")))[0])["line_format"]["ok"]
 
 
 def test_s7_reset_near_run_start_not_valid(tmp_path):

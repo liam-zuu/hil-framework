@@ -34,6 +34,12 @@ Manifest lượt (Codex Sol vòng 3, Liam 30/10 "Làm manifest lượt"):
   * S58: mỗi thư mục một lượt (hơn một #run_start → "insufficient"); #run_end, #run_stats ghép với #run_start
     bằng `run=`; dòng E của lượt lấy theo trường run (s06_load mới), nên lần đọc dở lúc END vẫn được tính.
 
+Sửa theo Codex Sol vòng 4 (Liam 30/10, phiên CODE `local_303aeaba…`):
+  * S72: không xác định được lượt (nhiều #run_start, thiếu mốc) vẫn đọc bộ đếm mất dữ liệu của mọi #run_end:
+    > 0 là "fail" (thứ tự Z19), không bị che thành "insufficient".
+  * S71: định dạng cả lượt phải nhất quán: mốc có `run=` thì dòng E/P phải có số lượt, mốc không có thì không
+    (mục "line_format"); dòng E không có số lượt không được chọn theo thời gian khi mốc có `run=`.
+
 Usage:
     python tools/s06_esp32_check.py <thư mục lượt> [<thư mục lượt> ...] [--out <thư mục kết quả>]
 Mã thoát (một lượt): 0 đạt; 1 có mục không đạt; 2 thiếu #run_start/#run_end; 3 lượt không hợp lệ
@@ -188,6 +194,19 @@ def first_text(ev, name, run=None):
     return None
 
 
+def known_losses(ev):
+    """S72: bộ đếm mất dữ liệu > 0 ở mọi #run_end của file, kể cả khi không chọn được một lượt để chấm."""
+    out = []
+    for t in ev["text"]:
+        if t["name"] != "run_end":
+            continue
+        for k in ("enc_ovf_run", "ev_qdrop_run", "log_qdrop_run"):
+            v = t["kv"].get(k, "0")
+            if v.lstrip("-").isdigit() and int(v) > 0:
+                out.append(f"run={t['kv'].get('run', '?')} {k}={v}")
+    return out
+
+
 def match_reports(J, I):
     """Ghép mỗi callback (I) với report ở cổng SPI (J) cùng (loại, epoch, seq), J mới nhất có
     t_us ≤ t_us của I. Trả về: tập chỉ số J đã tới callback; I không ghép được; I lặp report."""
@@ -233,10 +252,11 @@ def check_run(run_dir):
          "có cả hai (§4.3 điều 1)", bool(rs and re_))
     if n_starts > 1:
         item("one_run_per_file", f"{n_starts} dòng #run_start", "một lượt mỗi thư mục (S58)", False, "evidence")
-        res["status"] = "insufficient"
-        return res, ev, None
-    if not (rs and re_):
-        res["status"] = "insufficient"
+    if n_starts > 1 or not (rs and re_):
+        # S72 (Z19 order): a run that cannot be scored does not hide a loss the producer already reported
+        lost = known_losses(ev)
+        item("loss_counters_of_run_end", "; ".join(lost) or "0", "0 ở mọi #run_end (§4.3 điều 4, 6)", not lost)
+        res["status"] = "fail" if lost else "insufficient"
         return res, ev, None
     t0, t1 = int(rs["kv"]["timestamp_us"]), int(re_["kv"]["timestamp_us"])
     dur_s, auto_end = int(rs["kv"]["duration_s"]), int(rs["kv"]["auto_end"])
@@ -299,8 +319,12 @@ def check_run(run_dir):
     es.update(stream="esp32_events", overflow=int(re_["kv"].get("ev_qdrop_run", -1)))
     es["ok"] = es["gaps"] == 0 and es["dups"] == 0 and es["overflow"] == 0
     # S58: dòng E của lượt theo trường run (cả lần đọc dở lúc END, S59); firmware cũ: theo thời gian
-    E = [e for e in ev["E"] if (e["run_id"] == int(run_id) if run_id is not None and e["run_id"] is not None
+    E = [e for e in ev["E"] if (e["run_id"] == int(run_id) if run_id is not None
                                 else t0 - 1000 <= e["t_before"] <= t1 + 1000)]
+    # S71: the format of the lines must be that of the marks; the old fallback is only for a run all old
+    mixed = sum(1 for x in ev["E"] + ev["P"] if (x["run_id"] is None) == (run_id is not None))
+    item("line_format", f"{mixed} dòng E/P khác định dạng mốc lượt", "0: mốc có run= thì E/P có số lượt, và ngược lại (S71)",
+         mixed == 0, "evidence")
     enc = dict(stream="esp32_enc", expected=None, received=len({e["eseq"] for e in E}), gaps=None,
                dups=len(E) - len({e["eseq"] for e in E}), overflow=int(re_["kv"].get("enc_ovf_run", -1)))
     if E:
