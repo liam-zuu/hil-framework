@@ -81,11 +81,55 @@ def test_data_loss_is_failure(tmp_path, kw):
     assert r['status'] == 'fail_data_loss'
 
 
-def test_too_short_and_exit_codes(tmp_path):
+def test_too_short_and_exit_codes(tmp_path, capsys):
     short = write(tmp_path, n=300_000, name='s.csv')
     assert t2.check_run(short)['status'] == 'too_short'
     assert t2.main([short]) == 3
+    assert '#ket_qua,ma=3,ly_do=khong_du_dieu_kien' in capsys.readouterr().out
     assert t2.main([short, write(tmp_path, late={400_000}, name='f.csv')]) == 1
+    assert '#ket_qua,ma=1' in capsys.readouterr().out
+    assert t2.main([write(tmp_path, near={300_000}, res_s=1e-6, name='n.csv')]) == 3
+    assert 'ly_do=chua_ket_luan' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('bad', ['nan', 'inf'])
+def test_c1_10_non_finite_row_is_data_loss(tmp_path, bad):
+    # a late step whose t_done is NaN: `lat > 1000` is False, it would count as met
+    p = write(tmp_path)
+    lines = open(p).read().splitlines()
+    f = lines[300_000].split(',')
+    f[3] = bad
+    lines[300_000] = ','.join(f)
+    open(p, 'w', newline='\n').write('\n'.join(lines) + '\n')
+    r = t2.check_run(p)
+    assert r['status'] == 'fail_data_loss' and r['non_finite_rows'] == 1
+
+
+def test_c1_10_non_finite_resolution_is_data_loss(tmp_path):
+    p = write(tmp_path)
+    m = json.load(open(p + '.json'))
+    m['monotonic_resolution_s'] = float('nan')
+    json.dump(m, open(p + '.json', 'w'))
+    assert t2.check_run(p)['status'] == 'fail_data_loss'
+
+
+def test_x8_uname_reported(tmp_path):
+    p = write(tmp_path)
+    assert any('uname' in x for x in t2.check_run(p)['notes'])
+    m = json.load(open(p + '.json'))
+    m['uname'] = 'Linux thesis-hil 6.18'
+    json.dump(m, open(p + '.json', 'w'))
+    r = t2.check_run(p)
+    assert r['uname'] == 'Linux thesis-hil 6.18' and not any('uname' in x for x in r['notes'])
+
+
+def test_x7_step_log_cost(tmp_path):
+    import step_log_cost as c
+    out = tmp_path / 'cost.json'
+    assert c.main(['--n', '3000', '--no-pace', '--out', str(out)]) == 0
+    r = json.load(open(out))
+    assert r['n'] == 3000 and r['overflow'] == 0 and 0 <= r['median_us'] <= r['p999_us'] <= r['max_us']
+    assert set(r['rt']) == {'sched_fifo', 'cpu_pinned'} and r['uname']
 
 
 def test_rule_of_three(tmp_path, capsys):

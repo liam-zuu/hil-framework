@@ -360,9 +360,11 @@ def main() -> int:
     log.info("Plant process exited (code=%s)", p1.exitcode)
     if step_csv is not None:
         import json
+        import platform
         meta = step_csv.close()
         # the whole command line: shows the load of the run (e.g. --frame-log shared with S06 T1)
         meta['argv'] = sys.argv
+        meta['uname'] = ' '.join(platform.uname())       # X8: the kernel of the run
         with open(args.step_log + '.json', 'w') as f:
             json.dump(meta, f, indent=1)
         log.info('Step log: %d rows -> %s; overflow=%d lost_or_torn=%d', meta['rows'], args.step_log,

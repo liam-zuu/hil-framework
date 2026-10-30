@@ -30,10 +30,16 @@ Sửa theo Codex Sol vòng 1/2 (Liam duyệt 30/10 "Duyệt, sửa hết"):
     `wait_next_tick()` trả về (`timing.py`), nằm trước `t_done`.
   * S14: cận quy tắc ba chỉ in khi tổng số lỡ hạn = 0; có lỡ thì in số và tỉ lệ quan sát.
 
+Khớp spec 3.1 (Liam 30/10, "Duyệt, làm tiếp"):
+  * C1-10: giá trị không hữu hạn (NaN, Inf) trong CSV hay ở `monotonic_resolution_s` là mất dữ liệu đo, thất bại
+    (so sánh với NaN luôn sai nên trước đây lọt như "không lỡ hạn").
+  * X8: `uname` trong `.json` của lượt được chép vào kết quả; thiếu thì ghi chú.
+
 Usage:
   python tools/s06_t2_check.py <steps.csv> [<steps.csv> ...] [--out summary.json]
-Mã thoát: 0 mọi lượt đạt; 1 có lượt không đạt hoặc thất bại; 3 không có lượt không đạt nhưng có
-lượt không đủ thời lượng hoặc chưa kết luận; 2 lỗi đầu vào.
+Mã thoát (spec 3.1, bảng mã kết quả): 0 mọi lượt đạt; 1 có lượt không đạt hoặc thất bại; 3 không có lượt không
+đạt nhưng có lượt không đủ thời lượng (`khong_du_dieu_kien`) hoặc chưa kết luận (`chua_ket_luan`), in lý do;
+2 lỗi đầu vào.
 """
 from __future__ import annotations
 
@@ -79,9 +85,15 @@ def clusters(miss_steps, gap):
 
 def check_run(path, min_scored_s=MIN_SCORED_S, cluster_gap=CLUSTER_GAP_STEPS, period_us=PERIOD_US):
     a, meta = load(path)
+    # C1-10: a row with NaN/Inf is lost data (every comparison with NaN is False, it would pass as "no miss")
+    fin = np.all([np.isfinite(v) for v in a.values()], axis=0)
+    if not fin.any():
+        raise ValueError(f'{path}: no finite row')
+    non_finite = int(np.sum(~fin))
+    a = {k: v[fin] for k, v in a.items()}
     step = a['step'].astype(np.int64)
     ts, t0, td, te = (a[c].astype(float) for c in ('t_sched_us', 't_start_us', 't_done_us', 't_end_us'))
-    res = dict(file=path, rows=int(len(step)), notes=[])
+    res = dict(file=path, rows=int(len(step)), notes=[], non_finite_rows=non_finite)
     # data loss (Z19)
     gaps = int((step[-1] - step[0] + 1) - len(np.unique(step)))
     dup = int(len(step) - len(np.unique(step)))
@@ -93,11 +105,13 @@ def check_run(path, min_scored_s=MIN_SCORED_S, cluster_gap=CLUSTER_GAP_STEPS, pe
     else:
         argv = meta.get('argv')
         res.update(overflow=meta.get('overflow'), lost_or_torn=meta.get('lost_or_torn'),
-                   monotonic_resolution_s=meta.get('monotonic_resolution_s'), run_argv=argv,
+                   monotonic_resolution_s=meta.get('monotonic_resolution_s'), run_argv=argv, uname=meta.get('uname'),
                    frame_log=None if argv is None else any(x == '--frame-log' or x.startswith('--frame-log=')
                                                            for x in argv))
         if argv is None:
             res['notes'].append('file .json không có dòng lệnh (bản run_hil cũ): không biết lượt có --frame-log')
+        if meta.get('uname') is None:
+            res['notes'].append('file .json không có uname (X8): không biết kernel của lượt')
     # S4: the CSV must be the whole drained log of the ring: rows, first step and steps written of the
     # .json (rpi5/step_log.py StepLogReader.counters) must match the CSV, else rows were cut or lost
     meta_bad = []
@@ -107,10 +121,16 @@ def check_run(path, min_scored_s=MIN_SCORED_S, cluster_gap=CLUSTER_GAP_STEPS, pe
                 meta_bad.append(f'.json thiếu {k}')
             elif meta[k] != want:
                 meta_bad.append(f'.json {k} = {meta[k]}, CSV cho {want}')
+        r_s = meta.get('monotonic_resolution_s') or 0.0
+        if not (np.isfinite(r_s) and r_s >= 0):
+            meta_bad.append(f'.json monotonic_resolution_s = {r_s}')      # C1-10
+            meta['monotonic_resolution_s'] = 0.0
+    if non_finite:
+        res['notes'].append(f'{non_finite} dòng có giá trị không hữu hạn (NaN/Inf): mất dữ liệu đo')
         res['notes'] += meta_bad
     res['meta_mismatch'] = meta_bad
-    data_loss = bool(gaps or dup or order_bad or (meta is None) or meta.get('overflow') or meta.get('lost_or_torn')
-                     or meta_bad)
+    data_loss = bool(gaps or dup or order_bad or non_finite or (meta is None) or meta.get('overflow')
+                     or meta.get('lost_or_torn') or meta_bad)
     # schedule continuity
     dts = np.diff(ts)
     res['t_sched_step_bad'] = int(np.sum(np.abs(dts - period_us) > 1e-3))
@@ -200,9 +220,12 @@ def main(argv=None) -> int:
             json.dump(dict(total=total, runs=runs), f, indent=1, ensure_ascii=False)
     st = total['status']
     if st['fail'] or st['fail_data_loss']:
+        print('#ket_qua,ma=1')
         return 1
     if st['too_short'] or st['inconclusive']:
+        print('#ket_qua,ma=3,ly_do=' + ('khong_du_dieu_kien' if st['too_short'] else 'chua_ket_luan'))
         return 3
+    print('#ket_qua,ma=0')
     return 0
 
 
