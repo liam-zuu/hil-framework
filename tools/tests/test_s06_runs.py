@@ -130,7 +130,7 @@ def test_required_tools_are_the_spec_table():
         'T1': t2, 'T2': t2, 'T10': t2, 'T3b': ['t3b_score.py', 's06_esp32_check.py'],
         'T4': ['s06_t4_values.py', 's06_esp32_check.py'], 'T5': ['s06_t5_score.py', 's06_esp32_check.py'],
         'T6': ['s06_t6_check.py', 's06_esp32_check.py'],
-        'CB5': ['s06_t2_check.py', 's06_esp32_check.py', 's06_frames_decode.py']}
+        'CB5': ['s06_t2_check.py', 's06_esp32_check.py', 's06_frames_decode.py', 's06_enc_alive.py']}
 
 
 def test_every_required_tool_closes_the_run(f, tmp_path, capsys):

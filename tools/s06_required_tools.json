@@ -5,6 +5,6 @@
   "T4": ["s06_t4_values.py", "s06_esp32_check.py"],
   "T5": ["s06_t5_score.py", "s06_esp32_check.py"],
   "T6": ["s06_t6_check.py", "s06_esp32_check.py"],
-  "CB5": ["s06_t2_check.py", "s06_esp32_check.py", "s06_frames_decode.py"],
+  "CB5": ["s06_t2_check.py", "s06_esp32_check.py", "s06_frames_decode.py", "s06_enc_alive.py"],
   "dung_chung": {"T1": "T2", "T10": "T2"}
 }
