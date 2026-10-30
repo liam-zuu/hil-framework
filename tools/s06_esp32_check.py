@@ -51,7 +51,8 @@ Khớp spec 3.1, bảng mã kết quả (Liam 30/10, "Duyệt, làm tiếp"): d�
 Usage:
     python tools/s06_esp32_check.py <thư mục lượt> [<thư mục lượt> ...] [--out <thư mục kết quả>]
 Mã thoát (một lượt): 0 đạt; 1 có mục không đạt; 3 không có mục không đạt nhưng chưa ra kết luận (in lý do).
-Nhiều lượt: 0 khi mọi lượt đạt, ngược lại 1; in số lượt bị loại vì số lần đọc count.
+Nhiều lượt: 1 khi có lượt không đạt; không có thì 3 khi có lượt thiếu bằng chứng hay không hợp lệ; 0 khi mọi lượt
+đạt (C2-16); in số lượt bị loại vì số lần đọc count.
 """
 
 import argparse
