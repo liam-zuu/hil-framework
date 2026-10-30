@@ -13,7 +13,8 @@ from step_log import CSV_HEADER, format_row  # noqa: E402
 N_OK = 620_000            # 620 s: 10 s discarded + 610 s scored
 
 
-def write(tmp_path, n=N_OK, late=(), end_late=(), skip=(), overflow=0, lost=0, name='steps.csv', meta=True):
+def write(tmp_path, n=N_OK, late=(), end_late=(), skip=(), overflow=0, lost=0, name='steps.csv', meta=True,
+          argv=None):
     p = tmp_path / name
     with open(p, 'w', newline='\n') as f:
         f.write(CSV_HEADER + '\n')
@@ -28,9 +29,19 @@ def write(tmp_path, n=N_OK, late=(), end_late=(), skip=(), overflow=0, lost=0, n
                 te = max(te, td + 1000)
             f.write(format_row((k, ts, ts + 20_000, td, te)) + '\n')
     if meta:
-        json.dump(dict(rows=n - len(skip), overflow=overflow, lost_or_torn=lost, monotonic_resolution_s=1e-9),
-                  open(str(p) + '.json', 'w'))
+        m = dict(rows=n - len(skip), overflow=overflow, lost_or_torn=lost, monotonic_resolution_s=1e-9)
+        if argv is not None:
+            m['argv'] = argv
+        json.dump(m, open(str(p) + '.json', 'w'))
     return str(p)
+
+
+@pytest.mark.parametrize('argv, want', [(None, None), (['run_hil.py', '--step-log', 's.csv'], False),
+                                        (['run_hil.py', '--frame-log', 'f.npz', '--step-log', 's.csv'], True)])
+def test_frame_log_flag_reported(tmp_path, argv, want):
+    r = t2.check_run(write(tmp_path, argv=argv))
+    assert r['frame_log'] is want and r['status'] == 'pass'
+    assert (argv is None) == any('dòng lệnh' in n for n in r['notes'])
 
 
 def test_clean_run_passes(tmp_path):

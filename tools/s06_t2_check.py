@@ -81,8 +81,13 @@ def check_run(path, min_scored_s=MIN_SCORED_S, cluster_gap=CLUSTER_GAP_STEPS, pe
         res['notes'].append('thiếu file .json của bộ đệm vòng: không kiểm được tràn')
         res.update(overflow=None, lost_or_torn=None)
     else:
+        argv = meta.get('argv')
         res.update(overflow=meta.get('overflow'), lost_or_torn=meta.get('lost_or_torn'),
-                   monotonic_resolution_s=meta.get('monotonic_resolution_s'))
+                   monotonic_resolution_s=meta.get('monotonic_resolution_s'), run_argv=argv,
+                   frame_log=None if argv is None else any(x == '--frame-log' or x.startswith('--frame-log=')
+                                                           for x in argv))
+        if argv is None:
+            res['notes'].append('file .json không có dòng lệnh (bản run_hil cũ): không biết lượt có --frame-log')
     data_loss = bool(gaps or dup or order_bad or (meta is None) or meta.get('overflow') or meta.get('lost_or_torn'))
     # schedule continuity
     dts = np.diff(ts)
