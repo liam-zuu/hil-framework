@@ -1,6 +1,23 @@
 /* spi1_handler.c — SPI1 slave DMA handler (RPi5 ↔ H7)
  * Frame: 40 bytes full-duplex (v3 — trajectory reference + IMU values)
  * Re-arm inside HAL_SPI_TxRxCpltCallback — safe on H7 HAL.
+ *
+ * Frame consistency (29/10, S06 #3 and Codex #23 on the HIL data flow):
+ *  - the main loop reads state + traj of ONE frame with SPI1_GetFrame(), copied
+ *    with interrupts masked (before, SPI1_GetState() and SPI1_GetTrajRef() were
+ *    two unlocked copies, so a frame interrupt in between or in the middle of a
+ *    copy could mix two frames);
+ *  - the main loop never writes the buffer the DMA is sending: SPI1_SetOutput()
+ *    stages the MISO bytes, the callback copies them into _tx while the DMA is
+ *    idle (before, _encode() memset and rewrote _tx after the DMA was re-armed,
+ *    so the TX FIFO could already hold old or zero bytes). Cost: MISO now
+ *    always carries the output staged after the PREVIOUS callback, i.e. the
+ *    reply to frame N goes out in frame N+2 (seq says which frame it answers);
+ *  - a setpoint flagged VALID|NEW is latched in the callback until the main
+ *    loop takes it for the relay (SPI1_TakeNewTraj), so a NEW frame the main
+ *    loop did not see (debug printing longer than 1 ms) is not lost silently.
+ *    A newer NEW replaces a pending one (the DUT should follow the latest
+ *    setpoint); replaced and dropped ones are counted.
  */
 
 #include "spi1_handler.h"
@@ -9,10 +26,22 @@
 
 /* ── Private state ───────────────────────────────────────────────────── */
 static SPI_HandleTypeDef *_hspi;
-static uint8_t _tx[SPI1_FRAME_LEN];
+static uint8_t _tx[SPI1_FRAME_LEN];       /* buffer handed to the DMA      */
+static uint8_t _tx_next[SPI1_FRAME_LEN];  /* staged by SPI1_SetOutput()    */
+static volatile uint8_t _tx_next_valid;
 static uint8_t _rx[SPI1_FRAME_LEN];
 
 static volatile uint8_t _frame_ready = 0;
+static volatile uint32_t _n_unread;       /* frames decoded over an unread one */
+
+/* Setpoint waiting for the UART relay (Codex #23) */
+static HIL_TrajRef_t     _new_traj;
+static uint8_t           _new_seq;        /* state.seq of the frame that carried it */
+static volatile uint8_t  _new_pending;
+static volatile uint32_t _n_new;          /* VALID|NEW frames decoded       */
+static volatile uint32_t _n_new_replaced; /* pending one replaced by a newer */
+static uint32_t          _n_new_taken;
+static uint32_t          _n_new_dropped;  /* cleared by SPI1_DropNewTraj()  */
 
 /* Link statistics and error recovery (27/10). Before, a SPI1 error stopped
  * the DMA for good (no error callback) and the H7 ignored the RPi5 until a
@@ -83,19 +112,41 @@ static void _decode(void)
 }
 
 /* ── Encode MISO (H7 → RPi5) ────────────────────────────────────────── */
-static void _encode(void)
+static void _encode(uint8_t *buf)
 {
-    memset(_tx, 0, sizeof(_tx));
+    memset(buf, 0, SPI1_FRAME_LEN);
     for (int i = 0; i < 4; i++) {
-        _wr16(&_tx[i * 2],
+        _wr16(&buf[i * 2],
               (int16_t)(_clampf(_output.torque[i], -HIL_TORQUE_MAX, HIL_TORQUE_MAX)
                         * (INT16_MAXF / HIL_TORQUE_MAX)));
-        _wr16(&_tx[8 + i * 2],
+        _wr16(&buf[8 + i * 2],
               (int16_t)(_clampf(_output.pwm[i], -1.0f, 1.0f) * INT16_MAXF));
     }
-    _tx[16] = _output.status;
-    _tx[17] = _output.seq;
+    buf[16] = _output.status;
+    buf[17] = _output.seq;
     /* bytes 18–39: remain 0x00 */
+}
+
+/* Staged MISO bytes → DMA buffer. Only while the DMA is idle: in the frame
+ * callback before the re-arm, or in SPI1_Service() after the abort. */
+static void _take_staged_tx(void)
+{
+    if (_tx_next_valid) {
+        memcpy(_tx, _tx_next, SPI1_FRAME_LEN);
+        _tx_next_valid = 0;
+    }
+}
+
+/* VALID|NEW in the frame just decoded → latch it for the relay */
+static void _latch_new_traj(void)
+{
+    const uint8_t mask = HIL_TRAJ_VALID | HIL_TRAJ_NEW;
+    if ((_traj.traj_flags & mask) != mask) return;
+    if (_new_pending) _n_new_replaced++;
+    _new_traj    = _traj;
+    _new_seq     = _state.seq;
+    _new_pending = 1;
+    _n_new++;
 }
 
 /* ── Public API ──────────────────────────────────────────────────────── */
@@ -103,8 +154,11 @@ void SPI1_Handler_Init(SPI_HandleTypeDef *hspi)
 {
     _hspi = hspi;
     memset(_tx, 0, sizeof(_tx));
+    memset(_tx_next, 0, sizeof(_tx_next));
+    _tx_next_valid = 0;
     memset(_rx, 0, sizeof(_rx));
     _frame_ready = 0;
+    _new_pending = 0;
     HAL_SPI_TransmitReceive_DMA(_hspi, _tx, _rx, SPI1_FRAME_LEN);
 }
 
@@ -113,15 +167,45 @@ uint8_t SPI1_IsFrameReady(void)
     return _frame_ready;
 }
 
-void SPI1_GetState(HIL_State_t *out)
+/* State and traj of the same (latest) frame; clears frame_ready */
+void SPI1_GetFrame(HIL_State_t *state, HIL_TrajRef_t *traj)
 {
-    *out = _state;
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    *state = _state;
+    *traj  = _traj;
+    _frame_ready = 0;
+    __set_PRIMASK(primask);
 }
 
-void SPI1_GetTrajRef(HIL_TrajRef_t *out)
+/* Latched VALID|NEW setpoint, if any: 1 and a copy (plus the seq of the frame
+ * that carried it), 0 if none is waiting */
+uint8_t SPI1_TakeNewTraj(HIL_TrajRef_t *out, uint8_t *seq)
 {
-    *out = _traj;
-    _frame_ready = 0;   /* clear after both state + traj consumed */
+    uint8_t got = 0;
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    if (_new_pending) {
+        *out = _new_traj;
+        if (seq) *seq = _new_seq;
+        _new_pending = 0;
+        _n_new_taken++;
+        got = 1;
+    }
+    __set_PRIMASK(primask);
+    return got;
+}
+
+/* Forget a pending setpoint (link lost: do not relay an old one later) */
+void SPI1_DropNewTraj(void)
+{
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    if (_new_pending) {
+        _new_pending = 0;
+        _n_new_dropped++;
+    }
+    __set_PRIMASK(primask);
 }
 
 /* IMU values of the last frame (does not touch frame_ready). Copied with
@@ -134,10 +218,17 @@ void SPI1_GetImu(HIL_Imu_t *out)
     __enable_irq();
 }
 
+/* Stage the reply; the DMA buffer is only written while the DMA is idle */
 void SPI1_SetOutput(const HIL_Output_t *out)
 {
+    uint8_t buf[SPI1_FRAME_LEN];
     _output = *out;
-    _encode();
+    _encode(buf);
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    memcpy(_tx_next, buf, SPI1_FRAME_LEN);
+    _tx_next_valid = 1;
+    __set_PRIMASK(primask);
 }
 
 /* Re-arm inside callback — safe: HAL H7 resets state BEFORE calling callback */
@@ -145,10 +236,13 @@ void SPI1_Callback(SPI_HandleTypeDef *hspi)
 {
     if (hspi->Instance != _hspi->Instance) return;
     _decode();
+    _latch_new_traj();
+    _take_staged_tx();
     if (HAL_SPI_TransmitReceive_DMA(_hspi, _tx, _rx, SPI1_FRAME_LEN) != HAL_OK)
         _rearm_pending = 1;
     _last_frame_ms = HAL_GetTick();
     _n_frames++;
+    if (_frame_ready) _n_unread++;
     _frame_ready = 1;
 }
 
@@ -171,6 +265,10 @@ void SPI1_Service(void)
     if (HAL_GPIO_ReadPin(_NSS_PORT, _NSS_PIN) != GPIO_PIN_SET) return;  /* frame in progress */
 
     HAL_SPI_Abort(_hspi);
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    _take_staged_tx();
+    __set_PRIMASK(primask);
     if (HAL_SPI_TransmitReceive_DMA(_hspi, _tx, _rx, SPI1_FRAME_LEN) == HAL_OK) {
         _rearm_pending = 0;
         _n_rearms++;
@@ -187,5 +285,10 @@ void SPI1_GetStats(SPI1_Stats_t *out)
     __disable_irq();
     out->frames        = _n_frames;
     out->last_frame_ms = _last_frame_ms;
+    out->unread        = _n_unread;
+    out->new_seen      = _n_new;
+    out->new_replaced  = _n_new_replaced;
+    out->new_taken     = _n_new_taken;
+    out->new_dropped   = _n_new_dropped;
     __enable_irq();
 }
