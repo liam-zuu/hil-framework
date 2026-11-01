@@ -307,6 +307,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument('--traj-loop',     action='store_true',
                    help='Trajectory publisher starts the trajectory again when --duration is '
                         'reached (S06 V7), instead of stopping')
+    p.add_argument('--load-schedule', default=None, metavar='CSV',
+                   help='S06 V7, Z8: play the file of s06_load_schedule.py: group A setpoints in its order, '
+                        'heavy block on the omega sent to the H7, full plant dynamics; --steps 0 = its length')
     p.add_argument('--frame-log',     default='', metavar='NPZ',
                    help='S06: save raw MOSI + MISO of every frame and its send time '
                         '(time.monotonic_ns) to this .npz after the run')
@@ -350,6 +353,23 @@ def main() -> int:
 
     if args.imu_static and args.imu_profile:
         raise SystemExit('--imu-static and --imu-profile exclude each other')
+    load_rows, heavy_block, load_id = None, None, ''
+    if args.load_schedule:
+        # S06 Z8: full plant dynamics, relay running; nothing else may set omega or the trajectory
+        if n_modes or args.test or args.traj != 'idle' or args.no_traj or args.traj_loop:
+            raise SystemExit('--load-schedule excludes the omega modes, --test, --traj, --no-traj, --traj-loop')
+        import s06_load_schedule as lsched
+        load_rows = lsched.read_csv(args.load_schedule)
+        try:
+            lsched.check(load_rows)
+        except ValueError as exc:
+            raise SystemExit(str(exc))
+        n_load = lsched.total_steps(load_rows)
+        if args.steps not in (0, n_load):
+            raise SystemExit(f'--steps {args.steps} differs from the schedule ({n_load} steps)')
+        args.steps = n_load
+        heavy_block = lsched.heavy_span(load_rows)
+        load_id = f'{args.load_schedule} {lsched.file_sha256(args.load_schedule)}'
     hil_cfg = HILConfig(
         period_us    = 1_000,
         rt_priority  = args.rt_priority,
@@ -362,6 +382,8 @@ def main() -> int:
         imu_profile  = args.imu_profile,
         frame_log    = args.frame_log,
         rt_tune      = not args.no_rt_tune,
+        heavy_block  = heavy_block,
+        load_schedule = load_id,
     )
     traj_spec = TrajectorySpec(
         kind     = args.traj,
@@ -372,6 +394,9 @@ def main() -> int:
     )
     lifted = False
     fixed_omega = _parse_fixed_omega(args.fixed_omega) if args.fixed_omega else None
+    if load_rows is not None:
+        traj_spec = lsched.trajectory_spec(load_rows)
+        args.traj = traj_spec.kind
     if args.test:
         if args.test not in GROUP_A:
             raise SystemExit(f'--test must be one of {sorted(GROUP_A)}')
