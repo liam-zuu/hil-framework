@@ -307,6 +307,47 @@ static uint32_t reset_events, feature_resps;
 static bool initialized, reenable_pending, sh2_is_open;
 static uint32_t period_req;
 
+/* S06 event hook of the core (29/10): every report the host library hands to
+ * the sensor callback must have been built (REPORT, queued) and then read as
+ * part of a packet (PKT_READ); rpt_seq of each sensor goes up by one per built
+ * report within a reset; no report is built during IMU loss injection. */
+enum { HK_NONE = 0, HK_QUEUED, HK_READ, HK_RECEIVED };
+static uint8_t  hk_state[BNO_EMU_N_SENSORS][256];
+static int      hk_last_seq[BNO_EMU_N_SENSORS] = { -1, -1, -1 };
+static uint32_t hk_reset_done, hk_hold_on, hk_hold_off, hk_rpt_in_hold, hk_qfull;
+static uint32_t hk_built, hk_read, hk_received, hk_seq_gap, hk_read_not_built, hk_rx_not_read;
+static bool     hk_in_hold;
+
+static void hook(void *ctx, const bno_emu_event_t *ev)
+{
+    (void)ctx;
+    switch (ev->type) {
+    case BNO_EV_REPORT:
+        if (hk_in_hold) hk_rpt_in_hold++;
+        if (hk_last_seq[ev->sensor] >= 0 && ev->rpt_seq != (uint8_t)(hk_last_seq[ev->sensor] + 1)) hk_seq_gap++;
+        hk_last_seq[ev->sensor] = ev->rpt_seq;
+        if (ev->flags & BNO_EV_QFULL) { hk_qfull++; hk_state[ev->sensor][ev->rpt_seq] = HK_NONE; }
+        else hk_state[ev->sensor][ev->rpt_seq] = HK_QUEUED;
+        hk_built++;
+        break;
+    case BNO_EV_PKT_READ:
+        for (unsigned i = 0; i < BNO_EMU_N_SENSORS; i++) {
+            if (!(ev->mask & (1u << i))) continue;
+            if (hk_state[i][ev->seqs[i]] != HK_QUEUED) hk_read_not_built++;
+            hk_state[i][ev->seqs[i]] = HK_READ;
+            hk_read++;
+        }
+        break;
+    case BNO_EV_RESET_DONE:
+        hk_reset_done++;
+        for (unsigned i = 0; i < BNO_EMU_N_SENSORS; i++) hk_last_seq[i] = -1;   /* rpt_seq restarts at 0 */
+        break;
+    case BNO_EV_HOLD:
+        if (ev->flags) hk_hold_on++; else hk_hold_off++;
+        break;
+    }
+}
+
 static void rx_clear(void) { memset(rx, 0, sizeof(rx)); }
 
 static void hal_cb(void *cookie, sh2_AsyncEvent_t *ev)
@@ -329,6 +370,9 @@ static void sensor_cb(void *cookie, sh2_SensorEvent_t *ev)
     if (i < 0) return;
     rx_stat_t *r = &rx[i];
     const bno_emu_last_t *l = &emu.last[i];
+
+    if (hk_state[i][ev->report[1]] != HK_READ) hk_rx_not_read++;
+    else { hk_state[i][ev->report[1]] = HK_RECEIVED; hk_received++; }
 
     if (r->n > 0) {
         double dt = (double)(now - r->t_last);
@@ -659,6 +703,33 @@ static void sc_stale(uint32_t period)
     check_data();
 }
 
+/* S06 T8 (V3-1): IMU loss injected for 1.5 s in the middle of a run */
+static void sc_hold(uint32_t period)
+{
+    init_res_t r = host_init(period);
+    if (!check_init(&r, "init")) return;
+    service_for(2000000u);
+    uint32_t built0 = hk_built, skips0 = emu.st.hold_skips;
+    rx_clear();
+    hk_in_hold = true;
+    bno_emu_set_hold(&emu, true, (uint32_t)now);
+    service_for(1500000u);
+    uint32_t rx_hold = rx[0].n + rx[1].n + rx[2].n;
+    hk_in_hold = false;
+    bno_emu_set_hold(&emu, false, (uint32_t)now);
+    rx_clear();
+    service_for(2000000u);
+    uint32_t rx_after = rx[0].n + rx[1].n + rx[2].n;
+    printf("hold_rx_during=%u\nhold_rx_after=%u\nhold_skips=%u\n", rx_hold, rx_after, emu.st.hold_skips - skips0);
+    if (hk_hold_on != 1 || hk_hold_off != 1) fail("HOLD events on=%u off=%u (want 1, 1)", hk_hold_on, hk_hold_off);
+    if (hk_rpt_in_hold) fail("%u reports built during the hold", hk_rpt_in_hold);
+    if (emu.st.hold_skips == skips0) fail("hold_skips did not grow");
+    /* at most what was already queued at hold start reaches the host */
+    if (rx_hold > 3) fail("%u reports reached the host during the hold", rx_hold);
+    if (rx_after < (uint32_t)(3 * 2000000u / period) * 9 / 10) fail("only %u reports in 2 s after the hold", rx_after);
+    if (hk_built == built0) fail("no report built after the hold");
+}
+
 int main(int argc, char **argv)
 {
     const char *sc = argc > 1 ? argv[1] : "run";
@@ -671,6 +742,7 @@ int main(int argc, char **argv)
     bno_emu_cfg_t cfg;
     bno_emu_default_cfg(&cfg);
     bno_emu_init(&emu, &cfg, 0);
+    bno_emu_set_hook(&emu, hook, NULL);
     if (port_mode) { port_next_tick = PORT_TICK_US; port_rearm(); }
     printf("scenario=%s\nperiod_us=%u\nh7_port=%d\n", sc, period, (int)port_mode);
 
@@ -680,7 +752,18 @@ int main(int argc, char **argv)
     else if (strcmp(sc, "rst_mid") == 0)   sc_rst_mid(period);
     else if (strcmp(sc, "silent") == 0)    sc_silent(period);
     else if (strcmp(sc, "stale") == 0)     sc_stale(period);
+    else if (strcmp(sc, "hold") == 0)      sc_hold(period);
     else { printf("unknown scenario\n"); return 2; }
+
+    /* S06 hook checks, every scenario */
+    printf("hook_built=%u\nhook_qfull=%u\nhook_read=%u\nhook_received=%u\nhook_reset_done=%u\n"
+           "host_reset_events=%u\nhook_seq_gap=%u\nhook_read_not_built=%u\nhook_rx_not_read=%u\n",
+           hk_built, hk_qfull, hk_read, hk_received, hk_reset_done, reset_events, hk_seq_gap,
+           hk_read_not_built, hk_rx_not_read);
+    if (hk_seq_gap) fail("rpt_seq not +1 per built report within a reset (%u)", hk_seq_gap);
+    if (hk_read_not_built) fail("%u reports read by the host without a REPORT event", hk_read_not_built);
+    if (hk_rx_not_read) fail("%u reports at the host callback without a PKT_READ event", hk_rx_not_read);
+    if (hk_built == 0) fail("no REPORT event");
 
     print_emu();
     printf("RESULT=%s\n", pass ? "PASS" : "FAIL");

@@ -43,6 +43,10 @@ typedef struct {
     float   gx, gy, gz;         /* rad/s */
     float   qi, qj, qk, qr;     /* game rotation vector, unit quaternion */
     uint8_t seq;
+    /* S06 log only, not used by the core: H7 frame count and checksum of the
+     * raw frame bytes the sample came from (bno_emu_port.c) */
+    uint32_t src_nf;
+    uint16_t src_crc;
 } bno_emu_sample_t;
 
 typedef struct {
@@ -72,12 +76,40 @@ typedef struct {
     uint32_t input_overruns;       /* report due again before the last one was sent */
     uint32_t unknown_cmds, prod_id_reqs, set_features, get_features, adverts;
     uint32_t q_drops;              /* queue full, packet not sent             */
+    uint32_t hold_skips;           /* S06: reports due during IMU loss injection */
 } bno_emu_stats_t;
 
 typedef struct {
     uint16_t len;                               /* SHTP length incl. header */
     uint8_t  buf[BNO_EMU_PKT_MAX + 4u];         /* +4 zero pad (G0 v1 §2)   */
+    uint8_t  rmask;                             /* S06: sensors with a report in it */
+    uint8_t  rseq[3];                           /* S06: their report sequence numbers */
 } bno_emu_pkt_t;
+
+/* S06 event hook (spec S06 v3.4 T1 Z3, V3-1, V3-2, Y14). The core calls it, if
+ * set, at the moment each event happens; it does not change the behaviour. */
+typedef enum {
+    BNO_EV_REPORT = 1,      /* a report was built: sensor, rpt_seq, flags, sample */
+    BNO_EV_PKT_READ,        /* host clocked out a whole packet with reports: mask, seqs */
+    BNO_EV_RESET_DONE,      /* reset-complete queued (end of boot)        */
+    BNO_EV_HOLD,            /* IMU loss injection: flags 1 = on, 0 = off  */
+} bno_emu_ev_type_t;
+
+#define BNO_EV_QUEUED  0x01u        /* REPORT: its packet entered the queue    */
+#define BNO_EV_QFULL   0x02u        /* REPORT: its packet was dropped, queue full */
+
+typedef struct {
+    bno_emu_ev_type_t type;
+    uint8_t  sensor;                /* REPORT: 0 accel, 1 gyro, 2 game RV       */
+    uint8_t  rpt_seq;               /* REPORT                                   */
+    uint8_t  flags;
+    uint8_t  mask;                  /* PKT_READ: bit i = sensor i in the packet  */
+    uint8_t  seqs[3];               /* PKT_READ: rpt_seq of sensor i            */
+    const bno_emu_sample_t *sample; /* REPORT: sample the values came from      */
+    uint32_t now_us;
+} bno_emu_event_t;
+
+typedef void (*bno_emu_hook_t)(void *ctx, const bno_emu_event_t *ev);
 
 typedef enum { BNO_EMU_HELD = 0, BNO_EMU_BOOTING, BNO_EMU_RUNNING } bno_emu_state_t;
 
@@ -113,6 +145,11 @@ typedef struct {
     uint32_t         t_seq_change_us;           /* sample seq last changed     */
 
     bno_emu_stats_t  st;
+
+    /* S06 */
+    bool             hold;                      /* IMU loss injection: build no report */
+    bno_emu_hook_t   hook;
+    void            *hook_ctx;
 } bno_emu_t;
 
 void bno_emu_default_cfg(bno_emu_cfg_t *cfg);
@@ -132,6 +169,13 @@ bool bno_emu_int_low(const bno_emu_t *e);
 const uint8_t *bno_emu_peek_tx(const bno_emu_t *e, uint16_t *tx_len);
 const uint8_t *bno_emu_cs_fall(bno_emu_t *e, uint32_t now_us, uint16_t *tx_len);
 void bno_emu_cs_rise(bno_emu_t *e, const uint8_t *mosi, uint16_t n_clocked, uint32_t now_us);
+
+/* S06: event hook (after bno_emu_init, which clears it) and IMU loss
+ * injection. While held the report schedule keeps running but no report is
+ * built (rpt_seq does not advance); the host can still read and write. Not
+ * cleared by a chip reset (it is the plant's fault, not the chip's). */
+void bno_emu_set_hook(bno_emu_t *e, bno_emu_hook_t fn, void *ctx);
+void bno_emu_set_hold(bno_emu_t *e, bool hold, uint32_t now_us);
 
 /* Index 0..2 for report ID 0x01, 0x02, 0x08; -1 otherwise. */
 int bno_emu_sensor_index(uint8_t report_id);
