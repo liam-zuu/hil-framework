@@ -65,6 +65,22 @@ static double duration(const char *s)
     return 0.6;
 }
 
+#ifndef ENCGEN_NO_HOOK      /* the pre-29/10 encoder_gen.c (old builds of the tests) has no hook */
+/* "events" scenario: what the EncoderGen event hook saw */
+static int      ev_n[4][2];
+static int      ev_bad;
+static uint16_t ev_cnt_before[4];
+
+static void ev_hook(uint8_t wheel, uint8_t ev, uint16_t cnt, uint32_t n)
+{
+    int k = (ev == ENC_EV_START) ? 0 : 1;
+    ev_n[wheel][k]++;
+    /* the fake timer does not run inside SetOmega, so CNT at the call = CNT set before it */
+    if (cnt != ev_cnt_before[wheel] || n != (uint32_t)ev_n[wheel][k]) ev_bad++;
+    printf("EV %u %c %u %lu\n", wheel, k ? 'P' : 'S', cnt, (unsigned long)n);
+}
+#endif
+
 /* x4 quadrature: Gray order 00 -> 10 -> 11 -> 01 is A leading B */
 static int quad_index(int a, int b) { return a ? (b ? 2 : 1) : (b ? 3 : 0); }
 
@@ -133,6 +149,45 @@ int main(int argc, char **argv)
         if (ok) printf("REGS ok\n");
         return ok ? 0 : 1;
     }
+
+#ifndef ENCGEN_NO_HOOK
+    /* 29/10 (S06 T3b Y5, V2-6): _start_wheel/_stop calls reach the event hook
+     * with the timer CNT of the call and a per-wheel running count */
+    if (!strcmp(sc, "events")) {
+        /* starts: 10, flip to -10, 5, -3; stops: flip, -> 0, -> 0; 10.5 and 6 re-time, 0.1 stays stopped */
+        static const float seqw[] = { 10.0f, 10.5f, -10.0f, 0.0f, 0.1f, 5.0f, 6.0f, 0.0f, -3.0f };
+        const int want_start = 4, want_stop = 3;
+        int ok = 1;
+        EncoderGen_SetEventHook(ev_hook);
+        for (int w = 0; w < 4; w++) {
+            for (unsigned k = 0; k < sizeof seqw / sizeof seqw[0]; k++) {
+                T[w].CNT = (uint32_t)(rand() & 0xFFFF);
+                ev_cnt_before[w] = (uint16_t)T[w].CNT;
+                EncoderGen_SetOmega((uint8_t)w, seqw[k]);
+            }
+        }
+        EncoderGenDebug_t d[4];
+        EncoderGen_GetDebug(d);
+        for (int w = 0; w < 4; w++) {
+            if (ev_n[w][0] != want_start || ev_n[w][1] != want_stop) {
+                printf("EVENTS FAIL wheel %d: hook starts %d stops %d\n", w, ev_n[w][0], ev_n[w][1]); ok = 0;
+            }
+            if (d[w].n_start != (uint32_t)want_start || d[w].n_stop != (uint32_t)want_stop) {
+                printf("EVENTS FAIL wheel %d: debug starts %lu stops %lu\n", w,
+                       (unsigned long)d[w].n_start, (unsigned long)d[w].n_stop); ok = 0;
+            }
+        }
+        if (ev_bad) { printf("EVENTS FAIL %d hook calls with a wrong CNT or count\n", ev_bad); ok = 0; }
+        EncoderGen_SetEventHook(NULL);                 /* no hook: still counted, nothing called */
+        EncoderGen_SetOmega(0, 7.0f);
+        EncoderGen_GetDebug(d);
+        if (ev_n[0][0] != want_start || d[0].n_start != (uint32_t)want_start + 1u) {
+            printf("EVENTS FAIL hook removed: hook %d, debug %lu\n", ev_n[0][0], (unsigned long)d[0].n_start); ok = 0;
+        }
+        if (ok) printf("EVENTS ok\n");
+        return ok ? 0 : 1;
+    }
+#endif
 
     long n = (long)(duration(sc) * 1e6);
     long next_frame = rand() % 300;
