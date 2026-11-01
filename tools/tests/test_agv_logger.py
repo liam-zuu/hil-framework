@@ -316,6 +316,52 @@ def test_header_followed_only_by_duplicates_codex_v7():
     feed_rx(core, [(dut_line(s), 6_300_000 + s * 10_000) for s in range(1, 11)])
     g = seg(core, 0)
     assert g['duplicates'] == 10 and g['header_mid_segment'] == 1 and g['consistent'] is False
+    assert g['header'] == 'match'
+
+
+def test_two_headers_followed_only_by_duplicates_codex_x2():
+    """Codex X2: data, H, duplicate, H, duplicate, end of capture. The pending header lost its
+    value (header 'not_seen') and the two observations counted as one."""
+    core = al.LoggerCore(strict=True)
+    core.feed(dut_line(1), '10.0.0.2', t_rx_us=6 * S)
+    core.feed(DUT_HEADER, '10.0.0.2', t_rx_us=6_100_000)
+    core.feed(dut_line(1), '10.0.0.2', t_rx_us=6_200_000)
+    core.feed(DUT_HEADER, '10.0.0.2', t_rx_us=6_300_000)
+    core.feed(dut_line(1), '10.0.0.2', t_rx_us=6_400_000)
+    g = seg(core, 0)
+    assert (g['header'], g['header_mid_segment'], g['duplicates']) == ('match', 2, 2)
+    assert g['consistent'] is False
+
+
+def test_pending_header_keeps_its_own_value_codex_x2():
+    """The value reported is the header that was followed by the known line, not a default."""
+    core = al.LoggerCore(strict=False)
+    core.feed(dut_line(1), '10.0.0.2', t_rx_us=6 * S)
+    core.feed(DUT_HEADER + ',extra_column', '10.0.0.2', t_rx_us=6_100_000)
+    core.feed(dut_line(1), '10.0.0.2', t_rx_us=6_200_000)
+    g = seg(core, 0)
+    assert (g['header'], g['header_mid_segment']) == ('mismatch', 1)
+
+
+def test_summary_twice_gives_the_same_header_counts_codex_x2():
+    core = al.LoggerCore(strict=True)
+    core.feed(dut_line(1), '10.0.0.2', t_rx_us=6 * S)
+    core.feed(DUT_HEADER, '10.0.0.2', t_rx_us=6_100_000)
+    core.feed(dut_line(1), '10.0.0.2', t_rx_us=6_200_000)
+    assert seg(core, 0)['header_mid_segment'] == seg(core, 0)['header_mid_segment'] == 1
+
+
+def test_two_headers_before_duplicates_then_a_new_line_of_the_same_segment_codex_x2():
+    """The new line closes the pending headers: both observations stay in the count."""
+    core = al.LoggerCore(strict=True)
+    feed_rx(core, [(dut_line(s), 6 * S + s * 10_000) for s in range(1, 11)])
+    core.feed(DUT_HEADER, '10.0.0.2', t_rx_us=6_200_000)
+    core.feed(dut_line(10), '10.0.0.2', t_rx_us=6_210_000)
+    core.feed(DUT_HEADER, '10.0.0.2', t_rx_us=6_220_000)
+    core.feed(dut_line(10), '10.0.0.2', t_rx_us=6_230_000)
+    core.feed(dut_line(11), '10.0.0.2', t_rx_us=6_240_000)
+    g = seg(core, 0)
+    assert (g['header'], g['header_mid_segment'], g['consistent']) == ('match', 2, False)
 
 
 def test_header_then_late_duplicate_then_new_boot_codex_w4():
@@ -330,6 +376,21 @@ def test_header_then_late_duplicate_then_new_boot_codex_w4():
     a, b = core.summary()['segments']
     assert (a['duplicates'], a['header_mid_segment'], a['consistent']) == (1, 0, True)
     assert (b['header'], b['header_mid_segment']) == ('match', 0)
+
+
+def test_late_line_never_received_takes_the_header_known_limit_codex_x3():
+    """Codex X3, a known limit (written down, not fixed): after the late copy of A100 comes
+    A101, late too and never received before. 'New line' only means not held yet, so A101
+    takes B's header. The error is on the safe side: A is not consistent, B has no header."""
+    core = al.LoggerCore(strict=True)
+    core.feed(dut_line(100, ts=20 * S), '10.0.0.2', t_rx_us=100 * S)
+    core.feed(DUT_HEADER, '10.0.0.2', t_rx_us=101 * S)
+    core.feed(dut_line(100, ts=20 * S), '10.0.0.2', t_rx_us=101_001_000)
+    core.feed(dut_line(101, ts=20 * S + 10_000), '10.0.0.2', t_rx_us=101_002_000)
+    core.feed(dut_line(1, ts=5 * S), '10.0.0.2', t_rx_us=101_003_000)
+    a, b = core.summary()['segments']
+    assert (a['header'], a['header_mid_segment'], a['consistent']) == ('match', 1, False)
+    assert (b['header'], b['header_mid_segment']) == ('not_seen', 0)
 
 
 def test_queue_flush_then_live_line_stays_one_segment_codex_n3():
