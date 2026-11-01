@@ -11,6 +11,15 @@ Decision variables (the parameters the firmware actually has):
 Objectives (minimise), averaged over --seeds plant seeds on the 'steps' trajectory:
   f1 = RMS body-velocity error, sum of rms_vx, rms_vy and L * rms_wz (L = lx + ly = 0.24 m)
   f2 = total variation of the duty per second (actuator effort / chatter)
+f1 uses the TRUE plant body velocity, not the firmware's quantised estimate, so it is not a
+metric at the quantisation floor (03_CODE/CLAUDE.md, fwsim section).
+
+IMU and plant (28/10): the firmware gets BNO085 reports (QD 23; --imu-rate, --no-imu only for
+pre-28/10 re-runs) and the plant uses params.py's ground model (slip method A 'traction';
+--ground, --mu). Default --seeds is one seed: the plant has no random input and the IMU model is
+noise-free until K1, so more seeds only repeat the same run. Add seeds once the IMU noise model
+is in. Tool only: the gain range, objectives and selection rule are locked later (Outline QD 12,
+after the controller with the IMU has passed its function check; S04).
 
   python fwsim/tune_ga.py --pop 24 --gen 20 --out <dir>
   python fwsim/tune_ga.py --pop 6 --gen 2 --out <dir>       # smoke test
@@ -51,8 +60,10 @@ def gains_for(mode, x, fw):
                       2: (c, d, base[2]['b0'], base[2]['out_limit'])})
 
 
-def make_problem(fw, mode, seeds, setpoint, duration, bounds, history, pcnt_mode):
+def make_problem(fw, mode, seeds, setpoint, duration, bounds, history, pcnt_mode, sim_args):
+    """sim_args: parsed --ground/--mu/--imu-* options (fwsim.add_plant_imu_args)."""
     VARS = VARS_BY_MODE[mode]
+    imu = fwsim.imu_config(sim_args)
     from pymoo.core.problem import ElementwiseProblem
 
     class FirmwareGains(ElementwiseProblem):
@@ -63,7 +74,9 @@ def make_problem(fw, mode, seeds, setpoint, duration, bounds, history, pcnt_mode
             g = gains_for(mode, x, fw)
             f1, f2 = [], []
             for s in seeds:
-                m = fwsim.metrics(fwsim.simulate(fw, setpoint, duration, seed=s, pcnt_mode=pcnt_mode, mode=mode, **g))
+                params = fwsim.plant_params(sim_args)        # new object: simulate() writes motor_enable into it
+                m = fwsim.metrics(fwsim.simulate(fw, setpoint, duration, params, seed=s, pcnt_mode=pcnt_mode,
+                                                 mode=mode, imu=imu, **g))
                 f1.append(m['rms_vx'] + m['rms_vy'] + L_ARM * m['rms_wz'])
                 f2.append(m['tv_duty'])
             out['F'] = [float(np.mean(f1)), float(np.mean(f2))]
@@ -76,7 +89,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--pop', type=int, default=24)
     ap.add_argument('--gen', type=int, default=20)
-    ap.add_argument('--seeds', type=int, nargs='+', default=[0, 1, 2])
+    ap.add_argument('--seeds', type=int, nargs='+', default=[0],
+                    help='plant seeds averaged per evaluation (one is enough while plant and IMU model are noise-free)')
     ap.add_argument('--ga-seed', type=int, default=1)
     ap.add_argument('--speed', type=float, default=0.3)
     ap.add_argument('--radius', type=float, default=0.5)
@@ -84,6 +98,7 @@ def main():
     ap.add_argument('--mode', choices=list(VARS_BY_MODE), default='PID')
     ap.add_argument('--lower', type=float, nargs=4, default=None)
     ap.add_argument('--upper', type=float, nargs=4, default=None)
+    fwsim.add_plant_imu_args(ap)
     ap.add_argument('--out', required=True)
     a = ap.parse_args()
     VARS = VARS_BY_MODE[a.mode]
@@ -99,7 +114,7 @@ def main():
     fw = fwsim.FirmwareSim()
     sp = fwsim.make_setpoint(SimpleNamespace(traj='steps', speed=a.speed, radius=a.radius, period=8.0))
     history = []
-    problem = make_problem(fw, a.mode, a.seeds, sp, sp.duration, (a.lower, a.upper), history, a.pcnt_mode)
+    problem = make_problem(fw, a.mode, a.seeds, sp, sp.duration, (a.lower, a.upper), history, a.pcnt_mode, a)
     t0 = time.time()
     res = minimize(problem, NSGA2(pop_size=a.pop), ('n_gen', a.gen), seed=a.ga_seed, verbose=False)
     elapsed = time.time() - t0
@@ -128,6 +143,8 @@ ga: {{algorithm: NSGA2, pop: {a.pop}, gen: {a.gen}, ga_seed: {a.ga_seed}, evalua
 variables: {json.dumps(dict(names=VARS, lower=a.lower, upper=a.upper, fixed=('kd = 0, limits from pid.c' if a.mode == 'PID' else 'b0, out_limit from adrc.c')))}
 objectives: "f1 = rms_vx + rms_vy + 0.24 * rms_wz (true plant body velocity vs setpoint); f2 = duty total variation per second; mean over plant seeds"
 evaluation: {json.dumps(dict(traj='steps', speed=a.speed, radius=a.radius, seeds=a.seeds, pcnt_mode=a.pcnt_mode))}
+plant: {fwsim.plant_meta(fwsim.plant_params(a))}
+imu: {json.dumps(fwsim.imu_config(a))}             # null = no IMU reports (--no-imu)
 libraries: {json.dumps(fwsim.lib_versions())}
 """)
     print(f'{len(history)} evaluations in {elapsed:.0f} s; {len(order)} Pareto points -> {a.out}')

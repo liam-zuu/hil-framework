@@ -102,7 +102,7 @@ def load_log(path):
         kind = kinds.pop() if kinds else 'sim'
     run_end_last = None
     if kind == 'dut':
-        body, run_end_last = dut_rows(body, path)
+        body, run_end_last = dut_rows(body, str(path))     # path may be a pathlib.Path
     else:
         body = _old_format(body, t)
     data = np.array([[float(x) if x != '' else np.nan for x in r] for r in body])
