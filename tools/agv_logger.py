@@ -146,6 +146,10 @@ ENUM_DOMAINS["imu_init"] = frozenset((-1, 0, 1, 2, 3))
 COL = {c: i for i, c in enumerate(COLUMNS)}
 
 RUN_END_KEYS = ("seq", "last_data_seq", "log_qdrop", "log_send_err")   # logger.c:123
+# One binary (Outline QĐ 6 level 1, AGV feat/one-binary): good UDP packets dropped / taken during
+# the run. Both or neither: older firmware sends neither
+RUN_END_UDP_KEYS = ("udp_drop", "udp_take")
+SRC_IP_FIRST = "first"      # --src-ip first: lock on the source of the first decoded packet
 CONFIRM_LINES = 10          # a segment with fewer data lines is flagged 'few_lines' [ĐỀ XUẤT]
 # Segment policy (module docstring). All four numbers are proposals, to be set from traces
 # measured on the HIL bench (WiFi backlog, motor-off 10 Hz, slow control ticks) before the
@@ -190,7 +194,8 @@ def parse_run_end(line):
     """'#run_end,seq=..,last_data_seq=..,log_qdrop=..,log_send_err=..' -> dict, or None if
     malformed: a missing or repeated key, a value that is not U32, or seq not one of the three
     footers L+1..L+3 the firmware pushes after the last data line L (main.c:305-308,
-    logger.c:123; B0 review B33). s02_metrics uses this same parser (B50/N5)."""
+    logger.c:123; B0 review B33). udp_drop and udp_take come as a pair or not at all.
+    s02_metrics uses this same parser (B50/N5)."""
     parts = line.split(',')
     if parts[0] != '#run_end':
         return None
@@ -202,6 +207,8 @@ def parse_run_end(line):
             return None
         kv[k] = n
     if not all(k in kv for k in RUN_END_KEYS):
+        return None
+    if sum(k in kv for k in RUN_END_UDP_KEYS) == 1:
         return None
     if not 1 <= kv['seq'] - kv['last_data_seq'] <= 3:
         return None
@@ -364,7 +371,8 @@ class LoggerCore:
 
     def __init__(self, strict=False, src_ip=None):
         self.strict = strict
-        self.src_ip = src_ip
+        self.src_lock = 'first' if src_ip == SRC_IP_FIRST else 'fixed' if src_ip else 'none'
+        self.src_ip = None if src_ip == SRC_IP_FIRST else src_ip
         self.header = 'not_seen'            # last header-like line: not_seen / match / old_prefix / mismatch
         self.schema_blocked = False
         self.events = []
@@ -376,6 +384,7 @@ class LoggerCore:
         self.n_breaks = 0
         self.segments = []
         self.footer_obs = []                # every valid '#run_end': (seq, L, qdrop, send_err, t_rx)
+        self.footer_udp = set()             # distinct (L, udp_drop, udp_take) of the '#run_end' lines
         self.placement = None
         self._last_ts_noseq = None
         self._header_since_data = None      # header seen after the last new data line (belongs to the next segment)
@@ -419,6 +428,9 @@ class LoggerCore:
     def feed(self, line, src_ip=None, t_rx_us=None):
         self.n_packets += 1
         self.placement = None
+        if self.src_lock == 'first' and self.src_ip is None and src_ip is not None:
+            self.src_ip = src_ip            # the rest of the run keeps this source
+            self._event(f'src_ip_locked,ip={src_ip}')
         if self.src_ip is not None and src_ip != self.src_ip:
             return self._reject('source')
         line = line.lstrip('﻿')
@@ -433,6 +445,11 @@ class LoggerCore:
                     return ('dut_event_bad', line)
                 self.footer_obs.append((kv['seq'], kv['last_data_seq'], kv['log_qdrop'],
                                         kv['log_send_err'], t_rx_us))
+                if 'udp_take' in kv:
+                    udp = (kv['last_data_seq'], kv['udp_drop'], kv['udp_take'])
+                    if udp not in self.footer_udp and kv['udp_take'] > 0:
+                        self._event(f'udp_take,last_data_seq={udp[0]},udp_drop={udp[1]},udp_take={udp[2]}')
+                    self.footer_udp.add(udp)
             self.n_dut_events += 1
             return ('dut_event', line)
 
@@ -602,6 +619,7 @@ class LoggerCore:
         return dict(
             mode='strict' if self.strict else 'loose',
             src_ip=self.src_ip,
+            src_lock=self.src_lock,
             header=self.header,
             packets=self.n_packets,
             data_lines=self.n_data,
@@ -613,6 +631,8 @@ class LoggerCore:
                                 list(self._header_known.get(g.index, {}).values()))
                       for g in self.segments],
             run_end_unassigned=unassigned,
+            run_end_udp=[dict(last_data_seq=L, udp_drop=d, udp_take=t)
+                         for L, d, t in sorted(self.footer_udp)],
             policy=dict(max_us_per_seq=MAX_US_PER_SEQ, rate_slack_us=RATE_SLACK_US,
                         late_max_us=LATE_MAX_US, clock_tol_us=CLOCK_TOL_US),
             note=('segments group lines consistent with one boot by seq/time/receive clock; the DUT '
@@ -708,7 +728,9 @@ def main(argv=None):
     parser.add_argument("--out",  default=None, help="Tên file CSV output")
     parser.add_argument("--strict", action="store_true",
                         help="Chế độ đo: chỉ giữ dòng 66 cột đúng kiểu, header DUT phải khớp")
-    parser.add_argument("--src-ip", default=None, help="Chỉ nhận gói từ IP này (ESP32 của bàn HIL)")
+    parser.add_argument("--src-ip", default=None,
+                        help="Chỉ nhận gói từ IP này (ESP32 của bàn HIL); 'first': khóa theo gói đầu "
+                             "tiên, gói nguồn khác bị bỏ và đếm ở rejects.source")
     parser.add_argument("--ready-file", default=None,
                         help="Tạo file này (JSON, PID) khi đã bind cổng và mở file (LOGGER_OPEN)")
     parser.add_argument("--duration", type=float, default=None, help="Tự dừng sau N giây")

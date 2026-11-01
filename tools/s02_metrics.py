@@ -260,11 +260,29 @@ def read_run_end(events_path):
                 if kv is None:
                     continue
                 key = (kv['seq'], kv['last_data_seq'])
-                val = (kv['log_qdrop'], kv['log_send_err'])
+                val = (kv['log_qdrop'], kv['log_send_err'], kv.get('udp_drop'), kv.get('udp_take'))
                 if seen.setdefault(key, val) != val:
                     raise ValueError(f'{events_path}: #run_end seq={key[0]} last_data_seq={key[1]} '
                                      'with two different counter values; not usable as is')
     return sorted({L for _, L in seen})
+
+
+def check_no_udp_taken(events_path):
+    """One binary (Outline QĐ 6 level 1): on the HIL bench the setpoints must come from the H7
+    relay. A '#run_end' with udp_take > 0 means a UDP packet reached the controller during the
+    run, so that run is not valid. Firmware that prints no udp_take is not checked."""
+    if not os.path.isfile(events_path):
+        return
+    with open(events_path, encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            i = line.find('#run_end,')
+            if i < 0:
+                continue
+            kv = parse_run_end(line[i:].strip())
+            if kv is not None and kv.get('udp_take', 0) > 0:
+                raise ValueError(f"{events_path}: #run_end last_data_seq={kv['last_data_seq']} has "
+                                 f"udp_take={kv['udp_take']}: a UDP packet reached the controller "
+                                 'during this HIL run; not usable as is')
 
 
 def log_loss(log):
@@ -369,6 +387,8 @@ def run_dir_metrics(d, out_name='metrics.csv'):
     for r in runs:
         if r.get('aborted') not in (None, '', '0'):
             continue
+        if r['platform'].strip().lower() == 'hil':
+            check_no_udp_taken(os.path.join(d, r['file']) + '.events.txt')
         m = compute(load_log(os.path.join(d, r['file'])), r['test_id'])
         out.append(dict(run_id=r['run_id'], platform=r['platform'], controller=r['controller'],
                         test_id=r['test_id'], speed_mps=r['speed_mps'], rep=r['rep'], **m))
