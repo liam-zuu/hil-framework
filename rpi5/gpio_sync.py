@@ -99,7 +99,10 @@ class GPIOSync:
             return
 
         _lgpio.gpio_write(self._handle, self.pin, 1)
-        time.sleep(_PULSE_WIDTH_US * 1e-6)
+        # busy-wait, not time.sleep: a sleep gives the core up and wakes on the kernel timer, tens of µs late
+        t_end = time.monotonic_ns() + _PULSE_WIDTH_US * 1_000
+        while time.monotonic_ns() < t_end:
+            pass
         _lgpio.gpio_write(self._handle, self.pin, 0)
 
     # ── Cleanup ───────────────────────────────────────────────────────────

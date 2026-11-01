@@ -24,6 +24,7 @@ CPU allocation:
 """
 from __future__ import annotations
 
+import gc
 import logging
 import multiprocessing as mp
 import os
@@ -32,13 +33,14 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-from timing import PrecisionTimer, set_realtime, pin_cpu
+from timing import PrecisionTimer, set_realtime, pin_cpu, lock_memory
 from gpio_sync import GPIOSync
 from spi_master import SPIMaster
 from protocol import encode_state, decode_torques, TRAJ_VALID, TRAJ_NEW
 from plant_interface import PlantInterface, MockPlant
 from mecanum_plant import MecanumPlant
 from imu_model import imu_from_plant
+import t4_imu_profile
 from params import PARAMS
 from rt_monitor import RTMonitor
 
@@ -76,6 +78,11 @@ class HILConfig:
     # IMU for the BNO085 emulator (G2): (gz, ax, ay, az, yaw) sent in every
     # frame instead of the plant values; None = plant values (MecanumPlant)
     imu_static:        Optional[tuple] = None
+    # S06 T4 (4): 't4' = locked IMU sequence of t4_imu_profile.py by frame time
+    imu_profile:       Optional[str]   = None
+    # Timing of the 1 kHz loop: lock memory, stop the cyclic GC and touch the
+    # frame log before the loop. False = the run without them, to compare
+    rt_tune:           bool  = True
     # Monitoring
     # S06 (29/10): raw MOSI + MISO of every frame and the send time, kept in
     # preallocated arrays inside the loop (one index write per step) and
@@ -160,12 +167,20 @@ class HILNode:
         if self.cfg.frame_log:
             import numpy as np
             n = self.cfg.max_steps or self.cfg.frame_log_max
+            # t_pulse0/1_ns: just before / just after raising the sync pulse (S06 spec line 111:
+            # P_send := t_pulse_rise, the same physical edge as d_1w; tools/s06_frames_decode.py)
             self._flog = {
-                't_send_ns': np.zeros(n, dtype=np.int64),
-                'mosi':      np.zeros((n, 40), dtype=np.uint8),
-                'miso':      np.zeros((n, 40), dtype=np.uint8),
+                't_send_ns':   np.zeros(n, dtype=np.int64),
+                't_pulse0_ns': np.zeros(n, dtype=np.int64),
+                't_pulse1_ns': np.zeros(n, dtype=np.int64),
+                'mosi':        np.zeros((n, 40), dtype=np.uint8),
+                'miso':        np.zeros((n, 40), dtype=np.uint8),
             }
             self._flog_n = n
+            # np.zeros maps pages lazily: without this, a page fault every ~100 frames inside the loop
+            if self.cfg.rt_tune:
+                for a in self._flog.values():
+                    a.fill(0)
 
     # ── Main loop ─────────────────────────────────────────────────────────
 
@@ -176,8 +191,14 @@ class HILNode:
         Sets SCHED_FIFO and pins to cpu_core before entering the loop.
         Installs SIGTERM / SIGINT for clean shutdown.
         """
-        set_realtime(priority=self.cfg.rt_priority)
-        pin_cpu(core=self.cfg.cpu_core)
+        self._rt = dict(sched_fifo=set_realtime(priority=self.cfg.rt_priority),
+                        cpu_pinned=pin_cpu(core=self.cfg.cpu_core),
+                        mem_locked=self.cfg.rt_tune and lock_memory(), gc_off=self.cfg.rt_tune)
+        if self.cfg.rt_tune:
+            # no GC pass inside the loop; freeze keeps what is alive now out of any later one
+            gc.collect()
+            gc.freeze()
+            gc.disable()
 
         signal.signal(signal.SIGTERM, self._on_signal)
         signal.signal(signal.SIGINT,  self._on_signal)
@@ -206,6 +227,9 @@ class HILNode:
                 self._tick(jitter_ns)
         finally:
             self._shutdown()
+            if self.cfg.rt_tune:
+                gc.enable()
+                gc.unfreeze()
 
     # ── Single tick ───────────────────────────────────────────────────────
 
@@ -218,7 +242,12 @@ class HILNode:
           4. Write shared state
         """
         # 1. Sync pulse — H7 EXTI fires, enables DMA receive
-        self._gpio.pulse()
+        if self._flog is not None:
+            t_p0 = time.monotonic_ns()
+            self._gpio.pulse()
+            t_p1 = time.monotonic_ns()
+        else:
+            self._gpio.pulse()
 
         # 2. Encode current state + setpoint, send MOSI, receive MISO (torques from H7)
         traj_flags = 0
@@ -240,6 +269,8 @@ class HILNode:
         if self._flog is not None:
             k = self._step
             self._flog['t_send_ns'][k] = t_send
+            self._flog['t_pulse0_ns'][k] = t_p0
+            self._flog['t_pulse1_ns'][k] = t_p1
             self._flog['mosi'][k] = memoryview(bytes(mosi))
             self._flog['miso'][k] = memoryview(bytes(miso))
 
@@ -276,6 +307,8 @@ class HILNode:
         """
         if self.cfg.imu_static is not None:
             imu = self.cfg.imu_static
+        elif self.cfg.imu_profile == 't4':
+            imu = t4_imu_profile.sample(self._step * self.cfg.period_us / 1e6)
         elif self._mecanum:
             imu = imu_from_plant(state, self._prev_state,
                                  self.cfg.period_us / 1e6, PARAMS.g)
@@ -290,10 +323,22 @@ class HILNode:
     # ── Cleanup & diagnostics ─────────────────────────────────────────────
 
     def _save_frame_log(self) -> None:
+        import json
+        import platform
         import numpy as np
         n = self._step
-        np.savez(self.cfg.frame_log, t_send_ns=self._flog['t_send_ns'][:n],
-                 mosi=self._flog['mosi'][:n], miso=self._flog['miso'][:n])
+        # Run manifest (S06 tools, Codex Sol round 3 S57/S64): what the Pi itself ran, saved with the frames
+        # so the scoring tools can tell a cut or partial log and which IMU source fed the MOSI.
+        # imu_source: the source _imu_sample really uses, in its order of priority (S73, Codex Sol round 4)
+        imu_source = ('static' if self.cfg.imu_static is not None else
+                      self.cfg.imu_profile if self.cfg.imu_profile == 't4' else
+                      'plant' if self._mecanum else 'none')
+        manifest = dict(step_first=0, step_last=n - 1, steps=n, period_us=self.cfg.period_us,
+                        max_steps=self.cfg.max_steps, stop_reason=self._stop_reason,
+                        imu_source=imu_source, imu_profile=self.cfg.imu_profile, imu_static=self.cfg.imu_static,
+                        rt=self._rt, uname=' '.join(platform.uname()))     # X8: the kernel the run ran on
+        np.savez(self.cfg.frame_log, manifest=np.array(json.dumps(manifest)),
+                 **{k: v[:n] for k, v in self._flog.items()})
         log.info('Frame log: %d frames -> %s', n, self.cfg.frame_log)
 
     def _on_signal(self, signum: int, _frame) -> None:

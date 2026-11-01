@@ -73,7 +73,11 @@ def _parse_fixed_omega(text: str) -> list:
 
 def _parse_omega_steps(text: str) -> list:
     """'2,2,2,2:20/~39.2,39.2,39.2,39.2:0.3' -> [([2.0]*4, 20.0, False), ([39.2]*4, 0.3, True)].
-    Segments split by '/': W1,W2,W3,W4:seconds; a leading '~' ramps from the previous speeds."""
+    Segments split by '/': W1,W2,W3,W4:seconds; a leading '~' ramps from the previous speeds.
+    '@T5_pass1.csv' reads the segments from a T5 schedule (t5_schedule.py, S06 T5)."""
+    if text.startswith('@'):
+        import t5_schedule
+        return t5_schedule.segments(t5_schedule.read_csv(text[1:]))
     segs = []
     for part in text.split('/'):
         part = part.strip()
@@ -287,13 +291,16 @@ def _parse_args() -> argparse.Namespace:
                         'traction = slip method A (QD 25)')
     p.add_argument('--mu',            type=float, default=None,
                    help='mu_hd of all four wheels for --ground traction')
+    p.add_argument('--imu-profile',   default=None, choices=['t4'],
+                   help='S06 T4 (4): send the locked IMU sequence of t4_imu_profile.py '
+                        '(static levels then a 5 s ramp, 27 s cycle) instead of the plant values')
     p.add_argument('--fixed-omega',   default=None, metavar='W1,W2,W3,W4',
                    help='EncoderGen check: send these constant wheel speeds [rad/s] instead of '
                         'running the plant (use with --steps)')
     p.add_argument('--omega-steps',   default=None, metavar='W1,W2,W3,W4:S/...',
                    help='EncoderGen check: play this wheel-speed profile [rad/s, s] instead of the '
                         'plant, segments split by "/", a leading "~" ramps from the previous speeds; '
-                        '--steps 0 = the profile length')
+                        '"@CSV" plays a T5 schedule (t5_schedule.py); --steps 0 = the profile length')
     p.add_argument('--omega-schedule', default=None, metavar='CSV',
                    help='S06 T3b: play the wheel speeds of T3b_schedule.csv (t3b_schedule.py) instead '
                         'of the plant; --steps 0 = the schedule length')
@@ -303,6 +310,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument('--frame-log',     default='', metavar='NPZ',
                    help='S06: save raw MOSI + MISO of every frame and its send time '
                         '(time.monotonic_ns) to this .npz after the run')
+    p.add_argument('--no-rt-tune',    action='store_true',
+                   help='Without mlockall, GC off and touching the frame log, to compare timing '
+                        '(the frame log manifest says which run was which)')
     return p.parse_args()
 
 
@@ -338,6 +348,8 @@ def main() -> int:
         from t3b_schedule import read_csv
         args.steps = max(r.slot_end_ms for r in read_csv(args.omega_schedule))
 
+    if args.imu_static and args.imu_profile:
+        raise SystemExit('--imu-static and --imu-profile exclude each other')
     hil_cfg = HILConfig(
         period_us    = 1_000,
         rt_priority  = args.rt_priority,
@@ -347,7 +359,9 @@ def main() -> int:
         max_steps    = args.steps,
         simulate_hw  = args.mock,
         imu_static   = parse_imu_static(args.imu_static) if args.imu_static else None,
+        imu_profile  = args.imu_profile,
         frame_log    = args.frame_log,
+        rt_tune      = not args.no_rt_tune,
     )
     traj_spec = TrajectorySpec(
         kind     = args.traj,
