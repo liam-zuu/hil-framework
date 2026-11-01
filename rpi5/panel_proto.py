@@ -480,12 +480,14 @@ class PanelClient:
         HELLO_RESEND_MS until a STATUS with sid != 0 and panel_boot == nonce arrives; other
         STATUS frames are ignored until then. Fence (W1): after every handshake the panel
         first sends SYNC at next_seq (resent until its ACK or until next_seq passes it) and
-        refuses SELECT/START until then; frames are in order, so every frame sent before
-        (e.g. before a panel reboot) has been handled by then and its ACK can no longer be
-        taken for a new command. A nonce equal to that of the current session (a panel
-        reboot, 1 in 65 535) joins that session: frames sent before the reboot and still on
-        their way run as sent (as they would with any nonce); the fence keeps their results
-        apart from the new commands (V3, W1).
+        refuses SELECT/START until then; frames are in order, so an older frame at that seq
+        or below has been handled by then and its ACK can no longer be taken for a new
+        command. A nonce equal to that of the current session (a panel reboot, 1 in 65 535)
+        joins that session: frames sent before the reboot and still on their way run as sent
+        (as they would with any nonce); the fence keeps the results at or below its seq apart
+        from the new commands (V3, W1). Limit (X1): the fence proves nothing about an older
+        frame at a higher seq. Such a frame may still arrive and take the seq of a new
+        command, which is then not run and is shown 'unverified', never 'done'.
       * Session lost: a STATUS whose daemon_boot changed, or whose sid / panel_boot is not the
         session's (a new session opened by another HELLO), or no seq left (next_seq >=
         SEQ_END - 1 with nothing of the panel still needing the last seq) -> new nonce, HELLO
@@ -660,7 +662,7 @@ class PanelClient:
                     self.shown.append(('unverified', p['cmd'], None))
                 self.pending = None
             if self.pending is None and p['cmd'] == CMD_SYNC:
-                self.fence = False                          # every older frame is behind us
+                self.fence = False                          # older frames up to this seq are behind us
         if self.stale is not None and st.next_seq > self.stale:
             self.stale = None                               # the old frame can no longer run
         s = self.stop

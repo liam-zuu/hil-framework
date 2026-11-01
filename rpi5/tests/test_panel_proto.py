@@ -854,6 +854,33 @@ def test_reboot_same_nonce_old_command_in_fifo_new_command_other_arg_codex_w1(cm
     assert b.ran[-1] == (b.sess.next_seq - 1, cmd, 1) and b.panel.shown[-1][0] == 'done'
 
 
+def test_fence_opens_with_a_newer_frame_still_on_its_way_known_limit_codex_x1():
+    """Codex X1, a known limit (written down, not fixed): with the nonce of the running session
+    (1 in 65 535) SELECT at seq 1 and STOP at seq 2 are still queued ahead of the fence SYNC at
+    seq 1. The STATUS of SELECT opens the fence, and the old STOP then takes seq 2 from a new
+    SELECT. Nothing runs twice and no old ACK is taken for the new command: 'unverified'."""
+    b = Bench()
+    b.step(10)
+    sid = b.sess.sid
+    fifo = [pp.encode_cmd(sid, 1, pp.CMD_SELECT, 0), pp.encode_cmd(sid, 2, pp.CMD_STOP, 0)]
+    b.panel = pp.PanelClient(lambda: 0x1111)
+    fifo += b.panel.on_status(pp.decode(b.status()), b.t)
+    assert b.panel.fence and b.panel.pending['cmd'] == pp.CMD_SYNC and b.panel.pending['seq'] == 1
+
+    def deliver():
+        b.sess.on_cmd(pp.decode(fifo.pop(0)), b.run)
+        fifo.extend(b.panel.on_status(pp.decode(b.status()), b.t))
+
+    deliver()
+    assert not b.panel.fence and b.sess.next_seq == 2
+    fifo += b.panel.press(pp.CMD_SELECT, 1, b.t)
+    assert b.panel.pending['seq'] == 2
+    while fifo:
+        deliver()
+    assert b.ran == [(1, pp.CMD_SELECT, 0), (2, pp.CMD_STOP, 0)]
+    assert b.panel.shown == [('unverified', pp.CMD_SELECT, None)]
+
+
 def test_stop_acked_at_the_last_seq_is_confirmed_in_the_next_session_codex_w2():
     """Codex W2: the START at the last normal seq ran but its ACK was lost; STOP at the last
     seq got OK while still STOPPING; the session changed at once. 'acked' was dropped, so the
