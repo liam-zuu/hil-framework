@@ -80,6 +80,7 @@ class TrajectorySpec:
     radius:   float = 0.5      # circle or figure-8 amplitude [m]
     period:   float = 8.0      # figure-8 full period [s]
     duration: float = 0.0      # 0 = run forever
+    loop:     bool  = False    # S06 V7: at duration, start the trajectory again
 
 
 # ── Reference trajectory functions ───────────────────────────────────────
@@ -323,8 +324,12 @@ class TrajectoryPublisher:
                 t   = now - t_start
 
                 if self.spec.duration > 0 and t >= self.spec.duration:
-                    log.info("Trajectory duration %.1f s reached.", self.spec.duration)
-                    break
+                    if self.spec.loop:            # S06 V7: repeat for the whole run
+                        t_start += self.spec.duration
+                        t = now - t_start
+                    else:
+                        log.info("Trajectory duration %.1f s reached.", self.spec.duration)
+                        break
 
                 if self.shared_ref is not None:
                     vx_b, vy_b, wz_b = get_body_velocity(t, self.spec)
