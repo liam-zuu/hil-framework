@@ -15,6 +15,7 @@ int64_t esp_timer_get_time(void) { return fw_time_us; }
 static uint32_t gpio_level[FW_GPIO_MAX];
 esp_err_t gpio_config(const gpio_config_t *cfg) { (void)cfg; return 0; }
 esp_err_t gpio_set_level(int n, uint32_t level) { if (n >= 0 && n < FW_GPIO_MAX) gpio_level[n] = level; return 0; }
+esp_err_t gpio_set_drive_capability(int n, gpio_drive_cap_t s) { (void)n; (void)s; return 0; }
 uint32_t fw_gpio_level(int n) { return (n >= 0 && n < FW_GPIO_MAX) ? gpio_level[n] : 0; }
 
 /* ── PCNT ─────────────────────────────────────────────────────────────── */
