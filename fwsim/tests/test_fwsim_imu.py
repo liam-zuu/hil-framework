@@ -33,6 +33,22 @@ def fw():
     return fwsim.FirmwareSim()
 
 
+class _RigidParams(fwsim.MecanumParams):
+    """Plant for these logic checks: ground_model 'rigid' (Liam 28/10, CODE session: pin the
+    section 10 logic tests to rigid). Their [DE XUAT] thresholds were set on the rigid plant;
+    on 'traction' (default since 28/10) two cases differ by plant dynamics, not by slip
+    (r_true < 0.001 rad/s): switch-back PWM jump 36 > 33 in the gyro-loss case, slip flag off
+    at 3.5 s > 3.26 s after the injection (design note docs/2026-10-28_Thiet_ke_cach_A_mo_hinh_truot.md)."""
+    def __init__(self):
+        super().__init__()
+        self.ground_model = 'rigid'
+
+
+@pytest.fixture(autouse=True)
+def rigid_plant(monkeypatch):
+    monkeypatch.setattr(fwsim, 'MecanumParams', _RigidParams)
+
+
 def const(vx=0.0, vy=0.0, wz=0.0):
     return lambda t: (vx, vy, wz)
 
