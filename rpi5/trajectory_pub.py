@@ -278,6 +278,7 @@ class TrajectoryPublisher:
         rate_hz:     int   = 50,
         simulate:    bool  = False,
         shared_ref                 = None,
+        control                    = None,
         uart_direct: Optional[bool] = None,
     ):
         """
@@ -295,6 +296,7 @@ class TrajectoryPublisher:
         self.rate_hz     = rate_hz
         self.simulate    = simulate
         self.shared_ref  = shared_ref
+        self.control     = control         # --finite-run: run_lifecycle.ControlBox
         self.uart_direct = (shared_ref is None) if uart_direct is None else uart_direct
 
         self._uart     = None
@@ -304,6 +306,18 @@ class TrajectoryPublisher:
 
     # ── Main loop ─────────────────────────────────────────────────────────
 
+    def _wait_for_run(self) -> bool:
+        """--finite-run: the trajectory time starts with RUN. False = the run ended before it."""
+        from run_lifecycle import PREPARE, ARM, RUN
+        while self._running:
+            phase = self.control.phase()
+            if phase == RUN:
+                return True
+            if phase not in (PREPARE, ARM):
+                return False
+            time.sleep(0.002)
+        return False
+
     def run(self) -> None:
         """Block and publish.  Call as multiprocessing.Process target."""
         signal.signal(signal.SIGTERM, self._on_signal)
@@ -312,10 +326,13 @@ class TrajectoryPublisher:
         if self.uart_direct and not self.simulate:
             self._open_uart()
 
+        self._running = True
+        if self.control is not None and not self._wait_for_run():
+            return
+
         period_s  = 1.0 / self.rate_hz
         t_start   = time.monotonic()
         next_tick = t_start + period_s
-        self._running = True
 
         log.info(
             "Trajectory publisher start — kind=%s  v=%.2f m/s  "

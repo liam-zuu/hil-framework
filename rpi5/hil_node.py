@@ -25,6 +25,7 @@ CPU allocation:
 from __future__ import annotations
 
 import gc
+import json
 import logging
 import multiprocessing as mp
 import os
@@ -36,7 +37,7 @@ from typing import Optional
 from timing import PrecisionTimer, set_realtime, pin_cpu, lock_memory
 from gpio_sync import GPIOSync
 from spi_master import SPIMaster
-from protocol import encode_state, decode_torques, TRAJ_VALID, TRAJ_NEW
+from protocol import encode_state, decode_torques, TRAJ_VALID, TRAJ_NEW, OFS_MISO_SEQ
 from plant_interface import PlantInterface, MockPlant
 from mecanum_plant import MecanumPlant
 from imu_model import imu_from_plant
@@ -45,6 +46,7 @@ from params import PARAMS
 from rt_monitor import RTMonitor
 from s06_load_schedule import HeavyBlock
 from step_log import StepLog
+from run_lifecycle import ControlBox, LifecycleConfig, RunLifecycle, StepIn, END
 
 log = logging.getLogger('hil.node')
 
@@ -96,6 +98,8 @@ class HILConfig:
     # load_schedule = 'path sha256' of the schedule file, kept in the run manifest
     heavy_block:       Optional[tuple] = None
     load_schedule:     str   = ''
+    # --finite-run: phases of run_lifecycle.py; None = the loop as before
+    lifecycle:         Optional[LifecycleConfig] = None
     jitter_warn_us:    float = 500.0       # warn if jitter exceeds this
     stats_interval:    int   = 10_000      # print stats every N steps
 
@@ -122,6 +126,8 @@ class HILNode:
         shared_ref:    Optional[mp.Array] = None,
         monitor:       Optional[RTMonitor] = None,
         step_log:      Optional[StepLog]   = None,
+        control:       Optional[ControlBox] = None,
+        responder                           = None,
     ):
         """
         Args:
@@ -138,6 +144,8 @@ class HILNode:
                           1 kHz loop (THESIS H2). None: the old in-loop log.
             step_log:     StepLog (S06 T2): t_sched, t_start, t_done, t_end of
                           every step into a shared ring, read outside the loop.
+            control:      ControlBox of the run owner; needed with cfg.lifecycle.
+            responder:    simulate mode only: fake_h7.FakeH7 instead of the echo.
         """
         self.plant        = plant
         self.cfg          = config or HILConfig(simulate_hw=True)
@@ -146,6 +154,12 @@ class HILNode:
         self.monitor      = monitor
         self.step_log     = step_log
         self._t_done_ns   = 0
+        self.control      = control
+        self._lc          = RunLifecycle(self.cfg.lifecycle) if self.cfg.lifecycle else None
+        if self._lc is not None and control is None:
+            raise ValueError('cfg.lifecycle needs a ControlBox')
+        self._h7_seq      = -1
+        self._h7_new      = False
         self._ref         = (0.0, 0.0, 0.0)
         self._ref_count   = 0.0
 
@@ -159,6 +173,7 @@ class HILNode:
             device=self.cfg.spi_device,
             speed_hz=self.cfg.spi_speed_hz,
             simulate=self.cfg.simulate_hw,
+            responder=responder,
         )
         self._timer = PrecisionTimer(
             period_us=self.cfg.period_us,
@@ -213,7 +228,9 @@ class HILNode:
             gc.disable()
 
         signal.signal(signal.SIGTERM, self._on_signal)
-        signal.signal(signal.SIGINT,  self._on_signal)
+        # --finite-run: Ctrl+C reaches the whole process group; the owner turns it into STOP,
+        # so the loop goes on to send the zero setpoints. SIGTERM still stops at once.
+        signal.signal(signal.SIGINT, signal.SIG_IGN if self._lc is not None else self._on_signal)
 
         self._running = True
         self._t_start = time.monotonic()
@@ -231,6 +248,8 @@ class HILNode:
         # S06 Y16: schedule from here, not from when the timer was built (before,
         # the first deadlines were already past and the first steps ran back to back)
         self._timer.reset()
+        if self._lc is not None:
+            self._lc.begin(time.monotonic())
         try:
             while self._running:
                 if self.cfg.max_steps and self._step >= self.cfg.max_steps:
@@ -270,7 +289,11 @@ class HILNode:
 
         # 2. Encode current state + setpoint, send MOSI, receive MISO (torques from H7)
         traj_flags = 0
-        if self.shared_ref is not None:
+        lc = self._lifecycle_step() if self._lc is not None else None
+        if lc is not None and lc.send_zero:
+            self._ref  = (0.0, 0.0, 0.0)         # section 9.1: VALID|NEW, not through the publisher
+            traj_flags = TRAJ_VALID | TRAJ_NEW
+        elif (lc is None or lc.publish) and self.shared_ref is not None:
             with self.shared_ref.get_lock():
                 vx_r, vy_r, wz_r, count = self.shared_ref[:]
             if count != self._ref_count:
@@ -287,6 +310,9 @@ class HILNode:
         t_send = time.monotonic_ns()
         miso   = self._spi.transfer(mosi)
         torques = decode_torques(miso)
+        if self._lc is not None:
+            self._h7_new = miso[OFS_MISO_SEQ] != self._h7_seq
+            self._h7_seq = miso[OFS_MISO_SEQ]
         if self._flog is not None:
             k = self._step
             self._flog['t_send_ns'][k] = t_send
@@ -296,7 +322,8 @@ class HILNode:
             self._flog['miso'][k] = memoryview(bytes(miso))
 
         # 3. Advance plant dynamics
-        new_state = self.plant.step(torques)
+        # (ARM holds the plant at its initial state: no integration of the old DUT's PWM)
+        new_state = state if lc is not None and lc.hold_plant else self.plant.step(torques)
 
         # 4. Publish state to Process 2 (trajectory publisher)
         if self.shared_state is not None:
@@ -320,6 +347,20 @@ class HILNode:
         # 6. Periodic stats log
         if self._step % self.cfg.stats_interval == 0:
             self._log_stats()
+
+    def _lifecycle_step(self):
+        """One phase step. Reads the owner cells (one try of the lock), no blocking call."""
+        box = self.control
+        box.rt_poll(self._lc.phase)
+        now = time.monotonic_ns()
+        out = self._lc.step(StepIn(t=now / 1e9, h7_reply_new=self._h7_new,
+                                   publisher_done=box.pub_done, publisher_alive=not box.pub_dead,
+                                   stop_requested=box.stop,
+                                   heartbeat_age_s=(now - box.heartbeat_ns) / 1e9))
+        if out.done:
+            self._stop_reason = self._lc.outcome
+            self._running = False
+        return out
 
     def _imu_sample(self, state: list):
         """
@@ -345,7 +386,6 @@ class HILNode:
     # ── Cleanup & diagnostics ─────────────────────────────────────────────
 
     def _save_frame_log(self) -> None:
-        import json
         import platform
         import numpy as np
         n = self._step
@@ -359,7 +399,8 @@ class HILNode:
                         max_steps=self.cfg.max_steps, stop_reason=self._stop_reason,
                         imu_source=imu_source, imu_profile=self.cfg.imu_profile, imu_static=self.cfg.imu_static,
                         plant=type(self.plant).__name__, heavy_block=self.cfg.heavy_block,
-                        load_schedule=self.cfg.load_schedule, rt=self._rt, uname=' '.join(platform.uname()))     # X8: the kernel the run ran on
+                        load_schedule=self.cfg.load_schedule, rt=self._rt, uname=' '.join(platform.uname()),     # X8: the kernel the run ran on
+                        lifecycle=self.lifecycle_summary())
         np.savez(self.cfg.frame_log, manifest=np.array(json.dumps(manifest)),
                  **{k: v[:n] for k, v in self._flog.items()})
         log.info('Frame log: %d frames -> %s', n, self.cfg.frame_log)
@@ -369,7 +410,23 @@ class HILNode:
         self._stop_reason = f'signal_{signum}'
         self._running = False
 
+    def lifecycle_summary(self) -> Optional[dict]:
+        """Phases and outcome of a --finite-run; None without it."""
+        if self._lc is None:
+            return None
+        return dict(self._lc.summary(), lock_misses=self.control.lock_misses)
+
+    @property
+    def run_failed(self) -> bool:
+        """--finite-run ended in error:<reason>, or without reaching END."""
+        if self._lc is None:
+            return False
+        return self._lc.phase != END or (self._lc.outcome or '').startswith('error:')
+
     def _shutdown(self) -> None:
+        if self._lc is not None:
+            self.control.set_phase(self._lc.phase)
+            log.info('#run_summary,%s', json.dumps(self.lifecycle_summary()))
         log.info('#run_end,timestamp_us=%d,steps=%d,reason=%s',
                  time.monotonic_ns() // 1000, self._step, self._stop_reason)
         if self._flog is not None:
