@@ -29,6 +29,10 @@ sudo python run_hil.py --fixed-omega 10,20,-10,-20 --steps 15000 --no-traj
 #     for 20 s, step to 39.2 for 30 s, stop 5 s ('~' = ramp from the previous speeds)
 sudo python run_hil.py --omega-steps 2,2,2,2:20/39.2,39.2,39.2,39.2:30/0,0,0,0:5
 
+# 6c. Finite run: ARM (setpoint 0) -> RUN -> STOPPING (setpoint 0, 1 s) -> END; Ctrl+C = STOP
+sudo python run_hil.py --test A-K1 --finite-run
+python run_hil.py --mock --test A-K1 --finite-run      # dry run on a fake H7
+
 # 7. BNO085 emulator check (G2): constant IMU values, 60 s, no trajectory
 #    (gz,ax,ay,az,yaw in rad/s, m/s^2, m/s^2, m/s^2, rad)
 sudo python run_hil.py --imu-static 0.5,0.2,-0.1,9.81,1.0 --steps 60000 --no-traj
@@ -99,7 +103,7 @@ def _run_plant(cfg, shared_state: mp.Array, shared_ref: mp.Array, use_mock: bool
                wheels_lifted: bool = False, fixed_omega: list = None,
                omega_steps: list = None, monitor=None,
                ground: str = None, mu: float = None, omega_schedule: str = None,
-               step_log=None) -> None:
+               step_log=None, control=None) -> None:
     """Process 1 target: plant simulation loop."""
     import logging
     logging.basicConfig(
@@ -144,17 +148,25 @@ def _run_plant(cfg, shared_state: mp.Array, shared_ref: mp.Array, use_mock: bool
         plant = MockPlant() if use_mock else MecanumPlant(params=params, dt=cfg.period_us / 1e6, seed=seed)
     logging.getLogger('hil.main').info('Plant RNG seed = %s, wheels_lifted = %s, ground_model = %s, mu_hd = %s',
                                        seed, wheels_lifted, params.ground_model, list(np.broadcast_to(params.mu_hd, (4,))))
+    responder = None
+    if use_mock and cfg.lifecycle is not None:
+        # the --mock echo never leaves ARM (MISO seq does not change); section 9.1: fake_h7
+        from fake_h7 import FakeH7
+        responder = FakeH7()
     node  = HILNode(plant, config=cfg, shared_state=shared_state, shared_ref=shared_ref,
-                    monitor=monitor, step_log=step_log)
+                    monitor=monitor, step_log=step_log, control=control, responder=responder)
     node.run()
+    if node.run_failed:
+        sys.exit(3)
 
 
-def _report_plant_stats(p1, monitor, stats_interval: int, step_csv=None) -> None:
+def _report_plant_stats(p1, monitor, stats_interval: int, step_csv=None, owner=None) -> None:
     """
     Print the plant-loop lateness stats every stats_interval steps from this
     (non real-time) process while the plant process runs, then once for the
     whole run (THESIS H2: nothing printed or sorted inside the 1 kHz loop).
-    step_csv (S06 T2): drained here every 0.2 s.
+    step_csv (S06 T2): drained here every 0.2 s. owner (--finite-run): called every
+    0.1 s, the heartbeat of the run owner (section 9.1, 10 Hz).
     """
     from rt_monitor import RTMonitor, I_STEP
     try:
@@ -163,7 +175,9 @@ def _report_plant_stats(p1, monitor, stats_interval: int, step_csv=None) -> None
         pass
     prev, next_step, t0 = None, stats_interval, None
     while p1.is_alive():
-        p1.join(timeout=0.2)
+        p1.join(timeout=0.1 if owner is not None else 0.2)
+        if owner is not None:
+            owner()
         if step_csv is not None:
             step_csv.drain()
         snap = monitor.snapshot()
@@ -186,7 +200,35 @@ def _report_plant_stats(p1, monitor, stats_interval: int, step_csv=None) -> None
              s['n'], s.get('p99_us'), s.get('p999_us'), s['max_all_us'], s['warn'], s['overruns'])
 
 
-def _run_traj(spec, port: str, simulate: bool, shared_ref: mp.Array, uart_direct: bool) -> None:
+def _owner_tick(box, publisher) -> None:
+    """One beat of the run owner: heartbeat, then what became of the publisher."""
+    box.beat(time.monotonic_ns())
+    if publisher.is_alive() or box.stop_requested():
+        return                            # after STOP the publisher may leave any way it likes
+    if publisher.exitcode == 0:
+        box.publisher_done()
+    else:
+        box.publisher_dead()
+
+
+def _finite_run_config(args, spec):
+    """--finite-run: (LifecycleConfig, ceiling in steps), or SystemExit on a bad combination."""
+    from run_lifecycle import LifecycleConfig
+    bad = [name for name, on in (('--steps', args.steps), ('--no-traj', args.no_traj),
+                                 ('--traj-loop', args.traj_loop), ('--fixed-omega', args.fixed_omega),
+                                 ('--omega-steps', args.omega_steps), ('--omega-schedule', args.omega_schedule),
+                                 ('--load-schedule', args.load_schedule)) if on]
+    if bad:
+        raise SystemExit(f'--finite-run decides the end of the run itself, it excludes {", ".join(bad)}')
+    if spec.duration <= 0:
+        raise SystemExit('--finite-run needs a finite trajectory (--duration or --test)')
+    lc = LifecycleConfig(run_s=spec.duration)
+    # Ceiling only, the phases end first: it sizes the frame log, and a bug here cannot run forever
+    return lc, int((lc.arm_timeout_s + lc.run_s + lc.run_grace_s + lc.stop_s + 2.0) * 1000)
+
+
+def _run_traj(spec, port: str, simulate: bool, shared_ref: mp.Array, uart_direct: bool,
+              control=None) -> None:
     """Process 2 target: trajectory publisher."""
     import logging
     logging.basicConfig(
@@ -198,7 +240,7 @@ def _run_traj(spec, port: str, simulate: bool, shared_ref: mp.Array, uart_direct
 
     from trajectory_pub import TrajectoryPublisher
     pub = TrajectoryPublisher(spec=spec, port=port, simulate=simulate,
-                              shared_ref=shared_ref, uart_direct=uart_direct)
+                              shared_ref=shared_ref, uart_direct=uart_direct, control=control)
     pub.run()
 
 
@@ -320,6 +362,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument('--frame-log',     default='', metavar='NPZ',
                    help='S06: save raw MOSI + MISO of every frame and its send time '
                         '(time.monotonic_ns) to this .npz after the run')
+    p.add_argument('--finite-run',    action='store_true',
+                   help='Run phases of run_lifecycle.py: ARM (plant held, setpoint 0), RUN (the trajectory), '
+                        'STOPPING (setpoint 0 for 1 s), END. Needs a finite trajectory; Ctrl+C = STOP, '
+                        'a second Ctrl+C kills the run. --mock uses the fake H7. Exit code 3 = error')
     p.add_argument('--no-rt-tune',    action='store_true',
                    help='Without mlockall, GC off and touching the frame log, to compare timing '
                         '(the frame log manifest says which run was which)')
@@ -412,6 +458,14 @@ def main() -> int:
         args.traj = traj_spec.kind
         log.info('Group A test %s: %s', args.test, traj_spec)
 
+    control, owner = None, None
+    if args.finite_run:
+        from run_lifecycle import ControlBox
+        hil_cfg.lifecycle, hil_cfg.max_steps = _finite_run_config(args, traj_spec)
+        args.steps = hil_cfg.max_steps
+        control = ControlBox()
+        control.beat(time.monotonic_ns())
+
     # Shared state array: plant writes, trajectory pub can read (optional)
     shared_state = mp.Array('d', 10)
     # Shared setpoint: trajectory pub writes [vx_ref, vy_ref, wz_ref, counter],
@@ -433,7 +487,7 @@ def main() -> int:
     p1 = mp.Process(
         target=_run_plant,
         args=(hil_cfg, shared_state, shared_ref, args.mock, args.seed, lifted, fixed_omega,
-              omega_steps, monitor, args.ground, args.mu, args.omega_schedule, step_log),
+              omega_steps, monitor, args.ground, args.mu, args.omega_schedule, step_log, control),
         name='HIL-Plant',
         daemon=True,
     )
@@ -442,11 +496,13 @@ def main() -> int:
     if not args.no_traj:
         p2 = mp.Process(
             target=_run_traj,
-            args=(traj_spec, args.uart_port, args.mock, shared_ref, args.traj_uart_direct),
+            args=(traj_spec, args.uart_port, args.mock, shared_ref, args.traj_uart_direct, control),
             name='HIL-TrajPub',
             daemon=True,
         )
         procs.append(p2)
+        if control is not None:
+            owner = lambda: _owner_tick(control, p2)
 
     log.info(
         "Starting HIL: traj=%s  mock=%s  steps=%d  spi=%d kHz",
@@ -459,6 +515,10 @@ def main() -> int:
 
     # ── Wait + clean shutdown ────────────────────────────────────────────
     def _stop(signum, _frame):
+        if control is not None and not control.stop_requested():
+            log.info("Received signal %d — STOP: setpoint 0, then the end of the run", signum)
+            control.request_stop()
+            return
         log.info("Received signal %d — shutting down …", signum)
         for proc in procs:
             if proc.is_alive():
@@ -468,7 +528,7 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _stop)
 
     # Primary: wait for plant loop, printing its stats from here
-    _report_plant_stats(p1, monitor, hil_cfg.stats_interval, step_csv)
+    _report_plant_stats(p1, monitor, hil_cfg.stats_interval, step_csv, owner)
     p1.join()
     log.info("Plant process exited (code=%s)", p1.exitcode)
     if step_csv is not None:

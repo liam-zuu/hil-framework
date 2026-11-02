@@ -2,11 +2,12 @@
 Finite run lifecycle for one HIL run: PREPARE -> ARM -> RUN -> STOPPING -> END.
 
 Stage B of the HIL workflow (03_CODE/docs/2026-10-28_Luong_du_lieu_HIL_2_che_do.md,
-section 9.1; Liam approved writing it on the PC before G2, 29/10). This module is
-a pure state machine: no SPI, no files, no processes. The run owner calls step()
-once per real-time step with what it observed and does what the result says.
-It is NOT wired into run_hil.py yet: direct edits of run_hil.py / hil_node.py
-wait for the int/post-g2 merge (section 9.0 note).
+section 9.1; Liam approved writing it on the PC before G2, 29/10). RunLifecycle
+is a pure state machine: no SPI, no files, no processes. The 1 kHz loop calls
+step() once per real-time step with what it observed and does what the result
+says. Wired into hil_node.py / run_hil.py behind --finite-run (Liam 02/11);
+without that flag nothing here runs. ControlBox is the small shared block between
+the run owner (run_hil.py), the 1 kHz loop and the publisher (section 9.1).
 
 Rules taken from section 9.1 (numbers marked [ĐỀ XUẤT] there are defaults here,
 to be measured on the HIL bench before a run is judged with them):
@@ -44,10 +45,12 @@ Usage (one real-time step):
 """
 from __future__ import annotations
 
+import multiprocessing as mp
 from dataclasses import dataclass, field
 from typing import Optional
 
 PREPARE, ARM, RUN, STOPPING, END = 'PREPARE', 'ARM', 'RUN', 'STOPPING', 'END'
+_PHASES = (PREPARE, ARM, RUN, STOPPING, END)
 
 COMPLETED = 'completed'
 USER_STOP = 'user_stop'
@@ -225,3 +228,73 @@ class RunLifecycle:
             self._enter(RUN, s.t)
         elif s.t - self._t_phase > self.cfg.arm_timeout_s:
             self._to_stopping(ERR_ARM_TIMEOUT, 'no_h7' if not h7_ok else 'dut_not_ready', s.t)
+
+
+# Cells of the control box. Only the owner writes stop, heartbeat, done, dead (stop
+# has no clear); only the 1 kHz loop writes phase (section 9.1, B21).
+_STOP, _HEARTBEAT_NS, _PUB_DONE, _PUB_DEAD, _PHASE = range(5)
+
+
+class ControlBox:
+    """
+    Shared cells of one run (section 9.1 "hop dieu khien"). The 1 kHz loop tries the
+    lock once per step and keeps its last values when it misses, so a stale heartbeat
+    still ages and a stuck lock ends in error:heartbeat. The publisher only reads the
+    phase, without the lock.
+    """
+
+    def __init__(self):
+        self._a = mp.Array('q', 5)
+        self.stop = False                 # last values the 1 kHz loop read
+        self.heartbeat_ns = 0
+        self.pub_done = False
+        self.pub_dead = False
+        self.lock_misses = 0
+
+    # owner
+    def beat(self, now_ns: int) -> None:
+        with self._a.get_lock():
+            self._a[_HEARTBEAT_NS] = now_ns
+
+    def request_stop(self) -> None:
+        with self._a.get_lock():
+            self._a[_STOP] = 1
+
+    def publisher_done(self) -> None:
+        with self._a.get_lock():
+            self._a[_PUB_DONE] = 1
+
+    def publisher_dead(self) -> None:
+        with self._a.get_lock():
+            self._a[_PUB_DEAD] = 1
+
+    def stop_requested(self) -> bool:
+        return bool(self._a.get_obj()[_STOP])
+
+    # 1 kHz loop
+    def rt_poll(self, phase: str) -> bool:
+        """One try of the lock: publish phase, read the owner cells. False = missed."""
+        lock = self._a.get_lock()
+        if not lock.acquire(False):
+            self.lock_misses += 1
+            return False
+        try:
+            a = self._a.get_obj()
+            a[_PHASE] = _PHASES.index(phase)
+            self.stop = bool(a[_STOP])
+            self.heartbeat_ns = a[_HEARTBEAT_NS]
+            self.pub_done = bool(a[_PUB_DONE])
+            self.pub_dead = bool(a[_PUB_DEAD])
+        finally:
+            lock.release()
+        return True
+
+    def set_phase(self, phase: str) -> None:
+        """Outside the loop only: blocks on the lock."""
+        with self._a.get_lock():
+            self._a[_PHASE] = _PHASES.index(phase)
+
+    # publisher
+    def phase(self) -> str:
+        return _PHASES[self._a.get_obj()[_PHASE]]
+
