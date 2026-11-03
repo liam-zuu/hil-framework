@@ -178,20 +178,27 @@ uint32_t PWMCapture_GetIsrCount(void)
 
 /* Duty of one channel. Without an edge for PWM_TIMEOUT_MS the pin is held at a
  * constant level (0 % or 100 %): return that level instead of 0 (bug H7-PWM-LEVEL,
- * 22/10). The ESP32 holds the inactive BTS7960 input HIGH (motor.c motor_set). */
-static float _chan_duty(const PwmCh_t *c, uint32_t now)
+ * 22/10). The ESP32 holds the inactive BTS7960 input HIGH (motor.c motor_set).
+ * 03/11 (bug H7-PWM-TICK-RACE, Liam: "Duyệt sửa"): read last_tick first and
+ * HAL_GetTick() after it. Before, one 'now' was read for all 8 channels; a
+ * capture ISR that ran after a SysTick increment wrote last_tick = now + 1,
+ * now - last_tick wrapped to 0xFFFFFFFF and a live channel returned its pin
+ * level (exactly 0 or 1) for one read, also in the frame sent to the plant
+ * (PWM_CAPTURE/2026-11-03_run01, run02: mostly RR, the last wheel read). */
+static float _chan_duty(const PwmCh_t *c)
 {
-    if ((now - c->last_tick) < PWM_TIMEOUT_MS)
+    uint32_t last = *(volatile const uint32_t *)&c->last_tick;
+    uint32_t now  = HAL_GetTick();          /* read after last: now >= last */
+    if ((now - last) < PWM_TIMEOUT_MS)
         return c->duty;
     return (HAL_GPIO_ReadPin(c->port, c->pin) == GPIO_PIN_SET) ? 1.0f : 0.0f;
 }
 
 void PWMCapture_GetDuty(float *duty_out)
 {
-    uint32_t now = HAL_GetTick();
     for (uint8_t w = 0; w < PWM_NUM_WHEELS; w++) {
-        float rpwm = _chan_duty(&_ch[w], now);
-        float lpwm = _chan_duty(&_ch[w + 4], now);
+        float rpwm = _chan_duty(&_ch[w]);
+        float lpwm = _chan_duty(&_ch[w + 4]);
         duty_out[w] = rpwm - lpwm;
     }
 }
