@@ -22,6 +22,7 @@
 #include "pwm_capture.h"
 #include "uart_relay.h"         /* +++ NEW */
 #include "bno_emu_port.h"
+#include "ibus_gen_port.h"
 #include <stdio.h>
 /* USER CODE END Includes */
 
@@ -77,10 +78,13 @@ void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
     BnoPort_SpiError(hspi);
 }
 
-/* BNO085 emulator (G2): TIM6 10 kHz tick and RST pin PG3 (EXTI3) */
+/* BNO085 emulator (G2) and iBUS generator: TIM6 10 kHz tick; RST pin PG3 (EXTI3) */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
-    if (htim->Instance == TIM6) BnoPort_Tick();
+    if (htim->Instance == TIM6) {
+        IbusPort_Tick();
+        BnoPort_Tick();
+    }
 }
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
@@ -179,6 +183,11 @@ int main(void)
   HAL_NVIC_EnableIRQ(TIM17_IRQn);
   printf("BNO: emulator on SPI4 (INT PG2, RST PG3), TIM6 tick\r\n");
   BnoPort_Init(&hspi4, &htim6);
+  if (IbusPort_Init(UART4))
+    printf("IBUS: UART4 TX PD1, frame every %u ms while the SPI1 link is up\r\n",
+           (unsigned)(IBUS_GEN_PERIOD_TICKS / (IBUS_GEN_TICK_HZ / 1000u)));
+  else
+    printf("IBUS: UART4 not set up (add it in CubeMX), iBUS off\r\n");
   printf("Init done, entering main loop\r\n");
   /* USER CODE END 2 */
 
@@ -202,6 +211,7 @@ int main(void)
             SPI1_Stats_t s0;
             SPI1_GetStats(&s0);
             _link_up = 1;
+            IbusPort_SetEnabled(1);
             _up_first_ms = s0.last_frame_ms;
             _up_first_frames = s0.frames;
             printf("SPI link up at t=%lu ms\r\n", (unsigned long)_up_first_ms);
@@ -227,12 +237,13 @@ int main(void)
     } else if (_link_up && (HAL_GetTick() - _last_frame_ms) > SPI_LINK_TIMEOUT_MS) {
         _link_up = 0;
         _n_link_lost++;
+        IbusPort_SetEnabled(0);  /* DUT loses RC -> motors off (S06 T12 (d)) */
         for (int i = 0; i < ENC_NUM_WHEELS; i++)
             EncoderGen_SetOmega(i, 0.0f);
         SPI1_RequestRestart();   /* covers a DMA stuck without an error */
         SPI1_Stats_t s1;
         SPI1_GetStats(&s1);
-        printf("SPI link lost (no frame for %lu ms): encoders stopped, SPI1 restart\r\n",
+        printf("SPI link lost (no frame for %lu ms): encoders stopped, iBUS stopped, SPI1 restart\r\n",
                (unsigned long)SPI_LINK_TIMEOUT_MS);
         /* Clock check: H7 ms between the first and the last frame of this
          * period vs frame intervals (= Pi ms at 1 kHz) */
@@ -306,6 +317,20 @@ int main(void)
                (unsigned long)bs.missed_edge, (unsigned long)bs.arm_fail,
                (unsigned long)bs.spi_errors, (unsigned long)bs.max_clocked,
                (unsigned long)bs.samples);
+        /* iBUS 10 s summary (S06 T12 (b)): P = frame start to frame start,
+         * in TIM6 ticks of 0.1 ms; printed once per closed window */
+        static uint32_t _ibus_win_last = 0;
+        ibus_gen_window_t iw;
+        if (IbusPort_ReadWindow(&iw) && iw.window != _ibus_win_last) {
+            _ibus_win_last = iw.window;
+            printf("IBUS: win=%lu on=%lu frames=%lu P=%lu.%lu..%lu.%lu ms n=%lu late=%lu en=%lu total=%lu\r\n",
+                   (unsigned long)iw.window, (unsigned long)iw.enabled,
+                   (unsigned long)iw.frames,
+                   (unsigned long)(iw.p_min_ticks / 10u), (unsigned long)(iw.p_min_ticks % 10u),
+                   (unsigned long)(iw.p_max_ticks / 10u), (unsigned long)(iw.p_max_ticks % 10u),
+                   (unsigned long)iw.p_count, (unsigned long)iw.late_ticks,
+                   (unsigned long)iw.enables, (unsigned long)iw.total_frames);
+        }
         printf("---\r\n");
 
         HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_0);
