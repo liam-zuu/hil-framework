@@ -142,6 +142,7 @@ int main(void)
   MX_SPI4_Init();
   MX_TIM13_Init();
   MX_TIM6_Init();
+  MX_UART4_Init();
   /* USER CODE BEGIN 2 */
 
   HAL_NVIC_DisableIRQ(TIM5_IRQn);
