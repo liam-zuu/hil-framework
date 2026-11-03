@@ -18,7 +18,10 @@
  * the board drives PA1 (1.6 V with no wire, Liam's meter), so the ESP32 signal
  * never reached the timer (05_DATA/results/PWM_CAPTURE/2026-10-27_run01).
  *
- * Timer clock: 1 MHz (PSC=239 on 240 MHz timer clocks, APB1 and APB2)
+ * Timer clock: 10 MHz (PSC=23 on 240 MHz timer clocks, APB1 and APB2), so a
+ * 20 kHz PWM period is 500 ticks; the 16-bit counter wraps after 6.5 ms.
+ * Was 1 MHz (PSC=239, 50 ticks per period) before 03/11 (Fable F-ND #8, Liam:
+ * "10 MHz, chung CubeMX"; model: CLAUDE_THESIS 03_CODE/docs/2026-11-02_Kiem_Fable_F_ND_7_8.md).
  *
  * Duty cycle measurement (rising→falling→rising):
  *   Rising  edge: record t_rise
