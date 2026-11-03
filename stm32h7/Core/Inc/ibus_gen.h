@@ -9,13 +9,17 @@
  * checksum = 0xFFFF - sum(bytes 0..29), little-endian. The ESP32 parser
  * (AGV_MECANUM src/ibus/ibus.c) reads the first 10 channels.
  *
- * Timing: ibus_gen_tick() runs from the TIM6 10 kHz interrupt. A frame
- * starts every period_ticks (70 = 7 ms, like a real receiver) and its bytes
- * go into the UART TX FIFO as room appears, so the frame leaves the pin as
- * one burst (about 2.8 ms at 115200). The period must stay at or above
- * about 3.7 ms (2.8 ms burst + 0.87 ms idle): shorter, and the ESP32 UART
- * driver waits for 120 bytes before handing them over, which times out the
- * 20 ms read and turns the motors off.
+ * Timing: ibus_gen_tick() runs from the TIM6 10 kHz interrupt and gets the
+ * time in microseconds from the port, so a late or skipped interrupt shows
+ * in the statistics instead of being counted as one tick (Codex I4). A frame
+ * starts when the generator is on, at least period_us after the previous
+ * start (kept across off/on, Codex I2) and only when the UART line is idle,
+ * so the first byte goes on the wire at the recorded start time (Codex I3).
+ * Its bytes go into the UART TX FIFO as room appears, so the frame leaves
+ * the pin as one burst (about 2.8 ms at 115200). The period must stay at or
+ * above about 3.7 ms (2.8 ms burst + 0.87 ms idle): shorter, and the ESP32
+ * UART driver waits for 120 bytes before handing them over, which times
+ * out the 20 ms read and turns the motors off.
  *
  * This file has no HAL calls; ibus_gen_port.c drives UART4 (PD1). The same
  * core is compiled on the PC by ibusgen_pc/.
@@ -31,10 +35,9 @@
 #define IBUS_GEN_HEADER_0          0x20u
 #define IBUS_GEN_HEADER_1          0x40u
 
-#define IBUS_GEN_TICK_HZ           10000u    /* TIM6 rate */
-#define IBUS_GEN_PERIOD_TICKS      70u       /* 7 ms */
-#define IBUS_GEN_MIN_PERIOD_TICKS  37u       /* 3.7 ms floor, see above */
-#define IBUS_GEN_WINDOW_TICKS      100000u   /* 10 s summary window */
+#define IBUS_GEN_PERIOD_US         7000u     /* like a real receiver */
+#define IBUS_GEN_MIN_PERIOD_US     3700u     /* floor, see above */
+#define IBUS_GEN_WINDOW_US         10000000u /* 10 s summary window */
 #define IBUS_GEN_MAX_PUSH          16u       /* bytes per tick at most */
 
 /* Channel values for an automatic run (index = channel - 1) */
@@ -46,20 +49,23 @@
 
 typedef struct {
     int  (*tx_room)(void);        /* nonzero: the TX FIFO takes one more byte */
+    int  (*tx_idle)(void);        /* nonzero: FIFO empty and last byte shifted out */
     void (*tx_put)(uint8_t b);
 } ibus_gen_io_t;
 
-/* One 10 s window, published by the tick. P = ticks between the starts of
- * two frames in a row (0.1 ms each, H7 clock); the first frame after an
- * enable has no P. late_ticks counts ticks where the next frame was due but
- * the previous one was still waiting for FIFO room. */
+/* One 10 s window, published by the tick. P = microseconds between the
+ * starts of two frames in a row within one on period; the first frame
+ * after an off period has no P. late_ticks counts ticks where the next
+ * frame was due but the line was still busy. tick_gap_max_us is the longest
+ * time between two calls of ibus_gen_tick (TIM6 service, nominal 100 us). */
 typedef struct {
     uint32_t window;              /* 1, 2, ...; 0 = no window closed yet */
     uint32_t frames;
     uint32_t p_count;
-    uint32_t p_min_ticks;         /* 0 when p_count = 0 */
-    uint32_t p_max_ticks;
+    uint32_t p_min_us;            /* 0 when p_count = 0 */
+    uint32_t p_max_us;
     uint32_t late_ticks;
+    uint32_t tick_gap_max_us;
     uint32_t enables;             /* off -> on changes in the window */
     uint32_t total_frames;        /* since init */
     uint32_t enabled;             /* state at the end of the window */
@@ -67,15 +73,16 @@ typedef struct {
 
 typedef struct {
     ibus_gen_io_t io;
-    uint32_t period_ticks;
+    uint32_t period_us;
     uint8_t  frame[IBUS_GEN_FRAME_LEN];
     uint8_t  pos;                 /* bytes of the current frame written; FRAME_LEN = idle */
-    volatile uint8_t enable_req;  /* written by the main loop */
-    uint8_t  enabled;
-    uint8_t  have_last;
-    uint32_t tick;
-    uint32_t last_start;
-    uint32_t win_start;
+    uint8_t  on;
+    uint8_t  have_start;          /* a frame was ever started (spacing) */
+    uint8_t  p_valid;             /* previous start is in the current on period */
+    uint8_t  have_tick;
+    uint32_t last_start_us;
+    uint32_t last_tick_us;
+    uint32_t win_start_us;
     uint32_t win_no;
     uint32_t total_frames;
     ibus_gen_window_t acc;        /* window being filled */
@@ -84,10 +91,11 @@ typedef struct {
 } ibus_gen_t;
 
 void ibus_gen_build_frame(uint8_t out[IBUS_GEN_FRAME_LEN], const uint16_t ch[IBUS_GEN_NUM_CH]);
-/* period_ticks below IBUS_GEN_MIN_PERIOD_TICKS is raised to it */
-void ibus_gen_init(ibus_gen_t *g, const ibus_gen_io_t *io, uint32_t period_ticks);
-void ibus_gen_set_enabled(ibus_gen_t *g, int on);   /* main loop */
-void ibus_gen_tick(ibus_gen_t *g);                  /* TIM6 interrupt only */
+/* period_us below IBUS_GEN_MIN_PERIOD_US is raised to it */
+void ibus_gen_init(ibus_gen_t *g, const ibus_gen_io_t *io, uint32_t period_us, uint32_t now_us);
+/* TIM6 interrupt only. on: frames may start (link up); a frame being
+ * written always finishes. Intervals use unsigned differences of now_us. */
+void ibus_gen_tick(ibus_gen_t *g, uint32_t now_us, int on);
 /* Copy of the last closed window; returns 0 if the tick kept rewriting it */
 int  ibus_gen_read_window(const ibus_gen_t *g, ibus_gen_window_t *out);
 

@@ -189,3 +189,8 @@ void SPI1_GetStats(SPI1_Stats_t *out)
     out->last_frame_ms = _last_frame_ms;
     __enable_irq();
 }
+
+uint32_t SPI1_GetLastFrameMs(void)
+{
+    return _last_frame_ms;
+}

@@ -184,8 +184,8 @@ int main(void)
   printf("BNO: emulator on SPI4 (INT PG2, RST PG3), TIM6 tick\r\n");
   BnoPort_Init(&hspi4, &htim6);
   if (IbusPort_Init(UART4))
-    printf("IBUS: UART4 TX PD1, frame every %u ms while the SPI1 link is up\r\n",
-           (unsigned)(IBUS_GEN_PERIOD_TICKS / (IBUS_GEN_TICK_HZ / 1000u)));
+    printf("IBUS: UART4 TX PD1, frame every %u us while the SPI1 link is up (stop after %u ms without a frame)\r\n",
+           (unsigned)IBUS_GEN_PERIOD_US, (unsigned)IBUS_LINK_TIMEOUT_MS);
   else
     printf("IBUS: UART4 not set up (add it in CubeMX), iBUS off\r\n");
   printf("Init done, entering main loop\r\n");
@@ -317,18 +317,20 @@ int main(void)
                (unsigned long)bs.missed_edge, (unsigned long)bs.arm_fail,
                (unsigned long)bs.spi_errors, (unsigned long)bs.max_clocked,
                (unsigned long)bs.samples);
-        /* iBUS 10 s summary (S06 T12 (b)): P = frame start to frame start,
-         * in TIM6 ticks of 0.1 ms; printed once per closed window */
+        /* iBUS 10 s summary (S06 T12 (b)): P = frame start to frame start
+         * in us (DWT, real time), printed in ms with 0.01 ms; tgap = longest
+         * time between two TIM6 ticks; once per closed window */
         static uint32_t _ibus_win_last = 0;
         ibus_gen_window_t iw;
         if (IbusPort_ReadWindow(&iw) && iw.window != _ibus_win_last) {
             _ibus_win_last = iw.window;
-            printf("IBUS: win=%lu on=%lu frames=%lu P=%lu.%lu..%lu.%lu ms n=%lu late=%lu en=%lu total=%lu\r\n",
+            printf("IBUS: win=%lu on=%lu frames=%lu P=%lu.%02lu..%lu.%02lu ms n=%lu late=%lu tgap=%lu us en=%lu total=%lu\r\n",
                    (unsigned long)iw.window, (unsigned long)iw.enabled,
                    (unsigned long)iw.frames,
-                   (unsigned long)(iw.p_min_ticks / 10u), (unsigned long)(iw.p_min_ticks % 10u),
-                   (unsigned long)(iw.p_max_ticks / 10u), (unsigned long)(iw.p_max_ticks % 10u),
+                   (unsigned long)(iw.p_min_us / 1000u), (unsigned long)((iw.p_min_us % 1000u) / 10u),
+                   (unsigned long)(iw.p_max_us / 1000u), (unsigned long)((iw.p_max_us % 1000u) / 10u),
                    (unsigned long)iw.p_count, (unsigned long)iw.late_ticks,
+                   (unsigned long)iw.tick_gap_max_us,
                    (unsigned long)iw.enables, (unsigned long)iw.total_frames);
         }
         printf("---\r\n");
