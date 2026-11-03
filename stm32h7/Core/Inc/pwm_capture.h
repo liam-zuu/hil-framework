@@ -58,4 +58,10 @@ void  PWMCapture_IC_Callback(TIM_HandleTypeDef *htim);
 /* Capture interrupts handled since boot (debug: interrupt load). */
 uint32_t PWMCapture_GetIsrCount(void);
 
+/* Debug, since boot, per channel 0..7 = RPWM FL FR RL RR, LPWM FL FR RL RR:
+ * late = pin already low when armed for the falling edge (upper bound of
+ * missed falling edges); wide = falling capture with width >= period.
+ * Both arrays hold 8 values. */
+void  PWMCapture_GetMissCounts(uint32_t *late, uint32_t *wide);
+
 #endif /* PWM_CAPTURE_H */

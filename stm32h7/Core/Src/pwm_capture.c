@@ -16,6 +16,8 @@ typedef struct {
     float              duty;
     GPIO_TypeDef      *port;       /* input pin, read when no edge arrives */
     uint16_t           pin;
+    uint32_t           n_late;     /* debug: pin already low when armed for falling */
+    uint32_t           n_wide;     /* debug: width >= period at a falling capture */
 } PwmCh_t;
 
 #define N_CHANNELS 8u
@@ -176,6 +178,15 @@ uint32_t PWMCapture_GetIsrCount(void)
     return _isr_count;
 }
 
+/* Missed-edge debug counters since boot, per channel (index as _ch). */
+void PWMCapture_GetMissCounts(uint32_t *late, uint32_t *wide)
+{
+    for (uint8_t i = 0; i < N_CHANNELS; i++) {
+        late[i] = _ch[i].n_late;
+        wide[i] = _ch[i].n_wide;
+    }
+}
+
 /* Duty of one channel. Without an edge for PWM_TIMEOUT_MS the pin is held at a
  * constant level (0 % or 100 %): return that level instead of 0 (bug H7-PWM-LEVEL,
  * 22/10). The ESP32 holds the inactive BTS7960 input HIGH (motor.c motor_set).
@@ -231,11 +242,16 @@ void PWMCapture_IC_Callback(TIM_HandleTypeDef *htim)
         c->t_rise = cap;
         c->state  = 1;
         _arm(c, 1);  /* switch to falling */
+        /* Debug (03/11, Liam: "Duyệt, viết đi"): pin already low after arming
+         * means the falling edge may have passed before this ISR ran. Can also
+         * count an edge that comes just after the arm, so it is an upper bound. */
+        if ((c->port->IDR & c->pin) == 0u) c->n_late++;
     } else {
         /* WAIT_FALL: got falling edge */
         c->width = (uint16_t)(cap - (uint16_t)c->t_rise);
         c->state = 0;
         _arm(c, 0);  /* switch to rising */
+        if (c->period > 0 && c->width >= c->period) c->n_wide++;   /* debug */
         if (c->period > 0) {
             float d = (float)c->width / (float)c->period;
             if (d > 1.0f) d = 1.0f;

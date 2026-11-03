@@ -281,6 +281,16 @@ int main(void)
         uint32_t isr_now = PWMCapture_GetIsrCount();
         printf("ISR: %lu/s\r\n", (unsigned long)((isr_now - _isr_last) * 2u));
         _isr_last = isr_now;
+
+        /* Missed-edge debug counters since boot (03/11), channel order
+         * RPWM FL FR RL RR, LPWM FL FR RL RR (pwm_capture.h). */
+        uint32_t miss_late[8], miss_wide[8];
+        PWMCapture_GetMissCounts(miss_late, miss_wide);
+        printf("PWMmiss: late=%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu wide=%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\r\n",
+               (unsigned long)miss_late[0], (unsigned long)miss_late[1], (unsigned long)miss_late[2], (unsigned long)miss_late[3],
+               (unsigned long)miss_late[4], (unsigned long)miss_late[5], (unsigned long)miss_late[6], (unsigned long)miss_late[7],
+               (unsigned long)miss_wide[0], (unsigned long)miss_wide[1], (unsigned long)miss_wide[2], (unsigned long)miss_wide[3],
+               (unsigned long)miss_wide[4], (unsigned long)miss_wide[5], (unsigned long)miss_wide[6], (unsigned long)miss_wide[7]);
         uint32_t relay_sent, relay_dropped;
         UartRelay_GetStats(&relay_sent, &relay_dropped);
         printf("Relay: sent=%lu dropped=%lu  traj vx=%.2f vy=%.2f wz=%.2f\r\n",
