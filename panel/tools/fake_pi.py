@@ -19,7 +19,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, '..', '..', 'rpi5'))
-from panel_link import FakeRun, PanelLink, serve   # noqa: E402
+from panel_link import FakeRun, PanelLink, nonblocking_writer, serve   # noqa: E402
 
 
 def main(argv=None) -> int:
@@ -41,7 +41,7 @@ def main(argv=None) -> int:
     run = FakeRun([p for p in a.profiles.split(',') if p], a.run_s, a.ctrl, a.fault_at, not a.no_h7)
     with port:
         print(f'fake Pi on {a.port}, epoch {epoch}; Ctrl+C to quit')
-        serve(port, PanelLink(epoch, run, port.write))
+        serve(port, PanelLink(epoch, run, nonblocking_writer(port), baud=a.baud))
     return 0
 
 

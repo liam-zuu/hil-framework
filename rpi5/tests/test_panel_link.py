@@ -203,3 +203,81 @@ def test_fake_run_full_cycle_and_fault_ack():
         run.snapshot()
     assert run.state == pp.ST_ERROR and run.stop() == pp.RES_OK and run.snapshot().run_state == pp.ST_IDLE
     assert run.select(9) == pp.RES_BAD_PROFILE
+
+
+def test_no_result_while_a_run_is_active_codex_q1():
+    i = info_of(RunSnapshot(run_state=pp.ST_RUN, result=('old', '', '')), 1)
+    assert not any(i.result) and not i.flags & pp.I_RESULT_VALID
+    i = info_of(RunSnapshot(run_state=pp.ST_END, result=('new', '', '')), 1)
+    assert i.result[0] == 'new' and i.flags & pp.I_RESULT_VALID
+
+
+def test_reference_panel_drops_old_names_when_the_list_count_changes_codex_q4():
+    w = Wire(Recorder(names=('A', 'B', 'C')))
+    w.step(30)
+    sid = w.panel.sid
+    w.panel.on_profile(pp.Profile(sid, 0, 1, 'X'))
+    assert w.panel.profiles == {0: 'X'}
+    w.panel.on_profile(pp.Profile(sid, 0, 3, 'Y'))
+    assert w.panel.profiles == {0: 'Y'} and w.panel.profile_count == 3     # old 'C' not reused
+
+
+def test_nonblocking_writer_maps_eagain_to_zero_codex_q6(monkeypatch):
+    import panel_link
+
+    class Port:
+        def fileno(self):
+            return 99
+    calls = []
+
+    def fake_write(fd, data):
+        calls.append((fd, len(data)))
+        if len(calls) == 1:
+            raise BlockingIOError
+        return 3
+    monkeypatch.setattr(panel_link.os, 'name', 'posix')
+    monkeypatch.setattr(panel_link.os, 'write', fake_write)
+    w = panel_link.nonblocking_writer(Port())
+    assert w(b'abcdef') == 0 and w(b'abcdef') == 3 and calls == [(99, 6), (99, 6)]
+
+
+class WireFifo:
+    """UART buffer that takes everything at once and a wire that sends it at 115200 8N1:
+    returns the time each byte leaves the wire."""
+
+    def __init__(self, clock):
+        self.clock = clock
+        self.free = 0.0
+        self.data = bytearray()
+        self.t_out = []
+
+    def __call__(self, data):
+        t = max(self.clock(), self.free)
+        for _ in data:
+            t += 10 / 115200
+            self.t_out.append(t)
+        self.free = t
+        self.data += data
+        return len(data)
+
+
+@pytest.mark.parametrize('n', [11, 255])
+def test_status_keeps_flowing_on_the_wire_during_a_long_profile_list_codex_q9(n):
+    t = [0.0]
+    fifo = WireFifo(lambda: t[0])
+    link = PanelLink(5, Recorder(names=['T%d' % i for i in range(n)]), fifo, clock=lambda: t[0])
+    panel = pp.PanelClient(iter(range(0x600, 0x700)).__next__)
+    for f in panel.tick(0):
+        link.feed(f)                                        # HELLO: session + whole list queued
+    for _ in range(300):                                    # 3 s, poll every 10 ms
+        t[0] += 0.01
+        link.poll()
+    ends, i, buf = [], 0, bytes(fifo.data)
+    while i < len(buf):                                     # frames are written back to back
+        n_f = {pp.START_STATUS: pp.LEN_STATUS, pp.START_PROFILE: pp.LEN_PROFILE,
+               pp.START_INFO: pp.LEN_INFO}[buf[i]]
+        if buf[i] == pp.START_STATUS:
+            ends.append(fifo.t_out[i + n_f - 1])
+        i += n_f
+    gaps = [b - a for a, b in zip(ends, ends[1:])]
+    assert len(ends) > 20 and max(gaps) < 0.25

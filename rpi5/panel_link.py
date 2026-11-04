@@ -40,6 +40,8 @@ import panel_proto as pp
 STATUS_PERIOD_S = 0.1       # workflow 9.6: STATUS ~10 Hz
 INFO_PERIOD_S = 1.0         # v6: INFO ~1 Hz and on change
 INFO_MIN_GAP_S = 0.2        # a changing INFO (loop_us moves all the time) at most 5 per second
+WIRE_BUDGET_MAX = 128       # bytes handed to the UART ahead of the wire at most (Codex Q9)
+WIRE_RATE_FACTOR = 0.95     # hand bytes over at 95 % of the line rate (baud / 10 bytes per second)
 
 
 @dataclass
@@ -83,11 +85,29 @@ def status_of(snap: RunSnapshot, sess: pp.DaemonSession) -> pp.Status:
 
 
 def info_of(snap: RunSnapshot, sid: int) -> pp.Info:
+    # no result while a run is active, whatever the run manager says (contract v6, Codex Q1)
+    result = () if snap.run_state in pp.ST_ACTIVE else tuple(snap.result)[:pp.RESULT_LINES]
     flags = (pp.I_LOOP_VALID if snap.loop_us is not None else 0) | \
-            (pp.I_RESULT_VALID if any(snap.result) else 0)
+            (pp.I_RESULT_VALID if any(result) else 0)
     return pp.Info(sid=sid, loop_us=snap.loop_us or 0, overruns=snap.overruns or 0, flags=flags,
-                   ctrl_src=snap.ctrl_src, ctrl=snap.ctrl, result=tuple(snap.result)[:pp.RESULT_LINES],
-                   error_text=snap.error_text)
+                   ctrl_src=snap.ctrl_src, ctrl=snap.ctrl, result=result, error_text=snap.error_text)
+
+
+def nonblocking_writer(port) -> Callable[[bytes], int]:
+    """write(bytes) -> bytes the OS took now, never waiting (TxQueue contract; Codex Q6:
+    pySerial 3.5 on POSIX loops on EAGAIN even with write_timeout=0). POSIX: one os.write on
+    the port's descriptor (pySerial opens it O_NONBLOCK), EAGAIN -> 0. Elsewhere (the Windows
+    bench): port.write with write_timeout=0."""
+    if os.name != 'posix':
+        return lambda data: port.write(data) or 0
+    fd = port.fileno()
+
+    def write(data: bytes) -> int:
+        try:
+            return os.write(fd, data)
+        except BlockingIOError:
+            return 0
+    return write
 
 
 class PanelLink:
@@ -95,13 +115,15 @@ class PanelLink:
     what the UART read and poll() every few ms."""
 
     def __init__(self, epoch: int, run: RunControl, write: Callable[[bytes], int],
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic, baud: int = 115200):
         self.sess = pp.DaemonSession(epoch)
         self.run = run
         self.clock = clock
         self.parser = pp.StreamParser(accept=(pp.START_CMD,), clock=clock)
         self.tx = pp.TxQueue(write, max_profiles=pp.PROFILE_MAX + 1)   # a whole list fits (P14)
         self.t_status = self.t_info = None
+        self.rate = baud / 10 * WIRE_RATE_FACTOR     # bytes per second handed to the UART
+        self._budget, self._t_budget = float(WIRE_BUDGET_MAX), None
         self.last_info: Optional[bytes] = None
         self.log = []                       # (t, cmd, seq, result of on_cmd) for the operator
 
@@ -147,7 +169,17 @@ class PanelLink:
             if self.last_info is None or age >= INFO_PERIOD_S or (info != self.last_info and age >= INFO_MIN_GAP_S):
                 self.t_info, self.last_info = now, info
                 self.tx.put(info)
-        self.tx.pump()
+        self._pump(now)
+
+    def _pump(self, now: float) -> None:
+        '''Hand bytes to the UART at the line rate, never more than WIRE_BUDGET_MAX ahead: a
+        long PROFILE list cannot fill the UART buffer and hold a newer STATUS back on the
+        wire (TxQueue only orders what it still holds; Codex Q9).'''
+        if self._t_budget is not None:
+            self._budget = min(float(WIRE_BUDGET_MAX), self._budget + (now - self._t_budget) * self.rate)
+        self._t_budget = now
+        if self._budget >= 1:
+            self._budget -= self.tx.pump(max_bytes=int(self._budget))
 
 
 # ── FAKE run for the bench and --demo (nothing here is a measurement) ─────
@@ -266,7 +298,7 @@ def main(argv=None) -> int:
         port.port = a.port
         port.open()
         with port:
-            link = PanelLink(epoch, FakeRun(), port.write)
+            link = PanelLink(epoch, FakeRun(), nonblocking_writer(port), baud=a.baud)
             print(f'panel link on {a.port}, epoch {epoch}, FAKE run; Ctrl+C to quit')
             serve(port, link)
     return 0

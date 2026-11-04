@@ -69,7 +69,9 @@ poly 0x1021, init 0xFFFF, over all previous bytes of the frame, start byte inclu
     11    ctrl_src      CTRL_SRC_*: where the controller name comes from
     12-19 ctrl          controller running on the DUT, ASCII, NUL padded (8)
     20-79 result        3 lines of 20 ASCII, NUL padded: RESULT screen (metrics of the last
-                        finished run); an empty line is not drawn
+                        finished run); an empty line is not drawn. While a run is active
+                        (ST_ACTIVE) the daemon sends no result (I_RESULT_VALID clear): a new
+                        run always clears the old result before its own arrives (Codex Q1)
     80-103 error_text   ASCII, NUL padded (24): what the FAULT screen says under error_code
     104-105 crc
 
@@ -593,7 +595,9 @@ class PanelClient:
         active (ST_ACTIVE); a new START, an active run_state after that, or a lost session
         clears it (V5).
       * PROFILE list: kept per session; if not all `count` entries arrived PROFILE_WAIT_MS
-        after the session started (or the last request), send PROFILES.
+        after the session started (or the last request), send PROFILES. A PROFILE with
+        another count than the list kept starts a new list (names of the old one dropped,
+        Codex Q4).
       * INFO (v6): the newest INFO of the session is kept (`info`) and drawn as it is; INFO of
         another sid is ignored; a lost session forgets it. Nothing is sent for INFO: a missing
         INFO only leaves the fields unknown ('-').
@@ -769,6 +773,8 @@ class PanelClient:
 
     def on_profile(self, pr: Profile) -> None:
         if self.sid and pr.sid == self.sid:
+            if self.profile_count is not None and pr.count != self.profile_count:
+                self.profiles = {}                  # another list: old names do not belong (Q4)
             self.profile_count = pr.count
             if pr.index < pr.count:                 # an empty list is one PROFILE with count 0
                 self.profiles[pr.index] = pr.name
