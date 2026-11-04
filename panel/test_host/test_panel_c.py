@@ -98,6 +98,9 @@ _sig('pp_host_pending', ct.c_int, ct.c_void_p, ct.POINTER(ct.c_uint16), ct.POINT
 _sig('pp_host_stop', ct.c_int, ct.c_void_p, ct.POINTER(ct.c_uint16))
 _sig('pp_host_profile', ct.c_int, ct.c_void_p, ct.c_int, ct.c_char_p)
 _sig('pp_host_info', ct.POINTER(CInfo), ct.c_void_p)
+_sig('pp_host_profile_count', ct.c_int, ct.c_void_p)
+_sig('pp_host_ev_dropped', ct.c_uint32, ct.c_void_p)
+_sig('pp_host_link_open', ct.c_int, ct.c_void_p)
 _sig('pp_host_parser_new', ct.c_void_p, ct.c_uint8, ct.c_uint32)
 _sig('pp_host_parser_free', None, ct.c_void_p)
 _sig('pp_parser_feed', None, ct.c_void_p, ct.c_char_p, ct.c_size_t, ct.c_uint32, FRAME_FN, ct.c_void_p)
@@ -225,6 +228,11 @@ class CPanelClient:
         return None if k == 0 else dict(seq=seq.value if k == 2 else None)
 
     @property
+    def profile_count(self):
+        v = lib.pp_host_profile_count(self._c)
+        return None if v < 0 else v
+
+    @property
     def profiles(self):
         buf = ct.create_string_buffer(pp.NAME_LEN + 1)
         return {i: _dec(buf.value) for i in range(255) if lib.pp_host_profile(self._c, i, buf)}
@@ -327,6 +335,9 @@ def _py_parse(chunks, accept):
 
 @pytest.mark.parametrize('seed', range(40))
 def test_stream_parser_matches_python_on_mixed_cut_and_corrupted_streams(seed):
+    """Gaps never exactly 50 ms on purpose: the Python bench clock is a float in seconds, so at
+    exactly 50.000 ms '0.2 - 0.15 > 0.05' may be true while the C integer test is false
+    (Codex P10, kept as a known limit of this bench, not of the firmware)."""
     rnd = random.Random(100 + seed)
     stream = bytearray()
     for _ in range(60):
@@ -397,7 +408,7 @@ def _snap(panel):
     return (panel.sid, panel.boot, panel.next_seq, panel.stale, panel.fence, panel.stop_state,
             panel.stop_failures, panel.pending and (panel.pending['seq'], panel.pending['cmd'], panel.pending['arg']),
             panel.stop and panel.stop['seq'], tuple(panel.shown), tuple(sorted(panel.profiles.items())),
-            panel.info)
+            panel.info, panel.profile_count)
 
 
 class _FuzzBench(tpp.HoldBench):
@@ -456,3 +467,26 @@ def test_c_client_matches_python_step_by_step(seed):
         py, c = benches
         assert _snap(c.panel) == _snap(py.panel), f'step {step} action {action}'
         assert c.up == py.up and c.held == py.held and c.ran == py.ran and c.log == py.log, f'step {step}'
+
+
+def test_event_ring_keeps_newest_and_counts_dropped_codex_p18():
+    c = CPanelClient(iter(range(1, 100)).__next__)
+    for k in range(40):                                  # no session: every press is refused
+        lib.pp_client_press(c._c, pp.CMD_START, k, 0)
+    c._drain()
+    assert len(c.shown) == pp_EVENTS and lib.pp_host_ev_dropped(c._c) == 40 - pp_EVENTS
+    assert c.shown[0] == ('refused', pp.CMD_START, None)
+
+
+pp_EVENTS = 32
+
+
+def test_link_expires_and_a_millis_wrap_does_not_revive_it_codex_p9(monkeypatch):
+    monkeypatch.setattr(pp, 'PanelClient', CPanelClient)
+    b = tpp.Bench()
+    b.step(10)
+    assert b.panel.link(b.t)
+    t_last = b.t
+    b.panel.tick(t_last + 600)
+    assert not lib.pp_host_link_open(b.panel._c)
+    assert not b.panel.link((t_last + 2 ** 32) & 0xFFFFFFFF)     # same last_status_ms after a wrap

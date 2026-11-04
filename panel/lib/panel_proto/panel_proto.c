@@ -255,6 +255,8 @@ static void give_up(pp_client_t *c, const pp_pending_t *p)
 
 void pp_client_tick(pp_client_t *c, uint32_t now_ms)
 {
+    if (c->has_status_t && (uint32_t)(now_ms - c->last_status_ms) >= PP_NO_LINK_MS)
+        c->has_status_t = false;                /* expired: only a new STATUS opens it (P9) */
     if (!c->sid) {
         if (!c->has_t_hello || (uint32_t)(now_ms - c->t_hello) >= PP_HELLO_RESEND_MS) {
             c->t_hello = now_ms;
@@ -455,6 +457,7 @@ void pp_client_on_frame(pp_client_t *c, const uint8_t *frame, size_t len, uint32
         if (c->sid && in.sid == c->sid) {
             c->info = in;
             c->has_info = true;
+            c->info_count++;
         }
     }
 }

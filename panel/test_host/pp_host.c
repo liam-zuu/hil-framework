@@ -53,6 +53,10 @@ int pp_host_profile(const pp_client_t *c, int i, char *name)
     return 1;
 }
 
+int pp_host_profile_count(const pp_client_t *c) { return c->has_profile_count ? c->profile_count : -1; }
+uint32_t pp_host_ev_dropped(const pp_client_t *c) { return c->ev_dropped; }
+int pp_host_link_open(const pp_client_t *c) { return c->has_status_t; }
+
 const pp_info_t *pp_host_info(const pp_client_t *c) { return c->has_info ? &c->info : NULL; }
 
 pp_parser_t *pp_host_parser_new(uint8_t accept, uint32_t stale_ms)

@@ -8,7 +8,17 @@
  *
  * Plain C99, no Arduino / ESP-IDF calls, so the same file builds on the PC for the tests.
  * Frames are built in byte buffers (never a C struct sent as is). Times are uint32_t ms of a
- * free-running clock; only differences are used.
+ * free-running clock; only differences are used; calls into one client must come in time
+ * order (never an older now after a newer one).
+ *
+ * Known, deliberate differences from the Python reference (Codex round 1):
+ *  - text fields: a byte >= 0x80 becomes '?' (Python decodes it as U+FFFD). The contract says
+ *    ASCII and the daemon encodes with errors='replace', so a conforming daemon never sends one
+ *    (P11);
+ *  - events (what the screen reports) wait in a ring of PP_EVENTS: the caller pops them after
+ *    every call; if more pile up, the oldest are dropped and counted in ev_dropped (P18);
+ *  - the link is marked expired in tick once NO_LINK_MS has passed, so a millis() wrap
+ *    (49.7 days) cannot bring an old STATUS back to life (P9).
  */
 #ifndef PANEL_PROTO_H
 #define PANEL_PROTO_H
@@ -209,6 +219,7 @@ typedef struct {
     char     profile_name[PP_PROFILES_STORED][PP_NAME_LEN + 1];
 
     bool     has_info;  pp_info_t info;     /* newest INFO of the session */
+    uint32_t info_count;                    /* INFO frames of a session taken so far (never reset) */
     bool     has_st;    pp_status_t st;     /* newest STATUS of the session (for the screen) */
 
     pp_event_t events[PP_EVENTS];       /* what the screen reports, oldest first */
