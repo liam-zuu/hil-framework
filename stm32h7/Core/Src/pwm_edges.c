@@ -10,10 +10,18 @@ static void _drop_open_period(PwmEdges_t *e)
     e->have_fall = 0u;
 }
 
-void pwm_edges_init(PwmEdges_t *e, const PwmEdgesCfg_t *cfg)
+static void _unknown(PwmEdges_t *e)
+{
+    e->known = 0u;
+    e->cand_valid = 0u;
+    _drop_open_period(e);
+}
+
+void pwm_edges_init(PwmEdges_t *e, const PwmEdgesCfg_t *cfg, uint32_t now_ms)
 {
     memset(e, 0, sizeof(*e));
     e->cfg = *cfg;
+    e->last_svc_ms = now_ms;     /* capture started: a long wait before the first service is a lap (M12) */
 }
 
 void pwm_edges_process(PwmEdges_t *e, const volatile uint32_t *ring, uint32_t wr,
@@ -22,34 +30,39 @@ void pwm_edges_process(PwmEdges_t *e, const volatile uint32_t *ring, uint32_t wr
     const uint32_t len = e->cfg.ring_len;
     if (wr >= len) wr %= len;
 
-    /* Gap since the previous service. A gap of lap_ms or more may hide a full
+    /* Gap since the previous call. A gap of lap_ms or more may hide a full
      * lap of the ring (rd == wr although entries arrived) and, with lap_ms
      * below the 6.5 ms counter wrap, also bounds the time between two entries
      * read in one call. */
-    const uint32_t prev_svc = e->started ? e->last_svc_ms : now_ms;
-    int lap = e->started && (uint32_t)(now_ms - e->last_svc_ms) >= e->cfg.lap_ms;
-    e->started = 1u;
+    const uint32_t prev_svc = e->last_svc_ms;
+    int lap = (uint32_t)(now_ms - e->last_svc_ms) >= e->cfg.lap_ms;
     e->last_svc_ms = now_ms;
 
     if (lap || lost) {
         if (lap)  e->n_lap++;
         if (lost) e->n_lost++;
         /* Edge types can no longer be counted through: skip to the write
-         * index and wait for the next anchor. */
-        if (e->rd != wr || lost) {
+         * index and wait for new anchors. After a lap the entries are of
+         * unknown age, so they do not count as activity (M3); an overcapture
+         * means a capture just happened. */
+        if (lost) {
             e->any_edge = 1u;
             e->last_edge_ms = now_ms;
+            e->edge_svc_lo = prev_svc;
+            e->lap_pending = 0u;
+        } else if (e->rd != wr) {
+            e->lap_pending = 1u;
         }
         e->rd = wr;
-        e->known = 0u;
-        _drop_open_period(e);
+        _unknown(e);
         return;
     }
 
     if (e->rd == wr) return;
+    e->lap_pending = 0u;
 
-    /* The last edge read before was seen at the service after prev_edge_svc,
-     * so it is at most (now_ms - prev_edge_svc) + 1 ms old: from stale_ms on,
+    /* The last edge read before was seen at the service after edge_svc_lo,
+     * so it is at most (now_ms - edge_svc_lo) + 1 ms old: from stale_ms on,
      * the next difference could pass the 16-bit counter wrap. */
     if ((e->have_rise || e->have_fall) &&
         (uint32_t)(now_ms - e->edge_svc_lo) >= e->cfg.stale_ms) {
@@ -68,7 +81,9 @@ void pwm_edges_process(PwmEdges_t *e, const volatile uint32_t *ring, uint32_t wr
             if (e->have_rise && e->have_fall) {
                 uint16_t period = (uint16_t)(t - e->t_rise);
                 uint16_t width  = (uint16_t)(e->t_fall - e->t_rise);
-                if (period > 0u) {
+                if (period > e->cfg.max_period) {
+                    e->n_bad_period++;        /* gap or dropped pulse, not a PWM period (M2) */
+                } else if (period > 0u) {
                     float d = (float)width / (float)period;
                     if (d > 1.0f) d = 1.0f;
                     e->duty = e->duty * 0.75f + d * 0.25f;
@@ -88,22 +103,57 @@ void pwm_edges_process(PwmEdges_t *e, const volatile uint32_t *ring, uint32_t wr
     e->edge_svc_lo = prev_svc;
 }
 
-void pwm_edges_anchor(PwmEdges_t *e, uint32_t wr1, uint32_t wr2, int pin1, int pin2)
+void pwm_edges_anchor(PwmEdges_t *e, uint32_t svc, uint32_t now_ms,
+                      uint32_t wr1, uint32_t wr2, int pin_a, int pin_b, int pin_c)
 {
     if (wr1 != wr2) return;                   /* a capture came in the window */
-    if ((pin1 != 0) != (pin2 != 0)) return;   /* pin moved: edge not captured yet, or a glitch */
-    if (e->rd != wr2 % e->cfg.ring_len) return;   /* ring not read up to wr2 */
+    int a = pin_a != 0, b = pin_b != 0, c = pin_c != 0;
+    if (a != b || b != c) return;             /* pin moved: edge not captured yet, or a glitch */
+    if (e->rd != wr2 % e->cfg.ring_len) return;   /* ring not read up to the window */
 
-    uint8_t pin = (pin1 != 0) ? 1u : 0u;
-    if (!e->known) {
-        e->known = 1u;
-        e->level = pin;
-        _drop_open_period(e);
-    } else if (e->level != pin) {
-        e->n_parity_fix++;
-        e->level = pin;
-        _drop_open_period(e);
+    uint8_t pin = (uint8_t)a;
+    if (e->known) {
+        if (e->level == pin) {
+            e->verified_ms = now_ms;
+        } else {                              /* disagree: start over, two anchors again */
+            e->n_parity_fix++;
+            _unknown(e);
+            e->level = pin;
+            e->cand_valid = 1u;
+            e->cand_svc = svc;
+        }
+        return;
     }
+    if (!e->cand_valid) {                     /* first anchor: candidate only */
+        e->level = pin;
+        e->cand_valid = 1u;
+        e->cand_svc = svc;
+        _drop_open_period(e);
+    } else if (svc == e->cand_svc) {          /* same service: keep the latest reading */
+        e->level = pin;
+    } else if (e->level == pin) {             /* second service agrees: known */
+        e->known = 1u;
+        e->verified_ms = now_ms;
+        _drop_open_period(e);
+    } else {                                  /* second service disagrees: new candidate */
+        e->n_cand_retry++;
+        e->level = pin;
+        e->cand_svc = svc;
+    }
+}
+
+void pwm_edges_mark_active(PwmEdges_t *e, uint32_t now_ms)
+{
+    e->any_edge = 1u;
+    e->last_edge_ms = now_ms;
+    e->edge_svc_lo = now_ms;
+    e->lap_pending = 0u;
+}
+
+uint32_t pwm_edges_windows(const PwmEdges_t *e, uint32_t now_ms)
+{
+    if (!e->known || (uint32_t)(now_ms - e->verified_ms) >= e->cfg.verify_ms) return 3u;
+    return 1u;
 }
 
 float pwm_edges_duty(const PwmEdges_t *e, uint32_t now_ms, int pin)

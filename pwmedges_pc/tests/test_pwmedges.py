@@ -1,10 +1,14 @@
 """PC tests of the H7 PWM edge decoder (stm32h7/Core/Src/pwm_edges.c).
 
 The harness (pwmedges_pc/harness.c) runs the H7 file unchanged against a
-model of one input: ESP32 MCPWM period grid, timer input filter, 10 MHz
-16-bit capture, DMA ring, and the main-loop service of pwm_capture.c (wr1,
-pin, 3 us, pin, wr2, lost flag). Model numbers are assumptions, not
-measurements: filter 1067 ns (8 samples at 240 MHz / 32), DMA 300 ns.
+model of one input: ESP32 MCPWM period grid, timer input filter (8
+consecutive samples at 7.5 MHz), 10 MHz 16-bit capture, DMA ring, and the
+main-loop service of pwm_capture.c (windows at absolute 0, 7, 14 us: wr1,
+pin, pin, pin, wr2; overcapture flag; process up to wr1; anchor; probe after
+a lap). Model numbers are assumptions, not measurements: filter sampling,
+DMA 300 ns. Limits (Codex M9): the overcapture flag is injected (lose=K), not
+produced by a model of CCR and the DMA request; the DMA ring and its write
+index change together; one channel only.
 
   python -m pytest pwmedges_pc/tests -q      (needs gcc on PATH)
 
@@ -59,6 +63,7 @@ def test_steady_duty_all_t6_levels(harness, duty):
     vals = window(res, 30, 200)
     assert vals and max(abs(v - duty) for v in vals) <= TOL
     assert res['n_parity_fix'] == 0 and res['n_lost'] == 0 and res['n_lap'] == 0
+    assert res['n_cand_retry'] == 0 and res['n_bad_period'] == 0
 
 
 @pytest.mark.parametrize('phase_ns', [0, 1234, 17000, 34999, 49900])
@@ -133,10 +138,12 @@ def test_idle_gap_past_counter_wrap(harness):
 
 
 def test_idle_gap_short_of_stale(harness):
-    """Idle 3 ms (below stale): the first period after it spans the gap and
-    reads low, the filter pulls back within a few periods."""
+    """Idle 3 ms (below stale): the period that spans the gap is longer than
+    max_period, so it is skipped and counted, not filtered in (Codex M2:
+    before, duty fell to 0.43 for about 1 ms)."""
     res = run(harness, 'seg=0.5:60', 'seg=0:3', 'seg=0.5:60')
-    assert max(abs(v - 0.5) for v in window(res, 80, 123)) <= TOL
+    assert res['n_bad_period'] >= 1
+    assert max(abs(v - 0.5) for v in window(res, 30, 123)) <= TOL
 
 
 def test_glitch_shorter_than_filter(harness):
@@ -185,7 +192,7 @@ def test_single_window_can_lock_out(harness):
     """Same lock with one window only: some phase never anchors (why 3 windows)."""
     stuck = 0
     for off in range(1000, 51000, 700):
-        res = run(harness, 'seg=0.5:20', f'svc_off_ns={off}', 'n_try=1')
+        res = run(harness, 'seg=0.5:20', f'svc_off_ns={off}', 'max_win=1')
         if max(abs(v - 0.5) for v in window(res, 10, 20)) > TOL:
             stuck += 1
     assert stuck > 0
@@ -215,3 +222,88 @@ def test_overcapture_with_odd_edge_count(harness):
               'lose=2001', 'lose=3005', 'lose=4010', 'lose=5003', 'lose=6008', 'lose=7001')
     assert res['n_lost'] == 6 and res['n_parity_fix'] == 0
     assert max(abs(v - 0.3) for v in window(res, 30, 200)) <= TOL
+
+
+def _read_points(t_ms, off_ns=123457, n=3):
+    """Pin read times (ns) of the service at t_ms (harness schedule)."""
+    t = int(t_ms * 1e6) + off_ns
+    return [t + k * 7000 + d for k in range(n) for d in (50, 1750, 3550)]
+
+
+def _glitches_at(points, width=400):
+    return [f'glitch={(p - width // 2) / 1000:.3f}:{width}' for p in points]
+
+
+def test_glitches_fool_one_service_only(harness):
+    """Codex M1: 400 ns glitches (dropped by the input filter) on all 9 pin
+    reads of the first service give a wrong first anchor; it needs a second
+    service to agree, so no wrong duty comes out."""
+    res = run(harness, 'seg=0.3:60', *_glitches_at(_read_points(0)))
+    assert res['n_cand_retry'] >= 1
+    vals = window(res, 0, 60)
+    assert all(abs(v - 0.3) <= TOL or v in (0.0, 1.0) for v in vals)
+    assert max(abs(v - 0.3) for v in window(res, 20, 60)) <= TOL
+
+
+def test_glitches_fool_two_services_then_check_fixes(harness):
+    """Glitches on every pin read of the first two services: the wrong edge
+    type is accepted, then the 10 ms check (3 windows) disagrees, counts
+    parity_fix and the reading recovers within about 25 ms."""
+    args = _glitches_at(_read_points(0)) + _glitches_at(_read_points(1))
+    res = run(harness, 'seg=0.3:80', *args)
+    assert res['n_parity_fix'] >= 1
+    assert max(abs(v - 0.3) for v in window(res, 40, 80)) <= TOL
+
+
+def test_stall_while_pwm_stops_gives_pin_level(harness):
+    """Codex M3: main loop blocked 100 ms while the PWM stops (held high from
+    100 ms). After the stall nothing new arrives in the 60 us probe, so the
+    last edge keeps its age and the pin level comes out at once."""
+    res = run(harness, 'seg=0.3:100', 'seg=1:300', 'stall=90:100')
+    assert res['n_lap'] >= 1
+    assert window(res, 189, 400) and min(window(res, 189, 400)) == 1.0
+
+
+def test_stall_longer_than_timeout_while_pwm_runs(harness):
+    """Blocked 80 ms (more than the 50 ms timeout) while the PWM keeps running:
+    the probe sees new captures, so the output stays the duty, not the pin."""
+    res = run(harness, 'seg=0.3:300', 'stall=100:80')
+    assert res['n_lap'] >= 1
+    assert max(abs(v - 0.3) for v in window(res, 30, 300)) <= TOL
+
+
+def test_lap_before_first_service_is_counted(harness):
+    """Codex M12: first service 40 ms after the capture started (ring lapped)."""
+    res = run(harness, 'seg=0.3:100', 'stall=0:40')
+    assert res['n_lap'] >= 1
+    assert max(abs(v - 0.3) for v in window(res, 60, 100)) <= TOL
+
+
+def test_many_overcaptures_no_wrong_value(harness):
+    """Codex M4: overcaptures at many places in the service cycle (service
+    1013 us): drop up to the index read after the flag, re-anchor over two
+    services, never a wrong value."""
+    loses = [f'lose={k}' for k in range(1500, 9000, 157)]
+    res = run(harness, 'seg=0.3:250', 'svc_us=1013', *loses)
+    assert res['n_lost'] >= 40 and res['n_parity_fix'] == 0
+    vals = window(res, 30, 250)
+    assert max(abs(v - 0.3) for v in vals) <= TOL
+
+
+def test_glitches_two_services_phase_locked_needs_periodic_check(harness):
+    """As above, but the service is locked so that its first window always
+    holds the falling edge (single-window anchors never pass): only the 10 ms
+    full check can find the wrong edge type."""
+    off = 13000
+    args = _glitches_at(_read_points(0, off)) + _glitches_at(_read_points(1, off))
+    res = run(harness, 'seg=0.3:80', f'svc_off_ns={off}', *args)
+    assert res['n_parity_fix'] >= 1
+    assert max(abs(v - 0.3) for v in window(res, 40, 80)) <= TOL
+
+
+def test_one_glitched_check_does_not_flip_known(harness):
+    """A glitched anchor while known only drops to unknown (duty held), it does
+    not flip the edge type: no wrong value at any sample."""
+    res = run(harness, 'seg=0.3:80', *_glitches_at(_read_points(30)))
+    assert res['n_parity_fix'] >= 1
+    assert max(abs(v - 0.3) for v in window(res, 20, 80)) <= TOL

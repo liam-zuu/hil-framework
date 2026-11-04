@@ -261,11 +261,13 @@ int main(void)
          * LPWM FL FR RL RR: e/s = captures per second (about 40000 on a
          * channel with 20 kHz PWM, 0 when held), lost = overcapture flags,
          * lap = service gaps >= 5 ms (ring dropped, FL channel), fix = edge
-         * type corrected by the pin anchor, known = edge type known. */
+         * type corrected by the pin anchor, bad = periods > 75 us skipped,
+         * known = edge type known, act = DMA stream running, dmaerr = stream
+         * found stopped. */
         static uint32_t _edges_last[PWM_NUM_CHANNELS];
         PWMCapture_Stats_t ps;
         PWMCapture_GetStats(&ps);
-        char pl[200];
+        char pl[320];
         int n = snprintf(pl, sizeof(pl), "PWMdma: e/s=");
         for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++) {
             n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%lu", i ? "," : "",
@@ -279,7 +281,13 @@ int main(void)
         for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
             n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%lu", i ? "," : " fix=", (unsigned long)ps.parity_fix[i]);
         for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
+            n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%lu", i ? "," : " bad=", (unsigned long)ps.bad_period[i]);
+        for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
             n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%u", i ? "" : " known=", (unsigned)ps.known[i]);
+        for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
+            n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%u", i ? "" : " act=", (unsigned)ps.active[i]);
+        for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
+            n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%lu", i ? "," : " dmaerr=", (unsigned long)ps.dma_err[i]);
         printf("%s\r\n", pl);
         uint32_t relay_sent, relay_dropped;
         UartRelay_GetStats(&relay_sent, &relay_dropped);

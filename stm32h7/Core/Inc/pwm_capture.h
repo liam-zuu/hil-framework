@@ -44,8 +44,8 @@ void  PWMCapture_Init(TIM_HandleTypeDef *ht5,
                       TIM_HandleTypeDef *ht17);
 
 /* Read new captures and update the duty of each channel. Call every pass of
- * the main loop (about 3 us, up to about 25 us while an edge type is still
- * unknown). */
+ * the main loop (about 4 us; about 18 us while an edge type is unknown or a
+ * check is due; plus up to 60 us right after a main-loop stall of 5 ms or more). */
 void  PWMCapture_Service(void);
 
 /* Net duty [-1..1] per wheel from the last PWMCapture_Service().
@@ -58,7 +58,10 @@ typedef struct {
     uint32_t edges[PWM_NUM_CHANNELS];       /* captures read since boot */
     uint32_t lost[PWM_NUM_CHANNELS];        /* overcapture flags seen */
     uint32_t lap[PWM_NUM_CHANNELS];         /* service gaps >= 5 ms (ring dropped) */
-    uint32_t parity_fix[PWM_NUM_CHANNELS];  /* anchor disagreed with the counted edge type */
+    uint32_t parity_fix[PWM_NUM_CHANNELS];  /* anchor disagreed with the known edge type */
+    uint32_t bad_period[PWM_NUM_CHANNELS];  /* rising-to-rising > 75 us, skipped (gap or dropped pulse) */
+    uint32_t dma_err[PWM_NUM_CHANNELS];     /* DMA stream found stopped */
+    uint8_t  active[PWM_NUM_CHANNELS];      /* DMA stream running, channel read */
     uint8_t  known[PWM_NUM_CHANNELS];       /* edge type known now */
 } PWMCapture_Stats_t;
 

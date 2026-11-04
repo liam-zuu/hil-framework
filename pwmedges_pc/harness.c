@@ -3,34 +3,38 @@
  *   - the ESP32 MCPWM output: a free-running period grid (high from the period
  *     start, low from duty * T), duty taken at each period start (compare
  *     update on TEZ), held level for duty 0 or 1;
- *   - the timer input filter: the filtered level follows the pin after the pin
- *     stays at the new level for filt_ns (shorter pulses are dropped as pairs);
+ *   - the timer input filter (ICF = 0xF, Codex M11): the pin is sampled at
+ *     fs_hz (240 MHz / 32 = 7.5 MHz) and the filtered level changes after
+ *     fn = 8 consecutive samples at the new level (shorter pulses are dropped);
  *   - the capture: counter at 10 MHz (100 ns per tick) mod 65536;
  *   - the DMA: each capture lands in the ring dma_ns later;
- *   - the main loop service every svc_us, as pwm_capture.c does it:
- *     wr1, pin1, (3 us), pin2, wr2, lost flag, process, anchor, duty.
+ *   - the main loop service every svc_us, as pwm_capture.c does it (Codex M10):
+ *     pwm_edges_windows() windows at absolute 0, 7, 14 us, each wr1, pin a,
+ *     pin b (+1.7 us), pin c (+3.5 us), wr2; then the overcapture flag; then
+ *     process up to wr1 + anchor per window; after a lap a 60 us probe.
  * Prints one JSON object: samples [t_ms, duty] per service and the counters.
  *
  *   harness [key=value ...]
  *     seg=D:MS      duty D for MS ms (repeatable, in order; 0 / 1 = held level)
  *     freq=HZ       PWM frequency (20000)
  *     phase_ns=N    period grid offset (0)
- *     filt_ns=N     input filter delay (1067: 8 samples at 240 MHz / 32)
+ *     fs_hz=F fn=N fphase_ns=P   input filter sampling (7.5e6, 8, 0)
  *     dma_ns=N      capture to ring (300)
  *     ring=N        ring entries (1024)
  *     svc_us=N      service period (1000); svc_off_ns=N first service (123457)
  *     lap=MS stale=MS timeout=MS   decoder config (5, 5, 50)
+ *     max_win=N     cap on windows per service (3; test of the lock-out case)
  *     stall=MS:LEN  no service in [MS, MS + LEN) ms (repeatable)
  *     lose=K        capture K (0-based) overwritten, overcapture flag set
  *     silent=K      capture K missing, no flag (not expected in hardware)
  *     glitch=US:NS  pin inverted for NS ns at US us (repeatable)
  *     jitter_ns=N   each PWM edge moved by a pseudo-random amount in [-N, N] ns
- *     n_try=N try_ns=N   anchor windows per service while unknown (3, 7000)
  */
 #include "pwm_edges.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #define MAX_EDGES  4000000
 #define MAX_SEG    64
@@ -41,7 +45,9 @@ typedef long long ns_t;
 static double g_seg_d[MAX_SEG];
 static ns_t   g_seg_end[MAX_SEG];       /* end time of each segment */
 static int    g_nseg;
-static ns_t   g_T, g_phase, g_filt = 1067, g_dma = 300;
+static ns_t   g_T, g_phase, g_dma = 300;
+static double g_fs = 7.5e6, g_fphase = 0.0;
+static int    g_fn = 8;
 static ns_t   g_glitch_t[MAX_EV], g_glitch_w[MAX_EV];
 static int    g_nglitch;
 
@@ -150,12 +156,17 @@ static long  g_ncap;
 
 static void _filter(void)
 {
+    const double ts = 1e9 / g_fs;
     int fl = g_level0;
     for (long i = 0; i < g_nraw; i++) {
         int l = g_raw_l[i];
-        ns_t next = (i + 1 < g_nraw) ? g_raw_t[i + 1] : (ns_t)1 << 62;
-        if (l != fl && next - g_raw_t[i] >= g_filt) {
-            g_cap_t[g_ncap++] = g_raw_t[i] + g_filt;
+        double t0 = (double)g_raw_t[i];
+        double t1 = (i + 1 < g_nraw) ? (double)g_raw_t[i + 1] : 1e300;
+        if (l == fl) continue;
+        double n0 = ceil((t0 - g_fphase) / ts);
+        double tn = g_fphase + (n0 + g_fn - 1) * ts;     /* fn-th sample at the new level */
+        if (tn < t1) {
+            g_cap_t[g_ncap++] = (ns_t)tn;
             fl = l;
         }
     }
@@ -166,13 +177,12 @@ int main(int argc, char **argv)
     double freq = 20000.0;
     long ring_len = 1024, svc_us = 1000;
     ns_t svc_off = 123457;
-    PwmEdgesCfg_t cfg = { 0, 5, 5, 50 };
+    PwmEdgesCfg_t cfg = { 0, 5, 5, 50, 750, 10 };
     ns_t stall_a[MAX_EV], stall_b[MAX_EV]; int nstall = 0;
     long lose[MAX_EV]; int nlose = 0;
     long silent[MAX_EV]; int nsilent = 0;
     ns_t t_end = 0;
-    int  n_try = 3;
-    ns_t try_ns = 7000;
+    uint32_t max_win = 3;
 
     for (int i = 1; i < argc; i++) {
         char *a = argv[i];
@@ -184,7 +194,9 @@ int main(int argc, char **argv)
         }
         else if (!strncmp(a, "freq=", 5))       freq = atof(a + 5);
         else if (!strncmp(a, "phase_ns=", 9))   g_phase = atoll(a + 9);
-        else if (!strncmp(a, "filt_ns=", 8))    g_filt = atoll(a + 8);
+        else if (!strncmp(a, "fs_hz=", 6))      g_fs = atof(a + 6);
+        else if (!strncmp(a, "fn=", 3))         g_fn = atoi(a + 3);
+        else if (!strncmp(a, "fphase_ns=", 10)) g_fphase = atof(a + 10);
         else if (!strncmp(a, "dma_ns=", 7))     g_dma = atoll(a + 7);
         else if (!strncmp(a, "ring=", 5))       ring_len = atol(a + 5);
         else if (!strncmp(a, "svc_us=", 7))     svc_us = atol(a + 7);
@@ -192,6 +204,9 @@ int main(int argc, char **argv)
         else if (!strncmp(a, "lap=", 4))        cfg.lap_ms = (uint32_t)atol(a + 4);
         else if (!strncmp(a, "stale=", 6))      cfg.stale_ms = (uint32_t)atol(a + 6);
         else if (!strncmp(a, "timeout=", 8))    cfg.timeout_ms = (uint32_t)atol(a + 8);
+        else if (!strncmp(a, "max_period=", 11)) cfg.max_period = (uint32_t)atol(a + 11);
+        else if (!strncmp(a, "verify=", 7))     cfg.verify_ms = (uint32_t)atol(a + 7);
+        else if (!strncmp(a, "max_win=", 8))    max_win = (uint32_t)atol(a + 8);
         else if (!strncmp(a, "stall=", 6)) {
             double ms, len;
             if (sscanf(a + 6, "%lf:%lf", &ms, &len) != 2 || nstall >= MAX_EV) return 2;
@@ -200,8 +215,6 @@ int main(int argc, char **argv)
         else if (!strncmp(a, "lose=", 5) && nlose < MAX_EV)       lose[nlose++] = atol(a + 5);
         else if (!strncmp(a, "silent=", 7) && nsilent < MAX_EV)   silent[nsilent++] = atol(a + 7);
         else if (!strncmp(a, "jitter_ns=", 10)) g_jitter = atoll(a + 10);
-        else if (!strncmp(a, "n_try=", 6))      n_try = atoi(a + 6);
-        else if (!strncmp(a, "try_ns=", 7))     try_ns = atoll(a + 7);
         else if (!strncmp(a, "glitch=", 7)) {
             double us, w;
             if (sscanf(a + 7, "%lf:%lf", &us, &w) != 2 || g_nglitch >= MAX_EV) return 2;
@@ -218,11 +231,12 @@ int main(int argc, char **argv)
 
     uint32_t *ring = calloc((size_t)ring_len, sizeof(uint32_t));
     PwmEdges_t e;
-    pwm_edges_init(&e, &cfg);
+    pwm_edges_init(&e, &cfg, 0);            /* capture started at t = 0 */
 
     long ci = 0;            /* next capture to deliver */
     long written = 0;       /* entries written into the ring */
     int  ovc = 0;           /* overcapture flag (hardware, sticky until read) */
+    uint32_t svc = 0;
 
     printf("{\"samples\": [");
     int first = 1;
@@ -242,32 +256,45 @@ int main(int argc, char **argv)
             }
 
         uint32_t now_ms = (uint32_t)(t / 1000000);
-        int pin2 = 0;
-        /* Up to n_try anchor windows, try_ns apart, while the edge type is
-         * unknown (one window when known), as pwm_capture.c does. */
-        for (int k = 0; k < n_try; k++) {
-            ns_t ta = t + (ns_t)k * try_ns;
+        uint32_t nwin = pwm_edges_windows(&e, now_ms);
+        if (nwin > max_win) nwin = max_win;
+        uint32_t w1[3], w2[3];
+        int pa[3], pb[3], pc[3];
+        svc++;
+        for (uint32_t k = 0; k < nwin; k++) {
+            ns_t ta = t + (ns_t)k * 7000;
             DELIVER(ta);
-            uint32_t wr1 = (uint32_t)(written % ring_len);
-            int pin1 = _pin_at(ta + 50);
-            ns_t t2 = ta + 50 + 3000;
-            pin2 = _pin_at(t2);
-            DELIVER(t2 + 50);
-            uint32_t wr2 = (uint32_t)(written % ring_len);
-            int lost = ovc; ovc = 0;
-            pwm_edges_process(&e, ring, wr2, lost, now_ms);
-            pwm_edges_anchor(&e, wr1, wr2, pin1, pin2);
-            if (e.known) break;
+            w1[k] = (uint32_t)(written % ring_len);
+            pa[k] = _pin_at(ta + 50);
+            pb[k] = _pin_at(ta + 1700 + 50);
+            pc[k] = _pin_at(ta + 3500 + 50);
+            DELIVER(ta + 3500 + 100);
+            w2[k] = (uint32_t)(written % ring_len);
         }
-        float d = pwm_edges_duty(&e, now_ms, pin2);
+        ns_t tsr = t + (ns_t)(nwin - 1) * 7000 + 3700;
+        DELIVER(tsr);
+        if (ovc) {
+            ovc = 0;
+            pwm_edges_process(&e, ring, (uint32_t)(written % ring_len), 1, now_ms);
+        } else {
+            for (uint32_t k = 0; k < nwin; k++) {
+                pwm_edges_process(&e, ring, w1[k], 0, now_ms);
+                pwm_edges_anchor(&e, svc, now_ms, w1[k], w2[k], pa[k], pb[k], pc[k]);
+            }
+        }
+        if (e.lap_pending && ci < g_ncap && g_cap_t[ci] + g_dma <= tsr + 60000)
+            pwm_edges_mark_active(&e, now_ms);
+        float d = pwm_edges_duty(&e, now_ms, _pin_at(tsr));
         printf("%s[%.4f,%.5f]", first ? "" : ",", (double)t / 1e6, (double)d);
         first = 0;
     }
     printf("], \"captures\": %ld, \"raw_edges\": %ld, \"n_edges\": %lu, \"n_periods\": %lu, "
-           "\"n_lost\": %lu, \"n_lap\": %lu, \"n_parity_fix\": %lu, \"n_stale\": %lu}\n",
+           "\"n_lost\": %lu, \"n_lap\": %lu, \"n_parity_fix\": %lu, \"n_stale\": %lu, "
+           "\"n_bad_period\": %lu, \"n_cand_retry\": %lu, \"known\": %u}\n",
            g_ncap, g_nraw, (unsigned long)e.n_edges, (unsigned long)e.n_periods,
            (unsigned long)e.n_lost, (unsigned long)e.n_lap, (unsigned long)e.n_parity_fix,
-           (unsigned long)e.n_stale);
+           (unsigned long)e.n_stale, (unsigned long)e.n_bad_period, (unsigned long)e.n_cand_retry,
+           (unsigned)e.known);
     free(ring);
     return 0;
 }
