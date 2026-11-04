@@ -140,16 +140,17 @@ int main(void)
   MX_TIM17_Init();
   MX_USART2_UART_Init();
   MX_SPI4_Init();
-  MX_TIM13_Init();
   MX_TIM6_Init();
   MX_UART4_Init();
+  MX_TIM8_Init();
   /* USER CODE BEGIN 2 */
 
+  /* Capture timers: no interrupt since 04/11 (DMA capture, pwm_capture.h).
+   * CubeMX MspInit still enables these NVIC lines; keep them off. */
   HAL_NVIC_DisableIRQ(TIM5_IRQn);
   HAL_NVIC_DisableIRQ(TIM15_IRQn);
   HAL_NVIC_DisableIRQ(TIM16_IRQn);
   HAL_NVIC_DisableIRQ(TIM17_IRQn);
-  HAL_NVIC_DisableIRQ(TIM8_UP_TIM13_IRQn);   /* TIM13 = wheel 2 RPWM (PF8) */
 
   setvbuf(stdout, NULL, _IONBF, 0);
 
@@ -161,27 +162,7 @@ int main(void)
   SPI1_Handler_Init(&hspi1);
   UartRelay_Init(&huart2);     /* +++ NEW */
 
-  /* TIM5/13/15/16/17 priority lower than SPI1 DMA (priority 0) — Bug #7 fix */
-  HAL_NVIC_SetPriority(TIM5_IRQn,  5, 0);
-  HAL_NVIC_SetPriority(TIM8_UP_TIM13_IRQn, 5, 0);
-  HAL_NVIC_SetPriority(TIM15_IRQn, 5, 0);
-  HAL_NVIC_SetPriority(TIM16_IRQn, 5, 0);
-  HAL_NVIC_SetPriority(TIM17_IRQn, 5, 0);
-  /* NVIC lines stay off until PWMCapture_Init has cleared stale flags (25/10:
-   * enabling them here first could hang the boot after "resolve bits"). */
-
-  PWMCapture_Init(&htim5, &htim13, &htim15, &htim16, &htim17);
-
-  /* One line before each enable: if the boot stops right after a line, that
-   * timer's interrupt is the one that never lets main run (26/10). */
-  printf("NVIC: enabling TIM5\r\n");
-  HAL_NVIC_EnableIRQ(TIM5_IRQn);
-  printf("NVIC: enabling TIM13\r\n");
-  HAL_NVIC_EnableIRQ(TIM8_UP_TIM13_IRQn);
-  printf("NVIC: enabling TIM15/16/17\r\n");
-  HAL_NVIC_EnableIRQ(TIM15_IRQn);
-  HAL_NVIC_EnableIRQ(TIM16_IRQn);
-  HAL_NVIC_EnableIRQ(TIM17_IRQn);
+  PWMCapture_Init(&htim5, &htim8, &htim15, &htim16, &htim17);
   printf("BNO: emulator on SPI4 (INT PG2, RST PG3), TIM6 tick\r\n");
   BnoPort_Init(&hspi4, &htim6);
   if (IbusPort_Init(UART4))
@@ -206,6 +187,7 @@ int main(void)
 
   while (1)
   {
+    PWMCapture_Service();      /* read new PWM captures every pass (04/11, DMA) */
     if (SPI1_IsFrameReady()) {
         _last_frame_ms = HAL_GetTick();
         if (!_link_up) {
@@ -275,12 +257,30 @@ int main(void)
                (double)duty[0], (double)duty[1],
                (double)duty[2], (double)duty[3]);
 
-        /* Capture interrupt rate (debug, 25/10): expected about 2 x 20 kHz per
-         * channel that has PWM edges, 0 when all PWM pins are idle. */
-        static uint32_t _isr_last = 0;
-        uint32_t isr_now = PWMCapture_GetIsrCount();
-        printf("ISR: %lu/s\r\n", (unsigned long)((isr_now - _isr_last) * 2u));
-        _isr_last = isr_now;
+        /* DMA capture counters (04/11), channel order RPWM FL FR RL RR,
+         * LPWM FL FR RL RR: e/s = captures per second (about 40000 on a
+         * channel with 20 kHz PWM, 0 when held), lost = overcapture flags,
+         * lap = service gaps >= 5 ms (ring dropped, FL channel), fix = edge
+         * type corrected by the pin anchor, known = edge type known. */
+        static uint32_t _edges_last[PWM_NUM_CHANNELS];
+        PWMCapture_Stats_t ps;
+        PWMCapture_GetStats(&ps);
+        char pl[200];
+        int n = snprintf(pl, sizeof(pl), "PWMdma: e/s=");
+        for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++) {
+            n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%lu", i ? "," : "",
+                          (unsigned long)((ps.edges[i] - _edges_last[i]) * 2u));
+            _edges_last[i] = ps.edges[i];
+        }
+        for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
+            n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%lu", i ? "," : " lost=", (unsigned long)ps.lost[i]);
+        if (n < (int)sizeof(pl))
+            n += snprintf(pl + n, sizeof(pl) - (size_t)n, " lap=%lu", (unsigned long)ps.lap[0]);
+        for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
+            n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%lu", i ? "," : " fix=", (unsigned long)ps.parity_fix[i]);
+        for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
+            n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%u", i ? "" : " known=", (unsigned)ps.known[i]);
+        printf("%s\r\n", pl);
         uint32_t relay_sent, relay_dropped;
         UartRelay_GetStats(&relay_sent, &relay_dropped);
         printf("Relay: sent=%lu dropped=%lu  traj vx=%.2f vy=%.2f wz=%.2f\r\n",
@@ -404,10 +404,7 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
-void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
-{
-    PWMCapture_IC_Callback(htim);
-}
+/* HAL_TIM_IC_CaptureCallback removed 04/11: PWM capture uses DMA, no capture interrupt */
 /* USER CODE END 4 */
 
 /**

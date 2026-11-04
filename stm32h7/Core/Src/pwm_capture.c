@@ -1,246 +1,177 @@
 #include "pwm_capture.h"
+#include "pwm_edges.h"
 #include <string.h>
 #include <stdio.h>
 
+/* HAL side of the DMA capture (see pwm_capture.h); the decoding is in
+ * pwm_edges.c, tested on the PC (pwmedges_pc). */
+
+#define LAP_MS        5u     /* below the 6.5 ms counter wrap (pwm_edges.h) */
+#define STALE_MS      5u
+#define WIN_TICKS    30u     /* anchor window, 3 us at 10 MHz: > input filter (about 1.07 us) + DMA */
+#define TRY_GAP_TICKS 40u    /* pause between two windows: windows start 7 us apart */
+#define N_TRY         3u     /* windows per service while an edge type is unknown */
+
 typedef struct {
     TIM_HandleTypeDef *htim;
-    uint32_t           hal_ch;
-    uint32_t           ccer_bit;   /* CCxE bit in CCER */
-    uint32_t           ccer_pol;   /* CCxP bit in CCER — polarity toggle */
-    uint32_t           dier_bit;   /* CCxIE bit in DIER */
-    uint32_t           t_rise;
-    uint32_t           period;
-    uint32_t           width;
-    uint8_t            state;      /* 0=WAIT_RISE, 1=WAIT_FALL */
-    uint32_t           last_tick;
-    float              duty;
-    GPIO_TypeDef      *port;       /* input pin, read when no edge arrives */
+    DMA_HandleTypeDef *hdma;
+    uint32_t           ch;         /* TIM_CHANNEL_x */
+    uint32_t           ccxe;       /* CCxE in CCER */
+    uint32_t           ccxde;      /* CCxDE in DIER */
+    uint32_t           ccxie;      /* CCxIE in DIER (kept off) */
+    uint32_t           ccxif;      /* CCxIF in SR */
+    uint32_t           ccxof;      /* CCxOF in SR */
+    GPIO_TypeDef      *port;
     uint16_t           pin;
+    PwmEdges_t         dec;
+    float              duty;
 } PwmCh_t;
 
-#define N_CHANNELS 8u
-static PwmCh_t _ch[N_CHANNELS];
-static volatile uint32_t _isr_count;   /* capture interrupts handled (debug) */
+static PwmCh_t _ch[PWM_NUM_CHANNELS];
+/* Rings in .bss = RAM_D1 (AXI SRAM, reachable by DMA2; D-cache is off) */
+static uint32_t _ring[PWM_NUM_CHANNELS][PWM_RING_LEN];
+static TIM_TypeDef *_tbase;        /* 10 MHz counter used to time the windows */
 
-/* Arm the capture channels of TIM15 (2 channels, LPWM) or of a 1-channel timer
- * (TIM13 RPWM wheel 2, TIM16/TIM17 LPWM):
- * input filter 0xF, rising edge, counter on, stale flags cleared while the
- * channels are off, then interrupts enabled. NVIC stays off until main.c. */
-static void _arm_lpwm_timer(TIM_HandleTypeDef *ht, uint8_t n_ch)
+static volatile uint32_t *_ccr(TIM_TypeDef *t, uint32_t ch)
 {
-    TIM_TypeDef *t = ht->Instance;
-    uint32_t ccer = TIM_CCER_CC1E;
-    uint32_t pol  = TIM_CCER_CC1P | TIM_CCER_CC1NP;
-    uint32_t dier = TIM_DIER_CC1IE;
-    uint32_t sr   = TIM_SR_CC1IF | TIM_SR_CC1OF;
-
-    t->DIER &= ~(TIM_DIER_CC1IE | TIM_DIER_CC2IE);
-    t->CCER &= ~(TIM_CCER_CC1E | TIM_CCER_CC2E);
-    t->CCMR1 = (t->CCMR1 & ~TIM_CCMR1_IC1F) | (0xFu << TIM_CCMR1_IC1F_Pos);
-    if (n_ch == 2u) {
-        t->CCMR1 = (t->CCMR1 & ~TIM_CCMR1_IC2F) | (0xFu << TIM_CCMR1_IC2F_Pos);
-        ccer |= TIM_CCER_CC2E;
-        pol  |= TIM_CCER_CC2P | TIM_CCER_CC2NP;
-        dier |= TIM_DIER_CC2IE;
-        sr   |= TIM_SR_CC2IF | TIM_SR_CC2OF;
-    }
-    t->CCER &= ~pol;            /* rising edge */
-    t->CR1  |= TIM_CR1_CEN;
-    t->SR    = ~sr;             /* rc_w0: clear capture and overcapture flags */
-    t->CCER |= ccer;
-    t->SR    = ~sr;
-    t->DIER |= dier;
-}
-
-static uint32_t _hal_active_to_ch(HAL_TIM_ActiveChannel ac)
-{
-    switch (ac) {
-        case HAL_TIM_ACTIVE_CHANNEL_1: return TIM_CHANNEL_1;
-        case HAL_TIM_ACTIVE_CHANNEL_2: return TIM_CHANNEL_2;
-        case HAL_TIM_ACTIVE_CHANNEL_3: return TIM_CHANNEL_3;
-        case HAL_TIM_ACTIVE_CHANNEL_4: return TIM_CHANNEL_4;
-        default:                        return 0xFFFFFFFFu;
+    switch (ch) {
+        case TIM_CHANNEL_1: return &t->CCR1;
+        case TIM_CHANNEL_2: return &t->CCR2;
+        case TIM_CHANNEL_3: return &t->CCR3;
+        default:            return &t->CCR4;
     }
 }
 
-/*
- * Set polarity, re-enable CCER and DIER — direct register writes, ISR-safe.
- * falling=1 → CCxP=1 (falling edge), falling=0 → CCxP=0 (rising edge).
- * No LL dependency.
- */
-static void _arm(PwmCh_t *c, uint8_t falling)
+static void _set(PwmCh_t *c, TIM_HandleTypeDef *ht, uint32_t ch,
+                 GPIO_TypeDef *port, uint16_t pin)
 {
-    if (falling)
-        c->htim->Instance->CCER |=  c->ccer_pol;
-    else
-        c->htim->Instance->CCER &= ~c->ccer_pol;
-    c->htim->Instance->CCER |= c->ccer_bit;
-    c->htim->Instance->DIER |= c->dier_bit;
+    static const uint32_t ccxe[4]  = { TIM_CCER_CC1E,  TIM_CCER_CC2E,  TIM_CCER_CC3E,  TIM_CCER_CC4E };
+    static const uint32_t ccxde[4] = { TIM_DIER_CC1DE, TIM_DIER_CC2DE, TIM_DIER_CC3DE, TIM_DIER_CC4DE };
+    static const uint32_t ccxie[4] = { TIM_DIER_CC1IE, TIM_DIER_CC2IE, TIM_DIER_CC3IE, TIM_DIER_CC4IE };
+    static const uint32_t ccxif[4] = { TIM_SR_CC1IF,   TIM_SR_CC2IF,   TIM_SR_CC3IF,   TIM_SR_CC4IF };
+    static const uint32_t ccxof[4] = { TIM_SR_CC1OF,   TIM_SR_CC2OF,   TIM_SR_CC3OF,   TIM_SR_CC4OF };
+    static const uint16_t dma_id[4] = { TIM_DMA_ID_CC1, TIM_DMA_ID_CC2, TIM_DMA_ID_CC3, TIM_DMA_ID_CC4 };
+    uint32_t k = ch / 4u;          /* TIM_CHANNEL_1..4 = 0x0, 0x4, 0x8, 0xC */
+    c->htim  = ht;
+    c->ch    = ch;
+    c->hdma  = ht->hdma[dma_id[k]];   /* linked by CubeMX in HAL_TIM_*_MspInit */
+    c->ccxe  = ccxe[k];
+    c->ccxde = ccxde[k];
+    c->ccxie = ccxie[k];
+    c->ccxif = ccxif[k];
+    c->ccxof = ccxof[k];
+    c->port  = port;
+    c->pin   = pin;
+}
+
+/* Ring write index from the DMA counter (NDTR counts down, reloads in circular mode) */
+static uint32_t _wr(const PwmCh_t *c)
+{
+    uint32_t left = ((DMA_Stream_TypeDef *)c->hdma->Instance)->NDTR;
+    return (PWM_RING_LEN - left) % PWM_RING_LEN;
+}
+
+static int _pin(const PwmCh_t *c)
+{
+    return (c->port->IDR & c->pin) != 0u;
+}
+
+static void _wait_ticks(uint32_t n)
+{
+    uint16_t t0 = (uint16_t)_tbase->CNT;
+    while ((uint16_t)((uint16_t)_tbase->CNT - t0) < n) { }
 }
 
 void PWMCapture_Init(TIM_HandleTypeDef *ht5,
-                     TIM_HandleTypeDef *ht13,
+                     TIM_HandleTypeDef *ht8,
                      TIM_HandleTypeDef *ht15,
                      TIM_HandleTypeDef *ht16,
                      TIM_HandleTypeDef *ht17)
 {
+    const PwmEdgesCfg_t cfg = { PWM_RING_LEN, LAP_MS, STALE_MS, PWM_TIMEOUT_MS };
+
     memset(_ch, 0, sizeof(_ch));
-    printf("PWMCapture: assign channels\r\n");
+    memset(_ring, 0, sizeof(_ring));
+    _set(&_ch[0], ht5,  TIM_CHANNEL_1, GPIOA, GPIO_PIN_0);
+    _set(&_ch[1], ht8,  TIM_CHANNEL_3, GPIOC, GPIO_PIN_8);
+    _set(&_ch[2], ht5,  TIM_CHANNEL_3, GPIOA, GPIO_PIN_2);
+    _set(&_ch[3], ht5,  TIM_CHANNEL_4, GPIOA, GPIO_PIN_3);
+    _set(&_ch[4], ht15, TIM_CHANNEL_1, GPIOE, GPIO_PIN_5);
+    _set(&_ch[5], ht8,  TIM_CHANNEL_4, GPIOC, GPIO_PIN_9);
+    _set(&_ch[6], ht16, TIM_CHANNEL_1, GPIOF, GPIO_PIN_6);
+    _set(&_ch[7], ht17, TIM_CHANNEL_1, GPIOF, GPIO_PIN_7);
+    _tbase = ht5->Instance;
 
-    _ch[0].htim = ht5;  _ch[0].hal_ch = TIM_CHANNEL_1;
-    _ch[1].htim = ht13; _ch[1].hal_ch = TIM_CHANNEL_1;   /* was TIM5 CH2 / PA1 */
-    _ch[2].htim = ht5;  _ch[2].hal_ch = TIM_CHANNEL_3;
-    _ch[3].htim = ht5;  _ch[3].hal_ch = TIM_CHANNEL_4;
-    _ch[4].htim = ht15; _ch[4].hal_ch = TIM_CHANNEL_1;
-    _ch[5].htim = ht15; _ch[5].hal_ch = TIM_CHANNEL_2;
-    _ch[6].htim = ht16; _ch[6].hal_ch = TIM_CHANNEL_1;
-    _ch[7].htim = ht17; _ch[7].hal_ch = TIM_CHANNEL_1;
+    /* Per channel: capture off, interrupt off, DMA stream on, stale flags
+     * cleared, DMA request on, capture on. Polarity (both edges), filter
+     * 0xF and the input mapping come from MX_TIMx_Init (CubeMX). */
+    for (uint8_t i = 0; i < PWM_NUM_CHANNELS; i++) {
+        PwmCh_t *c = &_ch[i];
+        TIM_TypeDef *t = c->htim->Instance;
+        pwm_edges_init(&c->dec, &cfg);
+        t->CCER &= ~c->ccxe;
+        t->DIER &= ~(c->ccxie | c->ccxde);
+        if (c->hdma == NULL ||
+            HAL_DMA_Start(c->hdma, (uint32_t)_ccr(t, c->ch), (uint32_t)_ring[i], PWM_RING_LEN) != HAL_OK) {
+            printf("PWMCapture: DMA start failed on channel %u\r\n", (unsigned)i);
+            continue;
+        }
+        t->SR = ~(c->ccxif | c->ccxof);   /* rc_w0 */
+        t->DIER |= c->ccxde;
+        t->CCER |= c->ccxe;
+    }
+    ht5->Instance->CR1  |= TIM_CR1_CEN;
+    ht8->Instance->CR1  |= TIM_CR1_CEN;
+    ht15->Instance->CR1 |= TIM_CR1_CEN;
+    ht16->Instance->CR1 |= TIM_CR1_CEN;
+    ht17->Instance->CR1 |= TIM_CR1_CEN;
+    printf("PWMCapture: DMA capture on 8 channels (both edges, ring %u), no capture interrupt\r\n",
+           (unsigned)PWM_RING_LEN);
+}
 
-    /* Input pins (tim.c, pwm_capture.h) */
-    _ch[0].port = GPIOA; _ch[0].pin = GPIO_PIN_0;
-    _ch[1].port = GPIOF; _ch[1].pin = GPIO_PIN_8;
-    _ch[2].port = GPIOA; _ch[2].pin = GPIO_PIN_2;
-    _ch[3].port = GPIOA; _ch[3].pin = GPIO_PIN_3;
-    _ch[4].port = GPIOE; _ch[4].pin = GPIO_PIN_5;
-    _ch[5].port = GPIOE; _ch[5].pin = GPIO_PIN_6;
-    _ch[6].port = GPIOF; _ch[6].pin = GPIO_PIN_6;
-    _ch[7].port = GPIOF; _ch[7].pin = GPIO_PIN_7;
+void PWMCapture_Service(void)
+{
+    uint32_t now = HAL_GetTick();
+    uint32_t wr1[PWM_NUM_CHANNELS], wr2[PWM_NUM_CHANNELS];
+    int      p1[PWM_NUM_CHANNELS], p2[PWM_NUM_CHANNELS];
+    uint8_t  todo = 0xFFu;                 /* channels still in this service */
 
-    printf("PWMCapture: resolve bits\r\n");
+    for (uint32_t k = 0; k < N_TRY && todo; k++) {
+        if (k) _wait_ticks(TRY_GAP_TICKS);
+        /* window: wr1, pin, 3 us, pin, wr2 (order matters, pwm_edges.h) */
+        for (uint8_t i = 0; i < PWM_NUM_CHANNELS; i++) if (todo & (1u << i)) wr1[i] = _wr(&_ch[i]);
+        for (uint8_t i = 0; i < PWM_NUM_CHANNELS; i++) if (todo & (1u << i)) p1[i]  = _pin(&_ch[i]);
+        _wait_ticks(WIN_TICKS);
+        for (uint8_t i = 0; i < PWM_NUM_CHANNELS; i++) if (todo & (1u << i)) p2[i]  = _pin(&_ch[i]);
+        for (uint8_t i = 0; i < PWM_NUM_CHANNELS; i++) if (todo & (1u << i)) wr2[i] = _wr(&_ch[i]);
 
-    /* Resolve ccer_bit, ccer_pol, dier_bit */
-    for (uint8_t i = 0; i < N_CHANNELS; i++) {
-        _ch[i].state = 0;
-        switch (_ch[i].hal_ch) {
-            case TIM_CHANNEL_1:
-                _ch[i].ccer_bit = TIM_CCER_CC1E;
-                _ch[i].ccer_pol = TIM_CCER_CC1P;
-                _ch[i].dier_bit = TIM_DIER_CC1IE;
-                break;
-            case TIM_CHANNEL_2:
-                _ch[i].ccer_bit = TIM_CCER_CC2E;
-                _ch[i].ccer_pol = TIM_CCER_CC2P;
-                _ch[i].dier_bit = TIM_DIER_CC2IE;
-                break;
-            case TIM_CHANNEL_3:
-                _ch[i].ccer_bit = TIM_CCER_CC3E;
-                _ch[i].ccer_pol = TIM_CCER_CC3P;
-                _ch[i].dier_bit = TIM_DIER_CC3IE;
-                break;
-            case TIM_CHANNEL_4:
-                _ch[i].ccer_bit = TIM_CCER_CC4E;
-                _ch[i].ccer_pol = TIM_CCER_CC4P;
-                _ch[i].dier_bit = TIM_DIER_CC4IE;
-                break;
-            default: break;
+        for (uint8_t i = 0; i < PWM_NUM_CHANNELS; i++) {
+            if (!(todo & (1u << i))) continue;
+            PwmCh_t *c = &_ch[i];
+            TIM_TypeDef *t = c->htim->Instance;
+            int lost = (t->SR & c->ccxof) != 0u;
+            if (lost) t->SR = ~c->ccxof;   /* rc_w0: clears only CCxOF */
+            pwm_edges_process(&c->dec, _ring[i], wr2[i], lost, now);
+            pwm_edges_anchor(&c->dec, wr1[i], wr2[i], p1[i], p2[i]);
+            c->duty = pwm_edges_duty(&c->dec, now, p2[i]);
+            if (c->dec.known) todo &= (uint8_t)~(1u << i);
         }
     }
-
-    /* ── TIM5 CH1, CH3, CH4 (CH2 / PA1 no longer used, 27/10) ─────────────
-     * Init order: channels off → input filter 0xF → CCER → CEN → SR = 0
-     *             → DIER (NVIC: main.c, after this function)
-     * Input filter 0xF set here with the channels off: tim.c (CubeMX) leaves
-     * ICFilter = 0 for TIM5. CCMR1 CH2 bits are left alone: CH2 is not an
-     * input any more (CC2S = 00), so IC2F would be the OC2 fields. */
-    ht5->Instance->DIER = 0;
-    ht5->Instance->CCER = 0;
-    ht5->Instance->CCMR1 = (ht5->Instance->CCMR1 & ~TIM_CCMR1_IC1F)
-                         | (0xFu << TIM_CCMR1_IC1F_Pos);
-    ht5->Instance->CCMR2 = (ht5->Instance->CCMR2 & ~(TIM_CCMR2_IC3F | TIM_CCMR2_IC4F))
-                         | (0xFu << TIM_CCMR2_IC3F_Pos) | (0xFu << TIM_CCMR2_IC4F_Pos);
-    ht5->Instance->CCER  = (TIM_CCER_CC1E | TIM_CCER_CC3E | TIM_CCER_CC4E);
-    ht5->Instance->CR1  |= TIM_CR1_CEN;
-    ht5->Instance->SR    = 0;
-    ht5->Instance->DIER  = (TIM_DIER_CC1IE | TIM_DIER_CC3IE | TIM_DIER_CC4IE);
-
-    printf("PWMCapture: TIM5 armed (CH1/3/4, filter 0xF, NVIC still off)\r\n");
-
-    _arm_lpwm_timer(ht13, 1u);
-    printf("PWMCapture: TIM13 armed (PF8, wheel 2 RPWM)\r\n");
-
-    /* TIM15 CH1-2, TIM16 CH1, TIM17 CH1 (LPWM wheels 1-4).
-     * Same treatment as TIM5 (H7 hang after "resolve bits", 25/10):
-     *   input filter 0xF (CubeMX left ICFilter = 0, floating/noisy pins storm),
-     *   rising edge, start counter, drop stale flags with CCxE off, then enable
-     *   interrupts. main.c enables these NVIC lines only after this function. */
-    _arm_lpwm_timer(ht15, 2u);
-    printf("PWMCapture: TIM15 armed\r\n");
-    _arm_lpwm_timer(ht16, 1u);
-    _arm_lpwm_timer(ht17, 1u);
-    printf("PWMCapture: TIM16/17 armed\r\n");
-}
-
-/* Number of capture interrupts handled since boot (debug: interrupt load). */
-uint32_t PWMCapture_GetIsrCount(void)
-{
-    return _isr_count;
-}
-
-/* Duty of one channel. Without an edge for PWM_TIMEOUT_MS the pin is held at a
- * constant level (0 % or 100 %): return that level instead of 0 (bug H7-PWM-LEVEL,
- * 22/10). The ESP32 holds the inactive BTS7960 input HIGH (motor.c motor_set).
- * 03/11 (bug H7-PWM-TICK-RACE, Liam: "Duyệt sửa"): read last_tick first and
- * HAL_GetTick() after it. Before, one 'now' was read for all 8 channels; a
- * capture ISR that ran after a SysTick increment wrote last_tick = now + 1,
- * now - last_tick wrapped to 0xFFFFFFFF and a live channel returned its pin
- * level (exactly 0 or 1) for one read, also in the frame sent to the plant
- * (PWM_CAPTURE/2026-11-03_run01, run02: mostly RR, the last wheel read). */
-static float _chan_duty(const PwmCh_t *c)
-{
-    uint32_t last = *(volatile const uint32_t *)&c->last_tick;
-    uint32_t now  = HAL_GetTick();          /* read after last: now >= last */
-    if ((now - last) < PWM_TIMEOUT_MS)
-        return c->duty;
-    return (HAL_GPIO_ReadPin(c->port, c->pin) == GPIO_PIN_SET) ? 1.0f : 0.0f;
 }
 
 void PWMCapture_GetDuty(float *duty_out)
 {
-    for (uint8_t w = 0; w < PWM_NUM_WHEELS; w++) {
-        float rpwm = _chan_duty(&_ch[w]);
-        float lpwm = _chan_duty(&_ch[w + 4]);
-        duty_out[w] = rpwm - lpwm;
-    }
+    for (uint8_t w = 0; w < PWM_NUM_WHEELS; w++)
+        duty_out[w] = _ch[w].duty - _ch[w + 4].duty;
 }
 
-void PWMCapture_IC_Callback(TIM_HandleTypeDef *htim)
+void PWMCapture_GetStats(PWMCapture_Stats_t *out)
 {
-//	printf("IC!\r\n");  // thêm tạm
-
-    _isr_count++;
-    uint32_t trig_ch = _hal_active_to_ch(htim->Channel);
-    if (trig_ch == 0xFFFFFFFFu) return;
-
-    PwmCh_t *c = NULL;
-    for (uint8_t i = 0; i < N_CHANNELS; i++) {
-        if (_ch[i].htim->Instance == htim->Instance &&
-            _ch[i].hal_ch == trig_ch) {
-            c = &_ch[i];
-            break;
-        }
-    }
-    if (!c) return;
-
-    uint32_t cap = HAL_TIM_ReadCapturedValue(htim, trig_ch);
-    c->last_tick = HAL_GetTick();
-
-    if (c->state == 0) {
-        /* WAIT_RISE: got rising edge */
-        if (c->t_rise != 0)
-            c->period = (uint16_t)(cap - (uint16_t)c->t_rise);
-        c->t_rise = cap;
-        c->state  = 1;
-        _arm(c, 1);  /* switch to falling */
-    } else {
-        /* WAIT_FALL: got falling edge */
-        c->width = (uint16_t)(cap - (uint16_t)c->t_rise);
-        c->state = 0;
-        _arm(c, 0);  /* switch to rising */
-        if (c->period > 0) {
-            float d = (float)c->width / (float)c->period;
-            if (d > 1.0f) d = 1.0f;
-            if (d < 0.0f) d = 0.0f;
-            c->duty = c->duty * 0.75f + d * 0.25f;
-        }
+    for (uint8_t i = 0; i < PWM_NUM_CHANNELS; i++) {
+        out->edges[i]      = _ch[i].dec.n_edges;
+        out->lost[i]       = _ch[i].dec.n_lost;
+        out->lap[i]        = _ch[i].dec.n_lap;
+        out->parity_fix[i] = _ch[i].dec.n_parity_fix;
+        out->known[i]      = _ch[i].dec.known;
     }
 }
