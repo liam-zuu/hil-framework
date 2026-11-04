@@ -33,7 +33,7 @@ def main(argv=None) -> int:
     ap.add_argument('--no-h7', action='store_true')
     a = ap.parse_args(argv)
     import serial  # pyserial
-    port = serial.Serial(baudrate=a.baud, timeout=0)
+    port = serial.Serial(baudrate=a.baud, timeout=0, write_timeout=0)   # read and write never wait (P15)
     port.dtr = port.rts = False      # the "UART" port has DTR/RTS auto-reset: do not touch EN/IO0
     port.port = a.port
     port.open()

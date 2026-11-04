@@ -100,7 +100,7 @@ class PanelLink:
         self.run = run
         self.clock = clock
         self.parser = pp.StreamParser(accept=(pp.START_CMD,), clock=clock)
-        self.tx = pp.TxQueue(write)
+        self.tx = pp.TxQueue(write, max_profiles=pp.PROFILE_MAX + 1)   # a whole list fits (P14)
         self.t_status = self.t_info = None
         self.last_info: Optional[bytes] = None
         self.log = []                       # (t, cmd, seq, result of on_cmd) for the operator
@@ -127,7 +127,7 @@ class PanelLink:
             r = self.sess.on_cmd(c, self._exec)
             self.log.append((now, c.cmd, c.seq, r))
             if r == 'hello':
-                self.tx.clear_profiles()
+                self.tx.clear_session()
                 self.last_info = None                # INFO of the new session at once
             self.tx.put(pp.encode_status(status_of(self.run.snapshot(), self.sess)))
             if r in ('hello', 'profiles'):

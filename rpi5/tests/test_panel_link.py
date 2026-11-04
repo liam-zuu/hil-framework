@@ -115,6 +115,25 @@ def test_empty_profile_list_is_one_frame_with_count_zero():
     assert profs and all(p.count == 0 for p in profs) and w.panel.profiles == {}
 
 
+@pytest.mark.parametrize('n', [0, 1, 64, 65, 255])
+def test_whole_profile_list_arrives_codex_p14(n):
+    w = Wire(Recorder(names=['T%d' % i for i in range(n)]))
+    w.step(100)
+    assert w.panel.profiles == {i: 'T%d' % i for i in range(n)}
+    assert w.panel.profile_count == n
+
+
+def test_new_session_does_not_send_info_of_the_old_one():
+    run = Recorder()
+    w = Wire(run)
+    w.step(30)
+    old = w.link.sess.sid
+    w.panel = pp.PanelClient(iter(range(0x500, 0x600)).__next__)       # panel reboot: new HELLO
+    w.step(30)
+    infos = [x for t, x in w.frames if isinstance(x, pp.Info) and t > w.t - 300]
+    assert w.panel.sid != old and w.panel.info is not None and infos[-1].sid == w.panel.sid
+
+
 def test_info_rate_constant_and_changing():
     run = Recorder()
     run.snap = RunSnapshot(loop_us=27)

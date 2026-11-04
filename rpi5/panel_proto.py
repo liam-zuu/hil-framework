@@ -788,8 +788,10 @@ class TxQueue:
     by a newer one. STATUS goes before PROFILE frames, also before one already taken for
     sending that has no byte out yet (B58/N16); PROFILE frames queue up to max_profiles
     (oldest dropped) and belong to one session. INFO (v6) is kept like STATUS (only the
-    newest waits) and goes after STATUS, before PROFILE; a STATUS also goes before an INFO
-    taken for sending that has no byte out yet."""
+    newest waits) and goes after STATUS, before PROFILE, also before a PROFILE taken for
+    sending that has no byte out yet (Codex P12); a STATUS also goes before an INFO taken for
+    sending that has no byte out yet. clear_session() drops what belongs to the old session
+    and has not started (PROFILE, INFO; Codex P13)."""
 
     def __init__(self, write_fn: Callable[[bytes], int], max_profiles: int = 64):
         self.write_fn = write_fn
@@ -823,6 +825,9 @@ class TxQueue:
             if self._current and self._sent == 0 and self._current[0] == START_INFO:
                 self._current = b''
                 self.dropped_info += 1
+            elif self._current and self._sent == 0 and self._current[0] == START_PROFILE:
+                self._profiles.appendleft(self._current)        # waits behind the INFO (P12)
+                self._current = b''
             if self._info is not None:
                 self.dropped_info += 1
             self._info = frame
@@ -840,6 +845,17 @@ class TxQueue:
             self.dropped_profiles += 1
         self.dropped_profiles += len(self._profiles)
         self._profiles.clear()
+
+    def clear_session(self) -> None:
+        """New session: PROFILE and INFO frames of the old one that have no byte out yet are
+        not sent (P13); a frame already started finishes. STATUS is always the newest."""
+        self.clear_profiles()
+        if self._current and self._current[0] == START_INFO and self._sent == 0:
+            self._current = b''
+            self.dropped_info += 1
+        if self._info is not None:
+            self._info = None
+            self.dropped_info += 1
 
     def pending(self) -> bool:
         return bool(self._current or self._status or self._info or self._profiles)

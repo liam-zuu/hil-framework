@@ -80,14 +80,62 @@ def test_status_goes_before_an_info_taken_but_not_started():
 
 
 def test_started_info_finishes_before_a_newer_one():
-    uart = SlowUart([10, 1000, 1000])
+    uart = SlowUart([])
     q = pp.TxQueue(uart)
     q.put(pp.encode_info(_info(loop_us=1)))
-    q.pump()                                                           # 10 bytes of it out
+    q.pump(max_bytes=10)                                               # 10 bytes of it out (P16)
+    assert q._sent == 10 and q._current[0] == pp.START_INFO
     q.put(pp.encode_info(_info(loop_us=2)))
+    q.put(pp.encode_status(pp.Status(sid=SID1)))
     while q.pending():
         q.pump()
-    assert [x.loop_us for x in frames_of(uart)] == [1, 2]
+    out = frames_of(uart)
+    assert [type(x) for x in out] == [pp.Info, pp.Status, pp.Info] and [out[0].loop_us, out[2].loop_us] == [1, 2]
+
+
+def test_info_goes_before_a_profile_taken_but_not_started_codex_p12():
+    uart = SlowUart([0, 1000, 1000, 1000])
+    q = pp.TxQueue(uart)
+    q.put(pp.encode_profile(SID1, 0, 1, 'A-L2'))
+    q.pump()                                                           # PROFILE taken, 0 bytes out
+    q.put(pp.encode_info(_info(loop_us=7)))
+    while q.pending():
+        q.pump()
+    assert [type(x) for x in frames_of(uart)] == [pp.Info, pp.Profile]
+
+
+def test_started_profile_finishes_before_info():
+    uart = SlowUart([])
+    q = pp.TxQueue(uart)
+    q.put(pp.encode_profile(SID1, 0, 1, 'A-L2'))
+    q.pump(max_bytes=5)
+    q.put(pp.encode_info(_info()))
+    while q.pending():
+        q.pump()
+    assert [type(x) for x in frames_of(uart)] == [pp.Profile, pp.Info]
+
+
+def test_clear_session_drops_old_info_and_profiles_not_started_codex_p13():
+    uart = SlowUart([0] + [1000] * 10)
+    q = pp.TxQueue(uart)
+    q.put(pp.encode_info(_info(loop_us=1)))
+    q.pump()                                                           # INFO taken, 0 bytes out
+    q.put(pp.encode_profile(SID1, 0, 1, 'A-L2'))
+    q.clear_session()
+    q.put(pp.encode_status(pp.Status(sid=SID1 + 1)))
+    while q.pending():
+        q.pump()
+    assert [type(x) for x in frames_of(uart)] == [pp.Status] and q.dropped_info == 1
+    uart = SlowUart([])
+    q = pp.TxQueue(uart)
+    q.put(pp.encode_info(_info(loop_us=2)))
+    q.pump(max_bytes=3)                                                # started: must finish
+    q.put(pp.encode_info(_info(loop_us=3)))                            # waiting: dropped
+    q.clear_session()
+    while q.pending():
+        q.pump()
+    out = frames_of(uart)
+    assert [x.loop_us for x in out] == [2]
 
 
 def test_panel_keeps_info_of_its_session_and_forgets_it_when_lost():
