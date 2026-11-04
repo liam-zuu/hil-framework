@@ -151,9 +151,13 @@ void scr_run(const PanelView &v)
     text(8, 86, phase_name(c->st.run_state), 4, col, 2);
     snprintf(s, sizeof s, "t = %u.%u s", c->st.phase_ds / 10, c->st.phase_ds % 10);
     text(8, 150, s, 4, TFT_WHITE, 2);
-    uint32_t age = c->st.data_age_ms + (uint32_t)(v.now - c->last_status_ms);
     quality_text(c->st.quality, q, sizeof q);
-    snprintf(s, sizeof s, "data age %lu ms   lost %u   %s", (unsigned long)age, c->st.lost, q);
+    if (c->st.data_age_ms == 0xFFFF) {          /* unknown or saturated on the RPi5 */
+        snprintf(s, sizeof s, "data age -   lost %u   %s", c->st.lost, q);
+    } else {
+        uint32_t age = c->st.data_age_ms + (uint32_t)(v.now - c->last_status_ms);
+        snprintf(s, sizeof s, "data age %lu ms   lost %u   %s", (unsigned long)age, c->st.lost, q);
+    }
     text(8, 214, s, 2, TFT_LIGHTGREY);
     const char *stop = c->stop_state == PP_STOP_REQUESTED ? "STOP requested" :
                        c->stop_state == PP_STOP_ACKED ? "STOP acknowledged, stopping" : nullptr;

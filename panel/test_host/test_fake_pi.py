@@ -1,35 +1,41 @@
-"""The bench fake Pi (panel/tools/fake_pi.py) driven by the C panel client over a byte loop:
-it must speak the protocol well enough for the screens to be tried (handshake, profiles,
-SELECT/START/STOP, a run ending, a fault acknowledged by STOP)."""
+"""The Pi side of the panel link (rpi5/panel_link.py: PanelLink with the FAKE run that the bench
+fake Pi uses) driven by the C panel client over a byte loop: handshake, profiles, INFO,
+SELECT/START/STOP, a run ending, a fault acknowledged by STOP, a bad test index."""
 import os
 import sys
 
 import pytest
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, '..', 'tools'))
-
 from test_panel_c import CPanelClient        # noqa: E402  (also puts rpi5/ on sys.path)
 import panel_proto as pp                     # noqa: E402
-from fake_pi import FakePi                   # noqa: E402
+from panel_link import FakeRun, PanelLink    # noqa: E402
 
 
 class Loop:
     def __init__(self, **kw):
-        self.pi = FakePi(epoch=3, run_s=2.0, **kw)
+        self.t = 0
+        self.wire = bytearray()
+        clock = lambda: self.t / 1000                                    # noqa: E731
+        self.run = FakeRun(run_s=2.0, clock=clock, **kw)
+        self.pi = PanelLink(3, self.run, self._write, clock=clock)
         self.panel = CPanelClient(iter(range(0x100, 0x200)).__next__)
         self.parser = pp.StreamParser(accept=(pp.START_STATUS, pp.START_PROFILE, pp.START_INFO),
                                       clock=lambda: self.t / 1000)
-        self.t = 0
         self.up = []
         self.st = None
+
+    def _write(self, data):
+        self.wire += data
+        return len(data)
 
     def step(self, n=1):
         for _ in range(n):
             self.t += 10
-            self.pi.feed(b''.join(self.up), self.t / 1000)
+            self.pi.feed(b''.join(self.up))
             self.up = []
-            for x in self.parser.feed(self.pi.poll(self.t / 1000)):
+            self.pi.poll()
+            data, self.wire = bytes(self.wire), bytearray()
+            for x in self.parser.feed(data):
                 if isinstance(x, pp.Status):
                     self.st = x
                     self.up += self.panel.on_status(x, self.t)
