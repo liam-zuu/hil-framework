@@ -19,7 +19,8 @@
  *     channel is read at the start of each group. pre_ns adds random
  *     preemptions before read groups. Then the overcapture flag; then process
  *     up to wr1 + anchor per window; after a lap a 60 us probe that, like the
- *     firmware, compares the write index with rd (Codex M20).
+ *     firmware, polls the write index against rd, with one last read after
+ *     the loop (Codex M20, M24).
  * Prints one JSON object: samples [t_ms, duty] per service and the counters.
  *
  *   harness [key=value ...]
@@ -41,6 +42,11 @@
  *     silent=K      capture K missing, no flag (not expected in hardware)
  *     glitch=US:NS  pin inverted for NS ns at US us (repeatable)
  *     jitter_ns=N   each PWM edge moved by a pseudo-random amount in [-N, N] ns
+ *     poll_ns=N     probe poll period (300)
+ *     probe_pre=AT_US:LEN_US   preemption of LEN us in every probe, after the
+ *                   first poll at or past AT us (Codex M24)
+ *     probe_final=0 no last index read after the probe loop (firmware before round 3)
+ *     t0_ms=N       HAL tick at the capture start (0; Codex M26)
  *     dump_caps=N   also print the first N capture times (ns)
  *     dump_reads=N  also print the pin read times (ns) of the first N services
  */
@@ -230,6 +236,9 @@ int main(int argc, char **argv)
     ns_t t_end = 0;
     uint32_t max_win = N_WIN;
     int win_shift = 1, dump_caps = 0, dump_reads = 0;
+    ns_t poll_ns = 300, probe_pre_at = 0, probe_pre_len = 0;
+    int probe_final = 1;
+    uint32_t t0_ms = 0;
 
     for (int i = 1; i < argc; i++) {
         char *a = argv[i];
@@ -255,6 +264,14 @@ int main(int argc, char **argv)
         else if (!strncmp(a, "grp_ns=", 7))     grp = atoll(a + 7);
         else if (!strncmp(a, "pre_ns=", 7))     g_pre = atoll(a + 7);
         else if (!strncmp(a, "win_shift=", 10)) win_shift = atoi(a + 10);
+        else if (!strncmp(a, "poll_ns=", 8))    poll_ns = atoll(a + 8);
+        else if (!strncmp(a, "probe_final=", 12)) probe_final = atoi(a + 12);
+        else if (!strncmp(a, "t0_ms=", 6))     t0_ms = (uint32_t)atol(a + 6);
+        else if (!strncmp(a, "probe_pre=", 10)) {
+            double at, len;
+            if (sscanf(a + 10, "%lf:%lf", &at, &len) != 2) return 2;
+            probe_pre_at = (ns_t)(at * 1e3); probe_pre_len = (ns_t)(len * 1e3);
+        }
         else if (!strncmp(a, "ring=", 5))       ring_len = atol(a + 5);
         else if (!strncmp(a, "svc_us=", 7))     svc_us = atol(a + 7);
         else if (!strncmp(a, "svc_off_ns=", 11)) svc_off = atoll(a + 11);
@@ -293,7 +310,7 @@ int main(int argc, char **argv)
 
     uint32_t *ring = calloc((size_t)ring_len, sizeof(uint32_t));
     PwmEdges_t e;
-    pwm_edges_init(&e, &cfg, 0);            /* capture started at t = 0 */
+    pwm_edges_init(&e, &cfg, t0_ms);        /* capture started at t = 0, HAL tick t0_ms (Codex M26) */
 
     long ci = 0;            /* next capture to deliver */
     long written = 0;       /* entries written into the ring */
@@ -321,7 +338,7 @@ int main(int argc, char **argv)
                 ci++; \
             }
 
-        uint32_t now_ms = (uint32_t)(t / 1000000);
+        uint32_t now_ms = t0_ms + (uint32_t)(t / 1000000);
         uint32_t nwin = pwm_edges_windows(&e, now_ms);
         if (nwin > max_win) nwin = max_win;
         uint32_t w1[N_WIN], w2[N_WIN];
@@ -366,12 +383,26 @@ int main(int argc, char **argv)
         }
         int pin_d = pc[nwin - 1];
         if (e.lap_pending) {
-            /* firmware probe: the write index moves away from rd within 60 us */
+            /* firmware probe (Codex M20, M24): poll the write index every
+             * poll_ns while less than 60 us passed; an optional preemption of
+             * probe_pre_len ns after the first poll at or past probe_pre_at;
+             * after the loop one last index read (probe_final=1, firmware
+             * since round 3) before a negative result. */
             n_probe++;
-            DELIVER(tsr + 60000);
-            int seen = (uint32_t)(written % ring_len) != e.rd;
+            ns_t tp = tsr, tq = tsr;
+            int seen = 0, pre_done = 0;
+            while (tq - tp < 60000) {
+                DELIVER(tq);
+                if ((uint32_t)(written % ring_len) != e.rd) { seen = 1; break; }
+                tq += poll_ns;
+                if (probe_pre_len > 0 && !pre_done && tq - tp >= probe_pre_at) { tq += probe_pre_len; pre_done = 1; }
+            }
+            if (!seen && probe_final) {
+                DELIVER(tq);
+                seen = (uint32_t)(written % ring_len) != e.rd;
+            }
             pwm_edges_probe_done(&e, now_ms, seen);
-            pin_d = _pin_at(tsr + 60000);
+            pin_d = _pin_at(tq);
         }
         float d = pwm_edges_duty(&e, now_ms, pin_d);
         printf("%s[%.4f,%.5f]", first ? "" : ",", (double)t / 1e6, (double)d);

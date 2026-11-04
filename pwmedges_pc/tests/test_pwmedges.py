@@ -7,7 +7,8 @@ DMA ring, and the main-loop service of pwm_capture.c (windows from
 shift + 0, 10, 20 us, shift 0 / 2.5 / 5 / 7.5 us by service while 3 windows:
 wr1, pin a, pin b, pin c, wr2 with gaps counted from the end of the previous
 read group; overcapture flag; process up to wr1; anchor; probe after every
-lap, on the write index). Model numbers are assumptions, not measurements:
+lap: polls of the write index, optional preemption, one last read after
+the loop). Model numbers are assumptions, not measurements:
 filter sampling, DMA 300 ns, read group 500 ns. Limits (Codex M9, M20 part
 two): the overcapture flag is injected (lose=K), not produced by a model of
 CCR and the DMA request; the DMA ring and its write index change together;
@@ -420,6 +421,40 @@ def test_idle_gap_wrapping_to_short_period(harness):
     assert abs(t - 119.81) < 1e-6
     assert res['n_stale'] >= 1 and res['n_bad_period'] == 0
     assert abs(d - (0.7 - 0.4 * 0.75 ** 3)) <= TOL
+
+
+def _bad_after_stall(exe, final):
+    """Codex M24: duty 0.03 runs on, main loop blocked 100-180 ms with an
+    overcapture in the stall (lap + flag: entries up to the flag read are
+    dropped), a 21 us preemption 40 us into the probe. Count service phases
+    whose first sample after the stall is not the duty."""
+    bad = 0
+    for off in range(100000, 150000, 1000):
+        res = run(exe, 'seg=0.03:300', 'stall=100:80', f'svc_off_ns={off}', 'lose=6000',
+                  'probe_pre=40:21', f'probe_final={final}')
+        s = window(res, 180, 181)
+        assert len(s) == 1 and res['n_probe'] >= 1
+        bad += abs(s[0] - 0.03) > TOL
+    return bad
+
+
+def test_probe_last_read_after_preemption(harness):
+    """Codex M24: with the last index read after the probe loop, a preemption
+    past the 60 us deadline cannot hide captures that came meanwhile; without
+    it (firmware before round 3) some phases read the pin level (0)."""
+    assert _bad_after_stall(harness, 0) > 0
+    assert _bad_after_stall(harness, 1) == 0
+
+
+def test_init_tick_not_zero(harness):
+    """Codex M26: capture started at HAL tick 1000 ms. The lap test counts from
+    the init tick: first service 0.12 ms (no stall) or 4.12 ms after the start
+    is no lap, 6.12 ms is one."""
+    res = run(harness, 'seg=0.3:100', 't0_ms=1000')
+    assert res['n_lap'] == 0
+    assert max(abs(v - 0.3) for v in window(res, 30, 100)) <= TOL
+    assert run(harness, 'seg=0.3:100', 't0_ms=1000', 'stall=0:4')['n_lap'] == 0
+    assert run(harness, 'seg=0.3:100', 't0_ms=1000', 'stall=0:6')['n_lap'] == 1
 
 
 def test_overcapture_counts_as_activity(harness):

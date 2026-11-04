@@ -264,7 +264,10 @@ int main(void)
          * type corrected by the pin anchor, bad = periods > 75 us skipped,
          * una = runs of edges with the edge type unknown >= 20 ms (duty held),
          * known = edge type known, act = DMA stream running, dmaerr = stream
-         * did not start or found stopped.
+         * did not start or found stopped, win / svc = largest anchor window
+         * and largest PWMCapture_Service() time in us over the last 2 s
+         * (Codex M23, Liam: measure on the board; window above about 7 us:
+         * revisit the window step).
          * Printed every 2 s, not every 0.5 s: the line is about 200 bytes and
          * printf blocks the main loop about 17 ms at 115200 baud (Codex M21). */
         static uint32_t _edges_last[PWM_NUM_CHANNELS];
@@ -297,6 +300,12 @@ int main(void)
                 n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%u", i ? "" : " act=", (unsigned)ps.active[i]);
             for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
                 n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%lu", i ? "," : " dmaerr=", (unsigned long)ps.dma_err[i]);
+            uint32_t win_t, svc_t;
+            PWMCapture_TakeTiming(&win_t, &svc_t);
+            if (n < (int)sizeof(pl))
+                n += snprintf(pl + n, sizeof(pl) - (size_t)n, " win=%lu.%lu svc=%lu.%lu",
+                              (unsigned long)(win_t / 10u), (unsigned long)(win_t % 10u),
+                              (unsigned long)(svc_t / 10u), (unsigned long)(svc_t % 10u));
             printf("%s\r\n", pl);
         }
         uint32_t relay_sent, relay_dropped;

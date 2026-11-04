@@ -70,4 +70,10 @@ typedef struct {
 /* Debug counters, channel order as above */
 void  PWMCapture_GetStats(PWMCapture_Stats_t *out);
 
+/* Largest anchor window (wr1 to wr2 reads) and largest PWMCapture_Service()
+ * time, in 10 MHz ticks (0.1 us), since the last call; resets both. For the
+ * board check of Codex M23 (window above about 7 us: the shift may not break
+ * a phase lock). A main-loop preemption inside the service counts in. */
+void  PWMCapture_TakeTiming(uint32_t *win_max_ticks, uint32_t *svc_max_ticks);
+
 #endif /* PWM_CAPTURE_H */

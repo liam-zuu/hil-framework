@@ -10,7 +10,9 @@
  * (..._vong2.md, Liam: "mở vòng 3, sửa và gọi codex ở phiên mới"): M14 window
  * start moves per service + unanchored counter, M15-M17 probe after every lap,
  * M18 gaps counted from the end of the previous read group, M22 a stream that
- * does not start counts in dma_err. */
+ * does not start counts in dma_err. Round 3 (..._vong3.md, Liam: "sửa M24 và
+ * M26 luôn, M13 và M23 theo khuyến nghị"): M24 last index check after the
+ * probe loop; M23 accepted, window and service time maxima for the board. */
 
 #define LAP_MS          5u   /* below the 6.5 ms counter wrap (pwm_edges.h) */
 #define STALE_MS        5u
@@ -47,6 +49,11 @@ static PwmCh_t _ch[PWM_NUM_CHANNELS];
 static uint32_t _ring[PWM_NUM_CHANNELS][PWM_RING_LEN];
 static TIM_TypeDef *_tbase;        /* 10 MHz counter used to time the windows */
 static uint32_t _svc;              /* service counter, anchor "different service" test */
+/* Largest window (wr1 group start to wr2 group end) and service time in
+ * 10 MHz ticks since the last PWMCapture_TakeTiming(): the window shift (M14)
+ * breaks a phase lock only while a window is shorter than about 3/4 of the
+ * 10 us step, i.e. about 7 us (Codex M23; Liam: measure on the board). */
+static uint16_t _win_max, _svc_max;
 
 static volatile uint32_t *_ccr(TIM_TypeDef *t, uint32_t ch)
 {
@@ -159,6 +166,7 @@ void PWMCapture_Init(TIM_HandleTypeDef *ht5,
 
 void PWMCapture_Service(void)
 {
+    uint16_t ts = _now_ticks();        /* service start, for the timing maxima (M23) */
     uint32_t now = HAL_GetTick();
     uint32_t wr1[N_WIN][PWM_NUM_CHANNELS], wr2[N_WIN][PWM_NUM_CHANNELS];
     uint8_t  pa[N_WIN][PWM_NUM_CHANNELS], pb[N_WIN][PWM_NUM_CHANNELS], pc[N_WIN][PWM_NUM_CHANNELS];
@@ -188,6 +196,7 @@ void PWMCapture_Service(void)
     uint32_t shift = (nwin == N_WIN) ? (_svc & 3u) * WIN_SHIFT_TICKS : 0u;   /* M14 */
     for (uint32_t k = 0; k < nwin; k++) {
         _wait_until(t0, shift + k * WIN_STEP_TICKS);
+        uint16_t tw = _now_ticks();
         for (uint8_t i = 0; i < PWM_NUM_CHANNELS; i++) if (_ch[i].active) wr1[k][i] = _wr(&_ch[i]);
         for (uint8_t i = 0; i < PWM_NUM_CHANNELS; i++) if (_ch[i].active) pa[k][i]  = (uint8_t)_pin(&_ch[i]);
         uint16_t ta = _now_ticks();
@@ -198,6 +207,8 @@ void PWMCapture_Service(void)
         for (uint8_t i = 0; i < PWM_NUM_CHANNELS; i++) if (_ch[i].active) pc[k][i]  = (uint8_t)_pin(&_ch[i]);
         _wait_until(ta, WR2_GAP_TICKS);
         for (uint8_t i = 0; i < PWM_NUM_CHANNELS; i++) if (_ch[i].active) wr2[k][i] = _wr(&_ch[i]);
+        uint16_t span = (uint16_t)(_now_ticks() - tw);   /* wr1 group start to wr2 group end (M23) */
+        if (span > _win_max) _win_max = span;
     }
 
     uint8_t probe = 0u;
@@ -241,10 +252,25 @@ void PWMCapture_Service(void)
         }
         for (uint8_t i = 0; i < PWM_NUM_CHANNELS; i++) {
             if (!(probe & (1u << i))) continue;
-            if (left & (1u << i)) pwm_edges_probe_done(&_ch[i].dec, now, 0);
+            /* One last look after the loop: a preemption past the deadline
+             * may have ended the loop before captures that came meanwhile
+             * were seen (Codex M24). */
+            if (left & (1u << i))
+                pwm_edges_probe_done(&_ch[i].dec, now, _wr(&_ch[i]) != _ch[i].dec.rd);
             _ch[i].duty = pwm_edges_duty(&_ch[i].dec, now, _pin(&_ch[i]));
         }
     }
+
+    uint16_t svc_ticks = (uint16_t)(_now_ticks() - ts);
+    if (svc_ticks > _svc_max) _svc_max = svc_ticks;
+}
+
+void PWMCapture_TakeTiming(uint32_t *win_max_ticks, uint32_t *svc_max_ticks)
+{
+    *win_max_ticks = _win_max;
+    *svc_max_ticks = _svc_max;
+    _win_max = 0u;
+    _svc_max = 0u;
 }
 
 void PWMCapture_GetDuty(float *duty_out)
