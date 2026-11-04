@@ -100,3 +100,24 @@ def test_panel_keeps_info_of_its_session_and_forgets_it_when_lost():
     b.sess = pp.DaemonSession(8)                                       # daemon restart: new epoch
     b.step(10)
     assert b.panel.info is None
+
+
+def test_stop_without_link_after_a_given_up_start_goes_at_stale_plus_one():
+    """Docstring rule: 'with a stale seq STOP goes out at stale + 1'. Reached when a START is
+    given up (CMD_MAX_AGE_MS) while no STATUS arrives, and STOP is pressed before the link is
+    back (no SYNC can go out without link)."""
+    b = Bench()
+    b.step(10)
+    t0 = b.t
+    b.drop_down = lambda f: b.t < t0 + 3500                           # no STATUS for 3.5 s
+    b.drop_up = lambda f: f[8] == pp.CMD_START                         # every START copy lost
+    b.press(pp.CMD_START, 1)
+    seq = b.panel.pending['seq']
+    b.step(310)                                                        # > CMD_MAX_AGE_MS
+    assert b.panel.pending is None and b.panel.stale == seq and not b.panel.link(b.t)
+    b.press(pp.CMD_STOP)
+    stops = [pp.decode(f) for f in b.up if f[8] == pp.CMD_STOP]
+    assert stops and stops[-1].seq == seq + 1
+    b.step(100)
+    assert b.panel.stop_state == 'confirmed' and b.panel.stale is None
+    assert [r[1] for r in b.ran] == [pp.CMD_STOP]

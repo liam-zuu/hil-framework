@@ -15,3 +15,8 @@ fwsim/build/
 
 # bnoemu_pc build output (rebuild with python bnoemu_pc/build_bnoemu.py)
 bnoemu_pc/build/
+
+# panel host test build output (rebuilt by panel/test_host/test_panel_c.py)
+panel/test_host/build/
+# PlatformIO build output
+panel/.pio/
