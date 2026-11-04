@@ -185,6 +185,8 @@ def main():
     ap.add_argument('--pos-loop', default=None, metavar='KP,KI',
                     help='turn on the firmware position loop (pos_ctrl.c, O1 PA3) with these gains; '
                          'the DLL must be built from firmware that has it')
+    ap.add_argument('--fw-param', action='append', default=[], metavar='NAME=VALUE',
+                    help='extra firmware parameter by name (fwsim_set_param), e.g. pos_e_win=0.005, still_on=1')
     fwsim.add_plant_imu_args(ap)
     a = ap.parse_args()
     fw_params, pos_loop = None, None
@@ -192,6 +194,9 @@ def main():
         kp, ki = (float(x) for x in a.pos_loop.split(','))
         fw_params = dict(pos_on=1, pos_kp=kp, pos_ki=ki)
         pos_loop = dict(kp=kp, ki=ki)
+    for item in a.fw_param:
+        name, val = item.split('=', 1)
+        fw_params = dict(fw_params or {}, **{name.strip(): float(val)})
     if os.path.isdir(a.out) and os.listdir(a.out):
         sys.exit(f'{a.out} already holds data: use a new folder.')
     os.makedirs(a.out, exist_ok=True)
@@ -210,8 +215,9 @@ def main():
             params = fwsim.plant_params(a)
             log = fwsim.simulate(fw, sch.setpoint, sch.Tcmd + T_LATE, params, seed=1, mode=ctrl, imu=imu,
                                  fw_params=fw_params)
-            if pos_loop:
-                pos_params = {n: v for n, v in zip(('on', 'kp', 'ki', 'v_corr_max'), fw.pos_params())}
+            if fw.pos_cols:
+                pos_params = {n: v for n, v in zip(('on', 'kp', 'ki', 'v_corr_max', 'e_win', 'e_exit',
+                                                    'still_on', 'v_still', 't_still_us'), fw.pos_params())}
             gains[ctrl] = ({ax: fw.get_adrc(i) for i, ax in enumerate(['vx', 'vy', 'wz'])} if ctrl == 'ADRC'
                            else {ax: fw.get_pid(i) for i, ax in enumerate(['vx', 'vy', 'wz'])})
             res, rows = evaluate(log, path, sch)
@@ -242,7 +248,8 @@ purpose: "feasibility of D = 0.10 m with default gains, no tuning; simulation nu
 controllers: {list(CONTROLLERS)}
 speeds_mps: {list(SPEEDS)}
 gains: {json.dumps(gains)}     # firmware defaults, read back after each run
-pos_loop: {json.dumps(pos_params)}     # position loop pos_ctrl.c (on, kp, ki, v_corr_max) read back after the last run; null = not used
+pos_loop: {json.dumps(pos_params)}     # pos_ctrl.c + standstill hold (on, kp, ki, v_corr_max, e_win, e_exit, still_on, v_still, t_still_us) read back after the last run; null = DLL without pos_ctrl.c
+fw_params: {json.dumps(fw_params)}     # parameters set by name before each run (--pos-loop, --fw-param)
 firmware:
   esp32: {json.dumps(b.get('esp32'))}
   hil_framework_dll: {json.dumps(b.get('hil_framework'))}

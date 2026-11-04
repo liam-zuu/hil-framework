@@ -55,7 +55,8 @@ IMU_COLS = ['g_valid', 'r_valid', 'wz_src', 'wz_meas', 'gz', 'yaw', 'age_g_ms', 
             'psi_reset_count', 'head_toggle_count', 'bias_updates', 'slip_eval']
 # Position loop (pos_ctrl.c, AGV feat/pos-loop, O1 PA3): only with a DLL built from firmware that has it
 POS_COLS = ['pos_on', 'pos_corr_vx', 'pos_corr_vy', 'pos_x_ref', 'pos_y_ref', 'pos_th_ref',
-            'pos_x', 'pos_y', 'pos_th', 'pos_ex_b', 'pos_ey_b', 'pos_th_src']
+            'pos_x', 'pos_y', 'pos_th', 'pos_ex_b', 'pos_ey_b', 'pos_th_src',
+            'pos_in_pos', 'still']     # (a) in-position window, (d) standstill hold (04/11)
 # Wheel-consistency slip flag (wheel_slip.c, AGV feat/wheel-slip): only with a DLL that has it
 WS_COLS = ['ws_res', 'ws_th', 'ws_eval', 'ws_flag', 'ws_on_count']
 
@@ -177,8 +178,9 @@ class FirmwareSim:
         return list(out)
 
     def pos_params(self):
-        """Position-loop parameters held by the firmware: on, kp, ki, v_corr_max."""
-        out = (ctypes.c_float * 4)()
+        """Position-loop parameters held by the firmware: on, kp, ki, v_corr_max, e_win, e_exit,
+        still_on, v_still, t_still_us."""
+        out = (ctypes.c_float * 9)()
         self.lib.fwsim_get_pos(out)
         return [round(float(v), 6) for v in out]
 

@@ -140,6 +140,12 @@ FWSIM_API int fwsim_set_param(const char *name, double v) {
     if (!strcmp(name, "pos_kp"))         { q->kp = (float)v; return 1; }
     if (!strcmp(name, "pos_ki"))         { q->ki = (float)v; return 1; }
     if (!strcmp(name, "pos_v_corr_max")) { q->v_corr_max = (float)v; return 1; }
+    if (!strcmp(name, "pos_e_win"))      { q->e_win = (float)v; return 1; }        /* (a) */
+    if (!strcmp(name, "pos_e_exit"))     { q->e_exit = (float)v; return 1; }
+    still_params_t *st = vel_ctrl_still_params();                                   /* (d) */
+    if (!strcmp(name, "still_on"))       { st->on = v != 0.0; return 1; }
+    if (!strcmp(name, "still_v"))        { st->v_still = (float)v; return 1; }
+    if (!strcmp(name, "still_t_us"))     { st->t_still_us = (int64_t)v; return 1; }
 #endif
 #if FWSIM_HAS_WS
     /* wheel slip flag (wheel_slip.c): ws_win_ticks, ws_n_min, ws_k_rel, ws_act_min, ws_t_hold_us */
@@ -168,23 +174,28 @@ FWSIM_API void fwsim_ws_last(double out[FWSIM_WS_COLS]) {
 }
 
 /* Position loop of the last tick (firmware with pos_ctrl.c; fwsim_pos_cols() = 0 without it):
- * out[0] on, 1 corr_vx, 2 corr_vy, 3 x_ref, 4 y_ref, 5 th_ref, 6 x, 7 y, 8 th, 9 ex_b, 10 ey_b, 11 th_src */
-#define FWSIM_POS_COLS 12
+ * out[0] on, 1 corr_vx, 2 corr_vy, 3 x_ref, 4 y_ref, 5 th_ref, 6 x, 7 y, 8 th, 9 ex_b, 10 ey_b, 11 th_src,
+ * 12 in_pos (a), 13 still (d) */
+#define FWSIM_POS_COLS 14
 FWSIM_API int fwsim_pos_cols(void) { return FWSIM_HAS_POS ? FWSIM_POS_COLS : 0; }
-/* out: on, kp, ki, v_corr_max as the firmware holds them (read back after a run) */
-FWSIM_API void fwsim_get_pos(float out[4]) {
+/* out: on, kp, ki, v_corr_max, e_win, e_exit, still_on, v_still, t_still_us as the firmware holds them */
+FWSIM_API void fwsim_get_pos(float out[9]) {
 #if FWSIM_HAS_POS
     const pos_params_t *q = pos_params();
+    const still_params_t *st = vel_ctrl_still_params();
     out[0] = q->on; out[1] = q->kp; out[2] = q->ki; out[3] = q->v_corr_max;
+    out[4] = q->e_win; out[5] = q->e_exit;
+    out[6] = st->on; out[7] = st->v_still; out[8] = (float)st->t_still_us;
 #else
-    out[0] = out[1] = out[2] = out[3] = 0.0f;
+    for (int i = 0; i < 9; i++) out[i] = 0.0f;
 #endif
 }
 FWSIM_API void fwsim_pos_last(double out[FWSIM_POS_COLS]) {
 #if FWSIM_HAS_POS
     const pos_out_t *p = &last_vc.pos;
     double v[FWSIM_POS_COLS] = { p->on, p->corr_vx, p->corr_vy, p->x_ref, p->y_ref, p->th_ref,
-                                 p->x, p->y, p->th, p->ex_b, p->ey_b, p->th_src };
+                                 p->x, p->y, p->th, p->ex_b, p->ey_b, p->th_src,
+                                 p->in_pos, last_vc.still };
     memcpy(out, v, sizeof(v));
 #else
     memset(out, 0, sizeof(double) * FWSIM_POS_COLS);

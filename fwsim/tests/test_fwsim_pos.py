@@ -157,3 +157,78 @@ def test_heading_wraps_without_jump(fw):
     log = fwsim.simulate(fw, sp, 2 * math.pi + 2.0, imu={}, fw_params=ON)
     for name in ('pos_x', 'pos_y', 'pos_x_ref', 'pos_y_ref'):
         assert np.abs(np.diff(col(log, name))).max() < 0.01
+
+
+# ── (a) in-position window, (d) standstill hold (Liam 04/11, CODE session: "đồng ý làm a+d") ──
+AD = dict(ON, pos_e_win=0.005, still_on=1)
+
+
+def _traction():
+    p = fwsim.MecanumParams()
+    p.ground_model = 'traction'
+    p.mu_hd = np.full(4, 0.5)
+    return p
+
+
+def test_a_d_off_by_default(fw):
+    log = fwsim.simulate(fw, const(vx=0.3), 2.0, imu={}, fw_params=ON)
+    pp = fw.pos_params()
+    assert pp[4] == 0 and pp[6] == 0                      # e_win 0, still_on 0
+    assert np.all(col(log, 'pos_in_pos') == 0) and np.all(col(log, 'still') == 0)
+
+
+@pytest.mark.parametrize('v', [0.2, 0.5, 0.8])
+def test_ladrc_completes_o1_with_a_d(fw, v):
+    """Traction plant (S01 motor dead zone and friction): LADRC + position loop hunts at standstill
+    without a, d (O1_FEAS run02, run05_diag); with a + d the O1 stop condition is met in time and
+    the hold keeps the PWM at 0."""
+    sch, path = o1.Schedule(v), o1.Path8()
+    log = fwsim.simulate(fw, sch.setpoint, sch.Tcmd + o1.T_LATE, _traction(), seed=1, mode='ADRC', imu={},
+                         fw_params=AD)
+    res, _ = o1.evaluate(log, path, sch)
+    assert res['completed']
+    held = col(log, 'still') == 1
+    assert held.any() and np.all(log['pwm'][held] == 0)
+    assert not held[log['t'] <= sch.Tcmd].any()           # never while the command runs
+    assert np.all(col(log, 'pos_corr_vx')[held] == 0) and np.all(col(log, 'pos_corr_vy')[held] == 0)
+
+
+def test_hold_waits_for_slow_and_exits_on_command(fw):
+    """Brake from 0.8 m/s: no hold while faster than v_still; hold after t_still once slow; a new
+    command releases it at once and the car moves again."""
+    sp = lambda t: (0.8, 0.0, 0.0) if t < 1.5 else ((0.0, 0.0, 0.0) if t < 4.0 else (0.3, 0.0, 0.0))  # noqa: E731
+    log = fwsim.simulate(fw, sp, 5.5, _traction(), seed=1, mode='ADRC', imu={}, fw_params=AD)
+    t, held = log['t'], col(log, 'still') == 1
+    speed = np.hypot(log['v_fw'][:, 0], log['v_fw'][:, 1])
+    t_hold = t[np.argmax(held)]
+    assert 1.5 + 0.5 <= t_hold < 4.0
+    k = np.argmax(held)
+    assert np.all(speed[k - 50:k] < 0.05)                # slow for the whole t_still before the hold
+    assert not held[(t > 4.0 + 0.011)].any()              # released by the new command
+    assert log['v_true'][t > 5.0, 0].min() > 0.2
+
+
+def test_window_only_with_zero_command(fw):
+    """(a) alone: no window while the command runs; after it stops, inside the window the loop
+    gives no correction."""
+    sp = lambda t: (0.3, 0.0, 0.0) if t < 2.0 else (0.0, 0.0, 0.0)  # noqa: E731
+    log = fwsim.simulate(fw, sp, 5.0, _traction(), seed=1, mode='PID', imu={},
+                         fw_params=dict(ON, pos_e_win=0.005))
+    t, inpos = log['t'], col(log, 'pos_in_pos') == 1
+    assert not inpos[t < 2.0].any()
+    assert inpos.any()
+    assert np.all(col(log, 'pos_corr_vx')[inpos] == 0) and np.all(col(log, 'pos_corr_vy')[inpos] == 0)
+
+
+
+def test_hold_stops_position_correction(fw):
+    """(d) alone (no window): while held the position loop gives no correction, even though the
+    estimated error after the hunting stops is several mm."""
+    sch = o1.Schedule(0.5)
+    log = fwsim.simulate(fw, sch.setpoint, sch.Tcmd + o1.T_LATE, _traction(), seed=1, mode='ADRC', imu={},
+                         fw_params=dict(ON, still_on=1))
+    held = col(log, 'still') == 1
+    assert held.any()
+    e = np.hypot(col(log, 'pos_ex_b'), col(log, 'pos_ey_b'))
+    assert e[held].max() > 0.003
+    assert np.all(col(log, 'pos_corr_vx')[held] == 0) and np.all(col(log, 'pos_corr_vy')[held] == 0)
