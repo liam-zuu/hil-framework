@@ -18,6 +18,7 @@ typedef struct {
     uint16_t           pin;
     uint32_t           n_late;     /* debug: pin already low when armed for falling */
     uint32_t           n_wide;     /* debug: width >= period at a falling capture */
+    uint32_t           n_late_rise; /* debug: pin already high when armed for rising */
 } PwmCh_t;
 
 #define N_CHANNELS 8u
@@ -179,11 +180,12 @@ uint32_t PWMCapture_GetIsrCount(void)
 }
 
 /* Missed-edge debug counters since boot, per channel (index as _ch). */
-void PWMCapture_GetMissCounts(uint32_t *late, uint32_t *wide)
+void PWMCapture_GetMissCounts(uint32_t *late, uint32_t *wide, uint32_t *late_rise)
 {
     for (uint8_t i = 0; i < N_CHANNELS; i++) {
-        late[i] = _ch[i].n_late;
-        wide[i] = _ch[i].n_wide;
+        late[i]      = _ch[i].n_late;
+        wide[i]      = _ch[i].n_wide;
+        late_rise[i] = _ch[i].n_late_rise;
     }
 }
 
@@ -251,6 +253,13 @@ void PWMCapture_IC_Callback(TIM_HandleTypeDef *htim)
         c->width = (uint16_t)(cap - (uint16_t)c->t_rise);
         c->state = 0;
         _arm(c, 0);  /* switch to rising */
+        /* Debug (04/11, Liam: "viết bộ đếm để thử giả thuyết đi"): pin already
+         * high after arming the rising edge means the rising edge may have
+         * passed before this ISR ran; the next capture is then one period late
+         * (period read as 2 periods). Idea from RL step 3, 35 us high / 15 us
+         * low on PF6 (CLAUDE_THESIS 03_CODE/docs/2026-11-04_Phan_tich_RL_buoc3_doc_cao.md).
+         * Upper bound, like n_late. */
+        if ((c->port->IDR & c->pin) != 0u) c->n_late_rise++;
         if (c->period > 0 && c->width >= c->period) c->n_wide++;   /* debug */
         if (c->period > 0) {
             float d = (float)c->width / (float)c->period;

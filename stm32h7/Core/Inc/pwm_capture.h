@@ -60,8 +60,9 @@ uint32_t PWMCapture_GetIsrCount(void);
 
 /* Debug, since boot, per channel 0..7 = RPWM FL FR RL RR, LPWM FL FR RL RR:
  * late = pin already low when armed for the falling edge (upper bound of
- * missed falling edges); wide = falling capture with width >= period.
- * Both arrays hold 8 values. */
-void  PWMCapture_GetMissCounts(uint32_t *late, uint32_t *wide);
+ * missed falling edges); wide = falling capture with width >= period;
+ * late_rise = pin already high when armed for the rising edge (upper bound
+ * of missed rising edges, 04/11). Each array holds 8 values. */
+void  PWMCapture_GetMissCounts(uint32_t *late, uint32_t *wide, uint32_t *late_rise);
 
 #endif /* PWM_CAPTURE_H */

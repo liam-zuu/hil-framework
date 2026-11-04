@@ -284,13 +284,18 @@ int main(void)
 
         /* Missed-edge debug counters since boot (03/11), channel order
          * RPWM FL FR RL RR, LPWM FL FR RL RR (pwm_capture.h). */
-        uint32_t miss_late[8], miss_wide[8];
-        PWMCapture_GetMissCounts(miss_late, miss_wide);
+        uint32_t miss_late[8], miss_wide[8], miss_rise[8];
+        PWMCapture_GetMissCounts(miss_late, miss_wide, miss_rise);
         printf("PWMmiss: late=%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu wide=%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\r\n",
                (unsigned long)miss_late[0], (unsigned long)miss_late[1], (unsigned long)miss_late[2], (unsigned long)miss_late[3],
                (unsigned long)miss_late[4], (unsigned long)miss_late[5], (unsigned long)miss_late[6], (unsigned long)miss_late[7],
                (unsigned long)miss_wide[0], (unsigned long)miss_wide[1], (unsigned long)miss_wide[2], (unsigned long)miss_wide[3],
                (unsigned long)miss_wide[4], (unsigned long)miss_wide[5], (unsigned long)miss_wide[6], (unsigned long)miss_wide[7]);
+        /* Missed rising edges (04/11), same channel order; separate line so
+         * the PWMmiss line format of run07 stays the same. */
+        printf("PWMrise: late_rise=%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\r\n",
+               (unsigned long)miss_rise[0], (unsigned long)miss_rise[1], (unsigned long)miss_rise[2], (unsigned long)miss_rise[3],
+               (unsigned long)miss_rise[4], (unsigned long)miss_rise[5], (unsigned long)miss_rise[6], (unsigned long)miss_rise[7]);
         uint32_t relay_sent, relay_dropped;
         UartRelay_GetStats(&relay_sent, &relay_dropped);
         printf("Relay: sent=%lu dropped=%lu  traj vx=%.2f vy=%.2f wz=%.2f\r\n",
