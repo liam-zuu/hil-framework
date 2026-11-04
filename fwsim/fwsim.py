@@ -56,6 +56,8 @@ IMU_COLS = ['g_valid', 'r_valid', 'wz_src', 'wz_meas', 'gz', 'yaw', 'age_g_ms', 
 # Position loop (pos_ctrl.c, AGV feat/pos-loop, O1 PA3): only with a DLL built from firmware that has it
 POS_COLS = ['pos_on', 'pos_corr_vx', 'pos_corr_vy', 'pos_x_ref', 'pos_y_ref', 'pos_th_ref',
             'pos_x', 'pos_y', 'pos_th', 'pos_ex_b', 'pos_ey_b', 'pos_th_src']
+# Wheel-consistency slip flag (wheel_slip.c, AGV feat/wheel-slip): only with a DLL that has it
+WS_COLS = ['ws_res', 'ws_th', 'ws_eval', 'ws_flag', 'ws_on_count']
 
 
 class FirmwareSim:
@@ -99,6 +101,14 @@ class FirmwareSim:
             self.pos_cols = 0
         if self.pos_cols not in (0, len(POS_COLS)):
             sys.exit('fwsim.dll position-loop columns mismatch: rebuild with build_fwsim.py')
+        try:                                   # older DLLs have no wheel-slip entry points
+            L.fwsim_ws_cols.restype = ctypes.c_int
+            L.fwsim_ws_last.argtypes = [ctypes.POINTER(ctypes.c_double)]
+            self.ws_cols = L.fwsim_ws_cols()
+        except AttributeError:
+            self.ws_cols = 0
+        if self.ws_cols not in (0, len(WS_COLS)):
+            sys.exit('fwsim.dll wheel-slip columns mismatch: rebuild with build_fwsim.py')
         self._counts = (ctypes.c_int32 * 4)()
         self._sp = (ctypes.c_float * 3)()
         self._duty = (ctypes.c_double * 4)()
@@ -158,6 +168,12 @@ class FirmwareSim:
         """Position-loop columns of the last tick (POS_COLS); only when pos_cols > 0."""
         out = (ctypes.c_double * len(POS_COLS))()
         self.lib.fwsim_pos_last(out)
+        return list(out)
+
+    def ws_last(self):
+        """Wheel-slip columns of the last tick (WS_COLS); only when ws_cols > 0."""
+        out = (ctypes.c_double * len(WS_COLS))()
+        self.lib.fwsim_ws_last(out)
         return list(out)
 
     def pos_params(self):
@@ -276,6 +292,8 @@ def simulate(fw, setpoint, duration, params=None, seed=0, sp_rate_hz=50.0, pcnt_
                            'count', 'tick', 'dpwm', 'sat', 'imu', 'r_true', 'inj']}
     if fw.pos_cols:
         log['pos'] = []
+    if fw.ws_cols:
+        log['ws'] = []
 
     for k in range(n_plant + 1):
         t_us = k * 1000
@@ -309,6 +327,8 @@ def simulate(fw, setpoint, duration, params=None, seed=0, sp_rate_hz=50.0, pcnt_
             log['imu'].append(fw.imu_last())
             if fw.pos_cols:
                 log['pos'].append(fw.pos_last())
+            if fw.ws_cols:
+                log['ws'].append(fw.ws_last())
             log['r_true'].append((p.H_fwd @ x[6:10])[2] - x[5])     # wz from wheels - body wz
             log['inj'].append(bool(inj is not None and inj.active(t_us * 1e-6)))
         if k == n_plant:
@@ -404,6 +424,9 @@ def write_run(out, log, met, fw, args_dict, params):
     if len(log.get('pos', [])):                # position loop columns (firmware with pos_ctrl.c)
         cols += POS_COLS
         data = np.column_stack([data, log['pos']])
+    if len(log.get('ws', [])):                 # wheel slip flag columns (firmware with wheel_slip.c)
+        cols += WS_COLS
+        data = np.column_stack([data, log['ws']])
     np.savetxt(os.path.join(out, 'log.csv'), data, delimiter=',', header=','.join(cols), comments='', fmt='%.6g')
     with open(os.path.join(out, 'metrics.json'), 'w') as f:
         json.dump(met, f, indent=2)

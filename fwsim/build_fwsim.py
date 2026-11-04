@@ -19,7 +19,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 FW_SOURCES = ['encoder/encoder.c', 'motor/motor.c', 'kinematics/kinematics.c',
               'controller/pid.c', 'controller/adrc.c', 'controller/imu_fusion.c',
               'controller/heading.c', 'controller/vel_ctrl.c']
-FW_OPTIONAL = ['controller/pos_ctrl.c']   # position loop (AGV feat/pos-loop, O1 PA3): only if the tree has it
+FW_OPTIONAL = ['controller/pos_ctrl.c',    # position loop (AGV feat/pos-loop, O1 PA3): only if the tree has it
+               'controller/wheel_slip.c']  # wheel-consistency slip flag (AGV feat/wheel-slip): same
 FW_INCLUDES = ['motor', 'encoder', 'kinematics', 'controller', 'imu']
 
 

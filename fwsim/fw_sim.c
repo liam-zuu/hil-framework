@@ -30,6 +30,12 @@
 #else
 #define FWSIM_HAS_POS 0
 #endif
+/* Firmware with the wheel-consistency slip flag (AGV feat/wheel-slip, 04/11): optional too. */
+#if __has_include("wheel_slip.h")
+#define FWSIM_HAS_WS 1
+#else
+#define FWSIM_HAS_WS 0
+#endif
 
 #define FWSIM_API __declspec(dllexport)
 #define FWSIM_ABI 5
@@ -135,7 +141,30 @@ FWSIM_API int fwsim_set_param(const char *name, double v) {
     if (!strcmp(name, "pos_ki"))         { q->ki = (float)v; return 1; }
     if (!strcmp(name, "pos_v_corr_max")) { q->v_corr_max = (float)v; return 1; }
 #endif
+#if FWSIM_HAS_WS
+    /* wheel slip flag (wheel_slip.c): ws_win_ticks, ws_n_min, ws_k_rel, ws_act_min, ws_t_hold_us */
+    wheel_slip_params_t *w = wheel_slip_params();
+    if (!strcmp(name, "ws_win_ticks")) { w->win_ticks = (uint16_t)v; return 1; }
+    if (!strcmp(name, "ws_n_min"))     { w->n_min = (float)v; return 1; }
+    if (!strcmp(name, "ws_k_rel"))     { w->k_rel = (float)v; return 1; }
+    if (!strcmp(name, "ws_act_min"))   { w->act_min = (float)v; return 1; }
+    if (!strcmp(name, "ws_t_hold_us")) { w->t_hold_us = (int64_t)v; return 1; }
+#endif
     return 0;
+}
+
+/* Wheel slip flag of the last tick (fwsim_ws_cols() = 0 without wheel_slip.c):
+ * out[0] res, 1 th, 2 eval, 3 flag, 4 on_count */
+#define FWSIM_WS_COLS 5
+FWSIM_API int fwsim_ws_cols(void) { return FWSIM_HAS_WS ? FWSIM_WS_COLS : 0; }
+FWSIM_API void fwsim_ws_last(double out[FWSIM_WS_COLS]) {
+#if FWSIM_HAS_WS
+    const wheel_slip_out_t *s = &last_vc.wslip;
+    double v[FWSIM_WS_COLS] = { s->res, s->th, s->eval, s->flag, s->on_count };
+    memcpy(out, v, sizeof(v));
+#else
+    memset(out, 0, sizeof(double) * FWSIM_WS_COLS);
+#endif
 }
 
 /* Position loop of the last tick (firmware with pos_ctrl.c; fwsim_pos_cols() = 0 without it):
