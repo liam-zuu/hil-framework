@@ -26,20 +26,33 @@
  * than max_period is not a PWM period (a gap between two bursts, or a pulse
  * the filter dropped): it is skipped and counted (Codex M2).
  * No edge for timeout_ms: the output is the pin level (bug H7-PWM-LEVEL).
+ * Edges keep coming but the edge type stays unknown for unanchored_ms: the
+ * duty is held at its last value, so this is counted (n_unanchored, once per
+ * run of unknown, the run ends when the edge type becomes known; Codex M14).
  *
  * Use from the main loop, per service (svc = a counter that changes every service):
  *   n = pwm_edges_windows(e, now_ms)   (largest over the channels sharing the windows)
- *   take n windows 7 us apart on one time base: wr1, pin a, pin b, pin c, wr2,
- *   pins 1.5 us apart, wr2 read >= 3 us after pin a;
+ *   take n windows on one time base (pwm_capture.c): wr1, pin a, pin b, pin c, wr2.
+ *     Each read group waits a minimum time counted from the END of the group
+ *     it depends on (pin b >= 1.2 us after pin a, pin c >= 1.2 us after pin b,
+ *     wr2 >= 3.5 us after pin a), so a late or preempted read cannot squeeze a
+ *     window (Codex M18). While 3 windows are taken, their start moves by
+ *     0, 2.5, 5, 7.5 us from one service to the next, so a PWM pattern locked
+ *     to the service cannot keep an edge in every window (Codex M14);
  *   lost = overcapture flag; if set: clear it, read the write index again (wr3),
  *          pwm_edges_process(e, ring, wr3, 1, now_ms) and no anchor this service;
  *   else per window k: pwm_edges_process(e, ring, wr1[k], 0, now_ms);
  *                      pwm_edges_anchor(e, svc, now_ms, wr1[k], wr2[k], a, b, c);
- *   if e->lap_pending: watch the write index for one PWM period or more;
- *          a new capture means the input is still active: pwm_edges_mark_active();
+ *   if e->lap_pending: watch the write index for one PWM period or more, then
+ *          pwm_edges_probe_done(e, now_ms, seen) whatever the result (Codex M16);
  *   duty = pwm_edges_duty(e, now_ms, pin);
  * Only entries up to wr1 (taken before the window) are read, so the newest
  * entries are at least the window length old (Codex M7).
+ * After a service gap of lap_ms or more, neither the ring entries nor a
+ * pending overcapture flag say when the input last moved, so only the probe
+ * does (Codex M3, M15, M17). An input that stopped during the gap and shows no
+ * capture in the probe reads its pin level at once, up to timeout_ms earlier
+ * than without the gap: the pin does hold that level (M17 part two, accepted).
  * Capture values are taken mod 65536 (16-bit counters; TIM5 runs with ARR 65535).
  */
 
@@ -52,6 +65,7 @@ typedef struct {
     uint32_t timeout_ms;   /* no edge this long: output the pin level */
     uint32_t max_period;   /* ticks; a longer rising-to-rising time is not a PWM period */
     uint32_t verify_ms;    /* while known: ask for the full window set this often */
+    uint32_t unanchored_ms;/* edges but edge type unknown this long: count n_unanchored */
 } PwmEdgesCfg_t;
 
 typedef struct {
@@ -63,7 +77,8 @@ typedef struct {
     uint8_t  cand_valid;   /* !known: 'level' was set by an anchor of service cand_svc */
     uint8_t  have_rise;    /* t_rise valid (and level known when it was taken) */
     uint8_t  have_fall;    /* t_fall valid, after t_rise */
-    uint8_t  lap_pending;  /* last service dropped the ring after a gap; activity not yet seen */
+    uint8_t  lap_pending;  /* this service dropped the ring after a gap: probe for activity */
+    uint8_t  una_run;      /* 0 none, 1 edges read while unknown since una_start_ms, 2 counted; 0 again once known */
     uint16_t t_rise;
     uint16_t t_fall;
     uint32_t cand_svc;
@@ -71,6 +86,7 @@ typedef struct {
     uint32_t last_edge_ms; /* service that read the last edge */
     uint32_t edge_svc_lo;  /* service before that one: the last edge came after it */
     uint32_t verified_ms;  /* last agreeing anchor while known */
+    uint32_t una_start_ms; /* first service of the current run of unknown with edges */
     float    duty;
     /* debug counters since init */
     uint32_t n_edges;      /* ring entries read */
@@ -81,6 +97,7 @@ typedef struct {
     uint32_t n_stale;      /* open period dropped after stale_ms without edges */
     uint32_t n_bad_period; /* rising-to-rising longer than max_period, skipped */
     uint32_t n_cand_retry; /* !known: two anchors disagreed, candidate replaced */
+    uint32_t n_unanchored; /* runs of unknown with edges reaching unanchored_ms */
 } PwmEdges_t;
 
 /* now_ms: time the capture was started (a gap before the first service counts as a lap) */
@@ -95,8 +112,10 @@ void  pwm_edges_process(PwmEdges_t *e, const volatile uint32_t *ring, uint32_t w
 void  pwm_edges_anchor(PwmEdges_t *e, uint32_t svc, uint32_t now_ms,
                        uint32_t wr1, uint32_t wr2, int pin_a, int pin_b, int pin_c);
 
-/* After a lap: a capture arrived after the drop, so the input is active now */
-void  pwm_edges_mark_active(PwmEdges_t *e, uint32_t now_ms);
+/* End of the probe after a lap (call it whatever the result). seen != 0: a
+ * capture arrived after the drop, so the input is active now; else the last
+ * edge keeps its old age. */
+void  pwm_edges_probe_done(PwmEdges_t *e, uint32_t now_ms, int seen);
 
 /* Anchor windows this channel wants in this service: 3 while the edge type is
  * unknown or a check is due, else 1 */

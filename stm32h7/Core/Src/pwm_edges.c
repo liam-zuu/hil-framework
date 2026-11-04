@@ -42,16 +42,20 @@ void pwm_edges_process(PwmEdges_t *e, const volatile uint32_t *ring, uint32_t wr
         if (lap)  e->n_lap++;
         if (lost) e->n_lost++;
         /* Edge types can no longer be counted through: skip to the write
-         * index and wait for new anchors. After a lap the entries are of
-         * unknown age, so they do not count as activity (M3); an overcapture
-         * means a capture just happened. */
-        if (lost) {
+         * index and wait for new anchors. */
+        if (lap) {
+            /* After a gap of lap_ms or more the entries are of unknown age
+             * (M3), an overcapture flag may be as old as the gap (M17), and
+             * the index may have come back to rd after whole laps (M15): no
+             * activity is inferred, the caller always probes. */
+            e->lap_pending = 1u;
+        } else {
+            /* Overcapture flag set since the last service, less than lap_ms
+             * ago: a capture happened in that time. */
             e->any_edge = 1u;
             e->last_edge_ms = now_ms;
             e->edge_svc_lo = prev_svc;
             e->lap_pending = 0u;
-        } else if (e->rd != wr) {
-            e->lap_pending = 1u;
         }
         e->rd = wr;
         _unknown(e);
@@ -101,6 +105,21 @@ void pwm_edges_process(PwmEdges_t *e, const volatile uint32_t *ring, uint32_t wr
     e->any_edge = 1u;
     e->last_edge_ms = now_ms;
     e->edge_svc_lo = prev_svc;
+
+    /* Edges keep coming while the edge type stays unknown: the duty is held,
+     * count it once per run (M14: a pattern that never lets an anchor pass
+     * would otherwise hold the duty with no counter moving). A run ends when
+     * the edge type becomes known (a quiet input anchors at once). */
+    if (e->known) {
+        e->una_run = 0u;
+    } else if (!e->una_run) {
+        e->una_run = 1u;
+        e->una_start_ms = now_ms;
+    } else if (e->una_run == 1u &&
+               (uint32_t)(now_ms - e->una_start_ms) >= e->cfg.unanchored_ms) {
+        e->n_unanchored++;
+        e->una_run = 2u;
+    }
 }
 
 void pwm_edges_anchor(PwmEdges_t *e, uint32_t svc, uint32_t now_ms,
@@ -133,6 +152,7 @@ void pwm_edges_anchor(PwmEdges_t *e, uint32_t svc, uint32_t now_ms,
         e->level = pin;
     } else if (e->level == pin) {             /* second service agrees: known */
         e->known = 1u;
+        e->una_run = 0u;
         e->verified_ms = now_ms;
         _drop_open_period(e);
     } else {                                  /* second service disagrees: new candidate */
@@ -142,12 +162,14 @@ void pwm_edges_anchor(PwmEdges_t *e, uint32_t svc, uint32_t now_ms,
     }
 }
 
-void pwm_edges_mark_active(PwmEdges_t *e, uint32_t now_ms)
+void pwm_edges_probe_done(PwmEdges_t *e, uint32_t now_ms, int seen)
 {
-    e->any_edge = 1u;
-    e->last_edge_ms = now_ms;
-    e->edge_svc_lo = now_ms;
-    e->lap_pending = 0u;
+    e->lap_pending = 0u;                      /* a probe with no capture also ends it (M16) */
+    if (seen) {
+        e->any_edge = 1u;
+        e->last_edge_ms = now_ms;
+        e->edge_svc_lo = now_ms;
+    }
 }
 
 uint32_t pwm_edges_windows(const PwmEdges_t *e, uint32_t now_ms)

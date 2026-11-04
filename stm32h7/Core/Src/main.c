@@ -262,33 +262,43 @@ int main(void)
          * channel with 20 kHz PWM, 0 when held), lost = overcapture flags,
          * lap = service gaps >= 5 ms (ring dropped, FL channel), fix = edge
          * type corrected by the pin anchor, bad = periods > 75 us skipped,
+         * una = runs of edges with the edge type unknown >= 20 ms (duty held),
          * known = edge type known, act = DMA stream running, dmaerr = stream
-         * found stopped. */
+         * did not start or found stopped.
+         * Printed every 2 s, not every 0.5 s: the line is about 200 bytes and
+         * printf blocks the main loop about 17 ms at 115200 baud (Codex M21). */
         static uint32_t _edges_last[PWM_NUM_CHANNELS];
-        PWMCapture_Stats_t ps;
-        PWMCapture_GetStats(&ps);
-        char pl[320];
-        int n = snprintf(pl, sizeof(pl), "PWMdma: e/s=");
-        for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++) {
-            n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%lu", i ? "," : "",
-                          (unsigned long)((ps.edges[i] - _edges_last[i]) * 2u));
-            _edges_last[i] = ps.edges[i];
+        static uint32_t _pwm_dbg_ms = 0;
+        uint32_t pwm_el = HAL_GetTick() - _pwm_dbg_ms;
+        if (pwm_el >= 2000u) {
+            _pwm_dbg_ms += pwm_el;
+            PWMCapture_Stats_t ps;
+            PWMCapture_GetStats(&ps);
+            char pl[320];
+            int n = snprintf(pl, sizeof(pl), "PWMdma: e/s=");
+            for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++) {
+                n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%lu", i ? "," : "",
+                              (unsigned long)((uint64_t)(ps.edges[i] - _edges_last[i]) * 1000u / pwm_el));
+                _edges_last[i] = ps.edges[i];
+            }
+            for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
+                n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%lu", i ? "," : " lost=", (unsigned long)ps.lost[i]);
+            if (n < (int)sizeof(pl))
+                n += snprintf(pl + n, sizeof(pl) - (size_t)n, " lap=%lu", (unsigned long)ps.lap[0]);
+            for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
+                n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%lu", i ? "," : " fix=", (unsigned long)ps.parity_fix[i]);
+            for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
+                n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%lu", i ? "," : " bad=", (unsigned long)ps.bad_period[i]);
+            for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
+                n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%lu", i ? "," : " una=", (unsigned long)ps.unanchored[i]);
+            for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
+                n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%u", i ? "" : " known=", (unsigned)ps.known[i]);
+            for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
+                n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%u", i ? "" : " act=", (unsigned)ps.active[i]);
+            for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
+                n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%lu", i ? "," : " dmaerr=", (unsigned long)ps.dma_err[i]);
+            printf("%s\r\n", pl);
         }
-        for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
-            n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%lu", i ? "," : " lost=", (unsigned long)ps.lost[i]);
-        if (n < (int)sizeof(pl))
-            n += snprintf(pl + n, sizeof(pl) - (size_t)n, " lap=%lu", (unsigned long)ps.lap[0]);
-        for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
-            n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%lu", i ? "," : " fix=", (unsigned long)ps.parity_fix[i]);
-        for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
-            n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%lu", i ? "," : " bad=", (unsigned long)ps.bad_period[i]);
-        for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
-            n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%u", i ? "" : " known=", (unsigned)ps.known[i]);
-        for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
-            n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%u", i ? "" : " act=", (unsigned)ps.active[i]);
-        for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
-            n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%lu", i ? "," : " dmaerr=", (unsigned long)ps.dma_err[i]);
-        printf("%s\r\n", pl);
         uint32_t relay_sent, relay_dropped;
         UartRelay_GetStats(&relay_sent, &relay_dropped);
         printf("Relay: sent=%lu dropped=%lu  traj vx=%.2f vy=%.2f wz=%.2f\r\n",

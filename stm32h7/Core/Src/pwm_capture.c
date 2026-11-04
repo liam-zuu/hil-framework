@@ -6,15 +6,22 @@
 /* HAL side of the DMA capture (see pwm_capture.h); the decoding is in
  * pwm_edges.c, tested on the PC (pwmedges_pc). Codex Sol round 1 (04/11,
  * CLAUDE_THESIS 03_CODE/docs/review/2026-11-04_Review_H7_PWM_DMA_vong1.md):
- * fixes M1-M4, M6, M7, M10, M12 (Liam: "Duyệt sửa cả 9"). */
+ * fixes M1-M4, M6, M7, M10, M12 (Liam: "Duyệt sửa cả 9"). Round 2
+ * (..._vong2.md, Liam: "mở vòng 3, sửa và gọi codex ở phiên mới"): M14 window
+ * start moves per service + unanchored counter, M15-M17 probe after every lap,
+ * M18 gaps counted from the end of the previous read group, M22 a stream that
+ * does not start counts in dma_err. */
 
 #define LAP_MS          5u   /* below the 6.5 ms counter wrap (pwm_edges.h) */
 #define STALE_MS        5u
 #define MAX_PERIOD    750u   /* ticks, 75 us = 1.5 x the 20 kHz period (M2) */
 #define VERIFY_MS      10u   /* while known: full window set this often (M1) */
-#define WIN_STEP_TICKS 70u   /* window starts 7 us apart, absolute on TIM5 CNT (M10) */
-#define PIN_B_TICKS    17u   /* pin reads at 0, 1.7 us, 3.5 us in a window (M1) */
-#define PIN_C_TICKS    35u   /* 3.5 us: > input filter (about 1.07 us) + DMA, also for the last channel read */
+#define UNANCHORED_MS  20u   /* edges but edge type unknown this long: counted (M14) */
+#define WIN_STEP_TICKS 100u  /* window starts 10 us apart, from one TIM5 CNT reading (M10) */
+#define WIN_SHIFT_TICKS 25u  /* 3 windows: start + (service mod 4) x 2.5 us, breaks a phase lock (M14) */
+#define PIN_GAP_TICKS   12u  /* pin b >= 1.2 us after the END of the pin a reads, pin c after pin b:
+                                one glitch the input filter drops (< 1.07 us) covers one read only (M1, M18) */
+#define WR2_GAP_TICKS   35u  /* wr2 >= 3.5 us after the END of the pin a reads: > input filter + DMA (M7, M18) */
 #define PROBE_TICKS   600u   /* after a lap: look 60 us (> one 50 us period) for a new capture (M3) */
 #define N_WIN           3u
 
@@ -30,7 +37,7 @@ typedef struct {
     GPIO_TypeDef      *port;
     uint16_t           pin;
     uint8_t            active;     /* DMA stream started and still enabled (M6) */
-    uint32_t           dma_err;    /* stream found disabled while active */
+    uint32_t           dma_err;    /* stream did not start at init, or found disabled while active (M6, M22) */
     PwmEdges_t         dec;
     float              duty;
 } PwmCh_t;
@@ -102,7 +109,8 @@ void PWMCapture_Init(TIM_HandleTypeDef *ht5,
                      TIM_HandleTypeDef *ht16,
                      TIM_HandleTypeDef *ht17)
 {
-    const PwmEdgesCfg_t cfg = { PWM_RING_LEN, LAP_MS, STALE_MS, PWM_TIMEOUT_MS, MAX_PERIOD, VERIFY_MS };
+    const PwmEdgesCfg_t cfg = { PWM_RING_LEN, LAP_MS, STALE_MS, PWM_TIMEOUT_MS, MAX_PERIOD, VERIFY_MS,
+                                UNANCHORED_MS };
     unsigned n_active = 0;
 
     memset(_ch, 0, sizeof(_ch));
@@ -121,7 +129,7 @@ void PWMCapture_Init(TIM_HandleTypeDef *ht5,
      * cleared, DMA request on, capture on. Polarity (both edges), filter
      * 0xF and the input mapping come from MX_TIMx_Init (CubeMX). A channel
      * whose stream does not start stays inactive: never read, duty = pin
-     * level, counted in the boot line (M6). */
+     * level, counted in the boot line (M6) and in dma_err (M22). */
     for (uint8_t i = 0; i < PWM_NUM_CHANNELS; i++) {
         PwmCh_t *c = &_ch[i];
         TIM_TypeDef *t = c->htim->Instance;
@@ -131,6 +139,7 @@ void PWMCapture_Init(TIM_HandleTypeDef *ht5,
         if (c->hdma == NULL ||
             HAL_DMA_Start(c->hdma, (uint32_t)_ccr(t, c->ch), (uint32_t)_ring[i], PWM_RING_LEN) != HAL_OK) {
             printf("PWMCapture: DMA start FAILED on channel %u\r\n", (unsigned)i);
+            c->dma_err++;
             continue;
         }
         t->SR = ~(c->ccxif | c->ccxof);   /* rc_w0 */
@@ -168,18 +177,26 @@ void PWMCapture_Service(void)
         if (w > nwin) nwin = w;
     }
 
-    /* Windows first, at absolute times on the 10 MHz base (M10):
-     * wr1, pin a (0), pin b (1.7 us), pin c (3.5 us), wr2 */
+    /* Windows first (M10): window k starts at shift + k x 10 us after one
+     * reading of the 10 MHz base (at once if that time has passed). Inside a
+     * window each wait is counted from the END of the read group it depends
+     * on, so a preemption or a late start only makes a gap longer (M18):
+     *   wr1 | pin a | >= 1.2 us | pin b | >= 1.2 us | pin c | wr2 >= 3.5 us after pin a.
+     * Per channel the read of one group comes after the end of the group
+     * before it, so these are lower bounds for every channel. */
     uint16_t t0 = _now_ticks();
+    uint32_t shift = (nwin == N_WIN) ? (_svc & 3u) * WIN_SHIFT_TICKS : 0u;   /* M14 */
     for (uint32_t k = 0; k < nwin; k++) {
-        uint32_t base = k * WIN_STEP_TICKS;
-        _wait_until(t0, base);
+        _wait_until(t0, shift + k * WIN_STEP_TICKS);
         for (uint8_t i = 0; i < PWM_NUM_CHANNELS; i++) if (_ch[i].active) wr1[k][i] = _wr(&_ch[i]);
         for (uint8_t i = 0; i < PWM_NUM_CHANNELS; i++) if (_ch[i].active) pa[k][i]  = (uint8_t)_pin(&_ch[i]);
-        _wait_until(t0, base + PIN_B_TICKS);
+        uint16_t ta = _now_ticks();
+        _wait_until(ta, PIN_GAP_TICKS);
         for (uint8_t i = 0; i < PWM_NUM_CHANNELS; i++) if (_ch[i].active) pb[k][i]  = (uint8_t)_pin(&_ch[i]);
-        _wait_until(t0, base + PIN_C_TICKS);
+        uint16_t tb = _now_ticks();
+        _wait_until(tb, PIN_GAP_TICKS);
         for (uint8_t i = 0; i < PWM_NUM_CHANNELS; i++) if (_ch[i].active) pc[k][i]  = (uint8_t)_pin(&_ch[i]);
+        _wait_until(ta, WR2_GAP_TICKS);
         for (uint8_t i = 0; i < PWM_NUM_CHANNELS; i++) if (_ch[i].active) wr2[k][i] = _wr(&_ch[i]);
     }
 
@@ -205,9 +222,11 @@ void PWMCapture_Service(void)
         c->duty = pwm_edges_duty(&c->dec, now, pc[nwin - 1u][i]);
     }
 
-    /* After a lap (M3): a channel counts as active only if a new capture
-     * arrives within one PWM period or more; otherwise its last edge keeps
-     * its old age and the 50 ms timeout runs as before. */
+    /* After every lap (M3, M15): a channel counts as active only if a new
+     * capture arrives within one PWM period or more (the write index moves
+     * away from rd; this also sees an entry written after wr1 of the last
+     * window); otherwise its last edge keeps its old age and the 50 ms
+     * timeout runs as before. Either way the probe ends here (M16). */
     if (probe) {
         uint16_t p0 = _now_ticks();
         uint8_t left = probe;
@@ -215,13 +234,16 @@ void PWMCapture_Service(void)
             for (uint8_t i = 0; i < PWM_NUM_CHANNELS; i++) {
                 if (!(left & (1u << i))) continue;
                 if (_wr(&_ch[i]) != _ch[i].dec.rd) {
-                    pwm_edges_mark_active(&_ch[i].dec, now);
+                    pwm_edges_probe_done(&_ch[i].dec, now, 1);
                     left &= (uint8_t)~(1u << i);
                 }
             }
         }
-        for (uint8_t i = 0; i < PWM_NUM_CHANNELS; i++)
-            if (probe & (1u << i)) _ch[i].duty = pwm_edges_duty(&_ch[i].dec, now, _pin(&_ch[i]));
+        for (uint8_t i = 0; i < PWM_NUM_CHANNELS; i++) {
+            if (!(probe & (1u << i))) continue;
+            if (left & (1u << i)) pwm_edges_probe_done(&_ch[i].dec, now, 0);
+            _ch[i].duty = pwm_edges_duty(&_ch[i].dec, now, _pin(&_ch[i]));
+        }
     }
 }
 
@@ -240,6 +262,7 @@ void PWMCapture_GetStats(PWMCapture_Stats_t *out)
         out->parity_fix[i] = _ch[i].dec.n_parity_fix;
         out->bad_period[i] = _ch[i].dec.n_bad_period;
         out->dma_err[i]    = _ch[i].dma_err;
+        out->unanchored[i] = _ch[i].dec.n_unanchored;
         out->active[i]     = _ch[i].active;
         out->known[i]      = _ch[i].dec.known;
     }
