@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <TFT_eSPI.h>
+#include <esp_heap_caps.h>
 
 #include "pins.h"
 
@@ -69,7 +70,7 @@ void text(int x, int y, const char *s, uint8_t font, uint16_t fg, uint8_t size =
 
 void health_bar(const PanelView &v)
 {
-    const pp_client_t *c = v.c;
+    const pp_client_t *c = v.a->c;
     bool link = c->sid && pp_client_link(c, v.now);
     g->fillRect(0, 0, W, BAR, TFT_DARKGREY);
     text(8, 10, "RPi5", 2, TFT_WHITE);
@@ -92,24 +93,24 @@ void health_bar(const PanelView &v)
 void footer(const PanelView &v)
 {
     g->drawFastHLine(0, FOOT, W, TFT_DARKGREY);
-    text(8, FOOT + 8, v.msg, 2, TFT_LIGHTGREY);
+    text(8, FOOT + 8, v.a->msg, 2, TFT_LIGHTGREY);
 }
 
 void scr_nolink(const PanelView &v)
 {
     text(40, 90, "NO LINK", 4, TFT_YELLOW, 2);
-    text(40, 160, v.c->sid ? "no STATUS from the RPi5" : "waiting for the RPi5 daemon", 4, TFT_WHITE);
-    if (v.c->stop.active)
+    text(40, 160, v.a->c->sid ? "no STATUS from the RPi5" : "waiting for the RPi5 daemon", 4, TFT_WHITE);
+    if (v.a->c->stop.active)
         text(40, 210, "STOP pending (resending)", 4, TFT_RED);
 }
 
 void scr_home(const PanelView &v)
 {
-    const pp_client_t *c = v.c;
+    const pp_client_t *c = v.a->c;
     char s[48];
     ctrl_text(c, s, sizeof s);
     text(8, 46, s, 4, TFT_CYAN);
-    bool ready = ui_ready(v);
+    bool ready = app_ready(v.a, v.now);
     text(330, 46, ready ? "READY" : "NOT READY", 4, ready ? TFT_GREEN : TFT_YELLOW);
     int n = c->has_profile_count ? c->profile_count : 0;
     if (!n) {
@@ -117,13 +118,13 @@ void scr_home(const PanelView &v)
         return;
     }
     const int rows = 6, row_h = 30, y0 = 90;
-    int first = v.cursor - rows / 2;
+    int first = v.a->cursor - rows / 2;
     if (first > n - rows) first = n - rows;
     if (first < 0) first = 0;
     for (int r = 0; r < rows && first + r < n; r++) {
         int i = first + r;
         int y = y0 + r * row_h;
-        bool cur = i == v.cursor;
+        bool cur = i == v.a->cursor;
         if (cur)
             g->fillRect(0, y - 2, W, row_h, TFT_NAVY);
         bool sel = c->has_st && c->st.profile == i;
@@ -134,7 +135,7 @@ void scr_home(const PanelView &v)
 
 void title_line(const PanelView &v)
 {
-    const pp_client_t *c = v.c;
+    const pp_client_t *c = v.a->c;
     char s[64], ct[40];
     ctrl_text(c, ct, sizeof ct);
     snprintf(s, sizeof s, "%s  |  %s", c->st.profile == PP_PROFILE_NONE ? "-" : ui_profile_name(c, c->st.profile),
@@ -144,7 +145,7 @@ void title_line(const PanelView &v)
 
 void scr_run(const PanelView &v)
 {
-    const pp_client_t *c = v.c;
+    const pp_client_t *c = v.a->c;
     char s[112], q[48];
     title_line(v);
     uint16_t col = c->st.run_state == PP_ST_STOPPING ? TFT_YELLOW : TFT_GREEN;
@@ -167,7 +168,7 @@ void scr_run(const PanelView &v)
 
 void scr_result(const PanelView &v)
 {
-    const pp_client_t *c = v.c;
+    const pp_client_t *c = v.a->c;
     char s[112], q[48];
     title_line(v);
     const char *out = c->st.outcome == PP_OUT_COMPLETED ? "COMPLETED" :
@@ -176,12 +177,13 @@ void scr_result(const PanelView &v)
     uint16_t col = c->st.outcome == PP_OUT_COMPLETED ? TFT_GREEN :
                    c->st.outcome == PP_OUT_USER_STOP ? TFT_YELLOW : TFT_RED;
     text(8, 82, out, 4, col, 2);
-    if (c->has_info && (c->info.flags & PP_I_RESULT_VALID)) {
+    if (app_result_fresh(v.a)) {                /* P7: only lines of this generation */
         for (int k = 0; k < PP_RESULT_LINES; k++)
             if (c->info.result[k][0])
                 text(8, 144 + 30 * k, c->info.result[k], 4, TFT_WHITE);
     } else {
-        text(8, 144, "no result lines", 4, TFT_LIGHTGREY);
+        text(8, 144, c->st.outcome == PP_OUT_COMPLETED ? "waiting for result..." : "no result lines", 4,
+             TFT_LIGHTGREY);
     }
     quality_text(c->st.quality, q, sizeof q);
     snprintf(s, sizeof s, "lost %u   %s      STOP: back   START: run again", c->st.lost, q);
@@ -190,7 +192,7 @@ void scr_result(const PanelView &v)
 
 void scr_fault(const PanelView &v)
 {
-    const pp_client_t *c = v.c;
+    const pp_client_t *c = v.a->c;
     char s[48];
     g->fillRect(0, BAR, W, FOOT - BAR, TFT_MAROON);
     text(8, 50, "FAULT", 4, TFT_WHITE, 2);
@@ -209,27 +211,7 @@ const char *ui_profile_name(const pp_client_t *c, int i)
     return "?";
 }
 
-bool ui_ready(const PanelView &v)
-{
-    const pp_client_t *c = v.c;
-    return c->sid && pp_client_link(c, v.now) && c->has_st && (c->st.links & PP_L_H7);
-}
-
-Screen ui_screen(const PanelView &v)
-{
-    const pp_client_t *c = v.c;
-    if (!c->sid || !c->has_st || !pp_client_link(c, v.now))
-        return SCR_NOLINK;
-    if (c->st.run_state == PP_ST_ERROR)
-        return SCR_FAULT;
-    if (PP_ST_IS_ACTIVE(c->st.run_state))
-        return SCR_RUN;
-    if (c->st.run_state == PP_ST_END && !v.result_dismissed)
-        return SCR_RESULT;
-    return SCR_HOME;
-}
-
-void ui_begin(void)
+const char *ui_begin(void)
 {
     pinMode(PIN_TFT_BL, OUTPUT);
     digitalWrite(PIN_TFT_BL, HIGH);
@@ -237,18 +219,25 @@ void ui_begin(void)
     g_tft.setRotation(1);                       /* landscape 480x320 */
     g_tft.fillScreen(TFT_BLACK);
     g_spr.setColorDepth(16);
-    g_spr_ok = g_spr.createSprite(W, H) != nullptr;   /* ~300 KB: in PSRAM */
+    size_t ps_before = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    g_spr_ok = g_spr.createSprite(W, H) != nullptr;   /* ~300 KB: meant for PSRAM */
+    size_t ps_after = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     g = g_spr_ok ? (TFT_eSPI *)&g_spr : &g_tft;
+    if (!g_spr_ok)
+        return "no sprite: direct drawing (flicker)";
+    return ps_before - ps_after >= (size_t)W * H * 2 ? "sprite in PSRAM" : "sprite in internal RAM";
 }
 
 uint32_t ui_signature(const PanelView &v)
 {
-    const pp_client_t *c = v.c;
+    const pp_client_t *c = v.a->c;
     uint32_t h = 2166136261u;
-    Screen s = ui_screen(v);
+    app_screen_t s = app_screen(v.a, v.now);
     h = fnv(h, &s, sizeof s);
-    h = fnv(h, &v.cursor, sizeof v.cursor);
-    h = fnv(h, v.msg, strlen(v.msg));
+    h = fnv(h, &v.a->cursor, sizeof v.a->cursor);
+    h = fnv(h, v.a->msg, strlen(v.a->msg));
+    bool fresh = app_result_fresh(v.a);
+    h = fnv(h, &fresh, sizeof fresh);
     h = fnv(h, &c->stop_state, sizeof c->stop_state);
     h = fnv(h, &c->profiles_have, sizeof c->profiles_have);
     bool link = c->sid && pp_client_link(c, v.now);
@@ -276,12 +265,12 @@ void ui_draw(const PanelView &v)
 {
     g->fillScreen(TFT_BLACK);
     health_bar(v);
-    switch (ui_screen(v)) {
-    case SCR_NOLINK: scr_nolink(v); break;
-    case SCR_HOME:   scr_home(v); break;
-    case SCR_RUN:    scr_run(v); break;
-    case SCR_RESULT: scr_result(v); break;
-    case SCR_FAULT:  scr_fault(v); break;
+    switch (app_screen(v.a, v.now)) {
+    case APP_SCR_NOLINK: scr_nolink(v); break;
+    case APP_SCR_HOME:   scr_home(v); break;
+    case APP_SCR_RUN:    scr_run(v); break;
+    case APP_SCR_RESULT: scr_result(v); break;
+    case APP_SCR_FAULT:  scr_fault(v); break;
     }
     footer(v);
     if (g_spr_ok)

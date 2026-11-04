@@ -28,6 +28,7 @@ import test_panel_proto as tpp      # noqa: E402
 import test_panel_proto_v6 as tv6   # noqa: E402
 
 LIB_DIR = os.path.join(ROOT, 'panel', 'lib', 'panel_proto')
+APP_DIR = os.path.join(ROOT, 'panel', 'lib', 'panel_app')
 BUILD = os.path.join(HERE, 'build')
 
 
@@ -35,8 +36,8 @@ def _build():
     os.makedirs(BUILD, exist_ok=True)
     out = os.path.join(BUILD, 'panel_proto_host' + ('.dll' if os.name == 'nt' else '.so'))
     cmd = ['gcc', '-std=c99', '-O1', '-Wall', '-Wextra', '-Werror', '-shared', '-fPIC',
-           '-I', LIB_DIR, os.path.join(LIB_DIR, 'panel_proto.c'), os.path.join(HERE, 'pp_host.c'),
-           '-o', out]
+           '-I', LIB_DIR, '-I', APP_DIR, os.path.join(LIB_DIR, 'panel_proto.c'),
+           os.path.join(APP_DIR, 'panel_app.c'), os.path.join(HERE, 'pp_host.c'), '-o', out]
     subprocess.run(cmd, check=True)
     return ct.CDLL(out)
 

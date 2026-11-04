@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "panel_app.h"
 #include "panel_proto.h"
 
 pp_client_t *pp_host_client_new(pp_nonce_fn nonce, pp_send_fn send)
@@ -74,3 +75,15 @@ void pp_host_parser_counts(const pp_parser_t *p, uint32_t out[3])
     out[1] = p->skipped_bytes;
     out[2] = p->stale_drops;
 }
+
+app_t *app_host_new(pp_client_t *c)
+{
+    app_t *a = (app_t *)calloc(1, sizeof *a);
+    app_init(a, c);
+    return a;
+}
+
+void app_host_free(app_t *a) { free(a); }
+int app_host_cursor(const app_t *a) { return a->cursor; }
+const char *app_host_msg(const app_t *a) { return a->msg; }
+uint32_t app_host_gen(const app_t *a) { return a->gen; }

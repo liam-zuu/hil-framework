@@ -2,13 +2,15 @@
 #pragma once
 #include <stdint.h>
 
-enum {
-    BTN_EV_NAV      = 1 << 0,   /* NAV short press (on release): next item */
-    BTN_EV_NAV_BACK = 1 << 1,   /* NAV held >= NAV_HOLD_MS, then every NAV_REPEAT_MS: previous item */
-    BTN_EV_SELECT   = 1 << 2,
-    BTN_EV_START    = 1 << 3,
-    BTN_EV_STOP     = 1 << 4,
-};
+#include "panel_app.h"
+
+/* NAV short press (on release): next item; NAV held >= NAV_HOLD_MS, then every NAV_REPEAT_MS:
+ * previous item. Same bits as APP_EV_* (panel_app.h). */
+#define BTN_EV_NAV      APP_EV_NAV
+#define BTN_EV_NAV_BACK APP_EV_NAV_BACK
+#define BTN_EV_SELECT   APP_EV_SELECT
+#define BTN_EV_START    APP_EV_START
+#define BTN_EV_STOP     APP_EV_STOP
 
 #define BTN_DEBOUNCE_MS   30u   /* [ĐỀ XUẤT] */
 #define NAV_HOLD_MS      600u   /* [ĐỀ XUẤT] */
