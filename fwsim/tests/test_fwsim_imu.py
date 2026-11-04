@@ -282,9 +282,11 @@ def test_injection_above_threshold(fw):
 
 
 def test_injection_below_threshold(fw):
-    """Residual about 0.5 r_th: the flag stays off (threshold check, not sensitivity to real slip)."""
+    """Residual about 0.5 r_th: the flag stays off (threshold check, not sensitivity to real slip).
+    Velocity loop alone: on the rigid plant (no 4-wheel constraint) the position loop's mm/s
+    corrections move wz_enc, and with them the residual (ratio 0.298 with it, 0.377 without, 05/11)."""
     inj = GyroInjection(t0=2.0, t_inj=1.0, s=0.03)
-    log = fwsim.simulate(fw, const(wz=1.0), 5.0, imu=dict(injection=inj))
+    log = fwsim.simulate(fw, const(wz=1.0), 5.0, imu=dict(injection=inj), fw_params=fwsim.vel_loop_only(fw))
     t = log['t']
     r = np.abs(col(log, 'r')[(t > 2.3) & (t < 2.9)])
     assert 0.3 < r.mean() / col(log, 'r_th')[-1] < 0.7

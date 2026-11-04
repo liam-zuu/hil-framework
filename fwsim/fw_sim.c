@@ -50,6 +50,7 @@ static imu_data_t imu;              /* what imu.cpp keeps in g_data */
 static int imu_on;                  /* 0: no imu_get() copy yet (vel_ctrl gets NULL) */
 static int run_active = 1, wheels_lifted;
 static int imu_fail;                /* imu_init() failed at boot: g_imu_fail in main.c */
+static int block[4];                /* obstacle blocked fwd, bwd, left, right (main.c s_*_blocked) */
 
 FWSIM_API int fwsim_abi(void) { return FWSIM_ABI; }
 /* After a tick: encoder_get_count() per wheel and the vel_ctrl metric counters
@@ -76,6 +77,7 @@ FWSIM_API void fwsim_reset(int pcnt_mode) {
     run_active = 1;
     wheels_lifted = 0;
     imu_fail = 0;
+    for (int i = 0; i < 4; i++) block[i] = 0;
     motor_init();
     encoder_init();
     vel_ctrl_init();
@@ -147,6 +149,13 @@ FWSIM_API int fwsim_set_param(const char *name, double v) {
     if (!strcmp(name, "still_v"))        { st->v_still = (float)v; return 1; }
     if (!strcmp(name, "still_t_us"))     { st->t_still_us = (int64_t)v; return 1; }
 #endif
+#ifdef VEL_CTRL_HAS_BLOCK
+    /* obstacle blocked directions as main.c s_*_blocked (Codex P1, 05/11); cleared by fwsim_reset */
+    if (!strcmp(name, "block_fwd"))   { block[0] = v != 0.0; return 1; }
+    if (!strcmp(name, "block_bwd"))   { block[1] = v != 0.0; return 1; }
+    if (!strcmp(name, "block_left"))  { block[2] = v != 0.0; return 1; }
+    if (!strcmp(name, "block_right")) { block[3] = v != 0.0; return 1; }
+#endif
 #if FWSIM_HAS_WS
     /* wheel slip flag (wheel_slip.c): ws_win_ticks, ws_n_min, ws_k_rel, ws_act_min, ws_t_hold_us */
     wheel_slip_params_t *w = wheel_slip_params();
@@ -175,8 +184,8 @@ FWSIM_API void fwsim_ws_last(double out[FWSIM_WS_COLS]) {
 
 /* Position loop of the last tick (firmware with pos_ctrl.c; fwsim_pos_cols() = 0 without it):
  * out[0] on, 1 corr_vx, 2 corr_vy, 3 x_ref, 4 y_ref, 5 th_ref, 6 x, 7 y, 8 th, 9 ex_b, 10 ey_b, 11 th_src,
- * 12 in_pos (a), 13 still (d) */
-#define FWSIM_POS_COLS 14
+ * 12 in_pos (a), 13 still (d), 14 pos_reset_n, 15 run_active (05/11, Codex P6; 0 with older firmware) */
+#define FWSIM_POS_COLS 16
 FWSIM_API int fwsim_pos_cols(void) { return FWSIM_HAS_POS ? FWSIM_POS_COLS : 0; }
 /* out: on, kp, ki, v_corr_max, e_win, e_exit, still_on, v_still, t_still_us as the firmware holds them */
 FWSIM_API void fwsim_get_pos(float out[9]) {
@@ -195,7 +204,17 @@ FWSIM_API void fwsim_pos_last(double out[FWSIM_POS_COLS]) {
     const pos_out_t *p = &last_vc.pos;
     double v[FWSIM_POS_COLS] = { p->on, p->corr_vx, p->corr_vy, p->x_ref, p->y_ref, p->th_ref,
                                  p->x, p->y, p->th, p->ex_b, p->ey_b, p->th_src,
-                                 p->in_pos, last_vc.still };
+                                 p->in_pos, last_vc.still,
+#ifdef POS_CTRL_HAS_RESET_N
+                                 p->reset_n,
+#else
+                                 0,
+#endif
+#ifdef VEL_CTRL_HAS_BLOCK
+                                 last_vc.run_active };
+#else
+                                 0 };
+#endif
     memcpy(out, v, sizeof(v));
 #else
     memset(out, 0, sizeof(double) * FWSIM_POS_COLS);
@@ -260,7 +279,11 @@ FWSIM_API void fwsim_get_adrc(int axis, float out[4]) {
 FWSIM_API int fwsim_tick(int64_t t_us, const int32_t counts[4], const float sp[3],
                          double duty[4], float actual[3], int pwm[4], float rpm[4]) {
     fw_time_us = t_us;
-    for (int i = 0; i < 4; i++) { fw_pcnt_add(i, counts[i] - count_in[i]); count_in[i] = counts[i]; }
+    /* modulo 2^32 difference, then signed: no int32 overflow across the wrap (Codex P9, 05/11) */
+    for (int i = 0; i < 4; i++) {
+        fw_pcnt_add(i, (int32_t)((uint32_t)counts[i] - (uint32_t)count_in[i]));
+        count_in[i] = counts[i];
+    }
 
     /* encoder_task */
     float enc_rpm[4];
@@ -285,11 +308,21 @@ FWSIM_API int fwsim_tick(int64_t t_us, const int32_t counts[4], const float sp[3
         .motor_on = on,
         .run_active = on && run_active,
         .wheels_lifted = wheels_lifted,
+#ifdef VEL_CTRL_HAS_BLOCK
+        .block_fwd = block[0], .block_bwd = block[1], .block_left = block[2], .block_right = block[3],
+#endif
     };
     for (int i = 0; i < 4; i++) { in.enc_rpm[i] = enc_rpm[i]; in.enc_count[i] = enc_count[i]; }
     vel_ctrl_out_t vc = vel_ctrl_step(&in);
     if (on) {
-        /* main.c: motor_set() then vel_ctrl_applied() with the PWM applied (no obstacle cutoff here) */
+        /* main.c: motor_set() then vel_ctrl_applied() with the PWM applied. Hard cutoff of main.c
+         * (obstacle_enabled): with a blocked direction, PWM 0 when v_cmd goes that way (the intent
+         * part of main.c is the same test on the original command, which vel_ctrl already clamps) */
+#ifdef VEL_CTRL_HAS_BLOCK
+        if ((block[0] && (sp[0] > 0.0f || vc.v_cmd.vx > 0.0f)) || (block[1] && (sp[0] < 0.0f || vc.v_cmd.vx < 0.0f)) ||
+            (block[2] && (sp[1] > 0.0f || vc.v_cmd.vy > 0.0f)) || (block[3] && (sp[1] < 0.0f || vc.v_cmd.vy < 0.0f)))
+            for (int i = 0; i < 4; i++) vc.pwm[i] = 0;
+#endif
         for (int i = 0; i < 4; i++) motor_set((motor_id_t)i, vc.pwm[i]);
         vel_ctrl_applied(vc.pwm, &vc);
     } else {

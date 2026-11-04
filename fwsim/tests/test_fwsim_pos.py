@@ -156,17 +156,142 @@ def test_run_restart_resets_poses(fw):
     fw.set_run(False, False)
     fw.tick(101 * fwsim.FW_DT_US, [0, 0, 0, 0], (0.0, 0.0, 0.0))
     assert fw.pos_last()[P['pos_corr_vx']] == 0.0
+    n0 = fw.pos_last()[P['pos_reset_n']]
+    assert fw.pos_last()[P['run_active']] == 0
     fw.set_run(True, False)
     fw.tick(102 * fwsim.FW_DT_US, [0, 0, 0, 0], (0.3, 0.0, 0.0))
     assert fw.pos_last()[P['pos_x_ref']] == pytest.approx(0.003, abs=1e-4)
+    assert fw.pos_last()[P['pos_reset_n']] == n0 + 1 and fw.pos_last()[P['run_active']] == 1   # Codex P6
 
 
 def test_heading_wraps_without_jump(fw):
-    """Two full turns in place then a straight leg: theta estimate wraps, no pose jump."""
+    """Two full turns in place then a straight leg: theta estimate wraps, no pose jump; the angle
+    stays in [-pi, pi] and its wrapped step is small (Codex P16)."""
     sp = lambda t: (0.0, 0.0, 2.0) if t < 2 * math.pi else (0.3, 0.0, 0.0)  # noqa: E731
     log = fwsim.simulate(fw, sp, 2 * math.pi + 2.0, imu={}, fw_params=ON)
     for name in ('pos_x', 'pos_y', 'pos_x_ref', 'pos_y_ref'):
         assert np.abs(np.diff(col(log, name))).max() < 0.01
+    for name in ('pos_th', 'pos_th_ref'):
+        th = col(log, name)
+        assert np.abs(th).max() <= math.pi + 1e-6
+        # pos_th follows the 20 Hz yaw: steps of 2 rad/s x 50 ms = 0.1 rad between reports
+        assert np.abs(np.angle(np.exp(1j * np.diff(th)))).max() < 0.15
+        assert (np.abs(np.diff(th)) > math.pi).any()                     # it did wrap
+
+
+# ── Fixes after Codex round 1 (05/11, Liam: "Duyệt theo khuyến nghị") ─────────────────────────
+class _Ticks:
+    """Direct firmware ticks: command sp, all four wheels driven at wheel_v [m/s] (counts)."""
+    def __init__(self, fw, **params):
+        fw.reset()
+        for k, v in params.items():
+            fw.set_param(k, v)
+        fw.set_run(True, False)
+        self.fw, self.k, self.n = fw, 0, 0.0
+        self.per_mps = fwsim.FW_DT_US * 1e-6 / fwsim.MecanumParams().r * fwsim.COUNTS_PER_REV / (2 * math.pi)
+
+    def step(self, sp, wheel_v=0.0, n=1):
+        for _ in range(n):
+            self.k += 1
+            self.n += wheel_v * self.per_mps
+            c = int(math.floor(self.n))
+            out = self.fw.tick(self.k * fwsim.FW_DT_US, [c, c, c, c], sp)
+        return self.fw.pos_last(), out
+
+
+def _err(p):
+    return math.hypot(p[P['pos_ex_b']], p[P['pos_ey_b']])
+
+
+def test_block_stops_correction_toward_obstacle(fw):
+    """P1: command 0 with the estimate behind the command pose; front blocked: no forward
+    correction, and the integral does not grow while blocked (same output after unblocking)."""
+    t = _Ticks(fw, pos_e_win=0.0, still_on=0)
+    t.step((0.1, 0.0, 0.0), n=50)                       # wheels stuck: about 5 cm behind
+    free, _ = t.step((0.0, 0.0, 0.0))
+    assert free[P['pos_corr_vx']] > 0.1
+    fw.set_param('block_fwd', 1)
+    for _ in range(50):
+        p, _ = t.step((0.0, 0.0, 0.0))
+        assert p[P['pos_corr_vx']] == 0.0
+    fw.set_param('block_fwd', 0)
+    p, _ = t.step((0.0, 0.0, 0.0))
+    assert p[P['pos_corr_vx']] == pytest.approx(free[P['pos_corr_vx']], abs=0.002)
+
+
+def test_block_other_direction_still_corrects(fw):
+    """P1: only the blocked direction is cut: back blocked, the forward correction stays."""
+    t = _Ticks(fw, pos_e_win=0.0, still_on=0)
+    t.step((0.1, 0.0, 0.0), n=50)
+    fw.set_param('block_bwd', 1)
+    p, _ = t.step((0.0, 0.0, 0.0))
+    assert p[P['pos_corr_vx']] > 0.1
+
+
+def test_yaw_dropouts_keep_imu_offset(fw):
+    """P2: yaw drifts 0.1 rad/s away from the plant (the encoders do not see it) and drops out
+    twice for 0.5 s. While the heading loop runs, theta = psi_imu + the same offset each time:
+    the offset is not reset on every return of the yaw, only when psi0 changes."""
+    def hook(t, kind, v):
+        if kind == 'rv' and (1.0 <= t < 1.5 or 2.0 <= t < 2.5):
+            return None
+        return v + math.degrees(0.1 * t) if kind == 'rv' else v
+    log = fwsim.simulate(fw, const(vx=0.3), 3.5, imu=dict(hook=hook), fw_params=ON)
+    head_on = log['imu'][:, fwsim.IMU_COLS.index('head_on')] == 1
+    psi_imu = log['imu'][:, fwsim.IMU_COLS.index('psi_imu')]
+    assert (np.diff(head_on.astype(int)) == 1).sum() >= 3           # on at start + after each gap
+    sel = head_on & (log['t'] > 0.5)
+    d = np.angle(np.exp(1j * (col(log, 'pos_th') - psi_imu)))
+    assert np.ptp(d[sel]) < 1e-4
+
+
+def test_integral_cleared_in_window(fw):
+    """P5: the integral built while catching up is cleared in the (a) window, so a new small
+    command right after starts with the proportional part only."""
+    t = _Ticks(fw, still_on=0)
+    t.step((0.05, 0.0, 0.0), n=50)                      # 2.5 cm behind, unsaturated
+    for _ in range(300):                                # wheels catch up, command 0
+        p, _ = t.step((0.0, 0.0, 0.0), wheel_v=0.05)
+        if p[P['pos_in_pos']] == 1:
+            break
+    assert p[P['pos_in_pos']] == 1
+    p, _ = t.step((0.01, 0.0, 0.0))
+    assert p[P['pos_corr_vx']] == pytest.approx(6.0 * p[P['pos_ex_b']], abs=0.003)
+
+
+def test_integral_acts_below_saturation(fw):
+    """P16: unsaturated, the output is Kp e + Ki integral on both axes (dropping the integral
+    would give Kp e only)."""
+    t = _Ticks(fw, pos_e_win=0.0, still_on=0)
+    p, _ = t.step((0.02, 0.02, 0.0), n=100)             # error grows to 2 cm per axis, integral 0.01 m s
+    for ax, e in (('pos_corr_vx', 'pos_ex_b'), ('pos_corr_vy', 'pos_ey_b')):
+        assert p[P[ax]] < 0.5
+        assert p[P[ax]] > 6.0 * p[P[e]] + 0.5 * 3.0 * 0.01
+
+
+def test_window_hysteresis(fw):
+    """P16: the (a) window is entered below e_win = 5 mm only, kept between 5 and 10 mm, left
+    above e_exit = 10 mm."""
+    t = _Ticks(fw, still_on=0)
+    t.step((0.008, 0.0, 0.0), n=100)                    # 8 mm behind
+    for _ in range(20):
+        p, _ = t.step((0.0, 0.0, 0.0))
+        assert p[P['pos_in_pos']] == 0                  # 8 mm: not entered
+    for _ in range(300):
+        p, _ = t.step((0.0, 0.0, 0.0), wheel_v=0.01)
+        if p[P['pos_in_pos']] == 1:
+            break
+    assert p[P['pos_in_pos']] == 1 and _err(p) < 0.005
+    seen_mid = False
+    for _ in range(400):                                # back away slowly
+        p, _ = t.step((0.0, 0.0, 0.0), wheel_v=-0.01)
+        e = _err(p)
+        if e <= 0.0098:
+            assert p[P['pos_in_pos']] == 1
+            seen_mid |= e > 0.0055
+        if p[P['pos_in_pos']] == 0:
+            break
+    assert seen_mid and p[P['pos_in_pos']] == 0 and _err(p) > 0.010
 
 
 # ── (a) in-position window, (d) standstill hold (Liam 04/11, CODE session: "đồng ý làm a+d") ──

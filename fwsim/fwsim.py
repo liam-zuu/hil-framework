@@ -56,7 +56,8 @@ IMU_COLS = ['g_valid', 'r_valid', 'wz_src', 'wz_meas', 'gz', 'yaw', 'age_g_ms', 
 # Position loop (pos_ctrl.c, AGV feat/pos-loop, O1 PA3): only with a DLL built from firmware that has it
 POS_COLS = ['pos_on', 'pos_corr_vx', 'pos_corr_vy', 'pos_x_ref', 'pos_y_ref', 'pos_th_ref',
             'pos_x', 'pos_y', 'pos_th', 'pos_ex_b', 'pos_ey_b', 'pos_th_src',
-            'pos_in_pos', 'still']     # (a) in-position window, (d) standstill hold (04/11)
+            'pos_in_pos', 'still',     # (a) in-position window, (d) standstill hold (04/11)
+            'pos_reset_n', 'run_active']   # 05/11 (Codex P6); 0 with firmware before them
 # The firmware turns the loop, (a) and (d) ON by default since 04/11 (Liam, CODE session:
 # "làm cách 1 ban khuyến nghị đi"). Velocity-loop-only runs pass vel_loop_only(fw) as fw_params.
 VEL_LOOP_ONLY = dict(pos_on=0, pos_e_win=0.0, still_on=0)
