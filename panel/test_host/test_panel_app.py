@@ -19,8 +19,19 @@ lib.app_host_gen.restype, lib.app_host_gen.argtypes = ct.c_uint32, [ct.c_void_p]
 lib.app_update.restype, lib.app_update.argtypes = None, [ct.c_void_p, ct.c_uint32]
 lib.app_screen.restype, lib.app_screen.argtypes = ct.c_int, [ct.c_void_p, ct.c_uint32]
 lib.app_buttons.restype, lib.app_buttons.argtypes = None, [ct.c_void_p, ct.c_uint8, ct.c_uint32]
-lib.app_drawn.restype, lib.app_drawn.argtypes = None, [ct.c_void_p, ct.c_int, ct.c_uint8]
 lib.app_result_fresh.restype, lib.app_result_fresh.argtypes = ct.c_bool, [ct.c_void_p]
+lib.app_result.restype, lib.app_result.argtypes = ct.c_int, [ct.c_void_p]
+
+
+class AppView(ct.Structure):
+    _fields_ = [('screen', ct.c_int), ('cursor', ct.c_uint8), ('sid', ct.c_uint32),
+                ('profiles_gen', ct.c_uint32), ('result_profile', ct.c_uint8)]
+
+
+lib.app_view.restype, lib.app_view.argtypes = AppView, [ct.c_void_p, ct.c_uint32]
+lib.app_drawn.restype, lib.app_drawn.argtypes = None, [ct.c_void_p, ct.POINTER(AppView)]
+lib.app_drawing.restype, lib.app_drawing.argtypes = None, [ct.c_void_p]
+NOT_VERIFIED, WAITING, FRESH = range(3)
 
 NAV, NAV_BACK, SELECT, START, STOP = 1, 2, 4, 8, 16
 NOLINK, HOME, RUN, RESULT, FAULT = range(5)
@@ -66,14 +77,28 @@ class AppBench:
             self._send_up()
             self.link.poll()
 
-    def draw(self):
-        lib.app_drawn(self.app, lib.app_screen(self.app, self.t), lib.app_host_cursor(self.app))
+    def view(self):
+        return lib.app_view(self.app, self.t)               # what a drawing started now shows
+
+    def draw(self, view=None):
+        v = self.view() if view is None else view
+        lib.app_drawn(self.app, ct.byref(v))
 
     def press(self, ev):
+        """returns the frames the press made, then sends them up"""
         self.panel._out = []
         lib.app_buttons(self.app, ev, self.t)
         lib.app_update(self.app, self.t)
+        out = list(self.panel._out)
         self._send_up()
+        return out
+
+    def inject(self, frame):
+        lib.pp_client_on_frame(self.panel._c, frame, len(frame), self.t)
+
+    @property
+    def result(self):
+        return lib.app_result(self.app)
 
     @property
     def screen(self):
@@ -191,10 +216,10 @@ def test_result_lines_of_the_previous_run_are_not_shown_codex_p7():
     b.drop = lambda f: f[0] == pp.START_INFO            # every INFO of run B lost
     b.press(START)
     b.step(250)
-    assert b.screen == RESULT and not lib.app_result_fresh(b.app)
+    assert b.screen == RESULT and b.result == NOT_VERIFIED
     b.drop = lambda f: False
-    b.step(120)
-    assert lib.app_result_fresh(b.app) and b.panel.info.result[0].startswith('FAKE')
+    b.step(120)                                         # valid INFO of B, but no cleared one seen
+    assert b.result == NOT_VERIFIED and b.panel.info.result[0].startswith('FAKE')
 
 
 def test_closed_result_does_not_hide_the_next_one_codex_p8():
@@ -216,16 +241,15 @@ def test_closed_result_does_not_hide_the_next_one_codex_p8():
 def test_buttons_do_nothing_on_run_and_no_link_except_stop(ev):
     b = AppBench()
     b.step(1)
-    b.press(ev)
-    assert not b.panel._out
+    assert b.screen == NOLINK and b.press(ev) == []         # frames of the press itself (Q7)
     b.step(150)
     b.press(START)
     b.step(30)
+    assert b.screen == RUN
     n = len(b.link.log)
-    b.press(ev)
+    assert b.press(ev) == []
     b.step(5)
-    assert b.screen == RUN and all(e[1] in (pp.CMD_START, pp.CMD_SYNC, pp.CMD_PROFILES)
-                                   for e in b.link.log[n:])
+    assert not [e for e in b.link.log[n:] if e[1] in (pp.CMD_START, pp.CMD_SELECT, pp.CMD_STOP)]
 
 
 def test_cursor_clamped_when_the_list_shrinks_inside_a_session_codex_p3():
@@ -263,3 +287,151 @@ def test_run_started_elsewhere_and_never_seen_active_still_shows_result_codex_p8
     b.drop = lambda f: False
     b.step(30)
     assert b.run.state == pp.ST_END and b.screen == RESULT
+
+
+def test_a_normal_run_shows_its_result_codex_q1():
+    b = ready()
+    b.press(START)
+    b.step(250)
+    assert b.screen == RESULT and b.result == FRESH
+
+
+def test_old_result_arriving_during_a_new_run_is_not_shown_codex_q1():
+    b = ready()
+    b.press(START)
+    b.step(250)
+    b.press(NAV)
+    b.step(1)
+    b.drop = lambda f: f[0] == pp.START_INFO            # the link's own INFO of run B lost
+    b.press(START)
+    b.step(20)
+    old = pp.Info(sid=b.panel.sid, flags=pp.I_RESULT_VALID, result=('OLD A', '', ''))
+    b.inject(pp.encode_info(old))                       # a valid INFO of run A arrives during B
+    b.step(230)
+    assert b.screen == RESULT and b.result == NOT_VERIFIED
+
+
+def test_start_replaced_by_stop_and_a_short_run_still_shows_result_codex_q2():
+    b = ready()
+    b.press(START)
+    b.step(250)
+    b.press(NAV)                                        # close RESULT A
+    b.step(1)
+    b.drop = lambda f: f[0] == pp.START_STATUS and b.run.state in pp.ST_ACTIVE
+    b.press(START)
+    b.press(STOP)                                       # STOP before the START ACK
+    b.step(40)                                          # run B: PREPARE -> STOPPING -> END in 0.3 s
+    b.drop = lambda f: False
+    b.step(20)
+    assert b.run.state == pp.ST_END and b.screen == RESULT
+
+
+def test_link_gap_does_not_reopen_a_closed_result_codex_q2():
+    b = ready()
+    b.press(START)
+    b.step(250)
+    b.press(NAV)
+    b.step(1)
+    assert b.screen == HOME
+    b.drop = lambda f: f[0] == pp.START_STATUS          # 0.8 s without STATUS: NO LINK
+    b.step(80)
+    assert b.screen == NOLINK
+    b.drop = lambda f: False
+    b.step(20)
+    assert b.screen == HOME
+
+
+def test_start_answered_busy_gives_the_closed_state_back_codex_q2():
+    b = ready()
+    b.press(START)
+    b.step(250)
+    b.press(NAV)
+    b.step(1)
+    b.run.start = lambda i: pp.RES_BUSY
+    b.press(START)
+    b.step(30)
+    assert b.screen == HOME and 'BUSY' in b.msg
+
+
+def test_view_drawn_before_a_list_change_does_not_start_the_new_test_codex_q3():
+    b = ready()
+    old = b.view()                                      # snapshot taken for a drawing
+    b.inject(pp.encode_profile(b.panel.sid, 0, 3, 'RENAMED'))
+    lib.app_update(b.app, b.t)
+    b.draw(old)                                         # the drawing finishes with the old list
+    assert b.press(START) == [] and 'press again' in b.msg
+    b.draw()
+    assert [f[8] for f in b.press(START)] == [pp.CMD_START]
+
+
+def test_only_stop_during_a_redraw_that_changes_the_view_codex_q3():
+    b = ready()
+    lib.app_drawing(b.app)
+    assert b.press(START) == [] and b.press(SELECT) == []
+    assert [f[8] for f in b.press(STOP)] == [pp.CMD_STOP]
+
+
+def test_run_again_uses_the_test_shown_codex_q3():
+    b = ready()
+    b.press(NAV)
+    b.step(1)
+    b.press(START)                                      # test 1
+    b.step(250)
+    assert b.screen == RESULT
+    out = b.press(START)
+    assert [(f[8], pp.decode(f).arg) for f in out] == [(pp.CMD_START, 1)]
+
+
+def test_list_shrinks_then_grows_old_names_not_reused_codex_q4():
+    b = ready()
+    sid = b.panel.sid
+    b.inject(pp.encode_profile(sid, 0, 1, 'X'))
+    b.inject(pp.encode_profile(sid, 0, 3, 'Y'))         # new list of 3, names 1 and 2 not here yet
+    lib.app_update(b.app, b.t)
+    b.draw()
+    for _ in range(2):
+        b.press(NAV)
+        b.draw()
+    assert b.cursor == 2 and b.press(START) == [] and 'not complete' in b.msg
+
+
+def test_rejection_message_not_overwritten_by_an_ack_in_the_same_pass_codex_q8():
+    b = ready()
+    b.press(SELECT)                                     # SELECT in flight, reaches the link
+    b.t += 10
+    b.link.poll()                                       # the ACK (STATUS) is on the wire
+    b.panel._out = []
+    data, b.wire = bytes(b.wire), bytearray()
+    lib.pp_parser_feed(b.parser, data, len(data), b.t, b._cb, None)
+    lib.pp_client_tick(b.panel._c, b.t)
+    lib.app_update(b.app, b.t)                          # firmware order: update, buttons, update
+    lib.app_buttons(b.app, NAV | START, b.t)
+    lib.app_update(b.app, b.t)
+    assert 'cursor moved' in b.msg
+
+
+def test_two_runs_in_a_row_both_show_their_result():
+    b = ready()
+    for k in (0, 1):
+        b.press(START)
+        b.step(250)
+        assert b.screen == RESULT and b.result == FRESH, k
+        b.press(NAV)
+        b.step(1)
+
+
+def test_run_started_elsewhere_and_seen_active_shows_a_verified_result():
+    b = ready()
+    b.run.start(2)                                      # from the PC
+    b.step(250)
+    assert b.screen == RESULT and b.result == FRESH
+
+
+def test_start_on_a_result_not_drawn_yet_is_not_used_codex_q3():
+    b = ready()
+    b.press(START)                                      # test 0
+    b.step(250)
+    assert b.screen == RESULT                           # glass: RESULT of test 0
+    b.run.start(2)                                      # PC runs test 2; panel does not redraw
+    b.step(250, draw=False)
+    assert b.press(START) == [] and 'press again' in b.msg

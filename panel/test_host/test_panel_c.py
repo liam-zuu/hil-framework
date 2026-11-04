@@ -472,11 +472,12 @@ def test_c_client_matches_python_step_by_step(seed):
 
 def test_event_ring_keeps_newest_and_counts_dropped_codex_p18():
     c = CPanelClient(iter(range(1, 100)).__next__)
-    for k in range(40):                                  # no session: every press is refused
-        lib.pp_client_press(c._c, pp.CMD_START, k, 0)
+    cmds = [pp.CMD_START if k % 3 else pp.CMD_SELECT for k in range(40)]   # distinct events (Q7)
+    for cmd in cmds:                                     # no session: every press is refused
+        lib.pp_client_press(c._c, cmd, 0, 0)
     c._drain()
     assert len(c.shown) == pp_EVENTS and lib.pp_host_ev_dropped(c._c) == 40 - pp_EVENTS
-    assert c.shown[0] == ('refused', pp.CMD_START, None)
+    assert [x[1] for x in c.shown] == cmds[40 - pp_EVENTS:]     # the newest, in order
 
 
 pp_EVENTS = 32

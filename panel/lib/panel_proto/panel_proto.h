@@ -220,6 +220,8 @@ typedef struct {
 
     bool     has_info;  pp_info_t info;     /* newest INFO of the session */
     uint32_t info_count;                    /* INFO frames of a session taken so far (never reset) */
+    uint32_t info_cleared_at;               /* info_count after the last INFO without I_RESULT_VALID */
+    uint32_t profiles_gen;                  /* bumps whenever the kept list changes (count, a name) */
     bool     has_st;    pp_status_t st;     /* newest STATUS of the session (for the screen) */
 
     pp_event_t events[PP_EVENTS];       /* what the screen reports, oldest first */

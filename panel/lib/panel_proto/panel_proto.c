@@ -220,6 +220,7 @@ static uint16_t new_boot(pp_client_t *c)
 
 static void clear_profiles(pp_client_t *c)
 {
+    c->profiles_gen++;
     c->has_profile_count = false;
     c->profile_count = 0;
     c->profiles_have = 0;
@@ -441,12 +442,19 @@ void pp_client_on_frame(pp_client_t *c, const uint8_t *frame, size_t len, uint32
         pp_profile_t pr;
         pp_decode_profile(frame, &pr);
         if (c->sid && pr.sid == c->sid) {
+            if (c->has_profile_count && pr.count != c->profile_count)
+                clear_profiles(c);              /* another list: old names do not belong (Q4) */
+            if (!c->has_profile_count || pr.count != c->profile_count)
+                c->profiles_gen++;
             c->profile_count = pr.count;
             c->has_profile_count = true;
             if (pr.index < pr.count) {          /* an empty list is one PROFILE with count 0 */
                 if (!c->profile_ok[pr.index]) {
                     c->profile_ok[pr.index] = true;
                     c->profiles_have++;
+                    c->profiles_gen++;
+                } else if (strcmp(c->profile_name[pr.index], pr.name) != 0) {
+                    c->profiles_gen++;
                 }
                 memcpy(c->profile_name[pr.index], pr.name, sizeof pr.name);
             }
@@ -458,6 +466,8 @@ void pp_client_on_frame(pp_client_t *c, const uint8_t *frame, size_t len, uint32
             c->info = in;
             c->has_info = true;
             c->info_count++;
+            if (!(in.flags & PP_I_RESULT_VALID))
+                c->info_cleared_at = c->info_count;   /* the daemon cleared the result (Q1) */
         }
     }
 }

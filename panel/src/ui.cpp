@@ -177,12 +177,15 @@ void scr_result(const PanelView &v)
     uint16_t col = c->st.outcome == PP_OUT_COMPLETED ? TFT_GREEN :
                    c->st.outcome == PP_OUT_USER_STOP ? TFT_YELLOW : TFT_RED;
     text(8, 82, out, 4, col, 2);
-    if (app_result_fresh(v.a)) {                /* P7: only lines of this generation */
+    app_result_t r = app_result(v.a);           /* P7, Q1: only lines of this generation */
+    if (r == APP_RES_FRESH) {
         for (int k = 0; k < PP_RESULT_LINES; k++)
             if (c->info.result[k][0])
                 text(8, 144 + 30 * k, c->info.result[k], 4, TFT_WHITE);
+    } else if (c->st.outcome != PP_OUT_COMPLETED) {
+        text(8, 144, "no result lines", 4, TFT_LIGHTGREY);
     } else {
-        text(8, 144, c->st.outcome == PP_OUT_COMPLETED ? "waiting for result..." : "no result lines", 4,
+        text(8, 144, r == APP_RES_WAITING ? "waiting for result..." : "result not verified (see PC)", 4,
              TFT_LIGHTGREY);
     }
     quality_text(c->st.quality, q, sizeof q);
@@ -236,8 +239,10 @@ uint32_t ui_signature(const PanelView &v)
     h = fnv(h, &s, sizeof s);
     h = fnv(h, &v.a->cursor, sizeof v.a->cursor);
     h = fnv(h, v.a->msg, strlen(v.a->msg));
-    bool fresh = app_result_fresh(v.a);
-    h = fnv(h, &fresh, sizeof fresh);
+    app_result_t r = app_result(v.a);
+    h = fnv(h, &r, sizeof r);
+    h = fnv(h, &c->sid, sizeof c->sid);
+    h = fnv(h, &c->profiles_gen, sizeof c->profiles_gen);
     h = fnv(h, &c->stop_state, sizeof c->stop_state);
     h = fnv(h, &c->profiles_have, sizeof c->profiles_have);
     bool link = c->sid && pp_client_link(c, v.now);

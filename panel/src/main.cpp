@@ -85,10 +85,12 @@ static void link_task(void *)
             pp_parser_feed(&g_parser, buf, k, now, frame_cb, &now);
         }
         pp_client_tick(&g_c, now);
+        app_update(&g_app, now);                /* events of the frames first (Q8) */
         uint8_t ev = buttons_poll(now);
-        if (ev)
+        if (ev) {
             app_buttons(&g_app, ev, now);
-        app_update(&g_app, now);
+            app_update(&g_app, now);            /* only what this press caused */
+        }
         leds(now);
         xSemaphoreGive(g_mx);
         vTaskDelayUntil(&wake, pdMS_TO_TICKS(LINK_PERIOD_MS));     /* FreeRTOS tick 1 kHz */
@@ -121,24 +123,26 @@ void loop()
     static pp_client_t cs;                      /* copies drawn from (static: ~6 KB) */
     static app_t as;
 
-    uint32_t now = millis();
     xSemaphoreTake(g_mx, portMAX_DELAY);
     memcpy(&cs, &g_c, sizeof cs);
     as = g_app;
-    xSemaphoreGive(g_mx);
+    uint32_t now = millis();                    /* after the copy: never older than it (Q5) */
     as.c = &cs;
+    app_view_t view = app_view(&as, now);
+    bool changes_view = !as.drawn_valid || !app_view_same(&view, &as.drawn);
     PanelView v{&as, now};
-
-    app_screen_t s = app_screen(&as, now);
     uint32_t sig = ui_signature(v);
     uint32_t since = now - t_draw;
-    bool moved = !as.drawn_valid || s != as.drawn_screen || as.cursor != as.drawn_cursor;
-    if ((sig != sig_drawn && (since >= REDRAW_MIN_MS || moved)) || since >= REDRAW_MAX_MS) {
+    bool draw = (sig != sig_drawn && (since >= REDRAW_MIN_MS || changes_view)) || since >= REDRAW_MAX_MS;
+    if (draw && changes_view)
+        app_drawing(&g_app);                    /* buttons other than STOP wait (Q3) */
+    xSemaphoreGive(g_mx);
+    if (draw) {
         ui_draw(v);
         sig_drawn = sig;
         t_draw = millis();
         xSemaphoreTake(g_mx, portMAX_DELAY);
-        app_drawn(&g_app, s, as.cursor);        /* what the glass shows now (P2) */
+        app_drawn(&g_app, &view);               /* what the glass shows now (P2, Q3) */
         xSemaphoreGive(g_mx);
     }
     delay(5);
