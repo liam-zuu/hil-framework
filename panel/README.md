@@ -12,7 +12,7 @@ The panel only draws and forwards buttons; the RPi5 daemon owns the run (QĐ 17,
 
 ```
 python -m pytest panel/test_host -q            # from the repo root; needs gcc on PATH
-cd panel && pio run -e panel_s3_usb            # protocol on USB (fake Pi)
+cd panel && pio run -e panel_s3_bench          # protocol on the "UART" USB-C port (fake Pi)
 cd panel && pio run -e panel_s3                # protocol on UART1 to the RPi5
 ```
 

@@ -3,7 +3,7 @@ a serial port, with a made-up run, so the panel screens and buttons can be tried
 HIL box. Everything it shows is FAKE (result lines start with 'FAKE'); nothing here is a
 measurement and nothing goes to 05_DATA.
 
-  python panel/tools/fake_pi.py --port COM7                  # panel env panel_s3_usb
+  python panel/tools/fake_pi.py --port COM7                  # panel env panel_s3_bench
   python panel/tools/fake_pi.py --port COM7 --fault-at 4     # FAULT 4 s into each run
   python panel/tools/fake_pi.py --port COM7 --no-h7          # H7 link shown down
 
@@ -159,7 +159,11 @@ def main(argv=None) -> int:
     epoch = random.randrange(1, 0xFFFE)           # bench only: the real daemon keeps an epoch file
     pi = FakePi(epoch, [p for p in a.profiles.split(',') if p], a.run_s, a.ctrl, a.fault_at, not a.no_h7)
     names = {v: k[4:] for k, v in vars(pp).items() if k.startswith('CMD_')}
-    with serial.Serial(a.port, a.baud, timeout=0) as port:
+    port = serial.Serial(baudrate=a.baud, timeout=0)
+    port.dtr = port.rts = False      # the "UART" port has DTR/RTS auto-reset: do not touch EN/IO0
+    port.port = a.port
+    port.open()
+    with port:
         print(f'fake Pi on {a.port}, epoch {epoch}; Ctrl+C to quit')
         t0, n_log = time.monotonic(), 0
         while True:

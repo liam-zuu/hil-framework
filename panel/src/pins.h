@@ -1,10 +1,12 @@
 /*
  * pins.h — panel board pins (ESP32-S3 N16R8, WeAct board; Liam 04/11, PANEL session).
  *
- * [ĐỀ XUẤT] Claude's proposal, NOT checked on the board and NOT yet confirmed by Liam.
- * Rules used: no strapping pins (0, 3, 45, 46); 35-37 belong to the octal PSRAM; 19/20 are
- * the USB pins; 43/44 left for UART0 (boot log); 48 left free (some S3 boards put an RGB LED
- * there). Change the numbers here and in platformio.ini (TFT_* flags) together.
+ * [ĐỀ XUẤT] Claude's proposal, not yet run on the board. Checked 04/11 against the WeAct
+ * ESP32-S3-A schematic (WeAct_ESP32_S3_A_Sch.pdf): every pin below is on a header and has
+ * nothing else on the board. Avoided: 0 (BOOT), 3, 46 (strapping), 45 (strapping + KEY
+ * button with 10k pull-up), 48 (WS2812 RGB LED), 35-37 (octal PSRAM of N16R8), 19/20 ("USB"
+ * port), 43/44 (UART0 = CH343P = "UART" port, used by env panel_s3_bench).
+ * Change the numbers here and in platformio.ini (TFT_* flags) together.
  */
 #pragma once
 
@@ -15,7 +17,8 @@
 #define PIN_TFT_CS     10
 #define PIN_TFT_DC      9
 #define PIN_TFT_RST     8
-#define PIN_TFT_BL      7      /* backlight: through the module's LED pin; HIGH = on */
+#define PIN_TFT_BL      7      /* driven HIGH; the wiring guide ties the module's LED pin to
+                                  3V3 instead (backlight current not taken from a GPIO) */
 
 /* buttons: to GND when pressed, internal pull-up (+ 10-100 nF to GND per button) */
 #define PIN_BTN_NAV     4

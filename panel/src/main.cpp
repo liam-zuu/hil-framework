@@ -4,8 +4,10 @@
  * Protocol v6 (lib/panel_proto, mirror of rpi5/panel_proto.py). Controller choice is way (c):
  * the panel only shows the controller running (INFO), it is changed by flashing an env.
  *
- * Link: env panel_s3 -> UART1 to the RPi5 (pins.h); env panel_s3_usb -> the USB port
- * (bench, panel/tools/fake_pi.py on the PC). Nothing else is written to the link port.
+ * Link: env panel_s3 -> UART1 to the RPi5 (pins.h); env panel_s3_bench -> UART0, the "UART"
+ * USB-C port of the WeAct board (CH343P), used for flashing too (bench, panel/tools/fake_pi.py
+ * on the PC). Nothing else is written to the link port; the ROM boot text on UART0 is dropped
+ * by the fake Pi's frame parser.
  */
 #include <Arduino.h>
 
@@ -14,12 +16,12 @@
 #include "pins.h"
 #include "ui.h"
 
-#ifndef PANEL_LINK_USB
-#define PANEL_LINK_USB 0
+#ifndef PANEL_LINK_BENCH
+#define PANEL_LINK_BENCH 0
 #endif
 
-#if PANEL_LINK_USB
-#define LINK Serial          /* USB CDC (ARDUINO_USB_CDC_ON_BOOT=1) */
+#if PANEL_LINK_BENCH
+#define LINK Serial0         /* UART0 = GPIO43/44 = CH343P = "UART" USB-C port */
 #else
 #define LINK Serial1
 #endif
@@ -138,7 +140,7 @@ static void leds(uint32_t now)
 
 void setup()
 {
-#if PANEL_LINK_USB
+#if PANEL_LINK_BENCH
     LINK.begin(PI_BAUD);
 #else
     LINK.setRxBufferSize(2048);
@@ -151,7 +153,7 @@ void setup()
     pp_parser_init(&g_parser, PP_ACCEPT_PANEL, PP_PARSER_STALE_MS);
     pp_client_init(&g_c, nonce_cb, nullptr, send_cb, nullptr);
     g_v.c = &g_c;
-    snprintf(g_v.msg, sizeof g_v.msg, "panel M2, protocol v%d%s", PP_VERSION, PANEL_LINK_USB ? ", USB link" : "");
+    snprintf(g_v.msg, sizeof g_v.msg, "panel M2, protocol v%d%s", PP_VERSION, PANEL_LINK_BENCH ? ", bench link" : "");
 }
 
 void loop()
