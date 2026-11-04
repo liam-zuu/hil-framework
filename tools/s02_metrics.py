@@ -9,9 +9,10 @@ the window do not change the PWM metrics; losing a line at either end of the
 window moves the window itself (B0 review round 3, question 3).
 
 Formats (B0 review round 3 B51/N9), told apart by the header and the rows:
-  DUT     66 columns, every row with log_seq and motor_on (AGV ctrl-imu firmware):
+  DUT     83 columns (66 ctrl-imu firmware, 78 feat/pos-loop: their header and rows as
+          written by older loggers are accepted too), every row with log_seq and motor_on:
           log_seq U32, motor_on exactly 0 or 1, timestamp_us an integer
-  SIM     66 columns, log_seq and motor_on empty in every row (fwsim/s02_groupA_sim.py)
+  SIM     83 (or 66, 78) columns, log_seq and motor_on empty in every row (fwsim/s02_groupA_sim.py)
   legacy  the first 37 or 28 columns (older firmware)
 Anything else, or rows of two formats, is refused. SIM and legacy rows stay in file
 order and timestamp_us must be finite and never go back.
@@ -62,8 +63,9 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from agv_logger import (COLUMNS, MAX_US_PER_SEQ, N_OLD, N_S02, RATE_SLACK_US,  # noqa: E402
+from agv_logger import (COLUMNS, MAX_US_PER_SEQ, N_IMU, OLD_LENGTHS, RATE_SLACK_US,  # noqa: E402
                         SEGMENT_COLUMNS, SEGMENT_STATUSES, file_digest, parse_run_end)
+HEADS = [COLUMNS] + [COLUMNS[:n] for n in OLD_LENGTHS]     # 83, 28, 37, 66, 78 columns
 
 R_WHEEL = 0.0485
 L_SUM = 0.24          # LX + LY (kinematics.h)
@@ -86,14 +88,14 @@ def load_log(path):
         rows = list(csv.reader(f))
     head = rows[0]
     body = rows[1:]
-    if head not in (COLUMNS, COLUMNS[:N_S02], COLUMNS[:N_OLD]):
-        raise ValueError(f'{path}: header is not a logger format (agv_logger.COLUMNS, 66, 37 or 28 columns)')
+    if head not in HEADS:
+        raise ValueError(f'{path}: header is not a logger format (agv_logger.COLUMNS, 83, 78, 66, 37 or 28 columns)')
     bad = [i + 2 for i, r in enumerate(body) if len(r) != len(head)]
     if bad:
         raise ValueError(f'{path}: lines {bad[:5]} do not have {len(head)} columns (mixed formats)')
     t = head.index('timestamp_us')
     kind = 'legacy'
-    if head == COLUMNS:
+    if len(head) >= N_IMU:
         s, mo = head.index('log_seq'), head.index('motor_on')
         kinds = {('dut' if r[s] != '' and r[mo] != '' else
                   'sim' if r[s] == '' and r[mo] == '' else 'bad') for r in body}

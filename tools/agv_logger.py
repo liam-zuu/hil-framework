@@ -33,10 +33,11 @@ Exit code: 0 closed cleanly, 2 refused or could not open, 3 error while closing,
 receiving. The run owner checks the exit code AND the summary (B0 review B35): status "closed"
 alone does not prove a complete run, and no field of the summary proves a single DUT boot.
 
---strict (measurement mode, Codex rounds 2-3 #25, #43; B0 review B3-B10, B36): only 66-column
-lines with the DUT's printf types, C type ranges and flag/enum values are kept; a header-like
-line that is not COLUMNS name by name blocks data until a matching header arrives. Without
---strict, old 28/37-column lines are padded as before. LOGGER_OPEN is not DUT READY (#35).
+--strict (measurement mode, Codex rounds 2-3 #25, #43; B0 review B3-B10, B36): only 83-column
+lines (campaign firmware: ctrl-imu 66 + position loop 12 + wheel slip 5, 04/11) with the DUT's
+printf types, C type ranges and flag/enum values are kept; a header-like line that is not
+COLUMNS name by name blocks data until a matching header arrives. Without --strict, older
+28/37/66/78-column lines are padded as before. LOGGER_OPEN is not DUT READY (#35).
 
 Segments, not boots (B0 review B30; round 3 B43-B45, N1-N4): the DUT sends no boot id, so the
 logger only groups lines that are consistent with one boot. It is a policy with both kinds of
@@ -111,9 +112,20 @@ COLUMNS = [
     # Added 28/10 (Codex review of ctrl-imu #11, #8 (c)): slip_eval 0 = r could not be checked
     # this tick (gyro invalid or wheels below omega_min), so slip_flag 0 does not mean "no slip".
     "src_switch_dwz", "bias_updates", "slip_eval",
+    # Added 04/11 (Liam, CODE session: "Làm cột log"): position loop pos_ctrl.c + (a) window +
+    # (d) standstill hold (AGV feat/pos-loop 7756e0b logger.c): estimated and command pose
+    # (O1 v6 section 5.8, e_đo), correction added to vx, vy, theta source 0 encoder / 1 IMU.
+    "pos_on", "pos_x", "pos_y", "pos_th", "pos_x_ref", "pos_y_ref", "pos_th_ref",
+    "pos_corr_vx", "pos_corr_vy", "pos_th_src", "pos_in_pos", "still",
+    # Wheel-consistency slip flag wheel_slip.c (AGV feat/wheel-slip 8211c3c logger.c, where these
+    # come right after slip_eval; in the campaign firmware they come after the pos_* columns).
+    "ws_res", "ws_th", "ws_flag", "ws_on_count", "ws_eval",
 ]
-N_OLD = 28      # firmware before the counters: same columns without the last 9 + 29
-N_S02 = 37      # firmware a6644a5 .. before ctrl-imu: without the last 29
+N_OLD = 28      # firmware before the counters: same columns without the last 9 + 29 + 17
+N_S02 = 37      # firmware a6644a5 .. before ctrl-imu: without the last 29 + 17
+N_IMU = 66      # firmware ctrl-imu (spec controller-IMU v2.2): without the last 17
+N_POS = 78      # firmware feat/pos-loop before the wheel slip flag: without the last 5
+OLD_LENGTHS = (N_OLD, N_S02, N_IMU, N_POS)
 KNOWN_NAMES = frozenset(COLUMNS)
 SEGMENT_COLUMNS = ["row", "log_seq", "timestamp_us", "segment", "status"]
 SEGMENT_STATUSES = frozenset(("ok", "duplicate", "conflict", "ambiguous", "no_seq"))
@@ -132,16 +144,19 @@ INT_RANGES.update({c: _U32 for c in ("tick", "dpwm_fl", "dpwm_fr", "dpwm_rl", "d
                                      "sat_fl", "sat_fr", "sat_rl", "sat_rr",
                                      "log_seq", "log_qdrop", "log_send_err", "gyro_n", "rv_n", "reset_n",
                                      "src_switch_count", "psi_reset_count", "slip_on_count",
-                                     "bias_updates")})
+                                     "bias_updates", "ws_on_count")})
 INT_RANGES.update({c: _U8 for c in ("motor_on", "g_valid", "r_valid", "wz_src", "head_on",
-                                    "slip_flag", "slip_eval")})
+                                    "slip_flag", "slip_eval",
+                                    "pos_on", "pos_th_src", "pos_in_pos", "still", "ws_flag", "ws_eval")})
 INT_RANGES["imu_init"] = _I8
 INT_COLUMNS = frozenset(INT_RANGES)
 # Values the DUT can print in the flag / enum columns (B0 review B36): bools; wz_src
 # WZ_SRC_ENC 0 / WZ_SRC_IMU 1 (imu_fusion.h:60-61); imu_init IMU_INIT_* 0..3 (imu.h:29-32)
-# or -1 before imu_init() has run (imu.cpp:29)
+# or -1 before imu_init() has run (imu.cpp:29); pos_th_src 0 encoder / 1 IMU (pos_ctrl.h)
 ENUM_DOMAINS = {c: frozenset((0, 1)) for c in ("motor_on", "g_valid", "r_valid", "wz_src",
-                                               "head_on", "slip_flag", "slip_eval")}
+                                               "head_on", "slip_flag", "slip_eval",
+                                               "pos_on", "pos_th_src", "pos_in_pos", "still",
+                                               "ws_flag", "ws_eval")}
 ENUM_DOMAINS["imu_init"] = frozenset((-1, 0, 1, 2, 3))
 COL = {c: i for i, c in enumerate(COLUMNS)}
 
@@ -478,7 +493,7 @@ class LoggerCore:
                 elif _float(val) is None:
                     return self._reject('type')
         else:
-            if len(fields) in (N_OLD, N_S02):
+            if len(fields) in OLD_LENGTHS:
                 fields = fields + [""] * (len(COLUMNS) - len(fields))
             if len(fields) != len(COLUMNS):
                 return self._reject(f'n_cols_{len(fields)}')
@@ -493,7 +508,7 @@ class LoggerCore:
         if names == COLUMNS:
             self.header = 'match'
             self.schema_blocked = False
-        elif names in (COLUMNS[:N_OLD], COLUMNS[:N_S02]):
+        elif names in [COLUMNS[:n] for n in OLD_LENGTHS]:
             self.header = 'old_prefix'
             self.schema_blocked = self.strict
             self._event(f'header_old,n_cols={len(names)}')
@@ -727,7 +742,7 @@ def main(argv=None):
     parser.add_argument("--bind", default="0.0.0.0", help="Địa chỉ bind (mặc định mọi card mạng)")
     parser.add_argument("--out",  default=None, help="Tên file CSV output")
     parser.add_argument("--strict", action="store_true",
-                        help="Chế độ đo: chỉ giữ dòng 66 cột đúng kiểu, header DUT phải khớp")
+                        help="Chế độ đo: chỉ giữ dòng 83 cột đúng kiểu, header DUT phải khớp")
     parser.add_argument("--src-ip", default=None,
                         help="Chỉ nhận gói từ IP này (ESP32 của bàn HIL); 'first': khóa theo gói đầu "
                              "tiên, gói nguồn khác bị bỏ và đếm ở rejects.source")
