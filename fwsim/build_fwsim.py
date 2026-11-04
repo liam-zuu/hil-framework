@@ -19,6 +19,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 FW_SOURCES = ['encoder/encoder.c', 'motor/motor.c', 'kinematics/kinematics.c',
               'controller/pid.c', 'controller/adrc.c', 'controller/imu_fusion.c',
               'controller/heading.c', 'controller/vel_ctrl.c']
+FW_OPTIONAL = ['controller/pos_ctrl.c']   # position loop (AGV feat/pos-loop, O1 PA3): only if the tree has it
 FW_INCLUDES = ['motor', 'encoder', 'kinematics', 'controller', 'imu']
 
 
@@ -42,12 +43,13 @@ def main():
     a = ap.parse_args()
     fw = os.path.abspath(a.fw)
     src = os.path.join(fw, 'src')
+    sources = FW_SOURCES + [f for f in FW_OPTIONAL if os.path.isfile(os.path.join(src, f))]
     os.makedirs(a.out, exist_ok=True)
     dll = os.path.join(a.out, 'fwsim.dll')
     flags = ['-std=gnu11', '-O2', '-ffp-contract=off', '-Wall', '-Wno-unused-variable', '-shared']
     cmd = ([a.gcc] + flags + ['-I', os.path.join(HERE, 'shim')] +
            sum((['-I', os.path.join(src, d)] for d in FW_INCLUDES), []) +
-           [os.path.join(src, f) for f in FW_SOURCES] +
+           [os.path.join(src, f) for f in sources] +
            [os.path.join(HERE, 'shim', 'fw_shim.c'), os.path.join(HERE, 'fw_sim.c'), '-o', dll])
     r = subprocess.run(cmd, capture_output=True, text=True)
     sys.stdout.write(r.stdout); sys.stderr.write(r.stderr)
@@ -55,7 +57,7 @@ def main():
         sys.exit(f'gcc failed ({r.returncode})')
     ver = subprocess.run([a.gcc, '--version'], capture_output=True, text=True).stdout.splitlines()[0]
     info = dict(esp32=git_state(fw), hil_framework=git_state(os.path.join(HERE, '..')),
-                compiler=ver, flags=' '.join(flags), sources=FW_SOURCES)
+                compiler=ver, flags=' '.join(flags), sources=sources)
     with open(os.path.join(a.out, 'fwsim_build.json'), 'w') as f:
         json.dump(info, f, indent=2)
     print(f"Built {dll}\n  ESP32 firmware {info['esp32']['commit']} dirty={info['esp32']['dirty']}\n  {ver}")

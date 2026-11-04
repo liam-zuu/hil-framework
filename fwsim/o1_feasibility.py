@@ -25,6 +25,12 @@ Simulation numbers for feasibility only: plant slip method A with the assumed mu
 IMU model noise-free, default firmware gains, no tuning; not main results.
 
   python fwsim/o1_feasibility.py --out <05_DATA/results/O1_FEAS/<date>_runNN> [--dll <fwsim.dll>]
+         [--pos-loop KP,KI]
+
+--pos-loop (04/11, O1 PA3, Liam approved A1 + B1 in the CODE session): turns on the firmware
+position loop pos_ctrl.c (AGV feat/pos-loop) with these gains; the command pose is integrated
+on the ESP32 from the same body-velocity command (A1), heading stays with heading.c (B1).
+The measures are unchanged (true plant pose); log.csv gets the pos_* columns.
 """
 import argparse
 import csv
@@ -176,33 +182,48 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--out', required=True)
     ap.add_argument('--dll', default=os.path.join(HERE, 'build', 'fwsim.dll'))
+    ap.add_argument('--pos-loop', default=None, metavar='KP,KI',
+                    help='turn on the firmware position loop (pos_ctrl.c, O1 PA3) with these gains; '
+                         'the DLL must be built from firmware that has it')
     fwsim.add_plant_imu_args(ap)
     a = ap.parse_args()
+    fw_params, pos_loop = None, None
+    if a.pos_loop:
+        kp, ki = (float(x) for x in a.pos_loop.split(','))
+        fw_params = dict(pos_on=1, pos_kp=kp, pos_ki=ki)
+        pos_loop = dict(kp=kp, ki=ki)
     if os.path.isdir(a.out) and os.listdir(a.out):
         sys.exit(f'{a.out} already holds data: use a new folder.')
     os.makedirs(a.out, exist_ok=True)
     imu = fwsim.imu_config(a)
     fw = fwsim.FirmwareSim(a.dll)
+    if pos_loop and not fw.pos_cols:
+        sys.exit('--pos-loop: this fwsim.dll has no position loop (build it from AGV feat/pos-loop)')
     if fw.build_info.get('esp32', {}).get('dirty', True):
         print('WARNING: fwsim.dll was built from a dirty firmware tree; not usable as a main result')
     path = Path8()
     summary, gains, t0 = [], {}, time.time()
+    pos_params = None
     for ctrl in CONTROLLERS:
         for v in SPEEDS:
             sch = Schedule(v)
             params = fwsim.plant_params(a)
-            log = fwsim.simulate(fw, sch.setpoint, sch.Tcmd + T_LATE, params, seed=1, mode=ctrl, imu=imu)
+            log = fwsim.simulate(fw, sch.setpoint, sch.Tcmd + T_LATE, params, seed=1, mode=ctrl, imu=imu,
+                                 fw_params=fw_params)
+            if pos_loop:
+                pos_params = {n: v for n, v in zip(('on', 'kp', 'ki', 'v_corr_max'), fw.pos_params())}
             gains[ctrl] = ({ax: fw.get_adrc(i) for i, ax in enumerate(['vx', 'vy', 'wz'])} if ctrl == 'ADRC'
                            else {ax: fw.get_pid(i) for i, ax in enumerate(['vx', 'vy', 'wz'])})
             res, rows = evaluate(log, path, sch)
             run_id = f'fig8_v{v:.1f}_{ctrl}'
             rd = os.path.join(a.out, run_id)
-            fwsim.write_run(rd, log, res, fw, dict(controller=ctrl, v=v, a_r=A_R, imu=imu), params)
+            fwsim.write_run(rd, log, res, fw, dict(controller=ctrl, v=v, a_r=A_R, imu=imu, pos_loop=pos_params),
+                            params)
             with open(os.path.join(rd, 'o1_frames.csv'), 'w', newline='') as f:
                 w = csv.DictWriter(f, fieldnames=list(rows[0]))
                 w.writeheader()
                 w.writerows(rows)
-            summary.append(dict(run_id=run_id, controller=ctrl, **res))
+            summary.append(dict(run_id=run_id, controller=ctrl, pos_loop=int(bool(pos_loop)), **res))
             print(f"{run_id}: e_perp_max={res['e_perp_max']:.3f} m, e_theta_max={res['e_theta_max_deg']:.1f} deg, "
                   f"|e_s|max={res['e_s_absmax']:.3f} m, stop {res['stop_dist_origin']:.3f} m, "
                   f"completed={res['completed']}, track_err={res['track_err_frames']}")
@@ -221,6 +242,7 @@ purpose: "feasibility of D = 0.10 m with default gains, no tuning; simulation nu
 controllers: {list(CONTROLLERS)}
 speeds_mps: {list(SPEEDS)}
 gains: {json.dumps(gains)}     # firmware defaults, read back after each run
+pos_loop: {json.dumps(pos_params)}     # position loop pos_ctrl.c (on, kp, ki, v_corr_max) read back after the last run; null = not used
 firmware:
   esp32: {json.dumps(b.get('esp32'))}
   hil_framework_dll: {json.dumps(b.get('hil_framework'))}

@@ -23,6 +23,14 @@
 #include "vel_ctrl.h"
 #include <string.h>
 
+/* Firmware with the position loop (AGV feat/pos-loop, O1 PA3, 04/11): optional, so older
+ * firmware trees still build. */
+#if __has_include("pos_ctrl.h")
+#define FWSIM_HAS_POS 1
+#else
+#define FWSIM_HAS_POS 0
+#endif
+
 #define FWSIM_API __declspec(dllexport)
 #define FWSIM_ABI 5
 
@@ -119,7 +127,39 @@ FWSIM_API int fwsim_set_param(const char *name, double v) {
     H(k_psi) H(wz_corr_max) H(e_psi_reset)
 #undef F
 #undef H
+#if FWSIM_HAS_POS
+    /* position loop (pos_ctrl.c, firmware with O1 PA3): pos_on, pos_kp, pos_ki, pos_v_corr_max */
+    pos_params_t *q = pos_params();
+    if (!strcmp(name, "pos_on"))         { q->on = v != 0.0; return 1; }
+    if (!strcmp(name, "pos_kp"))         { q->kp = (float)v; return 1; }
+    if (!strcmp(name, "pos_ki"))         { q->ki = (float)v; return 1; }
+    if (!strcmp(name, "pos_v_corr_max")) { q->v_corr_max = (float)v; return 1; }
+#endif
     return 0;
+}
+
+/* Position loop of the last tick (firmware with pos_ctrl.c; fwsim_pos_cols() = 0 without it):
+ * out[0] on, 1 corr_vx, 2 corr_vy, 3 x_ref, 4 y_ref, 5 th_ref, 6 x, 7 y, 8 th, 9 ex_b, 10 ey_b, 11 th_src */
+#define FWSIM_POS_COLS 12
+FWSIM_API int fwsim_pos_cols(void) { return FWSIM_HAS_POS ? FWSIM_POS_COLS : 0; }
+/* out: on, kp, ki, v_corr_max as the firmware holds them (read back after a run) */
+FWSIM_API void fwsim_get_pos(float out[4]) {
+#if FWSIM_HAS_POS
+    const pos_params_t *q = pos_params();
+    out[0] = q->on; out[1] = q->kp; out[2] = q->ki; out[3] = q->v_corr_max;
+#else
+    out[0] = out[1] = out[2] = out[3] = 0.0f;
+#endif
+}
+FWSIM_API void fwsim_pos_last(double out[FWSIM_POS_COLS]) {
+#if FWSIM_HAS_POS
+    const pos_out_t *p = &last_vc.pos;
+    double v[FWSIM_POS_COLS] = { p->on, p->corr_vx, p->corr_vy, p->x_ref, p->y_ref, p->th_ref,
+                                 p->x, p->y, p->th, p->ex_b, p->ey_b, p->th_src };
+    memcpy(out, v, sizeof(v));
+#else
+    memset(out, 0, sizeof(double) * FWSIM_POS_COLS);
+#endif
 }
 
 /* IMU/heading columns of the last tick (log section 8 of the spec):

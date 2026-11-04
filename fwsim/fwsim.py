@@ -53,6 +53,9 @@ IMU_COLS = ['g_valid', 'r_valid', 'wz_src', 'wz_meas', 'gz', 'yaw', 'age_g_ms', 
             'bias_gz', 'r', 'r_th', 'slip_flag', 'slip_on_count', 'src_switch_count',
             'src_switch_dwz', 'wz_cmd', 'head_on', 'psi_ref', 'psi_imu', 'e_psi',
             'psi_reset_count', 'head_toggle_count', 'bias_updates', 'slip_eval']
+# Position loop (pos_ctrl.c, AGV feat/pos-loop, O1 PA3): only with a DLL built from firmware that has it
+POS_COLS = ['pos_on', 'pos_corr_vx', 'pos_corr_vy', 'pos_x_ref', 'pos_y_ref', 'pos_th_ref',
+            'pos_x', 'pos_y', 'pos_th', 'pos_ex_b', 'pos_ey_b', 'pos_th_src']
 
 
 class FirmwareSim:
@@ -87,6 +90,15 @@ class FirmwareSim:
         L.fwsim_imu_last.argtypes = [ctypes.POINTER(ctypes.c_double)]
         if L.fwsim_abi() != 5 or L.fwsim_imu_cols() != len(IMU_COLS):
             sys.exit('fwsim.dll ABI mismatch: rebuild with build_fwsim.py')
+        try:                                   # older DLLs have no position-loop entry points
+            L.fwsim_pos_cols.restype = ctypes.c_int
+            L.fwsim_pos_last.argtypes = [ctypes.POINTER(ctypes.c_double)]
+            L.fwsim_get_pos.argtypes = [ctypes.POINTER(ctypes.c_float)]
+            self.pos_cols = L.fwsim_pos_cols()
+        except AttributeError:
+            self.pos_cols = 0
+        if self.pos_cols not in (0, len(POS_COLS)):
+            sys.exit('fwsim.dll position-loop columns mismatch: rebuild with build_fwsim.py')
         self._counts = (ctypes.c_int32 * 4)()
         self._sp = (ctypes.c_float * 3)()
         self._duty = (ctypes.c_double * 4)()
@@ -141,6 +153,18 @@ class FirmwareSim:
     def imu_init_fail(self):
         """imu_init() failed at boot (spec section 7): motors stay disabled for the run."""
         self.lib.fwsim_imu_init_fail()
+
+    def pos_last(self):
+        """Position-loop columns of the last tick (POS_COLS); only when pos_cols > 0."""
+        out = (ctypes.c_double * len(POS_COLS))()
+        self.lib.fwsim_pos_last(out)
+        return list(out)
+
+    def pos_params(self):
+        """Position-loop parameters held by the firmware: on, kp, ki, v_corr_max."""
+        out = (ctypes.c_float * 4)()
+        self.lib.fwsim_get_pos(out)
+        return [round(float(v), 6) for v in out]
 
     def set_param(self, name, value):
         if not self.lib.fwsim_set_param(name.encode(), float(value)):
@@ -250,6 +274,8 @@ def simulate(fw, setpoint, duration, params=None, seed=0, sp_rate_hz=50.0, pcnt_
     sp_held, sp_next_us = (0.0, 0.0, 0.0), 0
     log = {k: [] for k in ['t', 'sp', 'v_true', 'v_fw', 'duty', 'pwm', 'rpm', 'omega', 'pose', 'en',
                            'count', 'tick', 'dpwm', 'sat', 'imu', 'r_true', 'inj']}
+    if fw.pos_cols:
+        log['pos'] = []
 
     for k in range(n_plant + 1):
         t_us = k * 1000
@@ -281,6 +307,8 @@ def simulate(fw, setpoint, duration, params=None, seed=0, sp_rate_hz=50.0, pcnt_
             cnt, tk, dp, sat = fw.last()
             log['count'].append(cnt); log['tick'].append(tk); log['dpwm'].append(dp); log['sat'].append(sat)
             log['imu'].append(fw.imu_last())
+            if fw.pos_cols:
+                log['pos'].append(fw.pos_last())
             log['r_true'].append((p.H_fwd @ x[6:10])[2] - x[5])     # wz from wheels - body wz
             log['inj'].append(bool(inj is not None and inj.active(t_us * 1e-6)))
         if k == n_plant:
@@ -373,6 +401,9 @@ def write_run(out, log, met, fw, args_dict, params):
             ['x', 'y', 'theta', 'en'] + IMU_COLS + ['r_true', 'inj'])
     data = np.column_stack([log['t'], log['sp'], log['v_true'], log['v_fw'], log['duty'], log['pwm'],
                             log['omega'], log['pose'], log['en'], log['imu'], log['r_true'], log['inj']])
+    if len(log.get('pos', [])):                # position loop columns (firmware with pos_ctrl.c)
+        cols += POS_COLS
+        data = np.column_stack([data, log['pos']])
     np.savetxt(os.path.join(out, 'log.csv'), data, delimiter=',', header=','.join(cols), comments='', fmt='%.6g')
     with open(os.path.join(out, 'metrics.json'), 'w') as f:
         json.dump(met, f, indent=2)
