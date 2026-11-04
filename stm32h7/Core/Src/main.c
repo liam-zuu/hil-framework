@@ -189,6 +189,22 @@ int main(void)
            (unsigned)IBUS_GEN_PERIOD_US, (unsigned)IBUS_LINK_TIMEOUT_MS);
   else
     printf("IBUS: UART4 not set up (add it in CubeMX), iBUS off\r\n");
+  /* Pin test (04/11, Liam: "Duyệt, viết đi"): PC8 and PC9 as inputs with the
+   * internal pull-up, nothing else uses them (.ioc). Liam measures both header
+   * spots of each pin (ZIO CN8, morpho CN12) with no wire: the spot that goes to
+   * about 3.3 V is the MCU pin. Candidates for TIM8 CH3/CH4 (DMA capture plan,
+   * CLAUDE_THESIS 03_CODE/docs/2026-11-04_Ke_hoach_PWMCapture_DMA.md).
+   * Input only: the MCU never drives these pins. Diagnosis build. */
+  {
+    GPIO_InitTypeDef pt = {0};
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    pt.Pin   = GPIO_PIN_8 | GPIO_PIN_9;
+    pt.Mode  = GPIO_MODE_INPUT;
+    pt.Pull  = GPIO_PULLUP;
+    pt.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOC, &pt);
+    printf("PINTEST: PC8, PC9 input pull-up (measure CN8 and CN12, no wire)\r\n");
+  }
   printf("Init done, entering main loop\r\n");
   /* USER CODE END 2 */
 
@@ -296,6 +312,9 @@ int main(void)
         printf("PWMrise: late_rise=%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\r\n",
                (unsigned long)miss_rise[0], (unsigned long)miss_rise[1], (unsigned long)miss_rise[2], (unsigned long)miss_rise[3],
                (unsigned long)miss_rise[4], (unsigned long)miss_rise[5], (unsigned long)miss_rise[6], (unsigned long)miss_rise[7]);
+        /* Pin test (04/11): level the MCU reads on PC8, PC9 (pull-up on) */
+        printf("PINTEST: PC8=%d PC9=%d\r\n",
+               (int)HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_8), (int)HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_9));
         uint32_t relay_sent, relay_dropped;
         UartRelay_GetStats(&relay_sent, &relay_dropped);
         printf("Relay: sent=%lu dropped=%lu  traj vx=%.2f vy=%.2f wz=%.2f\r\n",
