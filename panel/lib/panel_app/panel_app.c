@@ -22,20 +22,13 @@ bool app_ready(const app_t *a, uint32_t now)
 
 uint16_t app_run(const app_t *a)
 {
-    return pp_client_info_current(a->c) ? a->c->info.run_no : 0;
+    return a->c->has_st ? a->c->st.run_no : 0;
 }
 
 /* the RESULT of the END now is closed by the user */
 static bool closed(const app_t *a)
 {
-    uint16_t run = app_run(a);
-    if (run)
-        return a->closed_valid && a->closed_run == run;
-    if (a->closed_unknown)
-        return true;
-    /* run not known: the last known run still holds while no run start was seen since */
-    return a->last_run && a->closed_valid && a->closed_run == a->last_run &&
-           a->c->run_starts == a->last_run_starts;
+    return a->c->has_st && a->closed_valid && a->closed_run == a->c->st.run_no;
 }
 
 app_screen_t app_screen(const app_t *a, uint32_t now)
@@ -55,14 +48,11 @@ app_screen_t app_screen(const app_t *a, uint32_t now)
 app_result_t app_result(const app_t *a)
 {
     const pp_client_t *c = a->c;
-    uint16_t run = app_run(a);
-    if (!run)
-        return APP_RES_WAITING;                 /* which run ended is not known yet */
-    if ((c->info.flags & PP_I_RESULT_VALID) && c->info.result_run == run)
+    if (!c->has_st || !c->has_info || !(c->info.flags & PP_I_RESULT_VALID) || !c->info.result_run)
+        return APP_RES_WAITING;                 /* no lines of any run */
+    if (c->info.result_run == c->st.run_no)
         return APP_RES_FRESH;                   /* the lines of this run */
-    if ((c->info.flags & PP_I_RESULT_VALID) && c->info.result_run)
-        return APP_RES_NOT_VERIFIED;            /* lines of another run: never shown here */
-    return APP_RES_WAITING;
+    return APP_RES_NOT_VERIFIED;                /* lines of another run: never shown here */
 }
 
 bool app_result_fresh(const app_t *a)
@@ -72,15 +62,10 @@ bool app_result_fresh(const app_t *a)
 
 static void close_result(app_t *a)
 {
-    uint16_t run = app_run(a);
-    if (run) {
-        a->closed_run = run;
-        a->closed_valid = true;
-    } else {
-        a->closed_unknown = true;               /* given to the run known next (app_update) */
-        a->closed_unknown_starts = a->c->run_starts;
-        a->closed_unknown_gaps = a->c->gaps;
-    }
+    if (!a->c->has_st)
+        return;
+    a->closed_run = a->c->st.run_no;
+    a->closed_valid = true;
 }
 
 void app_init(app_t *a, pp_client_t *c)
@@ -129,24 +114,10 @@ void app_update(app_t *a, uint32_t now)
     if (c->has_daemon_boot && (!a->has_daemon_boot || c->daemon_boot != a->daemon_boot)) {
         a->has_daemon_boot = true;              /* another daemon: its runs count from 1 again */
         a->daemon_boot = c->daemon_boot;
-        a->last_run = 0;
         a->closed_valid = false;
-        a->closed_unknown = false;
     }
-    uint16_t run = app_run(a);
-    if (a->closed_unknown) {
-        if (c->run_starts != a->closed_unknown_starts || c->gaps != a->closed_unknown_gaps) {
-            a->closed_unknown = false;          /* maybe another END since: hide nothing */
-        } else if (run) {
-            a->closed_unknown = false;          /* the END that was closed is this run */
-            a->closed_run = run;
-            a->closed_valid = true;
-        }
-    }
-    if (run) {
-        a->last_run = run;
-        a->last_run_starts = c->run_starts;
-    }
+    if (c->has_st && a->closed_valid && c->st.run_no != a->closed_run)
+        a->closed_valid = false;                /* another run seen: the closed one is over (S4) */
     int n = profile_n(a);                       /* P3: keep the cursor in the list */
     if (n <= 0)
         a->cursor = 0;

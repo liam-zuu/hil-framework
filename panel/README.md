@@ -6,7 +6,7 @@ The panel only draws and forwards buttons; the RPi5 daemon owns the run (QĐ 17,
 | Path | What |
 |---|---|
 | `lib/panel_proto/` | panel side of the protocol v6 in plain C99 (mirror of `rpi5/panel_proto.py`) |
-| `lib/panel_app/` | buttons → commands, screen choice, result keyed on the run number (INFO run_no / result_run, R1-R5), plain C (tested on the PC) |
+| `lib/panel_app/` | buttons → commands, screen choice, result keyed on the run number (STATUS run_no, INFO result_run; Codex R1-R5, S1-S6), plain C (tested on the PC) |
 | `src/` | Arduino firmware: `main.cpp` (link task every 2 ms + drawing loop), `ui.cpp` (screens), `buttons.cpp`, `pins.h` (checked against the WeAct ESP32-S3-A schematic, not yet run) |
 | `test_host/` | PC tests: C vs Python golden bytes, the two-end Bench scenarios with the C client, seeded side-by-side runs, the fake Pi |
 | `tools/fake_pi.py` | bench "Pi" over a serial port with a FAKE run model |

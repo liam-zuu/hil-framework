@@ -22,18 +22,27 @@ def test_info_layout_and_roundtrip():
     assert struct.unpack_from('<IHHBB', f, 2) == (SID1, 27, 0, pp.I_LOOP_VALID, pp.CTRL_SRC_PROFILE)
     assert f[12:20] == b'LADRC\x00\x00\x00'
     assert f[20:40] == b'e_vx 0.005 m/s' + bytes(6)
-    assert f[60:80] == bytes(20) and f[80:84] == bytes(4) and f[84:104] == bytes(20)
+    assert f[60:80] == bytes(20) and f[80:82] == bytes(2) and f[82:104] == bytes(22)
     assert struct.unpack_from('<H', f, 104)[0] == pp.crc16(f[:104])
     assert pp.decode(f) == _info()
 
 
-def test_info_run_numbers_and_error_text_layout_r1_r5():
-    """Codex round 3 R1-R5 (Liam 04/11: "(a) Sửa gốc + R3"): run_no at 80-81, result_run at
-    82-83 (little-endian), error_text 84-103 (20 bytes)."""
-    f = pp.encode_info(_info(run_no=0x1234, result_run=0xABCD, error_text='E' * 40))
-    assert f[80:84] == bytes([0x34, 0x12, 0xCD, 0xAB]) and f[84:104] == b'E' * 20
+def test_info_result_run_and_error_text_layout():
+    """Codex round 3 R1-R5 and round 4 S1-S6 (Liam 04/11: "(a) Sửa gốc + R3", then "A: run_no
+    vào STATUS"): INFO result_run at 80-81 (little-endian), error_text 82-103 (22 bytes); the
+    run number itself is in STATUS."""
+    f = pp.encode_info(_info(result_run=0xABCD, error_text='E' * 40))
+    assert f[80:82] == bytes([0xCD, 0xAB]) and f[82:104] == b'E' * 22
     i = pp.decode(f)
-    assert (i.run_no, i.result_run, i.error_text) == (0x1234, 0xABCD, 'E' * 20)
+    assert (i.result_run, i.error_text) == (0xABCD, 'E' * 22)
+
+
+def test_status_run_no_layout_and_roundtrip():
+    s = pp.Status(sid=SID1, run_state=pp.ST_END, run_no=0x1234)
+    f = pp.encode_status(s)
+    assert len(f) == pp.LEN_STATUS == 32 and f[28:30] == bytes([0x34, 0x12])
+    assert struct.unpack_from('<H', f, 30)[0] == pp.crc16(f[:30])
+    assert pp.decode(f) == s
 
 
 def test_next_run_no_never_zero_and_wraps_to_one():
@@ -45,17 +54,18 @@ def test_info_text_truncated_and_numbers_saturate():
     f = pp.encode_info(_info(ctrl='LADRC-LONGNAME', result=('x' * 30,), error_text='E' * 40,
                              loop_us=70000, overruns=-5))
     i = pp.decode(f)
-    assert i.ctrl == 'LADRC-LO' and i.result == ('x' * 20, '', '') and i.error_text == 'E' * 20
+    assert i.ctrl == 'LADRC-LO' and i.result == ('x' * 20, '', '') and i.error_text == 'E' * 22
     assert i.loop_us == 0xFFFF and i.overruns == 0
 
 
 def test_older_frames_keep_their_layout_only_version_changes():
-    assert (pp.LEN_CMD, pp.LEN_STATUS, pp.LEN_PROFILE) == (13, 30, 28)
+    # CMD and PROFILE keep their v5 layout; STATUS grew by run_no (Liam 04/11: "A: run_no vào STATUS")
+    assert (pp.LEN_CMD, pp.LEN_STATUS, pp.LEN_PROFILE) == (13, 32, 28)
     f = pp.encode_status(pp.Status(sid=SID1))
     assert f[1] == 6
     old = bytearray(f)
     old[1] = 5
-    struct.pack_into('<H', old, 28, pp.crc16(bytes(old[:28])))
+    struct.pack_into('<H', old, 30, pp.crc16(bytes(old[:30])))
     assert pp.StreamParser().feed(bytes(old)) == []                    # a v5 peer is refused
 
 
@@ -162,45 +172,6 @@ def test_panel_keeps_info_of_its_session_and_forgets_it_when_lost():
     b.sess = pp.DaemonSession(8)                                       # daemon restart: new epoch
     b.step(10)
     assert b.panel.info is None
-
-
-def _give_info(b, **kw):
-    b.panel.on_info(pp.decode(pp.encode_info(_info(sid=b.sess.sid, **kw))))
-
-
-def test_info_stops_being_current_when_a_run_starts_r1_r5():
-    b = Bench()
-    b.step(10)
-    _give_info(b, run_no=3, result_run=3)
-    assert b.panel.info_current
-    b.run_state = pp.ST_RUN                                            # a run from the PC
-    b.step(10)
-    assert not b.panel.info_current and b.panel.info.run_no == 3      # INFO kept, not current
-    _give_info(b, run_no=4)
-    b.step(30)                                                         # more active STATUS: same run
-    assert b.panel.info_current
-    b.run_state = pp.ST_END
-    b.step(10)
-    assert b.panel.info_current                                        # END is not a run start
-    b.run_state = pp.ST_RUN
-    b.step(10)
-    assert not b.panel.info_current
-
-
-def test_info_stops_being_current_after_a_status_gap_r1_r5():
-    b = Bench()
-    b.step(10)
-    _give_info(b, run_no=1)
-    t0 = b.t
-    b.drop_down = lambda f: f[0] == pp.START_STATUS and b.t <= t0 + 100   # one STATUS lost: 200 ms
-    b.step(20)
-    assert b.panel.info_current
-    t1 = b.t
-    b.drop_down = lambda f: f[0] == pp.START_STATUS and b.t <= t1 + 200   # two lost: 300 ms > 250
-    b.step(30)
-    assert not b.panel.info_current
-    _give_info(b, run_no=1)
-    assert b.panel.info_current
 
 
 def test_stop_without_link_after_a_given_up_start_goes_at_stale_plus_one():

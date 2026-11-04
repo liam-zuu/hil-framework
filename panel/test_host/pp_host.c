@@ -59,8 +59,6 @@ uint32_t pp_host_ev_dropped(const pp_client_t *c) { return c->ev_dropped; }
 int pp_host_link_open(const pp_client_t *c) { return c->has_status_t; }
 
 const pp_info_t *pp_host_info(const pp_client_t *c) { return c->has_info ? &c->info : NULL; }
-int pp_host_info_current(const pp_client_t *c) { return pp_client_info_current(c); }
-
 pp_parser_t *pp_host_parser_new(uint8_t accept, uint32_t stale_ms)
 {
     pp_parser_t *p = (pp_parser_t *)malloc(sizeof *p);

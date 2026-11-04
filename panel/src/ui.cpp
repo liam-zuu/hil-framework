@@ -259,13 +259,13 @@ uint32_t ui_signature(const PanelView &v)
     /* field by field: struct padding is not hashed (data age alone is not worth a redraw) */
     if (c->has_st) {
         const pp_status_t &st = c->st;
-        uint16_t f[8] = {st.run_state, st.phase_ds, st.profile, st.outcome, st.quality, st.lost,
-                         st.links, st.error_code};
+        uint16_t f[9] = {st.run_state, st.phase_ds, st.profile, st.outcome, st.quality, st.lost,
+                         st.links, st.error_code, st.run_no};
         h = fnv(h, f, sizeof f);
     }
     if (c->has_info) {
         const pp_info_t &in = c->info;
-        uint16_t f[6] = {in.loop_us, in.overruns, in.flags, in.ctrl_src, in.run_no, in.result_run};
+        uint16_t f[5] = {in.loop_us, in.overruns, in.flags, in.ctrl_src, in.result_run};
         h = fnv(h, f, sizeof f);
         h = fnv(h, in.ctrl, strlen(in.ctrl));
         for (int k = 0; k < PP_RESULT_LINES; k++)

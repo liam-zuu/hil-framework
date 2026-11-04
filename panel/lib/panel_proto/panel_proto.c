@@ -54,6 +54,7 @@ void pp_decode_status(const uint8_t *f, pp_status_t *s)
     s->links = f[25];
     s->error_code = f[26];
     s->last_cmd = f[27];
+    s->run_no = get16(f + 28);
 }
 
 /* ASCII field, NUL padded -> C string cut at the first NUL (Python: split(b'\x00')[0]).
@@ -84,9 +85,8 @@ void pp_decode_info(const uint8_t *f, pp_info_t *i)
     text(i->ctrl, f + 12, PP_CTRL_LEN);
     for (int k = 0; k < PP_RESULT_LINES; k++)
         text(i->result[k], f + 20 + k * PP_RESULT_LEN, PP_RESULT_LEN);
-    i->run_no = get16(f + 80);
-    i->result_run = get16(f + 82);
-    text(i->error_text, f + 84, PP_ERROR_TEXT_LEN);
+    i->result_run = get16(f + 80);
+    text(i->error_text, f + 82, PP_ERROR_TEXT_LEN);
 }
 
 /* ── StreamParser ── */
@@ -245,11 +245,6 @@ bool pp_client_link(const pp_client_t *c, uint32_t now_ms)
     return c->has_status_t && (uint32_t)(now_ms - c->last_status_ms) < PP_NO_LINK_MS;
 }
 
-bool pp_client_info_current(const pp_client_t *c)
-{
-    return c->has_info && c->info_starts == c->run_starts && c->info_gaps == c->gaps;
-}
-
 /* _give_up */
 static void give_up(pp_client_t *c, const pp_pending_t *p)
 {
@@ -384,13 +379,6 @@ static void on_status(pp_client_t *c, const pp_status_t *st, uint32_t now_ms)
         lose_session(c, now_ms);
         return;
     }
-    if (c->has_st_rx && (uint32_t)(now_ms - c->st_rx_ms) > PP_INFO_GAP_MS)
-        c->gaps++;                              /* a short run may hide in the gap */
-    c->st_rx_ms = now_ms;
-    c->has_st_rx = true;
-    bool was_active = c->has_st && PP_ST_IS_ACTIVE(c->st.run_state);
-    if (PP_ST_IS_ACTIVE(st->run_state) && !was_active)
-        c->run_starts++;                        /* a run began after the previous STATUS */
     c->last_status_ms = now_ms;
     c->has_status_t = true;
     c->next_seq = st->next_seq;
@@ -480,8 +468,6 @@ void pp_client_on_frame(pp_client_t *c, const uint8_t *frame, size_t len, uint32
             c->info = in;
             c->has_info = true;
             c->info_count++;
-            c->info_starts = c->run_starts;
-            c->info_gaps = c->gaps;
         }
     }
 }

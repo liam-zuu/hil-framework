@@ -25,9 +25,9 @@ RunControl contract (what stage E implements):
   * run_no / result_run in the snapshot (Codex round 3 R1-R5, Liam 04/11: "(a) Sửa gốc + R3"):
     the run manager counts every run it starts, from the panel or from the PC
     (panel_proto.next_run_no: 1..65535, then 1); run_no is the current run, or the last one
-    when none is active; result_run is the run the result lines belong to (0 = none).
-    Result lines with result_run 0 are not sent as valid: the panel could not tell whose
-    they are.
+    when none is active, and goes into every STATUS (Codex round 4, Liam 04/11: "A: run_no vào
+    STATUS"); result_run is the run the result lines belong to (0 = none), in INFO. Result
+    lines with result_run 0 are not sent as valid: the panel could not tell whose they are.
 
 Run it on the Pi (only when stage E provides a RunControl; --demo uses the FAKE run):
     python panel_link.py --port /dev/ttyAMA0 --epoch-file ~/.hil_panel_epoch [--create-epoch] --demo
@@ -88,19 +88,19 @@ def status_of(snap: RunSnapshot, sess: pp.DaemonSession) -> pp.Status:
                    profile=pp.PROFILE_NONE if snap.profile is None else snap.profile,
                    outcome=snap.outcome, quality=snap.quality, lost=snap.lost,
                    data_age_ms=0xFFFF if snap.data_age_ms is None else snap.data_age_ms,
-                   links=links, error_code=snap.error_code)
+                   links=links, error_code=snap.error_code, run_no=snap.run_no)
     return sess.fill(st)
 
 
 def info_of(snap: RunSnapshot, sid: int) -> pp.Info:
     # no result while a run is active, whatever the run manager says (contract v6, Codex Q1)
-    # and no result lines without the run they belong to (R1-R5)
+    # and no result lines without the run they belong to (R1-R5, S1-S6)
     result = () if snap.run_state in pp.ST_ACTIVE or not snap.result_run else tuple(snap.result)[:pp.RESULT_LINES]
     valid = any(result)
     flags = (pp.I_LOOP_VALID if snap.loop_us is not None else 0) | (pp.I_RESULT_VALID if valid else 0)
     return pp.Info(sid=sid, loop_us=snap.loop_us or 0, overruns=snap.overruns or 0, flags=flags,
                    ctrl_src=snap.ctrl_src, ctrl=snap.ctrl, result=result, error_text=snap.error_text,
-                   run_no=snap.run_no, result_run=snap.result_run if valid else 0)
+                   result_run=snap.result_run if valid else 0)
 
 
 def nonblocking_writer(port) -> Callable[[bytes], int]:
@@ -176,12 +176,7 @@ class PanelLink:
             snap = snap or self.run.snapshot()
             info = pp.encode_info(info_of(snap, self.sess.sid))
             age = None if self.t_info is None else now - self.t_info
-            changed = info != self.last_info
-            # a changed INFO also replaces one that has no byte out yet, whatever the gap: no
-            # wire time is added, and an INFO taken before a run started never goes out after
-            # that run's first STATUS (TxQueue puts STATUS first; R1-R5)
-            if self.last_info is None or age >= INFO_PERIOD_S or (changed and age >= INFO_MIN_GAP_S) or \
-                    (changed and self.tx.info_unsent()):
+            if self.last_info is None or age >= INFO_PERIOD_S or (info != self.last_info and age >= INFO_MIN_GAP_S):
                 self.t_info, self.last_info = now, info
                 self.tx.put(info)
         self._pump(now)

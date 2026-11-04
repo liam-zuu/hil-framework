@@ -100,7 +100,7 @@ def test_info_mapping_valid_flags():
     i = info_of(RunSnapshot(loop_us=27, overruns=3, result=('x', '', ''), ctrl='LADRC',
                             ctrl_src=pp.CTRL_SRC_FW, run_no=7, result_run=7), 9)
     assert i.flags == pp.I_LOOP_VALID | pp.I_RESULT_VALID and i.overruns == 3 and i.ctrl == 'LADRC'
-    assert (i.run_no, i.result_run) == (7, 7)
+    assert i.result_run == 7
 
 
 def test_handshake_profiles_and_info_at_once():
@@ -208,7 +208,7 @@ def test_fake_run_full_cycle_and_fault_ack():
 
 def test_no_result_while_a_run_is_active_codex_q1():
     i = info_of(RunSnapshot(run_state=pp.ST_RUN, result=('old', '', ''), run_no=5, result_run=4), 1)
-    assert not any(i.result) and not i.flags & pp.I_RESULT_VALID and (i.run_no, i.result_run) == (5, 0)
+    assert not any(i.result) and not i.flags & pp.I_RESULT_VALID and i.result_run == 0
     i = info_of(RunSnapshot(run_state=pp.ST_END, result=('new', '', ''), run_no=5, result_run=5), 1)
     assert i.result[0] == 'new' and i.flags & pp.I_RESULT_VALID and i.result_run == 5
 
@@ -239,44 +239,22 @@ def test_fake_run_counts_runs_and_names_the_result_r1_r5():
     assert s.run_state == pp.ST_END and (s.run_no, s.result_run) == (2, 0)   # user stop: no result
 
 
-class GateUart:
-    """Takes nothing while closed, everything when open."""
-
-    def __init__(self):
-        self.open = False
-        self.data = bytearray()
-
-    def __call__(self, data):
-        if not self.open:
-            return 0
-        self.data += data
-        return len(data)
-
-
-def test_info_taken_before_a_run_never_follows_its_first_status_r1_r5():
-    """An INFO of run A waits (UART full); START B: the link's STATUS goes first, and the
-    waiting INFO is replaced by one of B at the next poll even inside INFO_MIN_GAP_S."""
-    t = [0.0]
-    uart = GateUart()
-    run = FakeRun(run_s=1.0, clock=lambda: t[0])
-    link = PanelLink(5, run, uart, clock=lambda: t[0])
-    panel = pp.PanelClient(iter(range(0x800, 0x900)).__next__)
-    for f in panel.tick(0):
-        link.feed(f)                                        # HELLO
-    link.poll()                                             # STATUS + INFO(run 0) wait
-    assert link.tx.info_unsent()
-    t[0] += 0.01
-    link.feed(pp.encode_cmd(link.sess.sid, 0, pp.CMD_START, 0))   # fence skipped: seq 0 is next
-    link.poll()
-    uart.open = True
-    for _ in range(5):                                      # 50 ms: the wire budget refills
-        t[0] += 0.01
-        link.poll()
-    out = pp.StreamParser().feed(bytes(uart.data))
-    first_active = next(k for k, x in enumerate(out) if isinstance(x, pp.Status) and x.run_state in pp.ST_ACTIVE)
-    later = [x for x in out[first_active:] if isinstance(x, pp.Info)]
-    assert later and all(x.run_no == 1 for x in later)
-    assert not any(isinstance(x, pp.Info) and x.run_no == 0 for x in out[first_active:])
+def test_every_status_carries_the_run_it_is_about_s1_s6():
+    """Codex round 4 S1-S6 (Liam 04/11: "A: run_no vào STATUS")."""
+    assert status_of(RunSnapshot(run_no=9), pp.DaemonSession(1)).run_no == 9
+    t = {'w': None}
+    w = Wire(FakeRun(('A', 'B'), run_s=0.5, clock=lambda: t['w'].t / 1000 if t['w'] else 0.0))
+    t['w'] = w
+    w.step(30)
+    w.link.run.start(0)                                     # from the PC: run 1
+    w.step(250)
+    w.link.run.start(1)                                     # run 2
+    w.step(250)
+    st = [(x.run_state, x.run_no) for _, x in w.frames if isinstance(x, pp.Status)]
+    assert st[0][1] == 0 and (pp.ST_END, 1) in st and st[-1] == (pp.ST_END, 2)
+    first_2 = next(k for k, s in enumerate(st) if s[1] == 2)
+    assert all(n == 2 for _, n in st[first_2:]) and all(n in (0, 1) for _, n in st[:first_2])
+    assert st[first_2][0] in pp.ST_ACTIVE                   # run 2 is named from its first STATUS
 
 
 def test_reference_panel_drops_old_names_when_the_list_count_changes_codex_q4():

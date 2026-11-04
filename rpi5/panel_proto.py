@@ -10,9 +10,11 @@ process, never inside the 1 kHz loop. Version 5: 16-bit command seq that never w
 a session; STATUS carries the command code of the last frame handled, so an ACK matches a
 command by seq AND code (V1, V3). Version 6 (Liam 04/11, PANEL session): adds the INFO
 frame (0xDF) for what M2 shows beyond STATUS; the three older layouts are unchanged, only the
-version byte is 6. INFO revised inside v6 before any board run (Codex round 3 R1-R5, Liam
-04/11, PANEL session: "(a) Sửa gốc + R3"): run_no / result_run name the run the result lines
-belong to, error_text is 20 bytes.
+version byte is 6. Revised inside v6 before any board run: INFO result_run names the run the
+result lines belong to (Codex round 3 R1-R5, Liam 04/11, PANEL session: "(a) Sửa gốc + R3");
+STATUS carries run_no, so every STATUS says which run it belongs to and the panel infers
+nothing (Codex round 4 S1-S6, Liam 04/11, PANEL session: "A: run_no vào STATUS"; STATUS is
+32 bytes, CMD and PROFILE keep their layout).
 
 Frames (multi-byte fields little-endian; every frame ends with CRC-16/CCITT-FALSE,
 poly 0x1021, init 0xFFFF, over all previous bytes of the frame, start byte included):
@@ -26,7 +28,7 @@ poly 0x1021, init 0xFFFF, over all previous bytes of the frame, start byte inclu
     9-10  arg        uint16 (HELLO: panel_boot; SELECT/START: profile index 0..PROFILE_MAX)
     11-12 crc
 
-  STATUS  daemon -> panel, 30 bytes, ~10 Hz and after every command
+  STATUS  daemon -> panel, 32 bytes, ~10 Hz and after every command
     0     0xDD
     1     version
     2-5   sid           current session id (0 = none: the panel sends HELLO)
@@ -48,7 +50,10 @@ poly 0x1021, init 0xFFFF, over all previous bytes of the frame, start byte inclu
     25    links         L_* bits
     26    error_code    0 = none (table: decided with panel M2, B19)
     27    last_cmd      CMD_* of the last command handled (0 while last_result is RES_NONE)
-    28-29 crc
+    28-29 run_no        the run this STATUS is about: the current run, or the last one when
+                        none is active; +1 at every run start, from the panel or from the PC;
+                        1..65535, after 65535 comes 1; 0 = no run since the run manager started
+    30-31 crc
 
   PROFILE daemon -> panel, 28 bytes, the list the panel scrolls with NAV
     0     0xDE
@@ -73,12 +78,10 @@ poly 0x1021, init 0xFFFF, over all previous bytes of the frame, start byte inclu
     20-79 result        3 lines of 20 ASCII, NUL padded: RESULT screen (metrics of the last
                         finished run); an empty line is not drawn. While a run is active
                         (ST_ACTIVE) the daemon sends no result (I_RESULT_VALID clear)
-    80-81 run_no        the current run, or the last one when none is active: +1 at every
-                        run start, from the panel or from the PC; 1..65535, after 65535
-                        comes 1; 0 = no run since the run manager started
-    82-83 result_run    the run the result lines belong to; 0 = no result lines
-                        (I_RESULT_VALID is set only with result_run != 0)
-    84-103 error_text   ASCII, NUL padded (20): what the FAULT screen says under error_code
+    80-81 result_run    the run (STATUS run_no) the result lines belong to; 0 = no result
+                        lines (I_RESULT_VALID is set only with result_run != 0). The panel
+                        shows them only under the END of that run
+    82-103 error_text   ASCII, NUL padded (22): what the FAULT screen says under error_code
     104-105 crc
 
 Daemon rules (DaemonSession):
@@ -127,14 +130,14 @@ START_STATUS  = 0xDD
 START_PROFILE = 0xDE
 START_INFO    = 0xDF
 LEN_CMD     = 13
-LEN_STATUS  = 30
+LEN_STATUS  = 32
 LEN_PROFILE = 28
 LEN_INFO    = 106
 NAME_LEN    = 18
 CTRL_LEN    = 8
 RESULT_LINES = 3
 RESULT_LEN  = 20
-ERROR_TEXT_LEN = 20
+ERROR_TEXT_LEN = 22
 RUN_NO_MAX  = 0xFFFF        # run_no counts 1..RUN_NO_MAX, then 1 again (0 = no run)
 _LEN = {START_CMD: LEN_CMD, START_STATUS: LEN_STATUS, START_PROFILE: LEN_PROFILE,
         START_INFO: LEN_INFO}
@@ -248,6 +251,7 @@ class Status:
     links: int = L_RPI
     error_code: int = 0
     last_cmd: int = 0
+    run_no: int = 0          # run this STATUS is about (0 = none yet)
 
 
 @dataclass
@@ -258,7 +262,7 @@ class Profile:
     name: str
 
 
-_STATUS_FMT = '<IHHHBHBHBBBHHBBB'     # bytes 2..27
+_STATUS_FMT = '<IHHHBHBHBBBHHBBBH'    # bytes 2..29
 
 
 def encode_status(s: Status) -> bytes:
@@ -269,7 +273,7 @@ def encode_status(s: Status) -> bytes:
                      s.last_cmd_seq & 0xFFFF, s.last_result & 0xFF, s.next_seq & 0xFFFF, s.run_state & 0xFF,
                      _sat16(s.phase_ds), s.profile & 0xFF, s.outcome & 0xFF, s.quality & 0xFF,
                      _sat16(s.lost), _sat16(s.data_age_ms), s.links & 0xFF, s.error_code & 0xFF,
-                     s.last_cmd & 0xFF)
+                     s.last_cmd & 0xFF, s.run_no & 0xFFFF)
     return _seal(buf)
 
 
@@ -292,7 +296,6 @@ class Info:
     ctrl: str = ''
     result: tuple = ('', '', '')
     error_text: str = ''
-    run_no: int = 0
     result_run: int = 0
 
 
@@ -320,8 +323,8 @@ def encode_info(i: Info) -> bytes:
     buf[12:20] = _ascii(i.ctrl, CTRL_LEN)
     for k, line in enumerate(lines):
         buf[20 + k * RESULT_LEN:20 + (k + 1) * RESULT_LEN] = _ascii(line, RESULT_LEN)
-    struct.pack_into('<HH', buf, 80, i.run_no & 0xFFFF, i.result_run & 0xFFFF)
-    buf[84:104] = _ascii(i.error_text, ERROR_TEXT_LEN)
+    struct.pack_into('<H', buf, 80, i.result_run & 0xFFFF)
+    buf[82:104] = _ascii(i.error_text, ERROR_TEXT_LEN)
     return _seal(buf)
 
 
@@ -340,9 +343,9 @@ def decode(frame: bytes):
         sid, loop_us, overruns, flags, ctrl_src = struct.unpack_from('<IHHBB', frame, 2)
         result = tuple(_text(frame[20 + k * RESULT_LEN:20 + (k + 1) * RESULT_LEN])
                        for k in range(RESULT_LINES))
-        run_no, result_run = struct.unpack_from('<HH', frame, 80)
+        result_run, = struct.unpack_from('<H', frame, 80)
         return Info(sid, loop_us, overruns, flags, ctrl_src, _text(frame[12:20]), result,
-                    _text(frame[84:104]), run_no, result_run)
+                    _text(frame[82:104]), result_run)
     raise ValueError(f"unknown start byte 0x{start:02X}")
 
 
@@ -563,7 +566,6 @@ RESEND_MS        = 200      # resend a command not yet acknowledged [ĐỀ XUẤ
 HELLO_RESEND_MS  = 200      # [ĐỀ XUẤT]
 CMD_MAX_AGE_MS   = 3_000    # SELECT/START not acknowledged by then: given up, seq stays stale [ĐỀ XUẤT]
 PROFILE_WAIT_MS  = 1_000    # PROFILE list incomplete this long after a session starts: ask again [ĐỀ XUẤT]
-INFO_GAP_MS      = 250      # STATUS gap longer than this: a short run may have been missed (R1) [ĐỀ XUẤT]
 
 
 class PanelClient:
@@ -618,15 +620,6 @@ class PanelClient:
       * INFO (v6): the newest INFO of the session is kept (`info`) and drawn as it is; INFO of
         another sid is ignored; a lost session forgets it. Nothing is sent for INFO: a missing
         INFO only leaves the fields unknown ('-').
-      * Is the newest INFO still current (R1-R5)? STATUS and INFO are separate frames, so a run
-        may begin after the newest INFO. Two counters of evidence: run_starts (a STATUS of the
-        session with an active run_state after one that was not active; an active first STATUS
-        of a session counts too) and gaps (a STATUS of the session more than INFO_GAP_MS after the one
-        before: a whole short run may hide in the gap). info_current is true when neither
-        moved since the newest INFO arrived. The daemon replaces an INFO it has not started to
-        send when the INFO changes (PanelLink), so an INFO that arrives after an active STATUS
-        carries that run's run_no or a later one. The panel app takes run_no / result_run only
-        from a current INFO.
     tick(now_ms) and the on_* methods return the frames to send now.
     """
 
@@ -649,16 +642,6 @@ class PanelClient:
         self._t_hello: Optional[float] = None
         self.fence = False                          # SYNC at next_seq still due after the handshake (W1)
         self.info: Optional[Info] = None            # newest INFO of the session (v6)
-        self.run_starts = 0                         # evidence that a run began (never reset)
-        self.gaps = 0                               # STATUS gaps longer than INFO_GAP_MS (never reset)
-        self._prev_active = False                   # run_state of the previous STATUS of the session was active
-        self._t_status_rx: Optional[float] = None   # arrival of the newest STATUS of a session (never expires)
-        self._info_mark: Optional[tuple] = None     # (run_starts, gaps) when the newest INFO arrived
-
-    @property
-    def info_current(self) -> bool:
-        """The newest INFO came after every sign of a run start or a STATUS gap."""
-        return self.info is not None and self._info_mark == (self.run_starts, self.gaps)
 
     def _new_boot(self) -> int:
         while True:
@@ -751,7 +734,6 @@ class PanelClient:
         self.sid, self.next_seq, self.daemon_boot = 0, None, None
         self.profiles, self.profile_count, self._t_session = {}, None, None
         self.info = None
-        self._prev_active = False
         self._t_hello = None
         return self.tick(now_ms)
 
@@ -765,13 +747,6 @@ class PanelClient:
                 return []
         elif st.daemon_boot != self.daemon_boot or st.sid != self.sid or st.panel_boot != self.boot:
             return self._lose_session(now_ms)
-        if self._t_status_rx is not None and now_ms - self._t_status_rx > INFO_GAP_MS:
-            self.gaps += 1                                  # a short run may hide in the gap
-        self._t_status_rx = now_ms
-        active = st.run_state in ST_ACTIVE
-        if active and not self._prev_active:
-            self.run_starts += 1                            # a run began after this STATUS's predecessor
-        self._prev_active = active
         self.last_status_ms = now_ms
         self.next_seq = st.next_seq
         acked = st.last_result != RES_NONE
@@ -826,7 +801,6 @@ class PanelClient:
     def on_info(self, info: Info) -> None:
         if self.sid and info.sid == self.sid:
             self.info = info
-            self._info_mark = (self.run_starts, self.gaps)
 
 
 # ── daemon side: non-blocking UART writer (9.6) ───────────────────────────
@@ -910,11 +884,6 @@ class TxQueue:
 
     def pending(self) -> bool:
         return bool(self._current or self._status or self._info or self._profiles)
-
-    def info_unsent(self) -> bool:
-        """An INFO waits that has no byte out yet (put() of a newer INFO replaces it)."""
-        return self._info is not None or \
-            bool(self._current and self._current[0] == START_INFO and self._sent == 0)
 
     def pump(self, max_bytes: Optional[int] = None) -> int:
         """Write what the UART takes now, at most max_bytes (a bounded amount of work per call
