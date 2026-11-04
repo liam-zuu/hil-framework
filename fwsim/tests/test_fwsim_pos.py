@@ -19,6 +19,10 @@ pytestmark = pytest.mark.skipif(not os.path.isfile(_DLL), reason='fwsim.dll not 
 
 P = {n: i for i, n in enumerate(fwsim.POS_COLS)}
 ON = dict(pos_on=1, pos_kp=6.0, pos_ki=3.0)
+# Firmware defaults since 04/11 (Liam, CODE session: "làm cách 1 ban khuyến nghị đi"): loop, (a), (d) ON.
+# Tests of one part alone turn the others off by name.
+OFF = dict(pos_on=0, pos_e_win=0.0, still_on=0)
+DEFAULTS = (1, 6.0, 3.0, 0.5, 0.005, 0.010, 1, 0.05, 500000)   # pos_params(): on .. t_still_us
 
 
 @pytest.fixture(scope='module')
@@ -48,9 +52,15 @@ def const(vx=0.0, vy=0.0, wz=0.0):
     return lambda t: (vx, vy, wz)
 
 
-def test_default_off_no_correction(fw):
-    """Default (pos_params on = false): no correction, but the poses are still tracked."""
-    log = fwsim.simulate(fw, const(vx=0.3, wz=0.3), 3.0, imu={})
+def test_defaults_on(fw):
+    """Firmware defaults (campaign firmware): position loop, (a) window, (d) hold all on."""
+    fwsim.simulate(fw, const(vx=0.3), 0.5, imu={})
+    assert fw.pos_params() == pytest.approx(DEFAULTS, rel=1e-6)
+
+
+def test_off_no_correction(fw):
+    """Turned off by name (pos_on = 0): no correction, but the poses are still tracked."""
+    log = fwsim.simulate(fw, const(vx=0.3, wz=0.3), 3.0, imu={}, fw_params=OFF)
     assert fw.pos_params()[0] == 0
     assert np.all(col(log, 'pos_on') == 0)
     assert np.all(col(log, 'pos_corr_vx') == 0) and np.all(col(log, 'pos_corr_vy') == 0)
@@ -97,7 +107,7 @@ def test_heading_estimate_takes_imu_yaw(fw):
 def test_loop_cuts_estimated_error_on_straight_line(fw):
     """Straight 0.3 m/s for 6 s: the per-wheel plant parameters (S01) drift the car; the loop
     keeps the estimated pose closer to the command pose than without it."""
-    off = fwsim.simulate(fw, const(vx=0.3), 6.0, imu={})
+    off = fwsim.simulate(fw, const(vx=0.3), 6.0, imu={}, fw_params=OFF)
     on = fwsim.simulate(fw, const(vx=0.3), 6.0, imu={}, fw_params=ON)
     e = lambda g: np.hypot(col(g, 'pos_x_ref') - col(g, 'pos_x'), col(g, 'pos_y_ref') - col(g, 'pos_y'))  # noqa: E731
     assert e(on)[-1] < 0.5 * e(off)[-1]
@@ -170,8 +180,8 @@ def _traction():
     return p
 
 
-def test_a_d_off_by_default(fw):
-    log = fwsim.simulate(fw, const(vx=0.3), 2.0, imu={}, fw_params=ON)
+def test_a_d_off_by_name(fw):
+    log = fwsim.simulate(fw, const(vx=0.3), 2.0, imu={}, fw_params=dict(ON, pos_e_win=0.0, still_on=0))
     pp = fw.pos_params()
     assert pp[4] == 0 and pp[6] == 0                      # e_win 0, still_on 0
     assert np.all(col(log, 'pos_in_pos') == 0) and np.all(col(log, 'still') == 0)
@@ -213,7 +223,7 @@ def test_window_only_with_zero_command(fw):
     gives no correction."""
     sp = lambda t: (0.3, 0.0, 0.0) if t < 2.0 else (0.0, 0.0, 0.0)  # noqa: E731
     log = fwsim.simulate(fw, sp, 5.0, _traction(), seed=1, mode='PID', imu={},
-                         fw_params=dict(ON, pos_e_win=0.005))
+                         fw_params=dict(ON, pos_e_win=0.005, still_on=0))
     t, inpos = log['t'], col(log, 'pos_in_pos') == 1
     assert not inpos[t < 2.0].any()
     assert inpos.any()
@@ -226,7 +236,7 @@ def test_hold_stops_position_correction(fw):
     estimated error after the hunting stops is several mm."""
     sch = o1.Schedule(0.5)
     log = fwsim.simulate(fw, sch.setpoint, sch.Tcmd + o1.T_LATE, _traction(), seed=1, mode='ADRC', imu={},
-                         fw_params=dict(ON, still_on=1))
+                         fw_params=dict(ON, pos_e_win=0.0, still_on=1))
     held = col(log, 'still') == 1
     assert held.any()
     e = np.hypot(col(log, 'pos_ex_b'), col(log, 'pos_ey_b'))

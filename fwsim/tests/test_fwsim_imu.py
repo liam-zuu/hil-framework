@@ -320,9 +320,12 @@ def test_bias_estimated_at_standstill(fw):
 
 def test_no_bias_with_motor_on_and_gyro_offset(fw):
     """Motor enabled, setpoint 0: the gyro offset drives the wz loop, PWM is not 0, so the
-    standstill condition (motor disabled or PWM = 0) is not met: no bias update."""
+    standstill condition (motor disabled or PWM = 0) is not met: no bias update.
+    Without the (d) hold: the hold (on by default since 04/11) sets the PWM to 0, which meets
+    the standstill condition, so the bias is then learnt (2 updates in 6 s, fwsim 04/11)."""
     hook = lambda t, k, v: v + 0.01 if k == 'gyro' else v   # noqa: E731
-    log = fwsim.simulate(fw, const(), 6.0, imu=dict(hook=hook), fw_params=dict(sigma_gz=0.01, sigma_a=0.05))
+    log = fwsim.simulate(fw, const(), 6.0, imu=dict(hook=hook),
+                         fw_params=dict(sigma_gz=0.01, sigma_a=0.05, **fwsim.vel_loop_only(fw)))
     assert np.abs(log['pwm']).max() > 0
     assert col(log, 'bias_updates')[-1] == 0
 

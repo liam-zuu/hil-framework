@@ -57,6 +57,23 @@ IMU_COLS = ['g_valid', 'r_valid', 'wz_src', 'wz_meas', 'gz', 'yaw', 'age_g_ms', 
 POS_COLS = ['pos_on', 'pos_corr_vx', 'pos_corr_vy', 'pos_x_ref', 'pos_y_ref', 'pos_th_ref',
             'pos_x', 'pos_y', 'pos_th', 'pos_ex_b', 'pos_ey_b', 'pos_th_src',
             'pos_in_pos', 'still']     # (a) in-position window, (d) standstill hold (04/11)
+# The firmware turns the loop, (a) and (d) ON by default since 04/11 (Liam, CODE session:
+# "làm cách 1 ban khuyến nghị đi"). Velocity-loop-only runs pass vel_loop_only(fw) as fw_params.
+VEL_LOOP_ONLY = dict(pos_on=0, pos_e_win=0.0, still_on=0)
+
+
+def vel_loop_only(fw):
+    """fw_params that turn the position loop, (a) and (d) off; {} for a DLL without pos_ctrl.c."""
+    return dict(VEL_LOOP_ONLY) if fw.pos_cols else {}
+
+
+def pos_meta(fw):
+    """Position loop + standstill hold parameters as the firmware holds them now (for meta.yaml);
+    None for a DLL without pos_ctrl.c."""
+    if not fw.pos_cols:
+        return None
+    return dict(zip(('on', 'kp', 'ki', 'v_corr_max', 'e_win', 'e_exit', 'still_on', 'v_still', 't_still_us'),
+                    (float(x) for x in fw.pos_params())))
 # Wheel-consistency slip flag (wheel_slip.c, AGV feat/wheel-slip): only with a DLL that has it
 WS_COLS = ['ws_res', 'ws_th', 'ws_eval', 'ws_flag', 'ws_on_count']
 

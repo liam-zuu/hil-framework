@@ -39,7 +39,8 @@ def test_pid_defaults_match_pid_c(fw):
 
 
 def test_forward_step_moves_forward(fw):
-    log = fwsim.simulate(fw, const(vx=0.3), 4.0)
+    # velocity loop alone (the position loop, on by default since 04/11, removes this error)
+    log = fwsim.simulate(fw, const(vx=0.3), 4.0, fw_params=fwsim.vel_loop_only(fw))
     late = log['t'] > 3.0
     # Default pid.c gains leave a steady error (ki = 0.05, motor dead zone): about 0.27 m/s here
     assert 0.25 < np.mean(log['v_true'][late, 0]) <= 0.3
@@ -79,9 +80,11 @@ def test_adrc_defaults_match_adrc_c(fw):
 
 
 def test_adrc_no_steady_error(fw):
-    """LADRC (body-velocity level, b0 from S01) removes the steady error PID leaves at low speed."""
+    """LADRC (body-velocity level, b0 from S01) removes the steady error PID leaves at low speed.
+    Velocity loop alone: with the position loop the car catches up the lag of the start, so the
+    velocity overshoots (0.145 m/s on a 0.1 m/s step, fwsim 04/11)."""
     for v in (0.1, 0.3):
-        log = fwsim.simulate(fw, const(vx=v), 4.0, mode='ADRC')
+        log = fwsim.simulate(fw, const(vx=v), 4.0, mode='ADRC', fw_params=fwsim.vel_loop_only(fw))
         late = log['t'] > 3.0
         assert np.mean(log['v_true'][late, 0]) == pytest.approx(v, abs=0.005)
         assert np.max(log['v_true'][:, 0]) < 1.1 * v

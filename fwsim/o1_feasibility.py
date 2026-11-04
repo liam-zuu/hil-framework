@@ -31,6 +31,10 @@ IMU model noise-free, default firmware gains, no tuning; not main results.
 position loop pos_ctrl.c (AGV feat/pos-loop) with these gains; the command pose is integrated
 on the ESP32 from the same body-velocity command (A1), heading stays with heading.c (B1).
 The measures are unchanged (true plant pose); log.csv gets the pos_* columns.
+Since 04/11 (Liam, CODE session: "làm cách 1 ban khuyến nghị đi") the firmware turns the loop,
+(a) and (d) ON by default, so a run without --pos-loop already has them; turn them off with
+--fw-param pos_on=0 --fw-param pos_e_win=0 --fw-param still_on=0. The summary column pos_loop
+and meta.yaml are read back from the firmware, not taken from the options.
 """
 import argparse
 import csv
@@ -215,9 +219,7 @@ def main():
             params = fwsim.plant_params(a)
             log = fwsim.simulate(fw, sch.setpoint, sch.Tcmd + T_LATE, params, seed=1, mode=ctrl, imu=imu,
                                  fw_params=fw_params)
-            if fw.pos_cols:
-                pos_params = {n: v for n, v in zip(('on', 'kp', 'ki', 'v_corr_max', 'e_win', 'e_exit',
-                                                    'still_on', 'v_still', 't_still_us'), fw.pos_params())}
+            pos_params = fwsim.pos_meta(fw)
             gains[ctrl] = ({ax: fw.get_adrc(i) for i, ax in enumerate(['vx', 'vy', 'wz'])} if ctrl == 'ADRC'
                            else {ax: fw.get_pid(i) for i, ax in enumerate(['vx', 'vy', 'wz'])})
             res, rows = evaluate(log, path, sch)
@@ -229,7 +231,8 @@ def main():
                 w = csv.DictWriter(f, fieldnames=list(rows[0]))
                 w.writeheader()
                 w.writerows(rows)
-            summary.append(dict(run_id=run_id, controller=ctrl, pos_loop=int(bool(pos_loop)), **res))
+            summary.append(dict(run_id=run_id, controller=ctrl,
+                                pos_loop=int(bool(pos_params and pos_params['on'])), **res))
             print(f"{run_id}: e_perp_max={res['e_perp_max']:.3f} m, e_theta_max={res['e_theta_max_deg']:.1f} deg, "
                   f"|e_s|max={res['e_s_absmax']:.3f} m, stop {res['stop_dist_origin']:.3f} m, "
                   f"completed={res['completed']}, track_err={res['track_err_frames']}")

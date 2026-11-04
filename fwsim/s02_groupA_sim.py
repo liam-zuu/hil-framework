@@ -124,6 +124,7 @@ def main():
     p0 = fwsim.plant_params(a)
     gains = ({ax: fw.get_adrc(i) for i, ax in enumerate(['vx', 'vy', 'wz'])} if a.controller == 'ADRC'
              else {ax: fw.get_pid(i) for i, ax in enumerate(['vx', 'vy', 'wz'])})
+    pos_loop = fwsim.pos_meta(fw)
     fw.reset()
     with open(os.path.join(a.out, 'meta.yaml'), 'w', encoding='utf-8') as f:
         f.write(f"""spec: S02
@@ -133,6 +134,7 @@ setup: sim                     # fwsim: ESP32 firmware C code (DLL) + rpi5/plant
 operator: Claude (phiên CODE)
 controller: {a.controller}
 gains: {json.dumps(gains)}
+pos_loop: {json.dumps(pos_loop)}     # pos_ctrl.c + standstill hold read back (on by default since 04/11); null = DLL without pos_ctrl.c
 firmware:
   esp32: {json.dumps(b.get('esp32'))}
   hil_framework: {json.dumps(b.get('hil_framework'))}

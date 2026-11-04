@@ -139,6 +139,7 @@ firmware:
   hil_framework: {json.dumps(b.get('hil_framework'))}
   compiler: "{b.get('compiler')}"
   ctrl_mode: {a.mode}
+pos_loop: {json.dumps(fwsim.pos_meta(fw))}     # pos_ctrl.c + standstill hold read back (on by default since 04/11); null = DLL without pos_ctrl.c
 ga: {{algorithm: NSGA2, pop: {a.pop}, gen: {a.gen}, ga_seed: {a.ga_seed}, evaluations: {len(history)}, elapsed_s: {elapsed:.1f}}}
 variables: {json.dumps(dict(names=VARS, lower=a.lower, upper=a.upper, fixed=('kd = 0, limits from pid.c' if a.mode == 'PID' else 'b0, out_limit from adrc.c')))}
 objectives: "f1 = rms_vx + rms_vy + 0.24 * rms_wz (true plant body velocity vs setpoint); f2 = duty total variation per second; mean over plant seeds"
