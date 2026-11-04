@@ -116,3 +116,24 @@ def test_not_evaluable_before_window_and_at_standstill(fw):
     assert np.all(ev[log['t'] < 1.0] == 0)
     assert ev[log['t'] > 2.0].all()
     assert np.all(ws(log, 'ws_flag') == 0)
+
+
+def test_window_change_mid_run_restarts_history(fw):
+    """Codex P11 (05/11): changing ws_win_ticks while running restarts the history, so the
+    flag can be evaluated again after the new window fills (before: S.n never equal to len)."""
+    fw.reset()
+    fw.set_run(True, False)
+    k, c = 0, 0
+    def tick():
+        nonlocal k, c
+        k += 1
+        c += 20                                     # all wheels forward, 20 counts per tick
+        fw.tick(k * fwsim.FW_DT_US, [c, c, c, c], (0.0, 0.0, 0.0))
+        return fw.ws_last()
+    for _ in range(WIN + 5):
+        w = tick()
+    assert w[W['ws_eval']] == 1
+    fw.set_param('ws_win_ticks', 10)
+    evs = [tick()[W['ws_eval']] for _ in range(15)]
+    assert evs[0] == 0 and evs[-1] == 1
+    fw.set_param('ws_win_ticks', WIN)
