@@ -20,6 +20,24 @@ bool app_ready(const app_t *a, uint32_t now)
     return c->sid && pp_client_link(c, now) && c->has_st && (c->st.links & PP_L_H7);
 }
 
+uint16_t app_run(const app_t *a)
+{
+    return pp_client_info_current(a->c) ? a->c->info.run_no : 0;
+}
+
+/* the RESULT of the END now is closed by the user */
+static bool closed(const app_t *a)
+{
+    uint16_t run = app_run(a);
+    if (run)
+        return a->closed_valid && a->closed_run == run;
+    if (a->closed_unknown)
+        return true;
+    /* run not known: the last known run still holds while no run start was seen since */
+    return a->last_run && a->closed_valid && a->closed_run == a->last_run &&
+           a->c->run_starts == a->last_run_starts;
+}
+
 app_screen_t app_screen(const app_t *a, uint32_t now)
 {
     const pp_client_t *c = a->c;
@@ -29,7 +47,7 @@ app_screen_t app_screen(const app_t *a, uint32_t now)
         return APP_SCR_FAULT;
     if (PP_ST_IS_ACTIVE(c->st.run_state))
         return APP_SCR_RUN;
-    if (c->st.run_state == PP_ST_END && a->dismissed_gen != a->gen)
+    if (c->st.run_state == PP_ST_END && !closed(a))
         return APP_SCR_RESULT;
     return APP_SCR_HOME;
 }
@@ -37,10 +55,13 @@ app_screen_t app_screen(const app_t *a, uint32_t now)
 app_result_t app_result(const app_t *a)
 {
     const pp_client_t *c = a->c;
-    if (c->info_cleared_at <= a->info_count_at_gen)
-        return APP_RES_NOT_VERIFIED;            /* no cleared INFO since this generation (Q1) */
-    if (c->has_info && (c->info.flags & PP_I_RESULT_VALID))
-        return APP_RES_FRESH;                   /* the newest INFO came after the clearing */
+    uint16_t run = app_run(a);
+    if (!run)
+        return APP_RES_WAITING;                 /* which run ended is not known yet */
+    if ((c->info.flags & PP_I_RESULT_VALID) && c->info.result_run == run)
+        return APP_RES_FRESH;                   /* the lines of this run */
+    if ((c->info.flags & PP_I_RESULT_VALID) && c->info.result_run)
+        return APP_RES_NOT_VERIFIED;            /* lines of another run: never shown here */
     return APP_RES_WAITING;
 }
 
@@ -49,18 +70,23 @@ bool app_result_fresh(const app_t *a)
     return app_result(a) == APP_RES_FRESH;
 }
 
-static void new_gen(app_t *a)
+static void close_result(app_t *a)
 {
-    a->gen++;
-    a->info_count_at_gen = a->c->info_count;
-    a->have_end = false;            /* the next END seen belongs to this generation */
+    uint16_t run = app_run(a);
+    if (run) {
+        a->closed_run = run;
+        a->closed_valid = true;
+    } else {
+        a->closed_unknown = true;               /* given to the run known next (app_update) */
+        a->closed_unknown_starts = a->c->run_starts;
+        a->closed_unknown_gaps = a->c->gaps;
+    }
 }
 
 void app_init(app_t *a, pp_client_t *c)
 {
     memset(a, 0, sizeof *a);
     a->c = c;
-    a->gen = 1;
     a->drawn.result_profile = PP_PROFILE_NONE;
 }
 
@@ -89,37 +115,37 @@ static const char *res_name(uint8_t r)
 
 void app_update(app_t *a, uint32_t now)
 {
+    (void)now;
     pp_client_t *c = a->c;
     pp_event_t ev;
     while (pp_client_pop_event(c, &ev)) {
-        if (ev.what == PP_EV_DONE) {
+        if (ev.what == PP_EV_DONE)
             snprintf(a->msg, sizeof a->msg, "%s: %s", cmd_name(ev.cmd), res_name(ev.result));
-            /* a START answered "did not start" gives back the closed state it replaced (Q2);
-             * FAILED means "effect unknown": the run may exist, keep the new generation */
-            if (ev.cmd == PP_CMD_START && ev.result != PP_RES_OK && ev.result != PP_RES_FAILED &&
-                a->gen == a->start_gen && a->start_prev_dismissed)
-                a->dismissed_gen = a->gen;
-        } else if (ev.what == PP_EV_UNVERIFIED) {
+        else if (ev.what == PP_EV_UNVERIFIED)
             snprintf(a->msg, sizeof a->msg, "%s: not verified (may or may not have run)", cmd_name(ev.cmd));
-        } else {
+        else
             snprintf(a->msg, sizeof a->msg, "%s refused: busy or no link, press again", cmd_name(ev.cmd));
+    }
+    if (c->has_daemon_boot && (!a->has_daemon_boot || c->daemon_boot != a->daemon_boot)) {
+        a->has_daemon_boot = true;              /* another daemon: its runs count from 1 again */
+        a->daemon_boot = c->daemon_boot;
+        a->last_run = 0;
+        a->closed_valid = false;
+        a->closed_unknown = false;
+    }
+    uint16_t run = app_run(a);
+    if (a->closed_unknown) {
+        if (c->run_starts != a->closed_unknown_starts || c->gaps != a->closed_unknown_gaps) {
+            a->closed_unknown = false;          /* maybe another END since: hide nothing */
+        } else if (run) {
+            a->closed_unknown = false;          /* the END that was closed is this run */
+            a->closed_run = run;
+            a->closed_valid = true;
         }
     }
-    if (c->sid != a->last_sid) {                /* new session (or none) */
-        a->last_sid = c->sid;
-        new_gen(a);
-    }
-    bool link = c->sid && pp_client_link(c, now);
-    bool active = link && c->has_st && PP_ST_IS_ACTIVE(c->st.run_state);
-    if (active && !a->was_active)
-        new_gen(a);                             /* a run became active */
-    a->was_active = active;
-    if (link && c->has_st && c->st.run_state == PP_ST_END && c->st.phase_ds != 0xFFFF) {
-        uint32_t end_start = c->last_status_ms - (uint32_t)c->st.phase_ds * 100u;   /* phase_ds: 0.1 s */
-        if (a->have_end && (int32_t)(end_start - a->end_start_ms) > (int32_t)APP_END_JUMP_MS)
-            new_gen(a);                         /* another END than the one seen (Q2) */
-        a->end_start_ms = end_start;
-        a->have_end = true;
+    if (run) {
+        a->last_run = run;
+        a->last_run_starts = c->run_starts;
     }
     int n = profile_n(a);                       /* P3: keep the cursor in the list */
     if (n <= 0)
@@ -131,18 +157,22 @@ void app_update(app_t *a, uint32_t now)
 app_view_t app_view(const app_t *a, uint32_t now)
 {
     app_view_t v;
+    memset(&v, 0, sizeof v);
     v.screen = app_screen(a, now);
     v.cursor = a->cursor;
     v.sid = a->c->sid;
     v.profiles_gen = a->c->profiles_gen;
-    v.result_profile = (v.screen == APP_SCR_RESULT && a->c->has_st) ? a->c->st.profile : PP_PROFILE_NONE;
+    bool result = v.screen == APP_SCR_RESULT;
+    v.result_profile = (result && a->c->has_st) ? a->c->st.profile : PP_PROFILE_NONE;
+    v.result_run = result ? app_run(a) : 0;
     return v;
 }
 
 bool app_view_same(const app_view_t *x, const app_view_t *y)
 {
     return x->screen == y->screen && x->cursor == y->cursor && x->sid == y->sid &&
-           x->profiles_gen == y->profiles_gen && x->result_profile == y->result_profile;
+           x->profiles_gen == y->profiles_gen && x->result_profile == y->result_profile &&
+           x->result_run == y->result_run;
 }
 
 void app_drawing(app_t *a)
@@ -166,13 +196,7 @@ static void start(app_t *a, int profile, uint32_t now)
         snprintf(a->msg, sizeof a->msg, "test list not complete: START not sent");
         return;
     }
-    bool was_dismissed = a->dismissed_gen == a->gen;
-    pp_client_press(a->c, PP_CMD_START, (uint16_t)profile, now);
-    if (a->c->pending.active && a->c->pending.cmd == PP_CMD_START) {   /* it went out (Q2) */
-        new_gen(a);
-        a->start_gen = a->gen;
-        a->start_prev_dismissed = was_dismissed;
-    }
+    pp_client_press(a->c, PP_CMD_START, (uint16_t)profile, now);   /* nothing to begin here (R3) */
 }
 
 void app_buttons(app_t *a, uint8_t ev, uint32_t now)
@@ -181,15 +205,16 @@ void app_buttons(app_t *a, uint8_t ev, uint32_t now)
     if (ev & APP_EV_STOP) {                     /* P1: always, first, nothing else this read */
         pp_client_press(a->c, PP_CMD_STOP, 0, now);
         if (s == APP_SCR_RESULT || (a->drawn_valid && a->drawn.screen == APP_SCR_RESULT))
-            a->dismissed_gen = a->gen;
+            close_result(a);
         return;
     }
     if (!ev)
         return;
     app_view_t v = app_view(a, now);
     if (!a->drawn_valid || a->drawn.screen != v.screen || a->drawn.sid != v.sid ||
-        a->drawn.profiles_gen != v.profiles_gen || a->drawn.result_profile != v.result_profile) {
-        snprintf(a->msg, sizeof a->msg, "screen changing: press again");   /* P2, Q3 */
+        a->drawn.profiles_gen != v.profiles_gen || a->drawn.result_profile != v.result_profile ||
+        a->drawn.result_run != v.result_run) {
+        snprintf(a->msg, sizeof a->msg, "screen changing: press again");   /* P2, Q3, R5 */
         return;
     }
     int n = profile_n(a);
@@ -214,7 +239,7 @@ void app_buttons(app_t *a, uint8_t ev, uint32_t now)
         break;
     case APP_SCR_RESULT:
         if (ev & (APP_EV_NAV | APP_EV_NAV_BACK | APP_EV_SELECT))
-            a->dismissed_gen = a->gen;          /* back to HOME, nothing sent */
+            close_result(a);                    /* back to HOME, nothing sent */
         else if (ev & APP_EV_START)
             start(a, a->drawn.result_profile, now);     /* the test shown, again (Q3) */
         break;

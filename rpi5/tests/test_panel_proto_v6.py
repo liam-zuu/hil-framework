@@ -22,16 +22,30 @@ def test_info_layout_and_roundtrip():
     assert struct.unpack_from('<IHHBB', f, 2) == (SID1, 27, 0, pp.I_LOOP_VALID, pp.CTRL_SRC_PROFILE)
     assert f[12:20] == b'LADRC\x00\x00\x00'
     assert f[20:40] == b'e_vx 0.005 m/s' + bytes(6)
-    assert f[60:80] == bytes(20) and f[80:104] == bytes(24)
+    assert f[60:80] == bytes(20) and f[80:84] == bytes(4) and f[84:104] == bytes(20)
     assert struct.unpack_from('<H', f, 104)[0] == pp.crc16(f[:104])
     assert pp.decode(f) == _info()
+
+
+def test_info_run_numbers_and_error_text_layout_r1_r5():
+    """Codex round 3 R1-R5 (Liam 04/11: "(a) Sửa gốc + R3"): run_no at 80-81, result_run at
+    82-83 (little-endian), error_text 84-103 (20 bytes)."""
+    f = pp.encode_info(_info(run_no=0x1234, result_run=0xABCD, error_text='E' * 40))
+    assert f[80:84] == bytes([0x34, 0x12, 0xCD, 0xAB]) and f[84:104] == b'E' * 20
+    i = pp.decode(f)
+    assert (i.run_no, i.result_run, i.error_text) == (0x1234, 0xABCD, 'E' * 20)
+
+
+def test_next_run_no_never_zero_and_wraps_to_one():
+    assert [pp.next_run_no(k) for k in (0, 1, 41, pp.RUN_NO_MAX - 1, pp.RUN_NO_MAX)] == \
+        [1, 2, 42, pp.RUN_NO_MAX, 1]
 
 
 def test_info_text_truncated_and_numbers_saturate():
     f = pp.encode_info(_info(ctrl='LADRC-LONGNAME', result=('x' * 30,), error_text='E' * 40,
                              loop_us=70000, overruns=-5))
     i = pp.decode(f)
-    assert i.ctrl == 'LADRC-LO' and i.result == ('x' * 20, '', '') and i.error_text == 'E' * 24
+    assert i.ctrl == 'LADRC-LO' and i.result == ('x' * 20, '', '') and i.error_text == 'E' * 20
     assert i.loop_us == 0xFFFF and i.overruns == 0
 
 
@@ -148,6 +162,45 @@ def test_panel_keeps_info_of_its_session_and_forgets_it_when_lost():
     b.sess = pp.DaemonSession(8)                                       # daemon restart: new epoch
     b.step(10)
     assert b.panel.info is None
+
+
+def _give_info(b, **kw):
+    b.panel.on_info(pp.decode(pp.encode_info(_info(sid=b.sess.sid, **kw))))
+
+
+def test_info_stops_being_current_when_a_run_starts_r1_r5():
+    b = Bench()
+    b.step(10)
+    _give_info(b, run_no=3, result_run=3)
+    assert b.panel.info_current
+    b.run_state = pp.ST_RUN                                            # a run from the PC
+    b.step(10)
+    assert not b.panel.info_current and b.panel.info.run_no == 3      # INFO kept, not current
+    _give_info(b, run_no=4)
+    b.step(30)                                                         # more active STATUS: same run
+    assert b.panel.info_current
+    b.run_state = pp.ST_END
+    b.step(10)
+    assert b.panel.info_current                                        # END is not a run start
+    b.run_state = pp.ST_RUN
+    b.step(10)
+    assert not b.panel.info_current
+
+
+def test_info_stops_being_current_after_a_status_gap_r1_r5():
+    b = Bench()
+    b.step(10)
+    _give_info(b, run_no=1)
+    t0 = b.t
+    b.drop_down = lambda f: f[0] == pp.START_STATUS and b.t <= t0 + 100   # one STATUS lost: 200 ms
+    b.step(20)
+    assert b.panel.info_current
+    t1 = b.t
+    b.drop_down = lambda f: f[0] == pp.START_STATUS and b.t <= t1 + 200   # two lost: 300 ms > 250
+    b.step(30)
+    assert not b.panel.info_current
+    _give_info(b, run_no=1)
+    assert b.panel.info_current
 
 
 def test_stop_without_link_after_a_given_up_start_goes_at_stale_plus_one():

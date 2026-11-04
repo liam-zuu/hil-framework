@@ -1,4 +1,4 @@
-"""panel_app.c (buttons -> commands, screen choice, result generation) on the PC, driven over a
+"""panel_app.c (buttons -> commands, screen choice, result keyed on the run number) on the PC, driven over a
 raw byte wire: Pi side = rpi5/panel_link.py PanelLink with the FAKE run, panel side = C parser
 -> C client -> C app. One scenario per fix of Codex round 1 (Liam approved 04/11): P1 STOP,
 P2 drawn screen / cursor, P3 cursor and incomplete list, P7 result lines, P8 closed RESULT.
@@ -15,7 +15,7 @@ lib.app_host_new.restype, lib.app_host_new.argtypes = ct.c_void_p, [ct.c_void_p]
 lib.app_host_free.argtypes = [ct.c_void_p]
 lib.app_host_cursor.restype, lib.app_host_cursor.argtypes = ct.c_int, [ct.c_void_p]
 lib.app_host_msg.restype, lib.app_host_msg.argtypes = ct.c_char_p, [ct.c_void_p]
-lib.app_host_gen.restype, lib.app_host_gen.argtypes = ct.c_uint32, [ct.c_void_p]
+lib.app_run.restype, lib.app_run.argtypes = ct.c_uint16, [ct.c_void_p]
 lib.app_update.restype, lib.app_update.argtypes = None, [ct.c_void_p, ct.c_uint32]
 lib.app_screen.restype, lib.app_screen.argtypes = ct.c_int, [ct.c_void_p, ct.c_uint32]
 lib.app_buttons.restype, lib.app_buttons.argtypes = None, [ct.c_void_p, ct.c_uint8, ct.c_uint32]
@@ -25,7 +25,7 @@ lib.app_result.restype, lib.app_result.argtypes = ct.c_int, [ct.c_void_p]
 
 class AppView(ct.Structure):
     _fields_ = [('screen', ct.c_int), ('cursor', ct.c_uint8), ('sid', ct.c_uint32),
-                ('profiles_gen', ct.c_uint32), ('result_profile', ct.c_uint8)]
+                ('profiles_gen', ct.c_uint32), ('result_profile', ct.c_uint8), ('result_run', ct.c_uint16)]
 
 
 lib.app_view.restype, lib.app_view.argtypes = AppView, [ct.c_void_p, ct.c_uint32]
@@ -103,6 +103,10 @@ class AppBench:
     @property
     def screen(self):
         return lib.app_screen(self.app, self.t)
+
+    @property
+    def run_no(self):
+        return lib.app_run(self.app)                    # run of the END shown; 0 = not known
 
     @property
     def cursor(self):
@@ -216,10 +220,10 @@ def test_result_lines_of_the_previous_run_are_not_shown_codex_p7():
     b.drop = lambda f: f[0] == pp.START_INFO            # every INFO of run B lost
     b.press(START)
     b.step(250)
-    assert b.screen == RESULT and b.result == NOT_VERIFIED
+    assert b.screen == RESULT and b.result == WAITING and b.run_no == 0   # A's INFO is not current
     b.drop = lambda f: False
-    b.step(120)                                         # valid INFO of B, but no cleared one seen
-    assert b.result == NOT_VERIFIED and b.panel.info.result[0].startswith('FAKE')
+    b.step(120)                                         # INFO of B: its run number, its lines (R1-R5)
+    assert b.result == FRESH and b.run_no == 2 == b.panel.info.result_run
 
 
 def test_closed_result_does_not_hide_the_next_one_codex_p8():
@@ -296,19 +300,20 @@ def test_a_normal_run_shows_its_result_codex_q1():
     assert b.screen == RESULT and b.result == FRESH
 
 
-def test_old_result_arriving_during_a_new_run_is_not_shown_codex_q1():
+def test_result_of_the_run_before_is_not_shown_under_the_new_end_codex_q1_r1():
+    """An INFO of run A that arrives after the START of B but before B's first active STATUS
+    (the order the link allows) is not current once B is seen active."""
     b = ready()
     b.press(START)
     b.step(250)
     b.press(NAV)
     b.step(1)
     b.drop = lambda f: f[0] == pp.START_INFO            # the link's own INFO of run B lost
+    old = pp.Info(sid=b.panel.sid, flags=pp.I_RESULT_VALID, result=('OLD A', '', ''), run_no=1, result_run=1)
     b.press(START)
-    b.step(20)
-    old = pp.Info(sid=b.panel.sid, flags=pp.I_RESULT_VALID, result=('OLD A', '', ''))
-    b.inject(pp.encode_info(old))                       # a valid INFO of run A arrives during B
-    b.step(230)
-    assert b.screen == RESULT and b.result == NOT_VERIFIED
+    b.inject(pp.encode_info(old))                       # before any STATUS of B
+    b.step(250)
+    assert b.run.state == pp.ST_END and b.screen == RESULT and b.result == WAITING and b.run_no == 0
 
 
 def test_start_replaced_by_stop_and_a_short_run_still_shows_result_codex_q2():
@@ -435,3 +440,191 @@ def test_start_on_a_result_not_drawn_yet_is_not_used_codex_q3():
     b.run.start(2)                                      # PC runs test 2; panel does not redraw
     b.step(250, draw=False)
     assert b.press(START) == [] and 'press again' in b.msg
+
+
+# ── Codex round 3 R1-R5 (Liam 04/11, PANEL session: "(a) Sửa gốc + R3") ───────
+
+def _active_status(b, state=pp.ST_RUN):
+    return pp.encode_status(b.link.sess.fill(pp.Status(run_state=state, links=pp.L_RPI | pp.L_H7)))
+
+
+def test_short_run_from_the_pc_with_its_active_status_lost_does_not_show_the_old_lines_r1():
+    b = ready()
+    b.press(START)
+    b.step(250)
+    assert b.screen == RESULT and b.result == FRESH and b.run_no == 1     # RESULT A open
+    b.drop = lambda f: f[0] == pp.START_STATUS and b.run.state in pp.ST_ACTIVE
+    b.run.start(2)                                      # B from the PC, stopped at once
+    b.run.stop()
+    while b.run.state != pp.ST_END:
+        b.step(1)
+    b.drop = lambda f: False
+    b.step(12)                                          # END B on the panel
+    assert not (b.result == FRESH and b.run_no == 1)    # never A's lines under END B
+    b.step(150)
+    assert b.screen == RESULT and b.run_no == 2 and b.result == WAITING   # B: user stop, no lines
+
+
+def test_start_then_stop_right_after_end_a_with_status_lost_r1():
+    b = ready()
+    b.press(START)
+    b.step(250)
+    b.drop = lambda f: f[0] == pp.START_STATUS and b.run.state in pp.ST_ACTIVE
+    b.press(START)
+    b.step(3)
+    b.press(STOP)
+    while b.run.state != pp.ST_END:
+        b.step(1)
+    b.drop = lambda f: False
+    b.step(12)
+    assert not (b.result == FRESH and b.run_no == 1)
+    b.step(150)
+    assert b.screen == RESULT and b.run_no == 2
+
+
+def test_growing_status_delay_does_not_reopen_a_closed_result_r2():
+    b = ready()
+    b.press(START)
+    b.step(250)
+    b.press(NAV)                                        # close RESULT A
+    b.step(1)
+    held = []
+    t0 = b.t
+
+    def hold(f):                                        # STATUS of the same END A delayed 600 ms
+        if f[0] == pp.START_STATUS and b.t < t0 + 600:
+            held.append(f)
+            return True
+        return False
+    b.drop = hold
+    seen = set()
+    for _ in range(60):
+        b.step(1)
+        seen.add(b.screen)
+    for f in held:
+        b.inject(f)                                     # the delayed copies arrive late, in order
+    lib.app_update(b.app, b.t)
+    b.drop = lambda f: False
+    for _ in range(150):
+        b.step(1)
+        seen.add(b.screen)
+    assert seen <= {HOME, NOLINK} and b.screen == HOME
+
+
+def test_start_pressed_twice_keeps_the_closed_state_r3():
+    b = ready()
+    b.press(START)
+    b.step(250)
+    b.press(NAV)                                        # close RESULT A
+    b.step(1)
+    b.run.start = lambda i: pp.RES_BUSY                 # START answered: nothing started
+    n0 = len(b.cmds(pp.CMD_START))
+    first = b.press(START)
+    second = b.press(START)                             # refused by the client: nothing sent
+    assert [f[8] for f in first] == [pp.CMD_START] and second == []
+    b.step(30)
+    assert b.screen == HOME and len(b.cmds(pp.CMD_START)) == n0 + 1 and 'BUSY' in b.msg
+
+
+def test_active_status_then_info_in_one_read_counts_the_info_r4():
+    b = ready()
+    b.press(START)
+    b.step(250)
+    assert b.result == FRESH and b.run_no == 1
+    sid = b.panel.sid
+    info_b = pp.Info(sid=sid, run_no=2)                 # B running: no lines
+    for f in (_active_status(b), pp.encode_info(info_b)):           # same RX pass, this order
+        lib.pp_client_on_frame(b.panel._c, f, len(f), b.t)
+    lib.app_update(b.app, b.t)
+    assert b.panel.info_current and b.screen == RUN
+    b.t += 10
+    end = pp.encode_status(b.link.sess.fill(pp.Status(run_state=pp.ST_END, outcome=pp.OUT_COMPLETED,
+                                                      links=pp.L_RPI | pp.L_H7)))
+    res = pp.Info(sid=sid, flags=pp.I_RESULT_VALID, result=('B lines', '', ''), run_no=2, result_run=2)
+    for f in (end, pp.encode_info(res)):
+        lib.pp_client_on_frame(b.panel._c, f, len(f), b.t)
+    lib.app_update(b.app, b.t)
+    assert b.screen == RESULT and b.result == FRESH and b.run_no == 2
+
+
+def test_nav_on_result_a_glass_while_b_ended_with_the_same_test_does_not_close_b_r5():
+    b = ready()
+    b.press(START)                                      # test 0, run 1
+    b.step(250)
+    assert b.screen == RESULT and b.run_no == 1         # glass: RESULT run 1
+    b.run.start(0)                                      # PC: test 0 again, run 2
+    b.step(250, draw=False)                             # the panel does not redraw
+    assert b.screen == RESULT and b.run_no == 2
+    assert b.press(NAV) == [] and 'screen changing' in b.msg
+    assert b.screen == RESULT                           # B not closed
+    b.draw()
+    b.press(NAV)
+    assert b.screen == HOME
+
+
+def test_close_while_the_run_is_not_known_goes_to_that_run_r1_r5():
+    b = ready()
+    b.press(START)
+    b.step(250)
+    b.drop = lambda f: f[0] == pp.START_INFO            # INFO of B lost for now
+    b.press(START)
+    b.step(250)
+    assert b.screen == RESULT and b.run_no == 0
+    b.press(NAV)                                        # close the END of B, run not known
+    assert b.screen == HOME
+    b.drop = lambda f: False
+    b.step(150)                                         # INFO of B arrives: the closed END is B
+    assert b.run_no == 2 and b.screen == HOME
+
+
+def test_close_while_not_known_does_not_hide_a_later_run_r1_r5():
+    b = ready()
+    b.press(START)
+    b.step(250)
+    b.drop = lambda f: f[0] == pp.START_INFO
+    b.press(START)
+    b.step(250)
+    b.press(NAV)                                        # closed, run not known
+    b.step(1)
+    b.run.start(1)                                      # C from the PC, seen active
+    b.step(250)
+    assert b.run.state == pp.ST_END and b.screen == RESULT and b.run_no == 0   # END C, not hidden
+    b.drop = lambda f: False
+    b.step(150)
+    assert b.run_no == 3 and b.screen == RESULT and b.result == FRESH
+
+
+def test_run_number_follows_the_run_manager():
+    b = ready()
+    for k in (1, 2, 3):
+        b.press(START)
+        b.step(250)
+        assert b.screen == RESULT and b.run_no == k == b.run.run_no and b.result == FRESH
+        b.press(NAV)
+        b.step(1)
+
+
+def test_new_daemon_forgets_the_closed_run():
+    b = ready()
+    b.press(START)
+    b.step(250)
+    b.press(NAV)                                        # run 1 closed
+    b.step(1)
+    b.run = FakeRun(('T0', 'T1', 'T2'), run_s=1.0, clock=b.clock)
+    b.link = PanelLink(9, b.run, b._w, clock=b.clock)   # daemon restart: runs count from 1 again
+    b.step(200)
+    b.press(START)
+    b.step(250)
+    assert b.run_no == 1 and b.screen == RESULT and b.result == FRESH
+
+
+def test_lines_of_another_run_are_never_shown_as_this_runs_result_r1_r5():
+    b = ready()
+    b.press(START)
+    b.step(250)
+    sid = b.panel.sid
+    f = pp.encode_info(pp.Info(sid=sid, flags=pp.I_RESULT_VALID, result=('run 1 lines', '', ''),
+                               run_no=2, result_run=1))
+    lib.pp_client_on_frame(b.panel._c, f, len(f), b.t)
+    lib.app_update(b.app, b.t)
+    assert b.run_no == 2 and b.result == NOT_VERIFIED

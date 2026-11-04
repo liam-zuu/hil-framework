@@ -22,6 +22,12 @@ RunControl contract (what stage E implements):
     to ST_IDLE) [ĐỀ XUẤT: rule of this link and of the fake Pi, not decided for stage E].
   * snapshot() -> RunSnapshot, cheap and non-blocking (read a copy the run manager keeps).
     Numbers it does not know stay None and are shown as '-' / not valid on the panel.
+  * run_no / result_run in the snapshot (Codex round 3 R1-R5, Liam 04/11: "(a) Sửa gốc + R3"):
+    the run manager counts every run it starts, from the panel or from the PC
+    (panel_proto.next_run_no: 1..65535, then 1); run_no is the current run, or the last one
+    when none is active; result_run is the run the result lines belong to (0 = none).
+    Result lines with result_run 0 are not sent as valid: the panel could not tell whose
+    they are.
 
 Run it on the Pi (only when stage E provides a RunControl; --demo uses the FAKE run):
     python panel_link.py --port /dev/ttyAMA0 --epoch-file ~/.hil_panel_epoch [--create-epoch] --demo
@@ -62,6 +68,8 @@ class RunSnapshot:
     loop_us: Optional[int] = None        # 1 kHz loop turnaround (statistics window), None: unknown
     overruns: Optional[int] = None
     result: Sequence[str] = field(default_factory=tuple)   # RESULT lines of the last finished run
+    run_no: int = 0                      # current run, or the last one (0 = none yet)
+    result_run: int = 0                  # run the result lines belong to (0 = none)
 
 
 class RunControl(Protocol):
@@ -86,11 +94,13 @@ def status_of(snap: RunSnapshot, sess: pp.DaemonSession) -> pp.Status:
 
 def info_of(snap: RunSnapshot, sid: int) -> pp.Info:
     # no result while a run is active, whatever the run manager says (contract v6, Codex Q1)
-    result = () if snap.run_state in pp.ST_ACTIVE else tuple(snap.result)[:pp.RESULT_LINES]
-    flags = (pp.I_LOOP_VALID if snap.loop_us is not None else 0) | \
-            (pp.I_RESULT_VALID if any(result) else 0)
+    # and no result lines without the run they belong to (R1-R5)
+    result = () if snap.run_state in pp.ST_ACTIVE or not snap.result_run else tuple(snap.result)[:pp.RESULT_LINES]
+    valid = any(result)
+    flags = (pp.I_LOOP_VALID if snap.loop_us is not None else 0) | (pp.I_RESULT_VALID if valid else 0)
     return pp.Info(sid=sid, loop_us=snap.loop_us or 0, overruns=snap.overruns or 0, flags=flags,
-                   ctrl_src=snap.ctrl_src, ctrl=snap.ctrl, result=result, error_text=snap.error_text)
+                   ctrl_src=snap.ctrl_src, ctrl=snap.ctrl, result=result, error_text=snap.error_text,
+                   run_no=snap.run_no, result_run=snap.result_run if valid else 0)
 
 
 def nonblocking_writer(port) -> Callable[[bytes], int]:
@@ -166,7 +176,12 @@ class PanelLink:
             snap = snap or self.run.snapshot()
             info = pp.encode_info(info_of(snap, self.sess.sid))
             age = None if self.t_info is None else now - self.t_info
-            if self.last_info is None or age >= INFO_PERIOD_S or (info != self.last_info and age >= INFO_MIN_GAP_S):
+            changed = info != self.last_info
+            # a changed INFO also replaces one that has no byte out yet, whatever the gap: no
+            # wire time is added, and an INFO taken before a run started never goes out after
+            # that run's first STATUS (TxQueue puts STATUS first; R1-R5)
+            if self.last_info is None or age >= INFO_PERIOD_S or (changed and age >= INFO_MIN_GAP_S) or \
+                    (changed and self.tx.info_unsent()):
                 self.t_info, self.last_info = now, info
                 self.tx.put(info)
         self._pump(now)
@@ -199,6 +214,7 @@ class FakeRun:
         self.state, self.t_phase = pp.ST_IDLE, clock()
         self.profile, self.outcome = None, pp.OUT_NONE
         self.error_code, self.error_text, self.result = 0, '', ()
+        self.run_no, self.result_run = 0, 0
 
     def _phase(self, st):
         self.state, self.t_phase = st, self.clock()
@@ -220,7 +236,8 @@ class FakeRun:
         if i >= len(self.names):
             return pp.RES_BAD_PROFILE
         self.profile = i
-        self.error_code, self.error_text, self.result = 0, '', ()
+        self.error_code, self.error_text, self.result, self.result_run = 0, '', (), 0
+        self.run_no = pp.next_run_no(self.run_no)
         self._phase(pp.ST_PREPARE)
         return pp.RES_OK
 
@@ -250,6 +267,7 @@ class FakeRun:
                 self.outcome = pp.OUT_COMPLETED
                 self.result = ('FAKE e_vx 0.0%02d m/s' % self.rnd.randrange(100),
                                'FAKE e_wz 0.%02d rad/s' % self.rnd.randrange(100), 'FAKE lost 0')
+                self.result_run = self.run_no
                 self._phase(pp.ST_END)
         elif self.state == pp.ST_STOPPING and dt >= STOPPING_S:
             self._phase(pp.ST_END)
@@ -259,7 +277,8 @@ class FakeRun:
         return RunSnapshot(run_state=self.state, phase_s=self.clock() - self.t_phase, profile=self.profile,
                            outcome=self.outcome, data_age_ms=20, h7_ok=self.h7, error_code=self.error_code,
                            error_text=self.error_text, ctrl=self.ctrl, ctrl_src=pp.CTRL_SRC_PROFILE,
-                           loop_us=25 + self.rnd.randrange(5), overruns=0, result=self.result)
+                           loop_us=25 + self.rnd.randrange(5), overruns=0, result=self.result,
+                           run_no=self.run_no, result_run=self.result_run)
 
 
 def serve(port, link: PanelLink, stop_after_s: Optional[float] = None, on_log=print) -> None:

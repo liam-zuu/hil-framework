@@ -59,6 +59,7 @@ uint32_t pp_host_ev_dropped(const pp_client_t *c) { return c->ev_dropped; }
 int pp_host_link_open(const pp_client_t *c) { return c->has_status_t; }
 
 const pp_info_t *pp_host_info(const pp_client_t *c) { return c->has_info ? &c->info : NULL; }
+int pp_host_info_current(const pp_client_t *c) { return pp_client_info_current(c); }
 
 pp_parser_t *pp_host_parser_new(uint8_t accept, uint32_t stale_ms)
 {
@@ -86,4 +87,3 @@ app_t *app_host_new(pp_client_t *c)
 void app_host_free(app_t *a) { free(a); }
 int app_host_cursor(const app_t *a) { return a->cursor; }
 const char *app_host_msg(const app_t *a) { return a->msg; }
-uint32_t app_host_gen(const app_t *a) { return a->gen; }

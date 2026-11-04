@@ -177,7 +177,14 @@ void scr_result(const PanelView &v)
     uint16_t col = c->st.outcome == PP_OUT_COMPLETED ? TFT_GREEN :
                    c->st.outcome == PP_OUT_USER_STOP ? TFT_YELLOW : TFT_RED;
     text(8, 82, out, 4, col, 2);
-    app_result_t r = app_result(v.a);           /* P7, Q1: only lines of this generation */
+    uint16_t run = app_run(v.a);                /* R1-R5: lines only of this run */
+    if (run) {
+        snprintf(s, sizeof s, "run #%u", run);
+    } else {
+        snprintf(s, sizeof s, "run #?");
+    }
+    text(330, 92, s, 4, TFT_LIGHTGREY);
+    app_result_t r = app_result(v.a);
     if (r == APP_RES_FRESH) {
         for (int k = 0; k < PP_RESULT_LINES; k++)
             if (c->info.result[k][0])
@@ -185,7 +192,7 @@ void scr_result(const PanelView &v)
     } else if (c->st.outcome != PP_OUT_COMPLETED) {
         text(8, 144, "no result lines", 4, TFT_LIGHTGREY);
     } else {
-        text(8, 144, r == APP_RES_WAITING ? "waiting for result..." : "result not verified (see PC)", 4,
+        text(8, 144, r == APP_RES_WAITING ? "waiting for result..." : "result of another run (see PC)", 4,
              TFT_LIGHTGREY);
     }
     quality_text(c->st.quality, q, sizeof q);
@@ -241,6 +248,8 @@ uint32_t ui_signature(const PanelView &v)
     h = fnv(h, v.a->msg, strlen(v.a->msg));
     app_result_t r = app_result(v.a);
     h = fnv(h, &r, sizeof r);
+    uint16_t run = app_run(v.a);
+    h = fnv(h, &run, sizeof run);
     h = fnv(h, &c->sid, sizeof c->sid);
     h = fnv(h, &c->profiles_gen, sizeof c->profiles_gen);
     h = fnv(h, &c->stop_state, sizeof c->stop_state);
@@ -256,7 +265,7 @@ uint32_t ui_signature(const PanelView &v)
     }
     if (c->has_info) {
         const pp_info_t &in = c->info;
-        uint16_t f[4] = {in.loop_us, in.overruns, in.flags, in.ctrl_src};
+        uint16_t f[6] = {in.loop_us, in.overruns, in.flags, in.ctrl_src, in.run_no, in.result_run};
         h = fnv(h, f, sizeof f);
         h = fnv(h, in.ctrl, strlen(in.ctrl));
         for (int k = 0; k < PP_RESULT_LINES; k++)

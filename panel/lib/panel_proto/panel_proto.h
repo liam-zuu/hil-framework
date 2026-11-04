@@ -46,7 +46,7 @@ extern "C" {
 #define PP_CTRL_LEN       8
 #define PP_RESULT_LINES   3
 #define PP_RESULT_LEN     20
-#define PP_ERROR_TEXT_LEN 24
+#define PP_ERROR_TEXT_LEN 20     /* INFO revised inside v6 (R1-R5): run_no, result_run at 80-83 */
 
 #define PP_PROFILE_MAX    254
 #define PP_PROFILE_NONE   0xFF
@@ -59,6 +59,7 @@ extern "C" {
 #define PP_CMD_MAX_AGE_MS   3000u
 #define PP_PROFILE_WAIT_MS  1000u
 #define PP_PARSER_STALE_MS  50u
+#define PP_INFO_GAP_MS      250u
 
 /* commands */
 #define PP_CMD_HELLO     0x01
@@ -127,6 +128,8 @@ typedef struct {
     char     ctrl[PP_CTRL_LEN + 1];
     char     result[PP_RESULT_LINES][PP_RESULT_LEN + 1];
     char     error_text[PP_ERROR_TEXT_LEN + 1];
+    uint16_t run_no;        /* current run, or the last one; 0 = none yet */
+    uint16_t result_run;    /* run the result lines belong to; 0 = none */
 } pp_info_t;
 
 uint16_t pp_crc16(const uint8_t *data, size_t n);
@@ -220,7 +223,11 @@ typedef struct {
 
     bool     has_info;  pp_info_t info;     /* newest INFO of the session */
     uint32_t info_count;                    /* INFO frames of a session taken so far (never reset) */
-    uint32_t info_cleared_at;               /* info_count after the last INFO without I_RESULT_VALID */
+    /* is the newest INFO still current (R1-R5, PanelClient.info_current)? */
+    uint32_t run_starts;                    /* active STATUS after a non-active one (never reset) */
+    uint32_t gaps;                          /* STATUS more than PP_INFO_GAP_MS after the one before */
+    bool     has_st_rx;  uint32_t st_rx_ms; /* arrival of the newest STATUS of a session (never expires) */
+    uint32_t info_starts, info_gaps;        /* run_starts, gaps when the newest INFO arrived */
     uint32_t profiles_gen;                  /* bumps whenever the kept list changes (count, a name) */
     bool     has_st;    pp_status_t st;     /* newest STATUS of the session (for the screen) */
 
@@ -231,6 +238,8 @@ typedef struct {
 
 void pp_client_init(pp_client_t *c, pp_nonce_fn nonce, void *nonce_ctx, pp_send_fn send, void *send_ctx);
 bool pp_client_link(const pp_client_t *c, uint32_t now_ms);
+/* the newest INFO came after every sign of a run start or a STATUS gap (PanelClient.info_current) */
+bool pp_client_info_current(const pp_client_t *c);
 /* user presses SELECT / START / STOP (NAV only moves the cursor and is never sent) */
 void pp_client_press(pp_client_t *c, uint8_t cmd, uint16_t arg, uint32_t now_ms);
 void pp_client_tick(pp_client_t *c, uint32_t now_ms);

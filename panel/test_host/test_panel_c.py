@@ -67,7 +67,8 @@ class CInfo(ct.Structure):
     _fields_ = [('sid', ct.c_uint32), ('loop_us', ct.c_uint16), ('overruns', ct.c_uint16),
                 ('flags', ct.c_uint8), ('ctrl_src', ct.c_uint8), ('ctrl', ct.c_char * (pp.CTRL_LEN + 1)),
                 ('result', (ct.c_char * (pp.RESULT_LEN + 1)) * pp.RESULT_LINES),
-                ('error_text', ct.c_char * (pp.ERROR_TEXT_LEN + 1))]
+                ('error_text', ct.c_char * (pp.ERROR_TEXT_LEN + 1)),
+                ('run_no', ct.c_uint16), ('result_run', ct.c_uint16)]
 
 
 def _sig(name, res, *args):
@@ -99,6 +100,7 @@ _sig('pp_host_pending', ct.c_int, ct.c_void_p, ct.POINTER(ct.c_uint16), ct.POINT
 _sig('pp_host_stop', ct.c_int, ct.c_void_p, ct.POINTER(ct.c_uint16))
 _sig('pp_host_profile', ct.c_int, ct.c_void_p, ct.c_int, ct.c_char_p)
 _sig('pp_host_info', ct.POINTER(CInfo), ct.c_void_p)
+_sig('pp_host_info_current', ct.c_int, ct.c_void_p)
 _sig('pp_host_profile_count', ct.c_int, ct.c_void_p)
 _sig('pp_host_ev_dropped', ct.c_uint32, ct.c_void_p)
 _sig('pp_host_link_open', ct.c_int, ct.c_void_p)
@@ -246,7 +248,11 @@ class CPanelClient:
         i = p.contents
         return pp.Info(i.sid, i.loop_us, i.overruns, i.flags, i.ctrl_src, _dec(i.ctrl),
                        tuple(_dec(i.result[k].value) for k in range(pp.RESULT_LINES)),
-                       _dec(i.error_text))
+                       _dec(i.error_text), i.run_no, i.result_run)
+
+    @property
+    def info_current(self):
+        return bool(lib.pp_host_info_current(self._c))
 
 
 # ── golden bytes ──────────────────────────────────────────────────────────
@@ -295,11 +301,13 @@ def test_profile_and_info_decoding_match_python():
         assert (c.sid, c.index, c.count, _dec(c.name)) == (pr.sid, pr.index, pr.count, pr.name)
         info = pp.decode(pp.encode_info(pp.Info(rnd.getrandbits(32), rnd.getrandbits(16), rnd.getrandbits(16),
                                                 rnd.getrandbits(8), rnd.randrange(3), word(8),
-                                                (word(20), word(20), word(20)), word(24))))
+                                                (word(20), word(20), word(20)), word(20),
+                                                rnd.getrandbits(16), rnd.getrandbits(16))))
         ci = CInfo()
         lib.pp_decode_info(pp.encode_info(info), ct.byref(ci))
         got = pp.Info(ci.sid, ci.loop_us, ci.overruns, ci.flags, ci.ctrl_src, _dec(ci.ctrl),
-                      tuple(_dec(ci.result[k].value) for k in range(3)), _dec(ci.error_text))
+                      tuple(_dec(ci.result[k].value) for k in range(3)), _dec(ci.error_text),
+                      ci.run_no, ci.result_run)
         assert got == info
 
 
@@ -390,10 +398,12 @@ def _c_client(request, monkeypatch):
 
 
 def test_two_end_scenarios_were_found():
-    # 23 Bench scenarios in test_panel_proto.py (handshake ... commands_refused) + 2 in v6;
-    # a new Bench scenario there makes this fail until it is counted here on purpose
+    # 23 Bench scenarios in test_panel_proto.py (handshake ... commands_refused) + 4 in v6 (2 of
+    # them for info_current, R1-R5); a new Bench scenario there makes this fail until it is
+    # counted here on purpose
     names = [n for n, _ in _TWO_END]
-    assert len(names) == 25 and 'test_panel_keeps_info_of_its_session_and_forgets_it_when_lost' in names
+    assert len(names) == 27 and 'test_panel_keeps_info_of_its_session_and_forgets_it_when_lost' in names
+    assert 'test_info_stops_being_current_after_a_status_gap_r1_r5' in names
 
 
 def test_c_client_is_really_used_in_the_scenarios(monkeypatch):
@@ -409,7 +419,7 @@ def _snap(panel):
     return (panel.sid, panel.boot, panel.next_seq, panel.stale, panel.fence, panel.stop_state,
             panel.stop_failures, panel.pending and (panel.pending['seq'], panel.pending['cmd'], panel.pending['arg']),
             panel.stop and panel.stop['seq'], tuple(panel.shown), tuple(sorted(panel.profiles.items())),
-            panel.info, panel.profile_count)
+            panel.info, panel.profile_count, panel.info_current)
 
 
 class _FuzzBench(tpp.HoldBench):
@@ -445,7 +455,7 @@ def test_c_client_matches_python_step_by_step(seed):
         elif r < 0.056:
             action = ('late_seq', pp.SEQ_END - ctl.randrange(1, 4))
         elif r < 0.06:
-            action = ('info', ctl.choice(['PID', 'LADRC']), ctl.randrange(2000))
+            action = ('info', ctl.choice(['PID', 'LADRC']), ctl.randrange(2000), ctl.randrange(4))
         elif r < 0.064:
             action = ('blackout', ctl.choice([600, 3500]))          # no STATUS: NO LINK, give-up
         for b in benches:
@@ -463,7 +473,7 @@ def test_c_client_matches_python_step_by_step(seed):
             elif action[0] == 'blackout':
                 b.blackout_until = b.t + action[1]
             elif action[0] == 'info':
-                b.panel.on_info(pp.Info(sid=b.sess.sid, ctrl=action[1], loop_us=action[2]))
+                b.panel.on_info(pp.Info(sid=b.sess.sid, ctrl=action[1], loop_us=action[2], run_no=action[3]))
             b.step(1)
         py, c = benches
         assert _snap(c.panel) == _snap(py.panel), f'step {step} action {action}'

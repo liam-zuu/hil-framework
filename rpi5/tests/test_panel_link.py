@@ -98,8 +98,9 @@ def test_info_mapping_valid_flags():
     i = info_of(RunSnapshot(), 9)
     assert i.flags == 0 and i.ctrl_src == pp.CTRL_SRC_NONE
     i = info_of(RunSnapshot(loop_us=27, overruns=3, result=('x', '', ''), ctrl='LADRC',
-                            ctrl_src=pp.CTRL_SRC_FW), 9)
+                            ctrl_src=pp.CTRL_SRC_FW, run_no=7, result_run=7), 9)
     assert i.flags == pp.I_LOOP_VALID | pp.I_RESULT_VALID and i.overruns == 3 and i.ctrl == 'LADRC'
+    assert (i.run_no, i.result_run) == (7, 7)
 
 
 def test_handshake_profiles_and_info_at_once():
@@ -206,10 +207,76 @@ def test_fake_run_full_cycle_and_fault_ack():
 
 
 def test_no_result_while_a_run_is_active_codex_q1():
-    i = info_of(RunSnapshot(run_state=pp.ST_RUN, result=('old', '', '')), 1)
-    assert not any(i.result) and not i.flags & pp.I_RESULT_VALID
-    i = info_of(RunSnapshot(run_state=pp.ST_END, result=('new', '', '')), 1)
-    assert i.result[0] == 'new' and i.flags & pp.I_RESULT_VALID
+    i = info_of(RunSnapshot(run_state=pp.ST_RUN, result=('old', '', ''), run_no=5, result_run=4), 1)
+    assert not any(i.result) and not i.flags & pp.I_RESULT_VALID and (i.run_no, i.result_run) == (5, 0)
+    i = info_of(RunSnapshot(run_state=pp.ST_END, result=('new', '', ''), run_no=5, result_run=5), 1)
+    assert i.result[0] == 'new' and i.flags & pp.I_RESULT_VALID and i.result_run == 5
+
+
+def test_result_lines_without_their_run_are_not_sent_as_valid_r1_r5():
+    i = info_of(RunSnapshot(run_state=pp.ST_END, result=('x', '', ''), run_no=5, result_run=0), 1)
+    assert not any(i.result) and not i.flags & pp.I_RESULT_VALID and i.result_run == 0
+    i = info_of(RunSnapshot(run_state=pp.ST_END, result=(), run_no=5, result_run=5), 1)
+    assert not i.flags & pp.I_RESULT_VALID and i.result_run == 0          # no lines: no result run
+
+
+def test_fake_run_counts_runs_and_names_the_result_r1_r5():
+    t = [0.0]
+    run = FakeRun(run_s=1.0, clock=lambda: t[0])
+    assert (run.snapshot().run_no, run.snapshot().result_run) == (0, 0)
+    run.start(0)
+    for _ in range(3):
+        t[0] += 1.01
+        run.snapshot()
+    s = run.snapshot()
+    assert s.run_state == pp.ST_END and (s.run_no, s.result_run) == (1, 1)
+    run.start(1)
+    s = run.snapshot()
+    assert (s.run_no, s.result_run) == (2, 0) and s.result == ()
+    run.stop()
+    t[0] += 1.0
+    s = run.snapshot()
+    assert s.run_state == pp.ST_END and (s.run_no, s.result_run) == (2, 0)   # user stop: no result
+
+
+class GateUart:
+    """Takes nothing while closed, everything when open."""
+
+    def __init__(self):
+        self.open = False
+        self.data = bytearray()
+
+    def __call__(self, data):
+        if not self.open:
+            return 0
+        self.data += data
+        return len(data)
+
+
+def test_info_taken_before_a_run_never_follows_its_first_status_r1_r5():
+    """An INFO of run A waits (UART full); START B: the link's STATUS goes first, and the
+    waiting INFO is replaced by one of B at the next poll even inside INFO_MIN_GAP_S."""
+    t = [0.0]
+    uart = GateUart()
+    run = FakeRun(run_s=1.0, clock=lambda: t[0])
+    link = PanelLink(5, run, uart, clock=lambda: t[0])
+    panel = pp.PanelClient(iter(range(0x800, 0x900)).__next__)
+    for f in panel.tick(0):
+        link.feed(f)                                        # HELLO
+    link.poll()                                             # STATUS + INFO(run 0) wait
+    assert link.tx.info_unsent()
+    t[0] += 0.01
+    link.feed(pp.encode_cmd(link.sess.sid, 0, pp.CMD_START, 0))   # fence skipped: seq 0 is next
+    link.poll()
+    uart.open = True
+    for _ in range(5):                                      # 50 ms: the wire budget refills
+        t[0] += 0.01
+        link.poll()
+    out = pp.StreamParser().feed(bytes(uart.data))
+    first_active = next(k for k, x in enumerate(out) if isinstance(x, pp.Status) and x.run_state in pp.ST_ACTIVE)
+    later = [x for x in out[first_active:] if isinstance(x, pp.Info)]
+    assert later and all(x.run_no == 1 for x in later)
+    assert not any(isinstance(x, pp.Info) and x.run_no == 0 for x in out[first_active:])
 
 
 def test_reference_panel_drops_old_names_when_the_list_count_changes_codex_q4():
