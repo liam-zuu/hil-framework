@@ -12,6 +12,15 @@
  *           STOP: TONE at the frequency playing (fine-tune there); START: sweep again.
  *  PREVIEW  every pattern (pb_pattern) with f0 = hz, BT_GAP_MS between, then QUIET.
  *           STOP: QUIET.
+ *
+ * Keyboard on the serial port, for the bench without buttons (Liam 05/11: "tôi chưa nối nút
+ * mà", then "thêm vào cách B đi"), bt_key, one character at a time, any mode:
+ *  s          sweep from BT_SWEEP_LO
+ *  x          stop: SWEEP -> TONE at the frequency playing; TONE, PREVIEW -> QUIET
+ *  + (or =)   +BT_STEP_HZ, TONE        -  -BT_STEP_HZ, TONE
+ *  digits + Enter (CR or LF)  play that frequency (clamped PB_F0_MIN..PB_F0_MAX), TONE
+ *  p          PREVIEW at hz
+ * Any other character drops the digits typed so far.
  */
 #pragma once
 #include <stdbool.h>
@@ -45,11 +54,14 @@ typedef struct {
     uint8_t    k;             /* PREVIEW: index in the list */
     bool       gap;           /* PREVIEW: between two patterns */
     pb_t       pb;            /* start-up tune and preview patterns */
+    uint32_t   num;           /* bt_key: digits typed so far */
+    uint8_t    ndig;          /* how many (0 = none) */
 } bt_t;
 
 /* hz = PB_F0_DEFAULT, QUIET, the start-up tune playing */
 void bt_init(bt_t *t, uint32_t now);
 void bt_buttons(bt_t *t, uint8_t ev, uint32_t now);
+void bt_key(bt_t *t, char c, uint32_t now);
 /* frequency to play now (0 = silent); moves the sweep and the preview on */
 uint16_t bt_tone(bt_t *t, uint32_t now);
 /* what the screen says: mode name, pattern name in PREVIEW, button hints */

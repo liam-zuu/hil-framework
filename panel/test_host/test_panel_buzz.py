@@ -48,6 +48,7 @@ def _build():
     lib.pb_pattern.argtypes = [ct.c_int]
     lib.bt_init.argtypes = [ct.c_void_p, ct.c_uint32]
     lib.bt_buttons.argtypes = [ct.c_void_p, ct.c_uint8, ct.c_uint32]
+    lib.bt_key.argtypes = [ct.c_void_p, ct.c_char, ct.c_uint32]
     lib.bt_tone.restype = ct.c_uint16
     lib.bt_tone.argtypes = [ct.c_void_p, ct.c_uint32]
     for f in ('bt_mode_name', 'bt_pattern_name', 'bt_hint'):
@@ -234,6 +235,11 @@ class Tool:
     def tone(self, dt=0):
         return lib.bt_tone(self.mem, self.t + dt)
 
+    def keys(self, text, dt=10):
+        self.t += dt
+        for c in text:
+            lib.bt_key(self.mem, c.encode(), self.t)
+
     def mode(self):
         return lib.bt_mode_name(self.mem).decode()
 
@@ -334,3 +340,69 @@ def test_tool_stop_in_preview_is_quiet():
     assert t.tone(0) != 0
     t.press(EV_STOP)
     assert t.mode() == 'Quiet' and t.tone(0) == 0 and t.tone(3000) == 0
+
+
+# ---- keyboard on the serial port (Liam 05/11: "tôi chưa nối nút mà", "thêm vào cách B đi") ----
+
+def test_key_s_sweeps_from_quiet_and_x_keeps_the_frequency_heard():
+    t = Tool()
+    t.keys('s')
+    assert t.mode() == 'Sweep' and t.tone(0) == 1000 and t.tone(1000) == 1200
+    t.keys('x', dt=2550)
+    assert t.mode() == 'Tone' and t.tone(0) == 1500 and t.tone(5000) == 1500
+    t.keys('x')
+    assert t.mode() == 'Quiet' and t.tone(0) == 0
+
+
+def test_key_s_stops_the_boot_tune():
+    t = Tool()
+    t.keys('s', dt=0)
+    t.keys('x', dt=0)
+    t.keys('x', dt=0)
+    assert t.mode() == 'Quiet' and t.tone(10) == 0                       # not the tune (still < 1 s)
+
+
+def test_key_plus_minus_step_50hz():
+    t = Tool()
+    t.keys('+')
+    assert t.mode() == 'Tone' and t.tone() == F0 + 50
+    t.keys('--')
+    assert t.tone() == F0 - 50
+    t.keys('=')
+    assert t.tone() == F0
+
+
+def test_key_number_enter_plays_it_crlf_once():
+    t = Tool()
+    t.keys('2300\r\n')
+    assert t.mode() == 'Tone' and t.tone() == 2300
+    t.keys('1850\n')
+    assert t.tone() == 1850
+    t.keys('99999\r')
+    assert t.tone() == 5000
+    t.keys('70000\r')                                                   # > 65535 too
+    assert t.tone() == 5000
+    t.keys('0\r')
+    assert t.tone() == 500
+
+
+def test_key_number_without_enter_or_cut_by_another_key_does_nothing():
+    t = Tool()
+    t.keys('2300')
+    assert t.mode() == 'Quiet'
+    t.keys('k\r')                                                       # dropped by 'k'
+    assert t.mode() == 'Quiet'
+    t.keys('+')
+    t.keys('12s\r')                                                     # 's' sweeps, digits dropped
+    assert t.mode() == 'Sweep' and t.tone(0) == 1000
+
+
+def test_key_p_previews_at_the_frequency_set_and_x_is_quiet():
+    t = Tool()
+    t.keys('2000\r')
+    t.keys('p')
+    assert t.mode() == 'Preview' and t.pattern() == 'Boot' and t.tone(0) == hz(667, 2000)
+    t.keys('x')
+    assert t.mode() == 'Quiet' and t.tone(0) == 0
+
+

@@ -36,48 +36,101 @@ static void quiet(bt_t *t)
     pb_play(&t->pb, PB_NONE, 0);
 }
 
+/* play hz + d without a break (the start-up tune or the preview stops) */
+static void tone_at(bt_t *t, int d)
+{
+    pb_play(&t->pb, PB_NONE, 0);
+    nudge(t, d);
+    t->mode = BT_TONE;
+}
+
+static void sweep(bt_t *t, uint32_t now)
+{
+    pb_play(&t->pb, PB_NONE, 0);
+    t->mode = BT_SWEEP;
+    t->t0 = now;
+    t->hz = BT_SWEEP_LO;
+}
+
+static void preview(bt_t *t, uint32_t now)
+{
+    t->mode = BT_PREVIEW;
+    pb_set_f0(&t->pb, t->hz);
+    t->k = 0;
+    t->gap = false;
+    pb_play(&t->pb, PREVIEW_LIST[0], now);
+}
+
+/* STOP: SWEEP keeps the frequency heard (fine-tune it there); the rest goes quiet */
+static void stop(bt_t *t, uint32_t now)
+{
+    if (t->mode == BT_SWEEP) {
+        uint16_t f = sweep_hz(t, now);
+        t->hz = f ? f : BT_SWEEP_HI;
+        t->mode = BT_TONE;
+    } else {
+        quiet(t);
+    }
+}
+
 void bt_buttons(bt_t *t, uint8_t ev, uint32_t now)
 {
     bool down = ev & (BT_EV_NAV | BT_EV_NAV_BACK), up = ev & BT_EV_SELECT;
+    int d = (up ? (int)BT_STEP_HZ : 0) - (down ? (int)BT_STEP_HZ : 0);
     switch (t->mode) {
     case BT_QUIET:
-        if (ev & BT_EV_START) {
-            t->mode = BT_PREVIEW;
-            pb_set_f0(&t->pb, t->hz);
-            t->k = 0;
-            t->gap = false;
-            pb_play(&t->pb, PREVIEW_LIST[0], now);
-        } else if (down || up) {
-            pb_play(&t->pb, PB_NONE, now);        /* the start-up tune stops */
-            nudge(t, (up ? (int)BT_STEP_HZ : 0) - (down ? (int)BT_STEP_HZ : 0));
-            t->mode = BT_TONE;
-        }
+        if (ev & BT_EV_START)
+            preview(t, now);
+        else if (down || up)
+            tone_at(t, d);
         break;
     case BT_TONE:
-        if (ev & BT_EV_STOP) {
-            quiet(t);
-        } else if (ev & BT_EV_START) {
-            t->mode = BT_SWEEP;
-            t->t0 = now;
-            t->hz = BT_SWEEP_LO;
-        } else {
-            nudge(t, (up ? (int)BT_STEP_HZ : 0) - (down ? (int)BT_STEP_HZ : 0));
-        }
+        if (ev & BT_EV_STOP)
+            stop(t, now);
+        else if (ev & BT_EV_START)
+            sweep(t, now);
+        else if (down || up)
+            tone_at(t, d);
         break;
     case BT_SWEEP:
-        if (ev & BT_EV_STOP) {
-            uint16_t f = sweep_hz(t, now);
-            t->hz = f ? f : BT_SWEEP_HI;
-            t->mode = BT_TONE;                    /* keep the frequency heard, fine-tune it */
-        } else if (ev & BT_EV_START) {
-            t->t0 = now;
-            t->hz = BT_SWEEP_LO;
-        }
+        if (ev & BT_EV_STOP)
+            stop(t, now);
+        else if (ev & BT_EV_START)
+            sweep(t, now);
         break;
     case BT_PREVIEW:
         if (ev & BT_EV_STOP)
-            quiet(t);
+            stop(t, now);
         break;
+    }
+}
+
+void bt_key(bt_t *t, char c, uint32_t now)
+{
+    if (c >= '0' && c <= '9') {
+        if (t->ndig < 5) {
+            t->num = t->num * 10u + (uint32_t)(c - '0');
+            t->ndig++;
+        }
+        return;
+    }
+    if ((c == '\r' || c == '\n') && t->ndig) {
+        uint32_t f = t->num;
+        t->num = 0;
+        t->ndig = 0;
+        t->hz = (uint16_t)(f > PB_F0_MAX ? PB_F0_MAX : f);
+        tone_at(t, 0);                            /* nudge(0) clamps below PB_F0_MIN */
+        return;
+    }
+    t->num = 0;
+    t->ndig = 0;
+    switch (c) {
+    case 's': case 'S':           sweep(t, now); break;
+    case 'x': case 'X':           stop(t, now); break;
+    case '+': case '=':           tone_at(t, (int)BT_STEP_HZ); break;
+    case '-': case '_':           tone_at(t, -(int)BT_STEP_HZ); break;
+    case 'p': case 'P':           preview(t, now); break;
+    default:                      break;
     }
 }
 
