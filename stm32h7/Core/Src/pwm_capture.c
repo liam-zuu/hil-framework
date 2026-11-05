@@ -3,6 +3,15 @@
 #include <string.h>
 #include <stdio.h>
 
+/* 05/11 (Liam: "Duyet, viet di"): this file only is built at -O2, the rest of
+ * the project stays at the Debug -O0. Reason: the anchor window was 14.7 us
+ * at best at -O0 with the I-cache on (PWM_CAPTURE/2026-11-05_run03), M23
+ * needs below about 7 us. Safe for the DMA rings: this file never reads
+ * _ring itself (only passes its address to HAL_DMA_Start and pwm_edges.c,
+ * another unit), and every register access goes through the CMSIS volatile
+ * types. */
+#pragma GCC optimize ("O2")
+
 /* HAL side of the DMA capture (see pwm_capture.h); the decoding is in
  * pwm_edges.c, tested on the PC (pwmedges_pc). Codex Sol round 1 (04/11,
  * CLAUDE_THESIS 03_CODE/docs/review/2026-11-04_Review_H7_PWM_DMA_vong1.md):
@@ -202,26 +211,51 @@ void PWMCapture_Service(void)
      *   wr1 | pin a | >= 1.2 us | pin b | >= 1.2 us | pin c | wr2 >= 3.5 us after pin a.
      * Per channel the read of one group comes after the end of the group
      * before it, so these are lower bounds for every channel. */
+    /* 05/11: register addresses of the active channels taken once, so each
+     * read group is a tight loop of register reads (no call, no pointer
+     * chain per channel). The DMA counters are kept raw (NDTR) inside the
+     * window and turned into ring indices after it, same values as _wr(). */
+    volatile uint32_t *ndtr[PWM_NUM_CHANNELS];
+    volatile uint32_t *idr[PWM_NUM_CHANNELS];
+    uint32_t msk[PWM_NUM_CHANNELS];
+    uint8_t  act[PWM_NUM_CHANNELS];
+    uint32_t na = 0u;
+    for (uint8_t i = 0; i < PWM_NUM_CHANNELS; i++) {
+        if (!_ch[i].active) continue;
+        ndtr[na] = &((DMA_Stream_TypeDef *)_ch[i].hdma->Instance)->NDTR;
+        idr[na]  = &_ch[i].port->IDR;
+        msk[na]  = _ch[i].pin;
+        act[na]  = i;
+        na++;
+    }
+    uint32_t n1[N_WIN][PWM_NUM_CHANNELS], n2[N_WIN][PWM_NUM_CHANNELS];
+
     uint16_t t0 = _now_ticks();
     uint32_t shift = (nwin == N_WIN) ? (_svc & 3u) * WIN_SHIFT_TICKS : 0u;   /* M14 */
     for (uint32_t k = 0; k < nwin; k++) {
         _wait_until(t0, shift + k * WIN_STEP_TICKS);
         uint16_t tw = _now_ticks();
-        for (uint8_t i = 0; i < PWM_NUM_CHANNELS; i++) if (_ch[i].active) wr1[k][i] = _wr(&_ch[i]);
-        for (uint8_t i = 0; i < PWM_NUM_CHANNELS; i++) if (_ch[i].active) pa[k][i]  = (uint8_t)_pin(&_ch[i]);
+        for (uint32_t j = 0; j < na; j++) n1[k][j] = *ndtr[j];
+        for (uint32_t j = 0; j < na; j++) pa[k][act[j]] = (uint8_t)((*idr[j] & msk[j]) != 0u);
         uint16_t ta = _now_ticks();
         _wait_until(ta, PIN_GAP_TICKS);
-        for (uint8_t i = 0; i < PWM_NUM_CHANNELS; i++) if (_ch[i].active) pb[k][i]  = (uint8_t)_pin(&_ch[i]);
+        for (uint32_t j = 0; j < na; j++) pb[k][act[j]] = (uint8_t)((*idr[j] & msk[j]) != 0u);
         uint16_t tb = _now_ticks();
         _wait_until(tb, PIN_GAP_TICKS);
-        for (uint8_t i = 0; i < PWM_NUM_CHANNELS; i++) if (_ch[i].active) pc[k][i]  = (uint8_t)_pin(&_ch[i]);
+        for (uint32_t j = 0; j < na; j++) pc[k][act[j]] = (uint8_t)((*idr[j] & msk[j]) != 0u);
         _wait_until(ta, WR2_GAP_TICKS);
-        for (uint8_t i = 0; i < PWM_NUM_CHANNELS; i++) if (_ch[i].active) wr2[k][i] = _wr(&_ch[i]);
+        for (uint32_t j = 0; j < na; j++) n2[k][j] = *ndtr[j];
         uint16_t span = (uint16_t)(_now_ticks() - tw);   /* wr1 group start to wr2 group end (M23) */
         if (span > _win_max) _win_max = span;
         if (span < _win_min) _win_min = span;                    /* DIAG 05/11 */
         _win_hist[(span < WIN_EDGE_7US) ? 0 : (span < WIN_EDGE_20US) ? 1 : (span < WIN_EDGE_50US) ? 2 : 3]++;
     }
+    /* Raw DMA counters to ring write indices, as _wr() does */
+    for (uint32_t k = 0; k < nwin; k++)
+        for (uint32_t j = 0; j < na; j++) {
+            wr1[k][act[j]] = (PWM_RING_LEN - n1[k][j]) % PWM_RING_LEN;
+            wr2[k][act[j]] = (PWM_RING_LEN - n2[k][j]) % PWM_RING_LEN;
+        }
 
     uint8_t probe = 0u;
     for (uint8_t i = 0; i < PWM_NUM_CHANNELS; i++) {
