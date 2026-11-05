@@ -239,6 +239,26 @@ def test_fake_run_counts_runs_and_names_the_result_r1_r5():
     assert s.run_state == pp.ST_END and (s.run_no, s.result_run) == (2, 0)   # user stop: no result
 
 
+def test_fake_run_refuses_start_at_the_last_run_number_codex_t1_t2():
+    """Codex round 5 T1, T2 (Liam 05/11: "(a) Chặn quay vòng"): run 65535 can still start;
+    after it START returns RES_FAILED and nothing changes (state, run, result, profile), so
+    no run number comes back inside one daemon run."""
+    t = [0.0]
+    run = FakeRun(run_s=1.0, clock=lambda: t[0])
+    run.run_no = pp.RUN_NO_MAX - 1
+    assert run.start(0) == pp.RES_OK
+    for _ in range(3):
+        t[0] += 1.01
+        run.snapshot()
+    before = run.snapshot()
+    assert before.run_state == pp.ST_END and (before.run_no, before.result_run) == (pp.RUN_NO_MAX,) * 2
+    assert run.start(1) == pp.RES_FAILED and run.start(0) == pp.RES_FAILED
+    after = run.snapshot()
+    assert (after.run_state, after.run_no, after.result_run, after.result, after.profile) == \
+        (pp.ST_END, pp.RUN_NO_MAX, pp.RUN_NO_MAX, before.result, before.profile)
+    assert run.select(1) == pp.RES_OK                       # the rest of the link still works
+
+
 def test_every_status_carries_the_run_it_is_about_s1_s6():
     """Codex round 4 S1-S6 (Liam 04/11: "A: run_no vào STATUS")."""
     assert status_of(RunSnapshot(run_no=9), pp.DaemonSession(1)).run_no == 9

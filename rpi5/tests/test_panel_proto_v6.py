@@ -4,6 +4,8 @@ older frames, the writer order (STATUS > INFO > PROFILE, newest INFO only), and 
 keeping the INFO of its own session. No hardware."""
 import struct
 
+import pytest
+
 import panel_proto as pp
 from test_panel_proto import Bench, SID1, SlowUart, frames_of
 
@@ -45,9 +47,15 @@ def test_status_run_no_layout_and_roundtrip():
     assert pp.decode(f) == s
 
 
-def test_next_run_no_never_zero_and_wraps_to_one():
-    assert [pp.next_run_no(k) for k in (0, 1, 41, pp.RUN_NO_MAX - 1, pp.RUN_NO_MAX)] == \
-        [1, 2, 42, pp.RUN_NO_MAX, 1]
+def test_next_run_no_never_zero_and_never_wraps_codex_t1_t2():
+    """Codex round 5 T1, T2 (Liam 05/11: "(a) Chặn quay vòng"): no run number is used twice
+    inside one daemon run; after 65535 there is no next number, START must be refused."""
+    assert [pp.next_run_no(k) for k in (0, 1, 41, pp.RUN_NO_MAX - 1)] == [1, 2, 42, pp.RUN_NO_MAX]
+    for k in (pp.RUN_NO_MAX, pp.RUN_NO_MAX + 1):
+        with pytest.raises(OverflowError):
+            pp.next_run_no(k)
+    with pytest.raises(ValueError):
+        pp.next_run_no(-1)
 
 
 def test_info_text_truncated_and_numbers_saturate():

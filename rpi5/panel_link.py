@@ -24,7 +24,10 @@ RunControl contract (what stage E implements):
     Numbers it does not know stay None and are shown as '-' / not valid on the panel.
   * run_no / result_run in the snapshot (Codex round 3 R1-R5, Liam 04/11: "(a) Sửa gốc + R3"):
     the run manager counts every run it starts, from the panel or from the PC
-    (panel_proto.next_run_no: 1..65535, then 1); run_no is the current run, or the last one
+    (panel_proto.next_run_no: 1..65535); run numbers never wrap inside one daemon run: at
+    65535 the run manager refuses START (RES_FAILED, state unchanged) until the daemon
+    restarts with a new epoch (Codex round 5 T1, T2, Liam 05/11: "(a) Chặn quay vòng");
+    run_no is the current run, or the last one
     when none is active, and goes into every STATUS (Codex round 4, Liam 04/11: "A: run_no vào
     STATUS"); result_run is the run the result lines belong to (0 = none), in INFO. Result
     lines with result_run 0 are not sent as valid: the panel could not tell whose they are.
@@ -230,9 +233,13 @@ class FakeRun:
             return pp.RES_BUSY
         if i >= len(self.names):
             return pp.RES_BAD_PROFILE
+        try:
+            run_no = pp.next_run_no(self.run_no)
+        except OverflowError:                       # no number left: refuse, change nothing
+            return pp.RES_FAILED
         self.profile = i
         self.error_code, self.error_text, self.result, self.result_run = 0, '', (), 0
-        self.run_no = pp.next_run_no(self.run_no)
+        self.run_no = run_no
         self._phase(pp.ST_PREPARE)
         return pp.RES_OK
 

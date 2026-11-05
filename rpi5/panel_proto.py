@@ -52,7 +52,10 @@ poly 0x1021, init 0xFFFF, over all previous bytes of the frame, start byte inclu
     27    last_cmd      CMD_* of the last command handled (0 while last_result is RES_NONE)
     28-29 run_no        the run this STATUS is about: the current run, or the last one when
                         none is active; +1 at every run start, from the panel or from the PC;
-                        1..65535, after 65535 comes 1; 0 = no run since the run manager started
+                        1..65535, never reused inside one daemon run: at 65535 START is
+                        refused until the daemon restarts (new epoch; Codex round 5 T1, T2,
+                        Liam 05/11: "(a) Chặn quay vòng"); 0 = no run since the run manager
+                        started
     30-31 crc
 
   PROFILE daemon -> panel, 28 bytes, the list the panel scrolls with NAV
@@ -138,7 +141,7 @@ CTRL_LEN    = 8
 RESULT_LINES = 3
 RESULT_LEN  = 20
 ERROR_TEXT_LEN = 22
-RUN_NO_MAX  = 0xFFFF        # run_no counts 1..RUN_NO_MAX, then 1 again (0 = no run)
+RUN_NO_MAX  = 0xFFFF        # run_no counts 1..RUN_NO_MAX, never wraps in one daemon (0 = no run)
 _LEN = {START_CMD: LEN_CMD, START_STATUS: LEN_STATUS, START_PROFILE: LEN_PROFILE,
         START_INFO: LEN_INFO}
 
@@ -300,8 +303,16 @@ class Info:
 
 
 def next_run_no(run_no: int) -> int:
-    """run_no of the next run: 1..RUN_NO_MAX, never 0."""
-    return run_no + 1 if 0 <= run_no < RUN_NO_MAX else 1
+    """run_no of the next run: 1..RUN_NO_MAX, never 0, never wraps (Codex round 5 T1, T2,
+    Liam 05/11: "(a) Chặn quay vòng"): a run number is not used twice inside one daemon run,
+    so at RUN_NO_MAX it raises OverflowError and the run manager refuses START (RES_FAILED)
+    until the daemon restarts with a new epoch."""
+    if run_no < 0:
+        raise ValueError('run_no < 0: %d' % run_no)
+    if run_no >= RUN_NO_MAX:
+        raise OverflowError('run_no %d: no run number left in this daemon run, restart it'
+                            % run_no)
+    return run_no + 1
 
 
 def _ascii(text: str, n: int) -> bytes:
