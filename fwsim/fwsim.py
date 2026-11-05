@@ -53,6 +53,30 @@ IMU_COLS = ['g_valid', 'r_valid', 'wz_src', 'wz_meas', 'gz', 'yaw', 'age_g_ms', 
             'bias_gz', 'r', 'r_th', 'slip_flag', 'slip_on_count', 'src_switch_count',
             'src_switch_dwz', 'wz_cmd', 'head_on', 'psi_ref', 'psi_imu', 'e_psi',
             'psi_reset_count', 'head_toggle_count', 'bias_updates', 'slip_eval']
+# Position loop (pos_ctrl.c, AGV feat/pos-loop, O1 PA3): only with a DLL built from firmware that has it
+POS_COLS = ['pos_on', 'pos_corr_vx', 'pos_corr_vy', 'pos_x_ref', 'pos_y_ref', 'pos_th_ref',
+            'pos_x', 'pos_y', 'pos_th', 'pos_ex_b', 'pos_ey_b', 'pos_th_src',
+            'pos_in_pos', 'still',     # (a) in-position window, (d) standstill hold (04/11)
+            'pos_reset_n', 'run_active']   # 05/11 (Codex P6); 0 with firmware before them
+# The firmware turns the loop, (a) and (d) ON by default since 04/11 (Liam, CODE session:
+# "làm cách 1 ban khuyến nghị đi"). Velocity-loop-only runs pass vel_loop_only(fw) as fw_params.
+VEL_LOOP_ONLY = dict(pos_on=0, pos_e_win=0.0, still_on=0)
+
+
+def vel_loop_only(fw):
+    """fw_params that turn the position loop, (a) and (d) off; {} for a DLL without pos_ctrl.c."""
+    return dict(VEL_LOOP_ONLY) if fw.pos_cols else {}
+
+
+def pos_meta(fw):
+    """Position loop + standstill hold parameters as the firmware holds them now (for meta.yaml);
+    None for a DLL without pos_ctrl.c."""
+    if not fw.pos_cols:
+        return None
+    return dict(zip(('on', 'kp', 'ki', 'v_corr_max', 'e_win', 'e_exit', 'still_on', 'v_still', 't_still_us'),
+                    (float(x) for x in fw.pos_params())))
+# Wheel-consistency slip flag (wheel_slip.c, AGV feat/wheel-slip): only with a DLL that has it
+WS_COLS = ['ws_res', 'ws_th', 'ws_eval', 'ws_flag', 'ws_on_count']
 
 
 class FirmwareSim:
@@ -87,6 +111,23 @@ class FirmwareSim:
         L.fwsim_imu_last.argtypes = [ctypes.POINTER(ctypes.c_double)]
         if L.fwsim_abi() != 5 or L.fwsim_imu_cols() != len(IMU_COLS):
             sys.exit('fwsim.dll ABI mismatch: rebuild with build_fwsim.py')
+        try:                                   # older DLLs have no position-loop entry points
+            L.fwsim_pos_cols.restype = ctypes.c_int
+            L.fwsim_pos_last.argtypes = [ctypes.POINTER(ctypes.c_double)]
+            L.fwsim_get_pos.argtypes = [ctypes.POINTER(ctypes.c_float)]
+            self.pos_cols = L.fwsim_pos_cols()
+        except AttributeError:
+            self.pos_cols = 0
+        if self.pos_cols not in (0, len(POS_COLS)):
+            sys.exit('fwsim.dll position-loop columns mismatch: rebuild with build_fwsim.py')
+        try:                                   # older DLLs have no wheel-slip entry points
+            L.fwsim_ws_cols.restype = ctypes.c_int
+            L.fwsim_ws_last.argtypes = [ctypes.POINTER(ctypes.c_double)]
+            self.ws_cols = L.fwsim_ws_cols()
+        except AttributeError:
+            self.ws_cols = 0
+        if self.ws_cols not in (0, len(WS_COLS)):
+            sys.exit('fwsim.dll wheel-slip columns mismatch: rebuild with build_fwsim.py')
         self._counts = (ctypes.c_int32 * 4)()
         self._sp = (ctypes.c_float * 3)()
         self._duty = (ctypes.c_double * 4)()
@@ -141,6 +182,25 @@ class FirmwareSim:
     def imu_init_fail(self):
         """imu_init() failed at boot (spec section 7): motors stay disabled for the run."""
         self.lib.fwsim_imu_init_fail()
+
+    def pos_last(self):
+        """Position-loop columns of the last tick (POS_COLS); only when pos_cols > 0."""
+        out = (ctypes.c_double * len(POS_COLS))()
+        self.lib.fwsim_pos_last(out)
+        return list(out)
+
+    def ws_last(self):
+        """Wheel-slip columns of the last tick (WS_COLS); only when ws_cols > 0."""
+        out = (ctypes.c_double * len(WS_COLS))()
+        self.lib.fwsim_ws_last(out)
+        return list(out)
+
+    def pos_params(self):
+        """Position-loop parameters held by the firmware: on, kp, ki, v_corr_max, e_win, e_exit,
+        still_on, v_still, t_still_us."""
+        out = (ctypes.c_float * 9)()
+        self.lib.fwsim_get_pos(out)
+        return [round(float(v), 6) for v in out]
 
     def set_param(self, name, value):
         if not self.lib.fwsim_set_param(name.encode(), float(value)):
@@ -250,6 +310,10 @@ def simulate(fw, setpoint, duration, params=None, seed=0, sp_rate_hz=50.0, pcnt_
     sp_held, sp_next_us = (0.0, 0.0, 0.0), 0
     log = {k: [] for k in ['t', 'sp', 'v_true', 'v_fw', 'duty', 'pwm', 'rpm', 'omega', 'pose', 'en',
                            'count', 'tick', 'dpwm', 'sat', 'imu', 'r_true', 'inj']}
+    if fw.pos_cols:
+        log['pos'] = []
+    if fw.ws_cols:
+        log['ws'] = []
 
     for k in range(n_plant + 1):
         t_us = k * 1000
@@ -281,6 +345,10 @@ def simulate(fw, setpoint, duration, params=None, seed=0, sp_rate_hz=50.0, pcnt_
             cnt, tk, dp, sat = fw.last()
             log['count'].append(cnt); log['tick'].append(tk); log['dpwm'].append(dp); log['sat'].append(sat)
             log['imu'].append(fw.imu_last())
+            if fw.pos_cols:
+                log['pos'].append(fw.pos_last())
+            if fw.ws_cols:
+                log['ws'].append(fw.ws_last())
             log['r_true'].append((p.H_fwd @ x[6:10])[2] - x[5])     # wz from wheels - body wz
             log['inj'].append(bool(inj is not None and inj.active(t_us * 1e-6)))
         if k == n_plant:
@@ -324,6 +392,34 @@ def plant_meta(params):
     return json.dumps(d)
 
 
+def add_plant_imu_args(ap):
+    """Plant ground contact and IMU options shared by fwsim.py, s02_groupA_sim.py and tune_ga.py."""
+    ap.add_argument('--imu-rate', type=float, default=20.0, help='BNO085 report rate [Hz] (IMU_REPORT_PERIOD_US)')
+    ap.add_argument('--imu-boot-reset', type=float, default=-1.0,
+                    help="time of the chip's boot SH2_RESET [s] (default -1: before the run); set from the measured init_ms")
+    ap.add_argument('--no-imu', action='store_true', help='no IMU reports: only to re-run pre-28/10 runs (QD 23: every firmware has the IMU)')
+    ap.add_argument('--ground', choices=['rigid', 'traction'], default=None,
+                    help='plant ground contact (default: params.py ground_model); traction = slip method A')
+    ap.add_argument('--mu', type=float, default=None, help='mu_hd of all four wheels for --ground traction')
+
+
+def plant_params(a, wheels_lifted=False):
+    """MecanumParams with the --ground / --mu options applied."""
+    params = MecanumParams()
+    if wheels_lifted:
+        params.update_physical(wheels_lifted=True)
+    if a.ground:
+        params.ground_model = a.ground
+    if a.mu is not None:
+        params.mu_hd = np.full(4, a.mu)
+    return params
+
+
+def imu_config(a):
+    """simulate(imu=...) from the --imu-rate / --imu-boot-reset / --no-imu options."""
+    return None if a.no_imu else dict(rate_hz=a.imu_rate, boot_reset=a.imu_boot_reset)
+
+
 def lib_versions():
     import numpy, scipy  # noqa: E401
     v = dict(python=sys.version.split()[0], numpy=numpy.__version__, scipy=scipy.__version__)
@@ -345,6 +441,12 @@ def write_run(out, log, met, fw, args_dict, params):
             ['x', 'y', 'theta', 'en'] + IMU_COLS + ['r_true', 'inj'])
     data = np.column_stack([log['t'], log['sp'], log['v_true'], log['v_fw'], log['duty'], log['pwm'],
                             log['omega'], log['pose'], log['en'], log['imu'], log['r_true'], log['inj']])
+    if len(log.get('pos', [])):                # position loop columns (firmware with pos_ctrl.c)
+        cols += POS_COLS
+        data = np.column_stack([data, log['pos']])
+    if len(log.get('ws', [])):                 # wheel slip flag columns (firmware with wheel_slip.c)
+        cols += WS_COLS
+        data = np.column_stack([data, log['ws']])
     np.savetxt(os.path.join(out, 'log.csv'), data, delimiter=',', header=','.join(cols), comments='', fmt='%.6g')
     with open(os.path.join(out, 'metrics.json'), 'w') as f:
         json.dump(met, f, indent=2)
@@ -379,25 +481,15 @@ def main():
     ap.add_argument('--pcnt-mode', default='idf', choices=list(PCNT_MODES))
     ap.add_argument('--io-delay-ms', type=int, default=0)
     ap.add_argument('--mode', choices=['PID', 'ADRC'], default=None, help='default: firmware CTRL_MODE')
-    ap.add_argument('--imu-rate', type=float, default=20.0, help='BNO085 report rate [Hz] (IMU_REPORT_PERIOD_US)')
-    ap.add_argument('--imu-boot-reset', type=float, default=-1.0,
-                    help="time of the chip's boot SH2_RESET [s] (default -1: before the run); set from the measured init_ms")
-    ap.add_argument('--no-imu', action='store_true', help='no IMU reports: only to re-run pre-28/10 runs (QD 23: every firmware has the IMU)')
-    ap.add_argument('--ground', choices=['rigid', 'traction'], default=None,
-                    help='plant ground contact (default: params.py ground_model); traction = slip method A')
-    ap.add_argument('--mu', type=float, default=None, help='mu_hd of all four wheels for --ground traction')
+    add_plant_imu_args(ap)
     ap.add_argument('--out')
     a = ap.parse_args()
     sp = make_setpoint(a)
     duration = a.duration or sp.duration or 20.0
     fw = FirmwareSim()
-    params = MecanumParams()
-    if a.ground:
-        params.ground_model = a.ground
-    if a.mu is not None:
-        params.mu_hd = np.full(4, a.mu)
+    params = plant_params(a)
     t0 = time.time()
-    imu = None if a.no_imu else dict(rate_hz=a.imu_rate, boot_reset=a.imu_boot_reset)
+    imu = imu_config(a)
     log = simulate(fw, sp, duration, params, a.seed, a.sp_rate, a.pcnt_mode, a.io_delay_ms, mode=a.mode, imu=imu)
     met = metrics(log)
     print(f'{duration:.1f} s simulated in {time.time() - t0:.1f} s, controller {fw.ctrl_mode}')

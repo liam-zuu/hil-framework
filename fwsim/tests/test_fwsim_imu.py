@@ -282,9 +282,11 @@ def test_injection_above_threshold(fw):
 
 
 def test_injection_below_threshold(fw):
-    """Residual about 0.5 r_th: the flag stays off (threshold check, not sensitivity to real slip)."""
+    """Residual about 0.5 r_th: the flag stays off (threshold check, not sensitivity to real slip).
+    Velocity loop alone: on the rigid plant (no 4-wheel constraint) the position loop's mm/s
+    corrections move wz_enc, and with them the residual (ratio 0.298 with it, 0.377 without, 05/11)."""
     inj = GyroInjection(t0=2.0, t_inj=1.0, s=0.03)
-    log = fwsim.simulate(fw, const(wz=1.0), 5.0, imu=dict(injection=inj))
+    log = fwsim.simulate(fw, const(wz=1.0), 5.0, imu=dict(injection=inj), fw_params=fwsim.vel_loop_only(fw))
     t = log['t']
     r = np.abs(col(log, 'r')[(t > 2.3) & (t < 2.9)])
     assert 0.3 < r.mean() / col(log, 'r_th')[-1] < 0.7
@@ -320,9 +322,12 @@ def test_bias_estimated_at_standstill(fw):
 
 def test_no_bias_with_motor_on_and_gyro_offset(fw):
     """Motor enabled, setpoint 0: the gyro offset drives the wz loop, PWM is not 0, so the
-    standstill condition (motor disabled or PWM = 0) is not met: no bias update."""
+    standstill condition (motor disabled or PWM = 0) is not met: no bias update.
+    Without the (d) hold: the hold (on by default since 04/11) sets the PWM to 0, which meets
+    the standstill condition, so the bias is then learnt (2 updates in 6 s, fwsim 04/11)."""
     hook = lambda t, k, v: v + 0.01 if k == 'gyro' else v   # noqa: E731
-    log = fwsim.simulate(fw, const(), 6.0, imu=dict(hook=hook), fw_params=dict(sigma_gz=0.01, sigma_a=0.05))
+    log = fwsim.simulate(fw, const(), 6.0, imu=dict(hook=hook),
+                         fw_params=dict(sigma_gz=0.01, sigma_a=0.05, **fwsim.vel_loop_only(fw)))
     assert np.abs(log['pwm']).max() > 0
     assert col(log, 'bias_updates')[-1] == 0
 
