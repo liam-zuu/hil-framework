@@ -8,6 +8,9 @@ Times, under the same scheduling as the plant loop (SCHED_FIFO 90, core 0):
                (IMU sample, state reorder, encode_state, decode_torques)
   traction_muM plant_step() with ground_model 'traction' (method A as implemented,
                mu_hd = M, sub-steps from the stability bound)
+  frame_log    the per-frame writes of run_hil.py --frame-log (hil_node.py: t_send + 40 B MOSI
+               + 40 B MISO into preallocated arrays, inside the step before t_done): extra
+               load of S06 T1/T2 runs that log frames (S06, Liam 30/10)
   slipA_nsubN  THROWAWAY timing prototype of a minimal slip model (method A):
                body with its own dynamics, traction per wheel capped by mu*N,
                N sub-steps per 1 ms. Only for timing: parameters are guesses,
@@ -122,6 +125,20 @@ def main() -> int:
         pt.ground_model = 'traction'
         pt.mu_hd = np.full(4, mu)
         variants.append((f'traction_mu{mu}', lambda pt=pt: plant_step(x, u, pt, 0.001, rng)))
+    nlog = 1 << 16
+    flog = {'t_send_ns': np.zeros(nlog, dtype=np.int64), 'mosi': np.zeros((nlog, 40), dtype=np.uint8),
+            'miso': np.zeros((nlog, 40), dtype=np.uint8)}
+    mosi_b, miso_b = bytearray(40), bytearray(40)
+    flog_k = [0]
+
+    def frame_log():
+        # same three writes as HILNode._tick with --frame-log
+        k = flog_k[0] = (flog_k[0] + 1) % nlog
+        flog['t_send_ns'][k] = time.monotonic_ns()
+        flog['mosi'][k] = memoryview(bytes(mosi_b))
+        flog['miso'][k] = memoryview(bytes(miso_b))
+
+    variants.append(('frame_log', frame_log))
     Minv = np.diag([1.0 / p.M, 1.0 / p.M, 1.0 / p.Iz])
     stepA = _slip_a_step(p, Minv, np.full(4, p.J_w), p.M * p.g / 4.0, 0.8, 5.0)
     v0, w0 = np.zeros(3), np.full(4, 5.0)
