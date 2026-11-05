@@ -9,8 +9,12 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import s02_metrics  # noqa: E402
+from agv_logger import COLUMNS, N_S02  # noqa: E402
 
-HEAD = ['timestamp_us', 'tick', 'log_seq', 'motor_on']
+
+def _row(head, **v):
+    """A row of the logger format (s02_metrics refuses other headers, B0 review round 3 N9)."""
+    return [v.get(c, 0) for c in head]
 
 
 def write_log(tmp_path, lines, run_end_last=None):
@@ -18,11 +22,11 @@ def write_log(tmp_path, lines, run_end_last=None):
     p = tmp_path / 'run.csv'
     with open(p, 'w', newline='') as f:
         w = csv.writer(f)
-        w.writerow(HEAD)
+        w.writerow(COLUMNS)
         tick = 0
         for seq, on in lines:
             tick += on
-            w.writerow([seq * 10_000, tick, seq, on])
+            w.writerow(_row(COLUMNS, timestamp_us=seq * 10_000, tick=tick, log_seq=seq, motor_on=on))
     if run_end_last is not None:
         with open(str(p) + '.events.txt', 'w') as f:
             for k in range(3):
@@ -59,8 +63,8 @@ def test_old_format_uses_ticks(tmp_path):
     p = tmp_path / 'old.csv'
     with open(p, 'w', newline='') as f:
         w = csv.writer(f)
-        w.writerow(['timestamp_us', 'tick'])
+        w.writerow(COLUMNS[:N_S02])
         for t in [1, 2, 3, 5]:
-            w.writerow([t * 10_000, t])
+            w.writerow(_row(COLUMNS[:N_S02], timestamp_us=t * 10_000, tick=t))
     pct, tail = s02_metrics.log_loss(s02_metrics.load_log(str(p)))
     assert pct == pytest.approx(20.0) and tail == 0
