@@ -32,14 +32,21 @@ DUT_HEADER = (
     "wz_meas,wz_cmd,gz_fused,yaw_rad,age_g_ms,age_r_ms,gyro_n,rv_n,reset_n,"
     "g_valid,r_valid,wz_src,src_switch_count,psi_ref,e_psi,head_on,psi_reset_count,"
     "slip_flag,slip_on_count,r,bias_gz,"
-    "src_switch_dwz,bias_updates,slip_eval"
+    "src_switch_dwz,bias_updates,slip_eval,"
+    # AGV feat/pos-loop 9110532 logger.c:108-109 (position loop, 04/11; run_active, pos_reset_n 05/11)
+    "pos_on,pos_x,pos_y,pos_th,pos_x_ref,pos_y_ref,pos_th_ref,pos_corr_vx,pos_corr_vy,"
+    "pos_th_src,pos_in_pos,still,run_active,pos_reset_n,"
+    # AGV feat/wheel-slip 8211c3c logger.c:108 (after the pos_* columns in the campaign firmware)
+    "ws_res,ws_th,ws_flag,ws_on_count,ws_eval"
 )
 # logger.c:132-145, the conversion of each column in order
 DUT_FMT = ("%lld," "%ld,%ld,%ld,%ld," "%.2f,%.2f,%.2f,%.2f," "%.3f,%.3f,%.3f," "%.3f,%.3f,%.3f,"
            "%d,%d,%d,%d," "%.3f,%.3f,%.3f," "%.3f,%.3f,%.3f," "%.2f,%.2f,%.2f,"
            "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu," "%lu,%lu,%lu,%u,%d,"
            "%.4f,%.4f,%.4f,%.4f,%.1f,%.1f,%lu,%lu,%lu," "%u,%u,%u,%lu,%.4f,%.4f,%u,%lu,"
-           "%u,%lu,%.4f,%.5f," "%.4f,%lu,%u").split(',')
+           "%u,%lu,%.4f,%.5f," "%.4f,%lu,%u,"
+           "%u,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f," "%u,%u,%u,%u,%lu,"   # pos-loop 9110532 logger.c:152-153
+           "%.0f,%.1f,%u,%lu,%u").split(',')                               # wheel-slip 8211c3c logger.c:148
 NAMES = DUT_HEADER.split(',')
 S = 1_000_000           # microseconds per second
 
@@ -81,7 +88,7 @@ def seg(core, i):
 
 
 def test_fixture_matches_logger_schema():
-    assert len(NAMES) == len(DUT_FMT) == 66
+    assert len(NAMES) == len(DUT_FMT) == 85
     assert NAMES == al.COLUMNS
     ints = {n for n, c in zip(NAMES, DUT_FMT) if 'f' not in c}
     assert ints == set(al.INT_COLUMNS)
@@ -101,8 +108,26 @@ def test_strict_keeps_dut_line_and_rejects_old_formats():
 def test_loose_pads_old_formats_like_before():
     core = al.LoggerCore(strict=False)
     kind, fields = core.feed(','.join(dut_line(1).split(',')[:al.N_S02]))
-    assert kind == 'data' and len(fields) == 66 and fields[-1] == ''
+    assert kind == 'data' and len(fields) == 85 and fields[-1] == ''
     assert core.placement == (None, 'no_seq')
+
+
+@pytest.mark.parametrize('n', [66, 80])
+def test_ctrl_imu_and_pos_loop_lines_padded_loose_rejected_strict(n):
+    """Firmware before the campaign columns (ctrl-imu 66, feat/pos-loop alone 80): loose mode pads
+    them with empty columns, measurement mode rejects them like the 28/37-column formats."""
+    line = ','.join(dut_line(1).split(',')[:n])
+    kind, fields = al.LoggerCore(strict=False).feed(line)
+    assert kind == 'data' and len(fields) == 85 and fields[n - 1] != '' and fields[n:] == [''] * (85 - n)
+    assert al.LoggerCore(strict=True).feed(line) == ('reject', f'n_cols_{n}')
+
+
+@pytest.mark.parametrize('n', [66, 80])
+def test_old_header_prefix_blocks_strict(n):
+    core = al.LoggerCore(strict=True)
+    assert core.feed(','.join(NAMES[:n]))[0] == 'header'
+    assert core.header == 'old_prefix' and core.schema_blocked
+    assert core.feed(dut_line(1)) == ('reject', 'schema_header')
 
 
 @pytest.mark.parametrize('col,val,why', [
@@ -111,7 +136,11 @@ def test_loose_pads_old_formats_like_before():
     ('imu_init', '-129', 'range'),
     # B36: values the DUT never prints in flag / enum columns
     ('motor_on', '2', 'domain'), ('slip_eval', '3', 'domain'), ('wz_src', '2', 'domain'),
-    ('imu_init', '4', 'domain'), ('imu_init', '-2', 'domain')])
+    ('imu_init', '4', 'domain'), ('imu_init', '-2', 'domain'),
+    # 04/11: flags of the position loop and the wheel slip flag
+    ('pos_on', '2', 'domain'), ('pos_th_src', '2', 'domain'), ('still', '2', 'domain'),
+    ('ws_eval', '2', 'domain'), ('ws_on_count', '-1', 'range'), ('pos_x', 'abc', 'type'),
+    ('run_active', '2', 'domain'), ('pos_reset_n', '-1', 'range')])
 def test_strict_rejects_wrong_type_range_or_domain(col, val, why):
     assert al.LoggerCore(strict=True).feed(dut_line(1, **{col: val})) == ('reject', why)
 
