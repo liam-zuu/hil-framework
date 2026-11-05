@@ -258,9 +258,11 @@ def test_strafe_still_runs_with_front_blocked(fw):
 
 def test_blocked_integral_discharges(fw):
     """Round 2 P1: the integral built while behind stays from growing toward the blocked side but
-    may discharge. The estimate passes the command pose while the front is blocked; once the
-    discharge turns the correction negative (allowed, backward), unblocking gives no forward step
-    from an old integral."""
+    may discharge. The estimate passes the command pose while the front is blocked; the integral
+    discharges until the correction turns negative (allowed, backward), and after unblocking the
+    correction stays negative. This checks discharge when the error changes sign; it does not
+    claim that unblocking never steps: the integral from before the block (same sign as the
+    blocked side) stays, the car returns to its state before the block (Codex round 3 R2)."""
     t = _Ticks(fw, pos_e_win=0.0, still_on=0)
     t.step((0.02, 0.0, 0.0), n=50)                      # command pose 1 cm ahead, wheels stuck
     t.step((0.0, 0.0, 0.0), n=500)                      # 5 s behind by 1 cm: integral about 0.05 m s
@@ -278,12 +280,40 @@ def test_blocked_integral_discharges(fw):
     assert p[P['pos_corr_vx']] < 0.0
 
 
+def test_blocked_integral_does_not_cross_zero(fw):
+    """Codex round 3 R1: a small negative integral (estimate slightly ahead), then the front is
+    blocked and the estimate jumps back so one tick's e*dt is 1-2 times |integral|: without the
+    clamp the integral crosses 0 to the blocked (positive) sign and stays there. The integral is
+    read back from an unblocked tick: corr = Kp*e + Ki*(i_prev + e*dt) (unsaturated)."""
+    kp, ki, dt = 6.0, 3.0, fwsim.FW_DT_US * 1e-6
+    t = _Ticks(fw, pos_e_win=0.0, still_on=0)
+    t.step((0.0, 0.0, 0.0), wheel_v=0.05, n=4)            # estimate about 2 mm ahead
+    p, _ = t.step((0.0, 0.0, 0.0))
+    i_old = (p[P['pos_corr_vx']] - kp * p[P['pos_ex_b']]) / ki
+    assert i_old < 0.0
+    fw.set_param('block_fwd', 1)
+    target_e = 1.5 * abs(i_old) / dt                      # e*dt about 1.5 |integral|
+    t.n -= (target_e - p[P['pos_ex_b']]) * t.per_mps / dt  # wheels jump back in one tick
+    p, _ = t.step((0.0, 0.0, 0.0))
+    ratio = p[P['pos_ex_b']] * dt / abs(i_old)
+    assert 1.05 < ratio < 1.95, ratio                       # the step would cross 0 by less than |i_old|
+    assert p[P['pos_corr_vx']] == 0.0
+    t.step((0.0, 0.0, 0.0), n=20)                           # still blocked, e unchanged
+    fw.set_param('block_fwd', 0)
+    p, _ = t.step((0.0, 0.0, 0.0))
+    e = p[P['pos_ex_b']]
+    i_prev = (p[P['pos_corr_vx']] - kp * e) / ki - e * dt
+    assert i_prev <= 1e-6, i_prev                           # not on the blocked side
+
+
 _HUGE_WZ = """
 import sys, math
 sys.path.insert(0, sys.argv[1])
 import fwsim
 f = fwsim.FirmwareSim()
 f.reset()
+f.set_mode('ADRC')   # LADRC limits the turn output before IK; PID would add wz to the wheel speed
+                     # and cast an out-of-range float to int in the PWM step (UB; Codex round 3 R3)
 f.set_run(True, False)
 for k in range(1, 6):
     f.tick(k * fwsim.FW_DT_US, [0, 0, 0, 0], (0.0, 0.0, 1e12))
