@@ -72,12 +72,29 @@ def test_one_slippery_wheel_on_acceleration(fw):
     assert f[-1] == 0
 
 
-def test_catches_sideways_slip_the_yaw_rate_flag_misses(fw):
-    """FL on mu 0.2, sideways step 0.6 m/s: the body does not turn much, so the yaw-rate slip
-    flag of imu_fusion.c stays off; the wheel-consistency flag turns on."""
-    log = fwsim.simulate(fw, step(vy=0.6), 3.0, plant([0.2, 0.5, 0.5, 0.5]), seed=1, mode='PID', imu=IMU)
+@pytest.mark.parametrize('pos_loop', [True, False], ids=['pos_on', 'pos_off'])
+def test_sideways_slip_one_slippery_wheel(fw, pos_loop):
+    """FL on mu 0.2, sideways step 0.6 m/s, position loop on (firmware default) and off:
+    the wheel-consistency flag turns on, and the yaw-rate residual r of imu_fusion.c follows the
+    plant's r_true (wz from wheels - body wz), so that flag measures the real slip.
+    Before the int/post-g2 merge (05/11) this test asserted the yaw-rate flag stays off. On the
+    merged firmware the body really turns while FL slips at the start (plant |wz| up to
+    0.6-0.8 rad/s) and the yaw-rate flag turns on with the position loop on (|r| > r_th for
+    25 ticks vs T_slip 20); with the loop off it missed by one sample. So that claim is not
+    asserted (Liam CODE session 05/11: 'Viết lại theo điều đúng'). r_th uses sigma_gz = 0 (gyro
+    noise not measured yet, K1): the yaw-rate flag behaviour will change once it is."""
+    fp = None if pos_loop else fwsim.vel_loop_only(fw)
+    log = fwsim.simulate(fw, step(vy=0.6), 3.0, plant([0.2, 0.5, 0.5, 0.5]), seed=1, mode='PID', imu=IMU,
+                         fw_params=fp)
     assert ws(log, 'ws_on_count')[-1] >= 1
-    assert log['imu'][-1, fwsim.IMU_COLS.index('slip_on_count')] == 0
+    imu = np.asarray(log['imu'])
+    r = imu[:, fwsim.IMU_COLS.index('r')]
+    ev = imu[:, fwsim.IMU_COLS.index('slip_eval')] == 1
+    r_true = np.asarray(log['r_true'])
+    k = int(np.argmax(np.abs(r_true)))
+    assert abs(r_true[k]) > 0.3                                    # a real slip event
+    assert np.sign(r[ev][np.argmax(np.abs(r[ev]))]) == np.sign(r_true[k])
+    assert np.abs(r[ev]).max() == pytest.approx(np.abs(r_true).max(), rel=0.2)
 
 
 def test_hold_time_needed(fw):
