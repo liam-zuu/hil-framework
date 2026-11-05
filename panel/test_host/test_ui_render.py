@@ -13,5 +13,7 @@ def test_all_screens_render_without_missing_glyphs(tmp_path):
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr
     assert 'missing_glyphs 0' in r.stdout
+    # bench 05/11: fillScreen on the sprite cleared only x < 320, old pixels stayed on the right
+    assert 'stale_pixels 0' in r.stdout
     pngs = sorted(p.name for p in tmp_path.glob('*.png') if p.name != 'sheet.png')
     assert len(pngs) == 12 and (tmp_path / 'sheet.png').exists()

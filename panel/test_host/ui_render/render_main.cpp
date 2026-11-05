@@ -134,5 +134,20 @@ int main(int argc, char **argv)
     strcpy(A.msg, "STOP: FAILED (effect unknown)");
     shot(dir, "12_fault_no_text_esp32_down");
     printf("missing_glyphs %d\n", TFT_eSPI::missing_glyphs());
+
+    /* every frame must start from a clean screen (bench 05/11: the right third kept old
+     * pixels): NO LINK drawn after RUN must equal NO LINK drawn after FAULT */
+    static uint16_t after_run[320][480];
+    PanelView v{&A, NOW};
+    base(); C.st.run_state = PP_ST_RUN; C.st.phase_ds = 63; ui_draw(v);
+    base(); C.sid = 0; C.has_st = false; C.has_status_t = false; ui_draw(v);
+    memcpy(after_run, ui_render_screen()->buf, sizeof after_run);
+    base(); C.st.run_state = PP_ST_ERROR; C.st.error_code = 1; ui_draw(v);
+    base(); C.sid = 0; C.has_st = false; C.has_status_t = false; ui_draw(v);
+    int stale = 0;
+    for (int y = 0; y < 320; y++)
+        for (int x = 0; x < 480; x++)
+            stale += after_run[y][x] != ui_render_screen()->buf[y][x];
+    printf("stale_pixels %d\n", stale);
     return 0;
 }

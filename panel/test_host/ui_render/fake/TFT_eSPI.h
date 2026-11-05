@@ -7,7 +7,8 @@
  *    are those of the board;
  *  - smooth shapes (round rects, circles, arcs) are drawn by 4x4 supersampling, close to but
  *    not bit-exact with the library's anti-aliasing;
- *  - only TL_DATUM; the sprite is a plain buffer pushed to the screen buffer.
+ *  - only TL_DATUM; the sprite is a plain buffer pushed to the screen buffer;
+ *  - fillScreen() on the sprite clears only x < 320, as on the board (see _width).
  */
 #pragma once
 #include <math.h>
@@ -23,11 +24,20 @@ public:
     uint16_t buf[HMAX][WMAX];
     int w = WMAX, h = HMAX;
 
+    /* as the library: _width/_height start at the rotation-0 size (TFT_WIDTH x TFT_HEIGHT =
+     * 320 x 480) and only setRotation() changes them; a TFT_eSprite never calls it, so its
+     * fillScreen() covers 320 x 480 clipped to the sprite, i.e. only x < 320 (bench 05/11) */
+    int _width = 320, _height = 480;
+
     TFT_eSPI() { memset(buf, 0, sizeof buf); }
     static int &missing_glyphs() { static int n = 0; return n; }
     virtual ~TFT_eSPI() {}
     void init() {}
-    void setRotation(int) {}
+    void setRotation(int r)
+    {
+        _width = (r & 1) ? 480 : 320;
+        _height = (r & 1) ? 320 : 480;
+    }
     int width() const { return w; }
     int height() const { return h; }
 
@@ -51,7 +61,7 @@ public:
             for (int i = x; i < x + ww; i++)
                 drawPixel(i, j, c);
     }
-    void fillScreen(uint16_t c) { fillRect(0, 0, w, h, c); }
+    void fillScreen(uint16_t c) { fillRect(0, 0, _width, _height, c); }
     void drawFastHLine(int x, int y, int ww, uint16_t c) { fillRect(x, y, ww, 1, c); }
     void drawRect(int x, int y, int ww, int hh, uint16_t c)
     {
@@ -193,6 +203,7 @@ public:
     TFT_eSPI *parent;
     explicit TFT_eSprite(TFT_eSPI *p) : parent(p) {}
     void setColorDepth(int) {}
-    void *createSprite(int ww, int hh) { w = ww; h = hh; return buf; }
+    void *createSprite(int ww, int hh) { w = ww; h = hh; memset(buf, 0, sizeof buf); return buf; }
+    void fillSprite(uint16_t c) { fillRect(0, 0, w, h, c); }
     void pushSprite(int, int) { memcpy(parent->buf, buf, sizeof buf); }
 };

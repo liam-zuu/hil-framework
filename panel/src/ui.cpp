@@ -502,7 +502,14 @@ uint32_t ui_signature(const PanelView &v)
 
 void ui_draw(const PanelView &v)
 {
-    g->fillScreen(BG);
+    /* fillSprite, not fillScreen: a TFT_eSprite keeps the TFT's rotation-0 _width/_height
+     * (320 x 480; Sprite.cpp never sets them), so fillScreen on the 480 x 320 sprite cleared
+     * only x < 320 and the right third kept old pixels (bench 05/11: black right part, an old
+     * "loop" over "ovr"). */
+    if (g_spr_ok)
+        g_spr.fillSprite(BG);
+    else
+        g->fillScreen(BG);
     health_bar(v);
     switch (app_screen(v.a, v.now)) {
     case APP_SCR_NOLINK: scr_nolink(v); break;
