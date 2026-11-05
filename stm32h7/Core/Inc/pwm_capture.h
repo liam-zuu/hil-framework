@@ -76,4 +76,8 @@ void  PWMCapture_GetStats(PWMCapture_Stats_t *out);
  * a phase lock). A main-loop preemption inside the service counts in. */
 void  PWMCapture_TakeTiming(uint32_t *win_max_ticks, uint32_t *svc_max_ticks);
 
+/* DIAG 05/11: number of windows < 7 us, 7-20 us, 20-50 us, >= 50 us and the
+ * shortest window (ticks) since the last call; resets them. */
+void  PWMCapture_TakeWinHist(uint32_t hist[4], uint32_t *win_min_ticks);
+
 #endif /* PWM_CAPTURE_H */

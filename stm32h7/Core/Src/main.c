@@ -306,6 +306,13 @@ int main(void)
                 n += snprintf(pl + n, sizeof(pl) - (size_t)n, " win=%lu.%lu svc=%lu.%lu",
                               (unsigned long)(win_t / 10u), (unsigned long)(win_t % 10u),
                               (unsigned long)(svc_t / 10u), (unsigned long)(svc_t % 10u));
+            /* DIAG 05/11: windows by length (<7 / 7-20 / 20-50 / >=50 us) and shortest window */
+            uint32_t wh[4], wmin_t;
+            PWMCapture_TakeWinHist(wh, &wmin_t);
+            if (n < (int)sizeof(pl))
+                n += snprintf(pl + n, sizeof(pl) - (size_t)n, " wh=%lu/%lu/%lu/%lu wmin=%lu.%lu",
+                              (unsigned long)wh[0], (unsigned long)wh[1], (unsigned long)wh[2], (unsigned long)wh[3],
+                              (unsigned long)(wmin_t / 10u), (unsigned long)(wmin_t % 10u));
             printf("%s\r\n", pl);
         }
         uint32_t relay_sent, relay_dropped;

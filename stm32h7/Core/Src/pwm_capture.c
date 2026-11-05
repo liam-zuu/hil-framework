@@ -54,6 +54,16 @@ static uint32_t _svc;              /* service counter, anchor "different service
  * breaks a phase lock only while a window is shorter than about 3/4 of the
  * 10 us step, i.e. about 7 us (Codex M23; Liam: measure on the board). */
 static uint16_t _win_max, _svc_max;
+/* DIAG 05/11 (bản chẩn đoán, không dùng đo): win was 65-107 us on every 2 s
+ * line on the board (PWM_CAPTURE/2026-11-05_run01, ENC_PI/2026-11-05_run03).
+ * Count every window by length, < 7 us / 7-20 us / 20-50 us / >= 50 us, and
+ * keep the shortest, to tell "a few windows preempted" from "every window
+ * long". Read and reset by PWMCapture_TakeWinHist(). */
+#define WIN_EDGE_7US   70u
+#define WIN_EDGE_20US 200u
+#define WIN_EDGE_50US 500u
+static uint32_t _win_hist[4];
+static uint16_t _win_min = 0xFFFFu;
 
 static volatile uint32_t *_ccr(TIM_TypeDef *t, uint32_t ch)
 {
@@ -209,6 +219,8 @@ void PWMCapture_Service(void)
         for (uint8_t i = 0; i < PWM_NUM_CHANNELS; i++) if (_ch[i].active) wr2[k][i] = _wr(&_ch[i]);
         uint16_t span = (uint16_t)(_now_ticks() - tw);   /* wr1 group start to wr2 group end (M23) */
         if (span > _win_max) _win_max = span;
+        if (span < _win_min) _win_min = span;                    /* DIAG 05/11 */
+        _win_hist[(span < WIN_EDGE_7US) ? 0 : (span < WIN_EDGE_20US) ? 1 : (span < WIN_EDGE_50US) ? 2 : 3]++;
     }
 
     uint8_t probe = 0u;
@@ -271,6 +283,15 @@ void PWMCapture_TakeTiming(uint32_t *win_max_ticks, uint32_t *svc_max_ticks)
     *svc_max_ticks = _svc_max;
     _win_max = 0u;
     _svc_max = 0u;
+}
+
+/* DIAG 05/11: window counts by length and shortest window (10 MHz ticks)
+ * since the last call; resets them. Main loop only, like TakeTiming. */
+void PWMCapture_TakeWinHist(uint32_t hist[4], uint32_t *win_min_ticks)
+{
+    for (int i = 0; i < 4; i++) { hist[i] = _win_hist[i]; _win_hist[i] = 0u; }
+    *win_min_ticks = (_win_min == 0xFFFFu) ? 0u : _win_min;
+    _win_min = 0xFFFFu;
 }
 
 void PWMCapture_GetDuty(float *duty_out)
