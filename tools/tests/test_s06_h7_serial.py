@@ -156,3 +156,39 @@ def test_cli(tmp_path):
     assert p.returncode == 3 and 'ly_do=thieu_bang_chung' in p.stdout
     assert subprocess.run([sys.executable, script, str(tmp_path / 'none.log'), '--out', str(out)],
                           capture_output=True, text=True).returncode == 2
+
+
+def t10_with_schedule(tmp_path, heavy=(10_000, 30_000), pc=True, blocks=4):
+    log = tmp_path / 'h7.log'
+    log.write_text('\n'.join(make_log(blocks=blocks, pc=pc)) + '\n')
+    sched = tmp_path / 's.csv'
+    sched.write_text('idx,kind,test,start_ms,end_ms\n0,test,A-L1,0,50000\n'
+                     + (f'1,heavy,,{heavy[0]},{heavy[1]}\n' if heavy else ''))
+    out = tmp_path / 'o'
+    code = ser.main([str(log), '--out', str(out), '--load-schedule', str(sched)])
+    return code, json.load(open(out / 'T10_summary.json', encoding='utf-8')), (out / 'T10_windows.csv').read_text()
+
+
+def test_t10_segments_from_schedule(tmp_path):
+    """Spec 2.2: heavy block and group A part reported apart; a window across a block edge goes into neither.
+    Link up at 1 s; block windows end 11, 21, 31, 41 s PC time, the first is dropped."""
+    code, s, rows = t10_with_schedule(tmp_path)
+    assert code == 0
+    assert s['segments']['heavy']['windows'] == 2 and s['segments']['nhom_a']['windows'] == 1
+    assert 'heavy' in rows and 'nhom_a' in rows
+
+
+def test_t10_window_across_edge_is_mixed(tmp_path):
+    code, s, rows = t10_with_schedule(tmp_path, heavy=(15_000, 25_000))
+    assert 'mixed' in rows and 'heavy' not in s['segments']
+    assert code == 3 and any('khối tải nặng' in m for m in s['missing']) and s['complete'] is False
+
+
+def test_t10_no_pc_time_leaves_segment_empty(tmp_path):
+    code, s, _ = t10_with_schedule(tmp_path, pc=False)
+    assert code == 3 and s['segments'] == {}
+
+
+def test_t10_schedule_without_heavy(tmp_path):
+    code, s, _ = t10_with_schedule(tmp_path, heavy=None)
+    assert code == 0 and 'heavy' not in s['segments'] and s['segments'] == {}

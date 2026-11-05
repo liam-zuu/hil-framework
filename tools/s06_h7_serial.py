@@ -74,9 +74,11 @@ _RE = {
     't10': re.compile(r'T10: win_ms=(\d+) isr_us=(\d+) idle_pass=(\d+) idle_us_est=(\d+) cal=(\d+)/(\d+) '
                       r'ovh_cyc=(\d+)'),
     't10_irq': re.compile(r'T10 (\S+)\s+n=(\d+) excl_us=(\d+) max_us=(\d+)\.(\d\d)'),
+    'relay': re.compile(r'Relay: sent=(\d+) dropped=(\d+)'),       # W8, tools/s06_relay_check.py
 }
 _FIELDS = {
     'link_up': ('t_ms',), 'link_lost': ('timeout_ms',), 'link_period': ('frames', 'h7_ms', 'pi_ms'),
+    'relay': ('sent', 'dropped'),
     'link': ('state', 'lost', 'fps', 'err', 'rearm', 'last_err'),
     'frame': ('unread', 'new_seen', 'taken', 'repl', 'drop', 'applied', 'skipped', 'age_max_us'),
     's06log': ('pushed', 'dropped', 'print_drop'),
@@ -184,6 +186,47 @@ def t10_rows(blocks, f_real_mhz: Optional[float] = None):
     win_rows = [dict(idx=n, **r) for n, r in enumerate(win_rows)]
     irq_rows = [dict(idx=n, **r) for n, r in enumerate(irq_rows)]
     return win_rows, irq_rows
+
+
+def read_heavy_ms(path: str) -> Optional[tuple]:
+    """(start_ms, end_ms) of the heavy row of a file of rpi5/s06_load_schedule.py, None without one."""
+    with open(path, newline='') as f:
+        for row in csv.DictReader(f):
+            if row['kind'] == 'heavy':
+                return int(row['start_ms']), int(row['end_ms'])
+    return None
+
+
+def mark_segments(win_rows, blocks, ev, span, heavy_ms) -> None:
+    """Spec 2.2 (Z8): T10 reports the heavy block and the group A part apart. PC time of the header = end of
+    the window; time 0 = PC time of the first 'SPI link up'. A window not fully on one side of a block edge
+    is `mixed` and goes into neither. Without PC times the column stays empty."""
+    t0 = ev[span[0]].get('t_pc_us') if span else None
+    for r, bl in zip(win_rows, blocks):
+        end = bl['head'].get('t_pc_us')
+        if t0 is None or end is None or heavy_ms is None:
+            r['segment'] = ''
+            continue
+        b_ms = (end - t0) / 1000.0
+        a_ms = b_ms - r['win_ms']
+        if a_ms >= heavy_ms[0] and b_ms <= heavy_ms[1]:
+            r['segment'] = 'heavy'
+        elif b_ms <= heavy_ms[0] or a_ms >= heavy_ms[1]:
+            r['segment'] = 'nhom_a'
+        else:
+            r['segment'] = 'mixed'
+
+
+def segment_means(win_rows) -> dict:
+    """% ISR, % idle of the heavy block and of the group A part (empty dict without the column)."""
+    out = {}
+    for seg in ('heavy', 'nhom_a'):
+        rows = [r for r in win_rows if r.get('segment') == seg]
+        if rows:
+            idle = [r['idle_pct'] for r in rows if r['idle_pct'] is not None]
+            out[seg] = dict(windows=len(rows), isr_pct=sum(r['isr_pct'] for r in rows) / len(rows),
+                            idle_pct=sum(idle) / len(idle) if idle else None)
+    return out
 
 
 def t10_summary(blocks, win_rows, irq_rows, ev, span) -> dict:
@@ -322,15 +365,24 @@ def main(argv=None) -> int:
     ap.add_argument('--f-real-mhz', type=float, default=None,
                     help='tần số H7 đo được của chính lượt; bỏ trống = dải X22 [478; 486] MHz')
     ap.add_argument('--all-blocks', action='store_true', help='lấy mọi khối T10, không cắt theo link up/lost')
+    ap.add_argument('--load-schedule', default=None,
+                    help='file lịch của lượt (s06_load_schedule.py): báo riêng khối tải nặng và nhóm A (spec 2.2)')
     a = ap.parse_args(argv)
     try:
         ev = read_log(a.log)
-    except OSError as exc:
+        heavy_ms = read_heavy_ms(a.load_schedule) if a.load_schedule else None
+    except (OSError, KeyError, ValueError) as exc:
         print(f'lỗi đầu vào: {exc}', file=sys.stderr)
         return 2
     blocks, span = t10_blocks(ev, a.all_blocks)
     win_rows, irq_rows = t10_rows(blocks, a.f_real_mhz)
     summ = t10_summary(blocks, win_rows, irq_rows, ev, None if a.all_blocks else span)
+    if a.load_schedule:
+        mark_segments(win_rows, blocks, ev, span, heavy_ms)
+        summ['segments'] = segment_means(win_rows)
+        if heavy_ms is not None and 'heavy' not in summ['segments']:
+            summ['missing'].append('không tách được khối tải nặng (thiếu giờ PC hoặc không có cửa sổ trọn trong khối)')
+            summ['complete'] = False
     summ['link'] = link_stats(ev, span)
     summ['f_nominal_mhz'], summ['f_real_mhz'] = F_NOMINAL_MHZ, a.f_real_mhz
     summ['run_span_lines'] = None if span is None else [ev[span[0]]['line'],
