@@ -6,13 +6,25 @@
 
 #include "panel_proto.h"
 
-/* patterns [ĐỀ XUẤT]: about 2-3 kHz suits small passive buzzers; the fault is longer and
- * lower so it reads as different without looking at the screen */
-static const pb_note_t P_START[] = {{2700, 80}, {0, 0}};
-static const pb_note_t P_DONE[] = {{2700, 90}, {0, 90}, {2700, 90}, {0, 0}};
-static const pb_note_t P_STOPPED[] = {{2000, 250}, {0, 0}};
-static const pb_note_t P_FAULT[] = {{1500, 300}, {0, 150}, {1500, 300}, {0, 150}, {1500, 300}, {0, 0}};
-static const pb_note_t P_LINK_LOST[] = {{2000, 150}, {1200, 250}, {0, 0}};
+/* patterns [ĐỀ XUẤT] (decision 21, Liam 05/11), in per mille of f0; with f0 = 2700 Hz:
+ *  BOOT       1800, 2025, 2400, 2700 (110 ms each), rest, 2400, 2700 held: ~1 s, going up
+ *  START      one 150 ms beep (80 ms before: too short to sound loud)
+ *  DONE       two beeps going up (2400 then 2700)
+ *  STOPPED    one long 400 ms beep
+ *  FAULT      three 300 ms beeps (at f0 now: 1500 Hz before was far from resonance)
+ *  LINK_LOST  f0 then 2/3 f0, the falling shape Liam heard loudest ("lúc no link ... to, rõ") */
+#define F1  1000u              /* f0 */
+#define F89  889u              /* 8/9 */
+#define F34  750u              /* 3/4 */
+#define F23  667u              /* 2/3 */
+
+static const pb_note_t P_BOOT[] = {{F23, 110}, {F34, 110}, {F89, 110}, {F1, 110}, {0, 70},
+                                   {F89, 90}, {F1, 450}, {0, 0}};
+static const pb_note_t P_START[] = {{F1, 150}, {0, 0}};
+static const pb_note_t P_DONE[] = {{F89, 120}, {0, 60}, {F1, 250}, {0, 0}};
+static const pb_note_t P_STOPPED[] = {{F1, 400}, {0, 0}};
+static const pb_note_t P_FAULT[] = {{F1, 300}, {0, 150}, {F1, 300}, {0, 150}, {F1, 300}, {0, 0}};
+static const pb_note_t P_LINK_LOST[] = {{F1, 150}, {F23, 250}, {0, 0}};
 
 const pb_note_t *pb_pattern(pb_event_t e)
 {
@@ -22,13 +34,47 @@ const pb_note_t *pb_pattern(pb_event_t e)
     case PB_STOPPED:   return P_STOPPED;
     case PB_FAULT:     return P_FAULT;
     case PB_LINK_LOST: return P_LINK_LOST;
+    case PB_BOOT:      return P_BOOT;
     default:           return NULL;
+    }
+}
+
+const char *pb_name(pb_event_t e)
+{
+    switch (e) {
+    case PB_START:     return "Start";
+    case PB_DONE:      return "Done";
+    case PB_STOPPED:   return "User stop";
+    case PB_FAULT:     return "Fault";
+    case PB_LINK_LOST: return "Link lost";
+    case PB_BOOT:      return "Boot";
+    default:           return "";
     }
 }
 
 void pb_init(pb_t *b)
 {
     memset(b, 0, sizeof *b);
+    b->f0 = PB_F0_DEFAULT;
+}
+
+void pb_set_f0(pb_t *b, uint16_t hz)
+{
+    if (hz < PB_F0_MIN) hz = PB_F0_MIN;
+    if (hz > PB_F0_MAX) hz = PB_F0_MAX;
+    b->f0 = hz;
+}
+
+void pb_play(pb_t *b, pb_event_t e, uint32_t now)
+{
+    b->pat = pb_pattern(e);
+    b->idx = 0;
+    b->t_note = now;
+}
+
+bool pb_busy(const pb_t *b)
+{
+    return b->pat != NULL;
 }
 
 static void take(pb_t *b, uint32_t sid, bool link, uint8_t st, uint16_t rn)
@@ -71,11 +117,8 @@ pb_event_t pb_watch(pb_t *b, uint32_t sid, bool link, uint8_t st, uint16_t rn, u
         }
     }
     take(b, sid, link, st, rn);
-    if (e != PB_NONE) {
-        b->pat = pb_pattern(e);
-        b->idx = 0;
-        b->t_note = now;
-    }
+    if (e != PB_NONE)
+        pb_play(b, e, now);
     return e;
 }
 
@@ -91,5 +134,7 @@ uint16_t pb_tone(pb_t *b, uint32_t now)
         b->pat = NULL;
         return 0;
     }
-    return b->pat[b->idx].hz;
+    if (!b->pat[b->idx].pm)
+        return 0;
+    return (uint16_t)(((uint32_t)b->f0 * b->pat[b->idx].pm + 500u) / 1000u);
 }

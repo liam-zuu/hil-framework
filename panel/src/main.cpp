@@ -11,6 +11,9 @@
  *    frame (parser silence timeout) or swallow a short press.
  *  - Arduino loop (drawing): copies client + app under the mutex, draws from the copy, then
  *    reports what is on the glass (app_drawn, P2).
+ * Plus the buzzer task (decision 21, Liam 05/11), created first: plays the start-up tune at
+ * once, then what pb_watch in the link task starts; g_buzz has its own mutex g_bmx (the link
+ * task takes g_mx then g_bmx, the buzzer task only g_bmx).
  *
  * Link: env panel_s3 -> UART1 to the RPi5 (pins.h); env panel_s3_bench -> UART0, the "UART"
  * USB-C port of the WeAct board (CH343P), used for flashing too (bench, panel/tools/fake_pi.py
@@ -50,6 +53,23 @@ static pp_parser_t       g_parser;
 static app_t             g_app;
 static pb_t              g_buzz;      /* buzzer (M3 part one, Liam 05/11: "Làm còi trước") */
 static SemaphoreHandle_t g_mx;
+static SemaphoreHandle_t g_bmx;       /* g_buzz: link task (pb_watch) and buzzer task (pb_tone) */
+
+#define BUZZ_PERIOD_MS     2u     /* buzzer task pass */
+
+/* Buzzer task (decision 21, Liam 05/11): created first in setup(), so the start-up tune
+ * plays while the screen starts; the only writer of the buzzer pin. */
+static void buzz_task(void *)
+{
+    TickType_t wake = xTaskGetTickCount();
+    for (;;) {
+        xSemaphoreTake(g_bmx, portMAX_DELAY);
+        uint16_t hz = pb_tone(&g_buzz, millis());
+        xSemaphoreGive(g_bmx);
+        buzzer_out(hz);
+        vTaskDelayUntil(&wake, pdMS_TO_TICKS(BUZZ_PERIOD_MS));
+    }
+}
 
 static uint16_t nonce_cb(void *)
 {
@@ -96,8 +116,9 @@ static void link_task(void *)
         }
         leds(now);
         bool lk = g_c.sid && g_c.has_st && pp_client_link(&g_c, now);
+        xSemaphoreTake(g_bmx, portMAX_DELAY);
         pb_watch(&g_buzz, g_c.sid, lk, g_c.st.run_state, g_c.st.run_no, g_c.st.outcome, now);
-        buzzer_out(pb_tone(&g_buzz, now));
+        xSemaphoreGive(g_bmx);
         xSemaphoreGive(g_mx);
         vTaskDelayUntil(&wake, pdMS_TO_TICKS(LINK_PERIOD_MS));     /* FreeRTOS tick 1 kHz */
     }
@@ -107,6 +128,9 @@ void setup()
 {
     buzzer_begin();                             /* first: pin HIGH = low-trigger buzzer off */
     pb_init(&g_buzz);
+    pb_play(&g_buzz, PB_BOOT, millis());        /* start-up tune right away (decision 21) */
+    g_bmx = xSemaphoreCreateMutex();
+    xTaskCreatePinnedToCore(buzz_task, "panel_buzz", 2048, nullptr, 2, nullptr, 0);
     LINK.setRxBufferSize(LINK_RX_BUFFER);       /* before begin (P6) */
 #if PANEL_LINK_BENCH
     LINK.begin(PI_BAUD);
