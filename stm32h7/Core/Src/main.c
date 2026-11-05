@@ -24,6 +24,7 @@
 #include "bno_emu_port.h"
 #include "s06_log.h"
 #include "s06_load.h"
+#include "ibus_gen_port.h"
 #include <stdio.h>
 /* USER CODE END Includes */
 
@@ -119,10 +120,13 @@ void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
     BnoPort_SpiError(hspi);
 }
 
-/* BNO085 emulator (G2): TIM6 10 kHz tick and RST pin PG3 (EXTI3) */
+/* BNO085 emulator (G2) and iBUS generator: TIM6 10 kHz tick; RST pin PG3 (EXTI3) */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
-    if (htim->Instance == TIM6) BnoPort_Tick();
+    if (htim->Instance == TIM6) {
+        IbusPort_Tick();
+        BnoPort_Tick();
+    }
 }
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
@@ -162,7 +166,13 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
+  /* Instruction cache on (05/11, Liam: "Duyet bat I-cache"): code runs from
+   * flash at 480 MHz; without the I-cache the PWMCapture read window was
+   * 19.2 us at best (PWM_CAPTURE/2026-11-05_run02), M23 needs below about
+   * 7 us. D-cache stays OFF: the DMA rings and SPI buffers in AXI SRAM rely
+   * on it (pwm_capture.c, spi1_handler.c). To do in CubeMX later: Cortex-M7
+   * > CPU ICache = Enabled, then drop this line. */
+  SCB_EnableICache();
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -196,15 +206,17 @@ int main(void)
   MX_TIM17_Init();
   MX_USART2_UART_Init();
   MX_SPI4_Init();
-  MX_TIM13_Init();
   MX_TIM6_Init();
+  MX_UART4_Init();
+  MX_TIM8_Init();
   /* USER CODE BEGIN 2 */
 
+  /* Capture timers: no interrupt since 04/11 (DMA capture, pwm_capture.h).
+   * CubeMX MspInit still enables these NVIC lines; keep them off. */
   HAL_NVIC_DisableIRQ(TIM5_IRQn);
   HAL_NVIC_DisableIRQ(TIM15_IRQn);
   HAL_NVIC_DisableIRQ(TIM16_IRQn);
   HAL_NVIC_DisableIRQ(TIM17_IRQn);
-  HAL_NVIC_DisableIRQ(TIM8_UP_TIM13_IRQn);   /* TIM13 = wheel 2 RPWM (PF8) */
 
   setvbuf(stdout, NULL, _IONBF, 0);
 
@@ -226,29 +238,14 @@ int main(void)
   SPI1_Handler_Init(&hspi1);
   UartRelay_Init(&huart2);     /* +++ NEW */
 
-  /* TIM5/13/15/16/17 priority lower than SPI1 DMA (priority 0) — Bug #7 fix */
-  HAL_NVIC_SetPriority(TIM5_IRQn,  5, 0);
-  HAL_NVIC_SetPriority(TIM8_UP_TIM13_IRQn, 5, 0);
-  HAL_NVIC_SetPriority(TIM15_IRQn, 5, 0);
-  HAL_NVIC_SetPriority(TIM16_IRQn, 5, 0);
-  HAL_NVIC_SetPriority(TIM17_IRQn, 5, 0);
-  /* NVIC lines stay off until PWMCapture_Init has cleared stale flags (25/10:
-   * enabling them here first could hang the boot after "resolve bits"). */
-
-  PWMCapture_Init(&htim5, &htim13, &htim15, &htim16, &htim17);
-
-  /* One line before each enable: if the boot stops right after a line, that
-   * timer's interrupt is the one that never lets main run (26/10). */
-  printf("NVIC: enabling TIM5\r\n");
-  HAL_NVIC_EnableIRQ(TIM5_IRQn);
-  printf("NVIC: enabling TIM13\r\n");
-  HAL_NVIC_EnableIRQ(TIM8_UP_TIM13_IRQn);
-  printf("NVIC: enabling TIM15/16/17\r\n");
-  HAL_NVIC_EnableIRQ(TIM15_IRQn);
-  HAL_NVIC_EnableIRQ(TIM16_IRQn);
-  HAL_NVIC_EnableIRQ(TIM17_IRQn);
+  PWMCapture_Init(&htim5, &htim8, &htim15, &htim16, &htim17);
   printf("BNO: emulator on SPI4 (INT PG2, RST PG3), TIM6 tick\r\n");
   BnoPort_Init(&hspi4, &htim6);
+  if (IbusPort_Init(UART4))
+    printf("IBUS: UART4 TX PD1, frame every %u us while the SPI1 link is up (stop after %u ms without a frame)\r\n",
+           (unsigned)IBUS_GEN_PERIOD_US, (unsigned)IBUS_LINK_TIMEOUT_MS);
+  else
+    printf("IBUS: UART4 not set up (add it in CubeMX), iBUS off\r\n");
   printf("Init done, entering main loop\r\n");
   /* USER CODE END 2 */
 
@@ -284,6 +281,7 @@ int main(void)
   while (1)
   {
     uint8_t _busy = 0;
+    PWMCapture_Service();      /* read new PWM captures every pass (04/11, DMA) */
     if (_cal_on && (DWT->CYCCNT - _cal_t0) >= SystemCoreClock / 10u) {
         S06Load_SetIdleCal(S06Load_IdleCount() - _cal_idle0, DWT->CYCCNT - _cal_t0);
         _cal_on = 0;
@@ -300,6 +298,7 @@ int main(void)
             SPI1_Stats_t s0;
             SPI1_GetStats(&s0);
             _link_up = 1;
+            IbusPort_SetEnabled(1);
             _up_first_ms = s0.last_frame_ms;
             _up_first_frames = s0.frames;
             printf("SPI link up at t=%lu ms\r\n", (unsigned long)_up_first_ms);
@@ -342,13 +341,14 @@ int main(void)
         _busy = 1;
         _link_up = 0;
         _n_link_lost++;
+        IbusPort_SetEnabled(0);  /* DUT loses RC -> motors off (S06 T12 (d)) */
         for (int i = 0; i < ENC_NUM_WHEELS; i++)
             EncoderGen_SetOmega(i, 0.0f);
         SPI1_DropNewTraj();      /* no old setpoint relayed after reconnect */
         SPI1_RequestRestart();   /* covers a DMA stuck without an error */
         SPI1_Stats_t s1;
         SPI1_GetStats(&s1);
-        printf("SPI link lost (no frame for %lu ms): encoders stopped, SPI1 restart\r\n",
+        printf("SPI link lost (no frame for %lu ms): encoders stopped, iBUS stopped, SPI1 restart\r\n",
                (unsigned long)SPI_LINK_TIMEOUT_MS);
         /* Clock check: H7 ms between the first and the last frame of this
          * period vs frame intervals (= Pi ms at 1 kHz) */
@@ -380,12 +380,64 @@ int main(void)
                (double)duty[0], (double)duty[1],
                (double)duty[2], (double)duty[3]);
 
-        /* Capture interrupt rate (debug, 25/10): expected about 2 x 20 kHz per
-         * channel that has PWM edges, 0 when all PWM pins are idle. */
-        static uint32_t _isr_last = 0;
-        uint32_t isr_now = PWMCapture_GetIsrCount();
-        printf("ISR: %lu/s\r\n", (unsigned long)((isr_now - _isr_last) * 2u));
-        _isr_last = isr_now;
+        /* DMA capture counters (04/11), channel order RPWM FL FR RL RR,
+         * LPWM FL FR RL RR: e/s = captures per second (about 40000 on a
+         * channel with 20 kHz PWM, 0 when held), lost = overcapture flags,
+         * lap = service gaps >= 5 ms (ring dropped, FL channel), fix = edge
+         * type corrected by the pin anchor, bad = periods > 75 us skipped,
+         * una = runs of edges with the edge type unknown >= 20 ms (duty held),
+         * known = edge type known, act = DMA stream running, dmaerr = stream
+         * did not start or found stopped, win / svc = largest anchor window
+         * and largest PWMCapture_Service() time in us over the last 2 s
+         * (Codex M23, Liam: measure on the board; window above about 7 us:
+         * revisit the window step).
+         * Printed every 2 s, not every 0.5 s: the line is about 200 bytes and
+         * printf blocks the main loop about 17 ms at 115200 baud (Codex M21). */
+        static uint32_t _edges_last[PWM_NUM_CHANNELS];
+        static uint32_t _pwm_dbg_ms = 0;
+        uint32_t pwm_el = HAL_GetTick() - _pwm_dbg_ms;
+        if (pwm_el >= 2000u) {
+            _pwm_dbg_ms += pwm_el;
+            PWMCapture_Stats_t ps;
+            PWMCapture_GetStats(&ps);
+            char pl[320];
+            int n = snprintf(pl, sizeof(pl), "PWMdma: e/s=");
+            for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++) {
+                n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%lu", i ? "," : "",
+                              (unsigned long)((uint64_t)(ps.edges[i] - _edges_last[i]) * 1000u / pwm_el));
+                _edges_last[i] = ps.edges[i];
+            }
+            for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
+                n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%lu", i ? "," : " lost=", (unsigned long)ps.lost[i]);
+            if (n < (int)sizeof(pl))
+                n += snprintf(pl + n, sizeof(pl) - (size_t)n, " lap=%lu", (unsigned long)ps.lap[0]);
+            for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
+                n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%lu", i ? "," : " fix=", (unsigned long)ps.parity_fix[i]);
+            for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
+                n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%lu", i ? "," : " bad=", (unsigned long)ps.bad_period[i]);
+            for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
+                n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%lu", i ? "," : " una=", (unsigned long)ps.unanchored[i]);
+            for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
+                n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%u", i ? "" : " known=", (unsigned)ps.known[i]);
+            for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
+                n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%u", i ? "" : " act=", (unsigned)ps.active[i]);
+            for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
+                n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%lu", i ? "," : " dmaerr=", (unsigned long)ps.dma_err[i]);
+            uint32_t win_t, svc_t;
+            PWMCapture_TakeTiming(&win_t, &svc_t);
+            if (n < (int)sizeof(pl))
+                n += snprintf(pl + n, sizeof(pl) - (size_t)n, " win=%lu.%lu svc=%lu.%lu",
+                              (unsigned long)(win_t / 10u), (unsigned long)(win_t % 10u),
+                              (unsigned long)(svc_t / 10u), (unsigned long)(svc_t % 10u));
+            /* DIAG 05/11: windows by length (<7 / 7-20 / 20-50 / >=50 us) and shortest window */
+            uint32_t wh[4], wmin_t;
+            PWMCapture_TakeWinHist(wh, &wmin_t);
+            if (n < (int)sizeof(pl))
+                n += snprintf(pl + n, sizeof(pl) - (size_t)n, " wh=%lu/%lu/%lu/%lu wmin=%lu.%lu",
+                              (unsigned long)wh[0], (unsigned long)wh[1], (unsigned long)wh[2], (unsigned long)wh[3],
+                              (unsigned long)(wmin_t / 10u), (unsigned long)(wmin_t % 10u));
+            printf("%s\r\n", pl);
+        }
         uint32_t relay_sent, relay_dropped;
         UartRelay_GetStats(&relay_sent, &relay_dropped);
         printf("Relay: sent=%lu dropped=%lu  traj vx=%.2f vy=%.2f wz=%.2f\r\n",
@@ -435,6 +487,22 @@ int main(void)
                (unsigned long)bs.missed_edge, (unsigned long)bs.arm_fail,
                (unsigned long)bs.spi_errors, (unsigned long)bs.max_clocked,
                (unsigned long)bs.samples);
+        /* iBUS 10 s summary (S06 T12 (b)): P = frame start to frame start
+         * in us (DWT, real time), printed in ms with 0.01 ms; tgap = longest
+         * time between two TIM6 ticks; once per closed window */
+        static uint32_t _ibus_win_last = 0;
+        ibus_gen_window_t iw;
+        if (IbusPort_ReadWindow(&iw) && iw.window != _ibus_win_last) {
+            _ibus_win_last = iw.window;
+            printf("IBUS: win=%lu on=%lu frames=%lu P=%lu.%02lu..%lu.%02lu ms n=%lu late=%lu tgap=%lu us en=%lu total=%lu\r\n",
+                   (unsigned long)iw.window, (unsigned long)iw.enabled,
+                   (unsigned long)iw.frames,
+                   (unsigned long)(iw.p_min_us / 1000u), (unsigned long)((iw.p_min_us % 1000u) / 10u),
+                   (unsigned long)(iw.p_max_us / 1000u), (unsigned long)((iw.p_max_us % 1000u) / 10u),
+                   (unsigned long)iw.p_count, (unsigned long)iw.late_ticks,
+                   (unsigned long)iw.tick_gap_max_us,
+                   (unsigned long)iw.enables, (unsigned long)iw.total_frames);
+        }
         printf("---\r\n");
 
         HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_0);
@@ -511,10 +579,7 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
-void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
-{
-    PWMCapture_IC_Callback(htim);
-}
+/* HAL_TIM_IC_CaptureCallback removed 04/11: PWM capture uses DMA, no capture interrupt */
 /* USER CODE END 4 */
 
 /**

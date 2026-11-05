@@ -30,10 +30,18 @@ TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim4;
 TIM_HandleTypeDef htim5;
 TIM_HandleTypeDef htim6;
-TIM_HandleTypeDef htim13;
+TIM_HandleTypeDef htim8;
 TIM_HandleTypeDef htim15;
 TIM_HandleTypeDef htim16;
 TIM_HandleTypeDef htim17;
+DMA_HandleTypeDef hdma_tim5_ch1;
+DMA_HandleTypeDef hdma_tim5_ch3;
+DMA_HandleTypeDef hdma_tim5_ch4;
+DMA_HandleTypeDef hdma_tim8_ch3;
+DMA_HandleTypeDef hdma_tim8_ch4;
+DMA_HandleTypeDef hdma_tim15_ch1;
+DMA_HandleTypeDef hdma_tim16_ch1;
+DMA_HandleTypeDef hdma_tim17_ch1;
 
 /* TIM1 init function */
 void MX_TIM1_Init(void)
@@ -263,7 +271,7 @@ void MX_TIM5_Init(void)
 
   /* USER CODE END TIM5_Init 1 */
   htim5.Instance = TIM5;
-  htim5.Init.Prescaler = 239;
+  htim5.Init.Prescaler = 23;
   htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim5.Init.Period = 65535;
   htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
@@ -278,10 +286,10 @@ void MX_TIM5_Init(void)
   {
     Error_Handler();
   }
-  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
+  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_BOTHEDGE;
   sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
   sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
-  sConfigIC.ICFilter = 0;
+  sConfigIC.ICFilter = 15;
   if (HAL_TIM_IC_ConfigChannel(&htim5, &sConfigIC, TIM_CHANNEL_1) != HAL_OK)
   {
     Error_Handler();
@@ -332,44 +340,63 @@ void MX_TIM6_Init(void)
   /* USER CODE END TIM6_Init 2 */
 
 }
-/* TIM13 init function */
-void MX_TIM13_Init(void)
+/* TIM8 init function */
+void MX_TIM8_Init(void)
 {
 
-  /* USER CODE BEGIN TIM13_Init 0 */
+  /* USER CODE BEGIN TIM8_Init 0 */
 
-  /* USER CODE END TIM13_Init 0 */
+  /* USER CODE END TIM8_Init 0 */
 
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
   TIM_IC_InitTypeDef sConfigIC = {0};
 
-  /* USER CODE BEGIN TIM13_Init 1 */
+  /* USER CODE BEGIN TIM8_Init 1 */
 
-  /* USER CODE END TIM13_Init 1 */
-  htim13.Instance = TIM13;
-  htim13.Init.Prescaler = 239;
-  htim13.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim13.Init.Period = 65535;
-  htim13.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim13.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim13) != HAL_OK)
+  /* USER CODE END TIM8_Init 1 */
+  htim8.Instance = TIM8;
+  htim8.Init.Prescaler = 23;
+  htim8.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim8.Init.Period = 65535;
+  htim8.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim8.Init.RepetitionCounter = 0;
+  htim8.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim8) != HAL_OK)
   {
     Error_Handler();
   }
-  if (HAL_TIM_IC_Init(&htim13) != HAL_OK)
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim8, &sClockSourceConfig) != HAL_OK)
   {
     Error_Handler();
   }
-  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
+  if (HAL_TIM_IC_Init(&htim8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim8, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_BOTHEDGE;
   sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
   sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
   sConfigIC.ICFilter = 15;
-  if (HAL_TIM_IC_ConfigChannel(&htim13, &sConfigIC, TIM_CHANNEL_1) != HAL_OK)
+  if (HAL_TIM_IC_ConfigChannel(&htim8, &sConfigIC, TIM_CHANNEL_3) != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN TIM13_Init 2 */
+  if (HAL_TIM_IC_ConfigChannel(&htim8, &sConfigIC, TIM_CHANNEL_4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM8_Init 2 */
 
-  /* USER CODE END TIM13_Init 2 */
+  /* USER CODE END TIM8_Init 2 */
 
 }
 /* TIM15 init function */
@@ -387,7 +414,7 @@ void MX_TIM15_Init(void)
 
   /* USER CODE END TIM15_Init 1 */
   htim15.Instance = TIM15;
-  htim15.Init.Prescaler = 239;
+  htim15.Init.Prescaler = 23;
   htim15.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim15.Init.Period = 65535;
   htim15.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
@@ -403,15 +430,11 @@ void MX_TIM15_Init(void)
   {
     Error_Handler();
   }
-  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
+  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_BOTHEDGE;
   sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
   sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
-  sConfigIC.ICFilter = 0;
+  sConfigIC.ICFilter = 15;
   if (HAL_TIM_IC_ConfigChannel(&htim15, &sConfigIC, TIM_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_TIM_IC_ConfigChannel(&htim15, &sConfigIC, TIM_CHANNEL_2) != HAL_OK)
   {
     Error_Handler();
   }
@@ -434,7 +457,7 @@ void MX_TIM16_Init(void)
 
   /* USER CODE END TIM16_Init 1 */
   htim16.Instance = TIM16;
-  htim16.Init.Prescaler = 239;
+  htim16.Init.Prescaler = 23;
   htim16.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim16.Init.Period = 65535;
   htim16.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
@@ -448,10 +471,10 @@ void MX_TIM16_Init(void)
   {
     Error_Handler();
   }
-  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
+  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_BOTHEDGE;
   sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
   sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
-  sConfigIC.ICFilter = 0;
+  sConfigIC.ICFilter = 15;
   if (HAL_TIM_IC_ConfigChannel(&htim16, &sConfigIC, TIM_CHANNEL_1) != HAL_OK)
   {
     Error_Handler();
@@ -475,7 +498,7 @@ void MX_TIM17_Init(void)
 
   /* USER CODE END TIM17_Init 1 */
   htim17.Instance = TIM17;
-  htim17.Init.Prescaler = 239;
+  htim17.Init.Prescaler = 23;
   htim17.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim17.Init.Period = 65535;
   htim17.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
@@ -489,7 +512,7 @@ void MX_TIM17_Init(void)
   {
     Error_Handler();
   }
-  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
+  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_BOTHEDGE;
   sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
   sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
   sConfigIC.ICFilter = 15;
@@ -498,15 +521,8 @@ void MX_TIM17_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN TIM17_Init 2 */
-  if (HAL_TIM_IC_Init(&htim17) != HAL_OK)
-      Error_Handler();
-  TIM_IC_InitTypeDef sConfigIC17 = {0};
-  sConfigIC17.ICPolarity  = TIM_INPUTCHANNELPOLARITY_RISING;
-  sConfigIC17.ICSelection = TIM_ICSELECTION_DIRECTTI;
-  sConfigIC17.ICPrescaler = TIM_ICPSC_DIV1;
-  sConfigIC17.ICFilter    = 0;
-  if (HAL_TIM_IC_ConfigChannel(&htim17, &sConfigIC17, TIM_CHANNEL_1) != HAL_OK)
-      Error_Handler();
+  /* 04/11: the hand-written re-init (rising edge, filter 0) is gone: CubeMX
+   * now sets both edges and filter 15 above (DMA capture, pwm_capture.h). */
   /* USER CODE END TIM17_Init 2 */
 
 }
@@ -601,6 +617,61 @@ void HAL_TIM_IC_MspInit(TIM_HandleTypeDef* tim_icHandle)
     GPIO_InitStruct.Alternate = GPIO_AF2_TIM5;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
+    /* TIM5 DMA Init */
+    /* TIM5_CH1 Init */
+    hdma_tim5_ch1.Instance = DMA2_Stream0;
+    hdma_tim5_ch1.Init.Request = DMA_REQUEST_TIM5_CH1;
+    hdma_tim5_ch1.Init.Direction = DMA_PERIPH_TO_MEMORY;
+    hdma_tim5_ch1.Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma_tim5_ch1.Init.MemInc = DMA_MINC_ENABLE;
+    hdma_tim5_ch1.Init.PeriphDataAlignment = DMA_PDATAALIGN_WORD;
+    hdma_tim5_ch1.Init.MemDataAlignment = DMA_MDATAALIGN_WORD;
+    hdma_tim5_ch1.Init.Mode = DMA_CIRCULAR;
+    hdma_tim5_ch1.Init.Priority = DMA_PRIORITY_HIGH;
+    hdma_tim5_ch1.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
+    if (HAL_DMA_Init(&hdma_tim5_ch1) != HAL_OK)
+    {
+      Error_Handler();
+    }
+
+    __HAL_LINKDMA(tim_icHandle,hdma[TIM_DMA_ID_CC1],hdma_tim5_ch1);
+
+    /* TIM5_CH3 Init */
+    hdma_tim5_ch3.Instance = DMA2_Stream1;
+    hdma_tim5_ch3.Init.Request = DMA_REQUEST_TIM5_CH3;
+    hdma_tim5_ch3.Init.Direction = DMA_PERIPH_TO_MEMORY;
+    hdma_tim5_ch3.Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma_tim5_ch3.Init.MemInc = DMA_MINC_ENABLE;
+    hdma_tim5_ch3.Init.PeriphDataAlignment = DMA_PDATAALIGN_WORD;
+    hdma_tim5_ch3.Init.MemDataAlignment = DMA_MDATAALIGN_WORD;
+    hdma_tim5_ch3.Init.Mode = DMA_CIRCULAR;
+    hdma_tim5_ch3.Init.Priority = DMA_PRIORITY_HIGH;
+    hdma_tim5_ch3.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
+    if (HAL_DMA_Init(&hdma_tim5_ch3) != HAL_OK)
+    {
+      Error_Handler();
+    }
+
+    __HAL_LINKDMA(tim_icHandle,hdma[TIM_DMA_ID_CC3],hdma_tim5_ch3);
+
+    /* TIM5_CH4 Init */
+    hdma_tim5_ch4.Instance = DMA2_Stream2;
+    hdma_tim5_ch4.Init.Request = DMA_REQUEST_TIM5_CH4;
+    hdma_tim5_ch4.Init.Direction = DMA_PERIPH_TO_MEMORY;
+    hdma_tim5_ch4.Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma_tim5_ch4.Init.MemInc = DMA_MINC_ENABLE;
+    hdma_tim5_ch4.Init.PeriphDataAlignment = DMA_PDATAALIGN_WORD;
+    hdma_tim5_ch4.Init.MemDataAlignment = DMA_MDATAALIGN_WORD;
+    hdma_tim5_ch4.Init.Mode = DMA_CIRCULAR;
+    hdma_tim5_ch4.Init.Priority = DMA_PRIORITY_HIGH;
+    hdma_tim5_ch4.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
+    if (HAL_DMA_Init(&hdma_tim5_ch4) != HAL_OK)
+    {
+      Error_Handler();
+    }
+
+    __HAL_LINKDMA(tim_icHandle,hdma[TIM_DMA_ID_CC4],hdma_tim5_ch4);
+
     /* TIM5 interrupt Init */
     HAL_NVIC_SetPriority(TIM5_IRQn, 0, 0);
     HAL_NVIC_EnableIRQ(TIM5_IRQn);
@@ -619,14 +690,32 @@ void HAL_TIM_IC_MspInit(TIM_HandleTypeDef* tim_icHandle)
     __HAL_RCC_GPIOE_CLK_ENABLE();
     /**TIM15 GPIO Configuration
     PE5     ------> TIM15_CH1
-    PE6     ------> TIM15_CH2
     */
-    GPIO_InitStruct.Pin = GPIO_PIN_5|GPIO_PIN_6;
+    GPIO_InitStruct.Pin = GPIO_PIN_5;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
     GPIO_InitStruct.Alternate = GPIO_AF4_TIM15;
     HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+
+    /* TIM15 DMA Init */
+    /* TIM15_CH1 Init */
+    hdma_tim15_ch1.Instance = DMA2_Stream5;
+    hdma_tim15_ch1.Init.Request = DMA_REQUEST_TIM15_CH1;
+    hdma_tim15_ch1.Init.Direction = DMA_PERIPH_TO_MEMORY;
+    hdma_tim15_ch1.Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma_tim15_ch1.Init.MemInc = DMA_MINC_ENABLE;
+    hdma_tim15_ch1.Init.PeriphDataAlignment = DMA_PDATAALIGN_WORD;
+    hdma_tim15_ch1.Init.MemDataAlignment = DMA_MDATAALIGN_WORD;
+    hdma_tim15_ch1.Init.Mode = DMA_CIRCULAR;
+    hdma_tim15_ch1.Init.Priority = DMA_PRIORITY_HIGH;
+    hdma_tim15_ch1.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
+    if (HAL_DMA_Init(&hdma_tim15_ch1) != HAL_OK)
+    {
+      Error_Handler();
+    }
+
+    __HAL_LINKDMA(tim_icHandle,hdma[TIM_DMA_ID_CC1],hdma_tim15_ch1);
 
     /* TIM15 interrupt Init */
     HAL_NVIC_SetPriority(TIM15_IRQn, 0, 0);
@@ -656,31 +745,66 @@ void HAL_TIM_Base_MspInit(TIM_HandleTypeDef* tim_baseHandle)
 
   /* USER CODE END TIM6_MspInit 1 */
   }
-  else if(tim_baseHandle->Instance==TIM13)
+  else if(tim_baseHandle->Instance==TIM8)
   {
-  /* USER CODE BEGIN TIM13_MspInit 0 */
+  /* USER CODE BEGIN TIM8_MspInit 0 */
 
-  /* USER CODE END TIM13_MspInit 0 */
-    /* TIM13 clock enable */
-    __HAL_RCC_TIM13_CLK_ENABLE();
+  /* USER CODE END TIM8_MspInit 0 */
+    /* TIM8 clock enable */
+    __HAL_RCC_TIM8_CLK_ENABLE();
 
-    __HAL_RCC_GPIOF_CLK_ENABLE();
-    /**TIM13 GPIO Configuration
-    PF8     ------> TIM13_CH1
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    /**TIM8 GPIO Configuration
+    PC8     ------> TIM8_CH3
+    PC9     ------> TIM8_CH4
     */
-    GPIO_InitStruct.Pin = GPIO_PIN_8;
+    GPIO_InitStruct.Pin = GPIO_PIN_8|GPIO_PIN_9;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-    GPIO_InitStruct.Alternate = GPIO_AF9_TIM13;
-    HAL_GPIO_Init(GPIOF, &GPIO_InitStruct);
+    GPIO_InitStruct.Alternate = GPIO_AF3_TIM8;
+    HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-    /* TIM13 interrupt Init */
-    HAL_NVIC_SetPriority(TIM8_UP_TIM13_IRQn, 5, 0);
-    HAL_NVIC_EnableIRQ(TIM8_UP_TIM13_IRQn);
-  /* USER CODE BEGIN TIM13_MspInit 1 */
+    /* TIM8 DMA Init */
+    /* TIM8_CH3 Init */
+    hdma_tim8_ch3.Instance = DMA2_Stream3;
+    hdma_tim8_ch3.Init.Request = DMA_REQUEST_TIM8_CH3;
+    hdma_tim8_ch3.Init.Direction = DMA_PERIPH_TO_MEMORY;
+    hdma_tim8_ch3.Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma_tim8_ch3.Init.MemInc = DMA_MINC_ENABLE;
+    hdma_tim8_ch3.Init.PeriphDataAlignment = DMA_PDATAALIGN_WORD;
+    hdma_tim8_ch3.Init.MemDataAlignment = DMA_MDATAALIGN_WORD;
+    hdma_tim8_ch3.Init.Mode = DMA_CIRCULAR;
+    hdma_tim8_ch3.Init.Priority = DMA_PRIORITY_HIGH;
+    hdma_tim8_ch3.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
+    if (HAL_DMA_Init(&hdma_tim8_ch3) != HAL_OK)
+    {
+      Error_Handler();
+    }
 
-  /* USER CODE END TIM13_MspInit 1 */
+    __HAL_LINKDMA(tim_baseHandle,hdma[TIM_DMA_ID_CC3],hdma_tim8_ch3);
+
+    /* TIM8_CH4 Init */
+    hdma_tim8_ch4.Instance = DMA2_Stream4;
+    hdma_tim8_ch4.Init.Request = DMA_REQUEST_TIM8_CH4;
+    hdma_tim8_ch4.Init.Direction = DMA_PERIPH_TO_MEMORY;
+    hdma_tim8_ch4.Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma_tim8_ch4.Init.MemInc = DMA_MINC_ENABLE;
+    hdma_tim8_ch4.Init.PeriphDataAlignment = DMA_PDATAALIGN_WORD;
+    hdma_tim8_ch4.Init.MemDataAlignment = DMA_MDATAALIGN_WORD;
+    hdma_tim8_ch4.Init.Mode = DMA_CIRCULAR;
+    hdma_tim8_ch4.Init.Priority = DMA_PRIORITY_HIGH;
+    hdma_tim8_ch4.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
+    if (HAL_DMA_Init(&hdma_tim8_ch4) != HAL_OK)
+    {
+      Error_Handler();
+    }
+
+    __HAL_LINKDMA(tim_baseHandle,hdma[TIM_DMA_ID_CC4],hdma_tim8_ch4);
+
+  /* USER CODE BEGIN TIM8_MspInit 1 */
+
+  /* USER CODE END TIM8_MspInit 1 */
   }
   else if(tim_baseHandle->Instance==TIM16)
   {
@@ -700,6 +824,25 @@ void HAL_TIM_Base_MspInit(TIM_HandleTypeDef* tim_baseHandle)
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
     GPIO_InitStruct.Alternate = GPIO_AF1_TIM16;
     HAL_GPIO_Init(GPIOF, &GPIO_InitStruct);
+
+    /* TIM16 DMA Init */
+    /* TIM16_CH1 Init */
+    hdma_tim16_ch1.Instance = DMA2_Stream6;
+    hdma_tim16_ch1.Init.Request = DMA_REQUEST_TIM16_CH1;
+    hdma_tim16_ch1.Init.Direction = DMA_PERIPH_TO_MEMORY;
+    hdma_tim16_ch1.Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma_tim16_ch1.Init.MemInc = DMA_MINC_ENABLE;
+    hdma_tim16_ch1.Init.PeriphDataAlignment = DMA_PDATAALIGN_WORD;
+    hdma_tim16_ch1.Init.MemDataAlignment = DMA_MDATAALIGN_WORD;
+    hdma_tim16_ch1.Init.Mode = DMA_CIRCULAR;
+    hdma_tim16_ch1.Init.Priority = DMA_PRIORITY_HIGH;
+    hdma_tim16_ch1.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
+    if (HAL_DMA_Init(&hdma_tim16_ch1) != HAL_OK)
+    {
+      Error_Handler();
+    }
+
+    __HAL_LINKDMA(tim_baseHandle,hdma[TIM_DMA_ID_CC1],hdma_tim16_ch1);
 
     /* TIM16 interrupt Init */
     HAL_NVIC_SetPriority(TIM16_IRQn, 0, 0);
@@ -726,6 +869,25 @@ void HAL_TIM_Base_MspInit(TIM_HandleTypeDef* tim_baseHandle)
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
     GPIO_InitStruct.Alternate = GPIO_AF1_TIM17;
     HAL_GPIO_Init(GPIOF, &GPIO_InitStruct);
+
+    /* TIM17 DMA Init */
+    /* TIM17_CH1 Init */
+    hdma_tim17_ch1.Instance = DMA2_Stream7;
+    hdma_tim17_ch1.Init.Request = DMA_REQUEST_TIM17_CH1;
+    hdma_tim17_ch1.Init.Direction = DMA_PERIPH_TO_MEMORY;
+    hdma_tim17_ch1.Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma_tim17_ch1.Init.MemInc = DMA_MINC_ENABLE;
+    hdma_tim17_ch1.Init.PeriphDataAlignment = DMA_PDATAALIGN_WORD;
+    hdma_tim17_ch1.Init.MemDataAlignment = DMA_MDATAALIGN_WORD;
+    hdma_tim17_ch1.Init.Mode = DMA_CIRCULAR;
+    hdma_tim17_ch1.Init.Priority = DMA_PRIORITY_HIGH;
+    hdma_tim17_ch1.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
+    if (HAL_DMA_Init(&hdma_tim17_ch1) != HAL_OK)
+    {
+      Error_Handler();
+    }
+
+    __HAL_LINKDMA(tim_baseHandle,hdma[TIM_DMA_ID_CC1],hdma_tim17_ch1);
 
     /* TIM17 interrupt Init */
     HAL_NVIC_SetPriority(TIM17_IRQn, 0, 0);
@@ -916,6 +1078,11 @@ void HAL_TIM_IC_MspDeInit(TIM_HandleTypeDef* tim_icHandle)
     */
     HAL_GPIO_DeInit(GPIOA, GPIO_PIN_0|GPIO_PIN_2|GPIO_PIN_3);
 
+    /* TIM5 DMA DeInit */
+    HAL_DMA_DeInit(tim_icHandle->hdma[TIM_DMA_ID_CC1]);
+    HAL_DMA_DeInit(tim_icHandle->hdma[TIM_DMA_ID_CC3]);
+    HAL_DMA_DeInit(tim_icHandle->hdma[TIM_DMA_ID_CC4]);
+
     /* TIM5 interrupt Deinit */
     HAL_NVIC_DisableIRQ(TIM5_IRQn);
   /* USER CODE BEGIN TIM5_MspDeInit 1 */
@@ -932,9 +1099,11 @@ void HAL_TIM_IC_MspDeInit(TIM_HandleTypeDef* tim_icHandle)
 
     /**TIM15 GPIO Configuration
     PE5     ------> TIM15_CH1
-    PE6     ------> TIM15_CH2
     */
-    HAL_GPIO_DeInit(GPIOE, GPIO_PIN_5|GPIO_PIN_6);
+    HAL_GPIO_DeInit(GPIOE, GPIO_PIN_5);
+
+    /* TIM15 DMA DeInit */
+    HAL_DMA_DeInit(tim_icHandle->hdma[TIM_DMA_ID_CC1]);
 
     /* TIM15 interrupt Deinit */
     HAL_NVIC_DisableIRQ(TIM15_IRQn);
@@ -961,24 +1130,26 @@ void HAL_TIM_Base_MspDeInit(TIM_HandleTypeDef* tim_baseHandle)
 
   /* USER CODE END TIM6_MspDeInit 1 */
   }
-  else if(tim_baseHandle->Instance==TIM13)
+  else if(tim_baseHandle->Instance==TIM8)
   {
-  /* USER CODE BEGIN TIM13_MspDeInit 0 */
+  /* USER CODE BEGIN TIM8_MspDeInit 0 */
 
-  /* USER CODE END TIM13_MspDeInit 0 */
+  /* USER CODE END TIM8_MspDeInit 0 */
     /* Peripheral clock disable */
-    __HAL_RCC_TIM13_CLK_DISABLE();
+    __HAL_RCC_TIM8_CLK_DISABLE();
 
-    /**TIM13 GPIO Configuration
-    PF8     ------> TIM13_CH1
+    /**TIM8 GPIO Configuration
+    PC8     ------> TIM8_CH3
+    PC9     ------> TIM8_CH4
     */
-    HAL_GPIO_DeInit(GPIOF, GPIO_PIN_8);
+    HAL_GPIO_DeInit(GPIOC, GPIO_PIN_8|GPIO_PIN_9);
 
-    /* TIM13 interrupt Deinit */
-    HAL_NVIC_DisableIRQ(TIM8_UP_TIM13_IRQn);
-  /* USER CODE BEGIN TIM13_MspDeInit 1 */
+    /* TIM8 DMA DeInit */
+    HAL_DMA_DeInit(tim_baseHandle->hdma[TIM_DMA_ID_CC3]);
+    HAL_DMA_DeInit(tim_baseHandle->hdma[TIM_DMA_ID_CC4]);
+  /* USER CODE BEGIN TIM8_MspDeInit 1 */
 
-  /* USER CODE END TIM13_MspDeInit 1 */
+  /* USER CODE END TIM8_MspDeInit 1 */
   }
   else if(tim_baseHandle->Instance==TIM16)
   {
@@ -992,6 +1163,9 @@ void HAL_TIM_Base_MspDeInit(TIM_HandleTypeDef* tim_baseHandle)
     PF6     ------> TIM16_CH1
     */
     HAL_GPIO_DeInit(GPIOF, GPIO_PIN_6);
+
+    /* TIM16 DMA DeInit */
+    HAL_DMA_DeInit(tim_baseHandle->hdma[TIM_DMA_ID_CC1]);
 
     /* TIM16 interrupt Deinit */
     HAL_NVIC_DisableIRQ(TIM16_IRQn);
@@ -1011,6 +1185,9 @@ void HAL_TIM_Base_MspDeInit(TIM_HandleTypeDef* tim_baseHandle)
     PF7     ------> TIM17_CH1
     */
     HAL_GPIO_DeInit(GPIOF, GPIO_PIN_7);
+
+    /* TIM17 DMA DeInit */
+    HAL_DMA_DeInit(tim_baseHandle->hdma[TIM_DMA_ID_CC1]);
 
     /* TIM17 interrupt Deinit */
     HAL_NVIC_DisableIRQ(TIM17_IRQn);

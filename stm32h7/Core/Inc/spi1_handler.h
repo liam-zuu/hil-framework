@@ -75,5 +75,8 @@ void    SPI1_Service        (void);
 void    SPI1_RequestRestart (void);
 void    SPI1_GetStats       (SPI1_Stats_t *out);
 uint32_t SPI1_GetFrameCount (void);              /* frames received so far (S06 log) */
+/* HAL_GetTick() in the callback of the last frame; one 32-bit read, safe
+ * from any interrupt (iBUS link check in the TIM6 tick, 03/11) */
+uint32_t SPI1_GetLastFrameMs(void);
 
 #endif /* SPI1_HANDLER_H */
