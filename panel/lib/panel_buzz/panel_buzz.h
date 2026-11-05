@@ -7,8 +7,9 @@
  * Every note is a fraction of one base frequency f0 (Liam 05/11, decision 21: "Duyệt, làm
  * bước 1"): a passive buzzer is loudest near its resonance, so f0 is meant to be the
  * frequency Liam finds loudest with the buzzer tool (env panel_s3_buzz_test, buzz_tool.h);
- * the patterns differ by rhythm and by going up or down, like the AGV buzzer. Until that
- * is measured f0 = PB_F0_DEFAULT (2700 Hz, the AGV value, not measured on this buzzer).
+ * the patterns differ by rhythm and by going up or down, like the AGV buzzer. First f0 was
+ * 2700 Hz (the AGV value); Liam 05/11 with the buzzer tool: "tần số 1200 là dễ nghe nhất"
+ * (by ear, not a measurement) -> PB_F0_DEFAULT 1200 Hz.
  *
  * What beeps (Claude's proposal, [ĐỀ XUẤT], change with Liam): only changes the RPi5 reports,
  * nothing the panel guesses, and nothing for the state already there when the link comes up
@@ -30,7 +31,7 @@ extern "C" {
 #endif
 
 #ifndef PB_F0_DEFAULT
-#define PB_F0_DEFAULT 2700u        /* Hz; [ĐỀ XUẤT] until measured (step 2 of decision 21) */
+#define PB_F0_DEFAULT 1200u        /* Hz; Liam 05/11 by ear with the buzzer tool (decision 21) */
 #endif
 #define PB_F0_MIN      500u        /* pb_set_f0 clamps to this range */
 #define PB_F0_MAX     5000u

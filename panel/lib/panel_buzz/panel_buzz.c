@@ -6,10 +6,10 @@
 
 #include "panel_proto.h"
 
-/* patterns [ĐỀ XUẤT] (decision 21, Liam 05/11), in per mille of f0; with f0 = 2700 Hz:
- *  BOOT       1800, 2025, 2400, 2700 (110 ms each), rest, 2400, 2700 held: ~1 s, going up
+/* patterns [ĐỀ XUẤT] (decision 21, Liam 05/11), in per mille of f0; with f0 = 1200 Hz:
+ *  BOOT       800, 900, 1067, 1200 (110 ms each), rest, 1067, 1200 held: ~1 s, going up
  *  START      one 150 ms beep (80 ms before: too short to sound loud)
- *  DONE       two beeps going up (2400 then 2700)
+ *  DONE       two beeps going up (1067 then 1200)
  *  STOPPED    one long 400 ms beep
  *  FAULT      three 300 ms beeps (at f0 now: 1500 Hz before was far from resonance)
  *  LINK_LOST  f0 then 2/3 f0, the falling shape Liam heard loudest ("lúc no link ... to, rõ") */

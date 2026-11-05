@@ -20,7 +20,7 @@ BUILD = os.path.join(HERE, 'build')
 
 PB_NONE, PB_START, PB_DONE, PB_STOPPED, PB_FAULT, PB_LINK_LOST, PB_BOOT = range(7)
 EV_NAV, EV_NAV_BACK, EV_SELECT, EV_START, EV_STOP = 1, 2, 4, 8, 16
-F0 = 2700                    # PB_F0_DEFAULT
+F0 = 1200                    # PB_F0_DEFAULT (Liam 05/11: "tần số 1200 là dễ nghe nhất")
 
 
 def hz(pm, f0=F0):
@@ -186,10 +186,10 @@ def test_every_note_follows_f0_and_f0_is_clamped():
         assert b.tone(0) == kept
 
 
-def test_default_f0_is_2700():
+def test_default_f0_is_1200():
     b = Buzz()
     b.play(PB_STOPPED)
-    assert b.tone(0) == 2700
+    assert b.tone(0) == 1200
 
 
 def test_boot_tune_rises_then_holds_f0_about_one_second():
@@ -308,12 +308,14 @@ def test_tool_start_restarts_the_sweep():
 def test_tool_preview_plays_every_pattern_at_the_chosen_f0_then_quiet():
     t = Tool()
     t.press(EV_SELECT)
-    for _ in range(14):
-        t.press(EV_NAV)                                                 # 2750 - 700 = 2050
+    for _ in range(16):
+        t.press(EV_SELECT)                                              # F0 + 50 + 800
+    for _ in range(4):
+        t.press(EV_NAV)                                                 # - 200 = F0 + 650 = 1850
     t.press(EV_STOP)
     t.press(EV_START)
     assert t.mode() == 'Preview' and t.pattern() == 'Boot'
-    f0 = 2050
+    f0 = F0 + 650
     seen, heard, k, starts, ends = [], set(), 0, [], []
     while t.mode() == 'Preview' and k < 30000:
         f = t.tone(k)
