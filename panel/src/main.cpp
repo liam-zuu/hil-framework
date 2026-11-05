@@ -23,7 +23,9 @@
 #include <freertos/task.h>
 
 #include "buttons.h"
+#include "buzzer.h"
 #include "panel_app.h"
+#include "panel_buzz.h"
 #include "panel_proto.h"
 #include "pins.h"
 #include "ui.h"
@@ -46,6 +48,7 @@
 static pp_client_t       g_c;
 static pp_parser_t       g_parser;
 static app_t             g_app;
+static pb_t              g_buzz;      /* buzzer (M3 part one, Liam 05/11: "Làm còi trước") */
 static SemaphoreHandle_t g_mx;
 
 static uint16_t nonce_cb(void *)
@@ -92,6 +95,9 @@ static void link_task(void *)
             app_update(&g_app, now);            /* only what this press caused */
         }
         leds(now);
+        bool lk = g_c.sid && g_c.has_st && pp_client_link(&g_c, now);
+        pb_watch(&g_buzz, g_c.sid, lk, g_c.st.run_state, g_c.st.run_no, g_c.st.outcome, now);
+        buzzer_out(pb_tone(&g_buzz, now));
         xSemaphoreGive(g_mx);
         vTaskDelayUntil(&wake, pdMS_TO_TICKS(LINK_PERIOD_MS));     /* FreeRTOS tick 1 kHz */
     }
@@ -99,6 +105,8 @@ static void link_task(void *)
 
 void setup()
 {
+    buzzer_begin();                             /* first: pin HIGH = low-trigger buzzer off */
+    pb_init(&g_buzz);
     LINK.setRxBufferSize(LINK_RX_BUFFER);       /* before begin (P6) */
 #if PANEL_LINK_BENCH
     LINK.begin(PI_BAUD);

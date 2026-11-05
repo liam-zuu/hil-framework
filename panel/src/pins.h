@@ -30,7 +30,8 @@
 #define PIN_LED_START  16
 #define PIN_LED_STOP   17
 
-/* passive buzzer: reserved, not driven in M2 */
+/* passive buzzer on a low-level-trigger module (Liam 05/11): I/O LOW = module on; the pin
+ * carries a square wave while a note plays and stays HIGH when silent (src/buzzer.cpp) */
 #define PIN_BUZZER     18
 
 /* UART1 to the RPi5 (Pi pin 8 GPIO14 TX -> panel RX, Pi pin 10 GPIO15 RX <- panel TX, GND) */
