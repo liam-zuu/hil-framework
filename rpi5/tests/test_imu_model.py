@@ -8,12 +8,21 @@ from params import PARAMS
 from plant_interface import MockPlant
 from mecanum_plant import MecanumPlant
 from hil_node import HILConfig, HILNode
-from imu_model import imu_from_plant, parse_imu_static
+from imu_model import GyroInjection, imu_from_plant, parse_imu_static
 from protocol import encode_state, decode_imu, IMU_RANGES
 
 
 def _state(theta=0.0, vx_w=0.0, vy_w=0.0, wz=0.0):
     return [0.0, 0.0, theta, vx_w, vy_w, wz, 0.0, 0.0, 0.0, 0.0]
+
+
+class TestGyroInjection:
+    def test_scales_gyro_only_inside_window(self):
+        inj = GyroInjection(t0=1.0, t_inj=0.5, s=0.4)
+        assert inj.apply(1.0, 0.99) == 1.0
+        assert inj.apply(1.0, 1.0) == pytest.approx(0.6)
+        assert inj.apply(-2.0, 1.49) == pytest.approx(-1.2)
+        assert inj.apply(1.0, 1.5) == 1.0
 
 
 class TestImuFromPlant:

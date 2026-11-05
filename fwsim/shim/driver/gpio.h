@@ -16,3 +16,6 @@ typedef struct {
 typedef int esp_err_t;
 esp_err_t gpio_config(const gpio_config_t *cfg);
 esp_err_t gpio_set_level(int gpio_num, uint32_t level);
+/* Output drive strength (motor.c raises GPIO46, AGV 4127d04): no effect on the PC. */
+typedef enum { GPIO_DRIVE_CAP_0 = 0, GPIO_DRIVE_CAP_1, GPIO_DRIVE_CAP_2, GPIO_DRIVE_CAP_3 } gpio_drive_cap_t;
+esp_err_t gpio_set_drive_capability(int gpio_num, gpio_drive_cap_t strength);

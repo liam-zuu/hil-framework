@@ -81,10 +81,12 @@ class SerialSource:
         t_end = time.time() + 8
         while time.time() < t_end:
             line = s.readline().decode(errors='replace').strip()
+            if line.startswith('IMU INIT FAIL'):
+                sys.exit(f'ESP32: "{line}" (imu_init failed, spec controller-IMU v2.2 section 7).')
             if line.startswith('IMU READY'):
                 if 'v2' not in line:
                     sys.exit(f'ESP32 prints "{line}": old firmware (v1). Flash env imu_log_20 or imu_log_100.')
-                got = int(line.split('period_us=')[1])
+                got = int(line.split('period_us=')[1].split()[0])   # AGV ctrl-imu adds init_ms=...
                 if got != period_us:
                     sys.exit(f'ESP32 reports period_us={got}, --rate expects {period_us}. Flash the matching env.')
                 return
