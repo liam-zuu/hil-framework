@@ -106,7 +106,13 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
+  /* Instruction cache on (05/11, Liam: "Duyet bat I-cache"): code runs from
+   * flash at 480 MHz; without the I-cache the PWMCapture read window was
+   * 19.2 us at best (PWM_CAPTURE/2026-11-05_run02), M23 needs below about
+   * 7 us. D-cache stays OFF: the DMA rings and SPI buffers in AXI SRAM rely
+   * on it (pwm_capture.c, spi1_handler.c). To do in CubeMX later: Cortex-M7
+   * > CPU ICache = Enabled, then drop this line. */
+  SCB_EnableICache();
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
