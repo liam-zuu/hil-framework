@@ -54,8 +54,12 @@ def test_logger_rows_with_imu(fw, tmp_path):
     a = sim_args()
     log = fwsim.simulate(fw, turn, 4.0, fwsim.plant_params(a), mode='PID', imu=fwsim.imu_config(a))
     rows = list(s02_groupA_sim.log_rows(log, True))
-    assert all(len(r) == len(COLUMNS) == 66 for r in rows)
+    assert all(len(r) == len(COLUMNS) == 85 for r in rows)   # 66 ctrl-imu + 14 pos + 5 ws (int/post-g2)
     col = {c: [r[i] for r in rows] for i, c in enumerate(COLUMNS)}
+    if fw.pos_cols:                                   # P17: pos_* / ws_* filled from the firmware
+        assert col['pos_on'][-1] in ('0', '1') and col['pos_reset_n'][-1] != ''
+    if fw.ws_cols:
+        assert col['ws_eval'][-1] in ('0', '1') and col['ws_th'][-1] != ''
     assert col['log_seq'] == [str(i + 1) for i in range(len(rows))]
     assert set(col['imu_init']) == {'0'} and set(col['log_qdrop']) == {'0'}
     assert col['wz_src'][-1] == '1'                   # wz from the gyro once reports flow
