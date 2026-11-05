@@ -93,6 +93,7 @@ static void leds(uint32_t now)
     bool stop_on = s == APP_SCR_RUN || s == APP_SCR_FAULT || g_c.stop.active;
     digitalWrite(PIN_LED_START, start_on ? HIGH : LOW);
     digitalWrite(PIN_LED_STOP, stop_on ? HIGH : LOW);
+    digitalWrite(PIN_LED_LINK, app_link_led(&g_app, now) ? HIGH : LOW);
 }
 
 static void link_task(void *)
@@ -139,6 +140,7 @@ void setup()
 #endif
     pinMode(PIN_LED_START, OUTPUT);
     pinMode(PIN_LED_STOP, OUTPUT);
+    pinMode(PIN_LED_LINK, OUTPUT);
     buttons_begin();
     const char *spr = ui_begin();
     pp_parser_init(&g_parser, PP_ACCEPT_PANEL, PP_PARSER_STALE_MS);

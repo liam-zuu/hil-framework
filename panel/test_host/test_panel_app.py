@@ -728,3 +728,65 @@ def test_views_of_two_runs_are_not_the_same_r5():
     x = AppView(RESULT, 0, 1, 2, 0, 1)
     y = AppView(RESULT, 0, 1, 2, 0, 2)
     assert lib.app_view_same(ct.byref(x), ct.byref(x)) and not lib.app_view_same(ct.byref(x), ct.byref(y))
+
+
+# ---- LINK LED (Liam 05/11: "thêm đèn link đi, nếu không dùng thì thôi") ----
+
+lib.app_link_led.restype, lib.app_link_led.argtypes = ct.c_bool, [ct.c_void_p, ct.c_uint32]
+lib.app_ready.restype, lib.app_ready.argtypes = ct.c_bool, [ct.c_void_p, ct.c_uint32]
+
+
+def _led_over(b, ms):
+    """LED state at every 10 ms step for ms milliseconds, with the bench running"""
+    out = []
+    for _ in range(ms // 10):
+        b.step(1)
+        out.append((b.t, lib.app_link_led(b.app, b.t)))
+    return out
+
+
+def test_link_led_fast_blink_before_the_link_is_up():
+    b = AppBench()
+    b.step(1)
+    assert b.screen == NOLINK
+    t0 = 1000
+    got = [lib.app_link_led(b.app, t0 + k) for k in (0, 99, 100, 199, 200)]
+    assert got == [True, True, False, False, True]                      # 100 ms on, 100 ms off
+
+
+def test_link_led_slow_blink_while_the_link_is_up():
+    b = ready()
+    samples = _led_over(b, 2000)
+    assert b.screen != NOLINK
+    assert all(on == ((t // 500) % 2 == 0) for t, on in samples)       # 500 ms on, 500 ms off
+    assert any(on for _, on in samples) and not all(on for _, on in samples)
+
+
+def test_link_led_goes_fast_when_the_link_is_lost_and_slow_when_back():
+    b = ready()
+    b.drop = lambda f: True                                             # the Pi goes silent
+    for _ in range(300):
+        b.step(1)
+        if b.screen == NOLINK:
+            break
+    assert b.screen == NOLINK
+    samples = _led_over(b, 400)
+    assert b.screen == NOLINK
+    assert all(on == ((t // 100) % 2 == 0) for t, on in samples)
+    b.drop = lambda f: False
+    for _ in range(300):
+        b.step(1)
+        if b.screen != NOLINK:
+            break
+    assert b.screen != NOLINK
+    t = b.t
+    assert lib.app_link_led(b.app, t) == ((t // 500) % 2 == 0)
+
+
+def test_link_led_is_about_the_rpi5_not_the_h7():
+    b = AppBench()
+    b.run.h7 = False                                                    # Pi answers, H7 does not
+    b.step(150)
+    assert b.screen == HOME and not lib.app_ready(b.app, b.t)
+    samples = _led_over(b, 1000)
+    assert all(on == ((t // 500) % 2 == 0) for t, on in samples)       # still the slow blink

@@ -20,6 +20,12 @@ bool app_ready(const app_t *a, uint32_t now)
     return c->sid && pp_client_link(c, now) && c->has_st && (c->st.links & PP_L_H7);
 }
 
+bool app_link_led(const app_t *a, uint32_t now)
+{
+    uint32_t half = app_screen(a, now) == APP_SCR_NOLINK ? APP_LED_FAST_MS : APP_LED_SLOW_MS;
+    return (now / half) % 2u == 0u;
+}
+
 uint16_t app_run(const app_t *a)
 {
     return a->c->has_st ? a->c->st.run_no : 0;

@@ -76,6 +76,14 @@ void app_init(app_t *a, pp_client_t *c);
 void app_update(app_t *a, uint32_t now);
 app_screen_t app_screen(const app_t *a, uint32_t now);
 bool app_ready(const app_t *a, uint32_t now);       /* START allowed: link + H7 answering */
+
+/* LINK LED (separate LED, Liam 05/11: "thêm đèn link đi, nếu không dùng thì thôi"): slow
+ * blink (APP_LED_SLOW_MS on, APP_LED_SLOW_MS off) while the link to the RPi5 is up (the
+ * screen is not NO LINK), fast blink (APP_LED_FAST_MS) while it is down or not up yet; off
+ * when the firmware does not run. Returns the LED state to drive now. */
+#define APP_LED_SLOW_MS  500u
+#define APP_LED_FAST_MS  100u
+bool app_link_led(const app_t *a, uint32_t now);
 bool app_profile_ok(const app_t *a, int i);         /* test i is in the list and its name arrived */
 app_result_t app_result(const app_t *a);
 uint16_t app_run(const app_t *a);                   /* st.run_no of the newest STATUS; 0 = none */

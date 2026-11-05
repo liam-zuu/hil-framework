@@ -26,9 +26,14 @@
 #define PIN_BTN_START   6
 #define PIN_BTN_STOP   15
 
-/* LEDs of the illuminated START / STOP buttons: HIGH = on (through a resistor) */
+/* LEDs: HIGH = on (GPIO -> resistor -> LED -> GND). The buttons have no light (Liam 05/11),
+ * so START / STOP are separate LEDs next to their buttons. LINK (Liam 05/11: "thêm đèn link
+ * đi, nếu không dùng thì thôi"): GPIO13, checked 05/11 on the WeAct ESP32-S3-A schematic
+ * (github.com/WeActStudio/WeActStudio.ESP32S3-AorB, ESP32S3-A/Hardware/ESP32_S3_A_Sch.pdf):
+ * left header pin 19, nothing else on the board. Not wired = harmless. */
 #define PIN_LED_START  16
 #define PIN_LED_STOP   17
+#define PIN_LED_LINK   13
 
 /* passive buzzer on a low-level-trigger module (Liam 05/11): I/O LOW = module on; the pin
  * carries a square wave while a note plays and stays HIGH when silent (src/buzzer.cpp) */
