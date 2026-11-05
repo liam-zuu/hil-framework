@@ -164,7 +164,7 @@ static void start(app_t *a, int profile, uint32_t now)
         return;
     }
     if (!app_profile_ok(a, profile)) {
-        snprintf(a->msg, sizeof a->msg, "test list not complete: START not sent");
+        snprintf(a->msg, sizeof a->msg, "Test list not complete: START not sent");
         return;
     }
     pp_client_press(a->c, PP_CMD_START, (uint16_t)profile, now);   /* nothing to begin here (R3) */
@@ -185,7 +185,7 @@ void app_buttons(app_t *a, uint8_t ev, uint32_t now)
     if (!a->drawn_valid || a->drawn.screen != v.screen || a->drawn.sid != v.sid ||
         a->drawn.profiles_gen != v.profiles_gen || a->drawn.result_profile != v.result_profile ||
         a->drawn.result_run != v.result_run) {
-        snprintf(a->msg, sizeof a->msg, "screen changing: press again");   /* P2, Q3, R5 */
+        snprintf(a->msg, sizeof a->msg, "Screen changing: press again");   /* P2, Q3, R5 */
         return;
     }
     int n = profile_n(a);
@@ -197,12 +197,12 @@ void app_buttons(app_t *a, uint8_t ev, uint32_t now)
             a->cursor = (uint8_t)((a->cursor + n - 1) % n);
         if (ev & (APP_EV_SELECT | APP_EV_START)) {
             if (a->cursor != a->drawn.cursor) {         /* P2: the cursor moved, not drawn yet */
-                snprintf(a->msg, sizeof a->msg, "cursor moved: press again");
+                snprintf(a->msg, sizeof a->msg, "Cursor moved: press again");
             } else if (ev & APP_EV_SELECT) {
                 if (app_profile_ok(a, a->cursor))
                     pp_client_press(a->c, PP_CMD_SELECT, a->cursor, now);
                 else
-                    snprintf(a->msg, sizeof a->msg, "test list not complete: SELECT not sent");
+                    snprintf(a->msg, sizeof a->msg, "Test list not complete: SELECT not sent");
             } else {
                 start(a, a->cursor, now);
             }

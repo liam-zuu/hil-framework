@@ -179,7 +179,7 @@ def test_start_against_a_screen_not_drawn_yet_is_ignored_codex_p2():
     assert b.screen == RESULT
     b.press(START)
     b.step(5, draw=False)
-    assert len(b.cmds(pp.CMD_START)) == 1 and 'screen changing' in b.msg
+    assert len(b.cmds(pp.CMD_START)) == 1 and 'Screen changing' in b.msg
 
 
 def test_cursor_follows_a_shorter_list_codex_p3():
@@ -412,7 +412,7 @@ def test_rejection_message_not_overwritten_by_an_ack_in_the_same_pass_codex_q8()
     lib.app_update(b.app, b.t)                          # firmware order: update, buttons, update
     lib.app_buttons(b.app, NAV | START, b.t)
     lib.app_update(b.app, b.t)
-    assert 'cursor moved' in b.msg
+    assert 'Cursor moved' in b.msg
 
 
 def test_two_runs_in_a_row_both_show_their_result():
@@ -620,7 +620,7 @@ def test_nav_on_result_a_glass_while_b_ended_with_the_same_test_does_not_close_b
     b.run.start(0)                                      # PC: test 0 again, run 2
     b.step(250, draw=False)                             # the panel does not redraw
     assert b.screen == RESULT and b.run_no == 2
-    assert b.press(NAV) == [] and 'screen changing' in b.msg
+    assert b.press(NAV) == [] and 'Screen changing' in b.msg
     assert b.screen == RESULT                           # B not closed
     b.draw()
     b.press(NAV)

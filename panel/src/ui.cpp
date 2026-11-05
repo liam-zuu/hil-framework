@@ -134,7 +134,7 @@ const char *phase_name(uint8_t st)
 void quality_text(uint8_t q, char *out, size_t n)
 {
     if (!q) {
-        snprintf(out, n, "ok");
+        snprintf(out, n, "OK");
         return;
     }
     snprintf(out, n, "%s%s%s%s%s", (q & PP_Q_LOST) ? "LOST " : "", (q & PP_Q_SP_STALE) ? "SP-OLD " : "",
@@ -148,17 +148,17 @@ void quality_text(uint8_t q, char *out, size_t n)
 /* controller name and where it comes from (INFO ctrl_src) */
 struct Ctrl {
     const char *name;           /* "-" when unknown */
-    const char *state;          /* "not verified" / "from #FW" / "unknown" */
+    const char *state;          /* "Not verified" / "From #FW" / "Unknown" */
     uint16_t    state_col;
 };
 
 Ctrl ctrl_of(const pp_client_t *c)
 {
     if (!c->has_info || c->info.ctrl_src == PP_CTRL_SRC_NONE || !c->info.ctrl[0])
-        return {"-", "unknown", MUTED};
+        return {"-", "Unknown", MUTED};
     if (c->info.ctrl_src == PP_CTRL_SRC_FW)
-        return {c->info.ctrl, "from #FW", GREEN_T};
-    return {c->info.ctrl, "not verified", AMBER};    /* from the load profile */
+        return {c->info.ctrl, "From #FW", GREEN_T};
+    return {c->info.ctrl, "Not verified", AMBER};    /* from the load profile */
 }
 
 /* "name · ctrl · state" on one line, small font */
@@ -209,14 +209,14 @@ void health_bar(const PanelView &v)
     char a[24], b[24];
     if (link && c->has_info && (c->info.flags & PP_I_LOOP_VALID)) {
         snprintf(a, sizeof a, "%u " MICRO "s", c->info.loop_us);
-        snprintf(b, sizeof b, " " DOT " ovr %u", c->info.overruns);
+        snprintf(b, sizeof b, " " DOT " Ovr %u", c->info.overruns);
         int xr = 472 - width_of(b, ui_font_small);
         int xa = xr - width_of(a, ui_font_small);
-        text_r(xa - 6, 24, "loop", ui_font_small, MUTED, BG);
+        text_r(xa - 6, 24, "Loop", ui_font_small, MUTED, BG);
         text(xa, 24, a, ui_font_small, TXT, BG);
         text(xr, 24, b, ui_font_small, MUTED, BG);
     } else {
-        text_r(472, 24, "loop  -", ui_font_small, DIM, BG);
+        text_r(472, 24, "Loop  -", ui_font_small, DIM, BG);
     }
 }
 
@@ -233,7 +233,7 @@ void scr_nolink(const PanelView &v)
     g->drawSmoothArc(240, 132, 37, 31, 0, 360, RING, BG, false);
     g->drawSmoothArc(240, 132, 37, 31, 180, 270, AMBER, BG, true);   /* 0 = 6 o'clock, clockwise */
     text_c(240, 208, "NO LINK", ui_font_head, AMBER, BG);
-    text_c(240, 236, v.a->c->sid ? "no STATUS from the RPi5" : "waiting for the RPi5 daemon", ui_font_body,
+    text_c(240, 236, v.a->c->sid ? "No STATUS from the RPi5" : "Waiting for the RPi5 daemon", ui_font_body,
            MUTED, BG);
     if (v.a->c->stop.active)
         text_c(240, 266, "STOP pending (resending)", ui_font_bold, RED_T, BG);
@@ -259,7 +259,7 @@ void scr_home(const PanelView &v)
 
     int n = c->has_profile_count ? c->profile_count : 0;
     if (!n) {
-        text(12, 140, c->has_profile_count ? "no tests on the RPi5" : "loading test list...", ui_font_body,
+        text(12, 140, c->has_profile_count ? "No tests on the RPi5" : "Loading test list...", ui_font_body,
              MUTED, BG);
         return;
     }
@@ -282,9 +282,9 @@ void scr_home(const PanelView &v)
             text(28, y + 26, ui_profile_name(c, i), ui_font_body, ROWTXT, rowbg);
         }
         if (sel) {
-            int bw = width_of("selected", ui_font_small) + 24;
+            int bw = width_of("Selected", ui_font_small) + 24;
             card(458 - bw, y + 9, bw, 22, 11, BLUE_CHIP, rowbg);
-            text(458 - bw + 12, y + 24, "selected", ui_font_small, BLUE_PALE, BLUE_CHIP);
+            text(458 - bw + 12, y + 24, "Selected", ui_font_small, BLUE_PALE, BLUE_CHIP);
         }
     }
 }
@@ -334,7 +334,7 @@ void scr_run(const PanelView &v)
     snprintf(s, sizeof s, "%u.%u", c->st.phase_ds / 10, c->st.phase_ds % 10);
     int x = text(12, 176, s, ui_font_big, WHITE, BG);
     x = text(x + 6, 176, "s", ui_font_head, MUTED, BG);
-    snprintf(s, sizeof s, "in %s", phase_name(c->st.run_state));
+    snprintf(s, sizeof s, "In %s", phase_name(c->st.run_state));
     text(x + 14, 174, s, ui_font_small, MUTED, BG);
 
     const char *stop = c->stop_state == PP_STOP_REQUESTED ? "STOP requested" :
@@ -351,11 +351,11 @@ void scr_run(const PanelView &v)
         snprintf(s, sizeof s, "%lu ms", (unsigned long)age);
     }
     /* the quality card is the widest: all five flags must fit in the small font (PC render) */
-    stat_card(12, 104, "data age", s, TXT);
+    stat_card(12, 104, "Data age", s, TXT);
     snprintf(s, sizeof s, "%u", c->st.lost);
-    stat_card(124, 72, "lost", s, c->st.lost ? AMBER_T : TXT);
+    stat_card(124, 72, "Lost", s, c->st.lost ? AMBER_T : TXT);
     quality_text(c->st.quality, q, sizeof q);
-    stat_card(204, 264, "quality", q, c->st.quality ? AMBER_T : GREEN_T);
+    stat_card(204, 264, "Quality", q, c->st.quality ? AMBER_T : GREEN_T);
 }
 
 void scr_result(const PanelView &v)
@@ -378,9 +378,9 @@ void scr_result(const PanelView &v)
     text(28, 98, out, ui_font_head, word, fill);
     uint16_t run = app_run(v.a);                /* R1-R5: lines only of this run */
     if (run)
-        snprintf(s, sizeof s, "run #%u", run);
+        snprintf(s, sizeof s, "Run #%u", run);
     else
-        snprintf(s, sizeof s, "run #?");
+        snprintf(s, sizeof s, "Run #?");
     int cw = width_of(s, ui_font_body) + 28;
     card(456 - cw, 60, cw, 28, 14, chipf, fill);
     text(456 - cw + 14, 80, s, ui_font_body, chipt, chipf);
@@ -395,22 +395,22 @@ void scr_result(const PanelView &v)
                 g->drawFastHLine(28, 161 + 40 * k, 424, DIV);
         }
     } else {
-        const char *m = c->st.outcome != PP_OUT_COMPLETED ? "no result lines" :
-                        r == APP_RES_WAITING ? "waiting for result..." : "result of another run (see PC)";
+        const char *m = c->st.outcome != PP_OUT_COMPLETED ? "No result lines" :
+                        r == APP_RES_WAITING ? "Waiting for result..." : "Result of another run (see PC)";
         text(28, 186, m, ui_font_body, MUTED, CARD);
     }
 
     quality_text(c->st.quality, q, sizeof q);
-    snprintf(s, sizeof s, "lost %u " DOT " quality %s", c->st.lost, q);
-    int w1 = width_of("START  run again", ui_font_small) + 24;
-    int w2 = width_of("STOP  back", ui_font_small) + 24;
+    snprintf(s, sizeof s, "Lost %u " DOT " Quality %s", c->st.lost, q);
+    int w1 = width_of("START  Run again", ui_font_small) + 24;
+    int w2 = width_of("STOP  Back", ui_font_small) + 24;
     int chips_x = 468 - w1 - 8 - w2;
     text(12, 272, s, ui_font_small, c->st.quality ? AMBER_T : MUTED, BG);
     if (12 + width_of(s, ui_font_small) + 12 <= chips_x) {      /* the hints only if they fit */
         card(chips_x, 256, w2, 24, 12, CHIP, BG);
-        text(chips_x + 12, 273, "STOP  back", ui_font_small, ROWTXT, CHIP);
+        text(chips_x + 12, 273, "STOP  Back", ui_font_small, ROWTXT, CHIP);
         card(468 - w1, 256, w1, 24, 12, CHIP, BG);
-        text(468 - w1 + 12, 273, "START  run again", ui_font_small, ROWTXT, CHIP);
+        text(468 - w1 + 12, 273, "START  Run again", ui_font_small, ROWTXT, CHIP);
     }
 }
 
@@ -424,11 +424,11 @@ void scr_fault(const PanelView &v)
     pill(240 - pw / 2, 60, 28, "FAULT", ui_font_bold, RED_CHIP, RED_PALE, RED_DEEP, 16);
     snprintf(s, sizeof s, "E%02u", c->st.error_code);
     text_c(240, 156, s, ui_font_big, RED_T, RED_DEEP);
-    text_c(240, 198, (c->has_info && c->info.error_text[0]) ? c->info.error_text : "(no text from the RPi5)",
+    text_c(240, 198, (c->has_info && c->info.error_text[0]) ? c->info.error_text : "(No text from the RPi5)",
            ui_font_body, RED_TXT, RED_DEEP);
-    int w = width_of("STOP  acknowledge", ui_font_small) + 32;
+    int w = width_of("STOP  Acknowledge", ui_font_small) + 32;
     card_line(240 - w / 2, 230, w, 30, 15, RED_BG, RED_CHIP, RED_DEEP);
-    text_c(240, 250, "STOP  acknowledge", ui_font_small, RED_PALE, RED_BG);
+    text_c(240, 250, "STOP  Acknowledge", ui_font_small, RED_PALE, RED_BG);
 }
 
 }  // namespace
