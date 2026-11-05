@@ -2,11 +2,22 @@
 tune_ga.py: multi-objective GA (pymoo NSGA-II) on the firmware's own gains,
 evaluated with fwsim (firmware C code + rpi5 plant).
 
-Decision variables (the parameters the firmware actually has):
+Decision variables (the parameters the firmware actually has; Liam 05/11, CODE session,
+STATUS_CODE L38: both RQ3 campaigns tune the same set, O1 v7):
   --mode PID : kp_xy, ki_xy (both vx and vy), kp_wz, ki_wz;
                kd = 0 and the integral/output limits stay at the pid.c defaults.
   --mode ADRC: omega_c_xy, omega_o_xy, omega_c_wz, omega_o_wz (adrc.c);
                b0 and out_limit stay at the adrc.c defaults (b0 from S01).
+  both modes : pos_kp, pos_ki (position loop pos_ctrl.c), k_psi (heading loop heading.c).
+               No position-loop Kd. The other position-loop / (a) / (d) / heading parameters
+               stay at the firmware defaults (fixed set of O1 v7 section 3.6).
+The bounds of pos_kp, pos_ki, k_psi below are temporary, not locked (Outline QD 12, S04).
+
+WARNING (05/11): objective f1 below is velocity tracking on the 'steps' trajectory. The position
+loop adds a correction on top of the setpoint, so f1 penalises it and the GA will push pos_kp,
+pos_ki toward 0. Position-loop gains are only meaningful with an O1-based objective; that choice
+belongs to S04 (objectives locked with the gain range, QD 12). Until then the three new variables
+make the tool ready, not the result.
 
 Objectives (minimise), averaged over --seeds plant seeds on the 'steps' trajectory:
   f1 = RMS body-velocity error, sum of rms_vx, rms_vy and L * rms_wz (L = lx + ly = 0.24 m)
@@ -42,22 +53,26 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fwsim  # noqa: E402
 
-VARS_BY_MODE = {'PID': ['kp_xy', 'ki_xy', 'kp_wz', 'ki_wz'],
-                'ADRC': ['omega_c_xy', 'omega_o_xy', 'omega_c_wz', 'omega_o_wz']}
-BOUNDS = {'PID': ([0.0, 0.0, 0.0, 0.0], [6.0, 10.0, 6.0, 10.0]),
-          'ADRC': ([1.0, 5.0, 1.0, 5.0], [25.0, 48.0, 25.0, 48.0])}
+OUTER_VARS = ['pos_kp', 'pos_ki', 'k_psi']                     # firmware names (fwsim_set_param)
+OUTER_BOUNDS = ([0.0, 0.0, 0.0], [12.0, 10.0, 4.0])              # temporary, not locked (QD 12)
+VARS_BY_MODE = {'PID': ['kp_xy', 'ki_xy', 'kp_wz', 'ki_wz'] + OUTER_VARS,
+                'ADRC': ['omega_c_xy', 'omega_o_xy', 'omega_c_wz', 'omega_o_wz'] + OUTER_VARS}
+BOUNDS = {'PID': ([0.0, 0.0, 0.0, 0.0] + OUTER_BOUNDS[0], [6.0, 10.0, 6.0, 10.0] + OUTER_BOUNDS[1]),
+          'ADRC': ([1.0, 5.0, 1.0, 5.0] + OUTER_BOUNDS[0], [25.0, 48.0, 25.0, 48.0] + OUTER_BOUNDS[1])}
 L_ARM = 0.24
 
 
 def gains_for(mode, x, fw):
-    """Decision vector -> simulate() keyword arguments."""
-    a, b, c, d = map(float, x)
+    """Decision vector -> simulate() keyword arguments (inner gains + fw_params of the outer loops)."""
+    a, b, c, d = map(float, x[:4])
+    outer = dict(zip(OUTER_VARS, map(float, x[4:])))
     if mode == 'PID':
-        return dict(pid={0: (a, b, 0.0, 0.5, 1.5), 1: (a, b, 0.0, 0.5, 1.5), 2: (c, d, 0.0, 1.0, 2.0)})
+        return dict(pid={0: (a, b, 0.0, 0.5, 1.5), 1: (a, b, 0.0, 0.5, 1.5), 2: (c, d, 0.0, 1.0, 2.0)},
+                    fw_params=outer)
     fw.reset()
     base = [fw.get_adrc(i) for i in range(3)]          # b0, out_limit from adrc.c
     return dict(adrc={0: (a, b, base[0]['b0'], base[0]['out_limit']), 1: (a, b, base[1]['b0'], base[1]['out_limit']),
-                      2: (c, d, base[2]['b0'], base[2]['out_limit'])})
+                      2: (c, d, base[2]['b0'], base[2]['out_limit'])}, fw_params=outer)
 
 
 def make_problem(fw, mode, seeds, setpoint, duration, bounds, history, pcnt_mode, sim_args):
@@ -96,14 +111,16 @@ def main():
     ap.add_argument('--radius', type=float, default=0.5)
     ap.add_argument('--pcnt-mode', default='idf', choices=list(fwsim.PCNT_MODES))
     ap.add_argument('--mode', choices=list(VARS_BY_MODE), default='PID')
-    ap.add_argument('--lower', type=float, nargs=4, default=None)
-    ap.add_argument('--upper', type=float, nargs=4, default=None)
+    ap.add_argument('--lower', type=float, nargs='+', default=None, help='one value per variable, in VARS order')
+    ap.add_argument('--upper', type=float, nargs='+', default=None, help='one value per variable, in VARS order')
     fwsim.add_plant_imu_args(ap)
     ap.add_argument('--out', required=True)
     a = ap.parse_args()
     VARS = VARS_BY_MODE[a.mode]
     a.lower = a.lower or BOUNDS[a.mode][0]
     a.upper = a.upper or BOUNDS[a.mode][1]
+    if len(a.lower) != len(VARS) or len(a.upper) != len(VARS):
+        sys.exit(f'--lower/--upper need {len(VARS)} values: {VARS}')
     if os.path.isdir(a.out) and os.listdir(a.out):
         sys.exit(f'{a.out} already holds data: use a new folder.')
     os.makedirs(a.out, exist_ok=True)
@@ -112,6 +129,8 @@ def main():
     from pymoo.optimize import minimize
 
     fw = fwsim.FirmwareSim()
+    if not fw.pos_cols:
+        sys.exit('fwsim.dll has no position loop (pos_ctrl.c): build it from the campaign firmware (AGV feat/pos-loop)')
     sp = fwsim.make_setpoint(SimpleNamespace(traj='steps', speed=a.speed, radius=a.radius, period=8.0))
     history = []
     problem = make_problem(fw, a.mode, a.seeds, sp, sp.duration, (a.lower, a.upper), history, a.pcnt_mode, a)
@@ -141,7 +160,7 @@ firmware:
   ctrl_mode: {a.mode}
 pos_loop: {json.dumps(fwsim.pos_meta(fw))}     # pos_ctrl.c + standstill hold read back (on by default since 04/11); null = DLL without pos_ctrl.c
 ga: {{algorithm: NSGA2, pop: {a.pop}, gen: {a.gen}, ga_seed: {a.ga_seed}, evaluations: {len(history)}, elapsed_s: {elapsed:.1f}}}
-variables: {json.dumps(dict(names=VARS, lower=a.lower, upper=a.upper, fixed=('kd = 0, limits from pid.c' if a.mode == 'PID' else 'b0, out_limit from adrc.c')))}
+variables: {json.dumps(dict(names=VARS, lower=a.lower, upper=a.upper, fixed=('kd = 0, limits from pid.c' if a.mode == 'PID' else 'b0, out_limit from adrc.c') + '; no position-loop Kd; other pos/(a)/(d)/heading parameters at firmware defaults', bounds_note='pos_kp, pos_ki, k_psi bounds temporary, not locked (QD 12)'))}
 objectives: "f1 = rms_vx + rms_vy + 0.24 * rms_wz (true plant body velocity vs setpoint); f2 = duty total variation per second; mean over plant seeds"
 evaluation: {json.dumps(dict(traj='steps', speed=a.speed, radius=a.radius, seeds=a.seeds, pcnt_mode=a.pcnt_mode))}
 plant: {fwsim.plant_meta(fwsim.plant_params(a))}
