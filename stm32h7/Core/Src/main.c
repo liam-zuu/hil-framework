@@ -96,6 +96,28 @@ void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef *htim)
 {
     EncoderGen_OC_Callback(htim);
 }
+
+/* DIAG 05/11 (bản chẩn đoán, không dùng đo): with the DMA capture build the
+ * SPI1 link never comes up (frames=0, err=0, rearm=0; ENC_PI/2026-11-05_run01),
+ * the old build d1df497 with the same wires works. One line with the SPI1
+ * handle and registers, the two DMA1 streams of SPI1, their DMAMUX1 channels
+ * and the NSS pin, to see at which step the slave stops. Read only. */
+static void SpiDiag_Print(const char *where)
+{
+    printf("SPIdiag[%s]: st=%u ec=0x%lx SR=0x%08lx CR1=0x%08lx CFG1=0x%08lx IER=0x%08lx"
+           " S0CR=0x%08lx S0N=%lu S1CR=0x%08lx S1N=%lu LISR=0x%08lx MX0=0x%08lx MX1=0x%08lx"
+           " NVIC0=%lu NVIC1=%lu NSS=%u\r\n",
+           where, (unsigned)hspi1.State, (unsigned long)hspi1.ErrorCode,
+           (unsigned long)SPI1->SR, (unsigned long)SPI1->CR1, (unsigned long)SPI1->CFG1,
+           (unsigned long)SPI1->IER,
+           (unsigned long)DMA1_Stream0->CR, (unsigned long)DMA1_Stream0->NDTR,
+           (unsigned long)DMA1_Stream1->CR, (unsigned long)DMA1_Stream1->NDTR,
+           (unsigned long)DMA1->LISR,
+           (unsigned long)DMAMUX1_Channel0->CCR, (unsigned long)DMAMUX1_Channel1->CCR,
+           (unsigned long)NVIC_GetEnableIRQ(DMA1_Stream0_IRQn),
+           (unsigned long)NVIC_GetEnableIRQ(DMA1_Stream1_IRQn),
+           (unsigned)HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_4));
+}
 /* USER CODE END 0 */
 
 /**
@@ -160,9 +182,11 @@ int main(void)
 
   EncoderGen_Init(&htim1, &htim2, &htim3, &htim4);
   SPI1_Handler_Init(&hspi1);
+  SpiDiag_Print("after SPI1_Handler_Init");   /* DIAG 05/11: SPI1 link down with the DMA build */
   UartRelay_Init(&huart2);     /* +++ NEW */
 
   PWMCapture_Init(&htim5, &htim8, &htim15, &htim16, &htim17);
+  SpiDiag_Print("after PWMCapture_Init");     /* DIAG 05/11 */
   printf("BNO: emulator on SPI4 (INT PG2, RST PG3), TIM6 tick\r\n");
   BnoPort_Init(&hspi4, &htim6);
   if (IbusPort_Init(UART4))
@@ -322,6 +346,7 @@ int main(void)
                (unsigned long)ss.errors, (unsigned long)ss.rearms,
                (unsigned long)ss.last_error);
         _frames_last = ss.frames;
+        SpiDiag_Print("loop");                  /* DIAG 05/11 */
         /* BNO085 emulator (G2): host init (adv, prod id, set features),
          * transactions and reports per sensor (accel / gyro / game RV) */
         BnoPort_Stats_t bs;
