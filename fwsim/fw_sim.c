@@ -300,8 +300,18 @@ FWSIM_API int fwsim_tick(int64_t t_us, const int32_t counts[4], const float sp[3
 
     int on = (int)fw_gpio_level(GPIO_EN);   /* motor_enable() state = g_motor_enabled */
     imu_data_t imu_copy = imu;              /* imu_get() */
+    /* main.c 7b/7c: intent from the original command, then interlock clamps the command before
+     * vel_ctrl_step (pose, (d) and heading see the clamped command, as on the firmware; Codex
+     * round 2 Q1) */
+    float vx = sp[0], vy = sp[1];
+#ifdef VEL_CTRL_HAS_BLOCK
+    if (block[0] && vx > 0.0f) vx = 0.0f;
+    if (block[1] && vx < 0.0f) vx = 0.0f;
+    if (block[2] && vy > 0.0f) vy = 0.0f;
+    if (block[3] && vy < 0.0f) vy = 0.0f;
+#endif
     vel_ctrl_in_t in = {
-        .sp = { .vx = sp[0], .vy = sp[1], .wz = sp[2] },
+        .sp = { .vx = vx, .vy = vy, .wz = sp[2] },
         .imu = imu_on ? &imu_copy : NULL,
         .now_us = t_us,
         .dt = dt_actual,
@@ -316,8 +326,8 @@ FWSIM_API int fwsim_tick(int64_t t_us, const int32_t counts[4], const float sp[3
     vel_ctrl_out_t vc = vel_ctrl_step(&in);
     if (on) {
         /* main.c: motor_set() then vel_ctrl_applied() with the PWM applied. Hard cutoff of main.c
-         * (obstacle_enabled): with a blocked direction, PWM 0 when v_cmd goes that way (the intent
-         * part of main.c is the same test on the original command, which vel_ctrl already clamps) */
+         * (obstacle_enabled): with a blocked direction, PWM 0 when the original command (intent,
+         * sp) or v_cmd goes that way */
 #ifdef VEL_CTRL_HAS_BLOCK
         if ((block[0] && (sp[0] > 0.0f || vc.v_cmd.vx > 0.0f)) || (block[1] && (sp[0] < 0.0f || vc.v_cmd.vx < 0.0f)) ||
             (block[2] && (sp[1] > 0.0f || vc.v_cmd.vy > 0.0f)) || (block[3] && (sp[1] < 0.0f || vc.v_cmd.vy < 0.0f)))

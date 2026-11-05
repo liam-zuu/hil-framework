@@ -119,9 +119,13 @@ def test_correction_saturates_and_integral_does_not_wind_up(fw):
     stops and the wheels turn forward at 0.6 m/s, so the estimate passes the command pose.
     Without anti-windup the integral of phase 1 (about 1.3 m s) keeps the correction at
     +v_corr_max long after the estimate has passed; with it, the correction turns negative
-    once the estimate is 0.1 m past."""
+    once the estimate is 0.1 m past. The (a) window and (d) hold are off: the window clears the
+    integral when the estimate passes the command pose, which would pass this test without
+    anti-windup too (Codex round 2 Q2)."""
     fw.reset()
     fw.set_param('pos_on', 1)
+    fw.set_param('pos_e_win', 0.0)
+    fw.set_param('still_on', 0)
     fw.set_run(True, False)
     k = 0
     for _ in range(300):                          # phase 1, encoders stuck at 0
@@ -226,6 +230,76 @@ def test_block_other_direction_still_corrects(fw):
     fw.set_param('block_bwd', 1)
     p, _ = t.step((0.0, 0.0, 0.0))
     assert p[P['pos_corr_vx']] > 0.1
+
+
+# ── Fixes after Codex round 2 (05/11, Liam: "bạn cứ sửa và kiểm bằng test trước đi") ──────────
+@pytest.mark.parametrize('mode', ['PID', 'ADRC'])
+def test_inner_loop_output_not_toward_obstacle(fw, mode):
+    """Round 2 P1: the inner loop charges (wheels stuck under a forward command), then the command
+    drops to 0 with the front blocked. The PID integral / ESO left over must not drive the wheels
+    forward (main.c hard cutoff only sees the intent and v_cmd, both 0 here). Position loop,
+    (a), (d) off to isolate the inner loop."""
+    t = _Ticks(fw, pos_on=0, pos_e_win=0.0, still_on=0)
+    fw.set_mode(mode)
+    t.step((0.3, 0.0, 0.0), n=100)                      # wheels stuck: integral / ESO charge
+    fw.set_param('block_fwd', 1)
+    for _ in range(20):
+        _, out = t.step((0.0, 0.0, 0.0))
+        assert np.all(out[2] <= 0), out[2]              # no forward PWM on any wheel
+
+
+def test_strafe_still_runs_with_front_blocked(fw):
+    """Round 2 P1: the clamp is per axis, so a sideways command still drives the wheels."""
+    t = _Ticks(fw, pos_on=0, pos_e_win=0.0, still_on=0)
+    fw.set_param('block_fwd', 1)
+    _, out = t.step((0.0, 0.3, 0.0), n=20)
+    assert np.abs(out[2]).max() > 0
+
+
+def test_blocked_integral_discharges(fw):
+    """Round 2 P1: the integral built while behind stays from growing toward the blocked side but
+    may discharge. The estimate passes the command pose while the front is blocked; once the
+    discharge turns the correction negative (allowed, backward), unblocking gives no forward step
+    from an old integral."""
+    t = _Ticks(fw, pos_e_win=0.0, still_on=0)
+    t.step((0.02, 0.0, 0.0), n=50)                      # command pose 1 cm ahead, wheels stuck
+    t.step((0.0, 0.0, 0.0), n=500)                      # 5 s behind by 1 cm: integral about 0.05 m s
+    p, _ = t.step((0.0, 0.0, 0.0))
+    assert 0.1 < p[P['pos_corr_vx']] < 0.5              # unsaturated, integral part dominant
+    fw.set_param('block_fwd', 1)
+    t.step((0.0, 0.0, 0.0), wheel_v=0.1, n=20)          # estimate moves about 2 cm: 1 cm past
+    for _ in range(600):
+        p, _ = t.step((0.0, 0.0, 0.0))
+        if p[P['pos_corr_vx']] < 0.0:
+            break
+    assert p[P['pos_ex_b']] < 0.0 and p[P['pos_corr_vx']] < 0.0
+    fw.set_param('block_fwd', 0)
+    p, _ = t.step((0.0, 0.0, 0.0))
+    assert p[P['pos_corr_vx']] < 0.0
+
+
+_HUGE_WZ = """
+import sys, math
+sys.path.insert(0, sys.argv[1])
+import fwsim
+f = fwsim.FirmwareSim()
+f.reset()
+f.set_run(True, False)
+for k in range(1, 6):
+    f.tick(k * fwsim.FW_DT_US, [0, 0, 0, 0], (0.0, 0.0, 1e12))
+th = f.pos_last()[fwsim.POS_COLS.index('pos_th_ref')]
+assert math.isfinite(th) and abs(th) <= math.pi + 1e-6, th
+print('ok')
+"""
+
+
+def test_huge_finite_command_does_not_hang(fw):
+    """Round 2 P18: a finite but huge wz (1e12) went into wrap_pi; in float32 1e10 - 2 pi == 1e10, so
+    the while loop never ended. Run in a subprocess with a timeout (a hang would freeze pytest).
+    The receiver range check (traj_receiver.c) is not in fwsim; this checks wrap_pi."""
+    import subprocess
+    r = subprocess.run([sys.executable, '-c', _HUGE_WZ, fwsim.HERE], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and 'ok' in r.stdout, r.stderr
 
 
 def test_yaw_dropouts_keep_imu_offset(fw):
