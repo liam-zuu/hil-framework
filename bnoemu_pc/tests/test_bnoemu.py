@@ -36,6 +36,8 @@ def test_20_boots(period, mode):
     """sh2_open gets reset complete, getProdIds 4 entries, 3 reports flow, 20 times in a row."""
     kv = run('boot', period, 20, mode=mode)
     assert kv['boots_ok'] == '20'
+    # S06 V3-2: one reset-complete event per reset the host saw (epoch on both sides)
+    assert kv['hook_reset_done'] == kv['host_reset_events']
 
 
 @pytest.mark.parametrize('period', RATES)
@@ -69,3 +71,15 @@ def test_host_silent_50ms(period, mode):
 def test_frozen_plant_stops_reports(period, mode):
     kv = run('stale', period, mode=mode)
     assert kv['stale.reports_while_frozen'] == '0'
+
+
+@pytest.mark.parametrize('period', RATES)
+def test_hold_imu_loss(period, mode):
+    """S06 T8 (V3-1): during IMU loss injection no report is built (rpt_seq does not
+    advance, no REPORT event), nothing new reaches the host; reports resume after.
+    Every scenario also checks the S06 event hook (harness main): each report at the
+    host callback was built and read as part of a packet, rpt_seq +1 per report."""
+    kv = run('hold', period, mode=mode)
+    assert kv['hold_rx_during'] == '0'
+    assert int(kv['hold_skips']) > 0
+    assert kv['hook_seq_gap'] == '0' and kv['hook_rx_not_read'] == '0'

@@ -27,6 +27,11 @@ HAL_StatusTypeDef HAL_SPI_Abort(SPI_HandleTypeDef *h);
 GPIO_PinState     HAL_GPIO_ReadPin(GPIO_TypeDef *port, uint16_t pin);
 uint32_t          HAL_GetTick(void);
 
+/* S06: cycle counter (the harness sets CYCCNT before each frame) */
+typedef struct { volatile uint32_t CYCCNT; } DWT_Type;
+extern DWT_Type fake_dwt;
+#define DWT (&fake_dwt)
+
 extern int  fake_irq_disabled;
 extern long fake_irq_sections;
 static inline uint32_t __get_PRIMASK(void) { return (uint32_t)fake_irq_disabled; }
