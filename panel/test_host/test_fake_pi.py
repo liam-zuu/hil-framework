@@ -12,11 +12,11 @@ from panel_link import FakeRun, PanelLink    # noqa: E402
 
 
 class Loop:
-    def __init__(self, **kw):
+    def __init__(self, run_cls=FakeRun, **kw):
         self.t = 0
         self.wire = bytearray()
         clock = lambda: self.t / 1000                                    # noqa: E731
-        self.run = FakeRun(run_s=2.0, clock=clock, **kw)
+        self.run = run_cls(run_s=2.0, clock=clock, **kw)
         self.pi = PanelLink(3, self.run, self._write, clock=clock)
         self.panel = CPanelClient(iter(range(0x100, 0x200)).__next__)
         self.parser = pp.StreamParser(accept=(pp.START_STATUS, pp.START_PROFILE, pp.START_INFO),
@@ -33,7 +33,10 @@ class Loop:
             self.t += 10
             self.pi.feed(b''.join(self.up))
             self.up = []
-            self.pi.poll()
+            if getattr(self.run, 'paused', lambda: False)():  # demo NO LINK, as serve_demo
+                self.run.snapshot()
+            else:
+                self.pi.poll()
             data, self.wire = bytes(self.wire), bytearray()
             for x in self.parser.feed(data):
                 if isinstance(x, pp.Status):
@@ -88,3 +91,29 @@ def test_bad_profile_refused(arg):
     lp.press(pp.CMD_START, arg)
     lp.step(20)
     assert lp.panel.shown == [('done', pp.CMD_START, pp.RES_BAD_PROFILE)]
+
+
+def test_demo_walks_through_every_screen_without_buttons():
+    """fake_pi --demo (Liam 05/11: "tôi muốn hiện hết các màn ra"): no button is pressed; the
+    panel must see a completed run, a user stop, a fault acknowledged back to IDLE, and a
+    STATUS gap longer than NO_LINK_MS, then the link back."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'tools'))
+    from fake_pi import DemoRun
+    log = []
+    lp = Loop(run_cls=DemoRun, on_log=log.append)
+    seen, last_status_t, gap = set(), 0, 0
+    for _ in range(5200):                                   # one demo cycle with run_s 2 is ~46 s
+        st_before = lp.st
+        lp.step()
+        if lp.st is not st_before:
+            gap = max(gap, lp.t - last_status_t)
+            last_status_t = lp.t
+            seen.add((lp.st.run_state, lp.st.outcome))
+    assert (pp.ST_RUN, pp.OUT_NONE) in seen
+    assert (pp.ST_END, pp.OUT_COMPLETED) in seen
+    assert (pp.ST_STOPPING, pp.OUT_USER_STOP) in seen and (pp.ST_END, pp.OUT_USER_STOP) in seen
+    assert (pp.ST_ERROR, pp.OUT_ERROR) in seen
+    assert gap > pp.NO_LINK_MS                              # NO LINK on the panel (ms)
+    assert lp.panel.shown == []                             # nothing was pressed
+    assert any('again from the start' in m for m in log)    # the cycle came back to HOME
+    assert lp.panel.sid and lp.t - last_status_t < pp.NO_LINK_MS     # the link came back
