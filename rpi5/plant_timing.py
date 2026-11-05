@@ -6,6 +6,8 @@ Times, under the same scheduling as the plant loop (SCHED_FIFO 90, core 0):
   current      plant_step() as used by the HIL today (motor 'dc', no slip)
   tick         current plant + the per-tick work of hil_node besides SPI/GPIO
                (IMU sample, state reorder, encode_state, decode_torques)
+  traction_muM plant_step() with ground_model 'traction' (method A as implemented,
+               mu_hd = M, sub-steps from the stability bound)
   slipA_nsubN  THROWAWAY timing prototype of a minimal slip model (method A):
                body with its own dynamics, traction per wheel capped by mu*N,
                N sub-steps per 1 ms. Only for timing: parameters are guesses,
@@ -115,6 +117,11 @@ def main() -> int:
         decode_torques(frame)
 
     variants = [('current', current), ('tick', tick)]
+    for mu in (0.5, 0.8):
+        pt = MecanumParams()
+        pt.ground_model = 'traction'
+        pt.mu_hd = np.full(4, mu)
+        variants.append((f'traction_mu{mu}', lambda pt=pt: plant_step(x, u, pt, 0.001, rng)))
     Minv = np.diag([1.0 / p.M, 1.0 / p.M, 1.0 / p.Iz])
     stepA = _slip_a_step(p, Minv, np.full(4, p.J_w), p.M * p.g / 4.0, 0.8, 5.0)
     v0, w0 = np.zeros(3), np.full(4, 5.0)

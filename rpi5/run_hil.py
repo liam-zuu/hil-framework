@@ -93,7 +93,8 @@ def _parse_omega_steps(text: str) -> list:
 
 def _run_plant(cfg, shared_state: mp.Array, shared_ref: mp.Array, use_mock: bool, seed: int = 0,
                wheels_lifted: bool = False, fixed_omega: list = None,
-               omega_steps: list = None, monitor=None) -> None:
+               omega_steps: list = None, monitor=None,
+               ground: str = None, mu: float = None) -> None:
     """Process 1 target: plant simulation loop."""
     import logging
     logging.basicConfig(
@@ -108,10 +109,15 @@ def _run_plant(cfg, shared_state: mp.Array, shared_ref: mp.Array, use_mock: bool
     from mecanum_plant import MecanumPlant
     from plant_interface import MockPlant, OmegaProfilePlant
 
+    import numpy as np
     from params import MecanumParams
     params = MecanumParams()
     if wheels_lifted:
         params.update_physical(wheels_lifted=True)     # spec S02 A-K: wheels off the ground
+    if ground:
+        params.ground_model = ground                   # QD 25: 'traction' = slip method A
+    if mu is not None:
+        params.mu_hd = np.full(4, mu)
     if fixed_omega is not None:
         # EncoderGen check: constant wheel speeds, no dynamics; SPI/GPIO path stays real
         plant = MockPlant()
@@ -124,7 +130,8 @@ def _run_plant(cfg, shared_state: mp.Array, shared_ref: mp.Array, use_mock: bool
                                            omega_steps, plant.total_steps)
     else:
         plant = MockPlant() if use_mock else MecanumPlant(params=params, dt=cfg.period_us / 1e6, seed=seed)
-    logging.getLogger('hil.main').info('Plant RNG seed = %s, wheels_lifted = %s', seed, wheels_lifted)
+    logging.getLogger('hil.main').info('Plant RNG seed = %s, wheels_lifted = %s, ground_model = %s, mu_hd = %s',
+                                       seed, wheels_lifted, params.ground_model, list(np.broadcast_to(params.mu_hd, (4,))))
     node  = HILNode(plant, config=cfg, shared_state=shared_state, shared_ref=shared_ref,
                     monitor=monitor)
     node.run()
@@ -268,6 +275,11 @@ def _parse_args() -> argparse.Namespace:
                    help='BNO085 emulator check (G2): send these constant IMU values '
                         '[rad/s, m/s^2, m/s^2, m/s^2, rad] in every frame instead of the '
                         'plant values (imu_seq still changes every frame)')
+    p.add_argument('--ground',        default=None, choices=['rigid', 'traction'],
+                   help='plant ground contact (default: params.py ground_model); '
+                        'traction = slip method A (QD 25)')
+    p.add_argument('--mu',            type=float, default=None,
+                   help='mu_hd of all four wheels for --ground traction')
     p.add_argument('--fixed-omega',   default=None, metavar='W1,W2,W3,W4',
                    help='EncoderGen check: send these constant wheel speeds [rad/s] instead of '
                         'running the plant (use with --steps; implies --no-traj)')
@@ -349,7 +361,7 @@ def main() -> int:
     p1 = mp.Process(
         target=_run_plant,
         args=(hil_cfg, shared_state, shared_ref, args.mock, args.seed, lifted, fixed_omega,
-              omega_steps, monitor),
+              omega_steps, monitor, args.ground, args.mu),
         name='HIL-Plant',
         daemon=True,
     )
