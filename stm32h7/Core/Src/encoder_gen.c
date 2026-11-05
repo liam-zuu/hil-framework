@@ -24,9 +24,15 @@ typedef struct {
     uint32_t           ch1_last_cnt;  /* CNT value at previous CH1 callback  */
     uint32_t           ch1_period;    /* measured ticks between CH1 callbacks*/
     uint8_t            ch1_has_last;  /* 0 until first CH1 callback seen     */
+
+    uint32_t           n_start;       /* _start_wheel calls (S06 T3b)        */
+    uint32_t           n_stop;        /* _stop calls                         */
 } Wheel_t;
 
 static Wheel_t _w[ENC_NUM_WHEELS];
+static EncoderGen_EventHook_t _hook;
+
+void EncoderGen_SetEventHook(EncoderGen_EventHook_t hook) { _hook = hook; }
 
 /* ── half_period from |omega| ───────────────────────────────────────────── */
 static uint32_t _half_period(float omega_abs)
@@ -73,6 +79,8 @@ static void _stop(uint8_t i)
     t->CCMR1 &= ~(TIM_CCMR1_OC1M | TIM_CCMR1_OC2M);   /* frozen */
     _w[i].dir          = 0;
     _w[i].ch1_has_last = 0;
+    _w[i].n_stop++;
+    if (_hook) _hook(i, ENC_EV_STOP, (uint16_t)t->CNT, _w[i].n_stop);
 }
 
 /* ── Arm both channels with the 90 deg phase offset for the given dir ──── */
@@ -112,6 +120,8 @@ static void _start_wheel(uint8_t i, int8_t dir)
 
     _w[i].dir          = dir;
     _w[i].ch1_has_last = 0;  /* discard stale period across restart */
+    _w[i].n_start++;
+    if (_hook) _hook(i, ENC_EV_START, (uint16_t)cnt, _w[i].n_start);
 }
 
 /* ── Same direction, new half period: re-time both pending edges ───────── */
@@ -261,6 +271,8 @@ void EncoderGen_GetDebug(EncoderGenDebug_t *dbg)
         dbg[i].dir         = _w[i].dir;
         dbg[i].half_period = _w[i].half_period;
         dbg[i].ch1_period  = _w[i].ch1_period;
+        dbg[i].n_start     = _w[i].n_start;
+        dbg[i].n_stop      = _w[i].n_stop;
 
         /* measured_freq: each CH1 callback is one toggle, so ch1_period (time
          * between two callbacks) is half a pulse period:
