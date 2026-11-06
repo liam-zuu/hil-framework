@@ -37,6 +37,11 @@ setpoint, i.e. initial transient and final stop excluded):
                      <log>.events.txt (log_loss); older logs: from the tick span
   missing_tail_known 1 when a '#run_end' line covers the end of the log, so a lost
                      end of run is counted; 0 when it cannot be seen
+  pos_reset_mid      pose resets inside the run (pos_reset_n increases between the first and
+  run_bad            the last run_active = 1 line, tools/run_validity.py, STATUS_CODE L37);
+  run_bad_reason     run_bad = 1 marks a broken run to run again (spec controller-IMU
+                     section 14.7.3 (A)); its metrics are still written but are not results.
+                     NaN when the log has no pos_reset_n / run_active (firmware before 05/11)
 Lifted tests A-K1, A-K2, per setpoint step whose new level lasts >= 2 s:
   rise_s_segN (10-90 % of the step), overshoot_pct_segN (beyond the new level,
   % of the step size), e_ss_segN (mean setpoint - vx over the last 1 s).
@@ -65,6 +70,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from agv_logger import (COLUMNS, MAX_US_PER_SEQ, N_IMU, OLD_LENGTHS, RATE_SLACK_US,  # noqa: E402
                         SEGMENT_COLUMNS, SEGMENT_STATUSES, file_digest, parse_run_end)
+from run_validity import pos_reset_mid, run_bad_fields  # noqa: E402
 HEADS = [COLUMNS] + [COLUMNS[:n] for n in OLD_LENGTHS]     # 85, 28, 37, 66, 80 columns
 
 R_WHEEL = 0.0485
@@ -346,6 +352,7 @@ def compute(log, test_id):
     tick = log['tick']
     m = {}
     m['missing_pct'], m['missing_tail_known'] = log_loss(log)
+    m.update(run_bad_fields(pos_reset_mid(log.get('run_active'), log.get('pos_reset_n'))))
 
     moving = np.flatnonzero(np.any(np.abs(sp) > 1e-9, axis=1))
     t0, t1 = t[moving[0]] + WINDOW_SKIP_S, t[moving[-1]]
@@ -413,3 +420,6 @@ if __name__ == '__main__':
         sys.exit(f'{name} already exists in {sys.argv[1]}: choose a new name (outputs are not overwritten).')
     res = run_dir_metrics(sys.argv[1], name)
     print(f'{len(res)} runs -> {os.path.join(sys.argv[1], name)}')
+    bad = [r['run_id'] for r in res if r.get('run_bad') == 1]
+    if bad:
+        print(f'BROKEN RUNS (run_bad = 1, pose reset mid-run, L37): run them again: {", ".join(bad)}')

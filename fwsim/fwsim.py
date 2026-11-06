@@ -45,6 +45,12 @@ from params import MecanumParams              # noqa: E402
 from plant_step import plant_step, traction_nsub   # noqa: E402
 from trajectory_pub import TrajectorySpec, get_body_velocity   # noqa: E402
 from imu_model import imu_from_plant          # noqa: E402
+from plant_blob import plant_source           # noqa: E402
+# L34 (Fable F-ND #7): git blobs of the plant_step.py / params.py imported just above, taken
+# now (not from the DLL build); written by plant_meta() into every meta.yaml 'plant'
+PLANT_SRC = plant_source()
+sys.path.insert(0, os.path.join(HERE, '..', 'tools'))
+from run_validity import pos_reset_mid, run_bad_fields   # noqa: E402
 
 COUNTS_PER_REV = 1320
 PCNT_MODES = {'idf': 0, 'wrap16': 1}
@@ -75,6 +81,17 @@ def pos_meta(fw):
         return None
     return dict(zip(('on', 'kp', 'ki', 'v_corr_max', 'e_win', 'e_exit', 'still_on', 'v_still', 't_still_us'),
                     (float(x) for x in fw.pos_params())))
+
+
+def run_validity(log):
+    """pos_reset_mid, run_bad, run_bad_reason of one simulate() log (tools/run_validity.py,
+    STATUS_CODE L37): a pose reset inside the run marks it broken. Not checkable (NaN) with a
+    DLL without pos_ctrl.c, or one built before run_active / pos_reset_n (05/11)."""
+    pos = np.asarray(log.get('pos', []), dtype=float)
+    if pos.ndim != 2 or pos.shape[1] != len(POS_COLS):
+        return run_bad_fields(None)
+    return run_bad_fields(pos_reset_mid(pos[:, POS_COLS.index('run_active')],
+                                        pos[:, POS_COLS.index('pos_reset_n')]))
 # Wheel-consistency slip flag (wheel_slip.c, AGV feat/wheel-slip): only with a DLL that has it
 WS_COLS = ['ws_res', 'ws_th', 'ws_eval', 'ws_flag', 'ws_on_count']
 
@@ -382,13 +399,15 @@ def metrics(log, t_from=0.0):
 
 
 def plant_meta(params):
-    """Plant settings for meta.yaml (one YAML flow mapping)."""
+    """Plant settings for meta.yaml (one YAML flow mapping), with src: the git blobs of
+    plant_step.py and params.py this process runs (PLANT_SRC, L34)."""
     d = dict(motor_model=params.motor_model, V_batt=params.V_batt,
              wheels_lifted=bool(getattr(params, 'wheels_lifted', False)),
              ground_model=params.ground_model, slip_legacy_enabled=bool(params.slip.enabled))
     if params.ground_model == 'traction':
         d.update(mu_hd=np.broadcast_to(params.mu_hd, (4,)).tolist(), slip_omega_s=params.slip_omega_s,
                  slip_nsub=traction_nsub(params))
+    d['src'] = PLANT_SRC
     return json.dumps(d)
 
 

@@ -223,6 +223,7 @@ def main():
             gains[ctrl] = ({ax: fw.get_adrc(i) for i, ax in enumerate(['vx', 'vy', 'wz'])} if ctrl == 'ADRC'
                            else {ax: fw.get_pid(i) for i, ax in enumerate(['vx', 'vy', 'wz'])})
             res, rows = evaluate(log, path, sch)
+            res.update(fwsim.run_validity(log))      # L37: run_bad = 1 when the pose reset mid-run
             run_id = f'fig8_v{v:.1f}_{ctrl}'
             rd = os.path.join(a.out, run_id)
             fwsim.write_run(rd, log, res, fw, dict(controller=ctrl, v=v, a_r=A_R, imu=imu, pos_loop=pos_params),
@@ -235,7 +236,7 @@ def main():
                                 pos_loop=int(bool(pos_params and pos_params['on'])), **res))
             print(f"{run_id}: e_perp_max={res['e_perp_max']:.3f} m, e_theta_max={res['e_theta_max_deg']:.1f} deg, "
                   f"|e_s|max={res['e_s_absmax']:.3f} m, stop {res['stop_dist_origin']:.3f} m, "
-                  f"completed={res['completed']}, track_err={res['track_err_frames']}")
+                  f"completed={res['completed']}, track_err={res['track_err_frames']}, run_bad={res['run_bad']}")
     with open(os.path.join(a.out, 'summary.csv'), 'w', newline='') as f:
         w = csv.DictWriter(f, fieldnames=list(summary[0]))
         w.writeheader()

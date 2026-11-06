@@ -184,6 +184,7 @@ imu: [none, 20 Hz reports noise-free (rpi5/imu_model.py)]
 variants: {{rigid: "ground_model rigid", tr_mu5: "traction mu_hd {MU_NO_SLIP}", tr_nom: "traction mu_hd {MU_NOMINAL}, nsub auto = {n0}", tr_nom_2n: "traction mu_hd {MU_NOMINAL}, nsub {2 * n0}", tr_nom_ws2: "traction mu_hd {MU_NOMINAL}, omega_s 0.05 (nsub auto)"}}
 checks: {json.dumps([dict(check=c, variant=v, base=bb, limit_x_qrms=k) for c, v, bb, k in CHECKS])}
 seed: 1                           # plant has no random input
+plant_src: {json.dumps(fwsim.PLANT_SRC)}     # L34: git blobs of rpi5/plant_step.py, params.py run here
 libraries: {json.dumps(fwsim.lib_versions())}
 elapsed_s: {time.time() - t_start:.0f}
 result: "{'PASS' if not fails else f'FAIL ({len(fails)} rows)'}"

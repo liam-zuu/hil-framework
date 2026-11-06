@@ -187,6 +187,11 @@ class HILNode:
         # MecanumPlant keeps its own state order; MockPlant (--fixed-omega)
         # already uses the frame order
         self._mecanum   = isinstance(plant, MecanumPlant)
+        # L34 (Fable F-ND #7): git blobs of the plant_step.py / params.py this process imported,
+        # taken at start; a SIM and a HIL run are compared only with the same blobs
+        from plant_blob import plant_source
+        self._plant_src = plant_source()
+        log.info('Plant source blobs: %s', self._plant_src)
         self._heavy     = HeavyBlock(*self.cfg.heavy_block) if self.cfg.heavy_block else None
         self._t_start:  Optional[float] = None
         self._stop_reason = 'max_steps'
@@ -398,7 +403,8 @@ class HILNode:
         manifest = dict(step_first=0, step_last=n - 1, steps=n, period_us=self.cfg.period_us,
                         max_steps=self.cfg.max_steps, stop_reason=self._stop_reason,
                         imu_source=imu_source, imu_profile=self.cfg.imu_profile, imu_static=self.cfg.imu_static,
-                        plant=type(self.plant).__name__, heavy_block=self.cfg.heavy_block,
+                        plant=type(self.plant).__name__, plant_src=self._plant_src,     # L34
+                        heavy_block=self.cfg.heavy_block,
                         load_schedule=self.cfg.load_schedule, rt=self._rt, uname=' '.join(platform.uname()),     # X8: the kernel the run ran on
                         lifecycle=self.lifecycle_summary())
         np.savez(self.cfg.frame_log, manifest=np.array(json.dumps(manifest)),
