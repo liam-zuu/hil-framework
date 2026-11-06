@@ -37,8 +37,10 @@ Section numbers below are those of S04 v5.
       the report-only measures.
   7   K1, K2 are never run; nothing here runs on the car.
   8   outputs in --out (columns controller, ga_seed): history.csv, evals.csv (key controller,
-      ga_seed, gen, cand_id, v, mu, attempt), hv.csv, pareto.csv, selected.csv, meta.yaml,
-      lock.yaml, trial/ (the trial phase), post_checks/.
+      ga_seed, gen, cand_id, v, mu, attempt), hv.csv, pareto.csv (feasible non-dominated),
+      final_population.csv, selected.csv, meta.yaml (whole folder, written before the GA and after
+      every phase), meta_<controller>.yaml, phases.json, lock.yaml (one mode and one source
+      fingerprint for the folder), trial/ (the trial phase), post_checks/.
 
 L56: the mu rule reads sealed/runs.csv of the S03 run, so --phase trial / main need
 --s03-unsealed (campaign A finished, the S03 results may be looked at). --tool-check (tool test,
@@ -87,14 +89,16 @@ B0_FACTORS = (0.7, 0.85, 1.0, 1.15, 1.3)
 R_FACTORS = (0.8, 0.9, 1.0, 1.1, 1.2)
 REL_LIMIT = 0.5               # B0_SENS criterion: e_perp_max change > 50 %
 PRECONDITIONS = ('s03_run_and_locked', 'final_test_set_locked', 'ctrl_imu_checked_on_board', 'x3_compared')
+CMP_EPS = 1e-12               # S4C-14: rounding tolerance of the inclusive mu-rule bounds (m; relative for Y3)
 # pymoo 0.6.2 constraint handling, read in the installed library (S04 section 3; Liam asked CODE to
 # record file:line before the trial). Re-read when the version differs.
 PYMOO_CHECKED = '0.6.2'
 PYMOO_CV = ("core/individual.py:29 cv_ieq default func=np.sum, eps 0, no scale, no pow; "
-            "core/individual.py:600-623 constr_to_cv: CV = sum(max(0, g_i)) over the inequality constraints; "
-            "core/survival.py:59-80 Survival.do: feasible (CV = 0) individuals ranked by RankAndCrowding first, "
-            "the rest filled by increasing CV; algorithms/moo/nsga2.py:33-47 binary tournament: if either is "
-            "infeasible the smaller CV wins (random on a tie), else dominance then crowding")
+            "core/individual.py:600-633 constr_to_cv: c = max(0, g_i - eps), CV = func(c) = sum (line 633) over "
+            "the inequality constraints; core/survival.py:59-80 Survival.do: feasible (CV = 0) individuals ranked "
+            "by RankAndCrowding first, the rest filled by increasing CV; algorithms/moo/nsga2.py:23-77 binary "
+            "tournament: if either is infeasible the smaller CV wins (random on a tie, 39-48), else dominance "
+            "then crowding (50-75)")
 EVAL_COLS = ['controller', 'ga_seed', 'gen', 'cand_id', 'v', 'mu', 'attempt', 'status', 'completed', 'e_perp_max',
              'tv_duty', 'sat_frac', 't_end', 'e_theta_lane_max_deg', 'e_theta_cmd_max_deg', 'ds_absmax', 'e_trk_max',
              'log_sha256', 'cause', 'error']
@@ -218,15 +222,31 @@ def mu_rule(s03_dir, ctrl, gate, mu_levels):
     meta = open(os.path.join(s03_dir, 'meta.yaml'), encoding='utf-8').read()
     y3_ref = meta_value(meta, 'y3_reference')
     runs = [r for r in read_csv(os.path.join(s03_dir, 'sealed', 'runs.csv')) if r['controller'] == ctrl]
+    design = [(r['point_id'], r['box']) for r in read_csv(os.path.join(s03_dir, 'design.csv'))
+              if r['controller'] == ctrl]
+    if not design or len(set(design)) != len(design):
+        sys.exit(f'{s03_dir}/design.csv: no or duplicate design points for {ctrl} (S04 3, S4C-5)')
     lo, mid, hi = mu_levels
-    by = {}
+    by, dup = {}, []
     for r in runs:
-        by.setdefault((r['point_id'], r['box'], float(r['v'])), {})[float(r['mu'])] = r
+        rs = by.setdefault((r['point_id'], r['box'], float(r['v'])), {})
+        if float(r['mu']) in rs:
+            dup.append((r['point_id'], r['box'], r['v'], r['mu']))
+        rs[float(r['mu'])] = r
+    if dup:
+        sys.exit(f'{s03_dir}/sealed/runs.csv: duplicate runs for {ctrl} (S4C-5), first {dup[0]}')
     bad = []
     n = 0
+    for (pid, box) in design:                   # every design point x every gate speed (S4C-5)
+        for v in gate:
+            key = next((k for k in by if k[:2] == (pid, box) and math.isclose(k[2], v)), None)
+            if key is None:
+                sys.exit(f'{s03_dir}/sealed/runs.csv: no run of {ctrl} point {pid} ({box}) at v = {v} (S4C-5)')
     for (pid, box, v), rs in sorted(by.items()):
         if not any(math.isclose(v, g) for g in gate):
             continue
+        if (pid, box) not in design:
+            sys.exit(f'{s03_dir}/sealed/runs.csv: {ctrl} point {pid} ({box}) not in design.csv (S4C-5)')
         n += 1
         why = []
         if set(rs) != {lo, mid, hi}:
@@ -239,11 +259,11 @@ def mu_rule(s03_dir, ctrl, gate, mu_levels):
             if len({r['completed'] for r in rs.values()}) > 1:
                 why.append('y1 differs over mu')
             y2 = {m: float(r['e_perp_max']) for m, r in rs.items()}
-            if max(abs(y2[lo] - y2[mid]), abs(y2[hi] - y2[mid])) > MU_Y2_TOL:
+            if max(abs(y2[lo] - y2[mid]), abs(y2[hi] - y2[mid])) > MU_Y2_TOL + CMP_EPS:     # S4C-14
                 why.append('dY2 > 0.01 m')
             y3 = {m: float(r['tv_duty']) for m, r in rs.items()}
             ref = y3_ref[f'{ctrl} v={v:g}']
-            if max(abs(y3[lo] - y3[mid]), abs(y3[hi] - y3[mid])) > MU_Y3_REL * ref:
+            if max(abs(y3[lo] - y3[mid]), abs(y3[hi] - y3[mid])) > MU_Y3_REL * ref * (1 + CMP_EPS):
                 why.append('dY3 > 20 % of the reference')
         if why:
             bad.append(dict(point_id=pid, box=box, v=v, why=why))
@@ -326,7 +346,9 @@ def run_seed(ev, dom, ga_seed, pop, n_gen, ref, history, hv_rows, ext=None, log=
                 s = ev.candidate(g, ga_seed, state['gen'], k)
                 F.append([s['f1'], s['f2']])
                 G.append([s['g1'], s['g2']])
-                seen.setdefault(np.asarray(x, dtype=float).tobytes(), (state['gen'], k))
+                # S4C-6: every evaluation of this vector (pymoo may evaluate a vector again)
+                seen.setdefault(np.asarray(x, dtype=float).tobytes(), []).append(
+                    (state['gen'], k, (float(s['f1']), float(s['f2']), float(s['g1']), float(s['g2']))))
                 history.append(dict(controller=ev.ctrl, ga_seed=ga_seed, gen=state['gen'], cand_id=k,
                                     **{d['name']: g[d['name']] for d in dom},
                                     **{f'x_{d["name"]}': float(xi) for d, xi in zip(dom, x)}, **s))
@@ -350,7 +372,7 @@ def run_seed(ev, dom, ga_seed, pop, n_gen, ref, history, hv_rows, ext=None, log=
                             n_nd_feasible=len(nondominated(feas)), n_nd_on_or_beyond_ref=n_out))
         log(f'[{ev.ctrl} seed {ga_seed}] gen {state["gen"]}: feasible {len(feas)}/{len(pts)}, HV {hv:.6g}')
         if ext and state['gen'] == ext[0]:
-            h_b, h_a = hv_by_gen[ext[0]], hv_by_gen[max(1, ext[0] - 5)]
+            h_b, h_a = hv_by_gen[ext[0]], hv_by_gen[gen_compare(ext[0])]
             extended = h_b == 0.0 or (h_b - h_a) / h_b > HV_EXT_REL
             if not extended:
                 break
@@ -361,10 +383,15 @@ def points_of(pop, dom, ga_seed, seen):
     pts = []
     for ind in pop:
         x = np.asarray(ind.X, dtype=float)
-        gen, cand = seen.get(x.tobytes(), ('', ''))
         G = np.asarray(ind.G, dtype=float)
-        pts.append(dict(ga_seed=ga_seed, gen=gen, cand_id=cand, f1=float(ind.F[0]), f2=float(ind.F[1]),
-                        g1=float(G[0]), g2=float(G[1]), feasible=bool(np.all(G <= 0)),
+        fg = (float(ind.F[0]), float(ind.F[1]), float(G[0]), float(G[1]))
+        hits = seen.get(x.tobytes(), [])
+        same = [e for e in hits if e[2] == fg]          # S4C-6: the evaluation whose F, G this point holds
+        gen, cand = same[0][:2] if same else ('', '')
+        note = ('' if len({e[2] for e in hits}) <= 1 else 'evaluated more than once with different results') \
+            if same else 'no evaluation with these F, G'
+        pts.append(dict(ga_seed=ga_seed, gen=gen, cand_id=cand, f1=fg[0], f2=fg[1], g1=fg[2], g2=fg[3],
+                        feasible=bool(np.all(G <= 0)), id_note=note,
                         x=[decode(dom, x)[d['name']] for d in dom], xga=x.tolist()))
     return pts
 
@@ -425,24 +452,35 @@ def seed_error_rates(evals, ctrl):
             for s, (a, n) in sorted(out.items())}
 
 
-def pareto_rows(ctrl, finals):
+def population_rows(ctrl, finals, nd_only=False):
+    """final_population.csv: every point of each seed's final population with a non-dominated flag;
+    nd_only: pareto.csv, the feasible non-dominated points only (S04 8; S4C-17)."""
     rows = []
     for seed in sorted(finals):
         pts = finals[seed]
         feas = [p for p in pts if p['feasible']]
         nd_ids = {id(p) for p in nondominated(feas)}
         for p in pts:
+            if nd_only and id(p) not in nd_ids:
+                continue
             rows.append(dict(controller=ctrl, ga_seed=seed, gen=p['gen'], cand_id=p['cand_id'], feasible=p['feasible'],
                              nondominated_feasible=id(p) in nd_ids, f1=p['f1'], f2=p['f2'], g1=p['g1'], g2=p['g2'],
-                             gains=json.dumps([repr(float(v)) for v in p['x']])))
+                             id_note=p.get('id_note', ''), gains=json.dumps([repr(float(v)) for v in p['x']])))
     return rows
 
 
-def default_f2(fw, ctrl, speeds, mu_mid):
-    """f2 of the firmware default gains at the middle mu (HV reference, section 4.2)."""
-    ev = Evaluator(fw, None, ctrl, speeds, [mu_mid], None)
+def pareto_rows(ctrl, finals):
+    return population_rows(ctrl, finals, nd_only=True)
+
+
+def default_f2(fw, dll, ctrl, speeds, mu_mid, work):
+    """f2 of the firmware default gains at the middle mu (HV reference, section 4.2). S4C-7: the
+    reference is only locked from a valid run (every run 'ok' or 'track_err' scored, no run_error,
+    f2 finite and > 0); otherwise the trial stops."""
+    ev = Evaluator(fw, dll, ctrl, speeds, [mu_mid], work)
     s = ev.candidate(s3.defaults(fw, ctrl), 0, 0, 0)
-    return s['f2'], s, ev.evals
+    ok = s['status'] == 'ok' and s['n_run_error'] == 0 and math.isfinite(s['f2']) and s['f2'] > 0
+    return s['f2'], s, ev.evals, ok
 
 
 # ── post checks (section 6) ──────────────────────────────────────────────────────────
@@ -466,13 +504,23 @@ def run_custom(fw, path, ctrl, g, v, mu, b0_factor=1.0, r_factor=1.0):
 
 
 def plant_dump(p):
-    out = {}
-    for k, v in sorted(vars(p).items()):
+    """Every attribute of the plant parameter object actually used, nested objects included
+    (S04 6; S4C-8): arrays as lists, numpy scalars as Python numbers, other values as repr."""
+    def conv(v):
         if isinstance(v, np.ndarray):
-            out[k] = v.tolist()
-        elif isinstance(v, (int, float, str, bool)):
-            out[k] = v
-    return out
+            return v.tolist()
+        if isinstance(v, np.generic):
+            return v.item()
+        if v is None or isinstance(v, (bool, int, float, str)):
+            return v
+        if isinstance(v, dict):
+            return {str(k): conv(x) for k, x in sorted(v.items(), key=lambda kv: str(kv[0]))}
+        if isinstance(v, (list, tuple)):
+            return [conv(x) for x in v]
+        if hasattr(v, '__dict__'):
+            return {k: conv(x) for k, x in sorted(vars(v).items())}
+        return repr(v)
+    return {k: conv(v) for k, v in sorted(vars(p).items())}
 
 
 def judge(rows, key):
@@ -493,6 +541,14 @@ def judge(rows, key):
     return bool(reasons), reasons
 
 
+def three_mu_findings(rows, ctrl):
+    """Runs of the three-mu check not passing the gate. S4C-9: a track_err / run_error run is not a
+    passed gate even with completed 'true'."""
+    return [f"v={r['v']} mu={r['mu']}: status {r.get('status')}, completed {r['completed']}, e_perp_max "
+            f"{r.get('e_perp_max')}" for r in rows if r['controller'] == ctrl and
+            (r.get('status') != 'ok' or r['completed'] != 'true' or float(r.get('e_perp_max') or 0) > D)]
+
+
 def post(a):
     out = a.out
     lock = json.load(open(os.path.join(out, 'lock.yaml'), encoding='utf-8'))
@@ -501,9 +557,15 @@ def post(a):
     pc = os.path.join(out, 'post_checks')
     if os.path.isdir(pc) and os.listdir(pc):
         sys.exit(f'{pc} already holds data')
+    common = lock.get('common')
+    if not common:
+        sys.exit(f'{out}/lock.yaml has no common block (written by this script version): run a new folder')
+    check_fingerprint(common, fingerprint(a.dll, common['s03_run']), 'post')        # S4C-2
+    tc = common['tool_check']
     os.makedirs(pc, exist_ok=True)
+    t0 = time.time()
     fw, path = fwsim.FirmwareSim(a.dll), o1.Path8()
-    det, sens, mu3, notes = [], [], [], {}
+    det, sens, mu3, notes, plant_full = [], [], [], {}, {}
     for s in sel:
         ctrl = s['controller']
         if s.get('feasible') != 'true':
@@ -519,15 +581,16 @@ def post(a):
         res = s3.run_in_new_process(a.dll, jobs, os.path.join(pc, '_work'))
         for (c, _, v, mu), r in zip(jobs, res):
             got = hashlib.sha256(json.dumps(r['digest'], sort_keys=True).encode()).hexdigest() if r['digest'] else ''
-            det.append(dict(controller=ctrl, v=v, mu=mu, ga_log_sha256=ref.get((v, mu), ''), new_process_log_sha256=got,
-                            equal=got != '' and got == ref.get((v, mu))))
+            det.append(dict(tool_check=tc, controller=ctrl, v=v, mu=mu, ga_log_sha256=ref.get((v, mu), ''),
+                            new_process_log_sha256=got, equal=got != '' and got == ref.get((v, mu))))
         for kind, factors in (('b0_factor', B0_FACTORS if ctrl == 'ADRC' else ()), ('r_factor', R_FACTORS)):
             rows = []
             for mu in mus:
                 for v in speeds:
                     for k in factors:
                         res_, _, back, before, after = run_custom(fw, path, ctrl, g, v, mu, **{kind: k})
-                        rows.append(dict(controller=ctrl, check=kind, v=v, mu=mu, **{kind: k},
+                        plant_full.setdefault(f'{ctrl} {kind}={k!r} mu={mu!r}', dict(before=before, after=after))
+                        rows.append(dict(tool_check=tc, controller=ctrl, check=kind, v=v, mu=mu, **{kind: k},
                                          completed=res_['completed'], status=res_['status'],
                                          e_perp_max=res_['e_perp_max'], tv_duty=res_['tv_duty'],
                                          read_back=json.dumps(back), plant_changed=json.dumps(
@@ -540,27 +603,41 @@ def post(a):
                 notes[f'{ctrl} {kind}'] = dict(sensitive=sensitive, reasons=reasons)
                 sens += rows
         if len(mus) == 1:                       # section 6: the three mu when the GA used the middle one
-            for mu in lock['s03_mu_levels']:
+            levels = lock['s03_mu_levels']
+            for mu in levels:
                 for v in speeds:
                     row, _ = s3.safe_run(fw, path, ctrl, g, v, mu)
-                    mu3.append(dict(controller=ctrl, v=v, mu=mu, **{k: row.get(k, '') for k in EVAL_COLS if k in row}))
-            notes[f'{ctrl} three_mu'] = [f"v={r['v']} mu={r['mu']}: completed {r['completed']}, e_perp_max "
-                                         f"{r.get('e_perp_max')}" for r in mu3 if r['controller'] == ctrl and
-                                         (r['completed'] != 'true' or float(r.get('e_perp_max') or 0) > D)]
+                    mu3.append(dict(tool_check=tc, controller=ctrl, v=v, mu=mu,
+                                    **{k: row.get(k, '') for k in EVAL_COLS if k in row}))
+            warn = three_mu_findings(mu3, ctrl)
+            if len(set(levels)) < 3:            # S4C-10: never an empty list for a check that was not done
+                notes[f'{ctrl} three_mu'] = dict(
+                    done=False, note=f'not applicable: the S03 run has the mu levels {levels} only; the three-mu '
+                                     'check of S04 6 was NOT done', findings=warn)
+            else:
+                notes[f'{ctrl} three_mu'] = dict(done=True, findings=warn,
+                                                 note='findings: runs not passing the gate; empty = every run ok, '
+                                                      'completed and e_perp_max <= D')
     write_rows(os.path.join(pc, 'determinism.csv'), det)
     write_rows(os.path.join(pc, 'sensitivity.csv'), sens)
     write_rows(os.path.join(pc, 'three_mu.csv'), mu3)
+    with open(os.path.join(pc, 'plant_params.json'), 'w', encoding='utf-8') as f:     # S4C-8
+        json.dump(dict(note='every attribute of the plant parameters used, before and after the change '
+                            '(one entry per controller, check, factor and mu; the same for every speed)',
+                       entries=plant_full), f, indent=1, default=str)
     work = os.path.join(pc, '_work')
     if os.path.isdir(work) and not os.listdir(work):
         os.rmdir(work)
     with open(os.path.join(pc, 'notes.json'), 'w', encoding='utf-8') as f:
-        json.dump(dict(determinism_all_equal=all(d['equal'] for d in det) if det else None, notes=notes,
+        json.dump(dict(tool_check=tc, determinism_all_equal=all(d['equal'] for d in det) if det else None, notes=notes,
                        script=s3.git_state(os.path.join(HERE, '..')), dll_sha256=s3.sha256_file(a.dll),
                        criterion='B0_SENS/2026-11-05_run01: sensitive if completed changes, e_perp_max <= D changes, '
                                  'or e_perp_max changes by more than 50 % of the factor-1.0 value; tv_duty change '
                                  'reported, not a criterion (S04 6, B8b-21); rank after the change not reported',
                        r_factors=R_FACTORS, b0_factors=B0_FACTORS), f, indent=1, default=str)
-    print(f'post checks -> {pc}; determinism equal: {all(d["equal"] for d in det) if det else None}')
+    log_phase(out, dict(phase='post', elapsed_s=round(time.time() - t0)))
+    write_root_meta(out, a.dll, lock)
+    print(f'post checks -> {pc}; tool_check {tc}; determinism equal: {all(d["equal"] for d in det) if det else None}')
     for k, v in notes.items():
         print(f'  {k}: {v}')
     return 0
@@ -594,6 +671,11 @@ def main():
         sys.exit(f'budget is locked by S04 4.3 (pop {POP}, {GEN_BASE} / {GEN_MAX} generations); --tool-check to change it')
     if not a.tool_check and a.seeds not in (None, list(SEEDS)):
         sys.exit('S04 4.2: GA seeds 1-5; --tool-check to change them')
+    if a.seeds and len(set(a.seeds)) != len(a.seeds):                         # S4C-13
+        sys.exit(f'--seeds has a repeated seed: {a.seeds}')
+    if not a.tool_check and a.gate_speeds:                                     # S4C-3
+        sys.exit('S04 3 / S03 8: the gate speeds are those of the S03 run; a new gate needs a new S03 run '
+                 '(--gate-speeds only with --tool-check)')
     if a.gen_base > a.gen_max or a.gen_base < 1:
         sys.exit('--gen-base must be in 1 .. --gen-max')
     ctrl = a.controller
@@ -622,6 +704,8 @@ def main():
     import pymoo
     t0 = time.time()
 
+    fp = fingerprint(a.dll, a.s03)
+
     if a.phase == 'trial':
         tdir = os.path.join(a.out, 'trial', ctrl)
         if os.path.isdir(tdir) and os.listdir(tdir):
@@ -629,14 +713,25 @@ def main():
         lock = json.load(open(lock_path, encoding='utf-8')) if os.path.isfile(lock_path) else dict(controllers={})
         if ctrl in lock['controllers']:
             sys.exit(f'{lock_path} already locks {ctrl}')
+        common = lock.get('common')
+        if lock['controllers'] and not common:
+            sys.exit(f'{lock_path} has no common block (older script version): use a new folder')
+        if common:                              # S4C-1, S4C-2: one mode and one source for the whole folder
+            if common['tool_check'] != a.tool_check:
+                sys.exit(f'{lock_path} was started with tool_check = {common["tool_check"]}; this trial has '
+                         f'{a.tool_check}: a tool check and a main run never share a folder (S4C-1)')
+            check_fingerprint(common, fp, 'trial')
+        else:
+            common = lock['common'] = dict(tool_check=a.tool_check, s03_run=os.path.abspath(a.s03), fingerprint=fp,
+                                           s03_mu_levels=s03_mu)
         pre = {}
         if not a.tool_check:
             if not a.preconditions:
                 sys.exit('S04 4.3: --preconditions <json> with ' + ', '.join(PRECONDITIONS))
             pre = json.load(open(a.preconditions, encoding='utf-8'))
-            miss = [k for k in PRECONDITIONS if not str(pre.get(k, '')).strip()]
+            miss = [k for k in PRECONDITIONS if not (isinstance(pre.get(k), str) and pre[k].strip())]   # S4C-4
             if miss:
-                sys.exit(f'S04 4.3: preconditions without "where checked": {miss}')
+                sys.exit(f'S04 4.3: preconditions without "where checked" (a non-empty text): {miss}')
         if a.tool_check:
             decision, report = 'mid', dict(note='tool check: mu rule not applied, the S03 run has one mu level '
                                                  'or sealed/ is not read (L56)')
@@ -644,36 +739,51 @@ def main():
             decision, report = mu_rule(a.s03, ctrl, gate, s03_mu)
         eval_mu = [mu_mid] if decision == 'mid' else list(s03_mu)
         os.makedirs(tdir, exist_ok=True)
-        f2_def, def_score, def_evals = default_f2(fw, ctrl, gate, mu_mid)
+        L_new = dict(tool_check=a.tool_check, domain=dom, s03_run=os.path.abspath(a.s03), speeds=gate, eval_mu=eval_mu,
+                     mu_decision=decision, mu_rule_report=report, pop=a.pop, gen_rule=dict(base=a.gen_base, max=a.gen_max),
+                     seeds=list(a.seeds or SEEDS), preconditions=pre, n_gen='set by this trial (S04 4.3)')
+        # S4C-12: the root meta.yaml holds the locked items and the pymoo reading before the GA runs
+        write_root_meta(a.out, a.dll, dict(lock, controllers=dict(lock['controllers'], **{ctrl: L_new})),
+                        running=f'trial {ctrl}')
+        work = os.path.join(tdir, '_work')
+        f2_def, def_score, def_evals, def_ok = default_f2(fw, a.dll, ctrl, gate, mu_mid, work)
+        if not def_ok:                          # S4C-7: no HV reference from a penalty or a failed run
+            write_rows(os.path.join(tdir, 'evals.csv'), def_evals, EVAL_COLS)
+            sys.exit(f'STOP: the default gains of {ctrl} did not give a valid run at mu {mu_mid} '
+                     f'(status {def_score["status"]}, f2 {def_score["f2"]}): no HV reference (S04 4.2); tell Liam. '
+                     f'Runs in {tdir}/evals.csv')
         ref = (D, HV_REF_MULT * f2_def)
-        ev = Evaluator(fw, a.dll, ctrl, gate, eval_mu, os.path.join(tdir, '_work'))
+        ev = Evaluator(fw, a.dll, ctrl, gate, eval_mu, work)
         history, hv_rows = [], []
         final, n_gen, extended = run_seed(ev, dom, SEEDS[0], a.pop, None, ref, history, hv_rows,
                                           ext=(a.gen_base, a.gen_max))
         feasible_final = any(p['feasible'] for p in final)
         locked_gen = a.gen_max if extended else a.gen_base
         stop = (extended and not feasible_final)
+        check_eval_keys(def_evals + ev.evals)                                   # S4C-13
         write_rows(os.path.join(tdir, 'history.csv'), history)
         write_rows(os.path.join(tdir, 'evals.csv'), def_evals + ev.evals, EVAL_COLS)
         write_rows(os.path.join(tdir, 'hv.csv'), hv_rows)
         write_rows(os.path.join(tdir, 'pareto.csv'), pareto_rows(ctrl, {SEEDS[0]: final}))
+        write_rows(os.path.join(tdir, 'final_population.csv'), population_rows(ctrl, {SEEDS[0]: final}))
         elapsed = time.time() - t0
-        lock['controllers'][ctrl] = dict(
-            domain=dom, s03_run=os.path.abspath(a.s03), speeds=gate, eval_mu=eval_mu, mu_decision=decision,
-            mu_rule_report=report, pop=a.pop, n_gen=locked_gen, gen_rule=dict(
-                base=a.gen_base, max=a.gen_max, hv_base=hv_rows[a.gen_base - 1]['hv'] if len(hv_rows) >= a.gen_base else None,
-                hv_base_minus_5=hv_rows[max(1, a.gen_base - 5) - 1]['hv'] if len(hv_rows) >= a.gen_base else None,
-                extended=extended), seeds=list(a.seeds or SEEDS), hv_ref=list(ref), default_f2=f2_def,
-            default_score=def_score, preconditions=pre, trial_elapsed_s=round(elapsed), trial_generations=n_gen,
-            trial_feasible_final=feasible_final, stop=('no feasible point after the extended trial: tell Liam (S04 4.3)'
-                                                       if stop else None))
-        lock.update(s03_mu_levels=s03_mu, rule=('section 5: f1* = min f1; keep f1 <= f1* + 0.01 m; min f2, then f1, '
-                                                'then gains lexicographic, then seed'), tool_check=a.tool_check,
-                    pymoo=pymoo.__version__)
+        L_new.update(n_gen=locked_gen, gen_rule=dict(
+            base=a.gen_base, max=a.gen_max, compared_with=gen_compare(a.gen_base),
+            hv_base=hv_rows[a.gen_base - 1]['hv'] if len(hv_rows) >= a.gen_base else None,
+            hv_compared=hv_rows[gen_compare(a.gen_base) - 1]['hv'] if len(hv_rows) >= a.gen_base else None,
+            extended=extended), hv_ref=list(ref), default_f2=f2_def, default_score=def_score,
+            trial_elapsed_s=round(elapsed), trial_generations=n_gen, trial_feasible_final=feasible_final,
+            stop=('no feasible point after the extended trial: tell Liam (S04 4.3)' if stop else None))
+        lock['controllers'][ctrl] = L_new
+        lock.update(s03_mu_levels=s03_mu, rule=SELECTION_RULE, pymoo=pymoo.__version__)
         with open(lock_path, 'w', encoding='utf-8') as f:
             json.dump(lock, f, indent=1, default=str)
-        write_meta(os.path.join(tdir, 'meta.yaml'), a, fw, ctrl, dict(phase='trial', elapsed_s=round(elapsed),
-                   generations=n_gen, extended=extended, locked_n_gen=locked_gen, mu_decision=decision), pymoo)
+        write_meta(os.path.join(tdir, 'meta.yaml'), a, fw, ctrl, dict(
+            phase='trial', elapsed_s=round(elapsed), generations=n_gen, extended=extended, locked_n_gen=locked_gen,
+            mu_decision=decision, eval_mu=eval_mu, speeds=gate, pop=a.pop, seeds_locked=L_new['seeds'],
+            gen_rule=L_new['gen_rule'], hv_ref=list(ref), preconditions=pre), pymoo, eval_mu)
+        log_phase(a.out, dict(phase='trial', controller=ctrl, elapsed_s=round(elapsed)))
+        write_root_meta(a.out, a.dll, lock)
         print(f'[{ctrl}] trial: {n_gen} generations, extended {extended}, feasible at the end {feasible_final}; '
               f'locked n_gen {locked_gen}; {round(elapsed)} s -> {tdir}')
         if stop:
@@ -690,8 +800,19 @@ def main():
         sys.exit(f'{lock_path} does not lock {ctrl}: run its trial first')
     if L.get('stop'):
         sys.exit(f'{ctrl}: the trial stopped ({L["stop"]})')
-    if lock.get('tool_check') != a.tool_check:
+    common = lock.get('common')
+    if not common:
+        sys.exit(f'{lock_path} has no common block (older script version): use a new folder')
+    if common['tool_check'] != a.tool_check or L.get('tool_check') != a.tool_check:          # S4C-1
         sys.exit('the lock and this run differ in --tool-check')
+    check_fingerprint(common, fp, 'main')                                                      # S4C-2
+    if not a.tool_check:                        # S4C-1: the controller's own trial had the full lock
+        miss = [k for k in PRECONDITIONS if not (isinstance(L['preconditions'].get(k), str)
+                                                 and L['preconditions'][k].strip())]
+        if miss or (L['pop'], L['gen_rule']['base'], L['gen_rule']['max']) != (POP, GEN_BASE, GEN_MAX) \
+                or L['seeds'] != list(SEEDS):
+            sys.exit(f'{ctrl}: lock.yaml does not hold the S04 4.2-4.3 budget, seeds and preconditions '
+                     f'(missing {miss}): not a main-run lock')
     if dom != L['domain'] or gate != L['speeds'] or os.path.abspath(a.s03) != L['s03_run']:
         sys.exit('the domain, gate speeds or S03 run differ from lock.yaml (S04 7: locked before the main runs)')
     seeds = list(a.seeds or L['seeds'])
@@ -706,8 +827,10 @@ def main():
         finals[seed], _, _ = run_seed(ev, dom, seed, L['pop'], L['n_gen'], ref, history, hv_rows)
     sel, stats = summarise(ctrl, dom, finals)
     errs = seed_error_rates(ev.evals, ctrl)
+    check_eval_keys(ev.evals)                                                   # S4C-13
     for name, rows, cols in ((f'history_{ctrl}.csv', history, None), (f'evals_{ctrl}.csv', ev.evals, EVAL_COLS),
                              (f'hv_{ctrl}.csv', hv_rows, None), (f'pareto_{ctrl}.csv', pareto_rows(ctrl, finals), None),
+                             (f'final_population_{ctrl}.csv', population_rows(ctrl, finals), None),
                              (f'selected_{ctrl}.csv', sel, None)):
         write_rows(os.path.join(a.out, name), rows, cols)
     merge_controllers(a.out)
@@ -715,7 +838,9 @@ def main():
     write_meta(os.path.join(a.out, f'meta_{ctrl}.yaml'), a, fw, ctrl, dict(
         phase='main', elapsed_s=round(elapsed), seeds=seeds, n_gen=L['n_gen'], pop=L['pop'], eval_mu=L['eval_mu'],
         speeds=L['speeds'], selection=stats, seed_error_rates=errs,
-        seeds_over_10pct=[s for s, e in errs.items() if e['over_10pct']]), pymoo)
+        seeds_over_10pct=[s for s, e in errs.items() if e['over_10pct']]), pymoo, L['eval_mu'])
+    log_phase(a.out, dict(phase='main', controller=ctrl, elapsed_s=round(elapsed), seeds=seeds))
+    write_root_meta(a.out, a.dll, lock)
     w = os.path.join(a.out, '_work')
     if os.path.isdir(w) and not os.listdir(w):
         os.rmdir(w)
@@ -727,9 +852,92 @@ def main():
     return 0 if send['feasible'] else 2
 
 
+SELECTION_RULE = ('section 5: f1* = min f1; keep f1 <= f1* + 0.01 m; min f2, then f1, then gains lexicographic, '
+                  'then seed; send_to_HIL on the union of the feasible non-dominated sets of the feasible seeds')
+
+
+def gen_compare(gen_base):
+    """Section 4.3: the generation compared with gen_base (HV_20 against HV_15). With --tool-check and
+    gen_base < 6 there is no gen_base - 5: generation 1 is used (with gen_base = 1 the rule can only
+    extend on HV = 0). S4C-16: written down here and in lock.yaml (gen_rule.compared_with)."""
+    return max(1, gen_base - 5)
+
+
+def fingerprint(dll, s03_dir):
+    """S4C-2: what must not change between the trial, the main runs and the post checks of one folder
+    (S04 7): the DLL, the S03 files the domain and the mu rule come from, the plant source blobs
+    (L34), the O1 / S03 / S04 scripts, D and the library versions."""
+    s03_files = {}
+    for n in ('meta.yaml', 'levels.csv', 'design.csv'):
+        p = os.path.join(s03_dir, n)
+        s03_files[n] = s3.sha256_file(p) if os.path.isfile(p) else None
+    scripts = {n: s3.sha256_file(os.path.join(HERE, n)) for n in ('s04_ga.py', 's03_doe.py', 'o1_feasibility.py',
+                                                                 'fwsim.py')}
+    return dict(dll_sha256=s3.sha256_file(dll), s03_files=s03_files, plant_src=fwsim.PLANT_SRC, scripts=scripts, D=D,
+                libraries=fwsim.lib_versions())
+
+
+def check_fingerprint(common, fp, phase):
+    old = common['fingerprint']
+    diff = sorted(k for k in set(old) | set(fp) if json.dumps(old.get(k), sort_keys=True, default=str)
+                  != json.dumps(fp.get(k), sort_keys=True, default=str))
+    if diff:
+        sys.exit(f'{phase}: {diff} differ from lock.yaml (S04 7: a change of DLL, S03, plant, O1 or scripts needs '
+                 f'a new S04 folder; S4C-2)')
+
+
+def check_eval_keys(evals):
+    keys = [(e['controller'], e['ga_seed'], e['gen'], e['cand_id'], e['v'], e['mu'], e['attempt']) for e in evals]
+    if len(keys) != len(set(keys)):
+        sys.exit('evals: the key (controller, ga_seed, gen, cand_id, v, mu, attempt) is not unique (S04 8; S4C-13)')
+
+
+def log_phase(out, entry):
+    p = os.path.join(out, 'phases.json')
+    log = json.load(open(p, encoding='utf-8')) if os.path.isfile(p) else []
+    log.append(dict(entry, ended=time.strftime('%Y-%m-%d %H:%M:%S')))
+    with open(p, 'w', encoding='utf-8') as f:
+        json.dump(log, f, indent=1)
+
+
+def write_root_meta(out, dll, lock, running=None):
+    """S4C-12: <out>/meta.yaml of S04 8, rewritten at the start of a trial (before any GA run) and after
+    every phase. Only JSON values (valid YAML)."""
+    p = os.path.join(out, 'phases.json')
+    phases = json.load(open(p, encoding='utf-8')) if os.path.isfile(p) else []
+    fw_info = json.load(open(os.path.join(os.path.dirname(dll), 'fwsim_build.json'), encoding='utf-8')) \
+        if os.path.isfile(os.path.join(os.path.dirname(dll), 'fwsim_build.json')) else None
+    import pymoo
+    common = lock.get('common', {})
+    ctrls = {}
+    for c, L in lock.get('controllers', {}).items():
+        ctrls[c] = {k: L.get(k) for k in ('tool_check', 'domain', 'speeds', 'eval_mu', 'mu_decision', 'mu_rule_report',
+                                          'pop', 'n_gen', 'gen_rule', 'seeds', 'hv_ref', 'default_f2', 'preconditions',
+                                          'stop')}
+        ctrls[c]['plant_by_mu'] = {repr(m): json.loads(fwsim.plant_meta(fwsim.plant_params(
+            argparse.Namespace(ground='traction', mu=m)))) for m in (L.get('eval_mu') or [])}
+    lines = dict(spec='S04 v5 (06_SPECS/2026-11-05_Spec_S04_GA_chon_gain.md)', date=time.strftime('%Y-%m-%d'),
+                 setup='sim: fwsim, ESP32 firmware C code (DLL) + rpi5/plant_step.py, NOT hardware',
+                 operator='Claude (phiên CODE)', tool_check=common.get('tool_check'),
+                 not_main_numbers=bool(common.get('tool_check')), running=running,
+                 script=s3.git_state(os.path.join(HERE, '..')), fwsim_build=fw_info,
+                 s03_run=common.get('s03_run'), s03_mu_levels=common.get('s03_mu_levels'),
+                 fingerprint=common.get('fingerprint'),
+                 pymoo=dict(version=pymoo.__version__, checked_version=PYMOO_CHECKED, constraint_handling=PYMOO_CV,
+                            recheck=pymoo.__version__ != PYMOO_CHECKED),
+                 selection_rule=SELECTION_RULE, D=D, imu=s3.IMU, plant_seed=s3.SEED, controllers=ctrls,
+                 phases=phases, elapsed_s=sum(int(x.get('elapsed_s', 0)) for x in phases),
+                 files=('lock.yaml, phases.json, trial/<controller>/, history/evals/hv/pareto/final_population/'
+                        'selected[_<controller>].csv, meta_<controller>.yaml, post_checks/'))
+    with open(os.path.join(out, 'meta.yaml'), 'w', encoding='utf-8') as f:
+        f.write('# S04 run folder (written by fwsim/s04_ga.py; every value is JSON, so the file is valid YAML)\n')
+        for k, v in lines.items():
+            f.write(f'{k}: {json.dumps(v, ensure_ascii=False, default=str)}\n')
+
+
 def merge_controllers(out):
-    """history.csv, evals.csv, hv.csv, pareto.csv, selected.csv over the controllers run so far."""
-    for name in ('history', 'evals', 'hv', 'pareto', 'selected'):
+    """history.csv, evals.csv, hv.csv, pareto.csv, final_population.csv, selected.csv over the controllers run so far."""
+    for name in ('history', 'evals', 'hv', 'pareto', 'final_population', 'selected'):
         rows = []
         for ctrl in s3.CONTROLLERS:
             p = os.path.join(out, f'{name}_{ctrl}.csv')
@@ -743,8 +951,13 @@ def merge_controllers(out):
                 w.writerows(rows)
 
 
-def write_meta(path, a, fw, ctrl, extra, pymoo):
+def write_meta(path, a, fw, ctrl, extra, pymoo, eval_mu):
+    """Per-controller meta (trial/<ctrl>/meta.yaml, meta_<ctrl>.yaml). S4C-11: every string written with
+    json.dumps (a Windows path in a YAML double-quoted scalar is not valid YAML); S4C-12: the plant of
+    every mu of the evaluation, not a fixed mu."""
     b = fw.build_info
+    plant = {repr(m): json.loads(fwsim.plant_meta(fwsim.plant_params(argparse.Namespace(ground='traction', mu=m))))
+             for m in eval_mu}
     with open(path, 'w', encoding='utf-8') as f:
         f.write(f"""spec: S04 v5 (06_SPECS/2026-11-05_Spec_S04_GA_chon_gain.md)
 date: {time.strftime('%Y-%m-%d')}
@@ -757,10 +970,10 @@ script: {json.dumps(s3.git_state(os.path.join(HERE, '..')))}
 firmware:
   esp32: {json.dumps(b.get('esp32'))}
   hil_framework_at_build: {json.dumps(b.get('hil_framework'))}
-  compiler: "{b.get('compiler')}"
+  compiler: {json.dumps(b.get('compiler'))}
   dll_sha256: {s3.sha256_file(a.dll)}
-s03_run: "{os.path.abspath(a.s03)}"
-plant: {fwsim.plant_meta(fwsim.plant_params(argparse.Namespace(ground='traction', mu=0.5)))}
+s03_run: {json.dumps(os.path.abspath(a.s03))}
+plant_by_mu: {json.dumps(plant)}
 imu: {json.dumps(s3.IMU)}
 plant_seed: {s3.SEED}
 objectives: "f1 = max e_perp_max over the evaluation runs (m); f2 = max over mu of the mean over the gate speeds of tv_duty (1/s); minimised"
@@ -771,7 +984,9 @@ libraries: {json.dumps(fwsim.lib_versions())}
 interpretations:   # of this script, not written in S04 v5; Liam or THESIS correct if wrong
   - "a new script fwsim/s04_ga.py (S04 9.1 names tune_ga.py): tune_ga.py keeps its velocity objective for the old runs, unchanged"
   - "mu rule: every S03 design point that ran (centre, outer, inner box: the inner box always runs since L41), every gate speed; status other than ok (track_err, run_error) or y1 inconclusive at any mu is 'not satisfied'"
-  - "HV: exact 2-D staircase on the feasible non-dominated points of the population after each generation's survival, strictly inside the reference; the trial rule compares generation gen_base with gen_base - 5 (15 and 20)"
+  - "HV: exact 2-D staircase on the feasible non-dominated points of the population after each generation's survival, strictly inside the reference; the trial rule compares generation gen_base with gen_base - 5 (15 and 20); with --tool-check and gen_base < 6 with generation 1"
+  - "pareto.csv: the feasible non-dominated points of each seed's final population; final_population.csv: every point of it with a non-dominated flag (S04 8)"
+  - "the HV reference is locked only from a valid run of the default gains (no run_error, f2 finite and > 0); otherwise the trial stops"
   - "per seed set (section 5): the feasible non-dominated points of the final population (pymoo algorithm.pop after the last generation)"
   - "run_error: attempt 2 in a new process is recorded with 'cause' empty; the candidate is scored as the first attempt (S04 3); CODE fills 'cause' when it finds a tool error"
   - "R sensitivity: motor_R of the four wheels x 0.8, 0.9, 1.0, 1.1, 1.2 (S04 6 says +-20 %), every other plant parameter as params.py (J, b not rescaled)"

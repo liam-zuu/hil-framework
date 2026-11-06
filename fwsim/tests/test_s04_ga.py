@@ -92,7 +92,8 @@ def test_score_run_error_penalty():
 
 # ── domain, mu rule (sections 2, 3) ──────────────────────────────────────────────────
 
-def _s03_dir(tmp_path, runs=None, trial=False, mu=(0.4, 0.5, 0.6)):
+def _s03_dir(tmp_path, runs=None, trial=False, mu=(0.4, 0.5, 0.6), levels=None):
+    """levels: {controller: {factor: (L, H)}}; default a synthetic domain."""
     d = tmp_path / 's03'
     (d / 'sealed').mkdir(parents=True)
     with open(d / 'levels.csv', 'w', newline='') as f:
@@ -100,8 +101,14 @@ def _s03_dir(tmp_path, runs=None, trial=False, mu=(0.4, 0.5, 0.6)):
         w.writerow(['controller', 'factor', 'L', 'H', 'centre', 'scale', 'default', 'rule_note'])
         for c in s3.CONTROLLERS:
             for k, n in enumerate(s3.FACTORS[c]):
-                L, H = (0.5, 8.0) if k % 2 == 0 else (1.0, 3.0)
-                w.writerow([c, n, L, H, '', 'log' if H / L >= 4 else 'lin', '', ''])
+                L, H = levels[c][n] if levels else ((0.5, 8.0) if k % 2 == 0 else (1.0, 3.0))
+                w.writerow([c, n, L, H, '', 'log' if L > 0 and H / L >= 4 else 'lin', '', ''])
+    with open(d / 'design.csv', 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['controller', 'point_id', 'box'])
+        for c in s3.CONTROLLERS:
+            for pid, box in [(0, 'centre'), (1, 'outer'), (129, 'inner')]:
+                w.writerow([c, pid, box])
     y3 = {f'{c} v={v:g}': 5.0 for c in s3.CONTROLLERS for v in s3.SPEEDS}
     (d / 'meta.yaml').write_text(
         f'trial: {str(trial).lower()}     # x\nstatus: "ran to the end"\nmu_levels: {json.dumps(list(mu))}\n'
@@ -158,12 +165,31 @@ def test_mu_rule_all_when_one_point_fails(tmp_path, mod, why):
     assert dec == 'all' and rep['points_failing'] >= 1 and any(why in w for w in rep['first'][0]['why'])
 
 
-def test_mu_rule_tolerances_are_inclusive(tmp_path):
+@pytest.mark.parametrize('e, tv, dec', [
+    (0.04, 6.0, 'mid'),            # exactly on both bounds: 0.04 - 0.03 = 0.010000000000000002 in binary64 (S4C-14)
+    (0.02, 4.0, 'mid'),            # the bounds below the middle mu
+    (0.0401, 5.0, 'all'),          # just outside dY2
+    (0.03, 6.001, 'all'),          # just outside dY3 (20 % of the reference 5.0)
+])
+def test_mu_rule_tolerances_are_inclusive_at_the_bound(tmp_path, e, tv, dec):
     def mod(r):
         if r['point_id'] == 1 and r['mu'] == 0.4:
-            r.update(e_perp_max=0.03 + 0.01 - 1e-12, tv_duty=5.0 + 0.2 * 5.0 - 1e-9)
-    dec, _ = s4.mu_rule(str(_s03_dir(tmp_path, _runs(mod))), 'PID', list(s3.SPEEDS), [0.4, 0.5, 0.6])
-    assert dec == 'mid'
+            r.update(e_perp_max=e, tv_duty=tv)
+    assert s4.mu_rule(str(_s03_dir(tmp_path, _runs(mod))), 'PID', list(s3.SPEEDS), [0.4, 0.5, 0.6])[0] == dec
+
+
+def test_mu_rule_refuses_missing_or_duplicate_runs(tmp_path):
+    """S4C-5: a design point missing at a gate speed, a duplicate run or a point not in design.csv
+    stops the rule; it never concludes 'mid' on a partial S03 table."""
+    runs = [r for r in _runs() if not (r['point_id'] == 129 and r['v'] == 0.8)]
+    with pytest.raises(SystemExit, match='no run of PID point 129'):
+        s4.mu_rule(str(_s03_dir(tmp_path / 'a', runs)), 'PID', list(s3.SPEEDS), [0.4, 0.5, 0.6])
+    runs = _runs() + [dict(_runs()[0], status='ok')]
+    with pytest.raises(SystemExit, match='duplicate'):
+        s4.mu_rule(str(_s03_dir(tmp_path / 'b', runs)), 'PID', list(s3.SPEEDS), [0.4, 0.5, 0.6])
+    runs = _runs() + [dict(r, point_id=7) for r in _runs() if r['point_id'] == 1]
+    with pytest.raises(SystemExit, match='not in design.csv'):
+        s4.mu_rule(str(_s03_dir(tmp_path / 'c', runs)), 'PID', list(s3.SPEEDS), [0.4, 0.5, 0.6])
 
 
 def test_mu_rule_only_gate_speeds(tmp_path):
@@ -187,6 +213,25 @@ def test_summary_union_and_infeasible_seeds():
     assert per[0]['f1'] == 0.020 and send['kind'] == 'send_to_HIL' and send['f1'] == 0.022 and send['ga_seed'] == 2
     assert send['a'] == repr(1.3) and float(send['a_f32']) == float(np.float32(1.3))
     assert stats['n_feasible_seeds'] == 2 and stats['per_seed_selected']['f1']['median'] == pytest.approx(0.021)
+
+
+@pytest.mark.parametrize('order', [0, 1, 2])
+def test_summary_union_is_not_two_level(order):
+    """S4C-15: seed 1 has A (0.020, 3) and B (0.029, 1) -> picks B; seed 2 has C (0.015, 4). On the
+    union of the sets f1* = 0.015, keep f1 <= 0.025: A wins (f2 3). Choosing among the per-seed picks
+    (B, C) would give C. Point order inside a seed must not matter."""
+    dom = [dict(name='a', L=1.0, H=2.0, scale='lin')]
+    s1 = [P(0.020, 3.0, x=(1.1,), seed=1), P(0.029, 1.0, x=(1.2,), seed=1)]
+    if order:
+        s1 = s1[::-1]
+    finals = {1: s1, 2: [P(0.015, 4.0, x=(1.3,), seed=2)]}
+    if order == 2:
+        finals = {2: finals[2], 1: finals[1]}
+    rows, _ = s4.summarise('PID', dom, finals)
+    per = {r['ga_seed']: r for r in rows if r['kind'] == 'per_seed'}
+    assert per[1]['f1'] == 0.029 and per[2]['f1'] == 0.015
+    send = rows[-1]
+    assert (send['f1'], send['f2'], send['ga_seed']) == (0.020, 3.0, 1)
 
 
 def test_summary_stops_when_more_than_half_infeasible():
@@ -236,13 +281,167 @@ def test_guard_l56_and_preconditions_and_budget(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, 'argv', base + ['--seeds', '1', '2'])
     with pytest.raises(SystemExit, match='seeds 1-5'):
         s4.main()
+    monkeypatch.setattr(sys, 'argv', base + ['--s03-unsealed', '--gate-speeds', '0.2'])       # S4C-3
+    with pytest.raises(SystemExit, match='gate speeds are those of the S03 run'):
+        s4.main()
+    monkeypatch.setattr(sys, 'argv', base + ['--tool-check', '--seeds', '1', '1'])            # S4C-13
+    with pytest.raises(SystemExit, match='repeated seed'):
+        s4.main()
     if os.path.isfile(_DLL):
-        pre = tmp_path / 'pre.json'
-        pre.write_text(json.dumps(dict(s03_run_and_locked='x', final_test_set_locked='', ctrl_imu_checked_on_board='y',
-                                       x3_compared='z')))
-        monkeypatch.setattr(sys, 'argv', base + ['--s03-unsealed', '--dll', _DLL, '--preconditions', str(pre)])
-        with pytest.raises(SystemExit, match='final_test_set_locked'):
-            s4.main()
+        for bad in ('', None, False, 0, [], {}):                                             # S4C-4
+            pre = tmp_path / 'pre.json'
+            pre.write_text(json.dumps(dict(s03_run_and_locked='x', final_test_set_locked=bad,
+                                           ctrl_imu_checked_on_board='y', x3_compared='z')))
+            monkeypatch.setattr(sys, 'argv', base + ['--s03-unsealed', '--dll', _DLL, '--preconditions', str(pre)])
+            with pytest.raises(SystemExit, match='final_test_set_locked'):
+                s4.main()
+
+
+def _lock(out, d, tool_check_common, tool_check_ctrl=None, fp=None, pre=None, budget=None):
+    pop, base, mx = budget or (s4.POP, s4.GEN_BASE, s4.GEN_MAX)
+    L = dict(tool_check=tool_check_common if tool_check_ctrl is None else tool_check_ctrl,
+             domain=s4.read_domain(str(d), 'PID'), s03_run=os.path.abspath(str(d)), speeds=list(s3.SPEEDS),
+             eval_mu=[0.5], pop=pop, n_gen=base, gen_rule=dict(base=base, max=mx), seeds=list(s4.SEEDS),
+             preconditions=pre if pre is not None else {k: 'x' for k in s4.PRECONDITIONS}, hv_ref=[s4.D, 50.0],
+             stop=None)
+    out.mkdir(parents=True, exist_ok=True)
+    lock = dict(controllers=dict(PID=L), common=dict(tool_check=tool_check_common, s03_run=os.path.abspath(str(d)),
+                                                    fingerprint=fp or s4.fingerprint(_DLL, str(d)),
+                                                    s03_mu_levels=[0.4, 0.5, 0.6]), s03_mu_levels=[0.4, 0.5, 0.6])
+    (out / 'lock.yaml').write_text(json.dumps(lock))
+
+
+@needs_dll
+def test_guard_one_mode_and_one_source_per_folder(tmp_path, monkeypatch):
+    """S4C-1: a tool-check lock never turns into a main-run lock; S4C-2: a changed DLL / S03 / plant /
+    script fingerprint stops the main phase and the post checks."""
+    d = _s03_dir(tmp_path, _runs())
+    out = tmp_path / 'o'
+    pre = tmp_path / 'pre.json'
+    pre.write_text(json.dumps({k: 'checked in x' for k in s4.PRECONDITIONS}))
+    main_trial = ['s04_ga.py', '--phase', 'trial', '--controller', 'ADRC', '--s03', str(d), '--s03-unsealed',
+                  '--preconditions', str(pre), '--dll', _DLL, '--out', str(out)]
+    _lock(out, d, True)                                    # PID trial was a tool check
+    monkeypatch.setattr(sys, 'argv', main_trial)
+    with pytest.raises(SystemExit, match='never share a folder'):
+        s4.main()
+    main_pid = ['s04_ga.py', '--phase', 'main', '--controller', 'PID', '--s03', str(d), '--s03-unsealed',
+                '--dll', _DLL, '--out', str(out)]
+    _lock(out, d, False, tool_check_ctrl=True)             # common flag forged to false, PID locked as a tool check
+    monkeypatch.setattr(sys, 'argv', main_pid)
+    with pytest.raises(SystemExit, match='differ in --tool-check'):
+        s4.main()
+    _lock(out, d, False, budget=(6, 3, 5))                 # main flag but a small budget in the lock
+    with pytest.raises(SystemExit, match='not a main-run lock'):
+        s4.main()
+    _lock(out, d, False, pre={})                           # main flag but no preconditions
+    with pytest.raises(SystemExit, match='not a main-run lock'):
+        s4.main()
+    fp = s4.fingerprint(_DLL, str(d))
+    _lock(out, d, False, fp=dict(fp, dll_sha256='0' * 64))
+    with pytest.raises(SystemExit, match='dll_sha256'):
+        s4.main()
+    _lock(out, d, False, fp=dict(fp, s03_files=dict(fp['s03_files'], **{'levels.csv': 'x'})))
+    with pytest.raises(SystemExit, match='s03_files'):
+        s4.main()
+
+
+# ── GA loop: generation rule, re-evaluation, run_error (sections 3, 4.3) ─────────────
+
+class FakeEv:
+    """Deterministic candidate scores from the gains, no fwsim."""
+    ctrl = 'PID'
+
+    def __init__(self):
+        self.calls = []
+
+    def candidate(self, g, ga_seed, gen, cand):
+        v = list(g.values())
+        self.calls.append((gen, cand))
+        f1 = 0.01 + 0.05 * abs(v[0] - 1.5)
+        f2 = 1.0 + abs(v[1] - 2.0) + 0.1 * v[0]
+        return dict(f1=f1, f2=f2, g1=0.0, g2=(f1 - s4.D) / s4.D, status='ok', n_runs=1, n_false=0, n_inconclusive=0,
+                    n_track_err=0, n_run_error=0)
+
+
+DOM2 = [dict(name='a', L=1.0, H=2.0, scale='lin'), dict(name='b', L=1.0, H=3.0, scale='lin')]
+
+
+@pytest.mark.parametrize('hv_seq, extended, n_gen', [
+    ([1.0, 1.0, 1.0], False, 3),           # HV_3 vs HV_1 (gen_compare(3) = 1): no gain -> stop at gen_base
+    ([1.0, 1.0, 1.5], True, 5),            # (1.5 - 1.0) / 1.5 > 1 % -> go on to gen_max
+    ([1.0, 1.0, 1.005], False, 3),         # 0.5 % -> stop
+    ([0.0, 0.0, 0.0], True, 5),            # HV_base = 0 -> go on
+])
+def test_generation_rule_branches(monkeypatch, hv_seq, extended, n_gen):
+    """S4C-16: each branch of the S04 4.3 rule forced through a fake HV sequence."""
+    seq = iter(hv_seq + [9.0] * 10)
+    monkeypatch.setattr(s4, 'hypervolume', lambda feas, ref: (next(seq), 0))
+    hist, hv_rows = [], []
+    _, g, ext = s4.run_seed(FakeEv(), DOM2, 1, 6, None, (s4.D, 50.0), hist, hv_rows, ext=(3, 5), log=lambda *_: None)
+    assert (ext, g, len(hv_rows)) == (extended, n_gen, n_gen)
+
+
+def test_gen_compare_is_gen_base_minus_5():
+    assert s4.gen_compare(20) == 15 and s4.gen_compare(3) == 1 and s4.gen_compare(1) == 1
+
+
+def test_extended_trial_equals_a_straight_run(monkeypatch):
+    """S4C-16: the trial that goes on to gen_max is the same NSGA-II run as one of gen_max generations."""
+    n = iter(range(1, 100))
+    monkeypatch.setattr(s4, 'hypervolume', lambda feas, ref: (float(next(n)), 0))     # rising HV: extends
+    ev1, ev2 = FakeEv(), FakeEv()
+    h1, h2 = [], []
+    f1, g1, e1 = s4.run_seed(ev1, DOM2, 3, 6, None, (s4.D, 1e9), h1, [], ext=(2, 5), log=lambda *_: None)
+    f2, g2, _ = s4.run_seed(ev2, DOM2, 3, 6, 5, (s4.D, 1e9), h2, [], log=lambda *_: None)
+    assert e1 and g1 == g2 == 5
+    assert [r['x_a'] for r in h1] == [r['x_a'] for r in h2] and ev1.calls == ev2.calls
+    assert [p['xga'] for p in f1] == [p['xga'] for p in f2]
+    assert all(p['gen'] != '' and p['id_note'] == '' for p in f1)       # every final point maps to its evaluation
+
+
+def test_points_of_maps_to_the_evaluation_with_the_same_scores():
+    """S4C-6: a vector evaluated twice with different results points to the evaluation whose F, G it holds."""
+    class Ind:
+        X = np.array([1.2, 2.0])
+        F = np.array([0.03, 4.0])
+        G = np.array([0.0, -0.7])
+    key = np.asarray(Ind.X, dtype=float).tobytes()
+    seen = {key: [(1, 4, (1e6, 1e6, 3.0, 1e6)), (3, 2, (0.03, 4.0, 0.0, -0.7))]}
+    p = s4.points_of([Ind()], DOM2, 1, seen)[0]
+    assert (p['gen'], p['cand_id']) == (3, 2) and 'more than once' in p['id_note']
+
+
+def test_run_error_retry_ok_keeps_the_first_attempt_penalty(monkeypatch):
+    """S04 3 (B8b-20): a run_error is run once more in a new process for diagnosis; even when that
+    attempt succeeds, the candidate keeps the penalty of the first attempt."""
+    ok = dict(status='ok', completed='true', e_perp_max=0.02, tv_duty=4.0)
+    calls = iter([(ok, None), (dict(status='run_error', completed='', error='x'), None)])
+    monkeypatch.setattr(s3, 'safe_run', lambda *a, **k: next(calls))
+    monkeypatch.setattr(s3, 'run_in_new_process', lambda dll, jobs, work: [dict(row=ok, digest=None)])
+    ev = s4.Evaluator(None, 'x.dll', 'PID', [0.2, 0.5], [0.5], 'w')
+    s = ev.candidate({}, 1, 1, 0)
+    assert (s['status'], s['f1'], s['g1']) == ('run_error', s4.PENALTY, 2.0)
+    assert [(e['v'], e['attempt'], e['status']) for e in ev.evals] == [(0.2, 1, 'ok'), (0.5, 1, 'run_error'),
+                                                                       (0.5, 2, 'ok')]
+
+
+def test_three_mu_findings_flag_track_err_even_when_completed():
+    """S4C-9."""
+    rows = [dict(controller='PID', v=0.2, mu=0.4, status='track_err', completed='true', e_perp_max=0.03),
+            dict(controller='PID', v=0.5, mu=0.4, status='ok', completed='true', e_perp_max=0.03),
+            dict(controller='PID', v=0.8, mu=0.6, status='ok', completed='true', e_perp_max=0.2)]
+    f = s4.three_mu_findings(rows, 'PID')
+    assert len(f) == 2 and 'track_err' in f[0] and 'v=0.8' in f[1]
+
+
+def test_plant_dump_keeps_nested_values():
+    """S4C-8: every attribute, nested objects included."""
+    p = fwsim.plant_params(__import__('argparse').Namespace(ground='traction', mu=0.5))
+    d = s4.plant_dump(p)
+    assert set(d) == set(vars(p))
+    assert isinstance(d['slip'], dict) and d['slip']                      # a nested object, not dropped
+    json.dumps(d)
 
 
 # ── end to end, tiny budget (needs the DLL) ──────────────────────────────────────────
@@ -251,33 +450,58 @@ def test_guard_l56_and_preconditions_and_budget(tmp_path, monkeypatch):
 def test_tool_check_three_phases(tmp_path, monkeypatch, capsys):
     """trial -> lock.yaml, main (2 seeds) -> selected.csv with a send_to_HIL row whose gains read back
     from the file reproduce every GA run bit for bit in a new process (post)."""
-    d = _s03_dir(tmp_path, trial=True, mu=(0.5,))
+    yaml = pytest.importorskip('yaml')
+    fw = fwsim.FirmwareSim(_DLL)                  # a domain around the firmware defaults: both controllers feasible
+    lv = {c: {n: ((v * 0.8, v * 1.25) if v > 0 else (0.0, 0.1)) for n, v in s3.defaults(fw, c).items()}
+          for c in s3.CONTROLLERS}
+    d = _s03_dir(tmp_path, trial=True, mu=(0.5,), levels=lv)
     out = tmp_path / 'run'
-    common = ['--tool-check', '--controller', 'PID', '--s03', str(d), '--pop', '4', '--gen-base', '1',
-              '--gen-max', '2', '--dll', _DLL, '--out', str(out)]
-    monkeypatch.setattr(sys, 'argv', ['s04_ga.py', '--phase', 'trial'] + common)
-    assert s4.main() in (0, 2)
+    for ctrl in s3.CONTROLLERS:
+        common = ['--tool-check', '--controller', ctrl, '--s03', str(d), '--pop', '4', '--gen-base', '1',
+                  '--gen-max', '2', '--dll', _DLL, '--out', str(out)]
+        monkeypatch.setattr(sys, 'argv', ['s04_ga.py', '--phase', 'trial'] + common)
+        assert s4.main() in (0, 2)
+        assert yaml.safe_load(open(out / 'meta.yaml', encoding='utf-8'))['tool_check'] is True    # S4C-12
     lock = json.load(open(out / 'lock.yaml'))
-    L = lock['controllers']['PID']
-    assert L['eval_mu'] == [0.5] and L['n_gen'] in (1, 2) and L['hv_ref'][0] == s4.D and lock['tool_check']
-    monkeypatch.setattr(sys, 'argv', ['s04_ga.py', '--phase', 'main', '--seeds', '1', '2'] + common)
-    s4.main()
+    for ctrl in s3.CONTROLLERS:
+        L = lock['controllers'][ctrl]
+        assert L['eval_mu'] == [0.5] and L['n_gen'] in (1, 2) and L['hv_ref'][0] == s4.D and L['tool_check']
+        assert L['gen_rule']['compared_with'] == 1
+    assert lock['common']['tool_check'] is True
+    for ctrl in s3.CONTROLLERS:
+        monkeypatch.setattr(sys, 'argv', ['s04_ga.py', '--phase', 'main', '--tool-check', '--controller', ctrl,
+                                          '--s03', str(d), '--seeds', '1', '2', '--dll', _DLL, '--out', str(out)])
+        s4.main()
     evals = list(csv.DictReader(open(out / 'evals.csv')))
     keys = [(e['controller'], e['ga_seed'], e['gen'], e['cand_id'], e['v'], e['mu'], e['attempt']) for e in evals]
-    assert len(keys) == len(set(keys))                                   # S04 8: unique key
+    assert len(keys) == len(set(keys)) and {e['controller'] for e in evals} == set(s3.CONTROLLERS)   # S04 8
     sel = list(csv.DictReader(open(out / 'selected.csv')))
-    send = [r for r in sel if r['kind'] == 'send_to_HIL'][0]
     hist = list(csv.DictReader(open(out / 'history.csv')))
-    h = next(r for r in hist if (r['ga_seed'], r['gen'], r['cand_id']) == (send['ga_seed'], send['gen'], send['cand_id']))
-    assert float(h['f1']) == float(send['f1'])                           # selected row is a GA candidate
+    for send in (r for r in sel if r['kind'] == 'send_to_HIL'):
+        h = next(r for r in hist if (r['controller'], r['ga_seed'], r['gen'], r['cand_id']) ==
+                 (send['controller'], send['ga_seed'], send['gen'], send['cand_id']))
+        assert float(h['f1']) == float(send['f1'])                       # selected row is a GA candidate
+    par = list(csv.DictReader(open(out / 'pareto.csv')))
+    pop = list(csv.DictReader(open(out / 'final_population.csv')))
+    assert par and all(r['nondominated_feasible'] == 'true' for r in par) and len(pop) >= len(par)   # S4C-17
     monkeypatch.setattr(sys, 'argv', ['s04_ga.py', '--phase', 'post', '--dll', _DLL, '--out', str(out)])
     assert s4.post(s4_args(out)) == 0
-    det = list(csv.DictReader(open(out / 'post_checks' / 'determinism.csv')))
-    assert det and all(r['equal'] == 'true' for r in det)
-    sens = list(csv.DictReader(open(out / 'post_checks' / 'sensitivity.csv')))
-    assert {r['r_factor'] for r in sens} == {repr(k) for k in s4.R_FACTORS}
-    changed = [json.loads(r['plant_changed']) for r in sens if r['r_factor'] != '1.0']
+    pc = out / 'post_checks'
+    det = list(csv.DictReader(open(pc / 'determinism.csv')))
+    assert det and all(r['equal'] == 'true' and r['tool_check'] == 'true' for r in det)
+    sens = list(csv.DictReader(open(pc / 'sensitivity.csv')))
+    assert {r['r_factor'] for r in sens if r['check'] == 'r_factor'} == {repr(k) for k in s4.R_FACTORS}
+    assert {r['b0_factor'] for r in sens if r['check'] == 'b0_factor'} == {repr(k) for k in s4.B0_FACTORS}
+    changed = [json.loads(r['plant_changed']) for r in sens if r['check'] == 'r_factor' and r['r_factor'] != '1.0']
     assert changed and all(set(c) == {'motor_R'} for c in changed)       # only R changes (S04 6)
+    full = json.load(open(pc / 'plant_params.json'))['entries']          # S4C-8
+    assert any('r_factor=1.2' in k for k in full) and all(set(v) == {'before', 'after'} for v in full.values())
+    notes = json.load(open(pc / 'notes.json'))
+    assert notes['tool_check'] is True                                   # S4C-10
+    assert notes['notes']['PID three_mu']['done'] is False and 'NOT done' in notes['notes']['PID three_mu']['note']
+    for p in [out / 'meta.yaml', out / 'meta_PID.yaml', out / 'meta_ADRC.yaml', out / 'trial' / 'PID' / 'meta.yaml',
+              out / 'trial' / 'ADRC' / 'meta.yaml', out / 'lock.yaml']:
+        yaml.safe_load(open(p, encoding='utf-8'))                        # S4C-11: valid YAML on Windows paths
 
 
 def s4_args(out):
