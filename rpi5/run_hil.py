@@ -509,6 +509,13 @@ def main() -> int:
         args.traj, args.mock, args.steps, args.spi_speed // 1_000,
     )
 
+    # L34 (Codex S3D-3): blobs read in this process just before the plant process starts (it
+    # imports the same files from this folder), and again after it; both go to the step-log JSON
+    plant_src_before = None
+    if step_csv is not None:
+        from plant_blob import plant_source
+        plant_src_before = plant_source()
+
     for proc in procs:
         proc.start()
         log.info("  %s  pid=%d", proc.name, proc.pid)
@@ -538,8 +545,10 @@ def main() -> int:
         # the whole command line: shows the load of the run (e.g. --frame-log shared with S06 T1)
         meta['argv'] = sys.argv
         meta['uname'] = ' '.join(platform.uname())       # X8: the kernel of the run
-        from plant_blob import plant_source               # L34 (Codex S3C-18): same files, this folder
-        meta['plant_src'] = plant_source()
+        from plant_blob import plant_source               # L34 (Codex S3C-18, S3D-3): same files, this folder
+        meta['plant_src'] = plant_src_before
+        meta['plant_src_after'] = plant_source()
+        meta['plant_src_changed'] = meta['plant_src_after'] != plant_src_before
         with open(args.step_log + '.json', 'w') as f:
             json.dump(meta, f, indent=1)
         log.info('Step log: %d rows -> %s; overflow=%d lost_or_torn=%d', meta['rows'], args.step_log,

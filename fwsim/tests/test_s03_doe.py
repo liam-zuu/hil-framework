@@ -189,6 +189,25 @@ def test_v7_measurement_error_on_the_lane_normal(path):
     assert math.isnan(res['e_meas_perp_max']) and 'O6-11' in res['e_meas_note']
 
 
+def test_v7_pose_change_after_t_end_keeps_e_meas(path):
+    """Codex S3D-1: run_active low or a second reset AFTER the run ended (t_end, before the
+    deadline) is outside the run: e_meas_perp_max stays a number; inside the run it is NaN."""
+    sch = o1.Schedule(0.5)
+    base, _ = o1.evaluate_v7(_with_fw_pose(_ideal(sch), 0.03), path, sch)
+    assert base['completed'] == 'true' and base['t_end'] < sch.Tcmd + o1.T_LATE - 0.2
+    P = {n: i for i, n in enumerate(fwsim.POS_COLS)}
+    for col, val in (('run_active', 0), ('pos_reset_n', 2)):
+        log = _with_fw_pose(_ideal(sch), 0.03)
+        log['pos'][log['t'] > base['t_end'] + 0.1, P[col]] = val
+        res, _ = o1.evaluate_v7(log, path, sch)
+        assert res['t_end'] == base['t_end'] and res['e_meas_note'] == ''
+        assert res['e_meas_perp_max'] == pytest.approx(base['e_meas_perp_max'])
+        log = _with_fw_pose(_ideal(sch), 0.03)
+        log['pos'][log['t'] > base['t_end'] - 1.0, P[col]] = val
+        res, _ = o1.evaluate_v7(log, path, sch)
+        assert math.isnan(res['e_meas_perp_max']) and 'O6-11' in res['e_meas_note']
+
+
 def test_v7_untrusted_progress_keeps_the_window_open(path):
     """S3C-4: tracking error before the progress -> y1 inconclusive and the window runs to the
     last frame before the deadline, so duty chatter after the stop is counted."""
@@ -207,16 +226,30 @@ def test_v7_untrusted_progress_keeps_the_window_open(path):
     assert res['tv_duty'] > 0
 
 
-def test_v7_deadline_is_strict(path):
-    """S3C-23: a frame exactly at T_cmd + t_late is not 'before the deadline'."""
-    sch = o1.Schedule(0.8)
+def _still_from(sch, t_still):
+    """Ideal log, the car reported moving (0.1 m/s) before t_still, plus a frame exactly at the
+    deadline: conditions 2-5 first hold together when the car has been still for t_d."""
     log = _ideal(sch)
     deadline = sch.Tcmd + o1.T_LATE
     log['t'] = np.append(log['t'], deadline)
     for key in ('pose', 'v_true', 'pwm', 'duty'):
         log[key] = np.vstack([log[key], log[key][-1:]])
-    _, rows = o1.evaluate_v7(log, path, sch)
+    log['v_true'][log['t'] < t_still - 1e-9, 0] = 0.1
+    return log, deadline
+
+
+def test_v7_deadline_is_strict(path):
+    """S3C-23 (test of round 2): still for exactly t_d AT the deadline frame -> not completed;
+    still for t_d one frame (10 ms) before the deadline -> completed. Both on the same log
+    except where the stillness starts."""
+    sch = o1.Schedule(0.8)
+    log, deadline = _still_from(sch, sch.Tcmd + o1.T_LATE - o1.T_D)
+    res, rows = o1.evaluate_v7(log, path, sch)
     assert all(r['t'] < deadline for r in rows)
+    assert res['completed'] == 'false'
+    log, _ = _still_from(sch, sch.Tcmd + o1.T_LATE - o1.T_D - 0.02)
+    res, _ = o1.evaluate_v7(log, path, sch)
+    assert res['completed'] == 'true' and res['t_end'] < deadline
 
 
 # ── S03 pieces ───────────────────────────────────────────────────────────────────────
@@ -403,6 +436,18 @@ def test_gains_reach_the_firmware_and_change_the_run(path):
             got = [fw.get_adrc(0)['omega_c'], fw.get_adrc(1)['omega_o'], fw.get_adrc(2)['omega_c'],
                    fw.get_adrc(2)['omega_o']]
         assert got == pytest.approx([g[n] for n in f[:4]], rel=1e-6)
+        # S3C-21 round 2: x and y share the xy gains; fixed parameters stay as after reset
+        fw.reset()
+        fw.set_mode(ctrl)
+        base = [fw.get_pid(i) for i in range(3)] if ctrl == 'PID' else [fw.get_adrc(i) for i in range(3)]
+        s3.run_one(fw, path, ctrl, g, 0.8, 0.5)
+        now = [fw.get_pid(i) for i in range(3)] if ctrl == 'PID' else [fw.get_adrc(i) for i in range(3)]
+        keys = (('kp', 'ki'), ('int_limit', 'out_limit', 'kd')) if ctrl == 'PID' else \
+            (('omega_c', 'omega_o'), ('b0', 'out_limit'))
+        for i in range(3):
+            want = (g[f[0]], g[f[1]]) if i < 2 else (g[f[2]], g[f[3]])
+            assert [now[i][k] for k in keys[0]] == pytest.approx(want, rel=1e-6)
+            assert [now[i][k] for k in keys[1]] == [base[i][k] for k in keys[1]]
         pm = fwsim.pos_meta(fw)
         assert pm['kp'] == pytest.approx(g['pos_kp'], rel=1e-6) and pm['ki'] == pytest.approx(g['pos_ki'], rel=1e-6)
         assert s3.log_digest(l1) != s3.log_digest(l0)
@@ -487,7 +532,12 @@ def test_main_pipeline_clean(tmp_path, monkeypatch, capsys):
     assert not (out / 'determinism_check.csv').exists() and not (out / '_work').exists()
     assert works and all(os.path.relpath(w, out).split(os.sep)[0] == 'sealed' for w in works)   # S3C-2
     runs = list(_csv.DictReader(open(out / 'sealed' / 'runs.csv')))
-    assert len(runs) == 2 * 129 * 3
+    assert len(runs) == 2 * (129 + 128) * 3                        # L41: the inner box always runs
+    assert sum(r['box'] == 'inner' for r in runs) == 2 * 128 * 3
+    design = list(_csv.DictReader(open(out / 'design.csv')))
+    assert len(design) == 2 * 257 and {r['box'] for r in design} == {'centre', 'outer', 'inner'}
+    effects = list(_csv.DictReader(open(out / 'sealed' / 'effects.csv')))
+    assert effects and {r['box'] for r in effects} == {'outer'}     # rule off: inner box not analysed
     assert all(float(r['t_end']) == 1.25 for r in runs)            # S3C-14: plain numbers
     assert {r['cond2_5_ever'] for r in runs} == {'true'}
     sweep = list(_csv.DictReader(open(out / 'sweep.csv')))
@@ -496,7 +546,7 @@ def test_main_pipeline_clean(tmp_path, monkeypatch, capsys):
     assert len(det) == 2 * 4 * 3 and all(r['log_arrays_equal'] == 'true' for r in det)
     assert len(list((out / 'sealed' / 'logs').glob('*.csv'))) == 2 * 4 * 3    # S03 3.4: log.csv of the 4 points
     meta = (out / 'meta.yaml').read_text(encoding='utf-8')
-    assert 'trial: true' in meta and 'determinism: "24/24 equal"' in meta
+    assert 'trial: true' in meta and 'determinism: "passed' in meta and 'equal' not in meta
     sha_line = next(l for l in meta.splitlines() if l.startswith('file_sha256:'))
     assert 'runs.csv' not in sha_line and 'notes.json' not in sha_line          # S3C-1
     assert 'inner' not in console.lower()
@@ -504,16 +554,24 @@ def test_main_pipeline_clean(tmp_path, monkeypatch, capsys):
 
 @needs_dll
 def test_main_inner_box_stays_sealed(tmp_path, monkeypatch, capsys):
-    """96/128 corners 'false' -> the inner box runs; no public file or console line differs from
-    a run where it does not (S3C-1..S3C-3), except the date and the timing line."""
+    """96/128 corners 'false' -> the rule of S03 3.2 is on and the inner box is analysed; no
+    public file or console line differs from a run where the rule is off (S3C-1..S3C-3), except
+    the date and the timing lines, and both runs make the same number of runs (L41: the run
+    time does not depend on the rule)."""
+    import csv as _csv
     import json as _json
-    code, out, console, _, _ = _run_main(tmp_path / 'a', monkeypatch, capsys, design_fail=True)
+    code, out, console, calls1, _ = _run_main(tmp_path / 'a', monkeypatch, capsys, design_fail=True)
     assert code == 0
     notes = _json.load(open(out / 'sealed' / 'notes.json'))
-    assert notes['inner_box_run'] == {'PID': True, 'ADRC': True}
-    assert (out / 'sealed' / 'design_inner.csv').stat().st_size > 0
-    code2, out2, console2, _, _ = _run_main(tmp_path / 'b', monkeypatch, capsys)
+    assert notes['inner_rule_speeds'] == {'PID': [0.2, 0.5, 0.8], 'ADRC': [0.2, 0.5, 0.8]}
+    effects = list(_csv.DictReader(open(out / 'sealed' / 'effects.csv')))
+    nc = notes['no_conclusion_speeds']
+    inner_eff = {(r['controller'], float(r['v'])) for r in effects if r['box'] == 'inner'}
+    assert inner_eff == {(c, v) for c in ('PID', 'ADRC') for v in (0.2, 0.5, 0.8) if v not in nc[c]}
+    assert inner_eff                                      # the rule is on: the inner box is analysed
+    code2, out2, console2, calls2, _ = _run_main(tmp_path / 'b', monkeypatch, capsys)
     assert code2 == 0
+    assert len(calls1) == len(calls2)
     pub1, pub2 = _public_text(out), _public_text(out2)
     assert set(pub1) == set(pub2)
     for name in pub1:
@@ -530,10 +588,14 @@ def test_main_inner_box_stays_sealed(tmp_path, monkeypatch, capsys):
 def test_main_stops_everything_when_a_default_fails(tmp_path, monkeypatch, capsys):
     """S3C-9: a default that does not complete at a gate speed stops S03 for both controllers
     before any sweep (3.1 (i))."""
+    import csv as _csv
     code, out, console, calls, _ = _run_main(tmp_path, monkeypatch, capsys, default_fails=True)
     assert code == 2 and '3.1 (i)' in console
     assert len(calls) == 3                                   # PID defaults at the 3 speeds, then stop
     assert (out / 'design.csv').read_text().strip() == ''
+    sweep = list(_csv.DictReader(open(out / 'sweep.csv')))   # S3D-4: the default check is recorded
+    assert [(r['factor'], r['v'], r['completed']) for r in sweep] == [
+        ('(default check)', '0.2', 'true'), ('(default check)', '0.5', 'true'), ('(default check)', '0.8', 'false')]
     assert 'stopped in the sweep' in (out / 'meta.yaml').read_text(encoding='utf-8')
 
 
@@ -550,6 +612,8 @@ def test_main_run_error_in_the_design_is_recorded_and_sealed(tmp_path, monkeypat
     rows = list(_csv.DictReader(open(out / 'sealed' / 'runs.csv')))
     assert rows[-1]['status'] == 'run_error' and 'FakeError' in rows[-1]['error']
     assert 'FakeError' in (out / 'sealed' / 'stop.json').read_text()
+    design = list(_csv.DictReader(open(out / 'design.csv')))         # S3C-3 (c): written before the run
+    assert {r['controller'] for r in design} == {'PID', 'ADRC'} and len(design) == 2 * 257
 
 
 def test_gate_speeds_must_be_task_speeds(tmp_path, monkeypatch):
@@ -567,6 +631,7 @@ def test_scale_tolerance_on_the_real_grid():
     sc, centre = s3.scale_of(L, 48.0)
     assert sc == 'log' and centre == pytest.approx(24.0)
     assert s3.scale_of(12.1, 48.0)[0] == 'lin'
+    assert s3.scale_of(1.0, 3.999999998)[0] == 'lin'           # S3D-7: a ratio really below 4
 
 
 def test_fmt_numpy_scalars():
@@ -602,6 +667,21 @@ def test_analyse_y3_zero_reference_and_worst_counts():
     assert r['significant'] and 'reference run is 0' in r['note']
     w = {(f['factors'], f['levels']): f['count'] for f in fails if f['kind'] == 'not_completed' and f['mu'] == 'worst'}
     assert w[('X1', '+')] == 64 and w[('X1', '-')] == 0
+
+
+def test_worst_y1_is_three_valued():
+    """S3C-13 round 2: at 'worst', a point false at one mu and inconclusive at another counts as
+    not completed only; inconclusive at one mu and true elsewhere counts as inconclusive."""
+    def model(c, mu):
+        if c[0] > 0:
+            return _row(0.05, completed={0.4: 'false', 0.5: 'inconclusive'}.get(mu, 'true'))
+        return _row(0.05, completed='inconclusive' if mu == 0.6 else 'true')
+    pts, runs = _runs(model)
+    _, _, _, fails = s3.analyse('PID', 'outer', pts, runs, [0.4, 0.5, 0.6], [0.5], {('PID', 0.5): 1.0})
+    w = {(f['kind'], f['levels']): f['count'] for f in fails
+         if f['mu'] == 'worst' and f['factors'] == 'X1'}
+    assert w[('not_completed', '+')] == 64 and w[('inconclusive', '+')] == 0
+    assert w[('not_completed', '-')] == 0 and w[('inconclusive', '-')] == 64
 
 
 def test_sweep_counts():

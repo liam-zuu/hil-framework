@@ -52,6 +52,46 @@ def test_blob_follows_the_repository_configuration(tmp_path, autocrlf):
             assert blob == plant_blob.python_blob(data)
 
 
+CASES = [b'a = 1\r\nb = 2\r\n', b'k=1\r\n# tail\r', b'k=1\r\n\0', b'#\x01\r\n', b'\x1b[0m\r\n',
+         b'x' * 128 + b'\x01\r\n', b'x' * 127 + b'\x01\r\n', b'k = 1\r\n\x1a', b'\x7f\r\n', b'\xc3\xa9 = 1\r\n']
+
+
+def test_python_rule_counts_non_printable_bytes():
+    """Codex S3C-16 round 2: git also takes a file as binary when (printable >> 7) < non-printable,
+    e.g. b'#\\x01\\r\\n' is stored as is, not with LF."""
+    assert plant_blob.python_blob(b'#\x01\r\n') == _raw_blob(b'#\x01\r\n')
+    assert plant_blob.python_blob(b'x' * 128 + b'\x01\r\n') == _raw_blob(b'x' * 128 + b'\x01\n')
+
+
+@pytest.mark.skipif(shutil.which('git') is None, reason='git not on PATH')
+def test_python_rule_equals_git_with_autocrlf_true(tmp_path):
+    """The fallback gives git's own blob (core.autocrlf = true, no attributes) on every case."""
+    repo = tmp_path / 'r'
+    repo.mkdir()
+    subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+    subprocess.run(['git', '-C', str(repo), 'config', 'core.autocrlf', 'true'], check=True)
+    for k, data in enumerate(CASES):
+        p = repo / f'c{k}.py'
+        p.write_bytes(data)
+        want = subprocess.run(['git', '-C', str(repo), 'hash-object', p.name], capture_output=True, text=True,
+                              check=True).stdout.strip()
+        assert plant_blob.python_blob(data) == want, data
+
+
+@pytest.mark.skipif(shutil.which('git') is None, reason='git not on PATH')
+def test_outside_a_repository_uses_the_fallback(tmp_path):
+    """Codex S3D-5: outside a git work tree git hash-object would read the global configuration;
+    the fallback rule is used instead."""
+    probe = subprocess.run(['git', '-C', str(tmp_path), 'rev-parse', '--is-inside-work-tree'],
+                           capture_output=True, text=True)
+    if probe.returncode == 0:
+        pytest.skip('the temporary folder is inside a git work tree on this machine')
+    p = tmp_path / 'plain.py'
+    p.write_bytes(b'a = 1\r\n')
+    blob, how = plant_blob.git_blob_with_method(str(p))
+    assert how.startswith('python') and blob == _raw_blob(b'a = 1\n')
+
+
 @pytest.mark.skipif(shutil.which('git') is None, reason='git not on PATH')
 def test_unchanged_files_match_head():
     """In a clean checkout the run-time blob equals git rev-parse HEAD:rpi5/<file> (L34)."""

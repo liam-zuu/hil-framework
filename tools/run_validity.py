@@ -55,8 +55,10 @@ def pos_reset_mid(run_active, reset_n, motor_on=None):
         if off.size:
             idx = np.flatnonzero(fin)
             later = vals[idx > off[0]]
-            before = vals[idx < off[0]]
-            ref = before[-1] if before.size else vals[0]
+            at, before = vals[idx == off[0]], vals[idx < off[0]]
+            # the counter AT the first motor-off line is the reference: a rise at a lost active
+            # line just before it already shows there (S3D-2: [1,0,0] / [1,2,2] counts 1, no error)
+            ref = at[0] if at.size else (before[-1] if before.size else vals[0])
             if later.size and later.max() > ref:
                 raise ValueError('pos_reset_n grows after a motor-off stretch: the log may hold more '
                                  'than one run; split it per run before checking (L37, S3C-8)')

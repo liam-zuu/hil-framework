@@ -49,6 +49,12 @@ def test_motor_off_then_a_reset_is_refused_as_two_runs():
         pos_reset_mid([1, 1, 0, 0, 1, 1], [1, 1, 1, 1, 2, 2], motor_on=[1, 1, 0, 0, 1, 1])
 
 
+def test_rise_already_at_the_first_motor_off_line_is_counted_not_refused():
+    # Codex S3D-2: the active tick that raised the counter was lost just before the motor went
+    # off; the off lines carry the new value from the first one on: one mid-run reset, no error
+    assert pos_reset_mid([1, 0, 0], [1, 2, 2], motor_on=[1, 0, 0]) == 1
+
+
 def test_motor_off_at_the_end_is_fine():
     assert pos_reset_mid([1, 1, 1, 0, 0], [1, 1, 1, 1, 1], motor_on=[1, 1, 1, 0, 0]) == 0
     # a reset before the motor goes off is still a mid-run reset

@@ -258,16 +258,12 @@ def evaluate_v7(log, path, sch, lsum=0.24):
     d0 = np.hypot(fx, fy)
     held = _held(t, (speed < V_D) & (np.abs(vt[:, 2]) < omega_d))
     c25 = (d0 <= D) & held & (t >= sch.Tcmd - 1e-9)          # conditions 2, 3, 5 (4: t < deadline)
-    fw_pose, meas_note = None, 'no firmware pose columns'
+    fw_pose, meas_note, pos = None, 'no firmware pose columns', None
     if len(log.get('pos', [])):
         pos = np.asarray(log['pos'])[keep]
         P = {n: i for i, n in enumerate(fwsim.POS_COLS)}
-        # O6-11 (S3C-19): the firmware pose frame holds only with run_active up and no second reset
-        if np.all(pos[:, P['run_active']] == 1) and np.all(pos[:, P['pos_reset_n']] == pos[0, P['pos_reset_n']]):
-            fw_pose = (c * pos[:, P['pos_x']] - s_ * pos[:, P['pos_y']], s_ * pos[:, P['pos_x']] + c * pos[:, P['pos_y']])
-            meas_note = ''
-        else:
-            meas_note = 'inconclusive: run_active low or pos_reset_n changed in the run (O6-11)'
+        fw_pose = (c * pos[:, P['pos_x']] - s_ * pos[:, P['pos_y']], s_ * pos[:, P['pos_x']] + c * pos[:, P['pos_y']])
+        meas_note = ''
     rows, s_prev, t_prev = [], 0.0, 0.0
     first_trk, t_prog, done = None, None, False
     for k in range(len(t)):
@@ -299,6 +295,15 @@ def evaluate_v7(log, path, sch, lsum=0.24):
             done = True
             break
     t_end = rows[-1]['t']
+    if pos is not None:
+        # O6-11 (S3C-19): the firmware pose frame holds only with run_active up and no second reset,
+        # checked on the frames of the run [0, t_end] only, not after it (S3D-1)
+        w = pos[:len(rows)]
+        if not (np.all(w[:, P['run_active']] == 1) and np.all(w[:, P['pos_reset_n']] == w[0, P['pos_reset_n']])):
+            fw_pose = None
+            meas_note = 'inconclusive: run_active low or pos_reset_n changed in the run (O6-11)'
+            for r in rows:
+                r['e_meas_perp'] = np.nan
     if first_trk is None or (t_prog is not None and t_prog < first_trk):
         y1 = 'true' if done else 'false'
     else:
