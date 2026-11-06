@@ -53,6 +53,11 @@ def test_rise_already_at_the_first_motor_off_line_is_counted_not_refused():
     # Codex S3D-2: the active tick that raised the counter was lost just before the motor went
     # off; the off lines carry the new value from the first one on: one mid-run reset, no error
     assert pos_reset_mid([1, 0, 0], [1, 2, 2], motor_on=[1, 0, 0]) == 1
+    # round 3: the first off line has an empty counter; the first value logged in the stretch counts
+    assert pos_reset_mid([1, 0, 0], [1, nan, 2], motor_on=[1, 0, 0]) == 1
+    # a rise after the motor-off stretch is still refused (S3C-8)
+    with pytest.raises(ValueError, match='more than one run'):
+        pos_reset_mid([1, 0, nan, 1], [1, 1, nan, 2], motor_on=[1, 0, 0, 1])
 
 
 def test_motor_off_at_the_end_is_fine():

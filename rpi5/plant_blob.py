@@ -17,7 +17,8 @@ CR, or (printable >> 7) < non-printable, stored as is; else CRLF -> LF; S3C-16);
 equals `git rev-parse HEAD:<file>` whenever the file is unchanged. Limit (S3C-17, deferred):
 the file is read at the time of the call (the plant process: just after the import; the
 --step-log JSON of run_hil.py: in the parent before the plant process starts and again after
-it, both written, flag plant_src_changed when they differ, S3D-3); a change between the read
+it, both written, flag plant_src_changed when their blobs differ, S3D-3, S3E-3; a file changed
+and changed back between the two reads is not seen, deferred); a change between the read
 and the import, or a stale .pyc, is not detected. Any other change,
 even a docstring, gives another blob (L34: before main numbers both sides go to one merged
 commit).

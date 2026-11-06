@@ -56,6 +56,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import io
 import itertools
 import json
 import math
@@ -90,7 +91,7 @@ RUN_COLS = ['controller', 'point_id', 'box', 'mu', 'v', 'status', 'completed', '
             'e_perp_global_max', 'tv_duty', 'sat_frac', 'sat_any_frac', 'e_theta_lane_max_deg',
             'e_theta_cmd_max_deg', 'ds_absmax', 'e_trk_max', 't_end', 'e_s_absmax', 'track_err_frames',
             'cond2_5_ever', 'pos_reset_mid', 'e_perp_rms', 'e_trk_rms', 'error']     # RMS: S3C-13; error: S3C-12
-SCALE_RTOL = 1e-12            # H/L >= 4 within float rounding of the log grid (S3C-6; 1e-9 too wide, S3D-7)
+SCALE_RTOL = 1e-14            # H/L >= 4 within float rounding of the log grid (S3C-6; S3D-7: about 45 ULP)
 
 
 class S03Stop(Exception):
@@ -198,8 +199,8 @@ def levels_from_sweep(grid, default, ok):
 def scale_of(L, H):
     """('log', centre) when L > 0 and H/L >= 4, else ('lin', centre) (section 3.1). The ratio is
     compared with a relative tolerance: grid points from np.geomspace carry rounding, e.g.
-    L = 12.000000000000002 for the mathematical 12 (S3C-6); the tolerance is a few hundred ULP,
-    so a ratio really below 4 (3.999999998) stays linear (S3D-7)."""
+    L = 12.000000000000002 for the mathematical 12 (S3C-6); the tolerance is about 45 ULP of 4,
+    so a ratio really below 4 (3.999999999998) stays linear (S3D-7)."""
     if L > 0 and H / L >= 4.0 * (1.0 - SCALE_RTOL):
         return 'log', math.sqrt(L * H)
     return 'lin', (L + H) / 2.0
@@ -326,9 +327,18 @@ def write_csv(path, rows, cols=None):
         w.writerows({k: fmt(r.get(k, '')) for k in cols} for r in rows)
 
 
-def save_log(d, name, log):
+def npz_bytes(log):
+    """The compressed npz of a log, in memory."""
+    buf = io.BytesIO()
+    np.savez_compressed(buf, **log)
+    return buf.getvalue()
+
+
+def save_log(d, name, log, data=None):
+    """Write the npz of a log (data: npz_bytes(log) already made)."""
     os.makedirs(d, exist_ok=True)
-    np.savez_compressed(os.path.join(d, name + '.npz'), **log)
+    with open(os.path.join(d, name + '.npz'), 'wb') as f:
+        f.write(npz_bytes(log) if data is None else data)
 
 
 def save_log_csv(d, name, log):
@@ -368,9 +378,13 @@ def analyse(ctrl, box, pts, runs, mu_levels, speeds, y3_ref, notes=None, no_conc
         def agg(fun, resp):
             return [fun([runs[(i, mu, v)][resp] for mu in mu_levels]) for i in ids]
         for cond in ([] if v in no_conclusion else [str(mu) for mu in mu_levels] + ['worst', 'range']):
-            cell = [runs[(i, mu, v)] for i in ids for mu in (mu_levels if cond in ('worst', 'range') else [float(cond)])]
-            n_trk = sum(r['status'] == 'track_err' for r in cell)
-            n_inc = sum(r['completed'] == 'inconclusive' for r in cell)
+            mus = mu_levels if cond in ('worst', 'range') else [float(cond)]
+            per = [[runs[(i, m, v)] for m in mus] for i in ids]
+            # counts of points (S3C-13 round 3): a track error at some mu; worst Y1 inconclusive
+            # (no mu false, some mu inconclusive); at one mu these are counts of runs, the same
+            n_trk = sum(any(r['status'] == 'track_err' for r in rs) for rs in per)
+            n_inc = sum(not any(r['completed'] == 'false' for r in rs) and
+                        any(r['completed'] == 'inconclusive' for r in rs) for rs in per)
             sig_sets = {}
             for resp in RESPONSES:
                 if cond == 'worst':
@@ -597,10 +611,10 @@ def main():
                                         **{f'X{k + 1}': c for k, c in enumerate(codes)},
                                         **{f'{n}_value': v_ for n, v_ in gains_at(codes).items()}))
             plan[ctrl] = (gains_at, centre_codes, outer, inner)
+        write_csv(os.path.join(a.out, 'design.csv'), design_rows)      # S3E-2: on disk before any run
         try:
             for ctrl in a.controllers:
                 gains_at, centre_codes, outer, inner = plan[ctrl]
-                boxes = [('outer', outer)]
                 runs, keep_logs = {}, {}
                 rng = np.random.default_rng(DET_SEED)
                 det_ids = [0] + sorted(int(x) for x in rng.choice(np.arange(1, 129), size=3, replace=False))
@@ -619,8 +633,9 @@ def main():
                                 if pid in det_ids and box != 'inner':
                                     keep_logs[(pid, mu, v)] = (g, box, row, log_digest(log))
                                     save_log_csv(sealed_logs, name, log)          # S03 3.4: log.csv
+                                data = npz_bytes(log)      # S3E-1: compressed for every run, same work
                                 if box == 'centre' or row['completed'] != 'true':
-                                    save_log(sealed_logs, name, log)
+                                    save_log(sealed_logs, name, log, data)
                 print(f'[design {ctrl}] running the main design (results sealed, L56)', flush=True)
                 run_points(todo)
                 # L41 (Liam 06/11, 'Chot B'): the inner box always runs, so the run time does not tell
@@ -630,8 +645,6 @@ def main():
                 need_inner = [v for v in SPEEDS
                               if sum(runs[(i, mu_mid, v)]['completed'] == 'false' for i in corner_ids) > 64]
                 inner_rule[ctrl] = need_inner
-                if need_inner:
-                    boxes.append(('inner', inner))
                 notes = {('outer', v): 'most corners not completed at the middle mu (S03 3.2): reported with this '
                          'warning; see the inner box' for v in need_inner}
                 no_concl[ctrl] = [v for v in need_inner
@@ -650,13 +663,17 @@ def main():
                 if not all(d['log_arrays_equal'] and d['runs_fields_equal'] for d in det_rows):
                     raise S03Stop('determinism check failed (S03 3.4): stop, tell CODE and THESIS')
 
-                # 5 analysis
-                for box, pts in boxes:
-                    e, c, vr, f = analyse(ctrl, box, pts, runs, mu_levels, SPEEDS, y3_ref, notes,
-                                          no_conclusion=no_concl[ctrl])
-                    eff_rows += e
-                    curv_rows += c
-                    ver_rows += vr
+                # 5 analysis: both boxes at every speed always (S3E-1: the same work whether the rule
+                # of 3.2 is on or not); kept: the inner box only when the rule is on, no effects /
+                # curvature / Y2 versions at a speed where the inner box is also mostly not completed
+                nc = no_concl[ctrl]
+                for box, pts in (('outer', outer), ('inner', inner)):
+                    e, c, vr, f = analyse(ctrl, box, pts, runs, mu_levels, SPEEDS, y3_ref, notes)
+                    if box == 'inner' and not need_inner:
+                        continue
+                    eff_rows += [r for r in e if r['v'] not in nc]
+                    curv_rows += [r for r in c if r['v'] not in nc]
+                    ver_rows += [r for r in vr if r['v'] not in nc]
                     fail_rows += f
         except S03Stop as exc:
             stop_sealed = str(exc)
@@ -673,7 +690,9 @@ def main():
         sealed_files[name] = sha256_file(p)
     with open(os.path.join(sealed, 'notes.json'), 'w', encoding='utf-8') as f:
         json.dump(dict(inner_rule_speeds=inner_rule, no_conclusion_speeds=no_concl, stop=stop_sealed,
-                       run_error_reruns=[n for n in rerun_notes if n['point'] is not None]),
+                       run_error_reruns=[n for n in rerun_notes if n['point'] is not None],
+                       elapsed_s_total=round(t_end - t0),
+                       elapsed_s_main_design=round(t_end - t_sweep_end) if t_sweep_end else None),
                   f, indent=1, default=str)
     sealed_files['notes.json'] = sha256_file(os.path.join(sealed, 'notes.json'))
     if stop_sealed:
@@ -694,7 +713,6 @@ def main():
     b = fw.build_info
     dll_sha = sha256_file(a.dll)
     sweep_s = round((t_sweep_end or t_end) - t0)
-    main_s = round(t_end - t_sweep_end) if t_sweep_end else 0
     status = ('stopped in the sweep: ' + stop_public if stop_public else
               'stopped in the main design (reason sealed)' if stop_sealed else 'ran to the end')
     with open(os.path.join(a.out, 'meta.yaml'), 'w', encoding='utf-8') as f:
@@ -736,12 +754,11 @@ interpretations:   # of this script, not written in S03 v6 / O1 v7; Liam or THES
   - "inner box trigger: corners with y1 'false' only (inconclusive not counted)"
   - "a stop of the spec (3.1 (i), (ii), 3.4, run_error) ends S03 for both controllers; the default gains of every controller are checked first"
   - "logs: log.csv (%.17g) of the four determinism points and npz (exact bits) of the centre and every main-design run not completed, all in sealed/logs/; npz of every sweep run not completed in logs_sweep/ (public, as the sweep)"
-  - "the inner box (codes +-0.5) always runs for every controller (L41, Liam 06/11 'Chot B'), so the run time does not depend on the results; it enters the analysis (effects, curvature, Y2 versions, fail counts; at every speed, as before L41) only when the rule of S03 3.2 is on at one speed or more (> 64/128 corners 'false' at the middle mu); otherwise its runs are only rows of sealed/runs.csv"
-  - "public channels left (L56, S3C-3): status, exit code and console say that S03 stopped in the main design (S03 3.4 asks to report the stop; the reason is in sealed/stop.json); scoring a run that does not complete takes a little longer (evaluate_v7 closes the window early on completion): not hidden, not measured"
+  - "the inner box (codes +-0.5) always runs for every controller (L41, Liam 06/11 'Chot B'), so the number of runs does not depend on the results; both boxes are always analysed (the same work), and the inner box is kept (effects, Y2 versions, fail counts; curvature is for the outer box only; at every speed, as before L41) only when the rule of S03 3.2 is on at one speed or more (> 64/128 corners 'false' at the middle mu); otherwise its runs are only rows of sealed/runs.csv"
+  - "elapsed_s here is the sweep only; the total and the main-design time are in sealed/notes.json (L56, Codex S3E-1; S03 section 7 asks elapsed_s in meta.yaml)"
+  - "public channels left (L56, S3C-3, S3E-1; Liam 06/11 'Chot B', 'Duyet khuyen nghi'): status, exit code and console say that S03 stopped in the main design (S03 3.4 asks to report the stop; the reason is in sealed/stop.json); the wall-clock time still varies a little with the results (scoring a run that does not complete is a little longer, evaluate_v7 closes the window early on completion; writing the npz of the runs not completed; machine noise): accepted, not measured"
   - "the upper-end tracking flag uses the 400 001-point path grid (about 15 um); at s = S the window is cut by the end of the path, not flagged (Codex S3C-5, deferred)"
-elapsed_s: {sweep_s + main_s}
-elapsed_s_sweep: {sweep_s}
-elapsed_s_main_design: {main_s}
+elapsed_s: {sweep_s}
 file_sha256: {json.dumps(files)}
 files:
   - sweep.csv: "one line per sweep run (section 3.1) and default gains at the other mu levels"

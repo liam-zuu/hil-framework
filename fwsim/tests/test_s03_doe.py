@@ -227,14 +227,19 @@ def test_v7_untrusted_progress_keeps_the_window_open(path):
 
 
 def _still_from(sch, t_still):
-    """Ideal log, the car reported moving (0.1 m/s) before t_still, plus a frame exactly at the
-    deadline: conditions 2-5 first hold together when the car has been still for t_d."""
+    """Ideal log, the car reported moving (0.1 m/s) before t_still, plus a frame exactly at
+    t_still and one exactly at the deadline (log in time order): the car is still from t_still
+    on, so conditions 2-5 first hold together at t_still + t_d (S3C-23 round 3)."""
     log = _ideal(sch)
     deadline = sch.Tcmd + o1.T_LATE
-    log['t'] = np.append(log['t'], deadline)
+    t = np.concatenate([log['t'], [t_still, deadline]])
+    order = np.argsort(t, kind='stable')
+    src = np.concatenate([np.arange(len(log['t'])), [len(log['t']) - 1, len(log['t']) - 1]])[order]
+    log['t'] = t[order]
     for key in ('pose', 'v_true', 'pwm', 'duty'):
-        log[key] = np.vstack([log[key], log[key][-1:]])
-    log['v_true'][log['t'] < t_still - 1e-9, 0] = 0.1
+        log[key] = np.asarray(log[key])[src]
+    log['v_true'] = log['v_true'].copy()
+    log['v_true'][log['t'] < t_still - 1e-12, 0] = 0.1
     return log, deadline
 
 
@@ -244,6 +249,9 @@ def test_v7_deadline_is_strict(path):
     except where the stillness starts."""
     sch = o1.Schedule(0.8)
     log, deadline = _still_from(sch, sch.Tcmd + o1.T_LATE - o1.T_D)
+    k = int(np.flatnonzero(log['t'] == deadline)[0])
+    still = log['t'][np.flatnonzero(np.hypot(log['v_true'][:, 0], log['v_true'][:, 1]) < o1.V_D)[0]]
+    assert log['t'][k] - still == pytest.approx(o1.T_D, abs=1e-12)    # still exactly t_d at the deadline frame
     res, rows = o1.evaluate_v7(log, path, sch)
     assert all(r['t'] < deadline for r in rows)
     assert res['completed'] == 'false'
@@ -374,6 +382,24 @@ def test_analyse_counts_track_errors_and_inconclusive():
     assert inc[('X1:X2', '+,+')] == 32
 
 
+def test_worst_cell_counts_are_points():
+    """S3C-13 round 3: at 'worst' and 'range', n_inconclusive counts points whose worst Y1 is
+    inconclusive (none false), n_track_err points with a track error at some mu."""
+    def model(c, mu):
+        if c[0] > 0:        # false at 0.4, inconclusive + track error at 0.5 and 0.6
+            return _row(0.05, completed='false' if mu == 0.4 else 'inconclusive',
+                        status='ok' if mu == 0.4 else 'track_err')
+        return _row(0.05, completed='inconclusive' if mu == 0.6 else 'true',
+                    status='track_err' if mu == 0.6 else 'ok')
+    pts, runs = _runs(model)
+    eff, _, _, _ = s3.analyse('PID', 'outer', pts, runs, [0.4, 0.5, 0.6], [0.5], {('PID', 0.5): 1.0})
+    for cond in ('worst', 'range'):
+        r = next(x for x in eff if x['mu'] == cond and x['term'] == 'X1')
+        assert r['n_inconclusive'] == 64 and r['n_track_err'] == 128
+    r = next(x for x in eff if x['mu'] == '0.5' and x['term'] == 'X1')
+    assert r['n_inconclusive'] == 64 and r['n_track_err'] == 64
+
+
 def test_log_digest_detects_one_bit():
     a = dict(x=np.array([1.0, 2.0]))
     b = dict(x=np.array([1.0, np.nextafter(2.0, 3.0)]))
@@ -425,7 +451,8 @@ def test_gains_reach_the_firmware_and_change_the_run(path):
         pytest.skip('DLL without pos_ctrl.c')
     for ctrl in ('PID', 'ADRC'):
         d = s3.defaults(fw, ctrl)
-        g = {n: (x * 1.7 if x else 0.3) for n, x in d.items()}
+        g = {n: (x * (1.3 + 0.2 * k) if x else 0.3 + 0.1 * k) for k, (n, x) in enumerate(d.items())}
+        assert len({round(x, 9) for x in g.values()}) == len(g)      # S3C-21 round 3: all different
         r0, l0 = s3.run_one(fw, path, ctrl, d, 0.8, 0.5)
         r1, l1 = s3.run_one(fw, path, ctrl, g, 0.8, 0.5)
         f = s3.FACTORS[ctrl]
@@ -463,10 +490,14 @@ FAKE_DEFAULTS = dict(PID=dict(kp_xy=1.5, ki_xy=0.05, kp_wz=1.0, ki_wz=0.05, pos_
                                pos_ki=3.0, k_psi=1.0))
 
 
+class _Calls(list):
+    """The calls list of _fake, with what _run_main saw on the side."""
+
+
 def _fake(design_fail=False, default_fails=False, error_in_design=False):
     """Instant stand-in for safe_run: sweep runs (one factor off its default) complete; design
     runs (several factors off) fail when X1 or X2 is above its default (96/128 corners)."""
-    calls, works = [], []
+    calls, works = _Calls(), []
 
     def fake_safe_run(fw, path, ctrl, g, v, mu):
         f = s3.FACTORS[ctrl]
@@ -511,10 +542,27 @@ def _public_text(out):
 
 def _run_main(tmp_path, monkeypatch, capsys, **kw):
     fsr, fnp, calls, works = _fake(**kw)
-    monkeypatch.setattr(s3, 'safe_run', fsr)
+    out = tmp_path / 'run'
+    seen = dict(design_before_first_main_run=None, analyse=[])
+
+    def fsr_watch(fw, path, ctrl, g, v, mu):
+        dflt = FAKE_DEFAULTS[ctrl]
+        if seen['design_before_first_main_run'] is None and \
+                sum(not math.isclose(g[n], dflt[n]) for n in s3.FACTORS[ctrl]) >= 2:
+            f = out / 'design.csv'
+            seen['design_before_first_main_run'] = f.read_text() if f.is_file() else ''
+        return fsr(fw, path, ctrl, g, v, mu)
+    real_analyse = getattr(s3.analyse, 'real', s3.analyse)        # not a watcher of an earlier call
+
+    def analyse_watch(ctrl, box, *a, **k):
+        seen['analyse'].append((ctrl, box))
+        return real_analyse(ctrl, box, *a, **k)
+    analyse_watch.real = real_analyse
+    monkeypatch.setattr(s3, 'analyse', analyse_watch)
+    calls.seen = seen
+    monkeypatch.setattr(s3, 'safe_run', fsr_watch)
     monkeypatch.setattr(s3, 'run_in_new_process', fnp)
     monkeypatch.setattr(s3, 'defaults', lambda fw, ctrl: dict(FAKE_DEFAULTS[ctrl]))
-    out = tmp_path / 'run'
     monkeypatch.setattr(sys, 'argv', ['s03_doe.py', '--out', str(out), '--mu', '0.5', '--trial'])
     code = s3.main()
     return code, out, capsys.readouterr().out, calls, works
@@ -572,6 +620,10 @@ def test_main_inner_box_stays_sealed(tmp_path, monkeypatch, capsys):
     code2, out2, console2, calls2, _ = _run_main(tmp_path / 'b', monkeypatch, capsys)
     assert code2 == 0
     assert len(calls1) == len(calls2)
+    assert calls1.seen['analyse'] == calls2.seen['analyse'] == [(c, b) for c in ('PID', 'ADRC')
+                                                                for b in ('outer', 'inner')]   # S3E-1
+    for c in (calls1, calls2):                          # S3E-2: design.csv on disk before the first run
+        assert c.seen['design_before_first_main_run'].count('\n') == 1 + 2 * 257
     pub1, pub2 = _public_text(out), _public_text(out2)
     assert set(pub1) == set(pub2)
     for name in pub1:
@@ -632,6 +684,7 @@ def test_scale_tolerance_on_the_real_grid():
     assert sc == 'log' and centre == pytest.approx(24.0)
     assert s3.scale_of(12.1, 48.0)[0] == 'lin'
     assert s3.scale_of(1.0, 3.999999998)[0] == 'lin'           # S3D-7: a ratio really below 4
+    assert s3.scale_of(1.0, 3.999999999998)[0] == 'lin'        # S3D-7 round 3
 
 
 def test_fmt_numpy_scalars():
