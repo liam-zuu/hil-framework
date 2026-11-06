@@ -1,6 +1,12 @@
 """
 o1_feasibility.py: feasibility check of the O1 floor task (figure 8) on fwsim.
 
+06/11 (S03 v6 section 11.2, O1 v7 section 5.9): main() scores with evaluate_v7 (O1 v7: two-sided
+e_perp, completion with t >= T_cmd and |wz| < omega_d, e_theta lane and command, e_s along the
+command tangent, s_cmd - s_car, e_trk, e_meas_perp, y1 true/false/inconclusive); evaluate()
+below is the O1 v5 version, kept unchanged for b0_sensitivity.py and the runs made with it
+(O1_FEAS 2026-11-04 run01-run06, B0_SENS 2026-11-05 run01). The text below describes v5.
+
 O1 v5 (CLAUDE_THESIS 06_SPECS/2026-11-04_De_xuat_O1_nhiem_vu_san_v5.md):
   path       x = A sin tau, y = (A/2) sin 2 tau, A = 1 m (section 3.1); the car keeps
              its heading on the tangent (vx = path speed, vy = 0, wz = curvature x speed,
@@ -77,6 +83,13 @@ class Path8:
 
     def s_of_tau(self, tau):
         return np.interp(tau, self.tau, self.s)
+
+    def distance_to_path(self, px, py):
+        """Distance to the whole figure 8, no window (S03 e_perp_global_max; exact pose only)."""
+        if not hasattr(self, '_tree'):
+            from scipy.spatial import cKDTree
+            self._tree = cKDTree(np.column_stack([self.x, self.y]))
+        return self._tree.query(np.column_stack([px, py]))[0]
 
     def nearest(self, px, py, s_lo, s_hi):
         """Nearest path point with s in [s_lo, s_hi]: (s*, dist, tangent heading, at_upper_end)."""
@@ -182,6 +195,131 @@ def evaluate(log, path, sch):
     return out, rows
 
 
+# ── O1 v7 (06_SPECS/2026-11-04_De_xuat_O1_nhiem_vu_san_v7.md section 5.9) + S03 v6 section 4 ──
+
+C_CENS = 0.5         # m, S03 v6 section 5.1: censored e_perp_max = min(e_perp_max, 5 D)
+
+
+def path_point(tau):
+    """Point and tangent heading of the figure 8 at tau (O1 v7 section 3.4: p_cmd, psi_cmd)."""
+    return (A * math.sin(tau), A / 2.0 * math.sin(2.0 * tau),
+            math.atan2(A * math.cos(2.0 * tau), A * math.cos(tau)))
+
+
+def _held(t, still):
+    """True at frames that end an unbroken run of still frames lasting >= T_D (condition 3)."""
+    out = np.zeros(len(t), dtype=bool)
+    start = None
+    for k in range(len(t)):
+        if still[k]:
+            start = t[k] if start is None else start
+            out[k] = t[k] - start >= T_D - 1e-9
+        else:
+            start = None
+    return out
+
+
+def evaluate_v7(log, path, sch, lsum=0.24):
+    """O1 v7 sections 3.3-3.5 on the true plant pose, with the run status of S03 v6 section 4.
+
+    Tracker (3.3): progress s* searched in [s_prev - delta, s_prev + D_k], D_k = 1.5 v_max dt
+    + delta, s only grows; e_perp = distance to the nearest point of the TWO-SIDED window
+    [s_prev - D_k, s_prev + D_k] (O6-8); tracking error when s* falls on the upper end of
+    its window, or the two-sided nearest point is below s_prev - delta (O6-8). The cap of
+    dt by t_miss (O6-9) never acts here: fwsim has a frame every tick.
+    Completion (3.4): at one instant, all five: (1) s_car >= S - D_d; (2) centre within D_d
+    of the origin; (3) speed < v_d and |wz| < omega_d = v_d / (lx + ly), unbroken for t_d up
+    to that instant (O6-18); (4) before t_deadline = T_cmd + t_late; (5) t >= T_cmd (O6-3).
+    The run ends at the first such instant (t_end), else at the deadline; every measure is
+    on the window [0, t_end] (S03 section 4, S3-7).
+    y1 (S03 section 4, B8b-1, S3-V-1): no tracking error -> 'true' / 'false'; progress
+    reached S - D_d at a frame before the first tracking error -> 'true' if conditions 2-5
+    hold together at some t after it (before the deadline), else 'false'; otherwise 'false'
+    if conditions 2-5 never hold together before the deadline (true pose, no tracker),
+    else 'inconclusive'. status 'track_err' when the run has a tracking error, else 'ok'.
+    Interpretation of this script (not written in O1 v7): condition 3 is a trailing window
+    (still for t_d up to the instant), conditions 1, 2, 5 are checked at the instant only.
+    Returns (summary dict, per-frame rows)."""
+    t_all = log['t']
+    keep = t_all <= sch.Tcmd + T_LATE + 1e-9
+    t = t_all[keep]
+    pose = log['pose'][keep]
+    c, s_ = math.cos(HEAD0), math.sin(HEAD0)
+    fx = c * pose[:, 0] - s_ * pose[:, 1]
+    fy = s_ * pose[:, 0] + c * pose[:, 1]
+    psi = pose[:, 2] + HEAD0
+    vt = log['v_true'][keep]
+    speed = np.hypot(vt[:, 0], vt[:, 1])
+    omega_d = V_D / lsum
+    d0 = np.hypot(fx, fy)
+    held = _held(t, (speed < V_D) & (np.abs(vt[:, 2]) < omega_d))
+    c25 = (d0 <= D) & held & (t >= sch.Tcmd - 1e-9)          # conditions 2, 3, 5 (4: t <= deadline)
+    fw_pose = None
+    if len(log.get('pos', [])):
+        pos = np.asarray(log['pos'])[keep]
+        ix, iy = fwsim.POS_COLS.index("pos_x"), fwsim.POS_COLS.index('pos_y')
+        fw_pose = (c * pos[:, ix] - s_ * pos[:, iy], s_ * pos[:, ix] + c * pos[:, iy])
+    rows, s_prev, t_prev = [], 0.0, 0.0
+    first_trk, t_prog, done = None, None, False
+    for k in range(len(t)):
+        dk = 1.5 * sch.vmax * (t[k] - t_prev) + DELTA
+        s_star, _, head, upper = path.nearest(fx[k], fy[k], s_prev - DELTA, s_prev + dk)
+        s_two, e_perp, _, _ = path.nearest(fx[k], fy[k], s_prev - dk, s_prev + dk)
+        trk = bool(upper or s_two < s_prev - DELTA - 1e-12)
+        if trk and first_trk is None:
+            first_trk = t[k]
+        s_car = max(s_prev, s_star)
+        tau_c, _ = sch.tau(t[k])
+        px, py, hc = path_point(tau_c)
+        ex, ey = fx[k] - px, fy[k] - py
+        e_meas_perp = np.nan
+        if fw_pose is not None:            # e_meas,perp (3.4): true - firmware pose, on the lane normal at s*
+            e_meas_perp = (-(fx[k] - fw_pose[0][k]) * math.sin(head) + (fy[k] - fw_pose[1][k]) * math.cos(head))
+        rows.append(dict(t=t[k], x=fx[k], y=fy[k], psi=psi[k], s_cmd=float(path.s_of_tau(tau_c)), s_car=s_car,
+                         s_star=s_star, e_perp=e_perp, e_theta_lane=wrap(psi[k] - head),
+                         e_theta_cmd=wrap(psi[k] - hc), e_s=-(ex * math.cos(hc) + ey * math.sin(hc)),
+                         e_trk=math.hypot(ex, ey), e_meas_perp=e_meas_perp, dist_origin=d0[k], speed=speed[k],
+                         wz=vt[k, 2], track_err=int(trk)))
+        s_prev, t_prev = s_car, t[k]
+        if t_prog is None and s_car >= path.S - D:
+            t_prog = t[k]
+        if t_prog is not None and c25[k]:
+            done = True
+            break
+    t_end = rows[-1]['t']
+    if first_trk is None or (t_prog is not None and t_prog < first_trk):
+        y1 = 'true' if done else 'false'
+    else:
+        y1 = 'inconclusive' if c25.any() else 'false'
+    e = {key: np.array([r[key] for r in rows]) for key in
+         ('e_perp', 'e_theta_lane', 'e_theta_cmd', 'e_s', 'e_trk', 'e_meas_perp')}
+    ds = np.array([r['s_cmd'] - r['s_car'] for r in rows])
+    m = t_all <= t_end + 1e-9                                    # window [0, t_end] on the full log
+    tm, duty, pwm = t_all[m], log['duty'][m], np.abs(log['pwm'][m]) >= 1000
+    last = rows[-1]
+    e_perp_max = float(e['e_perp'].max())
+    out = dict(
+        v=sch.v, T=sch.T, T_r=sch.Tr, T_cmd=sch.Tcmd, t_deadline=sch.Tcmd + T_LATE, t_end=t_end,
+        completed=y1, status='track_err' if first_trk is not None else 'ok',
+        track_err_frames=int(sum(r['track_err'] for r in rows)),
+        t_first_track_err=first_trk if first_trk is not None else np.nan,
+        t_progress=t_prog if t_prog is not None else np.nan, cond2_5_ever=bool(c25.any()),
+        e_perp_max=e_perp_max, e_perp_max_cens=min(e_perp_max, C_CENS),
+        e_perp_global_max=float(path.distance_to_path(fx[:len(rows)], fy[:len(rows)]).max()),
+        e_perp_max_le_D=bool(e_perp_max <= D),
+        e_theta_lane_max_deg=float(np.degrees(np.abs(e['e_theta_lane']).max())),
+        e_theta_cmd_max_deg=float(np.degrees(np.abs(e['e_theta_cmd']).max())),
+        e_s_absmax=float(np.abs(e['e_s']).max()), ds_absmax=float(np.abs(ds).max()),
+        ds_max=float(ds.max()), ds_min=float(ds.min()), e_trk_max=float(e['e_trk'].max()),
+        e_perp_rms=float(np.sqrt(np.mean(e['e_perp'] ** 2))), e_trk_rms=float(np.sqrt(np.mean(e['e_trk'] ** 2))),
+        e_meas_perp_max=float(np.nanmax(np.abs(e['e_meas_perp']))) if fw_pose is not None else np.nan,
+        tv_duty=float(np.sum(np.abs(np.diff(duty, axis=0))) / max(tm[-1] - tm[0], 1e-9)),
+        sat_frac=float(np.mean(pwm)), sat_any_frac=float(np.mean(pwm.any(axis=1))),
+        stop_dist_origin=last['dist_origin'], stop_x=last['x'], stop_y=last['y'],
+        stop_heading_err_deg=math.degrees(wrap(last['psi'] - HEAD0)), s_car_end=last['s_car'], S=path.S)
+    return out, rows
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--out', required=True)
@@ -222,7 +360,7 @@ def main():
             pos_params = fwsim.pos_meta(fw)
             gains[ctrl] = ({ax: fw.get_adrc(i) for i, ax in enumerate(['vx', 'vy', 'wz'])} if ctrl == 'ADRC'
                            else {ax: fw.get_pid(i) for i, ax in enumerate(['vx', 'vy', 'wz'])})
-            res, rows = evaluate(log, path, sch)
+            res, rows = evaluate_v7(log, path, sch, lsum=params.lx + params.ly)   # O1 v7 (06/11; before: v5)
             res.update(fwsim.run_validity(log))      # L37: run_bad = 1 when the pose reset mid-run
             run_id = f'fig8_v{v:.1f}_{ctrl}'
             rd = os.path.join(a.out, run_id)
@@ -234,9 +372,10 @@ def main():
                 w.writerows(rows)
             summary.append(dict(run_id=run_id, controller=ctrl,
                                 pos_loop=int(bool(pos_params and pos_params['on'])), **res))
-            print(f"{run_id}: e_perp_max={res['e_perp_max']:.3f} m, e_theta_max={res['e_theta_max_deg']:.1f} deg, "
-                  f"|e_s|max={res['e_s_absmax']:.3f} m, stop {res['stop_dist_origin']:.3f} m, "
-                  f"completed={res['completed']}, track_err={res['track_err_frames']}, run_bad={res['run_bad']}")
+            print(f"{run_id}: e_perp_max={res['e_perp_max']:.3f} m, e_theta lane/cmd={res['e_theta_lane_max_deg']:.1f}"
+                  f"/{res['e_theta_cmd_max_deg']:.1f} deg, |s_cmd - s_car|max={res['ds_absmax']:.3f} m, "
+                  f"stop {res['stop_dist_origin']:.3f} m, completed={res['completed']}, status={res['status']}, "
+                  f"run_bad={res['run_bad']}")
     with open(os.path.join(a.out, 'summary.csv'), 'w', newline='') as f:
         w = csv.DictWriter(f, fieldnames=list(summary[0]))
         w.writeheader()
@@ -244,7 +383,7 @@ def main():
     b = fw.build_info
     p0 = fwsim.plant_params(a)
     with open(os.path.join(a.out, 'meta.yaml'), 'w', encoding='utf-8') as f:
-        f.write(f"""spec: O1 v5 feasibility (06_SPECS/2026-11-04_De_xuat_O1_nhiem_vu_san_v5.md, sections 3.1, 3.3, 3.4, 8 item 2)
+        f.write(f"""spec: O1 v7 measures (06_SPECS/2026-11-04_De_xuat_O1_nhiem_vu_san_v7.md, sections 3.1, 3.3-3.5, 5.9; evaluate_v7)
 date: {time.strftime('%Y-%m-%d')}
 setup: sim                     # fwsim: ESP32 firmware C code (DLL) + rpi5/plant_step.py, NOT hardware
 operator: Claude (phiên CODE)
@@ -273,12 +412,13 @@ evaluation:
   t_late: {T_LATE}
   delta: {DELTA}            # assumption of this script (O1: camera position uncertainty, not fixed yet)
   v_d: {V_D}               # assumption of this script (O1: fixed after the camera trial)
-  D_theta_L: "not fixed in O1 v5: values reported, no pass/fail"
+  omega_d: "v_d / (lx + ly) (O1 v7 condition 3)"
+  gate: "O1 v7 3.5: completed and e_perp_max <= D; e_theta, e_s, e_trk report only"
 seed: 1                       # plant and IMU noise-free: the seed has no effect
 libraries: {json.dumps(fwsim.lib_versions())}
 elapsed_s: {time.time() - t0:.0f}
 files:
-  - summary.csv: "one line per run: O1 measures (e_perp_max, e_theta_max_deg, e_s max/min/absmax, RMS), stop error, completed, tracking-error frames, PWM saturation fraction"
+  - summary.csv: "one line per run: O1 v7 measures (evaluate_v7: completed true/false/inconclusive, status, e_perp_max, e_theta lane/cmd, e_s, s_cmd - s_car, e_trk, e_meas_perp, RMS), stop error, tv_duty, saturation, run_bad (L37)"
   - <run_id>/log.csv, metrics.json, meta.yaml: "fwsim.write_run (metrics.json = the summary line of that run)"
   - <run_id>/o1_frames.csv: "per frame: floor pose, s_cmd, s_car, s*, e_perp, e_theta [rad], e_s, distance to origin, speed, tracking error"
 """)
