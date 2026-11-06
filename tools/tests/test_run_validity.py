@@ -37,9 +37,22 @@ def test_two_mid_run_resets():
     assert pos_reset_mid([1, 0, 1, 0, 1], [5, 5, 6, 6, 7]) == 2
 
 
-def test_rise_after_the_last_active_line_is_outside_the_run():
-    # a later start without an active line in this log is not part of this run
-    assert pos_reset_mid([1, 1, 0, 0], [1, 1, 1, 2]) == 0
+def test_rise_after_the_last_logged_active_line_is_counted():
+    # Codex S3C-7: the active tick that raised the counter was lost, the inactive lines after it
+    # still carry 2: one log = one run, so this is a reset inside the run
+    assert pos_reset_mid([1, 1, 0, 0], [1, 1, 1, 2]) == 1
+
+
+def test_motor_off_then_a_reset_is_refused_as_two_runs():
+    # S3C-8: run, motor off, new run (reset): the log may hold two runs; do not merge them
+    with pytest.raises(ValueError, match='more than one run'):
+        pos_reset_mid([1, 1, 0, 0, 1, 1], [1, 1, 1, 1, 2, 2], motor_on=[1, 1, 0, 0, 1, 1])
+
+
+def test_motor_off_at_the_end_is_fine():
+    assert pos_reset_mid([1, 1, 1, 0, 0], [1, 1, 1, 1, 1], motor_on=[1, 1, 1, 0, 0]) == 0
+    # a reset before the motor goes off is still a mid-run reset
+    assert pos_reset_mid([1, 0, 1, 0, 0], [1, 1, 2, 2, 2], motor_on=[1, 1, 1, 0, 0]) == 1
 
 
 def test_lost_lines_do_not_hide_a_reset():
@@ -87,6 +100,23 @@ def test_s02_metrics_marks_mid_run_reset(tmp_path):
     m = s02_metrics.compute(s02_metrics.load_log(_write_dut_log(tmp_path, reset_at=150)), 'A-L1')
     assert m['pos_reset_mid'] == 1 and m['run_bad'] == 1
     assert np.isfinite(m['e_vx'])            # metrics still written, the row is marked
+
+
+def test_s02_metrics_sees_a_second_run_behind_motor_off_lines(tmp_path):
+    """S3C-8: two runs in one DUT log, separated by motor-off lines that load_log drops; the
+    check runs on every line and refuses the log instead of calling one run broken."""
+    p = tmp_path / 'two.csv'
+    with open(p, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(COLUMNS)
+        for s in range(300):
+            v = {c: 0 for c in COLUMNS}
+            off = 140 <= s < 160
+            v.update(timestamp_us=s * 10_000, tick=s + 1, log_seq=s, motor_on=0 if off else 1, sp_vx=0.3,
+                     run_active=0 if off else 1, pos_reset_n=1 + (s >= 160))
+            w.writerow([v[c] for c in COLUMNS])
+    with pytest.raises(ValueError, match='more than one run'):
+        s02_metrics.compute(s02_metrics.load_log(str(p)), 'A-L1')
 
 
 def test_s02_metrics_clean_run(tmp_path):

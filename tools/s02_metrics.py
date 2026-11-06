@@ -37,8 +37,9 @@ setpoint, i.e. initial transient and final stop excluded):
                      <log>.events.txt (log_loss); older logs: from the tick span
   missing_tail_known 1 when a '#run_end' line covers the end of the log, so a lost
                      end of run is counted; 0 when it cannot be seen
-  pos_reset_mid      pose resets inside the run (pos_reset_n increases between the first and
-  run_bad            the last run_active = 1 line, tools/run_validity.py, STATUS_CODE L37);
+  pos_reset_mid      pose resets inside the run (pos_reset_n increases from the first
+  run_bad            run_active = 1 line to the end of the log, every line before the motor-off
+                     filter; tools/run_validity.py, STATUS_CODE L37, Codex S3C-7, S3C-8);
   run_bad_reason     run_bad = 1 marks a broken run to run again (spec controller-IMU
                      section 14.7.3 (A)); its metrics are still written but are not results.
                      NaN when the log has no pos_reset_n / run_active (firmware before 05/11)
@@ -115,11 +116,13 @@ def load_log(path):
         body = _old_format(body, t)
     data = np.array([[float(x) if x != '' else np.nan for x in r] for r in body])
     log_seq_all = None
+    every = {h: data[:, head.index(h)] for h in ('run_active', 'pos_reset_n', 'motor_on') if h in head}
     if kind == 'dut':
         log_seq_all = data[:, head.index('log_seq')]
         # 10 Hz lines while the motor is off carry no controller tick: drop them
         data = data[data[:, head.index('motor_on')] == 1]
     log = {h: data[:, i] for i, h in enumerate(head)}
+    log['_every'] = every                                        # L37 check on every line (S3C-8)
     if kind == 'dut':
         log['_seq_all'] = log_seq_all                            # every line, motor off ones too
         log['_run_end_last'] = run_end_last
@@ -352,7 +355,8 @@ def compute(log, test_id):
     tick = log['tick']
     m = {}
     m['missing_pct'], m['missing_tail_known'] = log_loss(log)
-    m.update(run_bad_fields(pos_reset_mid(log.get('run_active'), log.get('pos_reset_n'))))
+    ev = log.get('_every', log)          # every logged line, before the motor-off filter (S3C-8)
+    m.update(run_bad_fields(pos_reset_mid(ev.get('run_active'), ev.get('pos_reset_n'), ev.get('motor_on'))))
 
     moving = np.flatnonzero(np.any(np.abs(sp) > 1e-9, axis=1))
     t0, t1 = t[moving[0]] + WINDOW_SKIP_S, t[moving[-1]]

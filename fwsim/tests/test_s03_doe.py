@@ -2,6 +2,7 @@
 S03 v6 section 4). Synthetic logs and responses with a known answer; the last tests need
 fwsim/build/fwsim.dll (firmware with pos_ctrl.c). Run: python -m pytest fwsim/tests -q"""
 import math
+import struct
 import os
 import sys
 
@@ -136,10 +137,16 @@ def test_v7_lag_sign_and_window_of_y3_y4(path):
     log = _ideal(sch)
     after = log['t'] > sch.Tcmd + o1.T_D + 0.05
     log['duty'][after, 0] = np.where(np.arange(after.sum()) % 2, 0.5, -0.5)   # duty chatter after t_end
-    log['pwm'][:, 1] = 1000                                                      # one wheel saturated throughout
+    log['pwm'][after, 1] = 1000                     # saturated only after t_end (S3C-22: must not count)
+    half = log['t'] <= sch.Tcmd / 2
+    log['pwm'][half, 2] = -1000                     # saturated over the first half of the window
     res, _ = o1.evaluate_v7(log, path, sch)
     assert res['tv_duty'] == 0.0
-    assert res['sat_frac'] == pytest.approx(0.25) and res['sat_any_frac'] == pytest.approx(1.0)
+    n_win = int(np.sum(log['t'] <= res['t_end'] + 1e-9))
+    assert res['sat_frac'] == pytest.approx(half.sum() / (4 * n_win))
+    assert res['sat_any_frac'] == pytest.approx(half.sum() / n_win)
+    whole = (np.abs(log['pwm']) >= 1000).mean()
+    assert res['sat_frac'] != pytest.approx(whole)  # the whole-log value would differ
     still = _ideal(sch)
     still['pose'][:] = 0.0
     still['v_true'][:] = 0.0
@@ -154,6 +161,62 @@ def test_v7_censored_and_measurement_error(path):
     res, _ = o1.evaluate_v7(log, path, sch)
     assert res['e_perp_max'] > 0.5 and res['e_perp_max_cens'] == o1.C_CENS
     assert math.isnan(res['e_meas_perp_max'])    # no firmware pose columns
+
+
+def _with_fw_pose(log, shift_left=0.0, reset_at=None):
+    """Add fwsim POS_COLS: firmware pose = true pose moved shift_left to the right of the heading
+    (so true - firmware = shift_left to the LEFT, on the lane normal), run_active 1."""
+    P = {n: i for i, n in enumerate(fwsim.POS_COLS)}
+    pos = np.zeros((len(log['t']), len(fwsim.POS_COLS)))
+    th = log['pose'][:, 2]
+    pos[:, P['pos_x']] = log['pose'][:, 0] + shift_left * np.sin(th)
+    pos[:, P['pos_y']] = log['pose'][:, 1] - shift_left * np.cos(th)
+    pos[:, P['run_active']] = 1
+    pos[:, P['pos_reset_n']] = 1
+    if reset_at is not None:
+        pos[reset_at:, P['pos_reset_n']] = 2
+    log['pos'] = pos
+    return log
+
+
+def test_v7_measurement_error_on_the_lane_normal(path):
+    """S3C-22: a known 3 cm offset between true and firmware pose along the lane normal gives
+    e_meas_perp_max 0.03 m; a second pose reset makes it NaN (O6-11, S3C-19)."""
+    sch = o1.Schedule(0.5)
+    res, _ = o1.evaluate_v7(_with_fw_pose(_ideal(sch), 0.03), path, sch)
+    assert res['e_meas_perp_max'] == pytest.approx(0.03, abs=2e-3) and res['e_meas_note'] == ''
+    res, _ = o1.evaluate_v7(_with_fw_pose(_ideal(sch), 0.03, reset_at=500), path, sch)
+    assert math.isnan(res['e_meas_perp_max']) and 'O6-11' in res['e_meas_note']
+
+
+def test_v7_untrusted_progress_keeps_the_window_open(path):
+    """S3C-4: tracking error before the progress -> y1 inconclusive and the window runs to the
+    last frame before the deadline, so duty chatter after the stop is counted."""
+    sch = o1.Schedule(0.5)
+    log = _ideal(sch)
+    k = int(np.searchsorted(log['t'], 4.0))
+    s_k = path.s_of_tau(sch.tau(log['t'][k])[0])
+    j = int(np.searchsorted(path.s, s_k + 1.0))
+    log['pose'][k, :2] = _plant_xy(path.x[j], path.y[j])
+    late = log['t'] > sch.Tcmd + o1.T_D + 0.2
+    log['duty'][late, 0] = np.where(np.arange(late.sum()) % 2, 0.5, -0.5)
+    res, _ = o1.evaluate_v7(log, path, sch)
+    assert res['completed'] == 'inconclusive'
+    deadline = sch.Tcmd + o1.T_LATE
+    assert res['t_end'] > deadline - 0.02 and res['t_end'] < deadline
+    assert res['tv_duty'] > 0
+
+
+def test_v7_deadline_is_strict(path):
+    """S3C-23: a frame exactly at T_cmd + t_late is not 'before the deadline'."""
+    sch = o1.Schedule(0.8)
+    log = _ideal(sch)
+    deadline = sch.Tcmd + o1.T_LATE
+    log['t'] = np.append(log['t'], deadline)
+    for key in ('pose', 'v_true', 'pwm', 'duty'):
+        log[key] = np.vstack([log[key], log[key][-1:]])
+    _, rows = o1.evaluate_v7(log, path, sch)
+    assert all(r['t'] < deadline for r in rows)
 
 
 # ── S03 pieces ───────────────────────────────────────────────────────────────────────
@@ -321,40 +384,231 @@ def test_run_one_and_new_process_rerun_are_identical(path, tmp_path):
 
 
 @needs_dll
-def test_main_pipeline_with_a_fake_simulator(tmp_path, monkeypatch):
-    """main() end to end with an instant fake run (responses from the codes): every output file,
-    sealed files in sealed/, meta.yaml, exit code 0. The DLL is only used for the defaults."""
-    calls = []
+def test_gains_reach_the_firmware_and_change_the_run(path):
+    """S3C-21: seven non-default gains are what the firmware holds after the run, the run differs
+    from the default one, and default - custom - default gives the first run back bit for bit."""
+    fw = fwsim.FirmwareSim(_DLL)
+    if not fw.pos_cols:
+        pytest.skip('DLL without pos_ctrl.c')
+    for ctrl in ('PID', 'ADRC'):
+        d = s3.defaults(fw, ctrl)
+        g = {n: (x * 1.7 if x else 0.3) for n, x in d.items()}
+        r0, l0 = s3.run_one(fw, path, ctrl, d, 0.8, 0.5)
+        r1, l1 = s3.run_one(fw, path, ctrl, g, 0.8, 0.5)
+        f = s3.FACTORS[ctrl]
+        if ctrl == 'PID':
+            got = [fw.get_pid(0)['kp'], fw.get_pid(1)['ki'], fw.get_pid(2)['kp'], fw.get_pid(2)['ki']]
+            assert fw.get_pid(0)['kd'] == 0.0
+        else:
+            got = [fw.get_adrc(0)['omega_c'], fw.get_adrc(1)['omega_o'], fw.get_adrc(2)['omega_c'],
+                   fw.get_adrc(2)['omega_o']]
+        assert got == pytest.approx([g[n] for n in f[:4]], rel=1e-6)
+        pm = fwsim.pos_meta(fw)
+        assert pm['kp'] == pytest.approx(g['pos_kp'], rel=1e-6) and pm['ki'] == pytest.approx(g['pos_ki'], rel=1e-6)
+        assert s3.log_digest(l1) != s3.log_digest(l0)
+        r2, l2 = s3.run_one(fw, path, ctrl, d, 0.8, 0.5)
+        assert s3.log_digest(l2) == s3.log_digest(l0)
+        g_psi = dict(d, k_psi=3.0)                       # k_psi alone changes the run (it is applied)
+        _, l3 = s3.run_one(fw, path, ctrl, g_psi, 0.8, 0.5)
+        assert s3.log_digest(l3) != s3.log_digest(l0)
+
+
+FAKE_DEFAULTS = dict(PID=dict(kp_xy=1.5, ki_xy=0.05, kp_wz=1.0, ki_wz=0.05, pos_kp=6.0, pos_ki=3.0, k_psi=1.0),
+                     ADRC=dict(omega_c_xy=8.0, omega_o_xy=30.0, omega_c_wz=8.0, omega_o_wz=30.0, pos_kp=6.0,
+                               pos_ki=3.0, k_psi=1.0))
+
+
+def _fake(design_fail=False, default_fails=False, error_in_design=False):
+    """Instant stand-in for safe_run: sweep runs (one factor off its default) complete; design
+    runs (several factors off) fail when X1 or X2 is above its default (96/128 corners)."""
+    calls, works = [], []
 
     def fake_safe_run(fw, path, ctrl, g, v, mu):
-        x = np.array([g[n] for n in s3.FACTORS[ctrl]])
-        calls.append((ctrl, v, mu))
-        log = dict(t=np.arange(3.0), duty=np.zeros((3, 4)) + x.sum())
-        return dict(status='ok', completed='true', e_perp_max=0.01 + 1e-3 * float(x[0]), e_perp_max_cens=0.01,
-                    e_perp_global_max=0.01, tv_duty=1.0 + float(x[1]), sat_frac=0.0, sat_any_frac=0.0,
-                    e_theta_lane_max_deg=1.0, e_theta_cmd_max_deg=1.0, ds_absmax=0.0, e_trk_max=0.0,
-                    t_end=1.0, e_s_absmax=0.0, track_err_frames=0, cond2_5_ever=True, pos_reset_mid=0), log
+        f = s3.FACTORS[ctrl]
+        dflt = FAKE_DEFAULTS[ctrl]
+        off = [n for n in f if not math.isclose(g[n], dflt[n])]
+        calls.append(len(off))
+        design = len(off) >= 2
+        if error_in_design and design:
+            return dict(status='run_error', completed='', error='FakeError: boom'), None
+        fail = (design_fail and design and (g[f[0]] > dflt[f[0]] or g[f[1]] > dflt[f[1]])) or \
+               (default_fails and not off and v == 0.8)
+        x = np.array([g[n] for n in f])
+        log = dict(t=np.arange(3.0) * 0.01, duty=np.zeros((3, 4)) + x.sum())
+        return dict(status='ok', completed='false' if fail else 'true', e_perp_max=0.01 + 1e-3 * float(x[0]),
+                    e_perp_max_cens=0.01, e_perp_global_max=0.01, tv_duty=np.float64(1.0 + float(x[1])),
+                    sat_frac=0.0, sat_any_frac=0.0, e_theta_lane_max_deg=1.0, e_theta_cmd_max_deg=1.0,
+                    ds_absmax=0.0, e_trk_max=0.0, t_end=np.float64(1.25), e_s_absmax=0.0, track_err_frames=0,
+                    cond2_5_ever=np.bool_(True), pos_reset_mid=0, e_perp_rms=0.0, e_trk_rms=0.0), log
 
     def fake_new_process(dll, runs, work):
-        return [dict(row=r, digest=s3.log_digest(l)) for r, l in (fake_safe_run(None, None, *j) for j in runs)]
+        works.append(work)
+        out = []
+        for j in runs:
+            r, l = fake_safe_run(None, None, *j)
+            out.append(dict(row=r, digest=s3.log_digest(l) if l is not None else None))
+        return out
+    return fake_safe_run, fake_new_process, calls, works
 
-    monkeypatch.setattr(s3, 'safe_run', fake_safe_run)
-    monkeypatch.setattr(s3, 'run_in_new_process', fake_new_process)
+
+def _public_text(out):
+    """Every file outside sealed/ as text (npz skipped)."""
+    txt = {}
+    for root, _, files in os.walk(out):
+        rel = os.path.relpath(root, out)
+        if rel.split(os.sep)[0] == 'sealed':
+            continue
+        for f in files:
+            if not f.endswith('.npz'):
+                txt[os.path.normpath(os.path.join(rel, f))] = open(os.path.join(root, f), encoding='utf-8').read()
+    return txt
+
+
+def _run_main(tmp_path, monkeypatch, capsys, **kw):
+    fsr, fnp, calls, works = _fake(**kw)
+    monkeypatch.setattr(s3, 'safe_run', fsr)
+    monkeypatch.setattr(s3, 'run_in_new_process', fnp)
+    monkeypatch.setattr(s3, 'defaults', lambda fw, ctrl: dict(FAKE_DEFAULTS[ctrl]))
     out = tmp_path / 'run'
     monkeypatch.setattr(sys, 'argv', ['s03_doe.py', '--out', str(out), '--mu', '0.5', '--trial'])
-    assert s3.main() == 0
-    for f in ('sweep.csv', 'levels.csv', 'design.csv', 'determinism_check.csv', 'meta.yaml',
-              'sealed/runs.csv', 'sealed/effects.csv', 'sealed/fail_counts.csv', 'sealed/notes.json'):
-        assert (out / f).is_file(), f
+    code = s3.main()
+    return code, out, capsys.readouterr().out, calls, works
+
+
+@needs_dll
+def test_main_pipeline_clean(tmp_path, monkeypatch, capsys):
     import csv as _csv
+    code, out, console, _, works = _run_main(tmp_path, monkeypatch, capsys)
+    assert code == 0
+    for f in ('sweep.csv', 'sweep_counts.csv', 'levels.csv', 'design.csv', 'meta.yaml', 'sealed/runs.csv',
+              'sealed/effects.csv', 'sealed/fail_counts.csv', 'sealed/notes.json', 'sealed/manifest.json',
+              'sealed/determinism_check.csv'):
+        assert (out / f).is_file(), f
+    assert not (out / 'determinism_check.csv').exists() and not (out / '_work').exists()
+    assert works and all(os.path.relpath(w, out).split(os.sep)[0] == 'sealed' for w in works)   # S3C-2
     runs = list(_csv.DictReader(open(out / 'sealed' / 'runs.csv')))
-    assert len(runs) == 2 * 129 * 3                      # 2 controllers x (128 + centre) x 3 speeds x 1 mu
-    det = list(_csv.DictReader(open(out / 'determinism_check.csv')))
+    assert len(runs) == 2 * 129 * 3
+    assert all(float(r['t_end']) == 1.25 for r in runs)            # S3C-14: plain numbers
+    assert {r['cond2_5_ever'] for r in runs} == {'true'}
+    sweep = list(_csv.DictReader(open(out / 'sweep.csv')))
+    assert all(float(r['t_end']) == 1.25 and float(r['tv_duty']) > 0 for r in sweep)
+    det = list(_csv.DictReader(open(out / 'sealed' / 'determinism_check.csv')))
     assert len(det) == 2 * 4 * 3 and all(r['log_arrays_equal'] == 'true' for r in det)
-    lv = list(_csv.DictReader(open(out / 'levels.csv')))
-    assert len(lv) == 14
+    assert len(list((out / 'sealed' / 'logs').glob('*.csv'))) == 2 * 4 * 3    # S03 3.4: log.csv of the 4 points
     meta = (out / 'meta.yaml').read_text(encoding='utf-8')
-    assert 'trial: true' in meta and 'sealed/runs.csv' in meta and 'src' in meta
+    assert 'trial: true' in meta and 'determinism: "24/24 equal"' in meta
+    sha_line = next(l for l in meta.splitlines() if l.startswith('file_sha256:'))
+    assert 'runs.csv' not in sha_line and 'notes.json' not in sha_line          # S3C-1
+    assert 'inner' not in console.lower()
+
+
+@needs_dll
+def test_main_inner_box_stays_sealed(tmp_path, monkeypatch, capsys):
+    """96/128 corners 'false' -> the inner box runs; no public file or console line differs from
+    a run where it does not (S3C-1..S3C-3), except the date and the timing line."""
+    import json as _json
+    code, out, console, _, _ = _run_main(tmp_path / 'a', monkeypatch, capsys, design_fail=True)
+    assert code == 0
+    notes = _json.load(open(out / 'sealed' / 'notes.json'))
+    assert notes['inner_box_run'] == {'PID': True, 'ADRC': True}
+    assert (out / 'sealed' / 'design_inner.csv').stat().st_size > 0
+    code2, out2, console2, _, _ = _run_main(tmp_path / 'b', monkeypatch, capsys)
+    assert code2 == 0
+    pub1, pub2 = _public_text(out), _public_text(out2)
+    assert set(pub1) == set(pub2)
+    for name in pub1:
+        a_, b_ = pub1[name], pub2[name]
+        if name == 'meta.yaml':
+            keep = lambda t: [l for l in t.splitlines() if not l.startswith(('elapsed_s', 'date', 'script'))]  # noqa
+            assert keep(a_) == keep(b_)
+        else:
+            assert a_ == b_, name
+    assert console.replace(str(out), '') == console2.replace(str(out2), '')
+
+
+@needs_dll
+def test_main_stops_everything_when_a_default_fails(tmp_path, monkeypatch, capsys):
+    """S3C-9: a default that does not complete at a gate speed stops S03 for both controllers
+    before any sweep (3.1 (i))."""
+    code, out, console, calls, _ = _run_main(tmp_path, monkeypatch, capsys, default_fails=True)
+    assert code == 2 and '3.1 (i)' in console
+    assert len(calls) == 3                                   # PID defaults at the 3 speeds, then stop
+    assert (out / 'design.csv').read_text().strip() == ''
+    assert 'stopped in the sweep' in (out / 'meta.yaml').read_text(encoding='utf-8')
+
+
+@needs_dll
+def test_main_run_error_in_the_design_is_recorded_and_sealed(tmp_path, monkeypatch, capsys):
+    """S3C-12, S3C-3: the run_error row is in sealed/runs.csv; the console and meta.yaml only say
+    that S03 stopped in the main design."""
+    import csv as _csv
+    code, out, console, _, _ = _run_main(tmp_path, monkeypatch, capsys, error_in_design=True)
+    assert code == 2
+    assert 'FakeError' not in console and 'sealed/stop.json' in console
+    meta = (out / 'meta.yaml').read_text(encoding='utf-8')
+    assert 'FakeError' not in meta and 'stopped in the main design' in meta
+    rows = list(_csv.DictReader(open(out / 'sealed' / 'runs.csv')))
+    assert rows[-1]['status'] == 'run_error' and 'FakeError' in rows[-1]['error']
+    assert 'FakeError' in (out / 'sealed' / 'stop.json').read_text()
+
+
+def test_gate_speeds_must_be_task_speeds(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, 'argv', ['s03_doe.py', '--out', str(tmp_path / 'x'), '--mu', '0.5', '--trial',
+                                      '--gate-speeds', '0.3'])
+    with pytest.raises(SystemExit, match='S3C-10'):
+        s3.main()
+
+
+def test_scale_tolerance_on_the_real_grid():
+    """S3C-6: L from np.geomspace (12.000000000000002) with H = 48 is a ratio of 4 -> log."""
+    g = s3.sweep_grid('omega_o_wz', 30.0, 5.0, 48.0)
+    L = min(x for x in g if math.isclose(x, 12.0))
+    assert L != 12.0                                  # the rounding is really there
+    sc, centre = s3.scale_of(L, 48.0)
+    assert sc == 'log' and centre == pytest.approx(24.0)
+    assert s3.scale_of(12.1, 48.0)[0] == 'lin'
+
+
+def test_fmt_numpy_scalars():
+    assert s3.fmt(np.float64(32.07)) == '32.07' and s3.fmt(np.bool_(True)) == 'true'
+    assert s3.fmt(np.int64(3)) == 3 and s3.fmt(float('nan')) == 'nan'
+
+
+def test_row_text_is_bit_exact_with_ids():
+    r = dict(status='ok', e_perp_max=float('nan'))
+    r2 = dict(status='ok', e_perp_max=struct.unpack('<d', bytes.fromhex('010000000000f87f'))[0])  # other NaN payload
+    ids = ('PID', 3, 'outer', 0.5, 0.8)
+    assert s3.row_text(r, ids) == s3.row_text(dict(r), ids)
+    assert s3.row_text(r, ids) != s3.row_text(r2, ids)
+    assert s3.row_text(r, ids) != s3.row_text(r, ('PID', 4, 'outer', 0.5, 0.8))
+    assert set(s3.row_text(r, ids)) == set(s3.RUN_COLS)
+
+
+def test_analyse_no_conclusion_speed_has_no_effects():
+    """S3C-11: a speed where the inner box is also mostly not completed gets no effect rows."""
+    pts, runs = _runs(lambda c, mu: _row(0.05), mu_levels=(0.5,))
+    eff, curv, ver, fails = s3.analyse('PID', 'outer', pts, runs, [0.5], [0.5], {('PID', 0.5): 1.0},
+                                       no_conclusion=[0.5])
+    assert eff == [] and curv == [] and ver == [] and fails
+
+
+def test_analyse_y3_zero_reference_and_worst_counts():
+    """S3C-13: Y3 reference 0 -> note; fail counts over mu ('worst': any mu not completed)."""
+    def model(c, mu):
+        return _row(0.05, tv=0.1 * c[2], completed='false' if (c[0] > 0 and mu == 0.6) else 'true')
+    pts, runs = _runs(model)
+    eff, _, _, fails = s3.analyse('PID', 'outer', pts, runs, [0.4, 0.5, 0.6], [0.5], {('PID', 0.5): 0.0})
+    r = next(x for x in eff if x['response'] == 'tv_duty' and x['term'] == 'X3' and x['mu'] == '0.5')
+    assert r['significant'] and 'reference run is 0' in r['note']
+    w = {(f['factors'], f['levels']): f['count'] for f in fails if f['kind'] == 'not_completed' and f['mu'] == 'worst'}
+    assert w[('X1', '+')] == 64 and w[('X1', '-')] == 0
+
+
+def test_sweep_counts():
+    rows = [dict(controller='PID', factor='kp_xy', v=0.5, mu=0.5, completed=c, sat_frac=s)
+            for c, s in (('true', 0.0), ('false', 0.1), ('inconclusive', 0.0))]
+    (c,) = s3.sweep_counts(rows)
+    assert (c['n'], c['not_completed'], c['inconclusive'], c['saturated']) == (3, 1, 1, 1)
 
 
 def test_analyse_writes_the_box_notes():

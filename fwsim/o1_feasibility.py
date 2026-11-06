@@ -229,9 +229,13 @@ def evaluate_v7(log, path, sch, lsum=0.24):
     dt by t_miss (O6-9) never acts here: fwsim has a frame every tick.
     Completion (3.4): at one instant, all five: (1) s_car >= S - D_d; (2) centre within D_d
     of the origin; (3) speed < v_d and |wz| < omega_d = v_d / (lx + ly), unbroken for t_d up
-    to that instant (O6-18); (4) before t_deadline = T_cmd + t_late; (5) t >= T_cmd (O6-3).
-    The run ends at the first such instant (t_end), else at the deadline; every measure is
-    on the window [0, t_end] (S03 section 4, S3-7).
+    to that instant (O6-18); (4) strictly before t_deadline = T_cmd + t_late (S3C-23);
+    (5) t >= T_cmd (O6-3). The run ends at the first such instant (t_end), else at the last
+    frame before the deadline; every measure is on the window [0, t_end] (S03 section 4,
+    S3-7). After a tracking error that came before the progress reached S - D_d, condition 1
+    is not trusted, so the window is NOT closed early: it runs to the deadline (S3C-4).
+    e_meas_perp (O6-11, S3C-19): NaN with e_meas_note when run_active drops or pos_reset_n
+    changes inside the run.
     y1 (S03 section 4, B8b-1, S3-V-1): no tracking error -> 'true' / 'false'; progress
     reached S - D_d at a frame before the first tracking error -> 'true' if conditions 2-5
     hold together at some t after it (before the deadline), else 'false'; otherwise 'false'
@@ -241,7 +245,7 @@ def evaluate_v7(log, path, sch, lsum=0.24):
     (still for t_d up to the instant), conditions 1, 2, 5 are checked at the instant only.
     Returns (summary dict, per-frame rows)."""
     t_all = log['t']
-    keep = t_all <= sch.Tcmd + T_LATE + 1e-9
+    keep = t_all < sch.Tcmd + T_LATE - 1e-9                   # "before the deadline" (S3C-23)
     t = t_all[keep]
     pose = log['pose'][keep]
     c, s_ = math.cos(HEAD0), math.sin(HEAD0)
@@ -253,12 +257,17 @@ def evaluate_v7(log, path, sch, lsum=0.24):
     omega_d = V_D / lsum
     d0 = np.hypot(fx, fy)
     held = _held(t, (speed < V_D) & (np.abs(vt[:, 2]) < omega_d))
-    c25 = (d0 <= D) & held & (t >= sch.Tcmd - 1e-9)          # conditions 2, 3, 5 (4: t <= deadline)
-    fw_pose = None
+    c25 = (d0 <= D) & held & (t >= sch.Tcmd - 1e-9)          # conditions 2, 3, 5 (4: t < deadline)
+    fw_pose, meas_note = None, 'no firmware pose columns'
     if len(log.get('pos', [])):
         pos = np.asarray(log['pos'])[keep]
-        ix, iy = fwsim.POS_COLS.index("pos_x"), fwsim.POS_COLS.index('pos_y')
-        fw_pose = (c * pos[:, ix] - s_ * pos[:, iy], s_ * pos[:, ix] + c * pos[:, iy])
+        P = {n: i for i, n in enumerate(fwsim.POS_COLS)}
+        # O6-11 (S3C-19): the firmware pose frame holds only with run_active up and no second reset
+        if np.all(pos[:, P['run_active']] == 1) and np.all(pos[:, P['pos_reset_n']] == pos[0, P['pos_reset_n']]):
+            fw_pose = (c * pos[:, P['pos_x']] - s_ * pos[:, P['pos_y']], s_ * pos[:, P['pos_x']] + c * pos[:, P['pos_y']])
+            meas_note = ''
+        else:
+            meas_note = 'inconclusive: run_active low or pos_reset_n changed in the run (O6-11)'
     rows, s_prev, t_prev = [], 0.0, 0.0
     first_trk, t_prog, done = None, None, False
     for k in range(len(t)):
@@ -283,7 +292,10 @@ def evaluate_v7(log, path, sch, lsum=0.24):
         s_prev, t_prev = s_car, t[k]
         if t_prog is None and s_car >= path.S - D:
             t_prog = t[k]
-        if t_prog is not None and c25[k]:
+        # close the window early only while condition 1 can be trusted: no tracking error, or
+        # progress reached before the first one (S3C-4); otherwise score up to the deadline
+        trusted = first_trk is None or (t_prog is not None and t_prog < first_trk)
+        if t_prog is not None and c25[k] and trusted:
             done = True
             break
     t_end = rows[-1]['t']
@@ -313,6 +325,7 @@ def evaluate_v7(log, path, sch, lsum=0.24):
         ds_max=float(ds.max()), ds_min=float(ds.min()), e_trk_max=float(e['e_trk'].max()),
         e_perp_rms=float(np.sqrt(np.mean(e['e_perp'] ** 2))), e_trk_rms=float(np.sqrt(np.mean(e['e_trk'] ** 2))),
         e_meas_perp_max=float(np.nanmax(np.abs(e['e_meas_perp']))) if fw_pose is not None else np.nan,
+        e_meas_note=meas_note,
         tv_duty=float(np.sum(np.abs(np.diff(duty, axis=0))) / max(tm[-1] - tm[0], 1e-9)),
         sat_frac=float(np.mean(pwm)), sat_any_frac=float(np.mean(pwm.any(axis=1))),
         stop_dist_origin=last['dist_origin'], stop_x=last['x'], stop_y=last['y'],

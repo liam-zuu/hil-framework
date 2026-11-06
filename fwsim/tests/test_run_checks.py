@@ -20,7 +20,7 @@ P = {n: i for i, n in enumerate(fwsim.POS_COLS)}
 def test_plant_meta_has_source_blobs():
     d = json.loads(fwsim.plant_meta(fwsim.MecanumParams()))
     assert d['src'] == fwsim.PLANT_SRC == plant_source()
-    assert all(len(v) == 40 for v in d['src'].values())
+    assert all(len(d['src'][k]) == 40 for k in ('plant_step_py', 'params_py')) and d['src']['method']
 
 
 def test_run_validity_without_pos_columns():

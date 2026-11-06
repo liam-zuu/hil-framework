@@ -10,21 +10,27 @@ trajectory packet (main.c), so a run whose packets go stale and come back has it
 in the middle; that run is broken and is run again. The protocol is not changed (A1).
 
 One log or one simulation is taken as one run (the same assumption as the metric window of
-s02_metrics.py): the run spans the first to the last line with run_active = 1, and every
-increase of pos_reset_n inside that span is a mid-run reset. The reset at the start of the
-run happens before its first active line is logged (pos_step runs before the logger), so it
-is not counted.
+s02_metrics.py): the run spans the first line with run_active = 1 to the END of the log
+(Codex S3C-7: the active line of a reset can be lost while later inactive lines still carry
+the higher count), and every increase of pos_reset_n inside that span is a mid-run reset.
+The reset at the start of the run happens before its first active line is logged (pos_step
+runs before the logger), so it is not counted. A log with motor-off lines after the first
+active line and an increase after them may hold a second run (S3C-8): refused, not merged.
+Give the rows before any filtering (s02_metrics keeps them for this).
 """
 import numpy as np
 
 
-def pos_reset_mid(run_active, reset_n):
+def pos_reset_mid(run_active, reset_n, motor_on=None):
     """Number of pose resets inside the run, or None when the log cannot show it.
 
-    run_active, reset_n: per-line arrays (NaN = empty field). None when either column is
-    missing or empty (firmware before pos_ctrl.c / run_active, 05/11), or when no line has
-    run_active = 1. Lines with an empty pos_reset_n inside the span are skipped; the counter
-    only grows, so a lost line cannot hide a reset that later lines still show.
+    run_active, reset_n (and motor_on, optional): per-line arrays of every logged line in log
+    order (NaN = empty field). None when run_active or reset_n is missing or empty (firmware
+    before pos_ctrl.c / run_active, 05/11), or when no line has run_active = 1. Lines with an
+    empty pos_reset_n are skipped; the counter only grows, so a lost line cannot hide a reset
+    that later lines still show. Raises ValueError when the counter goes back (restart, bad
+    line) or when it grows after a motor-off line that follows the first active line (the log
+    may hold more than one run, S3C-8).
     """
     if run_active is None or reset_n is None:
         return None
@@ -35,13 +41,26 @@ def pos_reset_mid(run_active, reset_n):
     act = np.flatnonzero(ra == 1)
     if act.size == 0:
         return None
-    span = rn[act[0]:act[-1] + 1]
-    span = span[np.isfinite(span)]
-    if span.size == 0:
+    k0 = int(act[0])
+    span = rn[k0:]
+    fin = np.isfinite(span)
+    if not fin.any():
         return None
-    if np.any(np.diff(span) < 0):
+    vals = span[fin]
+    if np.any(np.diff(vals) < 0):
         raise ValueError('pos_reset_n goes back inside the run: a DUT restart or a bad line')
-    return int(span[-1] - span[0])
+    if motor_on is not None:
+        mo = np.asarray(motor_on, dtype=float)[k0:]
+        off = np.flatnonzero(mo == 0)
+        if off.size:
+            idx = np.flatnonzero(fin)
+            later = vals[idx > off[0]]
+            before = vals[idx < off[0]]
+            ref = before[-1] if before.size else vals[0]
+            if later.size and later.max() > ref:
+                raise ValueError('pos_reset_n grows after a motor-off stretch: the log may hold more '
+                                 'than one run; split it per run before checking (L37, S3C-8)')
+    return int(vals[-1] - vals[0])
 
 
 def run_bad_fields(k):

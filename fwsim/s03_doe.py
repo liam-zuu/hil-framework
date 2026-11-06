@@ -28,15 +28,18 @@ Steps, as the spec orders them (section numbers of S03 v6):
        the thresholds of 5.2 (Y3: 20 % of Y3 of the default-gain run at the middle mu, same
        speed, from the sweep); y2_versions.csv: whether the two Y2 versions give the same
        significant set and signs (5.1); curvature.csv (5.4); fail_counts.csv (5.3).
-Outputs (section 7) in --out: sweep.csv, levels.csv, design.csv, determinism_check.csv, meta.yaml;
-in --out/sealed/ (L56): runs.csv, effects.csv, fail_counts.csv, curvature.csv, y2_versions.csv,
-design_inner.csv, notes.json, logs/.
+Outputs (section 7) in --out: sweep.csv, sweep_counts.csv, levels.csv, design.csv (centre +
+outer box), logs_sweep/, meta.yaml; in --out/sealed/ (L56): runs.csv, effects.csv,
+fail_counts.csv, curvature.csv, y2_versions.csv, determinism_check.csv, design_inner.csv,
+notes.json, stop.json, manifest.json (SHA-256 of the sealed files), logs/.
 
 L56 / S03 v6 section 1: the main design results (runs.csv, effects.csv and the tables of
-section 5) are NOT looked at before campaign A ends. This script prints only progress
-counts for the main design (no responses, no effects); the files are written and the
-meta.yaml records their SHA-256. The sweep (section 3.1) is a source of campaign A's domain
-and is printed.
+section 5) are NOT looked at before campaign A ends. Nothing derived from them leaves
+sealed/ (Codex S3C-1..S3C-3): no hash of a sealed file outside it, no child-process job file
+outside it, a stop in the main design prints only that S03 stopped, meta.yaml elapsed_s is
+the sweep time only and the determinism check is a count there. Every spec stop ends S03
+for both controllers (S3C-9). The sweep (section 3.1) is a source of campaign A's domain and
+is printed.
 
   python fwsim/s03_doe.py --out 05_DATA/results/S03/<date>_runNN --mu 0.5 --trial
   python fwsim/s03_doe.py --out ... --mu LOW MID HIGH --mu-source "MU_FLOOR/<run>: min, mean, max"
@@ -55,6 +58,7 @@ import json
 import math
 import os
 import pickle
+import struct
 import subprocess
 import sys
 import time
@@ -82,7 +86,8 @@ RESPONSES = ('e_perp_max', 'e_perp_max_cens', 'tv_duty', 'sat_frac')
 RUN_COLS = ['controller', 'point_id', 'box', 'mu', 'v', 'status', 'completed', 'e_perp_max', 'e_perp_max_cens',
             'e_perp_global_max', 'tv_duty', 'sat_frac', 'sat_any_frac', 'e_theta_lane_max_deg',
             'e_theta_cmd_max_deg', 'ds_absmax', 'e_trk_max', 't_end', 'e_s_absmax', 'track_err_frames',
-            'cond2_5_ever', 'pos_reset_mid']
+            'cond2_5_ever', 'pos_reset_mid', 'e_perp_rms', 'e_trk_rms', 'error']     # RMS: S3C-13; error: S3C-12
+SCALE_RTOL = 1e-9             # H/L >= 4 within float rounding of the log grid (S3C-6)
 
 
 class S03Stop(Exception):
@@ -188,8 +193,10 @@ def levels_from_sweep(grid, default, ok):
 
 
 def scale_of(L, H):
-    """('log', centre) when L > 0 and H/L >= 4, else ('lin', centre) (section 3.1)."""
-    if L > 0 and H / L >= 4.0:
+    """('log', centre) when L > 0 and H/L >= 4, else ('lin', centre) (section 3.1). The ratio is
+    compared with a relative tolerance: grid points from np.geomspace carry rounding, e.g.
+    L = 12.000000000000002 for the mathematical 12 (S3C-6)."""
+    if L > 0 and H / L >= 4.0 * (1.0 - SCALE_RTOL):
         return 'log', math.sqrt(L * H)
     return 'lin', (L + H) / 2.0
 
@@ -240,9 +247,22 @@ def log_digest(log):
                 hashlib.sha256(np.ascontiguousarray(v).tobytes()).hexdigest()) for k, v in sorted(log.items())}
 
 
-def row_text(row):
-    """runs.csv fields as exact text (repr keeps every bit of a float)."""
-    return {k: repr(row.get(k)) for k in RUN_COLS if k in row}
+def _bits(x):
+    """Exact representation: a float by its IEEE-754 bytes (NaN payloads too), others by repr."""
+    if isinstance(x, (float, np.floating)):
+        return 'f' + struct.pack('<d', float(x)).hex()
+    if isinstance(x, (bool, np.bool_)):
+        return 'b' + str(bool(x))
+    if isinstance(x, (int, np.integer)):
+        return 'i' + str(int(x))
+    return 'r' + repr(x)
+
+
+def row_text(row, ids=()):
+    """Every runs.csv field of one run, identifiers included, bit-exact (S3C-15). ids: the
+    (controller, point_id, box, mu, v) of the run."""
+    full = dict(zip(RUN_COLS[:5], ids), **row)
+    return {k: _bits(full.get(k)) for k in RUN_COLS}
 
 
 def child_main(job_path):
@@ -260,27 +280,37 @@ def child_main(job_path):
 
 
 def run_in_new_process(dll, runs, work):
-    """Run (ctrl, gains, v, mu) jobs in a fresh Python process (DLL loaded again)."""
+    """Run (ctrl, gains, v, mu) jobs in a fresh Python process (DLL loaded again). work must be
+    a folder under sealed/ when the runs belong to the main design (S3C-2); the job files are
+    removed in every case."""
+    os.makedirs(work, exist_ok=True)
     job = os.path.join(work, f'job_{time.time_ns()}.pkl')
-    with open(job, 'wb') as f:
-        pickle.dump(dict(dll=dll, runs=runs), f)
-    r = subprocess.run([sys.executable, os.path.abspath(__file__), '--child', job], capture_output=True, text=True)
-    if r.returncode != 0:
-        raise S03Stop(f'child process failed ({r.returncode}): {r.stderr[-2000:]}')
-    with open(job + '.out', 'rb') as f:
-        res = pickle.load(f)
-    os.remove(job)
-    os.remove(job + '.out')
-    return res
+    try:
+        with open(job, 'wb') as f:
+            pickle.dump(dict(dll=dll, runs=runs), f)
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), '--child', job], capture_output=True,
+                           text=True)
+        if r.returncode != 0:
+            raise S03Stop(f'child process failed ({r.returncode}): {r.stderr[-2000:]}')
+        with open(job + '.out', 'rb') as f:
+            return pickle.load(f)
+    finally:
+        for p in (job, job + '.out'):
+            if os.path.exists(p):
+                os.remove(p)
 
 
 # ── outputs ──────────────────────────────────────────────────────────────────────────
 
 def fmt(x):
-    if isinstance(x, bool):
+    """CSV text: Python and NumPy scalars as plain numbers (repr of np.float64 is
+    'np.float64(...)' in NumPy 2, S3C-14), booleans as true/false."""
+    if isinstance(x, (bool, np.bool_)):
         return 'true' if x else 'false'
-    if isinstance(x, float):
-        return repr(x)
+    if isinstance(x, (float, np.floating)):
+        return repr(float(x))
+    if isinstance(x, np.integer):
+        return int(x)
     return x
 
 
@@ -297,6 +327,20 @@ def save_log(d, name, log):
     np.savez_compressed(os.path.join(d, name + '.npz'), **log)
 
 
+def save_log_csv(d, name, log):
+    """log.csv of one run (S03 3.4: the four determinism points): one column per array column,
+    %.17g so every float64 reads back to the same bits."""
+    os.makedirs(d, exist_ok=True)
+    n = len(log['t'])
+    cols, data = [], []
+    for k in sorted(log):
+        a = np.asarray(log[k], dtype=float).reshape(n, -1)
+        cols += [k] if a.shape[1] == 1 else [f'{k}_{i}' for i in range(a.shape[1])]
+        data.append(a)
+    np.savetxt(os.path.join(d, name + '.csv'), np.hstack(data), delimiter=',', header=','.join(cols),
+               comments='', fmt='%.17g')
+
+
 def sha256_file(p):
     with open(p, 'rb') as f:
         return hashlib.sha256(f.read()).hexdigest()
@@ -304,11 +348,13 @@ def sha256_file(p):
 
 # ── analysis (section 5), pure functions on the runs ─────────────────────────────────
 
-def analyse(ctrl, box, pts, runs, mu_levels, speeds, y3_ref, notes=None):
+def analyse(ctrl, box, pts, runs, mu_levels, speeds, y3_ref, notes=None, no_conclusion=()):
     """effects.csv, curvature.csv, y2_versions.csv and fail_counts.csv rows of one controller and
     box. pts: [(point_id, codes)] of the box (128); runs: {(point_id, mu, v): row} incl. centre 0.
     notes: {(box, v): text} written in the 'note' column of every effect of that box and speed
-    (S03 3.2: outer box mostly not completed; inner box also: no conclusion on Y2-Y4)."""
+    (S03 3.2: outer box mostly not completed). no_conclusion: speeds where the inner box is
+    also mostly not completed: no effects, curvature or Y2 versions there, only the fail counts
+    (S03 3.2, S3C-11)."""
     notes = notes or {}
     eff, curv, ver, fails = [], [], [], []
     mu_mid = mu_levels[len(mu_levels) // 2]
@@ -317,7 +363,7 @@ def analyse(ctrl, box, pts, runs, mu_levels, speeds, y3_ref, notes=None):
     for v in speeds:
         def agg(fun, resp):
             return [fun([runs[(i, mu, v)][resp] for mu in mu_levels]) for i in ids]
-        for cond in [str(mu) for mu in mu_levels] + ['worst', 'range']:
+        for cond in ([] if v in no_conclusion else [str(mu) for mu in mu_levels] + ['worst', 'range']):
             cell = [runs[(i, mu, v)] for i in ids for mu in (mu_levels if cond in ('worst', 'range') else [float(cond)])]
             n_trk = sum(r['status'] == 'track_err' for r in cell)
             n_inc = sum(r['completed'] == 'inconclusive' for r in cell)
@@ -330,13 +376,17 @@ def analyse(ctrl, box, pts, runs, mu_levels, speeds, y3_ref, notes=None):
                 else:
                     y = [runs[(i, float(cond), v)][resp] for i in ids]
                 thr = THRESH.get(resp, Y3_REL * y3_ref[(ctrl, v)])
+                note = notes.get((box, v), '')
+                if resp == 'tv_duty' and thr == 0.0:            # S03 5.2: reference Y3 = 0 (S3C-13)
+                    note = '; '.join(x for x in (note, 'Y3 reference run is 0: every non-zero effect '
+                                                 'is reported') if x)
                 e = effects(codes, y)
                 sig_sets[resp] = {t: math.copysign(1.0, x) for t, x in e.items() if abs(x) > thr}
                 for t, x in e.items():
                     eff.append(dict(controller=ctrl, box=box, response=resp, v=v, mu=cond, term=t,
                                     order=t.count(':') + 1, effect=x, threshold=thr, significant=abs(x) > thr,
                                     censored='yes' if resp == 'e_perp_max_cens' else 'no',
-                                    n_track_err=n_trk, n_inconclusive=n_inc, note=notes.get((box, v), '')))
+                                    n_track_err=n_trk, n_inconclusive=n_inc, note=note))
                 if cond not in ('worst', 'range') and box == 'outer' and (0, float(cond), v) in runs:
                     c0 = runs[(0, float(cond), v)][resp]
                     diff = c0 - float(np.mean(y))
@@ -347,11 +397,17 @@ def analyse(ctrl, box, pts, runs, mu_levels, speeds, y3_ref, notes=None):
             same_set, same_sign = set(a) == set(b), all(a[t] == b[t] for t in set(a) & set(b))
             ver.append(dict(controller=ctrl, box=box, v=v, mu=cond, same_set=same_set, same_sign=same_sign,
                             main='as_measured' if same_set and same_sign else 'both'))
-        for mu in mu_levels:
-            rows = [runs[(i, mu, v)] for i in ids]
-            kinds = {'not_completed': [r['completed'] == 'false' for r in rows],
-                     'inconclusive': [r['completed'] == 'inconclusive' for r in rows],
-                     'saturated': [r['sat_frac'] > 0 for r in rows]}
+        for mu in list(mu_levels) + ['worst']:
+            if mu == 'worst':    # S03 5.1: Y1 robust = completed at every mu (S3C-13)
+                per = [[runs[(i, m, v)] for m in mu_levels] for i in ids]
+                kinds = {'not_completed': [any(r['completed'] == 'false' for r in rs) for rs in per],
+                         'inconclusive': [any(r['completed'] == 'inconclusive' for r in rs) for rs in per],
+                         'saturated': [any(r['sat_frac'] > 0 for r in rs) for rs in per]}
+            else:
+                rows = [runs[(i, mu, v)] for i in ids]
+                kinds = {'not_completed': [r['completed'] == 'false' for r in rows],
+                         'inconclusive': [r['completed'] == 'inconclusive' for r in rows],
+                         'saturated': [r['sat_frac'] > 0 for r in rows]}
             for kind, flag in kinds.items():
                 flag = np.array(flag)
                 for r_ in (1, 2):
@@ -379,6 +435,21 @@ def git_state(repo):
         return dict(commit='UNKNOWN', dirty=True, modified=[str(e)])
 
 
+def sweep_counts(rows):
+    """S03 5.3 for the sweep (S3C-13): per controller, factor, speed, mu: points, not completed,
+    inconclusive, saturated."""
+    out = {}
+    for r in rows:
+        k = (r['controller'], r['factor'], r['v'], r['mu'])
+        c = out.setdefault(k, dict(controller=k[0], factor=k[1], v=k[2], mu=k[3], n=0, not_completed=0,
+                                   inconclusive=0, saturated=0))
+        c['n'] += 1
+        c['not_completed'] += r.get('completed') == 'false'
+        c['inconclusive'] += r.get('completed') == 'inconclusive'
+        c['saturated'] += bool(r.get('sat_frac', 0) and r['sat_frac'] > 0)
+    return list(out.values())
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--out', required=True)
@@ -387,7 +458,7 @@ def main():
     ap.add_argument('--mu-source', default='', help='where the mu levels come from (meta.yaml)')
     ap.add_argument('--trial', action='store_true', help='tool check (S03 11.3): never main numbers')
     ap.add_argument('--gate-speeds', type=float, nargs='+', default=list(SPEEDS),
-                    help='speeds still in the O1 gate (O1 v7 3.9); the level rule uses only these')
+                    help='speeds still in the O1 gate (O1 v7 3.9): a non-empty subset of 0.2 0.5 0.8')
     ap.add_argument('--controllers', nargs='+', default=list(CONTROLLERS), choices=CONTROLLERS)
     ap.add_argument('--child', default=None, help=argparse.SUPPRESS)
     a = ap.parse_args()
@@ -395,9 +466,15 @@ def main():
         sys.exit('--mu needs three levels (S03 2.2); a single level only with --trial')
     if a.trial and a.mu != [0.5]:
         sys.exit('--trial runs with mu 0.5 only (S03 2.2: the fwsim assumption)')
+    if not a.gate_speeds or any(not any(math.isclose(g, s) for s in SPEEDS) for g in a.gate_speeds):
+        sys.exit(f'--gate-speeds must be a non-empty subset of {list(SPEEDS)} (S3C-10)')
+    gate = [s for s in SPEEDS if any(math.isclose(g, s) for g in a.gate_speeds)]
     if os.path.isdir(a.out) and os.listdir(a.out):
         sys.exit(f'{a.out} already holds data: use a new folder.')
-    os.makedirs(a.out, exist_ok=True)
+    sealed = os.path.join(a.out, 'sealed')
+    os.makedirs(sealed, exist_ok=True)
+    work_pub, work_sealed = os.path.join(a.out, '_work'), os.path.join(sealed, '_work')
+    sealed_logs = os.path.join(sealed, 'logs')        # determinism points, centre, runs not completed (L56)
     mu_levels = sorted(a.mu)
     mu_mid = mu_levels[len(mu_levels) // 2]
     fw = fwsim.FirmwareSim(a.dll)
@@ -405,29 +482,46 @@ def main():
         print('WARNING: fwsim.dll was built from a dirty firmware tree; not usable as a main result')
     path = o1.Path8()
     t0 = time.time()
-    sweep_rows, level_rows, design_rows, all_runs = [], [], [], []
-    sealed_logs = os.path.join(a.out, 'sealed', 'logs')     # determinism points, centre, runs not completed (L56)
-    inner_rows = []
-    eff_rows, curv_rows, ver_rows, fail_rows, det_rows, stops, inner_run = [], [], [], [], [], {}, {}
-    y3_ref, rerun_notes = {}, []
+    sweep_rows, level_rows, design_rows, inner_rows, all_runs = [], [], [], [], []
+    eff_rows, curv_rows, ver_rows, fail_rows, det_rows = [], [], [], [], []
+    y3_ref, rerun_notes, inner_run, no_concl = {}, [], {}, {}
+    stop_public, stop_sealed = None, None
+    t_sweep_end = None
 
-    def checked(ctrl, g, v, mu):
+    def checked(ctrl, g, v, mu, ids=None):
+        """One run; a run_error is recorded (S3C-12), rerun once in a new process for diagnosis
+        (B8b-20), then S03 stops. ids = (point_id, box) for a main-design run (sealed)."""
         row, log = safe_run(fw, path, ctrl, g, v, mu)
-        if row['status'] == 'run_error':
-            again = run_in_new_process(a.dll, [(ctrl, g, v, mu)], a.out)[0]['row']
-            rerun_notes.append(dict(controller=ctrl, gains=g, v=v, mu=mu, first=row.get('error'),
-                                    second=again.get('error', 'ran')))
-            raise S03Stop(f'run_error at {ctrl} {g} v={v} mu={mu}: {row.get("error")}; rerun in a new process: '
-                          f'{again.get("error", "ran (fwsim not deterministic there)")} (B8b-20: S03 stops, '
-                          'CODE finds the cause)')
-        return row, log
-
-    for ctrl in a.controllers:
+        if row['status'] != 'run_error':
+            return row, log
+        if ids is not None:
+            all_runs.append(dict(controller=ctrl, point_id=ids[0], box=ids[1], mu=mu, v=v, **row))
+        note = dict(controller=ctrl, gains=g, v=v, mu=mu, point=ids, first=row.get('error'))
+        rerun_notes.append(note)
         try:
-            dflt = defaults(fw, ctrl)
+            again = run_in_new_process(a.dll, [(ctrl, g, v, mu)], work_pub if ids is None else work_sealed)[0]['row']
+            note['second'] = again.get('error', 'ran (fwsim not deterministic there)')
+        except S03Stop as exc:
+            note['second'] = f'diagnosis process failed: {exc}'
+        raise S03Stop(f'run_error at {ctrl} {g} v={v} mu={mu}: {note["first"]}; rerun in a new process: '
+                      f'{note["second"]} (B8b-20: S03 stops, CODE finds the cause)')
+
+    try:
+        # 3.1 (i) first, for every controller, so S03 stops before any sweep (S3C-9)
+        dflts = {}
+        for ctrl in a.controllers:
+            dflts[ctrl] = defaults(fw, ctrl)
+            for v in SPEEDS:
+                row, log = checked(ctrl, dflts[ctrl], v, mu_mid)
+                if v in gate and row['completed'] != 'true':
+                    raise S03Stop(f'{ctrl}: default gains do not complete at gate speed {v} (y1 '
+                                  f'{row["completed"]}, S03 3.1 (i))')
+        # 3.1 sweep and levels, every controller (S3C-9: a stop ends S03)
+        levels = {}
+        for ctrl in a.controllers:
+            dflt = dflts[ctrl]
             lo_b, hi_b = tune_ga.BOUNDS[ctrl]
-            # 3.1 sweep
-            levels = {}
+            levels[ctrl] = {}
             for j, name in enumerate(FACTORS[ctrl]):
                 grid = sweep_grid(name, dflt[name], lo_b[j], hi_b[j])
                 ok = []
@@ -435,140 +529,167 @@ def main():
                     g = dict(dflt, **{name: x})
                     done = True
                     for v in SPEEDS:
-                        row, _ = checked(ctrl, g, v, mu_mid)
+                        row, log = checked(ctrl, g, v, mu_mid)
                         sweep_rows.append(dict(controller=ctrl, factor=name, value=x, is_default=x == dflt[name],
                                                v=v, mu=mu_mid, **row))
                         if x == dflt[name]:
                             y3_ref[(ctrl, v)] = row['tv_duty']
-                        if v in a.gate_speeds:
+                        if row['completed'] != 'true':          # sweep is public: its failed logs too (S3C-20)
+                            save_log(os.path.join(a.out, 'logs_sweep'), f'{ctrl}_{name}_{x:.6g}_v{v}', log)
+                        if v in gate:
                             done &= row['completed'] == 'true'
                     ok.append(done)
                     print(f'[sweep {ctrl}] {name} = {x:.4g}: completes at gate speeds = {done}', flush=True)
                 try:
                     L, H = levels_from_sweep(grid, dflt[name], ok)
                 except S03Stop as exc:
-                    raise S03Stop(f'{name}: {exc}') from None
+                    raise S03Stop(f'{ctrl} {name}: {exc}') from None
                 sc, centre = scale_of(L, H)
-                levels[name] = (L, H, sc)
+                levels[ctrl][name] = (L, H, sc)
                 level_rows.append(dict(controller=ctrl, factor=name, L=L, H=H, centre=centre, scale=sc,
                                        default=dflt[name], rule_note='longest completing run of the grid with the '
-                                       'default, gate speeds ' + ' '.join(map(str, a.gate_speeds))))
+                                       'default, gate speeds ' + ' '.join(map(str, gate))))
                 print(f'[levels {ctrl}] {name}: L={L:.4g} H={H:.4g} scale={sc}', flush=True)
-            same = [n for n, (L, H, _) in levels.items() if L == H]
+            same = [n for n, (L, H, _) in levels[ctrl].items() if L == H]
             if same:
-                raise S03Stop(f'L = H for {same} (S03 3.1 (ii)): Liam decides, no main design')
-            # 3.1 extra: default gains at low / high mu too (section 5.2: reported, not the threshold base)
-            for mu in mu_levels:
+                raise S03Stop(f'{ctrl}: L = H for {same} (S03 3.1 (ii)): Liam decides, no main design')
+            for mu in mu_levels:        # default gains at low / high mu too (5.2: reported, not the base)
                 if mu == mu_mid:
                     continue
                 for v in SPEEDS:
                     row, _ = checked(ctrl, dflt, v, mu)
                     sweep_rows.append(dict(controller=ctrl, factor='(default)', value='', is_default=True,
                                            v=v, mu=mu, **row))
+        t_sweep_end = time.time()
+    except S03Stop as exc:
+        stop_public = str(exc)                          # sweep phase: public (S03 3.1 is not sealed)
+        print(f'[STOP] {exc}', flush=True)
 
-            # 3.2 design
-            def gains_at(codes):
-                return {n: decode(c, *levels[n]) for n, c in zip(FACTORS[ctrl], codes)}
-            boxes = [('outer', design_points(1.0, 1))]
-            runs, keep_logs = {}, {}
-            centre_codes = (0.0,) * 7
-            rng = np.random.default_rng(DET_SEED)
-            det_ids = [0] + sorted(int(x) for x in rng.choice(np.arange(1, 129), size=3, replace=False))
-            design_rows.append(dict(controller=ctrl, point_id=0, box='centre',
-                                    **{f'X{k + 1}': 0.0 for k in range(7)},
-                                    **{f'{n}_value': v_ for n, v_ in gains_at(centre_codes).items()}))
-            todo = [(0, 'centre', centre_codes)]
-            for pid, codes in boxes[0][1]:
-                design_rows.append(dict(controller=ctrl, point_id=pid, box='outer',
-                                        **{f'X{k + 1}': c for k, c in enumerate(codes)},
-                                        **{f'{n}_value': v_ for n, v_ in gains_at(codes).items()}))
-                todo.append((pid, 'outer', codes))
+    if stop_public is None:
+        try:
+            for ctrl in a.controllers:
+                lv = levels[ctrl]
 
-            def run_points(points):
-                # L56: nothing about the main design goes to the console (not even run counts, which
-                # would tell whether the inner box ran)
-                for pid, box, codes in points:
-                    g = gains_at(codes)
-                    for mu in mu_levels:
-                        for v in SPEEDS:
-                            row, log = checked(ctrl, g, v, mu)
-                            runs[(pid, mu, v)] = row
-                            all_runs.append(dict(controller=ctrl, point_id=pid, box=box, mu=mu, v=v, **row))
-                            if pid in det_ids and box != 'inner':
-                                keep_logs[(pid, mu, v)] = (g, row, log_digest(log))
-                            if pid in det_ids and box != 'inner' or box == 'centre' or row['completed'] != 'true':
-                                save_log(sealed_logs, f'{ctrl}_p{pid}_mu{mu}_v{v}', log)
-            print(f'[design {ctrl}] running the main design (results sealed, L56)', flush=True)
-            run_points(todo)
-            corner_ids = [p for p, _ in boxes[0][1]]
-            need_inner = [v for v in SPEEDS
-                          if sum(runs[(i, mu_mid, v)]['completed'] == 'false' for i in corner_ids) > 64]
-            inner_run[ctrl] = bool(need_inner)
-            if need_inner:
-                inner = design_points(0.5, 129)
-                boxes.append(('inner', inner))
-                for pid, codes in inner:
-                    inner_rows.append(dict(controller=ctrl, point_id=pid, box='inner',
+                def gains_at(codes):
+                    return {n: decode(c, *lv[n]) for n, c in zip(FACTORS[ctrl], codes)}
+                boxes = [('outer', design_points(1.0, 1))]
+                runs, keep_logs = {}, {}
+                centre_codes = (0.0,) * 7
+                rng = np.random.default_rng(DET_SEED)
+                det_ids = [0] + sorted(int(x) for x in rng.choice(np.arange(1, 129), size=3, replace=False))
+                design_rows.append(dict(controller=ctrl, point_id=0, box='centre',
+                                        **{f'X{k + 1}': 0.0 for k in range(7)},
+                                        **{f'{n}_value': v_ for n, v_ in gains_at(centre_codes).items()}))
+                todo = [(0, 'centre', centre_codes)]
+                for pid, codes in boxes[0][1]:
+                    design_rows.append(dict(controller=ctrl, point_id=pid, box='outer',
                                             **{f'X{k + 1}': c for k, c in enumerate(codes)},
                                             **{f'{n}_value': v_ for n, v_ in gains_at(codes).items()}))
-                run_points([(p, 'inner', c) for p, c in inner])
-            notes = {('outer', v): 'most corners not completed at the middle mu (S03 3.2): reported with this '
-                     'warning; see the inner box' for v in need_inner}
-            for v in need_inner:
-                if sum(runs[(p, mu_mid, v)]['completed'] == 'false' for p, _ in boxes[1][1]) > 64:
-                    notes[('inner', v)] = ('inner box also mostly not completed at the middle mu (S03 3.2): '
-                                           'NO conclusion on Y2-Y4 effects at this speed')
+                    todo.append((pid, 'outer', codes))
 
-            # 3.4 determinism in a new process
-            jobs = sorted(keep_logs)
-            res = run_in_new_process(a.dll, [(ctrl, keep_logs[j][0], j[2], j[1]) for j in jobs], a.out)
-            bad = []
-            for j, r in zip(jobs, res):
-                g, row0, dig0 = keep_logs[j]
-                same_log = r['digest'] == dig0
-                same_row = row_text(r['row']) == row_text(row0)
-                det_rows.append(dict(controller=ctrl, point_id=j[0], mu=j[1], v=j[2], log_arrays_equal=same_log,
-                                     runs_fields_equal=same_row, n_arrays=len(dig0)))
-                if not (same_log and same_row):
-                    bad.append(j)
-            if bad:
-                raise S03Stop(f'determinism check failed at {bad} (S03 3.4): stop, tell CODE and THESIS')
+                def run_points(points):
+                    # L56: nothing about the main design goes to the console or outside sealed/
+                    for pid, box, codes in points:
+                        g = gains_at(codes)
+                        for mu in mu_levels:
+                            for v in SPEEDS:
+                                row, log = checked(ctrl, g, v, mu, ids=(pid, box))
+                                runs[(pid, mu, v)] = row
+                                all_runs.append(dict(controller=ctrl, point_id=pid, box=box, mu=mu, v=v, **row))
+                                name = f'{ctrl}_p{pid}_mu{mu}_v{v}'
+                                if pid in det_ids and box != 'inner':
+                                    keep_logs[(pid, mu, v)] = (g, box, row, log_digest(log))
+                                    save_log_csv(sealed_logs, name, log)          # S03 3.4: log.csv
+                                if box == 'centre' or row['completed'] != 'true':
+                                    save_log(sealed_logs, name, log)
+                print(f'[design {ctrl}] running the main design (results sealed, L56)', flush=True)
+                run_points(todo)
+                corner_ids = [p for p, _ in boxes[0][1]]
+                need_inner = [v for v in SPEEDS
+                              if sum(runs[(i, mu_mid, v)]['completed'] == 'false' for i in corner_ids) > 64]
+                inner_run[ctrl] = bool(need_inner)
+                if need_inner:
+                    inner = design_points(0.5, 129)
+                    boxes.append(('inner', inner))
+                    for pid, codes in inner:
+                        inner_rows.append(dict(controller=ctrl, point_id=pid, box='inner',
+                                               **{f'X{k + 1}': c for k, c in enumerate(codes)},
+                                               **{f'{n}_value': v_ for n, v_ in gains_at(codes).items()}))
+                    run_points([(p, 'inner', c) for p, c in inner])
+                notes = {('outer', v): 'most corners not completed at the middle mu (S03 3.2): reported with this '
+                         'warning; see the inner box' for v in need_inner}
+                no_concl[ctrl] = [v for v in need_inner
+                                  if sum(runs[(p, mu_mid, v)]['completed'] == 'false' for p, _ in boxes[1][1]) > 64]
 
-            # 5 analysis
-            for box, pts in boxes:
-                e, c, vr, f = analyse(ctrl, box, pts, runs, mu_levels, SPEEDS, y3_ref, notes)
-                eff_rows += e
-                curv_rows += c
-                ver_rows += vr
-                fail_rows += f
+                # 3.4 determinism in a new process (job files under sealed/, S3C-2)
+                jobs = sorted(keep_logs)
+                res = run_in_new_process(a.dll, [(ctrl, keep_logs[j][0], j[2], j[1]) for j in jobs], work_sealed)
+                for j, r in zip(jobs, res):
+                    g, box, row0, dig0 = keep_logs[j]
+                    ids = (ctrl, j[0], box, j[1], j[2])
+                    det_rows.append(dict(controller=ctrl, point_id=j[0], mu=j[1], v=j[2],
+                                         log_arrays_equal=r['digest'] == dig0,
+                                         runs_fields_equal=row_text(r['row'], ids) == row_text(row0, ids),
+                                         n_arrays=len(dig0)))
+                if not all(d['log_arrays_equal'] and d['runs_fields_equal'] for d in det_rows):
+                    raise S03Stop('determinism check failed (S03 3.4): stop, tell CODE and THESIS')
+
+                # 5 analysis
+                for box, pts in boxes:
+                    e, c, vr, f = analyse(ctrl, box, pts, runs, mu_levels, SPEEDS, y3_ref, notes,
+                                          no_conclusion=no_concl[ctrl])
+                    eff_rows += e
+                    curv_rows += c
+                    ver_rows += vr
+                    fail_rows += f
         except S03Stop as exc:
-            stops[ctrl] = str(exc)
-            print(f'[STOP {ctrl}] {exc}', flush=True)
+            stop_sealed = str(exc)
+            print('[STOP] S03 stopped in the main design; the reason is in sealed/stop.json (L56)', flush=True)
 
-    elapsed = time.time() - t0
-    files = {}
-    sealed = os.path.join(a.out, 'sealed')
-    os.makedirs(sealed, exist_ok=True)
+    t_end = time.time()
+    # sealed outputs, with their own manifest (no hash of a sealed file outside sealed/, S3C-1)
+    sealed_files = {}
+    for name, rows, cols in (('runs.csv', all_runs, RUN_COLS), ('effects.csv', eff_rows, None),
+                             ('curvature.csv', curv_rows, None), ('y2_versions.csv', ver_rows, None),
+                             ('fail_counts.csv', fail_rows, None), ('design_inner.csv', inner_rows, None),
+                             ('determinism_check.csv', det_rows, None)):
+        p = os.path.join(sealed, name)
+        write_csv(p, rows, cols)
+        sealed_files[name] = sha256_file(p)
     with open(os.path.join(sealed, 'notes.json'), 'w', encoding='utf-8') as f:
-        json.dump(dict(inner_box_run=inner_run), f, indent=1)
-    for d, name, rows in ((a.out, 'sweep.csv', sweep_rows), (a.out, 'levels.csv', level_rows),
-                          (a.out, 'design.csv', design_rows), (a.out, 'determinism_check.csv', det_rows),
-                          (sealed, 'design_inner.csv', inner_rows), (sealed, 'runs.csv', all_runs),
-                          (sealed, 'effects.csv', eff_rows), (sealed, 'curvature.csv', curv_rows),
-                          (sealed, 'y2_versions.csv', ver_rows), (sealed, 'fail_counts.csv', fail_rows)):
-        p = os.path.join(d, name)
-        write_csv(p, rows, RUN_COLS if name == 'runs.csv' else None)
-        files[os.path.relpath(p, a.out).replace(os.sep, '/')] = sha256_file(p)
-    files['sealed/notes.json'] = sha256_file(os.path.join(sealed, 'notes.json'))
+        json.dump(dict(inner_box_run=inner_run, no_conclusion_speeds=no_concl, stop=stop_sealed,
+                       run_error_reruns=[n for n in rerun_notes if n['point'] is not None],
+                       elapsed_s_total=round(t_end - t0), elapsed_s_main_design=(
+                           round(t_end - t_sweep_end) if t_sweep_end else None)), f, indent=1, default=str)
+    sealed_files['notes.json'] = sha256_file(os.path.join(sealed, 'notes.json'))
+    if stop_sealed:
+        with open(os.path.join(sealed, 'stop.json'), 'w', encoding='utf-8') as f:
+            json.dump(dict(stop=stop_sealed), f, indent=1)
+    with open(os.path.join(sealed, 'manifest.json'), 'w', encoding='utf-8') as f:
+        json.dump(dict(files=sealed_files), f, indent=1)
+    # public outputs: sweep only (S03 3.1 is a source of campaign A's domain) and the design points
+    files = {}
+    for name, rows in (('sweep.csv', sweep_rows), ('sweep_counts.csv', sweep_counts(sweep_rows)),
+                       ('levels.csv', level_rows), ('design.csv', design_rows)):
+        p = os.path.join(a.out, name)
+        write_csv(p, rows)
+        files[name] = sha256_file(p)
+    n_det = len(det_rows)
+    det_public = (f'{sum(d["log_arrays_equal"] and d["runs_fields_equal"] for d in det_rows)}/{n_det} equal'
+                  if n_det else 'not run')
     b = fw.build_info
     dll_sha = sha256_file(a.dll)
+    sweep_s = round((t_sweep_end or t_end) - t0)
+    status = ('stopped in the sweep: ' + stop_public if stop_public else
+              'stopped in the main design (reason sealed)' if stop_sealed else 'ran to the end')
     with open(os.path.join(a.out, 'meta.yaml'), 'w', encoding='utf-8') as f:
         f.write(f"""spec: S03 v6 (06_SPECS/2026-11-05_Spec_S03_DOE_chon_gain.md)
 date: {time.strftime('%Y-%m-%d')}
 setup: sim                     # fwsim: ESP32 firmware C code (DLL) + rpi5/plant_step.py, NOT hardware
 operator: Claude (phiên CODE)
 trial: {str(a.trial).lower()}     # true: tool check with mu 0.5 (S03 2.2, 11.3), never main numbers
-sealed: "L56 / S03 section 1: runs.csv, effects.csv and the section 5 tables are not looked at before campaign A ends; their SHA-256 below"
+sealed: "L56 / S03 section 1: everything derived from the main-design responses is in sealed/ (with its own manifest.json) and is not looked at before campaign A ends"
+status: {json.dumps(status)}
 script: {json.dumps(git_state(os.path.join(HERE, '..')))}
 firmware:
   esp32: {json.dumps(b.get('esp32'))}
@@ -584,35 +705,39 @@ mu_source: "{a.mu_source or ('trial: fwsim assumption 0.5 (params.py), no MU_FLO
 imu: {json.dumps(IMU)}
 seed: {SEED}                       # plant has no random input
 determinism_seed: {DET_SEED}       # draws the 3 corners of the determinism check (S03 3.4)
+determinism: "{det_public}"        # per-run detail in sealed/determinism_check.csv
 speeds: {json.dumps(list(SPEEDS))}
-gate_speeds: {json.dumps(a.gate_speeds)}
+gate_speeds: {json.dumps(gate)}
 controllers: {json.dumps(a.controllers)}
 factors: {json.dumps(FACTORS)}
 temporary_bounds_for_the_grid: {json.dumps({m: tune_ga.BOUNDS[m] for m in a.controllers})}   # tune_ga.BOUNDS (S03 3.1)
 thresholds: {json.dumps(dict(THRESH, tv_duty=f'{Y3_REL:.0%} of the default-gain run, middle mu, same speed'))}
 y3_reference: {json.dumps({f'{c} v={v}': y for (c, v), y in y3_ref.items()})}
 o1: {json.dumps(dict(A=o1.A, a_r=o1.A_R, D=o1.D, D_d=o1.D, t_d=o1.T_D, t_late=o1.T_LATE, delta=o1.DELTA, v_d=o1.V_D, c_cens=o1.C_CENS))}
-stops: {json.dumps(stops)}
-run_error_reruns: {json.dumps(rerun_notes)}
+sweep_run_error_reruns: {json.dumps([n for n in rerun_notes if n['point'] is None], default=str)}
 interpretations:   # of this script, not written in S03 v6 / O1 v7; Liam or THESIS correct if wrong
-  - "completion: conditions 1, 2, 5 at the instant, condition 3 as the trailing unbroken t_d window (o1_feasibility.evaluate_v7)"
+  - "completion: conditions 1, 2, 5 at the instant, condition 3 as the trailing unbroken t_d window, condition 4 strictly before the deadline; after a tracking error that came before the progress, the window runs to the deadline (o1_feasibility.evaluate_v7)"
   - "sweep level rule: a point is 'completing' only with y1 'true' at every gate speed (inconclusive breaks the run)"
   - "inner box trigger: corners with y1 'false' only (inconclusive not counted)"
-  - "one run per (point, mu, speed) for the centre too; logs saved (npz of every fwsim.simulate array, exact bits; spec section 7 says log.csv) for the determinism points, the centre and every run with y1 not 'true', all in sealed/logs/ (they are main-design results)"
-  - "sealed/ holds everything derived from the main-design responses (L56), including whether the inner box ran (sealed/notes.json, sealed/design_inner.csv)"
-  - "a controller that hits a stop of the spec is stopped; the other controller still runs (meta 'stops')"
-elapsed_s: {elapsed:.0f}
+  - "a stop of the spec (3.1 (i), (ii), 3.4, run_error) ends S03 for both controllers; the default gains of every controller are checked first"
+  - "logs: log.csv (%.17g) of the four determinism points and npz (exact bits) of the centre and every main-design run not completed, all in sealed/logs/; npz of every sweep run not completed in logs_sweep/ (public, as the sweep)"
+  - "elapsed_s here is the sweep only; the total and the main-design time are in sealed/notes.json, because they tell whether the inner box ran (L56; S03 section 7 asks elapsed_s in meta.yaml)"
+  - "the upper-end tracking flag uses the 400 001-point path grid (about 15 um); at s = S the window is cut by the end of the path, not flagged (Codex S3C-5, deferred)"
+elapsed_s: {sweep_s}
 file_sha256: {json.dumps(files)}
 files:
   - sweep.csv: "one line per sweep run (section 3.1) and default gains at the other mu levels"
+  - sweep_counts.csv: "section 5.3 for the sweep: runs not completed, inconclusive, saturated per factor, speed, mu"
   - levels.csv: "L, H, centre, scale per factor"
-  - design.csv: "points: codes X1..X7 and real values"
   - design.csv: "centre + outer box (the inner box, if run, is in sealed/design_inner.csv)"
-  - determinism_check.csv: "section 3.4: new-process rerun, log arrays and runs fields equal"
-  - sealed/: "SEALED (L56): runs.csv (section 4 responses), effects.csv (every term, per box, response, speed, mu / worst / range), curvature.csv (5.4), y2_versions.csv (5.1), fail_counts.csv (5.3), design_inner.csv, notes.json, logs/"
+  - logs_sweep/: "npz of the sweep runs not completed"
+  - sealed/: "SEALED (L56): runs.csv (section 4 responses), effects.csv (every term, per box, response, speed, mu / worst / range), curvature.csv (5.4), y2_versions.csv (5.1), fail_counts.csv (5.3), determinism_check.csv (3.4), design_inner.csv, notes.json, stop.json, manifest.json, logs/"
 """)
-    print(f'S03 done in {elapsed:.0f} s -> {a.out}; stops: {stops or "none"}')
-    return 0 if not stops else 2
+    for d in (work_pub, work_sealed):
+        if os.path.isdir(d) and not os.listdir(d):
+            os.rmdir(d)
+    print(f'S03 finished -> {a.out}; status: {status}')
+    return 0 if not (stop_public or stop_sealed) else 2
 
 
 if __name__ == '__main__':

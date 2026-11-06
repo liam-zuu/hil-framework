@@ -16,28 +16,40 @@ import plant_blob  # noqa: E402
 from plant_blob import git_blob, plant_source, same_plant  # noqa: E402
 
 
-def test_crlf_and_lf_give_the_same_blob(tmp_path):
-    a, b = tmp_path / 'lf.py', tmp_path / 'crlf.py'
-    a.write_bytes(b'a = 1\nb = 2\n')
-    b.write_bytes(b'a = 1\r\nb = 2\r\n')
-    assert git_blob(str(a)) == git_blob(str(b))
+def _raw_blob(data):
+    import hashlib
+    return hashlib.sha1(b'blob %d\0' % len(data) + data).hexdigest()
 
 
-def test_any_change_changes_the_blob(tmp_path):
-    a, b = tmp_path / 'a.py', tmp_path / 'b.py'
-    a.write_bytes(b'"""doc"""\nk = 1\n')
-    b.write_bytes(b'"""doc."""\nk = 1\n')
-    assert git_blob(str(a)) != git_blob(str(b))
+def test_python_rule_crlf_lone_cr_nul():
+    """Fallback rule (git text=auto with core.autocrlf = true): CRLF stored as LF; a lone CR or a
+    NUL makes the file binary, stored as is (Codex S3C-16)."""
+    assert plant_blob.python_blob(b'a = 1\r\nb = 2\r\n') == _raw_blob(b'a = 1\nb = 2\n')
+    lone = b'k=1\r\n# tail\r'
+    assert plant_blob.python_blob(lone) == _raw_blob(lone)
+    nul = b'k=1\r\n\0'
+    assert plant_blob.python_blob(nul) == _raw_blob(nul)
+    assert plant_blob.python_blob(b'"""doc"""\nk = 1\n') != plant_blob.python_blob(b'"""doc."""\nk = 1\n')
 
 
 @pytest.mark.skipif(shutil.which('git') is None, reason='git not on PATH')
-def test_blob_matches_git_hash_object(tmp_path):
-    """Same value as git itself for a text file (hash-object without filters, LF content)."""
-    p = tmp_path / 'f.py'
-    p.write_bytes(b'print("hil")\n')
-    want = subprocess.run(['git', 'hash-object', '--no-filters', str(p)], capture_output=True,
-                          text=True, check=True).stdout.strip()
-    assert git_blob(str(p)) == want
+@pytest.mark.parametrize('autocrlf', ['true', 'false'])
+def test_blob_follows_the_repository_configuration(tmp_path, autocrlf):
+    """In a repository, git_blob is git's own value for that repository's core.autocrlf, for a
+    CRLF file and a file with a lone CR (S3C-16); with autocrlf true it equals the fallback."""
+    repo = tmp_path / 'r'
+    repo.mkdir()
+    subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+    subprocess.run(['git', '-C', str(repo), 'config', 'core.autocrlf', autocrlf], check=True)
+    for name, data in (('crlf.py', b'a = 1\r\nb = 2\r\n'), ('lone.py', b'k=1\r\n# tail\r')):
+        p = repo / name
+        p.write_bytes(data)
+        want = subprocess.run(['git', '-C', str(repo), 'hash-object', name], capture_output=True, text=True,
+                              check=True).stdout.strip()
+        blob, how = plant_blob.git_blob_with_method(str(p))
+        assert blob == want and how == 'git hash-object'
+        if autocrlf == 'true':
+            assert blob == plant_blob.python_blob(data)
 
 
 @pytest.mark.skipif(shutil.which('git') is None, reason='git not on PATH')
@@ -71,4 +83,4 @@ def test_frame_log_manifest_has_plant_src(tmp_path):
     node.run()
     man = json.loads(str(np.load(p)['manifest']))
     assert man['plant_src'] == plant_source()
-    assert set(man['plant_src']) == {'plant_step_py', 'params_py'}
+    assert set(man['plant_src']) == {'plant_step_py', 'params_py', 'method'}
