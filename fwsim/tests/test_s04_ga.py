@@ -110,8 +110,10 @@ def _s03_dir(tmp_path, runs=None, trial=False, mu=(0.4, 0.5, 0.6), levels=None):
             for pid, box in [(0, 'centre'), (1, 'outer'), (129, 'inner')]:
                 w.writerow([c, pid, box])
     y3 = {f'{c} v={v:g}': 5.0 for c in s3.CONTROLLERS for v in s3.SPEEDS}
+    dll_sha = s3.sha256_file(_DLL) if os.path.isfile(_DLL) else 'no dll'
     (d / 'meta.yaml').write_text(
         f'trial: {str(trial).lower()}     # x\nstatus: "ran to the end"\nmu_levels: {json.dumps(list(mu))}\n'
+        f'firmware:\n  dll_sha256: {dll_sha}\n'
         f'gate_speeds: {json.dumps(list(s3.SPEEDS))}\ny3_reference: {json.dumps(y3)}\n', encoding='utf-8')
     if runs is not None:
         s3.write_csv(str(d / 'sealed' / 'runs.csv'), runs)
@@ -305,16 +307,19 @@ def _lock(out, d, tool_check_common, tool_check_ctrl=None, fp=None, pre=None, bu
              preconditions=pre if pre is not None else {k: 'x' for k in s4.PRECONDITIONS}, hv_ref=[s4.D, 50.0],
              stop=None)
     out.mkdir(parents=True, exist_ok=True)
+    unsealed = not tool_check_common
     lock = dict(controllers=dict(PID=L), common=dict(tool_check=tool_check_common, s03_run=os.path.abspath(str(d)),
-                                                    fingerprint=fp or s4.fingerprint(_DLL, str(d)),
-                                                    s03_mu_levels=[0.4, 0.5, 0.6]), s03_mu_levels=[0.4, 0.5, 0.6])
+                                                    fingerprint=fp or s4.fingerprint(_DLL, str(d), unsealed=unsealed),
+                                                    s03_mu_levels=[0.4, 0.5, 0.6], unsealed=unsealed),
+                s03_mu_levels=[0.4, 0.5, 0.6])
     (out / 'lock.yaml').write_text(json.dumps(lock))
 
 
 @needs_dll
 def test_guard_one_mode_and_one_source_per_folder(tmp_path, monkeypatch):
-    """S4C-1: a tool-check lock never turns into a main-run lock; S4C-2: a changed DLL / S03 / plant /
-    script fingerprint stops the main phase and the post checks."""
+    """S4C-1: the trial and main guards refuse a lock.yaml (written by hand here) whose mode, budget,
+    preconditions or fingerprint do not fit the run. The fingerprint against real changed files,
+    through a real trial and the post phase: test_lock_from_a_real_trial_catches_changed_sources."""
     d = _s03_dir(tmp_path, _runs())
     out = tmp_path / 'o'
     pre = tmp_path / 'pre.json'
@@ -337,12 +342,50 @@ def test_guard_one_mode_and_one_source_per_folder(tmp_path, monkeypatch):
     _lock(out, d, False, pre={})                           # main flag but no preconditions
     with pytest.raises(SystemExit, match='not a main-run lock'):
         s4.main()
-    fp = s4.fingerprint(_DLL, str(d))
+    fp = s4.fingerprint(_DLL, str(d), unsealed=True)
     _lock(out, d, False, fp=dict(fp, dll_sha256='0' * 64))
     with pytest.raises(SystemExit, match='dll_sha256'):
         s4.main()
     _lock(out, d, False, fp=dict(fp, s03_files=dict(fp['s03_files'], **{'levels.csv': 'x'})))
     with pytest.raises(SystemExit, match='s03_files'):
+        s4.main()
+
+
+def _levels_near_defaults():
+    fw = fwsim.FirmwareSim(_DLL)                  # a domain around the firmware defaults: both controllers feasible
+    return {c: {n: ((v * 0.8, v * 1.25) if v > 0 else (0.0, 0.1)) for n, v in s3.defaults(fw, c).items()}
+            for c in s3.CONTROLLERS}
+
+
+@needs_dll
+def test_lock_from_a_real_trial_catches_changed_sources(tmp_path, monkeypatch):
+    """S4C-2, S4C-16: the lock is written by a real trial; with nothing changed main and post run;
+    one changed byte in a real S03 file stops main, and after main one in design.csv stops post; a
+    DLL that is not the S03 DLL stops the trial."""
+    d = _s03_dir(tmp_path, trial=True, mu=(0.5,), levels=_levels_near_defaults())
+    out = tmp_path / 'run'
+    common = ['--tool-check', '--controller', 'PID', '--s03', str(d), '--pop', '4', '--gen-base', '1',
+              '--gen-max', '1', '--dll', _DLL, '--out', str(out)]
+    monkeypatch.setattr(sys, 'argv', ['s04_ga.py', '--phase', 'trial'] + common)
+    assert s4.main() in (0, 2)
+    lv = d / 'levels.csv'
+    orig = lv.read_bytes()
+    lv.write_bytes(orig + b'\n')                                       # same content, other bytes
+    monkeypatch.setattr(sys, 'argv', ['s04_ga.py', '--phase', 'main', '--seeds', '1'] + common)
+    with pytest.raises(SystemExit, match='s03_files'):
+        s4.main()
+    lv.write_bytes(orig)
+    s4.main()                                                          # unchanged sources: main runs
+    dz = d / 'design.csv'
+    dz.write_bytes(dz.read_bytes() + b'\n')
+    with pytest.raises(SystemExit, match='s03_files'):
+        s4.post(s4_args(out))
+    meta = d / 'meta.yaml'
+    meta.write_text(meta.read_text(encoding='utf-8').replace(s3.sha256_file(_DLL), '0' * 64), encoding='utf-8')
+    monkeypatch.setattr(sys, 'argv', ['s04_ga.py', '--phase', 'trial', '--tool-check', '--controller', 'ADRC',
+                                      '--s03', str(d), '--pop', '4', '--gen-base', '1', '--gen-max', '1',
+                                      '--dll', _DLL, '--out', str(tmp_path / 'run2')])
+    with pytest.raises(SystemExit, match='not the DLL of the S03 run'):
         s4.main()
 
 
@@ -397,19 +440,74 @@ def test_extended_trial_equals_a_straight_run(monkeypatch):
     assert e1 and g1 == g2 == 5
     assert [r['x_a'] for r in h1] == [r['x_a'] for r in h2] and ev1.calls == ev2.calls
     assert [p['xga'] for p in f1] == [p['xga'] for p in f2]
-    assert all(p['gen'] != '' and p['id_note'] == '' for p in f1)       # every final point maps to its evaluation
+    # every final point carries its own evaluation id, and that evaluation holds the point's F, G
+    hist = {(r['gen'], r['cand_id']): r for r in h1}
+    for p in f1:
+        assert p['gen'] != '' and 'does not match' not in p['id_note'] and 'no eval_id' not in p['id_note']
+        h = hist[(p['gen'], p['cand_id'])]
+        assert (h['f1'], h['f2']) == (p['f1'], p['f2'])
 
 
-def test_points_of_maps_to_the_evaluation_with_the_same_scores():
-    """S4C-6: a vector evaluated twice with different results points to the evaluation whose F, G it holds."""
-    class Ind:
-        X = np.array([1.2, 2.0])
-        F = np.array([0.03, 4.0])
-        G = np.array([0.0, -0.7])
-    key = np.asarray(Ind.X, dtype=float).tobytes()
-    seen = {key: [(1, 4, (1e6, 1e6, 3.0, 1e6)), (3, 2, (0.03, 4.0, 0.0, -0.7))]}
-    p = s4.points_of([Ind()], DOM2, 1, seen)[0]
+def test_points_of_uses_the_eval_id_on_the_individual():
+    """S4C-6: a vector evaluated twice with the SAME F, G (for example two run_error penalties) maps
+    to the evaluation id the Individual carries, not to the first evaluation of the vector."""
+    from pymoo.core.individual import Individual
+    X, F, G = np.array([1.2, 2.0]), np.array([1e6, 1e6]), np.array([3.0, 1e6])
+    ind = Individual(X=X, F=F, G=G)
+    ind.set('eval_id', (3, 2))
+    seen = {X.tobytes(): [(1, 4, (1e6, 1e6, 3.0, 1e6)), (3, 2, (1e6, 1e6, 3.0, 1e6))]}
+    p = s4.points_of([ind], DOM2, 1, seen)[0]
     assert (p['gen'], p['cand_id']) == (3, 2) and 'more than once' in p['id_note']
+    bad = Individual(X=X, F=np.array([0.5, 0.5]), G=G)
+    bad.set('eval_id', (3, 2))
+    assert 'does not match' in s4.points_of([bad], DOM2, 1, seen)[0]['id_note']
+    assert 'no eval_id' in s4.points_of([Individual(X=X, F=F, G=G)], DOM2, 1, seen)[0]['id_note']
+
+
+def test_pareto_rows_feasible_and_infeasible_and_empty(tmp_path):
+    """S4C-R-2: pareto.csv holds the non-dominated feasible points and, separately, the non-dominated
+    infeasible ones; an empty set still gives a file with the header, and the merged file exists."""
+    pts = [P(0.02, 5.0, x=(1.1,)), P(0.03, 6.0, x=(1.2,)), P(0.01, 1.0, x=(1.3,), feasible=False),
+           P(0.02, 2.0, x=(1.4,), feasible=False)]
+    rows = s4.pareto_rows('PID', {1: pts})
+    assert [(r['feasible'], r['f1']) for r in rows] == [(True, 0.02), (False, 0.01)]
+    s4.write_rows(str(tmp_path / 'pareto_PID.csv'), s4.pareto_rows('PID', {1: []}), s4.POP_COLS)
+    s4.merge_controllers(str(tmp_path))
+    with open(tmp_path / 'pareto.csv', newline='') as f:
+        r = list(csv.reader(f))
+    assert r == [s4.POP_COLS]
+
+
+def test_root_meta_keeps_code_notes(tmp_path):
+    """S4C-R-1: notes of CODE in code_notes.json survive every rewrite of meta.yaml."""
+    yaml = pytest.importorskip('yaml')
+    (tmp_path / 'code_notes.json').write_text(json.dumps({'PID seed 3': 'rate 12 %: lane reversal, no tool error'}))
+    for _ in range(2):
+        s4.write_root_meta(str(tmp_path), _DLL, dict(controllers={}, common=dict(tool_check=True)))
+    m = yaml.safe_load(open(tmp_path / 'meta.yaml', encoding='utf-8'))
+    assert m['code_notes'] == {'PID seed 3': 'rate 12 %: lane reversal, no tool error'}
+    assert set(m['pymoo_files']) == set(s4.PYMOO_FILES)                  # S4C-18
+
+
+def test_default_gains_must_give_a_valid_reference(monkeypatch):
+    """S4C-7: no HV reference from a run_error penalty or a non-positive f2."""
+    rows = iter([(dict(status='run_error', completed='', error='x'), None)])
+    monkeypatch.setattr(s3, 'safe_run', lambda *a, **k: next(rows))
+    monkeypatch.setattr(s3, 'run_in_new_process', lambda dll, jobs, work: [dict(row=dict(status='ok'), digest=None)])
+    monkeypatch.setattr(s3, 'defaults', lambda fw, c: {})
+    assert s4.default_f2(None, 'x.dll', 'PID', [0.2], 0.5, 'w')[3] is False
+    rows = iter([(dict(status='ok', completed='true', e_perp_max=0.02, tv_duty=0.0), None)])
+    assert s4.default_f2(None, 'x.dll', 'PID', [0.2], 0.5, 'w')[3] is False
+    rows = iter([(dict(status='ok', completed='true', e_perp_max=0.02, tv_duty=3.0), None)])
+    assert s4.default_f2(None, 'x.dll', 'PID', [0.2], 0.5, 'w')[3] is True
+
+
+def test_check_eval_keys_refuses_duplicates():
+    """S4C-13."""
+    e = dict(controller='PID', ga_seed=1, gen=1, cand_id=0, v=0.2, mu=0.5, attempt=1)
+    s4.check_eval_keys([e, dict(e, attempt=2)])
+    with pytest.raises(SystemExit, match='not unique'):
+        s4.check_eval_keys([e, dict(e)])
 
 
 def test_run_error_retry_ok_keeps_the_first_attempt_penalty(monkeypatch):
@@ -451,10 +549,7 @@ def test_tool_check_three_phases(tmp_path, monkeypatch, capsys):
     """trial -> lock.yaml, main (2 seeds) -> selected.csv with a send_to_HIL row whose gains read back
     from the file reproduce every GA run bit for bit in a new process (post)."""
     yaml = pytest.importorskip('yaml')
-    fw = fwsim.FirmwareSim(_DLL)                  # a domain around the firmware defaults: both controllers feasible
-    lv = {c: {n: ((v * 0.8, v * 1.25) if v > 0 else (0.0, 0.1)) for n, v in s3.defaults(fw, c).items()}
-          for c in s3.CONTROLLERS}
-    d = _s03_dir(tmp_path, trial=True, mu=(0.5,), levels=lv)
+    d = _s03_dir(tmp_path, trial=True, mu=(0.5,), levels=_levels_near_defaults())
     out = tmp_path / 'run'
     for ctrl in s3.CONTROLLERS:
         common = ['--tool-check', '--controller', ctrl, '--s03', str(d), '--pop', '4', '--gen-base', '1',

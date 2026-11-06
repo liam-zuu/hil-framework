@@ -341,6 +341,7 @@ def run_seed(ev, dom, ga_seed, pop, n_gen, ref, history, hv_rows, ext=None, log=
 
         def _evaluate(self, X, out, *args, **kwargs):
             F, G = [], []
+            state['ids'] = [(state['gen'], k) for k in range(len(X))]
             for k, x in enumerate(X):
                 g = decode(dom, x)
                 s = ev.candidate(g, ga_seed, state['gen'], k)
@@ -362,7 +363,13 @@ def run_seed(ev, dom, ga_seed, pop, n_gen, ref, history, hv_rows, ext=None, log=
     while alg.has_next():
         state['gen'] += 1
         infills = alg.ask()
+        todo = [ind for ind in infills if not (ind.evaluated and 'F' in ind.evaluated)]
+        state['ids'] = []
         alg.evaluator.eval(problem, infills)
+        if len(state['ids']) != len(todo):
+            raise RuntimeError(f'pymoo evaluated {len(state["ids"])} of {len(todo)} new individuals')
+        for ind, eid in zip(todo, state['ids']):  # S4C-6: the evaluation id rides on the Individual
+            ind.set('eval_id', eid)
         alg.tell(infills=infills)
         pts = points_of(alg.pop, dom, ga_seed, seen)
         feas = [p for p in pts if p['feasible']]
@@ -386,10 +393,15 @@ def points_of(pop, dom, ga_seed, seen):
         G = np.asarray(ind.G, dtype=float)
         fg = (float(ind.F[0]), float(ind.F[1]), float(G[0]), float(G[1]))
         hits = seen.get(x.tobytes(), [])
-        same = [e for e in hits if e[2] == fg]          # S4C-6: the evaluation whose F, G this point holds
-        gen, cand = same[0][:2] if same else ('', '')
-        note = ('' if len({e[2] for e in hits}) <= 1 else 'evaluated more than once with different results') \
-            if same else 'no evaluation with these F, G'
+        eid = ind.get('eval_id')                        # S4C-6: set on the Individual right after its evaluation
+        if eid is not None:
+            gen, cand = eid
+            mine = [e for e in hits if tuple(e[:2]) == tuple(eid)]
+            note = '' if len(hits) <= 1 else 'vector evaluated more than once; this point is its own evaluation'
+            if not mine or mine[0][2] != fg:
+                note = 'eval_id does not match the recorded evaluation'
+        else:
+            gen, cand, note = '', '', 'no eval_id on the individual'
         pts.append(dict(ga_seed=ga_seed, gen=gen, cand_id=cand, f1=fg[0], f2=fg[1], g1=fg[2], g2=fg[3],
                         feasible=bool(np.all(G <= 0)), id_note=note,
                         x=[decode(dom, x)[d['name']] for d in dom], xga=x.tolist()))
@@ -452,20 +464,29 @@ def seed_error_rates(evals, ctrl):
             for s, (a, n) in sorted(out.items())}
 
 
+POP_COLS = ['controller', 'ga_seed', 'gen', 'cand_id', 'feasible', 'nondominated_feasible', 'nondominated_in_group',
+            'f1', 'f2', 'g1', 'g2', 'id_note', 'gains']
+
+
 def population_rows(ctrl, finals, nd_only=False):
-    """final_population.csv: every point of each seed's final population with a non-dominated flag;
-    nd_only: pareto.csv, the feasible non-dominated points only (S04 8; S4C-17)."""
+    """final_population.csv: every point of each seed's final population with non-dominated flags;
+    nd_only: pareto.csv (S04 8, 'feasible and infeasible in separate columns'; S4C-17, S4C-R-2): the
+    non-dominated points of the feasible points and, separately, of the infeasible points (column
+    'feasible'). Written with POP_COLS, so an empty set still gives a file with its header."""
     rows = []
     for seed in sorted(finals):
         pts = finals[seed]
         feas = [p for p in pts if p['feasible']]
-        nd_ids = {id(p) for p in nondominated(feas)}
+        infeas = [p for p in pts if not p['feasible']]
+        nd_f = {id(p) for p in nondominated(feas)}
+        nd_g = nd_f | {id(p) for p in nondominated(infeas)}
         for p in pts:
-            if nd_only and id(p) not in nd_ids:
+            if nd_only and id(p) not in nd_g:
                 continue
             rows.append(dict(controller=ctrl, ga_seed=seed, gen=p['gen'], cand_id=p['cand_id'], feasible=p['feasible'],
-                             nondominated_feasible=id(p) in nd_ids, f1=p['f1'], f2=p['f2'], g1=p['g1'], g2=p['g2'],
-                             id_note=p.get('id_note', ''), gains=json.dumps([repr(float(v)) for v in p['x']])))
+                             nondominated_feasible=id(p) in nd_f, nondominated_in_group=id(p) in nd_g, f1=p['f1'],
+                             f2=p['f2'], g1=p['g1'], g2=p['g2'], id_note=p.get('id_note', ''),
+                             gains=json.dumps([repr(float(v)) for v in p['x']])))
     return rows
 
 
@@ -498,7 +519,7 @@ def run_custom(fw, path, ctrl, g, v, mu, b0_factor=1.0, r_factor=1.0):
         kw['adrc'] = {i: (a, b, b0 * b0_factor, lim) for i, (a, b, b0, lim) in kw['adrc'].items()}
     log = fwsim.simulate(fw, sch.setpoint, sch.Tcmd + o1.T_LATE, p, seed=s3.SEED, mode=ctrl, imu=dict(s3.IMU), **kw)
     back = [fw.get_adrc(i) for i in range(3)] if ctrl == 'ADRC' else [fw.get_pid(i) for i in range(3)]
-    back.append(dict(pos=fwsim.pos_meta(fw)))           # pos_kp, pos_ki; k_psi has no getter (S03 S3C-21)
+    back.append(dict(pos=fwsim.pos_meta(fw, raw=True)))  # exact float32 pos_kp, pos_ki (S4C-8); k_psi has no getter (S3C-21)
     res, _ = o1.evaluate_v7(log, path, sch, lsum=p.lx + p.ly)
     return res, log, back, before, after
 
@@ -560,7 +581,8 @@ def post(a):
     common = lock.get('common')
     if not common:
         sys.exit(f'{out}/lock.yaml has no common block (written by this script version): run a new folder')
-    check_fingerprint(common, fingerprint(a.dll, common['s03_run']), 'post')        # S4C-2
+    check_fingerprint(common, fingerprint(a.dll, common['s03_run'], unsealed=common.get('unsealed', False)),
+                      'post')                                                         # S4C-2
     tc = common['tool_check']
     os.makedirs(pc, exist_ok=True)
     t0 = time.time()
@@ -704,7 +726,10 @@ def main():
     import pymoo
     t0 = time.time()
 
-    fp = fingerprint(a.dll, a.s03)
+    fp = fingerprint(a.dll, a.s03, unsealed=a.s03_unsealed and not a.tool_check)
+    if s03_dll_sha(s03_meta) != fp['dll_sha256']:                 # S4C-2: the DLL the S03 run used
+        sys.exit(f'{a.dll} (sha256 {fp["dll_sha256"][:12]}…) is not the DLL of the S03 run '
+                 f'({str(s03_dll_sha(s03_meta))[:12]}…): S04 runs on the S03 firmware (S04 7)')
 
     if a.phase == 'trial':
         tdir = os.path.join(a.out, 'trial', ctrl)
@@ -723,7 +748,7 @@ def main():
             check_fingerprint(common, fp, 'trial')
         else:
             common = lock['common'] = dict(tool_check=a.tool_check, s03_run=os.path.abspath(a.s03), fingerprint=fp,
-                                           s03_mu_levels=s03_mu)
+                                           s03_mu_levels=s03_mu, unsealed=bool(a.s03_unsealed and not a.tool_check))
         pre = {}
         if not a.tool_check:
             if not a.preconditions:
@@ -764,8 +789,8 @@ def main():
         write_rows(os.path.join(tdir, 'history.csv'), history)
         write_rows(os.path.join(tdir, 'evals.csv'), def_evals + ev.evals, EVAL_COLS)
         write_rows(os.path.join(tdir, 'hv.csv'), hv_rows)
-        write_rows(os.path.join(tdir, 'pareto.csv'), pareto_rows(ctrl, {SEEDS[0]: final}))
-        write_rows(os.path.join(tdir, 'final_population.csv'), population_rows(ctrl, {SEEDS[0]: final}))
+        write_rows(os.path.join(tdir, 'pareto.csv'), pareto_rows(ctrl, {SEEDS[0]: final}), POP_COLS)
+        write_rows(os.path.join(tdir, 'final_population.csv'), population_rows(ctrl, {SEEDS[0]: final}), POP_COLS)
         elapsed = time.time() - t0
         L_new.update(n_gen=locked_gen, gen_rule=dict(
             base=a.gen_base, max=a.gen_max, compared_with=gen_compare(a.gen_base),
@@ -829,8 +854,8 @@ def main():
     errs = seed_error_rates(ev.evals, ctrl)
     check_eval_keys(ev.evals)                                                   # S4C-13
     for name, rows, cols in ((f'history_{ctrl}.csv', history, None), (f'evals_{ctrl}.csv', ev.evals, EVAL_COLS),
-                             (f'hv_{ctrl}.csv', hv_rows, None), (f'pareto_{ctrl}.csv', pareto_rows(ctrl, finals), None),
-                             (f'final_population_{ctrl}.csv', population_rows(ctrl, finals), None),
+                             (f'hv_{ctrl}.csv', hv_rows, None), (f'pareto_{ctrl}.csv', pareto_rows(ctrl, finals), POP_COLS),
+                             (f'final_population_{ctrl}.csv', population_rows(ctrl, finals), POP_COLS),
                              (f'selected_{ctrl}.csv', sel, None)):
         write_rows(os.path.join(a.out, name), rows, cols)
     merge_controllers(a.out)
@@ -863,18 +888,40 @@ def gen_compare(gen_base):
     return max(1, gen_base - 5)
 
 
-def fingerprint(dll, s03_dir):
+SOURCES = ('fwsim/s04_ga.py', 'fwsim/s03_doe.py', 'fwsim/o1_feasibility.py', 'fwsim/fwsim.py', 'fwsim/tune_ga.py',
+           'rpi5/trajectory_pub.py', 'rpi5/imu_model.py', 'rpi5/plant_blob.py', 'tools/run_validity.py')
+PYMOO_FILES = ('core/individual.py', 'core/survival.py', 'algorithms/moo/nsga2.py')     # PYMOO_CV refers to these
+
+
+def pymoo_file_hashes():
+    """S4C-18: SHA-256 of the installed pymoo files that PYMOO_CV cites, so the file:line can be re-checked."""
+    import pymoo
+    root = os.path.dirname(pymoo.__file__)
+    return {n: s3.sha256_file(os.path.join(root, n)) for n in PYMOO_FILES}
+
+
+def fingerprint(dll, s03_dir, unsealed=False):
     """S4C-2: what must not change between the trial, the main runs and the post checks of one folder
-    (S04 7): the DLL, the S03 files the domain and the mu rule come from, the plant source blobs
-    (L34), the O1 / S03 / S04 scripts, D and the library versions."""
+    (S04 7): the DLL, the S03 files the domain and the mu rule come from (sealed/runs.csv only with
+    --s03-unsealed, L56), the plant source blobs (L34), the Python sources the simulation and the
+    scoring import (SOURCES), D, the library versions and the pymoo files of PYMOO_CV."""
+    names = ('meta.yaml', 'levels.csv', 'design.csv') + (('sealed/runs.csv',) if unsealed else ())
     s03_files = {}
-    for n in ('meta.yaml', 'levels.csv', 'design.csv'):
+    for n in names:
         p = os.path.join(s03_dir, n)
         s03_files[n] = s3.sha256_file(p) if os.path.isfile(p) else None
-    scripts = {n: s3.sha256_file(os.path.join(HERE, n)) for n in ('s04_ga.py', 's03_doe.py', 'o1_feasibility.py',
-                                                                 'fwsim.py')}
+    root = os.path.join(HERE, '..')
+    scripts = {n: s3.sha256_file(os.path.join(root, n)) for n in SOURCES}
     return dict(dll_sha256=s3.sha256_file(dll), s03_files=s03_files, plant_src=fwsim.PLANT_SRC, scripts=scripts, D=D,
-                libraries=fwsim.lib_versions())
+                libraries=fwsim.lib_versions(), pymoo_files=pymoo_file_hashes())
+
+
+def s03_dll_sha(s03_meta):
+    """dll_sha256 of the S03 meta.yaml (indented under firmware:), or None."""
+    for line in s03_meta.splitlines():
+        if line.strip().startswith('dll_sha256:'):
+            return line.split(':', 1)[1].split('#')[0].strip().strip('"')
+    return None
 
 
 def check_fingerprint(common, fp, phase):
@@ -902,9 +949,13 @@ def log_phase(out, entry):
 
 def write_root_meta(out, dll, lock, running=None):
     """S4C-12: <out>/meta.yaml of S04 8, rewritten at the start of a trial (before any GA run) and after
-    every phase. Only JSON values (valid YAML)."""
+    every phase. Only JSON values (valid YAML). Do not edit meta.yaml by hand: notes of CODE (for
+    example the cause found for a seed error rate over 10 %, S04 3) go to <out>/code_notes.json,
+    which is copied verbatim into meta.yaml (code_notes) every time it is written (S4C-R-1)."""
     p = os.path.join(out, 'phases.json')
     phases = json.load(open(p, encoding='utf-8')) if os.path.isfile(p) else []
+    pn = os.path.join(out, 'code_notes.json')
+    code_notes = json.load(open(pn, encoding='utf-8')) if os.path.isfile(pn) else None
     fw_info = json.load(open(os.path.join(os.path.dirname(dll), 'fwsim_build.json'), encoding='utf-8')) \
         if os.path.isfile(os.path.join(os.path.dirname(dll), 'fwsim_build.json')) else None
     import pymoo
@@ -927,8 +978,10 @@ def write_root_meta(out, dll, lock, running=None):
                             recheck=pymoo.__version__ != PYMOO_CHECKED),
                  selection_rule=SELECTION_RULE, D=D, imu=s3.IMU, plant_seed=s3.SEED, controllers=ctrls,
                  phases=phases, elapsed_s=sum(int(x.get('elapsed_s', 0)) for x in phases),
-                 files=('lock.yaml, phases.json, trial/<controller>/, history/evals/hv/pareto/final_population/'
-                        'selected[_<controller>].csv, meta_<controller>.yaml, post_checks/'))
+                 code_notes=code_notes, pymoo_files=pymoo_file_hashes(),
+                 files=('lock.yaml, phases.json, code_notes.json (CODE notes, optional), trial/<controller>/, '
+                        'history/evals/hv/pareto/final_population/selected[_<controller>].csv, meta_<controller>.yaml, '
+                        'post_checks/'))
     with open(os.path.join(out, 'meta.yaml'), 'w', encoding='utf-8') as f:
         f.write('# S04 run folder (written by fwsim/s04_ga.py; every value is JSON, so the file is valid YAML)\n')
         for k, v in lines.items():
@@ -938,13 +991,15 @@ def write_root_meta(out, dll, lock, running=None):
 def merge_controllers(out):
     """history.csv, evals.csv, hv.csv, pareto.csv, final_population.csv, selected.csv over the controllers run so far."""
     for name in ('history', 'evals', 'hv', 'pareto', 'final_population', 'selected'):
-        rows = []
+        rows, found = [], False
         for ctrl in s3.CONTROLLERS:
             p = os.path.join(out, f'{name}_{ctrl}.csv')
             if os.path.isfile(p):
+                found = True
                 rows += read_csv(p)
-        if rows:
-            cols = EVAL_COLS if name == 'evals' else list(dict.fromkeys(k for r in rows for k in r))
+        if found:                               # S4C-R-2: a per-controller file with a header only is kept
+            fixed = {'evals': EVAL_COLS, 'pareto': POP_COLS, 'final_population': POP_COLS}
+            cols = fixed.get(name) or list(dict.fromkeys(k for r in rows for k in r))
             with open(os.path.join(out, name + '.csv'), 'w', newline='', encoding='utf-8') as f:
                 w = csv.DictWriter(f, fieldnames=cols, extrasaction='ignore')
                 w.writeheader()

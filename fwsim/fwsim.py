@@ -74,13 +74,13 @@ def vel_loop_only(fw):
     return dict(VEL_LOOP_ONLY) if fw.pos_cols else {}
 
 
-def pos_meta(fw):
-    """Position loop + standstill hold parameters as the firmware holds them now (for meta.yaml);
-    None for a DLL without pos_ctrl.c."""
+def pos_meta(fw, raw=False):
+    """Position loop + standstill hold parameters as the firmware holds them now (for meta.yaml;
+    raw=True: exact float32 values); None for a DLL without pos_ctrl.c."""
     if not fw.pos_cols:
         return None
     return dict(zip(('on', 'kp', 'ki', 'v_corr_max', 'e_win', 'e_exit', 'still_on', 'v_still', 't_still_us'),
-                    (float(x) for x in fw.pos_params())))
+                    (float(x) for x in fw.pos_params(raw=raw))))
 
 
 def run_validity(log):
@@ -212,12 +212,13 @@ class FirmwareSim:
         self.lib.fwsim_ws_last(out)
         return list(out)
 
-    def pos_params(self):
+    def pos_params(self, raw=False):
         """Position-loop parameters held by the firmware: on, kp, ki, v_corr_max, e_win, e_exit,
-        still_on, v_still, t_still_us."""
+        still_on, v_still, t_still_us. Rounded to 6 decimals for meta.yaml; raw=True: the exact
+        float32 values (S04 post-check read-back, S4C-8)."""
         out = (ctypes.c_float * 9)()
         self.lib.fwsim_get_pos(out)
-        return [round(float(v), 6) for v in out]
+        return [float(v) if raw else round(float(v), 6) for v in out]
 
     def set_param(self, name, value):
         if not self.lib.fwsim_set_param(name.encode(), float(value)):
