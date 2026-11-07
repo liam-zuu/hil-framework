@@ -37,8 +37,8 @@ Section numbers below are those of S04 v5.
       the report-only measures.
   7   K1, K2 are never run; nothing here runs on the car.
   8   outputs in --out (columns controller, ga_seed): history.csv, evals.csv (key controller,
-      ga_seed, gen, cand_id, v, mu, attempt), hv.csv, pareto.csv (feasible non-dominated),
-      final_population.csv, selected.csv, meta.yaml (whole folder, written before the GA and after
+      ga_seed, gen, cand_id, v, mu, attempt), hv.csv, pareto.csv (the non-dominated points of
+      the feasible and, separately, of the infeasible points; column feasible), final_population.csv, selected.csv, meta.yaml (whole folder, written before the GA and after
       every phase), meta_<controller>.yaml, phases.json, lock.yaml (one mode and one source
       fingerprint for the folder), trial/ (the trial phase), post_checks/.
 
@@ -73,6 +73,7 @@ sys.path.insert(0, HERE)
 import fwsim                 # noqa: E402
 import o1_feasibility as o1  # noqa: E402
 import s03_doe as s3         # noqa: E402
+from plant_blob import git_blob, same_plant   # noqa: E402  (rpi5/ is on sys.path through fwsim)
 
 D = o1.D                      # m, O1 v7 (temporary)
 F1_TOL = 0.01                 # m, section 3 / 5 (convention, same as S03 5.2)
@@ -727,9 +728,7 @@ def main():
     t0 = time.time()
 
     fp = fingerprint(a.dll, a.s03, unsealed=a.s03_unsealed and not a.tool_check)
-    if s03_dll_sha(s03_meta) != fp['dll_sha256']:                 # S4C-2: the DLL the S03 run used
-        sys.exit(f'{a.dll} (sha256 {fp["dll_sha256"][:12]}…) is not the DLL of the S03 run '
-                 f'({str(s03_dll_sha(s03_meta))[:12]}…): S04 runs on the S03 firmware (S04 7)')
+    check_s03_source(s03_meta, fp, a.dll)                          # S4C-2: the source the S03 run used
 
     if a.phase == 'trial':
         tdir = os.path.join(a.out, 'trial', ctrl)
@@ -924,6 +923,54 @@ def s03_dll_sha(s03_meta):
     return None
 
 
+def o1_constants():
+    """The O1 constants as s03_doe.py writes them into the S03 meta.yaml 'o1' line."""
+    return dict(A=o1.A, a_r=o1.A_R, D=o1.D, D_d=o1.D, t_d=o1.T_D, t_late=o1.T_LATE, delta=o1.DELTA, v_d=o1.V_D,
+                c_cens=o1.C_CENS)
+
+
+O1_FILE = 'fwsim/o1_feasibility.py'
+
+
+def blob_at(commit, path):
+    """`git rev-parse <commit>:<path>` in this repository, or None when git cannot read it."""
+    import subprocess
+    try:
+        r = subprocess.run(['git', '-C', HERE, 'rev-parse', '--verify', '--quiet', f'{commit}:{path}'],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = r.stdout.strip()
+    return out if r.returncode == 0 and len(out) == 40 else None
+
+
+def check_s03_source(s03_meta, fp, dll):
+    """S4C-2 (Codex round 3): S04 runs on the source the S03 run recorded, checked against the S03
+    meta.yaml in every trial and main start, so the first trial cannot lock a source S03 did not
+    use (later phases compare with lock.yaml): the DLL (firmware.dll_sha256), the plant blobs
+    (plant.src, L34), the O1 constants (o1) and the O1 code (blob of fwsim/o1_feasibility.py at the
+    S03 script commit, which must be clean). Other modules S03 ran (s03_doe.py, fwsim.py, ...) are
+    not compared with S03 (they hold S04 code too); they are fixed for the folder by the fingerprint."""
+    if s03_dll_sha(s03_meta) != fp['dll_sha256']:
+        sys.exit(f'{dll} (sha256 {fp["dll_sha256"][:12]}…) is not the DLL of the S03 run '
+                 f'({str(s03_dll_sha(s03_meta))[:12]}…): S04 runs on the S03 firmware (S04 7)')
+    try:
+        plant, o1m, script = (meta_value(s03_meta, k) for k in ('plant', 'o1', 'script'))
+    except KeyError as e:
+        sys.exit(f'the S03 meta.yaml has no {e} line: cannot check that S04 runs on the S03 source (S4C-2)')
+    src = plant.get('src') if isinstance(plant, dict) else None
+    if not isinstance(src, dict) or not same_plant(src, fp['plant_src']):
+        sys.exit(f'plant source {fp["plant_src"]} is not the S03 plant.src {src} (L34; S04 7; S4C-2)')
+    if o1m != o1_constants():
+        sys.exit(f'O1 constants {o1_constants()} are not the S03 o1 {o1m} (S04 7; S4C-2)')
+    if not isinstance(script, dict) or script.get('dirty', True) or not script.get('commit'):
+        sys.exit(f'the S03 run has no clean script commit ({script}): its O1 code cannot be checked (S4C-2)')
+    now, then = git_blob(os.path.join(HERE, '..', O1_FILE)), blob_at(script['commit'], O1_FILE)
+    if then is None or now != then:
+        sys.exit(f'{O1_FILE} (blob {now}) is not the one of the S03 script commit {script["commit"]} '
+                 f'(blob {then}) (S04 7; S4C-2)')
+
+
 def check_fingerprint(common, fp, phase):
     old = common['fingerprint']
     diff = sorted(k for k in set(old) | set(fp) if json.dumps(old.get(k), sort_keys=True, default=str)
@@ -1040,7 +1087,7 @@ interpretations:   # of this script, not written in S04 v5; Liam or THESIS corre
   - "a new script fwsim/s04_ga.py (S04 9.1 names tune_ga.py): tune_ga.py keeps its velocity objective for the old runs, unchanged"
   - "mu rule: every S03 design point that ran (centre, outer, inner box: the inner box always runs since L41), every gate speed; status other than ok (track_err, run_error) or y1 inconclusive at any mu is 'not satisfied'"
   - "HV: exact 2-D staircase on the feasible non-dominated points of the population after each generation's survival, strictly inside the reference; the trial rule compares generation gen_base with gen_base - 5 (15 and 20); with --tool-check and gen_base < 6 with generation 1"
-  - "pareto.csv: the feasible non-dominated points of each seed's final population; final_population.csv: every point of it with a non-dominated flag (S04 8)"
+  - "pareto.csv: per seed's final population, the non-dominated points among the feasible points and, separately, among the infeasible points (column feasible; nondominated_feasible true only for the first group, nondominated_in_group true for both); always written with its header, also when empty; final_population.csv: every point of it with both flags (S04 8)"
   - "the HV reference is locked only from a valid run of the default gains (no run_error, f2 finite and > 0); otherwise the trial stops"
   - "per seed set (section 5): the feasible non-dominated points of the final population (pymoo algorithm.pop after the last generation)"
   - "run_error: attempt 2 in a new process is recorded with 'cause' empty; the candidate is scored as the first attempt (S04 3); CODE fills 'cause' when it finds a tool error"

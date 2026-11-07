@@ -92,8 +92,15 @@ def test_score_run_error_penalty():
 
 # ── domain, mu rule (sections 2, 3) ──────────────────────────────────────────────────
 
-def _s03_dir(tmp_path, runs=None, trial=False, mu=(0.4, 0.5, 0.6), levels=None):
-    """levels: {controller: {factor: (L, H)}}; default a synthetic domain."""
+def _head():
+    import subprocess
+    return subprocess.run(['git', '-C', HERE, 'rev-parse', 'HEAD'], capture_output=True, text=True).stdout.strip()
+
+
+def _s03_dir(tmp_path, runs=None, trial=False, mu=(0.4, 0.5, 0.6), levels=None, plant_src=None, o1c=None,
+             script=None):
+    """levels: {controller: {factor: (L, H)}}; default a synthetic domain. plant_src, o1c, script: the
+    S03 source record (S4C-2); default the source of this checkout (HEAD, clean)."""
     d = tmp_path / 's03'
     (d / 'sealed').mkdir(parents=True)
     with open(d / 'levels.csv', 'w', newline='') as f:
@@ -113,7 +120,10 @@ def _s03_dir(tmp_path, runs=None, trial=False, mu=(0.4, 0.5, 0.6), levels=None):
     dll_sha = s3.sha256_file(_DLL) if os.path.isfile(_DLL) else 'no dll'
     (d / 'meta.yaml').write_text(
         f'trial: {str(trial).lower()}     # x\nstatus: "ran to the end"\nmu_levels: {json.dumps(list(mu))}\n'
+        f'script: {json.dumps(script if script is not None else dict(commit=_head(), dirty=False))}\n'
         f'firmware:\n  dll_sha256: {dll_sha}\n'
+        f'plant: {json.dumps(dict(motor_model="dc", src=plant_src or fwsim.PLANT_SRC))}\n'
+        f'o1: {json.dumps(o1c or s4.o1_constants())}\n'
         f'gate_speeds: {json.dumps(list(s3.SPEEDS))}\ny3_reference: {json.dumps(y3)}\n', encoding='utf-8')
     if runs is not None:
         s3.write_csv(str(d / 'sealed' / 'runs.csv'), runs)
@@ -359,9 +369,11 @@ def _levels_near_defaults():
 
 @needs_dll
 def test_lock_from_a_real_trial_catches_changed_sources(tmp_path, monkeypatch):
-    """S4C-2, S4C-16: the lock is written by a real trial; with nothing changed main and post run;
-    one changed byte in a real S03 file stops main, and after main one in design.csv stops post; a
-    DLL that is not the S03 DLL stops the trial."""
+    """S4C-2, S4C-16: the lock is written by a real trial; one changed byte in a real S03 file
+    (levels.csv) stops main, and with the file restored main runs; one changed byte in design.csv
+    stops post, and with it restored post runs; a trial whose S03 meta.yaml records another DLL
+    SHA-256 stops (the S03 record is changed here, not the DLL file). The other S03 source checks
+    of the first trial: test_first_trial_refuses_a_source_s03_did_not_use."""
     d = _s03_dir(tmp_path, trial=True, mu=(0.5,), levels=_levels_near_defaults())
     out = tmp_path / 'run'
     common = ['--tool-check', '--controller', 'PID', '--s03', str(d), '--pop', '4', '--gen-base', '1',
@@ -377,15 +389,69 @@ def test_lock_from_a_real_trial_catches_changed_sources(tmp_path, monkeypatch):
     lv.write_bytes(orig)
     s4.main()                                                          # unchanged sources: main runs
     dz = d / 'design.csv'
-    dz.write_bytes(dz.read_bytes() + b'\n')
+    dorig = dz.read_bytes()
+    dz.write_bytes(dorig + b'\n')
     with pytest.raises(SystemExit, match='s03_files'):
         s4.post(s4_args(out))
+    dz.write_bytes(dorig)
+    assert s4.post(s4_args(out)) == 0                                  # unchanged sources: post runs
     meta = d / 'meta.yaml'
     meta.write_text(meta.read_text(encoding='utf-8').replace(s3.sha256_file(_DLL), '0' * 64), encoding='utf-8')
     monkeypatch.setattr(sys, 'argv', ['s04_ga.py', '--phase', 'trial', '--tool-check', '--controller', 'ADRC',
                                       '--s03', str(d), '--pop', '4', '--gen-base', '1', '--gen-max', '1',
                                       '--dll', _DLL, '--out', str(tmp_path / 'run2')])
     with pytest.raises(SystemExit, match='not the DLL of the S03 run'):
+        s4.main()
+
+
+def _other_blob(b):
+    return ('0' if b[0] != '0' else '1') + b[1:]
+
+
+@needs_dll
+@pytest.mark.parametrize('kw, msg', [
+    (dict(plant_src='plant'), 'not the S03 plant.src'),                       # params.py changed after S03
+    (dict(o1c='D'), 'not the S03 o1'),                                         # an O1 constant changed after S03
+    (dict(script='dirty'), 'no clean script commit'),
+    (dict(script='unknown'), 'is not the one of the S03 script commit'),       # git cannot read the commit
+])
+def test_first_trial_refuses_a_source_s03_did_not_use(tmp_path, monkeypatch, kw, msg):
+    """S4C-2 (Codex round 3): the first trial checks the S03 meta.yaml, so it cannot lock a plant,
+    O1 constants or O1 code that the S03 run did not use; S03 records written without these lines
+    (older scripts) are refused too."""
+    src = dict(fwsim.PLANT_SRC)
+    arg = dict(plant_src=dict(src, params_py=_other_blob(src['params_py'])) if 'plant_src' in kw else None,
+               o1c=dict(s4.o1_constants(), D=0.2) if 'o1c' in kw else None,
+               script={'dirty': dict(commit=_head(), dirty=True), 'unknown': dict(commit='0' * 40, dirty=False)}
+               .get(kw.get('script')))
+    d = _s03_dir(tmp_path, trial=True, mu=(0.5,), **arg)
+    monkeypatch.setattr(sys, 'argv', ['s04_ga.py', '--phase', 'trial', '--tool-check', '--controller', 'PID',
+                                      '--s03', str(d), '--pop', '4', '--gen-base', '1', '--gen-max', '1',
+                                      '--dll', _DLL, '--out', str(tmp_path / 'run')])
+    with pytest.raises(SystemExit, match=msg):
+        s4.main()
+    assert not (tmp_path / 'run' / 'lock.yaml').exists()
+
+
+@needs_dll
+def test_first_trial_checks_the_o1_code_and_old_s03_records(tmp_path, monkeypatch):
+    """S4C-2: an O1 code blob at the S03 commit that is not the file of this checkout stops the
+    trial; an S03 meta.yaml without the plant line stops it; the blob read through git at HEAD is
+    the blob of the unchanged file (the comparison the clean case relies on)."""
+    assert s4.blob_at(_head(), s4.O1_FILE) == s4.git_blob(os.path.join(fwsim.HERE, '..', s4.O1_FILE))
+    d = _s03_dir(tmp_path, trial=True, mu=(0.5,))
+    argv = ['s04_ga.py', '--phase', 'trial', '--tool-check', '--controller', 'PID', '--s03', str(d), '--pop', '4',
+            '--gen-base', '1', '--gen-max', '1', '--dll', _DLL, '--out', str(tmp_path / 'run')]
+    monkeypatch.setattr(sys, 'argv', argv)
+    real = s4.blob_at
+    monkeypatch.setattr(s4, 'blob_at', lambda c, p: _other_blob(real(c, p)))
+    with pytest.raises(SystemExit, match='is not the one of the S03 script commit'):
+        s4.main()
+    monkeypatch.setattr(s4, 'blob_at', real)
+    meta = d / 'meta.yaml'
+    meta.write_text('\n'.join(l for l in meta.read_text(encoding='utf-8').splitlines() if not l.startswith('plant:')),
+                    encoding='utf-8')
+    with pytest.raises(SystemExit, match="no 'plant' line"):
         s4.main()
 
 
@@ -496,8 +562,9 @@ def test_default_gains_must_give_a_valid_reference(monkeypatch):
     monkeypatch.setattr(s3, 'run_in_new_process', lambda dll, jobs, work: [dict(row=dict(status='ok'), digest=None)])
     monkeypatch.setattr(s3, 'defaults', lambda fw, c: {})
     assert s4.default_f2(None, 'x.dll', 'PID', [0.2], 0.5, 'w')[3] is False
-    rows = iter([(dict(status='ok', completed='true', e_perp_max=0.02, tv_duty=0.0), None)])
-    assert s4.default_f2(None, 'x.dll', 'PID', [0.2], 0.5, 'w')[3] is False
+    for tv in (0.0, -3.0, float('nan'), float('inf')):                 # f2 not finite or not > 0
+        rows = iter([(dict(status='ok', completed='true', e_perp_max=0.02, tv_duty=tv), None)])
+        assert s4.default_f2(None, 'x.dll', 'PID', [0.2], 0.5, 'w')[3] is False, tv
     rows = iter([(dict(status='ok', completed='true', e_perp_max=0.02, tv_duty=3.0), None)])
     assert s4.default_f2(None, 'x.dll', 'PID', [0.2], 0.5, 'w')[3] is True
 
@@ -578,7 +645,10 @@ def test_tool_check_three_phases(tmp_path, monkeypatch, capsys):
         assert float(h['f1']) == float(send['f1'])                       # selected row is a GA candidate
     par = list(csv.DictReader(open(out / 'pareto.csv')))
     pop = list(csv.DictReader(open(out / 'final_population.csv')))
-    assert par and all(r['nondominated_feasible'] == 'true' for r in par) and len(pop) >= len(par)   # S4C-17
+    assert par and len(pop) >= len(par)                                  # S4C-17
+    assert all(r['nondominated_in_group'] == 'true' for r in par)        # S4C-R3-1: both groups, flag per group
+    assert all(r['nondominated_feasible'] == r['feasible'] for r in par)
+    assert sum(r['nondominated_in_group'] == 'true' for r in pop) == len(par)
     monkeypatch.setattr(sys, 'argv', ['s04_ga.py', '--phase', 'post', '--dll', _DLL, '--out', str(out)])
     assert s4.post(s4_args(out)) == 0
     pc = out / 'post_checks'
