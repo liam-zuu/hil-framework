@@ -62,10 +62,10 @@ class MecanumParams:
 
     def __init__(self):
         # ── Physical parameters ──────────────────────────────────────────
-        self.r         = 0.0485    # wheel radius [m]
-        self.lx        = 0.12     # longitudinal half-distance [m]
-        self.ly        = 0.12     # lateral half-distance [m]
-        self.M         = 4.0      # total mass [kg]
+        self.r         = 0.0485    # wheel radius [m] [Liam confirmed 07/11/2026, CODE session]
+        self.lx        = 0.12     # longitudinal half-distance [m] [Liam confirmed 07/11/2026, CODE session]
+        self.ly        = 0.12     # lateral half-distance [m] [Liam confirmed 07/11/2026, CODE session]
+        self.M         = 4.0      # total mass [kg] [not weighed yet: weigh the car with battery (Liam 07/11)]
         self.Iz        = 0.0384   # yaw inertia [kg·m²]  (computed from geometry)
         self.J_w       = 0.00247  # wheel inertia [kg·m²]
         self.b_w       = 0.002    # viscous friction [N·m·s/rad]
