@@ -98,9 +98,9 @@ def _head():
 
 
 def _s03_dir(tmp_path, runs=None, trial=False, mu=(0.4, 0.5, 0.6), levels=None, plant_src=None, o1c=None,
-             script=None):
-    """levels: {controller: {factor: (L, H)}}; default a synthetic domain. plant_src, o1c, script: the
-    S03 source record (S4C-2); default the source of this checkout (HEAD, clean)."""
+             script=None, imu=None):
+    """levels: {controller: {factor: (L, H)}}; default a synthetic domain. plant_src, o1c, imu, script:
+    the S03 source record (S4C-2); default the source of this checkout (HEAD, clean)."""
     d = tmp_path / 's03'
     (d / 'sealed').mkdir(parents=True)
     with open(d / 'levels.csv', 'w', newline='') as f:
@@ -123,7 +123,7 @@ def _s03_dir(tmp_path, runs=None, trial=False, mu=(0.4, 0.5, 0.6), levels=None, 
         f'script: {json.dumps(script if script is not None else dict(commit=_head(), dirty=False))}\n'
         f'firmware:\n  dll_sha256: {dll_sha}\n'
         f'plant: {json.dumps(dict(motor_model="dc", src=plant_src or fwsim.PLANT_SRC))}\n'
-        f'o1: {json.dumps(o1c or s4.o1_constants())}\n'
+        f'o1: {json.dumps(o1c or s4.o1_constants())}\nimu: {json.dumps(imu or s3.IMU)}\n'
         f'gate_speeds: {json.dumps(list(s3.SPEEDS))}\ny3_reference: {json.dumps(y3)}\n', encoding='utf-8')
     if runs is not None:
         s3.write_csv(str(d / 'sealed' / 'runs.csv'), runs)
@@ -412,16 +412,18 @@ def _other_blob(b):
 @pytest.mark.parametrize('kw, msg', [
     (dict(plant_src='plant'), 'not the S03 plant.src'),                       # params.py changed after S03
     (dict(o1c='D'), 'not the S03 o1'),                                         # an O1 constant changed after S03
+    (dict(imu='rate'), 'not the S03 imu'),                                     # s03_doe.IMU changed after S03
     (dict(script='dirty'), 'no clean script commit'),
-    (dict(script='unknown'), 'is not the one of the S03 script commit'),       # git cannot read the commit
+    (dict(script='unknown'), 'cannot be read in this repository'),             # git cannot read the commit
 ])
 def test_first_trial_refuses_a_source_s03_did_not_use(tmp_path, monkeypatch, kw, msg):
-    """S4C-2 (Codex round 3): the first trial checks the S03 meta.yaml, so it cannot lock a plant,
-    O1 constants or O1 code that the S03 run did not use; S03 records written without these lines
-    (older scripts) are refused too."""
+    """S4C-2 (Codex rounds 3, 4): the first trial checks the S03 meta.yaml, so it cannot lock a
+    plant, O1 constants or IMU configuration that the S03 run did not use, nor run when the S03 commit
+    is not clean or not readable; these stop a --tool-check too, before any lock is written."""
     src = dict(fwsim.PLANT_SRC)
     arg = dict(plant_src=dict(src, params_py=_other_blob(src['params_py'])) if 'plant_src' in kw else None,
                o1c=dict(s4.o1_constants(), D=0.2) if 'o1c' in kw else None,
+               imu=dict(s3.IMU, rate_hz=10.0) if 'imu' in kw else None,
                script={'dirty': dict(commit=_head(), dirty=True), 'unknown': dict(commit='0' * 40, dirty=False)}
                .get(kw.get('script')))
     d = _s03_dir(tmp_path, trial=True, mu=(0.5,), **arg)
@@ -433,26 +435,44 @@ def test_first_trial_refuses_a_source_s03_did_not_use(tmp_path, monkeypatch, kw,
     assert not (tmp_path / 'run' / 'lock.yaml').exists()
 
 
+S03_COMMIT_OLD_FWSIM = '49bbb50'   # feat/s03-doe, pushed: fwsim/fwsim.py there is older than on feat/s04-ga
+
+
 @needs_dll
-def test_first_trial_checks_the_o1_code_and_old_s03_records(tmp_path, monkeypatch):
-    """S4C-2: an O1 code blob at the S03 commit that is not the file of this checkout stops the
-    trial; an S03 meta.yaml without the plant line stops it; the blob read through git at HEAD is
-    the blob of the unchanged file (the comparison the clean case relies on)."""
-    assert s4.blob_at(_head(), s4.O1_FILE) == s4.git_blob(os.path.join(fwsim.HERE, '..', s4.O1_FILE))
-    d = _s03_dir(tmp_path, trial=True, mu=(0.5,))
-    argv = ['s04_ga.py', '--phase', 'trial', '--tool-check', '--controller', 'PID', '--s03', str(d), '--pop', '4',
-            '--gen-base', '1', '--gen-max', '1', '--dll', _DLL, '--out', str(tmp_path / 'run')]
-    monkeypatch.setattr(sys, 'argv', argv)
+def test_sources_compared_by_class_with_the_s03_commit(tmp_path, monkeypatch, capsys):
+    """S4C-2 (Codex round 4): every module of SIM_SOURCES (all S04 imports for simulation and
+    scoring except s04_ga.py) is compared, through git, with its blob at the S03 script commit. At
+    HEAD nothing differs; at the fixed older commit S03_COMMIT_OLD_FWSIM fwsim/fwsim.py differs
+    (real git history, no mock): a main trial stops before any lock, a --tool-check only warns and
+    returns the difference. A source that differs only through a mocked blob is caught too, and an
+    S03 meta.yaml without the plant line is refused."""
+    assert set(s4.SIM_SOURCES) == set(s4.SOURCES) - {'fwsim/s04_ga.py'}
+    assert s4.source_diff(_head()) == []
+    old = s4.source_diff(S03_COMMIT_OLD_FWSIM)
+    assert 'fwsim/fwsim.py' in [n for n, _, _ in old] and all(now != then for _, now, then in old)
+    d = _s03_dir(tmp_path, _runs(), script=dict(commit=S03_COMMIT_OLD_FWSIM, dirty=False))
+    pre = tmp_path / 'pre.json'
+    pre.write_text(json.dumps({k: 'checked in x' for k in s4.PRECONDITIONS}))
+    monkeypatch.setattr(sys, 'argv', ['s04_ga.py', '--phase', 'trial', '--controller', 'PID', '--s03', str(d),
+                                      '--s03-unsealed', '--preconditions', str(pre), '--dll', _DLL,
+                                      '--out', str(tmp_path / 'run')])
+    with pytest.raises(SystemExit, match='not the sources of the S03 script commit: .*fwsim/fwsim.py'):
+        s4.main()
+    assert not (tmp_path / 'run' / 'lock.yaml').exists()
+    meta = (d / 'meta.yaml').read_text(encoding='utf-8')
+    fp = s4.fingerprint(_DLL, str(d))
+    got = s4.check_s03_source(meta, fp, _DLL, tool_check=True)
+    assert 'fwsim/fwsim.py' in [g['path'] for g in got] and 'WARNING (--tool-check)' in capsys.readouterr().out
+    head_meta = (_s03_dir(tmp_path / 'h', trial=True, mu=(0.5,)) / 'meta.yaml').read_text(encoding='utf-8')
+    assert s4.check_s03_source(head_meta, fp, _DLL) == []
     real = s4.blob_at
-    monkeypatch.setattr(s4, 'blob_at', lambda c, p: _other_blob(real(c, p)))
-    with pytest.raises(SystemExit, match='is not the one of the S03 script commit'):
-        s4.main()
+    monkeypatch.setattr(s4, 'blob_at', lambda c, p: _other_blob(real(c, p)) if p == 'rpi5/imu_model.py' else real(c, p))
+    with pytest.raises(SystemExit, match='rpi5/imu_model.py'):
+        s4.check_s03_source(head_meta, fp, _DLL)
     monkeypatch.setattr(s4, 'blob_at', real)
-    meta = d / 'meta.yaml'
-    meta.write_text('\n'.join(l for l in meta.read_text(encoding='utf-8').splitlines() if not l.startswith('plant:')),
-                    encoding='utf-8')
+    no_plant = '\n'.join(l for l in head_meta.splitlines() if not l.startswith('plant:'))
     with pytest.raises(SystemExit, match="no 'plant' line"):
-        s4.main()
+        s4.check_s03_source(no_plant, fp, _DLL)
 
 
 # ── GA loop: generation rule, re-evaluation, run_error (sections 3, 4.3) ─────────────
@@ -537,6 +557,11 @@ def test_pareto_rows_feasible_and_infeasible_and_empty(tmp_path):
            P(0.02, 2.0, x=(1.4,), feasible=False)]
     rows = s4.pareto_rows('PID', {1: pts})
     assert [(r['feasible'], r['f1']) for r in rows] == [(True, 0.02), (False, 0.01)]
+    flags = [(r['feasible'], r['nondominated_feasible'], r['nondominated_in_group']) for r in rows]
+    assert flags == [(True, True, True), (False, False, True)]                      # S4C-R3-1: both flags
+    full = s4.population_rows('PID', {1: pts})                                      # dominated points too
+    assert [(r['f1'], r['nondominated_feasible'], r['nondominated_in_group']) for r in full] == [
+        (0.02, True, True), (0.03, False, False), (0.01, False, True), (0.02, False, False)]
     s4.write_rows(str(tmp_path / 'pareto_PID.csv'), s4.pareto_rows('PID', {1: []}), s4.POP_COLS)
     s4.merge_controllers(str(tmp_path))
     with open(tmp_path / 'pareto.csv', newline='') as f:
@@ -625,6 +650,7 @@ def test_tool_check_three_phases(tmp_path, monkeypatch, capsys):
         assert s4.main() in (0, 2)
         assert yaml.safe_load(open(out / 'meta.yaml', encoding='utf-8'))['tool_check'] is True    # S4C-12
     lock = json.load(open(out / 'lock.yaml'))
+    assert lock['common']['s03_source_diff'] == []                         # S4C-2: S03 record of this checkout
     for ctrl in s3.CONTROLLERS:
         L = lock['controllers'][ctrl]
         assert L['eval_mu'] == [0.5] and L['n_gen'] in (1, 2) and L['hv_ref'][0] == s4.D and L['tool_check']

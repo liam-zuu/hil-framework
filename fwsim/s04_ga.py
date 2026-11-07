@@ -728,7 +728,7 @@ def main():
     t0 = time.time()
 
     fp = fingerprint(a.dll, a.s03, unsealed=a.s03_unsealed and not a.tool_check)
-    check_s03_source(s03_meta, fp, a.dll)                          # S4C-2: the source the S03 run used
+    src_diff = check_s03_source(s03_meta, fp, a.dll, a.tool_check)   # S4C-2: the source the S03 run used
 
     if a.phase == 'trial':
         tdir = os.path.join(a.out, 'trial', ctrl)
@@ -747,7 +747,8 @@ def main():
             check_fingerprint(common, fp, 'trial')
         else:
             common = lock['common'] = dict(tool_check=a.tool_check, s03_run=os.path.abspath(a.s03), fingerprint=fp,
-                                           s03_mu_levels=s03_mu, unsealed=bool(a.s03_unsealed and not a.tool_check))
+                                           s03_mu_levels=s03_mu, unsealed=bool(a.s03_unsealed and not a.tool_check),
+                                           s03_source_diff=src_diff)
         pre = {}
         if not a.tool_check:
             if not a.preconditions:
@@ -944,18 +945,36 @@ def blob_at(commit, path):
     return out if r.returncode == 0 and len(out) == 40 else None
 
 
-def check_s03_source(s03_meta, fp, dll):
-    """S4C-2 (Codex round 3): S04 runs on the source the S03 run recorded, checked against the S03
-    meta.yaml in every trial and main start, so the first trial cannot lock a source S03 did not
-    use (later phases compare with lock.yaml): the DLL (firmware.dll_sha256), the plant blobs
-    (plant.src, L34), the O1 constants (o1) and the O1 code (blob of fwsim/o1_feasibility.py at the
-    S03 script commit, which must be clean). Other modules S03 ran (s03_doe.py, fwsim.py, ...) are
-    not compared with S03 (they hold S04 code too); they are fixed for the folder by the fingerprint."""
+SIM_SOURCES = tuple(n for n in SOURCES if n != 'fwsim/s04_ga.py')   # what S03 also ran (S4C-2, round 4)
+
+
+def source_diff(commit):
+    """The SIM_SOURCES whose working-tree blob is not the blob at <commit>: [(path, now, then)]."""
+    out = []
+    for n in SIM_SOURCES:
+        now, then = git_blob(os.path.join(HERE, '..', n)), blob_at(commit, n)
+        if then is None or now != then:
+            out.append((n, now, then))
+    return out
+
+
+def check_s03_source(s03_meta, fp, dll, tool_check=False):
+    """S4C-2 (Codex rounds 3, 4): S04 runs on the source the S03 run recorded, checked against the
+    S03 meta.yaml at every trial and main start, so the first trial cannot lock a source S03 did not
+    use (later phases compare with lock.yaml). By class, not file by file: the DLL
+    (firmware.dll_sha256), the plant blobs (plant.src, L34), the run configuration S03 wrote (o1, imu)
+    and every module S04 imports for the simulation and the scoring except this script
+    (SIM_SOURCES: the blob in this checkout against the blob at the S03 script commit, which must be
+    clean). A main run stops on any difference, so the S03 main run is run from the commit S04 runs
+    on (L34: one merged commit). --tool-check stops on the DLL, plant, configuration and commit, and
+    only warns about SIM_SOURCES; the differences are returned and written to lock.yaml and meta.yaml
+    (s03_source_diff). Not compared: the Python and library versions (S03 does not write them; S04
+    fixes them for its own folder in the fingerprint)."""
     if s03_dll_sha(s03_meta) != fp['dll_sha256']:
         sys.exit(f'{dll} (sha256 {fp["dll_sha256"][:12]}…) is not the DLL of the S03 run '
                  f'({str(s03_dll_sha(s03_meta))[:12]}…): S04 runs on the S03 firmware (S04 7)')
     try:
-        plant, o1m, script = (meta_value(s03_meta, k) for k in ('plant', 'o1', 'script'))
+        plant, o1m, imu, script = (meta_value(s03_meta, k) for k in ('plant', 'o1', 'imu', 'script'))
     except KeyError as e:
         sys.exit(f'the S03 meta.yaml has no {e} line: cannot check that S04 runs on the S03 source (S4C-2)')
     src = plant.get('src') if isinstance(plant, dict) else None
@@ -963,12 +982,22 @@ def check_s03_source(s03_meta, fp, dll):
         sys.exit(f'plant source {fp["plant_src"]} is not the S03 plant.src {src} (L34; S04 7; S4C-2)')
     if o1m != o1_constants():
         sys.exit(f'O1 constants {o1_constants()} are not the S03 o1 {o1m} (S04 7; S4C-2)')
+    if imu != s3.IMU:
+        sys.exit(f'IMU configuration {s3.IMU} is not the S03 imu {imu} (S04 7; S4C-2)')
     if not isinstance(script, dict) or script.get('dirty', True) or not script.get('commit'):
-        sys.exit(f'the S03 run has no clean script commit ({script}): its O1 code cannot be checked (S4C-2)')
-    now, then = git_blob(os.path.join(HERE, '..', O1_FILE)), blob_at(script['commit'], O1_FILE)
-    if then is None or now != then:
-        sys.exit(f'{O1_FILE} (blob {now}) is not the one of the S03 script commit {script["commit"]} '
-                 f'(blob {then}) (S04 7; S4C-2)')
+        sys.exit(f'the S03 run has no clean script commit ({script}): its sources cannot be checked (S4C-2)')
+    if blob_at(script['commit'], O1_FILE) is None:
+        sys.exit(f'the S03 script commit {script["commit"]} cannot be read in this repository (no '
+                 f'{O1_FILE} there): its sources cannot be checked (S4C-2)')
+    diff = source_diff(script['commit'])
+    if diff:
+        txt = '; '.join(f'{n} (blob {now}, at {script["commit"]}: {then})' for n, now, then in diff)
+        if not tool_check:
+            sys.exit(f'not the sources of the S03 script commit: {txt}. Run S03 from the commit S04 runs on '
+                     f'(S04 7; L34; S4C-2)')
+        print(f'WARNING (--tool-check): not the sources of the S03 script commit: {txt}; written to '
+              f'lock.yaml / meta.yaml s03_source_diff')
+    return [dict(path=n, blob=now, s03_blob=then) for n, now, then in diff]
 
 
 def check_fingerprint(common, fp, phase):
@@ -1020,7 +1049,7 @@ def write_root_meta(out, dll, lock, running=None):
                  not_main_numbers=bool(common.get('tool_check')), running=running,
                  script=s3.git_state(os.path.join(HERE, '..')), fwsim_build=fw_info,
                  s03_run=common.get('s03_run'), s03_mu_levels=common.get('s03_mu_levels'),
-                 fingerprint=common.get('fingerprint'),
+                 fingerprint=common.get('fingerprint'), s03_source_diff=common.get('s03_source_diff'),
                  pymoo=dict(version=pymoo.__version__, checked_version=PYMOO_CHECKED, constraint_handling=PYMOO_CV,
                             recheck=pymoo.__version__ != PYMOO_CHECKED),
                  selection_rule=SELECTION_RULE, D=D, imu=s3.IMU, plant_seed=s3.SEED, controllers=ctrls,
