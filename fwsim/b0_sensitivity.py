@@ -15,6 +15,8 @@ scored with the older evaluate (O1 v5). Plant and IMU options as fwsim (--ground
 Criterion written BEFORE the run (Claude's proposal, Liam may change it): "sensitive" if, at any
 speed, a scaled b0 changes 'completed' versus factor 1.0, changes e_perp_max <= D versus factor
 1.0, or changes e_perp_max by more than 50 % of the factor-1.0 value. Simulation numbers only.
+The criterion is applied to pairs of known results (completed true / false, status ok); a pair
+with an 'inconclusive' run or a tracking error is reported as undecided, not judged (EV7-1).
 
   python fwsim/b0_sensitivity.py --ground traction --mu 0.5 --out <05_DATA/results/B0_SENS/<date>_runNN>
 """
@@ -36,15 +38,28 @@ FACTORS = (0.7, 0.85, 1.0, 1.15, 1.3)
 REL_LIMIT = 0.5              # e_perp_max change > 50 % of the factor-1.0 value = sensitive
 
 
+def determinate(r):
+    """A run whose result is known: completed 'true' or 'false' and status 'ok' (evaluate_v7, S03
+    section 4). 'inconclusive' or a tracking error ('track_err') is not a known result."""
+    return r['completed'] in ('true', 'false') and r.get('status') == 'ok'
+
+
 def judge(rows):
-    """Apply the pre-declared criterion per speed. Returns (sensitive: bool, reasons: list)."""
-    reasons = []
+    """Apply the pre-declared criterion per speed. Returns (sensitive: bool, reasons: list,
+    undecided: list). EV7-1 (Codex round 1, Liam 07/11 CODE session): the criterion was written
+    for known results; a pair (factor k, factor 1.0, same speed) where either run is not
+    determinate is not counted as sensitive or as not sensitive, it is listed in 'undecided'."""
+    reasons, undecided = [], []
     for v in sorted({r['v'] for r in rows}):
         nom = next(r for r in rows if r['v'] == v and r['b0_factor'] == 1.0)
         for r in rows:
             if r['v'] != v or r['b0_factor'] == 1.0:
                 continue
             tag = f"v={v} b0x{r['b0_factor']}"
+            if not (determinate(r) and determinate(nom)):
+                undecided.append(f"{tag}: completed/status {nom['completed']}/{nom.get('status')} (x1.0) vs "
+                                 f"{r['completed']}/{r.get('status')}: not a known result, not judged")
+                continue
             if r['completed'] != nom['completed']:
                 reasons.append(f'{tag}: completed {nom["completed"]} -> {r["completed"]}')
             if r['e_perp_max_le_D'] != nom['e_perp_max_le_D']:
@@ -52,7 +67,7 @@ def judge(rows):
             rel = abs(r['e_perp_max'] - nom['e_perp_max']) / nom['e_perp_max']
             if rel > REL_LIMIT:
                 reasons.append(f'{tag}: e_perp_max {nom["e_perp_max"]:.4f} -> {r["e_perp_max"]:.4f} ({rel:.0%})')
-    return bool(reasons), reasons
+    return bool(reasons), reasons, undecided
 
 
 def main():
@@ -93,7 +108,7 @@ def main():
             r = rows[-1]
             print(f"v={v} b0x{k}: completed={r['completed']} e_perp_max={r['e_perp_max']:.4f} "
                   f"stop={r['stop_dist_origin']:.4f} tv_duty={r['tv_duty']:.2f}")
-    sensitive, reasons = judge(rows)
+    sensitive, reasons, undecided = judge(rows)
     with open(os.path.join(a.out, 'summary.csv'), 'w', newline='') as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0]))
         w.writeheader()
@@ -108,8 +123,8 @@ purpose: "LADRC result vs b0 scaled on all three axes; simulation numbers, not m
 gains: {json.dumps(dict(source='--adrc' if a.adrc else 'firmware defaults (GA not run yet: re-run with the chosen gains)', omega_c_omega_o=gains))}
 b0_default: {json.dumps([g['b0'] for g in base])}     # adrc.c defaults (from S01), axes vx, vy, wz
 factors: {json.dumps(a.factors)}
-criterion: "written before the run (Claude's proposal): sensitive if any scaled b0 changes completed, or e_perp_max <= D (D = {o1.D} m), versus factor 1.0 at the same speed, or changes e_perp_max by more than {REL_LIMIT:.0%} of the factor-1.0 value"
-result: {json.dumps(dict(sensitive=sensitive, reasons=reasons))}
+criterion: "written before the run (Claude's proposal): sensitive if any scaled b0 changes completed, or e_perp_max <= D (D = {o1.D} m), versus factor 1.0 at the same speed, or changes e_perp_max by more than {REL_LIMIT:.0%} of the factor-1.0 value; applied to pairs of known results only (completed true / false and status ok in both runs); a pair with an inconclusive run or a tracking error is listed in result.undecided, not judged (EV7-1, Liam 07/11)"
+result: {json.dumps(dict(sensitive=sensitive, reasons=reasons, undecided=undecided, n_pairs=len(rows) - len({r['v'] for r in rows}), complete=not undecided))}
 pos_loop: {json.dumps(fwsim.pos_meta(fw))}     # firmware defaults read back (loop, (a), (d) on)
 firmware:
   esp32: {json.dumps(b.get('esp32'))}
@@ -125,6 +140,8 @@ files:
   - summary.csv: "one line per (speed, b0 factor), measures of evaluate_v7: completed (true / false / inconclusive), status (ok / track_err), e_perp_max, e_perp_max <= D, e_perp_rms, e_theta_lane_max_deg, stop distance to origin, t_end, PWM saturation fraction, duty total variation per second on [0, t_end]"
 """)
     print(f'sensitive={sensitive}' + ''.join(f'\n  {x}' for x in reasons))
+    if undecided:
+        print(f'undecided ({len(undecided)} pairs, not judged):' + ''.join(f'\n  {x}' for x in undecided))
     print(f'done in {time.time() - t0:.0f} s -> {a.out}')
 
 

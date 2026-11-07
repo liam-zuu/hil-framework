@@ -101,6 +101,39 @@ def test_v7_condition2_holds_over_the_whole_still_window(path):
     assert res['t_end'] == pytest.approx(sch.Tcmd + 0.5 + o1.T_D, abs=0.02)
 
 
+def test_v7_one_frame_off_the_origin_restarts_the_window(path):
+    """EV7-3: still at the origin from T_cmd, one frame 0.15 m off at T_cmd + 0.5 s: the chain
+    restarts after that frame, t_end = (T_cmd + 0.5 + one frame) + t_d."""
+    sch = o1.Schedule(0.5)
+    log = _ideal(sch)
+    k = int(np.searchsorted(log['t'], sch.Tcmd + 0.5 - 1e-9))
+    px, py = _plant_xy(-math.sqrt(0.5) * 0.15, math.sqrt(0.5) * 0.15)
+    log['pose'][k, 0] += px
+    log['pose'][k, 1] += py
+    res, _ = o1.evaluate_v7(log, path, sch)
+    assert res['completed'] == 'true' and res['status'] == 'ok'
+    assert res['t_end'] == pytest.approx(log['t'][k + 1] + o1.T_D, abs=0.015)
+
+
+def test_v7_track_error_and_short_stays_at_origin_is_false(path):
+    """EV7-3: tracking error before the progress; after T_cmd the car is still but leaves the
+    D disc for 0.1 s every 0.6 s, so no still-and-near window lasts t_d: conditions 2-5 never
+    hold together -> 'false', cond2_5_ever False, the window runs to the deadline."""
+    sch = o1.Schedule(0.5)
+    log = _ideal(sch)
+    k = int(np.searchsorted(log['t'], 4.0))
+    s_k = path.s_of_tau(sch.tau(log['t'][k])[0])
+    j = int(np.searchsorted(path.s, s_k + 1.0))
+    log['pose'][k, :2] = _plant_xy(path.x[j], path.y[j])
+    px, py = _plant_xy(-math.sqrt(0.5) * 0.15, math.sqrt(0.5) * 0.15)
+    off = (log['t'] >= sch.Tcmd - 1e-9) & (np.mod(log['t'] - sch.Tcmd + 1e-9, 0.6) >= 0.5)
+    log['pose'][off, 0] += px
+    log['pose'][off, 1] += py
+    res, _ = o1.evaluate_v7(log, path, sch)
+    assert res['status'] == 'track_err' and res['completed'] == 'false' and not res['cond2_5_ever']
+    assert res['t_end'] == pytest.approx(log['t'][log['t'] < sch.Tcmd + o1.T_LATE - 1e-9][-1])
+
+
 def test_v7_turning_in_place_is_not_still(path):
     """Condition 3 also on |wz| < omega_d = v_d / (lx + ly) (O6-18)."""
     sch = o1.Schedule(0.8)

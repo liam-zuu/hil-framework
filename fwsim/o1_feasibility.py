@@ -4,8 +4,9 @@ o1_feasibility.py: feasibility check of the O1 floor task (figure 8) on fwsim.
 06/11 (S03 v6 section 11.2, O1 v7 section 5.9): main() scores with evaluate_v7 (O1 v7: two-sided
 e_perp, completion with t >= T_cmd and |wz| < omega_d, e_theta lane and command, e_s along the
 command tangent, s_cmd - s_car, e_trk, e_meas_perp, y1 true/false/inconclusive); evaluate()
-below is the O1 v5 version, kept unchanged for b0_sensitivity.py and the runs made with it
-(O1_FEAS 2026-11-04 run01-run06, B0_SENS 2026-11-05 run01). The text below describes v5.
+below is the O1 v5 version, kept unchanged for the runs made with it (O1_FEAS 2026-11-04
+run01-run06, B0_SENS 2026-11-05 run01); since 07/11 b0_sensitivity.py scores with evaluate_v7
+(EV7-4). The text below describes v5.
 
 O1 v5 (CLAUDE_THESIS 06_SPECS/2026-11-04_De_xuat_O1_nhiem_vu_san_v5.md):
   path       x = A sin tau, y = (A/2) sin 2 tau, A = 1 m (section 3.1); the car keeps
