@@ -435,6 +435,22 @@ def test_first_trial_refuses_a_source_s03_did_not_use(tmp_path, monkeypatch, kw,
     assert not (tmp_path / 'run' / 'lock.yaml').exists()
 
 
+@needs_dll
+@pytest.mark.parametrize('path', s4.SIM_SOURCES)
+def test_each_sim_source_is_compared(tmp_path, monkeypatch, capsys, path):
+    """S4C-R5-1: a blob at the S03 commit that differs for this one module (and no other) is
+    reported as exactly that module; a main start stops, a --tool-check warns and returns it."""
+    meta = (_s03_dir(tmp_path, trial=True, mu=(0.5,)) / 'meta.yaml').read_text(encoding='utf-8')
+    fp = s4.fingerprint(_DLL, str(tmp_path / 's03'))
+    real = s4.blob_at
+    monkeypatch.setattr(s4, 'blob_at', lambda c, p: _other_blob(real(c, p)) if p == path else real(c, p))
+    assert [n for n, _, _ in s4.source_diff(_head())] == [path]
+    with pytest.raises(SystemExit, match=f'not the sources of the S03 script commit: {path} '):
+        s4.check_s03_source(meta, fp, _DLL)
+    assert [g['path'] for g in s4.check_s03_source(meta, fp, _DLL, tool_check=True)] == [path]
+    assert f'WARNING (--tool-check): not the sources of the S03 script commit: {path} ' in capsys.readouterr().out
+
+
 S03_COMMIT_OLD_FWSIM = '49bbb50'   # feat/s03-doe, pushed: fwsim/fwsim.py there is older than on feat/s04-ga
 
 
