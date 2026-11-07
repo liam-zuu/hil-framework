@@ -8,10 +8,10 @@ function params = params_mecanum()
     params.T_sim  = 10;       % Default simulation duration (s)
 
     %% --- Mechanical (AGV Mecanum) ---
-    params.r      = 0.0485;   % Wheel radius (m) [from spec]
-    params.lx     = 0.12;     % Longitudinal half-distance: center→wheel along body X (m) [from spec]
-    params.ly     = 0.12;     % Lateral half-distance: center→wheel along body Y (m) [from spec]
-    params.M      = 4;        % Total mass (kg) [from spec]
+    params.r      = 0.0485;   % Wheel radius (m) [Liam confirmed 07/11/2026, CODE session]
+    params.lx     = 0.12;     % Longitudinal half-distance: center→wheel along body X (m) [Liam confirmed 07/11/2026, CODE session]
+    params.ly     = 0.12;     % Lateral half-distance: center→wheel along body Y (m) [Liam confirmed 07/11/2026, CODE session]
+    params.M      = 4;        % Total mass (kg) [not weighed yet: weigh the car with battery (Liam 07/11)]
     params.Iz     = (1/12) * 4 * ((2*0.12)^2 + (2*0.12)^2);  % Body yaw inertia (kg·m²) = 0.0384 [calculated: rectangular body]
     params.J_w    = 0.00247;  % Wheel inertia (kg·m²) [from spec]
     params.b_w    = 0.002;    % Wheel viscous friction (N·m·s/rad) [ASSUMPTION — not in spec]
