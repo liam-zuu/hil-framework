@@ -241,8 +241,10 @@ def evaluate_v7(log, path, sch, lsum=0.24):
     hold together at some t after it (before the deadline), else 'false'; otherwise 'false'
     if conditions 2-5 never hold together before the deadline (true pose, no tracker),
     else 'inconclusive'. status 'track_err' when the run has a tracking error, else 'ok'.
-    Interpretation of this script (not written in O1 v7): condition 3 is a trailing window
-    (still for t_d up to the instant), conditions 1, 2, 5 are checked at the instant only.
+    Condition 2 holds over the same trailing t_d window as condition 3 (L63 (2), Liam 07/11,
+    THESIS session: "Suot cua so t_d"): the window is an unbroken run of frames that are still
+    AND within D of the origin. Interpretation of this script (not written in O1 v7):
+    conditions 1, 5 are checked at the instant only.
     Returns (summary dict, per-frame rows)."""
     t_all = log['t']
     keep = t_all < sch.Tcmd + T_LATE - 1e-9                   # "before the deadline" (S3C-23)
@@ -256,8 +258,9 @@ def evaluate_v7(log, path, sch, lsum=0.24):
     speed = np.hypot(vt[:, 0], vt[:, 1])
     omega_d = V_D / lsum
     d0 = np.hypot(fx, fy)
-    held = _held(t, (speed < V_D) & (np.abs(vt[:, 2]) < omega_d))
-    c25 = (d0 <= D) & held & (t >= sch.Tcmd - 1e-9)          # conditions 2, 3, 5 (4: t < deadline)
+    # conditions 2 and 3 over one trailing t_d window (L63 (2)): still and near the origin, unbroken
+    held = _held(t, (speed < V_D) & (np.abs(vt[:, 2]) < omega_d) & (d0 <= D))
+    c25 = held & (t >= sch.Tcmd - 1e-9)                      # conditions 2, 3, 5 (4: t < deadline)
     fw_pose, meas_note, pos = None, 'no firmware pose columns', None
     if len(log.get('pos', [])):
         pos = np.asarray(log['pos'])[keep]

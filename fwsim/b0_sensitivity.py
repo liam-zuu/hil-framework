@@ -8,7 +8,9 @@ is very sensitive, reconsider.
 Method: LADRC with the given gains (default: the firmware defaults; after the GA, pass the chosen
 gains with --adrc), b0 of all three axes scaled by each factor in --factors (default 0.7, 0.85,
 1.0, 1.15, 1.3, i.e. +-30 %), O1 schedule at the three speeds of o1_feasibility, measures from
-o1_feasibility.evaluate (true plant pose). Plant and IMU options as fwsim (--ground, --mu, ...).
+o1_feasibility.evaluate_v7 (O1 v7 on the true plant pose, run status of S03 section 4; the scoring
+of S03 and S04; Liam 07/11, CODE session: "lam het viec A di"). B0_SENS/2026-11-05_run01 was
+scored with the older evaluate (O1 v5). Plant and IMU options as fwsim (--ground, --mu, ...).
 
 Criterion written BEFORE the run (Claude's proposal, Liam may change it): "sensitive" if, at any
 speed, a scaled b0 changes 'completed' versus factor 1.0, changes e_perp_max <= D versus factor
@@ -80,15 +82,14 @@ def main():
         sch = o1.Schedule(v)
         for k in a.factors:
             adrc = {i: (gains[i][0], gains[i][1], base[i]['b0'] * k, base[i]['out_limit']) for i in range(3)}
-            log = fwsim.simulate(fw, sch.setpoint, sch.Tcmd + o1.T_LATE, fwsim.plant_params(a), seed=1, mode='ADRC',
-                                 imu=imu, adrc=adrc)
-            res, _ = o1.evaluate(log, path, sch)
-            m = fwsim.metrics(log)
+            p = fwsim.plant_params(a)
+            log = fwsim.simulate(fw, sch.setpoint, sch.Tcmd + o1.T_LATE, p, seed=1, mode='ADRC', imu=imu, adrc=adrc)
+            res, _ = o1.evaluate_v7(log, path, sch, lsum=p.lx + p.ly)
             rows.append(dict(v=v, b0_factor=k, b0_xy=base[0]['b0'] * k, b0_wz=base[2]['b0'] * k,
-                             completed=res['completed'], e_perp_max=res['e_perp_max'], e_perp_max_le_D=res['e_perp_max_le_D'],
-                             e_perp_rms=res['e_perp_rms'], e_theta_max_deg=res['e_theta_max_deg'],
-                             stop_dist_origin=res['stop_dist_origin'], t_end=res['t_end'], sat_frac=res['sat_frac'],
-                             tv_duty=m['tv_duty']))
+                             completed=res['completed'], status=res['status'], e_perp_max=res['e_perp_max'],
+                             e_perp_max_le_D=res['e_perp_max_le_D'], e_perp_rms=res['e_perp_rms'],
+                             e_theta_lane_max_deg=res['e_theta_lane_max_deg'], stop_dist_origin=res['stop_dist_origin'],
+                             t_end=res['t_end'], sat_frac=res['sat_frac'], tv_duty=res['tv_duty']))
             r = rows[-1]
             print(f"v={v} b0x{k}: completed={r['completed']} e_perp_max={r['e_perp_max']:.4f} "
                   f"stop={r['stop_dist_origin']:.4f} tv_duty={r['tv_duty']:.2f}")
@@ -116,12 +117,12 @@ firmware:
   compiler: "{b.get('compiler')}"
 plant: {fwsim.plant_meta(fwsim.plant_params(a))}
 imu: {json.dumps(imu)}
-task: "O1 figure 8 as fwsim/o1_feasibility.py (Schedule, Path8, evaluate), speeds {list(o1.SPEEDS)} m/s"
+task: "O1 figure 8 as fwsim/o1_feasibility.py (Schedule, Path8, evaluate_v7: O1 v7, run status of S03 section 4, measures on the window [0, t_end]), speeds {list(o1.SPEEDS)} m/s; B0_SENS/2026-11-05_run01 used the older evaluate (O1 v5)"
 seed: 1                       # plant and IMU noise-free: the seed has no effect
 libraries: {json.dumps(fwsim.lib_versions())}
 elapsed_s: {time.time() - t0:.0f}
 files:
-  - summary.csv: "one line per (speed, b0 factor): completed, e_perp_max, e_perp_max <= D, e_perp_rms, e_theta_max_deg, stop distance to origin, t_end, PWM saturation fraction, duty total variation per second"
+  - summary.csv: "one line per (speed, b0 factor), measures of evaluate_v7: completed (true / false / inconclusive), status (ok / track_err), e_perp_max, e_perp_max <= D, e_perp_rms, e_theta_lane_max_deg, stop distance to origin, t_end, PWM saturation fraction, duty total variation per second on [0, t_end]"
 """)
     print(f'sensitive={sensitive}' + ''.join(f'\n  {x}' for x in reasons))
     print(f'done in {time.time() - t0:.0f} s -> {a.out}')

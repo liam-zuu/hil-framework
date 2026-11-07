@@ -84,6 +84,23 @@ def test_v7_condition5_waits_for_the_command_end(path):
     assert old['t_end'] < later.Tcmd - 1.0
 
 
+def test_v7_condition2_holds_over_the_whole_still_window(path):
+    """L63 (2) (Liam 07/11, 'Suot cua so t_d'): the car is still from T_cmd but outside D of the
+    origin for the first 0.5 s, then at the origin: the t_d window starts when it is near the
+    origin, so t_end = T_cmd + 0.5 + t_d (before: T_cmd + t_d, condition 2 at the instant only)."""
+    sch = o1.Schedule(0.5)
+    log = _ideal(sch)
+    off = (log['t'] >= sch.Tcmd - 1e-9) & (log['t'] < sch.Tcmd + 0.5 - 1e-9)
+    nx, ny = -math.sqrt(0.5) * 0.15, math.sqrt(0.5) * 0.15                    # 0.15 m > D, across the lane
+    px, py = _plant_xy(nx, ny)
+    log['pose'][off, 0] += px
+    log['pose'][off, 1] += py
+    res, rows = o1.evaluate_v7(log, path, sch)
+    assert max(r['dist_origin'] for r in rows if sch.Tcmd <= r['t'] < sch.Tcmd + 0.5) > o1.D
+    assert res['completed'] == 'true' and res['status'] == 'ok'
+    assert res['t_end'] == pytest.approx(sch.Tcmd + 0.5 + o1.T_D, abs=0.02)
+
+
 def test_v7_turning_in_place_is_not_still(path):
     """Condition 3 also on |wz| < omega_d = v_d / (lx + ly) (O6-18)."""
     sch = o1.Schedule(0.8)

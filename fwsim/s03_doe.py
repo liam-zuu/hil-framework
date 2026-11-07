@@ -749,7 +749,7 @@ y3_reference: {json.dumps({f'{c} v={v}': y for (c, v), y in y3_ref.items()})}
 o1: {json.dumps(dict(A=o1.A, a_r=o1.A_R, D=o1.D, D_d=o1.D, t_d=o1.T_D, t_late=o1.T_LATE, delta=o1.DELTA, v_d=o1.V_D, c_cens=o1.C_CENS))}
 sweep_run_error_reruns: {json.dumps([n for n in rerun_notes if n['point'] is None], default=str)}
 interpretations:   # of this script, not written in S03 v6 / O1 v7; Liam or THESIS correct if wrong
-  - "completion: conditions 1, 2, 5 at the instant, condition 3 as the trailing unbroken t_d window, condition 4 strictly before the deadline; after a tracking error that came before the progress, the window runs to the deadline (o1_feasibility.evaluate_v7)"
+  - "completion: conditions 1, 5 at the instant, conditions 2 and 3 together as the trailing unbroken t_d window (condition 2 over the window: L63 (2), Liam 07/11), condition 4 strictly before the deadline; after a tracking error that came before the progress, the window runs to the deadline (o1_feasibility.evaluate_v7)"
   - "sweep level rule: a point is 'completing' only with y1 'true' at every gate speed (inconclusive breaks the run)"
   - "inner box trigger: corners with y1 'false' only (inconclusive not counted)"
   - "a stop of the spec (3.1 (i), (ii), 3.4, run_error) ends S03 for both controllers; the default gains of every controller are checked first"
