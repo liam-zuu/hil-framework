@@ -44,6 +44,24 @@ def determinate(r):
     return r['completed'] in ('true', 'false') and r.get('status') == 'ok'
 
 
+def check_factors(factors):
+    """EV7-R-1 (Codex round 2): None if --factors is usable, else the error message. 1.0 is the
+    reference; a repeated factor would make two pairs of the same comparison; with no factor other
+    than 1.0 there is nothing to compare, and 'complete' would be true with no pair judged."""
+    if 1.0 not in factors:
+        return '--factors must include 1.0 (the reference)'
+    if len(set(factors)) != len(factors):
+        return f'--factors must not repeat a value: {factors}'
+    if not any(k != 1.0 for k in factors):
+        return '--factors must include at least one factor other than 1.0'
+    return None
+
+
+def n_pairs(rows):
+    """Number of pairs (factor k, factor 1.0, same speed) = rows with a factor other than 1.0 (EV7-R-1)."""
+    return sum(1 for r in rows if r['b0_factor'] != 1.0)
+
+
 def judge(rows):
     """Apply the pre-declared criterion per speed. Returns (sensitive: bool, reasons: list,
     undecided: list). EV7-1 (Codex round 1, Liam 07/11 CODE session): the criterion was written
@@ -79,8 +97,9 @@ def main():
                     help='LADRC gains to test (default: firmware defaults)')
     fwsim.add_plant_imu_args(ap)
     a = ap.parse_args()
-    if 1.0 not in a.factors:
-        sys.exit('--factors must include 1.0 (the reference)')
+    err = check_factors(a.factors)
+    if err:
+        sys.exit(err)
     if os.path.isdir(a.out) and os.listdir(a.out):
         sys.exit(f'{a.out} already holds data: use a new folder.')
     os.makedirs(a.out, exist_ok=True)
@@ -124,7 +143,7 @@ gains: {json.dumps(dict(source='--adrc' if a.adrc else 'firmware defaults (GA no
 b0_default: {json.dumps([g['b0'] for g in base])}     # adrc.c defaults (from S01), axes vx, vy, wz
 factors: {json.dumps(a.factors)}
 criterion: "written before the run (Claude's proposal): sensitive if any scaled b0 changes completed, or e_perp_max <= D (D = {o1.D} m), versus factor 1.0 at the same speed, or changes e_perp_max by more than {REL_LIMIT:.0%} of the factor-1.0 value; applied to pairs of known results only (completed true / false and status ok in both runs); a pair with an inconclusive run or a tracking error is listed in result.undecided, not judged (EV7-1, Liam 07/11)"
-result: {json.dumps(dict(sensitive=sensitive, reasons=reasons, undecided=undecided, n_pairs=len(rows) - len({r['v'] for r in rows}), complete=not undecided))}
+result: {json.dumps(dict(sensitive=sensitive, reasons=reasons, undecided=undecided, n_pairs=n_pairs(rows), complete=not undecided))}
 pos_loop: {json.dumps(fwsim.pos_meta(fw))}     # firmware defaults read back (loop, (a), (d) on)
 firmware:
   esp32: {json.dumps(b.get('esp32'))}

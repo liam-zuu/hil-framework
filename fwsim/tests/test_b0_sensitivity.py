@@ -47,6 +47,25 @@ def test_inconclusive_or_track_error_is_undecided_not_judged():
     assert (s, why, len(und)) == (False, [], 1)
 
 
+def test_factors_checked_before_the_run():
+    """EV7-R-1: 1.0 required, no repeated factor, at least one factor other than 1.0."""
+    assert bs.check_factors(list(bs.FACTORS)) is None
+    assert bs.check_factors([1.0, 0.7]) is None
+    assert 'include 1.0' in bs.check_factors([0.7, 1.3])
+    assert 'repeat' in bs.check_factors([1.0, 1.0, 0.7])
+    assert 'repeat' in bs.check_factors([1.0, 0.7, 0.7])
+    assert 'other than 1.0' in bs.check_factors([1.0])
+
+
+def test_n_pairs_counts_rows_with_a_factor_other_than_one():
+    """EV7-R-1: the default grid, 3 speeds x 4 scaled factors = 12 pairs."""
+    rows = [_row(v, k) for v in (0.2, 0.5, 0.8) for k in bs.FACTORS]
+    assert bs.n_pairs(rows) == 12
+    assert bs.n_pairs([_row(0.5, 1.0), _row(0.5, 0.7)]) == 1
+    # rows minus speeds would count 2 here (Codex EV7-R-1: 1.0 repeated)
+    assert bs.n_pairs([_row(0.5, 1.0), _row(0.5, 1.0), _row(0.5, 0.7)]) == 1
+
+
 def test_known_pairs_still_judged_next_to_undecided_ones():
     rows = [_row(0.2, 1.0), _row(0.2, 0.7, done='inconclusive', status='track_err'), _row(0.2, 1.3, done='false')]
     s, why, und = bs.judge(rows)

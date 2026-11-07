@@ -112,7 +112,12 @@ def test_v7_one_frame_off_the_origin_restarts_the_window(path):
     log['pose'][k, 1] += py
     res, _ = o1.evaluate_v7(log, path, sch)
     assert res['completed'] == 'true' and res['status'] == 'ok'
-    assert res['t_end'] == pytest.approx(log['t'][k + 1] + o1.T_D, abs=0.015)
+    # exact frame (EV7-3, Codex round 2: abs=0.015 > one frame let a one-frame-early end pass):
+    # the first frame at least t_d after the restart frame k + 1
+    t = log['t']
+    j = int(np.argmax(t - t[k + 1] >= o1.T_D - 1e-9))
+    assert t[j] - t[k + 1] >= o1.T_D - 1e-9 > t[j - 1] - t[k + 1]
+    assert res['t_end'] == pytest.approx(t[j], abs=1e-9)
 
 
 def test_v7_track_error_and_short_stays_at_origin_is_false(path):
