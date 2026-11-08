@@ -729,11 +729,40 @@ def decode(t_send_ns, mosi, miso, esp32_events: Optional[str] = None, cal: Optio
     lo, hi = (res.get('esp32_match') or {}).get('window_pi_us') or (t_send_us[0], t_send_us[-1])
     st['empty_in_run'] = sum(1 for r in rows if r['empty'] and r['j'] >= ANSWER_LAG
                              and lo <= t_send_us[r['j'] - ANSWER_LAG] <= hi)
+    res['swa'] = swa_summary(mosi, miso)          # I8: report only, not a problem (Liam 09/11)
     res['_records'] = recs
     res['_frames_rows'] = rows
     res['_calls'] = calls
     res['_reports'] = reps
     return res
+
+
+def swa_summary(mosi, miso) -> dict:
+    """I8 (Liam 09/11, "Duyet ca 5"): SWA the Pi asked (MOSI byte 20 bit 3) and the SWA of the last iBUS
+    frame the H7 started (MISO byte 16 bit 0). For every change of the command, how many frames later the
+    H7 status shows it (the status lags by the answer lag plus up to one iBUS period, about 2 + 7 frames).
+    Frames with an all-zero MISO or a bad MISO CRC are not read for the status."""
+    mosi = np.asarray(mosi, dtype=np.uint8).reshape(-1, 40)
+    miso = np.asarray(miso, dtype=np.uint8).reshape(-1, 40)
+    cmd = (mosi[:, 20] >> 3) & 1
+    ok = np.array([bool(m.any()) and crc16(bytes(m[:MISO_CRC]) + bytes(m[MISO_CRC + 2:])) == u16(m, MISO_CRC)
+                   for m in miso], dtype=bool)
+    st = miso[:, MISO_STATUS] & 1
+    cmd_ch = [int(j) for j in np.flatnonzero(np.diff(cmd.astype(np.int16)) != 0) + 1]
+    good = np.flatnonzero(ok)
+    st_good = st[good]
+    st_ch = [int(good[i]) for i in np.flatnonzero(np.diff(st_good.astype(np.int16)) != 0) + 1]
+    lags, unfollowed = [], 0
+    for n, j in enumerate(cmd_ch):
+        end = cmd_ch[n + 1] if n + 1 < len(cmd_ch) else len(cmd)
+        k = good[(good > j) & (good < end) & (st == cmd[j])[good]]
+        if len(k):
+            lags.append(int(k[0] - j))
+        else:
+            unfollowed += 1
+    return dict(cmd_on_frames=int(cmd.sum()), cmd_first=int(cmd[0]) if len(cmd) else None,
+                cmd_changes=cmd_ch, status_changes=st_ch, status_on_frames=int(st_good.sum()),
+                follow_lag_frames=lags, follow_lag_max=max(lags) if lags else None, unfollowed=unfollowed)
 
 
 def problems(res) -> List[str]:

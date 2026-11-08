@@ -403,3 +403,50 @@ def test_constants_match_h7_headers():
             s['S06_REC_HOLD_OFF'], s['S06_REC_RST_LOW'], s['S06_REC_RST_HIGH'], s['S06_REC_TICK'],
             s['S06_REC_REARM'], s['S06_REC_ENC_START'], s['S06_REC_ENC_STOP']) ==         (dec.REC_REPORT, dec.REC_PKT_READ, dec.REC_RESET_DONE, dec.REC_HOLD_ON, dec.REC_HOLD_OFF, dec.REC_RST_LOW,
          dec.REC_RST_HIGH, dec.REC_TICK, dec.REC_REARM, dec.REC_ENC_START, dec.REC_ENC_STOP)
+
+
+# ── I8: SWA command vs H7 status (report only) ──
+
+def _swa_frames(cmd, status, bad=()):
+    """MOSI with byte 20 bit 3 = cmd[j]; MISO with status bit 0 = status[j] and a valid CRC,
+    except frames in bad (all zero)."""
+    n = len(cmd)
+    mosi = np.zeros((n, 40), np.uint8)
+    miso = np.zeros((n, 40), np.uint8)
+    for j in range(n):
+        mosi[j, 20] = 0x08 if cmd[j] else 0
+        if j in bad:
+            continue
+        miso[j, 16] = 1 if status[j] else 0
+        miso[j, 17] = j & 0xFF
+        b = bytes(miso[j])
+        c = dec.crc16(b[:8] + b[10:])
+        miso[j, 8], miso[j, 9] = c & 0xFF, c >> 8
+    return mosi, miso
+
+
+def test_swa_summary_follow_lag():
+    cmd = [0] * 10 + [1] * 30 + [0] * 20
+    st = [0] * 18 + [1] * 30 + [0] * 12          # status follows 8 frames after each change
+    s = dec.swa_summary(*_swa_frames(cmd, st))
+    assert s['cmd_changes'] == [10, 40] and s['status_changes'] == [18, 48]
+    assert s['follow_lag_frames'] == [8, 8] and s['follow_lag_max'] == 8 and s['unfollowed'] == 0
+    assert s['cmd_on_frames'] == 30 and s['cmd_first'] == 0
+
+
+def test_swa_summary_status_never_follows():
+    cmd = [0] * 5 + [1] * 20
+    s = dec.swa_summary(*_swa_frames(cmd, [0] * 25))     # H7 without I8: status stays 0
+    assert s['unfollowed'] == 1 and s['follow_lag_max'] is None
+
+
+def test_swa_summary_skips_empty_miso():
+    cmd = [0] * 5 + [1] * 20
+    st = [0] * 5 + [1] * 20
+    s = dec.swa_summary(*_swa_frames(cmd, st, bad=(5, 6)))   # the first two answers after the change lost
+    assert s['follow_lag_frames'] == [2]
+
+
+def test_swa_in_decode_result(clean):
+    t, mosi, miso, _ = clean
+    assert dec.decode(t, mosi, miso)['swa']['cmd_on_frames'] == 0

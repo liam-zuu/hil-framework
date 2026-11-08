@@ -369,7 +369,22 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument('--no-rt-tune',    action='store_true',
                    help='Without mlockall, GC off and touching the frame log, to compare timing '
                         '(the frame log manifest says which run was which)')
+    p.add_argument('--swa',           choices=('auto', 'on', 'off'), default='auto',
+                   help='I8: RC switch SWA in the iBUS frames of the H7 (DUT motors). auto: with '
+                        '--finite-run on in RUN and STOPPING only; without it on when a trajectory '
+                        'runs and no omega mode is set, off otherwise (diagnostics). on / off: fixed')
     return p.parse_args()
+
+
+def resolve_swa(swa: str, finite_run: bool, n_omega_modes: int, traj_kind: str) -> str:
+    """I8 (Liam 09/11, "Duyet ca 5", bang 2.4 of the proposal): --swa -> HILConfig.swa_mode."""
+    if swa in ('on', 'off'):
+        return swa
+    if swa != 'auto':
+        raise ValueError(f'--swa {swa!r}')
+    if finite_run:
+        return 'phase'
+    return 'on' if (n_omega_modes == 0 and traj_kind != 'idle') else 'off'
 
 
 # ── Main ──────────────────────────────────────────────────────────────────
@@ -465,6 +480,8 @@ def main() -> int:
         args.steps = hil_cfg.max_steps
         control = ControlBox()
         control.beat(time.monotonic_ns())
+    hil_cfg.swa_mode = resolve_swa(args.swa, args.finite_run, n_modes, args.traj)
+    log.info('SWA (I8): --swa %s -> %s', args.swa, hil_cfg.swa_mode)
 
     # Shared state array: plant writes, trajectory pub can read (optional)
     shared_state = mp.Array('d', 10)

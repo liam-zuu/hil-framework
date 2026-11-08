@@ -16,7 +16,11 @@ việc 2: gom lượt bàn thành một lệnh). Làm đúng trình tự đã ch
      - bám setpoint: vận tốc plant trong MOSI là hệ thế giới, xoay về hệ thân xe theo θ rồi so với setpoint
        (bỏ 1 s đầu), duty lớn nhất, số frame |duty| ≥ 0,99, bước duty lớn nhất giữa hai frame;
      - rpm (CSV ESP32): lệch so với trung vị 11 mẫu khi motor bật và setpoint khác 0 (bỏ 1 s đầu);
-     - ESP32: `Motor disabled` giữa lượt, `POWERON`, `IMU_INIT_FAIL`, `IMU FAIL STATE`.
+     - ESP32: `Motor disabled` giữa lượt, `Motor enabled` khác đúng 1 lần (I8), `POWERON`, `IMU_INIT_FAIL`,
+       `IMU FAIL STATE`;
+     - I8 (Liam 09/11): khi Pi gửi bit SWA (MOSI byte 20 bit 3), status H7 (MISO byte 16 bit 0) phải theo
+       mỗi lần đổi (`s06_frames_decode.swa_summary`). `--boot` chạy `--imu-static` nên `--swa auto` = tắt:
+       ESP32 khởi động mà motor không bật; lượt `--finite-run` bật SWA ở RUN, STOPPING.
      Chỉ L50 và các lỗi ESP32 làm lượt "không sạch"; số bám setpoint, rpm chỉ báo, không có ngưỡng
      đạt/không (kiểm chức năng, gain chưa tune). Không viết `meta.yaml` (người chạy viết, kèm commit 3 board).
 
@@ -173,11 +177,14 @@ def esp_window(lines):
     txt = [s for _, s in lines]
     dis = [i for i, s in enumerate(txt) if 'Motor disabled' in s]
     return dict(motor_disabled_inside=len(dis[:-1]) if dis else 0,
+                motor_enabled=sum(1 for s in txt if 'Motor enabled' in s),     # I8: once, at RUN
                 bad={k: sum(1 for s in txt if k in s) for k in ESP_BAD})
 
 
-def judge(dec_problems, h7, esp):
-    """Run clean: L50 (no decode problem, SPIfix stuck did not rise) and no ESP32 failure. Reasons listed."""
+def judge(dec_problems, h7, esp, swa=None):
+    """Run clean: L50 (no decode problem, SPIfix stuck did not rise) and no ESP32 failure. Reasons listed.
+    I8 (Liam 09/11): the ESP32 turns the motors on exactly once in the run; when the Pi sent the SWA bit,
+    the H7 status must follow every change (swa = s06_frames_decode.swa_summary)."""
     why = list(dec_problems)
     if h7 and h7.get('stuck_rise'):
         why.append(f"SPIfix stuck tăng {h7['stuck_rise']}")
@@ -187,6 +194,10 @@ def judge(dec_problems, h7, esp):
         if esp['motor_disabled_inside']:
             why.append(f"ESP32 Motor disabled giữa lượt {esp['motor_disabled_inside']} lần")
         why += [f'ESP32 {k} {n} lần' for k, n in esp['bad'].items() if n]
+        if esp.get('motor_enabled', 1) != 1:
+            why.append(f"ESP32 Motor enabled {esp['motor_enabled']} lần (cần 1)")
+    if swa and swa.get('cmd_on_frames') and swa.get('unfollowed'):
+        why.append(f"H7 không làm theo bit SWA ({swa['unfollowed']} lần đổi không thấy trong status)")
     return (not why), why
 
 
@@ -199,12 +210,12 @@ def analyze_run(out, name, h7_lines=None, esp_lines=None):
     rpm = rpm_spikes(list(csv.DictReader(open(p, encoding='utf-8')))) if os.path.exists(p) else None
     h7 = h7_window(h7_lines) if h7_lines is not None else None
     esp = esp_window(esp_lines) if esp_lines is not None else None
-    ok, why = judge(probs, h7, esp)
+    ok, why = judge(probs, h7, esp, res.get('swa'))
     f = res['frames']
     return dict(name=name, clean=ok, why=why,
                 frames=dict(n=f['frames'], miso_crc_bad=f['miso_crc_bad'], empty_in_run=f['empty_in_run'],
                             unanswered=f['unanswered'], start_leftover=f.get('start_leftover')),
-                tracking=trk, rpm=rpm, h7=h7, esp32=esp)
+                tracking=trk, rpm=rpm, h7=h7, esp32=esp, swa=res.get('swa'))
 
 
 def summary_line(r):
@@ -218,6 +229,10 @@ def summary_line(r):
         s += f" | rpm lệch max {max(w['dev_max'] for w in r['rpm']['wheels'].values()):.1f}"
     if r['h7'] and r['h7']['loop_max_us'] is not None:
         s += f" | H7 Loop max {r['h7']['loop_max_us']:.1f} µs"
+    sw = r.get('swa')
+    if sw and sw.get('cmd_on_frames'):
+        s += (f" | SWA bật {sw['cmd_on_frames']} frame, đổi {len(sw['cmd_changes'])} lần,"
+              f" H7 theo sau max {sw['follow_lag_max']} frame")
     if r['why']:
         s += ' | ' + '; '.join(r['why'])
     return s
@@ -347,6 +362,10 @@ def analyze_only(a):
 
 
 def main(argv=None):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')     # Vietnamese text when stdout is a pipe (CLOSED_LOOP 2026-11-09_run03)
+    except (AttributeError, ValueError):
+        pass
     ap = argparse.ArgumentParser(description='Một buổi vòng kín HIL bằng một lệnh (chạy trên PC)')
     ap.add_argument('--out', required=True, help='thư mục lượt, ví dụ 05_DATA/results/CLOSED_LOOP/<ngày>_runNN')
     ap.add_argument('--host', default='liam-zuu@192.168.1.76')

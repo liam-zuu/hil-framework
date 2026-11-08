@@ -103,3 +103,18 @@ def test_run_cmd_and_bad_args():
     for bad in ('--test A-L1; rm -rf ~', '--test $(x)', '--test `x`', '--x | y', '--x && y'):
         assert hb.BAD_ARG.search(bad)
     assert not hb.BAD_ARG.search('--traj circle --speed 0.3 --radius 0.5 --duration 60')
+
+
+def test_i8_motor_enabled_once_and_swa_followed():
+    one = [(0, 'I (1) MOTOR: Motor enabled'), (1, 'I (2) MOTOR: Motor disabled')]
+    assert hb.esp_window(one)['motor_enabled'] == 1
+    assert hb.judge([], None, hb.esp_window(one)) == (True, [])
+    ok, why = hb.judge([], None, hb.esp_window(one[1:]))          # the DUT never ran
+    assert not ok and 'Motor enabled 0' in why[0]
+    sw_ok = dict(cmd_on_frames=100, unfollowed=0, cmd_changes=[10, 110], follow_lag_max=8)
+    sw_bad = dict(sw_ok, unfollowed=2)
+    assert hb.judge([], None, hb.esp_window(one), sw_ok)[0]
+    ok, why = hb.judge([], None, hb.esp_window(one), sw_bad)
+    assert not ok and 'SWA' in why[0]
+    # an old run (Pi before I8: bit never sent) is not judged on SWA
+    assert hb.judge([], None, None, dict(cmd_on_frames=0, unfollowed=0))[0]

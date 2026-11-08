@@ -5,7 +5,7 @@ Frame layout v3 (40 bytes, full-duplex), all int16 big-endian:
 
   MOSI (RPi5 → H7)
     0–19   10 × int16  plant state [ω1, ω2, ω3, ω4, x, y, θ, vx, vy, wz]
-    20     uint8       fault_flags
+    20     uint8       fault_flags (bits 0-2 faults; bit 3 = CMD_SWA_ON, I8)
     21     uint8       seq (frame counter, wraps)
     22–23  int16       gz_imu   (v3)
     24–29  3 × int16   trajectory reference [vx_ref, vy_ref, wz_ref] (body frame)
@@ -79,6 +79,12 @@ OFS_MISO_SEQ  = 17
 # traj_flags bits (HIL_TRAJ_VALID / HIL_TRAJ_NEW)
 TRAJ_VALID = 1 << 0
 TRAJ_NEW   = 1 << 1
+
+# I8 (Liam 09/11, "Duyet ca 5"; hil_protocol.h HIL_CMD_SWA_ON / HIL_STATUS_SWA):
+# MOSI byte 20 bit 3 = 1 -> the H7 sends iBUS SWA 2000 (DUT motors on), 0 -> SWA 1000.
+# MISO byte 16 bit 0 = SWA of the last iBUS frame the H7 started.
+CMD_SWA_ON = 1 << 3
+STATUS_SWA = 1 << 0
 
 # Must match hil_protocol.h defines exactly — field order: [ω1,ω2,ω3,ω4, x,y,θ, vx,vy,wz]
 STATE_RANGES: list[float] = [40.0, 40.0, 40.0, 40.0,   # omega[0..3]  HIL_OMEGA_MAX

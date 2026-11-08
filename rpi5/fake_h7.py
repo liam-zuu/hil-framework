@@ -43,8 +43,8 @@ from typing import Callable, Optional, Sequence
 import numpy as np
 
 from protocol import (
-    FRAME_SIZE, OFS_MISO_SEQ, OFS_PWM, OFS_SEQ, OFS_STATUS, TRAJ_NEW, TRAJ_VALID,
-    decode_imu, decode_state, decode_traj_ref,
+    CMD_SWA_ON, FRAME_SIZE, OFS_FAULT, OFS_MISO_SEQ, OFS_PWM, OFS_SEQ, OFS_STATUS, STATUS_SWA,
+    TRAJ_NEW, TRAJ_VALID, decode_imu, decode_state, decode_traj_ref,
 )
 
 FAULT_KINDS = ('stall', 'silent', 'miso_bad', 'torn', 'xfer_error')
@@ -112,6 +112,10 @@ class FakeH7:
         self.last_state: Optional[list] = None
         self.imu_updates = 0          # handled frames with a new imu_seq
         self._imu_seq: Optional[int] = None
+        # I8: SWA from MOSI byte 20 bit 3 of the handled frame; status bit 0 echoes it at once
+        # (the H7 echoes the SWA of the last iBUS frame started, up to ~10 ms later: not modelled)
+        self.swa = 0
+        self.swa_changes = 0
 
     def _fault(self, n: int) -> Optional[str]:
         for start, end, kind in self.faults:
@@ -159,8 +163,11 @@ class FakeH7:
             self.imu_updates += self._imu_seq is not None
             self._imu_seq = imu_seq
         self.last_state = state
+        swa = 1 if mosi[OFS_FAULT] & CMD_SWA_ON else 0
+        self.swa_changes += swa != self.swa
+        self.swa = swa
 
         duty = list(self.duty_fn(n, state, (vx, vy, wz, flags)))
         if len(duty) != 4:
             raise ValueError("duty_fn must return 4 values")
-        self._tx = encode_miso_like_h7(duty, seq=mosi[OFS_SEQ])
+        self._tx = encode_miso_like_h7(duty, seq=mosi[OFS_SEQ], status=STATUS_SWA if swa else 0)

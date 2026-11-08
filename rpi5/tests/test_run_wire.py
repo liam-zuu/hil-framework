@@ -11,8 +11,9 @@ import pytest
 from fake_h7 import FakeH7
 from hil_node import HILConfig, HILNode
 from plant_interface import MockPlant
-from protocol import OFS_TRAJ_FLAGS, TRAJ_NEW, TRAJ_VALID, decode_traj_ref
-from run_hil import _finite_run_config, _owner_tick
+from protocol import (CMD_SWA_ON, OFS_FAULT, OFS_STATUS, OFS_TRAJ_FLAGS, STATUS_SWA, TRAJ_NEW, TRAJ_VALID,
+                      decode_traj_ref)
+from run_hil import _finite_run_config, _owner_tick, resolve_swa
 from run_lifecycle import ARM, END, RUN, STOPPING, ControlBox, LifecycleConfig
 from trajectory_pub import TrajectoryPublisher, TrajectorySpec
 
@@ -46,8 +47,10 @@ class Owner(threading.Thread):
             time.sleep(0.002)
 
 
-def run_node(tmp_path=None, faults=(), event=None, beat=True, ref=(0.4, 0.0, 0.1), box=None, **lc):
-    """One finite run; returns the node, what went out in each phase, the plant, the box."""
+def run_node(tmp_path=None, faults=(), event=None, beat=True, ref=(0.4, 0.0, 0.1), box=None,
+             swa_mode='off', fake_out=None, **lc):
+    """One finite run; returns the node, what went out in each phase, the plant, the box.
+    fake_out: list that receives the FakeH7 (I8 tests read its SWA state)."""
     cfg = dict(run_s=0.15, arm_h7_fresh_s=0.12, stop_s=0.06, arm_timeout_s=0.5, heartbeat_max_s=0.1,
                h7_gap_max_s=0.05,   # time.monotonic ticks every 15.6 ms on Windows
                run_grace_s=0.1)
@@ -55,13 +58,15 @@ def run_node(tmp_path=None, faults=(), event=None, beat=True, ref=(0.4, 0.0, 0.1
     box = box or ControlBox()
     box.beat(time.monotonic_ns())
     fake = FakeH7(faults=faults)
+    if fake_out is not None:
+        fake_out.append(fake)
     plant = CountPlant()
     sent = []
     shared_ref = mp.Array('d', 4)
     shared_ref[:] = [ref[0], ref[1], ref[2], 1.0]
     flog = str(tmp_path / 'f.npz') if tmp_path else ''
     node = HILNode(plant, HILConfig(simulate_hw=True, max_steps=3000, lifecycle=LifecycleConfig(**cfg),
-                                    frame_log=flog, frame_log_max=3000),
+                                    frame_log=flog, frame_log_max=3000, swa_mode=swa_mode),
                    shared_ref=shared_ref, control=box,
                    responder=lambda m: (sent.append((node._lc.phase, plant.steps_done, bytes(m))), fake(m))[1])
     owner = Owner(box, event, beat)
@@ -323,3 +328,71 @@ def test_ctrl_c_does_not_stop_the_loop_directly():
             box.request_stop()
     run_node(event=ev)
     assert seen == [signal.SIG_IGN]
+
+
+# ── I8: SWA bit (MOSI byte 20 bit 3), Liam 09/11 "Duyet ca 5" ──
+
+def _swa(m):
+    return 1 if m[OFS_FAULT] & CMD_SWA_ON else 0
+
+
+def test_swa_phase_on_only_in_run_and_stopping(tmp_path):
+    fk = []
+    node, sent, _, _ = run_node(tmp_path, event=done_after(0.08), swa_mode='phase', fake_out=fk)
+    assert phases(node) == [ARM, RUN, STOPPING, END]
+    for ph, _, m in sent:
+        assert _swa(m) == (1 if ph in (RUN, STOPPING) else 0), ph
+        assert m[OFS_FAULT] & ~CMD_SWA_ON == 0              # no fault bit set by the SWA path
+    assert any(ph == END for ph, _, _ in sent) and _swa(sent[-1][2]) == 0   # last frame says off
+    ev = node.swa_events()
+    assert [v for _, v in ev] == [0, 1, 0]                  # off in ARM, on at RUN, off at END
+    run_first = next(i for i, (ph, _, _) in enumerate(sent) if ph == RUN)
+    assert ev[1][0] == run_first
+    import json
+    m = json.loads(str(np.load(tmp_path / 'f.npz')['manifest']))
+    assert m['swa_mode'] == 'phase' and m['swa_events'] == ev
+    assert fk[0].swa == 0 and fk[0].swa_changes == 2        # the fake H7 followed the bit
+
+
+def test_swa_status_bit_echoes_what_the_h7_took():
+    node, sent, _, _ = run_node(event=done_after(0.08), swa_mode='phase')
+    got = []
+    resp = []
+    fake = FakeH7()
+    for ph, _, m in sent:
+        resp.append(fake(m))
+        got.append(_swa(m))
+    # MISO of frame k carries the SWA the fake H7 took from frame k-1 (one frame late, like the echo)
+    st = [r[OFS_STATUS] & STATUS_SWA for r in resp]
+    assert st[1:] == got[:-1]
+
+
+def test_swa_on_and_off_are_fixed():
+    for mode, want in (('on', 1), ('off', 0)):
+        _, sent, _, _ = run_node(event=done_after(0.05), swa_mode=mode)
+        assert {_swa(m) for _, _, m in sent} == {want}
+
+
+def test_swa_default_is_off_without_lifecycle():
+    node = HILNode(MockPlant(), HILConfig(simulate_hw=True, max_steps=20))
+    node.run()
+    assert node.cfg.swa_mode == 'off' and node.swa_events() == [[0, 0]]
+
+
+def test_swa_phase_without_lifecycle_refused():
+    with pytest.raises(ValueError):
+        HILNode(MockPlant(), HILConfig(simulate_hw=True, swa_mode='phase'))
+    with pytest.raises(ValueError):
+        HILNode(MockPlant(), HILConfig(simulate_hw=True, swa_mode='yes'))
+
+
+@pytest.mark.parametrize('swa, finite, n_modes, traj, want', [
+    ('auto', True, 0, 'line', 'phase'),
+    ('auto', False, 0, 'circle', 'on'),        # old plant run with a trajectory: as before
+    ('auto', False, 0, 'idle', 'off'),         # --imu-static / --boot: diagnostics
+    ('auto', False, 1, 'line', 'off'),         # an omega mode
+    ('on', True, 0, 'line', 'on'),
+    ('off', False, 0, 'circle', 'off'),
+])
+def test_resolve_swa(swa, finite, n_modes, traj, want):
+    assert resolve_swa(swa, finite, n_modes, traj) == want

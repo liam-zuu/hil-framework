@@ -37,7 +37,7 @@ from typing import Optional
 from timing import PrecisionTimer, set_realtime, pin_cpu, lock_memory
 from gpio_sync import GPIOSync
 from spi_master import SPIMaster
-from protocol import encode_state, decode_torques, TRAJ_VALID, TRAJ_NEW, OFS_MISO_SEQ
+from protocol import encode_state, decode_torques, TRAJ_VALID, TRAJ_NEW, OFS_MISO_SEQ, CMD_SWA_ON
 from plant_interface import PlantInterface, MockPlant
 from mecanum_plant import MecanumPlant
 from imu_model import imu_from_plant
@@ -46,7 +46,12 @@ from params import PARAMS
 from rt_monitor import RTMonitor
 from s06_load_schedule import HeavyBlock
 from step_log import StepLog
-from run_lifecycle import ControlBox, LifecycleConfig, RunLifecycle, StepIn, END
+from run_lifecycle import ControlBox, LifecycleConfig, RunLifecycle, StepIn, END, RUN, STOPPING
+
+# I8 (Liam 09/11, "Duyet ca 5"): who holds the RC switch SWA of the iBUS frames the H7 sends.
+# 'phase' = on in RUN and STOPPING of --finite-run (needs cfg.lifecycle), 'on' / 'off' = fixed.
+SWA_MODES = ('off', 'on', 'phase')
+SWA_PHASES_ON = (RUN, STOPPING)
 
 log = logging.getLogger('hil.node')
 
@@ -100,6 +105,9 @@ class HILConfig:
     load_schedule:     str   = ''
     # --finite-run: phases of run_lifecycle.py; None = the loop as before
     lifecycle:         Optional[LifecycleConfig] = None
+    # I8: SWA command bit (MOSI byte 20 bit 3), see SWA_MODES. Default 'off': a node
+    # built without a choice never turns the DUT motors on (run_hil.py resolves --swa)
+    swa_mode:          str   = 'off'
     jitter_warn_us:    float = 500.0       # warn if jitter exceeds this
     stats_interval:    int   = 10_000      # print stats every N steps
 
@@ -158,6 +166,12 @@ class HILNode:
         self._lc          = RunLifecycle(self.cfg.lifecycle) if self.cfg.lifecycle else None
         if self._lc is not None and control is None:
             raise ValueError('cfg.lifecycle needs a ControlBox')
+        if self.cfg.swa_mode not in SWA_MODES:
+            raise ValueError(f'swa_mode {self.cfg.swa_mode!r} not in {SWA_MODES}')
+        if self.cfg.swa_mode == 'phase' and self._lc is None:
+            raise ValueError("swa_mode 'phase' needs cfg.lifecycle (--finite-run)")
+        self._swa       = None               # last bit sent; None before the first frame
+        self._swa_events: list = []          # (step, 0/1) at every change, for the manifest
         self._h7_seq      = -1
         self._h7_new      = False
         self._ref         = (0.0, 0.0, 0.0)
@@ -305,8 +319,13 @@ class HILNode:
         frame_state = plant_to_frame_state(state) if self._mecanum else state
         if self._heavy is not None:
             self._heavy.apply(self._step, frame_state)   # S06 Z8: omega to the H7 only, the plant goes on
+        swa = self._swa_bit()
+        if swa != self._swa:
+            self._swa = swa
+            self._swa_events.append((self._step, swa))
         mosi   = encode_state(frame_state, traj_ref=self._ref, traj_flags=traj_flags,
-                              seq=self._step, imu=imu, imu_seq=imu_seq)
+                              seq=self._step, imu=imu, imu_seq=imu_seq,
+                              fault_flags=CMD_SWA_ON if swa else 0)
         t_send = time.monotonic_ns()
         miso   = self._spi.transfer(mosi)
         torques = decode_torques(miso)
@@ -347,6 +366,15 @@ class HILNode:
         # 6. Periodic stats log
         if self._step % self.cfg.stats_interval == 0:
             self._log_stats()
+
+    def _swa_bit(self) -> int:
+        """I8: SWA command for this frame. 'phase' reads the phase after this step's lifecycle step."""
+        m = self.cfg.swa_mode
+        if m == 'on':
+            return 1
+        if m == 'phase':
+            return 1 if self._lc.phase in SWA_PHASES_ON else 0
+        return 0
 
     def _lifecycle_step(self):
         """One phase step. Reads the owner cells (one try of the lock), no blocking call."""
@@ -400,7 +428,8 @@ class HILNode:
                         imu_source=imu_source, imu_profile=self.cfg.imu_profile, imu_static=self.cfg.imu_static,
                         plant=type(self.plant).__name__, heavy_block=self.cfg.heavy_block,
                         load_schedule=self.cfg.load_schedule, rt=self._rt, uname=' '.join(platform.uname()),     # X8: the kernel the run ran on
-                        lifecycle=self.lifecycle_summary())
+                        lifecycle=self.lifecycle_summary(),
+                        swa_mode=self.cfg.swa_mode, swa_events=self.swa_events())     # I8
         np.savez(self.cfg.frame_log, manifest=np.array(json.dumps(manifest)),
                  **{k: v[:n] for k, v in self._flog.items()})
         log.info('Frame log: %d frames -> %s', n, self.cfg.frame_log)
@@ -409,6 +438,10 @@ class HILNode:
         log.info("Signal %d received — stopping plant loop.", signum)
         self._stop_reason = f'signal_{signum}'
         self._running = False
+
+    def swa_events(self) -> list:
+        """I8: [[step, 0/1], ...] at every change of the SWA bit sent (first frame included)."""
+        return [[int(k), int(v)] for k, v in self._swa_events]
 
     def lifecycle_summary(self) -> Optional[dict]:
         """Phases and outcome of a --finite-run; None without it."""
@@ -427,6 +460,7 @@ class HILNode:
         if self._lc is not None:
             self.control.set_phase(self._lc.phase)
             log.info('#run_summary,%s', json.dumps(self.lifecycle_summary()))
+        log.info('#swa,mode=%s,events=%s', self.cfg.swa_mode, json.dumps(self.swa_events()))   # I8
         log.info('#run_end,timestamp_us=%d,steps=%d,reason=%s',
                  time.monotonic_ns() // 1000, self._step, self._stop_reason)
         if self._flog is not None:
