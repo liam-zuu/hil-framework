@@ -40,6 +40,13 @@
  * speed. The ESP32 drops its setpoint to 0 on its own after 200 ms without
  * a relay packet (AGV_MECANUM traj_receiver.c, TRAJ_TIMEOUT_MS). */
 #define SPI_LINK_TIMEOUT_MS  50u
+/* While the link is down after having been up: SPI1 restart requested every
+ * this many ms (08/11, bug HIL-SPI1-SCK-GLITCH). Before, one request at the
+ * up -> down transition only, so a restart that returned HAL_OK but never
+ * completed left the link dead until a reset (CLOSED_LOOP/2026-11-08_run02,
+ * 01:48). Harmless when the Pi has stopped: the restart runs only while NSS
+ * is high. */
+#define SPI_DOWN_RESTART_MS  200u
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -260,6 +267,8 @@ int main(void)
   static uint32_t _up_first_ms = 0;
   static uint32_t _up_first_frames = 0;
   static uint32_t _n_link_lost = 0;
+  static uint32_t _down_restart_ms = 0;
+  static uint32_t _n_down_restarts = 0;   /* restarts requested while down */
   /* S06 T1 (V4): frames applied by this loop, frames received but never
    * applied (overwritten before the loop read them, from the frame count),
    * largest state age callback -> applied */
@@ -346,6 +355,7 @@ int main(void)
             EncoderGen_SetOmega(i, 0.0f);
         SPI1_DropNewTraj();      /* no old setpoint relayed after reconnect */
         SPI1_RequestRestart();   /* covers a DMA stuck without an error */
+        _down_restart_ms = HAL_GetTick();
         SPI1_Stats_t s1;
         SPI1_GetStats(&s1);
         printf("SPI link lost (no frame for %lu ms): encoders stopped, iBUS stopped, SPI1 restart\r\n",
@@ -356,6 +366,12 @@ int main(void)
                (unsigned long)(s1.frames - _up_first_frames + 1u),
                (unsigned long)(s1.last_frame_ms - _up_first_ms),
                (unsigned long)(s1.frames - _up_first_frames));
+    } else if (!_link_up && _n_link_lost > 0u
+               && (HAL_GetTick() - _down_restart_ms) >= SPI_DOWN_RESTART_MS) {
+        _busy = 1;
+        _down_restart_ms = HAL_GetTick();
+        _n_down_restarts++;
+        SPI1_RequestRestart();
     }
     SPI1_Service();
 
@@ -451,6 +467,19 @@ int main(void)
                (unsigned long)((ss.frames - _frames_last) * 2u),
                (unsigned long)ss.errors, (unsigned long)ss.rearms,
                (unsigned long)ss.last_error);
+        /* 08/11 (bug HIL-SPI1-SCK-GLITCH): SPI1 found not armed (each one is
+         * a lost frame; a run with stuck > 0 is not a main-number run),
+         * failed restarts, restarts requested while down, and the shortest /
+         * longest SPI1_Service() call over the last 0.5 s (L39) */
+        {
+            uint32_t svc_min, svc_max;
+            SPI1_TakeServiceCycles(&svc_min, &svc_max);
+            printf("SPIfix: stuck=%lu stuck_err=0x%lx restart_fail=%lu down_req=%lu svc=%lu..%lu cyc (%lu cyc/us)\r\n",
+                   (unsigned long)ss.stuck, (unsigned long)ss.stuck_err,
+                   (unsigned long)ss.restart_fail, (unsigned long)_n_down_restarts,
+                   (unsigned long)svc_min, (unsigned long)svc_max,
+                   (unsigned long)cyc_per_us);
+        }
         /* Frames the main loop did not read, and the NEW setpoint path:
          * seen = taken + replaced + dropped (+1 if one is pending) */
         printf("Frame: unread=%lu  new seen=%lu taken=%lu repl=%lu drop=%lu"

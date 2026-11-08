@@ -68,6 +68,13 @@ typedef struct {
     uint32_t new_replaced; /* pending setpoint replaced by a newer one      */
     uint32_t new_taken;    /* setpoints taken by the main loop for the relay */
     uint32_t new_dropped;  /* pending setpoints forgotten at link lost      */
+    /* 08/11 (bug HIL-SPI1-SCK-GLITCH): SPI1 found not armed by SPI1_Service()
+     * without a pending restart, e.g. HAL_SPI_IRQHandler after an underrun
+     * once both DMA streams were done: SPI disabled, no error callback,
+     * State left BUSY_TX_RX (CLOSED_LOOP/2026-11-08_run06) */
+    uint32_t stuck;        /* times found not armed, restart requested      */
+    uint32_t stuck_err;    /* hspi->ErrorCode at the last one               */
+    uint32_t restart_fail; /* restarts in SPI1_Service() that returned != HAL_OK */
 } SPI1_Stats_t;
 
 void    SPI1_ErrorCallback  (SPI_HandleTypeDef *hspi);
@@ -78,5 +85,8 @@ uint32_t SPI1_GetFrameCount (void);              /* frames received so far (S06 
 /* HAL_GetTick() in the callback of the last frame; one 32-bit read, safe
  * from any interrupt (iBUS link check in the TIM6 tick, 03/11) */
 uint32_t SPI1_GetLastFrameMs(void);
+/* Shortest and longest SPI1_Service() call in CYCCNT cycles since the last
+ * call, then reset (L39: measured on the board; min = max = 0 if no call) */
+void    SPI1_TakeServiceCycles(uint32_t *min_cyc, uint32_t *max_cyc);
 
 #endif /* SPI1_HANDLER_H */

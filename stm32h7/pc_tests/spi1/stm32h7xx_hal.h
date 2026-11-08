@@ -10,12 +10,20 @@
 typedef enum { HAL_OK = 0, HAL_ERROR = 1 } HAL_StatusTypeDef;
 typedef enum { GPIO_PIN_RESET = 0, GPIO_PIN_SET = 1 } GPIO_PinState;
 
-typedef struct { int dummy; } SPI_TypeDef;
+/* SPI CR1 SPE and the HAL handle State (08/11, bug HIL-SPI1-SCK-GLITCH: the
+ * armed check in SPI1_Service reads both). The harness DMA start sets
+ * State BUSY_TX_RX and SPE, the abort clears them, as the HAL does. */
+typedef struct { volatile uint32_t CR1; } SPI_TypeDef;
 typedef struct { int dummy; } GPIO_TypeDef;
+#define SPI_CR1_SPE  (1u << 0)
+typedef enum { HAL_SPI_STATE_RESET = 0, HAL_SPI_STATE_READY = 1, HAL_SPI_STATE_BUSY = 2,
+               HAL_SPI_STATE_BUSY_TX = 3, HAL_SPI_STATE_BUSY_RX = 4,
+               HAL_SPI_STATE_BUSY_TX_RX = 5 } HAL_SPI_StateTypeDef;
 
 typedef struct {
     SPI_TypeDef *Instance;
     uint32_t ErrorCode;
+    HAL_SPI_StateTypeDef State;   /* after ErrorCode: the { inst, 0 } init stays valid */
 } SPI_HandleTypeDef;
 
 extern GPIO_TypeDef fake_gpioa;
