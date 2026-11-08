@@ -344,14 +344,18 @@ static void _dbg_print_next(void)
          * time between two TIM6 ticks; once per closed window */
         if (d->ibus_new) {
             const ibus_gen_window_t *iw = &d->iw;
-            printf("IBUS: win=%lu on=%lu frames=%lu P=%lu.%02lu..%lu.%02lu ms n=%lu late=%lu tgap=%lu us en=%lu total=%lu\r\n",
+            /* I8: swa = frames started with SWA 2000 / frames, chg = SWA
+             * changes between frames, now = SWA of the last frame started */
+            printf("IBUS: win=%lu on=%lu frames=%lu P=%lu.%02lu..%lu.%02lu ms n=%lu late=%lu tgap=%lu us en=%lu total=%lu swa=%lu/%lu chg=%lu now=%lu\r\n",
                    (unsigned long)iw->window, (unsigned long)iw->enabled,
                    (unsigned long)iw->frames,
                    (unsigned long)(iw->p_min_us / 1000u), (unsigned long)((iw->p_min_us % 1000u) / 10u),
                    (unsigned long)(iw->p_max_us / 1000u), (unsigned long)((iw->p_max_us % 1000u) / 10u),
                    (unsigned long)iw->p_count, (unsigned long)iw->late_ticks,
                    (unsigned long)iw->tick_gap_max_us,
-                   (unsigned long)iw->enables, (unsigned long)iw->total_frames);
+                   (unsigned long)iw->enables, (unsigned long)iw->total_frames,
+                   (unsigned long)iw->swa_frames, (unsigned long)iw->frames,
+                   (unsigned long)iw->swa_changes, (unsigned long)iw->swa);
         } else {
             s = DS_END;                          /* no IBUS line: "---" in this pass */
             printf("---\r\n");
@@ -447,7 +451,7 @@ int main(void)
   printf("BNO: emulator on SPI4 (INT PG2, RST PG3), TIM6 tick\r\n");
   BnoPort_Init(&hspi4, &htim6);
   if (IbusPort_Init(UART4))
-    printf("IBUS: UART4 TX PD1, frame every %u us while the SPI1 link is up (stop after %u ms without a frame)\r\n",
+    printf("IBUS: UART4 TX PD1, frame every %u us while the SPI1 link is up (stop after %u ms without a frame); SWA from MOSI byte 20 bit 3 (I8), off at boot\r\n",
            (unsigned)IBUS_GEN_PERIOD_US, (unsigned)IBUS_LINK_TIMEOUT_MS);
   else
     printf("IBUS: UART4 not set up (add it in CubeMX), iBUS off\r\n");
@@ -522,6 +526,8 @@ int main(void)
         SPI1_GetFrameEx(&g_state, &g_traj, &fi);   /* one frame; clears frame_ready */
         for (int i = 0; i < ENC_NUM_WHEELS; i++)
             EncoderGen_SetOmega(i, g_state.omega[i]);
+        /* I8: the RPi5 holds the RC switch SWA; used from the next iBUS frame */
+        IbusPort_SetSwa((g_state.fault_flags & HIL_CMD_SWA_ON) != 0u);
         /* S06: state age at the moment the omegas were applied, and the
          * checksum of the raw bytes of this very copy (W3, Y9) */
         uint32_t age_us = (DWT->CYCCNT - fi.rx_cyc) / cyc_per_us;
@@ -549,6 +555,8 @@ int main(void)
             g_output.torque[i] = duty[i];
 
         g_output.seq = g_state.seq;
+        /* I8: what the H7 really sends, for the RPi5 frame log */
+        g_output.status = IbusPort_LastSwa() ? (uint8_t)HIL_STATUS_SWA : 0u;
         SPI1_SetOutputEx(&g_output, &mi);
 
         HAL_GPIO_TogglePin(GPIOE, GPIO_PIN_1);
@@ -557,6 +565,7 @@ int main(void)
         _link_up = 0;
         _n_link_lost++;
         IbusPort_SetEnabled(0);  /* DUT loses RC -> motors off (S06 T12 (d)) */
+        IbusPort_SetSwa(0);      /* I8: after reconnect SWA stays off until the RPi5 sets it */
         for (int i = 0; i < ENC_NUM_WHEELS; i++)
             EncoderGen_SetOmega(i, 0.0f);
         SPI1_DropNewTraj();      /* no old setpoint relayed after reconnect */

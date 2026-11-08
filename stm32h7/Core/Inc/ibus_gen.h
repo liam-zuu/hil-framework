@@ -5,6 +5,14 @@
  * 5) = 1000 keeps AUTO, the other channels 1500 (03_CODE/docs/
  * 2026-10-31_Danh_gia_Mot_binary.md, Q1; spec S06 T12).
  *
+ * I8 (Liam 09/11, "Duyet ca 5"; thesis repo 03_CODE/docs/
+ * 2026-11-09_De_xuat_I8_bit_SWA_va_reset_panel.md): the RPi5 flips SWA like
+ * a person on the RC switch. Two frames are built at init, SWA 2000 and SWA
+ * 1000 (everything else equal); the tick picks one only when a new frame
+ * starts, so a frame on the wire never mixes the two. SWA off still sends
+ * frames (the DUT has RC, motors off); link down sends none (the DUT loses
+ * RC), as before.
+ *
  * Frame (32 bytes): 0x20 0x40, 14 channels as uint16 little-endian, then
  * checksum = 0xFFFF - sum(bytes 0..29), little-endian. The ESP32 parser
  * (AGV_MECANUM src/ibus/ibus.c) reads the first 10 channels.
@@ -45,6 +53,7 @@
 #define IBUS_GEN_CH_SWA            6u        /* channel 7 */
 #define IBUS_GEN_VAL_SWC           1000u     /* not MANUAL (> 1700 is) */
 #define IBUS_GEN_VAL_SWA           2000u     /* motors on (> 1500) */
+#define IBUS_GEN_VAL_SWA_OFF       1000u     /* motors off (I8) */
 #define IBUS_GEN_VAL_MID           1500u
 
 typedef struct {
@@ -69,13 +78,20 @@ typedef struct {
     uint32_t enables;             /* off -> on changes in the window */
     uint32_t total_frames;        /* since init */
     uint32_t enabled;             /* state at the end of the window */
+    uint32_t swa_frames;          /* frames started with SWA 2000 in the window (I8) */
+    uint32_t swa_changes;         /* frame starts whose SWA differs from the frame before (I8) */
+    uint32_t swa;                 /* SWA of the last frame started, 1 = 2000 (end of window) */
 } ibus_gen_window_t;
 
 typedef struct {
     ibus_gen_io_t io;
     uint32_t period_us;
-    uint8_t  frame[IBUS_GEN_FRAME_LEN];
+    uint8_t  frame[IBUS_GEN_FRAME_LEN];      /* SWA 2000 */
+    uint8_t  frame_off[IBUS_GEN_FRAME_LEN];  /* SWA 1000 (I8) */
+    const uint8_t *cur;           /* frame being written (picked at its start) */
     uint8_t  pos;                 /* bytes of the current frame written; FRAME_LEN = idle */
+    volatile uint8_t last_swa;    /* SWA of the last frame started; 0 before any (I8) */
+    uint8_t  have_swa;            /* last_swa comes from a started frame */
     uint8_t  on;
     uint8_t  have_start;          /* a frame was ever started (spacing) */
     uint8_t  p_valid;             /* previous start is in the current on period */
@@ -94,8 +110,12 @@ void ibus_gen_build_frame(uint8_t out[IBUS_GEN_FRAME_LEN], const uint16_t ch[IBU
 /* period_us below IBUS_GEN_MIN_PERIOD_US is raised to it */
 void ibus_gen_init(ibus_gen_t *g, const ibus_gen_io_t *io, uint32_t period_us, uint32_t now_us);
 /* TIM6 interrupt only. on: frames may start (link up); a frame being
- * written always finishes. Intervals use unsigned differences of now_us. */
-void ibus_gen_tick(ibus_gen_t *g, uint32_t now_us, int on);
+ * written always finishes. swa: SWA of the next frame to start (nonzero =
+ * 2000); a frame already being written keeps its value (I8). Intervals use
+ * unsigned differences of now_us. */
+void ibus_gen_tick(ibus_gen_t *g, uint32_t now_us, int on, int swa);
+/* SWA of the last frame started (1 = 2000), 0 before any; any context */
+int  ibus_gen_last_swa(const ibus_gen_t *g);
 /* Copy of the last closed window; returns 0 if the tick kept rewriting it */
 int  ibus_gen_read_window(const ibus_gen_t *g, ibus_gen_window_t *out);
 

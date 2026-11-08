@@ -13,6 +13,7 @@
 
 static USART_TypeDef *volatile _u;     /* NULL until init succeeded */
 static volatile uint8_t _gate;
+static volatile uint8_t _swa;          /* I8: SWA asked by the RPi5 (MOSI byte 20 bit 3) */
 static ibus_gen_t _gen;
 
 static int _tx_room(void)
@@ -87,12 +88,22 @@ void IbusPort_Tick(void)
     uint32_t last_ms = SPI1_GetLastFrameMs();
     uint32_t age_ms = HAL_GetTick() - last_ms;
     int on = _gate && age_ms <= IBUS_LINK_TIMEOUT_MS;
-    ibus_gen_tick(&_gen, _now_us(), on);
+    ibus_gen_tick(&_gen, _now_us(), on, _swa);
 }
 
 void IbusPort_SetEnabled(int on)
 {
     _gate = on ? 1u : 0u;
+}
+
+void IbusPort_SetSwa(int on)
+{
+    _swa = on ? 1u : 0u;
+}
+
+int IbusPort_LastSwa(void)
+{
+    return _u != NULL && ibus_gen_last_swa(&_gen);
 }
 
 int IbusPort_ReadWindow(ibus_gen_window_t *out)
