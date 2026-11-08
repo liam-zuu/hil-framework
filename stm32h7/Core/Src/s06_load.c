@@ -65,35 +65,60 @@ void S06Load_SetIdleCal(uint32_t n_pass, uint32_t cycles)
     _cal_cyc = cycles;
 }
 
-void S06Load_Report(void)
+/* Window taken by S06Load_Snapshot(), printed line by line by
+ * S06Load_PrintNext() (08/11, STATUS_CODE L51: printing the whole block in
+ * one main-loop pass held the SPI1 reply 1-2 ms every 10 s) */
+static _irq_stat_t _snap[S06_IRQ_N];
+static uint32_t    _snap_win_ms, _snap_n_idle;
+static int         _snap_next = -2;         /* -2 nothing to print, -1 header next, else IRQ index */
+
+void S06Load_Snapshot(void)
 {
-    static _irq_stat_t snap[S06_IRQ_N];
     uint32_t pm = __get_PRIMASK();
     __disable_irq();
     uint32_t now_ms = HAL_GetTick();
     uint32_t idle = _idle;
-    memcpy(snap, _st, sizeof snap);
+    memcpy(_snap, _st, sizeof _snap);
     memset(_st, 0, sizeof _st);
     __set_PRIMASK(pm);
 
     /* window from the HAL ms tick: 10 s is longer than one CYCCNT wrap (8.9 s) */
-    uint32_t win_ms = now_ms - _win_ms0;
-    uint32_t n_idle = idle - _win_idle0;
+    _snap_win_ms = now_ms - _win_ms0;
+    _snap_n_idle = idle - _win_idle0;
     _win_ms0 = now_ms;
     _win_idle0 = idle;
+    _snap_next = -1;
+}
+
+int S06Load_PrintNext(void)
+{
     const uint32_t cpu = SystemCoreClock / 1000000u;
-    uint64_t isr_sum = 0;
-    for (int i = 0; i < S06_IRQ_N; i++) isr_sum += snap[i].sum;
-    /* idle time estimate: passes x calibrated cycles per pass */
-    uint64_t idle_cyc = (_cal_n > 0u) ? (uint64_t)n_idle * _cal_cyc / _cal_n : 0u;
-    printf("T10: win_ms=%lu isr_us=%lu idle_pass=%lu idle_us_est=%lu cal=%lu/%lu ovh_cyc=%lu\r\n",
-           (unsigned long)win_ms, (unsigned long)(isr_sum / cpu), (unsigned long)n_idle,
-           (unsigned long)(idle_cyc / cpu), (unsigned long)_cal_n, (unsigned long)_cal_cyc,
-           (unsigned long)_ovh_cyc);
-    for (int i = 0; i < S06_IRQ_N; i++) {
-        if (snap[i].n == 0u) continue;
+    if (_snap_next == -2) return 0;
+    if (_snap_next == -1) {
+        uint64_t isr_sum = 0;
+        for (int i = 0; i < S06_IRQ_N; i++) isr_sum += _snap[i].sum;
+        /* idle time estimate: passes x calibrated cycles per pass */
+        uint64_t idle_cyc = (_cal_n > 0u) ? (uint64_t)_snap_n_idle * _cal_cyc / _cal_n : 0u;
+        printf("T10: win_ms=%lu isr_us=%lu idle_pass=%lu idle_us_est=%lu cal=%lu/%lu ovh_cyc=%lu\r\n",
+               (unsigned long)_snap_win_ms, (unsigned long)(isr_sum / cpu), (unsigned long)_snap_n_idle,
+               (unsigned long)(idle_cyc / cpu), (unsigned long)_cal_n, (unsigned long)_cal_cyc,
+               (unsigned long)_ovh_cyc);
+        _snap_next = 0;
+    } else {
+        int i = _snap_next;
         printf("T10 %-7s n=%lu excl_us=%lu max_us=%lu.%02lu\r\n", _name[i],
-               (unsigned long)snap[i].n, (unsigned long)(snap[i].sum / cpu),
-               (unsigned long)(snap[i].max / cpu), (unsigned long)((snap[i].max % cpu) * 100u / cpu));
+               (unsigned long)_snap[i].n, (unsigned long)(_snap[i].sum / cpu),
+               (unsigned long)(_snap[i].max / cpu), (unsigned long)((_snap[i].max % cpu) * 100u / cpu));
+        _snap_next = i + 1;
     }
+    while (_snap_next >= 0 && _snap_next < S06_IRQ_N && _snap[_snap_next].n == 0u)
+        _snap_next++;
+    if (_snap_next >= S06_IRQ_N) _snap_next = -2;
+    return 1;
+}
+
+void S06Load_Report(void)
+{
+    S06Load_Snapshot();
+    while (S06Load_PrintNext()) {}
 }

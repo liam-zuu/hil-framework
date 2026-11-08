@@ -17,7 +17,10 @@ pytestmark = pytest.mark.skipif(shutil.which('gcc') is None, reason='gcc not on 
 
 CHECKS = ['outer_exclusive', 'middle_exclusive', 'inner_exclusive', 'sibling_exclusive',
           'primask_restored', 'wrap_inside_handler', 'count_sum_max', 'report_restarts_window',
-          'idle_counted', 'report_restores_primask']
+          'idle_counted', 'report_restores_primask',
+          # 08/11 (L51): one T10 line per call
+          'print_next_idle', 'snapshot_restarts_window', 'print_next_lines', 'print_next_done',
+          'print_keeps_next_window', 'print_next_one_handler', 'snapshot_restores_primask']
 
 
 @pytest.fixture(scope='module')
