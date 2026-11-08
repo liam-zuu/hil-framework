@@ -25,27 +25,38 @@ def crc(b):
     return binascii.crc_hqx(bytes(b), 0xFFFF)
 
 
-def build(n=N, faults=(), imu_fn=None):
-    """imu_fn(k) -> (gz, ax, ay, az, yaw) of frame k (default: a slow sine on gz and a yaw ramp)."""
+def build(n=N, faults=(), imu_fn=None, idx0=0, enc_n0=0, cyc0=4_000_000_000, pre_ticks=0):
+    """imu_fn(k) -> (gz, ax, ay, az, yaw) of frame k (default: a slow sine on gz and a yaw ramp).
+    idx0, enc_n0: H7 log index and EncoderGen call counts at the log start (0: log from the H7 boot).
+    pre_ticks: TICK records made every 0.5 s while the link was down before the log, the last one 0.5 s
+    before frame 0; they wait in the H7 ring and leave first."""
     rng = np.random.default_rng(3)
     t_send_ns = (np.arange(n) * 1e6 + rng.uniform(-20e3, 20e3, n)).astype(np.int64)
     mosi = np.zeros((n, 40), dtype=np.uint8)
     for k in range(n):
         imu = imu_fn(k) if imu_fn else (0.1 * np.sin(k / 50), 0.0, 0.0, 9.81, 0.01 * k % 3.0)
         mosi[k] = np.frombuffer(encode_state([0.0] * 10, seq=k, imu=imu, imu_seq=k // 10), dtype=np.uint8)
-    cyc0 = 4_000_000_000                                       # wraps after ~0.6 s
+    # cyc0 = 4e9: wraps after ~0.6 s
     cyc = [(cyc0 + int((t_send_ns[k] / 1e3 + D_1W_US) * 1e-6 * F_H7)) for k in range(n)]
     # log stream: RESET_DONE, then a REPORT per kind every 10 ms (src = frame 3 before), TICK every 500
-    produced, idx = [[] for _ in range(n)], 0
+    produced, idx = [[] for _ in range(n)], idx0
     seqs = [0, 0, 0]
+    for m in range(pre_ticks, 0, -1):
+        c = cyc[0] - int(0.5 * m * F_H7)
+        produced[1].append((0x40, struct.pack('<IIIH', c & 0xFFFFFFFF, c & 0xFFFFFFFF, c >> 32, 0)))  # 1: first carried
     for k in range(n):
         queue = produced[k]
         for kk, w, ev, cnt_n in ENC_EVENTS:
             if k == kk and ('drop_enc', kk) not in faults:
                 queue.append((0x35 if ev == 'S' else 0x36, bytes([w]) + struct.pack(
-                    '<HIIH', (k * 7) & 0xFFFF, cnt_n, cyc[k] & 0xFFFFFFFF, (k + 1) & 0xFFFF)))
+                    '<HIIH', (k * 7) & 0xFFFF, cnt_n + enc_n0, cyc[k] & 0xFFFFFFFF, (k + 1) & 0xFFFF)))
         if k == 5:
             queue.append((0x30, bytes([1]) + struct.pack('<IH', cyc[k] & 0xFFFFFFFF, (k + 1) & 0xFFFF)))
+        if ('old_src_report', k) in faults:        # gyro report built from a frame before the log (src nf -6)
+            raw = bytes(mosi[0][i] for i in dec.MOSI_IMU_BYTES)
+            queue.append((0x10, bytes([seqs[0] & 0xFF, 1, 1, 0]) + struct.pack(
+                '<HHHI', (-6) & 0xFFFF, (-6) & 0xFFFF, crc(raw), cyc[k] & 0xFFFFFFFF)))
+            seqs[0] += 1
         if k > 20 and k % 10 == 0:
             src = k - 3
             raw = bytes(mosi[src][i] for i in dec.MOSI_IMU_BYTES)
@@ -188,6 +199,52 @@ def test_report_left_from_previous_link_period(clean):
     assert rp['n'] == sum(seqs) and rp['no_source_frame'] == 0 and rp['imu_crc_bad'] == 0
     assert res['frames']['miso_crc_bad'] == 0 and res['frames']['empty'] == 0
     assert res['log']['gaps'] == 0
+    # j = 0, 1 answer no frame of this log: not "unanswered" (08/11), and a clean run has no problem
+    assert res['frames']['start_leftover'] == 2 and res['frames']['unanswered'] == 0
+    assert dec.problems(res) == []
+
+
+def test_report_from_frame_before_log_not_no_source():
+    """08/11: run11 w2 had 9 reports the H7 built from the last frame of the run before (Pi stopped);
+    their source is older than the first frame of the log: `src_before_log`, not `no_source_frame`."""
+    t, mosi, miso, seqs = build(n=3000, faults={('old_src_report', 3)})
+    res = dec.decode(t, mosi, miso)
+    rp = res['reports']
+    assert rp['src_before_log'] == 1 and rp['no_source_frame'] == 0 and rp['n'] == sum(seqs)
+    assert dec.problems(res) == []
+
+
+def test_report_source_missing_inside_log_still_reported():
+    """The 3 reports (one per kind) built at frame 1000 have source frame 997; the answer of 997 (j = 999)
+    has a bad CRC, so 997 is not in the frame map: a source inside the log is still `no_source_frame`."""
+    t, mosi, miso, seqs = build(n=3000, faults={('miso_bit', 999)})
+    res = dec.decode(t, mosi, miso)
+    rp = res['reports']
+    assert rp['no_source_frame'] == 3 and rp['src_before_log'] == 0
+
+
+def test_ticks_made_before_log_not_a_mismatch():
+    """08/11: run11 w1 started 21 s after the run before; TICKs made in that gap (> one 8.9 s CYCCNT wrap
+    before their carrier) were placed one wrap late and showed as '2 cặp TICK lệch _cyc_total'."""
+    t, mosi, miso, _ = build(n=5000, cyc0=20_000_000_000, pre_ticks=40)    # 20 s of TICKs before the log
+    res = dec.decode(t, mosi, miso)
+    assert res['log']['ticks_before_log'] == 40
+    assert res['clock']['tick_total_mismatch'] == 0 and res['log']['gaps'] == 0
+    assert dec.problems(res) == []
+
+
+def test_enc_gaps_log_not_from_boot():
+    """08/11: second and later runs without an H7 reset (run11 w2, w3): the call counts n start above 1;
+    calls of earlier runs are `calls_before_log`, not gaps. From the boot (idx0 = 0) n - 1 still counts."""
+    t, mosi, miso, _ = build(n=20_000, idx0=5000, enc_n0=2)
+    res = dec.decode(t, mosi, miso)
+    ec = res['enc_calls']
+    assert ec['log_from_boot'] is False and ec['count_gaps'] == 0 and ec['calls_before_log'] == 6
+    t, mosi, miso, _ = build(n=20_000, faults={('drop_enc', 3000)}, idx0=5000, enc_n0=2)
+    assert dec.decode(t, mosi, miso)['enc_calls']['count_gaps'] == 1   # lost S inside the log; lost first P not seen
+    t, mosi, miso, _ = build(n=20_000, enc_n0=2)                         # from the boot: n - 1 are missing
+    ec = dec.decode(t, mosi, miso)['enc_calls']
+    assert ec['log_from_boot'] is True and ec['count_gaps'] == 6
 
 
 def test_mosi_crc_mismatch():
