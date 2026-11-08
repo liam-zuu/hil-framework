@@ -84,7 +84,10 @@ NEW_CHECKS = ['pair_same_frame', 'getframe_masked', 'getframe_clears_ready', 'un
               'crc_check_value', 'crc_table_equals_ref', 'miso_crc_valid', 'mosi_crc_of_answered_frame',
               'rx_cyc_of_answered_frame', 'rx_nf_of_answered_frame', 'age_field', 'miso_crc_catches_flip',
               'imu_raw_same_frame', 'log_each_record_once_in_order', 'log_payload_intact',
-              'log_full_drops_counted', 'log_drop_leaves_index_gap', 'log_restores_primask']
+              'log_full_drops_counted', 'log_drop_leaves_index_gap', 'log_restores_primask',
+              # DIAG 08/11 (fix/spi1-link-diag): callback statistics
+              'diag_gap_bucket', 'diag_gap_minmax', 'diag_seq_jump', 'diag_nss_high_counts_nothing',
+              'diag_restart_clears_seq', 'diag_restores_primask']
 
 
 @pytest.mark.parametrize('name', NEW_CHECKS)

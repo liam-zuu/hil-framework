@@ -22,7 +22,9 @@
 #include "s06_log.h"
 #endif
 
-GPIO_TypeDef fake_gpioa;
+GPIO_TypeDef fake_gpioa = { 1u << 4 };   /* NSS (PA4) high: no frame clocking */
+DMA_TypeDef  fake_dma1;
+uint32_t     SystemCoreClock = 480000000u;
 DWT_Type     fake_dwt;
 int  fake_irq_disabled;
 long fake_irq_sections;
@@ -337,6 +339,29 @@ int main(void)
         check(last_idx == (uint16_t)(i0 + S06_LOG_SLOTS) && r.idx == (uint16_t)(i0 + S06_LOG_SLOTS + 11u),
               "log_drop_leaves_index_gap", "dropped records did not consume an index");
         check(fake_irq_disabled == 0, "log_restores_primask", "PRIMASK left set");
+    }
+    /* 10. DIAG 08/11 callback statistics: 1 ms gaps land in the 0.9-1.1 ms
+     * bucket, a skipped seq counts one jump, a restart clears the seq run,
+     * NSS high at entry and after the re-arm counts nothing, take clears. */
+    {
+        SPI1_DiagCb_t cb;
+        frame(200, 0);
+        SPI1_DiagTakeCb(&cb);                      /* start a clean window */
+        for (int k = 201; k <= 205; k++) frame(k, 0);
+        frame(207, 0);                             /* seq 206 missing */
+        SPI1_DiagTakeCb(&cb);
+        check(cb.n == 6 && cb.gap_hist[1] == 6 && cb.gap_hist[0] + cb.gap_hist[2]
+              + cb.gap_hist[3] + cb.gap_hist[4] == 0, "diag_gap_bucket", "1 ms gaps not in 0.9-1.1 ms");
+        check(cb.gap_min_us == 1000u && cb.gap_max_us == 1000u, "diag_gap_minmax", "gap min/max not 1000 us");
+        check(cb.seq_jump == 1u, "diag_seq_jump", "skipped seq not counted once");
+        check(cb.nss_low_entry == 0u && cb.nss_low_rearm == 0u && cb.rearm_fail == 0u,
+              "diag_nss_high_counts_nothing", "NSS high counted as low, or re-arm failure");
+        SPI1_RequestRestart();
+        SPI1_Service();
+        frame(150, 0);                             /* after a restart: no jump */
+        SPI1_DiagTakeCb(&cb);
+        check(cb.n == 1u && cb.seq_jump == 0u, "diag_restart_clears_seq", "jump counted across a restart");
+        check(fake_irq_disabled == 0, "diag_restores_primask", "PRIMASK left set");
     }
 #endif
     return _fails ? 1 : 0;

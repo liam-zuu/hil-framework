@@ -75,6 +75,18 @@ static volatile uint32_t _last_frame_ms;   /* tick at the last completed frame (
 static volatile uint8_t  _rearm_pending;
 static uint32_t          _n_rearms;
 
+/* DIAG 08/11 (spi1_handler.h, SPI1_Diag*): callback statistics, written in
+ * the callback (priority 0), read and cleared by SPI1_DiagTakeCb() with
+ * interrupts masked. Thresholds in CYCCNT cycles, set in SPI1_Handler_Init. */
+static uint32_t      _d_cpu = 1u;          /* CYCCNT cycles per us          */
+static uint32_t      _d_thr[4];            /* 0.9, 1.1, 2, 10 ms            */
+static uint32_t      _d_last_cyc;
+static uint8_t       _d_have_last;
+static uint8_t       _d_last_seq;
+static uint8_t       _d_have_seq;          /* 0 after a restart             */
+static SPI1_DiagCb_t _dcb;
+static uint32_t      _n_restart_fail;
+
 static HIL_State_t   _state;
 static HIL_TrajRef_t _traj;
 static HIL_Imu_t     _imu;
@@ -194,6 +206,16 @@ void SPI1_Handler_Init(SPI_HandleTypeDef *hspi)
     memset(_rx, 0, sizeof(_rx));
     _frame_ready = 0;
     _new_pending = 0;
+    /* DIAG 08/11 */
+    _d_cpu = SystemCoreClock / 1000000u;
+    if (_d_cpu == 0u) _d_cpu = 1u;
+    _d_thr[0] =   900u * _d_cpu;
+    _d_thr[1] =  1100u * _d_cpu;
+    _d_thr[2] =  2000u * _d_cpu;
+    _d_thr[3] = 10000u * _d_cpu;
+    memset(&_dcb, 0, sizeof(_dcb));
+    _dcb.gap_min_us = 0xFFFFFFFFu;
+    _dcb.dur_min_us = 0xFFFFFFFFu;
     HAL_SPI_TransmitReceive_DMA(_hspi, _tx, _rx, SPI1_FRAME_LEN);
 }
 
@@ -296,18 +318,44 @@ void SPI1_Callback(SPI_HandleTypeDef *hspi)
 {
     if (hspi->Instance != _hspi->Instance) return;
     uint32_t cyc = DWT->CYCCNT;        /* S06 L7-4: raw stamp, priority 0 */
+    /* DIAG 08/11: NSS at entry, gap since the previous callback */
+    if ((_NSS_PORT->IDR & _NSS_PIN) == 0u) _dcb.nss_low_entry++;
+    if (_d_have_last) {
+        uint32_t gap = cyc - _d_last_cyc;
+        unsigned b = 0;
+        while (b < 4u && gap >= _d_thr[b]) b++;
+        _dcb.gap_hist[b]++;
+        uint32_t gus = gap / _d_cpu;
+        if (gus > _dcb.gap_max_us) _dcb.gap_max_us = gus;
+        if (gus < _dcb.gap_min_us) _dcb.gap_min_us = gus;
+    }
+    _d_last_cyc   = cyc;
+    _d_have_last  = 1;
+    _dcb.n++;
     _decode();
+    /* DIAG 08/11: MOSI seq continuity (each completed frame should carry the
+     * next seq; a jump means a lost or misaligned frame) */
+    if (_d_have_seq && _state.seq != (uint8_t)(_d_last_seq + 1u)) _dcb.seq_jump++;
+    _d_last_seq  = _state.seq;
+    _d_have_seq  = 1;
     _rx_cyc = cyc;
     _rx_nf  = _n_frames + 1u;          /* this frame, counted below */
     _imu.src_nf = _rx_nf;
     _latch_new_traj();
     _take_staged_tx();
-    if (HAL_SPI_TransmitReceive_DMA(_hspi, _tx, _rx, SPI1_FRAME_LEN) != HAL_OK)
+    if (HAL_SPI_TransmitReceive_DMA(_hspi, _tx, _rx, SPI1_FRAME_LEN) != HAL_OK) {
         _rearm_pending = 1;
+        _dcb.rearm_fail++;             /* DIAG 08/11 */
+    }
+    if ((_NSS_PORT->IDR & _NSS_PIN) == 0u) _dcb.nss_low_rearm++;   /* DIAG 08/11 */
     _last_frame_ms = HAL_GetTick();
     _n_frames++;
     if (_frame_ready) _n_unread++;
     _frame_ready = 1;
+    /* DIAG 08/11: callback duration (L39: printed min/max on the board) */
+    uint32_t dus = (DWT->CYCCNT - cyc) / _d_cpu;
+    if (dus > _dcb.dur_max_us) _dcb.dur_max_us = dus;
+    if (dus < _dcb.dur_min_us) _dcb.dur_min_us = dus;
 }
 
 void SPI1_ErrorCallback(SPI_HandleTypeDef *hspi)
@@ -336,11 +384,64 @@ void SPI1_Service(void)
     if (HAL_SPI_TransmitReceive_DMA(_hspi, _tx, _rx, SPI1_FRAME_LEN) == HAL_OK) {
         _rearm_pending = 0;
         _n_rearms++;
+        _d_have_seq = 0;               /* DIAG 08/11: next frame starts a new seq run */
         uint8_t p[6];                  /* S06: cuts the H7 -> RPi5 clock fit */
         s06_put32(p, DWT->CYCCNT);
         s06_put16(p + 4, (uint16_t)_n_rearms);
         S06Log_Push(S06_REC_REARM, p, sizeof p);
+    } else {
+        _n_restart_fail++;             /* DIAG 08/11; _rearm_pending stays 1: retried next pass */
     }
+}
+
+/* ── DIAG 08/11 (spi1_handler.h) ─────────────────────────────────────── */
+void SPI1_DiagSnapshot(SPI1_Diag_t *d)
+{
+    DMA_Stream_TypeDef *rs = (DMA_Stream_TypeDef *)_hspi->hdmarx->Instance;
+    DMA_Stream_TypeDef *ts = (DMA_Stream_TypeDef *)_hspi->hdmatx->Instance;
+    SPI_TypeDef        *sp = _hspi->Instance;
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    uint32_t now = DWT->CYCCNT;
+    d->since_cb_us   = _d_have_last ? (now - _d_last_cyc) / _d_cpu : 0xFFFFFFFFu;
+    d->frames        = _n_frames;
+    d->sr            = sp->SR;
+    d->cr1           = sp->CR1;
+    d->cr2           = sp->CR2;
+    d->cfg1          = sp->CFG1;
+    d->ier           = sp->IER;
+    d->rx_cr         = rs->CR;
+    d->rx_ndtr       = rs->NDTR;
+    d->tx_cr         = ts->CR;
+    d->tx_ndtr       = ts->NDTR;
+    d->dma1_lisr     = DMA1->LISR & 0xFFFu;
+    d->hspi_state    = (uint8_t)_hspi->State;
+    d->hspi_err      = _hspi->ErrorCode;
+    d->rx_state      = (uint8_t)_hspi->hdmarx->State;
+    d->rx_err        = _hspi->hdmarx->ErrorCode;
+    d->tx_state      = (uint8_t)_hspi->hdmatx->State;
+    d->tx_err        = _hspi->hdmatx->ErrorCode;
+    d->nss           = (_NSS_PORT->IDR & _NSS_PIN) ? 1u : 0u;
+    d->rearm_pending = _rearm_pending;
+    memcpy(d->rx, _rx, SPI1_FRAME_LEN);
+    __set_PRIMASK(primask);
+}
+
+void SPI1_DiagTakeCb(SPI1_DiagCb_t *out)
+{
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    *out = _dcb;
+    memset(&_dcb, 0, sizeof(_dcb));
+    _dcb.gap_min_us = 0xFFFFFFFFu;
+    _dcb.dur_min_us = 0xFFFFFFFFu;
+    __set_PRIMASK(primask);
+}
+
+void SPI1_DiagRestartStats(uint32_t *done, uint32_t *failed)
+{
+    *done   = _n_rearms;
+    *failed = _n_restart_fail;
 }
 
 uint32_t SPI1_GetFrameCount(void)

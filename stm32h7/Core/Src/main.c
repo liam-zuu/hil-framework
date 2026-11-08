@@ -139,6 +139,45 @@ void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef *htim)
     EncoderGen_OC_Callback(htim);
 }
 
+/* DIAG 08/11 (fix/spi1-link-diag): SPI link lost in closed loop. While the
+ * link is down after having been up: SPI1 restart every SPI_DIAG_RESTART_MS
+ * (before: one restart request at the up -> down transition only, so a
+ * restart that returned HAL_OK but never completed left the link dead).
+ * At the loss: snapshot A, then NSS (PA4) polled for SPI_DIAG_POLL_US with
+ * falling edges and low time counted (Pi still clocking or not), snapshot B,
+ * then the restart. Lines: "SPIdiag A/B", "SPIdiag rx", "SPIdiag nss",
+ * "SPIdiag down" (every 0.5 s while down), "SPIcb" (every 0.5 s). */
+#define SPI_DIAG_RESTART_MS  200u
+#define SPI_DIAG_POLL_US     3000u
+
+static void _print_spi_diag(const char *tag, const SPI1_Diag_t *d)
+{
+    printf("SPIdiag %s: dt_cb=%luus fr=%lu sr=%08lx cr1=%08lx cr2=%08lx cfg1=%08lx ier=%08lx"
+           " rxs=%08lx/%lu txs=%08lx/%lu lisr=%03lx hs=%u/%lx dr=%u/%lx dt=%u/%lx nss=%u pend=%u\r\n",
+           tag, (unsigned long)d->since_cb_us, (unsigned long)d->frames,
+           (unsigned long)d->sr, (unsigned long)d->cr1, (unsigned long)d->cr2,
+           (unsigned long)d->cfg1, (unsigned long)d->ier,
+           (unsigned long)d->rx_cr, (unsigned long)d->rx_ndtr,
+           (unsigned long)d->tx_cr, (unsigned long)d->tx_ndtr,
+           (unsigned long)d->dma1_lisr,
+           (unsigned)d->hspi_state, (unsigned long)d->hspi_err,
+           (unsigned)d->rx_state, (unsigned long)d->rx_err,
+           (unsigned)d->tx_state, (unsigned long)d->tx_err,
+           (unsigned)d->nss, (unsigned)d->rearm_pending);
+}
+
+static void _print_spi_rx(const SPI1_Diag_t *d)
+{
+    char hex[2 * SPI1_FRAME_LEN + 1];
+    static const char hx[] = "0123456789abcdef";
+    for (int i = 0; i < SPI1_FRAME_LEN; i++) {
+        hex[2 * i]     = hx[d->rx[i] >> 4];
+        hex[2 * i + 1] = hx[d->rx[i] & 0xFu];
+    }
+    hex[2 * SPI1_FRAME_LEN] = '\0';
+    printf("SPIdiag rx: %s\r\n", hex);
+}
+
 #ifdef ENCODER_GEN_HAS_EVENT_HOOK
 /* S06 T3b (Y5, V2-6): one log record per _start_wheel / _stop call: wheel u8,
  * timer CNT at the call u16, calls of that kind on that wheel u32, CYCCNT u32,
@@ -221,6 +260,8 @@ int main(void)
   setvbuf(stdout, NULL, _IONBF, 0);
 
   printf("\r\n--- H753 HIL boot ---\r\n");
+  printf("DIAG build fix/spi1-link-diag (08/11): SPIdiag/SPIcb lines, SPI1 restart every %u ms while down; not for thesis numbers\r\n",
+         (unsigned)SPI_DIAG_RESTART_MS);
   printf("pclk1=%lu  pclk2=%lu\r\n",
          HAL_RCC_GetPCLK1Freq(), HAL_RCC_GetPCLK2Freq());
 
@@ -260,6 +301,8 @@ int main(void)
   static uint32_t _up_first_ms = 0;
   static uint32_t _up_first_frames = 0;
   static uint32_t _n_link_lost = 0;
+  static uint32_t _diag_restart_ms = 0;      /* DIAG 08/11 */
+  static uint32_t _diag_down_restarts = 0;   /* DIAG 08/11: restarts requested while down */
   /* S06 T1 (V4): frames applied by this loop, frames received but never
    * applied (overwritten before the loop read them, from the frame count),
    * largest state age callback -> applied */
@@ -345,6 +388,31 @@ int main(void)
         for (int i = 0; i < ENC_NUM_WHEELS; i++)
             EncoderGen_SetOmega(i, 0.0f);
         SPI1_DropNewTraj();      /* no old setpoint relayed after reconnect */
+        /* DIAG 08/11: state before the restart (main loop blocked about
+         * SPI_DIAG_POLL_US here; encoders already stopped) */
+        {
+            SPI1_Diag_t da, db;
+            SPI1_DiagSnapshot(&da);
+            uint32_t t0 = DWT->CYCCNT, lim = SPI_DIAG_POLL_US * cyc_per_us;
+            uint32_t tp = t0, falls = 0, low_cyc = 0;
+            uint32_t prev = GPIOA->IDR & GPIO_PIN_4;
+            while ((uint32_t)(DWT->CYCCNT - t0) < lim) {
+                uint32_t now = DWT->CYCCNT;
+                uint32_t lv  = GPIOA->IDR & GPIO_PIN_4;
+                if (!lv) low_cyc += now - tp;
+                if (prev && !lv) falls++;
+                prev = lv;
+                tp = now;
+            }
+            SPI1_DiagSnapshot(&db);
+            _print_spi_diag("A", &da);
+            _print_spi_rx(&da);
+            _print_spi_diag("B", &db);
+            printf("SPIdiag nss: %lu falling edges, low %lu us in %lu us between A and B (Pi at 1 kHz, 1 MHz: about 3 and 960)\r\n",
+                   (unsigned long)falls, (unsigned long)(low_cyc / cyc_per_us),
+                   (unsigned long)SPI_DIAG_POLL_US);
+        }
+        _diag_restart_ms = HAL_GetTick();
         SPI1_RequestRestart();   /* covers a DMA stuck without an error */
         SPI1_Stats_t s1;
         SPI1_GetStats(&s1);
@@ -356,6 +424,14 @@ int main(void)
                (unsigned long)(s1.frames - _up_first_frames + 1u),
                (unsigned long)(s1.last_frame_ms - _up_first_ms),
                (unsigned long)(s1.frames - _up_first_frames));
+    } else if (!_link_up && _n_link_lost > 0u
+               && (HAL_GetTick() - _diag_restart_ms) >= SPI_DIAG_RESTART_MS) {
+        /* DIAG 08/11: keep restarting while down (also when the Pi stopped:
+         * harmless, the restart only runs while NSS is high) */
+        _busy = 1;
+        _diag_restart_ms = HAL_GetTick();
+        _diag_down_restarts++;
+        SPI1_RequestRestart();
     }
     SPI1_Service();
 
@@ -451,6 +527,31 @@ int main(void)
                (unsigned long)((ss.frames - _frames_last) * 2u),
                (unsigned long)ss.errors, (unsigned long)ss.rearms,
                (unsigned long)ss.last_error);
+        /* DIAG 08/11: callbacks in the last 0.5 s; restarts; state when down */
+        {
+            SPI1_DiagCb_t cb;
+            SPI1_DiagTakeCb(&cb);
+            uint32_t r_done, r_fail;
+            SPI1_DiagRestartStats(&r_done, &r_fail);
+            printf("SPIcb: n=%lu gap<0.9/0.9-1.1/1.1-2/2-10/>=10ms=%lu/%lu/%lu/%lu/%lu"
+                   " gap=%lu..%luus dur=%lu..%luus nss_low entry=%lu rearm=%lu seqj=%lu"
+                   " rearm_fail=%lu restart=%lu fail=%lu down_req=%lu\r\n",
+                   (unsigned long)cb.n,
+                   (unsigned long)cb.gap_hist[0], (unsigned long)cb.gap_hist[1],
+                   (unsigned long)cb.gap_hist[2], (unsigned long)cb.gap_hist[3],
+                   (unsigned long)cb.gap_hist[4],
+                   (unsigned long)(cb.n > 1u ? cb.gap_min_us : 0u), (unsigned long)cb.gap_max_us,
+                   (unsigned long)(cb.n ? cb.dur_min_us : 0u), (unsigned long)cb.dur_max_us,
+                   (unsigned long)cb.nss_low_entry, (unsigned long)cb.nss_low_rearm,
+                   (unsigned long)cb.seq_jump, (unsigned long)cb.rearm_fail,
+                   (unsigned long)r_done, (unsigned long)r_fail,
+                   (unsigned long)_diag_down_restarts);
+            if (!_link_up && _n_link_lost > 0u) {
+                SPI1_Diag_t dd;
+                SPI1_DiagSnapshot(&dd);
+                _print_spi_diag("down", &dd);
+            }
+        }
         /* Frames the main loop did not read, and the NEW setpoint path:
          * seen = taken + replaced + dropped (+1 if one is pending) */
         printf("Frame: unread=%lu  new seen=%lu taken=%lu repl=%lu drop=%lu"

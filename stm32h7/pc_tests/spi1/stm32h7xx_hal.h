@@ -10,13 +10,24 @@
 typedef enum { HAL_OK = 0, HAL_ERROR = 1 } HAL_StatusTypeDef;
 typedef enum { GPIO_PIN_RESET = 0, GPIO_PIN_SET = 1 } GPIO_PinState;
 
-typedef struct { int dummy; } SPI_TypeDef;
-typedef struct { int dummy; } GPIO_TypeDef;
+/* Registers read by the DIAG 08/11 snapshot (SPI1_DiagSnapshot) and the NSS
+ * pin read in the callback (IDR); not simulated, only readable. */
+typedef struct { volatile uint32_t CR1, CR2, CFG1, CFG2, IER, SR; } SPI_TypeDef;
+typedef struct { volatile uint32_t IDR; } GPIO_TypeDef;
+typedef struct { volatile uint32_t CR, NDTR; } DMA_Stream_TypeDef;
+typedef struct { volatile uint32_t LISR; } DMA_TypeDef;
+typedef struct { void *Instance; uint32_t State; uint32_t ErrorCode; } DMA_HandleTypeDef;
 
 typedef struct {
     SPI_TypeDef *Instance;
     uint32_t ErrorCode;
+    DMA_HandleTypeDef *hdmarx, *hdmatx;   /* after ErrorCode: old { inst, 0 } init still valid */
+    uint32_t State;
 } SPI_HandleTypeDef;
+
+extern DMA_TypeDef fake_dma1;
+#define DMA1        (&fake_dma1)
+extern uint32_t SystemCoreClock;
 
 extern GPIO_TypeDef fake_gpioa;
 #define GPIOA       (&fake_gpioa)
