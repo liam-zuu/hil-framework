@@ -168,6 +168,28 @@ def test_missing_enc_record_reported():
     assert res['enc_calls']['count_gaps'] == 2           # a loss after the last call would not show
 
 
+def test_report_left_from_previous_link_period(clean):
+    """08/11 (HANDOFF_CODE việc 2): the real H7 starts a log with the reply staged in the previous link
+    period in frames j = 0, 1 (CLOSED_LOOP/2026-11-08_run09 w1, run11 w1: answer to its frame 20000, a
+    game RV REPORT record built there). Before the fix decode() stopped with KeyError: 0."""
+    t, mosi, miso, seqs = clean
+    miso = miso.copy()
+    b = bytearray(40)
+    b[17] = 31                                          # seq of an old frame: answers no frame of this log
+    b[18:20] = struct.pack('<H', 20000)                 # rx_nf of the old frame
+    b[22] = 0x12                                        # game RV REPORT, log index just before this log's
+    b[23:25] = struct.pack('<H', 0xFFFF)
+    b[25:25 + 14] = bytes([55, 1, 3, 109]) + struct.pack('<HHHI', 19999, 19999, 0x1234, 1_685_257_051)
+    b[8:10] = struct.pack('<H', crc(b[:8] + b[10:]))
+    miso[0] = miso[1] = np.frombuffer(bytes(b), dtype=np.uint8)
+    res = dec.decode(t, mosi, miso)
+    rp = res['reports']
+    assert rp['before_first_answer'] == 1               # carried twice, one record
+    assert rp['n'] == sum(seqs) and rp['no_source_frame'] == 0 and rp['imu_crc_bad'] == 0
+    assert res['frames']['miso_crc_bad'] == 0 and res['frames']['empty'] == 0
+    assert res['log']['gaps'] == 0
+
+
 def test_mosi_crc_mismatch():
     t, mosi, miso, _ = build(n=3000)
     mosi = mosi.copy()

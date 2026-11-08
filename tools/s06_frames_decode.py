@@ -320,11 +320,15 @@ def seq_chain(items, seq_of, t_of, mod=256, cut=SEQ_CUT_PERIODS):
 
 def h7_reports(recs, fmap, mosi, carrier_nf):
     """REPORT records with source frame checks; seq unwrapped per (epoch, kind) in log order with
-    the rules of `seq_chain` on the H7 build time (CYCCNT unwrapped)."""
+    the rules of `seq_chain` on the H7 build time (CYCCNT unwrapped).
+    08/11 (HANDOFF_CODE việc 2): a record carried by a frame with no frame-count reference, i.e.
+    before the first answered frame of the log (j = 0, 1: the H7 still sends the reply staged in
+    the previous link period, CLOSED_LOOP/2026-11-08_run09 w1, run11 w1), belongs to the earlier
+    period: left out here (no KeyError) and counted by the caller, like the time fields above."""
     out = []
     by_key = defaultdict(list)
     for rec in recs:
-        if 'rpt_seq' in rec['f']:
+        if 'rpt_seq' in rec['f'] and rec['carrier_j'] in carrier_nf:
             by_key[(rec['f']['epoch'], rec['f']['kind'])].append(rec)
     nchain = {}
     for key, lst in by_key.items():
@@ -333,7 +337,7 @@ def h7_reports(recs, fmap, mosi, carrier_nf):
             nchain[id(rec)] = v
     for rec in recs:
         f = rec['f']
-        if 'rpt_seq' not in f:
+        if 'rpt_seq' not in f or rec['carrier_j'] not in carrier_nf:
             continue
         ref = carrier_nf[rec['carrier_j']]
         src = nf_full(f['src_nf16'], ref)
@@ -657,7 +661,9 @@ def decode(t_send_ns, mosi, miso, esp32_events: Optional[str] = None, cal: Optio
     reps = h7_reports(recs, fmap, mosi, carrier_nf)
     calls, call_gaps = enc_calls(recs)
     res = dict(frames=st, log=lst, clock=dict(segments=segs, tick_total_mismatch=tick_bad, **calib),
-               reports=dict(n=len(reps), imu_crc_bad=sum(1 for r in reps if r.get('imu_crc_ok') is False),
+               reports=dict(n=len(reps), before_first_answer=sum(1 for rec in recs if 'rpt_seq' in rec['f']
+                                                                 and rec['carrier_j'] not in carrier_nf),
+                            imu_crc_bad=sum(1 for r in reps if r.get('imu_crc_ok') is False),
                             imu_seq_bad=sum(1 for r in reps if r.get('imu_seq_ok') is False),
                             no_source_frame=sum(1 for r in reps if r['src_frame'] is None),
                             seq_flags=dict(Counter(r['seq_flag'] for r in reps if r['seq_flag'])),
