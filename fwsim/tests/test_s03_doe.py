@@ -587,7 +587,7 @@ def _public_text(out):
     txt = {}
     for root, _, files in os.walk(out):
         rel = os.path.relpath(root, out)
-        if rel.split(os.sep)[0] == 'sealed':
+        if rel.split(os.sep)[0] in ('sealed', 'sealed_test'):      # v8: two sealed folders
             continue
         for f in files:
             if not f.endswith('.npz'):
@@ -595,13 +595,18 @@ def _public_text(out):
     return txt
 
 
-def _run_main(tmp_path, monkeypatch, capsys, **kw):
+def _run_main(tmp_path, monkeypatch, capsys, error_in_test=False, argv=None, **kw):
     fsr, fnp, calls, works = _fake(**kw)
     out = tmp_path / 'run'
-    seen = dict(design_before_first_main_run=None, analyse=[])
+    seen = dict(design_before_first_main_run=None, analyse=[], after_sealed=0)
 
     def fsr_watch(fw, path, ctrl, g, v, mu):
         dflt = FAKE_DEFAULTS[ctrl]
+        if (out / 'sealed' / 'manifest.json').is_file():          # v8: a run after sealed/ is closed
+            seen['after_sealed'] += 1
+            if error_in_test:
+                calls.append(-1)
+                return dict(status='run_error', completed='', error='FakeTestError: boom'), None
         if seen['design_before_first_main_run'] is None and \
                 sum(not math.isclose(g[n], dflt[n]) for n in s3.FACTORS[ctrl]) >= 2:
             f = out / 'design.csv'
@@ -618,7 +623,7 @@ def _run_main(tmp_path, monkeypatch, capsys, **kw):
     monkeypatch.setattr(s3, 'safe_run', fsr_watch)
     monkeypatch.setattr(s3, 'run_in_new_process', fnp)
     monkeypatch.setattr(s3, 'defaults', lambda fw, ctrl: dict(FAKE_DEFAULTS[ctrl]))
-    monkeypatch.setattr(sys, 'argv', ['s03_doe.py', '--out', str(out), '--mu', '0.5', '--trial'])
+    monkeypatch.setattr(sys, 'argv', ['s03_doe.py', '--out', str(out)] + (argv or ['--mu', '0.5', '--trial']))
     code = s3.main()
     return code, out, capsys.readouterr().out, calls, works
 
@@ -634,11 +639,21 @@ def test_main_pipeline_clean(tmp_path, monkeypatch, capsys):
         assert (out / f).is_file(), f
     assert not (out / 'determinism_check.csv').exists() and not (out / '_work').exists()
     assert works and all(os.path.relpath(w, out).split(os.sep)[0] == 'sealed' for w in works)   # S3C-2
+    assert not (out / 'sealed_test' / '_work').exists()
     runs = list(_csv.DictReader(open(out / 'sealed' / 'runs.csv')))
-    assert len(runs) == 2 * (129 + 128) * 3                        # L41: the inner box always runs
+    assert len(runs) == 2 * (129 + 128 + 14) * 3                   # L41: the inner box always runs; v8 axial
     assert sum(r['box'] == 'inner' for r in runs) == 2 * 128 * 3
+    assert sum(r['box'] == 'axial' for r in runs) == 2 * 14 * 3 and not any(r['box'] == 'test' for r in runs)
     design = list(_csv.DictReader(open(out / 'design.csv')))
-    assert len(design) == 2 * 257 and {r['box'] for r in design} == {'centre', 'outer', 'inner'}
+    assert len(design) == 2 * 371 and {r['box'] for r in design} == {'centre', 'outer', 'inner', 'axial', 'test'}
+    test = list(_csv.DictReader(open(out / 'sealed_test' / 'runs_test.csv')))      # v8: separate seal
+    assert len(test) == 2 * 100 * 3 and {r['box'] for r in test} == {'test'} and {r['mu'] for r in test} == {'0.5'}
+    for f in ('notes.json', 'manifest.json'):
+        assert (out / 'sealed_test' / f).is_file()
+    sealed_txt = ''.join(open(os.path.join(r_, f_), encoding='utf-8', errors='replace').read()
+                         for r_, _, fs in os.walk(out / 'sealed') for f_ in fs if not f_.endswith('.npz'))
+    assert 'test' not in sealed_txt.replace('determinism', '')          # sealed/ says nothing of the test set
+    assert 'n_upper_frames' in open(out / 'sealed' / 'runs.csv').readline()
     effects = list(_csv.DictReader(open(out / 'sealed' / 'effects.csv')))
     assert effects and {r['box'] for r in effects} == {'outer'}     # rule off: inner box not analysed
     assert all(float(r['t_end']) == 1.25 for r in runs)            # S3C-14: plain numbers
@@ -678,7 +693,8 @@ def test_main_inner_box_stays_sealed(tmp_path, monkeypatch, capsys):
     assert calls1.seen['analyse'] == calls2.seen['analyse'] == [(c, b) for c in ('PID', 'ADRC')
                                                                 for b in ('outer', 'inner')]   # S3E-1
     for c in (calls1, calls2):                          # S3E-2: design.csv on disk before the first run
-        assert c.seen['design_before_first_main_run'].count('\n') == 1 + 2 * 257
+        assert c.seen['design_before_first_main_run'].count('\n') == 1 + 2 * 371
+        assert c.seen['after_sealed'] == 2 * 100 * 3            # v8: only the test set runs after sealed/
     pub1, pub2 = _public_text(out), _public_text(out2)
     assert set(pub1) == set(pub2)
     for name in pub1:
@@ -720,7 +736,8 @@ def test_main_run_error_in_the_design_is_recorded_and_sealed(tmp_path, monkeypat
     assert rows[-1]['status'] == 'run_error' and 'FakeError' in rows[-1]['error']
     assert 'FakeError' in (out / 'sealed' / 'stop.json').read_text()
     design = list(_csv.DictReader(open(out / 'design.csv')))         # S3C-3 (c): written before the run
-    assert {r['controller'] for r in design} == {'PID', 'ADRC'} and len(design) == 2 * 257
+    assert {r['controller'] for r in design} == {'PID', 'ADRC'} and len(design) == 2 * 371
+    assert not (out / 'sealed_test').exists()                       # v8: no test set after a sealed stop
 
 
 def test_gate_speeds_must_be_task_speeds(tmp_path, monkeypatch):
@@ -806,3 +823,118 @@ def test_analyse_writes_the_box_notes():
     assert all(r['note'] == 'most corners not completed' for r in eff)
     eff, _, _, _ = s3.analyse('PID', 'outer', pts, runs, [0.5], [0.5], {('PID', 0.5): 1.0})
     assert all(r['note'] == '' for r in eff)
+
+
+# ── S03 v8 (L67): axial points, test set, checks of section 11 item 4 ────────────────
+
+def test_v8_axial_points_ids_and_codes():
+    pts = dict(s3.axial_points())
+    assert sorted(pts) == list(range(257, 271))
+    for k in range(1, 8):                       # X_k at -1: 255 + 2k, at +1: 256 + 2k, others 0
+        assert pts[255 + 2 * k] == tuple(-1.0 if j == k - 1 else 0.0 for j in range(7))
+        assert pts[256 + 2 * k] == tuple(1.0 if j == k - 1 else 0.0 for j in range(7))
+
+
+def test_v8_committed_test_points_pass_condition_7():
+    """The committed file reads, passes section 8.7, and is the LHS of section 3.2 bit for bit."""
+    from scipy.stats import qmc
+    pts = s3.check_test_points()
+    assert [p for p, _ in pts] == list(range(271, 371))
+    u = qmc.LatinHypercube(d=7, scramble=True, optimization=None, rng=np.random.default_rng(20261107)).random(100)
+    assert all(struct.pack('<d', 2.0 * u[j, k] - 1.0) == struct.pack('<d', pts[j][1][k])
+               for j in range(100) for k in range(7))
+
+
+@pytest.mark.parametrize('edit, why', [
+    (lambda rows: rows.__setitem__(0, rows[0].replace('X7', 'X8')), 'columns'),
+    (lambda rows: rows.pop(), 'rows'),
+    (lambda rows: rows.__setitem__(5, rows[5].replace('5,275,', '5,276,', 1)), 'point_id'),
+    (lambda rows: rows.__setitem__(3, ','.join(rows[3].split(',')[:2] + rows[4].split(',')[2:])), 'bin'),
+    (lambda rows: rows.__setitem__(9, ','.join(rows[9].split(',')[:2] + ['1.5'] + rows[9].split(',')[3:])),
+     'finite'),
+])
+def test_v8_test_points_check_catches(tmp_path, edit, why):
+    rows = open(s3.TEST_POINTS, encoding='utf-8').read().splitlines()
+    edit(rows)
+    p = tmp_path / 'tp.csv'
+    p.write_text('\n'.join(rows) + '\n', encoding='utf-8')
+    with pytest.raises(s3.S03Stop, match=why):
+        s3.check_test_points(str(p))
+
+
+def test_v8_make_test_points_never_overwrites(tmp_path):
+    with pytest.raises(s3.S03Stop, match='never generated again'):
+        s3.make_test_points(s3.TEST_POINTS, str(tmp_path / 'g.json'))
+    p, g = tmp_path / 'tp.csv', tmp_path / 'g.json'
+    gen = s3.make_test_points(str(p), str(g))
+    assert p.read_bytes() == open(s3.TEST_POINTS, 'rb').read()      # same file on this machine
+    assert gen['seed'] == 20261107 and gen['bit_generator'] == 'PCG64' and not (tmp_path / 'tp.csv.tmp').exists()
+
+
+def _design_rows():
+    rows = []
+    pts = ([(0, 'centre', (0.0,) * 7)] + [(p, 'outer', c) for p, c in s3.design_points(1.0, 1)] +
+           [(p, 'inner', c) for p, c in s3.design_points(0.5, 129)] + [(p, 'axial', c) for p, c in s3.axial_points()] +
+           [(p, 'test', c) for p, c in s3.check_test_points()])
+    for pid, box, codes in pts:
+        rows.append(dict(controller='PID', point_id=pid, box=box, **{f'X{k + 1}': c for k, c in enumerate(codes)}))
+    return rows
+
+
+def test_v8_design_map_check():
+    rows = _design_rows()
+    s3.check_design_map(rows)
+    bad = [dict(r) for r in rows]
+    bad[200]['box'] = 'outer'                                   # an inner point labelled outer
+    with pytest.raises(s3.S03Stop, match='point 200'):
+        s3.check_design_map(bad)
+    bad = [dict(r) for r in rows]
+    bad[260]['X3'] = 1.0                                        # an axial point with a wrong code
+    with pytest.raises(s3.S03Stop, match='point 260'):
+        s3.check_design_map(bad)
+    with pytest.raises(s3.S03Stop, match='370 rows'):
+        s3.check_design_map(rows[:-1])
+
+
+def test_v8_bounds_check():
+    lv = {n: (1.0, 8.0, 'log') for n in s3.FACTORS['ADRC']}
+    lv['omega_o_xy'] = (12.0, 48.0, 'log')
+
+    def gains_at(codes):
+        return {n: s3.decode(c, *lv[n]) for n, c in zip(s3.FACTORS['ADRC'], codes)}
+    pts = [(1, 'outer', (1.0,) * 7), (2, 'outer', (-1.0,) * 7)]
+    s3.check_bounds('ADRC', lv, pts, gains_at)                 # on the bounds: passes
+    with pytest.raises(s3.S03Stop, match=r'11.4 \(i\)'):
+        s3.check_bounds('ADRC', lv, [(3, 'test', (1.0 + 1e-6,) + (0.0,) * 6)], gains_at)
+    lv['omega_o_xy'] = (12.0, 48.00001, 'log')                # float32 of H is above 48
+    with pytest.raises(s3.S03Stop, match=r'11.4 \(ii\)'):
+        s3.check_bounds('ADRC', lv, [(4, 'outer', (0.0, 1.0) + (0.0,) * 5)], gains_at)
+
+
+@needs_dll
+def test_v8_run_error_in_the_test_set_stays_in_sealed_test(tmp_path, monkeypatch, capsys):
+    """A stop in the test set: sealed/ is already closed and unchanged (no stop.json, nothing about
+    the test set); the reason is only in sealed_test/stop.json; the console says only that S03
+    stopped in the test set."""
+    import json as _json
+    code, out, console, _, _ = _run_main(tmp_path, monkeypatch, capsys, error_in_test=True)
+    assert code == 2
+    assert 'FakeTestError' not in console and 'sealed_test/stop.json' in console
+    assert not (out / 'sealed' / 'stop.json').exists()
+    assert 'FakeTestError' in (out / 'sealed_test' / 'stop.json').read_text()
+    man = _json.load(open(out / 'sealed' / 'manifest.json'))
+    for name, sha in man['files'].items():                     # sealed/ as closed before the test set
+        assert s3.sha256_file(str(out / 'sealed' / name)) == sha
+    meta = (out / 'meta.yaml').read_text(encoding='utf-8')
+    assert 'stopped in the test set' in meta and 'FakeTestError' not in meta
+
+
+@needs_dll
+def test_v8_uncommitted_test_points_stop_a_main_run(tmp_path, monkeypatch, capsys):
+    """Section 8.7: without --trial the test file must be tracked and unmodified in git."""
+    p = tmp_path / 'tp.csv'
+    p.write_bytes(open(s3.TEST_POINTS, 'rb').read())
+    code, out, console, _, _ = _run_main(tmp_path, monkeypatch, capsys,
+                                         argv=['--mu', '0.4', '0.5', '0.6', '--test-points', str(p)])
+    assert code == 2 and 'not committed' in console
+    assert (out / 'design.csv').read_text().strip() == '' and not (out / 'sealed_test').exists()

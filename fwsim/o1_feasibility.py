@@ -270,11 +270,15 @@ def evaluate_v7(log, path, sch, lsum=0.24):
         meas_note = ''
     rows, s_prev, t_prev = [], 0.0, 0.0
     first_trk, t_prog, done = None, None, False
+    n_upper = n_back = 0
     for k in range(len(t)):
         dk = 1.5 * sch.vmax * (t[k] - t_prev) + DELTA
         s_star, _, head, upper = path.nearest(fx[k], fy[k], s_prev - DELTA, s_prev + dk)
         s_two, e_perp, _, _ = path.nearest(fx[k], fy[k], s_prev - dk, s_prev + dk)
-        trk = bool(upper or s_two < s_prev - DELTA - 1e-12)
+        back = bool(s_two < s_prev - DELTA - 1e-12)
+        trk = bool(upper or back)
+        n_upper += int(upper)          # S03 v8 section 4 (W8-Q (b)): two diagnostic counts, frames
+        n_back += int(back)            # kept for scoring with t_k <= t_end; one frame may count in both
         if trk and first_trk is None:
             first_trk = t[k]
         s_car = max(s_prev, s_star)
@@ -323,6 +327,7 @@ def evaluate_v7(log, path, sch, lsum=0.24):
         v=sch.v, T=sch.T, T_r=sch.Tr, T_cmd=sch.Tcmd, t_deadline=sch.Tcmd + T_LATE, t_end=t_end,
         completed=y1, status='track_err' if first_trk is not None else 'ok',
         track_err_frames=int(sum(r['track_err'] for r in rows)),
+        n_upper_frames=n_upper, n_back_frames=n_back,
         t_first_track_err=first_trk if first_trk is not None else np.nan,
         t_progress=t_prog if t_prog is not None else np.nan, cond2_5_ever=bool(c25.any()),
         e_perp_max=e_perp_max, e_perp_max_cens=min(e_perp_max, C_CENS),

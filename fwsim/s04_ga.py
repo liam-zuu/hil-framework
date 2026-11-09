@@ -91,6 +91,9 @@ R_FACTORS = (0.8, 0.9, 1.0, 1.1, 1.2)
 REL_LIMIT = 0.5               # B0_SENS criterion: e_perp_max change > 50 %
 PRECONDITIONS = ('s03_run_and_locked', 'final_test_set_locked', 'ctrl_imu_checked_on_board', 'x3_compared')
 CMP_EPS = 1e-12               # S4C-14: rounding tolerance of the inclusive mu-rule bounds (m; relative for Y3)
+MU_RULE_BOXES = ('centre', 'outer', 'inner')        # S04 v6 section 9 item 4 (S03 v8 axial / test excluded)
+MU_RULE_POINTS = ({('0', 'centre')} | {(str(i), 'outer') for i in range(1, 129)} |
+                  {(str(i), 'inner') for i in range(129, 257)})   # the 257 point_id locked for the mu rule
 # pymoo 0.6.2 constraint handling, read in the installed library (S04 section 3; Liam asked CODE to
 # record file:line before the trial). Re-read when the version differs.
 PYMOO_CHECKED = '0.6.2'
@@ -217,16 +220,24 @@ def edge_flags(dom, x):
 
 
 def mu_rule(s03_dir, ctrl, gate, mu_levels):
-    """Section 3: ('mid', report) when every S03 design point (all boxes that ran) at every gate
+    """Section 3: ('mid', report) when every S03 design point (the 257 points of the centre,
+    outer and inner boxes; S03 v8 axial and test points are not used) at every gate
     speed has the same Y1 at the three mu, |dY2| <= 0.01 m and |dY3| <= 20 % of the S03 Y3
     reference versus the middle mu, no track error, no inconclusive; else ('all', report)."""
     meta = open(os.path.join(s03_dir, 'meta.yaml'), encoding='utf-8').read()
     y3_ref = meta_value(meta, 'y3_reference')
-    runs = [r for r in read_csv(os.path.join(s03_dir, 'sealed', 'runs.csv')) if r['controller'] == ctrl]
+    # S04 v6 section 9 item 4 (S03 v8 adds axial and test points): the mu rule uses only the
+    # 257 points of the centre, outer and inner boxes, filtered by box in BOTH files before the
+    # completeness and membership checks; the point_id list used is locked to 0..256
+    runs = [r for r in read_csv(os.path.join(s03_dir, 'sealed', 'runs.csv'))
+            if r['controller'] == ctrl and r['box'] in MU_RULE_BOXES]
     design = [(r['point_id'], r['box']) for r in read_csv(os.path.join(s03_dir, 'design.csv'))
-              if r['controller'] == ctrl]
+              if r['controller'] == ctrl and r['box'] in MU_RULE_BOXES]
     if not design or len(set(design)) != len(design):
         sys.exit(f'{s03_dir}/design.csv: no or duplicate design points for {ctrl} (S04 3, S4C-5)')
+    if set(design) != MU_RULE_POINTS:
+        sys.exit(f'{s03_dir}/design.csv: the {len(design)} centre / outer / inner points of {ctrl} are not '
+                 f'point_id 0..256 with their boxes (S04 v6 section 9 item 4)')
     lo, mid, hi = mu_levels
     by, dup = {}, []
     for r in runs:

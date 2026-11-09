@@ -35,6 +35,16 @@ outer and inner box), logs_sweep/, meta.yaml; in --out/sealed/ (L56): runs.csv, 
 fail_counts.csv, curvature.csv, y2_versions.csv, determinism_check.csv, notes.json,
 stop.json, manifest.json (SHA-256 of the sealed files), logs/.
 
+S03 v8 (L67, Liam 07/11; spec section 11 item 4): 14 face-centred axial points (point_id
+257-270, box 'axial', 3 mu x 3 speeds) run with the main design and go to sealed/runs.csv;
+100 Latin-hypercube test points (point_id 271-370, box 'test', middle mu x 3 speeds) read
+from the committed file fwsim/s03_test_points.csv (made once with --make-test-points, never
+generated again) run AFTER sealed/ is closed, for both controllers, and everything about
+them is in --out/sealed_test/ (runs_test.csv, logs/, notes.json, stop.json, manifest.json).
+S03 does not analyse either: section 5 and the rule of 3.2 use centre, outer and inner only.
+design.csv: 371 rows per controller, checked point_id - box - codes and bounds (11.4 (i),
+(ii)) before the main design. Two diagnostic columns n_upper_frames, n_back_frames (section 4).
+
 L56 / S03 v6 section 1: the main design results (runs.csv, effects.csv and the tables of
 section 5) are NOT looked at before campaign A ends. Nothing derived from them leaves
 sealed/ (Codex S3C-1..S3C-3): no hash of a sealed file outside it, no child-process job file
@@ -90,8 +100,19 @@ RESPONSES = ('e_perp_max', 'e_perp_max_cens', 'tv_duty', 'sat_frac')
 RUN_COLS = ['controller', 'point_id', 'box', 'mu', 'v', 'status', 'completed', 'e_perp_max', 'e_perp_max_cens',
             'e_perp_global_max', 'tv_duty', 'sat_frac', 'sat_any_frac', 'e_theta_lane_max_deg',
             'e_theta_cmd_max_deg', 'ds_absmax', 'e_trk_max', 't_end', 'e_s_absmax', 'track_err_frames',
-            'cond2_5_ever', 'pos_reset_mid', 'e_perp_rms', 'e_trk_rms', 'error']     # RMS: S3C-13; error: S3C-12
+            'cond2_5_ever', 'pos_reset_mid', 'e_perp_rms', 'e_trk_rms',
+            'n_upper_frames', 'n_back_frames',      # S03 v8 section 4 (W8-Q (b)): diagnostics, not responses
+            'error']                                # RMS: S3C-13; error: S3C-12
 SCALE_RTOL = 1e-14            # H/L >= 4 within float rounding of the log grid (S3C-6; S3D-7: about 45 ULP)
+# S03 v8 (L67): axial points and the test set for the RSM comparison of S04; not analysed here
+ANALYSED_BOXES = ('centre', 'outer', 'inner')            # section 5 and the rule of 3.2 use only these
+AXIAL_FIRST, TEST_FIRST, N_TEST = 257, 271, 100
+TEST_POINTS = os.path.join(HERE, 's03_test_points.csv')  # section 7: the committed file is the reference
+TEST_POINTS_GEN = os.path.join(HERE, 's03_test_points.gen.json')
+TEST_SEED = 20261107                                      # section 3.2
+TEST_COLS = ['test_id', 'point_id'] + [f'X{k}' for k in range(1, 8)]
+BOUND_RTOL = 1e-12                                        # section 11 item 4 (i)
+PLANNED_RUNS = dict(centre=9, outer=1152, inner=1152, axial=126, test=300)   # per controller (sections 3.2, 7)
 
 
 class S03Stop(Exception):
@@ -221,6 +242,130 @@ def design_points(half=1.0, start_id=1):
     for i, bits in enumerate(itertools.product((-1, 1), repeat=7)):
         pts.append((start_id + i, tuple(half * b for b in reversed(bits))))   # X1 changes fastest
     return pts
+
+
+def axial_points():
+    """S03 v8 section 3.2: 14 face-centred axial points (alpha = 1): factor X_k at code -1 has
+    point_id 255 + 2k, at +1 256 + 2k (k = 1..7); the six others at code 0 (centre of the box)."""
+    pts = []
+    for k in range(1, 8):
+        for sign, pid in ((-1.0, 255 + 2 * k), (1.0, 256 + 2 * k)):
+            pts.append((pid, tuple(sign if j == k - 1 else 0.0 for j in range(7))))
+    return pts
+
+
+def _float_bits(x):
+    return struct.pack('<d', float(x))
+
+
+def make_test_points(path=TEST_POINTS, gen_path=TEST_POINTS_GEN):
+    """Generate the test-set file once (S03 v8 sections 3.2, 7): Latin hypercube, 100 points,
+    codes 2u - 1, written to a temporary file, read back and compared bit for bit (64-bit
+    patterns, so +0.0 and -0.0 differ) with the binary64 array just drawn; only then renamed to
+    the main file. Records the generation (command, seed, BitGenerator, versions) beside it."""
+    import platform
+    import scipy
+    from scipy.stats import qmc
+    if os.path.exists(path):
+        raise S03Stop(f'{path} exists: the committed file is the reference, it is never generated again')
+    u = qmc.LatinHypercube(d=7, scramble=True, optimization=None,
+                           rng=np.random.default_rng(TEST_SEED)).random(N_TEST)
+    codes = 2.0 * u - 1.0
+    tmp = path + '.tmp'
+    with open(tmp, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(TEST_COLS)
+        for j in range(N_TEST):
+            w.writerow([j + 1, TEST_FIRST - 1 + j + 1] + [fmt(codes[j, k]) for k in range(7)])
+    back = read_test_points_raw(tmp)
+    same = len(back) == N_TEST and all(_float_bits(back[j][2 + k]) == _float_bits(codes[j, k])
+                                       for j in range(N_TEST) for k in range(7))
+    if not same:
+        os.remove(tmp)
+        raise S03Stop('test points: the file read back differs from the drawn array (S03 v8 section 7)')
+    os.replace(tmp, path)
+    gen = dict(command='scipy.stats.qmc.LatinHypercube(d=7, scramble=True, optimization=None, '
+                       'rng=numpy.random.default_rng(20261107)).random(100); code = 2u - 1',
+               seed=TEST_SEED, bit_generator=type(np.random.default_rng(TEST_SEED).bit_generator).__name__,
+               python=platform.python_version(), numpy=np.__version__, scipy=scipy.__version__,
+               created=time.strftime('%Y-%m-%d %H:%M:%S'), sha256=sha256_file(path))
+    with open(gen_path, 'w', encoding='utf-8') as f:
+        json.dump(gen, f, indent=1)
+    return gen
+
+
+def read_test_points_raw(path):
+    """Rows of the test-set file as [test_id(str), point_id(str), X1..X7 (float)]; header checked."""
+    with open(path, newline='', encoding='utf-8') as f:
+        rd = csv.reader(f)
+        head = next(rd, None)
+        if head != TEST_COLS:
+            raise S03Stop(f'test points: columns {head} are not {TEST_COLS} (S03 v8 section 8.7)')
+        return [r[:2] + [float(x) for x in r[2:]] for r in rd]
+
+
+def check_test_points(path=TEST_POINTS):
+    """S03 v8 section 8 condition 7: 100 rows, test_id 1..100 and point_id 271..370 in order and
+    unique, every code finite in [-1, 1], one point of every column in each bin
+    [-1 + 0.02 (i - 1), -1 + 0.02 i), i = 1..100. Returns [(point_id, codes)]; raises S03Stop."""
+    rows = read_test_points_raw(path)
+    if len(rows) != N_TEST:
+        raise S03Stop(f'test points: {len(rows)} rows, not {N_TEST} (S03 v8 section 8.7)')
+    for j, r in enumerate(rows, start=1):
+        if any(len(x) != len(x.strip()) for x in r[:2]) or r[0] != str(j) or r[1] != str(TEST_FIRST - 1 + j):
+            raise S03Stop(f'test points: row {j} has test_id {r[0]!r}, point_id {r[1]!r} (expected {j}, '
+                          f'{TEST_FIRST - 1 + j}; S03 v8 section 8.7)')
+    codes = np.array([r[2:] for r in rows], dtype=float)
+    if codes.shape != (N_TEST, 7) or not np.all(np.isfinite(codes)) or np.any(np.abs(codes) > 1.0):
+        raise S03Stop('test points: a code is not finite or not in [-1, 1] (S03 v8 section 8.7)')
+    for k in range(7):
+        for i in range(1, N_TEST + 1):
+            lo, hi = -1.0 + 0.02 * (i - 1), -1.0 + 0.02 * i
+            n = int(np.sum((codes[:, k] >= lo) & (codes[:, k] < hi)))
+            if n != 1:
+                raise S03Stop(f'test points: X{k + 1} has {n} points in bin {i} [{lo}, {hi}) (S03 v8 section 8.7)')
+    return [(TEST_FIRST - 1 + j, tuple(float(x) for x in codes[j - 1])) for j in range(1, N_TEST + 1)]
+
+
+def check_design_map(rows):
+    """S03 v8 section 11 item 4: point_id - box - codes of design.csv, per controller, not only the
+    row count: 371 rows, ids 0..370 unique, the box of each id, the codes of centre / outer /
+    inner / axial points as the design defines them, test codes as in the test file."""
+    expect = {0: ('centre', (0.0,) * 7)}
+    expect.update({p: ('outer', c) for p, c in design_points(1.0, 1)})
+    expect.update({p: ('inner', c) for p, c in design_points(0.5, 129)})
+    expect.update({p: ('axial', c) for p, c in axial_points()})
+    by_ctrl = {}
+    for r in rows:
+        by_ctrl.setdefault(r['controller'], []).append(r)
+    for ctrl, rs in by_ctrl.items():
+        ids = [int(r['point_id']) for r in rs]
+        if len(rs) != 371 or sorted(ids) != list(range(371)):
+            raise S03Stop(f'{ctrl}: design.csv has {len(rs)} rows / ids not 0..370 unique (S03 v8 section 8.7)')
+        for r in rs:
+            pid, codes = int(r['point_id']), tuple(float(r[f'X{k}']) for k in range(1, 8))
+            if pid >= TEST_FIRST:
+                if r['box'] != 'test':
+                    raise S03Stop(f'{ctrl}: point {pid} is {r["box"]}, not test (S03 v8 section 11.4)')
+                continue
+            box, want = expect[pid]
+            if r['box'] != box or codes != want:
+                raise S03Stop(f'{ctrl}: point {pid} is {r["box"]} {codes}, expected {box} {want} (S03 v8 11.4)')
+
+
+def check_bounds(ctrl, lv, points, gains_at):
+    """S03 v8 section 11 item 4: (i) every binary64 value after decode is finite and within
+    [L - 1e-12 (H - L), H + 1e-12 (H - L)]; (ii) the float32 value the firmware uses is compared
+    only with the convention of section 2.1, omega_o <= 48 (not with [L, H]). Raises S03Stop."""
+    for pid, _box, codes in points:
+        for name, x in gains_at(codes).items():
+            L, H, _ = lv[name]
+            tol = BOUND_RTOL * (H - L)
+            if not (math.isfinite(x) and L - tol <= x <= H + tol):
+                raise S03Stop(f'{ctrl} point {pid}: {name} = {x!r} outside [{L!r}, {H!r}] (S03 v8 11.4 (i))')
+            if name.startswith('omega_o') and float(np.float32(x)) > OMEGA_O_MAX:
+                raise S03Stop(f'{ctrl} point {pid}: {name} float32 {float(np.float32(x))!r} > {OMEGA_O_MAX} '
+                              f'(S03 v8 11.4 (ii))')
 
 
 def term_names(k=7):
@@ -457,6 +602,21 @@ def git_state(repo):
         return dict(commit='UNKNOWN', dirty=True, modified=[str(e)])
 
 
+def file_git_state(p):
+    """Git state of one file (S03 v8 section 8.7): tracked, unmodified, last commit touching it."""
+    d = os.path.dirname(os.path.abspath(p))
+
+    def git(*a):
+        return subprocess.run(['git', '-C', d] + list(a), capture_output=True, text=True)
+    try:
+        tracked = git('ls-files', '--error-unmatch', os.path.abspath(p)).returncode == 0
+        clean = tracked and git('status', '--porcelain', '--', os.path.abspath(p)).stdout.strip() == ''
+        commit = git('log', '-1', '--format=%h', '--', os.path.abspath(p)).stdout.strip() or None
+        return dict(tracked=tracked, clean=clean, commit=commit)
+    except OSError as e:
+        return dict(tracked=False, clean=False, commit=None, error=str(e))
+
+
 def sweep_counts(rows):
     """S03 5.3 for the sweep (S3C-13): per controller, factor, speed, mu: points, not completed,
     inconclusive, saturated."""
@@ -482,6 +642,8 @@ def main():
     ap.add_argument('--gate-speeds', type=float, nargs='+', default=list(SPEEDS),
                     help='speeds still in the O1 gate (O1 v7 3.9): a non-empty subset of 0.2 0.5 0.8')
     ap.add_argument('--controllers', nargs='+', default=list(CONTROLLERS), choices=CONTROLLERS)
+    ap.add_argument('--test-points', default=TEST_POINTS,
+                    help='committed test-set file (S03 v8 section 7); default fwsim/s03_test_points.csv')
     ap.add_argument('--child', default=None, help=argparse.SUPPRESS)
     a = ap.parse_args()
     if len(a.mu) not in (1, 3) or (len(a.mu) == 1 and not a.trial):
@@ -510,18 +672,21 @@ def main():
     stop_public, stop_sealed = None, None
     t_sweep_end = None
 
-    def checked(ctrl, g, v, mu, ids=None):
+    def checked(ctrl, g, v, mu, ids=None, sink=None, work=None, notes_to=None):
         """One run; a run_error is recorded (S3C-12), rerun once in a new process for diagnosis
-        (B8b-20), then S03 stops. ids = (point_id, box) for a main-design run (sealed)."""
+        (B8b-20), then S03 stops. ids = (point_id, box) for a main-design run (sealed). The test
+        set (v8) passes its own sink (rows), work folder and notes list, all under sealed_test/."""
         row, log = safe_run(fw, path, ctrl, g, v, mu)
         if row['status'] != 'run_error':
             return row, log
         if ids is not None:
-            all_runs.append(dict(controller=ctrl, point_id=ids[0], box=ids[1], mu=mu, v=v, **row))
+            (all_runs if sink is None else sink).append(dict(controller=ctrl, point_id=ids[0], box=ids[1],
+                                                             mu=mu, v=v, **row))
         note = dict(controller=ctrl, gains=g, v=v, mu=mu, point=ids, first=row.get('error'))
-        rerun_notes.append(note)
+        (rerun_notes if notes_to is None else notes_to).append(note)
         try:
-            again = run_in_new_process(a.dll, [(ctrl, g, v, mu)], work_pub if ids is None else work_sealed)[0]['row']
+            wdir = work if work is not None else (work_pub if ids is None else work_sealed)
+            again = run_in_new_process(a.dll, [(ctrl, g, v, mu)], wdir)[0]['row']
             note['second'] = again.get('error', 'ran (fwsim not deterministic there)')
         except Exception as exc:          # noqa: BLE001 (S3C-12: any failure of the diagnosis is recorded)
             note['second'] = f'diagnosis process failed: {type(exc).__name__}: {exc}'
@@ -594,27 +759,41 @@ def main():
         stop_public = str(exc)                          # sweep phase: public (S03 3.1 is not sealed)
         print(f'[STOP] {exc}', flush=True)
 
+    plan = {}
     if stop_public is None:
         # every design point of every controller is public before any main-design run: the points
-        # follow from the public levels only, so design.csv does not depend on a stop (S3C-3 (c))
-        plan = {}
-        for ctrl in a.controllers:
-            lv = levels[ctrl]
+        # follow from the public levels and the committed test file only, so design.csv does not
+        # depend on a stop (S3C-3 (c)); v8: 371 rows per controller incl. axial and test points
+        try:
+            tp_state = file_git_state(a.test_points)
+            if not (tp_state['tracked'] and tp_state['clean']) and not a.trial:
+                raise S03Stop(f'{a.test_points} is not committed / is modified ({tp_state}; S03 v8 section 8.7)')
+            test_pts = check_test_points(a.test_points)                 # section 8 condition 7
+            for ctrl in a.controllers:
+                lv = levels[ctrl]
 
-            def gains_at(codes, lv=lv, ctrl=ctrl):
-                return {n: decode(c, *lv[n]) for n, c in zip(FACTORS[ctrl], codes)}
-            centre_codes = (0.0,) * 7
-            outer, inner = design_points(1.0, 1), design_points(0.5, 129)
-            for pid, box, codes in ([(0, 'centre', centre_codes)] + [(p, 'outer', c) for p, c in outer] +
-                                    [(p, 'inner', c) for p, c in inner]):
-                design_rows.append(dict(controller=ctrl, point_id=pid, box=box,
-                                        **{f'X{k + 1}': c for k, c in enumerate(codes)},
-                                        **{f'{n}_value': v_ for n, v_ in gains_at(codes).items()}))
-            plan[ctrl] = (gains_at, centre_codes, outer, inner)
+                def gains_at(codes, lv=lv, ctrl=ctrl):
+                    return {n: decode(c, *lv[n]) for n, c in zip(FACTORS[ctrl], codes)}
+                centre_codes = (0.0,) * 7
+                outer, inner, axial = design_points(1.0, 1), design_points(0.5, 129), axial_points()
+                points = ([(0, 'centre', centre_codes)] + [(p, 'outer', c) for p, c in outer] +
+                          [(p, 'inner', c) for p, c in inner] + [(p, 'axial', c) for p, c in axial] +
+                          [(p, 'test', c) for p, c in test_pts])
+                check_bounds(ctrl, lv, points, gains_at)                 # section 11 item 4 (i), (ii)
+                for pid, box, codes in points:
+                    design_rows.append(dict(controller=ctrl, point_id=pid, box=box,
+                                            **{f'X{k + 1}': c for k, c in enumerate(codes)},
+                                            **{f'{n}_value': v_ for n, v_ in gains_at(codes).items()}))
+                plan[ctrl] = (gains_at, centre_codes, outer, inner, axial, test_pts)
+            check_design_map(design_rows)                                # section 11 item 4: id - box - codes
+        except S03Stop as exc:
+            stop_public = f'before the main design: {exc}'
+            print(f'[STOP] {stop_public}', flush=True)
+    if stop_public is None:
         write_csv(os.path.join(a.out, 'design.csv'), design_rows)      # S3E-2: on disk before any run
         try:
             for ctrl in a.controllers:
-                gains_at, centre_codes, outer, inner = plan[ctrl]
+                gains_at, centre_codes, outer, inner, axial, _test = plan[ctrl]
                 runs, keep_logs = {}, {}
                 rng = np.random.default_rng(DET_SEED)
                 det_ids = [0] + sorted(int(x) for x in rng.choice(np.arange(1, 129), size=3, replace=False))
@@ -630,7 +809,9 @@ def main():
                                 runs[(pid, mu, v)] = row
                                 all_runs.append(dict(controller=ctrl, point_id=pid, box=box, mu=mu, v=v, **row))
                                 name = f'{ctrl}_p{pid}_mu{mu}_v{v}'
-                                if pid in det_ids and box != 'inner':
+                                # v8: the determinism points are the centre and 3 OUTER corners,
+                                # chosen by box, not only by point_id (section 11 item 4)
+                                if pid in det_ids and box in ('centre', 'outer'):
                                     keep_logs[(pid, mu, v)] = (g, box, row, log_digest(log))
                                     save_log_csv(sealed_logs, name, log)          # S03 3.4: log.csv
                                 data = npz_bytes(log)      # S3E-1: compressed for every run, same work
@@ -641,6 +822,9 @@ def main():
                 # L41 (Liam 06/11, 'Chot B'): the inner box always runs, so the run time does not tell
                 # whether the rule of S03 3.2 is on; it enters the analysis only when the rule is on
                 run_points([(p, 'inner', c) for p, c in inner])
+                # v8 (L67): axial points always run too, 3 mu x 3 speeds, sealed; S03 does not
+                # analyse them (section 5 and the rule of 3.2 use the outer / inner / centre runs)
+                run_points([(p, 'axial', c) for p, c in axial])
                 corner_ids = [p for p, _ in outer]
                 need_inner = [v for v in SPEEDS
                               if sum(runs[(i, mu_mid, v)]['completed'] == 'false' for i in corner_ids) > 64]
@@ -700,6 +884,48 @@ def main():
             json.dump(dict(stop=stop_sealed), f, indent=1)
     with open(os.path.join(sealed, 'manifest.json'), 'w', encoding='utf-8') as f:
         json.dump(dict(files=sealed_files), f, indent=1)
+    # sealed/ is closed here: nothing below writes in it (S03 v8 section 7)
+
+    # v8 (L67, S38-8): the test set of both controllers runs only now, after sealed/ is written,
+    # so sealed/ does not depend on it; everything about it stays in sealed_test/
+    stop_test, test_rows, test_notes, test_s = None, [], [], None
+    sealed_test = os.path.join(a.out, 'sealed_test')
+    work_test = os.path.join(sealed_test, '_work')
+    if stop_public is None and stop_sealed is None:
+        os.makedirs(sealed_test, exist_ok=True)
+        test_logs = os.path.join(sealed_test, 'logs')
+        t_test0 = time.time()
+        print('[test set] running the test points (results sealed in sealed_test/, S03 v8 section 7)', flush=True)
+        try:
+            for ctrl in a.controllers:
+                gains_at, test_pts = plan[ctrl][0], plan[ctrl][5]
+                for pid, codes in test_pts:
+                    g = gains_at(codes)
+                    for v in SPEEDS:
+                        row, log = checked(ctrl, g, v, mu_mid, ids=(pid, 'test'), sink=test_rows, work=work_test,
+                                           notes_to=test_notes)
+                        test_rows.append(dict(controller=ctrl, point_id=pid, box='test', mu=mu_mid, v=v, **row))
+                        data = npz_bytes(log)             # same work for every run (S3E-1)
+                        if row['completed'] != 'true':    # logs kept by the rule of section 7
+                            save_log(test_logs, f'{ctrl}_p{pid}_mu{mu_mid}_v{v}', log, data)
+        except S03Stop as exc:
+            stop_test = str(exc)
+            print('[STOP] S03 stopped in the test set; the reason is in sealed_test/stop.json', flush=True)
+        test_s = round(time.time() - t_test0)
+        test_files = {}
+        p = os.path.join(sealed_test, 'runs_test.csv')
+        write_csv(p, test_rows, RUN_COLS)
+        test_files['runs_test.csv'] = sha256_file(p)
+        with open(os.path.join(sealed_test, 'notes.json'), 'w', encoding='utf-8') as f:
+            json.dump(dict(stop=stop_test, rows_run=len(test_rows), run_error_reruns=test_notes,
+                           elapsed_s_test=test_s), f, indent=1, default=str)
+        test_files['notes.json'] = sha256_file(os.path.join(sealed_test, 'notes.json'))
+        if stop_test:
+            with open(os.path.join(sealed_test, 'stop.json'), 'w', encoding='utf-8') as f:
+                json.dump(dict(stop=stop_test), f, indent=1)
+            test_files['stop.json'] = sha256_file(os.path.join(sealed_test, 'stop.json'))
+        with open(os.path.join(sealed_test, 'manifest.json'), 'w', encoding='utf-8') as f:
+            json.dump(dict(files=test_files), f, indent=1)
     # public outputs: sweep only (S03 3.1 is a source of campaign A's domain) and the design points
     files = {}
     for name, rows in (('sweep.csv', sweep_rows), ('sweep_counts.csv', sweep_counts(sweep_rows)),
@@ -714,9 +940,15 @@ def main():
     dll_sha = sha256_file(a.dll)
     sweep_s = round((t_sweep_end or t_end) - t0)
     status = ('stopped in the sweep: ' + stop_public if stop_public else
-              'stopped in the main design (reason sealed)' if stop_sealed else 'ran to the end')
+              'stopped in the main design (reason sealed)' if stop_sealed else
+              'stopped in the test set (reason in sealed_test/)' if stop_test else 'ran to the end')
+    tp_sha = sha256_file(a.test_points) if os.path.exists(a.test_points) else None
+    tp_gen = {}
+    if os.path.exists(TEST_POINTS_GEN):
+        with open(TEST_POINTS_GEN, encoding='utf-8') as f:
+            tp_gen = json.load(f)
     with open(os.path.join(a.out, 'meta.yaml'), 'w', encoding='utf-8') as f:
-        f.write(f"""spec: S03 v6 (06_SPECS/2026-11-05_Spec_S03_DOE_chon_gain.md)
+        f.write(f"""spec: S03 v8 (06_SPECS/2026-11-05_Spec_S03_DOE_chon_gain.md)
 date: {time.strftime('%Y-%m-%d')}
 setup: sim                     # fwsim: ESP32 firmware C code (DLL) + rpi5/plant_step.py, NOT hardware
 operator: Claude (phiên CODE)
@@ -748,7 +980,14 @@ thresholds: {json.dumps(dict(THRESH, tv_duty=f'{Y3_REL:.0%} of the default-gain 
 y3_reference: {json.dumps({f'{c} v={v}': y for (c, v), y in y3_ref.items()})}
 o1: {json.dumps(dict(A=o1.A, a_r=o1.A_R, D=o1.D, D_d=o1.D, t_d=o1.T_D, t_late=o1.T_LATE, delta=o1.DELTA, v_d=o1.V_D, c_cens=o1.C_CENS))}
 sweep_run_error_reruns: {json.dumps([n for n in rerun_notes if n['point'] is None], default=str)}
-interpretations:   # of this script, not written in S03 v6 / O1 v7; Liam or THESIS correct if wrong
+planned_runs_per_controller: {json.dumps(PLANNED_RUNS)}   # S03 v8 3.2, 7 (rows actually run: sealed/, sealed_test/)
+test_points:            # S03 v8 sections 3.2, 7, 8.7: the committed file is the reference
+  file: {json.dumps(os.path.relpath(a.test_points, os.path.join(HERE, '..')).replace(os.sep, '/'))}
+  git: {json.dumps(file_git_state(a.test_points))}
+  sha256: {tp_sha}
+  generation: {json.dumps(tp_gen)}
+test_set: {json.dumps('not run (S03 stopped before it)' if (stop_public or stop_sealed) else 'sealed in sealed_test/ (not looked at before the RSM coefficients are saved, S03 v8 section 7)')}
+interpretations:   # of this script, not written in S03 v8 / O1 v7; Liam or THESIS correct if wrong
   - "completion: conditions 1, 5 at the instant, conditions 2 and 3 together as the trailing unbroken t_d window (condition 2 over the window: L63 (2), Liam 07/11), condition 4 strictly before the deadline; after a tracking error that came before the progress, the window runs to the deadline (o1_feasibility.evaluate_v7)"
   - "sweep level rule: a point is 'completing' only with y1 'true' at every gate speed (inconclusive breaks the run)"
   - "inner box trigger: corners with y1 'false' only (inconclusive not counted)"
@@ -758,25 +997,33 @@ interpretations:   # of this script, not written in S03 v6 / O1 v7; Liam or THES
   - "elapsed_s here is the sweep only; the total and the main-design time are in sealed/notes.json (L56, Codex S3E-1; S03 section 7 asks elapsed_s in meta.yaml)"
   - "public channels left (L56, S3C-3, S3E-1; Liam 06/11 'Chot B', 'Duyet khuyen nghi'): status, exit code and console say that S03 stopped in the main design (S03 3.4 asks to report the stop; the reason is in sealed/stop.json); the wall-clock time still varies a little with the results (scoring a run that does not complete is a little longer, evaluate_v7 closes the window early on completion; writing the npz of the runs not completed; machine noise): accepted, not measured"
   - "the upper-end tracking flag uses the 400 001-point path grid (about 15 um); at s = S the window is cut by the end of the path, not flagged (Codex S3C-5, deferred)"
+  - "v8: run order per controller centre, outer, inner, axial (3 mu x 3 speeds each), then determinism and analysis; sealed/ is written and closed after every controller; then the test set of every controller (middle mu x 3 speeds); a stop before the test set means the test set does not run"
+  - "v8: test-set logs follow the rule of section 7 (npz of every run not completed; there is no centre point in the test set); the compressed npz is made for every run (same work)"
+  - "v8: the test-points file must be tracked and unmodified in git (section 8.7 'committed'); with --trial an uncommitted file is allowed and recorded in test_points.git"
+  - "v8: n_upper_frames, n_back_frames count the frames evaluate_v7 kept for scoring (t_k <= t_end), as section 4 defines them; they are diagnostics, never responses"
 elapsed_s: {sweep_s}
 file_sha256: {json.dumps(files)}
 files:
   - sweep.csv: "one line per sweep run (section 3.1) and default gains at the other mu levels"
   - sweep_counts.csv: "section 5.3 for the sweep: runs not completed, inconclusive, saturated per factor, speed, mu"
   - levels.csv: "L, H, centre, scale per factor"
-  - design.csv: "centre, outer box and inner box of every controller (all run, L41)"
+  - design.csv: "371 rows per controller: centre, outer box, inner box, axial points, test points (all run, L41, L67)"
   - logs_sweep/: "npz of the sweep runs not completed"
-  - sealed/: "SEALED (L56): runs.csv (section 4 responses), effects.csv (every term, per box, response, speed, mu / worst / range), curvature.csv (5.4), y2_versions.csv (5.1), fail_counts.csv (5.3), determinism_check.csv (3.4), notes.json, stop.json, manifest.json, logs/"
+  - sealed/: "SEALED (L56): runs.csv (section 4 responses; centre, outer, inner, axial), effects.csv (every term, per box, response, speed, mu / worst / range; outer and inner only), curvature.csv (5.4), y2_versions.csv (5.1), fail_counts.csv (5.3), determinism_check.csv (3.4), notes.json, stop.json, manifest.json, logs/"
+  - sealed_test/: "SEALED separately (S03 v8 section 7): runs_test.csv, logs/, notes.json, stop.json, manifest.json; opened only after the RSM coefficients at the middle mu are saved and committed"
 """)
-    for d in (work_pub, work_sealed):
+    for d in (work_pub, work_sealed, work_test):
         if os.path.isdir(d) and not os.listdir(d):
             os.rmdir(d)
     print(f'S03 finished -> {a.out}; status: {status}')
-    return 0 if not (stop_public or stop_sealed) else 2
+    return 0 if not (stop_public or stop_sealed or stop_test) else 2
 
 
 if __name__ == '__main__':
     if '--child' in sys.argv:
         child_main(sys.argv[sys.argv.index('--child') + 1])
+        sys.exit(0)
+    if '--make-test-points' in sys.argv:          # S03 v8 section 7: once, then commit the file
+        print(json.dumps(make_test_points(), indent=1))
         sys.exit(0)
     sys.exit(main())

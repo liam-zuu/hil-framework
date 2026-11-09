@@ -1,0 +1,10 @@
+{
+ "command": "scipy.stats.qmc.LatinHypercube(d=7, scramble=True, optimization=None, rng=numpy.random.default_rng(20261107)).random(100); code = 2u - 1",
+ "seed": 20261107,
+ "bit_generator": "PCG64",
+ "python": "3.12.10",
+ "numpy": "2.4.1",
+ "scipy": "1.17.1",
+ "created": "2026-11-09 21:47:56",
+ "sha256": "9b9508f00beef6d51d24518324beeebda3ed6c9a168f9a1b7e99c173c2c0a1ab"
+}

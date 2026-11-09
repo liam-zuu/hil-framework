@@ -97,6 +97,12 @@ def _head():
     return subprocess.run(['git', '-C', HERE, 'rev-parse', 'HEAD'], capture_output=True, text=True).stdout.strip()
 
 
+# S03 v8 design: the 257 points of the mu rule (S04 v6 section 9 item 4) and, in design.csv, the
+# axial and test points the rule must ignore
+_POINTS = [(0, 'centre')] + [(i, 'outer') for i in range(1, 129)] + [(i, 'inner') for i in range(129, 257)]
+_V8_EXTRA = [(i, 'axial') for i in range(257, 271)] + [(i, 'test') for i in range(271, 371)]
+
+
 def _s03_dir(tmp_path, runs=None, trial=False, mu=(0.4, 0.5, 0.6), levels=None, plant_src=None, o1c=None,
              script=None, imu=None):
     """levels: {controller: {factor: (L, H)}}; default a synthetic domain. plant_src, o1c, imu, script:
@@ -114,7 +120,7 @@ def _s03_dir(tmp_path, runs=None, trial=False, mu=(0.4, 0.5, 0.6), levels=None, 
         w = csv.writer(f)
         w.writerow(['controller', 'point_id', 'box'])
         for c in s3.CONTROLLERS:
-            for pid, box in [(0, 'centre'), (1, 'outer'), (129, 'inner')]:
+            for pid, box in _POINTS + _V8_EXTRA:
                 w.writerow([c, pid, box])
     y3 = {f'{c} v={v:g}': 5.0 for c in s3.CONTROLLERS for v in s3.SPEEDS}
     dll_sha = s3.sha256_file(_DLL) if os.path.isfile(_DLL) else 'no dll'
@@ -132,7 +138,7 @@ def _s03_dir(tmp_path, runs=None, trial=False, mu=(0.4, 0.5, 0.6), levels=None, 
 
 def _runs(mod=None):
     out = []
-    for pid, box in [(0, 'centre'), (1, 'outer'), (129, 'inner')]:
+    for pid, box in _POINTS:
         for mu in (0.4, 0.5, 0.6):
             for v in s3.SPEEDS:
                 r = dict(controller='PID', point_id=pid, box=box, mu=mu, v=v, status='ok', completed='true',
@@ -159,7 +165,7 @@ def test_domain_and_log_coding(tmp_path):
 def test_mu_rule_mid_when_every_point_satisfies(tmp_path):
     d = _s03_dir(tmp_path, _runs())
     dec, rep = s4.mu_rule(str(d), 'PID', list(s3.SPEEDS), [0.4, 0.5, 0.6])
-    assert dec == 'mid' and rep['points_checked'] == 9 and rep['points_failing'] == 0
+    assert dec == 'mid' and rep['points_checked'] == 257 * 3 and rep['points_failing'] == 0
 
 
 @pytest.mark.parametrize('mod, why', [
@@ -199,9 +205,24 @@ def test_mu_rule_refuses_missing_or_duplicate_runs(tmp_path):
     runs = _runs() + [dict(_runs()[0], status='ok')]
     with pytest.raises(SystemExit, match='duplicate'):
         s4.mu_rule(str(_s03_dir(tmp_path / 'b', runs)), 'PID', list(s3.SPEEDS), [0.4, 0.5, 0.6])
-    runs = _runs() + [dict(r, point_id=7) for r in _runs() if r['point_id'] == 1]
+    runs = _runs() + [dict(r, point_id=999) for r in _runs() if r['point_id'] == 1]
     with pytest.raises(SystemExit, match='not in design.csv'):
         s4.mu_rule(str(_s03_dir(tmp_path / 'c', runs)), 'PID', list(s3.SPEEDS), [0.4, 0.5, 0.6])
+
+
+def test_mu_rule_ignores_v8_axial_and_test_points(tmp_path):
+    """S04 v6 section 9 item 4: axial rows (in sealed/runs.csv) and test rows are filtered out by
+    box in both files; a failing axial run does not change the rule, and the 257 point_id are
+    locked (a missing centre / outer / inner point stops)."""
+    axial = [dict(controller='PID', point_id=p, box='axial', mu=mu, v=v, status='track_err', completed='false',
+                  e_perp_max=0.5, tv_duty=50.0) for p in range(257, 271) for mu in (0.4, 0.5, 0.6) for v in s3.SPEEDS]
+    dec, rep = s4.mu_rule(str(_s03_dir(tmp_path / 'a', _runs() + axial)), 'PID', list(s3.SPEEDS), [0.4, 0.5, 0.6])
+    assert dec == 'mid' and rep['points_checked'] == 257 * 3
+    d = _s03_dir(tmp_path / 'b', _runs())
+    rows = (d / 'design.csv').read_text().splitlines()
+    (d / 'design.csv').write_text('\n'.join(r for r in rows if r != 'PID,200,inner') + '\n')
+    with pytest.raises(SystemExit, match='point_id 0..256'):
+        s4.mu_rule(str(d), 'PID', list(s3.SPEEDS), [0.4, 0.5, 0.6])
 
 
 def test_mu_rule_only_gate_speeds(tmp_path):
