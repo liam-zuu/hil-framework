@@ -174,6 +174,49 @@ def test_v7_track_error_after_progress_keeps_completion(path):
     assert res['t_progress'] < res['t_first_track_err']
 
 
+def _counts_ok(res, rows):
+    """S3V8-7: the two counts against track_err_frames and the frames kept (t_k <= t_end)."""
+    nu, nb, nt = res['n_upper_frames'], res['n_back_frames'], res['track_err_frames']
+    assert nt == sum(r['track_err'] for r in rows)
+    assert max(nu, nb) <= nt <= nu + nb
+    assert nu <= len(rows) and nb <= len(rows) and rows[-1]['t'] == res['t_end']
+
+
+def test_v7_diagnostic_counts(path):
+    """S03 v8 section 4 (S3V8-7): ideal car 0 / 0; a frame 1 m ahead counts in n_upper (and the
+    frame after it in n_back); a frame 0.5 m back after the progress counts in n_back only; a jump
+    after t_end is not counted."""
+    sch = o1.Schedule(0.5)
+    res, rows = o1.evaluate_v7(_ideal(sch), path, sch)
+    assert res['n_upper_frames'] == 0 and res['n_back_frames'] == 0
+    _counts_ok(res, rows)
+    log = _ideal(sch)                                             # upper end of the window
+    k = int(np.searchsorted(log['t'], 4.0))
+    j = int(np.searchsorted(path.s, path.s_of_tau(sch.tau(log['t'][k])[0]) + 1.0))
+    log['pose'][k, :2] = _plant_xy(path.x[j], path.y[j])
+    res, rows = o1.evaluate_v7(log, path, sch)
+    # known answer: the jump frame is on the upper end (s only grows, s_prev moves up by D_k), the
+    # next frame, back on the path, is below s_prev - delta: one upper, one back, two frames
+    assert (res['n_upper_frames'], res['n_back_frames'], res['track_err_frames']) == (1, 1, 2)
+    assert [r['t'] for r in rows if r['track_err']] == [log['t'][k], log['t'][k + 1]]
+    _counts_ok(res, rows)
+    log = _ideal(sch)                                             # back on the lane after the progress
+    k = int(np.searchsorted(log['t'], sch.Tcmd + 0.3))
+    j = int(np.searchsorted(path.s, path.S - 0.5))
+    log['pose'][k, :2] = _plant_xy(path.x[j], path.y[j])
+    res, rows = o1.evaluate_v7(log, path, sch)
+    assert (res['n_upper_frames'], res['n_back_frames'], res['track_err_frames']) == (0, 1, 1)   # back only
+    _counts_ok(res, rows)
+    log = _ideal(sch)                                             # a jump after t_end, before the deadline
+    t_end0 = o1.evaluate_v7(log, path, sch)[0]['t_end']
+    k = int(np.searchsorted(log['t'], t_end0 + 0.2))
+    assert log['t'][k] < sch.Tcmd + o1.T_LATE
+    log['pose'][k, :2] = _plant_xy(path.x[200000], path.y[200000])
+    res, rows = o1.evaluate_v7(log, path, sch)
+    assert res['t_end'] == t_end0 and res['n_upper_frames'] == res['n_back_frames'] == 0
+    _counts_ok(res, rows)
+
+
 def test_v7_track_error_and_never_at_origin_is_false(path):
     """Car parked 0.5 m from the origin, one jump frame: conditions 2-5 never hold -> 'false'."""
     sch = o1.Schedule(0.8)
@@ -566,13 +609,16 @@ def _fake(design_fail=False, default_fails=False, error_in_design=False):
                (default_fails and not off and v == 0.8)
         x = np.array([g[n] for n in f])
         log = dict(t=np.arange(3.0) * 0.01, duty=np.zeros((3, 4)) + x.sum())
+        # S3V8-7: the two diagnostic counts carry known values (factors off the default; v = 0.8)
         return dict(status='ok', completed='false' if fail else 'true', e_perp_max=0.01 + 1e-3 * float(x[0]),
                     e_perp_max_cens=0.01, e_perp_global_max=0.01, tv_duty=np.float64(1.0 + float(x[1])),
                     sat_frac=0.0, sat_any_frac=0.0, e_theta_lane_max_deg=1.0, e_theta_cmd_max_deg=1.0,
                     ds_absmax=0.0, e_trk_max=0.0, t_end=np.float64(1.25), e_s_absmax=0.0, track_err_frames=0,
+                    n_upper_frames=len(off), n_back_frames=int(v == 0.8),
                     cond2_5_ever=np.bool_(True), pos_reset_mid=0, e_perp_rms=0.0, e_trk_rms=0.0), log
 
     def fake_new_process(dll, runs, work):
+        os.makedirs(work, exist_ok=True)              # S3V8-6: as run_in_new_process, the folder stays
         works.append(work)
         out = []
         for j in runs:
@@ -595,18 +641,64 @@ def _public_text(out):
     return txt
 
 
+def _tree(d):
+    """Every folder and file (bytes) under d: the state of sealed/ (S3V8-6)."""
+    snap = {}
+    for root, _, files in os.walk(d):
+        rel = os.path.relpath(root, d)
+        snap[('dir', rel)] = None
+        for f in files:
+            with open(os.path.join(root, f), 'rb') as fh:
+                snap[('file', os.path.normpath(os.path.join(rel, f)))] = fh.read()
+    return snap
+
+
+def _test_gains(out):
+    """{controller: set of gain tuples} of the 'test' rows of design.csv: the test-set runs are
+    known from the input, not from the phase the script is in (S3V8-6)."""
+    import csv as _csv
+    f = out / 'design.csv'
+    if not f.is_file() or not f.read_text().strip():
+        return None
+    res = {}
+    for r in _csv.DictReader(open(f)):
+        if r['box'] == 'test':
+            res.setdefault(r['controller'], set()).add(tuple(float(r[f'{n}_value']) for n in s3.FACTORS[r['controller']]))
+    return res
+
+
 def _run_main(tmp_path, monkeypatch, capsys, error_in_test=False, argv=None, **kw):
+    """error_in_test: True -> run_error row; 'warn' -> a warning and a print in every test run;
+    'raise' -> an OSError (not S03Stop) in the first test run."""
     fsr, fnp, calls, works = _fake(**kw)
     out = tmp_path / 'run'
-    seen = dict(design_before_first_main_run=None, analyse=[], after_sealed=0)
+    seen = dict(design_before_first_main_run=None, analyse=[], after_sealed=0, other_after_test=0,
+                manifest_at_first_test=None, sealed_before_test=None, sealed_after=None)
+    tg = {}
 
     def fsr_watch(fw, path, ctrl, g, v, mu):
         dflt = FAKE_DEFAULTS[ctrl]
-        if (out / 'sealed' / 'manifest.json').is_file():          # v8: a run after sealed/ is closed
+        if not tg.get('loaded'):
+            got = _test_gains(out)
+            if got is not None:
+                tg.update(got, loaded=True)
+        is_test = tg.get('loaded') and tuple(g[n] for n in s3.FACTORS[ctrl]) in tg.get(ctrl, ())
+        if is_test:                                    # S3V8-6: a test-set run, known from design.csv
+            if seen['after_sealed'] == 0:
+                seen['manifest_at_first_test'] = (out / 'sealed' / 'manifest.json').is_file()
+                seen['sealed_before_test'] = _tree(out / 'sealed')
             seen['after_sealed'] += 1
-            if error_in_test:
+            if error_in_test is True:
                 calls.append(-1)
                 return dict(status='run_error', completed='', error='FakeTestError: boom'), None
+            if error_in_test == 'warn':
+                import warnings as _w
+                _w.warn('FakeTestWarning p%d' % seen['after_sealed'], RuntimeWarning)
+                print('FakeTestPrint')
+            if error_in_test == 'raise':
+                raise OSError('FakeTestOSError while writing a log of a test point')
+        elif seen['after_sealed']:
+            seen['other_after_test'] += 1
         if seen['design_before_first_main_run'] is None and \
                 sum(not math.isclose(g[n], dflt[n]) for n in s3.FACTORS[ctrl]) >= 2:
             f = out / 'design.csv'
@@ -625,21 +717,32 @@ def _run_main(tmp_path, monkeypatch, capsys, error_in_test=False, argv=None, **k
     monkeypatch.setattr(s3, 'defaults', lambda fw, ctrl: dict(FAKE_DEFAULTS[ctrl]))
     monkeypatch.setattr(sys, 'argv', ['s03_doe.py', '--out', str(out)] + (argv or ['--mu', '0.5', '--trial']))
     code = s3.main()
-    return code, out, capsys.readouterr().out, calls, works
+    if (out / 'sealed').is_dir():
+        seen['sealed_after'] = _tree(out / 'sealed')
+    cap = capsys.readouterr()
+    seen['stderr'] = cap.err
+    return code, out, cap.out, calls, works
 
 
 @needs_dll
 def test_main_pipeline_clean(tmp_path, monkeypatch, capsys):
     import csv as _csv
-    code, out, console, _, works = _run_main(tmp_path, monkeypatch, capsys)
+    code, out, console, calls, works = _run_main(tmp_path, monkeypatch, capsys)
     assert code == 0
     for f in ('sweep.csv', 'sweep_counts.csv', 'levels.csv', 'design.csv', 'meta.yaml', 'sealed/runs.csv',
               'sealed/effects.csv', 'sealed/fail_counts.csv', 'sealed/notes.json', 'sealed/manifest.json',
-              'sealed/determinism_check.csv'):
+              'sealed/determinism_check.csv', 'sealed_test/diag.txt'):
         assert (out / f).is_file(), f
     assert not (out / 'determinism_check.csv').exists() and not (out / '_work').exists()
     assert works and all(os.path.relpath(w, out).split(os.sep)[0] == 'sealed' for w in works)   # S3C-2
     assert not (out / 'sealed_test' / '_work').exists()
+    # S3V8-1, S3V8-6: test runs known from design.csv; sealed/ (files, folders, bytes) as it was
+    # just before the first test run, and closed (manifest) by then; no other run after it
+    seen = calls.seen
+    assert seen['after_sealed'] == 2 * 100 * 3 and seen['other_after_test'] == 0
+    assert seen['manifest_at_first_test'] is True
+    assert seen['sealed_before_test'] == seen['sealed_after']
+    assert ('dir', '_work') not in seen['sealed_after']           # removed before the manifest
     runs = list(_csv.DictReader(open(out / 'sealed' / 'runs.csv')))
     assert len(runs) == 2 * (129 + 128 + 14) * 3                   # L41: the inner box always runs; v8 axial
     assert sum(r['box'] == 'inner' for r in runs) == 2 * 128 * 3
@@ -653,7 +756,17 @@ def test_main_pipeline_clean(tmp_path, monkeypatch, capsys):
     sealed_txt = ''.join(open(os.path.join(r_, f_), encoding='utf-8', errors='replace').read()
                          for r_, _, fs in os.walk(out / 'sealed') for f_ in fs if not f_.endswith('.npz'))
     assert 'test' not in sealed_txt.replace('determinism', '')          # sealed/ says nothing of the test set
-    assert 'n_upper_frames' in open(out / 'sealed' / 'runs.csv').readline()
+    # S3V8-7: the values of the two diagnostic counts reach the three CSV files (fake: n_upper =
+    # factors off the default, n_back = 1 at v = 0.8)
+    off = {(d['controller'], d['point_id']): sum(not math.isclose(float(d[f'{n}_value']), FAKE_DEFAULTS[d['controller']][n])
+                                                 for n in s3.FACTORS[d['controller']]) for d in design}
+    assert max(off.values()) == 7
+    for r in runs + test:
+        assert int(r['n_upper_frames']) == off[(r['controller'], r['point_id'])], (r['box'], r['point_id'])
+        assert int(r['n_back_frames']) == (r['v'] == '0.8')
+    for r in list(_csv.DictReader(open(out / 'sweep.csv'))):
+        assert int(r['n_upper_frames']) == (0 if r['is_default'] == 'true' else 1)
+        assert int(r['n_back_frames']) == (r['v'] == '0.8')
     effects = list(_csv.DictReader(open(out / 'sealed' / 'effects.csv')))
     assert effects and {r['box'] for r in effects} == {'outer'}     # rule off: inner box not analysed
     assert all(float(r['t_end']) == 1.25 for r in runs)            # S3C-14: plain numbers
@@ -882,18 +995,138 @@ def _design_rows():
 
 
 def test_v8_design_map_check():
-    rows = _design_rows()
-    s3.check_design_map(rows)
+    rows, tp = _design_rows(), s3.check_test_points()
+    s3.check_design_map(rows, tp)
     bad = [dict(r) for r in rows]
     bad[200]['box'] = 'outer'                                   # an inner point labelled outer
     with pytest.raises(s3.S03Stop, match='point 200'):
-        s3.check_design_map(bad)
+        s3.check_design_map(bad, tp)
     bad = [dict(r) for r in rows]
     bad[260]['X3'] = 1.0                                        # an axial point with a wrong code
     with pytest.raises(s3.S03Stop, match='point 260'):
-        s3.check_design_map(bad)
+        s3.check_design_map(bad, tp)
     with pytest.raises(s3.S03Stop, match='370 rows'):
-        s3.check_design_map(rows[:-1])
+        s3.check_design_map(rows[:-1], tp)
+
+
+def test_v8_design_map_checks_the_test_codes():
+    """S3V8-4: codes of points 271..370 compared with the test file, bit for bit: swapped codes,
+    a NaN, or -0.0 for 0.0 are caught."""
+    rows, tp = _design_rows(), s3.check_test_points()
+    i271, i272 = (next(i for i, r in enumerate(rows) if r['point_id'] == p) for p in (271, 272))
+    bad = [dict(r) for r in rows]
+    for k in range(1, 8):
+        bad[i271][f'X{k}'], bad[i272][f'X{k}'] = rows[i272][f'X{k}'], rows[i271][f'X{k}']
+    with pytest.raises(s3.S03Stop, match='point 271'):
+        s3.check_design_map(bad, tp)
+    bad = [dict(r) for r in rows]
+    bad[i272]['X1'] = float('nan')
+    with pytest.raises(s3.S03Stop, match='point 272'):
+        s3.check_design_map(bad, tp)
+    i0 = next(i for i, r in enumerate(rows) if r['point_id'] == 0)
+    bad = [dict(r) for r in rows]
+    bad[i0]['X4'] = -0.0                                        # equal to 0.0 as a number, not as bits
+    with pytest.raises(s3.S03Stop, match='point 0'):
+        s3.check_design_map(bad, tp)
+
+
+def test_v8_latin_bins_use_exact_decimal_bounds(tmp_path):
+    """S3V8-5 (Codex counterexample): in X1, the points of bins 57 [0.12, 0.14) and 58 [0.14, 0.16)
+    become 0.14 and 0.14000000000000012: both are in bin 58, bin 57 is empty. Float bounds
+    (-1 + 0.02 * 57 = 0.14000000000000012) counted one point in each bin."""
+    rows = open(s3.TEST_POINTS, encoding='utf-8').read().splitlines()
+    head, body = rows[0], [r.split(',') for r in rows[1:]]
+    x1 = [float(r[2]) for r in body]
+    j57 = next(j for j, x in enumerate(x1) if 0.12 <= x < 0.14)
+    j58 = next(j for j, x in enumerate(x1) if 0.14 < x < 0.16)
+    assert -1.0 + 0.02 * 57 == 0.14000000000000012                # the rounding is really there
+    body[j57][2], body[j58][2] = repr(0.14), repr(0.14000000000000012)
+    text = '\n'.join([head] + [','.join(r) for r in body]) + '\n'
+    with pytest.raises(s3.S03Stop, match='bin 57'):
+        s3.check_test_points_text(text)
+    assert s3._latin_bin(0.14) == 58 and s3._latin_bin(np.nextafter(0.14, -1)) == 57
+    assert s3._latin_bin(-1.0) == 1 and s3._latin_bin(np.nextafter(1.0, -2)) == 100 and s3._latin_bin(1.0) == 101
+    assert s3._latin_bin(-0.0) == s3._latin_bin(0.0) == 51
+
+
+def _git(d, *args):
+    import subprocess
+    r = subprocess.run(['git', '-C', str(d), '-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'core.autocrlf=false']
+                       + list(args), capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    return r.stdout
+
+
+def _repo_with_test_file(tmp_path, gen_sha=None):
+    """A git repo holding a copy of the test file (bytes as in this work tree) and its .gen.json."""
+    import hashlib
+    import json as _json
+    d = tmp_path / 'repo'
+    d.mkdir(parents=True)
+    _git(d, 'init', '-q')
+    raw = open(s3.TEST_POINTS, 'rb').read()
+    (d / 'tp.csv').write_bytes(raw)
+    gen = dict(seed=20261107, sha256=gen_sha or hashlib.sha256(raw).hexdigest())
+    (d / 'tp.gen.json').write_text(_json.dumps(gen), encoding='utf-8')
+    _git(d, 'add', 'tp.csv', 'tp.gen.json')
+    _git(d, 'commit', '-q', '-m', 'test file')
+    return d
+
+
+def test_v8_load_test_points_committed_file():
+    """S3V8-3: the committed file passes; the two SHA-256 are of the bytes read; the generation
+    record is the one beside the file; content equal to HEAD after CRLF -> LF."""
+    import hashlib
+    pts, info = s3.load_test_points()
+    raw = open(s3.TEST_POINTS, 'rb').read()
+    assert pts == s3.check_test_points()
+    assert info['sha256'] == hashlib.sha256(raw).hexdigest()
+    assert info['sha256_lf'] == hashlib.sha256(raw.replace(b'\r\n', b'\n')).hexdigest()
+    assert info['matches_head_blob_lf'] and info['generation_sha256_matches'] and info['problems'] == []
+    assert info['generation']['sha256'] in (info['sha256'], info['sha256_lf'])
+    assert info['generation_file'].endswith('s03_test_points.gen.json')
+
+
+def test_v8_load_test_points_assume_unchanged_is_caught(tmp_path):
+    """S3V8-3 (Codex counterexample): tracked file marked assume-unchanged, one code moved inside
+    the same Latin bin: git status is clean and condition 7 passes, the HEAD blob differs -> stop."""
+    d = _repo_with_test_file(tmp_path)
+    p = d / 'tp.csv'
+    s3.load_test_points(str(p))                                  # as committed: passes
+    _git(d, 'update-index', '--assume-unchanged', 'tp.csv')
+    raw = p.read_bytes()
+    first = raw.split(b'\n')[1].split(b',')[2]                   # X1 of point 271
+    new = repr(float(first) + 1e-6).encode()
+    assert s3._latin_bin(float(new)) == s3._latin_bin(float(first))
+    p.write_bytes(raw.replace(first, new, 1))
+    assert _git(d, 'status', '--porcelain').strip() == ''        # git status does not see it
+    s3.check_test_points(str(p))                                 # condition 7 still passes
+    with pytest.raises(s3.S03Stop, match='blob in HEAD'):
+        s3.load_test_points(str(p))
+    _, info = s3.load_test_points(str(p), trial=True)            # --trial: recorded, not a stop
+    assert any('blob in HEAD' in x for x in info['problems'])
+
+
+def test_v8_load_test_points_eol_and_own_generation_record(tmp_path):
+    """S3V8-3: LF bytes on disk (blob LF) pass when the record has the LF SHA-256; the record
+    read is <name>.gen.json beside the file given, not the default one; a wrong sha256 stops."""
+    import hashlib
+    d = _repo_with_test_file(tmp_path)
+    p = d / 'tp.csv'
+    lf = p.read_bytes().replace(b'\r\n', b'\n')
+    p.write_bytes(lf)
+    (d / 'tp.gen.json').write_text('{"seed": 1, "sha256": "%s"}' % hashlib.sha256(lf).hexdigest(), encoding='utf-8')
+    _git(d, 'add', 'tp.csv', 'tp.gen.json')
+    _git(d, 'commit', '-q', '-m', 'lf')
+    _, info = s3.load_test_points(str(p))
+    assert info['generation']['seed'] == 1 and info['sha256'] == info['sha256_lf']
+    d2 = _repo_with_test_file(tmp_path / 'b', gen_sha='0' * 64)
+    with pytest.raises(s3.S03Stop, match='generation record'):
+        s3.load_test_points(str(d2 / 'tp.csv'))
+    (d2 / 'tp.gen.json').unlink()
+    _git(d2, 'commit', '-q', '-am', 'no record')
+    with pytest.raises(s3.S03Stop, match='generation record'):
+        s3.load_test_points(str(d2 / 'tp.csv'))
 
 
 def test_v8_bounds_check():
@@ -917,7 +1150,7 @@ def test_v8_run_error_in_the_test_set_stays_in_sealed_test(tmp_path, monkeypatch
     the test set); the reason is only in sealed_test/stop.json; the console says only that S03
     stopped in the test set."""
     import json as _json
-    code, out, console, _, _ = _run_main(tmp_path, monkeypatch, capsys, error_in_test=True)
+    code, out, console, calls, _ = _run_main(tmp_path, monkeypatch, capsys, error_in_test=True)
     assert code == 2
     assert 'FakeTestError' not in console and 'sealed_test/stop.json' in console
     assert not (out / 'sealed' / 'stop.json').exists()
@@ -925,8 +1158,33 @@ def test_v8_run_error_in_the_test_set_stays_in_sealed_test(tmp_path, monkeypatch
     man = _json.load(open(out / 'sealed' / 'manifest.json'))
     for name, sha in man['files'].items():                     # sealed/ as closed before the test set
         assert s3.sha256_file(str(out / 'sealed' / name)) == sha
+    assert calls.seen['sealed_before_test'] == calls.seen['sealed_after']      # S3V8-6: whole tree
     meta = (out / 'meta.yaml').read_text(encoding='utf-8')
     assert 'stopped in the test set' in meta and 'FakeTestError' not in meta
+
+
+@needs_dll
+@pytest.mark.parametrize('mode', ['warn', 'raise'])
+def test_v8_test_phase_diagnostics_stay_in_sealed_test(tmp_path, monkeypatch, capsys, mode):
+    """S3V8-2: a warning or a print of a test run, or an exception that is not S03Stop, leaves
+    nothing on the console or stderr; it is in sealed_test/diag.txt (and stop.json for the
+    exception); sealed/ unchanged."""
+    code, out, console, calls, _ = _run_main(tmp_path, monkeypatch, capsys, error_in_test=mode)
+    err = calls.seen['stderr']
+    for word in ('FakeTest', 'p271', 'Traceback'):
+        assert word not in console and word not in err
+    diag = (out / 'sealed_test' / 'diag.txt').read_text(encoding='utf-8')
+    man = (out / 'sealed_test' / 'manifest.json').read_text()
+    assert 'diag.txt' in man
+    if mode == 'warn':
+        assert code == 0 and 'FakeTestWarning' in diag and 'FakeTestPrint' in diag
+        assert diag.count('warning: RuntimeWarning: FakeTestWarning') == 2 * 100 * 3
+    else:
+        assert code == 2 and 'sealed_test/stop.json' in console
+        assert 'FakeTestOSError' in (out / 'sealed_test' / 'stop.json').read_text()
+        assert 'Traceback' in diag and 'FakeTestOSError' in diag
+        assert 'stopped in the test set' in (out / 'meta.yaml').read_text(encoding='utf-8')
+    assert calls.seen['sealed_before_test'] == calls.seen['sealed_after']
 
 
 @needs_dll

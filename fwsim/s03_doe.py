@@ -64,6 +64,7 @@ are in meta.yaml 'interpretations'.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import hashlib
 import io
@@ -76,6 +77,10 @@ import struct
 import subprocess
 import sys
 import time
+import traceback
+import warnings
+from collections import Counter
+from fractions import Fraction
 
 import numpy as np
 
@@ -294,21 +299,37 @@ def make_test_points(path=TEST_POINTS, gen_path=TEST_POINTS_GEN):
     return gen
 
 
+def _parse_test_points(text):
+    """Rows of the test-set text as [test_id(str), point_id(str), X1..X7 (float)]; header checked.
+    CRLF or LF: the csv module reads both the same."""
+    rd = csv.reader(io.StringIO(text, newline=''))
+    head = next(rd, None)
+    if head != TEST_COLS:
+        raise S03Stop(f'test points: columns {head} are not {TEST_COLS} (S03 v8 section 8.7)')
+    return [r[:2] + [float(x) for x in r[2:]] for r in rd]
+
+
 def read_test_points_raw(path):
-    """Rows of the test-set file as [test_id(str), point_id(str), X1..X7 (float)]; header checked."""
-    with open(path, newline='', encoding='utf-8') as f:
-        rd = csv.reader(f)
-        head = next(rd, None)
-        if head != TEST_COLS:
-            raise S03Stop(f'test points: columns {head} are not {TEST_COLS} (S03 v8 section 8.7)')
-        return [r[:2] + [float(x) for x in r[2:]] for r in rd]
+    """Rows of the test-set file (see _parse_test_points)."""
+    with open(path, 'rb') as f:
+        return _parse_test_points(f.read().decode('utf-8'))
 
 
-def check_test_points(path=TEST_POINTS):
-    """S03 v8 section 8 condition 7: 100 rows, test_id 1..100 and point_id 271..370 in order and
-    unique, every code finite in [-1, 1], one point of every column in each bin
-    [-1 + 0.02 (i - 1), -1 + 0.02 i), i = 1..100. Returns [(point_id, codes)]; raises S03Stop."""
-    rows = read_test_points_raw(path)
+LATIN_STEP = Fraction(1, 50)      # bin width 0.02, exact (S3V8-5)
+
+
+def _latin_bin(x):
+    """Index i of the bin [-1 + 0.02 (i - 1), -1 + 0.02 i) holding the binary64 value x, compared
+    with the exact decimal bounds (Fraction of the binary64, no rounding, no epsilon; S3V8-5)."""
+    return math.floor((Fraction(float(x)) + 1) / LATIN_STEP) + 1
+
+
+def check_test_points_text(text):
+    """S03 v8 section 8 condition 7 on the text of the test-set file: 100 rows, test_id 1..100 and
+    point_id 271..370 in order and unique, every code finite in [-1, 1], one point of every column
+    in each bin [-1 + 0.02 (i - 1), -1 + 0.02 i), i = 1..100 (exact bounds). Returns
+    [(point_id, codes)]; raises S03Stop."""
+    rows = _parse_test_points(text)
     if len(rows) != N_TEST:
         raise S03Stop(f'test points: {len(rows)} rows, not {N_TEST} (S03 v8 section 8.7)')
     for j, r in enumerate(rows, start=1):
@@ -319,22 +340,97 @@ def check_test_points(path=TEST_POINTS):
     if codes.shape != (N_TEST, 7) or not np.all(np.isfinite(codes)) or np.any(np.abs(codes) > 1.0):
         raise S03Stop('test points: a code is not finite or not in [-1, 1] (S03 v8 section 8.7)')
     for k in range(7):
+        n_in = Counter(_latin_bin(x) for x in codes[:, k])
         for i in range(1, N_TEST + 1):
-            lo, hi = -1.0 + 0.02 * (i - 1), -1.0 + 0.02 * i
-            n = int(np.sum((codes[:, k] >= lo) & (codes[:, k] < hi)))
-            if n != 1:
-                raise S03Stop(f'test points: X{k + 1} has {n} points in bin {i} [{lo}, {hi}) (S03 v8 section 8.7)')
+            if n_in.get(i, 0) != 1:
+                lo, hi = -1 + LATIN_STEP * (i - 1), -1 + LATIN_STEP * i
+                raise S03Stop(f'test points: X{k + 1} has {n_in.get(i, 0)} points in bin {i} '
+                              f'[{float(lo)}, {float(hi)}) (S03 v8 section 8.7)')
     return [(TEST_FIRST - 1 + j, tuple(float(x) for x in codes[j - 1])) for j in range(1, N_TEST + 1)]
 
 
-def check_design_map(rows):
+def check_test_points(path=TEST_POINTS):
+    """check_test_points_text on the file at path."""
+    with open(path, 'rb') as f:
+        return check_test_points_text(f.read().decode('utf-8'))
+
+
+def test_points_gen_path(path):
+    """The generation record beside a test-set file: <name>.csv -> <name>.gen.json."""
+    return os.path.splitext(path)[0] + '.gen.json'
+
+
+def _head_blob(p):
+    """Bytes of the file p in the commit HEAD of its repository (git show HEAD:./<name>, run in
+    the folder of p), or None when there is no such blob (not in git, not committed)."""
+    try:
+        r = subprocess.run(['git', '-C', os.path.dirname(os.path.abspath(p)), 'show',
+                            'HEAD:./' + os.path.basename(p)], capture_output=True)
+    except OSError:
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def _rel_here(p):
+    return _rel_or_abs(p, os.path.join(HERE, '..'))
+
+
+def load_test_points(path=TEST_POINTS, trial=False):
+    """S03 v8 sections 7, 8 condition 7 (S3V8-3): the bytes of the test-set file are read ONCE,
+    before the main design. From those bytes: the SHA-256 of the bytes as read and of the same
+    bytes with CRLF -> LF (git keeps LF, the work tree may hold CRLF), the CSV and its checks
+    (check_test_points_text). The content must equal the blob of the file in HEAD, both after
+    CRLF -> LF (git status alone is not evidence: assume-unchanged hides a change). The
+    generation record is <name>.gen.json beside this very file; its sha256 must be one of the
+    two SHA-256 above. Without --trial a failed git / generation check stops S03; with --trial it
+    is recorded in 'problems'. Returns (points, info for meta.yaml)."""
+    with open(path, 'rb') as f:
+        raw = f.read()
+    lf = raw.replace(b'\r\n', b'\n')
+    info = dict(file=_rel_here(path), sha256=hashlib.sha256(raw).hexdigest(),
+                sha256_lf=hashlib.sha256(lf).hexdigest(), git=file_git_state(path))
+    pts = check_test_points_text(raw.decode('utf-8'))
+    blob = _head_blob(path)
+    info['head_blob_sha256'] = hashlib.sha256(blob).hexdigest() if blob is not None else None
+    info['matches_head_blob_lf'] = blob is not None and blob.replace(b'\r\n', b'\n') == lf
+    gen_path, gen = test_points_gen_path(path), None
+    if os.path.isfile(gen_path):
+        try:
+            with open(gen_path, 'rb') as f:
+                gen = json.loads(f.read().decode('utf-8'))
+        except (ValueError, UnicodeDecodeError) as exc:
+            gen = dict(unreadable=f'{type(exc).__name__}: {exc}')
+    info['generation_file'] = _rel_here(gen_path)
+    info['generation'] = gen
+    info['generation_sha256_matches'] = bool(isinstance(gen, dict) and
+                                             gen.get('sha256') in (info['sha256'], info['sha256_lf']))
+    problems = []
+    if not (info['git']['tracked'] and info['git']['clean']):
+        problems.append('not committed / modified (git status)')
+    if not info['matches_head_blob_lf']:
+        problems.append('content differs from the blob in HEAD (compared after CRLF -> LF)')
+    if not info['generation_sha256_matches']:
+        problems.append(f'generation record {info["generation_file"]} missing, unreadable or its sha256 is '
+                        f'not the SHA-256 of the file read')
+    info['problems'] = problems
+    if problems and not trial:
+        raise S03Stop(f'{path}: ' + '; '.join(problems) + ' (S03 v8 sections 7, 8.7)')
+    return pts, info
+
+
+def check_design_map(rows, test_pts):
     """S03 v8 section 11 item 4: point_id - box - codes of design.csv, per controller, not only the
     row count: 371 rows, ids 0..370 unique, the box of each id, the codes of centre / outer /
-    inner / axial points as the design defines them, test codes as in the test file."""
+    inner / axial points as the design defines them, the codes of the 100 test points as in the
+    test file read (test_pts: [(point_id, codes)]); codes compared bit for bit (S3V8-4)."""
     expect = {0: ('centre', (0.0,) * 7)}
     expect.update({p: ('outer', c) for p, c in design_points(1.0, 1)})
     expect.update({p: ('inner', c) for p, c in design_points(0.5, 129)})
     expect.update({p: ('axial', c) for p, c in axial_points()})
+    test_ids = [p for p, _ in test_pts]
+    if test_ids != list(range(TEST_FIRST, TEST_FIRST + N_TEST)):
+        raise S03Stop(f'test points given to the design check are not ids {TEST_FIRST}..{TEST_FIRST + N_TEST - 1}')
+    expect.update({p: ('test', c) for p, c in test_pts})
     by_ctrl = {}
     for r in rows:
         by_ctrl.setdefault(r['controller'], []).append(r)
@@ -344,12 +440,8 @@ def check_design_map(rows):
             raise S03Stop(f'{ctrl}: design.csv has {len(rs)} rows / ids not 0..370 unique (S03 v8 section 8.7)')
         for r in rs:
             pid, codes = int(r['point_id']), tuple(float(r[f'X{k}']) for k in range(1, 8))
-            if pid >= TEST_FIRST:
-                if r['box'] != 'test':
-                    raise S03Stop(f'{ctrl}: point {pid} is {r["box"]}, not test (S03 v8 section 11.4)')
-                continue
             box, want = expect[pid]
-            if r['box'] != box or codes != want:
+            if r['box'] != box or [_float_bits(x) for x in codes] != [_float_bits(x) for x in want]:
                 raise S03Stop(f'{ctrl}: point {pid} is {r["box"]} {codes}, expected {box} {want} (S03 v8 11.4)')
 
 
@@ -680,6 +772,7 @@ def main():
     y3_ref, rerun_notes, inner_rule, no_concl = {}, [], {}, {}
     stop_public, stop_sealed = None, None
     t_sweep_end = None
+    tp_info = None                                    # S3V8-3: set when the test file is read (once)
 
     def checked(ctrl, g, v, mu, ids=None, sink=None, work=None, notes_to=None):
         """One run; a run_error is recorded (S3C-12), rerun once in a new process for diagnosis
@@ -774,10 +867,8 @@ def main():
         # follow from the public levels and the committed test file only, so design.csv does not
         # depend on a stop (S3C-3 (c)); v8: 371 rows per controller incl. axial and test points
         try:
-            tp_state = file_git_state(a.test_points)
-            if not (tp_state['tracked'] and tp_state['clean']) and not a.trial:
-                raise S03Stop(f'{a.test_points} is not committed / is modified ({tp_state}; S03 v8 section 8.7)')
-            test_pts = check_test_points(a.test_points)                 # section 8 condition 7
+            # S3V8-3: the file is read once here; its SHA-256 is fixed from those bytes
+            test_pts, tp_info = load_test_points(a.test_points, trial=a.trial)   # section 8 condition 7
             for ctrl in a.controllers:
                 lv = levels[ctrl]
 
@@ -794,7 +885,7 @@ def main():
                                             **{f'X{k + 1}': c for k, c in enumerate(codes)},
                                             **{f'{n}_value': v_ for n, v_ in gains_at(codes).items()}))
                 plan[ctrl] = (gains_at, centre_codes, outer, inner, axial, test_pts)
-            check_design_map(design_rows)                                # section 11 item 4: id - box - codes
+            check_design_map(design_rows, test_pts)                      # section 11 item 4: id - box - codes
         except S03Stop as exc:
             stop_public = f'before the main design: {exc}'
             print(f'[STOP] {stop_public}', flush=True)
@@ -873,6 +964,11 @@ def main():
             print('[STOP] S03 stopped in the main design; the reason is in sealed/stop.json (L56)', flush=True)
 
     t_end = time.time()
+    # S3V8-1: the empty work folders of the sweep and of the main design are removed BEFORE sealed/
+    # is written and closed; after the manifest only sealed_test/ changes
+    for d in (work_pub, work_sealed):
+        if os.path.isdir(d) and not os.listdir(d):
+            os.rmdir(d)
     # sealed outputs, with their own manifest (no hash of a sealed file outside sealed/, S3C-1)
     sealed_files = {}
     for name, rows, cols in (('runs.csv', all_runs, RUN_COLS), ('effects.csv', eff_rows, None),
@@ -905,23 +1001,42 @@ def main():
         test_logs = os.path.join(sealed_test, 'logs')
         t_test0 = time.time()
         print('[test set] running the test points (results sealed in sealed_test/, S03 v8 section 7)', flush=True)
-        try:
-            for ctrl in a.controllers:
-                gains_at, test_pts = plan[ctrl][0], plan[ctrl][5]
-                for pid, codes in test_pts:
-                    g = gains_at(codes)
-                    for v in SPEEDS:
-                        row, log = checked(ctrl, g, v, mu_mid, ids=(pid, 'test'), sink=test_rows, work=work_test,
-                                           notes_to=test_notes)
-                        test_rows.append(dict(controller=ctrl, point_id=pid, box='test', mu=mu_mid, v=v, **row))
-                        data = npz_bytes(log)             # same work for every run (S3E-1)
-                        if row['completed'] != 'true':    # logs kept by the rule of section 7
-                            save_log(test_logs, f'{ctrl}_p{pid}_mu{mu_mid}_v{v}', log, data)
-        except S03Stop as exc:
-            stop_test = str(exc)
+        # S3V8-2: every warning, print and traceback of the test phase goes to sealed_test/diag.txt,
+        # any exception of the phase is a stop recorded in sealed_test/stop.json; the console only
+        # says that S03 stopped in the test set (the DLL does not print: fwsim/shim/esp_log.h)
+        diag = io.StringIO()
+        with warnings.catch_warnings(record=True) as caught, contextlib.redirect_stdout(diag), \
+                contextlib.redirect_stderr(diag):
+            warnings.simplefilter('always')
+            try:
+                for ctrl in a.controllers:
+                    gains_at, test_pts = plan[ctrl][0], plan[ctrl][5]
+                    for pid, codes in test_pts:
+                        g = gains_at(codes)
+                        for v in SPEEDS:
+                            row, log = checked(ctrl, g, v, mu_mid, ids=(pid, 'test'), sink=test_rows,
+                                               work=work_test, notes_to=test_notes)
+                            test_rows.append(dict(controller=ctrl, point_id=pid, box='test', mu=mu_mid, v=v,
+                                                  **row))
+                            data = npz_bytes(log)             # same work for every run (S3E-1)
+                            if row['completed'] != 'true':    # logs kept by the rule of section 7
+                                save_log(test_logs, f'{ctrl}_p{pid}_mu{mu_mid}_v{v}', log, data)
+            except S03Stop as exc:
+                stop_test = str(exc)
+            except Exception as exc:          # noqa: BLE001 (S3V8-2: any failure of the phase stays sealed)
+                stop_test = f'{type(exc).__name__}: {exc}'
+                traceback.print_exc(file=diag)
+        if stop_test:
             print('[STOP] S03 stopped in the test set; the reason is in sealed_test/stop.json', flush=True)
         test_s = round(time.time() - t_test0)
+        if os.path.isdir(work_test) and not os.listdir(work_test):    # before sealed_test/manifest.json
+            os.rmdir(work_test)
         test_files = {}
+        with open(os.path.join(sealed_test, 'diag.txt'), 'w', encoding='utf-8') as f:
+            f.write(diag.getvalue())
+            for w_ in caught:
+                f.write(f'warning: {w_.category.__name__}: {w_.message} ({w_.filename}:{w_.lineno})\n')
+        test_files['diag.txt'] = sha256_file(os.path.join(sealed_test, 'diag.txt'))
         p = os.path.join(sealed_test, 'runs_test.csv')
         write_csv(p, test_rows, RUN_COLS)
         test_files['runs_test.csv'] = sha256_file(p)
@@ -951,11 +1066,9 @@ def main():
     status = ('stopped in the sweep: ' + stop_public if stop_public else
               'stopped in the main design (reason sealed)' if stop_sealed else
               'stopped in the test set (reason in sealed_test/)' if stop_test else 'ran to the end')
-    tp_sha = sha256_file(a.test_points) if os.path.exists(a.test_points) else None
-    tp_gen = {}
-    if os.path.exists(TEST_POINTS_GEN):
-        with open(TEST_POINTS_GEN, encoding='utf-8') as f:
-            tp_gen = json.load(f)
+    # S3V8-3: what was read before the main design, not a second read of the file now
+    tp_meta = tp_info if tp_info is not None else dict(file=_rel_here(a.test_points),
+                                                         read='no (S03 stopped before the test file was read)')
     with open(os.path.join(a.out, 'meta.yaml'), 'w', encoding='utf-8') as f:
         f.write(f"""spec: S03 v8 (06_SPECS/2026-11-05_Spec_S03_DOE_chon_gain.md)
 date: {time.strftime('%Y-%m-%d')}
@@ -990,11 +1103,7 @@ y3_reference: {json.dumps({f'{c} v={v}': y for (c, v), y in y3_ref.items()})}
 o1: {json.dumps(dict(A=o1.A, a_r=o1.A_R, D=o1.D, D_d=o1.D, t_d=o1.T_D, t_late=o1.T_LATE, delta=o1.DELTA, v_d=o1.V_D, c_cens=o1.C_CENS))}
 sweep_run_error_reruns: {json.dumps([n for n in rerun_notes if n['point'] is None], default=str)}
 planned_runs_per_controller: {json.dumps(PLANNED_RUNS)}   # S03 v8 3.2, 7 (rows actually run: sealed/, sealed_test/)
-test_points:            # S03 v8 sections 3.2, 7, 8.7: the committed file is the reference
-  file: {json.dumps(_rel_or_abs(a.test_points, os.path.join(HERE, '..')))}
-  git: {json.dumps(file_git_state(a.test_points))}
-  sha256: {tp_sha}
-  generation: {json.dumps(tp_gen)}
+test_points: {json.dumps(tp_meta)}   # S03 v8 3.2, 7, 8.7 (S3V8-3): read once before the main design; sha256 of the bytes read, sha256_lf after CRLF -> LF, matches_head_blob_lf, generation from <name>.gen.json beside the file
 test_set: {json.dumps('not run (S03 stopped before it)' if (stop_public or stop_sealed) else 'sealed in sealed_test/ (not looked at before the RSM coefficients are saved, S03 v8 section 7)')}
 interpretations:   # of this script, not written in S03 v8 / O1 v7; Liam or THESIS correct if wrong
   - "completion: conditions 1, 5 at the instant, conditions 2 and 3 together as the trailing unbroken t_d window (condition 2 over the window: L63 (2), Liam 07/11), condition 4 strictly before the deadline; after a tracking error that came before the progress, the window runs to the deadline (o1_feasibility.evaluate_v7)"
@@ -1008,7 +1117,8 @@ interpretations:   # of this script, not written in S03 v8 / O1 v7; Liam or THES
   - "the upper-end tracking flag uses the 400 001-point path grid (about 15 um); at s = S the window is cut by the end of the path, not flagged (Codex S3C-5, deferred)"
   - "v8: run order per controller centre, outer, inner, axial (3 mu x 3 speeds each), then determinism and analysis; sealed/ is written and closed after every controller; then the test set of every controller (middle mu x 3 speeds); a stop before the test set means the test set does not run"
   - "v8: test-set logs follow the rule of section 7 (npz of every run not completed; there is no centre point in the test set); the compressed npz is made for every run (same work)"
-  - "v8: the test-points file must be tracked and unmodified in git (section 8.7 'committed'); with --trial an uncommitted file is allowed and recorded in test_points.git"
+  - "v8: the test-points file is read once before the main design (S3V8-3); 'committed' (section 8.7) = tracked, unmodified for git status AND the bytes read match the blob in HEAD after CRLF -> LF of both; its generation record is <name>.gen.json beside the file read, with the sha256 of the bytes read or of their LF form; with --trial a failed check is allowed and recorded in test_points.problems"
+  - "v8 (S3V8-2): warnings, prints and tracebacks of the test phase go to sealed_test/diag.txt and any exception of the phase is a stop recorded in sealed_test/stop.json; the same channel in the main design (warnings to the console) is left as before (deferred, Codex S3V8-2)"
   - "v8: n_upper_frames, n_back_frames count the frames evaluate_v7 kept for scoring (t_k <= t_end), as section 4 defines them; they are diagnostics, never responses"
 elapsed_s: {sweep_s}
 file_sha256: {json.dumps(files)}
@@ -1019,11 +1129,8 @@ files:
   - design.csv: "371 rows per controller: centre, outer box, inner box, axial points, test points (all run, L41, L67)"
   - logs_sweep/: "npz of the sweep runs not completed"
   - sealed/: "SEALED (L56): runs.csv (section 4 responses; centre, outer, inner, axial), effects.csv (every term, per box, response, speed, mu / worst / range; outer and inner only), curvature.csv (5.4), y2_versions.csv (5.1), fail_counts.csv (5.3), determinism_check.csv (3.4), notes.json, stop.json, manifest.json, logs/"
-  - sealed_test/: "SEALED separately (S03 v8 section 7): runs_test.csv, logs/, notes.json, stop.json, manifest.json; opened only after the RSM coefficients at the middle mu are saved and committed"
+  - sealed_test/: "SEALED separately (S03 v8 section 7): runs_test.csv, logs/, notes.json, stop.json, diag.txt (warnings, prints, traceback of the test phase), manifest.json; opened only after the RSM coefficients at the middle mu are saved and committed"
 """)
-    for d in (work_pub, work_sealed, work_test):
-        if os.path.isdir(d) and not os.listdir(d):
-            os.rmdir(d)
     print(f'S03 finished -> {a.out}; status: {status}')
     return 0 if not (stop_public or stop_sealed or stop_test) else 2
 
