@@ -14,6 +14,7 @@
 static USART_TypeDef *volatile _u;     /* NULL until init succeeded */
 static volatile uint8_t _gate;
 static volatile uint8_t _swa;          /* I8: SWA asked by the RPi5 (MOSI byte 20 bit 3) */
+static volatile uint8_t _tmo;          /* I8-R2-1: link timeout seen by the tick, latched until taken */
 static ibus_gen_t _gen;
 
 static int _tx_room(void)
@@ -91,8 +92,14 @@ void IbusPort_Tick(void)
     /* I8-4: a link timeout seen here drops the SWA command at once, so a frame
      * that arrives before the main loop ran its link-lost branch cannot start
      * an iBUS frame with the SWA of the old link period. The main loop sets it
-     * again from the new frames (after its filter, also reset on a gap). */
-    if (age_ms > IBUS_LINK_TIMEOUT_MS) _swa = 0u;
+     * again from the new frames, after its filter. I8-R2-1: the same timeout
+     * is latched in _tmo, so the main loop restarts its filter before the
+     * first frame after it (IbusPort_TakeTimeout); a short gap without a
+     * timeout no longer touches the filter. */
+    if (age_ms > IBUS_LINK_TIMEOUT_MS) {
+        _swa = 0u;
+        _tmo = 1u;
+    }
     ibus_gen_tick(&_gen, _now_us(), on, _swa);
 }
 
@@ -104,6 +111,16 @@ void IbusPort_SetEnabled(int on)
 void IbusPort_SetSwa(int on)
 {
     _swa = on ? 1u : 0u;
+}
+
+int IbusPort_TakeTimeout(void)
+{
+    /* Main loop only. The tick (higher priority) can set _tmo again between
+     * the read and the clear: that set is for the same timeout, already
+     * reported by this call, so losing it is harmless. */
+    if (!_tmo) return 0;
+    _tmo = 0u;
+    return 1;
 }
 
 int IbusPort_LastSwa(void)

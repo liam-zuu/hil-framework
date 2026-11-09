@@ -207,8 +207,9 @@ def test_lock_never_free_ends_in_error_heartbeat():
     box._a.get_lock = lambda: HeldLock()
     node, sent, _, _ = run_node(box=box, beat=False)
     s = node.lifecycle_summary()
-    # one lifecycle step per frame up to END; the END_TAIL_FRAMES after it have none (I8-5)
-    assert s['outcome'] == 'error:heartbeat' and s['lock_misses'] == len(sent) - END_TAIL_FRAMES
+    # one lifecycle step per frame up to END; the tail frames after it have none (I8-5, I8-R2-2)
+    assert s['outcome'] == 'error:heartbeat' and s['lock_misses'] == len(sent) - s['swa_tail_sent']
+    assert s['swa_tail_sent'] >= END_TAIL_FRAMES and s['swa_tail_complete'] is True
     zeros_every_20([f for f in sent if f[0] == STOPPING])
 
 
@@ -359,11 +360,87 @@ def test_swa_end_tail_frames_off_without_publisher(tmp_path):
     # I8-5: after END the loop sends END_TAIL_FRAMES more frames, SWA off, no new setpoint
     node, sent, plant, _ = run_node(tmp_path, event=done_after(0.08), swa_mode='phase')
     end = [f for f in sent if f[0] == END]
-    assert len(end) == 1 + END_TAIL_FRAMES                  # the END step + the tail
+    s = node.lifecycle_summary()
+    assert len(end) == 1 + s['swa_tail_sent'] and s['swa_tail_sent'] >= END_TAIL_FRAMES   # END step + tail
+    assert s['swa_tail_complete'] is True
     assert all(_swa(m) == 0 and m[OFS_TRAJ_FLAGS] == 0 for _, _, m in end)
     assert end[-1][1] > end[0][1]                           # the plant keeps stepping in the tail
-    assert node.lifecycle_summary()['outcome'] == 'completed' and not node.run_failed
-    assert len(np.load(tmp_path / 'f.npz')['mosi']) == len(sent)
+    assert s['outcome'] == 'completed' and not node.run_failed
+    d = np.load(tmp_path / 'f.npz')
+    assert len(d['mosi']) == len(sent)
+    import json
+    m = json.loads(str(d['manifest']))                      # I8-R2-3: the tail is in the manifest too
+    assert (m['swa_tail_sent'], m['swa_tail_complete']) == (s['swa_tail_sent'], True)
+    assert m['lifecycle']['swa_tail_complete'] is True
+
+
+def _no_wait_in_tail(node):
+    """The timer catching up on late deadlines: the tail frames go out back to back (I8-R2-2)."""
+    real = node._timer.wait_next_tick
+    node._timer.wait_next_tick = lambda: 0 if node._end_seen else real()
+
+
+def _run_hooked(monkeypatch, hook, *args, **kw):
+    """run_node with `hook(node)` called on the node right after it is built."""
+    real_init = HILNode.__init__
+
+    def init(self, *a, **k):
+        real_init(self, *a, **k)
+        hook(self)
+    monkeypatch.setattr(HILNode, '__init__', init)
+    return run_node(*args, **kw)
+
+
+def test_swa_end_tail_lasts_its_time_when_frames_come_back_to_back(tmp_path, monkeypatch):
+    # I8-R2-2 (Codex round 2): 30 frames sent back to back are not 30 ms; the tail must still last
+    # 30 ms (the design value, written here on purpose, not read from hil_node) on the send clock, from
+    # the END frame to the last tail frame
+    node, sent, _, _ = _run_hooked(monkeypatch, _no_wait_in_tail, tmp_path, event=done_after(0.08),
+                                   swa_mode='phase')
+    t = np.load(tmp_path / 'f.npz')['t_send_ns']
+    end = [i for i, f in enumerate(sent) if f[0] == END]
+    assert t[end[-1]] - t[end[0]] >= 30_000_000
+    s = node.lifecycle_summary()
+    assert s['swa_tail_complete'] is True and s['swa_tail_sent'] >= END_TAIL_FRAMES
+
+
+def _cut_tail_after(n):
+    """max_steps lands n frames into the tail (the loop checks it before each frame)."""
+    def hook(node):
+        real = node._timer.wait_next_tick
+
+        def wait():
+            if node._end_seen and node.cfg.max_steps == 3000:
+                node.cfg.max_steps = node._step + n
+            return real()
+        node._timer.wait_next_tick = wait
+    return hook
+
+
+def test_swa_end_tail_cut_is_recorded(tmp_path, monkeypatch):
+    # I8-R2-3: max_steps reached inside the tail: the run ends without its tail, and says so
+    node, sent, _, _ = _run_hooked(monkeypatch, _cut_tail_after(5), tmp_path, event=done_after(0.08),
+                                   swa_mode='phase')
+    s = node.lifecycle_summary()
+    assert s['outcome'] == 'completed' and node._stop_reason == 'completed'
+    assert len([f for f in sent if f[0] == END]) == 1 + 5
+    assert s['swa_tail_complete'] is False and s['swa_tail_sent'] == 5
+    import json
+    m = json.loads(str(np.load(tmp_path / 'f.npz')['manifest']))
+    assert m['swa_tail_complete'] is False and m['swa_tail_sent'] == 5
+
+
+def test_swa_no_end_no_tail():
+    # SIGTERM-like stop before END (here: max_steps in RUN): no tail at all, recorded as not complete
+    node, sent, _, _ = run_node(swa_mode='phase', run_s=5.0)  # cut by max_steps 3000 long before END
+    s = node.lifecycle_summary()
+    assert END not in phases(node) and s['swa_tail_sent'] == 0 and s['swa_tail_complete'] is False
+
+
+def test_swa_tail_none_without_lifecycle():
+    node = HILNode(MockPlant(), HILConfig(simulate_hw=True, max_steps=20))
+    node.run()
+    assert node.swa_tail() == dict(swa_tail_sent=0, swa_tail_complete=None)
 
 
 def test_swa_stop_in_arm_never_turns_on():

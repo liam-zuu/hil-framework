@@ -56,6 +56,9 @@ SWA_PHASES_ON = (RUN, STOPPING)   # STOPPING only after the run reached RUN (I8-
 # surely gets the off command and the frame log shows the H7 status follow it (filter 3 frames +
 # iBUS period 7 ms + answer 2 frames, about 13 ms; 30 frames = 30 ms)
 END_TAIL_FRAMES = 30
+# I8-R2-2 (Codex round 2): 30 frames are not 30 ms when the timer catches up on late deadlines (it sends
+# them back to back), so the tail also lasts END_TAIL_MS on time.monotonic_ns, from the END frame on.
+END_TAIL_MS = 30
 
 log = logging.getLogger('hil.node')
 
@@ -177,7 +180,10 @@ class HILNode:
         self._swa       = None               # last bit sent; None before the first frame
         self._swa_events: list = []          # (step, 0/1) at every change, for the manifest
         self._run_seen  = False              # I8-1: the lifecycle reached RUN
-        self._end_left: Optional[int] = None  # I8-5: frames still to send after END
+        self._end_seen  = False              # I8-5: the lifecycle reached END, the tail frames follow
+        self._tail_t0_ns: Optional[int] = None  # I8-R2-2: send time of the END frame
+        self._tail_sent = 0                  # I8-R2-3: tail frames sent after the END frame
+        self._tail_complete = False          # I8-R2-3: the tail ran its frames and its time
         self._h7_seq      = -1
         self._h7_new      = False
         self._ref         = (0.0, 0.0, 0.0)
@@ -309,7 +315,7 @@ class HILNode:
 
         # 2. Encode current state + setpoint, send MOSI, receive MISO (torques from H7)
         traj_flags = 0
-        tail = self._end_left is not None    # I8-5: after END, no lifecycle step, no publisher
+        tail = self._end_seen                # I8-5: after END, no lifecycle step, no publisher
         lc = self._lifecycle_step() if (self._lc is not None and not tail) else None
         if tail:
             pass                                 # keep the last setpoint (0 from STOPPING), flags 0
@@ -338,9 +344,14 @@ class HILNode:
             self._swa = swa
             self._swa_events.append((self._step, swa))
         if tail:
-            self._end_left -= 1
-            if self._end_left <= 0:
+            # I8-R2-2: both END_TAIL_FRAMES frames and END_TAIL_MS since the END frame
+            self._tail_sent += 1
+            if (self._tail_sent >= END_TAIL_FRAMES
+                    and t_send - self._tail_t0_ns >= END_TAIL_MS * 1_000_000):
+                self._tail_complete = True
                 self._running = False
+        elif self._end_seen:                 # this step reached END: the tail time starts at its frame
+            self._tail_t0_ns = t_send
         torques = decode_torques(miso)
         if self._lc is not None:
             self._h7_new = miso[OFS_MISO_SEQ] != self._h7_seq
@@ -406,7 +417,7 @@ class HILNode:
             self._run_seen = True
         if out.done:
             self._stop_reason = self._lc.outcome
-            self._end_left = END_TAIL_FRAMES     # I8-5: the loop stops after the tail frames
+            self._end_seen = True                # I8-5: the loop stops after the tail (I8-R2-2)
         return out
 
     def _imu_sample(self, state: list):
@@ -448,7 +459,8 @@ class HILNode:
                         plant=type(self.plant).__name__, heavy_block=self.cfg.heavy_block,
                         load_schedule=self.cfg.load_schedule, rt=self._rt, uname=' '.join(platform.uname()),     # X8: the kernel the run ran on
                         lifecycle=self.lifecycle_summary(),
-                        swa_mode=self.cfg.swa_mode, swa_events=self.swa_events())     # I8
+                        swa_mode=self.cfg.swa_mode, swa_events=self.swa_events(),     # I8
+                        **self.swa_tail())                                             # I8-R2-3
         np.savez(self.cfg.frame_log, manifest=np.array(json.dumps(manifest)),
                  **{k: v[:n] for k, v in self._flog.items()})
         log.info('Frame log: %d frames -> %s', n, self.cfg.frame_log)
@@ -462,11 +474,18 @@ class HILNode:
         """I8: [[step, 0/1], ...] at every change of the SWA bit sent (first frame included)."""
         return [[int(k), int(v)] for k, v in self._swa_events]
 
+    def swa_tail(self) -> dict:
+        """I8-R2-3: the END tail. swa_tail_sent = tail frames sent after the END frame; swa_tail_complete =
+        it ran END_TAIL_FRAMES frames and END_TAIL_MS (False when max_steps, a full frame log, a signal or
+        an error cut it, or END was never reached); None without --finite-run (no tail)."""
+        return dict(swa_tail_sent=self._tail_sent,
+                    swa_tail_complete=self._tail_complete if self._lc is not None else None)
+
     def lifecycle_summary(self) -> Optional[dict]:
-        """Phases and outcome of a --finite-run; None without it."""
+        """Phases and outcome of a --finite-run, with the END tail (I8-R2-3); None without it."""
         if self._lc is None:
             return None
-        return dict(self._lc.summary(), lock_misses=self.control.lock_misses)
+        return dict(self._lc.summary(), lock_misses=self.control.lock_misses, **self.swa_tail())
 
     @property
     def run_failed(self) -> bool:
@@ -479,7 +498,8 @@ class HILNode:
         if self._lc is not None:
             self.control.set_phase(self._lc.phase)
             log.info('#run_summary,%s', json.dumps(self.lifecycle_summary()))
-        log.info('#swa,mode=%s,events=%s', self.cfg.swa_mode, json.dumps(self.swa_events()))   # I8
+        log.info('#swa,mode=%s,events=%s,tail=%s', self.cfg.swa_mode, json.dumps(self.swa_events()),
+                 json.dumps(self.swa_tail()))                                           # I8, I8-R2-3
         log.info('#run_end,timestamp_us=%d,steps=%d,reason=%s',
                  time.monotonic_ns() // 1000, self._step, self._stop_reason)
         if self._flog is not None:

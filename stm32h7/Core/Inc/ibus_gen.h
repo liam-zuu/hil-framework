@@ -121,7 +121,9 @@ int  ibus_gen_last_swa(const ibus_gen_t *g);
  * H7 can check, so one corrupted frame must not flip SWA. The main loop feeds
  * the bit of every applied frame; the output changes only after
  * IBUS_SWA_FILTER_N frames in a row agree (3 ms at 1 kHz), both directions.
- * Reset (output 0) at link lost and after a gap between applied frames. */
+ * Reset (output 0) at link lost and before the first frame after a link
+ * timeout seen by the TIM6 tick (I8-R2-1: only a real timeout, not a short
+ * gap between frames). */
 #define IBUS_SWA_FILTER_N          3u
 typedef struct {
     uint8_t out;                  /* filtered SWA, 0 after reset */

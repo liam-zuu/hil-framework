@@ -514,10 +514,11 @@ int main(void)
     }
     if (SPI1_IsFrameReady()) {
         _busy = 1;
-        /* I8-4: a gap between applied frames of half the link timeout or more
-         * starts the SWA filter again, also when this loop never saw the link
-         * as lost (the TIM6 tick may have timed out first) */
-        if ((HAL_GetTick() - _last_frame_ms) >= IBUS_LINK_TIMEOUT_MS / 2u)
+        /* I8-4, I8-R2-1: a link timeout seen by the TIM6 tick starts the SWA
+         * filter again, also when this loop never saw the link as lost (the
+         * tick may time out first). Only a real timeout does: a shorter gap
+         * keeps the filter, so it cannot make an SWA-off pulse. */
+        if (IbusPort_TakeTimeout())
             ibus_swa_filter_reset(&_swa_f);
         _last_frame_ms = HAL_GetTick();
         if (!_link_up) {

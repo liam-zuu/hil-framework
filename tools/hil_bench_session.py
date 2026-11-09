@@ -21,7 +21,9 @@ việc 2: gom lượt bàn thành một lệnh). Làm đúng trình tự đã ch
        status H7 (MISO byte 16 bit 0) bằng bit SWA Pi gửi (MOSI byte 20 bit 3) ở mọi frame mà lệnh đã giữ
        hơn 20 frame, không lần đổi nào H7 không theo (`s06_frames_decode.swa_summary`); ESP32 `Motor enabled`
        đúng 1 lần và có `Motor disabled` sau đó khi Pi có gửi SWA bật, 0 lần khi không. `--boot` chạy omega
-       mode nên `--swa auto` = tắt: thấy `Motor enabled` thì dừng mã 2.
+       mode nên `--swa auto` = tắt: thấy `Motor enabled` (tính từ lúc khởi chạy Pi, I8-10) thì dừng mã 2.
+       Lượt `swa_mode = phase` có đuôi END chưa xong (`swa_tail_complete` không phải true) là không sạch
+       (Codex vòng 2 I8-R2-3).
      Chỉ L50 và các lỗi ESP32 làm lượt "không sạch"; số bám setpoint, rpm chỉ báo, không có ngưỡng
      đạt/không (kiểm chức năng, gain chưa tune). Không viết `meta.yaml` (người chạy viết, kèm commit 3 board).
 
@@ -191,13 +193,20 @@ def esp_window(lines):
                 bad={k: sum(1 for s in txt if k in s) for k in ESP_BAD})
 
 
-def judge(dec_problems, h7, esp, swa=None, i8=False):
+def judge(dec_problems, h7, esp, swa=None, i8=False, man=None):
     """Run clean: L50 (no decode problem, SPIfix stuck did not rise) and no ESP32 failure. Reasons listed.
     I8 (Liam 09/11; Codex round 1 I8-6, -7, -9): only for a run whose frame-log manifest has swa_mode
     (i8=True): the H7 status follows the SWA bit (s06_frames_decode.swa_summary: no held mismatch, no
     unfollowed change), and the ESP32 turns the motors on once and off after it when the Pi sent SWA on,
-    never when it did not. Logs from before I8 keep the older rules."""
+    never when it did not. Logs from before I8 keep the older rules.
+    I8-R2-3 (Codex round 2): an I8 run in swa_mode 'phase' whose END tail did not finish (manifest
+    swa_tail_complete not true, also when the key is missing) is not clean: the off command may not have
+    been followed to the end."""
     why = list(dec_problems)
+    man = man or {}
+    if i8 and man.get('swa_mode') == 'phase' and man.get('swa_tail_complete') is not True:
+        why.append(f"đuôi END chưa xong (swa_tail_sent {man.get('swa_tail_sent')}, "
+                   f"swa_tail_complete {man.get('swa_tail_complete')})")
     if h7 and h7.get('stuck_rise'):
         why.append(f"SPIfix stuck tăng {h7['stuck_rise']}")
     if h7 and h7.get('skipped_rise'):
@@ -231,7 +240,7 @@ def analyze_run(out, name, h7_lines=None, esp_lines=None):
     h7 = h7_window(h7_lines) if h7_lines is not None else None
     esp = esp_window(esp_lines) if esp_lines is not None else None
     man = json.loads(str(z['manifest'])) if 'manifest' in z.files else {}
-    ok, why = judge(probs, h7, esp, res.get('swa'), i8='swa_mode' in man)
+    ok, why = judge(probs, h7, esp, res.get('swa'), i8='swa_mode' in man, man=man)
     f = res['frames']
     return dict(name=name, clean=ok, why=why,
                 frames=dict(n=f['frames'], miso_crc_bad=f['miso_crc_bad'], empty_in_run=f['empty_in_run'],
@@ -308,6 +317,7 @@ def bench(a):
         if a.boot:
             boot_cmd = (f'mkdir -p {a.pi_dir} && cd ~/hil-framework/rpi5 && python3 run_hil.py --fixed-omega 0,0,0,0 '
                         f'--imu-static 0,0,0,9.81,0 --steps 20000 --no-traj')
+            t_pi = time.time()           # I8-10 (Codex round 2): motor check from here, not from the reset
             p = subprocess.Popen(['ssh', '-o', 'BatchMode=yes', a.host, boot_cmd],
                                  stdout=open(os.path.join(a.out, 'pi', 'w0_imustatic_pi.txt'), 'wb'),
                                  stderr=subprocess.STDOUT)
@@ -317,8 +327,9 @@ def bench(a):
             boot_rc = p.wait(timeout=120)
             boot = [s for _, s in esp.since(t_reset)]
             miss = [k for k in BOOT_NEED if not any(k in s for s in boot)]
-            motor_on = boot_motor_on(boot)
-            sess['boot'] = dict(t_reset=t_reset, pi_exit=boot_rc, missing=miss, motor_enabled=motor_on,
+            # I8-10: the 4 s before the reset count too (the old ESP32 run sees the Pi start first)
+            motor_on = boot_motor_on([s for _, s in esp.since(t_pi)])
+            sess['boot'] = dict(t_pi=t_pi, t_reset=t_reset, pi_exit=boot_rc, missing=miss, motor_enabled=motor_on,
                                 controller=next((s.strip() for s in boot if 'Controller:' in s), None))
             print(f"khởi động ESP32: {sess['boot']['controller']}, thiếu {miss or 'không'}, Pi mã {boot_rc}, "
                   f"Motor enabled {motor_on} lần")

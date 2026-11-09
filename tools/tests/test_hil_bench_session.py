@@ -2,6 +2,7 @@
 import math
 import os
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -132,3 +133,55 @@ def test_i8_rules_only_for_i8_runs():
 def test_i8_boot_motor_on_counted():
     assert hb.boot_motor_on(['I (1) MAIN: Boot done', 'I (2) MOTOR: Motor enabled']) == 1
     assert hb.boot_motor_on(['I (1) MAIN: Boot done', 'I (2) MOTOR: Motor disabled']) == 0
+
+
+def test_i8_r2_3_unfinished_end_tail_is_not_clean():
+    e = hb.esp_window([(0, 'I (1) MOTOR: Motor enabled'), (1, 'I (2) MOTOR: Motor disabled')])
+    sw = dict(cmd_on_frames=100, held_mismatch=0, unfollowed=0, unobserved=0, settle_frames=20)
+    done = dict(swa_mode='phase', swa_tail_sent=30, swa_tail_complete=True)
+    assert hb.judge([], None, e, sw, i8=True, man=done) == (True, [])
+    for man in (dict(done, swa_tail_complete=False, swa_tail_sent=7),
+                {k: v for k, v in done.items() if k != 'swa_tail_complete'}):   # key missing: not clean either
+        ok, why = hb.judge([], None, e, sw, i8=True, man=man)
+        assert not ok and 'đuôi END' in why[0]
+    # 'on' / 'off' have no tail rule (no lifecycle tail), and neither has a run from before I8
+    assert hb.judge([], None, e, sw, i8=True, man=dict(swa_mode='on', swa_tail_complete=None)) == (True, [])
+    assert hb.judge([], None, e, sw, i8=False, man={}) == (True, [])
+
+
+class _FakeSerial:
+    lines = {}
+
+    def __init__(self, port, path):
+        self.port = port
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def pulse_rts(self):
+        pass
+
+    def since(self, t0, t1=None):
+        return [x for x in self.lines.get(self.port, []) if x[0] >= t0 and (t1 is None or x[0] <= t1)]
+
+
+def test_i8_10_boot_counts_motor_on_from_the_pi_start(tmp_path, monkeypatch):
+    # Codex round 2 I8-10: the old ESP32 run sees the Pi start 4 s before the reset; a `Motor enabled`
+    # there must stop the session too, not only one after the reset
+    clock = dict(t=100.0)
+    monkeypatch.setattr(hb, 'time', SimpleNamespace(time=lambda: clock['t'],
+                                                   sleep=lambda s: clock.__setitem__('t', clock['t'] + s)))
+    monkeypatch.setattr(hb, 'ssh', lambda *a, **k: (0, '## HEAD\nabc'))
+    monkeypatch.setattr(hb.subprocess, 'Popen', lambda *a, **k: SimpleNamespace(wait=lambda timeout=None: 0))
+    monkeypatch.setattr(hb, 'SerialLog', _FakeSerial)
+    boot_ok = [(105.0, 'BNO085 init OK'), (105.1, 'Controller: LADRC'), (105.2, 'Boot done')]
+    a = SimpleNamespace(out=str(tmp_path), host='h', pi_dir='~/r', h7_port='COM3', esp_port='COM9',
+                        boot=True, run=[], no_logger=True, run_timeout=10)
+    _FakeSerial.lines = {'COM9': [(102.0, 'I (9) MOTOR: Motor enabled')] + boot_ok}   # before the reset (104.0)
+    assert hb.bench(a) == (2, [])
+    clock['t'] = 100.0
+    _FakeSerial.lines = {'COM9': [(99.0, 'I (9) MOTOR: Motor enabled')] + boot_ok}    # before the Pi start
+    assert hb.bench(a) == (0, [])
