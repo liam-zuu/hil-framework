@@ -207,14 +207,95 @@ def test_v7_diagnostic_counts(path):
     res, rows = o1.evaluate_v7(log, path, sch)
     assert (res['n_upper_frames'], res['n_back_frames'], res['track_err_frames']) == (0, 1, 1)   # back only
     _counts_ok(res, rows)
-    log = _ideal(sch)                                             # a jump after t_end, before the deadline
+
+
+
+def _extend(log, n=300):
+    """Log held still n more frames (100 Hz) after its end."""
+    out = {k: np.concatenate([v, np.repeat(v[-1:], n, axis=0)]) for k, v in log.items() if k != 't'}
+    out['t'] = np.concatenate([log['t'], log['t'][-1] + 0.01 * np.arange(1, n + 1)])
+    return out
+
+
+def test_v7_counts_skip_a_flagged_frame_after_t_end(path):
+    """S3V8-7 round 2 (Codex: path[200000] is the origin, no flag): a frame 0.5 m back on the lane
+    (s = S - 0.5) 0.2 s after t_end is not counted; control: with T_cmd 1 s later the window is
+    still open at that frame and the same frame counts in n_back."""
+    sch = o1.Schedule(0.5)
+    log = _extend(_ideal(sch))
     t_end0 = o1.evaluate_v7(log, path, sch)[0]['t_end']
     k = int(np.searchsorted(log['t'], t_end0 + 0.2))
-    assert log['t'][k] < sch.Tcmd + o1.T_LATE
-    log['pose'][k, :2] = _plant_xy(path.x[200000], path.y[200000])
+    j = int(np.searchsorted(path.s, path.S - 0.5))
+    log['pose'][k, :2] = _plant_xy(path.x[j], path.y[j])
     res, rows = o1.evaluate_v7(log, path, sch)
-    assert res['t_end'] == t_end0 and res['n_upper_frames'] == res['n_back_frames'] == 0
+    assert res['t_end'] == t_end0 < log['t'][k] < sch.Tcmd + o1.T_LATE
+    assert (res['n_upper_frames'], res['n_back_frames'], res['track_err_frames']) == (0, 0, 0)
     _counts_ok(res, rows)
+    later = _Later(sch, 1.5)              # control: T_cmd after frame k (t_end0 + 0.2 = T_cmd + t_d + 0.2)
+    assert later.Tcmd > log['t'][k]
+    res2, rows2 = o1.evaluate_v7(log, path, later)
+    assert res2['t_end'] > log['t'][k]
+    assert (res2['n_upper_frames'], res2['n_back_frames'], res2['track_err_frames']) == (0, 1, 1)
+    _counts_ok(res2, rows2)
+
+
+def test_v7_counts_skip_a_flagged_frame_at_the_deadline(path):
+    """S3V8-7 round 2: a car that tracks the path but never completes (turns in place after T_cmd,
+    condition 3 never holds) is scored up to the deadline with no flag; a jump frame at the first
+    instant >= deadline is not counted, the same jump one frame earlier is."""
+    sch = o1.Schedule(0.8)
+    base = _extend(_ideal(sch), 50)
+    base['v_true'][base['t'] > sch.Tcmd, 2] = 0.1
+    res0, rows0 = o1.evaluate_v7(base, path, sch)
+    assert res0['completed'] == 'false' and res0['track_err_frames'] == 0
+    dl = sch.Tcmd + o1.T_LATE
+    kd = int(np.searchsorted(base['t'], dl - 1e-9))               # first frame not before the deadline
+    assert base['t'][kd] >= dl - 1e-9 > base['t'][kd - 1] and rows0[-1]['t'] == base['t'][kd - 1]
+    j = int(np.searchsorted(path.s, path.S - 0.5))                # 0.5 m back on the lane: a back flag
+    jump = _plant_xy(path.x[j], path.y[j])
+    got = {}
+    for k in (kd, kd - 1):
+        log = {n: v.copy() for n, v in base.items()}
+        log['pose'][k, :2] = jump
+        res, rows = o1.evaluate_v7(log, path, sch)
+        _counts_ok(res, rows)
+        got[k] = (res['n_upper_frames'], res['n_back_frames'], res['track_err_frames'])
+    assert got[kd] == (0, 0, 0)
+    assert got[kd - 1][2] == 1 and got[kd - 1][0] + got[kd - 1][1] >= 1
+
+
+class _BothFlags:
+    """Path8 whose tracker reports, at one frame (call pair), the upper end AND a two-sided
+    nearest point behind s_prev - delta: one frame counted in both n_upper and n_back."""
+
+    def __init__(self, path, frame):
+        self._p, self._frame, self._calls = path, frame, 0
+
+    def __getattr__(self, name):
+        return getattr(self._p, name)
+
+    def nearest(self, x, y, lo, hi):
+        out = self._p.nearest(x, y, lo, hi)
+        k, second = divmod(self._calls, 2)
+        self._calls += 1
+        if k != self._frame:
+            return out
+        if not second:                                            # narrow window: upper end
+            return (hi,) + tuple(out[1:3]) + (True,)
+        return (lo - 1.0,) + tuple(out[1:])                       # two-sided: behind s_prev - delta
+
+
+def test_v7_one_frame_in_both_counts(path):
+    """S3V8-7 round 2: one frame with both flags -> n_upper 1, n_back 1, track_err_frames 1
+    (max(n_upper, n_back) <= track_err_frames <= n_upper + n_back, both bounds reached apart)."""
+    sch = o1.Schedule(0.5)
+    log = _ideal(sch)
+    res, rows = o1.evaluate_v7(log, _BothFlags(path, 200), sch)
+    assert res['n_upper_frames'] >= 1 and res['n_back_frames'] >= 1
+    assert rows[200]['track_err'] == 1
+    _counts_ok(res, rows)
+    first = [i for i, r in enumerate(rows) if r['track_err']][0]
+    assert first == 200
 
 
 def test_v7_track_error_and_never_at_origin_is_false(path):
@@ -1107,6 +1188,50 @@ def test_v8_load_test_points_assume_unchanged_is_caught(tmp_path):
     assert any('blob in HEAD' in x for x in info['problems'])
 
 
+def test_v8_load_test_points_lf_checkout_with_the_committed_record(tmp_path):
+    """R2-2: a clean LF checkout of the same content (Pi, core.autocrlf=false) passes with the
+    generation record as committed (sha256 of the CRLF file written on Windows); a changed code
+    in the LF file still fails the record."""
+    import hashlib
+    import json as _json
+    d = _repo_with_test_file(tmp_path)                            # record: SHA-256 of the CRLF bytes
+    p = d / 'tp.csv'
+    crlf_sha = _json.loads((d / 'tp.gen.json').read_text(encoding='utf-8'))['sha256']
+    assert crlf_sha == hashlib.sha256(open(s3.TEST_POINTS, 'rb').read()).hexdigest()
+    lf = p.read_bytes().replace(b'\r\n', b'\n')
+    assert lf != p.read_bytes()                                   # the work tree really holds CRLF
+    p.write_bytes(lf)
+    _git(d, 'add', 'tp.csv')
+    _git(d, 'commit', '-q', '-m', 'lf checkout')
+    _, info = s3.load_test_points(str(p))
+    assert info['sha256'] == info['sha256_lf'] != crlf_sha == info['sha256_crlf']
+    assert info['generation_sha256_matches'] and info['problems'] == []
+    first = lf.split(b'\n')[1].split(b',')[2]
+    p.write_bytes(lf.replace(first, repr(float(first) + 1e-6).encode(), 1))
+    _git(d, 'commit', '-q', '-am', 'changed code')                # committed, but not the generated file
+    with pytest.raises(s3.S03Stop, match='generation record'):
+        s3.load_test_points(str(p))
+
+
+def test_v8_load_test_points_unreadable_record_is_recorded(tmp_path, monkeypatch):
+    """S3V8-3 round 2: an I/O error opening <name>.gen.json is recorded (trial) / a stop (main),
+    not an exception out of the preflight."""
+    d = _repo_with_test_file(tmp_path)
+    p = d / 'tp.csv'
+    real_open = open
+
+    def fake_open(f, *a, **k):
+        if str(f).endswith('tp.gen.json'):
+            raise PermissionError('FakeLockedRecord')
+        return real_open(f, *a, **k)
+    monkeypatch.setattr('builtins.open', fake_open)
+    _, info = s3.load_test_points(str(p), trial=True)
+    assert 'FakeLockedRecord' in info['generation']['unreadable'] and info['problems']
+    with pytest.raises(s3.S03Stop, match='generation record') as e:
+        s3.load_test_points(str(p))
+    assert e.value.tp_info['sha256'] == info['sha256']           # R2-4: what was read travels with the stop
+
+
 def test_v8_load_test_points_eol_and_own_generation_record(tmp_path):
     """S3V8-3: LF bytes on disk (blob LF) pass when the record has the LF SHA-256; the record
     read is <name>.gen.json beside the file given, not the default one; a wrong sha256 stops."""
@@ -1178,13 +1303,85 @@ def test_v8_test_phase_diagnostics_stay_in_sealed_test(tmp_path, monkeypatch, ca
     assert 'diag.txt' in man
     if mode == 'warn':
         assert code == 0 and 'FakeTestWarning' in diag and 'FakeTestPrint' in diag
-        assert diag.count('warning: RuntimeWarning: FakeTestWarning') == 2 * 100 * 3
+        assert diag.count('warning: RuntimeWarning: FakeTestWarning') >= 1     # policy in force (R2-3)
     else:
         assert code == 2 and 'sealed_test/stop.json' in console
         assert 'FakeTestOSError' in (out / 'sealed_test' / 'stop.json').read_text()
         assert 'Traceback' in diag and 'FakeTestOSError' in diag
         assert 'stopped in the test set' in (out / 'meta.yaml').read_text(encoding='utf-8')
     assert calls.seen['sealed_before_test'] == calls.seen['sealed_after']
+
+
+@needs_dll
+def test_v8_test_phase_keeps_the_warning_policy(tmp_path, monkeypatch, capsys):
+    """R2-3: with RuntimeWarning made an error (as -W error::RuntimeWarning), a warning of a test
+    run is still an error: the test phase stops (before the fix the phase forced 'always' and ran
+    to the end); nothing on the console but the generic stop line."""
+    import warnings as _w
+    with _w.catch_warnings():
+        _w.simplefilter('error', RuntimeWarning)
+        code, out, console, calls, _ = _run_main(tmp_path, monkeypatch, capsys, error_in_test='warn')
+    assert code == 2 and 'sealed_test/stop.json' in console
+    assert 'FakeTestWarning' not in console and 'FakeTestWarning' not in calls.seen['stderr']
+    assert 'RuntimeWarning: FakeTestWarning' in (out / 'sealed_test' / 'stop.json').read_text()
+    assert calls.seen['after_sealed'] == 1                        # stopped at the first test run
+
+
+@needs_dll
+def test_v8_output_error_of_the_test_phase_stays_sealed(tmp_path, monkeypatch, capsys):
+    """R2-1: writing runs_test.csv fails (PermissionError): the stop is in sealed_test/stop.json
+    (written before the other outputs) with the error, the traceback in diag.txt; console and
+    stderr show only the generic stop line; sealed/ unchanged."""
+    real = s3._write_csv_to
+
+    def failing(f, rows, cols=None):
+        if rows and rows[0].get('box') == 'test':
+            raise PermissionError('FakeDiskError on runs_test.csv')
+        return real(f, rows, cols)
+    monkeypatch.setattr(s3, '_write_csv_to', failing)
+    code, out, console, calls, _ = _run_main(tmp_path, monkeypatch, capsys)
+    assert code == 2 and 'sealed_test/stop.json' in console
+    for txt in (console, calls.seen['stderr']):
+        assert 'FakeDiskError' not in txt and 'Traceback' not in txt
+    stop = (out / 'sealed_test' / 'stop.json').read_text()
+    assert 'writing the test-set outputs failed' in stop and 'FakeDiskError' in stop
+    assert 'FakeDiskError' in (out / 'sealed_test' / 'diag.txt').read_text(encoding='utf-8')
+    assert calls.seen['sealed_before_test'] == calls.seen['sealed_after']
+    assert 'stopped in the test set' in (out / 'meta.yaml').read_text(encoding='utf-8')
+
+
+@needs_dll
+def test_v8_unwritable_sealed_test_still_says_only_stop(tmp_path, monkeypatch, capsys):
+    """R2-1: sealed_test/ cannot even be created: nothing is written there, and the console and
+    stderr still carry only the generic stop line (no traceback)."""
+    real = os.makedirs
+
+    def mk(p, *a, **k):
+        if os.path.basename(os.path.normpath(p)) == 'sealed_test':
+            raise PermissionError('FakeNoFolder')
+        return real(p, *a, **k)
+    monkeypatch.setattr(s3.os, 'makedirs', mk)
+    code, out, console, calls, _ = _run_main(tmp_path, monkeypatch, capsys)
+    assert code == 2 and 'sealed_test/stop.json' in console
+    for txt in (console, calls.seen['stderr']):
+        assert 'FakeNoFolder' not in txt and 'Traceback' not in txt
+    assert not (out / 'sealed_test').exists() and calls.seen['after_sealed'] == 0
+
+
+@needs_dll
+def test_v8_stop_at_the_test_file_keeps_what_was_read(tmp_path, monkeypatch, capsys):
+    """R2-4: a main run stops because the test file is not committed: meta.yaml still records the
+    SHA-256 and the problems of the bytes read (not 'not read')."""
+    import hashlib
+    p = tmp_path / 'tp.csv'
+    raw = open(s3.TEST_POINTS, 'rb').read()
+    p.write_bytes(raw)
+    code, out, console, _, _ = _run_main(tmp_path, monkeypatch, capsys,
+                                         argv=['--mu', '0.4', '0.5', '0.6', '--test-points', str(p)])
+    assert code == 2 and 'not committed' in console
+    meta = (out / 'meta.yaml').read_text(encoding='utf-8')
+    line = next(l for l in meta.splitlines() if l.startswith('test_points:'))
+    assert hashlib.sha256(raw).hexdigest() in line and 'not committed' in line and '"read": "no' not in line
 
 
 @needs_dll

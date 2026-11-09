@@ -378,32 +378,53 @@ def _rel_here(p):
 def load_test_points(path=TEST_POINTS, trial=False):
     """S03 v8 sections 7, 8 condition 7 (S3V8-3): the bytes of the test-set file are read ONCE,
     before the main design. From those bytes: the SHA-256 of the bytes as read and of the same
-    bytes with CRLF -> LF (git keeps LF, the work tree may hold CRLF), the CSV and its checks
-    (check_test_points_text). The content must equal the blob of the file in HEAD, both after
-    CRLF -> LF (git status alone is not evidence: assume-unchanged hides a change). The
-    generation record is <name>.gen.json beside this very file; its sha256 must be one of the
-    two SHA-256 above. Without --trial a failed git / generation check stops S03; with --trial it
-    is recorded in 'problems'. Returns (points, info for meta.yaml)."""
-    with open(path, 'rb') as f:
-        raw = f.read()
+    bytes with CRLF -> LF (git keeps LF, the work tree may hold CRLF) and with LF -> CRLF, the
+    CSV and its checks (check_test_points_text). The content must equal the blob of the file in
+    HEAD, both after CRLF -> LF (git status alone is not evidence: assume-unchanged hides a
+    change). The generation record is <name>.gen.json beside this very file; its sha256 must be
+    the SHA-256 of the bytes read or of their LF or CRLF form (R2-2: the committed record holds
+    the SHA-256 of the CRLF file written on Windows; a clean LF checkout is the same content).
+    Without --trial a failed git / generation check stops S03; with --trial it is recorded in
+    'problems'. Returns (points, info for meta.yaml). A stop carries the info read so far in
+    S03Stop.tp_info (R2-4: meta.yaml records what was read, the file is not read again)."""
+    try:
+        with open(path, 'rb') as f:
+            raw = f.read()
+    except OSError as exc:
+        e = S03Stop(f'test points: {path} cannot be read: {type(exc).__name__}: {exc} (S03 v8 section 8.7)')
+        e.tp_info = dict(file=_rel_here(path), read=f'no: {type(exc).__name__}: {exc}')
+        raise e from None
     lf = raw.replace(b'\r\n', b'\n')
     info = dict(file=_rel_here(path), sha256=hashlib.sha256(raw).hexdigest(),
-                sha256_lf=hashlib.sha256(lf).hexdigest(), git=file_git_state(path))
-    pts = check_test_points_text(raw.decode('utf-8'))
+                sha256_lf=hashlib.sha256(lf).hexdigest(),
+                sha256_crlf=hashlib.sha256(lf.replace(b'\n', b'\r\n')).hexdigest(), git=file_git_state(path))
+
+    def stop(msg):
+        exc = S03Stop(msg)
+        exc.tp_info = info
+        return exc
+    try:
+        pts = check_test_points_text(raw.decode('utf-8'))
+    except S03Stop as exc:
+        info['problems'] = [f'condition 7: {exc}']
+        raise stop(str(exc)) from None
+    except (ValueError, UnicodeDecodeError) as exc:          # e.g. a code that is not a number
+        info['problems'] = [f'condition 7: {type(exc).__name__}: {exc}']
+        raise stop(f'test points: {type(exc).__name__}: {exc} (S03 v8 section 8.7)') from None
     blob = _head_blob(path)
     info['head_blob_sha256'] = hashlib.sha256(blob).hexdigest() if blob is not None else None
     info['matches_head_blob_lf'] = blob is not None and blob.replace(b'\r\n', b'\n') == lf
     gen_path, gen = test_points_gen_path(path), None
-    if os.path.isfile(gen_path):
-        try:
+    try:
+        if os.path.isfile(gen_path):
             with open(gen_path, 'rb') as f:
                 gen = json.loads(f.read().decode('utf-8'))
-        except (ValueError, UnicodeDecodeError) as exc:
-            gen = dict(unreadable=f'{type(exc).__name__}: {exc}')
+    except (OSError, ValueError, UnicodeDecodeError) as exc:  # S3V8-3: I/O errors too, recorded
+        gen = dict(unreadable=f'{type(exc).__name__}: {exc}')
     info['generation_file'] = _rel_here(gen_path)
     info['generation'] = gen
-    info['generation_sha256_matches'] = bool(isinstance(gen, dict) and
-                                             gen.get('sha256') in (info['sha256'], info['sha256_lf']))
+    info['generation_sha256_matches'] = bool(isinstance(gen, dict) and gen.get('sha256') in
+                                             (info['sha256'], info['sha256_lf'], info['sha256_crlf']))
     problems = []
     if not (info['git']['tracked'] and info['git']['clean']):
         problems.append('not committed / modified (git status)')
@@ -414,7 +435,7 @@ def load_test_points(path=TEST_POINTS, trial=False):
                         f'not the SHA-256 of the file read')
     info['problems'] = problems
     if problems and not trial:
-        raise S03Stop(f'{path}: ' + '; '.join(problems) + ' (S03 v8 sections 7, 8.7)')
+        raise stop(f'{path}: ' + '; '.join(problems) + ' (S03 v8 sections 7, 8.7)')
     return pts, info
 
 
@@ -556,12 +577,16 @@ def fmt(x):
     return x
 
 
-def write_csv(path, rows, cols=None):
+def _write_csv_to(f, rows, cols=None):
     cols = cols or list(dict.fromkeys(k for r in rows for k in r))
+    w = csv.DictWriter(f, fieldnames=cols, extrasaction='ignore')
+    w.writeheader()
+    w.writerows({k: fmt(r.get(k, '')) for k in cols} for r in rows)
+
+
+def write_csv(path, rows, cols=None):
     with open(path, 'w', newline='', encoding='utf-8') as f:
-        w = csv.DictWriter(f, fieldnames=cols, extrasaction='ignore')
-        w.writeheader()
-        w.writerows({k: fmt(r.get(k, '')) for k in cols} for r in rows)
+        _write_csv_to(f, rows, cols)
 
 
 def npz_bytes(log):
@@ -888,6 +913,7 @@ def main():
             check_design_map(design_rows, test_pts)                      # section 11 item 4: id - box - codes
         except S03Stop as exc:
             stop_public = f'before the main design: {exc}'
+            tp_info = getattr(exc, 'tp_info', tp_info)                  # R2-4: what was read, if any
             print(f'[STOP] {stop_public}', flush=True)
     if stop_public is None:
         write_csv(os.path.join(a.out, 'design.csv'), design_rows)      # S3E-2: on disk before any run
@@ -997,18 +1023,21 @@ def main():
     sealed_test = os.path.join(a.out, 'sealed_test')
     work_test = os.path.join(sealed_test, '_work')
     if stop_public is None and stop_sealed is None:
-        os.makedirs(sealed_test, exist_ok=True)
         test_logs = os.path.join(sealed_test, 'logs')
         t_test0 = time.time()
         print('[test set] running the test points (results sealed in sealed_test/, S03 v8 section 7)', flush=True)
-        # S3V8-2: every warning, print and traceback of the test phase goes to sealed_test/diag.txt,
-        # any exception of the phase is a stop recorded in sealed_test/stop.json; the console only
-        # says that S03 stopped in the test set (the DLL does not print: fwsim/shim/esp_log.h)
+        # S3V8-2, R2-1: the whole phase (folder, runs, cleaning, every output of sealed_test/) is in
+        # one guard; warnings, prints and tracebacks go to sealed_test/diag.txt, any exception is a
+        # stop recorded in sealed_test/stop.json (written first); if even that cannot be written,
+        # the console still only says that S03 stopped in the test set (the DLL does not print:
+        # fwsim/shim/esp_log.h). R2-3: the warning policy in force is kept (no simplefilter): a
+        # warning made an error stays an error (run_error in safe_run), the others are recorded.
         diag = io.StringIO()
+        out_error = None
         with warnings.catch_warnings(record=True) as caught, contextlib.redirect_stdout(diag), \
                 contextlib.redirect_stderr(diag):
-            warnings.simplefilter('always')
             try:
+                os.makedirs(sealed_test, exist_ok=True)
                 for ctrl in a.controllers:
                     gains_at, test_pts = plan[ctrl][0], plan[ctrl][5]
                     for pid, codes in test_pts:
@@ -1026,30 +1055,45 @@ def main():
             except Exception as exc:          # noqa: BLE001 (S3V8-2: any failure of the phase stays sealed)
                 stop_test = f'{type(exc).__name__}: {exc}'
                 traceback.print_exc(file=diag)
+            test_s = round(time.time() - t_test0)
+
+            def diag_text():
+                return diag.getvalue() + ''.join(f'warning: {w_.category.__name__}: {w_.message} '
+                                                 f'({w_.filename}:{w_.lineno})\n' for w_ in caught)
+
+            def put(name, write):
+                p_ = os.path.join(sealed_test, name)
+                with open(p_, 'w', newline='' if name.endswith('.csv') else None, encoding='utf-8') as f_:
+                    write(f_)
+                test_files[name] = sha256_file(p_)
+
+            test_files = {}
+            try:
+                if os.path.isdir(work_test) and not os.listdir(work_test):    # before the manifest
+                    os.rmdir(work_test)
+                if stop_test:
+                    put('stop.json', lambda f_: json.dump(dict(stop=stop_test), f_, indent=1))
+                put('runs_test.csv', lambda f_: _write_csv_to(f_, test_rows, RUN_COLS))
+                put('notes.json', lambda f_: json.dump(dict(stop=stop_test, rows_run=len(test_rows),
+                                                            run_error_reruns=test_notes, elapsed_s_test=test_s),
+                                                       f_, indent=1, default=str))
+                put('diag.txt', lambda f_: f_.write(diag_text()))
+                with open(os.path.join(sealed_test, 'manifest.json'), 'w', encoding='utf-8') as f_:
+                    json.dump(dict(files=test_files), f_, indent=1)
+            except Exception as exc:          # noqa: BLE001 (R2-1: an output error is a stop, kept sealed)
+                out_error = f'{type(exc).__name__}: {exc}'
+                traceback.print_exc(file=diag)
+                stop_test = stop_test or f'writing the test-set outputs failed: {out_error}'
+                for name, text in (('stop.json', lambda: json.dumps(dict(stop=stop_test, output_error=out_error),
+                                                                    indent=1)),
+                                   ('diag.txt', diag_text)):
+                    try:                      # best effort; a failure here leaves only the public stop line
+                        with open(os.path.join(sealed_test, name), 'w', encoding='utf-8') as f_:
+                            f_.write(text())
+                    except Exception:         # noqa: BLE001,S110
+                        pass
         if stop_test:
             print('[STOP] S03 stopped in the test set; the reason is in sealed_test/stop.json', flush=True)
-        test_s = round(time.time() - t_test0)
-        if os.path.isdir(work_test) and not os.listdir(work_test):    # before sealed_test/manifest.json
-            os.rmdir(work_test)
-        test_files = {}
-        with open(os.path.join(sealed_test, 'diag.txt'), 'w', encoding='utf-8') as f:
-            f.write(diag.getvalue())
-            for w_ in caught:
-                f.write(f'warning: {w_.category.__name__}: {w_.message} ({w_.filename}:{w_.lineno})\n')
-        test_files['diag.txt'] = sha256_file(os.path.join(sealed_test, 'diag.txt'))
-        p = os.path.join(sealed_test, 'runs_test.csv')
-        write_csv(p, test_rows, RUN_COLS)
-        test_files['runs_test.csv'] = sha256_file(p)
-        with open(os.path.join(sealed_test, 'notes.json'), 'w', encoding='utf-8') as f:
-            json.dump(dict(stop=stop_test, rows_run=len(test_rows), run_error_reruns=test_notes,
-                           elapsed_s_test=test_s), f, indent=1, default=str)
-        test_files['notes.json'] = sha256_file(os.path.join(sealed_test, 'notes.json'))
-        if stop_test:
-            with open(os.path.join(sealed_test, 'stop.json'), 'w', encoding='utf-8') as f:
-                json.dump(dict(stop=stop_test), f, indent=1)
-            test_files['stop.json'] = sha256_file(os.path.join(sealed_test, 'stop.json'))
-        with open(os.path.join(sealed_test, 'manifest.json'), 'w', encoding='utf-8') as f:
-            json.dump(dict(files=test_files), f, indent=1)
     # public outputs: sweep only (S03 3.1 is a source of campaign A's domain) and the design points
     files = {}
     for name, rows in (('sweep.csv', sweep_rows), ('sweep_counts.csv', sweep_counts(sweep_rows)),
@@ -1117,8 +1161,8 @@ interpretations:   # of this script, not written in S03 v8 / O1 v7; Liam or THES
   - "the upper-end tracking flag uses the 400 001-point path grid (about 15 um); at s = S the window is cut by the end of the path, not flagged (Codex S3C-5, deferred)"
   - "v8: run order per controller centre, outer, inner, axial (3 mu x 3 speeds each), then determinism and analysis; sealed/ is written and closed after every controller; then the test set of every controller (middle mu x 3 speeds); a stop before the test set means the test set does not run"
   - "v8: test-set logs follow the rule of section 7 (npz of every run not completed; there is no centre point in the test set); the compressed npz is made for every run (same work)"
-  - "v8: the test-points file is read once before the main design (S3V8-3); 'committed' (section 8.7) = tracked, unmodified for git status AND the bytes read match the blob in HEAD after CRLF -> LF of both; its generation record is <name>.gen.json beside the file read, with the sha256 of the bytes read or of their LF form; with --trial a failed check is allowed and recorded in test_points.problems"
-  - "v8 (S3V8-2): warnings, prints and tracebacks of the test phase go to sealed_test/diag.txt and any exception of the phase is a stop recorded in sealed_test/stop.json; the same channel in the main design (warnings to the console) is left as before (deferred, Codex S3V8-2)"
+  - "v8: the test-points file is read once before the main design (S3V8-3); 'committed' (section 8.7) = tracked, unmodified for git status AND the bytes read match the blob in HEAD after CRLF -> LF of both; its generation record is <name>.gen.json beside the file read, with the sha256 of the bytes read or of their LF or CRLF form (R2-2: the committed record holds the SHA-256 of the CRLF file; a clean LF checkout is the same content); a stop at this check keeps what was read in test_points (R2-4); with --trial a failed check is allowed and recorded in test_points.problems"
+  - "v8 (S3V8-2): warnings, prints and tracebacks of the test phase go to sealed_test/diag.txt and any exception of the phase, writing its outputs included, is a stop recorded in sealed_test/stop.json (written first; R2-1); the warning policy in force is kept, a warning made an error stays an error (R2-3); the same channel in the main design (warnings to the console) is left as before (deferred, Codex S3V8-2)"
   - "v8: n_upper_frames, n_back_frames count the frames evaluate_v7 kept for scoring (t_k <= t_end), as section 4 defines them; they are diagnostics, never responses"
 elapsed_s: {sweep_s}
 file_sha256: {json.dumps(files)}
