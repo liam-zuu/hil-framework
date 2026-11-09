@@ -43,6 +43,11 @@ Nhận dạng firmware ESP32 (Liam 09/11, CODE): AGV in `#fw sha=.. dirty=.. env
 `runs[].esp32_fw` vào `session.json` và in ở dòng tổng kết; `--expect-esp32 SHA`: khác SHA, dirty=1 hay không
 thấy dòng thì `--boot` dừng mã 2, lượt không sạch (`meta.yaml` ghi commit ESP32 theo dòng này).
 
+Nhận dạng firmware H7 (cùng lời Liam, 2e): H7 in `#fw sha=.. dirty=.. env=Debug` lúc khởi động và mỗi 10 s
+(`stm32h7/scripts/fw_id.py`, bước pre-build CubeIDE). `--expect-h7 SHA`: trước lượt đầu chờ tối đa 11 s một dòng
+`#fw` của H7; khác SHA, dirty=1 hay không có thì dừng mã 2; lượt nào thấy `#fw` H7 khác thì không sạch. Ghi
+`h7_fw` (trước lượt đầu), `runs[].h7_fw`, `h7_fw_all` vào `session.json`.
+
 Logger chế độ đo (A5, Liam 09/11, CODE, STATUS_CODE L61 b): mỗi lượt chạy `agv_logger.py --strict --src-ip IP
 --ready-file <pi-dir>/TÊN.ready`; IP = `--esp32-ip`, không có thì dòng `Got IP:` ESP32 in ở serial trong phiên,
 không có nữa thì `first` (khóa theo gói đầu). `run_hil.py` chỉ chạy khi file ready đã có (chờ tối đa 5 s, không
@@ -240,6 +245,7 @@ def fw_problem(fws, expect):
     return None
 
 
+H7_FW_WAIT_S = 11.0                  # --expect-h7: the H7 prints #fw every 10 s (main.c debug block)
 IP_RE = re.compile(r'Got IP: (\d{1,3}(?:\.\d{1,3}){3})')
 LOGGER_EXIT_RE = re.compile(r'^logger_exit=(\d+)', re.M)
 LOGGER_SAFE_REJECTS = ('source',)     # datagrams from another sender: refused by the source lock, data unharmed
@@ -380,6 +386,8 @@ def summary_line(r):
         s += f" | H7 Loop max {r['h7']['loop_max_us']:.1f} µs"
     for f in r.get('esp32_fw') or []:
         s += f" | ESP32 #fw {f['sha']} {f['env']}" + (' DIRTY' if f['dirty'] else '')
+    for f in r.get('h7_fw') or []:
+        s += f" | H7 #fw {f['sha']} {f['env']}" + (' DIRTY' if f['dirty'] else '')
     lg = r.get('logger')
     if lg:
         s += f" | logger {lg['mode']} src {lg['src_ip']} seq hở {lg['seq_holes']}"
@@ -584,6 +592,18 @@ def bench(a):
                 # has no I8 (or the Pi sent SWA on): stop before any run
                 print('DỪNG: ESP32 bật motor lúc --boot (H7 chưa có I8, hoặc Pi gửi SWA bật)')
                 return 2, []
+        if a.expect_h7:
+            # #fw H7 (Liam 09/11, CODE): the H7 prints its id at boot and every 10 s; wait for one line
+            # before the first run, then the same rules as --expect-esp32
+            t_w = time.time()
+            while not fw_lines([s for _, s in h7.since(0)]) and time.time() - t_w < H7_FW_WAIT_S:
+                time.sleep(0.5)
+            sess['h7_fw'] = fw_lines([s for _, s in h7.since(0)])
+            print(f"H7 #fw {sess['h7_fw'] or 'không có'}")
+            bad = fw_problem(sess['h7_fw'], a.expect_h7)
+            if bad:
+                print('DỪNG: ' + bad.replace('ESP32', 'H7'))
+                return 2, []
         for name, args, stop in plan:
             stop_rec = dict(kind=stop[0], after_s=stop[1]) if stop else None
             timer = _stop_later(a, name, stop[0], stop[1], stop_rec) if stop else None
@@ -637,6 +657,13 @@ def bench(a):
             r = analyze_run(a.out, name, h7.since(t0, t1 + 1.0), esp.since(t0, t1 + 1.0))
             r['ssh_exit'] = rc
             r['esp32_fw'] = run_fw
+            r['h7_fw'] = fw_lines([s for _, s in h7.since(t0, t1 + 1.0)])
+            run_rec['h7_fw'] = r['h7_fw']
+            # a short run may hold no H7 #fw line (one every 10 s): only another id makes it not clean
+            hbad = fw_problem(r['h7_fw'], a.expect_h7) if (a.expect_h7 and r['h7_fw']) else None
+            if hbad:
+                r['clean'] = False
+                r['why'].append(hbad.replace('ESP32', 'H7'))
             if rc != 0:
                 r['clean'] = False
                 r['why'].append(f'Pi mã thoát {rc}')
@@ -663,6 +690,7 @@ def bench(a):
         time.sleep(1.0)
         h7.stop()
         esp.stop()
+        sess['h7_fw_all'] = fw_lines([s for _, s in h7.since(0)])      # every H7 id seen in the session
         sess['ended'] = datetime.datetime.now().isoformat(timespec='seconds')
         with open(os.path.join(a.out, 'session.json'), 'x', encoding='utf-8') as f:     # A
             json.dump(sess, f, ensure_ascii=False, indent=1)
@@ -713,6 +741,9 @@ def main(argv=None):
     ap.add_argument('--boot', action='store_true', help='--imu-static + reset ESP32 bằng RTS trước các lượt')
     ap.add_argument('--run', action='append', default=[], metavar='TÊN=ĐỐI_SỐ', help='đối số run_hil.py của một lượt')
     ap.add_argument('--no-logger', action='store_true', help='không chạy agv_logger trên Pi')
+    ap.add_argument('--expect-h7', metavar='SHA',
+                    help='commit H7 phải chạy (tiền tố SHA): chờ dòng #fw của H7 (tối đa 11 s) trước lượt đầu; '
+                         'khác SHA, dirty=1 hay không có thì dừng mã 2; lượt có #fw H7 khác thì không sạch')
     ap.add_argument('--esp32-ip', metavar='IP',
                     help='A5: IP nguồn khóa cho agv_logger --strict (mặc định: dòng "Got IP:" ESP32 in trong phiên, '
                          'không có thì khóa theo gói đầu tiên)')

@@ -180,7 +180,7 @@ def test_i8_10_boot_counts_motor_on_from_the_pi_start(tmp_path, monkeypatch):
     boot_ok = [(105.0, 'BNO085 init OK'), (105.1, 'Controller: LADRC'), (105.2, 'Boot done')]
     a = SimpleNamespace(out=str(tmp_path / 's1'), host='h', pi_dir='~/r', h7_port='COM3', esp_port='COM9',
                         boot=True, run=[], no_logger=True, run_timeout=10, pi_kill=[], pi_stop=[],
-                        expect_esp32=None, esp32_ip=None, logger_loose=False)
+                        expect_esp32=None, esp32_ip=None, logger_loose=False, expect_h7=None)
     _FakeSerial.lines = {'COM9': [(102.0, 'I (9) MOTOR: Motor enabled')] + boot_ok}   # before the reset (104.0)
     assert hb.bench(a) == (2, [])
     clock['t'] = 100.0
@@ -222,7 +222,7 @@ def _bench_env(monkeypatch, tmp_path, ssh_reply=None, out='s', **kw):
     _FakeSerial.lines = {}
     a = SimpleNamespace(out=str(tmp_path / out), host='h', pi_dir='~/r', h7_port='COM3', esp_port='COM9',
                         boot=False, run=[], no_logger=True, run_timeout=10, pi_kill=[], pi_stop=[],
-                        expect_esp32=None, esp32_ip=None, logger_loose=False)
+                        expect_esp32=None, esp32_ip=None, logger_loose=False, expect_h7=None)
     for k, v in kw.items():
         setattr(a, k, v)
     return a, calls, timers
@@ -486,3 +486,29 @@ def test_a5_bench_uses_serial_ip_and_judges_the_logger(tmp_path, monkeypatch):
     monkeypatch.setattr(hb, 'scp', fake_scp)
     hb.bench(a2)
     assert all('--strict' not in c for c in calls2)
+
+
+# ── #fw H7 (Liam 09/11, CODE, 2e) ──
+
+H7_FW = '#fw sha=45ec4cd0aaaa dirty=0 env=Debug'
+
+
+@pytest.mark.parametrize('h7_lines, expect, code, ran', [
+    ([(50.0, H7_FW)], '45ec4cd', None, True),                         # matching id seen: runs go on
+    ([(50.0, H7_FW)], 'a4041a8', 2, False),                           # another commit: stop before runs
+    ([(50.0, '#fw sha=45ec4cd0aaaa dirty=1 env=Debug')], '45ec4cd', 2, False),
+    ([(50.0, 'Loop: max=600.0 us')], '45ec4cd', 2, False),            # no #fw within the wait (old H7)
+    ([], None, None, True),                                           # no --expect-h7: no rule
+])
+def test_h7_expect(tmp_path, monkeypatch, h7_lines, expect, code, ran):
+    import json as _j
+    a, calls, _ = _bench_env(monkeypatch, tmp_path, run=['x=--test A-L1'], expect_h7=expect)
+    _FakeSerial.lines = {'COM3': h7_lines}
+    c, _ = hb.bench(a)
+    if code is not None:
+        assert c == code
+    assert any('run_hil.py --test A-L1' in x for x in calls) == ran
+    s = _j.load(open(os.path.join(a.out, 'session.json'), encoding='utf-8'))
+    if expect:
+        assert s['h7_fw'] == hb.fw_lines([x for _, x in h7_lines])
+    assert s['h7_fw_all'] == hb.fw_lines([x for _, x in h7_lines])
