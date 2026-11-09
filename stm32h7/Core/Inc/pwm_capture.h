@@ -2,57 +2,89 @@
 #define PWM_CAPTURE_H
 
 #include "stm32h7xx_hal.h"
-/* NOTE: stm32h7xx_ll_tim.h removed — polarity toggle uses direct CCER CCxP
- *       register write in pwm_capture.c. No LL dependency. */
 
 /*
  * PWMCapture — Measure RPWM/LPWM duty cycles from ESP32 via TIM Input Capture
  *
- * Hardware:
- *   TIM5  CH1, CH3, CH4 → RPWM wheels 1, 3, 4  (PA0, PA2, PA3)
- *   TIM13 CH1           → RPWM wheel 2         (PF8)
- *   TIM15 CH1-2         → LPWM wheels 1-2      (PE5, PE6)
- *   TIM16 CH1           → LPWM wheel 3         (PF6)
- *   TIM17 CH1           → LPWM wheel 4         (PF7)
- * Wheel 2 RPWM moved off PA1 (TIM5_CH2) on 27/10: on the Nucleo something on
- * the board drives PA1 (1.6 V with no wire, Liam's meter), so the ESP32 signal
- * never reached the timer (05_DATA/results/PWM_CAPTURE/2026-10-27_run01).
+ * Hardware (channel index 0..7; "RPWM"/"LPWM" below are the H7 channel names
+ * used in the code and logs, the ESP32 pin names in motor.h are the other way
+ * round, see PWMCapture_GetDuty and bug HIL-PWM-WIRE-SIGN, 07/11):
+ *   0 TIM5  CH1  PA0   RPWM wheel 1 = GPIO3  FL_LPWM    4 TIM15 CH1  PE5   LPWM wheel 1 = GPIO8  FL_RPWM
+ *   1 TIM8  CH3  PC8   RPWM wheel 2 = GPIO41 FR_LPWM    5 TIM8  CH4  PC9   LPWM wheel 2 = GPIO40 FR_RPWM
+ *   2 TIM5  CH3  PA2   RPWM wheel 3 = GPIO9  RL_LPWM    6 TIM16 CH1  PF6   LPWM wheel 3 = GPIO46 RL_RPWM
+ *   3 TIM5  CH4  PA3   RPWM wheel 4 = GPIO21 RR_LPWM    7 TIM17 CH1  PF7   LPWM wheel 4 = GPIO47 RR_RPWM
+ * GPIO46 is an ESP32-S3 strapping pin and PA2 is wired to the Nucleo Ethernet
+ * PHY (MDIO, UM2407 table 13): with GPIO46 on PA2 the ESP32 did not enter
+ * download mode (07/11), so GPIO46 stays on PF6.
+ * PC8 and PC9 are the pins on ZIO CN8; the CN12 spots with the same names are
+ * not these pins (Liam measured 04/11 with the internal pull-up: CN8 3.2 V,
+ * CN12 0 V). Wheel 2 moved to TIM8 on 04/11 because TIM13 and TIM15 CH2 have
+ * no DMA request (before: PF8 TIM13, PE6 TIM15 CH2; PA1 TIM5 CH2 before 27/10).
  *
- * Timer clock: 1 MHz (PSC=239 on 240 MHz timer clocks, APB1 and APB2)
+ * Timer clock: 10 MHz (PSC=23 on 240 MHz timer clocks), 20 kHz PWM period =
+ * 500 ticks, 16-bit counting (ARR 65535, also TIM5), wraps after 6.5 ms.
  *
- * Duty cycle measurement (rising→falling→rising):
- *   Rising  edge: record t_rise
- *   Falling edge: pulse_width = t_fall - t_rise
- *   Next rising:  period = t_rise_new - t_rise_prev
- *   duty [0..1]  = pulse_width / period
+ * Since 04/11 (bug H7-PWM-RISE-MISS, Liam: "duyệt chuyển sang DMA đi"): each
+ * channel captures BOTH edges, input filter 0xF, and a circular DMA2 stream
+ * copies each capture into a RAM ring; there is no capture interrupt. The old
+ * scheme toggled the polarity in the capture ISR and missed an edge whenever
+ * the ISR came later than the short phase of the period (RL step 3: 15 us low,
+ * 05_DATA/results/PWM_CAPTURE/2026-11-04_run01). Decoding: pwm_edges.c.
  *
- * Polarity toggle: direct CCER CCxP bit write — ISR-safe, no HAL re-entrancy.
- *
- * Torque conversion (RPWM/LPWM → signed duty [-1..1]):
- *   duty_net[w] = rpwm_duty[w] - lpwm_duty[w]
- *   torque[w]   = duty_net[w] × HIL_TORQUE_MAX
+ * Torque conversion (signed duty [-1..1], since 07/11):
+ *   duty_net[w] = duty[w + 4] - duty[w]
+ *   = duty at the ESP32 *_RPWM pin - duty at the *_LPWM pin (motor.h names)
  */
 
 #define PWM_NUM_WHEELS   4u
-#define PWM_TIMEOUT_MS  50u   /* wheel considered stopped if no edge for this long */
+#define PWM_NUM_CHANNELS 8u
+#define PWM_TIMEOUT_MS  50u   /* channel considered held if no edge for this long */
+#define PWM_RING_LEN  1024u   /* captures per channel ring: 25.6 ms at 20 kHz, both edges */
 
-/* Initialise all IC timers and arm first capture (rising edge) */
+/* Start the 8 DMA streams and the capture channels (after MX_DMA_Init and the
+ * MX_TIMx_Init calls). The capture timers' NVIC lines stay off. */
 void  PWMCapture_Init(TIM_HandleTypeDef *ht5,
-                      TIM_HandleTypeDef *ht13,
+                      TIM_HandleTypeDef *ht8,
                       TIM_HandleTypeDef *ht15,
                       TIM_HandleTypeDef *ht16,
                       TIM_HandleTypeDef *ht17);
 
-/* Returns net duty [-1..1] for each wheel.
- * Positive = RPWM dominates (forward), Negative = LPWM dominates (reverse).
+/* Read new captures and update the duty of each channel. Call every pass of
+ * the main loop (one window, about 5 us; up to about 35 us while an edge type
+ * is unknown or a check is due; plus up to 60 us right after a main-loop stall
+ * of 5 ms or more). Times are estimates from the waits in the code, not measured. */
+void  PWMCapture_Service(void);
+
+/* Net duty [-1..1] per wheel from the last PWMCapture_Service().
+ * Positive = the ESP32 *_RPWM pin (motor.h) dominates, i.e. channel w + 4;
+ * negative = the *_LPWM pin, channel w. Same sign as fwsim/fw_sim.c duty.
  * A channel with no edge within PWM_TIMEOUT_MS counts as its pin level
  * (1.0 if held HIGH, 0.0 if held LOW). */
 void  PWMCapture_GetDuty(float *duty_out);  /* float[4] */
 
-/* Call from HAL_TIM_IC_CaptureCallback in main.c */
-void  PWMCapture_IC_Callback(TIM_HandleTypeDef *htim);
+typedef struct {
+    uint32_t edges[PWM_NUM_CHANNELS];       /* captures read since boot */
+    uint32_t lost[PWM_NUM_CHANNELS];        /* overcapture flags seen */
+    uint32_t lap[PWM_NUM_CHANNELS];         /* service gaps >= 5 ms (ring dropped) */
+    uint32_t parity_fix[PWM_NUM_CHANNELS];  /* anchor disagreed with the known edge type */
+    uint32_t bad_period[PWM_NUM_CHANNELS];  /* rising-to-rising > 75 us, skipped (gap or dropped pulse) */
+    uint32_t dma_err[PWM_NUM_CHANNELS];     /* DMA stream did not start, or found stopped */
+    uint32_t unanchored[PWM_NUM_CHANNELS];  /* edges but edge type unknown >= 20 ms (duty held), per run */
+    uint8_t  active[PWM_NUM_CHANNELS];      /* DMA stream running, channel read */
+    uint8_t  known[PWM_NUM_CHANNELS];       /* edge type known now */
+} PWMCapture_Stats_t;
 
-/* Capture interrupts handled since boot (debug: interrupt load). */
-uint32_t PWMCapture_GetIsrCount(void);
+/* Debug counters, channel order as above */
+void  PWMCapture_GetStats(PWMCapture_Stats_t *out);
+
+/* Largest anchor window (wr1 to wr2 reads) and largest PWMCapture_Service()
+ * time, in 10 MHz ticks (0.1 us), since the last call; resets both. For the
+ * board check of Codex M23 (window above about 7 us: the shift may not break
+ * a phase lock). A main-loop preemption inside the service counts in. */
+void  PWMCapture_TakeTiming(uint32_t *win_max_ticks, uint32_t *svc_max_ticks);
+
+/* DIAG 05/11: number of windows < 7 us, 7-20 us, 20-50 us, >= 50 us and the
+ * shortest window (ticks) since the last call; resets them. */
+void  PWMCapture_TakeWinHist(uint32_t hist[4], uint32_t *win_min_ticks);
 
 #endif /* PWM_CAPTURE_H */

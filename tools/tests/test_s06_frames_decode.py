@@ -1,0 +1,548 @@
+"""tools/s06_frames_decode.py on synthetic frames built here from the MISO v4 layout of the
+design note (H7 feat/s06-h7 3235ec5): answer at N+2, CRC-16/CCITT-FALSE, little-endian fields,
+one log record per frame, CYCCNT at 483.1 MHz wrapping every ~8.9 s. Faults are put in on
+purpose and must be reported. Not checked against frames of the real H7 (none yet).
+Run: python -m pytest tools/tests"""
+import binascii
+import os
+import struct
+import sys
+
+import numpy as np
+import pytest
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+sys.path[:0] = [os.path.join(ROOT, 'tools'), os.path.join(ROOT, 'rpi5')]
+import s06_frames_decode as dec  # noqa: E402
+from protocol import encode_state  # noqa: E402
+
+F_H7 = 483.1e6
+D_1W_US = 45.0               # Pi send -> H7 callback
+N = 20_000                   # 20 s: CYCCNT wraps twice
+
+
+def crc(b):
+    return binascii.crc_hqx(bytes(b), 0xFFFF)
+
+
+def build(n=N, faults=(), imu_fn=None, idx0=0, enc_n0=0, cyc0=4_000_000_000, pre_ticks=0, idx_jump=0,
+          pre_reports=0):
+    """imu_fn(k) -> (gz, ax, ay, az, yaw) of frame k (default: a slow sine on gz and a yaw ramp).
+    idx0, enc_n0: H7 log index and EncoderGen call counts at the log start (0: log from the H7 boot).
+    pre_ticks: TICK records made every 0.5 s while the link was down before the log, the last one 0.5 s
+    before frame 0; they wait in the H7 ring and leave first.
+    pre_reports: reports per kind built 2 s before frame 0 from a frame before the log (src -6); they leave
+    right after the pre_ticks. idx_jump: log indexes taken by records the H7 dropped (ring full) after the
+    records made before the log and before those of the log (09/11, CLOSED_LOOP/2026-11-09_run08 b1_stop)."""
+    rng = np.random.default_rng(3)
+    t_send_ns = (np.arange(n) * 1e6 + rng.uniform(-20e3, 20e3, n)).astype(np.int64)
+    mosi = np.zeros((n, 40), dtype=np.uint8)
+    for k in range(n):
+        imu = imu_fn(k) if imu_fn else (0.1 * np.sin(k / 50), 0.0, 0.0, 9.81, 0.01 * k % 3.0)
+        mosi[k] = np.frombuffer(encode_state([0.0] * 10, seq=k, imu=imu, imu_seq=k // 10), dtype=np.uint8)
+    # cyc0 = 4e9: wraps after ~0.6 s
+    cyc = [(cyc0 + int((t_send_ns[k] / 1e3 + D_1W_US) * 1e-6 * F_H7)) for k in range(n)]
+    # log stream: RESET_DONE, then a REPORT per kind every 10 ms (src = frame 3 before), TICK every 500
+    produced, idx = [[] for _ in range(n)], idx0
+    seqs = [0, 0, 0]
+    for m in range(pre_ticks, 0, -1):
+        c = cyc[0] - int(0.5 * m * F_H7)
+        produced[1].append((0x40, struct.pack('<IIIH', c & 0xFFFFFFFF, c & 0xFFFFFFFF, c >> 32, 0)))  # 1: first carried
+    raw0 = bytes(mosi[0][i] for i in dec.MOSI_IMU_BYTES)
+    for m in range(pre_reports):
+        c = cyc[0] - int(2.0 * F_H7) + int(0.01 * m * F_H7)
+        for s in range(3):
+            produced[1].append((0x10 + s, bytes([seqs[s] & 0xFF, 1, 1, 0]) + struct.pack(
+                '<HHHI', (-6) & 0xFFFF, (-6) & 0xFFFF, crc(raw0), (c + 1000 * s) & 0xFFFFFFFF)))
+            seqs[s] += 1
+    n_pre = pre_ticks + 3 * pre_reports
+    pause = [f for f in faults if f[0] == 'report_pause']           # ('report_pause', from, to): none built
+    for k in range(n):
+        queue = produced[k]
+        for kk, w, ev, cnt_n in ENC_EVENTS:
+            if k == kk and ('drop_enc', kk) not in faults:
+                queue.append((0x35 if ev == 'S' else 0x36, bytes([w]) + struct.pack(
+                    '<HIIH', (k * 7) & 0xFFFF, cnt_n + enc_n0, cyc[k] & 0xFFFFFFFF, (k + 1) & 0xFFFF)))
+        if k == 5:
+            queue.append((0x30, bytes([1]) + struct.pack('<IH', cyc[k] & 0xFFFFFFFF, (k + 1) & 0xFFFF)))
+        if ('old_src_report', k) in faults:        # gyro report built from a frame before the log (src nf -6)
+            raw = bytes(mosi[0][i] for i in dec.MOSI_IMU_BYTES)
+            queue.append((0x10, bytes([seqs[0] & 0xFF, 1, 1, 0]) + struct.pack(
+                '<HHHI', (-6) & 0xFFFF, (-6) & 0xFFFF, crc(raw), cyc[k] & 0xFFFFFFFF)))
+            seqs[0] += 1
+        if k > 20 and k % 10 == 0 and not any(a <= k < b for _, a, b in pause):
+            src = k - 3
+            raw = bytes(mosi[src][i] for i in dec.MOSI_IMU_BYTES)
+            for s in range(3):
+                c = crc(raw)
+                if ('imu_crc', k, s) in faults:
+                    c ^= 1
+                p = bytes([seqs[s] & 0xFF, 1, 1, mosi[src][39]]) + struct.pack(
+                    '<HHHI', (src + 1) & 0xFFFF, (k + 1) & 0xFFFF, c, (cyc[k] + 1000 * s) & 0xFFFFFFFF)
+                queue.append((0x10 + s, p))
+                seqs[s] += 1
+        if k % 500 == 499:
+            drop = 0
+            for f in faults:                    # ('tick_drop', counter before the run, from frame, + after)
+                if f[0] == 'tick_drop':
+                    drop = (f[1] + (f[3] if k >= f[2] else 0)) & 0xFFFF
+            queue.append((0x40, struct.pack('<IIIH', cyc[k] & 0xFFFFFFFF, cyc[k] & 0xFFFFFFFF, cyc[k] >> 32, drop)))
+    miso = np.zeros((n, 40), dtype=np.uint8)
+    pending, qi = [], 0                                        # H7 ring: records leave one per frame
+    for j in range(2, n):
+        pending += produced[j - 1]
+        i = j - 2                                              # answer of frame i (N+2)
+        b = bytearray(40)
+        b[10:12] = struct.pack('<H', crc(mosi[i]))
+        b[12:16] = struct.pack('<I', cyc[i] & 0xFFFFFFFF)
+        b[17] = mosi[i][21]
+        b[18:20] = struct.pack('<H', (i + 1) & 0xFFFF)
+        if qi < len(pending):
+            if qi == n_pre:
+                idx += idx_jump                                # records dropped during the pause
+            typ, pl = pending[qi]
+            if ('drop_log', qi) not in faults:
+                b[22] = typ
+                b[23:25] = struct.pack('<H', idx & 0xFFFF)
+                b[25:25 + len(pl)] = pl
+            idx += 1
+            qi += 1
+        cr = crc(b[:8] + b[10:])
+        b[8:10] = struct.pack('<H', cr)
+        if ('miso_bit', j) in faults:
+            b[30] ^= 0x10
+        miso[j] = np.frombuffer(bytes(b), dtype=np.uint8)
+    return t_send_ns, mosi, miso, seqs
+
+
+# (frame, wheel, start/stop, running count of that kind on that wheel)
+ENC_EVENTS = [(1000, 0, 'S', 1), (3000, 0, 'P', 1), (3000, 0, 'S', 2), (9000, 2, 'S', 1), (15000, 0, 'P', 2),
+              (18000, 0, 'S', 3)]
+
+
+def esp32_file(tmp_path, seqs, epoch_off=1, skip=(), marks=(1_500_000, N * 1000 - 1_500_000), extra=(), resets=()):
+    """J/I lines of the reports of build(): report n of a kind is built at frame 30 + 10 n and reaches
+    the ESP32 SPI port ~300 µs later; ESP32 clock = Pi clock here (t_us = t_rx)."""
+    lines, q = [], 0
+    if marks:
+        lines.append(f'{marks[0]}\t#run_start,first_data_seq=1,timestamp_us={marks[0]},qseq=0')
+    for s, kind in enumerate((1, 2, 8)):
+        for n in range(seqs[s]):
+            q += 1
+            if (s, n) in skip:
+                continue
+            t = (30 + 10 * n) * 1000 + 300 + s
+            lines.append(f'{t}\tJ,{q},{t},{kind},1,{n % 256},{1 + epoch_off}')
+            lines.append(f'{t + 50}\tI,{q},{t + 50},{kind},1,{n % 256},{1 + epoch_off},{n},{n},0,0,0')
+    lines += list(extra)
+    for t in resets:
+        lines.append(f'{t}\tR,{q},{t},1')
+    if marks:
+        lines.append(f'{marks[1]}\t#run_end,last_data_seq=9,timestamp_us={marks[1]},qseq={q + 1}')
+    p = tmp_path / 'esp32_events.txt'
+    p.write_text('\n'.join(lines) + '\n')
+    return str(p)
+
+
+@pytest.fixture(scope='module')
+def clean():
+    return build()
+
+
+def test_clean_run(clean, tmp_path):
+    t, mosi, miso, seqs = clean
+    res = dec.decode(t, mosi, miso, esp32_file(tmp_path, seqs))
+    f = res['frames']
+    assert f['empty'] == 2 and f['miso_crc_bad'] == 0 and f['mosi_crc_bad'] == 0 and f['unanswered'] == 0
+    assert f['answer_lag'] == {2: N - 2}
+    assert res['log']['gaps'] == 0 and res['log']['h7_dropped'] == 0
+    segs = res['clock']['segments']
+    assert len(segs) == 1 and abs(segs[0]['f_h7_mhz'] - F_H7 / 1e6) < 0.01 and segs[0]['res_max_us'] < 25
+    assert res['clock']['tick_total_mismatch'] == 0
+    rp = res['reports']
+    assert rp['n'] == sum(seqs) and rp['imu_crc_bad'] == 0 and rp['imu_seq_bad'] == 0 and rp['no_source_frame'] == 0
+    m = res['esp32_match']
+    assert m['epoch_offset_esp32_minus_h7'] == 1 and m['esp32_without_h7'] == 0
+    assert 0 < m['h7_scored'] < sum(seqs) and m['matched_spi'] == m['h7_scored'] and m['not_at_esp32_spi'] == 0
+    assert res['resets_near_run_start']['ok'] and res['clock']['calibrated'] is False
+    # report build time on the Pi clock: frame k sent at ~k ms, cyc stamped D_1W_US after
+    r = next(x for x in res['_reports'] if x['kind'] == 'gyro' and x['n'] == 100)
+    assert dec.problems(res) == [] and dec.conditions(res) == []
+    calls = res['_calls']
+    assert [c[0] for c in calls[0]] == ['S', 'P', 'S', 'P', 'S'] and [c[0] for c in calls[2]] == ['S']
+    assert calls[0][1][2] == (3000 * 7) & 0xFFFF and calls[0][2][3] == 2
+    t9000 = calls[2][0][1]
+    # CYCCNT -> Pi clock is fitted to the send times, so the constant send -> callback delay is absorbed
+    assert abs(t9000 - t[9000] / 1e3) < 1
+    assert r['t_pi_us'] is not None
+
+
+def test_faults_reported(tmp_path):
+    faults = {('miso_bit', 7000), ('drop_log', 1234), ('imu_crc', 5000, 1)}
+    t, mosi, miso, seqs = build(faults=faults)
+    res = dec.decode(t, mosi, miso, esp32_file(tmp_path, seqs, skip={(0, 300)}))
+    assert res['frames']['miso_crc_bad'] == 1
+    assert res['log']['gaps'] >= 1
+    assert res['reports']['imu_crc_bad'] == 1
+    assert res['esp32_match']['not_at_esp32_spi'] == 1
+    assert len(dec.problems(res)) >= 4
+
+
+def test_missing_enc_record_reported():
+    t, mosi, miso, _ = build(faults={('drop_enc', 3000)})       # stop + start of wheel 0 lost
+    res = dec.decode(t, mosi, miso)
+    assert res['enc_calls']['count_gaps'] == 2           # a loss after the last call would not show
+
+
+def test_report_left_from_previous_link_period(clean):
+    """08/11 (HANDOFF_CODE việc 2): the real H7 starts a log with the reply staged in the previous link
+    period in frames j = 0, 1 (CLOSED_LOOP/2026-11-08_run09 w1, run11 w1: answer to its frame 20000, a
+    game RV REPORT record built there). Before the fix decode() stopped with KeyError: 0."""
+    t, mosi, miso, seqs = clean
+    miso = miso.copy()
+    b = bytearray(40)
+    b[17] = 31                                          # seq of an old frame: answers no frame of this log
+    b[18:20] = struct.pack('<H', 20000)                 # rx_nf of the old frame
+    b[22] = 0x12                                        # game RV REPORT, log index just before this log's
+    b[23:25] = struct.pack('<H', 0xFFFF)
+    b[25:25 + 14] = bytes([55, 1, 3, 109]) + struct.pack('<HHHI', 19999, 19999, 0x1234, 1_685_257_051)
+    b[8:10] = struct.pack('<H', crc(b[:8] + b[10:]))
+    miso[0] = miso[1] = np.frombuffer(bytes(b), dtype=np.uint8)
+    res = dec.decode(t, mosi, miso)
+    rp = res['reports']
+    assert rp['before_first_answer'] == 1               # carried twice, one record
+    assert rp['n'] == sum(seqs) and rp['no_source_frame'] == 0 and rp['imu_crc_bad'] == 0
+    assert res['frames']['miso_crc_bad'] == 0 and res['frames']['empty'] == 0
+    assert res['log']['gaps'] == 0
+    # j = 0, 1 answer no frame of this log: not "unanswered" (08/11), and a clean run has no problem
+    assert res['frames']['start_leftover'] == 2 and res['frames']['unanswered'] == 0
+    assert dec.problems(res) == []
+
+
+def test_report_from_frame_before_log_not_no_source():
+    """08/11: run11 w2 had 9 reports the H7 built from the last frame of the run before (Pi stopped);
+    their source is older than the first frame of the log: `src_before_log`, not `no_source_frame`."""
+    t, mosi, miso, seqs = build(n=3000, faults={('old_src_report', 3)})
+    res = dec.decode(t, mosi, miso)
+    rp = res['reports']
+    assert rp['src_before_log'] == 1 and rp['no_source_frame'] == 0 and rp['n'] == sum(seqs)
+    assert dec.problems(res) == []
+
+
+def test_report_source_missing_inside_log_still_reported():
+    """The 3 reports (one per kind) built at frame 1000 have source frame 997; the answer of 997 (j = 999)
+    has a bad CRC, so 997 is not in the frame map: a source inside the log is still `no_source_frame`."""
+    t, mosi, miso, seqs = build(n=3000, faults={('miso_bit', 999)})
+    res = dec.decode(t, mosi, miso)
+    rp = res['reports']
+    assert rp['no_source_frame'] == 3 and rp['src_before_log'] == 0
+
+
+def test_ticks_made_before_log_not_a_mismatch():
+    """08/11: run11 w1 started 21 s after the run before; TICKs made in that gap (> one 8.9 s CYCCNT wrap
+    before their carrier) were placed one wrap late and showed as '2 cặp TICK lệch _cyc_total'."""
+    t, mosi, miso, _ = build(n=5000, cyc0=20_000_000_000, pre_ticks=40)    # 20 s of TICKs before the log
+    res = dec.decode(t, mosi, miso)
+    assert res['log']['ticks_before_log'] == 40
+    assert res['clock']['tick_total_mismatch'] == 0 and res['log']['gaps'] == 0
+    assert dec.problems(res) == []
+
+
+def test_drops_during_the_pause_before_the_log_not_a_run_fault():
+    """09/11 (CLOSED_LOOP/2026-11-09_run08 b1_stop, about 32 min without link): the ring filled during the
+    pause, 13118 records were dropped (each still took an index); the old TICKs (counter 0) leave first,
+    the TICKs of the log carry 13118. Not a fault of the run: a condition, with the figures kept."""
+    t, mosi, miso, _ = build(n=5000, cyc0=20_000_000_000, pre_ticks=40, idx_jump=13118,
+                             faults={('tick_drop', 13118, 0, 0)})
+    res = dec.decode(t, mosi, miso)
+    lg = res['log']
+    assert lg['ticks_before_log'] == 40 and lg['gaps_file'] == 13118
+    assert lg['gaps'] == 0 and lg['h7_dropped'] == 0
+    assert lg['gaps_before_first_log_tick'] == 13118 and lg['h7_dropped_before_log'] == 13118
+    assert dec.problems(res) == []
+    assert any('trước TICK đầu dựng trong log' in c for c in dec.conditions(res))
+
+
+def test_drops_inside_the_log_still_reported_after_a_pause():
+    # same pause, plus 5 drops after frame 3000 and one record lost on the wire inside the log
+    t, mosi, miso, _ = build(n=5000, cyc0=20_000_000_000, pre_ticks=40, idx_jump=13118,
+                             faults={('tick_drop', 13118, 3000, 5), ('drop_log', 40 + 1000)})   # of ~1545 records
+    res = dec.decode(t, mosi, miso)
+    assert res['log']['h7_dropped'] == 5 and res['log']['gaps'] == 1
+    p = dec.problems(res)
+    assert any('H7 bỏ 5' in x for x in p) and any('hở 1 bản ghi' in x for x in p)
+
+
+def test_cut_at_the_log_start_after_reports_made_before_it():
+    """09/11 (CLOSED_LOOP/2026-11-09_run07 b4_kill9): the H7 built 3 reports per kind after the link
+    stopped; they leave first (src_before_log), then the first report of this log follows after the
+    pause (>= 128 periods): that cut is the log start, not a sequence fault."""
+    t, mosi, miso, seqs = build(n=3000, pre_reports=3)
+    res = dec.decode(t, mosi, miso)
+    rp = res['reports']
+    assert rp['src_before_log'] == 9 and rp['seq_flags'] == {}
+    starts = [r for r in res['_reports'] if r.get('seq_note') == 'log_start']
+    assert len(starts) == 3 and all(not r['src_before_log'] for r in starts)
+    assert dec.problems(res) == []
+
+
+def test_cut_inside_the_log_still_reported():
+    # no report built for 1.5 s inside the log (>= 128 periods of 10 ms): one cut per kind, still a fault,
+    # also when the log starts with reports made before it
+    t, mosi, miso, seqs = build(n=4000, pre_reports=3, faults={('report_pause', 1000, 2500)})
+    res = dec.decode(t, mosi, miso)
+    assert res['reports']['seq_flags'] == {'cut': 3}
+    assert any('số thứ tự report' in x for x in dec.problems(res))
+
+
+def test_enc_gaps_log_not_from_boot():
+    """08/11: second and later runs without an H7 reset (run11 w2, w3): the call counts n start above 1;
+    calls of earlier runs are `calls_before_log`, not gaps. From the boot (idx0 = 0) n - 1 still counts."""
+    t, mosi, miso, _ = build(n=20_000, idx0=5000, enc_n0=2)
+    res = dec.decode(t, mosi, miso)
+    ec = res['enc_calls']
+    assert ec['log_from_boot'] is False and ec['count_gaps'] == 0 and ec['calls_before_log'] == 6
+    t, mosi, miso, _ = build(n=20_000, faults={('drop_enc', 3000)}, idx0=5000, enc_n0=2)
+    assert dec.decode(t, mosi, miso)['enc_calls']['count_gaps'] == 1   # lost S inside the log; lost first P not seen
+    t, mosi, miso, _ = build(n=20_000, enc_n0=2)                         # from the boot: n - 1 are missing
+    ec = dec.decode(t, mosi, miso)['enc_calls']
+    assert ec['log_from_boot'] is True and ec['count_gaps'] == 6
+
+
+def test_mosi_crc_mismatch():
+    t, mosi, miso, _ = build(n=3000)
+    mosi = mosi.copy()
+    mosi[1500, 0] ^= 1            # the Pi log says one thing, the H7 checksummed another
+    res = dec.decode(t, mosi, miso)
+    assert res['frames']['mosi_crc_bad'] == 1
+
+
+def test_epoch_anchored_not_searched(clean, tmp_path):
+    # S7: raw epoch counters 8 apart are a valid run (both at their first epoch of the run)
+    t, mosi, miso, seqs = clean
+    m = dec.decode(t, mosi, miso, esp32_file(tmp_path, seqs, epoch_off=8))['esp32_match']
+    assert m['epoch_offset_esp32_minus_h7'] == 8 and m['not_at_esp32_spi'] == 0 and m['esp32_without_h7'] == 0
+
+
+def test_epoch_step_on_one_side_only(clean, tmp_path):
+    # S7: the ESP32 sees a reset (epoch + 1) that the H7 log never had: no anchor, reported
+    t, mosi, miso, seqs = clean
+    p = esp32_file(tmp_path, seqs)
+    lines = open(p).read().splitlines()
+    out = []
+    for ln in lines:
+        f = ln.split('\t')[1].split(',')
+        if f[0] in ('J', 'I') and int(f[2]) > 10_000_000:
+            f[6] = str(int(f[6]) + 1)
+        out.append(ln.split('\t')[0] + '\t' + ','.join(f))
+    open(p, 'w').write('\n'.join(out) + '\n')
+    res = dec.decode(t, mosi, miso, p)
+    assert res['esp32_match']['epoch_offset_esp32_minus_h7'] is None
+    assert any('không neo được' in x for x in dec.problems(res))
+
+
+def test_epoch_offset_rules():
+    # S7: same number of epochs but not stepping together (H7 1 -> 2, ESP32 2 -> 4): not anchored
+    h7 = [dict(epoch=1), dict(epoch=2)]
+    assert dec.epoch_offset(h7, [dict(epoch=2, t_us=0), dict(epoch=3, t_us=1)]) == (1, '')
+    off, note = dec.epoch_offset(h7, [dict(epoch=2, t_us=0), dict(epoch=4, t_us=1)])
+    assert off is None and 'không cùng bước' in note
+    off, note = dec.epoch_offset(h7, [dict(epoch=2, t_us=0), dict(epoch=3, t_us=1), dict(epoch=2, t_us=2)])
+    assert off is None                                   # an epoch coming back: not one-to-one
+
+
+def test_seq_chain_rules():
+    # S8: k ≥ 1, unwrap only below 128 periods, cut from 128 periods
+    items = [(s % 256, 10 * i) for i, s in enumerate(range(300))]          # clean, period 10
+    res, per = dec.seq_chain(items, lambda x: x[0], lambda x: x[1])
+    assert per == 10 and [r[0] for r in res] == list(range(300)) and not any(r[2] for r in res)
+    dup = items[:5] + [items[4]] + items[5:10]
+    assert [r[2] for r in dec.seq_chain(dup, lambda x: x[0], lambda x: x[1])[0]].count('dup') == 1
+    cut = items[:50] + [(c[0], c[1] + 2000) for c in items[50:]]          # 200 periods without report
+    r = dec.seq_chain(cut, lambda x: x[0], lambda x: x[1])[0]
+    assert r[50][2] == 'cut' and r[50][1] == 1 and len({x[0] for x in r}) == len(r)
+    jump = items[:50] + [(c[0] + 150, c[1]) for c in items[50:]]          # 150 reports lost in 1 period
+    assert dec.seq_chain(jump, lambda x: x[0], lambda x: x[1])[0][50][2] == 'seq_time_bad'
+
+
+def test_duplicate_report_seq_reported():
+    # S8: the H7 builds the same report number twice: not merged silently
+    t, mosi, miso, _ = build(n=3000)
+    miso = miso.copy()
+    # find two consecutive gyro REPORT records and give the second the seq of the first
+    rows, _ = dec.decode_frames(t, mosi, miso)
+    js = [r['j'] for r in rows if not r['empty'] and r['crc_ok'] and r['log_type'] == 0x11]
+    j0, j1 = js[10], js[11]
+    b = bytearray(miso[j1])
+    b[25] = miso[j0][25]
+    b[8:10] = struct.pack('<H', crc(b[:8] + b[10:]))
+    miso[j1] = np.frombuffer(bytes(b), dtype=np.uint8)
+    res = dec.decode(t, mosi, miso)
+    assert res['reports']['seq_flags'].get('dup') == 1 and any('dup' in x for x in dec.problems(res))
+
+
+def test_long_link_gap_keeps_clock():
+    # S11: 5 s without frames (> half the 32-bit CYCCNT range at 483 MHz): times after the gap stay right
+    t, mosi, miso, _ = build()
+    keep = np.r_[0:5000, 10000:N]
+    res = dec.decode(t[keep], mosi[keep], miso[keep])
+    segs = res['clock']['segments']
+    assert len(segs) == 2 and all(abs(s['f_h7_mhz'] - F_H7 / 1e6) < 0.01 for s in segs)
+    t15000 = next(c for c in res['_calls'][0] if c[0] == 'P' and c[3] == 2)[1]
+    assert abs(t15000 - t[15000] / 1e3) < 1
+    assert res['clock']['tick_total_mismatch'] == 0
+
+
+def test_dropped_is_run_difference():
+    # S36: the counter of TICK runs since S06Log_Init: 7 before the run and none in it is a clean run
+    t, mosi, miso, _ = build(n=3000, faults={('tick_drop', 7, 0, 0)})
+    assert dec.decode(t, mosi, miso)['log']['h7_dropped'] == 0
+    t, mosi, miso, _ = build(n=3000, faults={('tick_drop', 65534, 2000, 3)})   # +3 in the run, wraps 16 bits
+    res = dec.decode(t, mosi, miso)
+    assert res['log']['h7_dropped'] == 3 and any('bỏ 3' in x for x in dec.problems(res))
+
+
+def test_reset_near_run_start_reported(clean, tmp_path):
+    t, mosi, miso, seqs = clean
+    res = dec.decode(t, mosi, miso, esp32_file(tmp_path, seqs, resets=(1_800_000,)))
+    assert res['resets_near_run_start'] == dict(h7=0, esp32=1, ok=False)
+    assert any('V4-1' in x for x in dec.conditions(res)) and dec.problems(res) == []
+
+
+def test_report_outside_window_not_scored(clean, tmp_path):
+    # S32: a J received after the run window (H7 built it after the last Pi frame) is not a fault;
+    # one inside the window without an H7 report is
+    t, mosi, miso, seqs = clean
+    tail = [f'19800000\tJ,9999,19800000,2,1,{seqs[1] % 256},2']
+    m = dec.decode(t, mosi, miso, esp32_file(tmp_path, seqs, extra=tail))['esp32_match']
+    assert m['esp32_without_h7'] == 0 and m['not_at_esp32_spi'] == 0
+    # the same J before the start of the window is not scored either, a missing one inside is
+    m = dec.decode(t, mosi, miso, esp32_file(tmp_path, seqs, skip={(1, 5), (1, 900)}))['esp32_match']
+    assert m['not_at_esp32_spi'] == 1
+
+
+def test_calibrated_clock_adds_d1w(clean):
+    # S10: with the pulse times and d_1w the H7 event lands on its true Pi time; without, relative
+    t, mosi, miso, _ = clean
+    p0, p1 = t - 25_000, t - 15_000                       # pulse raised 15–25 µs before the send time
+    cal = dict(t_pulse0_ns=p0, t_pulse1_ns=p1, d1w_us=D_1W_US + 20.0, d1w_span_us=2.0, delta_h_us=0.5, ts_us=0.04)
+    res = dec.decode(t, mosi, miso, cal=cal)
+    c = res['clock']
+    assert c['calibrated'] and c['reference'] == 'pulse' and c['uncertainty_us'] > 10.0
+    t9000 = res['_calls'][2][0][1]
+    assert abs(t9000 - (t[9000] / 1e3 + D_1W_US)) < 25          # within the ±20 µs send jitter of build()
+    assert dec.decode(t, mosi, miso, cal=dict(t_pulse0_ns=p0, t_pulse1_ns=p1))['clock']['calibrated'] is False
+
+
+def test_unwrap_and_near():
+    assert dec.unwrap([65530, 65535, 3, 10], 16) == [65530, 65535, 65539, 65546]
+    assert dec.near(5, (1 << 32) - 10) == (1 << 32) + 5
+    assert dec.near((1 << 32) - 3, (1 << 32) + 2) == (1 << 32) - 3
+
+
+H7_REV = '598a451'           # feat/s06-h7: MISO v4 + S06 log + EncoderGen call records
+
+
+def _h7_defines(path):
+    import re
+    import subprocess
+    p = subprocess.run(['git', 'show', f'{H7_REV}:{path}'], cwd=ROOT, capture_output=True, text=True,
+                       encoding='utf-8', errors='replace')
+    if p.returncode != 0:
+        pytest.skip(f'{H7_REV} not in this clone')
+    return {m.group(1): int(m.group(2), 0) for m in re.finditer(r'#define\s+(\w+)\s+(0x[0-9A-Fa-f]+|\d+)u?\b', p.stdout)}
+
+
+def test_constants_match_h7_headers():
+    h = _h7_defines('stm32h7/Core/Inc/hil_protocol.h')
+    assert (h['HIL_MISO_CRC'], h['HIL_MISO_MOSI_CRC'], h['HIL_MISO_RX_CYC'], h['HIL_MISO_STATUS'], h['HIL_MISO_SEQ'],
+            h['HIL_MISO_RX_NF'], h['HIL_MISO_AGE'], h['HIL_MISO_LOG']) == \
+        (dec.MISO_CRC, dec.MISO_MOSI_CRC, dec.MISO_RX_CYC, dec.MISO_STATUS, dec.MISO_SEQ, dec.MISO_RX_NF,
+         dec.MISO_AGE, dec.MISO_LOG)
+    assert h['HIL_MISO_LOG_LEN'] == dec.FRAME - dec.MISO_LOG
+    s = _h7_defines('stm32h7/Core/Inc/s06_log.h')
+    assert (s['S06_REC_REPORT'], s['S06_REC_PKT_READ'], s['S06_REC_RESET_DONE'], s['S06_REC_HOLD_ON'],
+            s['S06_REC_HOLD_OFF'], s['S06_REC_RST_LOW'], s['S06_REC_RST_HIGH'], s['S06_REC_TICK'],
+            s['S06_REC_REARM'], s['S06_REC_ENC_START'], s['S06_REC_ENC_STOP']) ==         (dec.REC_REPORT, dec.REC_PKT_READ, dec.REC_RESET_DONE, dec.REC_HOLD_ON, dec.REC_HOLD_OFF, dec.REC_RST_LOW,
+         dec.REC_RST_HIGH, dec.REC_TICK, dec.REC_REARM, dec.REC_ENC_START, dec.REC_ENC_STOP)
+
+
+# ── I8: SWA command vs H7 status (report only) ──
+
+def _swa_frames(cmd, status, bad=()):
+    """MOSI with byte 20 bit 3 = cmd[j]; MISO with status bit 0 = status[j] and a valid CRC,
+    except frames in bad (all zero)."""
+    n = len(cmd)
+    mosi = np.zeros((n, 40), np.uint8)
+    miso = np.zeros((n, 40), np.uint8)
+    for j in range(n):
+        mosi[j, 20] = 0x08 if cmd[j] else 0
+        if j in bad:
+            continue
+        miso[j, 16] = 1 if status[j] else 0
+        miso[j, 17] = j & 0xFF
+        b = bytes(miso[j])
+        c = dec.crc16(b[:8] + b[10:])
+        miso[j, 8], miso[j, 9] = c & 0xFF, c >> 8
+    return mosi, miso
+
+
+def test_swa_summary_follow_lag():
+    cmd = [0] * 10 + [1] * 30 + [0] * 25
+    st = [0] * 18 + [1] * 30 + [0] * 17          # status follows 8 frames after each change
+    s = dec.swa_summary(*_swa_frames(cmd, st))
+    assert s['cmd_changes'] == [10, 40] and s['status_changes'] == [18, 48]
+    assert s['follow_lag_frames'] == [8, 8] and s['follow_lag_max'] == 8
+    assert s['unfollowed'] == 0 and s['unobserved'] == 0 and s['held_mismatch'] == 0 and s['held_checked'] > 0
+    assert s['cmd_on_frames'] == 30 and s['cmd_first'] == 0
+
+
+def test_swa_summary_status_never_follows():
+    cmd = [0] * 5 + [1] * 40
+    s = dec.swa_summary(*_swa_frames(cmd, [0] * 45))     # H7 without I8: status stays 0
+    assert s['unfollowed'] == 1 and s['follow_lag_max'] is None and s['held_mismatch'] == 45 - 25
+
+
+def test_swa_summary_fixed_command_never_followed():
+    # I8-7: no command change at all, status wrong the whole log
+    assert dec.swa_summary(*_swa_frames([1] * 40, [0] * 40))['held_mismatch'] == 40 - 20
+    assert dec.swa_summary(*_swa_frames([0] * 40, [1] * 40))['held_mismatch'] == 40 - 20
+
+
+def test_swa_summary_status_blip_caught():
+    # I8-7: status turns on once and off again while the command stays on
+    cmd = [0] * 10 + [1] * 40 + [0] * 25
+    st = [0] * 11 + [1] + [0] * 63
+    s = dec.swa_summary(*_swa_frames(cmd, st))
+    assert s['held_mismatch'] > 0 and s['unfollowed'] == 1      # round 1 code took it as a 1-frame lag
+
+
+def test_swa_summary_end_of_log_is_unobserved_not_unfollowed():
+    # I8-6: the off command on the last row of the log has no answer yet
+    cmd = [0] * 10 + [1] * 30 + [0]
+    st = [0] * 18 + [1] * 23
+    s = dec.swa_summary(*_swa_frames(cmd, st))
+    assert s['unobserved'] == 1 and s['unfollowed'] == 0 and s['follow_lag_frames'] == [8]
+
+
+def test_swa_summary_quick_changes():
+    # I8-8: on at 10, off at 11; the H7 takes the on (status 13..19), then off at 20
+    cmd = [0] * 10 + [1] + [0] * 40
+    st = [0] * 13 + [1] * 7 + [0] * 31
+    s = dec.swa_summary(*_swa_frames(cmd, st))
+    assert s['unobserved'] == 1 and s['unfollowed'] == 0      # the 1-frame on is not judged
+    assert s['follow_lag_frames'] == [9]                       # the off: first status 0 from frame 13 on is 20
+    assert s['held_mismatch'] == 0
+
+
+def test_swa_summary_skips_empty_miso():
+    cmd = [0] * 5 + [1] * 30
+    st = [0] * 5 + [1] * 30
+    s = dec.swa_summary(*_swa_frames(cmd, st, bad=(7, 8)))     # the first two answers after the change lost
+    assert s['follow_lag_frames'] == [4]
+
+
+def test_swa_in_decode_result(clean):
+    t, mosi, miso, _ = clean
+    s = dec.decode(t, mosi, miso)['swa']
+    assert s['cmd_on_frames'] == 0 and s['held_mismatch'] == 0   # a log from before I8: command 0, status 0

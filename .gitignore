@@ -12,3 +12,9 @@ __pycache__/
 
 # fwsim DLL build output (rebuild with python fwsim/build_fwsim.py)
 fwsim/build/
+
+# bnoemu_pc build output (rebuild with python bnoemu_pc/build_bnoemu.py)
+bnoemu_pc/build/
+
+# H7 firmware id header, written by stm32h7/scripts/fw_id.py at build time (CubeIDE pre-build)
+stm32h7/Core/Inc/fw_id_gen.h

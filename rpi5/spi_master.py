@@ -9,7 +9,7 @@ Hardware config:
   Interface:  /dev/spidev0.0  (SPI bus 0, CE0)
   Mode:       SPI Mode 0 (CPOL=0, CPHA=0) — matches H7 SPI slave default
   Speed:      1 MHz initial  →  increase to 4 MHz after loopback validation
-  Frame:      36 bytes (see protocol.py for layout)
+  Frame:      40 bytes (see protocol.py for layout)
   CS:         Hardware (GPIO8 / CE0), active low
 
 Enable SPI on RPi5 (if not already):
@@ -46,6 +46,8 @@ class SPIMaster:
 
     In simulate=True mode, MISO = MOSI echo (software loopback).
     This lets you test protocol framing without real hardware attached.
+    With a responder (e.g. fake_h7.FakeH7), simulate mode returns
+    responder(mosi) instead, a MISO frame with the real H7 layout.
     """
 
     def __init__(
@@ -54,22 +56,28 @@ class SPIMaster:
         device:    int   = 0,
         speed_hz:  int   = 1_000_000,
         simulate:  bool  = False,
+        responder        = None,
     ):
         """
         Args:
-            bus:      SPI bus index (0 → /dev/spidev0.x).
-            device:   SPI device index (0 → /dev/spidev0.0, CE0).
-            speed_hz: SPI clock [Hz]. Start at 1 MHz; increase after HW validation.
-            simulate: Loopback mode — no real hardware needed.
+            bus:       SPI bus index (0 → /dev/spidev0.x).
+            device:    SPI device index (0 → /dev/spidev0.0, CE0).
+            speed_hz:  SPI clock [Hz]. Start at 1 MHz; increase after HW validation.
+            simulate:  Loopback mode — no real hardware needed.
+            responder: Callable(mosi) -> miso used in simulate mode instead of the echo.
         """
         self.bus       = bus
         self.device    = device
         self.speed_hz  = speed_hz
         self.simulate  = simulate
+        self.responder = responder
 
         self._spi: Optional[object] = None
         self._n_transfers: int = 0
         self._n_errors:    int = 0
+
+        if responder is not None and not simulate:
+            raise ValueError("responder is only for simulate=True")
 
         if not simulate:
             self._open()
@@ -103,7 +111,7 @@ class SPIMaster:
         Perform one full-duplex SPI transaction.
 
         Args:
-            tx: MOSI payload, exactly FRAME_SIZE (36) bytes.
+            tx: MOSI payload, exactly FRAME_SIZE (40) bytes.
 
         Returns:
             MISO payload, exactly FRAME_SIZE bytes.
@@ -120,6 +128,18 @@ class SPIMaster:
         self._n_transfers += 1
 
         if self.simulate:
+            if self.responder is not None:
+                # Same error contract as the hardware path below (B0 review B13)
+                try:
+                    rx = bytes(self.responder(bytes(tx)))
+                except Exception as exc:
+                    self._n_errors += 1
+                    raise RuntimeError(f"SPI transfer failed: {exc}") from exc
+                if len(rx) != FRAME_SIZE:
+                    self._n_errors += 1
+                    raise RuntimeError(f"SPI transfer failed: responder returned {len(rx)} bytes, "
+                                       f"need {FRAME_SIZE}")
+                return rx
             # Loopback: H7 echoes MOSI back as MISO (for protocol tests)
             return bytes(tx)
 

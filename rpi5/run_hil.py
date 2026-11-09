@@ -25,6 +25,18 @@ python run_hil.py --loopback-test --steps 1000
 # 6. EncoderGen check: send constant wheel speeds (no dynamics), 15 s
 sudo python run_hil.py --fixed-omega 10,20,-10,-20 --steps 15000 --no-traj
 
+# 6b. EncoderGen check with speed changes in one run (bug H7-ENC-RETIME): 2 rad/s
+#     for 20 s, step to 39.2 for 30 s, stop 5 s ('~' = ramp from the previous speeds)
+sudo python run_hil.py --omega-steps 2,2,2,2:20/39.2,39.2,39.2,39.2:30/0,0,0,0:5
+
+# 6c. Finite run: ARM (setpoint 0) -> RUN -> STOPPING (setpoint 0, 1 s) -> END; Ctrl+C = STOP
+sudo python run_hil.py --test A-K1 --finite-run
+python run_hil.py --mock --test A-K1 --finite-run      # dry run on a fake H7
+
+# 7. BNO085 emulator check (G2): constant IMU values, 60 s, no trajectory
+#    (gz,ax,ay,az,yaw in rad/s, m/s^2, m/s^2, m/s^2, rad)
+sudo python run_hil.py --imu-static 0.5,0.2,-0.1,9.81,1.0 --steps 60000 --no-traj
+
 Notes
 ──────
 - sudo required for SCHED_FIFO (or grant cap_sys_nice).
@@ -63,8 +75,35 @@ def _parse_fixed_omega(text: str) -> list:
     return vals
 
 
+def _parse_omega_steps(text: str) -> list:
+    """'2,2,2,2:20/~39.2,39.2,39.2,39.2:0.3' -> [([2.0]*4, 20.0, False), ([39.2]*4, 0.3, True)].
+    Segments split by '/': W1,W2,W3,W4:seconds; a leading '~' ramps from the previous speeds.
+    '@T5_pass1.csv' reads the segments from a T5 schedule (t5_schedule.py, S06 T5)."""
+    if text.startswith('@'):
+        import t5_schedule
+        return t5_schedule.segments(t5_schedule.read_csv(text[1:]))
+    segs = []
+    for part in text.split('/'):
+        part = part.strip()
+        ramp = part.startswith('~')
+        w, sep, dur = part.lstrip('~').partition(':')
+        if not sep:
+            raise ValueError(f'--omega-steps segment "{part}" needs W1,W2,W3,W4:seconds')
+        omegas = _parse_fixed_omega(w)
+        d = float(dur)
+        if d <= 0:
+            raise ValueError(f'--omega-steps segment "{part}": duration must be > 0')
+        segs.append((omegas, d, ramp))
+    if not segs:
+        raise ValueError('--omega-steps needs at least one segment')
+    return segs
+
+
 def _run_plant(cfg, shared_state: mp.Array, shared_ref: mp.Array, use_mock: bool, seed: int = 0,
-               wheels_lifted: bool = False, fixed_omega: list = None) -> None:
+               wheels_lifted: bool = False, fixed_omega: list = None,
+               omega_steps: list = None, monitor=None,
+               ground: str = None, mu: float = None, omega_schedule: str = None,
+               step_log=None, control=None) -> None:
     """Process 1 target: plant simulation loop."""
     import logging
     logging.basicConfig(
@@ -77,25 +116,119 @@ def _run_plant(cfg, shared_state: mp.Array, shared_ref: mp.Array, use_mock: bool
 
     from hil_node import HILNode
     from mecanum_plant import MecanumPlant
-    from plant_interface import MockPlant
+    from plant_interface import MockPlant, OmegaProfilePlant
 
+    import numpy as np
     from params import MecanumParams
     params = MecanumParams()
     if wheels_lifted:
         params.update_physical(wheels_lifted=True)     # spec S02 A-K: wheels off the ground
+    if ground:
+        params.ground_model = ground                   # QD 25: 'traction' = slip method A
+    if mu is not None:
+        params.mu_hd = np.full(4, mu)
     if fixed_omega is not None:
         # EncoderGen check: constant wheel speeds, no dynamics; SPI/GPIO path stays real
         plant = MockPlant()
         plant.reset(list(fixed_omega) + [0.0] * 6)
         logging.getLogger('hil.main').info('Fixed wheel omega [rad/s] = %s (no plant dynamics)', fixed_omega)
+    elif omega_schedule is not None:
+        # S06 T3b: wheel speeds from T3b_schedule.csv (t3b_schedule.py), no dynamics
+        from t3b_schedule import read_csv, ScheduleOmegaPlant
+        sched = read_csv(omega_schedule)
+        plant = ScheduleOmegaPlant(sched)
+        logging.getLogger('hil.main').info('T3b schedule %s: %d transitions, %d steps, then 0',
+                                           omega_schedule, len(sched), plant.total_steps)
+    elif omega_steps is not None:
+        # EncoderGen check with speed changes in one run (bug H7-ENC-RETIME)
+        plant = OmegaProfilePlant(omega_steps, dt=cfg.period_us / 1e6)
+        logging.getLogger('hil.main').info('Wheel omega profile (no plant dynamics): %s, %d steps, then 0',
+                                           omega_steps, plant.total_steps)
     else:
         plant = MockPlant() if use_mock else MecanumPlant(params=params, dt=cfg.period_us / 1e6, seed=seed)
-    logging.getLogger('hil.main').info('Plant RNG seed = %s, wheels_lifted = %s', seed, wheels_lifted)
-    node  = HILNode(plant, config=cfg, shared_state=shared_state, shared_ref=shared_ref)
+    logging.getLogger('hil.main').info('Plant RNG seed = %s, wheels_lifted = %s, ground_model = %s, mu_hd = %s',
+                                       seed, wheels_lifted, params.ground_model, list(np.broadcast_to(params.mu_hd, (4,))))
+    responder = None
+    if use_mock and cfg.lifecycle is not None:
+        # the --mock echo never leaves ARM (MISO seq does not change); section 9.1: fake_h7
+        from fake_h7 import FakeH7
+        responder = FakeH7()
+    node  = HILNode(plant, config=cfg, shared_state=shared_state, shared_ref=shared_ref,
+                    monitor=monitor, step_log=step_log, control=control, responder=responder)
     node.run()
+    if node.run_failed:
+        sys.exit(3)
 
 
-def _run_traj(spec, port: str, simulate: bool, shared_ref: mp.Array, uart_direct: bool) -> None:
+def _report_plant_stats(p1, monitor, stats_interval: int, step_csv=None, owner=None) -> None:
+    """
+    Print the plant-loop lateness stats every stats_interval steps from this
+    (non real-time) process while the plant process runs, then once for the
+    whole run (THESIS H2: nothing printed or sorted inside the 1 kHz loop).
+    step_csv (S06 T2): drained here every 0.2 s. owner (--finite-run): called every
+    0.1 s, the heartbeat of the run owner (section 9.1, 10 Hz).
+    """
+    from rt_monitor import RTMonitor, I_STEP
+    try:
+        os.sched_setaffinity(0, {1, 3})        # stay off core 0 (plant loop)
+    except (AttributeError, OSError, ValueError):
+        pass
+    prev, next_step, t0 = None, stats_interval, None
+    while p1.is_alive():
+        p1.join(timeout=0.1 if owner is not None else 0.2)
+        if owner is not None:
+            owner()
+        if step_csv is not None:
+            step_csv.drain()
+        snap = monitor.snapshot()
+        if t0 is None and snap[I_STEP] > 0:
+            t0 = time.monotonic() - snap[I_STEP] / 1_000.0
+        if snap[I_STEP] < next_step:
+            continue
+        while next_step <= snap[I_STEP]:
+            next_step += stats_interval
+        s = RTMonitor.window_stats(snap, prev)
+        prev = snap
+        el = time.monotonic() - t0
+        log.info('step=%-8d  t=%5.1f s  rate=%6.0f Hz  jitter (last %d ticks) p99=%s us  max=%s us  '
+                 '>warn: %d  overruns=%d',
+                 s['step'], el, s['step'] / el if el > 0 else 0, s['n'], s.get('p99_us'),
+                 s.get('max_us'), s['warn'], s['overruns'])
+    s = RTMonitor.window_stats(monitor.snapshot())
+    log.info('Plant loop jitter, whole run (n=%d): p99=%s us  p99.9=%s us  max=%.1f us  '
+             '>warn: %d  overruns=%d',
+             s['n'], s.get('p99_us'), s.get('p999_us'), s['max_all_us'], s['warn'], s['overruns'])
+
+
+def _owner_tick(box, publisher) -> None:
+    """One beat of the run owner: heartbeat, then what became of the publisher."""
+    box.beat(time.monotonic_ns())
+    if publisher.is_alive() or box.stop_requested():
+        return                            # after STOP the publisher may leave any way it likes
+    if publisher.exitcode == 0:
+        box.publisher_done()
+    else:
+        box.publisher_dead()
+
+
+def _finite_run_config(args, spec):
+    """--finite-run: (LifecycleConfig, ceiling in steps), or SystemExit on a bad combination."""
+    from run_lifecycle import LifecycleConfig
+    bad = [name for name, on in (('--steps', args.steps), ('--no-traj', args.no_traj),
+                                 ('--traj-loop', args.traj_loop), ('--fixed-omega', args.fixed_omega),
+                                 ('--omega-steps', args.omega_steps), ('--omega-schedule', args.omega_schedule),
+                                 ('--load-schedule', args.load_schedule)) if on]
+    if bad:
+        raise SystemExit(f'--finite-run decides the end of the run itself, it excludes {", ".join(bad)}')
+    if spec.duration <= 0:
+        raise SystemExit('--finite-run needs a finite trajectory (--duration or --test)')
+    lc = LifecycleConfig(run_s=spec.duration)
+    # Ceiling only, the phases end first: it sizes the frame log, and a bug here cannot run forever
+    return lc, int((lc.arm_timeout_s + lc.run_s + lc.run_grace_s + lc.stop_s + 2.0) * 1000)
+
+
+def _run_traj(spec, port: str, simulate: bool, shared_ref: mp.Array, uart_direct: bool,
+              control=None) -> None:
     """Process 2 target: trajectory publisher."""
     import logging
     logging.basicConfig(
@@ -107,7 +240,7 @@ def _run_traj(spec, port: str, simulate: bool, shared_ref: mp.Array, uart_direct
 
     from trajectory_pub import TrajectoryPublisher
     pub = TrajectoryPublisher(spec=spec, port=port, simulate=simulate,
-                              shared_ref=shared_ref, uart_direct=uart_direct)
+                              shared_ref=shared_ref, uart_direct=uart_direct, control=control)
     pub.run()
 
 
@@ -195,10 +328,64 @@ def _parse_args() -> argparse.Namespace:
                    help='BCM sync GPIO pin')
     p.add_argument('--no-traj',       action='store_true',
                    help='Skip trajectory publisher process')
+    p.add_argument('--imu-static',    default=None, metavar='GZ,AX,AY,AZ,YAW',
+                   help='BNO085 emulator check (G2): send these constant IMU values '
+                        '[rad/s, m/s^2, m/s^2, m/s^2, rad] in every frame instead of the '
+                        'plant values (imu_seq still changes every frame)')
+    p.add_argument('--ground',        default=None, choices=['rigid', 'traction'],
+                   help='plant ground contact (default: params.py ground_model); '
+                        'traction = slip method A (QD 25)')
+    p.add_argument('--mu',            type=float, default=None,
+                   help='mu_hd of all four wheels for --ground traction')
+    p.add_argument('--imu-profile',   default=None, choices=['t4'],
+                   help='S06 T4 (4): send the locked IMU sequence of t4_imu_profile.py '
+                        '(static levels then a 5 s ramp, 27 s cycle) instead of the plant values')
+    p.add_argument('--step-log',      default='', metavar='CSV',
+                   help='S06 T2: t_sched, t_start, t_done, t_end of every plant step to this CSV '
+                        '(shared ring, written outside the 1 kHz loop); counts in <CSV>.json')
     p.add_argument('--fixed-omega',   default=None, metavar='W1,W2,W3,W4',
                    help='EncoderGen check: send these constant wheel speeds [rad/s] instead of '
-                        'running the plant (use with --steps; implies --no-traj)')
+                        'running the plant (use with --steps)')
+    p.add_argument('--omega-steps',   default=None, metavar='W1,W2,W3,W4:S/...',
+                   help='EncoderGen check: play this wheel-speed profile [rad/s, s] instead of the '
+                        'plant, segments split by "/", a leading "~" ramps from the previous speeds; '
+                        '"@CSV" plays a T5 schedule (t5_schedule.py); --steps 0 = the profile length')
+    p.add_argument('--omega-schedule', default=None, metavar='CSV',
+                   help='S06 T3b: play the wheel speeds of T3b_schedule.csv (t3b_schedule.py) instead '
+                        'of the plant; --steps 0 = the schedule length')
+    p.add_argument('--traj-loop',     action='store_true',
+                   help='Trajectory publisher starts the trajectory again when --duration is '
+                        'reached (S06 V7), instead of stopping')
+    p.add_argument('--load-schedule', default=None, metavar='CSV',
+                   help='S06 V7, Z8: play the file of s06_load_schedule.py: group A setpoints in its order, '
+                        'heavy block on the omega sent to the H7, full plant dynamics; --steps 0 = its length')
+    p.add_argument('--frame-log',     default='', metavar='NPZ',
+                   help='S06: save raw MOSI + MISO of every frame and its send time '
+                        '(time.monotonic_ns) to this .npz after the run')
+    p.add_argument('--finite-run',    action='store_true',
+                   help='Run phases of run_lifecycle.py: ARM (plant held, setpoint 0), RUN (the trajectory), '
+                        'STOPPING (setpoint 0 for 1 s), END. Needs a finite trajectory; Ctrl+C = STOP, '
+                        'a second Ctrl+C kills the run. --mock uses the fake H7. Exit code 3 = error')
+    p.add_argument('--no-rt-tune',    action='store_true',
+                   help='Without mlockall, GC off and touching the frame log, to compare timing '
+                        '(the frame log manifest says which run was which)')
+    p.add_argument('--swa',           choices=('auto', 'on', 'off'), default='auto',
+                   help='I8: RC switch SWA in the iBUS frames of the H7 (DUT motors). auto: with '
+                        '--finite-run on in RUN and STOPPING only; without it on when a trajectory '
+                        'runs and no omega mode is set, off otherwise (diagnostics). on / off: fixed')
     return p.parse_args()
+
+
+def resolve_swa(swa: str, finite_run: bool, n_omega_modes: int, traj_kind: str, no_traj: bool) -> str:
+    """I8 (Liam 09/11, "Duyet ca 5", bang 2.4 of the proposal): --swa -> HILConfig.swa_mode."""
+    if swa in ('on', 'off'):
+        return swa
+    if swa != 'auto':
+        raise ValueError(f'--swa {swa!r}')
+    if finite_run:
+        return 'phase'
+    # I8-2 (Codex round 1): --no-traj starts no publisher, so there is no trajectory to run
+    return 'on' if (n_omega_modes == 0 and traj_kind != 'idle' and not no_traj) else 'off'
 
 
 # ── Main ──────────────────────────────────────────────────────────────────
@@ -208,9 +395,9 @@ def main() -> int:
 
     # ── Jitter-only mode ─────────────────────────────────────────────────
     if args.jitter_only:
-        from timing import measure_jitter
+        from timing import jitter_ok, measure_jitter
         stats = measure_jitter(n_ticks=args.jitter_n, period_us=1_000, rt=True)
-        return 0 if stats.get('max_us', 9999) < 500 else 1
+        return 0 if jitter_ok(stats) else 1         # a failed restore fails too (B0 round 3 N17)
 
     # ── Loopback test ────────────────────────────────────────────────────
     if args.loopback_test:
@@ -218,8 +405,40 @@ def main() -> int:
 
     # ── Normal HIL run ───────────────────────────────────────────────────
     from hil_node import HILConfig
+    from imu_model import parse_imu_static
     from trajectory_pub import TrajectorySpec, GROUP_A, LIFTED_TESTS
 
+    # S06 (Y3, V7): the omega modes keep the trajectory publisher running
+    # (before: they forced --no-traj); --no-traj still turns it off.
+    omega_steps = _parse_omega_steps(args.omega_steps) if args.omega_steps else None
+    n_modes = sum(x is not None and x is not False for x in (args.fixed_omega, args.omega_steps, args.omega_schedule))
+    if n_modes > 1:
+        raise SystemExit('--fixed-omega, --omega-steps and --omega-schedule exclude each other')
+    if omega_steps is not None and not args.steps:
+        args.steps = int(round(sum(d for _, d, _ in omega_steps) * 1000))
+    if args.omega_schedule and not args.steps:
+        from t3b_schedule import read_csv
+        args.steps = max(r.slot_end_ms for r in read_csv(args.omega_schedule))
+
+    if args.imu_static and args.imu_profile:
+        raise SystemExit('--imu-static and --imu-profile exclude each other')
+    load_rows, heavy_block, load_id = None, None, ''
+    if args.load_schedule:
+        # S06 Z8: full plant dynamics, relay running; nothing else may set omega or the trajectory
+        if n_modes or args.test or args.traj != 'idle' or args.no_traj or args.traj_loop:
+            raise SystemExit('--load-schedule excludes the omega modes, --test, --traj, --no-traj, --traj-loop')
+        import s06_load_schedule as lsched
+        load_rows = lsched.read_csv(args.load_schedule)
+        try:
+            lsched.check(load_rows)
+        except ValueError as exc:
+            raise SystemExit(str(exc))
+        n_load = lsched.total_steps(load_rows)
+        if args.steps not in (0, n_load):
+            raise SystemExit(f'--steps {args.steps} differs from the schedule ({n_load} steps)')
+        args.steps = n_load
+        heavy_block = lsched.heavy_span(load_rows)
+        load_id = f'{args.load_schedule} {lsched.file_sha256(args.load_schedule)}'
     hil_cfg = HILConfig(
         period_us    = 1_000,
         rt_priority  = args.rt_priority,
@@ -228,17 +447,25 @@ def main() -> int:
         spi_speed_hz = args.spi_speed,
         max_steps    = args.steps,
         simulate_hw  = args.mock,
+        imu_static   = parse_imu_static(args.imu_static) if args.imu_static else None,
+        imu_profile  = args.imu_profile,
+        frame_log    = args.frame_log,
+        rt_tune      = not args.no_rt_tune,
+        heavy_block  = heavy_block,
+        load_schedule = load_id,
     )
     traj_spec = TrajectorySpec(
         kind     = args.traj,
         v        = args.speed,
         radius   = args.radius,
         duration = args.duration,
+        loop     = args.traj_loop,
     )
     lifted = False
     fixed_omega = _parse_fixed_omega(args.fixed_omega) if args.fixed_omega else None
-    if fixed_omega is not None:
-        args.no_traj = True
+    if load_rows is not None:
+        traj_spec = lsched.trajectory_spec(load_rows)
+        args.traj = traj_spec.kind
     if args.test:
         if args.test not in GROUP_A:
             raise SystemExit(f'--test must be one of {sorted(GROUP_A)}')
@@ -247,18 +474,38 @@ def main() -> int:
         args.traj = traj_spec.kind
         log.info('Group A test %s: %s', args.test, traj_spec)
 
+    control, owner = None, None
+    if args.finite_run:
+        from run_lifecycle import ControlBox
+        hil_cfg.lifecycle, hil_cfg.max_steps = _finite_run_config(args, traj_spec)
+        args.steps = hil_cfg.max_steps
+        control = ControlBox()
+        control.beat(time.monotonic_ns())
+    hil_cfg.swa_mode = resolve_swa(args.swa, args.finite_run, n_modes, args.traj, args.no_traj)
+    log.info('SWA (I8): --swa %s -> %s', args.swa, hil_cfg.swa_mode)
+
     # Shared state array: plant writes, trajectory pub can read (optional)
     shared_state = mp.Array('d', 10)
     # Shared setpoint: trajectory pub writes [vx_ref, vy_ref, wz_ref, counter],
     # plant loop packs it into the SPI frame for the H7 → ESP32 relay
     shared_ref = mp.Array('d', 4)
+    # Plant-loop lateness counters, read by this process (rt_monitor.py, THESIS H2)
+    from rt_monitor import RTMonitor
+    monitor = RTMonitor(warn_us=hil_cfg.jitter_warn_us)
+    # S06 T2: per-step timestamps through a shared ring, drained by this process
+    step_log, step_csv = None, None
+    if args.step_log:
+        from step_log import StepLog, StepLogCSV
+        step_log = StepLog()
+        step_csv = StepLogCSV(step_log, args.step_log, period_ns=hil_cfg.period_us * 1_000)
 
     # Build process list
     procs = []
 
     p1 = mp.Process(
         target=_run_plant,
-        args=(hil_cfg, shared_state, shared_ref, args.mock, args.seed, lifted, fixed_omega),
+        args=(hil_cfg, shared_state, shared_ref, args.mock, args.seed, lifted, fixed_omega,
+              omega_steps, monitor, args.ground, args.mu, args.omega_schedule, step_log, control),
         name='HIL-Plant',
         daemon=True,
     )
@@ -267,11 +514,13 @@ def main() -> int:
     if not args.no_traj:
         p2 = mp.Process(
             target=_run_traj,
-            args=(traj_spec, args.uart_port, args.mock, shared_ref, args.traj_uart_direct),
+            args=(traj_spec, args.uart_port, args.mock, shared_ref, args.traj_uart_direct, control),
             name='HIL-TrajPub',
             daemon=True,
         )
         procs.append(p2)
+        if control is not None:
+            owner = lambda: _owner_tick(control, p2)
 
     log.info(
         "Starting HIL: traj=%s  mock=%s  steps=%d  spi=%d kHz",
@@ -284,6 +533,10 @@ def main() -> int:
 
     # ── Wait + clean shutdown ────────────────────────────────────────────
     def _stop(signum, _frame):
+        if control is not None and not control.stop_requested():
+            log.info("Received signal %d — STOP: setpoint 0, then the end of the run", signum)
+            control.request_stop()
+            return
         log.info("Received signal %d — shutting down …", signum)
         for proc in procs:
             if proc.is_alive():
@@ -292,9 +545,21 @@ def main() -> int:
     signal.signal(signal.SIGINT,  _stop)
     signal.signal(signal.SIGTERM, _stop)
 
-    # Primary: wait for plant loop
+    # Primary: wait for plant loop, printing its stats from here
+    _report_plant_stats(p1, monitor, hil_cfg.stats_interval, step_csv, owner)
     p1.join()
     log.info("Plant process exited (code=%s)", p1.exitcode)
+    if step_csv is not None:
+        import json
+        import platform
+        meta = step_csv.close()
+        # the whole command line: shows the load of the run (e.g. --frame-log shared with S06 T1)
+        meta['argv'] = sys.argv
+        meta['uname'] = ' '.join(platform.uname())       # X8: the kernel of the run
+        with open(args.step_log + '.json', 'w') as f:
+            json.dump(meta, f, indent=1)
+        log.info('Step log: %d rows -> %s; overflow=%d lost_or_torn=%d', meta['rows'], args.step_log,
+                 meta['overflow'], meta['lost_or_torn'])
 
     # Cleanup secondaries
     for proc in procs:

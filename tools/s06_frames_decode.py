@@ -1,0 +1,983 @@
+#!/usr/bin/env python3
+"""
+s06_frames_decode.py — giải mã `frames.npz` (run_hil.py --frame-log: t_send_ns, MOSI, MISO thô)
+cho S06 v3.4, với H7 MISO bản 4 (hil-framework feat/s06-h7 3235ec5; thiết kế
+03_CODE/docs/2026-10-29_Thiet_ke_H7_S06.md mục 2–3 của repo luận văn).
+
+Bốn phần:
+  1. CRC (T1, Y9, Z3): CRC-16/CCITT-FALSE (= binascii.crc_hqx(data, 0xFFFF)).
+     * MISO: byte 8–9 (LE) = CRC trên byte 0–7 và 10–39 của chính frame MISO.
+     * MOSI: byte 10–11 của MISO (LE) = CRC trên 40 byte MOSI thô của frame được trả lời; frame
+       được trả lời tìm theo `seq` (MISO byte 17 = MOSI byte 21), trong 1–4 frame trước; báo
+       phân bố độ trễ trả lời (bản `fix/h7-frame`: luôn 2).
+     * Frame MISO toàn 0 (H7 chưa dựng lần nào, đầu lượt) đếm riêng, không tính CRC sai.
+  2. Luồng log H7 (§4.3 điều 6): byte 22 loại, 23–24 chỉ số liên tục 16 bit, 25–39 nội dung; lấy
+     từ frame MISO có CRC đúng; bỏ trùng theo chỉ số (frame lặp); mở vòng 16 bit; báo chỗ hở và
+     số bản ghi H7 bỏ vì đầy (bản ghi TICK cuối).
+  3. Khớp đồng hồ H7 → RPi5: cặp (t_send của frame được trả lời, CYCCNT lúc callback = MISO byte
+     12–15, mở vòng 32 bit theo thứ tự frame), bình phương tối thiểu t_pi = a + b·cyc theo từng
+     đoạn; đoạn cắt ở bản ghi REARM và ở khoảng trống > 0,5 s. Báo f_H7 = 1/b, phần dư lớn nhất.
+     Kiểm thêm: hiệu `_cyc_total` giữa hai TICK = hiệu CYCCNT đã mở vòng.
+     Mọi bản ghi có `cyc` được mở vòng quanh CYCCNT của frame tham chiếu (frame `nf` trong bản ghi
+     nếu có, không thì frame mang bản ghi) rồi quy ra giờ Pi.
+  4. Report IMU (T1, T4, T8; khóa report Z3): bản ghi REPORT (0x10 accel, 0x11 gyro, 0x12 game RV)
+     → `rpt_seq`, epoch, `imu_seq`, `src_nf`, `imu_crc`. Kiểm `imu_crc` với CRC 10 byte IMU thô
+     (MOSI 22–23, 31–38) của frame nguồn và `imu_seq` với MOSI byte 39 (frame nguồn tìm theo
+     `rx_nf` → frame Pi). Ghép với ESP32 (dòng J ở cổng SPI, dòng I ở callback của
+     `esp32_events.txt`) theo khóa (epoch, loại, số thứ tự mở vòng trong epoch); độ lệch epoch
+     ESP32 − H7 chọn theo số cặp khớp nhiều nhất và báo ra.
+
+Thêm (việc (5)): bản ghi 0x35/0x36 (mỗi lần gọi `_start_wheel`/`_stop`: bánh, CNT, số lần gọi, CYCCNT)
+→ danh sách lần gọi theo bánh trên giờ Pi cho tools/t3b_score.py; số lần gọi hở = thiếu bản ghi (lần
+gọi mất sau lần gọi cuối cùng của một loại thì không thấy được).
+Giờ Pi của sự kiện H7 (S10, spec dòng 111): khớp CYCCNT với mốc xung đồng bộ (`t_pulse0_ns`/`t_pulse1_ns`
+của frames.npz, ghi ngay trước/sau lệnh nâng chân) rồi cộng d_1w trung vị; bất định theo công thức spec.
+Thiếu mốc xung hoặc thiếu d_1w/δ_H/t_s (`--d1w-us` …): khớp theo giờ GỬI frame, trễ gửi → callback nằm
+trong phần bù, `clock.calibrated = false`: giờ đó chỉ là tương đối, công cụ không chấm theo nó.
+Sửa theo Codex Sol vòng 1/2 (Liam duyệt 30/10 "Duyệt, sửa hết"): S7 neo epoch theo lượt + kiểm reset
+±1 s quanh #run_start; S8 mở vòng report có luật k ≥ 1 và cắt ở 128 chu kỳ; S9/S34 callback lấy danh
+tính của report cổng SPI cùng seq gần nhất theo thời gian; S10 như trên; S11 mở vòng CYCCNT theo giờ Pi;
+S32 chỉ chấm ghép report trong khung chung bớt 0,5 s mỗi đầu [ĐỀ XUẤT CODE]; S36 `dropped` lấy hiệu TICK.
+Chưa có (ghi rõ): đồng hồ ESP32 → RPi5 (cần chân đánh dấu). Chưa thử với frame thật của H7 (chỉ dữ liệu tổng hợp, tools/tests/test_s06_frames_decode.py).
+
+Usage:
+  python tools/s06_frames_decode.py <frames.npz> [--esp32-events esp32_events.txt] --out <thư mục>
+Mã thoát: 0 không có lỗi; 1 có CRC sai, hở log, report không ghép được hoặc CRC IMU sai; 3 không lỗi nhưng
+thiếu điều kiện/bằng chứng (`conditions`: < 2 TICK, thiếu #run_start/#run_end, reset ±1 s); 2 lỗi đầu vào.
+"""
+from __future__ import annotations
+
+import argparse
+import binascii
+import csv
+import json
+import os
+import sys
+from collections import Counter, defaultdict
+from typing import Dict, List, Optional
+
+import numpy as np
+
+import s06_stream as stm
+
+FRAME = 40
+MOSI_SEQ, MOSI_IMU_SEQ = 21, 39
+MOSI_IMU_BYTES = list(range(22, 24)) + list(range(31, 39))      # gz, ax, ay, az, yaw (HIL_Imu_t.raw)
+MISO_CRC, MISO_MOSI_CRC, MISO_RX_CYC, MISO_STATUS, MISO_SEQ, MISO_RX_NF, MISO_AGE, MISO_LOG = \
+    8, 10, 12, 16, 17, 18, 20, 22
+REC_REPORT, REC_PKT_READ, REC_RESET_DONE, REC_HOLD_ON, REC_HOLD_OFF = 0x10, 0x20, 0x30, 0x31, 0x32
+REC_RST_LOW, REC_RST_HIGH, REC_TICK, REC_REARM = 0x33, 0x34, 0x40, 0x50
+REC_ENC_START, REC_ENC_STOP = 0x35, 0x36            # feat/s06-h7 598a451, with EncoderGen b005aa7
+REPORT_KIND = {0: 'accel', 1: 'gyro', 2: 'game_rv'}
+ESP32_KIND = {1: 'accel', 2: 'gyro', 8: 'game_rv'}               # SH-2 report ids
+SEGMENT_GAP_US = 500_000.0
+ANSWER_LAG = 2                # the H7 answers frame N in frame N + 2 (fix/h7-frame)
+F_PRED_HZ = 483.1e6           # CYCCNT rate used only to predict the count across gaps (spec value, Phần D)
+SEQ_CUT_PERIODS = 128         # spec dòng 96: unwrap only below 128 report periods, cut the chain from 128
+PAD_US = 1_000_000.0          # S38 [ĐỀ XUẤT CODE]: the Pi frames and the ESP32 IMU lines must reach this far
+                              # beyond #run_start..#run_end, so every report scored inside the run has its
+                              # counterpart in the files; the scored window itself is never shrunk
+UDP_MAX_US = 100_000.0        # S55 [ĐỀ XUẤT CODE]: bound on how much later than the best UDP packet near START
+                              # the #run_start packet may reach the Pi; the H7 window opens this much earlier
+RESET_NEAR_US = 1_000_000.0   # V4-1: no reset-complete within ±1 s of #run_start
+CARRY_MARGIN_CYC = 1_000_000  # a record's CYCCNT may be stamped up to ~2 ms after its carrier's callback
+
+
+def crc16(b: bytes) -> int:
+    return binascii.crc_hqx(bytes(b), 0xFFFF)
+
+
+def u16(b, o):
+    return int(b[o]) | int(b[o + 1]) << 8
+
+
+def u32(b, o):
+    return u16(b, o) | u16(b, o + 2) << 16
+
+
+def unwrap(vals, bits):
+    """Unwrap a counter sampled in order (steps forward < half the range)."""
+    m, half = 1 << bits, 1 << (bits - 1)
+    out, base, prev = [], 0, None
+    for v in vals:
+        if prev is not None:
+            d = (v - prev) % m
+            base += d if d < half else d - m
+        else:
+            base = v
+        out.append(base)
+        prev = v
+    return out
+
+
+def unwrap_timed(vals, t_us, f_hz=F_PRED_HZ, bits=32):
+    """Unwrap a cycle counter sampled in time order, each step predicted from the Pi time elapsed
+    (S11: a link gap longer than half the 32-bit range, ~4.4 s at 483 MHz, is no longer read as a
+    step back). f_hz only has to be within ~1 % over gaps up to minutes."""
+    out, base, t_prev = [], None, None
+    for v, t in zip(vals, t_us):
+        base = v if base is None else near(v, base + (t - t_prev) * 1e-6 * f_hz, bits)
+        out.append(base)
+        t_prev = t
+    return out
+
+
+def near(v, ref, bits=32):
+    """Full value of the low `bits` of v closest to the full value ref."""
+    m, half = 1 << bits, 1 << (bits - 1)
+    return ref + ((v - ref + half) % m) - half
+
+
+def behind(v, ref, margin=CARRY_MARGIN_CYC, bits=32):
+    """Full value of the low `bits` of v that is not later than ref + margin: a log record is made
+    before the frame that carries it, possibly long before when the ring backed up during a link
+    gap (`near` would put a record made > 4.4 s before its carrier one wrap too late). Holds for a
+    backlog up to one wrap (~8.9 s at 483 MHz); longer shows as a TICK mismatch."""
+    m = 1 << bits
+    top = ref + margin
+    return top - ((top - v) % m)
+
+
+# ── 1. frames, CRC ──
+
+def decode_frames(t_send_ns, mosi, miso, max_lag=4):
+    n = len(t_send_ns)
+    t = np.asarray(t_send_ns, dtype=np.float64) / 1000.0
+    rows, lag_hist = [], Counter()
+    # 08/11: `start_leftover` = frames j < ANSWER_LAG that answer no frame of this log: the H7 still sends
+    # the reply staged in the previous link period there (CLOSED_LOOP/2026-11-08_run11), not a problem;
+    # `unanswered` counts only from j = ANSWER_LAG on
+    st = dict(frames=n, empty=0, miso_crc_bad=0, mosi_crc_bad=0, unanswered=0, start_leftover=0)
+    for j in range(n):
+        b = bytes(miso[j])
+        r = dict(j=j, t_us=t[j])
+        if not any(b):
+            st['empty'] += 1
+            r['empty'] = True
+            rows.append(r)
+            continue
+        r['empty'] = False
+        r['crc_ok'] = u16(b, MISO_CRC) == crc16(b[:MISO_CRC] + b[MISO_CRC + 2:])
+        if not r['crc_ok']:
+            st['miso_crc_bad'] += 1
+            rows.append(r)
+            continue
+        r.update(seq=b[MISO_SEQ], rx_cyc=u32(b, MISO_RX_CYC), rx_nf16=u16(b, MISO_RX_NF),
+                 age_us=u16(b, MISO_AGE), status=b[MISO_STATUS], log_type=b[MISO_LOG],
+                 log_idx16=u16(b, MISO_LOG + 1), payload=b[MISO_LOG + 3:FRAME])
+        ans = None
+        for lag in range(1, max_lag + 1):
+            i = j - lag
+            if i >= 0 and mosi[i][MOSI_SEQ] == r['seq']:
+                ans = i
+                break
+        r['answered'] = ans
+        if ans is None and j < ANSWER_LAG:
+            st['start_leftover'] += 1
+        elif ans is None:
+            st['unanswered'] += 1
+        else:
+            lag_hist[j - ans] += 1
+            r['mosi_crc_ok'] = u16(b, MISO_MOSI_CRC) == crc16(bytes(mosi[ans]))
+            st['mosi_crc_bad'] += 0 if r['mosi_crc_ok'] else 1
+        rows.append(r)
+    st['answer_lag'] = dict(sorted(lag_hist.items()))
+    return rows, st
+
+
+# ── 3. clock (before 2: records need the frame map) ──
+
+def frame_map(rows, t_ref_us):
+    """Distinct H7 frames (rx_nf unwrapped) -> (Pi frame answered, CYCCNT unwrapped). CYCCNT is
+    unwrapped in Pi send order with the step predicted from the Pi time (S11), not by the 32-bit
+    half-range rule, so a long link gap keeps the right count of wraps."""
+    good = [r for r in rows if not r['empty'] and r['crc_ok'] and r['answered'] is not None]
+    nf_full = unwrap([r['rx_nf16'] for r in good], 16)
+    first = {}
+    for r, nf in zip(good, nf_full):
+        r['rx_nf'] = nf
+        first.setdefault(nf, r)
+    order = sorted(first, key=lambda k: first[k]['answered'])
+    cyc_full = unwrap_timed([first[k]['rx_cyc'] for k in order], [t_ref_us[first[k]['answered']] for k in order])
+    return {k: dict(i=first[k]['answered'], cyc=c, carrier=first[k]['j']) for k, c in zip(order, cyc_full)}
+
+
+def fit_clock(fmap, t_send_us, cut_cycs=()):
+    pts = sorted(((v['cyc'], t_send_us[v['i']]) for v in fmap.values()), key=lambda p: p[1])
+    segs, cur = [], []
+    cuts = sorted(cut_cycs)
+    for c, t in pts:
+        if cur and (t - cur[-1][1] > SEGMENT_GAP_US or any(cur[-1][0] < x <= c for x in cuts)):
+            segs.append(cur)
+            cur = []
+        cur.append((c, t))
+    if cur:
+        segs.append(cur)
+    out = []
+    for s in segs:
+        c = np.array([p[0] for p in s], dtype=np.float64)
+        t = np.array([p[1] for p in s])
+        if len(s) >= 2:
+            c0 = c[0]
+            b, a = np.polyfit(c - c0, t, 1)
+            res = t - (a + b * (c - c0))
+        else:
+            c0, a, b, res = c[0], t[0], 0.0, np.zeros(1)
+        out.append(dict(cyc_lo=float(c[0]), cyc_hi=float(c[-1]), c0=float(c0), a=float(a), b=float(b), n=len(s),
+                        f_h7_mhz=(1.0 / b if b else float('nan')), res_max_us=float(np.max(np.abs(res))),
+                        res_std_us=float(np.std(res))))
+    return out
+
+
+def cyc_to_pi(segs, cyc):
+    best = min(segs, key=lambda s: 0 if s['cyc_lo'] <= cyc <= s['cyc_hi'] else min(abs(cyc - s['cyc_lo']), abs(cyc - s['cyc_hi'])))
+    return best['a'] + best['b'] * (cyc - best['c0'])
+
+
+# ── 2. log stream ──
+
+def log_records(rows):
+    recs, seen = [], set()
+    carried = [r for r in rows if not r['empty'] and r['crc_ok'] and r['log_type'] != 0]
+    full = unwrap([r['log_idx16'] for r in carried], 16)
+    dups = 0
+    for r, idx in zip(carried, full):
+        if idx in seen:
+            dups += 1
+            continue
+        seen.add(idx)
+        recs.append(dict(idx=idx, type=r['log_type'], payload=r['payload'], carrier_j=r['j']))
+    gaps = (max(seen) - min(seen) + 1 - len(seen)) if seen else 0
+    return recs, dict(records=len(recs), repeated_frames=dups, gaps=gaps)
+
+
+def run_stream(recs, j_lo, j_hi, idx_from=None) -> dict:
+    """C3-6 (X16): hở luồng log và số H7 bỏ trong lượt, không tính phần đệm: bản ghi mang bởi frame j_lo..j_hi,
+    cộng một bản ghi liền trước và liền sau (hở ngay mép lượt không kết luận được là ngoài lượt).
+    09/11: bản ghi H7 dựng trước log (chỉ số < `idx_from`, TICK có `before_log`) không tính, kể cả khi frame
+    trong lượt mang chúng (decode, đoạn h7_dropped)."""
+    rr = sorted((r for r in recs if idx_from is None or r['idx'] >= idx_from), key=lambda r: r['idx'])
+    ins = [i for i, r in enumerate(rr) if j_lo <= r['carrier_j'] <= j_hi]
+    if not ins:
+        return dict(gaps=0, ticks=0, h7_dropped=None)
+    idx = [r['idx'] for r in rr[max(ins[0] - 1, 0):ins[-1] + 2]]
+    ticks = [rr[i] for i in ins if rr[i]['type'] == REC_TICK and 'cyc_full' in rr[i] and not rr[i].get('before_log')]
+    dropped = (ticks[-1]['f']['dropped'] - ticks[0]['f']['dropped']) & 0xFFFF if len(ticks) >= 2 else None
+    return dict(gaps=idx[-1] - idx[0] + 1 - len(idx), ticks=len(ticks), h7_dropped=dropped)
+
+
+def parse_record(rec):
+    p, t = rec['payload'], rec['type']
+    if REC_REPORT <= t <= REC_REPORT + 2:
+        return dict(kind=REPORT_KIND[t - REC_REPORT], rpt_seq=p[0], queued=bool(p[1] & 1), qfull=bool(p[1] & 2),
+                    epoch=p[2], imu_seq=p[3], src_nf16=u16(p, 4), nf16=u16(p, 6), imu_crc=u16(p, 8), cyc=u32(p, 10))
+    if t == REC_PKT_READ:
+        return dict(mask=p[0], seqs=tuple(p[1:4]), epoch=p[4], cyc=u32(p, 5))
+    if t in (REC_RESET_DONE, REC_HOLD_ON, REC_HOLD_OFF):
+        return dict(epoch=p[0], cyc=u32(p, 1), nf16=u16(p, 5))
+    if t in (REC_RST_LOW, REC_RST_HIGH):
+        return dict(cyc=u32(p, 0), nf16=u16(p, 4))
+    if t == REC_TICK:
+        return dict(cyc=u32(p, 0), cyc_total=u32(p, 4) | u32(p, 8) << 32, dropped=u16(p, 12))
+    if t == REC_REARM:
+        return dict(cyc=u32(p, 0), n_rearms=u16(p, 4))
+    if t in (REC_ENC_START, REC_ENC_STOP):
+        return dict(wheel=p[0], cnt=u16(p, 1), n=u32(p, 3), cyc=u32(p, 7), nf16=u16(p, 11))
+    return dict(unknown=True)
+
+
+def nf_full(nf16, ref_nf):
+    return near(nf16, ref_nf, 16)
+
+
+# ── 4. reports ──
+
+def seq_chain(items, seq_of, t_of, mod=256, cut=SEQ_CUT_PERIODS):
+    """S8: unwrap an 8-bit report sequence of ONE (epoch, kind) in arrival order, spec dòng 96:
+    a step k = (seq − seq_prev) mod 256 must be ≥ 1 (0 = the same report number twice: `dup`);
+    unwrap only when the two reports are < 128 report periods apart, and then k < 128 (else
+    `seq_time_bad`); from 128 periods the chain is cut (`cut`) and the next report starts a new
+    chain. The period is the median spacing of the steps with k = 1. Returns per item
+    (n, chain, flag) with flag in ('', 'dup', 'seq_time_bad', 'cut'). After a cut n goes on (+k, or
+    +256 when k = 0) only to stay unique: the match across the cut is not trusted (flag counted)."""
+    seqs, ts = [seq_of(x) for x in items], [t_of(x) for x in items]
+    steps = [ts[i] - ts[i - 1] for i in range(1, len(items))
+             if ts[i] is not None and ts[i - 1] is not None and (seqs[i] - seqs[i - 1]) % mod == 1]
+    period = float(np.median(steps)) if steps else None
+    out, n, chain = [], None, 0
+    for i in range(len(items)):
+        flag = ''
+        if i == 0:
+            n = seqs[0]
+        else:
+            k = (seqs[i] - seqs[i - 1]) % mod
+            gap = None if (period is None or ts[i] is None or ts[i - 1] is None) else ts[i] - ts[i - 1]
+            if gap is not None and gap >= cut * period:
+                chain += 1                    # number of steps unknown: keep n unique, flag the run
+                n, flag = n + (k or mod), 'cut'
+            elif k == 0:
+                flag = 'dup'
+            elif k >= cut:
+                n, flag = n + k, 'seq_time_bad'
+            else:
+                n += k
+        out.append((n, chain, flag))
+    return out, period
+
+
+def h7_reports(recs, fmap, mosi, carrier_nf):
+    """REPORT records with source frame checks; seq unwrapped per (epoch, kind) in log order with
+    the rules of `seq_chain` on the H7 build time (CYCCNT unwrapped).
+    08/11 (HANDOFF_CODE việc 2): a record carried by a frame with no frame-count reference, i.e.
+    before the first answered frame of the log (j = 0, 1: the H7 still sends the reply staged in
+    the previous link period, CLOSED_LOOP/2026-11-08_run09 w1, run11 w1), belongs to the earlier
+    period: left out here (no KeyError) and counted by the caller, like the time fields above."""
+    out = []
+    first_nf = min(fmap) if fmap else None
+    by_key = defaultdict(list)
+    for rec in recs:
+        if 'rpt_seq' in rec['f'] and rec['carrier_j'] in carrier_nf:
+            by_key[(rec['f']['epoch'], rec['f']['kind'])].append(rec)
+    nchain = {}
+    for key, lst in by_key.items():
+        res, _ = seq_chain(lst, lambda r: r['f']['rpt_seq'], lambda r: r.get('cyc_full'))
+        for rec, v in zip(lst, res):
+            nchain[id(rec)] = v
+    for rec in recs:
+        f = rec['f']
+        if 'rpt_seq' not in f or rec['carrier_j'] not in carrier_nf:
+            continue
+        ref = carrier_nf[rec['carrier_j']]
+        src = nf_full(f['src_nf16'], ref)
+        fr = fmap.get(src)
+        n, chain, flag = nchain[id(rec)]
+        latest = nf_full(f['nf16'], ref)
+        # 08/11: source frame older than the first H7 frame of this log = a report the H7 built from the
+        # last frame of the previous link period while the Pi was stopped (CLOSED_LOOP/2026-11-08_run11
+        # w2: src = last frame of w1, carried in j = 2..19); counted apart from "no source frame"
+        before_log = fr is None and first_nf is not None and src < first_nf
+        row = dict(log_idx=rec['idx'], kind=f['kind'], epoch=f['epoch'], rpt_seq=f['rpt_seq'], n=n,
+                   src_before_log=before_log,
+                   chain=chain, seq_flag=flag,
+                   queued=f['queued'], qfull=f['qfull'], imu_seq=f['imu_seq'], src_nf=src, nf_latest=latest,
+                   imu_age_frames=latest - src, imu_crc_h7=f['imu_crc'], cyccnt=f['cyc'],
+                   t_pi_us=rec.get('t_pi_us'), src_frame=fr['i'] if fr else None, carrier_j=rec['carrier_j'])
+        if fr is not None:
+            m = mosi[fr['i']]
+            row['imu_crc_pi'] = crc16(bytes(m[k] for k in MOSI_IMU_BYTES))
+            row['imu_crc_ok'] = f['imu_crc'] == row['imu_crc_pi']
+            row['imu_seq_ok'] = f['imu_seq'] == m[MOSI_IMU_SEQ]
+        out.append(row)
+    # 09/11 (CLOSED_LOOP/2026-11-09_run07 b4_kill9, Liam "giải quyết luôn"): the H7 keeps building
+    # reports for a while after the link stops; they wait in the ring and leave first in the next log
+    # (src_before_log). The first report of the log made from this log's frames then follows them after
+    # the whole pause, >= 128 periods: `seq_chain` marks it 'cut'. That cut is the log start, not a
+    # sequence fault: cleared, kept as seq_note 'log_start'. A cut between two reports of this log stays.
+    prev = {}
+    for row in out:
+        key = (row['epoch'], row['kind'])
+        p = prev.get(key)
+        if row['seq_flag'] == 'cut' and p is not None and p['src_before_log'] and not row['src_before_log']:
+            row['seq_flag'], row['seq_note'] = '', 'log_start'
+        prev[key] = row
+    return out
+
+
+def enc_calls(recs, from_boot=True):
+    """EncoderGen _start_wheel/_stop records -> {wheel: [('S'|'P', t_pi_us, CNT, n)]} for
+    tools/t3b_score.py, and the number of calls missing from the per-wheel running count n.
+    n counts calls since the H7 boot. 08/11: when the log does not start at the H7 boot
+    (`from_boot` False: second and later runs without an H7 reset, CLOSED_LOOP/2026-11-08_run11
+    w2, w3) the n - 1 calls before the first record of a kind are calls of earlier runs, not
+    missing records: returned apart (third value), not in the gap count. A lost first record of
+    a kind is then not seen (like a loss after the last call)."""
+    calls, last, gaps, before = {w: [] for w in range(4)}, {}, 0, 0
+    for rec in recs:
+        if rec['type'] not in (REC_ENC_START, REC_ENC_STOP):
+            continue
+        f, k = rec['f'], 'S' if rec['type'] == REC_ENC_START else 'P'
+        calls.setdefault(f['wheel'], []).append((k, rec.get('t_pi_us'), f['cnt'], f['n']))
+        prev = last.get((f['wheel'], k))
+        if prev is not None:
+            gaps += f['n'] - prev - 1
+        elif from_boot:
+            gaps += f['n'] - 1
+        else:
+            before += f['n'] - 1
+        last[(f['wheel'], k)] = f['n']
+    return calls, gaps, before
+
+
+def esp32_lines(path):
+    """Dòng J (cổng SPI), I (callback), R (reset hoàn tất) và #run_start/#run_end của esp32_events.txt;
+    `t_rx` = giờ Pi lúc logger nhận (monotonic, cùng đồng hồ với t_send_ns), `t_us` = giờ ESP32.
+    S70 (vòng 4): mốc lấy qua `s06_stream.run_marks`, cùng bộ chọn với các công cụ khác: START và END ghép
+    theo số lượt. T1, T4 chấm một lượt mỗi file (S58, X18): không xác định được một lượt thì `RunProblem`."""
+    marks = stm.run_marks(path)
+    stm.require_run(marks)
+    text ={k: marks[k] for k in ('run_start', 'run_end') if k in marks}
+    J, I, R = [], [], []
+    with open(path, encoding='utf-8', errors='replace') as fh:
+        for raw in fh:
+            t_rx, sep, line = raw.rstrip('\n').partition('\t')
+            if not sep:
+                continue
+            p = line.split(',')
+            try:
+                t_rx = int(t_rx)
+                if p[0] == 'J' and len(p) == 7:
+                    J.append(dict(t_rx=t_rx, t_us=int(p[2]), kind=ESP32_KIND.get(int(p[3]), p[3]), queued=int(p[4]),
+                                  seq=int(p[5]), epoch=int(p[6])))
+                elif p[0] == 'I' and len(p) == 12:
+                    I.append(dict(t_rx=t_rx, t_us=int(p[2]), kind=ESP32_KIND.get(int(p[3]), p[3]), applied=int(p[4]),
+                                  seq=int(p[5]), epoch=int(p[6]), n_cb=int(p[7]), lib_n=int(p[8]),
+                                  v=(float(p[9]), float(p[10]), float(p[11]))))
+                elif p[0] == 'R' and len(p) == 4:
+                    R.append(dict(t_rx=t_rx, t_us=int(p[2]), reset_count=int(p[3])))
+            except ValueError:
+                continue
+    return J, I, R, text
+
+
+def seq_keys(rows):
+    """(epoch, kind, n): n = seq unwrapped in ESP32 time order within (epoch, kind) by `seq_chain`.
+    Flags (dup, seq_time_bad, cut) go into r['seq_flag']."""
+    by = defaultdict(list)
+    for r in sorted(rows, key=lambda x: x['t_us']):
+        by[(r['epoch'], r['kind'])].append(r)
+    for lst in by.values():
+        res, _ = seq_chain(lst, lambda r: r['seq'], lambda r: r['t_us'])
+        for r, (n, chain, flag) in zip(lst, res):
+            r['n'], r['chain'], r['seq_flag'] = n, chain, flag
+    return {(r['epoch'], r['kind'], r['n']): r for r in rows}
+
+
+def map_callbacks(I, J):
+    """S9, S34: each callback (I) takes the identity n of the report at the SPI port (J) with the same
+    (epoch, kind, seq) NEAREST in ESP32 time (no `J before I` rule: the producer does not guarantee
+    that order). The same seq comes back only every 256 reports, so the nearest one is unique while
+    |t_I − t_J| < 128 report periods; farther = not matched. Sets I['n'] (None if not matched) and
+    I['j'] (the J row)."""
+    by = defaultdict(list)
+    for j in J:
+        by[(j['epoch'], j['kind'], j['seq'])].append(j)
+    periods = {}
+    for (ep, kd), lst in _group(J, lambda j: (j['epoch'], j['kind'])).items():
+        _, periods[(ep, kd)] = seq_chain(sorted(lst, key=lambda x: x['t_us']), lambda r: r['seq'], lambda r: r['t_us'])
+    for i in I:
+        cands = by.get((i['epoch'], i['kind'], i['seq']), [])
+        per = periods.get((i['epoch'], i['kind']))
+        best = min(cands, key=lambda j: abs(j['t_us'] - i['t_us']), default=None)
+        if best is not None and per is not None and abs(best['t_us'] - i['t_us']) >= SEQ_CUT_PERIODS * per:
+            best = None
+        i['j'] = best
+        i['n'] = best['n'] if best is not None else None
+    return I
+
+
+def _group(rows, key):
+    g = defaultdict(list)
+    for r in rows:
+        g[key(r)].append(r)
+    return g
+
+
+def epoch_offset(h7, J):
+    """S7: anchor the two epoch counters on the run instead of maximising matches. The distinct epochs
+    seen in the run, in order, must be the same number on both sides and step together; the offset
+    is ESP32 − H7 of the first one. Returns (offset or None, note)."""
+    eh = sorted({r['epoch'] for r in h7})
+    ej = []
+    for j in sorted(J, key=lambda x: x['t_us']):
+        if not ej or ej[-1] != j['epoch']:
+            ej.append(j['epoch'])
+    if not eh or not ej:
+        return None, 'không có report ở một phía'
+    if len(eh) != len(set(ej)) or len(set(ej)) != len(ej):
+        return None, f'epoch H7 {eh} và ESP32 {ej} không cùng số/không liên tục: không neo được'
+    off = ej[0] - eh[0]
+    if any(b - a != off for a, b in zip(eh, ej)):
+        return None, f'epoch H7 {eh} và ESP32 {ej} không cùng bước: không neo được'
+    return off, ''
+
+
+def common_window(t_send_us, text):
+    """Window scored for report matching on the Pi clock: exactly #run_start..#run_end of the ESP32
+    (receive time t_rx), not shrunk (S38: shrinking let wrong reports at the ends escape). None if the
+    ESP32 run marks are missing."""
+    if 'run_start' not in text or 'run_end' not in text:
+        return None
+    lo, hi = float(text['run_start']['t_rx']), float(text['run_end']['t_rx'])
+    return (lo, hi) if hi > lo else None
+
+
+def udp_widen(window, text, J, I):
+    """S55 (Codex Sol round 3): #run_start reaches the Pi (t_rx) one UDP delay after the ESP32 started the
+    run, so a window opening at t_rx leaves the first reports of the run out. Without a marker-pin clock,
+    the window opens UDP_MAX_US earlier (scored set ⊇ the true run: the J stream runs on and the ± PAD_US
+    cover is required, so this cannot fail a valid run), and the delay of the #run_start packet itself is
+    measured against the fastest J/I packet within 10 s (t_rx − t_us): above UDP_MAX_US the bound does not
+    hold → note (not concluded). Returns (window, note)."""
+    if window is None:
+        return None, ''
+    try:
+        ts = int(text['run_start']['kv']['timestamp_us'])
+    except (KeyError, ValueError):
+        return window, 'S55: #run_start không có timestamp_us: không kiểm được trễ UDP của mốc lượt'
+    near = [x['t_rx'] - x['t_us'] for x in list(J) + list(I) if abs(x['t_us'] - ts) <= 10_000_000]
+    if not near:
+        return window, 'S55: không có dòng J/I trong 10 s quanh #run_start: không kiểm được trễ UDP'
+    delay = (text['run_start']['t_rx'] - ts) - min(near)
+    note = '' if delay <= UDP_MAX_US else \
+        f'S55: gói #run_start tới Pi trễ {delay / 1e3:.1f} ms so với gói nhanh nhất, vượt cận {UDP_MAX_US / 1e3:g} ms'
+    return (window[0] - UDP_MAX_US, window[1]), note
+
+
+def esp_run_span(text):
+    """#run_start..#run_end on the ESP32 clock (`timestamp_us` the firmware stamps): the scored span of
+    ESP32-side lines (callbacks I, DATA ticks), which carry the same clock. None if missing."""
+    try:
+        return (int(text['run_start']['kv']['timestamp_us']), int(text['run_end']['kv']['timestamp_us']))
+    except (KeyError, ValueError):
+        return None
+
+
+def pad_check(window, t_send_us, J, I):
+    """S38: the matching pools (all H7 reports of the frame log, all J/I of the events file) must cover
+    the scored window plus PAD_US on both sides; otherwise a report at an end may lack its counterpart
+    only because the recording stopped. Returns a note ('' = covered)."""
+    if window is None:
+        return ''
+    lo, hi = window
+    out = []
+    if float(t_send_us[0]) > lo - PAD_US or float(t_send_us[-1]) < hi + PAD_US:
+        out.append(f'frame Pi [{t_send_us[0]:.0f}; {t_send_us[-1]:.0f}] µs không phủ lượt ± {PAD_US / 1e6:g} s')
+    t_imu = [x['t_rx'] for x in list(J) + list(I)]
+    if not t_imu or min(t_imu) > lo - PAD_US or max(t_imu) < hi + PAD_US:
+        out.append(f'dòng J/I của ESP32 không phủ lượt ± {PAD_US / 1e6:g} s')
+    return '; '.join(out)
+
+
+def match_esp32(h7, J, I, window=None, span=None):
+    """Match H7 reports with the ESP32 SPI port (J) and callbacks (I) on (epoch, kind, n). Only reports
+    inside `window` (Pi clock: H7 build time t_pi_us; J receive time t_rx) are scored (S32); the rest
+    is counted apart. Without a window every report is scored (as before) and that is reported.
+    Epochs are anchored on the J received during the Pi frames (`span`, Pi clock)."""
+    jk = seq_keys(J)
+    map_callbacks(I, J)
+    off, note = epoch_offset(h7, [j for j in J if span is None or span[0] <= j['t_rx'] <= span[1]])
+    cb_by_j = defaultdict(list)
+    for i in I:
+        if i['j'] is not None:
+            cb_by_j[id(i['j'])].append(i)
+
+    def inside_h7(r):
+        return window is None or (r.get('t_pi_us') is not None and window[0] <= r['t_pi_us'] <= window[1])
+
+    def inside_j(j):
+        return window is None or window[0] <= j['t_rx'] <= window[1]
+
+    h7k = set()
+    for r in h7:
+        k = None if off is None else (r['epoch'] + off, r['kind'], r['n'])
+        h7k.add(k)
+        j = jk.get(k) if k is not None else None
+        r['esp32_spi'] = j is not None
+        cbs = cb_by_j.get(id(j), []) if j is not None else []
+        r['esp32_cb'] = any(i['applied'] == 1 for i in cbs)
+        r['esp32_t_us'] = j['t_us'] if j is not None else None
+        r['scored'] = inside_h7(r)
+    sc = [r for r in h7 if r['scored']]
+    matched = sum(1 for r in sc if r['esp32_spi'])
+    extra = [j for k, j in jk.items() if k not in h7k and inside_j(j)]
+    return dict(epoch_offset_esp32_minus_h7=off, epoch_note=note, window_pi_us=window,
+                h7_reports=len(h7), h7_scored=len(sc), matched_spi=matched,
+                not_at_esp32_spi=len(sc) - matched if off is not None else len(sc),
+                at_spi_not_cb=sum(1 for r in sc if r['esp32_spi'] and not r['esp32_cb']),
+                esp32_without_h7=len(extra) if off is not None else sum(1 for j in J if inside_j(j)),
+                esp32_seq_flags=dict(Counter(j['seq_flag'] for j in J if j['seq_flag'] and inside_j(j))),
+                callbacks_unmatched=sum(1 for i in I if i['n'] is None))
+
+
+def resets_near_start(recs, R, text):
+    """V4-1: reset-complete within ±1 s of #run_start (H7: RESET_DONE build time on the Pi clock;
+    ESP32: R lines, receive time). Returns dict or None if #run_start is missing."""
+    if 'run_start' not in text:
+        return None
+    t0 = float(text['run_start']['t_rx'])
+    h7 = [rec['t_pi_us'] for rec in recs if rec['type'] == REC_RESET_DONE and rec.get('t_pi_us') is not None
+          and abs(rec['t_pi_us'] - t0) <= RESET_NEAR_US]
+    esp = [r['t_rx'] for r in R if abs(r['t_rx'] - t0) <= RESET_NEAR_US]
+    return dict(h7=len(h7), esp32=len(esp), ok=not h7 and not esp)
+
+
+# ── all ──
+
+def clock_reference(t_send_ns, cal):
+    """Pi reference time of each frame (µs) and the calibration status (S10, spec dòng 111).
+    Spec: P_gửi := t_pulse_rise (the sync pulse that also marks d_1w); RPi5 logs the time just before
+    and just after raising it (`t_pulse0_ns`, `t_pulse1_ns` in frames.npz); the H7 event time is
+    P = fit(H) + d_1w,median; uncertainty = max residual + (d_1w max − min) + δ_H + δ_P max + 2·t_s.
+    Without the pulse times or without d_1w/δ_H/t_s the times are only RELATIVE (send time, the
+    constant send → callback delay inside the fit) and `calibrated` is False: tools must not score
+    on them as if synchronised."""
+    cal = dict(cal or {})
+    t_send_us = np.asarray(t_send_ns, dtype=np.float64) / 1000.0
+    p0, p1 = cal.get('t_pulse0_ns'), cal.get('t_pulse1_ns')
+    if p0 is not None and p1 is not None and len(p0) == len(t_send_us):
+        p0 = np.asarray(p0, dtype=np.float64) / 1000.0
+        p1 = np.asarray(p1, dtype=np.float64) / 1000.0
+        t_ref, dp = 0.5 * (p0 + p1), float(np.max(p1 - p0))
+        ref = 'pulse'
+    else:
+        t_ref, dp, ref = t_send_us, None, 'send'
+    need = ('d1w_us', 'd1w_span_us', 'delta_h_us', 'ts_us')
+    ok = ref == 'pulse' and all(cal.get(k) is not None for k in need)
+    return t_ref, dict(reference=ref, calibrated=ok, delta_p_max_us=dp,
+                       **{k: cal.get(k) for k in need})
+
+
+def decode(t_send_ns, mosi, miso, esp32_events: Optional[str] = None, cal: Optional[dict] = None) -> dict:
+    mosi = np.asarray(mosi, dtype=np.uint8)
+    miso = np.asarray(miso, dtype=np.uint8)
+    rows, st = decode_frames(t_send_ns, mosi, miso)
+    t_ref_us, calib = clock_reference(t_send_ns, cal)
+    fmap = frame_map(rows, t_ref_us)
+    recs, lst = log_records(rows)
+    # nf of the frame that carried each record (reference for 16-bit nf and 32-bit cyc fields)
+    # (CYCCNT of a frame not in fmap, e.g. right after a gap, is predicted from the last matched frame
+    # and the Pi time elapsed, not copied from it)
+    carrier_nf, carrier_cyc = {}, {}
+    by_carrier = {v['carrier']: (k, v['cyc'], v['i']) for k, v in fmap.items()}
+    last = None
+    for r in rows:
+        if r['j'] in by_carrier:
+            last = by_carrier[r['j']]
+        if last is not None:
+            nf, cyc, i = last
+            carrier_nf[r['j']] = nf
+            carrier_cyc[r['j']] = cyc + int(round((t_ref_us[r['j']] - t_ref_us[i]) * 1e-6 * F_PRED_HZ))
+    for rec in recs:
+        rec['f'] = parse_record(rec)
+    t_send_us = np.asarray(t_send_ns, dtype=np.float64) / 1000.0
+    rearm = [behind(rec['f']['cyc'], carrier_cyc[rec['carrier_j']]) for rec in recs
+             if rec['type'] == REC_REARM and rec['carrier_j'] in carrier_cyc]
+    segs = fit_clock(fmap, t_ref_us, rearm) if fmap else []
+    d1w = calib['d1w_us'] if calib['calibrated'] else 0.0
+    if calib['calibrated'] and segs:
+        calib['uncertainty_us'] = (max(s['res_max_us'] for s in segs) + calib['d1w_span_us'] + calib['delta_h_us']
+                                   + calib['delta_p_max_us'] + 2.0 * calib['ts_us'])
+    else:
+        calib['uncertainty_us'] = None
+    for rec in recs:
+        f = rec['f']
+        if 'cyc' not in f or rec['carrier_j'] not in carrier_cyc:
+            continue
+        ref = carrier_cyc[rec['carrier_j']]
+        nf = f.get('nf16')
+        k = nf_full(nf, carrier_nf[rec['carrier_j']]) if nf is not None else None
+        if k is not None and k in fmap:
+            rec['cyc_full'] = near(f['cyc'], fmap[k]['cyc'])
+        else:
+            rec['cyc_full'] = behind(f['cyc'], ref)
+        rec['t_pi_us'] = cyc_to_pi(segs, rec['cyc_full']) + d1w if segs else None
+    ticks = [rec for rec in recs if rec['type'] == REC_TICK and 'cyc_full' in rec]
+    # 08/11: TICKs made while the link was down before this log (CLOSED_LOOP/2026-11-08_run11 w1, 21 s
+    # after the --imu-static run) wait in the H7 ring and leave in the first frames; made more than one
+    # CYCCNT wrap before their carrier, `behind` places them one wrap late (docstring above). Their
+    # 64-bit _cyc_total, counted back from the last TICK, says they were made before the first H7 frame
+    # of the log: counted as `ticks_before_log`, left out of the pair check.
+    if ticks and fmap:
+        last_t, first_cyc = ticks[-1], min(v['cyc'] for v in fmap.values())
+        in_log = [t for t in ticks
+                  if last_t['cyc_full'] - (last_t['f']['cyc_total'] - t['f']['cyc_total']) >= first_cyc]
+    else:
+        in_log = ticks
+    lst['ticks_before_log'] = len(ticks) - len(in_log)
+    in_ids = {id(t) for t in in_log}
+    for t in ticks:
+        t['before_log'] = id(t) not in in_ids
+    tick_bad = sum(1 for a, b in zip(in_log, in_log[1:])
+                   if (b['f']['cyc_total'] - a['f']['cyc_total']) != (b['cyc_full'] - a['cyc_full']))
+    # S36: TICK carries the H7 drop counter since S06Log_Init, cut to 16 bits: the run figure is the
+    # difference between the first and the last TICK of the frames (mod 65 536; drops before the first
+    # TICK still show as gaps of the record index). Fewer than 2 TICK: not known.
+    # 09/11 (CLOSED_LOOP/2026-11-09_run08 b1_stop, after about 32 min without link; Liam "giải quyết
+    # luôn"): the H7 also builds records while the link is down; once its ring is full each new record is
+    # dropped, and a dropped record still takes an index. The ring then leaves first in the next log, so
+    # the first TICK of the frames is an old one (counter 0) and the file-wide figures held 13118 drops and
+    # 13118 index gaps that all happened before the log. With TICKs made before the log
+    # (`ticks_before_log`), drops and gaps are counted from the first TICK made in the log; what lies before
+    # it goes to `h7_dropped_before_log`, `gaps_before_first_log_tick` (a condition, not a problem: drops
+    # in the first TICK period after link up cannot be told apart from drops in the pause).
+    lst['gaps_file'] = lst['gaps']
+    lst['h7_dropped_before_log'] = None
+    lst['gaps_before_first_log_tick'] = 0
+    if lst['ticks_before_log'] and in_log:
+        lst['h7_dropped_before_log'] = (in_log[0]['f']['dropped'] - ticks[0]['f']['dropped']) & 0xFFFF
+        lst['log_idx_from'] = b = in_log[0]['idx']
+        late = sorted({r['idx'] for r in recs if r['idx'] >= b})
+        lst['gaps'] = (late[-1] - late[0] + 1 - len(late)) if late else 0
+        lst['gaps_before_first_log_tick'] = lst['gaps_file'] - lst['gaps']
+        use = in_log
+    else:
+        use = ticks
+    if len(use) >= 2:
+        lst['h7_dropped'] = (use[-1]['f']['dropped'] - use[0]['f']['dropped']) & 0xFFFF
+    else:
+        lst['h7_dropped'] = None
+    lst['h7_dropped_counter_last'] = ticks[-1]['f']['dropped'] if ticks else None
+    lst['ticks'] = len(ticks)
+    reps = h7_reports(recs, fmap, mosi, carrier_nf)
+    # the H7 log index starts at 0 at S06Log_Init (boot): a log holding record 0 starts at the boot
+    # (16-bit index: a log starting at a multiple of 65 536 records would also pass, not expected)
+    from_boot = bool(recs) and min(rec['idx'] for rec in recs) == 0
+    calls, call_gaps, calls_before = enc_calls(recs, from_boot)
+    res = dict(frames=st, log=lst, clock=dict(segments=segs, tick_total_mismatch=tick_bad, **calib),
+               reports=dict(n=len(reps), before_first_answer=sum(1 for rec in recs if 'rpt_seq' in rec['f']
+                                                                 and rec['carrier_j'] not in carrier_nf),
+                            imu_crc_bad=sum(1 for r in reps if r.get('imu_crc_ok') is False),
+                            imu_seq_bad=sum(1 for r in reps if r.get('imu_seq_ok') is False),
+                            no_source_frame=sum(1 for r in reps if r['src_frame'] is None and not r['src_before_log']),
+                            src_before_log=sum(1 for r in reps if r['src_before_log']),
+                            seq_flags=dict(Counter(r['seq_flag'] for r in reps if r['seq_flag'])),
+                            per_kind=dict(Counter(r['kind'] for r in reps))),
+               enc_calls=dict(per_wheel={w: dict(Counter(c[0] for c in v)) for w, v in calls.items()},
+                              count_gaps=call_gaps, log_from_boot=from_boot, calls_before_log=calls_before))
+    if esp32_events:
+        J, I, R, text = esp32_lines(esp32_events)
+        span = (float(t_send_us[0]), float(t_send_us[-1]))
+        win, udp_note = udp_widen(common_window(t_send_us, text), text, J, I)
+        res['esp32_match'] = match_esp32(reps, J, I, win, span)
+        res['esp32_match']['pad_note'] = pad_check(win, t_send_us, J, I)
+        res['esp32_match']['udp_note'] = udp_note
+        res['esp32_run_marks'] = sorted(text)
+        res['esp32_run_esp_us'] = esp_run_span(text)
+        res['_esp32_text'] = text
+        res['resets_near_run_start'] = resets_near_start(recs, R, text)
+        res['_esp32_I'] = I
+        if win is not None:
+            in_run = np.flatnonzero((t_send_us >= win[0]) & (t_send_us <= win[1]))
+            if len(in_run):
+                # gaps_file: the whole file, records made before the log included; h7_dropped_file: the
+                # whole file from the first TICK made in the log (09/11)
+                res['log'] = dict(lst, gaps_file=lst['gaps_file'], h7_dropped_file=lst['h7_dropped'],
+                                  **run_stream(recs, int(in_run[0]), int(in_run[-1]) + ANSWER_LAG,
+                                               lst.get('log_idx_from')))
+    # C3-2: a frame of the run the H7 did not answer (answers come ANSWER_LAG frames later); the whole log
+    # when the run marks are not known. Only the first ANSWER_LAG frames of the log have nothing to answer.
+    lo, hi = (res.get('esp32_match') or {}).get('window_pi_us') or (t_send_us[0], t_send_us[-1])
+    st['empty_in_run'] = sum(1 for r in rows if r['empty'] and r['j'] >= ANSWER_LAG
+                             and lo <= t_send_us[r['j'] - ANSWER_LAG] <= hi)
+    res['swa'] = swa_summary(mosi, miso)          # I8: report only, not a problem (Liam 09/11)
+    res['_records'] = recs
+    res['_frames_rows'] = rows
+    res['_calls'] = calls
+    res['_reports'] = reps
+    return res
+
+
+# I8: frames a command must stay unchanged before the H7 status has to show it: H7 filter 3 applied
+# frames + next iBUS frame start (period 7 ms) + one main-loop pass + answer lag 2 frames, about 13
+# (estimated from the code, not measured); 20 leaves room
+SWA_SETTLE_FRAMES = 20
+
+
+def swa_summary(mosi, miso, settle: int = SWA_SETTLE_FRAMES) -> dict:
+    """I8 (Liam 09/11, "Duyet ca 5"; Codex round 1 I8-6..8): SWA the Pi asked (MOSI byte 20 bit 3) and the
+    SWA of the last iBUS frame the H7 started (MISO byte 16 bit 0). Frames with an all-zero MISO or a bad
+    MISO CRC are not read for the status.
+      held_mismatch: frames where the command has been the same for more than `settle` frames and the
+        status differs (catches a fixed command never followed, a status blip, a wrong start state);
+      per command change (until the next change): follow lag = first status equal to the new command from
+        the answer lag (2 frames) on; none seen: `unobserved` when the command held for at most `settle`
+        frames (end of log, or changed again), else `unfollowed`."""
+    mosi = np.asarray(mosi, dtype=np.uint8).reshape(-1, 40)
+    miso = np.asarray(miso, dtype=np.uint8).reshape(-1, 40)
+    n = len(mosi)
+    cmd = ((mosi[:, 20] >> 3) & 1).astype(np.int16)
+    ok = np.array([bool(m.any()) and crc16(bytes(m[:MISO_CRC]) + bytes(m[MISO_CRC + 2:])) == u16(m, MISO_CRC)
+                   for m in miso], dtype=bool)
+    st = (miso[:, MISO_STATUS] & 1).astype(np.int16)
+    held = np.zeros(n, dtype=np.int64)                 # frames the command has had its value, up to j
+    for j in range(n):
+        held[j] = held[j - 1] + 1 if j and cmd[j] == cmd[j - 1] else 1
+    check = ok & (held > settle)
+    mism = np.flatnonzero(check & (st != cmd))
+    cmd_ch = [int(j) for j in np.flatnonzero(np.diff(cmd) != 0) + 1]
+    good = np.flatnonzero(ok)
+    st_ch = [int(good[i]) for i in np.flatnonzero(np.diff(st[good]) != 0) + 1]
+    lags, unfollowed, unobserved = [], 0, 0
+    for i, j in enumerate(cmd_ch):
+        end = cmd_ch[i + 1] if i + 1 < len(cmd_ch) else n
+        sel = good[(good >= j + ANSWER_LAG) & (good < end)]
+        k = sel[st[sel] == cmd[j]]
+        if len(k):
+            lags.append(int(k[0] - j))
+        elif end - j <= settle:
+            unobserved += 1
+        else:
+            unfollowed += 1
+    return dict(cmd_on_frames=int(cmd.sum()), cmd_first=int(cmd[0]) if n else None,
+                cmd_changes=cmd_ch, status_changes=st_ch, status_on_frames=int(st[good].sum()),
+                settle_frames=settle, held_checked=int(check.sum()), held_mismatch=len(mism),
+                mismatch_first=[int(x) for x in mism[:10]],
+                follow_lag_frames=lags, follow_lag_max=max(lags) if lags else None,
+                unfollowed=unfollowed, unobserved=unobserved)
+
+
+def problems(res) -> List[str]:
+    p = []
+    f, lg, rp = res['frames'], res['log'], res['reports']
+    if f['empty_in_run']:
+        p.append(f"{f['empty_in_run']} frame MISO toàn 0 trong lượt (H7 không trả lời)")
+    if f['miso_crc_bad']:
+        p.append(f"{f['miso_crc_bad']} frame MISO sai CRC")
+    if f['mosi_crc_bad']:
+        p.append(f"{f['mosi_crc_bad']} frame MOSI sai CRC ở H7")
+    if f['unanswered']:
+        p.append(f"{f['unanswered']} frame MISO không tìm được frame MOSI được trả lời")
+    if lg['gaps']:
+        p.append(f"luồng log H7 hở {lg['gaps']} bản ghi")
+    if lg.get('h7_dropped'):
+        p.append(f"H7 bỏ {lg['h7_dropped']} bản ghi vì đầy (hiệu TICK đầu–cuối)")
+    if rp.get('seq_flags'):
+        p.append(f"số thứ tự report H7 bất thường {rp['seq_flags']} (dup = trùng, cut = cách ≥ 128 chu kỳ, "
+                 f"seq_time_bad = bước ≥ 128)")
+    if res['clock']['tick_total_mismatch']:
+        p.append(f"{res['clock']['tick_total_mismatch']} cặp TICK lệch _cyc_total")
+    if rp['imu_crc_bad'] or rp['imu_seq_bad'] or rp['no_source_frame']:
+        p.append(f"report: CRC IMU sai {rp['imu_crc_bad']}, imu_seq sai {rp['imu_seq_bad']}, "
+                 f"không có frame nguồn {rp['no_source_frame']}")
+    if res['enc_calls']['count_gaps']:
+        p.append(f"số lần gọi _start_wheel/_stop hở {res['enc_calls']['count_gaps']} (thiếu bản ghi)")
+    m = res.get('esp32_match')
+    if m and m['epoch_offset_esp32_minus_h7'] is None:
+        p.append(f"ghép ESP32: {m['epoch_note']}")
+    if m and (m['not_at_esp32_spi'] or m['esp32_without_h7']):
+        p.append(f"ghép ESP32: {m['not_at_esp32_spi']} report H7 không tới cổng SPI ESP32, "
+                 f"{m['esp32_without_h7']} report ESP32 không có ở H7")
+    if m and m.get('esp32_seq_flags'):
+        p.append(f"số thứ tự report ở cổng SPI ESP32 bất thường {m['esp32_seq_flags']}")
+    return p
+
+
+def conditions(res) -> List[str]:
+    """Run conditions and missing evidence (not product faults): the scoring tool reports them as
+    'not valid / not concluded' (mã 3), apart from `problems`."""
+    c = []
+    lg = res['log']
+    if lg.get('h7_dropped') is None:
+        c.append(f"chỉ có {lg.get('ticks', 0)} bản ghi TICK: không biết H7 có bỏ bản ghi trong lượt không")
+    if lg.get('gaps_before_first_log_tick'):
+        c.append(f"luồng log hở {lg['gaps_before_first_log_tick']} bản ghi trước TICK đầu dựng trong log "
+                 f"(H7 bỏ {lg.get('h7_dropped_before_log')} lúc không có link, ring đầy): nếu có bản ghi mất "
+                 f"ngay sau lúc link lên thì không tách được")
+    m = res.get('esp32_match')
+    if m and m['window_pi_us'] is None:
+        c.append('esp32_events thiếu #run_start/#run_end: chấm ghép report trên cả luồng, không theo khung lượt')
+    if m and m.get('pad_note'):
+        c.append(f"S38: {m['pad_note']}: report ở đầu/cuối lượt có thể thiếu bản đối chiếu, ghi đo dài hơn")
+    if m and m.get('udp_note'):
+        c.append(m['udp_note'])
+    rz = res.get('resets_near_run_start')
+    if 'esp32_match' in res and rz is None:
+        c.append('thiếu #run_start: không kiểm được điều kiện reset ±1 s (V4-1)')
+    elif rz is not None and not rz['ok']:
+        c.append(f"reset hoàn tất trong ±1 s quanh #run_start (H7 {rz['h7']}, ESP32 {rz['esp32']}): "
+                 f"lượt không hợp lệ (V4-1), đo lại")
+    return c
+
+
+def add_cal_args(ap):
+    """CLI of the H7 → RPi5 time calibration (spec dòng 111), shared by the S06 tools."""
+    g = ap.add_argument_group('quy giờ H7 → RPi5 (spec dòng 111; thiếu thì giờ H7 chỉ là tương đối)')
+    g.add_argument('--d1w-us', type=float, default=None, help='d_1w trung vị (cạnh xung đồng bộ → chân debug H7), µs')
+    g.add_argument('--d1w-span-us', type=float, default=None, help='d_1w lớn nhất − nhỏ nhất, µs')
+    g.add_argument('--delta-h-us', type=float, default=None, help='δ_H, µs')
+    g.add_argument('--ts-us', type=float, default=None, help='chu kỳ lấy mẫu logic analyzer t_s, µs')
+
+
+def load_manifest(z):
+    """Run manifest hil_node.py saves in frames.npz (`manifest`, JSON: step_first, step_last, steps,
+    period_us, stop_reason, imu_profile, imu_static); None for a log written before the manifest."""
+    files = getattr(z, 'files', z)
+    if 'manifest' not in files:
+        return None
+    return json.loads(str(z['manifest']))
+
+
+def manifest_check(manifest, t_send_ns, mosi, miso) -> List[str]:
+    """S57 (Codex Sol round 3): frames lost from the log itself: the arrays must hold every step the Pi
+    says it logged (step_first..step_last, row k = step k). S68 (round 4): the row count alone does not
+    prove it (a row lost, a neighbour repeated): row k must carry MOSI seq = k mod 256 (hil_node.py sends
+    seq = step) and t_send must rise strictly. Returns the faults ([] = whole)."""
+    if manifest is None:
+        return []
+    out = []
+    n_frames = len(t_send_ns)
+    if manifest.get('step_first') != 0 or manifest.get('steps') != n_frames or \
+            manifest.get('step_last') != n_frames - 1:
+        out.append(f"frames.npz có {n_frames} frame, manifest ghi bước {manifest.get('step_first')}.."
+                   f"{manifest.get('step_last')} ({manifest.get('steps')}): mất frame trong file (Z19)")
+    if len(mosi) != n_frames or len(miso) != n_frames:
+        out.append(f'frames.npz: t_send {n_frames}, mosi {len(mosi)}, miso {len(miso)} hàng: mảng không cùng chiều dài')
+        return out
+    seq_off = np.nonzero(np.asarray(mosi)[:, MOSI_SEQ] != (np.arange(n_frames) & 0xFF))[0]
+    if len(seq_off):
+        out.append(f'{len(seq_off)} hàng có seq MOSI khác chỉ số bước, đầu tiên hàng {seq_off[0]}: mất hoặc lặp frame (Z19)')
+    t_back = np.nonzero(np.diff(np.asarray(t_send_ns, dtype=np.int64)) <= 0)[0]
+    if len(t_back):
+        out.append(f't_send không tăng ở {len(t_back)} chỗ, đầu tiên sau hàng {t_back[0]}: mất hoặc lặp frame (Z19)')
+    return out
+
+
+def load_cal(z, a) -> dict:
+    """Calibration dict for `decode` from frames.npz (pulse times if logged) and the CLI of add_cal_args."""
+    files = getattr(z, 'files', z)
+    cal = {k: getattr(a, k) for k in ('d1w_us', 'd1w_span_us', 'delta_h_us', 'ts_us')}
+    for k in ('t_pulse0_ns', 't_pulse1_ns'):
+        cal[k] = z[k] if k in files else None
+    return cal
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description='Giải mã frames.npz (S06, MISO bản 4)')
+    ap.add_argument('frames')
+    ap.add_argument('--esp32-events', default=None)
+    ap.add_argument('--out', required=True)
+    add_cal_args(ap)
+    a = ap.parse_args(argv)
+    try:
+        z = np.load(a.frames)
+        res = decode(z['t_send_ns'], z['mosi'], z['miso'], a.esp32_events, load_cal(z, a))
+    except stm.RunProblem as ex:
+        return stm.report_run_problem(ex)
+    except (OSError, KeyError, ValueError) as ex:
+        print(f'lỗi đầu vào: {ex}', file=sys.stderr)
+        return 2
+    os.makedirs(a.out, exist_ok=True)
+    with open(os.path.join(a.out, 'h7_log.csv'), 'w', newline='') as fh:
+        w = csv.writer(fh)
+        w.writerow(['idx', 'type', 'carrier_frame', 'cyc_full', 't_pi_us', 'fields'])
+        for r in res['_records']:
+            w.writerow([r['idx'], f"0x{r['type']:02x}", r['carrier_j'], r.get('cyc_full', ''),
+                        f"{r['t_pi_us']:.1f}" if r.get('t_pi_us') is not None else '',
+                        json.dumps({k: v for k, v in r['f'].items()}, default=str)])
+    with open(os.path.join(a.out, 'h7_reports.csv'), 'w', newline='') as fh:
+        cols = ['log_idx', 'kind', 'epoch', 'rpt_seq', 'n', 'chain', 'seq_flag', 'queued', 'imu_seq', 'src_nf',
+                'src_frame', 't_pi_us', 'imu_crc_ok', 'imu_seq_ok', 'esp32_spi', 'esp32_cb', 'esp32_t_us', 'scored']
+        w = csv.DictWriter(fh, fieldnames=cols, extrasaction='ignore')
+        w.writeheader()
+        w.writerows(res['_reports'])
+    summ = {k: v for k, v in res.items() if not k.startswith('_')}
+    summ['problems'] = problems(res)
+    summ['conditions'] = conditions(res)
+    with open(os.path.join(a.out, 'frames_summary.json'), 'w', encoding='utf-8') as fh:
+        json.dump(summ, fh, indent=1, ensure_ascii=False, default=str)
+    print(json.dumps(summ, indent=1, ensure_ascii=False, default=str))
+    return stm.report_result(1 if summ['problems'] else (3 if summ['conditions'] else 0), ['khong_du_dieu_kien'])
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

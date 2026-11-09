@@ -13,3 +13,13 @@ python plot_log.py agv_log_20260610_xxxxxx.csv
 ```
 
 Lý do phải chạy receiver trước: UDP không có connection, nếu fake gửi trước mà chưa có ai lắng nghe thì packet mất luôn, không recover được.
+## S06: log ESP32 env s06_load (29/10/2026)
+
+Trên RPi5, một lượt (ESP32 đã nạp env s06_load, cùng mạng WiFi):
+
+```bash
+python tools/s06_logger.py --esp32 <IP ESP32> --profile heavy --duration 60 --out <thư mục lượt>
+python tools/s06_esp32_check.py <thư mục lượt>
+```
+
+T9: thêm `--no-auto-end` (Pi gửi STOP lúc nhận #run_start + thời lượng). Kết quả kiểm ở `<thư mục lượt>/check/`.

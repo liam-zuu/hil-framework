@@ -3,7 +3,7 @@
  * Baud: 115200, 8N1, TX FIFO enabled (non-blocking send)
  * Packet: 14 bytes — identical to WiFi UDP format on ESP32 side
  *   0xBB | vx_ref(4B LE float) | vy_ref(4B LE float)
- *         | wz_ref(4B LE float) | XOR checksum(1B)
+ *         | wz_ref(4B LE float) | XOR checksum(1B) of bytes 0..12
  * Sent only when traj_flags has HIL_TRAJ_VALID and HIL_TRAJ_NEW.
  */
 
@@ -15,6 +15,7 @@
 #include "usart.h"          /* CubeMX-generated, provides huart2 */
 
 void UartRelay_Init(UART_HandleTypeDef *huart);
+void UartRelay_Pack(const HIL_TrajRef_t *traj, uint8_t pkt[TRAJ_UART_LEN]);   /* no HAL: PC test */
 void UartRelay_Send(const HIL_TrajRef_t *traj);
 void UartRelay_GetStats(uint32_t *sent, uint32_t *dropped);
 

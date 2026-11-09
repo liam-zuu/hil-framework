@@ -33,7 +33,9 @@
  * Each channel toggles independently every half_period_ticks once started;
  * the initial 90 deg offset between A and B encodes direction and is
  * preserved as both channels advance by the same half_period_ticks on every
- * callback. At every start both pins are forced low first, so the first
+ * callback; when the speed changes, EncoderGen_SetOmega re-times both
+ * channels to the new half period (before 28/10 it did not, bug H7-ENC-RETIME).
+ * At every start both pins are forced low first, so the first
  * edge of each is rising and the lead/lag does not depend on the levels
  * left by the previous run.
  *
@@ -72,7 +74,23 @@ typedef struct {
     uint32_t ch1_period;      /* measured period between CH1 toggles [ticks] */
     float    measured_freq;   /* ENC_TIMER_FREQ / (2 * ch1_period) [Hz]   */
     float    expected_freq;   /* |omega|/(2*pi) * ENC_PPR [Hz]            */
+    uint32_t n_start;         /* _start_wheel calls since init            */
+    uint32_t n_stop;          /* _stop calls since init                   */
 } EncoderGenDebug_t;
+
+/* S06 T3b (spec Y5, V2-6; 29/10): every _start_wheel and _stop call is
+ * counted per wheel and reported to an optional hook, so the measurement log
+ * can carry the timer CNT at each start (phase coverage) and the real number
+ * of calls (compared with the scheduled starts and stops). The hook runs in
+ * the caller of EncoderGen_SetOmega (main loop), after the call took effect;
+ * NULL (default) = no hook. Code that uses it checks ENCODER_GEN_HAS_EVENT_HOOK. */
+#define ENCODER_GEN_HAS_EVENT_HOOK 1
+#define ENC_EV_START  1u
+#define ENC_EV_STOP   2u
+/* wheel, ENC_EV_*, timer CNT read at the call, calls of that kind on that
+ * wheel since init (this one included) */
+typedef void (*EncoderGen_EventHook_t)(uint8_t wheel, uint8_t ev, uint16_t cnt, uint32_t n);
+void EncoderGen_SetEventHook(EncoderGen_EventHook_t hook);
 
 /* Initialise — pass timer handles in wheel order 1-4.
  * Does NOT call HAL_TIM_Base_Start/OC_Start_IT: those set HAL state=BUSY
@@ -85,7 +103,10 @@ void EncoderGen_Init(TIM_HandleTypeDef *ht1,
 /* Set target angular velocity [rad/s].
  * omega = 0 (within ENC_OMEGA_MIN) stops the wheel (no toggling).
  * Direction change stops and restarts with the new 90 deg phase offset.
- * Same direction: only half_period is updated, picked up on next callback. */
+ * Same direction, new speed: both pending edges are re-timed (encoder_gen.c
+ * _retime, 28/10): the next edge comes within one NEW half period and B stays
+ * half a new half period from A, so the direction the ESP32 decodes holds.
+ * Called from the main loop; disables interrupts for a few hundred cycles. */
 void EncoderGen_SetOmega(uint8_t wheel, float omega_rad_s);
 
 /* Call from HAL_TIM_OC_DelayElapsedCallback in main.c.

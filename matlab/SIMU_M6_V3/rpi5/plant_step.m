@@ -1,6 +1,11 @@
 function x_new = plant_step(x, tau, params, dt, tau_ext)
 % PLANT_STEP  Mecanum AGV dynamics — kinematics + dynamics + optional wheel slip.
 %
+% NOTE 28/10/2026 (bug HIL-PLANT-ROTFRAME, not fixed here: M6 MATLAB is reference
+% only since 21/10): this model leaves out the body's rotating-frame term
+% M * wz x v_body (centripetal / Coriolis), so turning while moving needs no lateral
+% force. Fixed in the Python plant (rpi5/plant_step.py rotating_frame_torque).
+%
 % Model (Lagrangian, no-slip baseline):
 %   M_eff * d(omega)/dt = tau_eff - b_w * omega
 %   v_body = H_fwd * omega   (forward kinematics)

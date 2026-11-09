@@ -1,7 +1,7 @@
 """
 Tests: protocol.py — SPI encode/decode must match H7 hil_protocol.h
 
-MOSI field order: [ω1, ω2, ω3, ω4, x, y, θ, vx, vy, wz] + traj ref (v2, 36 bytes)
+MOSI field order: [ω1, ω2, ω3, ω4, x, y, θ, vx, vy, wz] + traj ref + IMU (v3, 40 bytes)
   index:           0    1    2    3   4  5  6   7   8   9
 
 Run: pytest tests/test_protocol.py -v
@@ -14,8 +14,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import pytest
 import re
+import struct
+import numpy as np
 from protocol import (
-    encode_state, decode_state, decode_traj_ref,
+    encode_state, decode_state, decode_traj_ref, decode_imu, IMU_RANGES,
     encode_torques, decode_torques, decode_output,
     _to_int16, _from_int16,
     STATE_RANGES, REF_RANGES, TORQUE_RANGE, FRAME_SIZE, N_STATES, N_TORQUES,
@@ -86,9 +88,34 @@ class TestStateEncoding:
     def test_reserved_bytes_are_zero(self):
         frame = encode_state([0.0] * 10, traj_ref=(1.0, -1.0, 2.0),
                              traj_flags=TRAJ_VALID, seq=7, fault_flags=1)
-        # bytes 22-23 and 31-35 are reserved in hil_protocol.h v2
+        # without imu, the v3 IMU bytes (22-23, 31-39) stay zero
         assert frame[22:24] == b'\x00\x00'
-        assert frame[31:36] == b'\x00' * 5
+        assert frame[31:40] == b'\x00' * 9
+
+    def test_imu_roundtrip_and_offsets(self):
+        imu = (1.25, -0.5, 0.3, 9.80665, -2.0)
+        frame = encode_state([0.0] * 10, imu=imu, imu_seq=0x1A5)
+        rec = decode_imu(frame)
+        for got, want, rng in zip(rec[:5], imu, IMU_RANGES):
+            assert abs(got - want) <= rng / 32767 + 1e-12
+        assert rec[5] == 0xA5                       # stored modulo 256
+        # offsets as in hil_protocol.h v3: gz 22, ax 31, ay 33, az 35, yaw 37, seq 39
+        assert struct.unpack_from('>h', frame, 22)[0] == round(1.25 / IMU_RANGES[0] * 32767)
+        assert struct.unpack_from('>h', frame, 35)[0] == round(9.80665 / IMU_RANGES[3] * 32767)
+        assert struct.unpack_from('>h', frame, 37)[0] == round(-2.0 / np.pi * 32767)
+        assert frame[39] == 0xA5
+
+    def test_imu_does_not_touch_other_fields(self):
+        state = [1.0, -2.0, 3.0, -4.0, 0.5, -0.5, 1.0, 0.2, -0.2, 2.0]
+        a = encode_state(state, traj_ref=(1.0, 0.5, -1.0), traj_flags=TRAJ_VALID, seq=9, fault_flags=1)
+        b = encode_state(state, traj_ref=(1.0, 0.5, -1.0), traj_flags=TRAJ_VALID, seq=9, fault_flags=1,
+                         imu=(30.0, 39.0, -39.0, 9.8, 3.1), imu_seq=255)
+        same = [i for i in range(FRAME_SIZE) if i not in (22, 23) and not 31 <= i <= 39]
+        assert [a[i] for i in same] == [b[i] for i in same]
+
+    def test_imu_wrong_length_raises(self):
+        with pytest.raises(ValueError):
+            encode_state([0.0] * 10, imu=(0.0, 0.0, 0.0))
 
     def test_seq_and_fault_bytes(self):
         frame = encode_state([0.0] * 10, seq=0x1FF, fault_flags=0x02)
@@ -162,7 +189,7 @@ class TestTorqueEncoding:
         assert out['pwm'] == pytest.approx([0.5, -0.5, 1.0, 0.0], abs=1e-4)
         assert out['status'] == 3
         assert out['seq'] == 200
-        assert frame[18:] == b'\x00' * 18
+        assert frame[18:] == b'\x00' * (FRAME_SIZE - 18)
 
     def test_lsb_value(self):
         """LSB ≈ 3.05e-5 N·m — matches HIL_TORQUE_MAX/32767."""
@@ -254,6 +281,11 @@ class TestMatchesH7Header:
         assert REF_RANGES == pytest.approx([self._define('HIL_REF_VEL_MAX')] * 2
                                            + [self._define('HIL_REF_OMEGA_MAX')])
         assert TORQUE_RANGE == pytest.approx(self._define('HIL_TORQUE_MAX'))
+
+    def test_imu_ranges(self):
+        assert IMU_RANGES == pytest.approx([self._define('HIL_IMU_GYRO_MAX')]
+                                           + [self._define('HIL_IMU_ACCEL_MAX')] * 3
+                                           + [self._define('HIL_IMU_YAW_MAX')], rel=1e-6)
 
 
 if __name__ == '__main__':

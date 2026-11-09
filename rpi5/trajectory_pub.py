@@ -4,7 +4,7 @@ Trajectory Publisher — Process 2 (Mission computer, 50 Hz)
 Responsibility:
   - Compute trajectory reference at time t  (50 Hz)
   - Default (HIL v2): write body-frame velocity setpoint (vx, vy, wz) into a
-    shared array. Process 1 packs it into the 36-byte SPI frame, the H7
+    shared array. Process 1 packs it into the 40-byte SPI frame, the H7
     relays it to the ESP32 as the 14-byte 0xBB UART packet.
   - Legacy (uart_direct=True): pack the 18-byte packet below and send it to
     the ESP32 over UART directly. The current ESP32 traj_receiver expects the
@@ -80,6 +80,8 @@ class TrajectorySpec:
     radius:   float = 0.5      # circle or figure-8 amplitude [m]
     period:   float = 8.0      # figure-8 full period [s]
     duration: float = 0.0      # 0 = run forever
+    loop:     bool  = False    # S06 V7: at duration, start the trajectory again
+    sequence: tuple = ()       # kind 'load' (S06 V7): ((t_start_s, t_end_s, TrajectorySpec), ...)
 
 
 # ── Reference trajectory functions ───────────────────────────────────────
@@ -158,6 +160,11 @@ def get_body_velocity(t: float, spec: TrajectorySpec) -> Tuple[float, float, flo
     wz = path curvature × path speed.  Time scaling matches get_reference(),
     so integrating these setpoints follows the same (x, y) path.
     """
+    if spec.kind == 'load':
+        for t0, t1, sub in spec.sequence:
+            if t0 <= t < t1:
+                return get_body_velocity(t - t0, sub)
+        return 0.0, 0.0, 0.0
     if spec.kind == 'line':
         return spec.v, 0.0, 0.0
     if spec.kind == 'strafe':
@@ -271,6 +278,7 @@ class TrajectoryPublisher:
         rate_hz:     int   = 50,
         simulate:    bool  = False,
         shared_ref                 = None,
+        control                    = None,
         uart_direct: Optional[bool] = None,
     ):
         """
@@ -288,6 +296,7 @@ class TrajectoryPublisher:
         self.rate_hz     = rate_hz
         self.simulate    = simulate
         self.shared_ref  = shared_ref
+        self.control     = control         # --finite-run: run_lifecycle.ControlBox
         self.uart_direct = (shared_ref is None) if uart_direct is None else uart_direct
 
         self._uart     = None
@@ -297,6 +306,18 @@ class TrajectoryPublisher:
 
     # ── Main loop ─────────────────────────────────────────────────────────
 
+    def _wait_for_run(self) -> bool:
+        """--finite-run: the trajectory time starts with RUN. False = the run ended before it."""
+        from run_lifecycle import PREPARE, ARM, RUN
+        while self._running:
+            phase = self.control.phase()
+            if phase == RUN:
+                return True
+            if phase not in (PREPARE, ARM):
+                return False
+            time.sleep(0.002)
+        return False
+
     def run(self) -> None:
         """Block and publish.  Call as multiprocessing.Process target."""
         signal.signal(signal.SIGTERM, self._on_signal)
@@ -305,10 +326,13 @@ class TrajectoryPublisher:
         if self.uart_direct and not self.simulate:
             self._open_uart()
 
+        self._running = True
+        if self.control is not None and not self._wait_for_run():
+            return
+
         period_s  = 1.0 / self.rate_hz
         t_start   = time.monotonic()
         next_tick = t_start + period_s
-        self._running = True
 
         log.info(
             "Trajectory publisher start — kind=%s  v=%.2f m/s  "
@@ -323,8 +347,12 @@ class TrajectoryPublisher:
                 t   = now - t_start
 
                 if self.spec.duration > 0 and t >= self.spec.duration:
-                    log.info("Trajectory duration %.1f s reached.", self.spec.duration)
-                    break
+                    if self.spec.loop:            # S06 V7: repeat for the whole run
+                        t_start += self.spec.duration
+                        t = now - t_start
+                    else:
+                        log.info("Trajectory duration %.1f s reached.", self.spec.duration)
+                        break
 
                 if self.shared_ref is not None:
                     vx_b, vy_b, wz_b = get_body_velocity(t, self.spec)

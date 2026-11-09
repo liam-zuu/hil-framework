@@ -24,9 +24,15 @@ typedef struct {
     uint32_t           ch1_last_cnt;  /* CNT value at previous CH1 callback  */
     uint32_t           ch1_period;    /* measured ticks between CH1 callbacks*/
     uint8_t            ch1_has_last;  /* 0 until first CH1 callback seen     */
+
+    uint32_t           n_start;       /* _start_wheel calls (S06 T3b)        */
+    uint32_t           n_stop;        /* _stop calls                         */
 } Wheel_t;
 
 static Wheel_t _w[ENC_NUM_WHEELS];
+static EncoderGen_EventHook_t _hook;
+
+void EncoderGen_SetEventHook(EncoderGen_EventHook_t hook) { _hook = hook; }
 
 /* ── half_period from |omega| ───────────────────────────────────────────── */
 static uint32_t _half_period(float omega_abs)
@@ -60,13 +66,21 @@ static void _force_low_then_toggle(TIM_TypeDef *t)
     t->CCMR1 = m | OCM_TOGGLE_1 | OCM_TOGGLE_2;
 }
 
-/* ── Disable both channels, mark stopped ────────────────────────────────── */
+/* ── Stop both channels, pins held at their level, mark stopped ───────── */
+/* 29/10 (Liam: "Sửa giữ mức"): before, _stop cleared CCxE, so the timer no
+ * longer drove A and B; with GPIO_NOPULL the pins floated while the wheel was
+ * stopped and the ESP32 could count noise. Now both channels go to frozen
+ * mode (OCxM = 0000: a compare match no longer changes OCxREF) with the output
+ * still enabled, so each pin stays driven at the level of its last edge. */
 static void _stop(uint8_t i)
 {
-    _w[i].htim->Instance->DIER &= ~(TIM_DIER_CC1IE | TIM_DIER_CC2IE);
-    _w[i].htim->Instance->CCER &= ~(TIM_CCER_CC1E  | TIM_CCER_CC2E);
+    TIM_TypeDef *t = _w[i].htim->Instance;
+    t->DIER  &= ~(TIM_DIER_CC1IE | TIM_DIER_CC2IE);
+    t->CCMR1 &= ~(TIM_CCMR1_OC1M | TIM_CCMR1_OC2M);   /* frozen */
     _w[i].dir          = 0;
     _w[i].ch1_has_last = 0;
+    _w[i].n_stop++;
+    if (_hook) _hook(i, ENC_EV_STOP, (uint16_t)t->CNT, _w[i].n_stop);
 }
 
 /* ── Arm both channels with the 90 deg phase offset for the given dir ──── */
@@ -106,6 +120,60 @@ static void _start_wheel(uint8_t i, int8_t dir)
 
     _w[i].dir          = dir;
     _w[i].ch1_has_last = 0;  /* discard stale period across restart */
+    _w[i].n_start++;
+    if (_hook) _hook(i, ENC_EV_START, (uint16_t)cnt, _w[i].n_start);
+}
+
+/* ── Same direction, new half period: re-time both pending edges ───────── */
+#define ENC_RETIME_MARGIN 3u   /* ticks: a compare closer than this is left to fire */
+
+static void _retime(uint8_t i, uint32_t hp)
+{
+    /*
+     * Before 28/10 only half_period changed and each callback added it to its
+     * own channel (bug H7-ENC-RETIME, model 05_DATA/results/ENC_SCHED_MODEL/
+     * 2026-10-28_run01). Two faults: (1) after a speed-up the next edge still
+     * came one OLD half period later (up to ~4.8 ms, S06 review #2); (2) the
+     * A/B offset stayed half the OLD half period, so after a speed-up of about
+     * x2 in one frame, or a start from rest, B fell more than one new half
+     * period behind A and the ESP32 decoded the wheel backwards.
+     *
+     * Now, with interrupts off (the encoder timers run at priority 0):
+     *  1. a compare that already toggled its pin but whose callback has not
+     *     run is advanced here by the old half period, as the callback would;
+     *  2. the channel whose edge comes first (N) keeps its edge, or moves it to
+     *     now + hp if that is sooner;
+     *  3. the other channel follows N by hp / 2.
+     * Edge order, so direction, is kept: the next edge is N's either way.
+     */
+    TIM_TypeDef *t = _w[i].htim->Instance;
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+
+    uint32_t hp_old = _w[i].half_period;
+    uint32_t now    = t->CNT;          /* read before SR: a match at or before now is flagged */
+    uint32_t sr     = t->SR & (t->DIER & (TIM_DIER_CC1IE | TIM_DIER_CC2IE));
+    uint32_t ccr1   = t->CCR1;
+    uint32_t ccr2   = t->CCR2;
+    if (sr & TIM_SR_CC1IF) ccr1 = (ccr1 + hp_old) & 0xFFFFu;
+    if (sr & TIM_SR_CC2IF) ccr2 = (ccr2 + hp_old) & 0xFFFFu;
+
+    uint32_t d1 = (ccr1 - now) & 0xFFFFu;
+    uint32_t d2 = (ccr2 - now) & 0xFFFFu;
+    int a_first = (d1 != d2) ? (d1 < d2)
+                             : ((int8_t)(_w[i].dir * ENC_DIR_SIGN[i]) > 0);   /* tie: the leader */
+    uint32_t dn  = a_first ? d1 : d2;
+    if (dn > hp && hp >= ENC_RETIME_MARGIN) dn = hp;
+    uint32_t n_at = (now + dn) & 0xFFFFu;
+    uint32_t f_at = (n_at + (hp >> 1)) & 0xFFFFu;
+
+    t->CCR1 = a_first ? n_at : f_at;
+    t->CCR2 = a_first ? f_at : n_at;
+    if (sr) t->SR = ~sr;               /* rc_w0: drop only the flags handled here */
+    _w[i].half_period  = hp;
+    _w[i].ch1_has_last = 0;            /* the next CH1 interval is not one half period */
+
+    __set_PRIMASK(primask);
 }
 
 /* ── Public API ─────────────────────────────────────────────────────────── */
@@ -122,7 +190,16 @@ void EncoderGen_Init(TIM_HandleTypeDef *ht1,
     _w[3].htim = ht4;
 
     /* No HAL_TIM_Base_Start / OC_Start_IT — counters started lazily by
-     * _start_wheel() via CR1 |= CEN. */
+     * _start_wheel() via CR1 |= CEN. Outputs driven low from boot (29/10):
+     * before, they were enabled only at the first start, so A and B floated
+     * until the first nonzero omega. */
+    for (int i = 0; i < ENC_NUM_WHEELS; i++) {
+        TIM_TypeDef *t = _w[i].htim->Instance;
+        uint32_t m = t->CCMR1 & ~(TIM_CCMR1_OC1M | TIM_CCMR1_OC2M);
+        t->CCMR1 = m | OCM_FORCE_INACTIVE_1 | OCM_FORCE_INACTIVE_2;
+        t->CCER |= TIM_CCER_CC1E | TIM_CCER_CC2E;
+        if (IS_TIM_BREAK_INSTANCE(t)) t->BDTR |= TIM_BDTR_MOE;
+    }
 }
 
 void EncoderGen_SetOmega(uint8_t wheel, float omega_rad_s)
@@ -140,16 +217,18 @@ void EncoderGen_SetOmega(uint8_t wheel, float omega_rad_s)
         return;
     }
 
-    _w[wheel].half_period = _half_period(abs_omega);
+    uint32_t hp = _half_period(abs_omega);
 
     if (_w[wheel].dir == 0) {
+        _w[wheel].half_period = hp;
         _start_wheel(wheel, new_dir);
     } else if (new_dir != _w[wheel].dir) {
+        _w[wheel].half_period = hp;
         _stop(wheel);
         _start_wheel(wheel, new_dir);
+    } else if (hp != _w[wheel].half_period) {
+        _retime(wheel, hp);         /* same direction, new speed */
     }
-    /* Same direction, already running: half_period updated above and
-     * picked up automatically on the next OC callback — no restart. */
 }
 
 void EncoderGen_OC_Callback(TIM_HandleTypeDef *htim)
@@ -192,6 +271,8 @@ void EncoderGen_GetDebug(EncoderGenDebug_t *dbg)
         dbg[i].dir         = _w[i].dir;
         dbg[i].half_period = _w[i].half_period;
         dbg[i].ch1_period  = _w[i].ch1_period;
+        dbg[i].n_start     = _w[i].n_start;
+        dbg[i].n_stop      = _w[i].n_stop;
 
         /* measured_freq: each CH1 callback is one toggle, so ch1_period (time
          * between two callbacks) is half a pulse period:

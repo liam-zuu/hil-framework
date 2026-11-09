@@ -7,7 +7,7 @@ import pytest
 from params import PARAMS
 from plant_interface import MockPlant
 from mecanum_plant import MecanumPlant
-from hil_node import HILConfig, HILNode
+from hil_node import HILConfig, HILNode, plant_to_frame_state
 from trajectory_pub import (
     TrajectorySpec,
     encode_packet,
@@ -15,7 +15,7 @@ from trajectory_pub import (
     get_reference,
     get_body_velocity,
 )
-from protocol import decode_traj_ref, TRAJ_VALID, TRAJ_NEW
+from protocol import decode_traj_ref, decode_state, STATE_RANGES, TRAJ_VALID, TRAJ_NEW
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +70,38 @@ class TestHILNodeSimulated:
         assert len(state) == 10
         for v in state:
             assert math.isfinite(v), f"Plant state non-finite: {state}"
+
+
+class TestHILNodeStateOrder:
+    """Bug HIL-STATE-ORDER (27/10): the frame must carry the wheel speeds in
+    bytes 0-7 whatever order the plant keeps its state in."""
+
+    def _first_frame(self, plant):
+        config = HILConfig(simulate_hw=True, max_steps=1, period_us=1_000)
+        node   = HILNode(plant, config=config)
+        frames = []
+        real_transfer = node._spi.transfer
+        node._spi.transfer = lambda tx: (frames.append(tx), real_transfer(tx))[1]
+        node.run()
+        return frames[0]
+
+    def test_mecanum_plant_wheel_speeds_first(self):
+        plant = MecanumPlant(PARAMS, dt=0.001)
+        # x, y, theta, vx, vy, wz, w1..w4: all different
+        plant.reset([0.5, -0.25, 0.75, 0.1, -0.2, 0.3, 11.0, -12.0, 13.0, -14.0])
+        got = decode_state(self._first_frame(plant))
+        want = [11.0, -12.0, 13.0, -14.0, 0.5, -0.25, 0.75, 0.1, -0.2, 0.3]
+        for g, w, rng in zip(got, want, STATE_RANGES):
+            assert abs(g - w) <= rng / 32767
+
+    def test_mock_plant_sent_as_is(self):
+        plant = MockPlant()
+        plant.reset([10.0, 20.0, -10.0, -20.0] + [0.0] * 6)   # --fixed-omega
+        got = decode_state(self._first_frame(plant))
+        assert got[:4] == pytest.approx([10.0, 20.0, -10.0, -20.0], abs=40.0 / 32767)
+
+    def test_plant_to_frame_state(self):
+        assert plant_to_frame_state(list(range(10))) == [6, 7, 8, 9, 0, 1, 2, 3, 4, 5]
 
 
 class TestHILNodeTrajRef:
