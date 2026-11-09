@@ -28,13 +28,28 @@ việc 2: gom lượt bàn thành một lệnh). Làm đúng trình tự đã ch
      đạt/không (kiểm chức năng, gain chưa tune). Không viết `meta.yaml` (người chạy viết, kèm commit 3 board).
 
 Đầu ra trong `--out`: `h7_COM3.txt`, `esp32_COM5.txt` (tên theo cổng), `pi/`, `frames/`, `session.json`
-(lệnh, commit Pi, giờ PC đầu/cuối mỗi lượt, mã thoát), `bench_summary.json` (số chấm). Dòng cuối in
-`#ket_qua,ma=<0|1|2>`: 0 mọi lượt sạch, 1 có lượt không sạch, 2 lỗi chuẩn bị (cổng, SSH, khởi động ESP32).
+(lệnh, commit Pi, giờ PC đầu/cuối mỗi lượt, mã thoát, lệnh dừng Pi), `bench_summary.json` (số chấm). Dòng cuối in
+`#ket_qua,ma=<0|1|2>`: 0 mọi lượt sạch, 1 có lượt không sạch, 2 lỗi chuẩn bị (cổng, SSH, khởi động ESP32,
+thư mục đã có kết quả, tiến trình sót trên Pi).
+
+Chống mất dữ liệu (A, Liam 09/11 "Làm cả A và B"; bài học CLOSED_LOOP/2026-11-09_run05: bốn phiên vào một thư
+mục, log serial ba phiên đầu bị ghi đè): mỗi phiên một thư mục. `--out` đã có `session.json`, `bench_summary.json`,
+`h7_*.txt`, `esp32_*.txt` hay file trong `frames/`, `pi/` thì dừng mã 2 trước khi mở cổng hay SSH; mọi file của
+phiên mở ở chế độ chỉ tạo mới; hai `--run` cùng tên bị từ chối. `flash/` (`tools/h7_flash.py`) được để sẵn.
+`--analyze-only --write-summary` ghi `bench_summary_analyze.json`.
+
+Dừng Pi giữa lượt (B, cùng lời Liam; bài học run05 b3_kill: `pkill -f` khớp cả shell bọc ngoài, TERM thành STOP
+êm): `--pi-kill TÊN=GIÂY` (SIGKILL `run_hil.py` và mọi tiến trình con: Pi chết, không STOP, không frame log),
+`--pi-stop TÊN=GIÂY` (SIGTERM: STOP êm). Công cụ đọc PID `run_hil.py` từ `<pi-dir>/TÊN.pid` (do lệnh lượt ghi), kiểm
+`/proc/PID/cmdline` có `run_hil.py`, không dò theo chuỗi lệnh. Trước phiên và sau mỗi lượt kiểm trên Pi không còn
+`run_hil.py`, `agv_logger.py` (`pgrep -a python3`); còn thì dừng mã 2 và in PID.
 
 Usage:
   python tools/hil_bench_session.py --out <thư mục lượt> --pi-dir '~/run14' --boot \
       --run b2_AL1='--test A-L1' --run b3_AC1='--test A-C1' \
       --run b4_PCNT='--traj circle --speed 0.3 --radius 0.5 --duration 60'
+  python tools/hil_bench_session.py --out <thư mục lượt mới> --pi-dir '~/run21' \
+      --run b5_kill='--test A-L1' --pi-kill b5_kill=11
   python tools/hil_bench_session.py --analyze-only --out <thư mục lượt có frames/>
 
 Giới hạn: Pi chạy không sudo (như run12); không nạp board; ESP32 phải đã nạp đúng env; PuTTY không được mở
@@ -79,7 +94,11 @@ class SerialLog(threading.Thread):
         self.s.dtr = False
         self.s.rts = False
         self.s.open()
-        self.f = open(path, 'wb')
+        try:
+            self.f = open(path, 'xb')                # A (Liam 09/11): never overwrite a log of an earlier session
+        except FileExistsError:
+            self.s.close()
+            raise
         self.lines = []                              # (time.time(), text)
         self.lock = threading.Lock()
         self.stop_ev = threading.Event()
@@ -281,20 +300,121 @@ def scp(host, remote, local_dir):
 
 
 def run_cmd(pi_dir, name, args, logger):
-    hil = (f'cd ~/hil-framework/rpi5 && python3 run_hil.py {args} --finite-run '
-           f'--frame-log {pi_dir}/{name}_frames.npz')
+    # B (Liam 09/11, "Làm cả A và B"): run_hil.py runs as a background job of its own (a single command after
+    # `;`, so $! is its PID, not a subshell's), the PID goes to <pi_dir>/<name>.pid for --pi-kill/--pi-stop,
+    # and `wait` gives its exit code (137 when killed). No stop by `pkill -f <pattern>`: that matched the
+    # wrapper shell too (CLOSED_LOOP/2026-11-09_run05, b3_kill).
+    hil = (f'rm -f {pi_dir}/{name}.pid; cd ~/hil-framework/rpi5 || exit 2; python3 run_hil.py {args} --finite-run '
+           f'--frame-log {pi_dir}/{name}_frames.npz & H=$!; echo $H > {pi_dir}/{name}.pid; wait $H; RC=$?')
     if not logger:
-        return f'mkdir -p {pi_dir} && {hil}'
+        return f'mkdir -p {pi_dir} || exit 2; {hil}; exit $RC'
     # `&` on the logger alone (a `;` before it): with `a && b && logger &` the whole list went to a background
     # subshell, $! was that shell, and a non-interactive shell ignores SIGINT in background jobs, so the
     # logger never stopped and ssh waited for ever (2026-11-09_run01). agv_logger closes on SIGINT/SIGTERM.
     return (f'mkdir -p {pi_dir} && cd ~/hil-framework || exit 2; python3 tools/agv_logger.py --out {pi_dir}/{name}.csv '
-            f'> {pi_dir}/{name}_logger.txt 2>&1 & L=$!; {hil}; RC=$?; sleep 1; kill -INT $L; '
+            f'> {pi_dir}/{name}_logger.txt 2>&1 & L=$!; {hil}; sleep 1; kill -INT $L; '
             f'for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 $L 2>/dev/null || break; sleep 0.5; done; '
             f'kill -TERM $L 2>/dev/null; wait $L; echo logger_exit=$?; exit $RC')
 
 
+def pi_stop_cmd(pi_dir, name, kind):
+    """B: stop the run_hil.py of run `name` by the PID in <pi_dir>/<name>.pid (written by run_cmd).
+    kind 'kill' = SIGKILL to it and every descendant (the Pi dies: no STOP, no END tail, no frame log);
+    'stop' = SIGTERM to it only (run_hil.py turns it into STOP: zero setpoint, then the end of the run).
+    Refuses (exit 3) without a PID file or a live process, (exit 4) when that PID is not run_hil.py."""
+    sig = {'kill': 'KILL', 'stop': 'TERM'}[kind]
+    tgt = '$(d $P) $P' if kind == 'kill' else '$P'
+    return (f'P=$(cat {pi_dir}/{name}.pid 2>/dev/null); [ -n "$P" ] && kill -0 "$P" 2>/dev/null || exit 3; '
+            f"tr '\\0' ' ' < /proc/$P/cmdline | grep -q 'run_hil.py' || exit 4; "
+            f'd() {{ for c in $(pgrep -P "$1"); do d "$c"; echo "$c"; done; }}; T="{tgt}"; '
+            f'echo "pid=$P targets=$(echo $T)"; date +%s.%N; kill -{sig} $T')
+
+
+LEFT_CMD = 'pgrep -u "$(id -u)" -a python3'          # process name python3: the ssh bash itself never matches
+LEFT_PAT = ('run_hil.py', 'agv_logger.py')
+
+
+def leftovers(pgrep_text):
+    """B: `pgrep -a python3` lines of run_hil.py / agv_logger.py processes still on the Pi."""
+    return [ln.strip() for ln in pgrep_text.splitlines() if any(p in ln for p in LEFT_PAT)]
+
+
+def existing_results(out):
+    """A (Liam 09/11): files of an earlier bench session in `out` (a bench run never writes into them).
+    flash/ (tools/h7_flash.py, run before the bench) and anything else the operator put there are allowed."""
+    found = [os.path.join(out, f) for f in ('session.json', 'bench_summary.json') if os.path.exists(os.path.join(out, f))]
+    found += glob.glob(os.path.join(out, 'h7_*.txt')) + glob.glob(os.path.join(out, 'esp32_*.txt'))
+    for sub in ('frames', 'pi'):
+        d = os.path.join(out, sub)
+        if os.path.isdir(d):
+            found += [os.path.join(d, f) for f in os.listdir(d)]
+    return sorted(found)
+
+
+def plan_runs(runs, kills=(), stops=()):
+    """Run specs -> [(name, args, stop)], stop = None or (kind, seconds). Raises ValueError on a bad name,
+    a bad argument, a repeated name (its Pi files and frame log would be overwritten, A), or a --pi-kill /
+    --pi-stop for a run that is not there, given twice, or not after a positive time."""
+    out, names = [], set()
+    for spec in runs:
+        name, _, args = spec.partition('=')
+        if not re.fullmatch(r'[A-Za-z0-9_\-]+', name) or BAD_ARG.search(args):
+            raise ValueError(f'--run không hợp lệ: {spec!r}')
+        if name in names:
+            raise ValueError(f'--run trùng tên {name!r} (file Pi, frame log sẽ bị ghi đè)')
+        names.add(name)
+        out.append([name, args, None])
+    by = {r[0]: r for r in out}
+    for kind, specs in (('kill', kills), ('stop', stops)):
+        for spec in specs:
+            name, _, s = spec.partition('=')
+            try:
+                sec = float(s)
+            except ValueError:
+                sec = -1.0
+            if name not in by or not sec > 0:
+                raise ValueError(f'--pi-{kind} không hợp lệ: {spec!r} (cần TÊN_LƯỢT=GIÂY, giây > 0)')
+            if by[name][2] is not None:
+                raise ValueError(f'lượt {name!r} có hai lệnh dừng')
+            by[name][2] = (kind, sec)
+    return [tuple(r) for r in out]
+
+
+def pi_leftovers(host):
+    """B: run_hil.py / agv_logger.py still running on the Pi (None if SSH failed)."""
+    rc, txt = ssh(host, LEFT_CMD, 30)
+    return leftovers(txt) if rc in (0, 1) else None    # pgrep: 1 = no process matched
+
+
+def _stop_later(a, name, kind, sec, rec):
+    """B: after `sec` s, stop the run's run_hil.py by its PID file; what happened goes into rec."""
+    def fire():
+        rec.update(t_pc=time.time())
+        try:
+            rc, txt = ssh(a.host, pi_stop_cmd(a.pi_dir, name, kind), 30)
+        except subprocess.TimeoutExpired:
+            rc, txt = -1, 'ssh quá 30 s'
+        rec.update(ssh_exit=rc, out=txt.strip())
+        print(f"{name}: --pi-{kind} sau {sec:g} s: mã {rc} ({txt.strip().splitlines()[0] if txt.strip() else ''})",
+              flush=True)
+    t = threading.Timer(sec, fire)
+    t.daemon = True
+    return t
+
+
 def bench(a):
+    # A (Liam 09/11, "Làm cả A và B"): one bench session per output folder (CLOSED_LOOP/2026-11-09_run05 lost
+    # the serial logs of three sessions run into one folder)
+    old = existing_results(a.out)
+    if old:
+        print(f'DỪNG: {a.out} đã có kết quả của một phiên trước ({len(old)} file, ví dụ '
+              f'{", ".join(os.path.relpath(p, a.out) for p in old[:3])}); dùng thư mục runNN mới')
+        return 2, []
+    try:
+        plan = plan_runs(a.run, a.pi_kill, a.pi_stop)
+    except ValueError as ex:
+        print(ex)
+        return 2, []
     os.makedirs(os.path.join(a.out, 'pi'), exist_ok=True)
     os.makedirs(os.path.join(a.out, 'frames'), exist_ok=True)
     sess = dict(started=datetime.datetime.now().isoformat(timespec='seconds'), host=a.host, pi_dir=a.pi_dir,
@@ -304,6 +424,10 @@ def bench(a):
         print(f'SSH tới Pi lỗi: {txt.strip()}')
         return 2, []
     sess['pi_git'] = txt.strip().splitlines()
+    left = pi_leftovers(a.host)
+    if left:                                         # B: an older run_hil / logger would share the SPI, UDP port
+        print('DỪNG: trên Pi còn tiến trình của lần trước, dừng tay rồi chạy lại:\n  ' + '\n  '.join(left))
+        return 2, []
     try:
         h7 = SerialLog(a.h7_port, os.path.join(a.out, f'h7_{a.h7_port}.txt'))
         esp = SerialLog(a.esp_port, os.path.join(a.out, f'esp32_{a.esp_port}.txt'))
@@ -319,7 +443,7 @@ def bench(a):
                         f'--imu-static 0,0,0,9.81,0 --steps 20000 --no-traj')
             t_pi = time.time()           # I8-10 (Codex round 2): motor check from here, not from the reset
             p = subprocess.Popen(['ssh', '-o', 'BatchMode=yes', a.host, boot_cmd],
-                                 stdout=open(os.path.join(a.out, 'pi', 'w0_imustatic_pi.txt'), 'wb'),
+                                 stdout=open(os.path.join(a.out, 'pi', 'w0_imustatic_pi.txt'), 'xb'),
                                  stderr=subprocess.STDOUT)
             time.sleep(4.0)
             t_reset = time.time()
@@ -340,44 +464,65 @@ def bench(a):
                 # has no I8 (or the Pi sent SWA on): stop before any run
                 print('DỪNG: ESP32 bật motor lúc --boot (H7 chưa có I8, hoặc Pi gửi SWA bật)')
                 return 2, []
-        for spec in a.run:
-            name, _, args = spec.partition('=')
-            if not re.fullmatch(r'[A-Za-z0-9_\-]+', name) or BAD_ARG.search(args):
-                print(f'--run không hợp lệ: {spec!r}')
-                return 2, results
+        for name, args, stop in plan:
+            stop_rec = dict(kind=stop[0], after_s=stop[1]) if stop else None
+            timer = _stop_later(a, name, stop[0], stop[1], stop_rec) if stop else None
             t0 = time.time()
+            if timer:
+                timer.start()
             try:
                 rc, txt = ssh(a.host, run_cmd(a.pi_dir, name, args, not a.no_logger), timeout=a.run_timeout)
             except subprocess.TimeoutExpired:
                 rc, txt = -1, f'ssh quá {a.run_timeout} s (--run-timeout); kiểm tiến trình trên Pi'
                 print(f'{name}: {txt}')
             t1 = time.time()
-            with open(os.path.join(a.out, 'pi', f'{name}_pi.txt'), 'w', encoding='utf-8') as f:
+            if timer:
+                timer.cancel()                       # the run ended first: no stop sent
+                timer.join(35.0)
+                if 't_pc' not in stop_rec:
+                    stop_rec['note'] = 'lượt xong trước khi tới giờ dừng: không gửi'
+            with open(os.path.join(a.out, 'pi', f'{name}_pi.txt'), 'x', encoding='utf-8') as f:
                 f.write(txt)
             scp(a.host, f'{a.pi_dir}/{name}_frames.npz', os.path.join(a.out, 'frames'))
             if not a.no_logger:
                 scp(a.host, f'{a.pi_dir}/{name}.csv*', os.path.join(a.out, 'pi'))
                 scp(a.host, f'{a.pi_dir}/{name}_logger.txt', os.path.join(a.out, 'pi'))
-            sess['runs'].append(dict(name=name, args=args, t0=t0, t1=t1, ssh_exit=rc))
+            run_rec = dict(name=name, args=args, t0=t0, t1=t1, ssh_exit=rc)
+            if stop_rec:
+                run_rec['pi_stop'] = stop_rec
+            sess['runs'].append(run_rec)
             time.sleep(1.0)                          # last H7 lines of the run
+            left = pi_leftovers(a.host)
+            if left is None or left:                 # B: nothing of this run may stay on the Pi
+                run_rec['pi_leftovers'] = left
+                print(f'{name}: DỪNG CÁC LƯỢT SAU: ' + ('không kiểm được tiến trình trên Pi (SSH)' if left is None else
+                      'trên Pi còn tiến trình, dừng tay:\n  ' + '\n  '.join(left)))
+                code = 2
             if not os.path.exists(os.path.join(a.out, 'frames', f'{name}_frames.npz')):
-                print(f'{name}: không có frame log (ssh mã {rc})')
-                code = 1
+                print(f'{name}: không có frame log (ssh mã {rc})'
+                      + (' — đúng dự kiến với --pi-kill' if stop and stop[0] == 'kill' else ''))
+                code = max(code, 1)
+                if code == 2:
+                    break
                 continue
             r = analyze_run(a.out, name, h7.since(t0, t1 + 1.0), esp.since(t0, t1 + 1.0))
             r['ssh_exit'] = rc
             if rc != 0:
                 r['clean'] = False
                 r['why'].append(f'Pi mã thoát {rc}')
+            if stop_rec:
+                r['pi_stop'] = stop_rec
             results.append(r)
             print(summary_line(r), flush=True)
             code = max(code, 0 if r['clean'] else 1)
+            if code == 2:
+                break
     finally:
         time.sleep(1.0)
         h7.stop()
         esp.stop()
         sess['ended'] = datetime.datetime.now().isoformat(timespec='seconds')
-        with open(os.path.join(a.out, 'session.json'), 'w', encoding='utf-8') as f:
+        with open(os.path.join(a.out, 'session.json'), 'x', encoding='utf-8') as f:     # A
             json.dump(sess, f, ensure_ascii=False, indent=1)
     return code, results
 
@@ -415,15 +560,25 @@ def main(argv=None):
     ap.add_argument('--run', action='append', default=[], metavar='TÊN=ĐỐI_SỐ', help='đối số run_hil.py của một lượt')
     ap.add_argument('--no-logger', action='store_true', help='không chạy agv_logger trên Pi')
     ap.add_argument('--run-timeout', type=float, default=600.0, help='giới hạn mỗi lượt ssh, giây')
+    ap.add_argument('--pi-kill', action='append', default=[], metavar='TÊN=GIÂY',
+                    help='sau GIÂY từ lúc bắt đầu lượt TÊN: SIGKILL run_hil.py và mọi tiến trình con (rút Pi)')
+    ap.add_argument('--pi-stop', action='append', default=[], metavar='TÊN=GIÂY',
+                    help='sau GIÂY từ lúc bắt đầu lượt TÊN: SIGTERM run_hil.py (STOP êm: setpoint 0 rồi hết lượt)')
     ap.add_argument('--analyze-only', action='store_true',
                     help='chỉ chấm thư mục đã có frames/ (không ghi gì vào thư mục, trừ khi --write-summary)')
-    ap.add_argument('--write-summary', action='store_true', help='với --analyze-only: ghi bench_summary.json')
+    ap.add_argument('--write-summary', action='store_true',
+                    help='với --analyze-only: ghi bench_summary_analyze.json (không đụng bench_summary.json của phiên)')
     a = ap.parse_args(argv)
     if not a.analyze_only and not a.run and not a.boot:
         ap.error('cần --run, --boot hoặc --analyze-only')
+    if a.analyze_only and (a.pi_kill or a.pi_stop):
+        ap.error('--pi-kill, --pi-stop chỉ dùng khi chạy lượt')
     code, results = analyze_only(a) if a.analyze_only else bench(a)
-    if results and (not a.analyze_only or a.write_summary):
-        with open(os.path.join(a.out, 'bench_summary.json'), 'w', encoding='utf-8') as f:
+    if results and a.analyze_only and a.write_summary:
+        with open(os.path.join(a.out, 'bench_summary_analyze.json'), 'w', encoding='utf-8') as f:
+            json.dump(results, f, ensure_ascii=False, indent=1)
+    elif results and not a.analyze_only:
+        with open(os.path.join(a.out, 'bench_summary.json'), 'x', encoding='utf-8') as f:    # A
             json.dump(results, f, ensure_ascii=False, indent=1)
     print(f'#ket_qua,ma={code}')
     return code

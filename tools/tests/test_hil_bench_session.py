@@ -178,10 +178,177 @@ def test_i8_10_boot_counts_motor_on_from_the_pi_start(tmp_path, monkeypatch):
     monkeypatch.setattr(hb.subprocess, 'Popen', lambda *a, **k: SimpleNamespace(wait=lambda timeout=None: 0))
     monkeypatch.setattr(hb, 'SerialLog', _FakeSerial)
     boot_ok = [(105.0, 'BNO085 init OK'), (105.1, 'Controller: LADRC'), (105.2, 'Boot done')]
-    a = SimpleNamespace(out=str(tmp_path), host='h', pi_dir='~/r', h7_port='COM3', esp_port='COM9',
-                        boot=True, run=[], no_logger=True, run_timeout=10)
+    a = SimpleNamespace(out=str(tmp_path / 's1'), host='h', pi_dir='~/r', h7_port='COM3', esp_port='COM9',
+                        boot=True, run=[], no_logger=True, run_timeout=10, pi_kill=[], pi_stop=[])
     _FakeSerial.lines = {'COM9': [(102.0, 'I (9) MOTOR: Motor enabled')] + boot_ok}   # before the reset (104.0)
     assert hb.bench(a) == (2, [])
     clock['t'] = 100.0
+    a.out = str(tmp_path / 's2')                     # one session per folder (A)
     _FakeSerial.lines = {'COM9': [(99.0, 'I (9) MOTOR: Motor enabled')] + boot_ok}    # before the Pi start
     assert hb.bench(a) == (0, [])
+
+
+# ── A, B (Liam 09/11, "Làm cả A và B") ──
+
+def _bench_env(monkeypatch, tmp_path, ssh_reply=None, out='s', **kw):
+    """bench() with fake ssh/scp/serial/clock/Timer; returns (args, ssh calls, timers)."""
+    calls, timers = [], []
+    clock = dict(t=100.0)
+    monkeypatch.setattr(hb, 'time', SimpleNamespace(time=lambda: clock['t'],
+                                                   sleep=lambda s: clock.__setitem__('t', clock['t'] + s)))
+
+    def fake_ssh(host, cmd, timeout=None):
+        calls.append(cmd)
+        return (ssh_reply or (lambda c: (0, '## HEAD\nabc')))(cmd)
+    monkeypatch.setattr(hb, 'ssh', fake_ssh)
+    monkeypatch.setattr(hb, 'scp', lambda *a: 0)
+    monkeypatch.setattr(hb, 'SerialLog', _FakeSerial)
+
+    class FakeTimer:
+        def __init__(self, sec, fn):
+            self.sec, self.fn, self.daemon = sec, fn, False
+            timers.append(self)
+
+        def start(self):
+            self.fn()                                # fire at once: the stop goes out before the run returns
+
+        def cancel(self):
+            pass
+
+        def join(self, t=None):
+            pass
+    monkeypatch.setattr(hb.threading, 'Timer', FakeTimer)
+    _FakeSerial.lines = {}
+    a = SimpleNamespace(out=str(tmp_path / out), host='h', pi_dir='~/r', h7_port='COM3', esp_port='COM9',
+                        boot=False, run=[], no_logger=True, run_timeout=10, pi_kill=[], pi_stop=[])
+    for k, v in kw.items():
+        setattr(a, k, v)
+    return a, calls, timers
+
+
+@pytest.mark.parametrize('old', ['session.json', 'bench_summary.json', 'h7_COM3.txt', 'esp32_COM5.txt',
+                                 'frames/b2_AL1_frames.npz', 'pi/b2_AL1_pi.txt'])
+def test_a_folder_with_results_is_refused_before_anything(tmp_path, monkeypatch, old):
+    a, calls, _ = _bench_env(monkeypatch, tmp_path, run=['x=--test A-L1'])
+    p = os.path.join(a.out, old)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, 'w') as f:
+        f.write('kept')
+    assert hb.bench(a) == (2, [])
+    assert calls == []                               # no SSH, no port opened
+    assert open(p).read() == 'kept'
+
+
+def test_a_flash_folder_alone_is_allowed(tmp_path, monkeypatch):
+    a, calls, _ = _bench_env(monkeypatch, tmp_path, run=['x=--test A-L1'])
+    os.makedirs(os.path.join(a.out, 'flash'))
+    open(os.path.join(a.out, 'flash', 'flash.json'), 'w').close()
+    assert hb.existing_results(a.out) == []
+    hb.bench(a)
+    assert any('run_hil.py --test A-L1' in c for c in calls)
+    assert os.path.exists(os.path.join(a.out, 'session.json'))
+
+
+def test_a_serial_log_never_overwritten(tmp_path, monkeypatch):
+    # second guard: even past existing_results(), the log file opens create-only
+    class FakePort:
+        def __init__(self):
+            self.closed = False
+
+        def open(self):
+            pass
+
+        def close(self):
+            self.closed = True
+    port = FakePort()
+    monkeypatch.setitem(sys.modules, 'serial', SimpleNamespace(Serial=lambda: port))
+    p = tmp_path / 'h7_COM3.txt'
+    p.write_bytes(b'old')
+    with pytest.raises(FileExistsError):
+        hb.SerialLog('COM3', str(p))
+    assert p.read_bytes() == b'old' and port.closed
+
+
+def test_a_plan_refuses_repeats_and_bad_stops():
+    assert hb.plan_runs(['a=--x', 'b=--y'], ['b=11']) == [('a', '--x', None), ('b', '--y', ('kill', 11.0))]
+    assert hb.plan_runs(['a=--x'], [], ['a=2.5']) == [('a', '--x', ('stop', 2.5))]
+    for runs, kills, stops in ((['a=--x', 'a=--y'], [], []),        # same name twice: files overwritten
+                               (['a=--x'], ['b=3'], []), (['a=--x'], ['a=0'], []), (['a=--x'], ['a=x'], []),
+                               (['a=--x'], ['a=3'], ['a=4']), (['a;b=--x'], [], []), (['a=--x; rm'], [], [])):
+        with pytest.raises(ValueError):
+            hb.plan_runs(runs, kills, stops)
+
+
+def test_b_run_cmd_writes_the_pid_of_run_hil_itself():
+    import re
+    for logger in (True, False):
+        c = hb.run_cmd('~/r', 'b5', '--test A-L1', logger)
+        # run_hil.py is the single command put in the background (after `;`), so $! is its own PID
+        assert re.search(r'\|\| exit 2; python3 run_hil\.py --test A-L1 --finite-run --frame-log ~/r/b5_frames\.npz '
+                         r'& H=\$!; echo \$H > ~/r/b5\.pid; wait \$H; RC=\$\?', c), c
+        assert 'rm -f ~/r/b5.pid' in c and c.endswith('exit $RC') and 'pkill' not in c
+
+
+def test_b_stop_cmd_uses_the_pid_file_and_checks_it():
+    k = hb.pi_stop_cmd('~/r', 'b5', 'kill')
+    s = hb.pi_stop_cmd('~/r', 'b5', 'stop')
+    for c in (k, s):
+        assert 'cat ~/r/b5.pid' in c and '/proc/$P/cmdline' in c and "grep -q 'run_hil.py'" in c
+        assert 'pkill' not in c and '|| exit 3' in c and '|| exit 4' in c
+    assert 'kill -KILL $T' in k and 'T="$(d $P) $P"' in k           # descendants too
+    assert 'kill -TERM $T' in s and 'T="$P"' in s                    # the main process only
+    with pytest.raises(KeyError):
+        hb.pi_stop_cmd('~/r', 'b5', 'int')
+
+
+def test_b_leftovers():
+    txt = ('812 python3 /usr/lib/x/other.py\n'
+           '4750 python3 tools/agv_logger.py --out /home/u/run18/b3_kill.csv\n'
+           '4751 python3 run_hil.py --test A-L1 --finite-run\n')
+    assert hb.leftovers(txt) == ['4750 python3 tools/agv_logger.py --out /home/u/run18/b3_kill.csv',
+                                 '4751 python3 run_hil.py --test A-L1 --finite-run']
+    assert hb.leftovers('') == [] and 'python3' in hb.LEFT_CMD and 'run_hil' not in hb.LEFT_CMD
+
+
+def test_b_leftover_before_the_session_stops_it(tmp_path, monkeypatch):
+    reply = lambda c: (0, '4751 python3 run_hil.py --test A-L1') if c == hb.LEFT_CMD else (0, '## HEAD\nabc')  # noqa: E731
+    a, calls, _ = _bench_env(monkeypatch, tmp_path, reply, run=['x=--test A-L1'])
+    assert hb.bench(a) == (2, [])
+    assert not any('run_hil.py --test A-L1 --finite-run' in c for c in calls)
+
+
+def test_b_leftover_after_a_run_stops_the_next_runs(tmp_path, monkeypatch):
+    n = dict(left=0)
+
+    def reply(c):
+        if c == hb.LEFT_CMD:
+            n['left'] += 1
+            return (0, '') if n['left'] == 1 else (0, '4750 python3 tools/agv_logger.py --out x')
+        return (0, '## HEAD\nabc')
+    a, calls, _ = _bench_env(monkeypatch, tmp_path, reply, run=['x=--test A-L1', 'y=--test A-L1'])
+    code, _ = hb.bench(a)
+    assert code == 2
+    assert sum('python3 run_hil.py' in c for c in calls) == 1                   # y never ran
+    import json as _j
+    s = _j.load(open(os.path.join(a.out, 'session.json'), encoding='utf-8'))
+    assert s['runs'][0]['pi_leftovers'] == ['4750 python3 tools/agv_logger.py --out x']
+
+
+def test_b_pi_kill_sends_the_stop_and_records_it(tmp_path, monkeypatch):
+    def reply(c):
+        if c.startswith('P=$(cat'):
+            return (0, 'pid=4905 targets=4907 4908 4905\n1794197831.1')
+        if 'run_hil.py' in c and 'finite-run' in c:
+            return (137, 'killed')
+        return (0, '## HEAD\nabc') if 'git' in c else (1, '')
+    a, calls, timers = _bench_env(monkeypatch, tmp_path, reply, run=['k=--test A-L1'], pi_kill=['k=11'])
+    code, _ = hb.bench(a)
+    assert [t.sec for t in timers] == [11.0]
+    stop = [c for c in calls if c.startswith('P=$(cat')]
+    assert stop == [hb.pi_stop_cmd('~/r', 'k', 'kill')]
+    import json as _j
+    s = _j.load(open(os.path.join(a.out, 'session.json'), encoding='utf-8'))
+    r = s['runs'][0]
+    assert r['ssh_exit'] == 137 and r['pi_stop']['kind'] == 'kill' and r['pi_stop']['after_s'] == 11.0
+    assert r['pi_stop']['ssh_exit'] == 0 and 'pid=4905' in r['pi_stop']['out'] and 't_pc' in r['pi_stop']
+    assert code == 1                                 # no frame log: expected with --pi-kill, still not clean
