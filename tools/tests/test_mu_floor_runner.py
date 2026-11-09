@@ -321,3 +321,9 @@ def test_run_over_udp_marks_link_bad_trial_without_asking_force(fake, tmp_path):
     assert len(asked) == 1                                           # only the "Enter to start" prompt
     assert rows[0]['link_ok'] == 'False' and rows[0]['mu'] == '' and rows[0]['note'].startswith('link:')
     assert rows[0]['n_missing'] == '5' and rows[0]['run_id'] == '1'
+
+
+def test_broadcast_targets_has_limited_and_subnet_broadcasts():
+    t = mf.broadcast_targets()
+    assert t[0] == '255.255.255.255' and all(b.endswith('.255') for b in t) and len(t) == len(set(t))
+    assert not any(b.startswith('127.') for b in t)

@@ -11,7 +11,8 @@ Liam 07/11, CODE session: "lam het viec A di".
 
 Link (protocol v2, Liam 09/11, CODE session: no USB cable while the car pushes, commands over WiFi
 from the laptop; "Duyet, code di" for UDP port 5013 and the 2 % rule below):
-  --udp auto       broadcast PING to <--bcast>:5013, the ESP32 that answers PONG is used
+  --udp auto       broadcast PING to port 5013 (255.255.255.255 and a.b.c.255 of every IPv4 address of
+                   this PC, or --bcast), the ESP32 that answers PONG is used
   --udp <IP>       that address (the ESP32 prints "EV WIFI ip=..." on its UART at boot; PONG has ip=)
   --port COMx      USB-UART 921600 (bench only; restarts the ESP32)
 The ESP32 env mu_floor is AGV_MECANUM src/tests/test_mu_floor.c (protocol in its header comment).
@@ -290,14 +291,32 @@ class SerialLink(LineLink):
                 return None
 
 
+def broadcast_targets():
+    """255.255.255.255 and a.b.c.255 for every IPv4 address of this PC (a /24 net assumed): on a PC
+    with another adapter (bench PC 09/11: ZeroTier) the limited broadcast alone did not reach the
+    ESP32, 192.168.1.255 did."""
+    out = ['255.255.255.255']
+    try:
+        ips = {ai[4][0] for ai in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)}
+    except OSError:
+        ips = set()
+    for ip in sorted(ips):
+        if not ip.startswith('127.'):
+            b = ip.rsplit('.', 1)[0] + '.255'
+            if b not in out:
+                out.append(b)
+    return out
+
+
 class UdpLink(LineLink):
     """WiFi UDP link to env mu_floor. host 'auto': PING to bcast:port, the first PONG sets the host.
     Only datagrams from that host are read afterwards."""
 
     kind = 'udp'
 
-    def __init__(self, host, port=UDP_PORT, bcast='255.255.255.255', tries=10):
+    def __init__(self, host, port=UDP_PORT, bcast='auto', tries=10):
         self.port, self.bcast = port, bcast
+        self.targets = broadcast_targets() if bcast == 'auto' else [bcast]
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         self.sock.bind(('', 0))
@@ -307,7 +326,7 @@ class UdpLink(LineLink):
         if self.host is None:
             self.host = self._discover(tries)
             if not self.host:
-                sys.exit(f'No PONG to a broadcast PING on {bcast}:{port}. Check: car ESP32 on (env mu_floor), '
+                sys.exit(f'No PONG to a broadcast PING on {self.targets} port {port}. Check: car ESP32 on (env mu_floor), '
                          'same WiFi as this PC, Windows firewall lets python receive UDP; or give --udp <IP> '
                          '(the ESP32 prints "EV WIFI ip=..." on its UART).')
         elif not self.hello(tries):
@@ -315,7 +334,11 @@ class UdpLink(LineLink):
 
     def _discover(self, tries):
         for _ in range(tries):
-            self.sock.sendto(b'PING\n', (self.bcast, self.port))
+            for b in self.targets:
+                try:
+                    self.sock.sendto(b'PING\n', (b, self.port))
+                except OSError:                       # an interface without a route: try the others
+                    pass
             t_end = time.time() + 0.5
             while time.time() < t_end:
                 got = self._recv(t_end - time.time(), any_host=True)
@@ -537,7 +560,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--udp', help="'auto' (broadcast PING) or the ESP32 IP")
     ap.add_argument('--udp-port', type=int, default=UDP_PORT)
-    ap.add_argument('--bcast', default='255.255.255.255', help='broadcast address for --udp auto')
+    ap.add_argument('--bcast', default='auto',
+                    help="broadcast address for --udp auto; 'auto' = 255.255.255.255 and a.b.c.255 of every "
+                         'IPv4 address of this PC')
     ap.add_argument('--port', help='serial port (bench only)')
     ap.add_argument('--out', required=True)
     ap.add_argument('--dry-run', action='store_true')
