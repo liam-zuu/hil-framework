@@ -344,14 +344,16 @@ class HILNode:
             self._swa = swa
             self._swa_events.append((self._step, swa))
         if tail:
-            # I8-R2-2: both END_TAIL_FRAMES frames and END_TAIL_MS since the END frame
+            # I8-R2-2: both END_TAIL_FRAMES frames and END_TAIL_MS since the END frame went out
             self._tail_sent += 1
             if (self._tail_sent >= END_TAIL_FRAMES
                     and t_send - self._tail_t0_ns >= END_TAIL_MS * 1_000_000):
                 self._tail_complete = True
                 self._running = False
-        elif self._end_seen:                 # this step reached END: the tail time starts at its frame
-            self._tail_t0_ns = t_send
+        elif self._end_seen:
+            # this step reached END: the tail time starts once its frame is out (Codex round 3: not
+            # t_send, taken before a transfer that may stall), so the H7 has had the off command
+            self._tail_t0_ns = time.monotonic_ns()
         torques = decode_torques(miso)
         if self._lc is not None:
             self._h7_new = miso[OFS_MISO_SEQ] != self._h7_seq
@@ -489,10 +491,12 @@ class HILNode:
 
     @property
     def run_failed(self) -> bool:
-        """--finite-run ended in error:<reason>, or without reaching END."""
+        """--finite-run ended in error:<reason>, or without reaching END, or (I8-R2-3, Codex round 3)
+        reached END but its tail was cut (max_steps, a full frame log, a signal), so run_hil.py exits 3."""
         if self._lc is None:
             return False
-        return self._lc.phase != END or (self._lc.outcome or '').startswith('error:')
+        return (self._lc.phase != END or (self._lc.outcome or '').startswith('error:')
+                or not self._tail_complete)
 
     def _shutdown(self) -> None:
         if self._lc is not None:

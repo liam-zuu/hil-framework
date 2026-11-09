@@ -404,6 +404,31 @@ def test_swa_end_tail_lasts_its_time_when_frames_come_back_to_back(tmp_path, mon
     assert s['swa_tail_complete'] is True and s['swa_tail_sent'] >= END_TAIL_FRAMES
 
 
+def test_swa_end_tail_time_starts_after_the_end_frame_went_out(tmp_path, monkeypatch):
+    # Codex round 3 (I8-R2-2): the END transfer stalls 40 ms, then the tail frames go out back to back;
+    # the tail must still last 30 ms from the moment the END frame was out, not from before its transfer
+    seen = {}
+
+    def hook(node):
+        _no_wait_in_tail(node)
+        real = node._spi.transfer
+
+        def transfer(m):
+            end_frame = node._end_seen and node._tail_t0_ns is None
+            if end_frame:
+                time.sleep(0.04)
+            r = real(m)
+            if end_frame:
+                seen['end_out_ns'] = time.monotonic_ns()
+            return r
+        node._spi.transfer = transfer
+    node, sent, _, _ = _run_hooked(monkeypatch, hook, tmp_path, event=done_after(0.08), swa_mode='phase')
+    t = np.load(tmp_path / 'f.npz')['t_send_ns']
+    last = max(i for i, f in enumerate(sent) if f[0] == END)
+    assert t[last] - seen['end_out_ns'] >= 30_000_000
+    assert node.lifecycle_summary()['swa_tail_complete'] is True and not node.run_failed
+
+
 def _cut_tail_after(n):
     """max_steps lands n frames into the tail (the loop checks it before each frame)."""
     def hook(node):
@@ -425,6 +450,7 @@ def test_swa_end_tail_cut_is_recorded(tmp_path, monkeypatch):
     assert s['outcome'] == 'completed' and node._stop_reason == 'completed'
     assert len([f for f in sent if f[0] == END]) == 1 + 5
     assert s['swa_tail_complete'] is False and s['swa_tail_sent'] == 5
+    assert node.run_failed                 # Codex round 3: run_hil.py exits 3, not 0, for a cut tail
     import json
     m = json.loads(str(np.load(tmp_path / 'f.npz')['manifest']))
     assert m['swa_tail_complete'] is False and m['swa_tail_sent'] == 5
