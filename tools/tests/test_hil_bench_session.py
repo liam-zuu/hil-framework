@@ -180,7 +180,7 @@ def test_i8_10_boot_counts_motor_on_from_the_pi_start(tmp_path, monkeypatch):
     boot_ok = [(105.0, 'BNO085 init OK'), (105.1, 'Controller: LADRC'), (105.2, 'Boot done')]
     a = SimpleNamespace(out=str(tmp_path / 's1'), host='h', pi_dir='~/r', h7_port='COM3', esp_port='COM9',
                         boot=True, run=[], no_logger=True, run_timeout=10, pi_kill=[], pi_stop=[],
-                        expect_esp32=None)
+                        expect_esp32=None, esp32_ip=None, logger_loose=False)
     _FakeSerial.lines = {'COM9': [(102.0, 'I (9) MOTOR: Motor enabled')] + boot_ok}   # before the reset (104.0)
     assert hb.bench(a) == (2, [])
     clock['t'] = 100.0
@@ -222,7 +222,7 @@ def _bench_env(monkeypatch, tmp_path, ssh_reply=None, out='s', **kw):
     _FakeSerial.lines = {}
     a = SimpleNamespace(out=str(tmp_path / out), host='h', pi_dir='~/r', h7_port='COM3', esp_port='COM9',
                         boot=False, run=[], no_logger=True, run_timeout=10, pi_kill=[], pi_stop=[],
-                        expect_esp32=None)
+                        expect_esp32=None, esp32_ip=None, logger_loose=False)
     for k, v in kw.items():
         setattr(a, k, v)
     return a, calls, timers
@@ -410,3 +410,79 @@ def test_b_pi_kill_sends_the_stop_and_records_it(tmp_path, monkeypatch):
     assert r['ssh_exit'] == 137 and r['pi_stop']['kind'] == 'kill' and r['pi_stop']['after_s'] == 11.0
     assert r['pi_stop']['ssh_exit'] == 0 and 'pid=4905' in r['pi_stop']['out'] and 't_pc' in r['pi_stop']
     assert code == 1                                 # no frame log: expected with --pi-kill, still not clean
+
+
+# ── A5: strict logger (Liam 09/11, CODE, STATUS_CODE L61 b) ──
+
+def test_a5_run_cmd_strict_waits_for_ready():
+    c = hb.run_cmd('~/r', 'b1', '--test A-L1', True, '192.168.1.181')
+    assert ('python3 tools/agv_logger.py --out ~/r/b1.csv --strict --src-ip 192.168.1.181 '
+            '--ready-file ~/r/b1.ready > ~/r/b1_logger.txt 2>&1 & L=$!;') in c
+    # run_hil.py starts only after the ready check; no ready file = no run, exit 2
+    i_ready, i_hil = c.index('[ -e ~/r/b1.ready ] ||'), c.index('python3 run_hil.py')
+    assert i_ready < i_hil and 'echo logger_not_ready' in c[i_ready:i_hil] and 'exit 2; }' in c[i_ready:i_hil]
+    assert 'kill -0 $L' in c[:i_hil]                 # a logger that died stops the wait at once
+    loose = hb.run_cmd('~/r', 'b1', '--test A-L1', True)
+    assert '--strict' not in loose and '.ready' not in loose
+    assert loose == hb.run_cmd('~/r', 'b1', '--test A-L1', True, None)
+
+
+def test_a5_logger_src():
+    lines = ['I (2069) WIFI: Got IP: 192.168.1.181 (after 0 failed attempts)', 'x',
+             'I (9) WIFI: Got IP: 192.168.1.190 (after 1 failed attempts)']
+    assert hb.esp32_ip(lines) == '192.168.1.190'     # the last one: a reconnect may change it
+    assert hb.esp32_ip(['I (1) MAIN: Controller: ADRC']) is None
+    assert hb.logger_src('10.0.0.5', lines) == ('10.0.0.5', 'arg')
+    assert hb.logger_src(None, lines) == ('192.168.1.190', 'serial')
+    assert hb.logger_src(None, []) == ('first', 'first_packet')
+
+
+def _lsum(**kw):
+    s = dict(mode='strict', status='closed', src_ip='192.168.1.181', src_lock='fixed', data_lines=10, rejects={},
+             segments=[dict(seq_holes=0), dict(seq_holes=2)])
+    s.update(kw)
+    return s
+
+
+@pytest.mark.parametrize('summary, txt, strict, n_why', [
+    (_lsum(), 'logger_exit=0', True, 0),
+    (_lsum(rejects={'source': 5}), 'logger_exit=0', True, 0),          # other sender: refused, data unharmed
+    (_lsum(rejects={'n_cols_66': 3}), 'logger_exit=0', True, 1),       # a data line missing from the CSV
+    (_lsum(status='open'), 'logger_exit=3', True, 2),
+    (_lsum(mode='loose'), 'logger_exit=0', True, 1),
+    (_lsum(mode='loose'), 'logger_exit=0', False, 0),                  # --logger-loose: loose is expected
+    (None, 'logger_not_ready\nlogger_exit=0', True, 2),
+    (None, '', True, 1),
+])
+def test_a5_logger_problems(summary, txt, strict, n_why):
+    assert len(hb.logger_problems(summary, txt, strict)) == n_why
+
+
+def test_a5_logger_info_and_summary_line():
+    info = hb.logger_info(_lsum())
+    assert info['seq_holes'] == 2 and info['segments'] == 2 and info['mode'] == 'strict'
+    assert hb.logger_info(None) is None
+
+
+def test_a5_bench_uses_serial_ip_and_judges_the_logger(tmp_path, monkeypatch):
+    import json as _j
+
+    def fake_scp(host, remote, local_dir):
+        if remote.endswith('.csv*'):
+            with open(os.path.join(local_dir, 'x.csv.summary.json'), 'w', encoding='utf-8') as f:
+                _j.dump(_lsum(rejects={'type': 1}), f)
+        return 0
+    reply = lambda c: (0, '## HEAD\nabc') if 'git' in c else (0, 'logger_exit=0')  # noqa: E731
+    a, calls, _ = _bench_env(monkeypatch, tmp_path, reply, run=['x=--test A-L1'], no_logger=False)
+    monkeypatch.setattr(hb, 'scp', fake_scp)
+    _FakeSerial.lines = {'COM9': [(50.0, 'I (2069) WIFI: Got IP: 192.168.1.181 (after 0 failed attempts)')]}
+    hb.bench(a)
+    run = [c for c in calls if 'run_hil.py' in c and 'agv_logger' in c]
+    assert run and '--strict --src-ip 192.168.1.181 --ready-file ~/r/x.ready' in run[0]
+    s = _j.load(open(os.path.join(a.out, 'session.json'), encoding='utf-8'))
+    assert s['runs'][0]['logger_cmd'] == dict(strict=True, src_ip='192.168.1.181', src_from='serial')
+    a2, calls2, _ = _bench_env(monkeypatch, tmp_path, reply, out='s2', run=['x=--test A-L1'], no_logger=False,
+                               logger_loose=True)
+    monkeypatch.setattr(hb, 'scp', fake_scp)
+    hb.bench(a2)
+    assert all('--strict' not in c for c in calls2)

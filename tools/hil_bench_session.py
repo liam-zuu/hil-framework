@@ -43,6 +43,13 @@ Nhận dạng firmware ESP32 (Liam 09/11, CODE): AGV in `#fw sha=.. dirty=.. env
 `runs[].esp32_fw` vào `session.json` và in ở dòng tổng kết; `--expect-esp32 SHA`: khác SHA, dirty=1 hay không
 thấy dòng thì `--boot` dừng mã 2, lượt không sạch (`meta.yaml` ghi commit ESP32 theo dòng này).
 
+Logger chế độ đo (A5, Liam 09/11, CODE, STATUS_CODE L61 b): mỗi lượt chạy `agv_logger.py --strict --src-ip IP
+--ready-file <pi-dir>/TÊN.ready`; IP = `--esp32-ip`, không có thì dòng `Got IP:` ESP32 in ở serial trong phiên,
+không có nữa thì `first` (khóa theo gói đầu). `run_hil.py` chỉ chạy khi file ready đã có (chờ tối đa 5 s, không
+có thì không chạy lượt, Pi thoát 2). Lượt không sạch khi logger không sẵn sàng, mã thoát khác 0, `summary.json`
+thiếu hay `status` khác `closed`, `mode` không phải `strict`, hoặc logger loại dòng vì lý do khác `source`;
+`seq_holes`, số đoạn chỉ báo. `--logger-loose` giữ logger cũ (firmware trước 85 cột).
+
 Dừng Pi giữa lượt (B, cùng lời Liam; bài học run05 b3_kill: `pkill -f` khớp cả shell bọc ngoài, TERM thành STOP
 êm): `--pi-kill TÊN=GIÂY` (SIGKILL `run_hil.py` và mọi tiến trình con: Pi chết, không STOP, không frame log),
 `--pi-stop TÊN=GIÂY` (SIGTERM: STOP êm). Công cụ đọc PID `run_hil.py` từ `<pi-dir>/TÊN.pid` (do lệnh lượt ghi), kiểm
@@ -233,6 +240,60 @@ def fw_problem(fws, expect):
     return None
 
 
+IP_RE = re.compile(r'Got IP: (\d{1,3}(?:\.\d{1,3}){3})')
+LOGGER_EXIT_RE = re.compile(r'^logger_exit=(\d+)', re.M)
+LOGGER_SAFE_REJECTS = ('source',)     # datagrams from another sender: refused by the source lock, data unharmed
+
+
+def esp32_ip(lines):
+    """A5: the last `Got IP: a.b.c.d` the ESP32 printed on its serial port (AGV wifi.c), else None."""
+    ips = [m[1] for s in lines for m in [IP_RE.search(s)] if m]
+    return ips[-1] if ips else None
+
+
+def logger_src(arg_ip, esp_lines):
+    """A5: (src_ip, source) for agv_logger --strict --src-ip: --esp32-ip, else the ESP32 serial `Got IP:` of
+    this session, else 'first' (agv_logger locks on the sender of the first packet)."""
+    if arg_ip:
+        return arg_ip, 'arg'
+    ip = esp32_ip(esp_lines)
+    return (ip, 'serial') if ip else ('first', 'first_packet')
+
+
+def logger_problems(summary, pi_txt, strict):
+    """A5 (Liam 09/11, CODE, STATUS_CODE L61 b): why the WiFi log of a run is not usable, [] if it is.
+    Not usable: the logger never got ready (strict), its exit code is not 0, no summary or status not
+    'closed', mode not 'strict' when asked, lines refused for any reason but the source lock (a refused
+    data line is a line missing from the CSV). seq holes and segments are reported, not judged here."""
+    why = []
+    if 'logger_not_ready' in pi_txt:
+        why.append('logger không sẵn sàng (không có file ready trong 5 s): lượt không chạy')
+    m = LOGGER_EXIT_RE.search(pi_txt)
+    if m and m[1] != '0':
+        why.append(f'logger mã thoát {m[1]}')
+    if summary is None:
+        return why + ['không có summary.json của logger']
+    if summary.get('status') != 'closed':
+        why.append(f"logger status {summary.get('status')}")
+    if strict and summary.get('mode') != 'strict':
+        why.append(f"logger mode {summary.get('mode')} (cần strict)")
+    bad = {k: n for k, n in (summary.get('rejects') or {}).items() if k not in LOGGER_SAFE_REJECTS and n}
+    if bad:
+        why.append(f'logger loại dòng: {bad}')
+    return why
+
+
+def logger_info(summary):
+    """A5: short logger record for bench_summary.json and the summary line."""
+    if summary is None:
+        return None
+    seg = summary.get('segments') or []
+    return dict(mode=summary.get('mode'), src_ip=summary.get('src_ip'), src_lock=summary.get('src_lock'),
+                status=summary.get('status'), data_lines=summary.get('data_lines'),
+                rejects=summary.get('rejects'), segments=len(seg),
+                seq_holes=sum(s.get('seq_holes', 0) for s in seg))
+
+
 def boot_motor_on(lines):
     """I8-10: `Motor enabled` lines of the ESP32 in the --boot step (texts)."""
     return sum(1 for s in lines if 'Motor enabled' in s)
@@ -319,6 +380,9 @@ def summary_line(r):
         s += f" | H7 Loop max {r['h7']['loop_max_us']:.1f} µs"
     for f in r.get('esp32_fw') or []:
         s += f" | ESP32 #fw {f['sha']} {f['env']}" + (' DIRTY' if f['dirty'] else '')
+    lg = r.get('logger')
+    if lg:
+        s += f" | logger {lg['mode']} src {lg['src_ip']} seq hở {lg['seq_holes']}"
     sw = r.get('swa')
     if sw and sw.get('cmd_on_frames'):
         s += (f" | SWA bật {sw['cmd_on_frames']} frame, đổi {len(sw['cmd_changes'])} lần,"
@@ -340,7 +404,11 @@ def scp(host, remote, local_dir):
     return subprocess.run(['scp', '-o', 'BatchMode=yes', '-q', f'{host}:{remote}', local_dir]).returncode
 
 
-def run_cmd(pi_dir, name, args, logger):
+def run_cmd(pi_dir, name, args, logger, src_ip=None):
+    # A5 (Liam 09/11, CODE, STATUS_CODE L61 b): src_ip given = measurement mode: agv_logger --strict
+    # --src-ip <src_ip> --ready-file <pi_dir>/<name>.ready, and run_hil.py starts only once the ready file
+    # exists (the logger has every output open); none within 5 s (or the logger died) = no run, exit 2.
+    # src_ip None = the old loose logger, unchanged.
     # B (Liam 09/11, "Làm cả A và B"): run_hil.py runs as a background job of its own (a single command after
     # `;`, so $! is its PID, not a subshell's), the PID goes to <pi_dir>/<name>.pid for --pi-kill/--pi-stop,
     # and `wait` gives its exit code (137 when killed). No stop by `pkill -f <pattern>`: that matched the
@@ -352,8 +420,13 @@ def run_cmd(pi_dir, name, args, logger):
     # `&` on the logger alone (a `;` before it): with `a && b && logger &` the whole list went to a background
     # subshell, $! was that shell, and a non-interactive shell ignores SIGINT in background jobs, so the
     # logger never stopped and ssh waited for ever (2026-11-09_run01). agv_logger closes on SIGINT/SIGTERM.
+    ready = f'{pi_dir}/{name}.ready'
+    strict = f'--strict --src-ip {src_ip} --ready-file {ready} ' if src_ip else ''
+    wait_ready = (f'for i in $(seq 1 50); do [ -e {ready} ] && break; kill -0 $L 2>/dev/null || break; sleep 0.1; '
+                  f'done; [ -e {ready} ] || {{ echo logger_not_ready; kill -TERM $L 2>/dev/null; wait $L; '
+                  f'echo logger_exit=$?; exit 2; }}; ') if src_ip else ''
     return (f'mkdir -p {pi_dir} && cd ~/hil-framework || exit 2; python3 tools/agv_logger.py --out {pi_dir}/{name}.csv '
-            f'> {pi_dir}/{name}_logger.txt 2>&1 & L=$!; {hil}; sleep 1; kill -INT $L; '
+            f'{strict}> {pi_dir}/{name}_logger.txt 2>&1 & L=$!; {wait_ready}{hil}; sleep 1; kill -INT $L; '
             f'for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 $L 2>/dev/null || break; sleep 0.5; done; '
             f'kill -TERM $L 2>/dev/null; wait $L; echo logger_exit=$?; exit $RC')
 
@@ -517,8 +590,11 @@ def bench(a):
             t0 = time.time()
             if timer:
                 timer.start()
+            # A5: strict logger locked on the ESP32 address (unless --logger-loose / --no-logger)
+            src, src_from = (None, None) if (a.no_logger or a.logger_loose) else \
+                logger_src(a.esp32_ip, [s for _, s in esp.since(0)])
             try:
-                rc, txt = ssh(a.host, run_cmd(a.pi_dir, name, args, not a.no_logger), timeout=a.run_timeout)
+                rc, txt = ssh(a.host, run_cmd(a.pi_dir, name, args, not a.no_logger, src), timeout=a.run_timeout)
             except subprocess.TimeoutExpired:
                 rc, txt = -1, f'ssh quá {a.run_timeout} s (--run-timeout); kiểm tiến trình trên Pi'
                 print(f'{name}: {txt}')
@@ -535,6 +611,8 @@ def bench(a):
                 scp(a.host, f'{a.pi_dir}/{name}.csv*', os.path.join(a.out, 'pi'))
                 scp(a.host, f'{a.pi_dir}/{name}_logger.txt', os.path.join(a.out, 'pi'))
             run_rec = dict(name=name, args=args, t0=t0, t1=t1, ssh_exit=rc)
+            if not a.no_logger:
+                run_rec['logger_cmd'] = dict(strict=src is not None, src_ip=src, src_from=src_from)    # A5
             ev = os.path.join(a.out, 'pi', f'{name}.csv.events.txt')
             run_fw = fw_lines(open(ev, encoding='utf-8', errors='replace').read().splitlines()) if os.path.exists(ev) else []
             run_rec['esp32_fw'] = run_fw                 # from the UDP log of this run (none with --no-logger)
@@ -550,7 +628,8 @@ def bench(a):
                 code = 2
             if not os.path.exists(os.path.join(a.out, 'frames', f'{name}_frames.npz')):
                 print(f'{name}: không có frame log (ssh mã {rc})'
-                      + (' — đúng dự kiến với --pi-kill' if stop and stop[0] == 'kill' else ''))
+                      + (' — đúng dự kiến với --pi-kill' if stop and stop[0] == 'kill' else '')
+                      + (' — logger không sẵn sàng, run_hil.py không chạy (A5)' if 'logger_not_ready' in txt else ''))
                 code = max(code, 1)
                 if code == 2:
                     break
@@ -565,6 +644,14 @@ def bench(a):
             if bad:
                 r['clean'] = False
                 r['why'].append(bad)
+            if not a.no_logger:                      # A5: the WiFi log of the run must be usable
+                sp = os.path.join(a.out, 'pi', f'{name}.csv.summary.json')
+                lsum = json.load(open(sp, encoding='utf-8')) if os.path.exists(sp) else None
+                r['logger'] = logger_info(lsum)
+                lbad = logger_problems(lsum, txt, src is not None)
+                if lbad:
+                    r['clean'] = False
+                    r['why'] += lbad
             if stop_rec:
                 r['pi_stop'] = stop_rec
             results.append(r)
@@ -590,8 +677,20 @@ def analyze_only(a):
         print('không có frames/*_frames.npz')
         return 2, []
     results, code = [], 0
+    runs = {x.get('name'): x for x in (sess or {}).get('runs', [])}
     for n in names:
         r = analyze_run(a.out, n)                    # no PC time windows: serial logs not judged per run
+        lc = runs.get(n, {}).get('logger_cmd')
+        if lc is not None:                           # A5: only sessions made with it, old folders keep their verdict
+            sp = os.path.join(a.out, 'pi', f'{n}.csv.summary.json')
+            tp = os.path.join(a.out, 'pi', f'{n}_pi.txt')
+            lsum = json.load(open(sp, encoding='utf-8')) if os.path.exists(sp) else None
+            txt = open(tp, encoding='utf-8', errors='replace').read() if os.path.exists(tp) else ''
+            r['logger'] = logger_info(lsum)
+            lbad = logger_problems(lsum, txt, lc.get('strict'))
+            if lbad:
+                r['clean'] = False
+                r['why'] += lbad
         results.append(r)
         print(summary_line(r))
         code = max(code, 0 if r['clean'] else 1)
@@ -614,6 +713,11 @@ def main(argv=None):
     ap.add_argument('--boot', action='store_true', help='--imu-static + reset ESP32 bằng RTS trước các lượt')
     ap.add_argument('--run', action='append', default=[], metavar='TÊN=ĐỐI_SỐ', help='đối số run_hil.py của một lượt')
     ap.add_argument('--no-logger', action='store_true', help='không chạy agv_logger trên Pi')
+    ap.add_argument('--esp32-ip', metavar='IP',
+                    help='A5: IP nguồn khóa cho agv_logger --strict (mặc định: dòng "Got IP:" ESP32 in trong phiên, '
+                         'không có thì khóa theo gói đầu tiên)')
+    ap.add_argument('--logger-loose', action='store_true',
+                    help='A5: logger chế độ cũ (không --strict, không khóa nguồn, không file ready), cho firmware cũ')
     ap.add_argument('--run-timeout', type=float, default=600.0, help='giới hạn mỗi lượt ssh, giây')
     ap.add_argument('--pi-kill', action='append', default=[], metavar='TÊN=GIÂY',
                     help='sau GIÂY từ lúc bắt đầu lượt TÊN: SIGKILL run_hil.py và mọi tiến trình con (rút Pi)')
