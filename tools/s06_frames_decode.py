@@ -251,15 +251,17 @@ def log_records(rows):
     return recs, dict(records=len(recs), repeated_frames=dups, gaps=gaps)
 
 
-def run_stream(recs, j_lo, j_hi) -> dict:
+def run_stream(recs, j_lo, j_hi, idx_from=None) -> dict:
     """C3-6 (X16): hở luồng log và số H7 bỏ trong lượt, không tính phần đệm: bản ghi mang bởi frame j_lo..j_hi,
-    cộng một bản ghi liền trước và liền sau (hở ngay mép lượt không kết luận được là ngoài lượt)."""
-    rr = sorted(recs, key=lambda r: r['idx'])
+    cộng một bản ghi liền trước và liền sau (hở ngay mép lượt không kết luận được là ngoài lượt).
+    09/11: bản ghi H7 dựng trước log (chỉ số < `idx_from`, TICK có `before_log`) không tính, kể cả khi frame
+    trong lượt mang chúng (decode, đoạn h7_dropped)."""
+    rr = sorted((r for r in recs if idx_from is None or r['idx'] >= idx_from), key=lambda r: r['idx'])
     ins = [i for i, r in enumerate(rr) if j_lo <= r['carrier_j'] <= j_hi]
     if not ins:
         return dict(gaps=0, ticks=0, h7_dropped=None)
     idx = [r['idx'] for r in rr[max(ins[0] - 1, 0):ins[-1] + 2]]
-    ticks = [rr[i] for i in ins if rr[i]['type'] == REC_TICK and 'cyc_full' in rr[i]]
+    ticks = [rr[i] for i in ins if rr[i]['type'] == REC_TICK and 'cyc_full' in rr[i] and not rr[i].get('before_log')]
     dropped = (ticks[-1]['f']['dropped'] - ticks[0]['f']['dropped']) & 0xFFFF if len(ticks) >= 2 else None
     return dict(gaps=idx[-1] - idx[0] + 1 - len(idx), ticks=len(ticks), h7_dropped=dropped)
 
@@ -366,6 +368,18 @@ def h7_reports(recs, fmap, mosi, carrier_nf):
             row['imu_crc_ok'] = f['imu_crc'] == row['imu_crc_pi']
             row['imu_seq_ok'] = f['imu_seq'] == m[MOSI_IMU_SEQ]
         out.append(row)
+    # 09/11 (CLOSED_LOOP/2026-11-09_run07 b4_kill9, Liam "giải quyết luôn"): the H7 keeps building
+    # reports for a while after the link stops; they wait in the ring and leave first in the next log
+    # (src_before_log). The first report of the log made from this log's frames then follows them after
+    # the whole pause, >= 128 periods: `seq_chain` marks it 'cut'. That cut is the log start, not a
+    # sequence fault: cleared, kept as seq_note 'log_start'. A cut between two reports of this log stays.
+    prev = {}
+    for row in out:
+        key = (row['epoch'], row['kind'])
+        p = prev.get(key)
+        if row['seq_flag'] == 'cut' and p is not None and p['src_before_log'] and not row['src_before_log']:
+            row['seq_flag'], row['seq_note'] = '', 'log_start'
+        prev[key] = row
     return out
 
 
@@ -680,13 +694,36 @@ def decode(t_send_ns, mosi, miso, esp32_events: Optional[str] = None, cal: Optio
     else:
         in_log = ticks
     lst['ticks_before_log'] = len(ticks) - len(in_log)
+    in_ids = {id(t) for t in in_log}
+    for t in ticks:
+        t['before_log'] = id(t) not in in_ids
     tick_bad = sum(1 for a, b in zip(in_log, in_log[1:])
                    if (b['f']['cyc_total'] - a['f']['cyc_total']) != (b['cyc_full'] - a['cyc_full']))
     # S36: TICK carries the H7 drop counter since S06Log_Init, cut to 16 bits: the run figure is the
     # difference between the first and the last TICK of the frames (mod 65 536; drops before the first
     # TICK still show as gaps of the record index). Fewer than 2 TICK: not known.
-    if len(ticks) >= 2:
-        lst['h7_dropped'] = (ticks[-1]['f']['dropped'] - ticks[0]['f']['dropped']) & 0xFFFF
+    # 09/11 (CLOSED_LOOP/2026-11-09_run08 b1_stop, after about 32 min without link; Liam "giải quyết
+    # luôn"): the H7 also builds records while the link is down; once its ring is full each new record is
+    # dropped, and a dropped record still takes an index. The ring then leaves first in the next log, so
+    # the first TICK of the frames is an old one (counter 0) and the file-wide figures held 13118 drops and
+    # 13118 index gaps that all happened before the log. With TICKs made before the log
+    # (`ticks_before_log`), drops and gaps are counted from the first TICK made in the log; what lies before
+    # it goes to `h7_dropped_before_log`, `gaps_before_first_log_tick` (a condition, not a problem: drops
+    # in the first TICK period after link up cannot be told apart from drops in the pause).
+    lst['gaps_file'] = lst['gaps']
+    lst['h7_dropped_before_log'] = None
+    lst['gaps_before_first_log_tick'] = 0
+    if lst['ticks_before_log'] and in_log:
+        lst['h7_dropped_before_log'] = (in_log[0]['f']['dropped'] - ticks[0]['f']['dropped']) & 0xFFFF
+        lst['log_idx_from'] = b = in_log[0]['idx']
+        late = sorted({r['idx'] for r in recs if r['idx'] >= b})
+        lst['gaps'] = (late[-1] - late[0] + 1 - len(late)) if late else 0
+        lst['gaps_before_first_log_tick'] = lst['gaps_file'] - lst['gaps']
+        use = in_log
+    else:
+        use = ticks
+    if len(use) >= 2:
+        lst['h7_dropped'] = (use[-1]['f']['dropped'] - use[0]['f']['dropped']) & 0xFFFF
     else:
         lst['h7_dropped'] = None
     lst['h7_dropped_counter_last'] = ticks[-1]['f']['dropped'] if ticks else None
@@ -722,8 +759,11 @@ def decode(t_send_ns, mosi, miso, esp32_events: Optional[str] = None, cal: Optio
         if win is not None:
             in_run = np.flatnonzero((t_send_us >= win[0]) & (t_send_us <= win[1]))
             if len(in_run):
-                res['log'] = dict(lst, gaps_file=lst['gaps'], h7_dropped_file=lst['h7_dropped'],
-                                  **run_stream(recs, int(in_run[0]), int(in_run[-1]) + ANSWER_LAG))
+                # gaps_file: the whole file, records made before the log included; h7_dropped_file: the
+                # whole file from the first TICK made in the log (09/11)
+                res['log'] = dict(lst, gaps_file=lst['gaps_file'], h7_dropped_file=lst['h7_dropped'],
+                                  **run_stream(recs, int(in_run[0]), int(in_run[-1]) + ANSWER_LAG,
+                                               lst.get('log_idx_from')))
     # C3-2: a frame of the run the H7 did not answer (answers come ANSWER_LAG frames later); the whole log
     # when the run marks are not known. Only the first ANSWER_LAG frames of the log have nothing to answer.
     lo, hi = (res.get('esp32_match') or {}).get('window_pi_us') or (t_send_us[0], t_send_us[-1])
@@ -829,6 +869,10 @@ def conditions(res) -> List[str]:
     lg = res['log']
     if lg.get('h7_dropped') is None:
         c.append(f"chỉ có {lg.get('ticks', 0)} bản ghi TICK: không biết H7 có bỏ bản ghi trong lượt không")
+    if lg.get('gaps_before_first_log_tick'):
+        c.append(f"luồng log hở {lg['gaps_before_first_log_tick']} bản ghi trước TICK đầu dựng trong log "
+                 f"(H7 bỏ {lg.get('h7_dropped_before_log')} lúc không có link, ring đầy): nếu có bản ghi mất "
+                 f"ngay sau lúc link lên thì không tách được")
     m = res.get('esp32_match')
     if m and m['window_pi_us'] is None:
         c.append('esp32_events thiếu #run_start/#run_end: chấm ghép report trên cả luồng, không theo khung lượt')

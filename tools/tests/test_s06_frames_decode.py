@@ -25,11 +25,15 @@ def crc(b):
     return binascii.crc_hqx(bytes(b), 0xFFFF)
 
 
-def build(n=N, faults=(), imu_fn=None, idx0=0, enc_n0=0, cyc0=4_000_000_000, pre_ticks=0):
+def build(n=N, faults=(), imu_fn=None, idx0=0, enc_n0=0, cyc0=4_000_000_000, pre_ticks=0, idx_jump=0,
+          pre_reports=0):
     """imu_fn(k) -> (gz, ax, ay, az, yaw) of frame k (default: a slow sine on gz and a yaw ramp).
     idx0, enc_n0: H7 log index and EncoderGen call counts at the log start (0: log from the H7 boot).
     pre_ticks: TICK records made every 0.5 s while the link was down before the log, the last one 0.5 s
-    before frame 0; they wait in the H7 ring and leave first."""
+    before frame 0; they wait in the H7 ring and leave first.
+    pre_reports: reports per kind built 2 s before frame 0 from a frame before the log (src -6); they leave
+    right after the pre_ticks. idx_jump: log indexes taken by records the H7 dropped (ring full) after the
+    records made before the log and before those of the log (09/11, CLOSED_LOOP/2026-11-09_run08 b1_stop)."""
     rng = np.random.default_rng(3)
     t_send_ns = (np.arange(n) * 1e6 + rng.uniform(-20e3, 20e3, n)).astype(np.int64)
     mosi = np.zeros((n, 40), dtype=np.uint8)
@@ -44,6 +48,15 @@ def build(n=N, faults=(), imu_fn=None, idx0=0, enc_n0=0, cyc0=4_000_000_000, pre
     for m in range(pre_ticks, 0, -1):
         c = cyc[0] - int(0.5 * m * F_H7)
         produced[1].append((0x40, struct.pack('<IIIH', c & 0xFFFFFFFF, c & 0xFFFFFFFF, c >> 32, 0)))  # 1: first carried
+    raw0 = bytes(mosi[0][i] for i in dec.MOSI_IMU_BYTES)
+    for m in range(pre_reports):
+        c = cyc[0] - int(2.0 * F_H7) + int(0.01 * m * F_H7)
+        for s in range(3):
+            produced[1].append((0x10 + s, bytes([seqs[s] & 0xFF, 1, 1, 0]) + struct.pack(
+                '<HHHI', (-6) & 0xFFFF, (-6) & 0xFFFF, crc(raw0), (c + 1000 * s) & 0xFFFFFFFF)))
+            seqs[s] += 1
+    n_pre = pre_ticks + 3 * pre_reports
+    pause = [f for f in faults if f[0] == 'report_pause']           # ('report_pause', from, to): none built
     for k in range(n):
         queue = produced[k]
         for kk, w, ev, cnt_n in ENC_EVENTS:
@@ -57,7 +70,7 @@ def build(n=N, faults=(), imu_fn=None, idx0=0, enc_n0=0, cyc0=4_000_000_000, pre
             queue.append((0x10, bytes([seqs[0] & 0xFF, 1, 1, 0]) + struct.pack(
                 '<HHHI', (-6) & 0xFFFF, (-6) & 0xFFFF, crc(raw), cyc[k] & 0xFFFFFFFF)))
             seqs[0] += 1
-        if k > 20 and k % 10 == 0:
+        if k > 20 and k % 10 == 0 and not any(a <= k < b for _, a, b in pause):
             src = k - 3
             raw = bytes(mosi[src][i] for i in dec.MOSI_IMU_BYTES)
             for s in range(3):
@@ -85,6 +98,8 @@ def build(n=N, faults=(), imu_fn=None, idx0=0, enc_n0=0, cyc0=4_000_000_000, pre
         b[17] = mosi[i][21]
         b[18:20] = struct.pack('<H', (i + 1) & 0xFFFF)
         if qi < len(pending):
+            if qi == n_pre:
+                idx += idx_jump                                # records dropped during the pause
             typ, pl = pending[qi]
             if ('drop_log', qi) not in faults:
                 b[22] = typ
@@ -231,6 +246,53 @@ def test_ticks_made_before_log_not_a_mismatch():
     assert res['log']['ticks_before_log'] == 40
     assert res['clock']['tick_total_mismatch'] == 0 and res['log']['gaps'] == 0
     assert dec.problems(res) == []
+
+
+def test_drops_during_the_pause_before_the_log_not_a_run_fault():
+    """09/11 (CLOSED_LOOP/2026-11-09_run08 b1_stop, about 32 min without link): the ring filled during the
+    pause, 13118 records were dropped (each still took an index); the old TICKs (counter 0) leave first,
+    the TICKs of the log carry 13118. Not a fault of the run: a condition, with the figures kept."""
+    t, mosi, miso, _ = build(n=5000, cyc0=20_000_000_000, pre_ticks=40, idx_jump=13118,
+                             faults={('tick_drop', 13118, 0, 0)})
+    res = dec.decode(t, mosi, miso)
+    lg = res['log']
+    assert lg['ticks_before_log'] == 40 and lg['gaps_file'] == 13118
+    assert lg['gaps'] == 0 and lg['h7_dropped'] == 0
+    assert lg['gaps_before_first_log_tick'] == 13118 and lg['h7_dropped_before_log'] == 13118
+    assert dec.problems(res) == []
+    assert any('trước TICK đầu dựng trong log' in c for c in dec.conditions(res))
+
+
+def test_drops_inside_the_log_still_reported_after_a_pause():
+    # same pause, plus 5 drops after frame 3000 and one record lost on the wire inside the log
+    t, mosi, miso, _ = build(n=5000, cyc0=20_000_000_000, pre_ticks=40, idx_jump=13118,
+                             faults={('tick_drop', 13118, 3000, 5), ('drop_log', 40 + 1000)})   # of ~1545 records
+    res = dec.decode(t, mosi, miso)
+    assert res['log']['h7_dropped'] == 5 and res['log']['gaps'] == 1
+    p = dec.problems(res)
+    assert any('H7 bỏ 5' in x for x in p) and any('hở 1 bản ghi' in x for x in p)
+
+
+def test_cut_at_the_log_start_after_reports_made_before_it():
+    """09/11 (CLOSED_LOOP/2026-11-09_run07 b4_kill9): the H7 built 3 reports per kind after the link
+    stopped; they leave first (src_before_log), then the first report of this log follows after the
+    pause (>= 128 periods): that cut is the log start, not a sequence fault."""
+    t, mosi, miso, seqs = build(n=3000, pre_reports=3)
+    res = dec.decode(t, mosi, miso)
+    rp = res['reports']
+    assert rp['src_before_log'] == 9 and rp['seq_flags'] == {}
+    starts = [r for r in res['_reports'] if r.get('seq_note') == 'log_start']
+    assert len(starts) == 3 and all(not r['src_before_log'] for r in starts)
+    assert dec.problems(res) == []
+
+
+def test_cut_inside_the_log_still_reported():
+    # no report built for 1.5 s inside the log (>= 128 periods of 10 ms): one cut per kind, still a fault,
+    # also when the log starts with reports made before it
+    t, mosi, miso, seqs = build(n=4000, pre_reports=3, faults={('report_pause', 1000, 2500)})
+    res = dec.decode(t, mosi, miso)
+    assert res['reports']['seq_flags'] == {'cut': 3}
+    assert any('số thứ tự report' in x for x in dec.problems(res))
 
 
 def test_enc_gaps_log_not_from_boot():
