@@ -33,8 +33,10 @@ static void _tx_put(uint8_t b)
 }
 
 /* Microseconds from the DWT cycle counter, corrected like EncoderGen and
- * the BNO085 emulator: the H7 clock runs 0.64 % fast (bug H7-CLK-HSE), so
- * one real millisecond is SystemCoreClock / 1000 * ENC_CLOCK_CAL cycles.
+ * the BNO085 emulator: one real millisecond is SystemCoreClock / 1000 *
+ * ENC_CLOCK_CAL cycles. ENC_CLOCK_CAL is 1.0 since 09/11 (HSE 5 MHz from the
+ * ST-LINK MCO HSE/5, bug H7-CLK-HSE fixed at the source); it was 1.0064 while
+ * the H7 ran 0.64 % fast on the ST-LINK HSI/2 default.
  * Called only from the TIM6 tick (and init), so no locking. */
 static uint32_t _cyc_last;
 static uint64_t _cyc_total;

@@ -178,7 +178,8 @@ def test_steady_20_s(harness):
 
 
 def test_h7_tick_from_the_fast_clock(harness):
-    # TIM6 runs on the H7 clock, 0.64 % fast: 100 us of H7 time is 99.36 us
+    # TIM6 on a clock 0.64 % fast (the H7 before the HSE/5 fix of 09/11, bug
+    # H7-CLK-HSE): 100 us of H7 time is 99.36 us. Kept as a robustness case.
     d = run(harness, 'run', WINDOW_TICKS + 700, 'tickus=99.36')
     w = d['windows'][0]
     assert 7000 <= w['p_min'] <= w['p_max'] <= 7100

@@ -56,7 +56,8 @@
 #define ENC_NUM_WHEELS  4u
 #define ENC_TIMER_FREQ  1000000UL  /* Hz, tick rate after PSC=239        */
 
-/* Clock correction (27/10, Liam approved in the CODE session, bug H7-CLK-HSE):
+/* Clock correction. Now 1.0 (09/11 fix below); history kept for the trace.
+ * 27/10 (Liam approved in the CODE session, bug H7-CLK-HSE):
  * the H7 clock runs about 0.64 % fast against two independent references
  * (RPi5 frame rate and the ESP32 crystal; 05_DATA/results/H7_CLOCK/
  * 2026-10-27_run01). The CubeMX clock setup is correct (8 MHz HSE bypass,
