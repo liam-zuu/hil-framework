@@ -25,6 +25,19 @@
 #include "s06_log.h"
 #include "s06_load.h"
 #include "ibus_gen_port.h"
+/* Firmware id (#fw, Liam 09/11, CODE; STATUS_CODE L61 b): fw_id_gen.h is written by the CubeIDE pre-build
+ * step (stm32h7/scripts/fw_id.py), not in git. A build without it (arm-gcc check, no pre-build) prints
+ * sha=unknown dirty=1, which hil_bench_session --expect-h7 refuses. */
+#if defined(__has_include)
+#  if __has_include("fw_id_gen.h")
+#    include "fw_id_gen.h"
+#  endif
+#endif
+#ifndef FW_GIT_SHA
+#  define FW_GIT_SHA   "unknown"
+#  define FW_GIT_DIRTY 1
+#  define FW_ENV       "none"
+#endif
 #include <stdio.h>
 /* USER CODE END Includes */
 
@@ -40,6 +53,13 @@
  * speed. The ESP32 drops its setpoint to 0 on its own after 200 ms without
  * a relay packet (AGV_MECANUM traj_receiver.c, TRAJ_TIMEOUT_MS). */
 #define SPI_LINK_TIMEOUT_MS  50u
+/* While the link is down after having been up: SPI1 restart requested every
+ * this many ms (08/11, bug HIL-SPI1-SCK-GLITCH). Before, one request at the
+ * up -> down transition only, so a restart that returned HAL_OK but never
+ * completed left the link dead until a reset (CLOSED_LOOP/2026-11-08_run02,
+ * 01:48). Harmless when the Pi has stopped: the restart runs only while NSS
+ * is high. */
+#define SPI_DOWN_RESTART_MS  200u
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -156,6 +176,215 @@ static void _s06_enc_event(uint8_t wheel, uint8_t ev, uint16_t cnt, uint32_t n)
     S06Log_Push(ev == ENC_EV_START ? S06_REC_ENC_START : S06_REC_ENC_STOP, p, sizeof p);
 }
 #endif
+
+/* Debug block, one line per main-loop pass (08/11, STATUS_CODE L51). Before,
+ * the whole 0.5 s block (and the PWMdma line every 2 s, the T10 report every
+ * 10 s) was formatted in ONE pass: the loop missed 1-5 SPI1 frames each time
+ * (reply in frame N+3..N+7 instead of N+2, frames never applied:
+ * CLOSED_LOOP/2026-11-08_run08). Now every counter is copied once when the
+ * block is due (_dbg_snap_t), then each pass prints at most one line (the
+ * PWMdma line is built in sections, one per pass) and only when no SPI1 frame
+ * is waiting. Lines and their order are unchanged, plus the "Loop:" line. */
+typedef struct {
+    EncoderGenDebug_t  enc[ENC_NUM_WHEELS];
+    float              duty[4];
+    uint8_t            pwm_line;                 /* PWMdma line in this block */
+    uint32_t           pwm_es[PWM_NUM_CHANNELS];
+    PWMCapture_Stats_t ps;
+    uint32_t           win_t, svc_t, wh[4], wmin_t;
+    uint32_t           relay_sent, relay_dropped;
+    HIL_TrajRef_t      traj;
+    uint8_t            link_up;
+    uint32_t           n_link_lost;
+    SPI1_Stats_t       ss;
+    uint32_t           frames_per_s;
+    uint32_t           svc_min, svc_max, n_down_restarts, cyc_per_us;
+    uint32_t           n_applied, n_skipped, age_max_us;
+    uint32_t           s06_pushed, s06_dropped, dbg_drop;
+    BnoPort_Stats_t    bs;
+    uint8_t            ibus_new;
+    ibus_gen_window_t  iw;
+    uint8_t            fw_line;                  /* #fw line in this block (every 10 s) */
+    /* main-loop passes since the last block (L39): longest pass, longest
+     * pass that did debug work (copy or one line), passes over 500 us and
+     * over 1 ms, passes; DWT cycles, preemption by interrupts included */
+    uint32_t           lp_max, lp_prn_max, lp_n500, lp_n1ms, lp_n;
+} _dbg_snap_t;
+
+enum {
+    DS_W1 = 0, DS_PWM = 4, DS_DMA0 = 5, DS_DMA_LAST = 13,   /* PWMdma: 9 sections */
+    DS_RELAY, DS_LINK, DS_SPIFIX, DS_LOOP, DS_FRAME, DS_S06LOG, DS_BNO1, DS_BNO2,
+    DS_FW, DS_IBUS, DS_END
+};
+
+static _dbg_snap_t _ds;
+static int         _ds_step = -1;                /* -1: nothing to print */
+static char        _ds_pl[320];
+static int         _ds_pn;
+static uint32_t    _lp_max, _lp_prn_max, _lp_n500, _lp_n1ms, _lp_n;
+
+#define _PL(...) do { if (_ds_pn < (int)sizeof(_ds_pl))                                 \
+        _ds_pn += snprintf(_ds_pl + _ds_pn, sizeof(_ds_pl) - (size_t)_ds_pn, __VA_ARGS__); \
+    } while (0)
+
+/* us with one decimal from DWT cycles */
+#define _US10(c) ((unsigned long)((uint64_t)(c) * 10u / _ds.cyc_per_us))
+
+static void _dbg_print_next(void)
+{
+    const _dbg_snap_t *d = &_ds;
+    int s = _ds_step;
+    if (s == DS_FW && !d->fw_line)
+        s = DS_IBUS;                             /* no #fw line in this block: the IBUS step, same pass */
+    if (s >= DS_W1 && s < DS_PWM) {
+        int i = s - DS_W1;
+        printf("W%d: omega=%6.2f dir=%2d hp=%5lu meas=%7.2fHz exp=%7.2fHz\r\n",
+               i + 1,
+               (double)d->enc[i].omega_cmd, (int)d->enc[i].dir,
+               (unsigned long)d->enc[i].half_period,
+               (double)d->enc[i].measured_freq,
+               (double)d->enc[i].expected_freq);
+    } else if (s == DS_PWM) {
+        printf("PWM: %.2f %.2f %.2f %.2f\r\n",
+               (double)d->duty[0], (double)d->duty[1],
+               (double)d->duty[2], (double)d->duty[3]);
+        if (!d->pwm_line) s = DS_DMA_LAST;       /* no PWMdma line this block */
+    } else if (s >= DS_DMA0 && s <= DS_DMA_LAST) {
+        /* DMA capture counters (04/11), channel order RPWM FL FR RL RR,
+         * LPWM FL FR RL RR: e/s = captures per second (about 40000 on a
+         * channel with 20 kHz PWM, 0 when held), lost = overcapture flags,
+         * lap = service gaps >= 5 ms (ring dropped, FL channel), fix = edge
+         * type corrected by the pin anchor, bad = periods > 75 us skipped,
+         * una = runs of edges with the edge type unknown >= 20 ms (duty held),
+         * known = edge type known, act = DMA stream running, dmaerr = stream
+         * did not start or found stopped, win / svc = largest anchor window
+         * and largest PWMCapture_Service() time in us over the last 2 s
+         * (Codex M23, Liam: measure on the board; window above about 7 us:
+         * revisit the window step). Printed every 2 s (Codex M21). */
+        switch (s - DS_DMA0) {
+        case 0:
+            _ds_pn = 0;
+            _PL("PWMdma: e/s=");
+            for (int i = 0; i < (int)PWM_NUM_CHANNELS; i++) _PL("%s%lu", i ? "," : "", (unsigned long)d->pwm_es[i]);
+            break;
+        case 1: for (int i = 0; i < (int)PWM_NUM_CHANNELS; i++) _PL("%s%lu", i ? "," : " lost=", (unsigned long)d->ps.lost[i]); break;
+        case 2:
+            _PL(" lap=%lu", (unsigned long)d->ps.lap[0]);
+            for (int i = 0; i < (int)PWM_NUM_CHANNELS; i++) _PL("%s%lu", i ? "," : " fix=", (unsigned long)d->ps.parity_fix[i]);
+            break;
+        case 3: for (int i = 0; i < (int)PWM_NUM_CHANNELS; i++) _PL("%s%lu", i ? "," : " bad=", (unsigned long)d->ps.bad_period[i]); break;
+        case 4: for (int i = 0; i < (int)PWM_NUM_CHANNELS; i++) _PL("%s%lu", i ? "," : " una=", (unsigned long)d->ps.unanchored[i]); break;
+        case 5: for (int i = 0; i < (int)PWM_NUM_CHANNELS; i++) _PL("%s%u", i ? "" : " known=", (unsigned)d->ps.known[i]); break;
+        case 6: for (int i = 0; i < (int)PWM_NUM_CHANNELS; i++) _PL("%s%u", i ? "" : " act=", (unsigned)d->ps.active[i]); break;
+        case 7: for (int i = 0; i < (int)PWM_NUM_CHANNELS; i++) _PL("%s%lu", i ? "," : " dmaerr=", (unsigned long)d->ps.dma_err[i]); break;
+        default:
+            _PL(" win=%lu.%lu svc=%lu.%lu",
+                (unsigned long)(d->win_t / 10u), (unsigned long)(d->win_t % 10u),
+                (unsigned long)(d->svc_t / 10u), (unsigned long)(d->svc_t % 10u));
+            /* DIAG 05/11: windows by length (<7 / 7-20 / 20-50 / >=50 us) and shortest window */
+            _PL(" wh=%lu/%lu/%lu/%lu wmin=%lu.%lu",
+                (unsigned long)d->wh[0], (unsigned long)d->wh[1], (unsigned long)d->wh[2], (unsigned long)d->wh[3],
+                (unsigned long)(d->wmin_t / 10u), (unsigned long)(d->wmin_t % 10u));
+            printf("%s\r\n", _ds_pl);
+            break;
+        }
+    } else if (s == DS_RELAY) {
+        printf("Relay: sent=%lu dropped=%lu  traj vx=%.2f vy=%.2f wz=%.2f\r\n",
+               (unsigned long)d->relay_sent, (unsigned long)d->relay_dropped,
+               (double)d->traj.vx_ref, (double)d->traj.vy_ref, (double)d->traj.wz_ref);
+    } else if (s == DS_LINK) {
+        printf("Link: %s lost=%lu  SPI frames=%lu/s err=%lu rearm=%lu last_err=0x%lx\r\n",
+               d->link_up ? "up" : "down", (unsigned long)d->n_link_lost,
+               (unsigned long)d->frames_per_s,
+               (unsigned long)d->ss.errors, (unsigned long)d->ss.rearms,
+               (unsigned long)d->ss.last_error);
+    } else if (s == DS_SPIFIX) {
+        /* 08/11 (bug HIL-SPI1-SCK-GLITCH): SPI1 found not armed (each one is
+         * a lost frame; a run with stuck > 0 is not a main-number run),
+         * failed restarts, restarts requested while down, and the shortest /
+         * longest SPI1_Service() call over the last 0.5 s (L39) */
+        printf("SPIfix: stuck=%lu stuck_err=0x%lx restart_fail=%lu down_req=%lu svc=%lu..%lu cyc (%lu cyc/us)\r\n",
+               (unsigned long)d->ss.stuck, (unsigned long)d->ss.stuck_err,
+               (unsigned long)d->ss.restart_fail, (unsigned long)d->n_down_restarts,
+               (unsigned long)d->svc_min, (unsigned long)d->svc_max,
+               (unsigned long)d->cyc_per_us);
+    } else if (s == DS_LOOP) {
+        /* 08/11 (L51, L39): main-loop pass times since the last block; a pass
+         * over 1 ms can miss an SPI1 frame (one frame per ms) */
+        printf("Loop: max=%lu.%lu us prn_max=%lu.%lu us over500us=%lu over1ms=%lu passes=%lu\r\n",
+               _US10(d->lp_max) / 10u, _US10(d->lp_max) % 10u,
+               _US10(d->lp_prn_max) / 10u, _US10(d->lp_prn_max) % 10u,
+               (unsigned long)d->lp_n500, (unsigned long)d->lp_n1ms, (unsigned long)d->lp_n);
+    } else if (s == DS_FRAME) {
+        /* Frames the main loop did not read, and the NEW setpoint path:
+         * seen = taken + replaced + dropped (+1 if one is pending) */
+        printf("Frame: unread=%lu  new seen=%lu taken=%lu repl=%lu drop=%lu"
+               "  applied=%lu skipped=%lu age_max=%luus\r\n",
+               (unsigned long)d->ss.unread, (unsigned long)d->ss.new_seen,
+               (unsigned long)d->ss.new_taken, (unsigned long)d->ss.new_replaced,
+               (unsigned long)d->ss.new_dropped,
+               (unsigned long)d->n_applied, (unsigned long)d->n_skipped,
+               (unsigned long)d->age_max_us);
+    } else if (s == DS_S06LOG) {
+        printf("S06log: pushed=%lu dropped=%lu  print_drop=%lu\r\n",
+               (unsigned long)d->s06_pushed, (unsigned long)d->s06_dropped,
+               (unsigned long)d->dbg_drop);
+    } else if (s == DS_BNO1) {
+        /* BNO085 emulator (G2): host init (adv, prod id, set features),
+         * transactions and reports per sensor (accel / gyro / game RV) */
+        const BnoPort_Stats_t *bs = &d->bs;
+        printf("BNO: st=%u rst=%lu adv=%lu pid=%lu sf=%lu gf=%lu rd=%lu empty=%lu wr=%lu col=%lu tmo=%lu\r\n",
+               (unsigned)bs->state, (unsigned long)bs->core.resets,
+               (unsigned long)bs->core.adverts, (unsigned long)bs->core.prod_id_reqs,
+               (unsigned long)bs->core.set_features, (unsigned long)bs->core.get_features,
+               (unsigned long)bs->core.reads, (unsigned long)bs->core.empty_reads,
+               (unsigned long)bs->core.writes, (unsigned long)bs->core.collisions,
+               (unsigned long)bs->core.int_timeouts);
+    } else if (s == DS_BNO2) {
+        const BnoPort_Stats_t *bs = &d->bs;
+        printf("BNO: rpt=%lu/%lu/%lu per=%lu/%lu/%lu us ovr=%lu stale=%lu drop=%lu unk=%lu"
+               " | xfer=%lu mism=%lu miss=%lu armf=%lu err=%lu max=%lu smp=%lu\r\n",
+               (unsigned long)bs->reports[0], (unsigned long)bs->reports[1],
+               (unsigned long)bs->reports[2],
+               (unsigned long)bs->period_us[0], (unsigned long)bs->period_us[1],
+               (unsigned long)bs->period_us[2],
+               (unsigned long)bs->core.input_overruns, (unsigned long)bs->core.stale_skips,
+               (unsigned long)bs->core.q_drops, (unsigned long)bs->core.unknown_cmds,
+               (unsigned long)bs->xfers, (unsigned long)bs->arm_mismatch,
+               (unsigned long)bs->missed_edge, (unsigned long)bs->arm_fail,
+               (unsigned long)bs->spi_errors, (unsigned long)bs->max_clocked,
+               (unsigned long)bs->samples);
+    } else if (s == DS_FW) {
+        /* firmware id (Liam 09/11, CODE): same text as the boot line, so a log that starts after the
+         * boot still shows which build runs (hil_bench_session --expect-h7) */
+        printf("#fw sha=%s dirty=%d env=%s\r\n", FW_GIT_SHA, (int)FW_GIT_DIRTY, FW_ENV);
+    } else if (s == DS_IBUS) {
+        /* iBUS 10 s summary (S06 T12 (b)): P = frame start to frame start
+         * in us (DWT, real time), printed in ms with 0.01 ms; tgap = longest
+         * time between two TIM6 ticks; once per closed window */
+        if (d->ibus_new) {
+            const ibus_gen_window_t *iw = &d->iw;
+            /* I8: swa = frames started with SWA 2000 / frames, chg = SWA
+             * changes between frames, now = SWA of the last frame started */
+            printf("IBUS: win=%lu on=%lu frames=%lu P=%lu.%02lu..%lu.%02lu ms n=%lu late=%lu tgap=%lu us en=%lu total=%lu swa=%lu/%lu chg=%lu now=%lu\r\n",
+                   (unsigned long)iw->window, (unsigned long)iw->enabled,
+                   (unsigned long)iw->frames,
+                   (unsigned long)(iw->p_min_us / 1000u), (unsigned long)((iw->p_min_us % 1000u) / 10u),
+                   (unsigned long)(iw->p_max_us / 1000u), (unsigned long)((iw->p_max_us % 1000u) / 10u),
+                   (unsigned long)iw->p_count, (unsigned long)iw->late_ticks,
+                   (unsigned long)iw->tick_gap_max_us,
+                   (unsigned long)iw->enables, (unsigned long)iw->total_frames,
+                   (unsigned long)iw->swa_frames, (unsigned long)iw->frames,
+                   (unsigned long)iw->swa_changes, (unsigned long)iw->swa);
+        } else {
+            s = DS_END;                          /* no IBUS line: "---" in this pass */
+            printf("---\r\n");
+        }
+    } else {
+        printf("---\r\n");
+    }
+    _ds_step = (s >= DS_END) ? -1 : s + 1;
+}
 /* USER CODE END 0 */
 
 /**
@@ -221,6 +450,7 @@ int main(void)
   setvbuf(stdout, NULL, _IONBF, 0);
 
   printf("\r\n--- H753 HIL boot ---\r\n");
+  printf("#fw sha=%s dirty=%d env=%s\r\n", FW_GIT_SHA, (int)FW_GIT_DIRTY, FW_ENV);   /* firmware id */
   printf("pclk1=%lu  pclk2=%lu\r\n",
          HAL_RCC_GetPCLK1Freq(), HAL_RCC_GetPCLK2Freq());
 
@@ -242,7 +472,7 @@ int main(void)
   printf("BNO: emulator on SPI4 (INT PG2, RST PG3), TIM6 tick\r\n");
   BnoPort_Init(&hspi4, &htim6);
   if (IbusPort_Init(UART4))
-    printf("IBUS: UART4 TX PD1, frame every %u us while the SPI1 link is up (stop after %u ms without a frame)\r\n",
+    printf("IBUS: UART4 TX PD1, frame every %u us while the SPI1 link is up (stop after %u ms without a frame); SWA from MOSI byte 20 bit 3 (I8), off at boot\r\n",
            (unsigned)IBUS_GEN_PERIOD_US, (unsigned)IBUS_LINK_TIMEOUT_MS);
   else
     printf("IBUS: UART4 not set up (add it in CubeMX), iBUS off\r\n");
@@ -260,6 +490,8 @@ int main(void)
   static uint32_t _up_first_ms = 0;
   static uint32_t _up_first_frames = 0;
   static uint32_t _n_link_lost = 0;
+  static uint32_t _down_restart_ms = 0;
+  static uint32_t _n_down_restarts = 0;   /* restarts requested while down */
   /* S06 T1 (V4): frames applied by this loop, frames received but never
    * applied (overwritten before the loop read them, from the frame count),
    * largest state age callback -> applied */
@@ -271,6 +503,15 @@ int main(void)
    * 100 ms (no frame, no tick, so every pass is idle). Debug print turns
    * non-blocking after that. */
   static uint32_t _t10_last = 0;
+  static uint8_t  _t10_pend = 0;       /* T10 window taken, lines not all printed */
+  /* debug block state, kept across blocks (were statics inside the block) */
+  static uint32_t _edges_last[PWM_NUM_CHANNELS];
+  static uint32_t _pwm_dbg_ms = 0;
+  static uint32_t _fw_dbg_ms = 0;    /* #fw line every 10 s in the debug block */
+  static uint32_t _frames_last = 0;
+  static uint32_t _ibus_win_last = 0;
+  static ibus_swa_filter_t _swa_f;     /* I8-3: SWA only after 3 frames in a row agree */
+  ibus_swa_filter_reset(&_swa_f);
   S06Load_CalibrateOverhead();
   uint8_t  _cal_on = 1;
   _dbg_last = _t10_last = HAL_GetTick();
@@ -280,8 +521,10 @@ int main(void)
 
   while (1)
   {
+    uint32_t _pass_t0 = DWT->CYCCNT;   /* L51: pass time, "Loop:" line */
     uint8_t _busy = 0;
-    PWMCapture_Service();      /* read new PWM captures every pass (04/11, DMA) */
+    uint8_t _prn = 0;                  /* this pass did debug work */
+    PWMCapture_Service();     /* read new PWM captures every pass (04/11, DMA) */
     if (_cal_on && (DWT->CYCCNT - _cal_t0) >= SystemCoreClock / 10u) {
         S06Load_SetIdleCal(S06Load_IdleCount() - _cal_idle0, DWT->CYCCNT - _cal_t0);
         _cal_on = 0;
@@ -293,6 +536,12 @@ int main(void)
     }
     if (SPI1_IsFrameReady()) {
         _busy = 1;
+        /* I8-4, I8-R2-1: a link timeout seen by the TIM6 tick starts the SWA
+         * filter again, also when this loop never saw the link as lost (the
+         * tick may time out first). Only a real timeout does: a shorter gap
+         * keeps the filter, so it cannot make an SWA-off pulse. */
+        if (IbusPort_TakeTimeout())
+            ibus_swa_filter_reset(&_swa_f);
         _last_frame_ms = HAL_GetTick();
         if (!_link_up) {
             SPI1_Stats_t s0;
@@ -307,6 +556,9 @@ int main(void)
         SPI1_GetFrameEx(&g_state, &g_traj, &fi);   /* one frame; clears frame_ready */
         for (int i = 0; i < ENC_NUM_WHEELS; i++)
             EncoderGen_SetOmega(i, g_state.omega[i]);
+        /* I8: the RPi5 holds the RC switch SWA; used from the next iBUS frame,
+         * after IBUS_SWA_FILTER_N applied frames in a row agree (I8-3) */
+        IbusPort_SetSwa(ibus_swa_filter_step(&_swa_f, (g_state.fault_flags & HIL_CMD_SWA_ON) != 0u));
         /* S06: state age at the moment the omegas were applied, and the
          * checksum of the raw bytes of this very copy (W3, Y9) */
         uint32_t age_us = (DWT->CYCCNT - fi.rx_cyc) / cyc_per_us;
@@ -334,6 +586,8 @@ int main(void)
             g_output.torque[i] = duty[i];
 
         g_output.seq = g_state.seq;
+        /* I8: what the H7 really sends, for the RPi5 frame log */
+        g_output.status = IbusPort_LastSwa() ? (uint8_t)HIL_STATUS_SWA : 0u;
         SPI1_SetOutputEx(&g_output, &mi);
 
         HAL_GPIO_TogglePin(GPIOE, GPIO_PIN_1);
@@ -342,10 +596,13 @@ int main(void)
         _link_up = 0;
         _n_link_lost++;
         IbusPort_SetEnabled(0);  /* DUT loses RC -> motors off (S06 T12 (d)) */
+        IbusPort_SetSwa(0);      /* I8: after reconnect SWA stays off until the RPi5 sets it */
+        ibus_swa_filter_reset(&_swa_f);
         for (int i = 0; i < ENC_NUM_WHEELS; i++)
             EncoderGen_SetOmega(i, 0.0f);
         SPI1_DropNewTraj();      /* no old setpoint relayed after reconnect */
         SPI1_RequestRestart();   /* covers a DMA stuck without an error */
+        _down_restart_ms = HAL_GetTick();
         SPI1_Stats_t s1;
         SPI1_GetStats(&s1);
         printf("SPI link lost (no frame for %lu ms): encoders stopped, iBUS stopped, SPI1 restart\r\n",
@@ -356,163 +613,93 @@ int main(void)
                (unsigned long)(s1.frames - _up_first_frames + 1u),
                (unsigned long)(s1.last_frame_ms - _up_first_ms),
                (unsigned long)(s1.frames - _up_first_frames));
+    } else if (!_link_up && _n_link_lost > 0u
+               && (HAL_GetTick() - _down_restart_ms) >= SPI_DOWN_RESTART_MS) {
+        _busy = 1;
+        _down_restart_ms = HAL_GetTick();
+        _n_down_restarts++;
+        SPI1_RequestRestart();
     }
     SPI1_Service();
 
-    if ((HAL_GetTick() - _dbg_last) >= 500) {
+    /* Debug block (08/11, L51): copy every counter once when due and the
+     * printer is idle, then print one line per pass (_dbg_print_next) */
+    if (_ds_step < 0 && !_t10_pend && (HAL_GetTick() - _dbg_last) >= 500) {
         _busy = 1;
+        _prn = 1;
         _dbg_last = HAL_GetTick();
-
-        EncoderGenDebug_t dbg[ENC_NUM_WHEELS];
-        EncoderGen_GetDebug(dbg);
-        for (int i = 0; i < ENC_NUM_WHEELS; i++) {
-            printf("W%d: omega=%6.2f dir=%2d hp=%5lu meas=%7.2fHz exp=%7.2fHz\r\n",
-                   i + 1,
-                   (double)dbg[i].omega_cmd, (int)dbg[i].dir,
-                   (unsigned long)dbg[i].half_period,
-                   (double)dbg[i].measured_freq,
-                   (double)dbg[i].expected_freq);
-        }
-
-        float duty[4];
-        PWMCapture_GetDuty(duty);
-        printf("PWM: %.2f %.2f %.2f %.2f\r\n",
-               (double)duty[0], (double)duty[1],
-               (double)duty[2], (double)duty[3]);
-
-        /* DMA capture counters (04/11), channel order RPWM FL FR RL RR,
-         * LPWM FL FR RL RR: e/s = captures per second (about 40000 on a
-         * channel with 20 kHz PWM, 0 when held), lost = overcapture flags,
-         * lap = service gaps >= 5 ms (ring dropped, FL channel), fix = edge
-         * type corrected by the pin anchor, bad = periods > 75 us skipped,
-         * una = runs of edges with the edge type unknown >= 20 ms (duty held),
-         * known = edge type known, act = DMA stream running, dmaerr = stream
-         * did not start or found stopped, win / svc = largest anchor window
-         * and largest PWMCapture_Service() time in us over the last 2 s
-         * (Codex M23, Liam: measure on the board; window above about 7 us:
-         * revisit the window step).
-         * Printed every 2 s, not every 0.5 s: the line is about 200 bytes and
-         * printf blocks the main loop about 17 ms at 115200 baud (Codex M21). */
-        static uint32_t _edges_last[PWM_NUM_CHANNELS];
-        static uint32_t _pwm_dbg_ms = 0;
+        _dbg_snap_t *d = &_ds;
+        EncoderGen_GetDebug(d->enc);
+        PWMCapture_GetDuty(d->duty);
         uint32_t pwm_el = HAL_GetTick() - _pwm_dbg_ms;
-        if (pwm_el >= 2000u) {
+        d->pwm_line = (pwm_el >= 2000u);
+        d->fw_line = (uint8_t)((HAL_GetTick() - _fw_dbg_ms) >= 10000u);
+        if (d->fw_line) _fw_dbg_ms = HAL_GetTick();
+        if (d->pwm_line) {
             _pwm_dbg_ms += pwm_el;
-            PWMCapture_Stats_t ps;
-            PWMCapture_GetStats(&ps);
-            char pl[320];
-            int n = snprintf(pl, sizeof(pl), "PWMdma: e/s=");
-            for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++) {
-                n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%lu", i ? "," : "",
-                              (unsigned long)((uint64_t)(ps.edges[i] - _edges_last[i]) * 1000u / pwm_el));
-                _edges_last[i] = ps.edges[i];
+            PWMCapture_GetStats(&d->ps);
+            for (int i = 0; i < (int)PWM_NUM_CHANNELS; i++) {
+                d->pwm_es[i] = (uint32_t)((uint64_t)(d->ps.edges[i] - _edges_last[i]) * 1000u / pwm_el);
+                _edges_last[i] = d->ps.edges[i];
             }
-            for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
-                n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%lu", i ? "," : " lost=", (unsigned long)ps.lost[i]);
-            if (n < (int)sizeof(pl))
-                n += snprintf(pl + n, sizeof(pl) - (size_t)n, " lap=%lu", (unsigned long)ps.lap[0]);
-            for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
-                n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%lu", i ? "," : " fix=", (unsigned long)ps.parity_fix[i]);
-            for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
-                n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%lu", i ? "," : " bad=", (unsigned long)ps.bad_period[i]);
-            for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
-                n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%lu", i ? "," : " una=", (unsigned long)ps.unanchored[i]);
-            for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
-                n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%u", i ? "" : " known=", (unsigned)ps.known[i]);
-            for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
-                n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%u", i ? "" : " act=", (unsigned)ps.active[i]);
-            for (int i = 0; i < (int)PWM_NUM_CHANNELS && n < (int)sizeof(pl); i++)
-                n += snprintf(pl + n, sizeof(pl) - (size_t)n, "%s%lu", i ? "," : " dmaerr=", (unsigned long)ps.dma_err[i]);
-            uint32_t win_t, svc_t;
-            PWMCapture_TakeTiming(&win_t, &svc_t);
-            if (n < (int)sizeof(pl))
-                n += snprintf(pl + n, sizeof(pl) - (size_t)n, " win=%lu.%lu svc=%lu.%lu",
-                              (unsigned long)(win_t / 10u), (unsigned long)(win_t % 10u),
-                              (unsigned long)(svc_t / 10u), (unsigned long)(svc_t % 10u));
-            /* DIAG 05/11: windows by length (<7 / 7-20 / 20-50 / >=50 us) and shortest window */
-            uint32_t wh[4], wmin_t;
-            PWMCapture_TakeWinHist(wh, &wmin_t);
-            if (n < (int)sizeof(pl))
-                n += snprintf(pl + n, sizeof(pl) - (size_t)n, " wh=%lu/%lu/%lu/%lu wmin=%lu.%lu",
-                              (unsigned long)wh[0], (unsigned long)wh[1], (unsigned long)wh[2], (unsigned long)wh[3],
-                              (unsigned long)(wmin_t / 10u), (unsigned long)(wmin_t % 10u));
-            printf("%s\r\n", pl);
+            PWMCapture_TakeTiming(&d->win_t, &d->svc_t);
+            PWMCapture_TakeWinHist(d->wh, &d->wmin_t);
         }
-        uint32_t relay_sent, relay_dropped;
-        UartRelay_GetStats(&relay_sent, &relay_dropped);
-        printf("Relay: sent=%lu dropped=%lu  traj vx=%.2f vy=%.2f wz=%.2f\r\n",
-               (unsigned long)relay_sent, (unsigned long)relay_dropped,
-               (double)g_traj.vx_ref, (double)g_traj.vy_ref, (double)g_traj.wz_ref);
-        static uint32_t _frames_last = 0;
-        SPI1_Stats_t ss;
-        SPI1_GetStats(&ss);
-        printf("Link: %s lost=%lu  SPI frames=%lu/s err=%lu rearm=%lu last_err=0x%lx\r\n",
-               _link_up ? "up" : "down", (unsigned long)_n_link_lost,
-               (unsigned long)((ss.frames - _frames_last) * 2u),
-               (unsigned long)ss.errors, (unsigned long)ss.rearms,
-               (unsigned long)ss.last_error);
-        /* Frames the main loop did not read, and the NEW setpoint path:
-         * seen = taken + replaced + dropped (+1 if one is pending) */
-        printf("Frame: unread=%lu  new seen=%lu taken=%lu repl=%lu drop=%lu"
-               "  applied=%lu skipped=%lu age_max=%luus\r\n",
-               (unsigned long)ss.unread, (unsigned long)ss.new_seen,
-               (unsigned long)ss.new_taken, (unsigned long)ss.new_replaced,
-               (unsigned long)ss.new_dropped,
-               (unsigned long)_n_applied, (unsigned long)_n_skipped,
-               (unsigned long)_age_max_us);
-        printf("S06log: pushed=%lu dropped=%lu  print_drop=%lu\r\n",
-               (unsigned long)S06Log_Pushed(), (unsigned long)S06Log_Dropped(),
-               (unsigned long)_dbg_drop);
-        _frames_last = ss.frames;
-        /* BNO085 emulator (G2): host init (adv, prod id, set features),
-         * transactions and reports per sensor (accel / gyro / game RV) */
-        BnoPort_Stats_t bs;
-        BnoPort_GetStats(&bs);
-        printf("BNO: st=%u rst=%lu adv=%lu pid=%lu sf=%lu gf=%lu rd=%lu empty=%lu wr=%lu col=%lu tmo=%lu\r\n",
-               (unsigned)bs.state, (unsigned long)bs.core.resets,
-               (unsigned long)bs.core.adverts, (unsigned long)bs.core.prod_id_reqs,
-               (unsigned long)bs.core.set_features, (unsigned long)bs.core.get_features,
-               (unsigned long)bs.core.reads, (unsigned long)bs.core.empty_reads,
-               (unsigned long)bs.core.writes, (unsigned long)bs.core.collisions,
-               (unsigned long)bs.core.int_timeouts);
-        printf("BNO: rpt=%lu/%lu/%lu per=%lu/%lu/%lu us ovr=%lu stale=%lu drop=%lu unk=%lu"
-               " | xfer=%lu mism=%lu miss=%lu armf=%lu err=%lu max=%lu smp=%lu\r\n",
-               (unsigned long)bs.reports[0], (unsigned long)bs.reports[1],
-               (unsigned long)bs.reports[2],
-               (unsigned long)bs.period_us[0], (unsigned long)bs.period_us[1],
-               (unsigned long)bs.period_us[2],
-               (unsigned long)bs.core.input_overruns, (unsigned long)bs.core.stale_skips,
-               (unsigned long)bs.core.q_drops, (unsigned long)bs.core.unknown_cmds,
-               (unsigned long)bs.xfers, (unsigned long)bs.arm_mismatch,
-               (unsigned long)bs.missed_edge, (unsigned long)bs.arm_fail,
-               (unsigned long)bs.spi_errors, (unsigned long)bs.max_clocked,
-               (unsigned long)bs.samples);
-        /* iBUS 10 s summary (S06 T12 (b)): P = frame start to frame start
-         * in us (DWT, real time), printed in ms with 0.01 ms; tgap = longest
-         * time between two TIM6 ticks; once per closed window */
-        static uint32_t _ibus_win_last = 0;
-        ibus_gen_window_t iw;
-        if (IbusPort_ReadWindow(&iw) && iw.window != _ibus_win_last) {
-            _ibus_win_last = iw.window;
-            printf("IBUS: win=%lu on=%lu frames=%lu P=%lu.%02lu..%lu.%02lu ms n=%lu late=%lu tgap=%lu us en=%lu total=%lu\r\n",
-                   (unsigned long)iw.window, (unsigned long)iw.enabled,
-                   (unsigned long)iw.frames,
-                   (unsigned long)(iw.p_min_us / 1000u), (unsigned long)((iw.p_min_us % 1000u) / 10u),
-                   (unsigned long)(iw.p_max_us / 1000u), (unsigned long)((iw.p_max_us % 1000u) / 10u),
-                   (unsigned long)iw.p_count, (unsigned long)iw.late_ticks,
-                   (unsigned long)iw.tick_gap_max_us,
-                   (unsigned long)iw.enables, (unsigned long)iw.total_frames);
-        }
-        printf("---\r\n");
+        UartRelay_GetStats(&d->relay_sent, &d->relay_dropped);
+        d->traj = g_traj;
+        SPI1_GetStats(&d->ss);
+        d->frames_per_s = (d->ss.frames - _frames_last) * 2u;
+        _frames_last = d->ss.frames;
+        d->link_up = _link_up;
+        d->n_link_lost = _n_link_lost;
+        SPI1_TakeServiceCycles(&d->svc_min, &d->svc_max);
+        d->n_down_restarts = _n_down_restarts;
+        d->cyc_per_us = cyc_per_us;
+        d->n_applied = _n_applied;
+        d->n_skipped = _n_skipped;
+        d->age_max_us = _age_max_us;
+        d->s06_pushed = S06Log_Pushed();
+        d->s06_dropped = S06Log_Dropped();
+        d->dbg_drop = _dbg_drop;
+        BnoPort_GetStats(&d->bs);
+        d->ibus_new = (uint8_t)(IbusPort_ReadWindow(&d->iw) && d->iw.window != _ibus_win_last);
+        if (d->ibus_new) _ibus_win_last = d->iw.window;
+        d->lp_max = _lp_max;   d->lp_prn_max = _lp_prn_max;
+        d->lp_n500 = _lp_n500; d->lp_n1ms = _lp_n1ms; d->lp_n = _lp_n;
+        _lp_max = _lp_prn_max = _lp_n500 = _lp_n1ms = _lp_n = 0u;
+        _ds_step = DS_W1;
 
         HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_0);
     }
     if ((HAL_GetTick() - _t10_last) >= 10000u) {   /* S06 T10, every 10 s */
         _busy = 1;
+        _prn = 1;
         _t10_last = HAL_GetTick();
-        S06Load_Report();
+        S06Load_Snapshot();      /* window taken on time, lines printed below */
+        _t10_pend = 1;
+    }
+    /* At most one debug line per pass, and none while an SPI1 frame waits
+     * (next pass handles the frame first). T10 lines once the block is out. */
+    if (!_prn && !SPI1_IsFrameReady()) {
+        if (_ds_step >= 0) {
+            _busy = 1;
+            _prn = 1;
+            _dbg_print_next();
+        } else if (_t10_pend) {
+            _busy = 1;
+            _prn = 1;
+            if (!S06Load_PrintNext()) _t10_pend = 0;
+        }
     }
     if (!_busy) S06Load_CountIdle();   /* W10: idle pass (an SPI1 rearm counts as idle) */
+    {                                  /* L51: pass time (interrupts included) */
+        uint32_t dt = DWT->CYCCNT - _pass_t0;
+        _lp_n++;
+        if (dt > _lp_max) _lp_max = dt;
+        if (_prn && dt > _lp_prn_max) _lp_prn_max = dt;
+        if (dt > 500u * cyc_per_us) _lp_n500++;
+        if (dt > 1000u * cyc_per_us) _lp_n1ms++;
+    }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -547,11 +734,11 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
   RCC_OscInitStruct.PLL.PLLM = 1;
-  RCC_OscInitStruct.PLL.PLLN = 120;
+  RCC_OscInitStruct.PLL.PLLN = 192;
   RCC_OscInitStruct.PLL.PLLP = 2;
   RCC_OscInitStruct.PLL.PLLQ = 5;
   RCC_OscInitStruct.PLL.PLLR = 2;
-  RCC_OscInitStruct.PLL.PLLRGE = RCC_PLL1VCIRANGE_3;
+  RCC_OscInitStruct.PLL.PLLRGE = RCC_PLL1VCIRANGE_2;
   RCC_OscInitStruct.PLL.PLLVCOSEL = RCC_PLL1VCOWIDE;
   RCC_OscInitStruct.PLL.PLLFRACN = 0;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)

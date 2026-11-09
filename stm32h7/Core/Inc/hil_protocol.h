@@ -11,6 +11,9 @@
  *       bytes 8-15 (pwm, never set by the H7) and 18-39 carry checksums,
  *       the H7 cycle stamp of the answered frame and one S06 log record
  *       per frame. MOSI unchanged except fault bit 2 (IMU loss injection).
+ *   I8 (09/11/2026, Liam "Duyet ca 5"): MOSI byte 20 bit 3 = SWA command
+ *       for the iBUS frames (HIL_CMD_SWA_ON); MISO byte 16 bit 0 = SWA of
+ *       the last iBUS frame started (HIL_STATUS_SWA). Lengths unchanged.
  */
 
 #ifndef HIL_PROTOCOL_H
@@ -97,9 +100,16 @@
 #define HIL_MISO_LOG_LEN    18          /* type + idx + 15-byte payload */
 
 /* ── Fault flags (MOSI byte 20) ─────────────────────────────────────── */
+/* Bits 0-2 are fault bits; bit 3 is a command bit (I8), not a fault.  */
 #define HIL_FAULT_PLANT     (1u << 0)
 #define HIL_FAULT_OVERRUN   (1u << 1)
 #define HIL_FAULT_IMU_LOSS  (1u << 2)   /* S06 T8: emulator builds no report [ĐỀ XUẤT] */
+#define HIL_CMD_SWA_ON      (1u << 3)   /* I8 (Liam 09/11): 1 = iBUS SWA 2000 (motors on),
+                                           0 = SWA 1000; a frame of zeros never turns
+                                           the motors on */
+
+/* ── Status (MISO byte 16) ──────────────────────────────────────────── */
+#define HIL_STATUS_SWA      (1u << 0)   /* I8: SWA of the last iBUS frame started */
 
 /* ── Traj flags (MOSI byte 30) ──────────────────────────────────────── */
 #define HIL_TRAJ_VALID      (1u << 0)   /* setpoint is valid            */

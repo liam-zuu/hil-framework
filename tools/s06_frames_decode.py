@@ -144,7 +144,10 @@ def decode_frames(t_send_ns, mosi, miso, max_lag=4):
     n = len(t_send_ns)
     t = np.asarray(t_send_ns, dtype=np.float64) / 1000.0
     rows, lag_hist = [], Counter()
-    st = dict(frames=n, empty=0, miso_crc_bad=0, mosi_crc_bad=0, unanswered=0)
+    # 08/11: `start_leftover` = frames j < ANSWER_LAG that answer no frame of this log: the H7 still sends
+    # the reply staged in the previous link period there (CLOSED_LOOP/2026-11-08_run11), not a problem;
+    # `unanswered` counts only from j = ANSWER_LAG on
+    st = dict(frames=n, empty=0, miso_crc_bad=0, mosi_crc_bad=0, unanswered=0, start_leftover=0)
     for j in range(n):
         b = bytes(miso[j])
         r = dict(j=j, t_us=t[j])
@@ -169,7 +172,9 @@ def decode_frames(t_send_ns, mosi, miso, max_lag=4):
                 ans = i
                 break
         r['answered'] = ans
-        if ans is None:
+        if ans is None and j < ANSWER_LAG:
+            st['start_leftover'] += 1
+        elif ans is None:
             st['unanswered'] += 1
         else:
             lag_hist[j - ans] += 1
@@ -246,15 +251,17 @@ def log_records(rows):
     return recs, dict(records=len(recs), repeated_frames=dups, gaps=gaps)
 
 
-def run_stream(recs, j_lo, j_hi) -> dict:
+def run_stream(recs, j_lo, j_hi, idx_from=None) -> dict:
     """C3-6 (X16): hở luồng log và số H7 bỏ trong lượt, không tính phần đệm: bản ghi mang bởi frame j_lo..j_hi,
-    cộng một bản ghi liền trước và liền sau (hở ngay mép lượt không kết luận được là ngoài lượt)."""
-    rr = sorted(recs, key=lambda r: r['idx'])
+    cộng một bản ghi liền trước và liền sau (hở ngay mép lượt không kết luận được là ngoài lượt).
+    09/11: bản ghi H7 dựng trước log (chỉ số < `idx_from`, TICK có `before_log`) không tính, kể cả khi frame
+    trong lượt mang chúng (decode, đoạn h7_dropped)."""
+    rr = sorted((r for r in recs if idx_from is None or r['idx'] >= idx_from), key=lambda r: r['idx'])
     ins = [i for i, r in enumerate(rr) if j_lo <= r['carrier_j'] <= j_hi]
     if not ins:
         return dict(gaps=0, ticks=0, h7_dropped=None)
     idx = [r['idx'] for r in rr[max(ins[0] - 1, 0):ins[-1] + 2]]
-    ticks = [rr[i] for i in ins if rr[i]['type'] == REC_TICK and 'cyc_full' in rr[i]]
+    ticks = [rr[i] for i in ins if rr[i]['type'] == REC_TICK and 'cyc_full' in rr[i] and not rr[i].get('before_log')]
     dropped = (ticks[-1]['f']['dropped'] - ticks[0]['f']['dropped']) & 0xFFFF if len(ticks) >= 2 else None
     return dict(gaps=idx[-1] - idx[0] + 1 - len(idx), ticks=len(ticks), h7_dropped=dropped)
 
@@ -320,11 +327,16 @@ def seq_chain(items, seq_of, t_of, mod=256, cut=SEQ_CUT_PERIODS):
 
 def h7_reports(recs, fmap, mosi, carrier_nf):
     """REPORT records with source frame checks; seq unwrapped per (epoch, kind) in log order with
-    the rules of `seq_chain` on the H7 build time (CYCCNT unwrapped)."""
+    the rules of `seq_chain` on the H7 build time (CYCCNT unwrapped).
+    08/11 (HANDOFF_CODE việc 2): a record carried by a frame with no frame-count reference, i.e.
+    before the first answered frame of the log (j = 0, 1: the H7 still sends the reply staged in
+    the previous link period, CLOSED_LOOP/2026-11-08_run09 w1, run11 w1), belongs to the earlier
+    period: left out here (no KeyError) and counted by the caller, like the time fields above."""
     out = []
+    first_nf = min(fmap) if fmap else None
     by_key = defaultdict(list)
     for rec in recs:
-        if 'rpt_seq' in rec['f']:
+        if 'rpt_seq' in rec['f'] and rec['carrier_j'] in carrier_nf:
             by_key[(rec['f']['epoch'], rec['f']['kind'])].append(rec)
     nchain = {}
     for key, lst in by_key.items():
@@ -333,14 +345,19 @@ def h7_reports(recs, fmap, mosi, carrier_nf):
             nchain[id(rec)] = v
     for rec in recs:
         f = rec['f']
-        if 'rpt_seq' not in f:
+        if 'rpt_seq' not in f or rec['carrier_j'] not in carrier_nf:
             continue
         ref = carrier_nf[rec['carrier_j']]
         src = nf_full(f['src_nf16'], ref)
         fr = fmap.get(src)
         n, chain, flag = nchain[id(rec)]
         latest = nf_full(f['nf16'], ref)
+        # 08/11: source frame older than the first H7 frame of this log = a report the H7 built from the
+        # last frame of the previous link period while the Pi was stopped (CLOSED_LOOP/2026-11-08_run11
+        # w2: src = last frame of w1, carried in j = 2..19); counted apart from "no source frame"
+        before_log = fr is None and first_nf is not None and src < first_nf
         row = dict(log_idx=rec['idx'], kind=f['kind'], epoch=f['epoch'], rpt_seq=f['rpt_seq'], n=n,
+                   src_before_log=before_log,
                    chain=chain, seq_flag=flag,
                    queued=f['queued'], qfull=f['qfull'], imu_seq=f['imu_seq'], src_nf=src, nf_latest=latest,
                    imu_age_frames=latest - src, imu_crc_h7=f['imu_crc'], cyccnt=f['cyc'],
@@ -351,22 +368,44 @@ def h7_reports(recs, fmap, mosi, carrier_nf):
             row['imu_crc_ok'] = f['imu_crc'] == row['imu_crc_pi']
             row['imu_seq_ok'] = f['imu_seq'] == m[MOSI_IMU_SEQ]
         out.append(row)
+    # 09/11 (CLOSED_LOOP/2026-11-09_run07 b4_kill9, Liam "giải quyết luôn"): the H7 keeps building
+    # reports for a while after the link stops; they wait in the ring and leave first in the next log
+    # (src_before_log). The first report of the log made from this log's frames then follows them after
+    # the whole pause, >= 128 periods: `seq_chain` marks it 'cut'. That cut is the log start, not a
+    # sequence fault: cleared, kept as seq_note 'log_start'. A cut between two reports of this log stays.
+    prev = {}
+    for row in out:
+        key = (row['epoch'], row['kind'])
+        p = prev.get(key)
+        if row['seq_flag'] == 'cut' and p is not None and p['src_before_log'] and not row['src_before_log']:
+            row['seq_flag'], row['seq_note'] = '', 'log_start'
+        prev[key] = row
     return out
 
 
-def enc_calls(recs):
+def enc_calls(recs, from_boot=True):
     """EncoderGen _start_wheel/_stop records -> {wheel: [('S'|'P', t_pi_us, CNT, n)]} for
-    tools/t3b_score.py, and the number of calls missing from the per-wheel running count n."""
-    calls, last, gaps = {w: [] for w in range(4)}, {}, 0
+    tools/t3b_score.py, and the number of calls missing from the per-wheel running count n.
+    n counts calls since the H7 boot. 08/11: when the log does not start at the H7 boot
+    (`from_boot` False: second and later runs without an H7 reset, CLOSED_LOOP/2026-11-08_run11
+    w2, w3) the n - 1 calls before the first record of a kind are calls of earlier runs, not
+    missing records: returned apart (third value), not in the gap count. A lost first record of
+    a kind is then not seen (like a loss after the last call)."""
+    calls, last, gaps, before = {w: [] for w in range(4)}, {}, 0, 0
     for rec in recs:
         if rec['type'] not in (REC_ENC_START, REC_ENC_STOP):
             continue
         f, k = rec['f'], 'S' if rec['type'] == REC_ENC_START else 'P'
         calls.setdefault(f['wheel'], []).append((k, rec.get('t_pi_us'), f['cnt'], f['n']))
         prev = last.get((f['wheel'], k))
-        gaps += (f['n'] - prev - 1) if prev is not None else f['n'] - 1
+        if prev is not None:
+            gaps += f['n'] - prev - 1
+        elif from_boot:
+            gaps += f['n'] - 1
+        else:
+            before += f['n'] - 1
         last[(f['wheel'], k)] = f['n']
-    return calls, gaps
+    return calls, gaps, before
 
 
 def esp32_lines(path):
@@ -643,27 +682,68 @@ def decode(t_send_ns, mosi, miso, esp32_events: Optional[str] = None, cal: Optio
             rec['cyc_full'] = behind(f['cyc'], ref)
         rec['t_pi_us'] = cyc_to_pi(segs, rec['cyc_full']) + d1w if segs else None
     ticks = [rec for rec in recs if rec['type'] == REC_TICK and 'cyc_full' in rec]
-    tick_bad = sum(1 for a, b in zip(ticks, ticks[1:])
+    # 08/11: TICKs made while the link was down before this log (CLOSED_LOOP/2026-11-08_run11 w1, 21 s
+    # after the --imu-static run) wait in the H7 ring and leave in the first frames; made more than one
+    # CYCCNT wrap before their carrier, `behind` places them one wrap late (docstring above). Their
+    # 64-bit _cyc_total, counted back from the last TICK, says they were made before the first H7 frame
+    # of the log: counted as `ticks_before_log`, left out of the pair check.
+    if ticks and fmap:
+        last_t, first_cyc = ticks[-1], min(v['cyc'] for v in fmap.values())
+        in_log = [t for t in ticks
+                  if last_t['cyc_full'] - (last_t['f']['cyc_total'] - t['f']['cyc_total']) >= first_cyc]
+    else:
+        in_log = ticks
+    lst['ticks_before_log'] = len(ticks) - len(in_log)
+    in_ids = {id(t) for t in in_log}
+    for t in ticks:
+        t['before_log'] = id(t) not in in_ids
+    tick_bad = sum(1 for a, b in zip(in_log, in_log[1:])
                    if (b['f']['cyc_total'] - a['f']['cyc_total']) != (b['cyc_full'] - a['cyc_full']))
     # S36: TICK carries the H7 drop counter since S06Log_Init, cut to 16 bits: the run figure is the
     # difference between the first and the last TICK of the frames (mod 65 536; drops before the first
     # TICK still show as gaps of the record index). Fewer than 2 TICK: not known.
-    if len(ticks) >= 2:
-        lst['h7_dropped'] = (ticks[-1]['f']['dropped'] - ticks[0]['f']['dropped']) & 0xFFFF
+    # 09/11 (CLOSED_LOOP/2026-11-09_run08 b1_stop, after about 32 min without link; Liam "giải quyết
+    # luôn"): the H7 also builds records while the link is down; once its ring is full each new record is
+    # dropped, and a dropped record still takes an index. The ring then leaves first in the next log, so
+    # the first TICK of the frames is an old one (counter 0) and the file-wide figures held 13118 drops and
+    # 13118 index gaps that all happened before the log. With TICKs made before the log
+    # (`ticks_before_log`), drops and gaps are counted from the first TICK made in the log; what lies before
+    # it goes to `h7_dropped_before_log`, `gaps_before_first_log_tick` (a condition, not a problem: drops
+    # in the first TICK period after link up cannot be told apart from drops in the pause).
+    lst['gaps_file'] = lst['gaps']
+    lst['h7_dropped_before_log'] = None
+    lst['gaps_before_first_log_tick'] = 0
+    if lst['ticks_before_log'] and in_log:
+        lst['h7_dropped_before_log'] = (in_log[0]['f']['dropped'] - ticks[0]['f']['dropped']) & 0xFFFF
+        lst['log_idx_from'] = b = in_log[0]['idx']
+        late = sorted({r['idx'] for r in recs if r['idx'] >= b})
+        lst['gaps'] = (late[-1] - late[0] + 1 - len(late)) if late else 0
+        lst['gaps_before_first_log_tick'] = lst['gaps_file'] - lst['gaps']
+        use = in_log
+    else:
+        use = ticks
+    if len(use) >= 2:
+        lst['h7_dropped'] = (use[-1]['f']['dropped'] - use[0]['f']['dropped']) & 0xFFFF
     else:
         lst['h7_dropped'] = None
     lst['h7_dropped_counter_last'] = ticks[-1]['f']['dropped'] if ticks else None
     lst['ticks'] = len(ticks)
     reps = h7_reports(recs, fmap, mosi, carrier_nf)
-    calls, call_gaps = enc_calls(recs)
+    # the H7 log index starts at 0 at S06Log_Init (boot): a log holding record 0 starts at the boot
+    # (16-bit index: a log starting at a multiple of 65 536 records would also pass, not expected)
+    from_boot = bool(recs) and min(rec['idx'] for rec in recs) == 0
+    calls, call_gaps, calls_before = enc_calls(recs, from_boot)
     res = dict(frames=st, log=lst, clock=dict(segments=segs, tick_total_mismatch=tick_bad, **calib),
-               reports=dict(n=len(reps), imu_crc_bad=sum(1 for r in reps if r.get('imu_crc_ok') is False),
+               reports=dict(n=len(reps), before_first_answer=sum(1 for rec in recs if 'rpt_seq' in rec['f']
+                                                                 and rec['carrier_j'] not in carrier_nf),
+                            imu_crc_bad=sum(1 for r in reps if r.get('imu_crc_ok') is False),
                             imu_seq_bad=sum(1 for r in reps if r.get('imu_seq_ok') is False),
-                            no_source_frame=sum(1 for r in reps if r['src_frame'] is None),
+                            no_source_frame=sum(1 for r in reps if r['src_frame'] is None and not r['src_before_log']),
+                            src_before_log=sum(1 for r in reps if r['src_before_log']),
                             seq_flags=dict(Counter(r['seq_flag'] for r in reps if r['seq_flag'])),
                             per_kind=dict(Counter(r['kind'] for r in reps))),
                enc_calls=dict(per_wheel={w: dict(Counter(c[0] for c in v)) for w, v in calls.items()},
-                              count_gaps=call_gaps))
+                              count_gaps=call_gaps, log_from_boot=from_boot, calls_before_log=calls_before))
     if esp32_events:
         J, I, R, text = esp32_lines(esp32_events)
         span = (float(t_send_us[0]), float(t_send_us[-1]))
@@ -679,18 +759,71 @@ def decode(t_send_ns, mosi, miso, esp32_events: Optional[str] = None, cal: Optio
         if win is not None:
             in_run = np.flatnonzero((t_send_us >= win[0]) & (t_send_us <= win[1]))
             if len(in_run):
-                res['log'] = dict(lst, gaps_file=lst['gaps'], h7_dropped_file=lst['h7_dropped'],
-                                  **run_stream(recs, int(in_run[0]), int(in_run[-1]) + ANSWER_LAG))
+                # gaps_file: the whole file, records made before the log included; h7_dropped_file: the
+                # whole file from the first TICK made in the log (09/11)
+                res['log'] = dict(lst, gaps_file=lst['gaps_file'], h7_dropped_file=lst['h7_dropped'],
+                                  **run_stream(recs, int(in_run[0]), int(in_run[-1]) + ANSWER_LAG,
+                                               lst.get('log_idx_from')))
     # C3-2: a frame of the run the H7 did not answer (answers come ANSWER_LAG frames later); the whole log
     # when the run marks are not known. Only the first ANSWER_LAG frames of the log have nothing to answer.
     lo, hi = (res.get('esp32_match') or {}).get('window_pi_us') or (t_send_us[0], t_send_us[-1])
     st['empty_in_run'] = sum(1 for r in rows if r['empty'] and r['j'] >= ANSWER_LAG
                              and lo <= t_send_us[r['j'] - ANSWER_LAG] <= hi)
+    res['swa'] = swa_summary(mosi, miso)          # I8: report only, not a problem (Liam 09/11)
     res['_records'] = recs
     res['_frames_rows'] = rows
     res['_calls'] = calls
     res['_reports'] = reps
     return res
+
+
+# I8: frames a command must stay unchanged before the H7 status has to show it: H7 filter 3 applied
+# frames + next iBUS frame start (period 7 ms) + one main-loop pass + answer lag 2 frames, about 13
+# (estimated from the code, not measured); 20 leaves room
+SWA_SETTLE_FRAMES = 20
+
+
+def swa_summary(mosi, miso, settle: int = SWA_SETTLE_FRAMES) -> dict:
+    """I8 (Liam 09/11, "Duyet ca 5"; Codex round 1 I8-6..8): SWA the Pi asked (MOSI byte 20 bit 3) and the
+    SWA of the last iBUS frame the H7 started (MISO byte 16 bit 0). Frames with an all-zero MISO or a bad
+    MISO CRC are not read for the status.
+      held_mismatch: frames where the command has been the same for more than `settle` frames and the
+        status differs (catches a fixed command never followed, a status blip, a wrong start state);
+      per command change (until the next change): follow lag = first status equal to the new command from
+        the answer lag (2 frames) on; none seen: `unobserved` when the command held for at most `settle`
+        frames (end of log, or changed again), else `unfollowed`."""
+    mosi = np.asarray(mosi, dtype=np.uint8).reshape(-1, 40)
+    miso = np.asarray(miso, dtype=np.uint8).reshape(-1, 40)
+    n = len(mosi)
+    cmd = ((mosi[:, 20] >> 3) & 1).astype(np.int16)
+    ok = np.array([bool(m.any()) and crc16(bytes(m[:MISO_CRC]) + bytes(m[MISO_CRC + 2:])) == u16(m, MISO_CRC)
+                   for m in miso], dtype=bool)
+    st = (miso[:, MISO_STATUS] & 1).astype(np.int16)
+    held = np.zeros(n, dtype=np.int64)                 # frames the command has had its value, up to j
+    for j in range(n):
+        held[j] = held[j - 1] + 1 if j and cmd[j] == cmd[j - 1] else 1
+    check = ok & (held > settle)
+    mism = np.flatnonzero(check & (st != cmd))
+    cmd_ch = [int(j) for j in np.flatnonzero(np.diff(cmd) != 0) + 1]
+    good = np.flatnonzero(ok)
+    st_ch = [int(good[i]) for i in np.flatnonzero(np.diff(st[good]) != 0) + 1]
+    lags, unfollowed, unobserved = [], 0, 0
+    for i, j in enumerate(cmd_ch):
+        end = cmd_ch[i + 1] if i + 1 < len(cmd_ch) else n
+        sel = good[(good >= j + ANSWER_LAG) & (good < end)]
+        k = sel[st[sel] == cmd[j]]
+        if len(k):
+            lags.append(int(k[0] - j))
+        elif end - j <= settle:
+            unobserved += 1
+        else:
+            unfollowed += 1
+    return dict(cmd_on_frames=int(cmd.sum()), cmd_first=int(cmd[0]) if n else None,
+                cmd_changes=cmd_ch, status_changes=st_ch, status_on_frames=int(st[good].sum()),
+                settle_frames=settle, held_checked=int(check.sum()), held_mismatch=len(mism),
+                mismatch_first=[int(x) for x in mism[:10]],
+                follow_lag_frames=lags, follow_lag_max=max(lags) if lags else None,
+                unfollowed=unfollowed, unobserved=unobserved)
 
 
 def problems(res) -> List[str]:
@@ -736,6 +869,10 @@ def conditions(res) -> List[str]:
     lg = res['log']
     if lg.get('h7_dropped') is None:
         c.append(f"chỉ có {lg.get('ticks', 0)} bản ghi TICK: không biết H7 có bỏ bản ghi trong lượt không")
+    if lg.get('gaps_before_first_log_tick'):
+        c.append(f"luồng log hở {lg['gaps_before_first_log_tick']} bản ghi trước TICK đầu dựng trong log "
+                 f"(H7 bỏ {lg.get('h7_dropped_before_log')} lúc không có link, ring đầy): nếu có bản ghi mất "
+                 f"ngay sau lúc link lên thì không tách được")
     m = res.get('esp32_match')
     if m and m['window_pi_us'] is None:
         c.append('esp32_events thiếu #run_start/#run_end: chấm ghép report trên cả luồng, không theo khung lượt')

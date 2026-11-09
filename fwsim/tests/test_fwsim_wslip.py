@@ -48,14 +48,22 @@ def step(vx=0.0, vy=0.0, wz=0.0, t0=0.5):
 
 
 @pytest.mark.parametrize('ctrl', ['PID', 'ADRC'])
-def test_no_flag_on_figure8_with_even_grip(fw, ctrl):
-    """O1 figure 8 at 0.8 m/s, mu 0.5 on all wheels: the residual stays within the count
-    quantization (|res| <= 4) and the flag never turns on."""
+@pytest.mark.parametrize('mu', [0.413, 0.436, 0.473, 0.5])
+def test_no_flag_on_figure8_with_even_grip(fw, ctrl, mu):
+    """O1 figure 8 at 0.8 m/s, the same mu on all wheels (the three measured levels of the task
+    floor, MU_FLOOR 2026-11-09_run02 min / mean / max, and the old assumption 0.5), plant defaults
+    (weighed M 4.12 kg): the residual stays at most 5 counts, below the threshold n_min 8, and the
+    flag never turns on.
+    09/11: the bound was |res| <= 4 (pure count quantization, wheel_slip.h) at M 4.0, mu 0.5, b0
+    5.9; with the weighed M and b0 5.85 / 10.3, ADRC reaches 5 on 1-2 samples (slight real slip
+    during the figure 8, probe 09/11), PID stays <= 4."""
+    p = plant(mu)
+    assert p.M == pytest.approx(4.12)
     sch = o1.Schedule(0.8)
-    log = fwsim.simulate(fw, sch.setpoint, sch.Tcmd + 2.0, plant(), seed=1, mode=ctrl, imu=IMU)
+    log = fwsim.simulate(fw, sch.setpoint, sch.Tcmd + 2.0, p, seed=1, mode=ctrl, imu=IMU)
     ev = ws(log, 'ws_eval') == 1
     assert ev.mean() > 0.5
-    assert np.abs(ws(log, 'ws_res')[ev]).max() <= 4
+    assert np.abs(ws(log, 'ws_res')[ev]).max() <= (4 if ctrl == 'PID' else 5)
     assert ws(log, 'ws_on_count')[-1] == 0
 
 

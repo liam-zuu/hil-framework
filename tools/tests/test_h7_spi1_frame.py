@@ -84,7 +84,11 @@ NEW_CHECKS = ['pair_same_frame', 'getframe_masked', 'getframe_clears_ready', 'un
               'crc_check_value', 'crc_table_equals_ref', 'miso_crc_valid', 'mosi_crc_of_answered_frame',
               'rx_cyc_of_answered_frame', 'rx_nf_of_answered_frame', 'age_field', 'miso_crc_catches_flip',
               'imu_raw_same_frame', 'log_each_record_once_in_order', 'log_payload_intact',
-              'log_full_drops_counted', 'log_drop_leaves_index_gap', 'log_restores_primask']
+              'log_full_drops_counted', 'log_drop_leaves_index_gap', 'log_restores_primask',
+              # 08/11 (bug HIL-SPI1-SCK-GLITCH): SPI1 left not armed by the HAL error path
+              'armed_no_restart', 'stuck_seen_waits_nss', 'stuck_counted_once',
+              'stuck_restarted_at_nss_high', 'frame_after_stuck_restart', 'ready_state_also_restarted',
+              'service_cycles_minmax', 'service_cycles_reset', 'stuck_restores_primask']
 
 
 @pytest.mark.parametrize('name', NEW_CHECKS)

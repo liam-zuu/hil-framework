@@ -32,6 +32,9 @@ void ibus_gen_init(ibus_gen_t *g, const ibus_gen_io_t *io, uint32_t period_us, u
     ch[IBUS_GEN_CH_SWC] = IBUS_GEN_VAL_SWC;
     ch[IBUS_GEN_CH_SWA] = IBUS_GEN_VAL_SWA;
     ibus_gen_build_frame(g->frame, ch);
+    ch[IBUS_GEN_CH_SWA] = IBUS_GEN_VAL_SWA_OFF;
+    ibus_gen_build_frame(g->frame_off, ch);
+    g->cur = g->frame_off;
     g->pos = IBUS_GEN_FRAME_LEN;
     g->win_start_us = now_us;
 }
@@ -41,6 +44,7 @@ static void _publish(ibus_gen_t *g)
     g->acc.window = ++g->win_no;
     g->acc.total_frames = g->total_frames;
     g->acc.enabled = g->on;
+    g->acc.swa = g->last_swa;
     g->pub_ver++;
     _BARRIER();
     g->pub = g->acc;
@@ -53,12 +57,12 @@ static void _push(ibus_gen_t *g)
 {
     uint32_t n = 0;
     while (g->pos < IBUS_GEN_FRAME_LEN && n < IBUS_GEN_MAX_PUSH && g->io.tx_room()) {
-        g->io.tx_put(g->frame[g->pos++]);
+        g->io.tx_put(g->cur[g->pos++]);
         n++;
     }
 }
 
-void ibus_gen_tick(ibus_gen_t *g, uint32_t now_us, int on)
+void ibus_gen_tick(ibus_gen_t *g, uint32_t now_us, int on, int swa)
 {
     if (g->have_tick) {
         uint32_t gap = now_us - g->last_tick_us;
@@ -92,6 +96,13 @@ void ibus_gen_tick(ibus_gen_t *g, uint32_t now_us, int on)
         g->last_start_us = now_us;
         g->have_start = 1u;
         g->p_valid = 1u;
+        /* I8: SWA is picked here, at the start of a frame, never inside one */
+        uint8_t s = swa ? 1u : 0u;
+        if (g->have_swa && s != g->last_swa) g->acc.swa_changes++;
+        g->have_swa = 1u;
+        g->last_swa = s;
+        g->cur = s ? g->frame : g->frame_off;
+        if (s) g->acc.swa_frames++;
         g->pos = 0u;
         g->acc.frames++;
         g->total_frames++;
@@ -102,6 +113,31 @@ void ibus_gen_tick(ibus_gen_t *g, uint32_t now_us, int on)
         g->win_start_us = now_us;
         _publish(g);
     }
+}
+
+void ibus_swa_filter_reset(ibus_swa_filter_t *f)
+{
+    f->out = 0u;
+    f->cand = 0u;
+    f->cnt = 0u;
+}
+
+int ibus_swa_filter_step(ibus_swa_filter_t *f, int bit)
+{
+    uint8_t b = bit ? 1u : 0u;
+    if (f->cnt > 0u && b == f->cand) {
+        if (f->cnt < 0xFFu) f->cnt++;
+    } else {
+        f->cand = b;
+        f->cnt = 1u;
+    }
+    if (f->cnt >= IBUS_SWA_FILTER_N) f->out = f->cand;
+    return f->out;
+}
+
+int ibus_gen_last_swa(const ibus_gen_t *g)
+{
+    return g->last_swa;          /* one byte: a single read, no tearing */
 }
 
 int ibus_gen_read_window(const ibus_gen_t *g, ibus_gen_window_t *out)

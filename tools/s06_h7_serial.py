@@ -25,7 +25,8 @@ T10 (spec S06 dòng T10, Y11, W10): chỉ báo số, không có ngưỡng.
     chính"). Bất định tương đối của phần rảnh do hiệu chuẩn: 1/cal_n + 1/idle_pass (đếm nguyên, ±1
     vòng). Chi phí đo = Σn × ovh_cyc / f_danh_định (cặp DWT, mục 4.1).
   * Đơn vị thời gian: H7 chia số chu kỳ cho SystemCoreClock danh định (480 MHz), win_ms đếm tick HAL của
-    cùng đồng hồ, nên mọi tỉ lệ % đúng dù đồng hồ H7 nhanh 0,64 %. µs của H7 là "µs danh định"; µs thật
+    cùng đồng hồ, nên mọi tỉ lệ % đúng dù đồng hồ H7 lệch (trước 09/11 nhanh 0,64 %; từ 09/11 xung HSE/5 của
+    ST-LINK, lệch ≤ 0,002 % theo `H7_CLOCK/2026-11-09_run04`, f thật ≈ 480 MHz, vẫn nằm trong dải mặc định dưới). µs của H7 là "µs danh định"; µs thật
     = µs H7 × f_danh_định / f_thật: cột `max_us_real_lo`, `max_us_real_hi` (X22, C1-15: theo tần số đo của
     chính lượt `--f-real-mhz`, không có thì theo dải [478; 486] MHz; 483,1 MHz là số suy từ đo 27/10, không
     phải của lượt nghiệm thu).

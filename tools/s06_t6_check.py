@@ -8,9 +8,10 @@ L7-13, V2-8, V3-7).
 với env `s06_load` hồ sơ `t6` (dòng `P,qseq,t_before,t_after,wheel,speed,gpioA,cmpA,gpioB,cmpB` mỗi
 lần ghi compare; dòng E cho đồng hồ).
 
-  * Chuẩn duty [Z11]: duty_chuẩn = (compare tại GPIO nối vào RPWM của H7 − compare tại GPIO nối vào
-    LPWM của H7)/1000, theo bảng nối dây (mặc định `WIRING` = 00_OVERVIEW/Setup_Guides/
-    2026-10-22_Huong_dan_Noi_day_HIL.md mục 4; khớp `pwm_capture.c` _ch[w] = RPWM, _ch[w+4] = LPWM).
+  * Chuẩn duty [Z11]: duty_chuẩn = (compare tại GPIO nối vào kênh LPWM của H7 − compare tại GPIO nối
+    vào kênh RPWM của H7)/1000, theo bảng nối dây (mặc định `WIRING` = 00_OVERVIEW/Setup_Guides/
+    2026-10-22_Huong_dan_Noi_day_HIL.md mục 4; khớp `pwm_capture.c` PWMCapture_GetDuty = _ch[w+4] −
+    _ch[w] từ 07/11, bug HIL-PWM-WIRE-SIGN: kênh LPWM của H7 nhận chân *_RPWM của motor.h).
     Dòng P có GPIO không thuộc bánh đó trong bảng → lỗi ánh xạ, mã 2.
   * Đồng hồ ESP32 → RPi5: `--clock-affine OFFSET RATE` (từ chân đánh dấu, khi có), hoặc mặc định
     chặn dưới t_rx − t_esp của các dòng có giờ ESP32 (tools/s06_t5_score.clock_fit). Cách mặc định
@@ -85,7 +86,7 @@ PWM_PERIOD_US = 50.0
 CLOCK_BIN_US = 1e6            # lượt T6 chỉ ~31 s: bin chặn dưới 1 s (T5 dùng 10 s cho lượt 20 phút)
 WHEELS = ('FL', 'FR', 'RL', 'RR')
 # wheel -> ((GPIO -> H7 RPWM, H7 pin), (GPIO -> H7 LPWM, H7 pin)); Huong_dan_Noi_day_HIL mục 4
-WIRING = {0: ((3, 'PA0'), (8, 'PE5')), 1: ((41, 'PF8'), (40, 'PE6')),
+WIRING = {0: ((3, 'PA0'), (8, 'PE5')), 1: ((41, 'PC8'), (40, 'PC9')),
           2: ((9, 'PA2'), (46, 'PF6')), 3: ((21, 'PA3'), (47, 'PF7'))}
 LEVELS = (0.03, 0.05, 0.10, 0.30, 0.33, 0.50, 0.55, 0.70, 0.77, 0.90, 0.95, 0.97, 1.00)
 PWM_RESOLUTION = 1000         # AGV motor.h: compare 0..1000
@@ -142,7 +143,7 @@ def duty_ref(wheel, cmp, wiring=WIRING):
     (gr, _), (gl, _) = wiring[wheel]
     if set(cmp) != {gr, gl}:
         raise ValueError(f'bánh {WHEELS[wheel]}: dòng P có GPIO {sorted(cmp)}, bảng nối dây là {gr}, {gl}')
-    return (cmp[gr] - cmp[gl]) / 1000.0
+    return (cmp[gl] - cmp[gr]) / 1000.0   # 07/11, HIL-PWM-WIRE-SIGN: same sign as PWMCapture_GetDuty
 
 
 def active_pin(wheel, cmp, wiring=WIRING, top=PWM_RESOLUTION):

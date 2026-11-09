@@ -43,17 +43,19 @@ def motor_set_info(wheel, speed):
 
 
 def test_golden_vectors():
-    # S23: FL +30 writes GPIO3 = 1000, GPIO8 = 970 (Codex Sol round 1/2 trace of motor.c): duty +0.03,
-    # chopping pin GPIO8 -> PE5; FL -30: GPIO3 = 970 -> PA0; FR +330: GPIO41 = 1000, GPIO40 = 670 -> PE6
+    # S23: FL +30 writes GPIO3 = 1000, GPIO8 = 970 (Codex Sol round 1/2 trace of motor.c), chopping pin
+    # GPIO8 -> PE5; FL -30: GPIO3 = 970 -> PA0; FR +330: GPIO41 = 1000, GPIO40 = 670 -> PC9.
+    # Duty sign since 07/11 (bug HIL-PWM-WIRE-SIGN, pwm_capture.c PWMCapture_GetDuty): duty at the
+    # *_RPWM pin of motor.h minus the *_LPWM pin = -(command)/1000 with motor_dir = -1 (old sign: +command).
     assert motor_set_info(0, 30) == ((3, 1000), (8, 970))
     cmp = dict(motor_set_info(0, 30))
-    assert t6.duty_ref(0, cmp) == pytest.approx(0.03) and t6.active_pin(0, cmp) == 'PE5'
+    assert t6.duty_ref(0, cmp) == pytest.approx(-0.03) and t6.active_pin(0, cmp) == 'PE5'
     cmp = dict(motor_set_info(0, -30))
-    assert t6.duty_ref(0, cmp) == pytest.approx(-0.03) and t6.active_pin(0, cmp) == 'PA0'
+    assert t6.duty_ref(0, cmp) == pytest.approx(0.03) and t6.active_pin(0, cmp) == 'PA0'
     cmp = dict(motor_set_info(1, 330))
-    assert cmp == {41: 1000, 40: 670} and t6.duty_ref(1, cmp) == pytest.approx(0.33) and t6.active_pin(1, cmp) == 'PE6'
+    assert cmp == {41: 1000, 40: 670} and t6.duty_ref(1, cmp) == pytest.approx(-0.33) and t6.active_pin(1, cmp) == 'PC9'
     cmp = dict(motor_set_info(3, 1000))
-    assert t6.duty_ref(3, cmp) == pytest.approx(1.0) and t6.active_pin(3, cmp) == 'PF7'
+    assert t6.duty_ref(3, cmp) == pytest.approx(-1.0) and t6.active_pin(3, cmp) == 'PF7'
     assert t6.active_pin(2, dict(motor_set_info(2, 0))) == '-'
 
 
@@ -83,7 +85,8 @@ def build(tmp_path, steps=STEPS, hold_s=1.0, gain=(1, 1, 1, 1), offset=None, bad
     for k in range(n):
         while i + 1 < len(steps) and t_pi[k] >= t_cmd[i + 1] + 2000:
             i += 1
-        target = np.array([s / 1000.0 for s in steps[i]]) if i >= 0 else np.zeros(4)    # FL +30 -> +0.03
+        # H7 duty since 07/11 (HIL-PWM-WIRE-SIGN): FL +30 -> -0.03 (old sign: +0.03)
+        target = np.array([-s / 1000.0 for s in steps[i]]) if i >= 0 else np.zeros(4)
         cur = a * cur + (1 - a) * target
         duty_true[k] = cur
     miso = np.zeros((n, 40), dtype=np.uint8)
@@ -214,7 +217,7 @@ def test_glitch_restarts_the_100_frame_hold(tmp_path):
     # FL 0 -> -0.03 commanded at frame 1100, in band from about frame 1110; one bad frame at 1150
     code, s, out, _ = run(tmp_path, glitch=1150)
     import csv
-    r = next(r for r in csv.DictReader(open(out / 'T6_follow.csv')) if r['wheel'] == 'FL' and r['duty_to'] == '0.03')
+    r = next(r for r in csv.DictReader(open(out / 'T6_follow.csv')) if r['wheel'] == 'FL' and r['duty_to'] == '-0.03')
     assert int(r['frame_settle']) == 1151 + PRE
     assert code == 0                                          # the glitch is inside the 100 skipped frames
 
@@ -346,7 +349,8 @@ def test_w15_rows_required(tmp_path):
     # S18: without the W15 row every level still shows per wheel, but a wheel mix-up would not
     steps = [s for s in STEPS if s != [100, 330, 550, 770]]
     code, s, _, _ = run(tmp_path, steps=steps)
-    assert code == 3 and s['levels_missing'] == {'W15': [[0.1, 0.33, 0.55, 0.77]]}
+    # command row +100 +330 +550 +770 is duty row -0.10 -0.33 -0.55 -0.77 since 07/11 (HIL-PWM-WIRE-SIGN)
+    assert code == 3 and s['levels_missing'] == {'W15': [[-0.1, -0.33, -0.55, -0.77]]}
 
 
 def test_forced_zero_after_run_end_is_not_a_level(tmp_path):

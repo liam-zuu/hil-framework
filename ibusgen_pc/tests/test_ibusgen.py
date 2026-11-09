@@ -178,7 +178,8 @@ def test_steady_20_s(harness):
 
 
 def test_h7_tick_from_the_fast_clock(harness):
-    # TIM6 runs on the H7 clock, 0.64 % fast: 100 us of H7 time is 99.36 us
+    # TIM6 on a clock 0.64 % fast (the H7 before the HSE/5 fix of 09/11, bug
+    # H7-CLK-HSE): 100 us of H7 time is 99.36 us. Kept as a robustness case.
     d = run(harness, 'run', WINDOW_TICKS + 700, 'tickus=99.36')
     w = d['windows'][0]
     assert 7000 <= w['p_min'] <= w['p_max'] <= 7100
@@ -255,3 +256,87 @@ def test_no_frames_while_off(harness):
     d = run(harness, 'run', WINDOW_TICKS, 'off@1')
     assert d['bytes'] == 0 and d['total_frames'] == 0
     assert d['windows'][0]['enabled'] == 0 and d['windows'][0]['enables'] == 0
+
+
+# ── I8: SWA from the RPi5 (Liam 09/11, "Duyet ca 5") ──
+
+def _swa_seq(d):
+    """SWA (channel 7) of every frame the ESP32 parser accepts, in order."""
+    good, bad = esp32_parse(d['val'])
+    assert bad == 0
+    return [g[6] for g in good]
+
+
+def test_frame_off_differs_only_in_swa(harness):
+    r = run(harness, 'frame')
+    on, off = r['frame'], r['frame_off']
+    ch_on = [on[2 + 2 * i] | (on[3 + 2 * i] << 8) for i in range(14)]
+    ch_off = [off[2 + 2 * i] | (off[3 + 2 * i] << 8) for i in range(14)]
+    assert ch_off[6] == 1000 and not ch_off[6] > 1500          # ESP32: motors off
+    assert [c for i, c in enumerate(ch_off) if i != 6] == [c for i, c in enumerate(ch_on) if i != 6]
+    good, bad = esp32_parse(off)
+    assert bad == 0 and len(good) == 1                          # checksum right for the second frame too
+    assert r['last_swa'] == 0                                   # no frame started yet
+
+
+def test_swa_change_mid_frame_waits_for_the_next_frame(harness):
+    # frame 1 starts at tick 1 and is on the wire for about 2.8 ms (28 ticks): ask SWA off at tick 5
+    d = run(harness, 'run', 3000, 'swa0@5')
+    frames_on_wire(d)
+    seq = _swa_seq(d)
+    assert seq[0] == 2000 and len(seq) >= 3
+    assert all(s == 1000 for s in seq[1:])
+    assert d['last_swa'] == 0
+
+
+def test_swa_off_still_sends_frames(harness):
+    # SWA off is "RC on, switch down": frames keep coming, the DUT does not time out
+    d = run(harness, 'run', WINDOW_TICKS, 'swa0@1')
+    w = d['windows'][0]
+    assert w['frames'] in (1428, 1429) and w['swa_frames'] == 0 and w['swa_changes'] == 0 and w['swa'] == 0
+    assert set(_swa_seq(d)) == {1000}
+    assert max_gap(esp32_deliveries(d['t_us'])) < SAFE_GAP_US
+
+
+def test_swa_toggles_counted_once_per_change(harness):
+    d = run(harness, 'run', WINDOW_TICKS, 'swa0@1000', 'swa1@5000')
+    w = d['windows'][0]
+    seq = _swa_seq(d)
+    changes = sum(a != b for a, b in zip(seq, seq[1:]))
+    assert changes == 2 and w['swa_changes'] == 2
+    assert w['swa_frames'] == seq[:w['frames']].count(2000)
+    assert w['swa'] == 1
+    assert max_gap(esp32_deliveries(d['t_us'])) < SAFE_GAP_US
+
+
+def test_swa_on_but_link_down_sends_nothing(harness):
+    # link down wins over the SWA command: the DUT loses RC (S06 T12 (d))
+    d = run(harness, 'run', 2000, 'off@1', 'swa1@1')
+    assert d['bytes'] == 0 and d['last_swa'] == 0
+
+
+# ── I8-3: SWA filter of the main loop (Codex round 1, Liam 09/11 "Duyet sua, vong 2") ──
+
+def _filt(harness, bits, *resets):
+    r = run(harness, 'filter', bits, *[f'r@{k}' for k in resets])
+    assert r['n'] == 3
+    return ''.join(str(x) for x in r['out'])
+
+
+def test_swa_filter_needs_three_in_a_row(harness):
+    assert _filt(harness, '0001111') == '0000011'
+    assert _filt(harness, '1110000') == '0011100'      # off also needs 3 frames
+
+
+def test_swa_filter_one_corrupt_frame_changes_nothing(harness):
+    assert _filt(harness, '0001000') == '0000000'      # one flipped 0 -> 1
+    assert _filt(harness, '1111011111') == '0011111111'  # one flipped 1 -> 0 while on
+
+
+def test_swa_filter_two_corrupt_frames_change_nothing(harness):
+    assert _filt(harness, '00110000') == '00000000'
+
+
+def test_swa_filter_reset_restarts_from_off(harness):
+    # link lost / gap after the filter was on: output 0 again, 3 new frames needed
+    assert _filt(harness, '11111111', 4) == '0011' + '0011'

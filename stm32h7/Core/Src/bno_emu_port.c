@@ -55,8 +55,10 @@ static uint32_t _n_xfers, _n_arm_mismatch, _n_missed_edge, _n_arm_fail;
 static uint32_t _n_spi_errors, _max_clocked, _n_samples;
 
 /* Microsecond time base from the DWT cycle counter, corrected like
- * EncoderGen: the H7 clock runs 0.64 % fast (bug H7-CLK-HSE), so one real
- * millisecond is SystemCoreClock / 1000 * ENC_CLOCK_CAL cycles. Only called
+ * EncoderGen: one real millisecond is SystemCoreClock / 1000 * ENC_CLOCK_CAL
+ * cycles. ENC_CLOCK_CAL is 1.0 since 09/11 (HSE 5 MHz from the ST-LINK MCO
+ * HSE/5, bug H7-CLK-HSE fixed at the source); it was 1.0064 while the H7 ran
+ * 0.64 % fast on the ST-LINK HSI/2 default. Only called
  * at NVIC priority 6 (and in init), so no locking. */
 static uint32_t _cyc_last;
 static uint64_t _cyc_total;

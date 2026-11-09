@@ -65,8 +65,11 @@ class MecanumParams:
         self.r         = 0.0485    # wheel radius [m] [Liam confirmed 07/11/2026, CODE session]
         self.lx        = 0.12     # longitudinal half-distance [m] [Liam confirmed 07/11/2026, CODE session]
         self.ly        = 0.12     # lateral half-distance [m] [Liam confirmed 07/11/2026, CODE session]
-        self.M         = 4.0      # total mass [kg] [not weighed yet: weigh the car with battery (Liam 07/11)]
-        self.Iz        = 0.0384   # yaw inertia [kg·m²]  (computed from geometry)
+        self.M         = 4.12     # total mass [kg] [measured: car with battery 4120 g, Liam 09/11/2026, CODE session]
+        # yaw inertia [kg·m²] [calculated: uniform rectangular body 2lx x 2ly, (1/12) M ((2lx)^2 + (2ly)^2)];
+        # = 0.039552 at M = 4.12 (0.0384 at the old M = 4.0). Computed from M here at construction only:
+        # update_physical(M=...) does not recompute it (no caller changes M, checked 09/11).
+        self.Iz        = (1.0 / 12.0) * self.M * ((2 * self.lx) ** 2 + (2 * self.ly) ** 2)
         self.J_w       = 0.00247  # wheel inertia [kg·m²]
         self.b_w       = 0.002    # viscous friction [N·m·s/rad]
         self.tau_max   = 0.5      # max torque per wheel [N·m]
@@ -118,7 +121,9 @@ class MecanumParams:
         # Effective wheel-floor mu as the force-gauge test measures it: mu_hd = F_max / (m g),
         # pushing straight or sideways (spec controller-IMU v2.2 §1b.4). Not the material mu:
         # with ideal 45° rollers mu_hd ≈ mu_material / sqrt(2).
-        self.mu_hd        = np.full(4, 0.5)   # [ASSUMPTION — pending MU_FLOOR measurement]
+        # [measured: mean of 10 runs, floor of the task (indoor tiles), 05_DATA/results/MU_FLOOR/
+        # 2026-11-09_run02 (min 0.413, max 0.473); before 09/11: 0.5, assumed]
+        self.mu_hd        = np.full(4, 0.436)
         self.slip_omega_s = 0.1               # [rad/s] traction smoothing band [ASSUMPTION — numerical smoothing]
         self.slip_nsub    = None              # sub-steps per dt; None = from the stability bound [calculated]
 

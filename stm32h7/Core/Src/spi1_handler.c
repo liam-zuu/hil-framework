@@ -74,6 +74,12 @@ static volatile uint32_t _last_error;
 static volatile uint32_t _last_frame_ms;   /* tick at the last completed frame (clock check) */
 static volatile uint8_t  _rearm_pending;
 static uint32_t          _n_rearms;
+/* 08/11 (bug HIL-SPI1-SCK-GLITCH, spi1_handler.h SPI1_Stats_t.stuck) */
+static uint32_t          _n_stuck;
+static uint32_t          _stuck_err;
+static uint32_t          _n_restart_fail;
+static uint32_t          _svc_min_cyc = 0xFFFFFFFFu;
+static uint32_t          _svc_max_cyc;
 
 static HIL_State_t   _state;
 static HIL_TrajRef_t _traj;
@@ -323,8 +329,34 @@ void SPI1_RequestRestart(void)
     _rearm_pending = 1;
 }
 
-void SPI1_Service(void)
+/* 08/11 (bug HIL-SPI1-SCK-GLITCH): SPI1 must be armed (State BUSY_TX_RX and
+ * SPE set) whenever no restart is pending. A phantom SCK edge makes the SPI
+ * count 40 bytes before the RPi5 frame ends; the next clocks find the TX FIFO
+ * empty (UDR). HAL_SPI_IRQHandler then disables the SPI and aborts the two
+ * DMA streams, which are already done, so the abort fails (NO_XFER), the
+ * error callback never runs and State stays BUSY_TX_RX: no frame until the
+ * 50 ms link watchdog (CLOSED_LOOP/2026-11-08_run06). Checked here with
+ * interrupts masked: the frame callback (priority 0) closes and re-arms in one
+ * interrupt, so the main loop never sees the SPI between the two. */
+static void _check_armed(void)
 {
+    if (_rearm_pending) return;
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    uint32_t state = (uint32_t)_hspi->State;
+    uint32_t spe   = _hspi->Instance->CR1 & SPI_CR1_SPE;
+    uint32_t err   = _hspi->ErrorCode;
+    __set_PRIMASK(primask);
+    if (state != (uint32_t)HAL_SPI_STATE_BUSY_TX_RX || spe == 0u) {
+        _n_stuck++;
+        _stuck_err     = err;
+        _rearm_pending = 1;
+    }
+}
+
+static void _service(void)
+{
+    _check_armed();
     if (!_rearm_pending) return;
     if (HAL_GPIO_ReadPin(_NSS_PORT, _NSS_PIN) != GPIO_PIN_SET) return;  /* frame in progress */
 
@@ -340,7 +372,27 @@ void SPI1_Service(void)
         s06_put32(p, DWT->CYCCNT);
         s06_put16(p + 4, (uint16_t)_n_rearms);
         S06Log_Push(S06_REC_REARM, p, sizeof p);
+    } else {
+        _n_restart_fail++;             /* _rearm_pending stays 1: retried next pass */
     }
+}
+
+void SPI1_Service(void)
+{
+    uint32_t t0 = DWT->CYCCNT;
+    _service();
+    uint32_t dt = DWT->CYCCNT - t0;
+    if (dt < _svc_min_cyc) _svc_min_cyc = dt;
+    if (dt > _svc_max_cyc) _svc_max_cyc = dt;
+}
+
+void SPI1_TakeServiceCycles(uint32_t *min_cyc, uint32_t *max_cyc)
+{
+    /* main loop only, like SPI1_Service(): no masking needed */
+    *min_cyc = (_svc_min_cyc == 0xFFFFFFFFu) ? 0u : _svc_min_cyc;
+    *max_cyc = _svc_max_cyc;
+    _svc_min_cyc = 0xFFFFFFFFu;
+    _svc_max_cyc = 0u;
 }
 
 uint32_t SPI1_GetFrameCount(void)
@@ -364,6 +416,9 @@ void SPI1_GetStats(SPI1_Stats_t *out)
     out->new_taken     = _n_new_taken;
     out->new_dropped   = _n_new_dropped;
     __enable_irq();
+    out->stuck        = _n_stuck;      /* main loop only (SPI1_Service) */
+    out->stuck_err    = _stuck_err;
+    out->restart_fail = _n_restart_fail;
 }
 
 uint32_t SPI1_GetLastFrameMs(void)

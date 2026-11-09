@@ -75,8 +75,32 @@ def test_pcnt_limit_no_spike(fw):
 
 def test_adrc_defaults_match_adrc_c(fw):
     fw.reset()
-    assert fw.get_adrc(0) == pytest.approx(dict(omega_c=8.0, omega_o=30.0, b0=5.9, out_limit=1.6))
-    assert fw.get_adrc(2) == pytest.approx(dict(omega_c=8.0, omega_o=30.0, b0=10.0, out_limit=6.5))
+    assert fw.get_adrc(0) == pytest.approx(dict(omega_c=8.0, omega_o=30.0, b0=5.85, out_limit=1.6))
+    assert fw.get_adrc(2) == pytest.approx(dict(omega_c=8.0, omega_o=30.0, b0=10.3, out_limit=6.5))
+
+
+def _step_tau(params, v_cmd, axis, T=2.0):
+    """Time to 63 % of the final |body velocity| for an open-loop step of the duty the firmware IK
+    gives for body command v_cmd (pwm = w / W_MAX * PWM_MAX), plant from rest (adrc.c b0 method)."""
+    from plant_step import plant_step
+    duty = params.H_inv @ np.asarray(v_cmd, dtype=float) / params.omega_max * params.motor_polarity
+    x, ys = np.zeros(10), []
+    for _ in range(int(T / 0.001)):
+        x = plant_step(x, duty, params, 0.001, np.random.default_rng(0))
+        ys.append(abs(x[3 + axis]))
+    ys = np.asarray(ys)
+    return (np.argmax(ys >= 0.632 * ys[-200:].mean()) + 1) * 0.001
+
+
+def test_adrc_b0_is_one_over_step_tau_of_the_plant(fw):
+    """adrc.c b0 = 1/tau of the open-loop step of the default plant (S01 motor, weighed M, measured
+    mu): if params.py changes and b0 is not recomputed, this fails (within 2 %; Liam 09/11)."""
+    p = fwsim.MecanumParams()
+    fw.reset()
+    for axis, adrc_axis, cmds in ((0, 0, ([0.3, 0, 0], [0.5, 0, 0])), (2, 2, ([0, 0, 1.0], [0, 0, 2.0]))):
+        b0 = fw.get_adrc(adrc_axis)['b0']
+        for v in cmds:
+            assert 1.0 / _step_tau(p, v, axis) == pytest.approx(b0, rel=0.02)
 
 
 def test_adrc_no_steady_error(fw):

@@ -54,7 +54,13 @@ void     S06Load_CalibrateOverhead(void);
  * with every interrupt masked before the main run and reports passes and
  * cycles here. */
 void     S06Load_SetIdleCal(uint32_t n_pass, uint32_t cycles);
-/* Main loop, every 10 s: prints and restarts the window. */
+/* Main loop, every 10 s: takes the window and restarts it (08/11). Then
+ * S06Load_PrintNext() prints one line of that window per call (header first,
+ * then one line per handler with n > 0, same lines as before) and returns 0
+ * when none is left, so the main loop prints one line per pass. */
+void     S06Load_Snapshot(void);
+int      S06Load_PrintNext(void);
+/* Snapshot + every line at once (PC test) */
 void     S06Load_Report(void);
 
 #endif /* S06_LOAD_H */

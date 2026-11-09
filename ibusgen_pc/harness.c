@@ -9,6 +9,8 @@
  *   harness frame
  *   harness run <ticks> [events...]
  *     off@T on@T     generator gate off / on from tick T
+ *     swa0@T swa1@T  SWA asked off / on from tick T (I8; up to 8 of each;
+ *                    default on from tick 1, so the older tests keep SWA 2000)
  *     block@T:N      line held from tick T for N ticks (no byte starts)
  *     stall@T:N      TIM6 interrupt not served for ticks T..T+N-1
  *     period=US      period passed to ibus_gen_init
@@ -76,8 +78,27 @@ int main(int argc, char **argv)
         ibus_gen_init(&g, &io, IBUS_GEN_PERIOD_US, 0);
         printf("{");
         _print_frame(g.frame);
+        printf(",\"frame_off\":[");
+        for (int i = 0; i < (int)IBUS_GEN_FRAME_LEN; i++) printf(i ? ",%u" : "%u", g.frame_off[i]);
+        printf("],\"last_swa\":%d", ibus_gen_last_swa(&g));
         printf(",\"period_us\":%u,\"min_period_us\":%u}\n",
                (unsigned)g.period_us, (unsigned)IBUS_GEN_MIN_PERIOD_US);
+        return 0;
+    }
+    if (argc >= 3 && strcmp(argv[1], "filter") == 0) {
+        /* I8-3: harness filter <bits, e.g. 0110111> [r@K ...] -> filtered output per bit;
+         * r@K resets the filter before bit K (link lost / gap) */
+        ibus_swa_filter_t f;
+        ibus_swa_filter_reset(&f);
+        printf("{\"out\":[");
+        for (int k = 0; argv[2][k]; k++) {
+            for (int i = 3; i < argc; i++) {
+                int r;
+                if (sscanf(argv[i], "r@%d", &r) == 1 && r == k) ibus_swa_filter_reset(&f);
+            }
+            printf(k ? ",%d" : "%d", ibus_swa_filter_step(&f, argv[2][k] == '1'));
+        }
+        printf("],\"n\":%u}\n", (unsigned)IBUS_SWA_FILTER_N);
         return 0;
     }
     if (argc < 3 || strcmp(argv[1], "run") != 0) {
@@ -86,9 +107,13 @@ int main(int argc, char **argv)
     }
     long ticks = atol(argv[2]);
     long off_at = -1, on_at = -1, blk_at = -1, blk_n = 0, st_at = -1, st_n = 0;
+    long swa_at[16]; int swa_val[16]; int n_swa = 0;
     unsigned period = IBUS_GEN_PERIOD_US;
     double tick_us = 100.0;
     for (int i = 3; i < argc; i++) {
+        long t_ev;
+        if (sscanf(argv[i], "swa0@%ld", &t_ev) == 1 && n_swa < 16) { swa_at[n_swa] = t_ev; swa_val[n_swa++] = 0; continue; }
+        if (sscanf(argv[i], "swa1@%ld", &t_ev) == 1 && n_swa < 16) { swa_at[n_swa] = t_ev; swa_val[n_swa++] = 1; continue; }
         if (sscanf(argv[i], "off@%ld", &off_at) == 1) continue;
         if (sscanf(argv[i], "on@%ld", &on_at) == 1) continue;
         if (sscanf(argv[i], "block@%ld:%ld", &blk_at, &blk_n) == 2) continue;
@@ -103,29 +128,34 @@ int main(int argc, char **argv)
 
     printf("{\"period_us\":%u,\"windows\":[", (unsigned)g.period_us);
     uint32_t last_win = 0;
-    int first = 1, on = 1;
+    int first = 1, on = 1, swa = 1;
     for (long t = 1; t <= ticks; t++) {
         if (t == off_at) on = 0;
         if (t == on_at)  on = 1;
+        for (int k = 0; k < n_swa; k++)
+            if (t == swa_at[k]) swa = swa_val[k];
         if (st_at >= 0 && t >= st_at && t < st_at + st_n) continue;   /* not served */
         g_now = t * tick_us;
-        ibus_gen_tick(&g, (uint32_t)(g_now + 0.5), on);
+        ibus_gen_tick(&g, (uint32_t)(g_now + 0.5), on, swa);
         if (g_n >= MAX_BYTES - 64) { fprintf(stderr, "byte buffer full\n"); return 2; }
         ibus_gen_window_t w;
         if (ibus_gen_read_window(&g, &w) && w.window != last_win) {
             last_win = w.window;
             printf("%s{\"window\":%u,\"frames\":%u,\"p_count\":%u,\"p_min\":%u,\"p_max\":%u,"
-                   "\"late\":%u,\"tick_gap_max\":%u,\"enables\":%u,\"total\":%u,\"enabled\":%u}",
+                   "\"late\":%u,\"tick_gap_max\":%u,\"enables\":%u,\"total\":%u,\"enabled\":%u,"
+                   "\"swa_frames\":%u,\"swa_changes\":%u,\"swa\":%u}",
                    first ? "" : ",", (unsigned)w.window, (unsigned)w.frames,
                    (unsigned)w.p_count, (unsigned)w.p_min_us, (unsigned)w.p_max_us,
                    (unsigned)w.late_ticks, (unsigned)w.tick_gap_max_us, (unsigned)w.enables,
-                   (unsigned)w.total_frames, (unsigned)w.enabled);
+                   (unsigned)w.total_frames, (unsigned)w.enabled,
+                   (unsigned)w.swa_frames, (unsigned)w.swa_changes, (unsigned)w.swa);
             first = 0;
         }
     }
     g_now = 1e18;                       /* let the FIFO drain */
     _advance();
-    printf("],\"total_frames\":%u,\"bytes\":%ld,\"t_us\":[", (unsigned)g.total_frames, g_n);
+    printf("],\"total_frames\":%u,\"last_swa\":%d,\"bytes\":%ld,\"t_us\":[",
+           (unsigned)g.total_frames, ibus_gen_last_swa(&g), g_n);
     for (long i = 0; i < g_sent; i++) printf(i ? ",%.3f" : "%.3f", g_start[i]);
     printf("],\"val\":[");
     for (long i = 0; i < g_n; i++) printf(i ? ",%u" : "%u", g_val[i]);

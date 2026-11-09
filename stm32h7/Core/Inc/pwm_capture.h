@@ -6,11 +6,16 @@
 /*
  * PWMCapture — Measure RPWM/LPWM duty cycles from ESP32 via TIM Input Capture
  *
- * Hardware (channel index 0..7 = RPWM FL FR RL RR, LPWM FL FR RL RR):
- *   0 TIM5  CH1  PA0   RPWM wheel 1        4 TIM15 CH1  PE5   LPWM wheel 1
- *   1 TIM8  CH3  PC8   RPWM wheel 2        5 TIM8  CH4  PC9   LPWM wheel 2
- *   2 TIM5  CH3  PA2   RPWM wheel 3        6 TIM16 CH1  PF6   LPWM wheel 3
- *   3 TIM5  CH4  PA3   RPWM wheel 4        7 TIM17 CH1  PF7   LPWM wheel 4
+ * Hardware (channel index 0..7; "RPWM"/"LPWM" below are the H7 channel names
+ * used in the code and logs, the ESP32 pin names in motor.h are the other way
+ * round, see PWMCapture_GetDuty and bug HIL-PWM-WIRE-SIGN, 07/11):
+ *   0 TIM5  CH1  PA0   RPWM wheel 1 = GPIO3  FL_LPWM    4 TIM15 CH1  PE5   LPWM wheel 1 = GPIO8  FL_RPWM
+ *   1 TIM8  CH3  PC8   RPWM wheel 2 = GPIO41 FR_LPWM    5 TIM8  CH4  PC9   LPWM wheel 2 = GPIO40 FR_RPWM
+ *   2 TIM5  CH3  PA2   RPWM wheel 3 = GPIO9  RL_LPWM    6 TIM16 CH1  PF6   LPWM wheel 3 = GPIO46 RL_RPWM
+ *   3 TIM5  CH4  PA3   RPWM wheel 4 = GPIO21 RR_LPWM    7 TIM17 CH1  PF7   LPWM wheel 4 = GPIO47 RR_RPWM
+ * GPIO46 is an ESP32-S3 strapping pin and PA2 is wired to the Nucleo Ethernet
+ * PHY (MDIO, UM2407 table 13): with GPIO46 on PA2 the ESP32 did not enter
+ * download mode (07/11), so GPIO46 stays on PF6.
  * PC8 and PC9 are the pins on ZIO CN8; the CN12 spots with the same names are
  * not these pins (Liam measured 04/11 with the internal pull-up: CN8 3.2 V,
  * CN12 0 V). Wheel 2 moved to TIM8 on 04/11 because TIM13 and TIM15 CH2 have
@@ -26,8 +31,9 @@
  * the ISR came later than the short phase of the period (RL step 3: 15 us low,
  * 05_DATA/results/PWM_CAPTURE/2026-11-04_run01). Decoding: pwm_edges.c.
  *
- * Torque conversion (RPWM/LPWM → signed duty [-1..1]):
- *   duty_net[w] = rpwm_duty[w] - lpwm_duty[w]
+ * Torque conversion (signed duty [-1..1], since 07/11):
+ *   duty_net[w] = duty[w + 4] - duty[w]
+ *   = duty at the ESP32 *_RPWM pin - duty at the *_LPWM pin (motor.h names)
  */
 
 #define PWM_NUM_WHEELS   4u
@@ -50,7 +56,8 @@ void  PWMCapture_Init(TIM_HandleTypeDef *ht5,
 void  PWMCapture_Service(void);
 
 /* Net duty [-1..1] per wheel from the last PWMCapture_Service().
- * Positive = RPWM dominates (forward), Negative = LPWM dominates (reverse).
+ * Positive = the ESP32 *_RPWM pin (motor.h) dominates, i.e. channel w + 4;
+ * negative = the *_LPWM pin, channel w. Same sign as fwsim/fw_sim.c duty.
  * A channel with no edge within PWM_TIMEOUT_MS counts as its pin level
  * (1.0 if held HIGH, 0.0 if held LOW). */
 void  PWMCapture_GetDuty(float *duty_out);  /* float[4] */

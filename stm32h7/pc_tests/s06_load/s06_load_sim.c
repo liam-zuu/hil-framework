@@ -73,5 +73,29 @@ int main(void)
     check(n == 0 && sum == 0 && max == 0, "report_restarts_window", "stats not cleared by the report");
     check(S06Load_IdleCount() == 7u, "idle_counted", "idle passes not counted");
     check(fake_irq_disabled == 0, "report_restores_primask", "PRIMASK left set");
+
+    /* 08/11 (L51): snapshot, then one line per S06Load_PrintNext() call:
+     * header + one line per handler with n > 0 (first and last index here) */
+    check(S06Load_PrintNext() == 0, "print_next_idle", "line printed without a snapshot");
+    handler(S06_IRQ_SYSTICK, 3000, 3010, NULL);
+    handler(S06_IRQ_USART3, 3100, 3130, NULL);
+    fake_tick_ms = 20000u;
+    S06Load_Snapshot();
+    s06_test_get(S06_IRQ_USART3, &sum, &n, &max);
+    int snap_cleared = (n == 0);
+    handler(S06_IRQ_TIM1, 3200, 3210, NULL);   /* after the snapshot: next window */
+    int lines = 0;
+    while (S06Load_PrintNext() && lines < 50) lines++;
+    check(snap_cleared, "snapshot_restarts_window", "stats not cleared by the snapshot");
+    check(lines == 3, "print_next_lines", "expected header + 2 handler lines");
+    check(S06Load_PrintNext() == 0, "print_next_done", "line printed after the last one");
+    s06_test_get(S06_IRQ_TIM1, &sum, &n, &max);
+    check(n == 1, "print_keeps_next_window", "printing touched the running window");
+    fake_tick_ms = 30000u;
+    S06Load_Snapshot();                        /* TIM1 only */
+    lines = 0;
+    while (S06Load_PrintNext() && lines < 50) lines++;
+    check(lines == 2, "print_next_one_handler", "expected header + 1 handler line");
+    check(fake_irq_disabled == 0, "snapshot_restores_primask", "PRIMASK left set");
     return _fails ? 1 : 0;
 }

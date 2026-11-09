@@ -37,7 +37,8 @@ from typing import Optional
 from timing import PrecisionTimer, set_realtime, pin_cpu, lock_memory
 from gpio_sync import GPIOSync
 from spi_master import SPIMaster
-from protocol import encode_state, decode_torques, TRAJ_VALID, TRAJ_NEW, OFS_MISO_SEQ
+from protocol import (encode_state, decode_torques, TRAJ_VALID, TRAJ_NEW, OFS_MISO_SEQ, CMD_SWA_ON,
+                      miso_check, MISO_OK, MISO_EMPTY)
 from plant_interface import PlantInterface, MockPlant
 from mecanum_plant import MecanumPlant
 from imu_model import imu_from_plant
@@ -46,9 +47,25 @@ from params import PARAMS
 from rt_monitor import RTMonitor
 from s06_load_schedule import HeavyBlock
 from step_log import StepLog
-from run_lifecycle import ControlBox, LifecycleConfig, RunLifecycle, StepIn, END
+from run_lifecycle import ControlBox, LifecycleConfig, RunLifecycle, StepIn, END, RUN, STOPPING
 
-log = logging.getLogger('hil.node')
+# I8 (Liam 09/11, "Duyet ca 5"): who holds the RC switch SWA of the iBUS frames the H7 sends.
+# 'phase' = on in RUN and STOPPING of --finite-run (needs cfg.lifecycle), 'on' / 'off' = fixed.
+SWA_MODES = ('off', 'on', 'phase')
+SWA_PHASES_ON = (RUN, STOPPING)   # STOPPING only after the run reached RUN (I8-1)
+# I8-5: frames sent after the lifecycle reached END (SWA off, setpoint 0, no publisher), so the H7
+# surely gets the off command and the frame log shows the H7 status follow it (filter 3 frames +
+# iBUS period 7 ms + answer 2 frames, about 13 ms; 30 frames = 30 ms)
+END_TAIL_FRAMES = 30
+# I8-R2-2 (Codex round 2): 30 frames are not 30 ms when the timer catches up on late deadlines (it sends
+# them back to back), so the tail also lasts END_TAIL_MS on time.monotonic_ns, from the END frame on.
+END_TAIL_MS = 30
+# A3: frames j < 2 are not checked: the H7 answers frame N in frame N + 2 and the first two frames still
+# carry the reply staged in the previous link period (as s06_frames_decode `start_leftover`, L50: "không
+# tính frame rỗng ở đầu log trước câu trả lời đầu tiên (j < 2)")
+MISO_SKIP_FRAMES = 2
+
+log =logging.getLogger('hil.node')
 
 
 def plant_to_frame_state(state: list) -> list:
@@ -100,6 +117,9 @@ class HILConfig:
     load_schedule:     str   = ''
     # --finite-run: phases of run_lifecycle.py; None = the loop as before
     lifecycle:         Optional[LifecycleConfig] = None
+    # I8: SWA command bit (MOSI byte 20 bit 3), see SWA_MODES. Default 'off': a node
+    # built without a choice never turns the DUT motors on (run_hil.py resolves --swa)
+    swa_mode:          str   = 'off'
     jitter_warn_us:    float = 500.0       # warn if jitter exceeds this
     stats_interval:    int   = 10_000      # print stats every N steps
 
@@ -158,6 +178,25 @@ class HILNode:
         self._lc          = RunLifecycle(self.cfg.lifecycle) if self.cfg.lifecycle else None
         if self._lc is not None and control is None:
             raise ValueError('cfg.lifecycle needs a ControlBox')
+        if self.cfg.swa_mode not in SWA_MODES:
+            raise ValueError(f'swa_mode {self.cfg.swa_mode!r} not in {SWA_MODES}')
+        if self.cfg.swa_mode == 'phase' and self._lc is None:
+            raise ValueError("swa_mode 'phase' needs cfg.lifecycle (--finite-run)")
+        self._swa       = None               # last bit sent; None before the first frame
+        self._swa_events: list = []          # (step, 0/1) at every change, for the manifest
+        self._run_seen  = False              # I8-1: the lifecycle reached RUN
+        self._end_seen  = False              # I8-5: the lifecycle reached END, the tail frames follow
+        self._tail_t0_ns: Optional[int] = None  # I8-R2-2: send time of the END frame
+        self._tail_sent = 0                  # I8-R2-3: tail frames sent after the END frame
+        self._tail_complete = False          # I8-R2-3: the tail ran its frames and its time
+        # A3 (Liam 09/11, CODE: "ok tôi đồng ý hết"; STATUS_CODE L50, L61 b): MISO frames with a bad CRC
+        # or all 0 from frame MISO_SKIP_FRAMES on, counted in the loop, reported at the end (#miso line,
+        # manifest). Report only: the loop still takes the duty from every frame (L50 rule: a run with
+        # any of them is not a main number, run again)
+        self._miso_crc_bad = 0
+        self._miso_empty   = 0
+        self._miso_first_crc_bad: Optional[int] = None
+        self._miso_first_empty: Optional[int] = None
         self._h7_seq      = -1
         self._h7_new      = False
         self._ref         = (0.0, 0.0, 0.0)
@@ -294,8 +333,11 @@ class HILNode:
 
         # 2. Encode current state + setpoint, send MOSI, receive MISO (torques from H7)
         traj_flags = 0
-        lc = self._lifecycle_step() if self._lc is not None else None
-        if lc is not None and lc.send_zero:
+        tail = self._end_seen                # I8-5: after END, no lifecycle step, no publisher
+        lc = self._lifecycle_step() if (self._lc is not None and not tail) else None
+        if tail:
+            pass                                 # keep the last setpoint (0 from STOPPING), flags 0
+        elif lc is not None and lc.send_zero:
             self._ref  = (0.0, 0.0, 0.0)         # section 9.1: VALID|NEW, not through the publisher
             traj_flags = TRAJ_VALID | TRAJ_NEW
         elif (lc is None or lc.publish) and self.shared_ref is not None:
@@ -310,11 +352,38 @@ class HILNode:
         frame_state = plant_to_frame_state(state) if self._mecanum else state
         if self._heavy is not None:
             self._heavy.apply(self._step, frame_state)   # S06 Z8: omega to the H7 only, the plant goes on
+        swa = self._swa_bit()
         mosi   = encode_state(frame_state, traj_ref=self._ref, traj_flags=traj_flags,
-                              seq=self._step, imu=imu, imu_seq=imu_seq)
+                              seq=self._step, imu=imu, imu_seq=imu_seq,
+                              fault_flags=CMD_SWA_ON if swa else 0)
         t_send = time.monotonic_ns()
         miso   = self._spi.transfer(mosi)
+        if swa != self._swa:                 # I8-11: recorded once the frame went out
+            self._swa = swa
+            self._swa_events.append((self._step, swa))
+        if tail:
+            # I8-R2-2: both END_TAIL_FRAMES frames and END_TAIL_MS since the END frame went out
+            self._tail_sent += 1
+            if (self._tail_sent >= END_TAIL_FRAMES
+                    and t_send - self._tail_t0_ns >= END_TAIL_MS * 1_000_000):
+                self._tail_complete = True
+                self._running = False
+        elif self._end_seen:
+            # this step reached END: the tail time starts once its frame is out (Codex round 3: not
+            # t_send, taken before a transfer that may stall), so the H7 has had the off command
+            self._tail_t0_ns = time.monotonic_ns()
         torques = decode_torques(miso)
+        if self._step >= MISO_SKIP_FRAMES:
+            chk = miso_check(miso)
+            if chk != MISO_OK:
+                if chk == MISO_EMPTY:
+                    self._miso_empty += 1
+                    if self._miso_first_empty is None:
+                        self._miso_first_empty = self._step
+                else:
+                    self._miso_crc_bad += 1
+                    if self._miso_first_crc_bad is None:
+                        self._miso_first_crc_bad = self._step
         if self._lc is not None:
             self._h7_new = miso[OFS_MISO_SEQ] != self._h7_seq
             self._h7_seq = miso[OFS_MISO_SEQ]
@@ -353,6 +422,19 @@ class HILNode:
         if self._step % self.cfg.stats_interval == 0:
             self._log_stats()
 
+    def _swa_bit(self) -> int:
+        """I8: SWA command for this frame. 'phase' reads the phase after this step's lifecycle step."""
+        m = self.cfg.swa_mode
+        if m == 'on':
+            return 1
+        if m == 'phase':
+            ph = self._lc.phase
+            if ph == RUN:
+                return 1
+            # I8-1: STOP or an error in ARM goes straight to STOPPING; the motors stay off then
+            return 1 if (ph == STOPPING and self._run_seen) else 0
+        return 0
+
     def _lifecycle_step(self):
         """One phase step. Reads the owner cells (one try of the lock), no blocking call."""
         box = self.control
@@ -362,9 +444,11 @@ class HILNode:
                                    publisher_done=box.pub_done, publisher_alive=not box.pub_dead,
                                    stop_requested=box.stop,
                                    heartbeat_age_s=(now - box.heartbeat_ns) / 1e9))
+        if self._lc.phase == RUN:
+            self._run_seen = True
         if out.done:
             self._stop_reason = self._lc.outcome
-            self._running = False
+            self._end_seen = True                # I8-5: the loop stops after the tail (I8-R2-2)
         return out
 
     def _imu_sample(self, state: list):
@@ -406,7 +490,10 @@ class HILNode:
                         plant=type(self.plant).__name__, plant_src=self._plant_src,     # L34
                         heavy_block=self.cfg.heavy_block,
                         load_schedule=self.cfg.load_schedule, rt=self._rt, uname=' '.join(platform.uname()),     # X8: the kernel the run ran on
-                        lifecycle=self.lifecycle_summary())
+                        lifecycle=self.lifecycle_summary(),
+                        swa_mode=self.cfg.swa_mode, swa_events=self.swa_events(),     # I8
+                        miso_check=self.miso_summary(),                                # A3
+                        **self.swa_tail())                                             # I8-R2-3
         np.savez(self.cfg.frame_log, manifest=np.array(json.dumps(manifest)),
                  **{k: v[:n] for k, v in self._flog.items()})
         log.info('Frame log: %d frames -> %s', n, self.cfg.frame_log)
@@ -416,23 +503,51 @@ class HILNode:
         self._stop_reason = f'signal_{signum}'
         self._running = False
 
+    def swa_events(self) -> list:
+        """I8: [[step, 0/1], ...] at every change of the SWA bit sent (first frame included)."""
+        return [[int(k), int(v)] for k, v in self._swa_events]
+
+    def miso_summary(self) -> dict:
+        """A3: MISO frames checked (from frame MISO_SKIP_FRAMES on), how many had a bad CRC or were all 0,
+        and the step of the first of each (None: none). Meaningful only against the real H7."""
+        return dict(checked=max(0, self._step - MISO_SKIP_FRAMES), crc_bad=self._miso_crc_bad,
+                    empty=self._miso_empty, first_crc_bad=self._miso_first_crc_bad,
+                    first_empty=self._miso_first_empty)
+
+    def swa_tail(self) -> dict:
+        """I8-R2-3: the END tail. swa_tail_sent = tail frames sent after the END frame; swa_tail_complete =
+        it ran END_TAIL_FRAMES frames and END_TAIL_MS (False when max_steps, a full frame log, a signal or
+        an error cut it, or END was never reached); None without --finite-run (no tail)."""
+        return dict(swa_tail_sent=self._tail_sent,
+                    swa_tail_complete=self._tail_complete if self._lc is not None else None)
+
     def lifecycle_summary(self) -> Optional[dict]:
-        """Phases and outcome of a --finite-run; None without it."""
+        """Phases and outcome of a --finite-run, with the END tail (I8-R2-3); None without it."""
         if self._lc is None:
             return None
-        return dict(self._lc.summary(), lock_misses=self.control.lock_misses)
+        return dict(self._lc.summary(), lock_misses=self.control.lock_misses, **self.swa_tail())
 
     @property
     def run_failed(self) -> bool:
-        """--finite-run ended in error:<reason>, or without reaching END."""
+        """--finite-run ended in error:<reason>, or without reaching END, or (I8-R2-3, Codex round 3)
+        reached END but its tail was cut (max_steps, a full frame log, a signal), so run_hil.py exits 3."""
         if self._lc is None:
             return False
-        return self._lc.phase != END or (self._lc.outcome or '').startswith('error:')
+        return (self._lc.phase != END or (self._lc.outcome or '').startswith('error:')
+                or not self._tail_complete)
 
     def _shutdown(self) -> None:
         if self._lc is not None:
             self.control.set_phase(self._lc.phase)
             log.info('#run_summary,%s', json.dumps(self.lifecycle_summary()))
+        log.info('#swa,mode=%s,events=%s,tail=%s', self.cfg.swa_mode, json.dumps(self.swa_events()),
+                 json.dumps(self.swa_tail()))                                           # I8, I8-R2-3
+        m = self.miso_summary()                                                         # A3
+        log.info('#miso,checked=%d,crc_bad=%d,empty=%d,first_crc_bad=%s,first_empty=%s',
+                 m['checked'], m['crc_bad'], m['empty'], m['first_crc_bad'], m['first_empty'])
+        if m['crc_bad'] or m['empty']:
+            log.warning('MISO: %d frame CRC sai, %d frame rỗng trong lượt (L50: không làm số chính)',
+                        m['crc_bad'], m['empty'])
         log.info('#run_end,timestamp_us=%d,steps=%d,reason=%s',
                  time.monotonic_ns() // 1000, self._step, self._stop_reason)
         if self._flog is not None:

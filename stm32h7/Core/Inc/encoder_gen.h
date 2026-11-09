@@ -56,14 +56,23 @@
 #define ENC_NUM_WHEELS  4u
 #define ENC_TIMER_FREQ  1000000UL  /* Hz, tick rate after PSC=239        */
 
-/* Clock correction (27/10, Liam approved in the CODE session, bug H7-CLK-HSE):
+/* Clock correction. Now 1.0 (09/11 fix below); history kept for the trace.
+ * 27/10 (Liam approved in the CODE session, bug H7-CLK-HSE):
  * the H7 clock runs about 0.64 % fast against two independent references
  * (RPi5 frame rate and the ESP32 crystal; 05_DATA/results/H7_CLOCK/
  * 2026-10-27_run01). The CubeMX clock setup is correct (8 MHz HSE bypass,
  * FRACN = 0), so the 8 MHz from the ST-LINK into PH0 is suspected. One real
  * second is therefore ENC_TIMER_FREQ * ENC_CLOCK_CAL timer ticks. Re-measure
- * with the 'Link period' line (main.c) after changing board or ST-LINK. */
-#define ENC_CLOCK_CAL   1.0064f
+ * with the 'Link period' line (main.c) after changing board or ST-LINK.
+ *
+ * 09/11/2026 (Liam chose option (a), CODE session local_48537b3f, L66):
+ * the ST-LINK MCO default is HSI/2 = 8 MHz (internal RC of the ST-LINK MCU,
+ * RN0093), which explains the 0.6 %. The ST-LINK MCO is switched to HSE/5 =
+ * 5 MHz (ST-LINK crystal, +/-50 ppm) and the H7 PLL now takes 5 MHz
+ * (M 1, N 192, P 2, Q 5, VCI range 2, wide VCO, FRACN 0 -> 480 MHz), so the
+ * correction goes back to 1.0. Needs the ST-LINK MCO set to HSE/5 first;
+ * with the old 8 MHz MCO this build runs the VCO out of range. */
+#define ENC_CLOCK_CAL   1.0f
 #define ENC_TICKS_PER_S ((float)ENC_TIMER_FREQ * ENC_CLOCK_CAL)
 #define ENC_PPR         330u       /* pulses/rev on channel A            */
 

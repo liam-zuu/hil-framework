@@ -38,16 +38,32 @@ static int      _fails;
 static uint8_t  _mosi_of[256][SPI1_FRAME_LEN];
 static uint32_t _cyc_of[256];
 
+static int _n_arms;                            /* DMA starts (08/11) */
+static int _fake_nss = 1;                      /* PA4 level, 1 = no frame (08/11) */
+
 HAL_StatusTypeDef HAL_SPI_TransmitReceive_DMA(SPI_HandleTypeDef *h, uint8_t *tx, uint8_t *rx, uint16_t n)
 {
-    (void)h; (void)n;
+    (void)n;
     _armed_tx = tx;
     _armed_rx = rx;
     memcpy(_armed_copy, tx, SPI1_FRAME_LEN);
+    h->State = HAL_SPI_STATE_BUSY_TX_RX;
+    h->Instance->CR1 |= SPI_CR1_SPE;
+    _n_arms++;
     return HAL_OK;
 }
-HAL_StatusTypeDef HAL_SPI_Abort(SPI_HandleTypeDef *h) { (void)h; return HAL_OK; }
-GPIO_PinState HAL_GPIO_ReadPin(GPIO_TypeDef *p, uint16_t pin) { (void)p; (void)pin; return GPIO_PIN_SET; }
+HAL_StatusTypeDef HAL_SPI_Abort(SPI_HandleTypeDef *h)
+{
+    h->State = HAL_SPI_STATE_READY;
+    h->Instance->CR1 &= ~SPI_CR1_SPE;
+    h->ErrorCode = 0;
+    return HAL_OK;
+}
+GPIO_PinState HAL_GPIO_ReadPin(GPIO_TypeDef *p, uint16_t pin)
+{
+    (void)p; (void)pin;
+    return _fake_nss ? GPIO_PIN_SET : GPIO_PIN_RESET;
+}
 uint32_t HAL_GetTick(void) { return 0; }
 
 static void check(int ok, const char *name, const char *why)
@@ -337,6 +353,51 @@ int main(void)
         check(last_idx == (uint16_t)(i0 + S06_LOG_SLOTS) && r.idx == (uint16_t)(i0 + S06_LOG_SLOTS + 11u),
               "log_drop_leaves_index_gap", "dropped records did not consume an index");
         check(fake_irq_disabled == 0, "log_restores_primask", "PRIMASK left set");
+    }
+    /* 10. (08/11, bug HIL-SPI1-SCK-GLITCH) SPI1 left not armed by the HAL
+     * error path after an underrun: SPE cleared, State still BUSY_TX_RX,
+     * ErrorCode UDR | ABORT (0xC0), no error callback, no restart request.
+     * SPI1_Service() must see it and restart, only while NSS is high. */
+    {
+        SPI1_Stats_t s0, s1, s2;
+        frame(60, 0);
+        int arms0 = _n_arms;
+        SPI1_Service();
+        SPI1_GetStats(&s0);
+        check(_n_arms == arms0 && s0.stuck == 0u, "armed_no_restart",
+              "restart while the SPI was armed");
+        _spi_inst.CR1 &= ~SPI_CR1_SPE;               /* HAL error path */
+        _hspi.State = HAL_SPI_STATE_BUSY_TX_RX;
+        _hspi.ErrorCode = 0xC0u;
+        _fake_nss = 0;                               /* the glitched frame still clocking */
+        SPI1_Service();
+        SPI1_GetStats(&s1);
+        check(s1.stuck == s0.stuck + 1u && s1.stuck_err == 0xC0u && _n_arms == arms0,
+              "stuck_seen_waits_nss", "not counted, or restarted while NSS low");
+        SPI1_Service();
+        SPI1_GetStats(&s1);
+        check(s1.stuck == s0.stuck + 1u, "stuck_counted_once", "counted again while the restart waits");
+        _fake_nss = 1;
+        SPI1_Service();
+        SPI1_GetStats(&s2);
+        check(_n_arms == arms0 + 1 && s2.rearms == s0.rearms + 1u
+              && (_spi_inst.CR1 & SPI_CR1_SPE) && _hspi.State == HAL_SPI_STATE_BUSY_TX_RX,
+              "stuck_restarted_at_nss_high", "no restart once NSS went high");
+        frame(61, 0);                                /* link goes on */
+        HIL_State_t st; HIL_TrajRef_t tr;
+        SPI1_GetFrame(&st, &tr);
+        check(st.seq == 61, "frame_after_stuck_restart", "next frame not received after the restart");
+        _hspi.State = HAL_SPI_STATE_READY;           /* not armed, SPE still set */
+        SPI1_Service();
+        SPI1_GetStats(&s2);
+        check(s2.stuck == s0.stuck + 2u && _hspi.State == HAL_SPI_STATE_BUSY_TX_RX,
+              "ready_state_also_restarted", "State READY without a transfer not restarted");
+        uint32_t mn, mx;
+        SPI1_TakeServiceCycles(&mn, &mx);
+        check(mn <= mx, "service_cycles_minmax", "min above max");
+        SPI1_TakeServiceCycles(&mn, &mx);
+        check(mn == 0u && mx == 0u, "service_cycles_reset", "not reset after take");
+        check(fake_irq_disabled == 0, "stuck_restores_primask", "PRIMASK left set");
     }
 #endif
     return _fails ? 1 : 0;

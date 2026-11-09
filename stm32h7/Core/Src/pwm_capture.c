@@ -328,10 +328,19 @@ void PWMCapture_TakeWinHist(uint32_t hist[4], uint32_t *win_min_ticks)
     _win_min = 0xFFFFu;
 }
 
+/* Sign (07/11, bug HIL-PWM-WIRE-SIGN, Liam: "đổi dây lại như cũ luôn từ bây
+ * giờ, sửa code ngay đi"): the bench wires channels 0-3 to the ESP32 pins
+ * named *_LPWM in motor.h (GPIO 3, 41, 9, 21) and channels 4-7 to *_RPWM
+ * (GPIO 8, 40, 46, 47), see pwm_capture.h. On the car the *_RPWM pin drives
+ * the BTS7960 RPWM input, so the driver-equivalent duty is channel w+4 minus
+ * channel w. This is the input the plant expects (rpi5/params.py
+ * motor_polarity from S01, fwsim/fw_sim.c duty = RPWM pin - LPWM pin). The
+ * old sign (channel w minus w+4) fed the plant the opposite duty and the
+ * first closed loop ran away (CLOSED_LOOP/2026-11-07_run01). */
 void PWMCapture_GetDuty(float *duty_out)
 {
     for (uint8_t w = 0; w < PWM_NUM_WHEELS; w++)
-        duty_out[w] = _ch[w].duty - _ch[w + 4].duty;
+        duty_out[w] = _ch[w + 4].duty - _ch[w].duty;
 }
 
 void PWMCapture_GetStats(PWMCapture_Stats_t *out)

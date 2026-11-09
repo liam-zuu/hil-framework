@@ -22,6 +22,17 @@ void IbusPort_Tick(void);                 /* TIM6 10 kHz callback */
  * link lost. Frames go out only while the gate is 1 and the last SPI1
  * frame is at most IBUS_LINK_TIMEOUT_MS old. */
 void IbusPort_SetEnabled(int on);
+/* I8: SWA of the frames that start from now on (main loop, from MOSI byte
+ * 20 bit 3 of every applied frame; 0 at link lost). 0 at boot. */
+void IbusPort_SetSwa(int on);
+/* I8-R2-1: 1 once after the TIM6 tick saw the link timed out (last SPI1
+ * frame older than IBUS_LINK_TIMEOUT_MS), then 0 until the next timeout.
+ * Main loop only: called before applying a frame, a 1 restarts the SWA
+ * filter. Stays 0 when UART4 is not set up (the tick does not run). */
+int  IbusPort_TakeTimeout(void);
+/* SWA of the last iBUS frame started (1 = 2000); 0 before any or when
+ * UART4 is not set up. For MISO status bit 0 (HIL_STATUS_SWA). */
+int  IbusPort_LastSwa(void);
 int  IbusPort_ReadWindow(ibus_gen_window_t *out);
 
 #endif /* IBUS_GEN_PORT_H */

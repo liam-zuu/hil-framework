@@ -15,7 +15,12 @@ shows the lifted plant is bit-identical. One run per test (the plant has no rand
 input, seeds give identical runs). Each case runs without IMU reports (as
 s02_groupA_sim.py) and with 20 Hz IMU reports (wz from the gyro, heading loop on).
 
-  python fwsim/slip_a_check.py --out D:\\CLAUDE_THESIS\\05_DATA\\results\\SLIP_A\\<date>_runNN
+  python fwsim/slip_a_check.py --out D:\\CLAUDE_THESIS\\05_DATA\\results\\SLIP_A\\<date>_runNN [--vel-loop-only]
+
+--vel-loop-only (Liam 09/11, CODE): position loop, (a) and (d) off (fwsim.vel_loop_only), as the
+thresholds were set for; without it the firmware defaults run (position loop on since AGV feat/pos-loop),
+where SLIP_A/2026-11-09_run01 failed 3/384 rows (A-F1 PID noimu e_vy) and its analysis/ showed the
+position loop, not the plant, makes the difference. meta.yaml `loops` records which.
 """
 import argparse
 import csv
@@ -40,7 +45,7 @@ import s02_metrics                                      # noqa: E402
 
 FLOOR_METRICS = ('e_vx', 'e_vy', 'e_wz', 'rms_w_err')
 INFO_METRICS = ('pwm_tv', 'sat_pct')
-MU_NOMINAL = 0.5            # params.py default mu_hd [ASSUMPTION — pending MU_FLOOR]
+MU_NOMINAL = 0.436          # params.py default mu_hd [measured, MU_FLOOR/2026-11-09_run02 mean; 0.5 assumed before 09/11]
 MU_NO_SLIP = 5.0
 
 
@@ -88,6 +93,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--out', required=True)
     ap.add_argument('--tests', default='', help='comma list of test IDs (default: every ground test of group A)')
+    ap.add_argument('--vel-loop-only', action='store_true',
+                    help='position loop, (a) and (d) off in the firmware (fwsim.vel_loop_only): the checks of the '
+                         'plant, thresholds set 28/10 for the velocity loop (Liam 09/11, CODE: "làm cả 1 và 2 đi"); '
+                         'default = firmware defaults (position loop on since AGV feat/pos-loop, L36)')
     a = ap.parse_args()
     if os.path.isdir(a.out) and os.listdir(a.out):
         sys.exit(f'{a.out} already holds data: use a new folder.')
@@ -95,6 +104,8 @@ def main():
     commit, branch, dirty = git_info()
 
     fw = fwsim.FirmwareSim()
+    pos_default = fwsim.pos_meta(fw)                 # the firmware defaults, before any run (None: no pos_ctrl.c)
+    fw_params = fwsim.vel_loop_only(fw) if a.vel_loop_only else None
     tests = [t for t in (a.tests.split(',') if a.tests else GROUP_A) if t not in LIFTED_TESTS]
     vmap, n0 = variants()
     t_start = time.time()
@@ -106,7 +117,8 @@ def main():
                     spec = GROUP_A[test_id]
                     sp = (lambda s: lambda t: get_body_velocity(t, s) if t < s.duration else (0.0, 0.0, 0.0))(spec)
                     p = make()
-                    log = fwsim.simulate(fw, sp, spec.duration + STOP_TAIL_S, p, seed=1, mode=ctrl, imu=imu)
+                    log = fwsim.simulate(fw, sp, spec.duration + STOP_TAIL_S, p, seed=1, mode=ctrl, imu=imu,
+                                         fw_params=fw_params)
                     path = os.path.join(a.out, 'raw', f'{test_id}_{ctrl}_{imu_name}_{vname}.csv')
                     with open(path, 'w', newline='') as f:
                         w = csv.writer(f)
@@ -180,6 +192,7 @@ firmware:
   rpi5: null
 tests: {json.dumps(tests)}
 controllers: [PID, ADRC]          # firmware default gains
+loops: {{vel_loop_only: {str(bool(a.vel_loop_only)).lower()}, fw_params: {json.dumps(fw_params)}, pos_loop_firmware_default: {json.dumps(pos_default)}}}
 imu: [none, 20 Hz reports noise-free (rpi5/imu_model.py)]
 variants: {{rigid: "ground_model rigid", tr_mu5: "traction mu_hd {MU_NO_SLIP}", tr_nom: "traction mu_hd {MU_NOMINAL}, nsub auto = {n0}", tr_nom_2n: "traction mu_hd {MU_NOMINAL}, nsub {2 * n0}", tr_nom_ws2: "traction mu_hd {MU_NOMINAL}, omega_s 0.05 (nsub auto)"}}
 checks: {json.dumps([dict(check=c, variant=v, base=bb, limit_x_qrms=k) for c, v, bb, k in CHECKS])}
