@@ -166,6 +166,7 @@ def test_mu_rule_mid_when_every_point_satisfies(tmp_path):
     d = _s03_dir(tmp_path, _runs())
     dec, rep = s4.mu_rule(str(d), 'PID', list(s3.SPEEDS), [0.4, 0.5, 0.6])
     assert dec == 'mid' and rep['points_checked'] == 257 * 3 and rep['points_failing'] == 0
+    assert rep['n_point_ids'] == 257 and rep['point_ids'] == list(range(257))     # S04 v6 9.4: to lock.yaml
 
 
 @pytest.mark.parametrize('mod, why', [

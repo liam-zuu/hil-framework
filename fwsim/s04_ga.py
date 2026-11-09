@@ -279,7 +279,10 @@ def mu_rule(s03_dir, ctrl, gate, mu_levels):
                 why.append('dY3 > 20 % of the reference')
         if why:
             bad.append(dict(point_id=pid, box=box, v=v, why=why))
-    return ('mid' if not bad and n else 'all'), dict(points_checked=n, points_failing=len(bad), first=bad[:5])
+    # S04 v6 section 9 item 4: the point_id list actually used goes to lock.yaml (via mu_rule_report)
+    used = sorted(int(p) for p, _ in design)
+    return ('mid' if not bad and n else 'all'), dict(points_checked=n, points_failing=len(bad), first=bad[:5],
+                                                     n_point_ids=len(used), point_ids=used)
 
 
 # ── one candidate ────────────────────────────────────────────────────────────────────

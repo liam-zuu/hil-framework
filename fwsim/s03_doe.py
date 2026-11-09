@@ -602,6 +602,15 @@ def git_state(repo):
         return dict(commit='UNKNOWN', dirty=True, modified=[str(e)])
 
 
+def _rel_or_abs(p, start):
+    """Path of p relative to start with '/', or the absolute path when they are on different
+    drives (Windows: relpath raises ValueError)."""
+    try:
+        return os.path.relpath(p, start).replace(os.sep, '/')
+    except ValueError:
+        return os.path.abspath(p).replace(os.sep, '/')
+
+
 def file_git_state(p):
     """Git state of one file (S03 v8 section 8.7): tracked, unmodified, last commit touching it."""
     d = os.path.dirname(os.path.abspath(p))
@@ -982,7 +991,7 @@ o1: {json.dumps(dict(A=o1.A, a_r=o1.A_R, D=o1.D, D_d=o1.D, t_d=o1.T_D, t_late=o1
 sweep_run_error_reruns: {json.dumps([n for n in rerun_notes if n['point'] is None], default=str)}
 planned_runs_per_controller: {json.dumps(PLANNED_RUNS)}   # S03 v8 3.2, 7 (rows actually run: sealed/, sealed_test/)
 test_points:            # S03 v8 sections 3.2, 7, 8.7: the committed file is the reference
-  file: {json.dumps(os.path.relpath(a.test_points, os.path.join(HERE, '..')).replace(os.sep, '/'))}
+  file: {json.dumps(_rel_or_abs(a.test_points, os.path.join(HERE, '..')))}
   git: {json.dumps(file_git_state(a.test_points))}
   sha256: {tp_sha}
   generation: {json.dumps(tp_gen)}
