@@ -38,6 +38,11 @@ mục, log serial ba phiên đầu bị ghi đè): mỗi phiên một thư mục
 phiên mở ở chế độ chỉ tạo mới; hai `--run` cùng tên bị từ chối. `flash/` (`tools/h7_flash.py`) được để sẵn.
 `--analyze-only --write-summary` ghi `bench_summary_analyze.json`.
 
+Nhận dạng firmware ESP32 (Liam 09/11, CODE): AGV in `#fw sha=.. dirty=.. env=..` lúc khởi động và gửi
+`#fw,sha=..` qua UDP ở đầu mỗi lượt (AGV `scripts/build_id.py`, mọi env). Công cụ ghi `boot.esp32_fw`,
+`runs[].esp32_fw` vào `session.json` và in ở dòng tổng kết; `--expect-esp32 SHA`: khác SHA, dirty=1 hay không
+thấy dòng thì `--boot` dừng mã 2, lượt không sạch (`meta.yaml` ghi commit ESP32 theo dòng này).
+
 Dừng Pi giữa lượt (B, cùng lời Liam; bài học run05 b3_kill: `pkill -f` khớp cả shell bọc ngoài, TERM thành STOP
 êm): `--pi-kill TÊN=GIÂY` (SIGKILL `run_hil.py` và mọi tiến trình con: Pi chết, không STOP, không frame log),
 `--pi-stop TÊN=GIÂY` (SIGTERM: STOP êm). Công cụ đọc PID `run_hil.py` từ `<pi-dir>/TÊN.pid` (do lệnh lượt ghi), kiểm
@@ -194,6 +199,40 @@ def h7_window(lines):
                 loop_over1ms=sum(x[1] for x in lp) if lp else None)
 
 
+FW_RE = re.compile(r'#fw[ ,]sha=([0-9a-f]+|unknown)[ ,]dirty=([01])[ ,]env=([A-Za-z0-9_\-]+)')
+
+
+def fw_lines(lines):
+    """ESP32 firmware id (Liam 09/11, CODE: AGV scripts/build_id.py, every env): the boot line
+    `#fw sha=.. dirty=.. env=..` (serial) and the UDP line `#fw,sha=..,dirty=..,env=..` (agv_logger
+    events file, 3 copies at each run start). Distinct ids in order: [{sha, dirty, env}]."""
+    out = []
+    for s in lines:
+        m = FW_RE.search(s)
+        if m:
+            d = dict(sha=m[1], dirty=int(m[2]), env=m[3])
+            if d not in out:
+                out.append(d)
+    return out
+
+
+def fw_problem(fws, expect):
+    """Why the ESP32 firmware seen does not match --expect-esp32 (a SHA prefix), else None. Not seen, more
+    than one id, another SHA, or dirty=1 are all refused: meta.yaml takes the commit from this line."""
+    if not expect:
+        return None
+    if not fws:
+        return 'không thấy dòng #fw của ESP32 (firmware chưa có nhận dạng, hay log thiếu)'
+    if len(fws) > 1:
+        return f'ESP32 có {len(fws)} nhận dạng firmware khác nhau: {fws}'
+    f, e = fws[0], expect.lower()
+    if f['sha'] == 'unknown' or not (f['sha'].startswith(e) or e.startswith(f['sha'])):   # either is a prefix
+        return f"ESP32 chạy {f['sha']} (env {f['env']}), --expect-esp32 {expect}"
+    if f['dirty']:
+        return f"ESP32 build từ cây bẩn (dirty=1, {f['sha']} env {f['env']})"
+    return None
+
+
 def boot_motor_on(lines):
     """I8-10: `Motor enabled` lines of the ESP32 in the --boot step (texts)."""
     return sum(1 for s in lines if 'Motor enabled' in s)
@@ -278,6 +317,8 @@ def summary_line(r):
         s += f" | rpm lệch max {max(w['dev_max'] for w in r['rpm']['wheels'].values()):.1f}"
     if r['h7'] and r['h7']['loop_max_us'] is not None:
         s += f" | H7 Loop max {r['h7']['loop_max_us']:.1f} µs"
+    for f in r.get('esp32_fw') or []:
+        s += f" | ESP32 #fw {f['sha']} {f['env']}" + (' DIRTY' if f['dirty'] else '')
     sw = r.get('swa')
     if sw and sw.get('cmd_on_frames'):
         s += (f" | SWA bật {sw['cmd_on_frames']} frame, đổi {len(sw['cmd_changes'])} lần,"
@@ -453,11 +494,17 @@ def bench(a):
             miss = [k for k in BOOT_NEED if not any(k in s for s in boot)]
             # I8-10: the 4 s before the reset count too (the old ESP32 run sees the Pi start first)
             motor_on = boot_motor_on([s for _, s in esp.since(t_pi)])
+            fws = fw_lines(boot)
             sess['boot'] = dict(t_pi=t_pi, t_reset=t_reset, pi_exit=boot_rc, missing=miss, motor_enabled=motor_on,
-                                controller=next((s.strip() for s in boot if 'Controller:' in s), None))
+                                controller=next((s.strip() for s in boot if 'Controller:' in s), None),
+                                esp32_fw=fws)
             print(f"khởi động ESP32: {sess['boot']['controller']}, thiếu {miss or 'không'}, Pi mã {boot_rc}, "
-                  f"Motor enabled {motor_on} lần")
+                  f"Motor enabled {motor_on} lần, #fw {fws or 'không có'}")
             if miss or boot_rc != 0:
+                return 2, []
+            bad = fw_problem(fws, a.expect_esp32)
+            if bad:
+                print(f'DỪNG: {bad}')
                 return 2, []
             if motor_on:
                 # I8-10: the boot step runs an omega mode, so --swa auto sends SWA off; motors on means the H7
@@ -488,6 +535,9 @@ def bench(a):
                 scp(a.host, f'{a.pi_dir}/{name}.csv*', os.path.join(a.out, 'pi'))
                 scp(a.host, f'{a.pi_dir}/{name}_logger.txt', os.path.join(a.out, 'pi'))
             run_rec = dict(name=name, args=args, t0=t0, t1=t1, ssh_exit=rc)
+            ev = os.path.join(a.out, 'pi', f'{name}.csv.events.txt')
+            run_fw = fw_lines(open(ev, encoding='utf-8', errors='replace').read().splitlines()) if os.path.exists(ev) else []
+            run_rec['esp32_fw'] = run_fw                 # from the UDP log of this run (none with --no-logger)
             if stop_rec:
                 run_rec['pi_stop'] = stop_rec
             sess['runs'].append(run_rec)
@@ -507,9 +557,14 @@ def bench(a):
                 continue
             r = analyze_run(a.out, name, h7.since(t0, t1 + 1.0), esp.since(t0, t1 + 1.0))
             r['ssh_exit'] = rc
+            r['esp32_fw'] = run_fw
             if rc != 0:
                 r['clean'] = False
                 r['why'].append(f'Pi mã thoát {rc}')
+            bad = fw_problem(run_fw, a.expect_esp32) if not a.no_logger else None
+            if bad:
+                r['clean'] = False
+                r['why'].append(bad)
             if stop_rec:
                 r['pi_stop'] = stop_rec
             results.append(r)
@@ -562,6 +617,9 @@ def main(argv=None):
     ap.add_argument('--run-timeout', type=float, default=600.0, help='giới hạn mỗi lượt ssh, giây')
     ap.add_argument('--pi-kill', action='append', default=[], metavar='TÊN=GIÂY',
                     help='sau GIÂY từ lúc bắt đầu lượt TÊN: SIGKILL run_hil.py và mọi tiến trình con (rút Pi)')
+    ap.add_argument('--expect-esp32', metavar='SHA',
+                    help='commit ESP32 phải chạy (tiền tố SHA): dòng #fw lúc --boot hoặc trong log UDP của lượt '
+                         'khác SHA, dirty=1, hay không có thì --boot dừng mã 2, lượt không sạch')
     ap.add_argument('--pi-stop', action='append', default=[], metavar='TÊN=GIÂY',
                     help='sau GIÂY từ lúc bắt đầu lượt TÊN: SIGTERM run_hil.py (STOP êm: setpoint 0 rồi hết lượt)')
     ap.add_argument('--analyze-only', action='store_true',

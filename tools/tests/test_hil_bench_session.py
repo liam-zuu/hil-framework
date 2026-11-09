@@ -179,7 +179,8 @@ def test_i8_10_boot_counts_motor_on_from_the_pi_start(tmp_path, monkeypatch):
     monkeypatch.setattr(hb, 'SerialLog', _FakeSerial)
     boot_ok = [(105.0, 'BNO085 init OK'), (105.1, 'Controller: LADRC'), (105.2, 'Boot done')]
     a = SimpleNamespace(out=str(tmp_path / 's1'), host='h', pi_dir='~/r', h7_port='COM3', esp_port='COM9',
-                        boot=True, run=[], no_logger=True, run_timeout=10, pi_kill=[], pi_stop=[])
+                        boot=True, run=[], no_logger=True, run_timeout=10, pi_kill=[], pi_stop=[],
+                        expect_esp32=None)
     _FakeSerial.lines = {'COM9': [(102.0, 'I (9) MOTOR: Motor enabled')] + boot_ok}   # before the reset (104.0)
     assert hb.bench(a) == (2, [])
     clock['t'] = 100.0
@@ -220,10 +221,67 @@ def _bench_env(monkeypatch, tmp_path, ssh_reply=None, out='s', **kw):
     monkeypatch.setattr(hb.threading, 'Timer', FakeTimer)
     _FakeSerial.lines = {}
     a = SimpleNamespace(out=str(tmp_path / out), host='h', pi_dir='~/r', h7_port='COM3', esp_port='COM9',
-                        boot=False, run=[], no_logger=True, run_timeout=10, pi_kill=[], pi_stop=[])
+                        boot=False, run=[], no_logger=True, run_timeout=10, pi_kill=[], pi_stop=[],
+                        expect_esp32=None)
     for k, v in kw.items():
         setattr(a, k, v)
     return a, calls, timers
+
+
+# ── #fw: ESP32 firmware id (Liam 09/11, CODE) ──
+
+FW_BOOT = 'I (1301) MAIN: #fw sha=1a2b3c4d5e6f dirty=0 env=ladrc'
+FW_UDP = '2026-11-09T12:00:00.000001 #fw,sha=1a2b3c4d5e6f,dirty=0,env=ladrc'
+
+
+def test_fw_lines_both_forms_and_distinct():
+    fw = dict(sha='1a2b3c4d5e6f', dirty=0, env='ladrc')
+    assert hb.fw_lines([FW_BOOT, 'x', FW_UDP, FW_UDP]) == [fw]
+    assert hb.fw_lines(['I (1) S06: #fw sha=unknown dirty=1 env=s06_load']) == [dict(sha='unknown', dirty=1, env='s06_load')]
+    assert hb.fw_lines(['#run_end,seq=3', 'Controller: ADRC']) == []
+
+
+@pytest.mark.parametrize('fws, expect, ok', [
+    ([], None, True),                                                      # no --expect-esp32: no rule
+    ([dict(sha='1a2b3c4d5e6f', dirty=0, env='ladrc')], '1a2b3c4', True),   # short prefix
+    ([dict(sha='1a2b3c4d5e6f', dirty=0, env='ladrc')], '1a2b3c4d5e6f7788', True),   # longer full SHA
+    ([dict(sha='1a2b3c4d5e6f', dirty=0, env='ladrc')], 'ffd4a07', False),
+    ([dict(sha='1a2b3c4d5e6f', dirty=1, env='ladrc')], '1a2b3c4', False),  # dirty build
+    ([], '1a2b3c4', False),                                                # old firmware: no line
+    ([dict(sha='unknown', dirty=1, env='ladrc')], 'unknown', False),
+    ([dict(sha='1a2b3c4d5e6f', dirty=0, env='ladrc'), dict(sha='aaaaaaaaaaaa', dirty=0, env='ladrc')],
+     '1a2b3c4', False),                                                    # two ids in one log
+])
+def test_fw_problem(fws, expect, ok):
+    assert (hb.fw_problem(fws, expect) is None) == ok
+
+
+def test_fw_boot_mismatch_stops_and_is_recorded(tmp_path, monkeypatch):
+    boot = [(105.0, 'BNO085 init OK'), (105.1, 'Controller: ADRC'), (105.15, FW_BOOT), (105.2, 'Boot done')]
+    for expect, code in (('ffd4a07', 2), ('1a2b3c4', 0)):
+        a, calls, _ = _bench_env(monkeypatch, tmp_path, out=f'b_{expect}', boot=True, expect_esp32=expect)
+        monkeypatch.setattr(hb.subprocess, 'Popen', lambda *x, **k: SimpleNamespace(wait=lambda timeout=None: 0))
+        _FakeSerial.lines = {'COM9': boot}
+        assert hb.bench(a)[0] == code
+        import json as _j
+        s = _j.load(open(os.path.join(a.out, 'session.json'), encoding='utf-8'))
+        assert s['boot']['esp32_fw'] == [dict(sha='1a2b3c4d5e6f', dirty=0, env='ladrc')]
+
+
+def test_fw_from_the_udp_events_of_a_run(tmp_path, monkeypatch):
+    def fake_scp(host, remote, local_dir):
+        if remote.endswith('.csv*'):                 # agv_logger files of the run
+            with open(os.path.join(local_dir, 'x.csv.events.txt'), 'w', encoding='utf-8') as f:
+                f.write(FW_UDP + '\n' + FW_UDP + '\n2026-11-09T12:00:09 #run_end,seq=9\n')
+        return 0
+    reply = lambda c: (0, '## HEAD\nabc') if 'git' in c else (1, '')  # noqa: E731
+    a, calls, _ = _bench_env(monkeypatch, tmp_path, reply, run=['x=--test A-L1'], no_logger=False,
+                             expect_esp32='ffd4a07')
+    monkeypatch.setattr(hb, 'scp', fake_scp)
+    hb.bench(a)
+    import json as _j
+    s = _j.load(open(os.path.join(a.out, 'session.json'), encoding='utf-8'))
+    assert s['runs'][0]['esp32_fw'] == [dict(sha='1a2b3c4d5e6f', dirty=0, env='ladrc')]
 
 
 @pytest.mark.parametrize('old', ['session.json', 'bench_summary.json', 'h7_COM3.txt', 'esp32_COM5.txt',
