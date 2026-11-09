@@ -25,6 +25,19 @@
 #include "s06_log.h"
 #include "s06_load.h"
 #include "ibus_gen_port.h"
+/* Firmware id (#fw, Liam 09/11, CODE; STATUS_CODE L61 b): fw_id_gen.h is written by the CubeIDE pre-build
+ * step (stm32h7/scripts/fw_id.py), not in git. A build without it (arm-gcc check, no pre-build) prints
+ * sha=unknown dirty=1, which hil_bench_session --expect-h7 refuses. */
+#if defined(__has_include)
+#  if __has_include("fw_id_gen.h")
+#    include "fw_id_gen.h"
+#  endif
+#endif
+#ifndef FW_GIT_SHA
+#  define FW_GIT_SHA   "unknown"
+#  define FW_GIT_DIRTY 1
+#  define FW_ENV       "none"
+#endif
 #include <stdio.h>
 /* USER CODE END Includes */
 
@@ -191,6 +204,7 @@ typedef struct {
     BnoPort_Stats_t    bs;
     uint8_t            ibus_new;
     ibus_gen_window_t  iw;
+    uint8_t            fw_line;                  /* #fw line in this block (every 10 s) */
     /* main-loop passes since the last block (L39): longest pass, longest
      * pass that did debug work (copy or one line), passes over 500 us and
      * over 1 ms, passes; DWT cycles, preemption by interrupts included */
@@ -200,7 +214,7 @@ typedef struct {
 enum {
     DS_W1 = 0, DS_PWM = 4, DS_DMA0 = 5, DS_DMA_LAST = 13,   /* PWMdma: 9 sections */
     DS_RELAY, DS_LINK, DS_SPIFIX, DS_LOOP, DS_FRAME, DS_S06LOG, DS_BNO1, DS_BNO2,
-    DS_IBUS, DS_END
+    DS_FW, DS_IBUS, DS_END
 };
 
 static _dbg_snap_t _ds;
@@ -220,6 +234,8 @@ static void _dbg_print_next(void)
 {
     const _dbg_snap_t *d = &_ds;
     int s = _ds_step;
+    if (s == DS_FW && !d->fw_line)
+        s = DS_IBUS;                             /* no #fw line in this block: the IBUS step, same pass */
     if (s >= DS_W1 && s < DS_PWM) {
         int i = s - DS_W1;
         printf("W%d: omega=%6.2f dir=%2d hp=%5lu meas=%7.2fHz exp=%7.2fHz\r\n",
@@ -338,6 +354,10 @@ static void _dbg_print_next(void)
                (unsigned long)bs->missed_edge, (unsigned long)bs->arm_fail,
                (unsigned long)bs->spi_errors, (unsigned long)bs->max_clocked,
                (unsigned long)bs->samples);
+    } else if (s == DS_FW) {
+        /* firmware id (Liam 09/11, CODE): same text as the boot line, so a log that starts after the
+         * boot still shows which build runs (hil_bench_session --expect-h7) */
+        printf("#fw sha=%s dirty=%d env=%s\r\n", FW_GIT_SHA, (int)FW_GIT_DIRTY, FW_ENV);
     } else if (s == DS_IBUS) {
         /* iBUS 10 s summary (S06 T12 (b)): P = frame start to frame start
          * in us (DWT, real time), printed in ms with 0.01 ms; tgap = longest
@@ -430,6 +450,7 @@ int main(void)
   setvbuf(stdout, NULL, _IONBF, 0);
 
   printf("\r\n--- H753 HIL boot ---\r\n");
+  printf("#fw sha=%s dirty=%d env=%s\r\n", FW_GIT_SHA, (int)FW_GIT_DIRTY, FW_ENV);   /* firmware id */
   printf("pclk1=%lu  pclk2=%lu\r\n",
          HAL_RCC_GetPCLK1Freq(), HAL_RCC_GetPCLK2Freq());
 
@@ -486,6 +507,7 @@ int main(void)
   /* debug block state, kept across blocks (were statics inside the block) */
   static uint32_t _edges_last[PWM_NUM_CHANNELS];
   static uint32_t _pwm_dbg_ms = 0;
+  static uint32_t _fw_dbg_ms = 0;    /* #fw line every 10 s in the debug block */
   static uint32_t _frames_last = 0;
   static uint32_t _ibus_win_last = 0;
   static ibus_swa_filter_t _swa_f;     /* I8-3: SWA only after 3 frames in a row agree */
@@ -611,6 +633,8 @@ int main(void)
         PWMCapture_GetDuty(d->duty);
         uint32_t pwm_el = HAL_GetTick() - _pwm_dbg_ms;
         d->pwm_line = (pwm_el >= 2000u);
+        d->fw_line = (uint8_t)((HAL_GetTick() - _fw_dbg_ms) >= 10000u);
+        if (d->fw_line) _fw_dbg_ms = HAL_GetTick();
         if (d->pwm_line) {
             _pwm_dbg_ms += pwm_el;
             PWMCapture_GetStats(&d->ps);
