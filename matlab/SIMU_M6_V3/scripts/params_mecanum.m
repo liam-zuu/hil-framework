@@ -11,8 +11,8 @@ function params = params_mecanum()
     params.r      = 0.0485;   % Wheel radius (m) [Liam confirmed 07/11/2026, CODE session]
     params.lx     = 0.12;     % Longitudinal half-distance: center→wheel along body X (m) [Liam confirmed 07/11/2026, CODE session]
     params.ly     = 0.12;     % Lateral half-distance: center→wheel along body Y (m) [Liam confirmed 07/11/2026, CODE session]
-    params.M      = 4;        % Total mass (kg) [not weighed yet: weigh the car with battery (Liam 07/11)]
-    params.Iz     = (1/12) * 4 * ((2*0.12)^2 + (2*0.12)^2);  % Body yaw inertia (kg·m²) = 0.0384 [calculated: rectangular body]
+    params.M      = 4.12;     % Total mass (kg) [measured: car with battery 4120 g, Liam 09/11/2026, CODE session]
+    params.Iz     = (1/12) * params.M * ((2*params.lx)^2 + (2*params.ly)^2);  % Body yaw inertia (kg·m²) = 0.039552 [calculated: rectangular body; 0.0384 at M = 4]
     params.J_w    = 0.00247;  % Wheel inertia (kg·m²) [from spec]
     params.b_w    = 0.002;    % Wheel viscous friction (N·m·s/rad) [ASSUMPTION — not in spec]
     params.g      = 9.81;     % Gravity (m/s²)
@@ -168,7 +168,7 @@ function params = params_mecanum()
     % reference only since 21/10, method A is not ported (Liam 28/10, design note Q5).
     % Lines kept here so the two parameter files stay in step.
     params.ground_model = 'rigid';         % MATLAB has 'rigid' only; Python default is 'traction' since 28/10
-    params.mu_hd        = 0.5 * ones(1,4); % effective mu = F_max/(m g) of the force-gauge test [ASSUMPTION — pending MU_FLOOR]
+    params.mu_hd        = 0.436 * ones(1,4); % effective mu = F_max/(m g) of the force-gauge test [measured: mean of 10 runs, 05_DATA/results/MU_FLOOR/2026-11-09_run02; 0.5 assumed before 09/11]
     params.slip_omega_s = 0.1;             % traction smoothing band (rad/s) [ASSUMPTION — numerical smoothing]
 
     %% --- Load Disturbance (M6) ---

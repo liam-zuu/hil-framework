@@ -45,7 +45,7 @@ import s02_metrics                                      # noqa: E402
 
 FLOOR_METRICS = ('e_vx', 'e_vy', 'e_wz', 'rms_w_err')
 INFO_METRICS = ('pwm_tv', 'sat_pct')
-MU_NOMINAL = 0.5            # params.py default mu_hd [ASSUMPTION — pending MU_FLOOR]
+MU_NOMINAL = 0.436          # params.py default mu_hd [measured, MU_FLOOR/2026-11-09_run02 mean; 0.5 assumed before 09/11]
 MU_NO_SLIP = 5.0
 
 

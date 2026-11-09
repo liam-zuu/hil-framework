@@ -47,15 +47,39 @@ def step(vx=0.0, vy=0.0, wz=0.0, t0=0.5):
     return lambda t: (vx, vy, wz) if t >= t0 else (0.0, 0.0, 0.0)
 
 
+def mass(p, m):
+    """The plant with mass m and Iz from it (params.py formula), kinematics recomputed."""
+    p.M = m
+    p.Iz = (1.0 / 12.0) * m * ((2 * p.lx) ** 2 + (2 * p.ly) ** 2)
+    p._compute_kinematics()
+    return p
+
+
 @pytest.mark.parametrize('ctrl', ['PID', 'ADRC'])
 def test_no_flag_on_figure8_with_even_grip(fw, ctrl):
-    """O1 figure 8 at 0.8 m/s, mu 0.5 on all wheels: the residual stays within the count
-    quantization (|res| <= 4) and the flag never turns on."""
+    """O1 figure 8 at 0.8 m/s, mu 0.5 on all wheels, M 4.0 kg (the plant this bound was checked
+    on): the residual stays within the count quantization (|res| <= 4) and the flag never turns on.
+    Pinned to M 4.0, mu 0.5 on 09/11 when params.py took the weighed M 4.12 and the measured
+    mu 0.436: there ADRC reaches |res| = 5 on 1-6 samples (real slight slip, not quantization;
+    probe 09/11), the flag still never on (next test)."""
     sch = o1.Schedule(0.8)
-    log = fwsim.simulate(fw, sch.setpoint, sch.Tcmd + 2.0, plant(), seed=1, mode=ctrl, imu=IMU)
+    log = fwsim.simulate(fw, sch.setpoint, sch.Tcmd + 2.0, mass(plant(), 4.0), seed=1, mode=ctrl, imu=IMU)
     ev = ws(log, 'ws_eval') == 1
     assert ev.mean() > 0.5
     assert np.abs(ws(log, 'ws_res')[ev]).max() <= 4
+    assert ws(log, 'ws_on_count')[-1] == 0
+
+
+@pytest.mark.parametrize('ctrl', ['PID', 'ADRC'])
+@pytest.mark.parametrize('mu', [0.413, 0.436, 0.473])
+def test_no_flag_on_figure8_at_measured_floor(fw, ctrl, mu):
+    """Same figure 8 on the plant defaults (weighed M) at the three measured mu levels of the
+    task floor (MU_FLOOR 2026-11-09_run02 min, mean, max): the slip flag never turns on."""
+    p = plant(mu)
+    assert p.M == pytest.approx(4.12)
+    sch = o1.Schedule(0.8)
+    log = fwsim.simulate(fw, sch.setpoint, sch.Tcmd + 2.0, p, seed=1, mode=ctrl, imu=IMU)
+    assert (ws(log, 'ws_eval') == 1).mean() > 0.5
     assert ws(log, 'ws_on_count')[-1] == 0
 
 

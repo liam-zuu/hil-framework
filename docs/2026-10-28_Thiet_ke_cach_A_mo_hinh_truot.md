@@ -83,7 +83,7 @@ Không đổi một dòng nào: kê bánh thì không có tiếp xúc. Phát l�
 | Tên | Mặc định | Nhãn |
 |---|---|---|
 | `ground_model` | `'rigid'` (plant hiện tại) hoặc `'traction'` (A) | xem câu hỏi Q3 |
-| `mu_hd` | 0,5 cho cả 4 bánh, nhận mảng 4 phần tử | `[ASSUMPTION — chờ MU_FLOOR]` |
+| `mu_hd` | ~~0,5~~ **0,436** cho cả 4 bánh, nhận mảng 4 phần tử | ~~`[ASSUMPTION — chờ MU_FLOOR]`~~ *[09/11: đo, trung bình 10 lượt sàn trong nhà, `05_DATA/results/MU_FLOOR/2026-11-09_run02` (0,413–0,473); cùng lúc M 4,0 → 4,12 kg (cân), Iz tính lại 0,039552]* |
 | `slip_omega_s` | 0,1 rad/s | `[ASSUMPTION — độ trơn số học]`; kiểm độ nhạy ở T-A7 |
 | `slip_nsub` | chọn theo mục 4 | `[calculated]` |
 

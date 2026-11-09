@@ -14,7 +14,7 @@ Criterion written BEFORE the run (Claude's proposal, Liam may change it): "sensi
 speed, a scaled b0 changes 'completed' versus factor 1.0, changes e_perp_max <= D versus factor
 1.0, or changes e_perp_max by more than 50 % of the factor-1.0 value. Simulation numbers only.
 
-  python fwsim/b0_sensitivity.py --ground traction --mu 0.5 --out <05_DATA/results/B0_SENS/<date>_runNN>
+  python fwsim/b0_sensitivity.py --ground traction --mu 0.436 --out <05_DATA/results/B0_SENS/<date>_runNN>
 """
 import argparse
 import csv
