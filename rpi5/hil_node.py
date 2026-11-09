@@ -37,7 +37,8 @@ from typing import Optional
 from timing import PrecisionTimer, set_realtime, pin_cpu, lock_memory
 from gpio_sync import GPIOSync
 from spi_master import SPIMaster
-from protocol import encode_state, decode_torques, TRAJ_VALID, TRAJ_NEW, OFS_MISO_SEQ, CMD_SWA_ON
+from protocol import (encode_state, decode_torques, TRAJ_VALID, TRAJ_NEW, OFS_MISO_SEQ, CMD_SWA_ON,
+                      miso_check, MISO_OK, MISO_EMPTY)
 from plant_interface import PlantInterface, MockPlant
 from mecanum_plant import MecanumPlant
 from imu_model import imu_from_plant
@@ -59,8 +60,12 @@ END_TAIL_FRAMES = 30
 # I8-R2-2 (Codex round 2): 30 frames are not 30 ms when the timer catches up on late deadlines (it sends
 # them back to back), so the tail also lasts END_TAIL_MS on time.monotonic_ns, from the END frame on.
 END_TAIL_MS = 30
+# A3: frames j < 2 are not checked: the H7 answers frame N in frame N + 2 and the first two frames still
+# carry the reply staged in the previous link period (as s06_frames_decode `start_leftover`, L50: "không
+# tính frame rỗng ở đầu log trước câu trả lời đầu tiên (j < 2)")
+MISO_SKIP_FRAMES = 2
 
-log = logging.getLogger('hil.node')
+log =logging.getLogger('hil.node')
 
 
 def plant_to_frame_state(state: list) -> list:
@@ -184,6 +189,14 @@ class HILNode:
         self._tail_t0_ns: Optional[int] = None  # I8-R2-2: send time of the END frame
         self._tail_sent = 0                  # I8-R2-3: tail frames sent after the END frame
         self._tail_complete = False          # I8-R2-3: the tail ran its frames and its time
+        # A3 (Liam 09/11, CODE: "ok tôi đồng ý hết"; STATUS_CODE L50, L61 b): MISO frames with a bad CRC
+        # or all 0 from frame MISO_SKIP_FRAMES on, counted in the loop, reported at the end (#miso line,
+        # manifest). Report only: the loop still takes the duty from every frame (L50 rule: a run with
+        # any of them is not a main number, run again)
+        self._miso_crc_bad = 0
+        self._miso_empty   = 0
+        self._miso_first_crc_bad: Optional[int] = None
+        self._miso_first_empty: Optional[int] = None
         self._h7_seq      = -1
         self._h7_new      = False
         self._ref         = (0.0, 0.0, 0.0)
@@ -355,6 +368,17 @@ class HILNode:
             # t_send, taken before a transfer that may stall), so the H7 has had the off command
             self._tail_t0_ns = time.monotonic_ns()
         torques = decode_torques(miso)
+        if self._step >= MISO_SKIP_FRAMES:
+            chk = miso_check(miso)
+            if chk != MISO_OK:
+                if chk == MISO_EMPTY:
+                    self._miso_empty += 1
+                    if self._miso_first_empty is None:
+                        self._miso_first_empty = self._step
+                else:
+                    self._miso_crc_bad += 1
+                    if self._miso_first_crc_bad is None:
+                        self._miso_first_crc_bad = self._step
         if self._lc is not None:
             self._h7_new = miso[OFS_MISO_SEQ] != self._h7_seq
             self._h7_seq = miso[OFS_MISO_SEQ]
@@ -462,6 +486,7 @@ class HILNode:
                         load_schedule=self.cfg.load_schedule, rt=self._rt, uname=' '.join(platform.uname()),     # X8: the kernel the run ran on
                         lifecycle=self.lifecycle_summary(),
                         swa_mode=self.cfg.swa_mode, swa_events=self.swa_events(),     # I8
+                        miso_check=self.miso_summary(),                                # A3
                         **self.swa_tail())                                             # I8-R2-3
         np.savez(self.cfg.frame_log, manifest=np.array(json.dumps(manifest)),
                  **{k: v[:n] for k, v in self._flog.items()})
@@ -475,6 +500,13 @@ class HILNode:
     def swa_events(self) -> list:
         """I8: [[step, 0/1], ...] at every change of the SWA bit sent (first frame included)."""
         return [[int(k), int(v)] for k, v in self._swa_events]
+
+    def miso_summary(self) -> dict:
+        """A3: MISO frames checked (from frame MISO_SKIP_FRAMES on), how many had a bad CRC or were all 0,
+        and the step of the first of each (None: none). Meaningful only against the real H7."""
+        return dict(checked=max(0, self._step - MISO_SKIP_FRAMES), crc_bad=self._miso_crc_bad,
+                    empty=self._miso_empty, first_crc_bad=self._miso_first_crc_bad,
+                    first_empty=self._miso_first_empty)
 
     def swa_tail(self) -> dict:
         """I8-R2-3: the END tail. swa_tail_sent = tail frames sent after the END frame; swa_tail_complete =
@@ -504,6 +536,12 @@ class HILNode:
             log.info('#run_summary,%s', json.dumps(self.lifecycle_summary()))
         log.info('#swa,mode=%s,events=%s,tail=%s', self.cfg.swa_mode, json.dumps(self.swa_events()),
                  json.dumps(self.swa_tail()))                                           # I8, I8-R2-3
+        m = self.miso_summary()                                                         # A3
+        log.info('#miso,checked=%d,crc_bad=%d,empty=%d,first_crc_bad=%s,first_empty=%s',
+                 m['checked'], m['crc_bad'], m['empty'], m['first_crc_bad'], m['first_empty'])
+        if m['crc_bad'] or m['empty']:
+            log.warning('MISO: %d frame CRC sai, %d frame rỗng trong lượt (L50: không làm số chính)',
+                        m['crc_bad'], m['empty'])
         log.info('#run_end,timestamp_us=%d,steps=%d,reason=%s',
                  time.monotonic_ns() // 1000, self._step, self._stop_reason)
         if self._flog is not None:
