@@ -245,7 +245,27 @@ def fw_problem(fws, expect):
     return None
 
 
-H7_FW_WAIT_S = 11.0                  # --expect-h7: the H7 prints #fw every 10 s (main.c debug block)
+LIFTED_TEST_RE = re.compile(r'--test\s+A-K\d')
+LIFTED_ENV_TAG = 'wheels_lifted'
+
+
+def lifted_env_problem(args, fws):
+    """L55 (Liam 09/11, CODE: the lifted-wheel flag is chosen by env): a lifted test (--test A-K*) must run on
+    an ESP32 env with wheels_lifted in its name (AGV env wheels_lifted / ladrc_wheels_lifted), and a ground
+    run must not; None when it fits or the ESP32 id is not known (fw_problem judges a missing id)."""
+    if not fws:
+        return None
+    lifted_run = bool(LIFTED_TEST_RE.search(args or ''))
+    envs = sorted({f['env'] for f in fws})
+    lifted_env = [LIFTED_ENV_TAG in e for e in envs]
+    if lifted_run and not all(lifted_env):
+        return f'bài kê bánh (A-K) nhưng ESP32 chạy env {envs}, cần env *{LIFTED_ENV_TAG}'
+    if not lifted_run and any(lifted_env):
+        return f'bài trên sàn nhưng ESP32 chạy env kê bánh {envs}'
+    return None
+
+
+H7_FW_WAIT_S = 11.0                 # --expect-h7: the H7 prints #fw every 10 s (main.c debug block)
 IP_RE = re.compile(r'Got IP: (\d{1,3}(?:\.\d{1,3}){3})')
 LOGGER_EXIT_RE = re.compile(r'^logger_exit=(\d+)', re.M)
 LOGGER_SAFE_REJECTS = ('source',)     # datagrams from another sender: refused by the source lock, data unharmed
@@ -671,6 +691,10 @@ def bench(a):
             if bad:
                 r['clean'] = False
                 r['why'].append(bad)
+            ebad = lifted_env_problem(args, run_fw or sess.get('boot', {}).get('esp32_fw') or [])
+            if ebad:
+                r['clean'] = False
+                r['why'].append(ebad)
             if not a.no_logger:                      # A5: the WiFi log of the run must be usable
                 sp = os.path.join(a.out, 'pi', f'{name}.csv.summary.json')
                 lsum = json.load(open(sp, encoding='utf-8')) if os.path.exists(sp) else None

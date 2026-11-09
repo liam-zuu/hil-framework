@@ -512,3 +512,19 @@ def test_h7_expect(tmp_path, monkeypatch, h7_lines, expect, code, ran):
     if expect:
         assert s['h7_fw'] == hb.fw_lines([x for _, x in h7_lines])
     assert s['h7_fw_all'] == hb.fw_lines([x for _, x in h7_lines])
+
+
+# ── L55: lifted-wheel test needs the wheels_lifted env (Liam 09/11, CODE) ──
+
+@pytest.mark.parametrize('args, env, ok', [
+    ('--test A-K1', 'wheels_lifted', True),
+    ('--test A-K3', 'ladrc_wheels_lifted', True),
+    ('--test A-K2', 'ladrc', False),                  # lifted test on the ground env
+    ('--test A-L1', 'ladrc', True),
+    ('--test A-L1', 'wheels_lifted', False),          # ground test on the lifted env
+    ('--traj circle --speed 0.3', 'esp32-s3-devkitc-1', True),
+])
+def test_lifted_env_problem(args, env, ok):
+    fws = [dict(sha='1a2b3c4d5e6f', dirty=0, env=env)]
+    assert (hb.lifted_env_problem(args, fws) is None) == ok
+    assert hb.lifted_env_problem(args, []) is None    # no id: fw_problem / --expect-esp32 judge that
