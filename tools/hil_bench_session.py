@@ -16,11 +16,12 @@ việc 2: gom lượt bàn thành một lệnh). Làm đúng trình tự đã ch
      - bám setpoint: vận tốc plant trong MOSI là hệ thế giới, xoay về hệ thân xe theo θ rồi so với setpoint
        (bỏ 1 s đầu), duty lớn nhất, số frame |duty| ≥ 0,99, bước duty lớn nhất giữa hai frame;
      - rpm (CSV ESP32): lệch so với trung vị 11 mẫu khi motor bật và setpoint khác 0 (bỏ 1 s đầu);
-     - ESP32: `Motor disabled` giữa lượt, `Motor enabled` khác đúng 1 lần (I8), `POWERON`, `IMU_INIT_FAIL`,
-       `IMU FAIL STATE`;
-     - I8 (Liam 09/11): khi Pi gửi bit SWA (MOSI byte 20 bit 3), status H7 (MISO byte 16 bit 0) phải theo
-       mỗi lần đổi (`s06_frames_decode.swa_summary`). `--boot` chạy `--imu-static` nên `--swa auto` = tắt:
-       ESP32 khởi động mà motor không bật; lượt `--finite-run` bật SWA ở RUN, STOPPING.
+     - ESP32: `Motor disabled` giữa lượt, `POWERON`, `IMU_INIT_FAIL`, `IMU FAIL STATE`;
+     - I8 (Liam 09/11; Codex vòng 1 I8-6..10), chỉ với lượt có `swa_mode` trong manifest frame log:
+       status H7 (MISO byte 16 bit 0) bằng bit SWA Pi gửi (MOSI byte 20 bit 3) ở mọi frame mà lệnh đã giữ
+       hơn 20 frame, không lần đổi nào H7 không theo (`s06_frames_decode.swa_summary`); ESP32 `Motor enabled`
+       đúng 1 lần và có `Motor disabled` sau đó khi Pi có gửi SWA bật, 0 lần khi không. `--boot` chạy omega
+       mode nên `--swa auto` = tắt: thấy `Motor enabled` thì dừng mã 2.
      Chỉ L50 và các lỗi ESP32 làm lượt "không sạch"; số bám setpoint, rpm chỉ báo, không có ngưỡng
      đạt/không (kiểm chức năng, gain chưa tune). Không viết `meta.yaml` (người chạy viết, kèm commit 3 board).
 
@@ -172,19 +173,30 @@ def h7_window(lines):
                 loop_over1ms=sum(x[1] for x in lp) if lp else None)
 
 
+def boot_motor_on(lines):
+    """I8-10: `Motor enabled` lines of the ESP32 in the --boot step (texts)."""
+    return sum(1 for s in lines if 'Motor enabled' in s)
+
+
 def esp_window(lines):
-    """ESP32 lines of one run: motor disabled before the last line (inside the run) and boot/IMU failures."""
+    """ESP32 lines of one run: motor disabled before the last line (inside the run) and boot/IMU failures.
+    I8: motor_enabled = number of `Motor enabled` lines; off_after_on = a `Motor disabled` line comes after
+    the last `Motor enabled` line."""
     txt = [s for _, s in lines]
     dis = [i for i, s in enumerate(txt) if 'Motor disabled' in s]
+    en = [i for i, s in enumerate(txt) if 'Motor enabled' in s]
     return dict(motor_disabled_inside=len(dis[:-1]) if dis else 0,
-                motor_enabled=sum(1 for s in txt if 'Motor enabled' in s),     # I8: once, at RUN
+                motor_enabled=len(en),
+                off_after_on=bool(en and dis and dis[-1] > en[-1]),
                 bad={k: sum(1 for s in txt if k in s) for k in ESP_BAD})
 
 
-def judge(dec_problems, h7, esp, swa=None):
+def judge(dec_problems, h7, esp, swa=None, i8=False):
     """Run clean: L50 (no decode problem, SPIfix stuck did not rise) and no ESP32 failure. Reasons listed.
-    I8 (Liam 09/11): the ESP32 turns the motors on exactly once in the run; when the Pi sent the SWA bit,
-    the H7 status must follow every change (swa = s06_frames_decode.swa_summary)."""
+    I8 (Liam 09/11; Codex round 1 I8-6, -7, -9): only for a run whose frame-log manifest has swa_mode
+    (i8=True): the H7 status follows the SWA bit (s06_frames_decode.swa_summary: no held mismatch, no
+    unfollowed change), and the ESP32 turns the motors on once and off after it when the Pi sent SWA on,
+    never when it did not. Logs from before I8 keep the older rules."""
     why = list(dec_problems)
     if h7 and h7.get('stuck_rise'):
         why.append(f"SPIfix stuck tăng {h7['stuck_rise']}")
@@ -194,10 +206,18 @@ def judge(dec_problems, h7, esp, swa=None):
         if esp['motor_disabled_inside']:
             why.append(f"ESP32 Motor disabled giữa lượt {esp['motor_disabled_inside']} lần")
         why += [f'ESP32 {k} {n} lần' for k, n in esp['bad'].items() if n]
-        if esp.get('motor_enabled', 1) != 1:
-            why.append(f"ESP32 Motor enabled {esp['motor_enabled']} lần (cần 1)")
-    if swa and swa.get('cmd_on_frames') and swa.get('unfollowed'):
-        why.append(f"H7 không làm theo bit SWA ({swa['unfollowed']} lần đổi không thấy trong status)")
+    if i8 and swa:
+        if swa.get('held_mismatch'):
+            why.append(f"H7 status SWA khác lệnh Pi ở {swa['held_mismatch']} frame (lệnh đã giữ "
+                       f"> {swa.get('settle_frames')} frame; đầu tiên {swa.get('mismatch_first', [])[:3]})")
+        if swa.get('unfollowed'):
+            why.append(f"H7 không làm theo bit SWA ({swa['unfollowed']} lần đổi không thấy trong status)")
+        if esp:
+            want = 1 if swa.get('cmd_on_frames') else 0
+            if esp['motor_enabled'] != want:
+                why.append(f"ESP32 Motor enabled {esp['motor_enabled']} lần (cần {want})")
+            elif want and not esp['off_after_on']:
+                why.append('ESP32 không có Motor disabled sau Motor enabled trong lượt')
     return (not why), why
 
 
@@ -210,7 +230,8 @@ def analyze_run(out, name, h7_lines=None, esp_lines=None):
     rpm = rpm_spikes(list(csv.DictReader(open(p, encoding='utf-8')))) if os.path.exists(p) else None
     h7 = h7_window(h7_lines) if h7_lines is not None else None
     esp = esp_window(esp_lines) if esp_lines is not None else None
-    ok, why = judge(probs, h7, esp, res.get('swa'))
+    man = json.loads(str(z['manifest'])) if 'manifest' in z.files else {}
+    ok, why = judge(probs, h7, esp, res.get('swa'), i8='swa_mode' in man)
     f = res['frames']
     return dict(name=name, clean=ok, why=why,
                 frames=dict(n=f['frames'], miso_crc_bad=f['miso_crc_bad'], empty_in_run=f['empty_in_run'],
@@ -296,10 +317,17 @@ def bench(a):
             boot_rc = p.wait(timeout=120)
             boot = [s for _, s in esp.since(t_reset)]
             miss = [k for k in BOOT_NEED if not any(k in s for s in boot)]
-            sess['boot'] = dict(t_reset=t_reset, pi_exit=boot_rc, missing=miss,
+            motor_on = boot_motor_on(boot)
+            sess['boot'] = dict(t_reset=t_reset, pi_exit=boot_rc, missing=miss, motor_enabled=motor_on,
                                 controller=next((s.strip() for s in boot if 'Controller:' in s), None))
-            print(f"khởi động ESP32: {sess['boot']['controller']}, thiếu {miss or 'không'}, Pi mã {boot_rc}")
+            print(f"khởi động ESP32: {sess['boot']['controller']}, thiếu {miss or 'không'}, Pi mã {boot_rc}, "
+                  f"Motor enabled {motor_on} lần")
             if miss or boot_rc != 0:
+                return 2, []
+            if motor_on:
+                # I8-10: the boot step runs an omega mode, so --swa auto sends SWA off; motors on means the H7
+                # has no I8 (or the Pi sent SWA on): stop before any run
+                print('DỪNG: ESP32 bật motor lúc --boot (H7 chưa có I8, hoặc Pi gửi SWA bật)')
                 return 2, []
         for spec in a.run:
             name, _, args = spec.partition('=')

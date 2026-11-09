@@ -105,16 +105,30 @@ def test_run_cmd_and_bad_args():
     assert not hb.BAD_ARG.search('--traj circle --speed 0.3 --radius 0.5 --duration 60')
 
 
-def test_i8_motor_enabled_once_and_swa_followed():
+def test_i8_rules_only_for_i8_runs():
     one = [(0, 'I (1) MOTOR: Motor enabled'), (1, 'I (2) MOTOR: Motor disabled')]
-    assert hb.esp_window(one)['motor_enabled'] == 1
-    assert hb.judge([], None, hb.esp_window(one)) == (True, [])
-    ok, why = hb.judge([], None, hb.esp_window(one[1:]))          # the DUT never ran
+    e = hb.esp_window(one)
+    assert e['motor_enabled'] == 1 and e['off_after_on']
+    sw = dict(cmd_on_frames=100, held_mismatch=0, unfollowed=0, unobserved=0, settle_frames=20)
+    assert hb.judge([], None, e, sw, i8=True) == (True, [])
+    # on with no off after it (I8-9)
+    ok, why = hb.judge([], None, hb.esp_window(one[:1]), sw, i8=True)
+    assert not ok and 'Motor disabled sau' in why[0]
+    # the DUT never ran although the Pi sent SWA on
+    ok, why = hb.judge([], None, hb.esp_window(one[1:]), sw, i8=True)
     assert not ok and 'Motor enabled 0' in why[0]
-    sw_ok = dict(cmd_on_frames=100, unfollowed=0, cmd_changes=[10, 110], follow_lag_max=8)
-    sw_bad = dict(sw_ok, unfollowed=2)
-    assert hb.judge([], None, hb.esp_window(one), sw_ok)[0]
-    ok, why = hb.judge([], None, hb.esp_window(one), sw_bad)
-    assert not ok and 'SWA' in why[0]
-    # an old run (Pi before I8: bit never sent) is not judged on SWA
-    assert hb.judge([], None, None, dict(cmd_on_frames=0, unfollowed=0))[0]
+    # SWA off the whole run: the motors must not come on
+    ok, why = hb.judge([], None, e, dict(sw, cmd_on_frames=0), i8=True)
+    assert not ok and 'cần 0' in why[0]
+    # the H7 status does not follow (I8-7)
+    ok, why = hb.judge([], None, e, dict(sw, held_mismatch=5, mismatch_first=[30, 31, 32]), i8=True)
+    assert not ok and 'status SWA' in why[0]
+    ok, why = hb.judge([], None, e, dict(sw, unfollowed=1), i8=True)
+    assert not ok and 'không làm theo' in why[0]
+    # a run from before I8 (no swa_mode in the manifest): none of these rules (I8-9)
+    assert hb.judge([], None, hb.esp_window(one[1:]), dict(sw, unfollowed=3), i8=False) == (True, [])
+
+
+def test_i8_boot_motor_on_counted():
+    assert hb.boot_motor_on(['I (1) MAIN: Boot done', 'I (2) MOTOR: Motor enabled']) == 1
+    assert hb.boot_motor_on(['I (1) MAIN: Boot done', 'I (2) MOTOR: Motor disabled']) == 0

@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from fake_h7 import FakeH7
-from hil_node import HILConfig, HILNode
+from hil_node import END_TAIL_FRAMES, HILConfig, HILNode
 from plant_interface import MockPlant
 from protocol import (CMD_SWA_ON, OFS_FAULT, OFS_STATUS, OFS_TRAJ_FLAGS, STATUS_SWA, TRAJ_NEW, TRAJ_VALID,
                       decode_traj_ref)
@@ -207,7 +207,8 @@ def test_lock_never_free_ends_in_error_heartbeat():
     box._a.get_lock = lambda: HeldLock()
     node, sent, _, _ = run_node(box=box, beat=False)
     s = node.lifecycle_summary()
-    assert s['outcome'] == 'error:heartbeat' and s['lock_misses'] == len(sent)
+    # one lifecycle step per frame up to END; the END_TAIL_FRAMES after it have none (I8-5)
+    assert s['outcome'] == 'error:heartbeat' and s['lock_misses'] == len(sent) - END_TAIL_FRAMES
     zeros_every_20([f for f in sent if f[0] == STOPPING])
 
 
@@ -343,15 +344,84 @@ def test_swa_phase_on_only_in_run_and_stopping(tmp_path):
     for ph, _, m in sent:
         assert _swa(m) == (1 if ph in (RUN, STOPPING) else 0), ph
         assert m[OFS_FAULT] & ~CMD_SWA_ON == 0              # no fault bit set by the SWA path
-    assert any(ph == END for ph, _, _ in sent) and _swa(sent[-1][2]) == 0   # last frame says off
     ev = node.swa_events()
     assert [v for _, v in ev] == [0, 1, 0]                  # off in ARM, on at RUN, off at END
     run_first = next(i for i, (ph, _, _) in enumerate(sent) if ph == RUN)
-    assert ev[1][0] == run_first
+    end_first = next(i for i, (ph, _, _) in enumerate(sent) if ph == END)
+    assert ev[1][0] == run_first and ev[2][0] == end_first
     import json
     m = json.loads(str(np.load(tmp_path / 'f.npz')['manifest']))
     assert m['swa_mode'] == 'phase' and m['swa_events'] == ev
     assert fk[0].swa == 0 and fk[0].swa_changes == 2        # the fake H7 followed the bit
+
+
+def test_swa_end_tail_frames_off_without_publisher(tmp_path):
+    # I8-5: after END the loop sends END_TAIL_FRAMES more frames, SWA off, no new setpoint
+    node, sent, plant, _ = run_node(tmp_path, event=done_after(0.08), swa_mode='phase')
+    end = [f for f in sent if f[0] == END]
+    assert len(end) == 1 + END_TAIL_FRAMES                  # the END step + the tail
+    assert all(_swa(m) == 0 and m[OFS_TRAJ_FLAGS] == 0 for _, _, m in end)
+    assert end[-1][1] > end[0][1]                           # the plant keeps stepping in the tail
+    assert node.lifecycle_summary()['outcome'] == 'completed' and not node.run_failed
+    assert len(np.load(tmp_path / 'f.npz')['mosi']) == len(sent)
+
+
+def test_swa_stop_in_arm_never_turns_on():
+    # I8-1: STOP in ARM goes straight to STOPPING; the motors must stay off
+    node, sent, _, _ = run_node(event=lambda phase, box: box.request_stop(), arm_h7_fresh_s=0.2, swa_mode='phase')
+    assert RUN not in phases(node) and STOPPING in phases(node)
+    assert {_swa(m) for _, _, m in sent} == {0} and node.swa_events() == [[0, 0]]
+
+
+def test_swa_heartbeat_loss_in_arm_never_turns_on():
+    node, sent, _, _ = run_node(beat=False, swa_mode='phase')
+    assert node.lifecycle_summary()['outcome'] == 'error:heartbeat' and RUN not in phases(node)
+    assert {_swa(m) for _, _, m in sent} == {0}
+
+
+def test_swa_arm_timeout_never_turns_on():
+    node, sent, _, _ = run_node(faults=[(0, 10**9, 'silent')], arm_timeout_s=0.3, heartbeat_max_s=5.0,
+                                swa_mode='phase')
+    assert node.lifecycle_summary()['outcome'] == 'error:arm_timeout'
+    assert {_swa(m) for _, _, m in sent} == {0}
+
+
+def test_swa_stop_in_run_keeps_on_through_stopping():
+    def ev(phase, box):
+        if phase == RUN:
+            box.request_stop()
+    node, sent, _, _ = run_node(event=ev, swa_mode='phase')
+    assert RUN in phases(node)
+    assert all(_swa(m) == 1 for ph, _, m in sent if ph == STOPPING)
+
+
+def test_swa_event_only_for_a_frame_that_went_out():
+    # I8-11: the transfer of the first RUN frame fails: no event for it
+    box = ControlBox()
+    sent = []
+    fake = FakeH7()
+    state = dict(fail=True)
+
+    def resp(m):
+        if _swa(m) and state['fail']:
+            state['fail'] = False
+            raise RuntimeError('transfer failed')
+        sent.append(m)
+        return fake(m)
+    box.beat(time.monotonic_ns())
+    node = HILNode(CountPlant(), HILConfig(simulate_hw=True, max_steps=3000, swa_mode='phase',
+                                           lifecycle=LifecycleConfig(run_s=0.15, arm_h7_fresh_s=0.12, stop_s=0.06,
+                                                                     arm_timeout_s=0.5, heartbeat_max_s=0.1,
+                                                                     h7_gap_max_s=0.05, run_grace_s=0.1)),
+                   control=box, responder=resp)
+    owner = Owner(box, None, True)
+    owner.start()
+    with pytest.raises(RuntimeError):
+        node.run()
+    owner.quit = True
+    owner.join()
+    assert node.swa_events() == [[0, 0]]                    # the failed SWA-on frame is not recorded
+    assert all(_swa(m) == 0 for m in sent)
 
 
 def test_swa_status_bit_echoes_what_the_h7_took():
@@ -386,13 +456,16 @@ def test_swa_phase_without_lifecycle_refused():
         HILNode(MockPlant(), HILConfig(simulate_hw=True, swa_mode='yes'))
 
 
-@pytest.mark.parametrize('swa, finite, n_modes, traj, want', [
-    ('auto', True, 0, 'line', 'phase'),
-    ('auto', False, 0, 'circle', 'on'),        # old plant run with a trajectory: as before
-    ('auto', False, 0, 'idle', 'off'),         # --imu-static / --boot: diagnostics
-    ('auto', False, 1, 'line', 'off'),         # an omega mode
-    ('on', True, 0, 'line', 'on'),
-    ('off', False, 0, 'circle', 'off'),
+@pytest.mark.parametrize('swa, finite, n_modes, traj, no_traj, want', [
+    ('auto', True, 0, 'line', False, 'phase'),
+    ('auto', False, 0, 'circle', False, 'on'),       # old plant run with a trajectory: as before
+    ('auto', False, 0, 'load', False, 'on'),         # --load-schedule (traj kind 'load' after the schedule)
+    ('auto', False, 0, 'idle', False, 'off'),        # --imu-static / --boot: diagnostics
+    ('auto', False, 1, 'line', False, 'off'),        # an omega mode
+    ('auto', False, 0, 'line', True, 'off'),         # I8-2: --traj line --no-traj
+    ('auto', False, 0, 'figure8', True, 'off'),      # I8-2: --test A-F1 --no-traj (traj set by --test)
+    ('on', True, 0, 'line', False, 'on'),
+    ('off', False, 0, 'circle', False, 'off'),
 ])
-def test_resolve_swa(swa, finite, n_modes, traj, want):
-    assert resolve_swa(swa, finite, n_modes, traj) == want
+def test_resolve_swa(swa, finite, n_modes, traj, no_traj, want):
+    assert resolve_swa(swa, finite, n_modes, traj, no_traj) == want

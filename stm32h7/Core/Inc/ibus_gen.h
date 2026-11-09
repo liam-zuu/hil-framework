@@ -116,6 +116,20 @@ void ibus_gen_init(ibus_gen_t *g, const ibus_gen_io_t *io, uint32_t period_us, u
 void ibus_gen_tick(ibus_gen_t *g, uint32_t now_us, int on, int swa);
 /* SWA of the last frame started (1 = 2000), 0 before any; any context */
 int  ibus_gen_last_swa(const ibus_gen_t *g);
+
+/* I8-3 (Codex vong 1, Liam 09/11 "Duyet sua, vong 2"): MOSI has no checksum the
+ * H7 can check, so one corrupted frame must not flip SWA. The main loop feeds
+ * the bit of every applied frame; the output changes only after
+ * IBUS_SWA_FILTER_N frames in a row agree (3 ms at 1 kHz), both directions.
+ * Reset (output 0) at link lost and after a gap between applied frames. */
+#define IBUS_SWA_FILTER_N          3u
+typedef struct {
+    uint8_t out;                  /* filtered SWA, 0 after reset */
+    uint8_t cand;                 /* value of the current run of equal bits */
+    uint8_t cnt;                  /* length of that run (saturates) */
+} ibus_swa_filter_t;
+void ibus_swa_filter_reset(ibus_swa_filter_t *f);
+int  ibus_swa_filter_step(ibus_swa_filter_t *f, int bit);
 /* Copy of the last closed window; returns 0 if the tick kept rewriting it */
 int  ibus_gen_read_window(const ibus_gen_t *g, ibus_gen_window_t *out);
 

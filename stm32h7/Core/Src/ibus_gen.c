@@ -115,6 +115,26 @@ void ibus_gen_tick(ibus_gen_t *g, uint32_t now_us, int on, int swa)
     }
 }
 
+void ibus_swa_filter_reset(ibus_swa_filter_t *f)
+{
+    f->out = 0u;
+    f->cand = 0u;
+    f->cnt = 0u;
+}
+
+int ibus_swa_filter_step(ibus_swa_filter_t *f, int bit)
+{
+    uint8_t b = bit ? 1u : 0u;
+    if (f->cnt > 0u && b == f->cand) {
+        if (f->cnt < 0xFFu) f->cnt++;
+    } else {
+        f->cand = b;
+        f->cnt = 1u;
+    }
+    if (f->cnt >= IBUS_SWA_FILTER_N) f->out = f->cand;
+    return f->out;
+}
+
 int ibus_gen_last_swa(const ibus_gen_t *g)
 {
     return g->last_swa;          /* one byte: a single read, no tearing */

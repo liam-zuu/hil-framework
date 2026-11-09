@@ -51,7 +51,11 @@ from run_lifecycle import ControlBox, LifecycleConfig, RunLifecycle, StepIn, END
 # I8 (Liam 09/11, "Duyet ca 5"): who holds the RC switch SWA of the iBUS frames the H7 sends.
 # 'phase' = on in RUN and STOPPING of --finite-run (needs cfg.lifecycle), 'on' / 'off' = fixed.
 SWA_MODES = ('off', 'on', 'phase')
-SWA_PHASES_ON = (RUN, STOPPING)
+SWA_PHASES_ON = (RUN, STOPPING)   # STOPPING only after the run reached RUN (I8-1)
+# I8-5: frames sent after the lifecycle reached END (SWA off, setpoint 0, no publisher), so the H7
+# surely gets the off command and the frame log shows the H7 status follow it (filter 3 frames +
+# iBUS period 7 ms + answer 2 frames, about 13 ms; 30 frames = 30 ms)
+END_TAIL_FRAMES = 30
 
 log = logging.getLogger('hil.node')
 
@@ -172,6 +176,8 @@ class HILNode:
             raise ValueError("swa_mode 'phase' needs cfg.lifecycle (--finite-run)")
         self._swa       = None               # last bit sent; None before the first frame
         self._swa_events: list = []          # (step, 0/1) at every change, for the manifest
+        self._run_seen  = False              # I8-1: the lifecycle reached RUN
+        self._end_left: Optional[int] = None  # I8-5: frames still to send after END
         self._h7_seq      = -1
         self._h7_new      = False
         self._ref         = (0.0, 0.0, 0.0)
@@ -303,8 +309,11 @@ class HILNode:
 
         # 2. Encode current state + setpoint, send MOSI, receive MISO (torques from H7)
         traj_flags = 0
-        lc = self._lifecycle_step() if self._lc is not None else None
-        if lc is not None and lc.send_zero:
+        tail = self._end_left is not None    # I8-5: after END, no lifecycle step, no publisher
+        lc = self._lifecycle_step() if (self._lc is not None and not tail) else None
+        if tail:
+            pass                                 # keep the last setpoint (0 from STOPPING), flags 0
+        elif lc is not None and lc.send_zero:
             self._ref  = (0.0, 0.0, 0.0)         # section 9.1: VALID|NEW, not through the publisher
             traj_flags = TRAJ_VALID | TRAJ_NEW
         elif (lc is None or lc.publish) and self.shared_ref is not None:
@@ -320,14 +329,18 @@ class HILNode:
         if self._heavy is not None:
             self._heavy.apply(self._step, frame_state)   # S06 Z8: omega to the H7 only, the plant goes on
         swa = self._swa_bit()
-        if swa != self._swa:
-            self._swa = swa
-            self._swa_events.append((self._step, swa))
         mosi   = encode_state(frame_state, traj_ref=self._ref, traj_flags=traj_flags,
                               seq=self._step, imu=imu, imu_seq=imu_seq,
                               fault_flags=CMD_SWA_ON if swa else 0)
         t_send = time.monotonic_ns()
         miso   = self._spi.transfer(mosi)
+        if swa != self._swa:                 # I8-11: recorded once the frame went out
+            self._swa = swa
+            self._swa_events.append((self._step, swa))
+        if tail:
+            self._end_left -= 1
+            if self._end_left <= 0:
+                self._running = False
         torques = decode_torques(miso)
         if self._lc is not None:
             self._h7_new = miso[OFS_MISO_SEQ] != self._h7_seq
@@ -373,7 +386,11 @@ class HILNode:
         if m == 'on':
             return 1
         if m == 'phase':
-            return 1 if self._lc.phase in SWA_PHASES_ON else 0
+            ph = self._lc.phase
+            if ph == RUN:
+                return 1
+            # I8-1: STOP or an error in ARM goes straight to STOPPING; the motors stay off then
+            return 1 if (ph == STOPPING and self._run_seen) else 0
         return 0
 
     def _lifecycle_step(self):
@@ -385,9 +402,11 @@ class HILNode:
                                    publisher_done=box.pub_done, publisher_alive=not box.pub_dead,
                                    stop_requested=box.stop,
                                    heartbeat_age_s=(now - box.heartbeat_ns) / 1e9))
+        if self._lc.phase == RUN:
+            self._run_seen = True
         if out.done:
             self._stop_reason = self._lc.outcome
-            self._running = False
+            self._end_left = END_TAIL_FRAMES     # I8-5: the loop stops after the tail frames
         return out
 
     def _imu_sample(self, state: list):

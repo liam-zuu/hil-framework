@@ -312,3 +312,30 @@ def test_swa_on_but_link_down_sends_nothing(harness):
     # link down wins over the SWA command: the DUT loses RC (S06 T12 (d))
     d = run(harness, 'run', 2000, 'off@1', 'swa1@1')
     assert d['bytes'] == 0 and d['last_swa'] == 0
+
+
+# ── I8-3: SWA filter of the main loop (Codex round 1, Liam 09/11 "Duyet sua, vong 2") ──
+
+def _filt(harness, bits, *resets):
+    r = run(harness, 'filter', bits, *[f'r@{k}' for k in resets])
+    assert r['n'] == 3
+    return ''.join(str(x) for x in r['out'])
+
+
+def test_swa_filter_needs_three_in_a_row(harness):
+    assert _filt(harness, '0001111') == '0000011'
+    assert _filt(harness, '1110000') == '0011100'      # off also needs 3 frames
+
+
+def test_swa_filter_one_corrupt_frame_changes_nothing(harness):
+    assert _filt(harness, '0001000') == '0000000'      # one flipped 0 -> 1
+    assert _filt(harness, '1111011111') == '0011111111'  # one flipped 1 -> 0 while on
+
+
+def test_swa_filter_two_corrupt_frames_change_nothing(harness):
+    assert _filt(harness, '00110000') == '00000000'
+
+
+def test_swa_filter_reset_restarts_from_off(harness):
+    # link lost / gap after the filter was on: output 0 again, 3 new frames needed
+    assert _filt(harness, '11111111', 4) == '0011' + '0011'

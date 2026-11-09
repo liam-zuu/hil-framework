@@ -488,6 +488,8 @@ int main(void)
   static uint32_t _pwm_dbg_ms = 0;
   static uint32_t _frames_last = 0;
   static uint32_t _ibus_win_last = 0;
+  static ibus_swa_filter_t _swa_f;     /* I8-3: SWA only after 3 frames in a row agree */
+  ibus_swa_filter_reset(&_swa_f);
   S06Load_CalibrateOverhead();
   uint8_t  _cal_on = 1;
   _dbg_last = _t10_last = HAL_GetTick();
@@ -512,6 +514,11 @@ int main(void)
     }
     if (SPI1_IsFrameReady()) {
         _busy = 1;
+        /* I8-4: a gap between applied frames of half the link timeout or more
+         * starts the SWA filter again, also when this loop never saw the link
+         * as lost (the TIM6 tick may have timed out first) */
+        if ((HAL_GetTick() - _last_frame_ms) >= IBUS_LINK_TIMEOUT_MS / 2u)
+            ibus_swa_filter_reset(&_swa_f);
         _last_frame_ms = HAL_GetTick();
         if (!_link_up) {
             SPI1_Stats_t s0;
@@ -526,8 +533,9 @@ int main(void)
         SPI1_GetFrameEx(&g_state, &g_traj, &fi);   /* one frame; clears frame_ready */
         for (int i = 0; i < ENC_NUM_WHEELS; i++)
             EncoderGen_SetOmega(i, g_state.omega[i]);
-        /* I8: the RPi5 holds the RC switch SWA; used from the next iBUS frame */
-        IbusPort_SetSwa((g_state.fault_flags & HIL_CMD_SWA_ON) != 0u);
+        /* I8: the RPi5 holds the RC switch SWA; used from the next iBUS frame,
+         * after IBUS_SWA_FILTER_N applied frames in a row agree (I8-3) */
+        IbusPort_SetSwa(ibus_swa_filter_step(&_swa_f, (g_state.fault_flags & HIL_CMD_SWA_ON) != 0u));
         /* S06: state age at the moment the omegas were applied, and the
          * checksum of the raw bytes of this very copy (W3, Y9) */
         uint32_t age_us = (DWT->CYCCNT - fi.rx_cyc) / cyc_per_us;
@@ -566,6 +574,7 @@ int main(void)
         _n_link_lost++;
         IbusPort_SetEnabled(0);  /* DUT loses RC -> motors off (S06 T12 (d)) */
         IbusPort_SetSwa(0);      /* I8: after reconnect SWA stays off until the RPi5 sets it */
+        ibus_swa_filter_reset(&_swa_f);
         for (int i = 0; i < ENC_NUM_WHEELS; i++)
             EncoderGen_SetOmega(i, 0.0f);
         SPI1_DropNewTraj();      /* no old setpoint relayed after reconnect */

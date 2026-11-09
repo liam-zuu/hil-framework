@@ -88,6 +88,11 @@ void IbusPort_Tick(void)
     uint32_t last_ms = SPI1_GetLastFrameMs();
     uint32_t age_ms = HAL_GetTick() - last_ms;
     int on = _gate && age_ms <= IBUS_LINK_TIMEOUT_MS;
+    /* I8-4: a link timeout seen here drops the SWA command at once, so a frame
+     * that arrives before the main loop ran its link-lost branch cannot start
+     * an iBUS frame with the SWA of the old link period. The main loop sets it
+     * again from the new frames (after its filter, also reset on a gap). */
+    if (age_ms > IBUS_LINK_TIMEOUT_MS) _swa = 0u;
     ibus_gen_tick(&_gen, _now_us(), on, _swa);
 }
 

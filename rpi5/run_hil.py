@@ -376,7 +376,7 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def resolve_swa(swa: str, finite_run: bool, n_omega_modes: int, traj_kind: str) -> str:
+def resolve_swa(swa: str, finite_run: bool, n_omega_modes: int, traj_kind: str, no_traj: bool) -> str:
     """I8 (Liam 09/11, "Duyet ca 5", bang 2.4 of the proposal): --swa -> HILConfig.swa_mode."""
     if swa in ('on', 'off'):
         return swa
@@ -384,7 +384,8 @@ def resolve_swa(swa: str, finite_run: bool, n_omega_modes: int, traj_kind: str) 
         raise ValueError(f'--swa {swa!r}')
     if finite_run:
         return 'phase'
-    return 'on' if (n_omega_modes == 0 and traj_kind != 'idle') else 'off'
+    # I8-2 (Codex round 1): --no-traj starts no publisher, so there is no trajectory to run
+    return 'on' if (n_omega_modes == 0 and traj_kind != 'idle' and not no_traj) else 'off'
 
 
 # ── Main ──────────────────────────────────────────────────────────────────
@@ -480,7 +481,7 @@ def main() -> int:
         args.steps = hil_cfg.max_steps
         control = ControlBox()
         control.beat(time.monotonic_ns())
-    hil_cfg.swa_mode = resolve_swa(args.swa, args.finite_run, n_modes, args.traj)
+    hil_cfg.swa_mode = resolve_swa(args.swa, args.finite_run, n_modes, args.traj, args.no_traj)
     log.info('SWA (I8): --swa %s -> %s', args.swa, hil_cfg.swa_mode)
 
     # Shared state array: plant writes, trajectory pub can read (optional)

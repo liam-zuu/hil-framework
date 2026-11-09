@@ -426,27 +426,61 @@ def _swa_frames(cmd, status, bad=()):
 
 
 def test_swa_summary_follow_lag():
-    cmd = [0] * 10 + [1] * 30 + [0] * 20
-    st = [0] * 18 + [1] * 30 + [0] * 12          # status follows 8 frames after each change
+    cmd = [0] * 10 + [1] * 30 + [0] * 25
+    st = [0] * 18 + [1] * 30 + [0] * 17          # status follows 8 frames after each change
     s = dec.swa_summary(*_swa_frames(cmd, st))
     assert s['cmd_changes'] == [10, 40] and s['status_changes'] == [18, 48]
-    assert s['follow_lag_frames'] == [8, 8] and s['follow_lag_max'] == 8 and s['unfollowed'] == 0
+    assert s['follow_lag_frames'] == [8, 8] and s['follow_lag_max'] == 8
+    assert s['unfollowed'] == 0 and s['unobserved'] == 0 and s['held_mismatch'] == 0 and s['held_checked'] > 0
     assert s['cmd_on_frames'] == 30 and s['cmd_first'] == 0
 
 
 def test_swa_summary_status_never_follows():
-    cmd = [0] * 5 + [1] * 20
-    s = dec.swa_summary(*_swa_frames(cmd, [0] * 25))     # H7 without I8: status stays 0
-    assert s['unfollowed'] == 1 and s['follow_lag_max'] is None
+    cmd = [0] * 5 + [1] * 40
+    s = dec.swa_summary(*_swa_frames(cmd, [0] * 45))     # H7 without I8: status stays 0
+    assert s['unfollowed'] == 1 and s['follow_lag_max'] is None and s['held_mismatch'] == 45 - 25
+
+
+def test_swa_summary_fixed_command_never_followed():
+    # I8-7: no command change at all, status wrong the whole log
+    assert dec.swa_summary(*_swa_frames([1] * 40, [0] * 40))['held_mismatch'] == 40 - 20
+    assert dec.swa_summary(*_swa_frames([0] * 40, [1] * 40))['held_mismatch'] == 40 - 20
+
+
+def test_swa_summary_status_blip_caught():
+    # I8-7: status turns on once and off again while the command stays on
+    cmd = [0] * 10 + [1] * 40 + [0] * 25
+    st = [0] * 11 + [1] + [0] * 63
+    s = dec.swa_summary(*_swa_frames(cmd, st))
+    assert s['held_mismatch'] > 0 and s['unfollowed'] == 1      # round 1 code took it as a 1-frame lag
+
+
+def test_swa_summary_end_of_log_is_unobserved_not_unfollowed():
+    # I8-6: the off command on the last row of the log has no answer yet
+    cmd = [0] * 10 + [1] * 30 + [0]
+    st = [0] * 18 + [1] * 23
+    s = dec.swa_summary(*_swa_frames(cmd, st))
+    assert s['unobserved'] == 1 and s['unfollowed'] == 0 and s['follow_lag_frames'] == [8]
+
+
+def test_swa_summary_quick_changes():
+    # I8-8: on at 10, off at 11; the H7 takes the on (status 13..19), then off at 20
+    cmd = [0] * 10 + [1] + [0] * 40
+    st = [0] * 13 + [1] * 7 + [0] * 31
+    s = dec.swa_summary(*_swa_frames(cmd, st))
+    assert s['unobserved'] == 1 and s['unfollowed'] == 0      # the 1-frame on is not judged
+    assert s['follow_lag_frames'] == [9]                       # the off: first status 0 from frame 13 on is 20
+    assert s['held_mismatch'] == 0
 
 
 def test_swa_summary_skips_empty_miso():
-    cmd = [0] * 5 + [1] * 20
-    st = [0] * 5 + [1] * 20
-    s = dec.swa_summary(*_swa_frames(cmd, st, bad=(5, 6)))   # the first two answers after the change lost
-    assert s['follow_lag_frames'] == [2]
+    cmd = [0] * 5 + [1] * 30
+    st = [0] * 5 + [1] * 30
+    s = dec.swa_summary(*_swa_frames(cmd, st, bad=(7, 8)))     # the first two answers after the change lost
+    assert s['follow_lag_frames'] == [4]
 
 
 def test_swa_in_decode_result(clean):
     t, mosi, miso, _ = clean
-    assert dec.decode(t, mosi, miso)['swa']['cmd_on_frames'] == 0
+    s = dec.decode(t, mosi, miso)['swa']
+    assert s['cmd_on_frames'] == 0 and s['held_mismatch'] == 0   # a log from before I8: command 0, status 0

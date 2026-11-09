@@ -85,6 +85,22 @@ int main(int argc, char **argv)
                (unsigned)g.period_us, (unsigned)IBUS_GEN_MIN_PERIOD_US);
         return 0;
     }
+    if (argc >= 3 && strcmp(argv[1], "filter") == 0) {
+        /* I8-3: harness filter <bits, e.g. 0110111> [r@K ...] -> filtered output per bit;
+         * r@K resets the filter before bit K (link lost / gap) */
+        ibus_swa_filter_t f;
+        ibus_swa_filter_reset(&f);
+        printf("{\"out\":[");
+        for (int k = 0; argv[2][k]; k++) {
+            for (int i = 3; i < argc; i++) {
+                int r;
+                if (sscanf(argv[i], "r@%d", &r) == 1 && r == k) ibus_swa_filter_reset(&f);
+            }
+            printf(k ? ",%d" : "%d", ibus_swa_filter_step(&f, argv[2][k] == '1'));
+        }
+        printf("],\"n\":%u}\n", (unsigned)IBUS_SWA_FILTER_N);
+        return 0;
+    }
     if (argc < 3 || strcmp(argv[1], "run") != 0) {
         fprintf(stderr, "usage: harness frame | harness run <ticks> [events]\n");
         return 2;
