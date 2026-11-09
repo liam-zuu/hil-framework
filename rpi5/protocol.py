@@ -52,6 +52,7 @@ CRITICAL: If you change anything here, update the H7 firmware decode
           in spi1_handler.c accordingly. A 1-byte offset here → all states
           wrong → controller gets garbage → system fails silently.
 """
+import binascii
 import struct
 import numpy as np
 
@@ -75,6 +76,13 @@ OFS_IMU_SEQ    = 39
 OFS_PWM       = 8
 OFS_STATUS    = 16
 OFS_MISO_SEQ  = 17
+# MISO v4 (H7 since the S06 branch, now main): bytes 8–9 = CRC-16/CCITT-FALSE, little-endian, over bytes
+# 0–7 and 10–39 of the same MISO frame (tools/s06_frames_decode.py, STATUS_CODE L50); the pwm field above
+# is the v3 layout used only by encode_torques()/decode_output() for loopback tests
+OFS_MISO_CRC  = 8
+
+# MISO check results (miso_check)
+MISO_OK, MISO_EMPTY, MISO_CRC_BAD = 0, 1, 2
 
 # traj_flags bits (HIL_TRAJ_VALID / HIL_TRAJ_NEW)
 TRAJ_VALID = 1 << 0
@@ -248,6 +256,22 @@ def decode_torques(frame: bytes) -> list:
         _from_int16(struct.unpack_from('>h', frame, i * 2)[0], TORQUE_RANGE)
         for i in range(N_TORQUES)
     ]
+
+
+def miso_check(frame) -> int:
+    """
+    MISO frame as the Pi loop sees it (A3, Liam 09/11, CODE: "ok tôi đồng ý hết"; STATUS_CODE L50, L61 b):
+    MISO_EMPTY all 40 bytes 0 (the Pi then takes duty 0 on all wheels for 1 ms), MISO_CRC_BAD CRC at
+    OFS_MISO_CRC does not match, MISO_OK otherwise. Same rule as tools/s06_frames_decode.decode_frames().
+    Only meaningful against the real H7: the simulate echo and fake_h7.FakeH7 send no CRC.
+    """
+    b = bytes(frame)
+    if not any(b):
+        return MISO_EMPTY
+    crc = b[OFS_MISO_CRC] | (b[OFS_MISO_CRC + 1] << 8)
+    if crc != binascii.crc_hqx(b[:OFS_MISO_CRC] + b[OFS_MISO_CRC + 2:], 0xFFFF):
+        return MISO_CRC_BAD
+    return MISO_OK
 
 
 def decode_output(frame: bytes) -> dict:
