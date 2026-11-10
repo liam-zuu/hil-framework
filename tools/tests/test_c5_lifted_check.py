@@ -112,7 +112,7 @@ def _set(rows, t0, t1, **vals):
     (dict(fn=lambda r: _set(r, 5.0, 5.01, pos_reset_n=2)), 'pos'),
     (dict(fn=lambda r: _set(r, 6.2, 7.0, vx=0.32)), 'track'),                    # last 1 s off by 0.02
     (dict(fn=lambda r: _set(r, 4.0, 7.0, rr_rpm=-60)), 'track'),                 # one wheel the wrong way
-    (dict(fn=lambda r: _set(r, 5.0, 5.05, sat_fl=1)), 'track'),
+    (dict(fn=lambda r: (_set(r, 0.0, 5.0, sat_fl=7), _set(r, 5.0, 99.0, sat_fl=12))), 'track'),  # counter grows in hold
     (dict(fn=lambda r: _set(r, 4.0, 7.0, sp_vx=0.25, vx=0.25)), 'track'),       # not the schedule
 ])
 def test_each_criterion_fails_on_its_mutation(tmp_path, capsys, case, expect):
@@ -124,6 +124,12 @@ def test_each_criterion_fails_on_its_mutation(tmp_path, capsys, case, expect):
 def test_small_wz_src_dropout_is_tolerated(tmp_path, capsys):
     rc, last = _mutate(tmp_path, capsys, fn=lambda r: _set(r, 2.0, 2.05, wz_src=0))   # 5 lines < 1 %
     assert rc == 0
+
+
+def test_sat_counter_constant_from_before_the_run_passes(tmp_path, capsys):
+    # cumulative counter already 1848 before the run, unchanged in it (CAR_LIFTED 10/11 pid_k1a_r4)
+    rc, last = _mutate(tmp_path, capsys, fn=lambda r: _set(r, 0.0, 99.0, sat_fl=1848, sat_rr=1869))
+    assert rc == 0, last
 
 
 def test_right_slip_flag_on_lifted_wheels_passes(tmp_path, capsys):

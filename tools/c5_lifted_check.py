@@ -27,7 +27,8 @@ Reads <run>.csv, <run>.csv.summary.json and <run>.csv.events.txt (agv_logger out
   pos      no pose reset in the middle of the run (tools/run_validity.pos_reset_mid = 0, L37)
   track    each hold phase of the schedule with a non-zero vx setpoint (>= 1.5 s): over its last
            1 s, |mean vx (encoder) - setpoint| <= 0.015 m/s (5 % of 0.3 m/s), the mean rpm of every
-           wheel has the sign of the setpoint, no sat_* flag (PWM at its limit)
+           wheel has the sign of the setpoint, no sat_* counter (cumulative ticks at the PWM
+           limit) grows over the phase
   stop     recorded, not scored: the most negative / positive wheel rpm within 1.5 s after each
            setpoint step to 0 (HIL 08/11: reverse spin to -23 rpm PID, -29 rpm LADRC)
 Safety (SWA off -> motor off, transmitter off -> failsafe) is checked by the operator at the
@@ -215,7 +216,10 @@ def check(col, summ, events, test_id, expect_sha, expect_env, t_settle=T_SETTLE_
             err = float(np.mean(vx[w]) - v)
             rpm = {k: float(np.mean(col(f'{k}_rpm')[w])) for k in WHEELS}
             sign_ok = all(np.sign(x) == np.sign(v) for x in rpm.values())
-            sat = int(sum(np.sum(col(f'sat_{k}')[i0:i1] != 0) for k in WHEELS))
+            # sat_* are cumulative tick counters since boot (main.c vc->sat_ticks): saturation in the
+            # hold = the counter grows over it (bug 10/11: '!= 0' failed a car log whose counters were
+            # already 1848-2130 from before the run; Liam 'Sua roi chay tiep')
+            sat = int(sum(np.nanmax(col(f'sat_{k}')[i0:i1]) - col(f'sat_{k}')[max(i0 - 1, 0)] for k in WHEELS))
             ok = abs(err) <= VX_TOL and sign_ok and sat == 0
             all_ok &= ok
             tr.append(dict(t0=round(float(t[i0]), 2), sp=v, vx_err=round(err, 4),
