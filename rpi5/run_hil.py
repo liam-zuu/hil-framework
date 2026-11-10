@@ -211,6 +211,22 @@ def _owner_tick(box, publisher) -> None:
         box.publisher_dead()
 
 
+class _PhaseReporter:
+    """Stage E (L79): one '#phase,<PHASE>,t_ns=<monotonic ns>' line each time the phase the
+    1 kHz loop published in the control box changes, printed by the run owner (outside the
+    loop; the box cell is read without the lock), so hil_daemon.py can follow the run live.
+    The first line is the phase seen at the first call (PREPARE until the loop starts)."""
+
+    def __init__(self, box):
+        self.box, self.last = box, None
+
+    def __call__(self) -> None:
+        ph = self.box.phase()
+        if ph != self.last:
+            self.last = ph
+            log.info('#phase,%s,t_ns=%d', ph, time.monotonic_ns())
+
+
 def _finite_run_config(args, spec):
     """--finite-run: (LifecycleConfig, ceiling in steps), or SystemExit on a bad combination."""
     from run_lifecycle import LifecycleConfig
@@ -547,7 +563,8 @@ def main() -> int:
         )
         procs.append(p2)
         if control is not None:
-            owner = lambda: _owner_tick(control, p2)
+            phase_rep = _PhaseReporter(control)
+            owner = lambda: (_owner_tick(control, p2), phase_rep())
 
     log.info(
         "Starting HIL: traj=%s  mock=%s  steps=%d  spi=%d kHz",
@@ -582,6 +599,8 @@ def main() -> int:
     # Primary: wait for plant loop, printing its stats from here
     _report_plant_stats(p1, monitor, hil_cfg.stats_interval, step_csv, owner)
     p1.join()
+    if owner is not None:
+        phase_rep()                       # the last phase (END, or where an error left it)
     log.info("Plant process exited (code=%s)", p1.exitcode)
     if step_csv is not None:
         import json
