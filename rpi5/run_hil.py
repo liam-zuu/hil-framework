@@ -239,6 +239,9 @@ def _run_traj(spec, port: str, simulate: bool, shared_ref: mp.Array, uart_direct
     os.sched_setaffinity(0, {2})   # pin to core 2 (away from plant loop)
 
     from trajectory_pub import TrajectoryPublisher
+    if getattr(spec, 'task', ''):
+        import o1_tasks                    # C6: O1Spec -> o1_tasks setpoint (trajectory_pub unchanged)
+        o1_tasks.install()
     pub = TrajectoryPublisher(spec=spec, port=port, simulate=simulate,
                               shared_ref=shared_ref, uart_direct=uart_direct, control=control)
     pub.run()
@@ -314,6 +317,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument('--test',          default=None,
                    help='Spec S02 group A test ID (A-L1 ... A-K3): sets trajectory, speed, '
                         'duration; A-K* also put the plant in wheels-lifted mode')
+    p.add_argument('--o1',            default=None,
+                   choices=['O1-F02', 'O1-F05', 'O1-F08', 'O1-K1', 'O1-K2'],
+                   help='C6 (L76): O1 floor task from o1_tasks.py (figure 8 = the S03/S04 schedule of '
+                        'fwsim/o1_feasibility, K1, K2), plant on the floor; sets trajectory and duration')
+    p.add_argument('--allow-final-set', action='store_true',
+                   help='allow --o1 O1-K1 / O1-K2 (final test set, O1 3.7: not in any tuning step)')
     # Hardware
     p.add_argument('--uart-port',     default='/dev/ttyAMA0',
                    help='UART port for ESP32 (legacy --traj-uart-direct only)')
@@ -429,8 +438,8 @@ def main() -> int:
     load_rows, heavy_block, load_id = None, None, ''
     if args.load_schedule:
         # S06 Z8: full plant dynamics, relay running; nothing else may set omega or the trajectory
-        if n_modes or args.test or args.traj != 'idle' or args.no_traj or args.traj_loop:
-            raise SystemExit('--load-schedule excludes the omega modes, --test, --traj, --no-traj, --traj-loop')
+        if n_modes or args.test or args.o1 or args.traj != 'idle' or args.no_traj or args.traj_loop:
+            raise SystemExit('--load-schedule excludes the omega modes, --test, --o1, --traj, --no-traj, --traj-loop')
         import s06_load_schedule as lsched
         load_rows = lsched.read_csv(args.load_schedule)
         try:
@@ -481,6 +490,16 @@ def main() -> int:
         lifted = args.test in LIFTED_TESTS
         args.traj = traj_spec.kind
         log.info('Group A test %s: %s', args.test, traj_spec)
+    if args.o1:
+        if args.test or args.traj != 'idle' or args.duration or args.traj_loop:
+            raise SystemExit('--o1 excludes --test, --traj, --duration, --traj-loop')
+        import o1_tasks
+        try:
+            traj_spec = o1_tasks.make_spec(args.o1, args.allow_final_set)
+        except ValueError as exc:
+            raise SystemExit(str(exc))
+        args.traj = traj_spec.kind
+        log.info('O1 task %s (C6): %s', args.o1, traj_spec)
 
     control, owner = None, None
     if args.finite_run:

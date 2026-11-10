@@ -14,6 +14,10 @@ Usage:
 trajectory_pub.get_body_velocity (cung lich voi HIL), goi k gui o t = k / 50 s tinh tu
 luc bat dau (lich tuyet doi, khong troi theo thoi gian ngu), het bai gui 0 trong 0,2 s.
 In dong '#test_start' va '#test_end' co gio may (epoch, ISO) de ghep voi log xe.
+
+--o1 O1-F02|O1-F05|O1-F08|O1-K1|O1-K2 (C6, L76, Liam 10/11 "Duyet, lam luon"): nhiem vu san O1,
+lich cua rpi5/o1_tasks.py (so 8 = fwsim/o1_feasibility.Schedule, cung bo sinh voi S03/S04 va
+run_hil --o1); cung vong gui nhu --test. O1-K1, O1-K2 la tap kiem cuoi: can --allow-final-set.
 """
 
 import socket
@@ -63,8 +67,12 @@ def send_loop(ip: str, vx: float, vy: float, wz: float, duration: float = 0):
         sock.close()
         print(f"Done. Sent {n} packets total.")
 
-def test_schedule(test_id: str):
-    """(duration [s], f(t) -> (vx, vy, wz)) of a lifted-wheel test of group A (trajectory_pub)."""
+def test_schedule(test_id: str, allow_final_set: bool = False):
+    """(duration [s], f(t) -> (vx, vy, wz)) of a lifted-wheel test of group A (trajectory_pub)
+    or of an O1 floor task (o1_tasks, C6)."""
+    if test_id.startswith('O1-'):
+        import o1_tasks
+        return o1_tasks.task(test_id, allow_final_set)
     from trajectory_pub import GROUP_A, LIFTED_TESTS, get_body_velocity
     if test_id not in LIFTED_TESTS:
         raise ValueError(f'--test {test_id}: only the lifted-wheel tests {LIFTED_TESTS}')
@@ -72,10 +80,11 @@ def test_schedule(test_id: str):
     return spec.duration, (lambda t: get_body_velocity(t, spec))
 
 
-def test_loop(ip: str, test_id: str, sock=None, clock=time.time, sleep=time.sleep, out=print) -> int:
+def test_loop(ip: str, test_id: str, sock=None, clock=time.time, sleep=time.sleep, out=print,
+              allow_final_set: bool = False) -> int:
     """Send the schedule of test_id at SEND_HZ on an absolute time grid, then zeros; returns the
     number of schedule packets sent."""
-    duration, f = test_schedule(test_id)
+    duration, f = test_schedule(test_id, allow_final_set)
     own = sock is None
     sock = sock or socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     n_total = int(round(duration * SEND_HZ))
@@ -145,9 +154,21 @@ if __name__ == "__main__":
     parser.add_argument("--sweep",    action="store_true",  help="Run sweep scenario")
     parser.add_argument("--test",     default=None, choices=["A-K1", "A-K2", "A-K3"],
                         help="lifted-wheel test of group A, schedule of trajectory_pub (C5)")
+    parser.add_argument("--o1",       default=None,
+                        choices=["O1-F02", "O1-F05", "O1-F08", "O1-K1", "O1-K2"],
+                        help="O1 floor task, schedule of o1_tasks (C6)")
+    parser.add_argument("--allow-final-set", action="store_true",
+                        help="allow O1-K1, O1-K2 (final test set, O1 3.7: camera trial or final check only)")
     args = parser.parse_args()
 
-    if args.test:
+    if args.test and args.o1:
+        parser.error("--test and --o1 exclude each other")
+    if args.o1:
+        try:
+            test_loop(args.ip, args.o1, allow_final_set=args.allow_final_set)
+        except ValueError as exc:
+            parser.error(str(exc))
+    elif args.test:
         test_loop(args.ip, args.test)
     elif args.sweep:
         sweep_loop(args.ip)
