@@ -407,7 +407,8 @@ def freeze(ds: str, campaign: str, stop_reason: str, gain_set: str, gain_file: s
     if any(r['campaign'] == campaign for r in read_rows(os.path.join(ds, FREEZE))):
         raise LogError(f'{campaign} already frozen')
     row = {'campaign': campaign, 'frozen_at': at or _iso(now()), 'stop_reason': stop_reason,
-           'gain_set_id': gain_set, 'gain_file': gain_file, 'gain_sha256': sha256_file(gain_file), 'notes': notes}
+           'gain_set_id': gain_set, 'gain_file': gain_file.replace('\\', '/'),       # same text on any OS
+           'gain_sha256': sha256_file(gain_file), 'notes': notes}
     append_row(os.path.join(ds, FREEZE), FREEZE_COLS, row)
     return row
 
