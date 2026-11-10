@@ -1,5 +1,5 @@
 """
-Panel UART protocol — RPi5 daemon <-> panel ESP32 (WROOM + ST7796, QĐ 17, M2).
+Panel UART protocol — RPi5 daemon <-> panel ESP32 (ESP32-S3 + ST7796, QĐ 17, M2).
 
 Contract (workflow v3.1 section 9.6; Codex rounds 2-3 #15, #44, #45; Liam approved B0 29/10;
 B0 review round 1 B1, B15-B18; round 2 B23-B29; round 3 B52-B58, N12-N16; round 4 V1-V5,
@@ -8,7 +8,13 @@ the frame in a byte buffer, never send a C struct with padding) and the panel ru
 PanelClient below (the reference the C code is checked against). The daemon runs in its own
 process, never inside the 1 kHz loop. Version 5: 16-bit command seq that never wraps inside
 a session; STATUS carries the command code of the last frame handled, so an ACK matches a
-command by seq AND code (V1, V3).
+command by seq AND code (V1, V3). Version 6 (Liam 04/11, PANEL session): adds the INFO
+frame (0xDF) for what M2 shows beyond STATUS; the three older layouts are unchanged, only the
+version byte is 6. Revised inside v6 before any board run: INFO result_run names the run the
+result lines belong to (Codex round 3 R1-R5, Liam 04/11, PANEL session: "(a) Sửa gốc + R3");
+STATUS carries run_no, so every STATUS says which run it belongs to and the panel infers
+nothing (Codex round 4 S1-S6, Liam 04/11, PANEL session: "A: run_no vào STATUS"; STATUS is
+32 bytes, CMD and PROFILE keep their layout).
 
 Frames (multi-byte fields little-endian; every frame ends with CRC-16/CCITT-FALSE,
 poly 0x1021, init 0xFFFF, over all previous bytes of the frame, start byte included):
@@ -22,7 +28,7 @@ poly 0x1021, init 0xFFFF, over all previous bytes of the frame, start byte inclu
     9-10  arg        uint16 (HELLO: panel_boot; SELECT/START: profile index 0..PROFILE_MAX)
     11-12 crc
 
-  STATUS  daemon -> panel, 30 bytes, ~10 Hz and after every command
+  STATUS  daemon -> panel, 32 bytes, ~10 Hz and after every command
     0     0xDD
     1     version
     2-5   sid           current session id (0 = none: the panel sends HELLO)
@@ -44,7 +50,13 @@ poly 0x1021, init 0xFFFF, over all previous bytes of the frame, start byte inclu
     25    links         L_* bits
     26    error_code    0 = none (table: decided with panel M2, B19)
     27    last_cmd      CMD_* of the last command handled (0 while last_result is RES_NONE)
-    28-29 crc
+    28-29 run_no        the run this STATUS is about: the current run, or the last one when
+                        none is active; +1 at every run start, from the panel or from the PC;
+                        1..65535, never reused inside one daemon run: at 65535 START is
+                        refused until the daemon restarts (new epoch; Codex round 5 T1, T2,
+                        Liam 05/11: "(a) Chặn quay vòng"); 0 = no run since the run manager
+                        started
+    30-31 crc
 
   PROFILE daemon -> panel, 28 bytes, the list the panel scrolls with NAV
     0     0xDE
@@ -54,6 +66,26 @@ poly 0x1021, init 0xFFFF, over all previous bytes of the frame, start byte inclu
     7     count
     8-25  name, ASCII, NUL padded (18 bytes)
     26-27 crc
+
+  INFO    daemon -> panel, 106 bytes, ~1 Hz and when it changes (v6). Text is formatted by
+          the daemon; the panel draws it as it is (no tables on the panel).
+    0     0xDF
+    1     version
+    2-5   sid
+    6-7   loop_us       turnaround of the 1 kHz loop [us] in the last statistics window,
+                        saturates (shown only with I_LOOP_VALID)
+    8-9   overruns      missed deadlines of the 1 kHz loop in this run, saturates
+    10    flags         I_* bits
+    11    ctrl_src      CTRL_SRC_*: where the controller name comes from
+    12-19 ctrl          controller running on the DUT, ASCII, NUL padded (8)
+    20-79 result        3 lines of 20 ASCII, NUL padded: RESULT screen (metrics of the last
+                        finished run); an empty line is not drawn. While a run is active
+                        (ST_ACTIVE) the daemon sends no result (I_RESULT_VALID clear)
+    80-81 result_run    the run (STATUS run_no) the result lines belong to; 0 = no result
+                        lines (I_RESULT_VALID is set only with result_run != 0). The panel
+                        shows them only under the END of that run
+    82-103 error_text   ASCII, NUL padded (22): what the FAULT screen says under error_code
+    104-105 crc
 
 Daemon rules (DaemonSession):
   * Epoch (B23, B52/N13): next_daemon_epoch() reads, increments and writes the epoch file
@@ -94,16 +126,24 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-PROTO_VERSION = 5
+PROTO_VERSION = 6
 
 START_CMD     = 0xCC
 START_STATUS  = 0xDD
 START_PROFILE = 0xDE
+START_INFO    = 0xDF
 LEN_CMD     = 13
-LEN_STATUS  = 30
+LEN_STATUS  = 32
 LEN_PROFILE = 28
+LEN_INFO    = 106
 NAME_LEN    = 18
-_LEN = {START_CMD: LEN_CMD, START_STATUS: LEN_STATUS, START_PROFILE: LEN_PROFILE}
+CTRL_LEN    = 8
+RESULT_LINES = 3
+RESULT_LEN  = 20
+ERROR_TEXT_LEN = 22
+RUN_NO_MAX  = 0xFFFF        # run_no counts 1..RUN_NO_MAX, never wraps in one daemon (0 = no run)
+_LEN = {START_CMD: LEN_CMD, START_STATUS: LEN_STATUS, START_PROFILE: LEN_PROFILE,
+        START_INFO: LEN_INFO}
 
 PROFILE_MAX  = 254
 PROFILE_NONE = 0xFF
@@ -149,6 +189,15 @@ L_RPI   = 1 << 0            # daemon alive (implicit, set by the daemon)
 L_H7    = 1 << 1            # fresh SPI answers
 L_ESP32 = 1 << 2            # known only after the H7 status bit exists: else '—'
 L_ESP32_KNOWN = 1 << 3
+
+# INFO flags (v6)
+I_LOOP_VALID   = 1 << 0     # loop_us / overruns come from the loop statistics
+I_RESULT_VALID = 1 << 1     # result lines belong to the last finished run
+
+# Where the controller name in INFO comes from (v6; workflow 9.6: load profile + level of proof)
+CTRL_SRC_NONE    = 0        # unknown: the panel shows '-'
+CTRL_SRC_PROFILE = 1        # from the load profile (what should have been flashed), not checked
+CTRL_SRC_FW      = 2        # from the firmware identity line #FW printed by the DUT
 
 
 def crc16(data: bytes) -> int:
@@ -205,6 +254,7 @@ class Status:
     links: int = L_RPI
     error_code: int = 0
     last_cmd: int = 0
+    run_no: int = 0          # run this STATUS is about (0 = none yet)
 
 
 @dataclass
@@ -215,7 +265,7 @@ class Profile:
     name: str
 
 
-_STATUS_FMT = '<IHHHBHBHBBBHHBBB'     # bytes 2..27
+_STATUS_FMT = '<IHHHBHBHBBBHHBBBH'    # bytes 2..29
 
 
 def encode_status(s: Status) -> bytes:
@@ -226,7 +276,7 @@ def encode_status(s: Status) -> bytes:
                      s.last_cmd_seq & 0xFFFF, s.last_result & 0xFF, s.next_seq & 0xFFFF, s.run_state & 0xFF,
                      _sat16(s.phase_ds), s.profile & 0xFF, s.outcome & 0xFF, s.quality & 0xFF,
                      _sat16(s.lost), _sat16(s.data_age_ms), s.links & 0xFF, s.error_code & 0xFF,
-                     s.last_cmd & 0xFF)
+                     s.last_cmd & 0xFF, s.run_no & 0xFFFF)
     return _seal(buf)
 
 
@@ -239,8 +289,58 @@ def encode_profile(sid: int, index: int, count: int, name: str) -> bytes:
     return _seal(buf)
 
 
+@dataclass
+class Info:
+    sid: int = 0
+    loop_us: int = 0
+    overruns: int = 0
+    flags: int = 0
+    ctrl_src: int = CTRL_SRC_NONE
+    ctrl: str = ''
+    result: tuple = ('', '', '')
+    error_text: str = ''
+    result_run: int = 0
+
+
+def next_run_no(run_no: int) -> int:
+    """run_no of the next run: 1..RUN_NO_MAX, never 0, never wraps (Codex round 5 T1, T2,
+    Liam 05/11: "(a) Chặn quay vòng"): a run number is not used twice inside one daemon run,
+    so at RUN_NO_MAX it raises OverflowError and the run manager refuses START (RES_FAILED)
+    until the daemon restarts with a new epoch."""
+    if run_no < 0:
+        raise ValueError('run_no < 0: %d' % run_no)
+    if run_no >= RUN_NO_MAX:
+        raise OverflowError('run_no %d: no run number left in this daemon run, restart it'
+                            % run_no)
+    return run_no + 1
+
+
+def _ascii(text: str, n: int) -> bytes:
+    raw = text.encode('ascii', errors='replace')[:n]
+    return raw + bytes(n - len(raw))
+
+
+def _text(raw: bytes) -> str:
+    return raw.split(b'\x00', 1)[0].decode('ascii', errors='replace')
+
+
+def encode_info(i: Info) -> bytes:
+    lines = tuple(i.result)[:RESULT_LINES]
+    lines = lines + ('',) * (RESULT_LINES - len(lines))
+    buf = bytearray(LEN_INFO)
+    buf[0], buf[1] = START_INFO, PROTO_VERSION
+    struct.pack_into('<IHHBB', buf, 2, i.sid & 0xFFFFFFFF, _sat16(i.loop_us), _sat16(i.overruns),
+                     i.flags & 0xFF, i.ctrl_src & 0xFF)
+    buf[12:20] = _ascii(i.ctrl, CTRL_LEN)
+    for k, line in enumerate(lines):
+        buf[20 + k * RESULT_LEN:20 + (k + 1) * RESULT_LEN] = _ascii(line, RESULT_LEN)
+    struct.pack_into('<H', buf, 80, i.result_run & 0xFFFF)
+    buf[82:104] = _ascii(i.error_text, ERROR_TEXT_LEN)
+    return _seal(buf)
+
+
 def decode(frame: bytes):
-    """One complete, checked frame -> Cmd / Status / Profile."""
+    """One complete, checked frame -> Cmd / Status / Profile / Info."""
     start = frame[0]
     if start == START_CMD:
         return Cmd(*struct.unpack_from('<IHBH', frame, 2))
@@ -250,6 +350,13 @@ def decode(frame: bytes):
         sid, index, count = struct.unpack_from('<IBB', frame, 2)
         name = frame[8:8 + NAME_LEN].split(b'\x00', 1)[0].decode('ascii', errors='replace')
         return Profile(sid, index, count, name)
+    if start == START_INFO:
+        sid, loop_us, overruns, flags, ctrl_src = struct.unpack_from('<IHHBB', frame, 2)
+        result = tuple(_text(frame[20 + k * RESULT_LEN:20 + (k + 1) * RESULT_LEN])
+                       for k in range(RESULT_LINES))
+        result_run, = struct.unpack_from('<H', frame, 80)
+        return Info(sid, loop_us, overruns, flags, ctrl_src, _text(frame[12:20]), result,
+                    _text(frame[82:104]), result_run)
     raise ValueError(f"unknown start byte 0x{start:02X}")
 
 
@@ -262,7 +369,7 @@ class StreamParser:
     complete frame waits in the UART path: a frame the panel gave up on can still arrive and
     run later (V1); the seq rules and PanelClient's STOP / SYNC handling account for it."""
 
-    def __init__(self, accept=(START_CMD, START_STATUS, START_PROFILE), stale_s: float = 0.05,
+    def __init__(self, accept=(START_CMD, START_STATUS, START_PROFILE, START_INFO), stale_s: float = 0.05,
                  clock: Callable[[], float] = time.monotonic):
         self.accept = set(accept)
         self.stale_s = stale_s
@@ -518,7 +625,12 @@ class PanelClient:
         active (ST_ACTIVE); a new START, an active run_state after that, or a lost session
         clears it (V5).
       * PROFILE list: kept per session; if not all `count` entries arrived PROFILE_WAIT_MS
-        after the session started (or the last request), send PROFILES.
+        after the session started (or the last request), send PROFILES. A PROFILE with
+        another count than the list kept starts a new list (names of the old one dropped,
+        Codex Q4).
+      * INFO (v6): the newest INFO of the session is kept (`info`) and drawn as it is; INFO of
+        another sid is ignored; a lost session forgets it. Nothing is sent for INFO: a missing
+        INFO only leaves the fields unknown ('-').
     tick(now_ms) and the on_* methods return the frames to send now.
     """
 
@@ -540,6 +652,7 @@ class PanelClient:
         self._t_session: Optional[float] = None
         self._t_hello: Optional[float] = None
         self.fence = False                          # SYNC at next_seq still due after the handshake (W1)
+        self.info: Optional[Info] = None            # newest INFO of the session (v6)
 
     def _new_boot(self) -> int:
         while True:
@@ -631,6 +744,7 @@ class PanelClient:
         self.boot = self._new_boot()
         self.sid, self.next_seq, self.daemon_boot = 0, None, None
         self.profiles, self.profile_count, self._t_session = {}, None, None
+        self.info = None
         self._t_hello = None
         return self.tick(now_ms)
 
@@ -689,9 +803,15 @@ class PanelClient:
 
     def on_profile(self, pr: Profile) -> None:
         if self.sid and pr.sid == self.sid:
+            if self.profile_count is not None and pr.count != self.profile_count:
+                self.profiles = {}                  # another list: old names do not belong (Q4)
             self.profile_count = pr.count
             if pr.index < pr.count:                 # an empty list is one PROFILE with count 0
                 self.profiles[pr.index] = pr.name
+
+    def on_info(self, info: Info) -> None:
+        if self.sid and info.sid == self.sid:
+            self.info = info
 
 
 # ── daemon side: non-blocking UART writer (9.6) ───────────────────────────
@@ -703,29 +823,50 @@ class TxQueue:
     frames interleaved. Only the newest STATUS waits, and a STATUS not started yet is replaced
     by a newer one. STATUS goes before PROFILE frames, also before one already taken for
     sending that has no byte out yet (B58/N16); PROFILE frames queue up to max_profiles
-    (oldest dropped) and belong to one session."""
+    (oldest dropped) and belong to one session. INFO (v6) is kept like STATUS (only the
+    newest waits) and goes after STATUS, before PROFILE, also before a PROFILE taken for
+    sending that has no byte out yet (Codex P12); a STATUS also goes before an INFO taken for
+    sending that has no byte out yet. clear_session() drops what belongs to the old session
+    and has not started (PROFILE, INFO; Codex P13)."""
 
     def __init__(self, write_fn: Callable[[bytes], int], max_profiles: int = 64):
         self.write_fn = write_fn
         self._current = b''          # frame being sent
         self._sent = 0               # bytes of _current already out
         self._status: Optional[bytes] = None
+        self._info: Optional[bytes] = None
         self._profiles: deque = deque()
         self.max_profiles = max_profiles
         self.dropped_status = 0
         self.dropped_profiles = 0
+        self.dropped_info = 0
 
     def put(self, frame: bytes) -> None:
         if frame[0] == START_STATUS:
             if self._current and self._sent == 0:
                 if self._current[0] == START_STATUS:
                     self.dropped_status += 1
+                elif self._current[0] == START_INFO:
+                    if self._info is None:
+                        self._info = self._current             # waits behind the STATUS
+                    else:
+                        self.dropped_info += 1                 # a newer INFO already waits
                 else:
                     self._profiles.appendleft(self._current)    # waits behind the STATUS
                 self._current = b''
             if self._status is not None:
                 self.dropped_status += 1
             self._status = frame
+        elif frame[0] == START_INFO:
+            if self._current and self._sent == 0 and self._current[0] == START_INFO:
+                self._current = b''
+                self.dropped_info += 1
+            elif self._current and self._sent == 0 and self._current[0] == START_PROFILE:
+                self._profiles.appendleft(self._current)        # waits behind the INFO (P12)
+                self._current = b''
+            if self._info is not None:
+                self.dropped_info += 1
+            self._info = frame
         else:
             if len(self._profiles) >= self.max_profiles:
                 self._profiles.popleft()
@@ -741,8 +882,19 @@ class TxQueue:
         self.dropped_profiles += len(self._profiles)
         self._profiles.clear()
 
+    def clear_session(self) -> None:
+        """New session: PROFILE and INFO frames of the old one that have no byte out yet are
+        not sent (P13); a frame already started finishes. STATUS is always the newest."""
+        self.clear_profiles()
+        if self._current and self._current[0] == START_INFO and self._sent == 0:
+            self._current = b''
+            self.dropped_info += 1
+        if self._info is not None:
+            self._info = None
+            self.dropped_info += 1
+
     def pending(self) -> bool:
-        return bool(self._current or self._status or self._profiles)
+        return bool(self._current or self._status or self._info or self._profiles)
 
     def pump(self, max_bytes: Optional[int] = None) -> int:
         """Write what the UART takes now, at most max_bytes (a bounded amount of work per call
@@ -752,6 +904,8 @@ class TxQueue:
             if not self._current:
                 if self._status is not None:
                     self._current, self._status = self._status, None
+                elif self._info is not None:
+                    self._current, self._info = self._info, None
                 elif self._profiles:
                     self._current = self._profiles.popleft()
                 else:
