@@ -96,8 +96,12 @@ FACTORS = {m: list(tune_ga.VARS_BY_MODE[m]) for m in CONTROLLERS}       # X1..X7
 K_PSI_DEFAULT = 1.0           # heading.h HEADING_PARAMS_DEFAULT (no getter in fw_sim.c); AGV b0047ac line 25
 OMEGA_O_MAX = 48.0            # S03 section 2.1: convention from the adrc.c comment, not a stability bound
 N_GRID = 11
-IMU = dict(rate_hz=20.0, boot_reset=-1.0)     # BNO085 20 Hz, noise-free (S03 section 3.3)
-SEED = 1                                      # plant seed (no random input; recorded)
+SEED = 1                                      # plant seed (no random plant input) and IMU noise seed; recorded
+# BNO085 20 Hz (C4, L73) with the replay of the measured noise, seed fixed = SEED (S03 v8
+# section 3.3: "when the IMU noise model is turned on, S03 is run again with a fixed seed
+# recorded in meta.yaml"; IMN-7, Liam 10/11 "Lam IMN-7 + S03"). The noise-free configuration of
+# S03/2026-11-09_run01 is dict(rate_hz=20.0, boot_reset=-1.0): re-run it from script 6f93607.
+IMU = dict(rate_hz=20.0, boot_reset=-1.0, noise='replay', noise_seed=SEED)
 DET_SEED = 20261106                           # S03 section 3.4: seed that draws the 3 corners, fixed before running
 THRESH = {'e_perp_max': 0.01, 'e_perp_max_cens': 0.01, 'sat_frac': 0.01}   # S03 section 5.2; tv_duty: 20 %
 Y3_REL = 0.20
@@ -1134,7 +1138,7 @@ plant_check: chua_X3
 mu_levels: {json.dumps(mu_levels)}
 mu_source: "{a.mu_source or ('trial: fwsim assumption 0.5 (params.py), no MU_FLOOR measurement yet' if a.trial else '')}"
 imu: {json.dumps(IMU)}
-seed: {SEED}                       # plant has no random input
+seed: {SEED}                       # plant has no random input; IMU noise replay seed (imu.noise_seed)
 determinism_seed: {DET_SEED}       # draws the 3 corners of the determinism check (S03 3.4)
 determinism: "{det_public}"
 speeds: {json.dumps(list(SPEEDS))}

@@ -44,7 +44,7 @@ sys.path.insert(0, os.path.join(HERE, '..', 'rpi5'))
 from params import MecanumParams              # noqa: E402
 from plant_step import plant_step, traction_nsub   # noqa: E402
 from trajectory_pub import TrajectorySpec, get_body_velocity   # noqa: E402
-from imu_model import imu_from_plant, firmware_view          # noqa: E402
+from imu_model import imu_from_plant, firmware_view, ImuNoise          # noqa: E402
 from plant_blob import plant_source           # noqa: E402
 # L34 (Fable F-ND #7): git blobs of the plant_step.py / params.py imported just above, taken
 # now (not from the DLL build); written by plant_meta() into every meta.yaml 'plant'
@@ -285,8 +285,10 @@ def simulate(fw, setpoint, duration, params=None, seed=0, sp_rate_hz=50.0, pcnt_
       init_fail   True: imu_init() failed (spec section 7), motors never turn on
       resets      further SH2_RESET times [s]
       injection   imu_model.GyroInjection (method C) or None
-      noise       imu_model.ImuNoise (replay of the measured noise, L72) or None (default:
-                  noise-free, as before); applied after the injection, once per report;
+      noise       imu_model.ImuNoise (replay of the measured noise, L72), or 'replay' with
+                  noise_seed (JSON form for meta.yaml: ImuNoise(rate_hz, noise_seed) is made
+                  here, IMN-7), or None (default: noise-free, as before); applied after the
+                  injection, once per report;
                   with noise the values then go through imu_model.firmware_view (SPI frame,
                   H7 SH-2 packing, ESP32 library: what the firmware gets on HIL, IMN-2)
       hook        f(t, kind, value) -> value or None (drop the report): faults for tests
@@ -318,6 +320,10 @@ def simulate(fw, setpoint, duration, params=None, seed=0, sp_rate_hz=50.0, pcnt_
     resets = sorted(imu.get('resets', []))
     inj = imu.get('injection')
     noise = imu.get('noise')
+    if noise == 'replay':
+        noise = ImuNoise(imu.get('rate_hz', 20.0), seed=int(imu['noise_seed']))
+    elif isinstance(noise, str):
+        raise ValueError(f"imu noise {noise!r}: 'replay', an ImuNoise or None")
     hook = imu.get('hook') or (lambda t, kind, v: v)
     if use_imu:
         fw.imu_reset(int(round(imu.get('boot_reset', -1.0) * 1e6)))
@@ -427,6 +433,10 @@ def add_plant_imu_args(ap):
     ap.add_argument('--imu-boot-reset', type=float, default=-1.0,
                     help="time of the chip's boot SH2_RESET [s] (default -1: before the run); set from the measured init_ms")
     ap.add_argument('--no-imu', action='store_true', help='no IMU reports: only to re-run pre-28/10 runs (QD 23: every firmware has the IMU)')
+    ap.add_argument('--imu-noise', choices=['replay', 'off'], default='replay',
+                    help='replay of the measured BNO085 noise (imu_model.ImuNoise, L72, IMN-7; default) '
+                         'or off: noise-free reports, only to re-run runs made before 10/11/2026')
+    ap.add_argument('--imu-noise-seed', type=int, default=0, help='seed of the noise replay (start row)')
     ap.add_argument('--ground', choices=['rigid', 'traction'], default=None,
                     help='plant ground contact (default: params.py ground_model); traction = slip method A')
     ap.add_argument('--mu', type=float, default=None, help='mu_hd of all four wheels for --ground traction')
@@ -445,8 +455,14 @@ def plant_params(a, wheels_lifted=False):
 
 
 def imu_config(a):
-    """simulate(imu=...) from the --imu-rate / --imu-boot-reset / --no-imu options."""
-    return None if a.no_imu else dict(rate_hz=a.imu_rate, boot_reset=a.imu_boot_reset)
+    """simulate(imu=...) from the --imu-rate / --imu-boot-reset / --no-imu / --imu-noise options
+    (JSON-able: written as is into meta.yaml)."""
+    if a.no_imu:
+        return None
+    cfg = dict(rate_hz=a.imu_rate, boot_reset=a.imu_boot_reset)
+    if getattr(a, 'imu_noise', 'off') == 'replay':
+        cfg.update(noise='replay', noise_seed=int(getattr(a, 'imu_noise_seed', 0)))
+    return cfg
 
 
 def lib_versions():

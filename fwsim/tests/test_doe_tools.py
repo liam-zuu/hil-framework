@@ -40,7 +40,9 @@ def turn(t):
 
 def test_plant_and_imu_options():
     a = sim_args()
-    assert fwsim.imu_config(a) == dict(rate_hz=20.0, boot_reset=-1.0)
+    assert fwsim.imu_config(a) == dict(rate_hz=20.0, boot_reset=-1.0, noise='replay', noise_seed=0)   # IMN-7
+    assert fwsim.imu_config(sim_args('--imu-noise', 'off')) == dict(rate_hz=20.0, boot_reset=-1.0)
+    assert fwsim.imu_config(sim_args('--imu-noise-seed', '3'))['noise_seed'] == 3
     assert fwsim.plant_params(a).ground_model == 'traction'          # params.py default since 0928e78
     b = sim_args('--no-imu', '--ground', 'rigid')
     assert fwsim.imu_config(b) is None and fwsim.plant_params(b).ground_model == 'rigid'
@@ -99,5 +101,5 @@ def test_ga_evaluation_passes_imu_and_fresh_params(fw, monkeypatch):
     out = {}
     prob._evaluate(np.array([1.5, 0.05, 1.0, 0.05]), out)
     assert len(seen) == 2 and seen[0][0] != seen[1][0]           # a new params object per run
-    assert all(g == 'traction' and imu == dict(rate_hz=100.0, boot_reset=-1.0) for _, g, imu in seen)
+    assert all(g == 'traction' and imu == dict(rate_hz=100.0, boot_reset=-1.0, noise='replay', noise_seed=0) for _, g, imu in seen)
     assert np.all(np.isfinite(out['F'])) and len(history) == 1

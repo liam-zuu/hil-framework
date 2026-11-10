@@ -903,7 +903,8 @@ def gen_compare(gen_base):
 
 
 SOURCES = ('fwsim/s04_ga.py', 'fwsim/s03_doe.py', 'fwsim/o1_feasibility.py', 'fwsim/fwsim.py', 'fwsim/tune_ga.py',
-           'rpi5/trajectory_pub.py', 'rpi5/imu_model.py', 'rpi5/plant_blob.py', 'tools/run_validity.py')
+           'rpi5/trajectory_pub.py', 'rpi5/imu_model.py', 'rpi5/plant_blob.py', 'tools/run_validity.py',
+           'rpi5/data/imu_noise_replay_20hz.csv', 'rpi5/data/imu_noise_replay_100hz.csv')   # IMN-7: replay data
 PYMOO_FILES = ('core/individual.py', 'core/survival.py', 'algorithms/moo/nsga2.py')     # PYMOO_CV refers to these
 
 

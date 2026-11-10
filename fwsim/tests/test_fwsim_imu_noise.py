@@ -109,3 +109,21 @@ def test_no_noise_is_the_old_behaviour(fw):
     if not (str(b.get('commit', '')).startswith('54b7269') and not b.get('dirty', True)):
         pytest.skip('baseline hash is for the DLL of AGV 54b7269')
     assert _base_run(fw) == BASELINE_6F93607
+
+
+def test_json_noise_config_is_the_replay(fw):
+    """IMN-7: simulate(imu=dict(..., noise='replay', noise_seed=s)) (the JSON form S03, S04 and the
+    CLI write into meta.yaml) is the same run as with ImuNoise(rate, s); a wrong name is refused."""
+    a = _run(fw, ImuNoise(20.0, seed=2))
+    b = fwsim.simulate(fw, _turn, 3.0, seed=0, mode='PID', imu=dict(rate_hz=20.0, noise='replay', noise_seed=2))
+    assert np.array_equal(np.asarray(a['duty']), np.asarray(b['duty']))
+    assert np.array_equal(np.asarray(a['imu']), np.asarray(b['imu']))
+    with pytest.raises(ValueError):
+        fwsim.simulate(fw, _turn, 0.5, seed=0, mode='PID', imu=dict(rate_hz=20.0, noise='gauss', noise_seed=2))
+
+
+def test_s03_and_s04_use_the_replay_noise():
+    import s03_doe as s3
+    import s04_ga as s4
+    assert s3.IMU == dict(rate_hz=20.0, boot_reset=-1.0, noise='replay', noise_seed=s3.SEED)
+    assert {'rpi5/data/imu_noise_replay_20hz.csv', 'rpi5/data/imu_noise_replay_100hz.csv'} <= set(s4.SIM_SOURCES)
