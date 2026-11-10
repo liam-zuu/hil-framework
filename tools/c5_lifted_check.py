@@ -16,7 +16,14 @@ Reads <run>.csv, <run>.csv.summary.json and <run>.csv.events.txt (agv_logger out
            one '#run_end' group with no footer and no tail line missing, log_qdrop unchanged
   motor    motor_on rises once and falls once, the fall after the last non-zero setpoint
   imu      imu_init = 0 on every line; wz_src = 1 on >= 99 % of motor-on lines from T_settle
-           after the rise; slip_flag = 0 on every motor-on line
+           after the rise
+  slip     no WRONG slip flag (Liam 10/11 CODE local_796cfeea "cham khong bat nham", replacing
+           "slip_flag = 0 on every motor-on line"): the body of a lifted-wheel test does not turn,
+           so the true IMU-encoder inconsistency is r_true = wz_enc - 0 = the log column wz;
+           each rise of slip_flag during motor-on is RIGHT when mean |wz| over the T_slip before
+           it is >= r_th / 2 (spec controller-IMU v2.6 section 6.1 classification), else WRONG.
+           A free-spinning lifted car whose left and right wheels turn at different speeds
+           raises the flag rightly (CAR_LIFTED/2026-11-10_run01 pid_k1a_r2: wz_enc -0.107 rad/s)
   pos      no pose reset in the middle of the run (tools/run_validity.pos_reset_mid = 0, L37)
   track    each hold phase of the schedule with a non-zero vx setpoint (>= 1.5 s): over its last
            1 s, |mean vx (encoder) - setpoint| <= 0.015 m/s (5 % of 0.3 m/s), the mean rpm of every
@@ -49,6 +56,10 @@ HOLD_MIN_S = 1.5
 LAST_S = 1.0
 STOP_WIN_S = 1.5
 WHEELS = ('fl', 'fr', 'rl', 'rr')
+# Slip flag of firmware AGV 54b7269 (imu_fusion.h IMU_FUSION_PARAMS_DEFAULT): r_th = k_r * sqrt(sigma_gz^2 + q_wz^2)
+# with k_r 4, sigma_gz 0 (bias estimation off), q_wz 0.0196 rad/s; T_slip 200 ms. Change with the firmware.
+SLIP_R_TH = 4.0 * 0.0196
+SLIP_T_S = 0.2
 FW_RE = re.compile(r'#fw,sha=([0-9a-fA-F]+|unknown),dirty=(\d),env=(\S+)')
 
 
@@ -161,10 +172,26 @@ def check(col, summ, events, test_id, expect_sha, expect_env, t_settle=T_SETTLE_
     wz_src, slip = col('wz_src'), col('slip_flag')
     after = run & (t >= t[r0] + t_settle)
     share = float(np.mean(wz_src[after] == 1)) if after.any() else float('nan')
-    n_slip = int(np.sum(slip[run] != 0))
-    ok = bool(np.all(init == 0)) and after.any() and share >= WZ_SRC_MIN and n_slip == 0
+    ok = bool(np.all(init == 0)) and after.any() and share >= WZ_SRC_MIN
     add('imu', ok, f'imu_init {sorted(set(init[np.isfinite(init)].astype(int).tolist()))}, wz_src=1 on '
-        f'{share:.4f} of lines from T_settle {t_settle} s, slip_flag lines {n_slip}')
+        f'{share:.4f} of lines from T_settle {t_settle} s')
+
+    # slip: no wrong flag (lifted body: r_true = wz_enc)
+    wz_enc = col('wz')
+    sflag = np.nan_to_num(slip) != 0
+    n_slip = int(np.sum(sflag & run))
+    ups = [i for i in np.nonzero(np.diff(sflag.astype(int)) > 0)[0] + 1 if run[i]]
+    if sflag[0] and run[0]:
+        ups = [0] + ups
+    right, wrong = [], []
+    for i in ups:
+        w = (t > t[i] - SLIP_T_S - 1e-9) & (t <= t[i])
+        m = float(np.nanmean(np.abs(wz_enc[w])))
+        (right if m >= SLIP_R_TH / 2 else wrong).append((round(float(t[i]), 2), round(m, 4)))
+    wz_run = wz_enc[run] if run.any() else np.array([np.nan])
+    add('slip', not wrong, f'slip_flag lines {n_slip}, rises {len(ups)}: right {len(right)}, wrong {len(wrong)}'
+        + (f' {wrong[:3]}' if wrong else '') + f' (r_th/2 {SLIP_R_TH / 2:.4f}); '
+        f'wz_enc motor-on mean {float(np.nanmean(wz_run)):+.4f}, max |.| {float(np.nanmax(np.abs(wz_run))):.4f} rad/s')
 
     # pos
     try:

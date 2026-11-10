@@ -107,7 +107,8 @@ def _set(rows, t0, t1, **vals):
     (dict(fn=lambda r: _set(r, 6.0, 6.2, motor_on=0)), 'motor'),                 # second rise
     (dict(fn=lambda r: _set(r, 0.0, 99.0, imu_init=3)), 'imu'),
     (dict(fn=lambda r: _set(r, 2.0, 2.2, wz_src=0)), 'imu'),                     # 20 of ~1050 lines < 99 %
-    (dict(fn=lambda r: _set(r, 5.0, 5.01, slip_flag=1)), 'imu'),
+    (dict(fn=lambda r: _set(r, 5.0, 5.01, slip_flag=1)), 'slip'),                # flag with wz_enc 0: wrong
+    (dict(fn=lambda r: (_set(r, 4.0, 5.0, wz=0.02), _set(r, 5.0, 5.3, slip_flag=1))), 'slip'),  # 0.02 < r_th/2
     (dict(fn=lambda r: _set(r, 5.0, 5.01, pos_reset_n=2)), 'pos'),
     (dict(fn=lambda r: _set(r, 6.2, 7.0, vx=0.32)), 'track'),                    # last 1 s off by 0.02
     (dict(fn=lambda r: _set(r, 4.0, 7.0, rr_rpm=-60)), 'track'),                 # one wheel the wrong way
@@ -123,6 +124,15 @@ def test_each_criterion_fails_on_its_mutation(tmp_path, capsys, case, expect):
 def test_small_wz_src_dropout_is_tolerated(tmp_path, capsys):
     rc, last = _mutate(tmp_path, capsys, fn=lambda r: _set(r, 2.0, 2.05, wz_src=0))   # 5 lines < 1 %
     assert rc == 0
+
+
+def test_right_slip_flag_on_lifted_wheels_passes(tmp_path, capsys):
+    # left and right wheels at different speeds, body still: wz_enc -0.107 (CAR_LIFTED 10/11) -> flag is right
+    def fn(rows):
+        _set(rows, 4.0, 6.0, wz=-0.107)
+        _set(rows, 4.3, 6.2, slip_flag=1)
+    rc, last = _mutate(tmp_path, capsys, fn=fn)
+    assert rc == 0, last
 
 
 def test_stop_reverse_spin_is_recorded_not_scored(tmp_path, capsys):
