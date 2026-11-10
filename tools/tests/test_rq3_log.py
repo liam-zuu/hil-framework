@@ -38,6 +38,21 @@ def tick(clock, s):
     clock[0] += dt.timedelta(seconds=s)
 
 
+def gain_file(d, name='g.json'):
+    p = os.path.join(d, name)
+    if not os.path.exists(p):
+        with open(p, 'w', encoding='utf-8') as f:
+            f.write('{"kp_xy": 1.0}\n')
+    return p
+
+
+def car_run(d, clock, campaign, stage, outcome, task='O1-F05', speed='0.5', s=60, **kw):
+    rl.begin(d, kw.pop('session', 'S'), campaign, kw.pop('platform', 'HW'), 'PID', task, speed, stage, **kw)
+    rl.step(d, 'run')
+    tick(clock, s)
+    return rl.end(d, outcome, fail_cause='mat_khung' if outcome == 'hong_he_do' else '')
+
+
 def rows(path):
     with open(path, newline='', encoding='utf-8') as f:
         return list(csv.DictReader(f))
@@ -114,9 +129,19 @@ def test_refusals(ds):
         rl.effort(d, '2026-11-20', '08:00', '09:00', campaign='A-PID', khoan='C_chung')
     with pytest.raises(rl.LogError, match='hoc'):
         rl.effort(d, '2026-11-20', '08:00', '09:00', campaign='A-PID', nhan='hoc')
-    rl.freeze(d, 'A-PID', 'x')
+    g = os.path.join(d, 'g.json')
+    with open(g, 'wb') as f:
+        f.write(b'{"kp_xy": 1.25}\n')
+    with pytest.raises(rl.LogError, match='stop-reason'):
+        rl.freeze(d, 'A-PID', 'cham_tran', 'G1', g)
+    with pytest.raises(rl.LogError, match='no such file'):
+        rl.freeze(d, 'A-PID', 'cham_tran_xe', 'G1', g + 'x')
+    row = rl.freeze(d, 'A-PID', 'cham_tran_xe', 'G1', g)
+    import hashlib
+    assert row['gain_sha256'] == hashlib.sha256(b'{"kp_xy": 1.25}\n').hexdigest()
+    assert list(rows(os.path.join(d, rl.FREEZE))[0]) == rl.FREEZE_COLS and 'gate_result' not in rl.FREEZE_COLS
     with pytest.raises(rl.LogError, match='already'):
-        rl.freeze(d, 'A-PID', 'y')
+        rl.freeze(d, 'A-PID', 'cham_tran_gio', 'G1', g)
 
 
 def test_effort_past_midnight(ds):
@@ -144,13 +169,14 @@ def test_summary_accounts_split_caps_and_finals(ds):
     rl.machine(d, 'B-chung', 'LADRC', 'S03X', 'r', 2739, 3600, '2026-11-20T09:00:00', '2026-11-20T10:00:00')
     rl.effort(d, '2026-11-20', '10:00', '12:00', campaign='B-chung', ghi_chu='doc S03')
     rl.hwfail(d, '2026-11-20', 'A1', 'A-PID', 'HW', 'tuot banh', 'phan_cung_ngau_nhien', 0.5, iter_no='2')
-    rl.freeze(d, 'A-PID', 'cham_tran', at='2026-11-20T12:00:00')
+    rl.freeze(d, 'A-PID', 'cham_tran_xe', 'G0', gain_file(d), at='2026-11-20T12:00:00')
     s = {r['campaign']: r for r in rl.summary(d)}
     a = s['A-PID']
     assert a['T_operator_h'] == f'{(1400 + 7200) / 3600:.3f}' and a['T_operator_no_hoc_h'] == f'{(1400 + 3600) / 3600:.3f}'
     assert a['T_tune_no_hoc_h'] == f'{(1200 + 3600) / 3600:.3f}'          # final runs and hoc out
     assert a['N_HW'] == '4' and a['N_HW_tune'] == '2' and a['N_hong'] == '1' and a['T_sua_h'] == '0.500'
-    assert a['stop_reason'] == 'cham_tran' and a['T_wall_end_src'] == 'freeze'
+    assert a['stop_reason'] == 'cham_tran_xe' and a['stop_reason_check'] == 'mismatch'   # 2 car runs, not 120
+    assert a['T_wall_end_src'] == 'freeze'
     assert a['T_wall_h'] == '6.000'                                     # 06:00 hoc row -> 12:00 freeze
     assert a['final_O1-F05@0.5_n_valid'] == '1' and a['final_O1-F05@0.5_pass'] == '1'
     assert a['final_O1-F05@0.5_invalid'] == '1'
@@ -172,6 +198,68 @@ def test_caps(ds):
     assert a['cap_hit'] == 'xe+gio' and a['N_HW_tune'] == '120' and a['T_tune_no_hoc_h'] == '10.000'
 
 
+def test_cap_hours_stop_at_the_freeze_and_stop_reason_check(ds):
+    d, clock = ds
+    rl.migrate(d)
+    car_run(d, clock, 'A-PID', 'screen', 'khong_dat', s=3600)
+    rl.freeze(d, 'A-PID', 'cham_tran_gio', 'G0', gain_file(d))
+    tick(clock, 10)
+    car_run(d, clock, 'A-PID', 'explore', 'khong_dat', s=36000)       # after the freeze (§4.8)
+    a = {r['campaign']: r for r in rl.summary(d)}['A-PID']
+    assert a['T_tune_no_hoc_h'] == '1.000' and a['T_operator_h'] == '11.000'
+    assert a['cap_hit'] == '' and a['stop_reason_check'] == 'mismatch'
+
+
+@pytest.mark.parametrize('outs,gate,want', [
+    ({'F05': ['dat'] * 5}, ['F05'], 'dat'),
+    ({'F05': ['dat'] * 5, 'F08': ['dat'] * 4}, ['F05', 'F08'], 'chua_ket_luan'),       # runs missing
+    ({'F05': ['dat'] * 4 + ['chua_ket_luan']}, ['F05'], 'chua_ket_luan'),
+    ({'F05': ['dat'] * 4 + ['khong_dat'], 'F08': ['dat']}, ['F05', 'F08'], 'khong_dat'),
+    ({'F05': ['dat'] * 5 + ['hong_he_do'], 'F02': ['khong_dat']}, ['F05'], 'dat'),     # F02 outside the gate
+    ({}, [], 'chua_ket_luan'),
+])
+def test_gate_result_rule_of_4_7(outs, gate, want):
+    assert rl.gate_result(outs, gate) == want
+
+
+def test_finals_gate_replacement_and_final_hil_join(ds):
+    d, clock = ds
+    rl.migrate(d)
+    rl.freeze(d, 'A-PID', 'khoi_xac_nhan_dat', 'G7', gain_file(d))
+    lost = car_run(d, clock, 'A-PID', 'final', 'hong_he_do', session='F')['run_uid']
+    car_run(d, clock, 'A-PID', 'final', 'dat', session='F', replaces_run_uid=lost)
+    for _ in range(4):
+        car_run(d, clock, 'A-PID', 'final', 'dat', session='F')
+    for _ in range(3):
+        car_run(d, clock, 'RQ2', 'final_hil', 'dat', session='H', platform='HIL', gain_set_id='G7')
+    car_run(d, clock, 'RQ2', 'final_hil', 'khong_dat', session='H', platform='HIL', gain_set_id='G99')
+    s = {r['campaign']: r for r in rl.summary(d, gate=['O1-F05'])}
+    a, q = s['A-PID'], s['RQ2']
+    assert a['gate_result'] == 'dat' and a['final_O1-F05@0.5_n_valid'] == '5'
+    assert a['final_O1-F05@0.5_invalid'] == '1' and a['final_hil_O1-F05@0.5_pass'] == '3'
+    assert a['N_HIL'] == '0' and q['N_HIL'] == '4'                        # HIL final = account RQ2
+    assert q['final_hil_G99_O1-F05@0.5_fail'] == '1'
+    assert {r['campaign']: r for r in rl.summary(d)}['A-PID']['gate_result'] == ''   # no gate given
+    car_run(d, clock, 'A-PID', 'final', 'dat', session='F')               # a 6th valid run
+    with pytest.raises(rl.LogError, match='more than 5'):
+        rl.summary(d)
+
+
+def test_bad_replacement_and_final_hil_account_are_errors(ds):
+    d, clock = ds
+    rl.migrate(d)
+    ok = car_run(d, clock, 'A-PID', 'final', 'dat', session='F')['run_uid']
+    car_run(d, clock, 'A-PID', 'final', 'dat', session='F', replaces_run_uid=ok)
+    with pytest.raises(rl.LogError, match='not a hong_he_do'):
+        rl.summary(d)
+    d2 = os.path.join(d, 'b')
+    os.makedirs(d2)
+    rl.migrate(d2)
+    car_run(d2, clock, 'A-PID', 'final_hil', 'dat', platform='HIL')
+    with pytest.raises(rl.LogError, match='account RQ2'):
+        rl.summary(d2)
+
+
 def test_c9_dry_run_recomputes_summary(tmp_path):
     """S05 §8.1 C9: one made-up campaign written through the commands, then S05_summary.csv;
     recomputing from the written logs gives the same file."""
@@ -180,11 +268,14 @@ def test_c9_dry_run_recomputes_summary(tmp_path):
     with open(out / rl.SUMMARY, newline='', encoding='utf-8') as f:
         written = list(csv.DictReader(f))
     assert [r['campaign'] for r in written] == list(rl.SUMMARY_ROWS)
-    again = rl.summary(str(out))
+    again = rl.summary(str(out), gate=['O1-F05'])
     assert [{k: v for k, v in r.items()} for r in again] == rows1
     for w, r in zip(written, rows1):
         assert all(w[k] == r.get(k, '') for k in w)
     a = {r['campaign']: r for r in written}
-    assert a['A-PID']['N_HW'] == '4' and a['A-PID']['stop_reason'] == 'FAKE_cham_tran'
+    assert a['A-PID']['N_HW'] == '6' and a['A-PID']['stop_reason'] == 'khong_du_luot_xac_nhan'
+    assert a['A-PID']['stop_reason_check'] == 'khong_kiem_duoc' and a['A-PID']['gate_result'] == 'chua_ket_luan'
+    assert a['A-PID']['final_O1-F05@0.5_n_valid'] == '2' and a['A-PID']['final_hil_O1-F05@0.5_pass'] == '2'
+    assert a['RQ2']['N_HIL'] == '2' and a['A-PID']['N_HIL'] == '0'
     assert a['B-PID']['N_SIM'] == '2739' and a['B-PID']['N_HIL'] == '1' and a['B-PID']['N_hong'] == '1'
     assert float(a['C_chung']['T_operator_h']) == 0.5
