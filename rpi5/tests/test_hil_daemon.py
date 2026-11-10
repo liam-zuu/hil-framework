@@ -140,6 +140,17 @@ def test_bad_miso_frames_mark_spi_quality_and_turn_h7_off(tmp_path, monkeypatch)
     assert s.quality & pp.Q_SPI_STALE and not s.h7_ok
 
 
+def test_mock_mode_ignores_the_fake_h7_miso_counters(tmp_path, monkeypatch):
+    """Pi check 11/11: run_hil.py --mock's fake H7 has bad MISO CRCs; with --mock the H7 light stays on."""
+    monkeypatch.setenv('FAKE_RUN_HIL', 'miso_bad')
+    d = make(tmp_path, mock=True)
+    d.h7_ok = True
+    d.start(0)
+    s = wait_for(d, (pp.ST_END,))
+    assert s.h7_ok and not s.quality & pp.Q_SPI_STALE
+    assert '--mock' in run_meta(d)['argv']
+
+
 def test_refusals_without_side_effects(tmp_path):
     d = make(tmp_path, busy=True)
     assert d.start(0) == pp.RES_BUSY and d.snapshot().run_no == 0 and d.proc is None

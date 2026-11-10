@@ -131,6 +131,7 @@ class HilDaemon:
                  busy_check: Callable[[Optional[int]], bool] = other_run_hil_running):
         self.tests = list(tests) if tests is not None else panel_tests()
         self.runs_dir = runs_dir
+        self.mock = mock
         self.extra_args = list(extra_args) + (['--mock'] if mock else [])
         self.ctrl = ctrl
         self.child_cmd = child_cmd or (lambda args: [sys.executable, '-u', os.path.join(HERE, 'run_hil.py'), *args])
@@ -340,7 +341,9 @@ class HilDaemon:
 
     def _finish(self, rc: int, summary: Optional[dict], miso, last) -> None:
         self._meta.update(run_summary=summary, miso=miso)
-        if miso is not None:
+        # --mock: the fake H7 of run_hil.py does not build valid MISO CRCs (Pi check 11/11: 11093 of
+        # 11096 frames 'bad'), so its counters say nothing about an H7; the light stays as it was
+        if miso is not None and not self.mock:
             checked, crc_bad, empty = miso
             if crc_bad or empty:
                 self.quality |= pp.Q_SPI_STALE
