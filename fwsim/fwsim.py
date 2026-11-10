@@ -285,6 +285,8 @@ def simulate(fw, setpoint, duration, params=None, seed=0, sp_rate_hz=50.0, pcnt_
       init_fail   True: imu_init() failed (spec section 7), motors never turn on
       resets      further SH2_RESET times [s]
       injection   imu_model.GyroInjection (method C) or None
+      noise       imu_model.ImuNoise (measured noise + output steps, L71) or None (default:
+                  noise-free, as before); applied after the injection, once per report
       hook        f(t, kind, value) -> value or None (drop the report): faults for tests
     run_active: MODE_AUTO with a VALID trajectory (heading loop may run).
     motor_on: False = SWA off for the whole run (driver disabled, controller idle).
@@ -313,6 +315,7 @@ def simulate(fw, setpoint, duration, params=None, seed=0, sp_rate_hz=50.0, pcnt_
     imu_next_us = imu_period_us
     resets = sorted(imu.get('resets', []))
     inj = imu.get('injection')
+    noise = imu.get('noise')
     hook = imu.get('hook') or (lambda t, kind, v: v)
     if use_imu:
         fw.imu_reset(int(round(imu.get('boot_reset', -1.0) * 1e6)))
@@ -347,6 +350,8 @@ def simulate(fw, setpoint, duration, params=None, seed=0, sp_rate_hz=50.0, pcnt_
             t = t_us * 1e-6
             if inj is not None:
                 gz = inj.apply(gz, t)
+            if noise is not None:
+                gz, ax, ay, az, yaw = noise.apply((gz, ax, ay, az, yaw), imu_period_us * 1e-6)
             for kind, v in (('accel', (ax, ay, az)), ('gyro', gz), ('rv', math.degrees(yaw))):
                 v = hook(t, kind, v)
                 if v is not None:

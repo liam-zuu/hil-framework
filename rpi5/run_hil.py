@@ -337,6 +337,10 @@ def _parse_args() -> argparse.Namespace:
                         'traction = slip method A (QD 25)')
     p.add_argument('--mu',            type=float, default=None,
                    help='mu_hd of all four wheels for --ground traction')
+    p.add_argument('--imu-noise',     default='20', choices=['20', '100', 'off'],
+                   help='measured BNO085 noise + output steps on the plant IMU values (imu_model.ImuNoise, '
+                        'L71): report rate of the DUT firmware (IMU_REPORT_PERIOD_US) or off; '
+                        'seed = --seed; not applied to --imu-static / --imu-profile')
     p.add_argument('--imu-profile',   default=None, choices=['t4'],
                    help='S06 T4 (4): send the locked IMU sequence of t4_imu_profile.py '
                         '(static levels then a 5 s ramp, 27 s cycle) instead of the plant values')
@@ -405,7 +409,7 @@ def main() -> int:
 
     # ── Normal HIL run ───────────────────────────────────────────────────
     from hil_node import HILConfig
-    from imu_model import parse_imu_static
+    from imu_model import parse_imu_static, ImuNoise, noise_spec_for_rate
     from trajectory_pub import TrajectorySpec, GROUP_A, LIFTED_TESTS
 
     # S06 (Y3, V7): the omega modes keep the trajectory publisher running
@@ -449,11 +453,15 @@ def main() -> int:
         simulate_hw  = args.mock,
         imu_static   = parse_imu_static(args.imu_static) if args.imu_static else None,
         imu_profile  = args.imu_profile,
+        imu_noise    = (None if args.imu_noise == 'off' else
+                        ImuNoise(noise_spec_for_rate(float(args.imu_noise)), seed=args.seed)),
         frame_log    = args.frame_log,
         rt_tune      = not args.no_rt_tune,
         heavy_block  = heavy_block,
         load_schedule = load_id,
     )
+    log.info('IMU noise (L71): %s', 'off' if hil_cfg.imu_noise is None else
+             f'{hil_cfg.imu_noise.spec} seed {hil_cfg.imu_noise.seed}')
     traj_spec = TrajectorySpec(
         kind     = args.traj,
         v        = args.speed,
