@@ -528,3 +528,31 @@ def test_lifted_env_problem(args, env, ok):
     fws = [dict(sha='1a2b3c4d5e6f', dirty=0, env=env)]
     assert (hb.lifted_env_problem(args, fws) is None) == ok
     assert hb.lifted_env_problem(args, []) is None    # no id: fw_problem / --expect-esp32 judge that
+
+
+# ── C5: --campaign-env (Liam 10/11, CODE local_85caf8b8, "Thêm cờ C5") ──
+
+@pytest.mark.parametrize('args, env, ok', [
+    ('--test A-K1', 'esp32-s3-devkitc-1', True),      # PID campaign env
+    ('--test A-K2', 'ladrc', True),                   # LADRC campaign env
+    ('--test A-K1', 'wheels_lifted', False),          # C5 asks the campaign binary, not the lifted env
+    ('--test A-K3', 'ladrc_wheels_lifted', False),
+    ('--test A-K1', 'mu_floor', False),               # another env
+    ('--test A-L1', 'ladrc', True),                   # ground tests: as without the flag
+    ('--test A-L1', 'wheels_lifted', False),
+])
+def test_lifted_env_problem_campaign(args, env, ok):
+    fws = [dict(sha='54b7269abcde', dirty=0, env=env)]
+    assert (hb.lifted_env_problem(args, fws, campaign_env=True) is None) == ok
+
+
+def test_campaign_env_mixed_envs_refused():
+    fws = [dict(sha='54b7269abcde', dirty=0, env='ladrc'), dict(sha='54b7269abcde', dirty=0, env='wheels_lifted')]
+    assert hb.lifted_env_problem('--test A-K1', fws, campaign_env=True) is not None
+
+
+def test_campaign_env_flag_parsed():
+    import inspect
+    assert 'campaign_env' in inspect.signature(hb.lifted_env_problem).parameters
+    src = inspect.getsource(hb)
+    assert "'--campaign-env'" in src and "r['campaign_env'] = bool(a.campaign_env)" in src

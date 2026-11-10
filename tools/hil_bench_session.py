@@ -247,19 +247,27 @@ def fw_problem(fws, expect):
 
 LIFTED_TEST_RE = re.compile(r'--test\s+A-K\d')
 LIFTED_ENV_TAG = 'wheels_lifted'
+CAMPAIGN_ENVS = ('esp32-s3-devkitc-1', 'ladrc')     # AGV env chinh (PID) va ladrc: binary chien dich (QD 6)
 
 
-def lifted_env_problem(args, fws):
+def lifted_env_problem(args, fws, campaign_env=False):
     """L55 (Liam 09/11, CODE: the lifted-wheel flag is chosen by env): a lifted test (--test A-K*) must run on
     an ESP32 env with wheels_lifted in its name (AGV env wheels_lifted / ladrc_wheels_lifted), and a ground
-    run must not; None when it fits or the ESP32 id is not known (fw_problem judges a missing id)."""
+    run must not; None when it fits or the ESP32 id is not known (fw_problem judges a missing id).
+    campaign_env (--campaign-env, C5; Liam 10/11 CODE local_85caf8b8 "Them co C5", after "Env chien dich"
+    for C5 the same day): a lifted test must run on a campaign env (CAMPAIGN_ENVS) instead; the
+    wheels_lifted flag only turns off the gyro-bias estimator, which is off anyway while sigma = 0."""
     if not fws:
         return None
     lifted_run = bool(LIFTED_TEST_RE.search(args or ''))
     envs = sorted({f['env'] for f in fws})
     lifted_env = [LIFTED_ENV_TAG in e for e in envs]
+    if lifted_run and campaign_env:
+        if not all(e in CAMPAIGN_ENVS for e in envs):
+            return f'bài kê bánh C5 (--campaign-env) nhưng ESP32 chạy env {envs}, cần env chiến dịch {list(CAMPAIGN_ENVS)}'
+        return None
     if lifted_run and not all(lifted_env):
-        return f'bài kê bánh (A-K) nhưng ESP32 chạy env {envs}, cần env *{LIFTED_ENV_TAG}'
+        return f'bài kê bánh (A-K) nhưng ESP32 chạy env {envs}, cần env *{LIFTED_ENV_TAG} (C5: --campaign-env)'
     if not lifted_run and any(lifted_env):
         return f'bài trên sàn nhưng ESP32 chạy env kê bánh {envs}'
     return None
@@ -691,7 +699,8 @@ def bench(a):
             if bad:
                 r['clean'] = False
                 r['why'].append(bad)
-            ebad = lifted_env_problem(args, run_fw or sess.get('boot', {}).get('esp32_fw') or [])
+            ebad = lifted_env_problem(args, run_fw or sess.get('boot', {}).get('esp32_fw') or [], a.campaign_env)
+            r['campaign_env'] = bool(a.campaign_env)
             if ebad:
                 r['clean'] = False
                 r['why'].append(ebad)
@@ -776,6 +785,9 @@ def main(argv=None):
     ap.add_argument('--run-timeout', type=float, default=600.0, help='giới hạn mỗi lượt ssh, giây')
     ap.add_argument('--pi-kill', action='append', default=[], metavar='TÊN=GIÂY',
                     help='sau GIÂY từ lúc bắt đầu lượt TÊN: SIGKILL run_hil.py và mọi tiến trình con (rút Pi)')
+    ap.add_argument('--campaign-env', action='store_true',
+                    help='C5 (Liam 10/11 "Thêm cờ C5"): bài kê bánh A-K chạy trên env chiến dịch (esp32-s3-devkitc-1, '
+                         'ladrc) thay cho env *wheels_lifted (L55); ghi campaign_env vào bản tóm tắt lượt')
     ap.add_argument('--expect-esp32', metavar='SHA',
                     help='commit ESP32 phải chạy (tiền tố SHA): dòng #fw lúc --boot hoặc trong log UDP của lượt '
                          'khác SHA, dirty=1, hay không có thì --boot dừng mã 2, lượt không sạch')
