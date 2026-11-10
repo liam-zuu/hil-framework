@@ -59,21 +59,33 @@ def test_reports_are_the_firmware_view_of_the_replay(fw, rate):
         assert math.radians(v) == pytest.approx(float(noise.replay.k_yaw[i]) * YAW_STEP_RAD, abs=1e-7)
 
 
-def test_report_values_equal_firmware_view_of_noise_apply(fw):
-    """The value fed for report m is firmware_view(noise.apply(truth, t_us)) with t_us = m * period."""
-    rate = 20.0
+@pytest.mark.parametrize('rate', [20.0, 100.0])
+def test_report_values_equal_firmware_view_of_noise_apply(fw, rate, monkeypatch):
+    """While turning (truth yaw off the Q14 grid, truth gz and accel off their grids), every
+    accel, gyro and game-RV value fed to the firmware is firmware_view(noise.apply(truth, t_us))
+    with t_us = m * period (Codex round 2 IMN2-2: catches simulate() skipping firmware_view)."""
+    truth = []
+    real = fwsim.imu_from_plant
+    monkeypatch.setattr(fwsim, 'imu_from_plant', lambda *a: truth.append(real(*a)) or truth[-1])
     seen = []
-    _run(fw, ImuNoise(rate, seed=6), rate_hz=rate, seen=seen, motor_on=False)
+    _run(fw, ImuNoise(rate, seed=6), rate_hz=rate, seen=seen)
     ref = ImuNoise(rate, seed=6)
-    per = ref.period_us
-    gyro = [(t, v) for t, k, v in seen if k == 'gyro']
-    # the first report comes at t = one period; at rest the truth is gz = 0, yaw = 0
-    assert len(gyro) > 50
-    for t, v in gyro:
-        m_us = int(round(t * 1e6))
-        assert m_us % per == 0
-        g, _, y = firmware_view(ref.apply((0.0, 0.0, 0.0, 9.80665, 0.0), m_us))
-        assert v == g
+    reports = {}
+    for t, k, v in seen:
+        reports.setdefault(int(round(t * 1e6)), {})[k] = v
+    times = sorted(reports)
+    assert len(times) == len(truth) > 2 * rate
+    off_grid = differs = 0
+    for t_us, s in zip(times, truth):
+        assert t_us % ref.period_us == 0
+        noisy = ref.apply(s, t_us)
+        g, acc, y = firmware_view(noisy)
+        r = reports[t_us]
+        assert r['gyro'] == g and tuple(r['accel']) == acc and r['rv'] == y
+        k = s[4] / YAW_STEP_RAD
+        off_grid += abs(k - round(k)) > 0.2
+        differs += r['rv'] != math.degrees(noisy[4])      # what skipping firmware_view would feed
+    assert off_grid > 0.3 * len(times) and differs > 0.3 * len(times)
 
 
 def test_same_seed_same_run_other_seed_differs(fw):

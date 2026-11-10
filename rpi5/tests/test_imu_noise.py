@@ -150,8 +150,10 @@ class TestNoise:
 
     @pytest.mark.parametrize('rate', RATES)
     def test_pi_calls_give_the_fwsim_sequence(self, rate):
-        """HIL Pi (call every 1 ms, H7 takes the frame at each report) and fwsim (call per report)
-        play the same rows, so the report-interval statistics do not depend on dt (IMN-10)."""
+        """1 ms calls (HIL Pi) sampled at the report instants m * period give the per-report
+        sequence (fwsim), so the report-interval statistics do not depend on dt (IMN-10). Only
+        when the samples are taken at those instants: the real H7 schedule has its own phase,
+        a fixed row shift on HIL (IMN2-1, DEFERRED, see ImuNoise)."""
         n_rep = int(60 * rate)
         a = _rest_series(rate, seed=4, n_reports=n_rep)
         b = _rest_series(rate, seed=4, n_reports=n_rep, pi_calls=True)

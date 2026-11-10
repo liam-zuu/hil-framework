@@ -470,8 +470,9 @@ class HILNode:
                                  self.cfg.period_us / 1e6, PARAMS.g)
             self._prev_state = state
             if self.cfg.imu_noise is not None:
-                # replay row by report index (frame time // report period), held over the
-                # report period; the H7 takes the latest frame at each of its reports
+                # replay row by frame time // report period, held over the report period;
+                # the H7 takes the latest frame at each of its reports, on its own schedule
+                # (fixed row shift against fwsim, IMN2-1: see imu_model.ImuNoise)
                 imu = self.cfg.imu_noise.apply(imu, self._step * self.cfg.period_us)
         else:
             return None, 0

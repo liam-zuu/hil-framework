@@ -179,10 +179,17 @@ class ImuNoise:
     with its own seed (start row = numpy default_rng(seed).integers(N)).
 
     apply(sample, t_us): t_us = time since the start of the run [us]. The row is
-    chosen by the report index m = t_us // period_us, so fwsim (one call per
-    report, at t_us = m * period_us) and the HIL Pi (one call per 1 ms frame,
-    the value held for a whole report period; the H7 takes the latest frame at
-    each report) play the same rows. Same (rate, seed, t_us) → same output.
+    chosen by m = t_us // period_us: fwsim calls once per report at
+    t_us = m * period_us; the HIL Pi calls every 1 ms frame (t_us from the Pi's
+    own start), so the value is held for one report period. Same (rate, seed,
+    t_us) → same output.
+    HIL limit (Codex round 2 IMN2-1, DEFERRED): the H7 schedules its reports
+    from the Set Feature it received, not from the Pi's start, so on HIL the
+    rows are the same sequence shifted by an unknown fixed number of rows
+    against fwsim with the same seed, and the gyro and game-RV reports (two H7
+    schedules) can take rows one apart. The statistics per rate are the same;
+    sample-by-sample comparison of HIL and fwsim noise would need the H7
+    report counter.
     """
 
     def __init__(self, rate_hz: float, seed: int):
