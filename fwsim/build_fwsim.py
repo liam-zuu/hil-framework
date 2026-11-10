@@ -36,6 +36,23 @@ def git_state(repo):
         return dict(commit='UNKNOWN', branch='UNKNOWN', dirty=True, modified=[f'git error: {e}'])
 
 
+def file_sha256(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for b in iter(lambda: f.read(1 << 20), b''):
+            h.update(b)
+    return h.hexdigest()
+
+
+def wrapper_identity():
+    """SHA-256 of fw_sim.c and every file of shim/ (the non-firmware part of the DLL)."""
+    shim = os.path.join(HERE, 'shim')
+    files = ['fw_sim.c'] + sorted(os.path.relpath(os.path.join(d, f), HERE).replace(os.sep, '/')
+                                  for d, _, fs in os.walk(shim) for f in fs if not f.endswith('.pyc'))
+    return {f: file_sha256(os.path.join(HERE, *f.split('/'))) for f in files}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--fw', default=os.path.join(HERE, '..', '..', 'AGV_FIRMWARE'))
@@ -58,7 +75,10 @@ def main():
         sys.exit(f'gcc failed ({r.returncode})')
     ver = subprocess.run([a.gcc, '--version'], capture_output=True, text=True).stdout.splitlines()[0]
     info = dict(esp32=git_state(fw), hil_framework=git_state(os.path.join(HERE, '..')),
-                compiler=ver, flags=' '.join(flags), sources=sources)
+                compiler=ver, flags=' '.join(flags), sources=sources,
+                # identity of this build (Codex round 1 IMN-8): the DLL itself and the wrapper
+                # files of this repo it was built from (wrapper_sha256 / wrapper_identity())
+                dll_sha256=file_sha256(dll), wrapper_sha256=wrapper_identity())
     with open(os.path.join(a.out, 'fwsim_build.json'), 'w') as f:
         json.dump(info, f, indent=2)
     print(f"Built {dll}\n  ESP32 firmware {info['esp32']['commit']} dirty={info['esp32']['dirty']}\n  {ver}")

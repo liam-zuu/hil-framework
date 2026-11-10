@@ -44,7 +44,7 @@ sys.path.insert(0, os.path.join(HERE, '..', 'rpi5'))
 from params import MecanumParams              # noqa: E402
 from plant_step import plant_step, traction_nsub   # noqa: E402
 from trajectory_pub import TrajectorySpec, get_body_velocity   # noqa: E402
-from imu_model import imu_from_plant          # noqa: E402
+from imu_model import imu_from_plant, firmware_view          # noqa: E402
 from plant_blob import plant_source           # noqa: E402
 # L34 (Fable F-ND #7): git blobs of the plant_step.py / params.py imported just above, taken
 # now (not from the DLL build); written by plant_meta() into every meta.yaml 'plant'
@@ -285,8 +285,10 @@ def simulate(fw, setpoint, duration, params=None, seed=0, sp_rate_hz=50.0, pcnt_
       init_fail   True: imu_init() failed (spec section 7), motors never turn on
       resets      further SH2_RESET times [s]
       injection   imu_model.GyroInjection (method C) or None
-      noise       imu_model.ImuNoise (measured noise + output steps, L71) or None (default:
-                  noise-free, as before); applied after the injection, once per report
+      noise       imu_model.ImuNoise (replay of the measured noise, L72) or None (default:
+                  noise-free, as before); applied after the injection, once per report;
+                  with noise the values then go through imu_model.firmware_view (SPI frame,
+                  H7 SH-2 packing, ESP32 library: what the firmware gets on HIL, IMN-2)
       hook        f(t, kind, value) -> value or None (drop the report): faults for tests
     run_active: MODE_AUTO with a VALID trajectory (heading loop may run).
     motor_on: False = SWA off for the whole run (driver disabled, controller idle).
@@ -351,8 +353,10 @@ def simulate(fw, setpoint, duration, params=None, seed=0, sp_rate_hz=50.0, pcnt_
             if inj is not None:
                 gz = inj.apply(gz, t)
             if noise is not None:
-                gz, ax, ay, az, yaw = noise.apply((gz, ax, ay, az, yaw), imu_period_us * 1e-6)
-            for kind, v in (('accel', (ax, ay, az)), ('gyro', gz), ('rv', math.degrees(yaw))):
+                gz, acc, yaw_deg = firmware_view(noise.apply((gz, ax, ay, az, yaw), t_us))
+            else:
+                acc, yaw_deg = (ax, ay, az), math.degrees(yaw)
+            for kind, v in (('accel', acc), ('gyro', gz), ('rv', yaw_deg)):
                 v = hook(t, kind, v)
                 if v is not None:
                     fw.imu_report(kind, t_us, v)

@@ -54,6 +54,15 @@ def main():
     sys.stdout.write(r.stdout); sys.stderr.write(r.stderr)
     if r.returncode != 0:
         sys.exit(f'gcc failed ({r.returncode})')
+    # fwview.exe: frame -> H7 SH-2 packing -> ESP32 SH-2 library, for the check of
+    # imu_model.firmware_view (Codex round 1 IMN-2, 10/11/2026); includes bno_emu.c itself
+    fv = os.path.join(a.out, 'fwview.exe')
+    r = subprocess.run([a.gcc] + flags + ['-I', sh2, '-I', emu_inc] +
+                       [os.path.join(sh2, f) for f in ('sh2_SensorValue.c', 'sh2_util.c')] +
+                       [os.path.join(HERE, 'fwview.c'), '-lm', '-o', fv], capture_output=True, text=True)
+    sys.stdout.write(r.stdout); sys.stderr.write(r.stderr)
+    if r.returncode != 0:
+        sys.exit(f'gcc failed for fwview ({r.returncode})')
     ver = subprocess.run([a.gcc, '--version'], capture_output=True, text=True).stdout.splitlines()[0]
     info = dict(esp32=git_state(fw), hil_framework=git_state(REPO),
                 compiler=ver, flags=' '.join(flags), sh2_sources=SH2_SOURCES)

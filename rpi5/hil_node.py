@@ -101,7 +101,7 @@ class HILConfig:
     imu_static:        Optional[tuple] = None
     # S06 T4 (4): 't4' = locked IMU sequence of t4_imu_profile.py by frame time
     imu_profile:       Optional[str]   = None
-    # imu_model.ImuNoise (measured noise + output steps, L71) applied to the plant
+    # imu_model.ImuNoise (replay of the measured noise, L72) applied to the plant
     # IMU values every frame; None = noise-free plant values. Not applied to
     # imu_static / imu_profile (those are locked test sequences).
     imu_noise:         Optional[object] = None
@@ -470,7 +470,9 @@ class HILNode:
                                  self.cfg.period_us / 1e6, PARAMS.g)
             self._prev_state = state
             if self.cfg.imu_noise is not None:
-                imu = self.cfg.imu_noise.apply(imu, self.cfg.period_us / 1e6)
+                # replay row by report index (frame time // report period), held over the
+                # report period; the H7 takes the latest frame at each of its reports
+                imu = self.cfg.imu_noise.apply(imu, self._step * self.cfg.period_us)
         else:
             return None, 0
         # a new sample every frame: 1..255, skipping 0 (before its first
@@ -494,7 +496,7 @@ class HILNode:
                         max_steps=self.cfg.max_steps, stop_reason=self._stop_reason,
                         imu_source=imu_source, imu_profile=self.cfg.imu_profile, imu_static=self.cfg.imu_static,
                         imu_noise=(None if self.cfg.imu_noise is None or imu_source != 'plant' else
-                                   dict(rate_hz=self.cfg.imu_noise.spec.rate_hz, seed=self.cfg.imu_noise.seed)),
+                                   self.cfg.imu_noise.describe()),
                         plant=type(self.plant).__name__, plant_src=self._plant_src,     # L34
                         heavy_block=self.cfg.heavy_block,
                         load_schedule=self.cfg.load_schedule, rt=self._rt, uname=' '.join(platform.uname()),     # X8: the kernel the run ran on
