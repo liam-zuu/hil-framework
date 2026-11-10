@@ -404,6 +404,11 @@ def freeze(ds: str, campaign: str, stop_reason: str, gain_set: str, gain_file: s
         raise LogError('--gain-set is needed')
     if not os.path.isfile(gain_file):
         raise LogError(f'--gain-file {gain_file!r}: no such file (the frozen set, saved bit-exact)')
+    base = os.path.basename(gain_file)
+    if 'gain_' not in base or not base.endswith('.json'):
+        # L81 (Liam 11/11): .gitattributes keeps 05_DATA/**/*gain_*.json byte-exact (-text), so the
+        # sha256 still matches after a checkout; another name would get its line ends converted
+        raise LogError(f'--gain-file {base!r}: name must contain "gain_" and end in .json (.gitattributes L81)')
     if any(r['campaign'] == campaign for r in read_rows(os.path.join(ds, FREEZE))):
         raise LogError(f'{campaign} already frozen')
     row = {'campaign': campaign, 'frozen_at': at or _iso(now()), 'stop_reason': stop_reason,

@@ -38,7 +38,7 @@ def tick(clock, s):
     clock[0] += dt.timedelta(seconds=s)
 
 
-def gain_file(d, name='g.json'):
+def gain_file(d, name='gain_G0.json'):
     p = os.path.join(d, name)
     if not os.path.exists(p):
         with open(p, 'w', encoding='utf-8') as f:
@@ -129,7 +129,12 @@ def test_refusals(ds):
         rl.effort(d, '2026-11-20', '08:00', '09:00', campaign='A-PID', khoan='C_chung')
     with pytest.raises(rl.LogError, match='hoc'):
         rl.effort(d, '2026-11-20', '08:00', '09:00', campaign='A-PID', nhan='hoc')
-    g = os.path.join(d, 'g.json')
+    bad = os.path.join(d, 'g.json')
+    with open(bad, 'wb') as f:
+        f.write(b'{}\n')
+    with pytest.raises(rl.LogError, match='gain_'):
+        rl.freeze(d, 'A-PID', 'cham_tran_xe', 'G1', bad)
+    g = os.path.join(d, 'gain_G1.json')
     with open(g, 'wb') as f:
         f.write(b'{"kp_xy": 1.25}\n')
     with pytest.raises(rl.LogError, match='stop-reason'):
