@@ -18,6 +18,10 @@ held through ARM; t = 0 (command start) is the first RUN step of the lifecycle i
 else the first frame whose trajectory part is VALID and non-zero (t0_src says which).
 t of frame k = (k - k0) x period: the plant time (fixed 1 ms step), not the Pi clock.
 [CÁCH HIỂU] pwm for the saturation share = duty x 1000 (firmware PWM scale of fwsim).
+Log too short (L85 Q1, Liam 11/11 CODE local_821ee4dc; Fable O1/C6 F-1b): when the last frame comes
+before t_deadline - one period and the evaluator says completed 'false', the result is
+'inconclusive' (completed_raw keeps 'false'); log_end_t, log_covers_deadline are always written.
+run_hil.py --o1 --finite-run keeps the zeros and the log to T_cmd + o1_tasks.O1_TAIL_S (2.5 s).
 
 Validity (CODE L50, STATUS_CODE CG4) is NOT decided here: the manifest counts (MISO CRC bad,
 empty frames) are copied out; the run rule is tools/s06_frames_decode.py on the same log.
@@ -79,6 +83,19 @@ def load(path):
     return manifest, z['mosi'], z['miso']
 
 
+def log_coverage(out, t_log_end, period):
+    """L85 Q1 (Fable O1/C6 F-1b), in place on an evaluator summary: the evaluators score frames
+    t < t_deadline, so a log whose last frame is before t_deadline - period cannot say 'false' (the
+    completion window may lie after its end): 'false' -> 'inconclusive', completed_raw keeps it."""
+    covers = t_log_end >= float(out['t_deadline']) - period - 1e-9
+    out.update(log_end_t=float(t_log_end), log_covers_deadline=bool(covers))
+    if not covers and out.get('completed') == 'false':
+        out.update(completed='inconclusive', completed_raw='false',
+                   completed_note=f'log ends at t = {t_log_end:.3f} s, before t_deadline = '
+                                  f'{float(out["t_deadline"]):.3f} s; every measure is on [0, log end] only')
+    return out
+
+
 def score(path, task, allow_final_set=False):
     if task not in FIG8 and task not in FINAL_SET:
         raise ValueError(f'task {task!r}: one of {tuple(FIG8) + FINAL_SET}')
@@ -96,6 +113,7 @@ def score(path, task, allow_final_set=False):
         out['task'] = task
     else:
         out, _ = o1_lanes.evaluate_k(log, task)
+    log_coverage(out, float(log['t'][-1]) if len(log['t']) else -1.0, period)
     mc = manifest.get('miso_check') or {}
     out.update(frame_log=os.path.basename(path), k0=k0, t0_src=t0_src, frames_scored=int(len(state) - k0),
                start_pose=[float(v) for v in state[k0, 4:7]], plant=manifest.get('plant'),

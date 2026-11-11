@@ -72,10 +72,11 @@ def fig8_pose(task, t):
     return np.asarray(out), sch
 
 
-def write_frame_log(path, task, k0=400, lifecycle=True):
-    """Frame log as run_hil.py writes it: plant held at 0 during ARM (k < k0), then the figure 8."""
+def write_frame_log(path, task, k0=400, lifecycle=True, tail=T_LATE + 0.5):
+    """Frame log as run_hil.py writes it: plant held at 0 during ARM (k < k0), then the figure 8,
+    logged to T_cmd + tail."""
     sch = Schedule(H.FIG8[task])
-    n_run = int((sch.Tcmd + T_LATE + 0.5) / DT)
+    n_run = int((sch.Tcmd + tail) / DT)
     t = np.arange(n_run) * DT
     pose, _ = fig8_pose(task, t)
     pose = np.vstack([np.zeros((k0, 3)), pose])
@@ -117,3 +118,35 @@ def test_command_start_without_lifecycle_and_final_set_guard(tmp_path):
     with pytest.raises(ValueError, match='final test set'):
         H.score(p, 'O1-K1')
     assert H.main(['--frame-log', p, '--task', 'O1-X']) == 2
+
+
+# L85 Q1 (Liam 11/11, CODE local_821ee4dc; Fable O1/C6 F-1b): a log that ends before the deadline
+# T_cmd + t_late cannot give completed 'false'
+
+def test_log_ending_before_the_deadline_is_inconclusive_not_false(tmp_path):
+    p = str(tmp_path / 'run.npz')
+    write_frame_log(p, 'O1-F05', tail=-0.5)            # cut 0.5 s before T_cmd: condition 5 never holds
+    out = H.score(p, 'O1-F05')
+    assert out['completed'] == 'inconclusive' and out['completed_raw'] == 'false'
+    assert out['log_covers_deadline'] is False and out['log_end_t'] < out['t_deadline']
+    assert 'before t_deadline' in out['completed_note']
+
+
+def test_log_to_the_deadline_keeps_the_result(tmp_path):
+    p = str(tmp_path / 'run.npz')
+    write_frame_log(p, 'O1-F05')                       # logged to T_cmd + t_late + 0.5
+    out = H.score(p, 'O1-F05')
+    assert out['completed'] == 'true' and out['log_covers_deadline'] is True and 'completed_raw' not in out
+
+
+@pytest.mark.parametrize('completed,end,expect', [
+    ('false', 9.0, 'inconclusive'),     # ends 1 s before the deadline 10.0
+    ('false', 9.999, 'false'),          # last frame t < deadline is there (period 1 ms)
+    ('false', 9.997, 'inconclusive'),
+    ('true', 9.0, 'true'),              # completed inside the log: kept
+    ('inconclusive', 9.0, 'inconclusive'),
+])
+def test_log_coverage_rule(completed, end, expect):
+    out = H.log_coverage(dict(completed=completed, t_deadline=10.0), end, 0.001)
+    assert out['completed'] == expect
+    assert out['log_covers_deadline'] is (end >= 9.999 - 1e-9)

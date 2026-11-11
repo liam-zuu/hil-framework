@@ -131,7 +131,9 @@ def test_pc_sender_o1_sends_the_schedule():
     n = pc_sender.test_loop('10.0.0.1', 'O1-F05', sock=Sock(), clock=lambda: clock[0],
                             sleep=lambda s: clock.__setitem__(0, clock[0] + s), out=lines.append)
     T = o1_feasibility.Schedule(0.5).Tcmd
-    assert n == int(round(T * pc_sender.SEND_HZ)) and len(sent) == n + 10
+    # L85 Q1: every k with k/50 < T_cmd, then zeros on the grid up to T_cmd + O1_TAIL_S (was: 10 zeros)
+    assert n == math.ceil(T * pc_sender.SEND_HZ - 1e-9)
+    assert len(sent) == math.ceil((T + o1_tasks.O1_TAIL_S) * pc_sender.SEND_HZ - 1e-9)
     assert lines[0].startswith('#test_start,test=O1-F05') and 'complete=1' in lines[-1]
     k = 300
     import struct
