@@ -327,3 +327,100 @@ def test_broadcast_targets_has_limited_and_subnet_broadcasts():
     t = mf.broadcast_targets()
     assert t[0] == '255.255.255.255' and all(b.endswith('.255') for b in t) and len(t) == len(set(t))
     assert not any(b.startswith('127.') for b in t)
+
+
+# --test hold / step (Liam 11/11, guide 2026-11-11_Huong_dan_Buoi_xe_san_thang_momen_yaw.md)
+
+def csv_rows(path):
+    return list(csv.DictReader(open(path, encoding='utf-8')))
+
+
+def test_hold_asks_battery_and_gauge_keeps_settings_per_trial_and_resumes(tmp_path):
+    yaml = pytest.importorskip('yaml')
+    out = tmp_path / 'hold'
+    os.makedirs(out)
+    dev = mf.FakeDevice(mass_kg=4.0, mu=0.6)
+    a = args(out, test='hold', pwm0=180, rate=50, pwm_max=200, w_slip=3.0, argv=['--test', 'hold'])
+    mf.write_meta(a, dev, os.path.dirname(mf.__file__))
+    # trial 1: Enter, 12.5 V, gauge 0.7, after 12.45; trial 2: Enter, Enter (keeps 12.45), gauge Enter = bad, after Enter
+    answers = iter(['', '12.5', '0,7', '12.45', '', '', '', ''])
+    prompts = []
+    trials, summ = mf.run(a, dev, inp=lambda p: (prompts.append(p), next(answers))[1])
+    assert summ == [] and not (out / 'summary.csv').exists()
+    r = csv_rows(out / 'trials.csv')
+    assert [x['trial'] for x in r] == ['hold200_XP_01', 'hold200_XP_02']
+    assert r[0]['test'] == 'hold' and r[0]['gauge_kgf'] == '0.7' and r[0]['mu'] == '' and r[0]['f_max_kgf'] == ''
+    assert r[0]['vbat_before_v'] == '12.5' and r[0]['vbat_after_v'] == '12.45' and r[0]['ok'] == 'True'
+    assert (r[0]['pwm0'], r[0]['rate'], r[0]['pwm_max'], r[0]['w_slip']) == ('180', '50', '200', '3.0')
+    assert r[1]['vbat_before_v'] == '12.45' and r[1]['ok'] == 'False' and r[1]['note'] == 'bad trial, redo'
+    assert not any('F_max' in p for p in prompts)
+    m = yaml.safe_load(open(out / 'meta.yaml', encoding='utf-8'))
+    assert m['test'] == 'hold' and m['method'].startswith('loaded torque scale') and m['vbat_min_v'] == 12.2
+    # a second command into the same folder: another level, and the bad trial of the first is kept for its own rerun
+    a2 = args(out, test='hold', pwm0=230, rate=50, pwm_max=250, w_slip=3.0, reps=1, argv=['--pwm-max', '250'])
+    mf.write_meta(a2, dev, os.path.dirname(mf.__file__))
+    mf.run(a2, dev, inp=lambda p, it=iter(['', '12.4', '1.0', '']): next(it))
+    r = csv_rows(out / 'trials.csv')
+    assert [x['trial'] for x in r] == ['hold200_XP_01', 'hold200_XP_02', 'hold250_XP_01']
+    assert r[2]['pwm_max'] == '250' and r[0]['pwm_max'] == '200'
+    c = csv_rows(out / 'commands.csv')
+    assert len(c) == 2 and c[1]['argv'] == '--pwm-max 250' and c[0]['test'] == 'hold'
+    # resume the first command: only hold200_XP_02 runs again
+    seen = []
+    mf.run(a, dev, inp=lambda p, it=iter(['', '12.4', '0.8', '']): (seen.append(p), next(it))[1])
+    assert any('hold200_XP_02' in p for p in seen) and not any('hold200_XP_01' in p for p in seen)
+    assert csv_rows(out / 'trials.csv')[-1]['ok'] == 'True'
+
+
+def test_hold_slip_is_kept_without_a_reading(tmp_path):
+    dev = mf.FakeDevice(mass_kg=4.0, mu=0.1)                           # spins at low PWM
+    a = args(tmp_path / 's', test='hold', pwm0=180, rate=50, pwm_max=600, w_slip=3.0, reps=1)
+    mf.run(a, dev, inp=lambda p, it=iter(['', '12.5', '', '']): next(it))
+    r = csv_rows(tmp_path / 's' / 'trials.csv')[0]
+    assert r['reason'] == 'slip' and r['ok'] == 'True' and r['gauge_kgf'] == '' and r['note'] == 'slip before pwm_max'
+
+
+def test_battery_below_minimum_does_not_start_the_trial():
+    told = []
+    it = iter(['12.1', '', '12.3'])                                  # low, then Enter (no previous left), then charged
+    v = mf.ask_vbat_before(None, 12.2, inp=lambda p: (told.append(p), next(it))[1])
+    assert v == 12.3 and len(told) == 3
+    assert mf.ask_vbat_before(12.4, 12.2, inp=lambda p: '') == 12.4    # Enter keeps the previous reading
+
+
+def test_step_trials_ask_clean_or_not(tmp_path):
+    out = tmp_path / 'st'
+    dev = mf.FakeDevice(mass_kg=4.0, mu=0.6)
+    a = args(out, test='step', pwm0=250, rate=1, pwm_max=250, w_slip=0.0, reps=2)
+    answers = iter(['', '12.5', '', '12.48', '', '', 'dam tuong', ''])
+    prompts = []
+    mf.run(a, dev, inp=lambda p: (prompts.append(p), next(answers))[1])
+    r = csv_rows(out / 'trials.csv')
+    assert [x['trial'] for x in r] == ['step250_XP_01', 'step250_XP_02']
+    assert r[0]['reason'] == 'max' and r[0]['ok'] == 'True' and r[0]['gauge_kgf'] == ''
+    assert int(r[0]['t_end_ms']) >= 2000                               # held 2 s at the step
+    assert r[1]['ok'] == 'False' and r[1]['note'] == 'bad trial, redo: dam tuong'
+    assert not any('can' in p.lower() and 'kgf' in p for p in prompts)
+    raw = csv_rows(out / 'raw' / 'step250_XP_01.csv')
+    assert raw[0]['pwm'] == '250'                                      # the PWM jumps at t = 0
+
+
+def test_main_refuses_a_step_that_is_not_a_step(tmp_path):
+    with pytest.raises(SystemExit, match='--test step needs'):
+        mf.main(['--dry-run', '--out', str(tmp_path / 'o'), '--mass-kg', '4', '--test', 'step',
+                 '--pwm0', '200', '--pwm-max', '250', '--w-slip', '0'])
+    with pytest.raises(SystemExit, match='--test step needs'):
+        mf.main(['--dry-run', '--out', str(tmp_path / 'o'), '--mass-kg', '4', '--test', 'step',
+                 '--pwm0', '250', '--pwm-max', '250', '--w-slip', '3'])
+    with pytest.raises(SystemExit, match='keep --surface floor'):
+        mf.main(['--dry-run', '--out', str(tmp_path / 'o'), '--mass-kg', '4', '--test', 'hold', '--surface', 'yard'])
+
+
+def test_mu_default_writes_no_commands_file_and_keeps_its_method(tmp_path):
+    yaml = pytest.importorskip('yaml')
+    out = tmp_path / 'mu'
+    os.makedirs(out)
+    a = args(out)
+    mf.write_meta(a, mf.FakeDevice(), os.path.dirname(mf.__file__))
+    m = yaml.safe_load(open(out / 'meta.yaml', encoding='utf-8'))
+    assert not (out / 'commands.csv').exists() and m['method'] == mf.METHODS['mu'] and m['test'] == 'mu'

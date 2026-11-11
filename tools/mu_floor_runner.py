@@ -39,6 +39,20 @@ Usage
 After each ramp the script asks for F_max read on the video (kgf, as the gauge shows it); Enter
 alone marks the trial bad (redo it). The independent stop is the motor power switch.
 Simulation of --dry-run is invented, NOT a measurement.
+
+Other tests on the same firmware (--test, Liam 11/11 CODE session local_b905f2ba: "Sua ca hai";
+guide 00_OVERVIEW/Setup_Guides/2026-11-11_Huong_dan_Buoi_xe_san_thang_momen_yaw.md; Fable item 6
+M-02 and item 4 F-01, F-09; L87 Q2, L85 Q5, Q7). The firmware and the link rules are the same.
+  --test mu    (default) the friction test above; nothing changes
+  --test hold  loaded torque scale: rope and gauge as for mu, PWM rises slowly to --pwm-max and holds
+               2 s; the script asks for the gauge reading just before the long beep (gauge_kgf)
+  --test step  open-loop duty step, no rope: --pwm0 must equal --pwm-max (PWM jumps at t = 0, held
+               2 s) and --w-slip must be 0 (the wheels turn by design); the script asks whether the
+               trial was clean
+hold and step name the trials <test><pwm_max>_<dir>_<rep> (hold250_XP_01), ask the battery rest
+voltage before every trial (refused below --vbat-min, charge first; Liam 11/11: 12.2 V) and after
+it (Enter = not measured), compute no mu and write no summary.csv. Every trial keeps its own ramp
+settings in trials.csv (several commands may share one --out); commands.csv lists every command.
 """
 import argparse
 import csv
@@ -62,6 +76,22 @@ RAMP_SENDS = 3
 LINE_TIMEOUT_S = 3.0       # no line for this long during a run = link lost
 MISSING_MAX = 0.02         # more missing D lines than this fraction = bad trial [Liam 09/11]
 FW_ENV = 'mu_floor'
+TESTS = ('mu', 'hold', 'step')
+VBAT_MIN = 12.2            # V, battery rest voltage for hold and step [Liam 11/11, guide 7a]
+METHODS = dict(
+    mu=('rope from the car to a fixed point through the gauge, the car pushes away from it; PWM rises '
+        'slowly on four wheels with the sign of kinematics_inverse for the direction; F_max = largest gauge '
+        'reading just before the wheels spin, read on the video by Liam; mu_hd = F_max[kgf] / m[kg]'),
+    hold=('loaded torque scale (Fable item 6 M-02): rope from the car to a fixed point through the gauge as for '
+          'mu; PWM rises at --rate from --pwm0 to --pwm-max on four wheels with the sign of kinematics_inverse, '
+          'holds 2 s at --pwm-max, then the motors stop (long beep); gauge_kgf = gauge reading just before the '
+          'long beep, read by Liam (video kept); a run that ends on slip is kept (the wheels spun below '
+          '--pwm-max); per-trial ramp settings in trials.csv'),
+    step=('open-loop duty step (Fable item 4 F-01): no rope; PWM jumps from 0 to --pwm-max at t = 0 on four '
+          'wheels with the sign of kinematics_inverse, held 2 s, then the motors stop; the car runs straight on '
+          'the floor and is carried back to the start line; the log (counts of the four wheels, BNO085 accel, '
+          '100 Hz) is the data; per-trial ramp settings in trials.csv'),
+)
 
 
 def mu_from_force(f_kgf, mass_kg):
@@ -466,10 +496,49 @@ def ask_force(prompt, inp=input):
 
 TRIAL_COLS = ['trial', 'surface', 'direction', 'rep', 'start', 'run_id', 'sends', 'reason', 't_end_ms', 'pwm_end',
               'slip_t_ms', 'slip_pwm', 'slip_w', 'n_samples', 'n_expected', 'n_missing', 'udp_err', 'link_ok',
-              'f_max_kgf', 'mu', 'note']
+              'f_max_kgf', 'mu', 'note',
+              'test', 'pwm0', 'rate', 'pwm_max', 'w_slip', 'gauge_kgf', 'vbat_before_v', 'vbat_after_v', 'ok']
+
+
+def ask_number(prompt, inp=input, lo=0.0, hi=float('inf'), default=None):
+    """A number in [lo, hi] (comma or dot); '' returns default (None = not given)."""
+    while True:
+        s = inp(prompt).strip().replace(',', '.')
+        if s == '':
+            return default
+        try:
+            v = float(s)
+            if lo <= v <= hi:
+                return v
+        except ValueError:
+            pass
+        print(f'  so trong [{lo:g}, {hi:g}], hoac Enter')
+
+
+def ask_vbat_before(prev, vmin, inp=input):
+    """Battery rest voltage before a trial; Enter keeps prev; below vmin the trial does not start."""
+    while True:
+        hint = f' [Enter = {prev:g}]' if prev is not None else ''
+        v = ask_number(f'  Dien ap pin nghi truoc luot (V){hint}, Enter xong la xe CHAY: ', inp, 9.0, 13.0, prev)
+        if v is None:
+            print('  can so dien ap (do bang dong ho van nang)')
+        elif v < vmin:
+            print(f'  Pin {v:g} V < {vmin:g} V: sac pin roi go lai so moi')
+            prev = None
+        else:
+            return v
+
+
+def trial_done(t):
+    """A trial that need not run again: mu given (test mu, also old files) or ok (hold, step)."""
+    if t.get('test', 'mu') in ('', 'mu'):
+        return t.get('mu') is not None
+    return str(t.get('ok')) == 'True'
 
 
 def run(a, dev, inp=input):
+    test = getattr(a, 'test', 'mu')
+    vmin = getattr(a, 'vbat_min', VBAT_MIN)
     os.makedirs(os.path.join(a.out, 'raw'), exist_ok=True)
     tpath = os.path.join(a.out, 'trials.csv')
     trials = []
@@ -479,11 +548,20 @@ def run(a, dev, inp=input):
                 r['mu'] = float(r['mu']) if r['mu'] not in ('', 'None') else None
                 trials.append(r)
     plan = [(d, rep) for d in a.dirs for rep in range(1, a.reps + 1)]
+    vbat = None
     for d, rep in plan:
-        name = f'{a.surface}_{d}_{rep:02d}'
-        if any(t['trial'] == name and t['mu'] is not None for t in trials):
+        name = f'{a.surface}_{d}_{rep:02d}' if test == 'mu' else f'{test}{a.pwm_max}_{d}_{rep:02d}'
+        if any(t['trial'] == name and trial_done(t) for t in trials):
             continue
-        inp(f'\n[{name}] Dat day va luc ke ({d}), luc ke ve 0, bat quay video, Enter de chay (Ctrl+C dung): ')
+        if test == 'mu':
+            inp(f'\n[{name}] Dat day va luc ke ({d}), luc ke ve 0, bat quay video, Enter de chay (Ctrl+C dung): ')
+        elif test == 'hold':
+            inp(f'\n[{name}] Dat day va can ({d}), can ve 0, bat quay video mat can, Enter de tiep (Ctrl+C dung): ')
+        else:
+            inp(f'\n[{name}] Dat xe sau vach xuat phat, duong chay trong >= 1.5 m, Enter de tiep (Ctrl+C dung): ')
+        vb_before = None
+        if test != 'mu':                                       # the run starts right after this answer
+            vbat = vb_before = ask_vbat_before(vbat, vmin, inp)
         start = time.strftime('%Y-%m-%d %H:%M:%S')
         rows, ev = dev.ramp(d, a.pwm0, a.rate, a.pwm_max, a.w_slip)
         rows = sorted({r['seq']: r for r in rows}.values(), key=lambda r: r['seq'])   # one row per seq
@@ -492,12 +570,35 @@ def run(a, dev, inp=input):
         chk = link_check(rows, ev)
         print(f'  ket thuc: {done.get("reason")} o PWM {done.get("pwm")}, {len(rows)}/{chk["n_expected"]} mau'
               + (f'; tu dung khi truot o PWM {slip.get("pwm")}' if slip else ''))
-        if chk['link_ok']:
+        f = g = vb_after = None
+        ok = False
+        if not chk['link_ok']:
+            print(f'  LUOT HONG (duong truyen): {chk["link_note"]}; chay lai luot nay')
+            note = f'link: {chk["link_note"]}'
+        elif test == 'mu':
             f = ask_force('  F_max doc tren video (kgf), Enter = luot hong: ', inp)
             note = '' if f is not None else 'bad trial, redo'
+        elif test == 'hold':
+            slipped = done.get('reason') == 'slip'
+            if slipped:
+                print('  BANH QUAY TRON truoc pwm_max: giu luot nay (la ket qua), khong chay lai')
+            g = ask_force('  So can ngay truoc bip dai (kgf), Enter = ' + ('khong doc duoc: ' if slipped else
+                                                                             'luot hong: '), inp)
+            ok = g is not None or slipped
+            note = ('slip before pwm_max' if slipped else '') if ok else 'bad trial, redo'
         else:
-            print(f'  LUOT HONG (duong truyen): {chk["link_note"]}; chay lai luot nay')
-            f, note = None, f'link: {chk["link_note"]}'
+            full = done.get('reason') == 'max'
+            if not full:
+                print(f'  Luot khong chay du 2 s (ket thuc {done.get("reason")}): chay lai')
+                note = f'step ended on {done.get("reason")}'
+            else:
+                s = inp('  Luot sach? Enter = sach, chu bat ky + Enter = hong (xe dam vat, truot, ...): ').strip()
+                ok = s == ''
+                note = '' if ok else f'bad trial, redo: {s}'
+        if test != 'mu':
+            vb_after = ask_number('  Dien ap pin nghi sau luot (V), Enter = khong do: ', inp, 9.0, 13.0)
+            if vb_after is not None:
+                vbat = vb_after
         trials = [t for t in trials if t['trial'] != name]
         trials.append(dict(trial=name, surface=a.surface, direction=d, rep=rep, start=start, run_id=ev.get('id', ''),
                            sends=ev.get('sends', ''), reason=done.get('reason', ''), t_end_ms=done.get('t_ms', ''),
@@ -505,10 +606,15 @@ def run(a, dev, inp=input):
                            slip_w=slip.get('w', ''), n_samples=len(rows), n_expected=chk['n_expected'],
                            n_missing=chk['n_missing'], udp_err=done.get('udp_err', ''), link_ok=chk['link_ok'],
                            f_max_kgf='' if f is None else f, mu=None if f is None else mu_from_force(f, a.mass_kg),
-                           note=note))
+                           note=note, test=test, pwm0=a.pwm0, rate=a.rate, pwm_max=a.pwm_max, w_slip=a.w_slip,
+                           gauge_kgf='' if g is None else g, vbat_before_v='' if vb_before is None else vb_before,
+                           vbat_after_v='' if vb_after is None else vb_after,
+                           ok=(f is not None) if test == 'mu' else ok))
         write_csv(tpath, [dict(t, mu='' if t['mu'] is None else t['mu']) for t in trials], TRIAL_COLS)
         if f is not None:
             print(f'  mu_hd = {mu_from_force(f, a.mass_kg):.3f}')
+    if test != 'mu':
+        return trials, []
     summ = summarize(trials)
     write_csv(os.path.join(a.out, 'summary.csv'), summ, ['surface', 'direction', 'n', 'mu_min', 'mu_mean', 'mu_max'])
     for s in summ:
@@ -519,11 +625,18 @@ def run(a, dev, inp=input):
 
 def write_meta(a, dev, here):
     p = getattr(dev, 'pong', {}) or {}
+    test = getattr(a, 'test', 'mu')
+    spec = {'mu': 'spec controller-IMU v2 section 1b.4 (mu_hd); S03 section 2.2 (mu levels from 10 runs)',
+            'hold': ('no spec: Fable item 6 M-02, L87 Q2 (03_CODE/docs/review/2026-11-11_Tham_dinh_Fable_mu_IMU.md); '
+                     'battery L85 Q7'),
+            'step': ('no spec: Fable item 4 F-01, L85 Q5, Q7 '
+                     '(03_CODE/docs/review/2026-11-11_Tham_dinh_Fable_plant_va_O1.md)')}[test]
     meta = dict(
-        spec='spec controller-IMU v2 section 1b.4 (mu_hd); S03 section 2.2 (mu levels from 10 runs)',
+        spec=spec, test=test,
         date=time.strftime('%Y-%m-%d'),
         setup='REAL car on the floor (dry run: invented simulation)' if not a.dry_run else 'dry run, NOT a measurement',
-        operator='Liam (car, gauge, video, F_max reading); script tools/mu_floor_runner.py',
+        operator=('Liam (car, gauge, video, F_max reading); script tools/mu_floor_runner.py' if test == 'mu' else
+                  'Liam (car, gauge and video for hold, battery voltmeter); script tools/mu_floor_runner.py'),
         firmware=dict(esp32=dict(commit=p.get('fw', ''), dirty=p.get('dirty', ''), env=p.get('env', ''),
                                  board='ESP32 on the car', source='PONG line of the board'),
                       ready_line=dev.ready, pong_line=getattr(dev, 'pong_line', '')),
@@ -531,15 +644,31 @@ def write_meta(a, dev, here):
                                              line_timeout_s=LINE_TIMEOUT_S, missing_max=MISSING_MAX),
         script=git_state(here), mass_kg=a.mass_kg, gauge=a.gauge, surface=a.surface,
         ramp=dict(pwm0=a.pwm0, rate_pwm_per_s=a.rate, pwm_max=a.pwm_max, w_slip_rad_s=a.w_slip, dirs=a.dirs, reps=a.reps),
-        method=('rope from the car to a fixed point through the gauge, the car pushes away from it; PWM rises '
-                'slowly on four wheels with the sign of kinematics_inverse for the direction; F_max = largest gauge '
-                'reading just before the wheels spin, read on the video by Liam; mu_hd = F_max[kgf] / m[kg]'),
-        files=dict(raw='raw/<surface>_<dir>_<rep>.csv (100 Hz)', trials='trials.csv', summary='summary.csv'),
+        method=METHODS[test],
+        files=(dict(raw='raw/<surface>_<dir>_<rep>.csv (100 Hz)', trials='trials.csv', summary='summary.csv')
+               if test == 'mu' else
+               dict(raw='raw/<test><pwm_max>_<dir>_<rep>.csv (100 Hz)',
+                    trials='trials.csv (ramp settings, gauge_kgf, vbat_before_v, vbat_after_v, ok per trial)',
+                    commands='commands.csv (every command run into this folder)')),
     )
+    if test != 'mu':
+        meta['ramp_note'] = 'settings of the LAST command; each trial keeps its own in trials.csv'
+        meta['vbat_min_v'] = getattr(a, 'vbat_min', VBAT_MIN)
     with open(os.path.join(a.out, 'meta.yaml'), 'w', encoding='utf-8') as f:
         f.write('# MU_FLOOR run (written by tools/mu_floor_runner.py; every value is JSON, so the file is valid YAML)\n')
         for k, v in meta.items():
             f.write(f'{k}: {json.dumps(v, ensure_ascii=False)}\n')
+    if test == 'mu':
+        return
+    cpath = os.path.join(a.out, 'commands.csv')
+    new = not os.path.isfile(cpath)
+    with open(cpath, 'a', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        if new:
+            w.writerow(['time', 'test', 'argv', 'script_commit', 'script_dirty'])
+        st = meta['script']
+        w.writerow([time.strftime('%Y-%m-%d %H:%M:%S'), test, ' '.join(getattr(a, 'argv', []) or []),
+                    st.get('commit', ''), st.get('dirty', '')])
 
 
 def check_firmware(dev, expect=''):
@@ -570,15 +699,24 @@ def main(argv=None):
     ap.add_argument('--mass-kg', type=float, required=True, help='car mass on a scale, kg')
     ap.add_argument('--gauge', default='', help='force gauge: model, range, resolution')
     ap.add_argument('--surface', default='floor', help='floor, or mica for X3 (slippery sheet under the wheels)')
-    ap.add_argument('--dirs', nargs='+', default=['XP', 'YP'], choices=DIRS)
+    ap.add_argument('--dirs', nargs='+', default=None, choices=DIRS, help='default XP YP for mu, XP for hold and step')
     ap.add_argument('--reps', type=int, default=5)
     ap.add_argument('--pwm0', type=int, default=100)
     ap.add_argument('--rate', type=int, default=10, help='PWM per second')
     ap.add_argument('--pwm-max', type=int, default=1000)
     ap.add_argument('--w-slip', type=float, default=3.0, help='rad/s, automatic stop (0 = off)')
+    ap.add_argument('--test', choices=TESTS, default='mu', help='mu (default), hold or step (see the top of the file)')
+    ap.add_argument('--vbat-min', type=float, default=VBAT_MIN, help='V, battery rest voltage for hold and step')
     a = ap.parse_args(argv)
+    a.argv = list(sys.argv[1:] if argv is None else argv)
+    if a.dirs is None:
+        a.dirs = ['XP', 'YP'] if a.test == 'mu' else ['XP']
     if not a.dry_run and bool(a.udp) == bool(a.port):
         sys.exit('give exactly one of --udp auto|IP and --port COMx (or --dry-run)')
+    if a.test == 'step' and (a.pwm0 != a.pwm_max or a.w_slip != 0):
+        sys.exit('--test step needs --pwm0 equal to --pwm-max (a step) and --w-slip 0 (the wheels turn by design)')
+    if a.test != 'mu' and a.surface != 'floor':
+        sys.exit('--test hold/step: the trial name comes from --test and --pwm-max; keep --surface floor')
     here = os.path.dirname(os.path.abspath(__file__))
     if a.dry_run:
         dev = FakeDevice(mass_kg=a.mass_kg)
