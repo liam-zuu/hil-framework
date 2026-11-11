@@ -91,7 +91,7 @@ def test_run_bad_fields():
 
 
 def _write_dut_log(tmp_path, reset_at=None, n=300):
-    """A DUT log (85 columns), motor on, sp_vx 0.3 m/s, run_active 1 except lines 140..149
+    """A DUT log (86 columns), motor on, sp_vx 0.3 m/s, run_active 1 except lines 140..149
     (stale packets); pos_reset_n 1, +1 from line reset_at on."""
     p = tmp_path / 'run.csv'
     with open(p, 'w', newline='') as f:
