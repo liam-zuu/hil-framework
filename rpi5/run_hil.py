@@ -222,7 +222,13 @@ def _finite_run_config(args, spec):
         raise SystemExit(f'--finite-run decides the end of the run itself, it excludes {", ".join(bad)}')
     if spec.duration <= 0:
         raise SystemExit('--finite-run needs a finite trajectory (--duration or --test)')
-    lc = LifecycleConfig(run_s=spec.duration)
+    if getattr(args, 'o1', None):
+        # L85 Q1 (Fable O1/C6 F-1): zeros, SWA and the frame log past the deadline T_cmd + t_late,
+        # as fwsim runs to it; the default stop_s (1.0 s) cut the log before the completion window
+        import o1_tasks
+        lc = LifecycleConfig(run_s=spec.duration, stop_s=max(LifecycleConfig.stop_s, o1_tasks.O1_TAIL_S))
+    else:
+        lc = LifecycleConfig(run_s=spec.duration)
     # Ceiling only, the phases end first: it sizes the frame log, and a bug here cannot run forever
     return lc, int((lc.arm_timeout_s + lc.run_s + lc.run_grace_s + lc.stop_s + 2.0) * 1000)
 

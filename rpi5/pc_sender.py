@@ -18,7 +18,14 @@ In dong '#test_start' va '#test_end' co gio may (epoch, ISO) de ghep voi log xe.
 --o1 O1-F02|O1-F05|O1-F08|O1-K1|O1-K2 (C6, L76, Liam 10/11 "Duyet, lam luon"): nhiem vu san O1,
 lich cua rpi5/o1_tasks.py (so 8 = fwsim/o1_feasibility.Schedule, cung bo sinh voi S03/S04 va
 run_hil --o1); cung vong gui nhu --test. O1-K1, O1-K2 la tap kiem cuoi: can --allow-final-set.
+
+L85 Q1 (Liam 11/11, CODE local_821ee4dc "duyet Q1-8 theo khuyen nghi"; Fable O1/C6 F-1, F-5, F-10):
+gui moi goi k co k/50 < T_lenh, roi goi 0 tren CUNG luoi (khong de goi 0 dau de goi lich cuoi);
+--o1 gui 0 trong o1_tasks.O1_TAIL_S = t_tre + 0,5 = 2,5 s (bang fwsim: lenh 0 toi han T_lenh + t_tre),
+--test A-K* giu 10 goi 0 (0,2 s) nhu C5. Luoi tinh bang dong ho don dieu (time.monotonic); gio may
+(time.time) chi de in '#test_start', '#test_end'. Ctrl-C: 10 goi 0 ngay.
 """
+import math
 
 import socket
 import struct
@@ -80,34 +87,60 @@ def test_schedule(test_id: str, allow_final_set: bool = False):
     return spec.duration, (lambda t: get_body_velocity(t, spec))
 
 
-def test_loop(ip: str, test_id: str, sock=None, clock=time.time, sleep=time.sleep, out=print,
-              allow_final_set: bool = False) -> int:
-    """Send the schedule of test_id at SEND_HZ on an absolute time grid, then zeros; returns the
-    number of schedule packets sent."""
+LIFTED_TAIL_ZEROS = 10      # --test A-K*: 0.2 s of zeros after the schedule (C5, unchanged)
+
+
+def grid_counts(test_id: str, duration: float):
+    """(schedule packets, zero packets) on the 50 Hz grid: every k with k/50 < duration, then the
+    zeros: O1 tasks up to duration + o1_tasks.O1_TAIL_S (k/50 < that), A-K tests 10 packets."""
+    n_total = int(math.ceil(duration * SEND_HZ - 1e-9))
+    if test_id.startswith('O1-'):
+        import o1_tasks
+        n_zero = int(math.ceil((duration + o1_tasks.O1_TAIL_S) * SEND_HZ - 1e-9)) - n_total
+    else:
+        n_zero = LIFTED_TAIL_ZEROS
+    return n_total, n_zero
+
+
+def test_loop(ip: str, test_id: str, sock=None, clock=time.monotonic, sleep=time.sleep, out=print,
+              allow_final_set: bool = False, wall=time.time) -> int:
+    """Send the schedule of test_id at SEND_HZ on an absolute time grid (clock: monotonic), then
+    the zeros of grid_counts on the same grid; returns the number of schedule packets sent.
+    wall gives the epoch printed in '#test_start' / '#test_end' only."""
     duration, f = test_schedule(test_id, allow_final_set)
     own = sock is None
     sock = sock or socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    n_total = int(round(duration * SEND_HZ))
-    t0 = clock()
-    out(f"#test_start,test={test_id},t_epoch={t0:.3f},iso={time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(t0))},"
-        f"duration_s={duration:g},send_hz={SEND_HZ},dst={ip}:{TRAJ_PORT}")
-    n = 0
+    n_total, n_zero = grid_counts(test_id, duration)
+    t0, e0 = clock(), wall()
+    out(f"#test_start,test={test_id},t_epoch={e0:.3f},iso={time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(e0))},"
+        f"duration_s={duration:g},send_hz={SEND_HZ},tail_zeros={n_zero},dst={ip}:{TRAJ_PORT}")
+
+    def at(k):
+        wait = t0 + k / SEND_HZ - clock()
+        if wait > 0:
+            sleep(wait)
+
+    n, nz, interrupted = 0, 0, False
     try:
         for k in range(n_total):
-            wait = t0 + k / SEND_HZ - clock()
-            if wait > 0:
-                sleep(wait)
+            at(k)
             vx, vy, wz = f(k / SEND_HZ)
             sock.sendto(pack_packet(vx, vy, wz), (ip, TRAJ_PORT))
             n += 1
+        for k in range(n_total, n_total + n_zero):
+            at(k)
+            sock.sendto(pack_packet(0, 0, 0), (ip, TRAJ_PORT))
+            nz += 1
     except KeyboardInterrupt:
+        interrupted = True
         out('#test_interrupted')
     finally:
-        for _ in range(10):
-            sock.sendto(pack_packet(0, 0, 0), (ip, TRAJ_PORT))
-            sleep(0.02)
-        t1 = clock()
-        out(f"#test_end,test={test_id},t_epoch={t1:.3f},sent={n},planned={n_total},complete={int(n == n_total)}")
+        if interrupted or nz < n_zero:
+            for _ in range(LIFTED_TAIL_ZEROS):
+                sock.sendto(pack_packet(0, 0, 0), (ip, TRAJ_PORT))
+                sleep(0.02)
+        out(f"#test_end,test={test_id},t_epoch={wall():.3f},zeros={nz},tail_planned={n_zero},"
+            f"sent={n},planned={n_total},complete={int(n == n_total)}")
         if own:
             sock.close()
     return n

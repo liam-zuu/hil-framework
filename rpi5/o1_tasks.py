@@ -43,7 +43,13 @@ for _p in (HERE, os.path.join(HERE, '..', 'fwsim')):
 
 import trajectory_pub                                   # noqa: E402
 from trajectory_pub import TrajectorySpec               # noqa: E402
-from o1_feasibility import Schedule, A_R                # noqa: E402  (A_R = 0.5 m/s^2, O1 3.1)
+from o1_feasibility import Schedule, A_R, T_LATE        # noqa: E402  (A_R = 0.5 m/s^2, O1 3.1)
+
+# Zero command after T_cmd on the bench and on the vehicle: t_late (the completion deadline
+# T_cmd + t_late of O1 3.4, fwsim runs to it) + 0.5 s margin, so the zero setpoint, run_active and
+# the logs reach past the deadline as on fwsim (L85 Q1, Liam 11/11 CODE local_821ee4dc; Fable
+# O1/C6 review F-1: the HIL stopped at T_cmd + 1 s, the vehicle at T_cmd + 0.18 s).
+O1_TAIL_S = T_LATE + 0.5
 
 FIG8 = {'O1-F02': 0.2, 'O1-F05': 0.5, 'O1-F08': 0.8}    # O1 section 1: three levels
 FINAL_SET = ('O1-K1', 'O1-K2')                          # O1 section 3.7
