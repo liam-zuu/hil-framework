@@ -150,3 +150,24 @@ def test_log_coverage_rule(completed, end, expect):
     out = H.log_coverage(dict(completed=completed, t_deadline=10.0), end, 0.001)
     assert out['completed'] == expect
     assert out['log_covers_deadline'] is (end >= 9.999 - 1e-9)
+
+
+def test_duty_comes_from_miso_bytes_0_7_not_the_crc(tmp_path):
+    """MISO v4: duty in the torque slots (bytes 0-7, as protocol.decode_torques / the Pi plant), CRC in
+    bytes 8-9. Fixed 11/11/2026 (the scorer read bytes 8-15)."""
+    p = str(tmp_path / 'run.npz')
+    write_frame_log(p, 'O1-F05')
+    z = dict(np.load(p))
+    miso = z['miso'].copy()
+    n = len(miso)
+    duty = np.zeros((n, 4))
+    duty[:, 0] = 1.0                                         # FL saturated all run, others 0
+    duty[::2, 1] = 0.25                                      # FR toggles 0 / 0.25 every frame
+    for k in range(n):
+        miso[k, 0:8] = np.frombuffer(np.round(duty[k] * 32767).astype('>i2').tobytes(), dtype=np.uint8)
+        miso[k, 8:10] = (0xA5, 0x5A)                         # a CRC-like pattern that must not be read as duty
+    np.savez(p, manifest=z['manifest'], mosi=z['mosi'], miso=miso)
+    out = H.score(p, 'O1-F05')
+    assert out['sat_frac'] == pytest.approx(0.25, abs=1e-3)            # one wheel of four at |pwm| 1000
+    assert 'tv_duty' not in out
+    assert out['tv_duty_h7_1khz'] == pytest.approx(0.25 * 1000, rel=0.01)   # 0.25 per frame, 1000 frames/s

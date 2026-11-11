@@ -12,7 +12,12 @@ O1 3.3 are for the camera only. So:
 
 Frame k of the log holds the plant state at step k before the step (MOSI bytes 0-19:
 omega 1-4, x, y, theta, vx, vy, wz, int16, protocol.STATE_RANGES; x, y step 5/32767 m = 0.15 mm)
-and the duty the H7 measured (MISO bytes 8-15, duty x 32767). The plant starts at (0, 0, 0)
+and the duty the H7 measured (MISO bytes 0-7, duty x 32767, the 'torque' slots the Pi plant reads with
+protocol.decode_torques; MISO v4 bytes 8-9 are the CRC: this scorer read bytes 8-15 until 11/11/2026,
+so its duty, sat_frac and tv_duty of runs scored before were wrong; pose fields were not affected).
+tv_duty here is the H7-measured duty at 1 kHz (written as tv_duty_h7_1khz): capture noise makes it
+larger than the S05 4.7 / S03 Y3 tv_duty, which comes from the ESP32 counters (s05_final_table.py).
+The plant starts at (0, 0, 0)
 held through ARM; t = 0 (command start) is the first RUN step of the lifecycle in the manifest
 (the publisher starts its trajectory clock when it sees RUN: trajectory_pub, polled every 2 ms),
 else the first frame whose trajectory part is VALID and non-zero (t0_src says which).
@@ -61,7 +66,7 @@ def decode_frames(mosi, miso):
     state = _int16(mosi, 0, 10) / 32767.0 * np.asarray(P.STATE_RANGES)
     ref = _int16(mosi, P.OFS_TRAJ_REF, 3) / 32767.0 * np.asarray(P.REF_RANGES)
     flags = np.asarray(mosi[:, P.OFS_TRAJ_FLAGS], dtype=np.uint8)
-    duty = _int16(miso, P.OFS_PWM, 4) / 32767.0 * P.PWM_RANGE
+    duty = _int16(miso, 0, 4) / 32767.0 * P.TORQUE_RANGE                # = protocol.decode_torques
     return state, ref, flags, duty
 
 
@@ -113,6 +118,7 @@ def score(path, task, allow_final_set=False):
         out['task'] = task
     else:
         out, _ = o1_lanes.evaluate_k(log, task)
+    out['tv_duty_h7_1khz'] = out.pop('tv_duty')                          # not the S05 4.7 tv_duty (docstring)
     log_coverage(out, float(log['t'][-1]) if len(log['t']) else -1.0, period)
     mc = manifest.get('miso_check') or {}
     out.update(frame_log=os.path.basename(path), k0=k0, t0_src=t0_src, frames_scored=int(len(state) - k0),
