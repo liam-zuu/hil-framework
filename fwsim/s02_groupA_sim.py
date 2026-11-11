@@ -42,6 +42,17 @@ import s02_metrics                                      # noqa: E402
 
 STOP_TAIL_S = 1.0
 
+
+def rep_imu(imu, rep):
+    """IMU config of repetition `rep`: with the noise replay on, its seed (start row) is the
+    repetition number, the same for every test and both controllers, and the HIL run of the
+    same repetition uses the same seed (Liam 11/11 CODE local_7787e22f, as S05 v3.7 section 6.3:
+    seed fixed in advance by condition and repetition, shared by every gain set). Before
+    11/11 every repetition used seed 0, so the N runs got the same noise segment."""
+    if not imu or imu.get('noise') != 'replay':
+        return imu
+    return dict(imu, noise_seed=int(rep))
+
 # Logger column (agv_logger.COLUMNS after the 37 S02 columns) -> (fwsim.IMU_COLS name, format).
 # None = not available in fwsim (left empty).
 CTRL_IMU_COLS = {
@@ -110,6 +121,8 @@ def main():
     ap.add_argument('--out', required=True)
     a = ap.parse_args()
     imu = fwsim.imu_config(a)
+    if imu and imu.get('noise') == 'replay' and a.imu_noise_seed != 0:
+        sys.exit('--imu-noise-seed: S02 sets the noise seed to the repetition number (rep_imu)')
     if os.path.isdir(a.out) and os.listdir(a.out):
         sys.exit(f'{a.out} already holds data: use a new folder.')
     os.makedirs(os.path.join(a.out, 'raw'), exist_ok=True)
@@ -126,7 +139,8 @@ def main():
             spec = GROUP_A[test_id]
             params = fwsim.plant_params(a, wheels_lifted=test_id in LIFTED_TESTS)
             sp = (lambda s: lambda t: get_body_velocity(t, s) if t < s.duration else (0.0, 0.0, 0.0))(spec)
-            log = fwsim.simulate(fw, sp, spec.duration + STOP_TAIL_S, params, seed=rep, mode=a.controller, imu=imu)
+            imu_r = rep_imu(imu, rep)
+            log = fwsim.simulate(fw, sp, spec.duration + STOP_TAIL_S, params, seed=rep, mode=a.controller, imu=imu_r)
             run_id = f'{test_id}_{a.controller}_r{rep}'
             path = os.path.join('raw', f'{run_id}.csv')
             with open(os.path.join(a.out, path), 'w', newline='') as f:
@@ -134,7 +148,8 @@ def main():
                 w.writerow(COLUMNS)
                 w.writerows(log_rows(log, imu is not None))
             runs.append(dict(run_id=run_id, platform='sim', controller=a.controller, test_id=test_id,
-                             speed_mps=spec.v, rep=rep, seed=rep, v_batt_start='', v_batt_end='',
+                             speed_mps=spec.v, rep=rep, seed=rep,
+                             noise_seed=(imu_r or {}).get('noise_seed', ''), v_batt_start='', v_batt_end='',
                              file=path, aborted=0, reason='ok', missing_pct=0))
     with open(os.path.join(a.out, 'runs.csv'), 'w', newline='') as f:
         w = csv.DictWriter(f, fieldnames=list(runs[0]))
@@ -147,6 +162,11 @@ def main():
     gains = ({ax: fw.get_adrc(i) for i, ax in enumerate(['vx', 'vy', 'wz'])} if a.controller == 'ADRC'
              else {ax: fw.get_pid(i) for i, ax in enumerate(['vx', 'vy', 'wz'])})
     pos_loop = fwsim.pos_meta(fw)
+    NOTE_NOISE = ('the plant has no random input (legacy slip model off; ground_model traction is deterministic); '
+                  'the IMU noise replay (rpi5/imu_model.ImuNoise) starts at the row given by the repetition seed, '
+                  'so repetitions differ by the noise segment; a re-run with the same seed is the same run bit for bit '
+                  '(S02 v1.3 A-R2-2)')
+    NOTE_NO_NOISE = 'no random input (plant deterministic, IMU noise off), so the repetitions give identical runs'
     fw.reset()
     with open(os.path.join(a.out, 'meta.yaml'), 'w', encoding='utf-8') as f:
         f.write(f"""spec: S02
@@ -166,9 +186,9 @@ firmware:
   rpi5: null
 plant: {fwsim.plant_meta(p0)}
 plant_extra: {{motor_polarity: {p0.motor_polarity.tolist()}, lifted_tests: {list(LIFTED_TESTS)}}}
-imu: {json.dumps(imu)}             # null = no IMU reports (--no-imu, only for pre-28/10 re-runs)
+imu: {json.dumps(imu)}             # null = no IMU reports (--no-imu, only for pre-28/10 re-runs); noise_seed is set per repetition (seeds)
 reps: {a.reps}
-seeds: "seed = rep (1..{a.reps})"
+seeds: "plant seed = rep (1..{a.reps}); IMU noise replay seed = rep (rep_imu, runs.csv noise_seed); the HIL run of the same repetition uses the same seed"
 order_seed: {a.order_seed}
 setpoint: "trajectory_pub.get_body_velocity held at 50 Hz, then 0 for {STOP_TAIL_S} s"
 libraries: {json.dumps(fwsim.lib_versions())}
@@ -177,7 +197,7 @@ files:
   - raw/<run_id>.csv: "ESP32 logger format (tools/agv_logger.py COLUMNS, 85), 100 Hz; IMU fusion / heading columns from the firmware (empty with --no-imu); pos_* and ws_* from the firmware (empty with a DLL without pos_ctrl.c / wheel_slip.c); raw chip columns ax..roll and gyro_n, rv_n, reset_n empty (not in fwsim)"
   - runs.csv: "spec P2-6 columns + test_id"
   - metrics.csv: "tools/s02_metrics.py, one line per run"
-notes: "the plant has no random input (legacy slip model off; ground_model traction is deterministic) and the IMU model is noise-free until the IMU noise measurement (K1), so the {a.reps} seeds give identical runs"
+notes: "{NOTE_NOISE if imu and imu.get('noise') == 'replay' else NOTE_NO_NOISE}"
 """)
     print(f'{len(runs)} runs in {time.time() - t_start:.0f} s -> {a.out}')
 
