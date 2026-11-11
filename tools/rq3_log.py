@@ -20,19 +20,29 @@ Commands (the operator types them while working; every time stamp is the PC cloc
   pause / resume                         other work in between: not counted (S05 §3.1)
   end    --outcome dat|khong_dat|chua_ket_luan|hong_he_do [--e-perp-max M] [--completed 0|1]
          [--fail-cause X] [--results-dir D]   close the run, append its row
-  cancel / status                        drop the open run without a row / show it
+  cancel / status                        drop the open run / show it. cancel only before the "run"
+                                         step (S05 §3.3: every started run counts, EA-6); time of the
+                                         steps already logged goes to m7_dev_effort_log.csv
   machine --campaign C --controller PID --script-run-id ID --results-dir D --n-sim-evals N
-         --t-machine-s S --wall-start T --wall-end T   summary row of a fwsim script run
+         --t-machine-s S --wall-start T --wall-end T [--stage script]   summary row of a fwsim
+                                         script run (stage script by default, S05 v3.7 A-R2-4)
+  hoc-start --campaign C --ghi-chu X / hoc-end [--ghi-chu X]   a hoc segment, time stamps written
+                                         by the script (S05 §3.1 R-2, EA-7)
   effort --date D --start HH:MM --end HH:MM (--campaign C | --khoan K) [--nhan hoc] --ghi-chu X
+                                         (a hoc row typed here is flagged [nhap_tay], EA-7)
   hwfail --date D --session S --campaign C --platform HW --what X --cause gain|... --fix-h H
-  freeze --campaign C --stop-reason R --gain-set G --gain-file F [--at T]   (sha256 of F computed)
-  summary [--gate O1-F05,O1-F08] [--out S05_summary.csv]   recompute the summary from the logs;
-                                         --gate = figure-8 levels inside the gate (locked at C8)
+                                         (refused while a run is open: close it first, EA-1)
+  freeze --campaign C --stop-reason R [--stop-cause K] --gain-set C/G --gain-file F [--at T]
+                                         (sha256 of F computed; gain set id prefixed by the campaign)
+  summary [--gate-file F] [--out S05_summary.csv]   recompute the summary from the logs;
+                                         F = the locked gate (figure-8 levels, locked at C8), one
+                                         level per row under the header "level"; its sha256 is reported
   demo   --out DIR                       C9 dry run: made-up campaign in DIR, then summary
 
-Rules taken from S05 v3.6 (approved 11/11, not locked): 3.1 (time types, wait, hoc), 3.2
-(accounts, B-chung split), 3.3 (counts by platform, stages), 4.1 (caps 10 h, 120 car runs, counted
-before frozen_at), 4.6 (final_hil = account RQ2), 4.7 (final counts, gate_result), 6.1-6.3.
+Rules taken from S05 v3.7 (approved 11/11, not locked): 3.1 (time types, wait, hoc), 3.2
+(accounts, B-chung split), 3.3 (counts by platform, stages, T_sua in T), 4.1 (caps 10 h, 120 car
+runs, counted before frozen_at; stop_cause), 4.6 (final_hil = account RQ2, N = 3), 4.7 (final
+counts, gate_result), 4.8 (explore out of T, N, caps), 6.1-6.3 (gain_set_id per campaign).
 """
 from __future__ import annotations
 
@@ -51,6 +61,7 @@ DEFAULT_DATASET = os.path.normpath(os.path.join(HERE, '..', '..', '..', '05_DATA
 
 TUNING, EFFORT, HWFAIL = 'm7_tuning_log.csv', 'm7_dev_effort_log.csv', 'm7_hw_failure_log.csv'
 FREEZE, OPEN_RUN, SUMMARY = 'S05_freeze.csv', 'rq3_open_run.json', 'S05_summary.csv'
+OPEN_HOC = 'rq3_open_hoc.json'
 
 # S05 §6.1: columns kept (checked 08/11) + added
 TUNING_OLD = ['session_id', 'date', 'platform', 'controller', 'trajectory', 'iter_no', 't_flash_s',
@@ -68,14 +79,21 @@ EFFORT_OLD = ['ngay', 'bat_dau', 'ket_thuc', 'gio', 'buoc', 'giai_doan', 'mot_la
 EFFORT_COLS = EFFORT_OLD + ['khoan', 'nhan']
 HWFAIL_COLS = ['ngay', 'session_id', 'chien_dich', 'nen_tang', 'thu_hong', 'nguyen_nhan', 'gio_sua',
                'ghi_chu', 'dut', 'iter_no', 'buoc', 'lap_lai']
-FREEZE_COLS = ['campaign', 'frozen_at', 'stop_reason', 'gain_set_id', 'gain_file', 'gain_sha256', 'notes']
+FREEZE_COLS = ['campaign', 'frozen_at', 'stop_reason', 'stop_cause', 'gain_set_id', 'gain_file', 'gain_sha256',
+               'notes']                                                  # stop_cause: S05 v3.7 §6.3
 STOP_REASONS = ('khoi_xac_nhan_dat', 'cham_tran_gio', 'cham_tran_xe', 'het_ung_vien', 's04_dung',
                 'khong_du_luot_xac_nhan', 'khong_co_bo_danh_gia_du')          # S05 v3.6 §4.7
+STOP_CAUSES = ('cham_tran_gio', 'cham_tran_xe', 'het_ung_vien', 's04_dung', 'khong_du_luot_xac_nhan')  # v3.7 §4.1
 FINAL_N = 5                              # S05 §4.6: 5 valid runs per condition
+FINAL_LOST_N = 3                         # S05 §4.6: stop a condition after 3 lost runs in a row
 
 CAMPAIGNS = ('A-PID', 'A-LADRC', 'B-PID', 'B-LADRC', 'B-chung', 'RQ2-INIT-PID', 'RQ2-INIT-LADRC', 'RQ2')
+TUNED = ('A-PID', 'A-LADRC', 'B-PID', 'B-LADRC')
+GAIN_OWNERS = TUNED + ('RQ2-INIT-PID', 'RQ2-INIT-LADRC')   # the six gain sets of the final session (§4.6)
 KHOAN = ('T_H', 'C_chung', 'RQ2')
-STAGES = ('screen', 'confirm', 'final', 'explore', 'hil_check', 'final_hil')
+STAGES = ('screen', 'confirm', 'final', 'explore', 'hil_check', 'final_hil', 'script')   # script: v3.7 §3.3
+FIG8 = {'O1-F02': 0.2, 'O1-F05': 0.5, 'O1-F08': 0.8}     # same as rpi5/o1_tasks.py FIG8 (a test checks)
+MANUAL = '[nhap_tay]'                    # flag of a hoc row typed by hand (S05 §3.1 R-2, EA-7)
 OUTCOMES = ('dat', 'khong_dat', 'chua_ket_luan', 'hong_he_do')
 PLATFORMS = ('SIM', 'HIL', 'HW')
 STEPS = ('flash', 'setup', 'run', 'log', 'analysis')
@@ -167,8 +185,40 @@ def migrate_file(path: str, cols: List[str]) -> str:
 
 
 def migrate(ds: str) -> Dict[str, str]:
-    return {name: migrate_file(os.path.join(ds, name), cols)
-            for name, cols in ((TUNING, TUNING_COLS), (EFFORT, EFFORT_COLS), (HWFAIL, HWFAIL_COLS))}
+    out = {name: migrate_file(os.path.join(ds, name), cols)
+           for name, cols in ((TUNING, TUNING_COLS), (EFFORT, EFFORT_COLS), (HWFAIL, HWFAIL_COLS))}
+    if os.path.exists(os.path.join(ds, FREEZE)):              # v3.6 file without stop_cause (v3.7)
+        out[FREEZE] = migrate_file(os.path.join(ds, FREEZE), FREEZE_COLS)
+    return out
+
+
+# ── checks shared by the commands and the summary ─────────────────────────
+def check_task(task: str, speed) -> None:
+    """EA-9: a figure-8 task name carries its level; the level and speed_mps must agree, so the
+    gate (a list of task names) cannot merge two speeds."""
+    if task.startswith('O1-F'):
+        if task not in FIG8:
+            raise LogError(f'task {task!r}: figure-8 names are {sorted(FIG8)} (the name carries the level)')
+        if abs(_f(speed) - FIG8[task]) > 1e-9:
+            raise LogError(f'task {task} is level {FIG8[task]} m/s, speed {speed!r} given')
+
+
+def gain_owner(gain_set: str) -> str:
+    """EA-5 (S05 v3.7 §6.3): gain_set_id = '<campaign>/<id>', unique per campaign."""
+    owner, sep, rest = (gain_set or '').partition('/')
+    if not sep or not rest or owner not in GAIN_OWNERS:
+        raise LogError(f'gain set {gain_set!r}: write it "<campaign>/<id>", campaign one of {GAIN_OWNERS}')
+    return owner
+
+
+def check_gain_set(campaign: str, stage: str, gain_set: str) -> None:
+    """A run of campaign C carries a gain set of C; a final_hil run (account RQ2) carries the gain
+    set of the campaign (or RQ2-INIT-*) it tests."""
+    if not gain_set:
+        return
+    owner = gain_owner(gain_set)
+    if stage != 'final_hil' and owner != campaign:
+        raise LogError(f'gain set {gain_set!r} belongs to {owner}, the run is {campaign}')
 
 
 # ── one run, live ──────────────────────────────────────────────────────────
@@ -211,12 +261,16 @@ def begin(ds: str, session: str, campaign: str, platform: str, controller: str, 
           stage: str, gain_set: str = '', gains: str = '', **extra) -> dict:
     if _load_open(ds):
         raise LogError('a run is open: "end" or "cancel" it first')
+    if _load_hoc(ds):
+        raise LogError('a hoc segment is open: "hoc-end" first (hoc touches no run, S05 §3.1)')
     if campaign not in CAMPAIGNS:
         raise LogError(f'--campaign {campaign!r}: one of {CAMPAIGNS}')
-    if platform not in PLATFORMS or stage not in STAGES:
-        raise LogError(f'--platform one of {PLATFORMS}, --stage one of {STAGES}')
+    if platform not in PLATFORMS or stage not in STAGES or stage == 'script':
+        raise LogError(f'--platform one of {PLATFORMS}, --stage one of {STAGES[:-1]} (script: "machine")')
     if not session or session.startswith(SKIP_PREFIX) or ':' in session:
         raise LogError('--session: a name of your own, no ":" (run_uid = session_id:iter_no)')
+    check_task(task, speed)
+    check_gain_set(campaign, stage, gain_set)
     it = next_iter_no(ds, session)
     t = now()
     row = {'session_id': session, 'date': t.date().isoformat(), 'platform': platform, 'controller': controller,
@@ -323,19 +377,44 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
 
 
 def cancel(ds: str) -> dict:
+    """EA-6: a run whose "run" step started counts (S05 §3.3): close it with "end" (an early end
+    is an outcome plus --fail-cause), never cancel it. Before that step a cancel drops the run;
+    the time of the steps already logged (flash, setup, ...) is active work of the campaign and
+    goes to m7_dev_effort_log.csv as one row (gio = sum of the segments, pauses out)."""
     run = _require_open(ds)
+    kinds = [s['kind'] for s in run['segments']] + [s['kind'] for s in (run.get('current'), run.get('paused_from'))
+                                                     if s]
+    if 'run' in kinds:
+        raise LogError('the "run" step started: the run counts (S05 §3.3); close it with '
+                       '"end --outcome ... --fail-cause ..."')
+    t = now()
+    if run.get('paused_from') is None:
+        _close_segment(run, t)
+    active = sum(v for k, v in segment_totals(run['segments']).items() if k != 't_operator_wait_s')
+    row = run['row']
+    if active > 0:
+        t0 = _parse_t(row['wall_start'])
+        eff = {'ngay': t0.date().isoformat(), 'bat_dau': t0.strftime('%H:%M:%S'), 'ket_thuc': t.strftime('%H:%M:%S'),
+               'gio': f'{active / 3600:.4f}', 'chien_dich': row['campaign'],
+               'ghi_chu': f"rq3_log cancel truoc buoc run: {row['run_uid']} ({row['trajectory']} {row['speed_mps']}); "
+                          f"gio = tong cac buoc da ghi"}
+        append_row(os.path.join(ds, EFFORT), EFFORT_COLS, eff)
+        run['effort_row'] = eff
     os.remove(_open_path(ds))
     return run
 
 
 # ── rows not tied to one live run ─────────────────────────────────────────
 def machine(ds: str, campaign: str, controller: str, script_run_id: str, results_dir: str, n_sim_evals: int,
-            t_machine_s: float, wall_start: str, wall_end: str, platform: str = 'SIM', stage: str = 'explore',
+            t_machine_s: float, wall_start: str, wall_end: str, platform: str = 'SIM', stage: str = 'script',
             session: str = 'MACHINE', notes: str = '', **active) -> dict:
     """Summary row of a script run (S5-23 v2): one per (controller, account); n_sim_evals and
-    t_machine_s are this row's part, the rows of one script run add up to the run."""
+    t_machine_s are this row's part, the rows of one script run add up to the run. Stage `script`
+    by default (S05 v3.7 §3.3, A-R2-4: an `explore` row would be left out of T and N, §4.8)."""
     if campaign not in CAMPAIGNS:
         raise LogError(f'--campaign {campaign!r}: one of {CAMPAIGNS}')
+    if stage not in STAGES:
+        raise LogError(f'--stage one of {STAGES}')
     it = next_iter_no(ds, session)
     row = {'session_id': session, 'iter_no': str(it), 'run_uid': f'{session}:{it}', 'date': wall_start[:10],
            'platform': platform, 'controller': controller, 'campaign': campaign, 'stage': stage,
@@ -360,6 +439,8 @@ def effort(ds: str, date: str, start: str, end_: str, campaign: str = '', khoan:
         raise LogError('--nhan hoc or nothing')
     if nhan == 'hoc' and not ghi_chu:
         raise LogError('a hoc row names what was read (S05 §3.1)')
+    if nhan == 'hoc' and not ghi_chu.startswith(MANUAL):
+        ghi_chu = f'{MANUAL} {ghi_chu}'                 # EA-7: times typed, not stamped by the script
     t0 = dt.datetime.fromisoformat(f'{date}T{start}')
     t1 = dt.datetime.fromisoformat(f'{date}T{end_}')
     if t1 <= t0:
@@ -371,8 +452,54 @@ def effort(ds: str, date: str, start: str, end_: str, campaign: str = '', khoan:
     return row
 
 
+def _hoc_path(ds):
+    return os.path.join(ds, OPEN_HOC)
+
+
+def _load_hoc(ds) -> Optional[dict]:
+    p = _hoc_path(ds)
+    if not os.path.exists(p):
+        return None
+    with open(p, encoding='utf-8') as f:
+        return json.load(f)
+
+
+def hoc_start(ds: str, campaign: str, ghi_chu: str) -> dict:
+    """EA-7 (S05 §3.1 R-2): open a hoc segment; the script stamps its start (PC clock)."""
+    if campaign not in TUNED:
+        raise LogError(f'--campaign one of {TUNED} (hoc of a campaign, S05 §3.1)')
+    if not ghi_chu:
+        raise LogError('a hoc row names what was read (S05 §3.1)')
+    if _load_hoc(ds):
+        raise LogError('a hoc segment is open: "hoc-end" first (one segment at a time)')
+    if _load_open(ds):
+        raise LogError('a run is open: hoc touches no run (S05 §3.1)')
+    seg = {'campaign': campaign, 'ghi_chu': ghi_chu, 'start': _iso(now())}
+    with open(_hoc_path(ds) + '.tmp', 'w', encoding='utf-8') as f:
+        json.dump(seg, f, ensure_ascii=False)
+    os.replace(_hoc_path(ds) + '.tmp', _hoc_path(ds))
+    return seg
+
+
+def hoc_end(ds: str, ghi_chu: str = '') -> dict:
+    """Close the hoc segment: one m7_dev_effort_log.csv row, both stamps from the script."""
+    seg = _load_hoc(ds)
+    if not seg:
+        raise LogError('no open hoc segment: "hoc-start" first')
+    t0, t1 = _parse_t(seg['start']), now()
+    row = {'ngay': t0.date().isoformat(), 'bat_dau': t0.strftime('%H:%M:%S'), 'ket_thuc': t1.strftime('%H:%M:%S'),
+           'gio': f'{(t1 - t0).total_seconds() / 3600:.4f}', 'chien_dich': seg['campaign'], 'nhan': 'hoc',
+           'ghi_chu': (seg['ghi_chu'] + (' ' + ghi_chu if ghi_chu else '')).strip()}
+    append_row(os.path.join(ds, EFFORT), EFFORT_COLS, row)
+    os.remove(_hoc_path(ds))
+    return row
+
+
 def hwfail(ds: str, date: str, session: str, campaign: str, platform: str, what: str, cause: str,
            fix_h: float, iter_no: str = '', notes: str = '', **extra) -> dict:
+    if _load_open(ds):
+        raise LogError('a run is open: close it first ("end" with its outcome and --fail-cause); the repair '
+                       'time is in no run (S05 v3.7 §3.3, EA-1)')
     if campaign not in CAMPAIGNS or cause not in CAUSES:
         raise LogError(f'--campaign one of {CAMPAIGNS}, --cause one of {CAUSES}')
     row = {'ngay': date, 'session_id': session, 'chien_dich': campaign, 'nen_tang': platform, 'thu_hong': what,
@@ -392,16 +519,25 @@ def sha256_file(path: str) -> str:
 
 
 def freeze(ds: str, campaign: str, stop_reason: str, gain_set: str, gain_file: str, at: str = '',
-           notes: str = '') -> dict:
+           notes: str = '', stop_cause: str = '') -> dict:
     """S05_freeze.csv (S05 v3.6 §4.7): one row per campaign when its gains freeze. The gain file is
     the bit-exact copy of the frozen set; its sha256 is computed here, never typed. gate_result is
-    not written by hand: summary() computes it from the final runs."""
-    if campaign not in CAMPAIGNS:
-        raise LogError(f'--campaign one of {CAMPAIGNS}')
+    not written by hand: summary() computes it from the final runs. S05 v3.7: stop_cause (the root
+    cause) only with khong_co_bo_danh_gia_du, and then required (§4.1, EA-2); gain_set_id carries
+    the campaign as prefix, '<campaign>/<id>' (§6.3, EA-5)."""
+    if campaign not in TUNED:
+        raise LogError(f'--campaign one of {TUNED}')
     if stop_reason not in STOP_REASONS:
         raise LogError(f'--stop-reason one of {STOP_REASONS}')
+    if stop_reason == 'khong_co_bo_danh_gia_du':
+        if stop_cause not in STOP_CAUSES:
+            raise LogError(f'khong_co_bo_danh_gia_du needs --stop-cause, one of {STOP_CAUSES} (S05 v3.7 §4.1)')
+    elif stop_cause:
+        raise LogError('--stop-cause only with khong_co_bo_danh_gia_du (S05 v3.7 §4.1)')
     if not gain_set:
         raise LogError('--gain-set is needed')
+    if gain_owner(gain_set) != campaign:
+        raise LogError(f'--gain-set {gain_set!r}: prefix must be {campaign}/ (S05 v3.7 §6.3)')
     if not os.path.isfile(gain_file):
         raise LogError(f'--gain-file {gain_file!r}: no such file (the frozen set, saved bit-exact)')
     base = os.path.basename(gain_file)
@@ -412,7 +548,7 @@ def freeze(ds: str, campaign: str, stop_reason: str, gain_set: str, gain_file: s
     if any(r['campaign'] == campaign for r in read_rows(os.path.join(ds, FREEZE))):
         raise LogError(f'{campaign} already frozen')
     row = {'campaign': campaign, 'frozen_at': at or _iso(now()), 'stop_reason': stop_reason,
-           'gain_set_id': gain_set, 'gain_file': gain_file.replace('\\', '/'),       # same text on any OS
+           'stop_cause': stop_cause, 'gain_set_id': gain_set, 'gain_file': gain_file.replace('\\', '/'),       # same text on any OS
            'gain_sha256': sha256_file(gain_file), 'notes': notes}
     append_row(os.path.join(ds, FREEZE), FREEZE_COLS, row)
     return row
@@ -422,10 +558,24 @@ def freeze(ds: str, campaign: str, stop_reason: str, gain_set: str, gain_file: s
 SUMMARY_ROWS = ('A-PID', 'A-LADRC', 'B-PID', 'B-LADRC', 'B-chung', 'RQ2-INIT-PID', 'RQ2-INIT-LADRC', 'RQ2',
                 'C_chung', 'T_H')
 SUMMARY_HEAD = ['campaign', 'T_operator_h', 'T_operator_no_hoc_h', 'T_machine_h', 'T_wall_h', 'N_SIM', 'N_HIL',
-                'N_HW', 'N_hong', 'T_sua_h', 'stop_reason', 'stop_reason_check', 'cap_hit', 'T_tune_no_hoc_h',
-                'N_HW_tune', 'gate_result', 'T_wall_end_src', 'B_chung_share']
+                'N_HW', 'N_hong', 'T_sua_h', 'stop_reason', 'stop_cause', 'stop_reason_check', 'cap_hit',
+                'T_tune_no_hoc_h', 'N_HW_tune', 'gate_result', 'gate_sha256', 'T_wall_end_src', 'B_chung_share',
+                'B_chung_after_freeze_h', 'hoc_nhap_tay_n', 'explore_T_operator_h', 'explore_N_SIM',
+                'explore_N_HIL', 'explore_N_HW']
 VALID = ('dat', 'khong_dat', 'chua_ket_luan')
 _COUNT = {'dat': 'pass', 'khong_dat': 'fail', 'chua_ket_luan': 'inconclusive', 'hong_he_do': 'invalid'}
+_SAME_CONDITION = ('campaign', 'platform', 'stage', 'trajectory', 'speed_mps', 'gain_set_id')
+
+
+def read_gate(path: str):
+    """EA-9: the gate is read from its locked file (one figure-8 level per row, header `level`),
+    never typed again; returns (levels, sha256 of the file)."""
+    if not os.path.isfile(path):
+        raise LogError(f'gate file {path!r}: no such file')
+    levels = [r.get('level', '').strip() for r in read_rows(path)]
+    if not levels or any(lv not in FIG8 for lv in levels) or len(set(levels)) != len(levels):
+        raise LogError(f'gate file {path!r}: column "level", figure-8 names {sorted(FIG8)}, each once')
+    return levels, sha256_file(path)
 
 
 def gate_result(runs_by_task: Dict[str, List[str]], gate: Iterable[str]) -> str:
@@ -449,32 +599,106 @@ def _b_target(controller: str) -> Optional[str]:
     return {'PID': 'B-PID', 'LADRC': 'B-LADRC'}.get(c)
 
 
-def summary(ds: str, gate: Optional[Iterable[str]] = None) -> List[dict]:
-    """S05_summary.csv rows (S05 v3.6). Accounts (§3.2):
+def _effort_span(r: dict):
+    """(start, end) of an effort row; end past midnight is the next day."""
+    if not (r.get('ngay') and r.get('bat_dau')):
+        return None, None
+    t0 = dt.datetime.fromisoformat(f"{r['ngay']}T{r['bat_dau']}")
+    if not r.get('ket_thuc'):
+        return t0, None
+    t1 = dt.datetime.fromisoformat(f"{r['ngay']}T{r['ket_thuc']}")
+    if t1 <= t0:
+        t1 += dt.timedelta(days=1)
+    return t0, t1
+
+
+def _check_replacements(tun: List[dict]) -> None:
+    """S05 §4.3, §4.6, §4.7 (EA-8): a replacement points to a lost run (hong_he_do) of the same
+    campaign, platform, stage, task, speed and gain set, earlier than itself; a run is replaced once."""
+    by_uid = {r['run_uid']: r for r in tun if r.get('run_uid')}
+    seen = {}
+    for r in tun:
+        ref = r.get('replaces_run_uid')
+        if not ref:
+            continue
+        old = by_uid.get(ref)
+        if not old or old.get('run_outcome') != 'hong_he_do':
+            raise LogError(f"{r.get('run_uid')}: replaces_run_uid {ref} is not a hong_he_do run (§4.7)")
+        diff = [k for k in _SAME_CONDITION if old.get(k, '') != r.get(k, '')]
+        if diff:
+            raise LogError(f"{r.get('run_uid')}: replaces {ref} with another {', '.join(diff)} (a replacement "
+                           f"runs the same condition, §4.3, §4.6)")
+        if ref == r.get('run_uid') or (old.get('wall_start', '') > r.get('wall_start', '')):
+            raise LogError(f"{r.get('run_uid')}: replaces {ref}, which is not an earlier run")
+        if ref in seen:
+            raise LogError(f"{ref} is replaced twice ({seen[ref]}, {r.get('run_uid')})")
+        seen[ref] = r.get('run_uid')
+
+
+def _final_stops(tun: List[dict]) -> set:
+    """S05 §4.6 (EA-8): after FINAL_LOST_N lost runs in a row in one condition of one gain set
+    (per platform), the condition stops; a later run of it is an error. Returns the stopped
+    conditions as (stage, campaign, gain_set_id, platform, task, speed)."""
+    groups = defaultdict(list)
+    for r in tun:
+        if r.get('stage') in ('final', 'final_hil'):
+            groups[(r['stage'], r.get('campaign', ''), r.get('gain_set_id', ''), r.get('platform', ''),
+                    r.get('trajectory', ''), r.get('speed_mps', ''))].append(r)
+    stopped = set()
+    for key, runs in groups.items():
+        runs.sort(key=lambda r: r.get('wall_start', ''))
+        lost = 0
+        for i, r in enumerate(runs):
+            if key in stopped:
+                raise LogError(f"{r.get('run_uid')}: {key[4]}@{key[5]} of {key[2] or key[1]} stopped after "
+                               f"{FINAL_LOST_N} lost runs in a row (§4.6), no run after that")
+            lost = lost + 1 if r.get('run_outcome') == 'hong_he_do' else 0
+            if lost >= FINAL_LOST_N:
+                stopped.add(key)
+    return stopped
+
+
+def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = '') -> List[dict]:
+    """S05_summary.csv rows (S05 v3.7). Accounts (§3.2):
       * a tuning row counts for its `campaign`; an effort row for `chien_dich`, or `khoan` when it is empty;
+        a hardware-failure row for `chien_dich` (B-chung split like the effort rows);
       * B-chung (§3.2 [v3.6]): a row whose controller is PID / LADRC (rows of one script run split by
         controller, S5-23 v2) goes whole to that B; a row without controller is split in two. The
-        B-chung line reports the unsplit total;
-      * T_operator = active time of the tuning rows + hours of the effort rows; no_hoc without nhan=hoc;
+        B-chung line reports the unsplit total, N_SIM included (EA-4); B_chung_after_freeze_h = the
+        share that came after that B froze (§3.2 [S5-16 v2]);
+      * T_operator = active time of the tuning rows + hours of the effort rows + repair hours T_sua
+        (S05 v3.7 §3.3, EA-1); no_hoc without nhan=hoc; T_sua_h reports the repair part;
+      * N_SIM of a SIM row = its n_sim_evals, 1 when the field is empty (one live fwsim run), 0 when 0;
+      * explore (S05 v3.7 §4.8, EA-17): out of T, N, caps and T_wall; reported in explore_* only;
       * T_wall = first time stamp of the campaign to its frozen_at (S05_freeze.csv), else to its last one;
       * caps (§4.1 [v3.6]): N_HW_tune = car runs of stage screen/confirm (lost-to-measurement runs of
-        the tune included); T_tune_no_hoc = active hours before the campaign's frozen_at, without hoc
-        and stage final/final_hil; B-chung shares likewise before the freeze of that B;
-      * stop_reason_check: cham_tran_xe / cham_tran_gio checked against the counts above
-        ('ok' / 'mismatch'), the other codes 'khong_kiem_duoc';
+        the tune included); T_tune_no_hoc = active hours (repairs included) before the campaign's
+        frozen_at, without hoc and stage final/final_hil; B-chung shares likewise before the freeze of
+        that B. A row (tuning or effort) that starts before a freeze it counts for and ends after it
+        is an error: split it at frozen_at (EA-3). [CÁCH HIỂU] a repair row has a date, no clock
+        time: it counts before a freeze unless its date is after the freeze date;
+      * stop_reason_check: cham_tran_xe / cham_tran_gio (or khong_co_bo_danh_gia_du with that
+        stop_cause) checked against the counts above ('ok' / 'mismatch'), the other codes 'khong_kiem_duoc';
       * final (§4.7 [v3.6]): final_<task>@<speed>_* by run_outcome (hong_he_do out of n_valid);
-        final_hil rows are account RQ2 (§4.6: not in T, caps or N_HIL of a campaign) and their
-        final_hil_<task>@<speed>_* columns go on the row of the campaign whose frozen gain_set_id
-        they carry (else on the RQ2 row, keyed by gain set). Error (LogError) when replaces_run_uid
-        names a run that is not hong_he_do, when a condition has more than FINAL_N valid runs, or
-        when a final_hil row is not account RQ2;
-      * gate_result: gate_result() over the final runs of the gate levels (`gate` = figure-8 tasks in
-        the gate, locked at C8); empty without `gate` or without any final run."""
+        final_hil rows are account RQ2 (§4.6) and their final_hil_<task>@<speed>_* columns go on the row
+        of the campaign whose frozen gain_set_id they carry, or of RQ2-INIT-* by the prefix of the id;
+        any other id is an error (EA-5). <cond>_stopped_n3 = 1 when the condition stopped after 3 lost
+        runs in a row (§4.6). Errors (LogError): a bad replacement (EA-8), more than FINAL_N valid
+        runs, a run after the stop, a final_hil row not account RQ2, a final car run with another gain
+        set than the frozen one, a figure-8 task whose name and speed disagree (EA-9);
+      * gate_result: gate_result() over the final runs of the gate levels (`gate`, read from the
+        locked gate file by read_gate); empty without `gate` or without any final run."""
     tun = [r for r in read_rows(os.path.join(ds, TUNING)) if not r.get('session_id', '').startswith(SKIP_PREFIX)]
     eff = read_rows(os.path.join(ds, EFFORT))
     hw = read_rows(os.path.join(ds, HWFAIL))
     frz = {r['campaign']: r for r in read_rows(os.path.join(ds, FREEZE))}
-    by_gain = {r['gain_set_id']: r['campaign'] for r in frz.values() if r.get('gain_set_id')}
+    by_gain = {}
+    for r in frz.values():
+        gs = r.get('gain_set_id', '')
+        if gs:
+            if gain_owner(gs) != r['campaign'] or gs in by_gain:
+                raise LogError(f"S05_freeze.csv: gain_set_id {gs!r} of {r['campaign']} (prefix = campaign, unique)")
+            by_gain[gs] = r['campaign']
 
     acc = defaultdict(lambda: defaultdict(float))
     times = defaultdict(list)
@@ -482,21 +706,36 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None) -> List[dict]:
     final_tasks = defaultdict(lambda: defaultdict(list))      # campaign -> task -> outcomes (stage final)
     unassigned = 0
 
-    by_uid = {r['run_uid']: r for r in tun if r.get('run_uid')}
     for r in tun:
-        ref = r.get('replaces_run_uid')
-        if ref and (ref not in by_uid or by_uid[ref].get('run_outcome') != 'hong_he_do'):
-            raise LogError(f"{r.get('run_uid')}: replaces_run_uid {ref} is not a hong_he_do run (§4.7)")
         if r.get('stage') == 'final_hil' and r.get('campaign') != 'RQ2':
             raise LogError(f"{r.get('run_uid')}: a final_hil run is account RQ2 (§4.6)")
+        if r.get('platform') in ('HIL', 'HW'):
+            try:
+                check_task(r.get('trajectory', ''), r.get('speed_mps', ''))
+            except LogError as exc:
+                raise LogError(f"{r.get('run_uid')}: {exc}")
+    _check_replacements(tun)
+    stopped = _final_stops(tun)
 
     def add(target, key, val, share=1.0):
         acc[target][key] += val * share
 
     def frozen_before(target, t: Optional[dt.datetime]) -> bool:
-        """True when `target` froze before t (time after the freeze: not counted in its caps)."""
+        """True when `target` froze at or before t (work from frozen_at on: not in its caps)."""
         f = frz.get(target)
-        return bool(f and t and t > _parse_t(f['frozen_at']))
+        return bool(f and t and t >= _parse_t(f['frozen_at']))
+
+    def spans_freeze(target, t0, t1, what) -> None:
+        f = frz.get(target)
+        if f and t0 and t1 and t0 < _parse_t(f['frozen_at']) < t1:
+            raise LogError(f"{what}: runs from {_iso(t0)} to {_iso(t1)}, across the freeze of {target} at "
+                           f"{f['frozen_at']}; split it at frozen_at (S05 §4.1 caps, EA-3)")
+
+    def b_split(c, controller=''):
+        if c != 'B-chung':
+            return [(c, 1.0)]
+        tgt = _b_target(controller)
+        return [(tgt, 1.0)] if tgt else [('B-PID', 0.5), ('B-LADRC', 0.5)]
 
     for r in tun:
         c = r.get('campaign', '')
@@ -507,23 +746,35 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None) -> List[dict]:
         t1 = _parse_t(r['wall_end']) if r.get('wall_end') else None
         stage = r.get('stage', '')
         act, mach = _active_s(r), _f(r.get('t_machine_s'))
+        plat = r.get('platform')
+        n_sim = (_f(r.get('n_sim_evals')) if r.get('n_sim_evals', '') != '' else 1.0) if plat == 'SIM' else 0.0
+        targets = b_split(c, r.get('controller'))
+        if stage == 'explore':                          # S05 v3.7 §4.8: reported apart only
+            for tgt, share in targets:
+                add(tgt, 'X_T_s', act, share)
+                add(tgt, 'X_N_SIM', n_sim, share if c != 'B-chung' else 1.0)
+                add(tgt, {'HIL': 'X_N_HIL', 'HW': 'X_N_HW'}.get(plat, 'X_none'), 1.0 if plat != 'SIM' else 0.0)
+            continue
         if c == 'B-chung':
-            tgt = _b_target(r.get('controller'))
-            targets = [(tgt, 1.0)] if tgt else [('B-PID', 0.5), ('B-LADRC', 0.5)]
             add('B-chung', 'T_op_s', act)
             add('B-chung', 'T_noh_s', act)
             add('B-chung', 'T_mach_s', mach)
-        else:
-            targets = [(c, 1.0)]
+            add('B-chung', 'N_SIM', n_sim)
+            for t in (t0, t1):
+                if t:
+                    times['B-chung'].append(t)
         for tgt, share in targets:
             add(tgt, 'T_op_s', act, share)
             add(tgt, 'T_noh_s', act, share)
             add(tgt, 'T_mach_s', mach, share)
-            if stage not in ('final', 'final_hil') and not frozen_before(tgt, t0):
-                add(tgt, 'T_tune_s', act, share)
-            plat = r.get('platform')
+            if stage not in ('final', 'final_hil'):
+                spans_freeze(tgt, t0, t1, r.get('run_uid', 'a tuning row'))
+                if not frozen_before(tgt, t0):
+                    add(tgt, 'T_tune_s', act, share)
+                elif c == 'B-chung':
+                    add(tgt, 'Bc_after_s', act, share)
             if plat == 'SIM':
-                add(tgt, 'N_SIM', _f(r.get('n_sim_evals')) or 1.0, share if c != 'B-chung' else 1.0)
+                add(tgt, 'N_SIM', n_sim, share if c != 'B-chung' else 1.0)
             elif plat == 'HIL':
                 add(tgt, 'N_HIL', 1.0)
             elif plat == 'HW':
@@ -533,26 +784,34 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None) -> List[dict]:
             for t in (t0, t1):
                 if t:
                     times[tgt].append(t)
-        if c == 'B-chung':
-            for t in (t0, t1):
-                if t:
-                    times['B-chung'].append(t)
         if stage in ('final', 'final_hil'):
-            task, o = r.get('trajectory', ''), r.get('run_outcome', '')
+            task, o, sp = r.get('trajectory', ''), r.get('run_outcome', ''), r.get('speed_mps', '')
+            gs = r.get('gain_set_id', '')
             if stage == 'final':
-                home, cond = c, f"final_{task}@{r.get('speed_mps', '')}"
+                home, cond = c, f"final_{task}@{sp}"
+                frozen_gs = (frz.get(c) or {}).get('gain_set_id', '')
+                if gs and frozen_gs and gs != frozen_gs:
+                    raise LogError(f"{r.get('run_uid')}: final run of {c} with gain set {gs}, frozen is {frozen_gs}")
                 final_tasks[c][task].append(o)
             else:
-                gs = r.get('gain_set_id', '')
-                home = by_gain.get(gs, 'RQ2')
-                cond = (f"final_hil_{task}@{r.get('speed_mps', '')}" if home != 'RQ2'
-                        else f"final_hil_{gs}_{task}@{r.get('speed_mps', '')}")
+                owner = gain_owner(gs) if gs else ''
+                if gs in by_gain:
+                    home = by_gain[gs]
+                elif owner in ('RQ2-INIT-PID', 'RQ2-INIT-LADRC'):
+                    home = owner
+                else:
+                    raise LogError(f"{r.get('run_uid')}: final_hil gain set {gs!r} is no frozen set and no "
+                                   f"RQ2-INIT-* set (S05 v3.7 §6.3, EA-5)")
+                cond = f"final_hil_{task}@{sp}"
             f = finals[home]
             if o in VALID:
                 f[f'{cond}_n_valid'] += 1
                 if f[f'{cond}_n_valid'] > FINAL_N:
                     raise LogError(f'{home} {cond}: more than {FINAL_N} valid runs (§4.7)')
             f[f'{cond}_' + _COUNT.get(o, 'invalid')] += 1
+            key = (stage, c, gs, r.get('platform', ''), task, sp)
+            if key in stopped:
+                f[f'{cond}_stopped_n3'] = 1
 
     for r in eff:
         c, k = r.get('chien_dich', ''), r.get('khoan', '')
@@ -560,30 +819,49 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None) -> List[dict]:
             continue                       # rows before S05 §6.2 (no account): not in any line
         h = _f(r.get('gio')) * 3600
         hoc = r.get('nhan') == 'hoc'
-        t = None
-        if r.get('ngay') and r.get('bat_dau'):
-            t = dt.datetime.fromisoformat(f"{r['ngay']}T{r['bat_dau']}")
+        t, t_end = _effort_span(r)
         if c == 'B-chung':
-            targets = [('B-PID', 0.5), ('B-LADRC', 0.5)]
             add('B-chung', 'T_op_s', h)
             if not hoc:
                 add('B-chung', 'T_noh_s', h)
-        else:
-            targets = [(c or k, 1.0)]
+        targets = b_split(c) if c else [(k, 1.0)]
         for tgt, share in targets:
             add(tgt, 'T_op_s', h, share)
-            if not hoc:
+            if hoc:
+                if r.get('ghi_chu', '').startswith(MANUAL):
+                    add(tgt, 'hoc_manual', 1.0)
+            else:
                 add(tgt, 'T_noh_s', h, share)
+                spans_freeze(tgt, t, t_end, f"effort row {r.get('ngay')} {r.get('bat_dau')}")
                 if not frozen_before(tgt, t):
                     add(tgt, 'T_tune_s', h, share)
+                elif c == 'B-chung':
+                    add(tgt, 'Bc_after_s', h, share)
             if t:
                 times[tgt].append(t)
 
     for r in hw:
         c = r.get('chien_dich', '')
-        if c:
-            add(c, 'N_hong', 1.0)
-            add(c, 'T_sua_s', _f(r.get('gio_sua')) * 3600)
+        if not c:
+            continue
+        h = _f(r.get('gio_sua')) * 3600
+        day = dt.datetime.fromisoformat(r['ngay']) if r.get('ngay') else None
+        add(c, 'N_hong', 1.0)
+        add(c, 'T_sua_s', h)
+        if c == 'B-chung':
+            add('B-chung', 'T_op_s', h)
+            add('B-chung', 'T_noh_s', h)
+        for tgt, share in b_split(c):
+            if c == 'B-chung':
+                add(tgt, 'T_sua_s', h, share)
+            add(tgt, 'T_op_s', h, share)
+            add(tgt, 'T_noh_s', h, share)
+            f = frz.get(tgt)
+            after = bool(f and day and day.date() > _parse_t(f['frozen_at']).date())   # [CÁCH HIỂU] date only
+            if not after:
+                add(tgt, 'T_tune_s', h, share)
+            elif c == 'B-chung':
+                add(tgt, 'Bc_after_s', h, share)
 
     out = []
     for c in SUMMARY_ROWS:
@@ -597,21 +875,23 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None) -> List[dict]:
             t_end, src = ts[-1], 'last_row'
         wall = (t_end - ts[0]).total_seconds() / 3600 if ts and t_end else 0.0
         cap = []
-        if c in ('A-PID', 'A-LADRC', 'B-PID', 'B-LADRC'):
+        if c in TUNED:
             if a.get('N_HW_tune', 0) >= CAP_HW:
                 cap.append('xe')
             if a.get('T_tune_s', 0) / 3600 >= CAP_H:
                 cap.append('gio')
         reason = (f or {}).get('stop_reason', '')
+        cause = (f or {}).get('stop_cause', '')
+        basis = cause if reason == 'khong_co_bo_danh_gia_du' else reason
         check = ''
-        if reason == 'cham_tran_xe':
+        if basis == 'cham_tran_xe':
             check = 'ok' if 'xe' in cap else 'mismatch'
-        elif reason == 'cham_tran_gio':
+        elif basis == 'cham_tran_gio':
             check = 'ok' if 'gio' in cap else 'mismatch'
         elif reason:
             check = 'khong_kiem_duoc'
         if check == 'mismatch':
-            print(f'warning: {c} stop_reason {reason} does not match the logs (cap_hit {"+".join(cap) or "none"})',
+            print(f'warning: {c} stop_reason {reason} {cause} does not match the logs (cap_hit {"+".join(cap) or "none"})',
                   file=sys.stderr)
         gres = gate_result(final_tasks[c], gate) if gate is not None and final_tasks.get(c) else ''
         row = {'campaign': c, 'T_operator_h': _fmt(a.get('T_op_s', 0) / 3600, 3),
@@ -619,11 +899,17 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None) -> List[dict]:
                'T_machine_h': _fmt(a.get('T_mach_s', 0) / 3600, 3), 'T_wall_h': _fmt(wall, 3),
                'N_SIM': str(int(round(a.get('N_SIM', 0)))), 'N_HIL': str(int(a.get('N_HIL', 0))),
                'N_HW': str(int(a.get('N_HW', 0))), 'N_hong': str(int(a.get('N_hong', 0))),
-               'T_sua_h': _fmt(a.get('T_sua_s', 0) / 3600, 3), 'stop_reason': reason,
+               'T_sua_h': _fmt(a.get('T_sua_s', 0) / 3600, 3), 'stop_reason': reason, 'stop_cause': cause,
                'stop_reason_check': check, 'cap_hit': '+'.join(cap),
                'T_tune_no_hoc_h': _fmt(a.get('T_tune_s', 0) / 3600, 3),
                'N_HW_tune': str(int(a.get('N_HW_tune', 0))), 'gate_result': gres,
-               'T_wall_end_src': src, 'B_chung_share': 'unsplit total' if c == 'B-chung' else ''}
+               'gate_sha256': gate_sha256 if gres else '', 'T_wall_end_src': src,
+               'B_chung_share': 'unsplit total' if c == 'B-chung' else '',
+               'B_chung_after_freeze_h': _fmt(a.get('Bc_after_s', 0) / 3600, 3) if c in ('B-PID', 'B-LADRC') else '',
+               'hoc_nhap_tay_n': str(int(a.get('hoc_manual', 0))),
+               'explore_T_operator_h': _fmt(a.get('X_T_s', 0) / 3600, 3),
+               'explore_N_SIM': str(int(round(a.get('X_N_SIM', 0)))), 'explore_N_HIL': str(int(a.get('X_N_HIL', 0))),
+               'explore_N_HW': str(int(a.get('X_N_HW', 0)))}
         row.update({k: str(v) for k, v in sorted(finals.get(c, {}).items())})
         out.append(row)
     if unassigned:
@@ -631,8 +917,8 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None) -> List[dict]:
     return out
 
 
-def write_summary(ds: str, out_path: str, gate: Optional[Iterable[str]] = None) -> List[dict]:
-    rows = summary(ds, gate)
+def write_summary(ds: str, out_path: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = '') -> List[dict]:
+    rows = summary(ds, gate, gate_sha256)
     extra = sorted({k for r in rows for k in r} - set(SUMMARY_HEAD))
     _write_all(out_path, SUMMARY_HEAD + extra, rows)
     return rows
@@ -654,9 +940,12 @@ def demo(out_dir: str, seed: int = 1) -> List[dict]:
         def tick(s):
             clock[0] += dt.timedelta(seconds=s)
 
-        effort(out_dir, '2026-11-20', '07:30', '08:00', campaign='A-PID', nhan='hoc', ghi_chu='FAKE: doc huong dan tune')
+        clock[0] -= dt.timedelta(minutes=30)
+        hoc_start(out_dir, 'A-PID', 'FAKE: doc huong dan tune')     # stamps by the script (EA-7)
+        tick(1800)
+        hoc_end(out_dir)
         for i, sp in enumerate(('0.2', '0.5', '0.8')):
-            begin(out_dir, 'FAKE-A1', 'A-PID', 'HW', 'PID', 'O1-F05', sp, 'screen', gain_set='G00',
+            begin(out_dir, 'FAKE-A1', 'A-PID', 'HW', 'PID', 'O1-F0' + sp[-1], sp, 'screen', gain_set='A-PID/G00',
                   gains='kp_xy=1.0,ki_xy=0.5,kp_wz=1.0,ki_wz=0.2,pos_kp=6,pos_ki=3,k_psi=1')
             for k, s in (('flash', 120), ('setup', 300), ('run', 60), ('log', 30), ('analysis', 240)):
                 step(out_dir, k, wait=(k == 'run'))
@@ -671,7 +960,7 @@ def demo(out_dir: str, seed: int = 1) -> List[dict]:
         with open(gfile, 'w', encoding='utf-8', newline='\n') as f:
             f.write('{"FAKE": true, "kp_xy": 1.0, "ki_xy": 0.5, "kp_wz": 1.0, "ki_wz": 0.2, '
                     '"pos_kp": 6, "pos_ki": 3, "k_psi": 1}\n')
-        freeze(out_dir, 'A-PID', 'khong_du_luot_xac_nhan', 'G00', gfile, at=_iso(clock[0]),
+        freeze(out_dir, 'A-PID', 'khong_du_luot_xac_nhan', 'A-PID/G00', gfile, at=_iso(clock[0]),
                notes='FAKE')
         machine(out_dir, 'B-chung', 'PID', 'FAKE-S03', 'results/S03/FAKE', 2739, 5400, _iso(clock[0]),
                 _iso(clock[0] + dt.timedelta(seconds=5400)), t_setup_s=600)
@@ -680,26 +969,30 @@ def demo(out_dir: str, seed: int = 1) -> List[dict]:
         effort(out_dir, '2026-11-20', '13:00', '14:00', campaign='B-chung', ghi_chu='FAKE: doc S03 chung')
         effort(out_dir, '2026-11-20', '14:00', '14:30', khoan='C_chung', ghi_chu='FAKE: script video')
         tick(7200)
-        begin(out_dir, 'FAKE-B1', 'B-PID', 'HIL', 'PID', 'O1-F05', '0.5', 'hil_check', gain_set='GA1')
+        begin(out_dir, 'FAKE-B1', 'B-PID', 'HIL', 'PID', 'O1-F05', '0.5', 'hil_check', gain_set='B-PID/GA1')
         step(out_dir, 'run')
         tick(90)
         end(out_dir, 'dat', completed=1, e_perp_max=0.04)
         hwfail(out_dir, '2026-11-20', 'FAKE-B1', 'B-PID', 'HW', 'FAKE: tuot banh', 'phan_cung_ngau_nhien', 0.5)
         for k in range(2):                              # final on HIL: account RQ2, joined by gain set
-            begin(out_dir, 'FAKE-FH', 'RQ2', 'HIL', 'PID', 'O1-F05', '0.5', 'final_hil', gain_set='G00')
+            begin(out_dir, 'FAKE-FH', 'RQ2', 'HIL', 'PID', 'O1-F05', '0.5', 'final_hil', gain_set='A-PID/G00')
             step(out_dir, 'run')
             tick(75)
             end(out_dir, 'dat', completed=1, e_perp_max=0.05)
         lost = None
         for o in ('hong_he_do', 'dat', 'chua_ket_luan'):  # final on the car; the lost run is replaced
-            begin(out_dir, 'FAKE-F1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'final', gain_set='G00',
+            begin(out_dir, 'FAKE-F1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'final', gain_set='A-PID/G00',
                   replaces_run_uid=lost if o == 'dat' else '')
             step(out_dir, 'run')
             tick(60)
             row = end(out_dir, o, completed=1, e_perp_max=0.10, fail_cause='mat_khung_FAKE' if o == 'hong_he_do' else '')
             if o == 'hong_he_do':
                 lost = row['run_uid']
-        return write_summary(out_dir, os.path.join(out_dir, SUMMARY), gate=['O1-F05'])
+        gate_path = os.path.join(out_dir, 'FAKE_gate.csv')            # stands for the gate locked at C8
+        with open(gate_path, 'w', encoding='utf-8', newline='\n') as f:
+            f.write('level\nO1-F05\n')
+        gate, sha = read_gate(gate_path)
+        return write_summary(out_dir, os.path.join(out_dir, SUMMARY), gate=gate, gate_sha256=sha)
     finally:
         now = real_now
 
@@ -735,10 +1028,15 @@ def main(argv=None) -> int:
     m.add_argument('--n-sim-evals', type=int, required=True)
     m.add_argument('--t-machine-s', type=float, required=True)
     m.add_argument('--platform', default='SIM', choices=PLATFORMS)
-    m.add_argument('--stage', default='explore', choices=STAGES)
+    m.add_argument('--stage', default='script', choices=STAGES)
     m.add_argument('--notes', default='')
     for k in STEPS:
         m.add_argument(f'--t-{k}-s', type=float)
+    hs = sub.add_parser('hoc-start')
+    hs.add_argument('--campaign', required=True, choices=TUNED)
+    hs.add_argument('--ghi-chu', required=True)
+    he = sub.add_parser('hoc-end')
+    he.add_argument('--ghi-chu', default='')
     f = sub.add_parser('effort')
     for name in ('date', 'start', 'end'):
         f.add_argument('--' + name, required=True)
@@ -751,15 +1049,16 @@ def main(argv=None) -> int:
     for name in ('iter-no', 'notes', 'dut', 'buoc', 'lap-lai'):
         h.add_argument('--' + name, default='')
     z = sub.add_parser('freeze')
-    z.add_argument('--campaign', required=True, choices=CAMPAIGNS)
+    z.add_argument('--campaign', required=True, choices=TUNED)
     z.add_argument('--stop-reason', required=True, choices=STOP_REASONS)
     for name in ('gain-set', 'gain-file'):
         z.add_argument('--' + name, required=True)
     for name in ('at', 'notes'):
         z.add_argument('--' + name, default='')
+    z.add_argument('--stop-cause', default='', choices=('',) + STOP_CAUSES)
     o = sub.add_parser('summary')
     o.add_argument('--out', default='')
-    o.add_argument('--gate', default=None, help='figure-8 tasks in the gate, e.g. O1-F05,O1-F08 (locked at C8)')
+    o.add_argument('--gate-file', default=None, help='the locked gate (column "level": O1-F05, ...; locked at C8)')
     d = sub.add_parser('demo')
     d.add_argument('--out', required=True)
     a = ap.parse_args(argv)
@@ -780,7 +1079,10 @@ def main(argv=None) -> int:
             (pause if a.cmd == 'pause' else resume)(ds)
             print(a.cmd, _iso(now()))
         elif a.cmd == 'cancel':
-            print('cancelled', cancel(ds)['row']['run_uid'], '(no row written)')
+            run = cancel(ds)
+            eff = run.get('effort_row')
+            print('cancelled', run['row']['run_uid'], '(no run row)',
+                  f"effort row {eff['gio']} h" if eff else 'no time logged')
         elif a.cmd == 'status':
             run = _load_open(ds)
             if not run:
@@ -797,6 +1099,11 @@ def main(argv=None) -> int:
                           a.wall_start, a.wall_end, a.platform, a.stage, notes=a.notes,
                           **{f't_{k}_s': getattr(a, f't_{k}_s') for k in STEPS})
             print('row', row['run_uid'])
+        elif a.cmd == 'hoc-start':
+            print('hoc open', hoc_start(ds, a.campaign, a.ghi_chu)['start'])
+        elif a.cmd == 'hoc-end':
+            row = hoc_end(ds, a.ghi_chu)
+            print('row', row['ngay'], row['bat_dau'], row['ket_thuc'], row['gio'], 'h')
         elif a.cmd == 'effort':
             row = effort(ds, a.date, a.start, a.end, a.campaign, a.khoan, a.nhan, a.ghi_chu, buoc=a.buoc,
                          giai_doan=a.giai_doan, dut=a.dut, lap_lai=a.lap_lai)
@@ -806,11 +1113,11 @@ def main(argv=None) -> int:
                    dut=a.dut, buoc=a.buoc, lap_lai=a.lap_lai)
             print('row written')
         elif a.cmd == 'freeze':
-            row = freeze(ds, a.campaign, a.stop_reason, a.gain_set, a.gain_file, a.at, a.notes)
+            row = freeze(ds, a.campaign, a.stop_reason, a.gain_set, a.gain_file, a.at, a.notes, a.stop_cause)
             print('frozen', a.campaign, row['gain_sha256'])
         elif a.cmd == 'summary':
-            gate = [g.strip() for g in a.gate.split(',') if g.strip()] if a.gate else None
-            rows = write_summary(ds, a.out or os.path.join(ds, SUMMARY), gate)
+            gate, sha = read_gate(a.gate_file) if a.gate_file else (None, '')
+            rows = write_summary(ds, a.out or os.path.join(ds, SUMMARY), gate, sha)
             for r in rows:
                 print(r['campaign'], r['T_operator_h'], 'h', 'N_HW', r['N_HW'], 'gate', r['gate_result'] or '-')
         elif a.cmd == 'demo':
