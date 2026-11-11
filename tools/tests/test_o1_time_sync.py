@@ -105,9 +105,62 @@ def test_errors():
         ts.sync(tc[::-1], vc, tl, vl)                     # times not increasing
     with pytest.raises(ValueError):
         ts.sync(tc, np.zeros_like(vc), tl, vl)            # camera never moving
-    short = tc < tc[0] + 6.0
+    tiny = tc < tc[0] + 2.5
     with pytest.raises(ValueError):
-        ts.sync(tc[short], vc[short], tl, vl)
+        ts.sync(tc[tiny], vc[tiny], tl, vl)                # under MIN_OVERLAP_S
+
+
+def test_short_window_fits_once_without_start_end_check():
+    # F-3 (L86 Q4): a window under 9 s (K1 is 5 s) is fitted once, the start/end check is not possible
+    tc, vc, tl, vl = make(cam_noise=0.0)
+    short = tc < tc[0] + 6.0
+    r = ts.sync(tc[short], vc[short], tl, vl)
+    assert r.short and math.isnan(r.start_end_diff_s)
+    assert r.offset_s == pytest.approx(3.4567, abs=0.005)
+
+
+def test_peak_on_the_edge_is_searched_again():
+    # F-1: a coarse guess 0.6 s off with a search range of +-0.3 s: the first peak sits on the edge
+    tc, vc, tl, vl = make(cam_noise=0.0)
+    r0 = ts.sync(tc, vc, tl, vl)
+    vc2 = vc.copy()
+    first = np.flatnonzero(np.nan_to_num(vc) > ts.MOVE_V)[0]
+    vc2[first:first + 72] = 0.0                          # camera onset 0.6 s late at 120 fps
+    r = ts.sync(tc, vc2, tl, vl, half=0.3)
+    assert r.widened >= 1
+    assert r.offset_s == pytest.approx(r0.offset_s, abs=0.005)
+
+
+def test_low_correlation_is_not_ok():
+    # F-2: a camera profile that is noise only
+    tc, vc, tl, vl = make()
+    rng = np.random.default_rng(3)
+    vn = np.abs(rng.normal(0.3, 0.2, len(vc)))
+    r = ts.sync(tc, vn, tl, vl, half=0.5)
+    assert not r.ok
+
+
+def test_signed_body_channel():
+    # F-6: two channels (vx, vy) concatenated; offset found
+    tc, vc, tl, vl = make(cam_noise=0.0)
+    r = ts.sync(tc, np.column_stack([vc, -0.5 * vc]), tl, np.column_stack([vl, -0.5 * vl]), channel='body')
+    assert r.offset_s == pytest.approx(3.4567, abs=0.004)
+
+
+def test_log_window_checks():
+    rows = [dict(timestamp_us=str(i * 10000), run_active='1' if 100 <= i < 900 else '0',
+                 sp_vx='0.2' if 100 <= i < 800 else '0', sp_vy='0', sp_wz='0', log_seq=str(i)) for i in range(1000)]
+    a, b = ts.log_window(rows)
+    assert a == pytest.approx(1.0 - ts.LOG_MARGIN_S) and b == pytest.approx(7.99 + ts.LOG_MARGIN_S)
+    bad = [dict(r) for r in rows]
+    for r in bad[500:]:
+        r['log_seq'] = str(int(r['log_seq']) + 20)
+    with pytest.raises(ValueError, match='log_seq'):
+        ts.log_window(bad)
+    two = [dict(r) for r in rows]
+    two[400]['run_active'] = '0'
+    with pytest.raises(ValueError, match='rising edges'):
+        ts.log_window(two)
 
 
 def _hil_pairs():

@@ -98,10 +98,35 @@ def command_start_us(rows):
     return float(rows[rises[0]]['timestamp_us']), rises[0]
 
 
-def log_speed(rows):
-    t = np.array([float(r['timestamp_us']) for r in rows]) / 1e6
-    v = np.hypot([float(r['vx']) for r in rows], [float(r['vy']) for r in rows])
-    return t, v
+def clock_match(frames, log_rows, task):
+    """o1_time_sync on the camera frames: path speed for the figure 8, signed body velocities for K1, K2
+    (F-6); window from the log (F-4). Also the gyro channel as an independent second estimate (Y-1,
+    reported only; None when it cannot be fitted)."""
+    t_cam = np.array([r['t_s'] for r in frames])
+    val = np.array([r['valid'] for r in frames])
+    sp = np.where(val, [r['speed'] for r in frames], np.nan)
+    win = o1_time_sync.log_window(log_rows)
+    coarse = dict(coarse_cam=(t_cam, sp), coarse_log=o1_time_sync.log_speed(log_rows))
+    if task in FIG8:
+        tl, vl = o1_time_sync.log_channel(log_rows, 'speed')
+        r = o1_time_sync.sync(t_cam, sp, tl, vl, window_log=win, channel='speed', **coarse)
+    else:
+        psi = np.array([r['psi'] for r in frames])
+        vx, vy = np.array([r['vx'] for r in frames]), np.array([r['vy'] for r in frames])
+        bx = np.cos(psi) * vx + np.sin(psi) * vy                 # floor velocity -> body frame
+        by = -np.sin(psi) * vx + np.cos(psi) * vy
+        vb = np.where(val[:, None], np.column_stack([bx, by]), np.nan)
+        tl, vl = o1_time_sync.log_channel(log_rows, 'body')
+        r = o1_time_sync.sync(t_cam, vb, tl, vl, window_log=win, channel='body', **coarse)
+    g = None
+    if 'gz_fused' in log_rows[0]:
+        try:
+            wz = np.where(val, [f['wz'] for f in frames], np.nan)
+            tg, gz = o1_time_sync.log_channel(log_rows, 'gyro')
+            g = o1_time_sync.sync(t_cam, wz, tg, gz, window_log=win, channel='gyro', **coarse)
+        except ValueError:
+            g = None
+    return r, g
 
 
 # ---------------------------------------------------------------- lanes
@@ -292,11 +317,11 @@ def score(frames, log_rows, task, U, offset_s=None, k_start=None, allow_final_se
     if not valid:
         raise ValueError('no valid camera frame in the clip')
     t_cam = np.array([r['t_s'] for r in frames])
-    sync = None
+    sync, sync_gyro = None, None
     if offset_s is None:
-        tl, vl = log_speed(log_rows)
-        vc = np.array([r['speed'] if r['valid'] else np.nan for r in frames])
-        sync = o1_time_sync.sync(t_cam, vc, tl, vl)
+        sync, sync_gyro = clock_match(frames, log_rows, task)
+        if not sync.ok:
+            raise ValueError(f'clock matching not ok: {sync.why} (o1_time_sync; --offset-s only with a reason)')
         offset_s = sync.offset_s
     t_all = t_cam + offset_s - t0_us / 1e6
     vi = [k for k, r in enumerate(frames) if r['valid']]
@@ -335,7 +360,11 @@ def score(frames, log_rows, task, U, offset_s=None, k_start=None, allow_final_se
                shift_drift_note=('quay lai clip H truoc luot sau (design 3.6)' if drift is not None and drift > DRIFT_PX else ''),
                t0_log_us=t0_us, offset_s=offset_s, offset_src='--offset-s' if sync is None else 'o1_time_sync',
                sync=None if sync is None else dict(corr=sync.corr, offset_start_s=sync.offset_start_s,
-                                                    offset_end_s=sync.offset_end_s, start_end_diff_s=sync.start_end_diff_s),
+                                                    offset_end_s=sync.offset_end_s, start_end_diff_s=sync.start_end_diff_s,
+                                                    short=sync.short, channel=sync.channel, window_src=sync.window_src,
+                                                    widened=sync.widened),
+               sync_gyro=None if sync_gyro is None else dict(offset_s=sync_gyro.offset_s, corr=sync_gyro.corr,
+                                                             ok=sync_gyro.ok, why=sync_gyro.why),
                pos_reset_n_values=resets, pos_reset_mid=len(resets) > 1,
                frames_total=len(frames), frames_valid=len(vi),
                thresholds=dict(delta=DELTA, t_miss=T_MISS, t_gap=T_GAP, bump_px=BUMP_PX, v_d=V_D, t_d=T_D,
