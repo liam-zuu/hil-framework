@@ -165,8 +165,10 @@ def initial_pose(obj_xy, img, f, cx, cy):
     return rvec.ravel(), tvec.ravel()
 
 
-def fit_camera(model, obj_xy, img, w, h, zc=None, f0=None):
-    """Least squares on the reprojection error (Huber), centre fixed, Z_c prior (sigma 20 mm) when given."""
+def fit_camera(model, obj_xy, img, w, h, zc=None, f0=None, sigma_px=0.3):
+    """Least squares on the reprojection error (Huber), centre fixed, Z_c prior (sigma 20 mm) when given.
+    sigma_px: pixel noise the prior is weighed against (one pixel residual of sigma_px = 20 mm of Z_c);
+    c7_measure.calibrate refits with the real residual (design 3.3, two passes)."""
     cx, cy = w / 2, h / 2
     if f0 is None:
         f0 = 0.36 * w                                 # about a 13 mm-equivalent lens on a 16:9 frame [GUESS]
@@ -188,7 +190,6 @@ def fit_camera(model, obj_xy, img, w, h, zc=None, f0=None):
         c = unpack(x)
         r = (c.project(obj) - img).ravel()
         if zc is not None:
-            sigma_px = 0.3
             r = np.concatenate([r, [(abs(c.centre[2]) - zc) / ZC_SIGMA_M * sigma_px]])
         return r
 
