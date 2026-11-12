@@ -1,45 +1,48 @@
 """
-o1_gate.py: the tune stop gate G1-G5 of one O1 run, on the summary of an evaluator
-(fwsim/o1_feasibility.evaluate_v7 for the figure 8, tools/o1_lanes.evaluate_k for K1, K2).
+o1_gate.py: the tune stop gate G1-G5 of one O1 run, from the per-frame values of an evaluator
+(fwsim/o1_gate_eval.py: evaluate_fig8 for the figure 8, evaluate_k for K1, K2).
 
-Source: CLAUDE_THESIS 00_OVERVIEW/2026-11-12_De_xuat_cong_dung_tune_bam_huong_van_toc_v3.md
-(Liam 12/11/2026 evening, THESIS session local_0900b80e, "Duyệt cả (Recommended)"); code asked by
-THESIS, Liam approved in the CODE session local_87282b70 ("làm ngay đi"), 12/11/2026; changes after
-Codex round 1 (GV3-2, 3, 4, 7; Liam "Cho sửa 7 chỗ", same session).
+Source: CLAUDE_THESIS 00_OVERVIEW/2026-11-12_De_xuat_cong_dung_tune_bam_huong_van_toc_v3.md (v3.2;
+Liam 12/11/2026 evening, THESIS session local_0900b80e, "Duyệt cả (Recommended)") and O1 v11.9 sections
+3.4, 3.5 (SC-1, SC3-1). Code: G1, G2, G3, G5 Liam 12/11 CODE local_87282b70 ("làm ngay đi", Codex Sol
+4 rounds); G4, the per-frame bounds and the HIL edge mapping Liam 13/11 CODE local_db99d287 ("Làm rs4 +
+g4 đi") and local_7f7b0ef4 ("Duyệt gộp luôn lo/hi").
 
   G1 completion        O1 3.4, unchanged: evaluator 'completed' true / false / inconclusive
   G2 lane              e_perp_max                         <= D = 0.10 m
   G3 schedule          e_trk_max = max |p(t) - p_cmd(t)|  <= D
-  G4 body envelope     NOT computed here yet: its formula is under Codex round 3 (state 'chua_tinh')
+  G4 body envelope     e_bao_max = max [|e_perp| + a_l |sin th_l| + b_l (|cos th_l| - 1)]  <= D
+                       (th_l = wrap(psi - psi_lane(s_perp) - psi_0); evaluator: o1_gate_eval.py)
   G5 heading           e_theta_cmd_max = max |wrap(psi - psi_cmd)|  <= 7.5 deg
-                       (figure 8: evaluate_v7 'e_theta_cmd_max_deg'; K1, K2: the command heading
-                       is the start heading, evaluate_k 'e_theta_start_max_deg')
+                       (K1, K2: the command heading is the start heading)
 
-Each of G2, G3, G5 has three states (S05 3.4), with U the bound of the measured maximum q (dossier v3
-section 5.1; empirical bounds locked at C8). The true value lies in [q - U, q + U]:
-  dat            q + U <= threshold   (every value of the interval meets "<= threshold": certain pass;
-                                       the upper edge equal to the threshold passes, as "<=" does)
-  khong_dat      q - U >  threshold   (every value fails)
-  chua_ket_luan  otherwise, or q / U not finite, or U < 0
-  U(G2) = U_p;  U(G3) = U_p + v_cmd_max * U_t;  U(G5) = U_psi + wz_cmd_max * U_t (in degrees)
-  (GV3-4, rejected: Codex read "the interval holds the threshold" as making an upper edge equal to
-  the threshold inconclusive; with a "<=" condition that edge is a certain pass. Rounding of q + U
-  near the threshold, of order 1e-17, is below any measurement resolution and is not handled.)
+Three states per condition G2-G5 (O1 3.5, SC-1, SC3-1). Frame k gives the measured value q_k, a lower
+bound lo_k and an upper bound hi_k of the quantity (here lo_k = q_k - U, hi_k = q_k + U with one U for
+the run; U unknown -> lo_k, hi_k NaN). Over the run, each field is the maximum over the frames where it
+is finite, taken separately: q = max q_k, lo = max lo_k, hi = max hi_k; n_undef = number of frames where
+q_k, lo_k or hi_k is not finite. Then
+  khong_dat      lo > threshold                          (one frame certainly above, whatever the others)
+  chua_ket_luan  otherwise, n_undef > 0 or hi > threshold or no frame with a finite hi
+  dat            n_undef = 0 and hi <= threshold         (an upper edge equal to the threshold passes, "<=")
+Example (SC3-1, THESIS 13/11, Codex TX-4): one frame (0.12, 0.11, +inf), D = 0.10 -> khong_dat.
+  U(G2) = U_p;  U(G3) = U_p + v_cmd_max U_t;  U(G5) = U_psi + wz_cmd_max U_t (degrees);
+  U(G4) = U_p + r_c (U_psi + kappa_eff U_p): only U_p = U_psi = 0 is handled here (fwsim, HIL score the true
+  plant state); the camera scorer (several projection solutions within 2 U_p, O1 3.4) is not this module.
 G1: 'true' -> dat, 'false' -> khong_dat, 'inconclusive' (or anything else) -> chua_ket_luan.
 
-Which conditions may decide (GV3-2): `decide` lists them. fwsim: all five. HIL: G1, G2 only, because
-t = 0 there is the plant RUN step, not yet mapped to the ESP32 run_active edge (dossier 5.2), which
-touches G3, G5 (schedule and command heading), not completion or the lane distance.
-Outcomes (O1 3.5 order: one khong_dat -> khong_dat; else one chua_ket_luan -> chua_ket_luan; else dat):
-  outcome         over G1, G2, G3, G5 (all computed), report only
-  outcome_decide  over the computed conditions that may decide
-  complete        G4 computed and all five may decide; only then can a run be 'dat' under the gate.
+Which conditions decide (`decide`): DECIDE_ALL on fwsim, the floor and on HIL when t = 0 is the ESP32
+run_active edge mapped to the plant step (tools/hil_edge_map.py, RS-4); DECIDE_HIL when that mapping is
+missing: t = 0 is then the plant RUN step, U_t is not known, so G3, G5 report only; G1, G2, G4 do not use
+the schedule time and decide. Outcomes (O1 3.5 order: one khong_dat -> khong_dat; else one chua_ket_luan ->
+chua_ket_luan; else dat):
+  outcome         over G1-G5, report only
+  outcome_decide  over the deciding conditions
+  complete        all five decide; only then can a run be 'dat' under the gate.
 Lost runs (measurement / command path, O1 3.5) are decided outside this module.
 
-U_t has no default (GV3-3): the caller passes the measured bound, or None when it is not known yet;
-None makes G3, G5 chua_ket_luan. fwsim and HIL score the true plant state: U_p = U_psi = 0 there. On
-fwsim the 50 Hz publisher is held for the 100 Hz firmware (0 or 10 ms per tick; about 5 ms, Claude's
-estimate, not measured: 03_CODE/docs/2026-11-12_Xac_nhan_cong_v3_muc_a.md section 2).
+U_t has no default: the caller passes the bound, or None when it is not known. On fwsim the 50 Hz
+publisher is held for the 100 Hz firmware (about 5 ms, an estimate): a property of the command path,
+not added to U (dossier 5.2, CG4-6).
 Command maxima (GV3-7): the grid maximum is refined around its peak and raised by a relative margin
 CMD_MARGIN, so the value used is an upper bound of the continuous maximum.
 """
@@ -50,16 +53,19 @@ from typing import Iterable, Optional
 
 import numpy as np
 
-GATE_VERSION = 'gate_v3_g1235'          # G4 not yet in; the version string changes when it is
+GATE_VERSION = 'gate_v3.2'              # G1-G5, per-frame lo / hi / n_undef (gate_v3_g1235 before 13/11)
 D = 0.10                                # m, O1 3.9 (1); same value as o1_feasibility.D (a test checks)
 THETA_MAX_DEG = 7.5                     # deg, dossier v3 section 2 (US-015 datasheet, author's choice)
+BODY_HALF_LEN = 0.17                    # m, half of 340 mm along the car x axis (O1 3.4, section 6)
+BODY_HALF_WID = 0.145                   # m, half of 290 mm
 STATES = ('dat', 'khong_dat', 'chua_ket_luan')
-G4_STATE = 'chua_tinh'
 CONDS = ('g1', 'g2', 'g3', 'g4', 'g5')
-COMPUTED = ('g1', 'g2', 'g3', 'g5')     # G4 not yet
-THRESHOLDS = {'g2': D, 'g3': D, 'g5': THETA_MAX_DEG}
+MEASURED = ('g2', 'g3', 'g4', 'g5')
+THRESHOLDS = {'g2': D, 'g3': D, 'g4': D, 'g5': THETA_MAX_DEG}
+FRAME_KEYS = {'g2': 'e_perp', 'g3': 'e_trk', 'g4': 'e_bao', 'g5': 'e_theta_cmd_deg'}
 DECIDE_ALL = CONDS
-DECIDE_HIL = ('g1', 'g2')
+DECIDE_HIL = ('g1', 'g2', 'g4')         # HIL without the run_active edge mapping (RS-4)
+DECIDE_SETS = (DECIDE_ALL, DECIDE_HIL)
 CMD_MARGIN = 1e-6                       # relative margin on the refined command maxima (GV3-7)
 
 
@@ -72,16 +78,45 @@ def _finite(x) -> bool:
         return False
 
 
-def tri_state(q, threshold: float, u) -> str:
-    """S05 3.4 on one maximum q with its bound u >= 0 (module docstring)."""
-    if not (_finite(q) and _finite(u)) or float(u) < 0.0:
-        return 'chua_ket_luan'
-    q, u = float(q), float(u)
-    if q - u > threshold:
+def frame_bounds(q_k, u):
+    """(lo_k, hi_k) = (q_k - u, q_k + u); u None / NaN / negative -> NaN bounds (not known)."""
+    q = np.asarray(q_k, dtype=float)
+    if not _finite(u) or float(u) < 0.0:
+        nan = np.full(q.shape, np.nan)
+        return nan, nan.copy()
+    return q - float(u), q + float(u)
+
+
+def cond_state(lo, hi, n_undef, threshold: float) -> str:
+    """O1 3.5 on the stored numbers (SC3-1). lo, hi: maxima over the frames where they are finite,
+    None / NaN when no frame has one; n_undef: frames with a value that is not finite."""
+    if _finite(lo) and float(lo) > threshold:
         return 'khong_dat'
-    if q + u <= threshold:
-        return 'dat'
-    return 'chua_ket_luan'
+    if not isinstance(n_undef, int) or isinstance(n_undef, bool) or n_undef != 0:
+        return 'chua_ket_luan'
+    if not _finite(hi) or float(hi) > threshold:
+        return 'chua_ket_luan'
+    return 'dat'
+
+
+def _fmax(a) -> float:
+    a = a[np.isfinite(a)]
+    return float(a.max()) if len(a) else float('nan')
+
+
+def aggregate(q_k, lo_k, hi_k, threshold: float) -> dict:
+    """One condition over the frames of a run (module docstring)."""
+    q, lo, hi = (np.asarray(x, dtype=float).ravel() for x in (q_k, lo_k, hi_k))
+    if not len(q) == len(lo) == len(hi):
+        raise ValueError(f'q, lo, hi of different lengths ({len(q)}, {len(lo)}, {len(hi)})')
+    fin = np.isfinite(q) & np.isfinite(lo) & np.isfinite(hi)
+    if np.any(fin & ((lo > q) | (q > hi))):
+        raise ValueError('a frame with lo > q or q > hi')
+    out = dict(q=_fmax(q), lo=_fmax(lo), hi=_fmax(hi), n_undef=int(np.count_nonzero(~fin)), n_frames=int(len(q)),
+               threshold=threshold)
+    out['ratio'] = out['q'] / threshold if _finite(out['q']) else float('nan')
+    out['state'] = cond_state(out['lo'], out['hi'], out['n_undef'], threshold)
+    return out
 
 
 def g1_state(completed) -> str:
@@ -148,49 +183,52 @@ def k_cmd_max(sch):
     return float(sch.vmax), 0.0
 
 
-def _cond(q, threshold, u):
-    st = tri_state(q, threshold, u)
-    qf = float(q) if _finite(q) else float('nan')
-    return dict(q=qf, u=float(u) if _finite(u) else float('nan'), threshold=threshold,
-                ratio=qf / threshold if _finite(q) else float('nan'), state=st)
+def check_decide(decide) -> tuple:
+    """`decide` as a tuple in CONDS order; it must be DECIDE_ALL or DECIDE_HIL (as a set)."""
+    raw = list(decide)                                   # once: an iterator is consumed (GV3-R2-5)
+    if len(set(raw)) != len(raw) or set(raw) not in [set(s) for s in DECIDE_SETS]:
+        raise ValueError(f'decide {raw!r}: {DECIDE_ALL} or {DECIDE_HIL}')
+    return tuple(c for c in CONDS if c in set(raw))
 
 
 def evaluate_outcomes(g: dict, decide: Iterable[str]) -> dict:
     """outcome, outcome_decide, complete, any_certain_fail of a gate dict with states g1..g5."""
     dset = set(decide)                                   # once: an iterator is consumed (GV3-R2-5)
-    decide = [c for c in CONDS if c in dset]
-    computed = [c for c in CONDS if g[c]['state'] != G4_STATE]
-    dec = [c for c in decide if c in computed]
-    return dict(outcome=run_outcome(g[c]['state'] for c in COMPUTED),
+    dec = [c for c in CONDS if c in dset]
+    return dict(outcome=run_outcome(g[c]['state'] for c in CONDS),
                 outcome_decide=run_outcome(g[c]['state'] for c in dec),
-                complete=set(decide) == set(CONDS) and set(computed) == set(CONDS),
+                complete=dset == set(CONDS),
                 any_certain_fail=any(g[c]['state'] == 'khong_dat' for c in dec))
 
 
-def gate_v3(summary: dict, *, v_cmd_max: float, wz_cmd_max: float, u_t: Optional[float],
-            theta_key: str = 'e_theta_cmd_max_deg', u_p: float = 0.0, u_psi_deg: float = 0.0,
-            decide: Iterable[str] = DECIDE_ALL, note: str = '') -> dict:
-    """G1, G2, G3, G5 of one run from an evaluator summary; G4 'chua_tinh'. Units: m, deg, s.
+def gate(frames: dict, completed, *, v_cmd_max: float, wz_cmd_max: float, u_t: Optional[float],
+         u_p: float = 0.0, u_psi_deg: float = 0.0, decide: Iterable[str] = DECIDE_ALL, status: str = '',
+         note: str = '') -> dict:
+    """G1-G5 of one run. frames: per-frame arrays FRAME_KEYS (e_perp, e_trk, e_bao [m], e_theta_cmd_deg
+    = |heading error| [deg]) on the scored frames; completed: the evaluator's G1 value.
     u_t: bound of the time offset of the command start [s], or None = not known (G3, G5 inconclusive)."""
-    raw = list(decide)                                   # once: an iterator is consumed (GV3-R2-5)
-    if not raw or set(raw) - set(CONDS) or not {'g1', 'g2'} <= set(raw):
-        raise ValueError(f'decide {raw!r}: a subset of {CONDS} that holds g1 and g2')
-    decide = tuple(c for c in CONDS if c in set(raw))
+    decide = check_decide(decide)
+    if u_p != 0.0 or u_psi_deg != 0.0:
+        raise ValueError('U_p, U_psi > 0 (camera): G4 needs the projection solutions within 2 U_p (O1 3.4); '
+                         'not in this module')
+    us = dict(g2=u_p, g4=0.0)
     if u_t is None:
-        u3 = u5 = float('nan')
+        us.update(g3=float('nan'), g5=float('nan'))
     else:
-        u3 = u_p + v_cmd_max * u_t
-        u5 = u_psi_deg + math.degrees(wz_cmd_max * u_t)
-    c1 = summary.get('completed')
+        if not _finite(u_t) or float(u_t) < 0.0:
+            raise ValueError(f'u_t {u_t!r}: None or a finite number >= 0')
+        us.update(g3=u_p + v_cmd_max * float(u_t), g5=u_psi_deg + math.degrees(wz_cmd_max * float(u_t)))
+    c1 = completed
     q1 = {'dat': 'true', 'khong_dat': 'false'}.get(g1_state(c1), 'inconclusive')   # always a string (GV3-R3-2)
-    g = dict(g1=dict(q=q1, state=g1_state(c1)),
-             g2=_cond(summary.get('e_perp_max'), D, u_p),
-             g3=_cond(summary.get('e_trk_max'), D, u3),
-             g4=dict(state=G4_STATE),
-             g5=_cond(summary.get(theta_key), THETA_MAX_DEG, u5))
-    ratios = [g[k]['ratio'] for k in ('g2', 'g3', 'g5') if _finite(g[k]['ratio'])]
-    return dict(version=GATE_VERSION, D=D, theta_max_deg=THETA_MAX_DEG, theta_key=theta_key,
-                v_cmd_max=v_cmd_max, wz_cmd_max=wz_cmd_max, u_p=u_p, u_psi_deg=u_psi_deg, u_t=u_t,
-                **g, **evaluate_outcomes(g, decide), decide=list(decide), conditions='G1,G2,G3,G5',
-                max_ratio=max(ratios) if ratios else float('nan'),
-                track_err=summary.get('status') == 'track_err', note=note)
+    g = dict(g1=dict(q=q1, state=g1_state(c1)))
+    for c in MEASURED:
+        if FRAME_KEYS[c] not in frames:
+            raise ValueError(f'frames: {FRAME_KEYS[c]!r} missing')
+        q = np.asarray(frames[FRAME_KEYS[c]], dtype=float)
+        lo, hi = frame_bounds(q, us[c])
+        g[c] = dict(aggregate(q, lo, hi, THRESHOLDS[c]), u=us[c])
+    ratios = [g[k]['ratio'] for k in MEASURED if _finite(g[k]['ratio'])]
+    return dict(version=GATE_VERSION, D=D, theta_max_deg=THETA_MAX_DEG, v_cmd_max=v_cmd_max,
+                wz_cmd_max=wz_cmd_max, u_p=u_p, u_psi_deg=u_psi_deg, u_t=u_t, **g,
+                **evaluate_outcomes(g, decide), decide=list(decide), conditions='G1,G2,G3,G4,G5',
+                max_ratio=max(ratios) if ratios else float('nan'), track_err=status == 'track_err', note=note)

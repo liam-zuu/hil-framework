@@ -20,12 +20,14 @@ Commands (the operator types them while working; every time stamp is the PC cloc
   pause / resume                         other work in between: not counted (S05 §3.1)
   end    --outcome dat|khong_dat|chua_ket_luan|hong_he_do [--e-perp-max M] [--completed 0|1]
          [--fail-cause X] [--results-dir D] [--gate-json F]   close the run, append its row;
-                                         F = scorer output with a gate_v3 block (fwsim/o1_gate.py):
-                                         checked and recomputed from q, U; its q, U, state per condition
+                                         F = scorer output with a gate_v3 block (fwsim/o1_gate.py,
+                                         version gate_v3.2): checked and recomputed from q, lo, hi,
+                                         n_undef (O1 3.5, SC3-1); those, the state per condition, U_t
                                          and the file's sha256 go to the gate columns (--results-dir
                                          required); the outcome is checked against the deciding
-                                         conditions; no 'dat' while the gate is not complete (G4)
-                                         (12/11, tune stop gate v3; the logs need "migrate" once)
+                                         conditions; no 'dat' while the gate is not complete (HIL run
+                                         without the run_active edge mapping, RS-4)
+                                         (12/11, tune stop gate v3; 13/11 v3.2; the logs need "migrate")
   cancel / status                        drop the open run / show it. cancel only before the "run"
                                          step (S05 §3.3: every started run counts, EA-6); time of the
                                          steps already logged goes to m7_dev_effort_log.csv
@@ -90,8 +92,12 @@ if _FWSIM not in sys.path:
     sys.path.insert(0, _FWSIM)
 import o1_gate                                                          # noqa: E402
 GATE_CONDS = o1_gate.CONDS
-GATE_COLS = (['gate_version', 'gate_decide', 'gate_json_sha256']
-             + [f'{g}_{x}' for g in GATE_CONDS for x in ('q', 'u', 'state')])
+# 13/11 gate v3.2 (SC-1, SC3-1; Liam CODE local_7f7b0ef4 "Duyệt gộp luôn lo/hi"): per condition G2-G5 the
+# maxima over the frames of q, lo, hi (each field over its finite frames) and n_undef; G1 q is 'completed';
+# gate_u_t = the U_t used (empty = not known: HIL run without the run_active edge mapping, RS-4)
+GATE_FIELDS = ('q', 'lo', 'hi', 'n_undef', 'state')
+GATE_COLS = (['gate_version', 'gate_decide', 'gate_json_sha256', 'gate_u_t', 'g1_q', 'g1_state']
+             + [f'{g}_{x}' for g in o1_gate.MEASURED for x in GATE_FIELDS])
 TUNING_COLS = TUNING_OLD + TUNING_NEW + GATE_COLS
 EFFORT_OLD = ['ngay', 'bat_dau', 'ket_thuc', 'gio', 'buoc', 'giai_doan', 'mot_lan_hay_thich_nghi', 'dut',
               'ghi_chu', 'chien_dich', 'lap_lai']
@@ -396,46 +402,63 @@ def _qnum(x, what: str):
     return float(x)
 
 
-# conditions that decide, by platform (GV3-R2-2): HIL scores the plant with t = 0 not yet mapped to the
-# ESP32 run_active edge, so G3, G5 report only there; G1, G2 always decide
-DECIDE_BY_PLATFORM = {'HIL': o1_gate.DECIDE_HIL, 'SIM': o1_gate.DECIDE_ALL, 'HW': o1_gate.DECIDE_ALL}
+# conditions that decide, by platform (GV3-R2-2; 13/11 RS-4): HIL decides all five when t = 0 is the mapped
+# ESP32 run_active edge (U_t known), else G1, G2, G4 (U_t not known); SIM and the floor decide all five
+DECIDE_BY_PLATFORM = {'HIL': (o1_gate.DECIDE_ALL, o1_gate.DECIDE_HIL), 'SIM': (o1_gate.DECIDE_ALL,),
+                      'HW': (o1_gate.DECIDE_ALL,)}
 _G1_Q = ('true', 'false', 'inconclusive')
-_TOP_KEYS = ('version', 'decide', 'outcome', 'outcome_decide', 'complete', 'any_certain_fail')
+_TOP_KEYS = ('version', 'decide', 'u_t', 'outcome', 'outcome_decide', 'complete', 'any_certain_fail')
 _BOOL_KEYS = ('complete', 'any_certain_fail')
+_COND_KEYS = ('q', 'lo', 'hi', 'n_undef', 'threshold', 'state')
 
 
 def _check_decide(decide, platform: Optional[str] = None) -> List[str]:
     if (not isinstance(decide, list) or not decide or len(set(decide)) != len(decide)
             or any(not isinstance(c, str) for c in decide) or set(decide) - set(GATE_CONDS)):
         raise LogError(f'gate decide {decide!r}: a non-empty list of distinct {GATE_CONDS}')
-    if not {'g1', 'g2'} <= set(decide):
-        raise LogError(f'gate decide {decide!r}: G1 and G2 always decide (GV3-R2-2)')
+    if set(decide) not in [set(x) for x in o1_gate.DECIDE_SETS]:
+        raise LogError(f'gate decide {decide!r}: {list(o1_gate.DECIDE_ALL)} or {list(o1_gate.DECIDE_HIL)}')
     if platform is not None:
         want = DECIDE_BY_PLATFORM.get(platform)
-        if want is None or set(decide) != set(want):
-            raise LogError(f'gate decide {decide!r} on platform {platform!r}: must be {list(want or ())} '
-                           f'(GV3-R2-2)')
+        if want is None or set(decide) not in [set(x) for x in want]:
+            raise LogError(f'gate decide {decide!r} on platform {platform!r}: must be one of '
+                           f'{[list(x) for x in (want or ())]} (GV3-R2-2)')
     return decide
 
 
+def _n_undef(x, what: str) -> int:
+    if isinstance(x, bool) or not isinstance(x, (int, float)) or not float(x).is_integer() or x < 0:
+        raise LogError(f'gate {what}: {x!r} is not a whole number >= 0')
+    return int(x)
+
+
 def _recompute(gate: dict, platform: Optional[str] = None) -> dict:
-    """States and outcomes recomputed from q, U with fwsim/o1_gate (thresholds, three states, O1 3.5
-    order); shared by the JSON path (end) and the logged rows (summary). Returns the outcomes."""
+    """States and outcomes recomputed from q, lo, hi, n_undef with fwsim/o1_gate (thresholds, O1 3.5
+    three states SC3-1, O1 3.5 order); shared by the JSON path (end) and the logged rows (summary).
+    Returns the outcomes."""
     if gate.get('version') != o1_gate.GATE_VERSION:
         raise LogError(f'gate version {gate.get("version")!r}: only {o1_gate.GATE_VERSION} is supported')
     decide = _check_decide(gate.get('decide'), platform)
-    if gate['g4'].get('state') != o1_gate.G4_STATE:
-        raise LogError(f'gate g4: {o1_gate.GATE_VERSION} does not compute G4 (state {o1_gate.G4_STATE})')
+    u_t = _qnum(gate.get('u_t'), 'u_t')
+    if u_t < 0.0:
+        raise LogError(f'gate u_t: {u_t!r} is negative (a bound is >= 0)')
+    # U_t known <=> G3, G5 may decide (RS-4): a HIL gate without the mapping cannot claim all five
+    if (set(decide) == set(o1_gate.DECIDE_ALL)) == math.isnan(u_t):
+        raise LogError(f'gate decide {decide!r} with u_t {gate.get("u_t")!r}: all five decide exactly when U_t '
+                       'is known (RS-4)')
     q1 = gate['g1'].get('q')
     if q1 not in _G1_Q or gate['g1'].get('state') != o1_gate.g1_state(q1):
         raise LogError(f'gate g1: q {q1!r} and state {gate["g1"].get("state")!r} do not agree (O1 3.4 completed)')
     for c, thr in o1_gate.THRESHOLDS.items():
-        u = _qnum(gate[c].get('u'), f'{c} u')
-        if u < 0.0:
-            raise LogError(f'gate {c} u: {u!r} is negative (a bound is >= 0)')
-        st = o1_gate.tri_state(_qnum(gate[c].get('q'), f'{c} q'), thr, u)
+        q, lo, hi = (_qnum(gate[c].get(k), f'{c} {k}') for k in ('q', 'lo', 'hi'))
+        nu = _n_undef(gate[c].get('n_undef'), f'{c} n_undef')
+        # every frame finite: the maxima keep lo <= q <= hi; with undefined frames each field is the maximum
+        # over its own finite frames (SC3-1), so hi may be below q (the frame of q may have hi = inf)
+        if nu == 0 and not (math.isnan(q) or lo <= q <= hi):
+            raise LogError(f'gate {c}: lo {lo!r} <= q {q!r} <= hi {hi!r} does not hold with n_undef 0')
+        st = o1_gate.cond_state(lo, hi, nu, thr)
         if st != gate[c].get('state'):
-            raise LogError(f'gate {c}: state {gate[c].get("state")!r}, recomputed from q, U: {st!r}')
+            raise LogError(f'gate {c}: state {gate[c].get("state")!r}, recomputed from lo, hi, n_undef: {st!r}')
     return o1_gate.evaluate_outcomes(gate, decide)
 
 
@@ -443,14 +466,14 @@ def validate_gate(gate: dict, platform: Optional[str] = None) -> dict:
     """GV3-5, GV3-R2-3: a gate JSON checked key by key (a missing key is an error, null is 'unknown';
     booleans by type; thresholds), then every state and outcome recomputed (_recompute); any difference
     is an error. The outcome fields of the JSON are never trusted. platform: the run's platform, whose
-    deciding set the JSON must carry (GV3-R2-2). Returns the recomputed outcomes."""
+    deciding sets the JSON must match (GV3-R2-2). Returns the recomputed outcomes."""
     if not isinstance(gate, dict):
         raise LogError(f'gate: {gate!r} is not an object')
     for k in _TOP_KEYS + GATE_CONDS:
         if k not in gate:
             raise LogError(f'gate {k}: missing')
     for c in GATE_CONDS:
-        need = ('state',) if c == 'g4' else ('q', 'state') if c == 'g1' else ('q', 'u', 'threshold', 'state')
+        need = ('q', 'state') if c == 'g1' else _COND_KEYS
         if not isinstance(gate[c], dict) or any(k not in gate[c] for k in need):
             raise LogError(f'gate {c}: missing, or without {need}')
     for c, thr in o1_gate.THRESHOLDS.items():
@@ -468,37 +491,42 @@ def validate_gate(gate: dict, platform: Optional[str] = None) -> dict:
 
 def gate_from_row(row: dict) -> dict:
     """The gate of a logged run (GATE_COLS) as a dict for _recompute ('' = unknown)."""
-    def num(s):
+    def num(s, whole=False):
         try:
-            return None if s in ('', None) else float(s)
+            if s in ('', None):
+                return None
+            v = float(s)
+            return int(v) if whole and v.is_integer() else v
         except ValueError:
             raise LogError(f"{row.get('run_uid')}: gate value {s!r} is not a number")
-    g = {'version': row.get('gate_version'), 'decide': [c for c in row.get('gate_decide', '').split(',') if c]}
-    for c in GATE_CONDS:                    # g1 has no U, g4 no q, U in gate_v3_g1235: not read (GV3-R3-3)
-        g[c] = {'q': row.get(f'{c}_q') if c == 'g1' else None if c == 'g4' else num(row.get(f'{c}_q')),
-                'u': None if c in ('g1', 'g4') else num(row.get(f'{c}_u')), 'state': row.get(f'{c}_state')}
+    g = {'version': row.get('gate_version'), 'decide': [c for c in row.get('gate_decide', '').split(',') if c],
+         'u_t': num(row.get('gate_u_t')), 'g1': {'q': row.get('g1_q'), 'state': row.get('g1_state')}}
+    for c in o1_gate.MEASURED:
+        g[c] = {k: num(row.get(f'{c}_{k}')) for k in ('q', 'lo', 'hi')}
+        g[c].update(n_undef=num(row.get(f'{c}_n_undef'), whole=True), state=row.get(f'{c}_state'))
     return g
 
 
 def outcome_vs_gate(outcome: str, ev: dict, decide) -> Optional[str]:
     """None when `outcome` agrees with the recomputed gate outcomes `ev`, else why not.
     hong_he_do is decided outside the gate (O1 3.5). complete gate: the outcome equals outcome_decide.
-    Gate not complete (G4 not computed, or G3, G5 report only on HIL): no run is 'dat' (GV3-1); a certain
-    fail of a deciding condition makes it khong_dat, an inconclusive one rules out dat (GV3-2)."""
+    Gate not complete (HIL run without the run_active edge mapping: G3, G5 report only): no run is 'dat'
+    (GV3-1); a certain fail of a deciding condition makes it khong_dat, an inconclusive one rules out dat
+    (GV3-2)."""
     if outcome == 'hong_he_do':
         return None
     od = ev['outcome_decide']
     if ev['complete']:
         return None if outcome == od else f'gate outcome {od}'
     if outcome == 'dat':
-        return 'the gate is not complete (G4 not computed, or conditions report only): no run is dat'
+        return 'the gate is not complete (conditions report only): no run is dat'
     ok = {'khong_dat': outcome == 'khong_dat', 'chua_ket_luan': outcome in ('khong_dat', 'chua_ket_luan')}.get(od, True)
     return None if ok else f'deciding conditions {",".join(decide)}: {od}'
 
 
 def check_gate_rows(tun: List[dict]) -> None:
-    """GV3-1, GV3-R2-1: every logged row that carries a gate is recomputed from its q, U (version,
-    deciding set of its platform, thresholds, states); its run_outcome must agree as at `end`.
+    """GV3-1, GV3-R2-1: every logged row that carries a gate is recomputed from its q, lo, hi, n_undef
+    (version, deciding set of its platform, thresholds, states); its run_outcome must agree as at `end`.
     Rows whose gate columns are ALL empty (before gate v3, or written without --gate-json) are not
     checked; any non-empty gate cell makes the row a gate row, with a supported version (GV3-R3-1)."""
     for r in tun:
@@ -516,15 +544,17 @@ def check_gate_rows(tun: List[dict]) -> None:
 
 
 def gate_columns(gate: dict, gate_sha256: str = '') -> dict:
-    """GATE_COLS of one run from a gate dict (fwsim/o1_gate.gate_v3). q of g1 is the evaluator's
-    'completed' (true / false / inconclusive); g4 has no q, u while it is not computed."""
+    """GATE_COLS of one run from a gate dict (fwsim/o1_gate.gate). q of g1 is the evaluator's
+    'completed' (true / false / inconclusive)."""
     out = {'gate_version': gate['version'], 'gate_decide': ','.join(gate['decide']),
-           'gate_json_sha256': gate_sha256}
-    for g in GATE_CONDS:                    # only fields that mean something are written (GV3-R3-3)
+           'gate_json_sha256': gate_sha256, 'gate_u_t': _num(gate.get('u_t')),
+           'g1_q': str(gate['g1'].get('q')), 'g1_state': gate['g1'].get('state', '')}
+    for g in o1_gate.MEASURED:
         c = gate.get(g) or {}
-        q = c.get('q')
-        out[f'{g}_q'] = '' if g == 'g4' else str(q) if g == 'g1' else _num(q)
-        out[f'{g}_u'] = '' if g in ('g1', 'g4') else _num(c.get('u'))
+        for k in ('q', 'lo', 'hi'):
+            v = c.get(k)
+            out[f'{g}_{k}'] = '' if v is None or (isinstance(v, float) and math.isnan(v)) else _num(v)
+        out[f'{g}_n_undef'] = str(int(c['n_undef'])) if c.get('n_undef') is not None else ''
         out[f'{g}_state'] = c.get('state', '')
     return out
 
@@ -908,7 +938,7 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
             except LogError as exc:
                 raise LogError(f"{r.get('run_uid')}: {exc}")
     _check_replacements(tun)
-    check_gate_rows(tun)                            # GV3-1, GV3-R2-1: gate rows recomputed from q, U
+    check_gate_rows(tun)                            # GV3-1, GV3-R2-1: gate rows recomputed from q, lo, hi
     stopped = _final_stops(tun)
 
     def add(target, key, val, share=1.0):

@@ -28,13 +28,18 @@ before t_deadline - one period and the evaluator says completed 'false', the res
 'inconclusive' (completed_raw keeps 'false'); log_end_t, log_covers_deadline are always written.
 run_hil.py --o1 --finite-run keeps the zeros and the log to T_cmd + o1_tasks.O1_TAIL_S (2.5 s).
 
-gate_v3 (12/11/2026, fwsim/o1_gate.py, tune stop gate v3): G1, G2, G3, G5 states of the run,
-G4 not computed yet; usable_for_decision False on HIL until t = 0 is mapped to the ESP32
-run_active edge (dossier v3 5.2).
+Gate v3.2 (13/11/2026, Liam CODE local_db99d287 "Làm rs4 + g4 đi", local_7f7b0ef4 "Duyệt gộp luôn
+lo/hi"): scored with fwsim/o1_gate_eval.py (evaluate_v7 / evaluate_k unchanged, plus G4 and the per-frame
+values) and fwsim/o1_gate.gate (G1-G5, per-frame lo / hi / n_undef), block 'gate_v3' of the output.
+RS-4: with --esp-log (the agv_logger CSV of the same run), t = 0 is the ESP32 run_active rising edge
+mapped to the plant step (tools/hil_edge_map.py): t of frame k = (k - a) x period, frames k >= a scored,
+U_t = the mapping bound, all five conditions decide; t0_src 'esp32_run_active_edge', edge_map block
+with offset_ms = edge - RUN step (the "chênh" of O1 3.4). Without --esp-log, or when the mapping is
+refused: t = 0 at the RUN step as before, U_t unknown, G3, G5 report only (decide G1, G2, G4).
 Validity (CODE L50, STATUS_CODE CG4) is NOT decided here: the manifest counts (MISO CRC bad,
 empty frames) are copied out; the run rule is tools/s06_frames_decode.py on the same log.
 
-  python tools/hil_o1_score.py --frame-log <run>.npz --task O1-F05 [--out score.json]
+  python tools/hil_o1_score.py --frame-log <run>.npz --task O1-F05 [--esp-log <run>.csv] [--out score.json]
   (K1, K2 need --allow-final-set: O1 3.7, final test set only)
 Last line: #ket_qua,ma=0 scored / 2 error.
 """
@@ -55,7 +60,9 @@ for _p in (os.path.join(HERE, '..', 'rpi5'), os.path.join(HERE, '..', 'fwsim'), 
 import protocol as P                                                     # noqa: E402
 import o1_lanes                                                          # noqa: E402
 import o1_gate                                                           # noqa: E402
-from o1_feasibility import Path8, Schedule, evaluate_v7                  # noqa: E402
+import o1_gate_eval                                                      # noqa: E402
+import hil_edge_map                                                      # noqa: E402
+from o1_feasibility import Path8, Schedule                               # noqa: E402
 from o1_tasks import FIG8, FINAL_SET                                     # noqa: E402
 
 
@@ -105,44 +112,55 @@ def log_coverage(out, t_log_end, period):
     return out
 
 
-def score(path, task, allow_final_set=False):
+def score(path, task, allow_final_set=False, esp_log=None):
     if task not in FIG8 and task not in FINAL_SET:
         raise ValueError(f'task {task!r}: one of {tuple(FIG8) + FINAL_SET}')
     if task in FINAL_SET and not allow_final_set:
         raise ValueError(f'{task} is the final test set (O1 3.7): only with --allow-final-set')
     manifest, mosi, miso = load(path)
     state, ref, flags, duty = decode_frames(mosi, miso)
-    k0, t0_src = command_start(manifest, ref, flags)
+    k_run, run_src = command_start(manifest, ref, flags)
     period = float(manifest.get('period_us', 1000)) * 1e-6
+    # RS-4: t = 0 at the ESP32 run_active edge mapped to the plant step, when the ESP32 log maps
+    em = dict(ok=False, reason='no --esp-log')
+    if esp_log:
+        em = hil_edge_map.map_edge(state[:, 0:4], k_run, hil_edge_map.read_esp_log(esp_log), period)
+        em['esp_log'] = os.path.basename(esp_log)
+    if em['ok']:
+        a = float(em['edge_step'])
+        k0, t0_src, u_t, decide = int(math.ceil(a - 1e-9)), 'esp32_run_active_edge', float(em['u_t_s']), o1_gate.DECIDE_ALL
+        note = (f'HIL: t = 0 at the ESP32 run_active edge, plant step {a:.2f} ({em["offset_ms"]:+.2f} ms from the RUN '
+                f'step); U_t = {u_t * 1e3:.2f} ms from the mapping (RS-4)')
+    else:
+        a, k0, t0_src, u_t, decide = float(k_run), k_run, run_src, None, o1_gate.DECIDE_HIL
+        note = (f'HIL: t = 0 at the plant RUN step, run_active edge not mapped ({em["reason"]}): U_t not known, '
+                'G3, G5 report only (G1, G2, G4 decide)')
     sl = slice(k0, len(state))
-    log = dict(t=(np.arange(len(state))[sl] - k0) * period, pose=state[sl, 4:7], v_true=state[sl, 7:10],
+    log = dict(t=(np.arange(len(state))[sl] - a) * period, pose=state[sl, 4:7], v_true=state[sl, 7:10],
                duty=duty[sl], pwm=np.round(duty[sl] * 1000.0))
     if task in FIG8:
-        out, _ = evaluate_v7(log, Path8(), Schedule(FIG8[task]))
+        out, _, frames = o1_gate_eval.evaluate_fig8(log, Path8(), Schedule(FIG8[task]))
         out['task'] = task
     else:
-        out, _ = o1_lanes.evaluate_k(log, task)
+        out, _, frames = o1_gate_eval.evaluate_k(log, task)
     out['tv_duty_h7_1khz'] = out.pop('tv_duty')                          # not the S05 4.7 tv_duty (docstring)
     log_coverage(out, float(log['t'][-1]) if len(log['t']) else -1.0, period)
-    # gate v3 (o1_gate.py): true plant state, so U_p = U_psi = 0; t = 0 is the plant RUN step, not yet
-    # mapped to the ESP32 run_active edge (dossier v3 5.2): G3, G5 reported, not used to decide
+    # gate v3.2 (o1_gate.py): true plant state, so U_p = U_psi = 0
     if task in FIG8:
         v_max, wz_max = o1_gate.fig8_cmd_max(Schedule(FIG8[task]))
-        theta_key = 'e_theta_cmd_max_deg'
     else:
         v_max, wz_max = o1_gate.k_cmd_max(o1_lanes.KSchedule(task))
-        theta_key = 'e_theta_start_max_deg'
-    out['gate_v3'] = o1_gate.gate_v3(
-        out, v_cmd_max=v_max, wz_cmd_max=wz_max, theta_key=theta_key, u_t=None, decide=o1_gate.DECIDE_HIL,
-        note='HIL: t = 0 at the plant RUN step, not mapped to the ESP32 run_active edge (dossier v3 5.2): '
-             'U_t not known, G3, G5 reported only (G1, G2 decide); G4 not computed yet')
+    out['gate_v3'] = o1_gate.gate(frames, out['completed'], v_cmd_max=v_max, wz_cmd_max=wz_max, u_t=u_t,
+                                  decide=decide, status=out.get('status', ''), note=note)
     mc = manifest.get('miso_check') or {}
-    out.update(frame_log=os.path.basename(path), k0=k0, t0_src=t0_src, frames_scored=int(len(state) - k0),
+    out.update(frame_log=os.path.basename(path), k0=k0, k_run=k_run, t0_step=a, t0_src=t0_src,
+               frames_scored=int(len(state) - k0), edge_map=em,
                start_pose=[float(v) for v in state[k0, 4:7]], plant=manifest.get('plant'),
                plant_src=manifest.get('plant_src'), imu_noise=manifest.get('imu_noise'),
                lifecycle_outcome=(manifest.get('lifecycle') or {}).get('outcome'),
                miso_crc_bad=mc.get('crc_bad'), miso_empty=mc.get('empty'),
-               validity='see tools/s06_frames_decode.py (L50)', rule='S05 v3.7 4.6: evaluate_v7, S03 section 4')
+               validity='see tools/s06_frames_decode.py (L50)',
+               rule='S05 v3.7 4.6: evaluate_v7, S03 section 4; gate v3.2: o1_gate_eval + o1_gate')
     return out
 
 
@@ -165,10 +183,11 @@ def main(argv=None) -> int:
     ap.add_argument('--frame-log', required=True)
     ap.add_argument('--task', required=True)
     ap.add_argument('--allow-final-set', action='store_true')
+    ap.add_argument('--esp-log', default='', help='agv_logger CSV of the run: t = 0 at the run_active edge (RS-4)')
     ap.add_argument('--out', default='')
     a = ap.parse_args(argv)
     try:
-        out = _json_safe(score(a.frame_log, a.task, a.allow_final_set))
+        out = _json_safe(score(a.frame_log, a.task, a.allow_final_set, a.esp_log or None))
     except (ValueError, KeyError, OSError) as exc:
         print('hil_o1_score:', exc, file=sys.stderr)
         print('#ket_qua,ma=2')
