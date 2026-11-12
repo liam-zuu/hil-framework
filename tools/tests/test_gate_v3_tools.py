@@ -228,6 +228,30 @@ def test_extra_fields_not_written(ds):
     rl.summary(d)
 
 
+@pytest.mark.parametrize('col', rl.GATE_COLS)
+def test_any_single_gate_cell_makes_a_gate_row(ds, col):
+    # GV3-R3-1 (Codex round 4, test gap): each gate column alone triggers the check; all empty does not
+    d, clock = ds
+    _open(d, clock)
+    rl.end(d, 'dat')                                                       # no gate: a legacy-style row
+    path = os.path.join(d, rl.TUNING)
+    rows = _rows(d)
+    rl.summary(d)                                                          # all gate cells empty: not checked
+    rows[-1][col] = 'x'
+    rl._write_all(path, rl.TUNING_COLS, rows)
+    with pytest.raises(rl.LogError):
+        rl.summary(d)
+
+
+def test_row_reader_ignores_meaningless_cells():
+    # GV3-R3-3 (Codex round 4, test gap): the reader side, on a row with junk in g1_u, g4_q, g4_u
+    row = dict(rl.gate_columns(_gate(completed='inconclusive')), g1_u='abc', g4_q='abc', g4_u='abc',
+               run_uid='S:1', platform='HW', run_outcome='chua_ket_luan')
+    g = rl.gate_from_row(row)
+    assert g['g1'].get('u') is None and g['g4']['q'] is None and g['g4']['u'] is None
+    rl.check_gate_rows([row])
+
+
 def test_read_gate_json_forms(tmp_path):
     g = _gate(e_trk_max=float('nan'))                        # NaN -> null, as the scorer writes
     a, b, c = (str(tmp_path / n) for n in ('a.json', 'b.json', 'c.json'))
