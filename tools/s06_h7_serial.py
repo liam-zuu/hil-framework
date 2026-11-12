@@ -24,6 +24,11 @@ T10 (spec S06 dòng T10, Y11, W10): chỉ báo số, không có ngưỡng.
     phần còn lại = 100 % − ISR − rảnh (vòng chính + vào/ra ngắt + sai số quy đổi; không gọi là "vòng
     chính"). Bất định tương đối của phần rảnh do hiệu chuẩn: 1/cal_n + 1/idle_pass (đếm nguyên, ±1
     vòng). Chi phí đo = Σn × ovh_cyc / f_danh_định (cặp DWT, mục 4.1).
+  * B3 (Liam 12/11, phiên THESIS local_694a2f03; `06_SPECS/2026-11-12_De_xuat_S06_B3_quy_doi_tai_F446_v1.md`
+    mục 3 (A)): cận dưới phần rảnh `idle_pct_lo` = % rảnh × (1 − bất định tương đối), không dưới 0;
+    cận trên tải `load_upper_pct` = 100 % − cận dưới phần rảnh (cột mỗi cửa sổ; tóm tắt: 100 − trung bình
+    các cận dưới, và `load_upper_pct_max_window`; có cho khối tải nặng và nhóm A khi có `--load-schedule`).
+    Công cụ không nhân hệ số F446 (2,67; 4,56) và không đọc vùng: việc đó của luận văn.
   * Đơn vị thời gian: H7 chia số chu kỳ cho SystemCoreClock danh định (480 MHz), win_ms đếm tick HAL của
     cùng đồng hồ, nên mọi tỉ lệ % đúng dù đồng hồ H7 lệch (trước 09/11 nhanh 0,64 %; từ 09/11 xung HSE/5 của
     ST-LINK, lệch ≤ 0,002 % theo `H7_CLOCK/2026-11-09_run04`, f thật ≈ 480 MHz, vẫn nằm trong dải mặc định dưới). µs của H7 là "µs danh định"; µs thật
@@ -158,6 +163,29 @@ def t10_blocks(ev: List[dict], all_blocks: bool = False):
     return blocks, span
 
 
+def idle_lower_pct(idle_pct: Optional[float], rel_unc: Optional[float], idle_pass: int) -> Optional[float]:
+    """B3 (S06 T10, Liam 12/11, THESIS local_694a2f03): lower bound of the idle share from the calibration
+    uncertainty, idle_pct × (1 − rel_unc), not below 0. idle_pass = 0 (no idle pass in the window): 0.
+    No calibration (idle_pct None): None."""
+    if idle_pct is None:
+        return None
+    if not idle_pass:
+        return 0.0
+    if rel_unc is None:
+        return None
+    return max(0.0, idle_pct * (1.0 - rel_unc))
+
+
+def load_upper(rows) -> dict:
+    """B3: L = 100 % − lower bound of the idle share. `load_upper_pct` = 100 − mean of the per-window lower
+    bounds (the windows have the same length, so this is the bound of the mean); `load_upper_pct_max_window`
+    = the largest per-window bound. None when a window has no bound (no calibration)."""
+    lo = [r['idle_pct_lo'] for r in rows]
+    if not lo or any(v is None for v in lo):
+        return dict(load_upper_pct=None, load_upper_pct_max_window=None)
+    return dict(load_upper_pct=100.0 - sum(lo) / len(lo), load_upper_pct_max_window=100.0 - min(lo))
+
+
 def t10_rows(blocks, f_real_mhz: Optional[float] = None):
     """X22, C1-15: `max_us_real_lo/hi` theo tần số đo của chính lượt, không có thì theo dải [478; 486] MHz."""
     win_rows, irq_rows = [], []
@@ -168,14 +196,16 @@ def t10_rows(blocks, f_real_mhz: Optional[float] = None):
         n_calls = sum(i['n'] for i in bl['irqs'])
         idle_pct = 100.0 * h['idle_us_est'] / win_us if h['cal_n'] else None
         isr_pct = 100.0 * h['isr_us'] / win_us
+        unc = (1.0 / h['cal_n'] + 1.0 / h['idle_pass']) if h['cal_n'] and h['idle_pass'] else None
+        lo = idle_lower_pct(idle_pct, unc, h['idle_pass'])
         win_rows.append(dict(window=k, line=h['line'], win_ms=h['win_ms'], isr_us=h['isr_us'],
                              isr_pct=isr_pct, idle_pass=h['idle_pass'], idle_us=h['idle_us_est'],
                              idle_pct=idle_pct,
                              rest_pct=None if idle_pct is None else 100.0 - isr_pct - idle_pct,
-                             idle_rel_unc=(1.0 / h['cal_n'] + 1.0 / h['idle_pass'])
-                             if h['cal_n'] and h['idle_pass'] else None,
+                             idle_rel_unc=unc,
                              cal_n=h['cal_n'], cal_cyc=h['cal_cyc'], ovh_cyc=h['ovh_cyc'],
-                             meas_cost_us=n_calls * h['ovh_cyc'] / F_NOMINAL_MHZ))
+                             meas_cost_us=n_calls * h['ovh_cyc'] / F_NOMINAL_MHZ,
+                             idle_pct_lo=lo, load_upper_pct=None if lo is None else 100.0 - lo))
         for i in bl['irqs']:
             irq_rows.append(dict(window=k, irq=i['irq'], count=i['n'], excl_us=i['excl_us'],
                                  gross_us='', max_us=i['max_us'],
@@ -226,7 +256,7 @@ def segment_means(win_rows) -> dict:
         if rows:
             idle = [r['idle_pct'] for r in rows if r['idle_pct'] is not None]
             out[seg] = dict(windows=len(rows), isr_pct=sum(r['isr_pct'] for r in rows) / len(rows),
-                            idle_pct=sum(idle) / len(idle) if idle else None)
+                            idle_pct=sum(idle) / len(idle) if idle else None, **load_upper(rows))
     return out
 
 
@@ -289,6 +319,7 @@ def t10_summary(blocks, win_rows, irq_rows, ev, span) -> dict:
     return dict(windows=len(win_rows), total_ms=tot_ms, isr_pct=mean('isr_pct'), idle_pct=mean('idle_pct'),
                 rest_pct=mean('rest_pct'), idle_rel_unc_max=max((r['idle_rel_unc'] for r in win_rows
                                                                  if r['idle_rel_unc'] is not None), default=None),
+                **load_upper(win_rows),
                 meas_cost_pct=100.0 * sum(r['meas_cost_us'] for r in win_rows) / (tot_ms * 1000.0) if tot_ms else None,
                 per_irq=sorted(per.values(), key=lambda p: -p['excl_us']),
                 gross_note='H7 chỉ in thời gian độc quyền; tổng gộp không có. Vào/ra ngắt: chưa đo.',

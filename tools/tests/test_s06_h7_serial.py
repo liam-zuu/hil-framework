@@ -192,3 +192,48 @@ def test_t10_no_pc_time_leaves_segment_empty(tmp_path):
 def test_t10_schedule_without_heavy(tmp_path):
     code, s, _ = t10_with_schedule(tmp_path, heavy=None)
     assert code == 0 and 'heavy' not in s['segments'] and s['segments'] == {}
+
+
+# B3 (S06 T10, Liam 12/11 at THESIS local_694a2f03): upper bound of the load L = 100 % - lower bound of the idle
+# share from the calibration uncertainty (1/cal_n + 1/idle_pass)
+UNC = 1 / 22500 + 1 / 900_000
+
+
+def test_t10_load_upper_per_window_and_summary():
+    ev = ser.parse_lines(make_log())
+    blocks, span = ser.t10_blocks(ev)
+    win, irq = ser.t10_rows(blocks)
+    w = win[0]
+    assert w['idle_pct_lo'] == pytest.approx(40.0 * (1 - UNC))
+    assert w['load_upper_pct'] == pytest.approx(60.0 + 40.0 * UNC)
+    assert w['load_upper_pct'] > 100.0 - w['idle_pct']                   # an upper bound, not the point value
+    s = ser.t10_summary(blocks, win, irq, ev, span)
+    assert s['load_upper_pct'] == pytest.approx(60.0 + 40.0 * UNC)
+    assert s['load_upper_pct_max_window'] == pytest.approx(60.0 + 40.0 * UNC)
+
+
+def test_load_upper_mean_max_and_missing():
+    rows = [dict(idle_pct_lo=30.0), dict(idle_pct_lo=40.0)]
+    assert ser.load_upper(rows) == dict(load_upper_pct=pytest.approx(65.0), load_upper_pct_max_window=70.0)
+    assert ser.load_upper(rows + [dict(idle_pct_lo=None)]) == dict(load_upper_pct=None,
+                                                                   load_upper_pct_max_window=None)
+    assert ser.load_upper([])['load_upper_pct'] is None
+
+
+def test_idle_lower_edge_cases():
+    assert ser.idle_lower_pct(None, None, 5) is None                     # no calibration
+    assert ser.idle_lower_pct(0.0, None, 0) == 0.0                       # no idle pass: load bound 100 %
+    assert ser.idle_lower_pct(1.0, 2.0, 1) == 0.0                        # never below 0
+    blocks, _ = ser.t10_blocks(ser.parse_lines(
+        [l.replace('idle_pass=900000 idle_us_est=4000000', 'idle_pass=0 idle_us_est=0') for l in make_log()]))
+    w = ser.t10_rows(blocks)[0][0]
+    assert w['idle_rel_unc'] is None and w['load_upper_pct'] == 100.0
+
+
+def test_t10_load_upper_heavy_block_and_cli(tmp_path):
+    code, s, rows = t10_with_schedule(tmp_path)
+    assert code == 0
+    for seg in ('heavy', 'nhom_a'):
+        assert s['segments'][seg]['load_upper_pct'] == pytest.approx(60.0 + 40.0 * UNC)
+    assert s['load_upper_pct'] == pytest.approx(60.0 + 40.0 * UNC)          # T10_summary.json from main()
+    assert 'idle_pct_lo' in rows.splitlines()[0] and 'load_upper_pct' in rows.splitlines()[0]
