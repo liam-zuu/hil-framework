@@ -163,3 +163,47 @@ REAL = r'D:\CLAUDE_THESIS\05_DATA\results\CLOSED_LOOP\2026-11-09_run14\pi\b1_AK1
 def test_real_hil_log_passes():
     assert c5.main(['--log', REAL, '--test', 'A-K1', '--expect-sha', 'b64095e', '--expect-env', 'wheels_lifted']) == 0
     assert c5.main(['--log', REAL, '--test', 'A-K1', '--expect-sha', '54b7269', '--expect-env', 'wheels_lifted']) == 1
+
+
+# UDP duplicates (Liam 12/11 CODE local_b80a58a2 "Cho sửa"): an identical copy marked 'duplicate' in the
+# segment file is dropped and recorded; it cannot be dropped without the segment file; a mark on a line
+# with no earlier equal line is an input error
+def _with_dup(tmp_path, k=300, seg=True, alter=False):
+    rows, last = _rows()
+    copy = dict(rows[k])
+    if alter:
+        copy['vx'] = '9.0'
+    rows.insert(k + 1, copy)
+    p = _write(tmp_path, rows, last, summary=lambda s: s['segments'][0].update(duplicates=1))
+    if seg:
+        with open(p + '.segments.csv', 'w', newline='', encoding='utf-8') as f:
+            w = csv.writer(f)
+            w.writerow(['row', 'log_seq', 'timestamp_us', 'segment', 'status'])
+            for i, r in enumerate(rows, start=1):
+                w.writerow([i, r['log_seq'], r['timestamp_us'], 0, 'duplicate' if i == k + 2 else 'ok'])
+    return p
+
+
+def test_identical_udp_duplicate_is_dropped_and_recorded(tmp_path, capsys):
+    assert _run(_with_dup(tmp_path)) == 0
+    out = capsys.readouterr().out
+    assert 'logger  DAT' in out and '1 identical UDP duplicate(s) dropped' in out
+
+
+def test_duplicate_without_segment_file_still_fails(tmp_path, capsys):
+    assert _run(_with_dup(tmp_path, seg=False)) == 1
+    assert 'no segment file' in capsys.readouterr().out
+
+
+def test_duplicate_mark_on_a_different_line_is_an_input_error(tmp_path, capsys):
+    assert _run(_with_dup(tmp_path, alter=True)) == 2
+    assert 'no earlier equal line' in capsys.readouterr().out
+
+
+REAL_DUP = r'D:\CLAUDE_THESIS\05_DATA\results\CLOSED_LOOP\2026-11-12_run01\pi\k1b.csv'
+
+
+@pytest.mark.skipif(not os.path.isfile(REAL_DUP), reason='HIL log of 12/11 with a UDP duplicate not on this machine')
+def test_real_log_with_udp_duplicate_passes():
+    assert c5.main(['--log', REAL_DUP, '--test', 'A-K1', '--expect-sha', '888eb48',
+                    '--expect-env', 'esp32-s3-devkitc-1']) == 0
