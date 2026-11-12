@@ -1,6 +1,6 @@
 """Gain over WiFi (L90, Liam 12/11): host test of the firmware module src/controller/gain_set.c
 (packet parsing, safety ranges, apply = the same field writes as fwsim_set_pid / fwsim_set_adrc with
-tune_ga.gains_for, read-back, %.9g round trip). Compiles fwsim/tests/gain_set_check.c with the fwsim
+tune_ga.gains_for, checked against fw_sim.c itself, read-back, %.9g round trip). Compiles fwsim/tests/gain_set_check.c with the fwsim
 firmware sources and shim (build_fwsim.py lists), runs it, and requires every check to pass.
 
 Firmware tree: $FWSIM_FW, else the default of build_fwsim.py (../AGV_FIRMWARE next to this repo).
@@ -36,7 +36,8 @@ def test_gain_set_checks(tmp_path):
             '-I', os.path.join(FWSIM, 'shim')] +
            sum((['-I', os.path.join(SRC, d)] for d in build_fwsim.FW_INCLUDES), []) +
            [os.path.join(SRC, f) for f in sources] +
-           [os.path.join(FWSIM, 'shim', 'fw_shim.c'), os.path.join(HERE, 'gain_set_check.c'), '-o', exe, '-lm'])
+           [os.path.join(FWSIM, 'shim', 'fw_shim.c'), os.path.join(FWSIM, 'fw_sim.c'),   # fwsim setters: parity check
+            os.path.join(HERE, 'gain_set_check.c'), '-o', exe, '-lm'])
     r = subprocess.run(cmd, capture_output=True, text=True)
     assert r.returncode == 0, f'gcc failed:\n{r.stderr}'
     assert 'gain_set.c' not in r.stderr, f'warnings in gain_set.c:\n{r.stderr}'
@@ -44,4 +45,4 @@ def test_gain_set_checks(tmp_path):
     lines = run.stdout.splitlines()
     fails = [l for l in lines if l.startswith('FAIL')]
     assert run.returncode == 0 and not fails, '\n'.join(fails) or run.stdout + run.stderr
-    assert sum(l.startswith('PASS') for l in lines) >= 40, run.stdout
+    assert sum(l.startswith('PASS') for l in lines) >= 75, run.stdout
