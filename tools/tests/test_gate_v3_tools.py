@@ -36,7 +36,9 @@ def test_hil_score_has_gate_block_g1_g2_decide(tmp_path):
     assert g['v_cmd_max'] == pytest.approx(0.729, abs=1e-3)
     js = H._json_safe(out)
     json.dumps(js)                                            # serialisable as hil_o1_score prints it
-    rl.validate_gate(js['gate_v3'])                           # and accepted by the RQ3 log
+    rl.validate_gate(js['gate_v3'], 'HIL')                    # and accepted by the RQ3 log for a HIL run
+    with pytest.raises(rl.LogError, match='on platform'):
+        rl.validate_gate(js['gate_v3'], 'HW')
 
 
 def write_k_frame_log(path, task, yaw, k0=300):
@@ -87,8 +89,8 @@ def _gate(decide=G.DECIDE_ALL, u_t=0.0, **kw):
     return H._json_safe(G.gate_v3(s, v_cmd_max=0.729, wz_cmd_max=1.634, u_t=u_t, decide=decide))
 
 
-def _open(d, clock):
-    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen')
+def _open(d, clock, platform='HW'):
+    rl.begin(d, 'S', 'A-PID', platform, 'PID', 'O1-F05', '0.5', 'screen')
     rl.step(d, 'run')
     clock[0] += dt.timedelta(seconds=60)
 
@@ -125,26 +127,41 @@ def test_no_dat_on_incomplete_gate_and_deciding_conditions(ds):
         rl.end(d, 'dat', gate=_gate(), results_dir='r')
     with pytest.raises(rl.LogError, match='disagrees'):                    # G3 certainly failed
         rl.end(d, 'chua_ket_luan', gate=_gate(e_trk_max=0.12), results_dir='r')
+    with pytest.raises(rl.LogError, match='on platform'):                  # GV3-R2-2: HW run, HIL deciding set
+        rl.end(d, 'chua_ket_luan', gate=_gate(decide=G.DECIDE_HIL, u_t=None), results_dir='r')
+    rl.end(d, 'chua_ket_luan', gate=_gate(completed='inconclusive'), results_dir='r')
+    _open(d, clock, 'HIL')
     with pytest.raises(rl.LogError, match='disagrees'):                    # GV3-2: HIL, G2 certain fail decides
         rl.end(d, 'chua_ket_luan', gate=_gate(decide=G.DECIDE_HIL, u_t=None, e_perp_max=0.2), results_dir='r')
-    rl.end(d, 'chua_ket_luan', gate=_gate(completed='inconclusive'), results_dir='r')
-    _open(d, clock)
+    with pytest.raises(rl.LogError, match='on platform'):                  # GV3-R2-2: HIL needs exactly g1, g2
+        rl.end(d, 'chua_ket_luan', gate=_gate(e_trk_max=0.5), results_dir='r')
     rl.end(d, 'chua_ket_luan', gate=_gate(decide=G.DECIDE_HIL, u_t=None, e_trk_max=0.5), results_dir='r')
     _open(d, clock)
     rl.end(d, 'hong_he_do', fail_cause='mat_khung', gate=_gate(e_trk_max=0.12), results_dir='r')
     assert [r['run_outcome'] for r in _rows(d)] == ['chua_ket_luan', 'chua_ket_luan', 'hong_he_do']
+    rl.summary(d)                                                          # the rows written by end pass
 
 
-def test_summary_refuses_dat_on_incomplete_gate(ds):
-    # GV3-1: a row written by hand (or by an older tool) with dat and an incomplete gate stops the summary
+@pytest.mark.parametrize('edit,match', [
+    (dict(run_outcome='dat'), 'no run is dat'),                            # GV3-1
+    (dict(g4_state='dat', g4_q='0.01', g4_u='0.0', run_outcome='dat'), 'does not compute G4'),   # GV3-R2-1
+    (dict(g2_q='0.2', g2_state='dat'), 'recomputed from q, U'),           # GV3-R2-1: state lied about
+    (dict(gate_decide='g1,g3,g4,g5'), 'G1 and G2'),                        # GV3-R2-2
+    (dict(gate_decide='g1,g2'), 'on platform'),                            # HW row with the HIL set
+    (dict(gate_version='gate_v3_full'), 'only'),
+    (dict(g3_u='-0.01'), 'negative'),
+    (dict(g3_q='abc'), 'not a number'),
+])
+def test_summary_recomputes_gate_rows(ds, edit, match):
+    # GV3-1, GV3-R2-1: summary recomputes every gate row from q, U, does not trust the state columns
     d, clock = ds
     _open(d, clock)
     rl.end(d, 'chua_ket_luan', gate=_gate(completed='inconclusive'), results_dir='r')
     path = os.path.join(d, rl.TUNING)
     rows = _rows(d)
-    rows[-1]['run_outcome'] = 'dat'
+    rows[-1].update(edit)
     rl._write_all(path, rl.TUNING_COLS, rows)
-    with pytest.raises(rl.LogError, match='incomplete gate'):
+    with pytest.raises(rl.LogError, match=match):
         rl.summary(d)
 
 
@@ -160,6 +177,18 @@ def test_summary_refuses_dat_on_incomplete_gate(ds):
     (lambda g: g['g5'].update(threshold=10.0), 'threshold'),
     (lambda g: g['g1'].update(q='false'), 'g1'),
     (lambda g: g['g4'].update(state='dat'), 'g4'),
+    # GV3-R2-3: a missing key is not 'unknown'; booleans by type
+    (lambda g: (g['g3'].pop('u'), g['g3'].update(state='chua_ket_luan'),
+                g.update(outcome='chua_ket_luan', outcome_decide='chua_ket_luan', any_certain_fail=False)), 'without'),
+    (lambda g: g['g2'].pop('q'), 'without'),
+    (lambda g: g.pop('complete'), 'complete: missing'),
+    (lambda g: g.update(complete=0), 'not a boolean'),
+    (lambda g: g.update(any_certain_fail=1), 'not a boolean'),
+    (lambda g: g['g2'].update(threshold=True), 'threshold'),
+    (lambda g: g['g1'].update(q=True), 'g1'),                          # JSON g1 q is a string
+    # GV3-R2-2: G1, G2 always decide
+    (lambda g: g.update(decide=['g1', 'g3', 'g4', 'g5']), 'G1 and G2'),
+    (lambda g: g.update(decide=['g1', 'g2', 2]), 'decide'),
 ])
 def test_validate_gate_rejects_inconsistent_json(patch, match):
     # GV3-5: the JSON is checked and recomputed, its outcome fields are not trusted

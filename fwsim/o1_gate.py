@@ -157,7 +157,8 @@ def _cond(q, threshold, u):
 
 def evaluate_outcomes(g: dict, decide: Iterable[str]) -> dict:
     """outcome, outcome_decide, complete, any_certain_fail of a gate dict with states g1..g5."""
-    decide = [c for c in CONDS if c in set(decide)]
+    dset = set(decide)                                   # once: an iterator is consumed (GV3-R2-5)
+    decide = [c for c in CONDS if c in dset]
     computed = [c for c in CONDS if g[c]['state'] != G4_STATE]
     dec = [c for c in decide if c in computed]
     return dict(outcome=run_outcome(g[c]['state'] for c in COMPUTED),
@@ -171,9 +172,10 @@ def gate_v3(summary: dict, *, v_cmd_max: float, wz_cmd_max: float, u_t: Optional
             decide: Iterable[str] = DECIDE_ALL, note: str = '') -> dict:
     """G1, G2, G3, G5 of one run from an evaluator summary; G4 'chua_tinh'. Units: m, deg, s.
     u_t: bound of the time offset of the command start [s], or None = not known (G3, G5 inconclusive)."""
-    decide = tuple(c for c in CONDS if c in set(decide))
-    if not decide or set(decide) - set(CONDS):
-        raise ValueError(f'decide: a non-empty subset of {CONDS}')
+    raw = list(decide)                                   # once: an iterator is consumed (GV3-R2-5)
+    if not raw or set(raw) - set(CONDS) or not {'g1', 'g2'} <= set(raw):
+        raise ValueError(f'decide {raw!r}: a subset of {CONDS} that holds g1 and g2')
+    decide = tuple(c for c in CONDS if c in set(raw))
     if u_t is None:
         u3 = u5 = float('nan')
     else:

@@ -113,6 +113,17 @@ def test_decide_subset_hil():
     assert g['g3']['state'] == 'khong_dat' and g['outcome'] == 'khong_dat' and g['outcome_decide'] == 'dat'
     with pytest.raises(ValueError):
         G.gate_v3(_summary(), v_cmd_max=0.7, wz_cmd_max=1.6, u_t=0.0, decide=())
+    with pytest.raises(ValueError, match='g1 and g2'):                   # GV3-R2-2: G1, G2 always decide
+        G.gate_v3(_summary(), v_cmd_max=0.7, wz_cmd_max=1.6, u_t=0.0, decide=('g1', 'g3'))
+
+
+def test_decide_iterator_keeps_every_condition():
+    # GV3-R2-5: an iterator is read once; G2 certainly failing must still decide
+    s = _summary(e_perp_max=0.2)
+    g = G.gate_v3(s, v_cmd_max=0.7, wz_cmd_max=1.6, u_t=None, decide=iter(G.DECIDE_HIL))
+    assert g['decide'] == ['g1', 'g2'] and g['outcome_decide'] == 'khong_dat' and g['any_certain_fail']
+    ev = G.evaluate_outcomes(g, iter(['g1', 'g2']))
+    assert ev['outcome_decide'] == 'khong_dat' and ev['any_certain_fail']
 
 
 def test_gate_k_task_heading_key_and_missing_values():
