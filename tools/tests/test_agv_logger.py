@@ -1122,3 +1122,16 @@ def test_receive_error_is_not_reported_as_closed(tmp_path, monkeypatch, capsys):
     assert al.main(['--out', str(out), '--duration', '5']) == 4
     summ = json.loads((tmp_path / 'run.csv.summary.json').read_text(encoding='utf-8'))
     assert summ['status'] == 'failed' and summ['stop_reason'] == 'error' and 'boom' in summ['recv_error']
+
+
+def test_us_lines_go_to_events_as_is_strict():
+    """L95 (AGV feat/us-swb, src/ultrasonic/us_state.c us_format_line): '#us' and '#us_end' lines are
+    DUT events kept verbatim, between data lines, without breaking the data stream (strict mode)."""
+    core = al.LoggerCore(strict=True)
+    us_start = '#us,ev=start,on=1,first_seq=2,line_drop=0'
+    us_change = '#us,ev=change,on=0,first_seq=3,line_drop=0'
+    us_end = '#us_end,on=0,changes=1,blk_ticks=0,cut_ticks=0,ticks=2,last_data_seq=3,line_drop=0'
+    out = feed_all(core, [dut_line(1), us_start, dut_line(2), us_change, dut_line(3), us_end])
+    assert [o[0] for o in out] == ['data', 'dut_event', 'data', 'dut_event', 'data', 'dut_event']
+    assert out[1][1] == us_start and out[3][1] == us_change and out[5][1] == us_end
+    assert core.n_dut_events == 3
