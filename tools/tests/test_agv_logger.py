@@ -1126,11 +1126,14 @@ def test_receive_error_is_not_reported_as_closed(tmp_path, monkeypatch, capsys):
 
 def test_us_lines_go_to_events_as_is_strict():
     """L95 (AGV feat/us-swb, src/ultrasonic/us_state.c us_format_line): '#us' and '#us_end' lines are
-    DUT events kept verbatim, between data lines, without breaking the data stream (strict mode)."""
+    DUT events kept verbatim, between data lines (86-column DUT lines of AGV feat/wifi-gain, strict mode),
+    without breaking the data stream; the firmware sends each line 3 times (logger_task)."""
     core = al.LoggerCore(strict=True)
-    us_start = '#us,ev=start,on=1,first_seq=2,line_drop=0'
-    us_change = '#us,ev=change,on=0,first_seq=3,line_drop=0'
-    us_end = '#us_end,on=0,changes=1,blk_ticks=0,cut_ticks=0,ticks=2,last_data_seq=3,line_drop=0'
+    us_start = '#us,ev=start,boot=0000abcd,on=1,swb=1000,first_seq=2,line_drop=0'
+    us_change = '#us,ev=change,boot=0000abcd,on=0,swb=2000,first_seq=3,line_drop=0'
+    us_end = ('#us_end,boot=0000abcd,on=0,swb=2000,changes=1,blk_ticks=0,cut_ticks=0,ticks=2,'
+              'last_data_seq=3,line_drop=0')
+    assert len(dut_line(1).split(',')) == 86
     out = feed_all(core, [dut_line(1), us_start, dut_line(2), us_change, dut_line(3), us_end])
     assert [o[0] for o in out] == ['data', 'dut_event', 'data', 'dut_event', 'data', 'dut_event']
     assert out[1][1] == us_start and out[3][1] == us_change and out[5][1] == us_end
