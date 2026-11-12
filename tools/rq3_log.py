@@ -19,7 +19,11 @@ Commands (the operator types them while working; every time stamp is the PC cloc
                                          (--wait: waiting for the machine, also in t_operator_wait_s)
   pause / resume                         other work in between: not counted (S05 §3.1)
   end    --outcome dat|khong_dat|chua_ket_luan|hong_he_do [--e-perp-max M] [--completed 0|1]
-         [--fail-cause X] [--results-dir D]   close the run, append its row
+         [--fail-cause X] [--results-dir D] [--gate-json F]   close the run, append its row;
+                                         F = scorer output with a gate_v3 block (fwsim/o1_gate.py):
+                                         its q, U, state per condition go to the g<n>_* columns, and
+                                         the outcome is checked against it when it may decide
+                                         (12/11, tune stop gate v3; the logs need "migrate" once)
   cancel / status                        drop the open run / show it. cancel only before the "run"
                                          step (S05 §3.3: every started run counts, EA-6); time of the
                                          steps already logged goes to m7_dev_effort_log.csv
@@ -73,7 +77,12 @@ TUNING_NEW = (['run_uid', 'campaign', 'script_run_id', 'gain_set_id', 'speed_mps
                'run_outcome', 'fail_cause', 'rule_version', 'fw_hash']
               + ['g_' + g for g in GAINS]
               + ['t_operator_wait_s', 't_machine_s', 'wall_start', 'wall_end', 'n_sim_evals'])
-TUNING_COLS = TUNING_OLD + TUNING_NEW
+# tune stop gate v3 (dossier 00_OVERVIEW/2026-11-12_De_xuat_cong_dung_tune_bam_huong_van_toc_v3.md section 6,
+# CG2-12; Liam 12/11 CODE local_87282b70 "làm ngay đi"): per run the measured maximum q, its bound U and
+# the state of each condition, so stopping, the S05 4.4 ranking and gate_result can be recomputed
+GATE_CONDS = ('g1', 'g2', 'g3', 'g4', 'g5')
+GATE_COLS = ['gate_version', 'gate_usable'] + [f'{g}_{x}' for g in GATE_CONDS for x in ('q', 'u', 'state')]
+TUNING_COLS = TUNING_OLD + TUNING_NEW + GATE_COLS
 EFFORT_OLD = ['ngay', 'bat_dau', 'ket_thuc', 'gio', 'buoc', 'giai_doan', 'mot_lan_hay_thich_nghi', 'dut',
               'ghi_chu', 'chien_dich', 'lap_lai']
 EFFORT_COLS = EFFORT_OLD + ['khoan', 'nhan']
@@ -351,11 +360,61 @@ def segment_totals(segments: List[dict]) -> dict:
     return {**{f't_{k}_s': v for k, v in tot.items()}, 't_operator_wait_s': wait}
 
 
+def read_gate_json(path: str) -> dict:
+    """The gate block of a scorer output (key 'gate_v3', hil_o1_score.py) or a bare gate dict."""
+    try:
+        with open(path, encoding='utf-8') as f:
+            d = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise LogError(f'--gate-json {path!r}: {exc}')
+    g = d.get('gate_v3', d) if isinstance(d, dict) else None
+    if not isinstance(g, dict) or not str(g.get('version', '')).startswith('gate_v3'):
+        raise LogError(f'--gate-json {path!r}: no gate_v3 block (fwsim/o1_gate.py)')
+    return g
+
+
+def _num(x) -> str:
+    return '' if x is None or isinstance(x, bool) else (repr(float(x)) if isinstance(x, (int, float)) else str(x))
+
+
+def gate_columns(gate: dict) -> dict:
+    """GATE_COLS of one run from a gate dict (fwsim/o1_gate.gate_v3). q of g1 is the evaluator's
+    'completed' (true / false / inconclusive); g4 has no q, u while it is not computed."""
+    out = {'gate_version': gate['version'], 'gate_usable': str(int(bool(gate.get('usable_for_decision'))))}
+    for g in GATE_CONDS:
+        c = gate.get(g) or {}
+        q = c.get('q')
+        out[f'{g}_q'] = str(q) if g == 'g1' and q is not None else _num(q)
+        out[f'{g}_u'] = _num(c.get('u'))
+        out[f'{g}_state'] = c.get('state', '')
+    return out
+
+
+def check_outcome_vs_gate(outcome: str, gate: dict) -> None:
+    """A run outcome typed by the operator must agree with the gate the scorer computed, when that gate
+    may decide (usable_for_decision). hong_he_do is decided outside the gate (O1 3.5): not checked.
+    With G4 not computed (complete False) the gate outcome is over G1, G2, G3, G5 only: khong_dat
+    there is khong_dat of the run; chua_ket_luan there rules out dat; dat there says nothing yet."""
+    if outcome == 'hong_he_do' or not gate.get('usable_for_decision'):
+        return
+    g = gate.get('outcome')
+    if gate.get('complete'):
+        ok = outcome == g
+    else:
+        ok = {'khong_dat': outcome == 'khong_dat',
+              'chua_ket_luan': outcome in ('khong_dat', 'chua_ket_luan')}.get(g, True)
+    if not ok:
+        raise LogError(f'--outcome {outcome} disagrees with the gate ({gate.get("conditions")}: {g}); '
+                       f'check the scoring')
+
+
 def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Optional[float] = None,
-        fail_cause: str = '', results_dir: str = '', notes: str = '') -> dict:
+        fail_cause: str = '', results_dir: str = '', notes: str = '', gate: Optional[dict] = None) -> dict:
     run = _require_open(ds)
     if outcome not in OUTCOMES:
         raise LogError(f'--outcome one of {OUTCOMES}')
+    if gate is not None:
+        check_outcome_vs_gate(outcome, gate)
     if outcome == 'hong_he_do' and not fail_cause:
         raise LogError('hong_he_do needs --fail-cause (S05 §6.1)')
     if run.get('paused_from') is not None:
@@ -369,6 +428,8 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
         row['completed'] = str(int(completed))
     if e_perp_max is not None:
         row['e_perp_max_m'] = f'{e_perp_max:.4f}'
+    if gate is not None:
+        row.update(gate_columns(gate))
     if notes:
         row['notes'] = (row.get('notes', '') + ' ' + notes).strip()
     append_row(os.path.join(ds, TUNING), TUNING_COLS, row)
@@ -1020,6 +1081,7 @@ def main(argv=None) -> int:
     e.add_argument('--outcome', required=True, choices=OUTCOMES)
     e.add_argument('--completed', type=int, choices=(0, 1))
     e.add_argument('--e-perp-max', type=float)
+    e.add_argument('--gate-json', default='', help='scorer output with a gate_v3 block (hil_o1_score.py --out)')
     for name in ('fail-cause', 'results-dir', 'notes'):
         e.add_argument('--' + name, default='')
     m = sub.add_parser('machine')
@@ -1092,7 +1154,8 @@ def main(argv=None) -> int:
                 print(run['row']['run_uid'], 'paused' if run.get('paused_from') is not None else 'running',
                       json.dumps(segment_totals(segs)))
         elif a.cmd == 'end':
-            row = end(ds, a.outcome, a.completed, a.e_perp_max, a.fail_cause, a.results_dir, a.notes)
+            row = end(ds, a.outcome, a.completed, a.e_perp_max, a.fail_cause, a.results_dir, a.notes,
+                      gate=read_gate_json(a.gate_json) if a.gate_json else None)
             print('row', row['run_uid'], {k: row[f't_{k}_s'] for k in STEPS}, 'wait', row['t_operator_wait_s'])
         elif a.cmd == 'machine':
             row = machine(ds, a.campaign, a.controller, a.script_run_id, a.results_dir, a.n_sim_evals, a.t_machine_s,

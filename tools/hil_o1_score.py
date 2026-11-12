@@ -28,6 +28,9 @@ before t_deadline - one period and the evaluator says completed 'false', the res
 'inconclusive' (completed_raw keeps 'false'); log_end_t, log_covers_deadline are always written.
 run_hil.py --o1 --finite-run keeps the zeros and the log to T_cmd + o1_tasks.O1_TAIL_S (2.5 s).
 
+gate_v3 (12/11/2026, fwsim/o1_gate.py, tune stop gate v3): G1, G2, G3, G5 states of the run,
+G4 not computed yet; usable_for_decision False on HIL until t = 0 is mapped to the ESP32
+run_active edge (dossier v3 5.2).
 Validity (CODE L50, STATUS_CODE CG4) is NOT decided here: the manifest counts (MISO CRC bad,
 empty frames) are copied out; the run rule is tools/s06_frames_decode.py on the same log.
 
@@ -51,6 +54,7 @@ for _p in (os.path.join(HERE, '..', 'rpi5'), os.path.join(HERE, '..', 'fwsim'), 
         sys.path.insert(0, _p)
 import protocol as P                                                     # noqa: E402
 import o1_lanes                                                          # noqa: E402
+import o1_gate                                                           # noqa: E402
 from o1_feasibility import Path8, Schedule, evaluate_v7                  # noqa: E402
 from o1_tasks import FIG8, FINAL_SET                                     # noqa: E402
 
@@ -120,6 +124,18 @@ def score(path, task, allow_final_set=False):
         out, _ = o1_lanes.evaluate_k(log, task)
     out['tv_duty_h7_1khz'] = out.pop('tv_duty')                          # not the S05 4.7 tv_duty (docstring)
     log_coverage(out, float(log['t'][-1]) if len(log['t']) else -1.0, period)
+    # gate v3 (o1_gate.py): true plant state, so U_p = U_psi = 0; t = 0 is the plant RUN step, not yet
+    # mapped to the ESP32 run_active edge (dossier v3 5.2): G3, G5 reported, not used to decide
+    if task in FIG8:
+        v_max, wz_max = o1_gate.fig8_cmd_max(Schedule(FIG8[task]))
+        theta_key = 'e_theta_cmd_max_deg'
+    else:
+        v_max, wz_max = o1_gate.k_cmd_max(o1_lanes.KSchedule(task))
+        theta_key = 'e_theta_start_max_deg'
+    out['gate_v3'] = o1_gate.gate_v3(
+        out, v_cmd_max=v_max, wz_cmd_max=wz_max, theta_key=theta_key, usable_for_decision=False,
+        note='HIL: t = 0 at the plant RUN step, not mapped to the ESP32 run_active edge (dossier v3 5.2); '
+             'G3, G5 reported only; G4 not computed yet')
     mc = manifest.get('miso_check') or {}
     out.update(frame_log=os.path.basename(path), k0=k0, t0_src=t0_src, frames_scored=int(len(state) - k0),
                start_pose=[float(v) for v in state[k0, 4:7]], plant=manifest.get('plant'),
