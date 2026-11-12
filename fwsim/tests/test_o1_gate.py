@@ -36,6 +36,15 @@ def test_tri_state(q, u, state):
     assert G.tri_state(q, 0.10, u) == state
 
 
+@pytest.mark.parametrize('completed,q', [(True, 'true'), (False, 'false'), ('true', 'true'), ('false', 'false'),
+                                         ('inconclusive', 'inconclusive'), (None, 'inconclusive')])
+def test_g1_q_is_always_a_string(completed, q):
+    # GV3-R3-2: the gate's g1 q is the string the RQ3 log accepts, also for a bool 'completed'
+    g = G.gate_v3(dict(completed=completed, e_perp_max=0.01, e_trk_max=0.01, e_theta_cmd_max_deg=1.0),
+                  v_cmd_max=0.7, wz_cmd_max=1.6, u_t=0.0)
+    assert g['g1']['q'] == q and g['g1']['state'] == G.g1_state(completed)
+
+
 def test_g1_and_outcome_order():
     assert [G.g1_state(c) for c in ('true', 'false', 'inconclusive', True, False, None)] == \
         ['dat', 'khong_dat', 'chua_ket_luan', 'dat', 'khong_dat', 'chua_ket_luan']

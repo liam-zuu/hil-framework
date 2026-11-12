@@ -181,7 +181,9 @@ def gate_v3(summary: dict, *, v_cmd_max: float, wz_cmd_max: float, u_t: Optional
     else:
         u3 = u_p + v_cmd_max * u_t
         u5 = u_psi_deg + math.degrees(wz_cmd_max * u_t)
-    g = dict(g1=dict(q=summary.get('completed'), state=g1_state(summary.get('completed'))),
+    c1 = summary.get('completed')
+    q1 = {'dat': 'true', 'khong_dat': 'false'}.get(g1_state(c1), 'inconclusive')   # always a string (GV3-R3-2)
+    g = dict(g1=dict(q=q1, state=g1_state(c1)),
              g2=_cond(summary.get('e_perp_max'), D, u_p),
              g3=_cond(summary.get('e_trk_max'), D, u3),
              g4=dict(state=G4_STATE),

@@ -151,6 +151,8 @@ def test_no_dat_on_incomplete_gate_and_deciding_conditions(ds):
     (dict(gate_version='gate_v3_full'), 'only'),
     (dict(g3_u='-0.01'), 'negative'),
     (dict(g3_q='abc'), 'not a number'),
+    (dict(gate_version='', g2_q='0.2', g2_state='dat', run_outcome='dat'), 'only'),   # GV3-R3-1
+    (dict(gate_version='', gate_decide='', run_outcome='dat'), 'only'),              # any gate cell left
 ])
 def test_summary_recomputes_gate_rows(ds, edit, match):
     # GV3-1, GV3-R2-1: summary recomputes every gate row from q, U, does not trust the state columns
@@ -196,6 +198,34 @@ def test_validate_gate_rejects_inconsistent_json(patch, match):
     patch(g)
     with pytest.raises(rl.LogError, match=match):
         rl.validate_gate(g)
+
+
+def test_bool_completed_from_the_scorer_end_to_end(ds, tmp_path):
+    # GV3-R3-2: gate_v3 output (completed as a Python bool, O1 v5 evaluate) -> JSON -> end -> summary
+    d, clock = ds
+    for completed, outcome in ((True, 'khong_dat'), (False, 'hong_he_do')):
+        f = str(tmp_path / f'score_{completed}.json')
+        with open(f, 'w', encoding='utf-8') as fh:
+            json.dump(dict(gate_v3=_gate(completed=completed, e_trk_max=0.12)), fh)
+        g = rl.read_gate_json(f)
+        assert g['g1']['q'] == ('true' if completed else 'false')
+        _open(d, clock)
+        rl.end(d, outcome, fail_cause='mat_khung' if outcome == 'hong_he_do' else '', results_dir='r', gate=g)
+    assert [r['g1_q'] for r in _rows(d)] == ['true', 'false']
+    rl.summary(d)
+
+
+def test_extra_fields_not_written(ds):
+    # GV3-R3-3: fields without meaning (g1 U, g4 q, U) are not written, so summary reads every row end wrote
+    d, clock = ds
+    g = _gate(completed='inconclusive')
+    g['g1']['u'] = 'khong_ap_dung'
+    g['g4'].update(q='x', u='y')
+    _open(d, clock)
+    rl.end(d, 'chua_ket_luan', gate=g, results_dir='r')
+    r = _rows(d)[-1]
+    assert r['g1_u'] == r['g4_q'] == r['g4_u'] == ''
+    rl.summary(d)
 
 
 def test_read_gate_json_forms(tmp_path):

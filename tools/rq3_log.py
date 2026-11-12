@@ -474,9 +474,9 @@ def gate_from_row(row: dict) -> dict:
         except ValueError:
             raise LogError(f"{row.get('run_uid')}: gate value {s!r} is not a number")
     g = {'version': row.get('gate_version'), 'decide': [c for c in row.get('gate_decide', '').split(',') if c]}
-    for c in GATE_CONDS:
-        g[c] = {'q': row.get(f'{c}_q') if c == 'g1' else num(row.get(f'{c}_q')),
-                'u': num(row.get(f'{c}_u')), 'state': row.get(f'{c}_state')}
+    for c in GATE_CONDS:                    # g1 has no U, g4 no q, U in gate_v3_g1235: not read (GV3-R3-3)
+        g[c] = {'q': row.get(f'{c}_q') if c == 'g1' else None if c == 'g4' else num(row.get(f'{c}_q')),
+                'u': None if c in ('g1', 'g4') else num(row.get(f'{c}_u')), 'state': row.get(f'{c}_state')}
     return g
 
 
@@ -499,9 +499,10 @@ def outcome_vs_gate(outcome: str, ev: dict, decide) -> Optional[str]:
 def check_gate_rows(tun: List[dict]) -> None:
     """GV3-1, GV3-R2-1: every logged row that carries a gate is recomputed from its q, U (version,
     deciding set of its platform, thresholds, states); its run_outcome must agree as at `end`.
-    Rows without gate columns (before gate v3, or written without --gate-json) are not checked."""
+    Rows whose gate columns are ALL empty (before gate v3, or written without --gate-json) are not
+    checked; any non-empty gate cell makes the row a gate row, with a supported version (GV3-R3-1)."""
     for r in tun:
-        if not r.get('gate_version'):
+        if not any(r.get(c) for c in GATE_COLS):
             continue
         g = gate_from_row(r)
         try:
@@ -519,11 +520,11 @@ def gate_columns(gate: dict, gate_sha256: str = '') -> dict:
     'completed' (true / false / inconclusive); g4 has no q, u while it is not computed."""
     out = {'gate_version': gate['version'], 'gate_decide': ','.join(gate['decide']),
            'gate_json_sha256': gate_sha256}
-    for g in GATE_CONDS:
+    for g in GATE_CONDS:                    # only fields that mean something are written (GV3-R3-3)
         c = gate.get(g) or {}
         q = c.get('q')
-        out[f'{g}_q'] = str(q).lower() if g == 'g1' and q is not None else _num(q)
-        out[f'{g}_u'] = _num(c.get('u'))
+        out[f'{g}_q'] = '' if g == 'g4' else str(q) if g == 'g1' else _num(q)
+        out[f'{g}_u'] = '' if g in ('g1', 'g4') else _num(c.get('u'))
         out[f'{g}_state'] = c.get('state', '')
     return out
 
