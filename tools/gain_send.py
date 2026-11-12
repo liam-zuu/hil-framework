@@ -111,8 +111,8 @@ def normalize(ctrl: str, gains: dict) -> dict:
             raise UsageError(f'gain {k}={v!r} is not a number')
         try:
             x = float(v)
-        except (TypeError, ValueError):
-            raise UsageError(f'gain {k}={v!r} is not a number')
+        except (TypeError, ValueError, OverflowError):          # OverflowError: JSON integer like 10**400
+            raise UsageError(f'gain {k}={v!r} is not a number that fits a float')
         if not math.isfinite(x):
             raise UsageError(f'gain {k}={v!r} is not finite')
         g[name] = f32(x)
@@ -149,8 +149,8 @@ def load_file(path: str):
     if 'gains' in d:
         if not isinstance(d['gains'], dict):
             raise UsageError(f'{path}: "gains" must be an object')
-        f_id = d.get('id')
-        return d.get('ctrl'), (check_id(f_id, path) if f_id is not None else None), d['gains']
+        # a key "id" that is present must be a valid id, even null (Codex round 2, L90-11)
+        return d.get('ctrl'), (check_id(d['id'], path) if 'id' in d else None), d['gains']
     return None, None, d
 
 

@@ -231,11 +231,22 @@ def test_file_forms_and_conflicts(fake, tmp_path, capsys):
     '{"ctrl": "PID", "id": 3, "gains": []}',                      # gains not an object
     '{"ctrl": "PID", "id": 3, "id": 4, "gains": {}}',             # duplicate JSON key
     '{"ctrl": "PID", "id": 3, "gains": {"kp_xy": 1, "kp_xy": 2}}',
+    '{"ctrl": "PID", "id": null, "gains": {}}',                   # id key present but null (round 2)
+    '{"ctrl": "PID", "id": 3, "gains": {"kp_xy": 1' + '0' * 400 + '}}',   # integer too big for a float
 ])
 def test_bad_files_are_usage_errors(fake, tmp_path, capsys, body):
     f = tmp_path / 'gain_bad.json'
     f.write_text(body)
     assert gs.main(args(fake, '--file', str(f))) == 1
+    assert gs.main(args(fake, '--file', str(f), '--id', '3')) == 1           # --id does not hide a bad file id
+    assert fake.received == []
+
+
+def test_null_id_with_full_gains_is_refused(fake, tmp_path, capsys):
+    """Codex round 2 (L90-11): "id": null must not be read as 'no id' and then filled by --id."""
+    f = tmp_path / 'gain_null_id.json'
+    f.write_text(json.dumps(dict(ctrl='PID', id=None, gains={k: float(v) for k, v in PID.items()})))
+    assert gs.main(args(fake, '--file', str(f), '--id', '3')) == 1
     assert fake.received == []
 
 

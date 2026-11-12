@@ -76,9 +76,9 @@ int main(void) {
     r = parse(ADRC_OK, &g);
     check(r == GAIN_OK && g.ctrl == CTRL_ADRC && g.v[1] == 35.0f, "parse_adrc", gain_err_str(r));
 
-    expect_err("err_header",        "#gain_sett,v=1,id=7,ctrl=PID,kp_xy=1,ki_xy=0,kp_wz=1,ki_wz=0,pos_kp=1,pos_ki=0,k_psi=1", GAIN_ERR_FORMAT);
-    expect_err("err_v2",            "#gain_set,v=2,id=7,ctrl=PID,kp_xy=1,ki_xy=0,kp_wz=1,ki_wz=0,pos_kp=1,pos_ki=0,k_psi=1", GAIN_ERR_FORMAT);
-    expect_err("err_no_v",          "#gain_set,id=7,ctrl=PID,kp_xy=1,ki_xy=0,kp_wz=1,ki_wz=0,pos_kp=1,pos_ki=0,k_psi=1", GAIN_ERR_FORMAT);
+    expect_err("err_header",        "#gain_sett,v=1,tx=5,id=7,ctrl=PID,kp_xy=1,ki_xy=0,kp_wz=1,ki_wz=0,pos_kp=1,pos_ki=0,k_psi=1", GAIN_ERR_FORMAT);
+    expect_err("err_v2",            "#gain_set,v=2,tx=5,id=7,ctrl=PID,kp_xy=1,ki_xy=0,kp_wz=1,ki_wz=0,pos_kp=1,pos_ki=0,k_psi=1", GAIN_ERR_FORMAT);
+    expect_err("err_no_v",          "#gain_set,tx=5,id=7,ctrl=PID,kp_xy=1,ki_xy=0,kp_wz=1,ki_wz=0,pos_kp=1,pos_ki=0,k_psi=1", GAIN_ERR_FORMAT);
     expect_err("err_id0",           "#gain_set,v=1,tx=5,id=0,ctrl=PID,kp_xy=1,ki_xy=0,kp_wz=1,ki_wz=0,pos_kp=1,pos_ki=0,k_psi=1", GAIN_ERR_FORMAT);
     expect_err("err_id_big",        "#gain_set,v=1,tx=5,id=2147483648,ctrl=PID,kp_xy=1,ki_xy=0,kp_wz=1,ki_wz=0,pos_kp=1,pos_ki=0,k_psi=1", GAIN_ERR_FORMAT);
     expect_err("err_id_sign",       "#gain_set,v=1,tx=5,id=+7,ctrl=PID,kp_xy=1,ki_xy=0,kp_wz=1,ki_wz=0,pos_kp=1,pos_ki=0,k_psi=1", GAIN_ERR_FORMAT);
@@ -115,6 +115,14 @@ int main(void) {
     memcpy(nul, PID_OK, L);
     nul[20] = '\0';
     check(parse_n(nul, L, &g) == GAIN_ERR_FORMAT, "err_embedded_nul", "packet with a 0 byte accepted");
+    /* NUL after a complete valid packet (Codex round 2, L90-R2-1): a C-string parser would see only
+     * the valid prefix; the byte check must reject it */
+    char nul2[200];
+    memcpy(nul2, PID_OK, L);
+    nul2[L] = '\0';
+    nul2[L + 1] = 'x';
+    check(parse_n(nul2, L + 2, &g) == GAIN_ERR_FORMAT, "err_nul_after_valid_packet",
+          "valid packet followed by NUL + byte accepted");
 
     /* ── round-1 fixes (Codex L90-7, L90-8, L90-10, L90-12) ── */
     r = parse(PID_OK, &g);
@@ -272,12 +280,14 @@ int main(void) {
         }
         fwsim_set_param("pos_kp", w[4]); fwsim_set_param("pos_ki", w[5]); fwsim_set_param("k_psi", w[6]);
         adrc_controller_t aa = *vel_ctrl_adrc();
+        float aa_pos[2] = { pos_params()->kp, pos_params()->ki }, aa_psi = heading_params()->k_psi;
         vel_ctrl_init(); vel_ctrl_set_mode(CTRL_ADRC);
         gain_set_t ga = { .id = 4, .ctrl = CTRL_ADRC };
         memcpy(ga.v, w, sizeof w);
         r = gain_set_apply(&ga);
         const adrc_controller_t *ab = vel_ctrl_adrc();
-        same = r == GAIN_OK && pos_params()->kp == w[4] && pos_params()->ki == w[5] && heading_params()->k_psi == w[6];
+        same = r == GAIN_OK && pos_params()->kp == aa_pos[0] && pos_params()->ki == aa_pos[1] &&
+               heading_params()->k_psi == aa_psi && aa_pos[0] == w[4] && aa_pos[1] == w[5] && aa_psi == w[6];
         const adrc_axis_t *xa[3] = { &aa.vx, &aa.vy, &aa.wz }, *xb[3] = { &ab->vx, &ab->vy, &ab->wz };
         for (int i = 0; i < 3; i++)
             same = same && xa[i]->kp == xb[i]->kp && xa[i]->eso.beta1 == xb[i]->eso.beta1 &&
