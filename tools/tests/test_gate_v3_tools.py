@@ -1,11 +1,14 @@
-"""Tune stop gate v3 in the tools: hil_o1_score.py (gate_v3 block), o1_lanes K tasks, rq3_log.py
-(GATE_COLS, --gate-json, outcome check). 12/11/2026, Liam CODE local_87282b70 "làm ngay đi"."""
+"""Tune stop gate v3 in the tools: hil_o1_score.py (gate_v3 block), rq3_log.py (GATE_COLS, --gate-json,
+outcome check, summary guard). 12/11/2026, Liam CODE local_87282b70 "làm ngay đi"; after Codex round 1
+(GV3-1, 2, 3, 5, 6, 8; Liam "Cho sửa 7 chỗ")."""
 import csv
 import datetime as dt
 import json
+import math
 import os
 import sys
 
+import numpy as np
 import pytest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -15,29 +18,57 @@ for _p in (HERE, os.path.join(HERE, '..'), os.path.join(HERE, '..', '..', 'fwsim
 import hil_o1_score as H                                     # noqa: E402
 import o1_gate as G                                          # noqa: E402
 import o1_lanes as L                                         # noqa: E402
+import protocol as P                                         # noqa: E402
 import rq3_log as rl                                         # noqa: E402
-from test_hil_o1_score import write_frame_log, k_log         # noqa: E402
+from test_hil_o1_score import write_frame_log, k_log, DT     # noqa: E402
 
 
-def test_hil_score_has_gate_block_not_for_decision(tmp_path):
+def test_hil_score_has_gate_block_g1_g2_decide(tmp_path):
     p = str(tmp_path / 'run.npz')
     write_frame_log(p, 'O1-F05')
     out = H.score(p, 'O1-F05')
     g = out['gate_v3']
-    assert g['version'] == G.GATE_VERSION and g['usable_for_decision'] is False
+    assert g['version'] == G.GATE_VERSION and g['decide'] == ['g1', 'g2'] and g['u_t'] is None
     assert g['theta_key'] == 'e_theta_cmd_max_deg'
     assert g['g1']['state'] == 'dat' and g['g2']['state'] == 'dat' and g['g4']['state'] == 'chua_tinh'
+    assert g['g3']['state'] == g['g5']['state'] == 'chua_ket_luan'          # U_t not known on HIL
     assert g['g3']['q'] == pytest.approx(out['e_trk_max']) and g['g5']['q'] == pytest.approx(out['e_theta_cmd_max_deg'])
     assert g['v_cmd_max'] == pytest.approx(0.729, abs=1e-3)
-    json.dumps(H._json_safe(out))                            # serialisable as hil_o1_score prints it
+    js = H._json_safe(out)
+    json.dumps(js)                                            # serialisable as hil_o1_score prints it
+    rl.validate_gate(js['gate_v3'])                           # and accepted by the RQ3 log
 
 
-def test_gate_on_k_task_uses_start_heading():
-    out, _ = L.evaluate_k(k_log('O1-K1'), 'O1-K1')
-    v, wz = G.k_cmd_max(L.KSchedule('O1-K1'))
-    g = G.gate_v3(out, v_cmd_max=v, wz_cmd_max=wz, theta_key='e_theta_start_max_deg')
-    assert wz == 0.0 and g['g5']['q'] == pytest.approx(out['e_theta_start_max_deg'])
-    assert g['g5']['state'] == 'dat'
+def write_k_frame_log(path, task, yaw, k0=300):
+    """Frame log of a K run: the car on the command point (k_log) with a constant yaw offset."""
+    lg = k_log(task)
+    pose = np.column_stack([lg['pose'][:, :2], np.full(len(lg['t']), yaw)])
+    pose = np.vstack([np.zeros((k0, 3)), pose])
+    v = np.vstack([np.zeros((k0, 3)), lg['v_true']])
+    n = len(pose)
+    mosi = np.zeros((n, 40), dtype=np.uint8)
+    for k in range(n):
+        st = [0.0] * 4 + [pose[k, 0], pose[k, 1], pose[k, 2], v[k, 0], v[k, 1], v[k, 2]]
+        on = k >= k0 + 3
+        mosi[k] = np.frombuffer(P.encode_state(st, traj_ref=(0.3, 0.0, 0.0) if on else None,
+                                               traj_flags=P.TRAJ_VALID if on else 0, seq=k), dtype=np.uint8)
+    manifest = dict(period_us=1000, steps=n, plant='MecanumPlant', miso_check=dict(crc_bad=0, empty=0),
+                    lifecycle=dict(outcome='completed', transitions=[dict(step=0, t=0, phase='ARM'),
+                                                                     dict(step=k0, t=0.3, phase='RUN')]))
+    np.savez(path, manifest=np.array(json.dumps(manifest)), mosi=mosi, miso=np.zeros((n, 40), dtype=np.uint8))
+
+
+@pytest.mark.parametrize('task', L.K_TASKS)
+def test_hil_score_k_task_uses_start_heading(tmp_path, task):
+    # GV3-8: through the K branch of H.score, with a yaw that is not zero
+    p = str(tmp_path / 'k.npz')
+    yaw = math.radians(3.0)
+    write_k_frame_log(p, task, yaw)
+    out = H.score(p, task, allow_final_set=True)
+    g = out['gate_v3']
+    assert g['theta_key'] == 'e_theta_start_max_deg' and g['wz_cmd_max'] == 0.0
+    assert g['g5']['q'] == pytest.approx(out['e_theta_start_max_deg']) == pytest.approx(3.0, abs=0.05)
+    assert g['v_cmd_max'] == pytest.approx(L.KSchedule(task).vmax)
 
 
 # ── rq3_log ──
@@ -50,10 +81,10 @@ def ds(tmp_path, monkeypatch):
     return d, clock
 
 
-def _gate(usable=True, **kw):
+def _gate(decide=G.DECIDE_ALL, u_t=0.0, **kw):
     s = dict(completed='true', status='ok', e_perp_max=0.02, e_trk_max=0.03, e_theta_cmd_max_deg=3.0)
     s.update(kw)
-    return G.gate_v3(s, v_cmd_max=0.729, wz_cmd_max=1.634, usable_for_decision=usable)
+    return H._json_safe(G.gate_v3(s, v_cmd_max=0.729, wz_cmd_max=1.634, u_t=u_t, decide=decide))
 
 
 def _open(d, clock):
@@ -70,71 +101,112 @@ def _rows(d):
 def test_gate_columns_written(ds):
     d, clock = ds
     _open(d, clock)
-    rl.end(d, 'khong_dat', gate=_gate(e_trk_max=0.12))
+    rl.end(d, 'khong_dat', gate=_gate(e_trk_max=0.12), results_dir='res/x', gate_sha256='ab' * 32)
     r = _rows(d)[-1]
-    assert r['gate_version'] == G.GATE_VERSION and r['gate_usable'] == '1'
+    assert r['gate_version'] == G.GATE_VERSION and r['gate_decide'] == 'g1,g2,g3,g4,g5'
+    assert r['gate_json_sha256'] == 'ab' * 32 and r['results_dir'] == 'res/x'
     assert r['g1_q'] == 'true' and r['g1_state'] == 'dat'
     assert float(r['g3_q']) == pytest.approx(0.12) and r['g3_state'] == 'khong_dat' and float(r['g3_u']) == 0.0
     assert r['g4_state'] == 'chua_tinh' and r['g4_q'] == '' and r['g4_u'] == ''
     assert float(r['g5_q']) == pytest.approx(3.0) and r['g5_state'] == 'dat'
 
 
-def test_outcome_checked_against_gate(ds):
+def test_gate_needs_results_dir(ds):
     d, clock = ds
     _open(d, clock)
-    with pytest.raises(rl.LogError, match='disagrees with the gate'):
-        rl.end(d, 'dat', gate=_gate(e_trk_max=0.12))                       # G3 certainly failed
-    with pytest.raises(rl.LogError, match='disagrees with the gate'):
-        rl.end(d, 'dat', gate=_gate(completed='inconclusive'))               # chua_ket_luan rules out dat
-    rl.end(d, 'chua_ket_luan', gate=_gate(completed='inconclusive'))
-    _open(d, clock)
-    rl.end(d, 'dat', gate=_gate())                                          # G4 missing: dat not refuted
-    _open(d, clock)
-    rl.end(d, 'hong_he_do', fail_cause='mat_khung', gate=_gate(e_trk_max=0.12))   # lost runs: not checked
-    _open(d, clock)
-    rl.end(d, 'dat', gate=_gate(usable=False, e_trk_max=0.12))             # HIL report-only gate: not checked
-    assert [r['run_outcome'] for r in _rows(d)] == ['chua_ket_luan', 'dat', 'hong_he_do', 'dat']
+    with pytest.raises(rl.LogError, match='results-dir'):                  # GV3-6
+        rl.end(d, 'khong_dat', gate=_gate(e_trk_max=0.12))
 
 
-def test_complete_gate_needs_equal_outcome(ds):
+def test_no_dat_on_incomplete_gate_and_deciding_conditions(ds):
     d, clock = ds
-    g = dict(_gate(), complete=True, outcome='dat')
     _open(d, clock)
-    with pytest.raises(rl.LogError):
-        rl.end(d, 'khong_dat', gate=g)
-    rl.end(d, 'dat', gate=g)
+    with pytest.raises(rl.LogError, match='not complete'):                 # GV3-1: G4 missing
+        rl.end(d, 'dat', gate=_gate(), results_dir='r')
+    with pytest.raises(rl.LogError, match='disagrees'):                    # G3 certainly failed
+        rl.end(d, 'chua_ket_luan', gate=_gate(e_trk_max=0.12), results_dir='r')
+    with pytest.raises(rl.LogError, match='disagrees'):                    # GV3-2: HIL, G2 certain fail decides
+        rl.end(d, 'chua_ket_luan', gate=_gate(decide=G.DECIDE_HIL, u_t=None, e_perp_max=0.2), results_dir='r')
+    rl.end(d, 'chua_ket_luan', gate=_gate(completed='inconclusive'), results_dir='r')
+    _open(d, clock)
+    rl.end(d, 'chua_ket_luan', gate=_gate(decide=G.DECIDE_HIL, u_t=None, e_trk_max=0.5), results_dir='r')
+    _open(d, clock)
+    rl.end(d, 'hong_he_do', fail_cause='mat_khung', gate=_gate(e_trk_max=0.12), results_dir='r')
+    assert [r['run_outcome'] for r in _rows(d)] == ['chua_ket_luan', 'chua_ket_luan', 'hong_he_do']
+
+
+def test_summary_refuses_dat_on_incomplete_gate(ds):
+    # GV3-1: a row written by hand (or by an older tool) with dat and an incomplete gate stops the summary
+    d, clock = ds
+    _open(d, clock)
+    rl.end(d, 'chua_ket_luan', gate=_gate(completed='inconclusive'), results_dir='r')
+    path = os.path.join(d, rl.TUNING)
+    rows = _rows(d)
+    rows[-1]['run_outcome'] = 'dat'
+    rl._write_all(path, rl.TUNING_COLS, rows)
+    with pytest.raises(rl.LogError, match='incomplete gate'):
+        rl.summary(d)
+
+
+@pytest.mark.parametrize('patch,match', [
+    (lambda g: g.update(outcome_decide='dat', outcome='dat', any_certain_fail=False), 'recomputed'),
+    (lambda g: g['g3'].update(state='dat'), 'recomputed from q, U'),
+    (lambda g: g['g3'].update(q=None, u=-1, state='dat'), 'negative'),
+    (lambda g: g['g3'].update(q='0.1'), 'not null or a finite number'),
+    (lambda g: g['g2'].update(u=True), 'not null or a finite number'),
+    (lambda g: g.pop('g2'), 'g2: missing'),
+    (lambda g: g.update(version='gate_v3_other'), 'only'),
+    (lambda g: g.update(decide=[]), 'decide'),
+    (lambda g: g['g5'].update(threshold=10.0), 'threshold'),
+    (lambda g: g['g1'].update(q='false'), 'g1'),
+    (lambda g: g['g4'].update(state='dat'), 'g4'),
+])
+def test_validate_gate_rejects_inconsistent_json(patch, match):
+    # GV3-5: the JSON is checked and recomputed, its outcome fields are not trusted
+    g = _gate(e_trk_max=0.12)
+    patch(g)
+    with pytest.raises(rl.LogError, match=match):
+        rl.validate_gate(g)
 
 
 def test_read_gate_json_forms(tmp_path):
-    g = H._json_safe(_gate(e_trk_max=float('nan')))                        # NaN -> null, as the scorer writes
+    g = _gate(e_trk_max=float('nan'))                        # NaN -> null, as the scorer writes
     a, b, c = (str(tmp_path / n) for n in ('a.json', 'b.json', 'c.json'))
-    json.dump(dict(task='O1-F05', gate_v3=g), open(a, 'w', encoding='utf-8'))
-    json.dump(g, open(b, 'w', encoding='utf-8'))
-    json.dump(dict(task='O1-F05'), open(c, 'w', encoding='utf-8'))
+    for path, obj in ((a, dict(task='O1-F05', gate_v3=g)), (b, g), (c, dict(task='O1-F05'))):
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(obj, f)
     assert rl.read_gate_json(a) == rl.read_gate_json(b) == g
     with pytest.raises(rl.LogError, match='no gate_v3 block'):
         rl.read_gate_json(c)
+    rl.validate_gate(g)
     cols = rl.gate_columns(g)
     assert cols['g3_q'] == '' and cols['g3_state'] == 'chua_ket_luan'
 
 
-def test_migrate_adds_gate_columns_and_keeps_rows(ds):
+def test_migrate_adds_gate_columns_and_keeps_every_cell(ds):
+    # GV3-8: every old cell, with values that tell columns apart
     d, clock = ds
     _open(d, clock)
-    rl.end(d, 'dat')
+    rl.end(d, 'khong_dat', notes='ghi chú, có dấu phẩy', fail_cause='', results_dir='res/a')
     path = os.path.join(d, rl.TUNING)
     old_cols = [c for c in rl.TUNING_COLS if c not in rl.GATE_COLS]
     rows = _rows(d)
-    rl._write_all(path, old_cols, rows)                                     # a log of the 11/11 columns
+    for i, c in enumerate(old_cols):
+        rows[0][c] = rows[0][c] or f'v{i}_{c}'
+    rl._write_all(path, old_cols, rows)                                    # a log of the 11/11 columns
     assert rl.migrate(d)[rl.TUNING] == 'migrated'
     new = _rows(d)
-    assert list(new[0]) == rl.TUNING_COLS and new[0]['run_uid'] == rows[0]['run_uid'] and new[0]['g3_state'] == ''
+    assert list(new[0]) == rl.TUNING_COLS and len(new) == 1
+    assert all(new[0][c] == rows[0][c] for c in old_cols)
+    assert all(new[0][c] == '' for c in rl.GATE_COLS)
 
 
 def test_cli_end_with_gate_json(ds, tmp_path):
     d, clock = ds
     f = str(tmp_path / 'score.json')
-    json.dump(dict(gate_v3=H._json_safe(_gate())), open(f, 'w', encoding='utf-8'))
+    with open(f, 'w', encoding='utf-8') as fh:
+        json.dump(dict(gate_v3=_gate(e_trk_max=0.12)), fh)
     _open(d, clock)
-    assert rl.main(['--dataset', d, 'end', '--outcome', 'dat', '--gate-json', f]) == 0
-    assert _rows(d)[-1]['g2_state'] == 'dat'
+    assert rl.main(['--dataset', d, 'end', '--outcome', 'khong_dat', '--gate-json', f, '--results-dir', 'r']) == 0
+    r = _rows(d)[-1]
+    assert r['g3_state'] == 'khong_dat' and r['gate_json_sha256'] == rl.sha256_file(f)

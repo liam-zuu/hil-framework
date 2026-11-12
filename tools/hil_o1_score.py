@@ -133,9 +133,9 @@ def score(path, task, allow_final_set=False):
         v_max, wz_max = o1_gate.k_cmd_max(o1_lanes.KSchedule(task))
         theta_key = 'e_theta_start_max_deg'
     out['gate_v3'] = o1_gate.gate_v3(
-        out, v_cmd_max=v_max, wz_cmd_max=wz_max, theta_key=theta_key, usable_for_decision=False,
-        note='HIL: t = 0 at the plant RUN step, not mapped to the ESP32 run_active edge (dossier v3 5.2); '
-             'G3, G5 reported only; G4 not computed yet')
+        out, v_cmd_max=v_max, wz_cmd_max=wz_max, theta_key=theta_key, u_t=None, decide=o1_gate.DECIDE_HIL,
+        note='HIL: t = 0 at the plant RUN step, not mapped to the ESP32 run_active edge (dossier v3 5.2): '
+             'U_t not known, G3, G5 reported only (G1, G2 decide); G4 not computed yet')
     mc = manifest.get('miso_check') or {}
     out.update(frame_log=os.path.basename(path), k0=k0, t0_src=t0_src, frames_scored=int(len(state) - k0),
                start_pose=[float(v) for v in state[k0, 4:7]], plant=manifest.get('plant'),
