@@ -86,6 +86,13 @@ int main(void) {
     check(us_format_line(NULL, 10, US_EV_START, &s, 1, 0) < 0, "NULL buffer -> error");
     check(us_format_line(buf, sizeof(buf), US_EV_START, NULL, 1, 0) < 0, "NULL run -> error");
 
+    /* (d) queue room before an event goes in (L95-R2-1) */
+    check(us_queue_need(US_EV_START) == 2,  "start needs 2 slots (event + data line)");
+    check(us_queue_need(US_EV_CHANGE) == 2, "change needs 2 slots");
+    check(us_queue_need(US_EV_END) == 4,    "end needs 4 slots (event + 3 #run_end)");
+    check(us_queue_need(9) == 0,            "unknown event -> 0 (not pushed)");
+    check(us_queue_need(-1) == 0,           "negative event -> 0");
+
     printf("%d pass, %d fail\n", n_pass, n_fail);
     return n_fail ? 1 : 0;
 }

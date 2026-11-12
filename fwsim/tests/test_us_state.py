@@ -39,10 +39,21 @@ def test_us_state_checks(tmp_path):
         if REQUIRE:
             pytest.fail(why + ' (FWSIM_REQUIRE=1)')
         pytest.skip(why)
+    # Codex L95-R2-3: git must succeed on the firmware tree itself (not a parent repository); with
+    # FWSIM_REQUIRE=1 a tree that is not its own git root is a failure, otherwise it is reported as such.
+    top = subprocess.run(['git', '-C', FW, 'rev-parse', '--show-toplevel'], capture_output=True, text=True)
     head = subprocess.run(['git', '-C', FW, 'rev-parse', '--short', 'HEAD'], capture_output=True, text=True)
     dirty = subprocess.run(['git', '-C', FW, 'status', '--porcelain', '--untracked-files=no'],
                            capture_output=True, text=True)
-    print(f'firmware tree {FW} HEAD {head.stdout.strip()} dirty={int(bool(dirty.stdout.strip()))}')
+    git_ok = (top.returncode == 0 and head.returncode == 0 and dirty.returncode == 0 and
+              os.path.normcase(os.path.abspath(top.stdout.strip())) == os.path.normcase(FW))
+    if git_ok:
+        print(f'firmware tree {FW} HEAD {head.stdout.strip()} dirty={int(bool(dirty.stdout.strip()))}')
+    elif REQUIRE:
+        pytest.fail(f'firmware tree {FW} is not its own git root (git rc {top.returncode}, {head.returncode}, '
+                    f'{dirty.returncode}; top {top.stdout.strip()!r}): source not identified (FWSIM_REQUIRE=1)')
+    else:
+        print(f'firmware tree {FW}: source NOT identified by git (copy or parent repository)')
     exe = str(tmp_path / 'us_state_check.exe')
     cmd = ['gcc', '-std=gnu11', '-O2', '-Wall', '-Wextra', '-I', US, '-I', IB,
            os.path.join(US, 'us_state.c'), os.path.join(HERE, 'us_state_check.c'), '-o', exe]
@@ -53,4 +64,4 @@ def test_us_state_checks(tmp_path):
     lines = run.stdout.splitlines()
     fails = [l for l in lines if l.startswith('FAIL')]
     assert run.returncode == 0 and not fails, '\n'.join(fails) or run.stdout + run.stderr
-    assert sum(l.startswith('PASS') for l in lines) >= 32, run.stdout
+    assert sum(l.startswith('PASS') for l in lines) >= 37, run.stdout
