@@ -18,6 +18,13 @@
  *   max_wait_excess: after a speed-up, (first edge - SetOmega time) - new half period [ticks]
  *
  *   encgen_sim <scenario> <seed>
+ *
+ * Profile mode (RS-4 oracle, L98, 13/11/2026): `encgen_sim profile <seed> < file` reads
+ *   <n>
+ *   <tick> <omega0> <omega1> <omega2> <omega3>     (n lines, ticks increasing)
+ * and calls EncoderGen_SetOmega for every wheel at each given tick (the time the H7 main
+ * loop applies a frame), omega as given (no scenario sign). Runs to the last tick + 50 ms
+ * and prints every decoded count change: E <wheel> <tick> <count>, then the W lines.
  */
 #include <math.h>
 #include <stdio.h>
@@ -43,6 +50,12 @@ static double   ideal[4];
 static long     wait_from[4];
 static uint32_t wait_hp[4];
 static long     wait_excess_max[4];
+
+/* profile mode */
+static int      prof_mode;
+static long     prof_n, prof_i;
+static long    *prof_t;
+static double (*prof_w)[4];
 
 static double scenario(const char *s, double t)
 {
@@ -92,6 +105,7 @@ static void edge(int w, long tick, double omega)
     int step = (d == 1) ? 1 : (d == 3) ? -1 : 0;   /* d == 2: lost step, counted as 0 */
     step *= SIGN[w];
     count[w] += step;
+    if (prof_mode && step != 0) printf("E %d %ld %ld\n", w, tick, count[w]);
     if (step != 0 && fabs(omega) > 0.3 && (step > 0) != (omega > 0)) rev[w]++;
     if (wait_from[w] >= 0) {
         long ex = (tick - wait_from[w]) - (long)wait_hp[w];
@@ -123,6 +137,20 @@ int main(int argc, char **argv)
     if (argc != 3) { fprintf(stderr, "usage: encgen_sim <scenario> <seed>\n"); return 2; }
     const char *sc = argv[1];
     srand((unsigned)atoi(argv[2]));
+    if (!strcmp(sc, "profile")) {
+        prof_mode = 1;
+        if (scanf("%ld", &prof_n) != 1 || prof_n < 1) { fprintf(stderr, "profile: bad n\n"); return 2; }
+        prof_t = malloc(sizeof(long) * (size_t)prof_n);
+        prof_w = malloc(sizeof(double[4]) * (size_t)prof_n);
+        if (!prof_t || !prof_w) return 2;
+        for (long i = 0; i < prof_n; i++) {
+            if (scanf("%ld %lf %lf %lf %lf", &prof_t[i], &prof_w[i][0], &prof_w[i][1], &prof_w[i][2],
+                      &prof_w[i][3]) != 5 || (i > 0 && prof_t[i] <= prof_t[i - 1]) || prof_t[i] < 0) {
+                fprintf(stderr, "profile: bad line %ld\n", i + 1);
+                return 2;
+            }
+        }
+    }
     for (int w = 0; w < 4; w++) {
         H[w].Instance = &T[w];
         T[w].CNT = (uint32_t)(rand() & 0xFFFF);
@@ -189,8 +217,8 @@ int main(int argc, char **argv)
     }
 #endif
 
-    long n = (long)(duration(sc) * 1e6);
-    long next_frame = rand() % 300;
+    long n = prof_mode ? prof_t[prof_n - 1] + 50000 : (long)(duration(sc) * 1e6);
+    long next_frame = prof_mode ? prof_t[0] : rand() % 300;
     double omega[4] = { 0 };
     EncoderGenDebug_t dbg[4];
     for (long tick = 0; tick < n; tick++) {
@@ -200,7 +228,7 @@ int main(int argc, char **argv)
             for (int w = 0; w < 4; w++) {
                 int8_t dir0 = dbg[w].dir;
                 uint32_t hp0 = dbg[w].half_period;
-                omega[w] = WSIGN[w] * scenario(sc, tick * 1e-6);
+                omega[w] = prof_mode ? prof_w[prof_i][w] : WSIGN[w] * scenario(sc, tick * 1e-6);
                 T[w].SR = flags[w];
                 EncoderGen_SetOmega((uint8_t)w, (float)omega[w]);
                 flags[w] &= T[w].SR;
@@ -216,7 +244,8 @@ int main(int argc, char **argv)
                     wait_hp[w] = d1[w].half_period;
                 }
             }
-            next_frame = (tick / 1000 + 1) * 1000 + rand() % 300;
+            if (prof_mode) next_frame = (++prof_i < prof_n) ? prof_t[prof_i] : -1;
+            else           next_frame = (tick / 1000 + 1) * 1000 + rand() % 300;
         }
         /* timers */
         for (int w = 0; w < 4; w++) {

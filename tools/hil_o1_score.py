@@ -36,7 +36,8 @@ mapped to the plant step (tools/hil_edge_map.py): t of frame k = (k - a) x perio
 U_t = the mapping bound, all five conditions decide; t0_src 'esp32_run_active_edge', edge_map block
 with offset_ms = edge - RUN step (the "chênh" of O1 3.4). Without --esp-log, or when the mapping is
 refused: t = 0 at the RUN step as before, U_t unknown, G3, G5 inconclusive, G4 reported (decide G1, G2;
-O1 v11.9 3.5). The mapping is a two-sided bracket (count side early, PWM side late; Codex round 1, L97).
+O1 v11.9 3.5). The mapping (L98) brackets the edge from the encoder counts read at t_now by AGV firmware
+2c02641 or later in FW_COUNTS_AT_TICK (logs of older firmware are refused), the PWM side as a cross-check.
 Validity (CODE L50, STATUS_CODE CG4) is NOT decided here: the manifest counts (MISO CRC bad,
 empty frames) are copied out; the run rule is tools/s06_frames_decode.py on the same log.
 
@@ -125,7 +126,8 @@ def score(path, task, allow_final_set=False, esp_log=None):
     # RS-4: t = 0 at the ESP32 run_active edge mapped to the plant step, when the ESP32 log maps
     em = dict(ok=False, reason='no --esp-log')
     if esp_log:
-        em = hil_edge_map.map_edge(state[:, 0:4], duty, k_run, hil_edge_map.read_esp_log(esp_log), period)
+        em = hil_edge_map.map_edge(state[:, 0:4], duty, k_run, hil_edge_map.read_esp_log(esp_log), period,
+                                   hil_edge_map.frame_send_times(path))
         em['esp_log'] = os.path.basename(esp_log)
     if em['ok']:
         a = float(em['edge_step'])
