@@ -15,6 +15,14 @@ Section numbers below are those of S04 v5.
       track error; g2 = (f1 - D) / D; pymoo G <= 0. A run_error is run once more in a new
       process for diagnosis (attempt 2, column 'cause' left for CODE); the candidate then
       gets g1 = number of runs, f1 = f2 = 1e6, status run_error; the GA goes on.
+      S04 v6.2-v6.3 (gate G1-G5, CS-23, SC-8, RS2-8; SC3-3; Liam 14/11 CODE_R134 local_eb9f3b5c
+      "duyet goi sua code fix/r134-answers"): three more constraints g3 = (max e_trk_max - D) / D,
+      g4 = (max e_bao_max - D) / D, g5 = (max e_theta_cmd_max_deg - 7.5) / 7.5, max over every run of
+      the evaluation; e_bao_max from fwsim/o1_gate_eval.evaluate_fig8 (it calls evaluate_v7
+      unchanged, so every older field keeps its value). A run_error run, or a run whose e_perp_max,
+      e_trk_max, e_bao_max or e_theta_cmd_max_deg is missing or not finite, takes 1e6 for that
+      quantity, flagged per run in evals.csv (pen_<quantity> = 1); history.csv has pen_f1 and
+      n_pen_runs. G must be finite before pymoo sees it (else the run stops).
   4.2 GA seeds 1-5, plant seed 1 (s03_doe.SEED). Hypervolume per generation on the feasible
       non-dominated set of that generation's population, reference (D, 10 x f2 of the default
       gains at the middle mu), points on or beyond the reference counted, HV 0 when none.
@@ -73,6 +81,8 @@ sys.path.insert(0, HERE)
 import fwsim                 # noqa: E402
 import o1_feasibility as o1  # noqa: E402
 import s03_doe as s3         # noqa: E402
+import o1_gate as og         # noqa: E402  (THETA_MAX_DEG of G5)
+import o1_gate_eval as oge   # noqa: E402  (G4 e_bao_max; evaluate_v7 inside, unchanged)
 from plant_blob import git_blob, same_plant   # noqa: E402  (rpi5/ is on sys.path through fwsim)
 
 D = o1.D                      # m, O1 v7 (temporary)
@@ -103,9 +113,15 @@ PYMOO_CV = ("core/individual.py:29 cv_ieq default func=np.sum, eps 0, no scale, 
             "by RankAndCrowding first, the rest filled by increasing CV; algorithms/moo/nsga2.py:23-77 binary "
             "tournament: if either is infeasible the smaller CV wins (random on a tie, 39-48), else dominance "
             "then crowding (50-75)")
+THETA_MAX_DEG = og.THETA_MAX_DEG    # deg, G5 (O1 v11.8 3.5; S04 v6.2 g5)
+# S04 v6.2 SC-8 / v6.3 RS2-8: the run quantities replaced by PENALTY when missing, not finite or run_error,
+# each with its own flag column pen_<quantity> in evals.csv (names fixed by CODE, S04 v6.3 section 3)
+PEN_KEYS = ('e_perp_max', 'e_trk_max', 'e_bao_max', 'e_theta_cmd_max_deg')
+PEN_COLS = ['pen_' + k for k in PEN_KEYS]
+N_CONSTR = 5                  # g1 .. g5 (S04 v6.2)
 EVAL_COLS = ['controller', 'ga_seed', 'gen', 'cand_id', 'v', 'mu', 'attempt', 'status', 'completed', 'e_perp_max',
              'tv_duty', 'sat_frac', 't_end', 'e_theta_lane_max_deg', 'e_theta_cmd_max_deg', 'ds_absmax', 'e_trk_max',
-             'log_sha256', 'cause', 'error']
+             'e_bao_max'] + PEN_COLS + ['log_sha256', 'cause', 'error']
 
 
 # ── small helpers ────────────────────────────────────────────────────────────────────
@@ -306,36 +322,102 @@ class Evaluator:
         rows, error = [], False
         for mu in self.mus:
             for v in self.speeds:
-                row, log = s3.safe_run(self.fw, self.path, self.ctrl, g, v, mu)
-                self._rec(ga_seed, gen, cand, v, mu, 1, row, log)
+                row, log = safe_run_gate(self.fw, self.path, self.ctrl, g, v, mu)
+                self._rec(ga_seed, gen, cand, v, mu, 1, row, log, **run_values(row)[1])
                 rows.append((mu, v, row))
                 if row['status'] == 'run_error':
                     error = True
                     try:                     # section 3: once more in a new process, for diagnosis only
                         again = s3.run_in_new_process(self.dll, [(self.ctrl, g, v, mu)], self.work)[0]
+                        # diagnosis only: s03_doe's evaluator (no e_bao_max), so pen_e_bao_max = 1 here
                         self._rec(ga_seed, gen, cand, v, mu, 2, again['row'], None,
                                   log_sha256=(hashlib.sha256(json.dumps(again['digest'], sort_keys=True).encode())
-                                              .hexdigest() if again.get('digest') else ''))
+                                              .hexdigest() if again.get('digest') else ''),
+                                  **run_values(again['row'])[1])
                     except Exception as exc:  # noqa: BLE001
                         self._rec(ga_seed, gen, cand, v, mu, 2, dict(status='diagnosis_failed'), None,
-                                  error=f'{type(exc).__name__}: {exc}')
+                                  error=f'{type(exc).__name__}: {exc}', **run_values(dict(status='run_error'))[1])
         return score(rows, error)
 
 
+def run_gate(fw, path, ctrl, g, v, mu):
+    """s03_doe.run_one with the gate evaluator (S04 v6.2: G4 needs e_bao_max): the same simulation,
+    checks and fields, the summary of o1_gate_eval.evaluate_fig8, which runs evaluate_v7 unchanged and
+    adds e_bao_max. Returns (row, log); raises on a DLL / NaN error, as run_one."""
+    sch = o1.Schedule(v)
+    p = fwsim.plant_params(argparse.Namespace(ground='traction', mu=mu))
+    log = fwsim.simulate(fw, sch.setpoint, sch.Tcmd + o1.T_LATE, p, seed=s3.SEED, mode=ctrl, imu=dict(s3.IMU),
+                         **s3.sim_kwargs(fw, ctrl, g))
+    for k in ('pose', 'v_true', 'duty', 'pwm'):
+        if not np.all(np.isfinite(log[k])):
+            raise FloatingPointError(f'non-finite {k} in the log')
+    res, _, _ = oge.evaluate_fig8(log, path, sch, lsum=p.lx + p.ly)
+    val = fwsim.run_validity(log)
+    if val['run_bad'] == 1:
+        raise RuntimeError(f"pose reset mid-run in fwsim ({val['run_bad_reason']})")
+    row = {k: res[k] for k in s3.RUN_COLS[5:] if k in res}
+    row.update(pos_reset_mid=val['pos_reset_mid'], e_bao_max=res['e_bao_max'])
+    return row, log
+
+
+def safe_run_gate(fw, path, ctrl, g, v, mu):
+    """run_gate, or a 'run_error' row (S03 section 4, S04 section 3) with the reason."""
+    try:
+        return run_gate(fw, path, ctrl, g, v, mu)
+    except Exception as exc:                 # noqa: BLE001 (any DLL / numeric / evaluator failure)
+        return dict(status='run_error', completed='', error=f'{type(exc).__name__}: {exc}'), None
+
+
+def _finite(x):
+    """float(x) when it is a finite number, else None ('' and None are missing)."""
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def run_values(row):
+    """({quantity: value}, {pen_<quantity>: 0 / 1}) of one run for PEN_KEYS (S04 v6.2 SC-8, v6.3 RS2-8):
+    a run_error run, or a value missing or not finite, gives PENALTY with its flag at 1. A flagged value
+    is never evidence of an observed violation (S04 12.3)."""
+    err = row.get('status') == 'run_error'
+    vals, flags = {}, {}
+    for k in PEN_KEYS:
+        x = None if err else _finite(row.get(k))
+        vals[k] = PENALTY if x is None else x
+        flags['pen_' + k] = int(x is None)
+    return vals, flags
+
+
 def score(rows, error):
-    """f1, f2, g1, g2 and counts of one candidate from its [(mu, v, row)] (section 3)."""
+    """f1, f2, g1 .. g5 and counts of one candidate from its [(mu, v, row)] (section 3, S04 v6.2)."""
     n = len(rows)
     counts = dict(n_runs=n, n_false=sum(r['completed'] == 'false' for _, _, r in rows),
                   n_inconclusive=sum(r['completed'] == 'inconclusive' for _, _, r in rows),
                   n_track_err=sum(r['status'] == 'track_err' for _, _, r in rows),
                   n_run_error=sum(r['status'] == 'run_error' for _, _, r in rows))
+    vals, flags = zip(*(run_values(r) for _, _, r in rows)) if rows else ((), ())
+    counts.update(pen_f1=int(error or any(f['pen_e_perp_max'] for f in flags)),
+                  n_pen_runs=sum(any(f.values()) for f in flags))
     if error:
-        return dict(f1=PENALTY, f2=PENALTY, g1=float(n), g2=(PENALTY - D) / D, status='run_error', **counts)
-    f1 = max(float(r['e_perp_max']) for _, _, r in rows)
-    mus = sorted({mu for mu, _, _ in rows})
-    f2 = max(float(np.mean([float(r['tv_duty']) for m, _, r in rows if m == mu])) for mu in mus)
-    g1 = sum(r['completed'] != 'true' or r['status'] == 'track_err' for _, _, r in rows)
-    return dict(f1=f1, f2=f2, g1=float(g1), g2=(f1 - D) / D, status='ok', **counts)
+        f1 = f2 = PENALTY
+        g1 = float(n)
+        q = dict(e_trk_max=PENALTY, e_bao_max=PENALTY, e_theta_cmd_max_deg=PENALTY)
+        status = 'run_error'
+    else:
+        f1 = max(v['e_perp_max'] for v in vals)
+        mus = sorted({mu for mu, _, _ in rows})
+        f2 = max(float(np.mean([float(r['tv_duty']) for m, _, r in rows if m == mu])) for mu in mus)
+        g1 = float(sum(r['completed'] != 'true' or r['status'] == 'track_err' for _, _, r in rows))
+        q = {k: max(v[k] for v in vals) for k in ('e_trk_max', 'e_bao_max', 'e_theta_cmd_max_deg')}
+        status = 'ok'
+    s = dict(f1=f1, f2=f2, g1=g1, g2=(f1 - D) / D, g3=(q['e_trk_max'] - D) / D, g4=(q['e_bao_max'] - D) / D,
+             g5=(q['e_theta_cmd_max_deg'] - THETA_MAX_DEG) / THETA_MAX_DEG, status=status, **counts)
+    bad = [k for k in ('g1', 'g2', 'g3', 'g4', 'g5') if not math.isfinite(s[k])]
+    if bad:                                  # S04 v6.2 section 3: G is checked finite before the optimiser
+        raise RuntimeError(f'constraint(s) {bad} not finite: {s}')
+    return s
 
 
 # ── one GA seed ──────────────────────────────────────────────────────────────────────
@@ -352,7 +434,7 @@ def run_seed(ev, dom, ga_seed, pop, n_gen, ref, history, hv_rows, ext=None, log=
 
     class Gains(Problem):
         def __init__(self):
-            super().__init__(n_var=len(dom), n_obj=2, n_ieq_constr=2, xl=lo, xu=hi)
+            super().__init__(n_var=len(dom), n_obj=2, n_ieq_constr=N_CONSTR, xl=lo, xu=hi)
 
         def _evaluate(self, X, out, *args, **kwargs):
             F, G = [], []
@@ -361,10 +443,11 @@ def run_seed(ev, dom, ga_seed, pop, n_gen, ref, history, hv_rows, ext=None, log=
                 g = decode(dom, x)
                 s = ev.candidate(g, ga_seed, state['gen'], k)
                 F.append([s['f1'], s['f2']])
-                G.append([s['g1'], s['g2']])
+                G.append([s[f'g{i}'] for i in range(1, N_CONSTR + 1)])
                 # S4C-6: every evaluation of this vector (pymoo may evaluate a vector again)
                 seen.setdefault(np.asarray(x, dtype=float).tobytes(), []).append(
-                    (state['gen'], k, (float(s['f1']), float(s['f2']), float(s['g1']), float(s['g2']))))
+                    (state['gen'], k, (float(s['f1']), float(s['f2']),
+                                       *(float(s[f'g{i}']) for i in range(1, N_CONSTR + 1)))))
                 history.append(dict(controller=ev.ctrl, ga_seed=ga_seed, gen=state['gen'], cand_id=k,
                                     **{d['name']: g[d['name']] for d in dom},
                                     **{f'x_{d["name"]}': float(xi) for d, xi in zip(dom, x)}, **s))
@@ -406,7 +489,7 @@ def points_of(pop, dom, ga_seed, seen):
     for ind in pop:
         x = np.asarray(ind.X, dtype=float)
         G = np.asarray(ind.G, dtype=float)
-        fg = (float(ind.F[0]), float(ind.F[1]), float(G[0]), float(G[1]))
+        fg = (float(ind.F[0]), float(ind.F[1]), *(float(x) for x in G))
         hits = seen.get(x.tobytes(), [])
         eid = ind.get('eval_id')                        # S4C-6: set on the Individual right after its evaluation
         if eid is not None:
@@ -417,7 +500,8 @@ def points_of(pop, dom, ga_seed, seen):
                 note = 'eval_id does not match the recorded evaluation'
         else:
             gen, cand, note = '', '', 'no eval_id on the individual'
-        pts.append(dict(ga_seed=ga_seed, gen=gen, cand_id=cand, f1=fg[0], f2=fg[1], g1=fg[2], g2=fg[3],
+        pts.append(dict(ga_seed=ga_seed, gen=gen, cand_id=cand, f1=fg[0], f2=fg[1],
+                        **{f'g{i}': fg[1 + i] for i in range(1, len(G) + 1)},
                         feasible=bool(np.all(G <= 0)), id_note=note,
                         x=[decode(dom, x)[d['name']] for d in dom], xga=x.tolist()))
     return pts
@@ -480,7 +564,7 @@ def seed_error_rates(evals, ctrl):
 
 
 POP_COLS = ['controller', 'ga_seed', 'gen', 'cand_id', 'feasible', 'nondominated_feasible', 'nondominated_in_group',
-            'f1', 'f2', 'g1', 'g2', 'id_note', 'gains']
+            'f1', 'f2', 'g1', 'g2', 'g3', 'g4', 'g5', 'id_note', 'gains']
 
 
 def population_rows(ctrl, finals, nd_only=False):
@@ -500,7 +584,8 @@ def population_rows(ctrl, finals, nd_only=False):
                 continue
             rows.append(dict(controller=ctrl, ga_seed=seed, gen=p['gen'], cand_id=p['cand_id'], feasible=p['feasible'],
                              nondominated_feasible=id(p) in nd_f, nondominated_in_group=id(p) in nd_g, f1=p['f1'],
-                             f2=p['f2'], g1=p['g1'], g2=p['g2'], id_note=p.get('id_note', ''),
+                             f2=p['f2'], **{f'g{i}': p[f'g{i}'] for i in range(1, N_CONSTR + 1)},
+                             id_note=p.get('id_note', ''),
                              gains=json.dumps([repr(float(v)) for v in p['x']])))
     return rows
 
@@ -904,7 +989,8 @@ def gen_compare(gen_base):
 
 SOURCES = ('fwsim/s04_ga.py', 'fwsim/s03_doe.py', 'fwsim/o1_feasibility.py', 'fwsim/fwsim.py', 'fwsim/tune_ga.py',
            'rpi5/trajectory_pub.py', 'rpi5/imu_model.py', 'rpi5/plant_blob.py', 'tools/run_validity.py',
-           'rpi5/data/imu_noise_replay_20hz.csv', 'rpi5/data/imu_noise_replay_100hz.csv')   # IMN-7: replay data
+           'rpi5/data/imu_noise_replay_20hz.csv', 'rpi5/data/imu_noise_replay_100hz.csv',   # IMN-7: replay data
+           'fwsim/o1_gate_eval.py', 'fwsim/o1_gate.py', 'tools/o1_lanes.py', 'rpi5/o1_tasks.py')   # g3-g5 (S04 v6.2)
 PYMOO_FILES = ('core/individual.py', 'core/survival.py', 'algorithms/moo/nsga2.py')     # PYMOO_CV refers to these
 
 
@@ -1123,7 +1209,7 @@ plant_by_mu: {json.dumps(plant)}
 imu: {json.dumps(s3.IMU)}
 plant_seed: {s3.SEED}
 objectives: "f1 = max e_perp_max over the evaluation runs (m); f2 = max over mu of the mean over the gate speeds of tv_duty (1/s); minimised"
-constraints: "g1 = runs not completed, inconclusive or with a track error (all runs when a run_error); g2 = (f1 - D) / D, D = {D} m; pymoo G <= 0"
+constraints: "g1 = runs not completed, inconclusive or with a track error (all runs when a run_error); g2 = (f1 - D) / D, D = {D} m; g3 = (max e_trk_max - D) / D; g4 = (max e_bao_max - D) / D; g5 = (max e_theta_cmd_max_deg - {THETA_MAX_DEG}) / {THETA_MAX_DEG} (S04 v6.2); a run_error run, or a quantity missing or not finite, takes {PENALTY:g} with pen_<quantity> = 1 in evals.csv (S04 v6.3 RS2-8); pymoo G <= 0"
 pymoo: {json.dumps(dict(version=pymoo.__version__, checked_version=PYMOO_CHECKED, constraint_handling=PYMOO_CV,
                        recheck=pymoo.__version__ != PYMOO_CHECKED))}
 libraries: {json.dumps(fwsim.lib_versions())}
@@ -1138,6 +1224,8 @@ interpretations:   # of this script, not written in S04 v5; Liam or THESIS corre
   - "R sensitivity: motor_R of the four wheels x 0.8, 0.9, 1.0, 1.1, 1.2 (S04 6 says +-20 %), every other plant parameter as params.py (J, b not rescaled)"
   - "gains stored as Python repr (17 significant digits) and as the float32 value the firmware receives (fwsim set_pid / set_adrc take c_float)"
   - "evals.csv rows with ga_seed 0, gen 0 (trial folder): the firmware default gains at the middle mu, run once for the HV reference (section 4.2)"
+  - "g3-g5 (S04 v6.2, R134 package): e_bao_max of o1_gate_eval.evaluate_fig8 (evaluate_v7 unchanged inside); the diagnosis attempt 2 of a run_error runs s03_doe's evaluator in a new process, so it has no e_bao_max (pen_e_bao_max = 1, diagnosis only); a candidate with a run_error takes 1e6 for every quantity as for f1"
+  - "not in this version (S04 v6.2-v6.3, open): the G3-G5 states in the mu rule (needs the S03 run with G1-G5, S03 v8.2) and G3-G5 in the section 6 post checks"
 """)
 
 
