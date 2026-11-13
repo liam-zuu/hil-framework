@@ -1025,13 +1025,20 @@ def _check_replacements(tun: List[dict]) -> None:
     """S05 §4.3, §4.6, §4.7 (EA-8): a replacement points to a lost run (hong_he_do) of the same
     campaign, platform, stage, task, speed and gain set, earlier than itself in the log (row order, as
     _final_stops; Codex S315-R3-2: not by wall_start, which can go back); a run is replaced once."""
-    by_uid = {r['run_uid']: r for r in tun if r.get('run_uid')}
-    pos = {r['run_uid']: i for i, r in enumerate(tun) if r.get('run_uid')}
+    by_uid, pos = {}, {}
+    for i, r in enumerate(tun):                    # Codex S315-R4-1: a run_uid names one row
+        uid = r.get('run_uid')
+        if uid in by_uid:
+            raise LogError(f'run_uid {uid} on two rows (rows {pos[uid] + 1} and {i + 1} of the live log)')
+        if uid:
+            by_uid[uid], pos[uid] = r, i
     seen = {}
-    for r in tun:
+    for i, r in enumerate(tun):
         ref = r.get('replaces_run_uid')
         if not ref:
             continue
+        if not r.get('run_uid'):
+            raise LogError(f'row {i + 1} of the live log replaces {ref} but has no run_uid')
         old = by_uid.get(ref)
         if not old or old.get('run_outcome') != 'hong_he_do':
             raise LogError(f"{r.get('run_uid')}: replaces_run_uid {ref} is not a hong_he_do run (§4.7)")
@@ -1039,7 +1046,7 @@ def _check_replacements(tun: List[dict]) -> None:
         if diff:
             raise LogError(f"{r.get('run_uid')}: replaces {ref} with another {', '.join(diff)} (a replacement "
                            f"runs the same condition, §4.3, §4.6)")
-        if ref == r.get('run_uid') or pos[ref] > pos.get(r.get('run_uid'), len(tun)):
+        if ref == r.get('run_uid') or pos[ref] > i:
             raise LogError(f"{r.get('run_uid')}: replaces {ref}, which is not an earlier run")
         if ref in seen:
             raise LogError(f"{ref} is replaced twice ({seen[ref]}, {r.get('run_uid')})")

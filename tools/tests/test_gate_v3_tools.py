@@ -610,3 +610,21 @@ def test_s315_r3_3_summary_refuses_speed_not_finite(ds):
         rl._write_all(path, rl.TUNING_COLS, [dict(base[0], speed_mps=bad)])
         with pytest.raises(rl.LogError, match='not a finite number'):
             rl.summary(d)
+
+
+def test_s315_r4_1_replacement_uid_duplicate_or_missing(ds):
+    # Codex S315-R4-1: the position of a row is its own index; a run_uid on two rows, or a replacement row
+    # without run_uid, is an error
+    d, clock = ds
+    lost = _final_car(d, clock, 'hong_he_do', 10)                         # F:1 lost
+    _final_car(d, clock, 'dat', 20, replaces=lost)                         # F:2 replaces F:1
+    rl.summary(d)
+    path = os.path.join(d, rl.TUNING)
+    rows = _rows(d)
+    # duplicate: the replacement first, then the lost run, then a second row with the replacement's uid
+    rl._write_all(path, rl.TUNING_COLS, [rows[1], rows[0], dict(rows[1], replaces_run_uid='')])
+    with pytest.raises(rl.LogError, match='on two rows'):
+        rl.summary(d)
+    rl._write_all(path, rl.TUNING_COLS, [dict(rows[1], run_uid=''), rows[0]])   # missing uid, replacement first
+    with pytest.raises(rl.LogError, match='has no run_uid'):
+        rl.summary(d)
