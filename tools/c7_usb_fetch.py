@@ -28,6 +28,12 @@ git (L88), the manifest is.
                                      [--prefix run]
 watch: clips already on the phone when it starts are ignored; every new clip is copied and, with
 --session, analysed by `c7_measure.py track` into <out>/<stem>_track/. Ctrl+C stops.
+Frame check (Liam 13/11 CODE_CAM "Them kiem khung hinh"; --no-check skips it): on the first frame of
+each clip, count the ArUco marks (floor 1-24, check 25-33, car 0) with the c7_measure detector; with
+--session, compare the floor-mark centres with clip H (missing marks, median shift > 5 px = the
+camera may have moved: WARNING); without, warn below 8 floor marks. Writes <stem>_khung.jpg (marks
+drawn, red crosses = clip H) and <stem>_khung.json; result in the manifest column frame_check.
+  python tools/c7_usb_fetch.py check --video <clip> [--session S]
 Last line: #ket_qua,ma=0 done / 2 error.
 """
 from __future__ import annotations
@@ -47,7 +53,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 VIDEO_EXT = ('.mov', '.mp4', '.m4v')
 MANIFEST = 'manifest_usb.csv'
 MANIFEST_COLS = ['n', 'src_folder', 'src_name', 'bytes', 'sha256', 'created_utc', 'copied_local',
-                 'copy_s', 'dest', 'measure_rc']
+                 'copy_s', 'dest', 'frame_check', 'measure_rc']
+# frame check (Liam 13/11 CODE_CAM "Them kiem khung hinh") [DE XUAT, lock at C8]
+CHECK_SHIFT_PX = 5.0          # median shift of the floor-mark centres from clip H: camera moved
+CHECK_MIN_FLOOR = 8           # without a session: fewer floor marks than the frame gate of c7_measure
+THUMB_W = 1280
 
 # ---------------------------------------------------------------- PowerShell (Windows Shell COM)
 _PS_COMMON = r'''
@@ -243,11 +253,118 @@ def run_measure(video, session, tag_offset, out_dir):
     return r.returncode, (lines[-1] if lines else (r.stderr or '').strip()[-200:])
 
 
-def handle(dev, item, out_dir, prefix, session, tag_offset, measure=run_measure, log=print):
+def _load_session(session):
+    if not session:
+        return None
+    with open(session, encoding='utf-8') as f:
+        return json.load(f)
+
+
+def _median(v):
+    v = sorted(v)
+    m = len(v) // 2
+    return float(v[m]) if len(v) % 2 else float((v[m - 1] + v[m]) / 2)
+
+
+def check_marks(seen, shape, sess=None):
+    """Verdict on one frame. seen = {id: (x, y) centre px}, shape = (h, w). Pure (tested).
+    Returns dict(verdict 'OK' / 'CANH_BAO', reasons, counts, shift_px, missing)."""
+    floor = sorted(i for i in seen if 1 <= i <= 24)
+    check = sorted(i for i in seen if 25 <= i <= 33)
+    out = dict(n_floor=len(floor), n_check=len(check), car_seen=0 in seen, floor_ids=floor,
+               shift_px=None, missing=[], reasons=[])
+    if sess is None:
+        if len(floor) < CHECK_MIN_FLOOR:
+            out['reasons'].append(f'chi thay {len(floor)} moc san (< {CHECK_MIN_FLOOR})')
+    else:
+        if (int(sess['height']), int(sess['width'])) != tuple(shape):
+            out['reasons'].append(f'kich thuoc khung {shape[1]}x{shape[0]} khac clip H '
+                                  f'{sess["width"]}x{sess["height"]}')
+        ref = {int(k): v for k, v in sess['ref_centres_px'].items()}
+        out['missing'] = sorted(i for i in ref if i not in seen)
+        common = [i for i in ref if i in seen]
+        if out['missing']:
+            out['reasons'].append(f'thieu {len(out["missing"])} moc so voi clip H: {out["missing"]}')
+        if common:
+            out['shift_px'] = _median([((seen[i][0] - ref[i][0]) ** 2 + (seen[i][1] - ref[i][1]) ** 2) ** 0.5
+                                       for i in common])
+            if out['shift_px'] > CHECK_SHIFT_PX:
+                out['reasons'].append(f'moc lech {out["shift_px"]:.1f} px so voi clip H '
+                                      f'(> {CHECK_SHIFT_PX:g}): may co the da xe dich')
+        else:
+            out['reasons'].append('khong thay moc nao cua clip H')
+    out['verdict'] = 'CANH_BAO' if out['reasons'] else 'OK'
+    return out
+
+
+def frame_check(video, session=None, out_dir=None):
+    """First frame of the clip: ArUco marks seen, shift from clip H; writes <stem>_khung.jpg (marks
+    drawn, red crosses = clip H centres) and <stem>_khung.json. Same reading as c7_measure (auto
+    rotation off, its detector)."""
+    import cv2                                                   # heavy, only here
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    import c7_measure as cm
+    cap = cv2.VideoCapture(video, cv2.CAP_FFMPEG)
+    if not cap.isOpened():
+        raise OSError(f'OpenCV cannot open {video}')
+    cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 0)
+    ok, frame = cap.read()
+    cap.release()
+    if not ok:
+        raise OSError(f'{video}: no frame read')
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+    corners, ids, _ = cm.make_detector().detectMarkers(gray)
+    seen = {}
+    if ids is not None:
+        for c, i in zip(corners, ids.ravel()):
+            seen[int(i)] = c.reshape(4, 2).mean(axis=0).tolist()
+    sess = session if (session is None or isinstance(session, dict)) else _load_session(session)
+    res = check_marks(seen, gray.shape, sess)
+    res['video'] = os.path.basename(video)
+    res['ref'] = 'clip H (session.json)' if sess else 'khong co session: chi dem moc'
+    res['thresholds'] = dict(shift_px=CHECK_SHIFT_PX, min_floor=CHECK_MIN_FLOOR, status='DE XUAT, khoa o C8')
+    out_dir = out_dir or os.path.dirname(os.path.abspath(video))
+    stem = os.path.splitext(os.path.basename(video))[0]
+    img = (frame if frame.ndim == 3 else cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)).copy()
+    if ids is not None:
+        cv2.aruco.drawDetectedMarkers(img, corners, ids)
+    if sess:
+        for x, y in sess['ref_centres_px'].values():
+            cv2.drawMarker(img, (int(round(x)), int(round(y))), (0, 0, 255), cv2.MARKER_CROSS, 40, 4)
+    if img.shape[1] > THUMB_W:
+        sc = THUMB_W / img.shape[1]
+        img = cv2.resize(img, None, fx=sc, fy=sc, interpolation=cv2.INTER_AREA)
+    color = (0, 160, 0) if res['verdict'] == 'OK' else (0, 0, 255)
+    txt = f'{res["verdict"]} san {res["n_floor"]} kiem {res["n_check"]} xe {"co" if res["car_seen"] else "khong"}'
+    if res['shift_px'] is not None:
+        txt += f' lech {res["shift_px"]:.1f}px'
+    cv2.putText(img, txt, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 5, cv2.LINE_AA)
+    cv2.putText(img, txt, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2, cv2.LINE_AA)
+    cv2.imwrite(os.path.join(out_dir, f'{stem}_khung.jpg'), img)
+    with open(os.path.join(out_dir, f'{stem}_khung.json'), 'w', encoding='utf-8') as f:
+        json.dump(res, f, indent=1)
+    return res
+
+
+def handle(dev, item, out_dir, prefix, session, tag_offset, measure=run_measure, log=print, check=None):
     n = next_index(out_dir)
     row = fetch_one(dev, item, out_dir, n, prefix)
     log(f'[{n:02d}] {item["name"]} -> {row["dest"]}  {int(row["bytes"]) / 1e6:.1f} MB  '
         f'chep {row["copy_s"]} s')
+    if check:
+        try:
+            r = check(os.path.join(out_dir, row['dest']), session, out_dir)
+            row['frame_check'] = r['verdict']
+            msg = f'san {r["n_floor"]}, kiem {r["n_check"]}, xe {"co" if r["car_seen"] else "khong"}'
+            if r.get('shift_px') is not None:
+                msg += f', lech {r["shift_px"]:.1f} px'
+            log(f'     khung hinh: {r["verdict"]} ({msg})')
+            for x in r['reasons']:
+                log(f'       !! {x}')
+        except (OSError, ValueError, KeyError) as e:
+            row['frame_check'] = 'LOI'
+            log(f'     khung hinh: LOI ({e})')
     if session:
         rc, last = measure(os.path.join(out_dir, row['dest']), session, tag_offset, out_dir)
         row['measure_rc'] = rc
@@ -257,7 +374,7 @@ def handle(dev, item, out_dir, prefix, session, tag_offset, measure=run_measure,
 
 
 def watch(dev, out_dir, prefix='run', session=None, tag_offset=None, poll_s=2.0, max_clips=None,
-          sleep=time.sleep, measure=run_measure, log=print, max_polls=None):
+          sleep=time.sleep, measure=run_measure, log=print, max_polls=None, check=None):
     folders, _ = dev.list('~')          # '~' sorts after every folder name: folder list only
     minf = latest_folder(folders)
     _, items = dev.list(minf)
@@ -275,7 +392,7 @@ def watch(dev, out_dir, prefix='run', session=None, tag_offset=None, poll_s=2.0,
             log(f'  (iPhone chua doc duoc: {e}; mo khoa iPhone neu can)')
             continue
         for it in tr.poll(items):
-            done.append(handle(dev, it, out_dir, prefix, session, tag_offset, measure, log))
+            done.append(handle(dev, it, out_dir, prefix, session, tag_offset, measure, log, check))
             if max_clips is not None and len(done) >= max_clips:
                 break
     return done
@@ -298,12 +415,16 @@ def main(argv=None):
     sub = ap.add_subparsers(dest='cmd', required=True)
     a0 = sub.add_parser('list', help='list the newest videos on the phone')
     a0.add_argument('--n', type=int, default=10)
+    ac = sub.add_parser('check', help='frame check of a clip already on the laptop')
+    ac.add_argument('--video', required=True)
+    ac.add_argument('--session', default=None)
     for name in ('get', 'watch'):
         a = sub.add_parser(name)
         a.add_argument('--out', required=True, help='e.g. 05_DATA/results/C7_VIDEO/<date>_<what>/')
         a.add_argument('--prefix', default='run')
         a.add_argument('--session', default=None, help='session.json of c7_measure calib: run the analysis')
         a.add_argument('--tag-offset', default=None, help='DX,DY,DPSI_DEG, passed to c7_measure track')
+        a.add_argument('--no-check', action='store_true', help='skip the frame check of each clip')
         if name == 'get':
             a.add_argument('--name', required=True, help='IMG_xxxx as listed')
         else:
@@ -312,7 +433,13 @@ def main(argv=None):
     args = ap.parse_args(argv)
     dev = ShellDevice()
     try:
-        if args.cmd == 'list':
+        if args.cmd == 'check':
+            r = frame_check(args.video, _load_session(args.session))
+            print(f'{r["verdict"]}: san {r["n_floor"]}, kiem {r["n_check"]}, xe {r["car_seen"]}, '
+                  f'lech {r["shift_px"]} px')
+            for x in r['reasons']:
+                print(f'  !! {x}')
+        elif args.cmd == 'list':
             folders, items = dev.list(latest_folder(dev.list('~')[0]))
             vids = sorted((i for i in items if is_video(i)), key=lambda i: (i['folder'], i['name']))
             for i in vids[-args.n:]:
@@ -326,11 +453,12 @@ def main(argv=None):
                 hit = find_clip(dev, args.name)
                 if not hit:
                     raise FileNotFoundError(f'{args.name} not on the phone')
-                handle(dev, hit, args.out, args.prefix, args.session, args.tag_offset)
+                handle(dev, hit, args.out, args.prefix, args.session, args.tag_offset,
+                       check=None if args.no_check else frame_check)
             else:
                 try:
                     watch(dev, args.out, args.prefix, args.session, args.tag_offset, args.poll,
-                          args.max_clips)
+                          args.max_clips, check=None if args.no_check else frame_check)
                 except KeyboardInterrupt:
                     print('Dung theo Ctrl+C.')
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:

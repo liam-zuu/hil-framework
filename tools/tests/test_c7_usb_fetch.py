@@ -161,3 +161,99 @@ def test_find_clip_newest_folder_first():
     assert ph.list_args == ['~', '202611_a']
     assert uf.find_clip(ph, 'IMG_1')['folder'] == '202610_a'
     assert uf.find_clip(ph, 'IMG_9') is None
+
+
+# ---------------------------------------------------------------- frame check
+def sess_of(centres, w=1280, h=720):
+    return {'width': w, 'height': h, 'ref_centres_px': {str(i): list(c) for i, c in centres.items()}}
+
+
+def grid(n, dx=0.0, dy=0.0):
+    return {i: (100.0 + 110 * ((i - 1) % 10) + dx, 120.0 + 200 * ((i - 1) // 10) + dy) for i in range(1, n + 1)}
+
+
+def test_check_marks_without_session():
+    assert uf.check_marks(grid(8), (720, 1280))['verdict'] == 'OK'
+    r = uf.check_marks(grid(7), (720, 1280))
+    assert r['verdict'] == 'CANH_BAO' and r['n_floor'] == 7
+    r = uf.check_marks({**grid(9), 0: (5, 5), 25: (6, 6)}, (720, 1280))
+    assert r['car_seen'] and r['n_check'] == 1 and r['n_floor'] == 9
+
+
+def test_check_marks_with_session():
+    s = sess_of(grid(10))
+    r = uf.check_marks(grid(10, dx=2.0), (720, 1280), s)
+    assert r['verdict'] == 'OK' and abs(r['shift_px'] - 2.0) < 1e-9
+    r = uf.check_marks(grid(10, dx=6.0), (720, 1280), s)
+    assert r['verdict'] == 'CANH_BAO' and 'xe dich' in r['reasons'][0]
+    seen = grid(10)
+    del seen[3]
+    r = uf.check_marks(seen, (720, 1280), s)
+    assert r['verdict'] == 'CANH_BAO' and r['missing'] == [3]
+    assert uf.check_marks(grid(10), (1080, 1920), s)['verdict'] == 'CANH_BAO'
+    assert uf.check_marks({}, (720, 1280), s)['shift_px'] is None
+
+
+def make_clip(path, centres, side=70, w=1280, h=720, frames=3, extra=None):
+    import cv2
+    import numpy as np
+    img = np.full((h, w), 255, np.uint8)
+    d = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+    for i, (x, y) in {**centres, **(extra or {})}.items():
+        m = cv2.aruco.generateImageMarker(d, i, side)
+        x0, y0 = int(round(x - side / 2)), int(round(y - side / 2))
+        img[y0:y0 + side, x0:x0 + side] = m
+    vw = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*'MJPG'), 30, (w, h))
+    assert vw.isOpened()
+    for _ in range(frames):
+        vw.write(cv2.cvtColor(img, cv2.COLOR_GRAY2BGR))
+    vw.release()
+    return str(path)
+
+
+def test_frame_check_on_video(tmp_path):
+    pytest.importorskip('cv2')
+    ref = grid(10)
+    s = sess_of(ref)
+    v = make_clip(tmp_path / 'run01_IMG_1.avi', ref, extra={0: (640, 600), 25: (900, 600)})
+    r = uf.frame_check(v, s)
+    assert r['verdict'] == 'OK', r
+    assert r['n_floor'] == 10 and r['car_seen'] and r['n_check'] == 1 and r['shift_px'] < 1.0
+    assert (tmp_path / 'run01_IMG_1_khung.jpg').exists() and (tmp_path / 'run01_IMG_1_khung.json').exists()
+    moved = make_clip(tmp_path / 'run02_IMG_2.avi', grid(10, dx=15, dy=-8))
+    r = uf.frame_check(moved, s)
+    assert r['verdict'] == 'CANH_BAO' and r['shift_px'] > 15
+    few = make_clip(tmp_path / 'run03_IMG_3.avi', grid(5))
+    assert uf.frame_check(few)['verdict'] == 'CANH_BAO'
+
+
+def test_frame_check_session_path(tmp_path):
+    pytest.importorskip('cv2')
+    import json
+    ref = grid(10)
+    p = tmp_path / 'session.json'
+    p.write_text(json.dumps(sess_of(ref)), encoding='utf-8')
+    v = make_clip(tmp_path / 'a.avi', ref)
+    assert uf.frame_check(v, str(p))['verdict'] == 'OK'
+
+
+def test_handle_records_frame_check(tmp_path):
+    a = item('IMG_2', 50)
+    logs = []
+    calls = []
+
+    def chk(video, session, out_dir):
+        calls.append((os.path.basename(video), session))
+        return {'verdict': 'CANH_BAO', 'n_floor': 6, 'n_check': 0, 'car_seen': False, 'shift_px': None,
+                'reasons': ['chi thay 6 moc san (< 8)']}
+    row = uf.handle(FakePhone([[a]]), a, str(tmp_path), 'run', None, None, log=logs.append, check=chk)
+    assert row['frame_check'] == 'CANH_BAO' and calls == [('run01_IMG_2.MOV', None)]
+    assert any('!! chi thay 6' in s for s in logs)
+
+    def bad(video, session, out_dir):
+        raise OSError('OpenCV cannot open')
+    b = item('IMG_3', 40)
+    row = uf.handle(FakePhone([[b]]), b, str(tmp_path), 'run', None, None, log=logs.append, check=bad)
+    assert row['frame_check'] == 'LOI'
+    with open(tmp_path / uf.MANIFEST, newline='', encoding='utf-8') as f:
+        assert [r['frame_check'] for r in csv.DictReader(f)] == ['CANH_BAO', 'LOI']
