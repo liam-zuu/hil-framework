@@ -200,6 +200,7 @@ typedef struct {
     uint32_t           frames_per_s;
     uint32_t           svc_min, svc_max, n_down_restarts, cyc_per_us;
     uint32_t           n_applied, n_skipped, age_max_us;
+    uint32_t           ap_min, ap_max, n_stage, n_pre_sat, n_dur_sat;   /* L100 Apply line */
     uint32_t           s06_pushed, s06_dropped, dbg_drop;
     BnoPort_Stats_t    bs;
     uint8_t            ibus_new;
@@ -213,7 +214,7 @@ typedef struct {
 
 enum {
     DS_W1 = 0, DS_PWM = 4, DS_DMA0 = 5, DS_DMA_LAST = 13,   /* PWMdma: 9 sections */
-    DS_RELAY, DS_LINK, DS_SPIFIX, DS_LOOP, DS_FRAME, DS_S06LOG, DS_BNO1, DS_BNO2,
+    DS_RELAY, DS_LINK, DS_SPIFIX, DS_LOOP, DS_FRAME, DS_APPLY, DS_S06LOG, DS_BNO1, DS_BNO2,
     DS_FW, DS_IBUS, DS_END
 };
 
@@ -325,6 +326,18 @@ static void _dbg_print_next(void)
                (unsigned long)d->ss.new_dropped,
                (unsigned long)d->n_applied, (unsigned long)d->n_skipped,
                (unsigned long)d->age_max_us);
+    } else if (s == DS_APPLY) {
+        /* L100 (rule "H7 code with time limits", Codex RS4-R4-1, R4-2): the
+         * window c_pre..c_post around the four EncoderGen_SetOmega calls of a
+         * frame, shortest / longest over the last block (interrupts included),
+         * windows the MISO could not hold since boot (pre >= 2047 us, dur >=
+         * 31 us: the Pi refuses such a frame in a mapped range), replies staged
+         * and replies replaced before the DMA took them (stage gaps) */
+        printf("Apply: win=%lu.%lu..%lu.%lu us presat=%lu dursat=%lu staged=%lu reply_over=%lu\r\n",
+               _US10(d->ap_min) / 10u, _US10(d->ap_min) % 10u,
+               _US10(d->ap_max) / 10u, _US10(d->ap_max) % 10u,
+               (unsigned long)d->n_pre_sat, (unsigned long)d->n_dur_sat,
+               (unsigned long)d->n_stage, (unsigned long)d->ss.reply_over);
     } else if (s == DS_S06LOG) {
         printf("S06log: pushed=%lu dropped=%lu  print_drop=%lu\r\n",
                (unsigned long)d->s06_pushed, (unsigned long)d->s06_dropped,
@@ -497,6 +510,10 @@ int main(void)
    * largest state age callback -> applied */
   static uint32_t _n_applied = 0, _n_skipped = 0, _age_max_us = 0;
   static uint32_t _last_applied_nf = 0;
+  /* L100: replies staged (MISO status bits 1-6), saturated apply windows
+   * since boot, shortest / longest SetOmega x4 window in cycles per block */
+  static uint32_t _n_stage = 0, _n_pre_sat = 0, _n_dur_sat = 0;
+  static uint32_t _ap_min_cyc = 0xFFFFFFFFu, _ap_max_cyc = 0u;
   const uint32_t cyc_per_us = SystemCoreClock / 1000000u;
   /* S06 T10: cost of the S06_IRQ_ENTER/EXIT pair; then (W10) the cost of one
    * idle pass, measured on this very loop with every interrupt masked for
@@ -554,19 +571,31 @@ int main(void)
         }
         SPI1_FrameInfo_t fi;
         SPI1_GetFrameEx(&g_state, &g_traj, &fi);   /* one frame; clears frame_ready */
+        /* L100 (Codex RS4-R4-1): CYCCNT right before the first and right after
+         * the last SetOmega, so every speed of this frame took effect inside
+         * [c_pre, c_post] even when an interrupt lands in between */
+        uint32_t c_pre = DWT->CYCCNT;
         for (int i = 0; i < ENC_NUM_WHEELS; i++)
             EncoderGen_SetOmega(i, g_state.omega[i]);
+        uint32_t c_post = DWT->CYCCNT;
         /* I8: the RPi5 holds the RC switch SWA; used from the next iBUS frame,
          * after IBUS_SWA_FILTER_N applied frames in a row agree (I8-3) */
         IbusPort_SetSwa(ibus_swa_filter_step(&_swa_f, (g_state.fault_flags & HIL_CMD_SWA_ON) != 0u));
-        /* S06: state age at the moment the omegas were applied, and the
-         * checksum of the raw bytes of this very copy (W3, Y9) */
-        uint32_t age_us = (DWT->CYCCNT - fi.rx_cyc) / cyc_per_us;
+        /* MISO v5 apply window (hil_protocol.h): pre_us rounded down, the end
+         * rounded up, so rx + [pre_us, pre_us + dur_us] holds [c_pre, c_post];
+         * plus the checksum of the raw bytes of this very copy (W3, Y9) */
+        uint8_t pre_sat, dur_sat;
         SPI1_MisoInfo_t mi;
+        mi.apply = SPI1_PackApply(fi.rx_cyc, c_pre, c_post, cyc_per_us, &pre_sat, &dur_sat);
+        _n_pre_sat += pre_sat;
+        _n_dur_sat += dur_sat;
+        uint32_t ap_cyc = c_post - c_pre;
+        if (ap_cyc < _ap_min_cyc) _ap_min_cyc = ap_cyc;
+        if (ap_cyc > _ap_max_cyc) _ap_max_cyc = ap_cyc;
+        uint32_t age_us = (c_post - fi.rx_cyc) / cyc_per_us;   /* receive -> after the last SetOmega (T1 age_max) */
         mi.mosi_crc = S06_Crc16(0xFFFFu, fi.raw, SPI1_FRAME_LEN);
         mi.rx_cyc   = fi.rx_cyc;
         mi.rx_nf    = fi.rx_nf;
-        mi.age_us   = (age_us > 0xFFFFu) ? 0xFFFFu : (uint16_t)age_us;
         if (_n_applied > 0u && fi.rx_nf > _last_applied_nf + 1u)
             _n_skipped += fi.rx_nf - _last_applied_nf - 1u;
         _last_applied_nf = fi.rx_nf;
@@ -586,8 +615,13 @@ int main(void)
             g_output.torque[i] = duty[i];
 
         g_output.seq = g_state.seq;
-        /* I8: what the H7 really sends, for the RPi5 frame log */
-        g_output.status = IbusPort_LastSwa() ? (uint8_t)HIL_STATUS_SWA : 0u;
+        /* I8: what the H7 really sends, for the RPi5 frame log; v5 (L100,
+         * Codex RS4-R4-2): replies staged mod 64, one per applied frame, so a
+         * reply replaced before the DMA took it shows as a gap on the Pi */
+        _n_stage++;
+        g_output.status = (uint8_t)((IbusPort_LastSwa() ? HIL_STATUS_SWA : 0u)
+                                    | ((_n_stage << HIL_STATUS_STAGE_SHIFT) & HIL_STATUS_STAGE_MASK)
+                                    | HIL_STATUS_V5);
         SPI1_SetOutputEx(&g_output, &mi);
 
         HAL_GPIO_TogglePin(GPIOE, GPIO_PIN_1);
@@ -658,6 +692,10 @@ int main(void)
         d->n_applied = _n_applied;
         d->n_skipped = _n_skipped;
         d->age_max_us = _age_max_us;
+        d->ap_min = (_ap_min_cyc == 0xFFFFFFFFu) ? 0u : _ap_min_cyc;
+        d->ap_max = _ap_max_cyc;
+        _ap_min_cyc = 0xFFFFFFFFu; _ap_max_cyc = 0u;
+        d->n_stage = _n_stage; d->n_pre_sat = _n_pre_sat; d->n_dur_sat = _n_dur_sat;
         d->s06_pushed = S06Log_Pushed();
         d->s06_dropped = S06Log_Dropped();
         d->dbg_drop = _dbg_drop;

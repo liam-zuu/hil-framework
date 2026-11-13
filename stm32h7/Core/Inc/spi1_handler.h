@@ -36,7 +36,7 @@ typedef struct {
     uint16_t mosi_crc;             /* S06_Crc16 over SPI1_FrameInfo_t.raw     */
     uint32_t rx_cyc;
     uint32_t rx_nf;
-    uint16_t age_us;               /* callback -> applied, saturated          */
+    uint16_t apply;                /* v5 apply window, packed (hil_protocol.h) */
 } SPI1_MisoInfo_t;
 
 void    SPI1_Handler_Init(SPI_HandleTypeDef *hspi);
@@ -46,6 +46,11 @@ void    SPI1_GetFrameEx  (HIL_State_t *state, HIL_TrajRef_t *traj, SPI1_FrameInf
 uint8_t SPI1_TakeNewTraj (HIL_TrajRef_t *out, uint8_t *seq);       /* 1 = got one */
 void    SPI1_DropNewTraj (void);                 /* link lost: forget pending */
 void    SPI1_GetImu      (HIL_Imu_t *out);       /* IMU values, v3 frame */
+/* L100: MISO v5 apply window from the receive stamp and the CYCCNT right
+ * before / after the SetOmega calls (hil_protocol.h bytes 20-21): pre rounded
+ * down, end rounded up, each saturated (flag set); wrap-safe (unsigned) */
+uint16_t SPI1_PackApply  (uint32_t rx_cyc, uint32_t c_pre, uint32_t c_post, uint32_t cyc_per_us,
+                          uint8_t *pre_sat, uint8_t *dur_sat);
 void    SPI1_SetOutput   (const HIL_Output_t *out);
 void    SPI1_SetOutputEx (const HIL_Output_t *out, const SPI1_MisoInfo_t *info);
 void    SPI1_Callback    (SPI_HandleTypeDef *hspi);
@@ -75,6 +80,9 @@ typedef struct {
     uint32_t stuck;        /* times found not armed, restart requested      */
     uint32_t stuck_err;    /* hspi->ErrorCode at the last one               */
     uint32_t restart_fail; /* restarts in SPI1_Service() that returned != HAL_OK */
+    /* L100 (Codex RS4-R4-2): staged replies replaced before the DMA took
+     * them; each one is an applied frame whose reply never went out */
+    uint32_t reply_over;
 } SPI1_Stats_t;
 
 void    SPI1_ErrorCallback  (SPI_HandleTypeDef *hspi);

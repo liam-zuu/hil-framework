@@ -83,6 +83,27 @@ RESET_NEAR_US = 1_000_000.0   # V4-1: no reset-complete within ±1 s of #run_sta
 CARRY_MARGIN_CYC = 1_000_000  # a record's CYCCNT may be stamped up to ~2 ms after its carrier's callback
 
 
+
+# MISO v5 (L100, hil_protocol.h): status bit 7 marks it; bits 1-6 count the replies staged (one per applied
+# frame) mod 64; bytes 20-21 hold the apply window: pre_us (bits 0-10, 2047 = unusable), dur_us (bits 11-15,
+# 31 = no upper bound); every speed of the frame took effect in rx_cyc + [pre_us, pre_us + dur_us] H7 us.
+# age_us is then the upper end (receive -> after the last SetOmega), 0xFFFF when not known; v4 frames keep
+# the H7 age as sent.
+STATUS_V5, STAGE_SHIFT, STAGE_MOD = 0x80, 1, 64
+APPLY_PRE_MAX, APPLY_DUR_SHIFT, APPLY_DUR_MAX = 2047, 11, 31
+
+
+def miso_apply(b) -> dict:
+    """v5 fields of one MISO frame (bytes): miso_v5, stage, apply_pre_us, apply_dur_us, apply_ok, age_us."""
+    st = b[MISO_STATUS]
+    if not st & STATUS_V5:
+        return dict(miso_v5=False)
+    raw = u16(b, MISO_AGE)
+    pre, dur = raw & 0x7FF, raw >> APPLY_DUR_SHIFT
+    ok = pre < APPLY_PRE_MAX and dur < APPLY_DUR_MAX
+    return dict(miso_v5=True, stage=(st >> STAGE_SHIFT) % STAGE_MOD, apply_pre_us=pre, apply_dur_us=dur,
+                apply_ok=ok, age_us=(pre + dur) if ok else 0xFFFF)
+
 def crc16(b: bytes) -> int:
     return binascii.crc_hqx(bytes(b), 0xFFFF)
 
@@ -165,6 +186,7 @@ def decode_frames(t_send_ns, mosi, miso, max_lag=4):
         r.update(seq=b[MISO_SEQ], rx_cyc=u32(b, MISO_RX_CYC), rx_nf16=u16(b, MISO_RX_NF),
                  age_us=u16(b, MISO_AGE), status=b[MISO_STATUS], log_type=b[MISO_LOG],
                  log_idx16=u16(b, MISO_LOG + 1), payload=b[MISO_LOG + 3:FRAME])
+        r.update(miso_apply(b))
         ans = None
         for lag in range(1, max_lag + 1):
             i = j - lag

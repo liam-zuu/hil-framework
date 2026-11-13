@@ -88,7 +88,9 @@ NEW_CHECKS = ['pair_same_frame', 'getframe_masked', 'getframe_clears_ready', 'un
               # 08/11 (bug HIL-SPI1-SCK-GLITCH): SPI1 left not armed by the HAL error path
               'armed_no_restart', 'stuck_seen_waits_nss', 'stuck_counted_once',
               'stuck_restarted_at_nss_high', 'frame_after_stuck_restart', 'ready_state_also_restarted',
-              'service_cycles_minmax', 'service_cycles_reset', 'stuck_restores_primask']
+              'service_cycles_minmax', 'service_cycles_reset', 'stuck_restores_primask',
+              # L100 (13/11, Codex RS4-R4-2): a staged reply replaced before the DMA took it
+              'reply_over_counted', 'reply_over_after_take', 'apply_window_holds', 'apply_window_saturation']
 
 
 @pytest.mark.parametrize('name', NEW_CHECKS)

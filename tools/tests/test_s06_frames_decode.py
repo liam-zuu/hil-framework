@@ -546,3 +546,34 @@ def test_swa_in_decode_result(clean):
     t, mosi, miso, _ = clean
     s = dec.decode(t, mosi, miso)['swa']
     assert s['cmd_on_frames'] == 0 and s['held_mismatch'] == 0   # a log from before I8: command 0, status 0
+
+
+# ── L100: MISO v5 apply window and reply stage (hil_protocol.h, working tree) ──
+def test_v5_constants_match_h7_header():
+    import re
+    with open(os.path.join(ROOT, 'stm32h7', 'Core', 'Inc', 'hil_protocol.h'), encoding='utf-8') as f:
+        txt = f.read()
+    num = {m.group(1): int(m.group(2), 0) for m in re.finditer(r'#define\s+(\w+)\s+(0x[0-9A-Fa-f]+|\d+)u?\b', txt)}
+    assert (num['HIL_APPLY_PRE_MAX'], num['HIL_APPLY_DUR_SHIFT'], num['HIL_APPLY_DUR_MAX'],
+            num['HIL_STATUS_STAGE_SHIFT']) == (dec.APPLY_PRE_MAX, dec.APPLY_DUR_SHIFT, dec.APPLY_DUR_MAX,
+                                               dec.STAGE_SHIFT)
+    assert re.search(r'#define\s+HIL_STATUS_V5\s+\(1u << 7\)', txt) and dec.STATUS_V5 == 0x80
+    assert re.search(r'#define\s+HIL_STATUS_STAGE_MASK\s+\(0x3Fu << HIL_STATUS_STAGE_SHIFT\)', txt)
+    assert dec.STAGE_MOD == 64
+
+
+def _miso_v5(status, pre, dur):
+    b = bytearray(dec.FRAME)
+    b[dec.MISO_STATUS] = status
+    v = pre | (dur << dec.APPLY_DUR_SHIFT)
+    b[dec.MISO_AGE], b[dec.MISO_AGE + 1] = v & 0xFF, v >> 8
+    return bytes(b)
+
+
+def test_miso_apply_v5_and_v4():
+    r = dec.miso_apply(_miso_v5(0x80 | (37 << 1) | 1, 412, 6))
+    assert r == dict(miso_v5=True, stage=37, apply_pre_us=412, apply_dur_us=6, apply_ok=True, age_us=418)
+    assert dec.miso_apply(_miso_v5(0x80, 2047, 31))['apply_ok'] is False
+    assert dec.miso_apply(_miso_v5(0x80, 2047, 31))['age_us'] == 0xFFFF
+    assert dec.miso_apply(_miso_v5(0x80, 100, 31))['apply_ok'] is False
+    assert dec.miso_apply(_miso_v5(0x01, 412, 6)) == dict(miso_v5=False)     # v4: status bit 7 never set

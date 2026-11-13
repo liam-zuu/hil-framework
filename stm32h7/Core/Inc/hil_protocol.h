@@ -14,6 +14,13 @@
  *   I8 (09/11/2026, Liam "Duyet ca 5"): MOSI byte 20 bit 3 = SWA command
  *       for the iBUS frames (HIL_CMD_SWA_ON); MISO byte 16 bit 0 = SWA of
  *       the last iBUS frame started (HIL_STATUS_SWA). Lengths unchanged.
+ *   MISO v5 (L100, 13/11/2026, Liam "Sửa gốc ở H7, phiên mới", Codex RS4-R4-1,
+ *       R4-2): bytes 20-21 carry the apply window of the answered frame (CYCCNT
+ *       just before the first and just after the last EncoderGen_SetOmega)
+ *       instead of one age taken after them; status bits 1-6 count the
+ *       replies staged (one per applied frame), so a reply overwritten before
+ *       the DMA sent it shows as a gap; status bit 7 marks v5. Lengths and the
+ *       other bytes unchanged; a v4 H7 always sends status bits 1-7 = 0.
  */
 
 #ifndef HIL_PROTOCOL_H
@@ -81,10 +88,18 @@
 /* Byte 10–11  mosi_crc     CRC-16 of the 40 raw MOSI bytes of the frame  */
 /*                          answered, on the main-loop copy (W3, Y9)      */
 /* Byte 12–15  rx_cyc       DWT CYCCNT in SPI1_Callback of that frame     */
-/* Byte 16     status       uint8                                        */
+/* Byte 16     status       uint8: bit 0 SWA; v5: bits 1-6 replies staged */
+/*                          mod 64, bit 7 = 1 (HIL_STATUS_V5)             */
 /* Byte 17     seq          uint8, seq of the frame answered             */
 /* Byte 18–19  rx_nf        low 16 bits of the H7 frame count of it      */
-/* Byte 20–21  age_us       callback -> main loop applied it, us (sat.)  */
+/* Byte 20–21  v4: age_us   callback -> main loop applied it, us (sat.)  */
+/*             v5: apply    bits 0-10 pre_us = floor((CYCCNT before the  */
+/*                          first SetOmega - rx_cyc) / cyc_per_us), 2047 */
+/*                          = 2047 or more; bits 11-15 dur_us = ceil((    */
+/*                          CYCCNT after the last SetOmega - rx_cyc) /   */
+/*                          cyc_per_us) - pre_us, 31 = 31 or more. Every */
+/*                          speed of the frame took effect in rx_cyc +   */
+/*                          [pre_us, pre_us + dur_us] H7 us (not sat.)   */
 /* Byte 22     log_type     S06 log record type, 0 = none (s06_log.h)    */
 /* Byte 23–24  log_idx      continuous index of the H7 log record        */
 /* Byte 25–39  log_payload  15 bytes, by type                            */
@@ -110,6 +125,14 @@
 
 /* ── Status (MISO byte 16) ──────────────────────────────────────────── */
 #define HIL_STATUS_SWA      (1u << 0)   /* I8: SWA of the last iBUS frame started */
+#define HIL_STATUS_STAGE_SHIFT 1        /* v5: replies staged mod 64, bits 1-6 */
+#define HIL_STATUS_STAGE_MASK  (0x3Fu << HIL_STATUS_STAGE_SHIFT)
+#define HIL_STATUS_V5       (1u << 7)   /* v5: bytes 20-21 = apply window, bits 1-6 = stage */
+
+/* ── Apply window (MISO bytes 20-21, v5) ────────────────────────────── */
+#define HIL_APPLY_PRE_MAX   2047u       /* bits 0-10: saturated = not usable */
+#define HIL_APPLY_DUR_SHIFT 11
+#define HIL_APPLY_DUR_MAX   31u         /* bits 11-15: saturated = no upper bound */
 
 /* ── Traj flags (MOSI byte 30) ──────────────────────────────────────── */
 #define HIL_TRAJ_VALID      (1u << 0)   /* setpoint is valid            */

@@ -78,6 +78,7 @@ static uint32_t          _n_rearms;
 static uint32_t          _n_stuck;
 static uint32_t          _stuck_err;
 static uint32_t          _n_restart_fail;
+static uint32_t          _n_reply_over;   /* L100: staged replies replaced before the DMA took them */
 static uint32_t          _svc_min_cyc = 0xFFFFFFFFu;
 static uint32_t          _svc_max_cyc;
 
@@ -154,7 +155,7 @@ static void _encode(uint8_t *buf, const SPI1_MisoInfo_t *info)
         s06_put16(&buf[HIL_MISO_MOSI_CRC], info->mosi_crc);
         s06_put32(&buf[HIL_MISO_RX_CYC], info->rx_cyc);
         s06_put16(&buf[HIL_MISO_RX_NF], (uint16_t)info->rx_nf);
-        s06_put16(&buf[HIL_MISO_AGE], info->age_us);
+        s06_put16(&buf[HIL_MISO_AGE], info->apply);   /* v5 apply window (L100) */
     }
     buf[HIL_MISO_STATUS] = _output.status;
     buf[HIL_MISO_SEQ]    = _output.seq;
@@ -270,6 +271,21 @@ void SPI1_GetImu(HIL_Imu_t *out)
     __enable_irq();
 }
 
+/* L100 (Codex RS4-R4-1): rx + [pre_us, pre_us + dur_us] H7 us holds
+ * [c_pre, c_post]; pure, main loop only */
+uint16_t SPI1_PackApply(uint32_t rx_cyc, uint32_t c_pre, uint32_t c_post, uint32_t cyc_per_us,
+                        uint8_t *pre_sat, uint8_t *dur_sat)
+{
+    uint32_t pre_us  = (c_pre - rx_cyc) / cyc_per_us;
+    uint32_t post_us = (uint32_t)(((uint64_t)(c_post - rx_cyc) + cyc_per_us - 1u) / cyc_per_us);
+    uint32_t dur_us  = post_us - pre_us;
+    *pre_sat = (uint8_t)(pre_us >= HIL_APPLY_PRE_MAX);
+    *dur_sat = (uint8_t)(*pre_sat || dur_us >= HIL_APPLY_DUR_MAX);
+    if (*pre_sat) pre_us = HIL_APPLY_PRE_MAX;
+    if (*dur_sat) dur_us = HIL_APPLY_DUR_MAX;
+    return (uint16_t)(pre_us | (dur_us << HIL_APPLY_DUR_SHIFT));
+}
+
 /* Stage the reply; the DMA buffer is only written while the DMA is idle */
 void SPI1_SetOutputEx(const HIL_Output_t *out, const SPI1_MisoInfo_t *info)
 {
@@ -287,6 +303,7 @@ void SPI1_SetOutputEx(const HIL_Output_t *out, const SPI1_MisoInfo_t *info)
     _encode(buf, info);
     primask = __get_PRIMASK();
     __disable_irq();
+    if (_tx_next_valid) _n_reply_over++;   /* L100: the staged reply is lost (status stage gap) */
     memcpy(_tx_next, buf, SPI1_FRAME_LEN);
     _tx_next_valid = 1;
     __set_PRIMASK(primask);
@@ -419,6 +436,7 @@ void SPI1_GetStats(SPI1_Stats_t *out)
     out->stuck        = _n_stuck;      /* main loop only (SPI1_Service) */
     out->stuck_err    = _stuck_err;
     out->restart_fail = _n_restart_fail;
+    out->reply_over   = _n_reply_over; /* main loop only (SPI1_SetOutputEx) */
 }
 
 uint32_t SPI1_GetLastFrameMs(void)

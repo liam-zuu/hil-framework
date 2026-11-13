@@ -146,7 +146,7 @@ static void main_step(void)
     mi.mosi_crc = S06_Crc16(0xFFFF, fi.raw, SPI1_FRAME_LEN);
     mi.rx_cyc = fi.rx_cyc;
     mi.rx_nf = fi.rx_nf;
-    mi.age_us = 7;
+    mi.apply = 7;                    /* v5 apply window (L100), any value */
     memset(&o, 0, sizeof o);
     o.seq = s.seq;
     SPI1_SetOutputEx(&o, &mi);
@@ -281,7 +281,7 @@ int main(void)
         check(ok_mosi, "mosi_crc_of_answered_frame", "mosi_crc/seq is not that of frame k-2");
         check(ok_cyc, "rx_cyc_of_answered_frame", "rx_cyc is not the CYCCNT of frame k-2");
         check(ok_nf, "rx_nf_of_answered_frame", "rx_nf is not the frame count of frame k-2");
-        check(ok_age, "age_field", "age_us not carried");
+        check(ok_age, "age_field", "apply window (bytes 20-21) not carried");
         /* one byte flipped -> checksum catches it */
         uint8_t bad[SPI1_FRAME_LEN];
         memcpy(bad, _sent, sizeof bad);
@@ -398,6 +398,55 @@ int main(void)
         SPI1_TakeServiceCycles(&mn, &mx);
         check(mn == 0u && mx == 0u, "service_cycles_reset", "not reset after take");
         check(fake_irq_disabled == 0, "stuck_restores_primask", "PRIMASK left set");
+    }
+    /* 9. L100 (Codex RS4-R4-2): a reply staged over one the DMA has not taken
+     *    is counted (the applied frame of the lost reply), a normal reply
+     *    (staged once per frame) is not */
+    {
+        SPI1_Stats_t a, b, c;
+        frame(70, 0); main_step();
+        SPI1_GetStats(&a);
+        frame(71, 0); main_step();               /* frame 71 took the reply of 70: no loss */
+        SPI1_GetStats(&b);
+        main_step();                             /* second reply before any frame: replaces 71's */
+        main_step();                             /* and a third */
+        SPI1_GetStats(&c);
+        check(b.reply_over == a.reply_over && c.reply_over == b.reply_over + 2u,
+              "reply_over_counted", "replaced replies not counted, or a normal reply counted");
+        frame(72, 0);                            /* takes the last staged one */
+        main_step();
+        SPI1_GetStats(&a);
+        check(a.reply_over == c.reply_over && fake_irq_disabled == 0,
+              "reply_over_after_take", "counted after the DMA took the reply, or PRIMASK left set");
+    }
+    /* 10. L100 (Codex RS4-R4-1): the apply window holds [c_pre, c_post] in
+     *     whole us from rx (pre down, end up), across the CYCCNT wrap; a
+     *     window the 11 + 5 bits cannot hold is flagged and saturated */
+    {
+        const uint32_t cpu = 480u;
+        int ok = 1, ok_sat = 1;
+        uint8_t ps, ds;
+        /* brute force over small offsets, rx near the wrap and at 0 */
+        const uint32_t rxs[3] = { 0u, 0xFFFFFF00u, 123456789u };
+        for (int r = 0; r < 3; r++)
+            for (uint32_t a = 0; a < 5000u; a += 37u)
+                for (uint32_t w = 0; w < 6000u; w += 53u) {
+                    uint32_t rx = rxs[r], c0 = rx + a, c1 = rx + a + w;
+                    uint16_t v = SPI1_PackApply(rx, c0, c1, cpu, &ps, &ds);
+                    uint32_t pre = v & 0x7FFu, dur = v >> 11;
+                    if (ps || ds) continue;
+                    /* rx + pre us <= c0 and c1 <= rx + (pre + dur) us, each within one us */
+                    if (!(pre * cpu <= a && a < (pre + 1u) * cpu)) ok = 0;
+                    if (!(a + w <= (pre + dur) * cpu && (pre + dur) * cpu < a + w + cpu)) ok = 0;
+                }
+        SPI1_PackApply(0u, 2047u * cpu, 2047u * cpu + 10u, cpu, &ps, &ds);
+        if (!(ps && ds)) ok_sat = 0;                       /* pre 2047: unusable */
+        uint16_t v = SPI1_PackApply(0u, 100u * cpu, 131u * cpu, cpu, &ps, &ds);
+        if (ps || !ds || (v >> 11) != 31u) ok_sat = 0;     /* dur 31: no upper bound */
+        v = SPI1_PackApply(0u, 100u * cpu, 130u * cpu, cpu, &ps, &ds);
+        if (ps || ds || (v >> 11) != 30u || (v & 0x7FFu) != 100u) ok_sat = 0;
+        check(ok, "apply_window_holds", "rx + [pre, pre + dur] us does not hold [c_pre, c_post]");
+        check(ok_sat, "apply_window_saturation", "saturation not flagged or wrong");
     }
 #endif
     return _fails ? 1 : 0;
