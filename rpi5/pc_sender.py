@@ -26,6 +26,8 @@ gui moi goi k co k/50 < T_lenh, roi goi 0 tren CUNG luoi (khong de goi 0 dau de 
 (time.time) chi de in '#test_start', '#test_end'. Ctrl-C: 10 goi 0 ngay.
 """
 import math
+import os
+import sys
 
 import socket
 import struct
@@ -177,6 +179,26 @@ def sweep_loop(ip: str):
         sock.close()
         print("Sweep done.")
 
+GAIN_SEND = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tools', 'gain_send.py')
+
+
+def gain_query_file(ip: str, path: str, run=None) -> int:
+    """S05 4.7 (iv), R3V-9 (R134 package, Liam 14/11 CODE_R134 "duyet goi sua code fix/r134-answers"):
+    tools/gain_send.py --query to the ESP32 just before '#test_start' / just after '#test_end' of --o1;
+    its whole output goes to `path` (new file, never overwritten); returns its exit code. The boot of the
+    two answers is compared by the scorer (s05_final_table.py) and by the run log, not here."""
+    import subprocess
+    run = run or subprocess.run
+    try:
+        p = run([sys.executable, GAIN_SEND, '--ip', ip, '--query'], capture_output=True, text=True, timeout=20)
+        txt, code = (p.stdout or '') + (p.stderr or ''), p.returncode
+    except (OSError, subprocess.TimeoutExpired) as e:
+        txt, code = f'# gain_send.py --query failed: {e}\n#ket_qua,ma=1\n', 1
+    with open(path, 'x', encoding='utf-8') as f:
+        f.write(txt)
+    return code
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Trajectory UDP sender")
     parser.add_argument("--ip",       required=True,       help="ESP32 IP address")
@@ -192,15 +214,27 @@ if __name__ == "__main__":
                         help="O1 floor task, schedule of o1_tasks (C6)")
     parser.add_argument("--allow-final-set", action="store_true",
                         help="allow O1-K1, O1-K2 (final test set, O1 3.7: camera trial or final check only)")
+    parser.add_argument("--gain-query-dir", default=None,
+                        help="--o1: gain_send.py --query just before and just after the task, outputs to "
+                             "DIR/gain_query_before.txt and DIR/gain_query_after.txt (S05 4.7 (iv), R134)")
     args = parser.parse_args()
+    if args.gain_query_dir and not args.o1:
+        parser.error("--gain-query-dir goes with --o1")
+    if args.gain_query_dir and not os.path.isfile(GAIN_SEND):
+        parser.error(f"--gain-query-dir needs {GAIN_SEND} (feat/wifi-gain, L90; not merged here yet)")
 
     if args.test and args.o1:
         parser.error("--test and --o1 exclude each other")
     if args.o1:
+        if args.gain_query_dir:
+            os.makedirs(args.gain_query_dir, exist_ok=True)
+            print(f"#gain_query,when=before,exit={gain_query_file(args.ip, os.path.join(args.gain_query_dir, 'gain_query_before.txt'))}")
         try:
             test_loop(args.ip, args.o1, allow_final_set=args.allow_final_set)
         except ValueError as exc:
             parser.error(str(exc))
+        if args.gain_query_dir:
+            print(f"#gain_query,when=after,exit={gain_query_file(args.ip, os.path.join(args.gain_query_dir, 'gain_query_after.txt'))}")
     elif args.test:
         test_loop(args.ip, args.test)
     elif args.sweep:

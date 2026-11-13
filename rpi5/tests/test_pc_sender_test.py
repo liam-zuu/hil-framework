@@ -78,3 +78,33 @@ def test_k1_has_the_expected_levels():
 def test_only_lifted_tests():
     with pytest.raises(ValueError):
         ps.test_schedule('A-L1')
+
+
+
+# R134 package (S05 4.7 (iv), R3V-9): --gain-query-dir with --o1
+ANSWER = '\n'.join(['#gain_running,boot=4753dc47,id=0', '#ket_qua,ma=0', ''])
+
+
+def test_gain_query_file_saves_the_whole_answer(tmp_path):
+    from types import SimpleNamespace
+    calls = []
+
+    def run(cmd, **kw):
+        calls.append(cmd)
+        return SimpleNamespace(stdout=ANSWER, stderr='', returncode=0)
+    p = tmp_path / 'gain_query_before.txt'
+    assert ps.gain_query_file('192.168.1.69', str(p), run=run) == 0
+    assert calls[0][1:] == [ps.GAIN_SEND, '--ip', '192.168.1.69', '--query']
+    assert 'boot=4753dc47' in p.read_text(encoding='utf-8')
+    with pytest.raises(FileExistsError):
+        ps.gain_query_file('192.168.1.69', str(p), run=run)
+
+
+def test_gain_query_file_records_a_failure(tmp_path):
+    import subprocess
+
+    def slow(cmd, **kw):
+        raise subprocess.TimeoutExpired(cmd, 20)
+    p = tmp_path / 'q.txt'
+    assert ps.gain_query_file('1.2.3.4', str(p), run=slow) == 1
+    assert '#ket_qua,ma=1' in p.read_text(encoding='utf-8')
