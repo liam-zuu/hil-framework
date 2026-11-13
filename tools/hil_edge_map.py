@@ -11,13 +11,15 @@ retried, and a line that never fits logs LOG_CNT_INVALID (dropped here). So ever
 [t_now, t_now + J_READ_US]. Logs of other firmware are refused (FW_COUNTS_AT_TICK, #fw lines of .events.txt).
 
 H7 apply times (h7_apply; L100, MISO v5: Liam 13/11 CODE local_4dc05b46 "Sửa gốc ở H7, phiên mới", Codex
-RS4-R4-1, R4-2). Every time is on the H7 clock (DWT CYCCNT / H7_CYC_PER_US, unwrapped); the Pi clock is not used.
+RS4-R4-1, R4-2). Every time is on the H7 clock (DWT CYCCNT / H7_CYC_PER_US, unwrapped); the Pi clock (t_send_ns)
+only checks the anchors and sets the widening E_ID_US (RS4-R8-1, R9-1).
 Each MISO answers a frame (identified by its raw MOSI CRC, its seq byte and the H7 frame count RX_NF minus one
 common offset, Codex RS4-R6-1; see h7_apply; every MOSI seq of the range must be its frame index & 0xFF, the Pi
 convention, so the LAG_MAX frames an answer can belong to carry distinct seq, Codex RS4-R7-1; that names at most
 one frame, not that the answer's source is in the log, so every anchor's receive must also sit within R_ID_US of
-one line in the Pi send times of the frames, rate within RHO_MAX_PPM, and the bracket is widened by E_ID_US in H7
-time before it becomes steps, Codex RS4-R8-1) with the CYCCNT of its receive (RX_CYC) and the apply
+one least-squares line in the Pi send times of the frames, rate within RHO_MAX_PPM, the edge must lie at least
+START_MARGIN_FRAMES after the first anchor, and the bracket is widened by E_ID_US in H7 time before it becomes
+steps, Codex RS4-R8-1, R9-1; assumptions below) with the CYCCNT of its receive (RX_CYC) and the apply
 window: the speeds of that frame took effect in rx + [pre_us, pre_us + 4 dur4] (CYCCNT right before the first
 and right after the last EncoderGen_SetOmega, pre rounded down, end rounded up; hil_protocol.h). Status bits
 1-6 count the replies the H7 staged, one per applied frame: consecutive answered frames must step it by 1, else
@@ -30,6 +32,19 @@ wrap, Codex RS4-R5-2) refuse. Plant step k is placed at the H7 receive of frame 
 no receive stamp, only its order (RX_NF): an H7 time between the receives of answered frames a and b > a + 1
 maps to steps in [a, b] (both ends taken: early to a, late to b; Codex RS4-R5-1); between a and a + 1 it is
 interpolated.
+
+Assumptions of the frame identity (RS-4 closed on them 13/11/2026, Liam CODE local_9951f4b7 "sửa hẹp và đóng RS-4 ở
+thời điểm hiện tại đi, ghi vào sẽ tiếp tục làm tới cùng RS-4 khi còn thời gian"; Codex RS4-R9-1 not re-reviewed):
+(A1) t_send_ns is the Pi CLOCK_MONOTONIC read right before each transfer (rpi5/hil_node.py, time.monotonic_ns();
+it never steps, it is only slewed); the Pi is the only SPI master, so the H7 receives frame k at the Pi time
+t_send[k] plus a delay. (A2) That delay sits within J_SEND_US of one straight line in t_send over the whole log
+(two crystal clocks, rate within RHO_MAX_PPM). (A3) The H7 holds at most one staged reply besides the one on the
+wire (spi1_handler.c, two TX buffers): a reply of a frame received before the log can only go out before the
+first reply of a log frame, and no stream of replies runs 256 frames late. With (A1)-(A3): at a true anchor the
+fitted line is within R_ID_US + J_SEND_US of the true one (Codex RS4-R9-1: the least-squares line may move by
+more than R_ID_US), so any anchor that passes is within E_ID_US = 2 R_ID_US + 2 J_SEND_US of the true receive of
+the frame it is labelled with (between the extreme true anchors; START_MARGIN_FRAMES keeps the edge away from
+the anchors a stale reply could make at the start).
 
 EncoderGen model (EncModel; Codex RS4-R3-1). The count rate of frame k is 2 ENC_TIMER_HZ / hp_k, hp_k the integer
 half period encoder_gen.c computes in float32 from the float32 wheel speed the H7 decodes (not the nominal
@@ -72,7 +87,8 @@ still refuse; the PWM side can only refuse more, never move the bracket.
 
 Refused (ok False, reason) when: firmware not in FW_COUNTS_AT_TICK or no events file; frame log without MOSI /
 MISO, or without t_send_ns; a MOSI seq of the range (to k_hi + LAG_MAX) not its frame index & 0xFF; an anchor
-receive more than R_ID_US off the Pi send line (or its rate off by more than RHO_MAX_PPM); MISO not v5, an apply window saturated, an applied frame without its reply (stage gap); not exactly one
+receive more than R_ID_US off the Pi send line (or its rate off by more than RHO_MAX_PPM); the early bound less
+than START_MARGIN_FRAMES after the first anchor; MISO not v5, an apply window saturated, an applied frame without its reply (stage gap); not exactly one
 run_active rising edge; the edge line does not follow a run_active = 0 line with the next log_seq (G32-4); the
 edge line has LOG_CNT_INVALID counts; a frame lost before the H7 or answered twice differently; counts never move; no
 fitting cell, more than one interval, or one on the search range end; bracket wider than BRACKET_MAX_STEPS;
@@ -139,10 +155,11 @@ BRACKET_MAX_STEPS = 25.0         # Liam 13/11 CODE local_b3611c27 "Nới trần 
                                  # of CLOSED_LOOP/2026-11-13_run14 bracket 21-22 steps with RHO_MAX_PPM)
 RIDGE_FRAC = 0.25                # [ĐỀ XUẤT] alias test (_unique, PWM side)
 RHO_MAX_PPM = 1000.0             # ESP32 vs H7 clock rate, unknown inside (Liam 13/11, L100)
-R_ID_US = 200.0                  # [ĐỀ XUẤT] anchor vs Pi send line (Codex RS4-R8-1; Liam 13/11 CODE local_9951f4b7
-                                 # "Sửa kiểm giờ + vòng 9 (Recommended)"); run14: largest residual 27 us
-E_ID_US = 2.0 * R_ID_US          # H7 time widening of the bracket before steps: anchor <= R_ID_US off the line,
-                                 # the line <= R_ID_US off the true receive of a frame (assumed Pi send jitter)
+R_ID_US = 100.0                  # [ĐỀ XUẤT] anchor vs Pi send line (Codex RS4-R8-1, R9-1; Liam 13/11 CODE
+                                 # local_9951f4b7); run14: largest residual 27 us over the whole log
+J_SEND_US = 100.0                # [ĐỀ XUẤT] assumption (A2): Pi send -> H7 receive delay off one line
+E_ID_US = 2.0 * R_ID_US + 2.0 * J_SEND_US   # H7 time widening of the bracket before steps (A1-A3, RS4-R9-1)
+START_MARGIN_FRAMES = 20         # [ĐỀ XUẤT] the early step at least this far after the first anchor (A3)
 WHEELS = ('fl_count', 'fr_count', 'rl_count', 'rr_count')
 PWMS = ('pwm_fl', 'pwm_fr', 'pwm_rl', 'pwm_rr')
 NEED = ('timestamp_us', 'log_seq', 'motor_on', 'run_active') + WHEELS + PWMS
@@ -451,7 +468,8 @@ def h7_apply(frames, k_lo, k_hi):
     # reply staged before the log, or one 256 frames late). The H7 receive of each anchor must sit on one line in
     # the Pi send time of the frame it is labelled with: rx = alpha + beta t_send, |beta - 1| <= RHO_MAX_PPM, every
     # residual <= R_ID_US (a wrong label is a frame period or more off). The line pins times, not labels:
-    # map_edge widens the bracket by E_ID_US before turning H7 time into steps.
+    # map_edge widens the bracket by E_ID_US before turning H7 time into steps (assumptions A1-A3, module docstring;
+    # Codex RS4-R9-1).
     t_send = frames.get('t_send_ns')
     if t_send is None:
         return dict(ok=False, reason='frame log without t_send_ns: the anchors cannot be checked against the Pi send '
@@ -726,7 +744,8 @@ def map_edge(duty, k_run: int, esp: dict, period_s: float, frames=None) -> dict:
                constants=dict(fw_counts_at_tick=list(FW_COUNTS_AT_TICK), j_read_us=J_READ_US, fit_s=FIT_S,
                               tol_int=TOL_INT, e_start=E_START, retime_max=RETIME_MAX, tol_margin=TOL_MARGIN,
                               grid_us=GRID_US, coarse_us=COARSE_US, rho_max_ppm=RHO_MAX_PPM,
-                              r_id_us=R_ID_US, e_id_us=E_ID_US,
+                              r_id_us=R_ID_US, j_send_us=J_SEND_US, e_id_us=E_ID_US,
+                              start_margin_frames=START_MARGIN_FRAMES,
                               bracket_max_steps=BRACKET_MAX_STEPS, pwm_lag_max_steps=PWM_LAG_MAX_STEPS,
                               pwm_windows_s=list(WINDOWS_S), pwm_cost_max=PWM_COST_MAX, min_corr=MIN_CORR,
                               unique_ratio=UNIQUE_RATIO))
@@ -786,7 +805,10 @@ def map_edge(duty, k_run: int, esp: dict, period_s: float, frames=None) -> dict:
     out.update(early_step=early, late_step=late, edge_step=a_step, offset_ms=(a_step - k_run) * period_s * 1e3,
                edge_h7_time_us=[early_t, late_t], u_t_s=0.5 * (late - early) * period_s,
                u_t_parts_s=dict(half_bracket_steps=0.5 * (late - early) * period_s))
-    if late - early > BRACKET_MAX_STEPS:
+    if early < ap['anchor_k'][0] + START_MARGIN_FRAMES:
+        out['reason'] = (f'early bound {early:.2f} is less than {START_MARGIN_FRAMES} frames after the first anchor '
+                         f'{int(ap["anchor_k"][0])}: a reply staged before the log could be next to it (RS4-R9-1, A3)')
+    elif late - early > BRACKET_MAX_STEPS:
         out['reason'] = f'bracket {late - early:.2f} steps > {BRACKET_MAX_STEPS}'
     elif not p['ok']:
         out['reason'] = f'PWM cross-check failed: {p["reason"]}'

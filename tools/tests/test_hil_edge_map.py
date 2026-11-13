@@ -543,8 +543,6 @@ def test_reply_staged_before_the_range_is_refused():
     assert not em['ok'] and 'RS4-R8-1' in em['reason'], em['reason']
     ok = M.h7_apply(dict(fr, miso=make_miso(mo, s['duty_cap'], tm, lost=lost)), 280, 3800)
     assert ok['ok'] and ok['send_line']['max_resid_us'] <= 60.0, ok      # without the stale reply: kept
-    no_t = M.h7_apply(dict(s['frames'], t_send_ns=None), 300, 3800)
-    assert not no_t['ok'] and 't_send_ns' in no_t['reason'], no_t['reason']
 
 
 @needs_gcc
@@ -559,7 +557,85 @@ def test_bracket_widened_by_e_id_before_steps():
     assert em['early_step'] == M.h7_to_steps(t_lo - M.E_ID_US, ap['anchor_k'], ap['anchor_us'])[0]
     assert em['late_step'] == M.h7_to_steps(t_hi + M.E_ID_US, ap['anchor_k'], ap['anchor_us'])[1]
     assert em['late_step'] - em['early_step'] >= 2 * M.E_ID_US / 1000.0 * 0.9   # frames about 1 ms apart
-    assert M.E_ID_US == 2 * M.R_ID_US and em['constants']['e_id_us'] == M.E_ID_US
+    assert M.E_ID_US == 2 * M.R_ID_US + 2 * M.J_SEND_US and em['constants']['e_id_us'] == M.E_ID_US
+
+
+def test_widening_holds_the_true_step_with_anchors_off_by_up_to_e():
+    # RS4-R9-1: the lemma behind E_ID_US, against independent true times. Every frame has a true H7 receive; the
+    # anchors are some of the frames (gaps included), each placed up to E off its true receive (still in order).
+    # For any time t the true step (interpolated over ALL frames' true receives) lies in
+    # [h7_to_steps(t - E)[0], h7_to_steps(t + E)[1]]; with no widening it does not.
+    rng = np.random.default_rng(5)
+    E = M.E_ID_US
+    missed = 0
+    for trial in range(40):
+        n = 300
+        tr = np.cumsum(rng.uniform(50.0, 1500.0, n))                 # true receives, catch-up frames included
+        keep = np.sort(rng.choice(n, size=n // 2, replace=False))
+        keep = np.unique(np.r_[0, keep, n - 1])
+        ak = keep.astype(float)
+        for _ in range(100):                                         # displacement <= E, order kept
+            rx = tr[keep] + rng.uniform(-E, E, len(keep))
+            if np.all(np.diff(rx) > 0):
+                break
+        else:
+            continue
+        for t in rng.uniform(tr[0] + E, tr[-1] - E, 200):
+            true = float(np.interp(t, tr, np.arange(n, dtype=float)))
+            lo = M.h7_to_steps(t - E, ak, rx)[0]
+            hi = M.h7_to_steps(t + E, ak, rx)[1]
+            assert lo - 1e-9 <= true <= hi + 1e-9, (trial, t, lo, true, hi)
+            lo0, hi0 = M.h7_to_steps(t, ak, rx)
+            missed += not (lo0 - 1e-9 <= true <= hi0 + 1e-9)
+    assert missed > 0                                                # the widening is needed
+
+
+def _small_frames(n=400, lost=()):
+    """Frames without the EncoderGen oracle (no gcc): seq = k, H7 receive 1000 k + 320, replies at lag 2."""
+    mosi = np.array([np.frombuffer(P.encode_state([0.0] * 10, seq=k), dtype=np.uint8) for k in range(n)])
+    T = np.arange(n) * 1000.0
+    tm = dict(T=T, rx=np.round(T + 320.0), pre=np.full(n, 400.0), win=np.full(n, 10.0))
+    miso = make_miso(mosi, np.zeros((n, 4)), tm, lost=lost)
+    return dict(t_send_ns=np.round((T + 7.0e9) * 1000.0).astype(np.int64), t_pulse0_ns=None, mosi=mosi,
+                miso=miso), tm
+
+
+def test_frame_log_without_t_send_is_refused():
+    fr, _ = _small_frames()
+    assert M.h7_apply(fr, 20, 300)['ok']
+    no_t = M.h7_apply(dict(fr, t_send_ns=None), 20, 300)
+    assert not no_t['ok'] and 't_send_ns' in no_t['reason'], no_t['reason']
+
+
+@pytest.mark.parametrize('stale_dt, want', [(-4000.0, 'refused'), (-1000.0, 'kept')])
+def test_reply_staged_before_the_log_at_its_start(stale_dt, want):
+    # Codex RS4-R8-1, R9-2: k_lo = 0, frames 0-2 never reach the H7, the H7 still holds a reply of an older frame
+    # with the bytes of frame 2 (RX_NF, stage one below frame 3's) and sends it at transfers 3, 4. Received 4 ms
+    # before frame 3: off the Pi send line, refused. Received where frame 2 would be (A1: then it is frame 2's
+    # time): kept, the anchor time is right.
+    fr, tm = _small_frames(lost=(0, 1, 2))
+    miso = fr['miso'].copy()
+    nf3 = int(miso[5, 18]) | (int(miso[5, 19]) << 8)
+    st3 = (int(miso[5, 16]) >> 1) & 0x3F
+    stale = _stale_reply(miso[5], fr['mosi'][2], float(tm['rx'][3]) + stale_dt, nf3 - 1, st3 - 1)
+    miso[3] = stale
+    miso[4] = stale
+    ap = M.h7_apply(dict(fr, miso=miso), 0, 300)
+    if want == 'refused':
+        assert not ap['ok'] and 'RS4-R8-1' in ap['reason'] and 'frame 2' in ap['reason'], ap.get('applied', ap)[:3]
+    else:
+        assert ap['ok'] and ap['applied'][0] == 2 and ap['send_line']['max_resid_us'] <= M.R_ID_US, ap
+
+
+@needs_gcc
+def test_edge_near_the_first_anchor_is_refused(monkeypatch):
+    # RS4-R9-1, A3: the early bound must be START_MARGIN_FRAMES after the first anchor (here the margin is raised
+    # past the edge: the first anchor about 280, the edge about 415)
+    s = sim()
+    assert run(s)['ok']
+    monkeypatch.setattr(M, 'START_MARGIN_FRAMES', 200)
+    em = run(s)
+    assert not em['ok'] and 'after the first anchor' in em['reason'], em['reason']
 
 
 def test_seq_convention_checked_up_to_k_hi_plus_lag_max():
