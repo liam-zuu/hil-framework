@@ -67,30 +67,26 @@ def wheel_omega(n, k_move, kind='ramp'):
     return np.clip(om, -39.99, 39.99)
 
 
-def make_miso(mosi, duty, tm, skip=(), lost=(), twice=(), over=(), sat=(), v4=False):
-    """MISO v5 of each transfer j: the answer to frame j - 2 (hil_protocol.h offsets), duty in bytes 0-7. tm: rx
-    (H7 us of the receive, integer), pre (us from rx to the window start, integer), win (window width, us).
-    Frames in `skip` were received but not applied (no answer, RX_NF counts them, no reply count), in `lost`
-    never reached the H7 (no answer, not counted); frames in `over` were applied but their reply was replaced
-    before the DMA took it (no answer, reply count steps); for frames in `twice` the next transfer repeats the
-    answer with another window; frames in `sat` get a saturated window; v4: no v5 mark."""
+def make_miso(mosi, duty, tm, skip=(), lost=(), twice=(), over=(), sat=(), v4=False, crc_bad=()):
+    """MISO v5 of each transfer j as the H7 sends it (hil_protocol.h offsets, Codex RS4-R5-3 (a)): the reply of the
+    latest frame f <= j - 2 whose reply reached the DMA, with the duty of its first transfer in bytes 0-7; with no
+    newer reply the DMA sends the same bytes again (spi1_handler.c _tx). tm: rx (H7 us of the receive, integer),
+    pre (us from rx to the window start, integer), win (window width, us). Frames in `skip` were received but not
+    applied (no reply, RX_NF counts them, no reply count), in `lost` never reached the H7 (no reply, not counted);
+    frames in `over` were applied but their reply was replaced before the DMA took it (no reply, reply count
+    steps); for frames in `twice` the next transfer repeats the reply with another window; frames in `sat` get a
+    saturated window; v4: no v5 mark; transfers in `crc_bad` arrive with a bad MISO CRC."""
     n = len(mosi)
     rx, pre, win = tm['rx'], tm['pre'], tm['win']
+    skip, lost, over, twice, sat, crc_bad = (set(x) for x in (skip, lost, over, twice, sat, crc_bad))
     stage = np.zeros(n, dtype=int)
     c = 0
     for k in range(n):
         if k not in skip and k not in lost:
             c += 1
         stage[k] = c
-    miso = np.zeros((n, 40), dtype=np.uint8)
-    for j in range(2, n):
-        k = j - 2
-        if k in skip or k in lost or k in over:
-            continue
-        extra = 0
-        if k - 1 in twice:
-            k = k - 1
-            extra = 1
+
+    def reply(k, j, extra=0):
         p = int(pre[k])
         dur4 = int(math.ceil((math.ceil(pre[k] + win[k]) - p) / M.APPLY_DUR_UNIT_US)) + extra
         if k in sat:
@@ -105,18 +101,33 @@ def make_miso(mosi, duty, tm, skip=(), lost=(), twice=(), over=(), sat=(), v4=Fa
         b[18:20] = ((k + 1 - sum(1 for x in lost if x <= k)) & 0xFFFF).to_bytes(2, 'little')
         b[20:22] = (p | (dur4 << M.APPLY_DUR_SHIFT)).to_bytes(2, 'little')
         b[8:10] = M.crc16(bytes(b[:8]) + bytes(b[10:])).to_bytes(2, 'little')
-        miso[j] = np.frombuffer(bytes(b), dtype=np.uint8)
+        return np.frombuffer(bytes(b), dtype=np.uint8)
+
+    miso = np.zeros((n, 40), dtype=np.uint8)
+    cur = None                                                     # bytes the DMA sends while no newer reply
+    for j in range(2, n):
+        k = j - 2
+        if k not in skip and k not in lost and k not in over:
+            cur = reply(k, j)
+        if cur is not None:
+            miso[j] = cur
+        if k - 1 in twice and k - 1 not in skip | lost | over:
+            miso[j] = reply(k - 1, j, extra=1)
+        if j in crc_bad:
+            miso[j, 8] ^= 0x5A
     return miso
 
 
 def sim(edge_ms=415.3, k_run=400, n=5200, kind='ramp', move_after_ms=3.0, ppm=30.0,
         late=(3, 7, 40, 41, 90, 133), write_ms=0.4, glitch_every=97, n_before=6, seed=1, pwm_period=None,
-        burst=None, stale_ms=0.0, skip=(), dup=(), win_max=80.0):
+        burst=None, stale_ms=0.0, skip=(), dup=(), win_max=80.0, dts=()):
     """dict(duty, esp, frames, k_true, timing) of a made-up run with the edge tick at H7 time edge_ms."""
     rng = np.random.default_rng(seed)
     dt = np.full(n, 1000.0)
     if burst:
         dt[burst[0]:burst[0] + burst[1]] = burst[2]                   # catch-up frames closer than 1 ms
+    for a0, ln, d0 in dts:                                          # Pi delays then catch-up (Codex RS4-R5-1)
+        dt[a0:a0 + ln] = d0
     T = np.r_[0.0, np.cumsum(dt[:-1])] - rng.uniform(0.0, 140.0, n) * (np.arange(n) > 0)
     T[1:] = np.maximum(T[1:], T[:-1] + 50.0)
     rx = np.round(T + 320.0 + rng.uniform(0.0, 50.0, n))             # 40 bytes at 1 MHz, then a little (H7 us)
@@ -168,8 +179,8 @@ def sim(edge_ms=415.3, k_run=400, n=5200, kind='ramp', move_after_ms=3.0, ppm=30
     frames = dict(t_send_ns=np.round((T + 7.0e9) * 1000.0).astype(np.int64),
                   t_pulse0_ns=np.round((T - 60.0 + 7.0e9) * 1000.0).astype(np.int64),
                   mosi=mosi, miso=make_miso(mosi, duty, tm, skip=skip))
-    on_k = np.nonzero(on)[0]                                         # plant step = H7 receive of the applied frames
-    return dict(duty=duty, esp=esp, frames=frames, k_true=float(np.interp(t_e, rx[on_k], on_k.astype(float))),
+    # truth: plant step = H7 receive of EVERY frame, applied or not (Codex RS4-R5-1, R5-3)
+    return dict(duty=duty, esp=esp, frames=frames, k_true=float(np.interp(t_e, rx, np.arange(n, dtype=float))),
                 timing=tm)
 
 
@@ -349,7 +360,8 @@ def test_cells_cover_every_fitting_time():
     D = (esp['timestamp_us'][lines] - esp['timestamp_us'][ie]).astype(float)
     sel = D <= c['fit_span_s'] * 1e6 + 1
     dc = esp['counts'][lines][sel] - esp['counts'][ie]
-    probe = np.arange(c['s_lo'] - 400.0, c['s_hi'] + 400.0, 1.0)
+    g_lo, g_hi = c['search_us']                                     # Codex RS4-R5-3 (c): the whole search range
+    probe = np.arange(g_lo, g_hi, 1.0)
     r = M._ratio(model, probe, D[sel], dc, np.ones((sel.sum(), 4), bool), 0.0)
     fit = probe[r <= 1.0]
     assert len(fit) and fit.min() >= c['s_lo'] and fit.max() <= c['s_hi']
@@ -381,6 +393,42 @@ def test_refusals_firmware_clock_frames():
     refused('before L100', v4=True)                                     # H7 firmware with MISO v4
     fr = dict(s['frames'], miso=make_miso(mo, s['duty'], tm, over=(4900,)))
     assert M.map_edge(s['duty'], 400, s['esp'], 1e-3, fr)['ok']          # a lost reply outside the used frames
+
+
+@needs_gcc
+def test_delay_then_catch_up_across_skipped_frames():
+    # Codex RS4-R5-1: the Pi is late, then sends frames 0.4 ms apart; the H7 main loop skips 39 of them; the edge
+    # falls among the skipped frames, whose receive times are not linear in the index. The bracket must hold the
+    # true step (from the receive of every frame) or the run is refused.
+    s = sim(edge_ms=431.0, dts=[(395, 10, 4000.0), (405, 30, 400.0)], skip=tuple(range(396, 435)), seed=5)
+    em = run(s)
+    assert (not em['ok']) or (em['early_step'] <= s['k_true'] <= em['late_step']), (em, s['k_true'])
+    tm = s['timing']
+    lin = float(np.interp(431000.0, tm['rx'][[395, 435]], [395.0, 435.0]))
+    assert abs(lin - s['k_true']) > 5.0                              # the interpolation the fix replaces is wrong here
+    lo, hi = M.h7_to_steps(431000.0, np.array([395.0, 435.0]), tm['rx'][[395, 435]].astype(float))
+    assert (lo, hi) == (395.0, 435.0)
+
+
+@needs_gcc
+def test_small_gap_at_the_edge_widens_the_bracket():
+    # Codex RS4-R5-1: three skipped frames right at the edge: the step bracket spans the gap's anchors
+    s = sim(skip=(414, 415, 416))
+    em = run(s)
+    _check_bracket(em, s['k_true'])
+    assert em['h7_apply']['n_not_applied'] >= 3
+
+
+@needs_gcc
+def test_lost_replies_refused_including_a_full_reply_count_wrap():
+    # Codex RS4-R5-2: replies lost at the Pi (bad MISO CRC). Three lost: the reply count jumps; 64 lost: the count
+    # steps by exactly 1 mod 64, refused by the 64-frame anchor gap
+    s = sim()
+    tm, mo = s['timing'], s['frames']['mosi']
+    for bad, word in ((range(702, 705), 'lost its reply'), (range(702, 766), 'more than 64 apart')):
+        fr = dict(s['frames'], miso=make_miso(mo, s['duty'], tm, crc_bad=tuple(bad)))
+        em = M.map_edge(s['duty'], 400, s['esp'], 1e-3, fr)
+        assert not em['ok'] and word in em['reason'], em['reason']
 
 
 @needs_gcc
@@ -439,14 +487,9 @@ def test_refusals():
     assert not em['ok'] and 'log_seq' in em['reason']
 
 
-@needs_gcc
-def test_stale_counts_are_not_accepted_silently():
-    # pre-L98 firmware read counts up to ~10 ms before the tick; such logs are refused by the #fw check (above);
-    # here the same stale counts under an accepted #fw line: the bracket must not hold a wrong edge silently
-    # in this made-up run (a refusal is fine)
-    s = sim(stale_ms=7.0)
-    em = run(s)
-    assert (not em['ok']) or (em['early_step'] <= s['k_true'] + 7.0 + 1e-6)
+# Counts read outside [t_now, t_now + J_READ_US] (pre-L98 firmware) are outside the mapper's model; the only guard
+# is the firmware allow-list FW_COUNTS_AT_TICK (test_refusals_firmware_clock_frames). The earlier one-sided
+# "stale counts" test is dropped (Codex RS4-R4-5 (b), RS4-R5-3).
 
 
 def test_plateau_right_end():

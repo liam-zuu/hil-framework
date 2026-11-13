@@ -19,9 +19,12 @@ and right after the last EncoderGen_SetOmega, pre rounded down, end rounded up; 
 an applied frame lost its reply (replaced before the DMA took it) and the run is refused. A frame without an
 answer and without a stage step was received but not applied (the H7 main loop took the newer one; RX_NF of the
 applied frames around it steps by the frames sent): the previous speed holds, as on the H7. A frame that did not
-reach the H7 (RX_NF), two different answers for one frame, a MISO without the v5 mark (H7 before L100) or a
-saturated window refuse. Plant step k is placed at the H7 receive of frame k (frames without an answer
-interpolated between their neighbours).
+reach the H7 (RX_NF), two different answers for one frame, a MISO without the v5 mark (H7 before L100), a
+saturated window, or two consecutive answered frames more than STAGE_MOD frames apart (the reply count could
+wrap, Codex RS4-R5-2) refuse. Plant step k is placed at the H7 receive of frame k. A frame without an answer has
+no receive stamp, only its order (RX_NF): an H7 time between the receives of answered frames a and b > a + 1
+maps to steps in [a, b] (both ends taken: early to a, late to b; Codex RS4-R5-1); between a and a + 1 it is
+interpolated.
 
 EncoderGen model (EncModel; Codex RS4-R3-1). The count rate of frame k is 2 ENC_TIMER_HZ / hp_k, hp_k the integer
 half period encoder_gen.c computes in float32 from the float32 wheel speed the H7 decodes (not the nominal
@@ -43,14 +46,15 @@ Count side (count_side). s = H7 time of the edge tick's t_now. Line i (D_i = its
 cell of s of half width h when, on every used wheel,
     |(count_i - count_edge) - (Q(s + D_i) - Q(s))| <= TOL_INT + TOL_MARGIN + EV + W_e (J + h) + W_i (rho D_i + J + h)
 (Lipschitz terms in time, Codex RS4-R3-3: W = the largest |rate| over the frames holding in the uncertain time
-interval, both ends, widened by the largest apply window; rho = RHO_MAX_PPM, the ESP32 / H7 clock-rate bound:
-the rate is unknown inside it (Liam 13/11 CODE local_b3611c27, "Miền rộng ±1000 ppm (Recommended)"; replaces the
+interval, both ends, widened by the largest apply window; the ESP32 / H7 clock-rate ratio f_ESP / f_H7 is in
+[1 - rho, 1 + rho], rho = RHO_MAX_PPM, so an ESP32 span d is at most d / (1 - rho) H7 us: the read bound J and the
+drift use J / (1 - rho) and rho / (1 - rho) D (Codex RS4-R5-4); the rate is unknown inside the bound (Liam 13/11 CODE local_b3611c27, "Miền rộng ±1000 ppm (Recommended)"; replaces the
 100 ppm assumption of L99, R4-4); esp_clock_ppm (ESP32 vs Pi from the logger raw packets) is reported only). A
 coarse pass (COARSE_US cells) then GRID_US cells inside the kept coarse cells: the Lipschitz term covers each
 whole cell, so no fitting s is missed (RS4-R3-4). The kept cells must form ONE interval [s_lo, s_hi] away from
 the search ends (no alias). The edge tick is at H7 time in [s_lo, s_hi] (the apply windows are inside the
-tolerance), given as plant steps (H7 receive of the frames interpolated): early_step, late_step, edge_step the
-middle; U_t = period x half the width in steps (the scorer's time scale, RS4-R3-5). The O1 schedule and the plant
+tolerance), given as plant steps (h7_to_steps: interpolated between consecutive answered frames, the anchors
+across a gap): early_step, late_step, edge_step the middle; U_t = period x half the width in steps (the scorer's time scale, RS4-R3-5). The O1 schedule and the plant
 steps run on the Pi, so no drift to t_deadline enters on HIL. [ĐỀ XUẤT, not reviewed by THESIS: the spacing of
 the firmware ticks is not added; the edge tick itself is bracketed.]
 
@@ -377,6 +381,11 @@ def h7_apply(frames, k_lo, k_hi):
     # steps by the frames sent (else a frame did not reach the H7) and the reply count steps by one (else an
     # applied frame lost its reply: its apply time is not known)
     ua = np.array(used, dtype=float)
+    far = np.diff(ua) > STAGE_MOD
+    if np.any(far):
+        i = int(np.argmax(far))
+        return dict(ok=False, reason=f'answered frames {used[i]} and {used[i + 1]} more than {STAGE_MOD} apart: the '
+                                     'reply count could wrap (Codex RS4-R5-2)')
     nf = np.unwrap(np.array([ans[k][0][2] for k in used], dtype=float), period=65536.0)
     if np.any(np.diff(nf) != np.diff(ua)):
         i = int(np.argmax(np.diff(nf) != np.diff(ua)))
@@ -410,8 +419,24 @@ def h7_apply(frames, k_lo, k_hi):
     t_frame[a:b] = np.interp(np.arange(a, b, dtype=float), ua, rx)
     return dict(ok=True, apply_us=apply, width_us=wid, applied=np.array(used, dtype=np.int64),
                 n_not_applied=int(sum(np.diff(used) - 1)), t_frame_us=t_frame, range=[int(a), int(b)],
+                anchor_k=ua, anchor_us=rx, max_gap=int(np.max(np.diff(used))),
                 window_us=dict(max=float(width.max()), median=float(np.median(width)),
                                pre_max=float(pre.max())))
+
+
+def h7_to_steps(t, anchor_k, anchor_us):
+    """(lo, hi) plant steps of H7 time t from the answered frames (index anchor_k, receive anchor_us): between
+    consecutive frames a, a + 1 one interpolated value (lo = hi); across a gap a, b > a + 1 the receives of the
+    frames in between are not known, only that they lie in order between the two: [a, b] (Codex RS4-R5-1)."""
+    i = int(np.searchsorted(anchor_us, t, side='right')) - 1
+    if i < 0 or i >= len(anchor_k) - 1:
+        v = float(np.interp(t, anchor_us, anchor_k))
+        return v, v
+    a, b = anchor_k[i], anchor_k[i + 1]
+    if b - a == 1:
+        v = float(a + (t - anchor_us[i]) / (anchor_us[i + 1] - anchor_us[i]))
+        return v, v
+    return float(a), float(b)
 
 
 def esp_clock_ppm(raw_path: str):
@@ -505,11 +530,12 @@ def _ratio(model, s, D, dc, use_lines, half):
     width `half`), docstring. Lines (i, w) whose span crosses a stop or reversal of wheel w, or more than one
     start, are not used."""
     rho = RHO_MAX_PPM * 1e-6
+    rho_h, j_h = rho / (1.0 - rho), J_READ_US / (1.0 - rho)          # ESP32 spans on the H7 clock (RS4-R5-4)
     out = np.empty(len(s))
     for c0 in range(0, len(s), 400):
         sc = s[c0:c0 + 400][:, None]                                  # (G, 1)
-        de = J_READ_US + half                                          # edge read: [s, s + J], cell: +-half
-        di = rho * D[None, :] + J_READ_US + half                       # line read: +-rho D, + [0, J], cell
+        de = j_h + half                                                # edge read: [s, s + J], cell: +-half
+        di = rho_h * D[None, :] + j_h + half                           # line read: +-rho D, + [0, J], cell
         q0 = model.Q(sc[:, 0])                                         # (G, 4)
         qi = model.Q(sc + D[None, :])                                  # (G, L, 4)
         we = model.wmax(sc[:, 0] - half, sc[:, 0] + de)               # (G,)
@@ -675,11 +701,11 @@ def map_edge(duty, k_run: int, esp: dict, period_s: float, frames=None) -> dict:
     d_move = float(esp['timestamp_us'][moved[0]] - esp['timestamp_us'][ie]) if len(moved) else 0.0
     d_use = d_move + FIT_S * 1e6
     k_lo = int(max(0, k_run + SEARCH[0] - 20))
-    t_need = d_use * (1 + RHO_MAX_PPM * 1e-6) + J_READ_US + COARSE_US + 5000.0       # us after the search end
+    t_need = d_use / (1 - RHO_MAX_PPM * 1e-6) + J_READ_US + COARSE_US + 5000.0       # us after the search end
     k_hi = int(min(n - 4, k_run + SEARCH[1] + t_need / period_us + 20))
     ap = h7_apply(frames, k_lo, k_hi)
     out['h7_apply'] = {k: (v if k != 'applied' else len(v)) for k, v in ap.items()
-                       if k not in ('apply_us', 'width_us', 't_frame_us')}
+                       if k not in ('apply_us', 'width_us', 't_frame_us', 'anchor_k', 'anchor_us')}
     if not ap['ok']:
         out['reason'] = ap['reason']
         return out
@@ -693,9 +719,8 @@ def map_edge(duty, k_run: int, esp: dict, period_s: float, frames=None) -> dict:
         out['reason'] = c['reason']
         return out
     early_t, late_t = c['s_lo'], c['s_hi']                            # apply windows are inside the tolerance
-    fin = np.isfinite(T_all)
-    T, kk = T_all[fin], np.nonzero(fin)[0].astype(float)
-    early, late = float(np.interp(early_t, T, kk)), float(np.interp(late_t, T, kk))
+    early = h7_to_steps(early_t, ap['anchor_k'], ap['anchor_us'])[0]
+    late = h7_to_steps(late_t, ap['anchor_k'], ap['anchor_us'])[1]
     a_step = 0.5 * (early + late)
     out.update(early_step=early, late_step=late, edge_step=a_step, offset_ms=(a_step - k_run) * period_s * 1e3,
                edge_h7_time_us=[early_t, late_t], u_t_s=0.5 * (late - early) * period_s,
