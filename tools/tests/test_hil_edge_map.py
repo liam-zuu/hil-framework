@@ -126,7 +126,7 @@ def make_miso(mosi, duty, tm, skip=(), lost=(), twice=(), over=(), sat=(), v4=Fa
 
 def sim(edge_ms=415.3, k_run=400, n=5200, kind='ramp', move_after_ms=3.0, ppm=30.0,
         late=(3, 7, 40, 41, 90, 133), write_ms=0.4, glitch_every=97, n_before=6, seed=1, pwm_period=None,
-        burst=None, stale_ms=0.0, skip=(), dup=(), win_max=80.0, dts=(), stage_lag=None, crc_twin=()):
+        burst=None, stale_ms=0.0, skip=(), dup=(), win_max=80.0, dts=(), stage_lag=None, crc_twin=(), copy2=()):
     """dict(duty, esp, frames, k_true, timing) of a made-up run with the edge tick at H7 time edge_ms."""
     rng = np.random.default_rng(seed)
     dt = np.full(n, 1000.0)
@@ -144,8 +144,10 @@ def sim(edge_ms=415.3, k_run=400, n=5200, kind='ramp', move_after_ms=3.0, ppm=30
     om = wheel_omega(n, int(edge_ms + move_after_ms), kind)
     mosi = np.array([np.frombuffer(P.encode_state(list(om[k]) + [0.0] * 6, seq=k), dtype=np.uint8)
                      for k in range(n)])
-    for k in dup:                                                   # two equal MOSI frames (seen on run11 K1b)
-        mosi[k + 1] = mosi[k]
+    for k in dup:                                                   # two equal MOSI frames, seq included (off the Pi
+        mosi[k + 1] = mosi[k]                                       # convention: 74 real frame logs have none)
+    for k in copy2:                                                 # Codex RS4-R7-1: frame k + 2 a whole copy of k
+        mosi[k + 2] = mosi[k]
     om32 = M.h7_omega32(mosi)
     app = np.round(apply + 10_000).astype(np.int64)
     for i in range(1, n):
@@ -474,13 +476,47 @@ def test_frames_the_h7_did_not_apply():
 
 
 @needs_gcc
-def test_equal_mosi_frames_answer_by_lag_two():
-    # two consecutive frames with the same bytes have the same CRC: the answer lag 2 decides (CLOSED_LOOP/
-    # 2026-11-13_run11 K1b frames 4126, 4127)
+def test_repeated_mosi_frames_are_refused():
+    # Codex RS4-R7-1: two consecutive frames with the same bytes, seq included, break the Pi convention seq =
+    # step & 0xFF (none in the 74 frame logs of CLOSED_LOOP 11-13/11); which frame an answer belongs to is then
+    # not known: refused, not guessed by the answer lag
     s = sim(dup=(425, 700, 1201))
     em = run(s)
-    _check_bracket(em, s['k_true'])
-    assert em['h7_apply']['n_not_applied'] == 0
+    assert not em['ok'] and 'RS4-R7-1' in em['reason'], em['reason']
+    ap = M.h7_apply(s['frames'], 300, 3800)
+    assert not ap['ok'] and 'frame 426: MOSI seq' in ap['reason'], ap['reason']
+
+
+@needs_gcc
+@pytest.mark.parametrize('every', [3, 9])
+def test_copied_frames_before_the_range_are_refused(every):
+    # Codex RS4-R7-1 schedule: the H7 applies every `every`-th frame and its reply first goes out at lag
+    # `every + 1` (3) or `every` (9 > LAG_MAX); frame k + 2 (not applied) is a whole 40-byte copy of frame k. The
+    # true source 279 lies just before the range, so its copy 281 was the only candidate of its answer and set a
+    # wrong RX_NF offset: every answer moved +2 frames and the bracket missed the edge. Now refused.
+    lo, hi = 270, 3900
+    applied = [k for k in range(lo, hi) if k % every == 0]
+    skip = tuple(k for k in range(lo, hi) if k % every)
+    lag = {k: (4 if every == 3 else 9) for k in applied}
+    s = sim(skip=skip, stage_lag=lag, copy2=tuple(applied), seed=9)
+    k_hi = 3858 if every == 3 else 3850
+    ap = M.h7_apply(s['frames'], 280, k_hi)
+    assert not ap['ok'] and 'RS4-R7-1' in ap['reason'] and 'frame 281' in ap['reason'], ap['reason']
+    em = run(s)
+    assert not em['ok'] and 'RS4-R7-1' in em['reason'], em['reason']
+
+
+def test_seq_convention_checked_up_to_k_hi_plus_lag_max():
+    # the check covers [k_lo, k_hi + LAG_MAX): a bad seq right after k_hi + LAG_MAX - 1 is outside, at it inside
+    n = 200
+    mosi = np.array([np.frombuffer(P.encode_state([0.0] * 10, seq=k), dtype=np.uint8) for k in range(n)])
+    miso = np.zeros((n, 40), dtype=np.uint8)
+    out = 'not one offset'                                          # no MISO at all: the next refusal
+    for bad, word in ((100 + M.LAG_MAX - 1, 'RS4-R7-1'), (100 + M.LAG_MAX, out), (49, out), (50, 'RS4-R7-1')):
+        m = mosi.copy()
+        m[bad, M.MOSI_SEQ] ^= 0x01
+        ap = M.h7_apply(dict(mosi=m, miso=miso), 50, 100)
+        assert not ap['ok'] and word in ap['reason'], (bad, ap['reason'])
 
 
 @needs_gcc

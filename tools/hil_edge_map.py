@@ -13,7 +13,8 @@ retried, and a line that never fits logs LOG_CNT_INVALID (dropped here). So ever
 H7 apply times (h7_apply; L100, MISO v5: Liam 13/11 CODE local_4dc05b46 "Sửa gốc ở H7, phiên mới", Codex
 RS4-R4-1, R4-2). Every time is on the H7 clock (DWT CYCCNT / H7_CYC_PER_US, unwrapped); the Pi clock is not used.
 Each MISO answers a frame (identified by its raw MOSI CRC, its seq byte and the H7 frame count RX_NF minus one
-common offset, Codex RS4-R6-1; see h7_apply) with the CYCCNT of its receive (RX_CYC) and the apply
+common offset, Codex RS4-R6-1; see h7_apply; every MOSI seq of the range must be its frame index & 0xFF, the Pi
+convention, so the LAG_MAX frames an answer can belong to carry distinct seq, Codex RS4-R7-1) with the CYCCNT of its receive (RX_CYC) and the apply
 window: the speeds of that frame took effect in rx + [pre_us, pre_us + 4 dur4] (CYCCNT right before the first
 and right after the last EncoderGen_SetOmega, pre rounded down, end rounded up; hil_protocol.h). Status bits
 1-6 count the replies the H7 staged, one per applied frame: consecutive answered frames must step it by 1, else
@@ -67,7 +68,7 @@ the 10 ms tick, H7 capture, frame answer) [ĐỀ XUẤT]. The PWM checks of roun
 still refuse; the PWM side can only refuse more, never move the bracket.
 
 Refused (ok False, reason) when: firmware not in FW_COUNTS_AT_TICK or no events file; frame log without MOSI /
-MISO; MISO not v5, an apply window saturated, an applied frame without its reply (stage gap); not exactly one
+MISO; a MOSI seq of the range (to k_hi + LAG_MAX) not its frame index & 0xFF; MISO not v5, an apply window saturated, an applied frame without its reply (stage gap); not exactly one
 run_active rising edge; the edge line does not follow a run_active = 0 line with the next log_seq (G32-4); the
 edge line has LOG_CNT_INVALID counts; a frame lost before the H7 or answered twice differently; counts never move; no
 fitting cell, more than one interval, or one on the search range end; bracket wider than BRACKET_MAX_STEPS;
@@ -343,7 +344,8 @@ class EncModel:
 def h7_apply(frames, k_lo, k_hi):
     """H7 apply windows of the frames of [k_lo, k_hi) on the H7 clock (module docstring, L100). Which frame a MISO
     answers (Codex RS4-R6-1): its candidates are the frames k with j - LAG_MAX <= k < j whose raw MOSI CRC AND seq
-    byte (MOSI 21, the Pi step & 0xFF) equal the MISO's MOSI_CRC and seq (MISO 17); the H7 frame count RX_NF of the
+    byte (MOSI 21, the Pi step & 0xFF) equal the MISO's MOSI_CRC and seq (MISO 17); every frame of [k_lo, k_hi +
+    LAG_MAX) must carry seq = k & 0xFF, else refused (Codex RS4-R7-1), so at most one candidate; the H7 frame count RX_NF of the
     answer minus k is one common offset (no frame of the range was lost before the H7, checked below): the offset
     comes from the answers with exactly one candidate (all must agree), and every answer is the candidate that
     fits it (none: refused). The lag order is not used as identity. Returns dict ok, apply_us / width_us (n, NaN
@@ -356,6 +358,15 @@ def h7_apply(frames, k_lo, k_hi):
     if k_lo < 0 or k_hi > n - LAG_MAX or k_hi - k_lo < 10:
         return dict(ok=False, reason=f'frames {k_lo}..{k_hi} not all inside the frame log (n = {n}) with answers')
     a, b = k_lo, k_hi
+    # Codex RS4-R7-1: the Pi writes seq = step & 0xFF (rpi5/protocol.py, hil_node.py seq=self._step) and the frame
+    # log index is the step. With that, the LAG_MAX frames an answer can belong to carry distinct seq, so CRC + seq
+    # name one frame; a frame breaking it (a repeated frame, seq included) is refused, not guessed
+    ks = np.arange(a, b + LAG_MAX)
+    off_seq = np.nonzero(mosi[a:b + LAG_MAX, MOSI_SEQ].astype(int) != (ks & 0xFF))[0]
+    if off_seq.size:
+        k0 = int(ks[off_seq[0]])
+        return dict(ok=False, reason=f'frame {k0}: MOSI seq {int(mosi[k0, MOSI_SEQ])} is not frame index & 0xFF '
+                                     f'({k0 & 0xFF}): which frame an answer belongs to is not known (Codex RS4-R7-1)')
     crc = np.array([crc16(mosi[k]) for k in range(a, b)])
     seq = mosi[a:b, MOSI_SEQ].astype(int)
     u16 = lambda m, o: int(m[o]) | (int(m[o + 1]) << 8)  # noqa: E731
