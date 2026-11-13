@@ -5,43 +5,61 @@ frame log, so t = 0 of the O1 schedule on HIL is the tick where the firmware sta
 CODE local_7f7b0ef4 ("Kẹp hai phía", L97; after Codex Sol round 2/2, "Sửa firmware (Recommended)", L98).
 Inputs: the ESP32 log of agv_logger.py (with its .events.txt) and the frame log of run_hil.py --frame-log.
 
-L98 (AGV fix/enc-log-tick 2c02641): control_task reads the four PCNT counts right after t_now, with the
-scheduler of its core suspended, and logs that pair (timestamp_us, *_count). Before, the counts were
-encoder_task's copy from its own 10 ms loop, older or newer than the tick by an unknown amount (Codex
-G32-R2-1 (b)); logs of such firmware are refused (FW_COUNTS_AT_TICK, #fw lines of the events file).
+L98, L99 (AGV fix/enc-log-tick 16702ff; Liam 13/11 CODE local_4dc05b46 "Sửa hết, vòng 4", Codex L98-1): control_task
+reads the four PCNT counts right after t_now and the time again after them; a read later than J_READ_US is
+retried, and a line that never fits logs LOG_CNT_INVALID (dropped here). So every logged count was read in
+[t_now, t_now + J_READ_US]. Logs of other firmware are refused (FW_COUNTS_AT_TICK, #fw lines of .events.txt).
 
-Count side (the bracket). Pi time on the frame log: frame k is sent at T_k (t_send_ns; k x period when the
-frame log has no times). The H7 applies omega_k from T_k + d, d in [D_MIN_US, D_MAX_US] (transfer and main
-loop; H7 'Frame: ... age_max=750us', CLOSED_LOOP/2026-11-13_run08 h7_COM3.txt) [ĐỀ XUẤT]. Theta(t) = the
-ideal encoder angle for omega applied at T_k (wheels at or below ENC_OMEGA_MIN emit nothing), K = 1320 / 2 pi.
-For an unknown s (Pi time), line i (ESP32 time ts_i, D_i = ts_i - ts_edge) fits when, on every wheel,
-    | (count_i - count_edge) - K (Theta(s + D_i) - Theta(s)) | <= TOL_COUNTS + K W_i (DRIFT_PPM D_i + J_ESP_US)
-W_i = the largest |omega| near s + D_i (Lipschitz bound for the clock-rate difference and the time between
-t_now and the PCNT reads). TOL_COUNTS bounds how far the H7 EncoderGen's emitted count strays from K Theta
-between two times: measured with the unchanged encoder_gen.c on the PC (stm32h7/pc_tests/encgen, profile
-mode; tools/tests/encgen_oracle.py) on the wheel speeds of the six frame logs below and on stop/start,
-reverse, slow-ramp, step profiles, with the H7 apply time random in 0..750 us: largest range 7.36 counts
-(13/11, 03_CODE/docs/2026-11-13_RS4_L98_dem_tai_tick.md); TOL_COUNTS = 10 [ĐỀ XUẤT]. Every s on a 10 us grid
-over the search range is tested on every line from the edge to FIT_S; the feasible s must form ONE
-connected interval [s_lo, s_hi] (no alias, G32-6, G32-R2-3) away from the search range ends; the edge tick is
-then at Pi time t_e in [s_lo + D_MIN_US - GRID_US, s_hi + D_MAX_US + GRID_US], given as plant steps (T_k
-interpolated): early_step, late_step, edge_step the middle, U_t = half the width. The clock-rate difference
-is inside the test, so U_t has no separate drift term. The O1 schedule and the plant steps run on the Pi, so
-no drift to t_deadline enters on HIL. [ĐỀ XUẤT, not reviewed by THESIS: the spacing of the firmware ticks is
-not added; the edge tick itself is bracketed.]
+H7 apply times (h7_apply; Codex RS4-R3-2). Each MISO answers a frame (its raw MOSI CRC) with the H7 CYCCNT at
+the receive and the age at EncoderGen_SetOmega. The receive is put on the Pi clock by a line fitted to t_send
+of the answered frames; the common offset tau of the true receive after that line is only known to lie in
+[tau_lo, tau_hi]: after t_send of the frame, before t_pulse0 of the next (the Pi starts the next step after the
+transfer returned). apply_k = receive + age. A frame without an answer was received but not applied (the H7
+main loop took the newer one; RX_NF of the applied frames around it steps by the frames sent): the previous
+speed holds, as on the H7. A frame that did not reach the H7 (RX_NF), or two different answers, refuses.
+
+EncoderGen model (EncModel; Codex RS4-R3-1). The count rate of frame k is 2 ENC_TIMER_HZ / hp_k, hp_k the integer
+half period encoder_gen.c computes in float32 from the float32 wheel speed the H7 decodes (not the nominal
+omega: at 39.9 rad/s, hp 238, the difference is 17 counts/s), times the H7 / Pi clock rate of the fit. Q(t) is
+that ideal count. Between two times t0 < t with no stop and no reversal of the wheel applied in [t0, t]:
+    |C(t) - C(t0) - (Q(t) - Q(t0))| <= TOL_INT + TOL_MARGIN + EV[t0, t]
+EV sums E_START per start (both pins forced low: <= 2 counts; first edge one whole half period in: <= 2) and
+per same-direction speed change a retime bound: the pending count is at most one old half period away, so
+the phase moves by at most 2 |1/r - 1| (speed-up, capped at RETIME_MAX: the next edge is never later than one
+new half period) or 2 (1 - 1/r) (slow-down), r = hp_k / hp_k-1; plus what a 1-tick hp ambiguity of a frame
+can make. Checked against the unchanged encoder_gen.c on the PC at every count change (both sides of each
+jump), on the frame wheel speeds of 9 bench runs, 6 fixed hard profiles (39.9 rad/s hold, Codex 1 ms on/off,
+step, near the dead zone, ramp, x5 steps) and 200 random profiles with jumps, stops, reversals: largest
+violation / budget 0.67 (05_DATA/results/ENC_SCHED_MODEL/2026-11-13_run03). Lines across a stop or reversal
+of a wheel are not used for that wheel (the first run of one direction only).
+
+Count side (count_side). s = Pi time of the edge tick's t_now. Line i (D_i = its timestamp - the edge's) fits a
+cell of s of half width h when, on every used wheel,
+    |(count_i - count_edge) - (Q(s + D_i) - Q(s))| <= TOL_INT + TOL_MARGIN + EV + W_e (J + h) + W_i (rho D_i + J + h)
+(Lipschitz terms in time, Codex RS4-R3-3: W = the largest |rate| over the frames holding in the uncertain time
+interval, both ends; rho = DRIFT_PPM, the ESP32 / Pi rate bound, checked coarsely from the logger raw packets
+by esp_clock_ppm: refused above it or when not measurable). A coarse pass (COARSE_US cells) then GRID_US cells
+inside the kept coarse cells: the Lipschitz term covers each whole cell, so no fitting s is missed (RS4-R3-4).
+The kept cells must form ONE interval [s_lo, s_hi] away from the search ends (no alias). The edge tick is at
+Pi time in [s_lo, s_hi + tau_hi - tau_lo] (the true applies are later than modelled by at most that), given as
+plant steps (t_send interpolated): early_step, late_step, edge_step the middle; U_t = period x half the width
+in steps (the scorer's time scale, RS4-R3-5). The O1 schedule and the plant steps run on the Pi, so no drift
+to t_deadline enters on HIL. [ĐỀ XUẤT, not reviewed by THESIS: the spacing of the firmware ticks is not added;
+the edge tick itself is bracketed.]
 
 PWM side (cross-check only, not in the bracket). The pwm written in a tick (pwm_*) reaches the plant in the
 MISO duty of a later frame, never an earlier one. The fit of the pwm steps to the duty is a step function of
 the shift (whole frames), so its minimum is an interval; its right end p_hi (G32-R2-2) cannot be before the
-edge: early_step <= p_hi is required, and p_lo - late_step <= PWM_LAG_MAX_STEPS (write within the 10 ms tick,
-H7 capture, frame answer) [ĐỀ XUẤT]. The PWM checks of round 1 (cost, correlation, alias) still refuse.
+edge: early_step <= p_hi + PWM_SLACK_STEPS is required, and p_lo - late_step <= PWM_LAG_MAX_STEPS (write within
+the 10 ms tick, H7 capture, frame answer) [ĐỀ XUẤT]. The PWM checks of round 1 (cost, correlation, alias)
+still refuse; the PWM side can only refuse more, never move the bracket.
 
-Refused (ok False, reason) when: firmware before L98 or no events file; not exactly one run_active rising
-edge; the edge line does not follow a run_active = 0 line with the next log_seq (G32-4); counts never move;
-no feasible s, more than one feasible interval, or one on the search range end; bracket wider than
-BRACKET_MAX_STEPS; the PWM fit fails or disagrees with the bracket.
-Frame logs used for the thresholds: CLOSED_LOOP/2026-11-11_run01 (F02, F05, F08), 2026-11-13_run08 (K1a, K1b,
-K2) (counts of the old firmware there are not used, only the plant wheel speeds).
+Refused (ok False, reason) when: firmware not in FW_COUNTS_AT_TICK or no events file; ESP32 clock rate not
+measured or above DRIFT_PPM; frame log without t_send_ns / t_pulse0_ns / MOSI / MISO; not exactly one
+run_active rising edge; the edge line does not follow a run_active = 0 line with the next log_seq (G32-4); the
+edge line has LOG_CNT_INVALID counts; a frame lost before the H7 or answered twice differently; counts never move; no
+fitting cell, more than one interval, or one on the search range end; bracket wider than BRACKET_MAX_STEPS;
+the PWM fit fails or disagrees with the bracket.
 
 Log reading: the CSV of agv_logger.py by column name; with <log>.segments.csv, lines marked 'duplicate' are
 dropped after checking they equal an earlier kept line (L92), 'conflict' / 'ambiguous' or more than one
@@ -53,6 +71,8 @@ Last line: #ket_qua,ma=0 mapped / 3 not mapped (reason) / 2 error.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import csv
 import json
 import math
@@ -72,13 +92,21 @@ OMEGA_MIN = 0.3                  # rad/s, stm32h7/Core/Src/encoder_gen.c ENC_OME
 WINDOWS_S = (1.0, 2.0, 3.0)      # s after the first non-zero pwm (PWM side)
 SEARCH = (-100.0, 400.0)         # steps around the RUN step
 COARSE, FINE = 0.25, 0.01        # steps (PWM side)
-# count side (L98)
-FW_COUNTS_AT_TICK = ('2c026415dfc6',)   # AGV firmware whose log counts are read at t_now (fix/enc-log-tick)
-FIT_S = 3.0                      # s of log lines after the edge
-TOL_COUNTS = 10.0                # [ĐỀ XUẤT] largest EncoderGen range measured 7.36 counts (docstring)
-D_MIN_US, D_MAX_US = 0.0, 1000.0  # [ĐỀ XUẤT] H7 apply time after t_send (age_max 750 us + transfer)
-J_ESP_US = 100.0                 # [ĐỀ XUẤT] t_now to the PCNT reads (a few us; interrupts may come in between)
-GRID_US = 10.0                   # grid of s
+# count side (L98, L99)
+FW_COUNTS_AT_TICK = ('16702ff0e688',)   # AGV firmware: counts read within J_READ_US of t_now, else LOG_CNT_INVALID
+LOG_CNT_INVALID = -2 ** 31       # AGV main.c LOG_CNT_INVALID (INT32_MIN): line dropped
+J_READ_US = 50.0                 # AGV main.c LOG_CNT_WIN_US (a test checks)
+FIT_S = 3.0                      # s of log lines after the first count change
+ENC_TIMER_HZ = 1_000_000.0       # encoder_gen.h ENC_TIMER_FREQ x ENC_CLOCK_CAL (a test checks)
+HIL_OMEGA_MAX = 40.0             # hil_protocol.h HIL_OMEGA_MAX (a test checks)
+H7_CYC_PER_US = 480.0            # H7 age_us = DWT cycles / cyc_per_us (SystemCoreClock 480 MHz)
+TOL_INT = 2.0                    # counts are integers at both ends of a difference
+E_START = 4.0                    # a start: both pins forced low (<= 2 counts) + first edge one whole half period in (<= 2)
+RETIME_MAX = 2.0                 # a retime moves the next count by at most one new half period (2 counts)
+TOL_MARGIN = 1.0                 # [ĐỀ XUẤT]
+COARSE_US, GRID_US = 250.0, 10.0  # cells of s: coarse pass, then fine cells inside kept coarse cells
+CLOCK_FIT_FRAMES = 3000          # frames each side of the used range for the H7 -> Pi clock fit
+MISO_CRC, MISO_MOSI_CRC, MISO_RX_CYC, MISO_RX_NF, MISO_AGE = 8, 10, 12, 18, 20   # hil_protocol.h (a test checks)
 PWM_LAG_MAX_STEPS = 15.0         # [ĐỀ XUẤT] tick compute (< 10 ms) + capture + frame answer
 PWM_SLACK_STEPS = 0.5            # [ĐỀ XUẤT] the PWM fit puts ticks on k x period, frames move <= 0.15 step
 PWM_COST_MAX = 100.0             # [ĐỀ XUẤT] capped mean square (pwm units^2)
@@ -153,6 +181,8 @@ def read_esp_log(path: str) -> dict:
     out['pwm'] = pw[order]
     ev = path + '.events.txt'
     out['fw'] = read_fw(ev) if os.path.isfile(ev) else None
+    raw = path + '.raw.jsonl'
+    out['esp_pi_ppm'] = esp_clock_ppm(raw) if os.path.isfile(raw) else None
     return out
 
 
@@ -188,40 +218,211 @@ def rising_edges(run_active) -> np.ndarray:
     return np.nonzero((ra[1:] == 1) & (ra[:-1] == 0))[0] + 1
 
 
-def frame_times_us(n, period_s, t_send_ns=None) -> np.ndarray:
-    """Pi time [us] of frames 0..n-1 from the first: t_send_ns of the frame log, else k x period."""
-    if t_send_ns is None:
-        return np.arange(n, dtype=float) * period_s * 1e6
-    t = np.asarray(t_send_ns, dtype=np.int64)
-    if len(t) != n or n < 2 or np.any(np.diff(t) <= 0):
-        raise ValueError('frame log t_send_ns: not one increasing time per frame')
-    return (t - t[0]).astype(float) / 1e3
+def crc16(b) -> int:
+    return binascii.crc_hqx(bytes(b), 0xFFFF)
 
 
-class Theta:
-    """Ideal encoder angle [rad] of the four wheels at Pi time t [us] when omega_k is applied from T_k until
-    T_k+1 (wheels at or below OMEGA_MIN emit nothing, as EncoderGen); 0 before T_0. wmax[k]: largest |omega|
-    over frames k - 2 .. k + 2 (Lipschitz bound near frame k)."""
+def h7_omega32(mosi) -> np.ndarray:
+    """Wheel speeds (n, 4) as the H7 computes them, float32: int16 big-endian x (40.0f / 32767.0f)
+    (spi1_handler.c _rd16, hil_protocol.h)."""
+    b = np.ascontiguousarray(np.asarray(mosi, dtype=np.uint8)[:, 0:8])
+    raw = b.view('>i2').reshape(len(b), 4).astype(np.float32)
+    return raw * (np.float32(HIL_OMEGA_MAX) / np.float32(32767.0))
 
-    def __init__(self, T_us, omega):
-        w = np.asarray(omega, dtype=float).copy()
-        w[np.abs(w) <= OMEGA_MIN] = 0.0
-        self.T, self.w = np.asarray(T_us, dtype=float), w
-        self.cum = np.vstack([np.zeros(w.shape[1]), np.cumsum(w[:-1] * (np.diff(self.T) * 1e-6)[:, None], axis=0)])
-        a = np.abs(w)
-        m = a.copy()
-        for sh in (1, 2):
-            m[sh:] = np.maximum(m[sh:], a[:-sh])
-            m[:-sh] = np.maximum(m[:-sh], a[sh:])
-        self.wmax = m
 
-    def at(self, t):
-        """(angle (..., 4), frame index (...)) at times t (any shape)."""
+def h7_half_period(om32) -> tuple:
+    """(hp, ambiguous): encoder_gen.c _half_period in float32 (ticks), and frames whose float value sits within
+    1e-3 of a rounding step (the PC float may round the other way)."""
+    a = np.abs(om32).astype(np.float32)
+    with np.errstate(divide='ignore', over='ignore'):
+        hp_f = (np.float32(ENC_TIMER_HZ) * np.float32(math.pi)) / (np.maximum(a, np.float32(1e-30))
+                                                                   * np.float32(ENC_PPR))
+    hp_f = np.where(np.isfinite(hp_f), hp_f, np.float32(1e9)).astype(np.float32)
+    hp = np.floor((hp_f + np.float32(0.5)).astype(np.float64))
+    hp = np.clip(hp, 1.0, 65535.0)
+    frac = (hp_f.astype(np.float64) + 0.5) % 1.0
+    amb = (np.minimum(frac, 1.0 - frac) < 1e-3) & (hp_f > 1.0) & (hp_f < 65535.0)
+    return hp, amb
+
+
+class EncModel:
+    """H7 EncoderGen on the Pi clock for the frames of the frame log. apply[k]: Pi time [us] the H7 applies frame k
+    (with the smallest common offset tau_lo, see h7_apply); rate[k, w]: counts per Pi second while frame k holds
+    (sign = direction, 0 at or below OMEGA_MIN; 2 x ENC_TIMER_HZ / half_period x H7 rate); Q(t): ideal count.
+    Per frame event bound ev[k, w] (counts) at the change from frame k-1 to k: E_START at a start from 0, a
+    retime bound at a same-direction speed change: the pending count is at most one old half period away (the
+    first edge after a start comes one whole half period in), so the retime shifts the phase by at most
+    2 |1/r - 1| (speed-up) or 2 (1 - 1/r) (slow-down) counts, r = hp_k / hp_k-1, capped at RETIME_MAX (the next
+    edge is never later than one new half period); plus the count a 1-tick half-period ambiguity can make while
+    frame k holds;
+    bad[k, w] = 1 at a stop or a reversal (lines across it are not used)."""
+
+    def __init__(self, apply_us, mosi, h7_rate):
+        om = h7_omega32(mosi)
+        hp, amb = h7_half_period(om)
+        d = np.where(om > np.float32(OMEGA_MIN), 1, np.where(om < -np.float32(OMEGA_MIN), -1, 0))
+        n = len(apply_us)
+        self.apply = np.asarray(apply_us, dtype=float)
+        self.dir, self.hp = d, hp
+        self.rate = d * (2.0 * ENC_TIMER_HZ / hp) * h7_rate
+        dur = np.diff(np.r_[self.apply, self.apply[-1] + 1000.0]) * 1e-6
+        alt = 2.0 * ENC_TIMER_HZ / np.maximum(hp - 1.0, 1.0) * h7_rate - np.abs(self.rate)
+        ev = np.where(amb & (d != 0), np.abs(alt) * dur[:, None], 0.0)
+        bad = np.zeros((n, 4))
+        for k in range(1, n):
+            p, c = d[k - 1], d[k]
+            st = (p == 0) & (c != 0)
+            same = (p == c) & (c != 0) & (hp[k] != hp[k - 1])
+            r = hp[k] / hp[k - 1]
+            rt = np.minimum(RETIME_MAX, 2.0 * np.where(r < 1.0, 1.0 / r - 1.0, 1.0 - 1.0 / r))
+            ev[k] += np.where(st, E_START, 0.0) + np.where(same, rt, 0.0)
+            bad[k] = (p != c) & (c == 0) & (p != 0) | ((p != 0) & (c != 0) & (p != c))
+        self.ev_cum = np.vstack([np.zeros(4), np.cumsum(ev, axis=0)])
+        self.bad_cum = np.vstack([np.zeros(4), np.cumsum(bad, axis=0)])
+        self.cum = np.vstack([np.zeros(4), np.cumsum(self.rate[:-1] * np.diff(self.apply)[:, None] * 1e-6, axis=0)])
+        self._rmq = [np.max(np.abs(self.rate), axis=1)]
+        while 2 ** len(self._rmq) <= n:
+            p, s = self._rmq[-1], 2 ** (len(self._rmq) - 1)
+            self._rmq.append(np.maximum(p[:-s], p[s:]))
+
+    def frame(self, t):
+        """Index of the frame holding at time t (-1 before the first apply)."""
+        return np.searchsorted(self.apply, t, side='right') - 1
+
+    def Q(self, t):
+        """Ideal count (..., 4) at Pi time t (0 before the first frame's apply)."""
         t = np.asarray(t, dtype=float)
-        j = np.clip(np.searchsorted(self.T, t, side='right') - 1, 0, len(self.T) - 1)
-        th = self.cum[j] + self.w[j] * ((t - self.T[j]) * 1e-6)[..., None]
-        th[t < self.T[0]] = 0.0
-        return th, j
+        j = self.frame(t)
+        jj = np.clip(j, 0, len(self.apply) - 1)
+        q = self.cum[jj] + self.rate[jj] * ((t - self.apply[jj]) * 1e-6)[..., None]
+        q[j < 0] = 0.0
+        return q
+
+    def wmax(self, t1, t2):
+        """Largest |rate| (counts/s, over the four wheels) of the frames holding in [t1, t2] (same shapes)."""
+        lo = np.clip(self.frame(t1), 0, len(self.apply) - 1)
+        hi = np.clip(self.frame(t2), 0, len(self.apply) - 1)
+        L = hi - lo + 1
+        lev = np.floor(np.log2(np.maximum(L, 1))).astype(int)
+        out = np.zeros(np.shape(lo))
+        for v in np.unique(lev):
+            m = lev == v
+            t = self._rmq[v]
+            out[m] = np.maximum(t[lo[m]], t[hi[m] - 2 ** v + 1])
+        return out
+
+    def events(self, t1, t2):
+        """(event bound (..., 4), bad changes (..., 4)) of the frame changes applied in [t1, t2]."""
+        a = np.searchsorted(self.apply, t1, side='left')
+        b = np.searchsorted(self.apply, t2, side='right')
+        return self.ev_cum[b] - self.ev_cum[a], self.bad_cum[b] - self.bad_cum[a]
+
+
+def h7_apply(frames, k_lo, k_hi):
+    """H7 apply time of every frame on the Pi clock. The MISO of transfer j answers the frame k whose raw MOSI
+    CRC it carries (MOSI_CRC, lag 2 first, then 1, 3, 4: two equal MOSI frames give the same CRC), with the H7 CYCCNT at its receive (RX_CYC) and the time from receive to
+    EncoderGen_SetOmega (AGE, us). RX_CYC is put on the Pi clock by a linear fit on t_send of the answered frames
+    (CLOCK_FIT_FRAMES around the range); the common offset tau of the receive after the fitted line is bounded
+    from the data: receive after t_send of the frame, and before t_pulse0 of the next frame (the Pi starts the
+    next step only after the transfer has returned). Returns dict ok, apply_us (tau = tau_lo), tau_lo, tau_hi,
+    h7_rate (H7 us per Pi us); refuses when a frame of [k_lo, k_hi) has no answer or more than one."""
+    ts = np.asarray(frames['t_send_ns'], dtype=np.int64)
+    tp0 = np.asarray(frames['t_pulse0_ns'], dtype=np.int64)
+    mosi = np.asarray(frames['mosi'], dtype=np.uint8)
+    miso = np.asarray(frames['miso'], dtype=np.uint8)
+    n = len(ts)
+    t_us = (ts - ts[0]).astype(float) / 1e3
+    tp_us = (tp0 - ts[0]).astype(float) / 1e3
+    if k_lo < 0 or k_hi > n - 4:
+        return dict(ok=False, reason=f'frames {k_lo}..{k_hi} not all inside the frame log (n = {n}) with answers')
+    a, b = max(0, k_lo - CLOCK_FIT_FRAMES), min(n - 4, k_hi + CLOCK_FIT_FRAMES)
+    crc = np.array([crc16(mosi[k]) for k in range(a, b + 4)])
+    u16 = lambda m, o: int(m[o]) | (int(m[o + 1]) << 8)  # noqa: E731
+    ans = {}
+    for j in range(a + 1, b + 4):
+        m = miso[j]
+        if not m.any() or u16(m, MISO_CRC) != crc16(bytes(m[:MISO_CRC]) + bytes(m[MISO_CRC + 2:])):
+            continue
+        mc = u16(m, MISO_MOSI_CRC)
+        for lag in (2, 1, 3, 4):                                      # the H7 answers frame N in N + 2 first
+            k = j - lag
+            if a <= k < b and crc[k - a] == mc:
+                cyc = int(m[MISO_RX_CYC]) | (int(m[MISO_RX_CYC + 1]) << 8) | (int(m[MISO_RX_CYC + 2]) << 16) | \
+                    (int(m[MISO_RX_CYC + 3]) << 24)
+                ans.setdefault(k, []).append((cyc, u16(m, MISO_AGE), u16(m, MISO_RX_NF)))
+                break
+    # an answer repeated with the same content (no newer frame had reached the H7) counts once; different
+    # contents for one frame cannot be placed
+    bad = [k for k in range(k_lo, k_hi) if len(set(ans.get(k, ()))) > 1]
+    if bad:
+        return dict(ok=False, reason=f'frame {bad[0]} answered with different H7 receive / age values; H7 apply '
+                                     'time not known')
+    used = [k for k in range(k_lo, k_hi) if k in ans]
+    if not used or used[0] > k_lo + 5:
+        return dict(ok=False, reason=f'no H7 answer for the first frames of {k_lo}..{k_hi}')
+    # a frame without an answer was received but not applied (the H7 main loop took the newer frame: the
+    # previous speed holds until the next applied frame), as long as RX_NF of the applied frames before and
+    # after it steps by the number of frames sent; otherwise a frame did not reach the H7
+    nf = np.unwrap(np.array([ans[k][0][2] for k in used], dtype=float), period=65536.0)
+    if np.any(np.diff(nf) != np.diff(np.array(used, dtype=float))):
+        i = int(np.argmax(np.diff(nf) != np.diff(np.array(used, dtype=float))))
+        return dict(ok=False, reason=f'H7 RX_NF {int(nf[i])} -> {int(nf[i + 1])} between frames {used[i]} and '
+                                     f'{used[i + 1]}: a frame did not reach the H7')
+    n_skip = int(sum(np.diff(used) - 1))
+    fk = np.array(sorted(k for k in ans if a <= k < b and len(set(ans[k])) == 1))
+    cyc = np.unwrap(np.array([ans[k][0][0] for k in fk], dtype=float), period=2.0 ** 32)
+    slope, icpt = np.polyfit(t_us[fk], cyc, 1)                         # cycles per Pi us
+    rx_env = (cyc - icpt) / slope
+    tau_lo = float(np.max(t_us[fk] - rx_env))
+    nxt = fk + 1 < n
+    tau_hi = float(np.min(tp_us[fk[nxt] + 1] - rx_env[nxt]))
+    if not tau_lo <= tau_hi:
+        return dict(ok=False, reason=f'H7 receive times not inside [t_send, next t_pulse0] (offset {tau_lo:.1f} > '
+                                     f'{tau_hi:.1f} us)')
+    h7_rate = slope / H7_CYC_PER_US
+    apply = np.full(n, np.nan)
+    pos = {k: i for i, k in enumerate(fk)}
+    for k in range(a, b):
+        if k in pos:
+            apply[k] = rx_env[pos[k]] + tau_lo + ans[k][0][1] / h7_rate
+    # the AGE truncation (< 1 H7 us) and the fit: the offset range covers both ends
+    return dict(ok=True, apply_us=apply, applied=np.array(used, dtype=np.int64), n_not_applied=n_skip,
+                tau_lo=tau_lo, tau_hi=tau_hi + 1.0 / h7_rate, h7_rate=float(h7_rate),
+                range=[int(a), int(b)], rx_resid_us=float(np.max(rx_env + tau_lo - t_us[fk])))
+
+
+def esp_clock_ppm(raw_path: str):
+    """ESP32 clock rate vs the Pi clock [ppm] from the logger's raw packets (Pi receive time, ESP32 timestamp):
+    slope of the edge of the lower convex hull of (timestamp, receive - timestamp) that spans the mean timestamp
+    (one-way delay skew estimate). A coarse check only: on 12 bench runs of 13/11 (12.7 s each) it spread over
+    -52 .. +31 ppm. None when fewer than 50 packets or 5 s."""
+    pts = []
+    with open(raw_path, encoding='utf-8') as f:
+        for line in f:
+            try:
+                d = json.loads(line)
+                first = base64.b64decode(d['b64']).split(b',', 1)[0]
+                pts.append((int(first), d['t_mono_ns'] / 1e3))
+            except (ValueError, KeyError, TypeError):
+                continue
+    if len(pts) < 50:
+        return None
+    a = np.array(pts, dtype=float)
+    a = a[np.argsort(a[:, 0], kind='stable')]
+    x, y = a[:, 0], a[:, 1] - a[:, 0]
+    if x[-1] - x[0] < 5e6:
+        return None
+    h = []
+    for p in zip(x, y):
+        while len(h) >= 2 and ((h[-1][0] - h[-2][0]) * (p[1] - h[-2][1])
+                               - (h[-1][1] - h[-2][1]) * (p[0] - h[-2][0])) <= 0:
+            h.pop()
+        h.append(p)
+    xm = float(x.mean())
+    for (x1, y1), (x2, y2) in zip(h[:-1], h[1:]):
+        if x1 <= xm <= x2 and x2 > x1:
+            return float((y2 - y1) / (x2 - x1) * 1e6)
+    return None
 
 
 def _minimise(cost, lo, hi):
@@ -276,53 +477,78 @@ def _windows(ts, idx, t_from):
     return out
 
 
-def count_side(theta: Theta, k_run, esp, ie):
-    """Feasible set of s (Pi time [us] whose ideal angle matches the counts of the edge line, docstring) on a
-    GRID_US grid over the search range: ok with s_lo, s_hi when it is one interval away from the range ends."""
+def _ratio(model, s, D, dc, use_lines, half):
+    """Largest |misfit| / tolerance over lines and wheels for candidate edge times s (centres of cells of half
+    width `half`), docstring. Lines (i, w) whose span crosses a stop or reversal of wheel w, or more than one
+    start, are not used."""
+    rho = DRIFT_PPM * 1e-6
+    out = np.empty(len(s))
+    for c0 in range(0, len(s), 400):
+        sc = s[c0:c0 + 400][:, None]                                  # (G, 1)
+        de = J_READ_US + half                                          # edge read: [s, s + J], cell: +-half
+        di = rho * D[None, :] + J_READ_US + half                       # line read: +-rho D, + [0, J], cell
+        q0 = model.Q(sc[:, 0])                                         # (G, 4)
+        qi = model.Q(sc + D[None, :])                                  # (G, L, 4)
+        we = model.wmax(sc[:, 0] - half, sc[:, 0] + de)               # (G,)
+        wi = model.wmax(sc + D[None, :] - di, sc + D[None, :] + di)    # (G, L)
+        ev, bad = model.events(sc - half, sc + D[None, :] + di)         # (G, L, 4)
+        tol = TOL_INT + TOL_MARGIN + ev + (we[:, None, None] * de + wi[:, :, None] * di[:, :, None]) * 1e-6
+        mis = np.abs(dc[None] - (qi - q0[:, None, :]))
+        ok_pair = (bad == 0) & use_lines[None]
+        r = np.where(ok_pair, mis / tol, 0.0)
+        out[c0:c0 + 400] = r.max(axis=(1, 2))
+    return out
+
+
+def count_side(model, frames_t_us, k_run, esp, ie):
+    """Cells of s (Pi time of the edge tick's t_now) that fit every used count within the tolerance; a coarse pass
+    then GRID_US cells inside the kept coarse cells (the Lipschitz term covers each cell, so no fitting s is
+    missed). ok with s_lo, s_hi when the kept cells form one interval away from the search ends."""
     ts, cnt = esp['timestamp_us'].astype(float), esp['counts']
-    T = theta.T
+    T = frames_t_us
     kk = np.arange(len(T), dtype=float)
-    g_lo = float(np.interp(k_run + SEARCH[0], kk, T, left=T[0] + (k_run + SEARCH[0]) * (T[1] - T[0])))
+    g_lo = float(np.interp(k_run + SEARCH[0], kk, T))
     g_hi = float(np.interp(k_run + SEARCH[1], kk, T))
-    grid = np.arange(g_lo, g_hi + GRID_US / 2, GRID_US)
     after = np.arange(ie, len(ts))
     after = after[esp['run_active'][after] == 1]
+    valid = ~np.any(cnt[after] == LOG_CNT_INVALID, axis=1)
     D = ts[after] - ts[ie]
-    moved = np.nonzero(np.any(cnt[after] != cnt[ie], axis=1))[0]
-    d_move = D[moved[0]] if len(moved) else 0.0                      # first line with a count change
-    lim = min(d_move + FIT_S * 1e6, T[-1] - grid[-1] - 1000.0)
-    keep = D <= lim
+    moved = np.nonzero(valid & np.any(cnt[after] != cnt[ie], axis=1))[0]
+    d_move = D[moved[0]] if len(moved) else 0.0
+    d_model = model.apply[-1] - g_hi - 2000.0                       # lines inside the modelled frames
+    keep = valid & (D <= min(d_move + FIT_S * 1e6, d_model))
     lines, D = after[keep], D[keep]
-    out = dict(n_lines=int(len(lines)), fit_span_s=float(D[-1] * 1e-6) if len(D) else 0.0, grid_us=GRID_US,
-               search_us=[g_lo, g_hi])
-    if lim <= 0:
-        return dict(out, ok=False, reason='count side: the frame log ends before the search range does')
+    out = dict(n_lines=int(len(lines)), n_invalid_lines=int(np.count_nonzero(~valid)),
+               fit_span_s=float(D[-1] * 1e-6) if len(D) else 0.0, search_us=[g_lo, g_hi])
+    if not len(moved):
+        return dict(out, ok=False, reason='counts never move after the edge')
     dc = cnt[lines] - cnt[ie]
-    if not np.any(dc != 0):
-        return dict(out, ok=False, reason='counts never move after the edge (within the fit span)')
-    K = COUNTS_PER_REV / (2.0 * math.pi)
-    lip = (DRIFT_PPM * 1e-6 * D + J_ESP_US) * 1e-6                     # s, per line
-    ratio = np.empty(len(grid))
-    for c0 in range(0, len(grid), 1000):
-        s = grid[c0:c0 + 1000]
-        th0, _ = theta.at(s)                                             # (G, 4)
-        th, j = theta.at(s[:, None] + D[None, :])                       # (G, L, 4), (G, L)
-        pred = K * (th - th0[:, None, :])
-        tol = TOL_COUNTS + K * theta.wmax[j] * lip[None, :, None]
-        ratio[c0:c0 + 1000] = np.max(np.abs(dc[None] - pred) / tol, axis=(1, 2))
-    feas = ratio <= 1.0
-    out.update(best_ratio=float(ratio.min()), s_best=float(grid[int(np.argmin(ratio))]))
-    idx = np.nonzero(feas)[0]
-    if not len(idx):
+    use = np.ones((len(lines), 4), dtype=bool)
+    coarse = np.arange(g_lo + COARSE_US / 2, g_hi, COARSE_US)
+    rc = _ratio(model, coarse, D, dc, use, COARSE_US / 2)
+    keep_c = np.nonzero(rc <= 1.0)[0]
+    out['best_ratio_coarse'] = float(rc.min())
+    if not len(keep_c):
         return dict(out, ok=False, reason=f'count side: no Pi time fits every count within the tolerance (best '
-                                          f'{ratio.min():.2f} x tolerance)')
-    comps = np.split(idx, np.nonzero(np.diff(idx) > 1)[0] + 1)
-    out['components_us'] = [[float(grid[c[0]]), float(grid[c[-1]])] for c in comps]
+                                          f'{rc.min():.2f} x tolerance)')
+    m = int(round(COARSE_US / GRID_US))
+    fine = (coarse[keep_c][:, None] - COARSE_US / 2 + (np.arange(m)[None, :] + 0.5) * GRID_US).ravel()
+    rf = _ratio(model, fine, D, dc, use, GRID_US / 2)
+    kf = rf <= 1.0
+    out['best_ratio'] = float(rf.min())
+    if not kf.any():
+        return dict(out, ok=False, reason=f'count side: no Pi time fits every count within the tolerance (best '
+                                          f'{rf.min():.2f} x tolerance)')
+    cells = fine[kf]
+    gaps = np.nonzero(np.diff(cells) > GRID_US * 1.5)[0]
+    comps = np.split(cells, gaps + 1)
+    out['components_us'] = [[float(c[0] - GRID_US / 2), float(c[-1] + GRID_US / 2)] for c in comps]
     if len(comps) > 1:
         return dict(out, ok=False, reason=f'count side: {len(comps)} separate feasible intervals (alias)')
-    if idx[0] == 0 or idx[-1] == len(grid) - 1:
+    s_lo, s_hi = float(cells[0] - GRID_US / 2), float(cells[-1] + GRID_US / 2)
+    if s_lo <= g_lo + COARSE_US or s_hi >= g_hi - COARSE_US:
         return dict(out, ok=False, reason='count side: feasible interval on the edge of the search range')
-    return dict(out, ok=True, s_lo=float(grid[idx[0]]), s_hi=float(grid[idx[-1]]))
+    return dict(out, ok=True, s_lo=s_lo, s_hi=s_hi)
 
 
 def pwm_side(duty, k_run, esp, ie, period_us):
@@ -380,22 +606,31 @@ def pwm_side(duty, k_run, esp, ie, period_us):
                 t_end_us=max(f['t_end_us'] for f in fits.values()))
 
 
-def map_edge(omega, duty, k_run: int, esp: dict, period_s: float, t_send_ns=None) -> dict:
-    """Plant step of the run_active edge of `esp` (read_esp_log) on a frame log with wheel speeds `omega`
-    (n, 4) [rad/s], MISO duty `duty` (n, 4), RUN step k_run and frame send times t_send_ns (None: k x period).
-    Returns a dict, ok True / False with reason."""
+def map_edge(duty, k_run: int, esp: dict, period_s: float, frames=None) -> dict:
+    """Plant step of the run_active edge of `esp` (read_esp_log) on a frame log: MISO duty `duty` (n, 4), RUN step
+    k_run, frames = dict(t_send_ns, t_pulse0_ns, mosi, miso) of the frame log (None: refused). Returns a dict,
+    ok True / False with reason."""
     period_us = period_s * 1e6
-    out = dict(ok=False, reason='', method='count_feasible_set_L98', k_run=int(k_run), period_s=period_s,
-               counts_per_rev=COUNTS_PER_REV, omega_min=OMEGA_MIN, frame_times='t_send_ns' if t_send_ns is not None
-               else 'k x period', fw=esp.get('fw'),
-               constants=dict(fw_counts_at_tick=list(FW_COUNTS_AT_TICK), fit_s=FIT_S, tol_counts=TOL_COUNTS,
-                              d_min_us=D_MIN_US, d_max_us=D_MAX_US, j_esp_us=J_ESP_US, grid_us=GRID_US,
-                              drift_ppm=DRIFT_PPM, bracket_max_steps=BRACKET_MAX_STEPS,
-                              pwm_lag_max_steps=PWM_LAG_MAX_STEPS, pwm_windows_s=list(WINDOWS_S),
-                              pwm_cost_max=PWM_COST_MAX, min_corr=MIN_CORR, unique_ratio=UNIQUE_RATIO))
+    out = dict(ok=False, reason='', method='count_feasible_set_L99', k_run=int(k_run), period_s=period_s,
+               counts_per_rev=COUNTS_PER_REV, omega_min=OMEGA_MIN, fw=esp.get('fw'),
+               esp_pi_ppm=esp.get('esp_pi_ppm'),
+               constants=dict(fw_counts_at_tick=list(FW_COUNTS_AT_TICK), j_read_us=J_READ_US, fit_s=FIT_S,
+                              tol_int=TOL_INT, e_start=E_START, retime_max=RETIME_MAX, tol_margin=TOL_MARGIN,
+                              grid_us=GRID_US, coarse_us=COARSE_US, drift_ppm=DRIFT_PPM,
+                              bracket_max_steps=BRACKET_MAX_STEPS, pwm_lag_max_steps=PWM_LAG_MAX_STEPS,
+                              pwm_windows_s=list(WINDOWS_S), pwm_cost_max=PWM_COST_MAX, min_corr=MIN_CORR,
+                              unique_ratio=UNIQUE_RATIO))
     why = fw_check(esp.get('fw'))
     if why:
         out['reason'] = why
+        return out
+    ppm = esp.get('esp_pi_ppm')
+    if ppm is None or not abs(ppm) <= DRIFT_PPM:
+        out['reason'] = (f'ESP32 clock rate vs Pi {ppm} ppm: not measured or above the bound {DRIFT_PPM} ppm used '
+                         'in the tolerance')
+        return out
+    if frames is None or any(frames.get(k) is None for k in ('t_send_ns', 't_pulse0_ns', 'mosi', 'miso')):
+        out['reason'] = 'frame log without t_send_ns / t_pulse0_ns / MOSI / MISO: H7 apply times not known'
         return out
     edges = rising_edges(esp['run_active'])
     out['n_edges'] = int(len(edges))
@@ -408,26 +643,46 @@ def map_edge(omega, duty, k_run: int, esp: dict, period_s: float, t_send_ns=None
         out['reason'] = (f'log_seq {int(esp["log_seq"][ie - 1])} -> {int(esp["log_seq"][ie])} at the edge: lines lost, '
                          'the first run_active line may not be the edge tick (G32-4)')
         return out
-    n = len(omega)
-    try:
-        T = frame_times_us(n, period_s, t_send_ns)
-    except ValueError as exc:
-        out['reason'] = str(exc)
+    if np.any(esp['counts'][ie] == LOG_CNT_INVALID):
+        out['reason'] = 'the edge line has no valid counts (read later than J_READ_US after t_now)'
         return out
-    c = count_side(Theta(T, omega), k_run, esp, ie)
+    ts = np.asarray(frames['t_send_ns'], dtype=np.int64)
+    n = len(ts)
+    if n < 10 or np.any(np.diff(ts) <= 0):
+        out['reason'] = 'frame log t_send_ns: not one increasing time per frame'
+        return out
+    T = (ts - ts[0]).astype(float) / 1e3
+    kk = np.arange(n, dtype=float)
+    # frames needed: from before the search range to the last line count_side uses (first count change + FIT_S)
+    cnt = esp['counts']
+    after = np.arange(ie, len(cnt))
+    after = after[(esp['run_active'][after] == 1) & ~np.any(cnt[after] == LOG_CNT_INVALID, axis=1)]
+    moved = after[np.any(cnt[after] != cnt[ie], axis=1)]
+    d_move = float(esp['timestamp_us'][moved[0]] - esp['timestamp_us'][ie]) if len(moved) else 0.0
+    d_use = d_move + FIT_S * 1e6
+    k_lo = int(max(0, k_run + SEARCH[0] - 20))
+    t_need = np.interp(k_run + SEARCH[1], kk, T) + d_use * (1 + DRIFT_PPM * 1e-6) + J_READ_US + COARSE_US + 5000.0
+    k_hi = int(min(n - 4, np.searchsorted(T, t_need) + 10))
+    ap = h7_apply(frames, k_lo, k_hi)
+    out['h7_apply'] = {k: (v if k != 'applied' else len(v)) for k, v in ap.items() if k != 'apply_us'}
+    if not ap['ok']:
+        out['reason'] = ap['reason']
+        return out
+    used = ap['applied']
+    model = EncModel(ap['apply_us'][used], np.asarray(frames['mosi'])[used], ap['h7_rate'])
+    c = count_side(model, T, k_run, esp, ie)
     p = pwm_side(duty, k_run, esp, ie, period_us)
     out.update(count_side=c, pwm_side=p)
     if not c['ok']:
         out['reason'] = c['reason']
         return out
-    kk = np.arange(n, dtype=float)
-    early_t = c['s_lo'] + D_MIN_US - GRID_US
-    late_t = c['s_hi'] + D_MAX_US + GRID_US
-    mid_t = 0.5 * (early_t + late_t)
-    early, late, a = (float(np.interp(t, T, kk)) for t in (early_t, late_t, mid_t))
-    half = 0.5 * (late_t - early_t) * 1e-6
-    out.update(early_step=early, late_step=late, edge_step=a, offset_ms=(a - k_run) * period_s * 1e3,
-               edge_pi_time_us=mid_t, u_t_s=half, u_t_parts_s=dict(half_bracket=half))
+    early_t = c['s_lo']
+    late_t = c['s_hi'] + (ap['tau_hi'] - ap['tau_lo'])                 # the true apply is later by <= this
+    early, late = float(np.interp(early_t, T, kk)), float(np.interp(late_t, T, kk))
+    a_step = 0.5 * (early + late)
+    out.update(early_step=early, late_step=late, edge_step=a_step, offset_ms=(a_step - k_run) * period_s * 1e3,
+               edge_pi_time_us=[early_t, late_t], u_t_s=0.5 * (late - early) * period_s,
+               u_t_parts_s=dict(half_bracket_steps=0.5 * (late - early) * period_s))
     if late - early > BRACKET_MAX_STEPS:
         out['reason'] = f'bracket {late - early:.2f} steps > {BRACKET_MAX_STEPS}'
     elif not p['ok']:
@@ -443,22 +698,22 @@ def map_edge(omega, duty, k_run: int, esp: dict, period_s: float, t_send_ns=None
     return out
 
 
+def load_frames(frame_log: str) -> dict:
+    """t_send_ns, t_pulse0_ns, mosi, miso of a run_hil.py frame log (None for a missing array)."""
+    with np.load(frame_log, allow_pickle=False) as z:
+        return {k: (np.array(z[k]) if k in z.files else None) for k in ('t_send_ns', 't_pulse0_ns', 'mosi', 'miso')}
+
+
 def map_run(frame_log: str, esp_log: str) -> dict:
     """map_edge on the files (frame log of run_hil.py, ESP32 CSV of agv_logger.py)."""
     import hil_o1_score as H
     manifest, mosi, miso = H.load(frame_log)
     state, ref, flags, duty = H.decode_frames(mosi, miso)
     k_run, src = H.command_start(manifest, ref, flags)
-    out = map_edge(state[:, 0:4], duty, k_run, read_esp_log(esp_log), float(manifest.get('period_us', 1000)) * 1e-6,
-                   frame_send_times(frame_log))
+    out = map_edge(duty, k_run, read_esp_log(esp_log), float(manifest.get('period_us', 1000)) * 1e-6,
+                   load_frames(frame_log))
     out.update(k_run_src=src, frame_log=os.path.basename(frame_log), esp_log=os.path.basename(esp_log))
     return out
-
-
-def frame_send_times(frame_log: str):
-    """t_send_ns of a run_hil.py frame log, None when the file has none."""
-    with np.load(frame_log, allow_pickle=False) as z:
-        return np.array(z['t_send_ns']) if 't_send_ns' in z.files else None
 
 
 def main(argv=None) -> int:

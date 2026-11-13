@@ -60,7 +60,8 @@ def run(apply_ticks, omega, seed=1):
     apply_ticks[i] (us, increasing)."""
     apply_ticks = np.asarray(apply_ticks, dtype=np.int64)
     omega = np.asarray(omega, dtype=float)
-    lines = [str(len(apply_ticks))] + [f'{int(t)} {w[0]:.6f} {w[1]:.6f} {w[2]:.6f} {w[3]:.6f}'
+    # %.9g keeps a float32 value exact, so the C float of SetOmega equals the H7's (h7_omega32)
+    lines = [str(len(apply_ticks))] + [f'{int(t)} {w[0]:.9g} {w[1]:.9g} {w[2]:.9g} {w[3]:.9g}'
                                        for t, w in zip(apply_ticks, omega)]
     r = subprocess.run([build(), 'profile', str(seed)], input='\n'.join(lines) + '\n', capture_output=True,
                        text=True, check=True)

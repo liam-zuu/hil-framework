@@ -1,12 +1,14 @@
-"""RS-4 (tools/hil_edge_map.py), count side after L98: the ESP32 run_active edge bracketed on made-up runs whose
-true edge (Pi time) is known. The counts come from the H7 code itself (tools/tests/encgen_oracle.py: the
-unchanged encoder_gen.c in profile mode; Codex Sol G32-12, G32-R2-4), driven by the frame wheel speeds applied
-at T_k + d_k (d_k random in 0..750 us plus a constant 0..900 us), read at the ESP32 tick times (L98:
-counts read at t_now) mapped to the Pi clock with a rate difference; ticks are 10 ms with some 5 ms late
-(ESP_TICK/2026-11-13_scan); the pwm written in a tick reaches the MISO duty of the frame after the one the H7
-serviced (capture at the service time T_j + d_j, answer in frame j + 2), with capture glitches. Liam
-13/11/2026 CODE local_db99d287 ("Làm rs4 + g4 đi"), local_7f7b0ef4 ("Kẹp hai phía", "Sửa firmware" L98).
-Every number is invented."""
+"""RS-4 (tools/hil_edge_map.py), count side after L98/L99: the ESP32 run_active edge bracketed on made-up runs whose
+true edge (Pi time) is known. Everything the mapper reads is made the way the bench makes it:
+- frames: Pi send times (jitter, optional bursts), the H7 receive after the SPI transfer, the H7 apply after a
+  random age (18..750 us, as H7 'age_max'), MISO answering frame j - 2 with its MOSI CRC, H7 CYCCNT at the
+  receive (480 MHz, H7 clock off by some ppm), RX_NF, AGE and the duty captured at the H7 service;
+- counts: the unchanged H7 encoder_gen.c (tools/tests/encgen_oracle.py, profile mode) driven by the frame wheel
+  speeds at the apply times, read at the ESP32 tick time + 0..J_READ_US (L99), ESP32 clock off by `ppm`;
+- ticks 10 ms with some 5 ms late (ESP_TICK/2026-11-13_scan).
+Liam 13/11/2026 CODE local_db99d287 ("Làm rs4 + g4 đi"), local_7f7b0ef4 ("Kẹp hai phía", "Sửa firmware" L98),
+local_4dc05b46 ("Sửa hết, vòng 4" L99; Codex Sol RS4-R3-1..6). Every number is invented."""
+import base64
 import csv
 import json
 import math
@@ -36,7 +38,7 @@ needs_gcc = pytest.mark.skipif(not O.available(), reason='gcc not on PATH (H7 En
 
 
 def wheel_omega(n, k_move, kind='ramp'):
-    """Wheel speeds [rad/s] per frame: 0 before k_move (except 'moving'), then by kind."""
+    """Wheel speeds [rad/s] per frame: 0 before k_move, then by kind."""
     k = np.arange(n, dtype=float)
     u = np.clip((k - k_move) / 400.0, 0.0, 1.0)
     if kind == 'ramp':
@@ -48,38 +50,82 @@ def wheel_omega(n, k_move, kind='ramp'):
     elif kind == 'stop_start':
         base = 10.0 * u
         base[(k > k_move + 900) & (k < k_move + 1000)] = 0.0
+    elif kind == 'onoff':                                           # Codex RS4-R3-1: 1 ms on / 1 ms off
+        j = k - k_move
+        base = np.where((j >= 0) & (j < 20), np.where(j % 2 == 0, 10.0, 0.0), np.where(j >= 20, 10.0, 0.0))
+    elif kind == 'fast':                                            # Codex RS4-R3-1: hp 238 quantisation
+        base = np.where(k >= k_move, 39.91821039, 0.0)
     else:
         raise ValueError(kind)
     om = np.column_stack([base, -base * 1.07, base * 0.94, -base * 1.02])
     om[k < k_move] = 0.0
-    return om
+    return np.clip(om, -39.99, 39.99)
 
 
-def sim(edge_ms=415.3, k_run=400, n=5200, kind='ramp', move_after_ms=3.0, d0_us=400.0, ppm=30.0,
-        late=(3, 7, 40, 41, 90, 133), write_ms=0.4, glitch_every=97, n_before=6, seed=1, pwm_period=None):
-    """(omega, duty, esp log dict, t_send_ns, true edge step) of a made-up run; the true edge tick is at Pi
-    time edge_ms [ms] from frame 0."""
+def make_miso(mosi, duty, rx_us, age_us, h7_ppm=2.0, skip=(), lost=(), twice=()):
+    """MISO of each transfer j: the answer to frame j - 2 (hil_protocol.h offsets), duty in bytes 0-7. Frames in
+    `skip` were received but not applied (no answer, RX_NF counts them), in `lost` never reached the H7 (no answer,
+    not counted); for frames in `twice` the next transfer repeats the answer with another age."""
+    n = len(mosi)
+    miso = np.zeros((n, 40), dtype=np.uint8)
+    for j in range(2, n):
+        k = j - 2
+        if k in skip or k in lost:
+            continue
+        age_k = int(age_us[k])
+        if k - 1 in twice:
+            k = k - 1
+            age_k = int(age_us[k]) + 7
+        b = bytearray(40)
+        b[0:8] = np.round(np.clip(duty[j], -1.0, 1.0) * 32767).astype('>i2').tobytes()
+        b[10:12] = M.crc16(bytes(mosi[k])).to_bytes(2, 'little')
+        cyc = int(round((rx_us[k] + 1e6) * M.H7_CYC_PER_US * (1 + h7_ppm * 1e-6))) % 2 ** 32
+        b[12:16] = cyc.to_bytes(4, 'little')
+        b[17] = mosi[k][P.OFS_SEQ] if hasattr(P, 'OFS_SEQ') else (k & 0xFF)
+        b[18:20] = ((k + 1 - sum(1 for x in lost if x <= k)) & 0xFFFF).to_bytes(2, 'little')
+        b[20:22] = age_k.to_bytes(2, 'little')
+        b[8:10] = M.crc16(bytes(b[:8]) + bytes(b[10:])).to_bytes(2, 'little')
+        miso[j] = np.frombuffer(bytes(b), dtype=np.uint8)
+    return miso
+
+
+def sim(edge_ms=415.3, k_run=400, n=5200, kind='ramp', move_after_ms=3.0, ppm=30.0,
+        late=(3, 7, 40, 41, 90, 133), write_ms=0.4, glitch_every=97, n_before=6, seed=1, pwm_period=None,
+        burst=None, stale_ms=0.0, skip=(), dup=()):
+    """dict(duty, esp, frames, k_true, timing) of a made-up run with the edge tick at Pi time edge_ms."""
     rng = np.random.default_rng(seed)
-    k = np.arange(n)
-    T = k * 1000.0 - rng.uniform(0.0, 140.0, n) * (k > 0)         # Pi send times [us] (jitter, as run08)
-    T[1:] = np.maximum(T[1:], T[:-1] + 1.0)
+    dt = np.full(n, 1000.0)
+    if burst:
+        dt[burst[0]:burst[0] + burst[1]] = burst[2]                   # catch-up frames closer than 1 ms
+    T = np.r_[0.0, np.cumsum(dt[:-1])] - rng.uniform(0.0, 140.0, n) * (np.arange(n) > 0)
+    T[1:] = np.maximum(T[1:], T[:-1] + 50.0)
+    rx = T + 320.0 + rng.uniform(0.0, 50.0, n)                       # 40 bytes at 1 MHz, then a little
+    age = np.round(rng.uniform(18.0, 750.0, n))
+    age = np.minimum(age, np.maximum(np.r_[np.diff(rx), 1000.0] - 30.0, 1.0))   # applied before the next frame
+    apply = rx + age
     om = wheel_omega(n, int(edge_ms + move_after_ms), kind)
-    d = d0_us + rng.uniform(0.0, 750.0, n)                         # H7 applies frame k at T_k + d_k
-    app = np.round(T + d + 10_000).astype(np.int64)                # oracle ticks (offset keeps them >= 0)
+    mosi = np.array([np.frombuffer(P.encode_state(list(om[k]) + [0.0] * 6, seq=k), dtype=np.uint8)
+                     for k in range(n)])
+    for k in dup:                                                   # two equal MOSI frames (seen on run11 K1b)
+        mosi[k + 1] = mosi[k]
+    om32 = M.h7_omega32(mosi)
+    app = np.round(apply + 10_000).astype(np.int64)
     for i in range(1, n):
         app[i] = max(app[i], app[i - 1] + 1)
-    counts = O.run(app, om, seed)
+    on = np.array([k not in skip for k in range(n)])                 # skipped frames are never applied
+    counts = O.run(app[on], om32[on].astype(np.float64), seed)
     t_e = edge_ms * 1000.0
     ts_e = 5_000_000.0
 
-    def pi_time(ts):                                               # ESP32 clock -> Pi time (truth, with drift)
+    def pi_time(ts):                                               # ESP32 clock -> Pi time (truth)
         return t_e + (ts - ts_e) * (1.0 + ppm * 1e-6)
     n_ticks = int((T[-1] - t_e - 60_000) / 10_000)
     ts = [ts_e - i * 100_000.0 for i in range(n_before, 0, -1)]
     ts += [ts_e + j * 10_000.0 + (5_000.0 if j in late else 0.0) for j in range(n_ticks)]
     ts = np.array(ts)
     run = np.r_[np.zeros(n_before, int), np.ones(n_ticks, int)]
-    cnt = counts.at(np.round(pi_time(ts) + 10_000).astype(np.int64))   # L98: read at t_now
+    read = pi_time(ts) + rng.uniform(0.0, M.J_READ_US, len(ts)) - stale_ms * 1000.0
+    cnt = counts.at(np.round(read + 10_000).astype(np.int64))
     j = np.arange(n_ticks)
     if pwm_period:
         p = 60.0 + 30.0 * ((j // (pwm_period // 2)) % 2)
@@ -87,17 +133,25 @@ def sim(edge_ms=415.3, k_run=400, n=5200, kind='ramp', move_after_ms=3.0, d0_us=
         p = np.round(60 + 40 * np.sin(0.13 * j) + 20 * np.sin(0.051 * j + 1.0))
     p[0] = 15.0
     pw = np.r_[np.zeros((n_before, 4)), np.round(np.column_stack([p, p * 0.9, p * 1.1, p]))]
-    # MISO duty of frame f: the pwm written before the H7 serviced frame f - 2 (capture then, answer in f)
+    # MISO duty of transfer f: the pwm written before the H7 serviced frame f - 2
     write_t = pi_time(ts + write_ms * 1000.0)
-    serv = np.r_[np.full(2, -1e18), (T + d)[:-2]]
+    serv = np.r_[np.full(2, -1e18), apply[:-2]]
     idx = np.searchsorted(write_t, serv, side='right') - 1
     duty = np.where(idx[:, None] >= 0, pw[np.clip(idx, 0, len(pw) - 1)], 0.0) * (-1.0 / 1000.0)
     if glitch_every:
-        duty[k_run + 50::glitch_every, 1] = -1.0                 # capture glitch frames
+        duty[k_run + 50::glitch_every, 1] = -1.0                     # capture glitch frames
     esp = dict(timestamp_us=ts.astype(np.int64), log_seq=np.arange(100, 100 + len(ts), dtype=np.int64),
-               motor_on=run.copy(), run_active=run.copy(), counts=cnt.astype(float), pwm=pw, fw=list(FW))
-    t_send_ns = np.round((T + 7.0e9) * 1000.0).astype(np.int64)
-    return om, duty, esp, t_send_ns, float(np.interp(t_e, T, k))
+               motor_on=run.copy(), run_active=run.copy(), counts=cnt.astype(float), pwm=pw, fw=list(FW),
+               esp_pi_ppm=ppm)
+    frames = dict(t_send_ns=np.round((T + 7.0e9) * 1000.0).astype(np.int64),
+                  t_pulse0_ns=np.round((T - 60.0 + 7.0e9) * 1000.0).astype(np.int64),
+                  mosi=mosi, miso=make_miso(mosi, duty, rx, age, skip=skip))
+    return dict(duty=duty, esp=esp, frames=frames, k_true=float(np.interp(t_e, T, np.arange(n))),
+                timing=dict(T=T, rx=rx, age=age, om=om, skip=skip))
+
+
+def run(s, k_run=400, **over):
+    return M.map_edge(s['duty'], k_run, dict(s['esp'], **over), 1e-3, s['frames'])
 
 
 def _check_bracket(em, edge):
@@ -109,95 +163,200 @@ def _check_bracket(em, edge):
 def test_constants_match_the_h7_source():
     h = open(os.path.join(ROOT, 'stm32h7', 'Core', 'Inc', 'encoder_gen.h'), encoding='utf-8', errors='replace').read()
     c = open(os.path.join(ROOT, 'stm32h7', 'Core', 'Src', 'encoder_gen.c'), encoding='utf-8', errors='replace').read()
+    p = open(os.path.join(ROOT, 'stm32h7', 'Core', 'Inc', 'hil_protocol.h'), encoding='utf-8', errors='replace').read()
     assert int(re.search(r'#define\s+ENC_PPR\s+(\d+)u', h).group(1)) == M.ENC_PPR
     assert float(re.search(r'#define\s+ENC_OMEGA_MIN\s+([0-9.]+)f', c).group(1)) == M.OMEGA_MIN
+    f = float(re.search(r'#define\s+ENC_TIMER_FREQ\s+(\d+)UL', h).group(1))
+    cal = float(re.search(r'#define\s+ENC_CLOCK_CAL\s+([0-9.]+)f', h).group(1))
+    assert f * cal == M.ENC_TIMER_HZ
+    assert float(re.search(r'#define\s+HIL_OMEGA_MAX\s+([0-9.]+)f', p).group(1)) == M.HIL_OMEGA_MAX
+    for name, val in (('MOSI_CRC', M.MISO_MOSI_CRC), ('RX_NF', M.MISO_RX_NF), ('AGE', M.MISO_AGE)):
+        assert int(re.search(rf'#define\s+HIL_MISO_{name}\s+(\d+)', p).group(1)) == val
+    assert P.OFS_MISO_CRC == M.MISO_CRC
     assert M.COUNTS_PER_REV == 1320
 
 
-@needs_gcc
-@pytest.mark.parametrize('edge,d0,ppm,write', [(415.3, 400.0, 30.0, 0.4), (437.85, 0.0, -100.0, 0.4),
-                                               (408.1, 900.0, 100.0, 7.4), (420.5, 250.0, 0.0, 9.0)])
-def test_bracket_holds_the_true_edge(edge, d0, ppm, write):
-    om, duty, esp, tsend, k_true = sim(edge_ms=edge, d0_us=d0, ppm=ppm, write_ms=write)
-    em = M.map_edge(om, duty, 400, esp, 1e-3, tsend)
-    _check_bracket(em, k_true)
-    assert em['u_t_s'] < 6e-3
-    assert em['u_t_s'] == pytest.approx(sum(em['u_t_parts_s'].values()))
-    assert em['frame_times'] == 't_send_ns'
+def test_half_period_as_the_h7():
+    om = np.array([[39.91821039, 10.0, 0.31, 0.0]], dtype=np.float32)
+    hp, amb = M.h7_half_period(om)
+    assert hp[0, 0] == 238.0                                         # Codex RS4-R3-1 (b)
+    assert hp[0, 1] == round(1e6 * math.pi / (10.0 * 330))
+    assert hp[0, 3] == 65535.0 and not amb[0, 3]
+
+
+def test_enc_model_events_and_integral():
+    mosi = np.zeros((5, 40), dtype=np.uint8)
+    om = np.array([[0, 0, 0, 0], [10, 10, 10, -10], [20, 5, 10, 10], [20, 0, 10, 10], [20, 5, 10, 10]], float)
+    for k in range(5):
+        mosi[k] = np.frombuffer(P.encode_state(list(om[k]) + [0.0] * 6, seq=k), dtype=np.uint8)
+    m = M.EncModel(np.array([0.0, 1000.0, 2000.0, 3000.0, 4000.0]), mosi, 1.0)
+    hp, _ = M.h7_half_period(M.h7_omega32(mosi))
+    ev, bad = m.events(np.array([1500.0]), np.array([2500.0]))                 # the change at 2000 only
+    r = hp[2, 0] / hp[1, 0]
+    assert ev[0, 0] == pytest.approx(min(M.RETIME_MAX, 2 * (1 / r - 1)))     # speed-up 10 -> 20
+    r1 = hp[2, 1] / hp[1, 1]
+    assert ev[0, 1] == pytest.approx(min(M.RETIME_MAX, 2 * (1 - 1 / r1)))    # slow-down 10 -> 5
+    assert ev[0, 2] == 0 and bad[0].tolist() == [0, 0, 0, 1]                   # same speed; reversal
+    ev1, _ = m.events(np.array([1000.0]), np.array([1000.0]))                  # an event at t0 counts
+    assert ev1[0, 0] == pytest.approx(M.E_START)
+    _, bad2 = m.events(np.array([2500.0]), np.array([4500.0]))
+    assert bad2[0].tolist() == [0, 1, 0, 0]                                    # stop of wheel 1
+    q = m.Q(np.array([1500.0]))
+    assert q[0, 0] == pytest.approx(0.5e-3 * 2e6 / hp[1, 0])
+    assert m.wmax(np.array([1500.0]), np.array([2500.0]))[0] == pytest.approx(2e6 / hp[2:].min())
 
 
 @needs_gcc
-def test_moving_at_the_edge_and_stop_start():
-    # Codex G32-R2-1 (a): wheels already turning at the edge; a stop / restart inside the fit span
-    for kind, after in (('ramp', -40.0), ('stop_start', 3.0)):
-        om, duty, esp, tsend, k_true = sim(kind=kind, move_after_ms=after)
-        _check_bracket(M.map_edge(om, duty, 400, esp, 1e-3, tsend), k_true)
+@pytest.mark.parametrize('edge,ppm,write,seed', [(415.3, 30.0, 0.4, 1), (437.85, -90.0, 0.4, 2),
+                                                 (408.1, 90.0, 7.4, 3), (420.5, 0.0, 9.0, 4)])
+def test_bracket_holds_the_true_edge(edge, ppm, write, seed):
+    s = sim(edge_ms=edge, ppm=ppm, write_ms=write, seed=seed)
+    em = run(s)
+    _check_bracket(em, s['k_true'])
+    assert em['u_t_s'] < 7e-3
+    assert em['u_t_s'] == pytest.approx(0.5 * (em['late_step'] - em['early_step']) * 1e-3)   # RS4-R3-5
+    assert em['h7_apply']['ok'] and em['h7_apply']['tau_lo'] <= em['h7_apply']['tau_hi']
 
 
 @needs_gcc
-def test_slow_wheels_are_refused_or_bracketed():
-    # Codex G32-R2-1 (a): 1 rad/s from before the edge then a very slow ramp: one count is about 4.8 ms
-    om, duty, esp, tsend, k_true = sim(kind='slow', move_after_ms=-17.0)
-    em = M.map_edge(om, duty, 400, esp, 1e-3, tsend)
-    assert (not em['ok']) or (em['early_step'] <= k_true <= em['late_step'])
+@pytest.mark.parametrize('kind,after', [('ramp', -40.0), ('stop_start', 3.0), ('fast', 3.0)])
+def test_moving_at_the_edge_stop_start_and_fast(kind, after):
+    # Codex G32-R2-1 (a): wheels turning at the edge; a stop / restart in the fit span; RS4-R3-1 (b) 39.9 rad/s
+    s = sim(kind=kind, move_after_ms=after)
+    _check_bracket(run(s), s['k_true'])
 
 
 @needs_gcc
-def test_periodic_run_is_refused_or_bracketed():
-    # G32-6: speeds and pwm repeating every 100 steps (10 ticks): an alias of the edge must not pass silently
-    om, duty, esp, tsend, k_true = sim(kind='periodic', pwm_period=10, glitch_every=0)
-    em = M.map_edge(om, duty, 400, esp, 1e-3, tsend)
-    assert (not em['ok']) or (em['early_step'] <= k_true <= em['late_step'])
+@pytest.mark.parametrize('kind,after,extra', [('slow', -17.0, {}), ('onoff', 2.7, {}),
+                                              ('periodic', 3.0, dict(pwm_period=10, glitch_every=0))])
+def test_hard_profiles_are_refused_or_bracketed(kind, after, extra):
+    # slow wheels (Codex G32-R2-1 a), 1 ms on / off starts (RS4-R3-1 a), a periodic pattern (G32-6)
+    s = sim(kind=kind, move_after_ms=after, **extra)
+    em = run(s)
+    assert (not em['ok']) or (em['early_step'] <= s['k_true'] <= em['late_step']), em
 
 
 @needs_gcc
-def test_stale_counts_of_the_old_firmware_are_caught():
-    # the pre-L98 log: counts copied 7 ms before the tick; with the old firmware's #fw line it is refused,
-    # and even with the firmware check bypassed the stale counts must not give a wrong narrow bracket silently
-    om, duty, esp, tsend, k_true = sim()
-    old = dict(esp, fw=[dict(sha='cfc892b0ba28', dirty='0', env='esp32-s3-devkitc-1')])
-    em = M.map_edge(om, duty, 400, old, 1e-3, tsend)
-    assert not em['ok'] and 'L98' in em['reason']
+def test_catch_up_frames_and_u_t_in_plant_steps():
+    # Codex RS4-R3-5: frames sent 0.5 ms apart near the edge; U_t is in the scorer's plant-step time
+    s = sim(burst=(395, 40, 500.0))
+    em = run(s)
+    _check_bracket(em, s['k_true'])
+    assert em['u_t_s'] == pytest.approx(0.5 * (em['late_step'] - em['early_step']) * 1e-3)
+    assert em['edge_step'] == pytest.approx(0.5 * (em['early_step'] + em['late_step']))
+
+
+@needs_gcc
+def test_cells_cover_every_fitting_time():
+    # Codex RS4-R3-4: every s that fits on a 1 us grid lies inside the kept cells
+    s = sim()
+    em = run(s)
+    assert em['ok'], em['reason']
+    esp, fr = s['esp'], s['frames']
+    T = (fr['t_send_ns'] - fr['t_send_ns'][0]) / 1e3
+    k_lo, k_hi = 400 + int(M.SEARCH[0]) - 20, 4000
+    ap = M.h7_apply(fr, k_lo, k_hi)
+    model = M.EncModel(ap['apply_us'][k_lo:k_hi], fr['mosi'][k_lo:k_hi], ap['h7_rate'])
+    ie = int(M.rising_edges(esp['run_active'])[0])
+    c = M.count_side(model, T, 400, esp, ie)
+    lines = np.arange(ie, len(esp['timestamp_us']))
+    D = (esp['timestamp_us'][lines] - esp['timestamp_us'][ie]).astype(float)
+    sel = D <= c['fit_span_s'] * 1e6 + 1
+    dc = esp['counts'][lines][sel] - esp['counts'][ie]
+    probe = np.arange(c['s_lo'] - 400.0, c['s_hi'] + 400.0, 1.0)
+    r = M._ratio(model, probe, D[sel], dc, np.ones((sel.sum(), 4), bool), 0.0)
+    fit = probe[r <= 1.0]
+    assert len(fit) and fit.min() >= c['s_lo'] and fit.max() <= c['s_hi']
+
+
+@needs_gcc
+def test_refusals_firmware_clock_frames():
+    s = sim()
     for fw, word in ((None, 'no events file'), ([], 'no #fw'), ([dict(FW[0], dirty='1')], 'dirty=1'),
+                     ([dict(sha='2c026415dfc6', dirty='0')], '2c026415dfc6'),        # L98 without the L99 bound
+                     ([dict(sha='cfc892b0ba28', dirty='0')], 'cfc892b0ba28'),
                      (FW + [dict(sha='54b7269abcde', dirty='0')], '54b7269abcde')):
-        em = M.map_edge(om, duty, 400, dict(esp, fw=fw), 1e-3, tsend)
+        em = run(s, fw=fw)
         assert not em['ok'] and word in em['reason'], em['reason']
+    for ppm in (None, 150.0, -101.0):
+        assert 'clock rate' in run(s, esp_pi_ppm=ppm)['reason']
+    assert 'H7 apply times not known' in M.map_edge(s['duty'], 400, s['esp'], 1e-3, None)['reason']
+    tm = s['timing']
+    fr = dict(s['frames'], miso=make_miso(s['frames']['mosi'], s['duty'], tm['rx'], tm['age'], lost=(700,)))
+    em = M.map_edge(s['duty'], 400, s['esp'], 1e-3, fr)                # a frame that never reached the H7
+    assert not em['ok'] and 'did not reach the H7' in em['reason']
+    fr = dict(s['frames'], miso=make_miso(s['frames']['mosi'], s['duty'], tm['rx'], tm['age'], twice=(700,)))
+    em = M.map_edge(s['duty'], 400, s['esp'], 1e-3, fr)                # two different answers for one frame
+    assert not em['ok'] and 'different' in em['reason']
+    bad_t = dict(s['frames'], t_send_ns=s['frames']['t_send_ns'].copy())
+    bad_t['t_send_ns'][50] = bad_t['t_send_ns'][49]
+    assert 'increasing' in M.map_edge(s['duty'], 400, s['esp'], 1e-3, bad_t)['reason']
 
 
 @needs_gcc
-def test_lost_edge_lines_refuse():
-    # G32-4: the first two run_active lines lost; the next line still looks like an edge
-    om, duty, esp, tsend, _ = sim()
-    keep = np.r_[0:6, 8:len(esp['log_seq'])]
-    esp2 = {k: (v[keep] if isinstance(v, np.ndarray) else v) for k, v in esp.items()}
-    em = M.map_edge(om, duty, 400, esp2, 1e-3, tsend)
-    assert not em['ok'] and 'log_seq' in em['reason']
+def test_frames_the_h7_did_not_apply():
+    # the H7 main loop took a newer frame: the skipped frames' speeds never reach EncoderGen (RS4-R3-2)
+    s = sim(skip=(430, 431, 520, 777, 1500))
+    em = run(s)
+    _check_bracket(em, s['k_true'])
+    assert em['h7_apply']['n_not_applied'] >= 4
+
+
+@needs_gcc
+def test_equal_mosi_frames_answer_by_lag_two():
+    # two consecutive frames with the same bytes have the same CRC: the answer lag 2 decides (CLOSED_LOOP/
+    # 2026-11-13_run11 K1b frames 4126, 4127)
+    s = sim(dup=(425, 700, 1201))
+    em = run(s)
+    _check_bracket(em, s['k_true'])
+    assert em['h7_apply']['n_not_applied'] == 0
+
+
+@needs_gcc
+def test_invalid_count_lines():
+    s = sim()
+    esp = dict(s['esp'], counts=s['esp']['counts'].copy())
+    esp['counts'][[30, 31, 200]] = M.LOG_CNT_INVALID                  # L99: lines read too late are dropped
+    em = M.map_edge(s['duty'], 400, esp, 1e-3, s['frames'])
+    _check_bracket(em, s['k_true'])
+    assert em['count_side']['n_invalid_lines'] == 3
+    esp['counts'][6] = M.LOG_CNT_INVALID                               # the edge line itself
+    assert 'edge line has no valid counts' in M.map_edge(s['duty'], 400, esp, 1e-3, s['frames'])['reason']
 
 
 @needs_gcc
 def test_refusals():
-    om, duty, esp, tsend, _ = sim()
+    s = sim()
+    esp = s['esp']
     two = {k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in esp.items()}
     two['run_active'][len(two['run_active']) // 2] = 0
-    assert '2 run_active rising edges' in M.map_edge(om, duty, 400, two, 1e-3, tsend)['reason']
+    assert '2 run_active rising edges' in M.map_edge(s['duty'], 400, two, 1e-3, s['frames'])['reason']
     none = dict(esp, run_active=np.zeros_like(esp['run_active']))
-    assert 'need exactly 1' in M.map_edge(om, duty, 400, none, 1e-3, tsend)['reason']
+    assert 'need exactly 1' in M.map_edge(s['duty'], 400, none, 1e-3, s['frames'])['reason']
     still = dict(esp, counts=np.zeros_like(esp['counts']))
-    assert 'never move' in M.map_edge(om, duty, 400, still, 1e-3, tsend)['reason']
-    shifted = dict(esp, counts=esp['counts'] + np.where(np.arange(len(esp['counts']))[:, None] > 60, 40.0, 0.0))
-    assert 'no Pi time fits' in M.map_edge(om, duty, 400, shifted, 1e-3, tsend)['reason']   # 40 counts jump
+    assert 'never move' in M.map_edge(s['duty'], 400, still, 1e-3, s['frames'])['reason']
+    jump = dict(esp, counts=esp['counts'] + np.where(np.arange(len(esp['counts']))[:, None] > 60, 40.0, 0.0))
+    assert 'no Pi time fits' in M.map_edge(s['duty'], 400, jump, 1e-3, s['frames'])['reason']
     nopwm = dict(esp, pwm=np.zeros_like(esp['pwm']))
-    assert 'PWM cross-check failed' in M.map_edge(om, duty, 400, nopwm, 1e-3, tsend)['reason']
-    em = M.map_edge(om, np.zeros_like(duty), 400, esp, 1e-3, tsend)                 # no duty in the frames
-    assert not em['ok'] and 'PWM' in em['reason']
-    early_duty = np.r_[duty[30:], np.repeat(duty[-1:], 30, axis=0)]                   # duty 30 ms before its write
-    em = M.map_edge(om, early_duty, 400, esp, 1e-3, tsend)
+    assert 'PWM cross-check failed' in M.map_edge(s['duty'], 400, nopwm, 1e-3, s['frames'])['reason']
+    early_duty = np.r_[s['duty'][30:], np.repeat(s['duty'][-1:], 30, axis=0)]       # duty 30 ms before its write
+    em = M.map_edge(early_duty, 400, esp, 1e-3, s['frames'])
     assert not em['ok'] and 'cannot precede' in em['reason']
-    em = M.map_edge(om, duty, 1000, esp, 1e-3, tsend)                                 # RUN step far after the edge
-    assert not em['ok']
-    bad_t = tsend.copy()
-    bad_t[50] = bad_t[49]
-    assert 'increasing' in M.map_edge(om, duty, 400, esp, 1e-3, bad_t)['reason']
+    assert not M.map_edge(s['duty'], 1000, esp, 1e-3, s['frames'])['ok']              # RUN step far after the edge
+    keep = np.r_[0:6, 8:len(esp['log_seq'])]                                          # G32-4: edge lines lost
+    lost = {k: (v[keep] if isinstance(v, np.ndarray) else v) for k, v in esp.items()}
+    em = M.map_edge(s['duty'], 400, lost, 1e-3, s['frames'])
+    assert not em['ok'] and 'log_seq' in em['reason']
+
+
+@needs_gcc
+def test_stale_counts_are_not_accepted_silently():
+    # pre-L98 firmware read counts up to ~10 ms before the tick; such logs are refused by the #fw check (above);
+    # here the same stale counts under an accepted #fw line: the bracket must not hold a wrong edge silently
+    # in this made-up run (a refusal is fine)
+    s = sim(stale_ms=7.0)
+    em = run(s)
+    assert (not em['ok']) or (em['early_step'] <= s['k_true'] + 7.0 + 1e-6)
 
 
 def test_plateau_right_end():
@@ -208,16 +367,19 @@ def test_plateau_right_end():
     assert lo == pytest.approx(0.6) and hi == pytest.approx(1.55, abs=0.011)
 
 
-def test_theta_matches_the_integral():
-    T = np.array([0.0, 1000.0, 2100.0, 3000.0])
-    om = np.array([[0.2, 1, 2, -3], [1.0, 1, 2, -3], [2.0, 1, 2, -3], [2.0, 0, 0, 0]])
-    th, j = M.Theta(T, om).at(np.array([-5.0, 500.0, 1500.0, 3500.0]))
-    assert th[0].tolist() == [0, 0, 0, 0] and j.tolist() == [0, 0, 1, 3]
-    assert th[1] == pytest.approx([0.0, 0.5e-3, 1.0e-3, -1.5e-3])                   # 0.2 rad/s is below the dead zone
-    assert th[3] == pytest.approx([1.1e-3 + 1.8e-3 + 1.0e-3, 3.0e-3, 6.0e-3, -9.0e-3])
+def test_esp_clock_ppm_from_raw(tmp_path):
+    rng = np.random.default_rng(3)
+    ts = np.arange(0, 12_000_000, 10_000) + 1_000_000
+    for true in (-40.0, 0.0, 35.0):
+        rx = ts * (1 + true * 1e-6) + 5e6 + 300.0 + rng.exponential(600.0, len(ts))   # floor + WiFi delay
+        p = tmp_path / f'r{true}.jsonl'
+        with open(p, 'w') as f:
+            for a, b in zip(ts, rx):
+                f.write(json.dumps(dict(t_mono_ns=int(b * 1e3), b64=base64.b64encode(f'{a},0,0'.encode()).decode())) + '\n')
+        assert M.esp_clock_ppm(str(p)) == pytest.approx(true, abs=5.0)
 
 
-def write_esp_csv(path, esp, columns=COLUMNS, extra_rows=(), fw=FW):
+def write_esp_csv(path, esp, columns=COLUMNS, extra_rows=(), fw=FW, ppm=None):
     with open(path, 'w', newline='', encoding='utf-8') as f:
         w = csv.writer(f)
         w.writerow(columns)
@@ -238,21 +400,27 @@ def write_esp_csv(path, esp, columns=COLUMNS, extra_rows=(), fw=FW):
             f.write('2026-11-13T01:45:57.545110 #logger,start\n')
             for d in fw:
                 f.write('2026-11-13T01:45:57.545975 #fw,' + ','.join(f'{k}={v}' for k, v in d.items()) + '\n')
+    if ppm is not None:                                               # raw packets: Pi receive vs ESP32 timestamp
+        rng = np.random.default_rng(5)
+        ts = np.arange(esp['timestamp_us'][0], esp['timestamp_us'][0] + 8_000_000, 10_000)
+        rx = ts * (1 + ppm * 1e-6) + 300.0 + rng.exponential(600.0, len(ts))
+        with open(path + '.raw.jsonl', 'w') as f:
+            for a, b in zip(ts, rx):
+                f.write(json.dumps(dict(t_mono_ns=int(b * 1e3), b64=base64.b64encode(f'{a},1'.encode()).decode())) + '\n')
 
 
 @needs_gcc
 def test_read_esp_log_order_duplicates_columns_and_fw(tmp_path):
-    _, _, esp, _, _ = sim(n=3000)
+    s = sim(n=3000)
+    esp = s['esp']
     p = str(tmp_path / 'r.csv')
-    write_esp_csv(p, esp)
+    write_esp_csv(p, esp, ppm=20.0)
     got = M.read_esp_log(p)
     assert np.array_equal(got['log_seq'], esp['log_seq']) and np.array_equal(got['pwm'], esp['pwm'])
-    assert got['fw'] == FW and M.fw_check(got['fw']) == ''
-    # G32-10: a duplicate line without a segment file refuses the log
-    write_esp_csv(p, esp, extra_rows=(40,))
+    assert got['fw'] == FW and M.fw_check(got['fw']) == '' and got['esp_pi_ppm'] == pytest.approx(20.0, abs=8.0)
+    write_esp_csv(p, esp, extra_rows=(40,))                            # G32-10: duplicate without segment file
     with pytest.raises(ValueError, match='duplicate line'):
         M.read_esp_log(p)
-    # with the segment file marking it, it is dropped; a conflict refuses
     with open(p, newline='') as f:
         body = list(csv.reader(f))[1:]
     seg = p + '.segments.csv'
@@ -270,20 +438,20 @@ def test_read_esp_log_order_duplicates_columns_and_fw(tmp_path):
     with pytest.raises(ValueError, match='conflict'):
         M.read_esp_log(p)
     os.remove(seg)
-    # any column count that has the needed columns (85 or 86 column logs); no events file: fw None
     p2 = str(tmp_path / 'small.csv')
     write_esp_csv(p2, esp, columns=list(M.NEED) + ['traj_age_ms'], fw=None)
     g2 = M.read_esp_log(p2)
-    assert np.array_equal(g2['counts'], got['counts']) and g2['fw'] is None and 'no events file' in M.fw_check(None)
+    assert np.array_equal(g2['counts'], got['counts']) and g2['fw'] is None and g2['esp_pi_ppm'] is None
     p3 = str(tmp_path / 'bad.csv')
     write_esp_csv(p3, esp, columns=[c for c in M.NEED if c != 'pwm_fl'])
     with pytest.raises(ValueError, match='pwm_fl'):
         M.read_esp_log(p3)
 
 
-def write_frame_log(path, task, k_run, om, duty, t_send_ns=None):
-    """Figure-8 frame log: plant pose from k where omega starts, wheel speeds in the omega slots, the duty in
-    MISO bytes 0-7 (not kinematically tied to the pose: only RS-4 reads them), t_send_ns when given."""
+def write_frame_log(path, task, k_run, s):
+    """Figure-8 frame log from a sim: plant pose from k where omega starts, the sim's wheel speeds in the omega
+    slots, the MISO answers (with the duty) rebuilt for these MOSI bytes, the sim's frame times."""
+    om, tm = s['timing']['om'], s['timing']
     n = len(om)
     k_move = int(np.argmax(np.any(om != 0, axis=1)))
     t = np.arange(n - k_move) * 1e-3
@@ -292,33 +460,30 @@ def write_frame_log(path, task, k_run, om, duty, t_send_ns=None):
     vel = np.gradient(pose[:, :2], 1e-3, axis=0)
     wz = np.gradient(np.unwrap(pose[:, 2]), 1e-3)
     mosi = np.zeros((n, 40), dtype=np.uint8)
-    miso = np.zeros((n, 40), dtype=np.uint8)
     for k in range(n):
         st = list(om[k]) + [pose[k, 0], pose[k, 1], pose[k, 2], vel[k, 0], vel[k, 1], wz[k]]
         on = k >= k_run + 3
         mosi[k] = np.frombuffer(P.encode_state(st, traj_ref=(0.3, 0.0, 0.1) if on else None,
                                                traj_flags=P.TRAJ_VALID if on else 0, seq=k), dtype=np.uint8)
-        miso[k, 0:8] = np.frombuffer(np.round(duty[k] * 32767).astype('>i2').tobytes(), dtype=np.uint8)
+    miso = make_miso(mosi, s['duty'], tm['rx'], tm['age'], skip=tm['skip'])
     manifest = dict(period_us=1000, steps=n, plant='MecanumPlant', miso_check=dict(crc_bad=0, empty=0),
                     lifecycle=dict(outcome='completed', transitions=[dict(step=0, t=0, phase='ARM'),
                                                                      dict(step=k_run, t=0.4, phase='RUN')]))
-    extra = {} if t_send_ns is None else dict(t_send_ns=t_send_ns)
-    np.savez(path, manifest=np.array(json.dumps(manifest)), mosi=mosi, miso=miso, **extra)
-    state, _, _, d = H.decode_frames(mosi, miso)
-    return state[:, 0:4], d
+    np.savez(path, manifest=np.array(json.dumps(manifest)), mosi=mosi, miso=miso,
+             t_send_ns=s['frames']['t_send_ns'], t_pulse0_ns=s['frames']['t_pulse0_ns'])
 
 
 @needs_gcc
 def test_scorer_with_esp_log_decides_all_five(tmp_path):
     p, c = str(tmp_path / 'run.npz'), str(tmp_path / 'run.csv')
     n = int((H.Schedule(H.FIG8['O1-F05']).Tcmd + 2.5) / 1e-3) + 420
-    om, duty, esp, tsend, k_true = sim(edge_ms=400.0, k_run=388, n=n)
-    om_q, duty_q = write_frame_log(p, 'O1-F05', 388, om, duty, tsend)   # frames carry omega, duty as int16
-    write_esp_csv(c, esp)
+    s = sim(edge_ms=400.0, k_run=388, n=n)
+    write_frame_log(p, 'O1-F05', 388, s)
+    write_esp_csv(c, s['esp'], ppm=20.0)
     out = H.score(p, 'O1-F05', esp_log=c)
     em, g = out['edge_map'], out['gate_v3']
-    _check_bracket(em, k_true)
-    assert em['frame_times'] == 't_send_ns' and M.map_run(p, c)['ok']
+    _check_bracket(em, s['k_true'])
+    assert M.map_run(p, c)['ok']
     assert out['t0_src'] == 'esp32_run_active_edge' and out['k_run'] == 388
     assert g['decide'] == list(G.CONDS) and g['u_t'] == pytest.approx(em['u_t_s']) and g['complete']
     js = H._json_safe(out)
@@ -327,16 +492,16 @@ def test_scorer_with_esp_log_decides_all_five(tmp_path):
     plain = H.score(p, 'O1-F05')                                         # no ESP32 log: RUN step, G1, G2 decide
     assert plain['t0_src'] == 'lifecycle_RUN' and plain['gate_v3']['decide'] == list(G.DECIDE_HIL)
     assert plain['edge_map'] == dict(ok=False, reason='no --esp-log') and not plain['gate_v3']['complete']
-    os.remove(c + '.events.txt')                                         # firmware not known: G1, G2 only
-    nofw = H.score(p, 'O1-F05', esp_log=c)
-    assert not nofw['edge_map']['ok'] and nofw['gate_v3']['decide'] == list(G.DECIDE_HIL)
+    os.remove(c + '.raw.jsonl')                                          # ESP32 clock not checked: G1, G2 only
+    noclk = H.score(p, 'O1-F05', esp_log=c)
+    assert not noclk['edge_map']['ok'] and noclk['gate_v3']['decide'] == list(G.DECIDE_HIL)
 
 
 @needs_gcc
 def test_scorer_cli_esp_log_errors(tmp_path):
     p, c = str(tmp_path / 'run.npz'), str(tmp_path / 'run.csv')
-    om, duty, _, tsend, _ = sim(n=3000)
-    write_frame_log(p, 'O1-F05', 400, om, duty, tsend)
+    s = sim(n=3000)
+    write_frame_log(p, 'O1-F05', 400, s)
     with open(c, 'w') as f:
         f.write('timestamp_us,log_seq\n1,1\n')
     assert H.main(['--frame-log', p, '--task', 'O1-F05', '--esp-log', c]) == 2       # bad log: an error
