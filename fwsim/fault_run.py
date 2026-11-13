@@ -17,8 +17,10 @@ Assumptions (stated by the author, to be checked): inside one fwsim step k (t = 
 IMU report (noise.apply, then hook), then fw.tick, then plant_step(x_k) -> x_{k+1}, and adds omega(x_{k+1})*dt
 to the wheel angle (fwsim.py 2b2426b lines 355-392; pinned by tests/test_fault_run.py). t0 = 0.
 
-Differences to the bench (to state with the results): with this wrapper the IMU values always go through
-firmware_view, also with the noise off, so a baseline run must use this wrapper with no row (--baseline);
+Differences to the bench (to state with the results): imu['noise'] is wrapped only when the run has IMU
+noise or an imu_delay / gyro_scale row (Codex FI1-5); then the IMU values go through firmware_view, also
+with the noise off, and fault_imu has a row per report; else the IMU path is exactly simulate's and
+fault_imu is empty. Compare a fault run with a --baseline run (this wrapper, no row) of the same noise;
 the IMU loss acts from the next report (the H7 may still deliver one queued report); after an encoder loss
 the count goes on from where it stood (the H7 restarts its pulse train with a new phase).
 
@@ -156,7 +158,10 @@ class FwsimFaults:
                 return None
             return user_hook(t, kind, v) if user_hook else v
 
-        imu['noise'] = _Noise(inner, self)
+        if inner is not None or any(r.fault in ('imu_delay', 'gyro_scale') for r in self.schedule.rows):
+            imu['noise'] = _Noise(inner, self)
+        else:
+            imu['noise'] = None                      # FI1-5: simulate's noise-free path, no firmware_view
         imu['hook'] = hook
         fwsim.plant_step = step
         try:

@@ -408,6 +408,9 @@ def load_faults(args, n_omega_modes: int, hil_cfg, load_schedule: bool):
         raise SystemExit('--faults excludes --load-schedule (both write the wheel speeds)')
     if not args.frame_log:
         raise SystemExit('--faults needs --frame-log (the true frames are the record of the run)')
+    if not args.step_log and not args.mock:
+        # design 6.5, 8.1 step 4 (Codex FI1-10): the run itself shows that no step missed its deadline
+        raise SystemExit('--faults needs --step-log on the Pi (tools/fault_check.py checks the missed steps)')
     if hil_cfg.lifecycle is not None:
         run_ms = int(round(hil_cfg.lifecycle.run_s * 1000))
     elif args.steps:
@@ -439,6 +442,9 @@ def resolve_swa(swa: str, finite_run: bool, n_omega_modes: int, traj_kind: str, 
 
 def main() -> int:
     args = _parse_args()
+    if args.faults and (args.jitter_only or args.loopback_test):
+        # Codex FI1-3: both modes return before the schedule is read (and the loopback opens the SPI)
+        raise SystemExit('--faults excludes --jitter-only and --loopback-test')
 
     # ── Jitter-only mode ─────────────────────────────────────────────────
     if args.jitter_only:

@@ -38,8 +38,8 @@ Fault injection batch 1 (L82): `fault_run.py` runs the same schedule file as
 imu_delay, gyro_scale; windows in ms from t = 0) by wrapping `fwsim.plant_step`,
 the IMU noise object, the IMU hook and `fw.tick` while it runs, so `fwsim.py`
 (S04 blob lock) is unchanged. Compare a fault run only with a `--baseline` run
-(same wrapper, no row): with the wrapper the IMU values always go through
-`firmware_view`.
+(same wrapper, no row, same noise setting): with IMU noise, or with an
+imu_delay / gyro_scale row, the IMU values go through `firmware_view`.
 
 ```
 python fwsim/fault_run.py --task A-W1 --mode PID --baseline --out <dir>

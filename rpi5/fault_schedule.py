@@ -21,8 +21,9 @@ Schedule file (CSV, UTF-8):
       enc_loss   target FL|FR|RL|RR, joined with '+': int16 omega of the wheel = 0
       imu_loss   target imu: byte 20 |= HIL_FAULT_IMU_LOSS (the H7 builds no report)
       imu_delay  target imu, d_ms (int 1..1000): the 10 IMU bytes (gz, ax, ay, az, yaw) of T[k - d]
-      gyro_scale target gz, s (float in [-1, 1], not 0): int16 gz = round half away((1 - s) * int16 gz),
-                 after the IMU noise (L82 Q2)
+      gyro_scale target gz, s (decimal number in [-1, 1], not 0): int16 gz = round half away((1 - s) *
+                 int16 gz), after the IMU noise (L82 Q2); s is kept as the exact decimal written in the
+                 file (fractions.Fraction) and the product is rounded exactly (Codex FI1-1)
     Overlap on the IMU: delay (picks the source frame), then the gyro scale, then the loss bit.
   * Lines starting with '#' after the first one are comments. Faults of batch 2 are refused.
 
@@ -38,7 +39,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
-import math
+from fractions import Fraction
 import re
 import struct
 from dataclasses import dataclass
@@ -60,13 +61,14 @@ FAULTS = {
     'enc_loss':   ('wheels', {}, 'enc'),
     'imu_loss':   (('imu',), {}, 'imu_loss'),
     'imu_delay':  (('imu',), {'d_ms': int}, 'imu_delay'),
-    'gyro_scale': (('gz',), {'s': float}, 'gyro_scale'),
+    'gyro_scale': (('gz',), {'s': Fraction}, 'gyro_scale'),
 }
 IMU_FAULTS = ('imu_loss', 'imu_delay', 'gyro_scale')
 BATCH2 = ('wheel_jam', 'batt_sag', 'mu_time', 'mu_zone', 'ibus_loss', 'body_drag')   # design section 4
 IMU_SOURCES = ('plant', 'static', 'profile', None)
 
 _WHOLE = re.compile(r'^[0-9]+$')
+_DECIMAL = re.compile(r'^[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?$')
 
 
 class ScheduleError(ValueError):
@@ -122,13 +124,9 @@ def _parse_params(text: str, schema: dict, where: str) -> tuple:
                 raise ScheduleError(f'{where}: parameter {k}={v!r} is not a whole number')
             out[k] = int(v)
         else:
-            try:
-                f = float(v)
-            except ValueError:
-                raise ScheduleError(f'{where}: parameter {k}={v!r} is not a number') from None
-            if not math.isfinite(f):
-                raise ScheduleError(f'{where}: parameter {k}={v!r} is not finite')
-            out[k] = f
+            if not _DECIMAL.match(v):                 # refuses nan, inf, 3/10, empty
+                raise ScheduleError(f'{where}: parameter {k}={v!r} is not a decimal number')
+            out[k] = Fraction(v)                      # exact value of the text (FI1-1)
     missing = sorted(set(schema) - set(out))
     if missing:
         raise ScheduleError(f'{where}: missing parameter {missing}')
@@ -231,18 +229,30 @@ def load(path: str, run_ms: Optional[int], imu_source: Optional[str]) -> Schedul
 
 
 def rows_as_json(rows: Sequence[Row]) -> list:
+    """JSON form of the rows (manifest, meta.yaml): exact decimal parameters as float."""
     return [dict(id=r.id, fault=r.fault, target=r.target, start_ms=r.start_ms, end_ms=r.end_ms,
-                 params=dict(r.params)) for r in rows]
+                 params={k: (float(v) if isinstance(v, Fraction) else v) for k, v in r.params})
+            for r in rows]
 
 
-def round_half_away(v: float) -> int:
-    return int(v + 0.5) if v >= 0 else -int(-v + 0.5)
+def scale_pq(s) -> Tuple[int, int]:
+    """(p, q) with (1 - s) = p / q exactly, q > 0. A float s is taken as its shortest decimal (repr)."""
+    f = 1 - (s if isinstance(s, Fraction) else Fraction(repr(float(s))))
+    return f.numerator, f.denominator
 
 
-def scale_raw(raw: int, s: float) -> int:
-    """gyro_scale on the int16 of the frame: round half away from zero of (1 - s) * raw, clamped to the
-    int16 range of protocol._to_int16."""
-    return max(-32767, min(32767, round_half_away((1.0 - s) * raw)))
+def scale_raw_pq(raw: int, p: int, q: int) -> int:
+    """round half away from zero of raw * p / q in integers (no float rounding), clamped to the int16
+    range of protocol._to_int16."""
+    n = abs(raw * p)
+    r = (2 * n + q) // (2 * q)
+    v = r if raw * p >= 0 else -r
+    return max(-32767, min(32767, v))
+
+
+def scale_raw(raw: int, s) -> int:
+    """gyro_scale on the int16 of the frame: round half away from zero of (1 - s) * raw, exactly."""
+    return scale_raw_pq(raw, *scale_pq(s))
 
 
 class ActiveSet:
@@ -264,7 +274,8 @@ class ActiveSet:
         self.enc_mask = 0
         self.loss = False
         self.delay = 0
-        self.scale: Optional[float] = None
+        self.scale: Optional[Fraction] = None
+        self.scale_pq: Optional[Tuple[int, int]] = None
         self.any = False
 
     def _pop(self, k: int) -> None:
@@ -296,7 +307,7 @@ class ActiveSet:
         self._derive()
 
     def _derive(self) -> None:
-        self.enc_mask, self.loss, self.delay, self.scale = 0, False, 0, None
+        self.enc_mask, self.loss, self.delay, self.scale, self.scale_pq = 0, False, 0, None, None
         for i in self.on:
             r = self.rows[i]
             if r.fault == 'enc_loss':
@@ -308,6 +319,7 @@ class ActiveSet:
                 self.delay = r.p('d_ms')
             elif r.fault == 'gyro_scale':
                 self.scale = r.p('s')
+                self.scale_pq = scale_pq(self.scale)
         self.any = bool(self.on)
 
     def not_run(self) -> List[str]:
@@ -371,7 +383,7 @@ class FramePatcher:
                 b[lo:hi] = src[lo:hi]
         if a.scale is not None:
             raw = struct.unpack_from('>h', b, OFS_IMU_GZ)[0]
-            struct.pack_into('>h', b, OFS_IMU_GZ, scale_raw(raw, a.scale))
+            struct.pack_into('>h', b, OFS_IMU_GZ, scale_raw_pq(raw, *a.scale_pq))
         if a.loss:
             b[OFS_FAULT] |= FAULT_IMU_LOSS
         return bytes(b)

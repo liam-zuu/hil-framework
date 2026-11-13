@@ -2,6 +2,7 @@
 The patcher against the independent reference of tools/fault_check.py: tools/tests/test_fault_check.py."""
 import math
 import struct
+from fractions import Fraction
 
 import numpy as np
 import pytest
@@ -48,7 +49,7 @@ def test_parse_good():
     rows = fs.parse(GOOD)
     fs.check(rows, 1000, 'plant')
     assert [r.fault for r in rows] == ['enc_loss', 'imu_loss', 'imu_delay', 'gyro_scale']
-    assert rows[2].p('d_ms') == 30 and rows[3].p('s') == 0.3
+    assert rows[2].p('d_ms') == 30 and rows[3].p('s') == Fraction(3, 10)      # exact decimal (FI1-1)
     assert rows[0].wheels == (0,) and fs.parse(HEAD + 'E,enc_loss,FR+RR,1,2,\n')[0].wheels == (1, 3)
 
 
@@ -75,7 +76,10 @@ def test_parse_comments_crlf_and_blank_lines():
     HEAD + 'D1,imu_delay,imu,100,200,d_ms=30;d_ms=31\n',                 # twice
     HEAD + 'S1,gyro_scale,gz,1,2,s=nan\n',                               # not finite
     HEAD + 'S1,gyro_scale,gz,1,2,s=abc\n',
-    HEAD + 'E1,enc_loss,FL,1,2\n',                                       # a field short
+    HEAD + 'S1,gyro_scale,gz,1,2,s=inf\n',
+    HEAD + 'S1,gyro_scale,gz,1,2,s=3/10\n',                              # decimal only (FI1-1)
+    HEAD + 'S1,gyro_scale,gz,1,2,s=\n',
+    HEAD + 'E1,enc_loss,FL,1,2\n',                                      # a field short
     HEAD + 'E1,enc_loss,FL,1,2,,\n',                                     # a field too many
 ])
 def test_parse_refuses(bad):
@@ -140,6 +144,11 @@ def test_scale_raw_rounding_and_clamp():
     assert fs.scale_raw(4, 0.5) == 2 and fs.scale_raw(0, 0.3) == 0
     assert fs.scale_raw(30000, -1.0) == 32767 and fs.scale_raw(-30000, -1.0) == -32767
     assert fs.scale_raw(1000, 1.0) == 0
+    # FI1-1: exact half points that float arithmetic rounds toward zero
+    assert fs.scale_raw(45, Fraction('0.3')) == 32 and fs.scale_raw(-45, Fraction('0.3')) == -32
+    assert fs.scale_raw(5, Fraction('0.9')) == 1 and fs.scale_raw(-5, Fraction('0.9')) == -1
+    assert fs.scale_raw(45, 0.3) == 32                     # a float s is taken as its shortest decimal
+    assert fs.rows_as_json(fs.parse(HEAD + 'S1,gyro_scale,gz,1,2,s=0.3\n'))[0]['params'] == {'s': 0.3}
 
 
 # ── Pi patcher ──────────────────────────────────────────────────────────────

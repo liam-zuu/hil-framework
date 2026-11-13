@@ -205,13 +205,34 @@ def test_run_hil_load_faults_imu_source_and_run_length():
         p = os.path.join(d, 's.csv')
         with open(p, 'w') as f:
             f.write(HEAD + 'S1,gyro_scale,gz,10,1500,s=0.2\n')
-        a = SimpleNamespace(frame_log='x.npz', faults=p, steps=0, mock=False)
+        a = SimpleNamespace(frame_log='x.npz', faults=p, steps=0, mock=False, step_log='st.csv')
         cfg = HILConfig(lifecycle=LifecycleConfig(run_s=1.5))
         assert load_faults(a, 0, cfg, False).rows[0].id == 'S1'            # plant IMU, RUN 1500 ms
         cfg = HILConfig(lifecycle=LifecycleConfig(run_s=1.4))
         with pytest.raises(SystemExit):
             load_faults(a, 0, cfg, False)
-        a2 = SimpleNamespace(frame_log='x.npz', faults=p, steps=2000, mock=False)
+        a2 = SimpleNamespace(frame_log='x.npz', faults=p, steps=2000, mock=False, step_log='st.csv')
         with pytest.raises(SystemExit):
             load_faults(a2, 1, HILConfig(), False)                         # omega mode: no IMU
         assert load_faults(a2, 1, HILConfig(imu_profile='t4'), False).sha256
+        # FI1-10: on the Pi a fault run needs the step log; --mock does not
+        with pytest.raises(SystemExit, match='--step-log'):
+            load_faults(SimpleNamespace(frame_log='x.npz', faults=p, steps=2000, mock=False, step_log=''),
+                        0, HILConfig(), False)
+        assert load_faults(SimpleNamespace(frame_log='x.npz', faults=p, steps=2000, mock=True, step_log=''),
+                           0, HILConfig(imu_static=IMU_STATIC), False).sha256
+
+
+@pytest.mark.parametrize('mode', ['--loopback-test', '--jitter-only'])
+def test_run_hil_faults_refused_before_the_early_modes(tmp_path, monkeypatch, mode):
+    """Codex FI1-3: --faults with a mode that returns before the schedule is read is refused first; the
+    loopback test (which opens the SPI) and the jitter test are never called."""
+    import run_hil
+    called = []
+    monkeypatch.setattr(run_hil, '_run_loopback_test', lambda **k: called.append('loopback') or 0)
+    monkeypatch.setattr(sys, 'argv', ['run_hil.py', mode, '--faults', str(tmp_path / 'missing.csv')])
+    import timing
+    monkeypatch.setattr(timing, 'measure_jitter', lambda **k: called.append('jitter'))
+    with pytest.raises(SystemExit, match='--faults excludes'):
+        run_hil.main()
+    assert called == []

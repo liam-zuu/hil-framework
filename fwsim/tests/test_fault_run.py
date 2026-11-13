@@ -164,22 +164,64 @@ def test_scale_is_the_frame_integer_operation(fw):
     assert np.array_equal(fi[inside][:, 3:7], fi[inside][:, 8:12])         # accel, yaw untouched
 
 
-def test_pi_and_fwsim_give_the_same_integers():
-    """Design 9.4: the same plant states through the Pi patcher (encode_state) and through the fwsim
-    operations give the same int16 gz and the same frozen wheel."""
-    from protocol import encode_state, decode_imu
-    s = sched('S1,gyro_scale,gz,0,10,s=0.3\nE1,enc_loss,RL,0,10,\n', run_ms=10)
+def test_pi_and_fwsim_give_the_same_integers(fw):
+    """Design 9.4, Codex FI1-11: the true IMU values of a real fault_run (what fwsim computed before the
+    fault) go through the Pi path (encode_state + FramePatcher, one frame per 1 ms step); the int16 the Pi
+    sends equals the int16 of what the fwsim wrapper gave the firmware, for gyro_scale and imu_delay; for
+    enc_loss the counts given to the firmware stop exactly inside the window and follow the true counts
+    outside it."""
+    from protocol import IMU_RANGES, encode_state
+    s = sched('S1,gyro_scale,gz,1000,2500,s=0.3\nD1,imu_delay,imu,2000,3000,d_ms=100\n'
+              'E1,enc_loss,RL,1500,2500,\n')
+    log = run(fw, s, duration=3.5)
+    fi = log['fault_imu']
+    rep = {int(round(t * 1000)): row for t, row in zip(fi[:, 0], fi)}
     p = fs.FramePatcher(s)
     p.start(0)
-    rng = np.random.default_rng(5)
-    for k in range(10):
-        st = list(rng.uniform(-20, 20, 4)) + list(rng.uniform(-1, 1, 6))
-        imu = (float(rng.uniform(-5, 5)), 0.1, 0.2, 9.8, 0.3)
-        true = encode_state(st, imu=imu, imu_seq=k + 1)
+    blank = encode_state([0.0] * 10, imu=(0, 0, 0, 0, 0), imu_seq=1)
+    n_checked = 0
+    for k in range(3500):
+        row = rep.get(k)
+        true = encode_state([0.0] * 10, imu=tuple(row[2:7]), imu_seq=k % 255 + 1) if row is not None else blank
         sent = p.patch(k, true)
-        gz_pi = int.from_bytes(sent[22:24], 'big', signed=True)
-        assert gz_pi == fs.scale_raw(_to_int16(imu[0], GZR), 0.3)
-        assert sent[4:6] == b'\x00\x00' and decode_imu(sent)[1:5] == decode_imu(true)[1:5]
+        if row is None:
+            continue
+        pi = [int.from_bytes(sent[o:o + 2], 'big', signed=True) for o in (22, 31, 33, 35, 37)]
+        fw_ = [_to_int16(v, r) for v, r in zip(row[7:12], IMU_RANGES)]
+        assert pi == fw_, k
+        n_checked += 1
+    assert n_checked == 69                                  # 20 Hz reports, 50 ms .. 3450 ms
+    ft = log['fault_tick']                                  # t, mask, true x4, sent x4 (wheel RL = 2)
+    d_true, d_sent = np.diff(ft[:, 4]), np.diff(ft[:, 8])
+    t1 = ft[1:, 0]
+    inside = (t1 > 1.5) & (t1 <= 2.5)                       # tick interval (t - 10 ms, t] inside [1500, 2500)
+    assert np.all(d_sent[inside] == 0) and np.any(d_true[inside] != 0)
+    before = t1 <= 1.5
+    assert np.array_equal(d_sent[before], d_true[before])
+    # after the window the sent angle is the true one minus a fixed angle: with floor(), the count gap
+    # stays within one count of the gap at the end of the window
+    gap = ft[1:, 4] - ft[1:, 8]
+    g0 = gap[np.nonzero(inside)[0][-1]]
+    after = t1 > 2.5
+    assert np.all((gap[after] >= g0 - 1) & (gap[after] <= g0 + 1)) and g0 > 0
+    assert np.array_equal(ft[:, 2:4], ft[:, 6:8]) and np.array_equal(ft[:, 5], ft[:, 9])   # other wheels
+
+
+def test_noise_off_paths_are_simulate_paths(fw):
+    """Codex FI1-5: with the IMU noise off, an empty schedule and an encoder/IMU-loss schedule leave the IMU
+    path of simulate as it is (no firmware_view): the empty one is bit identical, the enc_loss one has the
+    same IMU columns up to its window."""
+    imu = dict(rate_hz=20.0)
+    a = fwsim.simulate(fw, _sp, 4.0, MecanumParams(), imu=dict(imu), mode='PID')
+    b = run(fw, fs.Schedule(()), duration=4.0, imu=imu)
+    for k in a:
+        assert np.array_equal(a[k], b[k], equal_nan=True), k
+    assert b['fault_imu'].shape == (0, 12)
+    c = run(fw, sched('E1,enc_loss,FL,2000,3000,\n', run_ms=4000), duration=4.0, imu=imu)
+    before = a['t'] < 2.0
+    assert np.array_equal(a['imu'][before], c['imu'][before])
+    d = run(fw, sched('S1,gyro_scale,gz,2000,3000,s=0.3\n', run_ms=4000), duration=4.0, imu=imu)
+    assert d['fault_imu'].shape[0] == 80                    # wrapped: one row per report
 
 
 def test_cli_baseline_and_fault_run(tmp_path):
