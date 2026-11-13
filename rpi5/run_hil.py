@@ -211,6 +211,35 @@ def _owner_tick(box, publisher) -> None:
         box.publisher_dead()
 
 
+def mem_report(meminfo='/proc/meminfo'):
+    """S06 T2 B1 (Liam 12/11 THESIS local_f4d7c6ff, spec S06 T2 '[B1]'; code: R134 package, Liam 14/11
+    CODE_R134 local_eb9f3b5c "duyet goi sua code fix/r134-answers"): memory of the Pi for section 6.5, report
+    only, never scored. Called in the main process right after the plant process has exited and been joined,
+    so nothing runs inside the 1 kHz loop:
+      plant_peak_rss_kib  getrusage(RUSAGE_CHILDREN).ru_maxrss: the largest peak resident set of the
+                          children waited for so far (Linux: KiB, the same high-water mark as VmHWM of
+                          /proc/<pid>/status, which is gone once the process has exited). The plant process
+                          is the first child joined; a smaller child (git in plant_blob) cannot raise it.
+      mem_available_kib, mem_total_kib   MemAvailable, MemTotal of /proc/meminfo at that moment.
+    None where the OS does not give it (Windows tests)."""
+    out = dict(plant_peak_rss_kib=None, mem_available_kib=None, mem_total_kib=None,
+               method='getrusage(RUSAGE_CHILDREN).ru_maxrss after the plant process joined; /proc/meminfo')
+    try:
+        import resource
+        out['plant_peak_rss_kib'] = int(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)
+    except (ImportError, OSError, ValueError):
+        pass
+    try:
+        with open(meminfo, encoding='ascii') as f:
+            for line in f:
+                key, _, rest = line.partition(':')
+                if key in ('MemAvailable', 'MemTotal'):
+                    out['mem_available_kib' if key == 'MemAvailable' else 'mem_total_kib'] = int(rest.split()[0])
+    except (OSError, ValueError, IndexError):
+        pass
+    return out
+
+
 def _finite_run_config(args, spec):
     """--finite-run: (LifecycleConfig, ceiling in steps), or SystemExit on a bad combination."""
     from run_lifecycle import LifecycleConfig
@@ -589,6 +618,9 @@ def main() -> int:
     _report_plant_stats(p1, monitor, hil_cfg.stats_interval, step_csv, owner)
     p1.join()
     log.info("Plant process exited (code=%s)", p1.exitcode)
+    mem = mem_report()                     # S06 T2 B1: right after the join, outside the 1 kHz loop
+    log.info('Memory (S06 T2 B1): plant peak RSS %s KiB, MemAvailable %s KiB of %s KiB',
+             mem['plant_peak_rss_kib'], mem['mem_available_kib'], mem['mem_total_kib'])
     if step_csv is not None:
         import json
         import platform
@@ -601,6 +633,7 @@ def main() -> int:
         meta['plant_src_after'] = plant_source()
         # the two blobs only, not the method (S3E-3); limit: read in this process, not the plant one
         meta['plant_src_changed'] = not same_plant(meta['plant_src_after'], plant_src_before)
+        meta['memory'] = mem                              # S06 T2 B1 (report only)
         with open(args.step_log + '.json', 'w') as f:
             json.dump(meta, f, indent=1)
         log.info('Step log: %d rows -> %s; overflow=%d lost_or_torn=%d', meta['rows'], args.step_log,
