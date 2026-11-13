@@ -18,17 +18,18 @@ from hil_daemon import E_NO_SUMMARY, E_RUN, O1_PANEL, HilDaemon, panel_tests
 STUB = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fake_run_hil.py')
 
 
-def stdin_stop(proc, hard):
-    if hard:
+def stdin_stop(proc, level):
+    """Stand-in for _posix_stop on any OS: level 0 = soft STOP line, 1 and 2 = kill."""
+    if level:
         proc.kill()
     else:
         proc.stdin.write('STOP\n')
         proc.stdin.flush()
 
 
-def make(tmp_path, busy=False, **kw):
+def make(tmp_path, busy=False, stop_fn=stdin_stop, **kw):
     d = HilDaemon(str(tmp_path), tests=[('T-1', ['--test', 'A-L1']), ('T-2', ['--o1', 'O1-F05'])],
-                  child_cmd=lambda args: [sys.executable, '-u', STUB, *args], stop_fn=stdin_stop,
+                  child_cmd=lambda args: [sys.executable, '-u', STUB, *args], stop_fn=stop_fn,
                   busy_check=lambda pid: busy, **kw)
     return d
 
@@ -96,11 +97,14 @@ def test_stop_in_run_is_user_stop_and_again_is_harmless(tmp_path, monkeypatch):
 
 
 def test_stop_before_the_first_phase_line_is_sent_when_it_comes(tmp_path, monkeypatch):
+    hold = tmp_path / 'go'
     monkeypatch.setenv('FAKE_RUN_HIL', 'ok')
     monkeypatch.setenv('FAKE_RUN_S', '30')
-    d = make(tmp_path)
+    monkeypatch.setenv('FAKE_HOLD_FILE', str(hold))                     # PPI-10: no race
+    d = make(tmp_path / 'runs')
     d.start(0)
     assert d.stop() == pp.RES_OK and d._stop_pending                   # child has printed nothing yet
+    hold.write_text('')
     s = wait_for(d, (pp.ST_END,))
     assert s.outcome == pp.OUT_USER_STOP
 
@@ -219,7 +223,7 @@ def test_run_hil_phase_reporter_prints_each_change_once(caplog):
 # ── CODE_PANEL 14/11: daemon started with the Pi (Liam Q3), plan 2026-11-14 items 2, 7 ──
 
 def test_run_meta_records_the_swa_mode(tmp_path, monkeypatch):
-    monkeypatch.setenv('FAKE_SCEN', 'ok')
+    monkeypatch.setenv('FAKE_RUN_HIL', 'ok')
     d = make(tmp_path)
     assert d.start(0) == pp.RES_OK
     wait_for(d, (pp.ST_END, pp.ST_ERROR))
@@ -269,37 +273,210 @@ def test_reprobe_never_in_mock(tmp_path, monkeypatch):
 
 
 class FakeLgpio:
-    def __init__(self, fail_open=False):
-        self.calls, self.fail_open = [], fail_open
+    """lgpio stand-in that models the pin, not only the calls (PPI-5): the direction and level
+    set last stay after the chip is closed, as RP1 may keep outputs (persist_gpio_outputs).
+    fail: name of the call that raises."""
+    SET_OPEN_DRAIN = 8
+
+    def __init__(self, fail=None):
+        self.calls, self.fail = [], fail
+        self.pin = {'dir': 'in', 'level': None, 'flags': 0}
+
+    def _do(self, name, *a):
+        self.calls.append((name, *a))
+        if self.fail == name:
+            raise OSError(f'{name} failed')
 
     def gpiochip_open(self, chip):
-        if self.fail_open:
-            raise OSError('no chip')
-        self.calls.append(('open', chip))
+        self._do('open', chip)
         return 7
 
-    def gpio_claim_output(self, h, g, level):
-        self.calls.append(('out', g, level))
+    def gpio_claim_output(self, h, g, level, flags=0):
+        self._do('out', g, level, flags)
+        self.pin.update(dir='out', level=level, flags=flags)
 
     def gpio_free(self, h, g):
-        self.calls.append(('free', g))
+        self._do('free', g)                       # free alone does not change the pin
 
-    def gpio_claim_input(self, h, g):
-        self.calls.append(('in', g))
+    def gpio_claim_input(self, h, g, flags=0):
+        self._do('in', g)
+        self.pin.update(dir='in', level=None)
 
     def gpiochip_close(self, h):
-        self.calls.append(('close', h))
+        self._do('close', h)
+
+    def en_held_low(self):
+        return self.pin['dir'] == 'out' and self.pin['level'] == 0
 
 
 def test_reset_panel_pulls_en_low_then_leaves_an_input():
     from hil_daemon import reset_panel
     lg, slept = FakeLgpio(), []
     assert reset_panel(22, 4, 0.1, lg=lg, sleep=slept.append) == 'done'
-    assert lg.calls == [('open', 4), ('out', 22, 0), ('free', 22), ('in', 22), ('close', 7)]
-    assert slept == [0.1]
+    assert lg.calls[:2] == [('open', 4), ('out', 22, 0, FakeLgpio.SET_OPEN_DRAIN)] and lg.calls[-1] == ('close', 7)
+    assert slept == [0.1] and not lg.en_held_low()
     assert not any(c[0] == 'out' and c[2] == 1 for c in lg.calls)   # never drives EN high
+
+
+def test_reset_panel_ctrl_c_during_the_pulse_still_releases_en():
+    from hil_daemon import reset_panel
+    lg = FakeLgpio()
+
+    def interrupted(_s):
+        raise KeyboardInterrupt
+    with pytest.raises(KeyboardInterrupt):
+        reset_panel(22, 4, 0.1, lg=lg, sleep=interrupted)
+    assert not lg.en_held_low() and lg.calls[-1] == ('close', 7)
+
+
+def test_reset_panel_failed_release_is_reported():
+    from hil_daemon import reset_panel
+    lg = FakeLgpio(fail='in')
+    r = reset_panel(22, 4, 0.1, lg=lg, sleep=lambda s: None)
+    assert r.startswith('failed: GPIO22 release') and lg.calls[-1] == ('close', 7)
 
 
 def test_reset_panel_without_the_chip_is_skipped_not_fatal():
     from hil_daemon import reset_panel
-    assert reset_panel(22, 4, 0.1, lg=FakeLgpio(fail_open=True), sleep=lambda s: None).startswith('skipped')
+    assert reset_panel(22, 4, 0.1, lg=FakeLgpio(fail='open'), sleep=lambda s: None).startswith('skipped')
+
+
+# ── Codex round 1 (14/11), PPI-1, -3, -6, -8 ──
+
+def test_stop_escalates_on_its_own_when_the_run_ignores_it(tmp_path, monkeypatch):
+    """PPI-1: one STOP press; the child ignores the soft STOP; the daemon's timer sends level 1,
+    then level 2, without further presses, and the run ends."""
+    monkeypatch.setenv('FAKE_RUN_HIL', 'hang')
+    levels = []
+
+    def stop_fn(proc, level):
+        levels.append(level)
+        if level == 2:
+            proc.kill()                           # level 1 'ignored' too: only SIGKILL works
+    d = make(tmp_path, stop_fn=stop_fn)
+    d.stop_term_s, d.stop_kill_s = 0.3, 0.3
+    d.start(0)
+    t_end = time.monotonic() + 10
+    while not d._seen_phase and time.monotonic() < t_end:
+        time.sleep(0.01)
+    assert d.stop() == pp.RES_OK
+    s = wait_for(d, (pp.ST_ERROR, pp.ST_END), timeout=10)
+    assert levels == [0, 1, 2] and d.proc is None
+    assert run_meta(d)['stop_signals'] == [0, 1, 2]
+    assert s.run_state == pp.ST_ERROR and s.error_code == E_NO_SUMMARY
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='process groups and signals: run on the Pi')
+def test_posix_stop_kills_the_whole_group(tmp_path):
+    """PPI-1/PPI-10: the real _posix_stop and _reap_group on a child that ignores SIGINT and
+    SIGTERM and has a grandchild in its group."""
+    import subprocess
+    from hil_daemon import _posix_stop, _reap_group, _spawn_kw, _group_alive
+    code = ('import signal, subprocess, sys, time;'
+            'signal.signal(signal.SIGINT, signal.SIG_IGN); signal.signal(signal.SIGTERM, signal.SIG_IGN);'
+            'subprocess.Popen([sys.executable, "-c", "import signal,time;'
+            'signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"]); time.sleep(60)')
+    p = subprocess.Popen([sys.executable, '-c', code], **_spawn_kw())
+    time.sleep(0.5)
+    _posix_stop(p, 0)
+    _posix_stop(p, 1)
+    time.sleep(0.3)
+    assert p.poll() is None                       # both ignored
+    _posix_stop(p, 2)
+    p.wait(timeout=5)
+    assert _reap_group(p.pid, wait_s=1.0) and not _group_alive(p.pid)
+
+
+@pytest.mark.parametrize('argv,expected', [
+    ([b'python3', b'run_hil.py', b'--test', b'A-L1'], True),
+    ([b'/usr/bin/python3', b'-u', b'-B', b'/home/x/rpi5/run_hil.py', b'--finite-run'], True),
+    ([b'python3.13', b'-W', b'ignore', b'run_hil.py'], True),
+    ([b'python3', b'-X', b'dev', b'-u', b'run_hil.py'], True),
+    ([b'vim', b'/home/x/rpi5/run_hil.py'], False),
+    ([b'python3', b'-c', b'print(1)', b'run_hil.py'], False),
+    ([b'python3', b'-m', b'pytest', b'tests/test_run_hil.py'], False),
+    ([b'python3', b'hil_daemon.py'], False),
+    ([b'python3', b'not_run_hil.py'], False),
+    ([b''], False),
+])
+def test_run_hil_argv_detection(argv, expected):
+    """PPI-3: options of the interpreter are skipped; an editor on the file is not a run."""
+    from hil_daemon import is_run_hil_argv
+    assert is_run_hil_argv(argv) is expected
+
+
+def test_spawn_worker_of_this_folder_is_a_run(tmp_path):
+    from hil_daemon import is_run_hil_worker
+    argv = [b'/usr/bin/python3', b'-c', b'from multiprocessing.spawn import spawn_main; spawn_main(tracker_fd=5)',
+            b'--multiprocessing-fork']
+    assert is_run_hil_worker(argv, str(tmp_path), folder=str(tmp_path))
+    assert not is_run_hil_worker(argv, str(tmp_path / 'other'), folder=str(tmp_path))
+    assert not is_run_hil_worker([b'python3', b'x.py'], str(tmp_path), folder=str(tmp_path))
+
+
+def test_log_that_cannot_be_written_does_not_leave_the_panel_active(tmp_path, monkeypatch):
+    """PPI-6: run_hil.log cannot be opened (full card): the run is still followed to its end."""
+    import builtins
+    import hil_daemon
+    real_open = builtins.open
+
+    def bad_open(path, *a, **k):
+        if str(path).endswith('run_hil.log'):
+            raise OSError(28, 'No space left on device')
+        return real_open(path, *a, **k)
+    monkeypatch.setattr(hil_daemon, 'open', bad_open, raising=False)
+    monkeypatch.setenv('FAKE_RUN_HIL', 'ok')
+    d = make(tmp_path)
+    assert d.start(0) == pp.RES_OK
+    s = wait_for(d, (pp.ST_END, pp.ST_ERROR))
+    assert s.run_state == pp.ST_END and s.outcome == pp.OUT_COMPLETED and d.proc is None
+    assert any('No space' in e for e in run_meta(d)['reader_errors'])
+    assert d.start(1) == pp.RES_OK                # not stuck BUSY
+    wait_for(d, (pp.ST_END, pp.ST_ERROR))
+
+
+def test_meta_starts_with_swa_mode_null(tmp_path, monkeypatch):
+    monkeypatch.setenv('FAKE_RUN_HIL', 'crash')
+    d = make(tmp_path)
+    d.start(0)
+    wait_for(d, (pp.ST_ERROR,))
+    assert 'swa_mode' in run_meta(d) and run_meta(d)['swa_mode'] is None
+
+
+def test_shutdown_stops_the_run_and_closes_meta(tmp_path, monkeypatch):
+    """PPI-2: the daemon's way out waits for the run and writes meta.json before returning."""
+    monkeypatch.setenv('FAKE_RUN_HIL', 'ok')
+    monkeypatch.setenv('FAKE_RUN_S', '30')
+    d = make(tmp_path)
+    d.start(0)
+    t_end = time.monotonic() + 10
+    while d.snapshot().run_state != pp.ST_RUN and time.monotonic() < t_end:
+        time.sleep(0.01)
+    assert d.shutdown(wait_s=10) is True and d.proc is None
+    m = run_meta(d)
+    assert m['outcome'] == 'user_stop' and m['exit_code'] == 0 and m['stop_signals'] == [0]
+
+
+def test_uart_wait_retries_without_spending_anything():
+    """PPI-9: the UART not there yet is waited for, one line said, then opened."""
+    from hil_daemon import open_uart_when_ready
+    tries, said, slept = [], [], []
+
+    class SerialException(OSError):
+        pass
+
+    class Port:
+        def __init__(self, **kw):
+            self.port = None
+
+        def open(self):
+            tries.append(self.port)
+            if len(tries) < 3:
+                raise SerialException('no such device')
+
+    class Serial:
+        pass
+    Serial.Serial, Serial.SerialException = Port, SerialException
+    port = open_uart_when_ready(Serial, '/dev/ttyAMA0', 115200, retry_s=2, say=lambda *a, **k: said.append(a),
+                                sleep=slept.append)
+    assert len(tries) == 3 and slept == [2, 2] and len(said) == 2 and port.port == '/dev/ttyAMA0'

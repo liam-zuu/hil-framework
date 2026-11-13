@@ -19,13 +19,18 @@ Reduced version, what it leaves for the full one of 28/10 (sections 8.4-8.5, 9.4
     no hil_session on the PC, no request_id; the controller is only what --ctrl declares.
   * H7 state while idle: no SPI frame is exchanged between runs, so the 'H7' light is the
     evidence of the last H7 check: a short probe run at daemon start (probe_h7; --no-probe skips it),
+    a new probe every REPROBE_S while idle with the light off (the H7 may boot after the Pi),
     then every finished run (it reached RUN only if the H7 answered for 1 s in ARM; MISO CRC /
     empty frames counted by hil_node). The panel only sends START while that light is on.
   * LOOP on the panel: p99 of the plant-step lateness of the last stats window (rt_monitor,
     printed every 10 s and for the whole run), not a loop turnaround time.
   * One run at a time on the Pi: START (and the probe) are refused while any other
-    run_hil.py runs (e.g. one started from the PC), checked in /proc. Nothing else stops the
-    PC from starting run_hil.py during a panel run: do not mix the two uses.
+    run_hil.py runs (e.g. one started from the PC), checked in /proc (is_run_hil_argv,
+    is_run_hil_worker). That is a check, not a lock: nothing stops the PC from starting
+    run_hil.py a moment later. Do not mix the two uses: stop the service before a PC session.
+  * Each run and each probe is its own session / process group (POSIX). STOP = SIGINT to
+    run_hil.py, then the daemon's timer: SIGTERM to the group after STOP_TERM_S, SIGKILL after
+    STOP_KILL_S more; a run is finished only once its whole group is gone.
 
 Run on the Pi (rpi5/ folder of the checkout):
     python hil_daemon.py --port /dev/ttyAMA0 --ctrl LADRC      # H7 probe first, then serve the panel
@@ -74,12 +79,21 @@ RPI5_GPIOCHIP = 4         # as gpio_sync.py
 E_RUN = 1          # run_hil.py ended in error:<reason> or with exit code != 0
 E_SPAWN = 2        # run_hil.py could not be started
 E_NO_SUMMARY = 3   # run_hil.py ended without a #run_summary line (killed, crashed early)
+E_GROUP = 4        # a process of the run survived SIGKILL (PPI-1/4): START refused until restart
 
-STOP_KILL_S = 5.0  # STOP again this long after the first one: SIGTERM (run_hil: 2nd Ctrl+C)
+# STOP escalation (PPI-1, Codex 14/11 round 1), run by the daemon's own timer from the first STOP,
+# whatever the child prints: level 0 = SIGINT to run_hil.py (soft STOP: setpoint 0, then END);
+# STOP_TERM_S later level 1 = SIGTERM to the run's whole process group; STOP_KILL_S after that
+# level 2 = SIGKILL to the group. A run ends only once its whole group is gone (_reap_group).
+STOP_TERM_S = 5.0   # [ĐỀ XUẤT]
+STOP_KILL_S = 3.0   # [ĐỀ XUẤT]
+REAP_S = 3.0        # after the owner exits: the group's last processes get this long, then SIGKILL
+SHUTDOWN_S = 12.0   # daemon stop (Ctrl+C, systemd; TimeoutStopSec 15): wait this long for the run
 
+_PHASES = ('PREPARE', 'ARM', 'RUN', 'STOPPING', 'END')
 _PHASE_ST = {'PREPARE': pp.ST_PREPARE, 'ARM': pp.ST_ARM, 'RUN': pp.ST_RUN,
              'STOPPING': pp.ST_STOPPING, 'END': pp.ST_STOPPING}   # END of the loop: child still closing
-_RE_PHASE = re.compile(r'#phase,([A-Z]+)')
+_RE_PHASE = re.compile(r'#phase,(' + '|'.join(_PHASES) + r'),t_ns=')   # PPI-11: whole field only
 _RE_SUMMARY = re.compile(r'#run_summary,(\{.*\})\s*$')
 _RE_MISO = re.compile(r'#miso,checked=(\d+),crc_bad=(\d+),empty=(\d+)')
 _RE_SWA = re.compile(r'#swa,mode=(\w+)')
@@ -95,8 +109,44 @@ def panel_tests() -> List[Tuple[str, List[str]]]:
     return tests
 
 
+# Python options that take a separate value (python3 -W ignore run_hil.py ...)
+_PY_OPT_ARG = {b'-W', b'-X', b'--check-hash-based-pycs'}
+
+
+def is_run_hil_argv(argv: Sequence[bytes]) -> bool:
+    """True if argv (a /proc cmdline split on NUL) is a Python interpreter running the script
+    run_hil.py (PPI-3): the interpreter's options are skipped, the first non-option argument is
+    the script; '-c'/'-m' mean no script. 'vim run_hil.py' is not a run."""
+    argv = [a for a in argv if a != b'']
+    if not argv or not os.path.basename(argv[0]).startswith(b'python'):
+        return False
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a in (b'-c', b'-m') or a.startswith((b'-c', b'-m')) and not a.startswith(b'--'):
+            return False
+        if a == b'--':
+            i += 1
+            break
+        if not a.startswith(b'-'):
+            break
+        i += 2 if a in _PY_OPT_ARG else 1
+    return i < len(argv) and os.path.basename(argv[i]) == b'run_hil.py'
+
+
+def is_run_hil_worker(argv: Sequence[bytes], cwd: Optional[str], folder: str = HERE) -> bool:
+    """A multiprocessing 'spawn' worker (HIL-Plant, HIL-TrajPub: run_hil.py sets 'spawn', so the
+    cmdline does not name run_hil.py) started from this rpi5 folder (PPI-3/PPI-4: an orphan of a
+    killed run_hil.py may still hold the SPI)."""
+    joined = b' '.join(argv)
+    return (b'multiprocessing' in joined and b'spawn_main' in joined and cwd is not None
+            and os.path.realpath(cwd) == os.path.realpath(folder))
+
+
 def other_run_hil_running(exclude_pid: Optional[int] = None) -> bool:
-    """True if a run_hil.py process runs on this machine (Linux /proc; False elsewhere)."""
+    """True if a run_hil.py process, or a spawn worker of one started from this rpi5 folder,
+    runs on this machine (Linux /proc; False elsewhere). Not a lock: a PC run can still start a
+    moment later (documented: never mix the two uses; stop the service before a PC session)."""
     if not os.path.isdir('/proc'):
         return False
     for d in os.listdir('/proc'):
@@ -107,9 +157,44 @@ def other_run_hil_running(exclude_pid: Optional[int] = None) -> bool:
                 argv = f.read().split(b'\0')
         except OSError:
             continue
-        if any(a.endswith(b'run_hil.py') for a in argv[:3]):
+        if is_run_hil_argv(argv):
+            return True
+        try:
+            cwd = os.readlink(f'/proc/{d}/cwd')
+        except OSError:
+            cwd = None
+        if is_run_hil_worker(argv, cwd):
             return True
     return False
+
+
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _reap_group(pgid: Optional[int], wait_s: float = REAP_S) -> bool:
+    """POSIX: give what is left of the process group pgid wait_s to exit, then SIGKILL it.
+    True once the group is gone (always True off POSIX or without a group)."""
+    if pgid is None or os.name != 'posix':
+        return True
+    t_end = time.monotonic() + wait_s
+    while _group_alive(pgid) and time.monotonic() < t_end:
+        time.sleep(0.05)
+    if _group_alive(pgid):
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        t_end = time.monotonic() + 2.0
+        while _group_alive(pgid) and time.monotonic() < t_end:
+            time.sleep(0.05)
+    return not _group_alive(pgid)
 
 
 def checkout_id(folder: str = HERE) -> dict:
@@ -128,9 +213,13 @@ def checkout_id(folder: str = HERE) -> dict:
 
 def reset_panel(gpio: int = PANEL_RESET_GPIO, chip: int = RPI5_GPIOCHIP, low_s: float = PANEL_RESET_LOW_S,
                 lg=None, sleep: Callable[[float], None] = time.sleep) -> str:
-    """Pull the panel's EN low for low_s, then free the line (input, the board's pull-up wins).
-    Returns 'done', or why it was skipped: the daemon still serves the panel without the wire
-    (the panel then handshakes on its own when it sees the new epoch). lg: lgpio module (tests)."""
+    """Pull the panel's EN low for low_s, then let it go: the line is requested open drain
+    (writing 1 = released, never driven high) and left an input before the chip is closed, on
+    every path once it was pulled low, including an exception or Ctrl+C during the wait (PPI-5).
+    The code cannot see whether the wire is there: 'done' only means the GPIO calls succeeded.
+    Returns 'done', 'skipped: …' (no lgpio, no chip: the daemon still serves the panel), or
+    'failed: …'. A failed release is reported, the original exception (if any) still raised.
+    lg: lgpio module (tests)."""
     if lg is None:
         try:
             import lgpio as lg
@@ -140,25 +229,47 @@ def reset_panel(gpio: int = PANEL_RESET_GPIO, chip: int = RPI5_GPIOCHIP, low_s: 
         h = lg.gpiochip_open(chip)
     except Exception as exc:                      # lgpio raises its own error type
         return f'skipped: gpiochip{chip}: {exc}'
+    pulled, result = False, 'done'
     try:
-        lg.gpio_claim_output(h, gpio, 0)
-        sleep(low_s)
-        lg.gpio_free(h, gpio)
-        lg.gpio_claim_input(h, gpio)              # leave it an input, never drive EN high
-    except Exception as exc:
-        return f'failed: GPIO{gpio}: {exc}'
+        try:
+            lg.gpio_claim_output(h, gpio, 0, getattr(lg, 'SET_OPEN_DRAIN', 0))
+            pulled = True
+            sleep(low_s)
+        except Exception as exc:
+            result = f'failed: GPIO{gpio}: {exc}'
     finally:
-        lg.gpiochip_close(h)
-    return 'done'
+        if pulled:
+            try:
+                lg.gpio_free(h, gpio)
+                lg.gpio_claim_input(h, gpio)      # left an input after close (RP1 may keep outputs)
+            except Exception as exc:
+                result = f'failed: GPIO{gpio} release: {exc} (EN may stay low: check the wire)'
+        try:
+            lg.gpiochip_close(h)
+        except Exception:
+            pass
+    return result
 
 
 def _num(s: str) -> Optional[float]:
     return None if s == 'None' else float(s)
 
 
-def _posix_stop(proc, hard: bool) -> None:
-    """SIGINT = STOP for run_hil.py --finite-run (setpoint 0, then END); SIGTERM = kill."""
-    os.kill(proc.pid, signal.SIGTERM if hard else signal.SIGINT)
+def _posix_stop(proc, level: int) -> None:
+    """level 0: SIGINT to run_hil.py only (soft STOP: setpoint 0, then END). level 1: SIGTERM,
+    level 2: SIGKILL, both to the whole process group of the run (start_new_session: group id =
+    the owner's pid), so HIL-Plant / HIL-TrajPub go too (PPI-1)."""
+    if level == 0:
+        os.kill(proc.pid, signal.SIGINT)
+    else:
+        os.killpg(proc.pid, signal.SIGTERM if level == 1 else signal.SIGKILL)
+
+
+def _spawn_kw() -> dict:
+    """Popen arguments: on POSIX the child leads its own session / process group, so the
+    terminal's or systemd's SIGINT to the daemon does not reach it twice (PPI-2) and the
+    daemon can signal the whole group (PPI-1, PPI-4)."""
+    return {'start_new_session': True} if os.name == 'posix' else {}
 
 
 class HilDaemon:
@@ -197,6 +308,9 @@ class HilDaemon:
         self._reader: Optional[threading.Thread] = None
         self._meta: dict = {}
         self._probing = False               # a probe run_hil.py is running: START is BUSY
+        self._wedged = False                # a run's process survived SIGKILL: START is BUSY
+        self.meta_error: Optional[str] = None
+        self.stop_term_s, self.stop_kill_s = STOP_TERM_S, STOP_KILL_S
         self._t_probe: Optional[float] = None
         self._checkout = checkout_id()         # read once: the checkout must not change under the daemon
 
@@ -219,7 +333,7 @@ class HilDaemon:
                 return pp.RES_BUSY
             if not 0 <= index < len(self.tests):
                 return pp.RES_BAD_PROFILE
-            if self._probing or self.busy_check(None):
+            if self._probing or self._wedged or self.busy_check(None):
                 return pp.RES_BUSY                 # another run_hil.py (e.g. from the PC, or the probe) owns the SPI
             try:
                 run_no = pp.next_run_no(self.run_no)
@@ -233,11 +347,11 @@ class HilDaemon:
             self.loop_us = self.overruns = None
             self._t_stop, self._stop_pending, self._seen_phase = None, False, False
             argv = self.child_cmd([*args, '--finite-run', *self.extra_args])
-            self._open_run_dir(name, argv)
             try:
+                self._open_run_dir(name, argv)
                 self.proc = subprocess.Popen(argv, cwd=HERE, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                              stderr=subprocess.STDOUT, text=True, bufsize=1,
-                                             encoding='utf-8', errors='replace')
+                                             encoding='utf-8', errors='replace', **_spawn_kw())
             except OSError as exc:
                 self._fail(E_SPAWN, f'spawn {exc.errno}', f'spawn failed: {exc}')
                 self._close_meta(rc=None)
@@ -256,17 +370,16 @@ class HilDaemon:
                 return pp.RES_OK
             if self.state not in pp.ST_ACTIVE or self.proc is None:
                 return pp.RES_NOT_IDLE
-            now = self.clock()
-            if self._t_stop is None:
-                self._t_stop = now
-                self.outcome = pp.OUT_USER_STOP
-                if not self._seen_phase:
-                    self._stop_pending = True      # run_hil installs its STOP handler late: send at #phase
-                    return pp.RES_OK
-                return self._send_stop(hard=False)
-            if now - self._t_stop >= STOP_KILL_S:
-                return self._send_stop(hard=True)
-            return pp.RES_OK                       # STOP again: harmless
+            if self._t_stop is not None:
+                return pp.RES_OK                   # STOP again: harmless, the timer escalates
+            self._t_stop = self.clock()
+            self.outcome = pp.OUT_USER_STOP
+            proc = self.proc
+            threading.Thread(target=self._escalate, args=(proc,), name='stop-escalate', daemon=True).start()
+            if not self._seen_phase:
+                self._stop_pending = True          # run_hil installs its STOP handler late: send at #phase
+                return pp.RES_OK
+            return self._signal(proc, 0)
 
     def snapshot(self) -> RunSnapshot:
         with self._lock:
@@ -290,21 +403,34 @@ class HilDaemon:
             self._probing, self._t_probe = True, self.clock()
         argv = self.child_cmd(['--fixed-omega', '0,0,0,0', '--imu-static', '0,0,0,9.81,0',
                                '--steps', str(steps), '--no-traj', '--swa', 'off', *self.extra_args])
+        gone = True
         try:
+            text = ''
             try:
-                out = subprocess.run(argv, cwd=HERE, capture_output=True, text=True, timeout=timeout_s,
-                                     encoding='utf-8', errors='replace')
-                text = out.stdout + out.stderr
-            except (OSError, subprocess.TimeoutExpired):
-                text = ''
-            m = _RE_MISO.search(text)
+                p = subprocess.Popen(argv, cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                     text=True, encoding='utf-8', errors='replace', **_spawn_kw())
+            except OSError:
+                p = None
+            if p is not None:
+                try:
+                    text, _ = p.communicate(timeout=timeout_s)
+                except subprocess.TimeoutExpired:
+                    # PPI-4: the whole group (HIL-Plant may hold the SPI), not only the owner
+                    try:
+                        self.stop_fn(p, 2)
+                    except OSError:
+                        pass
+                    text = p.communicate()[0] or ''
+                gone = _reap_group(p.pid if _spawn_kw() else None)
+            m = _RE_MISO.search(text or '')
             ok = bool(m) and int(m.group(1)) > 0 and m.group(2) == '0' and m.group(3) == '0'
             with self._lock:
                 self.h7_ok = ok
             return ok
         finally:
             with self._lock:
-                self._probing, self._t_probe = False, self.clock()
+                # a group that would not die keeps START refused (BUSY) until the daemon restarts
+                self._probing, self._t_probe = (not gone), self.clock()
 
     def maybe_reprobe(self, every_s: float = REPROBE_S) -> Optional[bool]:
         """Idle re-check of the H7 (daemon started before the H7 was up): probe when idle, the H7
@@ -326,12 +452,50 @@ class HilDaemon:
         self._meta['error'] = detail
         self._enter(pp.ST_ERROR)
 
-    def _send_stop(self, hard: bool) -> int:
+    def _signal(self, proc, level: int) -> int:
+        """Send STOP level 0 / 1 / 2 to proc (see _posix_stop); recorded in meta.json."""
+        self._meta.setdefault('stop_signals', []).append(level)
         try:
-            self.stop_fn(self.proc, hard)
+            self.stop_fn(proc, level)
         except (OSError, ProcessLookupError):
             return pp.RES_FAILED                   # effect unknown
         return pp.RES_OK
+
+    def _escalate(self, proc) -> None:
+        """Timer thread from the first STOP (PPI-1): soft STOP may not end the run (child hung,
+        handler not installed, plant stuck), so level 1 after stop_term_s and level 2 after
+        stop_term_s + stop_kill_s, whatever the child prints. Ends when the owner exits; the
+        group's remaining processes are reaped by the reader (_reap_group)."""
+        t0, level = time.monotonic(), 0
+        while proc.poll() is None:
+            el = time.monotonic() - t0
+            with self._lock:
+                if self.proc is not proc:
+                    return
+                if level < 1 and el >= self.stop_term_s:
+                    level = 1
+                    self._stop_pending = False
+                    self._signal(proc, 1)
+                elif level < 2 and el >= self.stop_term_s + self.stop_kill_s:
+                    level = 2
+                    self._signal(proc, 2)
+            time.sleep(0.05)
+
+    def shutdown(self, wait_s: float = SHUTDOWN_S) -> bool:
+        """Daemon stop (Ctrl+C, systemd SIGINT, a fatal error of the panel link; PPI-2): STOP the
+        run, then wait for the reader to finish it (escalation and reaping included) so its
+        meta.json is closed. True if nothing is left running."""
+        with self._lock:
+            active = self.proc is not None
+        if active:
+            self.stop()
+        t_end = time.monotonic() + wait_s
+        while time.monotonic() < t_end:
+            with self._lock:
+                if self.proc is None and not self._probing:
+                    return True
+            time.sleep(0.05)
+        return False
 
     def _open_run_dir(self, name: str, argv: List[str]) -> None:
         now = _dt.datetime.now()
@@ -340,15 +504,19 @@ class HilDaemon:
         os.makedirs(self.run_dir, exist_ok=False)
         self._meta = {'run_id': run_id, 'run_no': self.run_no, 'mode': 'panel', 'data_valid': False,
                       'data_valid_why': 'panel run = quick look / demo (L79, workflow use 1)',
-                      'test': name, 'argv': argv, 'ctrl_declared': self.ctrl or None,
+                      'test': name, 'argv': argv, 'ctrl_declared': self.ctrl or None, 'swa_mode': None,
                       'pi_checkout': self._checkout, 'started': now.isoformat(timespec='seconds')}
         self._write_meta()
 
     def _write_meta(self) -> None:
+        """meta.json; a write error (full card) is kept in memory, never stops the run (PPI-6)."""
         path = os.path.join(self.run_dir, 'meta.json')
-        with open(path + '.tmp', 'w', encoding='utf-8') as f:
-            json.dump(self._meta, f, indent=1)
-        os.replace(path + '.tmp', path)
+        try:
+            with open(path + '.tmp', 'w', encoding='utf-8') as f:
+                json.dump(self._meta, f, indent=1)
+            os.replace(path + '.tmp', path)
+        except OSError as exc:
+            self.meta_error = str(exc)
 
     def _close_meta(self, rc: Optional[int]) -> None:
         self._meta.update(ended=_dt.datetime.now().isoformat(timespec='seconds'), exit_code=rc,
@@ -357,53 +525,91 @@ class HilDaemon:
                           h7_ok_after=self.h7_ok, result=list(self.result))
         self._write_meta()
 
-    def _read(self, proc) -> None:
-        """Reader thread: every line to run_hil.log, parsed for the panel; then the end."""
-        summary, miso, last = None, None, None
-        with open(os.path.join(self.run_dir, 'run_hil.log'), 'w', encoding='utf-8') as logf:
-            for line in proc.stdout:
-                logf.write(line)
-                with self._lock:
-                    m = _RE_PHASE.search(line)
-                    if m and m.group(1) in _PHASE_ST:
-                        self._seen_phase = True
-                        if self._stop_pending:
-                            self._stop_pending = False
-                            self._send_stop(hard=False)
-                        st = _PHASE_ST[m.group(1)]
-                        if m.group(1) == 'RUN':
-                            self.h7_ok = True      # ARM leaves only after 1 s of fresh H7 answers
-                        if st != self.state:
-                            self._enter(st)
-                        continue
-                    m = _RE_WHOLE.search(line) or _RE_STATS.search(line)
-                    if m:
-                        p99 = _num(m.group(1))
-                        self.loop_us = None if p99 is None else int(round(p99))
-                        self.overruns = int(m.group(3))
-                        if _RE_WHOLE.search(line):
-                            last = (p99, float(m.group(2)), int(m.group(3)))
-                        continue
-                    m = _RE_SUMMARY.search(line)
-                    if m:
-                        try:
-                            summary = json.loads(m.group(1))
-                        except ValueError:
-                            summary = {'outcome': 'error:bad_summary'}
-                        continue
-                    m = _RE_MISO.search(line)
-                    if m:
-                        miso = tuple(int(g) for g in m.groups())
-                        continue
-                    m = _RE_SWA.search(line)
-                    if m:
-                        self._meta['swa_mode'] = m.group(1)   # what SWA did in this panel run (I8)
-        rc = proc.wait()
-        with self._lock:
-            self._finish(rc, summary, miso, last)
+    def _parse(self, line: str, acc: dict) -> None:
+        """One output line of run_hil.py (lock held): pha, stats, summary, MISO, SWA into the
+        snapshot or acc (summary, miso, last). The single parser used by the reader and the tests."""
+        m = _RE_PHASE.search(line)
+        if m:
+            self._seen_phase = True
+            if self._stop_pending:
+                self._stop_pending = False
+                self._signal(self.proc, 0)
+            st = _PHASE_ST[m.group(1)]
+            if m.group(1) == 'RUN':
+                self.h7_ok = True                  # ARM leaves only after 1 s of fresh H7 answers
+            if st != self.state:
+                self._enter(st)
+            return
+        m = _RE_WHOLE.search(line) or _RE_STATS.search(line)
+        if m:
+            p99 = _num(m.group(1))
+            self.loop_us = None if p99 is None else int(round(p99))
+            self.overruns = int(m.group(3))
+            if _RE_WHOLE.search(line):
+                acc['last'] = (p99, float(m.group(2)), int(m.group(3)))
+            return
+        m = _RE_SUMMARY.search(line)
+        if m:
+            try:
+                acc['summary'] = json.loads(m.group(1))
+            except ValueError:
+                acc['summary'] = {'outcome': 'error:bad_summary'}
+            return
+        m = _RE_MISO.search(line)
+        if m:
+            acc['miso'] = tuple(int(g) for g in m.groups())
+            return
+        m = _RE_SWA.search(line)
+        if m:
+            self._meta['swa_mode'] = m.group(1)    # what SWA did in this panel run (I8)
 
-    def _finish(self, rc: int, summary: Optional[dict], miso, last) -> None:
-        self._meta.update(run_summary=summary, miso=miso)
+    def _read(self, proc) -> None:
+        """Reader thread: every line to run_hil.log, parsed for the panel; then the end. A log
+        that cannot be written (full card), or a line the parser chokes on, never stops the
+        reader (PPI-6): the output is still drained, the run still finished, the error kept."""
+        acc = {'summary': None, 'miso': None, 'last': None}
+        logf, errors = None, []
+        try:
+            try:
+                logf = open(os.path.join(self.run_dir, 'run_hil.log'), 'w', encoding='utf-8')
+            except OSError as exc:
+                errors.append(f'log open: {exc}')
+            for line in proc.stdout:
+                if logf is not None:
+                    try:
+                        logf.write(line)
+                    except OSError as exc:
+                        errors.append(f'log write: {exc}')
+                        try:
+                            logf.close()
+                        except OSError:
+                            pass
+                        logf = None
+                try:
+                    with self._lock:
+                        self._parse(line, acc)
+                except Exception as exc:           # keep draining, whatever the line
+                    errors.append(f'parse: {type(exc).__name__}: {exc}')
+        except Exception as exc:                   # stdout itself failed
+            errors.append(f'read: {type(exc).__name__}: {exc}')
+        finally:
+            if logf is not None:
+                try:
+                    logf.close()
+                except OSError:
+                    pass
+            try:
+                rc = proc.wait()
+            except Exception:
+                rc = None
+            gone = _reap_group(proc.pid if _spawn_kw() else None)
+            with self._lock:
+                if errors:
+                    self._meta['reader_errors'] = errors[:20]
+                self._finish(rc, acc['summary'], acc['miso'], acc['last'], gone)
+
+    def _finish(self, rc: Optional[int], summary: Optional[dict], miso, last, group_gone: bool = True) -> None:
+        self._meta.update(run_summary=summary, miso=miso, group_gone=group_gone)
         # --mock: the fake H7 of run_hil.py does not build valid MISO CRCs (Pi check 11/11: 11093 of
         # 11096 frames 'bad'), so its counters say nothing about an H7; the light stays as it was
         if miso is not None and not self.mock:
@@ -418,7 +624,11 @@ class HilDaemon:
             lines.append(f'p99 {p99} max {last[1]:.0f}us'[:pp.RESULT_LEN])
             lines.append(f'ovr {last[2]} miso {"-" if miso is None else miso[1] + miso[2]}'[:pp.RESULT_LEN])
         self.result, self.result_run = tuple(lines), self.run_no
-        if summary is None:
+        if not group_gone:
+            # a process of the run would not die even by SIGKILL: it may hold the SPI
+            self._fail(E_GROUP, 'run process left', 'process group of the run still alive after SIGKILL')
+            self._wedged = True                    # START stays BUSY until the daemon restarts
+        elif summary is None:
             self._fail(E_NO_SUMMARY, f'no summary rc {rc}', f'run_hil.py exit {rc} without #run_summary')
         elif outcome.startswith('error:') or rc != 0:
             detail = summary.get('detail') or ''
@@ -444,20 +654,67 @@ def main(argv=None) -> int:
     ap.add_argument('--ctrl', default='', help='controller flashed on the DUT, as declared (shown "declared")')
     ap.add_argument('--mock', action='store_true', help='run_hil.py --mock (fake H7, no SPI)')
     ap.add_argument('--no-probe', action='store_true',
-                    help='skip the H7 check at start (the H7 light, so START, stays off until a run reaches RUN)')
+                    help='skip only the H7 check at start; the idle re-check still turns the light on (PPI-8)')
     ap.add_argument('--panel-reset-gpio', type=int, default=PANEL_RESET_GPIO,
                     help='BCM GPIO wired to the panel EN (pulled low once at start); -1 = no wire')
     a = ap.parse_args(argv)
     os.makedirs(a.runs_dir, exist_ok=True)
-    daemon = HilDaemon(a.runs_dir, ctrl=a.ctrl, mock=a.mock)
+    import serial  # pyserial
+    from panel_link import PanelLink, nonblocking_writer, serve
+    # PPI-7: one daemon per UART and per epoch file, decided before anything touches the panel or
+    # the H7 (reset, probe, threads). The UART lock name comes from the device's real path.
+    uart_lock = os.path.join(os.path.dirname(os.path.abspath(a.epoch_file)),
+                             '.hil_panel_uart_' + re.sub(r'[^A-Za-z0-9]', '_', os.path.realpath(a.port)) + '.lock')
+    with pp._FileLock(uart_lock, timeout_s=0.5), pp._FileLock(a.epoch_file + '.owner', timeout_s=0.5):
+        daemon = HilDaemon(a.runs_dir, ctrl=a.ctrl, mock=a.mock)
+        try:
+            return _serve_panel(a, daemon, serial, PanelLink, nonblocking_writer, serve)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            # PPI-2: one way out for Ctrl+C, systemd (KillSignal SIGINT, KillMode mixed: only the
+            # daemon gets it, the run is in its own session) and errors: STOP the run, wait for it
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            if daemon.proc is not None or daemon._probing:
+                print('daemon stopping: STOP to the running run_hil.py, waiting for it ...', flush=True)
+            ok = daemon.shutdown()
+            print('daemon stopped' + ('' if ok else ': the run did not end in time (systemd kills the rest)'),
+                  flush=True)
+    return 0
+
+
+def open_uart_when_ready(serial, port_path: str, baud: int, retry_s: float = 2.0,
+                         say=print, sleep=time.sleep):
+    """PPI-9: wait for the UART instead of failing (and restarting, and spending an epoch);
+    one line when it starts waiting, one when it opens."""
+    told = False
+    while True:
+        port = serial.Serial(baudrate=baud, timeout=0, write_timeout=0)
+        port.dtr = port.rts = False
+        port.port = port_path
+        try:
+            port.open()
+            if told:
+                say(f'{port_path}: open', flush=True)
+            return port
+        except (OSError, serial.SerialException) as exc:
+            if not told:
+                say(f'{port_path}: not ready ({exc}); retrying every {retry_s:.0f} s', flush=True)
+                told = True
+            sleep(retry_s)
+
+
+def _serve_panel(a, daemon, serial, PanelLink, nonblocking_writer, serve) -> int:
     if a.panel_reset_gpio >= 0:
         print(f'panel reset GPIO{a.panel_reset_gpio}:', reset_panel(a.panel_reset_gpio), flush=True)
     if a.mock:
         daemon.h7_ok = True                        # fake H7 of run_hil.py --mock always answers
-    elif not a.no_probe:
-        print('H7 probe ...', flush=True)
-        print('H7 probe:', 'answers' if daemon.probe_h7()
-              else f'NO ANSWER (panel START blocked; probing again every {REPROBE_S:.0f} s while idle)', flush=True)
+    else:
+        if not a.no_probe:
+            print('H7 probe ...', flush=True)
+            print('H7 probe:', 'answers' if daemon.probe_h7()
+                  else f'NO ANSWER (panel START blocked; probing again every {REPROBE_S:.0f} s while idle)',
+                  flush=True)
 
         def reprobe_loop():
             while True:
@@ -466,25 +723,13 @@ def main(argv=None) -> int:
                     print('H7 re-probe:', 'answers' if r else 'no answer', flush=True)
                 time.sleep(1.0)
         threading.Thread(target=reprobe_loop, name='h7-reprobe', daemon=True).start()
-    import serial  # pyserial
-    from panel_link import PanelLink, nonblocking_writer, serve
-    owner = pp._FileLock(a.epoch_file + '.owner', timeout_s=0.5)
-    with owner:                                    # one link per UART / epoch file
-        epoch = pp.next_daemon_epoch(a.epoch_file, create=a.create_epoch)
-        port = serial.Serial(baudrate=a.baud, timeout=0, write_timeout=0)
-        port.dtr = port.rts = False
-        port.port = a.port
-        port.open()
-        with port:
-            link = PanelLink(epoch, daemon, nonblocking_writer(port), baud=a.baud)
-            print(f'hil_daemon on {a.port}, epoch {epoch}, {len(daemon.tests)} tests, runs in {a.runs_dir}; '
-                  'Ctrl+C to quit', flush=True)
-            try:
-                serve(port, link)
-            except KeyboardInterrupt:
-                if daemon.proc is not None:
-                    daemon.stop()
-                    print('STOP sent to the running run_hil.py', flush=True)
+    port = open_uart_when_ready(serial, a.port, a.baud)
+    with port:
+        epoch = pp.next_daemon_epoch(a.epoch_file, create=a.create_epoch)   # only once the UART is up
+        link = PanelLink(epoch, daemon, nonblocking_writer(port), baud=a.baud)
+        print(f'hil_daemon on {a.port}, epoch {epoch}, {len(daemon.tests)} tests, runs in {a.runs_dir}; '
+              'Ctrl+C to quit', flush=True)
+        serve(port, link)
     return 0
 
 

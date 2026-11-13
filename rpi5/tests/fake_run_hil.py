@@ -7,6 +7,8 @@ scenario comes from FAKE_RUN_HIL; STOP is the line 'STOP' on stdin (test stop_fn
   crash      PREPARE, then exit 1 without #run_summary
   miso_bad   as ok, with crc_bad=2 in the #miso line
   tail_cut   as ok (completed), but exit 3 (END tail cut, hil_node.run_failed)
+  hang       PREPARE, then ignores STOP (stdin and SIGINT) and sleeps 60 s: only a kill ends it
+FAKE_HOLD_FILE: wait until that file exists before the first line (a STOP before any #phase).
 Probe calls (--fixed-omega in argv): '#miso' line only, crc_bad from FAKE_PROBE (ok / bad / none).
 """
 import json
@@ -47,7 +49,15 @@ def main():
     if hasattr(signal, 'SIGINT'):
         signal.signal(signal.SIGINT, lambda *_: stop.set())
     threading.Thread(target=watch_stdin, daemon=True).start()
+    hold = os.environ.get('FAKE_HOLD_FILE')
+    while hold and not os.path.exists(hold):
+        time.sleep(0.01)
     phase('PREPARE')
+    if scen == 'hang':
+        if hasattr(signal, 'SIGINT'):
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+        time.sleep(60)
+        return 9
     time.sleep(0.05)
     if scen == 'crash':
         return 1

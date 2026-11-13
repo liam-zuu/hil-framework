@@ -29,8 +29,11 @@ WorkingDirectory=/home/liam-zuu/hil-framework/rpi5
 ExecStartPre=+/usr/local/bin/hil-prep.sh
 # python3 carries cap_sys_nice (Setup RPi5, Step 6), so run_hil.py gets SCHED_FIFO without sudo.
 ExecStart=/usr/bin/python3 -u hil_daemon.py --port /dev/ttyAMA0
-# SIGINT = the same path as Ctrl+C: a running panel run gets STOP before the daemon quits.
+# SIGINT to the daemon only (KillMode=mixed; each run is its own session): the daemon STOPs the
+# run and waits for it (escalating to SIGTERM / SIGKILL of the run's group), closes meta.json,
+# then exits. After TimeoutStopSec systemd SIGKILLs whatever is left in the cgroup.
 KillSignal=SIGINT
+KillMode=mixed
 TimeoutStopSec=15
 Restart=on-failure
 RestartSec=5
