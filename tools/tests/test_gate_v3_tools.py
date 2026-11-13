@@ -95,7 +95,8 @@ def _gate(decide=G.DECIDE_ALL, u_t=0.0, completed='true', n=20, **peak):
 
 
 def _open(d, clock, platform='HW'):
-    rl.begin(d, 'S', 'A-PID', platform, 'PID', 'O1-F05', '0.5', 'screen')
+    rl.begin(d, 'S', 'A-PID', platform, 'PID', 'O1-F05', '0.5', 'screen',
+             gain_set='A-PID/G1' if platform == 'HIL' else '')         # a counted HIL run names its gain set
     rl.step(d, 'run')
     clock[0] += dt.timedelta(seconds=60)
 
@@ -175,8 +176,8 @@ def test_outcome_against_the_gate(ds):
 
 
 def _hil_check(d, clock, gain_set='B-PID/GA1', task='O1-F05', speed='0.5', stage='hil_check', campaign='B-PID',
-               mapped=False):
-    rl.begin(d, 'H', campaign, 'HIL', 'PID', task, speed, stage, gain_set=gain_set)
+               mapped=False, gains=''):
+    rl.begin(d, 'H', campaign, 'HIL', 'PID', task, speed, stage, gain_set=gain_set, gains=gains)
     rl.step(d, 'run')
     clock[0] += dt.timedelta(seconds=60)
     if mapped:
@@ -196,7 +197,7 @@ def test_refused_mapping_reruns_capped(ds):
     assert s['hil_map_refused_n'] == '5' and s['hil_map_stopped'] == ''
     _hil_check(d, clock)                                                   # 4th refused = 3 reruns used up
     s = {r['campaign']: r for r in rl.summary(d)}['B-PID']
-    assert s['hil_map_refused_n'] == '6' and s['hil_map_stopped'] == 'B-PID/GA1 O1-F05@0.5 (hil_check)'
+    assert s['hil_map_refused_n'] == '6' and s['hil_map_stopped'] == 'B-PID/GA1 O1-F05@0.5'
     assert s['N_HIL'] == '6'                                               # lost runs still count as HIL runs
     with pytest.raises(rl.LogError, match='stopped after 3 reruns'):        # no fifth run of that level
         rl.begin(d, 'H', 'B-PID', 'HIL', 'PID', 'O1-F05', '0.5', 'hil_check', gain_set='B-PID/GA1')
@@ -210,14 +211,135 @@ def test_refused_mapping_reruns_capped(ds):
 
 
 def test_refused_mapping_cap_not_on_final_hil(ds):
-    # final_hil keeps S05 4.6 (FINAL_LOST_N lost runs in a row); refused runs there are still hong_he_do
+    # final_hil keeps S05 4.6 (FINAL_LOST_N lost runs in a row); refused runs there are still hong_he_do. Codex
+    # S315 tests: begin refuses the next run itself (not only summary)
     d, clock = ds
-    for _ in range(rl.FINAL_LOST_N):
-        _hil_check(d, clock, stage='final_hil', campaign='RQ2', gain_set='RQ2-INIT-PID/G0')
+    fh = dict(stage='final_hil', campaign='RQ2', gain_set='RQ2-INIT-PID/G0')
+    _hil_check(d, clock, **fh)
+    _hil_check(d, clock, mapped=True, **fh)                                # a valid run between: streak restarts
+    for _ in range(rl.FINAL_LOST_N - 1):
+        _hil_check(d, clock, **fh)
     assert rl.map_refusals(_rows(d)) == {}
+    rl.summary(d)                                                          # 2 in a row: not stopped
+    _hil_check(d, clock, **fh)                                             # 3 in a row: stopped
     with pytest.raises(rl.LogError, match='lost runs in a row'):
-        _hil_check(d, clock, stage='final_hil', campaign='RQ2', gain_set='RQ2-INIT-PID/G0')
+        rl.begin(d, 'H', 'RQ2', 'HIL', 'PID', 'O1-F05', '0.5', 'final_hil', gain_set='RQ2-INIT-PID/G0')
+    rl.summary(d)
+
+
+def test_s315_1_hil_judged_without_gate(ds):
+    # Codex S315-1: a HIL run judged dat / khong_dat / chua_ket_luan needs its gate, at end and in summary
+    d, clock = ds
+    _open(d, clock, 'HIL')
+    for o in ('dat', 'khong_dat', 'chua_ket_luan'):
+        with pytest.raises(rl.LogError, match='needs its scorer output'):
+            rl.end(d, o, results_dir='r')
+    rl.end(d, 'hong_he_do', fail_cause='mat_khung', results_dir='r')       # a lost run without gate: allowed
+    _open(d, clock)
+    rl.end(d, 'dat')                                                       # a car run without gate: as before
+    rl.summary(d)
+    path = os.path.join(d, rl.TUNING)
+    base = _rows(d)
+    for edit, match in ((dict(run_outcome='dat', fail_cause=''), 'without its gate'),                 # HIL row
+                        (dict(platform='HW', fail_cause=rl.MAP_REFUSED), 'not a HIL hong_he_do'),
+                        (dict(fail_cause=rl.MAP_REFUSED), 'not a HIL hong_he_do')):               # HIL, no gate
+        rows = [dict(r) for r in base]
+        rows[0].update(edit)
+        rl._write_all(path, rl.TUNING_COLS, rows)
+        with pytest.raises(rl.LogError, match=match):
+            rl.summary(d)
+
+
+def test_s315_2_same_gain_same_level_as_numbers(ds):
+    # Codex S315-2: '1' and '1.0', '0.5' and '0.50' are the same candidate, the same level; a gain set id is needed,
+    # and one gain set id cannot carry other gain values at the same level
+    d, clock = ds
+    for g in ('kp_xy=1', 'kp_xy=1.0', 'kp_xy=1e0', 'kp_xy=1'):
+        _hil_check(d, clock, gains=g, speed='0.5')
+    with pytest.raises(rl.LogError, match='stopped after 3 reruns'):
+        rl.begin(d, 'H', 'B-PID', 'HIL', 'PID', 'O1-F05', '0.50', 'hil_check', gain_set='B-PID/GA1',
+                 gains='kp_xy=1.00')
+    with pytest.raises(rl.LogError, match='other values of kp_xy'):
+        rl.begin(d, 'H', 'B-PID', 'HIL', 'PID', 'O1-F05', '0.5', 'hil_check', gain_set='B-PID/GA1', gains='kp_xy=2')
+    with pytest.raises(rl.LogError, match='needs --gain-set'):
+        rl.begin(d, 'H', 'B-PID', 'HIL', 'PID', 'O1-F05', '0.5', 'hil_check')
+    assert rl.map_refusals(_rows(d)) == {('B-PID', 'B-PID/GA1', 'O1-F05', '0.5'): 4}
+
+
+def test_s315_3_stage_does_not_restart_the_count(ds):
+    d, clock = ds
+    for st in ('hil_check', 'screen', 'confirm', 'explore'):               # Codex S315-3: one count over the stages
+        _hil_check(d, clock, stage=st)
+    for st in ('hil_check', 'screen', 'explore'):
+        with pytest.raises(rl.LogError, match='stopped after 3 reruns'):
+            rl.begin(d, 'H', 'B-PID', 'HIL', 'PID', 'O1-F05', '0.5', st, gain_set='B-PID/GA1')
+
+
+def test_s315_4_log_order_not_the_clock(ds):
+    # Codex S315-4: a row added after the stop with an earlier wall_start is still after the stop
+    d, clock = ds
+    for _ in range(rl.MAP_RERUNS_MAX + 1):
+        _hil_check(d, clock)
+    rows = _rows(d)
+    late = dict(rows[0], run_uid='H:9', iter_no='9', wall_start='2026-11-20T07:59:00', run_outcome='dat')
+    late.update(rl.gate_columns(_gate(u_t=0.0015)))
+    late['fail_cause'] = ''
+    rl._write_all(os.path.join(d, rl.TUNING), rl.TUNING_COLS, rows + [late])
+    with pytest.raises(rl.LogError, match='no run after that'):
         rl.summary(d)
+
+
+def test_s315_5_log_changed_between_begin_and_end(ds):
+    # Codex S315-5: the log as it will be is checked before the row is written; nothing written on refusal
+    d, clock = ds
+    for _ in range(rl.MAP_RERUNS_MAX):
+        _hil_check(d, clock)
+    rl.begin(d, 'H', 'B-PID', 'HIL', 'PID', 'O1-F05', '0.5', 'hil_check', gain_set='B-PID/GA1')
+    rl.step(d, 'run')
+    path = os.path.join(d, rl.TUNING)
+    rows = _rows(d)                                                        # another window logged a 4th refusal
+    rl._write_all(path, rl.TUNING_COLS, rows + [dict(rows[-1], run_uid='X:1', session_id='X', iter_no='1')])
+    before = _rows(d)
+    with pytest.raises(rl.LogError, match='not logged'):
+        rl.end(d, 'hong_he_do', fail_cause=rl.MAP_REFUSED, gate=_gate(decide=G.DECIDE_HIL, u_t=None),
+               results_dir='r')
+    assert _rows(d) == before and os.path.exists(os.path.join(d, rl.OPEN_RUN))   # still open, log unchanged
+    rl._write_all(path, rl.TUNING_COLS, rows)                              # back to 3 refusals
+    rows = _rows(d)                                                        # another window: same set, kp_xy=2
+    rl._write_all(path, rl.TUNING_COLS, rows + [dict(rows[-1], run_uid='X:1', session_id='X', iter_no='1',
+                                                     g_kp_xy='2', fail_cause='mat_khung')])
+    os.remove(os.path.join(d, rl.OPEN_RUN))
+    rl.begin(d, 'H', 'B-PID', 'HIL', 'PID', 'O1-F05', '0.5', 'hil_check', gain_set='B-PID/GA1', gains='kp_xy=2')
+    rl.step(d, 'run')
+    rows = _rows(d)                                                        # and changes it to kp_xy=1 meanwhile
+    rows[-1]['g_kp_xy'] = '1'
+    rl._write_all(path, rl.TUNING_COLS, rows)
+    before = _rows(d)
+    with pytest.raises(rl.LogError, match='not logged.*other values of kp_xy'):
+        rl.end(d, 'hong_he_do', fail_cause=rl.MAP_REFUSED, gate=_gate(decide=G.DECIDE_HIL, u_t=None),
+               results_dir='r')
+    assert _rows(d) == before
+
+
+def test_s315_6_cli_note_by_stage(ds, tmp_path, capsys):
+    # Codex S315-6: the CLI note follows 4.5 step 2 for hil_check and 4.6 for final_hil
+    d, clock = ds
+    f = str(tmp_path / 'unmapped.json')
+    with open(f, 'w', encoding='utf-8') as fh:
+        json.dump(dict(gate_v3=_gate(decide=G.DECIDE_HIL, u_t=None)), fh)
+    end = ['--dataset', d, 'end', '--outcome', 'hong_he_do', '--fail-cause', rl.MAP_REFUSED, '--gate-json', f,
+           '--results-dir', 'r']
+    notes = []
+    for stage, campaign, gs, n in (('hil_check', 'B-PID', 'B-PID/GA1', 4), ('final_hil', 'RQ2', 'RQ2-INIT-PID/G0', 3)):
+        for _ in range(n):
+            rl.begin(d, 'H', campaign, 'HIL', 'PID', 'O1-F05', '0.5', stage, gain_set=gs)
+            rl.step(d, 'run')
+            assert rl.main(end) == 0
+            notes.append([ln for ln in capsys.readouterr().out.splitlines() if 'tu choi' in ln][0])
+    assert notes[0].startswith('anh xa bi tu choi lan 1: chay lai cung gain (con 3 lan)')
+    assert notes[3].startswith('anh xa bi tu choi lan 4: qua 3 lan chay lai')
+    assert notes[4].startswith('final_hil: anh xa bi tu choi, 1 luot hong lien') and 'chay lai' in notes[4]
+    assert notes[6].startswith('final_hil: anh xa bi tu choi, 3 luot hong lien') and 'dung' in notes[6]
 
 
 def test_sc3_1_example_end_to_end(ds):

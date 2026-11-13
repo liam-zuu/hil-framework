@@ -47,9 +47,12 @@ def gain_file(d, name='gain_G0.json'):
 
 
 def car_run(d, clock, campaign, stage, outcome, task='O1-F05', speed='0.5', s=60, **kw):
-    rl.begin(d, kw.pop('session', 'S'), campaign, kw.pop('platform', 'HW'), 'PID', task, speed, stage, **kw)
+    platform = kw.pop('platform', 'HW')
+    rl.begin(d, kw.pop('session', 'S'), campaign, platform, 'PID', task, speed, stage, **kw)
     rl.step(d, 'run')
     tick(clock, s)
+    if platform == 'HIL' and outcome != 'hong_he_do':     # S05 v3.15: a judged HIL run carries its gate
+        return rl.end(d, outcome, results_dir='r', gate=rl.fake_gate(e_trk=0.5 if outcome == 'khong_dat' else 0.03))
     return rl.end(d, outcome, fail_cause='mat_khung' if outcome == 'hong_he_do' else '')
 
 
@@ -285,7 +288,8 @@ def test_c9_dry_run_recomputes_summary(tmp_path):
     assert a['A-PID']['stop_reason_check'] == 'khong_kiem_duoc' and a['A-PID']['gate_result'] == 'chua_ket_luan'
     assert a['A-PID']['final_O1-F05@0.5_n_valid'] == '2' and a['A-PID']['final_hil_O1-F05@0.5_pass'] == '2'
     assert a['RQ2']['N_HIL'] == '2' and a['A-PID']['N_HIL'] == '0'
-    assert a['B-PID']['N_SIM'] == '2739' and a['B-PID']['N_HIL'] == '1' and a['B-PID']['N_hong'] == '1'
+    assert a['B-PID']['N_SIM'] == '2739' and a['B-PID']['N_HIL'] == '2' and a['B-PID']['N_hong'] == '1'
+    assert a['B-PID']['hil_map_refused_n'] == '1' and a['B-PID']['hil_map_stopped'] == ''   # S05 v3.15 4.5 step 2
     assert a['A-PID']['hoc_nhap_tay_n'] == '0' and len(a['A-PID']['gate_sha256']) == 64
     assert float(a['A-PID']['T_operator_h']) - float(a['A-PID']['T_operator_no_hoc_h']) == pytest.approx(0.5)
     assert float(a['C_chung']['T_operator_h']) == 0.5
@@ -466,7 +470,13 @@ def test_ea8_three_lost_in_a_row_stop_the_condition(ds):
     a = {r['campaign']: r for r in rl.summary(d)}['A-PID']
     assert a['final_O1-F05@0.5_stopped_n3'] == '1' and a['final_O1-F05@0.5_n_valid'] == '1'
     assert 'final_O1-F08@0.8_stopped_n3' not in a
-    car_run(d, clock, 'A-PID', 'final', 'dat', session='F')
+    with pytest.raises(rl.LogError, match='stopped after 3'):           # begin refuses it (Codex S315 tests)
+        car_run(d, clock, 'A-PID', 'final', 'dat', session='F')
+    path = os.path.join(d, rl.TUNING)
+    old = rows(path)                                                     # a row written past the stop by hand
+    first = next(r for r in old if r['session_id'] == 'F')               # not the June example rows
+    rl._write_all(path, rl.TUNING_COLS, old + [dict(first, run_uid='F:99', iter_no='99',
+                                                    wall_start='2026-12-01T08:00:00')])
     with pytest.raises(rl.LogError, match='stopped after 3'):
         rl.summary(d)
 
