@@ -10,7 +10,7 @@ type I, later).
 Checks:
   1. the frame log has the true frames (mosi_true) and the manifest has 'faults';
   2. SHA-256 of the schedule file (CRLF -> LF) = manifest; rows of the file = rows of the manifest;
-  3. every frame k of the log, inside and outside the windows (ARM, STOPPING, END tail too): the 40 bytes
+  3. every frame k of the log, inside and outside the windows (ARM, STOPPING, END tail too): every byte
      sent = expected_sent(), built here from the schedule, t0, the stop step and mosi_true only (written
      apart from rpi5/fault_schedule.FramePatcher on purpose: no shared state, no ring buffer);
   4. the on / off / cut events of the manifest = the events expected from the schedule, t0, the stop step

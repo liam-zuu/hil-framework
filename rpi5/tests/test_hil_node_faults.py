@@ -14,13 +14,13 @@ import fault_schedule as fs
 from fake_h7 import FakeH7
 from hil_node import HILConfig, HILNode
 from mecanum_plant import MecanumPlant
-from protocol import CMD_SWA_ON, OFS_FAULT
+from protocol import CMD_SWA_ON, FRAME_SIZE, OFS_FAULT
 from run_lifecycle import ARM, RUN, ControlBox, LifecycleConfig
 from tests.test_run_wire import CountPlant, Owner, done_after
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HEAD = fs.MAGIC + '\nid,fault,target,start_ms,end_ms,params\n'
-DUTY = bytes([0x10, 0x00] * 4) + bytes(32)        # constant duty from the "H7"
+DUTY = bytes([0x10, 0x00] * 4) + bytes(FRAME_SIZE - 8)    # constant duty from the "H7" (rule 3.7: no fixed 40)
 IMU_STATIC = (0.5, 0.1, 0.2, 9.81, 0.3)
 
 

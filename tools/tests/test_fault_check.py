@@ -18,7 +18,7 @@ import fault_check as fc                       # noqa: E402
 import fault_schedule as fs                    # noqa: E402
 from hil_node import HILConfig, HILNode        # noqa: E402
 from mecanum_plant import MecanumPlant         # noqa: E402
-from protocol import encode_state              # noqa: E402
+from protocol import FRAME_SIZE, encode_state  # noqa: E402
 
 HEAD = fs.MAGIC + '\nid,fault,target,start_ms,end_ms,params\n'
 BODY = ('E1,enc_loss,FR,50,120,\nL1,imu_loss,imu,100,200,\nD1,imu_delay,imu,220,300,d_ms=20\n'
@@ -70,7 +70,7 @@ def run(tmp_path):
     p = str(tmp_path / 'frames.npz')
     node = HILNode(moving_plant(),
                    config=HILConfig(simulate_hw=True, max_steps=400, frame_log=p, faults=sched))
-    node._spi.transfer = lambda mosi: bytes([0x10, 0x00] * 4) + bytes(32)
+    node._spi.transfer = lambda mosi: bytes([0x10, 0x00] * 4) + bytes(FRAME_SIZE - 8)
     node.run()
     return p, str(csv)
 
@@ -129,7 +129,7 @@ def test_cut_window_fails_even_if_bytes_agree(tmp_path):
     node = HILNode(MecanumPlant(dt=0.001, seed=0),
                    config=HILConfig(simulate_hw=True, max_steps=400, frame_log=p,
                                     faults=fs.load(str(csv), 500, 'plant')))
-    node._spi.transfer = lambda mosi: bytes(40)
+    node._spi.transfer = lambda mosi: bytes(FRAME_SIZE)
     node.run()
     p2 = resave(p, str(tmp_path / 'ok.npz'), _miso_ok)
     r = fc.check(p2, str(csv))
