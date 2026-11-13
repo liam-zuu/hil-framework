@@ -241,6 +241,12 @@ def migrate(ds: str) -> Dict[str, str]:
 def check_task(task: str, speed) -> None:
     """EA-9: a figure-8 task name carries its level; the level and speed_mps must agree, so the
     gate (a list of task names) cannot merge two speeds."""
+    try:
+        bad = not math.isfinite(float(speed))
+    except (TypeError, ValueError):
+        bad = False                                     # not a number: the figure-8 check below refuses it
+    if bad:                                             # Codex S315-R2-1: nan passes abs(nan - x) > tol
+        raise LogError(f'speed {speed!r}: not a finite number')
     if task.startswith('O1-F'):
         if task not in FIG8:
             raise LogError(f'task {task!r}: figure-8 names are {sorted(FIG8)} (the name carries the level)')
@@ -327,7 +333,7 @@ def begin(ds: str, session: str, campaign: str, platform: str, controller: str, 
             if k not in TUNING_COLS:
                 raise LogError(f'unknown field {k}')
             row[k] = str(v)
-    tun = read_rows(os.path.join(ds, TUNING))
+    tun = live_rows(read_rows(os.path.join(ds, TUNING)))      # S315-R2-2
     if _map_counted(row):
         if not gain_set:
             raise LogError('a HIL run needs --gain-set (S05 v3.15 4.5 step 2 counts reruns per candidate)')
@@ -622,8 +628,17 @@ def _num_text(s) -> str:
 def map_key(r: dict) -> tuple:
     """One candidate at one level (S05 v3.15 4.5 step 2): (campaign, gain set id, task, speed as a number).
     The stage is not in it (Codex S315-3: a run of the same gain at the same level in another HIL stage counts
-    against the same reruns); the gain values are checked for agreement in map_refusals (S315-2)."""
-    return (r.get('campaign', ''), r.get('gain_set_id', ''), r.get('trajectory', ''), _num_text(r.get('speed_mps')))
+    against the same reruns); the gain values are checked for agreement in map_refusals (S315-2). A figure-8
+    task gives its level FIG8[task], not the speed as typed (S315-R2-1: check_task allows 1e-9 around it)."""
+    task = r.get('trajectory', '')
+    speed = repr(float(FIG8[task])) if task in FIG8 else _num_text(r.get('speed_mps'))
+    return (r.get('campaign', ''), r.get('gain_set_id', ''), task, speed)
+
+
+def live_rows(tun: List[dict]) -> List[dict]:
+    """The tuning rows every rule looks at: the June example and reconstruction rows (SKIP_PREFIX) left out,
+    as in summary (Codex S315-R2-2: begin, end and the CLI note use the same rows)."""
+    return [r for r in tun if not r.get('session_id', '').startswith(SKIP_PREFIX)]
 
 
 def _map_counted(r: dict) -> bool:
@@ -731,7 +746,7 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
     if notes:
         row['notes'] = (row.get('notes', '') + ' ' + notes).strip()
     # Codex S315-5: the log as it will be, this row included, checked before the row is written
-    after = read_rows(os.path.join(ds, TUNING)) + [row]
+    after = live_rows(read_rows(os.path.join(ds, TUNING))) + [row]
     check_map_rows([row])
     if _map_counted(row):
         try:
@@ -750,7 +765,7 @@ def refusal_note(ds: str, row: dict) -> str:
     if row.get('fail_cause') != MAP_REFUSED:
         return ''
     try:
-        tun = read_rows(os.path.join(ds, TUNING))
+        tun = live_rows(read_rows(os.path.join(ds, TUNING)))
         if row.get('stage') == 'final_hil':
             s = final_lost_streak(tun, final_key(row))
             return (f'final_hil: anh xa bi tu choi, {s} luot hong lien (S05 4.6): ' +
@@ -1034,7 +1049,7 @@ def _final_stops(tun: List[dict]) -> set:
                     r.get('trajectory', ''), r.get('speed_mps', ''))].append(r)
     stopped = set()
     for key, runs in groups.items():
-        runs.sort(key=lambda r: r.get('wall_start', ''))
+        # S315-R2-3: the order of the log rows (as map_refusals, S315-4, and final_lost_streak), not wall_start
         lost = 0
         for i, r in enumerate(runs):
             if key in stopped:
@@ -1081,7 +1096,7 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
         gain set id or with other gain values than the earlier runs of its key;
       * gate_result: gate_result() over the final runs of the gate levels (`gate`, read from the
         locked gate file by read_gate); empty without `gate` or without any final run."""
-    tun = [r for r in read_rows(os.path.join(ds, TUNING)) if not r.get('session_id', '').startswith(SKIP_PREFIX)]
+    tun = live_rows(read_rows(os.path.join(ds, TUNING)))
     eff = read_rows(os.path.join(ds, EFFORT))
     hw = read_rows(os.path.join(ds, HWFAIL))
     frz = {r['campaign']: r for r in read_rows(os.path.join(ds, FREEZE))}

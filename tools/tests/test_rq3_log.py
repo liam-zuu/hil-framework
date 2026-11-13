@@ -503,3 +503,17 @@ def test_fig8_matches_o1_tasks():
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'rpi5'))
     import o1_tasks
     assert rl.FIG8 == o1_tasks.FIG8
+
+
+def test_s315_r2_2_example_rows_do_not_block_hil(ds):
+    # Codex S315-R2-2: the June HIL example row (no gain set, left out of summary) is left out of begin, end and
+    # the CLI note too; the real dataset has this row
+    d, clock = ds
+    rl.migrate(d)
+    assert any(r['platform'] == 'HIL' and r['session_id'].startswith('EXAMPLE') for r in rows(os.path.join(d, rl.TUNING)))
+    rl.begin(d, 'H', 'B-PID', 'HIL', 'PID', 'O1-F05', '0.5', 'hil_check', gain_set='B-PID/GA1')
+    rl.step(d, 'run')
+    tick(clock, 60)
+    row = rl.end(d, 'hong_he_do', fail_cause=rl.MAP_REFUSED, results_dir='r', gate=rl.fake_gate(mapped=False))
+    assert rl.refusal_note(d, row).startswith('anh xa bi tu choi lan 1')
+    assert {r['campaign']: r for r in rl.summary(d)}['B-PID']['hil_map_refused_n'] == '1'

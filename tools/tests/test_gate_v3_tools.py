@@ -305,9 +305,11 @@ def test_s315_5_log_changed_between_begin_and_end(ds):
                results_dir='r')
     assert _rows(d) == before and os.path.exists(os.path.join(d, rl.OPEN_RUN))   # still open, log unchanged
     rl._write_all(path, rl.TUNING_COLS, rows)                              # back to 3 refusals
-    rows = _rows(d)                                                        # another window: same set, kp_xy=2
-    rl._write_all(path, rl.TUNING_COLS, rows + [dict(rows[-1], run_uid='X:1', session_id='X', iter_no='1',
-                                                     g_kp_xy='2', fail_cause='mat_khung')])
+    rows = _rows(d)                       # another window: same set, kp_xy=2, an L50 lost run without gate (R2-4)
+    l50 = dict(rows[-1], run_uid='X:1', session_id='X', iter_no='1', g_kp_xy='2', fail_cause='mat_khung')
+    l50.update({c: '' for c in rl.GATE_COLS})
+    rl._write_all(path, rl.TUNING_COLS, rows + [l50])
+    rl.summary(d)                                                          # a valid log so far
     os.remove(os.path.join(d, rl.OPEN_RUN))
     rl.begin(d, 'H', 'B-PID', 'HIL', 'PID', 'O1-F05', '0.5', 'hil_check', gain_set='B-PID/GA1', gains='kp_xy=2')
     rl.step(d, 'run')
@@ -338,8 +340,42 @@ def test_s315_6_cli_note_by_stage(ds, tmp_path, capsys):
             notes.append([ln for ln in capsys.readouterr().out.splitlines() if 'tu choi' in ln][0])
     assert notes[0].startswith('anh xa bi tu choi lan 1: chay lai cung gain (con 3 lan)')
     assert notes[3].startswith('anh xa bi tu choi lan 4: qua 3 lan chay lai')
-    assert notes[4].startswith('final_hil: anh xa bi tu choi, 1 luot hong lien') and 'chay lai' in notes[4]
-    assert notes[6].startswith('final_hil: anh xa bi tu choi, 3 luot hong lien') and 'dung' in notes[6]
+    # Codex S315-R2-4: the exact branch, before and at the stop
+    assert notes[4] == 'final_hil: anh xa bi tu choi, 1 luot hong lien (S05 4.6): chay lai (dung khi du 3 luot hong lien)'
+    assert notes[5] == 'final_hil: anh xa bi tu choi, 2 luot hong lien (S05 4.6): chay lai (dung khi du 3 luot hong lien)'
+    assert notes[6] == 'final_hil: anh xa bi tu choi, 3 luot hong lien (S05 4.6): dieu kien nay dung'
+
+
+def test_s315_r2_1_level_not_the_typed_speed(ds):
+    # Codex S315-R2-1: a speed within check_task's 1e-9 is the same level; nan is refused
+    d, clock = ds
+    for _ in range(rl.MAP_RERUNS_MAX + 1):
+        _hil_check(d, clock)
+    with pytest.raises(rl.LogError, match='stopped after 3 reruns'):
+        rl.begin(d, 'H', 'B-PID', 'HIL', 'PID', 'O1-F05', '0.5000000001', 'hil_check', gain_set='B-PID/GA1')
+    for bad in ('nan', 'inf'):
+        with pytest.raises(rl.LogError, match='not a finite number'):
+            rl.begin(d, 'H', 'B-PID', 'HIL', 'PID', 'O1-F05', bad, 'hil_check', gain_set='B-PID/GA1')
+    rows = _rows(d)                                                        # the same by hand: summary refuses
+    rl._write_all(os.path.join(d, rl.TUNING), rl.TUNING_COLS,
+                  rows + [dict(rows[-1], run_uid='H:9', iter_no='9', speed_mps='0.5000000001')])
+    with pytest.raises(rl.LogError, match='no run after that'):
+        rl.summary(d)
+
+
+def test_s315_r2_3_final_hil_one_order(ds, tmp_path, capsys):
+    # Codex S315-R2-3: the PC clock goes back between runs; the CLI note, begin and summary agree (log order)
+    d, clock = ds
+    fh = dict(stage='final_hil', campaign='RQ2', gain_set='RQ2-INIT-PID/G0')
+    _hil_check(d, clock, **fh)                                             # F1 R
+    _hil_check(d, clock, **fh)                                             # F2 R
+    clock[0] -= dt.timedelta(hours=1)
+    _hil_check(d, clock, mapped=True, **fh)                                # F3 M, earlier wall_start
+    row = _hil_check(d, clock, **fh)                                       # F4 R
+    assert rl.refusal_note(d, row).startswith('final_hil: anh xa bi tu choi, 1 luot hong lien')
+    rl.begin(d, 'H', 'RQ2', 'HIL', 'PID', 'O1-F05', '0.5', 'final_hil', gain_set='RQ2-INIT-PID/G0')   # not stopped
+    rl.cancel(d)
+    rl.summary(d)
 
 
 def test_sc3_1_example_end_to_end(ds):
