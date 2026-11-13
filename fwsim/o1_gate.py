@@ -23,7 +23,7 @@ is finite, taken separately: q = max q_k, lo = max lo_k, hi = max hi_k; n_undef 
 q_k, lo_k or hi_k is not finite. Then
   khong_dat      lo > threshold                          (one frame certainly above, whatever the others)
   chua_ket_luan  otherwise, n_undef > 0 or hi > threshold or no frame with a finite hi
-  dat            n_undef = 0 and hi <= threshold         (an upper edge equal to the threshold passes, "<=")
+  dat            n_undef = 0, lo and hi finite, hi <= threshold   (an upper edge equal to the threshold passes)
 Example (SC3-1, THESIS 13/11, Codex TX-4): one frame (0.12, 0.11, +inf), D = 0.10 -> khong_dat.
   U(G2) = U_p;  U(G3) = U_p + v_cmd_max U_t;  U(G5) = U_psi + wz_cmd_max U_t (degrees);
   U(G4) = U_p + r_c (U_psi + kappa_eff U_p): only U_p = U_psi = 0 is handled here (fwsim, HIL score the true
@@ -31,9 +31,9 @@ Example (SC3-1, THESIS 13/11, Codex TX-4): one frame (0.12, 0.11, +inf), D = 0.1
 G1: 'true' -> dat, 'false' -> khong_dat, 'inconclusive' (or anything else) -> chua_ket_luan.
 
 Which conditions decide (`decide`): DECIDE_ALL on fwsim, the floor and on HIL when t = 0 is the ESP32
-run_active edge mapped to the plant step (tools/hil_edge_map.py, RS-4); DECIDE_HIL when that mapping is
-missing: t = 0 is then the plant RUN step, U_t is not known, so G3, G5 report only; G1, G2, G4 do not use
-the schedule time and decide. Outcomes (O1 3.5 order: one khong_dat -> khong_dat; else one chua_ket_luan ->
+run_active edge mapped to the plant step (tools/hil_edge_map.py, RS-4); DECIDE_HIL = G1, G2 when that mapping
+is missing (O1 v11.9 3.5: on HIL before RS-4 only G1, G2 decide): t = 0 is then the plant RUN step, U_t is not
+known, G3, G5 are inconclusive and G4 reports only. Outcomes (O1 3.5 order: one khong_dat -> khong_dat; else one chua_ket_luan ->
 chua_ket_luan; else dat):
   outcome         over G1-G5, report only
   outcome_decide  over the deciding conditions
@@ -64,7 +64,7 @@ MEASURED = ('g2', 'g3', 'g4', 'g5')
 THRESHOLDS = {'g2': D, 'g3': D, 'g4': D, 'g5': THETA_MAX_DEG}
 FRAME_KEYS = {'g2': 'e_perp', 'g3': 'e_trk', 'g4': 'e_bao', 'g5': 'e_theta_cmd_deg'}
 DECIDE_ALL = CONDS
-DECIDE_HIL = ('g1', 'g2', 'g4')         # HIL without the run_active edge mapping (RS-4)
+DECIDE_HIL = ('g1', 'g2')               # HIL without the run_active edge mapping (RS-4; O1 3.5)
 DECIDE_SETS = (DECIDE_ALL, DECIDE_HIL)
 CMD_MARGIN = 1e-6                       # relative margin on the refined command maxima (GV3-7)
 
@@ -94,7 +94,7 @@ def cond_state(lo, hi, n_undef, threshold: float) -> str:
         return 'khong_dat'
     if not isinstance(n_undef, int) or isinstance(n_undef, bool) or n_undef != 0:
         return 'chua_ket_luan'
-    if not _finite(hi) or float(hi) > threshold:
+    if not (_finite(lo) and _finite(hi)) or float(hi) > threshold:     # no 'dat' without both bounds (G32-1)
         return 'chua_ket_luan'
     return 'dat'
 

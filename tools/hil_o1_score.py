@@ -35,7 +35,8 @@ RS-4: with --esp-log (the agv_logger CSV of the same run), t = 0 is the ESP32 ru
 mapped to the plant step (tools/hil_edge_map.py): t of frame k = (k - a) x period, frames k >= a scored,
 U_t = the mapping bound, all five conditions decide; t0_src 'esp32_run_active_edge', edge_map block
 with offset_ms = edge - RUN step (the "chênh" of O1 3.4). Without --esp-log, or when the mapping is
-refused: t = 0 at the RUN step as before, U_t unknown, G3, G5 report only (decide G1, G2, G4).
+refused: t = 0 at the RUN step as before, U_t unknown, G3, G5 inconclusive, G4 reported (decide G1, G2;
+O1 v11.9 3.5). The mapping is a two-sided bracket (count side early, PWM side late; Codex round 1, L97).
 Validity (CODE L50, STATUS_CODE CG4) is NOT decided here: the manifest counts (MISO CRC bad,
 empty frames) are copied out; the run rule is tools/s06_frames_decode.py on the same log.
 
@@ -124,7 +125,7 @@ def score(path, task, allow_final_set=False, esp_log=None):
     # RS-4: t = 0 at the ESP32 run_active edge mapped to the plant step, when the ESP32 log maps
     em = dict(ok=False, reason='no --esp-log')
     if esp_log:
-        em = hil_edge_map.map_edge(state[:, 0:4], k_run, hil_edge_map.read_esp_log(esp_log), period)
+        em = hil_edge_map.map_edge(state[:, 0:4], duty, k_run, hil_edge_map.read_esp_log(esp_log), period)
         em['esp_log'] = os.path.basename(esp_log)
     if em['ok']:
         a = float(em['edge_step'])
@@ -134,7 +135,7 @@ def score(path, task, allow_final_set=False, esp_log=None):
     else:
         a, k0, t0_src, u_t, decide = float(k_run), k_run, run_src, None, o1_gate.DECIDE_HIL
         note = (f'HIL: t = 0 at the plant RUN step, run_active edge not mapped ({em["reason"]}): U_t not known, '
-                'G3, G5 report only (G1, G2, G4 decide)')
+                'G3, G5, G4 report only (G1, G2 decide, O1 3.5)')
     sl = slice(k0, len(state))
     log = dict(t=(np.arange(len(state))[sl] - a) * period, pose=state[sl, 4:7], v_true=state[sl, 7:10],
                duty=duty[sl], pwm=np.round(duty[sl] * 1000.0))

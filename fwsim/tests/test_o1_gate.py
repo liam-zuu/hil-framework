@@ -59,6 +59,7 @@ def test_aggregate_fields_are_maxima_over_finite_frames_separately():
     (0.11, None, 3, 'khong_dat'), (None, None, 0, 'chua_ket_luan'), (0.05, 0.08, 1, 'chua_ket_luan'),
     (0.05, 0.08, 0, 'dat'), (0.05, 0.12, 0, 'chua_ket_luan'), (0.05, 0.08, True, 'chua_ket_luan'),
     (0.05, 0.08, 0.0, 'chua_ket_luan'),                       # n_undef must be an int
+    (None, 0.05, 0, 'chua_ket_luan'), (NAN, 0.05, 0, 'chua_ket_luan'),   # G32-1: no 'dat' without lo
 ])
 def test_cond_state(lo, hi, nu, state):
     assert G.cond_state(lo, hi, nu, 0.10) == state
@@ -142,11 +143,13 @@ def test_gate_states_and_fields():
     assert g['outcome'] == 'dat' and g['complete'] and g['track_err']
 
 
-def test_g4_decides():
+def test_g4_decides_when_all_five_decide_and_reports_only_on_unmapped_hil():
     g = G.gate(_frames(e_bao=0.1001), 'true', v_cmd_max=0.729, wz_cmd_max=1.634, u_t=0.0)
     assert g['g4']['state'] == 'khong_dat' and g['outcome_decide'] == 'khong_dat'
+    # O1 v11.9 3.5: on HIL before RS-4 only G1, G2 decide; G4 is computed and reported
     g = G.gate(_frames(e_bao=0.1001), 'true', v_cmd_max=0.729, wz_cmd_max=1.634, u_t=None, decide=G.DECIDE_HIL)
-    assert g['g4']['state'] == 'khong_dat' and g['outcome_decide'] == 'khong_dat' and g['any_certain_fail']
+    assert g['g4']['state'] == 'khong_dat' and g['outcome'] == 'khong_dat'
+    assert g['outcome_decide'] == 'dat' and not g['any_certain_fail'] and not g['complete']
 
 
 def test_u_t_is_required_and_none_means_unknown():
@@ -177,11 +180,11 @@ def test_camera_bounds_are_not_handled_here():
 
 def test_decide_sets():
     g = G.gate(_frames(trk=0.5), 'true', v_cmd_max=0.7, wz_cmd_max=1.6, u_t=None, decide=G.DECIDE_HIL)
-    assert g['decide'] == ['g1', 'g2', 'g4'] and g['outcome'] == 'chua_ket_luan'
+    assert g['decide'] == ['g1', 'g2'] and g['outcome'] == 'chua_ket_luan'
     assert g['outcome_decide'] == 'dat' and not g['complete'] and not g['any_certain_fail']
     g = G.gate(_frames(perp=0.2), 'true', v_cmd_max=0.7, wz_cmd_max=1.6, u_t=None, decide=iter(G.DECIDE_HIL))
     assert g['outcome_decide'] == 'khong_dat' and g['any_certain_fail']         # GV3-R2-5: iterator read once
-    for bad in ((), ('g1', 'g2'), ('g1', 'g3'), ('g1', 'g2', 'g4', 'g4')):
+    for bad in ((), ('g1', 'g2', 'g4'), ('g1', 'g3'), ('g1', 'g2', 'g2')):
         with pytest.raises(ValueError, match='decide'):
             G.gate(_frames(), 'true', v_cmd_max=0.7, wz_cmd_max=1.6, u_t=0.0, decide=bad)
 

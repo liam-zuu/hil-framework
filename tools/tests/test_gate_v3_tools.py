@@ -24,12 +24,12 @@ import rq3_log as rl                                         # noqa: E402
 from test_hil_o1_score import write_frame_log, k_log         # noqa: E402
 
 
-def test_hil_score_without_esp_log_decides_g1_g2_g4(tmp_path):
+def test_hil_score_without_esp_log_decides_g1_g2(tmp_path):
     p = str(tmp_path / 'run.npz')
     write_frame_log(p, 'O1-F05')
     out = H.score(p, 'O1-F05')
     g = out['gate_v3']
-    assert g['version'] == G.GATE_VERSION and g['decide'] == ['g1', 'g2', 'g4'] and g['u_t'] is None
+    assert g['version'] == G.GATE_VERSION and g['decide'] == ['g1', 'g2'] and g['u_t'] is None
     assert g['g1']['state'] == g['g2']['state'] == g['g4']['state'] == 'dat'
     assert g['g3']['state'] == g['g5']['state'] == 'chua_ket_luan'          # U_t not known without RS-4
     assert g['g3']['q'] == pytest.approx(out['e_trk_max']) and g['g5']['q'] == pytest.approx(out['e_theta_cmd_max_deg'])
@@ -152,14 +152,17 @@ def test_outcome_against_the_gate(ds):
     _open(d, clock, 'HIL')
     with pytest.raises(rl.LogError, match='not complete'):                 # GV3-1: HIL without RS-4 mapping
         rl.end(d, 'dat', gate=_gate(decide=G.DECIDE_HIL, u_t=None), results_dir='r')
-    with pytest.raises(rl.LogError, match='disagrees'):                    # GV3-2: G4 certain fail decides on HIL
-        rl.end(d, 'chua_ket_luan', gate=_gate(decide=G.DECIDE_HIL, u_t=None, e_bao=0.2), results_dir='r')
+    with pytest.raises(rl.LogError, match='disagrees'):                    # GV3-2: G2 certain fail decides on HIL
+        rl.end(d, 'chua_ket_luan', gate=_gate(decide=G.DECIDE_HIL, u_t=None, e_perp=0.2), results_dir='r')
+    rl.end(d, 'chua_ket_luan', gate=_gate(decide=G.DECIDE_HIL, u_t=None, e_bao=0.2), results_dir='r')  # G4 reports only
+    _open(d, clock, 'HIL')
     rl.end(d, 'chua_ket_luan', gate=_gate(decide=G.DECIDE_HIL, u_t=None, e_trk=0.5), results_dir='r')
     _open(d, clock, 'HIL')
     rl.end(d, 'dat', gate=_gate(u_t=0.0015), results_dir='r')             # HIL with the mapping: all five
     _open(d, clock)
     rl.end(d, 'hong_he_do', fail_cause='mat_khung', gate=_gate(e_trk=0.12), results_dir='r')
-    assert [r['run_outcome'] for r in _rows(d)] == ['dat', 'chua_ket_luan', 'chua_ket_luan', 'dat', 'hong_he_do']
+    assert [r['run_outcome'] for r in _rows(d)] == ['dat', 'chua_ket_luan', 'chua_ket_luan', 'chua_ket_luan', 'dat',
+                                                    'hong_he_do']
     rl.summary(d)                                                          # the rows written by end pass
 
 
@@ -168,17 +171,17 @@ def test_sc3_1_example_end_to_end(ds):
     # keeps lo, so summary recomputes khong_dat, not chua_ket_luan
     d, clock = ds
     g = _gate(decide=G.DECIDE_HIL, u_t=None)
-    g['g4'].update(q=0.12, lo=0.11, hi=0.06, n_undef=1, state='khong_dat')  # hi: max over the finite frames
+    g['g2'].update(q=0.12, lo=0.11, hi=0.06, n_undef=1, state='khong_dat')  # hi: max over the finite frames
     g.update(outcome='khong_dat', outcome_decide='khong_dat', any_certain_fail=True)
     _open(d, clock, 'HIL')
     rl.end(d, 'khong_dat', gate=g, results_dir='r')
     r = _rows(d)[-1]
-    assert (r['g4_lo'], r['g4_n_undef'], r['g4_state']) == ('0.11', '1', 'khong_dat')
+    assert (r['g2_lo'], r['g2_n_undef'], r['g2_state']) == ('0.11', '1', 'khong_dat')
     rl.summary(d)
 
 
 @pytest.mark.parametrize('edit,match', [
-    (dict(platform='HIL', run_outcome='dat', gate_decide='g1,g2,g4', gate_u_t='', g3_lo='', g3_hi='', g3_n_undef='20',
+    (dict(platform='HIL', run_outcome='dat', gate_decide='g1,g2', gate_u_t='', g3_lo='', g3_hi='', g3_n_undef='20',
           g3_state='chua_ket_luan', g5_lo='', g5_hi='', g5_n_undef='20', g5_state='chua_ket_luan'), 'no run is dat'),
     (dict(g2_lo='0.2', g2_q='0.2', g2_hi='0.2', g2_state='dat'), 'recomputed from lo, hi'),   # state lied about
     (dict(g4_n_undef='1'), 'recomputed from lo, hi'),
@@ -186,8 +189,8 @@ def test_sc3_1_example_end_to_end(ds):
     (dict(g4_n_undef='0.5'), 'whole number'),
     (dict(g3_lo='0.05'), 'lo'),                                            # lo > q
     (dict(gate_decide='g1,g3,g4,g5'), 'decide'),
-    (dict(gate_decide='g1,g2,g4'), 'on platform'),                         # HW row, HIL set
-    (dict(platform='HIL', gate_decide='g1,g2,g4'), 'U_t'),                 # HIL set with U_t given
+    (dict(gate_decide='g1,g2'), 'on platform'),                            # HW row, HIL set
+    (dict(platform='HIL', gate_decide='g1,g2'), 'U_t'),                    # HIL set with U_t given
     (dict(gate_u_t=''), 'U_t'),                                            # all five decide, U_t unknown
     (dict(gate_version='gate_v3_g1235'), 'only'),
     (dict(gate_u_t='-0.01'), 'negative'),
@@ -315,3 +318,36 @@ def test_cli_end_with_gate_json(ds, tmp_path):
     assert rl.main(['--dataset', d, 'end', '--outcome', 'khong_dat', '--gate-json', f, '--results-dir', 'r']) == 0
     r = _rows(d)[-1]
     assert r['g3_state'] == 'khong_dat' and r['gate_json_sha256'] == rl.sha256_file(f)
+
+
+def test_g32_1_unknown_q_and_lo_never_pass(ds):
+    # Codex G32-1: q, lo unknown, hi finite, n_undef 0, state dat: refused at end and at summary
+    g = _gate()
+    g['g2'].update(q=None, lo=None, hi=0.05, n_undef=0, state='dat')
+    with pytest.raises(rl.LogError, match='n_undef 0'):
+        rl.validate_gate(g)
+    d, clock = ds
+    _open(d, clock)
+    rl.end(d, 'dat', gate=_gate(), results_dir='r')
+    rows = _rows(d)
+    rows[-1].update(g2_q='', g2_lo='')
+    rl._write_all(os.path.join(d, rl.TUNING), rl.TUNING_COLS, rows)
+    with pytest.raises(rl.LogError, match='n_undef 0'):
+        rl.summary(d)
+
+
+def test_g32_11_migrate_drops_empty_old_u_columns(ds):
+    # a log written by hil 7768134 (gate_v3_g1235): g1_u..g5_u columns; empty -> dropped, a value -> refused
+    d, clock = ds
+    _open(d, clock)
+    rl.end(d, 'khong_dat', results_dir='r')
+    path = os.path.join(d, rl.TUNING)
+    rows = _rows(d)
+    old = rl.TUNING_COLS + list(rl.OLD_GATE_U)
+    rl._write_all(path, old, rows)
+    assert rl.migrate(d)[rl.TUNING] == 'migrated' and list(_rows(d)[0]) == rl.TUNING_COLS
+    rows = _rows(d)
+    rows[0]['g3_u'] = '0.01'
+    rl._write_all(path, old, rows)
+    with pytest.raises(rl.LogError, match='gate_v3_g1235'):
+        rl.migrate(d)

@@ -96,6 +96,7 @@ GATE_CONDS = o1_gate.CONDS
 # maxima over the frames of q, lo, hi (each field over its finite frames) and n_undef; G1 q is 'completed';
 # gate_u_t = the U_t used (empty = not known: HIL run without the run_active edge mapping, RS-4)
 GATE_FIELDS = ('q', 'lo', 'hi', 'n_undef', 'state')
+OLD_GATE_U = tuple(f'g{i}_u' for i in range(1, 6))       # gate_v3_g1235 columns, dropped by migrate when empty
 GATE_COLS = (['gate_version', 'gate_decide', 'gate_json_sha256', 'gate_u_t', 'g1_q', 'g1_state']
              + [f'{g}_{x}' for g in o1_gate.MEASURED for x in GATE_FIELDS])
 TUNING_COLS = TUNING_OLD + TUNING_NEW + GATE_COLS
@@ -194,7 +195,9 @@ def append_row(path: str, cols: List[str], row: dict) -> None:
 
 def migrate_file(path: str, cols: List[str]) -> str:
     """Add the missing columns of `cols` at their place, keep every value. 'ok' / 'migrated' / 'created'.
-    Refuses a file with a column S05 does not know (nothing is dropped)."""
+    Refuses a file with a column S05 does not know (nothing is dropped). The single exception (G32-11): the
+    g*_u columns of gate_v3_g1235 (hil 7768134) are dropped when every cell of them is empty; a value in any
+    of them refuses the file (no conversion of gate_v3_g1235 rows)."""
     if not os.path.exists(path):
         _write_all(path, cols, [])
         return 'created'
@@ -202,9 +205,13 @@ def migrate_file(path: str, cols: List[str]) -> str:
     if old == cols:
         return 'ok'
     extra = [c for c in old if c not in cols]
+    rows = read_rows(path)
+    old_u = [c for c in extra if c in OLD_GATE_U]
+    if old_u and any(r.get(c) for r in rows for c in old_u):
+        raise LogError(f'{os.path.basename(path)}: columns {old_u} of gate_v3_g1235 hold values; not migrated')
+    extra = [c for c in extra if c not in OLD_GATE_U]
     if extra:
         raise LogError(f'{os.path.basename(path)}: columns not in S05 §6 {extra}; not migrated')
-    rows = read_rows(path)
     _write_all(path, cols, rows)
     return 'migrated'
 
@@ -403,7 +410,7 @@ def _qnum(x, what: str):
 
 
 # conditions that decide, by platform (GV3-R2-2; 13/11 RS-4): HIL decides all five when t = 0 is the mapped
-# ESP32 run_active edge (U_t known), else G1, G2, G4 (U_t not known); SIM and the floor decide all five
+# ESP32 run_active edge (U_t known), else G1, G2 (U_t not known, O1 3.5); SIM and the floor decide all five
 DECIDE_BY_PLATFORM = {'HIL': (o1_gate.DECIDE_ALL, o1_gate.DECIDE_HIL), 'SIM': (o1_gate.DECIDE_ALL,),
                       'HW': (o1_gate.DECIDE_ALL,)}
 _G1_Q = ('true', 'false', 'inconclusive')
@@ -452,10 +459,13 @@ def _recompute(gate: dict, platform: Optional[str] = None) -> dict:
     for c, thr in o1_gate.THRESHOLDS.items():
         q, lo, hi = (_qnum(gate[c].get(k), f'{c} {k}') for k in ('q', 'lo', 'hi'))
         nu = _n_undef(gate[c].get('n_undef'), f'{c} n_undef')
-        # every frame finite: the maxima keep lo <= q <= hi; with undefined frames each field is the maximum
-        # over its own finite frames (SC3-1), so hi may be below q (the frame of q may have hi = inf)
-        if nu == 0 and not (math.isnan(q) or lo <= q <= hi):
-            raise LogError(f'gate {c}: lo {lo!r} <= q {q!r} <= hi {hi!r} does not hold with n_undef 0')
+        # n_undef 0: every frame finite, so q, lo, hi are all finite with lo <= q <= hi (some frame), or all
+        # unknown (no frame scored: inconclusive). With undefined frames each field is the maximum over its own
+        # finite frames (SC3-1), so hi may be below q (the frame of q may have hi = inf). G32-1
+        fin = [not math.isnan(x) for x in (q, lo, hi)]
+        if nu == 0 and any(fin) and not (all(fin) and lo <= q <= hi):
+            raise LogError(f'gate {c}: with n_undef 0, q, lo, hi must all be numbers with lo <= q <= hi '
+                           f'(or all unknown); got {lo!r}, {q!r}, {hi!r}')
         st = o1_gate.cond_state(lo, hi, nu, thr)
         if st != gate[c].get('state'):
             raise LogError(f'gate {c}: state {gate[c].get("state")!r}, recomputed from lo, hi, n_undef: {st!r}')
