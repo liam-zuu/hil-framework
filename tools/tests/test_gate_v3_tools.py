@@ -564,3 +564,49 @@ def test_g32_11_migrate_drops_empty_old_u_columns(ds):
     rl._write_all(path, old, rows)
     with pytest.raises(rl.LogError, match='gate_v3_g1235'):
         rl.migrate(d)
+
+
+def test_s315_r3_1_begin_extra_cannot_set_identity(ds):
+    # Codex S315-R3-1: an extra field cannot replace a field begin sets and checks (session_id: SKIP_PREFIX rows
+    # are left out of every count), nor a gain column (gains go through --gains)
+    d, clock = ds
+    for k, v in (('session_id', 'EXAMPLE-R3'), ('run_uid', 'EXAMPLE-R3:1'), ('iter_no', '1'), ('g_kp_xy', 'x'),
+                 ('wall_start', '2026-11-01T00:00:00')):
+        with pytest.raises(rl.LogError, match='set by begin'):
+            rl.begin(d, 'H1', 'B-PID', 'HIL', 'PID', 'O1-F05', '0.5', 'hil_check', gain_set='B-PID/GA1', **{k: v})
+    rl.begin(d, 'H1', 'B-PID', 'HIL', 'PID', 'O1-F05', '0.5', 'hil_check', gain_set='B-PID/GA1', candidate_no='2')
+    assert not _rows(d)
+
+
+def _final_car(d, clock, outcome, minutes, replaces=''):
+    clock[0] = dt.datetime(2026, 11, 20, 8, 0, 0) + dt.timedelta(minutes=minutes)
+    rl.begin(d, 'F', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'final', gain_set='A-PID/G0', replaces_run_uid=replaces)
+    rl.step(d, 'run')
+    clock[0] += dt.timedelta(seconds=30)
+    return rl.end(d, outcome, fail_cause='mat_khung' if outcome == 'hong_he_do' else '')['run_uid']
+
+
+def test_s315_r3_2_replacement_by_log_order(ds):
+    # Codex S315-R3-2: a replacement is later in the log than the run it replaces, whatever the PC clock says
+    d, clock = ds
+    lost = _final_car(d, clock, 'hong_he_do', 10)
+    _final_car(d, clock, 'dat', -60, replaces=lost)                        # clock went back: a real replacement
+    rl.summary(d)
+    path = os.path.join(d, rl.TUNING)
+    rows = _rows(d)                                                        # the replacement written before its run
+    rl._write_all(path, rl.TUNING_COLS, [rows[1], rows[0]])
+    with pytest.raises(rl.LogError, match='not an earlier run'):
+        rl.summary(d)
+
+
+def test_s315_r3_3_summary_refuses_speed_not_finite(ds):
+    # Codex S315-R3-3: summary checks the speed of every HIL / HW row
+    d, clock = ds
+    _open(d, clock)
+    rl.end(d, 'dat')
+    path = os.path.join(d, rl.TUNING)
+    base = _rows(d)
+    for bad in ('nan', 'inf'):
+        rl._write_all(path, rl.TUNING_COLS, [dict(base[0], speed_mps=bad)])
+        with pytest.raises(rl.LogError, match='not a finite number'):
+            rl.summary(d)
