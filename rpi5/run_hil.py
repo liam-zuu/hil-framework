@@ -381,6 +381,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument('--frame-log',     default='', metavar='NPZ',
                    help='S06: save raw MOSI + MISO of every frame and its send time '
                         '(time.monotonic_ns) to this .npz after the run')
+    p.add_argument('--faults',        default=None, metavar='CSV',
+                   help='L82 fault injection batch 1: schedule file of fault_schedule.py (enc_loss, imu_loss, '
+                        'imu_delay, gyro_scale), windows in ms from the first RUN step (--finite-run) or '
+                        'step 0 (--steps); needs --frame-log, which then also keeps the true frames')
     p.add_argument('--finite-run',    action='store_true',
                    help='Run phases of run_lifecycle.py: ARM (plant held, setpoint 0), RUN (the trajectory), '
                         'STOPPING (setpoint 0 for 1 s), END. Needs a finite trajectory; Ctrl+C = STOP, '
@@ -393,6 +397,30 @@ def _parse_args() -> argparse.Namespace:
                         '--finite-run on in RUN and STOPPING only; without it on when a trajectory '
                         'runs and no omega mode is set, off otherwise (diagnostics). on / off: fixed')
     return p.parse_args()
+
+
+def load_faults(args, n_omega_modes: int, hil_cfg, load_schedule: bool):
+    """L82 --faults: the schedule loaded and checked for this run (fault_schedule.load), or SystemExit
+    before any process or SPI is opened. Run length: RUN of --finite-run, else --steps. IMU source in the
+    priority order of HILNode._imu_sample: static, profile, plant (MecanumPlant), none."""
+    import fault_schedule
+    if load_schedule:
+        raise SystemExit('--faults excludes --load-schedule (both write the wheel speeds)')
+    if not args.frame_log:
+        raise SystemExit('--faults needs --frame-log (the true frames are the record of the run)')
+    if hil_cfg.lifecycle is not None:
+        run_ms = int(round(hil_cfg.lifecycle.run_s * 1000))
+    elif args.steps:
+        run_ms = int(args.steps)
+    else:
+        raise SystemExit('--faults needs --finite-run or --steps (a window must end inside the run)')
+    imu_source = ('static' if hil_cfg.imu_static is not None else
+                  'profile' if hil_cfg.imu_profile else
+                  None if (n_omega_modes or args.mock) else 'plant')
+    try:
+        return fault_schedule.load(args.faults, run_ms, imu_source)
+    except (OSError, fault_schedule.ScheduleError) as exc:
+        raise SystemExit(f'--faults {args.faults}: {exc}')
 
 
 def resolve_swa(swa: str, finite_run: bool, n_omega_modes: int, traj_kind: str, no_traj: bool) -> str:
@@ -516,6 +544,10 @@ def main() -> int:
         control.beat(time.monotonic_ns())
     hil_cfg.swa_mode = resolve_swa(args.swa, args.finite_run, n_modes, args.traj, args.no_traj)
     log.info('SWA (I8): --swa %s -> %s', args.swa, hil_cfg.swa_mode)
+    if args.faults:
+        hil_cfg.faults = load_faults(args, n_modes, hil_cfg, load_rows is not None)
+        log.info('Faults (L82): %s sha256=%s, %d rows', args.faults, hil_cfg.faults.sha256,
+                 len(hil_cfg.faults.rows))
 
     # Shared state array: plant writes, trajectory pub can read (optional)
     shared_state = mp.Array('d', 10)
