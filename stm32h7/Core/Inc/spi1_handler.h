@@ -48,7 +48,7 @@ void    SPI1_DropNewTraj (void);                 /* link lost: forget pending */
 void    SPI1_GetImu      (HIL_Imu_t *out);       /* IMU values, v3 frame */
 /* L100: MISO v5 apply window from the receive stamp and the CYCCNT right
  * before / after the SetOmega calls (hil_protocol.h bytes 20-21): pre rounded
- * down, end rounded up, each saturated (flag set); wrap-safe (unsigned) */
+ * down, end rounded up (4 us unit), each saturated (flag set); wrap-safe (unsigned) */
 uint16_t SPI1_PackApply  (uint32_t rx_cyc, uint32_t c_pre, uint32_t c_post, uint32_t cyc_per_us,
                           uint8_t *pre_sat, uint8_t *dur_sat);
 void    SPI1_SetOutput   (const HIL_Output_t *out);

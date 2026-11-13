@@ -271,19 +271,19 @@ void SPI1_GetImu(HIL_Imu_t *out)
     __enable_irq();
 }
 
-/* L100 (Codex RS4-R4-1): rx + [pre_us, pre_us + dur_us] H7 us holds
+/* L100 (Codex RS4-R4-1): rx + [pre_us, pre_us + 4 dur4] H7 us holds
  * [c_pre, c_post]; pure, main loop only */
 uint16_t SPI1_PackApply(uint32_t rx_cyc, uint32_t c_pre, uint32_t c_post, uint32_t cyc_per_us,
                         uint8_t *pre_sat, uint8_t *dur_sat)
 {
     uint32_t pre_us  = (c_pre - rx_cyc) / cyc_per_us;
     uint32_t post_us = (uint32_t)(((uint64_t)(c_post - rx_cyc) + cyc_per_us - 1u) / cyc_per_us);
-    uint32_t dur_us  = post_us - pre_us;
+    uint32_t dur4    = (post_us - pre_us + HIL_APPLY_DUR_UNIT_US - 1u) / HIL_APPLY_DUR_UNIT_US;
     *pre_sat = (uint8_t)(pre_us >= HIL_APPLY_PRE_MAX);
-    *dur_sat = (uint8_t)(*pre_sat || dur_us >= HIL_APPLY_DUR_MAX);
+    *dur_sat = (uint8_t)(*pre_sat || dur4 >= HIL_APPLY_DUR_MAX);
     if (*pre_sat) pre_us = HIL_APPLY_PRE_MAX;
-    if (*dur_sat) dur_us = HIL_APPLY_DUR_MAX;
-    return (uint16_t)(pre_us | (dur_us << HIL_APPLY_DUR_SHIFT));
+    if (*dur_sat) dur4 = HIL_APPLY_DUR_MAX;
+    return (uint16_t)(pre_us | (dur4 << HIL_APPLY_DUR_SHIFT));
 }
 
 /* Stage the reply; the DMA buffer is only written while the DMA is idle */

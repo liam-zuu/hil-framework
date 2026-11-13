@@ -430,20 +430,20 @@ int main(void)
         const uint32_t rxs[3] = { 0u, 0xFFFFFF00u, 123456789u };
         for (int r = 0; r < 3; r++)
             for (uint32_t a = 0; a < 5000u; a += 37u)
-                for (uint32_t w = 0; w < 6000u; w += 53u) {
+                for (uint32_t w = 0; w < 60000u; w += 53u) {
                     uint32_t rx = rxs[r], c0 = rx + a, c1 = rx + a + w;
                     uint16_t v = SPI1_PackApply(rx, c0, c1, cpu, &ps, &ds);
-                    uint32_t pre = v & 0x7FFu, dur = v >> 11;
+                    uint32_t pre = v & 0x7FFu, dur = (v >> 11) * 4u;
                     if (ps || ds) continue;
-                    /* rx + pre us <= c0 and c1 <= rx + (pre + dur) us, each within one us */
+                    /* rx + pre us <= c0 within 1 us; c1 <= rx + (pre + dur) us within 5 us (4 us unit) */
                     if (!(pre * cpu <= a && a < (pre + 1u) * cpu)) ok = 0;
-                    if (!(a + w <= (pre + dur) * cpu && (pre + dur) * cpu < a + w + cpu)) ok = 0;
+                    if (!(a + w <= (pre + dur) * cpu && (pre + dur) * cpu < a + w + 5u * cpu)) ok = 0;
                 }
         SPI1_PackApply(0u, 2047u * cpu, 2047u * cpu + 10u, cpu, &ps, &ds);
         if (!(ps && ds)) ok_sat = 0;                       /* pre 2047: unusable */
-        uint16_t v = SPI1_PackApply(0u, 100u * cpu, 131u * cpu, cpu, &ps, &ds);
-        if (ps || !ds || (v >> 11) != 31u) ok_sat = 0;     /* dur 31: no upper bound */
-        v = SPI1_PackApply(0u, 100u * cpu, 130u * cpu, cpu, &ps, &ds);
+        uint16_t v = SPI1_PackApply(0u, 100u * cpu, 220u * cpu + 1u, cpu, &ps, &ds);
+        if (ps || !ds || (v >> 11) != 31u) ok_sat = 0;     /* > 120 us: no upper bound */
+        v = SPI1_PackApply(0u, 100u * cpu, 220u * cpu, cpu, &ps, &ds);
         if (ps || ds || (v >> 11) != 30u || (v & 0x7FFu) != 100u) ok_sat = 0;
         check(ok, "apply_window_holds", "rx + [pre, pre + dur] us does not hold [c_pre, c_post]");
         check(ok_sat, "apply_window_saturation", "saturation not flagged or wrong");

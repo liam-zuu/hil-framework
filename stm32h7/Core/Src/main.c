@@ -331,7 +331,7 @@ static void _dbg_print_next(void)
          * window c_pre..c_post around the four EncoderGen_SetOmega calls of a
          * frame, shortest / longest over the last block (interrupts included),
          * windows the MISO could not hold since boot (pre >= 2047 us, dur >=
-         * 31 us: the Pi refuses such a frame in a mapped range), replies staged
+         * 124 us: the Pi refuses such a frame in a mapped range), replies staged
          * and replies replaced before the DMA took them (stage gaps) */
         printf("Apply: win=%lu.%lu..%lu.%lu us presat=%lu dursat=%lu staged=%lu reply_over=%lu\r\n",
                _US10(d->ap_min) / 10u, _US10(d->ap_min) % 10u,
@@ -582,7 +582,7 @@ int main(void)
          * after IBUS_SWA_FILTER_N applied frames in a row agree (I8-3) */
         IbusPort_SetSwa(ibus_swa_filter_step(&_swa_f, (g_state.fault_flags & HIL_CMD_SWA_ON) != 0u));
         /* MISO v5 apply window (hil_protocol.h): pre_us rounded down, the end
-         * rounded up, so rx + [pre_us, pre_us + dur_us] holds [c_pre, c_post];
+         * rounded up, so rx + [pre_us, pre_us + 4 dur4] holds [c_pre, c_post];
          * plus the checksum of the raw bytes of this very copy (W3, Y9) */
         uint8_t pre_sat, dur_sat;
         SPI1_MisoInfo_t mi;

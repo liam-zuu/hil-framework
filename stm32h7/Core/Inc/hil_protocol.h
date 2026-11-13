@@ -95,11 +95,12 @@
 /* Byte 20–21  v4: age_us   callback -> main loop applied it, us (sat.)  */
 /*             v5: apply    bits 0-10 pre_us = floor((CYCCNT before the  */
 /*                          first SetOmega - rx_cyc) / cyc_per_us), 2047 */
-/*                          = 2047 or more; bits 11-15 dur_us = ceil((    */
-/*                          CYCCNT after the last SetOmega - rx_cyc) /   */
-/*                          cyc_per_us) - pre_us, 31 = 31 or more. Every */
-/*                          speed of the frame took effect in rx_cyc +   */
-/*                          [pre_us, pre_us + dur_us] H7 us (not sat.)   */
+/*                          = 2047 or more; bits 11-15 dur4 = ceil((end  */
+/*                          - pre_us) / 4), end = ceil((CYCCNT after the */
+/*                          last SetOmega - rx_cyc) / cyc_per_us), 31 =  */
+/*                          31 or more. Every speed of the frame took    */
+/*                          effect in rx_cyc + [pre_us, pre_us + 4 dur4] */
+/*                          H7 us (not saturated)                        */
 /* Byte 22     log_type     S06 log record type, 0 = none (s06_log.h)    */
 /* Byte 23–24  log_idx      continuous index of the H7 log record        */
 /* Byte 25–39  log_payload  15 bytes, by type                            */
@@ -133,6 +134,8 @@
 #define HIL_APPLY_PRE_MAX   2047u       /* bits 0-10: saturated = not usable */
 #define HIL_APPLY_DUR_SHIFT 11
 #define HIL_APPLY_DUR_MAX   31u         /* bits 11-15: saturated = no upper bound */
+#define HIL_APPLY_DUR_UNIT_US 4u        /* dur4 unit: 120 us held (H7 TIM6 tick ran to
+                                           63.6 us inside a window, CLOSED_LOOP/2026-11-13_run13) */
 
 /* ── Traj flags (MOSI byte 30) ──────────────────────────────────────── */
 #define HIL_TRAJ_VALID      (1u << 0)   /* setpoint is valid            */

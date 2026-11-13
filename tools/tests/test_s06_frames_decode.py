@@ -555,8 +555,7 @@ def test_v5_constants_match_h7_header():
         txt = f.read()
     num = {m.group(1): int(m.group(2), 0) for m in re.finditer(r'#define\s+(\w+)\s+(0x[0-9A-Fa-f]+|\d+)u?\b', txt)}
     assert (num['HIL_APPLY_PRE_MAX'], num['HIL_APPLY_DUR_SHIFT'], num['HIL_APPLY_DUR_MAX'],
-            num['HIL_STATUS_STAGE_SHIFT']) == (dec.APPLY_PRE_MAX, dec.APPLY_DUR_SHIFT, dec.APPLY_DUR_MAX,
-                                               dec.STAGE_SHIFT)
+            num['HIL_STATUS_STAGE_SHIFT'], num['HIL_APPLY_DUR_UNIT_US']) ==         (dec.APPLY_PRE_MAX, dec.APPLY_DUR_SHIFT, dec.APPLY_DUR_MAX, dec.STAGE_SHIFT, dec.APPLY_DUR_UNIT_US)
     assert re.search(r'#define\s+HIL_STATUS_V5\s+\(1u << 7\)', txt) and dec.STATUS_V5 == 0x80
     assert re.search(r'#define\s+HIL_STATUS_STAGE_MASK\s+\(0x3Fu << HIL_STATUS_STAGE_SHIFT\)', txt)
     assert dec.STAGE_MOD == 64
@@ -572,7 +571,7 @@ def _miso_v5(status, pre, dur):
 
 def test_miso_apply_v5_and_v4():
     r = dec.miso_apply(_miso_v5(0x80 | (37 << 1) | 1, 412, 6))
-    assert r == dict(miso_v5=True, stage=37, apply_pre_us=412, apply_dur_us=6, apply_ok=True, age_us=418)
+    assert r == dict(miso_v5=True, stage=37, apply_pre_us=412, apply_dur_us=24, apply_ok=True, age_us=436)
     assert dec.miso_apply(_miso_v5(0x80, 2047, 31))['apply_ok'] is False
     assert dec.miso_apply(_miso_v5(0x80, 2047, 31))['age_us'] == 0xFFFF
     assert dec.miso_apply(_miso_v5(0x80, 100, 31))['apply_ok'] is False

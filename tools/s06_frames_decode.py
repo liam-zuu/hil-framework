@@ -85,12 +85,12 @@ CARRY_MARGIN_CYC = 1_000_000  # a record's CYCCNT may be stamped up to ~2 ms aft
 
 
 # MISO v5 (L100, hil_protocol.h): status bit 7 marks it; bits 1-6 count the replies staged (one per applied
-# frame) mod 64; bytes 20-21 hold the apply window: pre_us (bits 0-10, 2047 = unusable), dur_us (bits 11-15,
-# 31 = no upper bound); every speed of the frame took effect in rx_cyc + [pre_us, pre_us + dur_us] H7 us.
+# frame) mod 64; bytes 20-21 hold the apply window: pre_us (bits 0-10, 2047 = unusable), dur4 (bits 11-15, 4 us
+# units, 31 = no upper bound); every speed of the frame took effect in rx_cyc + [pre_us, pre_us + 4 dur4] H7 us.
 # age_us is then the upper end (receive -> after the last SetOmega), 0xFFFF when not known; v4 frames keep
 # the H7 age as sent.
 STATUS_V5, STAGE_SHIFT, STAGE_MOD = 0x80, 1, 64
-APPLY_PRE_MAX, APPLY_DUR_SHIFT, APPLY_DUR_MAX = 2047, 11, 31
+APPLY_PRE_MAX, APPLY_DUR_SHIFT, APPLY_DUR_MAX, APPLY_DUR_UNIT_US = 2047, 11, 31, 4
 
 
 def miso_apply(b) -> dict:
@@ -99,8 +99,9 @@ def miso_apply(b) -> dict:
     if not st & STATUS_V5:
         return dict(miso_v5=False)
     raw = u16(b, MISO_AGE)
-    pre, dur = raw & 0x7FF, raw >> APPLY_DUR_SHIFT
-    ok = pre < APPLY_PRE_MAX and dur < APPLY_DUR_MAX
+    pre, dur4 = raw & 0x7FF, raw >> APPLY_DUR_SHIFT
+    ok = pre < APPLY_PRE_MAX and dur4 < APPLY_DUR_MAX
+    dur = dur4 * APPLY_DUR_UNIT_US
     return dict(miso_v5=True, stage=(st >> STAGE_SHIFT) % STAGE_MOD, apply_pre_us=pre, apply_dur_us=dur,
                 apply_ok=ok, age_us=(pre + dur) if ok else 0xFFFF)
 
