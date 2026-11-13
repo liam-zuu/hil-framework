@@ -85,7 +85,8 @@ TUNING_NEW = (['run_uid', 'campaign', 'script_run_id', 'gain_set_id', 'speed_mps
                'replaces_run_uid', 'candidate_no', 'results_dir', 'completed', 'e_perp_max_m',
                'run_outcome', 'fail_cause', 'rule_version', 'fw_hash']
               + ['g_' + g for g in GAINS]
-              + ['t_operator_wait_s', 't_machine_s', 'wall_start', 'wall_end', 'n_sim_evals'])
+              + ['t_operator_wait_s', 't_machine_s', 'wall_start', 'wall_end', 'n_sim_evals']
+              + ['boot_before', 'boot_after'])          # R134 (b): S05 4.7 (iv), R3V-9
 # tune stop gate v3 (dossier 00_OVERVIEW/2026-11-12_De_xuat_cong_dung_tune_bam_huong_van_toc_v3.md section 6,
 # CG2-12; Liam 12/11 CODE local_87282b70 "làm ngay đi"): per run the measured maximum q, its bound U and
 # the state of each condition, so stopping, the S05 4.4 ranking and gate_result can be recomputed.
@@ -125,6 +126,16 @@ FINAL_LOST_N = 3                         # S05 §4.6: stop a condition after 3 l
 # level counted, in a row or not; final_hil keeps its own rule (§4.6, FINAL_LOST_N lost runs in a row).
 MAP_REFUSED = 'anh_xa_tu_choi'           # --fail-cause of such a run
 MAP_RERUNS_MAX = 3
+# R134 package (Liam 14/11 CODE_R134 local_eb9f3b5c "duyet goi sua code fix/r134-answers"):
+# (b) S05 v3.13-v3.17 4.7 (iv), R3V-9, O1 v11.10 R4: the boot of gain_send.py --query just before and just after
+#     the run go to the run history (boot_before, boot_after). Both given and equal: one ESP32 boot over the run.
+#     Missing, unreadable or different: a run failed by operation, so only hong_he_do with fail cause BOOT_FAIL.
+#     [PENDING: test_gate_v3_tools.py held by CODE_RS4] the CLI 'end' will require the two query files for a
+#     judged run on the car (every stage: the obstacle-stop
+#     rule of O1 R4 ties #us to the run through them) and on the HIL at final_hil (tv_duty, S05 4.7 (iv));
+#     [CACH HIEU] other HIL stages do not need them (the HIL rules of O1 3.5 do not use #us). The Python API
+#     keeps them optional (older callers, demo); summary refuses a judged row whose two boots disagree.
+BOOT_FAIL = 'boot_thieu_hay_khac'        # --fail-cause of a run without one ESP32 boot shown
 
 CAMPAIGNS = ('A-PID', 'A-LADRC', 'B-PID', 'B-LADRC', 'B-chung', 'RQ2-INIT-PID', 'RQ2-INIT-LADRC', 'RQ2')
 TUNED = ('A-PID', 'A-LADRC', 'B-PID', 'B-LADRC')
@@ -586,6 +597,10 @@ def check_gate_rows(tun: List[dict]) -> None:
     Rows whose gate columns are ALL empty (before gate v3, or written without --gate-json) are not
     checked; any non-empty gate cell makes the row a gate row, with a supported version (GV3-R3-1)."""
     for r in tun:
+        if r.get('run_outcome') in VALID and (r.get('boot_before') or r.get('boot_after')):    # R134 (b)
+            bbad = boot_problem(r.get('boot_before'), r.get('boot_after'))
+            if bbad:
+                raise LogError(f"{r.get('run_uid')}: run_outcome {r.get('run_outcome')!r} but {bbad}")
         if not any(r.get(c) for c in GATE_COLS):
             continue
         g = gate_from_row(r)
@@ -718,12 +733,34 @@ def map_stopped(n_refused: int) -> bool:
     return n_refused > MAP_RERUNS_MAX
 
 
+def boot_needed(platform: str, stage: str) -> bool:
+    """R134 (b): the CLI 'end' of a judged run needs both gain_send --query files (see BOOT_FAIL)."""
+    return platform == 'HW' or (platform == 'HIL' and stage == 'final_hil')
+
+
+def boot_problem(before, after) -> Optional[str]:
+    """None when the two boot answers show one ESP32 boot over the run, else why not."""
+    ok = [b for b in (before, after) if b and all(c in '0123456789abcdefABCDEF' for c in str(b))]
+    if len(ok) < 2:
+        return f'boot {"before" if not ok or ok[0] != before else "after"} the run missing or unreadable'
+    if str(before).lower() != str(after).lower():
+        return f'boot {before} before the run, {after} after it: the ESP32 restarted'
+    return None
+
+
 def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Optional[float] = None,
         fail_cause: str = '', results_dir: str = '', notes: str = '', gate: Optional[dict] = None,
-        gate_sha256: str = '') -> dict:
+        gate_sha256: str = '', boot_before: Optional[str] = None, boot_after: Optional[str] = None) -> dict:
     run = _require_open(ds)
     if outcome not in OUTCOMES:
         raise LogError(f'--outcome one of {OUTCOMES}')
+    asked = boot_before is not None or boot_after is not None
+    bbad = boot_problem(boot_before, boot_after) if asked else None
+    if bbad and not (outcome == 'hong_he_do' and fail_cause == BOOT_FAIL):   # R134 (b)
+        raise LogError(f'{bbad}: a run failed by operation, outcome hong_he_do with fail cause {BOOT_FAIL} '
+                       '(S05 4.7 (iv), R3V-9)')
+    if fail_cause == BOOT_FAIL and not bbad:
+        raise LogError(f'fail cause {BOOT_FAIL} needs the two boot answers showing it (missing or different)')
     if fail_cause == MAP_REFUSED and (gate is None or run['row'].get('platform') != 'HIL'):
         raise LogError(f'--fail-cause {MAP_REFUSED}: a HIL run with its scorer output (--gate-json) showing the '
                        'refused mapping (S05 v3.15 4.5 step 2)')
@@ -749,6 +786,8 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
         row['e_perp_max_m'] = f'{e_perp_max:.4f}'
     if gate is not None:
         row.update(gate_columns(gate, gate_sha256))
+    if asked:
+        row.update(boot_before=boot_before or '', boot_after=boot_after or '')
     if notes:
         row['notes'] = (row.get('notes', '') + ' ' + notes).strip()
     # Codex S315-5: the log as it will be, this row included, checked before the row is written
@@ -1449,7 +1488,9 @@ def demo(out_dir: str, seed: int = 1) -> List[dict]:
                   replaces_run_uid=lost if o == 'dat' else '')
             step(out_dir, 'run')
             tick(60)
-            row = end(out_dir, o, completed=1, e_perp_max=0.10, fail_cause='mat_khung_FAKE' if o == 'hong_he_do' else '')
+            row = end(out_dir, o, completed=1, e_perp_max=0.10, fail_cause='mat_khung_FAKE' if o == 'hong_he_do' else '',
+                      results_dir='results/FAKE/f1' if o == 'dat' else '', gate=fake_gate() if o == 'dat' else None,
+                      boot_before='4753dc47', boot_after='4753dc47')   # R134: dat with its gate, boot asked
             if o == 'hong_he_do':
                 lost = row['run_uid']
         gate_path = os.path.join(out_dir, 'FAKE_gate.csv')            # stands for the gate locked at C8
@@ -1485,6 +1526,8 @@ def main(argv=None) -> int:
     e.add_argument('--completed', type=int, choices=(0, 1))
     e.add_argument('--e-perp-max', type=float)
     e.add_argument('--gate-json', default='', help='scorer output with a gate_v3 block (hil_o1_score.py --out)')
+    e.add_argument('--query-before', default='', help='gain_send.py --query output just before the run (R134 (b))')
+    e.add_argument('--query-after', default='', help='gain_send.py --query output just after the run (R134 (b))')
     for name in ('fail-cause', 'results-dir', 'notes'):
         e.add_argument('--' + name, default='')
     m = sub.add_parser('machine')
@@ -1557,9 +1600,13 @@ def main(argv=None) -> int:
                 print(run['row']['run_uid'], 'paused' if run.get('paused_from') is not None else 'running',
                       json.dumps(segment_totals(segs)))
         elif a.cmd == 'end':
+            import s05_final_table as s5
+            boots = {}
+            if a.query_before or a.query_after:
+                boots = dict(boot_before=s5.read_boot(a.query_before) or '', boot_after=s5.read_boot(a.query_after) or '')
             row = end(ds, a.outcome, a.completed, a.e_perp_max, a.fail_cause, a.results_dir, a.notes,
                       gate=read_gate_json(a.gate_json) if a.gate_json else None,
-                      gate_sha256=sha256_file(a.gate_json) if a.gate_json else '')
+                      gate_sha256=sha256_file(a.gate_json) if a.gate_json else '', **boots)
             print('row', row['run_uid'], {k: row[f't_{k}_s'] for k in STEPS}, 'wait', row['t_operator_wait_s'])
             note = refusal_note(ds, row)
             if note:
