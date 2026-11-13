@@ -153,12 +153,8 @@ def refine_edges(img, corners, half=6.0, skip=0.18, n_samp=24, iters=2):
 def detect_refined(det, gray):
     """{id: (4, 2) corners} with edge refinement; a tag the refinement rejects is dropped (its corners
     would carry the inward bias of an unrefined detection; counted by the caller as not seen)."""
-    corners, ids, _ = det.detectMarkers(gray)
     out = {}
-    if ids is None:
-        return out
-    for cc, i in zip(corners, ids.ravel()):
-        c = cc.reshape(4, 2).astype(float)
+    for i, c in cp.detect_markers(det, gray).items():           # near-square, unique IDs only
         side_px = float(np.mean(np.linalg.norm(np.diff(np.vstack([c, c[:1]]), axis=0), axis=1)))
         half = HALF_CAR_PX if int(i) == CAR_ID else HALF_FLOOR_PX
         half = min(half, 0.75 * side_px / 6.0)               # at most 3/4 of the black border (6 cells)

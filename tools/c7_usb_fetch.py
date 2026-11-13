@@ -314,21 +314,22 @@ def frame_check(video, session=None, out_dir=None):
     if not ok:
         raise OSError(f'{video}: no frame read')
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
-    corners, ids, _ = cm.make_detector().detectMarkers(gray)
-    seen = {}
-    if ids is not None:
-        for c, i in zip(corners, ids.ravel()):
-            seen[int(i)] = c.reshape(4, 2).mean(axis=0).tolist()
+    stats = {}
+    found = cm.cp.detect_markers(cm.make_detector(), gray, stats)   # same gate as c7_measure
+    seen = {i: c.mean(axis=0).tolist() for i, c in found.items()}
     sess = session if (session is None or isinstance(session, dict)) else _load_session(session)
     res = check_marks(seen, gray.shape, sess)
+    res['dropped'] = stats
     res['video'] = os.path.basename(video)
     res['ref'] = 'clip H (session.json)' if sess else 'khong co session: chi dem moc'
     res['thresholds'] = dict(shift_px=CHECK_SHIFT_PX, min_floor=CHECK_MIN_FLOOR, status='DE XUAT, khoa o C8')
     out_dir = out_dir or os.path.dirname(os.path.abspath(video))
     stem = os.path.splitext(os.path.basename(video))[0]
     img = (frame if frame.ndim == 3 else cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)).copy()
-    if ids is not None:
-        cv2.aruco.drawDetectedMarkers(img, corners, ids)
+    if found:
+        import numpy as np
+        cv2.aruco.drawDetectedMarkers(img, [c.reshape(1, 4, 2).astype(np.float32) for c in found.values()],
+                                      np.array(list(found), np.int32).reshape(-1, 1))
     if sess:
         for x, y in sess['ref_centres_px'].values():
             cv2.drawMarker(img, (int(round(x)), int(round(y))), (0, 0, 255), cv2.MARKER_CROSS, 40, 4)

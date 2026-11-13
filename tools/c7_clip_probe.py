@@ -63,6 +63,12 @@ CV_FOLDS = 4
 CV_TOL = 0.15                # simplest model within 15 % of the best cross-validated error
 MODELS = ('B1', 'B2', 'KB2')
 CORNER_DIST_LIMIT = 0.10     # distortion at the frame corner below this: no checkerboard (3.3 rule 1)
+# Square-shape gate after ArUco detection (Liam 13/11, CODE_CAM "Them o day"). Clip IMG_3550 (24 floor
+# marks, camera straight down, 1883 frames, 13/11): the 24 real marks in every frame plus 5 false
+# detections, all a second "ID 17" on marble veins and all thin quads; this gate drops the 5, keeps
+# every real mark. [DE XUAT, lock at C8]
+SQ_SIDE_RATIO = 0.7          # shortest side / longest side of the detected quad, at least
+SQ_DIAG_RATIO = 0.8          # shorter diagonal / longer diagonal, at least
 
 
 # ---------------------------------------------------------------- floor marks
@@ -277,13 +283,47 @@ def read_clip(path, stride=1, max_frames=None):
         if frame is not None:
             shapes.add(frame.shape[:2])
             g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
-            corners, ids, _ = det.detectMarkers(g)
-            dets[k] = {} if ids is None else {int(i): c.reshape(4, 2).astype(float) for i, c in zip(ids.ravel(), corners)}
+            dets[k] = detect_markers(det, g)
         k += 1
     cap.release()
     info['frames_read'] = len(times)
     info['decoded_shapes'] = sorted(list(s) for s in shapes)
     return info, times, dets
+
+
+def is_squareish(c, side_ratio=SQ_SIDE_RATIO, diag_ratio=SQ_DIAG_RATIO):
+    """True when the (4, 2) quad is close to a square (a floor tag seen from above)."""
+    c = np.asarray(c, float).reshape(4, 2)
+    s = np.linalg.norm(np.diff(np.vstack([c, c[:1]]), axis=0), axis=1)
+    dg = np.array([np.linalg.norm(c[0] - c[2]), np.linalg.norm(c[1] - c[3])])
+    if s.max() <= 0 or dg.max() <= 0:
+        return False
+    return bool(s.min() / s.max() >= side_ratio and dg.min() / dg.max() >= diag_ratio)
+
+
+def detect_markers(det, gray, stats=None):
+    """{id: (4, 2) corners} of one frame: ArUco detection, then quads that are not near-square are
+    dropped, then an ID still seen more than once is dropped (ambiguous, counted as not seen).
+    stats (dict, optional) counts 'not_square' and 'dup_dropped'."""
+    corners, ids, _ = det.detectMarkers(gray)
+    out, dup = {}, set()
+    if ids is None:
+        return out
+    for c, i in zip(corners, ids.ravel()):
+        c = c.reshape(4, 2).astype(float)
+        if not is_squareish(c):
+            if stats is not None:
+                stats['not_square'] = stats.get('not_square', 0) + 1
+            continue
+        i = int(i)
+        if i in out:
+            dup.add(i)
+        out[i] = c
+    for i in dup:
+        del out[i]
+        if stats is not None:
+            stats['dup_dropped'] = stats.get('dup_dropped', 0) + 1
+    return out
 
 
 def frame_times(times, fps):
