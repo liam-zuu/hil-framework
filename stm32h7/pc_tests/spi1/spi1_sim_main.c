@@ -1,6 +1,6 @@
 /* PC harness for stm32h7/Core/Src/spi1_handler.c (tools/tests/test_h7_spi1_frame.py).
  *
- * One "frame" = the harness writes the 40 MOSI bytes into the rx buffer the DMA
+ * One "frame" = the harness writes the SPI1_FRAME_LEN MOSI bytes into the rx buffer the DMA
  * was armed with, checks the tx buffer was not changed since it was armed (a
  * real SPI slave DMA pulls tx bytes into the TX FIFO as soon as it is armed and
  * while the frame is clocked out), then calls SPI1_Callback() as the interrupt.
@@ -37,6 +37,8 @@ static int      _fails;
 /* S06: MOSI bytes and CYCCNT of each frame k (k < 256), set in frame() */
 static uint8_t  _mosi_of[256][SPI1_FRAME_LEN];
 static uint32_t _cyc_of[256];
+
+#define RUN_ID 0xA5C3E1F7u                     /* MOSI v4 run_id of this harness (RS-4 P1) */
 
 static int _n_arms;                            /* DMA starts (08/11) */
 static int _fake_nss = 1;                      /* PA4 level, 1 = no frame (08/11) */
@@ -88,6 +90,13 @@ static void frame(int k, int is_new)
     m[39] = (uint8_t)k;
     wr16(&m[22], (int16_t)(7 * k));              /* gz  */
     for (int i = 0; i < 4; i++) wr16(&m[31 + 2 * i], (int16_t)(11 * k + i));   /* ax..yaw */
+#ifndef OLD_API
+    /* MOSI v4 (RS-4 P1): run_id, frame_no = k, little-endian */
+    for (int i = 0; i < 4; i++) {
+        m[HIL_MOSI_ID + i]     = (uint8_t)(RUN_ID >> (8 * i));
+        m[HIL_MOSI_ID + 4 + i] = (uint8_t)((uint32_t)k >> (8 * i));
+    }
+#endif
     if (memcmp(_armed_tx, _armed_copy, SPI1_FRAME_LEN) != 0) _tx_changed_after_arm++;
     memcpy(_sent, _armed_copy, SPI1_FRAME_LEN);
     memcpy(_armed_rx, m, SPI1_FRAME_LEN);
@@ -147,6 +156,7 @@ static void main_step(void)
     mi.rx_cyc = fi.rx_cyc;
     mi.rx_nf = fi.rx_nf;
     mi.apply = 7;                    /* v5 apply window (L100), any value */
+    memcpy(mi.id, &fi.raw[HIL_MOSI_ID], HIL_MOSI_ID_LEN);   /* v6 (RS-4 P1), as main.c */
     memset(&o, 0, sizeof o);
     o.seq = s.seq;
     SPI1_SetOutputEx(&o, &mi);
@@ -262,7 +272,7 @@ int main(void)
     /* 6. MISO v4: frame k+2 carries checksum of frame k's raw MOSI, its
      *    stamp and count; MISO checksum valid on every frame sent */
     {
-        int ok_mosi = 1, ok_cyc = 1, ok_nf = 1, ok_crc = 1, ok_age = 1;
+        int ok_mosi = 1, ok_cyc = 1, ok_nf = 1, ok_crc = 1, ok_age = 1, ok_id = 1;
         SPI1_Stats_t st0; SPI1_GetStats(&st0);
         frame(60, 0); main_step();
         frame(61, 0); main_step();
@@ -275,8 +285,10 @@ int main(void)
             if (le32(_sent + 12) != _cyc_of[a]) ok_cyc = 0;
             if (le16(_sent + 18) != (uint16_t)(st0.frames + (uint32_t)(a - 60) + 1u)) ok_nf = 0;
             if (le16(_sent + 20) != 7) ok_age = 0;
+            if (memcmp(_sent + HIL_MISO_ID, &_mosi_of[a][HIL_MOSI_ID], HIL_MOSI_ID_LEN) != 0) ok_id = 0;
             main_step();
         }
+        check(ok_id, "id_of_answered_frame", "MISO 40-47 is not MOSI 40-47 of frame k-2 (RS-4 P1)");
         check(ok_crc, "miso_crc_valid", "MISO checksum does not match its bytes");
         check(ok_mosi, "mosi_crc_of_answered_frame", "mosi_crc/seq is not that of frame k-2");
         check(ok_cyc, "rx_cyc_of_answered_frame", "rx_cyc is not the CYCCNT of frame k-2");
@@ -447,6 +459,41 @@ int main(void)
         if (ps || ds || (v >> 11) != 30u || (v & 0x7FFu) != 100u) ok_sat = 0;
         check(ok, "apply_window_holds", "rx + [pre, pre + dur] us does not hold [c_pre, c_post]");
         check(ok_sat, "apply_window_saturation", "saturation not flagged or wrong");
+    }
+    /* 11. RS-4 P1, assumption B1 of tools/hil_edge_map.py: in every MISO sent,
+     *     the id (MOSI 40-47: run_id, frame_no f), the MOSI checksum and the
+     *     receive stamp are those of ONE frame f, whatever the main loop does
+     *     between frames: 0 replies (frames not applied), 1, or 2-3 (a staged
+     *     reply replaced before the DMA took it). Schedule fixed, pseudo-random. */
+    {
+        int ok_one = 1, ok_run = 1, n_checked = 0;
+        uint32_t lcg = 12345u;
+        for (int k = 150; k < 250; k++) {
+            frame(k, 0);
+            if (miso_crc_ok(_sent) && le32(_sent + HIL_MISO_ID) != 0u) {
+                uint32_t f = le32(_sent + HIL_MISO_ID + 4);
+                if (le32(_sent + HIL_MISO_ID) != RUN_ID) ok_run = 0;
+                /* f < 150: the reply staged before this block (frame 72), still a
+                 * consistent reply of its own frame */
+                if (f >= (uint32_t)k
+                    || le16(_sent + 10) != ref_crc(_mosi_of[f & 0xFF], SPI1_FRAME_LEN)
+                    || le32(_sent + 12) != _cyc_of[f & 0xFF]
+                    || _sent[17] != (uint8_t)f)
+                    ok_one = 0;
+                n_checked++;
+            }
+            lcg = lcg * 1103515245u + 12345u;
+            int calls = (int)((lcg >> 16) % 4u);     /* 0..3 main-loop replies before the next frame */
+            for (int c = 0; c < calls; c++) main_step();
+        }
+        check(ok_one && ok_run && n_checked > 50, "id_crc_stamp_same_frame",
+              "a MISO mixes the id of one frame with the checksum or stamp of another (B1)");
+        uint32_t mn, mx;
+        SPI1_TakeCallbackCycles(&mn, &mx);
+        check(mn <= mx, "callback_cycles_minmax", "min above max");
+        SPI1_TakeCallbackCycles(&mn, &mx);
+        check(mn == 0u && mx == 0u && fake_irq_disabled == 0, "callback_cycles_reset",
+              "not reset after take, or PRIMASK left set");
     }
 #endif
     return _fails ? 1 : 0;

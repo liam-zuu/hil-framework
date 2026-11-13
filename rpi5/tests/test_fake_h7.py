@@ -144,7 +144,51 @@ def test_spi_master_uses_responder_and_echo_stays_default():
 def test_encode_matches_the_h7_byte_layout():
     raw = encode_miso_like_h7([1.0, -1.0, 0.0, 0.25], seq=0x1A0 & 0xFF)
     assert raw[:8] == bytes.fromhex('7fff8001 00001fff')
-    assert raw[8:16] == bytes(8) and raw[16] == 0 and raw[17] == 0xA0 and raw[18:] == bytes(22)
+    assert raw[8:16] == bytes(8) and raw[16] == 0 and raw[17] == 0xA0 and raw[18:] == bytes(30)
+    # v6 (RS-4 P1): bytes 40-47 = MOSI 40-47 of the frame answered
+    raw = encode_miso_like_h7([0.0] * 4, seq=3, mosi_id=bytes(range(1, 9)))
+    assert len(raw) == 48 and raw[40:48] == bytes(range(1, 9)) and raw[18:40] == bytes(22)
+
+
+def test_fake_h7_sends_back_the_id_of_the_frame_it_answers():
+    """RS-4 P1: through HILNode and FakeH7, every MISO 40-47 is (run_id, frame_no) of an earlier frame of the
+    same run (the frame the fake main loop handled), and HILNode sees its run_id come back."""
+    from protocol import miso_id
+    fake = FakeH7(main_every=2)
+    node = HILNode(MockPlant(), config=HILConfig(simulate_hw=True, max_steps=60, period_us=1_000), responder=fake)
+    seen = []
+    orig = node._spi.transfer
+
+    def rec(mosi):
+        miso = orig(mosi)
+        seen.append((int.from_bytes(mosi[44:48], 'little'), miso_id(miso)))
+        return miso
+    node._spi.transfer = rec
+    node.run()
+    got = [(k, f) for k, (rid, f) in seen if rid]
+    assert len(got) > 20 and node._id_first_step is not None
+    assert all(rid in (0, node._run_id) for _, (rid, _) in seen)
+    assert all(1 <= k - f <= 3 for k, f in got)
+
+
+@pytest.mark.parametrize('h7', ['v5', 'other_run'])
+def test_run_stops_when_the_h7_does_not_send_the_run_id_back(h7):
+    """RS-4 P1 guard: on the real link (simulate_hw False is set after the simulated SPI is built, the only
+    place the guard reads it), no reply with this run's run_id in ID_CHECK_FRAMES frames stops the run:
+    an H7 before MISO v6 (bytes 40-47 not sent) or replies of another run."""
+    import hil_node as hn
+
+    def responder(mosi):
+        if h7 == 'v5':
+            return bytes(48)
+        return bytes(40) + (0x12345678).to_bytes(4, 'little') + mosi[44:48]
+    node = HILNode(MockPlant(), config=HILConfig(simulate_hw=True, max_steps=500, period_us=1_000),
+                   responder=responder)
+    node.cfg.simulate_hw = False
+    node._run_id = 0x9ABCDEF0
+    node.run()
+    assert node._stop_reason == 'h7_not_miso_v6' and node._step == hn.ID_CHECK_FRAMES + 1
+    assert node._id_first_step is None and node.run_failed          # run_hil.py exits 3
 
 
 class RecPlant(MockPlant):

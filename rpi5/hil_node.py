@@ -12,9 +12,10 @@ Responsibility:
 
 Real-time requirements:
   - Must complete each tick in < 1 ms (1 ms period)
-  - Typical work: GPIO pulse (~10 μs) + SPI 40 bytes (320 μs at 1 MHz,
-    72 μs at 4 MHz) + spidev overhead + plant (~50 μs)
-  - Total ≈ 400 μs at 1 MHz → still inside 1 ms; raise spi_speed_hz to
+  - Typical work: GPIO pulse (~10 μs) + SPI 48 bytes (384 μs at 1 MHz, 96 μs at 4 MHz; 40 bytes and
+    320 μs before RS-4 P1) + spidev overhead + plant (~50 μs) [estimates; the transfer time of a run is in
+    the frame log manifest, xfer_us]
+  - Total ≈ 460 μs at 1 MHz → still inside 1 ms; raise spi_speed_hz to
     2–4 MHz after the link is validated to regain margin
 
 CPU allocation:
@@ -38,7 +39,7 @@ from timing import PrecisionTimer, set_realtime, pin_cpu, lock_memory
 from gpio_sync import GPIOSync
 from spi_master import SPIMaster
 from protocol import (encode_state, decode_torques, TRAJ_VALID, TRAJ_NEW, OFS_MISO_SEQ, CMD_SWA_ON,
-                      miso_check, MISO_OK, MISO_EMPTY)
+                      miso_check, MISO_OK, MISO_EMPTY, FRAME_SIZE, new_run_id, miso_id)
 from plant_interface import PlantInterface, MockPlant
 from mecanum_plant import MecanumPlant
 from imu_model import imu_from_plant
@@ -64,6 +65,10 @@ END_TAIL_MS = 30
 # carry the reply staged in the previous link period (as s06_frames_decode `start_leftover`, L50: "không
 # tính frame rỗng ở đầu log trước câu trả lời đầu tiên (j < 2)")
 MISO_SKIP_FRAMES = 2
+# RS-4 P1 (MOSI v4 / MISO v6, 48 bytes; Liam 14/11 CODE_RS4 "Làm P1, 48 byte"): on the real link, if none of
+# the first ID_CHECK_FRAMES MISO carries this run's run_id in bytes 40-47, the H7 is not a v6 build (or the
+# frame length differs): the run stops (stop_reason 'h7_not_miso_v6'). The H7 answers frame N in N + 2.
+ID_CHECK_FRAMES = 50
 
 log =logging.getLogger('hil.node')
 
@@ -203,6 +208,11 @@ class HILNode:
         self._miso_first_empty: Optional[int] = None
         self._h7_seq      = -1
         self._h7_new      = False
+        # RS-4 P1: run_id sent in every MOSI (bytes 40-47 with the step); replies the H7 sent back with it
+        self._run_id      = new_run_id()
+        self._id_match_n  = 0
+        self._id_first_step: Optional[int] = None
+        log.info('#run_id,%08x', self._run_id)
         self._ref         = (0.0, 0.0, 0.0)
         self._ref_count   = 0.0
 
@@ -244,12 +254,14 @@ class HILNode:
             n = self.cfg.max_steps or self.cfg.frame_log_max
             # t_pulse0/1_ns: just before / just after raising the sync pulse (S06 spec line 111:
             # P_send := t_pulse_rise, the same physical edge as d_1w; tools/s06_frames_decode.py)
+            # t_recv_ns (RS-4 P1): right after the transfer returns, so the 48-byte transfer time is measured
             self._flog = {
                 't_send_ns':   np.zeros(n, dtype=np.int64),
+                't_recv_ns':   np.zeros(n, dtype=np.int64),
                 't_pulse0_ns': np.zeros(n, dtype=np.int64),
                 't_pulse1_ns': np.zeros(n, dtype=np.int64),
-                'mosi':        np.zeros((n, 40), dtype=np.uint8),
-                'miso':        np.zeros((n, 40), dtype=np.uint8),
+                'mosi':        np.zeros((n, FRAME_SIZE), dtype=np.uint8),
+                'miso':        np.zeros((n, FRAME_SIZE), dtype=np.uint8),
             }
             self._flog_n = n
             # np.zeros maps pages lazily: without this, a page fault every ~100 frames inside the loop
@@ -359,9 +371,20 @@ class HILNode:
         swa = self._swa_bit()
         mosi   = encode_state(frame_state, traj_ref=self._ref, traj_flags=traj_flags,
                               seq=self._step, imu=imu, imu_seq=imu_seq,
-                              fault_flags=CMD_SWA_ON if swa else 0)
+                              fault_flags=CMD_SWA_ON if swa else 0,
+                              run_id=self._run_id, frame_no=self._step)
         t_send = time.monotonic_ns()
         miso   = self._spi.transfer(mosi)
+        t_recv = time.monotonic_ns()
+        if self._id_first_step is None:
+            # RS-4 P1: first MISO carrying this run's run_id (one unpack per frame until then)
+            if miso_id(miso)[0] == self._run_id:
+                self._id_first_step = self._step
+            elif self._step >= ID_CHECK_FRAMES and not self.cfg.simulate_hw:
+                log.error('MISO: no reply with run_id %08x in %d frames: H7 not MISO v6 (48-byte frame, '
+                          'RS-4 P1); run stopped', self._run_id, self._step)
+                self._stop_reason = 'h7_not_miso_v6'
+                self._running = False
         if swa != self._swa:                 # I8-11: recorded once the frame went out
             self._swa = swa
             self._swa_events.append((self._step, swa))
@@ -394,6 +417,7 @@ class HILNode:
         if self._flog is not None:
             k = self._step
             self._flog['t_send_ns'][k] = t_send
+            self._flog['t_recv_ns'][k] = t_recv
             self._flog['t_pulse0_ns'][k] = t_p0
             self._flog['t_pulse1_ns'][k] = t_p1
             self._flog['mosi'][k] = memoryview(bytes(mosi))
@@ -504,10 +528,23 @@ class HILNode:
                         lifecycle=self.lifecycle_summary(),
                         swa_mode=self.cfg.swa_mode, swa_events=self.swa_events(),     # I8
                         miso_check=self.miso_summary(),                                # A3
+                        frame_len=int(self._flog['mosi'].shape[1]), proto='mosi_v4_miso_v6',   # RS-4 P1
+                        run_id=int(self._run_id), id_first_step=self._id_first_step,
+                        xfer_us=self._xfer_stats(n), timer_overruns=int(self._timer.overruns),
                         **self.swa_tail())                                             # I8-R2-3
         np.savez(self.cfg.frame_log, manifest=np.array(json.dumps(manifest)),
                  **{k: v[:n] for k, v in self._flog.items()})
         log.info('Frame log: %d frames -> %s', n, self.cfg.frame_log)
+
+    def _xfer_stats(self, n: int) -> Optional[dict]:
+        """RS-4 P1 (rule "H7 code with time limits", first run of the 48-byte frame): SPI transfer time
+        t_recv - t_send over the logged frames, us: p50, p99.9, max; None without frames."""
+        import numpy as np
+        if n <= 0:
+            return None
+        d = (self._flog['t_recv_ns'][:n] - self._flog['t_send_ns'][:n]) / 1000.0
+        p50, p999 = np.percentile(d, [50.0, 99.9])
+        return dict(p50=float(p50), p99_9=float(p999), max=float(d.max()), n=int(n))
 
     def _on_signal(self, signum: int, _frame) -> None:
         log.info("Signal %d received — stopping plant loop.", signum)
@@ -541,7 +578,10 @@ class HILNode:
     @property
     def run_failed(self) -> bool:
         """--finite-run ended in error:<reason>, or without reaching END, or (I8-R2-3, Codex round 3)
-        reached END but its tail was cut (max_steps, a full frame log, a signal), so run_hil.py exits 3."""
+        reached END but its tail was cut (max_steps, a full frame log, a signal), so run_hil.py exits 3.
+        RS-4 P1: also any run stopped because the H7 did not send the run_id back (H7 not MISO v6)."""
+        if self._stop_reason == 'h7_not_miso_v6':
+            return True
         if self._lc is None:
             return False
         return (self._lc.phase != END or (self._lc.outcome or '').startswith('error:')

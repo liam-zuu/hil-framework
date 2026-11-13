@@ -21,6 +21,15 @@
  *       replies staged (one per applied frame), so a reply overwritten before
  *       the DMA sent it shows as a gap; status bit 7 marks v5. Lengths and the
  *       other bytes unchanged; a v4 H7 always sends status bits 1-7 = 0.
+ *   MOSI v4 / MISO v6 (RS-4 P1, 14/11/2026, Liam CODE_RS4 local_c3031475 "Làm P1,
+ *       48 byte"; design 03_CODE/docs/2026-11-14_Thiet_ke_RS4_so_phien_MOSI_v1.md):
+ *       48 bytes both ways. MOSI 40-43 run_id (u32, the Pi draws one per run,
+ *       never 0), 44-47 frame_no (u32, the Pi step = frame log index). The H7
+ *       copies MOSI 40-47 of the frame it answers, from the same raw copy as the
+ *       MOSI checksum, receive stamp and apply window, into MISO 40-47; the MISO
+ *       checksum covers bytes 0-7 and 10-47. The H7 never decodes these bytes.
+ *       So the Pi reads which frame of which run a reply answers, instead of
+ *       inferring it (assumptions A1-A3 of tools/hil_edge_map.py ff616ab).
  */
 
 #ifndef HIL_PROTOCOL_H
@@ -29,7 +38,7 @@
 #include <stdint.h>
 
 /* ── Frame size ─────────────────────────────────────────────────────── */
-#define SPI1_FRAME_LEN      40          /* bytes, both directions */
+#define SPI1_FRAME_LEN      48          /* bytes, both directions (40 before MOSI v4 / MISO v6) */
 
 /* ── Scale factors (MOSI — plant state) ────────────────────────────── */
 #define HIL_OMEGA_MAX       40.0f       /* rad/s  — wheel speed  */
@@ -53,7 +62,7 @@
 /* ── Fixed-point helpers ─────────────────────────────────────────────── */
 #define INT16_MAXF          32767.0f
 
-/* ── MOSI layout (RPi5 → H7), 40 bytes ─────────────────────────────── */
+/* ── MOSI layout (RPi5 → H7), 48 bytes ─────────────────────────────── */
 /* Byte  0– 1  omega[0]     int16 × (HIL_OMEGA_MAX / INT16_MAXF)        */
 /* Byte  2– 3  omega[1]                                                  */
 /* Byte  4– 5  omega[2]                                                  */
@@ -76,16 +85,21 @@
 /* Byte 35–36  az_imu                                                 v3 */
 /* Byte 37–38  yaw_imu      int16 × (HIL_IMU_YAW_MAX / INT16_MAXF)   v3 */
 /* Byte 39     imu_seq      uint8, +1 for every new plant IMU sample  v3 */
+/* Byte 40–43  run_id       uint32 LE, one per Pi run, never 0       v4 */
+/* Byte 44–47  frame_no     uint32 LE, Pi step (frame log index)     v4 */
+/*             (MOSI v4: the H7 only copies bytes 40-47 into the MISO)  */
+#define HIL_MOSI_ID         40          /* run_id + frame_no, copied as they are */
+#define HIL_MOSI_ID_LEN     8
 
-/* ── MISO layout (H7 → RPi5), 40 bytes ─────────────────────────────── */
+/* ── MISO layout (H7 → RPi5), 48 bytes ─────────────────────────────── */
 /* Byte  0– 1  torque[0]    int16 × (HIL_TORQUE_MAX / INT16_MAXF)       */
 /* Byte  2– 3  torque[1]                                                 */
 /* Byte  4– 5  torque[2]                                                 */
 /* Byte  6– 7  torque[3]                                                 */
 /* v4 (S06): bytes 8-15 and 18-39 below; multi-byte fields little-endian */
-/* Byte  8– 9  miso_crc     CRC-16 of bytes 0-7 and 10-39 of this frame,  */
+/* Byte  8– 9  miso_crc     CRC-16 of bytes 0-7 and 10-47 of this frame,  */
 /*                          computed when the frame is staged (Z3)        */
-/* Byte 10–11  mosi_crc     CRC-16 of the 40 raw MOSI bytes of the frame  */
+/* Byte 10–11  mosi_crc     CRC-16 of the 48 raw MOSI bytes of the frame  */
 /*                          answered, on the main-loop copy (W3, Y9)      */
 /* Byte 12–15  rx_cyc       DWT CYCCNT in SPI1_Callback of that frame     */
 /* Byte 16     status       uint8: bit 0 SWA; v5: bits 1-6 replies staged */
@@ -104,6 +118,8 @@
 /* Byte 22     log_type     S06 log record type, 0 = none (s06_log.h)    */
 /* Byte 23–24  log_idx      continuous index of the H7 log record        */
 /* Byte 25–39  log_payload  15 bytes, by type                            */
+/* Byte 40–47  id           v6: MOSI bytes 40-47 (run_id, frame_no) of the */
+/*                          frame answered, same raw copy as bytes 10-21   */
 /* CRC-16: CCITT-FALSE (poly 0x1021, init 0xFFFF, no reflection, no XOR) */
 #define HIL_MISO_CRC        8
 #define HIL_MISO_MOSI_CRC   10
@@ -114,6 +130,7 @@
 #define HIL_MISO_AGE        20
 #define HIL_MISO_LOG        22
 #define HIL_MISO_LOG_LEN    18          /* type + idx + 15-byte payload */
+#define HIL_MISO_ID         40          /* v6: copy of MOSI bytes 40-47 */
 
 /* ── Fault flags (MOSI byte 20) ─────────────────────────────────────── */
 /* Bits 0-2 are fault bits; bit 3 is a command bit (I8), not a fault.  */

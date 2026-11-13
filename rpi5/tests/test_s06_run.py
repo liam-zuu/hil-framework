@@ -14,7 +14,7 @@ import pytest
 import gpio_sync
 import hil_node as hn
 from hil_node import HILConfig, HILNode
-from protocol import decode_state, encode_state
+from protocol import FRAME_SIZE, decode_state, encode_state
 from trajectory_pub import TrajectorySpec
 import t3b_schedule as t3
 
@@ -35,7 +35,13 @@ def test_frame_log_and_run_lines(tmp_path, caplog):
     sched = t3.make_schedule(seed=3)
     steps = 1500
     d, text = _run(tmp_path, sched, steps, caplog)
-    assert d['mosi'].shape == (steps, 40) and d['miso'].shape == (steps, 40)
+    assert d['mosi'].shape == (steps, FRAME_SIZE) and d['miso'].shape == (steps, FRAME_SIZE) and FRAME_SIZE == 48
+    # RS-4 P1: MOSI 40-47 = run_id (manifest) + step; transfer times logged
+    m = json.loads(str(d['manifest']))
+    assert m['run_id'] != 0 and m['frame_len'] == 48 and m['xfer_us']['n'] == steps
+    assert all(int.from_bytes(bytes(d['mosi'][k, 40:44]), 'little') == m['run_id'] and
+               int.from_bytes(bytes(d['mosi'][k, 44:48]), 'little') == k for k in (0, 1, 777, steps - 1))
+    assert np.all(d['t_recv_ns'] >= d['t_send_ns'])
     t = d['t_send_ns']
     assert np.all(np.diff(t) >= 0)                    # one send time per frame (Windows clock: ~15 ms steps)
     # sync pulse bracketed just before the send (S06 spec line 111, P_send := t_pulse_rise)
@@ -109,7 +115,7 @@ def test_frame_log_pages_touched_before_the_loop(monkeypatch):
     monkeypatch.setattr(np, 'zeros', lambda *a, **k: zeros(*a, **k).view(Arr))
     plant = t3.ScheduleOmegaPlant(t3.make_schedule(seed=3))
     HILNode(plant, config=HILConfig(simulate_hw=True, max_steps=10, period_us=1_000, frame_log='x.npz'))
-    assert sorted(filled) == [(10,), (10,), (10,), (10, 40), (10, 40)]
+    assert sorted(filled) == [(10,), (10,), (10,), (10,), (10, FRAME_SIZE), (10, FRAME_SIZE)]
 
 
 def test_sync_pulse_busy_waits(monkeypatch):

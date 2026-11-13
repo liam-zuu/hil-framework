@@ -8,15 +8,16 @@ Times, under the same scheduling as the plant loop (SCHED_FIFO 90, core 0):
                (IMU sample, state reorder, encode_state, decode_torques)
   traction_muM plant_step() with ground_model 'traction' (method A as implemented,
                mu_hd = M, sub-steps from the stability bound)
-  frame_log    the per-frame writes of run_hil.py --frame-log (hil_node.py: t_send + 40 B MOSI
-               + 40 B MISO into preallocated arrays, inside the step before t_done): extra
+  frame_log    the per-frame writes of run_hil.py --frame-log (hil_node.py: t_send, t_recv + 48 B MOSI
+               + 48 B MISO into preallocated arrays, inside the step before t_done; 40 B and no
+               t_recv before RS-4 P1, RPI5_TIMING/2026-11-03_run01): extra
                load of S06 T1/T2 runs that log frames (S06, Liam 30/10)
   slipA_nsubN  THROWAWAY timing prototype of a minimal slip model (method A):
                body with its own dynamics, traction per wheel capped by mu*N,
                N sub-steps per 1 ms. Only for timing: parameters are guesses,
                the model is not validated and is not used anywhere else.
-Budget reference (estimates in hil_node.py, not measured): SPI 40 bytes at
-1 MHz ~320 us + GPIO pulse ~10 us, period 1000 us.
+Budget reference (estimates in hil_node.py, not measured): SPI 48 bytes at
+1 MHz ~384 us (40 bytes ~320 us before RS-4 P1) + GPIO pulse ~10 us, period 1000 us.
 
 Usage (on the Pi, nothing else running; does not touch SPI/GPIO, so the H7 can
 stay connected):
@@ -37,7 +38,7 @@ import numpy as np
 
 from params import MecanumParams
 from plant_step import plant_step, motor_torque
-from protocol import encode_state, decode_torques
+from protocol import encode_state, decode_torques, FRAME_SIZE
 from hil_node import plant_to_frame_state
 from imu_model import imu_from_plant
 from timing import set_realtime, pin_cpu
@@ -126,15 +127,18 @@ def main() -> int:
         pt.mu_hd = np.full(4, mu)
         variants.append((f'traction_mu{mu}', lambda pt=pt: plant_step(x, u, pt, 0.001, rng)))
     nlog = 1 << 16
-    flog = {'t_send_ns': np.zeros(nlog, dtype=np.int64), 'mosi': np.zeros((nlog, 40), dtype=np.uint8),
-            'miso': np.zeros((nlog, 40), dtype=np.uint8)}
-    mosi_b, miso_b = bytearray(40), bytearray(40)
+    # RS-4 P1: FRAME_SIZE bytes (48) and t_recv_ns, as HILNode._tick writes them now (40 bytes, no t_recv before)
+    flog = {'t_send_ns': np.zeros(nlog, dtype=np.int64), 't_recv_ns': np.zeros(nlog, dtype=np.int64),
+            'mosi': np.zeros((nlog, FRAME_SIZE), dtype=np.uint8),
+            'miso': np.zeros((nlog, FRAME_SIZE), dtype=np.uint8)}
+    mosi_b, miso_b = bytearray(FRAME_SIZE), bytearray(FRAME_SIZE)
     flog_k = [0]
 
     def frame_log():
-        # same three writes as HILNode._tick with --frame-log
+        # same writes as HILNode._tick with --frame-log
         k = flog_k[0] = (flog_k[0] + 1) % nlog
         flog['t_send_ns'][k] = time.monotonic_ns()
+        flog['t_recv_ns'][k] = time.monotonic_ns()
         flog['mosi'][k] = memoryview(bytes(mosi_b))
         flog['miso'][k] = memoryview(bytes(miso_b))
 
