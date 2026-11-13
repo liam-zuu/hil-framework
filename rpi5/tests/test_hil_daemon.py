@@ -368,23 +368,51 @@ def test_stop_escalates_on_its_own_when_the_run_ignores_it(tmp_path, monkeypatch
 
 @pytest.mark.skipif(os.name != 'posix', reason='process groups and signals: run on the Pi')
 def test_posix_stop_kills_the_whole_group(tmp_path):
-    """PPI-1/PPI-10: the real _posix_stop and _reap_group on a child that ignores SIGINT and
-    SIGTERM and has a grandchild in its group."""
+    """PPI-1/PPI-10, PPI-R2-7: the real _posix_stop on a child that ignores SIGINT and SIGTERM
+    and has a grandchild in its group; level 2 alone (no _reap_group here) must take the whole
+    group, so a level 2 sent to the owner's pid only fails. Ready signal = a line on stdout."""
     import subprocess
-    from hil_daemon import _posix_stop, _reap_group, _spawn_kw, _group_alive
+    from hil_daemon import _posix_stop, _spawn_kw, _group_alive
     code = ('import signal, subprocess, sys, time;'
             'signal.signal(signal.SIGINT, signal.SIG_IGN); signal.signal(signal.SIGTERM, signal.SIG_IGN);'
-            'subprocess.Popen([sys.executable, "-c", "import signal,time;'
-            'signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"]); time.sleep(60)')
-    p = subprocess.Popen([sys.executable, '-c', code], **_spawn_kw())
-    time.sleep(0.5)
+            'g = subprocess.Popen([sys.executable, "-c", "import signal,sys,time;'
+            'signal.signal(signal.SIGTERM, signal.SIG_IGN); print(1, flush=True); time.sleep(60)"],'
+            ' stdout=subprocess.PIPE); g.stdout.readline(); print("ready", flush=True); time.sleep(60)')
+    p = subprocess.Popen([sys.executable, '-c', code], stdout=subprocess.PIPE, text=True, **_spawn_kw())
+    assert p.stdout.readline().strip() == 'ready'
     _posix_stop(p, 0)
     _posix_stop(p, 1)
     time.sleep(0.3)
-    assert p.poll() is None                       # both ignored
+    assert p.poll() is None and _group_alive(p.pid)      # both ignored
     _posix_stop(p, 2)
     p.wait(timeout=5)
-    assert _reap_group(p.pid, wait_s=1.0) and not _group_alive(p.pid)
+    t_end = time.monotonic() + 2.0
+    while _group_alive(p.pid) and time.monotonic() < t_end:
+        time.sleep(0.02)
+    assert not _group_alive(p.pid)                       # grandchild gone too, without a reap
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='process groups and signals: run on the Pi')
+def test_owner_exit_reaps_a_child_holding_the_pipe(tmp_path, monkeypatch):
+    """PPI-R2-1: the owner prints a phase and exits; its child (same group) ignores SIGTERM and
+    keeps the stdout pipe. The daemon must still end the run (reap with SIGKILL) and not stay
+    ACTIVE waiting for EOF."""
+    import hil_daemon
+    from hil_daemon import _group_alive
+    monkeypatch.setattr(hil_daemon, 'REAP_S', 0.5)
+    script = tmp_path / 'owner.py'
+    script.write_text(
+        'import signal, subprocess, sys, time\n'
+        'print("02:00:00 INFO     hil.main: #phase,PREPARE,t_ns=1", flush=True)\n'
+        'subprocess.Popen([sys.executable, "-c", "import signal,time; '
+        'signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"])\n'
+        'time.sleep(0.3)\n', encoding='utf-8')
+    d = HilDaemon(str(tmp_path / 'runs'), tests=[('T-1', ['x'])], busy_check=lambda pid: False,
+                  child_cmd=lambda args: [sys.executable, '-u', str(script)])
+    assert d.start(0) == pp.RES_OK
+    pid = d.proc.pid
+    s = wait_for(d, (pp.ST_ERROR, pp.ST_END), timeout=8)
+    assert d.proc is None and s.error_code == E_NO_SUMMARY and not _group_alive(pid)
 
 
 @pytest.mark.parametrize('argv,expected', [
@@ -480,3 +508,124 @@ def test_uart_wait_retries_without_spending_anything():
     port = open_uart_when_ready(Serial, '/dev/ttyAMA0', 115200, retry_s=2, say=lambda *a, **k: said.append(a),
                                 sleep=slept.append)
     assert len(tries) == 3 and slept == [2, 2] and len(said) == 2 and port.port == '/dev/ttyAMA0'
+
+
+# ── Codex round 2 (14/11): PPI-R2-2 … R2-7 ──
+
+@pytest.mark.parametrize('argv,expected', [
+    ([b'python3', b'-uW', b'ignore', b'run_hil.py'], True),
+    ([b'python3', b'-Wignore', b'run_hil.py'], True),
+    ([b'python3', b'-BXdev', b'run_hil.py'], True),
+    ([b'python3', b'-BX', b'dev', b'-u', b'/x/rpi5/run_hil.py'], True),
+    ([b'python3', b'-uc', b'import x', b'run_hil.py'], False),
+    ([b'python3', b'-Bm', b'pytest', b'run_hil.py'], False),
+    ([b'python3', b'--check-hash-based-pycs', b'always', b'run_hil.py'], True),
+    ([b'python3', b'-', b'run_hil.py'], False),
+])
+def test_combined_short_options(argv, expected):
+    from hil_daemon import is_run_hil_argv
+    assert is_run_hil_argv(argv) is expected
+
+
+def test_ctrl_c_during_the_probe_still_kills_and_reaps_it(tmp_path, monkeypatch):
+    """PPI-R2-2: KeyboardInterrupt while waiting for the probe: the probe child is killed, the
+    probe flag cleared only once it is gone."""
+    import subprocess
+    monkeypatch.setenv('FAKE_PROBE', 'hang')
+    levels = []
+
+    def stop_fn(proc, level):
+        levels.append(level)
+        proc.kill()
+    d = make(tmp_path, stop_fn=stop_fn)
+    seen = {}
+    real = subprocess.Popen.communicate
+
+    def interrupted(self, *a, **k):
+        if k.get('timeout') is not None:
+            seen['p'] = self
+            raise KeyboardInterrupt
+        return real(self, *a, **k)
+    monkeypatch.setattr(subprocess.Popen, 'communicate', interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        d.probe_h7()
+    assert levels == [2] and seen['p'].poll() is not None
+    assert not d._probing and not d._wedged and d._probe_proc is None
+
+
+def test_shutdown_kills_a_probe_in_progress_and_blocks_new_work(tmp_path, monkeypatch):
+    """PPI-R2-2: shutdown during a background probe: the probe is killed, then nothing new."""
+    import threading
+    monkeypatch.setenv('FAKE_PROBE', 'hang')
+    d = make(tmp_path)
+    t = threading.Thread(target=d.probe_h7, daemon=True)
+    t.start()
+    t_end = time.monotonic() + 10
+    while d._probe_proc is None and time.monotonic() < t_end:
+        time.sleep(0.01)
+    assert d.shutdown(wait_s=10) is True
+    t.join(5)
+    assert not t.is_alive() and not d._probing
+    assert d.start(0) == pp.RES_BUSY and d.probe_h7() is False and d.maybe_reprobe(every_s=0) is None
+
+
+def test_wedged_blocks_start_probe_reprobe_and_shutdown_says_so(tmp_path, monkeypatch):
+    """PPI-R2-6: after E_GROUP nothing new runs, even when /proc sees nothing."""
+    monkeypatch.setenv('FAKE_PROBE', 'ok')
+    d = make(tmp_path)
+    d._wedged = True
+    assert d.start(0) == pp.RES_BUSY and d.probe_h7() is False and d.maybe_reprobe(every_s=0) is None
+    assert d.shutdown(wait_s=1) is False
+
+
+def test_reset_panel_ctrl_c_and_failed_release_is_still_said():
+    """PPI-R2-5: Ctrl+C during the pulse and the release fails: the error is printed even
+    though the KeyboardInterrupt goes on and nothing is returned."""
+    from hil_daemon import reset_panel
+    said = []
+
+    def interrupted(_s):
+        raise KeyboardInterrupt
+    with pytest.raises(KeyboardInterrupt):
+        reset_panel(22, 4, 0.1, lg=FakeLgpio(fail='in'), sleep=interrupted,
+                    say=lambda *a, **k: said.append(' '.join(map(str, a))))
+    assert len(said) == 1 and 'release' in said[0] and 'EN may stay low' in said[0]
+
+
+def test_epoch_is_taken_only_once_the_uart_opens(tmp_path, monkeypatch):
+    """PPI-9, PPI-R2-7: _serve_panel opens the UART (retrying) before it takes an epoch."""
+    import argparse
+    import hil_daemon
+    events = []
+
+    class SerialException(OSError):
+        pass
+
+    class Port:
+        def __init__(self, **kw):
+            self.port = None
+
+        def open(self):
+            events.append('open')
+            if events.count('open') < 3:
+                raise SerialException('not yet')
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class Serial:
+        pass
+    Serial.Serial, Serial.SerialException = Port, SerialException
+    real_wait = hil_daemon.open_uart_when_ready
+    monkeypatch.setattr(hil_daemon, 'open_uart_when_ready',
+                        lambda s, p, b: real_wait(s, p, b, say=lambda *a, **k: None, sleep=lambda x: None))
+    monkeypatch.setattr(hil_daemon.pp, 'next_daemon_epoch', lambda path, create=False: events.append('epoch') or 5)
+    a = argparse.Namespace(panel_reset_gpio=-1, mock=True, no_probe=True, port='/dev/x', baud=115200,
+                           epoch_file=str(tmp_path / 'e'), create_epoch=False, runs_dir=str(tmp_path))
+    d = make(tmp_path / 'runs')
+    hil_daemon._serve_panel(a, d, Serial, lambda epoch, daemon, w, baud: None, lambda port: None,
+                            lambda port, link: events.append('serve'))
+    assert events == ['open', 'open', 'open', 'epoch', 'serve']

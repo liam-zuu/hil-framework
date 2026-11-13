@@ -9,7 +9,8 @@ scenario comes from FAKE_RUN_HIL; STOP is the line 'STOP' on stdin (test stop_fn
   tail_cut   as ok (completed), but exit 3 (END tail cut, hil_node.run_failed)
   hang       PREPARE, then ignores STOP (stdin and SIGINT) and sleeps 60 s: only a kill ends it
 FAKE_HOLD_FILE: wait until that file exists before the first line (a STOP before any #phase).
-Probe calls (--fixed-omega in argv): '#miso' line only, crc_bad from FAKE_PROBE (ok / bad / none).
+Probe calls (--fixed-omega in argv): '#miso' line only, crc_bad from FAKE_PROBE (ok / bad / none;
+hang = sleeps 60 s).
 """
 import json
 import os
@@ -39,6 +40,9 @@ def watch_stdin():
 def main():
     if '--fixed-omega' in sys.argv:
         probe = os.environ.get('FAKE_PROBE', 'ok')
+        if probe == 'hang':                     # a probe that never ends by itself
+            time.sleep(60)
+            return 9
         if probe != 'none':
             say('#miso,checked=1490,crc_bad=%d,empty=0,first_crc_bad=None,first_empty=None'
                 % (0 if probe == 'ok' else 3))

@@ -109,28 +109,41 @@ def panel_tests() -> List[Tuple[str, List[str]]]:
     return tests
 
 
-# Python options that take a separate value (python3 -W ignore run_hil.py ...)
-_PY_OPT_ARG = {b'-W', b'-X', b'--check-hash-based-pycs'}
+# Short options of the interpreter that take a value (CPython getopt: '-W x', '-Wx', '-uW x');
+# 'c' and 'm' end the options with no script. Long options that take the next token as value.
+_PY_SHORT_ARG = b'WX'
+_PY_SHORT_END = b'cm'
+_PY_LONG_ARG = {b'--check-hash-based-pycs'}
 
 
 def is_run_hil_argv(argv: Sequence[bytes]) -> bool:
     """True if argv (a /proc cmdline split on NUL) is a Python interpreter running the script
-    run_hil.py (PPI-3): the interpreter's options are skipped, the first non-option argument is
-    the script; '-c'/'-m' mean no script. 'vim run_hil.py' is not a run."""
+    run_hil.py (PPI-3, PPI-R2-3): options are read as CPython does, letter by letter inside a
+    token ('-uW ignore', '-BXdev', '-uc …'); the first non-option argument is the script; '-c'
+    or '-m' (alone or inside a token) mean no script. 'vim run_hil.py' is not a run."""
     argv = [a for a in argv if a != b'']
     if not argv or not os.path.basename(argv[0]).startswith(b'python'):
         return False
     i = 1
     while i < len(argv):
         a = argv[i]
-        if a in (b'-c', b'-m') or a.startswith((b'-c', b'-m')) and not a.startswith(b'--'):
-            return False
         if a == b'--':
             i += 1
             break
-        if not a.startswith(b'-'):
-            break
-        i += 2 if a in _PY_OPT_ARG else 1
+        if a == b'-' or not a.startswith(b'-'):
+            break                                  # '-' = script from stdin: no run_hil.py
+        if a.startswith(b'--'):
+            i += 2 if a in _PY_LONG_ARG else 1
+            continue
+        i += 1
+        for k in range(1, len(a)):
+            ch = a[k:k + 1]
+            if ch in _PY_SHORT_END:
+                return False
+            if ch in _PY_SHORT_ARG:
+                if k + 1 == len(a):
+                    i += 1                         # its value is the next token
+                break                              # else the rest of this token is its value
     return i < len(argv) and os.path.basename(argv[i]) == b'run_hil.py'
 
 
@@ -212,14 +225,16 @@ def checkout_id(folder: str = HERE) -> dict:
 
 
 def reset_panel(gpio: int = PANEL_RESET_GPIO, chip: int = RPI5_GPIOCHIP, low_s: float = PANEL_RESET_LOW_S,
-                lg=None, sleep: Callable[[float], None] = time.sleep) -> str:
+                lg=None, sleep: Callable[[float], None] = time.sleep,
+                say: Callable[..., None] = print) -> str:
     """Pull the panel's EN low for low_s, then let it go: the line is requested open drain
     (writing 1 = released, never driven high) and left an input before the chip is closed, on
     every path once it was pulled low, including an exception or Ctrl+C during the wait (PPI-5).
     The code cannot see whether the wire is there: 'done' only means the GPIO calls succeeded.
     Returns 'done', 'skipped: …' (no lgpio, no chip: the daemon still serves the panel), or
-    'failed: …'. A failed release is reported, the original exception (if any) still raised.
-    lg: lgpio module (tests)."""
+    'failed: …'. A failed release is said at once through say (PPI-R2-5: also when Ctrl+C is
+    on its way out and nothing is returned), and the original exception (if any) still raised.
+    lg: lgpio module, say: where the release error is printed (tests)."""
     if lg is None:
         try:
             import lgpio as lg
@@ -244,6 +259,7 @@ def reset_panel(gpio: int = PANEL_RESET_GPIO, chip: int = RPI5_GPIOCHIP, low_s: 
                 lg.gpio_claim_input(h, gpio)      # left an input after close (RP1 may keep outputs)
             except Exception as exc:
                 result = f'failed: GPIO{gpio} release: {exc} (EN may stay low: check the wire)'
+                say('panel reset ' + result, flush=True)
         try:
             lg.gpiochip_close(h)
         except Exception:
@@ -308,7 +324,9 @@ class HilDaemon:
         self._reader: Optional[threading.Thread] = None
         self._meta: dict = {}
         self._probing = False               # a probe run_hil.py is running: START is BUSY
-        self._wedged = False                # a run's process survived SIGKILL: START is BUSY
+        self._wedged = False                # a run's / probe's process survived SIGKILL: START, probe refused
+        self._closing = False               # shutdown started: no new START, no new probe
+        self._probe_proc = None
         self.meta_error: Optional[str] = None
         self.stop_term_s, self.stop_kill_s = STOP_TERM_S, STOP_KILL_S
         self._t_probe: Optional[float] = None
@@ -333,7 +351,7 @@ class HilDaemon:
                 return pp.RES_BUSY
             if not 0 <= index < len(self.tests):
                 return pp.RES_BAD_PROFILE
-            if self._probing or self._wedged or self.busy_check(None):
+            if self._closing or self._probing or self._wedged or self.busy_check(None):
                 return pp.RES_BUSY                 # another run_hil.py (e.g. from the PC, or the probe) owns the SPI
             try:
                 run_no = pp.next_run_no(self.run_no)
@@ -358,6 +376,7 @@ class HilDaemon:
                 return pp.RES_FAILED
             self._meta['pid'] = self.proc.pid
             self._enter(pp.ST_PREPARE)
+            threading.Thread(target=self._watch_owner, args=(self.proc,), name='run-owner', daemon=True).start()
             self._reader = threading.Thread(target=self._read, args=(self.proc,), daemon=True)
             self._reader.start()
             return pp.RES_OK
@@ -398,46 +417,64 @@ class HilDaemon:
         frames were checked and none had a bad CRC or was empty (hil_node '#miso' line).
         Refused (False, h7_ok unchanged) while a run is active or another run_hil.py runs."""
         with self._lock:
-            if self.state in pp.ST_ACTIVE or self._probing or self.busy_check(None):
+            if (self.state in pp.ST_ACTIVE or self._probing or self._closing or self._wedged
+                    or self.busy_check(None)):
                 return False
             self._probing, self._t_probe = True, self.clock()
         argv = self.child_cmd(['--fixed-omega', '0,0,0,0', '--imu-static', '0,0,0,9.81,0',
                                '--steps', str(steps), '--no-traj', '--swa', 'off', *self.extra_args])
-        gone = True
+        p, gone = None, False                       # PPI-R2-2: 'gone' only from a real reap
         try:
-            text = ''
             try:
                 p = subprocess.Popen(argv, cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                      text=True, encoding='utf-8', errors='replace', **_spawn_kw())
             except OSError:
-                p = None
-            if p is not None:
-                try:
-                    text, _ = p.communicate(timeout=timeout_s)
-                except subprocess.TimeoutExpired:
-                    # PPI-4: the whole group (HIL-Plant may hold the SPI), not only the owner
-                    try:
-                        self.stop_fn(p, 2)
-                    except OSError:
-                        pass
-                    text = p.communicate()[0] or ''
-                gone = _reap_group(p.pid if _spawn_kw() else None)
-            m = _RE_MISO.search(text or '')
-            ok = bool(m) and int(m.group(1)) > 0 and m.group(2) == '0' and m.group(3) == '0'
+                gone = True                         # nothing was started
+                return self._probe_result('')
             with self._lock:
-                self.h7_ok = ok
-            return ok
+                self._probe_proc = p
+            try:
+                text, _ = p.communicate(timeout=timeout_s)
+            except subprocess.TimeoutExpired:
+                self._kill_probe(p)                 # PPI-4: the whole group, not only the owner
+                text = p.communicate()[0] or ''
+            gone = _reap_group(p.pid if _spawn_kw() else None)
+            return self._probe_result(text)
         finally:
+            if p is not None and not gone:          # exception, Ctrl+C, shutdown: still reap it
+                self._kill_probe(p)
+                try:
+                    p.wait(timeout=5)
+                except Exception:
+                    pass
+                gone = _reap_group(p.pid if _spawn_kw() else None) and p.poll() is not None
             with self._lock:
-                # a group that would not die keeps START refused (BUSY) until the daemon restarts
-                self._probing, self._t_probe = (not gone), self.clock()
+                self._probe_proc = None
+                # a probe that would not die keeps START and probes refused until the daemon restarts
+                self._probing, self._t_probe = False, self.clock()
+                if not gone:
+                    self._wedged = True
+
+    def _probe_result(self, text: str) -> bool:
+        m = _RE_MISO.search(text or '')
+        ok = bool(m) and int(m.group(1)) > 0 and m.group(2) == '0' and m.group(3) == '0'
+        with self._lock:
+            self.h7_ok = ok
+        return ok
+
+    def _kill_probe(self, p) -> None:
+        try:
+            self.stop_fn(p, 2)
+        except OSError:
+            pass
 
     def maybe_reprobe(self, every_s: float = REPROBE_S) -> Optional[bool]:
         """Idle re-check of the H7 (daemon started before the H7 was up): probe when idle, the H7
         light is off and the last probe ended at least every_s ago. None = no probe this time.
         Never in --mock (the fake H7 always answers)."""
         with self._lock:
-            if (self.mock or self.h7_ok or self.state in pp.ST_ACTIVE or self._probing
+            if (self.mock or self.h7_ok or self.state in pp.ST_ACTIVE or self._probing or self._closing
+                    or self._wedged
                     or (self._t_probe is not None and self.clock() - self._t_probe < every_s)):
                 return None
         return self.probe_h7()
@@ -465,7 +502,7 @@ class HilDaemon:
         """Timer thread from the first STOP (PPI-1): soft STOP may not end the run (child hung,
         handler not installed, plant stuck), so level 1 after stop_term_s and level 2 after
         stop_term_s + stop_kill_s, whatever the child prints. Ends when the owner exits; the
-        group's remaining processes are reaped by the reader (_reap_group)."""
+        group's remaining processes are then reaped at once by _watch_owner (PPI-R2-1)."""
         t0, level = time.monotonic(), 0
         while proc.poll() is None:
             el = time.monotonic() - t0
@@ -481,19 +518,35 @@ class HilDaemon:
                     self._signal(proc, 2)
             time.sleep(0.05)
 
+    def _watch_owner(self, proc) -> None:
+        """Run thread (PPI-R2-1): as soon as the owner run_hil.py exits, by itself or killed,
+        reap its process group (wait REAP_S, then SIGKILL), without waiting for the reader's EOF:
+        a child of the group that still holds the stdout pipe would otherwise keep the reader,
+        so the run, open for ever. The reader then sees EOF and finishes the run."""
+        try:
+            proc.wait()
+        except Exception:
+            return
+        _reap_group(proc.pid if _spawn_kw() else None)
+
     def shutdown(self, wait_s: float = SHUTDOWN_S) -> bool:
-        """Daemon stop (Ctrl+C, systemd SIGINT, a fatal error of the panel link; PPI-2): STOP the
-        run, then wait for the reader to finish it (escalation and reaping included) so its
-        meta.json is closed. True if nothing is left running."""
+        """Daemon stop (Ctrl+C, systemd SIGINT, a fatal error of the panel link; PPI-2, PPI-R2-2):
+        no new START or probe from now on (closing), STOP the run, kill a probe in progress, then
+        wait for the reader / probe to finish them (escalation and reaping included) so meta.json
+        is closed. True only if nothing of the daemon's is left running (not after E_GROUP)."""
         with self._lock:
+            self._closing = True
             active = self.proc is not None
+            probe = self._probe_proc
         if active:
             self.stop()
+        if probe is not None:
+            self._kill_probe(probe)
         t_end = time.monotonic() + wait_s
         while time.monotonic() < t_end:
             with self._lock:
                 if self.proc is None and not self._probing:
-                    return True
+                    return not self._wedged
             time.sleep(0.05)
         return False
 
@@ -657,15 +710,18 @@ def main(argv=None) -> int:
                     help='skip only the H7 check at start; the idle re-check still turns the light on (PPI-8)')
     ap.add_argument('--panel-reset-gpio', type=int, default=PANEL_RESET_GPIO,
                     help='BCM GPIO wired to the panel EN (pulled low once at start); -1 = no wire')
+    ap.add_argument('--lock-dir', default=os.path.expanduser('~/.hil_panel_locks'),
+                    help='one daemon per machine: its lock file lives here (tests only change it)')
     a = ap.parse_args(argv)
     os.makedirs(a.runs_dir, exist_ok=True)
     import serial  # pyserial
     from panel_link import PanelLink, nonblocking_writer, serve
-    # PPI-7: one daemon per UART and per epoch file, decided before anything touches the panel or
-    # the H7 (reset, probe, threads). The UART lock name comes from the device's real path.
-    uart_lock = os.path.join(os.path.dirname(os.path.abspath(a.epoch_file)),
-                             '.hil_panel_uart_' + re.sub(r'[^A-Za-z0-9]', '_', os.path.realpath(a.port)) + '.lock')
-    with pp._FileLock(uart_lock, timeout_s=0.5), pp._FileLock(a.epoch_file + '.owner', timeout_s=0.5):
+    # PPI-7, PPI-R2-4: ONE daemon on this machine (one panel, one H7 per bench), whatever the
+    # port name or epoch file: a fixed lock (--lock-dir, default ~/.hil_panel_locks), plus the
+    # epoch file's owner lock; both taken before anything touches the panel or the H7.
+    os.makedirs(a.lock_dir, exist_ok=True)
+    with pp._FileLock(os.path.join(a.lock_dir, 'hil_daemon.lock'), timeout_s=0.5), \
+            pp._FileLock(a.epoch_file + '.owner', timeout_s=0.5):
         daemon = HilDaemon(a.runs_dir, ctrl=a.ctrl, mock=a.mock)
         try:
             return _serve_panel(a, daemon, serial, PanelLink, nonblocking_writer, serve)
@@ -717,7 +773,7 @@ def _serve_panel(a, daemon, serial, PanelLink, nonblocking_writer, serve) -> int
                   flush=True)
 
         def reprobe_loop():
-            while True:
+            while not daemon._closing:              # PPI-R2-2: no probe once shutdown started
                 r = daemon.maybe_reprobe()
                 if r is not None:
                     print('H7 re-probe:', 'answers' if r else 'no answer', flush=True)
