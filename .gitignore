@@ -18,3 +18,7 @@ bnoemu_pc/build/
 
 # H7 firmware id header, written by stm32h7/scripts/fw_id.py at build time (CubeIDE pre-build)
 stm32h7/Core/Inc/fw_id_gen.h
+# panel host test build output (rebuilt by panel/test_host/test_panel_c.py)
+panel/test_host/build/
+# PlatformIO build output
+panel/.pio/
