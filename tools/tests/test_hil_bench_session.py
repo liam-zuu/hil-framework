@@ -10,13 +10,14 @@ import pytest
 HERE = os.path.dirname(__file__)
 sys.path.insert(0, os.path.join(HERE, '..'))
 sys.path.insert(0, os.path.join(HERE, '..', '..', 'rpi5'))
+from protocol import FRAME_SIZE as FRAME_LEN  # noqa: E402  RS-4 P1: 48-byte frames
 import hil_bench_session as hb  # noqa: E402
 from protocol import encode_state, encode_torques  # noqa: E402
 
 
 def frames(n=4000, v=0.2, w=0.2, ref_from=500, duty=0.2, jump_at=None):
     """Circle: the plant follows the setpoint exactly; MOSI carries world-frame velocity like hil_node."""
-    mosi, miso = np.zeros((n, 40), np.uint8), np.zeros((n, 40), np.uint8)
+    mosi, miso = np.zeros((n, FRAME_LEN), np.uint8), np.zeros((n, FRAME_LEN), np.uint8)
     th = 0.0
     for k in range(n):
         on = k >= ref_from

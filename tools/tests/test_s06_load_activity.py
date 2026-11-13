@@ -11,6 +11,7 @@ import pytest
 HERE = os.path.dirname(__file__)
 sys.path.insert(0, os.path.join(HERE, '..'))
 sys.path.insert(0, os.path.join(HERE, '..', '..', 'rpi5'))
+from protocol import FRAME_SIZE as FRAME_LEN  # noqa: E402  RS-4 P1: 48-byte frames
 import s06_load_activity as la  # noqa: E402
 import s06_load_schedule as ls  # noqa: E402
 
@@ -24,8 +25,8 @@ def sched_file(tmp_path):
 
 
 def frames(tmp_path, sched, faults=()):
-    mosi = np.zeros((N, 40), dtype=np.uint8)
-    miso = np.zeros((N, 40), dtype=np.uint8)
+    mosi = np.zeros((N, FRAME_LEN), dtype=np.uint8)
+    miso = np.zeros((N, FRAME_LEN), dtype=np.uint8)
     for k in range(N):
         w = ls.heavy_omegas(k - 1000) if 1000 <= k < 2000 else [0.0, 20.0, 0.1, 20.0]
         if 'wrong_block' in faults and k == 1500:

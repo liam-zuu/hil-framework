@@ -11,6 +11,7 @@ import pytest
 HERE = os.path.dirname(__file__)
 sys.path.insert(0, os.path.join(HERE, '..'))
 sys.path.insert(0, os.path.join(HERE, '..', '..', 'rpi5'))
+from protocol import FRAME_SIZE as FRAME_LEN  # noqa: E402  RS-4 P1: 48-byte frames
 import s06_enc_alive as ea  # noqa: E402
 import t3b_schedule as ts  # noqa: E402
 
@@ -36,8 +37,8 @@ def omega_table(fault=None):
 
 def make_frames(tmp_path, w, drop=None, manifest=True, start_us=T0_US - PAD_MS * 1000):
     n = len(w)
-    mosi = np.zeros((n, 40), dtype=np.uint8)
-    miso = np.zeros((n, 40), dtype=np.uint8)
+    mosi = np.zeros((n, FRAME_LEN), dtype=np.uint8)
+    miso = np.zeros((n, FRAME_LEN), dtype=np.uint8)
     for k in range(n):
         mosi[k, :8] = np.frombuffer(struct.pack('>4h', *[round(x * 32767 / 40) for x in w[k]]), dtype=np.uint8)
         mosi[k, 21] = k & 0xFF

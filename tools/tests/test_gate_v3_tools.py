@@ -50,7 +50,7 @@ def write_k_frame_log(path, task, yaw, k0=300):
     pose = np.vstack([np.zeros((k0, 3)), pose])
     v = np.vstack([np.zeros((k0, 3)), lg['v_true']])
     n = len(pose)
-    mosi = np.zeros((n, 40), dtype=np.uint8)
+    mosi = np.zeros((n, P.FRAME_SIZE), dtype=np.uint8)
     for k in range(n):
         st = [0.0] * 4 + [pose[k, 0], pose[k, 1], pose[k, 2], v[k, 0], v[k, 1], v[k, 2]]
         on = k >= k0 + 3
@@ -59,7 +59,7 @@ def write_k_frame_log(path, task, yaw, k0=300):
     manifest = dict(period_us=1000, steps=n, plant='MecanumPlant', miso_check=dict(crc_bad=0, empty=0),
                     lifecycle=dict(outcome='completed', transitions=[dict(step=0, t=0, phase='ARM'),
                                                                      dict(step=k0, t=0.3, phase='RUN')]))
-    np.savez(path, manifest=np.array(json.dumps(manifest)), mosi=mosi, miso=np.zeros((n, 40), dtype=np.uint8))
+    np.savez(path, manifest=np.array(json.dumps(manifest)), mosi=mosi, miso=np.zeros((n, P.FRAME_SIZE), dtype=np.uint8))
 
 
 @pytest.mark.parametrize('task', L.K_TASKS)

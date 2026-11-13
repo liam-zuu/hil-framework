@@ -9,6 +9,7 @@ import pytest
 HERE = os.path.dirname(__file__)
 sys.path.insert(0, os.path.join(HERE, '..'))
 sys.path.insert(0, os.path.join(HERE, '..', '..', 'rpi5'))
+from protocol import FRAME_SIZE as FRAME_LEN  # noqa: E402  RS-4 P1: 48-byte frames
 import protocol  # noqa: E402
 import s06_h7_serial as ser  # noqa: E402
 import s06_relay_check as rc  # noqa: E402
@@ -20,8 +21,8 @@ SETPOINTS = N // EVERY
 
 
 def frames(tmp_path, manifest='ok', skip_new=()):
-    mosi = np.zeros((N, 40), dtype=np.uint8)
-    miso = np.zeros((N, 40), dtype=np.uint8)
+    mosi = np.zeros((N, FRAME_LEN), dtype=np.uint8)
+    miso = np.zeros((N, FRAME_LEN), dtype=np.uint8)
     for k in range(N):
         mosi[k, 21] = k & 0xFF
         if k % EVERY == 0 and k not in skip_new:
