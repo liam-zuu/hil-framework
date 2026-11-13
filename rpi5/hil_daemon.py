@@ -53,7 +53,22 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # Tests the panel lists, in this order: spec S02 group A (trajectory_pub.GROUP_A, same order)
 # and the C6 floor tasks (run_hil.py --o1; K1, K2 are the final test set, O1 3.7: never here).
-O1_PANEL = ('O1-F02', 'O1-F05', 'O1-F08')
+def _o1_panel() -> Tuple[str, ...]:
+    import o1_tasks                               # the figure-8 levels, never FINAL_SET (K1, K2)
+    return tuple(t for t in o1_tasks.FIG8 if t not in o1_tasks.FINAL_SET)
+
+
+O1_PANEL = _o1_panel()
+
+# Idle H7 re-check (CODE_PANEL 14/11, Liam Q3 "tự chạy": the daemon starts with the Pi, the H7
+# may still be off or booting): while idle and the H7 light is off, probe again this often.
+REPROBE_S = 15.0   # [ĐỀ XUẤT]
+
+# Panel reset line (CG2): Pi GPIO22 (pin 15) -> 1 kOhm -> EN of the WeAct board, open drain:
+# the Pi only pulls EN low, then lets the line go (input); the board's own pull-up raises EN.
+PANEL_RESET_GPIO = 22
+PANEL_RESET_LOW_S = 0.1   # [ĐỀ XUẤT]
+RPI5_GPIOCHIP = 4         # as gpio_sync.py
 
 # error_code on the FAULT screen (panel shows the number and error_text)
 E_RUN = 1          # run_hil.py ended in error:<reason> or with exit code != 0
@@ -67,6 +82,7 @@ _PHASE_ST = {'PREPARE': pp.ST_PREPARE, 'ARM': pp.ST_ARM, 'RUN': pp.ST_RUN,
 _RE_PHASE = re.compile(r'#phase,([A-Z]+)')
 _RE_SUMMARY = re.compile(r'#run_summary,(\{.*\})\s*$')
 _RE_MISO = re.compile(r'#miso,checked=(\d+),crc_bad=(\d+),empty=(\d+)')
+_RE_SWA = re.compile(r'#swa,mode=(\w+)')
 _RE_STATS = re.compile(r'p99=([0-9.]+|None) us\s+max=([0-9.]+|None) us\s+>warn: \d+\s+overruns=(\d+)')
 _RE_WHOLE = re.compile(r'whole run .*?p99=([0-9.]+|None) us .*?max=([0-9.]+) us .*?overruns=(\d+)')
 
@@ -108,6 +124,32 @@ def checkout_id(folder: str = HERE) -> dict:
     if sha.returncode:
         return {'sha': None, 'dirty': None}
     return {'sha': sha.stdout.strip(), 'dirty': bool(st.stdout.strip())}
+
+
+def reset_panel(gpio: int = PANEL_RESET_GPIO, chip: int = RPI5_GPIOCHIP, low_s: float = PANEL_RESET_LOW_S,
+                lg=None, sleep: Callable[[float], None] = time.sleep) -> str:
+    """Pull the panel's EN low for low_s, then free the line (input, the board's pull-up wins).
+    Returns 'done', or why it was skipped: the daemon still serves the panel without the wire
+    (the panel then handshakes on its own when it sees the new epoch). lg: lgpio module (tests)."""
+    if lg is None:
+        try:
+            import lgpio as lg
+        except ImportError:
+            return 'skipped: lgpio not installed'
+    try:
+        h = lg.gpiochip_open(chip)
+    except Exception as exc:                      # lgpio raises its own error type
+        return f'skipped: gpiochip{chip}: {exc}'
+    try:
+        lg.gpio_claim_output(h, gpio, 0)
+        sleep(low_s)
+        lg.gpio_free(h, gpio)
+        lg.gpio_claim_input(h, gpio)              # leave it an input, never drive EN high
+    except Exception as exc:
+        return f'failed: GPIO{gpio}: {exc}'
+    finally:
+        lg.gpiochip_close(h)
+    return 'done'
 
 
 def _num(s: str) -> Optional[float]:
@@ -154,6 +196,8 @@ class HilDaemon:
         self._seen_phase = False
         self._reader: Optional[threading.Thread] = None
         self._meta: dict = {}
+        self._probing = False               # a probe run_hil.py is running: START is BUSY
+        self._t_probe: Optional[float] = None
         self._checkout = checkout_id()         # read once: the checkout must not change under the daemon
 
     # ── RunControl ────────────────────────────────────────────────────────
@@ -175,8 +219,8 @@ class HilDaemon:
                 return pp.RES_BUSY
             if not 0 <= index < len(self.tests):
                 return pp.RES_BAD_PROFILE
-            if self.busy_check(None):
-                return pp.RES_BUSY                 # another run_hil.py (e.g. from the PC) owns the SPI
+            if self._probing or self.busy_check(None):
+                return pp.RES_BUSY                 # another run_hil.py (e.g. from the PC, or the probe) owns the SPI
             try:
                 run_no = pp.next_run_no(self.run_no)
             except OverflowError:                  # no number left: refuse, change nothing
@@ -241,21 +285,36 @@ class HilDaemon:
         frames were checked and none had a bad CRC or was empty (hil_node '#miso' line).
         Refused (False, h7_ok unchanged) while a run is active or another run_hil.py runs."""
         with self._lock:
-            if self.state in pp.ST_ACTIVE or self.busy_check(None):
+            if self.state in pp.ST_ACTIVE or self._probing or self.busy_check(None):
                 return False
+            self._probing, self._t_probe = True, self.clock()
         argv = self.child_cmd(['--fixed-omega', '0,0,0,0', '--imu-static', '0,0,0,9.81,0',
                                '--steps', str(steps), '--no-traj', '--swa', 'off', *self.extra_args])
         try:
-            out = subprocess.run(argv, cwd=HERE, capture_output=True, text=True, timeout=timeout_s,
-                                 encoding='utf-8', errors='replace')
-            text = out.stdout + out.stderr
-        except (OSError, subprocess.TimeoutExpired):
-            text = ''
-        m = _RE_MISO.search(text)
-        ok = bool(m) and int(m.group(1)) > 0 and m.group(2) == '0' and m.group(3) == '0'
+            try:
+                out = subprocess.run(argv, cwd=HERE, capture_output=True, text=True, timeout=timeout_s,
+                                     encoding='utf-8', errors='replace')
+                text = out.stdout + out.stderr
+            except (OSError, subprocess.TimeoutExpired):
+                text = ''
+            m = _RE_MISO.search(text)
+            ok = bool(m) and int(m.group(1)) > 0 and m.group(2) == '0' and m.group(3) == '0'
+            with self._lock:
+                self.h7_ok = ok
+            return ok
+        finally:
+            with self._lock:
+                self._probing, self._t_probe = False, self.clock()
+
+    def maybe_reprobe(self, every_s: float = REPROBE_S) -> Optional[bool]:
+        """Idle re-check of the H7 (daemon started before the H7 was up): probe when idle, the H7
+        light is off and the last probe ended at least every_s ago. None = no probe this time.
+        Never in --mock (the fake H7 always answers)."""
         with self._lock:
-            self.h7_ok = ok
-        return ok
+            if (self.mock or self.h7_ok or self.state in pp.ST_ACTIVE or self._probing
+                    or (self._t_probe is not None and self.clock() - self._t_probe < every_s)):
+                return None
+        return self.probe_h7()
 
     # ── internals (called with the lock held unless noted) ───────────────
     def _enter(self, st: int) -> None:
@@ -335,6 +394,10 @@ class HilDaemon:
                     m = _RE_MISO.search(line)
                     if m:
                         miso = tuple(int(g) for g in m.groups())
+                        continue
+                    m = _RE_SWA.search(line)
+                    if m:
+                        self._meta['swa_mode'] = m.group(1)   # what SWA did in this panel run (I8)
         rc = proc.wait()
         with self._lock:
             self._finish(rc, summary, miso, last)
@@ -382,14 +445,27 @@ def main(argv=None) -> int:
     ap.add_argument('--mock', action='store_true', help='run_hil.py --mock (fake H7, no SPI)')
     ap.add_argument('--no-probe', action='store_true',
                     help='skip the H7 check at start (the H7 light, so START, stays off until a run reaches RUN)')
+    ap.add_argument('--panel-reset-gpio', type=int, default=PANEL_RESET_GPIO,
+                    help='BCM GPIO wired to the panel EN (pulled low once at start); -1 = no wire')
     a = ap.parse_args(argv)
     os.makedirs(a.runs_dir, exist_ok=True)
     daemon = HilDaemon(a.runs_dir, ctrl=a.ctrl, mock=a.mock)
+    if a.panel_reset_gpio >= 0:
+        print(f'panel reset GPIO{a.panel_reset_gpio}:', reset_panel(a.panel_reset_gpio), flush=True)
     if a.mock:
         daemon.h7_ok = True                        # fake H7 of run_hil.py --mock always answers
     elif not a.no_probe:
         print('H7 probe ...', flush=True)
-        print('H7 probe:', 'answers' if daemon.probe_h7() else 'NO ANSWER (panel START stays blocked)', flush=True)
+        print('H7 probe:', 'answers' if daemon.probe_h7()
+              else f'NO ANSWER (panel START blocked; probing again every {REPROBE_S:.0f} s while idle)', flush=True)
+
+        def reprobe_loop():
+            while True:
+                r = daemon.maybe_reprobe()
+                if r is not None:
+                    print('H7 re-probe:', 'answers' if r else 'no answer', flush=True)
+                time.sleep(1.0)
+        threading.Thread(target=reprobe_loop, name='h7-reprobe', daemon=True).start()
     import serial  # pyserial
     from panel_link import PanelLink, nonblocking_writer, serve
     owner = pp._FileLock(a.epoch_file + '.owner', timeout_s=0.5)

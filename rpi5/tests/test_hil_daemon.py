@@ -214,3 +214,92 @@ def test_run_hil_phase_reporter_prints_each_change_once(caplog):
             rep()
     got = [r.getMessage().split(',')[1] for r in caplog.records if r.getMessage().startswith('#phase,')]
     assert got == ['PREPARE', 'ARM', 'RUN', 'STOPPING', 'END']
+
+
+# ── CODE_PANEL 14/11: daemon started with the Pi (Liam Q3), plan 2026-11-14 items 2, 7 ──
+
+def test_run_meta_records_the_swa_mode(tmp_path, monkeypatch):
+    monkeypatch.setenv('FAKE_SCEN', 'ok')
+    d = make(tmp_path)
+    assert d.start(0) == pp.RES_OK
+    wait_for(d, (pp.ST_END, pp.ST_ERROR))
+    assert run_meta(d)['swa_mode'] == 'phase'
+
+
+def test_o1_panel_is_the_figure_8_levels_of_o1_tasks():
+    import o1_tasks
+    assert O1_PANEL == tuple(o1_tasks.FIG8) and not set(O1_PANEL) & set(o1_tasks.FINAL_SET)
+
+
+def test_start_is_busy_while_the_probe_runs(tmp_path, monkeypatch):
+    monkeypatch.setenv('FAKE_PROBE', 'ok')
+    d = make(tmp_path)
+    seen = []
+    real = d.child_cmd
+
+    def spy(args):
+        if '--fixed-omega' in args:
+            seen.append(d.start(0))               # a panel START while the probe child is spawned
+        return real(args)
+    d.child_cmd = spy
+    assert d.probe_h7() is True
+    assert seen == [pp.RES_BUSY] and d.state == pp.ST_IDLE and d.run_no == 0
+    assert d.start(0) == pp.RES_OK                # after the probe: allowed
+    wait_for(d, (pp.ST_END, pp.ST_ERROR))
+
+
+def test_reprobe_only_when_idle_light_off_and_due(tmp_path, monkeypatch):
+    t = [100.0]
+    d = make(tmp_path, clock=lambda: t[0])
+    monkeypatch.setenv('FAKE_PROBE', 'none')
+    assert d.maybe_reprobe(every_s=15) is False     # never probed yet: probe now
+    t[0] += 10
+    assert d.maybe_reprobe(every_s=15) is None      # not due
+    t[0] += 6
+    monkeypatch.setenv('FAKE_PROBE', 'ok')
+    assert d.maybe_reprobe(every_s=15) is True and d.h7_ok
+    t[0] += 100
+    assert d.maybe_reprobe(every_s=15) is None      # light on: no probe
+
+
+def test_reprobe_never_in_mock(tmp_path, monkeypatch):
+    monkeypatch.setenv('FAKE_PROBE', 'none')
+    d = make(tmp_path, mock=True)
+    assert d.maybe_reprobe(every_s=0) is None
+
+
+class FakeLgpio:
+    def __init__(self, fail_open=False):
+        self.calls, self.fail_open = [], fail_open
+
+    def gpiochip_open(self, chip):
+        if self.fail_open:
+            raise OSError('no chip')
+        self.calls.append(('open', chip))
+        return 7
+
+    def gpio_claim_output(self, h, g, level):
+        self.calls.append(('out', g, level))
+
+    def gpio_free(self, h, g):
+        self.calls.append(('free', g))
+
+    def gpio_claim_input(self, h, g):
+        self.calls.append(('in', g))
+
+    def gpiochip_close(self, h):
+        self.calls.append(('close', h))
+
+
+def test_reset_panel_pulls_en_low_then_leaves_an_input():
+    from hil_daemon import reset_panel
+    lg, slept = FakeLgpio(), []
+    assert reset_panel(22, 4, 0.1, lg=lg, sleep=slept.append) == 'done'
+    assert lg.calls == [('open', 4), ('out', 22, 0), ('free', 22), ('in', 22), ('close', 7)]
+    assert slept == [0.1]
+    assert not any(c[0] == 'out' and c[2] == 1 for c in lg.calls)   # never drives EN high
+
+
+def test_reset_panel_without_the_chip_is_skipped_not_fatal():
+    from hil_daemon import reset_panel
+    assert reset_panel(22, 4, 0.1, lg=FakeLgpio(fail_open=True), sleep=lambda s: None).startswith('skipped')

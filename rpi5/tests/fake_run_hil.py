@@ -70,6 +70,7 @@ def main():
     outcome = 'user_stop' if stop.is_set() else 'completed'
     say('#run_summary,' + json.dumps({'outcome': outcome, 'detail': None, 'steps': 1234}))
     say('Plant loop jitter, whole run (n=1234): p99=43.2 us  p99.9=80.0 us  max=150.0 us  >warn: 0  overruns=1')
+    say('#swa,mode=phase,events=[],tail={}')
     say('#miso,checked=1200,crc_bad=%d,empty=0,first_crc_bad=None,first_empty=None'
         % (2 if scen == 'miso_bad' else 0))
     say('#run_end,timestamp_us=2,steps=1234,reason=end')
