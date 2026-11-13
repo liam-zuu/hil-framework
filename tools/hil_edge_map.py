@@ -12,7 +12,8 @@ retried, and a line that never fits logs LOG_CNT_INVALID (dropped here). So ever
 
 H7 apply times (h7_apply; L100, MISO v5: Liam 13/11 CODE local_4dc05b46 "Sửa gốc ở H7, phiên mới", Codex
 RS4-R4-1, R4-2). Every time is on the H7 clock (DWT CYCCNT / H7_CYC_PER_US, unwrapped); the Pi clock is not used.
-Each MISO answers a frame (its raw MOSI CRC, lag 2 first) with the CYCCNT of its receive (RX_CYC) and the apply
+Each MISO answers a frame (identified by its raw MOSI CRC, its seq byte and the H7 frame count RX_NF minus one
+common offset, Codex RS4-R6-1; see h7_apply) with the CYCCNT of its receive (RX_CYC) and the apply
 window: the speeds of that frame took effect in rx + [pre_us, pre_us + 4 dur4] (CYCCNT right before the first
 and right after the last EncoderGen_SetOmega, pre rounded down, end rounded up; hil_protocol.h). Status bits
 1-6 count the replies the H7 staged, one per applied frame: consecutive answered frames must step it by 1, else
@@ -118,6 +119,7 @@ TOL_MARGIN = 1.0                 # [ĐỀ XUẤT]
 COARSE_US, GRID_US = 250.0, 10.0  # cells of s: coarse pass, then fine cells inside kept coarse cells
 MISO_CRC, MISO_MOSI_CRC, MISO_RX_CYC, MISO_RX_NF, MISO_AGE = 8, 10, 12, 18, 20   # hil_protocol.h (a test checks)
 MISO_STATUS, STATUS_V5, STAGE_MOD = 16, 0x80, 64   # v5 (L100): bit 7 mark, bits 1-6 replies staged mod 64
+MISO_SEQ, MOSI_SEQ, LAG_MAX = 17, 21, 8   # hil_protocol.h; answer lags considered (R6-1: identity by CRC, seq, RX_NF)
 APPLY_PRE_MAX, APPLY_DUR_SHIFT, APPLY_DUR_MAX, APPLY_DUR_UNIT_US = 2047, 11, 31, 4   # bytes 20-21, v5
 PWM_LAG_MAX_STEPS = 15.0         # [ĐỀ XUẤT] tick compute (< 10 ms) + capture + frame answer
 PWM_SLACK_STEPS = 0.5            # [ĐỀ XUẤT] the PWM fit puts ticks on k x period, frames move <= 0.15 step
@@ -339,33 +341,50 @@ class EncModel:
 
 
 def h7_apply(frames, k_lo, k_hi):
-    """H7 apply windows of the frames of [k_lo, k_hi) on the H7 clock (module docstring, L100). The MISO of
-    transfer j answers the frame k whose raw MOSI CRC it carries (lag 2 first, then 1, 3, 4: two equal MOSI frames
-    give the same CRC). Returns dict ok, apply_us / width_us (n, NaN where not applied), applied (frame indices),
-    n_not_applied, t_frame_us (n: H7 receive of each frame of the range, unanswered ones interpolated, NaN
-    outside), window stats; refuses (ok False, reason) as the docstring says."""
+    """H7 apply windows of the frames of [k_lo, k_hi) on the H7 clock (module docstring, L100). Which frame a MISO
+    answers (Codex RS4-R6-1): its candidates are the frames k with j - LAG_MAX <= k < j whose raw MOSI CRC AND seq
+    byte (MOSI 21, the Pi step & 0xFF) equal the MISO's MOSI_CRC and seq (MISO 17); the H7 frame count RX_NF of the
+    answer minus k is one common offset (no frame of the range was lost before the H7, checked below): the offset
+    comes from the answers with exactly one candidate (all must agree), and every answer is the candidate that
+    fits it (none: refused). The lag order is not used as identity. Returns dict ok, apply_us / width_us (n, NaN
+    where not applied), applied (frame indices), n_not_applied, t_frame_us (n: H7 receive of each frame of the
+    range, unanswered ones interpolated, NaN outside), anchors, window stats; refuses (ok False, reason) as the
+    docstring says."""
     mosi = np.asarray(frames['mosi'], dtype=np.uint8)
     miso = np.asarray(frames['miso'], dtype=np.uint8)
     n = len(mosi)
-    if k_lo < 0 or k_hi > n - 4 or k_hi - k_lo < 10:
+    if k_lo < 0 or k_hi > n - LAG_MAX or k_hi - k_lo < 10:
         return dict(ok=False, reason=f'frames {k_lo}..{k_hi} not all inside the frame log (n = {n}) with answers')
     a, b = k_lo, k_hi
-    crc = np.array([crc16(mosi[k]) for k in range(a, b + 4)])
+    crc = np.array([crc16(mosi[k]) for k in range(a, b)])
+    seq = mosi[a:b, MOSI_SEQ].astype(int)
     u16 = lambda m, o: int(m[o]) | (int(m[o + 1]) << 8)  # noqa: E731
-    ans = {}
-    for j in range(a + 1, b + 4):
+    raw_ans = []                                                       # (candidates, payload)
+    for j in range(a + 1, b + LAG_MAX):
         m = miso[j]
         if not m.any() or u16(m, MISO_CRC) != crc16(bytes(m[:MISO_CRC]) + bytes(m[MISO_CRC + 2:])):
             continue
-        mc = u16(m, MISO_MOSI_CRC)
-        for lag in (2, 1, 3, 4):                                      # the H7 answers frame N in N + 2 first
-            k = j - lag
-            if a <= k < b and crc[k - a] == mc:
-                cyc = int(m[MISO_RX_CYC]) | (int(m[MISO_RX_CYC + 1]) << 8) | (int(m[MISO_RX_CYC + 2]) << 16) | \
-                    (int(m[MISO_RX_CYC + 3]) << 24)
-                # status without the SWA bit: a repeated answer carries the same stage
-                ans.setdefault(k, []).append((cyc, u16(m, MISO_AGE), u16(m, MISO_RX_NF), int(m[MISO_STATUS]) >> 1))
-                break
+        mc, ms = u16(m, MISO_MOSI_CRC), int(m[MISO_SEQ])
+        cands = [k for k in range(max(a, j - LAG_MAX), min(b, j)) if crc[k - a] == mc and seq[k - a] == ms]
+        if not cands:
+            continue
+        cyc = int(m[MISO_RX_CYC]) | (int(m[MISO_RX_CYC + 1]) << 8) | (int(m[MISO_RX_CYC + 2]) << 16) | \
+            (int(m[MISO_RX_CYC + 3]) << 24)
+        # status without the SWA bit: a repeated answer carries the same stage
+        raw_ans.append((cands, (cyc, u16(m, MISO_AGE), u16(m, MISO_RX_NF), int(m[MISO_STATUS]) >> 1)))
+    offs = {(p[2] - c[0]) % 65536 for c, p in raw_ans if len(c) == 1}
+    if len(offs) != 1:
+        return dict(ok=False, reason=f'H7 frame count minus frame index not one offset over the answers with one '
+                                     f'candidate ({sorted(offs)[:4]}): a frame did not reach the H7, or which frame an '
+                                     'answer belongs to is not known')
+    off = offs.pop()
+    ans = {}
+    for c, p in raw_ans:
+        fit = [k for k in c if (p[2] - k) % 65536 == off]
+        if len(fit) != 1:
+            return dict(ok=False, reason=f'an answer (RX_NF {p[2]}) fits none of its candidate frames {c[:4]}: which '
+                                         'frame it belongs to is not known (Codex RS4-R6-1)')
+        ans.setdefault(fit[0], []).append(p)
     bad = [k for k in range(a, b) if len(set(ans.get(k, ()))) > 1]
     if bad:
         return dict(ok=False, reason=f'frame {bad[0]} answered with different H7 receive / apply values; H7 apply '
@@ -702,7 +721,7 @@ def map_edge(duty, k_run: int, esp: dict, period_s: float, frames=None) -> dict:
     d_use = d_move + FIT_S * 1e6
     k_lo = int(max(0, k_run + SEARCH[0] - 20))
     t_need = d_use / (1 - RHO_MAX_PPM * 1e-6) + J_READ_US + COARSE_US + 5000.0       # us after the search end
-    k_hi = int(min(n - 4, k_run + SEARCH[1] + t_need / period_us + 20))
+    k_hi = int(min(n - LAG_MAX, k_run + SEARCH[1] + t_need / period_us + 20))
     ap = h7_apply(frames, k_lo, k_hi)
     out['h7_apply'] = {k: (v if k != 'applied' else len(v)) for k, v in ap.items()
                        if k not in ('apply_us', 'width_us', 't_frame_us', 'anchor_k', 'anchor_us')}

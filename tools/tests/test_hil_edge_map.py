@@ -67,7 +67,7 @@ def wheel_omega(n, k_move, kind='ramp'):
     return np.clip(om, -39.99, 39.99)
 
 
-def make_miso(mosi, duty, tm, skip=(), lost=(), twice=(), over=(), sat=(), v4=False, crc_bad=()):
+def make_miso(mosi, duty, tm, skip=(), lost=(), twice=(), over=(), sat=(), v4=False, crc_bad=(), stage_lag=None):
     """MISO v5 of each transfer j as the H7 sends it (hil_protocol.h offsets, Codex RS4-R5-3 (a)): the reply of the
     latest frame f <= j - 2 whose reply reached the DMA, with the duty of its first transfer in bytes 0-7; with no
     newer reply the DMA sends the same bytes again (spi1_handler.c _tx). tm: rx (H7 us of the receive, integer),
@@ -75,7 +75,9 @@ def make_miso(mosi, duty, tm, skip=(), lost=(), twice=(), over=(), sat=(), v4=Fa
     applied (no reply, RX_NF counts them, no reply count), in `lost` never reached the H7 (no reply, not counted);
     frames in `over` were applied but their reply was replaced before the DMA took it (no reply, reply count
     steps); for frames in `twice` the next transfer repeats the reply with another window; frames in `sat` get a
-    saturated window; v4: no v5 mark; transfers in `crc_bad` arrive with a bad MISO CRC."""
+    saturated window; v4: no v5 mark; transfers in `crc_bad` arrive with a bad MISO CRC; stage_lag {k: L}: the
+    reply of frame k reaches the DMA for transfer k + L (default 2; L 3, 4 when the main loop stages late, Codex
+    RS4-R6-3)."""
     n = len(mosi)
     rx, pre, win = tm['rx'], tm['pre'], tm['win']
     skip, lost, over, twice, sat, crc_bad = (set(x) for x in (skip, lost, over, twice, sat, crc_bad))
@@ -104,11 +106,15 @@ def make_miso(mosi, duty, tm, skip=(), lost=(), twice=(), over=(), sat=(), v4=Fa
         return np.frombuffer(bytes(b), dtype=np.uint8)
 
     miso = np.zeros((n, 40), dtype=np.uint8)
+    send_at = {}                                                   # transfer -> frame whose reply goes out first
+    for k in range(n):
+        if k not in skip and k not in lost and k not in over:
+            send_at[k + (stage_lag or {}).get(k, 2)] = k
     cur = None                                                     # bytes the DMA sends while no newer reply
     for j in range(2, n):
         k = j - 2
-        if k not in skip and k not in lost and k not in over:
-            cur = reply(k, j)
+        if j in send_at:
+            cur = reply(send_at[j], j)
         if cur is not None:
             miso[j] = cur
         if k - 1 in twice and k - 1 not in skip | lost | over:
@@ -120,7 +126,7 @@ def make_miso(mosi, duty, tm, skip=(), lost=(), twice=(), over=(), sat=(), v4=Fa
 
 def sim(edge_ms=415.3, k_run=400, n=5200, kind='ramp', move_after_ms=3.0, ppm=30.0,
         late=(3, 7, 40, 41, 90, 133), write_ms=0.4, glitch_every=97, n_before=6, seed=1, pwm_period=None,
-        burst=None, stale_ms=0.0, skip=(), dup=(), win_max=80.0, dts=()):
+        burst=None, stale_ms=0.0, skip=(), dup=(), win_max=80.0, dts=(), stage_lag=None, crc_twin=()):
     """dict(duty, esp, frames, k_true, timing) of a made-up run with the edge tick at H7 time edge_ms."""
     rng = np.random.default_rng(seed)
     dt = np.full(n, 1000.0)
@@ -175,13 +181,24 @@ def sim(edge_ms=415.3, k_run=400, n=5200, kind='ramp', move_after_ms=3.0, ppm=30
     esp = dict(timestamp_us=ts.astype(np.int64), log_seq=np.arange(100, 100 + len(ts), dtype=np.int64),
                motor_on=run.copy(), run_active=run.copy(), counts=cnt.astype(float), pwm=pw, fw=list(FW),
                esp_pi_ppm=ppm)
-    tm = dict(T=T, rx=rx, pre=pre, win=win, om=om, skip=skip)
+    tm = dict(T=T, rx=rx, pre=pre, win=win, om=om, skip=skip, stage_lag=stage_lag)
+    for k in crc_twin:                     # Codex RS4-R6-1: frame k + 2 (not applied) with frame k's speeds and CRC
+        mosi[k + 2, 0:8] = mosi[k, 0:8]
+        want = M.crc16(bytes(mosi[k]))
+        for v in range(65536):
+            mosi[k + 2, 31], mosi[k + 2, 32] = v >> 8, v & 0xFF
+            if M.crc16(bytes(mosi[k + 2])) == want:
+                break
+        assert M.crc16(bytes(mosi[k + 2])) == want and mosi[k + 2, 21] != mosi[k, 21]
+    miso = make_miso(mosi, duty, tm, skip=skip, stage_lag=stage_lag)
     frames = dict(t_send_ns=np.round((T + 7.0e9) * 1000.0).astype(np.int64),
                   t_pulse0_ns=np.round((T - 60.0 + 7.0e9) * 1000.0).astype(np.int64),
-                  mosi=mosi, miso=make_miso(mosi, duty, tm, skip=skip))
+                  mosi=mosi, miso=miso)
+    duty_cap = duty                        # duty at the H7 capture; the mapper gets the duty on the wire (R6-3)
+    duty = miso[:, 0:8].copy().view('>i2').reshape(n, 4).astype(float) / 32767.0
     # truth: plant step = H7 receive of EVERY frame, applied or not (Codex RS4-R5-1, R5-3)
-    return dict(duty=duty, esp=esp, frames=frames, k_true=float(np.interp(t_e, rx, np.arange(n, dtype=float))),
-                timing=tm)
+    return dict(duty=duty, duty_cap=duty_cap, esp=esp, frames=frames,
+                k_true=float(np.interp(t_e, rx, np.arange(n, dtype=float))), timing=tm)
 
 
 def run(s, k_run=400, **over):
@@ -383,7 +400,7 @@ def test_refusals_firmware_clock_frames():
     tm, mo = s['timing'], s['frames']['mosi']
 
     def refused(word, **kw):
-        fr = dict(s['frames'], miso=make_miso(mo, s['duty'], tm, **kw))
+        fr = dict(s['frames'], miso=make_miso(mo, s['duty_cap'], tm, **kw))
         em = M.map_edge(s['duty'], 400, s['esp'], 1e-3, fr)
         assert not em['ok'] and word in em['reason'], em['reason']
     refused('did not reach the H7', lost=(700,))                         # a frame that never reached the H7
@@ -391,7 +408,7 @@ def test_refusals_firmware_clock_frames():
     refused('lost its reply', over=(700,))                              # Codex RS4-R4-2: applied, reply replaced
     refused('saturated', sat=(700,))                                    # apply window not bounded
     refused('before L100', v4=True)                                     # H7 firmware with MISO v4
-    fr = dict(s['frames'], miso=make_miso(mo, s['duty'], tm, over=(4900,)))
+    fr = dict(s['frames'], miso=make_miso(mo, s['duty_cap'], tm, over=(4900,)))
     assert M.map_edge(s['duty'], 400, s['esp'], 1e-3, fr)['ok']          # a lost reply outside the used frames
 
 
@@ -411,6 +428,22 @@ def test_delay_then_catch_up_across_skipped_frames():
 
 
 @needs_gcc
+def test_late_replies_and_crc_twins_keep_the_frame_identity():
+    # Codex RS4-R6-1: the H7 applies every third frame, its reply first goes out at lag 4 and repeats; around the
+    # edge frame k + 2 (not applied) has frame k's speeds and the same MOSI CRC (two IMU bytes chosen), only its
+    # seq differs. The answers must still land on k (CRC + seq + one RX_NF offset), so the bracket holds the edge.
+    lo, hi = 280, 3900
+    skip = tuple(k for k in range(lo, hi) if k % 3)
+    lag = {k: 4 for k in range(lo, hi) if k % 3 == 0}
+    s = sim(skip=skip, stage_lag=lag, crc_twin=(408, 411, 414, 417, 420), seed=9)
+    em = run(s)
+    assert (not em['ok']) or (em['early_step'] <= s['k_true'] <= em['late_step']), (em, s['k_true'])
+    ap = M.h7_apply(s['frames'], 300, 3800)
+    assert ap['ok'], ap['reason']
+    assert all(k % 3 == 0 for k in ap['applied'])                   # no answer moved to a twin k + 2
+
+
+@needs_gcc
 def test_small_gap_at_the_edge_widens_the_bracket():
     # Codex RS4-R5-1: three skipped frames right at the edge: the step bracket spans the gap's anchors
     s = sim(skip=(414, 415, 416))
@@ -426,7 +459,7 @@ def test_lost_replies_refused_including_a_full_reply_count_wrap():
     s = sim()
     tm, mo = s['timing'], s['frames']['mosi']
     for bad, word in ((range(702, 705), 'lost its reply'), (range(702, 766), 'more than 64 apart')):
-        fr = dict(s['frames'], miso=make_miso(mo, s['duty'], tm, crc_bad=tuple(bad)))
+        fr = dict(s['frames'], miso=make_miso(mo, s['duty_cap'], tm, crc_bad=tuple(bad)))
         em = M.map_edge(s['duty'], 400, s['esp'], 1e-3, fr)
         assert not em['ok'] and word in em['reason'], em['reason']
 
@@ -598,7 +631,7 @@ def write_frame_log(path, task, k_run, s):
         on = k >= k_run + 3
         mosi[k] = np.frombuffer(P.encode_state(st, traj_ref=(0.3, 0.0, 0.1) if on else None,
                                                traj_flags=P.TRAJ_VALID if on else 0, seq=k), dtype=np.uint8)
-    miso = make_miso(mosi, s['duty'], tm, skip=tm['skip'])
+    miso = make_miso(mosi, s['duty_cap'], tm, skip=tm['skip'], stage_lag=tm['stage_lag'])
     manifest = dict(period_us=1000, steps=n, plant='MecanumPlant', miso_check=dict(crc_bad=0, empty=0),
                     lifecycle=dict(outcome='completed', transitions=[dict(step=0, t=0, phase='ARM'),
                                                                      dict(step=k_run, t=0.4, phase='RUN')]))
