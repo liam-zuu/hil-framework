@@ -28,6 +28,10 @@ Commands (the operator types them while working; every time stamp is the PC cloc
                                          conditions; no 'dat' while the gate is not complete (HIL run
                                          without the run_active edge mapping, RS-4)
                                          (12/11, tune stop gate v3; 13/11 v3.2; the logs need "migrate")
+                                         S05 v3.15 (14/11): a HIL run whose edge mapping was refused (or
+                                         scored without --esp-log: gate decide g1,g2) is a lost run,
+                                         --outcome hong_he_do --fail-cause anh_xa_tu_choi; at most 3 reruns
+                                         of one gain at one level, then that level is chua_ket_luan
   cancel / status                        drop the open run / show it. cancel only before the "run"
                                          step (S05 §3.3: every started run counts, EA-6); time of the
                                          steps already logged goes to m7_dev_effort_log.csv
@@ -112,6 +116,15 @@ STOP_REASONS = ('khoi_xac_nhan_dat', 'cham_tran_gio', 'cham_tran_xe', 'het_ung_v
 STOP_CAUSES = ('cham_tran_gio', 'cham_tran_xe', 'het_ung_vien', 's04_dung', 'khong_du_luot_xac_nhan')  # v3.7 §4.1
 FINAL_N = 5                              # S05 §4.6: 5 valid runs per condition
 FINAL_LOST_N = 3                         # S05 §4.6: stop a condition after 3 lost runs in a row
+# S05 v3.15 §4.5 step 2, O1 v11.12 §3.4 (Q1 (a), Liam 14/11 at THESIS local_701fb2e3; CODE may change the tools:
+# Liam 14/11 CODE local_9951f4b7 "duyệt luật S05 v3.15 nhé"): a HIL run whose run_active edge could not be mapped
+# to a plant step (hil_edge_map refused, or no --esp-log; the scorer then lets only G1, G2 decide) is lost to the
+# measurement: run the same gain again, not counted in the candidate limit, at most MAP_RERUNS_MAX reruns for one
+# gain at one level; past that the level is chua_ket_luan (counted as not passed), the reason logged.
+# [CÁCH HIỂU] "at most 3 reruns" = the level stops at the 4th refused run (1 + 3 reruns), all refused runs of the
+# level counted, in a row or not; final_hil keeps its own rule (§4.6, FINAL_LOST_N lost runs in a row).
+MAP_REFUSED = 'anh_xa_tu_choi'           # --fail-cause of such a run
+MAP_RERUNS_MAX = 3
 
 CAMPAIGNS = ('A-PID', 'A-LADRC', 'B-PID', 'B-LADRC', 'B-chung', 'RQ2-INIT-PID', 'RQ2-INIT-LADRC', 'RQ2')
 TUNED = ('A-PID', 'A-LADRC', 'B-PID', 'B-LADRC')
@@ -314,6 +327,9 @@ def begin(ds: str, session: str, campaign: str, platform: str, controller: str, 
             if k not in TUNING_COLS:
                 raise LogError(f'unknown field {k}')
             row[k] = str(v)
+    if _map_counted(row) and map_stopped(map_refusals(read_rows(os.path.join(ds, TUNING))).get(map_key(row), 0)):
+        raise LogError(f'{task}@{speed} of {gain_set or "this gain"}: stopped after {MAP_RERUNS_MAX} reruns for a '
+                       'refused mapping (S05 v3.15 4.5 step 2): the level is chua_ket_luan, no further run')
     run = {'row': row, 'segments': [], 'current': None, 'paused_from': None}
     _save_open(ds, run)
     return run
@@ -517,21 +533,32 @@ def gate_from_row(row: dict) -> dict:
     return g
 
 
-def outcome_vs_gate(outcome: str, ev: dict, decide) -> Optional[str]:
-    """None when `outcome` agrees with the recomputed gate outcomes `ev`, else why not.
-    hong_he_do is decided outside the gate (O1 3.5). complete gate: the outcome equals outcome_decide.
-    Gate not complete (HIL run without the run_active edge mapping: G3, G5 report only): no run is 'dat'
-    (GV3-1); a certain fail of a deciding condition makes it khong_dat, an inconclusive one rules out dat
-    (GV3-2)."""
+def map_refused(decide) -> bool:
+    """The gate of a HIL run whose run_active edge was not mapped (only G1, G2 decide, O1 v11.12 §3.4)."""
+    return set(decide) == set(o1_gate.DECIDE_HIL)
+
+
+def outcome_vs_gate(outcome: str, ev: dict, decide, fail_cause: str = '') -> Optional[str]:
+    """None when `outcome` (and its fail cause) agrees with the recomputed gate outcomes `ev`, else why not.
+    Gate with all five deciding: hong_he_do is decided outside the gate (O1 3.5) but not for a refused
+    mapping (the mapping was made); any other outcome equals outcome_decide.
+    Gate of a HIL run without the run_active edge mapping (G1, G2 decide, G3, G5 report only): S05 v3.15
+    §4.5 step 2 (replaces GV3-1, GV3-2 of 12/11, under which such a run could be khong_dat or chua_ket_luan
+    by G1, G2): the run is lost to the measurement, hong_he_do with fail cause MAP_REFUSED; no run is dat."""
+    od = ev['outcome_decide']
+    if map_refused(decide):
+        if outcome == 'hong_he_do' and fail_cause == MAP_REFUSED:
+            return None
+        return (f'run_active edge not mapped (gate decides {",".join(decide)} only): a lost run, outcome '
+                f'hong_he_do with fail cause {MAP_REFUSED} (S05 v3.15 4.5 step 2); no run is dat')
+    if fail_cause == MAP_REFUSED:
+        return f'fail cause {MAP_REFUSED} but the gate has the mapping (all five decide)'
     if outcome == 'hong_he_do':
         return None
-    od = ev['outcome_decide']
     if ev['complete']:
         return None if outcome == od else f'gate outcome {od}'
-    if outcome == 'dat':
-        return 'the gate is not complete (conditions report only): no run is dat'
-    ok = {'khong_dat': outcome == 'khong_dat', 'chua_ket_luan': outcome in ('khong_dat', 'chua_ket_luan')}.get(od, True)
-    return None if ok else f'deciding conditions {",".join(decide)}: {od}'
+    # not reached: decide is DECIDE_ALL (complete) or DECIDE_HIL (o1_gate.DECIDE_SETS), kept as a guard
+    return f'the gate is not complete (decides {",".join(decide)}): no run is dat'
 
 
 def check_gate_rows(tun: List[dict]) -> None:
@@ -547,7 +574,7 @@ def check_gate_rows(tun: List[dict]) -> None:
             ev = _recompute(g, r.get('platform'))
         except LogError as exc:
             raise LogError(f"{r.get('run_uid')}: {exc}")
-        why = outcome_vs_gate(r.get('run_outcome', ''), ev, g['decide'])
+        why = outcome_vs_gate(r.get('run_outcome', ''), ev, g['decide'], r.get('fail_cause', ''))
         if why:
             raise LogError(f"{r.get('run_uid')}: run_outcome {r.get('run_outcome')!r} disagrees with its gate "
                            f"({r.get('gate_version')}: {why})")
@@ -569,12 +596,41 @@ def gate_columns(gate: dict, gate_sha256: str = '') -> dict:
     return out
 
 
-def check_outcome_vs_gate(outcome: str, gate: dict, platform: Optional[str] = None) -> None:
+def check_outcome_vs_gate(outcome: str, gate: dict, platform: Optional[str] = None, fail_cause: str = '') -> None:
     """The run outcome typed by the operator against the gate, validated and recomputed first (GV3-5)."""
     ev = validate_gate(gate, platform)
-    why = outcome_vs_gate(outcome, ev, gate['decide'])
+    why = outcome_vs_gate(outcome, ev, gate['decide'], fail_cause)
     if why:
         raise LogError(f'--outcome {outcome} disagrees with the gate ({why}); check the scoring')
+
+
+def map_key(r: dict) -> tuple:
+    """One gain at one level (S05 v3.15 4.5 step 2): the condition of a replacement (_SAME_CONDITION) and the
+    gain values, so runs of the same gain set id with other gains are not mixed."""
+    return tuple(r.get(k, '') for k in _SAME_CONDITION) + tuple(r.get('g_' + g, '') for g in GAINS)
+
+
+def _map_counted(r: dict) -> bool:
+    return r.get('platform') == 'HIL' and r.get('stage') != 'final_hil'      # final_hil: S05 4.6 (FINAL_LOST_N)
+
+
+def map_refusals(tun: List[dict]) -> Dict[tuple, int]:
+    """S05 v3.15 4.5 step 2: refused-mapping runs per gain and level (map_key), HIL stages but final_hil.
+    The level stops at 1 + MAP_RERUNS_MAX refused runs; a run of it after that is an error (LogError)."""
+    n = defaultdict(int)
+    for r in sorted((r for r in tun if _map_counted(r)), key=lambda r: r.get('wall_start', '')):
+        k = map_key(r)
+        if n[k] > MAP_RERUNS_MAX:
+            raise LogError(f"{r.get('run_uid')}: {r.get('trajectory')}@{r.get('speed_mps')} of "
+                           f"{r.get('gain_set_id') or 'this gain'} stopped after {MAP_RERUNS_MAX} reruns for a refused "
+                           f"mapping (S05 v3.15 4.5 step 2: the level is chua_ket_luan), no run after that")
+        if r.get('fail_cause') == MAP_REFUSED:
+            n[k] += 1
+    return dict(n)
+
+
+def map_stopped(n_refused: int) -> bool:
+    return n_refused > MAP_RERUNS_MAX
 
 
 def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Optional[float] = None,
@@ -583,12 +639,21 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
     run = _require_open(ds)
     if outcome not in OUTCOMES:
         raise LogError(f'--outcome one of {OUTCOMES}')
+    if fail_cause == MAP_REFUSED and (gate is None or run['row'].get('platform') != 'HIL'):
+        raise LogError(f'--fail-cause {MAP_REFUSED}: a HIL run with its scorer output (--gate-json) showing the '
+                       'refused mapping (S05 v3.15 4.5 step 2)')
     if gate is not None:
         if not results_dir:
             raise LogError('--gate-json needs --results-dir (the run must be scorable again, GV3-6)')
-        check_outcome_vs_gate(outcome, gate, run['row'].get('platform'))
+        check_outcome_vs_gate(outcome, gate, run['row'].get('platform'), fail_cause)
     if outcome == 'hong_he_do' and not fail_cause:
         raise LogError('hong_he_do needs --fail-cause (S05 §6.1)')
+    if _map_counted(run['row']):
+        n = map_refusals(read_rows(os.path.join(ds, TUNING))).get(map_key(run['row']), 0)
+        if map_stopped(n):
+            raise LogError(f'this gain at this level stopped after {MAP_RERUNS_MAX} reruns for a refused mapping '
+                           '(S05 v3.15 4.5 step 2) while the run was open (begin checks it): the logs changed '
+                           'since begin; the run is not logged')
     if run.get('paused_from') is not None:
         raise LogError('paused: "resume" first (or the pause is lost time of the next segment)')
     t = now()
@@ -919,6 +984,9 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
         runs in a row (§4.6). Errors (LogError): a bad replacement (EA-8), more than FINAL_N valid
         runs, a run after the stop, a final_hil row not account RQ2, a final car run with another gain
         set than the frozen one, a figure-8 task whose name and speed disagree (EA-9);
+      * refused mappings (S05 v3.15 4.5 step 2): hil_map_refused_n, hil_map_stopped (gain set task@speed
+        (stage) of each level stopped after MAP_RERUNS_MAX reruns, chua_ket_luan) on the row of a campaign
+        that has any; a run of a stopped level is an error;
       * gate_result: gate_result() over the final runs of the gate levels (`gate`, read from the
         locked gate file by read_gate); empty without `gate` or without any final run."""
     tun = [r for r in read_rows(os.path.join(ds, TUNING)) if not r.get('session_id', '').startswith(SKIP_PREFIX)]
@@ -950,6 +1018,15 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
     _check_replacements(tun)
     check_gate_rows(tun)                            # GV3-1, GV3-R2-1: gate rows recomputed from q, lo, hi
     stopped = _final_stops(tun)
+    map_n = map_refusals(tun)                       # S05 v3.15 4.5 step 2: refused mappings, levels stopped
+    map_rep = defaultdict(lambda: {'n': 0, 'stopped': []})
+    for k, n in map_n.items():
+        if not n:
+            continue
+        rep = map_rep[k[0]]                         # k[0]: campaign (_SAME_CONDITION order)
+        rep['n'] += n
+        if map_stopped(n):
+            rep['stopped'].append(f'{k[5] or "-"} {k[3]}@{k[4]} ({k[2]})')   # gain set, task@speed (stage)
 
     def add(target, key, val, share=1.0):
         acc[target][key] += val * share
@@ -1145,6 +1222,9 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
                'explore_N_SIM': str(int(round(a.get('X_N_SIM', 0)))), 'explore_N_HIL': str(int(a.get('X_N_HIL', 0))),
                'explore_N_HW': str(int(a.get('X_N_HW', 0)))}
         row.update({k: str(v) for k, v in sorted(finals.get(c, {}).items())})
+        if c in map_rep:                            # extra columns, only for a campaign with refused mappings
+            row['hil_map_refused_n'] = str(map_rep[c]['n'])
+            row['hil_map_stopped'] = '; '.join(sorted(map_rep[c]['stopped']))
         out.append(row)
     if unassigned:
         print(f'note: {unassigned} tuning row(s) without campaign left out', file=sys.stderr)
@@ -1331,6 +1411,11 @@ def main(argv=None) -> int:
                       gate=read_gate_json(a.gate_json) if a.gate_json else None,
                       gate_sha256=sha256_file(a.gate_json) if a.gate_json else '')
             print('row', row['run_uid'], {k: row[f't_{k}_s'] for k in STEPS}, 'wait', row['t_operator_wait_s'])
+            if row.get('fail_cause') == MAP_REFUSED:
+                n = map_refusals(read_rows(os.path.join(ds, TUNING))).get(map_key(row), 0)
+                print(f'anh xa bi tu choi lan {n}: ' + (f'qua {MAP_RERUNS_MAX} lan chay lai, muc nay chua ket luan '
+                      '(tinh nhu khong dat), ly do ghi o hil_map_stopped cua summary' if map_stopped(n) else
+                      f'chay lai cung gain (con {MAP_RERUNS_MAX + 1 - n} lan), khong dem vao gioi han ung vien'))
         elif a.cmd == 'machine':
             row = machine(ds, a.campaign, a.controller, a.script_run_id, a.results_dir, a.n_sim_evals, a.t_machine_s,
                           a.wall_start, a.wall_end, a.platform, a.stage, notes=a.notes,

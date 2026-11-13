@@ -123,7 +123,7 @@ def test_gate_columns_written(ds):
 def test_hil_columns_without_mapping(ds):
     d, clock = ds
     _open(d, clock, 'HIL')
-    rl.end(d, 'chua_ket_luan', gate=_gate(decide=G.DECIDE_HIL, u_t=None), results_dir='r')
+    rl.end(d, 'hong_he_do', fail_cause=rl.MAP_REFUSED, gate=_gate(decide=G.DECIDE_HIL, u_t=None), results_dir='r')
     r = _rows(d)[-1]
     assert r['gate_u_t'] == '' and r['g3_lo'] == r['g3_hi'] == '' and r['g3_n_undef'] == '20'
     assert float(r['g3_q']) == pytest.approx(0.03) and r['g3_state'] == 'chua_ket_luan'
@@ -150,30 +150,85 @@ def test_outcome_against_the_gate(ds):
     _open(d, clock)
     rl.end(d, 'chua_ket_luan', gate=_gate(completed='inconclusive'), results_dir='r')
     _open(d, clock, 'HIL')
-    with pytest.raises(rl.LogError, match='not complete'):                 # GV3-1: HIL without RS-4 mapping
-        rl.end(d, 'dat', gate=_gate(decide=G.DECIDE_HIL, u_t=None), results_dir='r')
-    with pytest.raises(rl.LogError, match='disagrees'):                    # GV3-2: G2 certain fail decides on HIL
-        rl.end(d, 'chua_ket_luan', gate=_gate(decide=G.DECIDE_HIL, u_t=None, e_perp=0.2), results_dir='r')
-    rl.end(d, 'chua_ket_luan', gate=_gate(decide=G.DECIDE_HIL, u_t=None, e_bao=0.2), results_dir='r')  # G4 reports only
+    unmapped = _gate(decide=G.DECIDE_HIL, u_t=None)
+    # S05 v3.15 4.5 step 2 (replaces GV3-1, GV3-2): HIL without the RS-4 mapping is a lost run, whatever G1, G2 say
+    for outcome, gate in (('dat', unmapped), ('chua_ket_luan', unmapped), ('khong_dat', unmapped),
+                          ('khong_dat', _gate(decide=G.DECIDE_HIL, u_t=None, e_perp=0.2))):   # G2 certain fail too
+        with pytest.raises(rl.LogError, match='not mapped'):
+            rl.end(d, outcome, gate=gate, results_dir='r')
+    with pytest.raises(rl.LogError, match='not mapped'):                   # another fail cause
+        rl.end(d, 'hong_he_do', fail_cause='mat_khung', gate=unmapped, results_dir='r')
+    rl.end(d, 'hong_he_do', fail_cause=rl.MAP_REFUSED, gate=_gate(decide=G.DECIDE_HIL, u_t=None, e_bao=0.2),
+           results_dir='r')
     _open(d, clock, 'HIL')
-    rl.end(d, 'chua_ket_luan', gate=_gate(decide=G.DECIDE_HIL, u_t=None, e_trk=0.5), results_dir='r')
-    _open(d, clock, 'HIL')
+    with pytest.raises(rl.LogError, match='has the mapping'):              # mapped gate, cause says refused
+        rl.end(d, 'hong_he_do', fail_cause=rl.MAP_REFUSED, gate=_gate(u_t=0.0015), results_dir='r')
+    with pytest.raises(rl.LogError, match='gate-json'):                    # refused needs the scorer output
+        rl.end(d, 'hong_he_do', fail_cause=rl.MAP_REFUSED, results_dir='r')
     rl.end(d, 'dat', gate=_gate(u_t=0.0015), results_dir='r')             # HIL with the mapping: all five
     _open(d, clock)
+    with pytest.raises(rl.LogError, match='gate-json'):                    # not a HIL run
+        rl.end(d, 'hong_he_do', fail_cause=rl.MAP_REFUSED, gate=_gate(e_trk=0.12), results_dir='r')
     rl.end(d, 'hong_he_do', fail_cause='mat_khung', gate=_gate(e_trk=0.12), results_dir='r')
-    assert [r['run_outcome'] for r in _rows(d)] == ['dat', 'chua_ket_luan', 'chua_ket_luan', 'chua_ket_luan', 'dat',
-                                                    'hong_he_do']
+    assert [r['run_outcome'] for r in _rows(d)] == ['dat', 'chua_ket_luan', 'hong_he_do', 'dat', 'hong_he_do']
     rl.summary(d)                                                          # the rows written by end pass
+
+
+def _hil_check(d, clock, gain_set='B-PID/GA1', task='O1-F05', speed='0.5', stage='hil_check', campaign='B-PID',
+               mapped=False):
+    rl.begin(d, 'H', campaign, 'HIL', 'PID', task, speed, stage, gain_set=gain_set)
+    rl.step(d, 'run')
+    clock[0] += dt.timedelta(seconds=60)
+    if mapped:
+        return rl.end(d, 'dat', gate=_gate(u_t=0.0015), results_dir='r')
+    return rl.end(d, 'hong_he_do', fail_cause=rl.MAP_REFUSED, gate=_gate(decide=G.DECIDE_HIL, u_t=None),
+                  results_dir='r')
+
+
+def test_refused_mapping_reruns_capped(ds):
+    # S05 v3.15 4.5 step 2 (Q1 (a), Liam 14/11): at most 3 reruns of one gain at one level, then chua_ket_luan
+    d, clock = ds
+    for _ in range(rl.MAP_RERUNS_MAX):
+        _hil_check(d, clock)
+    _hil_check(d, clock, gain_set='B-PID/GA2')                             # another gain: its own count
+    _hil_check(d, clock, task='O1-F08', speed='0.8')                       # another level: its own count
+    s = {r['campaign']: r for r in rl.summary(d)}['B-PID']
+    assert s['hil_map_refused_n'] == '5' and s['hil_map_stopped'] == ''
+    _hil_check(d, clock)                                                   # 4th refused = 3 reruns used up
+    s = {r['campaign']: r for r in rl.summary(d)}['B-PID']
+    assert s['hil_map_refused_n'] == '6' and s['hil_map_stopped'] == 'B-PID/GA1 O1-F05@0.5 (hil_check)'
+    assert s['N_HIL'] == '6'                                               # lost runs still count as HIL runs
+    with pytest.raises(rl.LogError, match='stopped after 3 reruns'):        # no fifth run of that level
+        rl.begin(d, 'H', 'B-PID', 'HIL', 'PID', 'O1-F05', '0.5', 'hil_check', gain_set='B-PID/GA1')
+    _hil_check(d, clock, gain_set='B-PID/GA2', mapped=True)                # a rerun that maps decides the level
+    assert 'hil_map_refused_n' not in {r['campaign']: r for r in rl.summary(d)}['A-PID']
+    rows = _rows(d)                                                        # a row written past the stop
+    rows.append(dict(rows[0], run_uid='H:99', iter_no='99', wall_start='2026-11-21T08:00:00'))
+    rl._write_all(os.path.join(d, rl.TUNING), rl.TUNING_COLS, rows)
+    with pytest.raises(rl.LogError, match='no run after that'):
+        rl.summary(d)
+
+
+def test_refused_mapping_cap_not_on_final_hil(ds):
+    # final_hil keeps S05 4.6 (FINAL_LOST_N lost runs in a row); refused runs there are still hong_he_do
+    d, clock = ds
+    for _ in range(rl.FINAL_LOST_N):
+        _hil_check(d, clock, stage='final_hil', campaign='RQ2', gain_set='RQ2-INIT-PID/G0')
+    assert rl.map_refusals(_rows(d)) == {}
+    with pytest.raises(rl.LogError, match='lost runs in a row'):
+        _hil_check(d, clock, stage='final_hil', campaign='RQ2', gain_set='RQ2-INIT-PID/G0')
+        rl.summary(d)
 
 
 def test_sc3_1_example_end_to_end(ds):
     # THESIS 13/11 (Codex TX-4): a frame (q, lo, hi) = (0.12, 0.11, +inf), D = 0.10, is khong_dat; the log
-    # keeps lo, so summary recomputes khong_dat, not chua_ket_luan
+    # keeps lo, so summary recomputes khong_dat, not chua_ket_luan (on a car run since S05 v3.15: an unmapped HIL
+    # run is hong_he_do whatever G2 says)
     d, clock = ds
-    g = _gate(decide=G.DECIDE_HIL, u_t=None)
+    g = _gate()
     g['g2'].update(q=0.12, lo=0.11, hi=0.06, n_undef=1, state='khong_dat')  # hi: max over the finite frames
     g.update(outcome='khong_dat', outcome_decide='khong_dat', any_certain_fail=True)
-    _open(d, clock, 'HIL')
+    _open(d, clock)
     rl.end(d, 'khong_dat', gate=g, results_dir='r')
     r = _rows(d)[-1]
     assert (r['g2_lo'], r['g2_n_undef'], r['g2_state']) == ('0.11', '1', 'khong_dat')

@@ -75,8 +75,9 @@ whole cell, so no fitting s is missed (RS4-R3-4). The kept cells must form ONE i
 the search ends (no alias). The edge tick is at H7 time in [s_lo, s_hi] (the apply windows are inside the
 tolerance), given as plant steps of [s_lo - E_ID_US, s_hi + E_ID_US] (h7_to_steps: interpolated between
 consecutive answered frames, the anchors across a gap; E_ID_US, RS4-R8-1): early_step, late_step, edge_step the middle; U_t = period x half the width in steps (the scorer's time scale, RS4-R3-5). The O1 schedule and the plant
-steps run on the Pi, so no drift to t_deadline enters on HIL. [ĐỀ XUẤT, not reviewed by THESIS: the spacing of
-the firmware ticks is not added; the edge tick itself is bracketed.]
+steps run on the Pi, so no drift to t_deadline enters on HIL. The spacing of the firmware ticks is not added;
+the edge tick itself is bracketed (O1 v11.12 3.5, Q2: THESIS 14/11, Liam "Chấp nhận" at THESIS local_701fb2e3;
+CODE may drop the label: Liam 14/11 CODE local_9951f4b7 "duyệt luật S05 v3.15 nhé").
 
 PWM side (cross-check only, not in the bracket). The pwm written in a tick (pwm_*) reaches the plant in the
 MISO duty of a later frame, never an earlier one. The fit of the pwm steps to the duty is a step function of
