@@ -137,3 +137,24 @@ def test_cli_writes_a_marker_csv_that_load_marks_reads(tmp_path):
     mm = re.search(r'--plumb (-?[0-9.]+),(-?[0-9.]+)', rep)
     assert mm and float(mm.group(1)) == pytest.approx(0.310, abs=5e-4) and float(mm.group(2)) == pytest.approx(0.120, abs=5e-4)
     assert mt.main(['--measured', str(m), '--design', design_csv(tmp_path), '--out', str(out)]) == 2   # no overwrite
+
+
+def test_default_four_references_with_measured_Y_and_X2():
+    refs_true = {'O': (0.0, 0.0), 'X': (1501.0, 0.0), 'Y': (6.0, 998.0), 'X2': (-1497.0, 4.0)}
+    rows = [{'id': 'X', 'd_O_mm_1': '1501', 'd_O_mm_2': '1501'},
+            row('Y', refs_true['Y'], refs={k: refs_true[k] for k in ('O', 'X')}),
+            row('X2', refs_true['X2'], refs={k: refs_true[k] for k in ('O', 'X', 'Y')})]
+    true = {'7': (1402, 6), '27': (3, -4), '1': (-1390, 905), '13': (-1945, 1452)}
+    rows += [row(k, v, refs=refs_true) for k, v in true.items()]
+    pts, lines, n_err, n_warn, _ = mt.process(rows, design_dict(), mt.DEFAULT_REFS)
+    P = by_id(pts)
+    assert n_err == 0 and n_warn == 0, lines
+    for k, (x, y) in true.items():
+        assert P[k]['x_mm'] == pytest.approx(x, abs=0.5) and P[k]['y_mm'] == pytest.approx(y, abs=0.5)
+        assert max(P[k]['sigma_x'], P[k]['sigma_y']) < 3
+    assert any(l.startswith('X2: do duoc') for l in lines) and any(l.startswith('Y: do duoc') for l in lines)
+
+
+def test_reference_rows_are_not_marks():
+    pts, lines, *_ = mt.process([row('Y', (0.0, 1000.0), refs=REFS)], design_dict(), mt.DEFAULT_REFS)
+    assert pts == []

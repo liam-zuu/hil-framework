@@ -3,13 +3,15 @@
 c7_marks_from_tape.py: L104 (Liam 14/11, CODE local_9951f4b7, "ok"; given to CODE_CAM 14/11, box
 "Giao L104 cho CODE_CAM (Recommended)"). The true centre of each ArUco floor mark is measured with a
 steel tape as distances to fixed reference points, O = (0, 0) and X = (150, 0) cm by default
-(guide 00_OVERVIEW/Setup_Guides/2026-11-10_Huong_dan_Dan_so8_va_moc_san.md section 4e). This script
+(guide 00_OVERVIEW/Setup_Guides/2026-11-10_Huong_dan_Dan_so8_va_moc_san.md section 4e), and since
+Liam 14/11 (CODE_CAM, "Them Y, X2 (Recommended)") also Y = (0, 100) and X2 = (-150, 0) cm. This script
 turns the distances into floor coordinates and writes the marker CSV that
 `c7_measure.py calib --markers` reads (id, vai_tro, x_cm, y_cm, canh_den_mm, dict).
 
 Input (template 00_OVERVIEW/Setup_Guides/2026-11-14_Mau_do_tam_moc.csv), one row per point:
-  id               1-33 (ArUco), or a name (day_doi = plumb point under the lens), or X (row whose
-                   d_O_mm_* is the O-X distance measured again; it replaces the design 1500 mm)
+  id               1-33 (ArUco), or a name (day_doi = plumb point under the lens), or a reference:
+                   X (its d_O is the O-X distance, replaces the design 1500 mm), Y (d_O, d_X: its true
+                   position), X2 (d_O, d_X, d_Y: its true position); not measured = design position
   d_<R>_mm_1, d_<R>_mm_2   distance from reference R to the centre, two readings (mm); R = O, X, and
                    any reference added with --ref (e.g. Y). Readings more than 2 mm apart: DO_LAI
   phia             tren / duoi (y > 0 / y < 0); used when there is no design position
@@ -49,6 +51,12 @@ import sys
 import numpy as np
 
 READ_TOL_MM = 2.0
+# Reference points (mm). L104 (Liam 14/11 CODE "ok"): O, X. Y and X2 added by Liam 14/11 in CODE_CAM,
+# box "Them Y, X2 (Recommended)": with O, X only, 14 of the 33 design positions had a 1-sigma error
+# above 3 mm for a 1 mm reading error (estimate), the marks on the x axis had no usable y; with
+# O, X, Y, X2 the largest is 2.5 mm, median 1.0 mm. Order matters: Y is located from O, X, then X2
+# (on the x axis) from O, X, Y.
+DEFAULT_REFS = {'O': (0.0, 0.0), 'X': (1500.0, 0.0), 'Y': (0.0, 1000.0), 'X2': (-1500.0, 0.0)}
 RES_TOL_MM = 2.0
 OUT_COLS = ['id', 'vai_tro', 'x_cm', 'y_cm', 'canh_den_mm', 'dict', 'lech_tk_mm', 'sigma_x_mm',
             'sigma_y_mm', 'canh_nguon', 'nguoi_do', 'ngay', 'ghi_chu']
@@ -135,11 +143,41 @@ def process(rows, design, refs, sigma_d=1.0, warn_dev=20.0, warn_sigma=3.0):
             else:
                 lines.append(f'O-X do lai {L:.1f} mm (thiet ke {refs["X"][0]:.0f} mm), dung so do')
                 refs['X'] = (L, 0.0)
+    # the other reference points (Y, X2, ...): true position from their distances to the references
+    # fixed before them (in order), started at the design position; kept at design when not measured
+    fixed = ['O', 'X']
+    for name in [n for n in refs if n not in ('O', 'X')]:
+        rr = [r for r in rows if r['id'].strip().upper() == name.upper()]
+        use, dist, bad = [], [], False
+        for n in fixed:
+            m, sp = readings(rr[0], n) if rr else (None, None)
+            if m is None:
+                continue
+            bad |= sp > READ_TOL_MM
+            use.append(refs[n])
+            dist.append(m)
+        if len(use) >= 2 and not bad:
+            p, res, J = solve(use, dist, refs[name])
+            sx, sy = sigma_xy(J, sigma_d)
+            ok = max(sx, sy) <= warn_sigma and (len(use) < 3 or float(np.sqrt(np.mean(res ** 2))) <= RES_TOL_MM)
+            if ok:
+                lines.append(f'{name}: do duoc ({p[0] / 10:.1f}, {p[1] / 10:.1f}) cm (thiet ke {refs[name][0] / 10:g}, '
+                             f'{refs[name][1] / 10:g}), sigma {max(sx, sy):.1f} mm')
+                refs[name] = (float(p[0]), float(p[1]))
+            else:
+                lines.append(f'{name}: so do khong dat (sigma {max(sx, sy):.1f} mm hoac du lon): giu vi tri thiet ke')
+                n_warn += 1
+        elif rr:
+            lines.append(f'{name}: {"DO_LAI" if bad else "thieu khoang cach"}: giu vi tri thiet ke')
+            n_err += bad
+            n_warn += not bad
+        fixed.append(name)
     names = list(refs)
+    ref_ids = {n.upper() for n in refs}
     points = []
     for row in rows:
         pid = row['id'].strip()
-        if not pid or pid.upper() == 'X':
+        if not pid or pid.upper() in ref_ids:
             continue
         flags = []
         use, dist = [], []
@@ -225,7 +263,7 @@ def main(argv=None):
     ap.add_argument('--warn-sigma', type=float, default=3.0)
     a = ap.parse_args(argv)
     try:
-        refs = {'O': (0.0, 0.0), 'X': (1500.0, 0.0)}
+        refs = dict(DEFAULT_REFS)
         for s in a.ref:
             n, xy = parse_ref(s)
             refs[n] = xy
