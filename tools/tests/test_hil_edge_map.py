@@ -506,6 +506,62 @@ def test_copied_frames_before_the_range_are_refused(every):
     assert not em['ok'] and 'RS4-R7-1' in em['reason'], em['reason']
 
 
+def _stale_reply(row, mosi_k, rx_us, rx_nf, stage, pre=400, dur4=5):
+    """MISO v5 bytes as the H7 sends them for a frame with the bytes mosi_k received at H7 time rx_us (duty bytes
+    of `row` kept)."""
+    b = bytearray(bytes(row))
+    b[10:12] = M.crc16(bytes(mosi_k)).to_bytes(2, 'little')
+    b[12:16] = (int(round((rx_us + 1e6) * M.H7_CYC_PER_US)) % 2 ** 32).to_bytes(4, 'little')
+    b[16] = M.STATUS_V5 | ((stage % M.STAGE_MOD) << 1) | 1
+    b[17] = mosi_k[M.MOSI_SEQ]
+    b[18:20] = (rx_nf & 0xFFFF).to_bytes(2, 'little')
+    b[20:22] = (pre | (dur4 << M.APPLY_DUR_SHIFT)).to_bytes(2, 'little')
+    b[8:10] = M.crc16(bytes(b[:8]) + bytes(b[10:])).to_bytes(2, 'little')
+    return np.frombuffer(bytes(b), dtype=np.uint8)
+
+
+@needs_gcc
+def test_reply_staged_before_the_range_is_refused():
+    # Codex RS4-R8-1: frames 280-282 (the start of map_edge's range, k_run 400) never reach the H7; the H7 still
+    # holds a reply of an older frame with the same 40 bytes as frame 282 (idle frames differ only in seq) and
+    # sends it at transfers 283, 284, with RX_NF and stage one below frame 283's. Every MOSI keeps seq = k & 0xFF,
+    # the answer has one candidate (282) and one RX_NF offset: only its receive time, 4 ms before frame 283's,
+    # shows it is not frame 282's.
+    s = sim()
+    tm, mo = s['timing'], s['frames']['mosi']
+    lost = (280, 281, 282)
+    miso = make_miso(mo, s['duty_cap'], tm, lost=lost).copy()
+    nf283 = int(miso[285, 18]) | (int(miso[285, 19]) << 8)            # reply of frame 283 goes out at transfer 285
+    st283 = (int(miso[285, 16]) >> 1) & 0x3F
+    stale = _stale_reply(miso[283], mo[282], float(tm['rx'][283]) - 4000.0, nf283 - 1, st283 - 1)
+    miso[283] = stale
+    miso[284] = stale
+    fr = dict(s['frames'], miso=miso)
+    ap = M.h7_apply(fr, 280, 3800)
+    assert not ap['ok'] and 'RS4-R8-1' in ap['reason'] and 'frame 282' in ap['reason'], ap.get('applied', ap)[:3]
+    em = M.map_edge(s['duty'], 400, s['esp'], 1e-3, fr)
+    assert not em['ok'] and 'RS4-R8-1' in em['reason'], em['reason']
+    ok = M.h7_apply(dict(fr, miso=make_miso(mo, s['duty_cap'], tm, lost=lost)), 280, 3800)
+    assert ok['ok'] and ok['send_line']['max_resid_us'] <= 60.0, ok      # without the stale reply: kept
+    no_t = M.h7_apply(dict(s['frames'], t_send_ns=None), 300, 3800)
+    assert not no_t['ok'] and 't_send_ns' in no_t['reason'], no_t['reason']
+
+
+@needs_gcc
+def test_bracket_widened_by_e_id_before_steps():
+    # RS4-R8-1: the steps come from the H7 times [s_lo - E_ID_US, s_hi + E_ID_US]
+    s = sim()
+    em = run(s)
+    _check_bracket(em, s['k_true'])
+    a, b = em['h7_apply']['range']
+    ap = M.h7_apply(s['frames'], a, b)
+    t_lo, t_hi = em['edge_h7_time_us']
+    assert em['early_step'] == M.h7_to_steps(t_lo - M.E_ID_US, ap['anchor_k'], ap['anchor_us'])[0]
+    assert em['late_step'] == M.h7_to_steps(t_hi + M.E_ID_US, ap['anchor_k'], ap['anchor_us'])[1]
+    assert em['late_step'] - em['early_step'] >= 2 * M.E_ID_US / 1000.0 * 0.9   # frames about 1 ms apart
+    assert M.E_ID_US == 2 * M.R_ID_US and em['constants']['e_id_us'] == M.E_ID_US
+
+
 def test_seq_convention_checked_up_to_k_hi_plus_lag_max():
     # the check covers [k_lo, k_hi + LAG_MAX): a bad seq right after k_hi + LAG_MAX - 1 is outside, at it inside
     n = 200
