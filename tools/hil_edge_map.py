@@ -719,7 +719,8 @@ def pwm_side(duty, k_run, esp, ie, period_us):
     fits = {}
     for W, sel in _windows(ts, after, ts[on[0]]):
         t_last = ts[sel][-1]
-        k_hi = int(min(n, hi + (t_last - ts[ie]) / period_us + 1))
+        # to the largest shift the fine grid of _minimise can try (hi + 1 step), plus one frame
+        k_hi = int(min(n, hi + 2 + (t_last - ts[ie]) / period_us + 1))
         frames = np.arange(max(0, int(lo) - 5), k_hi)
         frames = frames[good[frames]]
         lines = np.r_[ie - 1, sel]                            # the 0 before the edge
