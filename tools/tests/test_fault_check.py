@@ -257,16 +257,20 @@ def test_lifecycle_checked_before_use(tmp_path):
     steps = write_step_log(str(tmp_path / 'lc_st.csv'), 100)
 
     def past_log(d, m):
-        _lc_manifest(m, [dict(step=0, t=0.0, phase='PREPARE'), dict(step=10, t=0.0, phase='RUN'),
+        _lc_manifest(m, [dict(step=0, t=0.0, phase='ARM'), dict(step=10, t=0.0, phase='RUN'),
                          dict(step=1000, t=0.0, phase='STOPPING'), dict(step=1000, t=0.0, phase='END')])
         m['faults'].update(t0_step=10, stop_step=1000, events=[[200, 'E1', 1, 'on'], [300, 'E1', 0, 'off']],
                            not_run=[], cut=False, complete=True)
         d['mosi'][:] = d['mosi_true']
     r = fc.check(resave(p, str(tmp_path / 'past.npz'), past_log), csv_, steps)
     assert not r['ok'] and any('outside the 100 frames' in s for s in r['fails']), r['fails']
-    good = [dict(step=0, t=0.0, phase='PREPARE'), dict(step=10, t=0.0, phase='RUN'),
+    good = [dict(step=0, t=0.0, phase='ARM'), dict(step=10, t=0.0, phase='RUN'),
             dict(step=60, t=0.0, phase='STOPPING'), dict(step=90, t=0.0, phase='END')]
     for name, trs, msg in (
+            ('no_stopping', good[:2] + good[3:], 'out of order'),                          # FI3-2
+            ('prepare_first', [dict(step=0, t=0.0, phase='PREPARE')] + good, 'out of order'),  # FI3-2
+            ('run_first', good[1:], 'out of order'),                                          # FI3-2
+            ('end_then_run', good + [dict(step=95, t=0.0, phase='RUN')], 'out of order'),     # FI3-2
             ('float', [dict(good[0]), dict(good[1], step=10.0)] + good[2:], 'bad transition'),
             ('float9', [dict(good[0]), dict(good[1], step=10.9)] + good[2:], 'bad transition'),
             ('bool', [dict(good[0], step=False)] + good[1:], 'bad transition'),
@@ -278,12 +282,56 @@ def test_lifecycle_checked_before_use(tmp_path):
         assert not r['ok'] and any(msg in s for s in r['fails']), (name, r['fails'])
 
 
-@pytest.mark.parametrize('kind', ['cut2', 'empty', 'wide', 'true_short', 't_send'])
+def test_phase_paths_of_run_lifecycle(tmp_path):
+    """Codex FI3-2: the paths RunLifecycle records pass the phase check, cut ones included (ARM; ARM, RUN;
+    END alone after a failed PREPARE; ARM, STOPPING, END after an ARM timeout); and the counterexample: real
+    phases ARM@0, RUN@10, STOPPING@30, END@80, window [50, 60) from t0 = frames 60..69 inside STOPPING; a
+    log patched there with STOPPING dropped and stop 80 written (events as run in full) passed before, now
+    fails on the phases."""
+    def tr(*ps):
+        return dict(lifecycle=dict(transitions=[dict(step=s, t=0.0, phase=p) for p, s in ps]))
+    for ps in ((('ARM', 0),), (('ARM', 0), ('RUN', 10)), (('END', 0),), (('ARM', 0), ('STOPPING', 40), ('END', 50)),
+               (('ARM', 0), ('RUN', 10), ('STOPPING', 30), ('END', 80)), (('ARM', 0), ('STOPPING', 0), ('END', 0))):
+        assert fc.phases_t0_stop(tr(*ps), 100)[2] is None, ps
+    p, csv_, _ = open_loop(tmp_path, body='E1,enc_loss,FL,50,60,\n', steps=100, run_ms=1000, name='nostop')
+    steps = write_step_log(str(tmp_path / 'nostop_st.csv'), 100)
+
+    def drop_stopping(d, m):
+        rows = fs.parse(HEAD + 'E1,enc_loss,FL,50,60,\n')
+        pt = fs.FramePatcher(fs.Schedule(tuple(rows)))
+        for k in range(100):
+            if k == 10:
+                pt.start(k)
+            if k == 80:
+                pt.stop(k)
+            d['mosi'][k] = np.frombuffer(pt.patch(k, bytes(d['mosi_true'][k])), dtype=np.uint8)
+        _lc_manifest(m, [dict(step=0, t=0.0, phase='ARM'), dict(step=10, t=0.0, phase='RUN'),
+                         dict(step=80, t=0.0, phase='END')])
+        m['faults'].update(t0_step=10, stop_step=80, events=[[50, 'E1', 1, 'on'], [60, 'E1', 0, 'off']],
+                           not_run=[], cut=False, complete=True)
+    p2 = resave(p, str(tmp_path / 'nostop2.npz'), drop_stopping)
+    f = np.load(p2)
+    assert np.all(f['mosi'][60:70, 0:2] == 0) and np.any(f['mosi_true'][60:70, 0:2] != 0)   # patched in "STOPPING"
+    r = fc.check(p2, csv_, steps)
+    assert not r['ok'] and any('out of order' in s for s in r['fails']), r['fails']
+
+
+@pytest.mark.parametrize('kind', ['cut2', 'empty', 'wide', 'true_short', 't_send', 'all_narrow', 'all_wide',
+                                  'scalar'])
 def test_frame_arrays_must_cover_the_run(run, tmp_path, kind):
-    """Codex FI2-5: MISO cut to 2 frames (0 checked) with the manifest left at 398, MISO empty, MISO of
-    another width, mosi_true or t_send_ns shorter: the run is not taken as clean."""
+    """Codex FI2-5, FI3-3, FI3-4: MISO cut to 2 frames (0 checked) with the manifest left at 398, MISO empty,
+    MISO of another width, mosi_true or t_send_ns shorter; the three frame arrays cut together to
+    FRAME_SIZE - 1 bytes (MISO CRC recomputed) or widened together; mosi a scalar: cannot be checked."""
     def edit(d, m):
-        if kind == 'cut2':
+        if kind in ('all_narrow', 'all_wide'):
+            w = FRAME_SIZE - 1 if kind == 'all_narrow' else FRAME_SIZE + 8
+            for a in ('mosi', 'mosi_true', 'miso'):
+                x = d[a][:, :w] if w < FRAME_SIZE else np.hstack([d[a], np.zeros((len(d[a]), 8), np.uint8)])
+                d[a] = np.ascontiguousarray(x)
+            d['miso'] = np.array([np.frombuffer(with_crc(bytes(r)), np.uint8) for r in d['miso']])
+        elif kind == 'scalar':
+            d['mosi'] = np.array(0, dtype=np.uint8)
+        elif kind == 'cut2':
             d['miso'] = d['miso'][:2]
         elif kind == 'empty':
             d['miso'] = d['miso'][:0]
@@ -541,3 +589,8 @@ def test_cli_exit_codes(run, tmp_path):
     assert res['ok'] and res['frames_injected'] > 0
     r = subprocess.run([sys.executable, tool, p, '--faults', csv_], capture_output=True, text=True, timeout=60)
     assert r.returncode == 1 and 'no step log' in r.stdout
+    # Codex FI3-4: a scalar mosi is "cannot be checked" (exit 2), not a traceback
+    p2 = resave(p, str(tmp_path / 'scalar.npz'), lambda d, m: d.__setitem__('mosi', np.array(0, dtype=np.uint8)))
+    r = subprocess.run([sys.executable, tool, p2, '--faults', csv_, '--step-log', steps],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 2 and 'Traceback' not in r.stderr, r.stderr

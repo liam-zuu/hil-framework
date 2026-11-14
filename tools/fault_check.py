@@ -28,8 +28,10 @@ Checks (all must hold for ok):
   9. the run ended the normal way (FI1-4): stop_reason 'max_steps' with n = max_steps without phases;
      with phases last phase END, outcome not error:..., END tail complete, stop_reason = outcome;
   10. the frame arrays (mosi, mosi_true, miso, t_send_ns) have the same number of rows, the three frame
-     arrays the same width, manifest steps = n, MISO checked = n - MISO_SKIP_FRAMES (FI2-5); the lifecycle
-     transitions are typed strictly, in phase order, inside the log (FI2-2).
+     arrays are 2-D with frames of protocol.FRAME_SIZE bytes, manifest steps = n, MISO checked =
+     n - MISO_SKIP_FRAMES (FI2-5, FI3-3, FI3-4; a log of another frame size cannot be checked, exit 2); the
+     lifecycle transitions are typed strictly, follow the phase changes RunLifecycle can make, inside the
+     log (FI2-2, FI3-2).
 Exit 0 = ok, 1 = a check failed, 2 = the input cannot be checked. Writes fault_check.json.
 
 Assumptions (stated by the author, to be checked): frame k of the log is step k of the loop, and the
@@ -51,10 +53,16 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, '..', 'rpi5'))
 from fault_schedule import FAULT_IMU_LOSS, file_sha256, parse, rows_as_json   # noqa: E402
-from protocol import (IMU_RANGES, MISO_CRC_BAD, MISO_EMPTY, OFS_FAULT, OFS_IMU_ACC, OFS_IMU_GZ,   # noqa: E402
+from protocol import (FRAME_SIZE, IMU_RANGES, MISO_CRC_BAD, MISO_EMPTY, OFS_FAULT, OFS_IMU_ACC, OFS_IMU_GZ,   # noqa: E402
                       OFS_IMU_YAW, OFS_SEQ, STATE_RANGES, miso_check)
 from hil_node import MISO_SKIP_FRAMES                                          # noqa: E402
 from run_lifecycle import _PHASES as PHASES                                    # noqa: E402
+
+# Phase changes RunLifecycle can record (rpi5/run_lifecycle.py: begin() enters ARM, fail_prepare() END from
+# PREPARE; ARM -> RUN or STOPPING; RUN -> STOPPING; STOPPING -> END). PREPARE is the start, never recorded;
+# None = before the first transition (Codex FI3-2).
+NEXT_PHASE = {None: ('ARM', 'END'), 'ARM': ('RUN', 'STOPPING'), 'RUN': ('STOPPING',), 'STOPPING': ('END',),
+              'END': (), 'PREPARE': ()}
 
 WHEEL_IDX = {'FL': 0, 'FR': 1, 'RL': 2, 'RR': 3}
 WHY_RANK = {'off': 0, 'on': 1, 'cut': 2}
@@ -135,26 +143,26 @@ def expected_events(rows, t0, stop, n_frames):
 
 def phases_t0_stop(man, n):
     """(t0, stop, problem) from the run phases: lifecycle transitions, or (0, None, None) without phases
-    (FI1-2). The transitions are checked before use (Codex FI2-2): a list of {step, phase}, step a strict
-    int (no bool, no float), phase one of run_lifecycle's phases, phases in their order without repeat, steps
-    not falling, every step <= n (no phase change past the frames of the log). problem = None, or why the
-    phases cannot be used (then t0 = stop = None)."""
+    (FI1-2). The transitions are checked before use (Codex FI2-2, FI3-2): a list of {step, phase}, step a
+    strict int (no bool, no float), phase one of run_lifecycle's phases, each phase change one that
+    RunLifecycle can make (NEXT_PHASE: the list starts at ARM or END, END only after STOPPING; a list cut
+    before END is a start of such a path), steps not falling, every step <= n (no phase change past the
+    frames of the log). problem = None, or why the phases cannot be used (then t0 = stop = None)."""
     lc = man.get('lifecycle')
     if lc is None:
         return 0, None, None
     trs = lc.get('transitions') if isinstance(lc, dict) else None
     if not isinstance(trs, list):
         return None, None, 'manifest lifecycle: no transitions list'
-    prev_step = prev_rank = None
+    prev_step, prev_phase = None, None
     for tr in trs:
         if not (isinstance(tr, dict) and _is_int(tr.get('step')) and tr.get('phase') in PHASES):
             return None, None, f'manifest lifecycle: bad transition {tr!r}'
-        rank = PHASES.index(tr['phase'])
-        if prev_rank is not None and (rank <= prev_rank or tr['step'] < prev_step):
-            return None, None, f'manifest lifecycle: transitions out of order at {tr!r}'
+        if tr['phase'] not in NEXT_PHASE[prev_phase] or (prev_step is not None and tr['step'] < prev_step):
+            return None, None, f'manifest lifecycle: transitions out of order at {tr!r} (after {prev_phase})'
         if not 0 <= tr['step'] <= n:
             return None, None, f'manifest lifecycle: step {tr["step"]} outside the {n} frames of the log'
-        prev_step, prev_rank = tr['step'], rank
+        prev_step, prev_phase = tr['step'], tr['phase']
     t0 = stop = None
     for tr in trs:
         if t0 is None:
@@ -302,12 +310,13 @@ def check(npz_path: str, sched_path: str, step_log: str = None) -> dict:
     rows = parse(raw.decode('utf-8'))
     mosi, true, miso = f['mosi'], f['mosi_true'], f['miso']
     t_send = f['t_send_ns'] if 't_send_ns' in f.files else None
-    n = len(mosi)
-    # Codex FI2-5: the frame arrays cover the same steps, frames of one width (not a fixed 40 bytes)
-    if (mosi.ndim != 2 or true.shape != mosi.shape or miso.ndim != 2 or miso.shape != mosi.shape
+    # Codex FI2-5, FI3-3, FI3-4: the frame arrays are 2-D (checked before len()), cover the same steps, and
+    # their frames are protocol.FRAME_SIZE bytes (coordination rule 3.7: the constant, not a fixed 40)
+    n = len(mosi) if mosi.ndim == 2 else -1
+    if (n < 0 or mosi.shape[1] != FRAME_SIZE or true.shape != mosi.shape or miso.shape != mosi.shape
             or t_send is None or t_send.shape != (n,)):
         out['error'] = (f'frame arrays do not match: mosi {mosi.shape}, mosi_true {true.shape}, miso {miso.shape}, '
-                        f't_send_ns {None if t_send is None else t_send.shape}')
+                        f't_send_ns {None if t_send is None else t_send.shape}, frame size {FRAME_SIZE}')
         return out
     fails = []
     if man.get('steps') != n or not _is_int(man.get('steps')):
@@ -380,7 +389,7 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     try:
         res = check(a.frames, a.faults, a.step_log)
-    except (OSError, ValueError, KeyError) as exc:
+    except (OSError, ValueError, KeyError, TypeError) as exc:      # TypeError: Codex FI3-4
         print(f'fault_check: cannot check: {exc}', file=sys.stderr)
         return 2
     out = a.out or os.path.join(os.path.dirname(os.path.abspath(a.frames)), 'fault_check.json')

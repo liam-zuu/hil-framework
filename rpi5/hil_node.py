@@ -329,8 +329,10 @@ class HILNode:
                     self.step_log.record(self._step - 1, self._timer.last_deadline_ns,
                                          self._timer.last_wake_ns, self._t_done_ns)
         except BaseException as exc:
-            # L82, Codex FI1-4: the manifest and #run_end say the run broke (fault_check refuses it)
-            self._stop_reason = f'error:{type(exc).__name__}'
+            # L82, Codex FI1-4: the manifest and #run_end say the run broke (fault_check refuses it); only
+            # with --faults, so a run without faults keeps today's stop_reason (Codex FI3-5)
+            if self._faults is not None:
+                self._stop_reason = f'error:{type(exc).__name__}'
             raise
         finally:
             self._shutdown()
