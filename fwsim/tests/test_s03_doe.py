@@ -674,9 +674,24 @@ class _Calls(list):
     """The calls list of _fake, with what _run_main saw on the side."""
 
 
-def _fake(design_fail=False, default_fails=False, error_in_design=False):
+def _fake_gate_fields(ctrl, g, v):
+    """S3G-3: v8.2 gate columns of a fake run, different per gains and speed (known from the inputs)."""
+    x = float(sum(g[n] * (k + 1) for k, n in enumerate(s3.FACTORS[ctrl])))
+    bad = v == 0.8
+    f = dict(e_bao_max=1e-3 * x + v + 0.5, gate_version='gate_fake', gate_decide='g1,g2,g3,g4,g5', gate_u_t=0.0,
+             g1_q='true', g1_state='dat', gate_outcome='khong_dat' if bad else 'dat')
+    for i, c in enumerate(('g2', 'g3', 'g4', 'g5')):
+        q = 1e-3 * x + v + 0.01 * (i + 1)
+        f.update({f'{c}_q': q, f'{c}_lo': q - 1e-6, f'{c}_hi': q + 1e-6, f'{c}_n_undef': i,
+                  f'{c}_state': 'khong_dat' if bad and c == 'g5' else 'dat'})
+    return f
+
+
+def _fake(design_fail=False, default_fails=False, error_in_design=False, error_in_sweep=None):
     """Instant stand-in for safe_run: sweep runs (one factor off its default) complete; design
-    runs (several factors off) fail when X1 or X2 is above its default (96/128 corners)."""
+    runs (several factors off) fail when X1 or X2 is above its default (96/128 corners).
+    error_in_sweep (S3G-2): 'default' -> run_error at the first default check; 'factor' -> at every
+    sweep run with one factor off."""
     calls, works = _Calls(), []
 
     def fake_safe_run(fw, path, ctrl, g, v, mu):
@@ -687,6 +702,8 @@ def _fake(design_fail=False, default_fails=False, error_in_design=False):
         design = len(off) >= 2
         if error_in_design and design:
             return dict(status='run_error', completed='', error='FakeError: boom'), None
+        if (error_in_sweep == 'default' and not off) or (error_in_sweep == 'factor' and len(off) == 1):
+            return dict(status='run_error', completed='', error='FakeSweepError: boom'), None
         fail = (design_fail and design and (g[f[0]] > dflt[f[0]] or g[f[1]] > dflt[f[1]])) or \
                (default_fails and not off and v == 0.8)
         x = np.array([g[n] for n in f])
@@ -697,7 +714,8 @@ def _fake(design_fail=False, default_fails=False, error_in_design=False):
                     sat_frac=0.0, sat_any_frac=0.0, e_theta_lane_max_deg=1.0, e_theta_cmd_max_deg=1.0,
                     ds_absmax=0.0, e_trk_max=0.0, t_end=np.float64(1.25), e_s_absmax=0.0, track_err_frames=0,
                     n_upper_frames=len(off), n_back_frames=int(v == 0.8),
-                    cond2_5_ever=np.bool_(True), pos_reset_mid=0, e_perp_rms=0.0, e_trk_rms=0.0), log
+                    cond2_5_ever=np.bool_(True), pos_reset_mid=0, e_perp_rms=0.0, e_trk_rms=0.0,
+                    **_fake_gate_fields(ctrl, g, v)), log
 
     def fake_new_process(dll, runs, work):
         os.makedirs(work, exist_ok=True)              # S3V8-6: as run_in_new_process, the folder stays
@@ -1527,9 +1545,26 @@ def test_v82_main_writes_the_gate_columns_and_meta(tmp_path, monkeypatch, capsys
     assert code == 0
     for f in ('sealed/runs.csv', 'sealed_test/runs_test.csv'):
         assert next(_csv.reader(open(out / f))) == V8_COLS + V82_COLS, f
-    # sweep.csv takes the keys of its rows (run_one rows carry V82_COLS, test_v82_gate_maxima...); the
-    # fake rows here have none, so its header is not checked for them
+    assert set(V82_COLS) <= set(next(_csv.reader(open(out / 'sweep.csv'))))
+    # S3G-3: the VALUES reach the three files (fake gate fields differ per gains and speed)
+    gains = {(d['controller'], d['point_id']): {n: float(d[f'{n}_value']) for n in s3.FACTORS[d['controller']]}
+             for d in _csv.DictReader(open(out / 'design.csv'))}
+    n = 0
+    for f in ('sealed/runs.csv', 'sealed_test/runs_test.csv'):
+        for r in _csv.DictReader(open(out / f)):
+            want = _fake_gate_fields(r['controller'], gains[(r['controller'], r['point_id'])], float(r['v']))
+            assert {c: r[c] for c in V82_COLS} == {c: str(s3.fmt(want[c])) for c in V82_COLS}, (f, r['point_id'])
+            n += 1
+    for r in _csv.DictReader(open(out / 'sweep.csv')):
+        g = dict(FAKE_DEFAULTS[r['controller']])
+        if not r['factor'].startswith('('):
+            g[r['factor']] = float(r['value'])
+        want = _fake_gate_fields(r['controller'], g, float(r['v']))
+        assert {c: r[c] for c in V82_COLS} == {c: str(s3.fmt(want[c])) for c in V82_COLS}, (r['factor'], r['value'])
+        n += 1
+    assert n > 2 * (271 * 3 + 300)
     meta = (out / 'meta.yaml').read_text(encoding='utf-8')
+    assert 'source_check: "same at the end of the run"' in meta                 # S3G-1
     assert meta.startswith('spec: S03 v8.2 ')
     lines = meta.splitlines()
     gate = _json.loads(next(x for x in lines if x.startswith('gate: ')).split('   #')[0][len('gate: '):])
@@ -1542,3 +1577,108 @@ def test_v82_main_writes_the_gate_columns_and_meta(tmp_path, monkeypatch, capsys
     b = open(E.__file__, 'rb').read()
     assert ev['fwsim/o1_gate_eval.py'] == dict(sha256=_h.sha256(b).hexdigest(),
                                                sha256_lf=_h.sha256(b.replace(b'\r\n', b'\n')).hexdigest())
+
+
+# ── after Codex round 1 (S3G-1..4; Liam 14/11 CODE_FEAS "Sua 5 muc + vong 2 (Recommended)") ──────────
+
+@needs_dll
+def test_v82_run_one_copies_the_gate_dict_it_was_given(path, monkeypatch):
+    """S3G-4: through the real run_one: evaluate_fig8 gets the log, path, schedule and lsum; gate() gets the
+    evaluator's frames and completed, the command maxima, u_t 0, DECIDE_ALL and the status; the row copies
+    what gate() returned (marked values), never recomputing it."""
+    fw = fwsim.FirmwareSim(_DLL)
+    if not fw.pos_cols:
+        pytest.skip('DLL without pos_ctrl.c')
+    seen = {}
+    real_eval, real_gate = E.evaluate_fig8, G.gate
+
+    def spy_eval(log, p_, sch, lsum=0.24):
+        out = real_eval(log, p_, sch, lsum=lsum)
+        seen['eval'] = dict(path=p_, v=sch.v, lsum=lsum, frames=out[2], res=out[0])
+        return out
+
+    def spy_gate(frames, completed, **kw):
+        seen['gate'] = dict(frames=frames, completed=completed, **kw)
+        gt = real_gate(frames, completed, **kw)
+        gt['g3'] = dict(gt['g3'], state='SPY_STATE', q=123.0)
+        gt['outcome'] = 'SPY_OUTCOME'
+        gt['version'] = 'SPY_VERSION'
+        return gt
+    monkeypatch.setattr(E, 'evaluate_fig8', spy_eval)
+    monkeypatch.setattr(G, 'gate', spy_gate)
+    g = s3.defaults(fw, 'PID')
+    row, _ = s3.run_one(fw, path, 'PID', g, 0.8, 0.5)
+    p = fwsim.plant_params(s3.argparse.Namespace(ground='traction', mu=0.5))
+    assert seen['eval']['path'] is path and seen['eval']['v'] == 0.8 and seen['eval']['lsum'] == p.lx + p.ly
+    sg = seen['gate']
+    assert sg['frames'] is seen['eval']['frames'] and sg['completed'] == seen['eval']['res']['completed']
+    assert sg['u_t'] == 0.0 and sg['decide'] == G.DECIDE_ALL and sg['status'] == seen['eval']['res']['status']
+    assert (sg['v_cmd_max'], sg['wz_cmd_max']) == G.fig8_cmd_max(o1.Schedule(0.8))
+    assert 'u_p' not in sg and 'u_psi_deg' not in sg                     # the defaults 0 of gate()
+    assert row['g3_state'] == 'SPY_STATE' and row['g3_q'] == 123.0 and row['gate_outcome'] == 'SPY_OUTCOME'
+    assert row['gate_version'] == 'SPY_VERSION' and row['e_bao_max'] == seen['eval']['res']['e_bao_max']
+
+
+@needs_dll
+@pytest.mark.parametrize('where', ['evaluate_fig8', 'fig8_cmd_max', 'gate'])
+def test_v82_a_scoring_failure_is_a_run_error(path, monkeypatch, where):
+    """S3G-4: a failure in the evaluator, the command maxima (cache emptied) or the gate is a run_error
+    row with no gate value (S03 then stops, B8b-20)."""
+    fw = fwsim.FirmwareSim(_DLL)
+    if not fw.pos_cols:
+        pytest.skip('DLL without pos_ctrl.c')
+
+    def boom(*a, **k):
+        raise ValueError(f'boom in {where}')
+    monkeypatch.setattr(s3, '_CMD_MAX', {})
+    monkeypatch.setattr(E if where == 'evaluate_fig8' else G, where, boom)
+    row, log = s3.safe_run(fw, path, 'PID', s3.defaults(fw, 'PID'), 0.8, 0.5)
+    assert row['status'] == 'run_error' and log is None and row['error'] == f'ValueError: boom in {where}'
+    assert not set(V82_COLS) & set(row)
+
+
+@needs_dll
+@pytest.mark.parametrize('mode', ['default', 'factor'])
+def test_v82_sweep_run_error_is_a_sweep_row(tmp_path, monkeypatch, capsys, mode):
+    """S3G-2: a run_error in the sweep is a row of sweep.csv (gate cells empty) before S03 stops; the
+    header holds every run column even when the first run fails."""
+    import csv as _csv
+    code, out, console, _, _ = _run_main(tmp_path, monkeypatch, capsys, error_in_sweep=mode)
+    assert code == 2 and '[STOP]' in console
+    head = next(_csv.reader(open(out / 'sweep.csv')))
+    assert head[:6] == list(s3.SWEEP_ID_COLS) and set(s3.RUN_COLS[5:]) <= set(head)
+    rows = list(_csv.DictReader(open(out / 'sweep.csv')))
+    err = [r for r in rows if r['status'] == 'run_error']
+    assert len(err) == 1 and err[0]['error'] == 'FakeSweepError: boom' and err[-1] == rows[-1]
+    assert all(err[0][c] == '' for c in V82_COLS)
+    if mode == 'default':
+        assert len(rows) == 1 and err[0]['factor'] == '(default check)' and err[0]['is_default'] == 'true'
+    else:
+        f0 = s3.FACTORS['PID'][0]
+        assert err[0]['factor'] == f0 and err[0]['is_default'] == 'false' and err[0]['value'] != ''
+        assert all(r['status'] == 'ok' for r in rows[:-1])
+
+
+@needs_dll
+def test_v82_sources_taken_at_the_start_and_checked_at_the_end(tmp_path, monkeypatch, capsys):
+    """S3G-1: script and evaluator are recorded as they were before the first run; a change by the end
+    is recorded in source_check, said on the console and ends with exit code 2."""
+    calls = dict(git=0, ev=0)
+    real_git, real_ev = s3.git_state, s3.evaluator_sha256
+
+    def git_state(repo):
+        calls['git'] += 1
+        return dict(real_git(repo), commit=f'commit{calls["git"]}')
+
+    def ev():
+        calls['ev'] += 1
+        return dict(real_ev(), marker=calls['ev'])
+    monkeypatch.setattr(s3, 'git_state', git_state)
+    monkeypatch.setattr(s3, 'evaluator_sha256', ev)
+    code, out, console, _, _ = _run_main(tmp_path, monkeypatch, capsys)
+    meta = (out / 'meta.yaml').read_text(encoding='utf-8')
+    assert calls == dict(git=2, ev=2) and code == 2
+    assert '"commit": "commit1"' in next(x for x in meta.splitlines() if x.startswith('script: '))
+    assert '"marker": 1' in next(x for x in meta.splitlines() if x.startswith('evaluator_sha256: '))
+    sc = next(x for x in meta.splitlines() if x.startswith('source_check: '))
+    assert 'CHANGED' in sc and '"commit": "commit2"' in sc and 'S3G-1' in meta and 'source_check' in console

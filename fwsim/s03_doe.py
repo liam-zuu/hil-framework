@@ -131,6 +131,7 @@ GATE_RUN_COLS = (['e_bao_max', 'gate_version', 'gate_decide', 'gate_u_t', 'g1_q'
                  + [f'{c}_{x}' for c in G.MEASURED for x in ('q', 'lo', 'hi', 'n_undef', 'state')]
                  + ['gate_outcome'])
 RUN_COLS = OLD_COLS + GATE_RUN_COLS
+SWEEP_ID_COLS = ('controller', 'factor', 'value', 'is_default', 'v', 'mu')   # sweep.csv identifiers (section 7)
 GATE_U_T = 0.0                # s: fwsim knows the command start exactly (o1_gate docstring; as C12, S04)
 SCALE_RTOL = 1e-14            # H/L >= 4 within float rounding of the log grid (S3C-6; S3D-7: about 45 ULP)
 # S03 v8 (L67): axial points and the test set for the RSM comparison of S04; not analysed here
@@ -862,6 +863,9 @@ def main():
     if fw.build_info.get('esp32', {}).get('dirty', True):
         print('WARNING: fwsim.dll was built from a dirty firmware tree; not usable as a main result')
     path = o1.Path8()
+    # S3G-1 (Codex round 1): the script commit and the evaluator files are taken BEFORE the first run and
+    # checked again at the end; a change in between is recorded and S03 ends with exit code 2
+    src_start = dict(script=git_state(os.path.join(HERE, '..')), evaluator=evaluator_sha256())
     t0 = time.time()
     sweep_rows, level_rows, design_rows, all_runs = [], [], [], []
     eff_rows, curv_rows, ver_rows, fail_rows, det_rows = [], [], [], [], []
@@ -870,16 +874,20 @@ def main():
     t_sweep_end = None
     tp_info = None                                    # S3V8-3: set when the test file is read (once)
 
-    def checked(ctrl, g, v, mu, ids=None, sink=None, work=None, notes_to=None):
+    def checked(ctrl, g, v, mu, ids=None, sink=None, work=None, notes_to=None, sweep=None):
         """One run; a run_error is recorded (S3C-12), rerun once in a new process for diagnosis
         (B8b-20), then S03 stops. ids = (point_id, box) for a main-design run (sealed). The test
-        set (v8) passes its own sink (rows), work folder and notes list, all under sealed_test/."""
+        set (v8) passes its own sink (rows), work folder and notes list, all under sealed_test/.
+        sweep = (factor, value, is_default) of a sweep run: its run_error row goes to sweep.csv (S3G-2)."""
         row, log = safe_run(fw, path, ctrl, g, v, mu)
         if row['status'] != 'run_error':
             return row, log
         if ids is not None:
             (all_runs if sink is None else sink).append(dict(controller=ctrl, point_id=ids[0], box=ids[1],
                                                              mu=mu, v=v, **row))
+        elif sweep is not None:
+            sweep_rows.append(dict(controller=ctrl, factor=sweep[0], value=sweep[1], is_default=sweep[2],
+                                   v=v, mu=mu, **row))
         note = dict(controller=ctrl, gains=g, v=v, mu=mu, point=ids, first=row.get('error'))
         (rerun_notes if notes_to is None else notes_to).append(note)
         try:
@@ -897,7 +905,7 @@ def main():
         for ctrl in a.controllers:
             dflts[ctrl] = defaults(fw, ctrl)
             for v in SPEEDS:
-                row, log = checked(ctrl, dflts[ctrl], v, mu_mid)
+                row, log = checked(ctrl, dflts[ctrl], v, mu_mid, sweep=('(default check)', '', True))
                 # recorded and logged before the stop test (S3D-4); public like the sweep
                 sweep_rows.append(dict(controller=ctrl, factor='(default check)', value='', is_default=True,
                                        v=v, mu=mu_mid, **row))
@@ -919,7 +927,7 @@ def main():
                     g = dict(dflt, **{name: x})
                     done = True
                     for v in SPEEDS:
-                        row, log = checked(ctrl, g, v, mu_mid)
+                        row, log = checked(ctrl, g, v, mu_mid, sweep=(name, x, x == dflt[name]))
                         sweep_rows.append(dict(controller=ctrl, factor=name, value=x, is_default=x == dflt[name],
                                                v=v, mu=mu_mid, **row))
                         if x == dflt[name]:
@@ -947,7 +955,7 @@ def main():
                 if mu == mu_mid:
                     continue
                 for v in SPEEDS:
-                    row, log = checked(ctrl, dflt, v, mu)
+                    row, log = checked(ctrl, dflt, v, mu, sweep=('(default)', '', True))
                     sweep_rows.append(dict(controller=ctrl, factor='(default)', value='', is_default=True,
                                            v=v, mu=mu, **row))
                     if row['completed'] != 'true':                      # S3C-20
@@ -1170,7 +1178,10 @@ def main():
     for name, rows in (('sweep.csv', sweep_rows), ('sweep_counts.csv', sweep_counts(sweep_rows)),
                        ('levels.csv', level_rows), ('design.csv', design_rows)):
         p = os.path.join(a.out, name)
-        write_csv(p, rows)
+        cols = None
+        if name == 'sweep.csv':     # S3G-2: the columns of the rows, then every run column still missing
+            cols = list(dict.fromkeys([k for r in rows for k in r] + list(SWEEP_ID_COLS) + RUN_COLS[5:]))
+        write_csv(p, rows, cols)
         files[name] = sha256_file(p)
     # S3C-3 (b): no count in public; a failed check stops S03 (3.4), so 'passed' iff it ran to the end
     det_public = ('not run' if stop_public else 'see sealed/ (S03 stopped in the main design)' if stop_sealed
@@ -1181,6 +1192,15 @@ def main():
     status = ('stopped in the sweep: ' + stop_public if stop_public else
               'stopped in the main design (reason sealed)' if stop_sealed else
               'stopped in the test set (reason in sealed_test/)' if stop_test else 'ran to the end')
+    # S3G-1: the sources the runs were made with are those taken at the start; the end must give the same
+    src_end = dict(script=git_state(os.path.join(HERE, '..')), evaluator=evaluator_sha256())
+    src_changed = src_end != src_start
+    source_check = (dict(result='CHANGED during the run: not usable as a main result', end=src_end) if src_changed
+                    else 'same at the end of the run')
+    if src_changed:
+        status += '; the script or evaluator sources changed during the run (S3G-1)'
+        print('WARNING: the script commit or the evaluator files changed during the run; see meta.yaml '
+              'source_check (not usable as a main result)', flush=True)
     # S3V8-3: what was read before the main design, not a second read of the file now
     tp_meta = tp_info if tp_info is not None else dict(file=_rel_here(a.test_points),
                                                          read='no (S03 stopped before the test file was read)')
@@ -1192,7 +1212,8 @@ operator: Claude (phiên CODE)
 trial: {str(a.trial).lower()}     # true: tool check with mu 0.5 (S03 2.2, 11.3), never main numbers
 sealed: "L56 / S03 section 1: everything derived from the main-design responses is in sealed/ (with its own manifest.json) and is not looked at before campaign A ends"
 status: {json.dumps(status)}
-script: {json.dumps(git_state(os.path.join(HERE, '..')))}
+script: {json.dumps(src_start['script'])}   # taken before the first run (S3G-1)
+source_check: {json.dumps(source_check)}   # script and evaluator again at the end (S3G-1)
 firmware:
   esp32: {json.dumps(b.get('esp32'))}
   hil_framework_at_build: {json.dumps(b.get('hil_framework'))}
@@ -1217,7 +1238,7 @@ thresholds: {json.dumps(dict(THRESH, tv_duty=f'{Y3_REL:.0%} of the default-gain 
 y3_reference: {json.dumps({f'{c} v={v}': y for (c, v), y in y3_ref.items()})}
 o1: {json.dumps(dict(A=o1.A, a_r=o1.A_R, D=o1.D, D_d=o1.D, t_d=o1.T_D, t_late=o1.T_LATE, delta=o1.DELTA, v_d=o1.V_D, c_cens=o1.C_CENS))}
 gate: {json.dumps(gate_meta())}   # S03 v8.2 section 7: G1-G5 per run (o1_gate.gate), U = 0 on fwsim
-evaluator_sha256: {json.dumps(evaluator_sha256())}   # S03 v8.2 section 8 condition 8: S03 and S04 on the same evaluator
+evaluator_sha256: {json.dumps(src_start['evaluator'])}   # S03 v8.2 section 8 condition 8: S03 and S04 on the same evaluator; taken before the first run (S3G-1)
 sweep_run_error_reruns: {json.dumps([n for n in rerun_notes if n['point'] is None], default=str)}
 planned_runs_per_controller: {json.dumps(PLANNED_RUNS)}   # S03 v8 3.2, 7 (rows actually run: sealed/, sealed_test/)
 test_points: {json.dumps(tp_meta)}   # S03 v8 3.2, 7, 8.7 (S3V8-3): read once before the main design; sha256 of the bytes read, sha256_lf after CRLF -> LF, matches_head_blob_lf, generation from <name>.gen.json beside the file
@@ -1230,7 +1251,7 @@ interpretations:   # of this script, not written in S03 v8 / O1 v7; Liam or THES
   - "logs: log.csv (%.17g) of the four determinism points and npz (exact bits) of the centre and every main-design run not completed, all in sealed/logs/; npz of every sweep run not completed in logs_sweep/ (public, as the sweep)"
   - "the inner box (codes +-0.5) always runs for every controller (L41, Liam 06/11 'Chot B'), so the number of runs does not depend on the results; both boxes are always analysed (the same work), and the inner box is kept (effects, Y2 versions, fail counts; curvature is for the outer box only; at every speed, as before L41) only when the rule of S03 3.2 is on at one speed or more (> 64/128 corners 'false' at the middle mu); otherwise its runs are only rows of sealed/runs.csv"
   - "elapsed_s here is the sweep only; the total and the main-design time are in sealed/notes.json (L56, Codex S3E-1; S03 section 7 asks elapsed_s in meta.yaml)"
-  - "public channels left (L56, S3C-3, S3E-1; Liam 06/11 'Chot B', 'Duyet khuyen nghi'): status, exit code and console say that S03 stopped in the main design (S03 3.4 asks to report the stop; the reason is in sealed/stop.json); the wall-clock time still varies a little with the results (scoring a run that does not complete is a little longer, evaluate_v7 closes the window early on completion; writing the npz of the runs not completed; machine noise): accepted, not measured"
+  - "public channels left (L56, S3C-3, S3E-1; Liam 06/11 'Chot B', 'Duyet khuyen nghi'): status, exit code and console say that S03 stopped in the main design (S03 3.4 asks to report the stop; the reason is in sealed/stop.json); the wall-clock time still varies a little with the results (scoring a run that does not complete is a little longer, evaluate_v7 closes the window early on completion; v8.2: the G4 scoring of o1_gate_eval works on the scored frames and their projection solutions, so it may add to this, S3G-7; writing the npz of the runs not completed; machine noise): accepted, not measured"
   - "the upper-end tracking flag uses the 400 001-point path grid (about 15 um); at s = S the window is cut by the end of the path, not flagged (Codex S3C-5, deferred)"
   - "v8: run order per controller centre, outer, inner, axial (3 mu x 3 speeds each), then determinism and analysis; sealed/ is written and closed after every controller; then the test set of every controller (middle mu x 3 speeds); a stop before the test set means the test set does not run"
   - "v8: test-set logs follow the rule of section 7 (npz of every run not completed; there is no centre point in the test set); the compressed npz is made for every run (same work)"
@@ -1253,7 +1274,7 @@ files:
   - sealed_test/: "SEALED separately (S03 v8 section 7): runs_test.csv, logs/, notes.json, stop.json, diag.txt (warnings, prints, traceback of the test phase), manifest.json; opened only after the RSM coefficients at the middle mu are saved and committed"
 """)
     print(f'S03 finished -> {a.out}; status: {status}')
-    return 0 if not (stop_public or stop_sealed or stop_test) else 2
+    return 0 if not (stop_public or stop_sealed or stop_test or src_changed) else 2
 
 
 if __name__ == '__main__':
