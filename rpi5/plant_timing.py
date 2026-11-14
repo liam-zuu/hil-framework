@@ -12,6 +12,10 @@ Times, under the same scheduling as the plant loop (SCHED_FIFO 90, core 0):
                + 48 B MISO into preallocated arrays, inside the step before t_done; 40 B and no
                t_recv before RS-4 P1, RPI5_TIMING/2026-11-03_run01): extra
                load of S06 T1/T2 runs that log frames (S06, Liam 30/10)
+  fault_idle   L82: fault_schedule.FramePatcher.patch outside every window (with a delay row,
+               so the ring write of every step is counted)
+  fault_all4   L82: the same with enc_loss (2 wheels), imu_loss, imu_delay and gyro_scale all on
+  mosi_true_log L82: the extra FRAME_SIZE-byte write of the true frame into the frame log (--faults)
   slipA_nsubN  THROWAWAY timing prototype of a minimal slip model (method A):
                body with its own dynamics, traction per wheel capped by mu*N,
                N sub-steps per 1 ms. Only for timing: parameters are guesses,
@@ -143,6 +147,39 @@ def main() -> int:
         flog['miso'][k] = memoryview(bytes(miso_b))
 
     variants.append(('frame_log', frame_log))
+    # L82 fault injection: FramePatcher.patch outside every window (one delay row: the ring write runs every
+    # step) and with all four faults on; the extra mosi_true write of the frame log
+    import fault_schedule as fsch
+    frame0 = encode_state(plant_to_frame_state(list(x)), imu=(0.5, 0.1, 0.2, 9.8, 0.3), imu_seq=1, seq=1)
+    head = fsch.MAGIC + '\nid,fault,target,start_ms,end_ms,params\n'
+
+    def patcher(body):
+        rows = fsch.parse(head + body)
+        fsch.check(rows, 1 << 30, 'plant')
+        pa = fsch.FramePatcher(fsch.Schedule(tuple(rows)))
+        pa.start(0)
+        return pa
+    idle = patcher(f'D1,imu_delay,imu,{1 << 29},{(1 << 29) + 1},d_ms=100\n')
+    busy = patcher(f'E1,enc_loss,FL+RR,0,{1 << 29},\nL1,imu_loss,imu,0,{1 << 29},\n'
+                   f'D1,imu_delay,imu,100,{1 << 29},d_ms=100\nS1,gyro_scale,gz,0,{1 << 29},s=0.3\n')
+    step_i, step_b = [0], [0]
+    for k in range(200):                                   # past d: the delay reads the ring
+        busy.patch(k, frame0)
+    step_b[0] = 200
+
+    def fault_idle():
+        step_i[0] += 1
+        idle.patch(step_i[0], frame0)
+
+    def fault_all4():
+        step_b[0] += 1
+        busy.patch(step_b[0], frame0)
+
+    def mosi_true_log():
+        k = flog_k[0]
+        flog['mosi'][k] = memoryview(frame0)
+
+    variants += [('fault_idle', fault_idle), ('fault_all4', fault_all4), ('mosi_true_log', mosi_true_log)]
     Minv = np.diag([1.0 / p.M, 1.0 / p.M, 1.0 / p.Iz])
     stepA = _slip_a_step(p, Minv, np.full(4, p.J_w), p.M * p.g / 4.0, 0.8, 5.0)
     v0, w0 = np.zeros(3), np.full(4, 5.0)

@@ -127,6 +127,9 @@ class HILConfig:
     # load_schedule = 'path sha256' of the schedule file, kept in the run manifest
     heavy_block:       Optional[tuple] = None
     load_schedule:     str   = ''
+    # Fault injection batch 1 (L82): fault_schedule.Schedule (loaded and checked), None = no injection,
+    # the loop as before. Needs frame_log (the true frames are the record), excludes heavy_block
+    faults:            Optional[object] = None
     # --finite-run: phases of run_lifecycle.py; None = the loop as before
     lifecycle:         Optional[LifecycleConfig] = None
     # I8: SWA command bit (MOSI byte 20 bit 3), see SWA_MODES. Default 'off': a node
@@ -194,6 +197,17 @@ class HILNode:
             raise ValueError(f'swa_mode {self.cfg.swa_mode!r} not in {SWA_MODES}')
         if self.cfg.swa_mode == 'phase' and self._lc is None:
             raise ValueError("swa_mode 'phase' needs cfg.lifecycle (--finite-run)")
+        self._faults = None
+        if self.cfg.faults is not None:
+            if not self.cfg.frame_log:
+                raise ValueError('cfg.faults needs cfg.frame_log (the true frames are the record)')
+            if self.cfg.heavy_block is not None:
+                raise ValueError('cfg.faults excludes cfg.heavy_block (both write the wheel speeds)')
+            from fault_schedule import FramePatcher
+            self._faults = FramePatcher(self.cfg.faults)
+            if self._lc is None:
+                self._faults.start(0)        # no phases: t0 = step 0
+        self._fault_summary: Optional[dict] = None
         self._swa       = None               # last bit sent; None before the first frame
         self._swa_events: list = []          # (step, 0/1) at every change, for the manifest
         self._run_seen  = False              # I8-1: the lifecycle reached RUN
@@ -266,6 +280,9 @@ class HILNode:
                 'mosi':        np.zeros((n, FRAME_SIZE), dtype=np.uint8),
                 'miso':        np.zeros((n, FRAME_SIZE), dtype=np.uint8),
             }
+            if self._faults is not None:
+                # L82: the frame of today's code before the injection, every step (mosi = what was sent)
+                self._flog['mosi_true'] = np.zeros_like(self._flog['mosi'])   # same width as mosi
             self._flog_n = n
             # np.zeros maps pages lazily: without this, a page fault every ~100 frames inside the loop
             if self.cfg.rt_tune:
@@ -326,6 +343,12 @@ class HILNode:
                     # S06 T2 (Z9): t_end is taken inside record, after its fields
                     self.step_log.record(self._step - 1, self._timer.last_deadline_ns,
                                          self._timer.last_wake_ns, self._t_done_ns)
+        except BaseException as exc:
+            # L82, Codex FI1-4: the manifest and #run_end say the run broke (fault_check refuses it); only
+            # with --faults, so a run without faults keeps today's stop_reason (Codex FI3-5)
+            if self._faults is not None:
+                self._stop_reason = f'error:{type(exc).__name__}'
+            raise
         finally:
             self._shutdown()
             if self.cfg.rt_tune:
@@ -372,10 +395,13 @@ class HILNode:
         if self._heavy is not None:
             self._heavy.apply(self._step, frame_state)   # S06 Z8: omega to the H7 only, the plant goes on
         swa = self._swa_bit()
-        mosi   = encode_state(frame_state, traj_ref=self._ref, traj_flags=traj_flags,
-                              seq=self._step, imu=imu, imu_seq=imu_seq,
-                              fault_flags=CMD_SWA_ON if swa else 0,
-                              run_id=self._run_id, frame_no=self._step)
+        mosi_true = encode_state(frame_state, traj_ref=self._ref, traj_flags=traj_flags,
+                                 seq=self._step, imu=imu, imu_seq=imu_seq,
+                                 fault_flags=CMD_SWA_ON if swa else 0,
+                                 run_id=self._run_id, frame_no=self._step)
+        # L82: the faults of the schedule patch the frame (never bytes 40-47, run_id / frame_no, rule 3.7);
+        # without a schedule mosi is mosi_true
+        mosi = mosi_true if self._faults is None else self._faults.patch(self._step, mosi_true)
         t_send = time.monotonic_ns()
         miso   = self._spi.transfer(mosi)
         t_recv = time.monotonic_ns()
@@ -426,6 +452,8 @@ class HILNode:
             self._flog['t_pulse1_ns'][k] = t_p1
             self._flog['mosi'][k] = memoryview(bytes(mosi))
             self._flog['miso'][k] = memoryview(bytes(miso))
+            if self._faults is not None:
+                self._flog['mosi_true'][k] = memoryview(mosi_true)
 
         # 3. Advance plant dynamics
         # (ARM holds the plant at its initial state: no integration of the old DUT's PWM)
@@ -478,6 +506,10 @@ class HILNode:
                                    heartbeat_age_s=(now - box.heartbeat_ns) / 1e9))
         if self._lc.phase == RUN:
             self._run_seen = True
+            if self._faults is not None:
+                self._faults.start(self._step)       # t0 = first RUN step (once)
+        elif self._run_seen and self._faults is not None:
+            self._faults.stop(self._step)            # design 6.2: no injection once RUN is left (once)
         if out.done:
             self._stop_reason = self._lc.outcome
             self._end_seen = True                # I8-5: the loop stops after the tail (I8-R2-2)
@@ -527,7 +559,7 @@ class HILNode:
                         imu_noise=(None if self.cfg.imu_noise is None or imu_source != 'plant' else
                                    self.cfg.imu_noise.describe()),
                         plant=type(self.plant).__name__, plant_src=self._plant_src,     # L34
-                        heavy_block=self.cfg.heavy_block,
+                        heavy_block=self.cfg.heavy_block, faults=self.fault_summary(),    # L82
                         load_schedule=self.cfg.load_schedule, rt=self._rt, uname=' '.join(platform.uname()),     # X8: the kernel the run ran on
                         lifecycle=self.lifecycle_summary(),
                         swa_mode=self.cfg.swa_mode, swa_events=self.swa_events(),     # I8
@@ -574,6 +606,15 @@ class HILNode:
         return dict(swa_tail_sent=self._tail_sent,
                     swa_tail_complete=self._tail_complete if self._lc is not None else None)
 
+    def fault_summary(self) -> Optional[dict]:
+        """L82: schedule, t0, executed on/off/cut events, rows that never ran; None without --faults.
+        Taken once, at the end of the loop (windows still open then are cut at the step after the last)."""
+        if self._faults is None:
+            return None
+        if self._fault_summary is None:
+            self._fault_summary = self._faults.summary(last_step=self._step - 1)
+        return self._fault_summary
+
     def lifecycle_summary(self) -> Optional[dict]:
         """Phases and outcome of a --finite-run, with the END tail (I8-R2-3); None without it."""
         if self._lc is None:
@@ -607,6 +648,13 @@ class HILNode:
         if m['crc_bad'] or m['empty']:
             log.warning('MISO: %d frame CRC sai, %d frame rỗng trong lượt (L50: không làm số chính)',
                         m['crc_bad'], m['empty'])
+        if self._faults is not None:                                                    # L82
+            fsum = self.fault_summary()
+            log.info('#faults,sha256=%s,rows=%d,t0_step=%s,events=%d,cut=%d,not_run=%d,complete=%d',
+                     fsum['sha256'][:8], len(fsum['rows']), fsum['t0_step'], len(fsum['events']),
+                     int(fsum['cut']), len(fsum['not_run']), int(fsum['complete']))
+            if not fsum['complete']:
+                log.warning('Bơm lỗi: lịch không thi hành đủ (cut=%s, not_run=%s)', fsum['cut'], fsum['not_run'])
         log.info('#run_end,timestamp_us=%d,steps=%d,reason=%s',
                  time.monotonic_ns() // 1000, self._step, self._stop_reason)
         if self._flog is not None:
