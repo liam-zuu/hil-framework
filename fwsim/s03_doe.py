@@ -883,8 +883,14 @@ def main():
         print('WARNING: fwsim.dll was built from a dirty firmware tree; not usable as a main result')
     path = o1.Path8()
     # S3G-1 (Codex round 1): the script commit and the evaluator files are taken BEFORE the first run and
-    # checked again at the end; a change in between is recorded and S03 ends with exit code 2. S3G2-1: the
-    # evaluator files are also compared with their hash taken when this module was imported
+    # taken again at the end; S3G2-1: the evaluator files are also compared with their hash read at the end
+    # of this module's import. A difference between these snapshots is recorded and S03 ends with exit
+    # code 2. Limits (S3G3-1, S3G3-2, deferred): only the snapshots of THIS process are compared, so a
+    # source changed and changed back between two snapshots is not seen; the hash at import is a read of
+    # the files on disk a few milliseconds after the evaluator modules were loaded, not of the loaded
+    # code itself; child processes (determinism check, run_error diagnosis) import again from disk and
+    # their sources are not locked: the determinism check of section 3.4 can see such a change only
+    # partly (its 4 points).
     src_start = source_snapshot(os.path.join(HERE, '..'))
     t0 = time.time()
     sweep_rows, level_rows, design_rows, all_runs = [], [], [], []
@@ -1299,9 +1305,11 @@ files:
     return 0 if not (stop_public or stop_sealed or stop_test or src_changed) else 2
 
 
-# S3G2-1: the evaluator files hashed when this module is imported, i.e. right after they were imported
-# above (the start and end snapshots of main() are compared with it). Child processes import again from
-# disk; a change between the two is caught only by the determinism check of section 3.4 (deferred).
+# S3G2-1: the evaluator files on disk, read at the end of this module's import, a few milliseconds after
+# the evaluator modules were loaded above (the start and end snapshots of main() are compared with it).
+# Not a hash of the loaded code: a checkout changed inside that window is not seen (S3G3-1, deferred).
+# Child processes import again from disk and their sources are not locked; the determinism check of
+# section 3.4 can see such a change only partly (S3G3-2).
 EVAL_SHA_AT_IMPORT = evaluator_sha256()
 
 
