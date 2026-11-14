@@ -308,6 +308,44 @@ def test_CP2_1_us_end_of_a_later_run_is_not_used(tmp_path):
     assert res['flags'] == [] and res['cond4']['applies'] is True
 
 
+def run_end_line(last, seq):
+    """'#run_end' of logger.c 5bde4c5 202: the 3 copies differ in seq, no boot field."""
+    return f'#run_end,seq={seq},last_data_seq={last},log_qdrop=0,log_send_err=0,udp_drop=0,udp_take=460'
+
+
+def test_CP2_1_run_end_bounds_the_us_end(tmp_path):
+    # this run's '#us_end' lost; the later run lost its '#gain' and '#us' start and has no motor-off line
+    # in between; only this run's '#run_end' is left (Codex round 3)
+    rows = make_log()
+    start, _ = us_events(rows)
+    last = rows[-1]['log_seq']
+    ends = tuple(run_end_line(last, last + 1 + k) for k in range(3))
+    res = run(tmp_path, rows, events=(start,) + ends + (us_end_line(last + 13),))
+    assert any(f.startswith('us_unknown') for f in res['flags'])
+    (tmp_path / 'b').mkdir()
+    res = run(tmp_path / 'b', rows, events=(start,) + ends + (us_end_line(last),))
+    assert res['flags'] == [] and res['cond4']['applies'] is True
+
+
+def test_CP3_2_gain_set_line_is_not_a_run_start(tmp_path):
+    rows = make_log()
+    _, end = us_events(rows)
+    res = run(tmp_path, rows, events=('#gain,v=1,id=2,ctrl=PID,first_seq=0,line_drop=0,boot=00000001', end))
+    assert any(f.startswith('us_unknown') for f in res['flags'])
+
+
+def test_CP3_2_new_reset_count_only_on_run_active_0_lines(tmp_path):
+    # a hidden rise after the window whose run_active = 1 lines are all lost: only the following
+    # run_active = 0 lines carry the new count (pos_ctrl.c 132-135 outputs it on every call)
+    rows = make_log()
+    last = rows[-1]
+    tail = [dict(last, log_seq=last['log_seq'] + 40 + k, tick=last['tick'] + 40 + k, run_active=0,
+                 pos_reset_n=last['pos_reset_n'] + 1, timestamp_us=last['timestamp_us'] + 400000 + 10000 * k)
+            for k in range(3)]
+    res = run(tmp_path, rows + tail)
+    assert any(f.startswith('cond1_pos_reset') for f in res['flags'])
+
+
 def test_CP2_1_us_start_between_the_edge_and_the_end(tmp_path):
     rows = make_log()
     start, _ = us_events(rows)
@@ -356,16 +394,40 @@ def test_first_packet_one_line_before_the_edge_is_a_number(tmp_path):
     assert any(n.startswith('pre_edge_packet_lag') for n in res['notes'])
 
 
-def test_pre_edge_packet_flag_from_200_ms(tmp_path):
+def test_pre_edge_packet_lag_interval_and_200_ms(tmp_path):
+    # lag in [D + a - S, D + a + 1) ms (age read after timestamp_us, floored; CP3-1): flag when the lower
+    # bound reaches 200 ms, undecided across 200 ms, a note below
     rows = make_log()
-    by = {r['log_seq']: r for r in rows}
     edge = next(r['log_seq'] for r in rows if r['run_active'] == 1)
-    d_ms = (by[edge]['timestamp_us'] - by[edge - 1]['timestamp_us']) / 1e3
-    for age, flagged, sub in ((int(200 - d_ms) + 2, True, 'a'), (int(200 - d_ms) - 3, False, 'b')):
+    t0 = next(r['timestamp_us'] for r in rows if r['log_seq'] == edge)
+    # line edge-1 put exactly 10 ms before the edge: for line edge-2 the lower bound is 10 ms + a
+    base = [dict(r, timestamp_us=t0 - 10000) if r['log_seq'] == edge - 1 else r for r in rows]
+    for age, want, sub in ((190, 'pre_edge_packet:', 'a'),            # lower bound exactly 200 ms
+                           (189, 'pre_edge_packet_undecided', 'b'),   # 199 ms .. above 200 ms
+                           (150, None, 'c')):
         (tmp_path / sub).mkdir()
-        res = run(tmp_path / sub, [dict(r, traj_age_ms=age) if r['log_seq'] == edge - 1 else r for r in rows])
-        assert res['pre_edge_packet_lag_ms'] == pytest.approx(d_ms + age)
-        assert any(f.startswith('pre_edge_packet') for f in res['flags']) is flagged, (age, res['flags'])
+        res = run(tmp_path / sub, [dict(r, traj_age_ms=age) if r['log_seq'] == edge - 2 else r for r in base])
+        assert res['pre_edge_packet_lag_lo_ms'] == pytest.approx(10.0 + age)
+        assert res['pre_edge_packet_lag_lo_ms'] <= res['pre_edge_packet_lag_ms'] < res['pre_edge_packet_lag_hi_ms']
+        got = [f for f in res['flags'] if f.startswith('pre_edge_packet')]
+        if want is None:
+            assert got == [] and any(n.startswith('pre_edge_packet_lag') for n in res['notes'])
+        else:
+            assert len(got) == 1 and got[0].startswith(want), (age, got)
+
+
+def test_pre_edge_lag_interval_holds_the_true_receive_time():
+    # firmware timing (main.c 532-540): tick start t, age read at t + s, floored; the true lag must be
+    # inside the reported interval for any s < next tick and any receive time
+    rng = np.random.default_rng(7)
+    for _ in range(2000):
+        t_line, t_next, t_edge = 0, int(rng.integers(5000, 15000)), int(rng.integers(15000, 400000))
+        t_ref = t_line + int(rng.integers(0, t_next))
+        t_rx = t_ref - int(rng.integers(0, 199000))
+        a = max(0, (t_ref - t_rx) // 1000)
+        d, s = (t_edge - t_line) / 1e3, (t_next - t_line) / 1e3
+        true = (t_edge - t_rx) / 1e3
+        assert d + a - s <= true < d + a + 1.0
 
 
 def test_events_file_with_the_agv_logger_time_prefix(tmp_path):

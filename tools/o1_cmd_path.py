@@ -68,7 +68,9 @@ commands; edge age as a note). Round 2 (14/11, CP2-1..4; Liam 14/11 CODE_CAM loc
 vong 3 (Recommended)"): #us_end not past a later run start (#us or #gain first_seq) or the first
 motor-off line after the edge; #gain first_seq as a run start when #us start is lost; run_active = 1
 with traj_age_ms < 0 is a flag. Found on the real CAR_LIFTED 14/11 logs, same round: .events.txt lines
-carry the agv_logger time prefix (read_events); pre_edge_packet from a 200 ms lag.
+carry the agv_logger time prefix (read_events); pre_edge_packet from a 200 ms lag. Round 3 (15/11;
+Liam 15/11 CODE_CAM "Sua hep + vong 4 (Recommended)"): '#run_end' bounds the '#us_end' of the run; the lag
+is an interval (age read after timestamp_us, floored to ms), across 200 ms -> pre_edge_packet_undecided.
 On the HIL bench the H7 relays packets all the time, so pre_edge_packet is expected there.
 
   python tools/o1_cmd_path.py --log <run.csv> --task O1-F05 [--events <run.csv.events.txt>]
@@ -193,10 +195,17 @@ def us_for_edge(events, edge_seq, off_seq=None):
     CP2-2; a '#gain' without boot only marks a boundary).
     Tied when the latest start with F <= edge_seq has boot B and the first '#us_end' of boot B with
     L >= edge_seq lies before every known boundary after the edge: any run start with F > F0 (any
-    boot), and off_seq, the first received motor_on = 0 data line after the edge (CP2-1)."""
+    boot), off_seq, the first received motor_on = 0 data line after the edge (CP2-1), and the end of
+    the run itself: '#run_end,seq=S,last_data_seq=R,...' (logger.c 202; same R as the '#us_end' of that
+    run, push_run_end; no boot field, the 3 copies differ in seq) with R >= F0 means no data line of
+    that run after R, so an '#us_end' with L > R belongs to a later run (CP2-1, Codex round 3)."""
     starts, ends, bounds = [], [], []
     for e in dict.fromkeys(events):                      # identical copies once (logger sends 3)
-        if e.startswith('#us,') and _kv(e).get('ev') == 'start':
+        if e.startswith('#run_end,'):
+            kv = _kv(e)
+            if 'last_data_seq' in kv:
+                bounds.append(int(kv['last_data_seq']) + 1)
+        elif e.startswith('#us,') and _kv(e).get('ev') == 'start':
             kv = _kv(e)
             starts.append((int(kv['first_seq']), kv.get('boot')))
         elif e.startswith('#gain,'):
@@ -353,15 +362,34 @@ def analyse(rows, task, events=(), has_age_col=True):
     # Lag = edge time - receive time of the earliest fresh packet before the edge, a number; flag only
     # from TRAJ_TIMEOUT_MS: a packet that old not running means motor off or MANUAL (Liam 14/11 CODE_CAM
     # local_ed93bb1a "Bao so, co tu 200 ms (Recommended)"; tighter limit locked at C8)
-    lag = (max((t0 - (r['_t'] - 1000 * r['_age'])) / 1e3 for r in pe_rows) if pe_rows else None)
-    res['pre_edge_packet_lag_ms'] = lag
+    # The age is read at t_age_ref, after timestamp_us of the line and before the next tick, and floored to
+    # ms (main.c 532-540), so the receive time is known only within an interval (CP3-1, Codex round 3):
+    #   D + a - S <= lag < D + a + 1 ms, D = t_edge - t_line, a = traj_age_ms, S = t_next_line - t_line.
+    # The earliest packet seen has lag >= max(lower) and <= max(upper). Flag when the lower bound reaches
+    # 200 ms; an interval across 200 ms is no evidence either way (pre_edge_packet_undecided).
+    lag = lag_lo = lag_hi = None
+    if pe_rows:
+        idx = {r['_seq']: i for i, r in enumerate(rows)}
+        pts, los, his = [], [], []
+        for r in pe_rows:
+            i = idx[r['_seq']]
+            d_ms = (t0 - r['_t']) / 1e3
+            s_ms = (rows[i + 1]['_t'] - r['_t']) / 1e3          # i < edge, so rows[i + 1] exists
+            pts.append(d_ms + r['_age'])
+            los.append(d_ms + r['_age'] - s_ms)
+            his.append(d_ms + r['_age'] + 1.0)
+        lag, lag_lo, lag_hi = max(pts), max(los), max(his)
+    res.update(pre_edge_packet_lag_ms=lag, pre_edge_packet_lag_lo_ms=lag_lo, pre_edge_packet_lag_hi_ms=lag_hi)
     if lag is not None:
-        if lag >= TRAJ_TIMEOUT_MS:
-            res['flags'].append(f'pre_edge_packet: a fresh packet received {lag:.0f} ms before the edge '
-                                f'({len(pe)} lines before the edge, 0 <= traj_age_ms < {TRAJ_TIMEOUT_MS})')
+        span = f'{lag_lo:.1f}-{lag_hi:.1f} ms ({len(pe)} lines before the edge, 0 <= traj_age_ms < {TRAJ_TIMEOUT_MS})'
+        if lag_lo >= TRAJ_TIMEOUT_MS:
+            res['flags'].append(f'pre_edge_packet: a fresh packet received {span} before the edge')
+        elif lag_hi >= TRAJ_TIMEOUT_MS:
+            res['flags'].append(f'pre_edge_packet_undecided: first packet {span} before the edge, '
+                                f'across {TRAJ_TIMEOUT_MS} ms')
         else:
-            res['notes'].append(f'pre_edge_packet_lag: first packet {lag:.0f} ms before the edge '
-                                f'({len(pe)} lines; flag from {TRAJ_TIMEOUT_MS} ms)')
+            res['notes'].append(f'pre_edge_packet_lag: first packet {span} before the edge '
+                                f'(flag from {TRAJ_TIMEOUT_MS} ms)')
     if has_age and e['_age'] is not None and e['_age'] > EDGE_AGE_MS:
         # diagnostic number only: no locked criterion (CP1-5)
         res['notes'].append(f'edge_age: traj_age_ms {e["_age"]} at the edge (DE XUAT reference {EDGE_AGE_MS} ms)')
