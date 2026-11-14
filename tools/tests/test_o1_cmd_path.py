@@ -275,3 +275,113 @@ def test_CP1_5_edge_age_above_30_ms_is_a_note(tmp_path):
     rows = [dict(r, traj_age_ms=39) if r['log_seq'] == edge else r for r in rows]
     res = run(tmp_path, rows)
     assert res['flags'] == [] and any(n.startswith('edge_age') for n in res['notes'])
+
+
+# ---------------------------------------------------------------- Codex Sol round 2 (CP2-1 .. CP2-4)
+def gain_line(first_seq, boot='00000001'):
+    """'#gain' line of a motor-on run, trailing fields of logger.c 5bde4c5 184 (gain fields shortened)."""
+    return f'#gain,v=1,id=1,ctrl=PID,first_seq={first_seq},line_drop=0,boot={boot}'
+
+
+def us_end_line(last, blk=0, cut=0, boot='00000001'):
+    return (f'#us_end,boot={boot},on=1,swb=0,changes=0,blk_ticks={blk},cut_ticks={cut},ticks=10,'
+            f'last_data_seq={last},line_drop=0')
+
+
+def test_CP2_1_us_end_of_a_later_run_is_not_used(tmp_path):
+    rows = make_log()
+    start, _ = us_events(rows)
+    last = rows[-1]['log_seq']
+    # the end of THIS run lost; a later motor-on run whose '#us' start is lost: only '#gain' marks it
+    res = run(tmp_path, rows, events=(start, gain_line(rows[0]['log_seq']), gain_line(last + 10),
+                                      us_end_line(last + 50)))
+    assert any(f.startswith('us_unknown') for f in res['flags'])
+    # same with no '#gain' at all: the motor-off data line after the run marks the boundary
+    off = [dict(rows[-1], log_seq=last + k, tick=rows[-1]['tick'] + k, motor_on=0, run_active=0,
+                timestamp_us=rows[-1]['timestamp_us'] + 100000 * k) for k in (1, 2)]
+    (tmp_path / 'b').mkdir()
+    res = run(tmp_path / 'b', rows + off, events=(start, us_end_line(last + 50)))
+    assert any(f.startswith('us_unknown') for f in res['flags'])
+    # the right end, before the motor-off line, is still used
+    (tmp_path / 'c').mkdir()
+    res = run(tmp_path / 'c', rows + off, events=(start, us_end_line(last)))
+    assert res['flags'] == [] and res['cond4']['applies'] is True
+
+
+def test_CP2_1_us_start_between_the_edge_and_the_end(tmp_path):
+    rows = make_log()
+    start, _ = us_events(rows)
+    last = rows[-1]['log_seq']
+    later = f'#us,ev=start,boot=00000001,on=1,swb=0,first_seq={last + 10},line_drop=0'
+    res = run(tmp_path, rows, events=(start, later, us_end_line(last + 50)))
+    assert any(f.startswith('us_unknown') for f in res['flags'])
+
+
+def test_CP2_2_gain_line_ties_the_end_when_the_us_start_is_lost(tmp_path):
+    full = make_log()
+    _, end = us_events(full)                             # metadata of the firmware, not of the lines kept
+    rows = full[:-3]                                     # the last lines lost
+    ev = (gain_line(full[0]['log_seq']), '#gain,v=1,id=2,ctrl=PID,first_seq=0,line_drop=0,boot=00000001', end)
+    res = run(tmp_path, rows, events=ev)
+    assert res['flags'] == [] and res['cond4']['applies'] is True
+    (tmp_path / 'b').mkdir()                             # '#gain' of another boot does not tie it
+    res = run(tmp_path / 'b', rows, events=(gain_line(full[0]['log_seq'], boot='00000002'), end))
+    assert any(f.startswith('us_unknown') for f in res['flags'])
+
+
+def test_CP2_3_negative_age_on_a_run_active_line_is_a_flag(tmp_path):
+    rows = make_log()
+    edge = next(r['log_seq'] for r in rows if r['run_active'] == 1)
+    res = run(tmp_path, [dict(r, traj_age_ms=-1) if r['log_seq'] == edge else r for r in rows])
+    assert any(f.startswith('ra_age_negative') for f in res['flags'])
+    (tmp_path / 'b').mkdir()
+    res = run(tmp_path / 'b', [dict(r, traj_age_ms=-1) if r['log_seq'] == edge + 300 else r for r in rows])
+    assert any(f.startswith('ra_age_negative') for f in res['flags'])
+
+
+def test_CP2_4_empty_age_before_the_edge(tmp_path):
+    rows = make_log()
+    edge = next(r['log_seq'] for r in rows if r['run_active'] == 1)
+    res = run(tmp_path, [dict(r, traj_age_ms='') if r['log_seq'] == edge - 20 else r for r in rows])
+    assert any(f.startswith('pre_edge_age_missing') for f in res['flags'])
+
+
+def test_first_packet_one_line_before_the_edge_is_a_number(tmp_path):
+    # traj_task moves the packet every 10 ms: the line before the edge already has a fresh age (real logs)
+    rows = make_log()
+    edge = next(r['log_seq'] for r in rows if r['run_active'] == 1)
+    rows = [dict(r, traj_age_ms=0) if r['log_seq'] == edge - 1 else r for r in rows]
+    res = run(tmp_path, rows)
+    assert res['flags'] == [] and 0 < res['pre_edge_packet_lag_ms'] < 30
+    assert any(n.startswith('pre_edge_packet_lag') for n in res['notes'])
+
+
+def test_pre_edge_packet_flag_from_200_ms(tmp_path):
+    rows = make_log()
+    by = {r['log_seq']: r for r in rows}
+    edge = next(r['log_seq'] for r in rows if r['run_active'] == 1)
+    d_ms = (by[edge]['timestamp_us'] - by[edge - 1]['timestamp_us']) / 1e3
+    for age, flagged, sub in ((int(200 - d_ms) + 2, True, 'a'), (int(200 - d_ms) - 3, False, 'b')):
+        (tmp_path / sub).mkdir()
+        res = run(tmp_path / sub, [dict(r, traj_age_ms=age) if r['log_seq'] == edge - 1 else r for r in rows])
+        assert res['pre_edge_packet_lag_ms'] == pytest.approx(d_ms + age)
+        assert any(f.startswith('pre_edge_packet') for f in res['flags']) is flagged, (age, res['flags'])
+
+
+def test_events_file_with_the_agv_logger_time_prefix(tmp_path):
+    # agv_logger.py writes '<PC time ISO> <payload>' per line (880, 894), each event 3 times
+    rows = make_log()
+    start, end = us_events(rows, blk=4)
+    ev = [f'2026-11-14T16:43:44.40{k}400 {e}' for e in (start, end) for k in range(3)]
+    res = run(tmp_path, rows, events=ev)
+    assert res['cond4']['applies'] is False and res['flags'] == []
+    assert cp.read_events(str(tmp_path / 'run.csv.events.txt')) == [start] * 3 + [end] * 3
+
+
+def test_CP2_4_cli_prints_the_edge_age_note(tmp_path, capsys):
+    rows = make_log()
+    edge = next(r['log_seq'] for r in rows if r['run_active'] == 1)
+    p = write(tmp_path, [dict(r, traj_age_ms=39) if r['log_seq'] == edge else r for r in rows])
+    assert cp.main(['--log', p, '--task', 'O1-F05']) == 0
+    out = capsys.readouterr().out
+    assert '-- edge_age: traj_age_ms 39' in out and out.rstrip().endswith('#ket_qua,ma=0')

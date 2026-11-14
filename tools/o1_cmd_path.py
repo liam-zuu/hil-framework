@@ -14,7 +14,8 @@ Log: agv_logger CSV of ONE run (one run_active rising edge), firmware columns of
 (binary of the campaign): log_seq, timestamp_us, tick, motor_on, run_active, pos_reset_n,
 pos_x_ref, pos_y_ref, sp_vx, sp_vy, sp_wz, traj_age_ms (older firmware without traj_age_ms: (3)
 and the packet-age check are not computed, said so). '#' lines and <log>.events.txt: '#us_end'
-(blk_ticks, cut_ticks) decides whether (4) applies (no ultrasonic detect or block tick).
+(blk_ticks, cut_ticks) decides whether (4) applies (no ultrasonic detect or block tick), tied to the
+run by '#us,ev=start' or '#gain' (us_for_edge).
 
 Rising edge (O1 3.4): first data line with run_active = 1 whose line just before by log_seq was
 received and has run_active = 0. That line lost: the edge is unknown (run lost to the measurement
@@ -55,13 +56,19 @@ figure 8 start at the origin with heading 45 deg (o1_feasibility.HEAD0), lane = 
 Ideal p_cmd(t), t = timestamp_us - t_w0: figure 8 = path_point(tau(t)); K1, K2 = integral of the
 body command (no rotation).
 (1): more than one pos_reset_n value on the run_active stretch from the edge to the end anchor.
-Packet before the edge (task 2 of CODE, with C6): any line before the edge (motor on or off) with
-0 <= traj_age_ms < 200 (a fresh packet that did not start the run) -> pre_edge_packet. A non-zero
+Packet before the edge (task 2 of CODE, with C6): lines before the edge (motor on or off) with
+0 <= traj_age_ms < 200 (a fresh packet that did not start the run); the lag from the earliest such
+receive to the edge is reported, pre_edge_packet only from 200 ms (the 10 ms traj_task transfer puts the
+first packet 1-2 lines before every normal edge; Liam 14/11 "Bao so, co tu 200 ms"). A non-zero
 sp_* alone proves nothing (MANUAL mode, CP1-4). The edge line traj_age_ms is a diagnostic number
 (note above EDGE_AGE_MS, no flag: no locked criterion, CP1-5).
 Codex Sol round 1 (14/11, session 01a1da4f): CP1-1..5 accepted and fixed (reset check over the whole
 log after the edge; required columns and empty cells; #us_end tied to the run of the edge; manual
-commands; edge age as a note).
+commands; edge age as a note). Round 2 (14/11, CP2-1..4; Liam 14/11 CODE_CAM local_ed93bb1a "Sua hep +
+vong 3 (Recommended)"): #us_end not past a later run start (#us or #gain first_seq) or the first
+motor-off line after the edge; #gain first_seq as a run start when #us start is lost; run_active = 1
+with traj_age_ms < 0 is a flag. Found on the real CAR_LIFTED 14/11 logs, same round: .events.txt lines
+carry the agv_logger time prefix (read_events); pre_edge_packet from a 200 ms lag.
 On the HIL bench the H7 relays packets all the time, so pre_edge_packet is expected there.
 
   python tools/o1_cmd_path.py --log <run.csv> --task O1-F05 [--events <run.csv.events.txt>]
@@ -154,40 +161,69 @@ def read_log(path):
 
 
 def read_events(path):
+    """'#' lines of <log>.events.txt. agv_logger.py writes each as '<PC time ISO> <payload>' (lines 880,
+    894); the time prefix is dropped so identical copies of one event compare equal. A bare '#' line
+    is kept as it is."""
     if not path or not os.path.exists(path):
         return []
+    out = []
     with open(path, encoding='utf-8') as f:
-        return [ln.strip() for ln in f if ln.startswith('#')]
+        for ln in f:
+            ln = ln.strip()
+            if not ln.startswith('#'):
+                parts = ln.split(' ', 1)
+                ln = parts[1].strip() if len(parts) == 2 else ''
+            if ln.startswith('#'):
+                out.append(ln)
+    return out
 
 
 def _kv(e):
     return dict(p.split('=', 1) for p in e.split(',')[1:] if '=' in p)
 
 
-def us_for_edge(events, edge_seq):
+def us_for_edge(events, edge_seq, off_seq=None):
     """(blk_ticks, cut_ticks) of the ultrasonic summary of the motor-on run that holds the edge, or
-    None when it cannot be tied (CP1-3). Firmware AGV 5bde4c5 (main.c run_udp_mark, push_run_end;
-    us_state.c us_format_line): '#us,ev=start,boot=B,...,first_seq=F' at motor on (F = first data
-    line of the run) and '#us_end,boot=B,...,blk_ticks,cut_ticks,ticks,last_data_seq=L' at motor
-    off. Tied when one start of boot B has F <= edge_seq, no later start of any boot has
-    F <= edge_seq, and one '#us_end' of boot B has L >= edge_seq with no start between F and L."""
-    starts, ends = [], []
+    None when it cannot be tied (CP1-3, CP2-1, CP2-2). Firmware AGV 5bde4c5 (main.c run_udp_mark
+    349-355, push_run_end 358-361; us_state.c us_format_line; logger.c 184): at motor on, in the same
+    tick, '#gain,...,first_seq=F,...,boot=B' and '#us,ev=start,boot=B,...,first_seq=F' (F = first data
+    line of the run; 3 copies each); at motor off '#us_end,boot=B,...,blk_ticks,cut_ticks,ticks,
+    last_data_seq=L'. '#gain' with first_seq=0 is a gain set (main.c 636), not a run start.
+    Run starts = '#us' starts and '#gain' lines with F > 0 and a boot field (either one is enough,
+    CP2-2; a '#gain' without boot only marks a boundary).
+    Tied when the latest start with F <= edge_seq has boot B and the first '#us_end' of boot B with
+    L >= edge_seq lies before every known boundary after the edge: any run start with F > F0 (any
+    boot), and off_seq, the first received motor_on = 0 data line after the edge (CP2-1)."""
+    starts, ends, bounds = [], [], []
     for e in dict.fromkeys(events):                      # identical copies once (logger sends 3)
         if e.startswith('#us,') and _kv(e).get('ev') == 'start':
             kv = _kv(e)
             starts.append((int(kv['first_seq']), kv.get('boot')))
+        elif e.startswith('#gain,'):
+            kv = _kv(e)
+            f = int(kv.get('first_seq', '0'))
+            if f > 0:
+                (starts.append((f, kv['boot'])) if kv.get('boot') else bounds.append(f))
         elif e.startswith('#us_end'):
             kv = _kv(e)
             ends.append((int(kv['last_data_seq']), kv.get('boot'), int(kv['blk_ticks']), int(kv['cut_ticks'])))
+    starts = list(dict.fromkeys(starts))
     before = [s for s in starts if s[0] <= edge_seq]
     if not before:
         return None
-    f0, boot = max(before)
+    f0 = max(s[0] for s in before)
+    boots = {s[1] for s in before if s[0] == f0}
+    if len(boots) != 1:                                  # two boots claim the same start line
+        return None
+    boot = boots.pop()
     cand = sorted(e for e in ends if e[1] == boot and e[0] >= edge_seq)
     if not cand:
         return None
     last = cand[0][0]
-    if any(f0 < s[0] <= last for s in starts):
+    bounds += [s[0] for s in starts if s[0] > f0]
+    if off_seq is not None:
+        bounds.append(off_seq)
+    if any(b <= last for b in bounds if b > f0):         # the end belongs to a later motor-on run
         return None
     return cand[0][2], cand[0][3]
 
@@ -292,7 +328,8 @@ def analyse(rows, task, events=(), has_age_col=True):
     if not has_age_col:
         res['flags'].append('no_traj_age_column: (3) and the packet-before-edge check no evidence '
                             '(main runs need the campaign binary, O1 3.5)')
-    us = us_for_edge(events, e['_seq'])
+    off_seq = next((r['_seq'] for r in rows[edge:] if not r['_mo']), None)   # motor off after the run
+    us = us_for_edge(events, e['_seq'], off_seq)
 
     # motor-on stretch around the edge
     lo = edge
@@ -303,18 +340,36 @@ def analyse(rows, task, events=(), has_age_col=True):
     # every line before the edge, motor on or off: a schedule started while the motor was off makes the
     # edge come mid-schedule with no motor-on line before it (one file = one run). Only the packet age
     # shows a received trajectory packet: a non-zero sp_* may be a MANUAL command (CP1-4)
-    pe = [r['_seq'] for r in rows[:edge] if r['_age'] is not None and 0 <= r['_age'] < TRAJ_TIMEOUT_MS]
+    pe_rows = [r for r in rows[:edge] if r['_age'] is not None and 0 <= r['_age'] < TRAJ_TIMEOUT_MS]
+    pe = [r['_seq'] for r in pe_rows]
     miss_pre = [r['_seq'] for r in rows[:edge] if has_age and r['_age'] is None]
     if miss_pre:
         res['flags'].append(f'pre_edge_age_missing: empty traj_age_ms before the edge at {miss_pre[:5]}')
     res['pre_edge_motor_on_lines'] = len(pre)
     res['pre_edge_packet_seqs'] = pe[:20]
-    if pe:
-        res['flags'].append(f'pre_edge_packet: {len(pe)} lines before the edge with a fresh packet '
-                            f'or a non-zero command')
-    if has_age and e['_age'] is not None and (e['_age'] < 0 or e['_age'] > EDGE_AGE_MS):
+    # traj_age_ms counts from the RECEIVE time (receiver snapshot, main.c 528-541) but run_active needs the
+    # packet moved by traj_task every 10 ms (main.c 75-90, 520-525, 611): with the motor on in AUTO the
+    # first packet comes 1-2 lines before the edge (CAR_LIFTED 2026-11-14_run01: 9/15 runs, 7-21 ms).
+    # Lag = edge time - receive time of the earliest fresh packet before the edge, a number; flag only
+    # from TRAJ_TIMEOUT_MS: a packet that old not running means motor off or MANUAL (Liam 14/11 CODE_CAM
+    # local_ed93bb1a "Bao so, co tu 200 ms (Recommended)"; tighter limit locked at C8)
+    lag = (max((t0 - (r['_t'] - 1000 * r['_age'])) / 1e3 for r in pe_rows) if pe_rows else None)
+    res['pre_edge_packet_lag_ms'] = lag
+    if lag is not None:
+        if lag >= TRAJ_TIMEOUT_MS:
+            res['flags'].append(f'pre_edge_packet: a fresh packet received {lag:.0f} ms before the edge '
+                                f'({len(pe)} lines before the edge, 0 <= traj_age_ms < {TRAJ_TIMEOUT_MS})')
+        else:
+            res['notes'].append(f'pre_edge_packet_lag: first packet {lag:.0f} ms before the edge '
+                                f'({len(pe)} lines; flag from {TRAJ_TIMEOUT_MS} ms)')
+    if has_age and e['_age'] is not None and e['_age'] > EDGE_AGE_MS:
         # diagnostic number only: no locked criterion (CP1-5)
         res['notes'].append(f'edge_age: traj_age_ms {e["_age"]} at the edge (DE XUAT reference {EDGE_AGE_MS} ms)')
+    # run_active = 1 needs a transferred packet (main.c 524, 611), and once a packet came the age is >= 0
+    # (main.c 535-541): a run_active line with age < 0 is an inconsistent log, not a number (CP2-3)
+    neg_ra = [r['_seq'] for r in rows[edge:] if r['_ra'] and r['_age'] is not None and r['_age'] < 0]
+    if neg_ra:
+        res['flags'].append(f'ra_age_negative: run_active = 1 with traj_age_ms < 0 at log_seq {neg_ra[:5]}')
 
     # run_active stretch from the edge to the end anchor
     end = None
