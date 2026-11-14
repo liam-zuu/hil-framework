@@ -48,3 +48,4 @@ bnoemu_pc/build/bnoemu_harness.exe run 10000 600     # one scenario, key=value o
 | `core_wrap` | core only, no host: RST held while a frozen sample's age passes 2³² µs, released 1 ms after, sensor enabled straight in the core: no report built until the plant moves (covers a host faster than the SH-2 driver above) |
 | `pend_stale read\|disable` | core only: reports pending behind an unread input packet when the sample turns stale (no report due then); the host reads the queue (`read`) or first disables the sensor (`disable`): no report built after that (Codex BNOW-R1-1) |
 | `stale_edge <period> <due_age_us> [n]` | core only: first report due at sample age `due_age_us`; built exactly when `due_age_us` < n × period (64-bit) and under 2³¹ µs (Codex BNOW-R1-2) |
+| `pend_two` | core only: sensors 0 and 1 pending on a fresh sample; disabling sensor 0 drops its pending report only; after the read a report of sensor 1 alone is built (Codex BNOW-R2-1) |

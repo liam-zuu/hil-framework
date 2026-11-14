@@ -17,7 +17,8 @@
  *              stale_gap (seconds = gap with the plant frozen; 4th arg "held":
  *              RST low during the gap, "held_wrap": same, gap ending at a
  *              sample age of 2^32 us, see sc_stale_gap), core_wrap, pend_stale
- *              read|disable, stale_edge <period> <due_age_us> [stale_periods] (no host)
+ *              read|disable, pend_two, stale_edge <period> <due_age_us> [stale_periods]
+ *              (no host)
  * Environment BNOEMU_H7_PORT=1 (G2, 28/10): the emulator is driven the way the
  * H7 layer stm32h7/Core/Src/bno_emu_port.c drives it: core poll, new plant
  * sample and INT pin only on a 100 us tick (TIM6); MISO comes from a DMA buffer
@@ -324,6 +325,7 @@ static uint8_t  hk_state[BNO_EMU_N_SENSORS][256];
 static int      hk_last_seq[BNO_EMU_N_SENSORS] = { -1, -1, -1 };
 static uint32_t hk_reset_done, hk_hold_on, hk_hold_off, hk_rpt_in_hold, hk_qfull;
 static uint32_t hk_built, hk_read, hk_received, hk_seq_gap, hk_read_not_built, hk_rx_not_read;
+static uint32_t hk_built_s[BNO_EMU_N_SENSORS];  /* REPORT events per sensor */
 static bool     hk_in_hold;
 
 static void hook(void *ctx, const bno_emu_event_t *ev)
@@ -337,6 +339,7 @@ static void hook(void *ctx, const bno_emu_event_t *ev)
         if (ev->flags & BNO_EV_QFULL) { hk_qfull++; hk_state[ev->sensor][ev->rpt_seq] = HK_NONE; }
         else hk_state[ev->sensor][ev->rpt_seq] = HK_QUEUED;
         hk_built++;
+        hk_built_s[ev->sensor]++;
         break;
     case BNO_EV_PKT_READ:
         for (unsigned i = 0; i < BNO_EMU_N_SENSORS; i++) {
@@ -782,11 +785,11 @@ static void sc_core_wrap(void)
     advance(1000u);                              /* the core takes the sample (20 us core, 100 us port) */
     uint64_t t_load = emu.t_seq_change_us;       /* < 2^32 here: the 64-bit time */
     advance(t_load + (1ull << 32) + 1000u - now);
-    double age_rel = (double)(now - t_load) * 1e-6;
+    uint64_t age_rel = now - t_load;
     if (port_mode) port_reset(false); else bno_emu_set_reset(&emu, false, (uint32_t)now);
     advance(emu.cfg.boot_delay_us + 1000u);
     uint32_t built0 = hk_built;
-    double age_on = (double)(now - t_load) * 1e-6;
+    uint64_t age_on = now - t_load;
     emu.period_us[0] = 50000u;
     emu.next_due_us[0] = (uint32_t)now;
     advance(200000u);
@@ -795,8 +798,9 @@ static void sc_core_wrap(void)
     plant_on = true;
     advance(200000u);
     uint32_t built_after = hk_built - built0 - built;
-    printf("core_wrap.state=%d\ncore_wrap.age_release_s=%.6f\ncore_wrap.age_enable_s=%.6f\n"
-           "core_wrap.built_frozen=%u\ncore_wrap.built_after=%u\n", state, age_rel, age_on, built, built_after);
+    printf("core_wrap.state=%d\ncore_wrap.age_release_us=%llu\ncore_wrap.age_enable_us=%llu\n"
+           "core_wrap.built_frozen=%u\ncore_wrap.built_after=%u\n", state, (unsigned long long)age_rel,
+           (unsigned long long)age_on, built, built_after);
     if (state != BNO_EMU_RUNNING) fail("emulator not running after the release (state %d)", state);
     if (built) fail("%u reports built on a sample frozen 2^32 us", built);
     if (built_after == 0) fail("no report built after the plant moved");
@@ -808,6 +812,7 @@ static void sc_core_wrap(void)
  * (0): built exactly when due_age_us < n x period_us (n x period in 64 bits)
  * and due_age_us < 2^31 us. */
 static void core_read_all(void);
+static void core_set_feature(uint8_t id, uint32_t interval_us);
 static void sc_stale_edge(uint32_t period_us, uint32_t due_age_us, uint32_t n)
 {
     advance(emu.cfg.boot_delay_us + 1000u);
@@ -825,8 +830,37 @@ static void sc_stale_edge(uint32_t period_us, uint32_t due_age_us, uint32_t n)
     core_read_all();                             /* the input packet, if built, leaves the queue */
     plant_on = true;
     emu.cfg.stale_periods = 3u;
-    advance(2u * period_us + 1000u);
+    emu.period_us[0] = 10000u;                   /* resume check at a short period */
+    emu.next_due_us[0] = (uint32_t)now + 10000u;
+    advance(30000u);
     if (hk_built == built0 + built) fail("no report built after the plant moved");
+}
+
+/* Two sensors, sample always fresh (Codex BNOW-R2-1, 14/11). Core only:
+ * sensors 0 and 1 at 10 ms, enabled together; the first due builds an input
+ * packet nobody reads, the second leaves both pending. The host then disables
+ * sensor 0 (Set Feature, interval 0): its pending report goes, sensor 1's
+ * stays; after the host reads the queue, a report of sensor 1 only is built. */
+static void sc_pend_two(void)
+{
+    advance(emu.cfg.boot_delay_us + 1000u);
+    for (unsigned i = 0; i < 2; i++) {
+        emu.period_us[i] = 10000u;
+        emu.next_due_us[i] = (uint32_t)now + 10000u;
+    }
+    advance(21000u);                             /* dues at +10 ms (packet), +20 ms (pending) */
+    int p0 = emu.pend[0], p1 = emu.pend[1];
+    core_set_feature(0x01, 0u);                  /* accelerometer = sensor 0 */
+    int q0 = emu.pend[0], q1 = emu.pend[1];
+    uint32_t b0 = hk_built_s[0], b1 = hk_built_s[1];
+    core_read_all();
+    advance(2000u);                              /* next due of sensor 1 at +30 ms: not yet */
+    printf("pend_two.before=%d,%d\npend_two.after_disable=%d,%d\npend_two.built_after_read=%u,%u\n",
+           p0, p1, q0, q1, hk_built_s[0] - b0, hk_built_s[1] - b1);
+    if (!(p0 && p1)) fail("both sensors not pending before the disable (scenario did not set it up)");
+    if (q0 || !q1) fail("after disabling sensor 0: pending %d,%d (want 0,1)", q0, q1);
+    if (hk_built_s[0] != b0 || hk_built_s[1] != b1 + 1u)
+        fail("after the read: built %u,%u (want 0,1)", hk_built_s[0] - b0, hk_built_s[1] - b1);
 }
 
 /* Core-level host transactions for the pending tests (no SH-2 library). */
@@ -947,6 +981,7 @@ int main(int argc, char **argv)
                                                         argc > 4 && strcmp(argv[4], "held_wrap") == 0);
     else if (strcmp(sc, "core_wrap") == 0) sc_core_wrap();
     else if (strcmp(sc, "pend_stale") == 0) sc_pend_stale(argc > 2 ? argv[2] : "read");
+    else if (strcmp(sc, "pend_two") == 0)   sc_pend_two();
     else if (strcmp(sc, "stale_edge") == 0) sc_stale_edge(period, argc > 3 ? (uint32_t)strtoul(argv[3], NULL, 10) : 0u,
                                                           argc > 4 ? (uint32_t)strtoul(argv[4], NULL, 10) : 3u);
     else { printf("unknown scenario\n"); return 2; }

@@ -112,10 +112,9 @@ def test_core_rst_release_at_clock_wrap(mode):
     kv = run('core_wrap', mode=mode)
     assert kv['core_wrap.built_frozen'] == '0'
     assert int(kv['core_wrap.built_after']) > 0
-    # Codex BNOW-R1-3: ages from the time the core took the sample
-    rel = float(kv['core_wrap.age_release_s']) - 2**32 * 1e-6
-    on = float(kv['core_wrap.age_enable_s']) - 2**32 * 1e-6
-    assert 0.0009 < rel < 0.0011 and on < 0.150 - 0.001, (rel, on)
+    # Codex BNOW-R1-3, R2-3: ages from the time the core took the sample, exact (the harness picks the times)
+    assert int(kv['core_wrap.age_release_us']) == 2**32 + 1000
+    assert int(kv['core_wrap.age_enable_us']) == 2**32 + 1000 + 20_000 + 1000     # boot delay 20 ms, then 1 ms
 
 
 @pytest.mark.parametrize('how', ['read', 'disable'])
@@ -123,10 +122,22 @@ def test_pending_report_not_built_once_stale(how, mode):
     """Codex BNOW-R1-1: reports that fell due on a fresh sample but wait behind an unread
     input packet are not built once the sample is stale: 'read' the host reads the
     queue after the threshold, with no report due then; 'disable' the host disables
-    the sensor first (its waiting report goes)."""
+    the only sensor first. With one sensor, the stale check drops the pending report
+    anyway (pmin 0), so 'disable' does not show the drop in handle_control
+    (Codex BNOW-R2-1): test_disable_one_of_two_pending_sensors does."""
     kv = run('pend_stale', how, mode=mode)
     assert kv['pend_stale.pend_before'] == '1'
     assert kv['pend_stale.built_after_read'] == '0'
+
+
+def test_disable_one_of_two_pending_sensors(mode):
+    """Codex BNOW-R2-1: two sensors pending on a fresh sample; disabling sensor 0 drops
+    its pending report only (sensor 1 keeps its own), and after the read a report of
+    sensor 1 alone is built."""
+    kv = run('pend_two', mode=mode)
+    assert kv['pend_two.before'] == '1,1'
+    assert kv['pend_two.after_disable'] == '0,1'
+    assert kv['pend_two.built_after_read'] == '0,1'
 
 
 @pytest.mark.parametrize('period,due_age,n,built', [
@@ -134,6 +145,9 @@ def test_pending_report_not_built_once_stale(how, mode):
     (10_000, 30_000, 3, 0),          # at 3 periods: stale
     (1_000_000, 2_900_000, 3, 1),    # 2.9 s old but under 3 periods: no early latch
     (65_536, 131_072, 65_537, 1),    # n x period = 2^32 + 2^16 us: needs the 64-bit product
+    # Codex BNOW-R2-2: threshold above 2^31 us, so the latch alone decides near 2^31
+    (1_000_000_000, 2**31 - 48, 3, 1),   # just under the latch: fresh
+    (1_000_000_000, 2**31, 3, 0),        # at the latch: stale
 ])
 def test_stale_threshold_edge(period, due_age, n, built, mode):
     """Codex BNOW-R1-2: a report due at sample age due_age is built exactly when
