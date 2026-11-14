@@ -40,6 +40,15 @@ hil_o1_score.py, or of the camera scorer with the same keys) and <results_dir>/<
   e_trk_max                          e_trk_max
   tv_duty                            tv_duty_esp32() above (NOT the scorer's tv_duty_h7_1khz)
   flag                               HIL: track_err_frames > 0; camera: n_back_frames > 0
+t_end on the ESP32 clock (S05 4.7 (i), RS-4; Liam 14/11 CODE_RS4 local_c3031475, Q4 "Giữ công thức, ghi sai
+lệch (Recommended)"; design 03_CODE/docs/2026-11-14_Thiet_ke_RS4_so_phien_MOSI_v1.md section 10): the window
+end stays t = 0 + t_end on the ESP32 log; each HIL run reports the estimated error of that end,
+  t_end_err_ms = t_end x (|esp_pi_ppm| + ESP_PPM_NOISE + |pi_period_ppm|) x 1e-3
+esp_pi_ppm: the ESP32 / Pi rate estimate of the run (score edge_map, from the logger WiFi packets);
+pi_period_ppm: the Pi step period against the nominal 1 ms (score key if present, else PI_PERIOD_PPM_BOUND);
+no esp_pi_ppm: the RHO_PRIOR_PPM bound (12 ms at 12 s). Report only; the line choice is unchanged. Car runs:
+the camera clock goes to the ESP32 through C7b, not here (column empty, 'xe: C7b').
+
 Each cell (controller x condition x platform x gain set): n_valid, n_dat / n_khong_dat / n_chua_ket_luan,
 n_flag, and per quantity median and max over the valid runs that have a number, n_m, and the reason of
 every valid run without a number. The quantity list is fixed here (do not change after seeing numbers).
@@ -72,6 +81,22 @@ GAIN_SETS = ('khoi_dau', 'A', 'B')
 CONTROLLERS = ('PID', 'LADRC')
 QUANTITIES = ('e_perp_max', 'e_theta_lane_max_deg', 'e_theta_cmd_max_deg', 'e_s_absmax', 'e_trk_max', 'tv_duty')
 VALID = ('dat', 'khong_dat', 'chua_ket_luan')
+# t_end error (S05 4.7 (i), Liam 14/11 CODE_RS4 Q4)
+ESP_PPM_NOISE = 50.0               # spread of the per-run esp_pi_ppm estimate (13/11: 12 runs -52..+31 ppm)
+PI_PERIOD_PPM_BOUND = 100.0        # [DE XUAT] when the score has no pi_period_ppm (run14: -12 / -12 / -13 ppm)
+RHO_PRIOR_PPM = 1000.0             # ESP32 vs H7 rate bound of RS-4 (Liam 13/11, L100), when esp_pi_ppm is missing
+
+
+def t_end_err_ms(t_end_s, esp_pi_ppm=None, pi_period_ppm=None):
+    """Estimated error (ms) of t = 0 + t_end on the ESP32 log of a HIL run (module docstring), and its source."""
+    if t_end_s is None:
+        return None, 'khong co t_end'
+    t = abs(float(t_end_s))
+    if esp_pi_ppm is None:
+        return t * RHO_PRIOR_PPM * 1e-3, f'khong co esp_pi_ppm: can {RHO_PRIOR_PPM:g} ppm'
+    pi = PI_PERIOD_PPM_BOUND if pi_period_ppm is None else abs(float(pi_period_ppm))
+    src = 'esp_pi_ppm + nhieu + ' + ('can Pi' if pi_period_ppm is None else 'pi_period_ppm')
+    return t * (abs(float(esp_pi_ppm)) + ESP_PPM_NOISE + pi) * 1e-3, src
 
 
 # ---------------------------------------------------------------- tv_duty
@@ -215,6 +240,12 @@ def load_runs(dataset, score_name, esp32_name):
             run['flag'] = (int(score.get('track_err_frames') or 0) > 0 if plat[1] == 'HIL'
                            else int(score.get('n_back_frames') or 0) > 0)
             run['tv_check'] = tv
+            if plat[1] == 'HIL':
+                em = score.get('edge_map') or {}
+                run['t_end_err_ms'], run['t_end_err_src'] = t_end_err_ms(
+                    score.get('t_end'), em.get('esp_pi_ppm'), score.get('pi_period_ppm'))
+            else:
+                run['t_end_err_ms'], run['t_end_err_src'] = None, 'xe: C7b'
         runs.append(run)
     return runs, problems
 
@@ -280,7 +311,7 @@ def write_table(runs, out_dir):
     with open(os.path.join(out_dir, 'S05_final_table.md'), 'w', encoding='utf-8') as f:
         f.write(markdown(table))
     rcols = ['run_uid', 'platform', 'controller', 'condition', 'gain_set', 'outcome', 'flag'] + list(QUANTITIES) + \
-            ['tv_reason', 'tv_d_tick', 'tv_d_seq', 'tv_end_gap_ms', 'results_dir']
+            ['tv_reason', 'tv_d_tick', 'tv_d_seq', 'tv_end_gap_ms', 't_end_err_ms', 't_end_err_src', 'results_dir']
     with open(os.path.join(out_dir, 'S05_final_runs.csv'), 'w', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=rcols)
         w.writeheader()
@@ -291,7 +322,9 @@ def write_table(runs, out_dir):
                             condition=r['condition'], gain_set=r['gain_set'], outcome=r['outcome'],
                             flag=r.get('flag', ''), **{q: ('' if v.get(q) is None else v[q]) for q in QUANTITIES},
                             tv_reason=tv.get('reason', ''), tv_d_tick=tv.get('d_tick', ''), tv_d_seq=tv.get('d_seq', ''),
-                            tv_end_gap_ms=tv.get('end_gap_ms', ''), results_dir=r['results_dir']))
+                            tv_end_gap_ms=tv.get('end_gap_ms', ''),
+                            t_end_err_ms='' if r.get('t_end_err_ms') is None else r['t_end_err_ms'],
+                            t_end_err_src=r.get('t_end_err_src', ''), results_dir=r['results_dir']))
     return table
 
 

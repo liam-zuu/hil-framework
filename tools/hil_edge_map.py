@@ -11,15 +11,18 @@ retried, and a line that never fits logs LOG_CNT_INVALID (dropped here). So ever
 [t_now, t_now + J_READ_US]. Logs of other firmware are refused (FW_COUNTS_AT_TICK, #fw lines of .events.txt).
 
 H7 apply times (h7_apply; L100, MISO v5: Liam 13/11 CODE local_4dc05b46 "Sửa gốc ở H7, phiên mới", Codex
-RS4-R4-1, R4-2). Every time is on the H7 clock (DWT CYCCNT / H7_CYC_PER_US, unwrapped); the Pi clock (t_send_ns)
-only checks the anchors and sets the widening E_ID_US (RS4-R8-1, R9-1).
-Each MISO answers a frame (identified by its raw MOSI CRC, its seq byte and the H7 frame count RX_NF minus one
-common offset, Codex RS4-R6-1; see h7_apply; every MOSI seq of the range must be its frame index & 0xFF, the Pi
-convention, so the LAG_MAX frames an answer can belong to carry distinct seq, Codex RS4-R7-1; that names at most
-one frame, not that the answer's source is in the log, so every anchor's receive must also sit within R_ID_US of
-one least-squares line in the Pi send times of the frames, rate within RHO_MAX_PPM, the edge must lie at least
-START_MARGIN_FRAMES after the first anchor, and the bracket is widened by E_ID_US in H7 time before it becomes
-steps, Codex RS4-R8-1, R9-1; assumptions below) with the CYCCNT of its receive (RX_CYC) and the apply
+RS4-R4-1, R4-2; RS-4 P1, MOSI v4 / MISO v6, 48-byte frames: Liam 14/11 CODE_RS4 local_c3031475 "Làm P1, 48 byte",
+03_CODE/docs/2026-11-14_Thiet_ke_RS4_so_phien_MOSI_v1.md). Every time is on the H7 clock (DWT CYCCNT /
+H7_CYC_PER_US, unwrapped); the Pi clock only bounds the number of CYCCNT wraps between anchors (B4), it is not
+a time axis.
+Frame identity (P1, replaces the inference of the closed RS-4 ff616ab and its assumptions A1-A3): the Pi writes in
+every MOSI the run_id of the run (bytes 40-43, drawn per run, never 0) and the frame_no (bytes 44-47, = the
+frame log index = the plant step); the H7 copies MOSI 40-47 of the frame it answers into MISO 40-47, from the same
+raw copy as the MOSI CRC, the receive stamp and the apply window. A MISO with a good MISO CRC answers frame f of
+this log iff its MISO 40-43 is the run_id of the log and MISO 44-47 is f; its MOSI CRC must then equal the CRC
+of the logged MOSI of frame f (else the H7 applied other bytes: refused). Replies carrying another run_id (a run
+before this one) are not of this log: skipped and counted (foreign_n). Every MOSI of the range must carry the log
+run_id and its own index as frame_no (the Pi convention; else refused). With the CYCCNT of its receive (RX_CYC) and the apply
 window: the speeds of that frame took effect in rx + [pre_us, pre_us + 4 dur4] (CYCCNT right before the first
 and right after the last EncoderGen_SetOmega, pre rounded down, end rounded up; hil_protocol.h). Status bits
 1-6 count the replies the H7 staged, one per applied frame: consecutive answered frames must step it by 1, else
@@ -33,18 +36,26 @@ no receive stamp, only its order (RX_NF): an H7 time between the receives of ans
 maps to steps in [a, b] (both ends taken: early to a, late to b; Codex RS4-R5-1); between a and a + 1 it is
 interpolated.
 
-Assumptions of the frame identity (RS-4 closed on them 13/11/2026, Liam CODE local_9951f4b7 "sửa hẹp và đóng RS-4 ở
-thời điểm hiện tại đi, ghi vào sẽ tiếp tục làm tới cùng RS-4 khi còn thời gian"; Codex RS4-R9-1 not re-reviewed):
-(A1) t_send_ns is the Pi CLOCK_MONOTONIC read right before each transfer (rpi5/hil_node.py, time.monotonic_ns();
-it never steps, it is only slewed); the Pi is the only SPI master, so the H7 receives frame k at the Pi time
-t_send[k] plus a delay. (A2) That delay sits within J_SEND_US of one straight line in t_send over the whole log
-(two crystal clocks, rate within RHO_MAX_PPM). (A3) The H7 holds at most one staged reply besides the one on the
-wire (spi1_handler.c, two TX buffers): a reply of a frame received before the log can only go out before the
-first reply of a log frame, and no stream of replies runs 256 frames late. With (A1)-(A3): at a true anchor the
-fitted line is within R_ID_US + J_SEND_US of the true one (Codex RS4-R9-1: the least-squares line may move by
-more than R_ID_US), so any anchor that passes is within E_ID_US = 2 R_ID_US + 2 J_SEND_US of the true receive of
-the frame it is labelled with (between the extreme true anchors; START_MARGIN_FRAMES keeps the edge away from
-the anchors a stale reply could make at the start).
+Assumptions of the frame identity (P1; design section 4.3): (B1) the four things the H7 sends for one answered
+frame (RX_CYC, the apply window, the MOSI CRC, MISO 40-47) come from the one raw copy of the frame it applied
+(main.c read; the unchanged spi1_handler.c run on the PC by stm32h7/pc_tests/spi1 id_crc_stamp_same_frame and
+id_apply_same_frame_with_interrupts, frames landing where the mask is lifted, with a main loop written like
+main.c's, not main.c itself; Codex RS4-R10-3). (B2) The run_id
+of the log differs from the run_id of every run the H7 answered since it booted (rpi5/protocol.py new_run_id:
+32 random bits, never 0; two runs share one with probability 2^-32). (B3) A MISO that is not what the H7 sent
+passes the MISO CRC-16 with probability 2^-16 (as before P1). (B4, Codex RS4-R10-1; Liam 14/11 CODE_RS4
+local_c3031475 "Sửa hẹp + vòng 11 (Recommended)") RX_CYC is CYCCNT mod 2^32, one wrap every 8.95 s; B1-B3 fix
+which frame a reply is, not how many wraps lie between two anchors. t_send_ns is the Pi CLOCK_MONOTONIC read
+right before each transfer (rpi5/hil_node.py), it increases, and over a few seconds it runs within RHO_MAX_PPM of
+the H7 clock; the H7 receives a frame (DMA end, inside the Pi transfer) after its t_send and less than 3 s after
+it. Two consecutive anchors must be less than ANCHOR_GAP_MAX_S apart in t_send (and in order), else refused
+(also a log without t_send_ns): then their true H7 span is in (0, ANCHOR_GAP_MAX_S / (1 - rho) + 3 s), rho =
+RHO_MAX_PPM * 1e-6, so under 4.0011 s (Codex RS4-R11-1, R12-1), inside the 4.47 s half wrap: the nearest unwrap
+is the true one. The Pi time is used for nothing else: not a time axis, not a bracket term,
+no bound on the Pi -> H7 delay inside a step (A1, A2 of ff616ab are not used), nothing on how many replies the
+H7 holds (A3). Frame logs of 40-byte frames
+(before P1) carry no run_id: refused here; they were mapped by ff616ab (L103: each result names its mapper
+commit).
 
 EncoderGen model (EncModel; Codex RS4-R3-1). The count rate of frame k is 2 ENC_TIMER_HZ / hp_k, hp_k the integer
 half period encoder_gen.c computes in float32 from the float32 wheel speed the H7 decodes (not the nominal
@@ -73,8 +84,9 @@ drift use J / (1 - rho) and rho / (1 - rho) D (Codex RS4-R5-4); the rate is unkn
 coarse pass (COARSE_US cells) then GRID_US cells inside the kept coarse cells: the Lipschitz term covers each
 whole cell, so no fitting s is missed (RS4-R3-4). The kept cells must form ONE interval [s_lo, s_hi] away from
 the search ends (no alias). The edge tick is at H7 time in [s_lo, s_hi] (the apply windows are inside the
-tolerance), given as plant steps of [s_lo - E_ID_US, s_hi + E_ID_US] (h7_to_steps: interpolated between
-consecutive answered frames, the anchors across a gap; E_ID_US, RS4-R8-1): early_step, late_step, edge_step the middle; U_t = period x half the width in steps (the scorer's time scale, RS4-R3-5). The O1 schedule and the plant
+tolerance), given as plant steps of [s_lo, s_hi] (h7_to_steps: interpolated between consecutive answered frames,
+the anchors across a gap; each anchor is the true receive of its frame, read from the reply, so no widening:
+P1 drops E_ID_US of ff616ab): early_step, late_step, edge_step the middle; U_t = period x half the width in steps (the scorer's time scale, RS4-R3-5). The O1 schedule and the plant
 steps run on the Pi, so no drift to t_deadline enters on HIL. The spacing of the firmware ticks is not added;
 the edge tick itself is bracketed (O1 v11.12 3.5, Q2: THESIS 14/11, Liam "Chấp nhận" at THESIS local_701fb2e3;
 CODE may drop the label: Liam 14/11 CODE local_9951f4b7 "duyệt luật S05 v3.15 nhé").
@@ -87,9 +99,10 @@ the 10 ms tick, H7 capture, frame answer) [ĐỀ XUẤT]. The PWM checks of roun
 still refuse; the PWM side can only refuse more, never move the bracket.
 
 Refused (ok False, reason) when: firmware not in FW_COUNTS_AT_TICK or no events file; frame log without MOSI /
-MISO, or without t_send_ns; a MOSI seq of the range (to k_hi + LAG_MAX) not its frame index & 0xFF; an anchor
-receive more than R_ID_US off the Pi send line (or its rate off by more than RHO_MAX_PPM); the early bound less
-than START_MARGIN_FRAMES after the first anchor; MISO not v5, an apply window saturated, an applied frame without its reply (stage gap); not exactly one
+MISO; frames shorter than FRAME_V6 (40-byte logs before P1); a MOSI of the range (to k_hi + LAG_MAX) whose run_id
+is 0 or not the log's, or whose frame_no is not its index; a reply of this run naming a frame not yet sent, or
+whose MOSI CRC is not that of the frame it names; MISO not v5, an apply window saturated, an applied frame without its reply (stage gap); no
+t_send_ns, or two consecutive answered frames not in (0, ANCHOR_GAP_MAX_S) apart in t_send (B4); not exactly one
 run_active rising edge; the edge line does not follow a run_active = 0 line with the next log_seq (G32-4); the
 edge line has LOG_CNT_INVALID counts; a frame lost before the H7 or answered twice differently; counts never move; no
 fitting cell, more than one interval, or one on the search range end; bracket wider than BRACKET_MAX_STEPS;
@@ -141,7 +154,10 @@ TOL_MARGIN = 1.0                 # [ĐỀ XUẤT]
 COARSE_US, GRID_US = 250.0, 10.0  # cells of s: coarse pass, then fine cells inside kept coarse cells
 MISO_CRC, MISO_MOSI_CRC, MISO_RX_CYC, MISO_RX_NF, MISO_AGE = 8, 10, 12, 18, 20   # hil_protocol.h (a test checks)
 MISO_STATUS, STATUS_V5, STAGE_MOD = 16, 0x80, 64   # v5 (L100): bit 7 mark, bits 1-6 replies staged mod 64
-MISO_SEQ, MOSI_SEQ, LAG_MAX = 17, 21, 8   # hil_protocol.h; answer lags considered (R6-1: identity by CRC, seq, RX_NF)
+MISO_SEQ, MOSI_SEQ, LAG_MAX = 17, 21, 8   # hil_protocol.h; frames the log must hold after k_hi (replies of the range)
+FRAME_V6, MOSI_ID, MISO_ID = 48, 40, 40   # RS-4 P1 (hil_protocol.h SPI1_FRAME_LEN, HIL_MOSI_ID, HIL_MISO_ID; a test checks)
+ANCHOR_GAP_MAX_S = 1.0           # [ĐỀ XUẤT] B4: consecutive anchors' Pi send times closer than this, else refused
+CYC_HALF_WRAP_S = 2.0 ** 31 / (H7_CYC_PER_US * 1e6)   # 4.47 s: np.unwrap of CYCCNT is exact below this span
 APPLY_PRE_MAX, APPLY_DUR_SHIFT, APPLY_DUR_MAX, APPLY_DUR_UNIT_US = 2047, 11, 31, 4   # bytes 20-21, v5
 PWM_LAG_MAX_STEPS = 15.0         # [ĐỀ XUẤT] tick compute (< 10 ms) + capture + frame answer
 PWM_SLACK_STEPS = 0.5            # [ĐỀ XUẤT] the PWM fit puts ticks on k x period, frames move <= 0.15 step
@@ -156,11 +172,6 @@ BRACKET_MAX_STEPS = 25.0         # Liam 13/11 CODE local_b3611c27 "Nới trần 
                                  # of CLOSED_LOOP/2026-11-13_run14 bracket 21-22 steps with RHO_MAX_PPM)
 RIDGE_FRAC = 0.25                # [ĐỀ XUẤT] alias test (_unique, PWM side)
 RHO_MAX_PPM = 1000.0             # ESP32 vs H7 clock rate, unknown inside (Liam 13/11, L100)
-R_ID_US = 100.0                  # [ĐỀ XUẤT] anchor vs Pi send line (Codex RS4-R8-1, R9-1; Liam 13/11 CODE
-                                 # local_9951f4b7); run14: largest residual 27 us over the whole log
-J_SEND_US = 100.0                # [ĐỀ XUẤT] assumption (A2): Pi send -> H7 receive delay off one line
-E_ID_US = 2.0 * R_ID_US + 2.0 * J_SEND_US   # H7 time widening of the bracket before steps (A1-A3, RS4-R9-1)
-START_MARGIN_FRAMES = 20         # [ĐỀ XUẤT] the early step at least this far after the first anchor (A3)
 WHEELS = ('fl_count', 'fr_count', 'rl_count', 'rr_count')
 PWMS = ('pwm_fl', 'pwm_fr', 'pwm_rl', 'pwm_rr')
 NEED = ('timestamp_us', 'log_seq', 'motor_on', 'run_active') + WHEELS + PWMS
@@ -368,61 +379,59 @@ class EncModel:
 
 
 def h7_apply(frames, k_lo, k_hi):
-    """H7 apply windows of the frames of [k_lo, k_hi) on the H7 clock (module docstring, L100). Which frame a MISO
-    answers (Codex RS4-R6-1): its candidates are the frames k with j - LAG_MAX <= k < j whose raw MOSI CRC AND seq
-    byte (MOSI 21, the Pi step & 0xFF) equal the MISO's MOSI_CRC and seq (MISO 17); every frame of [k_lo, k_hi +
-    LAG_MAX) must carry seq = k & 0xFF, else refused (Codex RS4-R7-1), so at most one candidate; each anchor's
-    receive must sit within R_ID_US of one line in the Pi send times (Codex RS4-R8-1); the H7 frame count RX_NF of the
-    answer minus k is one common offset (no frame of the range was lost before the H7, checked below): the offset
-    comes from the answers with exactly one candidate (all must agree), and every answer is the candidate that
-    fits it (none: refused). The lag order is not used as identity. Returns dict ok, apply_us / width_us (n, NaN
-    where not applied), applied (frame indices), n_not_applied, t_frame_us (n: H7 receive of each frame of the
-    range, unanswered ones interpolated, NaN outside), anchors, window stats; refuses (ok False, reason) as the
-    docstring says."""
+    """H7 apply windows of the frames of [k_lo, k_hi) on the H7 clock (module docstring, L100, RS-4 P1). Which frame a
+    MISO answers is read from it (P1): a MISO of transfer j with a good MISO CRC, MISO 40-43 = the log run_id and
+    MISO 44-47 = f answers frame f of this log; f must be < j (the reply of a frame not yet sent: refused) and its
+    MOSI CRC must be that of the logged MOSI of frame f (else refused). Every MOSI of [k_lo, k_hi + LAG_MAX) must
+    carry the log run_id (non-zero, the one of MOSI k_lo) and frame_no = its index (else refused). Replies with
+    another non-zero run_id are skipped and counted (foreign_n). Every transfer after k_lo is read, so a late reply
+    is found wherever it is. Consecutive answered frames must be sent by the Pi (t_send_ns) in order and less than
+    ANCHOR_GAP_MAX_S apart, so the CYCCNT unwrap is exact (B4, Codex RS4-R10-1). Returns dict ok, apply_us / width_us (n, NaN where not applied), applied (frame
+    indices), n_not_applied, t_frame_us (n: H7 receive of each frame of the range, unanswered ones interpolated,
+    NaN outside), anchors, run_id, foreign_n, window stats; refuses (ok False, reason) as the docstring says."""
     mosi = np.asarray(frames['mosi'], dtype=np.uint8)
     miso = np.asarray(frames['miso'], dtype=np.uint8)
     n = len(mosi)
+    if mosi.ndim != 2 or mosi.shape[1] < FRAME_V6 or miso.shape != mosi.shape:
+        return dict(ok=False, reason=f'frame log of {mosi.shape[-1]}-byte frames: no run_id / frame_no (MOSI v4, '
+                                     f'{FRAME_V6} bytes, RS-4 P1); logs before P1 were mapped by ff616ab (L103)')
     if k_lo < 0 or k_hi > n - LAG_MAX or k_hi - k_lo < 10:
         return dict(ok=False, reason=f'frames {k_lo}..{k_hi} not all inside the frame log (n = {n}) with answers')
     a, b = k_lo, k_hi
-    # Codex RS4-R7-1: the Pi writes seq = step & 0xFF (rpi5/protocol.py, hil_node.py seq=self._step) and the frame
-    # log index is the step. With that, the LAG_MAX frames an answer can belong to carry distinct seq, so CRC + seq
-    # name one frame; a frame breaking it (a repeated frame, seq included) is refused, not guessed
-    ks = np.arange(a, b + LAG_MAX)
-    off_seq = np.nonzero(mosi[a:b + LAG_MAX, MOSI_SEQ].astype(int) != (ks & 0xFF))[0]
-    if off_seq.size:
-        k0 = int(ks[off_seq[0]])
-        return dict(ok=False, reason=f'frame {k0}: MOSI seq {int(mosi[k0, MOSI_SEQ])} is not frame index & 0xFF '
-                                     f'({k0 & 0xFF}): which frame an answer belongs to is not known (Codex RS4-R7-1)')
-    crc = np.array([crc16(mosi[k]) for k in range(a, b)])
-    seq = mosi[a:b, MOSI_SEQ].astype(int)
+    u32 = lambda m, o: int(m[o]) | (int(m[o + 1]) << 8) | (int(m[o + 2]) << 16) | (int(m[o + 3]) << 24)  # noqa: E731
     u16 = lambda m, o: int(m[o]) | (int(m[o + 1]) << 8)  # noqa: E731
-    raw_ans = []                                                       # (candidates, payload)
-    for j in range(a + 1, b + LAG_MAX):
+    # the Pi writes run_id and frame_no = step in every MOSI (rpi5/hil_node.py) and the frame log index is the step
+    run_id = u32(mosi[a], MOSI_ID)
+    if run_id == 0:
+        return dict(ok=False, reason=f'frame {a}: MOSI run_id 0 (a frame log without run_id: not a P1 run)')
+    for k in range(a, b + LAG_MAX):
+        if u32(mosi[k], MOSI_ID) != run_id or u32(mosi[k], MOSI_ID + 4) != k:
+            return dict(ok=False, reason=f'frame {k}: MOSI run_id {u32(mosi[k], MOSI_ID):08x} / frame_no '
+                                         f'{u32(mosi[k], MOSI_ID + 4)} is not the log run_id {run_id:08x} and its '
+                                         'index: which frame a reply names is not known')
+    crc = {}
+    ans, foreign = {}, 0
+    for j in range(a + 1, n):
         m = miso[j]
         if not m.any() or u16(m, MISO_CRC) != crc16(bytes(m[:MISO_CRC]) + bytes(m[MISO_CRC + 2:])):
             continue
-        mc, ms = u16(m, MISO_MOSI_CRC), int(m[MISO_SEQ])
-        cands = [k for k in range(max(a, j - LAG_MAX), min(b, j)) if crc[k - a] == mc and seq[k - a] == ms]
-        if not cands:
+        rid, f = u32(m, MISO_ID), u32(m, MISO_ID + 4)
+        if rid != run_id:
+            foreign += rid != 0                       # a reply of another run (B2), or an H7 before v6 (0)
             continue
-        cyc = int(m[MISO_RX_CYC]) | (int(m[MISO_RX_CYC + 1]) << 8) | (int(m[MISO_RX_CYC + 2]) << 16) | \
-            (int(m[MISO_RX_CYC + 3]) << 24)
+        if f >= j:
+            return dict(ok=False, reason=f'transfer {j} carries a reply of frame {f}, not yet sent: the frame log is '
+                                         'not what the H7 answered')
+        if not a <= f < b:
+            continue
+        if f not in crc:
+            crc[f] = crc16(mosi[f])
+        if u16(m, MISO_MOSI_CRC) != crc[f]:
+            return dict(ok=False, reason=f'frame {f}: the MOSI CRC the H7 computed differs from the logged frame: '
+                                         'the H7 applied other bytes')
         # status without the SWA bit: a repeated answer carries the same stage
-        raw_ans.append((cands, (cyc, u16(m, MISO_AGE), u16(m, MISO_RX_NF), int(m[MISO_STATUS]) >> 1)))
-    offs = {(p[2] - c[0]) % 65536 for c, p in raw_ans if len(c) == 1}
-    if len(offs) != 1:
-        return dict(ok=False, reason=f'H7 frame count minus frame index not one offset over the answers with one '
-                                     f'candidate ({sorted(offs)[:4]}): a frame did not reach the H7, or which frame an '
-                                     'answer belongs to is not known')
-    off = offs.pop()
-    ans = {}
-    for c, p in raw_ans:
-        fit = [k for k in c if (p[2] - k) % 65536 == off]
-        if len(fit) != 1:
-            return dict(ok=False, reason=f'an answer (RX_NF {p[2]}) fits none of its candidate frames {c[:4]}: which '
-                                         'frame it belongs to is not known (Codex RS4-R6-1)')
-        ans.setdefault(fit[0], []).append(p)
+        ans.setdefault(f, []).append((u32(m, MISO_RX_CYC), u16(m, MISO_AGE), u16(m, MISO_RX_NF),
+                                      int(m[MISO_STATUS]) >> 1))
     bad = [k for k in range(a, b) if len(set(ans.get(k, ()))) > 1]
     if bad:
         return dict(ok=False, reason=f'frame {bad[0]} answered with different H7 receive / apply values; H7 apply '
@@ -461,29 +470,23 @@ def h7_apply(frames, k_lo, k_hi):
         i = int(np.argmax(sat))
         return dict(ok=False, reason=f'frame {used[i]}: H7 apply window saturated (pre {int(pre[i])} us, dur '
                                      f'{int(dur4[i]) * APPLY_DUR_UNIT_US} us): apply time not bounded')
+    # B4 (Codex RS4-R10-1): np.unwrap takes the nearest wrap, true only for spans under the half wrap; the Pi send
+    # times bound the span between consecutive anchors, nothing else is taken from them
+    ts = frames.get('t_send_ns')
+    if ts is None or len(ts) != n:
+        return dict(ok=False, reason='frame log without t_send_ns: the CYCCNT wraps between H7 receive stamps are not '
+                                     'bounded (B4, Codex RS4-R10-1)')
+    dts = np.diff(np.asarray(ts, dtype=np.int64)[used])
+    far = (dts <= 0) | (dts >= int(ANCHOR_GAP_MAX_S * 1e9))
+    if np.any(far):
+        i = int(np.argmax(far))
+        return dict(ok=False, reason=f'answered frames {used[i]} and {used[i + 1]} sent {dts[i] * 1e-9:.6f} s apart by '
+                                     f'the Pi (not in (0, {ANCHOR_GAP_MAX_S} s)): the H7 CYCCNT (one wrap every '
+                                     f'{2 * CYC_HALF_WRAP_S:.2f} s) cannot be unwrapped (B4, Codex RS4-R10-1)')
     cyc = np.unwrap(np.array([ans[k][0][0] for k in used], dtype=float), period=2.0 ** 32)
     rx = (cyc - cyc[0]) / H7_CYC_PER_US
     if np.any(np.diff(rx) <= 0):
         return dict(ok=False, reason='H7 receive stamps of the answered frames not increasing')
-    # Codex RS4-R8-1: CRC + seq name at most one frame of an answer's window, not that its source is in the log (a
-    # reply staged before the log, or one 256 frames late). The H7 receive of each anchor must sit on one line in
-    # the Pi send time of the frame it is labelled with: rx = alpha + beta t_send, |beta - 1| <= RHO_MAX_PPM, every
-    # residual <= R_ID_US (a wrong label is a frame period or more off). The line pins times, not labels:
-    # map_edge widens the bracket by E_ID_US before turning H7 time into steps (assumptions A1-A3, module docstring;
-    # Codex RS4-R9-1).
-    t_send = frames.get('t_send_ns')
-    if t_send is None:
-        return dict(ok=False, reason='frame log without t_send_ns: the anchors cannot be checked against the Pi send '
-                                     'times (Codex RS4-R8-1)')
-    ts = (np.asarray(t_send, dtype=np.int64)[used] - int(t_send[used[0]])) / 1000.0
-    A = np.column_stack([np.ones_like(ts), ts])
-    coef = np.linalg.lstsq(A, rx, rcond=None)[0]
-    resid = rx - A @ coef
-    i = int(np.argmax(np.abs(resid)))
-    if abs(coef[1] - 1.0) > RHO_MAX_PPM * 1e-6 or abs(resid[i]) > R_ID_US:
-        return dict(ok=False, reason=f'H7 receive of frame {used[i]} is {resid[i]:.0f} us off the line in the Pi send '
-                                     f'times (rate {(coef[1] - 1.0) * 1e6:+.0f} ppm; bounds {R_ID_US:.0f} us, '
-                                     f'{RHO_MAX_PPM:.0f} ppm): the answer may not be of that frame (Codex RS4-R8-1)')
     lo = rx + pre
     width = dur4 * float(APPLY_DUR_UNIT_US)
     if np.any(np.diff(lo) <= 0):
@@ -496,7 +499,8 @@ def h7_apply(frames, k_lo, k_hi):
     return dict(ok=True, apply_us=apply, width_us=wid, applied=np.array(used, dtype=np.int64),
                 n_not_applied=int(sum(np.diff(used) - 1)), t_frame_us=t_frame, range=[int(a), int(b)],
                 anchor_k=ua, anchor_us=rx, max_gap=int(np.max(np.diff(used))),
-                send_line=dict(rate_ppm=float((coef[1] - 1.0) * 1e6), max_resid_us=float(abs(resid[i]))),
+                max_anchor_send_gap_s=float(dts.max()) * 1e-9 if len(dts) else 0.0,
+                run_id=f'{run_id:08x}', foreign_n=int(foreign),
                 window_us=dict(max=float(width.max()), median=float(np.median(width)),
                                pre_max=float(pre.max())))
 
@@ -739,15 +743,14 @@ def map_edge(duty, k_run: int, esp: dict, period_s: float, frames=None) -> dict:
     k_run, frames = dict(mosi, miso, ...) of the frame log (None: refused). Returns a dict, ok True / False with
     reason."""
     period_us = period_s * 1e6
-    out = dict(ok=False, reason='', method='count_feasible_set_L100_h7_clock', k_run=int(k_run), period_s=period_s,
+    out = dict(ok=False, reason='', method='count_feasible_set_L100_h7_clock_P1_frame_id', k_run=int(k_run),
+               period_s=period_s,
                counts_per_rev=COUNTS_PER_REV, omega_min=OMEGA_MIN, fw=esp.get('fw'),
                esp_pi_ppm=esp.get('esp_pi_ppm'),
                constants=dict(fw_counts_at_tick=list(FW_COUNTS_AT_TICK), j_read_us=J_READ_US, fit_s=FIT_S,
                               tol_int=TOL_INT, e_start=E_START, retime_max=RETIME_MAX, tol_margin=TOL_MARGIN,
                               grid_us=GRID_US, coarse_us=COARSE_US, rho_max_ppm=RHO_MAX_PPM,
-                              r_id_us=R_ID_US, j_send_us=J_SEND_US, e_id_us=E_ID_US,
-                              start_margin_frames=START_MARGIN_FRAMES,
-                              bracket_max_steps=BRACKET_MAX_STEPS, pwm_lag_max_steps=PWM_LAG_MAX_STEPS,
+                              frame_len=FRAME_V6, anchor_gap_max_s=ANCHOR_GAP_MAX_S, bracket_max_steps=BRACKET_MAX_STEPS, pwm_lag_max_steps=PWM_LAG_MAX_STEPS,
                               pwm_windows_s=list(WINDOWS_S), pwm_cost_max=PWM_COST_MAX, min_corr=MIN_CORR,
                               unique_ratio=UNIQUE_RATIO))
     why = fw_check(esp.get('fw'))
@@ -798,18 +801,14 @@ def map_edge(duty, k_run: int, esp: dict, period_s: float, frames=None) -> dict:
         out['reason'] = c['reason']
         return out
     early_t, late_t = c['s_lo'], c['s_hi']                            # apply windows are inside the tolerance
-    # Codex RS4-R8-1: each anchor is within E_ID_US of the true H7 receive of its frame, so the steps of the H7
-    # times [early_t - E_ID_US, late_t + E_ID_US] hold the edge step
-    early = h7_to_steps(early_t - E_ID_US, ap['anchor_k'], ap['anchor_us'])[0]
-    late = h7_to_steps(late_t + E_ID_US, ap['anchor_k'], ap['anchor_us'])[1]
+    # RS-4 P1: each anchor is the H7 receive of the frame its reply names, so no widening (E_ID_US of ff616ab)
+    early = h7_to_steps(early_t, ap['anchor_k'], ap['anchor_us'])[0]
+    late = h7_to_steps(late_t, ap['anchor_k'], ap['anchor_us'])[1]
     a_step = 0.5 * (early + late)
     out.update(early_step=early, late_step=late, edge_step=a_step, offset_ms=(a_step - k_run) * period_s * 1e3,
                edge_h7_time_us=[early_t, late_t], u_t_s=0.5 * (late - early) * period_s,
                u_t_parts_s=dict(half_bracket_steps=0.5 * (late - early) * period_s))
-    if early < ap['anchor_k'][0] + START_MARGIN_FRAMES:
-        out['reason'] = (f'early bound {early:.2f} is less than {START_MARGIN_FRAMES} frames after the first anchor '
-                         f'{int(ap["anchor_k"][0])}: a reply staged before the log could be next to it (RS4-R9-1, A3)')
-    elif late - early > BRACKET_MAX_STEPS:
+    if late - early > BRACKET_MAX_STEPS:
         out['reason'] = f'bracket {late - early:.2f} steps > {BRACKET_MAX_STEPS}'
     elif not p['ok']:
         out['reason'] = f'PWM cross-check failed: {p["reason"]}'

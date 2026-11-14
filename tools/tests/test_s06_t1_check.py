@@ -15,6 +15,7 @@ import pytest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 sys.path[:0] = [os.path.join(ROOT, 'tools'), os.path.join(ROOT, 'rpi5')]
+from protocol import FRAME_SIZE as FRAME_LEN  # noqa: E402  RS-4 P1: 48-byte frames
 import s06_t1_check as t1  # noqa: E402
 from protocol import encode_state  # noqa: E402
 
@@ -31,13 +32,13 @@ def build(n=N, faults=None, period_us=1000.0):
     f = faults or {}
     rng = np.random.default_rng(5)
     t_send_ns = (np.arange(n) * period_us * 1e3 + rng.uniform(-12e3, 12e3, n)).astype(np.int64)
-    mosi = np.zeros((n, 40), dtype=np.uint8)
+    mosi = np.zeros((n, FRAME_LEN), dtype=np.uint8)
     for k in range(n):
         w = 10 * np.sin(k / 300.0)
         st = [w, -w, w, -w, 0.001 * k % 5, 0.0, 0.0, 0.1, 0.0, 0.2]
         imu = (0.1 * np.sin(k / 50), 0.0, 0.0, 9.81, 0.0)
         mosi[k] = np.frombuffer(encode_state(st, seq=k, imu=imu, imu_seq=k // 10), dtype=np.uint8)
-    miso = np.zeros((n, 40), dtype=np.uint8)
+    miso = np.zeros((n, FRAME_LEN), dtype=np.uint8)
     idx, seqs, rx_shift = 0, [0, 0, 0], 0
     reps = []                                             # (kind 0..2, seq, Pi send time of the frame, µs)
     for j in range(2, n):
@@ -50,7 +51,7 @@ def build(n=N, faults=None, period_us=1000.0):
         cyc = cyc_full & 0xFFFFFFFF
         if j in f.get('empty', ()):                       # S1: the H7 did not answer this frame
             continue
-        b = bytearray(40)
+        b = bytearray(FRAME_LEN)
         mc = crc(mosi[i]) ^ (1 if j in f.get('mixed', ()) else 0)
         b[10:12] = struct.pack('<H', mc)
         b[12:16] = struct.pack('<I', cyc)

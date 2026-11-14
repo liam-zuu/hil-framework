@@ -13,6 +13,7 @@ import pytest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 sys.path[:0] = [os.path.join(ROOT, 'tools'), os.path.join(ROOT, 'rpi5')]
+from protocol import FRAME_SIZE as FRAME_LEN  # noqa: E402  RS-4 P1: 48-byte frames
 import s06_frames_decode as dec  # noqa: E402
 from protocol import encode_state  # noqa: E402
 
@@ -36,7 +37,7 @@ def build(n=N, faults=(), imu_fn=None, idx0=0, enc_n0=0, cyc0=4_000_000_000, pre
     records made before the log and before those of the log (09/11, CLOSED_LOOP/2026-11-09_run08 b1_stop)."""
     rng = np.random.default_rng(3)
     t_send_ns = (np.arange(n) * 1e6 + rng.uniform(-20e3, 20e3, n)).astype(np.int64)
-    mosi = np.zeros((n, 40), dtype=np.uint8)
+    mosi = np.zeros((n, FRAME_LEN), dtype=np.uint8)
     for k in range(n):
         imu = imu_fn(k) if imu_fn else (0.1 * np.sin(k / 50), 0.0, 0.0, 9.81, 0.01 * k % 3.0)
         mosi[k] = np.frombuffer(encode_state([0.0] * 10, seq=k, imu=imu, imu_seq=k // 10), dtype=np.uint8)
@@ -87,12 +88,12 @@ def build(n=N, faults=(), imu_fn=None, idx0=0, enc_n0=0, cyc0=4_000_000_000, pre
                 if f[0] == 'tick_drop':
                     drop = (f[1] + (f[3] if k >= f[2] else 0)) & 0xFFFF
             queue.append((0x40, struct.pack('<IIIH', cyc[k] & 0xFFFFFFFF, cyc[k] & 0xFFFFFFFF, cyc[k] >> 32, drop)))
-    miso = np.zeros((n, 40), dtype=np.uint8)
+    miso = np.zeros((n, FRAME_LEN), dtype=np.uint8)
     pending, qi = [], 0                                        # H7 ring: records leave one per frame
     for j in range(2, n):
         pending += produced[j - 1]
         i = j - 2                                              # answer of frame i (N+2)
-        b = bytearray(40)
+        b = bytearray(FRAME_LEN)
         b[10:12] = struct.pack('<H', crc(mosi[i]))
         b[12:16] = struct.pack('<I', cyc[i] & 0xFFFFFFFF)
         b[17] = mosi[i][21]
@@ -200,7 +201,7 @@ def test_report_left_from_previous_link_period(clean):
     game RV REPORT record built there). Before the fix decode() stopped with KeyError: 0."""
     t, mosi, miso, seqs = clean
     miso = miso.copy()
-    b = bytearray(40)
+    b = bytearray(FRAME_LEN)
     b[17] = 31                                          # seq of an old frame: answers no frame of this log
     b[18:20] = struct.pack('<H', 20000)                 # rx_nf of the old frame
     b[22] = 0x12                                        # game RV REPORT, log index just before this log's
@@ -473,8 +474,8 @@ def _swa_frames(cmd, status, bad=()):
     """MOSI with byte 20 bit 3 = cmd[j]; MISO with status bit 0 = status[j] and a valid CRC,
     except frames in bad (all zero)."""
     n = len(cmd)
-    mosi = np.zeros((n, 40), np.uint8)
-    miso = np.zeros((n, 40), np.uint8)
+    mosi = np.zeros((n, FRAME_LEN), np.uint8)
+    miso = np.zeros((n, FRAME_LEN), np.uint8)
     for j in range(n):
         mosi[j, 20] = 0x08 if cmd[j] else 0
         if j in bad:

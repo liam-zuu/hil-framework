@@ -42,9 +42,22 @@ extern DWT_Type fake_dwt;
 
 extern int  fake_irq_disabled;
 extern long fake_irq_sections;
+/* RS-4 P1 (Codex RS4-R10-3): an interrupt pending while masked runs when the
+ * mask is lifted. The harness may arm fake_irq_hook to fire at the n-th
+ * unmask from now (fake_irq_hook_in = n): one-shot, cleared before it runs. */
+extern void (*fake_irq_hook)(void);
+extern int  fake_irq_hook_in;
+static inline void fake_unmasked(void)
+{
+    if (fake_irq_hook && --fake_irq_hook_in <= 0) {
+        void (*h)(void) = fake_irq_hook;
+        fake_irq_hook = 0;
+        h();
+    }
+}
 static inline uint32_t __get_PRIMASK(void) { return (uint32_t)fake_irq_disabled; }
 static inline void __disable_irq(void) { fake_irq_disabled = 1; fake_irq_sections++; }
-static inline void __enable_irq(void) { fake_irq_disabled = 0; }
-static inline void __set_PRIMASK(uint32_t m) { fake_irq_disabled = (int)m; }
+static inline void __enable_irq(void) { fake_irq_disabled = 0; fake_unmasked(); }
+static inline void __set_PRIMASK(uint32_t m) { fake_irq_disabled = (int)m; if (!m) fake_unmasked(); }
 
 #endif

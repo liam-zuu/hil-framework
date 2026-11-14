@@ -39,6 +39,7 @@
 #  define FW_ENV       "none"
 #endif
 #include <stdio.h>
+#include <string.h>             /* memcpy: MISO v6 id (RS-4 P1) */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -201,6 +202,7 @@ typedef struct {
     uint32_t           svc_min, svc_max, n_down_restarts, cyc_per_us;
     uint32_t           n_applied, n_skipped, age_max_us;
     uint32_t           ap_min, ap_max, n_stage, n_pre_sat, n_dur_sat;   /* L100 Apply line */
+    uint32_t           cb_min, cb_max, crc_min, crc_max, set_min, set_max;   /* RS-4 P1 Frm6 line */
     uint32_t           s06_pushed, s06_dropped, dbg_drop;
     BnoPort_Stats_t    bs;
     uint8_t            ibus_new;
@@ -214,7 +216,7 @@ typedef struct {
 
 enum {
     DS_W1 = 0, DS_PWM = 4, DS_DMA0 = 5, DS_DMA_LAST = 13,   /* PWMdma: 9 sections */
-    DS_RELAY, DS_LINK, DS_SPIFIX, DS_LOOP, DS_FRAME, DS_APPLY, DS_S06LOG, DS_BNO1, DS_BNO2,
+    DS_RELAY, DS_LINK, DS_SPIFIX, DS_LOOP, DS_FRAME, DS_APPLY, DS_FRM6, DS_S06LOG, DS_BNO1, DS_BNO2,
     DS_FW, DS_IBUS, DS_END
 };
 
@@ -338,6 +340,20 @@ static void _dbg_print_next(void)
                _US10(d->ap_max) / 10u, _US10(d->ap_max) % 10u,
                (unsigned long)d->n_pre_sat, (unsigned long)d->n_dur_sat,
                (unsigned long)d->n_stage, (unsigned long)d->ss.reply_over);
+    } else if (s == DS_FRM6) {
+        /* RS-4 P1 (48-byte frame, rule "H7 code with time limits"): shortest /
+         * longest SPI1_Callback run (priority 0), MOSI checksum over 48 bytes
+         * and SPI1_SetOutputEx (MISO v6) over the last block; first flash of
+         * the 48-byte frame: separates "an interrupt landed in it" from "it is
+         * slow by itself" */
+        printf("Frm6: len=%u cb=%lu.%lu..%lu.%lu us crc=%lu.%lu..%lu.%lu us set=%lu.%lu..%lu.%lu us\r\n",
+               (unsigned)SPI1_FRAME_LEN,
+               _US10(d->cb_min) / 10u, _US10(d->cb_min) % 10u,
+               _US10(d->cb_max) / 10u, _US10(d->cb_max) % 10u,
+               _US10(d->crc_min) / 10u, _US10(d->crc_min) % 10u,
+               _US10(d->crc_max) / 10u, _US10(d->crc_max) % 10u,
+               _US10(d->set_min) / 10u, _US10(d->set_min) % 10u,
+               _US10(d->set_max) / 10u, _US10(d->set_max) % 10u);
     } else if (s == DS_S06LOG) {
         printf("S06log: pushed=%lu dropped=%lu  print_drop=%lu\r\n",
                (unsigned long)d->s06_pushed, (unsigned long)d->s06_dropped,
@@ -514,6 +530,11 @@ int main(void)
    * since boot, shortest / longest SetOmega x4 window in cycles per block */
   static uint32_t _n_stage = 0, _n_pre_sat = 0, _n_dur_sat = 0;
   static uint32_t _ap_min_cyc = 0xFFFFFFFFu, _ap_max_cyc = 0u;
+  /* RS-4 P1 (48-byte frame; rule "H7 code with time limits"): shortest /
+   * longest MOSI checksum (48 bytes) and SPI1_SetOutputEx() (MISO v6 encode,
+   * checksum over 46 bytes, staging) per block, in cycles ("Frm6:" line) */
+  static uint32_t _crc_min_cyc = 0xFFFFFFFFu, _crc_max_cyc = 0u;
+  static uint32_t _set_min_cyc = 0xFFFFFFFFu, _set_max_cyc = 0u;
   const uint32_t cyc_per_us = SystemCoreClock / 1000000u;
   /* S06 T10: cost of the S06_IRQ_ENTER/EXIT pair; then (W10) the cost of one
    * idle pass, measured on this very loop with every interrupt masked for
@@ -593,9 +614,16 @@ int main(void)
         if (ap_cyc < _ap_min_cyc) _ap_min_cyc = ap_cyc;
         if (ap_cyc > _ap_max_cyc) _ap_max_cyc = ap_cyc;
         uint32_t age_us = (c_post - fi.rx_cyc) / cyc_per_us;   /* receive -> after the last SetOmega (T1 age_max) */
+        uint32_t c_crc = DWT->CYCCNT;
         mi.mosi_crc = S06_Crc16(0xFFFFu, fi.raw, SPI1_FRAME_LEN);
+        c_crc = DWT->CYCCNT - c_crc;
+        if (c_crc < _crc_min_cyc) _crc_min_cyc = c_crc;
+        if (c_crc > _crc_max_cyc) _crc_max_cyc = c_crc;
         mi.rx_cyc   = fi.rx_cyc;
         mi.rx_nf    = fi.rx_nf;
+        /* v6 (RS-4 P1): run_id + frame_no of this very copy go back to the Pi,
+         * so the reply names its frame (assumption B1 of hil_edge_map.py) */
+        memcpy(mi.id, &fi.raw[HIL_MOSI_ID], HIL_MOSI_ID_LEN);
         if (_n_applied > 0u && fi.rx_nf > _last_applied_nf + 1u)
             _n_skipped += fi.rx_nf - _last_applied_nf - 1u;
         _last_applied_nf = fi.rx_nf;
@@ -622,7 +650,11 @@ int main(void)
         g_output.status = (uint8_t)((IbusPort_LastSwa() ? HIL_STATUS_SWA : 0u)
                                     | ((_n_stage << HIL_STATUS_STAGE_SHIFT) & HIL_STATUS_STAGE_MASK)
                                     | HIL_STATUS_V5);
+        uint32_t c_set = DWT->CYCCNT;
         SPI1_SetOutputEx(&g_output, &mi);
+        c_set = DWT->CYCCNT - c_set;
+        if (c_set < _set_min_cyc) _set_min_cyc = c_set;
+        if (c_set > _set_max_cyc) _set_max_cyc = c_set;
 
         HAL_GPIO_TogglePin(GPIOE, GPIO_PIN_1);
     } else if (_link_up && (HAL_GetTick() - _last_frame_ms) > SPI_LINK_TIMEOUT_MS) {
@@ -695,6 +727,13 @@ int main(void)
         d->ap_min = (_ap_min_cyc == 0xFFFFFFFFu) ? 0u : _ap_min_cyc;
         d->ap_max = _ap_max_cyc;
         _ap_min_cyc = 0xFFFFFFFFu; _ap_max_cyc = 0u;
+        SPI1_TakeCallbackCycles(&d->cb_min, &d->cb_max);
+        d->crc_min = (_crc_min_cyc == 0xFFFFFFFFu) ? 0u : _crc_min_cyc;
+        d->crc_max = _crc_max_cyc;
+        d->set_min = (_set_min_cyc == 0xFFFFFFFFu) ? 0u : _set_min_cyc;
+        d->set_max = _set_max_cyc;
+        _crc_min_cyc = _set_min_cyc = 0xFFFFFFFFu;
+        _crc_max_cyc = _set_max_cyc = 0u;
         d->n_stage = _n_stage; d->n_pre_sat = _n_pre_sat; d->n_dur_sat = _n_dur_sat;
         d->s06_pushed = S06Log_Pushed();
         d->s06_dropped = S06Log_Dropped();

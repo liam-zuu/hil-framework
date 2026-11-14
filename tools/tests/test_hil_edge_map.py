@@ -3,7 +3,8 @@ whose true edge (H7 time) is known. Everything the mapper reads is made the way 
 is the H7 clock (L100):
 - frames: Pi send times (jitter, optional bursts), the H7 receive after the SPI transfer, the H7 apply window
   (start 18..750 us after the receive, as H7 'age_max'; width 1..80 us, as the 'Apply:' line of
-  CLOSED_LOOP/2026-11-13_run14) with the true apply inside, MISO v5 answering frame j - 2 with its MOSI CRC,
+  CLOSED_LOOP/2026-11-13_run14) with the true apply inside, 48-byte frames (RS-4 P1: MOSI run_id + frame_no,
+  copied back in MISO 40-47; Liam 14/11 CODE_RS4 "Làm P1, 48 byte"), MISO v6 answering frame j - 2 with its MOSI CRC,
   H7 CYCCNT at the receive (480 MHz), RX_NF, the apply window, the reply count and the duty captured at the H7
   service;
 - counts: the unchanged H7 encoder_gen.c (tools/tests/encgen_oracle.py, profile mode) driven by the frame wheel
@@ -39,6 +40,13 @@ from test_hil_o1_score import fig8_pose  # noqa: E402
 
 ROOT = os.path.join(HERE, '..', '..')
 FW = [dict(sha=M.FW_COUNTS_AT_TICK[0], dirty='0', env='esp32-s3-devkitc-1')]
+RUN_ID = 0x5EED1234                     # RS-4 P1: MOSI v4 run_id of the made-up runs
+OTHER_RUN = 0x0BADF00D                  # a run before this one (replies the H7 may still hold)
+
+
+def mosi_frame(state10, k, run_id=RUN_ID, **kw):
+    """MOSI v4 bytes of frame k as hil_node.py sends them (seq = frame_no = k)."""
+    return np.frombuffer(P.encode_state(list(state10), seq=k, run_id=run_id, frame_no=k, **kw), dtype=np.uint8)
 needs_gcc = pytest.mark.skipif(not O.available(), reason='gcc not on PATH (H7 EncoderGen oracle)')
 
 
@@ -67,15 +75,17 @@ def wheel_omega(n, k_move, kind='ramp'):
     return np.clip(om, -39.99, 39.99)
 
 
-def make_miso(mosi, duty, tm, skip=(), lost=(), twice=(), over=(), sat=(), v4=False, crc_bad=(), stage_lag=None):
-    """MISO v5 of each transfer j as the H7 sends it (hil_protocol.h offsets, Codex RS4-R5-3 (a)): the reply of the
+def make_miso(mosi, duty, tm, skip=(), lost=(), twice=(), over=(), sat=(), v4=False, crc_bad=(), stage_lag=None,
+              no_id=False):
+    """MISO v6 (v5 + MISO 40-47 = MOSI 40-47 of the frame answered, RS-4 P1) of each transfer j as the H7 sends it
+    (hil_protocol.h offsets, Codex RS4-R5-3 (a)): the reply of the
     latest frame f <= j - 2 whose reply reached the DMA, with the duty of its first transfer in bytes 0-7; with no
     newer reply the DMA sends the same bytes again (spi1_handler.c _tx). tm: rx (H7 us of the receive, integer),
     pre (us from rx to the window start, integer), win (window width, us). Frames in `skip` were received but not
     applied (no reply, RX_NF counts them, no reply count), in `lost` never reached the H7 (no reply, not counted);
     frames in `over` were applied but their reply was replaced before the DMA took it (no reply, reply count
     steps); for frames in `twice` the next transfer repeats the reply with another window; frames in `sat` get a
-    saturated window; v4: no v5 mark; transfers in `crc_bad` arrive with a bad MISO CRC; stage_lag {k: L}: the
+    saturated window; v4: no v5 mark; no_id: MISO 40-47 left 0 (an H7 before v6); transfers in `crc_bad` arrive with a bad MISO CRC; stage_lag {k: L}: the
     reply of frame k reaches the DMA for transfer k + L (default 2; L 3, 4 when the main loop stages late, Codex
     RS4-R6-3)."""
     n = len(mosi)
@@ -93,7 +103,9 @@ def make_miso(mosi, duty, tm, skip=(), lost=(), twice=(), over=(), sat=(), v4=Fa
         dur4 = int(math.ceil((math.ceil(pre[k] + win[k]) - p) / M.APPLY_DUR_UNIT_US)) + extra
         if k in sat:
             dur4 = M.APPLY_DUR_MAX
-        b = bytearray(40)
+        b = bytearray(P.FRAME_SIZE)
+        if not no_id:
+            b[M.MISO_ID:M.MISO_ID + 8] = bytes(mosi[k][M.MOSI_ID:M.MOSI_ID + 8])   # v6: the H7 copies MOSI 40-47
         b[0:8] = np.round(np.clip(duty[j], -1.0, 1.0) * 32767).astype('>i2').tobytes()
         b[10:12] = M.crc16(bytes(mosi[k])).to_bytes(2, 'little')
         cyc = int(round((rx[k] + 1e6) * M.H7_CYC_PER_US)) % 2 ** 32
@@ -105,8 +117,8 @@ def make_miso(mosi, duty, tm, skip=(), lost=(), twice=(), over=(), sat=(), v4=Fa
         b[8:10] = M.crc16(bytes(b[:8]) + bytes(b[10:])).to_bytes(2, 'little')
         return np.frombuffer(bytes(b), dtype=np.uint8)
 
-    miso = np.zeros((n, 40), dtype=np.uint8)
-    send_at = {}                                                   # transfer -> frame whose reply goes out first
+    miso = np.zeros((n, P.FRAME_SIZE), dtype=np.uint8)
+    send_at = {}                                                 # transfer -> frame whose reply goes out first
     for k in range(n):
         if k not in skip and k not in lost and k not in over:
             send_at[k + (stage_lag or {}).get(k, 2)] = k
@@ -136,16 +148,15 @@ def sim(edge_ms=415.3, k_run=400, n=5200, kind='ramp', move_after_ms=3.0, ppm=30
         dt[a0:a0 + ln] = d0
     T = np.r_[0.0, np.cumsum(dt[:-1])] - rng.uniform(0.0, 140.0, n) * (np.arange(n) > 0)
     T[1:] = np.maximum(T[1:], T[:-1] + 50.0)
-    rx = np.round(T + 320.0 + rng.uniform(0.0, 50.0, n))             # 40 bytes at 1 MHz, then a little (H7 us)
+    rx = np.round(T + 384.0 + rng.uniform(0.0, 50.0, n))             # 48 bytes at 1 MHz, then a little (H7 us)
     win = rng.uniform(1.0, win_max, n) * (rng.uniform(size=n) < 0.3) + rng.uniform(1.0, 5.0, n)
     pre = np.round(rng.uniform(18.0, 750.0, n))
     pre = np.minimum(pre, np.maximum(np.r_[np.diff(rx), 1000.0] - win - 30.0, 1.0))   # applied before the next frame
     apply = rx + pre + np.floor(rng.uniform(0.0, 1.0, n) * np.floor(win))  # the true apply, inside the window
     om = wheel_omega(n, int(edge_ms + move_after_ms), kind)
-    mosi = np.array([np.frombuffer(P.encode_state(list(om[k]) + [0.0] * 6, seq=k), dtype=np.uint8)
-                     for k in range(n)])
-    for k in dup:                                                   # two equal MOSI frames, seq included (off the Pi
-        mosi[k + 1] = mosi[k]                                       # convention: 74 real frame logs have none)
+    mosi = np.array([mosi_frame(list(om[k]) + [0.0] * 6, k) for k in range(n)])
+    for k in dup:                                                   # two equal MOSI frames, frame_no included (off the
+        mosi[k + 1] = mosi[k]                                       # Pi convention)
     for k in copy2:                                                 # Codex RS4-R7-1: frame k + 2 a whole copy of k
         mosi[k + 2] = mosi[k]
     om32 = M.h7_omega32(mosi)
@@ -236,6 +247,13 @@ def test_constants_match_the_h7_source():
     assert 'cyc_per_us = SystemCoreClock / 1000000u' in mc and M.H7_CYC_PER_US == 480.0
     assert P.OFS_MISO_CRC == M.MISO_CRC
     assert M.COUNTS_PER_REV == 1320
+    # RS-4 P1: 48-byte frames, run_id + frame_no at MOSI 40, copied at MISO 40
+    assert int(re.search(r'#define\s+SPI1_FRAME_LEN\s+(\d+)', p).group(1)) == M.FRAME_V6 == P.FRAME_SIZE
+    assert int(re.search(r'#define\s+HIL_MOSI_ID\s+(\d+)', p).group(1)) == M.MOSI_ID == P.OFS_RUN_ID
+    assert int(re.search(r'#define\s+HIL_MISO_ID\s+(\d+)', p).group(1)) == M.MISO_ID == P.OFS_MISO_ID
+    assert 'memcpy(mi.id, &fi.raw[HIL_MOSI_ID], HIL_MOSI_ID_LEN)' in mc            # B1: from the applied copy
+    for gone in ('R_ID_US', 'J_SEND_US', 'E_ID_US', 'START_MARGIN_FRAMES'):      # A1-A3 of ff616ab not used
+        assert not hasattr(M, gone)
 
 
 def test_half_period_as_the_h7():
@@ -247,10 +265,10 @@ def test_half_period_as_the_h7():
 
 
 def test_enc_model_events_and_integral():
-    mosi = np.zeros((5, 40), dtype=np.uint8)
+    mosi = np.zeros((5, P.FRAME_SIZE), dtype=np.uint8)
     om = np.array([[0, 0, 0, 0], [10, 10, 10, -10], [20, 5, 10, 10], [20, 0, 10, 10], [20, 5, 10, 10]], float)
     for k in range(5):
-        mosi[k] = np.frombuffer(P.encode_state(list(om[k]) + [0.0] * 6, seq=k), dtype=np.uint8)
+        mosi[k] = mosi_frame(list(om[k]) + [0.0] * 6, k)
     m = M.EncModel(np.array([0.0, 1000.0, 2000.0, 3000.0, 4000.0]), mosi)
     hp, _ = M.h7_half_period(M.h7_omega32(mosi))
     ev, bad = m.events(np.array([1500.0]), np.array([2500.0]))                 # the change at 2000 only
@@ -271,10 +289,10 @@ def test_enc_model_events_and_integral():
 def test_enc_model_apply_window_widens_events_and_wmax():
     # L100: frame k may apply anywhere in [apply_k, apply_k + width_k]: |rate change| x width joins the event
     # bound of that change, a change whose window reaches into [t1, t2] counts, and wmax looks back one window
-    mosi = np.zeros((3, 40), dtype=np.uint8)
+    mosi = np.zeros((3, P.FRAME_SIZE), dtype=np.uint8)
     om = np.array([[20, 20, 20, 20], [10, 10, 10, 10], [10, 10, 10, 10]], float)   # slow-down: lookback matters
     for k in range(3):
-        mosi[k] = np.frombuffer(P.encode_state(list(om[k]) + [0.0] * 6, seq=k), dtype=np.uint8)
+        mosi[k] = mosi_frame(list(om[k]) + [0.0] * 6, k)
     ap = np.array([0.0, 1000.0, 2000.0])
     m0 = M.EncModel(ap, mosi)
     m1 = M.EncModel(ap, mosi, np.array([0.0, 60.0, 0.0]))
@@ -410,6 +428,7 @@ def test_refusals_firmware_clock_frames():
     refused('lost its reply', over=(700,))                              # Codex RS4-R4-2: applied, reply replaced
     refused('saturated', sat=(700,))                                    # apply window not bounded
     refused('before L100', v4=True)                                     # H7 firmware with MISO v4
+    refused('no H7 answer', no_id=True)                                 # RS-4 P1: H7 before v6 (no id copied)
     fr = dict(s['frames'], miso=make_miso(mo, s['duty_cap'], tm, over=(4900,)))
     assert M.map_edge(s['duty'], 400, s['esp'], 1e-3, fr)['ok']          # a lost reply outside the used frames
 
@@ -433,7 +452,8 @@ def test_delay_then_catch_up_across_skipped_frames():
 def test_late_replies_and_crc_twins_keep_the_frame_identity():
     # Codex RS4-R6-1: the H7 applies every third frame, its reply first goes out at lag 4 and repeats; around the
     # edge frame k + 2 (not applied) has frame k's speeds and the same MOSI CRC (two IMU bytes chosen), only its
-    # seq differs. The answers must still land on k (CRC + seq + one RX_NF offset), so the bracket holds the edge.
+    # seq and frame_no differ. The answers must still land on k (P1: the reply names its frame), so the bracket
+    # holds the edge.
     lo, hi = 280, 3900
     skip = tuple(k for k in range(lo, hi) if k % 3)
     lag = {k: 4 for k in range(lo, hi) if k % 3 == 0}
@@ -477,23 +497,22 @@ def test_frames_the_h7_did_not_apply():
 
 @needs_gcc
 def test_repeated_mosi_frames_are_refused():
-    # Codex RS4-R7-1: two consecutive frames with the same bytes, seq included, break the Pi convention seq =
-    # step & 0xFF (none in the 74 frame logs of CLOSED_LOOP 11-13/11); which frame an answer belongs to is then
-    # not known: refused, not guessed by the answer lag
+    # Codex RS4-R7-1 input, P1: two consecutive frames with the same 48 bytes (frame_no included) break the Pi
+    # convention frame_no = index; which frame a reply names is then not the logged one: refused, not guessed
     s = sim(dup=(425, 700, 1201))
     em = run(s)
-    assert not em['ok'] and 'RS4-R7-1' in em['reason'], em['reason']
+    assert not em['ok'] and 'is not the log run_id' in em['reason'], em['reason']
     ap = M.h7_apply(s['frames'], 300, 3800)
-    assert not ap['ok'] and 'frame 426: MOSI seq' in ap['reason'], ap['reason']
+    assert not ap['ok'] and 'frame 426:' in ap['reason'] and 'frame_no 425' in ap['reason'], ap['reason']
 
 
 @needs_gcc
 @pytest.mark.parametrize('every', [3, 9])
 def test_copied_frames_before_the_range_are_refused(every):
     # Codex RS4-R7-1 schedule: the H7 applies every `every`-th frame and its reply first goes out at lag
-    # `every + 1` (3) or `every` (9 > LAG_MAX); frame k + 2 (not applied) is a whole 40-byte copy of frame k. The
-    # true source 279 lies just before the range, so its copy 281 was the only candidate of its answer and set a
-    # wrong RX_NF offset: every answer moved +2 frames and the bracket missed the edge. Now refused.
+    # `every + 1` (3) or `every` (9 > LAG_MAX); frame k + 2 (not applied) is a whole copy of frame k. Before P1 the
+    # copy 281 of the source 279 (just before the range) moved every answer +2 frames. P1: the copy carries
+    # frame_no 279 at index 281, refused by the convention check.
     lo, hi = 270, 3900
     applied = [k for k in range(lo, hi) if k % every == 0]
     skip = tuple(k for k in range(lo, hi) if k % every)
@@ -501,154 +520,282 @@ def test_copied_frames_before_the_range_are_refused(every):
     s = sim(skip=skip, stage_lag=lag, copy2=tuple(applied), seed=9)
     k_hi = 3858 if every == 3 else 3850
     ap = M.h7_apply(s['frames'], 280, k_hi)
-    assert not ap['ok'] and 'RS4-R7-1' in ap['reason'] and 'frame 281' in ap['reason'], ap['reason']
+    assert not ap['ok'] and 'frame 281:' in ap['reason'] and 'frame_no 279' in ap['reason'], ap['reason']
     em = run(s)
-    assert not em['ok'] and 'RS4-R7-1' in em['reason'], em['reason']
+    assert not em['ok'] and 'is not the log run_id' in em['reason'], em['reason']
 
 
-def _stale_reply(row, mosi_k, rx_us, rx_nf, stage, pre=400, dur4=5):
-    """MISO v5 bytes as the H7 sends them for a frame with the bytes mosi_k received at H7 time rx_us (duty bytes
-    of `row` kept)."""
+@needs_gcc
+@pytest.mark.parametrize('every', [3, 9])
+def test_late_replies_without_copies_map(every):
+    # the same H7 schedules as above (every 3rd / 9th frame applied, replies at lag 4 / 9 > LAG_MAX) without the
+    # copies: P1 reads every transfer after k_lo, so the late replies keep their frames and the bracket holds
+    lo, hi = 270, 3900
+    applied = [k for k in range(lo, hi) if k % every == 0]
+    skip = tuple(k for k in range(lo, hi) if k % every)
+    lag = {k: (4 if every == 3 else 9) for k in applied}
+    s = sim(skip=skip, stage_lag=lag, seed=9)
+    em = run(s)
+    assert (not em['ok']) or (em['early_step'] <= s['k_true'] <= em['late_step']), (em, s['k_true'])
+    ap = M.h7_apply(s['frames'], 297, 3800)                         # 297: applied for both schedules
+    assert ap['ok'] and all(k % every == 0 for k in ap['applied']), ap.get('reason')
+
+
+def _stale_reply(row, mosi_k, rx_us, rx_nf, stage, pre=400, dur4=5, run_id=None, frame_no=None):
+    """MISO v6 bytes as the H7 sends them for a frame with the bytes mosi_k received at H7 time rx_us (duty bytes
+    of `row` kept); MISO 40-47 = MOSI 40-47 of mosi_k, or run_id / frame_no when given (a frame of another run)."""
     b = bytearray(bytes(row))
-    b[10:12] = M.crc16(bytes(mosi_k)).to_bytes(2, 'little')
+    mk = bytearray(bytes(mosi_k))
+    if run_id is not None:
+        mk[M.MOSI_ID:M.MOSI_ID + 4] = int(run_id).to_bytes(4, 'little')
+    if frame_no is not None:
+        mk[M.MOSI_ID + 4:M.MOSI_ID + 8] = int(frame_no).to_bytes(4, 'little')
+    b[10:12] = M.crc16(bytes(mk)).to_bytes(2, 'little')
     b[12:16] = (int(round((rx_us + 1e6) * M.H7_CYC_PER_US)) % 2 ** 32).to_bytes(4, 'little')
     b[16] = M.STATUS_V5 | ((stage % M.STAGE_MOD) << 1) | 1
-    b[17] = mosi_k[M.MOSI_SEQ]
+    b[17] = mk[M.MOSI_SEQ]
     b[18:20] = (rx_nf & 0xFFFF).to_bytes(2, 'little')
     b[20:22] = (pre | (dur4 << M.APPLY_DUR_SHIFT)).to_bytes(2, 'little')
+    b[M.MISO_ID:M.MISO_ID + 8] = mk[M.MOSI_ID:M.MOSI_ID + 8]
     b[8:10] = M.crc16(bytes(b[:8]) + bytes(b[10:])).to_bytes(2, 'little')
     return np.frombuffer(bytes(b), dtype=np.uint8)
 
 
 @needs_gcc
-def test_reply_staged_before_the_range_is_refused():
-    # Codex RS4-R8-1: frames 280-282 (the start of map_edge's range, k_run 400) never reach the H7; the H7 still
-    # holds a reply of an older frame with the same 40 bytes as frame 282 (idle frames differ only in seq) and
-    # sends it at transfers 283, 284, with RX_NF and stage one below frame 283's. Every MOSI keeps seq = k & 0xFF,
-    # the answer has one candidate (282) and one RX_NF offset: only its receive time, 4 ms before frame 283's,
-    # shows it is not frame 282's.
+def test_reply_of_an_earlier_run_is_skipped():
+    # Codex RS4-R8-1 schedule, P1, with the H7 two-buffer order (Codex R9-2): no frame of this run reaches the
+    # H7 before 283 (frames 0-282 lost, k_lo 280 inside them; the Pi reads 0 bytes), and the H7 still holds two
+    # replies of the run before: X in the DMA buffer (_tx), Y staged (_tx_next). Transfer 283 (the first the H7
+    # receives) sends X, its callback moves Y to the DMA buffer; transfer 284 sends Y, its callback takes the
+    # reply of 283; transfer 285 sends that. X has the bytes of frame 282 with that run's run_id (frame_no 282
+    # too), received 4 ms before 283; Y another frame of that run. Before P1 only the Pi send times showed X was
+    # not frame 282's. Now neither is of this run: skipped and counted, the run maps, the bracket holds the edge.
     s = sim()
     tm, mo = s['timing'], s['frames']['mosi']
-    lost = (280, 281, 282)
+    lost = tuple(range(0, 283))
     miso = make_miso(mo, s['duty_cap'], tm, lost=lost).copy()
+    assert not miso[:285].any()                                       # the two-buffer order: nothing before 285
     nf283 = int(miso[285, 18]) | (int(miso[285, 19]) << 8)            # reply of frame 283 goes out at transfer 285
     st283 = (int(miso[285, 16]) >> 1) & 0x3F
-    stale = _stale_reply(miso[283], mo[282], float(tm['rx'][283]) - 4000.0, nf283 - 1, st283 - 1)
-    miso[283] = stale
-    miso[284] = stale
+    x = _stale_reply(miso[285], mo[282], float(tm['rx'][283]) - 4000.0, nf283 - 2, st283 - 2, run_id=OTHER_RUN)
+    y = _stale_reply(miso[285], mo[282], float(tm['rx'][283]) - 3000.0, nf283 - 1, st283 - 1, run_id=OTHER_RUN,
+                     frame_no=283)
+    miso[283] = x
+    miso[284] = y
     fr = dict(s['frames'], miso=miso)
     ap = M.h7_apply(fr, 280, 3800)
-    assert not ap['ok'] and 'RS4-R8-1' in ap['reason'] and 'frame 282' in ap['reason'], ap.get('applied', ap)[:3]
-    em = M.map_edge(s['duty'], 400, s['esp'], 1e-3, fr)
-    assert not em['ok'] and 'RS4-R8-1' in em['reason'], em['reason']
-    ok = M.h7_apply(dict(fr, miso=make_miso(mo, s['duty_cap'], tm, lost=lost)), 280, 3800)
-    assert ok['ok'] and ok['send_line']['max_resid_us'] <= 60.0, ok      # without the stale reply: kept
+    assert ap['ok'] and ap['applied'][0] == 283 and ap['foreign_n'] == 2, ap.get('reason', ap)
+    _check_bracket(M.map_edge(s['duty'], 400, s['esp'], 1e-3, fr), s['k_true'])
+    # the same reply carrying THIS run_id and frame 282 is what the H7 sends only if it received frame 282 (B1,
+    # B2); a reply naming a frame not yet sent is refused
+    early = _stale_reply(miso[283], mo[290], float(tm['rx'][283]), nf283 - 1, st283 - 1)
+    m2 = miso.copy()
+    m2[284] = early
+    bad = M.h7_apply(dict(fr, miso=m2), 280, 3800)
+    assert not bad['ok'] and 'frame 290, not yet sent' in bad['reason'], bad.get('reason')
 
 
 @needs_gcc
-def test_bracket_widened_by_e_id_before_steps():
-    # RS4-R8-1: the steps come from the H7 times [s_lo - E_ID_US, s_hi + E_ID_US]
+def test_reply_with_another_mosi_crc_is_refused():
+    # the reply names frame 700 of this run but its MOSI CRC is not that of the logged frame 700: the H7 applied
+    # other bytes (a corrupted transfer with the id bytes intact)
+    s = sim()
+    tm, mo = s['timing'], s['frames']['mosi']
+    miso = make_miso(mo, s['duty_cap'], tm).copy()
+    other = mo[700].copy()
+    other[0] ^= 0x40                                                 # wheel 1 speed changed on the wire
+    nf = int(miso[702, 18]) | (int(miso[702, 19]) << 8)
+    st = (int(miso[702, 16]) >> 1) & 0x3F
+    miso[702] = _stale_reply(miso[702], other, float(tm['rx'][700]), nf, st)
+    ap = M.h7_apply(dict(s['frames'], miso=miso), 280, 3800)
+    assert not ap['ok'] and 'frame 700: the MOSI CRC' in ap['reason'], ap.get('reason')
+
+
+@needs_gcc
+def test_reply_256_frames_late_keeps_its_frame():
+    # Codex RS4-R9-1 (c) input, P1: a reply of frame 700 also goes out 256 frames later (transfer 958). It names
+    # frame 700, so it is frame 700's: the same values change nothing; other values refuse (two answers differ).
+    # Frame 956 is not applied, so transfer 958 would only resend the reply of 955: no reply is lost.
+    s = sim(skip=(956,))
+    tm, mo = s['timing'], s['frames']['mosi']
+    miso = s['frames']['miso'].copy()
+    base = M.h7_apply(dict(s['frames'], miso=miso), 280, 3800)
+    assert base['ok'], base.get('reason')
+    m2 = miso.copy()
+    m2[958] = miso[702]
+    same = M.h7_apply(dict(s['frames'], miso=m2), 280, 3800)
+    assert same['ok'] and np.array_equal(same['anchor_us'], base['anchor_us']), same.get('reason')
+    nf = int(miso[702, 18]) | (int(miso[702, 19]) << 8)
+    st = (int(miso[702, 16]) >> 1) & 0x3F
+    m2[958] = _stale_reply(miso[702], mo[700], float(tm['rx'][700]) + 256_000.0, nf, st)
+    diff = M.h7_apply(dict(s['frames'], miso=m2), 280, 3800)
+    assert not diff['ok'] and 'frame 700 answered with different' in diff['reason'], diff.get('reason')
+
+
+@needs_gcc
+def test_bracket_steps_from_the_exact_anchors():
+    # P1: the anchors are the receives of the frames the replies name, so the steps come from [s_lo, s_hi] with no
+    # widening (E_ID_US of ff616ab is gone)
     s = sim()
     em = run(s)
     _check_bracket(em, s['k_true'])
     a, b = em['h7_apply']['range']
     ap = M.h7_apply(s['frames'], a, b)
     t_lo, t_hi = em['edge_h7_time_us']
-    assert em['early_step'] == M.h7_to_steps(t_lo - M.E_ID_US, ap['anchor_k'], ap['anchor_us'])[0]
-    assert em['late_step'] == M.h7_to_steps(t_hi + M.E_ID_US, ap['anchor_k'], ap['anchor_us'])[1]
-    assert em['late_step'] - em['early_step'] >= 2 * M.E_ID_US / 1000.0 * 0.9   # frames about 1 ms apart
-    assert M.E_ID_US == 2 * M.R_ID_US + 2 * M.J_SEND_US and em['constants']['e_id_us'] == M.E_ID_US
+    assert em['early_step'] == M.h7_to_steps(t_lo, ap['anchor_k'], ap['anchor_us'])[0]
+    assert em['late_step'] == M.h7_to_steps(t_hi, ap['anchor_k'], ap['anchor_us'])[1]
+    assert 'e_id_us' not in em['constants'] and em['constants']['frame_len'] == 48
+    assert em['h7_apply']['run_id'] == f'{RUN_ID:08x}' and em['h7_apply']['foreign_n'] == 0
 
 
-def test_widening_holds_the_true_step_with_anchors_off_by_up_to_e():
-    # RS4-R9-1: the lemma behind E_ID_US, against independent true times. Every frame has a true H7 receive; the
-    # anchors are some of the frames (gaps included), each placed up to E off its true receive (still in order).
-    # For any time t the true step (interpolated over ALL frames' true receives) lies in
-    # [h7_to_steps(t - E)[0], h7_to_steps(t + E)[1]]; with no widening it does not.
+def test_exact_anchors_hold_the_true_step():
+    # the lemma P1 relies on, against independent true times: every frame has a true H7 receive; the anchors are
+    # some of the frames (gaps included) at their exact receives. For any time t the true step (interpolated over
+    # ALL frames' true receives) lies in h7_to_steps(t) (the gap rule of Codex RS4-R5-1). Only the lemma: the
+    # anchors are given as full times here; turning RX_CYC (mod 2^32) into full times is
+    # test_cyccnt_unwrap_across_a_pi_stop_codex_r10_1 (B4, Codex RS4-R10-3).
     rng = np.random.default_rng(5)
-    E = M.E_ID_US
-    missed = 0
     for trial in range(40):
         n = 300
         tr = np.cumsum(rng.uniform(50.0, 1500.0, n))                 # true receives, catch-up frames included
-        keep = np.sort(rng.choice(n, size=n // 2, replace=False))
-        keep = np.unique(np.r_[0, keep, n - 1])
-        ak = keep.astype(float)
-        for _ in range(100):                                         # displacement <= E, order kept
-            rx = tr[keep] + rng.uniform(-E, E, len(keep))
-            if np.all(np.diff(rx) > 0):
-                break
-        else:
-            continue
-        for t in rng.uniform(tr[0] + E, tr[-1] - E, 200):
+        keep = np.unique(np.r_[0, np.sort(rng.choice(n, size=n // 2, replace=False)), n - 1])
+        for t in rng.uniform(tr[0], tr[-1], 200):
             true = float(np.interp(t, tr, np.arange(n, dtype=float)))
-            lo = M.h7_to_steps(t - E, ak, rx)[0]
-            hi = M.h7_to_steps(t + E, ak, rx)[1]
+            lo, hi = M.h7_to_steps(t, keep.astype(float), tr[keep])
             assert lo - 1e-9 <= true <= hi + 1e-9, (trial, t, lo, true, hi)
-            lo0, hi0 = M.h7_to_steps(t, ak, rx)
-            missed += not (lo0 - 1e-9 <= true <= hi0 + 1e-9)
-    assert missed > 0                                                # the widening is needed
 
 
 def _small_frames(n=400, lost=()):
-    """Frames without the EncoderGen oracle (no gcc): seq = k, H7 receive 1000 k + 320, replies at lag 2."""
-    mosi = np.array([np.frombuffer(P.encode_state([0.0] * 10, seq=k), dtype=np.uint8) for k in range(n)])
+    """Frames without the EncoderGen oracle (no gcc): seq = frame_no = k, H7 receive 1000 k + 384, replies at lag 2."""
+    mosi = np.array([mosi_frame([0.0] * 10, k) for k in range(n)])
     T = np.arange(n) * 1000.0
-    tm = dict(T=T, rx=np.round(T + 320.0), pre=np.full(n, 400.0), win=np.full(n, 10.0))
+    tm = dict(T=T, rx=np.round(T + 384.0), pre=np.full(n, 400.0), win=np.full(n, 10.0))
     miso = make_miso(mosi, np.zeros((n, 4)), tm, lost=lost)
     return dict(t_send_ns=np.round((T + 7.0e9) * 1000.0).astype(np.int64), t_pulse0_ns=None, mosi=mosi,
                 miso=miso), tm
 
 
-def test_frame_log_without_t_send_is_refused():
+def test_frame_log_without_t_send_and_40_byte_logs_are_refused():
     fr, _ = _small_frames()
     assert M.h7_apply(fr, 20, 300)['ok']
-    no_t = M.h7_apply(dict(fr, t_send_ns=None), 20, 300)
-    assert not no_t['ok'] and 't_send_ns' in no_t['reason'], no_t['reason']
+    no_t = M.h7_apply(dict(fr, t_send_ns=None), 20, 300)            # B4: the CYCCNT unwrap needs the Pi send times
+    assert not no_t['ok'] and 'without t_send_ns' in no_t['reason'], no_t['reason']
+    short = M.h7_apply(dict(fr, t_send_ns=fr['t_send_ns'][:-1]), 20, 300)
+    assert not short['ok'] and 'without t_send_ns' in short['reason'], short['reason']
+    old = M.h7_apply(dict(fr, mosi=fr['mosi'][:, :40], miso=fr['miso'][:, :40]), 20, 300)
+    assert not old['ok'] and '40-byte frames' in old['reason'] and 'ff616ab' in old['reason'], old['reason']
 
 
-@pytest.mark.parametrize('stale_dt, want', [(-4000.0, 'refused'), (-1000.0, 'kept')])
-def test_reply_staged_before_the_log_at_its_start(stale_dt, want):
-    # Codex RS4-R8-1, R9-2: k_lo = 0, frames 0-2 never reach the H7, the H7 still holds a reply of an older frame
-    # with the bytes of frame 2 (RX_NF, stage one below frame 3's) and sends it at transfers 3, 4. Received 4 ms
-    # before frame 3: off the Pi send line, refused. Received where frame 2 would be (A1: then it is frame 2's
-    # time): kept, the anchor time is right.
+W_US = 2.0 ** 32 / M.H7_CYC_PER_US                                   # one CYCCNT wrap, 8 947 848.53 us
+
+
+def _paused_frames(pause_us, at=5, n=400):
+    """_small_frames with the Pi stopped pause_us between frames at - 1 and at (Codex RS4-R10-1): the Pi send times
+    and the H7 receives both move by pause_us; every frame reaches the H7 and is answered at lag 2."""
+    mosi = np.array([mosi_frame([0.0] * 10, k) for k in range(n)])
+    T = np.arange(n) * 1000.0 + pause_us * (np.arange(n) >= at)
+    tm = dict(T=T, rx=np.round(T + 384.0), pre=np.full(n, 400.0), win=np.full(n, 10.0))
+    miso = make_miso(mosi, np.zeros((n, 4)), tm)
+    return dict(t_send_ns=np.round((T + 7.0e9) * 1000.0).astype(np.int64), t_pulse0_ns=None, mosi=mosi,
+                miso=miso), tm
+
+
+def test_cyccnt_unwrap_across_a_pi_stop_codex_r10_1():
+    # Codex RS4-R10-1 counterexample: the Pi stops W = 2^32 / 480 us between frames 4 and 5; identity, MOSI CRC,
+    # MISO CRC, RX_NF and the reply count are all right, but RX_CYC of frame 5 on is one wrap short and the nearest
+    # unwrap loses it (before the fix: ok with the anchors W early). B4: refused on the Pi send-time gap.
+    fr, tm = _paused_frames(W_US)
+    rx = np.asarray(tm['rx'], dtype=float)
+    d = (round((rx[5] + 1e6) * M.H7_CYC_PER_US) - round((rx[1] + 1e6) * M.H7_CYC_PER_US)) % 2 ** 32
+    assert abs(d - 4000 * M.H7_CYC_PER_US) <= M.H7_CYC_PER_US      # the wrap is invisible in the stamps
+    ap = M.h7_apply(fr, 0, 300)
+    assert not ap['ok'] and 'answered frames 4 and 5' in ap['reason'] and 'RS4-R10-1' in ap['reason'], ap
+    # half a wrap, then send gaps 1 ms above and 1 ms under the bound (the 1000 us step is added to the pause):
+    # refused above, exact under (the bound to the ns: test_anchor_send_gap_exactly_at_the_bound, Codex RS4-R11-2)
+    for pause, ok in ((0.5 * W_US, False), (M.ANCHOR_GAP_MAX_S * 1e6, False), (M.ANCHOR_GAP_MAX_S * 1e6 - 2000.0, True)):
+        fr, tm = _paused_frames(pause)
+        ap = M.h7_apply(fr, 0, 300)
+        assert ap['ok'] == ok, (pause, ap.get('reason'))
+        if ok:
+            true = np.asarray(tm['rx'], dtype=float)[ap['applied']]
+            assert np.allclose(ap['anchor_us'], true - true[0], atol=0.01), pause
+            assert ap['max_anchor_send_gap_s'] < M.ANCHOR_GAP_MAX_S
+    # the Pi send times out of order between anchors (not a CLOCK_MONOTONIC read before each transfer)
+    fr, _ = _small_frames()
+    ts = fr['t_send_ns'].copy()
+    ts[101] = ts[100]
+    ap = M.h7_apply(dict(fr, t_send_ns=ts), 20, 300)
+    assert not ap['ok'] and 'answered frames 100 and 101' in ap['reason'], ap['reason']
+
+
+@needs_gcc
+def test_map_edge_refuses_a_pi_stop_of_one_wrap_inside_the_range():
+    # the same stop inside map_edge's range (between frames 300 and 301, k_run 400): refused on B4, not mapped
+    s = sim(dts=((300, 1, W_US + 1000.0),), edge_ms=(W_US + 415_300.0) / 1000.0)
+    em = run(s)
+    assert not em['ok'] and 'answered frames 300 and 301' in em['reason'] and 'B4' in em['reason'], em['reason']
+    assert em['constants']['anchor_gap_max_s'] == M.ANCHOR_GAP_MAX_S
+
+
+def test_anchor_gap_bound_keeps_the_unwrap_inside_the_half_wrap():
+    # B4 arithmetic: a send gap under ANCHOR_GAP_MAX_S, at most 1 / (1 - rho) longer on the H7 clock (rho =
+    # RHO_MAX_PPM * 1e-6, Codex RS4-R11-1, R12-1), plus a receive at most 3 s after its send stays inside the half
+    # wrap, so the nearest unwrap is the true one
+    assert abs(M.CYC_HALF_WRAP_S - 2.0 ** 31 / 480e6) < 1e-12
+    assert M.ANCHOR_GAP_MAX_S / (1 - M.RHO_MAX_PPM * 1e-6) + 3.0 < M.CYC_HALF_WRAP_S
+
+
+@pytest.mark.parametrize('gap_ns, ok', [(10 ** 9 - 1, True), (10 ** 9, False), (10 ** 9 + 1, False)])
+def test_anchor_send_gap_exactly_at_the_bound(gap_ns, ok):
+    # Codex RS4-R11-2: the Pi send gap between frames 4 and 5 set to the ns around ANCHOR_GAP_MAX_S (the H7 receives
+    # follow the same pause): one ns under maps, the bound itself and above are refused
+    fr, _ = _paused_frames(gap_ns / 1000.0 - 1000.0)
+    ts = fr['t_send_ns'].copy()
+    ts[5:] = ts[5:] - ts[5] + ts[4] + gap_ns
+    assert int(ts[5] - ts[4]) == gap_ns and M.ANCHOR_GAP_MAX_S == 1.0
+    ap = M.h7_apply(dict(fr, t_send_ns=ts), 0, 300)
+    assert ap['ok'] == ok, ap.get('reason')
+    if not ok:
+        assert 'answered frames 4 and 5' in ap['reason'] and 'B4' in ap['reason'], ap['reason']
+
+
+@pytest.mark.parametrize('stale_dt', [-4000.0, -1000.0, 0.0])
+def test_reply_of_an_earlier_run_at_the_log_start(stale_dt):
+    # Codex RS4-R8-1, R9-2 schedule, P1: k_lo = 0, frames 0-2 never reach the H7, the H7 still holds a reply of the
+    # run before with the bytes of frame 2 (RX_NF, stage one below frame 3's) and sends it at transfers 3, 4, at
+    # any receive time. It is not of this run: skipped, frame 3 is the first anchor, nothing assumed about time.
     fr, tm = _small_frames(lost=(0, 1, 2))
     miso = fr['miso'].copy()
     nf3 = int(miso[5, 18]) | (int(miso[5, 19]) << 8)
     st3 = (int(miso[5, 16]) >> 1) & 0x3F
-    stale = _stale_reply(miso[5], fr['mosi'][2], float(tm['rx'][3]) + stale_dt, nf3 - 1, st3 - 1)
+    stale = _stale_reply(miso[5], fr['mosi'][2], float(tm['rx'][3]) + stale_dt, nf3 - 1, st3 - 1, run_id=OTHER_RUN)
     miso[3] = stale
     miso[4] = stale
     ap = M.h7_apply(dict(fr, miso=miso), 0, 300)
-    if want == 'refused':
-        assert not ap['ok'] and 'RS4-R8-1' in ap['reason'] and 'frame 2' in ap['reason'], ap.get('applied', ap)[:3]
-    else:
-        assert ap['ok'] and ap['applied'][0] == 2 and ap['send_line']['max_resid_us'] <= M.R_ID_US, ap
+    assert ap['ok'] and ap['applied'][0] == 3 and ap['foreign_n'] == 2, ap.get('reason', ap)
 
 
-@needs_gcc
-def test_edge_near_the_first_anchor_is_refused(monkeypatch):
-    # RS4-R9-1, A3: the early bound must be START_MARGIN_FRAMES after the first anchor (here the margin is raised
-    # past the edge: the first anchor about 280, the edge about 415)
-    s = sim()
-    assert run(s)['ok']
-    monkeypatch.setattr(M, 'START_MARGIN_FRAMES', 200)
-    em = run(s)
-    assert not em['ok'] and 'after the first anchor' in em['reason'], em['reason']
-
-
-def test_seq_convention_checked_up_to_k_hi_plus_lag_max():
-    # the check covers [k_lo, k_hi + LAG_MAX): a bad seq right after k_hi + LAG_MAX - 1 is outside, at it inside
+def test_frame_id_convention_checked_up_to_k_hi_plus_lag_max():
+    # the check covers [k_lo, k_hi + LAG_MAX): a bad frame_no right after k_hi + LAG_MAX - 1 is outside, at it
+    # inside; run_id 0 (no run_id) refused
     n = 200
-    mosi = np.array([np.frombuffer(P.encode_state([0.0] * 10, seq=k), dtype=np.uint8) for k in range(n)])
-    miso = np.zeros((n, 40), dtype=np.uint8)
-    out = 'not one offset'                                          # no MISO at all: the next refusal
-    for bad, word in ((100 + M.LAG_MAX - 1, 'RS4-R7-1'), (100 + M.LAG_MAX, out), (49, out), (50, 'RS4-R7-1')):
+    mosi = np.array([mosi_frame([0.0] * 10, k) for k in range(n)])
+    miso = np.zeros((n, P.FRAME_SIZE), dtype=np.uint8)
+    out = 'no H7 answer'                                            # no MISO at all: the next refusal
+    word = 'is not the log run_id'
+    for bad, want in ((100 + M.LAG_MAX - 1, word), (100 + M.LAG_MAX, out), (49, out), (50, word), (75, word)):
         m = mosi.copy()
-        m[bad, M.MOSI_SEQ] ^= 0x01
+        m[bad, M.MOSI_ID + 4] ^= 0x01
         ap = M.h7_apply(dict(mosi=m, miso=miso), 50, 100)
-        assert not ap['ok'] and word in ap['reason'], (bad, ap['reason'])
+        assert not ap['ok'] and want in ap['reason'], (bad, ap['reason'])
+    m = mosi.copy()
+    m[:, M.MOSI_ID:M.MOSI_ID + 4] = 0
+    ap = M.h7_apply(dict(mosi=m, miso=miso), 50, 100)
+    assert not ap['ok'] and 'run_id 0' in ap['reason'], ap['reason']
+    m = mosi.copy()
+    m[60, M.MOSI_ID] ^= 0x01                                          # another run_id inside the range
+    ap = M.h7_apply(dict(mosi=m, miso=miso), 50, 100)
+    assert not ap['ok'] and 'frame 60:' in ap['reason'] and word in ap['reason'], ap['reason']
 
 
 @needs_gcc
@@ -793,12 +940,11 @@ def write_frame_log(path, task, k_run, s):
     pose = np.vstack([np.zeros((k_move, 3)), pose])
     vel = np.gradient(pose[:, :2], 1e-3, axis=0)
     wz = np.gradient(np.unwrap(pose[:, 2]), 1e-3)
-    mosi = np.zeros((n, 40), dtype=np.uint8)
+    mosi = np.zeros((n, P.FRAME_SIZE), dtype=np.uint8)
     for k in range(n):
         st = list(om[k]) + [pose[k, 0], pose[k, 1], pose[k, 2], vel[k, 0], vel[k, 1], wz[k]]
         on = k >= k_run + 3
-        mosi[k] = np.frombuffer(P.encode_state(st, traj_ref=(0.3, 0.0, 0.1) if on else None,
-                                               traj_flags=P.TRAJ_VALID if on else 0, seq=k), dtype=np.uint8)
+        mosi[k] = mosi_frame(st, k, traj_ref=(0.3, 0.0, 0.1) if on else None, traj_flags=P.TRAJ_VALID if on else 0)
     miso = make_miso(mosi, s['duty_cap'], tm, skip=tm['skip'], stage_lag=tm['stage_lag'])
     manifest = dict(period_us=1000, steps=n, plant='MecanumPlant', miso_check=dict(crc_bad=0, empty=0),
                     lifecycle=dict(outcome='completed', transitions=[dict(step=0, t=0, phase='ARM'),
