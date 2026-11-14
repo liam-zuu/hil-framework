@@ -412,9 +412,39 @@ def ack_problem(ack, before, run_gain=None):
                 'lai sau khi dat gain (gain da mat) hay file ack cu')
     if (ack.get('mac') or '').lower() != (before.get('mac') or '').lower():
         return f'mac #gain_ack {ack.get("mac")} khac mac hai lan hoi {before.get("mac")}: board khac'
-    if run_gain is not None and ack.get('id') != run_gain.get('id'):
-        return f'id #gain_ack {ack.get("id")} khac id dong #gain cua luot {run_gain.get("id")}: ack cua bo gain khac'
+    if run_gain is not None:
+        # R134C6-2 (Codex round 6): both ids present and decimal before they are compared; two missing or two empty
+        # ids are no match
+        a_id, r_id = ack.get('id'), run_gain.get('id')
+        if not _dec(a_id) or not _dec(r_id):
+            return (f'id #gain_ack {a_id!r} hay id dang chay {r_id!r} thieu hay khong phai so nguyen: khong so duoc '
+                    'bo gain')
+        if int(a_id) != int(r_id):
+            return f'id #gain_ack {a_id} khac id dong #gain cua luot {r_id}: ack cua bo gain khac'
     return None
+
+
+def _dec(v) -> bool:
+    """A non-empty text of decimal digits (an id of the firmware lines)."""
+    return isinstance(v, str) and v.isascii() and v.isdigit()
+
+
+def gain_mismatch(g: dict, want: dict) -> list:
+    """Why the run's '#gain' line `g` (run_start()['gain']) is not the set of the gain file `want`
+    (load_gain_file); [] when id, ctrl and every gain (float32 bits) agree. Same rules as check() without
+    --builtin; used by the table (s05_final_table, R134C6-1)."""
+    why = []
+    if g['id'] == '0':
+        why.append(f'id=0 (built-in set) while the run should run id {want["id"]}')
+    elif not _dec(g['id']) or int(g['id']) != want['id']:
+        why.append(f'id={g["id"]}, gain file id {want["id"]}')
+    if g['ctrl'] != want['ctrl']:
+        why.append(f'ctrl={g["ctrl"]}, gain file {want["ctrl"]}')
+    else:
+        for n in NAMES[want['ctrl']]:
+            if f32_bits(g[n]) != want['gains'][n]:
+                why.append(f'{n}: log {g[n]}, file {struct.unpack("<f", want["gains"][n])[0]!r}')
+    return why
 
 
 def run_boot_of(csv_path, events_path=None):

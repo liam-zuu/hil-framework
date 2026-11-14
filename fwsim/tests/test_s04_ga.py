@@ -5,6 +5,7 @@ import csv
 import json
 import math
 import os
+import re
 import sys
 
 import numpy as np
@@ -812,6 +813,21 @@ def test_g5_alone_makes_the_point_infeasible():
     assert (row['g3'], row['g4'], row['g5']) == (-0.5, -0.5, 0.2) and set(s4.POP_COLS) >= {'g3', 'g4', 'g5'}
 
 
+GATE_FIELD = re.compile(r'^(e_bao_max|gate_[a-z_]+|g[1-5]_[a-z_]+)$')     # G1-G5 fields an s03_doe row may carry
+
+
+def _same_fields(a, b):
+    """run_gate row b against s03_doe.run_one row a: b adds e_bao_max; every field of b keeps the value of a; a field
+    of a that b has not is a G1-G5 field of an s03_doe that writes them (hil feat/s03-gate, S3G-5; CODE 15/11), and
+    an e_bao_max in a equals the one of b bit for bit."""
+    assert 'e_bao_max' in b and set(b) - set(a) <= {'e_bao_max'}
+    assert all(GATE_FIELD.match(k) for k in set(a) - set(b)), sorted(set(a) - set(b))
+    keys = [k for k in b if k != 'e_bao_max']
+    assert s3.row_text({k: a[k] for k in keys}) == s3.row_text({k: b[k] for k in keys})
+    if 'e_bao_max' in a:
+        assert s3._bits(a['e_bao_max']) == s3._bits(b['e_bao_max'])
+
+
 @needs_dll
 def test_run_gate_matches_run_one_and_adds_e_bao():
     """The gate run is s03_doe.run_one with o1_gate_eval: every field of run_one keeps its value."""
@@ -824,8 +840,7 @@ def test_run_gate_matches_run_one_and_adds_e_bao():
     a, la = s3.run_one(fw, path, 'PID', g, 0.5, 0.436)
     b, lb = s4.run_gate(fw, path, 'PID', g, 0.5, 0.436)
     assert s3.log_digest(la) == s3.log_digest(lb)
-    assert set(b) == set(a) | {'e_bao_max'}
-    assert s3.row_text(a) == s3.row_text({k: b[k] for k in a})
+    _same_fields(a, b)
     assert math.isfinite(b['e_bao_max'])
 
 
@@ -900,7 +915,7 @@ def test_run_gate_matches_run_one_for_both_controllers(ctrl, v, mu):
     a, la = s3.run_one(fw, path, ctrl, g, v, mu)
     b, lb = s4.run_gate(fw, path, ctrl, g, v, mu)
     assert s3.log_digest(la) == s3.log_digest(lb)
-    assert set(b) == set(a) | {'e_bao_max'} and s3.row_text(a) == s3.row_text({k: b[k] for k in a})
+    _same_fields(a, b)
     assert math.isfinite(b['e_bao_max'])
 
 

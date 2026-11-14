@@ -167,3 +167,8 @@ def test_c4_5_ack_before_problem(tmp_path):
     (tmp_path / ps.ACK_NAME).write_text(ACK, encoding='utf-8')     # R134C5-4: another set runs (id 8) since the ack
     (tmp_path / 'gain_query_before.txt').write_text(before.replace('id=7', 'id=8'), encoding='utf-8')
     assert 'bo gain khac' in ps.ack_before_problem(str(tmp_path))
+    # R134C6-2: the ack and the question before both without id, or both with an empty id: no match
+    for gone, empty in (('', ''), (',id=', ',id=')):
+        (tmp_path / ps.ACK_NAME).write_text(ACK.replace(',id=7,applied_n', gone + ',applied_n'), encoding='utf-8')
+        (tmp_path / 'gain_query_before.txt').write_text(before.replace(',id=7', empty), encoding='utf-8')
+        assert 'khong so duoc bo gain' in ps.ack_before_problem(str(tmp_path)), (gone, empty)

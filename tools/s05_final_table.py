@@ -47,6 +47,10 @@ tv_duty (S03 Y3, S05 4.7 (1)), from the cumulative firmware counters dpwm_fl..dp
     checks of rq3_log summary; every judged final run must show its evidence at run level (run_evidence_problem:
     two answers that are two questions, of the row's boots, and a readable ack of the question's boot, MAC and
     running id), else the table stops (exit 2). tv_duty may still have no number for its own reasons.
+    R134C6-1 (Codex round 6; Liam 15/11 CODE_R134 "Tham so cua lenh bang (Recommended)"): and the run's '#gain'
+    line is the gain file of its set, bit for bit, the file id = the running id of the question before: A, B the
+    file of S05_freeze.csv (sha256 checked), the initial gain the file of --init-gain <ctrl>=F; no file for the
+    set stops the table too. The files and their sha256 go to S05_final_gain_files.csv and S05_final_runs.csv.
     The data lines are read by gain_line_check.read_esp32_log (R134C-3, S05 6.3): lines marked
     'duplicate' in <log>.segments.csv dropped (counted, tv_rows_dropped), 'conflict' / 'ambiguous'
     refused; without the sidecar two lines with one log_seq are refused.
@@ -79,9 +83,10 @@ every valid run without a number. The quantity list is fixed here (do not change
   python tools/s05_final_table.py table [--dataset 05_DATA/M7_dataset] --out <dir>
       [--score-name score.json] [--esp32-name esp32.csv]
       [--query-before-name gain_query_before.txt] [--query-after-name gain_query_after.txt]
-      [--gain-ack-name gain_ack.txt]
+      [--gain-ack-name gain_ack.txt] [--init-gain PID=F] [--init-gain LADRC=F]
   table writes <out>/S05_final_table.csv (one row per cell and quantity), S05_final_table.md (the
-  three gain sets side by side) and S05_final_runs.csv (the value of every valid run: appendix).
+  three gain sets side by side), S05_final_runs.csv (the value of every valid run: appendix) and
+  S05_final_gain_files.csv (gain file and sha256 of every set; R134C6-1).
 Last line: #ket_qua,ma=0 done / 2 error.
 """
 from __future__ import annotations
@@ -311,8 +316,57 @@ def run_values(score, task, tv):
     return v, miss
 
 
+def gain_files(dataset, init_gain=None):
+    """R134C6-1 (Codex round 6; Liam 15/11 CODE_R134 hop chon "Tham so cua lenh bang (Recommended)"): the gain file
+    of every gain set the table may meet, {gain_set_id or 'RQ2-INIT-<ctrl>': dict(file, sha256, source, want)}.
+    A, B: the rows of <dataset>/S05_freeze.csv (rq3_log freeze); the file as written there (a relative name is
+    taken from the dataset folder first, then from the working folder) and its sha256 must equal gain_sha256.
+    Initial gain (RQ2-INIT-<ctrl>): init_gain {ctrl: file} of --init-gain, its sha256 written to the output.
+    want = gain_line_check.load_gain_file of the file; its ctrl must be the controller of the set."""
+    import rq3_log as rl
+    out = {}
+    for r in rl.read_rows(os.path.join(dataset, rl.FREEZE)):
+        gs, p = r.get('gain_set_id', ''), r.get('gain_file', '')
+        if not gs:
+            continue
+        cand = [p] if os.path.isabs(p) else [os.path.join(dataset, p), p]
+        f = next((c for c in cand if os.path.isfile(c)), None)
+        if f is None:
+            raise ValueError(f'S05_freeze.csv: gain_file {p!r} of {gs} not found (tried {cand})')
+        sha = rl.sha256_file(f)
+        if sha != r.get('gain_sha256', ''):
+            raise ValueError(f'S05_freeze.csv: {f} sha256 {sha} khac gain_sha256 {r.get("gain_sha256")!r} of {gs}')
+        out[gs] = dict(file=f, sha256=sha, source='S05_freeze.csv', want=_want(f, gs.split('/')[0].split('-')[-1]))
+    for ctrl, f in (init_gain or {}).items():
+        if ctrl not in CONTROLLERS:
+            raise ValueError(f'--init-gain {ctrl}=...: controller one of {CONTROLLERS}')
+        if not os.path.isfile(f):
+            raise ValueError(f'--init-gain {ctrl}={f}: no such file')
+        out[f'RQ2-INIT-{ctrl}'] = dict(file=f, sha256=rl.sha256_file(f), source='--init-gain', want=_want(f, ctrl))
+    return out
+
+
+FW_CTRL = {'PID': 'PID', 'LADRC': 'ADRC'}     # controller of the log -> ctrl of the gain file / '#gain' line
+
+
+def _want(path, ctrl):
+    try:
+        w = glc.load_gain_file(path)
+    except glc.InputError as e:
+        raise ValueError(f'gain file: {e}')
+    if w['ctrl'] != FW_CTRL.get(ctrl):
+        raise ValueError(f'gain file {path}: ctrl {w["ctrl"]}, the set is of {ctrl} (ctrl {FW_CTRL.get(ctrl)})')
+    return w
+
+
+def gain_file_of(gain_set_id, files):
+    """The entry of gain_files() for one row: the frozen set by its id (A, B), the initial gain by its prefix."""
+    g = (gain_set_id or '').split('/')[0]
+    return files.get(g) if g.startswith('RQ2-INIT-') else files.get(gain_set_id or '')
+
+
 def load_runs(dataset, score_name, esp32_name, query_before_name='gain_query_before.txt',
-              query_after_name='gain_query_after.txt', gain_ack_name='gain_ack.txt'):
+              query_after_name='gain_query_after.txt', gain_ack_name='gain_ack.txt', init_gain=None):
     path = os.path.join(dataset, 'm7_tuning_log.csv')
     with open(path, newline='', encoding='utf-8') as f:
         rows = list(csv.DictReader(f))
@@ -331,24 +385,28 @@ def load_runs(dataset, score_name, esp32_name, query_before_name='gain_query_bef
         rl.check_map_rows(rows)
     except rl.LogError as e:
         raise ValueError(f'm7_tuning_log.csv: {e}')
+    files = gain_files(dataset, init_gain)                                              # R134C6-1
     runs, bad = [], []
     for r in rows:
         plat = next((p for p in PLATFORMS if r.get('platform') == p[0] and r.get('stage') == p[2]), None)
         if plat is None:
             continue
-        if r.get('run_outcome') in VALID:           # R134C5-1, R134C5-3: the run's evidence, whatever tv_duty
-            why = run_evidence_problem(r, query_before_name, query_after_name, gain_ack_name)
-            if why:
-                bad.append(f"run {r.get('run_uid')}: {why}")
         ctrl, task = r.get('controller', ''), r.get('trajectory', '')
         gs = gain_set_of(r.get('gain_set_id'), ctrl)
         if ctrl not in CONTROLLERS or task not in CONDITIONS or gs is None:
             problems.append(f"run {r.get('run_uid')}: controller {ctrl!r}, trajectory {task!r}, gain_set_id "
                             f"{r.get('gain_set_id')!r} khong vao bang")
             continue
+        gf = gain_file_of(r.get('gain_set_id'), files)
+        if r.get('run_outcome') in VALID:           # R134C5-1, -3, R134C6-1: the run's evidence, whatever tv_duty
+            why = run_evidence_problem(r, query_before_name, query_after_name, gain_ack_name, esp32_name, gf)
+            if why:
+                bad.append(f"run {r.get('run_uid')}: {why}")
         run = dict(run_uid=r.get('run_uid'), platform=plat[1], controller=ctrl, condition=task, gain_set=gs,
                    outcome=r.get('run_outcome'), results_dir=r.get('results_dir', ''),
-                   cat_t1=r.get('g1_cat_t1') == 'true')      # R134C4-6: O1 3.5 R2V-4, counted per cell
+                   cat_t1=r.get('g1_cat_t1') == 'true',      # R134C4-6: O1 3.5 R2V-4, counted per cell
+                   gain_set_id=r.get('gain_set_id', ''), gain_file=(gf or {}).get('file', ''),
+                   gain_sha256=(gf or {}).get('sha256', ''), gain_source=(gf or {}).get('source', ''))
         if run['outcome'] in VALID:
             d = run['results_dir']
             score, tv = {}, dict(reason='')
@@ -379,14 +437,38 @@ def load_runs(dataset, score_name, esp32_name, query_before_name='gain_query_bef
     return runs, problems
 
 
+def run_gain_problem(esp32_path, want):
+    """R134C6-1: None, or why the '#gain' line of the run (next to its start: the first motor-on data line, as
+    tv_duty_esp32 takes it; gain_line_check.run_start) is not the set of the gain file `want`. Only the run's
+    start is taken: a log with a second motor-on stretch keeps its other reasons (tv_duty has no number then)."""
+    if not os.path.isfile(esp32_path):
+        return f'thieu {os.path.basename(esp32_path)}: khong so duoc dong #gain cua luot voi file gain'
+    try:
+        rows, _ = read_esp32_log_info(esp32_path)
+        on = [x.get('motor_on') == '1' for x in rows]
+        rise = next((i for i in range(len(rows)) if on[i]), None)
+        if rise is None or rise == 0:
+            return 'khong xac dinh duoc dong du lieu dau luot (motor_on) de khop #gain voi file gain'
+        st = glc.run_start(read_events(esp32_path), _int(rows[rise]['log_seq']))
+    except (OSError, glc.InputError) as e:
+        return f'dong #gain cua luot: {e}'
+    if st['gain'] is None:
+        return f'dong #gain cua luot: {"; ".join(st["why"])} (S05 6.3)'
+    why = glc.gain_mismatch(st['gain'], want)
+    return f'dong #gain cua luot khac file gain: {"; ".join(why)}' if why else None
+
+
 def run_evidence_problem(row, query_before_name='gain_query_before.txt', query_after_name='gain_query_after.txt',
-                         gain_ack_name='gain_ack.txt'):
+                         gain_ack_name='gain_ack.txt', esp32_name='esp32.csv', gain_file=None):
     """R134C5-1, R134C5-3 (Codex round 5; Liam 14/11 CODE_R134 hop chon "Bat buoc ack moi luot (Recommended)"):
     None, or why a judged final run (car or HIL) lacks the evidence S05 4.7 (iv) asks for, checked at the level of
     the run, apart from tv_duty: two answers in <results_dir> that are two questions one after the other
     (gain_line_check.query_problem), their boots equal to the two boot columns of the row, and the '#gain_ack' of
     the gain setting (every final run, the initial gain too, sets its gain from a file with --gain-file): present,
-    readable, of the boot, MAC and running id of the question before the run."""
+    readable, of the boot, MAC and running id of the question before the run.
+    R134C6-1 (Codex round 6): and the set of the row's cell (gain_file: entry of gain_files(), None = no file for
+    the gain_set_id): the run's '#gain' line equals that file bit for bit (run_gain_problem), and the id of the file
+    is the running id of the question before (so of the ack too)."""
     d = row.get('results_dir', '')
     qb, qa = read_query(os.path.join(d, query_before_name)), read_query(os.path.join(d, query_after_name))
     why = glc.query_problem(qb, qa, check_run_boot=False)
@@ -400,7 +482,18 @@ def run_evidence_problem(row, query_before_name='gain_query_before.txt', query_a
     if ack is None:
         return (f'{gain_ack_name} hong (khong mot dong # ack ok=1, hay dong cuoi khong ma=0)' if os.path.exists(ap)
                 else f'thieu {gain_ack_name}: moi luot kiem cuoi dat gain bang --gain-file (Liam 14/11)')
-    return glc.ack_problem(ack, qb, {'id': qb.get('id')})
+    why = glc.ack_problem(ack, qb, {'id': qb.get('id')})
+    if why:
+        return why
+    if gain_file is None:
+        g = (row.get('gain_set_id') or '').split('/')[0]
+        return (f'khong co file gain cua {row.get("gain_set_id")!r}: '
+                + (f'cho --init-gain {g.split("-")[-1]}=<file>' if g.startswith('RQ2-INIT-')
+                   else 'bo gain khong co dong trong S05_freeze.csv'))
+    want = gain_file['want']
+    if int(qb['id']) != want['id']:
+        return f'id dang chay {qb["id"]} cua lan hoi truoc khac id {want["id"]} cua file gain {gain_file["file"]}'
+    return run_gain_problem(os.path.join(d, esp32_name), want)
 
 
 def build_table(runs):
@@ -466,7 +559,8 @@ def write_table(runs, out_dir):
     with open(os.path.join(out_dir, 'S05_final_table.md'), 'w', encoding='utf-8') as f:
         f.write(markdown(table))
     rcols = ['run_uid', 'platform', 'controller', 'condition', 'gain_set', 'outcome', 'flag'] + list(QUANTITIES) + \
-            ['tv_reason', 'tv_d_tick', 'tv_d_seq', 'tv_end_gap_ms', 'tv_rows_dropped', 'results_dir']
+            ['tv_reason', 'tv_d_tick', 'tv_d_seq', 'tv_end_gap_ms', 'tv_rows_dropped', 'results_dir',
+             'gain_set_id', 'gain_file', 'gain_sha256']
     with open(os.path.join(out_dir, 'S05_final_runs.csv'), 'w', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=rcols)
         w.writeheader()
@@ -478,7 +572,15 @@ def write_table(runs, out_dir):
                             flag=r.get('flag', ''), **{q: ('' if v.get(q) is None else v[q]) for q in QUANTITIES},
                             tv_reason=tv.get('reason', ''), tv_d_tick=tv.get('d_tick', ''), tv_d_seq=tv.get('d_seq', ''),
                             tv_end_gap_ms=tv.get('end_gap_ms', ''), tv_rows_dropped=tv.get('rows_dropped', ''),
-                            results_dir=r['results_dir']))
+                            results_dir=r['results_dir'], gain_set_id=r.get('gain_set_id', ''),
+                            gain_file=r.get('gain_file', ''), gain_sha256=r.get('gain_sha256', '')))
+    used = sorted({(r.get('gain_set_id', '').split('/')[0] if r.get('gain_source') == '--init-gain'
+                    else r.get('gain_set_id', ''), r.get('gain_file', ''), r.get('gain_sha256', ''),
+                    r.get('gain_source', '')) for r in runs if r.get('gain_file')})
+    with open(os.path.join(out_dir, 'S05_final_gain_files.csv'), 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)                        # R134C6-1: the gain file of every set in the table, with sha256
+        w.writerow(['gain_set', 'gain_file', 'gain_sha256', 'source'])
+        w.writerows(used)
     return table
 
 
@@ -502,6 +604,8 @@ def main(argv=None):
     a2.add_argument('--query-before-name', default='gain_query_before.txt')
     a2.add_argument('--query-after-name', default='gain_query_after.txt')
     a2.add_argument('--gain-ack-name', default='gain_ack.txt')
+    a2.add_argument('--init-gain', action='append', default=[], metavar='CTRL=FILE',
+                    help='gain file of the initial gain RQ2-INIT-<CTRL> (PID, LADRC; R134C6-1)')
     a = ap.parse_args(argv)
     try:
         if a.cmd == 'tv':
@@ -513,8 +617,14 @@ def main(argv=None):
             r['rows_dropped'] = n_drop
             print(json.dumps(r, ensure_ascii=False, indent=1))
         else:
+            init = {}
+            for x in a.init_gain:
+                c, sep, f = x.partition('=')
+                if not sep or not f or c in init:
+                    raise ValueError(f'--init-gain {x!r}: write CTRL=FILE, once per controller')
+                init[c] = f
             runs, problems = load_runs(a.dataset, a.score_name, a.esp32_name, a.query_before_name,
-                                       a.query_after_name, a.gain_ack_name)
+                                       a.query_after_name, a.gain_ack_name, init)
             for p in problems:
                 print('CANH BAO:', p)
             write_table(runs, a.out)

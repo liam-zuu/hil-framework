@@ -329,7 +329,8 @@ class Evaluator:
                     error = True
                     try:                     # section 3: once more in a new process, for diagnosis only
                         again = s3.run_in_new_process(self.dll, [(self.ctrl, g, v, mu)], self.work)[0]
-                        # diagnosis only: s03_doe's evaluator (no e_bao_max), so pen_e_bao_max = 1 here
+                        # diagnosis only: s03_doe's evaluator; an s03_doe without e_bao_max gives pen_e_bao_max = 1
+                        # here (an s03_doe that writes G1-G5, hil feat/s03-gate, has it; S3G-6)
                         self._rec(ga_seed, gen, cand, v, mu, 2, again['row'], None,
                                   log_sha256=(hashlib.sha256(json.dumps(again['digest'], sort_keys=True).encode())
                                               .hexdigest() if again.get('digest') else ''),
@@ -1227,7 +1228,7 @@ interpretations:   # of this script, not written in S04 v5; Liam or THESIS corre
   - "R sensitivity: motor_R of the four wheels x 0.8, 0.9, 1.0, 1.1, 1.2 (S04 6 says +-20 %), every other plant parameter as params.py (J, b not rescaled)"
   - "gains stored as Python repr (17 significant digits) and as the float32 value the firmware receives (fwsim set_pid / set_adrc take c_float)"
   - "evals.csv rows with ga_seed 0, gen 0 (trial folder): the firmware default gains at the middle mu, run once for the HV reference (section 4.2)"
-  - "g3-g5 (S04 v6.2, R134 package): e_bao_max of o1_gate_eval.evaluate_fig8 (evaluate_v7 unchanged inside); the diagnosis attempt 2 of a run_error runs s03_doe's evaluator in a new process, so it has no e_bao_max (pen_e_bao_max = 1, diagnosis only); a candidate with a run_error takes 1e6 for every quantity as for f1"
+  - "g3-g5 (S04 v6.2, R134 package): e_bao_max of o1_gate_eval.evaluate_fig8 (evaluate_v7 unchanged inside); the diagnosis attempt 2 of a run_error runs s03_doe's evaluator in a new process (diagnosis only; pen_e_bao_max = 1 when that s03_doe writes no e_bao_max); a candidate with a run_error takes 1e6 for every quantity as for f1"
   - "not in this version (S04 v6.2-v6.3, open): the G3-G5 states in the mu rule (needs the S03 run with G1-G5, S03 v8.2) and G3-G5 in the section 6 post checks"
 """)
 

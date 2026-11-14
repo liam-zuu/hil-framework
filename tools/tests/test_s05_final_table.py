@@ -3,6 +3,7 @@ Synthetic logs follow the firmware (AGV 54b7269): one data line per motor-on tic
 log_seq +1, dpwm += |dpwm|), motor-off lines at 10 Hz (log_seq +1, tick unchanged), three '#run_end'
 lines at an on -> off edge (log_seq +3, not in the CSV)."""
 import csv
+import re
 import json
 import os
 import sys
@@ -164,11 +165,50 @@ def start_events(seq, boot='4753dc47', gain_seq=None, drops=(0, 0, 0), t0='2026-
                  + [US.format(boot=boot, seq=seq)] * 3, t0)
 
 
-def answer(boot, mac='aa:bb', t=(100.0, 101.0)):
+def answer(boot, mac='aa:bb', t=(100.0, 101.0), gid=7):
     """A saved gain_send --query output: the writer's '#query_pc' line (R134C2-1), then the answer."""
     return (f'#query_pc,t_start={t[0]:.6f},t_end={t[1]:.6f}\n'
-            f'#gain_running,sha=16702ff0e688,env=pid,mac={mac},boot={boot},id=7,applied_n=1,ctrl=PID\n'
+            f'#gain_running,sha=16702ff0e688,env=pid,mac={mac},boot={boot},id={gid},applied_n=1,ctrl=PID\n'
             '#ket_qua,ma=0\n')
+
+
+# R134C6-1: the gain file of the set the runs carry (the values of GAIN7, id 7), frozen as A-PID/G07, and the same
+# set given as the initial gain of PID (--init-gain)
+GAIN7_FILE = dict(ctrl='PID', id=7, gains=dict(kp_xy=1.5, ki_xy=0.05, kp_wz=1.0, ki_wz=0.05, pos_kp=6.0, pos_ki=3.0,
+                                                k_psi=1.0))
+
+
+def write_gain_file(path, **kw):
+    g = dict(GAIN7_FILE, **{k: v for k, v in kw.items() if k != 'gains'})
+    g['gains'] = dict(GAIN7_FILE['gains'], **kw.get('gains', {}))
+    with open(path, 'w', encoding='utf-8', newline='\n') as f:
+        json.dump(g, f)
+    return str(path)
+
+
+def write_gains(ds, frozen=(('A-PID', 'A-PID/G07'),)):
+    """S05_freeze.csv of the dataset (rq3_log freeze format) with one gain file per frozen set, and the initial
+    gain file of PID; returns the --init-gain map."""
+    rows = []
+    for camp, gs in frozen:
+        f = write_gain_file(os.path.join(ds, f'gain_{gs.replace("/", "_")}.json'))
+        rows.append(dict.fromkeys(rl.FREEZE_COLS, '') | dict(campaign=camp, gain_set_id=gs,
+                                                              gain_file=os.path.basename(f),
+                                                              gain_sha256=rl.sha256_file(f)))
+    with open(os.path.join(ds, rl.FREEZE), 'w', newline='', encoding='utf-8') as fh:
+        w = csv.DictWriter(fh, fieldnames=rl.FREEZE_COLS)
+        w.writeheader()
+        w.writerows(rows)
+    return dict(PID=write_gain_file(os.path.join(ds, 'gain_init_PID.json')))
+
+
+def init_args(ds):
+    return ['--init-gain', f'PID={os.path.join(ds, "gain_init_PID.json")}']
+
+
+def LR(ds, **kw):
+    return T.load_runs(ds, 'score.json', 'esp32.csv', init_gain=kw.pop('init_gain', {'PID': os.path.join(
+        ds, 'gain_init_PID.json')}), **kw)
 
 
 def ack_text(boot='4753dc47', mac='aa:bb', gid=7, ok=1, ma=0):
@@ -245,14 +285,9 @@ def test_table_cells_medians_and_reasons(tmp_path):
         # R134C5-1: a run whose two answers differ is refused at run level (test_c5_1_...), not tabled
         write_run(tmp_path, 'r6', 'HW', 'screen', 'PID', 'O1-F05', 'A-PID/G03', 'dat', 0.010),   # not final
     ]
-    ds = tmp_path / 'ds'
-    os.makedirs(ds)
-    with open(ds / 'm7_tuning_log.csv', 'w', newline='', encoding='utf-8') as f:
-        w = csv.DictWriter(f, fieldnames=list(runs[0]))
-        w.writeheader()
-        w.writerows(runs)
+    ds = _table_ds(tmp_path, runs)
     out = tmp_path / 'out'
-    assert T.main(['table', '--dataset', str(ds), '--out', str(out)]) == 0
+    assert T.main(['table', '--dataset', ds, '--out', str(out)] + init_args(ds)) == 0
     tab = list(csv.DictReader(open(out / 'S05_final_table.csv', encoding='utf-8')))
     assert len(tab) == 2 * 5 * 2 * 3 * len(T.QUANTITIES)                  # fixed shape, empty cells kept
     cell = {t['quantity']: t for t in tab if (t['controller'], t['condition'], t['platform'], t['gain_set'])
@@ -271,17 +306,18 @@ def test_table_cells_medians_and_reasons(tmp_path):
     assert '| PID | O1-F05 | xe |' in md and '0.03 / 0.12 (n_m 3)' in md
     per_run = list(csv.DictReader(open(out / 'S05_final_runs.csv', encoding='utf-8')))
     assert {r['run_uid'] for r in per_run} == {'r1', 'r2', 'r3', 'r4', 'r5'}
+    assert {r['run_uid']: r['gain_sha256'] for r in per_run}['r1'] == rl.sha256_file(os.path.join(ds,
+                                                                                         'gain_A-PID_G07.json'))
+    used = list(csv.DictReader(open(out / 'S05_final_gain_files.csv', encoding='utf-8')))      # R134C6-1
+    assert [(u['gain_set'], u['source']) for u in used] == [('A-PID/G07', 'S05_freeze.csv'),
+                                                            ('RQ2-INIT-PID', '--init-gain')]
+    assert used[1]['gain_sha256'] == rl.sha256_file(os.path.join(ds, 'gain_init_PID.json'))
 
 
 def test_unknown_gain_set_is_reported_not_tabled(tmp_path, capsys):
     r = write_run(tmp_path, 'x', 'HW', 'final', 'PID', 'O1-F05', 'C-PID/G01', 'dat', 0.02)
-    ds = tmp_path / 'ds'
-    os.makedirs(ds)
-    with open(ds / 'm7_tuning_log.csv', 'w', newline='', encoding='utf-8') as f:
-        w = csv.DictWriter(f, fieldnames=list(r))
-        w.writeheader()
-        w.writerow(r)
-    assert T.main(['table', '--dataset', str(ds), '--out', str(tmp_path / 'o')]) == 0
+    ds = _table_ds(tmp_path, [r])
+    assert T.main(['table', '--dataset', ds, '--out', str(tmp_path / 'o')]) == 0
     assert 'khong vao bang' in capsys.readouterr().out
 
 
@@ -557,26 +593,21 @@ def test_b81_14_read_ack_and_the_table(tmp_path):
     assert T.glc.read_ack(os.path.join(d, 'none.txt')) is None
     base = os.path.join(d, 'runs')
     os.makedirs(base)
-    run = write_run(base, 'F1', 'HIL', 'final_hil', 'PID', 'O1-F05', 'A-PID/G0', 'dat', 0.03)
-    ds = os.path.join(d, 'ds')
-    os.makedirs(ds)
-    with open(os.path.join(ds, 'm7_tuning_log.csv'), 'w', newline='', encoding='utf-8') as f:
-        w = csv.DictWriter(f, fieldnames=list(run))
-        w.writeheader()
-        w.writerow(run)
-    runs, _ = T.load_runs(ds, 'score.json', 'esp32.csv')
+    run = write_run(base, 'F1', 'HIL', 'final_hil', 'PID', 'O1-F05', 'A-PID/G07', 'dat', 0.03)
+    ds = _table_ds(d, [run])
+    runs, _ = LR(ds)
     assert runs[0]['values']['tv_duty'] == pytest.approx(4.0) and runs[0]['tv_check']['boot_ack'] == '4753dc47'
     with open(os.path.join(run['results_dir'], 'gain_ack.txt'), 'w', encoding='utf-8') as f:
         f.write(ack_text('0badf00d'))
     with pytest.raises(ValueError, match='khoi dong lai sau khi dat gain'):     # R134C5-3: run level, not tv
-        T.load_runs(ds, 'score.json', 'esp32.csv')
+        LR(ds)
     os.remove(os.path.join(run['results_dir'], 'gain_ack.txt'))
     with pytest.raises(ValueError, match='thieu gain_ack.txt'):
-        T.load_runs(ds, 'score.json', 'esp32.csv')
+        LR(ds)
     with open(os.path.join(run['results_dir'], 'gain_ack.txt'), 'w', encoding='utf-8') as f:
         f.write(ack_text(ok=0))                                         # there but not an applied set
     with pytest.raises(ValueError, match='gain_ack.txt hong'):
-        T.load_runs(ds, 'score.json', 'esp32.csv')
+        LR(ds)
 
 
 @pytest.mark.parametrize('bad', [float('nan'), float('inf'), float('-inf'), True, 'x'])
@@ -598,14 +629,15 @@ def test_b81_16_not_finite_is_no_number(bad):
 
 # ---------------------------------------------------------------- Codex Sol round 4 (CODE_R134)
 
-def _table_ds(tmp_path, runs):
-    ds = tmp_path / 'ds'
+def _table_ds(tmp_path, runs, frozen=(('A-PID', 'A-PID/G07'),)):
+    ds = os.path.join(tmp_path, 'ds')
     os.makedirs(ds, exist_ok=True)
-    with open(ds / 'm7_tuning_log.csv', 'w', newline='', encoding='utf-8') as f:
+    with open(os.path.join(ds, 'm7_tuning_log.csv'), 'w', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=list(runs[0]))
         w.writeheader()
         w.writerows(runs)
-    return str(ds)
+    write_gains(ds, frozen)                                            # R134C6-1
+    return ds
 
 
 @pytest.mark.parametrize('cut, match', [
@@ -631,7 +663,7 @@ def test_c4_2_final_hil_without_boots_and_rows_outside_the_campaigns(tmp_path, c
     capsys.readouterr()
     c = write_run(tmp_path, 'c1', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', 0.02)
     old = dict(c, campaign='', run_uid='OLD:1')
-    runs, problems = T.load_runs(_table_ds(tmp_path, [c, old]), 'score.json', 'esp32.csv')
+    runs, problems = LR(_table_ds(tmp_path, [c, old]))
     assert [r['run_uid'] for r in runs] == ['c1'] and any('OLD:1' in p and 'ngoai cac chien dich' in p
                                                           for p in problems)
 
@@ -644,7 +676,7 @@ def test_c4_6_cat_t1_counted_per_cell(tmp_path):
     g.update(rl.o1_gate.evaluate_outcomes(g, g['decide']))
     r.update(rl.gate_columns(g), fail_cause=rl.VIOL_BEFORE)
     p = write_run(tmp_path, 'v2', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'khong_dat', 0.12)
-    runs, _ = T.load_runs(_table_ds(tmp_path, [r, p]), 'score.json', 'esp32.csv')
+    runs, _ = LR(_table_ds(tmp_path, [r, p]))
     cell = [t for t in T.build_table(runs) if (t['condition'], t['platform'], t['gain_set'], t['quantity'])
             == ('O1-F05', 'xe', 'A', 'e_perp_max')][0]
     assert cell['n_valid'] == 2 and cell['n_cat_t1'] == 1
@@ -685,7 +717,7 @@ def test_c5_1_run_evidence_is_checked_apart_from_tv_duty(tmp_path, case, match):
     else:
         r.update(boot_before='0badf00d', boot_after='0badf00d')
     with pytest.raises(ValueError, match=match):
-        T.load_runs(_table_ds(tmp_path, [r]), 'score.json', 'esp32.csv')
+        LR(_table_ds(tmp_path, [r]))
 
 
 def test_c5_2_a_historic_hil_row_does_not_stop_the_table(tmp_path):
@@ -694,7 +726,7 @@ def test_c5_2_a_historic_hil_row_does_not_stop_the_table(tmp_path):
     old = dict.fromkeys(rl.TUNING_COLS, '')
     old.update(session_id='OLD', run_uid='OLD:1', campaign='', platform='HIL', stage='hil_check', run_outcome='dat',
                controller='PID', trajectory='O1-F05', speed_mps='0.5')
-    runs, problems = T.load_runs(_table_ds(tmp_path, [good, old]), 'score.json', 'esp32.csv')
+    runs, problems = LR(_table_ds(tmp_path, [good, old]))
     assert [x['run_uid'] for x in runs] == ['g1'] and problems == []
 
 
@@ -704,8 +736,133 @@ def test_c5_3_every_final_run_has_its_ack(tmp_path):
     r = write_run(tmp_path, 'i1', 'HIL', 'final_hil', 'PID', 'O1-F05', 'RQ2-INIT-PID/G00', 'dat', 0.02)
     os.remove(os.path.join(r['results_dir'], 'gain_ack.txt'))
     with pytest.raises(ValueError, match='thieu gain_ack.txt'):
-        T.load_runs(_table_ds(tmp_path, [r]), 'score.json', 'esp32.csv')
+        LR(_table_ds(tmp_path, [r]))
     with open(os.path.join(r['results_dir'], 'gain_ack.txt'), 'w', encoding='utf-8') as f:
         f.write(ack_text(gid=8))                                      # the question before says id 7
     with pytest.raises(ValueError, match='bo gain khac'):
-        T.load_runs(_table_ds(tmp_path, [r]), 'score.json', 'esp32.csv')
+        LR(_table_ds(tmp_path, [r]))
+
+
+# ---------------------------------------------------------------- Codex Sol round 6 (CODE_R134)
+
+def _set_id(r, gid, ack=True, query=True, line=True):
+    """Make the run of row r show set `gid` in its ack, its two answers and / or its '#gain' line."""
+    d = r['results_dir']
+    if ack:
+        with open(os.path.join(d, 'gain_ack.txt'), 'w', encoding='utf-8') as f:
+            f.write(ack_text(gid=gid))
+    if query:
+        for w, t in (('before', (100.0, 101.0)), ('after', (200.0, 201.0))):
+            with open(os.path.join(d, f'gain_query_{w}.txt'), 'w', encoding='utf-8') as f:
+                f.write(answer('4753dc47', t=t, gid=gid))
+    if line:
+        p = os.path.join(d, 'esp32.csv.events.txt')
+        with open(p, encoding='utf-8') as f:
+            txt = f.read()
+        with open(p, 'w', encoding='utf-8') as f:
+            f.write(txt.replace('#gain,id=7,', f'#gain,id={gid},'))
+
+
+def test_c6_1_a_run_of_another_file_than_its_set_is_refused(tmp_path):
+    """R134C6-1: the gain file id 8 was given for a run of A-PID/G07 (ack, two answers, '#gain' all id 8): the
+    table stops at that run, whatever tv_duty."""
+    r = write_run(tmp_path, 'w1', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', 0.02)
+    ds = _table_ds(tmp_path, [r])
+    assert len(LR(ds)[0]) == 1                                        # the fixture run itself passes
+    _set_id(r, 8)
+    with pytest.raises(ValueError, match=r'run w1: id dang chay 8 .* khac id 7 cua file gain'):
+        LR(ds)
+
+
+def test_c6_1_set_changed_after_the_ack_is_refused(tmp_path):
+    """R134C6-1 variant: ack and the question before say id 7, the run's '#gain' line says id 8 (set changed
+    before the run): no longer only tv_duty empty; the run stops the table."""
+    r = write_run(tmp_path, 'w2', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', 0.02)
+    ds = _table_ds(tmp_path, [r])
+    _set_id(r, 8, ack=False, query=False)
+    with pytest.raises(ValueError, match=r'run w2: dong #gain cua luot khac file gain: id=8, gain file id 7'):
+        LR(ds)
+
+
+def test_c6_1_gain_values_must_match_bit_for_bit(tmp_path):
+    """R134C6-1: one gain of the file differs from the run's '#gain' line (same id): refused."""
+    r = write_run(tmp_path, 'w3', 'HIL', 'final_hil', 'PID', 'O1-F05', 'RQ2-INIT-PID/G00', 'dat', 0.02)
+    ds = _table_ds(tmp_path, [r])
+    other = write_gain_file(os.path.join(ds, 'gain_init_other.json'), gains=dict(kp_xy=1.25))
+    with pytest.raises(ValueError, match=r'run w3: dong #gain cua luot khac file gain: kp_xy: log 1.5'):
+        LR(ds, init_gain={'PID': other})
+
+
+def test_c6_1_no_file_for_the_set(tmp_path, capsys):
+    """R134C6-1: a set with no row in S05_freeze.csv, or an initial gain without --init-gain, stops the table."""
+    a = write_run(tmp_path, 'n1', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', 0.02)
+    i = write_run(tmp_path, 'n2', 'HIL', 'final_hil', 'PID', 'O1-F05', 'RQ2-INIT-PID/G00', 'dat', 0.02)
+    ds = _table_ds(tmp_path, [a, i], frozen=())
+    with pytest.raises(ValueError, match=r'run n1: khong co file gain .*S05_freeze.csv; run n2: .*--init-gain PID'):
+        LR(ds, init_gain={})
+    assert T.main(['table', '--dataset', ds, '--out', str(tmp_path / 'o')]) == 2
+    assert 'cho --init-gain PID' in capsys.readouterr().out
+
+
+def test_c6_1_frozen_file_must_keep_its_sha(tmp_path):
+    r = write_run(tmp_path, 's1', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', 0.02)
+    ds = _table_ds(tmp_path, [r])
+    write_gain_file(os.path.join(ds, 'gain_A-PID_G07.json'), gains=dict(kp_xy=1.25))     # changed after freeze
+    with pytest.raises(ValueError, match='khac gain_sha256'):
+        LR(ds)
+
+
+def test_c6_1_init_gain_arguments_and_ladrc_ctrl(tmp_path, capsys):
+    """--init-gain CTRL=FILE once per controller; a LADRC set is a gain file with ctrl ADRC (gain_send format)."""
+    r = write_run(tmp_path, 'l1', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', 0.02)
+    ds = _table_ds(tmp_path, [r])
+    ok = os.path.join(ds, 'gain_init_PID.json')
+    for bad, why in ((['--init-gain', 'PID'], 'write CTRL=FILE'), (init_args(ds) * 2, 'once per controller'),
+                     (['--init-gain', 'XYZ=' + ok], 'controller one of')):
+        assert T.main(['table', '--dataset', ds, '--out', str(tmp_path / 'o')] + bad) == 2, bad
+        assert why in capsys.readouterr().out, bad
+    assert T.main(['table', '--dataset', ds, '--out', str(tmp_path / 'o')] + init_args(ds)) == 0
+    capsys.readouterr()
+    adrc = os.path.join(ds, 'gain_init_LADRC.json')
+    with open(adrc, 'w', encoding='utf-8') as f:
+        json.dump(dict(ctrl='ADRC', id=3, gains=dict(omega_c_xy=8, omega_o_xy=30, omega_c_wz=6, omega_o_wz=25,
+                                                    pos_kp=6, pos_ki=3, k_psi=1)), f)
+    f = T.gain_files(ds, {'LADRC': adrc})
+    assert f['RQ2-INIT-LADRC']['want']['ctrl'] == 'ADRC'
+    with pytest.raises(ValueError, match='the set is of LADRC'):
+        T.gain_files(ds, {'LADRC': os.path.join(ds, 'gain_init_PID.json')})
+
+
+def test_c6_1_no_esp32_log_no_gain_proof(tmp_path):
+    """R134C6-1: without the ESP32 log of a judged run its '#gain' line cannot be compared: the table stops."""
+    r = write_run(tmp_path, 'm1', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', 0.02)
+    os.remove(os.path.join(r['results_dir'], 'esp32.csv'))
+    with pytest.raises(ValueError, match='run m1: thieu esp32.csv'):
+        LR(_table_ds(tmp_path, [r]))
+
+
+@pytest.mark.parametrize('a_id, q_id', [(None, None), ('', ''), (None, '7'), ('7', None), ('7', ''), ('x', 'x')])
+def test_c6_2_both_ids_must_be_there(a_id, q_id):
+    """R134C6-2: ids are compared only when both are decimal; two missing or two empty ids are no match."""
+    ack, before = dict(ok='1', boot='4753dc47', mac='aa:bb'), dict(boot='4753dc47', mac='aa:bb')
+    if a_id is not None:
+        ack['id'] = a_id
+    why = T.glc.ack_problem(ack, before, {'id': q_id})
+    assert why and 'khong so duoc bo gain' in why
+    assert T.glc.ack_problem(dict(ack, id='7'), before, {'id': '7'}) is None
+    assert T.glc.ack_problem(dict(ack, id='7'), before, None) is None           # no running id shown: not compared
+
+
+def test_c6_2_table_without_ids(tmp_path):
+    """R134C6-2 at the table: ack and the two answers without id: refused."""
+    r = write_run(tmp_path, 'k1', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', 0.02)
+    ds = _table_ds(tmp_path, [r])
+    d = r['results_dir']
+    for name in ('gain_ack.txt', 'gain_query_before.txt', 'gain_query_after.txt'):
+        p = os.path.join(d, name)
+        with open(p, encoding='utf-8') as f:
+            txt = f.read()
+        with open(p, 'w', encoding='utf-8') as f:
+            f.write(re.sub(r',id=7(?=[,\n])', '', txt))
+    with pytest.raises(ValueError, match='run k1: .*khong so duoc bo gain'):
+        LR(ds)

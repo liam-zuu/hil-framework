@@ -338,3 +338,15 @@ def test_c5_4_bench_stops_when_another_set_runs_since_the_ack(tmp_path, monkeypa
     assert code == 2 and order == ['set', 'q_before'], order
     s = json.load(open(os.path.join(a.out, 'session.json'), encoding='utf-8'))
     assert 'bo gain khac' in s['runs'][0]['gain_ack']['problem']
+
+
+@pytest.mark.parametrize('q_id', [None, ''])
+def test_c6_2_bench_stops_when_ack_and_question_have_no_id(tmp_path, monkeypatch, q_id):
+    """R134C6-2: the ack and the question before both without id (or both empty): no match, the run is not
+    started."""
+    monkeypatch.setattr(sys.modules[__name__], 'QUERY_ID', [q_id])
+    a, order, code = _gain_bench(monkeypatch, tmp_path, ACK.replace(',id=7,applied_n', ',applied_n' if q_id is None
+                                                                    else ',id=,applied_n'))
+    assert code == 2 and order == ['set', 'q_before'], order
+    s = json.load(open(os.path.join(a.out, 'session.json'), encoding='utf-8'))
+    assert 'khong so duoc bo gain' in s['runs'][0]['gain_ack']['problem']
