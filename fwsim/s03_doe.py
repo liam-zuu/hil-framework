@@ -45,6 +45,15 @@ S03 does not analyse either: section 5 and the rule of 3.2 use centre, outer and
 design.csv: 371 rows per controller, checked point_id - box - codes and bounds (11.4 (i),
 (ii)) before the main design. Two diagnostic columns n_upper_frames, n_back_frames (section 4).
 
+S03 v8.2 (Liam 13/11, THESIS local_7999bf79; section 4 row G, 7, 8 condition 8; script: Liam 14/11
+CODE_FEAS local_4e9b745d "Code ngay", design 03_CODE/docs/2026-11-14_Thiet_ke_S03_G1G5_v1.md): every
+run is scored with the gate evaluator of S04 and C12, o1_gate_eval.evaluate_fig8 (it calls evaluate_v7
+UNCHANGED, so every older column keeps its value bit for bit) and o1_gate.gate(u_t = 0, DECIDE_ALL;
+U = 0 on fwsim: the true plant pose). GATE_RUN_COLS are appended after 'error' in runs.csv,
+runs_test.csv and the sweep (Liam "Co, mot cach cham"): e_bao_max (G4), gate_version, gate_decide,
+gate_u_t, g1_q, g1_state, g2..g5 q, lo, hi, n_undef, state (names of tools/rq3_log.py GATE_COLS, B81-3)
+and gate_outcome (O1 3.5 over G1-G5). G3-G5 belong to the gate and S04, not to the section 5 analysis.
+
 L56 / S03 v6 section 1: the main design results (runs.csv, effects.csv and the tables of
 section 5) are NOT looked at before campaign A ends. Nothing derived from them leaves
 sealed/ (Codex S3C-1..S3C-3): no hash of a sealed file outside it, no child-process job file
@@ -88,6 +97,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import fwsim                                            # noqa: E402
 import o1_feasibility as o1                             # noqa: E402
+import o1_gate as G                                     # noqa: E402  (S03 v8.2: G1-G5)
+import o1_gate_eval as E                                # noqa: E402  (G4 e_bao; evaluate_v7 inside, unchanged)
 import tune_ga                                          # noqa: E402
 
 CONTROLLERS = ('PID', 'ADRC')
@@ -106,12 +117,21 @@ DET_SEED = 20261106                           # S03 section 3.4: seed that draws
 THRESH = {'e_perp_max': 0.01, 'e_perp_max_cens': 0.01, 'sat_frac': 0.01}   # S03 section 5.2; tv_duty: 20 %
 Y3_REL = 0.20
 RESPONSES = ('e_perp_max', 'e_perp_max_cens', 'tv_duty', 'sat_frac')
-RUN_COLS = ['controller', 'point_id', 'box', 'mu', 'v', 'status', 'completed', 'e_perp_max', 'e_perp_max_cens',
+OLD_COLS = ['controller', 'point_id', 'box', 'mu', 'v', 'status', 'completed', 'e_perp_max', 'e_perp_max_cens',
             'e_perp_global_max', 'tv_duty', 'sat_frac', 'sat_any_frac', 'e_theta_lane_max_deg',
             'e_theta_cmd_max_deg', 'ds_absmax', 'e_trk_max', 't_end', 'e_s_absmax', 'track_err_frames',
             'cond2_5_ever', 'pos_reset_mid', 'e_perp_rms', 'e_trk_rms',
             'n_upper_frames', 'n_back_frames',      # S03 v8 section 4 (W8-Q (b)): diagnostics, not responses
             'error']                                # RMS: S3C-13; error: S3C-12
+# S03 v8.2 section 7: e_bao_max and the G1-G5 states (o1_gate.py, U = 0), appended after the S03 v8 columns.
+# Names as tools/rq3_log.py GATE_COLS (B81-3); not written: gate_json_sha256 (no gate file per run), the
+# _chung columns (one frame domain on fwsim: common = union) and the G1 fields t_done... (deferred for the
+# fwsim scorer, Liam 14/11 CODE_R134 "De goi rieng sau"). gate_outcome: O1 3.5 over G1-G5.
+GATE_RUN_COLS = (['e_bao_max', 'gate_version', 'gate_decide', 'gate_u_t', 'g1_q', 'g1_state']
+                 + [f'{c}_{x}' for c in G.MEASURED for x in ('q', 'lo', 'hi', 'n_undef', 'state')]
+                 + ['gate_outcome'])
+RUN_COLS = OLD_COLS + GATE_RUN_COLS
+GATE_U_T = 0.0                # s: fwsim knows the command start exactly (o1_gate docstring; as C12, S04)
 SCALE_RTOL = 1e-14            # H/L >= 4 within float rounding of the log grid (S3C-6; S3D-7: about 45 ULP)
 # S03 v8 (L67): axial points and the test set for the RSM comparison of S04; not analysed here
 ANALYSED_BOXES = ('centre', 'outer', 'inner')            # section 5 and the rule of 3.2 use only these
@@ -176,13 +196,42 @@ def run_one(fw, path, ctrl, g, v, mu):
     for k in ('pose', 'v_true', 'duty', 'pwm'):
         if not np.all(np.isfinite(log[k])):
             raise FloatingPointError(f'non-finite {k} in the log')
-    res, _ = o1.evaluate_v7(log, path, sch, lsum=p.lx + p.ly)
+    # S03 v8.2: the gate evaluator; evaluate_v7 runs unchanged inside, so res holds its keys as before
+    res, _, frames = E.evaluate_fig8(log, path, sch, lsum=p.lx + p.ly)
     val = fwsim.run_validity(log)
     if val['run_bad'] == 1:
         raise RuntimeError(f"pose reset mid-run in fwsim ({val['run_bad_reason']})")
-    row = {k: res[k] for k in RUN_COLS[5:] if k in res}          # responses only (no controller..v keys)
+    v_cmd_max, wz_cmd_max = cmd_max(sch)
+    gt = G.gate(frames, res['completed'], v_cmd_max=v_cmd_max, wz_cmd_max=wz_cmd_max, u_t=GATE_U_T,
+                decide=G.DECIDE_ALL, status=res['status'])
+    row = {k: res[k] for k in OLD_COLS[5:] if k in res}          # responses only (no controller..v keys)
     row.update(pos_reset_mid=val['pos_reset_mid'])
+    row.update(gate_fields(res, gt))
     return row, log
+
+
+_CMD_MAX = {}
+
+
+def cmd_max(sch):
+    """o1_gate.fig8_cmd_max of the schedule, kept per (v, w0) as C12 does (the same numbers)."""
+    key = (sch.v, sch.w0)
+    if key not in _CMD_MAX:
+        _CMD_MAX[key] = G.fig8_cmd_max(sch)
+    return _CMD_MAX[key]
+
+
+def gate_fields(res, gt):
+    """GATE_RUN_COLS of one run from the evaluate_fig8 summary and the o1_gate.gate dict (states are the
+    gate's, never recomputed here)."""
+    out = dict(e_bao_max=res['e_bao_max'], gate_version=gt['version'], gate_decide=','.join(gt['decide']),
+               gate_u_t=gt['u_t'], g1_q=gt['g1']['q'], g1_state=gt['g1']['state'], gate_outcome=gt['outcome'])
+    for c in G.MEASURED:
+        for x in ('q', 'lo', 'hi', 'n_undef', 'state'):
+            out[f'{c}_{x}'] = gt[c][x]
+    if set(out) != set(GATE_RUN_COLS):
+        raise RuntimeError(f'gate fields {sorted(set(out) ^ set(GATE_RUN_COLS))} do not match GATE_RUN_COLS')
+    return out
 
 
 def safe_run(fw, path, ctrl, g, v, mu):
@@ -377,6 +426,24 @@ def _head_blob(p):
 
 def _rel_here(p):
     return _rel_or_abs(p, os.path.join(HERE, '..'))
+
+
+def gate_meta():
+    """meta.yaml 'gate' (S03 v8.2): versions and settings of the G1-G5 scoring."""
+    return dict(version=G.GATE_VERSION, eval_version=E.EVAL_VERSION, u_t=GATE_U_T, u_p=0.0, u_psi_deg=0.0,
+                decide=list(G.DECIDE_ALL), thresholds=G.THRESHOLDS, columns=GATE_RUN_COLS)
+
+
+def evaluator_sha256():
+    """SHA-256 of the evaluator files as imported in this process (S03 v8.2 section 8 condition 8), of the
+    bytes on disk and after CRLF -> LF (a Windows checkout holds CRLF; the git blob is LF)."""
+    out = {}
+    for m in (o1, E, G, E.L, E.L.ot):
+        with open(m.__file__, 'rb') as f:
+            b = f.read()
+        out[_rel_here(m.__file__)] = dict(sha256=hashlib.sha256(b).hexdigest(),
+                                          sha256_lf=hashlib.sha256(b.replace(b'\r\n', b'\n')).hexdigest())
+    return out
 
 
 def load_test_points(path=TEST_POINTS, trial=False):
@@ -1118,7 +1185,7 @@ def main():
     tp_meta = tp_info if tp_info is not None else dict(file=_rel_here(a.test_points),
                                                          read='no (S03 stopped before the test file was read)')
     with open(os.path.join(a.out, 'meta.yaml'), 'w', encoding='utf-8') as f:
-        f.write(f"""spec: S03 v8 (06_SPECS/2026-11-05_Spec_S03_DOE_chon_gain.md)
+        f.write(f"""spec: S03 v8.2 (06_SPECS/2026-11-05_Spec_S03_DOE_chon_gain.md)
 date: {time.strftime('%Y-%m-%d')}
 setup: sim                     # fwsim: ESP32 firmware C code (DLL) + rpi5/plant_step.py, NOT hardware
 operator: Claude (phiên CODE)
@@ -1149,6 +1216,8 @@ temporary_bounds_for_the_grid: {json.dumps({m: tune_ga.BOUNDS[m] for m in a.cont
 thresholds: {json.dumps(dict(THRESH, tv_duty=f'{Y3_REL:.0%} of the default-gain run, middle mu, same speed'))}
 y3_reference: {json.dumps({f'{c} v={v}': y for (c, v), y in y3_ref.items()})}
 o1: {json.dumps(dict(A=o1.A, a_r=o1.A_R, D=o1.D, D_d=o1.D, t_d=o1.T_D, t_late=o1.T_LATE, delta=o1.DELTA, v_d=o1.V_D, c_cens=o1.C_CENS))}
+gate: {json.dumps(gate_meta())}   # S03 v8.2 section 7: G1-G5 per run (o1_gate.gate), U = 0 on fwsim
+evaluator_sha256: {json.dumps(evaluator_sha256())}   # S03 v8.2 section 8 condition 8: S03 and S04 on the same evaluator
 sweep_run_error_reruns: {json.dumps([n for n in rerun_notes if n['point'] is None], default=str)}
 planned_runs_per_controller: {json.dumps(PLANNED_RUNS)}   # S03 v8 3.2, 7 (rows actually run: sealed/, sealed_test/)
 test_points: {json.dumps(tp_meta)}   # S03 v8 3.2, 7, 8.7 (S3V8-3): read once before the main design; sha256 of the bytes read, sha256_lf after CRLF -> LF, matches_head_blob_lf, generation from <name>.gen.json beside the file
@@ -1168,6 +1237,10 @@ interpretations:   # of this script, not written in S03 v8 / O1 v7; Liam or THES
   - "v8: the test-points file is read once before the main design (S3V8-3); 'committed' (section 8.7) = tracked, unmodified for git status AND the bytes read match the blob in HEAD after CRLF -> LF of both; its generation record is <name>.gen.json beside the file read, with the sha256 of the bytes read or of their LF or CRLF form (R2-2: the committed record holds the SHA-256 of the CRLF file; a clean LF checkout is the same content); a stop at this check keeps what was read in test_points (R2-4); with --trial a failed check is allowed and recorded in test_points.problems"
   - "v8 (S3V8-2): warnings, prints and tracebacks of the test phase go to sealed_test/diag.txt and any exception of the phase, writing its outputs included, is a stop recorded in sealed_test/stop.json (written first; R2-1); the warning policy in force is kept, a warning made an error stays an error (R2-3); the same channel in the main design (warnings to the console) is left as before (deferred, Codex S3V8-2)"
   - "v8: n_upper_frames, n_back_frames count the frames evaluate_v7 kept for scoring (t_k <= t_end), as section 4 defines them; they are diagnostics, never responses"
+  - "v8.2: every run (sweep, main design, axial, test set, determinism reruns) is scored by o1_gate_eval.evaluate_fig8, which calls evaluate_v7 unchanged (the S03 v8 columns keep their values), then o1_gate.gate with u_t = 0 (fwsim knows the command start; the 50 Hz hold is a property of the command path, not added to U, o1_gate docstring), U_p = U_psi = 0 (true plant pose) and every condition deciding (DECIDE_ALL)"
+  - "v8.2: G1-G5 columns use the names of tools/rq3_log.py GATE_COLS (B81-3); gate_json_sha256, the _chung columns (one frame domain on fwsim: the common domain is the union) and the G1 fields t_done... (fwsim scorer, deferred: Liam 14/11 CODE_R134) are not written; gate_outcome is the O1 3.5 outcome over G1-G5; with U = 0, lo = hi = q"
+  - "v8.2: a failure of the gate scoring (e.g. the rebuilt nearest distance of G4 not the row e_perp) is a run_error, so S03 stops (B8b-20) as for a DLL error"
+  - "v8.2: the public sweep carries the G columns too (Liam 14/11 CODE_FEAS 'Co, mot cach cham'); G3-G5 are not responses of section 5"
 elapsed_s: {sweep_s}
 file_sha256: {json.dumps(files)}
 files:

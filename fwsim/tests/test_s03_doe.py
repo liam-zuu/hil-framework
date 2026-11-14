@@ -619,6 +619,7 @@ def test_run_one_and_new_process_rerun_are_identical(path, tmp_path):
     assert row['pos_reset_mid'] == 0
     again = s3.run_in_new_process(_DLL, [('PID', g, 0.8, 0.5)], str(tmp_path))[0]
     assert again['digest'] == s3.log_digest(log) and s3.row_text(again['row']) == s3.row_text(row)
+    assert set(s3.GATE_RUN_COLS) <= set(row) and set(s3.GATE_RUN_COLS) <= set(s3.row_text(row))   # v8.2 (T6)
 
 
 @needs_dll
@@ -1393,3 +1394,151 @@ def test_v8_uncommitted_test_points_stop_a_main_run(tmp_path, monkeypatch, capsy
                                          argv=['--mu', '0.4', '0.5', '0.6', '--test-points', str(p)])
     assert code == 2 and 'not committed' in console
     assert (out / 'design.csv').read_text().strip() == '' and not (out / 'sealed_test').exists()
+
+
+# ── S03 v8.2: e_bao_max and G1-G5 (design 03_CODE/docs/2026-11-14_Thiet_ke_S03_G1G5_v1.md) ──────────
+
+import o1_gate as G  # noqa: E402
+import o1_gate_eval as E  # noqa: E402
+
+# the 27 runs.csv columns of S03 v8 (blob 2127c69), written out here so that a change to them fails
+V8_COLS = ['controller', 'point_id', 'box', 'mu', 'v', 'status', 'completed', 'e_perp_max', 'e_perp_max_cens',
+           'e_perp_global_max', 'tv_duty', 'sat_frac', 'sat_any_frac', 'e_theta_lane_max_deg',
+           'e_theta_cmd_max_deg', 'ds_absmax', 'e_trk_max', 't_end', 'e_s_absmax', 'track_err_frames',
+           'cond2_5_ever', 'pos_reset_mid', 'e_perp_rms', 'e_trk_rms', 'n_upper_frames', 'n_back_frames', 'error']
+V82_COLS = (['e_bao_max', 'gate_version', 'gate_decide', 'gate_u_t', 'g1_q', 'g1_state']
+            + [f'g{i}_{x}' for i in range(2, 6) for x in ('q', 'lo', 'hi', 'n_undef', 'state')] + ['gate_outcome'])
+Q_OF = dict(g2='e_perp_max', g3='e_trk_max', g4='e_bao_max', g5='e_theta_cmd_max_deg')
+
+
+def test_v82_columns_appended_after_the_v8_columns():
+    assert s3.OLD_COLS == V8_COLS and s3.RUN_COLS[:len(V8_COLS)] == V8_COLS
+    assert s3.GATE_RUN_COLS == V82_COLS and s3.RUN_COLS == V8_COLS + V82_COLS
+    tools = os.path.join(HERE, '..', '..', 'tools')
+    if tools not in sys.path:
+        sys.path.insert(0, tools)
+    import rq3_log                                       # B81-3: the same names as the shared gate columns
+    assert set(V82_COLS) - {'e_bao_max', 'gate_outcome'} <= set(rq3_log.GATE_COLS)
+
+
+def _gframes(e_perp, e_trk, e_bao, th):
+    return dict(e_perp=np.array(e_perp, float), e_trk=np.array(e_trk, float), e_bao=np.array(e_bao, float),
+                e_theta_cmd_deg=np.array(th, float))
+
+
+@pytest.mark.parametrize('frames, completed, want, outcome', [
+    (_gframes([0.05, 0.02], [0.03, 0.01], [0.06, 0.04], [1.0, 2.0]), 'true',
+     dict(g1='dat', g2='dat', g3='dat', g4='dat', g5='dat'), 'dat'),
+    (_gframes([0.05, 0.02], [0.12, 0.01], [0.06, np.nan], [1.0, 2.0]), 'true',
+     dict(g1='dat', g2='dat', g3='khong_dat', g4='chua_ket_luan', g5='dat'), 'khong_dat'),
+    (_gframes([0.05, 0.02], [0.03, 0.01], [0.06, 0.04], [1.0, 8.0]), 'inconclusive',
+     dict(g1='chua_ket_luan', g2='dat', g3='dat', g4='dat', g5='khong_dat'), 'khong_dat'),
+    (_gframes([0.05, 0.10], [0.03, 0.10], [0.06, 0.10], [1.0, 7.5]), 'inconclusive',
+     dict(g1='chua_ket_luan', g2='dat', g3='dat', g4='dat', g5='dat'), 'chua_ket_luan'),
+    (_gframes([0.05, 0.02], [0.03, 0.01], [0.06, 0.04], [1.0, 2.0]), 'false',
+     dict(g1='khong_dat', g2='dat', g3='dat', g4='dat', g5='dat'), 'khong_dat'),
+])
+def test_v82_gate_fields_are_the_gate_dict(frames, completed, want, outcome):
+    """T3: gate_fields copies the o1_gate.gate states and maxima (an edge equal to the threshold passes,
+    O1 3.5)."""
+    gt = G.gate(frames, completed, v_cmd_max=0.9, wz_cmd_max=1.1, u_t=s3.GATE_U_T, decide=G.DECIDE_ALL)
+    m = float(np.max(frames['e_bao']))
+    f = s3.gate_fields(dict(e_bao_max=m), gt)
+    assert set(f) == set(V82_COLS)
+    assert {c: f[f'{c}_state'] for c in want} == want and f['gate_outcome'] == outcome
+    assert f['gate_version'] == G.GATE_VERSION and f['gate_decide'] == 'g1,g2,g3,g4,g5' and f['gate_u_t'] == 0.0
+    assert f['g1_q'] == {'dat': 'true', 'khong_dat': 'false'}.get(want['g1'], 'inconclusive')
+    assert f['g4_n_undef'] == int(np.count_nonzero(~np.isfinite(frames['e_bao'])))
+    for c in ('g2', 'g3', 'g4', 'g5'):
+        assert f[f'{c}_q'] == f[f'{c}_lo'] == f[f'{c}_hi'] == gt[c]['q']      # U = 0 on fwsim
+    assert s3.fmt(f['e_bao_max']) == repr(m)
+
+
+def test_v82_run_error_has_no_gate_values(tmp_path):
+    """T4: a run_error row (here: no DLL) has no gate value; the CSV cells are empty."""
+    row, log = s3.safe_run(None, None, 'PID', dict(FAKE_DEFAULTS['PID']), 0.8, 0.5)
+    assert row['status'] == 'run_error' and log is None and not set(V82_COLS) & set(row)
+    p = tmp_path / 'r.csv'
+    s3.write_csv(str(p), [dict(controller='PID', point_id=0, box='centre', mu=0.5, v=0.8, **row)], s3.RUN_COLS)
+    import csv as _csv
+    r = next(_csv.DictReader(open(p)))
+    assert all(r[c] == '' for c in V82_COLS)
+
+
+@pytest.fixture(scope='module')
+def v82_runs(path):
+    """Default gains of both controllers at 0.5 and 0.8 m/s, and one detuned PID run (mu 0.5):
+    [(ctrl, v, new row, log)]. The gate evaluator costs about 2-4 s a run."""
+    if not os.path.isfile(_DLL):
+        pytest.skip('fwsim.dll not built')
+    fw = fwsim.FirmwareSim(_DLL)
+    if not fw.pos_cols:
+        pytest.skip('DLL without pos_ctrl.c')
+    out = []
+    for ctrl in ('PID', 'ADRC'):
+        d = s3.defaults(fw, ctrl)
+        for v in (0.5, 0.8):
+            out.append((ctrl, v) + s3.run_one(fw, path, ctrl, d, v, 0.5))
+    d = s3.defaults(fw, 'PID')
+    out.append(('PID', 0.8) + s3.run_one(fw, path, 'PID', dict(d, kp_xy=0.15, pos_kp=0.6), 0.8, 0.5))
+    return out
+
+
+@needs_dll
+def test_v82_v8_columns_keep_their_bits(path, v82_runs):
+    """T1 (a): on the same log, the v8 scoring (evaluate_v7 alone, as blob 2127c69 did) gives every v8
+    column of the new row bit for bit."""
+    for ctrl, v, row, log in v82_runs:
+        sch = o1.Schedule(v)
+        p = fwsim.plant_params(s3.argparse.Namespace(ground='traction', mu=0.5))
+        res, _ = o1.evaluate_v7(log, path, sch, lsum=p.lx + p.ly)
+        old = {k: res[k] for k in V8_COLS[5:] if k in res}
+        old.update(pos_reset_mid=fwsim.run_validity(log)['pos_reset_mid'])
+        assert set(row) - set(V82_COLS) == set(old), (ctrl, v)
+        assert {k: s3._bits(row[k]) for k in old} == {k: s3._bits(old[k]) for k in old}, (ctrl, v)
+
+
+@needs_dll
+def test_v82_gate_maxima_are_the_v8_maxima(v82_runs):
+    """T2: G2, G3, G5 q are the evaluate_v7 maxima and G4 q is e_bao_max, bit for bit; lo = hi = q;
+    G1 follows completed; states from the thresholds."""
+    states = set()
+    for ctrl, v, row, _ in v82_runs:
+        assert all(row[f'{c}_n_undef'] == 0 for c in Q_OF), (ctrl, v)
+        for c, k in Q_OF.items():
+            assert s3._bits(row[f'{c}_q']) == s3._bits(row[k]) == s3._bits(row[f'{c}_lo']) == \
+                s3._bits(row[f'{c}_hi']), (ctrl, v, c)
+            assert row[f'{c}_state'] == ('dat' if row[k] <= G.THRESHOLDS[c] else 'khong_dat'), (ctrl, v, c)
+        assert row['g1_q'] == row['completed'] and row['g1_state'] == G.g1_state(row['completed'])
+        assert row['gate_outcome'] == G.run_outcome(row[f'g{i}_state'] for i in range(1, 6))
+        assert row['gate_u_t'] == 0.0 and row['gate_decide'] == 'g1,g2,g3,g4,g5'
+        states |= {row[f'g{i}_state'] for i in range(1, 6)}
+    assert {'dat', 'khong_dat'} <= states                 # the runs reach both sides of a threshold
+
+
+@needs_dll
+def test_v82_main_writes_the_gate_columns_and_meta(tmp_path, monkeypatch, capsys):
+    """T5, T7: runs.csv, runs_test.csv headers are the v8 columns then the v8.2 columns; the sweep has
+    them too (one scoring, Liam 14/11 'Co, mot cach cham'); meta.yaml records the gate and the evaluator."""
+    import csv as _csv
+    import hashlib as _h
+    import json as _json
+    code, out, _, _, _ = _run_main(tmp_path, monkeypatch, capsys)
+    assert code == 0
+    for f in ('sealed/runs.csv', 'sealed_test/runs_test.csv'):
+        assert next(_csv.reader(open(out / f))) == V8_COLS + V82_COLS, f
+    # sweep.csv takes the keys of its rows (run_one rows carry V82_COLS, test_v82_gate_maxima...); the
+    # fake rows here have none, so its header is not checked for them
+    meta = (out / 'meta.yaml').read_text(encoding='utf-8')
+    assert meta.startswith('spec: S03 v8.2 ')
+    lines = meta.splitlines()
+    gate = _json.loads(next(x for x in lines if x.startswith('gate: ')).split('   #')[0][len('gate: '):])
+    assert gate['version'] == G.GATE_VERSION and gate['eval_version'] == E.EVAL_VERSION and gate['u_t'] == 0.0
+    assert gate['decide'] == list(G.DECIDE_ALL) and gate['columns'] == V82_COLS
+    ev = _json.loads(next(x for x in lines if x.startswith('evaluator_sha256: ')).split('   #')[0]
+                     [len('evaluator_sha256: '):])
+    assert set(ev) == {'fwsim/o1_feasibility.py', 'fwsim/o1_gate_eval.py', 'fwsim/o1_gate.py', 'tools/o1_lanes.py',
+                       'rpi5/o1_tasks.py'}
+    b = open(E.__file__, 'rb').read()
+    assert ev['fwsim/o1_gate_eval.py'] == dict(sha256=_h.sha256(b).hexdigest(),
+                                               sha256_lf=_h.sha256(b.replace(b'\r\n', b'\n')).hexdigest())
