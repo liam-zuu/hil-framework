@@ -857,6 +857,50 @@ def test_command_change_right_after_the_3_s_window_maps(factor):
     assert set(fits) == {'1.0', '2.0', '3.0'} and min(fits['3.0']['corr']) > M.MIN_CORR, fits['3.0']['corr']
 
 
+@needs_gcc
+def test_wrong_duty_in_the_last_part_of_the_3_s_window_is_refused():
+    # Codex B8C-R1-1: the duty disagrees with the pwm over the last 90 frames that the 3 s window's own lines
+    # predict at the true shift (data of the window, not pwm held past it). Cutting the frames at the smallest
+    # shift dropped them and the run passed; comparing up to the last line's tick at each shift refuses it.
+    s = sim()
+    ok = run(s)
+    assert ok['ok'], ok['reason']
+    a = ok['pwm_side']['fits']['3.0']['a']
+    ts, pw = s['esp']['timestamp_us'].astype(float), s['esp']['pwm']
+    ie = int(M.rising_edges(s['esp']['run_active'])[0])
+    t0 = ts[ie:][np.any(pw[ie:] != 0, axis=1)][0]
+    d_last = (ts[ts <= t0 + 3e6][-1] - ts[ie]) / 1000.0
+    k1 = int(np.floor(a + d_last))
+    duty = s['duty'].copy()
+    # 90 frames: inside the ~100 + (a - k_run) frames a cut at the smallest shift drops
+    duty[k1 - 90:k1 + 1, :] = 0.9                       # 900 pwm units, under GLITCH, against the logged pwm
+    em = M.map_edge(duty, 400, s['esp'], 1e-3, s['frames'])
+    assert not em['ok'] and 'PWM' in em['reason'] and 'window 3.0' in em['reason'], em['reason']
+    assert min(min(em['pwm_side']['fits'][w]['corr']) for w in ('1.0', '2.0')) > M.MIN_CORR   # only 3 s sees it
+
+
+def test_pwm_before_the_edge_must_show_zero():
+    # Codex B8C-R1-5: frames before the first line used get pwm 0; the log must show 0 over the time before the
+    # edge a fit frame can reach (SEARCH range + 7 steps), else refused
+    ie, n = 6, 5000
+    ts = np.r_[np.arange(-600, 0, 100), np.arange(0, 4000, 10)] * 1000.0
+    run_active = (np.arange(len(ts)) >= ie).astype(int)
+    pw = np.zeros((len(ts), 4))
+    pw[ie:] = 50.0
+    esp = dict(timestamp_us=ts, pwm=pw, run_active=run_active)
+    duty = np.zeros((n, 4))
+    base = M.pwm_side(duty, 1000, esp, ie, 1000.0)
+    assert 'before the edge' not in base.get('reason', ''), base
+    bad = dict(esp, pwm=pw.copy())
+    bad['pwm'][ie - 2] = 30.0                                  # 200 ms before the edge: inside the reach
+    assert 'before the edge' in M.pwm_side(duty, 1000, bad, ie, 1000.0)['reason']
+    far = dict(esp, pwm=pw.copy())
+    far['pwm'][0] = 30.0                                       # 600 ms before: outside (reach 507 ms)
+    assert 'before the edge' not in M.pwm_side(duty, 1000, far, ie, 1000.0).get('reason', '')
+    short = dict(timestamp_us=ts[4:], pwm=pw[4:], run_active=run_active[4:])   # log starts 200 ms before
+    assert 'before the edge' in M.pwm_side(duty, 1000, short, ie - 4, 1000.0)['reason']
+
+
 def test_plateau_right_end():
     # G32-R2-2: a step-function cost keeps the right end of its flat minimum
     fine = np.arange(0.0, 2.001, 0.01)
@@ -965,6 +1009,7 @@ def write_frame_log(path, task, k_run, s):
         mosi[k] = mosi_frame(st, k, traj_ref=(0.3, 0.0, 0.1) if on else None, traj_flags=P.TRAJ_VALID if on else 0)
     miso = make_miso(mosi, s['duty_cap'], tm, skip=tm['skip'], stage_lag=tm['stage_lag'])
     manifest = dict(period_us=1000, steps=n, plant='MecanumPlant', miso_check=dict(crc_bad=0, empty=0),
+                    state_out_of_range=None,                        # B81-15 check ran on the Pi
                     lifecycle=dict(outcome='completed', transitions=[dict(step=0, t=0, phase='ARM'),
                                                                      dict(step=k_run, t=0.4, phase='RUN')]))
     np.savez(path, manifest=np.array(json.dumps(manifest)), mosi=mosi, miso=miso,

@@ -94,22 +94,25 @@ ESP_PI_PRIOR_PPM = 2000.0          # S05 v3.20 4.7 (i): ESP32/H7 1000 (RHO_MAX_P
 def _finite(v):
     try:
         return v is not None and math.isfinite(float(v))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):               # OverflowError: an int too big for a float
         return False
 
 
 def t_end_err_ms(t_end_s, esp_pi_ppm=None, pi_period_ppm=None):
-    """Estimated error (ms) of t = 0 + t_end on the ESP32 log of a HIL run (module docstring), and its source."""
-    if not _finite(t_end_s):
+    """Estimated error (ms) of t = 0 + t_end on the ESP32 log of a HIL run (module docstring), and its source.
+    t_end not finite or < 0, or a result that is not finite: no number (Codex B8C-R1-6)."""
+    if not _finite(t_end_s) or float(t_end_s) < 0:
         return None, 'khong co t_end'
-    t = abs(float(t_end_s))
+    t = float(t_end_s)
     if not _finite(esp_pi_ppm):
-        return t * ESP_PI_PRIOR_PPM * 1e-3, f'khong co esp_pi_ppm: can {ESP_PI_PRIOR_PPM:g} ppm (gia dinh)'
-    if not _finite(pi_period_ppm):
-        pi_period_ppm = None
-    pi = PI_PERIOD_PPM_BOUND if pi_period_ppm is None else abs(float(pi_period_ppm))
-    src = 'esp_pi_ppm + nhieu + ' + ('can Pi' if pi_period_ppm is None else 'pi_period_ppm')
-    return t * (abs(float(esp_pi_ppm)) + ESP_PPM_NOISE + pi) * 1e-3, src
+        v, src = t * (ESP_PI_PRIOR_PPM * 1e-3), f'khong co esp_pi_ppm: can {ESP_PI_PRIOR_PPM:g} ppm (gia dinh)'
+    else:
+        if not _finite(pi_period_ppm):
+            pi_period_ppm = None
+        pi = PI_PERIOD_PPM_BOUND if pi_period_ppm is None else abs(float(pi_period_ppm))
+        src = 'esp_pi_ppm + nhieu + ' + ('can Pi' if pi_period_ppm is None else 'pi_period_ppm')
+        v = t * ((abs(float(esp_pi_ppm)) + ESP_PPM_NOISE + pi) * 1e-3)
+    return (v, src) if math.isfinite(v) else (None, 'khong co so huu han')
 
 
 # ---------------------------------------------------------------- tv_duty

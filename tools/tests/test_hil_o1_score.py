@@ -90,6 +90,7 @@ def write_frame_log(path, task, k0=400, lifecycle=True, tail=T_LATE + 0.5):
         mosi[k] = np.frombuffer(P.encode_state(st, traj_ref=(0.3, 0.0, 0.1) if on else None,
                                                traj_flags=P.TRAJ_VALID if on else 0, seq=k), dtype=np.uint8)
     manifest = dict(period_us=1000, steps=n, plant='MecanumPlant', miso_check=dict(crc_bad=0, empty=0),
+                    state_out_of_range=None,                        # B81-15 check ran on the Pi
                     lifecycle=(dict(outcome='completed', transitions=[dict(step=0, t=0, phase='ARM'),
                                                                       dict(step=k0, t=0.4, phase='RUN')])
                                if lifecycle else None))
@@ -102,6 +103,7 @@ def test_frame_log_path_matches_evaluate_v7(tmp_path):
     pose, vel, wz, sch = write_frame_log(p, 'O1-F05')
     out = H.score(p, 'O1-F05')
     assert out['k0'] == 400 and out['t0_src'] == 'lifecycle_RUN' and out['completed'] == 'true'
+    assert out['b81_15_check'] == 'manifest'
     t = np.arange(len(pose)) * DT
     ref, _ = evaluate_v7(dict(t=t, pose=pose, v_true=np.column_stack([vel, wz]), duty=np.zeros((len(t), 4)),
                               pwm=np.zeros((len(t), 4))), Path8(), sch)
@@ -175,23 +177,33 @@ def test_duty_comes_from_miso_bytes_0_7_not_the_crc(tmp_path):
 
 def test_tool_error_plant_state_out_of_range_b81_15():
     """O1 v11.15 3.5 (B81-15): a run whose plant state was NaN / inf, or whose x, y reached the +-5 m bound, is a
-    HIL tool error, refused (ValueError -> exit 2): from the manifest key the Pi writes, or for older logs from
-    x or y at +-32767; theta at +-pi (wrapped by the plant) and other fields at their bound are not (spec rule)."""
-    mosi = np.array([np.frombuffer(P.encode_state([1.0] * 4 + [0.5, -0.5, 0.0, 0.1, 0.0, 0.2]), np.uint8)
-                     for _ in range(5)])
-    H.tool_error({}, mosi)                                                # normal frames: no error
-    H.tool_error({'state_out_of_range': None}, mosi)
+    HIL tool error, refused (ValueError -> exit 2). With the manifest key the Pi writes, only the key decides
+    (Codex B8C-R1-3: x = 4.99999 m codes as 32767 without reaching the bound). Without it (a log from before the
+    check) the run is refused as not enough evidence (B8C-R1-4), unless allow_pre_b81_15: then x or y at +-32767
+    refuses; theta at +-pi and other fields at their bound do not."""
+    def frames(*rows):
+        return np.array([np.frombuffer(P.encode_state(r), np.uint8) for r in rows])
+    ok = [1.0] * 4 + [0.5, -0.5, 0.0, 0.1, 0.0, 0.2]
+    mosi = frames(*[ok] * 5)
+    key = {'state_out_of_range': None}
+    assert H.tool_error(key, mosi) == 'manifest'
+    near = frames(ok, ok[:4] + [4.99999, -4.99999] + ok[6:], ok)           # rounds to +-32767, check said fine
+    assert abs(P._to_int16(4.99999, 5.0)) == 32767 and P.state_out_of_range(ok[:4] + [4.99999] + ok[5:]) == -1
+    assert H.tool_error(key, near) == 'manifest'
     with pytest.raises(ValueError, match='HIL tool error.*field 4.*step 3'):
         H.tool_error({'state_out_of_range': dict(step=3, field=4, value='nan')}, mosi)
+    with pytest.raises(ValueError, match='not enough evidence'):
+        H.tool_error({}, mosi)                                            # log from before the Pi check
+    assert H.tool_error({}, mosi, allow_pre_b81_15=True).startswith('pre_b81_15')
     for i, v in ((4, float('nan')), (5, 5.0), (4, float('-inf'))):
-        s = [1.0] * 4 + [0.5, -0.5, 0.0, 0.1, 0.0, 0.2]
+        s = list(ok)
         s[i] = v
         m = mosi.copy()
-        m[2] = np.frombuffer(P.encode_state(s), np.uint8)
+        m[2] = frames(s)[0]
         with pytest.raises(ValueError, match=f'field {i} at the int16 bound at frame 2'):
-            H.tool_error({}, m)
+            H.tool_error({}, m, allow_pre_b81_15=True)
     m = mosi.copy()
-    m[1] = np.frombuffer(P.encode_state([1.0] * 4 + [0.5, -0.5, -math.pi, 0.1, 0.0, 0.2]), np.uint8)
-    H.tool_error({}, m)                                                   # theta -pi: not an error
-    m[1] = np.frombuffer(P.encode_state([40.0] * 4 + [0.5, -0.5, 0.0, 3.0, 0.0, 10.0]), np.uint8)
-    H.tool_error({}, m)                                                   # wheel speed, v, wz at bound: not in the rule
+    m[1] = frames(ok[:6] + [-math.pi] + ok[7:])[0]
+    assert H.tool_error({}, m, allow_pre_b81_15=True)                    # theta -pi: not an error
+    m[1] = frames([40.0] * 4 + [0.5, -0.5, 0.0, 3.0, 0.0, 10.0])[0]
+    assert H.tool_error({}, m, allow_pre_b81_15=True)                    # wheel speed, v, wz at bound: not in the rule

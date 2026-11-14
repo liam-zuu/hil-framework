@@ -202,9 +202,12 @@ def test_t_end_error_estimate():
     v, src = T.t_end_err_ms(12.0, esp_pi_ppm=24.6)
     assert v == pytest.approx(12.0 * (24.6 + 50.0 + T.PI_PERIOD_PPM_BOUND) * 1e-3) and 'can Pi' in src
     # S05 v3.20 4.7 (i) (B81-13): no esp_pi_ppm -> the whole sum is 2000 ppm, 2 x T ms (24 ms at 12 s)
-    for missing in (None, float('nan'), float('inf'), 'x'):
+    for missing in (None, float('nan'), float('inf'), 'x', 10 ** 400):            # 10**400: OverflowError (B8C-R1-6)
         v, src = T.t_end_err_ms(12.0, esp_pi_ppm=missing, pi_period_ppm=-12.0)
         assert v == pytest.approx(24.0) and '2000 ppm' in src, missing
+    # Codex B8C-R1-6: t_end < 0 has no number; a large finite t_end keeps a finite result
+    assert T.t_end_err_ms(-12.0)[0] is None and T.t_end_err_ms(10 ** 400)[0] is None
+    assert T.t_end_err_ms(1e305)[0] == pytest.approx(2e305) and T.t_end_err_ms(1e306, 1e300)[0] is None
     v, src = T.t_end_err_ms(12.0, esp_pi_ppm=24.6, pi_period_ppm=float('nan'))          # not finite: the Pi bound
     assert v == pytest.approx(12.0 * (24.6 + 50.0 + T.PI_PERIOD_PPM_BOUND) * 1e-3) and 'can Pi' in src
     assert T.t_end_err_ms(None) == (None, 'khong co t_end') and T.t_end_err_ms(float('nan'))[0] is None

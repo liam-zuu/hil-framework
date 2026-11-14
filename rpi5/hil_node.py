@@ -368,17 +368,14 @@ class HILNode:
                 self._ref       = (vx_r, vy_r, wz_r)
                 traj_flags      = TRAJ_VALID | TRAJ_NEW
         state  = self.plant.get_state()
-        imu, imu_seq = self._imu_sample(state)
         frame_state = plant_to_frame_state(state) if self._mecanum else state
+        # O1 v11.15 3.5 (B81-15): the plant state as it comes, before the IMU sample (which may raise on it) and
+        # the S06 heavy block (which may overwrite omega), then the frame as encoded (Codex B8C-R1-2)
+        self._check_state(frame_state, 'plant')
+        imu, imu_seq = self._imu_sample(state)
         if self._heavy is not None:
             self._heavy.apply(self._step, frame_state)   # S06 Z8: omega to the H7 only, the plant goes on
-        if self._state_bad is None:
-            # O1 v11.15 3.5 (B81-15): a state field not finite, or x, y at the +-5 m bound, is a HIL tool error
-            i = state_out_of_range(frame_state)
-            if i >= 0:
-                self._state_bad = dict(step=int(self._step), field=int(i), value=repr(float(frame_state[i])))
-                log.error('plant state field %d = %r at step %d: not finite or position at the +-5 m bound; '
-                          'HIL tool error, run to be redone (O1 3.5)', i, frame_state[i], self._step)
+            self._check_state(frame_state, 'frame')
         swa = self._swa_bit()
         mosi   = encode_state(frame_state, traj_ref=self._ref, traj_flags=traj_flags,
                               seq=self._step, imu=imu, imu_seq=imu_seq,
@@ -461,6 +458,17 @@ class HILNode:
         # 6. Periodic stats log
         if self._step % self.cfg.stats_interval == 0:
             self._log_stats()
+
+    def _check_state(self, frame_state, where: str) -> None:
+        """O1 v11.15 3.5 (B81-15): record the first state field that is not finite, or x, y at the +-5 m bound
+        (protocol.state_out_of_range): a HIL tool error, the run is failed (run_failed) and redone."""
+        if self._state_bad is not None:
+            return
+        i = state_out_of_range(frame_state)
+        if i >= 0:
+            self._state_bad = dict(step=int(self._step), field=int(i), value=repr(float(frame_state[i])), where=where)
+            log.error('plant state field %d = %r at step %d (%s): not finite or position at the +-5 m bound; '
+                      'HIL tool error, run to be redone (O1 3.5)', i, frame_state[i], self._step, where)
 
     def _swa_bit(self) -> int:
         """I8: SWA command for this frame. 'phase' reads the phase after this step's lifecycle step."""

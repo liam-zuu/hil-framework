@@ -309,3 +309,38 @@ def test_hil_node_reads_duty_from_fake_h7_and_relays_new_setpoints():
     assert plant.torques[0] == [0.0] * 4                 # first MISO: nothing prepared yet
     assert plant.torques[-1] == pytest.approx([0.25, -0.25, 0.5, -0.5], abs=1e-4)
     assert fake.relay_attempted == 2 and fake.last_relay == pytest.approx((0.3, 0.0, 0.0), abs=1e-3)
+
+
+def test_plant_state_checked_before_the_imu_and_the_heavy_block(tmp_path):
+    """Codex B8C-R1-2: the state is checked as the plant gives it, before the IMU sample (a Mecanum theta = inf
+    makes imu_from_plant raise) and before the S06 heavy block (which overwrites omega): the first bad field is
+    in the manifest even when the run then stops on an exception, and a NaN omega under the heavy block counts."""
+    import json
+
+    import numpy as np
+
+    from mecanum_plant import MecanumPlant
+    from params import PARAMS
+
+    class InfTheta(MecanumPlant):
+        def get_state(self):
+            s = super().get_state()
+            if self._ticks >= 20:
+                s[2] = float('inf')                     # Mecanum order [x, y, theta, ...]
+            return s
+    p = str(tmp_path / 'm.npz')
+    node = HILNode(InfTheta(PARAMS, dt=0.001), config=HILConfig(simulate_hw=True, max_steps=60, period_us=1_000,
+                                                                frame_log=p))
+    try:
+        node.run()
+    except Exception:                                  # the IMU sample may raise on theta = inf
+        pass
+    m = json.loads(str(np.load(p)['manifest']))
+    assert m['state_out_of_range']['field'] == 6 and m['state_out_of_range']['where'] == 'plant'
+    assert node.run_failed
+    p2 = str(tmp_path / 'h.npz')
+    node = HILNode(_BadStatePlant(20, 0, float('nan')),
+                   config=HILConfig(simulate_hw=True, max_steps=60, period_us=1_000, frame_log=p2, heavy_block=(0, 60)))
+    node.run()
+    m = json.loads(str(np.load(p2)['manifest']))
+    assert node.run_failed and m['state_out_of_range']['field'] == 0 and m['state_out_of_range']['where'] == 'plant'

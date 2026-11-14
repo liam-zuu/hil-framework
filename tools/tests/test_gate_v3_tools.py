@@ -57,6 +57,7 @@ def write_k_frame_log(path, task, yaw, k0=300):
         mosi[k] = np.frombuffer(P.encode_state(st, traj_ref=(0.3, 0.0, 0.0) if on else None,
                                                traj_flags=P.TRAJ_VALID if on else 0, seq=k), dtype=np.uint8)
     manifest = dict(period_us=1000, steps=n, plant='MecanumPlant', miso_check=dict(crc_bad=0, empty=0),
+                    state_out_of_range=None,                        # B81-15 check ran on the Pi
                     lifecycle=dict(outcome='completed', transitions=[dict(step=0, t=0, phase='ARM'),
                                                                      dict(step=k0, t=0.3, phase='RUN')]))
     np.savez(path, manifest=np.array(json.dumps(manifest)), mosi=mosi, miso=np.zeros((n, P.FRAME_SIZE), dtype=np.uint8))
