@@ -919,6 +919,19 @@ def test_pwm_before_the_edge_must_show_zero():
     assert 'before the edge' in why(held50, k_run=50, i=ie - 2)
 
 
+@needs_gcc
+def test_run_step_near_frame_0_maps_with_a_log_from_500_ms():
+    # Codex B8C-R3-2: a valid run with k_run 50 (frames cut at 0, reach -452 ms) and an ESP32 log from -500 ms
+    # before the edge (after the -507 ms of an uncut range) maps in full: every window fits, the edge is bracketed
+    s = sim(edge_ms=70.4, k_run=50, n_before=5)
+    ts, ie = s['esp']['timestamp_us'], int(M.rising_edges(s['esp']['run_active'])[0])
+    assert ts[0] - ts[ie] == -500e3
+    em = run(s, k_run=50)
+    _check_bracket(em, s['k_true'])
+    assert set(em['pwm_side']['fits']) == {'1.0', '2.0', '3.0'}
+    assert min(min(f['corr']) for f in em['pwm_side']['fits'].values()) > M.MIN_CORR
+
+
 def test_plateau_right_end():
     # G32-R2-2: a step-function cost keeps the right end of its flat minimum
     fine = np.arange(0.0, 2.001, 0.01)

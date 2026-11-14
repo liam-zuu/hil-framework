@@ -537,7 +537,7 @@ def esp_clock_ppm(raw_path: str):
     Sign (B81-20, THESIS_B8 14/11, CODE): the hull slope s is d(receive - timestamp) / d(timestamp) = f_Pi / f_ESP
     - 1; the value returned is f_ESP / f_Pi - 1 = -s / (1 + s), > 0 when the ESP32 clock runs fast, as the name
     says. Before 14/11 s itself was returned (the opposite sign; S05 4.7 (i) uses |esp_pi_ppm|, which changes
-    by the factor 1 / (1 + s), at most |s| / (1 - |s|) = 0.1001 % at |s| <= 1000 ppm; Codex B8C-R1 note, R2-3)."""
+    by the factor 1 / (1 + s), at most |s| / (1 - |s|), about 0.1001 % (under 0.101 %) at |s| <= 1000 ppm; Codex B8C-R1 note, R2-3, R3-1)."""
     pts = []
     with open(raw_path, encoding='utf-8') as f:
         for line in f:
