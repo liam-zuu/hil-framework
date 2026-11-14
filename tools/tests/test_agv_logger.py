@@ -37,7 +37,9 @@ DUT_HEADER = (
     "pos_on,pos_x,pos_y,pos_th,pos_x_ref,pos_y_ref,pos_th_ref,pos_corr_vx,pos_corr_vy,"
     "pos_th_src,pos_in_pos,still,run_active,pos_reset_n,"
     # AGV feat/wheel-slip 8211c3c logger.c:108 (after the pos_* columns in the campaign firmware)
-    "ws_res,ws_th,ws_flag,ws_on_count,ws_eval"
+    "ws_res,ws_th,ws_flag,ws_on_count,ws_eval,"
+    # AGV feat/wifi-gain logger.c (12/11, R128 RB-4): age of the last command packet [ms]
+    "traj_age_ms"
 )
 # logger.c:132-145, the conversion of each column in order
 DUT_FMT = ("%lld," "%ld,%ld,%ld,%ld," "%.2f,%.2f,%.2f,%.2f," "%.3f,%.3f,%.3f," "%.3f,%.3f,%.3f,"
@@ -46,7 +48,8 @@ DUT_FMT = ("%lld," "%ld,%ld,%ld,%ld," "%.2f,%.2f,%.2f,%.2f," "%.3f,%.3f,%.3f," "
            "%.4f,%.4f,%.4f,%.4f,%.1f,%.1f,%lu,%lu,%lu," "%u,%u,%u,%lu,%.4f,%.4f,%u,%lu,"
            "%u,%lu,%.4f,%.5f," "%.4f,%lu,%u,"
            "%u,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f," "%u,%u,%u,%u,%lu,"   # pos-loop 9110532 logger.c:152-153
-           "%.0f,%.1f,%u,%lu,%u").split(',')                               # wheel-slip 8211c3c logger.c:148
+           "%.0f,%.1f,%u,%lu,%u,"                                          # wheel-slip 8211c3c logger.c:148
+           "%ld").split(',')                                               # traj_age_ms feat/wifi-gain
 NAMES = DUT_HEADER.split(',')
 S = 1_000_000           # microseconds per second
 
@@ -88,7 +91,7 @@ def seg(core, i):
 
 
 def test_fixture_matches_logger_schema():
-    assert len(NAMES) == len(DUT_FMT) == 85
+    assert len(NAMES) == len(DUT_FMT) == 86
     assert NAMES == al.COLUMNS
     ints = {n for n, c in zip(NAMES, DUT_FMT) if 'f' not in c}
     assert ints == set(al.INT_COLUMNS)
@@ -108,17 +111,17 @@ def test_strict_keeps_dut_line_and_rejects_old_formats():
 def test_loose_pads_old_formats_like_before():
     core = al.LoggerCore(strict=False)
     kind, fields = core.feed(','.join(dut_line(1).split(',')[:al.N_S02]))
-    assert kind == 'data' and len(fields) == 85 and fields[-1] == ''
+    assert kind == 'data' and len(fields) == 86 and fields[-1] == ''
     assert core.placement == (None, 'no_seq')
 
 
-@pytest.mark.parametrize('n', [66, 80])
+@pytest.mark.parametrize('n', [66, 80, 85])
 def test_ctrl_imu_and_pos_loop_lines_padded_loose_rejected_strict(n):
     """Firmware before the campaign columns (ctrl-imu 66, feat/pos-loop alone 80): loose mode pads
     them with empty columns, measurement mode rejects them like the 28/37-column formats."""
     line = ','.join(dut_line(1).split(',')[:n])
     kind, fields = al.LoggerCore(strict=False).feed(line)
-    assert kind == 'data' and len(fields) == 85 and fields[n - 1] != '' and fields[n:] == [''] * (85 - n)
+    assert kind == 'data' and len(fields) == 86 and fields[n - 1] != '' and fields[n:] == [''] * (86 - n)
     assert al.LoggerCore(strict=True).feed(line) == ('reject', f'n_cols_{n}')
 
 

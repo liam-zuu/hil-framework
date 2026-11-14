@@ -33,8 +33,9 @@ Exit code: 0 closed cleanly, 2 refused or could not open, 3 error while closing,
 receiving. The run owner checks the exit code AND the summary (B0 review B35): status "closed"
 alone does not prove a complete run, and no field of the summary proves a single DUT boot.
 
---strict (measurement mode, Codex rounds 2-3 #25, #43; B0 review B3-B10, B36): only 85-column
-lines (campaign firmware: ctrl-imu 66 + position loop 14 + wheel slip 5, 05/11) with the DUT's
+--strict (measurement mode, Codex rounds 2-3 #25, #43; B0 review B3-B10, B36): only 86-column
+lines (campaign firmware: ctrl-imu 66 + position loop 14 + wheel slip 5, 05/11, + traj_age_ms 12/11,
+AGV feat/wifi-gain; firmware 54b7269 and older print 85 and are padded only without --strict) with the DUT's
 printf types, C type ranges and flag/enum values are kept; a header-like line that is not
 COLUMNS name by name blocks data until a matching header arrives. Without --strict, older
 28/37/66/80-column lines are padded as before. LOGGER_OPEN is not DUT READY (#35).
@@ -121,12 +122,17 @@ COLUMNS = [
     # Wheel-consistency slip flag wheel_slip.c (AGV feat/wheel-slip 8211c3c logger.c, where these
     # come right after slip_eval; in the campaign firmware they come after the pos_* columns).
     "ws_res", "ws_th", "ws_flag", "ws_on_count", "ws_eval",
+    # Added 12/11 (R128 RB-4, Liam 12/11 "Thêm luôn"; AGV feat/wifi-gain logger.c): age of the last
+    # trajectory command packet at the tick [ms] (tick time - receive time), -1 before the first one.
+    # Sampled every 10 ms tick, so the largest gap of a run is seen to within one tick.
+    "traj_age_ms",
 ]
-N_OLD = 28      # firmware before the counters: same columns without the last 9 + 29 + 17
-N_S02 = 37      # firmware a6644a5 .. before ctrl-imu: without the last 29 + 17
-N_IMU = 66      # firmware ctrl-imu (spec controller-IMU v2.2): without the last 17
-N_POS = 80      # firmware feat/pos-loop (9110532 on) before the wheel slip flag: without the last 5
-OLD_LENGTHS = (N_OLD, N_S02, N_IMU, N_POS)
+N_OLD = 28      # firmware before the counters: same columns without the last 9 + 29 + 18
+N_S02 = 37      # firmware a6644a5 .. before ctrl-imu: without the last 29 + 18
+N_IMU = 66      # firmware ctrl-imu (spec controller-IMU v2.2): without the last 18
+N_POS = 80      # firmware feat/pos-loop (9110532 on) before the wheel slip flag: without the last 6
+N_WS = 85       # campaign firmware up to AGV 54b7269 (before traj_age_ms, 12/11): without the last 1
+OLD_LENGTHS = (N_OLD, N_S02, N_IMU, N_POS, N_WS)
 KNOWN_NAMES = frozenset(COLUMNS)
 SEGMENT_COLUMNS = ["row", "log_seq", "timestamp_us", "segment", "status"]
 SEGMENT_STATUSES = frozenset(("ok", "duplicate", "conflict", "ambiguous", "no_seq"))
@@ -151,6 +157,7 @@ INT_RANGES.update({c: _U8 for c in ("motor_on", "g_valid", "r_valid", "wz_src", 
                                     "pos_on", "pos_th_src", "pos_in_pos", "still", "run_active",
                                     "ws_flag", "ws_eval")})
 INT_RANGES["imu_init"] = _I8
+INT_RANGES["traj_age_ms"] = _I32
 INT_COLUMNS = frozenset(INT_RANGES)
 # Values the DUT can print in the flag / enum columns (B0 review B36): bools; wz_src
 # WZ_SRC_ENC 0 / WZ_SRC_IMU 1 (imu_fusion.h:60-61); imu_init IMU_INIT_* 0..3 (imu.h:29-32)
@@ -744,7 +751,7 @@ def main(argv=None):
     parser.add_argument("--bind", default="0.0.0.0", help="Địa chỉ bind (mặc định mọi card mạng)")
     parser.add_argument("--out",  default=None, help="Tên file CSV output")
     parser.add_argument("--strict", action="store_true",
-                        help="Chế độ đo: chỉ giữ dòng 85 cột đúng kiểu, header DUT phải khớp")
+                        help="Chế độ đo: chỉ giữ dòng 86 cột đúng kiểu, header DUT phải khớp")
     parser.add_argument("--src-ip", default=None,
                         help="Chỉ nhận gói từ IP này (ESP32 của bàn HIL); 'first': khóa theo gói đầu "
                              "tiên, gói nguồn khác bị bỏ và đếm ở rejects.source")
