@@ -272,6 +272,25 @@ def test_noise_off_paths_are_simulate_paths(fw):
         assert np.array_equal(fb[rb], fe[fe[:, 0] < 2.0])
 
 
+def test_c7_table_reads_real_fault_run_output(fw, tmp_path):
+    """tools/fault_c7_table.py on folders written as fault_run.py writes them (fwsim.write_run + write_faults):
+    the log columns and meta.yaml lines it assumes are there; an encoder loss on FL shows in the row."""
+    sys.path.insert(0, os.path.join(HERE, '..', '..', 'tools'))
+    import fault_c7_table as ct
+    cfg = dict(task='A-W1', mode='PID', seed=0, imu_rate=20.0, imu_boot_reset=-1.0, imu_noise='replay',
+               imu_noise_seed=0, ground=None, mu=None, no_imu=False, duration=6.0)
+    for name, s in (('PID_base', fs.Schedule(())), ('PID_encFL', sched('E1,enc_loss,FL,3000,5000,\n'))):
+        log = run(fw, s, duration=6.0)
+        out = str(tmp_path / name)
+        fwsim.write_run(out, log, fwsim.metrics(log), fw, dict(cfg), MecanumParams())
+        fault_run.write_faults(out, log)
+    (r,) = ct.table(str(tmp_path))
+    assert (r['controller'], r['case'], r['win_start_s'], r['win_end_s'], r['complete']) == ('PID', 'encFL', 3.0,
+                                                                                         5.0, True)
+    assert r['ticks'] == r['ticks_expected'] == 600 and r['imu_rows'] == r['base_imu_rows'] == 120
+    assert r['imu_dropped'] == 0 and r['err_rms_vx'] > 5 * r['base_err_rms_vx']
+
+
 def test_cli_baseline_and_fault_run(tmp_path):
     import subprocess
     p = tmp_path / 's.csv'
