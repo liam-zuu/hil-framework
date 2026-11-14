@@ -191,7 +191,8 @@ def test_table_cells_medians_and_reasons(tmp_path):
     per_run = list(csv.DictReader(open(out / 'S05_final_runs.csv', encoding='utf-8')))
     assert {r['run_uid'] for r in per_run} == {'r1', 'r2', 'r3', 'r4', 'r5'}
     pr = {r['run_uid']: r for r in per_run}                                  # S05 4.7 (i), Liam Q4 (CODE_RS4)
-    assert float(pr['r5']['t_end_err_ms']) == pytest.approx(10.0 * T.ESP_PI_PRIOR_PPM * 1e-3)   # no esp_pi_ppm
+    assert float(pr['r5']['t_end_err_ms']) == pytest.approx(                          # no esp_pi_ppm (S05 v3.24)
+        10.0 * ((1.0 + T.ESP_PI_EMAX_PPM * 1e-6) * (1.0 + T.PI_PERIOD_PPM_BOUND * 1e-6) - 1.0) * 1e3)
     assert pr['r1']['t_end_err_ms'] == '' and pr['r1']['t_end_err_src'] == 'xe: C7b'
 
 
@@ -201,13 +202,29 @@ def test_t_end_error_estimate():
     assert v == pytest.approx(12.0 * (52.0 + 50.0 + 12.0) * 1e-3) and 'pi_period_ppm' in src      # 1.37 ms
     v, src = T.t_end_err_ms(12.0, esp_pi_ppm=24.6)
     assert v == pytest.approx(12.0 * (24.6 + 50.0 + T.PI_PERIOD_PPM_BOUND) * 1e-3) and 'can Pi' in src
-    # S05 v3.20 4.7 (i) (B81-13): no esp_pi_ppm -> the whole sum is 2000 ppm, 2 x T ms (24 ms at 12 s)
+    # S05 v3.24 4.7 (i) (B81R2-1, B81R3-1, B81R3-2): no esp_pi_ppm -> T x [(1 + e_max)(1 + |pi| 1e-6) - 1] x 1e3,
+    # e_max = (1 + rho)/(1 - rho) - 1, rho = 1e-3: 2002.002 ppm; S05: "about +-24.2 ms at T = 12 s, pi_period_ppm -12"
+    assert T.ESP_PI_EMAX_PPM == pytest.approx(2002.002002, abs=1e-6)
+    assert T.ESP_PI_EMAX_PPM == pytest.approx(1001.0 / 999.0 * 1e6 - 1e6, rel=1e-12)
     for missing in (None, float('nan'), float('inf'), 'x', 10 ** 400):            # 10**400: OverflowError (B8C-R1-6)
         v, src = T.t_end_err_ms(12.0, esp_pi_ppm=missing, pi_period_ppm=-12.0)
-        assert v == pytest.approx(24.0) and '2000 ppm' in src, missing
+        assert v == pytest.approx(24.168312, abs=1e-6) and 'e_max 2002.002 ppm' in src and 'pi_period_ppm' in src, missing
+        assert round(v, 1) == 24.2
+    # pi_period_ppm missing too: the Pi bound (Liam 15/11 CODE_RS4 "Cận 100 ppm (Recommended)")
+    for pi in (None, float('nan'), 10 ** 400):
+        v, src = T.t_end_err_ms(12.0, esp_pi_ppm=None, pi_period_ppm=pi)
+        assert v == pytest.approx(12.0 * ((1001.0 / 999.0) * (1.0 + 1e-4) - 1.0) * 1e3) and 'can Pi' in src, pi
+    v, _ = T.t_end_err_ms(12.0, esp_pi_ppm=None, pi_period_ppm=+12.0)               # |pi_period_ppm|
+    assert v == pytest.approx(24.168312, abs=1e-6)
+    assert T.t_end_err_ms(0.0)[0] == 0.0
+    # the mapper's assumed range is the rho of e_max (a change there must change this bound)
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+    import hil_edge_map
+    assert T.MAPPER_RHO_PPM == hil_edge_map.RHO_MAX_PPM
     # Codex B8C-R1-6: t_end < 0 has no number; a large finite t_end keeps a finite result
     assert T.t_end_err_ms(-12.0)[0] is None and T.t_end_err_ms(10 ** 400)[0] is None
-    assert T.t_end_err_ms(1e305)[0] == pytest.approx(2e305) and T.t_end_err_ms(1e306, 1e300)[0] is None
+    assert T.t_end_err_ms(1e305)[0] == pytest.approx(1e305 * ((1001.0 / 999.0) * (1.0 + 1e-4) - 1.0) * 1e3)
+    assert T.t_end_err_ms(1e306, 1e300)[0] is None
     v, src = T.t_end_err_ms(12.0, esp_pi_ppm=24.6, pi_period_ppm=float('nan'))          # not finite: the Pi bound
     assert v == pytest.approx(12.0 * (24.6 + 50.0 + T.PI_PERIOD_PPM_BOUND) * 1e-3) and 'can Pi' in src
     assert T.t_end_err_ms(None) == (None, 'khong co t_end') and T.t_end_err_ms(float('nan'))[0] is None

@@ -46,10 +46,15 @@ end stays t = 0 + t_end on the ESP32 log; each HIL run reports the estimated err
   t_end_err_ms = t_end x (|esp_pi_ppm| + ESP_PPM_NOISE + |pi_period_ppm|) x 1e-3
 esp_pi_ppm: the ESP32 / Pi rate estimate of the run (score edge_map, from the logger WiFi packets);
 pi_period_ppm: the Pi step period against the nominal 1 ms (score key if present, else PI_PERIOD_PPM_BOUND);
-no esp_pi_ppm (or not finite): the whole sum in brackets is ESP_PI_PRIOR_PPM = 2000 ppm, the ESP32 / Pi bound
-built from the two assumed ranges of the mapper (ESP32 / H7 and H7 / Pi, 1000 ppm each), i.e. 2 x t_end ms
-(24 ms at 12 s), an assumed bound, not a measurement (S05 v3.20 4.7 (i), B81-13; Liam 14/11 THESIS_B8 "duyệt
-cả"); a pi_period_ppm that is not finite counts as missing. Report only; the line choice is unchanged. Car runs:
+no esp_pi_ppm (or not finite): S05 v3.24 4.7 (i) (B81R2-1, B81R3-1, B81R3-2; Liam 14/11 THESIS_B8 "Duyệt, kiểm
+ở B8-1b (Recommended)"), the multiplicative bound
+  t_end_err_ms = t_end x [(1 + e_max) (1 + |pi_period_ppm| 1e-6) - 1] x 1e3,  e_max = (1 + rho) / (1 - rho) - 1
+with rho = MAPPER_RHO_PPM 1e-6 (the mapper P1 assumes ESP32 / H7 and Pi / H7 both in [1 - rho, 1 + rho],
+hil_edge_map.RHO_MAX_PPM; a test checks the two agree), e_max = 2002.002 ppm; about 24.17 ms at 12 s with
+pi_period_ppm = -12; an assumed bound, not a measurement. pi_period_ppm missing there too: PI_PERIOD_PPM_BOUND, as in
+the other branch (Liam 15/11 CODE_RS4 local_3b1a170b, "Cận 100 ppm (Recommended)"). Before 15/11 this branch was
+2000 ppm added (2 x t_end ms, S05 v3.20). A pi_period_ppm that is not finite counts as missing. Report only; the
+line choice is unchanged. Car runs:
 the camera clock goes to the ESP32 through C7b, not here (column empty, 'xe: C7b').
 
 Each cell (controller x condition x platform x gain set): n_valid, n_dat / n_khong_dat / n_chua_ket_luan,
@@ -86,9 +91,15 @@ CONTROLLERS = ('PID', 'LADRC')
 QUANTITIES = ('e_perp_max', 'e_theta_lane_max_deg', 'e_theta_cmd_max_deg', 'e_s_absmax', 'e_trk_max', 'tv_duty')
 VALID = ('dat', 'khong_dat', 'chua_ket_luan')
 # t_end error (S05 4.7 (i), Liam 14/11 CODE_RS4 Q4)
-ESP_PPM_NOISE = 50.0               # spread of the per-run esp_pi_ppm estimate (13/11: 12 runs -52..+31 ppm)
+# ESP_PPM_NOISE: noise of the per-run esp_pi_ppm estimate, an estimate of Claude (not a bound). Source (recomputed
+# 15/11 with esp_clock_ppm at hil b907d98 on CLOSED_LOOP/2026-11-13_run*/pi/*.raw.jsonl; design RS-4 section 18.2):
+# "12 runs of 13/11, -52..+31 ppm" (hil 4a5572d) is in the sign before B81-20 (f_Pi / f_ESP - 1); the 12 files of
+# run06-run09 and those of run07-run10 both give -52.4..+30.9 (which 12 was not recorded); in the current sign
+# (> 0 when the ESP32 runs fast) -30.9..+52.4 ppm; all 36 files of 13/11: -45.2..+52.4 ppm.
+ESP_PPM_NOISE = 50.0
 PI_PERIOD_PPM_BOUND = 100.0        # [DE XUAT] when the score has no pi_period_ppm (run14: -12 / -12 / -13 ppm)
-ESP_PI_PRIOR_PPM = 2000.0          # S05 v3.20 4.7 (i): ESP32/H7 1000 (RHO_MAX_PPM, L100) + H7/Pi 1000, no esp_pi_ppm
+MAPPER_RHO_PPM = 1000.0            # = hil_edge_map.RHO_MAX_PPM (L100); no esp_pi_ppm: e_max from it (S05 v3.24)
+ESP_PI_EMAX_PPM = ((1.0 + MAPPER_RHO_PPM * 1e-6) / (1.0 - MAPPER_RHO_PPM * 1e-6) - 1.0) * 1e6   # 2002.002 ppm
 
 
 def _finite(v):
@@ -104,13 +115,15 @@ def t_end_err_ms(t_end_s, esp_pi_ppm=None, pi_period_ppm=None):
     if not _finite(t_end_s) or float(t_end_s) < 0:
         return None, 'khong co t_end'
     t = float(t_end_s)
+    if not _finite(pi_period_ppm):
+        pi_period_ppm = None
+    pi = PI_PERIOD_PPM_BOUND if pi_period_ppm is None else abs(float(pi_period_ppm))
+    pi_src = 'can Pi' if pi_period_ppm is None else 'pi_period_ppm'
     if not _finite(esp_pi_ppm):
-        v, src = t * (ESP_PI_PRIOR_PPM * 1e-3), f'khong co esp_pi_ppm: can {ESP_PI_PRIOR_PPM:g} ppm (gia dinh)'
+        v = t * ((1.0 + ESP_PI_EMAX_PPM * 1e-6) * (1.0 + pi * 1e-6) - 1.0) * 1e3
+        src = f'khong co esp_pi_ppm: can e_max {ESP_PI_EMAX_PPM:.3f} ppm (gia dinh) x {pi_src}'
     else:
-        if not _finite(pi_period_ppm):
-            pi_period_ppm = None
-        pi = PI_PERIOD_PPM_BOUND if pi_period_ppm is None else abs(float(pi_period_ppm))
-        src = 'esp_pi_ppm + nhieu + ' + ('can Pi' if pi_period_ppm is None else 'pi_period_ppm')
+        src = 'esp_pi_ppm + nhieu + ' + pi_src
         v = t * ((abs(float(esp_pi_ppm)) + ESP_PPM_NOISE + pi) * 1e-3)
     return (v, src) if math.isfinite(v) else (None, 'khong co so huu han')
 

@@ -533,7 +533,10 @@ def esp_clock_ppm(raw_path: str):
     """ESP32 clock rate vs the Pi clock [ppm] from the logger's raw packets (Pi receive time, ESP32 timestamp):
     slope of the edge of the lower convex hull of (timestamp, receive - timestamp) that spans the mean timestamp
     (one-way delay skew estimate). A coarse check only: on 12 bench runs of 13/11 (12.7 s each) it spread over
-    -52 .. +31 ppm. Reported only since L100 (the bound is RHO_MAX_PPM). None when fewer than 50 packets or 5 s.
+    -52 .. +31 ppm in the sign before B81-20 (written at 4a5572d without the runs; recomputed 15/11 at b907d98: the
+    12 files of CLOSED_LOOP/2026-11-13_run06-run09 and those of run07-run10 both give -52.4 .. +30.9 in that sign,
+    -30.9 .. +52.4 ppm in the current one; all 36 files of 13/11 -45.2 .. +52.4 ppm, current sign; design RS-4 18.2).
+    Reported only since L100 (the bound is RHO_MAX_PPM). None when fewer than 50 packets or 5 s.
     Sign (B81-20, THESIS_B8 14/11, CODE): the hull slope s is d(receive - timestamp) / d(timestamp) = f_Pi / f_ESP
     - 1; the value returned is f_ESP / f_Pi - 1 = -s / (1 + s), > 0 when the ESP32 clock runs fast, as the name
     says. Before 14/11 s itself was returned (the opposite sign; S05 4.7 (i) uses |esp_pi_ppm|, which changes

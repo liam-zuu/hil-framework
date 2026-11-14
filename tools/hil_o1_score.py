@@ -44,6 +44,20 @@ empty frames) are copied out; the run rule is tools/s06_frames_decode.py on the 
 (O1 v11.15 3.5, B81-15; Liam 14/11 THESIS_B8 "duyệt cả", "Giữ U_p = 0, ghi giới hạn"): a plant state field that
 is NaN / inf, or x, y at the +-5 m encoding bound, is a HIL tool error and the run is refused here (tool_error, exit 2).
 
+B81-3 (S05 v3.20; the gate JSON format of CODE_R134, tools/rq3_log.py at hil 4f1a0ef: gate_g1_fields,
+_common_block; Liam 14/11 CODE_RS4 "Làm sau khi phần A gộp (Recommended)"; design RS-4 section 18.1): the
+gate_v3 block also holds
+  g1.t_deadline, g1.t_done ([t_end] when completed 'true', [null] otherwise: one way of using the frames on HIL),
+  g1.t1 (first tracking-error frame, null when none), and with t1 g1.prog_before_t1 (progress reached S - D_d at a
+  frame before t1) and g1.cond25_before_deadline (a frame before the deadline with conditions 2-5 met); without t1
+  both null. O1 v11.22 3.5, last block: the evaluators already compute them (t_first_track_err, t_progress,
+  cond2_5_ever of evaluate_v7 / evaluate_k, the same comparisons that give 'completed'); they are copied here.
+  g2..g5 'chung' {q, lo, hi, n_undef}: the common frame domain, equal to the union one on HIL (one way, O1 3.3).
+  G1 is recomputed from these fields (as rq3_log.gate_g1_state) and must agree with g1.state, else exit 2.
+  Short log (L85 Q1 turned 'false' into 'inconclusive'): the fields cannot say "not known", so none is written
+  (all null, g1_fields_note says why; G1 stays chua_ket_luan from q; Liam 15/11 CODE_RS4 local_3b1a170b,
+  "Không ghi số chi tiết (Recommended)").
+
   python tools/hil_o1_score.py --frame-log <run>.npz --task O1-F05 [--esp-log <run>.csv] [--out score.json]
   (K1, K2 need --allow-final-set: O1 3.7, final test set only)
 Last line: #ket_qua,ma=0 scored / 2 error.
@@ -145,6 +159,47 @@ def tool_error(manifest, mosi, allow_pre_b81_15=False):
     return 'pre_b81_15: x, y codes only (development log)'
 
 
+G1_FIELDS = ('t_done', 't_deadline', 't1', 'prog_before_t1', 'cond25_before_deadline')   # B81-3, one way (HIL)
+
+
+def _opt_time(x):
+    """A finite time, else None (the evaluators write NaN for 'none')."""
+    return float(x) if x is not None and not isinstance(x, bool) and math.isfinite(float(x)) else None
+
+
+def g1_state_from_fields(g1):
+    """G1 from its B81-3 fields, one way of using the frames (O1 3.3, 3.5 last block; rq3_log.gate_g1_state)."""
+    done = g1['t_done'][0] is not None
+    if g1['t1'] is None or g1['prog_before_t1']:          # no tracking error, or progress reached before t1
+        return 'dat' if done else 'khong_dat'
+    return 'chua_ket_luan' if g1['cond25_before_deadline'] else 'khong_dat'
+
+
+def add_b81_3(gate, out):
+    """In place on the gate_v3 block (module docstring, B81-3): the common domain of g2..g5 and the G1 fields
+    from the evaluator summary out. Raises ValueError when G1 from the fields differs from g1.state."""
+    for c in o1_gate.MEASURED:
+        gate[c]['chung'] = {k: gate[c][k] for k in ('q', 'lo', 'hi', 'n_undef')}
+    g1 = gate['g1']
+    if not out.get('log_covers_deadline', True) and out.get('completed_raw') == 'false':
+        g1.update(dict.fromkeys(G1_FIELDS))
+        gate['g1_fields_note'] = ('short log (L85 Q1): completed false turned inconclusive; t_done, t1 and the flags '
+                                  'cannot say "not known", so none is written (B81-3)')
+        return gate
+    t1 = _opt_time(out.get('t_first_track_err'))
+    t_prog = _opt_time(out.get('t_progress'))
+    g1.update(t_deadline=float(out['t_deadline']),
+              t_done=[float(out['t_end']) if out.get('completed') == 'true' else None], t1=t1,
+              prog_before_t1=None if t1 is None else bool(t_prog is not None and t_prog < t1),
+              cond25_before_deadline=None if t1 is None else bool(out['cond2_5_ever']))
+    st = g1_state_from_fields(g1)
+    if st != g1['state']:
+        raise ValueError(f'B81-3: G1 from t_done, t1 and the flags is {st!r}, the gate says {g1["state"]!r} '
+                         f'(completed {out.get("completed")!r})')
+    gate['g1_fields_note'] = ''
+    return gate
+
+
 def score(path, task, allow_final_set=False, esp_log=None, allow_pre_b81_15=False):
     if task not in FIG8 and task not in FINAL_SET:
         raise ValueError(f'task {task!r}: one of {tuple(FIG8) + FINAL_SET}')
@@ -188,6 +243,7 @@ def score(path, task, allow_final_set=False, esp_log=None, allow_pre_b81_15=Fals
         v_max, wz_max = o1_gate.k_cmd_max(o1_lanes.KSchedule(task))
     out['gate_v3'] = o1_gate.gate(frames, out['completed'], v_cmd_max=v_max, wz_cmd_max=wz_max, u_t=u_t,
                                   decide=decide, status=out.get('status', ''), note=note)
+    add_b81_3(out['gate_v3'], out)                                       # B81-3 (module docstring)
     mc = manifest.get('miso_check') or {}
     out.update(frame_log=os.path.basename(path), k0=k0, k_run=k_run, t0_step=a, t0_src=t0_src,
                frames_scored=int(len(state) - k0), edge_map=em,
