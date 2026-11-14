@@ -164,6 +164,13 @@ def check(t_send_ns, mosi, miso, esp32_events=None, serial_events=None, skip_s=0
             tot['miso_crc_bad'] += 1
             prev = None
             continue
+        # S06 T1 (Liam 14/11 THESIS local_2bb6f593 "Đếm riêng, đòi bằng 0"): a saturated apply window (pre_us 2047
+        # or dur4 31; s06_frames_decode age_us 0xFFFF) has no known age: counted, never in the max. Counted once
+        # the MISO CRC holds, also when no MOSI frame matches its seq (Codex T1A-R1-1)
+        sat = bool(r.get('miso_v5') and not r.get('apply_ok'))
+        if sat:
+            W['n_age_unknown'] += 1
+            tot['n_age_unknown'] += 1
         if r['answered'] is None:
             tot['unanswered'] += 1
             W['miso_seq_bad'] += 1
@@ -174,12 +181,7 @@ def check(t_send_ns, mosi, miso, esp32_events=None, serial_events=None, skip_s=0
         steps_crc_h7[a] = dec.u16(bytes(miso[r['j']]), dec.MISO_MOSI_CRC)
         W['_ans'].append(a)
         W['_nf'].append(r['rx_nf'])
-        if r.get('miso_v5') and not r.get('apply_ok'):
-            # S06 T1 (Liam 14/11 THESIS local_2bb6f593 "Đếm riêng, đòi bằng 0"): a saturated apply window
-            # (pre_us 2047 or dur4 31; s06_frames_decode age_us 0xFFFF) has no known age: counted, not in the max
-            W['n_age_unknown'] += 1
-            tot['n_age_unknown'] += 1
-        else:
+        if not sat:
             W['max_state_age_us'] = max(W['max_state_age_us'], r['age_us'])
             tot['age_max_us'] = max(tot['age_max_us'], r['age_us'])
         if not r['mosi_crc_ok']:
@@ -232,6 +234,9 @@ def check(t_send_ns, mosi, miso, esp32_events=None, serial_events=None, skip_s=0
     segs = res['clock']['segments']
     f_fit = float(np.median([s['f_h7_mhz'] for s in segs if s['n'] >= 2])) if any(s['n'] >= 2 for s in segs) else None
     age = age_verdict(tot['age_max_us'], f_fit)
+    # Codex T1A-R1 note: this verdict is on the known ages only; frames of unknown age fail T1 apart (below)
+    age.update(scope='known ages only (MISO v5: saturated apply windows excluded, see n_age_unknown)',
+               n_age_unknown=tot['n_age_unknown'])
     fails: List[str] = []
     incomplete: List[str] = []         # cannot conclude: missing evidence the spec needs (mã 3)
     if not h1['ok']:
