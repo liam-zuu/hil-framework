@@ -642,7 +642,12 @@ def test_group_that_cannot_be_reaped_finishes_the_run_without_eof(tmp_path, monk
     monkeypatch.setenv('FAKE_RUN_HIL', 'orphan')
     monkeypatch.setenv('FAKE_ORPHAN_S', '3')
     monkeypatch.setenv('FAKE_PROBE', 'ok')
-    d = make(tmp_path)
+    gate = tmp_path / 'gate'
+    monkeypatch.setenv('FAKE_ORPHAN_GATE', str(gate))
+    d = make(tmp_path / 'runs')
+    finishes = []
+    real_finish = d._finish
+    d._finish = lambda *a, **k: (finishes.append(a), real_finish(*a, **k))[1]
     t0 = time.monotonic()
     assert d.start(0) == pp.RES_OK
     reader = d._reader
@@ -651,8 +656,11 @@ def test_group_that_cannot_be_reaped_finishes_the_run_without_eof(tmp_path, monk
     assert s.error_code == hil_daemon.E_GROUP and d._wedged and d.proc is None
     assert run_meta(d)['group_gone'] is False
     assert d.start(0) == pp.RES_BUSY and d.probe_h7() is False
+    gate.write_text('')                          # PPI-R4-1: a stale '#phase,RUN' arrives now
     reader.join(10)
-    assert not reader.is_alive() and d.snapshot().error_code == hil_daemon.E_GROUP
+    s = d.snapshot()
+    assert not reader.is_alive() and s.error_code == hil_daemon.E_GROUP
+    assert s.run_state == pp.ST_ERROR and len(finishes) == 1           # R4-2: finished once
 
 
 def test_probe_started_while_shutdown_begins_is_killed(tmp_path, monkeypatch):

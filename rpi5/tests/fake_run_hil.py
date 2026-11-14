@@ -65,8 +65,14 @@ def main():
         return 9
     if scen == 'orphan':                        # owner exits, a child keeps the stdout pipe
         import subprocess
-        subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(%s)'
-                          % os.environ.get('FAKE_ORPHAN_S', '3')], stdout=sys.stdout, stderr=sys.stdout)
+        # FAKE_ORPHAN_GATE: the child waits for that file, then prints a stale '#phase,RUN' line
+        # (a line still in the pipe after the run was finished), then holds the pipe on
+        child = ('import os, sys, time\n'
+                 'g = os.environ.get("FAKE_ORPHAN_GATE")\n'
+                 'while g and not os.path.exists(g): time.sleep(0.01)\n'
+                 'if g: print("00:00:00 INFO     hil.main: #phase,RUN,t_ns=2", flush=True)\n'
+                 'time.sleep(float(os.environ.get("FAKE_ORPHAN_S", "3")))\n')
+        subprocess.Popen([sys.executable, '-c', child], stdout=sys.stdout, stderr=sys.stdout)
         return 0
     time.sleep(0.05)
     if scen == 'crash':

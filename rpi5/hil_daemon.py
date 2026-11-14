@@ -660,7 +660,8 @@ class HilDaemon:
                         logf = None
                 try:
                     with self._lock:
-                        self._parse(line, acc)
+                        if self.proc is proc:       # PPI-R4-1: once finished (watcher), only drain
+                            self._parse(line, acc)
                 except Exception as exc:           # keep draining, whatever the line
                     errors.append(f'parse: {type(exc).__name__}: {exc}')
         except Exception as exc:                   # stdout itself failed
