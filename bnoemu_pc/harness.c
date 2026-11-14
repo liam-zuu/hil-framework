@@ -13,7 +13,10 @@
  * 30 ms delay after each Set Feature (BNO08xRpt.cpp) runs the service loop.
  *
  *   harness <scenario> [period_us] [seconds]
- *   scenarios: boot, run, collision, rst_mid, silent, stale
+ *   scenarios: boot, run, collision, rst_mid, silent, stale, hold,
+ *              stale_gap (seconds = gap with the plant frozen; 4th arg "held":
+ *              RST low during the gap, "held_wrap": same, gap ending at a
+ *              sample age of 2^32 us, see sc_stale_gap), core_wrap (no host)
  * Environment BNOEMU_H7_PORT=1 (G2, 28/10): the emulator is driven the way the
  * H7 layer stm32h7/Core/Src/bno_emu_port.c drives it: core poll, new plant
  * sample and INT pin only on a 100 us tick (TIM6); MISO comes from a DMA buffer
@@ -58,6 +61,7 @@ static bool prev_int, hint_flag;
 static uint64_t next_plant;
 static bool plant_on = true;
 static uint8_t plant_seq;
+static uint64_t plant_seq_t;           /* virtual time of the last seq change */
 static uint32_t int_edges;
 
 static const uint8_t *zeros_port(void) { static const uint8_t z[(BNO_EMU_PKT_MAX + 4u + 16u)] = { 0 }; return z; }
@@ -172,6 +176,7 @@ static void plant_tick(void)
         static bno_emu_sample_t s;
         if (plant_on) {
             plant_seq++;
+            plant_seq_t = now;
             plant_sample(&s, (double)now * 1e-6);
         }
         s.seq = plant_seq;                  /* frozen plant: same seq every frame */
@@ -206,12 +211,14 @@ static uint64_t xfer_us(unsigned nbytes) { return XFER_OVERHEAD_US + (uint64_t)(
 
 static uint32_t hard_resets;          /* host timeouts that pulsed RST */
 static uint8_t zeros[512];
+static uint64_t t_rst_release;        /* virtual time of the last RST release */
 
 static void toggle_reset(void)
 {
     if (port_mode) port_reset(true); else bno_emu_set_reset(&emu, true, (uint32_t)now);
     sync_int();
     advance(RST_LOW_US);
+    t_rst_release = now;
     if (port_mode) port_reset(false); else bno_emu_set_reset(&emu, false, (uint32_t)now);
     sync_int();
     advance(RST_WAIT_US);
@@ -703,6 +710,90 @@ static void sc_stale(uint32_t period)
     check_data();
 }
 
+/* Plant frozen for a long gap (14/11, CODE_RS4): the emulator clock is uint32
+ * us and wraps every 2^32 us (71.6 min). After gap_s with no new imu_seq and
+ * no host reading, the host resets and inits again, plant still frozen: the
+ * chip must answer (reset complete, product IDs, Set Feature) but send no
+ * report; reports resume when the plant moves. Bench case 14/11
+ * (CLOSED_LOOP/2026-11-14_run02): gap 7430 s, init OK on a stale sample.
+ * held: RST held low for the whole gap (host powered off, chip in reset).
+ * held_wrap: as held, gap_s ignored: the gap is chosen so that the RST release
+ * of the reinit comes 1 ms after the sample age passes 2^32 us (the age read
+ * on the wrapped clock is then near 0 while the host enables the reports).
+ * Reports built (S06 hook) are counted from 1 s after the freeze to 2 s after
+ * the reinit, so a short "fresh" window is seen even with nobody reading. */
+static void sc_stale_gap(uint32_t period, double gap_s, bool held, bool wrap)
+{
+    init_res_t r = host_init(period);
+    if (!check_init(&r, "init")) return;
+    service_for(2000000u);
+    plant_on = false;
+    service_for(1000000u);                       /* stale before the gap */
+    uint32_t built0 = hk_built;
+    uint64_t gap_us = (uint64_t)(gap_s * 1e6);
+    if (wrap) gap_us = (1ull << 32) + 1000u - RST_LOW_US - (now - plant_seq_t);
+    if (held) { if (port_mode) port_reset(true); else bno_emu_set_reset(&emu, true, (uint32_t)now); }
+    advance(gap_us);                             /* host off: nobody reads */
+    uint32_t built_gap = hk_built - built0;
+    printf("stale_gap.held=%d\n", (int)held);    /* host_init's RST pulse releases it */
+    uint32_t skips0 = emu.st.stale_skips;
+    rx_clear();
+    r = host_init(period);                       /* host reset + init, plant frozen */
+    if (!check_init(&r, "reinit")) return;
+    service_for(2000000u);
+    uint32_t during = rx[0].n + rx[1].n + rx[2].n;
+    uint32_t built_frozen = hk_built - built0;
+    gap_s = (double)gap_us * 1e-6;
+    printf("stale_gap.release_age_s=%.6f\nstale_gap.age_end_s=%.6f\nstale_gap.built_in_gap=%u\n"
+           "stale_gap.built_while_frozen=%u\n", (double)(t_rst_release - plant_seq_t) * 1e-6,
+           (double)(now - plant_seq_t) * 1e-6, built_gap, built_frozen);
+    if (built_frozen != 0) fail("%u reports built on a sample frozen up to %.0f s", built_frozen, (double)(now - plant_seq_t) * 1e-6);
+    plant_on = true;
+    uint64_t t_back = now;
+    rx_clear();
+    service_for(3000000u);
+    double resume_ms = 0.0;
+    for (unsigned i = 0; i < BNO_EMU_N_SENSORS; i++) {
+        double ms = rx[i].n ? (double)(rx[i].t_first - t_back) * 1e-3 : 1e9;
+        if (ms > resume_ms) resume_ms = ms;
+    }
+    printf("stale_gap.gap_s=%.3f\nstale_gap.reports_after_reinit=%u\nstale_gap.skips_after_gap=%u\n"
+           "stale_gap.resume_ms=%.1f\n", gap_s, during, emu.st.stale_skips - skips0, resume_ms);
+    if (during != 0) fail("%u reports after reinit on a sample frozen %.0f s", during, gap_s);
+    if (emu.st.stale_skips == skips0) fail("emulator never skipped a stale report after the gap");
+    if (resume_ms > 2.0 * period * 1e-3 + 1.0) fail("reports resumed after %.1f ms", resume_ms);
+    check_data();
+}
+
+/* Core only, no host (14/11, CODE_RS4): RST held low while the age of a frozen
+ * sample passes 2^32 us, released 1 ms after; boot; sensor 0 enabled straight
+ * in the core at 50 ms, first report due at once, wrapped age about 22 ms, under
+ * the 150 ms stale threshold (a host faster than the SH-2 driver above, whose
+ * first report comes more than 150 ms after the release). No report may be
+ * built on the old sample; reports are built again once the plant moves. */
+static void sc_core_wrap(void)
+{
+    plant_on = false;
+    plant_seq = 1;                               /* one frozen sample, seq 1 */
+    if (port_mode) port_reset(true); else bno_emu_set_reset(&emu, true, (uint32_t)now);
+    advance((1ull << 32) + 1000u - now);
+    if (port_mode) port_reset(false); else bno_emu_set_reset(&emu, false, (uint32_t)now);
+    advance(emu.cfg.boot_delay_us + 1000u);
+    uint32_t built0 = hk_built;
+    emu.period_us[0] = 50000u;
+    emu.next_due_us[0] = (uint32_t)now;
+    advance(200000u);
+    uint32_t built = hk_built - built0;
+    int state = (int)emu.state;
+    plant_on = true;
+    advance(200000u);
+    uint32_t built_after = hk_built - built0 - built;
+    printf("core_wrap.state=%d\ncore_wrap.built_frozen=%u\ncore_wrap.built_after=%u\n", state, built, built_after);
+    if (state != BNO_EMU_RUNNING) fail("emulator not running after the release (state %d)", state);
+    if (built) fail("%u reports built on a sample frozen 2^32 us", built);
+    if (built_after == 0) fail("no report built after the plant moved");
+}
+
 /* S06 T8 (V3-1): IMU loss injected for 1.5 s in the middle of a run */
 static void sc_hold(uint32_t period)
 {
@@ -753,6 +844,10 @@ int main(int argc, char **argv)
     else if (strcmp(sc, "silent") == 0)    sc_silent(period);
     else if (strcmp(sc, "stale") == 0)     sc_stale(period);
     else if (strcmp(sc, "hold") == 0)      sc_hold(period);
+    else if (strcmp(sc, "stale_gap") == 0) sc_stale_gap(period, argc > 3 ? seconds : 3221.0,
+                                                        argc > 4 && strncmp(argv[4], "held", 4) == 0,
+                                                        argc > 4 && strcmp(argv[4], "held_wrap") == 0);
+    else if (strcmp(sc, "core_wrap") == 0) sc_core_wrap();
     else { printf("unknown scenario\n"); return 2; }
 
     /* S06 hook checks, every scenario */

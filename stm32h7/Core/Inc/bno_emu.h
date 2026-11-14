@@ -143,6 +143,8 @@ typedef struct {
     bool             have_sample;
     uint32_t         t_sample_us;               /* sample arrived              */
     uint32_t         t_seq_change_us;           /* sample seq last changed     */
+    bool             seq_old;                   /* seq unchanged >= 2^31 us: stale
+                                                   until it changes (bno_emu.c) */
 
     bno_emu_stats_t  st;
 

@@ -73,6 +73,45 @@ def test_frozen_plant_stops_reports(period, mode):
     assert kv['stale.reports_while_frozen'] == '0'
 
 
+@pytest.mark.parametrize('gap_s', [1000, 3221, 7430])
+@pytest.mark.parametrize('period', RATES)
+def test_frozen_plant_long_gap(period, gap_s, mode):
+    """Plant frozen for gap_s with nobody reading, then host reset + init (14/11):
+    no report on the old sample whatever the gap. The emulator clock is uint32 us
+    (wraps every 2^32 us); 1000 s is below 2^31 us, 3221 s between 2^31 and 2^32,
+    7430 s the bench gap of CLOSED_LOOP/2026-11-14_run02 (clock wraps inside it)."""
+    kv = run('stale_gap', period, gap_s, mode=mode)
+    assert kv['stale_gap.reports_after_reinit'] == '0'
+    assert kv['stale_gap.built_while_frozen'] == '0'
+    assert int(kv['stale_gap.skips_after_gap']) > 0
+    if gap_s == 7430:       # the age passed 2^32 us inside the gap, chip running
+        assert float(kv['stale_gap.age_end_s']) > 2**32 * 1e-6
+
+
+@pytest.mark.parametrize('how', ['held', 'held_wrap'])
+@pytest.mark.parametrize('period', RATES)
+def test_frozen_plant_long_gap_rst_held(period, how, mode):
+    """RST held low during the gap (host off): the sample keeps ageing while the
+    chip is in reset. 'held': 3221 s. 'held_wrap': the reinit releases RST 1 ms
+    after the age passes 2^32 us, so the wrapped age is near 0 while the host
+    enables the reports; no report may be built on the old sample."""
+    kv = run('stale_gap', period, 3221, how, mode=mode)
+    assert kv['stale_gap.held'] == '1'
+    assert kv['stale_gap.reports_after_reinit'] == '0'
+    assert kv['stale_gap.built_while_frozen'] == '0'
+    if how == 'held_wrap':
+        assert 0 < float(kv['stale_gap.release_age_s']) - 2**32 * 1e-6 < 0.01
+
+
+def test_core_rst_release_at_clock_wrap(mode):
+    """Core only, no host: RST released 1 ms after a frozen sample's age passes
+    2^32 us, a sensor (50 ms) enabled 21 ms later straight in the core, due at once: no report built
+    on the old sample (the latch must also run while the chip is in reset)."""
+    kv = run('core_wrap', mode=mode)
+    assert kv['core_wrap.built_frozen'] == '0'
+    assert int(kv['core_wrap.built_after']) > 0
+
+
 @pytest.mark.parametrize('period', RATES)
 def test_hold_imu_loss(period, mode):
     """S06 T8 (V3-1): during IMU loss injection no report is built (rpt_seq does not
