@@ -117,24 +117,29 @@ def test_core_rst_release_at_clock_wrap(mode):
     assert int(kv['core_wrap.age_enable_us']) == 2**32 + 1000 + 20_000 + 1000     # boot delay 20 ms, then 1 ms
 
 
+@pytest.mark.parametrize('sensor', [0, 1, 2])
 @pytest.mark.parametrize('how', ['read', 'disable'])
-def test_pending_report_not_built_once_stale(how, mode):
+def test_pending_report_not_built_once_stale(how, sensor, mode):
     """Codex BNOW-R1-1: reports that fell due on a fresh sample but wait behind an unread
     input packet are not built once the sample is stale: 'read' the host reads the
     queue after the threshold, with no report due then; 'disable' the host disables
     the only sensor first. With one sensor, the stale check drops the pending report
     anyway (pmin 0), so 'disable' does not show the drop in handle_control
-    (Codex BNOW-R2-1): test_disable_one_of_two_pending_sensors does."""
-    kv = run('pend_stale', how, mode=mode)
+    (Codex BNOW-R2-1): test_disable_one_of_two_pending_sensors does. Every sensor
+    index (Codex BNOW-R3-2)."""
+    kv = run('pend_stale', how, sensor, mode=mode)
+    assert kv['pend_stale.sensor'] == str(sensor)
     assert kv['pend_stale.pend_before'] == '1'
     assert kv['pend_stale.built_after_read'] == '0'
 
 
-def test_disable_one_of_two_pending_sensors(mode):
-    """Codex BNOW-R2-1: two sensors pending on a fresh sample; disabling sensor 0 drops
-    its pending report only (sensor 1 keeps its own), and after the read a report of
-    sensor 1 alone is built."""
-    kv = run('pend_two', mode=mode)
+@pytest.mark.parametrize('off,keep', [(0, 1), (1, 0), (1, 2), (2, 0)])
+def test_disable_one_of_two_pending_sensors(off, keep, mode):
+    """Codex BNOW-R2-1, R3-2: two sensors pending on a fresh sample; disabling sensor
+    'off' drops its pending report only ('keep' keeps its own), and after the read a
+    report of 'keep' alone is built."""
+    kv = run('pend_two', off, keep, mode=mode)
+    assert kv['pend_two.sensors'] == f'{off},{keep}'
     assert kv['pend_two.before'] == '1,1'
     assert kv['pend_two.after_disable'] == '0,1'
     assert kv['pend_two.built_after_read'] == '0,1'
@@ -151,8 +156,16 @@ def test_disable_one_of_two_pending_sensors(mode):
 ])
 def test_stale_threshold_edge(period, due_age, n, built, mode):
     """Codex BNOW-R1-2: a report due at sample age due_age is built exactly when
-    due_age < n x period (64-bit product) and under the 2^31 us latch."""
+    due_age < n x period (64-bit product) and under the 2^31 us latch. Codex
+    BNOW-R3-1: the core mode polls exactly at due_age (so 'at the latch' is the
+    edge itself, a latch 1 us later fails); the port mode polls on its 100 us ticks,
+    first within one tick after it."""
     kv = run('stale_edge', period, due_age, n, mode=mode)
+    first = int(kv['stale_edge.first_poll_age_us'])
+    if mode == 'core':
+        assert first == due_age
+    else:
+        assert due_age <= first < due_age + 100
     assert kv['stale_edge.built'] == str(built)
 
 
