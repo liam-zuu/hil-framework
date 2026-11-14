@@ -158,14 +158,16 @@ def test_stale_threshold_edge(period, due_age, n, built, mode):
     """Codex BNOW-R1-2: a report due at sample age due_age is built exactly when
     due_age < n x period (64-bit product) and under the 2^31 us latch. Codex
     BNOW-R3-1: the core mode polls exactly at due_age (so 'at the latch' is the
-    edge itself, a latch 1 us later fails); the port mode polls on its 100 us ticks,
-    first within one tick after it."""
+    edge itself, a latch 1 us later fails); the port mode polls on its 100 us ticks.
+    BNOW-R4-1: first_poll_age_us is the time the first poll at or after due_age saw;
+    in the port mode the tick runs at the harness step (20 us) that reaches it, so it
+    lies under one tick plus one step after due_age."""
     kv = run('stale_edge', period, due_age, n, mode=mode)
     first = int(kv['stale_edge.first_poll_age_us'])
     if mode == 'core':
         assert first == due_age
     else:
-        assert due_age <= first < due_age + 100
+        assert due_age <= first < due_age + 100 + 20
     assert kv['stale_edge.built'] == str(built)
 
 

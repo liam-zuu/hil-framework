@@ -188,6 +188,15 @@ static void plant_tick(void)
     }
 }
 
+/* stale_edge (Codex BNOW-R4-1): time of the first core poll at or after
+ * poll_mark (0 = not armed), as the core saw it (now at that call) */
+static uint64_t poll_mark, poll_seen;
+
+static void note_poll(void)
+{
+    if (poll_mark && !poll_seen && now >= poll_mark) poll_seen = now;
+}
+
 static void advance(uint64_t us)
 {
     uint64_t end = now + us;
@@ -198,10 +207,12 @@ static void advance(uint64_t us)
         if (port_mode) {
             while (now >= port_next_tick) {
                 port_next_tick += PORT_TICK_US;
-                port_tick();
+                port_tick();                        /* polls with now, not the tick time */
+                note_poll();
             }
         } else {
             bno_emu_poll(&emu, (uint32_t)now);
+            note_poll();
         }
         sync_int();
         if (guard_on && now >= guard_until) longjmp(abort_jmp, 1);
@@ -824,13 +835,17 @@ static void sc_stale_edge(uint32_t period_us, uint32_t due_age_us, uint32_t n)
     emu.period_us[0] = period_us;
     emu.next_due_us[0] = (uint32_t)(t_c + due_age_us);
     uint32_t built0 = hk_built;
-    /* Codex BNOW-R3-1: the core mode polls at the end of every advance(), so it
-     * polls exactly at sample age due_age_us; the port mode polls on its 100 us
-     * ticks, first at or after it (printed) */
+    /* Codex BNOW-R3-1, R4-1: the core mode polls at the end of every advance(),
+     * so it polls exactly at sample age due_age_us; the port mode polls on its
+     * 100 us ticks, with the now of the advance() step that reaches the tick.
+     * The time printed is the one the first poll at or after the due age saw. */
+    poll_mark = t_c + due_age_us;
+    poll_seen = 0;
     advance(t_c + due_age_us - now);
-    uint64_t poll_t = port_mode ? (port_next_tick - PORT_TICK_US) : now;   /* last poll so far */
-    if (poll_t < t_c + due_age_us) poll_t = port_next_tick;                /* the next tick polls it */
     advance(200u);
+    uint64_t poll_t = poll_seen;
+    poll_mark = 0;
+    if (!poll_t) fail("no poll within 200 us of the due age");
     uint32_t built = hk_built - built0;
     printf("stale_edge.period_us=%u\nstale_edge.due_age_us=%u\nstale_edge.stale_periods=%u\n"
            "stale_edge.first_poll_age_us=%llu\nstale_edge.built=%u\n",
