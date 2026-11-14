@@ -8,6 +8,7 @@ scenario comes from FAKE_RUN_HIL; STOP is the line 'STOP' on stdin (test stop_fn
   miso_bad   as ok, with crc_bad=2 in the #miso line
   tail_cut   as ok (completed), but exit 3 (END tail cut, hil_node.run_failed)
   hang       PREPARE, then ignores STOP (stdin and SIGINT) and sleeps 60 s: only a kill ends it
+  orphan     PREPARE, then exits 0 at once; a child holds stdout FAKE_ORPHAN_S s (default 3)
 FAKE_HOLD_FILE: wait until that file exists before the first line (a STOP before any #phase).
 Probe calls (--fixed-omega in argv): '#miso' line only, crc_bad from FAKE_PROBE (ok / bad / none;
 hang = sleeps 60 s).
@@ -62,6 +63,11 @@ def main():
             signal.signal(signal.SIGINT, signal.SIG_IGN)
         time.sleep(60)
         return 9
+    if scen == 'orphan':                        # owner exits, a child keeps the stdout pipe
+        import subprocess
+        subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(%s)'
+                          % os.environ.get('FAKE_ORPHAN_S', '3')], stdout=sys.stdout, stderr=sys.stdout)
+        return 0
     time.sleep(0.05)
     if scen == 'crash':
         return 1

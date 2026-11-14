@@ -629,3 +629,67 @@ def test_epoch_is_taken_only_once_the_uart_opens(tmp_path, monkeypatch):
     hil_daemon._serve_panel(a, d, Serial, lambda epoch, daemon, w, baud: None, lambda port: None,
                             lambda port, link: events.append('serve'))
     assert events == ['open', 'open', 'open', 'epoch', 'serve']
+
+
+# ── Codex round 3 (14/11): PPI-R3-1 … R3-3 ──
+
+def test_group_that_cannot_be_reaped_finishes_the_run_without_eof(tmp_path, monkeypatch):
+    """PPI-R3-2: the owner exits, a child keeps the pipe and (as patched here) the group cannot
+    be reaped: the run is finished at once with E_GROUP, START and probes are refused, and the
+    reader's later EOF finishes nothing again."""
+    import hil_daemon
+    monkeypatch.setattr(hil_daemon, '_reap_group', lambda pgid, wait_s=0: False)
+    monkeypatch.setenv('FAKE_RUN_HIL', 'orphan')
+    monkeypatch.setenv('FAKE_ORPHAN_S', '3')
+    monkeypatch.setenv('FAKE_PROBE', 'ok')
+    d = make(tmp_path)
+    t0 = time.monotonic()
+    assert d.start(0) == pp.RES_OK
+    reader = d._reader
+    s = wait_for(d, (pp.ST_ERROR,), timeout=5)
+    assert time.monotonic() - t0 < 2.5 and reader.is_alive()           # before the pipe's EOF
+    assert s.error_code == hil_daemon.E_GROUP and d._wedged and d.proc is None
+    assert run_meta(d)['group_gone'] is False
+    assert d.start(0) == pp.RES_BUSY and d.probe_h7() is False
+    reader.join(10)
+    assert not reader.is_alive() and d.snapshot().error_code == hil_daemon.E_GROUP
+
+
+def test_probe_started_while_shutdown_begins_is_killed(tmp_path, monkeypatch):
+    """PPI-R3-1: shutdown begins between the probe's Popen and the publication of its handle:
+    the probe sees closing and kills its own child."""
+    import subprocess
+    import hil_daemon
+    monkeypatch.setenv('FAKE_PROBE', 'hang')
+    levels = []
+
+    def stop_fn(proc, level):
+        levels.append(level)
+        proc.kill()
+    d = make(tmp_path, stop_fn=stop_fn)
+    real_popen = subprocess.Popen
+
+    class Gate(real_popen):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            d._closing = True                     # shutdown arrives right here
+    monkeypatch.setattr(hil_daemon.subprocess, 'Popen', Gate)
+    t0 = time.monotonic()
+    assert d.probe_h7() is False
+    assert time.monotonic() - t0 < 10 and 2 in levels and not d._probing and not d._wedged
+
+
+def test_reset_panel_failing_say_still_closes_the_chip_and_keeps_ctrl_c():
+    """PPI-R3-3: Ctrl+C during the pulse, the release fails and printing fails too: the chip is
+    still closed and the KeyboardInterrupt is what comes out."""
+    from hil_daemon import reset_panel
+    lg = FakeLgpio(fail='in')
+
+    def interrupted(_s):
+        raise KeyboardInterrupt
+
+    def broken_say(*a, **k):
+        raise BrokenPipeError('stdout gone')
+    with pytest.raises(KeyboardInterrupt):
+        reset_panel(22, 4, 0.1, lg=lg, sleep=interrupted, say=broken_say)
+    assert lg.calls[-1] == ('close', 7)

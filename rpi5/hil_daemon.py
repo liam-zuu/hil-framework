@@ -253,17 +253,22 @@ def reset_panel(gpio: int = PANEL_RESET_GPIO, chip: int = RPI5_GPIOCHIP, low_s: 
         except Exception as exc:
             result = f'failed: GPIO{gpio}: {exc}'
     finally:
-        if pulled:
-            try:
-                lg.gpio_free(h, gpio)
-                lg.gpio_claim_input(h, gpio)      # left an input after close (RP1 may keep outputs)
-            except Exception as exc:
-                result = f'failed: GPIO{gpio} release: {exc} (EN may stay low: check the wire)'
-                say('panel reset ' + result, flush=True)
         try:
-            lg.gpiochip_close(h)
-        except Exception:
-            pass
+            if pulled:
+                try:
+                    lg.gpio_free(h, gpio)
+                    lg.gpio_claim_input(h, gpio)  # left an input after close (RP1 may keep outputs)
+                except Exception as exc:
+                    result = f'failed: GPIO{gpio} release: {exc} (EN may stay low: check the wire)'
+                    try:                          # PPI-R3-3: a failing say never cuts the cleanup
+                        say('panel reset ' + result, flush=True)
+                    except Exception:
+                        pass
+        finally:
+            try:
+                lg.gpiochip_close(h)
+            except Exception:
+                pass
     return result
 
 
@@ -376,8 +381,9 @@ class HilDaemon:
                 return pp.RES_FAILED
             self._meta['pid'] = self.proc.pid
             self._enter(pp.ST_PREPARE)
-            threading.Thread(target=self._watch_owner, args=(self.proc,), name='run-owner', daemon=True).start()
-            self._reader = threading.Thread(target=self._read, args=(self.proc,), daemon=True)
+            acc = {'summary': None, 'miso': None, 'last': None}   # this run's results, shared by both
+            threading.Thread(target=self._watch_owner, args=(self.proc, acc), name='run-owner', daemon=True).start()
+            self._reader = threading.Thread(target=self._read, args=(self.proc, acc), daemon=True)
             self._reader.start()
             return pp.RES_OK
 
@@ -433,6 +439,9 @@ class HilDaemon:
                 return self._probe_result('')
             with self._lock:
                 self._probe_proc = p
+                closing = self._closing             # PPI-R3-1: shutdown began before p was published
+            if closing:
+                self._kill_probe(p)
             try:
                 text, _ = p.communicate(timeout=timeout_s)
             except subprocess.TimeoutExpired:
@@ -518,16 +527,24 @@ class HilDaemon:
                     self._signal(proc, 2)
             time.sleep(0.05)
 
-    def _watch_owner(self, proc) -> None:
+    def _watch_owner(self, proc, acc: dict) -> None:
         """Run thread (PPI-R2-1): as soon as the owner run_hil.py exits, by itself or killed,
         reap its process group (wait REAP_S, then SIGKILL), without waiting for the reader's EOF:
         a child of the group that still holds the stdout pipe would otherwise keep the reader,
-        so the run, open for ever. The reader then sees EOF and finishes the run."""
+        so the run, open for ever. The reader then sees EOF and finishes the run.
+        PPI-R3-2: if the group will not go even by SIGKILL (a process stuck in the kernel still
+        holding the pipe, so no EOF may ever come), the run is finished here with E_GROUP and
+        START / probes are refused (_wedged); the reader, if it ever gets EOF, finishes nothing
+        again (both finish only while self.proc is this proc)."""
         try:
             proc.wait()
         except Exception:
             return
-        _reap_group(proc.pid if _spawn_kw() else None)
+        if _reap_group(proc.pid if _spawn_kw() else None):
+            return
+        with self._lock:
+            if self.proc is proc:
+                self._finish(proc.returncode, acc.get('summary'), acc.get('miso'), acc.get('last'), False)
 
     def shutdown(self, wait_s: float = SHUTDOWN_S) -> bool:
         """Daemon stop (Ctrl+C, systemd SIGINT, a fatal error of the panel link; PPI-2, PPI-R2-2):
@@ -537,16 +554,18 @@ class HilDaemon:
         with self._lock:
             self._closing = True
             active = self.proc is not None
-            probe = self._probe_proc
         if active:
             self.stop()
-        if probe is not None:
-            self._kill_probe(probe)
+        killed = None
         t_end = time.monotonic() + wait_s
         while time.monotonic() < t_end:
             with self._lock:
                 if self.proc is None and not self._probing:
                     return not self._wedged
+                probe = self._probe_proc            # read again each time (PPI-R3-1)
+            if probe is not None and probe is not killed:
+                self._kill_probe(probe)
+                killed = probe
             time.sleep(0.05)
         return False
 
@@ -616,11 +635,12 @@ class HilDaemon:
         if m:
             self._meta['swa_mode'] = m.group(1)    # what SWA did in this panel run (I8)
 
-    def _read(self, proc) -> None:
+    def _read(self, proc, acc: Optional[dict] = None) -> None:
         """Reader thread: every line to run_hil.log, parsed for the panel; then the end. A log
         that cannot be written (full card), or a line the parser chokes on, never stops the
         reader (PPI-6): the output is still drained, the run still finished, the error kept."""
-        acc = {'summary': None, 'miso': None, 'last': None}
+        if acc is None:
+            acc = {'summary': None, 'miso': None, 'last': None}
         logf, errors = None, []
         try:
             try:
@@ -657,9 +677,10 @@ class HilDaemon:
                 rc = None
             gone = _reap_group(proc.pid if _spawn_kw() else None)
             with self._lock:
-                if errors:
-                    self._meta['reader_errors'] = errors[:20]
-                self._finish(rc, acc['summary'], acc['miso'], acc['last'], gone)
+                if self.proc is proc:               # not finished yet by _watch_owner (PPI-R3-2)
+                    if errors:
+                        self._meta['reader_errors'] = errors[:20]
+                    self._finish(rc, acc['summary'], acc['miso'], acc['last'], gone)
 
     def _finish(self, rc: Optional[int], summary: Optional[dict], miso, last, group_gone: bool = True) -> None:
         self._meta.update(run_summary=summary, miso=miso, group_gone=group_gone)
@@ -711,14 +732,15 @@ def main(argv=None) -> int:
     ap.add_argument('--panel-reset-gpio', type=int, default=PANEL_RESET_GPIO,
                     help='BCM GPIO wired to the panel EN (pulled low once at start); -1 = no wire')
     ap.add_argument('--lock-dir', default=os.path.expanduser('~/.hil_panel_locks'),
-                    help='one daemon per machine: its lock file lives here (tests only change it)')
+                    help='lock folder: one daemon per account and folder (never change it in use)')
     a = ap.parse_args(argv)
     os.makedirs(a.runs_dir, exist_ok=True)
     import serial  # pyserial
     from panel_link import PanelLink, nonblocking_writer, serve
-    # PPI-7, PPI-R2-4: ONE daemon on this machine (one panel, one H7 per bench), whatever the
-    # port name or epoch file: a fixed lock (--lock-dir, default ~/.hil_panel_locks), plus the
-    # epoch file's owner lock; both taken before anything touches the panel or the H7.
+    # PPI-7, PPI-R2-4, PPI-R3-4: one daemon per user account and lock folder (default
+    # ~/.hil_panel_locks; the bench has one account, liam-zuu, also the systemd User=), whatever
+    # the port name or epoch file, plus the epoch file's owner lock; both taken before anything
+    # touches the panel or the H7. Two accounts, or a changed --lock-dir, are NOT kept apart.
     os.makedirs(a.lock_dir, exist_ok=True)
     with pp._FileLock(os.path.join(a.lock_dir, 'hil_daemon.lock'), timeout_s=0.5), \
             pp._FileLock(a.epoch_file + '.owner', timeout_s=0.5):
