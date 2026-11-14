@@ -334,7 +334,7 @@ def test_b81_3_time_just_below_zero_is_the_first_frame():
     a = 400.00000000000216
     k0 = int(math.ceil(a - 1e-9))
     t_first = (k0 - a) * 1e-3
-    assert k0 == 400 and -H.G1_T_NEG_TOL <= t_first < 0.0
+    assert k0 == 400 and -H.G1_T_NEG_STEPS * 1e-3 <= t_first < 0.0
     out = dict(completed='false', t_end=11.9, t_deadline=12.0, t_first_track_err=t_first, t_progress=NAN,
                cond2_5_ever=False, log_covers_deadline=True)
     g1 = H.add_b81_3(_gate_stub('false'), out)['g1']
@@ -347,10 +347,23 @@ def test_b81_3_time_just_below_zero_is_the_first_frame():
     # progress at the same (negative) time as t1 is not before it: compared on the evaluator's own times
     out.update(t_progress=t_first, completed='false')
     assert H.add_b81_3(_gate_stub('false'), out)['g1']['prog_before_t1'] is False
-    out.update(t_first_track_err=-1e-6)
-    with pytest.raises(ValueError, match='B81-3: time .* below 0'):
-        H.add_b81_3(_gate_stub('false'), out)
-    assert H._g1_time(None) is None and H._g1_time(0.0) == 0.0 and H._g1_time(-H.G1_T_NEG_TOL) == 0.0
+    for bad in (-1e-6, -5e-10, -2.1e-12):            # Codex B813-R2-1: -5e-10 is 500 x the 1 ms rounding bound
+        out.update(t_first_track_err=bad)
+        with pytest.raises(ValueError, match='B81-3: time .* below 0'):
+            H.add_b81_3(_gate_stub('false'), out, 1e-3)
+    assert H._g1_time(None, 1e-3) is None and H._g1_time(0.0, 1e-3) == 0.0 and H._g1_time(3.0, 1e-3) == 3.0
+    assert H._g1_time(-2e-12, 1e-3) == 0.0 and H._g1_time(-2e-9, 1.0) == 0.0     # the bound scales with the period
+    with pytest.raises(ValueError):
+        H._g1_time(-2e-9, 1e-3)
+    # every k0 the scorer can choose: a just above / below an integer, small and large step indices (Codex R2-1:
+    # a = 10000.000000001 gives t(k0) = -1.0004e-12 s, beyond the exact -1e-12 by float rounding)
+    for base in (0, 400, 10000, 30000, 10 ** 6):
+        for d in (0.0, 2.16e-12, 1e-9, 1e-9 + 1e-15, 0.99e-9, -1e-12, 0.5, 0.999999999):
+            a = base + d
+            k0 = int(math.ceil(a - 1e-9))
+            for per in (1e-3, 5e-4, 2e-3):
+                t = (k0 - a) * per
+                assert H._g1_time(t, per) >= 0.0, (a, per, t)
 
 
 def test_b81_3_k1_run(tmp_path):

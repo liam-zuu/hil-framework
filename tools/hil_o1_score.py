@@ -54,8 +54,8 @@ gate_v3 block also holds
   cond2_5_ever of evaluate_v7 / evaluate_k, the same comparisons that give 'completed'); they are copied here.
   g2..g5 'chung' {q, lo, hi, n_undef}: the common frame domain, equal to the union one on HIL (one way, O1 3.3).
   G1 is recomputed from these fields (as rq3_log.gate_g1_state) and must agree with g1.state, else exit 2.
-  Times are written >= 0: a time within G1_T_NEG_TOL below 0 (the first scored frame after the mapped edge,
-  rounding of the k0 choice) is written 0.0, one further below is an error (Codex B813-R1-1).
+  Times are written >= 0: a time within G1_T_NEG_STEPS x period below 0 (the first scored frame after the
+  mapped edge, rounding of the k0 choice) is written 0.0, one further below is an error (Codex B813-R1-1, R2-1).
   Short log (L85 Q1 turned 'false' into 'inconclusive'): the fields cannot say "not known", so none is written
   (all null, g1_fields_note says why; G1 stays chua_ket_luan from q; Liam 15/11 CODE_RS4 local_3b1a170b,
   "Không ghi số chi tiết (Recommended)").
@@ -164,7 +164,8 @@ def tool_error(manifest, mosi, allow_pre_b81_15=False):
 G1_FIELDS = ('t_done', 't_deadline', 't1', 'prog_before_t1', 'cond25_before_deadline')   # B81-3, one way (HIL)
 
 
-G1_T_NEG_TOL = 1e-9                    # s: t of the first scored frame may be below 0 by rounding (B813-R1-1)
+G1_T_NEG_STEPS = 2e-9                  # steps: k0 = ceil(a - 1e-9) puts the first frame >= -1e-9 step before t = 0;
+                                       # twice that covers float rounding (Codex B813-R1-1, R2-1)
 
 
 def _opt_time(x):
@@ -172,15 +173,17 @@ def _opt_time(x):
     return float(x) if x is not None and not isinstance(x, bool) and math.isfinite(float(x)) else None
 
 
-def _g1_time(t):
+def _g1_time(t, period_s):
     """A time written in a B81-3 field (rq3_log wants >= 0). With the edge mapped, k0 = ceil(a - 1e-9) so the
-    first scored frame has t = (k0 - a) x period >= -1e-9 x period (about -1e-12 s): such a time is that frame at
-    t = 0 and is written 0.0 (Codex B813-R1-1); a time further below 0 is an error. None stays None."""
+    first scored frame has t = (k0 - a) x period >= -1e-9 x period (about -1e-12 s at 1 ms), plus float rounding:
+    a time within G1_T_NEG_STEPS x period below 0 is that frame at t = 0 and is written 0.0 (Codex B813-R1-1,
+    R2-1); a time further below 0 is an error. None stays None."""
     if t is None or t >= 0.0:
         return t
-    if t >= -G1_T_NEG_TOL:
+    if t >= -G1_T_NEG_STEPS * float(period_s):
         return 0.0
-    raise ValueError(f'B81-3: time {t!r} s below 0 (more than the rounding of the k0 choice)')
+    raise ValueError(f'B81-3: time {t!r} s below 0 (more than the rounding of the k0 choice, '
+                     f'{G1_T_NEG_STEPS:g} step x {period_s!r} s)')
 
 
 def g1_state_from_fields(g1):
@@ -191,9 +194,10 @@ def g1_state_from_fields(g1):
     return 'chua_ket_luan' if g1['cond25_before_deadline'] else 'khong_dat'
 
 
-def add_b81_3(gate, out):
+def add_b81_3(gate, out, period_s=1e-3):
     """In place on the gate_v3 block (module docstring, B81-3): the common domain of g2..g5 and the G1 fields
-    from the evaluator summary out. Raises ValueError when G1 from the fields differs from g1.state."""
+    from the evaluator summary out (period_s: the plant step of the run, for _g1_time). Raises ValueError when G1
+    from the fields differs from g1.state."""
     for c in o1_gate.MEASURED:
         gate[c]['chung'] = {k: gate[c][k] for k in ('q', 'lo', 'hi', 'n_undef')}
     g1 = gate['g1']
@@ -204,8 +208,9 @@ def add_b81_3(gate, out):
         return gate
     t1 = _opt_time(out.get('t_first_track_err'))
     t_prog = _opt_time(out.get('t_progress'))
-    g1.update(t_deadline=_g1_time(float(out['t_deadline'])),
-              t_done=[_g1_time(float(out['t_end'])) if out.get('completed') == 'true' else None], t1=_g1_time(t1),
+    g1.update(t_deadline=_g1_time(float(out['t_deadline']), period_s),
+              t_done=[_g1_time(float(out['t_end']), period_s) if out.get('completed') == 'true' else None],
+              t1=_g1_time(t1, period_s),
               prog_before_t1=None if t1 is None else bool(t_prog is not None and t_prog < t1),   # evaluator times
               cond25_before_deadline=None if t1 is None else bool(out['cond2_5_ever']))
     st = g1_state_from_fields(g1)
@@ -259,7 +264,7 @@ def score(path, task, allow_final_set=False, esp_log=None, allow_pre_b81_15=Fals
         v_max, wz_max = o1_gate.k_cmd_max(o1_lanes.KSchedule(task))
     out['gate_v3'] = o1_gate.gate(frames, out['completed'], v_cmd_max=v_max, wz_cmd_max=wz_max, u_t=u_t,
                                   decide=decide, status=out.get('status', ''), note=note)
-    add_b81_3(out['gate_v3'], out)                                       # B81-3 (module docstring)
+    add_b81_3(out['gate_v3'], out, period)                               # B81-3 (module docstring)
     mc = manifest.get('miso_check') or {}
     out.update(frame_log=os.path.basename(path), k0=k0, k_run=k_run, t0_step=a, t0_src=t0_src,
                frames_scored=int(len(state) - k0), edge_map=em,
