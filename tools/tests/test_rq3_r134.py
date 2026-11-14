@@ -114,3 +114,31 @@ def test_next_iter_no_counts_the_open_run_of_the_same_session(ds):
     assert m['run_uid'] == 'MACHINE:2' and e['run_uid'] == 'MACHINE:1' and len(set(uids)) == len(uids)
     assert rl.next_iter_no(d, 'MACHINE') == 3
     rl.summary(d)
+
+
+def _answer_file(path, boot='4753dc47', t=(1.0, 2.0), pc=True):
+    path.write_text((f'#query_pc,t_start={t[0]},t_end={t[1]}\n' if pc else '') + ANSWER.format(b=boot), encoding='utf-8')
+    return str(path)
+
+
+@pytest.mark.parametrize('case', ['same_file', 'no_pc_line', 'wrong_order'])
+def test_cli_end_checks_the_two_answers_like_the_scorers(ds, tmp_path, case):
+    """R134C3-3 (Codex counterexample): one file given for both, a file without '#query_pc', or the two in
+    the wrong order: not two questions around the run, so only hong_he_do with boot_thieu_hay_khac."""
+    d, clock = ds
+    _open(d, clock)
+    qb = _answer_file(tmp_path / 'qb.txt', pc=case != 'no_pc_line')
+    qa = {'same_file': qb, 'no_pc_line': _answer_file(tmp_path / 'qa.txt', t=(3, 4)),
+          'wrong_order': _answer_file(tmp_path / 'qa.txt', t=(0.0, 0.5))}[case]
+    assert rl.main(['--dataset', d, 'end', '--outcome', 'khong_dat', '--query-before', qb, '--query-after', qa]) == 2
+    assert rl.main(['--dataset', d, 'end', '--outcome', 'hong_he_do', '--fail-cause', rl.BOOT_FAIL,
+                    '--query-before', qb, '--query-after', qa]) == 0
+    assert _rows(d)[-1]['fail_cause'] == rl.BOOT_FAIL
+
+
+def test_cli_end_accepts_two_proper_answers(ds, tmp_path):
+    d, clock = ds
+    _open(d, clock)
+    qb, qa = _answer_file(tmp_path / 'qb.txt'), _answer_file(tmp_path / 'qa.txt', t=(3.0, 4.0))
+    assert rl.main(['--dataset', d, 'end', '--outcome', 'khong_dat', '--query-before', qb, '--query-after', qa]) == 0
+    assert (_rows(d)[-1]['boot_before'], _rows(d)[-1]['boot_after']) == ('4753dc47', '4753dc47')

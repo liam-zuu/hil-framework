@@ -229,6 +229,24 @@ def _meminfo(path='/proc/meminfo'):
     return out.get('MemAvailable'), out.get('MemTotal')
 
 
+def mem_snapshot_setup():
+    """main(), before the processes start (S06 T2 B1): the path of the plant snapshot in the temporary folder,
+    stale files removed, put in HIL_MEM_SNAPSHOT for the plant process. Any error (no usable temporary folder,
+    a stale file that cannot be removed): a warning, HIL_MEM_SNAPSHOT unset, None (R134C2-6, R134C3-6)."""
+    try:
+        import tempfile
+        path = os.path.join(tempfile.gettempdir(), f'hil_mem_{os.getpid()}.json')
+        for stale in (path, path + '.tmp'):
+            if os.path.exists(stale):
+                os.remove(stale)
+        os.environ[MEM_SNAPSHOT_ENV] = path
+        return path
+    except Exception as exc:              # noqa: BLE001 (report only)
+        logging.getLogger('hil.main').warning('Memory snapshot (S06 T2 B1) not set up: %s', exc)
+        os.environ.pop(MEM_SNAPSHOT_ENV, None)
+        return None
+
+
 def plant_mem_snapshot(path=None, status='/proc/self/status', meminfo='/proc/meminfo'):
     """S06 T2 B1 (Liam 12/11 THESIS local_f4d7c6ff, spec S06 T2 '[B1]'; R134 package, Liam 14/11 CODE_R134
     "duyet goi sua code fix/r134-answers"; Codex R134C-12, Liam 14/11 "Sua + vong 2 (Recommended)"; CODE 14/11
@@ -658,17 +676,7 @@ def main() -> int:
         plant_src_before = plant_source()
 
     # S06 T2 B1 (R134C-12): where the plant process writes its memory snapshot (inherited environment)
-    import tempfile
-    mem_path = os.path.join(tempfile.gettempdir(), f'hil_mem_{os.getpid()}.json')
-    try:                                   # R134C2-6: a memory report never stops the run
-        for stale in (mem_path, mem_path + '.tmp'):
-            if os.path.exists(stale):
-                os.remove(stale)
-        os.environ[MEM_SNAPSHOT_ENV] = mem_path
-    except OSError as exc:
-        log.warning('Memory snapshot (S06 T2 B1) not set up: %s', exc)
-        os.environ.pop(MEM_SNAPSHOT_ENV, None)
-        mem_path = None
+    mem_path = mem_snapshot_setup()        # R134C2-6, R134C3-6: a memory report never stops the run
     for proc in procs:
         proc.start()
         log.info("  %s  pid=%d", proc.name, proc.pid)

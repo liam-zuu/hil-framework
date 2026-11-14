@@ -193,7 +193,7 @@ def test_stop_timer_cancelled_before_the_question_after(tmp_path, monkeypatch):
             self.alive = False
 
         def join(self, t=None):
-            pass
+            order.append('join')                                      # R134C3-5: after the question after
 
     def sleep(s):
         clock['t'] += s
@@ -212,6 +212,6 @@ def test_stop_timer_cancelled_before_the_question_after(tmp_path, monkeypatch):
         return dict(boot='4753dc47', mac='aa')
     monkeypatch.setattr(B, 'gain_query', fake_query)
     B.bench(a)
-    assert 'stop' not in order and order[:3] == ['q_before', 'run_end', 'q_after'], order
+    assert 'stop' not in order and order[:4] == ['q_before', 'run_end', 'q_after', 'join'], order
     s = json.load(open(os.path.join(a.out, 'session.json'), encoding='utf-8'))
     assert 'không gửi' in s['runs'][0]['pi_stop']['note']

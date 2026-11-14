@@ -417,9 +417,23 @@ def test_order_of_arrival_does_not_matter():
     reordered = ev[:6] + stamp(['#run_end,seq=90,last_data_seq=89,log_qdrop=0'], '2026-11-14T10:00:00.006') + ev[6:]
     r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), events=reordered)
     assert r['tv_duty'] == pytest.approx(4.0), r['reason']
-    late = ev[:8] + stamp(['#us_end,boot=4753dc47,on=0', '#run_end,seq=1200,last_data_seq=1199'],
-                          '2026-11-14T10:00:10') + ev[8:]
+    late = ev[:8] + stamp(['#us_end,boot=4753dc47,on=0', '#run_end,seq=1200,last_data_seq=1199',
+                           US.format(boot='4753dc47', seq=s0)], '2026-11-14T10:00:10')     # read late: late time
     r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), events=late)
+    assert r['tv_duty'] == pytest.approx(4.0), r['reason']                # an early copy is still there
+
+
+def test_only_a_late_start_copy_left():
+    """R134C3-2 (Codex): only a copy of '#us,ev=start' read late (> 0.5 s) is left: without boot on '#gain'
+    (firmware 16702ff) the run is refused (limit, DEFERRED); with boot on '#gain' it is the run."""
+    L = _clean()
+    s0 = _first(L)
+    gains = start_events(s0)[3:6]
+    late_us = stamp([US.format(boot='4753dc47', seq=s0)], '2026-11-14T10:00:00.700')
+    r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), events=gains + late_us)
+    assert r['tv_duty'] is None and 'within 0.5 s' in r['reason']
+    with_boot = [x + ',boot=4753dc47' for x in gains]
+    r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), events=with_boot + late_us)
     assert r['tv_duty'] == pytest.approx(4.0), r['reason']
 
 

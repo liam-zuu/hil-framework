@@ -57,12 +57,22 @@ def test_no_snapshot_path_is_a_note():
     assert 'no snapshot' in mem_report(None, 1)['note']
 
 
-def test_setup_of_the_snapshot_cannot_stop_the_run():
-    """R134C2-6: the stale-file removal and the environment variable are inside a try in main()."""
-    src = inspect.getsource(run_hil.main)
-    i = src.index('mem_path = os.path.join(tempfile.gettempdir()')
-    block = src[i:src.index('for proc in procs:', i)]
-    assert 'try:' in block and 'except OSError' in block and 'mem_path = None' in block
+def test_setup_of_the_snapshot(tmp_path, monkeypatch):
+    """R134C2-6, R134C3-6: mem_snapshot_setup gives the path and sets HIL_MEM_SNAPSHOT; no usable temporary
+    folder, or a stale file that cannot be removed: None, the variable unset, no exception."""
+    import tempfile
+    monkeypatch.setattr(tempfile, 'gettempdir', lambda: str(tmp_path))
+    p = run_hil.mem_snapshot_setup()
+    assert p and os.environ[MEM_SNAPSHOT_ENV] == p
+    os.makedirs(p)                                                    # a stale "file" that os.remove cannot take
+    assert run_hil.mem_snapshot_setup() is None and MEM_SNAPSHOT_ENV not in os.environ
+    os.rmdir(p)
+
+    def no_tmp():
+        raise FileNotFoundError('no usable temporary directory')
+    monkeypatch.setattr(tempfile, 'gettempdir', no_tmp)
+    assert run_hil.mem_snapshot_setup() is None and MEM_SNAPSHOT_ENV not in os.environ
+    assert 'mem_path = mem_snapshot_setup()' in inspect.getsource(run_hil.main)     # main uses it
 
 
 def test_no_snapshot_gives_none_and_a_note(tmp_path):

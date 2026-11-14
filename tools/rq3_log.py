@@ -781,12 +781,15 @@ def boot_problem(before, after) -> Optional[str]:
 
 def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Optional[float] = None,
         fail_cause: str = '', results_dir: str = '', notes: str = '', gate: Optional[dict] = None,
-        gate_sha256: str = '', boot_before: Optional[str] = None, boot_after: Optional[str] = None) -> dict:
+        gate_sha256: str = '', boot_before: Optional[str] = None, boot_after: Optional[str] = None,
+        query_problem: Optional[str] = None) -> dict:
+    """query_problem (R134C3-3): why the two query answer files given on the command line are not two
+    questions before and after the run (gain_line_check.query_problem); handled as missing / different boot."""
     run = _require_open(ds)
     if outcome not in OUTCOMES:
         raise LogError(f'--outcome one of {OUTCOMES}')
-    asked = boot_before is not None or boot_after is not None
-    bbad = boot_problem(boot_before, boot_after) if asked else None
+    asked = boot_before is not None or boot_after is not None or query_problem is not None
+    bbad = query_problem or (boot_problem(boot_before, boot_after) if asked else None)
     if not asked and fail_cause == BOOT_FAIL:          # R134C2-7: no answer at all = both missing
         bbad = boot_problem('', '')
     if bbad and not (outcome == 'hong_he_do' and fail_cause == BOOT_FAIL):   # R134 (b)
@@ -1644,7 +1647,10 @@ def main(argv=None) -> int:
                                f'judged {a.outcome} needs --query-before and --query-after (gain_send.py --query '
                                'outputs around the run; S05 4.7 (iv), R3V-9, O1 R4)')
             if a.query_before or a.query_after:
-                boots = dict(boot_before=s5.read_boot(a.query_before) or '', boot_after=s5.read_boot(a.query_after) or '')
+                import gain_line_check as glc            # R134C3-3: the checks of the two answers, as the scorers do
+                qb, qa = glc.read_query(a.query_before), glc.read_query(a.query_after)
+                boots = dict(boot_before=(qb or {}).get('boot', ''), boot_after=(qa or {}).get('boot', ''),
+                             query_problem=glc.query_problem(qb, qa, check_run_boot=False))
             row = end(ds, a.outcome, a.completed, a.e_perp_max, a.fail_cause, a.results_dir, a.notes,
                       gate=read_gate_json(a.gate_json) if a.gate_json else None,
                       gate_sha256=sha256_file(a.gate_json) if a.gate_json else '', **boots)

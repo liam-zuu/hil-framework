@@ -34,7 +34,14 @@ boot is older by at least the boot time of the ESP32. Order of arrival is not us
 line without a readable time does not count. Their gain content (id, applied_n, ctrl, the 7 gains,
 first_seq) must agree; line_drop is reported (largest), not compared (R134C-5). Limit (R134C2-4,
 DEFERRED): a run whose '#us,ev=start' was dropped by the firmware (queue full, logger.c 88) has no boot
-evidence and fails, although its '#gain' lines are there.
+evidence and fails, although its '#gain' lines are there. Limit (Codex round 3 R134C3-1, -2): a receive
+time does not prove the source of a line (a line of an earlier boot read late by a stalled logger could
+fall in the window; a valid line read more than GAIN_US_WINDOW_S late is refused).
+'#gain' with boot (Liam 14/11 CODE_R134, hop chon, nguyen van "Them boot vao #gain"; firmware change
+scheduled by CODE, not in AGV 16702ff): a '#gain' line may carry a field boot=<hex> anywhere after ctrl.
+When the lines of the run's first_seq carry it, only those whose boot equals the boot of the run's
+'#us,ev=start' count, whatever their receive time (the window is not used); lines without it (firmware
+16702ff) keep the window rule.
 
 ESP32 log (R134C-3, R134C2-3, S05 6.3, L92): read_esp32_log is the one reader of the data lines for this
 tool and s05_final_table.py. With <csv>.segments.csv of agv_logger.py, lines marked 'duplicate' are dropped
@@ -83,6 +90,7 @@ ALIASES = {'wc_xy': 'omega_c_xy', 'wo_xy': 'omega_o_xy', 'wc_wz': 'omega_c_wz', 
 ID_MAX = 2147483647
 GAIN_FIELDS = ('id', 'applied_n', 'ctrl')
 TAIL_FIELDS = ('first_seq', 'line_drop')
+OPT_FIELDS = ('boot',)           # Liam 14/11 "Them boot vao #gain" (firmware after 16702ff)
 SEGMENT_STATUS_BAD = ('conflict', 'ambiguous')
 HEX = set('0123456789abcdefABCDEF')
 GAIN_US_WINDOW_S = 0.5           # [DE XUAT] '#gain' to '#us,ev=start' of one run (same tick, ms apart)
@@ -201,7 +209,9 @@ def parse_gain_line(text: str) -> dict:
     ctrl = out['ctrl']
     if ctrl not in NAMES:
         raise InputError(f'#gain ctrl={ctrl!r}')
-    names = [k for k in out if k not in GAIN_FIELDS + TAIL_FIELDS]
+    names = [k for k in out if k not in GAIN_FIELDS + TAIL_FIELDS + OPT_FIELDS]
+    if 'boot' in out and (not out['boot'] or not set(out['boot']) <= HEX):
+        raise InputError(f'#gain boot={out["boot"]!r}')
     if names != NAMES[ctrl]:
         raise InputError(f'#gain names {names}, firmware order is {NAMES[ctrl]}')
     for k in ('id', 'applied_n', 'first_seq', 'line_drop'):
@@ -284,12 +294,20 @@ def run_start(events, seq0: int, window_s: float = GAIN_US_WINDOW_S) -> dict:
         out['why'].append(f'the #us,ev=start lines of the run (first_seq = {seq0}) have no logger time')
         return out
     t_us = min(times)
-    gs = [g for t, g in gains if t is not None and abs(t - t_us) <= window_s]
-    out.update(n_gain_lines=len(gs), n_gain_outside=len(gains) - len(gs))
-    if not gs:
-        out['why'].append(f'no #gain line with first_seq = {seq0} (the first data line of the run) within '
-                          f'{window_s:g} s of its #us,ev=start (boot {boot})')
-        return out
+    with_boot = [g for _, g in gains if 'boot' in g]
+    if with_boot:                        # firmware with boot on '#gain': the boot decides, not the time
+        gs = [g for g in with_boot if g['boot'].lower() == boot]
+        out.update(n_gain_lines=len(gs), n_gain_outside=len(gains) - len(gs), gain_rule='boot')
+        if not gs:
+            out['why'].append(f'no #gain line with first_seq = {seq0} and boot {boot} (the boot of the run)')
+            return out
+    else:
+        gs = [g for t, g in gains if t is not None and abs(t - t_us) <= window_s]
+        out.update(n_gain_lines=len(gs), n_gain_outside=len(gains) - len(gs), gain_rule='time_window')
+        if not gs:
+            out['why'].append(f'no #gain line with first_seq = {seq0} (the first data line of the run) within '
+                              f'{window_s:g} s of its #us,ev=start (boot {boot})')
+            return out
     out['line_drop_max'] = max(int(g['line_drop']) for g in gs)
     if len({_content(g) for g in gs}) > 1:
         out['why'].append(f'#gain lines of the run (first_seq = {seq0}) disagree in id, applied_n, ctrl or a '
@@ -337,9 +355,12 @@ def query_problem(before, after, run_boot=None, check_run_boot=True):
         return f'thieu hoi boot {"truoc" if before is None else "sau"} luot (gain_send --query; S05 4.7 (iv))'
     if before.get('_path') and before.get('_path') == after.get('_path'):
         return 'cung mot file cho hoi truoc va hoi sau: khong phai hai lan hoi (R134C2-1)'
-    tb, ta = before.get('_t_end'), after.get('_t_start')
-    if tb is None or ta is None:
+    times = [before.get('_t_start'), before.get('_t_end'), after.get('_t_start'), after.get('_t_end')]
+    if any(t is None for t in times):
         return 'file hoi khong co dong #query_pc (gio PC cua lan hoi): khong biet hai lan hoi la hai lan (R134C2-1)'
+    if not all(math.isfinite(t) for t in times) or times[0] > times[1] or times[2] > times[3]:
+        return f'gio #query_pc khong hop le {times} (khong huu han hay khoang nguoc, R134C3-4)'
+    tb, ta = times[1], times[2]
     if tb > ta:
         return f'hoi truoc xong luc {tb:.3f} sau khi hoi sau bat dau {ta:.3f}: khong phai truoc va sau luot'
     bb, ba = before['boot'].lower(), after['boot'].lower()

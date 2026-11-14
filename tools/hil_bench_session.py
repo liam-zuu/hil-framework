@@ -707,11 +707,12 @@ def bench(a):
             t1 = time.time()
             if timer:                                # R134C2-5: the run ended first: no stop sent, also not
                 timer.cancel()                       # during the question after
+            if boots is not None:                    # ... and just after it, before any file is copied (R134C-9),
+                boots[1], qrec['after'] = timed_query(q_ip, os.path.join(a.out, 'pi', f'{name}_gain_query_after.txt'))
+            if timer:                                # not after waiting for a stop already on its way (R134C3-5)
                 timer.join(35.0)
                 if 't_pc' not in stop_rec:
                     stop_rec['note'] = 'lượt xong trước khi tới giờ dừng: không gửi'
-            if boots is not None:                    # ... and just after it, before any file is copied (R134C-9)
-                boots[1], qrec['after'] = timed_query(q_ip, os.path.join(a.out, 'pi', f'{name}_gain_query_after.txt'))
             with open(os.path.join(a.out, 'pi', f'{name}_pi.txt'), 'x', encoding='utf-8') as f:
                 f.write(txt)
             scp(a.host, f'{a.pi_dir}/{name}_frames.npz', os.path.join(a.out, 'frames'))

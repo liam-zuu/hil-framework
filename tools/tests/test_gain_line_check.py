@@ -220,3 +220,35 @@ def test_real_run_2026_11_13_builtin_set(name):
     """The three runs of CLOSED_LOOP/2026-11-13_run14 (AGV 16702ff, built-in gains): the line is found."""
     s = glc.check(os.path.join(REAL14, f'{name}.csv'), builtin=True)
     assert s['ok'] and s['line_id'] == 0 and s['run_boot'] == '4753dc47' and s['n_gain_lines'] == 3
+
+
+@pytest.mark.parametrize('tb, ta, why', [((1.0, 'nan'), (3.0, 4.0), 'khong hop le'),
+                                        ((1.0, 2.0), ('inf', 4.0), 'khong hop le'),
+                                        ((200.0, 100.0), (150.0, 160.0), 'khong hop le')])     # reversed interval
+def test_query_times_must_be_finite_and_ordered(tmp_path, tb, ta, why):
+    """R134C3-4 (Codex counterexamples): nan, inf, or an interval that runs backwards."""
+    log = write_run(tmp_path, [gain_line(first_seq=11)])
+    qb, qa = _answer(tmp_path, 'b.txt', t=tb), _answer(tmp_path, 'a.txt', t=ta)
+    s = glc.check(log, write_gain(tmp_path), queries=(qb, qa))
+    assert not s['ok'] and any(why in w for w in s['why']), s['why']
+
+
+def _boot_line(boot, **kw):
+    return gain_line(**kw) + f',boot={boot}'
+
+
+def test_gain_line_with_boot_decides_by_boot_not_time(tmp_path):
+    """Liam 14/11 "Them boot vao #gain": with boot on '#gain', the line of another boot is refused even right
+    next to the run's '#us,ev=start' (R134C3-1), and the run's line counts even when read late (R134C3-2)."""
+    log = write_run(tmp_path, [], name='r.csv')
+    ev = (tmp_path / 'r.csv.events.txt').read_text(encoding='utf-8').splitlines()
+    near_old = ['2026-11-14T10:00:00.200000 ' + _boot_line('0badf00d', first_seq=11)]
+    (tmp_path / 'r.csv.events.txt').write_text('\n'.join(ev + near_old) + '\n', encoding='utf-8')
+    s = glc.check(log, write_gain(tmp_path))
+    assert not s['ok'] and 'boot 4753dc47' in s['why'][0] and s['n_gain_outside'] == 1
+    late_mine = ['2026-11-14T10:00:05.000000 ' + _boot_line('4753DC47', first_seq=11)]
+    (tmp_path / 'r.csv.events.txt').write_text('\n'.join(ev + near_old + late_mine) + '\n', encoding='utf-8')
+    s = glc.check(log, write_gain(tmp_path))
+    assert s['ok'] and s['n_gain_lines'] == 1 and s['line_id'] == 7
+    with pytest.raises(glc.InputError, match='boot'):
+        glc.parse_gain_line(gain_line() + ',boot=xyz')

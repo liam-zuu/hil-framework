@@ -639,10 +639,12 @@ def test_s315_r4_1_replacement_uid_duplicate_or_missing(ds):
 # ── R134 package after Codex round 1 (Liam 14/11 CODE_R134 "Sua + vong 2 (Recommended)") ──
 
 def _query_files(tmp_path, before='4753dc47', after='4753dc47'):
+    """Two saved gain_send --query outputs as the writers save them (R134C3-7: with the '#query_pc' line)."""
     out = []
-    for name, boot in (('qb.txt', before), ('qa.txt', after)):
+    for name, boot, t in (('qb.txt', before, (1.0, 2.0)), ('qa.txt', after, (3.0, 4.0))):
         p = tmp_path / name
-        p.write_text(f'#gain_running,sha=16702ff0e688,env=pid,mac=aa:bb,boot={boot},id=7,applied_n=1,ctrl=PID\n'
+        p.write_text(f'#query_pc,t_start={t[0]},t_end={t[1]}\n'
+                     f'#gain_running,sha=16702ff0e688,env=pid,mac=aa:bb,boot={boot},id=7,applied_n=1,ctrl=PID\n'
                      '#ket_qua,ma=0\n', encoding='utf-8')
         out.append(str(p))
     return out
@@ -691,17 +693,19 @@ def test_sc3_2_summary_cli_reports_the_historic_rows(ds, capsys):
 
 @pytest.mark.parametrize('platform, stage, outcome, needed', [
     ('HW', 'screen', 'khong_dat', True), ('HW', 'final', 'dat', True), ('HW', 'screen', 'hong_he_do', False),
-    ('HIL', 'final_hil', 'chua_ket_luan', True), ('HIL', 'hil_check', 'khong_dat', False),
+    ('HIL', 'final_hil', 'khong_dat', True), ('HIL', 'hil_check', 'khong_dat', False),
     ('SIM', 'screen', 'khong_dat', False)])
 def test_cli_end_requires_the_query_files(ds, tmp_path, capsys, platform, stage, outcome, needed):
-    """R134 (b), R134C2-10: the CLI 'end' of a judged car run (every stage) or HIL final_hil run needs both
-    files; each row of the matrix is opened with its own platform and stage and ended with its own outcome."""
+    """R134 (b), R134C2-10, R134C3-7: the CLI 'end' of a judged car run (every stage) or HIL final_hil run
+    needs both files; each row opens a valid run of its platform, stage and gain set, ends with its own
+    outcome and a gate that agrees, and must close (rc 0, the row written) when the files are given or not
+    needed."""
     assert rl.query_files_needed(dict(platform=platform, stage=stage), outcome) is needed
     d, clock = ds
-    _open(d, clock)
-    run = rl._load_open(d)
-    run['row'].update(platform=platform, stage=stage)                    # the open run of this row
-    rl._save_open(d, run)
+    campaign, gs = {('HW', 'screen'): ('A-PID', ''), ('HW', 'final'): ('A-PID', 'A-PID/G0'), ('HIL', 'final_hil'): ('RQ2', 'RQ2-INIT-PID/G0'), ('HIL', 'hil_check'): ('B-PID', 'B-PID/GA1'), ('SIM', 'screen'): ('B-PID', '')}[(platform, stage)]
+    rl.begin(d, 'S', campaign, platform, 'PID', 'O1-F05', '0.5', stage, gain_set=gs)
+    rl.step(d, 'run')
+    clock[0] += dt.timedelta(seconds=60)
     f = str(tmp_path / 'score.json')
     with open(f, 'w', encoding='utf-8') as fh:
         json.dump(dict(gate_v3=_gate(u_t=0.0015 if platform == 'HIL' else 0.0, e_trk=0.12 if outcome == 'khong_dat' else 0.03)), fh)
@@ -718,3 +722,7 @@ def test_cli_end_requires_the_query_files(ds, tmp_path, capsys, platform, stage,
     if needed:
         rc = rl.main(['--dataset', d, 'end', '--outcome', outcome] + extra + ['--query-before', qb, '--query-after', qa])
         assert 'needs --query-before' not in capsys.readouterr().err
+    assert rc == 0 and rl._load_open(d) is None, capsys.readouterr()      # closed
+    r = _rows(d)[-1]
+    assert (r['platform'], r['stage'], r['run_outcome']) == (platform, stage, outcome)
+    assert (r['boot_before'], r['boot_after']) == (('4753dc47',) * 2 if needed else ('', ''))
