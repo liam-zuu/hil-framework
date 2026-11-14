@@ -58,6 +58,12 @@ def build(n=N, faults=None, period_us=1000.0):
         b[17] = mosi[i][21]
         b[18:20] = struct.pack('<H', (i + 1 - rx_shift) & 0xFFFF)
         b[20:22] = struct.pack('<H', f.get('age', {}).get(j, 300))
+        if f.get('v5'):                                   # MISO v5: bit 7 mark, window pre_us | dur4 << 11
+            b[16] = t1.dec.STATUS_V5
+            if j in f.get('sat', ()):
+                b[20:22] = struct.pack('<H', 2047 | (5 << 11))
+            elif j in f.get('sat_dur', ()):
+                b[20:22] = struct.pack('<H', 100 | (31 << 11))
         rec = None
         if i > 20 and i % 10 == 0 and i not in f.get('no_log', ()):
             s = (i // 10) % 3
@@ -429,3 +435,16 @@ def test_cli(clean, tmp_path):
         assert open(out / name).readline().split(',')[0].strip() == first
     assert subprocess.run([sys.executable, script, str(npz), '--out', str(out)], capture_output=True,
                           text=True).returncode == 3           # 19 s scored < 600 s
+
+
+def test_saturated_apply_window_counted_apart_and_fails():
+    """S06 T1 [H7 v6] (Liam 14/11, phiên THESIS local_2bb6f593, "Đếm riêng, đòi bằng 0"): MISO v5 frames with a
+    saturated apply window (pre_us 2047 or dur4 31: age 0xFFFF in s06_frames_decode) do not enter the age
+    maximum; they are counted in n_age_unknown (per window and total) and T1 fails unless it is 0."""
+    ok = run(build(faults={'v5': True}))
+    assert ok['verdict'] == 'pass' and ok['frames']['n_age_unknown'] == 0 and ok['frames']['age_max_us'] == 300
+    for key in ('sat', 'sat_dur'):
+        out = run(build(faults={'v5': True, key: {7000, 7001}}))
+        assert out['verdict'] == 'fail' and out['frames']['n_age_unknown'] == 2, key
+        assert out['frames']['age_max_us'] == 300 and any('n_age_unknown' in f for f in out['fails']), key
+        assert sum(w['n_age_unknown'] for w in out['_windows']) == 2

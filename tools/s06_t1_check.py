@@ -25,7 +25,10 @@ Sửa theo Codex Sol vòng 3 (Liam 30/10 "Làm cả gói, 0,2 %"): C3-5 tập ch
   * H7 nhận đủ frame: Δ(số frame H7, MISO byte 18–19 mở vòng) = Δ(frame Pi được trả lời) trên cùng đoạn.
   * H7 áp dụng đủ frame (V4): hai frame MISO liên tiếp (đều CRC đúng) trả lời hai frame Pi liên tiếp;
     hụt (cách > 1) cộng vào `seq_gaps`; lặp (cách 0) và trễ trả lời ≠ 2 frame (`--answer-lag`, bản
-    `fix/h7-frame`: N − 2) cộng vào `miso_seq_bad`. Tuổi trạng thái (MISO byte 20–21) lớn nhất ≤ 1 000 µs.
+    `fix/h7-frame`: N − 2) cộng vào `miso_seq_bad`. Tuổi trạng thái (MISO byte 20–21) lớn nhất ≤ 1 000 µs;
+    từ MISO v5 tuổi = `pre_us + 4·dur4` (s06_frames_decode), frame có cửa sổ áp bão hòa (`pre_us` 2047 hay
+    `dur4` 31) không vào cực đại, đếm riêng `n_age_unknown` theo cửa sổ và tổng, đạt khi = 0 (S06 T1 [H7 v6],
+    Liam 14/11, phiên THESIS local_2bb6f593, hộp chọn "Đếm riêng, đòi bằng 0 (Recommended)"; frame v4 như cũ).
   * Frame trộn (W3): CRC MOSI do H7 tính trên bản sao vòng chính (MISO byte 10–11) khác CRC của frame Pi
     được trả lời. Độ phủ (Y9): % bước mỗi trường MOSI khác bước trước; trộn chỉ thấy trên trường có đổi.
   * MISO (Z3 (1)): CRC MISO sai = MISO trộn hoặc hỏng.
@@ -76,7 +79,7 @@ FIELDS = [(f'w{i + 1}', (2 * i, 2 * i + 1)) for i in range(4)] + [
     ('yaw', (37, 38)), ('imu_seq', (39,))]
 
 WINDOW_COLS = ['idx', 'window', 't_start_us', 'pi_frames', 'frames_rx', 'frames_applied', 'seq_gaps',
-               'max_state_age_us', 'miso_seq_bad', 'mixed_frames', 'miso_crc_bad']
+               'max_state_age_us', 'n_age_unknown', 'miso_seq_bad', 'mixed_frames', 'miso_crc_bad']
 STEP_COLS = ['idx', 'step', 'crc_sent', 'crc_h7', 'field_change_mask', 'miso_crc_ok']
 IMU_COLS = ['idx', 'report_type', 'rpt_seq', 'queued', 'qfull', 'imu_seq_used', 'n_frames_src', 'n_frames_latest',
             'imu_crc_h7', 'imu_crc_pi', 'imu_crc_ok', 'imu_age_frames', 'cyccnt', 'esp32_spi']
@@ -148,13 +151,13 @@ def check(t_send_ns, mosi, miso, esp32_events=None, serial_events=None, skip_s=0
     wins = {}
     steps_crc_h7 = {}
     tot = dict(frames_rx=0, pi_answered=0, seq_gaps=0, miso_seq_bad=0, mixed=0, miso_crc_bad=0,
-               age_max_us=0, unanswered=0)
+               age_max_us=0, n_age_unknown=0, unanswered=0)
     prev = None
     first_ok = last_ok = None
     for r in good:
         w = int((t_us[r['j'] - answer_lag] - t0) // win_us)       # the window of the source frame
         W = wins.setdefault(w, dict(window=w, t_start_us=t0 + w * win_us, pi_frames=0, frames_rx=0,
-                                    frames_applied=0, seq_gaps=0, max_state_age_us=0, miso_seq_bad=0,
+                                    frames_applied=0, seq_gaps=0, max_state_age_us=0, n_age_unknown=0, miso_seq_bad=0,
                                     mixed_frames=0, miso_crc_bad=0, _nf=[], _ans=[]))
         if not r['crc_ok']:
             W['miso_crc_bad'] += 1
@@ -171,8 +174,14 @@ def check(t_send_ns, mosi, miso, esp32_events=None, serial_events=None, skip_s=0
         steps_crc_h7[a] = dec.u16(bytes(miso[r['j']]), dec.MISO_MOSI_CRC)
         W['_ans'].append(a)
         W['_nf'].append(r['rx_nf'])
-        W['max_state_age_us'] = max(W['max_state_age_us'], r['age_us'])
-        tot['age_max_us'] = max(tot['age_max_us'], r['age_us'])
+        if r.get('miso_v5') and not r.get('apply_ok'):
+            # S06 T1 (Liam 14/11 THESIS local_2bb6f593 "Đếm riêng, đòi bằng 0"): a saturated apply window
+            # (pre_us 2047 or dur4 31; s06_frames_decode age_us 0xFFFF) has no known age: counted, not in the max
+            W['n_age_unknown'] += 1
+            tot['n_age_unknown'] += 1
+        else:
+            W['max_state_age_us'] = max(W['max_state_age_us'], r['age_us'])
+            tot['age_max_us'] = max(tot['age_max_us'], r['age_us'])
         if not r['mosi_crc_ok']:
             W['mixed_frames'] += 1
             tot['mixed'] += 1
@@ -247,6 +256,8 @@ def check(t_send_ns, mosi, miso, esp32_events=None, serial_events=None, skip_s=0
     if len(lag_hist) == 1 and answer_lag not in lag_hist:
         fails.append(f'mọi frame MISO trả lời trễ {next(iter(lag_hist))} frame, không phải {answer_lag}: '
                      f'kiểm bản H7 đã nạp (fix/h7-frame: 2) hoặc --answer-lag')
+    if tot['n_age_unknown']:
+        fails.append(f"{tot['n_age_unknown']} frame có cửa sổ áp bão hòa, không biết tuổi (n_age_unknown phải = 0)")
     if age['verdict'] == 'fail':
         fails.append(f"tuổi trạng thái lớn nhất {tot['age_max_us']} µs danh định = "
                      f"{age['age_true_lo_us']:.1f}–{age['age_true_hi_us']:.1f} µs thật > {AGE_MAX_US}")
