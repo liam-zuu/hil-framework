@@ -190,6 +190,20 @@ def test_table_cells_medians_and_reasons(tmp_path):
     assert '| PID | O1-F05 | xe |' in md and '0.03 / 0.12 (n_m 3)' in md
     per_run = list(csv.DictReader(open(out / 'S05_final_runs.csv', encoding='utf-8')))
     assert {r['run_uid'] for r in per_run} == {'r1', 'r2', 'r3', 'r4', 'r5'}
+    pr = {r['run_uid']: r for r in per_run}                                  # S05 4.7 (i), Liam Q4 (CODE_RS4)
+    assert float(pr['r5']['t_end_err_ms']) == pytest.approx(10.0 * T.RHO_PRIOR_PPM * 1e-3)   # no esp_pi_ppm
+    assert pr['r1']['t_end_err_ms'] == '' and pr['r1']['t_end_err_src'] == 'xe: C7b'
+
+
+def test_t_end_error_estimate():
+    """S05 4.7 (i), Liam 14/11 CODE_RS4 Q4: t_end x (|esp_pi_ppm| + noise + |pi_period_ppm|); bounds when missing."""
+    v, src = T.t_end_err_ms(12.0, esp_pi_ppm=-52.0, pi_period_ppm=-12.0)
+    assert v == pytest.approx(12.0 * (52.0 + 50.0 + 12.0) * 1e-3) and 'pi_period_ppm' in src      # 1.37 ms
+    v, src = T.t_end_err_ms(12.0, esp_pi_ppm=24.6)
+    assert v == pytest.approx(12.0 * (24.6 + 50.0 + T.PI_PERIOD_PPM_BOUND) * 1e-3) and 'can Pi' in src
+    v, src = T.t_end_err_ms(12.0)
+    assert v == pytest.approx(12.0) and '1000 ppm' in src                                       # +-12 ms at 12 s
+    assert T.t_end_err_ms(None) == (None, 'khong co t_end')
 
 
 def test_unknown_gain_set_is_reported_not_tabled(tmp_path, capsys):

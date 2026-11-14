@@ -9,10 +9,10 @@ the window do not change the PWM metrics; losing a line at either end of the
 window moves the window itself (B0 review round 3, question 3).
 
 Formats (B0 review round 3 B51/N9), told apart by the header and the rows:
-  DUT     85 columns (66 ctrl-imu firmware, 80 feat/pos-loop: their header and rows as
+  DUT     86 columns (85 AGV 54b7269 and older campaign firmware, 66 ctrl-imu, 80 feat/pos-loop: their header and rows as
           written by older loggers are accepted too), every row with log_seq and motor_on:
           log_seq U32, motor_on exactly 0 or 1, timestamp_us an integer
-  SIM     85 (or 66, 80) columns, log_seq and motor_on empty in every row (fwsim/s02_groupA_sim.py)
+  SIM     86 (or 66, 80, 85) columns, log_seq and motor_on empty in every row (fwsim/s02_groupA_sim.py)
   legacy  the first 37 or 28 columns (older firmware)
 Anything else, or rows of two formats, is refused. SIM and legacy rows stay in file
 order and timestamp_us must be finite and never go back.
@@ -72,7 +72,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from agv_logger import (COLUMNS, MAX_US_PER_SEQ, N_IMU, OLD_LENGTHS, RATE_SLACK_US,  # noqa: E402
                         SEGMENT_COLUMNS, SEGMENT_STATUSES, file_digest, parse_run_end)
 from run_validity import pos_reset_mid, run_bad_fields  # noqa: E402
-HEADS = [COLUMNS] + [COLUMNS[:n] for n in OLD_LENGTHS]     # 85, 28, 37, 66, 80 columns
+HEADS = [COLUMNS] + [COLUMNS[:n] for n in OLD_LENGTHS]     # 86, 28, 37, 66, 80, 85 columns
 
 R_WHEEL = 0.0485
 L_SUM = 0.24          # LX + LY (kinematics.h)
@@ -96,7 +96,7 @@ def load_log(path):
     head = rows[0]
     body = rows[1:]
     if head not in HEADS:
-        raise ValueError(f'{path}: header is not a logger format (agv_logger.COLUMNS, 85, 80, 66, 37 or 28 columns)')
+        raise ValueError(f'{path}: header is not a logger format (agv_logger.COLUMNS, 86, 85, 80, 66, 37 or 28 columns)')
     bad = [i + 2 for i, r in enumerate(body) if len(r) != len(head)]
     if bad:
         raise ValueError(f'{path}: lines {bad[:5]} do not have {len(head)} columns (mixed formats)')

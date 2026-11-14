@@ -140,6 +140,10 @@ CAUSES = ('gain', 'cong_cu_HIL', 'phan_cung_ngau_nhien', 'chua_ro')
 CAP_H, CAP_HW = 10.0, 120               # S05 §4.1: per campaign, tune part only
 TUNE_STAGES = ('screen', 'confirm')     # [CÁCH HIỂU] 'explore' is not a tune run of §4.1 either way
 SKIP_PREFIX = ('EXAMPLE', 'PREHIL')      # rows of the June files: examples, reconstruction
+# fields begin / end set themselves; begin refuses them as extra fields (Codex S315-R3-1)
+OWN_FIELDS = ('session_id', 'iter_no', 'run_uid', 'date', 'wall_start', 'wall_end', 'run_outcome', 'fail_cause',
+              'results_dir', 'completed', 'e_perp_max_m') + tuple(f't_{k}_s' for k in ('flash', 'setup', 'run', 'log',
+                                                                                        'analysis', 'operator_wait'))
 
 
 class LogError(Exception):
@@ -332,6 +336,8 @@ def begin(ds: str, session: str, campaign: str, platform: str, controller: str, 
         if v not in (None, ''):
             if k not in TUNING_COLS:
                 raise LogError(f'unknown field {k}')
+            if k in row or k.startswith('g_') or k in OWN_FIELDS:   # Codex S315-R3-1: the identity fields
+                raise LogError(f'field {k}: set by begin or end, not by an extra field')   # are checked, not given
             row[k] = str(v)
     tun = live_rows(read_rows(os.path.join(ds, TUNING)))      # S315-R2-2
     if _map_counted(row):
@@ -1017,13 +1023,22 @@ def _effort_span(r: dict):
 
 def _check_replacements(tun: List[dict]) -> None:
     """S05 §4.3, §4.6, §4.7 (EA-8): a replacement points to a lost run (hong_he_do) of the same
-    campaign, platform, stage, task, speed and gain set, earlier than itself; a run is replaced once."""
-    by_uid = {r['run_uid']: r for r in tun if r.get('run_uid')}
+    campaign, platform, stage, task, speed and gain set, earlier than itself in the log (row order, as
+    _final_stops; Codex S315-R3-2: not by wall_start, which can go back); a run is replaced once."""
+    by_uid, pos = {}, {}
+    for i, r in enumerate(tun):                    # Codex S315-R4-1: a run_uid names one row
+        uid = r.get('run_uid')
+        if uid in by_uid:
+            raise LogError(f'run_uid {uid} on two rows (rows {pos[uid] + 1} and {i + 1} of the live log)')
+        if uid:
+            by_uid[uid], pos[uid] = r, i
     seen = {}
-    for r in tun:
+    for i, r in enumerate(tun):
         ref = r.get('replaces_run_uid')
         if not ref:
             continue
+        if not r.get('run_uid'):
+            raise LogError(f'row {i + 1} of the live log replaces {ref} but has no run_uid')
         old = by_uid.get(ref)
         if not old or old.get('run_outcome') != 'hong_he_do':
             raise LogError(f"{r.get('run_uid')}: replaces_run_uid {ref} is not a hong_he_do run (§4.7)")
@@ -1031,7 +1046,7 @@ def _check_replacements(tun: List[dict]) -> None:
         if diff:
             raise LogError(f"{r.get('run_uid')}: replaces {ref} with another {', '.join(diff)} (a replacement "
                            f"runs the same condition, §4.3, §4.6)")
-        if ref == r.get('run_uid') or (old.get('wall_start', '') > r.get('wall_start', '')):
+        if ref == r.get('run_uid') or pos[ref] > i:
             raise LogError(f"{r.get('run_uid')}: replaces {ref}, which is not an earlier run")
         if ref in seen:
             raise LogError(f"{ref} is replaced twice ({seen[ref]}, {r.get('run_uid')})")

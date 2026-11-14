@@ -88,7 +88,8 @@ def _fmt(v, spec):
 
 
 def log_rows(log, use_imu=False):
-    """One logger line per firmware tick, columns as tools/agv_logger.COLUMNS (campaign firmware, 85)."""
+    """One logger line per firmware tick, columns as tools/agv_logger.COLUMNS (campaign firmware, 86;
+    traj_age_ms empty: fwsim has no command packets)."""
     n = len(log['t'])
     rpm = log['rpm']
     tail = COLUMNS[37:]
@@ -98,7 +99,8 @@ def log_rows(log, use_imu=False):
     has_pos, has_ws = 'pos' in log, 'ws' in log
     for i in range(n):
         extra = {'log_seq': str(i + 1), 'log_qdrop': '0', 'log_send_err': '0',
-                 'motor_on': str(int(log['en'][i])), 'imu_init': '0' if use_imu else ''}
+                 'motor_on': str(int(log['en'][i])), 'imu_init': '0' if use_imu else '',
+                 'traj_age_ms': ''}
         for col, src in CTRL_IMU_COLS.items():
             extra[col] = _fmt(log['imu'][i][imu_idx[src[0]]], src[1]) if (src and use_imu) else ''
         for col, src in POS_LOG_COLS.items():
@@ -194,7 +196,7 @@ setpoint: "trajectory_pub.get_body_velocity held at 50 Hz, then 0 for {STOP_TAIL
 libraries: {json.dumps(fwsim.lib_versions())}
 elapsed_s: {time.time() - t_start:.0f}
 files:
-  - raw/<run_id>.csv: "ESP32 logger format (tools/agv_logger.py COLUMNS, 85), 100 Hz; IMU fusion / heading columns from the firmware (empty with --no-imu); pos_* and ws_* from the firmware (empty with a DLL without pos_ctrl.c / wheel_slip.c); raw chip columns ax..roll and gyro_n, rv_n, reset_n empty (not in fwsim)"
+  - raw/<run_id>.csv: "ESP32 logger format (tools/agv_logger.py COLUMNS, 86), 100 Hz; IMU fusion / heading columns from the firmware (empty with --no-imu); pos_* and ws_* from the firmware (empty with a DLL without pos_ctrl.c / wheel_slip.c); raw chip columns ax..roll and gyro_n, rv_n, reset_n, and traj_age_ms empty (not in fwsim)"
   - runs.csv: "spec P2-6 columns + test_id"
   - metrics.csv: "tools/s02_metrics.py, one line per run"
 notes: "{NOTE_NOISE if imu and imu.get('noise') == 'replay' else NOTE_NO_NOISE}"

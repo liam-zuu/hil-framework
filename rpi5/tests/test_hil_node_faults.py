@@ -14,7 +14,7 @@ import fault_schedule as fs
 from fake_h7 import FakeH7
 from hil_node import HILConfig, HILNode
 from mecanum_plant import MecanumPlant
-from protocol import CMD_SWA_ON, FRAME_SIZE, OFS_FAULT
+from protocol import CMD_SWA_ON, FRAME_SIZE, OFS_FAULT, OFS_RUN_ID
 from run_lifecycle import ARM, RUN, ControlBox, LifecycleConfig
 from tests.test_run_wire import CountPlant, Owner, done_after
 
@@ -55,7 +55,10 @@ def test_open_loop_windows_only_and_plant_untouched(tmp_path, caplog):
     s1, f1, node = open_loop(tmp_path, 'b', sch)
     assert s0 == s1                                         # the plant ran the same dynamics
     m0, m1, t1 = f0['mosi'], f1['mosi'], f1['mosi_true']
-    assert np.array_equal(m0, t1)                           # the truth record = the frame of today's code
+    # the truth record = the frame of today's code; run_id (RS-4, random per run) differs between two runs
+    keep = np.r_[0:OFS_RUN_ID, OFS_RUN_ID + 4:m0.shape[1]]
+    assert np.array_equal(m0[:, keep], t1[:, keep])
+    assert np.array_equal(m1[:, OFS_RUN_ID:], t1[:, OFS_RUN_ID:])   # run_id, frame_no never patched (rule 3.7)
     changed = np.nonzero(np.any(m1 != t1, axis=1))[0]
     assert changed.min() >= 50 and changed.max() < 350
     assert np.all(m1[50:120, 2:4] == 0) and np.all(np.any(t1[50:120, 2:4] != 0, axis=1))

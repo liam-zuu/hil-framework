@@ -1,0 +1,42 @@
+# hil-panel.service: hil_daemon.py starts with the Pi, so the panel works without a laptop
+# (CODE_PANEL 14/11, Liam Q3: "tôi nghĩ tự chạy hợp lí hơn chứ, chả lẽ bật hil xong phải có
+# laptop để mới có thể bật được panel à"). Install and checks: 00_OVERVIEW/Setup_Guides/
+# 2026-11-04_Huong_dan_Panel_M2_noi_day_nap.md, section "Panel với Pi thật".
+#
+#   sudo cp ~/hil-framework/rpi5/systemd/hil-panel.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now hil-panel
+#   journalctl -u hil-panel -f                    # what the daemon prints
+#
+# Before a PC bench session (tools/hil_bench_session.py, thesis data): stop it,
+#   sudo systemctl stop hil-panel
+# The daemon refuses a panel START while another run_hil.py runs, but its H7 re-probe (while the
+# H7 light is off) could start in the same second as a PC run: never mix the two uses.
+#
+# First start only (the epoch file must exist; it is never created here, see panel_proto.py
+# next_daemon_epoch): cd ~/hil-framework/rpi5 && python3 -c "import panel_proto as p, os; p.next_daemon_epoch(os.path.expanduser('~/.hil_panel_epoch'), create=True)"
+
+[Unit]
+Description=HIL panel run manager (hil_daemon.py, stage E reduced)
+After=local-fs.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=liam-zuu
+WorkingDirectory=/home/liam-zuu/hil-framework/rpi5
+# '+': run as root. Same core-0 clearing as before every bench session (Setup RPi5, Step 9).
+ExecStartPre=+/usr/local/bin/hil-prep.sh
+# python3 carries cap_sys_nice (Setup RPi5, Step 6), so run_hil.py gets SCHED_FIFO without sudo.
+ExecStart=/usr/bin/python3 -u hil_daemon.py --port /dev/ttyAMA0
+# SIGINT to the daemon only (KillMode=mixed; each run is its own session): the daemon STOPs the
+# run and waits for it (escalating to SIGTERM / SIGKILL of the run's group), closes meta.json,
+# then exits. After TimeoutStopSec systemd SIGKILLs whatever is left in the cgroup.
+KillSignal=SIGINT
+KillMode=mixed
+TimeoutStopSec=15
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -90,7 +90,11 @@ NEW_CHECKS = ['pair_same_frame', 'getframe_masked', 'getframe_clears_ready', 'un
               'stuck_restarted_at_nss_high', 'frame_after_stuck_restart', 'ready_state_also_restarted',
               'service_cycles_minmax', 'service_cycles_reset', 'stuck_restores_primask',
               # L100 (13/11, Codex RS4-R4-2): a staged reply replaced before the DMA took it
-              'reply_over_counted', 'reply_over_after_take', 'apply_window_holds', 'apply_window_saturation']
+              'reply_over_counted', 'reply_over_after_take', 'apply_window_holds', 'apply_window_saturation',
+              # RS-4 P1 (14/11): MISO 40-47 = MOSI 40-47 of the frame answered, B1 of tools/hil_edge_map.py;
+              # Codex RS4-R10-3: apply window per frame, frames landing where the main loop lifts the mask
+              'id_of_answered_frame', 'id_crc_stamp_same_frame', 'callback_cycles_minmax', 'callback_cycles_reset',
+              'id_apply_same_frame_with_interrupts', 'interrupt_points_covered']
 
 
 @pytest.mark.parametrize('name', NEW_CHECKS)

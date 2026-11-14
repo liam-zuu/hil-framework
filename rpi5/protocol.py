@@ -1,7 +1,9 @@
 """
 SPI Wire Protocol — must match H7 hil_protocol.h byte-for-byte.
 
-Frame layout v3 (40 bytes, full-duplex), all int16 big-endian:
+Frame layout MOSI v4 / MISO v6 (48 bytes, full-duplex; RS-4 P1, 14/11/2026, Liam CODE_RS4
+"Làm P1, 48 byte", 03_CODE/docs/2026-11-14_Thiet_ke_RS4_so_phien_MOSI_v1.md). Bytes 0-39 as v3 (40 bytes,
+all int16 big-endian); bytes 40-47 below, little-endian:
 
   MOSI (RPi5 → H7)
     0–19   10 × int16  plant state [ω1, ω2, ω3, ω4, x, y, θ, vx, vy, wz]
@@ -13,6 +15,8 @@ Frame layout v3 (40 bytes, full-duplex), all int16 big-endian:
     31–36  3 × int16   ax_imu, ay_imu, az_imu (v3)
     37–38  int16       yaw_imu  (v3)
     39     uint8       imu_seq  (v3, +1 for every new plant IMU sample)
+    40–43  uint32 LE   run_id   (v4, one per run, drawn by the Pi, never 0 on a real run)
+    44–47  uint32 LE   frame_no (v4, the Pi step = frame log index; the H7 only copies 40-47)
 
   The IMU values feed the BNO085 emulator on the H7 (G0 v1 §5). The H7 stops
   sending IMU reports when imu_seq stops changing, so imu=None (seq 0 forever)
@@ -24,6 +28,8 @@ Frame layout v3 (40 bytes, full-duplex), all int16 big-endian:
     16     uint8       status
     17     uint8       seq (echo of MOSI seq)
     18–39  reserved    0x00
+  (the H7 layout since MISO v4 / v5 is in hil_protocol.h: CRC, MOSI CRC, receive stamp, apply window, log)
+    40–47  id          (v6) MOSI bytes 40-47 of the frame answered, same copy as its MOSI CRC
 
 Encoding formula:
   int16 = round(clamp(v, ±range) / range × 32767)
@@ -53,11 +59,13 @@ CRITICAL: If you change anything here, update the H7 firmware decode
           wrong → controller gets garbage → system fails silently.
 """
 import binascii
+import os
 import struct
 import numpy as np
 
 # ── Wire constants ────────────────────────────────────────────────────────
-FRAME_SIZE   = 40           # bytes per SPI transaction (both directions)
+FRAME_SIZE   = 48           # bytes per SPI transaction (both directions); 40 before MOSI v4 / MISO v6
+FRAME_SIZE_V3 = 40          # frame logs before RS-4 P1 (tools read both)
 N_STATES     = 10
 N_TORQUES    = 4
 N_REFS       = 3
@@ -71,6 +79,9 @@ OFS_IMU_GZ     = 22
 OFS_IMU_ACC    = 31         # ax, ay, az
 OFS_IMU_YAW    = 37
 OFS_IMU_SEQ    = 39
+OFS_RUN_ID     = 40         # v4: uint32 LE
+OFS_FRAME_NO   = 44         # v4: uint32 LE
+ID_LEN         = 8          # run_id + frame_no
 
 # MISO byte offsets
 OFS_PWM       = 8
@@ -80,6 +91,7 @@ OFS_MISO_SEQ  = 17
 # 0–7 and 10–39 of the same MISO frame (tools/s06_frames_decode.py, STATUS_CODE L50); the pwm field above
 # is the v3 layout used only by encode_torques()/decode_output() for loopback tests
 OFS_MISO_CRC  = 8
+OFS_MISO_ID   = 40          # v6: copy of MOSI 40-47 of the frame answered (hil_protocol.h HIL_MISO_ID)
 
 # MISO check results (miso_check)
 MISO_OK, MISO_EMPTY, MISO_CRC_BAD = 0, 1, 2
@@ -132,9 +144,10 @@ def _check_len(frame: bytes, need: int) -> None:
 
 def encode_state(state, traj_ref=None, traj_flags: int = 0,
                  seq: int = 0, fault_flags: int = 0,
-                 imu=None, imu_seq: int = 0) -> bytes:
+                 imu=None, imu_seq: int = 0,
+                 run_id: int = 0, frame_no=None) -> bytes:
     """
-    Pack plant state (+ optional trajectory reference, IMU) → 40-byte MOSI frame.
+    Pack plant state (+ optional trajectory reference, IMU) → 48-byte MOSI frame (v4).
 
     Args:
         state:       Iterable of 10 floats [ω1, ω2, ω3, ω4, x, y, θ, vx, vy, wz].
@@ -146,9 +159,11 @@ def encode_state(state, traj_ref=None, traj_flags: int = 0,
         imu:         Optional (gz, ax, ay, az, yaw) [rad/s, m/s², m/s², m/s², rad]
                      for the BNO085 emulator. None → zeros.
         imu_seq:     Stored modulo 256; change it whenever imu is a new sample.
+        run_id:      v4 (RS-4 P1): uint32 of this run (new_run_id()); 0 = none (tests, tools).
+        frame_no:    v4: uint32, the Pi step (frame log index); None -> seq (callers pass seq = step).
 
     Returns:
-        40-byte bytes object ready to send via spidev.xfer2().
+        FRAME_SIZE-byte bytes object ready to send via spidev.xfer2().
     """
     state = list(state)
     if len(state) != N_STATES:
@@ -176,7 +191,29 @@ def encode_state(state, traj_ref=None, traj_flags: int = 0,
         for o, val, rng in zip(ofs, imu, IMU_RANGES):
             struct.pack_into('>h', buf, o, _to_int16(val, rng))
     buf[OFS_IMU_SEQ] = imu_seq & 0xFF
+    fn = seq if frame_no is None else frame_no
+    if not (0 <= run_id <= 0xFFFFFFFF) or not (0 <= fn <= 0xFFFFFFFF):
+        raise ValueError(f"run_id {run_id} / frame_no {fn} outside uint32")
+    struct.pack_into('<II', buf, OFS_RUN_ID, run_id, fn)
     return bytes(buf)
+
+
+def new_run_id() -> int:
+    """MOSI v4 run_id of a run (RS-4 P1): 32 random bits from os.urandom, never 0 (0 = no run_id). Two runs
+    share one with probability 2^-32 (assumption B2 of tools/hil_edge_map.py)."""
+    while True:
+        r = struct.unpack('<I', os.urandom(4))[0]
+        if r:
+            return r
+
+
+def miso_id(frame) -> tuple:
+    """(run_id, frame_no) the H7 copied into MISO 40-47 (v6): the frame the MISO answers. (0, 0) for a frame
+    shorter than FRAME_SIZE or an H7 before v6 (bytes 40-47 not sent)."""
+    b = bytes(frame)
+    if len(b) < OFS_MISO_ID + ID_LEN:
+        return 0, 0
+    return struct.unpack_from('<II', b, OFS_MISO_ID)
 
 
 def decode_state(frame: bytes) -> list:

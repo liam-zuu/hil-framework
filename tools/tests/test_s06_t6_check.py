@@ -15,6 +15,7 @@ import pytest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 sys.path[:0] = [os.path.join(ROOT, 'tools'), os.path.join(ROOT, 'rpi5')]
+from protocol import FRAME_SIZE as FRAME_LEN  # noqa: E402  RS-4 P1: 48-byte frames
 import s06_stream as stm  # noqa: E402
 import s06_t6_check as t6  # noqa: E402
 
@@ -75,7 +76,7 @@ def build(tmp_path, steps=STEPS, hold_s=1.0, gain=(1, 1, 1, 1), offset=None, bad
     rng = np.random.default_rng(11)
     n = PRE + int(len(steps) * hold_s * 1000) + 500 + POST
     t_pi = np.arange(n) * 1000.0 + 200e3                    # µs, frame send times
-    mosi = np.zeros((n, 40), dtype=np.uint8)
+    mosi = np.zeros((n, FRAME_LEN), dtype=np.uint8)
     mosi[:, 21] = np.arange(n) % 256
     t_cmd = [t_pi[PRE] + 100e3 + i * hold_s * 1e6 for i in range(len(steps))]
     duty_true = np.zeros((n, 4))
@@ -89,9 +90,9 @@ def build(tmp_path, steps=STEPS, hold_s=1.0, gain=(1, 1, 1, 1), offset=None, bad
         target = np.array([-s / 1000.0 for s in steps[i]]) if i >= 0 else np.zeros(4)
         cur = a * cur + (1 - a) * target
         duty_true[k] = cur
-    miso = np.zeros((n, 40), dtype=np.uint8)
+    miso = np.zeros((n, FRAME_LEN), dtype=np.uint8)
     for k in range(2, n):
-        b = bytearray(40)
+        b = bytearray(FRAME_LEN)
         for w in range(4):
             v = duty_true[k - 2, w] * gain[w] + (offset[1] if offset and offset[0] == (k, w) else 0.0)
             if offset and offset[0] == ('level', w) and abs(duty_true[k - 2, w] - offset[2]) < 1e-3:

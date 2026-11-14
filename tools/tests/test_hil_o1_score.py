@@ -83,7 +83,7 @@ def write_frame_log(path, task, k0=400, lifecycle=True, tail=T_LATE + 0.5):
     vel = np.gradient(pose[:, :2], DT, axis=0)
     wz = np.gradient(np.unwrap(pose[:, 2]), DT)
     n = len(pose)
-    mosi = np.zeros((n, 40), dtype=np.uint8)
+    mosi = np.zeros((n, P.FRAME_SIZE), dtype=np.uint8)
     for k in range(n):
         st = [0.0] * 4 + [pose[k, 0], pose[k, 1], pose[k, 2], vel[k, 0], vel[k, 1], wz[k]]
         on = k >= k0 + 3
@@ -93,7 +93,7 @@ def write_frame_log(path, task, k0=400, lifecycle=True, tail=T_LATE + 0.5):
                     lifecycle=(dict(outcome='completed', transitions=[dict(step=0, t=0, phase='ARM'),
                                                                       dict(step=k0, t=0.4, phase='RUN')])
                                if lifecycle else None))
-    np.savez(path, manifest=np.array(json.dumps(manifest)), mosi=mosi, miso=np.zeros((n, 40), dtype=np.uint8))
+    np.savez(path, manifest=np.array(json.dumps(manifest)), mosi=mosi, miso=np.zeros((n, P.FRAME_SIZE), dtype=np.uint8))
     return pose[k0:], vel[k0:], wz[k0:], sch
 
 

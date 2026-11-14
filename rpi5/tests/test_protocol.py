@@ -287,6 +287,41 @@ class TestMatchesH7Header:
                                            + [self._define('HIL_IMU_ACCEL_MAX')] * 3
                                            + [self._define('HIL_IMU_YAW_MAX')], rel=1e-6)
 
+    def test_id_offsets(self):
+        """RS-4 P1: MOSI v4 id at 40 (8 bytes), MISO v6 copy at 40."""
+        import protocol as P
+        assert self._define('HIL_MOSI_ID') == P.OFS_RUN_ID == 40 and P.OFS_FRAME_NO == 44
+        assert self._define('HIL_MOSI_ID_LEN') == P.ID_LEN == 8
+        assert self._define('HIL_MISO_ID') == P.OFS_MISO_ID == 40
+
+
+class TestRunIdFrameNo:
+    """RS-4 P1 (MOSI v4): run_id and frame_no in MOSI 40-47, little-endian; the H7 copies them back."""
+
+    def test_encode_writes_run_id_and_frame_no(self):
+        import protocol as P
+        b = P.encode_state([0.0] * 10, seq=0x1234, run_id=0xDEADBEEF, frame_no=0x01020304)
+        assert len(b) == 48 and b[21] == 0x34
+        assert struct.unpack_from('<II', b, 40) == (0xDEADBEEF, 0x01020304)
+        assert struct.unpack_from('<I', P.encode_state([0.0] * 10, seq=777), 44)[0] == 777   # default = seq
+        with pytest.raises(ValueError):
+            P.encode_state([0.0] * 10, run_id=-1)
+        with pytest.raises(ValueError):
+            P.encode_state([0.0] * 10, frame_no=1 << 32)
+
+    def test_new_run_id_never_zero_and_varies(self, monkeypatch):
+        import protocol as P
+        ids = {P.new_run_id() for _ in range(50)}
+        assert 0 not in ids and len(ids) > 45
+        draws = iter([bytes(4), bytes(4), b'\x01\x00\x00\x00'])
+        monkeypatch.setattr(P.os, 'urandom', lambda n: next(draws))
+        assert P.new_run_id() == 1                       # zero draws are skipped
+
+    def test_miso_id(self):
+        import protocol as P
+        m = bytes(40) + struct.pack('<II', 5, 6)
+        assert P.miso_id(m) == (5, 6) and P.miso_id(bytes(40)) == (0, 0)
+
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

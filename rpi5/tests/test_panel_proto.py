@@ -33,15 +33,16 @@ def test_status_layout_and_roundtrip():
     s = pp.Status(sid=0x00071234, daemon_boot=0xBEEF, panel_boot=0x4321, last_cmd_seq=0x0309,
                   last_result=pp.RES_OK, next_seq=0x030A, run_state=pp.ST_RUN, phase_ds=123, profile=4,
                   outcome=pp.OUT_COMPLETED, quality=pp.Q_LOST | pp.Q_SPI_STALE, lost=17, data_age_ms=250,
-                  links=pp.L_RPI | pp.L_H7, error_code=7, last_cmd=pp.CMD_START)
+                  links=pp.L_RPI | pp.L_H7, error_code=7, last_cmd=pp.CMD_START, run_no=0xA1B2)
     f = pp.encode_status(s)
-    assert len(f) == pp.LEN_STATUS == 30 and f[0] == 0xDD and f[27] == pp.CMD_START
+    assert len(f) == pp.LEN_STATUS == 32 and f[0] == 0xDD and f[27] == pp.CMD_START
+    assert f[28:30] == b'\xb2\xa1'                      # run_no (v6, Codex round 4, Liam 04/11: "A")
     assert f[2:6] == b'\x34\x12\x07\x00' and f[6:8] == b'\xef\xbe' and f[8:10] == b'\x21\x43'
     assert f[10:12] == b'\x09\x03' and f[12] == pp.RES_OK and f[13:15] == b'\x0a\x03' and f[15] == pp.ST_RUN
     assert f[16:18] == (123).to_bytes(2, 'little') and (f[18], f[19], f[20]) == (4, pp.OUT_COMPLETED, 5)
     assert f[21:23] == (17).to_bytes(2, 'little') and f[23:25] == (250).to_bytes(2, 'little')
     assert f[25] == pp.L_RPI | pp.L_H7 and f[26] == 7
-    assert struct.unpack_from('<H', f, 28)[0] == pp.crc16(f[:28])
+    assert struct.unpack_from('<H', f, 30)[0] == pp.crc16(f[:30])
     assert pp.decode(f) == s
 
 
