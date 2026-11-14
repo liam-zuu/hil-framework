@@ -654,10 +654,26 @@ def test_stop_after_the_searches_keeps_their_results(fake, tmp_path):
     assert meta['status'] == 'stopped' and meta['sealed_sha256']['manifest.json'] ==         F.s3.sha256_file(out / 'sealed' / 'manifest.json')
 
 
-def test_duplicate_checked_meta_key_refused(fake, tmp_path):
+@pytest.mark.parametrize('extra', ['status: stopped', 'status : stopped', '"status": stopped', "'tool_check': true",
+                                   'tool_check  : true', '"kind": recheck', 'sealed_sha256 : {}',
+                                   '"sealed_sha256": {"manifest.json": "x"}'])
+@pytest.mark.parametrize('where', ['before', 'after'])
+def test_repeated_checked_meta_key_refused(fake, tmp_path, extra, where):
+    """Any YAML spelling of a repeated key is refused (C12R2-5, C12R3-1), also placed BEFORE the real key,
+    where a last-value-wins reader would still see the real value."""
     out = tmp_path / 'run'
     _search(fake, out)
-    with open(out / 'meta.yaml', 'a', encoding='utf-8') as f:
-        f.write('status: stopped' + chr(10) + 'tool_check: true' + chr(10))
+    p = out / 'meta.yaml'
+    text = p.read_text(encoding='utf-8')
+    p.write_text(extra + chr(10) + text if where == 'before' else text + extra + chr(10), encoding='utf-8')
     code, _ = _recheck(fake, out, tmp_path / 'rc', '0.2')
     assert code not in (0, None)
+
+
+def test_strict_yaml_reads_the_written_meta(fake, tmp_path):
+    out = tmp_path / 'run'
+    _search(fake, out)
+    meta = F.strict_yaml((out / 'meta.yaml').read_text(encoding='utf-8'))
+    assert meta == yaml.safe_load((out / 'meta.yaml').read_text(encoding='utf-8'))
+    code, _ = _recheck(fake, out, tmp_path / 'rc', '0.2')
+    assert code == 0

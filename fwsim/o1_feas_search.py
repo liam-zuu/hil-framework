@@ -71,7 +71,6 @@ import hashlib
 import json
 import math
 import os
-import re
 import secrets
 import shutil
 import subprocess
@@ -735,23 +734,39 @@ def _q(x):
     return f'{float(x):.4f}' if _finite(x) else 'nan'
 
 
-def _meta_field(text, key):
-    """Value of a checked meta.yaml key; the key must appear exactly once (C12R2-5), else None."""
-    m = re.findall(rf'^{key}:[ \t]*(.*?)(?:\s+#.*)?$', text, re.M)
-    return m[0].strip() if len(m) == 1 else None
+def strict_yaml(text):
+    """meta.yaml parsed by PyYAML's safe loader that refuses a repeated key at any level, whatever its
+    spelling (`status : x`, `"status": x`): C12R2-5, C12R3-1."""
+    import yaml
+
+    class Strict(yaml.SafeLoader):
+        pass
+
+    def mapping(loader, node, deep=False):
+        keys = [loader.construct_object(k, deep=True) for k, _ in node.value]
+        if len({repr(k) for k in keys}) != len(keys):
+            raise yaml.constructor.ConstructorError(None, None, 'repeated key in a mapping', node.start_mark)
+        return yaml.SafeLoader.construct_mapping(loader, node, deep)
+    Strict.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, mapping)
+    return yaml.load(text, Loader=Strict)
 
 
 def read_source(run):
     """Witnesses of a COMPLETE, non-tool-check search run with an intact sealed/ (C12-4)."""
+    import yaml
     try:
         with open(os.path.join(run, 'meta.yaml'), encoding='utf-8') as f:
-            meta = f.read()
+            meta = strict_yaml(f.read())
     except OSError:
         sys.exit(f'{run}: no meta.yaml')
-    if (_meta_field(meta, 'kind'), _meta_field(meta, 'status'), _meta_field(meta, 'tool_check')) != \
-            ('search', 'complete', 'false'):
+    except yaml.YAMLError:
+        sys.exit(f'{run}: meta.yaml is not valid (repeated key or bad YAML)')
+    if not isinstance(meta, dict) or (meta.get('kind'), meta.get('status'), meta.get('tool_check')) != \
+            ('search', 'complete', False):
         sys.exit(f'{run}: not a complete main search run (kind, status, tool_check)')
-    pub = json.loads(_meta_field(meta, 'sealed_sha256') or '{}')
+    pub = meta.get('sealed_sha256')
+    if not isinstance(pub, dict):
+        sys.exit(f'{run}: meta.yaml has no sealed_sha256 mapping')
     sealed = os.path.join(run, 'sealed')
     man_p = os.path.join(sealed, 'manifest.json')
     if not os.path.isfile(man_p) or s3.sha256_file(man_p) != pub.get('manifest.json'):
