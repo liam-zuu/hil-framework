@@ -96,11 +96,28 @@ def write(tmp_path, rows, name='run.csv', events='auto', cols=COLS):
     return str(p)
 
 
-def run(tmp_path, rows, task='O1-F05', events='auto', cols=COLS, **kw):
+def nominal_sched(task):
+    """(sched_first_s, sched_last_s) of an on-time sender: packet k sent at k/50 s (make_log)."""
+    return 0.0, (task.n_sched - 1) / 50
+
+
+def sender_log(tmp_path, task_id='O1-F05', sched='nominal', name='run_sender.txt'):
+    """'#test_end' of pc_sender.test_loop with the two fields agreed with CODE 15/11 at the end."""
+    t = cp.Task(task_id)
+    a, b = nominal_sched(t) if sched == 'nominal' else sched
+    p = tmp_path / name
+    p.write_text(f'#test_start,test={task_id},t_epoch=1.000,iso=x,duration_s={t.duration:g},send_hz=50\n'
+                 f'#test_end,test={task_id},t_epoch=20.000,zeros=50,tail_planned=50,sent={t.n_sched},'
+                 f'planned={t.n_sched},complete=1,sched_first_s={a},sched_last_s={b}\n', encoding='utf-8')
+    return str(p)
+
+
+def run(tmp_path, rows, task='O1-F05', events='auto', cols=COLS, sched='nominal', **kw):
     p = write(tmp_path, rows, events=events, cols=cols)
     t = cp.Task(task, kw.get('allow_final_set', False))
     rr, ev, dup, has_age = cp.read_log(p)
-    return cp.analyse(rr, t, ev + cp.read_events(p + '.events.txt'), has_age)
+    return cp.analyse(rr, t, ev + cp.read_events(p + '.events.txt'), has_age,
+                      nominal_sched(t) if sched == 'nominal' else sched)
 
 
 def test_clean_run_has_no_flag_and_small_values(tmp_path):
@@ -211,10 +228,51 @@ def test_K1_final_set(tmp_path):
 
 def test_cli_exit_codes(tmp_path):
     p = write(tmp_path, make_log())
-    assert cp.main(['--log', p, '--task', 'O1-F05', '--json', str(tmp_path / 'o.json')]) == 0
-    assert cp.main(['--log', p, '--task', 'O1-F05', '--json', str(tmp_path / 'o.json')]) == 2   # no overwrite
+    s = sender_log(tmp_path)
+    assert cp.main(['--log', p, '--task', 'O1-F05', '--sender', s, '--json', str(tmp_path / 'o.json')]) == 0
+    assert cp.main(['--log', p, '--task', 'O1-F05', '--sender', s, '--json', str(tmp_path / 'o.json')]) == 2
     p2 = write(tmp_path, make_log(motor_on_at=1.5), name='late.csv')
-    assert cp.main(['--log', p2, '--task', 'O1-F05']) == 1
+    assert cp.main(['--log', p2, '--task', 'O1-F05', '--sender', s]) == 1
+    assert cp.main(['--log', p, '--task', 'O1-F05']) == 1                     # no sender log (B81c-1)
+
+
+def test_B81c_1_window_end_from_the_real_send_times(tmp_path):
+    rows = make_log()
+    t = cp.Task('O1-F05')
+    a, b = nominal_sched(t)
+    res = run(tmp_path, rows)
+    assert res['flags'] == [] and res['sched_send_span_s'] == pytest.approx(b - a)
+    assert res['t_w1_us'] - res['t_w0_us'] == round(((b - a) * (1 + cp.E_MAX) + cp.T_SEND) * 1e6)
+    (tmp_path / 'late').mkdir()                        # the sender was late, the last packet 0.3 s later
+    late = run(tmp_path / 'late', rows, sched=(a, b + 0.3))
+    assert late['t_w1_us'] - res['t_w1_us'] == pytest.approx(0.3 * (1 + cp.E_MAX) * 1e6, abs=1)
+    for sub, sched in (('none', None),):
+        (tmp_path / sub).mkdir()
+        res = run(tmp_path / sub, rows, sched=sched)
+        assert any(f.startswith('sched_times_missing') for f in res['flags'])
+        assert res['cond2'].get('no_evidence') and res['cond3'].get('no_evidence') and res['cond4'].get('no_evidence')
+
+
+def test_B81c_1_read_sender(tmp_path):
+    assert cp.read_sender(sender_log(tmp_path, sched=(0.000012, 13.640031)), 'O1-F05') == (0.000012, 13.640031)
+    assert cp.read_sender(sender_log(tmp_path, name='k.txt'), 'O1-F08') is None             # other task
+    assert cp.read_sender(str(tmp_path / 'absent.txt'), 'O1-F05') is None
+    p = tmp_path / 'cut.txt'                           # interrupted: last packet not sent, field empty
+    p.write_text('#test_interrupted\n#test_end,test=O1-F05,t_epoch=5.0,zeros=0,tail_planned=50,sent=200,'
+                 'planned=683,complete=0,sched_first_s=0.000010,sched_last_s=\n', encoding='utf-8')
+    assert cp.read_sender(str(p), 'O1-F05') is None
+    old = tmp_path / 'old.txt'                         # sender before the fields (C6 10/11)
+    old.write_text('#test_end,test=O1-F05,t_epoch=1794322949.749,sent=683,planned=683,complete=1\n', encoding='utf-8')
+    assert cp.read_sender(str(old), 'O1-F05') is None
+    two = tmp_path / 'two.txt'                         # two different #test_end lines of the task
+    two.write_text('#test_end,test=O1-F05,complete=1,sched_first_s=0.0,sched_last_s=13.6\n'
+                   '#test_end,test=O1-F05,complete=1,sched_first_s=0.0,sched_last_s=1.0\n', encoding='utf-8')
+    with pytest.raises(ValueError):
+        cp.read_sender(str(two), 'O1-F05')
+    bad = tmp_path / 'bad.txt'
+    bad.write_text('#test_end,test=O1-F05,complete=1,sched_first_s=2.0,sched_last_s=1.0\n', encoding='utf-8')
+    with pytest.raises(ValueError):
+        cp.read_sender(str(bad), 'O1-F05')
 
 
 # ---------------------------------------------------------------- Codex Sol round 1 (CP1-1 .. CP1-5)
@@ -430,6 +488,19 @@ def test_pre_edge_lag_interval_holds_the_true_receive_time():
         assert d + a - s <= true < d + a + 1.0
 
 
+def test_B81c_7_tick_or_time_not_increasing_is_no_evidence(tmp_path):
+    rows = make_log()
+    edge = next(r['log_seq'] for r in rows if r['run_active'] == 1)
+    by = {r['log_seq']: r for r in rows}
+    for sub, change in (('a', dict(tick=by[edge + 99]['tick'])),                      # tick repeats
+                        ('b', dict(tick=0)),                                          # counter reset
+                        ('c', dict(timestamp_us=by[edge + 99]['timestamp_us']))):     # time repeats
+        (tmp_path / sub).mkdir()
+        res = run(tmp_path / sub, [dict(r, **change) if r['log_seq'] == edge + 100 else r for r in rows])
+        assert any(f.startswith('pair_not_increasing') for f in res['flags']), sub
+        assert res['cond2'].get('no_evidence') and res['cond4'].get('no_evidence'), sub
+
+
 def test_events_file_with_the_agv_logger_time_prefix(tmp_path):
     # agv_logger.py writes '<PC time ISO> <payload>' per line (880, 894), each event 3 times
     rows = make_log()
@@ -444,6 +515,6 @@ def test_CP2_4_cli_prints_the_edge_age_note(tmp_path, capsys):
     rows = make_log()
     edge = next(r['log_seq'] for r in rows if r['run_active'] == 1)
     p = write(tmp_path, [dict(r, traj_age_ms=39) if r['log_seq'] == edge else r for r in rows])
-    assert cp.main(['--log', p, '--task', 'O1-F05']) == 0
+    assert cp.main(['--log', p, '--task', 'O1-F05', '--sender', sender_log(tmp_path)]) == 0
     out = capsys.readouterr().out
     assert '-- edge_age: traj_age_ms 39' in out and out.rstrip().endswith('#ket_qua,ma=0')

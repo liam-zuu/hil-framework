@@ -22,8 +22,12 @@ received and has run_active = 0. That line lost: the edge is unknown (run lost t
 system, edge_unknown). Exactly one rising edge in the log.
 
 Window of the schedule on the ESP32 clock (Liam Q1): start t_w0 = timestamp_us of the edge line;
-end t_w1 = t_w0 + (n_sched - 1)/50 s x (1 + E_MAX) + T_SEND, n_sched = schedule packets of the
-task (rpi5/pc_sender.grid_counts), E_MAX = 2002e-6 the Pi/ESP32 clock-rate bound of S05 4.7 (i),
+end t_w1 = t_w0 + (sched_last_s - sched_first_s) x (1 + E_MAX) + T_SEND, the REAL send times of the
+first and last schedule packets on the Pi monotonic clock, from the '#test_end' line of the sender log
+(fields sched_first_s, sched_last_s; O1 v11.23 3.5 B81c-1, the sender may be late then send in a
+burst; Liam 15/11 CODE_CAM "Tinh tu canh len (Recommended)", format agreed with CODE 15/11). No such
+time (no sender log, field empty or absent): (2), (3), (4) no evidence (sched_times_missing).
+E_MAX = 2002e-6 the Pi/ESP32 clock-rate bound of S05 4.7 (i),
 T_SEND = one send period. The sender has no packet before packet 0 (pc_sender.test_loop) and the
 firmware stamps a packet with its RECEIVE time (main.c 5bde4c5 88) and runs only while a packet is
 fresh (< TRAJ_TIMEOUT 200 ms, main.c 45, 524-525, 611), so with the motor on the edge comes within
@@ -71,9 +75,13 @@ with traj_age_ms < 0 is a flag. Found on the real CAR_LIFTED 14/11 logs, same ro
 carry the agv_logger time prefix (read_events); pre_edge_packet from a 200 ms lag. Round 3 (15/11;
 Liam 15/11 CODE_CAM "Sua hep + vong 4 (Recommended)"): '#run_end' bounds the '#us_end' of the run; the lag
 is an interval (age read after timestamp_us, floored to ms), across 200 ms -> pre_edge_packet_undecided.
+B8-1c (CODE 15/11, O1 v11.23 3.5; Liam 15/11 CODE_CAM "Lam B8-1c roi vong 4 gop (Recommended)"): window end
+from the real send times (--sender, B81c-1); a pair whose tick or timestamp_us does not increase is no
+evidence for (2), (4) (B81c-7).
 On the HIL bench the H7 relays packets all the time, so pre_edge_packet is expected there.
 
-  python tools/o1_cmd_path.py --log <run.csv> --task O1-F05 [--events <run.csv.events.txt>]
+  python tools/o1_cmd_path.py --log <run.csv> --task O1-F05 --sender <run>_sender.txt
+                              [--events <run.csv.events.txt>]
                               [--allow-final-set] [--json out.json]
 Last line: #ket_qua,ma=0 no flag / 1 run lost to the command path or to the measurement system
 (flags in the JSON) / 2 error.
@@ -322,7 +330,27 @@ def find_edge(rows):
     return rises[0], later, probs
 
 
-def analyse(rows, task, events=(), has_age_col=True):
+def read_sender(path, task_id):
+    """(sched_first_s, sched_last_s) from the '#test_end' line of the sender log of task_id, or None when
+    the log or a time is missing (B81c-1). Two '#test_end' lines of the task, or last < first: error."""
+    if not path or not os.path.exists(path):
+        return None
+    ends = [e for e in read_events(path) if e.startswith('#test_end,') and _kv(e).get('test') == task_id]
+    if not ends:
+        return None
+    if len(set(ends)) > 1:
+        raise ValueError(f'{path}: {len(set(ends))} different #test_end lines of {task_id}')
+    kv = _kv(ends[0])
+    a, b = kv.get('sched_first_s', ''), kv.get('sched_last_s', '')
+    if a == '' or b == '':
+        return None
+    a, b = float(a), float(b)
+    if b < a:
+        raise ValueError(f'{path}: sched_last_s {b} < sched_first_s {a}')
+    return a, b
+
+
+def analyse(rows, task, events=(), has_age_col=True, sched=None):
     res = dict(task=task.id, v_cmd_max=task.v, n_sched=task.n_sched, flags=[], notes=[])
     edge, later, probs = find_edge(rows)
     res['flags'] += probs
@@ -331,8 +359,14 @@ def analyse(rows, task, events=(), has_age_col=True):
         return res
     e = rows[edge]
     t0 = e['_t']
-    t_w1 = t0 + int(round(((task.n_sched - 1) * T_SEND * (1 + E_MAX) + T_SEND) * 1e6))
-    res.update(edge_seq=e['_seq'], t_w0_us=t0, t_w1_us=t_w1, edge_traj_age_ms=e['_age'])
+    win_ok = sched is not None
+    span_s = (sched[1] - sched[0]) if win_ok else (task.n_sched - 1) * T_SEND     # nominal: report only
+    t_w1 = t0 + int(round((span_s * (1 + E_MAX) + T_SEND) * 1e6))
+    res.update(edge_seq=e['_seq'], t_w0_us=t0, t_w1_us=t_w1, edge_traj_age_ms=e['_age'],
+               sched_send_span_s=span_s if win_ok else None)
+    if not win_ok:
+        res['flags'].append('sched_times_missing: no real send time of the last schedule packet '
+                            '(sender #test_end sched_first_s, sched_last_s): (2), (3), (4) no evidence')
     has_age = has_age_col
     if not has_age_col:
         res['flags'].append('no_traj_age_column: (3) and the packet-before-edge check no evidence '
@@ -431,8 +465,16 @@ def analyse(rows, task, events=(), has_age_col=True):
     res['n_gap_in_window'] = gaps
     res['n_anchor'] = len(stretch)
 
+    # a pair whose tick or timestamp_us does not increase (counter reset, vel_ctrl.c 5bde4c5 23) has no
+    # bound: (2), (4) no evidence (O1 v11.23 3.5, B81c-7)
+    nonincr = [[a['_seq'], b['_seq']] for a, b in zip(stretch[:-1], stretch[1:])
+               if b['_tick'] <= a['_tick'] or b['_t'] <= a['_t']]
+    if nonincr:
+        res['flags'].append(f'pair_not_increasing: tick or timestamp_us does not increase at log_seq pairs '
+                            f'{nonincr[:3]}: (2), (4) no evidence')
+
     # (2), (4)
-    can24 = end is not None and not toggled and not big
+    can24 = win_ok and end is not None and not toggled and not big and not nonincr
     c2 = c4 = None
     if can24:
         d = [task.lane_dist(r['_x'], r['_y']) for r in stretch]
@@ -458,10 +500,10 @@ def analyse(rows, task, events=(), has_age_col=True):
         for k in range(len(stretch) - 1):
             a, b = stretch[k], stretch[k + 1]
             dt = (b['_t'] - a['_t']) / 1e6
-            nt = (b['_tick'] - a['_tick']) if (a['_tick'] is not None and b['_tick'] is not None) else                 int(math.ceil(dt / 0.005))
+            nt = b['_tick'] - a['_tick']                       # >= 1 here (pair_not_increasing above)
             hidden = b['_seq'] != a['_seq'] + 1 or nt != 1     # a lost line or a tick not logged
             bg = max(abs(a['_x']), abs(a['_y']), abs(b['_x']), abs(b['_y'])) >= COORD_DOUBLE_M
-            r = round_term(task.v, dt, max(nt, 0), bg)
+            r = round_term(task.v, dt, nt, bg)
             b2 = ((d[k] + d[k + 1] + task.v * dt) / 2.0 + r, [a['_seq'], b['_seq']])
             b4 = ((ev[k] + ev[k + 1] + 2.0 * task.v * dt) / 2.0 + r, [a['_seq'], b['_seq']])
             p2a.append(b2)
@@ -484,7 +526,7 @@ def analyse(rows, task, events=(), has_age_col=True):
     # (3)
     if not has_age:
         res['cond3'] = dict(value_ms=None, note='log without traj_age_ms (firmware before RB-4)')
-    elif end is None:
+    elif end is None or not win_ok:
         res['cond3'] = dict(value_ms=None, no_evidence=True)
     else:
         by_seq = {r['_seq']: r for r in rows}
@@ -539,6 +581,7 @@ def main(argv=None):
     ap.add_argument('--log', required=True)
     ap.add_argument('--task', required=True)
     ap.add_argument('--events', default=None, help='default <log>.events.txt when it exists')
+    ap.add_argument('--sender', default=None, help='sender log of the run (pc_sender stdout, #test_end)')
     ap.add_argument('--allow-final-set', action='store_true')
     ap.add_argument('--json', default=None)
     a = ap.parse_args(argv)
@@ -546,7 +589,7 @@ def main(argv=None):
         task = Task(a.task, a.allow_final_set)
         rows, ev_in, dup, has_age = read_log(a.log)
         ev = ev_in + read_events(a.events or (a.log + '.events.txt'))
-        res = analyse(rows, task, ev, has_age)
+        res = analyse(rows, task, ev, has_age, read_sender(a.sender, a.task))
         res.update(log=os.path.basename(a.log), n_lines=len(rows), n_duplicates=dup,
                    thresholds='not locked before C8 (O1 3.5): values reported only')
         if a.json:
