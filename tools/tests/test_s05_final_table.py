@@ -780,7 +780,8 @@ def test_c6_1_set_changed_after_the_ack_is_refused(tmp_path):
     r = write_run(tmp_path, 'w2', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', 0.02)
     ds = _table_ds(tmp_path, [r])
     _set_id(r, 8, ack=False, query=False)
-    with pytest.raises(ValueError, match=r'run w2: dong #gain cua luot khac file gain: id=8, gain file id 7'):
+    with pytest.raises(ValueError, match=r'run w2: dong #gain cua doan motor bat 1/1 \(first_seq=\d+\) khac file '
+                                         r'gain: id=8, gain file id 7'):
         LR(ds)
 
 
@@ -789,7 +790,8 @@ def test_c6_1_gain_values_must_match_bit_for_bit(tmp_path):
     r = write_run(tmp_path, 'w3', 'HIL', 'final_hil', 'PID', 'O1-F05', 'RQ2-INIT-PID/G00', 'dat', 0.02)
     ds = _table_ds(tmp_path, [r])
     other = write_gain_file(os.path.join(ds, 'gain_init_other.json'), gains=dict(kp_xy=1.25))
-    with pytest.raises(ValueError, match=r'run w3: dong #gain cua luot khac file gain: kp_xy: log 1.5'):
+    with pytest.raises(ValueError, match=r'run w3: dong #gain cua doan motor bat 1/1 \(first_seq=\d+\) khac file '
+                                         r'gain: kp_xy: log 1.5'):
         LR(ds, init_gain={'PID': other})
 
 
@@ -865,4 +867,90 @@ def test_c6_2_table_without_ids(tmp_path):
         with open(p, 'w', encoding='utf-8') as f:
             f.write(re.sub(r',id=7(?=[,\n])', '', txt))
     with pytest.raises(ValueError, match='run k1: .*khong so duoc bo gain'):
+        LR(ds)
+
+
+# ---------------------------------------------------------------- Codex Sol round 7 (CODE_R134)
+
+def _two_stretches(r, second_gid=7, second_gain=True):
+    """Rewrite the ESP32 log of row r: two motor-on stretches (the motor stops, then starts again), each with its
+    start lines (#fw, #gain, #us,ev=start) as the firmware sends them; the second '#gain' line with id second_gid,
+    or none."""
+    L = Log()
+    L.off(30)
+    L.on(500, zigzag)
+    L.off(20, after_on=True)
+    L.on(504, zigzag)
+    on = [x['motor_on'] == '1' for x in L.rows]
+    rises = [int(L.rows[i]['log_seq']) for i in range(1, len(L.rows)) if on[i] and not on[i - 1]]
+    assert len(rises) == 2
+    second = start_events(rises[1], t0='2026-11-14T10:00:05')
+    second = ([x.replace('#gain,id=7,', f'#gain,id={second_gid},') for x in second] if second_gain
+              else [x for x in second if ' #gain,' not in x])
+    write_log(r['results_dir'], L.rows, events=start_events(rises[0]) + second)
+
+
+def test_c7_1_every_motor_on_stretch_shows_the_set(tmp_path):
+    """R134C7-1 (Liam 15/11 "Kiem gain moi doan (Recommended)"): a log with two motor-on stretches counts when both
+    show the set of the file (tv_duty has no number then); a second stretch with id 8, or without its '#gain'
+    line, refuses the run."""
+    r = write_run(tmp_path, 't1', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', 0.02)
+    ds = _table_ds(tmp_path, [r])
+    _two_stretches(r)
+    runs, _ = LR(ds)
+    assert len(runs) == 1 and runs[0]['values']['tv_duty'] is None
+    _two_stretches(r, second_gid=8)
+    with pytest.raises(ValueError, match=r'run t1: dong #gain cua doan motor bat 2/2 .* khac file gain: id=8'):
+        LR(ds)
+    _two_stretches(r, second_gain=False)
+    with pytest.raises(ValueError, match=r'run t1: dong #gain cua doan motor bat 2/2 \(first_seq=\d+\): '):
+        LR(ds)
+
+
+def test_c7_1_question_after_shows_the_file_id(tmp_path):
+    """R134C7-1: the question after the run says id 8 (the set changed during the run): refused."""
+    r = write_run(tmp_path, 'q1', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', 0.02)
+    ds = _table_ds(tmp_path, [r])
+    with open(os.path.join(r['results_dir'], 'gain_query_after.txt'), 'w', encoding='utf-8') as f:
+        f.write(answer('4753dc47', t=(200.0, 201.0), gid=8))
+    with pytest.raises(ValueError, match=r"run q1: id dang chay '8' cua lan hoi sau khac id 7"):
+        LR(ds)
+
+
+def test_c7_2_a_frozen_set_without_judged_runs_does_not_stop_the_table(tmp_path):
+    """R134C7-2: the file of B-LADRC was moved after its freeze; the table of runs of other sets is made; a judged
+    run of B-LADRC is refused for it, a hong_he_do run of B-LADRC is not."""
+    a = write_run(tmp_path, 'a1', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', 0.02)
+    h = write_run(tmp_path, 'b0', 'HW', 'final', 'LADRC', 'O1-F05', 'B-LADRC/G02', 'hong_he_do', 0.9)
+    ds = _table_ds(tmp_path, [a, h], frozen=(('A-PID', 'A-PID/G07'), ('B-LADRC', 'B-LADRC/G02')))
+    os.remove(os.path.join(ds, 'gain_B-LADRC_G02.json'))
+    runs, _ = LR(ds)
+    assert sorted(x['run_uid'] for x in runs) == ['a1', 'b0']
+    b = write_run(tmp_path, 'b1', 'HW', 'final', 'LADRC', 'O1-F05', 'B-LADRC/G02', 'dat', 0.02)
+    ds = _table_ds(tmp_path, [a, h, b], frozen=(('A-PID', 'A-PID/G07'), ('B-LADRC', 'B-LADRC/G02')))
+    os.remove(os.path.join(ds, 'gain_B-LADRC_G02.json'))
+    with pytest.raises(ValueError, match=r"run b1: file gain cua 'B-LADRC/G02': .*not found") as e:
+        LR(ds)
+    assert 'run a1' not in str(e.value) and 'run b0' not in str(e.value)
+
+
+def test_c7_3_relative_frozen_name_takes_the_candidate_with_the_sha(tmp_path, monkeypatch):
+    """R134C7-3: gain_file 'gain_rel.json' written at freeze from the working folder; a copy with the same name but
+    other content in the dataset folder does not hide it. No candidate with the sha256: refused."""
+    r = write_run(tmp_path, 'c1', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', 0.02)
+    ds = _table_ds(tmp_path, [r], frozen=())
+    work = tmp_path / 'work'
+    os.makedirs(work)
+    good = write_gain_file(work / 'gain_rel.json')
+    write_gain_file(os.path.join(ds, 'gain_rel.json'), gains=dict(kp_xy=1.25))
+    with open(os.path.join(ds, rl.FREEZE), 'w', newline='', encoding='utf-8') as fh:
+        w = csv.DictWriter(fh, fieldnames=rl.FREEZE_COLS)
+        w.writeheader()
+        w.writerow(dict.fromkeys(rl.FREEZE_COLS, '') | dict(campaign='A-PID', gain_set_id='A-PID/G07',
+                                                             gain_file='gain_rel.json', gain_sha256=rl.sha256_file(good)))
+    monkeypatch.chdir(work)
+    runs, _ = LR(ds)
+    assert runs[0]['gain_file'] == 'gain_rel.json' and runs[0]['gain_sha256'] == rl.sha256_file(good)
+    write_gain_file(good, gains=dict(kp_xy=1.75))                    # no candidate keeps the frozen sha256 now
+    with pytest.raises(ValueError, match=r'run c1: file gain cua .*khac gain_sha256'):
         LR(ds)

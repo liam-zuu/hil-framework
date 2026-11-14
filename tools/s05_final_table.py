@@ -50,7 +50,10 @@ tv_duty (S03 Y3, S05 4.7 (1)), from the cumulative firmware counters dpwm_fl..dp
     R134C6-1 (Codex round 6; Liam 15/11 CODE_R134 "Tham so cua lenh bang (Recommended)"): and the run's '#gain'
     line is the gain file of its set, bit for bit, the file id = the running id of the question before: A, B the
     file of S05_freeze.csv (sha256 checked), the initial gain the file of --init-gain <ctrl>=F; no file for the
-    set stops the table too. The files and their sha256 go to S05_final_gain_files.csv and S05_final_runs.csv.
+    set stops the table too. R134C7-1, -2, -3 (round 7; Liam 15/11 "Kiem gain moi doan (Recommended)"): the '#gain'
+    line of every motor-on stretch of the log, the running id of the question after = the file id; a frozen file
+    that cannot be proved refuses only the judged runs of its set; a relative frozen name takes the first
+    candidate (dataset folder, then working folder) whose sha256 matches. The files and their sha256 go to S05_final_gain_files.csv and S05_final_runs.csv.
     The data lines are read by gain_line_check.read_esp32_log (R134C-3, S05 6.3): lines marked
     'duplicate' in <log>.segments.csv dropped (counted, tv_rows_dropped), 'conflict' / 'ambiguous'
     refused; without the sidecar two lines with one log_seq are refused.
@@ -320,8 +323,12 @@ def gain_files(dataset, init_gain=None):
     """R134C6-1 (Codex round 6; Liam 15/11 CODE_R134 hop chon "Tham so cua lenh bang (Recommended)"): the gain file
     of every gain set the table may meet, {gain_set_id or 'RQ2-INIT-<ctrl>': dict(file, sha256, source, want)}.
     A, B: the rows of <dataset>/S05_freeze.csv (rq3_log freeze); the file as written there (a relative name is
-    taken from the dataset folder first, then from the working folder) and its sha256 must equal gain_sha256.
-    Initial gain (RQ2-INIT-<ctrl>): init_gain {ctrl: file} of --init-gain, its sha256 written to the output.
+    looked for in the dataset folder first, then in the working folder) whose sha256 equals gain_sha256: the first
+    candidate that matches is taken (R134C7-3). A frozen set whose file is not found, matches no sha256 or does not
+    load gives an entry dict(error=..) instead: only a judged run of that set is refused for it (R134C7-2; a set
+    with no judged run in the table does not stop the table).
+    Initial gain (RQ2-INIT-<ctrl>): init_gain {ctrl: file} of --init-gain, its sha256 written to the output; a bad
+    --init-gain stops the table at once (the argument the operator gave).
     want = gain_line_check.load_gain_file of the file; its ctrl must be the controller of the set."""
     import rq3_log as rl
     out = {}
@@ -330,13 +337,19 @@ def gain_files(dataset, init_gain=None):
         if not gs:
             continue
         cand = [p] if os.path.isabs(p) else [os.path.join(dataset, p), p]
-        f = next((c for c in cand if os.path.isfile(c)), None)
-        if f is None:
-            raise ValueError(f'S05_freeze.csv: gain_file {p!r} of {gs} not found (tried {cand})')
-        sha = rl.sha256_file(f)
-        if sha != r.get('gain_sha256', ''):
-            raise ValueError(f'S05_freeze.csv: {f} sha256 {sha} khac gain_sha256 {r.get("gain_sha256")!r} of {gs}')
-        out[gs] = dict(file=f, sha256=sha, source='S05_freeze.csv', want=_want(f, gs.split('/')[0].split('-')[-1]))
+        have = [(c, rl.sha256_file(c)) for c in cand if os.path.isfile(c)]
+        f, sha = next(((c, h) for c, h in have if h == r.get('gain_sha256', '')), (None, None))
+        try:
+            if not have:
+                raise ValueError(f'S05_freeze.csv: gain_file {p!r} of {gs} not found (tried {cand})')
+            if f is None:
+                raise ValueError(f'S05_freeze.csv: gain_file of {gs}: sha256 '
+                                 + ', '.join(f'{c} {h}' for c, h in have)
+                                 + f' khac gain_sha256 {r.get("gain_sha256")!r}')
+            out[gs] = dict(file=f, sha256=sha, source='S05_freeze.csv',
+                           want=_want(f, gs.split('/')[0].split('-')[-1]))
+        except ValueError as e:
+            out[gs] = dict(error=str(e))
     for ctrl, f in (init_gain or {}).items():
         if ctrl not in CONTROLLERS:
             raise ValueError(f'--init-gain {ctrl}=...: controller one of {CONTROLLERS}')
@@ -438,24 +451,33 @@ def load_runs(dataset, score_name, esp32_name, query_before_name='gain_query_bef
 
 
 def run_gain_problem(esp32_path, want):
-    """R134C6-1: None, or why the '#gain' line of the run (next to its start: the first motor-on data line, as
-    tv_duty_esp32 takes it; gain_line_check.run_start) is not the set of the gain file `want`. Only the run's
-    start is taken: a log with a second motor-on stretch keeps its other reasons (tv_duty has no number then)."""
+    """R134C6-1, R134C7-1 (Codex rounds 6, 7; Liam 15/11 CODE_R134 hop chon "Kiem gain moi doan (Recommended)"):
+    None, or why the run does not show the set of the gain file `want` in EVERY motor-on stretch of its ESP32 log:
+    each stretch (a data line with motor_on = 1 after one with 0) must have its own '#gain' line, next to its
+    '#us,ev=start' (first_seq = the first data line of the stretch; gain_line_check.run_start), equal to the file
+    bit for bit. A run whose motor stopped and started again with the same set still counts (tv_duty has no number
+    then); a stretch with another set, or without its '#gain' line, refuses the run."""
     if not os.path.isfile(esp32_path):
         return f'thieu {os.path.basename(esp32_path)}: khong so duoc dong #gain cua luot voi file gain'
     try:
         rows, _ = read_esp32_log_info(esp32_path)
         on = [x.get('motor_on') == '1' for x in rows]
-        rise = next((i for i in range(len(rows)) if on[i]), None)
-        if rise is None or rise == 0:
+        rises = [i for i in range(len(rows)) if on[i] and (i == 0 or not on[i - 1])]
+        if not rises or rises[0] == 0:
             return 'khong xac dinh duoc dong du lieu dau luot (motor_on) de khop #gain voi file gain'
-        st = glc.run_start(read_events(esp32_path), _int(rows[rise]['log_seq']))
+        events = read_events(esp32_path)
+        for k, i in enumerate(rises, 1):
+            seq = _int(rows[i]['log_seq'])
+            st = glc.run_start(events, seq)
+            where = f'doan motor bat {k}/{len(rises)} (first_seq={seq})'
+            if st['gain'] is None:
+                return f'dong #gain cua {where}: {"; ".join(st["why"])} (S05 6.3)'
+            why = glc.gain_mismatch(st['gain'], want)
+            if why:
+                return f'dong #gain cua {where} khac file gain: {"; ".join(why)}'
     except (OSError, glc.InputError) as e:
         return f'dong #gain cua luot: {e}'
-    if st['gain'] is None:
-        return f'dong #gain cua luot: {"; ".join(st["why"])} (S05 6.3)'
-    why = glc.gain_mismatch(st['gain'], want)
-    return f'dong #gain cua luot khac file gain: {"; ".join(why)}' if why else None
+    return None
 
 
 def run_evidence_problem(row, query_before_name='gain_query_before.txt', query_after_name='gain_query_after.txt',
@@ -468,7 +490,9 @@ def run_evidence_problem(row, query_before_name='gain_query_before.txt', query_a
     readable, of the boot, MAC and running id of the question before the run.
     R134C6-1 (Codex round 6): and the set of the row's cell (gain_file: entry of gain_files(), None = no file for
     the gain_set_id): the run's '#gain' line equals that file bit for bit (run_gain_problem), and the id of the file
-    is the running id of the question before (so of the ack too)."""
+    is the running id of the question before (so of the ack too).
+    R134C7-1, -2 (Codex round 7): the '#gain' line of every motor-on stretch; the running id of the question after
+    equals the file id too; a frozen set whose file could not be proved (entry with 'error') refuses its runs."""
     d = row.get('results_dir', '')
     qb, qa = read_query(os.path.join(d, query_before_name)), read_query(os.path.join(d, query_after_name))
     why = glc.query_problem(qb, qa, check_run_boot=False)
@@ -490,9 +514,14 @@ def run_evidence_problem(row, query_before_name='gain_query_before.txt', query_a
         return (f'khong co file gain cua {row.get("gain_set_id")!r}: '
                 + (f'cho --init-gain {g.split("-")[-1]}=<file>' if g.startswith('RQ2-INIT-')
                    else 'bo gain khong co dong trong S05_freeze.csv'))
+    if 'error' in gain_file:                                                         # R134C7-2
+        return f'file gain cua {row.get("gain_set_id")!r}: {gain_file["error"]}'
     want = gain_file['want']
     if int(qb['id']) != want['id']:
         return f'id dang chay {qb["id"]} cua lan hoi truoc khac id {want["id"]} cua file gain {gain_file["file"]}'
+    if not glc._dec(qa.get('id')) or int(qa['id']) != want['id']:                    # R134C7-1
+        return (f'id dang chay {qa.get("id")!r} cua lan hoi sau khac id {want["id"]} cua file gain '
+                f'{gain_file["file"]}: bo gain doi trong luot')
     return run_gain_problem(os.path.join(d, esp32_name), want)
 
 
