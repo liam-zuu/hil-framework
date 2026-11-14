@@ -16,7 +16,14 @@ import o1_cmd_path as cp  # noqa: E402
 
 COLS = ['timestamp_us', 'tick', 'log_seq', 'motor_on', 'run_active', 'pos_reset_n', 'pos_x_ref', 'pos_y_ref',
         'sp_vx', 'sp_vy', 'sp_wz', 'traj_age_ms']
-US_OK = '#us_end,boot=00000001,on=1,swb=0,changes=0,blk_ticks=0,cut_ticks=0,x=0'
+
+
+def us_events(rows, blk=0, cut=0, boot='00000001'):
+    """'#us' start and '#us_end' of the motor-on run, firmware format (us_state.c 5bde4c5)."""
+    mo = [r['log_seq'] for r in rows if r['motor_on'] == 1]
+    return (f'#us,ev=start,boot={boot},on=1,swb=0,first_seq={mo[0]},line_drop=0',
+            f'#us_end,boot={boot},on=1,swb=0,changes=0,blk_ticks={blk},cut_ticks={cut},ticks={len(mo)},'
+            f'last_data_seq={mo[-1]},line_drop=0')
 
 
 def make_log(task_id='O1-F05', drop_packets=(), drop_lines=(), motor_on_at=0.0, pkt_start=0.5,
@@ -76,10 +83,12 @@ def make_log(task_id='O1-F05', drop_packets=(), drop_lines=(), motor_on_at=0.0, 
     return [r for r in rows if r['log_seq'] not in set(drop_lines)]
 
 
-def write(tmp_path, rows, name='run.csv', events=(US_OK,)):
+def write(tmp_path, rows, name='run.csv', events='auto', cols=COLS):
+    if events == 'auto':
+        events = us_events(rows)
     p = tmp_path / name
     with open(p, 'w', newline='', encoding='utf-8') as f:
-        w = csv.DictWriter(f, fieldnames=COLS)
+        w = csv.DictWriter(f, fieldnames=cols, extrasaction='ignore')
         w.writeheader()
         w.writerows(rows)
     if events is not None:
@@ -87,11 +96,11 @@ def write(tmp_path, rows, name='run.csv', events=(US_OK,)):
     return str(p)
 
 
-def run(tmp_path, rows, task='O1-F05', events=(US_OK,), **kw):
-    p = write(tmp_path, rows, events=events)
+def run(tmp_path, rows, task='O1-F05', events='auto', cols=COLS, **kw):
+    p = write(tmp_path, rows, events=events, cols=cols)
     t = cp.Task(task, kw.get('allow_final_set', False))
-    rr, ev, dup = cp.read_log(p)
-    return cp.analyse(rr, t, cp.us_ticks(ev + cp.read_events(p + '.events.txt')))
+    rr, ev, dup, has_age = cp.read_log(p)
+    return cp.analyse(rr, t, ev + cp.read_events(p + '.events.txt'), has_age)
 
 
 def test_clean_run_has_no_flag_and_small_values(tmp_path):
@@ -176,8 +185,8 @@ def test_log_ending_before_the_window_end(tmp_path):
 
 
 def test_ultrasonic_ticks_or_no_us_end(tmp_path):
-    ev = ('#us_end,boot=00000001,on=1,swb=0,changes=0,blk_ticks=3,cut_ticks=2,x=0',)
-    res = run(tmp_path, make_log(), events=ev)
+    rows = make_log()
+    res = run(tmp_path, rows, events=us_events(rows, blk=3, cut=2))
     assert res['cond4']['applies'] is False and res['flags'] == []
     (tmp_path / 'b').mkdir()
     res = run(tmp_path / 'b', make_log(), events=None)
@@ -187,7 +196,7 @@ def test_ultrasonic_ticks_or_no_us_end(tmp_path):
 def test_duplicate_lines_dropped_conflict_is_an_error(tmp_path):
     rows = make_log()
     p = write(tmp_path, rows + rows[10:12])
-    rr, _, dup = cp.read_log(p)
+    rr, _, dup, _ = cp.read_log(p)
     assert dup == 2 and len(rr) == len(rows)
     bad = dict(rows[10], pos_x_ref='1.2345')
     p = write(tmp_path, rows + [bad], name='bad.csv')
@@ -206,3 +215,63 @@ def test_cli_exit_codes(tmp_path):
     assert cp.main(['--log', p, '--task', 'O1-F05', '--json', str(tmp_path / 'o.json')]) == 2   # no overwrite
     p2 = write(tmp_path, make_log(motor_on_at=1.5), name='late.csv')
     assert cp.main(['--log', p2, '--task', 'O1-F05']) == 1
+
+
+# ---------------------------------------------------------------- Codex Sol round 1 (CP1-1 .. CP1-5)
+def test_CP1_1_reset_after_the_window_with_the_off_lines_lost(tmp_path):
+    t = cp.Task('O1-F05')
+    k0 = t.n_sched + 40                                 # packets lost 0.3 s in the zero tail: timeout
+    rows = make_log(toggle_gap=(k0, k0 + 15))
+    rows = [r for r in rows if not (r['run_active'] == 0 and r['log_seq'] > rows[0]['log_seq'] + 100)]
+    seqs = sorted({r['pos_reset_n'] for r in rows})
+    assert len(seqs) > 2                                # 0 before, 1 the run, 2 after the hidden rise
+    res = run(tmp_path, rows)
+    assert any(f.startswith('cond1_pos_reset') for f in res['flags'])
+
+
+def test_CP1_2_missing_columns_and_cells(tmp_path):
+    rows = make_log()
+    res = run(tmp_path, rows, cols=[c for c in COLS if c != 'traj_age_ms'])
+    assert any(f.startswith('no_traj_age_column') for f in res['flags'])
+    with pytest.raises(ValueError):
+        cp.read_log(write(tmp_path, rows, name='nr.csv', cols=[c for c in COLS if c != 'pos_reset_n']))
+    edge = next(r['log_seq'] for r in rows if r['run_active'] == 1)
+    holed = [dict(r, traj_age_ms='') if r['log_seq'] == edge + 50 else r for r in rows]
+    (tmp_path / 'b').mkdir()
+    res = run(tmp_path / 'b', holed)
+    assert any(f.startswith('cond3_age_missing') for f in res['flags'])
+    bad = [dict(r, pos_reset_n='') if r['log_seq'] == edge + 50 else r for r in rows]
+    with pytest.raises(ValueError):
+        cp.read_log(write(tmp_path, bad, name='empty.csv'))
+
+
+def test_CP1_3_us_end_of_another_motor_run_is_not_used(tmp_path):
+    rows = make_log()
+    other = ('#us,ev=start,boot=00000001,on=1,swb=0,first_seq=10,line_drop=0',
+             '#us_end,boot=00000001,on=1,swb=0,changes=0,blk_ticks=1,cut_ticks=0,ticks=30,last_data_seq=40,line_drop=0')
+    res = run(tmp_path, rows, events=other)
+    assert any(f.startswith('us_unknown') for f in res['flags'])
+    (tmp_path / 'b').mkdir()
+    res = run(tmp_path / 'b', rows, events=other + us_events(rows))
+    assert res['cond4']['applies'] is True and res['flags'] == []
+    (tmp_path / 'c').mkdir()
+    ev = us_events(rows, boot='00000002')[:1] + us_events(rows)[1:]     # end of another boot
+    res = run(tmp_path / 'c', rows, events=ev)
+    assert any(f.startswith('us_unknown') for f in res['flags'])
+
+
+def test_CP1_4_manual_command_before_the_edge_is_not_a_packet(tmp_path):
+    rows = make_log()
+    edge = next(r['log_seq'] for r in rows if r['run_active'] == 1)
+    rows = [dict(r, sp_vx='0.200') if edge - 20 <= r['log_seq'] < edge - 5 else r for r in rows]
+    assert all(r['traj_age_ms'] == -1 for r in rows if edge - 20 <= r['log_seq'] < edge - 5)
+    res = run(tmp_path, rows)
+    assert res['flags'] == []
+
+
+def test_CP1_5_edge_age_above_30_ms_is_a_note(tmp_path):
+    rows = make_log()
+    edge = next(r['log_seq'] for r in rows if r['run_active'] == 1)
+    rows = [dict(r, traj_age_ms=39) if r['log_seq'] == edge else r for r in rows]
+    res = run(tmp_path, rows)
+    assert res['flags'] == [] and any(n.startswith('edge_age') for n in res['notes'])

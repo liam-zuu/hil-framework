@@ -56,8 +56,12 @@ Ideal p_cmd(t), t = timestamp_us - t_w0: figure 8 = path_point(tau(t)); K1, K2 =
 body command (no rotation).
 (1): more than one pos_reset_n value on the run_active stretch from the edge to the end anchor.
 Packet before the edge (task 2 of CODE, with C6): any line before the edge (motor on or off) with
-0 <= traj_age_ms < 200 (a fresh packet that did not start the run) or a non-zero command
-(sp_vx, sp_vy, sp_wz) -> pre_edge_packet; edge line traj_age_ms above EDGE_AGE_MS -> edge_age_high.
+0 <= traj_age_ms < 200 (a fresh packet that did not start the run) -> pre_edge_packet. A non-zero
+sp_* alone proves nothing (MANUAL mode, CP1-4). The edge line traj_age_ms is a diagnostic number
+(note above EDGE_AGE_MS, no flag: no locked criterion, CP1-5).
+Codex Sol round 1 (14/11, session 01a1da4f): CP1-1..5 accepted and fixed (reset check over the whole
+log after the edge; required columns and empty cells; #us_end tied to the run of the edge; manual
+commands; edge age as a note).
 On the HIL bench the H7 relays packets all the time, so pre_edge_packet is expected there.
 
   python tools/o1_cmd_path.py --log <run.csv> --task O1-F05 [--events <run.csv.events.txt>]
@@ -98,9 +102,13 @@ R_TICK_M = 2e-7               # 2e-4 mm per tick (float32 accumulation)
 
 
 # ---------------------------------------------------------------- log
+REQUIRED = ('log_seq', 'timestamp_us', 'tick', 'motor_on', 'run_active', 'pos_reset_n', 'pos_x_ref', 'pos_y_ref')
+
+
 def read_log(path):
-    """(rows sorted by log_seq, '#' lines, n_duplicates). Identical duplicate lines of one log_seq
-    are dropped and counted (L92); two different lines with the same log_seq is an error."""
+    """(rows sorted by log_seq, '#' lines, n_duplicates, has traj_age_ms column). Identical duplicate
+    lines of one log_seq are dropped and counted (L92); two different lines with the same log_seq is
+    an error. A missing REQUIRED column or an empty REQUIRED cell is an error (CP1-2)."""
     rows, hashes, dup = {}, {}, 0
     events = []
     with open(path, newline='', encoding='utf-8') as f:
@@ -120,18 +128,29 @@ def read_log(path):
         rows[s] = r
         hashes[s] = key
     out = [rows[s] for s in sorted(rows)]
+    if not out:
+        raise ValueError('no data line')
+    cols = set(out[0].keys())
+    miss = [c for c in REQUIRED if c not in cols]
+    if miss:
+        raise ValueError(f'missing columns {miss} (CP1-2)')
     for r in out:
+        empty = [c for c in REQUIRED if r.get(c, '') in ('', None)]
+        if empty:
+            raise ValueError(f'log_seq {r.get("log_seq")}: empty {empty} (CP1-2)')
         r['_seq'] = int(r['log_seq'])
         r['_t'] = int(r['timestamp_us'])
-        r['_ra'] = r.get('run_active') == '1'
-        r['_mo'] = r.get('motor_on') == '1'
+        r['_ra'] = r['run_active'] == '1'
+        r['_mo'] = r['motor_on'] == '1'
         r['_x'] = float(r['pos_x_ref'])
         r['_y'] = float(r['pos_y_ref'])
-        a = r.get('traj_age_ms', '')
+        r['_tick'] = int(r['tick'])
+        r['_rst'] = r['pos_reset_n']
+        # traj_age_ms: absent column (firmware before RB-4) or empty cell -> None (MISSING, CP1-2);
+        # -1 is the firmware value 'no packet since boot', kept as -1
+        a = r.get('traj_age_ms', '') if 'traj_age_ms' in cols else ''
         r['_age'] = None if a in ('', None) else int(a)
-        tk = r.get('tick', '')
-        r['_tick'] = None if tk in ('', None) else int(tk)
-    return out, events, dup
+    return out, events, dup, 'traj_age_ms' in cols
 
 
 def read_events(path):
@@ -141,19 +160,36 @@ def read_events(path):
         return [ln.strip() for ln in f if ln.startswith('#')]
 
 
-def us_ticks(events):
-    """(blk_ticks, cut_ticks) summed over '#us_end' lines (identical copies counted once), or None."""
-    seen, blk, cut = set(), 0, 0
-    for e in events:
-        if not e.startswith('#us_end'):
-            continue
-        if e in seen:
-            continue
-        seen.add(e)
-        kv = dict(p.split('=', 1) for p in e.split(',')[1:] if '=' in p)
-        blk += int(kv.get('blk_ticks', 0))
-        cut += int(kv.get('cut_ticks', 0))
-    return (blk, cut) if seen else None
+def _kv(e):
+    return dict(p.split('=', 1) for p in e.split(',')[1:] if '=' in p)
+
+
+def us_for_edge(events, edge_seq):
+    """(blk_ticks, cut_ticks) of the ultrasonic summary of the motor-on run that holds the edge, or
+    None when it cannot be tied (CP1-3). Firmware AGV 5bde4c5 (main.c run_udp_mark, push_run_end;
+    us_state.c us_format_line): '#us,ev=start,boot=B,...,first_seq=F' at motor on (F = first data
+    line of the run) and '#us_end,boot=B,...,blk_ticks,cut_ticks,ticks,last_data_seq=L' at motor
+    off. Tied when one start of boot B has F <= edge_seq, no later start of any boot has
+    F <= edge_seq, and one '#us_end' of boot B has L >= edge_seq with no start between F and L."""
+    starts, ends = [], []
+    for e in dict.fromkeys(events):                      # identical copies once (logger sends 3)
+        if e.startswith('#us,') and _kv(e).get('ev') == 'start':
+            kv = _kv(e)
+            starts.append((int(kv['first_seq']), kv.get('boot')))
+        elif e.startswith('#us_end'):
+            kv = _kv(e)
+            ends.append((int(kv['last_data_seq']), kv.get('boot'), int(kv['blk_ticks']), int(kv['cut_ticks'])))
+    before = [s for s in starts if s[0] <= edge_seq]
+    if not before:
+        return None
+    f0, boot = max(before)
+    cand = sorted(e for e in ends if e[1] == boot and e[0] >= edge_seq)
+    if not cand:
+        return None
+    last = cand[0][0]
+    if any(f0 < s[0] <= last for s in starts):
+        return None
+    return cand[0][2], cand[0][3]
 
 
 # ---------------------------------------------------------------- task geometry (firmware frame)
@@ -241,7 +277,7 @@ def find_edge(rows):
     return rises[0], later, probs
 
 
-def analyse(rows, task, us=None):
+def analyse(rows, task, events=(), has_age_col=True):
     res = dict(task=task.id, v_cmd_max=task.v, n_sched=task.n_sched, flags=[], notes=[])
     edge, later, probs = find_edge(rows)
     res['flags'] += probs
@@ -252,7 +288,11 @@ def analyse(rows, task, us=None):
     t0 = e['_t']
     t_w1 = t0 + int(round(((task.n_sched - 1) * T_SEND * (1 + E_MAX) + T_SEND) * 1e6))
     res.update(edge_seq=e['_seq'], t_w0_us=t0, t_w1_us=t_w1, edge_traj_age_ms=e['_age'])
-    has_age = e['_age'] is not None
+    has_age = has_age_col
+    if not has_age_col:
+        res['flags'].append('no_traj_age_column: (3) and the packet-before-edge check no evidence '
+                            '(main runs need the campaign binary, O1 3.5)')
+    us = us_for_edge(events, e['_seq'])
 
     # motor-on stretch around the edge
     lo = edge
@@ -261,16 +301,20 @@ def analyse(rows, task, us=None):
     pre = rows[lo:edge]
     # packet before the edge (task 2)
     # every line before the edge, motor on or off: a schedule started while the motor was off makes the
-    # edge come mid-schedule with no motor-on line before it (one file = one run)
-    pe = [r['_seq'] for r in rows[:edge] if (has_age and r['_age'] is not None and 0 <= r['_age'] < TRAJ_TIMEOUT_MS)
-          or abs(float(r['sp_vx'])) + abs(float(r['sp_vy'])) + abs(float(r['sp_wz'])) > 0]
+    # edge come mid-schedule with no motor-on line before it (one file = one run). Only the packet age
+    # shows a received trajectory packet: a non-zero sp_* may be a MANUAL command (CP1-4)
+    pe = [r['_seq'] for r in rows[:edge] if r['_age'] is not None and 0 <= r['_age'] < TRAJ_TIMEOUT_MS]
+    miss_pre = [r['_seq'] for r in rows[:edge] if has_age and r['_age'] is None]
+    if miss_pre:
+        res['flags'].append(f'pre_edge_age_missing: empty traj_age_ms before the edge at {miss_pre[:5]}')
     res['pre_edge_motor_on_lines'] = len(pre)
     res['pre_edge_packet_seqs'] = pe[:20]
     if pe:
         res['flags'].append(f'pre_edge_packet: {len(pe)} lines before the edge with a fresh packet '
                             f'or a non-zero command')
     if has_age and e['_age'] is not None and (e['_age'] < 0 or e['_age'] > EDGE_AGE_MS):
-        res['flags'].append(f'edge_age_high: traj_age_ms {e["_age"]} at the edge (> {EDGE_AGE_MS}, DE XUAT)')
+        # diagnostic number only: no locked criterion (CP1-5)
+        res['notes'].append(f'edge_age: traj_age_ms {e["_age"]} at the edge (DE XUAT reference {EDGE_AGE_MS} ms)')
 
     # run_active stretch from the edge to the end anchor
     end = None
@@ -290,10 +334,13 @@ def analyse(rows, task, us=None):
         res['flags'].append('no_end_anchor: no line at or after the window end (2), (3), (4) no evidence')
     if toggled:
         res['flags'].append('run_active_toggle: run_active falls in the window: (2), (4) no evidence')
-    resets = sorted({r.get('pos_reset_n') for r in stretch if r['_ra']})
+    # (1) and run integrity on EVERY line from the edge to the end of the log, not only the window:
+    # a timeout then a new rise after the window with the run_active = 0 lines lost shows only as a
+    # pos_reset_n change (CP1-1); one file = one run
+    resets = list(dict.fromkeys(r['_rst'] for r in rows[edge:]))
     res['pos_reset_n_values'] = resets
     if len(resets) > 1:
-        res['flags'].append(f'cond1_pos_reset: pos_reset_n {resets} in the run')
+        res['flags'].append(f'cond1_pos_reset: pos_reset_n {resets} after the edge')
     big = [r['_seq'] for r in stretch if max(abs(r['_x']), abs(r['_y'])) >= COORD_MAX_M]
     if big:
         res['flags'].append(f'coord_over_8m: |x_ref| or |y_ref| >= 8 m at log_seq {big[:5]}')
@@ -384,7 +431,11 @@ def analyse(rows, task, us=None):
             worst, at, neg = -math.inf, None, 0
             for pa, pb in zip(chain[:-1], chain[1:]):
                 age = pa['_age']
-                if age is None or age < 0:     # no packet yet at a: any later packet came after t_a
+                if age is None:                 # empty cell: no evidence for this pair (CP1-2)
+                    res['flags'].append(f'cond3_age_missing: empty traj_age_ms at log_seq {pa["_seq"]}')
+                    at = None
+                    break
+                if age < 0:                     # -1: no packet since boot; any later packet came after t_a
                     neg += 1
                     age = 0
                 b3 = age + 1.0 + (pb['_t'] - pa['_t']) / 1e3 + L_of(pb) / 1e3
@@ -410,9 +461,9 @@ def main(argv=None):
     a = ap.parse_args(argv)
     try:
         task = Task(a.task, a.allow_final_set)
-        rows, ev_in, dup = read_log(a.log)
+        rows, ev_in, dup, has_age = read_log(a.log)
         ev = ev_in + read_events(a.events or (a.log + '.events.txt'))
-        res = analyse(rows, task, us_ticks(ev))
+        res = analyse(rows, task, ev, has_age)
         res.update(log=os.path.basename(a.log), n_lines=len(rows), n_duplicates=dup,
                    thresholds='not locked before C8 (O1 3.5): values reported only')
         if a.json:
@@ -432,6 +483,8 @@ def main(argv=None):
             print(f'  (3) tuoi goi       {c3["value_ms"]:.1f} ms (cap neo {c3["at_seq"]})')
         for fl in res['flags']:
             print(f'  !! {fl}')
+        for nt in res['notes'] + [c.get('note') for c in (c2, c3, c4) if c.get('note')]:
+            print(f'  -- {nt}')
         rc = 1 if lost(res) else 0
     except (OSError, ValueError, KeyError) as exc:
         print(f'LOI: {exc}')
