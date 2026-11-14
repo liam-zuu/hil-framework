@@ -537,7 +537,7 @@ def esp_clock_ppm(raw_path: str):
     Sign (B81-20, THESIS_B8 14/11, CODE): the hull slope s is d(receive - timestamp) / d(timestamp) = f_Pi / f_ESP
     - 1; the value returned is f_ESP / f_Pi - 1 = -s / (1 + s), > 0 when the ESP32 clock runs fast, as the name
     says. Before 14/11 s itself was returned (the opposite sign; S05 4.7 (i) uses |esp_pi_ppm|, which changes
-    by the factor 1 / (1 + s), under 0.1 % at |s| <= 1000 ppm; Codex B8C-R1 note)."""
+    by the factor 1 / (1 + s), at most |s| / (1 - |s|) = 0.1001 % at |s| <= 1000 ppm; Codex B8C-R1 note, R2-3)."""
     pts = []
     with open(raw_path, encoding='utf-8') as f:
         for line in f:
@@ -708,11 +708,13 @@ def pwm_side(duty, k_run, esp, ie, period_us):
         return dict(ok=False, reason='pwm never leaves 0 after the edge')
     lo, hi = k_run + SEARCH[0], k_run + SEARCH[1]
     # frames before the first line used get pwm 0 (the 0 before the edge): the log must show it over every time
-    # a fit frame can fall on, (lo - 5 - hi - 2) steps before the edge on (Codex B8C-R1-5)
-    t_pre = ts[ie] - (hi - lo + 7) * period_us
-    pre = np.arange(ie)
-    pre = pre[ts[pre] >= t_pre]
-    if ie == 0 or ts[0] > t_pre or np.any(pw[pre] != 0):
+    # a fit frame can fall on (Codex B8C-R1-5). Earliest: the first frame compared, max(0, lo - 5) (the frame range
+    # below, cut at frame 0: B8C-R2-2), at the largest shift tried, hi + 2 (the fine grid reaches hi + 1). The pwm
+    # held at that time is the one of the last line at or before it (B8C-R2-1): that line and every later line up
+    # to the edge must show 0, and such a line must exist.
+    t_pre = ts[ie] + (max(0, int(lo) - 5) - (hi + 2)) * period_us
+    cover = np.nonzero(ts[:ie] <= t_pre)[0]
+    if ie == 0 or not len(cover) or np.any(pw[cover[-1]:ie] != 0):
         return dict(ok=False, reason='PWM side: the log does not show pwm 0 over the time before the edge the fit '
                                      'can reach (Codex B8C-R1-5)')
     good = np.all(np.abs(D) < GLITCH, axis=1)

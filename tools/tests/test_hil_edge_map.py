@@ -881,24 +881,42 @@ def test_wrong_duty_in_the_last_part_of_the_3_s_window_is_refused():
 
 def test_pwm_before_the_edge_must_show_zero():
     # Codex B8C-R1-5: frames before the first line used get pwm 0; the log must show 0 over the time before the
-    # edge a fit frame can reach (SEARCH range + 7 steps), else refused
-    ie, n = 6, 5000
-    ts = np.r_[np.arange(-600, 0, 100), np.arange(0, 4000, 10)] * 1000.0
+    # edge a fit frame can reach, else refused. k_run 1000: frames from lo - 5 = 895, shifts to hi + 2 = 1402, so
+    # the reach is 507 ms before the edge. The pwm at that time is the one of the last line at or before it
+    # (Codex B8C-R2-1), so that line counts too, and a line at or before -507 ms must exist.
+    ie, n = 7, 5000
+    ts = np.r_[np.arange(-700, 0, 100), np.arange(0, 4000, 10)] * 1000.0
     run_active = (np.arange(len(ts)) >= ie).astype(int)
     pw = np.zeros((len(ts), 4))
     pw[ie:] = 50.0
     esp = dict(timestamp_us=ts, pwm=pw, run_active=run_active)
     duty = np.zeros((n, 4))
-    base = M.pwm_side(duty, 1000, esp, ie, 1000.0)
-    assert 'before the edge' not in base.get('reason', ''), base
+
+    def why(e, k_run=1000, i=ie):
+        return M.pwm_side(duty, k_run, e, i, 1000.0).get('reason', '')
+    assert 'before the edge' not in why(esp)
     bad = dict(esp, pwm=pw.copy())
     bad['pwm'][ie - 2] = 30.0                                  # 200 ms before the edge: inside the reach
-    assert 'before the edge' in M.pwm_side(duty, 1000, bad, ie, 1000.0)['reason']
+    assert 'before the edge' in why(bad)
+    held = dict(esp, pwm=pw.copy())
+    held['pwm'][1] = 30.0                                      # -600 ms, held to -500 ms: covers -507 ms (R2-1)
+    assert 'before the edge' in why(held)
     far = dict(esp, pwm=pw.copy())
-    far['pwm'][0] = 30.0                                       # 600 ms before: outside (reach 507 ms)
-    assert 'before the edge' not in M.pwm_side(duty, 1000, far, ie, 1000.0).get('reason', '')
-    short = dict(timestamp_us=ts[4:], pwm=pw[4:], run_active=run_active[4:])   # log starts 200 ms before
-    assert 'before the edge' in M.pwm_side(duty, 1000, short, ie - 4, 1000.0)['reason']
+    far['pwm'][0] = 30.0                                       # -700 ms, replaced by the 0 at -600 ms: outside
+    assert 'before the edge' not in why(far)
+    short = dict(timestamp_us=ts[4:], pwm=pw[4:], run_active=run_active[4:])   # log starts 300 ms before
+    assert 'before the edge' in why(short, i=ie - 4)
+    late = dict(timestamp_us=ts[2:], pwm=pw[2:], run_active=run_active[2:])    # first line -500 ms > -507 ms
+    assert 'before the edge' in why(late, i=ie - 2)
+    # Codex B8C-R2-2: k_run 50, the frames start at 0 (not lo - 5 = -55), so the reach is 0 - 452 = -452 ms:
+    # a log from -500 ms covers it, one from -400 ms does not
+    from500 = dict(timestamp_us=ts[2:], pwm=pw[2:], run_active=run_active[2:])
+    assert 'before the edge' not in why(from500, k_run=50, i=ie - 2)
+    from400 = dict(timestamp_us=ts[3:], pwm=pw[3:], run_active=run_active[3:])
+    assert 'before the edge' in why(from400, k_run=50, i=ie - 3)
+    held50 = dict(from500, pwm=from500['pwm'].copy())
+    held50['pwm'][0] = 30.0                                    # -500 ms, held to -400 ms: covers -452 ms
+    assert 'before the edge' in why(held50, k_run=50, i=ie - 2)
 
 
 def test_plateau_right_end():
