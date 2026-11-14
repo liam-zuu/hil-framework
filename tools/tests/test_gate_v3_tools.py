@@ -106,10 +106,24 @@ def _rows(d):
         return list(csv.DictReader(f))
 
 
+def _end(d, outcome, gate=None, **kw):
+    """rl.end with what a car run needs since B8-1 (S05 v3.20 C9 (a)-(c)): its gate as a camera scorer output
+    (FAKE: rl.floor_gate, the two frame domains equal; B81-1, B81-3); a judged car or final_hil run both boot
+    answers (B81-2).
+    Other platforms: rl.end unchanged. Tests of the B8-1 rules themselves call rl.end."""
+    row = (rl._load_open(d) or {}).get('row', {})
+    if row.get('platform') == 'HW' and gate is not None and gate['g1'].get('t_done') is None:
+        gate = rl.floor_gate(gate)
+    if outcome in rl.VALID and rl.boot_needed(row.get('platform'), row.get('stage')):     # car, final_hil
+        kw.setdefault('boot_before', 'ab')
+        kw.setdefault('boot_after', 'ab')
+    return rl.end(d, outcome, gate=gate, **kw)
+
+
 def test_gate_columns_written(ds):
     d, clock = ds
     _open(d, clock)
-    rl.end(d, 'khong_dat', gate=_gate(e_trk=0.12), results_dir='res/x', gate_sha256='ab' * 32)
+    _end(d, 'khong_dat', gate=_gate(e_trk=0.12), results_dir='res/x', gate_sha256='ab' * 32)
     r = _rows(d)[-1]
     assert r['gate_version'] == G.GATE_VERSION and r['gate_decide'] == 'g1,g2,g3,g4,g5'
     assert r['gate_json_sha256'] == 'ab' * 32 and r['results_dir'] == 'res/x' and float(r['gate_u_t']) == 0.0
@@ -124,7 +138,7 @@ def test_gate_columns_written(ds):
 def test_hil_columns_without_mapping(ds):
     d, clock = ds
     _open(d, clock, 'HIL')
-    rl.end(d, 'hong_he_do', fail_cause=rl.MAP_REFUSED, gate=_gate(decide=G.DECIDE_HIL, u_t=None), results_dir='r')
+    _end(d, 'hong_he_do', fail_cause=rl.MAP_REFUSED, gate=_gate(decide=G.DECIDE_HIL, u_t=None), results_dir='r')
     r = _rows(d)[-1]
     assert r['gate_u_t'] == '' and r['g3_lo'] == r['g3_hi'] == '' and r['g3_n_undef'] == '20'
     assert float(r['g3_q']) == pytest.approx(0.03) and r['g3_state'] == 'chua_ket_luan'
@@ -135,42 +149,42 @@ def test_gate_needs_results_dir(ds):
     d, clock = ds
     _open(d, clock)
     with pytest.raises(rl.LogError, match='results-dir'):                  # GV3-6
-        rl.end(d, 'khong_dat', gate=_gate(e_trk=0.12))
+        _end(d, 'khong_dat', gate=_gate(e_trk=0.12))
 
 
 def test_outcome_against_the_gate(ds):
     d, clock = ds
     _open(d, clock)
     with pytest.raises(rl.LogError, match='disagrees'):                    # G3 certainly failed
-        rl.end(d, 'chua_ket_luan', gate=_gate(e_trk=0.12), results_dir='r')
+        _end(d, 'chua_ket_luan', gate=_gate(e_trk=0.12), results_dir='r')
     with pytest.raises(rl.LogError, match='on platform'):                  # GV3-R2-2: HW run, HIL deciding set
-        rl.end(d, 'chua_ket_luan', gate=_gate(decide=G.DECIDE_HIL, u_t=None), results_dir='r')
+        _end(d, 'chua_ket_luan', gate=_gate(decide=G.DECIDE_HIL, u_t=None), results_dir='r')
     with pytest.raises(rl.LogError, match='disagrees'):                    # complete gate: dat is dat
-        rl.end(d, 'chua_ket_luan', gate=_gate(), results_dir='r')
-    rl.end(d, 'dat', gate=_gate(), results_dir='r')                        # all five decide and pass
+        _end(d, 'chua_ket_luan', gate=_gate(), results_dir='r')
+    _end(d, 'dat', gate=_gate(), results_dir='r')                        # all five decide and pass
     _open(d, clock)
-    rl.end(d, 'chua_ket_luan', gate=_gate(completed='inconclusive'), results_dir='r')
+    _end(d, 'chua_ket_luan', gate=_gate(completed='inconclusive'), results_dir='r')
     _open(d, clock, 'HIL')
     unmapped = _gate(decide=G.DECIDE_HIL, u_t=None)
     # S05 v3.15 4.5 step 2 (replaces GV3-1, GV3-2): HIL without the RS-4 mapping is a lost run, whatever G1, G2 say
     for outcome, gate in (('dat', unmapped), ('chua_ket_luan', unmapped), ('khong_dat', unmapped),
                           ('khong_dat', _gate(decide=G.DECIDE_HIL, u_t=None, e_perp=0.2))):   # G2 certain fail too
         with pytest.raises(rl.LogError, match='not mapped'):
-            rl.end(d, outcome, gate=gate, results_dir='r')
+            _end(d, outcome, gate=gate, results_dir='r')
     with pytest.raises(rl.LogError, match='not mapped'):                   # another fail cause
-        rl.end(d, 'hong_he_do', fail_cause='mat_khung', gate=unmapped, results_dir='r')
-    rl.end(d, 'hong_he_do', fail_cause=rl.MAP_REFUSED, gate=_gate(decide=G.DECIDE_HIL, u_t=None, e_bao=0.2),
+        _end(d, 'hong_he_do', fail_cause='mat_khung', gate=unmapped, results_dir='r')
+    _end(d, 'hong_he_do', fail_cause=rl.MAP_REFUSED, gate=_gate(decide=G.DECIDE_HIL, u_t=None, e_bao=0.2),
            results_dir='r')
     _open(d, clock, 'HIL')
     with pytest.raises(rl.LogError, match='has the mapping'):              # mapped gate, cause says refused
-        rl.end(d, 'hong_he_do', fail_cause=rl.MAP_REFUSED, gate=_gate(u_t=0.0015), results_dir='r')
+        _end(d, 'hong_he_do', fail_cause=rl.MAP_REFUSED, gate=_gate(u_t=0.0015), results_dir='r')
     with pytest.raises(rl.LogError, match='gate-json'):                    # refused needs the scorer output
-        rl.end(d, 'hong_he_do', fail_cause=rl.MAP_REFUSED, results_dir='r')
-    rl.end(d, 'dat', gate=_gate(u_t=0.0015), results_dir='r')             # HIL with the mapping: all five
+        _end(d, 'hong_he_do', fail_cause=rl.MAP_REFUSED, results_dir='r')
+    _end(d, 'dat', gate=_gate(u_t=0.0015), results_dir='r')             # HIL with the mapping: all five
     _open(d, clock)
     with pytest.raises(rl.LogError, match='gate-json'):                    # not a HIL run
-        rl.end(d, 'hong_he_do', fail_cause=rl.MAP_REFUSED, gate=_gate(e_trk=0.12), results_dir='r')
-    rl.end(d, 'hong_he_do', fail_cause='mat_khung', gate=_gate(e_trk=0.12), results_dir='r')
+        _end(d, 'hong_he_do', fail_cause=rl.MAP_REFUSED, gate=_gate(e_trk=0.12), results_dir='r')
+    _end(d, 'hong_he_do', fail_cause='mat_khung', gate=_gate(e_trk=0.12), results_dir='r')
     assert [r['run_outcome'] for r in _rows(d)] == ['dat', 'chua_ket_luan', 'hong_he_do', 'dat', 'hong_he_do']
     rl.summary(d)                                                          # the rows written by end pass
 
@@ -181,8 +195,8 @@ def _hil_check(d, clock, gain_set='B-PID/GA1', task='O1-F05', speed='0.5', stage
     rl.step(d, 'run')
     clock[0] += dt.timedelta(seconds=60)
     if mapped:
-        return rl.end(d, 'dat', gate=_gate(u_t=0.0015), results_dir='r')
-    return rl.end(d, 'hong_he_do', fail_cause=rl.MAP_REFUSED, gate=_gate(decide=G.DECIDE_HIL, u_t=None),
+        return _end(d, 'dat', gate=_gate(u_t=0.0015), results_dir='r')
+    return _end(d, 'hong_he_do', fail_cause=rl.MAP_REFUSED, gate=_gate(decide=G.DECIDE_HIL, u_t=None),
                   results_dir='r')
 
 
@@ -233,12 +247,13 @@ def test_s315_1_hil_judged_without_gate(ds):
     _open(d, clock, 'HIL')
     for o in ('dat', 'khong_dat', 'chua_ket_luan'):
         with pytest.raises(rl.LogError, match='needs its scorer output'):
-            rl.end(d, o, results_dir='r')
-    rl.end(d, 'hong_he_do', fail_cause='mat_khung', results_dir='r')       # a lost run without gate: allowed
+            _end(d, o, results_dir='r')
+    _end(d, 'hong_he_do', fail_cause='mat_khung', results_dir='r')       # a lost run without gate: allowed
     _open(d, clock)
-    with pytest.raises(rl.LogError, match='SC3-2'):                        # R134 (d): no car dat without gate
-        rl.end(d, 'dat')
-    rl.end(d, 'khong_dat')                                                 # a car run judged without gate
+    for o in ('dat', 'khong_dat', 'chua_ket_luan'):                        # R134 (d), B81-1: no car run judged
+        with pytest.raises(rl.LogError, match='camera scorer'):            # without its gate
+            _end(d, o)
+    _end(d, 'hong_he_do', fail_cause='mat_khung')                          # a lost car run without gate
     rl.summary(d)
     path = os.path.join(d, rl.TUNING)
     base = _rows(d)
@@ -303,7 +318,7 @@ def test_s315_5_log_changed_between_begin_and_end(ds):
     rl._write_all(path, rl.TUNING_COLS, rows + [dict(rows[-1], run_uid='X:1', session_id='X', iter_no='1')])
     before = _rows(d)
     with pytest.raises(rl.LogError, match='not logged'):
-        rl.end(d, 'hong_he_do', fail_cause=rl.MAP_REFUSED, gate=_gate(decide=G.DECIDE_HIL, u_t=None),
+        _end(d, 'hong_he_do', fail_cause=rl.MAP_REFUSED, gate=_gate(decide=G.DECIDE_HIL, u_t=None),
                results_dir='r')
     assert _rows(d) == before and os.path.exists(os.path.join(d, rl.OPEN_RUN))   # still open, log unchanged
     rl._write_all(path, rl.TUNING_COLS, rows)                              # back to 3 refusals
@@ -320,7 +335,7 @@ def test_s315_5_log_changed_between_begin_and_end(ds):
     rl._write_all(path, rl.TUNING_COLS, rows)
     before = _rows(d)
     with pytest.raises(rl.LogError, match='not logged.*other values of kp_xy'):
-        rl.end(d, 'hong_he_do', fail_cause=rl.MAP_REFUSED, gate=_gate(decide=G.DECIDE_HIL, u_t=None),
+        _end(d, 'hong_he_do', fail_cause=rl.MAP_REFUSED, gate=_gate(decide=G.DECIDE_HIL, u_t=None),
                results_dir='r')
     assert _rows(d) == before
 
@@ -389,7 +404,7 @@ def test_sc3_1_example_end_to_end(ds):
     g['g2'].update(q=0.12, lo=0.11, hi=0.06, n_undef=1, state='khong_dat')  # hi: max over the finite frames
     g.update(outcome='khong_dat', outcome_decide='khong_dat', any_certain_fail=True)
     _open(d, clock)
-    rl.end(d, 'khong_dat', gate=g, results_dir='r')
+    _end(d, 'khong_dat', gate=g, results_dir='r')
     r = _rows(d)[-1]
     assert (r['g2_lo'], r['g2_n_undef'], r['g2_state']) == ('0.11', '1', 'khong_dat')
     rl.summary(d)
@@ -398,8 +413,8 @@ def test_sc3_1_example_end_to_end(ds):
 @pytest.mark.parametrize('edit,match', [
     (dict(platform='HIL', run_outcome='dat', gate_decide='g1,g2', gate_u_t='', g3_lo='', g3_hi='', g3_n_undef='20',
           g3_state='chua_ket_luan', g5_lo='', g5_hi='', g5_n_undef='20', g5_state='chua_ket_luan'), 'no run is dat'),
-    (dict(g2_lo='0.2', g2_q='0.2', g2_hi='0.2', g2_state='dat'), 'recomputed from lo, hi'),   # state lied about
-    (dict(g4_n_undef='1'), 'recomputed from lo, hi'),
+    (dict(g2_lo='0.2', g2_q='0.2', g2_hi='0.2', g2_state='dat'), 'recomputed from lo'),   # state lied about
+    (dict(g4_n_undef='1'), 'recomputed from lo'),
     (dict(g4_n_undef='-1'), 'whole number'),
     (dict(g4_n_undef='0.5'), 'whole number'),
     (dict(g3_lo='0.05'), 'lo'),                                            # lo > q
@@ -414,13 +429,16 @@ def test_sc3_1_example_end_to_end(ds):
     (dict(gate_version='', gate_decide='', run_outcome='dat'), 'only'),              # any gate cell left
 ])
 def test_summary_recomputes_gate_rows(ds, edit, match):
-    # GV3-1, GV3-R2-1: summary recomputes every gate row, does not trust the state columns
+    # GV3-1, GV3-R2-1: summary recomputes every gate row, does not trust the state columns. A one-domain row
+    # (SIM; B81-3: the common-domain columns are a copy of the union), each number edited in both domains
     d, clock = ds
-    _open(d, clock)
-    rl.end(d, 'chua_ket_luan', gate=_gate(completed='inconclusive'), results_dir='r')
+    _open(d, clock, 'SIM')
+    _end(d, 'chua_ket_luan', gate=_gate(completed='inconclusive'), results_dir='r')
     path = os.path.join(d, rl.TUNING)
     rows = _rows(d)
     rows[-1].update(edit)
+    rows[-1].update({k + '_chung': v for k, v in edit.items() if k[:3] in ('g2_', 'g3_', 'g4_', 'g5_')
+                     and k[3:] in rl.DOMAIN_FIELDS})
     rl._write_all(path, rl.TUNING_COLS, rows)
     with pytest.raises(rl.LogError, match=match):
         rl.summary(d)
@@ -428,7 +446,7 @@ def test_summary_recomputes_gate_rows(ds, edit, match):
 
 @pytest.mark.parametrize('patch,match', [
     (lambda g: g.update(outcome_decide='dat', outcome='dat', any_certain_fail=False), 'recomputed'),
-    (lambda g: g['g3'].update(state='dat'), 'recomputed from lo, hi'),
+    (lambda g: g['g3'].update(state='dat'), 'recomputed from lo'),
     (lambda g: g['g3'].update(n_undef=-1), 'whole number'),
     (lambda g: g['g3'].update(n_undef=True), 'whole number'),
     (lambda g: g['g3'].update(q='0.1'), 'not null or a finite number'),
@@ -472,7 +490,7 @@ def test_bool_completed_from_the_scorer_end_to_end(ds, tmp_path):
         g = rl.read_gate_json(f)
         assert g['g1']['q'] == ('true' if completed else 'false')
         _open(d, clock)
-        rl.end(d, outcome, fail_cause='mat_khung' if outcome == 'hong_he_do' else '', results_dir='r', gate=g)
+        _end(d, outcome, fail_cause='mat_khung' if outcome == 'hong_he_do' else '', results_dir='r', gate=g)
     assert [r['g1_q'] for r in _rows(d)] == ['true', 'false']
     rl.summary(d)
 
@@ -481,8 +499,8 @@ def test_bool_completed_from_the_scorer_end_to_end(ds, tmp_path):
 def test_any_single_gate_cell_makes_a_gate_row(ds, col):
     # GV3-R3-1 (Codex round 4, test gap): each gate column alone triggers the check; all empty does not
     d, clock = ds
-    _open(d, clock)
-    rl.end(d, 'khong_dat')                                                 # no gate: a legacy-style row
+    _open(d, clock, 'SIM')                                                 # B81-1: a judged car run has a gate
+    _end(d, 'khong_dat')                                                 # no gate: a legacy-style row
     path = os.path.join(d, rl.TUNING)
     rows = _rows(d)
     rl.summary(d)                                                          # all gate cells empty: not checked
@@ -509,8 +527,8 @@ def test_read_gate_json_forms(tmp_path):
 def test_migrate_adds_gate_columns_and_keeps_every_cell(ds):
     # GV3-8: every old cell, with values that tell columns apart
     d, clock = ds
-    _open(d, clock)
-    rl.end(d, 'khong_dat', notes='ghi chú, có dấu phẩy', fail_cause='', results_dir='res/a')
+    _open(d, clock, 'SIM')                                                 # B81-1: a judged car run has a gate
+    _end(d, 'khong_dat', notes='ghi chú, có dấu phẩy', fail_cause='', results_dir='res/a')
     path = os.path.join(d, rl.TUNING)
     old_cols = [c for c in rl.TUNING_COLS if c not in rl.GATE_COLS]
     rows = _rows(d)
@@ -528,7 +546,7 @@ def test_cli_end_with_gate_json(ds, tmp_path):
     d, clock = ds
     f = str(tmp_path / 'score.json')
     with open(f, 'w', encoding='utf-8') as fh:
-        json.dump(dict(gate_v3=_gate(e_trk=0.12)), fh)
+        json.dump(dict(gate_v3=rl.floor_gate(_gate(e_trk=0.12))), fh)  # a car run: camera scorer output
     _open(d, clock)
     qb, qa = _query_files(tmp_path)                                        # a judged car run: R134 (b)
     assert rl.main(['--dataset', d, 'end', '--outcome', 'khong_dat', '--gate-json', f, '--results-dir', 'r',
@@ -546,7 +564,7 @@ def test_g32_1_unknown_q_and_lo_never_pass(ds):
         rl.validate_gate(g)
     d, clock = ds
     _open(d, clock)
-    rl.end(d, 'dat', gate=_gate(), results_dir='r')
+    _end(d, 'dat', gate=_gate(), results_dir='r')
     rows = _rows(d)
     rows[-1].update(g2_q='', g2_lo='')
     rl._write_all(os.path.join(d, rl.TUNING), rl.TUNING_COLS, rows)
@@ -557,8 +575,8 @@ def test_g32_1_unknown_q_and_lo_never_pass(ds):
 def test_g32_11_migrate_drops_empty_old_u_columns(ds):
     # a log written by hil 7768134 (gate_v3_g1235): g1_u..g5_u columns; empty -> dropped, a value -> refused
     d, clock = ds
-    _open(d, clock)
-    rl.end(d, 'khong_dat', results_dir='r')
+    _open(d, clock, 'SIM')                                                 # B81-1: a judged car run has a gate
+    _end(d, 'khong_dat', results_dir='r')
     path = os.path.join(d, rl.TUNING)
     rows = _rows(d)
     old = rl.TUNING_COLS + list(rl.OLD_GATE_U)
@@ -589,7 +607,7 @@ def _final_car(d, clock, outcome, minutes, replaces=''):
     rl.step(d, 'run')
     clock[0] += dt.timedelta(seconds=30)
     gate = dict(gate=_gate(), results_dir='r') if outcome == 'dat' else {}     # R134 (d) SC3-2
-    return rl.end(d, outcome, fail_cause='mat_khung' if outcome == 'hong_he_do' else '', **gate)['run_uid']
+    return _end(d, outcome, fail_cause='mat_khung' if outcome == 'hong_he_do' else '', **gate)['run_uid']
 
 
 def test_s315_r3_2_replacement_by_log_order(ds):
@@ -609,7 +627,7 @@ def test_s315_r3_3_summary_refuses_speed_not_finite(ds):
     # Codex S315-R3-3: summary checks the speed of every HIL / HW row
     d, clock = ds
     _open(d, clock)
-    rl.end(d, 'khong_dat')
+    _end(d, 'hong_he_do', fail_cause='mat_khung')                          # a HW row (B81-1: judged needs a gate)
     path = os.path.join(d, rl.TUNING)
     base = _rows(d)
     for bad in ('nan', 'inf'):
@@ -655,9 +673,10 @@ def test_sc3_2_no_dat_without_the_gate_at_end(ds, platform):
     """R134 (d) SC3-2: a campaign run is never dat without its gate, on every platform."""
     d, clock = ds
     _open(d, clock, platform)
-    with pytest.raises(rl.LogError, match='SC3-2' if platform != 'HIL' else 'needs its scorer output'):
-        rl.end(d, 'dat', results_dir='r')
-    rl.end(d, 'dat', gate=_gate(u_t=0.0015 if platform == 'HIL' else 0.0), results_dir='r')
+    match = {'SIM': 'SC3-2', 'HIL': 'needs its scorer output', 'HW': 'camera scorer'}[platform]   # B81-1 on HW
+    with pytest.raises(rl.LogError, match=match):
+        _end(d, 'dat', results_dir='r')
+    _end(d, 'dat', gate=_gate(u_t=0.0015 if platform == 'HIL' else 0.0), results_dir='r')
     assert _rows(d)[-1]['run_outcome'] == 'dat'
     rl.summary(d)
 
@@ -666,7 +685,7 @@ def test_sc3_2_summary_refuses_a_campaign_dat_row_without_gate_columns(ds):
     """R134 (d) SC3-2: at the summary too; a row outside the campaigns (historic) is counted apart."""
     d, clock = ds
     _open(d, clock)
-    rl.end(d, 'dat', gate=_gate(), results_dir='r')
+    _end(d, 'dat', gate=_gate(), results_dir='r')
     path = os.path.join(d, rl.TUNING)
     rows = _rows(d)
     bare = dict(rows[0], **{c: '' for c in rl.GATE_COLS})
@@ -683,7 +702,7 @@ def test_sc3_2_summary_cli_reports_the_historic_rows(ds, capsys):
     """R134C2-11: the CLI summary prints the historic dat rows without gate columns, apart."""
     d, clock = ds
     _open(d, clock)
-    rl.end(d, 'dat', gate=_gate(), results_dir='r')
+    _end(d, 'dat', gate=_gate(), results_dir='r')
     rows = _rows(d)
     old = dict(rows[0], campaign='', session_id='OLD', run_uid='OLD:1', **{c: '' for c in rl.GATE_COLS})
     rl._write_all(os.path.join(d, rl.TUNING), rl.TUNING_COLS, rows + [old])
@@ -708,7 +727,8 @@ def test_cli_end_requires_the_query_files(ds, tmp_path, capsys, platform, stage,
     clock[0] += dt.timedelta(seconds=60)
     f = str(tmp_path / 'score.json')
     with open(f, 'w', encoding='utf-8') as fh:
-        json.dump(dict(gate_v3=_gate(u_t=0.0015 if platform == 'HIL' else 0.0, e_trk=0.12 if outcome == 'khong_dat' else 0.03)), fh)
+        g = _gate(u_t=0.0015 if platform == 'HIL' else 0.0, e_trk=0.12 if outcome == 'khong_dat' else 0.03)
+        json.dump(dict(gate_v3=rl.floor_gate(g) if platform == 'HW' else g), fh)          # B81-1, B81-3
     extra = ['--fail-cause', 'mat_khung'] if outcome == 'hong_he_do' else ['--gate-json', f, '--results-dir', 'r']
     qb, qa = _query_files(tmp_path)
     for q in ([], ['--query-before', qb]):

@@ -53,13 +53,31 @@ def car_run(d, clock, campaign, stage, outcome, task='O1-F05', speed='0.5', s=60
     tick(clock, s)
     # S05 v3.15: a judged HIL run carries its gate; R134 (d) SC3-2: a dat run on any platform too
     if (platform == 'HIL' and outcome != 'hong_he_do') or outcome == 'dat':
-        return rl.end(d, outcome, results_dir='r', gate=rl.fake_gate(e_trk=0.5 if outcome == 'khong_dat' else 0.03))
-    return rl.end(d, outcome, fail_cause='mat_khung' if outcome == 'hong_he_do' else '')
+        return end_(d, outcome, results_dir='r', gate=rl.fake_gate(e_trk=0.5 if outcome == 'khong_dat' else 0.03))
+    return end_(d, outcome, fail_cause='mat_khung' if outcome == 'hong_he_do' else '')
 
 
 def rows(path):
     with open(path, newline='', encoding='utf-8') as f:
         return list(csv.DictReader(f))
+
+
+def end_(d, outcome, gate=None, **kw):
+    """rl.end with what B8-1 (S05 v3.20 C9 (a)-(c)) asks of a judged car run, and of a judged final_hil run:
+    a car gate is a camera scorer output (FAKE: rl.floor_gate, the two frame domains equal; B81-1, B81-3), and
+    both boot answers are given (B81-2). The rules themselves are tested in test_rq3_r134.py with rl.end."""
+    run = rl._load_open(d)
+    row = run['row'] if run else {}
+    if row.get('platform') == 'HW' and gate is not None and gate['g1'].get('t_done') is None:
+        gate = rl.floor_gate(gate)
+    if outcome in rl.VALID and rl.boot_needed(row.get('platform'), row.get('stage')):
+        kw.setdefault('boot_before', 'ab')
+        kw.setdefault('boot_after', 'ab')
+    if row.get('platform') == 'HW' and outcome in rl.VALID and gate is None:      # a judged car run needs one
+        gate = rl.floor_gate(rl.fake_gate(e_trk=0.5 if outcome == 'khong_dat' else 0.03,
+                                          completed='true' if outcome != 'chua_ket_luan' else 'inconclusive'))
+        kw.setdefault('results_dir', 'r')
+    return rl.end(d, outcome, gate=gate, **kw)
 
 
 def test_migrate_adds_columns_keeps_values_and_is_idempotent(ds):
@@ -98,7 +116,7 @@ def test_live_run_segments_pause_and_wait(ds):
     rl.pause(d); tick(clock, 900)                 # other work
     rl.resume(d); tick(clock, 20)                 # still 'run', still waiting
     rl.step(d, 'analysis'); tick(clock, 200)
-    row = rl.end(d, 'khong_dat', completed=1, e_perp_max=0.123)
+    row = end_(d, 'khong_dat', completed=1, e_perp_max=0.123)
     assert row['run_uid'] == 'A1:1' and row['t_flash_s'] == '100' and row['t_run_s'] == '80'
     assert row['t_analysis_s'] == '200' and row['t_operator_wait_s'] == '80' and row['t_setup_s'] == '0'
     assert row['g_kp_xy'] == '1.2' and row['g_k_psi'] == '1' and row['e_perp_max_m'] == '0.1230'
@@ -123,10 +141,10 @@ def test_refusals(ds):
     with pytest.raises(rl.LogError, match='open'):
         rl.begin(d, 'A1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen')
     with pytest.raises(rl.LogError, match='fail-cause'):
-        rl.end(d, 'hong_he_do')
+        end_(d, 'hong_he_do')
     rl.pause(d)
     with pytest.raises(rl.LogError, match='resume'):
-        rl.end(d, 'dat', results_dir='r', gate=rl.fake_gate())
+        end_(d, 'dat', results_dir='r', gate=rl.fake_gate())
     rl.cancel(d)
     assert len(rows(os.path.join(d, rl.TUNING))) == 2           # only the June rows
     with pytest.raises(rl.LogError):
@@ -165,11 +183,11 @@ def test_summary_accounts_split_caps_and_finals(ds):
     # A-PID: 2 tune car runs of 600 s active, one final run 100 s, 1 h hoc, 1 h other work
     for sp in ('0.2', '0.5'):
         rl.begin(d, 'A1', 'A-PID', 'HW', 'PID', 'O1-F0' + sp[-1], sp, 'screen'); rl.step(d, 'setup'); tick(clock, 600)
-        rl.end(d, 'khong_dat')
+        end_(d, 'khong_dat')
     rl.begin(d, 'F1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'final'); rl.step(d, 'run'); tick(clock, 100)
-    rl.end(d, 'dat', results_dir='r', gate=rl.fake_gate())               # R134 (d) SC3-2: dat with its gate
+    end_(d, 'dat', results_dir='r', gate=rl.fake_gate())               # R134 (d) SC3-2: dat with its gate
     rl.begin(d, 'F1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'final'); rl.step(d, 'run'); tick(clock, 100)
-    rl.end(d, 'hong_he_do', fail_cause='mat_khung')
+    end_(d, 'hong_he_do', fail_cause='mat_khung')
     rl.effort(d, '2026-11-20', '06:00', '07:00', campaign='A-PID', nhan='hoc', ghi_chu='doc')
     rl.effort(d, '2026-11-20', '07:00', '08:00', campaign='A-PID', ghi_chu='lap xe')
     # B-chung: S03 rows per controller (machine 3600 s each, 100 s setup on the PID row), 2 h common
@@ -204,7 +222,7 @@ def test_caps(ds):
     rl.migrate(d)
     for _ in range(rl.CAP_HW):
         rl.begin(d, 'A1', 'A-LADRC', 'HW', 'LADRC', 'O1-F05', '0.5', 'confirm'); rl.step(d, 'run'); tick(clock, 300)
-        rl.end(d, 'khong_dat')
+        end_(d, 'khong_dat')
     a = {r['campaign']: r for r in rl.summary(d)}['A-LADRC']
     assert a['cap_hit'] == 'xe+gio' and a['N_HW_tune'] == '120' and a['T_tune_no_hoc_h'] == '10.000'
 
@@ -304,7 +322,7 @@ def test_ea1_repair_in_T_and_refused_while_a_run_is_open(ds):
     with pytest.raises(rl.LogError, match='run is open'):
         rl.hwfail(d, '2026-11-20', 'A1', 'A-PID', 'HW', 'tuot banh', 'phan_cung_ngau_nhien', 1.0)
     tick(clock, 60)
-    rl.end(d, 'hong_he_do', fail_cause='hong_xe')
+    end_(d, 'hong_he_do', fail_cause='hong_xe')
     rl.hwfail(d, '2026-11-20', 'A1', 'A-PID', 'HW', 'tuot banh', 'phan_cung_ngau_nhien', 1.0)
     a = {r['campaign']: r for r in rl.summary(d)}['A-PID']
     assert a['T_operator_h'] == f'{(60 + 3600) / 3600:.3f}' and a['T_sua_h'] == '1.000'
@@ -401,7 +419,7 @@ def test_ea4_n_sim_zero_and_empty(ds):
     rl.migrate(d)
     rl.machine(d, 'B-PID', 'PID', 'X', 'r', 0, 10, '2026-11-20T09:00:00', '2026-11-20T09:01:00')
     rl.begin(d, 'B1', 'B-PID', 'SIM', 'PID', 'O1-F05', '0.5', 'screen')
-    rl.end(d, 'dat', results_dir='r', gate=rl.fake_gate())   # one live fwsim run, n_sim_evals empty (SC3-2: gate)
+    end_(d, 'dat', results_dir='r', gate=rl.fake_gate())   # one live fwsim run, n_sim_evals empty (SC3-2: gate)
     assert {r['campaign']: r for r in rl.summary(d)}['B-PID']['N_SIM'] == '1'
 
 
@@ -413,7 +431,7 @@ def test_ea6_cancel_only_before_the_run_step(ds):
     rl.step(d, 'run'); tick(clock, 5)
     with pytest.raises(rl.LogError, match='run counts'):
         rl.cancel(d)
-    rl.end(d, 'hong_he_do', fail_cause='dung_som')
+    end_(d, 'hong_he_do', fail_cause='dung_som')
     rl.begin(d, 'A1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen')
     rl.step(d, 'flash'); tick(clock, 120)
     rl.pause(d); tick(clock, 600)
@@ -515,6 +533,6 @@ def test_s315_r2_2_example_rows_do_not_block_hil(ds):
     rl.begin(d, 'H', 'B-PID', 'HIL', 'PID', 'O1-F05', '0.5', 'hil_check', gain_set='B-PID/GA1')
     rl.step(d, 'run')
     tick(clock, 60)
-    row = rl.end(d, 'hong_he_do', fail_cause=rl.MAP_REFUSED, results_dir='r', gate=rl.fake_gate(mapped=False))
+    row = end_(d, 'hong_he_do', fail_cause=rl.MAP_REFUSED, results_dir='r', gate=rl.fake_gate(mapped=False))
     assert rl.refusal_note(d, row).startswith('anh xa bi tu choi lan 1')
     assert {r['campaign']: r for r in rl.summary(d)}['B-PID']['hil_map_refused_n'] == '1'
