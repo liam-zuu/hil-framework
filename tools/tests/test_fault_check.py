@@ -26,7 +26,8 @@ import fault_check as fc                       # noqa: E402
 import fault_schedule as fs                    # noqa: E402
 from hil_node import HILConfig, HILNode        # noqa: E402
 from mecanum_plant import MecanumPlant         # noqa: E402
-from protocol import FRAME_SIZE, OFS_IMU_SEQ, OFS_MISO_CRC, encode_state   # noqa: E402
+from protocol import (FRAME_SIZE, ID_LEN, OFS_IMU_SEQ, OFS_MISO_CRC, OFS_MISO_ID, OFS_RUN_ID,   # noqa: E402
+                      encode_state)
 from run_lifecycle import RUN, ControlBox, LifecycleConfig   # noqa: E402
 from step_log import CSV_HEADER                # noqa: E402
 
@@ -43,7 +44,13 @@ def with_crc(b) -> bytes:
     return bytes(b)
 
 
-GOOD_MISO = with_crc(bytes([0x10, 0x00] * 4) + bytes(FRAME_SIZE - 8))
+GOOD_MISO = with_crc(bytes([0x10, 0x00] * 4) + bytes(FRAME_SIZE - 8))     # no run_id: never confirms
+
+
+def good_miso(mosi) -> bytes:
+    """A MISO with a good CRC carrying back MOSI 40-47 (run_id, frame_no), as the H7 v6 and fake_h7 do (FI4-1)."""
+    return with_crc(GOOD_MISO[:OFS_MISO_ID] + bytes(mosi[OFS_RUN_ID:OFS_RUN_ID + ID_LEN])
+                    + GOOD_MISO[OFS_MISO_ID + ID_LEN:])
 
 
 def moving_plant():
@@ -121,7 +128,7 @@ def open_loop(tmp_path, body=BODY, steps=400, run_ms=400, transfer=None, name='f
     sched = fs.load(str(csv_), run_ms, 'plant')
     p = str(tmp_path / f'{name}.npz')
     node = HILNode(moving_plant(), config=HILConfig(simulate_hw=True, max_steps=steps, frame_log=p, faults=sched))
-    node._spi.transfer = transfer or (lambda mosi: GOOD_MISO)
+    node._spi.transfer = transfer or good_miso
     node.run()
     return p, str(csv_), write_step_log(str(tmp_path / f'{name}_steps.csv'), steps)
 
@@ -211,6 +218,25 @@ def test_tampered_run_fails(run, tmp_path, name, edit):
     p = resave(run[0], str(tmp_path / f'{name}.npz'), edit)
     r = fc.check(p, run[1], run[2])
     assert not r['ok'], name
+
+
+def test_run_without_id_confirmed_fails(run, tmp_path):
+    """Codex FI4-1: a run whose MISO never carried its run_id back (H7 not v6, wrong H7, link swapped):
+    RS-4's run_failed takes it as failed on the real link; the checker refuses it for every run. A run with a
+    good CRC but no run_id (40 frames, under the 50-transfer stop) has id_confirmed False and fails; the good
+    run with the key set False or removed fails too; the good run itself has id_confirmed True."""
+    assert json.loads(str(np.load(run[0])['manifest']))['id_confirmed'] is True
+    p, csv_, steps = open_loop(tmp_path, body='E1,enc_loss,FL,10,20,\n', steps=40, run_ms=40, name='noid',
+                               transfer=lambda mosi: GOOD_MISO)
+    man = json.loads(str(np.load(p)['manifest']))
+    assert man['id_confirmed'] is False and man['stop_reason'] == 'max_steps' and man['steps'] == 40
+    r = fc.check(p, csv_, steps)
+    assert not r['ok'] and any('id_confirmed=False' in s for s in r['fails']), r['fails']
+    for name, edit in (('false', lambda d, m: m.__setitem__('id_confirmed', False)),
+                       ('one', lambda d, m: m.__setitem__('id_confirmed', 1)),
+                       ('gone', lambda d, m: m.pop('id_confirmed'))):
+        r = fc.check(resave(run[0], str(tmp_path / f'id_{name}.npz'), edit), run[1], run[2])
+        assert not r['ok'] and any('id_confirmed' in s for s in r['fails']), (name, r['fails'])
 
 
 def test_bad_miso_fails_even_with_clean_manifest(tmp_path):
@@ -317,13 +343,19 @@ def test_phase_paths_of_run_lifecycle(tmp_path):
 
 
 @pytest.mark.parametrize('kind', ['cut2', 'empty', 'wide', 'true_short', 't_send', 'all_narrow', 'all_wide',
-                                  'scalar'])
+                                  'scalar', 'all_u16'])
 def test_frame_arrays_must_cover_the_run(run, tmp_path, kind):
-    """Codex FI2-5, FI3-3, FI3-4: MISO cut to 2 frames (0 checked) with the manifest left at 398, MISO empty,
-    MISO of another width, mosi_true or t_send_ns shorter; the three frame arrays cut together to
-    FRAME_SIZE - 1 bytes (MISO CRC recomputed) or widened together; mosi a scalar: cannot be checked."""
+    """Codex FI2-5, FI3-3, FI3-4, FI4-2: MISO cut to 2 frames (0 checked) with the manifest left at 398, MISO
+    empty, MISO of another width, mosi_true or t_send_ns shorter; the three frame arrays cut together to
+    FRAME_SIZE - 1 bytes (MISO CRC recomputed) or widened together; mosi a scalar; the three frame arrays
+    of dtype uint16 with shape (n, FRAME_SIZE) (2 bytes an element, MISO CRC recomputed on the 96 bytes):
+    cannot be checked."""
     def edit(d, m):
-        if kind in ('all_narrow', 'all_wide'):
+        if kind == 'all_u16':
+            for a in ('mosi', 'mosi_true', 'miso'):
+                d[a] = d[a].astype('<u2')
+            d['miso'] = np.array([np.frombuffer(with_crc(bytes(r)), '<u2') for r in d['miso']])
+        elif kind in ('all_narrow', 'all_wide'):
             w = FRAME_SIZE - 1 if kind == 'all_narrow' else FRAME_SIZE + 8
             for a in ('mosi', 'mosi_true', 'miso'):
                 x = d[a][:, :w] if w < FRAME_SIZE else np.hstack([d[a], np.zeros((len(d[a]), 8), np.uint8)])
@@ -403,7 +435,7 @@ def test_exception_after_the_schedule_fails(tmp_path):
     p = str(tmp_path / 'e.npz')
     node = HILNode(plant, config=HILConfig(simulate_hw=True, max_steps=400, frame_log=p,
                                            faults=fs.load(str(csv_), 400, 'plant')))
-    node._spi.transfer = lambda mosi: GOOD_MISO
+    node._spi.transfer = good_miso
     with pytest.raises(RuntimeError):
         node.run()
     steps = write_step_log(str(tmp_path / 'e_st.csv'), 100)
@@ -419,7 +451,7 @@ def test_truth_self_check_plant_imu_without_noise(tmp_path):
     p = str(tmp_path / 'f.npz')
     node = HILNode(moving_plant(), config=HILConfig(simulate_hw=True, max_steps=200, frame_log=p,
                                                     faults=fs.load(str(csv_), 200, 'plant')))
-    node._spi.transfer = lambda mosi: GOOD_MISO
+    node._spi.transfer = good_miso
     node.run()
     steps = write_step_log(str(tmp_path / 'st.csv'), 200)
     r = fc.check(p, str(csv_), steps)
@@ -456,7 +488,7 @@ def test_real_step_log_format_is_read(tmp_path):
     sl = StepLog(n_slots=1024)
     node = HILNode(moving_plant(), config=HILConfig(simulate_hw=True, max_steps=100, frame_log=p,
                                                     faults=fs.load(str(csv_), 100, 'plant')), step_log=sl)
-    node._spi.transfer = lambda mosi: GOOD_MISO
+    node._spi.transfer = good_miso
     node.run()
     w = StepLogCSV(sl, str(tmp_path / 'st.csv'))
     meta = w.close()

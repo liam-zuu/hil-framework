@@ -25,8 +25,9 @@ Checks (all must hold for ok):
      int16 yaw = int16 theta and gz = wz within half a step of each scale;
   8. step log (FI1-10, FI2-6): every step of the frame log present once and in rising order, every miss
      0 or 1 and none 1, its .json rows = CSV rows and lost_or_torn, overflow present as int 0;
-  9. the run ended the normal way (FI1-4): stop_reason 'max_steps' with n = max_steps without phases;
-     with phases last phase END, outcome not error:..., END tail complete, stop_reason = outcome;
+  9. the run ended the normal way (FI1-4, FI4-1): id_confirmed True (a MISO carried the run_id back, RS-4);
+     stop_reason 'max_steps' with n = max_steps without phases; with phases last phase END, outcome not
+     error:..., END tail complete, stop_reason = outcome;
   10. the frame arrays (mosi, mosi_true, miso, t_send_ns) have the same number of rows, the three frame
      arrays are 2-D with frames of protocol.FRAME_SIZE bytes, manifest steps = n, MISO checked =
      n - MISO_SKIP_FRAMES (FI2-5, FI3-3, FI3-4; a log of another frame size cannot be checked, exit 2); the
@@ -181,6 +182,11 @@ def run_end_problem(man, n):
     in full, and stop_reason = the outcome (an exception, a signal or a full frame log after END rewrites
     it)."""
     reason = man.get('stop_reason')
+    # Codex FI4-1: RS-4 P1 takes a run whose MISO never carried its run_id back as failed (HILNode.run_failed on
+    # the real link); here for every run, simulated ones too (their MISO is the MOSI echo or fake_h7, which
+    # carry the run_id), so no manifest key on the mode is needed. A log without the key cannot pass.
+    if man.get('id_confirmed') is not True:
+        return f'run did not end normally: id_confirmed={man.get("id_confirmed")!r} (no MISO carried the run_id)'
     lc = man.get('lifecycle')
     if lc is None:
         ms = man.get('max_steps')
@@ -313,10 +319,13 @@ def check(npz_path: str, sched_path: str, step_log: str = None) -> dict:
     # Codex FI2-5, FI3-3, FI3-4: the frame arrays are 2-D (checked before len()), cover the same steps, and
     # their frames are protocol.FRAME_SIZE bytes (coordination rule 3.7: the constant, not a fixed 40)
     n = len(mosi) if mosi.ndim == 2 else -1
-    if (n < 0 or mosi.shape[1] != FRAME_SIZE or true.shape != mosi.shape or miso.shape != mosi.shape
+    # FI4-2: and of dtype uint8 (no cast: a uint16 array of shape (n, 48) would be 96 bytes a frame)
+    if (n < 0 or any(a.dtype != np.uint8 for a in (mosi, true, miso))
+            or mosi.shape[1] != FRAME_SIZE or true.shape != mosi.shape or miso.shape != mosi.shape
             or t_send is None or t_send.shape != (n,)):
-        out['error'] = (f'frame arrays do not match: mosi {mosi.shape}, mosi_true {true.shape}, miso {miso.shape}, '
-                        f't_send_ns {None if t_send is None else t_send.shape}, frame size {FRAME_SIZE}')
+        out['error'] = (f'frame arrays do not match: mosi {mosi.shape} {mosi.dtype}, mosi_true {true.shape} '
+                        f'{true.dtype}, miso {miso.shape} {miso.dtype}, t_send_ns '
+                        f'{None if t_send is None else t_send.shape}, frame size {FRAME_SIZE} uint8')
         return out
     fails = []
     if man.get('steps') != n or not _is_int(man.get('steps')):
