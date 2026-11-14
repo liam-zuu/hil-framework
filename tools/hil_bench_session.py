@@ -305,6 +305,33 @@ def gain_query(ip, path, run=subprocess.run):
     return glc.read_query(path)
 
 
+def gain_set(ip, gain_file, path, run=subprocess.run):
+    """B8-1 B81-14 (S05 v3.20 4.7 (iv); Liam 14/11 CODE_R134 local_076fc0aa, hop chon "Cong cu tu dat va luu
+    (Recommended)"): gain_send.py --file <gain_file> to the ESP32 just before the run's question 'before' (the
+    ESP32 applies a set only with the motors off), its whole output to `path` (new file, never overwritten);
+    returns the fields of its '# ack' line (gain_line_check.read_ack: ok=1, output ending with '#ket_qua,ma=0'),
+    or None (not applied, refused, no answer, no IP)."""
+    import gain_line_check as glc
+    if not ip:
+        txt = '# no ESP32 IP (--esp32-ip or a "Got IP:" line): gain not set\n#ket_qua,ma=1\n'
+    else:
+        try:
+            p = run([sys.executable, GAIN_SEND, '--ip', ip, '--file', gain_file], capture_output=True, text=True,
+                    timeout=GAIN_QUERY_TIMEOUT_S)
+            txt = (p.stdout or '') + (p.stderr or '')
+        except (OSError, subprocess.TimeoutExpired) as e:
+            txt = f'# gain_send.py --file failed: {e}\n#ket_qua,ma=1\n'
+    with open(path, 'x', encoding='utf-8') as f:
+        f.write(txt)
+    return glc.read_ack(path)
+
+
+def ack_of_run(out_dir, name):
+    """The saved '#gain_ack' of a run's gain setting (pi/<name>_gain_ack.txt), read again (None = missing)."""
+    import gain_line_check as glc
+    return glc.read_ack(os.path.join(out_dir, 'pi', f'{name}_gain_ack.txt'))
+
+
 def timed_query(ip, path):
     """gain_query with the PC times around it: (answer fields or None, record for session.json)."""
     t_a = time.time()
@@ -691,9 +718,18 @@ def bench(a):
             # A5: strict logger locked on the ESP32 address (unless --logger-loose / --no-logger)
             src, src_from = (None, None) if (a.no_logger or a.logger_loose) else \
                 logger_src(a.esp32_ip, [s for _, s in esp.since(0)])
-            boots, qrec = None, None
+            boots, qrec, ack = None, None, None
             if getattr(a, 'gain_query', False):                         # S05 4.7 (iv): ask boot just before the run
                 q_ip = a.esp32_ip or esp32_ip([s for _, s in esp.since(0)])
+                if getattr(a, 'gain_file', None):                       # B81-14: set the gain first, keep its ack
+                    ack = gain_set(q_ip, a.gain_file, os.path.join(a.out, 'pi', f'{name}_gain_ack.txt'))
+                    if ack is None:
+                        print(f'{name}: DỪNG: không đặt được gain {a.gain_file} (pi/{name}_gain_ack.txt); '
+                              'không chạy lượt này và các lượt sau')
+                        sess['runs'].append(dict(name=name, args=args, gain_ack=dict(file=f'{name}_gain_ack.txt',
+                                                                                     applied=False)))
+                        code = 2
+                        break
                 q, rb = timed_query(q_ip, os.path.join(a.out, 'pi', f'{name}_gain_query_before.txt'))
                 boots, qrec = [q, None], dict(before=rb)
             t0 = time.time()                         # R134C-9: the run (and its --pi-stop / --pi-kill clock)
@@ -722,6 +758,9 @@ def bench(a):
             run_rec = dict(name=name, args=args, t0=t0, t1=t1, ssh_exit=rc)
             if boots is not None:
                 run_rec['boot'] = qrec
+            if ack is not None:
+                run_rec['gain_ack'] = dict(file=f'{name}_gain_ack.txt', applied=True, boot=ack.get('boot'),
+                                           mac=ack.get('mac'), id=ack.get('id'))
             if not a.no_logger:
                 run_rec['logger_cmd'] = dict(strict=src is not None, src_ip=src, src_from=src_from)    # A5
             ev = os.path.join(a.out, 'pi', f'{name}.csv.events.txt')
@@ -761,6 +800,9 @@ def bench(a):
             if boots is not None:
                 r['boot'] = run_rec['boot']
                 bbad = boot_problem(boots[0], boots[1], a.out, name)
+                if not bbad and ack is not None:                   # B81-14: the set's ack of the same boot
+                    import gain_line_check as glc
+                    bbad = glc.ack_problem(ack, boots[0])
                 if bbad:
                     r['clean'] = False
                     r['why'].append(bbad)
@@ -814,6 +856,9 @@ def analyze_only(a):
             qb, qa = queries_of_run(a.out, n)        # from the saved answers (older sessions: no such record)
             r['boot'] = runs[n]['boot']
             bbad = boot_problem(qb, qa, a.out, n)
+            if not bbad and 'gain_ack' in runs[n]:   # B81-14: a session made with --gain-file, ack read again
+                import gain_line_check as glc
+                bbad = glc.ack_problem(ack_of_run(a.out, n), qb)
             if bbad:
                 r['clean'] = False
                 r['why'].append(bbad)
@@ -873,6 +918,11 @@ def main(argv=None):
                     help='S05 4.7 (iv) (R134): gain_send.py --query ngay trước lượt (rồi mới đếm giờ --pi-stop, '
                          '--pi-kill) và ngay khi lượt xong (trước scp), ghi pi/<TÊN>_gain_query_before.txt, _after.txt; '
                          'thiếu, khác boot hay MAC, hay boot khác dòng #us,ev=start của lượt thì lượt không sạch')
+    ap.add_argument('--gain-file', metavar='FILE',
+                    help='B81-14 (S05 4.7 (iv)): với --gain-query, trước câu hỏi "trước lượt" của mỗi lượt đặt bộ gain '
+                         'FILE bằng gain_send.py --file (motor phải tắt), lưu nguyên đầu ra thành pi/<TÊN>_gain_ack.txt; '
+                         'đặt không được thì dừng (mã 2), không chạy lượt; boot của #gain_ack khác hai lần hỏi thì '
+                         'lượt không sạch')
     ap.add_argument('--analyze-only', action='store_true',
                     help='chỉ chấm thư mục đã có frames/ (không ghi gì vào thư mục, trừ khi --write-summary)')
     ap.add_argument('--write-summary', action='store_true',
@@ -888,6 +938,10 @@ def main(argv=None):
         ap.error('--gain-query chỉ dùng khi chạy lượt')
     if a.gain_query and a.no_logger:
         ap.error('--gain-query cần log UDP của lượt (dòng #us,ev=start mang boot của lượt, R134C-1): bỏ --no-logger')
+    if a.gain_file and not a.gain_query:
+        ap.error('--gain-file đi cùng --gain-query (boot của #gain_ack so với hai lần hỏi, B81-14)')
+    if a.gain_file and not os.path.isfile(a.gain_file):
+        ap.error(f'--gain-file {a.gain_file}: không có file')
     code, results = analyze_only(a) if a.analyze_only else bench(a)
     if results and a.analyze_only and a.write_summary:
         with open(os.path.join(a.out, 'bench_summary_analyze.json'), 'w', encoding='utf-8') as f:

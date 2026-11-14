@@ -119,3 +119,35 @@ def test_query_dir_with_a_file_of_an_earlier_run_is_refused(tmp_path, present):
         (tmp_path / n).write_text(ANSWER, encoding='utf-8')
     bad = ps.query_dir_problem(str(tmp_path))
     assert (bad is None) == (not present) and all(n in (bad or '') for n in present)
+
+
+# ── B8-1 B81-14: --gain-file (Liam 14/11 CODE_R134 "Cong cu tu dat va luu (Recommended)") ──
+
+ACK = '\n'.join(['# send 1.2.3.4:5014 #gain_set,v=1,tx=<new each try>,id=7,ctrl=PID',
+                 '# ack tx=9,req_id=7,ok=1,err=,sha=16702ff0e688,env=pid,mac=aa:bb,boot=4753dc47,id=7,applied_n=1,ctrl=PID',
+                 '#ket_qua,ma=0', ''])
+
+
+def test_gain_set_file_saves_the_whole_output(tmp_path):
+    from types import SimpleNamespace
+    calls = []
+
+    def run(cmd, **kw):
+        calls.append(cmd)
+        return SimpleNamespace(stdout=ACK, stderr='', returncode=0)
+    p = tmp_path / ps.ACK_NAME
+    assert ps.gain_set_file('1.2.3.4', 'g.json', str(p), run=run) == 0
+    assert calls[0][1:] == [ps.GAIN_SEND, '--ip', '1.2.3.4', '--file', 'g.json']
+    assert p.read_text(encoding='utf-8') == ACK
+    with pytest.raises(FileExistsError):                          # never overwrites a record
+        ps.gain_set_file('1.2.3.4', 'g.json', str(p), run=run)
+
+    def refused(cmd, **kw):
+        return SimpleNamespace(stdout='# rejected: err=motor_on\n#ket_qua,ma=2\n', stderr='', returncode=2)
+    assert ps.gain_set_file('1.2.3.4', 'g.json', str(tmp_path / 'b.txt'), run=refused) == 2
+
+
+def test_query_dir_refuses_an_old_ack_with_gain_file(tmp_path):
+    (tmp_path / ps.ACK_NAME).write_text(ACK, encoding='utf-8')
+    assert ps.query_dir_problem(str(tmp_path)) is None                 # without --gain-file: not looked at
+    assert ps.ACK_NAME in ps.query_dir_problem(str(tmp_path), with_ack=True)

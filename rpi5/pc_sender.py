@@ -201,13 +201,34 @@ def gain_query_file(ip: str, path: str, run=None) -> int:
     return code
 
 
+def gain_set_file(ip: str, gain_file: str, path: str, run=None) -> int:
+    """B8-1 B81-14 (S05 v3.20 4.7 (iv); Liam 14/11 CODE_R134 local_076fc0aa, hop chon "Cong cu tu dat va luu
+    (Recommended)"): tools/gain_send.py --file <gain_file> to the ESP32 of the car just before the question
+    'before' of --o1 (applied only with the motors off); its whole output goes to `path` (new file, never
+    overwritten); returns its exit code (0 = applied and verified). The scorer (s05_final_table.py) compares the
+    boot of its '# ack' line with the two questions."""
+    import subprocess
+    run = run or subprocess.run
+    try:
+        p = run([sys.executable, GAIN_SEND, '--ip', ip, '--file', gain_file], capture_output=True, text=True,
+                timeout=20)
+        txt, code = (p.stdout or '') + (p.stderr or ''), p.returncode
+    except (OSError, subprocess.TimeoutExpired) as e:
+        txt, code = f'# gain_send.py --file failed: {e}\n#ket_qua,ma=1\n', 1
+    with open(path, 'x', encoding='utf-8') as f:
+        f.write(txt)
+    return code
+
+
 QUERY_NAMES = ('gain_query_before.txt', 'gain_query_after.txt')
+ACK_NAME = 'gain_ack.txt'                       # B81-14: s05_final_table --gain-ack-name default
 
 
-def query_dir_problem(d: str):
-    """R134C-11: one folder per run. A file of an earlier run (before or after) refuses the run before
-    '#test_start', so a new 'before' can never sit next to an old 'after'. None when the folder is free."""
-    old = [n for n in QUERY_NAMES if os.path.exists(os.path.join(d, n))]
+def query_dir_problem(d: str, with_ack: bool = False):
+    """R134C-11: one folder per run. A file of an earlier run (before or after, and the gain ack with
+    --gain-file) refuses the run before '#test_start', so a new 'before' can never sit next to an old 'after'.
+    None when the folder is free."""
+    old = [n for n in QUERY_NAMES + ((ACK_NAME,) if with_ack else ()) if os.path.exists(os.path.join(d, n))]
     return f"--gain-query-dir {d} already holds {', '.join(old)}: use a new folder for each run" if old else None
 
 
@@ -229,9 +250,16 @@ if __name__ == "__main__":
     parser.add_argument("--gain-query-dir", default=None,
                         help="--o1: gain_send.py --query just before and just after the task, outputs to "
                              "DIR/gain_query_before.txt and DIR/gain_query_after.txt (S05 4.7 (iv), R134)")
+    parser.add_argument("--gain-file", default=None,
+                        help="with --gain-query-dir: set this gain file (gain_send.py --file, motors off) before the "
+                             "question 'before', output to DIR/gain_ack.txt; not applied: stop, no task (B81-14)")
     args = parser.parse_args()
     if args.gain_query_dir and not args.o1:
         parser.error("--gain-query-dir goes with --o1")
+    if args.gain_file and not args.gain_query_dir:
+        parser.error("--gain-file goes with --gain-query-dir (the boot of its ack is compared with the two questions)")
+    if args.gain_file and not os.path.isfile(args.gain_file):
+        parser.error(f"--gain-file {args.gain_file}: no such file")
     if args.gain_query_dir and not os.path.isfile(GAIN_SEND):
         parser.error(f"--gain-query-dir needs {GAIN_SEND} (feat/wifi-gain, L90; not merged here yet)")
 
@@ -240,9 +268,15 @@ if __name__ == "__main__":
     if args.o1:
         if args.gain_query_dir:
             os.makedirs(args.gain_query_dir, exist_ok=True)
-            bad = query_dir_problem(args.gain_query_dir)
+            bad = query_dir_problem(args.gain_query_dir, with_ack=bool(args.gain_file))
             if bad:
                 parser.error(bad)
+            if args.gain_file:                      # B81-14: set the gain, keep the ack, then ask the boot
+                gcode = gain_set_file(args.ip, args.gain_file, os.path.join(args.gain_query_dir, ACK_NAME))
+                print(f"#gain_set,exit={gcode}")
+                if gcode != 0:
+                    print(f"gain {args.gain_file} not applied (see {ACK_NAME}): no task sent")
+                    sys.exit(2)
             print(f"#gain_query,when=before,exit={gain_query_file(args.ip, os.path.join(args.gain_query_dir, 'gain_query_before.txt'))}")
         try:
             test_loop(args.ip, args.o1, allow_final_set=args.allow_final_set)

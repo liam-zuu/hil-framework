@@ -215,3 +215,104 @@ def test_stop_timer_cancelled_before_the_question_after(tmp_path, monkeypatch):
     assert 'stop' not in order and order[:4] == ['q_before', 'run_end', 'q_after', 'join'], order
     s = json.load(open(os.path.join(a.out, 'session.json'), encoding='utf-8'))
     assert 'không gửi' in s['runs'][0]['pi_stop']['note']
+
+
+# ── B8-1 B81-14: --gain-file (Liam 14/11 CODE_R134 "Cong cu tu dat va luu (Recommended)") ──
+
+ACK = ('# send 1.2.3.4:5014 #gain_set,v=1,tx=<new each try>,id=7,ctrl=ADRC\n'
+       '# ack tx=9,req_id=7,ok=1,err=,sha=16702ff0e688,env=ladrc,mac=aa:bb:cc:dd:ee:ff,boot=4753dc47,id=7,'
+       'applied_n=1,ctrl=ADRC\n# applied: id=7\n#ket_qua,ma=0\n')
+
+
+def test_gain_set_saved_and_ack_read(tmp_path):
+    calls = []
+    p = str(tmp_path / 'r1_gain_ack.txt')
+    ack = B.gain_set('1.2.3.4', 'g.json', p, run=fake_run(ACK, calls))
+    assert ack['boot'] == '4753dc47' and ack['id'] == '7'
+    assert calls[0][1:] == [B.GAIN_SEND, '--ip', '1.2.3.4', '--file', 'g.json']
+    assert open(p, encoding='utf-8').read() == ACK
+    with pytest.raises(FileExistsError):
+        B.gain_set('1.2.3.4', 'g.json', p, run=fake_run(ACK, calls))
+    for i, bad in enumerate(('# rejected: err=motor_on\n#ket_qua,ma=2\n', ACK.replace('ok=1', 'ok=0'),
+                             ACK + '#ket_qua,ma=4\n')):
+        assert B.gain_set('1.2.3.4', 'g.json', str(tmp_path / f'b{i}.txt'), run=fake_run(bad, [])) is None
+    assert B.gain_set(None, 'g.json', str(tmp_path / 'c.txt'), run=fake_run(ACK, [])) is None
+
+
+def _gain_bench(monkeypatch, tmp_path, ack_text):
+    order = []
+
+    def reply(c):
+        if 'run_hil.py' in c and 'finite-run' in c:
+            order.append('run')
+            return (0, 'ok')
+        return (0, '## HEAD\nabc') if 'git' in c else (1, '')
+    a, calls, timers = _bench_env(monkeypatch, tmp_path, reply, run=['r=--test A-L1', 's=--test A-L1'],
+                                  gain_query=True, gain_file='g.json', esp32_ip='1.2.3.4')
+
+    def fake_set(ip, gain_file, path, run=None):
+        import gain_line_check as glc
+        order.append('set')
+        with open(path, 'x', encoding='utf-8') as f:
+            f.write(ack_text)
+        return glc.read_ack(path)
+
+    def fake_query(ip, path, run=None):
+        order.append('q_' + ('before' if path.endswith('before.txt') else 'after'))
+        with open(path, 'x', encoding='utf-8') as f:
+            f.write(ANSWER)
+        return dict(boot='4753dc47', mac='aa:bb:cc:dd:ee:ff')
+    monkeypatch.setattr(B, 'gain_set', fake_set)
+    monkeypatch.setattr(B, 'gain_query', fake_query)
+    code, _ = B.bench(a)
+    return a, order, code
+
+
+def test_bench_sets_the_gain_before_each_question_before(tmp_path, monkeypatch):
+    a, order, code = _gain_bench(monkeypatch, tmp_path, ACK)
+    assert order[:4] == ['set', 'q_before', 'run', 'q_after'] and order[4:6] == ['set', 'q_before'], order
+    s = json.load(open(os.path.join(a.out, 'session.json'), encoding='utf-8'))
+    assert s['runs'][0]['gain_ack'] == dict(file='r_gain_ack.txt', applied=True, boot='4753dc47',
+                                            mac='aa:bb:cc:dd:ee:ff', id='7')
+
+
+def test_bench_stops_when_the_gain_is_not_applied(tmp_path, monkeypatch):
+    a, order, code = _gain_bench(monkeypatch, tmp_path, '# rejected: err=motor_on\n#ket_qua,ma=2\n')
+    assert code == 2 and order == ['set'], order                      # no question, no run
+    s = json.load(open(os.path.join(a.out, 'session.json'), encoding='utf-8'))
+    assert s['runs'] == [dict(name='r', args='--test A-L1', gain_ack=dict(file='r_gain_ack.txt', applied=False))]
+
+
+def test_analyze_only_judges_the_saved_ack_again(tmp_path, monkeypatch):
+    out = str(tmp_path)
+    os.makedirs(os.path.join(out, 'frames'))
+    for n, ack_boot in (('x', '4753dc47'), ('y', '0badf00d'), ('z', None)):
+        open(os.path.join(out, 'frames', f'{n}_frames.npz'), 'w').close()
+        write_run_log(out, n)
+        for w, t in (('before', ('1', '2')), ('after', ('3', '4'))):
+            with open(os.path.join(out, 'pi', f'{n}_gain_query_{w}.txt'), 'w', encoding='utf-8') as f:
+                f.write(f'#query_pc,t_start={t[0]},t_end={t[1]}\n' + ANSWER)
+        if ack_boot:
+            with open(os.path.join(out, 'pi', f'{n}_gain_ack.txt'), 'w', encoding='utf-8') as f:
+                f.write(ACK.replace('4753dc47', ack_boot))
+    with open(os.path.join(out, 'session.json'), 'w', encoding='utf-8') as f:
+        json.dump(dict(runs=[dict(name=n, boot={}, gain_ack=dict(file=f'{n}_gain_ack.txt')) for n in 'xyz']), f)
+    monkeypatch.setattr(B, 'analyze_run', lambda o, n, *x: dict(name=n, clean=True, why=[]))
+    monkeypatch.setattr(B, 'summary_line', lambda r: r['name'])
+    code, res = B.analyze_only(SimpleNamespace(out=out))
+    by = {r['name']: r for r in res}
+    assert by['x']['clean'] and not by['y']['clean'] and not by['z']['clean'] and code == 1
+    assert any('khoi dong lai sau khi dat gain' in w for w in by['y']['why'])
+    assert any('thieu cau tra loi #gain_ack' in w for w in by['z']['why'])
+
+
+def test_gain_file_needs_gain_query(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(B, 'GAIN_SEND', __file__)
+    g = tmp_path / 'g.json'
+    g.write_text('{}', encoding='utf-8')
+    with pytest.raises(SystemExit):
+        B.main(['--out', 'x', '--run', 'a=b', '--gain-file', str(g)])
+    assert '--gain-query' in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        B.main(['--out', 'x', '--run', 'a=b', '--gain-query', '--gain-file', str(tmp_path / 'none.json')])
+    assert 'không có file' in capsys.readouterr().err
