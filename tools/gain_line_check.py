@@ -377,6 +377,45 @@ def query_problem(before, after, run_boot=None, check_run_boot=True):
     return None
 
 
+def read_ack(path):
+    """B8-1 B81-14 (S05 v3.20 4.7 (iv)): fields of the '#gain_ack' answer in one saved output of gain_send.py
+    setting a gain set (hil feat/wifi-gain 331cd76 main: one '# ack <k=v,...>' line, last line '#ket_qua,ma=0'
+    when applied and verified), or None (no file, not exactly one ack line, not ok=1, not ma=0, no hex boot)."""
+    if not path or not os.path.isfile(path):
+        return None
+    with open(path, encoding='utf-8') as f:
+        lines = [x.strip() for x in f if x.strip()]
+    acks = [x for x in lines if x.startswith('# ack ')]
+    if len(acks) != 1 or not lines or lines[-1] != '#ket_qua,ma=0':
+        return None
+    fields = dict(p.partition('=')[::2] for p in acks[0][len('# ack '):].split(','))
+    b = fields.get('boot', '')
+    if fields.get('ok') != '1' or not b or not set(b) <= HEX:
+        return None
+    return fields
+
+
+def ack_problem(ack, before, run_gain=None):
+    """None, or why the '#gain_ack' of the gain setting (read_ack dict, None = missing) is not of the boot and the
+    board of the two query answers (`before`, already checked against `after` by query_problem) and of the set the
+    run ran (`run_gain`: the run's '#gain' dict, None = not shown). A run on the built-in set (id 0 on its '#gain'
+    line: nothing was set since that boot) has no ack to check (S05 4.7 (iv) speaks of the ack 'luc dat gain')."""
+    if run_gain is not None and run_gain.get('id') == '0':
+        return None
+    if ack is None:
+        return 'thieu cau tra loi #gain_ack luc dat gain (gain_send.py, ok=1, ma=0; S05 4.7 (iv))'
+    if before is None:
+        return 'thieu hoi boot truoc luot: khong so duoc #gain_ack'
+    if ack['boot'].lower() != before['boot'].lower():
+        return (f'boot #gain_ack luc dat gain {ack["boot"]} khac boot hai lan hoi {before["boot"]}: ESP32 khoi dong '
+                'lai sau khi dat gain (gain da mat) hay file ack cu')
+    if (ack.get('mac') or '').lower() != (before.get('mac') or '').lower():
+        return f'mac #gain_ack {ack.get("mac")} khac mac hai lan hoi {before.get("mac")}: board khac'
+    if run_gain is not None and ack.get('id') != run_gain.get('id'):
+        return f'id #gain_ack {ack.get("id")} khac id dong #gain cua luot {run_gain.get("id")}: ack cua bo gain khac'
+    return None
+
+
 def run_boot_of(csv_path, events_path=None):
     """(boot of the run's '#us,ev=start', None) or (None, why) for one agv_logger CSV of one run."""
     try:

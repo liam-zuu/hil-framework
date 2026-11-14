@@ -38,6 +38,11 @@ tv_duty (S03 Y3, S05 4.7 (1)), from the cumulative firmware counters dpwm_fl..dp
     - no '#gain' line of the run: first_seq = the log_seq of the first motor-on data line, next to the
       run's '#us,ev=start', all copies agreeing except line_drop (S05 6.3, R134C-2, -5; events file
       <log>.events.txt of agv_logger.py; gain_line_check.run_start).
+    - B8-1 B81-14 (S05 v3.20 4.7 (iv), C9 (d); CODE 14/11 to CODE_R134): the '#gain_ack' answer of the
+      gain setting (saved gain_send.py output, --gain-ack / --gain-ack-name) missing, not ok, or with a boot
+      or MAC other than the two query answers, or an id other than the run's '#gain' line
+      (gain_line_check.ack_problem). A run whose '#gain' line has id 0 (built-in set, nothing set since that
+      boot) has no ack to check.
     The data lines are read by gain_line_check.read_esp32_log (R134C-3, S05 6.3): lines marked
     'duplicate' in <log>.segments.csv dropped (counted, tv_rows_dropped), 'conflict' / 'ambiguous'
     refused; without the sidecar two lines with one log_seq are refused.
@@ -65,10 +70,12 @@ n_flag, and per quantity median and max over the valid runs that have a number, 
 every valid run without a number. The quantity list is fixed here (do not change after seeing numbers).
 
   python tools/s05_final_table.py tv --log <esp32 csv> --t-end <s> --query-before F --query-after F
-      [--no-boot] [--no-gain-line]       (F: stdout of gain_send.py --query, with its '#gain_running' line)
+      [--gain-ack A] [--no-boot] [--no-gain-line]   (F: stdout of gain_send.py --query, with its '#gain_running'
+      line; A: stdout of gain_send.py setting the set, with its '# ack' line)
   python tools/s05_final_table.py table [--dataset 05_DATA/M7_dataset] --out <dir>
       [--score-name score.json] [--esp32-name esp32.csv]
       [--query-before-name gain_query_before.txt] [--query-after-name gain_query_after.txt]
+      [--gain-ack-name gain_ack.txt]
   table writes <out>/S05_final_table.csv (one row per cell and quantity), S05_final_table.md (the
   three gain sets side by side) and S05_final_runs.csv (the value of every valid run: appendix).
 Last line: #ket_qua,ma=0 done / 2 error.
@@ -134,11 +141,12 @@ def read_events(log_path):
 
 
 def tv_duty_esp32(rows, t_end_s, edge_max_ms=EDGE_MAX_MS, t0_us=None, queries=None, events=None,
-                  check_boot=True, check_gain_line=True):
+                  check_boot=True, check_gain_line=True, ack=None):
     """tv_duty of one run from its ESP32 log lines (dicts of strings, read_esp32_log). Returns a dict with
     tv_duty (None when no number) and every check; 'reason' says why there is no number.
     queries: (before, after) read_query dicts of the gain_send --query answers around the run (None =
-    missing); events: read_events of the run (None = no events file).
+    missing); events: read_events of the run (None = no events file); ack: gain_line_check.read_ack of the
+    gain setting (None = missing; B81-14, checked with the boot).
     check_boot / check_gain_line False skip those two checks (tool tests, old runs; never for the table)."""
     out = dict(tv_duty=None, reason='', edge_max_ms=edge_max_ms)
     need = ('timestamp_us', 'tick', 'log_seq', 'motor_on', 'run_active') + WHEELS
@@ -251,7 +259,8 @@ def tv_duty_esp32(rows, t_end_s, edge_max_ms=EDGE_MAX_MS, t0_us=None, queries=No
         before, after = queries if queries else (None, None)
         out.update(boot_before=before and before['boot'], boot_after=after and after['boot'],
                    mac_before=before and before.get('mac'), mac_after=after and after.get('mac'))
-        bad = glc.query_problem(before, after, st['boot'])
+        bad = glc.query_problem(before, after, st['boot']) or glc.ack_problem(ack, before, st.get('gain'))
+        out.update(boot_ack=ack and ack.get('boot'))                                         # B81-14
         if bad:
             out['reason'] = bad
             return out
@@ -273,6 +282,13 @@ def gain_set_of(gain_set_id, controller):
     return None
 
 
+def _a_number(v):
+    """B8-1 B81-16 (S05 v3.20 C9 (e)): a finite int or float (not bool); NaN, inf, text are no number."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return False
+    return v == v and v not in (float('inf'), float('-inf'))
+
+
 def run_values(score, task, tv):
     fig8 = task.startswith('O1-F')
     v = dict(e_perp_max=score.get('e_perp_max'),
@@ -285,11 +301,14 @@ def run_values(score, task, tv):
             miss[q] = 'khong ap dung (K1, K2: chi so huong lenh, O1 3.7)'
         elif v[q] is None:
             miss[q] = (tv.get('reason') or 'thieu') if q == 'tv_duty' else 'diem cham khong co so'
+        elif not _a_number(v[q]):                                       # B81-16: NaN / inf is no number
+            miss[q] = f'gia tri khong huu han hay khong phai so ({v[q]!r})'
+            v[q] = None
     return v, miss
 
 
 def load_runs(dataset, score_name, esp32_name, query_before_name='gain_query_before.txt',
-              query_after_name='gain_query_after.txt'):
+              query_after_name='gain_query_after.txt', gain_ack_name='gain_ack.txt'):
     path = os.path.join(dataset, 'm7_tuning_log.csv')
     with open(path, newline='', encoding='utf-8') as f:
         rows = list(csv.DictReader(f))
@@ -321,7 +340,7 @@ def load_runs(dataset, score_name, esp32_name, query_before_name='gain_query_bef
                 tv = tv_duty_esp32(rows_ep, float(score['t_end']),
                                    queries=(read_query(os.path.join(d, query_before_name)),
                                             read_query(os.path.join(d, query_after_name))),
-                                   events=read_events(ep))
+                                   events=read_events(ep), ack=glc.read_ack(os.path.join(d, gain_ack_name)))
                 tv['rows_dropped'] = n_drop
             elif not tv['reason']:
                 tv['reason'] = f'thieu {esp32_name}' if not os.path.isfile(ep) else 'diem cham khong co t_end'
@@ -351,7 +370,7 @@ def build_table(runs):
                                 n_hong_he_do=sum(r['outcome'] == 'hong_he_do' for r in rs),
                                 n_flag=sum(bool(r.get('flag')) for r in val))
                     for q in QUANTITIES:
-                        xs = [r['values'][q] for r in val if r['values'].get(q) is not None]
+                        xs = [r['values'][q] for r in val if _a_number(r['values'].get(q))]   # B81-16
                         why = '; '.join(f"{r['run_uid']}: {r['missing'][q]}" for r in val if q in r['missing'])
                         out.append(dict(base, quantity=q, n_m=len(xs),
                                         median=statistics.median(xs) if xs else None,
@@ -419,6 +438,7 @@ def main(argv=None):
     a1.add_argument('--edge-max-ms', type=float, default=EDGE_MAX_MS)
     a1.add_argument('--query-before', default=None, help='gain_send.py --query output just before the run')
     a1.add_argument('--query-after', default=None, help='gain_send.py --query output just after the run')
+    a1.add_argument('--gain-ack', default=None, help='gain_send.py output of the gain setting (#gain_ack; B81-14)')
     a1.add_argument('--no-boot', action='store_true', help='skip the boot check (tool test, old run)')
     a1.add_argument('--no-gain-line', action='store_true', help="skip the '#gain' first_seq check")
     a2 = sub.add_parser('table')
@@ -428,6 +448,7 @@ def main(argv=None):
     a2.add_argument('--esp32-name', default='esp32.csv')
     a2.add_argument('--query-before-name', default='gain_query_before.txt')
     a2.add_argument('--query-after-name', default='gain_query_after.txt')
+    a2.add_argument('--gain-ack-name', default='gain_ack.txt')
     a = ap.parse_args(argv)
     try:
         if a.cmd == 'tv':
@@ -435,12 +456,12 @@ def main(argv=None):
             r = tv_duty_esp32(rows, a.t_end, a.edge_max_ms,
                               queries=(read_query(a.query_before), read_query(a.query_after)),
                               events=read_events(a.log), check_boot=not a.no_boot,
-                              check_gain_line=not a.no_gain_line)
+                              check_gain_line=not a.no_gain_line, ack=glc.read_ack(a.gain_ack))
             r['rows_dropped'] = n_drop
             print(json.dumps(r, ensure_ascii=False, indent=1))
         else:
             runs, problems = load_runs(a.dataset, a.score_name, a.esp32_name, a.query_before_name,
-                                       a.query_after_name)
+                                       a.query_after_name, a.gain_ack_name)
             for p in problems:
                 print('CANH BAO:', p)
             write_table(runs, a.out)

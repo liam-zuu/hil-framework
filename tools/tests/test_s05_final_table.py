@@ -170,6 +170,19 @@ def answer(boot, mac='aa:bb', t=(100.0, 101.0)):
             '#ket_qua,ma=0\n')
 
 
+def ack_text(boot='4753dc47', mac='aa:bb', gid=7, ok=1, ma=0):
+    """A saved gain_send.py output of setting set `gid` (hil feat/wifi-gain 331cd76 main; B81-14)."""
+    return (f'# send 192.168.1.50:5014 #gain_set,v=1,tx=<new each try>,id={gid},ctrl=PID\n'
+            f'# ack tx=12345,req_id={gid},ok={ok},err=,sha=16702ff0e688,env=pid,mac={mac},boot={boot},id={gid},'
+            'applied_n=1,ctrl=PID\n'
+            f'# applied: id={gid} ctrl=PID applied_n=1 mac={mac} boot={boot}\n#ket_qua,ma={ma}\n')
+
+
+def _ack(boot='4753dc47', mac='aa:bb', gid='7'):
+    """read_ack fields of the gain setting (B81-14)."""
+    return dict(ok='1', boot=boot, mac=mac, id=gid)
+
+
 def write_log(d, rows, boots=('4753dc47', '4753dc47'), gain_seq=None, name='esp32.csv', run_boot='4753dc47',
               events=None):
     """esp32.csv, its events file with the run's start lines (start_events, or `events`), and gain_send
@@ -189,6 +202,8 @@ def write_log(d, rows, boots=('4753dc47', '4753dc47'), gain_seq=None, name='esp3
         if b is not None:
             with open(q, 'w', encoding='utf-8') as f:
                 f.write(answer(b, t=t))
+    with open(os.path.join(d, 'gain_ack.txt'), 'w', encoding='utf-8') as f:      # B81-14: ack of the setting
+        f.write(ack_text(run_boot))
 
 
 def write_run(base, uid, platform, stage, ctrl, task, gain_set_id, outcome, e_perp, tv_ok=True, flag=0,
@@ -350,7 +365,7 @@ def test_boot_before_and_after_the_run(tmp_path):
                         ((_q('ab', t=B), _q('ab', t=B)), False, 'khong phai truoc va sau'),   # one question twice
                         ((_q('ab', path='p'), _q('ab', t=A, path='p')), False, 'cung mot file'),
                         ((_q('ab', t=None), _q('ab', t=A)), False, '#query_pc')):            # no PC times
-        r = T.tv_duty_esp32(L.rows, 10.0, queries=qs, events=ev)
+        r = T.tv_duty_esp32(L.rows, 10.0, queries=qs, events=ev, ack=_ack('ab'))
         assert (r['tv_duty'] is not None) == ok and why in r['reason'], (qs, r['reason'])
     r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs('ab'), events=ev[:6], check_gain_line=False)
     assert r['tv_duty'] is None and 'khong co boot' in r['reason']             # no #us,ev=start: no run boot
@@ -359,7 +374,8 @@ def test_boot_before_and_after_the_run(tmp_path):
     write_log(d, L.rows, boots=('4753DC47', '4753dc47'))
     qb, qa = os.path.join(d, 'gain_query_before.txt'), os.path.join(d, 'gain_query_after.txt')
     assert T.read_boot(qb) == '4753DC47' and T.read_query(qb)['_t_end'] == 101.0
-    assert T.main(['tv', '--log', p, '--t-end', '10', '--query-before', qb, '--query-after', qa]) == 0
+    assert T.main(['tv', '--log', p, '--t-end', '10', '--query-before', qb, '--query-after', qa,
+                   '--gain-ack', os.path.join(d, 'gain_ack.txt')]) == 0
     r = T.tv_duty_esp32(T.read_esp32_log(p), 10.0, events=T.read_events(p), queries=(T.read_query(qb),) * 2)
     assert r['tv_duty'] is None and 'cung mot file' in r['reason']             # R134C2-1: one file for both
     for bad in ('# no answer\n#ket_qua,ma=3\n', answer('4753dc47') + '#ket_qua,ma=3\n',     # R134C-1: last line
@@ -376,14 +392,14 @@ def test_gain_line_of_the_run(tmp_path):
     d = str(tmp_path)
     p = os.path.join(d, 'esp32.csv')
     write_log(d, L.rows, gain_seq=3)                                  # the line of another run
-    r = T.tv_duty_esp32(T.read_esp32_log(p), 10.0, queries=_qs(), events=T.read_events(p))
+    r = T.tv_duty_esp32(T.read_esp32_log(p), 10.0, queries=_qs(), ack=_ack(), events=T.read_events(p))
     assert r['tv_duty'] is None and 'no #gain line' in r['reason']
     os.remove(p + '.events.txt')
     assert T.read_events(p) is None
-    r = T.tv_duty_esp32(T.read_esp32_log(p), 10.0, queries=_qs(), events=None)
+    r = T.tv_duty_esp32(T.read_esp32_log(p), 10.0, queries=_qs(), ack=_ack(), events=None)
     assert 'thieu file events' in r['reason']
     write_log(d, L.rows)
-    r = T.tv_duty_esp32(T.read_esp32_log(p), 10.0, queries=_qs(), events=T.read_events(p))
+    r = T.tv_duty_esp32(T.read_esp32_log(p), 10.0, queries=_qs(), ack=_ack(), events=T.read_events(p))
     assert r['tv_duty'] == pytest.approx(4.0) and r['run_first_seq'] == int(L.rows[3]['log_seq'])
     assert r['run_boot'] == '4753dc47'
 
@@ -398,12 +414,12 @@ def test_old_gain_line_of_an_earlier_boot_is_not_taken():
     old_gain = [x for x in start_events(s0, '0badf00d') if '#gain,' in x]                 # 30 s earlier
     for events in (start_events(s0, '0badf00d') + stamp(['#us_end,boot=0badf00d,on=0'], '2026-11-14T10:00:05')
                    + now, old_gain + now):                                            # every boundary line lost
-        r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), events=events)
+        r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), ack=_ack(), events=events)
         assert r['tv_duty'] is None and ('no #gain line' in r['reason'] or 'cannot be told apart' in r['reason'])
-    r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), events=old_gain + now)
+    r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), ack=_ack(), events=old_gain + now)
     assert 'no #gain line' in r['reason'] and 'within 0.5 s' in r['reason']
     # two boots on the run's own #us,ev=start lines: refused
-    r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(),
+    r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), ack=_ack(),
                         events=start_events(s0)[:7] + stamp([US.format(boot='0badf00d', seq=s0)], '2026-11-14T10:00:00.007'))
     assert r['tv_duty'] is None and 'cannot be told apart' in r['reason']
 
@@ -415,11 +431,11 @@ def test_order_of_arrival_does_not_matter():
     s0 = _first(L)
     ev = start_events(s0)
     reordered = ev[:6] + stamp(['#run_end,seq=90,last_data_seq=89,log_qdrop=0'], '2026-11-14T10:00:00.006') + ev[6:]
-    r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), events=reordered)
+    r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), ack=_ack(), events=reordered)
     assert r['tv_duty'] == pytest.approx(4.0), r['reason']
     late = ev[:8] + stamp(['#us_end,boot=4753dc47,on=0', '#run_end,seq=1200,last_data_seq=1199',
                            US.format(boot='4753dc47', seq=s0)], '2026-11-14T10:00:10')     # read late: late time
-    r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), events=late)
+    r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), ack=_ack(), events=late)
     assert r['tv_duty'] == pytest.approx(4.0), r['reason']                # an early copy is still there
 
 
@@ -430,10 +446,10 @@ def test_only_a_late_start_copy_left():
     s0 = _first(L)
     gains = start_events(s0)[3:6]
     late_us = stamp([US.format(boot='4753dc47', seq=s0)], '2026-11-14T10:00:00.700')
-    r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), events=gains + late_us)
+    r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), ack=_ack(), events=gains + late_us)
     assert r['tv_duty'] is None and 'within 0.5 s' in r['reason']
     with_boot = [x + ',boot=4753dc47' for x in gains]
-    r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), events=with_boot + late_us)
+    r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), ack=_ack(), events=with_boot + late_us)
     assert r['tv_duty'] == pytest.approx(4.0), r['reason']
 
 
@@ -441,11 +457,11 @@ def test_line_drop_differs_between_copies_of_one_gain_line():
     """R134C-5: line_drop is read live when formatted (logger.c 181-182); not a conflict, largest reported."""
     L = _clean()
     ev = start_events(_first(L), drops=(0, 1, 1))
-    r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), events=ev)
+    r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), ack=_ack(), events=ev)
     assert r['tv_duty'] == pytest.approx(4.0) and r['gain_line_drop_max'] == 1
     ev = start_events(_first(L))
     ev[4] = ev[4].replace('id=7', 'id=8')
-    r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), events=ev)
+    r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), ack=_ack(), events=ev)
     assert r['tv_duty'] is None and 'conflict' in r['reason']
 
 
@@ -498,3 +514,67 @@ def test_tail_must_follow_b_in_the_same_segment(tmp_path):
     rows[b + 1]['tick'] = '1'                                         # counters reset (new boot) at b + 1
     r = tv(rows, t_end)
     assert r['tv_duty'] is None and 'tick 1' in r['reason']
+
+
+# ---------------------------------------------------------------- B8-1 (S05 v3.20 C9 (d), (e); CODE_R134)
+
+def test_b81_14_gain_ack_boot_matches_the_two_questions(tmp_path):
+    """S05 4.7 (iv): the boot of the '#gain_ack' at the gain setting equals the boot of the two questions (and the
+    board, and the set the run ran)."""
+    L = _clean()
+    ev = start_events(_first(L))
+    for ack, ok, why in ((_ack(), True, ''), (None, False, 'thieu cau tra loi #gain_ack'),
+                         (_ack('0badf00d'), False, 'khoi dong lai sau khi dat gain'),
+                         (_ack(mac='cc:dd'), False, 'board khac'), (_ack(gid='8'), False, 'bo gain khac'),
+                         (_ack('4753DC47'), True, '')):
+        r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), events=ev, ack=ack)
+        assert (r['tv_duty'] is not None) == ok and why in r['reason'], (ack, r['reason'])
+    built_in = [x.replace('id=7', 'id=0') for x in ev]               # built-in set: nothing set since that boot
+    r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), events=built_in, ack=None)
+    assert r['tv_duty'] == pytest.approx(4.0), r['reason']
+
+
+def test_b81_14_read_ack_and_the_table(tmp_path):
+    d = str(tmp_path)
+    p = os.path.join(d, 'a.txt')
+    for text, ok in ((ack_text(), True), (ack_text(ok=0), False), (ack_text(ma=4), False),
+                     (ack_text() + ack_text(), False), (ack_text(boot='zz'), False), ('#ket_qua,ma=0\n', False)):
+        with open(p, 'w', encoding='utf-8') as f:
+            f.write(text)
+        assert (T.glc.read_ack(p) is not None) is ok, text
+    assert T.glc.read_ack(os.path.join(d, 'none.txt')) is None
+    base = os.path.join(d, 'runs')
+    os.makedirs(base)
+    run = write_run(base, 'F1', 'HIL', 'final_hil', 'PID', 'O1-F05', 'A-PID/G0', 'dat', 0.03)
+    ds = os.path.join(d, 'ds')
+    os.makedirs(ds)
+    with open(os.path.join(ds, 'm7_tuning_log.csv'), 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=list(run))
+        w.writeheader()
+        w.writerow(run)
+    runs, _ = T.load_runs(ds, 'score.json', 'esp32.csv')
+    assert runs[0]['values']['tv_duty'] == pytest.approx(4.0) and runs[0]['tv_check']['boot_ack'] == '4753dc47'
+    with open(os.path.join(run['results_dir'], 'gain_ack.txt'), 'w', encoding='utf-8') as f:
+        f.write(ack_text('0badf00d'))
+    runs, _ = T.load_runs(ds, 'score.json', 'esp32.csv')
+    assert runs[0]['values']['tv_duty'] is None and 'khoi dong lai sau khi dat gain' in runs[0]['missing']['tv_duty']
+    os.remove(os.path.join(run['results_dir'], 'gain_ack.txt'))
+    runs, _ = T.load_runs(ds, 'score.json', 'esp32.csv')
+    assert 'thieu cau tra loi #gain_ack' in runs[0]['missing']['tv_duty']
+
+
+@pytest.mark.parametrize('bad', [float('nan'), float('inf'), float('-inf'), True, 'x'])
+def test_b81_16_not_finite_is_no_number(bad):
+    """S05 v3.20 C9 (e): a quantity that is not a finite number is missing (with its reason), not counted in n_m."""
+    v, miss = T.run_values(dict(e_perp_max=bad, e_s_absmax=0.01, e_trk_max=0.02, e_theta_lane_max_deg=5.0,
+                                e_theta_cmd_max_deg=4.0), 'O1-F05', dict(tv_duty=1.0))
+    assert v['e_perp_max'] is None and 'khong huu han' in miss['e_perp_max']
+    runs = [dict(run_uid='a', controller='PID', condition='O1-F05', platform='HIL', gain_set='A', outcome='dat',
+                 values=v, missing=miss),
+            dict(run_uid='b', controller='PID', condition='O1-F05', platform='HIL', gain_set='A', outcome='dat',
+                 values=dict(v, e_perp_max=0.05), missing={}),
+            dict(run_uid='c', controller='PID', condition='O1-F05', platform='HIL', gain_set='A', outcome='dat',
+                 values=dict(v, e_perp_max=bad), missing={})]               # a value that skipped run_values
+    cell = [t for t in T.build_table(runs) if t['condition'] == 'O1-F05' and t['platform'] == 'HIL'
+            and t['gain_set'] == 'A' and t['quantity'] == 'e_perp_max'][0]
+    assert cell['n_m'] == 1 and cell['max'] == 0.05 and 'a: gia tri khong huu han' in cell['missing']
