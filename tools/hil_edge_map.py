@@ -49,8 +49,8 @@ which frame a reply is, not how many wraps lie between two anchors. t_send_ns is
 right before each transfer (rpi5/hil_node.py), it increases, and over a few seconds it runs within RHO_MAX_PPM of
 the H7 clock; the H7 receives a frame (DMA end, inside the Pi transfer) after its t_send and less than 3 s after
 it. Two consecutive anchors must be less than ANCHOR_GAP_MAX_S apart in t_send (and in order), else refused
-(also a log without t_send_ns): then their true H7 span is in (0, 1.001 s + 3 s), inside the 4.47 s half wrap,
-so the nearest unwrap is the true one. The Pi time is used for nothing else: not a time axis, not a bracket term,
+(also a log without t_send_ns): then their true H7 span is in (0, ANCHOR_GAP_MAX_S / (1 - rho) + 3 s) = (0, 4.001
+s), rho = RHO_MAX_PPM (Codex RS4-R11-1), inside the 4.47 s half wrap, so the nearest unwrap is the true one. The Pi time is used for nothing else: not a time axis, not a bracket term,
 no bound on the Pi -> H7 delay inside a step (A1, A2 of ff616ab are not used), nothing on how many replies the
 H7 holds (A3). Frame logs of 40-byte frames
 (before P1) carry no run_id: refused here; they were mapped by ff616ab (L103: each result names its mapper

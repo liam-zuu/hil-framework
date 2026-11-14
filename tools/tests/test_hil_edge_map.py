@@ -710,7 +710,8 @@ def test_cyccnt_unwrap_across_a_pi_stop_codex_r10_1():
     assert abs(d - 4000 * M.H7_CYC_PER_US) <= M.H7_CYC_PER_US      # the wrap is invisible in the stamps
     ap = M.h7_apply(fr, 0, 300)
     assert not ap['ok'] and 'answered frames 4 and 5' in ap['reason'] and 'RS4-R10-1' in ap['reason'], ap
-    # half a wrap and just under the bound: refused at the bound, exact below it
+    # half a wrap, then send gaps 1 ms above and 1 ms under the bound (the 1000 us step is added to the pause):
+    # refused above, exact under (the bound to the ns: test_anchor_send_gap_exactly_at_the_bound, Codex RS4-R11-2)
     for pause, ok in ((0.5 * W_US, False), (M.ANCHOR_GAP_MAX_S * 1e6, False), (M.ANCHOR_GAP_MAX_S * 1e6 - 2000.0, True)):
         fr, tm = _paused_frames(pause)
         ap = M.h7_apply(fr, 0, 300)
@@ -737,10 +738,25 @@ def test_map_edge_refuses_a_pi_stop_of_one_wrap_inside_the_range():
 
 
 def test_anchor_gap_bound_keeps_the_unwrap_inside_the_half_wrap():
-    # B4 arithmetic: a send gap under ANCHOR_GAP_MAX_S at RHO_MAX_PPM plus a receive at most 3 s after its send stays
-    # inside the half wrap, so the nearest unwrap is the true one
+    # B4 arithmetic: a send gap under ANCHOR_GAP_MAX_S, at most 1 / (1 - rho) longer on the H7 clock (rho =
+    # RHO_MAX_PPM, Codex RS4-R11-1), plus a receive at most 3 s after its send stays inside the half wrap, so the
+    # nearest unwrap is the true one
     assert abs(M.CYC_HALF_WRAP_S - 2.0 ** 31 / 480e6) < 1e-12
-    assert M.ANCHOR_GAP_MAX_S * (1 + M.RHO_MAX_PPM * 1e-6) + 3.0 < M.CYC_HALF_WRAP_S
+    assert M.ANCHOR_GAP_MAX_S / (1 - M.RHO_MAX_PPM * 1e-6) + 3.0 < M.CYC_HALF_WRAP_S
+
+
+@pytest.mark.parametrize('gap_ns, ok', [(10 ** 9 - 1, True), (10 ** 9, False), (10 ** 9 + 1, False)])
+def test_anchor_send_gap_exactly_at_the_bound(gap_ns, ok):
+    # Codex RS4-R11-2: the Pi send gap between frames 4 and 5 set to the ns around ANCHOR_GAP_MAX_S (the H7 receives
+    # follow the same pause): one ns under maps, the bound itself and above are refused
+    fr, _ = _paused_frames(gap_ns / 1000.0 - 1000.0)
+    ts = fr['t_send_ns'].copy()
+    ts[5:] = ts[5:] - ts[5] + ts[4] + gap_ns
+    assert int(ts[5] - ts[4]) == gap_ns and M.ANCHOR_GAP_MAX_S == 1.0
+    ap = M.h7_apply(dict(fr, t_send_ns=ts), 0, 300)
+    assert ap['ok'] == ok, ap.get('reason')
+    if not ok:
+        assert 'answered frames 4 and 5' in ap['reason'] and 'B4' in ap['reason'], ap['reason']
 
 
 @pytest.mark.parametrize('stale_dt', [-4000.0, -1000.0, 0.0])
