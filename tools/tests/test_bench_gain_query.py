@@ -239,6 +239,9 @@ def test_gain_set_saved_and_ack_read(tmp_path):
     assert B.gain_set(None, 'g.json', str(tmp_path / 'c.txt'), run=fake_run(ACK, [])) is None
 
 
+QUERY_ID = ['7']                     # the running id the fake question before answers (R134C5-4)
+
+
 def _gain_bench(monkeypatch, tmp_path, ack_text):
     order = []
 
@@ -261,7 +264,7 @@ def _gain_bench(monkeypatch, tmp_path, ack_text):
         order.append('q_' + ('before' if path.endswith('before.txt') else 'after'))
         with open(path, 'x', encoding='utf-8') as f:
             f.write(ANSWER)
-        return dict(boot='4753dc47', mac='aa:bb:cc:dd:ee:ff')
+        return dict(boot='4753dc47', mac='aa:bb:cc:dd:ee:ff', id=QUERY_ID[0])      # R134C5-4: running id
     monkeypatch.setattr(B, 'gain_set', fake_set)
     monkeypatch.setattr(B, 'gain_query', fake_query)
     code, _ = B.bench(a)
@@ -291,7 +294,8 @@ def test_analyze_only_judges_the_saved_ack_again(tmp_path, monkeypatch):
         write_run_log(out, n)
         for w, t in (('before', ('1', '2')), ('after', ('3', '4'))):
             with open(os.path.join(out, 'pi', f'{n}_gain_query_{w}.txt'), 'w', encoding='utf-8') as f:
-                f.write(f'#query_pc,t_start={t[0]},t_end={t[1]}\n' + ANSWER)
+                f.write(f'#query_pc,t_start={t[0]},t_end={t[1]}\n' + ANSWER.replace('id=0,applied_n=0',
+                                                                                 'id=7,applied_n=1'))
         if ack_boot:
             with open(os.path.join(out, 'pi', f'{n}_gain_ack.txt'), 'w', encoding='utf-8') as f:
                 f.write(ACK.replace('4753dc47', ack_boot))
@@ -325,3 +329,12 @@ def test_c4_5_bench_stops_when_the_ack_is_of_another_boot(tmp_path, monkeypatch)
     s = json.load(open(os.path.join(a.out, 'session.json'), encoding='utf-8'))
     rec = s['runs'][0]
     assert rec['gain_ack']['boot'] == '0badf00d' and 'khoi dong lai sau khi dat gain' in rec['gain_ack']['problem']
+
+
+def test_c5_4_bench_stops_when_another_set_runs_since_the_ack(tmp_path, monkeypatch):
+    """R134C5-4: the ack says id 7, the question before says id 8 (same boot): the run is not started."""
+    monkeypatch.setattr(sys.modules[__name__], 'QUERY_ID', ['8'])
+    a, order, code = _gain_bench(monkeypatch, tmp_path, ACK)
+    assert code == 2 and order == ['set', 'q_before'], order
+    s = json.load(open(os.path.join(a.out, 'session.json'), encoding='utf-8'))
+    assert 'bo gain khac' in s['runs'][0]['gain_ack']['problem']

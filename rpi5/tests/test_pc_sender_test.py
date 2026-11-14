@@ -155,7 +155,8 @@ def test_query_dir_refuses_an_old_ack_with_gain_file(tmp_path):
 
 def test_c4_5_ack_before_problem(tmp_path):
     """R134C4-5: the car's ack is compared with the question just before the task."""
-    before = '#query_pc,t_start=1.0,t_end=2.0\n' + ANSWER.replace('boot=4753dc47', 'boot=4753dc47,mac=aa:bb')
+    before = ('#query_pc,t_start=1.0,t_end=2.0\n'
+              + ANSWER.replace('boot=4753dc47', 'boot=4753dc47,mac=aa:bb').replace('id=0', 'id=7'))
     assert 'no readable answer' in ps.ack_before_problem(str(tmp_path))
     (tmp_path / 'gain_query_before.txt').write_text(before, encoding='utf-8')
     assert 'thieu cau tra loi #gain_ack' in ps.ack_before_problem(str(tmp_path))
@@ -163,3 +164,6 @@ def test_c4_5_ack_before_problem(tmp_path):
     assert ps.ack_before_problem(str(tmp_path)) is None
     (tmp_path / ps.ACK_NAME).write_text(ACK.replace('4753dc47', '0badf00d'), encoding='utf-8')
     assert 'khoi dong lai sau khi dat gain' in ps.ack_before_problem(str(tmp_path))
+    (tmp_path / ps.ACK_NAME).write_text(ACK, encoding='utf-8')     # R134C5-4: another set runs (id 8) since the ack
+    (tmp_path / 'gain_query_before.txt').write_text(before.replace('id=7', 'id=8'), encoding='utf-8')
+    assert 'bo gain khac' in ps.ack_before_problem(str(tmp_path))

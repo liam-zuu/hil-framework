@@ -241,8 +241,8 @@ def test_table_cells_medians_and_reasons(tmp_path):
         write_run(tmp_path, 'r2', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'khong_dat', 0.120, flag=3),
         write_run(tmp_path, 'r3', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', 0.030, tv_ok=False),
         write_run(tmp_path, 'r4', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'hong_he_do', 0.900),
-        write_run(tmp_path, 'r5', 'HIL', 'final_hil', 'PID', 'O1-K1', 'RQ2-INIT-PID/G00', 'chua_ket_luan', 0.050,
-                  boots=('4753dc47', '0badf00d')),                      # boot differs: tv_duty has no number
+        write_run(tmp_path, 'r5', 'HIL', 'final_hil', 'PID', 'O1-K1', 'RQ2-INIT-PID/G00', 'chua_ket_luan', 0.050),
+        # R134C5-1: a run whose two answers differ is refused at run level (test_c5_1_...), not tabled
         write_run(tmp_path, 'r6', 'HW', 'screen', 'PID', 'O1-F05', 'A-PID/G03', 'dat', 0.010),   # not final
     ]
     ds = tmp_path / 'ds'
@@ -266,7 +266,7 @@ def test_table_cells_medians_and_reasons(tmp_path):
          == ('PID', 'O1-K1', 'HIL', 'khoi_dau')}
     assert k['e_theta_lane_max_deg']['n_m'] == '0' and 'khong ap dung' in k['e_theta_lane_max_deg']['missing']
     assert float(k['e_theta_cmd_max_deg']['median']) == pytest.approx(3.0)
-    assert k['tv_duty']['n_m'] == '0' and 'khac boot' in k['tv_duty']['missing']
+    assert k['tv_duty']['n_m'] == '1' and float(k['tv_duty']['median']) == pytest.approx(4.0)
     md = (out / 'S05_final_table.md').read_text(encoding='utf-8')
     assert '| PID | O1-F05 | xe |' in md and '0.03 / 0.12 (n_m 3)' in md
     per_run = list(csv.DictReader(open(out / 'S05_final_runs.csv', encoding='utf-8')))
@@ -541,9 +541,9 @@ def test_b81_14_gain_ack_boot_matches_the_two_questions(tmp_path):
                          (_ack('4753DC47'), True, '')):
         r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), events=ev, ack=ack)
         assert (r['tv_duty'] is not None) == ok and why in r['reason'], (ack, r['reason'])
-    built_in = [x.replace('id=7', 'id=0') for x in ev]               # built-in set: nothing set since that boot
+    built_in = [x.replace('id=7', 'id=0') for x in ev]               # R134C5-3: every final run has its ack
     r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), events=built_in, ack=None)
-    assert r['tv_duty'] == pytest.approx(4.0), r['reason']
+    assert r['tv_duty'] is None and 'thieu cau tra loi #gain_ack' in r['reason']
 
 
 def test_b81_14_read_ack_and_the_table(tmp_path):
@@ -568,11 +568,15 @@ def test_b81_14_read_ack_and_the_table(tmp_path):
     assert runs[0]['values']['tv_duty'] == pytest.approx(4.0) and runs[0]['tv_check']['boot_ack'] == '4753dc47'
     with open(os.path.join(run['results_dir'], 'gain_ack.txt'), 'w', encoding='utf-8') as f:
         f.write(ack_text('0badf00d'))
-    runs, _ = T.load_runs(ds, 'score.json', 'esp32.csv')
-    assert runs[0]['values']['tv_duty'] is None and 'khoi dong lai sau khi dat gain' in runs[0]['missing']['tv_duty']
+    with pytest.raises(ValueError, match='khoi dong lai sau khi dat gain'):     # R134C5-3: run level, not tv
+        T.load_runs(ds, 'score.json', 'esp32.csv')
     os.remove(os.path.join(run['results_dir'], 'gain_ack.txt'))
-    runs, _ = T.load_runs(ds, 'score.json', 'esp32.csv')
-    assert 'thieu cau tra loi #gain_ack' in runs[0]['missing']['tv_duty']
+    with pytest.raises(ValueError, match='thieu gain_ack.txt'):
+        T.load_runs(ds, 'score.json', 'esp32.csv')
+    with open(os.path.join(run['results_dir'], 'gain_ack.txt'), 'w', encoding='utf-8') as f:
+        f.write(ack_text(ok=0))                                         # there but not an applied set
+    with pytest.raises(ValueError, match='gain_ack.txt hong'):
+        T.load_runs(ds, 'score.json', 'esp32.csv')
 
 
 @pytest.mark.parametrize('bad', [float('nan'), float('inf'), float('-inf'), True, 'x'])
@@ -655,5 +659,53 @@ def test_c4_5_an_ack_is_checked_even_with_id_0(tmp_path):
     assert r['tv_duty'] is None and 'khoi dong lai sau khi dat gain' in r['reason']
     r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), events=ev, ack=_ack())       # same boot, but id 7 != 0
     assert r['tv_duty'] is None and 'bo gain khac' in r['reason']
-    r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), events=ev, ack=None)
-    assert r['tv_duty'] == pytest.approx(4.0), r['reason']
+    r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), events=ev, ack=None)   # R134C5-3: no exemption left
+    assert r['tv_duty'] is None and 'thieu cau tra loi #gain_ack' in r['reason']
+
+
+# ---------------------------------------------------------------- Codex Sol round 5 (CODE_R134)
+
+@pytest.mark.parametrize('case, match', [('same_answer', 'khong phai truoc va sau'), ('other_boot', 'khac boot sau'),
+                                         ('row_boots', 'boot cua dong log')])
+def test_c5_1_run_evidence_is_checked_apart_from_tv_duty(tmp_path, case, match):
+    """R134C5-1: two answers that are not two questions (or not the row's boots) refuse the table, even when the
+    run has no number for tv_duty (no ESP32 log here)."""
+    r = write_run(tmp_path, 'e1', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', 0.02)
+    d = r['results_dir']
+    os.remove(os.path.join(d, 'esp32.csv'))                          # tv_duty: no number either way
+    qb, qa = os.path.join(d, 'gain_query_before.txt'), os.path.join(d, 'gain_query_after.txt')
+    if case == 'same_answer':                                         # 'after' is a copy of 'before': same PC times
+        with open(qb, encoding='utf-8') as f:
+            txt = f.read()
+        with open(qa, 'w', encoding='utf-8') as f:
+            f.write(txt)
+    elif case == 'other_boot':
+        with open(qa, 'w', encoding='utf-8') as f:
+            f.write(answer('0badf00d', t=(200.0, 201.0)))
+    else:
+        r.update(boot_before='0badf00d', boot_after='0badf00d')
+    with pytest.raises(ValueError, match=match):
+        T.load_runs(_table_ds(tmp_path, [r]), 'score.json', 'esp32.csv')
+
+
+def test_c5_2_a_historic_hil_row_does_not_stop_the_table(tmp_path):
+    """R134C5-2: a HIL row outside the campaigns, judged without a gate, is set apart before the row checks."""
+    good = write_run(tmp_path, 'g1', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', 0.02)
+    old = dict.fromkeys(rl.TUNING_COLS, '')
+    old.update(session_id='OLD', run_uid='OLD:1', campaign='', platform='HIL', stage='hil_check', run_outcome='dat',
+               controller='PID', trajectory='O1-F05', speed_mps='0.5')
+    runs, problems = T.load_runs(_table_ds(tmp_path, [good, old]), 'score.json', 'esp32.csv')
+    assert [x['run_uid'] for x in runs] == ['g1'] and problems == []
+
+
+def test_c5_3_every_final_run_has_its_ack(tmp_path):
+    """R134C5-3 (Liam 14/11 "Bat buoc ack moi luot (Recommended)"): the initial gain set too; the ack must be of
+    the running id of the question before."""
+    r = write_run(tmp_path, 'i1', 'HIL', 'final_hil', 'PID', 'O1-F05', 'RQ2-INIT-PID/G00', 'dat', 0.02)
+    os.remove(os.path.join(r['results_dir'], 'gain_ack.txt'))
+    with pytest.raises(ValueError, match='thieu gain_ack.txt'):
+        T.load_runs(_table_ds(tmp_path, [r]), 'score.json', 'esp32.csv')
+    with open(os.path.join(r['results_dir'], 'gain_ack.txt'), 'w', encoding='utf-8') as f:
+        f.write(ack_text(gid=8))                                      # the question before says id 7
+    with pytest.raises(ValueError, match='bo gain khac'):
+        T.load_runs(_table_ds(tmp_path, [r]), 'score.json', 'esp32.csv')

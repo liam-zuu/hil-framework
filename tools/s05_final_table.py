@@ -41,8 +41,12 @@ tv_duty (S03 Y3, S05 4.7 (1)), from the cumulative firmware counters dpwm_fl..dp
     - B8-1 B81-14 (S05 v3.20 4.7 (iv), C9 (d); CODE 14/11 to CODE_R134): the '#gain_ack' answer of the
       gain setting (saved gain_send.py output, --gain-ack / --gain-ack-name) missing, not ok, or with a boot
       or MAC other than the two query answers, or an id other than the run's '#gain' line
-      (gain_line_check.ack_problem). A run whose '#gain' line has id 0 (built-in set, nothing set since that
-      boot) has no ack to check.
+      (gain_line_check.ack_problem). Every final run has an ack, the initial gain too (R134C5-3; Liam 14/11
+      CODE_R134 "Bat buoc ack moi luot (Recommended)": gain set from a file with --gain-file).
+    Table (R134C4-2, R134C5-1, -2, -3): rows outside the campaigns set apart; the campaign rows go through the row
+    checks of rq3_log summary; every judged final run must show its evidence at run level (run_evidence_problem:
+    two answers that are two questions, of the row's boots, and a readable ack of the question's boot, MAC and
+    running id), else the table stops (exit 2). tv_duty may still have no number for its own reasons.
     The data lines are read by gain_line_check.read_esp32_log (R134C-3, S05 6.3): lines marked
     'duplicate' in <log>.segments.csv dropped (counted, tv_rows_dropped), 'conflict' / 'ambiguous'
     refused; without the sidecar two lines with one log_seq are refused.
@@ -315,22 +319,27 @@ def load_runs(dataset, score_name, esp32_name, query_before_name='gain_query_bef
     # R134C4-2 (Codex round 4): the rows go through the same row checks as rq3_log summary (gate columns
     # recomputed, the camera gate of a judged car run, both boots of a judged car / final_hil run, the HIL
     # mapping rules); any error stops the table. A final row outside the campaigns is not tabled (reported).
+    # R134C5-2: rows outside the campaigns (historic) are set apart first, so they cannot stop the table.
     import rq3_log as rl
-    rows = rl.live_rows(rows)
+    live = rl.live_rows(rows)
+    rows = [r for r in live if r.get('campaign') in rl.CAMPAIGNS]
+    problems = [f"run {r.get('run_uid')}: campaign {r.get('campaign')!r} ngoai cac chien dich, khong vao bang "
+                '(R134C4-2)' for r in live if r.get('campaign') not in rl.CAMPAIGNS
+                and any(r.get('platform') == p[0] and r.get('stage') == p[2] for p in PLATFORMS)]
     try:
         rl.check_gate_rows(rows)
         rl.check_map_rows(rows)
     except rl.LogError as e:
         raise ValueError(f'm7_tuning_log.csv: {e}')
-    runs, problems = [], []
+    runs, bad = [], []
     for r in rows:
         plat = next((p for p in PLATFORMS if r.get('platform') == p[0] and r.get('stage') == p[2]), None)
         if plat is None:
             continue
-        if r.get('campaign') not in rl.CAMPAIGNS:
-            problems.append(f"run {r.get('run_uid')}: campaign {r.get('campaign')!r} ngoai cac chien dich, khong vao "
-                            'bang (R134C4-2)')
-            continue
+        if r.get('run_outcome') in VALID:           # R134C5-1, R134C5-3: the run's evidence, whatever tv_duty
+            why = run_evidence_problem(r, query_before_name, query_after_name, gain_ack_name)
+            if why:
+                bad.append(f"run {r.get('run_uid')}: {why}")
         ctrl, task = r.get('controller', ''), r.get('trajectory', '')
         gs = gain_set_of(r.get('gain_set_id'), ctrl)
         if ctrl not in CONTROLLERS or task not in CONDITIONS or gs is None:
@@ -364,7 +373,34 @@ def load_runs(dataset, score_name, esp32_name, query_before_name='gain_query_bef
                            else int(score.get('n_back_frames') or 0) > 0)
             run['tv_check'] = tv
         runs.append(run)
+    if bad:
+        raise ValueError('luot da phan ma thieu bang chung bat buoc (luot hong do thao tac, sua log hay chay lai): '
+                         + '; '.join(bad))
     return runs, problems
+
+
+def run_evidence_problem(row, query_before_name='gain_query_before.txt', query_after_name='gain_query_after.txt',
+                         gain_ack_name='gain_ack.txt'):
+    """R134C5-1, R134C5-3 (Codex round 5; Liam 14/11 CODE_R134 hop chon "Bat buoc ack moi luot (Recommended)"):
+    None, or why a judged final run (car or HIL) lacks the evidence S05 4.7 (iv) asks for, checked at the level of
+    the run, apart from tv_duty: two answers in <results_dir> that are two questions one after the other
+    (gain_line_check.query_problem), their boots equal to the two boot columns of the row, and the '#gain_ack' of
+    the gain setting (every final run, the initial gain too, sets its gain from a file with --gain-file): present,
+    readable, of the boot, MAC and running id of the question before the run."""
+    d = row.get('results_dir', '')
+    qb, qa = read_query(os.path.join(d, query_before_name)), read_query(os.path.join(d, query_after_name))
+    why = glc.query_problem(qb, qa, check_run_boot=False)
+    if why:
+        return why
+    cols = ((row.get('boot_before') or '').lower(), (row.get('boot_after') or '').lower())
+    if cols != (qb['boot'].lower(), qa['boot'].lower()):
+        return f'boot cua dong log {cols} khac hai file hoi ({qb["boot"]}, {qa["boot"]})'
+    ap = os.path.join(d, gain_ack_name)
+    ack = glc.read_ack(ap)
+    if ack is None:
+        return (f'{gain_ack_name} hong (khong mot dong # ack ok=1, hay dong cuoi khong ma=0)' if os.path.exists(ap)
+                else f'thieu {gain_ack_name}: moi luot kiem cuoi dat gain bang --gain-file (Liam 14/11)')
+    return glc.ack_problem(ack, qb, {'id': qb.get('id')})
 
 
 def build_table(runs):

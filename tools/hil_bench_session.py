@@ -734,7 +734,7 @@ def bench(a):
                 boots, qrec = [q, None], dict(before=rb)
                 if ack is not None:                  # R134C4-5: a restart between the set and the question
                     import gain_line_check as glc
-                    abad = glc.ack_problem(ack, q)
+                    abad = glc.ack_problem(ack, q, {'id': (q or {}).get('id')})      # R134C5-4: id too
                     if abad:
                         print(f'{name}: DỪNG: {abad}; không chạy lượt này và các lượt sau')
                         sess['runs'].append(dict(name=name, args=args, boot=qrec, gain_ack=dict(
@@ -811,7 +811,7 @@ def bench(a):
                 bbad = boot_problem(boots[0], boots[1], a.out, name)
                 if not bbad and ack is not None:                   # B81-14: the set's ack of the same boot
                     import gain_line_check as glc
-                    bbad = glc.ack_problem(ack, boots[0])
+                    bbad = glc.ack_problem(ack, boots[0], {'id': (boots[0] or {}).get('id')})
                 if bbad:
                     r['clean'] = False
                     r['why'].append(bbad)
@@ -867,7 +867,7 @@ def analyze_only(a):
             bbad = boot_problem(qb, qa, a.out, n)
             if not bbad and 'gain_ack' in runs[n]:   # B81-14: a session made with --gain-file, ack read again
                 import gain_line_check as glc
-                bbad = glc.ack_problem(ack_of_run(a.out, n), qb)
+                bbad = glc.ack_problem(ack_of_run(a.out, n), qb, {'id': (qb or {}).get('id')})
             if bbad:
                 r['clean'] = False
                 r['why'].append(bbad)

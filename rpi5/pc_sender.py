@@ -231,7 +231,7 @@ def ack_before_problem(d: str):
     before = glc.read_query(os.path.join(d, 'gain_query_before.txt'))
     if before is None:
         return 'no readable answer to the question before the task (gain_query_before.txt)'
-    return glc.ack_problem(glc.read_ack(os.path.join(d, ACK_NAME)), before)
+    return glc.ack_problem(glc.read_ack(os.path.join(d, ACK_NAME)), before, {'id': before.get('id')})   # C5-4
 
 
 QUERY_NAMES = ('gain_query_before.txt', 'gain_query_after.txt')
