@@ -171,3 +171,27 @@ def test_duty_comes_from_miso_bytes_0_7_not_the_crc(tmp_path):
     assert out['sat_frac'] == pytest.approx(0.25, abs=1e-3)            # one wheel of four at |pwm| 1000
     assert 'tv_duty' not in out
     assert out['tv_duty_h7_1khz'] == pytest.approx(0.25 * 1000, rel=0.01)   # 0.25 per frame, 1000 frames/s
+
+
+def test_tool_error_plant_state_out_of_range_b81_15():
+    """O1 v11.15 3.5 (B81-15): a run whose plant state was NaN / inf, or whose x, y reached the +-5 m bound, is a
+    HIL tool error, refused (ValueError -> exit 2): from the manifest key the Pi writes, or for older logs from
+    x or y at +-32767; theta at +-pi (wrapped by the plant) and other fields at their bound are not (spec rule)."""
+    mosi = np.array([np.frombuffer(P.encode_state([1.0] * 4 + [0.5, -0.5, 0.0, 0.1, 0.0, 0.2]), np.uint8)
+                     for _ in range(5)])
+    H.tool_error({}, mosi)                                                # normal frames: no error
+    H.tool_error({'state_out_of_range': None}, mosi)
+    with pytest.raises(ValueError, match='HIL tool error.*field 4.*step 3'):
+        H.tool_error({'state_out_of_range': dict(step=3, field=4, value='nan')}, mosi)
+    for i, v in ((4, float('nan')), (5, 5.0), (4, float('-inf'))):
+        s = [1.0] * 4 + [0.5, -0.5, 0.0, 0.1, 0.0, 0.2]
+        s[i] = v
+        m = mosi.copy()
+        m[2] = np.frombuffer(P.encode_state(s), np.uint8)
+        with pytest.raises(ValueError, match=f'field {i} at the int16 bound at frame 2'):
+            H.tool_error({}, m)
+    m = mosi.copy()
+    m[1] = np.frombuffer(P.encode_state([1.0] * 4 + [0.5, -0.5, -math.pi, 0.1, 0.0, 0.2]), np.uint8)
+    H.tool_error({}, m)                                                   # theta -pi: not an error
+    m[1] = np.frombuffer(P.encode_state([40.0] * 4 + [0.5, -0.5, 0.0, 3.0, 0.0, 10.0]), np.uint8)
+    H.tool_error({}, m)                                                   # wheel speed, v, wz at bound: not in the rule

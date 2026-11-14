@@ -96,7 +96,12 @@ MISO duty of a later frame, never an earlier one. The fit of the pwm steps to th
 the shift (whole frames), so its minimum is an interval; its right end p_hi (G32-R2-2) cannot be before the
 edge: early_step <= p_hi + PWM_SLACK_STEPS is required, and p_lo - late_step <= PWM_LAG_MAX_STEPS (write within
 the 10 ms tick, H7 capture, frame answer) [ĐỀ XUẤT]. The PWM checks of round 1 (cost, correlation, alias)
-still refuse; the PWM side can only refuse more, never move the bracket.
+still refuse; the PWM side can only refuse more, never move the bracket. The frames a window compares end at
+the tick of its last line at the SMALLEST shift of the search (SEARCH[0]), so at every shift tried each frame
+is predicted by a line of the window; before, they ran to the largest shift (SEARCH[1], about 400 frames past
+the last line) holding its pwm, and a command change right after the window (A-K2 reversal at 3 s, PID) gave
+a low correlation and refused a run whose count side mapped (CLOSED_LOOP/2026-11-14_run01 k2; Liam 14/11
+CODE_RS4 local_33fb860c "Sửa + test + Codex (Recommended)").
 
 Refused (ok False, reason) when: firmware not in FW_COUNTS_AT_TICK or no events file; frame log without MOSI /
 MISO; frames shorter than FRAME_V6 (40-byte logs before P1); a MOSI of the range (to k_hi + LAG_MAX) whose run_id
@@ -524,7 +529,11 @@ def esp_clock_ppm(raw_path: str):
     """ESP32 clock rate vs the Pi clock [ppm] from the logger's raw packets (Pi receive time, ESP32 timestamp):
     slope of the edge of the lower convex hull of (timestamp, receive - timestamp) that spans the mean timestamp
     (one-way delay skew estimate). A coarse check only: on 12 bench runs of 13/11 (12.7 s each) it spread over
-    -52 .. +31 ppm. Reported only since L100 (the bound is RHO_MAX_PPM). None when fewer than 50 packets or 5 s."""
+    -52 .. +31 ppm. Reported only since L100 (the bound is RHO_MAX_PPM). None when fewer than 50 packets or 5 s.
+    Sign (B81-20, THESIS_B8 14/11, CODE): the hull slope s is d(receive - timestamp) / d(timestamp) = f_Pi / f_ESP
+    - 1; the value returned is f_ESP / f_Pi - 1 = -s / (1 + s), > 0 when the ESP32 clock runs fast, as the name
+    says. Before 14/11 s itself was returned (the opposite sign; S05 4.7 (i) uses |esp_pi_ppm|, so t_end_err_ms
+    did not change)."""
     pts = []
     with open(raw_path, encoding='utf-8') as f:
         for line in f:
@@ -550,7 +559,8 @@ def esp_clock_ppm(raw_path: str):
     xm = float(x.mean())
     for (x1, y1), (x2, y2) in zip(h[:-1], h[1:]):
         if x1 <= xm <= x2 and x2 > x1:
-            return float((y2 - y1) / (x2 - x1) * 1e6)
+            s = (y2 - y1) / (x2 - x1)
+            return float(-s / (1.0 + s) * 1e6)
     return None
 
 
@@ -697,7 +707,9 @@ def pwm_side(duty, k_run, esp, ie, period_us):
     fits = {}
     for W, sel in _windows(ts, after, ts[on[0]]):
         t_last = ts[sel][-1]
-        k_hi = int(min(n, hi + (t_last - ts[ie]) / period_us + 1))
+        # frames up to the last line's tick at the smallest shift lo: every frame compared is predicted by a
+        # line of the window at every shift a >= lo (not the last pwm held past the window; run01 k2, docstring)
+        k_hi = int(min(n, lo + (t_last - ts[ie]) / period_us + 1))
         frames = np.arange(max(0, int(lo) - 5), k_hi)
         frames = frames[good[frames]]
         lines = np.r_[ie - 1, sel] if ie > 0 else sel        # the 0 before the edge

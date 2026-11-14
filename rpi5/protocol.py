@@ -59,6 +59,7 @@ CRITICAL: If you change anything here, update the H7 firmware decode
           wrong → controller gets garbage → system fails silently.
 """
 import binascii
+import math
 import os
 import struct
 import numpy as np
@@ -125,9 +126,29 @@ PWM_RANGE:    float = 1.0   # duty ±1.0
 # ── Core conversion helpers ───────────────────────────────────────────────
 
 def _to_int16(value: float, scale: float) -> int:
-    """Clamp to ±scale then quantise to int16 range [-32767, 32767]."""
+    """Clamp to ±scale then quantise to int16 range [-32767, 32767]. Not finite: NaN gives +32767 (Python
+    max/min), ±inf the bound of its sign, so the frame cannot show it (B81-15): the plant state is checked
+    before encoding with state_out_of_range (hil_node.py); this function is unchanged (rpi5/imu_model.py of
+    the S04 lock calls it)."""
     clamped = max(-scale, min(scale, float(value)))
     return int(round(clamped / scale * 32767))
+
+
+THETA_INDEX = 6     # theta in the frame state order [w1..w4, x, y, theta, vx, vy, wz]
+POS_INDEX = (4, 5)  # x, y
+
+
+def state_out_of_range(state) -> int:
+    """O1 v11.15 3.5 (B81-15; Liam 14/11 THESIS_B8 "duyệt cả", then "Giữ U_p = 0, ghi giới hạn"): index of the
+    first field of a frame state (encode_state order) that is not finite, or of x, y when it reaches the +-5 m
+    encoding bound (|v| >= STATE_RANGES[i]: the encoder would clamp it), else -1. A HIL tool error, the run is
+    redone. theta: only not finite, since the plant wraps it to [-pi, pi) before it is sent (plant_step.py
+    _wrap_angle), so +-pi is a normal value (B81-8). The other fields are checked for finite only (the spec rule)."""
+    for i, (v, rng) in enumerate(zip(state, STATE_RANGES)):
+        v = float(v)
+        if not math.isfinite(v) or (i in POS_INDEX and abs(v) >= rng):
+            return i
+    return -1
 
 
 def _from_int16(raw: int, scale: float) -> float:

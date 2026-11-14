@@ -138,7 +138,8 @@ def make_miso(mosi, duty, tm, skip=(), lost=(), twice=(), over=(), sat=(), v4=Fa
 
 def sim(edge_ms=415.3, k_run=400, n=5200, kind='ramp', move_after_ms=3.0, ppm=30.0,
         late=(3, 7, 40, 41, 90, 133), write_ms=0.4, glitch_every=97, n_before=6, seed=1, pwm_period=None,
-        burst=None, stale_ms=0.0, skip=(), dup=(), win_max=80.0, dts=(), stage_lag=None, crc_twin=(), copy2=()):
+        burst=None, stale_ms=0.0, skip=(), dup=(), win_max=80.0, dts=(), stage_lag=None, crc_twin=(), copy2=(),
+        pwm_flip=None):
     """dict(duty, esp, frames, k_true, timing) of a made-up run with the edge tick at H7 time edge_ms."""
     rng = np.random.default_rng(seed)
     dt = np.full(n, 1000.0)
@@ -183,6 +184,8 @@ def sim(edge_ms=415.3, k_run=400, n=5200, kind='ramp', move_after_ms=3.0, ppm=30
     else:
         p = np.round(60 + 40 * np.sin(0.13 * j) + 20 * np.sin(0.051 * j + 1.0))
     p[0] = 15.0
+    if pwm_flip:                                                    # (tick, factor): command change at that tick
+        p[j >= pwm_flip[0]] *= pwm_flip[1]                          # (A-K2 reversal at 3 s, run01 k2)
     pw = np.r_[np.zeros((n_before, 4)), np.round(np.column_stack([p, p * 0.9, p * 1.1, p]))]
     # MISO duty of transfer f: the pwm written before the H7 serviced frame f - 2
     write_t = pi_time(ts + write_ms * 1000.0)
@@ -840,6 +843,20 @@ def test_refusals():
 # "stale counts" test is dropped (Codex RS4-R4-5 (b), RS4-R5-3).
 
 
+@needs_gcc
+@pytest.mark.parametrize('factor', [-2.5, 0.0])
+def test_command_change_right_after_the_3_s_window_maps(factor):
+    # CLOSED_LOOP/2026-11-14_run01 k2 (PID, A-K2 reversal 3 s after the first pwm): the pwm reverses (or stops)
+    # at the first log line after the 3 s window. The frames each window compares end at its last line's tick
+    # at the smallest shift (SEARCH[0]); before, they ran about 400 frames further holding the last pwm, the
+    # 3 s fit had correlation ~0.2 and the run was refused although its count side mapped.
+    s = sim(pwm_flip=(301, factor))
+    em = run(s)
+    _check_bracket(em, s['k_true'])
+    fits = em['pwm_side']['fits']
+    assert set(fits) == {'1.0', '2.0', '3.0'} and min(fits['3.0']['corr']) > M.MIN_CORR, fits['3.0']['corr']
+
+
 def test_plateau_right_end():
     # G32-R2-2: a step-function cost keeps the right end of its flat minimum
     fine = np.arange(0.0, 2.001, 0.01)
@@ -851,8 +868,9 @@ def test_plateau_right_end():
 def test_esp_clock_ppm_from_raw(tmp_path):
     rng = np.random.default_rng(3)
     ts = np.arange(0, 12_000_000, 10_000) + 1_000_000
-    for true in (-40.0, 0.0, 35.0):
-        rx = ts * (1 + true * 1e-6) + 5e6 + 300.0 + rng.exponential(600.0, len(ts))   # floor + WiFi delay
+    # true = f_ESP / f_Pi - 1 [ppm] (B81-20): an ESP32 timestamp span d is d / (1 + true) on the Pi clock
+    for true in (-40.0, 0.0, 35.0, 900.0):
+        rx = ts / (1 + true * 1e-6) + 5e6 + 300.0 + rng.exponential(600.0, len(ts))   # floor + WiFi delay
         p = tmp_path / f'r{true}.jsonl'
         with open(p, 'w') as f:
             for a, b in zip(ts, rx):
@@ -884,7 +902,7 @@ def write_esp_csv(path, esp, columns=COLUMNS, extra_rows=(), fw=FW, ppm=None):
     if ppm is not None:                                               # raw packets: Pi receive vs ESP32 timestamp
         rng = np.random.default_rng(5)
         ts = np.arange(esp['timestamp_us'][0], esp['timestamp_us'][0] + 8_000_000, 10_000)
-        rx = ts * (1 + ppm * 1e-6) + 300.0 + rng.exponential(600.0, len(ts))
+        rx = ts / (1 + ppm * 1e-6) + 300.0 + rng.exponential(600.0, len(ts))   # ppm = f_ESP / f_Pi - 1 (B81-20)
         with open(path + '.raw.jsonl', 'w') as f:
             for a, b in zip(ts, rx):
                 f.write(json.dumps(dict(t_mono_ns=int(b * 1e3), b64=base64.b64encode(f'{a},1'.encode()).decode())) + '\n')
