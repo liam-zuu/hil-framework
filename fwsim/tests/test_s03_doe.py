@@ -1545,7 +1545,7 @@ def test_v82_main_writes_the_gate_columns_and_meta(tmp_path, monkeypatch, capsys
     assert code == 0
     for f in ('sealed/runs.csv', 'sealed_test/runs_test.csv'):
         assert next(_csv.reader(open(out / f))) == V8_COLS + V82_COLS, f
-    assert set(V82_COLS) <= set(next(_csv.reader(open(out / 'sweep.csv'))))
+    assert next(_csv.reader(open(out / 'sweep.csv'))) == list(s3.SWEEP_ID_COLS) + s3.RUN_COLS[5:]   # S3G2-3
     # S3G-3: the VALUES reach the three files (fake gate fields differ per gains and speed)
     gains = {(d['controller'], d['point_id']): {n: float(d[f'{n}_value']) for n in s3.FACTORS[d['controller']]}
              for d in _csv.DictReader(open(out / 'design.csv'))}
@@ -1564,7 +1564,7 @@ def test_v82_main_writes_the_gate_columns_and_meta(tmp_path, monkeypatch, capsys
         n += 1
     assert n > 2 * (271 * 3 + 300)
     meta = (out / 'meta.yaml').read_text(encoding='utf-8')
-    assert 'source_check: "same at the end of the run"' in meta                 # S3G-1
+    assert 'source_check: "same at import, start and end of the run"' in meta   # S3G-1, S3G2-1
     assert meta.startswith('spec: S03 v8.2 ')
     lines = meta.splitlines()
     gate = _json.loads(next(x for x in lines if x.startswith('gate: ')).split('   #')[0][len('gate: '):])
@@ -1646,7 +1646,7 @@ def test_v82_sweep_run_error_is_a_sweep_row(tmp_path, monkeypatch, capsys, mode)
     code, out, console, _, _ = _run_main(tmp_path, monkeypatch, capsys, error_in_sweep=mode)
     assert code == 2 and '[STOP]' in console
     head = next(_csv.reader(open(out / 'sweep.csv')))
-    assert head[:6] == list(s3.SWEEP_ID_COLS) and set(s3.RUN_COLS[5:]) <= set(head)
+    assert head == list(s3.SWEEP_ID_COLS) + s3.RUN_COLS[5:]                      # S3G2-3: one fixed header
     rows = list(_csv.DictReader(open(out / 'sweep.csv')))
     err = [r for r in rows if r['status'] == 'run_error']
     assert len(err) == 1 and err[0]['error'] == 'FakeSweepError: boom' and err[-1] == rows[-1]
@@ -1679,6 +1679,44 @@ def test_v82_sources_taken_at_the_start_and_checked_at_the_end(tmp_path, monkeyp
     meta = (out / 'meta.yaml').read_text(encoding='utf-8')
     assert calls == dict(git=2, ev=2) and code == 2
     assert '"commit": "commit1"' in next(x for x in meta.splitlines() if x.startswith('script: '))
-    assert '"marker": 1' in next(x for x in meta.splitlines() if x.startswith('evaluator_sha256: '))
+    ev_line = next(x for x in meta.splitlines() if x.startswith('evaluator_sha256: '))
+    import json as _json
+    assert 'marker' not in ev_line and _json.dumps(s3.EVAL_SHA_AT_IMPORT) in ev_line  # S3G2-1: as imported
     sc = next(x for x in meta.splitlines() if x.startswith('source_check: '))
     assert 'CHANGED' in sc and '"commit": "commit2"' in sc and 'S3G-1' in meta and 'source_check' in console
+
+
+@needs_dll
+def test_v82_evaluator_changed_before_the_start_is_caught(tmp_path, monkeypatch, capsys):
+    """S3G2-1: the evaluator hashed at import differs from the files at the start (changed in between):
+    recorded as CHANGED, exit 2, although start and end agree."""
+    monkeypatch.setattr(s3, 'EVAL_SHA_AT_IMPORT', dict(s3.EVAL_SHA_AT_IMPORT, marker='import'))
+    code, out, console, _, _ = _run_main(tmp_path, monkeypatch, capsys)
+    meta = (out / 'meta.yaml').read_text(encoding='utf-8')
+    sc = next(x for x in meta.splitlines() if x.startswith('source_check: '))
+    assert code == 2 and 'CHANGED' in sc and '"marker": "import"' in sc and 'source_check' in console
+
+
+def test_v82_untracked_files_are_not_a_source_change(tmp_path):
+    """S3G2-2: an untracked file (e.g. an output folder inside the repo) leaves the snapshot key equal; a
+    change of a tracked file does not."""
+    import subprocess as _sp
+    repo = str(tmp_path / 'repo')
+    os.makedirs(repo)
+
+    def git(*a):
+        _sp.run(['git', '-C', repo, *a], check=True, capture_output=True)
+    git('init', '-q')
+    git('config', 'user.email', 't@t')
+    git('config', 'user.name', 't')
+    (tmp_path / 'repo' / 'a.py').write_text('x = 1\n')
+    git('add', 'a.py')
+    git('commit', '-q', '-m', 'a')
+    k0 = s3.source_snapshot(repo)['key']
+    os.makedirs(os.path.join(repo, 'out', 'sealed'))
+    (tmp_path / 'repo' / 'out' / 'sealed' / 'runs.csv').write_text('a\n')
+    s1 = s3.source_snapshot(repo)
+    assert s1['key'] == k0 and s1['script']['dirty']          # meta still says untracked files are there
+    (tmp_path / 'repo' / 'a.py').write_text('x = 2\n')
+    k2 = s3.source_snapshot(repo)['key']
+    assert k2 != k0 and k2['tracked'] == ['a.py'] and k2['commit'] == k0['commit']

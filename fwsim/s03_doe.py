@@ -791,6 +791,25 @@ def git_state(repo):
         return dict(commit='UNKNOWN', dirty=True, modified=[str(e)])
 
 
+def tracked_changes(repo):
+    """Tracked files that differ from HEAD (staged or not); untracked files are not sources (S3G2-2: an
+    output folder inside the repo is not a change of the code)."""
+    try:
+        out = subprocess.run(['git', '-C', repo, 'diff', '--name-only', 'HEAD'], capture_output=True, text=True,
+                             check=True).stdout
+        return sorted(p for p in out.splitlines() if p and not p.startswith(('fwsim/build/', '.vscode/')))
+    except (OSError, subprocess.CalledProcessError) as e:
+        return [f'UNKNOWN: {e}']
+
+
+def source_snapshot(repo):
+    """S3G-1, S3G2-2: git state for meta.yaml, and the key compared at the start and the end of a run: the
+    commit, the tracked files changed, the evaluator files."""
+    st = git_state(repo)
+    return dict(script=st, key=dict(commit=st['commit'], tracked=tracked_changes(repo),
+                                    evaluator=evaluator_sha256()))
+
+
 def _rel_or_abs(p, start):
     """Path of p relative to start with '/', or the absolute path when they are on different
     drives (Windows: relpath raises ValueError)."""
@@ -864,8 +883,9 @@ def main():
         print('WARNING: fwsim.dll was built from a dirty firmware tree; not usable as a main result')
     path = o1.Path8()
     # S3G-1 (Codex round 1): the script commit and the evaluator files are taken BEFORE the first run and
-    # checked again at the end; a change in between is recorded and S03 ends with exit code 2
-    src_start = dict(script=git_state(os.path.join(HERE, '..')), evaluator=evaluator_sha256())
+    # checked again at the end; a change in between is recorded and S03 ends with exit code 2. S3G2-1: the
+    # evaluator files are also compared with their hash taken when this module was imported
+    src_start = source_snapshot(os.path.join(HERE, '..'))
     t0 = time.time()
     sweep_rows, level_rows, design_rows, all_runs = [], [], [], []
     eff_rows, curv_rows, ver_rows, fail_rows, det_rows = [], [], [], [], []
@@ -1179,8 +1199,8 @@ def main():
                        ('levels.csv', level_rows), ('design.csv', design_rows)):
         p = os.path.join(a.out, name)
         cols = None
-        if name == 'sweep.csv':     # S3G-2: the columns of the rows, then every run column still missing
-            cols = list(dict.fromkeys([k for r in rows for k in r] + list(SWEEP_ID_COLS) + RUN_COLS[5:]))
+        if name == 'sweep.csv':     # S3G-2, S3G2-3: one fixed header (identifiers, run columns), other keys after
+            cols = list(dict.fromkeys(list(SWEEP_ID_COLS) + RUN_COLS[5:] + [k for r in rows for k in r]))
         write_csv(p, rows, cols)
         files[name] = sha256_file(p)
     # S3C-3 (b): no count in public; a failed check stops S03 (3.4), so 'passed' iff it ran to the end
@@ -1193,10 +1213,12 @@ def main():
               'stopped in the main design (reason sealed)' if stop_sealed else
               'stopped in the test set (reason in sealed_test/)' if stop_test else 'ran to the end')
     # S3G-1: the sources the runs were made with are those taken at the start; the end must give the same
-    src_end = dict(script=git_state(os.path.join(HERE, '..')), evaluator=evaluator_sha256())
-    src_changed = src_end != src_start
-    source_check = (dict(result='CHANGED during the run: not usable as a main result', end=src_end) if src_changed
-                    else 'same at the end of the run')
+    # (S3G2-1: and the evaluator files are those hashed at import; S3G2-2: untracked files do not count)
+    src_end = source_snapshot(os.path.join(HERE, '..'))
+    src_changed = (src_end['key'] != src_start['key'] or src_start['key']['evaluator'] != EVAL_SHA_AT_IMPORT)
+    source_check = (dict(result='CHANGED during the run: not usable as a main result', start=src_start['key'],
+                         end=src_end['key'], evaluator_at_import=EVAL_SHA_AT_IMPORT) if src_changed
+                    else 'same at import, start and end of the run')
     if src_changed:
         status += '; the script or evaluator sources changed during the run (S3G-1)'
         print('WARNING: the script commit or the evaluator files changed during the run; see meta.yaml '
@@ -1238,7 +1260,7 @@ thresholds: {json.dumps(dict(THRESH, tv_duty=f'{Y3_REL:.0%} of the default-gain 
 y3_reference: {json.dumps({f'{c} v={v}': y for (c, v), y in y3_ref.items()})}
 o1: {json.dumps(dict(A=o1.A, a_r=o1.A_R, D=o1.D, D_d=o1.D, t_d=o1.T_D, t_late=o1.T_LATE, delta=o1.DELTA, v_d=o1.V_D, c_cens=o1.C_CENS))}
 gate: {json.dumps(gate_meta())}   # S03 v8.2 section 7: G1-G5 per run (o1_gate.gate), U = 0 on fwsim
-evaluator_sha256: {json.dumps(src_start['evaluator'])}   # S03 v8.2 section 8 condition 8: S03 and S04 on the same evaluator; taken before the first run (S3G-1)
+evaluator_sha256: {json.dumps(EVAL_SHA_AT_IMPORT)}   # S03 v8.2 section 8 condition 8: S03 and S04 on the same evaluator; the files as hashed when the script was imported (S3G-1, S3G2-1)
 sweep_run_error_reruns: {json.dumps([n for n in rerun_notes if n['point'] is None], default=str)}
 planned_runs_per_controller: {json.dumps(PLANNED_RUNS)}   # S03 v8 3.2, 7 (rows actually run: sealed/, sealed_test/)
 test_points: {json.dumps(tp_meta)}   # S03 v8 3.2, 7, 8.7 (S3V8-3): read once before the main design; sha256 of the bytes read, sha256_lf after CRLF -> LF, matches_head_blob_lf, generation from <name>.gen.json beside the file
@@ -1275,6 +1297,12 @@ files:
 """)
     print(f'S03 finished -> {a.out}; status: {status}')
     return 0 if not (stop_public or stop_sealed or stop_test or src_changed) else 2
+
+
+# S3G2-1: the evaluator files hashed when this module is imported, i.e. right after they were imported
+# above (the start and end snapshots of main() are compared with it). Child processes import again from
+# disk; a change between the two is caught only by the determinism check of section 3.4 (deferred).
+EVAL_SHA_AT_IMPORT = evaluator_sha256()
 
 
 if __name__ == '__main__':
