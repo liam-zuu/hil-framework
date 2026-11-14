@@ -739,8 +739,8 @@ def test_map_edge_refuses_a_pi_stop_of_one_wrap_inside_the_range():
 
 def test_anchor_gap_bound_keeps_the_unwrap_inside_the_half_wrap():
     # B4 arithmetic: a send gap under ANCHOR_GAP_MAX_S, at most 1 / (1 - rho) longer on the H7 clock (rho =
-    # RHO_MAX_PPM, Codex RS4-R11-1), plus a receive at most 3 s after its send stays inside the half wrap, so the
-    # nearest unwrap is the true one
+    # RHO_MAX_PPM * 1e-6, Codex RS4-R11-1, R12-1), plus a receive at most 3 s after its send stays inside the half
+    # wrap, so the nearest unwrap is the true one
     assert abs(M.CYC_HALF_WRAP_S - 2.0 ** 31 / 480e6) < 1e-12
     assert M.ANCHOR_GAP_MAX_S / (1 - M.RHO_MAX_PPM * 1e-6) + 3.0 < M.CYC_HALF_WRAP_S
 
