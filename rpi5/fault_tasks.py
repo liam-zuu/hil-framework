@@ -8,9 +8,13 @@ for the HIL bench (run_hil.py --test A-W1). L82, spec S06 T8 "Loai II" (task A-W
          here again (the Pi publisher does not import the fwsim experiment script, which imports fwsim,
          ctypes and the build tools); test_fault_tasks.py pins it equal to imu_freq_exp.a_w1.
 
-On the bench, with --finite-run, RUN lasts the task (8 s) and STOPPING then sends the zero setpoint for
-LifecycleConfig.stop_s (1 s): as fault_run.py, which runs the task then TAIL_S = 1 s of zeros. A fault window
-counts from t0 = the first RUN step on the bench and from 0 in fwsim.
+On the bench, with --finite-run, LifecycleConfig.run_s is the task (8 s) and STOPPING then sends the zero
+setpoint for LifecycleConfig.stop_s (1 s), as fault_run.py runs the task then TAIL_S = 1 s of zeros. RUN is not
+exactly 8 s (Codex C7T1-1; Liam 15/11 CODE_FAULT "Sua 10, giu RUN": the mechanism is kept): the lifecycle ends
+RUN when the publisher reports the end of the task, 8.083-8.102 s in FAULT_C7 2026-11-14 run02 / run03, and the
+publisher's clock starts when it sees RUN, so the setpoint changes 2-4 ms after t0 + 2 / 4 / 6 s. A fault window
+counts from t0 = the first RUN step on the bench and from 0 in fwsim; tools/fault_c7_table.py records the RUN
+length (run_s) and the first setpoint change (ref_first_s) of each bench run.
 
 Why a new module (as rpi5/o1_tasks.py): rpi5/trajectory_pub.py is in the S04 blob lock (fwsim/s04_ga.py
 SIM_SOURCES), so it is not edited. install() wraps its get_body_velocity in the publishing process

@@ -40,7 +40,12 @@ def base_log():
     return lg
 
 
-def write_case(folder, lg, rows=(), config=None, esp32='5bde4c5', hil='a2de855', imu_rows=180, dropped=()):
+PLANT = dict(motor_model='dc', V_batt=12.4, ground_model='traction', mu_hd=[0.436] * 4,
+             src=dict(plant_step_py='e56a', params_py='501e'))
+
+
+def write_case(folder, lg, rows=(), config=None, esp32='5bde4c5', hil='a2de855', imu_rows=180, dropped=(),
+               plant=None, dirty=False):
     os.makedirs(folder)
     np.savetxt(os.path.join(folder, 'log.csv'), np.column_stack([lg[c] for c in COLS]), delimiter=',',
                header=','.join(COLS), comments='', fmt='%.6g')
@@ -51,9 +56,10 @@ def write_case(folder, lg, rows=(), config=None, esp32='5bde4c5', hil='a2de855',
         fh.write('t,mask\n' + ''.join(f'{k * 0.05},{16 if k in dropped else 0}\n' for k in range(imu_rows)))
     with open(os.path.join(folder, 'meta.yaml'), 'w', encoding='utf-8') as fh:
         fh.write('spec: null\nfirmware:\n'
-                 f'  esp32: {json.dumps(dict(commit=esp32, dirty=False))}\n'
+                 f'  esp32: {json.dumps(dict(commit=esp32, dirty=dirty))}\n'
                  f'  hil_framework: {json.dumps(dict(commit=hil, dirty=False))}\n'
                  f'config: {json.dumps(config or CONFIG)}\n'
+                 f'plant: {json.dumps(plant or PLANT)}\n'
                  f'faults: {json.dumps(dict(rows=rows))}\n')
 
 
@@ -116,6 +122,9 @@ def test_row_against_the_baseline(tmp_path):
     ('esp32', 'esp32 commit'),
     ('ticks', 'tick times differ'),
     ('name', 'not <MODE>_<CASE>'),
+    ('plant', 'plant'),                        # C7T1-4: same config, another mu_hd
+    ('dirty', 'dirty or unknown'),             # C7T1-4: a dirty DLL build under the same commit
+    ('dirty_none', 'dirty or unknown'),
 ])
 def test_folders_that_cannot_be_tabled(tmp_path, kind, msg):
     if kind != 'no_base':
@@ -126,7 +135,9 @@ def test_folders_that_cannot_be_tabled(tmp_path, kind, msg):
                    rows=[ROW] if kind == 'base_rows' else ())
     cfg = dict(CONFIG, seed=1) if kind == 'seed' else dict(CONFIG, imu_noise='off') if kind == 'noise' else None
     write_case(str(tmp_path / 'PID_encFL'), fault_log(), rows=[ROW], config=cfg,
-               esp32='16702ff' if kind == 'esp32' else '5bde4c5')
+               esp32='16702ff' if kind == 'esp32' else '5bde4c5',
+               plant=dict(PLANT, mu_hd=[0.3] * 4) if kind == 'plant' else None,
+               dirty=True if kind == 'dirty' else None if kind == 'dirty_none' else False)
     with pytest.raises(ct.TableError, match=msg):
         ct.table(str(tmp_path))
 
@@ -141,19 +152,23 @@ import params as PARAMS                        # noqa: E402
 T0 = 1000                                      # first RUN step
 NF = T0 + 9500                                 # frames: past t0 + 9 s
 TH = 0.5                                       # heading: body != world velocity
+RUN_ID = 0x1234ABCD
 ARGS = '--test A-W1 --seed 0 --imu-noise 20 --ground traction'
 FW = dict(esp32_fw=[dict(sha='5bde4c55bf3a', dirty=0, env='esp32-s3-devkitc-1')],
           h7_fw=[dict(sha='7dd5ab265933', dirty=0, env='Debug')])
 GAIN = '#gain,id=0,applied_n=0,ctrl=PID,kp_xy=1.5,ki_xy=0.05,kp_wz=1,ki_wz=0.05,first_seq={},line_drop=0,boot=ab'
 ESP_PRE, ESP_RUN, ESP_POST = 5, 920, 30        # rows: idle before, run_active, idle after (tick frozen)
+SEQ0 = 1000                                    # log_seq of the first ESP32 row
+FIRST_SEQ = SEQ0 + ESP_PRE                     # log_seq of the first run_active row (= #gain first_seq)
 H_FWD = PARAMS.MecanumParams().H_fwd
 
 
 @functools.lru_cache(maxsize=None)
-def bench_frames(fault):
+def bench_frames(fault, endpoint=False):
     """(mosi, mosi_true) of a run: 9.5 s after t0, wheels 2 rad/s each, body wz = A-W1 + 0.01, heading TH;
     the fault run: body vx 0.4 at t0 + 5.9 s and 9.0 at 6.0 s, x 0.25 at t0 + 9 s and 1.0 after, theta -3.1
-    at t0 + 9 s (base 3.1); mosi of the fault run has wheel FL = 0 in [3, 5) s (enc_loss)."""
+    at t0 + 9 s (base 3.1); mosi of the fault run has wheel FL = 0 in [3, 5) s (enc_loss). endpoint: wheels
+    -10 / 10 / -10 / 10 at t0 + 9 s (r_true 2.01, inside (0, duration]) and -20 / 20 at t0 (outside)."""
     true, sent = [], []
     for step in range(NF):
         k = step - T0
@@ -161,8 +176,10 @@ def bench_frames(fault):
         vb = 0.4 if fault and k == 5900 else 9.0 if fault and k == 6000 else 0.0
         x = (0.25 if k == 9000 else 1.0 if k > 9000 else 0.0) if fault else 0.0
         th = (-3.1 if fault else 3.1) if k == 9000 else TH
-        st = [2.0, 2.0, 2.0, 2.0, x, 0.0, th, math.cos(th) * vb, math.sin(th) * vb, wz_ref + 0.01]
-        kw = dict(traj_ref=(0.0, 0.0, wz_ref), seq=step, frame_no=step)
+        w = 10.0 if endpoint and k == 9000 else 20.0 if endpoint and k == 0 else None
+        om = [-w, w, -w, w] if w else [2.0, 2.0, 2.0, 2.0]
+        st = om + [x, 0.0, th, math.cos(th) * vb, math.sin(th) * vb, wz_ref + 0.01]
+        kw = dict(traj_ref=(0.0, 0.0, wz_ref), seq=step, frame_no=step, run_id=RUN_ID)
         true.append(np.frombuffer(P.encode_state(st, **kw), np.uint8))
         if fault and 3000 <= k < 5000:
             st = [0.0] + st[1:]
@@ -171,8 +188,9 @@ def bench_frames(fault):
 
 
 def esp_rows(fault):
-    """ESP32 CSV rows (ESP_COLS); tick 100 before the run, 101.. while run_active, frozen after; timestamp_us
-    with +-2 ms of jitter; wz_src 0 from 9.2 s in both runs (the motor-off switch after the run)."""
+    """ESP32 CSV rows (ESP_COLS); tick 100 before the run, 101.. while run_active, frozen after; log_seq one per
+    row from SEQ0; timestamp_us with +-2 ms of jitter; wz_src 0 from 9.2 s in both runs (the motor-off switch
+    after the run)."""
     out, gyro = [], 0
     for i in range(ESP_PRE + ESP_RUN + ESP_POST):
         j = i - ESP_PRE                                    # run tick index, t = j * 10 ms
@@ -183,7 +201,7 @@ def esp_rows(fault):
             gyro += 1                                      # 20 Hz reports, none in the imu window of the fault run
         w = 1.0 if 3.0 <= t < 5.0 else 0.0
         out.append(dict(timestamp_us=1_000_000 + 10_000 * i + (2000 if i % 2 else -2000), tick=tick,
-                        run_active=ra,
+                        log_seq=SEQ0 + i, run_active=ra,
                         wz_src=0 if (fault and 3.08 <= t < 5.10) or t >= 9.2 else 1,
                         slip_flag=1 if fault and 3.25 <= t < 5.5 else 0,
                         ws_flag=1 if fault and 3.22 <= t < 5.3 else 0,
@@ -194,8 +212,9 @@ def esp_rows(fault):
 
 
 def manifest(fault, t0=T0, **over):
-    m = dict(step_first=0, steps=NF, imu_source='plant', imu_noise=dict(model='replay', seed=0, start_row=5114),
-             plant='MecanumPlant', plant_src=dict(plant_step_py='e56a'), proto='mosi_v4_miso_v6', frame_len=48,
+    m = dict(step_first=0, step_last=NF - 1, steps=NF, period_us=1000, imu_source='plant',
+             imu_noise=dict(model='replay', seed=0, start_row=5114), plant='MecanumPlant',
+             plant_src=dict(plant_step_py='e56a'), proto='mosi_v4_miso_v6', frame_len=48,
              lifecycle=dict(transitions=[dict(step=0, phase='ARM'), dict(step=T0, phase='RUN'),
                                          dict(step=T0 + 8090, phase='STOPPING'), dict(step=T0 + 9090, phase='END')]),
              faults=dict(file='enc_FL.csv', sha256='abc', rows=[ROW], t0_step=t0, events=[], not_run=[], cut=False,
@@ -204,30 +223,53 @@ def manifest(fault, t0=T0, **over):
     return m
 
 
+ESP_BREAK = {   # kind -> (row index of the fault run's ESP32 log, column, value); C7T1-2, C7T1-6
+    'nan_r': (ESP_PRE + 400, 'r', 'nan'),
+    'flag_bad': (ESP_PRE + 400, 'slip_flag', 2),
+    'run_gap': (ESP_PRE + 400, 'run_active', 0),
+    'seq_gap': (ESP_PRE + 400, 'log_seq', SEQ0 + ESP_PRE + 401),
+    'half_tick': (ESP_PRE + 400, 'gyro_n', 50.5),
+}
+
+
 def write_bench(d, kind=None):
     """A bench folder with PID_base and PID_enc_FL; kind breaks one thing."""
     os.makedirs(os.path.join(d, 'frames'))
     os.makedirs(os.path.join(d, 'pi'))
+    os.makedirs(os.path.join(d, 'steps'))
     runs, summ = [], []
     for name, fault in (('PID_base', False), ('PID_enc_FL', True)):
         args = ARGS + (' --faults ~/fault_c7/enc_FL.csv' if fault else '') + f' --step-log ~/{name}_steps.csv'
         if fault and kind == 'args':
             args = args.replace('--seed 0', '--seed 1')
+        if fault and kind == 'args_order':                     # same pairs, another order and --opt=value
+            args = '--seed 0 --ground=traction --imu-noise 20 --test=A-W1 --faults ~/x.csv --step-log=~/s.csv'
         fw = dict(FW)
         if fault and kind == 'esp32':
             fw['esp32_fw'] = [dict(sha='16702ff00000', dirty=0, env='esp32-s3-devkitc-1')]
         runs.append(dict(name=name, args=args, **fw))
         summ.append(dict(name=name, clean=not (fault and kind == 'clean')))
-        mosi, true = bench_frames(fault)
+        mosi, true = bench_frames(fault, endpoint=fault and kind == 'endpoint')
+        mosi, true = mosi.copy(), true.copy()
         over = {}
         if fault and kind == 'noise':
             over['imu_noise'] = dict(model='replay', seed=1, start_row=5114)
+        if not fault and kind == 'period':
+            over['period_us'] = 2000
         man = manifest(fault or kind == 'base_rows', t0=T0 + 1 if fault and kind == 't0' else T0, **over)
         n = NF - 600 if fault and kind == 'short' else NF
-        man['steps'] = n
+        man['steps'], man['step_last'] = n, n - 1
+        if not fault and kind == 'frame_no':                   # C7T1-5: a lost baseline frame, steps renumbered
+            mosi = np.delete(mosi, T0 + 4500, axis=0)
+            n -= 1
+            man['steps'], man['step_last'] = n, n - 1
+        if not fault and kind == 'run_id0':
+            mosi[:, P.OFS_RUN_ID:P.OFS_RUN_ID + 4] = 0
         arrs = dict(manifest=np.array(json.dumps(man)), mosi=mosi[:n])
         if fault or kind == 'base_rows':
             arrs['mosi_true'] = true[:n]
+        if not fault and kind == 'dtype':
+            arrs['mosi'] = mosi[:n].astype(np.uint16)
         np.savez(os.path.join(d, 'frames', f'{name}_frames.npz'), **arrs)
         rows = esp_rows(fault)
         cols = list(ct.ESP_COLS)
@@ -236,30 +278,65 @@ def write_bench(d, kind=None):
         if fault and kind == 'no_run':
             for r in rows:
                 r['run_active'] = 0
+        if fault and kind in ESP_BREAK:
+            i, c, v = ESP_BREAK[kind]
+            rows[i][c] = v
+        if fault and kind == 'lost_head':                      # C7T1-2: the first 3 run rows lost
+            del rows[ESP_PRE:ESP_PRE + 3]
+        if fault and kind == 'no_pre':
+            del rows[:ESP_PRE]
         with open(os.path.join(d, 'pi', f'{name}.csv'), 'w', newline='') as fh:
             fh.write(','.join(cols) + '\n' + ''.join(','.join(str(r[c]) for c in cols) + '\n' for r in rows))
-        gain = GAIN.format(1139 if fault else 167)
+        gain = GAIN.format(FIRST_SEQ + (1 if fault and kind == 'first_seq' else 0))
         if fault and kind == 'gain':
             gain = gain.replace('kp_xy=1.5', 'kp_xy=2')
         with open(os.path.join(d, 'pi', f'{name}.csv.events.txt'), 'w') as fh:
             fh.write(''.join(f'2026-11-14T22:53:{s} {gain}\n' for s in ('01', '02', '03')))
-        if fault and kind != 'no_check':
-            with open(os.path.join(d, f'fault_check_{name}.json'), 'w') as fh:
-                json.dump(dict(ok=kind != 'check_bad', sha256='abd' if kind == 'check_sha' else 'abc',
-                               frames=f'05_DATA/x/frames/{name}_frames.npz'), fh)
+        if fault:
+            sched = os.path.join(d, 'enc_FL.csv')
+            with open(sched, 'w') as fh:
+                fh.write('# hil-fault-schedule v1\n')
+            if kind != 'no_check':
+                with open(os.path.join(d, f'fault_check_{name}.json'), 'w') as fh:
+                    json.dump(dict(ok=True, sha256='abc', schedule=None if kind == 'no_sched' else sched,
+                                   frames=f'05_DATA/x/frames/{name}_frames.npz'), fh)
+            if kind != 'no_steps':
+                open(os.path.join(d, 'steps', f'{name}_steps.csv'), 'w').close()
     with open(os.path.join(d, 'session.json'), 'w') as fh:
         json.dump(dict(runs=runs), fh)
     with open(os.path.join(d, 'bench_summary.json'), 'w') as fh:
         json.dump(summ, fh)
 
 
-def test_bench_row(tmp_path):
+class _Calls(list):
+    pass
+
+
+@pytest.fixture
+def fake_check(monkeypatch):
+    """Replaces tools/fault_check.check (it needs MISO, step log, schedule of a real run): records the calls,
+    answers with calls.answer."""
+    calls = _Calls()
+    calls.answer = dict(ok=True, sha256='abc')
+
+    def check(npz, sched, step_log):
+        calls.append((npz, sched, step_log))
+        return dict(calls.answer)
+    monkeypatch.setattr(ct, 'run_fault_check', check)
+    return calls
+
+
+def test_bench_row(tmp_path, fake_check):
     write_bench(str(tmp_path))
     rows = ct.table(str(tmp_path))
     assert len(rows) == 1
     r = rows[0]
     assert (r['controller'], r['case'], r['win_start_s'], r['win_end_s'], r['complete']) == ('PID', 'enc_FL', 3.0,
                                                                                          5.0, True)
+    # C7T1-3: fault_check run again on this folder's frame log, the schedule its report names, its step log
+    assert fake_check == [(os.path.join(str(tmp_path), 'frames', 'PID_enc_FL_frames.npz'),
+                           os.path.join(str(tmp_path), 'enc_FL.csv'),
+                           os.path.join(str(tmp_path), 'steps', 'PID_enc_FL_steps.csv'))]
     # ESP32 clock = tick count from the first run_active row (the jittered timestamp_us would miss these)
     assert r['t_src_enc'] == pytest.approx(3.08) and r['t_src_imu'] == pytest.approx(5.10)
     assert r['t_slip_on'] == pytest.approx(3.25) and r['t_slip_off'] == pytest.approx(5.5)
@@ -278,13 +355,27 @@ def test_bench_row(tmp_path):
     assert r['r_true_max'] == pytest.approx(1.01, abs=2e-3)
     assert (r['ticks'], r['ticks_expected'], r['tick_gaps']) == (900, 900, 0)
     assert (r['imu_rows'], r['imu_dropped'], r['base_imu_rows']) == (None, None, None)
+    # C7T1-7: gyro_n at the last row of the span minus at the first (counted after the first tick)
     assert (r['esp_gyro_n'], r['base_esp_gyro_n']) == (139, 179)
     assert r['run_s'] == pytest.approx(8.09)
     assert r['ref_first_s'] == pytest.approx(2.0) and r['esp_sp_first_s'] == pytest.approx(2.0)
     assert r['blank'] == 'r_th;imu_rows;imu_dropped;base_imu_rows'
 
 
-def test_bench_columns_extend_the_fwsim_ones(tmp_path):
+def test_bench_r_true_over_0_duration(tmp_path, fake_check):
+    """C7T1-8: r_true over (0, duration] as fwsim's ticks 0.01 .. 9.00 s: the frame at t0 + 9 s counts, t0 not."""
+    write_bench(str(tmp_path), 'endpoint')
+    r = ct.table(str(tmp_path))[0]
+    assert r['r_true_max'] == pytest.approx(4 * 0.0505208 * 10 - 0.01, abs=5e-3)
+
+
+def test_bench_args_in_another_order(tmp_path, fake_check):
+    """C7T1-10: the same (option, value) pairs in another order, --opt=value, are the same run."""
+    write_bench(str(tmp_path), 'args_order')
+    assert len(ct.table(str(tmp_path))) == 1
+
+
+def test_bench_columns_extend_the_fwsim_ones(tmp_path, fake_check):
     write_case(str(tmp_path / 'fw' / 'PID_base'), base_log())
     write_case(str(tmp_path / 'fw' / 'PID_encFL'), fault_log(), rows=[ROW])
     write_bench(str(tmp_path / 'hil'))
@@ -297,8 +388,10 @@ def test_bench_columns_extend_the_fwsim_ones(tmp_path):
 @pytest.mark.parametrize('kind,msg', [
     ('clean', 'not clean'),
     ('no_check', 'no fault_check_PID_enc_FL.json'),
-    ('check_bad', 'not ok'),
-    ('check_sha', 'not ok'),
+    ('no_sched', 'names no schedule'),
+    ('no_steps', 'not found'),
+    ('check_bad', 'not ok again'),
+    ('check_sha', 'not ok again'),
     ('args', 'run args'),
     ('esp32', 'esp32_fw'),
     ('noise', 'manifest imu_noise'),
@@ -308,20 +401,48 @@ def test_bench_columns_extend_the_fwsim_ones(tmp_path):
     ('base_rows', 'baseline has schedule rows'),
     ('col', 'no column'),
     ('no_run', 'run_active'),
+    ('lost_head', 'start of the run not shown'),
+    ('no_pre', 'no ESP32 row before'),
+    ('first_seq', 'start of the run not shown'),
+    ('nan_r', 'r not finite'),
+    ('flag_bad', 'slip_flag not 0 / 1'),
+    ('run_gap', 'run_active 0 inside'),
+    ('seq_gap', 'log_seq gap'),
+    ('half_tick', 'gyro_n not a whole number'),
+    ('frame_no', 'frame_no is not step_first'),
+    ('run_id0', 'run_id 0'),
+    ('dtype', 'uint8'),
+    ('period', 'period_us'),
 ])
-def test_bench_folders_that_cannot_be_tabled(tmp_path, kind, msg):
+def test_bench_folders_that_cannot_be_tabled(tmp_path, fake_check, kind, msg):
     write_bench(str(tmp_path), kind)
+    if kind == 'check_bad':
+        fake_check.answer = dict(ok=False, sha256='abc', error='byte 3 of frame 4000')
+    if kind == 'check_sha':
+        fake_check.answer = dict(ok=True, sha256='abd')
     with pytest.raises(ct.TableError, match=msg):
         ct.table(str(tmp_path))
 
 
 def test_run_args_without_the_schedule():
     a = '--test A-W1 --seed 0 --faults ~/x.csv --step-log ~/s.csv --ground traction'
-    assert ct._run_args(a) == ['--test', 'A-W1', '--seed', '0', '--ground', 'traction']
-    assert ct._run_args('--test A-W1 --faults=~/x.csv') == ['--test', 'A-W1']
-    assert ct.task_duration(a) == ('A-W1', 9.0)
+    assert ct._run_args(a) == [('--ground', 'traction'), ('--seed', '0'), ('--test', 'A-W1')]
+    assert ct._run_args('--test A-W1 --faults=~/x.csv') == [('--test', 'A-W1')]
+    assert ct._run_args('--seed 0 --test=A-W1 --finite-run') == ct._run_args('--finite-run --test A-W1 --seed 0')
+    assert ct.task_duration(a) == ('A-W1', 9.0) == ct.task_duration('--seed 0 --test=A-W1')
     with pytest.raises(ct.TableError, match='not a fault task'):
         ct.task_duration('--test A-K1')
+    with pytest.raises(ct.TableError, match='no single --test'):
+        ct.task_duration('--test A-W1 --test A-W1')
+
+
+def test_thesis_path(tmp_path):
+    d = tmp_path / '05_DATA' / 'results' / 'FAULT_C7' / 'r2'
+    d.mkdir(parents=True)
+    got = ct._thesis_path(str(d), '05_DATA/results/FAULT_C7/r1/schedules/enc_FL.csv')
+    assert os.path.normpath(got) == os.path.normpath(str(tmp_path / '05_DATA/results/FAULT_C7/r1/schedules/enc_FL.csv'))
+    with pytest.raises(ct.TableError, match='not under a 05_DATA'):
+        ct._thesis_path(str(tmp_path), '05_DATA/x.csv')
 
 
 FAULT_C7 = r'D:\CLAUDE_THESIS\05_DATA\results\FAULT_C7'
@@ -329,6 +450,7 @@ FAULT_C7 = r'D:\CLAUDE_THESIS\05_DATA\results\FAULT_C7'
 
 @pytest.mark.parametrize('run,mode', [('2026-11-14_run02', 'ADRC'), ('2026-11-14_run03', 'PID')])
 def test_real_bench_runs(run, mode):
+    """The two bench sessions of 14/11, with the real tools/fault_check.check run again on each fault run."""
     d = os.path.join(FAULT_C7, run)
     if not os.path.isfile(os.path.join(d, 'session.json')):
         pytest.skip('bench runs of 14/11 not on this machine')
@@ -339,6 +461,7 @@ def test_real_bench_runs(run, mode):
         assert (r['win_start_s'], r['win_end_s']) == (3.0, 5.0)
         assert (r['ticks'], r['ticks_expected'], r['tick_gaps']) == (900, 900, 0)
         assert 2.0 <= r['ref_first_s'] < 2.01 and abs(r['esp_sp_first_s'] - 2.0) <= 0.02
+        assert 8.0 < r['run_s'] < 8.2                                  # C7T1-1: RUN a little over 8 s
     # the imu_loss window of 2 s at 20 Hz: 40 gyro reports fewer than the baseline, wz from the encoders
     il = rows['imu_loss']
     assert il['base_esp_gyro_n'] - il['esp_gyro_n'] == 40
@@ -359,14 +482,10 @@ def test_cli(tmp_path):
     assert r.returncode == 2 and 'cannot table' in r.stderr
 
 
-def test_cli_bench(tmp_path):
+def test_cli_bench_refuses_without_fault_check(tmp_path):
+    """The CLI on a bench folder: exit 2 when the fault run has no fault_check report (the real check needs a
+    real run, so the CLI is not asked for a table of the synthetic one)."""
     tool = os.path.join(ROOT, 'tools', 'fault_c7_table.py')
-    write_bench(str(tmp_path))
-    r = subprocess.run([sys.executable, tool, str(tmp_path)], capture_output=True, text=True, timeout=120)
-    assert r.returncode == 0, r.stderr
-    with open(tmp_path / 'c7_table.csv') as fh:
-        lines = fh.read().splitlines()
-    assert len(lines) == 2 and lines[1].startswith('PID,enc_FL,') and lines[0].endswith(',blank')
-    os.remove(tmp_path / 'fault_check_PID_enc_FL.json')
+    write_bench(str(tmp_path), 'no_check')
     r = subprocess.run([sys.executable, tool, str(tmp_path)], capture_output=True, text=True, timeout=120)
     assert r.returncode == 2 and 'no fault_check' in r.stderr

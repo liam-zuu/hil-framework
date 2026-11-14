@@ -13,7 +13,8 @@ faults.json, faults_tick.csv, faults_imu.csv, meta.yaml.
 One row per (controller, fault case), each against the baseline of the same controller:
   * the fault window [start, end) from faults.json (several rows: first start, last end) and complete;
   * the run was the same as its baseline but for the schedule: same task, mode, seed, IMU config, ground,
-    firmware and hil commit of the DLL (meta.yaml config / firmware), else the folder cannot be tabled (exit 2);
+    firmware and hil commit of the DLL (meta.yaml config / firmware), both builds dirty: false, the same plant
+    line (meta.yaml plant: mu_hd, V_batt, source blobs, ...), else the folder cannot be tabled (exit 2);
   * t_src_enc: first firmware tick at or after start where wz_src = 0 (wz from the encoders), t_src_imu: the
     first tick after it where wz_src = 1 again; t_slip_on / t_slip_off, t_ws_on / t_ws_off: first rising edge
     of slip_flag / ws_flag at or after start (a flag already on at start counts as a rise there), then the
@@ -43,25 +44,41 @@ fault_check_<run>.json. The same columns as the fwsim table, from two clocks:
     origin of the schedule). True plant state from mosi_true (mosi in the baseline, which has no faults):
     body velocity = world velocity rotated by -theta (fwsim.body_velocity), setpoint = the MOSI reference the
     Pi sent; err_*, end pose (frame t0 + duration, duration = the task's + TAIL_S, as fault_run.py), r_true_max
-    over [0, duration) (params.MecanumParams H_fwd, as fwsim). The span is taken on the 1 ms frames, the fwsim
-    table on 10 ms ticks.
+    over (0, duration] (params.MecanumParams H_fwd, as fwsim, whose ticks are 0.01 .. duration s). The span is
+    taken on the 1 ms frames, the fwsim table on 10 ms ticks. The frame log must hold one uint8 frame of
+    protocol.FRAME_SIZE bytes per step: frame_no (MOSI bytes 44-47) = step_first + row, one run_id (40-43)
+    != 0, step_last = step_first + steps - 1, period_us 1000, in the baseline too (C7T1-5).
+  * RUN on the bench is not exactly the task (C7T1-1, Liam 15/11 "Sua 10, giu RUN"): the lifecycle ends RUN
+    when the publisher reports the end of the task, 8.083-8.102 s in FAULT_C7 run02 / run03, and the reference
+    changes 2-4 ms after the schedule's clock (2.002-2.004 s for the 2 s step). run_s and ref_first_s record
+    both per run. After the last setpoint change of A-W1 (6 s) RUN and STOPPING both send 0, so the end pose at
+    t0 + duration is read at rest in both runs.
   * ESP32 time: t = (tick - tick of the first row with run_active = 1) x 10 ms, the firmware's tick counter
     from its own start of the run (it follows the SWA bit the Pi sets at t0 through the H7 and iBUS: some ms
     late, not measured on a common clock; ref_first_s and esp_sp_first_s show both clocks at the task's first
-    setpoint step); only the rows of [0, duration) are read, as the fwsim run ends at duration (the ESP32 log
-    goes on through the motor-off switch after it). The tick, not timestamp_us (the log time, some ms of
-    jitter), so the grid is the 10 ms of the fwsim table. wz_src, slip_flag, ws_flag edges, age_g_max_ms,
-    r_max, sat_frac (|pwm| >= PWM_MAX of the ESP32 rows) and ticks (ESP32 rows in [0, duration)) come from it.
+    setpoint step, an indicator, not a mapping of one clock onto the other); only the rows of [0, duration)
+    are read, as the fwsim run ends at duration (the ESP32 log goes on through the motor-off switch after it).
+    The tick, not timestamp_us, so the grid is the 10 ms of the fwsim table. The start of the run must be in
+    the log (C7T1-2): the row just before the first run_active row is there, with run_active 0, tick one less
+    and log_seq one less, and that first row's log_seq is the #gain line's first_seq; the rows of [0, duration)
+    are exactly duration / 10 ms rows with consecutive tick and log_seq and run_active 1, every ESP_COLS value
+    finite, flags 0 / 1, counters whole (C7T1-6). wz_src, slip_flag, ws_flag edges, age_g_max_ms, r_max,
+    sat_frac (|pwm| >= PWM_MAX of the ESP32 rows) and ticks (ESP32 rows in [0, duration)) come from it.
   * Left blank on the bench (column blank lists them): r_th (no column in the ESP32 CSV); imu_rows,
-    imu_dropped, base_imu_rows (the H7 builds the IMU reports, the Pi logs no report; the firmware's count of
-    gyro reports received in [0, duration) is esp_gyro_n, base_esp_gyro_n).
-  * More columns: run_s (RUN length, lifecycle), tick_gaps (ticks of [0, duration) without an ESP32 row),
-ref_first_s (first change of the MOSI reference, Pi time), esp_sp_first_s (first change
-    of sp_vx, sp_vy, sp_wz in the ESP32 rows, ESP32 time).
-  * Same run but for the schedule: session.json run args equal without --faults / --step-log, same ESP32 and
-    H7 #fw, same manifest imu_source, imu_noise, plant_src, proto, same #gain line (without first_seq,
-    line_drop, boot), else exit 2; a run that bench_summary.json does not call clean, or a fault run whose
-    fault_check_<run>.json is missing or not ok, cannot be tabled either.
+    imu_dropped, base_imu_rows (the H7 builds the IMU reports, the Pi logs no report). esp_gyro_n,
+    base_esp_gyro_n (C7T1-7): the firmware's gyro report counter gyro_n at the last row of [0, duration) minus
+    at the first, i.e. the reports it counted after its first tick of the run up to its last one (duration - 10
+    ms of ticks, about 180 at 20 Hz over 8.99 s), not a count of reports in [0, duration) (the row before the
+    run is an idle row up to 100 ms earlier, so it does not bound tick 0).
+  * More columns: run_s (RUN length, lifecycle), tick_gaps (ticks of [0, duration) without an ESP32 row: 0, as
+    a run with one is refused), ref_first_s (first change of the MOSI reference, Pi time), esp_sp_first_s
+    (first change of sp_vx, sp_vy, sp_wz in the ESP32 rows, ESP32 time).
+  * Same run but for the schedule: session.json run args equal as (option, value) pairs without --faults /
+    --step-log, in any order, --opt=value read as --opt value (C7T1-10), same ESP32 and H7 #fw, same manifest
+    imu_source, imu_noise, plant_src, proto, same #gain line (without first_seq, line_drop, boot), else exit 2;
+    a run that bench_summary.json does not call clean cannot be tabled either. A fault run is tabled only if
+    tools/fault_check.check() passes again on this folder's frame log, the schedule its fault_check_<run>.json
+    names (with the manifest's SHA-256) and this folder's steps/<run>_steps.csv (C7T1-3).
 
 Assumptions (stated by the author, to be checked): log.csv columns as fwsim.write_run writes them (IMU_COLS,
 then WS_COLS when the firmware has wheel_slip.c); the tick time column t is the time of the tick in s. Bench:
@@ -110,10 +127,10 @@ def read_meta(path):
     out = {}
     with open(path, encoding='utf-8') as fh:
         for line in fh:
-            for key in ('config:', '  esp32:', '  hil_framework:', 'faults:'):
+            for key in ('config:', '  esp32:', '  hil_framework:', 'faults:', 'plant:'):
                 if line.startswith(key):
                     out[key.strip(' :')] = json.loads(line[len(key):].strip())
-    for key in ('config', 'esp32', 'hil_framework'):
+    for key in ('config', 'esp32', 'hil_framework', 'plant'):
         if key not in out:
             raise TableError(f'{path}: no {key} line')
     return out
@@ -140,6 +157,13 @@ def same_run(a, b):
     for k in ('esp32', 'hil_framework'):
         if (a['meta'][k] or {}).get('commit') != (b['meta'][k] or {}).get('commit'):
             return f'{k} commit {a["meta"][k]} != {b["meta"][k]}'
+        # C7T1-4: a dirty or unknown build may differ under the same commit
+        for m in (a, b):
+            if (m['meta'][k] or {}).get('dirty') is not False:
+                return f'{k} of {m["folder"]}: dirty or unknown ({m["meta"][k]})'
+    # C7T1-4: the plant the run used (meta.yaml plant: mu_hd, V_batt, source blobs, ...), not only the config
+    if a['meta']['plant'] != b['meta']['plant']:
+        return f'plant {a["meta"]["plant"]} != {b["meta"]["plant"]}'
     return None
 
 
@@ -251,33 +275,43 @@ def table(run_dir):
 # ── HIL bench folders (hil_bench_session.py sessions) ──
 
 BENCH_BLANK = ('r_th', 'imu_rows', 'imu_dropped', 'base_imu_rows')    # no bench source (docstring)
-ESP_COLS = ('timestamp_us', 'tick', 'run_active', 'wz_src', 'slip_flag', 'ws_flag', 'age_g_ms', 'r', 'gyro_n',
-            'pwm_fl', 'pwm_fr', 'pwm_rl', 'pwm_rr', 'sp_vx', 'sp_vy', 'sp_wz')
+ESP_COLS = ('timestamp_us', 'tick', 'log_seq', 'run_active', 'wz_src', 'slip_flag', 'ws_flag', 'age_g_ms', 'r',
+            'gyro_n', 'pwm_fl', 'pwm_fr', 'pwm_rl', 'pwm_rr', 'sp_vx', 'sp_vy', 'sp_wz')
+ESP_FLAGS = ('run_active', 'wz_src', 'slip_flag', 'ws_flag')          # 0 / 1
+ESP_COUNTERS = ('tick', 'log_seq', 'gyro_n')                          # whole numbers
 GAIN_SKIP = ('first_seq', 'line_drop', 'boot')                        # differ run to run, not the gains
 ARG_SKIP = ('--faults', '--step-log')                                 # the schedule and its own step log
 MAN_SAME = ('imu_source', 'imu_noise', 'plant_src', 'proto', 'frame_len', 'plant')
 
 
-def _run_args(args):
-    """The run_hil.py arguments of a session run without ARG_SKIP and their values."""
-    toks, out, i = args.split(), [], 0
+def _arg_pairs(args):
+    """run_hil.py arguments of a session run as (option, value or None) pairs, --opt=value read as --opt value."""
+    toks = []
+    for t in args.split():
+        toks.extend(t.split('=', 1) if t.startswith('--') and '=' in t else [t])
+    pairs, i = [], 0
     while i < len(toks):
-        if toks[i] in ARG_SKIP:
-            i += 2
-            continue
-        if not any(toks[i].startswith(a + '=') for a in ARG_SKIP):
-            out.append(toks[i])
-        i += 1
-    return out
+        t = toks[i]
+        if not t.startswith('--'):
+            raise TableError(f'run args {args!r}: {t!r} is not after an option')
+        has_val = i + 1 < len(toks) and not toks[i + 1].startswith('--')
+        pairs.append((t, toks[i + 1] if has_val else None))
+        i += 2 if has_val else 1
+    return pairs
+
+
+def _run_args(args):
+    """C7T1-10: the (option, value) pairs of a session run without ARG_SKIP, sorted (order does not matter)."""
+    return sorted((o, v or '') for o, v in _arg_pairs(args) if o not in ARG_SKIP)
 
 
 def task_duration(args):
-    """(task id, duration [s]) of a bench run: the --test task of rpi5/fault_tasks.py + TAIL_S (= the RUN
-    then STOPPING of --finite-run, and fault_run.py's task + TAIL_S)."""
-    toks = args.split()
-    if '--test' not in toks or toks.index('--test') + 1 >= len(toks):
-        raise TableError(f'run args {args!r}: no --test task')
-    task = toks[toks.index('--test') + 1]
+    """(task id, duration [s]) of a bench run: the --test task of rpi5/fault_tasks.py + TAIL_S (the task then
+    STOPPING of --finite-run, as fault_run.py's task + TAIL_S; RUN itself runs a little longer, docstring)."""
+    tests = [v for o, v in _arg_pairs(args) if o == '--test']
+    if len(tests) != 1 or not tests[0]:
+        raise TableError(f'run args {args!r}: no single --test task')
+    task = tests[0]
     import fault_tasks
     if task not in fault_tasks.TASKS:
         raise TableError(f'--test {task}: not a fault task of rpi5/fault_tasks.py ({sorted(fault_tasks.TASKS)})')
@@ -302,25 +336,87 @@ def read_esp(path):
 
 
 def read_gain(path):
-    """The #gain line of an agv_logger events file as a dict without GAIN_SKIP; every copy must agree."""
+    """The #gain line of an agv_logger events file: (dict without GAIN_SKIP, first_seq); every copy agrees."""
     seen = []
     with open(path, encoding='utf-8') as fh:
         for line in fh:
             if '#gain,' in line:
                 kv = dict(p.split('=', 1) for p in line.strip().split('#gain,', 1)[1].split(',') if '=' in p)
-                kv = {k: v for k, v in kv.items() if k not in GAIN_SKIP}
                 if kv not in seen:
                     seen.append(kv)
     if len(seen) != 1:
         raise TableError(f'{path}: {len(seen)} different #gain lines (want 1)')
-    return seen[0]
+    first = seen[0].get('first_seq')
+    if first is None or not first.isdigit():
+        raise TableError(f'{path}: #gain line without first_seq')
+    return {k: v for k, v in seen[0].items() if k not in GAIN_SKIP}, int(first)
+
+
+def _u32(frames, ofs):
+    """Little-endian uint32 at byte ofs of every frame."""
+    b = frames[:, ofs:ofs + 4].astype(np.uint64)
+    return b[:, 0] | (b[:, 1] << np.uint64(8)) | (b[:, 2] << np.uint64(16)) | (b[:, 3] << np.uint64(24))
+
+
+def check_frames(name, man, mosi, true):
+    """C7T1-5: one uint8 frame of protocol.FRAME_SIZE bytes per step, frame_no = step, one run_id != 0."""
+    for nm, a in (('mosi', mosi), ('mosi_true', true)):
+        if a.dtype != np.uint8 or a.ndim != 2 or a.shape[1] != P.FRAME_SIZE:
+            raise TableError(f'{name}: {nm} {a.shape} {a.dtype}, want (n, {P.FRAME_SIZE}) uint8')
+    n, first = int(man['steps']), int(man['step_first'])
+    if (len(mosi) != n or true.shape != mosi.shape or int(man.get('step_last', -1)) != first + n - 1
+            or man.get('period_us') != 1000):
+        raise TableError(f'{name}: frames {mosi.shape} / {true.shape}, manifest step_first {first} step_last '
+                         f'{man.get("step_last")} steps {n} period_us {man.get("period_us")}')
+    want = first + np.arange(n, dtype=np.uint64)
+    for nm, a in (('mosi', mosi), ('mosi_true', true)):
+        rid = _u32(a, P.OFS_RUN_ID)
+        if not np.array_equal(_u32(a, P.OFS_FRAME_NO), want):
+            raise TableError(f'{name}: {nm} frame_no is not step_first + row')
+        if rid[0] == 0 or np.any(rid != rid[0]):
+            raise TableError(f'{name}: {nm} run_id 0 or not one value')
+    if not np.array_equal(_u32(true, P.OFS_RUN_ID), _u32(mosi, P.OFS_RUN_ID)):
+        raise TableError(f'{name}: mosi and mosi_true run_id differ')
+
+
+def esp_run_rows(name, esp_all, n_ticks, first_seq):
+    """C7T1-2, C7T1-6: (rows of [0, duration), the row just before the run) of the ESP32 log, or TableError
+    when the log does not show the start of the run or holds a gap or a bad value in the span."""
+    on = np.nonzero(esp_all['run_active'] >= 0.5)[0]
+    if not len(on):
+        raise TableError(f'{name}: no ESP32 row with run_active = 1')
+    i0 = int(on[0])
+    if i0 == 0:
+        raise TableError(f'{name}: no ESP32 row before the first run_active row (start of the run not in the log)')
+    sel = np.arange(i0 - 1, min(i0 + n_ticks, len(esp_all['tick'])))
+    for c in ESP_COLS:
+        v = esp_all[c][sel]
+        if not np.all(np.isfinite(v)):
+            raise TableError(f'{name}: ESP32 {c} not finite near the run')
+        if c in ESP_FLAGS and not np.all((v == 0) | (v == 1)):
+            raise TableError(f'{name}: ESP32 {c} not 0 / 1 near the run')
+        if c in ESP_COUNTERS and not np.all(v == np.round(v)):
+            raise TableError(f'{name}: ESP32 {c} not a whole number near the run')
+    pre = {c: esp_all[c][i0 - 1] for c in ESP_COLS}
+    rows = {c: v[i0:i0 + n_ticks] for c, v in esp_all.items()}
+    if (pre['run_active'] != 0 or rows['tick'][0] != pre['tick'] + 1 or rows['log_seq'][0] != pre['log_seq'] + 1
+            or int(rows['log_seq'][0]) != first_seq):
+        raise TableError(f'{name}: start of the run not shown (row before: run_active {pre["run_active"]:g}, tick '
+                         f'{pre["tick"]:g}, log_seq {pre["log_seq"]:g}; first run row: tick {rows["tick"][0]:g}, '
+                         f'log_seq {rows["log_seq"][0]:g}; #gain first_seq {first_seq})')
+    if (len(rows['tick']) != n_ticks or np.any(np.diff(rows['tick']) != 1) or np.any(np.diff(rows['log_seq']) != 1)
+            or np.any(np.diff(rows['timestamp_us']) <= 0) or np.any(rows['run_active'] != 1)):
+        raise TableError(f'{name}: ESP32 rows of [0, duration): {len(rows["tick"])} of {n_ticks}, or a tick / '
+                         f'log_seq gap, or run_active 0 inside')
+    return rows, pre
 
 
 def load_bench_run(run_dir, srun, clean):
     name = srun['name']
     if not clean.get(name):
         raise TableError(f'{name}: not clean in bench_summary.json')
-    z = np.load(os.path.join(run_dir, 'frames', f'{name}_frames.npz'))
+    npz = os.path.join(run_dir, 'frames', f'{name}_frames.npz')
+    z = np.load(npz)
     man = json.loads(str(z['manifest']))
     trans = (man.get('lifecycle') or {}).get('transitions') or []
     steps = {}
@@ -339,44 +435,58 @@ def load_bench_run(run_dir, srun, clean):
         true = z['mosi_true']
     else:
         true = mosi
-    if mosi.shape != true.shape or mosi.shape[0] != int(man['steps']):
-        raise TableError(f'{name}: frame arrays {mosi.shape} / {true.shape}, manifest steps {man["steps"]}')
+    check_frames(name, man, mosi, true)
     S = np.array([P.decode_state(bytes(fr)) for fr in true])
     R = np.array([P.decode_traj_ref(bytes(fr))[:3] for fr in mosi])
     k = int(man['step_first']) + np.arange(len(S)) - t0                # ms since t0
     task, dur = task_duration(srun['args'])
-    esp_all = read_esp(os.path.join(run_dir, 'pi', f'{name}.csv'))
-    on = np.nonzero(esp_all['run_active'] >= 0.5)[0]
-    if not len(on):
-        raise TableError(f'{name}: no ESP32 row with run_active = 1')
+    gain, first_seq = read_gain(os.path.join(run_dir, 'pi', f'{name}.csv.events.txt'))
     # ESP32 clock = the firmware tick counter from the first run_active row; rows of [0, duration) only
     # (the fwsim run ends at duration; the ESP32 log goes on through the motor-off switch)
     n_ticks = int(round(dur / TICK_S))
-    tk = esp_all['tick'] - esp_all['tick'][on[0]]
-    keep = np.arange(len(tk)) >= on[0]
-    keep &= tk < n_ticks
-    esp = {c: v[keep] for c, v in esp_all.items()}
-    if np.any(np.diff(esp['tick']) <= 0) or np.any(np.diff(esp['timestamp_us']) <= 0):
-        raise TableError(f'{name}: ESP32 tick / timestamp_us not increasing in [0, duration)')
-    te = np.round(tk[keep] * TICK_S, 6)
-    out = dict(name=name, args=srun['args'], task=task, dur=dur, man=man, faults=faults, S=S, R=R, k=k,
-               esp=esp, te=te, gain=read_gain(os.path.join(run_dir, 'pi', f'{name}.csv.events.txt')),
-               esp32_fw=srun.get('esp32_fw'), h7_fw=srun.get('h7_fw'),
-               run_s=(steps['STOPPING'] - t0) / 1000.0)
-    return out
+    esp, pre = esp_run_rows(name, read_esp(os.path.join(run_dir, 'pi', f'{name}.csv')), n_ticks, first_seq)
+    te = np.round((esp['tick'] - esp['tick'][0]) * TICK_S, 6)
+    return dict(name=name, args=srun['args'], task=task, dur=dur, man=man, faults=faults, S=S, R=R, k=k,
+                esp=esp, esp_pre=pre, te=te, gain=gain, npz=npz, esp32_fw=srun.get('esp32_fw'),
+                h7_fw=srun.get('h7_fw'), run_s=(steps['STOPPING'] - t0) / 1000.0)
+
+
+def run_fault_check(npz, sched, step_log):
+    """tools/fault_check.check (design 8.1), the byte-for-byte check of a fault run (tests replace this)."""
+    import fault_check
+    return fault_check.check(npz, sched, step_log)
+
+
+def _thesis_path(run_dir, rel):
+    """A path the fault_check report wrote relative to the thesis repo (05_DATA/...): joined to the folder that
+    holds the 05_DATA of run_dir."""
+    if os.path.isabs(rel):
+        return rel
+    parts = os.path.abspath(run_dir).split(os.sep)
+    if '05_DATA' not in parts:
+        raise TableError(f'{run_dir}: not under a 05_DATA folder, cannot place {rel}')
+    return os.path.join(os.sep.join(parts[:parts.index('05_DATA')]) + os.sep, *rel.replace('\\', '/').split('/'))
 
 
 def check_fault_check(run_dir, f):
-    """The fault run f must have fault_check_<run>.json (design 8.1), ok, of its frame log and schedule."""
+    """C7T1-3: the fault run f is tabled only if tools/fault_check.check() passes again on this folder's frame
+    log, the schedule its fault_check_<run>.json names (SHA-256 = the manifest's) and this folder's step log."""
     name = f['name']
     fc_path = os.path.join(run_dir, f'fault_check_{name}.json')
     if not os.path.isfile(fc_path):
-        raise TableError(f'{name}: no fault_check_{name}.json')
+        raise TableError(f'{name}: no fault_check_{name}.json (it names the schedule file)')
     with open(fc_path) as fh:
-        fc = json.load(fh)
-    if fc.get('ok') is not True or fc.get('sha256') != f['faults'].get('sha256') or \
-            os.path.basename(str(fc.get('frames'))) != f'{name}_frames.npz':
-        raise TableError(f'{name}: fault_check_{name}.json not ok or not of this frame log / schedule')
+        sched = json.load(fh).get('schedule')
+    if not sched:
+        raise TableError(f'{name}: fault_check_{name}.json names no schedule')
+    sched = _thesis_path(run_dir, sched)
+    step_log = os.path.join(run_dir, 'steps', f'{name}_steps.csv')
+    if not os.path.isfile(sched) or not os.path.isfile(step_log):
+        raise TableError(f'{name}: schedule {sched} or step log {step_log} not found')
+    res = run_fault_check(f['npz'], sched, step_log)
+    if res.get('ok') is not True or res.get('sha256') != f['faults'].get('sha256'):
+        raise TableError(f'{name}: tools/fault_check.check not ok again on this frame log / schedule / step log '
+                         f'({res.get("error") or res.get("fails")})')
 
 
 def same_bench_run(a, b):
@@ -459,16 +569,16 @@ def bench_row(mode, case, f, base, H_fwd):
         if not len(at):
             raise TableError(f'{run["name"]}: no frame at t0 + {dur_ms} ms')
         pose[tag] = run['S'][at[0], 4:7]
-    rs = (f['k'] >= 0) & (f['k'] < dur_ms)
+    rs = (f['k'] > 0) & (f['k'] <= dur_ms)                         # (0, duration], as fwsim (C7T1-8)
     r_true = (f['S'][rs, :4] @ np.asarray(H_fwd)[2]) - f['S'][rs, 9]
     out.update(end_dx=float(pose[''][0] - pose['base_'][0]), end_dy=float(pose[''][1] - pose['base_'][1]),
                end_dtheta=float(wrap(pose[''][2] - pose['base_'][2])), r_true_max=float(np.abs(r_true).max()))
     # counts on the ESP32 clock
     cnt = {}
     for tag, run in (('', f), ('base_', base)):
-        tick, gyro = run['esp']['tick'], run['esp']['gyro_n']          # rows of [0, duration), increasing
+        tick, gyro = run['esp']['tick'], run['esp']['gyro_n']          # rows of [0, duration), consecutive
         cnt[tag] = dict(ticks=int(len(tick)), gaps=int(round(run['dur'] / TICK_S)) - len(tick),
-                        gyro=int(gyro[-1] - gyro[0]))
+                        gyro=int(gyro[-1] - gyro[0]))  # counted after the first tick, to the last (C7T1-7)
     out.update(ticks=cnt['']['ticks'], imu_rows=None, imu_dropped=None, base_imu_rows=None,
                ticks_expected=int(round(f['dur'] / TICK_S)), run_s=f['run_s'], tick_gaps=cnt['']['gaps'],
                esp_gyro_n=cnt['']['gyro'], base_esp_gyro_n=cnt['base_']['gyro'],

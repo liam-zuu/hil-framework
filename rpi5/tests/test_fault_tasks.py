@@ -99,10 +99,30 @@ def _run_hil(tmp_path, body, *extra):
                           capture_output=True, text=True, timeout=60)
 
 
+def test_a_w1_schedule_bounds(tmp_path):
+    """C7T1-9: run_hil.load_faults with the --finite-run A-W1 lifecycle reaches the schedule check: windows
+    ending at 7999 and 8000 ms are inside the 8 s RUN, one ending at 8001 ms is refused."""
+    import run_hil
+    args = SimpleNamespace(steps=0, no_traj=False, traj_loop=False, fixed_omega=None, omega_steps=None,
+                           omega_schedule=None, load_schedule=None, o1=None)
+    lc, _ = run_hil._finite_run_config(args, fault_tasks.make_spec('A-W1'))
+    cfg = SimpleNamespace(lifecycle=lc, imu_static=None, imu_profile=None)
+    for end, ok in ((7999, True), (8000, True), (8001, False)):
+        p = tmp_path / f's{end}.csv'
+        p.write_text(fs.MAGIC + '\nid,fault,target,start_ms,end_ms,params\n' + f'E1,enc_loss,FL,3000,{end},\n')
+        fa = SimpleNamespace(faults=str(p), frame_log=str(tmp_path / 'f.npz'), step_log=None, mock=True, steps=0)
+        if ok:
+            sched = run_hil.load_faults(fa, 0, cfg, False)
+            assert [(r.start_ms, r.end_ms) for r in sched.rows] == [(3000, end)]
+        else:
+            with pytest.raises(SystemExit, match='after the run'):
+                run_hil.load_faults(fa, 0, cfg, False)
+
+
 def test_run_hil_takes_a_w1(tmp_path):
-    """--test A-W1 passes the task selection (the run stops later, at the fault checks, before any SPI):
-    the schedule's run length is the task's 8 s (a window ending at 8000 ms is accepted up to the frame-log
-    check, one ending at 8001 ms is after the run); an unknown task is refused with both lists."""
+    """--test A-W1 passes the task selection (the run stops later, at the fault checks, before any SPI): a
+    window ending at 8001 ms is after the run's 8 s (the bounds 7999 / 8000 / 8001 through the schedule check:
+    test_a_w1_schedule_bounds); an unknown task is refused with both lists."""
     r = _run_hil(tmp_path, 'E1,enc_loss,FL,3000,8000,\n')
     assert r.returncode != 0 and '--faults needs --frame-log' in r.stderr, r.stderr[-800:]
     r = _run_hil(tmp_path, 'E1,enc_loss,FL,3000,8001,\n', '--frame-log', str(tmp_path / 'f.npz'))
