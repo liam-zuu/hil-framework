@@ -677,16 +677,44 @@ def test_sc3_2_summary_refuses_a_campaign_dat_row_without_gate_columns(ds):
     assert rl.count_no_gate(_rows(d)) == 1
 
 
+def test_sc3_2_summary_cli_reports_the_historic_rows(ds, capsys):
+    """R134C2-11: the CLI summary prints the historic dat rows without gate columns, apart."""
+    d, clock = ds
+    _open(d, clock)
+    rl.end(d, 'dat', gate=_gate(), results_dir='r')
+    rows = _rows(d)
+    old = dict(rows[0], campaign='', session_id='OLD', run_uid='OLD:1', **{c: '' for c in rl.GATE_COLS})
+    rl._write_all(os.path.join(d, rl.TUNING), rl.TUNING_COLS, rows + [old])
+    assert rl.main(['--dataset', d, 'summary']) == 0
+    assert f'{rl.NO_GATE_EVIDENCE}: 1 dat row' in capsys.readouterr().out
+
+
 @pytest.mark.parametrize('platform, stage, outcome, needed', [
     ('HW', 'screen', 'khong_dat', True), ('HW', 'final', 'dat', True), ('HW', 'screen', 'hong_he_do', False),
     ('HIL', 'final_hil', 'chua_ket_luan', True), ('HIL', 'hil_check', 'khong_dat', False),
     ('SIM', 'screen', 'khong_dat', False)])
-def test_cli_end_requires_the_query_files(ds, tmp_path, platform, stage, outcome, needed):
-    """R134 (b): the CLI 'end' of a judged car run (every stage) or HIL final_hil run needs both files."""
+def test_cli_end_requires_the_query_files(ds, tmp_path, capsys, platform, stage, outcome, needed):
+    """R134 (b), R134C2-10: the CLI 'end' of a judged car run (every stage) or HIL final_hil run needs both
+    files; each row of the matrix is opened with its own platform and stage and ended with its own outcome."""
     assert rl.query_files_needed(dict(platform=platform, stage=stage), outcome) is needed
     d, clock = ds
-    _open(d, clock)                                                        # a car screen run
-    assert rl.main(['--dataset', d, 'end', '--outcome', 'khong_dat']) == 2
+    _open(d, clock)
+    run = rl._load_open(d)
+    run['row'].update(platform=platform, stage=stage)                    # the open run of this row
+    rl._save_open(d, run)
+    f = str(tmp_path / 'score.json')
+    with open(f, 'w', encoding='utf-8') as fh:
+        json.dump(dict(gate_v3=_gate(u_t=0.0015 if platform == 'HIL' else 0.0, e_trk=0.12 if outcome == 'khong_dat' else 0.03)), fh)
+    extra = ['--fail-cause', 'mat_khung'] if outcome == 'hong_he_do' else ['--gate-json', f, '--results-dir', 'r']
     qb, qa = _query_files(tmp_path)
-    assert rl.main(['--dataset', d, 'end', '--outcome', 'khong_dat', '--query-before', qb]) == 2
-    assert rl.main(['--dataset', d, 'end', '--outcome', 'hong_he_do', '--fail-cause', 'mat_khung']) == 0
+    for q in ([], ['--query-before', qb]):
+        rc = rl.main(['--dataset', d, 'end', '--outcome', outcome] + extra + q)
+        err = capsys.readouterr().err
+        assert ('needs --query-before and --query-after' in err) is needed, (q, err)
+        if needed:
+            assert rc == 2 and rl._load_open(d) is not None               # refused, the run still open
+        else:
+            break
+    if needed:
+        rc = rl.main(['--dataset', d, 'end', '--outcome', outcome] + extra + ['--query-before', qb, '--query-after', qa])
+        assert 'needs --query-before' not in capsys.readouterr().err

@@ -188,14 +188,16 @@ def gain_query_file(ip: str, path: str, run=None) -> int:
     its whole output goes to `path` (new file, never overwritten); returns its exit code. The boot of the
     two answers is compared by the scorer (s05_final_table.py) and by the run log, not here."""
     import subprocess
+    import time
     run = run or subprocess.run
+    t_start = time.time()
     try:
         p = run([sys.executable, GAIN_SEND, '--ip', ip, '--query'], capture_output=True, text=True, timeout=20)
         txt, code = (p.stdout or '') + (p.stderr or ''), p.returncode
     except (OSError, subprocess.TimeoutExpired) as e:
         txt, code = f'# gain_send.py --query failed: {e}\n#ket_qua,ma=1\n', 1
-    with open(path, 'x', encoding='utf-8') as f:
-        f.write(txt)
+    with open(path, 'x', encoding='utf-8') as f:     # R134C2-1: PC times of the question, read by the scorers
+        f.write(f'#query_pc,t_start={t_start:.6f},t_end={time.time():.6f}\n' + txt)
     return code
 
 

@@ -33,7 +33,9 @@ def test_query_saved_and_answer_read(tmp_path):
     q = B.gain_query('192.168.1.69', p, run=fake_run(ANSWER, calls))
     assert q['boot'] == '4753dc47' and q['mac'] == 'aa:bb:cc:dd:ee:ff'
     assert calls[0][1:] == [B.GAIN_SEND, '--ip', '192.168.1.69', '--query']
-    assert open(p, encoding='utf-8').read() == ANSWER
+    first, rest = open(p, encoding='utf-8').read().split('\n', 1)
+    assert first.startswith('#query_pc,t_start=') and rest == ANSWER                   # R134C2-1: PC times
+    assert q['_t_start'] <= q['_t_end']
     with pytest.raises(FileExistsError):                       # never overwrites a record
         B.gain_query('192.168.1.69', p, run=fake_run(ANSWER, calls))
 
@@ -54,8 +56,8 @@ def test_no_ip_and_timeout(tmp_path):
     assert B.gain_query('1.2.3.4', str(tmp_path / 'b.txt'), run=slow) is None
 
 
-def _q(boot, mac='aa:bb'):
-    return dict(boot=boot, mac=mac)
+def _q(boot, mac='aa:bb', t=(1.0, 2.0)):
+    return dict(boot=boot, mac=mac, _t_start=t[0], _t_end=t[1])
 
 
 def write_run_log(out, name, boot='4753dc47'):
@@ -69,10 +71,14 @@ def write_run_log(out, name, boot='4753dc47'):
     return p
 
 
-@pytest.mark.parametrize('before, after, why', [(_q('ab'), _q('ab'), None), (None, _q('ab'), 'truoc'),
-                                                (_q('ab'), None, 'sau'), (_q('ab'), _q('AB'), None),
-                                                (_q('ab'), _q('cd'), 'khac boot'),
-                                                (_q('ab', 'm1'), _q('ab', 'm2'), 'hai board')])
+A = (3.0, 4.0)
+
+
+@pytest.mark.parametrize('before, after, why', [(_q('ab'), _q('ab', t=A), None), (None, _q('ab', t=A), 'truoc'),
+                                                (_q('ab'), None, 'sau'), (_q('ab'), _q('AB', t=A), None),
+                                                (_q('ab'), _q('cd', t=A), 'khac boot'),
+                                                (_q('ab', 'm1'), _q('ab', 'm2', t=A), 'hai board'),
+                                                (_q('ab', t=A), _q('ab'), 'khong phai truoc va sau')])
 def test_boot_problem_between_the_two_answers(before, after, why):
     w = B.boot_problem(before, after)
     assert (w is None) if why is None else (why in w)
@@ -82,9 +88,9 @@ def test_boot_problem_against_the_run_boot(tmp_path):
     """R134C-1: two equal answers of an old boot (or another board) are not the run's boot."""
     out = str(tmp_path)
     write_run_log(out, 'x', boot='4753dc47')
-    assert B.boot_problem(_q('4753dc47'), _q('4753dc47'), out, 'x') is None
-    assert 'khac boot cua luot' in B.boot_problem(_q('0badf00d'), _q('0badf00d'), out, 'x')
-    assert 'khong co boot' in B.boot_problem(_q('4753dc47'), _q('4753dc47'), out, 'missing')
+    assert B.boot_problem(_q('4753dc47'), _q('4753dc47', t=A), out, 'x') is None
+    assert 'khac boot cua luot' in B.boot_problem(_q('0badf00d'), _q('0badf00d', t=A), out, 'x')
+    assert 'khong co boot' in B.boot_problem(_q('4753dc47'), _q('4753dc47', t=A), out, 'missing')
 
 
 def test_question_before_the_run_clock_and_after_before_scp(tmp_path, monkeypatch):
@@ -134,9 +140,10 @@ def test_analyze_only_judges_the_saved_answers_again(tmp_path, monkeypatch):
     for n in ('x', 'y'):
         open(os.path.join(out, 'frames', f'{n}_frames.npz'), 'w').close()
         write_run_log(out, n)
-    for w, boot in (('before', '4753dc47'), ('after', '0badf00d')):
+    for w, boot, t in (('before', '4753dc47', '1,2'), ('after', '0badf00d', '3,4')):
         with open(os.path.join(out, 'pi', f'x_gain_query_{w}.txt'), 'w', encoding='utf-8') as f:
-            f.write(ANSWER.replace('4753dc47', boot))
+            a, b = t.split(',')
+            f.write(f'#query_pc,t_start={a},t_end={b}\n' + ANSWER.replace('4753dc47', boot))
     with open(os.path.join(out, 'session.json'), 'w', encoding='utf-8') as f:
         json.dump(dict(runs=[dict(name='x', boot=dict(before=dict(boot='4753dc47'), after=dict(boot='0badf00d'))),
                              dict(name='y')]), f)
@@ -154,3 +161,57 @@ def test_gain_query_needs_the_udp_log(monkeypatch, capsys):
     with pytest.raises(SystemExit):
         B.main(['--out', 'x', '--run', 'a=b', '--gain-query', '--no-logger'])
     assert 'no-logger' in capsys.readouterr().err
+
+
+def test_stop_timer_cancelled_before_the_question_after(tmp_path, monkeypatch):
+    """R134C2-5 (Codex example): --pi-stop r=11, the run's ssh returns at 10 s, the question after takes 3 s:
+    the stop must not be sent (the run ended first). Timer driven by the fake clock."""
+    order, timers = [], []
+
+    def reply(c):
+        if 'run_hil.py' in c and 'finite-run' in c:
+            B.time.sleep(10.0)                                        # the run lasts 10 s
+            order.append('run_end')
+            return (0, 'ok')
+        if c.startswith('P=$(cat'):
+            order.append('stop')
+            return (0, 'pid=1')
+        return (0, '## HEAD\nabc') if 'git' in c else (1, '')
+    a, calls, _ = _bench_env(monkeypatch, tmp_path, reply, run=['r=--test A-L1'], pi_stop=['r=11'],
+                             gain_query=True, esp32_ip='1.2.3.4')
+    clock = dict(t=B.time.time())
+
+    class ClockTimer:
+        def __init__(self, sec, fn):
+            self.sec, self.fn, self.daemon, self.t0, self.alive = sec, fn, False, None, False
+            timers.append(self)
+
+        def start(self):
+            self.t0, self.alive = clock['t'], True
+
+        def cancel(self):
+            self.alive = False
+
+        def join(self, t=None):
+            pass
+
+    def sleep(s):
+        clock['t'] += s
+        for tm in timers:
+            if tm.alive and clock['t'] >= tm.t0 + tm.sec:
+                tm.alive = False
+                tm.fn()
+    monkeypatch.setattr(B, 'time', SimpleNamespace(time=lambda: clock['t'], sleep=sleep))
+    monkeypatch.setattr(B.threading, 'Timer', ClockTimer)
+
+    def fake_query(ip, path, run=None):
+        order.append('q_' + ('before' if path.endswith('before.txt') else 'after'))
+        B.time.sleep(3.0)
+        with open(path, 'x', encoding='utf-8') as f:
+            f.write(ANSWER)
+        return dict(boot='4753dc47', mac='aa')
+    monkeypatch.setattr(B, 'gain_query', fake_query)
+    B.bench(a)
+    assert 'stop' not in order and order[:3] == ['q_before', 'run_end', 'q_after'], order
+    s = json.load(open(os.path.join(a.out, 'session.json'), encoding='utf-8'))
+    assert 'không gửi' in s['runs'][0]['pi_stop']['note']

@@ -285,10 +285,19 @@ def mem_report(snapshot_path, plant_pid=None):
                 os.remove(snapshot_path)
         except OSError:
             pass
-    out.update(plant_peak_rss_kib=snap.get('vm_hwm_kib'), plant_rss_kib=snap.get('vm_rss_kib'),
-               mem_available_kib=snap.get('mem_available_kib'), mem_total_kib=snap.get('mem_total_kib'),
-               plant_pid=snap.get('pid'), t_wall=snap.get('t_wall'),
+    # R134C2-6: a snapshot of another shape, or of another process, gives no number under the plant labels
+    keys = ('pid', 'vm_hwm_kib', 'vm_rss_kib', 'mem_available_kib', 'mem_total_kib', 't_wall')
+    if not isinstance(snap, dict) or any(not (snap.get(k) is None or isinstance(snap.get(k), (int, float)))
+                                         or isinstance(snap.get(k), bool) for k in keys):
+        out['note'] = 'snapshot of an unknown shape: not used'
+        return out
+    out.update(plant_pid=snap.get('pid'), t_wall=snap.get('t_wall'),
                pid_match=None if plant_pid is None else snap.get('pid') == plant_pid)
+    if out['pid_match'] is False:
+        out['note'] = f"snapshot of PID {snap.get('pid')}, not of the plant process {plant_pid}: not used"
+        return out
+    out.update(plant_peak_rss_kib=snap.get('vm_hwm_kib'), plant_rss_kib=snap.get('vm_rss_kib'),
+               mem_available_kib=snap.get('mem_available_kib'), mem_total_kib=snap.get('mem_total_kib'))
     return out
 
 
@@ -651,10 +660,15 @@ def main() -> int:
     # S06 T2 B1 (R134C-12): where the plant process writes its memory snapshot (inherited environment)
     import tempfile
     mem_path = os.path.join(tempfile.gettempdir(), f'hil_mem_{os.getpid()}.json')
-    for stale in (mem_path, mem_path + '.tmp'):
-        if os.path.exists(stale):
-            os.remove(stale)
-    os.environ[MEM_SNAPSHOT_ENV] = mem_path
+    try:                                   # R134C2-6: a memory report never stops the run
+        for stale in (mem_path, mem_path + '.tmp'):
+            if os.path.exists(stale):
+                os.remove(stale)
+        os.environ[MEM_SNAPSHOT_ENV] = mem_path
+    except OSError as exc:
+        log.warning('Memory snapshot (S06 T2 B1) not set up: %s', exc)
+        os.environ.pop(MEM_SNAPSHOT_ENV, None)
+        mem_path = None
     for proc in procs:
         proc.start()
         log.info("  %s  pid=%d", proc.name, proc.pid)

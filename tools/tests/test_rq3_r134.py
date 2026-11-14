@@ -65,8 +65,9 @@ def test_boot_fail_cause_needs_the_evidence(ds):
     _open(d, clock)
     with pytest.raises(rl.LogError, match='needs the two boot answers'):
         rl.end(d, 'hong_he_do', fail_cause=rl.BOOT_FAIL, boot_before='ab', boot_after='ab')
-    with pytest.raises(rl.LogError, match='needs the two boot answers'):
-        rl.end(d, 'hong_he_do', fail_cause=rl.BOOT_FAIL)
+    # R134C2-7: no answer file at all is "both missing": the run can be closed as failed by operation
+    row = rl.end(d, 'hong_he_do', fail_cause=rl.BOOT_FAIL)
+    assert row['fail_cause'] == rl.BOOT_FAIL and row.get('boot_before', '') == ''
 
 
 def test_summary_refuses_a_judged_row_with_two_boots(ds):

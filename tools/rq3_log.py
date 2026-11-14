@@ -329,7 +329,9 @@ def _parse_gains(text: str) -> dict:
 def next_iter_no(ds: str, session: str) -> int:
     """Next iter_no of `session`: past the logged rows AND the open run of the same session (S05 v3.15
     Codex round 5 P3: begin(session='MACHINE') then machine gave two MACHINE:1; Liam 14/11 CODE_R134
-    "Lam cung goi (Recommended)")."""
+    "Lam cung goi (Recommended)"). Limit (Codex R134C2-9, DEFERRED): one writer at a time (one operator, one
+    command), as the S05 workflow runs it; two processes writing the same dataset at once could both take the
+    same number, and summary then refuses the log (a run_uid on two rows, S315-R4-1)."""
     nums = [int(_f(r.get('iter_no'))) for r in read_rows(os.path.join(ds, TUNING)) if r.get('session_id') == session]
     run = _load_open(ds)
     if run and run.get('row', {}).get('session_id') == session:
@@ -613,8 +615,7 @@ def count_no_gate(tun: List[dict]) -> int:
 
 def query_files_needed(row: dict, outcome: str) -> bool:
     """R134 (b): the CLI 'end' of this open run needs --query-before and --query-after (comment above BOOT_FAIL)."""
-    return outcome in VALID and (row.get('platform') == 'HW'
-                                 or (row.get('platform') == 'HIL' and row.get('stage') == 'final_hil'))
+    return outcome in VALID and boot_needed(row.get('platform'), row.get('stage'))
 
 
 def check_gate_rows(tun: List[dict]) -> None:
@@ -786,6 +787,8 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
         raise LogError(f'--outcome one of {OUTCOMES}')
     asked = boot_before is not None or boot_after is not None
     bbad = boot_problem(boot_before, boot_after) if asked else None
+    if not asked and fail_cause == BOOT_FAIL:          # R134C2-7: no answer at all = both missing
+        bbad = boot_problem('', '')
     if bbad and not (outcome == 'hong_he_do' and fail_cause == BOOT_FAIL):   # R134 (b)
         raise LogError(f'{bbad}: a run failed by operation, outcome hong_he_do with fail cause {BOOT_FAIL} '
                        '(S05 4.7 (iv), R3V-9)')
@@ -1675,6 +1678,10 @@ def main(argv=None) -> int:
             rows = write_summary(ds, a.out or os.path.join(ds, SUMMARY), gate, sha)
             for r in rows:
                 print(r['campaign'], r['T_operator_h'], 'h', 'N_HW', r['N_HW'], 'gate', r['gate_result'] or '-')
+            n_old = count_no_gate(read_rows(os.path.join(ds, TUNING)))         # R134C2-11 (SC3-2)
+            if n_old:
+                print(f'{NO_GATE_EVIDENCE}: {n_old} dat row(s) outside the campaigns without gate columns '
+                      '(historic; not in gate_result nor in a stop rule)')
         elif a.cmd == 'demo':
             for r in demo(a.out):
                 print(json.dumps(r, ensure_ascii=False))

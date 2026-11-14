@@ -24,22 +24,31 @@ formatted (logger.c 181-182), so the copies of one snapshot may differ in it. Th
 <csv>.events.txt as '<iso time> <line>', in arrival order. A run is one motor-on stretch; one file = one
 run (CG7).
 
-The run's lines (R134C-2): the '#us,ev=start' lines with first_seq = log_seq of the first motor-on data
-line give the boot of the run (all of them the same boot, else no evidence). The '#gain' lines that count
-are those with that first_seq in the same block of the events file: after the last '#run_end',
-'#us_end', or '#us,ev=start' of another (boot, first_seq) before the run's '#us,ev=start', and before the
-first such line after it. Their gain content (id, applied_n, ctrl, the 7 gains, first_seq) must agree;
-line_drop is reported (largest), not compared (R134C-5). Limit: a '#gain' line of an earlier boot with
-the same first_seq whose '#us,ev=start', '#us_end' and '#run_end' were all lost cannot be told apart.
+The run's lines (R134C-2; Codex round 2 R134C2-2, -4): the '#us,ev=start' lines with first_seq = log_seq
+of the first motor-on data line give the boot of the run (all of them the same boot, else no evidence).
+The '#gain' lines that count are those with that first_seq whose receive time (the ISO time agv_logger
+writes in front of each events line: one clock, one writer) is within GAIN_US_WINDOW_S of the first copy
+of the run's '#us,ev=start': the firmware pushes the three '#gain' and the '#us,ev=start' in the same
+control tick (main.c 342-356; CLOSED_LOOP/2026-11-13_run14 k1a: 6.5 ms apart), while a line of an earlier
+boot is older by at least the boot time of the ESP32. Order of arrival is not used (UDP may reorder). A
+line without a readable time does not count. Their gain content (id, applied_n, ctrl, the 7 gains,
+first_seq) must agree; line_drop is reported (largest), not compared (R134C-5). Limit (R134C2-4,
+DEFERRED): a run whose '#us,ev=start' was dropped by the firmware (queue full, logger.c 88) has no boot
+evidence and fails, although its '#gain' lines are there.
 
-ESP32 log (R134C-3, S05 6.3, L92): read_esp32_log is the one reader of the data lines for this tool and
-s05_final_table.py. With <csv>.segments.csv of agv_logger.py, lines marked 'duplicate' are dropped
-(counted), 'conflict' / 'ambiguous' lines are refused; without it, two data lines with the same log_seq
-are refused (a duplicate is dropped only when the logger marked it).
+ESP32 log (R134C-3, R134C2-3, S05 6.3, L92): read_esp32_log is the one reader of the data lines for this
+tool and s05_final_table.py. With <csv>.segments.csv of agv_logger.py, lines marked 'duplicate' are dropped
+(counted), 'conflict' / 'ambiguous' lines are refused; with or without it, two kept data lines with the
+same log_seq are refused, in one logger segment or in two ("cung log_seq ma khac noi dung": a run failed
+by the measurement system; a duplicate is dropped only when the logger marked it).
 
-Query answers (R134C-1): read_query reads one gain_send.py --query output (exactly one '#gain_running'
-line, last line '#ket_qua,ma=0'); query_problem says why two answers around a run do not show one boot of
-one board equal to the boot of the run.
+Query answers (R134C-1, R134C2-1): read_query reads one gain_send.py --query output (exactly one
+'#gain_running' line, last line '#ket_qua,ma=0') and the '#query_pc,t_start=..,t_end=..' line (PC epoch
+seconds around the question) that the two writers put first (hil_bench_session.py, pc_sender.py);
+query_problem says why two answers do not show one boot of one board equal to the boot of the run, asked
+in two questions one after the other (the 'before' answer ended before the 'after' question started; the
+same file given twice fails that). Limit (R134C2-1, DEFERRED): the question times are not compared with
+the time of the ESP32 log (on the bench the logger runs on the Pi, the questions on the PC: two clocks).
 
 Gain file (format of tools/gain_send.py load_file, hil feat/wifi-gain 331cd76): JSON object
 {"ctrl": "PID"|"ADRC", "id": 1..2147483647, "gains": {<7 names>: number}}; the names and aliases are
@@ -76,6 +85,7 @@ GAIN_FIELDS = ('id', 'applied_n', 'ctrl')
 TAIL_FIELDS = ('first_seq', 'line_drop')
 SEGMENT_STATUS_BAD = ('conflict', 'ambiguous')
 HEX = set('0123456789abcdefABCDEF')
+GAIN_US_WINDOW_S = 0.5           # [DE XUAT] '#gain' to '#us,ev=start' of one run (same tick, ms apart)
 
 
 class InputError(ValueError):
@@ -140,9 +150,10 @@ def read_esp32_log_info(path):
                 raise InputError(f'{seg_path} row {i}: marked duplicate but no earlier equal line')
             dropped += 1
             continue
-        sk = (m.get('segment'), r.get('log_seq'))
-        if sk in keys:
-            raise InputError(f'{path}: line {i}: log_seq {sk[1]} twice in segment {sk[0]}, not marked duplicate')
+        sk = r.get('log_seq')
+        if sk in keys:                   # R134C2-3: in one segment or in two (S05 6.3)
+            raise InputError(f'{path}: line {i}: log_seq {sk} on two kept lines (segment {m.get("segment")}), '
+                             'not marked duplicate: not usable as is (S05 6.3)')
         keys.add(sk)
         seen.add(key)
         out.append(dict(r, _segment=m.get('segment')))
@@ -204,75 +215,80 @@ def _fields(text: str) -> dict:
 
 
 def read_events(path) -> list:
-    """'#' lines of an agv_logger events file ('<iso time> <line>'), in file order, without the time;
-    None when there is no file."""
+    """Lines of an agv_logger events file that hold a '#' line ('<iso time> <line>'), in file order, time
+    kept; None when there is no file."""
     if not path or not os.path.isfile(path):
         return None
     out = []
     with open(path, encoding='utf-8') as f:
         for raw in f:
             line = raw.rstrip('\r\n')
-            i = line.find('#')
-            if i >= 0:
-                out.append(line[i:])
+            if '#' in line:
+                out.append(line)
     return out
+
+
+def split_event(line: str):
+    """(receive time in s, or None, '#...' text) of one events line."""
+    import datetime as _dt
+    i = line.find('#')
+    head = line[:i].strip()
+    try:
+        t = _dt.datetime.fromisoformat(head).timestamp() if head else None
+    except ValueError:
+        t = None
+    return t, line[i:]
 
 
 def gain_lines(events_path: str) -> list:
     """Every '#gain' line of an events file, parsed (copies kept). InputError on a malformed line."""
-    return [parse_gain_line(t) for t in (read_events(events_path) or []) if t.startswith('#gain,')]
+    return [parse_gain_line(t) for _, t in map(split_event, read_events(events_path) or []) if t.startswith('#gain,')]
 
 
 def _content(g: dict) -> tuple:
     return tuple((k, v) for k, v in g.items() if k != 'line_drop')
 
 
-def run_start(events, seq0: int) -> dict:
+def run_start(events, seq0: int, window_s: float = GAIN_US_WINDOW_S) -> dict:
     """The run's start in the events (module docstring): dict(boot, gain (parsed '#gain' dict or None),
-    n_gain_lines, line_drop_max, why (list: empty when boot and gain line are both shown)).
-    events: read_events output (None = no file). InputError on a malformed '#gain' line."""
-    out = dict(boot=None, gain=None, n_gain_lines=0, line_drop_max=None, why=[])
+    n_gain_lines, n_gain_outside (same first_seq, outside the time window), line_drop_max, why (list: empty
+    when boot and gain line are both shown)). events: read_events output (None = no file). InputError on a
+    malformed '#gain' line."""
+    out = dict(boot=None, gain=None, n_gain_lines=0, n_gain_outside=0, line_drop_max=None, why=[])
     if events is None:
         out['why'].append('no events file (#gain, #us lines)')
         return out
-    parsed = []
-    for t in events:
-        if t.startswith('#gain,'):
-            parsed.append(('gain', parse_gain_line(t)))
-        elif t.startswith('#us,'):
-            f = _fields(t)
-            parsed.append(('us_start' if f.get('ev') == 'start' else 'us', f))
-        elif t.startswith('#us_end,') or t.startswith('#run_end,'):
-            parsed.append(('end', None))
-        else:
-            parsed.append(('other', None))
-    mine = [i for i, (k, f) in enumerate(parsed) if k == 'us_start' and _int(f.get('first_seq')) == seq0]
-    if not mine:
+    starts, gains = [], []
+    for line in events:
+        t, text = split_event(line)
+        if text.startswith('#gain,'):
+            g = parse_gain_line(text)
+            if _int(g['first_seq']) == seq0:
+                gains.append((t, g))
+        elif text.startswith('#us,'):
+            f = _fields(text)
+            if f.get('ev') == 'start' and _int(f.get('first_seq')) == seq0:
+                starts.append((t, f))
+    if not starts:
         out['why'].append(f'no #us,ev=start line with first_seq = {seq0}: the boot of the run is not shown')
         return out
-    boots = {parsed[i][1].get('boot', '').lower() for i in mine}
+    boots = {f.get('boot', '').lower() for _, f in starts}
     boot = next(iter(boots))
     if len(boots) != 1 or not boot or not set(boot) <= HEX:
         out['why'].append(f'#us,ev=start lines with first_seq = {seq0} carry boots {sorted(boots)}: '
                           'the run cannot be told apart')
         return out
     out['boot'] = boot
-
-    def boundary(i):
-        k, f = parsed[i]
-        return k == 'end' or (k == 'us_start' and (_int(f.get('first_seq')) != seq0
-                                                   or f.get('boot', '').lower() != boot))
-    if any(boundary(i) for i in range(mine[0], mine[-1] + 1)):
-        out['why'].append(f'the #us,ev=start lines of the run (first_seq = {seq0}) are split by lines of '
-                          'another run: the run cannot be told apart')
+    times = [t for t, _ in starts if t is not None]
+    if not times:
+        out['why'].append(f'the #us,ev=start lines of the run (first_seq = {seq0}) have no logger time')
         return out
-    lo = max((i for i in range(mine[0]) if boundary(i)), default=-1)
-    hi = min((i for i in range(mine[-1] + 1, len(parsed)) if boundary(i)), default=len(parsed))
-    gs = [f for k, f in parsed[lo + 1:hi] if k == 'gain' and _int(f['first_seq']) == seq0]
-    out['n_gain_lines'] = len(gs)
+    t_us = min(times)
+    gs = [g for t, g in gains if t is not None and abs(t - t_us) <= window_s]
+    out.update(n_gain_lines=len(gs), n_gain_outside=len(gains) - len(gs))
     if not gs:
-        out['why'].append(f'no #gain line with first_seq = {seq0} (the first data line of the run) '
-                          f'next to its #us,ev=start (boot {boot})')
+        out['why'].append(f'no #gain line with first_seq = {seq0} (the first data line of the run) within '
+                          f'{window_s:g} s of its #us,ev=start (boot {boot})')
         return out
     out['line_drop_max'] = max(int(g['line_drop']) for g in gs)
     if len({_content(g) for g in gs}) > 1:
@@ -296,7 +312,21 @@ def read_query(path):
         return None
     fields = _fields(run[0])
     b = fields.get('boot', '')
-    return fields if b and set(b) <= HEX else None
+    if not b or not set(b) <= HEX:
+        return None
+    pc = [x for x in lines if x.startswith('#query_pc,')]     # R134C2-1: written by the two writers
+    t = _fields(pc[0]) if len(pc) == 1 else {}
+    try:
+        fields['_t_start'], fields['_t_end'] = float(t['t_start']), float(t['t_end'])
+    except (KeyError, ValueError):
+        fields['_t_start'] = fields['_t_end'] = None
+    fields['_path'] = os.path.realpath(path)
+    return fields
+
+
+def query_pc_line(t_start: float, t_end: float) -> str:
+    """First line of a saved query output (R134C2-1): PC epoch seconds just before and just after it."""
+    return f'#query_pc,t_start={t_start:.6f},t_end={t_end:.6f}\n'
 
 
 def query_problem(before, after, run_boot=None, check_run_boot=True):
@@ -305,6 +335,13 @@ def query_problem(before, after, run_boot=None, check_run_boot=True):
     check_run_boot False: only before against after (no ESP32 log at hand)."""
     if before is None or after is None:
         return f'thieu hoi boot {"truoc" if before is None else "sau"} luot (gain_send --query; S05 4.7 (iv))'
+    if before.get('_path') and before.get('_path') == after.get('_path'):
+        return 'cung mot file cho hoi truoc va hoi sau: khong phai hai lan hoi (R134C2-1)'
+    tb, ta = before.get('_t_end'), after.get('_t_start')
+    if tb is None or ta is None:
+        return 'file hoi khong co dong #query_pc (gio PC cua lan hoi): khong biet hai lan hoi la hai lan (R134C2-1)'
+    if tb > ta:
+        return f'hoi truoc xong luc {tb:.3f} sau khi hoi sau bat dau {ta:.3f}: khong phai truoc va sau luot'
     bb, ba = before['boot'].lower(), after['boot'].lower()
     if bb != ba:
         return f'boot truoc {before["boot"]} khac boot sau {after["boot"]}: ESP32 khoi dong lai giua luot'
@@ -377,7 +414,8 @@ def check(csv_path: str, gain_file=None, builtin=False, events_path=None, querie
     st = run_start(read_events(events_path), seq0)
     want = load_gain_file(gain_file) if gain_file else None
     out = dict(log=csv_path, events=events_path, first_data_seq=seq0, rows_dropped=n_drop,
-               run_boot=st['boot'], n_gain_lines=st['n_gain_lines'], line_drop_max=st['line_drop_max'],
+               run_boot=st['boot'], n_gain_lines=st['n_gain_lines'], n_gain_outside=st['n_gain_outside'],
+               line_drop_max=st['line_drop_max'],
                gain_file=gain_file, builtin=builtin, ok=False, why=list(st['why']))
     if queries is not None:
         qb, qa = (read_query(p) for p in queries)

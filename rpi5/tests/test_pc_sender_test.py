@@ -95,7 +95,8 @@ def test_gain_query_file_saves_the_whole_answer(tmp_path):
     p = tmp_path / 'gain_query_before.txt'
     assert ps.gain_query_file('192.168.1.69', str(p), run=run) == 0
     assert calls[0][1:] == [ps.GAIN_SEND, '--ip', '192.168.1.69', '--query']
-    assert 'boot=4753dc47' in p.read_text(encoding='utf-8')
+    txt = p.read_text(encoding='utf-8')
+    assert 'boot=4753dc47' in txt and txt.startswith('#query_pc,t_start=')         # R134C2-1: PC times first
     with pytest.raises(FileExistsError):
         ps.gain_query_file('192.168.1.69', str(p), run=run)
 

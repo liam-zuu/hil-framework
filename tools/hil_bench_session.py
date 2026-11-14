@@ -290,6 +290,7 @@ def gain_query(ip, path, run=subprocess.run):
     '#gain_running' line (boot, mac, ...; gain_line_check.read_query: one answer line, output ending with
     '#ket_qua,ma=0'), or None (no answer, refused, no IP)."""
     import gain_line_check as glc
+    t_start = time.time()
     if not ip:
         txt = '# no ESP32 IP (--esp32-ip or a "Got IP:" line): boot not asked\n#ket_qua,ma=1\n'
     else:
@@ -300,7 +301,7 @@ def gain_query(ip, path, run=subprocess.run):
         except (OSError, subprocess.TimeoutExpired) as e:
             txt = f'# gain_send.py --query failed: {e}\n#ket_qua,ma=1\n'
     with open(path, 'x', encoding='utf-8') as f:
-        f.write(txt)
+        f.write(glc.query_pc_line(t_start, time.time()) + txt)      # R134C2-1: PC times of the question
     return glc.read_query(path)
 
 
@@ -704,13 +705,13 @@ def bench(a):
                 rc, txt = -1, f'ssh quá {a.run_timeout} s (--run-timeout); kiểm tiến trình trên Pi'
                 print(f'{name}: {txt}')
             t1 = time.time()
-            if boots is not None:                    # ... and just after it, before any file is copied (R134C-9)
-                boots[1], qrec['after'] = timed_query(q_ip, os.path.join(a.out, 'pi', f'{name}_gain_query_after.txt'))
-            if timer:
-                timer.cancel()                       # the run ended first: no stop sent
+            if timer:                                # R134C2-5: the run ended first: no stop sent, also not
+                timer.cancel()                       # during the question after
                 timer.join(35.0)
                 if 't_pc' not in stop_rec:
                     stop_rec['note'] = 'lượt xong trước khi tới giờ dừng: không gửi'
+            if boots is not None:                    # ... and just after it, before any file is copied (R134C-9)
+                boots[1], qrec['after'] = timed_query(q_ip, os.path.join(a.out, 'pi', f'{name}_gain_query_after.txt'))
             with open(os.path.join(a.out, 'pi', f'{name}_pi.txt'), 'x', encoding='utf-8') as f:
                 f.write(txt)
             scp(a.host, f'{a.pi_dir}/{name}_frames.npz', os.path.join(a.out, 'frames'))

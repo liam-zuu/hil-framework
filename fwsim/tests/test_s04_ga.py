@@ -902,3 +902,19 @@ def test_run_gate_matches_run_one_for_both_controllers(ctrl, v, mu):
     assert s3.log_digest(la) == s3.log_digest(lb)
     assert set(b) == set(a) | {'e_bao_max'} and s3.row_text(a) == s3.row_text({k: b[k] for k in a})
     assert math.isfinite(b['e_bao_max'])
+
+
+@pytest.mark.parametrize('bad, row_mod', [('g3', dict(e_trk_max=0.2)), ('g4', dict(e_bao_max=0.2)),
+                                          ('g5', dict(e_theta_cmd_max_deg=9.0))])
+def test_each_constraint_through_the_real_evaluator(monkeypatch, bad, row_mod):
+    """R134C2-10: G3, G4, G5 through Evaluator.candidate (only the simulation row is made up), then
+    run_seed: no feasible point, and the breaking constraint is the only one above 0."""
+    def fake_gate(fw, path, ctrl, g, v, mu):
+        return dict(R(), **row_mod), None
+    monkeypatch.setattr(s4, 'safe_run_gate', fake_gate)
+    ev = s4.Evaluator(None, 'x.dll', 'PID', [0.2, 0.5], [0.4, 0.6], 'w')
+    s = ev.candidate({}, 1, 1, 0)
+    assert s[bad] > 0 and all(s[g] <= 0 for g in ('g1', 'g2', 'g3', 'g4', 'g5') if g != bad)
+    assert len(ev.evals) == 4 and all(e['attempt'] == 1 for e in ev.evals)
+    pts, _, _ = s4.run_seed(ev, DOM2, 1, 4, 2, (s4.D, 50.0), [], [], log=lambda *_: None)
+    assert pts and not any(p['feasible'] for p in pts)

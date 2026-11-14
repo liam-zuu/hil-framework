@@ -34,11 +34,35 @@ def test_snapshot_then_report(tmp_path):
     assert m['pid_match'] is True and 'VmHWM' in m['method'] and not os.path.exists(p)   # read once, removed
 
 
-def test_snapshot_of_another_pid_is_flagged(tmp_path):
+def test_snapshot_of_another_pid_gives_no_number(tmp_path):
+    """R134C2-6: a snapshot of another process is not reported under the plant labels."""
     st, mi = _files(tmp_path)
     p = str(tmp_path / 'snap.json')
     plant_mem_snapshot(p, status=st, meminfo=mi)
-    assert mem_report(p, os.getpid() + 1)['pid_match'] is False
+    m = mem_report(p, os.getpid() + 1)
+    assert m['pid_match'] is False and m['plant_peak_rss_kib'] is None and 'not of the plant' in m['note']
+
+
+@pytest.mark.parametrize('content', ['[]', '"x"', '{"pid": "1", "vm_hwm_kib": 5}', '{"pid": 1, "vm_hwm_kib": true}'])
+def test_snapshot_of_an_unknown_shape_is_not_used(tmp_path, content):
+    """R134C2-6 (Codex counterexample: valid JSON of another type): no exception, no number."""
+    p = tmp_path / 'snap.json'
+    p.write_text(content, encoding='utf-8')
+    m = mem_report(str(p), 1)
+    assert m['plant_peak_rss_kib'] is None and 'unknown shape' in m['note'] and not p.exists()
+
+
+def test_no_snapshot_path_is_a_note():
+    """R134C2-6: main() could not prepare the snapshot (mem_path None): a note, no exception."""
+    assert 'no snapshot' in mem_report(None, 1)['note']
+
+
+def test_setup_of_the_snapshot_cannot_stop_the_run():
+    """R134C2-6: the stale-file removal and the environment variable are inside a try in main()."""
+    src = inspect.getsource(run_hil.main)
+    i = src.index('mem_path = os.path.join(tempfile.gettempdir()')
+    block = src[i:src.index('for proc in procs:', i)]
+    assert 'try:' in block and 'except OSError' in block and 'mem_path = None' in block
 
 
 def test_no_snapshot_gives_none_and_a_note(tmp_path):

@@ -31,8 +31,8 @@ def write_run(tmp_path, gain_lines, on=(0, 0, 1, 1, 1, 0), seq0=9, copies=3, nam
         ev += [f'2026-11-14T10:00:00.{k:06d} {g}' for k in range(copies)]
     first = next((seq0 + i for i, m in enumerate(on) if m), None)
     if us and first is not None:
-        ev += [f'2026-11-14T10:00:00.5{k:05d} #us,ev=start,boot={boot},on=0,swb=1500,first_seq={first},line_drop=0'
-               for k in range(3)]
+        ev += [f'2026-11-14T10:00:00.1{k:05d} #us,ev=start,boot={boot},on=0,swb=1500,first_seq={first},line_drop=0'
+               for k in range(3)]                                     # 0.1 s after the #gain lines
     ev.append('2026-11-14T10:00:01.000000 #fw,sha=16702ff0e688,dirty=0,env=pid')
     (tmp_path / (name + '.events.txt')).write_text('\n'.join(ev) + '\n', encoding='utf-8')
     return str(csv_p)
@@ -128,6 +128,7 @@ def test_gain_line_needs_the_run_start_with_its_boot(tmp_path):
     ev = (tmp_path / 'r2.csv.events.txt').read_text(encoding='utf-8').splitlines()
     gl = [x for x in ev if '#gain,' in x]
     rest = [x for x in ev if '#gain,' not in x]
+    gl = ['2026-11-14T09:58:59.00000%d %s' % (k, x.split(' ', 1)[1]) for k, x in enumerate(gl)]   # an earlier boot
     old = gl + ['2026-11-14T09:59:00.000000 #us_end,boot=0badf00d,on=0',
                 '2026-11-14T09:59:00.000001 #run_end,seq=20,last_data_seq=19']
     (tmp_path / 'r2.csv.events.txt').write_text('\n'.join(old + rest) + '\n', encoding='utf-8')
@@ -135,9 +136,10 @@ def test_gain_line_needs_the_run_start_with_its_boot(tmp_path):
     assert not s['ok'] and 'no #gain line with first_seq = 11' in s['why'][0] and s['run_boot'] == '4753dc47'
 
 
-def _answer(tmp_path, name, boot='4753dc47', mac='aa:bb:cc:dd:ee:ff', tail='#ket_qua,ma=0'):
+def _answer(tmp_path, name, boot='4753dc47', mac='aa:bb:cc:dd:ee:ff', tail='#ket_qua,ma=0', t=(1.0, 2.0)):
     p = tmp_path / name
-    p.write_text(f'#gain_running,sha=16702ff0e688,env=pid,mac={mac},boot={boot},id=7,applied_n=1,ctrl=PID\n'
+    p.write_text(f'#query_pc,t_start={t[0]},t_end={t[1]}\n'
+                 f'#gain_running,sha=16702ff0e688,env=pid,mac={mac},boot={boot},id=7,applied_n=1,ctrl=PID\n'
                  f'{tail}\n', encoding='utf-8')
     return str(p)
 
@@ -146,15 +148,17 @@ def test_query_answers_against_the_run_boot(tmp_path):
     """R134C-1: with --query-before / --query-after, both answers complete, same boot and MAC, = run boot."""
     log = write_run(tmp_path, [gain_line(first_seq=11)])
     g = write_gain(tmp_path)
-    qb, qa = _answer(tmp_path, 'b.txt'), _answer(tmp_path, 'a.txt')
+    qb, qa = _answer(tmp_path, 'b.txt'), _answer(tmp_path, 'a.txt', t=(3.0, 4.0))
     assert glc.check(log, g, queries=(qb, qa))['ok']
     assert glc.main(['--log', log, '--gain-file', g, '--query-before', qb, '--query-after', qa]) == 0
-    for after, why in ((_answer(tmp_path, 'o.txt', boot='0badf00d'), 'khac boot sau'),
-                       (_answer(tmp_path, 'm.txt', mac='11:22:33:44:55:66'), 'hai board'),
-                       (_answer(tmp_path, 'e.txt', tail='#ket_qua,ma=0\n#ket_qua,ma=3'), 'thieu hoi boot sau')):
+    for after, why in ((_answer(tmp_path, 'o.txt', boot='0badf00d', t=(3, 4)), 'khac boot sau'),
+                       (_answer(tmp_path, 'm.txt', mac='11:22:33:44:55:66', t=(3, 4)), 'hai board'),
+                       (_answer(tmp_path, 'e.txt', tail='#ket_qua,ma=0\n#ket_qua,ma=3', t=(3, 4)), 'thieu hoi boot sau'),
+                       (qb, 'cung mot file'),                                         # R134C2-1
+                       (_answer(tmp_path, 'early.txt', t=(0.0, 0.5)), 'khong phai truoc va sau')):
         s = glc.check(log, g, queries=(qb, after))
         assert not s['ok'] and any(why in w for w in s['why']), (why, s['why'])
-    old = (_answer(tmp_path, 'ob.txt', boot='0badf00d'), _answer(tmp_path, 'oa.txt', boot='0badf00d'))
+    old = (_answer(tmp_path, 'ob.txt', boot='0badf00d'), _answer(tmp_path, 'oa.txt', boot='0badf00d', t=(3, 4)))
     s = glc.check(log, g, queries=old)                                # an old pair of the same board
     assert not s['ok'] and any('khac boot cua luot' in w for w in s['why'])
 
@@ -194,3 +198,25 @@ def test_aliases_of_gain_send(tmp_path):
     p = tmp_path / 'g.json'
     p.write_text(json.dumps(dict(ctrl='ADRC', id=3, gains=g)), encoding='utf-8')
     assert sorted(glc.load_gain_file(str(p))['gains']) == sorted(glc.NAMES['ADRC'])
+
+
+def test_gain_line_far_from_the_run_start_does_not_count(tmp_path):
+    """R134C2-2 (Codex counterexample): an old '#gain' line of the same first_seq, no boundary line left,
+    then the run's '#us,ev=start' 40 s later: not the run's line. Real log: 6.5 ms apart (run14 k1a)."""
+    log = write_run(tmp_path, [], name='r.csv')
+    ev = (tmp_path / 'r.csv.events.txt').read_text(encoding='utf-8').splitlines()
+    old = ['2026-11-14T09:59:20.000000 ' + gain_line(first_seq=11)]
+    (tmp_path / 'r.csv.events.txt').write_text('\n'.join(old + ev) + '\n', encoding='utf-8')
+    s = glc.check(log, write_gain(tmp_path))
+    assert not s['ok'] and 'within 0.5 s' in s['why'][0] and s['n_gain_outside'] == 1
+
+
+REAL14 = r'D:\CLAUDE_THESIS\05_DATA\results\CLOSED_LOOP\2026-11-13_run14\pi'
+
+
+@pytest.mark.skipif(not os.path.isdir(REAL14), reason='real HIL run not on this machine')
+@pytest.mark.parametrize('name', ['k1a', 'k1b', 'k2'])
+def test_real_run_2026_11_13_builtin_set(name):
+    """The three runs of CLOSED_LOOP/2026-11-13_run14 (AGV 16702ff, built-in gains): the line is found."""
+    s = glc.check(os.path.join(REAL14, f'{name}.csv'), builtin=True)
+    assert s['ok'] and s['line_id'] == 0 and s['run_boot'] == '4753dc47' and s['n_gain_lines'] == 3
