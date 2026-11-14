@@ -236,7 +236,9 @@ def test_s315_1_hil_judged_without_gate(ds):
             rl.end(d, o, results_dir='r')
     rl.end(d, 'hong_he_do', fail_cause='mat_khung', results_dir='r')       # a lost run without gate: allowed
     _open(d, clock)
-    rl.end(d, 'dat')                                                       # a car run without gate: as before
+    with pytest.raises(rl.LogError, match='SC3-2'):                        # R134 (d): no car dat without gate
+        rl.end(d, 'dat')
+    rl.end(d, 'khong_dat')                                                 # a car run judged without gate
     rl.summary(d)
     path = os.path.join(d, rl.TUNING)
     base = _rows(d)
@@ -480,7 +482,7 @@ def test_any_single_gate_cell_makes_a_gate_row(ds, col):
     # GV3-R3-1 (Codex round 4, test gap): each gate column alone triggers the check; all empty does not
     d, clock = ds
     _open(d, clock)
-    rl.end(d, 'dat')                                                       # no gate: a legacy-style row
+    rl.end(d, 'khong_dat')                                                 # no gate: a legacy-style row
     path = os.path.join(d, rl.TUNING)
     rows = _rows(d)
     rl.summary(d)                                                          # all gate cells empty: not checked
@@ -528,9 +530,12 @@ def test_cli_end_with_gate_json(ds, tmp_path):
     with open(f, 'w', encoding='utf-8') as fh:
         json.dump(dict(gate_v3=_gate(e_trk=0.12)), fh)
     _open(d, clock)
-    assert rl.main(['--dataset', d, 'end', '--outcome', 'khong_dat', '--gate-json', f, '--results-dir', 'r']) == 0
+    qb, qa = _query_files(tmp_path)                                        # a judged car run: R134 (b)
+    assert rl.main(['--dataset', d, 'end', '--outcome', 'khong_dat', '--gate-json', f, '--results-dir', 'r',
+                    '--query-before', qb, '--query-after', qa]) == 0
     r = _rows(d)[-1]
     assert r['g3_state'] == 'khong_dat' and r['gate_json_sha256'] == rl.sha256_file(f)
+    assert r['boot_before'] == r['boot_after'] == '4753dc47'
 
 
 def test_g32_1_unknown_q_and_lo_never_pass(ds):
@@ -583,7 +588,8 @@ def _final_car(d, clock, outcome, minutes, replaces=''):
     rl.begin(d, 'F', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'final', gain_set='A-PID/G0', replaces_run_uid=replaces)
     rl.step(d, 'run')
     clock[0] += dt.timedelta(seconds=30)
-    return rl.end(d, outcome, fail_cause='mat_khung' if outcome == 'hong_he_do' else '')['run_uid']
+    gate = dict(gate=_gate(), results_dir='r') if outcome == 'dat' else {}     # R134 (d) SC3-2
+    return rl.end(d, outcome, fail_cause='mat_khung' if outcome == 'hong_he_do' else '', **gate)['run_uid']
 
 
 def test_s315_r3_2_replacement_by_log_order(ds):
@@ -603,7 +609,7 @@ def test_s315_r3_3_summary_refuses_speed_not_finite(ds):
     # Codex S315-R3-3: summary checks the speed of every HIL / HW row
     d, clock = ds
     _open(d, clock)
-    rl.end(d, 'dat')
+    rl.end(d, 'khong_dat')
     path = os.path.join(d, rl.TUNING)
     base = _rows(d)
     for bad in ('nan', 'inf'):
@@ -628,3 +634,59 @@ def test_s315_r4_1_replacement_uid_duplicate_or_missing(ds):
     rl._write_all(path, rl.TUNING_COLS, [dict(rows[1], run_uid=''), rows[0]])   # missing uid, replacement first
     with pytest.raises(rl.LogError, match='has no run_uid'):
         rl.summary(d)
+
+
+# ── R134 package after Codex round 1 (Liam 14/11 CODE_R134 "Sua + vong 2 (Recommended)") ──
+
+def _query_files(tmp_path, before='4753dc47', after='4753dc47'):
+    out = []
+    for name, boot in (('qb.txt', before), ('qa.txt', after)):
+        p = tmp_path / name
+        p.write_text(f'#gain_running,sha=16702ff0e688,env=pid,mac=aa:bb,boot={boot},id=7,applied_n=1,ctrl=PID\n'
+                     '#ket_qua,ma=0\n', encoding='utf-8')
+        out.append(str(p))
+    return out
+
+
+@pytest.mark.parametrize('platform', ['HW', 'SIM', 'HIL'])
+def test_sc3_2_no_dat_without_the_gate_at_end(ds, platform):
+    """R134 (d) SC3-2: a campaign run is never dat without its gate, on every platform."""
+    d, clock = ds
+    _open(d, clock, platform)
+    with pytest.raises(rl.LogError, match='SC3-2' if platform != 'HIL' else 'needs its scorer output'):
+        rl.end(d, 'dat', results_dir='r')
+    rl.end(d, 'dat', gate=_gate(u_t=0.0015 if platform == 'HIL' else 0.0), results_dir='r')
+    assert _rows(d)[-1]['run_outcome'] == 'dat'
+    rl.summary(d)
+
+
+def test_sc3_2_summary_refuses_a_campaign_dat_row_without_gate_columns(ds):
+    """R134 (d) SC3-2: at the summary too; a row outside the campaigns (historic) is counted apart."""
+    d, clock = ds
+    _open(d, clock)
+    rl.end(d, 'dat', gate=_gate(), results_dir='r')
+    path = os.path.join(d, rl.TUNING)
+    rows = _rows(d)
+    bare = dict(rows[0], **{c: '' for c in rl.GATE_COLS})
+    rl._write_all(path, rl.TUNING_COLS, [bare])
+    with pytest.raises(rl.LogError, match=rl.NO_GATE_EVIDENCE):
+        rl.summary(d)
+    old = dict(bare, campaign='', session_id='OLD', run_uid='OLD:1')
+    rl._write_all(path, rl.TUNING_COLS, [old])
+    rl.summary(d)
+    assert rl.count_no_gate(_rows(d)) == 1
+
+
+@pytest.mark.parametrize('platform, stage, outcome, needed', [
+    ('HW', 'screen', 'khong_dat', True), ('HW', 'final', 'dat', True), ('HW', 'screen', 'hong_he_do', False),
+    ('HIL', 'final_hil', 'chua_ket_luan', True), ('HIL', 'hil_check', 'khong_dat', False),
+    ('SIM', 'screen', 'khong_dat', False)])
+def test_cli_end_requires_the_query_files(ds, tmp_path, platform, stage, outcome, needed):
+    """R134 (b): the CLI 'end' of a judged car run (every stage) or HIL final_hil run needs both files."""
+    assert rl.query_files_needed(dict(platform=platform, stage=stage), outcome) is needed
+    d, clock = ds
+    _open(d, clock)                                                        # a car screen run
+    assert rl.main(['--dataset', d, 'end', '--outcome', 'khong_dat']) == 2
+    qb, qa = _query_files(tmp_path)
+    assert rl.main(['--dataset', d, 'end', '--outcome', 'khong_dat', '--query-before', qb]) == 2
+    assert rl.main(['--dataset', d, 'end', '--outcome', 'hong_he_do', '--fail-cause', 'mat_khung']) == 0

@@ -108,3 +108,13 @@ def test_gain_query_file_records_a_failure(tmp_path):
     p = tmp_path / 'q.txt'
     assert ps.gain_query_file('1.2.3.4', str(p), run=slow) == 1
     assert '#ket_qua,ma=1' in p.read_text(encoding='utf-8')
+
+
+@pytest.mark.parametrize('present', [(), ('gain_query_before.txt',), ('gain_query_after.txt',),
+                                     ('gain_query_before.txt', 'gain_query_after.txt')])
+def test_query_dir_with_a_file_of_an_earlier_run_is_refused(tmp_path, present):
+    """R134C-11: an 'after' (or 'before') already in the folder refuses the run before #test_start."""
+    for n in present:
+        (tmp_path / n).write_text(ANSWER, encoding='utf-8')
+    bad = ps.query_dir_problem(str(tmp_path))
+    assert (bad is None) == (not present) and all(n in (bad or '') for n in present)

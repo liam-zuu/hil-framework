@@ -19,14 +19,20 @@ def gain_line(set_id=7, ctrl='PID', gains=None, first_seq=11, applied_n=1, line_
     return f'#gain,id={set_id},applied_n={applied_n},ctrl={ctrl},{body},first_seq={first_seq},line_drop={line_drop}'
 
 
-def write_run(tmp_path, gain_lines, on=(0, 0, 1, 1, 1, 0), seq0=9, copies=3, name='r.csv'):
-    """CSV with motor_on per line and log_seq from seq0; events file with each gain line `copies` times."""
+def write_run(tmp_path, gain_lines, on=(0, 0, 1, 1, 1, 0), seq0=9, copies=3, name='r.csv', boot='4753dc47',
+              us=True):
+    """CSV with motor_on per line and log_seq from seq0; events file with each gain line `copies` times, then
+    the run's '#us,ev=start' (boot, first_seq = first motor-on line) three times when `us` (AGV 16702ff)."""
     csv_p = tmp_path / name
     rows = ['timestamp_us,log_seq,motor_on'] + [f'{1000 * (i + 1)},{seq0 + i},{m}' for i, m in enumerate(on)]
     csv_p.write_text('\n'.join(rows) + '\n', encoding='utf-8')
     ev = []
     for g in gain_lines:
         ev += [f'2026-11-14T10:00:00.{k:06d} {g}' for k in range(copies)]
+    first = next((seq0 + i for i, m in enumerate(on) if m), None)
+    if us and first is not None:
+        ev += [f'2026-11-14T10:00:00.5{k:05d} #us,ev=start,boot={boot},on=0,swb=1500,first_seq={first},line_drop=0'
+               for k in range(3)]
     ev.append('2026-11-14T10:00:01.000000 #fw,sha=16702ff0e688,dirty=0,env=pid')
     (tmp_path / (name + '.events.txt')).write_text('\n'.join(ev) + '\n', encoding='utf-8')
     return str(csv_p)
@@ -41,7 +47,7 @@ def write_gain(tmp_path, set_id=7, ctrl='PID', gains=None, name='S05_gain_A-PID.
 def test_match_bit_for_bit(tmp_path):
     log = write_run(tmp_path, [gain_line(first_seq=11)])          # first motor-on line: index 2 -> seq 11
     s = glc.check(log, write_gain(tmp_path))
-    assert s['ok'] and s['first_data_seq'] == 11 and s['line_id'] == 7 and s['n_gain_lines'] == 1
+    assert s['ok'] and s['first_data_seq'] == 11 and s['line_id'] == 7 and s['n_gain_lines'] == 3   # the three copies of the run's line
     assert glc.main(['--log', log, '--gain-file', write_gain(tmp_path)]) == 0
 
 
@@ -92,15 +98,81 @@ def test_run_shape_errors(tmp_path, on, msg):
     assert glc.main(['--log', log, '--gain-file', write_gain(tmp_path)]) == 2
 
 
-def test_conflicting_lines_and_bad_lines_are_input_errors(tmp_path):
+def test_conflicting_lines_fail_and_bad_lines_are_input_errors(tmp_path):
+    """R134C-5: copies disagreeing in the gain content are a conflict (a run failed by operation, ma=1)."""
     log = write_run(tmp_path, [gain_line(first_seq=11), gain_line(first_seq=11, set_id=9)], copies=1)
-    with pytest.raises(glc.InputError, match='conflict'):
-        glc.check(log, write_gain(tmp_path))
+    s = glc.check(log, write_gain(tmp_path))
+    assert not s['ok'] and any('conflict' in w for w in s['why'])
+    assert glc.main(['--log', log, '--gain-file', write_gain(tmp_path)]) == 1
     with pytest.raises(glc.InputError, match='firmware order'):
         glc.parse_gain_line('#gain,id=1,applied_n=1,ctrl=PID,ki_xy=1,kp_xy=1,kp_wz=1,ki_wz=1,pos_kp=1,pos_ki=1,'
                             'k_psi=1,first_seq=2,line_drop=0')
     with pytest.raises(glc.InputError, match='without'):
         glc.parse_gain_line('#gain,id=1,ctrl=PID,first_seq=2')
+
+
+def test_line_drop_is_not_a_conflict(tmp_path):
+    """R134C-5 (Codex counterexample): two copies differing only in line_drop (read live, logger.c 181-182)."""
+    log = write_run(tmp_path, [gain_line(first_seq=11, line_drop=0), gain_line(first_seq=11, line_drop=1)], copies=1)
+    s = glc.check(log, write_gain(tmp_path))
+    assert s['ok'] and s['line_drop_max'] == 1 and s['n_gain_lines'] == 2
+
+
+def test_gain_line_needs_the_run_start_with_its_boot(tmp_path):
+    """R134C-2: no '#us,ev=start' of the run (boot not shown), or a '#gain' line of an earlier boot with the
+    same first_seq before that boot's end lines: no evidence."""
+    log = write_run(tmp_path, [gain_line(first_seq=11)], us=False)
+    s = glc.check(log, write_gain(tmp_path))
+    assert not s['ok'] and 'boot of the run is not shown' in s['why'][0]
+    log = write_run(tmp_path, [gain_line(first_seq=11)], name='r2.csv')
+    ev = (tmp_path / 'r2.csv.events.txt').read_text(encoding='utf-8').splitlines()
+    gl = [x for x in ev if '#gain,' in x]
+    rest = [x for x in ev if '#gain,' not in x]
+    old = gl + ['2026-11-14T09:59:00.000000 #us_end,boot=0badf00d,on=0',
+                '2026-11-14T09:59:00.000001 #run_end,seq=20,last_data_seq=19']
+    (tmp_path / 'r2.csv.events.txt').write_text('\n'.join(old + rest) + '\n', encoding='utf-8')
+    s = glc.check(log, write_gain(tmp_path))
+    assert not s['ok'] and 'no #gain line with first_seq = 11' in s['why'][0] and s['run_boot'] == '4753dc47'
+
+
+def _answer(tmp_path, name, boot='4753dc47', mac='aa:bb:cc:dd:ee:ff', tail='#ket_qua,ma=0'):
+    p = tmp_path / name
+    p.write_text(f'#gain_running,sha=16702ff0e688,env=pid,mac={mac},boot={boot},id=7,applied_n=1,ctrl=PID\n'
+                 f'{tail}\n', encoding='utf-8')
+    return str(p)
+
+
+def test_query_answers_against_the_run_boot(tmp_path):
+    """R134C-1: with --query-before / --query-after, both answers complete, same boot and MAC, = run boot."""
+    log = write_run(tmp_path, [gain_line(first_seq=11)])
+    g = write_gain(tmp_path)
+    qb, qa = _answer(tmp_path, 'b.txt'), _answer(tmp_path, 'a.txt')
+    assert glc.check(log, g, queries=(qb, qa))['ok']
+    assert glc.main(['--log', log, '--gain-file', g, '--query-before', qb, '--query-after', qa]) == 0
+    for after, why in ((_answer(tmp_path, 'o.txt', boot='0badf00d'), 'khac boot sau'),
+                       (_answer(tmp_path, 'm.txt', mac='11:22:33:44:55:66'), 'hai board'),
+                       (_answer(tmp_path, 'e.txt', tail='#ket_qua,ma=0\n#ket_qua,ma=3'), 'thieu hoi boot sau')):
+        s = glc.check(log, g, queries=(qb, after))
+        assert not s['ok'] and any(why in w for w in s['why']), (why, s['why'])
+    old = (_answer(tmp_path, 'ob.txt', boot='0badf00d'), _answer(tmp_path, 'oa.txt', boot='0badf00d'))
+    s = glc.check(log, g, queries=old)                                # an old pair of the same board
+    assert not s['ok'] and any('khac boot cua luot' in w for w in s['why'])
+
+
+def test_duplicate_data_lines_need_the_logger_marks(tmp_path):
+    """R134C-3: a duplicate data line without <csv>.segments.csv: input error; marked duplicate: dropped."""
+    log = write_run(tmp_path, [gain_line(first_seq=11)])
+    lines = open(log, encoding='utf-8').read().splitlines()
+    lines.insert(4, lines[1])                                         # copy of the first off line after an on line
+    open(log, 'w', encoding='utf-8').write('\n'.join(lines) + '\n')
+    with pytest.raises(glc.InputError, match='two data lines with log_seq'):
+        glc.check(log, write_gain(tmp_path))
+    rows = [x.split(',') for x in lines[1:]]
+    seg = ['row,log_seq,timestamp_us,segment,status'] + [
+        f'{i},{r[1]},{r[0]},0,{"duplicate" if i == 4 else "ok"}' for i, r in enumerate(rows, start=1)]
+    open(log + '.segments.csv', 'w', encoding='utf-8').write('\n'.join(seg) + '\n')
+    s = glc.check(log, write_gain(tmp_path))
+    assert s['ok'] and s['rows_dropped'] == 1
 
 
 @pytest.mark.parametrize('content, msg', [

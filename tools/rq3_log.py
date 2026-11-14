@@ -130,12 +130,20 @@ MAP_RERUNS_MAX = 3
 # (b) S05 v3.13-v3.17 4.7 (iv), R3V-9, O1 v11.10 R4: the boot of gain_send.py --query just before and just after
 #     the run go to the run history (boot_before, boot_after). Both given and equal: one ESP32 boot over the run.
 #     Missing, unreadable or different: a run failed by operation, so only hong_he_do with fail cause BOOT_FAIL.
-#     [PENDING: test_gate_v3_tools.py held by CODE_RS4] the CLI 'end' will require the two query files for a
-#     judged run on the car (every stage: the obstacle-stop
-#     rule of O1 R4 ties #us to the run through them) and on the HIL at final_hil (tv_duty, S05 4.7 (iv));
-#     [CACH HIEU] other HIL stages do not need them (the HIL rules of O1 3.5 do not use #us). The Python API
-#     keeps them optional (older callers, demo); summary refuses a judged row whose two boots disagree.
+#     The CLI 'end' requires the two query files (--query-before, --query-after) for a judged run
+#     (dat / khong_dat / chua_ket_luan) on the car (every stage: the obstacle-stop rule of O1 R4 ties #us to
+#     the run through them) and on the HIL at final_hil (tv_duty, S05 4.7 (iv)); query_files_needed().
+#     [CACH HIEU] other HIL stages and SIM do not need them (the HIL rules of O1 3.5 do not use #us). The
+#     Python API keeps them optional (older callers, demo); summary refuses a judged row whose two boots
+#     disagree.
+# (d) SC3-2 (S05 §6.3 "Kiem cuoi va tong hop", rule [SC3-2]): a run of a campaign of CAMPAIGNS (A-PID on) is
+#     never dat without gate evidence: end refuses dat without --gate-json on every platform (HIL already
+#     needs it for any judged outcome, Codex S315-1), and the summary refuses a dat row of a campaign with
+#     empty gate columns (NO_GATE_EVIDENCE). [CACH HIEU] "historic rows before the gate columns" are rows
+#     without a campaign of CAMPAIGNS (the example rows of m7_tuning_log.csv); they are not in any campaign
+#     summary, so they never reach gate_result or a stop rule; count_no_gate() reports them apart.
 BOOT_FAIL = 'boot_thieu_hay_khac'        # --fail-cause of a run without one ESP32 boot shown
+NO_GATE_EVIDENCE = 'chua_du_bang_chung_cong'   # SC3-2: a dat row without gate columns
 
 CAMPAIGNS = ('A-PID', 'A-LADRC', 'B-PID', 'B-LADRC', 'B-chung', 'RQ2-INIT-PID', 'RQ2-INIT-LADRC', 'RQ2')
 TUNED = ('A-PID', 'A-LADRC', 'B-PID', 'B-LADRC')
@@ -319,7 +327,13 @@ def _parse_gains(text: str) -> dict:
 
 
 def next_iter_no(ds: str, session: str) -> int:
+    """Next iter_no of `session`: past the logged rows AND the open run of the same session (S05 v3.15
+    Codex round 5 P3: begin(session='MACHINE') then machine gave two MACHINE:1; Liam 14/11 CODE_R134
+    "Lam cung goi (Recommended)")."""
     nums = [int(_f(r.get('iter_no'))) for r in read_rows(os.path.join(ds, TUNING)) if r.get('session_id') == session]
+    run = _load_open(ds)
+    if run and run.get('row', {}).get('session_id') == session:
+        nums.append(int(_f(run['row'].get('iter_no'))))
     return max(nums, default=0) + 1
 
 
@@ -591,6 +605,18 @@ def outcome_vs_gate(outcome: str, ev: dict, decide, fail_cause: str = '') -> Opt
     return f'the gate is not complete (decides {",".join(decide)}): no run is dat'
 
 
+def count_no_gate(tun: List[dict]) -> int:
+    """SC3-2: dat rows outside the campaigns (historic rows) with empty gate columns, reported apart."""
+    return sum(r.get('run_outcome') == 'dat' and r.get('campaign') not in CAMPAIGNS
+               and not any(r.get(c) for c in GATE_COLS) for r in tun)
+
+
+def query_files_needed(row: dict, outcome: str) -> bool:
+    """R134 (b): the CLI 'end' of this open run needs --query-before and --query-after (comment above BOOT_FAIL)."""
+    return outcome in VALID and (row.get('platform') == 'HW'
+                                 or (row.get('platform') == 'HIL' and row.get('stage') == 'final_hil'))
+
+
 def check_gate_rows(tun: List[dict]) -> None:
     """GV3-1, GV3-R2-1: every logged row that carries a gate is recomputed from its q, lo, hi, n_undef
     (version, deciding set of its platform, thresholds, states); its run_outcome must agree as at `end`.
@@ -602,6 +628,10 @@ def check_gate_rows(tun: List[dict]) -> None:
             if bbad:
                 raise LogError(f"{r.get('run_uid')}: run_outcome {r.get('run_outcome')!r} but {bbad}")
         if not any(r.get(c) for c in GATE_COLS):
+            # R134 (d) SC3-2 (HIL rows have their own rule for every judged outcome, Codex S315-1)
+            if r.get('run_outcome') == 'dat' and r.get('campaign') in CAMPAIGNS and r.get('platform') != 'HIL':
+                raise LogError(f"{r.get('run_uid')}: run_outcome 'dat' without gate columns ({NO_GATE_EVIDENCE}, "
+                               'SC3-2): a campaign run is never dat without the gate')
             continue
         g = gate_from_row(r)
         try:
@@ -773,6 +803,9 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
     if run['row'].get('platform') == 'HIL' and outcome in VALID and gate is None:
         raise LogError(f'a HIL run judged {outcome} needs its scorer output (--gate-json): S05 v3.15 4.5 step 2 '
                        '(a run without the run_active edge mapping is a lost run)')        # Codex S315-1
+    if outcome == 'dat' and gate is None:                                                    # R134 (d) SC3-2
+        raise LogError(f"a run judged dat needs its gate evidence (--gate-json), on {run['row'].get('platform')} "
+                       'too (SC3-2: no dat without the gate)')
     if run.get('paused_from') is not None:
         raise LogError('paused: "resume" first (or the pause is lost time of the next segment)')
     t = now()
@@ -1602,6 +1635,11 @@ def main(argv=None) -> int:
         elif a.cmd == 'end':
             import s05_final_table as s5
             boots = {}
+            open_run = _load_open(ds)
+            if open_run and query_files_needed(open_run['row'], a.outcome) and not (a.query_before and a.query_after):
+                raise LogError(f"a {open_run['row'].get('platform')} run at stage {open_run['row'].get('stage')} "
+                               f'judged {a.outcome} needs --query-before and --query-after (gain_send.py --query '
+                               'outputs around the run; S05 4.7 (iv), R3V-9, O1 R4)')
             if a.query_before or a.query_after:
                 boots = dict(boot_before=s5.read_boot(a.query_before) or '', boot_after=s5.read_boot(a.query_after) or '')
             row = end(ds, a.outcome, a.completed, a.e_perp_max, a.fail_cause, a.results_dir, a.notes,

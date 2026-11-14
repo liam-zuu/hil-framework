@@ -827,3 +827,78 @@ def test_run_gate_matches_run_one_and_adds_e_bao():
     assert set(b) == set(a) | {'e_bao_max'}
     assert s3.row_text(a) == s3.row_text({k: b[k] for k in a})
     assert math.isfinite(b['e_bao_max'])
+
+
+# ── after Codex round 1 (R134C-7, R134C-13; Liam 14/11 CODE_R134 "Sua + vong 2 (Recommended)") ──
+
+def test_safe_run_gate_lets_s03stop_through(monkeypatch):
+    """R134C-7: a tool / configuration error stops the GA as in s03_doe.safe_run, not a run_error row."""
+    def stop(*a, **k):
+        raise s3.S03Stop('PID kd != 0')
+    monkeypatch.setattr(s4, 'run_gate', stop)
+    with pytest.raises(s3.S03Stop):
+        s4.safe_run_gate(None, None, 'PID', {}, 0.5, 0.5)
+    ev = s4.Evaluator(None, 'x.dll', 'PID', [0.2], [0.5], 'w')
+    with pytest.raises(s3.S03Stop):
+        ev.candidate({}, 1, 1, 0)
+    assert ev.evals == []
+
+    def boom(*a, **k):
+        raise ValueError('evaluator')
+    monkeypatch.setattr(s4, 'run_gate', boom)
+    row, log = s4.safe_run_gate(None, None, 'PID', {}, 0.5, 0.5)
+    assert row['status'] == 'run_error' and 'ValueError' in row['error'] and log is None
+
+
+def test_g3_g4_g5_maxima_found_at_another_mu():
+    """R134C-13: the largest e_trk, e_bao, e_theta of the candidate is at the second mu, not the first."""
+    rows = [(0.4, 0.2, R(trk=0.03, bao=0.04, th=2.0)), (0.4, 0.5, R(trk=0.04, bao=0.03, th=3.0)),
+            (0.6, 0.2, R(trk=0.11, bao=0.02, th=1.0)), (0.6, 0.5, R(trk=0.05, bao=0.09, th=8.5))]
+    s = s4.score(rows, False)
+    assert s['g3'] == pytest.approx((0.11 - s4.D) / s4.D) and s['g4'] == pytest.approx((0.09 - s4.D) / s4.D)
+    assert s['g5'] == pytest.approx((8.5 - 7.5) / 7.5)
+
+
+class InfeasibleEv(FakeEv):
+    """Every candidate breaks one constraint only (g5 > 0 by default), through the real score()."""
+
+    def __init__(self, bad='g5'):
+        super().__init__()
+        self.bad = bad
+
+    def candidate(self, g, ga_seed, gen, cand):
+        self.calls.append((gen, cand))
+        r = R(e=0.02, tv=5.0, trk=0.03, bao=0.04, th=2.0)
+        r.update({'g3': dict(e_trk_max=0.2), 'g4': dict(e_bao_max=0.2), 'g5': dict(e_theta_cmd_max_deg=9.0)}[self.bad])
+        return s4.score([(0.5, 0.2, r)], False)
+
+
+@pytest.mark.parametrize('bad', ['g3', 'g4', 'g5'])
+def test_one_constraint_alone_leaves_no_feasible_point_and_no_send(bad):
+    """R134C-13: candidates that break only G3, G4 or G5, evaluated through run_seed: no feasible point,
+    HV 0 every generation, the trial goes on to gen_max (HV_base = 0), and summarise sends nothing."""
+    hist, hv_rows = [], []
+    pts, n_gen, ext = s4.run_seed(InfeasibleEv(bad), DOM2, 1, 6, None, (s4.D, 50.0), hist, hv_rows, ext=(3, 5),
+                                  log=lambda *_: None)
+    assert pts and not any(p['feasible'] for p in pts) and all(p[bad] > 0 for p in pts)
+    assert all(h['hv'] == 0.0 and h['n_feasible'] == 0 for h in hv_rows) and (ext, n_gen) == (True, 5)
+    rows, st = s4.summarise('PID', DOM2, {1: pts, 2: pts})
+    send = [r for r in rows if r['kind'] == 'send_to_HIL']
+    assert len(send) == 1 and send[0]['feasible'] is False and st['n_feasible_seeds'] == 0
+
+
+@needs_dll
+@pytest.mark.parametrize('ctrl, v, mu', [('PID', 0.2, 0.6), ('ADRC', 0.5, 0.436), ('ADRC', 0.8, 0.3)])
+def test_run_gate_matches_run_one_for_both_controllers(ctrl, v, mu):
+    """R134C-13: run_gate = s03_doe.run_one + e_bao_max for both controllers, other speeds and mu."""
+    fw = fwsim.FirmwareSim(_DLL)
+    if not fw.pos_cols:
+        pytest.skip('DLL without pos_ctrl.c')
+    import o1_feasibility as o1
+    path = o1.Path8()
+    g = s3.defaults(fw, ctrl)
+    a, la = s3.run_one(fw, path, ctrl, g, v, mu)
+    b, lb = s4.run_gate(fw, path, ctrl, g, v, mu)
+    assert s3.log_digest(la) == s3.log_digest(lb)
+    assert set(b) == set(a) | {'e_bao_max'} and s3.row_text(a) == s3.row_text({k: b[k] for k in a})
+    assert math.isfinite(b['e_bao_max'])

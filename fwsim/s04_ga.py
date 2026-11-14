@@ -361,9 +361,12 @@ def run_gate(fw, path, ctrl, g, v, mu):
 
 
 def safe_run_gate(fw, path, ctrl, g, v, mu):
-    """run_gate, or a 'run_error' row (S03 section 4, S04 section 3) with the reason."""
+    """run_gate, or a 'run_error' row (S03 section 4, S04 section 3) with the reason. S03Stop (a tool or
+    configuration error, s03_doe.sim_kwargs) goes up as in s03_doe.safe_run (Codex R134C-7)."""
     try:
         return run_gate(fw, path, ctrl, g, v, mu)
+    except s3.S03Stop:
+        raise
     except Exception as exc:                 # noqa: BLE001 (any DLL / numeric / evaluator failure)
         return dict(status='run_error', completed='', error=f'{type(exc).__name__}: {exc}'), None
 

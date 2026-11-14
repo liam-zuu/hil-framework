@@ -142,23 +142,43 @@ def test_real_hil_run_2026_11_11(task, expect):
 
 # ---------------------------------------------------------------- table
 
-def write_log(d, rows, boots=('4753dc47', '4753dc47'), gain_seq=None, name='esp32.csv'):
-    """esp32.csv, its events file with the run's '#gain' line (first_seq = first motor-on line, or gain_seq)
-    three times, and gain_send --query outputs before / after (None: file not written)."""
+GAIN7 = ('#gain,id=7,applied_n=1,ctrl=PID,kp_xy=1.5,ki_xy=0.0500000007,kp_wz=1,ki_wz=0.0500000007,pos_kp=6,'
+         'pos_ki=3,k_psi=1,first_seq={seq},line_drop={drop}')
+US = '#us,ev=start,boot={boot},on=0,swb=1500,first_seq={seq},line_drop=0'
+
+
+def start_events(seq, boot='4753dc47', gain_seq=None, drops=(0, 0, 0)):
+    """'#' lines of a run start as the firmware sends them (AGV 16702ff run_udp_mark): #fw x3, #gain x3,
+    #us,ev=start x3 (first_seq = first motor-on data line; gain_seq: another first_seq for #gain)."""
+    g = gain_seq if gain_seq is not None else seq
+    return (['#fw,sha=16702ff0e688,dirty=0,env=pid'] * 3 + [GAIN7.format(seq=g, drop=d) for d in drops]
+            + [US.format(boot=boot, seq=seq)] * 3)
+
+
+def answer(boot, mac='aa:bb'):
+    return (f'#gain_running,sha=16702ff0e688,env=pid,mac={mac},boot={boot},id=7,applied_n=1,ctrl=PID\n'
+            '#ket_qua,ma=0\n')
+
+
+def write_log(d, rows, boots=('4753dc47', '4753dc47'), gain_seq=None, name='esp32.csv', run_boot='4753dc47',
+              events=None):
+    """esp32.csv, its events file with the run's start lines (start_events, or `events`), and gain_send
+    --query outputs before / after (None: file not written)."""
     with open(os.path.join(d, name), 'w', newline='') as f:
         w = csv.DictWriter(f, fieldnames=COLS)
         w.writeheader()
         w.writerows(rows)
-    first = next(r['log_seq'] for r in rows if r['motor_on'] == '1')
-    g = ('#gain,id=7,applied_n=1,ctrl=PID,kp_xy=1.5,ki_xy=0.0500000007,kp_wz=1,ki_wz=0.0500000007,pos_kp=6,'
-         f'pos_ki=3,k_psi=1,first_seq={gain_seq if gain_seq is not None else first},line_drop=0')
+    first = int(next(r['log_seq'] for r in rows if r['motor_on'] == '1'))
+    ev = events if events is not None else start_events(first, run_boot, gain_seq)
     with open(os.path.join(d, name + '.events.txt'), 'w', encoding='utf-8') as f:
-        f.write(''.join(f'2026-11-14T10:00:00.00000{k} {g}\n' for k in range(3)))
+        f.write(''.join(f'2026-11-14T10:00:00.{k:06d} {t}\n' for k, t in enumerate(ev)))
     for when, b in zip(('before', 'after'), boots or (None, None)):
+        q = os.path.join(d, f'gain_query_{when}.txt')
+        if os.path.exists(q):
+            os.remove(q)
         if b is not None:
-            with open(os.path.join(d, f'gain_query_{when}.txt'), 'w', encoding='utf-8') as f:
-                f.write(f'#gain_running,sha=16702ff0e688,env=pid,mac=aa:bb,boot={b},id=7,applied_n=1,ctrl=PID\n'
-                        '#ket_qua,ma=0\n')
+            with open(q, 'w', encoding='utf-8') as f:
+                f.write(answer(b))
 
 
 def write_run(base, uid, platform, stage, ctrl, task, gain_set_id, outcome, e_perp, tv_ok=True, flag=0,
@@ -289,37 +309,124 @@ def test_segments_of_the_logger(tmp_path):
         T.read_esp32_log(p)
 
 
+def _q(boot, mac='aa:bb'):
+    return dict(boot=boot, mac=mac)
+
+
+def _first(L):
+    return int(next(r['log_seq'] for r in L.rows if r['motor_on'] == '1'))
+
+
 def test_boot_before_and_after_the_run(tmp_path):
-    """S05 4.7 (iv), R3V-9: both gain_send --query answers, same boot."""
+    """S05 4.7 (iv), R3V-9, R134C-1: both gain_send --query answers, same boot and MAC, = boot of the run."""
     L = _clean()
-    first = int(next(r['log_seq'] for r in L.rows if r['motor_on'] == '1'))
-    for boots, ok, why in ((('ab', 'ab'), True, ''), ((None, 'ab'), False, 'truoc'), (('ab', None), False, 'sau'),
-                           (('ab', 'cd'), False, 'khac boot')):
-        r = T.tv_duty_esp32(L.rows, 10.0, boots=boots, gain_first_seqs={first})
-        assert (r['tv_duty'] is not None) == ok and why in r['reason'], (boots, r['reason'])
+    ev = start_events(_first(L), boot='ab')
+    for qs, ok, why in (((_q('ab'), _q('ab')), True, ''), ((None, _q('ab')), False, 'truoc'),
+                        ((_q('ab'), None), False, 'sau'), ((_q('ab'), _q('cd')), False, 'khac boot'),
+                        ((_q('AB'), _q('ab')), True, ''),
+                        ((_q('cd'), _q('cd')), False, 'khac boot cua luot'),          # old answer / other board
+                        ((_q('ab', 'm1'), _q('ab', 'm2')), False, 'hai board')):
+        r = T.tv_duty_esp32(L.rows, 10.0, queries=qs, events=ev)
+        assert (r['tv_duty'] is not None) == ok and why in r['reason'], (qs, r['reason'])
+    r = T.tv_duty_esp32(L.rows, 10.0, queries=(_q('ab'), _q('ab')), events=ev[:6], check_gain_line=False)
+    assert r['tv_duty'] is None and 'khong co boot' in r['reason']             # no #us,ev=start: no run boot
     d = str(tmp_path)
     write_log(d, L.rows, boots=('4753DC47', '4753dc47'))
     assert T.read_boot(os.path.join(d, 'gain_query_before.txt')) == '4753DC47'
     assert T.main(['tv', '--log', os.path.join(d, 'esp32.csv'), '--t-end', '10',
                    '--query-before', os.path.join(d, 'gain_query_before.txt'),
                    '--query-after', os.path.join(d, 'gain_query_after.txt')]) == 0
-    with open(os.path.join(d, 'gain_query_after.txt'), 'w', encoding='utf-8') as f:
-        f.write('# no answer\n#ket_qua,ma=3\n')
-    assert T.read_boot(os.path.join(d, 'gain_query_after.txt')) is None
+    for bad in ('# no answer\n#ket_qua,ma=3\n', answer('4753dc47') + '#ket_qua,ma=3\n',     # R134C-1: last line
+                answer('4753dc47') + answer('4753dc47')):                                   # two answers
+        with open(os.path.join(d, 'gain_query_after.txt'), 'w', encoding='utf-8') as f:
+            f.write(bad)
+        assert T.read_boot(os.path.join(d, 'gain_query_after.txt')) is None, bad
 
 
 def test_gain_line_of_the_run(tmp_path):
-    """S05 6.3: a '#gain' line whose first_seq is the first motor-on data line of the run."""
+    """S05 6.3, R134C-2: a '#gain' line whose first_seq is the first motor-on data line, next to the
+    run's '#us,ev=start'."""
     L = _clean()
     d = str(tmp_path)
-    write_log(d, L.rows, gain_seq=3)                                  # the line of another run
     p = os.path.join(d, 'esp32.csv')
-    r = T.tv_duty_esp32(T.read_esp32_log(p), 10.0, boots=('a', 'a'), gain_first_seqs=T.gain_seqs(p))
-    assert r['tv_duty'] is None and 'khong co dong #gain' in r['reason']
+    write_log(d, L.rows, gain_seq=3)                                  # the line of another run
+    r = T.tv_duty_esp32(T.read_esp32_log(p), 10.0, queries=(_q('4753dc47'),) * 2, events=T.read_events(p))
+    assert r['tv_duty'] is None and 'no #gain line' in r['reason']
     os.remove(p + '.events.txt')
-    assert T.gain_seqs(p) is None
-    r = T.tv_duty_esp32(T.read_esp32_log(p), 10.0, boots=('a', 'a'), gain_first_seqs=None)
+    assert T.read_events(p) is None
+    r = T.tv_duty_esp32(T.read_esp32_log(p), 10.0, queries=(_q('4753dc47'),) * 2, events=None)
     assert 'thieu file events' in r['reason']
     write_log(d, L.rows)
-    r = T.tv_duty_esp32(T.read_esp32_log(p), 10.0, boots=('a', 'a'), gain_first_seqs=T.gain_seqs(p))
+    r = T.tv_duty_esp32(T.read_esp32_log(p), 10.0, queries=(_q('4753dc47'),) * 2, events=T.read_events(p))
     assert r['tv_duty'] == pytest.approx(4.0) and r['run_first_seq'] == int(L.rows[3]['log_seq'])
+    assert r['run_boot'] == '4753dc47'
+
+
+def test_old_gain_line_of_an_earlier_boot_is_not_taken():
+    """R134C-2 (Codex counterexample): the events still hold the start of an earlier boot with the same
+    first_seq (its #gain id 7 kept), the current run's three #gain lines are lost: no evidence."""
+    L = _clean()
+    s0 = _first(L)
+    end = ['#us_end,boot=0badf00d,on=0', '#run_end,seq=1,last_data_seq=1']
+    now = [x for x in start_events(s0, boot='4753dc47') if not x.startswith('#gain')]
+    # the old #us,ev=start with the same first_seq is there: two boots for the run, not told apart
+    r = T.tv_duty_esp32(L.rows, 10.0, queries=(_q('4753dc47'),) * 2, events=start_events(s0, '0badf00d') + end + now)
+    assert r['tv_duty'] is None and 'cannot be told apart' in r['reason']
+    # the old #us,ev=start lost: its #gain lies before the old #us_end / #run_end, outside the run's block
+    r = T.tv_duty_esp32(L.rows, 10.0, queries=(_q('4753dc47'),) * 2,
+                        events=start_events(s0, '0badf00d')[:6] + end + now)
+    assert r['tv_duty'] is None and 'no #gain line' in r['reason']
+    # two boots on the run's own #us,ev=start lines: refused
+    r = T.tv_duty_esp32(L.rows, 10.0, queries=(_q('4753dc47'),) * 2,
+                        events=start_events(s0)[:7] + [US.format(boot='0badf00d', seq=s0)])
+    assert r['tv_duty'] is None and 'cannot be told apart' in r['reason']
+
+
+def test_line_drop_differs_between_copies_of_one_gain_line():
+    """R134C-5: line_drop is read live when formatted (logger.c 181-182); not a conflict, largest reported."""
+    L = _clean()
+    ev = start_events(_first(L), drops=(0, 1, 1))
+    r = T.tv_duty_esp32(L.rows, 10.0, queries=(_q('4753dc47'),) * 2, events=ev)
+    assert r['tv_duty'] == pytest.approx(4.0) and r['gain_line_drop_max'] == 1
+    ev = start_events(_first(L))
+    ev[4] = ev[4].replace('id=7', 'id=8')
+    r = T.tv_duty_esp32(L.rows, 10.0, queries=(_q('4753dc47'),) * 2, events=ev)
+    assert r['tv_duty'] is None and 'conflict' in r['reason']
+
+
+def test_duplicate_lines_follow_the_logger_marks(tmp_path):
+    """R134C-3 (S05 6.3, L92): a copy of a line without the sidecar refuses the log, even outside the
+    window; with the sidecar marking it duplicate it is dropped and counted."""
+    L = _clean()
+    d = str(tmp_path)
+    p = os.path.join(d, 'esp32.csv')
+    rows = L.rows + [dict(L.rows[0])]                                 # copy of the first off line, at the end
+    write_log(d, rows)
+    with pytest.raises(ValueError, match='two data lines with log_seq'):
+        T.read_esp32_log(p)
+    assert T.main(['tv', '--log', p, '--t-end', '10', '--no-boot']) == 2
+    _segments(p, rows, status_of=lambda i: 'duplicate' if i == len(rows) else 'ok')
+    got, n = T.read_esp32_log_info(p)
+    assert n == 1 and len(got) == len(L.rows)
+    assert T.main(['tv', '--log', p, '--t-end', '10', '--query-before', os.path.join(d, 'gain_query_before.txt'),
+                   '--query-after', os.path.join(d, 'gain_query_after.txt')]) == 0
+
+
+def test_tail_must_follow_b_in_the_same_segment(tmp_path):
+    """R134C-4 (Codex counterexample): the line with log_seq(b) + 1 is in another logger segment (a new
+    boot), or b + 1 has the right log_seq but a reset tick: no number."""
+    L = _clean()
+    t_end = 10.0
+    r = tv(L.rows, t_end)
+    b = next(i for i, x in enumerate(L.rows) if int(x['log_seq']) == r['tail_seq']) - 1
+    d = str(tmp_path)
+    p = os.path.join(d, 'esp32.csv')
+    rows = L.rows[:b + 2]
+    write_log(d, rows)
+    _segments(p, rows, seg_of=lambda i: 1 if i == b + 2 else 0)
+    r = tv(T.read_esp32_log(p), t_end)
+    assert r['tv_duty'] is None and 'doan logger khac' in r['reason']
+    rows = [dict(x) for x in L.rows[:b + 2]]
+    rows[b + 1]['tick'] = '1'                                         # counters reset (new boot) at b + 1
+    r = tv(rows, t_end)
+    assert r['tv_duty'] is None and 'tick 1' in r['reason']

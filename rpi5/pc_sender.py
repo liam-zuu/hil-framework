@@ -199,6 +199,16 @@ def gain_query_file(ip: str, path: str, run=None) -> int:
     return code
 
 
+QUERY_NAMES = ('gain_query_before.txt', 'gain_query_after.txt')
+
+
+def query_dir_problem(d: str):
+    """R134C-11: one folder per run. A file of an earlier run (before or after) refuses the run before
+    '#test_start', so a new 'before' can never sit next to an old 'after'. None when the folder is free."""
+    old = [n for n in QUERY_NAMES if os.path.exists(os.path.join(d, n))]
+    return f"--gain-query-dir {d} already holds {', '.join(old)}: use a new folder for each run" if old else None
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Trajectory UDP sender")
     parser.add_argument("--ip",       required=True,       help="ESP32 IP address")
@@ -228,6 +238,9 @@ if __name__ == "__main__":
     if args.o1:
         if args.gain_query_dir:
             os.makedirs(args.gain_query_dir, exist_ok=True)
+            bad = query_dir_problem(args.gain_query_dir)
+            if bad:
+                parser.error(bad)
             print(f"#gain_query,when=before,exit={gain_query_file(args.ip, os.path.join(args.gain_query_dir, 'gain_query_before.txt'))}")
         try:
             test_loop(args.ip, args.o1, allow_final_set=args.allow_final_set)

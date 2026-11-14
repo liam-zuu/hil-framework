@@ -97,3 +97,19 @@ def test_cli_end_reads_the_query_files(ds, tmp_path):
                     '--query-before', str(qb), '--query-after', str(qa)]) == 0
     r = _rows(d)[-1]
     assert (r['boot_before'], r['boot_after'], r['run_outcome']) == ('4753dc47', '0badf00d', 'hong_he_do')
+
+
+def test_next_iter_no_counts_the_open_run_of_the_same_session(ds):
+    """S05 v3.15 Codex round 5 P3 (DEFERRED there; Liam 14/11 CODE_R134 "Lam cung goi (Recommended)"):
+    begin(session='MACHINE') then machine gave two MACHINE:1."""
+    d, clock = ds
+    rl.begin(d, 'MACHINE', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen')
+    assert rl.next_iter_no(d, 'MACHINE') == 2 and rl.next_iter_no(d, 'OTHER') == 1
+    m = rl.machine(d, 'A-PID', 'PID', 'X', 'r', 1, 10, '2026-11-20T09:00:00', '2026-11-20T09:01:00')
+    rl.step(d, 'run')
+    clock[0] += dt.timedelta(seconds=60)
+    e = rl.end(d, 'khong_dat')
+    uids = [r['run_uid'] for r in _rows(d)]
+    assert m['run_uid'] == 'MACHINE:2' and e['run_uid'] == 'MACHINE:1' and len(set(uids)) == len(uids)
+    assert rl.next_iter_no(d, 'MACHINE') == 3
+    rl.summary(d)

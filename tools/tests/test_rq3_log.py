@@ -51,7 +51,8 @@ def car_run(d, clock, campaign, stage, outcome, task='O1-F05', speed='0.5', s=60
     rl.begin(d, kw.pop('session', 'S'), campaign, platform, 'PID', task, speed, stage, **kw)
     rl.step(d, 'run')
     tick(clock, s)
-    if platform == 'HIL' and outcome != 'hong_he_do':     # S05 v3.15: a judged HIL run carries its gate
+    # S05 v3.15: a judged HIL run carries its gate; R134 (d) SC3-2: a dat run on any platform too
+    if (platform == 'HIL' and outcome != 'hong_he_do') or outcome == 'dat':
         return rl.end(d, outcome, results_dir='r', gate=rl.fake_gate(e_trk=0.5 if outcome == 'khong_dat' else 0.03))
     return rl.end(d, outcome, fail_cause='mat_khung' if outcome == 'hong_he_do' else '')
 
@@ -125,7 +126,7 @@ def test_refusals(ds):
         rl.end(d, 'hong_he_do')
     rl.pause(d)
     with pytest.raises(rl.LogError, match='resume'):
-        rl.end(d, 'dat')
+        rl.end(d, 'dat', results_dir='r', gate=rl.fake_gate())
     rl.cancel(d)
     assert len(rows(os.path.join(d, rl.TUNING))) == 2           # only the June rows
     with pytest.raises(rl.LogError):
@@ -166,7 +167,7 @@ def test_summary_accounts_split_caps_and_finals(ds):
         rl.begin(d, 'A1', 'A-PID', 'HW', 'PID', 'O1-F0' + sp[-1], sp, 'screen'); rl.step(d, 'setup'); tick(clock, 600)
         rl.end(d, 'khong_dat')
     rl.begin(d, 'F1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'final'); rl.step(d, 'run'); tick(clock, 100)
-    rl.end(d, 'dat')
+    rl.end(d, 'dat', results_dir='r', gate=rl.fake_gate())               # R134 (d) SC3-2: dat with its gate
     rl.begin(d, 'F1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'final'); rl.step(d, 'run'); tick(clock, 100)
     rl.end(d, 'hong_he_do', fail_cause='mat_khung')
     rl.effort(d, '2026-11-20', '06:00', '07:00', campaign='A-PID', nhan='hoc', ghi_chu='doc')
@@ -400,7 +401,7 @@ def test_ea4_n_sim_zero_and_empty(ds):
     rl.migrate(d)
     rl.machine(d, 'B-PID', 'PID', 'X', 'r', 0, 10, '2026-11-20T09:00:00', '2026-11-20T09:01:00')
     rl.begin(d, 'B1', 'B-PID', 'SIM', 'PID', 'O1-F05', '0.5', 'screen')
-    rl.end(d, 'dat')                                     # one live fwsim run, n_sim_evals empty
+    rl.end(d, 'dat', results_dir='r', gate=rl.fake_gate())   # one live fwsim run, n_sim_evals empty (SC3-2: gate)
     assert {r['campaign']: r for r in rl.summary(d)}['B-PID']['N_SIM'] == '1'
 
 

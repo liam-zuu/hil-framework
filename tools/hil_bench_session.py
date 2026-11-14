@@ -286,9 +286,10 @@ GAIN_QUERY_TIMEOUT_S = 20.0
 def gain_query(ip, path, run=subprocess.run):
     """S05 4.7 (iv), R3V-9 (R134 package, Liam 14/11 CODE_R134 local_eb9f3b5c "duyet goi sua code
     fix/r134-answers"): gain_send.py --query to the ESP32 (UDP 5014; answered with the motors on or off,
-    AGV 16702ff main.c 623-627), its whole output to `path` (new file); returns the boot of the
-    '#gain_running' line, or None (no answer, refused, no IP)."""
-    import s05_final_table as s5
+    AGV 16702ff main.c 623-627), its whole output to `path` (new file); returns the fields of the
+    '#gain_running' line (boot, mac, ...; gain_line_check.read_query: one answer line, output ending with
+    '#ket_qua,ma=0'), or None (no answer, refused, no IP)."""
+    import gain_line_check as glc
     if not ip:
         txt = '# no ESP32 IP (--esp32-ip or a "Got IP:" line): boot not asked\n#ket_qua,ma=1\n'
     else:
@@ -300,16 +301,34 @@ def gain_query(ip, path, run=subprocess.run):
             txt = f'# gain_send.py --query failed: {e}\n#ket_qua,ma=1\n'
     with open(path, 'x', encoding='utf-8') as f:
         f.write(txt)
-    return s5.read_boot(path)
+    return glc.read_query(path)
 
 
-def boot_problem(before, after):
-    """None, or why the two boot answers do not show one ESP32 boot over the run."""
-    if before is None or after is None:
-        return f'thiếu boot {"trước" if before is None else "sau"} lượt (gain_send --query; S05 4.7 (iv))'
-    if before.lower() != after.lower():
-        return f'boot trước {before} khác boot sau {after}: ESP32 khởi động lại giữa lượt'
-    return None
+def timed_query(ip, path):
+    """gain_query with the PC times around it: (answer fields or None, record for session.json)."""
+    t_a = time.time()
+    q = gain_query(ip, path)
+    return q, dict(t_start=t_a, t_end=time.time(), boot=q and q['boot'], mac=q and q.get('mac'),
+                   file=os.path.basename(path))
+
+
+def boot_problem(before, after, out_dir=None, name=None):
+    """None, or why the two answers (gain_query fields, None = missing) do not show one boot of one board
+    over the run (R134C-1): same boot and MAC, and the boot of the run's '#us,ev=start' in its UDP log
+    pi/<name>.csv (gain_line_check.run_boot_of; out_dir None: that last check is skipped)."""
+    import gain_line_check as glc
+    run_boot, why = (None, None) if out_dir is None else \
+        glc.run_boot_of(os.path.join(out_dir, 'pi', f'{name}.csv'))
+    bad = glc.query_problem(before, after, run_boot, check_run_boot=out_dir is not None)
+    if bad and why and run_boot is None and before is not None and after is not None:
+        bad += f' ({why})'
+    return bad
+
+
+def queries_of_run(out_dir, name):
+    """The two saved answers of a run (pi/<name>_gain_query_before.txt, _after.txt), read again."""
+    import gain_line_check as glc
+    return tuple(glc.read_query(os.path.join(out_dir, 'pi', f'{name}_gain_query_{w}.txt')) for w in ('before', 'after'))
 
 
 def esp32_ip(lines):
@@ -668,22 +687,25 @@ def bench(a):
         for name, args, stop in plan:
             stop_rec = dict(kind=stop[0], after_s=stop[1]) if stop else None
             timer = _stop_later(a, name, stop[0], stop[1], stop_rec) if stop else None
-            t0 = time.time()
-            if timer:
-                timer.start()
             # A5: strict logger locked on the ESP32 address (unless --logger-loose / --no-logger)
             src, src_from = (None, None) if (a.no_logger or a.logger_loose) else \
                 logger_src(a.esp32_ip, [s for _, s in esp.since(0)])
-            boots = None
+            boots, qrec = None, None
             if getattr(a, 'gain_query', False):                         # S05 4.7 (iv): ask boot just before the run
                 q_ip = a.esp32_ip or esp32_ip([s for _, s in esp.since(0)])
-                boots = [gain_query(q_ip, os.path.join(a.out, 'pi', f'{name}_gain_query_before.txt')), None]
+                q, rb = timed_query(q_ip, os.path.join(a.out, 'pi', f'{name}_gain_query_before.txt'))
+                boots, qrec = [q, None], dict(before=rb)
+            t0 = time.time()                         # R134C-9: the run (and its --pi-stop / --pi-kill clock)
+            if timer:                                # starts after the question before it
+                timer.start()
             try:
                 rc, txt = ssh(a.host, run_cmd(a.pi_dir, name, args, not a.no_logger, src), timeout=a.run_timeout)
             except subprocess.TimeoutExpired:
                 rc, txt = -1, f'ssh quá {a.run_timeout} s (--run-timeout); kiểm tiến trình trên Pi'
                 print(f'{name}: {txt}')
             t1 = time.time()
+            if boots is not None:                    # ... and just after it, before any file is copied (R134C-9)
+                boots[1], qrec['after'] = timed_query(q_ip, os.path.join(a.out, 'pi', f'{name}_gain_query_after.txt'))
             if timer:
                 timer.cancel()                       # the run ended first: no stop sent
                 timer.join(35.0)
@@ -695,11 +717,9 @@ def bench(a):
             if not a.no_logger:
                 scp(a.host, f'{a.pi_dir}/{name}.csv*', os.path.join(a.out, 'pi'))
                 scp(a.host, f'{a.pi_dir}/{name}_logger.txt', os.path.join(a.out, 'pi'))
-            if getattr(a, 'gain_query', False):                         # ... and just after it (the motors are off again)
-                boots[1] = gain_query(q_ip, os.path.join(a.out, 'pi', f'{name}_gain_query_after.txt'))
             run_rec = dict(name=name, args=args, t0=t0, t1=t1, ssh_exit=rc)
-            if boots:
-                run_rec['boot'] = dict(before=boots[0], after=boots[1])
+            if boots is not None:
+                run_rec['boot'] = qrec
             if not a.no_logger:
                 run_rec['logger_cmd'] = dict(strict=src is not None, src_ip=src, src_from=src_from)    # A5
             ev = os.path.join(a.out, 'pi', f'{name}.csv.events.txt')
@@ -736,9 +756,9 @@ def bench(a):
             if rc != 0:
                 r['clean'] = False
                 r['why'].append(f'Pi mã thoát {rc}')
-            if boots:
+            if boots is not None:
                 r['boot'] = run_rec['boot']
-                bbad = boot_problem(*boots)
+                bbad = boot_problem(boots[0], boots[1], a.out, name)
                 if bbad:
                     r['clean'] = False
                     r['why'].append(bbad)
@@ -788,6 +808,13 @@ def analyze_only(a):
     runs = {x.get('name'): x for x in (sess or {}).get('runs', [])}
     for n in names:
         r = analyze_run(a.out, n)                    # no PC time windows: serial logs not judged per run
+        if 'boot' in runs.get(n, {}):                # R134C-10: a session made with --gain-query, checked again
+            qb, qa = queries_of_run(a.out, n)        # from the saved answers (older sessions: no such record)
+            r['boot'] = runs[n]['boot']
+            bbad = boot_problem(qb, qa, a.out, n)
+            if bbad:
+                r['clean'] = False
+                r['why'].append(bbad)
         lc = runs.get(n, {}).get('logger_cmd')
         if lc is not None:                           # A5: only sessions made with it, old folders keep their verdict
             sp = os.path.join(a.out, 'pi', f'{n}.csv.summary.json')
@@ -841,8 +868,9 @@ def main(argv=None):
     ap.add_argument('--pi-stop', action='append', default=[], metavar='TÊN=GIÂY',
                     help='sau GIÂY từ lúc bắt đầu lượt TÊN: SIGTERM run_hil.py (STOP êm: setpoint 0 rồi hết lượt)')
     ap.add_argument('--gain-query', action='store_true',
-                    help='S05 4.7 (iv) (R134): gain_send.py --query ngay trước và ngay sau mỗi lượt, ghi '
-                         'pi/<TÊN>_gain_query_before.txt, _after.txt; thiếu hay khác boot thì lượt không sạch')
+                    help='S05 4.7 (iv) (R134): gain_send.py --query ngay trước lượt (rồi mới đếm giờ --pi-stop, '
+                         '--pi-kill) và ngay khi lượt xong (trước scp), ghi pi/<TÊN>_gain_query_before.txt, _after.txt; '
+                         'thiếu, khác boot hay MAC, hay boot khác dòng #us,ev=start của lượt thì lượt không sạch')
     ap.add_argument('--analyze-only', action='store_true',
                     help='chỉ chấm thư mục đã có frames/ (không ghi gì vào thư mục, trừ khi --write-summary)')
     ap.add_argument('--write-summary', action='store_true',
@@ -856,6 +884,8 @@ def main(argv=None):
         ap.error(f'--gain-query cần {GAIN_SEND} (nhánh feat/wifi-gain, L90; chưa gộp vào nhánh này)')
     if a.gain_query and a.analyze_only:
         ap.error('--gain-query chỉ dùng khi chạy lượt')
+    if a.gain_query and a.no_logger:
+        ap.error('--gain-query cần log UDP của lượt (dòng #us,ev=start mang boot của lượt, R134C-1): bỏ --no-logger')
     code, results = analyze_only(a) if a.analyze_only else bench(a)
     if results and a.analyze_only and a.write_summary:
         with open(os.path.join(a.out, 'bench_summary_analyze.json'), 'w', encoding='utf-8') as f:
