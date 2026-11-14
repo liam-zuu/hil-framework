@@ -115,8 +115,8 @@ def _end(d, outcome, gate=None, **kw):
     if row.get('platform') == 'HW' and gate is not None and gate['g1'].get('t_done') is None:
         gate = rl.floor_gate(gate)
     if outcome in rl.VALID and rl.boot_needed(row.get('platform'), row.get('stage')):     # car, final_hil
-        kw.setdefault('boot_before', 'ab')
-        kw.setdefault('boot_after', 'ab')
+        if 'boot_before' not in kw and 'queries' not in kw:      # R134C4-1: two answers, not two strings
+            kw['queries'] = rl.fake_queries('ab')
     return rl.end(d, outcome, gate=gate, **kw)
 
 

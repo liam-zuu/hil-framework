@@ -66,7 +66,7 @@ hil_o1_score.py, or of the camera scorer with the same keys) and <results_dir>/<
   tv_duty                            tv_duty_esp32() above (NOT the scorer's tv_duty_h7_1khz)
   flag                               HIL: track_err_frames > 0; camera: n_back_frames > 0
 Each cell (controller x condition x platform x gain set): n_valid, n_dat / n_khong_dat / n_chua_ket_luan,
-n_flag, and per quantity median and max over the valid runs that have a number, n_m, and the reason of
+n_flag, n_cat_t1 (runs khong_dat by the exception before t1, O1 3.5 R2V-4; R134C4-6), and per quantity median and max over the valid runs that have a number, n_m, and the reason of
 every valid run without a number. The quantity list is fixed here (do not change after seeing numbers).
 
   python tools/s05_final_table.py tv --log <esp32 csv> --t-end <s> --query-before F --query-after F
@@ -312,10 +312,24 @@ def load_runs(dataset, score_name, esp32_name, query_before_name='gain_query_bef
     path = os.path.join(dataset, 'm7_tuning_log.csv')
     with open(path, newline='', encoding='utf-8') as f:
         rows = list(csv.DictReader(f))
+    # R134C4-2 (Codex round 4): the rows go through the same row checks as rq3_log summary (gate columns
+    # recomputed, the camera gate of a judged car run, both boots of a judged car / final_hil run, the HIL
+    # mapping rules); any error stops the table. A final row outside the campaigns is not tabled (reported).
+    import rq3_log as rl
+    rows = rl.live_rows(rows)
+    try:
+        rl.check_gate_rows(rows)
+        rl.check_map_rows(rows)
+    except rl.LogError as e:
+        raise ValueError(f'm7_tuning_log.csv: {e}')
     runs, problems = [], []
     for r in rows:
         plat = next((p for p in PLATFORMS if r.get('platform') == p[0] and r.get('stage') == p[2]), None)
         if plat is None:
+            continue
+        if r.get('campaign') not in rl.CAMPAIGNS:
+            problems.append(f"run {r.get('run_uid')}: campaign {r.get('campaign')!r} ngoai cac chien dich, khong vao "
+                            'bang (R134C4-2)')
             continue
         ctrl, task = r.get('controller', ''), r.get('trajectory', '')
         gs = gain_set_of(r.get('gain_set_id'), ctrl)
@@ -324,7 +338,8 @@ def load_runs(dataset, score_name, esp32_name, query_before_name='gain_query_bef
                             f"{r.get('gain_set_id')!r} khong vao bang")
             continue
         run = dict(run_uid=r.get('run_uid'), platform=plat[1], controller=ctrl, condition=task, gain_set=gs,
-                   outcome=r.get('run_outcome'), results_dir=r.get('results_dir', ''))
+                   outcome=r.get('run_outcome'), results_dir=r.get('results_dir', ''),
+                   cat_t1=r.get('g1_cat_t1') == 'true')      # R134C4-6: O1 3.5 R2V-4, counted per cell
         if run['outcome'] in VALID:
             d = run['results_dir']
             score, tv = {}, dict(reason='')
@@ -368,7 +383,8 @@ def build_table(runs):
                                 n_khong_dat=sum(r['outcome'] == 'khong_dat' for r in val),
                                 n_chua_ket_luan=sum(r['outcome'] == 'chua_ket_luan' for r in val),
                                 n_hong_he_do=sum(r['outcome'] == 'hong_he_do' for r in rs),
-                                n_flag=sum(bool(r.get('flag')) for r in val))
+                                n_flag=sum(bool(r.get('flag')) for r in val),
+                                n_cat_t1=sum(bool(r.get('cat_t1')) for r in val))      # R134C4-6
                     for q in QUANTITIES:
                         xs = [r['values'][q] for r in val if _a_number(r['values'].get(q))]   # B81-16
                         why = '; '.join(f"{r['run_uid']}: {r['missing'][q]}" for r in val if q in r['missing'])
@@ -389,7 +405,8 @@ def markdown(table):
                     f"n {by[(ctrl, cond, plat, g, QUANTITIES[0])]['n_valid']}: "
                     f"{by[(ctrl, cond, plat, g, QUANTITIES[0])]['n_dat']}/"
                     f"{by[(ctrl, cond, plat, g, QUANTITIES[0])]['n_khong_dat']}/"
-                    f"{by[(ctrl, cond, plat, g, QUANTITIES[0])]['n_chua_ket_luan']}, co {by[(ctrl, cond, plat, g, QUANTITIES[0])]['n_flag']}"
+                    f"{by[(ctrl, cond, plat, g, QUANTITIES[0])]['n_chua_ket_luan']}, co {by[(ctrl, cond, plat, g, QUANTITIES[0])]['n_flag']}, "
+                    f"cat_t1 {by[(ctrl, cond, plat, g, QUANTITIES[0])]['n_cat_t1']}"
                     for g in GAIN_SETS)
                 L.append(f'| {ctrl} | {cond} | {plat} | n_valid: dat/khong/chua, co | {head} |')
                 for q in QUANTITIES:
@@ -405,7 +422,7 @@ def write_table(runs, out_dir):
     os.makedirs(out_dir, exist_ok=True)
     table = build_table(runs)
     cols = ['controller', 'condition', 'platform', 'gain_set', 'n_valid', 'n_dat', 'n_khong_dat', 'n_chua_ket_luan',
-            'n_hong_he_do', 'n_flag', 'quantity', 'n_m', 'median', 'max', 'missing']
+            'n_hong_he_do', 'n_flag', 'n_cat_t1', 'quantity', 'n_m', 'median', 'max', 'missing']
     with open(os.path.join(out_dir, 'S05_final_table.csv'), 'w', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()

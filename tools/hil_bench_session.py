@@ -732,6 +732,15 @@ def bench(a):
                         break
                 q, rb = timed_query(q_ip, os.path.join(a.out, 'pi', f'{name}_gain_query_before.txt'))
                 boots, qrec = [q, None], dict(before=rb)
+                if ack is not None:                  # R134C4-5: a restart between the set and the question
+                    import gain_line_check as glc
+                    abad = glc.ack_problem(ack, q)
+                    if abad:
+                        print(f'{name}: DỪNG: {abad}; không chạy lượt này và các lượt sau')
+                        sess['runs'].append(dict(name=name, args=args, boot=qrec, gain_ack=dict(
+                            file=f'{name}_gain_ack.txt', applied=True, boot=ack.get('boot'), problem=abad)))
+                        code = 2
+                        break
             t0 = time.time()                         # R134C-9: the run (and its --pi-stop / --pi-kill clock)
             if timer:                                # starts after the question before it
                 timer.start()

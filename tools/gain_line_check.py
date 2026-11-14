@@ -398,11 +398,14 @@ def read_ack(path):
 def ack_problem(ack, before, run_gain=None):
     """None, or why the '#gain_ack' of the gain setting (read_ack dict, None = missing) is not of the boot and the
     board of the two query answers (`before`, already checked against `after` by query_problem) and of the set the
-    run ran (`run_gain`: the run's '#gain' dict, None = not shown). A run on the built-in set (id 0 on its '#gain'
-    line: nothing was set since that boot) has no ack to check (S05 4.7 (iv) speaks of the ack 'luc dat gain')."""
-    if run_gain is not None and run_gain.get('id') == '0':
-        return None
+    run ran (`run_gain`: the run's '#gain' dict, None = not shown). An ack that is there is always checked
+    (R134C4-5: a set applied, then an ESP32 restart, leaves id 0 on the run's line and the ack of the older boot).
+    Only a run with no ack and id 0 on its '#gain' line (built-in set, nothing set since that boot) has no ack to
+    check (S05 4.7 (iv) speaks of the ack 'luc dat gain'). Limit: a run that should have run another set but has
+    no ack and id 0 is caught by the '#gain' line against the gain file (check(), S05 6.3), not here."""
     if ack is None:
+        if run_gain is not None and run_gain.get('id') == '0':
+            return None
         return 'thieu cau tra loi #gain_ack luc dat gain (gain_send.py, ok=1, ma=0; S05 4.7 (iv))'
     if before is None:
         return 'thieu hoi boot truoc luot: khong so duoc #gain_ack'

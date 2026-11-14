@@ -44,7 +44,8 @@ def _rows(d):
 def test_boot_columns_recorded(ds):
     d, clock = ds
     _open(d, clock)
-    rl.end(d, 'khong_dat', boot_before='4753dc47', boot_after='4753DC47', **CAR_KD)
+    qb, qa = rl.fake_queries('4753dc47')
+    rl.end(d, 'khong_dat', queries=(qb, dict(qa, boot='4753DC47')), **CAR_KD)
     r = _rows(d)[-1]
     assert (r['boot_before'], r['boot_after']) == ('4753dc47', '4753DC47')
     assert {'boot_before', 'boot_after'} <= set(rl.TUNING_COLS)
@@ -78,7 +79,7 @@ def test_boot_fail_cause_needs_the_evidence(ds):
 def test_summary_refuses_a_judged_row_with_two_boots(ds):
     d, clock = ds
     _open(d, clock)
-    rl.end(d, 'khong_dat', boot_before='ab', boot_after='ab', **CAR_KD)
+    rl.end(d, 'khong_dat', queries=rl.fake_queries('ab'), **CAR_KD)
     rows = _rows(d)
     rows[-1]['boot_after'] = 'cd'                                      # edited by hand
     rl._write_all(os.path.join(d, rl.TUNING), rl.TUNING_COLS, rows)
@@ -173,7 +174,7 @@ def _restate(g):
     return g
 
 
-BOOTS = dict(boot_before='ab', boot_after='ab')
+BOOTS = dict(queries=rl.fake_queries('ab'))                   # R134C4-1: two answers, not two strings
 
 
 @pytest.mark.parametrize('outcome', ['dat', 'khong_dat', 'chua_ket_luan'])
@@ -287,7 +288,7 @@ def test_b81_3_two_domains_violation_only_in_the_union_is_inconclusive(ds):
     (lambda g: g['g2']['chung'].update(n_undef=3), 'n_undef of the common domain'),
     (lambda g: g['g2']['chung'].pop('hi'), 'chung: not an object'),
     (lambda g: g['g1'].update(t_done=[10.0, 10.0]), 'numbers differ'),       # one domain: the sets must be equal
-    (lambda g: g['g1'].update(t_done=[10.0, 25.0]), 'after t_deadline'),
+    (lambda g: g['g1'].update(t_done=[10.0, 25.0]), 'not before t_deadline'),
     (lambda g: g['g1'].update(t_done=[10.0]), 'way'),
     (lambda g: g['g1'].update(t_deadline=None), 't_deadline'),
     (lambda g: g['g1'].update(t_done=[10.0, float('nan')]), 'finite time'),
@@ -386,3 +387,80 @@ def test_b81_demo_writes_two_domain_rows(tmp_path):
     assert car and all(r['g1_ways'] == '2' and r['boot_before'] for r in car)
     inc = [r for r in car if r['run_outcome'] == 'chua_ket_luan']
     assert inc and inc[0]['g1_t_done_1'] and not inc[0]['g1_t_done_2']
+
+
+# ── Codex Sol round 4 (Liam 14/11 CODE_R134 "Sua 6 muc, goi vong 5 (Recommended)") ──
+
+def test_c4_1_end_needs_two_answers_not_two_strings(ds):
+    """R134C4-1: a judged car / final_hil run needs the two read_query answers; end checks them itself."""
+    d, clock = ds
+    _open(d, clock)
+    with pytest.raises(rl.LogError, match='R134C4-1'):
+        rl.end(d, 'khong_dat', boot_before='ab', boot_after='ab', **CAR_KD)
+    qb, qa = rl.fake_queries('ab')
+    for qs, why in (((qb, qb), 'cung mot file'), ((qa, qb), 'khong phai truoc va sau'),
+                    ((qb, dict(qa, mac='cc')), 'hai board'), ((qb, None), 'sau')):
+        with pytest.raises(rl.LogError, match=why):
+            rl.end(d, 'khong_dat', queries=qs, **CAR_KD)
+    row = rl.end(d, 'hong_he_do', fail_cause=rl.BOOT_FAIL, queries=(qb, qb))      # the failed run is logged
+    assert row['fail_cause'] == rl.BOOT_FAIL
+    rl.begin(d, 'S', 'RQ2', 'HIL', 'PID', 'O1-F05', '0.5', 'final_hil', gain_set='RQ2-INIT-PID/G0')
+    rl.step(d, 'run')
+    with pytest.raises(rl.LogError, match='R134C4-1'):
+        rl.end(d, 'khong_dat', gate=rl.fake_gate(e_trk=0.5), results_dir='r', boot_before='ab', boot_after='ab')
+    rl.end(d, 'khong_dat', gate=rl.fake_gate(e_trk=0.5), results_dir='r', queries=(qb, qa))
+    rl.begin(d, 'S', 'B-PID', 'HIL', 'PID', 'O1-F05', '0.5', 'hil_check', gain_set='B-PID/GA1')
+    rl.step(d, 'run')
+    rl.end(d, 'khong_dat', gate=rl.fake_gate(e_trk=0.5), results_dir='r', boot_before='ab', boot_after='ab')
+    rl.summary(d)                                                     # hil_check: the boots are not required
+
+
+def _t1_gate(t_done=(None, None), t1=5.0, e_trk=0.03):
+    g = rl.floor_gate(rl.fake_gate(e_trk=e_trk), t_done=t_done)
+    g['g1'].update(t1=t1)
+    return _restate(g)
+
+
+@pytest.mark.parametrize('t_done, outcome', [((None, None), 'khong_dat'), ((10.0, None), 'chua_ket_luan'),
+                                             ((10.0, 10.0), 'dat')])
+def test_c4_3_floor_run_with_t1_is_lost(ds, t_done, outcome):
+    """R134C4-3, O1 3.5: a floor run with a tracking error or a long gap (t1) and no violation before it is a run
+    lost to the measurement; it is never judged."""
+    d, clock = ds
+    g = _t1_gate(t_done)
+    assert g['outcome_decide'] == outcome
+    _open(d, clock)
+    with pytest.raises(rl.LogError, match='lost to the measurement'):
+        rl.end(d, outcome, gate=g, results_dir='r', **BOOTS)
+    rl.end(d, 'hong_he_do', fail_cause='loi_theo_doi', gate=g, results_dir='r')
+    rl.summary(d)
+    _open(d, clock)
+    rl.end(d, outcome, gate=_hw_gate(t_done=t_done), results_dir='r', **BOOTS)   # the same run without t1
+    rows = _rows(d)
+    rows[-1]['g1_t1'] = '5.0'                                         # t1 written in by hand
+    rl._write_all(os.path.join(d, rl.TUNING), rl.TUNING_COLS, rows)
+    with pytest.raises(rl.LogError, match='lost to the measurement'):
+        rl.summary(d)
+
+
+def test_c4_4_completion_at_the_deadline_is_not_before_it(ds):
+    """R134C4-4, O1 3.4 condition 4: completed strictly before t_deadline."""
+    g = _hw_gate(t_done=(19.999, 19.999))
+    rl.validate_gate(g, 'HW')
+    for td in ([20.0, 20.0], [10.0, 20.0]):
+        bad = copy.deepcopy(g)
+        bad['g1']['t_done'] = td
+        with pytest.raises(rl.LogError, match='not before t_deadline'):
+            rl.validate_gate(bad, 'HW')
+    one = rl.fake_gate()
+    one['g1'].update(t_done=[20.0], t_deadline=20.0)
+    with pytest.raises(rl.LogError, match='not before t_deadline'):
+        rl.validate_gate(one, 'SIM')
+    d, clock = ds
+    _open(d, clock)
+    rl.end(d, 'dat', gate=g, results_dir='r', **BOOTS)
+    rows = _rows(d)
+    rows[-1]['g1_t_done_2'] = rows[-1]['g1_t_deadline']               # the CSV path too
+    rl._write_all(os.path.join(d, rl.TUNING), rl.TUNING_COLS, rows)
+    with pytest.raises(rl.LogError, match='not before t_deadline'):
+        rl.summary(d)

@@ -220,6 +220,20 @@ def gain_set_file(ip: str, gain_file: str, path: str, run=None) -> int:
     return code
 
 
+def ack_before_problem(d: str):
+    """R134C4-5: None, or why the saved '#gain_ack' (DIR/gain_ack.txt) is not of the boot and the board of the
+    question just before the task (DIR/gain_query_before.txt): an ESP32 restart after the set (gain lost), or no
+    readable answer. gain_line_check (tools/) reads both, as the scorer does."""
+    tools = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tools')
+    if tools not in sys.path:
+        sys.path.insert(0, tools)
+    import gain_line_check as glc
+    before = glc.read_query(os.path.join(d, 'gain_query_before.txt'))
+    if before is None:
+        return 'no readable answer to the question before the task (gain_query_before.txt)'
+    return glc.ack_problem(glc.read_ack(os.path.join(d, ACK_NAME)), before)
+
+
 QUERY_NAMES = ('gain_query_before.txt', 'gain_query_after.txt')
 ACK_NAME = 'gain_ack.txt'                       # B81-14: s05_final_table --gain-ack-name default
 
@@ -278,6 +292,11 @@ if __name__ == "__main__":
                     print(f"gain {args.gain_file} not applied (see {ACK_NAME}): no task sent")
                     sys.exit(2)
             print(f"#gain_query,when=before,exit={gain_query_file(args.ip, os.path.join(args.gain_query_dir, 'gain_query_before.txt'))}")
+            if args.gain_file:                      # R134C4-5: a restart between the set and the question
+                bad = ack_before_problem(args.gain_query_dir)
+                if bad:
+                    print(f"{bad}: no task sent")
+                    sys.exit(2)
         try:
             test_loop(args.ip, args.o1, allow_final_set=args.allow_final_set)
         except ValueError as exc:

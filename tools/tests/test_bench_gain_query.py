@@ -316,3 +316,12 @@ def test_gain_file_needs_gain_query(monkeypatch, capsys, tmp_path):
     with pytest.raises(SystemExit):
         B.main(['--out', 'x', '--run', 'a=b', '--gain-query', '--gain-file', str(tmp_path / 'none.json')])
     assert 'không có file' in capsys.readouterr().err
+
+
+def test_c4_5_bench_stops_when_the_ack_is_of_another_boot(tmp_path, monkeypatch):
+    """R134C4-5: an ESP32 restart between the set and the question before: the run is not started."""
+    a, order, code = _gain_bench(monkeypatch, tmp_path, ACK.replace('4753dc47', '0badf00d'))
+    assert code == 2 and order == ['set', 'q_before'], order
+    s = json.load(open(os.path.join(a.out, 'session.json'), encoding='utf-8'))
+    rec = s['runs'][0]
+    assert rec['gain_ack']['boot'] == '0badf00d' and 'khoi dong lai sau khi dat gain' in rec['gain_ack']['problem']

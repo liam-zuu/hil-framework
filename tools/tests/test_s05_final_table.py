@@ -11,6 +11,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import s05_final_table as T  # noqa: E402
+import rq3_log as rl  # noqa: E402  (R134C4-2: the table runs the log's row checks)
 
 COLS = ['timestamp_us', 'tick', 'log_seq', 'motor_on', 'run_active'] + list(T.WHEELS)
 
@@ -219,8 +220,19 @@ def write_run(base, uid, platform, stage, ctrl, task, gain_set_id, outcome, e_pe
     L.off(30)
     L.on(1001 + 3, zigzag) if tv_ok else (L.on(400, zigzag), L.off(5, after_on=True), L.on(601 + 3, zigzag))
     write_log(d, L.rows, boots=boots)
-    return dict(run_uid=uid, platform=platform, stage=stage, controller=ctrl, trajectory=task,
-                gain_set_id=gain_set_id, run_outcome=outcome, results_dir=d)
+    # R134C4-2: the log row as rq3_log writes it (the table runs its row checks): campaign, the gate columns of a
+    # judged run (FAKE gate agreeing with the outcome; a car run: camera gate), both boots of a judged car /
+    # final_hil run
+    row = dict.fromkeys(rl.TUNING_COLS, '')
+    row.update(run_uid=uid, platform=platform, stage=stage, controller=ctrl, trajectory=task, gain_set_id=gain_set_id,
+               run_outcome=outcome, results_dir=d, fail_cause='mat_khung' if outcome == 'hong_he_do' else '',
+               campaign='RQ2' if stage == 'final_hil' else gain_set_id.split('/')[0])
+    if outcome in T.VALID:
+        g = rl.fake_gate(e_trk=0.5 if outcome == 'khong_dat' else 0.03,
+                         completed='inconclusive' if outcome == 'chua_ket_luan' else 'true')
+        row.update(rl.gate_columns(rl.floor_gate(g) if platform == 'HW' else g))
+        row.update(boot_before='4753dc47', boot_after='4753dc47')
+    return row
 
 
 def test_table_cells_medians_and_reasons(tmp_path):
@@ -578,3 +590,70 @@ def test_b81_16_not_finite_is_no_number(bad):
     cell = [t for t in T.build_table(runs) if t['condition'] == 'O1-F05' and t['platform'] == 'HIL'
             and t['gain_set'] == 'A' and t['quantity'] == 'e_perp_max'][0]
     assert cell['n_m'] == 1 and cell['max'] == 0.05 and 'a: gia tri khong huu han' in cell['missing']
+
+
+# ---------------------------------------------------------------- Codex Sol round 4 (CODE_R134)
+
+def _table_ds(tmp_path, runs):
+    ds = tmp_path / 'ds'
+    os.makedirs(ds, exist_ok=True)
+    with open(ds / 'm7_tuning_log.csv', 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=list(runs[0]))
+        w.writeheader()
+        w.writerows(runs)
+    return str(ds)
+
+
+@pytest.mark.parametrize('cut, match', [
+    (dict(gate_version=''), 'without gate columns'),          # a judged car row without its camera gate
+    (dict(boot_before='', boot_after=''), 'missing'),         # without the two boots
+])
+def test_c4_2_table_refuses_rows_the_log_refuses(tmp_path, capsys, cut, match):
+    """R134C4-2: the table runs the row checks of rq3_log summary; a row without its evidence stops it."""
+    r = write_run(tmp_path, 'r1', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', 0.02)
+    if 'gate_version' in cut:
+        r.update({c: '' for c in rl.GATE_COLS})
+    else:
+        r.update(cut)
+    ds = _table_ds(tmp_path, [r])
+    assert T.main(['table', '--dataset', ds, '--out', str(tmp_path / 'out')]) == 2
+    assert match in capsys.readouterr().out
+
+
+def test_c4_2_final_hil_without_boots_and_rows_outside_the_campaigns(tmp_path, capsys):
+    h = write_run(tmp_path, 'h1', 'HIL', 'final_hil', 'PID', 'O1-F05', 'RQ2-INIT-PID/G00', 'dat', 0.02)
+    ds = _table_ds(tmp_path, [dict(h, boot_after='')])
+    assert T.main(['table', '--dataset', ds, '--out', str(tmp_path / 'o1')]) == 2
+    capsys.readouterr()
+    c = write_run(tmp_path, 'c1', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', 0.02)
+    old = dict(c, campaign='', run_uid='OLD:1')
+    runs, problems = T.load_runs(_table_ds(tmp_path, [c, old]), 'score.json', 'esp32.csv')
+    assert [r['run_uid'] for r in runs] == ['c1'] and any('OLD:1' in p and 'ngoai cac chien dich' in p
+                                                          for p in problems)
+
+
+def test_c4_6_cat_t1_counted_per_cell(tmp_path):
+    """R134C4-6, O1 3.5 R2V-4: runs khong_dat by the exception before t1 are counted in their cell."""
+    r = write_run(tmp_path, 'v1', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'khong_dat', 0.12)
+    g = rl.floor_gate(rl.fake_gate(e_trk=0.5), t_done=(None, None))
+    g['g1'].update(t1=6.0, cat_t1=True, state='chua_ket_luan', q='inconclusive')
+    g.update(rl.o1_gate.evaluate_outcomes(g, g['decide']))
+    r.update(rl.gate_columns(g), fail_cause=rl.VIOL_BEFORE)
+    p = write_run(tmp_path, 'v2', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'khong_dat', 0.12)
+    runs, _ = T.load_runs(_table_ds(tmp_path, [r, p]), 'score.json', 'esp32.csv')
+    cell = [t for t in T.build_table(runs) if (t['condition'], t['platform'], t['gain_set'], t['quantity'])
+            == ('O1-F05', 'xe', 'A', 'e_perp_max')][0]
+    assert cell['n_valid'] == 2 and cell['n_cat_t1'] == 1
+
+
+def test_c4_5_an_ack_is_checked_even_with_id_0(tmp_path):
+    """R134C4-5: a set applied, then an ESP32 restart: the run's '#gain' has id 0 and the queries the new boot;
+    the ack of the older boot is still checked. Without an ack, id 0 (built-in set) needs none."""
+    L = _clean()
+    ev = [x.replace('id=7', 'id=0').replace('applied_n=1', 'applied_n=0') for x in start_events(_first(L))]
+    r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), events=ev, ack=_ack('0badf00d'))
+    assert r['tv_duty'] is None and 'khoi dong lai sau khi dat gain' in r['reason']
+    r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), events=ev, ack=_ack())       # same boot, but id 7 != 0
+    assert r['tv_duty'] is None and 'bo gain khac' in r['reason']
+    r = T.tv_duty_esp32(L.rows, 10.0, queries=_qs(), events=ev, ack=None)
+    assert r['tv_duty'] == pytest.approx(4.0), r['reason']

@@ -565,9 +565,9 @@ def gate_g1_fields(g1: dict, platform: Optional[str] = None) -> Optional[dict]:
         raise LogError(f'gate g1 t_done: {ways} way(s) on platform {platform!r} (floor 2, fwsim / HIL 1; O1 3.5)')
     t_dl = _time(g1.get('t_deadline'), 'g1 t_deadline', null_ok=False)
     t_done = [_time(t, 'g1 t_done') for t in td]
-    if any(t is not None and t > t_dl for t in t_done):
-        raise LogError(f'gate g1 t_done {t_done!r} after t_deadline {t_dl!r} (a time is given only when completed '
-                       'before the deadline)')
+    if any(t is not None and t >= t_dl for t in t_done):              # R134C4-4: O1 3.4 (4) strictly before
+        raise LogError(f'gate g1 t_done {t_done!r} not before t_deadline {t_dl!r} (a time is given only when '
+                       'completed strictly before the deadline, O1 3.4 condition 4)')
     t1 = _time(g1.get('t1'), 'g1 t1')
     prog = _opt_bool(g1.get('prog_before_t1'), 'g1 prog_before_t1')
     c25 = _opt_bool(g1.get('cond25_before_deadline'), 'g1 cond25_before_deadline')
@@ -863,10 +863,15 @@ def gate_columns(gate: dict, gate_sha256: str = '') -> dict:
 def viol_before_problem(outcome: str, fail_cause: str, gate: Optional[dict]) -> Optional[str]:
     """O1 3.5 R2V-4 (B81-3): the floor exception before t1 is khong_dat with fail cause VIOL_BEFORE and a gate whose
     G1 has cat_t1 true; one without the other is an error."""
-    cat = bool(((gate or {}).get('g1') or {}).get('cat_t1'))
+    g1 = (gate or {}).get('g1') or {}
+    cat = bool(g1.get('cat_t1'))
     if cat != (fail_cause == VIOL_BEFORE) or (cat and outcome != 'khong_dat'):
         return (f'cat_t1 {cat} with outcome {outcome!r}, fail cause {fail_cause!r}: the floor exception before t1 is '
                 f'khong_dat with fail cause {VIOL_BEFORE} and cat_t1 true (O1 3.5 R2V-4), and only that')
+    floor = isinstance(g1.get('t_done'), list) and len(g1['t_done']) == 2
+    if floor and g1.get('t1') is not None and not cat and outcome in VALID:          # R134C4-3
+        return (f'floor run with t1 {g1.get("t1")!r} (tracking error or a gap above t_trong) and no violation '
+                f'before it (cat_t1 false): a run lost to the measurement, hong_he_do, not {outcome} (O1 3.5)')
     return None
 
 
@@ -991,17 +996,28 @@ def boot_problem(before, after) -> Optional[str]:
 def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Optional[float] = None,
         fail_cause: str = '', results_dir: str = '', notes: str = '', gate: Optional[dict] = None,
         gate_sha256: str = '', boot_before: Optional[str] = None, boot_after: Optional[str] = None,
-        query_problem: Optional[str] = None) -> dict:
+        query_problem: Optional[str] = None, queries: Optional[tuple] = None) -> dict:
     """query_problem (R134C3-3): why the two query answer files given on the command line are not two
-    questions before and after the run (gain_line_check.query_problem); handled as missing / different boot."""
+    questions before and after the run (gain_line_check.query_problem); handled as missing / different boot.
+    queries (R134C4-1): the two answers as read by gain_line_check.read_query (before, after; None = missing);
+    end checks them itself (query_problem, without the run's boot) and takes boot_before / boot_after from them.
+    A judged car / final_hil run needs them: two boot strings alone do not show two questions."""
     run = _require_open(ds)
     if outcome not in OUTCOMES:
         raise LogError(f'--outcome one of {OUTCOMES}')
     plat, stage = run['row'].get('platform'), run['row'].get('stage')
+    if queries is not None:                            # R134C4-1: the two answers checked here, not by the caller
+        import gain_line_check as glc
+        qb, qa = queries
+        query_problem = query_problem or glc.query_problem(qb, qa, check_run_boot=False)
+        boot_before, boot_after = (qb or {}).get('boot', ''), (qa or {}).get('boot', '')
     asked = boot_before is not None or boot_after is not None or query_problem is not None
     bbad = query_problem or (boot_problem(boot_before, boot_after) if asked else None)
     if not asked and (fail_cause == BOOT_FAIL or (outcome in VALID and boot_needed(plat, stage))):
         bbad = boot_problem('', '')                    # R134C2-7, B81-2: no answer at all = both missing
+    if not bbad and queries is None and outcome in VALID and boot_needed(plat, stage):
+        bbad = ('the two query answers (gain_send --query outputs read by gain_line_check.read_query) not given: '
+                'two boot strings do not show two questions (R134C4-1)')
     if bbad and not (outcome == 'hong_he_do' and fail_cause == BOOT_FAIL):   # R134 (b)
         raise LogError(f'{bbad}: a run failed by operation, outcome hong_he_do with fail cause {BOOT_FAIL} '
                        '(S05 4.7 (iv), R3V-9)')
@@ -1677,6 +1693,12 @@ def fake_gate(e_trk: float = 0.03, mapped: bool = True, completed: str = 'true')
                                decide=o1_gate.DECIDE_ALL if mapped else o1_gate.DECIDE_HIL, note='FAKE'))
 
 
+def fake_queries(boot: str = '4753dc47', mac: str = 'aa:bb', t0: float = 0.0) -> tuple:
+    """FAKE (demo and tests only): two read_query answers of one boot, asked one after the other (R134C4-1)."""
+    return tuple(dict(boot=boot, mac=mac, _t_start=t0 + a, _t_end=t0 + b, _path=f'FAKE_{w}')
+                 for w, a, b in (('before', 1.0, 2.0), ('after', 3.0, 4.0)))
+
+
 def floor_gate(g: dict, t_done=None, t_deadline: float = 20.0) -> dict:
     """FAKE (demo and tests only): a one-domain gate of o1_gate dressed as a camera scorer output (B81-3): the
     common domain set equal to the union, the two t_done given (default from the G1 state: dat both 10 s, khong_dat
@@ -1725,7 +1747,7 @@ def demo(out_dir: str, seed: int = 1) -> List[dict]:
             end(out_dir, 'khong_dat' if i else 'hong_he_do', completed=1, e_perp_max=0.12 + i / 100,
                 fail_cause='' if i else 'mat_khung_FAKE', results_dir=f'results/FAKE/a1_{i}' if i else '',
                 gate=floor_gate(fake_gate(e_trk=0.5)) if i else None,      # B81-1: a judged car run, camera gate
-                boot_before='4753dc47' if i else None, boot_after='4753dc47' if i else None)   # B81-2
+                queries=fake_queries() if i else None)                    # B81-2, R134C4-1
         gfile = os.path.join(out_dir, 'FAKE_gain_G00.json')
         with open(gfile, 'w', encoding='utf-8', newline='\n') as f:
             f.write('{"FAKE": true, "kp_xy": 1.0, "ki_xy": 0.5, "kp_wz": 1.0, "ki_wz": 0.2, '
@@ -1754,7 +1776,7 @@ def demo(out_dir: str, seed: int = 1) -> List[dict]:
             step(out_dir, 'run')
             tick(75)
             end(out_dir, 'dat', completed=1, e_perp_max=0.05, results_dir=f'results/FAKE/fh_{k}', gate=fake_gate(),
-                boot_before='4753dc47', boot_after='4753dc47')            # B81-2: final_hil asks the boot too
+                queries=fake_queries())                                   # B81-2: final_hil asks the boot too
         lost = None
         # final on the car; the lost run is replaced. The chua_ket_luan run: one way of using the frames did not
         # complete (suspect frames as gaps), so G1 is inconclusive and the two frame domains differ (B81-3)
@@ -1766,7 +1788,7 @@ def demo(out_dir: str, seed: int = 1) -> List[dict]:
             tick(60)
             row = end(out_dir, o, completed=1, e_perp_max=0.10, fail_cause='mat_khung_FAKE' if o == 'hong_he_do' else '',
                       results_dir='' if o == 'hong_he_do' else f'results/FAKE/f1_{o}', gate=car_gate.get(o),
-                      boot_before='4753dc47', boot_after='4753dc47')   # R134: judged with its gate, boot asked
+                      queries=fake_queries())   # R134: judged with its gate, boot asked
             if o == 'hong_he_do':
                 lost = row['run_uid']
         gate_path = os.path.join(out_dir, 'FAKE_gate.csv')            # stands for the gate locked at C8
@@ -1885,9 +1907,7 @@ def main(argv=None) -> int:
                                'outputs around the run; S05 4.7 (iv), R3V-9, O1 R4)')
             if a.query_before or a.query_after:
                 import gain_line_check as glc            # R134C3-3: the checks of the two answers, as the scorers do
-                qb, qa = glc.read_query(a.query_before), glc.read_query(a.query_after)
-                boots = dict(boot_before=(qb or {}).get('boot', ''), boot_after=(qa or {}).get('boot', ''),
-                             query_problem=glc.query_problem(qb, qa, check_run_boot=False))
+                boots = dict(queries=(glc.read_query(a.query_before), glc.read_query(a.query_after)))   # R134C4-1
             row = end(ds, a.outcome, a.completed, a.e_perp_max, a.fail_cause, a.results_dir, a.notes,
                       gate=read_gate_json(a.gate_json) if a.gate_json else None,
                       gate_sha256=sha256_file(a.gate_json) if a.gate_json else '', **boots)
