@@ -54,6 +54,8 @@ gate_v3 block also holds
   cond2_5_ever of evaluate_v7 / evaluate_k, the same comparisons that give 'completed'); they are copied here.
   g2..g5 'chung' {q, lo, hi, n_undef}: the common frame domain, equal to the union one on HIL (one way, O1 3.3).
   G1 is recomputed from these fields (as rq3_log.gate_g1_state) and must agree with g1.state, else exit 2.
+  Times are written >= 0: a time within G1_T_NEG_TOL below 0 (the first scored frame after the mapped edge,
+  rounding of the k0 choice) is written 0.0, one further below is an error (Codex B813-R1-1).
   Short log (L85 Q1 turned 'false' into 'inconclusive'): the fields cannot say "not known", so none is written
   (all null, g1_fields_note says why; G1 stays chua_ket_luan from q; Liam 15/11 CODE_RS4 local_3b1a170b,
   "Không ghi số chi tiết (Recommended)").
@@ -162,9 +164,23 @@ def tool_error(manifest, mosi, allow_pre_b81_15=False):
 G1_FIELDS = ('t_done', 't_deadline', 't1', 'prog_before_t1', 'cond25_before_deadline')   # B81-3, one way (HIL)
 
 
+G1_T_NEG_TOL = 1e-9                    # s: t of the first scored frame may be below 0 by rounding (B813-R1-1)
+
+
 def _opt_time(x):
     """A finite time, else None (the evaluators write NaN for 'none')."""
     return float(x) if x is not None and not isinstance(x, bool) and math.isfinite(float(x)) else None
+
+
+def _g1_time(t):
+    """A time written in a B81-3 field (rq3_log wants >= 0). With the edge mapped, k0 = ceil(a - 1e-9) so the
+    first scored frame has t = (k0 - a) x period >= -1e-9 x period (about -1e-12 s): such a time is that frame at
+    t = 0 and is written 0.0 (Codex B813-R1-1); a time further below 0 is an error. None stays None."""
+    if t is None or t >= 0.0:
+        return t
+    if t >= -G1_T_NEG_TOL:
+        return 0.0
+    raise ValueError(f'B81-3: time {t!r} s below 0 (more than the rounding of the k0 choice)')
 
 
 def g1_state_from_fields(g1):
@@ -188,9 +204,9 @@ def add_b81_3(gate, out):
         return gate
     t1 = _opt_time(out.get('t_first_track_err'))
     t_prog = _opt_time(out.get('t_progress'))
-    g1.update(t_deadline=float(out['t_deadline']),
-              t_done=[float(out['t_end']) if out.get('completed') == 'true' else None], t1=t1,
-              prog_before_t1=None if t1 is None else bool(t_prog is not None and t_prog < t1),
+    g1.update(t_deadline=_g1_time(float(out['t_deadline'])),
+              t_done=[_g1_time(float(out['t_end'])) if out.get('completed') == 'true' else None], t1=_g1_time(t1),
+              prog_before_t1=None if t1 is None else bool(t_prog is not None and t_prog < t1),   # evaluator times
               cond25_before_deadline=None if t1 is None else bool(out['cond2_5_ever']))
     st = g1_state_from_fields(g1)
     if st != g1['state']:

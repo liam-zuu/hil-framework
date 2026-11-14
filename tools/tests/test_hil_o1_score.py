@@ -327,6 +327,44 @@ def test_b81_3_fields_from_the_evaluator_summary(completed, t_first, t_prog, c25
         assert rl.gate_g1_state(f) == g1['state']
 
 
+def test_b81_3_time_just_below_zero_is_the_first_frame():
+    """Codex B813-R1-1: edge mapped at step 400.00000000000216 -> k0 = 400, t(k0) = -2.16e-15 s; a tracking error
+    on that frame gave t1 < 0, refused by rq3_log (times >= 0). Within G1_T_NEG_TOL it is written 0.0; further
+    below 0 is an error."""
+    a = 400.00000000000216
+    k0 = int(math.ceil(a - 1e-9))
+    t_first = (k0 - a) * 1e-3
+    assert k0 == 400 and -H.G1_T_NEG_TOL <= t_first < 0.0
+    out = dict(completed='false', t_end=11.9, t_deadline=12.0, t_first_track_err=t_first, t_progress=NAN,
+               cond2_5_ever=False, log_covers_deadline=True)
+    g1 = H.add_b81_3(_gate_stub('false'), out)['g1']
+    assert g1['t1'] == 0.0 and g1['prog_before_t1'] is False and g1['cond25_before_deadline'] is False
+    assert g1['state'] == 'khong_dat'
+    rl = _rq3_new()
+    if rl is not None:
+        f = rl.gate_g1_fields(json.loads(json.dumps(H._json_safe(g1))), 'HIL')
+        assert rl.gate_g1_state(f) == 'khong_dat'
+    # progress at the same (negative) time as t1 is not before it: compared on the evaluator's own times
+    out.update(t_progress=t_first, completed='false')
+    assert H.add_b81_3(_gate_stub('false'), out)['g1']['prog_before_t1'] is False
+    out.update(t_first_track_err=-1e-6)
+    with pytest.raises(ValueError, match='B81-3: time .* below 0'):
+        H.add_b81_3(_gate_stub('false'), out)
+    assert H._g1_time(None) is None and H._g1_time(0.0) == 0.0 and H._g1_time(-H.G1_T_NEG_TOL) == 0.0
+
+
+def test_b81_3_k1_run(tmp_path):
+    """K1 (evaluate_k path, Codex B813-R1-2): the car on the command point completes; G1 fields and chung."""
+    from test_gate_v3_tools import write_k_frame_log
+    p = str(tmp_path / 'k1.npz')
+    write_k_frame_log(p, 'O1-K1', 0.0)
+    out = H.score(p, 'O1-K1', allow_final_set=True)
+    g = out['gate_v3']
+    assert out['completed'] == 'true' and g['g1']['state'] == 'dat'
+    assert g['g1']['t_done'] == [out['t_end']] and g['g1']['t1'] is None
+    _check_b81_3_common(g)
+
+
 @pytest.mark.parametrize('completed,t_first,t_prog,c25', [
     ('true', 6.0, 7.0, True),           # completed although progress came after t1: the evaluator never says so
     ('inconclusive', NAN, 5.0, True),
@@ -355,3 +393,9 @@ def test_b81_3_gate_accepted_by_rq3_log_b81_3(tmp_path):
     write_frame_log_tmap(p, 'O1-F05', _jump_ahead)
     js = json.loads(json.dumps(H._json_safe(H.score(p, 'O1-F05'))))
     rl.validate_gate(js['gate_v3'], 'HIL')
+    from test_gate_v3_tools import write_k_frame_log                 # K1, K2 (Codex B813-R1-2)
+    for task, yaw in (('O1-K1', 0.0), ('O1-K2', 0.0), ('O1-K1', 0.2)):
+        p = str(tmp_path / f'{task}_{yaw}.npz')
+        write_k_frame_log(p, task, yaw)
+        js = json.loads(json.dumps(H._json_safe(H.score(p, task, allow_final_set=True))))
+        rl.validate_gate(js['gate_v3'], 'HIL')
