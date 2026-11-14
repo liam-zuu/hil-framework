@@ -164,34 +164,68 @@ def test_scale_is_the_frame_integer_operation(fw):
     assert np.array_equal(fi[inside][:, 3:7], fi[inside][:, 8:12])         # accel, yaw untouched
 
 
+class _ArgRec:
+    """Records the arguments fwsim really passes to the firmware (Codex FI2-7), not the wrapper's own rows."""
+    def __init__(self, f):
+        self.f, self.reports, self.ticks = f, {}, []
+
+    def __getattr__(self, n):
+        return getattr(self.f, n)
+
+    def imu_report(self, kind, t_us, v):
+        self.reports[(int(t_us), kind)] = v
+        return self.f.imu_report(kind, t_us, v)
+
+    def tick(self, t_us, counts, sp):
+        self.ticks.append((int(t_us), [int(c) for c in counts]))
+        return self.f.tick(t_us, counts, sp)
+
+
 def test_pi_and_fwsim_give_the_same_integers(fw):
-    """Design 9.4, Codex FI1-11: the true IMU values of a real fault_run (what fwsim computed before the
-    fault) go through the Pi path (encode_state + FramePatcher, one frame per 1 ms step); the int16 the Pi
-    sends equals the int16 of what the fwsim wrapper gave the firmware, for gyro_scale and imu_delay; for
-    enc_loss the counts given to the firmware stop exactly inside the window and follow the true counts
-    outside it."""
+    """Design 9.4, Codex FI1-11, FI2-7: the true IMU values of a real fault_run (what fwsim computed before
+    the fault) and the real plant state of every 1 ms step (wheels turning) go through the Pi path
+    (encode_state + FramePatcher, one frame per step). (1) IMU: firmware_view of the int16 the Pi sends
+    equals what fw.imu_report() really got, for gyro_scale and imu_delay. (2) Wheels: the Pi frame has
+    omega 0 for RL exactly inside the window, the true omega (not 0) for RL outside and for the other wheels
+    always; fw.tick() really got counts that stop for RL inside the window and follow the true ones before."""
+    from hil_node import plant_to_frame_state
+    from imu_model import firmware_view
     from protocol import IMU_RANGES, encode_state
     s = sched('S1,gyro_scale,gz,1000,2500,s=0.3\nD1,imu_delay,imu,2000,3000,d_ms=100\n'
               'E1,enc_loss,RL,1500,2500,\n')
-    log = run(fw, s, duration=3.5)
+    rec = _ArgRec(fw)
+    ff = fault_run.FwsimFaults(s)
+    log = ff.run(rec, _sp, 3.5, MecanumParams(), imu=dict(IMU), mode='PID')
     fi = log['fault_imu']
     rep = {int(round(t * 1000)): row for t, row in zip(fi[:, 0], fi)}
     p = fs.FramePatcher(s)
     p.start(0)
-    blank = encode_state([0.0] * 10, imu=(0, 0, 0, 0, 0), imu_seq=1)
-    n_checked = 0
+    n_checked = enc_in = 0
     for k in range(3500):
         row = rep.get(k)
-        true = encode_state([0.0] * 10, imu=tuple(row[2:7]), imu_seq=k % 255 + 1) if row is not None else blank
+        state = plant_to_frame_state(list(ff.X[k]))             # state x_k of step k, wheels turning
+        imu = tuple(row[2:7]) if row is not None else (0.0,) * 5
+        true = encode_state(state, imu=imu, imu_seq=k % 255 + 1)
         sent = p.patch(k, true)
+        w_true = [int.from_bytes(true[2 * i:2 * i + 2], 'big', signed=True) for i in range(4)]
+        w_sent = [int.from_bytes(sent[2 * i:2 * i + 2], 'big', signed=True) for i in range(4)]
+        if 1500 <= k < 2500:
+            assert w_sent == w_true[:2] + [0] + w_true[3:], k
+            enc_in += w_true[2] != 0
+        else:
+            assert w_sent == w_true, k
         if row is None:
             continue
         pi = [int.from_bytes(sent[o:o + 2], 'big', signed=True) for o in (22, 31, 33, 35, 37)]
-        fw_ = [_to_int16(v, r) for v, r in zip(row[7:12], IMU_RANGES)]
-        assert pi == fw_, k
+        gz, acc, yaw_deg = firmware_view(tuple(v / 32767.0 * r for v, r in zip(pi, IMU_RANGES)))
+        assert rec.reports[(k * 1000, 'gyro')] == gz, k
+        assert tuple(rec.reports[(k * 1000, 'accel')]) == acc, k
+        assert rec.reports[(k * 1000, 'rv')] == yaw_deg, k
         n_checked += 1
     assert n_checked == 69                                  # 20 Hz reports, 50 ms .. 3450 ms
+    assert enc_in > 500                                     # RL really turns inside the window (int16 != 0)
     ft = log['fault_tick']                                  # t, mask, true x4, sent x4 (wheel RL = 2)
+    assert [c for _, c in rec.ticks] == ft[:, 6:10].astype(int).tolist()   # what fw.tick() really got
     d_true, d_sent = np.diff(ft[:, 4]), np.diff(ft[:, 8])
     t1 = ft[1:, 0]
     inside = (t1 > 1.5) & (t1 <= 2.5)                       # tick interval (t - 10 ms, t] inside [1500, 2500)
@@ -208,9 +242,10 @@ def test_pi_and_fwsim_give_the_same_integers(fw):
 
 
 def test_noise_off_paths_are_simulate_paths(fw):
-    """Codex FI1-5: with the IMU noise off, an empty schedule and an encoder/IMU-loss schedule leave the IMU
-    path of simulate as it is (no firmware_view): the empty one is bit identical, the enc_loss one has the
-    same IMU columns up to its window."""
+    """Codex FI1-5, FI2-4: with the IMU noise off, an empty schedule and an encoder/IMU-loss schedule leave
+    the IMU path of simulate as it is (no firmware_view): the empty one is bit identical, the enc_loss one has
+    the same IMU columns up to its window; a delay / scale row with the noise off is refused; with the noise
+    on, a delay / scale run equals its baseline up to the window."""
     imu = dict(rate_hz=20.0)
     a = fwsim.simulate(fw, _sp, 4.0, MecanumParams(), imu=dict(imu), mode='PID')
     b = run(fw, fs.Schedule(()), duration=4.0, imu=imu)
@@ -220,8 +255,21 @@ def test_noise_off_paths_are_simulate_paths(fw):
     c = run(fw, sched('E1,enc_loss,FL,2000,3000,\n', run_ms=4000), duration=4.0, imu=imu)
     before = a['t'] < 2.0
     assert np.array_equal(a['imu'][before], c['imu'][before])
-    d = run(fw, sched('S1,gyro_scale,gz,2000,3000,s=0.3\n', run_ms=4000), duration=4.0, imu=imu)
-    assert d['fault_imu'].shape[0] == 80                    # wrapped: one row per report
+    # Codex FI2-4: delay / scale with the noise off would change the IMU path of the whole run: refused
+    for body in ('S1,gyro_scale,gz,2000,3000,s=0.3\n', 'D1,imu_delay,imu,2000,3000,d_ms=100\n'):
+        with pytest.raises(ValueError, match='noise on'):
+            run(fw, sched(body, run_ms=4000), duration=4.0, imu=imu)
+        assert fwsim.plant_step is fault_run._REAL_PLANT_STEP
+    # with the noise on, a scale / delay run and its baseline share the IMU path up to the window
+    base = run(fw, fs.Schedule(()), duration=4.0)
+    for body in ('S1,gyro_scale,gz,2000,3000,s=0.3\n', 'D1,imu_delay,imu,2000,3000,d_ms=100\n'):
+        e = run(fw, sched(body, run_ms=4000), duration=4.0)
+        before = base['t'] < 2.0
+        for key in ('imu', 'v_fw', 'count', 'duty'):
+            assert np.array_equal(base[key][before], e[key][before], equal_nan=True), (body, key)
+        fb, fe = base['fault_imu'], e['fault_imu']
+        rb = fb[:, 0] < 2.0
+        assert np.array_equal(fb[rb], fe[fe[:, 0] < 2.0])
 
 
 def test_cli_baseline_and_fault_run(tmp_path):

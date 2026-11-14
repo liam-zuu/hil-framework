@@ -442,7 +442,10 @@ def resolve_swa(swa: str, finite_run: bool, n_omega_modes: int, traj_kind: str, 
 
 def main() -> int:
     args = _parse_args()
-    if args.faults and (args.jitter_only or args.loopback_test):
+    if args.faults is not None and not args.faults.strip():
+        # Codex FI2-3: '--faults ""' is a flag given with no file, not "no --faults"
+        raise SystemExit('--faults needs a schedule file (empty path given)')
+    if args.faults is not None and (args.jitter_only or args.loopback_test):
         # Codex FI1-3: both modes return before the schedule is read (and the loopback opens the SPI)
         raise SystemExit('--faults excludes --jitter-only and --loopback-test')
 
@@ -550,7 +553,7 @@ def main() -> int:
         control.beat(time.monotonic_ns())
     hil_cfg.swa_mode = resolve_swa(args.swa, args.finite_run, n_modes, args.traj, args.no_traj)
     log.info('SWA (I8): --swa %s -> %s', args.swa, hil_cfg.swa_mode)
-    if args.faults:
+    if args.faults is not None:
         hil_cfg.faults = load_faults(args, n_modes, hil_cfg, load_rows is not None)
         log.info('Faults (L82): %s sha256=%s, %d rows', args.faults, hil_cfg.faults.sha256,
                  len(hil_cfg.faults.rows))

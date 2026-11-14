@@ -23,7 +23,13 @@ Checks (all must hold for ok):
      empty frame; the manifest counts must agree (FI1-8);
   7. truth self-check (FI1-9): seq byte of every true frame = k mod 256; with the plant IMU and no noise,
      int16 yaw = int16 theta and gz = wz within half a step of each scale;
-  8. step log (FI1-10): every step of the frame log present, no missed deadline, nothing lost or torn.
+  8. step log (FI1-10, FI2-6): every step of the frame log present once and in rising order, every miss
+     0 or 1 and none 1, its .json rows = CSV rows and lost_or_torn, overflow present as int 0;
+  9. the run ended the normal way (FI1-4): stop_reason 'max_steps' with n = max_steps without phases;
+     with phases last phase END, outcome not error:..., END tail complete, stop_reason = outcome;
+  10. the frame arrays (mosi, mosi_true, miso, t_send_ns) have the same number of rows, the three frame
+     arrays the same width, manifest steps = n, MISO checked = n - MISO_SKIP_FRAMES (FI2-5); the lifecycle
+     transitions are typed strictly, in phase order, inside the log (FI2-2).
 Exit 0 = ok, 1 = a check failed, 2 = the input cannot be checked. Writes fault_check.json.
 
 Assumptions (stated by the author, to be checked): frame k of the log is step k of the loop, and the
@@ -37,7 +43,7 @@ import csv
 import json
 import os
 import sys
-from decimal import ROUND_HALF_UP, Decimal, localcontext
+from decimal import ROUND_HALF_UP, Decimal, Inexact, localcontext
 from fractions import Fraction
 
 import numpy as np
@@ -48,6 +54,7 @@ from fault_schedule import FAULT_IMU_LOSS, file_sha256, parse, rows_as_json   # 
 from protocol import (IMU_RANGES, MISO_CRC_BAD, MISO_EMPTY, OFS_FAULT, OFS_IMU_ACC, OFS_IMU_GZ,   # noqa: E402
                       OFS_IMU_YAW, OFS_SEQ, STATE_RANGES, miso_check)
 from hil_node import MISO_SKIP_FRAMES                                          # noqa: E402
+from run_lifecycle import _PHASES as PHASES                                    # noqa: E402
 
 WHEEL_IDX = {'FL': 0, 'FR': 1, 'RL': 2, 'RR': 3}
 WHY_RANK = {'off': 0, 'on': 1, 'cut': 2}
@@ -56,12 +63,21 @@ OFS_THETA, OFS_WZ = 12, 18                     # int16 theta, wz of [w1..w4, x, 
 
 def ref_scale(raw: int, s) -> int:
     """Reference for gyro_scale, apart from fault_schedule.scale_raw: Decimal arithmetic on the exact value
-    of s, ROUND_HALF_UP on the magnitude (= half away from zero), int16 clamp."""
+    of s, ROUND_HALF_UP on the magnitude (= half away from zero), int16 clamp. The precision is sized from
+    the input (a decimal num/den, den = 2^a 5^b, has at most digits(num) + max(a, b) significant digits) and
+    Inexact is trapped, so no step rounds before the final one, whatever the length of s (Codex FI2-1); an s
+    that is not a finite decimal raises ValueError (exit 2)."""
     fr = s if isinstance(s, Fraction) else Fraction(repr(float(s)))
+    nd = len(str(abs(fr.numerator))) + 4 * len(str(fr.denominator)) + len(str(abs(int(raw)))) + 4
     with localcontext() as ctx:
-        ctx.prec = 60
-        sd = Decimal(fr.numerator) / Decimal(fr.denominator)
-        v = (Decimal(1) - sd) * Decimal(raw)
+        ctx.prec = nd
+        ctx.traps[Inexact] = True
+        try:
+            sd = Decimal(fr.numerator) / Decimal(fr.denominator)
+            v = (Decimal(1) - sd) * Decimal(raw)
+        except Inexact:
+            raise ValueError(f'gyro_scale s={fr} is not a finite decimal') from None
+        ctx.traps[Inexact] = False                     # the final rounding to a whole number is meant
         m = abs(v).quantize(Decimal(1), rounding=ROUND_HALF_UP)
     r = int(m) if v >= 0 else -int(m)
     return max(-32767, min(32767, r))
@@ -101,10 +117,11 @@ def expected_sent(rows, k, t0, stop, true_frames) -> bytes:
 
 def expected_events(rows, t0, stop, n_frames):
     """([[k_rel, id, 1/0, why], ...] sorted by (k, off < on < cut, id), not_run ids). The run ends at the
-    stop step, or after the last frame."""
+    stop step, or after the last frame, whichever comes first: no event is taken as executed past the
+    frames of the log (Codex FI2-2)."""
     if t0 is None:
         return [], [r.id for r in rows]
-    end = (stop if stop is not None else n_frames) - t0
+    end = min(stop if stop is not None else n_frames, n_frames) - t0
     ev, not_run = [], []
     for r in rows:
         if r.start_ms >= end:
@@ -116,20 +133,61 @@ def expected_events(rows, t0, stop, n_frames):
     return ev, not_run
 
 
-def phases_t0_stop(man):
-    """(t0, stop) from the run phases: lifecycle transitions, or (0, None) without phases (FI1-2)."""
+def phases_t0_stop(man, n):
+    """(t0, stop, problem) from the run phases: lifecycle transitions, or (0, None, None) without phases
+    (FI1-2). The transitions are checked before use (Codex FI2-2): a list of {step, phase}, step a strict
+    int (no bool, no float), phase one of run_lifecycle's phases, phases in their order without repeat, steps
+    not falling, every step <= n (no phase change past the frames of the log). problem = None, or why the
+    phases cannot be used (then t0 = stop = None)."""
     lc = man.get('lifecycle')
     if lc is None:
-        return 0, None
+        return 0, None, None
+    trs = lc.get('transitions') if isinstance(lc, dict) else None
+    if not isinstance(trs, list):
+        return None, None, 'manifest lifecycle: no transitions list'
+    prev_step = prev_rank = None
+    for tr in trs:
+        if not (isinstance(tr, dict) and _is_int(tr.get('step')) and tr.get('phase') in PHASES):
+            return None, None, f'manifest lifecycle: bad transition {tr!r}'
+        rank = PHASES.index(tr['phase'])
+        if prev_rank is not None and (rank <= prev_rank or tr['step'] < prev_step):
+            return None, None, f'manifest lifecycle: transitions out of order at {tr!r}'
+        if not 0 <= tr['step'] <= n:
+            return None, None, f'manifest lifecycle: step {tr["step"]} outside the {n} frames of the log'
+        prev_step, prev_rank = tr['step'], rank
     t0 = stop = None
-    for tr in lc.get('transitions', []):
+    for tr in trs:
         if t0 is None:
             if tr['phase'] == 'RUN':
-                t0 = int(tr['step'])
+                t0 = tr['step']
         elif tr['phase'] != 'RUN':
-            stop = int(tr['step'])
+            stop = tr['step']
             break
-    return t0, stop
+    return t0, stop, None
+
+
+def run_end_problem(man, n):
+    """Codex FI1-4: None if the run ended the normal way, else why not. Without phases: stop_reason
+    'max_steps' and n = max_steps (an exception in HILNode.run writes stop_reason 'error:<name>'). With
+    phases (as HILNode.run_failed): the last phase is END, the outcome is not 'error:...', the END tail ran
+    in full, and stop_reason = the outcome (an exception, a signal or a full frame log after END rewrites
+    it)."""
+    reason = man.get('stop_reason')
+    lc = man.get('lifecycle')
+    if lc is None:
+        ms = man.get('max_steps')
+        if reason != 'max_steps' or not _is_int(ms) or ms <= 0 or n != ms:
+            return f'run did not end normally: stop_reason={reason!r}, max_steps={ms!r}, frames={n}'
+        return None
+    trs = lc.get('transitions') if isinstance(lc, dict) else None
+    trs = trs if isinstance(trs, list) else []
+    last = trs[-1].get('phase') if trs and isinstance(trs[-1], dict) else None
+    outcome = lc.get('outcome') if isinstance(lc, dict) else None
+    if (last != 'END' or not isinstance(outcome, str) or outcome.startswith('error:')
+            or man.get('swa_tail_complete') is not True or reason != outcome):
+        return (f'run did not end normally: last phase {last!r}, outcome {outcome!r}, stop_reason {reason!r}, '
+                f'END tail complete {man.get("swa_tail_complete")!r}')
+    return None
 
 
 def _is_int(x) -> bool:
@@ -183,20 +241,52 @@ def truth_self_check(man, true):
 
 
 def step_log_check(path, n):
-    """FI1-10: every step 0..n-1 in the step log, no 'miss', nothing lost or torn (its .json)."""
-    steps, misses = set(), 0
+    """FI1-10, Codex FI2-6: every step 0..n-1 in the step log, each once and in rising order, no step past
+    n-1; every 'miss' is the text 0 or 1 and none is 1; its .json has 'rows' = the CSV rows and the counters
+    'lost_or_torn', 'overflow' as int 0 (a missing counter is not taken as 0). problems = why it fails."""
+    steps, misses, bad_miss, order_bad, last_k = [], 0, 0, 0, None
     with open(path, newline='') as fh:
         for row in csv.DictReader(fh):
-            steps.add(int(row['step']))
-            misses += int(row['miss'])
-    missing = [k for k in range(n) if k not in steps]
-    meta = {}
+            st = row.get('step') or ''
+            k = int(st) if st.isascii() and st.isdigit() else None
+            if k is None or (last_k is not None and k <= last_k):
+                order_bad += 1
+            if k is not None:
+                last_k = k
+            steps.append(k)
+            m = row.get('miss')
+            if m not in ('0', '1'):
+                bad_miss += 1
+            misses += m == '1'
+    seen = {k for k in steps if k is not None}
+    missing = [k for k in range(n) if k not in seen]
+    extra = sum(1 for k in seen if k >= n)
+    meta = None
     if os.path.isfile(path + '.json'):
         with open(path + '.json') as fh:
             meta = json.load(fh)
-    return dict(file=path, rows=len(steps), missed_deadline=misses, steps_missing=len(missing),
-                first_missing=missing[0] if missing else None, json=bool(meta),
-                lost_or_torn=meta.get('lost_or_torn'), overflow=meta.get('overflow'))
+    meta_d = meta if isinstance(meta, dict) else {}
+    problems = []
+    if misses:
+        problems.append(f'{misses} steps missed their deadline')
+    if bad_miss:
+        problems.append(f'{bad_miss} rows with miss not 0/1')
+    if order_bad:
+        problems.append(f'{order_bad} rows with a step not a whole number or not rising (repeat or out of order)')
+    if missing or extra:
+        problems.append(f'{len(missing)} steps of the frame log missing, {extra} steps past the frame log')
+    if meta is None:
+        problems.append('no .json next to the step log')
+    else:
+        for key in ('lost_or_torn', 'overflow'):
+            if not (_is_int(meta_d.get(key)) and meta_d.get(key) == 0):
+                problems.append(f'.json {key}={meta_d.get(key)!r}, needs int 0')
+        if not (_is_int(meta_d.get('rows')) and meta_d.get('rows') == len(steps)):
+            problems.append(f'.json rows={meta_d.get("rows")!r} != {len(steps)} CSV rows')
+    return dict(file=path, rows=len(steps), missed_deadline=misses, bad_miss=bad_miss, order_bad=order_bad,
+                steps_missing=len(missing), first_missing=missing[0] if missing else None, steps_extra=extra,
+                json=meta is not None, lost_or_torn=meta_d.get('lost_or_torn'), overflow=meta_d.get('overflow'),
+                json_rows=meta_d.get('rows'), problems=problems)
 
 
 def check(npz_path: str, sched_path: str, step_log: str = None) -> dict:
@@ -211,14 +301,28 @@ def check(npz_path: str, sched_path: str, step_log: str = None) -> dict:
         raw = fh.read()
     rows = parse(raw.decode('utf-8'))
     mosi, true, miso = f['mosi'], f['mosi_true'], f['miso']
+    t_send = f['t_send_ns'] if 't_send_ns' in f.files else None
     n = len(mosi)
+    # Codex FI2-5: the frame arrays cover the same steps, frames of one width (not a fixed 40 bytes)
+    if (mosi.ndim != 2 or true.shape != mosi.shape or miso.ndim != 2 or miso.shape != mosi.shape
+            or t_send is None or t_send.shape != (n,)):
+        out['error'] = (f'frame arrays do not match: mosi {mosi.shape}, mosi_true {true.shape}, miso {miso.shape}, '
+                        f't_send_ns {None if t_send is None else t_send.shape}')
+        return out
     fails = []
+    if man.get('steps') != n or not _is_int(man.get('steps')):
+        fails.append(f'manifest steps={man.get("steps")!r} != {n} frames in the log')
+    end_problem = run_end_problem(man, n)
+    if end_problem:
+        fails.append(end_problem)
     sha = file_sha256(raw)
     if sha != fm.get('sha256'):
         fails.append(f'sha256 of the file {sha[:12]} != manifest {str(fm.get("sha256"))[:12]}')
     if rows_as_json(rows) != fm.get('rows'):
         fails.append('rows of the file differ from the manifest rows')
-    t0, stop = phases_t0_stop(man)
+    t0, stop, lc_problem = phases_t0_stop(man, n)
+    if lc_problem:
+        fails.append(lc_problem)
     for name, want in (('t0_step', t0), ('stop_step', stop)):
         got = fm.get(name)
         if not (got is None or _is_int(got)) or got != want:
@@ -244,15 +348,18 @@ def check(npz_path: str, sched_path: str, step_log: str = None) -> dict:
     mc = man.get('miso_check') or {}
     if crc_bad or empty:
         fails.append(f'MISO: {crc_bad} bad CRC, {empty} empty (L50, recomputed from the frames)')
-    if mc.get('crc_bad') != crc_bad or mc.get('empty') != empty:
-        fails.append(f'manifest miso_check {mc} differs from the frames ({crc_bad} bad CRC, {empty} empty)')
+    if mc.get('crc_bad') != crc_bad or mc.get('empty') != empty or mc.get('checked') != checked:
+        fails.append(f'manifest miso_check {mc} differs from the frames ({checked} checked, {crc_bad} bad CRC, '
+                     f'{empty} empty)')
+    if checked != max(0, n - MISO_SKIP_FRAMES):                                  # FI2-5
+        fails.append(f'MISO: {checked} frames checked, the run has {max(0, n - MISO_SKIP_FRAMES)}')
     sc = truth_self_check(man, true)
     if sc['seq_bad'] or sc.get('yaw_theta_bad') or sc.get('gz_wz_bad'):
         fails.append(f'true frames fail the self-check: {sc}')
     if step_log:
         tl = step_log_check(step_log, n)
-        if tl['missed_deadline'] or tl['steps_missing'] or not tl['json'] or tl['lost_or_torn'] or tl['overflow']:
-            fails.append(f'step log: {tl}')
+        if tl['problems']:
+            fails.append(f'step log: {"; ".join(tl["problems"])}')
     else:
         tl = None
         fails.append('no step log: the run does not show that no step missed its deadline (design 8.1)')

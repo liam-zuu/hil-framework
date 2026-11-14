@@ -236,3 +236,47 @@ def test_run_hil_faults_refused_before_the_early_modes(tmp_path, monkeypatch, mo
     with pytest.raises(SystemExit, match='--faults excludes'):
         run_hil.main()
     assert called == []
+
+
+@pytest.mark.parametrize('mode', [['--loopback-test'], ['--jitter-only'], ['--mock', '--steps', '100']])
+@pytest.mark.parametrize('path', ['', '  '])
+def test_run_hil_empty_faults_path_refused_first(monkeypatch, mode, path):
+    """Codex FI2-3: '--faults ""' is the flag with no file: refused before any mode (the loopback test opens
+    the SPI), and the normal path does not run without its schedule."""
+    import run_hil
+    import timing
+    called = []
+    monkeypatch.setattr(run_hil, '_run_loopback_test', lambda **k: called.append('loopback') or 0)
+    monkeypatch.setattr(timing, 'measure_jitter', lambda **k: called.append('jitter'))
+    monkeypatch.setattr(run_hil, 'load_faults', lambda *a, **k: called.append('load'))
+    monkeypatch.setattr(sys, 'argv', ['run_hil.py', *mode, '--faults', path])
+    with pytest.raises(SystemExit, match='empty path'):
+        run_hil.main()
+    assert called == []
+
+
+def test_exception_in_the_loop_writes_error_stop_reason(tmp_path, caplog):
+    """Codex FI1-4: plant.step raises at step 100 (after the transfer and the frame arrays, before the step
+    count): the error goes on to the caller, the manifest and #run_end say error:<name>, not max_steps."""
+    caplog.set_level('INFO')
+    sch = schedule(HEAD + 'E1,enc_loss,FL,10,20,\n', 400, 'plant')
+    plant = MecanumPlant(dt=0.001, seed=0)
+    plant.reset([0, 0, 0, 0.2, 0, 0.8, 10, 12, 14, 16])
+    real, n = plant.step, [0]
+
+    def step(*a, **k):
+        if n[0] == 100:
+            raise RuntimeError('plant broke')
+        n[0] += 1
+        return real(*a, **k)
+    plant.step = step
+    p = str(tmp_path / 'e.npz')
+    node = HILNode(plant, config=HILConfig(simulate_hw=True, max_steps=400, frame_log=p, faults=sch))
+    node._spi.transfer = lambda mosi: DUTY
+    with pytest.raises(RuntimeError, match='plant broke'):
+        node.run()
+    man = json.loads(str(np.load(p)['manifest']))
+    assert man['stop_reason'] == 'error:RuntimeError' and man['steps'] == 100
+    assert man['faults']['complete']                         # the schedule itself had run in full
+    assert any(r.message.startswith('#run_end,') and r.message.endswith('reason=error:RuntimeError')
+               for r in caplog.records)

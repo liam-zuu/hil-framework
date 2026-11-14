@@ -23,7 +23,9 @@ Schedule file (CSV, UTF-8):
       imu_delay  target imu, d_ms (int 1..1000): the 10 IMU bytes (gz, ax, ay, az, yaw) of T[k - d]
       gyro_scale target gz, s (decimal number in [-1, 1], not 0): int16 gz = round half away((1 - s) *
                  int16 gz), after the IMU noise (L82 Q2); s is kept as the exact decimal written in the
-                 file (fractions.Fraction) and the product is rounded exactly (Codex FI1-1)
+                 file (fractions.Fraction) and the product is rounded exactly (Codex FI1-1); s has at
+                 most S_PLACES = 9 decimal places (its exact value is a multiple of 1e-9; 0.30, 3e-1 and
+                 0.300000000 are the same s) and an exponent of at most 2 digits (Codex FI2-1)
     Overlap on the IMU: delay (picks the source frame), then the gyro scale, then the loss bit.
   * Lines starting with '#' after the first one are comments. Faults of batch 2 are refused.
 
@@ -68,7 +70,8 @@ BATCH2 = ('wheel_jam', 'batt_sag', 'mu_time', 'mu_zone', 'ibus_loss', 'body_drag
 IMU_SOURCES = ('plant', 'static', 'profile', None)
 
 _WHOLE = re.compile(r'^[0-9]+$')
-_DECIMAL = re.compile(r'^[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?$')
+_DECIMAL = re.compile(r'^[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]{1,2})?$')
+S_PLACES = 9                                 # decimal places of a decimal parameter (Codex FI2-1)
 
 
 class ScheduleError(ValueError):
@@ -127,6 +130,8 @@ def _parse_params(text: str, schema: dict, where: str) -> tuple:
             if not _DECIMAL.match(v):                 # refuses nan, inf, 3/10, empty
                 raise ScheduleError(f'{where}: parameter {k}={v!r} is not a decimal number')
             out[k] = Fraction(v)                      # exact value of the text (FI1-1)
+            if (10 ** S_PLACES) % out[k].denominator:   # FI2-1: not a multiple of 1e-9
+                raise ScheduleError(f'{where}: parameter {k}={v!r} has more than {S_PLACES} decimal places')
     missing = sorted(set(schema) - set(out))
     if missing:
         raise ScheduleError(f'{where}: missing parameter {missing}')

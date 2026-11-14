@@ -328,6 +328,10 @@ class HILNode:
                     # S06 T2 (Z9): t_end is taken inside record, after its fields
                     self.step_log.record(self._step - 1, self._timer.last_deadline_ns,
                                          self._timer.last_wake_ns, self._t_done_ns)
+        except BaseException as exc:
+            # L82, Codex FI1-4: the manifest and #run_end say the run broke (fault_check refuses it)
+            self._stop_reason = f'error:{type(exc).__name__}'
+            raise
         finally:
             self._shutdown()
             if self.cfg.rt_tune:

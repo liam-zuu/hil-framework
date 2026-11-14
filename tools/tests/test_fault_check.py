@@ -26,7 +26,7 @@ import fault_check as fc                       # noqa: E402
 import fault_schedule as fs                    # noqa: E402
 from hil_node import HILConfig, HILNode        # noqa: E402
 from mecanum_plant import MecanumPlant         # noqa: E402
-from protocol import FRAME_SIZE, OFS_MISO_CRC, encode_state   # noqa: E402
+from protocol import FRAME_SIZE, OFS_IMU_SEQ, OFS_MISO_CRC, encode_state   # noqa: E402
 from run_lifecycle import RUN, ControlBox, LifecycleConfig   # noqa: E402
 from step_log import CSV_HEADER                # noqa: E402
 
@@ -150,11 +150,37 @@ def test_good_run_passes(run):
     assert r['self_check']['seq_bad'] == 0
 
 
+def _patch_with_t0(d, m, t0):
+    """mosi rebuilt by the real FramePatcher started at t0 on the true frame of every step (Codex FI2-8):
+    only the schedule is late, every other byte is still the one of the current frame."""
+    rows = fs.parse(HEAD + BODY)
+    p = fs.FramePatcher(fs.Schedule(tuple(rows)))
+    for k in range(len(d['mosi_true'])):
+        if k == t0:
+            p.start(k)
+        d['mosi'][k] = np.frombuffer(p.patch(k, bytes(d['mosi_true'][k])), dtype=np.uint8)
+    m['faults']['t0_step'] = t0
+
+
 def _shift_late(d, m):
-    """The patcher one step late everywhere, with t0 = 1 in its own manifest (FI1-2)."""
-    d['mosi'][1:] = d['mosi'][:-1].copy()
-    d['mosi'][:, 21] = d['mosi_true'][:, 21]
-    m['faults']['t0_step'] = 1
+    """The patcher one step late everywhere, with t0 = 1 in its own manifest (FI1-2, FI2-8)."""
+    _patch_with_t0(d, m, 1)
+
+
+def test_patcher_late_with_matching_t0_is_caught_only_by_the_phases(run, tmp_path):
+    """Codex FI2-8: the bytes of a patcher started at t0 = 1 agree with the byte reference taken at t0 = 1
+    (so a byte check alone, trusting the patcher's t0, would pass), and the frames do differ from the good
+    run; the checker refuses the run because the phases give t0 = 0."""
+    p = resave(run[0], str(tmp_path / 'late1.npz'), _shift_late)
+    f = np.load(p)
+    rows = fs.parse(HEAD + BODY)
+    assert all(bytes(f['mosi'][k]) == fc.expected_sent(rows, k, 1, None, f['mosi_true'])
+               for k in range(len(f['mosi'])))
+    g = np.load(run[0])
+    assert not np.array_equal(f['mosi'], g['mosi'])
+    assert np.array_equal(f['mosi'][:, OFS_IMU_SEQ], g['mosi'][:, OFS_IMU_SEQ])   # imu_seq of the current frame
+    r = fc.check(p, run[1], run[2])
+    assert not r['ok'] and any('t0_step=1' in s for s in r['fails']), r['fails']
 
 
 @pytest.mark.parametrize('name,edit', [
@@ -174,6 +200,10 @@ def _shift_late(d, m):
     ('complete_flag', lambda d, m: m['faults'].__setitem__('complete', 1)),
     ('not_run', lambda d, m: m['faults'].__setitem__('not_run', ['E1'])),
     ('miso_count', lambda d, m: m['miso_check'].__setitem__('crc_bad', 3)),
+    ('miso_checked', lambda d, m: m['miso_check'].__setitem__('checked', 397)),             # FI2-5
+    ('manifest_steps', lambda d, m: m.__setitem__('steps', 399)),                          # FI2-5
+    ('stop_reason', lambda d, m: m.__setitem__('stop_reason', 'signal_15')),               # FI1-4
+    ('max_steps', lambda d, m: m.__setitem__('max_steps', 500)),                           # FI1-4
     ('miso_frame', lambda d, m: d['miso'].__setitem__((40, 0), 0x55)),
     ('true_seq', lambda d, m: (d['mosi_true'].__setitem__((5, 21), 99), d['mosi'].__setitem__((5, 21), 99))),
 ])
@@ -189,6 +219,149 @@ def test_bad_miso_fails_even_with_clean_manifest(tmp_path):
         m['miso_check'], crc_bad=0, empty=0)))
     r = fc.check(p2, csv_, steps)
     assert not r['ok'] and r['miso']['crc_bad'] == 398 and any('recomputed' in s for s in r['fails'])
+
+
+def test_reference_scale_exact_past_60_digits_and_parse_limit():
+    """Codex FI2-1: s = 1/2 +- 10^-61 with raw = +-1: the exact (1 - s) * raw is just under / over one half,
+    so the result is 0 / +-1; a 60-digit Decimal took both as 1/2. The schedule refuses s with more than 9
+    decimal places and an exponent of more than 2 digits."""
+    eps = Fraction(1, 10 ** 61)
+    for raw in (1, -1):
+        assert fc.ref_scale(raw, Fraction(1, 2) + eps) == 0 == fs.scale_raw(raw, Fraction(1, 2) + eps)
+        assert fc.ref_scale(raw, Fraction(1, 2) - eps) == raw == fs.scale_raw(raw, Fraction(1, 2) - eps)
+    long_s = Fraction(3, 10) + Fraction(1, 10 ** 70)
+    for raw in range(-2000, 2001, 13):
+        assert fc.ref_scale(raw, long_s) == fs.scale_raw(raw, long_s), raw
+    for bad in ('0.3000000001', '0.5000000000000000000000000000000000000000000000000000000000001', '1e-100',
+                '3e100'):
+        with pytest.raises(fs.ScheduleError):
+            fs.parse(HEAD + f'S1,gyro_scale,gz,0,1,s={bad}\n')
+    for good, want in (('0.300000000', Fraction(3, 10)), ('3e-1', Fraction(3, 10)), ('-0.123456789', None),
+                       ('0.5e-8', Fraction(5, 10 ** 9))):
+        s = fs.parse(HEAD + f'S1,gyro_scale,gz,0,1,s={good}\n')[0].p('s')
+        assert s == (want if want is not None else Fraction(good))
+
+
+def _lc_manifest(m, trs, outcome='completed'):
+    m['lifecycle'] = dict(outcome=outcome, detail=None, steps=0, transitions=trs, first_zero_step=None,
+                          zeros_sent=0, dut_ready=None)
+    m['stop_reason'] = outcome
+    m['swa_tail_complete'] = True
+
+
+def test_lifecycle_checked_before_use(tmp_path):
+    """Codex FI2-2: 100 frames, phases RUN at 10 and STOPPING / END at 1000, window [200, 300) and its events
+    written as executed: every frame is the true one, yet the old checker took the window as run. Phase steps
+    past the log, not whole numbers, or out of order are refused."""
+    p, csv_, _ = open_loop(tmp_path, body='E1,enc_loss,FL,200,300,\n', steps=100, run_ms=1000, name='lc')
+    steps = write_step_log(str(tmp_path / 'lc_st.csv'), 100)
+
+    def past_log(d, m):
+        _lc_manifest(m, [dict(step=0, t=0.0, phase='PREPARE'), dict(step=10, t=0.0, phase='RUN'),
+                         dict(step=1000, t=0.0, phase='STOPPING'), dict(step=1000, t=0.0, phase='END')])
+        m['faults'].update(t0_step=10, stop_step=1000, events=[[200, 'E1', 1, 'on'], [300, 'E1', 0, 'off']],
+                           not_run=[], cut=False, complete=True)
+        d['mosi'][:] = d['mosi_true']
+    r = fc.check(resave(p, str(tmp_path / 'past.npz'), past_log), csv_, steps)
+    assert not r['ok'] and any('outside the 100 frames' in s for s in r['fails']), r['fails']
+    good = [dict(step=0, t=0.0, phase='PREPARE'), dict(step=10, t=0.0, phase='RUN'),
+            dict(step=60, t=0.0, phase='STOPPING'), dict(step=90, t=0.0, phase='END')]
+    for name, trs, msg in (
+            ('float', [dict(good[0]), dict(good[1], step=10.0)] + good[2:], 'bad transition'),
+            ('float9', [dict(good[0]), dict(good[1], step=10.9)] + good[2:], 'bad transition'),
+            ('bool', [dict(good[0], step=False)] + good[1:], 'bad transition'),
+            ('phase', good[:1] + [dict(good[1], phase='GO')] + good[2:], 'bad transition'),
+            ('repeat', good[:2] + [dict(good[1], step=20)] + good[2:], 'out of order'),
+            ('back', good[:2] + [dict(good[2], step=5)] + good[3:], 'out of order'),
+            ('nolist', None, 'no transitions')):
+        r = fc.check(resave(p, str(tmp_path / f'{name}.npz'), lambda d, m: _lc_manifest(m, trs)), csv_, steps)
+        assert not r['ok'] and any(msg in s for s in r['fails']), (name, r['fails'])
+
+
+@pytest.mark.parametrize('kind', ['cut2', 'empty', 'wide', 'true_short', 't_send'])
+def test_frame_arrays_must_cover_the_run(run, tmp_path, kind):
+    """Codex FI2-5: MISO cut to 2 frames (0 checked) with the manifest left at 398, MISO empty, MISO of
+    another width, mosi_true or t_send_ns shorter: the run is not taken as clean."""
+    def edit(d, m):
+        if kind == 'cut2':
+            d['miso'] = d['miso'][:2]
+        elif kind == 'empty':
+            d['miso'] = d['miso'][:0]
+        elif kind == 'wide':
+            d['miso'] = np.hstack([d['miso'], np.zeros((len(d['miso']), 8), dtype=np.uint8)])
+        elif kind == 'true_short':
+            d['mosi_true'] = d['mosi_true'][:-1]
+        else:
+            d['t_send_ns'] = d['t_send_ns'][:-1]
+    r = fc.check(resave(run[0], str(tmp_path / f'{kind}.npz'), edit), run[1], run[2])
+    assert not r['ok'] and 'frame arrays do not match' in r.get('error', ''), r
+
+
+@pytest.mark.parametrize('kind', ['json_rows_only', 'miss_pm1', 'miss_2', 'dup', 'order', 'extra', 'lost_bool',
+                                  'overflow_str', 'json_rows'])
+def test_step_log_strict(run, tmp_path, kind):
+    """Codex FI2-6: a .json without its counters, miss = 1 and -1 (sum 0), miss 2, a repeated or out of order
+    step, a step past the frame log, counters of the wrong type, rows not the CSV rows: all fail."""
+    p, csv_, _ = run
+    sl = write_step_log(str(tmp_path / 'sl.csv'), 400)
+    with open(sl) as fh:
+        lines = fh.read().splitlines()
+    meta = dict(rows=400, lost_or_torn=0, overflow=0)
+    row = lambda k, miss: f'{k},{k * 1000.0:.3f},{k * 1000.0 + 1:.3f},{k * 1000.0 + 60:.3f},{k * 1000.0 + 61:.3f},{miss}'
+    if kind == 'json_rows_only':
+        meta = dict(rows=400)
+    elif kind == 'miss_pm1':
+        lines[1 + 5], lines[1 + 6] = row(5, 1), row(6, -1)
+    elif kind == 'miss_2':
+        lines[1 + 5] = row(5, 2)
+    elif kind == 'dup':
+        lines.insert(1 + 6, row(5, 0))
+        meta['rows'] = 401
+    elif kind == 'order':
+        lines[1 + 5], lines[1 + 6] = lines[1 + 6], lines[1 + 5]
+    elif kind == 'extra':
+        lines.append(row(400, 0))
+        meta['rows'] = 401
+    elif kind == 'lost_bool':
+        meta['lost_or_torn'] = False
+    elif kind == 'overflow_str':
+        meta['overflow'] = '0'
+    else:
+        meta['rows'] = 399
+    with open(sl, 'w', newline='\n') as fh:
+        fh.write('\n'.join(lines) + '\n')
+    with open(sl + '.json', 'w') as fh:
+        json.dump(meta, fh)
+    r = fc.check(p, csv_, sl)
+    assert not r['ok'] and any(s.startswith('step log:') for s in r['fails']), r['fails']
+    assert len(r['fails']) == 1, r['fails']                 # only the step log is wrong
+
+
+def test_exception_after_the_schedule_fails(tmp_path):
+    """Codex FI1-4: window [10, 20), plant.step raises at step 100 (after the transfer and the frame arrays,
+    before the step count): frame 100 is not in the log, the schedule ran in full, the step log of 0..99 is
+    good; the run broke, so the checker refuses it."""
+    csv_ = tmp_path / 'e.csv'
+    csv_.write_text(HEAD + 'E1,enc_loss,FL,10,20,\n')
+    plant = moving_plant()
+    real, c = plant.step, [0]
+
+    def step(*a, **k):
+        if c[0] == 100:
+            raise RuntimeError('plant broke')
+        c[0] += 1
+        return real(*a, **k)
+    plant.step = step
+    p = str(tmp_path / 'e.npz')
+    node = HILNode(plant, config=HILConfig(simulate_hw=True, max_steps=400, frame_log=p,
+                                           faults=fs.load(str(csv_), 400, 'plant')))
+    node._spi.transfer = lambda mosi: GOOD_MISO
+    with pytest.raises(RuntimeError):
+        node.run()
+    steps = write_step_log(str(tmp_path / 'e_st.csv'), 100)
+    r = fc.check(p, str(csv_), steps)
+    assert r['n_frames'] == 100 and r['complete'] and r['frames_bad'] == 0
+    assert not r['ok'] and r['fails'] == [m for m in r['fails'] if 'did not end normally' in m] and r['fails']
 
 
 def test_truth_self_check_plant_imu_without_noise(tmp_path):
@@ -260,6 +433,52 @@ class _Owner(threading.Thread):
                 if time.monotonic() - self.t_run >= self.after:
                     self.box.publisher_done()
             time.sleep(0.002)
+
+
+def finite_run(tmp_path, body, name='f', after=0.06):
+    """A --finite-run of the 1 kHz loop (simulate_hw, fake H7 with CRC), its schedule and step log."""
+    from fake_h7 import FakeH7
+    csv_ = tmp_path / f'{name}.csv'
+    csv_.write_text(HEAD + body)
+    sched = fs.load(str(csv_), 150, 'static')
+    p = str(tmp_path / f'{name}.npz')
+    box = ControlBox()
+    box.beat(time.monotonic_ns())
+    fake = FakeH7()
+    shared_ref = mp.Array('d', 4)
+    shared_ref[:] = [0.2, 0.0, 0.0, 1.0]
+    node = HILNode(MecanumPlant(dt=0.001, seed=0),
+                   HILConfig(simulate_hw=True, max_steps=3000, frame_log=p, frame_log_max=3000, swa_mode='phase',
+                             imu_static=(0.5, 0.1, 0.2, 9.81, 0.3), faults=sched,
+                             lifecycle=LifecycleConfig(run_s=0.15, arm_h7_fresh_s=0.12, stop_s=0.06,
+                                                       arm_timeout_s=0.5, heartbeat_max_s=0.1, h7_gap_max_s=0.05,
+                                                       run_grace_s=0.1)),
+                   shared_ref=shared_ref, control=box, responder=lambda m: with_crc(fake(m)))
+    owner = _Owner(box, after)
+    owner.start()
+    node.run()
+    owner.quit = True
+    owner.join()
+    n = len(np.load(p)['mosi'])
+    return p, str(csv_), write_step_log(str(tmp_path / f'{name}_st.csv'), n), node
+
+
+def test_finite_run_must_end_normally(tmp_path):
+    """Codex FI1-4 with phases: a run that reaches END with its tail and runs the window in full passes;
+    an error outcome, a cut END tail, a stop_reason rewritten after END (error, signal), or no END fail."""
+    p, csv_, steps, node = finite_run(tmp_path, 'L1,imu_loss,imu,5,25,\n', 'n')
+    assert not node.run_failed
+    r = fc.check(p, csv_, steps)
+    assert r['ok'], r['fails']
+    for name, edit in (
+            ('outcome', lambda d, m: (m['lifecycle'].__setitem__('outcome', 'error:heartbeat'),
+                                      m.__setitem__('stop_reason', 'error:heartbeat'))),
+            ('tail', lambda d, m: m.__setitem__('swa_tail_complete', False)),
+            ('error', lambda d, m: m.__setitem__('stop_reason', 'error:RuntimeError')),
+            ('signal', lambda d, m: m.__setitem__('stop_reason', 'signal_15')),
+            ('no_end', lambda d, m: m['lifecycle']['transitions'].pop())):
+        r = fc.check(resave(p, str(tmp_path / f'n_{name}.npz'), edit), csv_, steps)
+        assert not r['ok'] and any('did not end normally' in s for s in r['fails']), (name, r['fails'])
 
 
 def test_finite_run_t0_and_stop_from_phases(tmp_path):
