@@ -96,7 +96,16 @@ MISO duty of a later frame, never an earlier one. The fit of the pwm steps to th
 the shift (whole frames), so its minimum is an interval; its right end p_hi (G32-R2-2) cannot be before the
 edge: early_step <= p_hi + PWM_SLACK_STEPS is required, and p_lo - late_step <= PWM_LAG_MAX_STEPS (write within
 the 10 ms tick, H7 capture, frame answer) [ĐỀ XUẤT]. The PWM checks of round 1 (cost, correlation, alias)
-still refuse; the PWM side can only refuse more, never move the bracket.
+still refuse; the PWM side can only refuse more, never move the bracket. At each shift a tried, a window
+compares the frames up to the tick of its last line at that shift (a + its time from the edge): all the
+window's data, and no pwm held past its last line. Before, every shift compared the frames up to the tick at
+the largest shift (SEARCH[1], about 400 frames past the last line at the true shift) holding its pwm, and a
+command change right after the window (A-K2 reversal at 3 s, PID) gave a low correlation and refused a run
+whose count side mapped (CLOSED_LOOP/2026-11-14_run01 k2; Liam 14/11 CODE_RS4 local_33fb860c "Sửa + test +
+Codex (Recommended)", then "Sửa cả 6 + vòng 2 (Recommended)" after Codex B8C-R1-1: cutting at the smallest
+shift lost the window's last ~120 ms of data). Frames before the first line used (the one before the edge)
+are predicted pwm 0, the motor being off before the edge: refused unless the log shows pwm 0 on every line
+over the time before the edge a fit frame can fall on (B8C-R1-5).
 
 Refused (ok False, reason) when: firmware not in FW_COUNTS_AT_TICK or no events file; frame log without MOSI /
 MISO; frames shorter than FRAME_V6 (40-byte logs before P1); a MOSI of the range (to k_hi + LAG_MAX) whose run_id
@@ -524,7 +533,11 @@ def esp_clock_ppm(raw_path: str):
     """ESP32 clock rate vs the Pi clock [ppm] from the logger's raw packets (Pi receive time, ESP32 timestamp):
     slope of the edge of the lower convex hull of (timestamp, receive - timestamp) that spans the mean timestamp
     (one-way delay skew estimate). A coarse check only: on 12 bench runs of 13/11 (12.7 s each) it spread over
-    -52 .. +31 ppm. Reported only since L100 (the bound is RHO_MAX_PPM). None when fewer than 50 packets or 5 s."""
+    -52 .. +31 ppm. Reported only since L100 (the bound is RHO_MAX_PPM). None when fewer than 50 packets or 5 s.
+    Sign (B81-20, THESIS_B8 14/11, CODE): the hull slope s is d(receive - timestamp) / d(timestamp) = f_Pi / f_ESP
+    - 1; the value returned is f_ESP / f_Pi - 1 = -s / (1 + s), > 0 when the ESP32 clock runs fast, as the name
+    says. Before 14/11 s itself was returned (the opposite sign; S05 4.7 (i) uses |esp_pi_ppm|, which changes
+    by the factor 1 / (1 + s), at most |s| / (1 - |s|), about 0.1001 % (under 0.101 %) at |s| <= 1000 ppm; Codex B8C-R1 note, R2-3, R3-1)."""
     pts = []
     with open(raw_path, encoding='utf-8') as f:
         for line in f:
@@ -550,7 +563,8 @@ def esp_clock_ppm(raw_path: str):
     xm = float(x.mean())
     for (x1, y1), (x2, y2) in zip(h[:-1], h[1:]):
         if x1 <= xm <= x2 and x2 > x1:
-            return float((y2 - y1) / (x2 - x1) * 1e6)
+            s = (y2 - y1) / (x2 - x1)
+            return float(-s / (1.0 + s) * 1e6)
     return None
 
 
@@ -693,14 +707,31 @@ def pwm_side(duty, k_run, esp, ie, period_us):
     if not len(on):
         return dict(ok=False, reason='pwm never leaves 0 after the edge')
     lo, hi = k_run + SEARCH[0], k_run + SEARCH[1]
+    # frames before the first line used get pwm 0 (the 0 before the edge): the log must show it over every time
+    # a fit frame can fall on (Codex B8C-R1-5). Earliest: the first frame compared, max(0, lo - 5) (the frame range
+    # below, cut at frame 0: B8C-R2-2), at the largest shift tried, hi + 2 (the fine grid reaches hi + 1). The pwm
+    # held at that time is the one of the last line at or before it (B8C-R2-1): that line and every later line up
+    # to the edge must show 0, and such a line must exist.
+    t_pre = ts[ie] + (max(0, int(lo) - 5) - (hi + 2)) * period_us
+    cover = np.nonzero(ts[:ie] <= t_pre)[0]
+    if ie == 0 or not len(cover) or np.any(pw[cover[-1]:ie] != 0):
+        return dict(ok=False, reason='PWM side: the log does not show pwm 0 over the time before the edge the fit '
+                                     'can reach (Codex B8C-R1-5)')
     good = np.all(np.abs(D) < GLITCH, axis=1)
     fits = {}
     for W, sel in _windows(ts, after, ts[on[0]]):
         t_last = ts[sel][-1]
-        k_hi = int(min(n, hi + (t_last - ts[ie]) / period_us + 1))
+        # to the largest shift the fine grid of _minimise can try (hi + 1 step), plus one frame
+        k_hi = int(min(n, hi + 2 + (t_last - ts[ie]) / period_us + 1))
         frames = np.arange(max(0, int(lo) - 5), k_hi)
         frames = frames[good[frames]]
-        lines = np.r_[ie - 1, sel] if ie > 0 else sel        # the 0 before the edge
+        lines = np.r_[ie - 1, sel]                            # the 0 before the edge
+        d_last = (t_last - ts[ie]) / period_us
+
+        def use(a, frames=frames, d_last=d_last):
+            # Codex B8C-R1-1 (run01 k2): at shift a, only the frames up to the tick of the window's last line,
+            # all the window's data and no pwm held past it
+            return frames <= a + d_last
 
         def pred(a, frames=frames, lines=lines):
             tick_k = a + (ts[lines] - ts[ie]) / period_us
@@ -708,20 +739,22 @@ def pwm_side(duty, k_run, esp, ie, period_us):
             P = pw[lines][np.clip(j, 0, len(lines) - 1)].copy()
             P[(j < 0) | (lines[np.clip(j, 0, len(lines) - 1)] < ie)] = 0.0
             return P
-        P0 = pred(k_run + 15.0)
-        sgn = np.sign(np.sum(P0 * D[frames], axis=0))
+        m0 = use(k_run + 15.0)
+        sgn = np.sign(np.sum(pred(k_run + 15.0)[m0] * D[frames[m0]], axis=0))
         sgn[sgn == 0] = 1.0
 
         def cost(a):
-            e = D[frames] - pred(a) * sgn
+            m = use(a)
+            e = D[frames[m]] - pred(a)[m] * sgn
             return float(np.mean(np.minimum(e ** 2, PWM_CAP)))
         a, c, grid, cs, fine, cf = _minimise(cost, lo, hi)
         a_lo, a_hi = _plateau(fine, cf)
-        P = pred(a) * sgn
-        corr = [float(np.corrcoef(P[:, w], D[frames, w])[0, 1]) if np.std(P[:, w]) > 0 and np.std(D[frames, w]) > 0
+        m = use(a)
+        P, Dm = pred(a)[m] * sgn, D[frames[m]]
+        corr = [float(np.corrcoef(P[:, w], Dm[:, w])[0, 1]) if np.std(P[:, w]) > 0 and np.std(Dm[:, w]) > 0
                 else float('nan') for w in range(4)]
         fits[str(W)] = dict(a=a, a_lo=a_lo, a_hi=a_hi, cost=c, corr=corr, sign=[float(s) for s in sgn],
-                            n_frames=int(len(frames)),
+                            n_frames=int(np.count_nonzero(m)),
                             n_glitch=int(np.count_nonzero(~good[max(0, int(lo) - 5):k_hi])), t_end_us=float(t_last),
                             unique=_unique(grid, cs, a, 10.0), on_edge=bool(a - lo < 2 * COARSE or hi - a < 2 * COARSE))
     out = dict(fits=fits)

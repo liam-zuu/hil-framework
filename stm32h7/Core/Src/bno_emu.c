@@ -63,6 +63,15 @@ static const uint8_t k_zero[8] = { 0 };
 
 static bool time_ge(uint32_t a, uint32_t b) { return (int32_t)(a - b) >= 0; }
 
+/* Age of an unchanged sample seq at which "stale" is latched (14/11/2026).
+ * now_us is uint32 and wraps every 2^32 us (71.6 min); the age now_us -
+ * t_seq_change_us read as unsigned is right only while the true age is below
+ * 2^32 us. bno_emu_poll() runs every 100 us on the H7 (BnoPort_Tick), so it
+ * latches long before that; bno_emu_set_sample() clears the latch when the
+ * seq changes. Before the latch a seq frozen for more than 2^31 us read as
+ * fresh again (signed difference in time_ge). */
+#define STALE_LATCH_US 0x80000000u
+
 static void put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
 static void put32(uint8_t *p, uint32_t v)
 {
@@ -314,6 +323,7 @@ static void handle_control(bno_emu_t *e, const uint8_t *p, uint16_t n, uint32_t 
             if (idx >= 0 && e->period_us[idx] != interval) {   /* same period: keep cadence */
                 e->period_us[idx] = interval;
                 e->next_due_us[idx] = now_us + interval;
+                if (interval == 0u) e->pend[idx] = false;      /* disabled: its waiting report goes (BNOW-R1-1) */
             }
             send_feature_resp(e, p[c + 1], p + c);
             e->st.set_features++;
@@ -399,7 +409,10 @@ void bno_emu_set_reset(bno_emu_t *e, bool rst_low, uint32_t now_us)
 
 void bno_emu_set_sample(bno_emu_t *e, const bno_emu_sample_t *s, uint32_t now_us)
 {
-    if (!e->have_sample || s->seq != e->sample.seq) e->t_seq_change_us = now_us;
+    if (!e->have_sample || s->seq != e->sample.seq) {
+        e->t_seq_change_us = now_us;
+        e->seq_old = false;
+    }
     e->sample = *s;
     e->have_sample = true;
     e->t_sample_us = now_us;
@@ -407,6 +420,9 @@ void bno_emu_set_sample(bno_emu_t *e, const bno_emu_sample_t *s, uint32_t now_us
 
 void bno_emu_poll(bno_emu_t *e, uint32_t now_us)
 {
+    /* before the HELD return: the sample keeps ageing while the chip is in reset */
+    if (e->have_sample && (uint32_t)(now_us - e->t_seq_change_us) >= STALE_LATCH_US) e->seq_old = true;
+
     if (e->state == BNO_EMU_HELD) return;
 
     if (e->state == BNO_EMU_BOOTING) {
@@ -437,16 +453,27 @@ void bno_emu_poll(bno_emu_t *e, uint32_t now_us)
             }
         }
     }
-    if (any_due) {
-        bool stale = !e->have_sample ||
-                     time_ge(now_us, e->t_seq_change_us + e->cfg.stale_periods * pmin);
+    /* Checked when a report falls due and also while one waits for the input
+     * channel (Codex BNOW-R1-1, 14/11): a report that fell due on a fresh sample
+     * but waited behind the previous input packet is not built once the sample
+     * is stale or held. A waiting report belongs to an enabled sensor (disabling
+     * one drops it, handle_control), so pmin > 0 here. */
+    bool any_pend = false;
+    for (unsigned i = 0; i < BNO_EMU_N_SENSORS; i++) any_pend |= e->pend[i];
+    if (any_due || any_pend) {
+        /* unsigned age, threshold in 64 bits: same result as the old
+         * time_ge(now_us, t_seq_change_us + stale_periods * pmin) wherever that
+         * was right (age and threshold below 2^31 us); beyond, seq_old decides */
+        bool stale = !e->have_sample || e->seq_old ||
+                     (uint64_t)(uint32_t)(now_us - e->t_seq_change_us) >=
+                         (uint64_t)e->cfg.stale_periods * pmin;
         if (e->hold) {
             e->st.hold_skips++;                         /* S06 T8: injected IMU loss */
             memset(e->pend, 0, sizeof(e->pend));
         } else if (stale) {
             e->st.stale_skips++;                        /* like a dead chip: send nothing */
             memset(e->pend, 0, sizeof(e->pend));
-        } else {
+        } else if (any_due) {
             for (unsigned i = 0; i < BNO_EMU_N_SENSORS; i++) {
                 if (!due[i]) continue;
                 if (e->pend[i]) e->st.input_overruns++; /* previous one never left */
@@ -457,7 +484,7 @@ void bno_emu_poll(bno_emu_t *e, uint32_t now_us)
     /* One input packet in flight at a time; reports that fall due meanwhile
      * wait and go out together in the next packet (the sensors are enabled
      * at different times, so their schedules are out of phase). */
-    bool any_pend = false;
+    any_pend = false;
     for (unsigned i = 0; i < BNO_EMU_N_SENSORS; i++) any_pend |= e->pend[i];
     if (any_pend && !q_has_chan(e, CH_INPUT)) {
         uint8_t pkt[5u + 10u + 10u + 12u];

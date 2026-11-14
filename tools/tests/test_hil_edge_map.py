@@ -138,7 +138,8 @@ def make_miso(mosi, duty, tm, skip=(), lost=(), twice=(), over=(), sat=(), v4=Fa
 
 def sim(edge_ms=415.3, k_run=400, n=5200, kind='ramp', move_after_ms=3.0, ppm=30.0,
         late=(3, 7, 40, 41, 90, 133), write_ms=0.4, glitch_every=97, n_before=6, seed=1, pwm_period=None,
-        burst=None, stale_ms=0.0, skip=(), dup=(), win_max=80.0, dts=(), stage_lag=None, crc_twin=(), copy2=()):
+        burst=None, stale_ms=0.0, skip=(), dup=(), win_max=80.0, dts=(), stage_lag=None, crc_twin=(), copy2=(),
+        pwm_flip=None):
     """dict(duty, esp, frames, k_true, timing) of a made-up run with the edge tick at H7 time edge_ms."""
     rng = np.random.default_rng(seed)
     dt = np.full(n, 1000.0)
@@ -183,6 +184,8 @@ def sim(edge_ms=415.3, k_run=400, n=5200, kind='ramp', move_after_ms=3.0, ppm=30
     else:
         p = np.round(60 + 40 * np.sin(0.13 * j) + 20 * np.sin(0.051 * j + 1.0))
     p[0] = 15.0
+    if pwm_flip:                                                    # (tick, factor): command change at that tick
+        p[j >= pwm_flip[0]] *= pwm_flip[1]                          # (A-K2 reversal at 3 s, run01 k2)
     pw = np.r_[np.zeros((n_before, 4)), np.round(np.column_stack([p, p * 0.9, p * 1.1, p]))]
     # MISO duty of transfer f: the pwm written before the H7 serviced frame f - 2
     write_t = pi_time(ts + write_ms * 1000.0)
@@ -840,6 +843,95 @@ def test_refusals():
 # "stale counts" test is dropped (Codex RS4-R4-5 (b), RS4-R5-3).
 
 
+@needs_gcc
+@pytest.mark.parametrize('factor', [-2.5, 0.0])
+def test_command_change_right_after_the_3_s_window_maps(factor):
+    # CLOSED_LOOP/2026-11-14_run01 k2 (PID, A-K2 reversal 3 s after the first pwm): the pwm reverses (or stops)
+    # at the first log line after the 3 s window. The frames each window compares end at its last line's tick
+    # at the smallest shift (SEARCH[0]); before, they ran about 400 frames further holding the last pwm, the
+    # 3 s fit had correlation ~0.2 and the run was refused although its count side mapped.
+    s = sim(pwm_flip=(301, factor))
+    em = run(s)
+    _check_bracket(em, s['k_true'])
+    fits = em['pwm_side']['fits']
+    assert set(fits) == {'1.0', '2.0', '3.0'} and min(fits['3.0']['corr']) > M.MIN_CORR, fits['3.0']['corr']
+
+
+@needs_gcc
+def test_wrong_duty_in_the_last_part_of_the_3_s_window_is_refused():
+    # Codex B8C-R1-1: the duty disagrees with the pwm over the last 90 frames that the 3 s window's own lines
+    # predict at the true shift (data of the window, not pwm held past it). Cutting the frames at the smallest
+    # shift dropped them and the run passed; comparing up to the last line's tick at each shift refuses it.
+    s = sim()
+    ok = run(s)
+    assert ok['ok'], ok['reason']
+    a = ok['pwm_side']['fits']['3.0']['a']
+    ts, pw = s['esp']['timestamp_us'].astype(float), s['esp']['pwm']
+    ie = int(M.rising_edges(s['esp']['run_active'])[0])
+    t0 = ts[ie:][np.any(pw[ie:] != 0, axis=1)][0]
+    d_last = (ts[ts <= t0 + 3e6][-1] - ts[ie]) / 1000.0
+    k1 = int(np.floor(a + d_last))
+    duty = s['duty'].copy()
+    # 90 frames: inside the ~100 + (a - k_run) frames a cut at the smallest shift drops
+    duty[k1 - 90:k1 + 1, :] = 0.9                       # 900 pwm units, under GLITCH, against the logged pwm
+    em = M.map_edge(duty, 400, s['esp'], 1e-3, s['frames'])
+    assert not em['ok'] and 'PWM' in em['reason'] and 'window 3.0' in em['reason'], em['reason']
+    assert min(min(em['pwm_side']['fits'][w]['corr']) for w in ('1.0', '2.0')) > M.MIN_CORR   # only 3 s sees it
+
+
+def test_pwm_before_the_edge_must_show_zero():
+    # Codex B8C-R1-5: frames before the first line used get pwm 0; the log must show 0 over the time before the
+    # edge a fit frame can reach, else refused. k_run 1000: frames from lo - 5 = 895, shifts to hi + 2 = 1402, so
+    # the reach is 507 ms before the edge. The pwm at that time is the one of the last line at or before it
+    # (Codex B8C-R2-1), so that line counts too, and a line at or before -507 ms must exist.
+    ie, n = 7, 5000
+    ts = np.r_[np.arange(-700, 0, 100), np.arange(0, 4000, 10)] * 1000.0
+    run_active = (np.arange(len(ts)) >= ie).astype(int)
+    pw = np.zeros((len(ts), 4))
+    pw[ie:] = 50.0
+    esp = dict(timestamp_us=ts, pwm=pw, run_active=run_active)
+    duty = np.zeros((n, 4))
+
+    def why(e, k_run=1000, i=ie):
+        return M.pwm_side(duty, k_run, e, i, 1000.0).get('reason', '')
+    assert 'before the edge' not in why(esp)
+    bad = dict(esp, pwm=pw.copy())
+    bad['pwm'][ie - 2] = 30.0                                  # 200 ms before the edge: inside the reach
+    assert 'before the edge' in why(bad)
+    held = dict(esp, pwm=pw.copy())
+    held['pwm'][1] = 30.0                                      # -600 ms, held to -500 ms: covers -507 ms (R2-1)
+    assert 'before the edge' in why(held)
+    far = dict(esp, pwm=pw.copy())
+    far['pwm'][0] = 30.0                                       # -700 ms, replaced by the 0 at -600 ms: outside
+    assert 'before the edge' not in why(far)
+    short = dict(timestamp_us=ts[4:], pwm=pw[4:], run_active=run_active[4:])   # log starts 300 ms before
+    assert 'before the edge' in why(short, i=ie - 4)
+    late = dict(timestamp_us=ts[2:], pwm=pw[2:], run_active=run_active[2:])    # first line -500 ms > -507 ms
+    assert 'before the edge' in why(late, i=ie - 2)
+    # Codex B8C-R2-2: k_run 50, the frames start at 0 (not lo - 5 = -55), so the reach is 0 - 452 = -452 ms:
+    # a log from -500 ms covers it, one from -400 ms does not
+    from500 = dict(timestamp_us=ts[2:], pwm=pw[2:], run_active=run_active[2:])
+    assert 'before the edge' not in why(from500, k_run=50, i=ie - 2)
+    from400 = dict(timestamp_us=ts[3:], pwm=pw[3:], run_active=run_active[3:])
+    assert 'before the edge' in why(from400, k_run=50, i=ie - 3)
+    held50 = dict(from500, pwm=from500['pwm'].copy())
+    held50['pwm'][0] = 30.0                                    # -500 ms, held to -400 ms: covers -452 ms
+    assert 'before the edge' in why(held50, k_run=50, i=ie - 2)
+
+
+@needs_gcc
+def test_run_step_near_frame_0_maps_with_a_log_from_500_ms():
+    # Codex B8C-R3-2: a valid run with k_run 50 (frames cut at 0, reach -452 ms) and an ESP32 log from -500 ms
+    # before the edge (after the -507 ms of an uncut range) maps in full: every window fits, the edge is bracketed
+    s = sim(edge_ms=70.4, k_run=50, n_before=5)
+    ts, ie = s['esp']['timestamp_us'], int(M.rising_edges(s['esp']['run_active'])[0])
+    assert ts[0] - ts[ie] == -500e3
+    em = run(s, k_run=50)
+    _check_bracket(em, s['k_true'])
+    assert set(em['pwm_side']['fits']) == {'1.0', '2.0', '3.0'}
+    assert min(min(f['corr']) for f in em['pwm_side']['fits'].values()) > M.MIN_CORR
+
+
 def test_plateau_right_end():
     # G32-R2-2: a step-function cost keeps the right end of its flat minimum
     fine = np.arange(0.0, 2.001, 0.01)
@@ -851,8 +943,9 @@ def test_plateau_right_end():
 def test_esp_clock_ppm_from_raw(tmp_path):
     rng = np.random.default_rng(3)
     ts = np.arange(0, 12_000_000, 10_000) + 1_000_000
-    for true in (-40.0, 0.0, 35.0):
-        rx = ts * (1 + true * 1e-6) + 5e6 + 300.0 + rng.exponential(600.0, len(ts))   # floor + WiFi delay
+    # true = f_ESP / f_Pi - 1 [ppm] (B81-20): an ESP32 timestamp span d is d / (1 + true) on the Pi clock
+    for true in (-40.0, 0.0, 35.0, 900.0):
+        rx = ts / (1 + true * 1e-6) + 5e6 + 300.0 + rng.exponential(600.0, len(ts))   # floor + WiFi delay
         p = tmp_path / f'r{true}.jsonl'
         with open(p, 'w') as f:
             for a, b in zip(ts, rx):
@@ -884,7 +977,7 @@ def write_esp_csv(path, esp, columns=COLUMNS, extra_rows=(), fw=FW, ppm=None):
     if ppm is not None:                                               # raw packets: Pi receive vs ESP32 timestamp
         rng = np.random.default_rng(5)
         ts = np.arange(esp['timestamp_us'][0], esp['timestamp_us'][0] + 8_000_000, 10_000)
-        rx = ts * (1 + ppm * 1e-6) + 300.0 + rng.exponential(600.0, len(ts))
+        rx = ts / (1 + ppm * 1e-6) + 300.0 + rng.exponential(600.0, len(ts))   # ppm = f_ESP / f_Pi - 1 (B81-20)
         with open(path + '.raw.jsonl', 'w') as f:
             for a, b in zip(ts, rx):
                 f.write(json.dumps(dict(t_mono_ns=int(b * 1e3), b64=base64.b64encode(f'{a},1'.encode()).decode())) + '\n')
@@ -947,6 +1040,7 @@ def write_frame_log(path, task, k_run, s):
         mosi[k] = mosi_frame(st, k, traj_ref=(0.3, 0.0, 0.1) if on else None, traj_flags=P.TRAJ_VALID if on else 0)
     miso = make_miso(mosi, s['duty_cap'], tm, skip=tm['skip'], stage_lag=tm['stage_lag'])
     manifest = dict(period_us=1000, steps=n, plant='MecanumPlant', miso_check=dict(crc_bad=0, empty=0),
+                    state_out_of_range=None,                        # B81-15 check ran on the Pi
                     lifecycle=dict(outcome='completed', transitions=[dict(step=0, t=0, phase='ARM'),
                                                                      dict(step=k_run, t=0.4, phase='RUN')]))
     np.savez(path, manifest=np.array(json.dumps(manifest)), mosi=mosi, miso=miso,

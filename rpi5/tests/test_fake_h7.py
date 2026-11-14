@@ -216,6 +216,41 @@ def test_run_stops_when_the_h7_does_not_send_the_run_id_back(h7):
     assert node._id_first_step is None and node.run_failed          # run_hil.py exits 3
 
 
+class _BadStatePlant(MockPlant):
+    """MockPlant (frame order state) whose field `field` becomes `value` from step `at` on."""
+
+    def __init__(self, at, field, value):
+        super().__init__()
+        self._at, self._field, self._value = at, field, value
+
+    def get_state(self):
+        s = super().get_state()
+        if self._step_count >= self._at:
+            s[self._field] = self._value
+        return s
+
+
+@pytest.mark.parametrize('field, value', [(4, float('nan')), (7, float('inf')), (5, 5.0), (6, float('nan'))])
+def test_plant_state_out_of_range_fails_the_run(tmp_path, field, value):
+    """O1 v11.15 3.5 (B81-15): the first plant state field that is NaN / inf, or x, y at the +-5 m bound, is
+    recorded in the manifest and the run is failed (HIL tool error, run to be redone); theta -pi is not (B81-8),
+    nor a wheel speed at its bound (not in the spec rule)."""
+    import json
+
+    import numpy as np
+    p = str(tmp_path / 'f.npz')
+    node = HILNode(_BadStatePlant(20, field, value),
+                   config=HILConfig(simulate_hw=True, max_steps=60, period_us=1_000, frame_log=p))
+    node.run()
+    m = json.loads(str(np.load(p)['manifest']))
+    assert node.run_failed and m['state_out_of_range']['field'] == field
+    assert 19 <= m['state_out_of_range']['step'] <= 21
+    ok = HILNode(_BadStatePlant(20, 6, -3.141592653589793) if field != 5 else _BadStatePlant(20, 0, 41.0),
+                 config=HILConfig(simulate_hw=True, max_steps=60, period_us=1_000, frame_log=str(tmp_path / 'g.npz')))
+    ok.run()
+    assert not ok.run_failed and json.loads(str(np.load(tmp_path / 'g.npz')['manifest']))['state_out_of_range'] is None
+
+
 def test_good_crc_reply_confirms_v6_and_a_short_run_without_it_fails(tmp_path):
     """Codex RS4-R10-2: a good-CRC reply naming an earlier frame of this run confirms v6 (the run goes on, not
     failed); a run that ends before ID_CHECK_FRAMES transfers without a confirmation is failed, manifest
@@ -274,3 +309,38 @@ def test_hil_node_reads_duty_from_fake_h7_and_relays_new_setpoints():
     assert plant.torques[0] == [0.0] * 4                 # first MISO: nothing prepared yet
     assert plant.torques[-1] == pytest.approx([0.25, -0.25, 0.5, -0.5], abs=1e-4)
     assert fake.relay_attempted == 2 and fake.last_relay == pytest.approx((0.3, 0.0, 0.0), abs=1e-3)
+
+
+def test_plant_state_checked_before_the_imu_and_the_heavy_block(tmp_path):
+    """Codex B8C-R1-2: the state is checked as the plant gives it, before the IMU sample (a Mecanum theta = inf
+    makes imu_from_plant raise) and before the S06 heavy block (which overwrites omega): the first bad field is
+    in the manifest even when the run then stops on an exception, and a NaN omega under the heavy block counts."""
+    import json
+
+    import numpy as np
+
+    from mecanum_plant import MecanumPlant
+    from params import PARAMS
+
+    class InfTheta(MecanumPlant):
+        def get_state(self):
+            s = super().get_state()
+            if self._ticks >= 20:
+                s[2] = float('inf')                     # Mecanum order [x, y, theta, ...]
+            return s
+    p = str(tmp_path / 'm.npz')
+    node = HILNode(InfTheta(PARAMS, dt=0.001), config=HILConfig(simulate_hw=True, max_steps=60, period_us=1_000,
+                                                                frame_log=p))
+    try:
+        node.run()
+    except Exception:                                  # the IMU sample may raise on theta = inf
+        pass
+    m = json.loads(str(np.load(p)['manifest']))
+    assert m['state_out_of_range']['field'] == 6 and m['state_out_of_range']['where'] == 'plant'
+    assert node.run_failed
+    p2 = str(tmp_path / 'h.npz')
+    node = HILNode(_BadStatePlant(20, 0, float('nan')),
+                   config=HILConfig(simulate_hw=True, max_steps=60, period_us=1_000, frame_log=p2, heavy_block=(0, 60)))
+    node.run()
+    m = json.loads(str(np.load(p2)['manifest']))
+    assert node.run_failed and m['state_out_of_range']['field'] == 0 and m['state_out_of_range']['where'] == 'plant'

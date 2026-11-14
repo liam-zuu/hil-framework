@@ -42,7 +42,7 @@ import numpy as np
 
 from params import MecanumParams
 from plant_step import plant_step, motor_torque
-from protocol import encode_state, decode_torques, FRAME_SIZE
+from protocol import encode_state, decode_torques, FRAME_SIZE, state_out_of_range
 from hil_node import plant_to_frame_state
 from imu_model import imu_from_plant
 from timing import set_realtime, pin_cpu
@@ -120,7 +120,9 @@ def main() -> int:
         imu = imu_from_plant(s, state['prev'], 0.001, p.g)
         state['prev'] = s
         state['seq'] = state['seq'] % 255 + 1
-        frame = encode_state(plant_to_frame_state(list(s)), traj_ref=(0.1, 0.0, 0.2), traj_flags=0,
+        fs = plant_to_frame_state(list(s))
+        state_out_of_range(fs)                     # B81-15: the check hil_node.py runs every tick
+        frame = encode_state(fs, traj_ref=(0.1, 0.0, 0.2), traj_flags=0,
                              seq=state['seq'], imu=imu, imu_seq=state['seq'])
         decode_torques(frame)
 
