@@ -91,10 +91,12 @@ def test_frozen_plant_long_gap(period, gap_s, mode):
 @pytest.mark.parametrize('how', ['held', 'held_wrap'])
 @pytest.mark.parametrize('period', RATES)
 def test_frozen_plant_long_gap_rst_held(period, how, mode):
-    """RST held low during the gap (host off): the sample keeps ageing while the
-    chip is in reset. 'held': 3221 s. 'held_wrap': the reinit releases RST 1 ms
-    after the age passes 2^32 us, so the wrapped age is near 0 while the host
-    enables the reports; no report may be built on the old sample."""
+    """RST held low during the gap (host off), no report may be built on the old
+    sample. 'held': 3221 s. 'held_wrap': the reinit releases RST 1 ms after the
+    age passes 2^32 us. With the SH-2 driver of this harness the first report is
+    due more than 150 ms after the release, so the unsigned age alone already
+    refuses it: this test does not show that the latch runs while in reset
+    (Codex BNOW-R1-2); test_core_rst_release_at_clock_wrap does."""
     kv = run('stale_gap', period, 3221, how, mode=mode)
     assert kv['stale_gap.held'] == '1'
     assert kv['stale_gap.reports_after_reinit'] == '0'
@@ -110,6 +112,34 @@ def test_core_rst_release_at_clock_wrap(mode):
     kv = run('core_wrap', mode=mode)
     assert kv['core_wrap.built_frozen'] == '0'
     assert int(kv['core_wrap.built_after']) > 0
+    # Codex BNOW-R1-3: ages from the time the core took the sample
+    rel = float(kv['core_wrap.age_release_s']) - 2**32 * 1e-6
+    on = float(kv['core_wrap.age_enable_s']) - 2**32 * 1e-6
+    assert 0.0009 < rel < 0.0011 and on < 0.150 - 0.001, (rel, on)
+
+
+@pytest.mark.parametrize('how', ['read', 'disable'])
+def test_pending_report_not_built_once_stale(how, mode):
+    """Codex BNOW-R1-1: reports that fell due on a fresh sample but wait behind an unread
+    input packet are not built once the sample is stale: 'read' the host reads the
+    queue after the threshold, with no report due then; 'disable' the host disables
+    the sensor first (its waiting report goes)."""
+    kv = run('pend_stale', how, mode=mode)
+    assert kv['pend_stale.pend_before'] == '1'
+    assert kv['pend_stale.built_after_read'] == '0'
+
+
+@pytest.mark.parametrize('period,due_age,n,built', [
+    (10_000, 29_900, 3, 1),          # just under 3 periods: fresh
+    (10_000, 30_000, 3, 0),          # at 3 periods: stale
+    (1_000_000, 2_900_000, 3, 1),    # 2.9 s old but under 3 periods: no early latch
+    (65_536, 131_072, 65_537, 1),    # n x period = 2^32 + 2^16 us: needs the 64-bit product
+])
+def test_stale_threshold_edge(period, due_age, n, built, mode):
+    """Codex BNOW-R1-2: a report due at sample age due_age is built exactly when
+    due_age < n x period (64-bit product) and under the 2^31 us latch."""
+    kv = run('stale_edge', period, due_age, n, mode=mode)
+    assert kv['stale_edge.built'] == str(built)
 
 
 @pytest.mark.parametrize('period', RATES)
