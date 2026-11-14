@@ -112,6 +112,11 @@ class FeasStop(Exception):
     """A stop of the design (determinism check, configuration): print the reason only."""
 
 
+class LevelCheckError(FeasStop, ValueError):
+    """Level rows that do not hold exactly the expected levels (C12-7): the run stops and is closed as
+    'stopped' like any FeasStop (C12R2-2); still a ValueError for the helpers' callers."""
+
+
 # ── domain ────────────────────────────────────────────────────────────────────────────
 
 def box_of(ctrl, default):
@@ -222,12 +227,12 @@ def by_level(rows, levels, mu=None):
     """{v: row} of rows that must hold exactly the levels (unique keys, C12-7); mu: also check each row's mu."""
     keys = [(float(r['v']), float(r['mu'])) for r in rows]
     if len(set(keys)) != len(keys):
-        raise ValueError(f'duplicate level rows {keys}')
+        raise LevelCheckError(f'duplicate level rows {keys}')
     vs = sorted(k[0] for k in keys)
     if vs != sorted(float(v) for v in levels):
-        raise ValueError(f'level rows {vs} are not the levels {sorted(levels)}')
+        raise LevelCheckError(f'level rows {vs} are not the levels {sorted(levels)}')
     if mu is not None and any(k[1] != float(mu) for k in keys):
-        raise ValueError(f'level rows {keys} not all at mu {mu}')
+        raise LevelCheckError(f'level rows {keys} not all at mu {mu}')
     return {float(r['v']): r for r in rows}
 
 
@@ -521,7 +526,10 @@ def source_state(dll, expect_fw):
     exp = str(expect_fw or '')
     if len(exp) < 7 or not commit or not (commit.startswith(exp) or exp.startswith(commit)):
         raise FeasStop(f'fwsim.dll built from firmware {commit or "?"}, not the expected {exp or "?"} (--expect-fw)')
-    return dict(hil_framework=s3.git_state(os.path.join(HERE, '..')), dll_sha256=s3.sha256_file(dll),
+    dll_sha = s3.sha256_file(dll)
+    if not build.get('dll_sha256') or build['dll_sha256'] != dll_sha:     # the DLL is the one built (C12R2-3)
+        raise FeasStop('fwsim.dll is not the DLL recorded in fwsim_build.json (dll_sha256)')
+    return dict(hil_framework=s3.git_state(os.path.join(HERE, '..')), dll_sha256=dll_sha,
                 build=build, script=s3.file_git_state(os.path.abspath(__file__)))
 
 
@@ -589,16 +597,24 @@ def _drop_job_results(sealed):
             os.remove(os.path.join(jd, n))
 
 
-def post_schedule(wit, boxes, set_levels):
+def post_schedule(wit, defaults, set_levels):
     """Fixed post-search schedule (C12-3): one entry per position (ctrl, set) in fixed order, with the witness
-    gains or, without a witness, the default gains (substitute, results dropped)."""
+    gains or, without a witness, the default gains {ctrl: {name: value}} (substitute, results dropped)."""
     out, set_levels = [], list(set_levels)               # iterated once per controller
     for c in CONTROLLERS:
         for sn, lv in set_levels:
             w = wit.get((c, sn))
             out.append(dict(key=(c, sn), levels=tuple(lv), real=w is not None,
-                            gains=w['gains'] if w else default_gains(boxes[c])))
+                            gains=w['gains'] if w else dict(defaults[c])))
     return out
+
+
+def close_stopped(out, kind, a, src, sealed, notes, t0, reason):
+    """Close a stopped run (C12R2-1, -2): job results kept (no history written yet), notes with the reason,
+    the manifest over everything in sealed/, meta.yaml status: stopped."""
+    notes = dict(notes, stop=reason, elapsed_s=time.time() - t0)
+    dump_json(notes, os.path.join(sealed, 'notes.json'), indent=1)
+    write_meta(out, kind, 'stopped', a, src, {}, sealed_manifest(sealed))
 
 
 def cmd_search(a):
@@ -642,7 +658,7 @@ def cmd_search(a):
             notes['jobs'][job['name']] = dict(elapsed_s=r['elapsed_s'], **r['notes'])
             wit[key] = r['witness']
         # fixed post-search schedule (C12-3): every position, middle mu (determinism), then low and high mu
-        sched = post_schedule(wit, boxes, zip(SET_NAMES, LEVEL_SETS))
+        sched = post_schedule(wit, {c: default_gains(boxes[c]) for c in CONTROLLERS}, zip(SET_NAMES, LEVEL_SETS))
         mus = () if tool else (MU_LO, MU_HI)                   # tool-check: the fwsim assumption only
         pjobs = [dict(name=f'post_{e["key"][0]}_{e["key"][1]}', kind='levels', dll=os.path.abspath(a.dll),
                       controller=e['key'][0], tag=e['key'][1],
@@ -696,10 +712,9 @@ def cmd_search(a):
             pop=pop, n_gen=n_gen, seed=GA_SEED, first_population='default + 23 uniform in the coded box'),
             boxes=boxes, interpretations=INTERPRETATIONS,
             files=['box.csv', 'default_gains.csv', 'labels.csv', 'logs_default/', 'console.txt', 'sealed/']), pub)
-    except FeasStop:
+    except FeasStop as e:
         if not os.path.isfile(os.path.join(a.out, 'meta.yaml')):
-            _drop_job_results(sealed)
-            write_meta(a.out, 'search', 'stopped', a, src, {}, sealed_manifest(sealed))
+            close_stopped(a.out, 'search', a, src, sealed, notes, t0, f'{type(e).__name__}: {e}')
         raise
     if tool:
         say(f'tool-check done: mean time of one default-gain run {np.mean(t_runs):.2f} s '
@@ -721,8 +736,9 @@ def _q(x):
 
 
 def _meta_field(text, key):
-    m = re.search(rf'^{key}: (.*?)(\s+#.*)?$', text, re.M)
-    return m.group(1).strip() if m else None
+    """Value of a checked meta.yaml key; the key must appear exactly once (C12R2-5), else None."""
+    m = re.findall(rf'^{key}:[ \t]*(.*?)(?:\s+#.*)?$', text, re.M)
+    return m[0].strip() if len(m) == 1 else None
 
 
 def read_source(run):
@@ -778,9 +794,9 @@ def cmd_recheck(a):
         say(f'o1_feas_search recheck: levels {levels}, a_r {o1.A_R}, '
             f'firmware {src["build"].get("esp32", {}).get("commit")}')
         runner = Runner(a.dll)
-        boxes = {c: box_of(c, runner.defaults(c)) for c in CONTROLLERS}
+        dflts = {c: {n: float(runner.defaults(c)[n]) for n in s3.FACTORS[c]} for c in CONTROLLERS}   # no GA box (C12R2-6)
         sets = [(sn, lv) for sn, lv in zip(SET_NAMES, LEVEL_SETS) if set(levels) <= set(lv)]
-        sched = post_schedule(wit, boxes, [(sn, levels) for sn, _ in sets])
+        sched = post_schedule(wit, dflts, [(sn, levels) for sn, _ in sets])
         jobs = [dict(name=f'recheck_{e["key"][0]}_{e["key"][1]}', kind='levels', dll=os.path.abspath(a.dll),
                      controller=e['key'][0], tag=e['key'][1], runs=[(e['gains'], v, MU_MID) for v in levels],
                      log_dir=os.path.join(sealed, 'logs'), a_r=o1.A_R) for e in sched]
@@ -804,10 +820,10 @@ def cmd_recheck(a):
         _drop_job_results(sealed)
         write_meta(a.out, 'recheck', 'complete', a, src, dict(source_run=getattr(a, 'from'), levels=list(levels),
                                                               interpretations=INTERPRETATIONS), sealed_manifest(sealed))
-    except FeasStop:
+    except FeasStop as e:
         if not os.path.isfile(os.path.join(a.out, 'meta.yaml')):
-            _drop_job_results(sealed)
-            write_meta(a.out, 'recheck', 'stopped', a, src, {}, sealed_manifest(sealed))
+            close_stopped(a.out, 'recheck', a, src, sealed, dict(source=getattr(a, 'from')), t0,
+                          f'{type(e).__name__}: {e}')
         raise
     for r in out:
         say(f"  {r['controller']:4s} {{{r['levels']}}} a_r {r['a_r']}: {r['result']}")

@@ -71,6 +71,11 @@ class FakeRunner(F.Runner):
         return r, None
 
 
+def _build_json(d, dirty=False):
+    (d / 'fwsim_build.json').write_text(json.dumps(dict(esp32=dict(commit=FAKE_FW, dirty=dirty),
+                                                        dll_sha256=F.s3.sha256_file(d / 'fwsim.dll'))))
+
+
 def fake_run_jobs(jobs, work, n_parallel, say=None):
     """In-process run_jobs: same job files, job_main with the (patched) Runner."""
     os.makedirs(work, exist_ok=True)
@@ -81,12 +86,17 @@ def fake_run_jobs(jobs, work, n_parallel, say=None):
         p = os.path.join(work, f"job_{job['name']}.json")
         F.dump_json(job, p)
         post = job['name'].startswith('post_')
+        if post and fake_run_jobs.fail_post:
+            raise F.FeasStop(F.CHILD_FAILED)
         FakeRunner.salt = fake_run_jobs.salt if post else ''
         FakeRunner.gate_fail = fake_run_jobs.gate_fail if post else False
         F.job_main(p)
         FakeRunner.salt, FakeRunner.gate_fail = '', False
         with open(p + '.out.json', encoding='utf-8') as f:
-            out.append(json.load(f))
+            res = json.load(f)
+        if post and fake_run_jobs.drop_row:
+            res['levels'] = res['levels'][:-1]
+        out.append(res)
     return out
 
 
@@ -94,13 +104,14 @@ def fake_run_jobs(jobs, work, n_parallel, say=None):
 def fake(monkeypatch, tmp_path):
     dll = tmp_path / 'fwsim.dll'
     dll.write_bytes(b'fake')
-    (tmp_path / 'fwsim_build.json').write_text(json.dumps(dict(esp32=dict(commit=FAKE_FW, dirty=False))))
+    _build_json(tmp_path, dirty=False)
     monkeypatch.setattr(F, 'Runner', FakeRunner)
     monkeypatch.setattr(F, 'run_jobs', fake_run_jobs)
     monkeypatch.setattr(F, 'POP', 6)
     monkeypatch.setattr(F, 'N_GEN', 3)
     monkeypatch.setattr(F.o1, 'A_R', 0.5)
     fake_run_jobs.salt, fake_run_jobs.gate_fail = '', False
+    fake_run_jobs.fail_post, fake_run_jobs.drop_row = False, False
     FakeRunner.calls, FakeRunner.only = [], ('PID', 'ADRC')
     return dll
 
@@ -453,9 +464,13 @@ def test_firmware_must_be_clean_and_expected(fake, tmp_path):
     code, text = _search(fake, tmp_path / 'a', fw='0123456')
     assert code == 2 and 'expect-fw' in text
     assert yaml.safe_load((tmp_path / 'a' / 'meta.yaml').read_text(encoding='utf-8'))['status'] == 'stopped'
-    (fake.parent / 'fwsim_build.json').write_text(json.dumps(dict(esp32=dict(commit=FAKE_FW, dirty=True))))
+    _build_json(fake.parent, dirty=True)
     code, text = _search(fake, tmp_path / 'b')
     assert code == 2 and 'dirty' in text
+    _build_json(fake.parent, dirty=False)
+    fake.write_bytes(b'another dll')                                   # DLL swapped after the build (C12R2-3)
+    code, text = _search(fake, tmp_path / 'c')
+    assert code == 2 and 'dll_sha256' in text
 
 
 def test_existing_folder_refused(fake, tmp_path):
@@ -563,3 +578,86 @@ def test_tool_check_smoke_real_dll(tmp_path):
     root = os.path.abspath(os.path.join(FW, '..'))
     st = subprocess.run(['git', '-C', root, 'status', '--porcelain', '--'] + SIM_LOCK, capture_output=True, text=True)
     assert st.stdout.strip() == ''                                     # S04 lock and evaluator untouched
+
+
+# ── round 2 (C12R2-1..6) ─────────────────────────────────────────────────────────────
+
+SEARCH_META_KEYS = {'spec', 'kind', 'status', 'script_version', 'date', 'setup', 'operator', 'tool_check', 'expect_fw',
+                    'firmware', 'dll_sha256', 'hil_framework', 'script', 'plant', 'imu', 'seed_plant_imu', 'a_r',
+                    'o1_constants', 'gate', 'libraries', 'mu', 'level_sets', 'ga', 'boxes', 'interpretations',
+                    'files', 'sealed_sha256'}
+
+
+def test_public_meta_schema_is_locked(fake, tmp_path):
+    out = tmp_path / 'run'
+    _search(fake, out)
+    meta = yaml.safe_load((out / 'meta.yaml').read_text(encoding='utf-8'))
+    assert set(meta) == SEARCH_META_KEYS                               # no count, V or time added (C12R2-4)
+    assert meta['ga'] == dict(algorithm='pymoo GA (single objective)', pop=F.POP, n_gen=F.N_GEN, seed=F.GA_SEED,
+                              first_population='default + 23 uniform in the coded box')
+
+
+def test_job_main_sets_a_r_in_the_child(fake, tmp_path, monkeypatch):
+    monkeypatch.setattr(F.o1, 'A_R', 0.5)
+    job = dict(name='x', kind='levels', dll=str(fake), controller='PID', tag='T1', log_dir=None, a_r=0.3,
+               runs=[(DEFAULTS['PID'], 0.2, 0.436)])
+    p = tmp_path / 'job.json'
+    F.dump_json(job, p)
+    F.job_main(str(p))
+    assert FakeRunner.calls[-1][3] == 0.3                              # the job's a_r, not the process's
+
+
+def test_recheck_runs_every_set_holding_the_levels(fake, tmp_path, monkeypatch):
+    out = tmp_path / 'run'
+    _search(fake, out)
+    names = []
+
+    def spy(jobs, work, n, say=None):
+        names.extend(j['name'] for j in jobs)
+        return fake_run_jobs(jobs, work, n, say)
+    monkeypatch.setattr(F, 'run_jobs', spy)
+    code, _ = _recheck(fake, out, tmp_path / 'rc', '0.5')
+    assert code == 0
+    assert names == ['recheck_PID_T3', 'recheck_PID_T2', 'recheck_ADRC_T3', 'recheck_ADRC_T2']
+
+
+def test_recheck_needs_no_ga_box(fake, tmp_path, monkeypatch):
+    """A C8 binary whose default ki_xy is 0 cannot give a GA box, but recheck still runs (C12R2-6)."""
+    out = tmp_path / 'run'
+    _search(fake, out)
+    monkeypatch.setattr(FakeRunner, 'defaults', lambda self, ctrl: dict(DEFAULTS[ctrl], ki_xy=0.0, omega_o_xy=0.0))
+    code, text = _recheck(fake, out, tmp_path / 'rc', '0.2')
+    assert code == 0, text
+
+
+def test_level_check_error_closes_the_run(fake, tmp_path):
+    fake_run_jobs.drop_row = True                                      # a post-search result misses a level
+    out = tmp_path / 'run'
+    code, text = _search(fake, out)
+    assert code == 2 and 'stopped:' in text
+    assert yaml.safe_load((out / 'meta.yaml').read_text(encoding='utf-8'))['status'] == 'stopped'
+    notes = json.loads((out / 'sealed' / 'notes.json').read_text())
+    assert notes['stop'].startswith('LevelCheckError')
+    assert not (out / 'labels.csv').exists()
+
+
+def test_stop_after_the_searches_keeps_their_results(fake, tmp_path):
+    fake_run_jobs.fail_post = True                                     # a child fails after the 6 searches
+    out = tmp_path / 'run'
+    code, text = _search(fake, out)
+    assert code == 2 and F.CHILD_FAILED in text
+    kept = sorted(n for n in os.listdir(out / 'sealed' / 'jobs') if n.endswith('.out.json'))
+    assert len(kept) == 6 and all(n.startswith('job_search_') for n in kept)      # C12R2-1
+    man = json.loads((out / 'sealed' / 'manifest.json').read_text())
+    assert all(f'jobs/{n}' in man['files'] for n in kept) and 'notes.json' in man['files']
+    meta = yaml.safe_load((out / 'meta.yaml').read_text(encoding='utf-8'))
+    assert meta['status'] == 'stopped' and meta['sealed_sha256']['manifest.json'] ==         F.s3.sha256_file(out / 'sealed' / 'manifest.json')
+
+
+def test_duplicate_checked_meta_key_refused(fake, tmp_path):
+    out = tmp_path / 'run'
+    _search(fake, out)
+    with open(out / 'meta.yaml', 'a', encoding='utf-8') as f:
+        f.write('status: stopped' + chr(10) + 'tool_check: true' + chr(10))
+    code, _ = _recheck(fake, out, tmp_path / 'rc', '0.2')
+    assert code not in (0, None)
