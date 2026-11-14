@@ -66,8 +66,11 @@ END_TAIL_MS = 30
 # tính frame rỗng ở đầu log trước câu trả lời đầu tiên (j < 2)")
 MISO_SKIP_FRAMES = 2
 # RS-4 P1 (MOSI v4 / MISO v6, 48 bytes; Liam 14/11 CODE_RS4 "Làm P1, 48 byte"): on the real link, if none of
-# the first ID_CHECK_FRAMES MISO carries this run's run_id in bytes 40-47, the H7 is not a v6 build (or the
-# frame length differs): the run stops (stop_reason 'h7_not_miso_v6'). The H7 answers frame N in N + 2.
+# the first ID_CHECK_FRAMES MISO (transfers 1..50) is a good-CRC reply carrying this run's run_id and a frame_no
+# already sent (< the transfer's step) in bytes 40-47, the H7 is not a v6 build (or the frame length differs):
+# the run stops (stop_reason 'h7_not_miso_v6'). A run that ends before a confirmation fails too (manifest
+# id_confirmed False; Codex RS4-R10-2, Liam 14/11 CODE_RS4 "Sửa hẹp + vòng 11"). The H7 answers frame N in N + 2.
+# Simulate mode confirms on the run_id alone (the echo and FakeH7 send no CRC) and never fails on it.
 ID_CHECK_FRAMES = 50
 
 log =logging.getLogger('hil.node')
@@ -376,13 +379,15 @@ class HILNode:
         t_send = time.monotonic_ns()
         miso   = self._spi.transfer(mosi)
         t_recv = time.monotonic_ns()
+        chk = miso_check(miso)
         if self._id_first_step is None:
-            # RS-4 P1: first MISO carrying this run's run_id (one unpack per frame until then)
-            if miso_id(miso)[0] == self._run_id:
+            # RS-4 P1: first good-CRC MISO carrying this run's run_id and a frame already sent (Codex RS4-R10-2)
+            rid, fno = miso_id(miso)
+            if rid == self._run_id and (self.cfg.simulate_hw or (chk == MISO_OK and fno < self._step)):
                 self._id_first_step = self._step
-            elif self._step >= ID_CHECK_FRAMES and not self.cfg.simulate_hw:
-                log.error('MISO: no reply with run_id %08x in %d frames: H7 not MISO v6 (48-byte frame, '
-                          'RS-4 P1); run stopped', self._run_id, self._step)
+            elif self._step + 1 >= ID_CHECK_FRAMES and not self.cfg.simulate_hw:
+                log.error('MISO: no good-CRC reply with run_id %08x in %d transfers: H7 not MISO v6 (48-byte '
+                          'frame, RS-4 P1); run stopped', self._run_id, self._step + 1)
                 self._stop_reason = 'h7_not_miso_v6'
                 self._running = False
         if swa != self._swa:                 # I8-11: recorded once the frame went out
@@ -401,7 +406,6 @@ class HILNode:
             self._tail_t0_ns = time.monotonic_ns()
         torques = decode_torques(miso)
         if self._step >= MISO_SKIP_FRAMES:
-            chk = miso_check(miso)
             if chk != MISO_OK:
                 if chk == MISO_EMPTY:
                     self._miso_empty += 1
@@ -530,6 +534,7 @@ class HILNode:
                         miso_check=self.miso_summary(),                                # A3
                         frame_len=int(self._flog['mosi'].shape[1]), proto='mosi_v4_miso_v6',   # RS-4 P1
                         run_id=int(self._run_id), id_first_step=self._id_first_step,
+                        id_confirmed=self._id_first_step is not None,                   # R10-2
                         xfer_us=self._xfer_stats(n), timer_overruns=int(self._timer.overruns),
                         **self.swa_tail())                                             # I8-R2-3
         np.savez(self.cfg.frame_log, manifest=np.array(json.dumps(manifest)),
@@ -579,8 +584,11 @@ class HILNode:
     def run_failed(self) -> bool:
         """--finite-run ended in error:<reason>, or without reaching END, or (I8-R2-3, Codex round 3)
         reached END but its tail was cut (max_steps, a full frame log, a signal), so run_hil.py exits 3.
-        RS-4 P1: also any run stopped because the H7 did not send the run_id back (H7 not MISO v6)."""
+        RS-4 P1: also any run stopped because the H7 did not send the run_id back (H7 not MISO v6), and on the
+        real link any run that ended before a good-CRC reply confirmed it (Codex RS4-R10-2)."""
         if self._stop_reason == 'h7_not_miso_v6':
+            return True
+        if not self.cfg.simulate_hw and self._id_first_step is None:
             return True
         if self._lc is None:
             return False

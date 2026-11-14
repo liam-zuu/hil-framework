@@ -171,24 +171,81 @@ def test_fake_h7_sends_back_the_id_of_the_frame_it_answers():
     assert all(1 <= k - f <= 3 for k, f in got)
 
 
-@pytest.mark.parametrize('h7', ['v5', 'other_run'])
+def _good_crc(b40, id8) -> bytes:
+    """48-byte MISO with the CRC the H7 writes (bytes 8-9, little endian, CRC-16/CCITT over 0-7 and 10-47)."""
+    import binascii
+    b = bytearray(bytes(b40)[:40] + bytes(id8))
+    crc = binascii.crc_hqx(bytes(b[:8]) + bytes(b[10:]), 0xFFFF)
+    b[8], b[9] = crc & 0xFF, crc >> 8
+    return bytes(b)
+
+
+def _real_link_node(responder, max_steps=500, frame_log=None):
+    """HILNode on the 'real link' (simulate_hw False is set after the simulated SPI is built; the guard and
+    run_failed read it), with a known run_id."""
+    node = HILNode(MockPlant(), config=HILConfig(simulate_hw=True, max_steps=max_steps, period_us=1_000,
+                                                 frame_log=frame_log), responder=responder)
+    node.cfg.simulate_hw = False
+    node._run_id = 0x9ABCDEF0
+    return node
+
+
+RID = (0x9ABCDEF0).to_bytes(4, 'little')
+
+
+@pytest.mark.parametrize('h7', ['v5', 'other_run', 'crc_bad_id', 'echo_of_the_frame_sent'])
 def test_run_stops_when_the_h7_does_not_send_the_run_id_back(h7):
-    """RS-4 P1 guard: on the real link (simulate_hw False is set after the simulated SPI is built, the only
-    place the guard reads it), no reply with this run's run_id in ID_CHECK_FRAMES frames stops the run:
-    an H7 before MISO v6 (bytes 40-47 not sent) or replies of another run."""
+    """RS-4 P1 guard (Codex RS4-R10-2): on the real link, no good-CRC reply with this run's run_id and a frame
+    already sent in the first ID_CHECK_FRAMES transfers stops the run at transfer ID_CHECK_FRAMES: an H7 before
+    MISO v6 (bytes 40-47 not sent), replies of another run, a bad-CRC MISO whose bytes 40-47 happen to carry the
+    run_id (40 zero bytes + the id), or the MOSI id of the frame being sent echoed back (not a reply)."""
     import hil_node as hn
 
     def responder(mosi):
         if h7 == 'v5':
             return bytes(48)
-        return bytes(40) + (0x12345678).to_bytes(4, 'little') + mosi[44:48]
-    node = HILNode(MockPlant(), config=HILConfig(simulate_hw=True, max_steps=500, period_us=1_000),
-                   responder=responder)
-    node.cfg.simulate_hw = False
-    node._run_id = 0x9ABCDEF0
+        if h7 == 'other_run':
+            return _good_crc(bytes(40), (0x12345678).to_bytes(4, 'little') + mosi[44:48])
+        if h7 == 'crc_bad_id':                   # names frame k - 2 (already sent): only the CRC is wrong
+            k = int.from_bytes(bytes(mosi[44:48]), 'little')
+            return bytes(40) + RID + max(k - 2, 0).to_bytes(4, 'little')
+        return _good_crc(bytes(40), mosi[40:48])
+    node = _real_link_node(responder)
     node.run()
-    assert node._stop_reason == 'h7_not_miso_v6' and node._step == hn.ID_CHECK_FRAMES + 1
+    assert node._stop_reason == 'h7_not_miso_v6' and node._step == hn.ID_CHECK_FRAMES
     assert node._id_first_step is None and node.run_failed          # run_hil.py exits 3
+
+
+def test_good_crc_reply_confirms_v6_and_a_short_run_without_it_fails(tmp_path):
+    """Codex RS4-R10-2: a good-CRC reply naming an earlier frame of this run confirms v6 (the run goes on, not
+    failed); a run that ends before ID_CHECK_FRAMES transfers without a confirmation is failed, manifest
+    id_confirmed False (before: max_steps 50 never checked and exited 0)."""
+    import json
+
+    import numpy as np
+
+    import hil_node as hn
+    sent = []
+
+    def good(mosi):
+        sent.append(bytes(mosi[40:48]))
+        return _good_crc(bytes(40), sent[-3]) if len(sent) >= 3 else bytes(48)
+    node = _real_link_node(good, max_steps=200, frame_log=str(tmp_path / 'g.npz'))
+    node.run()
+    m = json.loads(str(np.load(tmp_path / 'g.npz')['manifest']))
+    assert node._stop_reason == 'max_steps' and node._id_first_step == 2 and not node.run_failed
+    assert m['id_confirmed'] is True and m['id_first_step'] == 2
+    for steps in (hn.ID_CHECK_FRAMES - 1, 3):
+        node = _real_link_node(lambda mosi: bytes(48), max_steps=steps, frame_log=str(tmp_path / f's{steps}.npz'))
+        node.run()
+        m = json.loads(str(np.load(tmp_path / f's{steps}.npz')['manifest']))
+        assert node._stop_reason == 'max_steps' and node.run_failed, steps
+        assert m['id_confirmed'] is False and m['id_first_step'] is None
+    # simulate mode keeps the exception: no CRC from the echo / FakeH7, never failed on it
+    sim = HILNode(MockPlant(), config=HILConfig(simulate_hw=True, max_steps=10, period_us=1_000),
+                  responder=lambda mosi: bytes(48))
+    sim.run()
+    assert sim._id_first_step is None and not sim.run_failed
 
 
 class RecPlant(MockPlant):

@@ -563,20 +563,25 @@ def _stale_reply(row, mosi_k, rx_us, rx_nf, stage, pre=400, dur4=5, run_id=None,
 
 @needs_gcc
 def test_reply_of_an_earlier_run_is_skipped():
-    # Codex RS4-R8-1 schedule, P1: frames 280-282 (the start of map_edge's range, k_run 400) never reach the H7;
-    # the H7 still holds a reply of a frame of the run before, with the same bytes as frame 282 but that run's
-    # run_id (frame_no 282 too), and sends it at transfers 283, 284 with RX_NF and stage one below frame 283's,
-    # received 4 ms before frame 283. Before P1 only the Pi send times showed it was not frame 282's. Now it is
-    # not of this run: skipped and counted, the run maps and the bracket holds the true edge.
+    # Codex RS4-R8-1 schedule, P1, with the H7 two-buffer order (Codex R9-2): no frame of this run reaches the
+    # H7 before 283 (frames 0-282 lost, k_lo 280 inside them; the Pi reads 0 bytes), and the H7 still holds two
+    # replies of the run before: X in the DMA buffer (_tx), Y staged (_tx_next). Transfer 283 (the first the H7
+    # receives) sends X, its callback moves Y to the DMA buffer; transfer 284 sends Y, its callback takes the
+    # reply of 283; transfer 285 sends that. X has the bytes of frame 282 with that run's run_id (frame_no 282
+    # too), received 4 ms before 283; Y another frame of that run. Before P1 only the Pi send times showed X was
+    # not frame 282's. Now neither is of this run: skipped and counted, the run maps, the bracket holds the edge.
     s = sim()
     tm, mo = s['timing'], s['frames']['mosi']
-    lost = (280, 281, 282)
+    lost = tuple(range(0, 283))
     miso = make_miso(mo, s['duty_cap'], tm, lost=lost).copy()
+    assert not miso[:285].any()                                       # the two-buffer order: nothing before 285
     nf283 = int(miso[285, 18]) | (int(miso[285, 19]) << 8)            # reply of frame 283 goes out at transfer 285
     st283 = (int(miso[285, 16]) >> 1) & 0x3F
-    stale = _stale_reply(miso[283], mo[282], float(tm['rx'][283]) - 4000.0, nf283 - 1, st283 - 1, run_id=OTHER_RUN)
-    miso[283] = stale
-    miso[284] = stale
+    x = _stale_reply(miso[285], mo[282], float(tm['rx'][283]) - 4000.0, nf283 - 2, st283 - 2, run_id=OTHER_RUN)
+    y = _stale_reply(miso[285], mo[282], float(tm['rx'][283]) - 3000.0, nf283 - 1, st283 - 1, run_id=OTHER_RUN,
+                     frame_no=283)
+    miso[283] = x
+    miso[284] = y
     fr = dict(s['frames'], miso=miso)
     ap = M.h7_apply(fr, 280, 3800)
     assert ap['ok'] and ap['applied'][0] == 283 and ap['foreign_n'] == 2, ap.get('reason', ap)
@@ -646,7 +651,9 @@ def test_bracket_steps_from_the_exact_anchors():
 def test_exact_anchors_hold_the_true_step():
     # the lemma P1 relies on, against independent true times: every frame has a true H7 receive; the anchors are
     # some of the frames (gaps included) at their exact receives. For any time t the true step (interpolated over
-    # ALL frames' true receives) lies in h7_to_steps(t) (the gap rule of Codex RS4-R5-1).
+    # ALL frames' true receives) lies in h7_to_steps(t) (the gap rule of Codex RS4-R5-1). Only the lemma: the
+    # anchors are given as full times here; turning RX_CYC (mod 2^32) into full times is
+    # test_cyccnt_unwrap_across_a_pi_stop_codex_r10_1 (B4, Codex RS4-R10-3).
     rng = np.random.default_rng(5)
     for trial in range(40):
         n = 300
@@ -668,12 +675,72 @@ def _small_frames(n=400, lost=()):
                 miso=miso), tm
 
 
-def test_frame_log_without_t_send_maps_and_40_byte_logs_are_refused():
+def test_frame_log_without_t_send_and_40_byte_logs_are_refused():
     fr, _ = _small_frames()
     assert M.h7_apply(fr, 20, 300)['ok']
-    assert M.h7_apply(dict(fr, t_send_ns=None), 20, 300)['ok']      # P1: the Pi clock is not used
+    no_t = M.h7_apply(dict(fr, t_send_ns=None), 20, 300)            # B4: the CYCCNT unwrap needs the Pi send times
+    assert not no_t['ok'] and 'without t_send_ns' in no_t['reason'], no_t['reason']
+    short = M.h7_apply(dict(fr, t_send_ns=fr['t_send_ns'][:-1]), 20, 300)
+    assert not short['ok'] and 'without t_send_ns' in short['reason'], short['reason']
     old = M.h7_apply(dict(fr, mosi=fr['mosi'][:, :40], miso=fr['miso'][:, :40]), 20, 300)
     assert not old['ok'] and '40-byte frames' in old['reason'] and 'ff616ab' in old['reason'], old['reason']
+
+
+W_US = 2.0 ** 32 / M.H7_CYC_PER_US                                   # one CYCCNT wrap, 8 947 848.53 us
+
+
+def _paused_frames(pause_us, at=5, n=400):
+    """_small_frames with the Pi stopped pause_us between frames at - 1 and at (Codex RS4-R10-1): the Pi send times
+    and the H7 receives both move by pause_us; every frame reaches the H7 and is answered at lag 2."""
+    mosi = np.array([mosi_frame([0.0] * 10, k) for k in range(n)])
+    T = np.arange(n) * 1000.0 + pause_us * (np.arange(n) >= at)
+    tm = dict(T=T, rx=np.round(T + 384.0), pre=np.full(n, 400.0), win=np.full(n, 10.0))
+    miso = make_miso(mosi, np.zeros((n, 4)), tm)
+    return dict(t_send_ns=np.round((T + 7.0e9) * 1000.0).astype(np.int64), t_pulse0_ns=None, mosi=mosi,
+                miso=miso), tm
+
+
+def test_cyccnt_unwrap_across_a_pi_stop_codex_r10_1():
+    # Codex RS4-R10-1 counterexample: the Pi stops W = 2^32 / 480 us between frames 4 and 5; identity, MOSI CRC,
+    # MISO CRC, RX_NF and the reply count are all right, but RX_CYC of frame 5 on is one wrap short and the nearest
+    # unwrap loses it (before the fix: ok with the anchors W early). B4: refused on the Pi send-time gap.
+    fr, tm = _paused_frames(W_US)
+    rx = np.asarray(tm['rx'], dtype=float)
+    d = (round((rx[5] + 1e6) * M.H7_CYC_PER_US) - round((rx[1] + 1e6) * M.H7_CYC_PER_US)) % 2 ** 32
+    assert abs(d - 4000 * M.H7_CYC_PER_US) <= M.H7_CYC_PER_US      # the wrap is invisible in the stamps
+    ap = M.h7_apply(fr, 0, 300)
+    assert not ap['ok'] and 'answered frames 4 and 5' in ap['reason'] and 'RS4-R10-1' in ap['reason'], ap
+    # half a wrap and just under the bound: refused at the bound, exact below it
+    for pause, ok in ((0.5 * W_US, False), (M.ANCHOR_GAP_MAX_S * 1e6, False), (M.ANCHOR_GAP_MAX_S * 1e6 - 2000.0, True)):
+        fr, tm = _paused_frames(pause)
+        ap = M.h7_apply(fr, 0, 300)
+        assert ap['ok'] == ok, (pause, ap.get('reason'))
+        if ok:
+            true = np.asarray(tm['rx'], dtype=float)[ap['applied']]
+            assert np.allclose(ap['anchor_us'], true - true[0], atol=0.01), pause
+            assert ap['max_anchor_send_gap_s'] < M.ANCHOR_GAP_MAX_S
+    # the Pi send times out of order between anchors (not a CLOCK_MONOTONIC read before each transfer)
+    fr, _ = _small_frames()
+    ts = fr['t_send_ns'].copy()
+    ts[101] = ts[100]
+    ap = M.h7_apply(dict(fr, t_send_ns=ts), 20, 300)
+    assert not ap['ok'] and 'answered frames 100 and 101' in ap['reason'], ap['reason']
+
+
+@needs_gcc
+def test_map_edge_refuses_a_pi_stop_of_one_wrap_inside_the_range():
+    # the same stop inside map_edge's range (between frames 300 and 301, k_run 400): refused on B4, not mapped
+    s = sim(dts=((300, 1, W_US + 1000.0),), edge_ms=(W_US + 415_300.0) / 1000.0)
+    em = run(s)
+    assert not em['ok'] and 'answered frames 300 and 301' in em['reason'] and 'B4' in em['reason'], em['reason']
+    assert em['constants']['anchor_gap_max_s'] == M.ANCHOR_GAP_MAX_S
+
+
+def test_anchor_gap_bound_keeps_the_unwrap_inside_the_half_wrap():
+    # B4 arithmetic: a send gap under ANCHOR_GAP_MAX_S at RHO_MAX_PPM plus a receive at most 3 s after its send stays
+    # inside the half wrap, so the nearest unwrap is the true one
+    assert abs(M.CYC_HALF_WRAP_S - 2.0 ** 31 / 480e6) < 1e-12
+    assert M.ANCHOR_GAP_MAX_S * (1 + M.RHO_MAX_PPM * 1e-6) + 3.0 < M.CYC_HALF_WRAP_S
 
 
 @pytest.mark.parametrize('stale_dt', [-4000.0, -1000.0, 0.0])

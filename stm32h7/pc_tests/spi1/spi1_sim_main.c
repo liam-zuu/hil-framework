@@ -8,7 +8,12 @@
  * two calls, which is where an interrupt can land on the board.
  * Not covered: an interrupt in the middle of one C struct copy (cannot be
  * forced on the PC); for that the test checks the copy runs with interrupts
- * masked (fake PRIMASK) and that PRIMASK is restored.
+ * masked (fake PRIMASK) and that PRIMASK is restored. Block 12 (RS-4 P1,
+ * Codex RS4-R10-3) lands frames at the points where the mask is lifted
+ * (fake_irq_hook in stm32h7xx_hal.h), inside SPI1_GetFrameEx and
+ * SPI1_SetOutputEx. main_step() is written like the main.c loop (one
+ * SPI1_GetFrameEx, the MISO info from that copy, one SPI1_SetOutputEx); it is
+ * not main.c: main.c itself is checked by reading only.
  *
  * Prints one line per check: "PASS <name>" or "FAIL <name>: <why>"; exit 1 if
  * any check failed. Build with -DOLD_API for the file before 29/10 (only the
@@ -26,6 +31,8 @@ GPIO_TypeDef fake_gpioa;
 DWT_Type     fake_dwt;
 int  fake_irq_disabled;
 long fake_irq_sections;
+void (*fake_irq_hook)(void);
+int  fake_irq_hook_in;
 
 static SPI_TypeDef       _spi_inst;
 static SPI_HandleTypeDef _hspi = { &_spi_inst, 0 };
@@ -146,7 +153,12 @@ static int miso_crc_ok(const uint8_t *b)
     memcpy(u + 8, t + 10, SPI1_FRAME_LEN - 10);
     return ref_crc(u, SPI1_FRAME_LEN - 2) == le16(b + 8);
 }
-/* Main loop as in main.c: one frame, checksum of its raw copy, reply */
+/* Apply window value the harness main loop sends for a frame received at
+ * CYCCNT c: differs from frame to frame, so a MISO with the window of
+ * another frame shows (Codex RS4-R10-3; main.c computes it from CYCCNT
+ * around the SetOmega calls of the frame it applies) */
+static uint16_t apply_of(uint32_t c) { return (uint16_t)((c * 2654435761u) >> 16); }
+/* Main loop like main.c: one frame, checksum of its raw copy, reply */
 static void main_step(void)
 {
     HIL_State_t s; HIL_TrajRef_t t; SPI1_FrameInfo_t fi; SPI1_MisoInfo_t mi;
@@ -155,11 +167,36 @@ static void main_step(void)
     mi.mosi_crc = S06_Crc16(0xFFFF, fi.raw, SPI1_FRAME_LEN);
     mi.rx_cyc = fi.rx_cyc;
     mi.rx_nf = fi.rx_nf;
-    mi.apply = 7;                    /* v5 apply window (L100), any value */
+    mi.apply = apply_of(fi.rx_cyc);  /* v5 apply window (L100), per frame */
     memcpy(mi.id, &fi.raw[HIL_MOSI_ID], HIL_MOSI_ID_LEN);   /* v6 (RS-4 P1), as main.c */
     memset(&o, 0, sizeof o);
     o.seq = s.seq;
     SPI1_SetOutputEx(&o, &mi);
+}
+
+/* Block 12 (RS-4 P1, Codex RS4-R10-3): one MISO sent is consistent when its
+ * id, MOSI checksum, stamp, seq and apply window are all those of the frame f
+ * its id names, f a frame already received */
+static int _k12, _b12_ok = 1, _b12_run = 1, _b12_n, _b12_fired;
+static void check_sent12(void)
+{
+    if (!miso_crc_ok(_sent) || le32(_sent + HIL_MISO_ID) == 0u) return;
+    uint32_t f = le32(_sent + HIL_MISO_ID + 4);
+    if (le32(_sent + HIL_MISO_ID) != RUN_ID) _b12_run = 0;
+    if (f >= (uint32_t)_k12
+        || le16(_sent + 10) != ref_crc(_mosi_of[f & 0xFF], SPI1_FRAME_LEN)
+        || le32(_sent + 12) != _cyc_of[f & 0xFF]
+        || le16(_sent + 20) != apply_of(_cyc_of[f & 0xFF])
+        || _sent[17] != (uint8_t)f)
+        _b12_ok = 0;
+    _b12_n++;
+}
+/* the interrupt: the next frame lands where the mask is lifted */
+static void irq_frame12(void)
+{
+    frame(_k12++, 0);
+    check_sent12();
+    _b12_fired++;
 }
 #endif
 
@@ -284,7 +321,7 @@ int main(void)
             if (le16(_sent + 10) != ref_crc(_mosi_of[a], SPI1_FRAME_LEN)) ok_mosi = 0;
             if (le32(_sent + 12) != _cyc_of[a]) ok_cyc = 0;
             if (le16(_sent + 18) != (uint16_t)(st0.frames + (uint32_t)(a - 60) + 1u)) ok_nf = 0;
-            if (le16(_sent + 20) != 7) ok_age = 0;
+            if (le16(_sent + 20) != apply_of(_cyc_of[a])) ok_age = 0;
             if (memcmp(_sent + HIL_MISO_ID, &_mosi_of[a][HIL_MOSI_ID], HIL_MOSI_ID_LEN) != 0) ok_id = 0;
             main_step();
         }
@@ -460,11 +497,13 @@ int main(void)
         check(ok, "apply_window_holds", "rx + [pre, pre + dur] us does not hold [c_pre, c_post]");
         check(ok_sat, "apply_window_saturation", "saturation not flagged or wrong");
     }
-    /* 11. RS-4 P1, assumption B1 of tools/hil_edge_map.py: in every MISO sent,
-     *     the id (MOSI 40-47: run_id, frame_no f), the MOSI checksum and the
-     *     receive stamp are those of ONE frame f, whatever the main loop does
-     *     between frames: 0 replies (frames not applied), 1, or 2-3 (a staged
-     *     reply replaced before the DMA took it). Schedule fixed, pseudo-random. */
+    /* 11. RS-4 P1, assumption B1 of tools/hil_edge_map.py, without interrupts
+     *     inside the main loop: in every MISO sent, the id (MOSI 40-47: run_id,
+     *     frame_no f), the MOSI checksum, the receive stamp and the apply window
+     *     are those of ONE frame f, whether the main loop replies 0 times
+     *     between frames (frames not applied), 1, or 2-3 (here the SAME frame
+     *     replied again: different frames replacing a staged reply are block
+     *     12). Schedule fixed, pseudo-random. */
     {
         int ok_one = 1, ok_run = 1, n_checked = 0;
         uint32_t lcg = 12345u;
@@ -478,6 +517,7 @@ int main(void)
                 if (f >= (uint32_t)k
                     || le16(_sent + 10) != ref_crc(_mosi_of[f & 0xFF], SPI1_FRAME_LEN)
                     || le32(_sent + 12) != _cyc_of[f & 0xFF]
+                    || le16(_sent + 20) != apply_of(_cyc_of[f & 0xFF])
                     || _sent[17] != (uint8_t)f)
                     ok_one = 0;
                 n_checked++;
@@ -487,13 +527,50 @@ int main(void)
             for (int c = 0; c < calls; c++) main_step();
         }
         check(ok_one && ok_run && n_checked > 50, "id_crc_stamp_same_frame",
-              "a MISO mixes the id of one frame with the checksum or stamp of another (B1)");
+              "a MISO mixes the id of one frame with the checksum, stamp or apply window of another (B1)");
         uint32_t mn, mx;
         SPI1_TakeCallbackCycles(&mn, &mx);
         check(mn <= mx, "callback_cycles_minmax", "min above max");
         SPI1_TakeCallbackCycles(&mn, &mx);
         check(mn == 0u && mx == 0u && fake_irq_disabled == 0, "callback_cycles_reset",
               "not reset after take, or PRIMASK left set");
+    }
+    /* 12. RS-4 P1, B1 with interrupts (Codex RS4-R10-3): frames land at the
+     *     points where the main loop lifts the mask: unmask 1 = end of
+     *     SPI1_GetFrameEx (after its copy, before the reply is built), 2 =
+     *     inside SPI1_SetOutputEx after the "taken" check, 3 = after the
+     *     S06Log_Pop of the next record or after the reply is published. So a
+     *     staged reply is replaced by the reply of a DIFFERENT frame, and the
+     *     main loop builds a reply while a newer frame is in. Between two masked
+     *     parts these functions touch only locals, _output and _slot, which the
+     *     callback does not use, so landing at the unmask stands for any point
+     *     there. Every MISO sent must stay consistent (check_sent12). */
+    {
+        uint32_t lcg = 777u;
+        int hits[4] = { 0, 0, 0, 0 }, n_mixed = 0;
+        _k12 = 300;
+        while (_k12 < 700) {
+            frame(_k12++, 0);
+            check_sent12();
+            lcg = lcg * 1103515245u + 12345u;
+            int calls = 1 + (int)((lcg >> 16) % 3u);         /* 1..3 main-loop replies */
+            int arm = ((lcg >> 8) & 3u) != 0u;               /* 3 in 4 */
+            int at = 1 + (int)((lcg >> 24) % 3u);            /* unmask 1..3 */
+            for (int c = 0; c < calls; c++) {
+                int fired0 = _b12_fired;
+                if (c == 0 && arm) { fake_irq_hook = irq_frame12; fake_irq_hook_in = at; }
+                main_step();
+                if (_b12_fired != fired0) {
+                    hits[at]++;
+                    if (c + 1 < calls) n_mixed++;           /* the next reply is of the newer frame */
+                }
+            }
+            fake_irq_hook = 0;
+        }
+        check(_b12_ok && _b12_run && _b12_n > 300, "id_apply_same_frame_with_interrupts",
+              "with frames landing inside the main loop, a MISO mixes the fields of two frames (B1)");
+        check(hits[1] > 20 && hits[2] > 20 && hits[3] > 20 && n_mixed > 20 && fake_irq_disabled == 0,
+              "interrupt_points_covered", "a mask-lift point of the main loop was not hit, or PRIMASK left set");
     }
 #endif
     return _fails ? 1 : 0;
