@@ -1098,6 +1098,7 @@ AGV_DEFAULT = r'D:/CLAUDE_THESIS/03_CODE/AGV_FIRMWARE'
 def test_fw_check_lists_and_refusals():
     """fw_check alone (no gcc, no oracle; Codex MAP5-R1-1 answer 3): both listed firmware accepted, alone or
     together; anything else, dirty, no #fw or no events file refused."""
+    assert M.fw_check([dict(sha='16702ff0e688', dirty='0', env='esp32-s3-devkitc-1')]) == ''     # MAP5-R2-2
     assert M.fw_check([dict(sha='5bde4c55bf3a', dirty='0', env='ladrc')]) == ''
     assert M.fw_check([dict(sha='16702ff0e688', dirty='0'), dict(sha='5bde4c55bf3a', dirty='0')]) == ''
     for fw, word in (([dict(sha='5bde4c55bf3a', dirty='1')], 'dirty=1'), ([dict(sha='5bde4c5', dirty='0')], '5bde4c5'),
@@ -1118,14 +1119,14 @@ def _git(agv, *args):
 def test_fw_counts_at_tick_keep_the_count_read_path():
     """Every firmware of FW_COUNTS_AT_TICK has the src/main.c blob and the src/encoder tree of FW_COUNTS_BASE (where
     L98 put the count read at t_now), in the AGV repo. Skipped only when AGV_REPO is not set and the default
-    checkout is not a git repo; otherwise any git failure (missing commit, wrong AGV_REPO) fails (Codex MAP5-R1-1)."""
-    import subprocess
+    checkout folder does not exist; otherwise any git failure (not a repo, missing commit, wrong AGV_REPO, git error)
+    fails with git's message (Codex MAP5-R1-1, R2-1)."""
     agv = os.environ.get('AGV_REPO')
     if agv is None:
         agv = AGV_DEFAULT
-        r = subprocess.run(['git', '-C', agv, 'rev-parse', '--git-dir'], capture_output=True, text=True)
-        if r.returncode != 0:
-            pytest.skip(f'no AGV repo at {agv} (set AGV_REPO to check)')
+        if not os.path.exists(agv):
+            pytest.skip(f'no AGV checkout at {agv} (set AGV_REPO to check)')
+    _git(agv, 'rev-parse', '--git-dir')                 # a folder that is there must be a working git repo
     ids = {}
     for short, full in AGV_FULL_SHA.items():
         assert _git(agv, 'rev-parse', '--verify', f'{full}^{{commit}}') == full
