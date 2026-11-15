@@ -19,7 +19,7 @@ import c8_u_imu as U  # noqa: E402
 
 T0 = 0.05            # report period of the campaign firmware (20 Hz)
 COLS = ['timestamp_us', 'log_seq', 'yaw_rad', 'rv_n', 'age_r_ms', 'gz', 'gyro_n', 'age_g_ms', 'reset_n',
-        'roll', 'pitch', 'run_active']
+        'roll', 'pitch', 'run_active', 'r_valid', 'g_valid']
 
 
 def wrap(a):
@@ -27,7 +27,8 @@ def wrap(a):
 
 
 def make_log(path, rate, t_end, s_plus=0.0, s_minus=0.0, drift=0.0, lat=0.004, late=(), miss=(),
-             run=None, tilt=0.0, t_start=10.0, reset_at=None, no_gyro=False, gyro_miss=None, runs=None):
+             run=None, tilt=0.0, t_start=10.0, reset_at=None, no_gyro=False, gyro_miss=None, runs=None,
+             reset_jump=0.0, valid_from=None):
     """ESP32 log at 100 Hz. rate(t) = true yaw rate [rad/s]; the sensor samples every T0 from t_start (sensor
     time = ESP32 time); the IMU yaw integrates the rate with scale (1 + s_plus) for positive steps and
     (1 + s_minus) for negative ones, plus drift [rad/s]; a report reaches the ESP32 lat seconds after it is
@@ -47,7 +48,7 @@ def make_log(path, rate, t_end, s_plus=0.0, s_minus=0.0, drift=0.0, lat=0.004, l
     imu = imu + drift * (ts - t_start)
     if reset_at is not None:
         k0 = int(np.searchsorted(ts, reset_at))
-        imu[k0:] = imu[k0:] - imu[k0]
+        imu[k0:] = imu[k0:] - imu[k0] + reset_jump
     gzs = np.array([rate(x) for x in ts])
     rv = sorted((ts[k] + lat + late.get(k, 0.0), k) for k in range(len(ts)) if k not in miss)
     gy = sorted((ts[k] + lat + late.get(k, 0.0), k) for k in range(len(ts)) if k not in gyro_miss)
@@ -72,7 +73,9 @@ def make_log(path, rate, t_end, s_plus=0.0, s_minus=0.0, drift=0.0, lat=0.004, l
                      'gz': repr(float(gzs[lg[1]])), 'gyro_n': '0' if no_gyro else str(ng),
                      'age_g_ms': '-1.0' if no_gyro else repr(float((t - lg[0]) * 1e3)),
                      'reset_n': '1' if reset_at is not None and t >= reset_at else '0',
-                     'roll': repr(float(tilt * math.sin(t))), 'pitch': '0.0', 'run_active': on})
+                     'roll': repr(float(tilt * math.sin(t))), 'pitch': '0.0', 'run_active': on,
+                     'r_valid': '0' if valid_from is not None and t < valid_from else '1',
+                     'g_valid': '0' if valid_from is not None and t < valid_from else '1'})
         seq += 1
     with open(path, 'w', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=COLS)
@@ -419,8 +422,8 @@ def test_cu2_2_no_yaw_from_the_report_before_an_unrecoverable_gap(tmp_path):
     S = U.rv_samples(U.load_log(p), period_s=T0)
     t_after = S['t'][S['t'] > 10.0 + 33 * T0][0]           # first kept report after the gap
     t_before = S['t'][S['t'] < 10.0 + 20 * T0][-1]          # last kept report before it
-    v = U.interp_yaw(S, np.array([t_before - 0.03, t_before, t_after, t_after + 0.002]))
-    assert np.isfinite(v[0]) and np.all(np.isnan(v[1:]))
+    v = U.interp_yaw(S, np.array([t_before - 0.03, t_before, t_before + 0.01, t_after, t_after + 0.002]))
+    assert np.all(np.isfinite(v[:2])) and np.all(np.isnan(v[2:]))       # usable up to the report before the gap
 
 
 def test_cu2_3_valid_jitter_accepted(tmp_path):
@@ -502,6 +505,60 @@ def test_cu12_tre_common_frame_set(tmp_path):
     write_frames(fr, rate, 10.0, a + 23.0, offset=0.5)
     r = U.tre_one(fr, lg, 0.5)
     assert r['tau_s'] == pytest.approx(0.004, abs=0.001) and math.isfinite(r['rms_rad'])
+
+
+# ── Codex round 3 (Liam 15/11 "sua + soan goi vong 4") ────────────────────────────────────────────
+
+def test_cu2_r3_gap_bound_on_both_time_bases():
+    """tau 55 ms: the reversal happens in the sample-time gap [0, 0.1], before the receive-time gap."""
+    tg = np.arange(-0.05, 0.2001, 0.005)
+    gz = np.where((tg >= 0) & (tg < 0.025), 4.0, np.where((tg >= 0.025) & (tg < 0.05), -4.0, 0.0))
+    S = dict(t_all=np.array([0.0, 0.1]), t_recv=np.array([0.055, 0.155]), n_all=np.array([0, 2]),
+             psi_all=np.array([0.0, 0.0]), tg=tg, gz=gz, period_fit_s=0.05, h_lim=0.105)
+    P, N = U.turn_totals(S, 0.0, 0.1)
+    assert P >= 0.1 and N >= 0.1
+
+
+def test_cu4_r3_no_interpolation_to_a_report_after_reset(tmp_path):
+    p = str(tmp_path / 'a.csv')
+    make_log(p, lambda t: 0.0, 13.0, late={19: 0.015}, reset_at=11.0, reset_jump=1.0)
+    S = U.rv_samples(U.load_log(p), period_s=T0)
+    q = np.arange(10.5, 11.2, 0.005)
+    v = U.interp_yaw(S, q)
+    assert np.all(np.isnan(v) | (np.abs(v) < 1e-9))                 # never a value pulled toward the reset jump
+    assert np.isfinite(v[0])
+
+
+def test_cu4_r3_settle_flag(tmp_path):
+    p = str(tmp_path / 'a.csv')
+    make_log(p, lambda t: 0.3, 14.0, valid_from=11.0)
+    S = U.rv_samples(U.load_log(p), period_s=T0)
+    v = U.interp_yaw(S, np.array([10.5, 12.0]))
+    assert np.isnan(v[0]) and np.isfinite(v[1]) and S['n_invalid'] > 0
+    c8, a, _ = _c8_log(tmp_path, name='c.csv', valid_from=12.5)        # flag still 0 inside [t_on - 2 s, ...]
+    g = _globals()
+    with pytest.raises(U.InputError, match='CU-4'):
+        U.tong('O1-F08', [c8], g['thang'], g['troi'], g['tre'], u_g=0.01, le=0.25, out=str(tmp_path / 'u.json'),
+               tail_s=1.0)
+
+
+def test_cu3_1_long_gap_with_off_nominal_period():
+    I = np.r_[np.arange(0, 100), np.arange(200, 300)]
+    r = 10.0 + 0.0508 * I
+    n, a, b, j, inl = U._grid(r, 0.05, 0.005)
+    assert inl.all() and n[100] - n[99] == 101 and b == pytest.approx(0.0508)
+
+
+def test_cu12_r3_common_set_smaller_than_some_set(tmp_path):
+    a = 13.0
+    t1 = a + math.radians(300) / 2.0
+    t2 = t1 + math.radians(300) / 2.0
+    rate = lambda t: 2.0 if a <= t < t1 else (-2.0 if t1 <= t < t2 else 0.0)      # noqa: E731
+    lg, fr = str(tmp_path / 'g.csv'), str(tmp_path / 'g_frames.csv')
+    make_log(lg, rate, a + 23.0, lat=0.004, run=(a, a + 16.0), miss={90, 91}, gyro_miss=set())
+    write_frames(fr, rate, 10.0, a + 23.0, offset=0.5)
+    r = U.tre_one(fr, lg, 0.5)
+    assert r['n_frames'] < r['n_frames_some']
 
 
 # ── scale (thang) ─────────────────────────────────────────────────────────────────────

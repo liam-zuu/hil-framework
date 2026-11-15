@@ -155,7 +155,7 @@ def load_log(path, need=LOG_COLS):
     if miss:
         raise InputError(f'{path}: no column {miss}')
     rows, n_dup = _drop_duplicates(path, rows)
-    cols = set(need) | ({'run_active', 'roll', 'pitch'} & set(rows[0]))
+    cols = set(need) | ({'run_active', 'roll', 'pitch', 'r_valid', 'g_valid'} & set(rows[0]))
     try:
         L = {c: np.array([float(r[c]) if r[c] not in ('', None) else np.nan for r in rows]) for c in cols}
     except ValueError as exc:
@@ -194,12 +194,17 @@ def _grid(r, period_s, j_lim):
     """Index n of each receive time on the report grid of the LOCKED period (CU-1, CU2-3: no median of the
     spacings), line fit r = a + b n on the inliers, residual j. The fitted period must stay within +-2 % and at
     most MAX_LATE of the reports may be off the grid."""
+    d = np.diff(r)
+    near = d[(d > 0.5 * period_s) & (d < 1.5 * period_s)]
+    b_idx = float(np.median(near)) if near.size else period_s
+    if not abs(b_idx / period_s - 1.0) <= PERIOD_TOL:       # CU3-1: use the measured spacing only when plausible
+        b_idx = period_s                                     # CU2-3: never refuse on it
     n = np.zeros(len(r), dtype=int)
     i_lt = 0                                   # last trusted report
     for k in range(1, len(r)):
-        m = max(1, int(round((r[k] - r[i_lt]) / period_s)))
+        m = max(1, int(round((r[k] - r[i_lt]) / b_idx)))
         n[k] = n[i_lt] + m
-        if abs(r[k] - (r[i_lt] + m * period_s)) <= 0.25 * period_s:
+        if abs(r[k] - (r[i_lt] + m * b_idx)) <= 0.25 * b_idx:
             i_lt = k
     inl = np.ones(len(r), dtype=bool)
     for _ in range(10):
@@ -219,7 +224,11 @@ def _grid(r, period_s, j_lim):
 
 
 def gyro_samples(L):
+    """Gyro reports (receive times, gz); with a g_valid column, reports at rows with g_valid != 1 are dropped
+    (firmware: age, settle time after a reset, CU-4)."""
     idx = report_rows(L['gyro_n'], L['age_g_ms'])
+    if 'g_valid' in L:
+        idx = idx[L['g_valid'][idx] == 1]
     t = L['timestamp_us'][idx] * 1e-6 - L['age_g_ms'][idx] * 1e-3
     if np.any(np.diff(t) <= 0):
         raise InputError(f'{L.get("path")}: gyro receive times not increasing')
@@ -259,6 +268,8 @@ def rv_samples(L, period_s=PERIOD_S, tau_hat=0.0, s_plus=0.0, s_minus=0.0, j_lim
     if not np.all(np.isfinite(y)):
         raise InputError(f'{L.get("path")}: yaw_rad not finite')
     n, a, b, j, keep = _grid(r, period_s, j_lim)
+    valid = (L['r_valid'][idx] == 1) if 'r_valid' in L else np.ones(len(idx), dtype=bool)
+    keep = keep & valid                                    # CU-4: firmware settle / age flag
     t_all = a + b * n - tau_hat
     tg, gz = gyro_samples(L) if np.any(L['gyro_n'] > 0) else (np.array([]), np.array([]))
     d0 = (np.diff(y) + math.pi) % (2 * math.pi) - math.pi
@@ -280,26 +291,28 @@ def rv_samples(L, period_s=PERIOD_S, tau_hat=0.0, s_plus=0.0, s_minus=0.0, j_lim
     d = np.where(d > 0, d / (1.0 + s_plus), d / (1.0 + s_minus))
     psi = y[0] + np.concatenate([[0.0], np.cumsum(d)])
     return dict(t=t_all[keep], psi=psi[keep], t_all=t_all, psi_all=psi, n_all=n, t_recv=r, j=j, keep=keep,
-                n_samples=int(idx.size), n_late=int((~keep).sum()), period_fit_s=float(b), rows=idx, h_lim=h_lim,
+                n_samples=int(idx.size), n_late=int((~keep & valid).sum()), n_invalid=int((~valid).sum()),
+                valid=valid, period_fit_s=float(b), rows=idx, h_lim=h_lim,
                 t_break=t_break, resets=resets, tg=tg, gz=gz)
 
 
 def interp_yaw(S, t, h_lim=None):
-    """IMU yaw at times t (same clock as S['t']): linear between two kept reports at most h_lim apart, strictly
-    before S['t_break']; NaN otherwise."""
+    """IMU yaw at times t (same clock as S['t']): linear between two kept reports at most h_lim apart, both at or
+    before S['t_break'] (the last usable report); NaN otherwise."""
     h_lim = S.get('h_lim', H_LIM_S) if h_lim is None else h_lim
     t = np.atleast_1d(np.asarray(t, dtype=float))
     ts, ps = S['t'], S['psi']
     tb = S.get('t_break', math.inf)
     out = np.full(t.shape, np.nan)
     i = np.searchsorted(ts, t, side='right')
-    ok = (i > 0) & (i < len(ts)) & (t < tb)
+    ok = (i > 0) & (i < len(ts)) & (t <= tb)
+    ok[ok] = ts[i[ok]] <= tb                                  # CU-4: the later end too
     i0, i1 = i[ok] - 1, i[ok]
     gap = ts[i1] - ts[i0]
     w = (t[ok] - ts[i0]) / gap
     v = np.where(gap <= h_lim + 1e-9, ps[i0] + w * (ps[i1] - ps[i0]), np.nan)
     out[ok] = v
-    exact = np.isin(t, ts) & (t < tb)
+    exact = np.isin(t, ts) & (t <= tb)
     if exact.any():
         out[exact] = np.interp(t[exact], ts, ps)
     return out
@@ -320,13 +333,16 @@ def turn_totals(S, w0, w1):
     tg, gz, tr = S.get('tg', np.array([])), S.get('gz', np.array([])), S['t_recv']
     for k in range(i0, i1):
         if na[k + 1] - na[k] > 1:
-            a, b = tr[k], tr[k + 1]
+            a, b = min(ta[k], tr[k]), max(ta[k + 1], tr[k + 1])  # CU-2 (round 3): both time bases
             if tg.size < 2 or tg[0] > a or tg[-1] < b:
                 raise InputError('missing IMU reports in the window without gyro reports over the gap (CU-2)')
+            dur = b - a                                       # length of the gap
+            per = S.get('period_fit_s', PERIOD_S)
+            a, b = max(a - per, tg[0]), min(b + per, tg[-1])   # wider only to find the largest |gz|
             j0, j1 = np.searchsorted(tg, a, 'right') - 1, np.searchsorted(tg, b, 'left')
             if np.max(np.diff(tg[j0:j1 + 1])) > S.get('h_lim', H_LIM_S):
                 raise InputError('missing IMU reports in the window and gyro reports too far apart (CU-2)')
-            extra = float(np.max(np.abs(gz[j0:j1 + 1]))) * (b - a)
+            extra = float(np.max(np.abs(gz[j0:j1 + 1]))) * dur
             P += extra
             N += extra
     return P, N
@@ -547,7 +563,10 @@ def _level_numbers(path, muc, tre, thang_d, period_s, j_lim, h_lim, pre_s, tail_
     S = rv_samples(L, period_s=period_s, tau_hat=tre['tau_hat_s'], s_plus=thang_d['s_plus'],
                    s_minus=thang_d['s_minus'], j_lim=j_lim, h_lim=h_lim)
     _check_no_reset(S, w0, w1, path)
-    if S['t_break'] <= w1:
+    inv = S['t_all'][~S['valid']]
+    if np.any((inv >= w0) & (inv <= w1)):
+        raise InputError(f'{path}: IMU reports flagged not valid by the firmware (r_valid) inside the window (CU-4)')
+    if S['t_break'] < w1:
         raise InputError(f'{path}: a gap in the IMU reports could not be unwrapped inside the window (CU-3)')
     P, N = turn_totals(S, w0, w1)
     tg, gz = gyro_samples(L) if np.any(L['gyro_n'] > 0) else (np.array([]), np.array([]))
@@ -695,7 +714,8 @@ def tre_one(frames, log, offset_s, s_plus=0.0, s_minus=0.0, period_s=PERIOD_S, j
     tau = taus[k] + (0.5 * step_s * (y0 - y2) / den if den > 0 else 0.0)
     if not (math.isfinite(tau) and math.isfinite(y1)):
         raise InputError(f'{frames}: delay not determined (CU-12)')
-    return dict(tau_s=float(tau), rms_rad=float(y1), n_frames=int((win & common).sum()), offset_s=offset_s,
+    return dict(tau_s=float(tau), rms_rad=float(y1), n_frames=int((win & common).sum()),
+                n_frames_some=int((win & np.any(np.isfinite(P), axis=0)).sum()), offset_s=offset_s,
                 n_late=S0['n_late'], frames=os.path.basename(frames), frames_sha256=sha256(frames),
                 log=os.path.basename(log), log_sha256=sha256(log))
 
