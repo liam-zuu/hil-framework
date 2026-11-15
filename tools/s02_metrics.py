@@ -72,6 +72,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from agv_logger import (COLUMNS, MAX_US_PER_SEQ, N_IMU, OLD_LENGTHS, RATE_SLACK_US,  # noqa: E402
                         SEGMENT_COLUMNS, SEGMENT_STATUSES, file_digest, parse_run_end)
 from run_validity import pos_reset_mid, run_bad_fields  # noqa: E402
+import s02_cmd_path  # noqa: E402
 HEADS = [COLUMNS] + [COLUMNS[:n] for n in OLD_LENGTHS]     # 86, 28, 37, 66, 80, 85 columns
 
 R_WHEEL = 0.0485
@@ -117,12 +118,14 @@ def load_log(path):
     data = np.array([[float(x) if x != '' else np.nan for x in r] for r in body])
     log_seq_all = None
     every = {h: data[:, head.index(h)] for h in ('run_active', 'pos_reset_n', 'motor_on') if h in head}
+    all_cols = {h: data[:, i] for i, h in enumerate(head)}       # CODE_S02: before the motor-off filter
     if kind == 'dut':
         log_seq_all = data[:, head.index('log_seq')]
         # 10 Hz lines while the motor is off carry no controller tick: drop them
         data = data[data[:, head.index('motor_on')] == 1]
     log = {h: data[:, i] for i, h in enumerate(head)}
     log['_every'] = every                                        # L37 check on every line (S3C-8)
+    log['_all'] = all_cols                                       # s02_cmd_path: every column, every line
     if kind == 'dut':
         log['_seq_all'] = log_seq_all                            # every line, motor off ones too
         log['_run_end_last'] = run_end_last
@@ -347,7 +350,7 @@ def step_segments(t, sp, v):
     return out
 
 
-def compute(log, test_id):
+def compute(log, test_id, platform=''):
     t = (log['timestamp_us'] - log['timestamp_us'][0]) * 1e-6
     sp = np.stack([log['sp_vx'], log['sp_vy'], log['sp_wz']], axis=1)
     v = np.stack([log['vx'], log['vy'], log['wz']], axis=1)
@@ -357,8 +360,10 @@ def compute(log, test_id):
     m['missing_pct'], m['missing_tail_known'] = log_loss(log)
     ev = log.get('_every', log)          # every logged line, before the motor-off filter (S3C-8)
     m.update(run_bad_fields(pos_reset_mid(ev.get('run_active'), ev.get('pos_reset_n'), ev.get('motor_on'))))
+    if '_all' in log and test_id in s02_cmd_path.GROUP_A:
+        m.update(s02_cmd_path.stats(log['_all'], test_id, platform))     # CODE_S02: t = 0, preparation, command path
 
-    moving = np.flatnonzero(np.any(np.abs(sp) > 1e-9, axis=1))
+    moving =np.flatnonzero(np.any(np.abs(sp) > 1e-9, axis=1))
     t0, t1 = t[moving[0]] + WINDOW_SKIP_S, t[moving[-1]]
     win = (t >= t0) & (t <= t1)
     e = sp[win] - v[win]
@@ -402,7 +407,7 @@ def run_dir_metrics(d, out_name='metrics.csv'):
             continue
         if r['platform'].strip().lower() == 'hil':
             check_no_udp_taken(os.path.join(d, r['file']) + '.events.txt')
-        m = compute(load_log(os.path.join(d, r['file'])), r['test_id'])
+        m = compute(load_log(os.path.join(d, r['file'])), r['test_id'], r['platform'])
         out.append(dict(run_id=r['run_id'], platform=r['platform'], controller=r['controller'],
                         test_id=r['test_id'], speed_mps=r['speed_mps'], rep=r['rep'], **m))
     keys = []
