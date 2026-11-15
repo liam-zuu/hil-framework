@@ -32,6 +32,9 @@ Commands (the operator types them while working; every time stamp is the PC cloc
                                          scored without --esp-log: gate decide g1,g2) is a lost run,
                                          --outcome hong_he_do --fail-cause anh_xa_tu_choi; at most 3 reruns
                                          of one gain at one level, then that level is chua_ket_luan
+                                         B8-1 (S05 v3.20 C9 (a)-(c), 14/11): a judged car run needs the
+                                         camera scorer output (two frame domains, G1 fields: see GATE_COLS);
+                                         a judged car / final_hil run needs both boot answers (API and summary)
   cancel / status                        drop the open run / show it. cancel only before the "run"
                                          step (S05 §3.3: every started run counts, EA-6); time of the
                                          steps already logged goes to m7_dev_effort_log.csv
@@ -85,7 +88,8 @@ TUNING_NEW = (['run_uid', 'campaign', 'script_run_id', 'gain_set_id', 'speed_mps
                'replaces_run_uid', 'candidate_no', 'results_dir', 'completed', 'e_perp_max_m',
                'run_outcome', 'fail_cause', 'rule_version', 'fw_hash']
               + ['g_' + g for g in GAINS]
-              + ['t_operator_wait_s', 't_machine_s', 'wall_start', 'wall_end', 'n_sim_evals'])
+              + ['t_operator_wait_s', 't_machine_s', 'wall_start', 'wall_end', 'n_sim_evals']
+              + ['boot_before', 'boot_after'])          # R134 (b): S05 4.7 (iv), R3V-9
 # tune stop gate v3 (dossier 00_OVERVIEW/2026-11-12_De_xuat_cong_dung_tune_bam_huong_van_toc_v3.md section 6,
 # CG2-12; Liam 12/11 CODE local_87282b70 "làm ngay đi"): per run the measured maximum q, its bound U and
 # the state of each condition, so stopping, the S05 4.4 ranking and gate_result can be recomputed.
@@ -101,8 +105,24 @@ GATE_CONDS = o1_gate.CONDS
 # gate_u_t = the U_t used (empty = not known: HIL run without the run_active edge mapping, RS-4)
 GATE_FIELDS = ('q', 'lo', 'hi', 'n_undef', 'state')
 OLD_GATE_U = tuple(f'g{i}_u' for i in range(1, 6))       # gate_v3_g1235 columns, dropped by migrate when empty
+# B8-1 B81-3 (S05 v3.20 6.3, C9 (c); O1 v11.15 3.3 "Khung nghi ngo vi tri", 3.5 R4V-3, R4V-4, RS2-10; CODE 14/11 gave
+# it to CODE_R134, Liam 14/11 CODE_R134 "Gop vao vong 4 (Recommended)"): G2-G5 stored on the two frame domains of
+# O1 3.3. g*_q, g*_lo, g*_hi, g*_n_undef (and g*_state) are the UNION domain (t = 0 to the later t_done, or to the
+# deadline when one way does not complete: every frame the run reports, the S05 4.4 ranking); g*_<field>_chung the
+# COMMON domain (t = 0 to the earlier t_done, or to the deadline when neither completes). One way of using the
+# frames (fwsim, HIL: no camera, no position-suspect frame) or two equal t_done: the two domains are one and the
+# two sets equal. G1 has no q, lo, hi (RS2-10): g1_ways (1 fwsim / HIL, 2 floor), g1_t_deadline, g1_t_done_1
+# (floor: suspect frames used like every frame), g1_t_done_2 (floor: suspect frames as gaps), empty = not completed
+# before the deadline; fwsim / HIL: g1_t1 (first tracking-error frame, empty = none), g1_prog_before_t1 (progress
+# reached S - D_d before t1), g1_cond25_before_deadline (a time before the deadline with conditions 2-5 met);
+# floor: g1_t1, g1_cat_t1 (R2V-4: a khong_dat run by the exception before t1, fail cause VIOL_BEFORE; G1 is then
+# chua_ket_luan). States are recomputed from these (gate_g1_state, cond_state2), never trusted.
+DOMAIN_FIELDS = ('q', 'lo', 'hi', 'n_undef')
+G1_COLS = ['g1_ways', 'g1_t_deadline', 'g1_t_done_1', 'g1_t_done_2', 'g1_t1', 'g1_prog_before_t1',
+           'g1_cond25_before_deadline', 'g1_cat_t1']
 GATE_COLS = (['gate_version', 'gate_decide', 'gate_json_sha256', 'gate_u_t', 'g1_q', 'g1_state']
-             + [f'{g}_{x}' for g in o1_gate.MEASURED for x in GATE_FIELDS])
+             + [f'{g}_{x}' for g in o1_gate.MEASURED for x in GATE_FIELDS]
+             + [f'{g}_{x}_chung' for g in o1_gate.MEASURED for x in DOMAIN_FIELDS] + G1_COLS)
 TUNING_COLS = TUNING_OLD + TUNING_NEW + GATE_COLS
 EFFORT_OLD = ['ngay', 'bat_dau', 'ket_thuc', 'gio', 'buoc', 'giai_doan', 'mot_lan_hay_thich_nghi', 'dut',
               'ghi_chu', 'chien_dich', 'lap_lai']
@@ -125,6 +145,31 @@ FINAL_LOST_N = 3                         # S05 §4.6: stop a condition after 3 l
 # level counted, in a row or not; final_hil keeps its own rule (§4.6, FINAL_LOST_N lost runs in a row).
 MAP_REFUSED = 'anh_xa_tu_choi'           # --fail-cause of such a run
 MAP_RERUNS_MAX = 3
+# R134 package (Liam 14/11 CODE_R134 local_eb9f3b5c "duyet goi sua code fix/r134-answers"):
+# (b) S05 v3.13-v3.17 4.7 (iv), R3V-9, O1 v11.10 R4: the boot of gain_send.py --query just before and just after
+#     the run go to the run history (boot_before, boot_after). Both given and equal: one ESP32 boot over the run.
+#     Missing, unreadable or different: a run failed by operation, so only hong_he_do with fail cause BOOT_FAIL.
+#     The CLI 'end' requires the two query files (--query-before, --query-after) for a judged run
+#     (dat / khong_dat / chua_ket_luan) on the car (every stage: the obstacle-stop rule of O1 R4 ties #us to
+#     the run through them) and on the HIL at final_hil (tv_duty, S05 4.7 (iv)); query_files_needed().
+#     [CACH HIEU] other HIL stages and SIM do not need them (the HIL rules of O1 3.5 do not use #us). The
+#     Python API keeps them optional (older callers, demo); summary refuses a judged row whose two boots
+#     disagree.
+# (d) SC3-2 (S05 §6.3 "Kiem cuoi va tong hop", rule [SC3-2]): a run of a campaign of CAMPAIGNS (A-PID on) is
+#     never dat without gate evidence: end refuses dat without --gate-json on every platform (HIL already
+#     needs it for any judged outcome, Codex S315-1), and the summary refuses a dat row of a campaign with
+#     empty gate columns (NO_GATE_EVIDENCE). [CACH HIEU] "historic rows before the gate columns" are rows
+#     without a campaign of CAMPAIGNS (the example rows of m7_tuning_log.csv); they are not in any campaign
+#     summary, so they never reach gate_result or a stop rule; count_no_gate() reports them apart.
+# B8-1 (S05 v3.20 8.1 C9 (a), (b); B81-1, B81-2; CODE 14/11 to CODE_R134):
+# B81-1 a car run (platform HW) judged dat / khong_dat / chua_ket_luan carries the camera scorer output
+#     (--gate-json with the two frame domains and the G1 fields of the floor, B81-3 above), at end and in the
+#     summary (a judged car row without gate columns is an error, as for HIL).
+# B81-2 boot_needed (car runs, HIL final_hil) is applied by end and by the summary, not only by the CLI: a judged
+#     run there without both boot answers is a run failed by operation (only hong_he_do with BOOT_FAIL).
+BOOT_FAIL = 'boot_thieu_hay_khac'        # --fail-cause of a run without one ESP32 boot shown
+NO_GATE_EVIDENCE = 'chua_du_bang_chung_cong'   # SC3-2: a dat row without gate columns
+VIOL_BEFORE = 'vi_pham_truoc_loi_he_do'  # S05 6.1, O1 3.5 R2V-4: khong_dat by a violation before t1 (floor, cat_t1)
 
 CAMPAIGNS = ('A-PID', 'A-LADRC', 'B-PID', 'B-LADRC', 'B-chung', 'RQ2-INIT-PID', 'RQ2-INIT-LADRC', 'RQ2')
 TUNED = ('A-PID', 'A-LADRC', 'B-PID', 'B-LADRC')
@@ -308,7 +353,15 @@ def _parse_gains(text: str) -> dict:
 
 
 def next_iter_no(ds: str, session: str) -> int:
+    """Next iter_no of `session`: past the logged rows AND the open run of the same session (S05 v3.15
+    Codex round 5 P3: begin(session='MACHINE') then machine gave two MACHINE:1; Liam 14/11 CODE_R134
+    "Lam cung goi (Recommended)"). Limit (Codex R134C2-9, DEFERRED): one writer at a time (one operator, one
+    command), as the S05 workflow runs it; two processes writing the same dataset at once could both take the
+    same number, and summary then refuses the log (a run_uid on two rows, S315-R4-1)."""
     nums = [int(_f(r.get('iter_no'))) for r in read_rows(os.path.join(ds, TUNING)) if r.get('session_id') == session]
+    run = _load_open(ds)
+    if run and run.get('row', {}).get('session_id') == session:
+        nums.append(int(_f(run['row'].get('iter_no'))))
     return max(nums, default=0) + 1
 
 
@@ -474,10 +527,141 @@ def _n_undef(x, what: str) -> int:
     return int(x)
 
 
+G1_KEYS = ('t_done', 't_deadline', 't1', 'prog_before_t1', 'cond25_before_deadline', 'cat_t1')
+
+
+def _opt_bool(x, what: str):
+    if x is not None and not isinstance(x, bool):
+        raise LogError(f'gate {what}: {x!r} is not null or a boolean')
+    return x
+
+
+def _time(x, what: str, null_ok: bool = True):
+    if x is None and null_ok:
+        return None
+    if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(float(x)) or x < 0:
+        raise LogError(f'gate {what}: {x!r} is not {"null or " if null_ok else ""}a finite time >= 0')
+    return float(x)
+
+
+def gate_g1_fields(g1: dict, platform: Optional[str] = None) -> Optional[dict]:
+    """B81-3: the G1 fields of O1 3.5 (RS2-10) in a gate's g1 block, checked; None when the block has none
+    (a fwsim / HIL scorer that does not write them yet: G1 then rests on q alone, refused for a car run).
+    t_done: list, one time per way of using the frames (1 fwsim / HIL, 2 floor: suspect frames kept, as gaps),
+    null = not completed before t_deadline."""
+    if g1.get('t_done') is None:
+        if platform == 'HW':
+            raise LogError('gate g1: a car run needs t_done of the two ways of using the frames and t_deadline '
+                           '(camera scorer output; O1 3.3, 3.5 RS2-10; B81-1, B81-3)')
+        extra = [k for k in G1_KEYS if g1.get(k) is not None]
+        if extra:
+            raise LogError(f'gate g1: {", ".join(extra)} without t_done')
+        return None
+    td = g1['t_done']
+    if not isinstance(td, list) or len(td) not in (1, 2):
+        raise LogError(f'gate g1 t_done: {td!r} is not a list of 1 (fwsim, HIL) or 2 (floor) times')
+    ways = len(td)
+    if platform is not None and ways != (2 if platform == 'HW' else 1):
+        raise LogError(f'gate g1 t_done: {ways} way(s) on platform {platform!r} (floor 2, fwsim / HIL 1; O1 3.5)')
+    t_dl = _time(g1.get('t_deadline'), 'g1 t_deadline', null_ok=False)
+    t_done = [_time(t, 'g1 t_done') for t in td]
+    if any(t is not None and t >= t_dl for t in t_done):              # R134C4-4: O1 3.4 (4) strictly before
+        raise LogError(f'gate g1 t_done {t_done!r} not before t_deadline {t_dl!r} (a time is given only when '
+                       'completed strictly before the deadline, O1 3.4 condition 4)')
+    t1 = _time(g1.get('t1'), 'g1 t1')
+    prog = _opt_bool(g1.get('prog_before_t1'), 'g1 prog_before_t1')
+    c25 = _opt_bool(g1.get('cond25_before_deadline'), 'g1 cond25_before_deadline')
+    cat = _opt_bool(g1.get('cat_t1'), 'g1 cat_t1')
+    if ways == 1:
+        if cat is not None:
+            raise LogError('gate g1 cat_t1: a floor field (O1 3.5 R2V-4), not for one way of using the frames')
+        if t1 is None and (prog is not None or c25 is not None):
+            raise LogError('gate g1: prog_before_t1 / cond25_before_deadline without t1')
+        if t1 is not None and (prog is None or (not prog and c25 is None)):
+            raise LogError('gate g1: with t1, prog_before_t1, and cond25_before_deadline when progress was not '
+                           'reached before t1, are needed (O1 3.5, last block)')
+        if t1 is not None and not prog and t_done[0] is not None and not c25:
+            raise LogError('gate g1: completed (t_done) although no time before the deadline had conditions 2-5 met')
+    else:
+        if prog is not None or c25 is not None:
+            raise LogError('gate g1: prog_before_t1 / cond25_before_deadline are fwsim / HIL fields (one way)')
+        if cat and t1 is None:
+            raise LogError('gate g1 cat_t1: needs t1 (O1 3.5 R2V-4)')
+    return dict(ways=ways, t_deadline=t_dl, t_done=t_done, t1=t1, prog_before_t1=prog, cond25_before_deadline=c25,
+                cat_t1=bool(cat) if ways == 2 else None)
+
+
+def gate_g1_state(f: dict) -> str:
+    """G1 recomputed from its fields (O1 v11.15 3.3 "Khung nghi ngo vi tri", 3.5 last block, R2V-4)."""
+    done = [t is not None for t in f['t_done']]
+    if f['ways'] == 2:                       # floor: both ways done -> dat, neither -> khong_dat, else inconclusive
+        if f['cat_t1']:
+            return 'chua_ket_luan'           # R2V-4: progress after t1 not known
+        return 'dat' if all(done) else ('khong_dat' if not any(done) else 'chua_ket_luan')
+    if f['t1'] is None or f['prog_before_t1']:  # no tracking error, or progress reached before t1
+        return 'dat' if done[0] else 'khong_dat'
+    return 'chua_ket_luan' if f['cond25_before_deadline'] else 'khong_dat'
+
+
+def domains_one(f: Optional[dict]) -> bool:
+    """The common and the union domain are the same frames: one way, no G1 fields, or two equal t_done."""
+    return f is None or f['ways'] == 1 or f['t_done'][0] == f['t_done'][1]
+
+
+def cond_state2(lo_common, lo_union, hi_union, n_undef_union, threshold: float) -> str:
+    """O1 3.5 "Theo so luu" on two domains: khong_dat when lo of the common domain > threshold; else the three
+    states on the union (a certain violation only in the union is chua_ket_luan). One domain: o1_gate.cond_state."""
+    if o1_gate._finite(lo_common) and float(lo_common) > threshold:
+        return 'khong_dat'
+    st = o1_gate.cond_state(lo_union, hi_union, n_undef_union, threshold)
+    return 'chua_ket_luan' if st == 'khong_dat' else st
+
+
+def _domain_nums(block: dict, what: str) -> tuple:
+    q, lo, hi = (_qnum(block.get(k), f'{what} {k}') for k in ('q', 'lo', 'hi'))
+    nu = _n_undef(block.get('n_undef'), f'{what} n_undef')
+    # n_undef 0: every frame finite, so q, lo, hi are all finite with lo <= q <= hi (some frame), or all
+    # unknown (no frame scored: inconclusive). With undefined frames each field is the maximum over its own
+    # finite frames (SC3-1), so hi may be below q (the frame of q may have hi = inf). G32-1
+    fin = [not math.isnan(x) for x in (q, lo, hi)]
+    if nu == 0 and any(fin) and not (all(fin) and lo <= q <= hi):
+        raise LogError(f'gate {what}: with n_undef 0, q, lo, hi must all be numbers with lo <= q <= hi '
+                       f'(or all unknown); got {lo!r}, {q!r}, {hi!r}')
+    return q, lo, hi, nu
+
+
+def _common_block(gate: dict, c: str, union: tuple, one: bool, platform: Optional[str]) -> tuple:
+    """The common domain of condition c (B81-3), checked against the union: part of it (a finite maximum of the
+    common domain has a finite union maximum not below it; n_undef not above), equal when the domains are one.
+    No "chung" block (the gate of o1_gate, one domain): the union numbers, refused on the car."""
+    blk = gate[c].get('chung')
+    if blk is None:
+        if platform == 'HW':
+            raise LogError(f'gate {c}: a car run needs the common frame domain ("chung": q, lo, hi, n_undef; '
+                           'O1 3.3, 3.5 R4V-4; B81-3)')
+        if not one:
+            raise LogError(f'gate {c}: two different t_done but no common domain ("chung")')
+        return union
+    if not isinstance(blk, dict) or any(k not in blk for k in DOMAIN_FIELDS):
+        raise LogError(f'gate {c} chung: not an object with {DOMAIN_FIELDS}')
+    com = _domain_nums(blk, f'{c} chung')
+    for k, a, b in zip(('q', 'lo', 'hi'), com[:3], union[:3]):
+        if not math.isnan(a) and (math.isnan(b) or a > b):
+            raise LogError(f'gate {c}: {k} of the common domain {a!r} above that of the union {b!r} (the common '
+                           'domain is part of the union, O1 3.3)')
+    if com[3] > union[3]:
+        raise LogError(f'gate {c}: n_undef of the common domain {com[3]} above that of the union {union[3]}')
+    if one and any(not (a == b or (math.isnan(a) and math.isnan(b))) for a, b in zip(com, union)):
+        raise LogError(f'gate {c}: one frame domain (one way, or the two t_done equal) but the common and union '
+                       f'numbers differ: {com!r} / {union!r}')
+    return com
+
+
 def _recompute(gate: dict, platform: Optional[str] = None) -> dict:
     """States and outcomes recomputed from q, lo, hi, n_undef with fwsim/o1_gate (thresholds, O1 3.5
     three states SC3-1, O1 3.5 order); shared by the JSON path (end) and the logged rows (summary).
-    Returns the outcomes."""
+    B81-3: G2-G5 on the common and the union frame domain (cond_state2), G1 from its fields (gate_g1_state)
+    when the gate has them (always on the car). Returns the outcomes."""
     if gate.get('version') != o1_gate.GATE_VERSION:
         raise LogError(f'gate version {gate.get("version")!r}: only {o1_gate.GATE_VERSION} is supported')
     decide = _check_decide(gate.get('decide'), platform)
@@ -491,19 +675,18 @@ def _recompute(gate: dict, platform: Optional[str] = None) -> dict:
     q1 = gate['g1'].get('q')
     if q1 not in _G1_Q or gate['g1'].get('state') != o1_gate.g1_state(q1):
         raise LogError(f'gate g1: q {q1!r} and state {gate["g1"].get("state")!r} do not agree (O1 3.4 completed)')
+    f1 = gate_g1_fields(gate['g1'], platform)                                   # B81-3
+    if f1 is not None and gate_g1_state(f1) != gate['g1']['state']:
+        raise LogError(f'gate g1: state {gate["g1"]["state"]!r}, recomputed from t_done, t1 and the flags: '
+                       f'{gate_g1_state(f1)!r} (O1 3.3, 3.5)')
+    one = domains_one(f1)
     for c, thr in o1_gate.THRESHOLDS.items():
-        q, lo, hi = (_qnum(gate[c].get(k), f'{c} {k}') for k in ('q', 'lo', 'hi'))
-        nu = _n_undef(gate[c].get('n_undef'), f'{c} n_undef')
-        # n_undef 0: every frame finite, so q, lo, hi are all finite with lo <= q <= hi (some frame), or all
-        # unknown (no frame scored: inconclusive). With undefined frames each field is the maximum over its own
-        # finite frames (SC3-1), so hi may be below q (the frame of q may have hi = inf). G32-1
-        fin = [not math.isnan(x) for x in (q, lo, hi)]
-        if nu == 0 and any(fin) and not (all(fin) and lo <= q <= hi):
-            raise LogError(f'gate {c}: with n_undef 0, q, lo, hi must all be numbers with lo <= q <= hi '
-                           f'(or all unknown); got {lo!r}, {q!r}, {hi!r}')
-        st = o1_gate.cond_state(lo, hi, nu, thr)
+        union = _domain_nums(gate[c], c)
+        com = _common_block(gate, c, union, one, platform)
+        st = cond_state2(com[1], union[1], union[2], union[3], thr)
         if st != gate[c].get('state'):
-            raise LogError(f'gate {c}: state {gate[c].get("state")!r}, recomputed from lo, hi, n_undef: {st!r}')
+            raise LogError(f'gate {c}: state {gate[c].get("state")!r}, recomputed from lo of the common domain, '
+                           f'hi and n_undef of the union: {st!r}')
     return o1_gate.evaluate_outcomes(gate, decide)
 
 
@@ -544,11 +727,29 @@ def gate_from_row(row: dict) -> dict:
             return int(v) if whole and v.is_integer() else v
         except ValueError:
             raise LogError(f"{row.get('run_uid')}: gate value {s!r} is not a number")
+    def flag(k):
+        s = row.get(k, '')
+        if s not in ('', 'true', 'false'):
+            raise LogError(f"{row.get('run_uid')}: {k} {s!r} is not true, false or empty")
+        return None if s == '' else s == 'true'
+
     g = {'version': row.get('gate_version'), 'decide': [c for c in row.get('gate_decide', '').split(',') if c],
          'u_t': num(row.get('gate_u_t')), 'g1': {'q': row.get('g1_q'), 'state': row.get('g1_state')}}
+    ways = row.get('g1_ways', '')                                               # B81-3
+    if ways:
+        if ways not in ('1', '2') or (ways == '1' and row.get('g1_t_done_2', '') != ''):
+            raise LogError(f"{row.get('run_uid')}: g1_ways {ways!r} with g1_t_done_2 {row.get('g1_t_done_2')!r}")
+        g['g1'].update(t_done=[num(row.get(f'g1_t_done_{i}')) for i in range(1, int(ways) + 1)],
+                       t_deadline=num(row.get('g1_t_deadline')), t1=num(row.get('g1_t1')),
+                       prog_before_t1=flag('g1_prog_before_t1'), cond25_before_deadline=flag('g1_cond25_before_deadline'),
+                       cat_t1=flag('g1_cat_t1'))
+    elif any(row.get(k) for k in G1_COLS):
+        raise LogError(f"{row.get('run_uid')}: G1 fields without g1_ways")
     for c in o1_gate.MEASURED:
         g[c] = {k: num(row.get(f'{c}_{k}')) for k in ('q', 'lo', 'hi')}
         g[c].update(n_undef=num(row.get(f'{c}_n_undef'), whole=True), state=row.get(f'{c}_state'))
+        if any(row.get(f'{c}_{k}_chung') for k in DOMAIN_FIELDS):
+            g[c]['chung'] = {k: num(row.get(f'{c}_{k}_chung'), whole=k == 'n_undef') for k in DOMAIN_FIELDS}
     return g
 
 
@@ -580,20 +781,50 @@ def outcome_vs_gate(outcome: str, ev: dict, decide, fail_cause: str = '') -> Opt
     return f'the gate is not complete (decides {",".join(decide)}): no run is dat'
 
 
+def count_no_gate(tun: List[dict]) -> int:
+    """SC3-2: dat rows outside the campaigns (historic rows) with empty gate columns, reported apart."""
+    return sum(r.get('run_outcome') == 'dat' and r.get('campaign') not in CAMPAIGNS
+               and not any(r.get(c) for c in GATE_COLS) for r in tun)
+
+
+def query_files_needed(row: dict, outcome: str) -> bool:
+    """R134 (b): the CLI 'end' of this open run needs --query-before and --query-after (comment above BOOT_FAIL)."""
+    return outcome in VALID and boot_needed(row.get('platform'), row.get('stage'))
+
+
 def check_gate_rows(tun: List[dict]) -> None:
     """GV3-1, GV3-R2-1: every logged row that carries a gate is recomputed from its q, lo, hi, n_undef
     (version, deciding set of its platform, thresholds, states); its run_outcome must agree as at `end`.
     Rows whose gate columns are ALL empty (before gate v3, or written without --gate-json) are not
     checked; any non-empty gate cell makes the row a gate row, with a supported version (GV3-R3-1)."""
     for r in tun:
+        judged = r.get('run_outcome') in VALID
+        camp = r.get('campaign') in CAMPAIGNS           # [CACH HIEU] historic rows (no campaign): SC3-2 note above
+        # R134 (b); B81-2: a judged car / final_hil campaign row needs both boots, given or not
+        if judged and (r.get('boot_before') or r.get('boot_after')
+                       or (camp and boot_needed(r.get('platform'), r.get('stage')))):
+            bbad = boot_problem(r.get('boot_before'), r.get('boot_after'))
+            if bbad:
+                raise LogError(f"{r.get('run_uid')}: run_outcome {r.get('run_outcome')!r} but {bbad} (S05 4.7 (iv); "
+                               f'a run failed by operation is hong_he_do, {BOOT_FAIL})')
         if not any(r.get(c) for c in GATE_COLS):
+            # R134 (d) SC3-2 (HIL rows have their own rule for every judged outcome, Codex S315-1)
+            if r.get('run_outcome') == 'dat' and r.get('campaign') in CAMPAIGNS and r.get('platform') != 'HIL':
+                raise LogError(f"{r.get('run_uid')}: run_outcome 'dat' without gate columns ({NO_GATE_EVIDENCE}, "
+                               'SC3-2): a campaign run is never dat without the gate')
+            if judged and camp and r.get('platform') == 'HW':                           # B8-1 B81-1
+                raise LogError(f"{r.get('run_uid')}: car run {r.get('run_outcome')} without gate columns (the camera "
+                               'scorer output, S05 v3.20 8.1 C9 (a)): not in the summary')
+            if r.get('fail_cause') == VIOL_BEFORE:
+                raise LogError(f"{r.get('run_uid')}: {viol_before_problem(r.get('run_outcome', ''), VIOL_BEFORE, None)}")
             continue
         g = gate_from_row(r)
         try:
             ev = _recompute(g, r.get('platform'))
         except LogError as exc:
             raise LogError(f"{r.get('run_uid')}: {exc}")
-        why = outcome_vs_gate(r.get('run_outcome', ''), ev, g['decide'], r.get('fail_cause', ''))
+        why = (outcome_vs_gate(r.get('run_outcome', ''), ev, g['decide'], r.get('fail_cause', ''))
+               or viol_before_problem(r.get('run_outcome', ''), r.get('fail_cause', ''), g))
         if why:
             raise LogError(f"{r.get('run_uid')}: run_outcome {r.get('run_outcome')!r} disagrees with its gate "
                            f"({r.get('gate_version')}: {why})")
@@ -605,20 +836,49 @@ def gate_columns(gate: dict, gate_sha256: str = '') -> dict:
     out = {'gate_version': gate['version'], 'gate_decide': ','.join(gate['decide']),
            'gate_json_sha256': gate_sha256, 'gate_u_t': _num(gate.get('u_t')),
            'g1_q': str(gate['g1'].get('q')), 'g1_state': gate['g1'].get('state', '')}
+    def cell(v):
+        return '' if v is None or (isinstance(v, float) and math.isnan(v)) else _num(v)
+
     for g in o1_gate.MEASURED:
         c = gate.get(g) or {}
         for k in ('q', 'lo', 'hi'):
-            v = c.get(k)
-            out[f'{g}_{k}'] = '' if v is None or (isinstance(v, float) and math.isnan(v)) else _num(v)
+            out[f'{g}_{k}'] = cell(c.get(k))
         out[f'{g}_n_undef'] = str(int(c['n_undef'])) if c.get('n_undef') is not None else ''
         out[f'{g}_state'] = c.get('state', '')
+        com = c.get('chung') or c                     # B81-3: one domain -> the common set equals the union
+        for k in ('q', 'lo', 'hi'):
+            out[f'{g}_{k}_chung'] = cell(com.get(k))
+        out[f'{g}_n_undef_chung'] = str(int(com['n_undef'])) if com.get('n_undef') is not None else ''
+    g1 = gate.get('g1') or {}
+    if g1.get('t_done') is not None:                   # B81-3: the G1 fields (checked by validate_gate first)
+        td = g1['t_done']
+        out.update(g1_ways=str(len(td)), g1_t_deadline=cell(g1.get('t_deadline')), g1_t_done_1=cell(td[0]),
+                   g1_t_done_2=cell(td[1]) if len(td) > 1 else '', g1_t1=cell(g1.get('t1')))
+        for k in ('prog_before_t1', 'cond25_before_deadline', 'cat_t1'):
+            v = g1.get(k)
+            out[f'g1_{k}'] = '' if v is None else ('true' if v else 'false')
     return out
+
+
+def viol_before_problem(outcome: str, fail_cause: str, gate: Optional[dict]) -> Optional[str]:
+    """O1 3.5 R2V-4 (B81-3): the floor exception before t1 is khong_dat with fail cause VIOL_BEFORE and a gate whose
+    G1 has cat_t1 true; one without the other is an error."""
+    g1 = (gate or {}).get('g1') or {}
+    cat = bool(g1.get('cat_t1'))
+    if cat != (fail_cause == VIOL_BEFORE) or (cat and outcome != 'khong_dat'):
+        return (f'cat_t1 {cat} with outcome {outcome!r}, fail cause {fail_cause!r}: the floor exception before t1 is '
+                f'khong_dat with fail cause {VIOL_BEFORE} and cat_t1 true (O1 3.5 R2V-4), and only that')
+    floor = isinstance(g1.get('t_done'), list) and len(g1['t_done']) == 2
+    if floor and g1.get('t1') is not None and not cat and outcome in VALID:          # R134C4-3
+        return (f'floor run with t1 {g1.get("t1")!r} (tracking error or a gap above t_trong) and no violation '
+                f'before it (cat_t1 false): a run lost to the measurement, hong_he_do, not {outcome} (O1 3.5)')
+    return None
 
 
 def check_outcome_vs_gate(outcome: str, gate: dict, platform: Optional[str] = None, fail_cause: str = '') -> None:
     """The run outcome typed by the operator against the gate, validated and recomputed first (GV3-5)."""
     ev = validate_gate(gate, platform)
-    why = outcome_vs_gate(outcome, ev, gate['decide'], fail_cause)
+    why = outcome_vs_gate(outcome, ev, gate['decide'], fail_cause) or viol_before_problem(outcome, fail_cause, gate)
     if why:
         raise LogError(f'--outcome {outcome} disagrees with the gate ({why}); check the scoring')
 
@@ -718,12 +978,51 @@ def map_stopped(n_refused: int) -> bool:
     return n_refused > MAP_RERUNS_MAX
 
 
+def boot_needed(platform: str, stage: str) -> bool:
+    """R134 (b): the CLI 'end' of a judged run needs both gain_send --query files (see BOOT_FAIL)."""
+    return platform == 'HW' or (platform == 'HIL' and stage == 'final_hil')
+
+
+def boot_problem(before, after) -> Optional[str]:
+    """None when the two boot answers show one ESP32 boot over the run, else why not."""
+    ok = [b for b in (before, after) if b and all(c in '0123456789abcdefABCDEF' for c in str(b))]
+    if len(ok) < 2:
+        return f'boot {"before" if not ok or ok[0] != before else "after"} the run missing or unreadable'
+    if str(before).lower() != str(after).lower():
+        return f'boot {before} before the run, {after} after it: the ESP32 restarted'
+    return None
+
+
 def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Optional[float] = None,
         fail_cause: str = '', results_dir: str = '', notes: str = '', gate: Optional[dict] = None,
-        gate_sha256: str = '') -> dict:
+        gate_sha256: str = '', boot_before: Optional[str] = None, boot_after: Optional[str] = None,
+        query_problem: Optional[str] = None, queries: Optional[tuple] = None) -> dict:
+    """query_problem (R134C3-3): why the two query answer files given on the command line are not two
+    questions before and after the run (gain_line_check.query_problem); handled as missing / different boot.
+    queries (R134C4-1): the two answers as read by gain_line_check.read_query (before, after; None = missing);
+    end checks them itself (query_problem, without the run's boot) and takes boot_before / boot_after from them.
+    A judged car / final_hil run needs them: two boot strings alone do not show two questions."""
     run = _require_open(ds)
     if outcome not in OUTCOMES:
         raise LogError(f'--outcome one of {OUTCOMES}')
+    plat, stage = run['row'].get('platform'), run['row'].get('stage')
+    if queries is not None:                            # R134C4-1: the two answers checked here, not by the caller
+        import gain_line_check as glc
+        qb, qa = queries
+        query_problem = query_problem or glc.query_problem(qb, qa, check_run_boot=False)
+        boot_before, boot_after = (qb or {}).get('boot', ''), (qa or {}).get('boot', '')
+    asked = boot_before is not None or boot_after is not None or query_problem is not None
+    bbad = query_problem or (boot_problem(boot_before, boot_after) if asked else None)
+    if not asked and (fail_cause == BOOT_FAIL or (outcome in VALID and boot_needed(plat, stage))):
+        bbad = boot_problem('', '')                    # R134C2-7, B81-2: no answer at all = both missing
+    if not bbad and queries is None and outcome in VALID and boot_needed(plat, stage):
+        bbad = ('the two query answers (gain_send --query outputs read by gain_line_check.read_query) not given: '
+                'two boot strings do not show two questions (R134C4-1)')
+    if bbad and not (outcome == 'hong_he_do' and fail_cause == BOOT_FAIL):   # R134 (b)
+        raise LogError(f'{bbad}: a run failed by operation, outcome hong_he_do with fail cause {BOOT_FAIL} '
+                       '(S05 4.7 (iv), R3V-9)')
+    if fail_cause == BOOT_FAIL and not bbad:
+        raise LogError(f'fail cause {BOOT_FAIL} needs the two boot answers showing it (missing or different)')
     if fail_cause == MAP_REFUSED and (gate is None or run['row'].get('platform') != 'HIL'):
         raise LogError(f'--fail-cause {MAP_REFUSED}: a HIL run with its scorer output (--gate-json) showing the '
                        'refused mapping (S05 v3.15 4.5 step 2)')
@@ -736,6 +1035,14 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
     if run['row'].get('platform') == 'HIL' and outcome in VALID and gate is None:
         raise LogError(f'a HIL run judged {outcome} needs its scorer output (--gate-json): S05 v3.15 4.5 step 2 '
                        '(a run without the run_active edge mapping is a lost run)')        # Codex S315-1
+    if plat == 'HW' and outcome in VALID and gate is None:                                   # B8-1 B81-1
+        raise LogError(f'a car run judged {outcome} needs the camera scorer output (--gate-json, with the two frame '
+                       'domains and the G1 fields of the floor; S05 v3.20 8.1 C9 (a), O1 3.3, 3.5)')
+    if outcome == 'dat' and gate is None:                                                    # R134 (d) SC3-2
+        raise LogError(f"a run judged dat needs its gate evidence (--gate-json), on {run['row'].get('platform')} "
+                       'too (SC3-2: no dat without the gate)')
+    if gate is None and fail_cause == VIOL_BEFORE:                                           # R2V-4 (B81-3)
+        raise LogError(viol_before_problem(outcome, fail_cause, None))
     if run.get('paused_from') is not None:
         raise LogError('paused: "resume" first (or the pause is lost time of the next segment)')
     t = now()
@@ -749,6 +1056,8 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
         row['e_perp_max_m'] = f'{e_perp_max:.4f}'
     if gate is not None:
         row.update(gate_columns(gate, gate_sha256))
+    if asked:
+        row.update(boot_before=boot_before or '', boot_after=boot_after or '')
     if notes:
         row['notes'] = (row.get('notes', '') + ' ' + notes).strip()
     # Codex S315-5: the log as it will be, this row included, checked before the row is written
@@ -1375,13 +1684,35 @@ def _plain(o):
     return o
 
 
-def fake_gate(e_trk: float = 0.03, mapped: bool = True) -> dict:
+def fake_gate(e_trk: float = 0.03, mapped: bool = True, completed: str = 'true') -> dict:
     """A made-up gate (FAKE: demo and tests only, no measurement): 20 frames of constant errors, e_trk as given;
     mapped: U_t known and all five decide, else the HIL set without the run_active edge mapping (G1, G2)."""
     n = 20
     frames = {'e_perp': [0.02] * n, 'e_trk': [e_trk] * n, 'e_bao': [0.04] * n, 'e_theta_cmd_deg': [3.0] * n}
-    return _plain(o1_gate.gate(frames, 'true', v_cmd_max=0.729, wz_cmd_max=1.634, u_t=0.0015 if mapped else None,
+    return _plain(o1_gate.gate(frames, completed, v_cmd_max=0.729, wz_cmd_max=1.634, u_t=0.0015 if mapped else None,
                                decide=o1_gate.DECIDE_ALL if mapped else o1_gate.DECIDE_HIL, note='FAKE'))
+
+
+def fake_queries(boot: str = '4753dc47', mac: str = 'aa:bb', t0: float = 0.0) -> tuple:
+    """FAKE (demo and tests only): two read_query answers of one boot, asked one after the other (R134C4-1)."""
+    return tuple(dict(boot=boot, mac=mac, _t_start=t0 + a, _t_end=t0 + b, _path=f'FAKE_{w}')
+                 for w, a, b in (('before', 1.0, 2.0), ('after', 3.0, 4.0)))
+
+
+def floor_gate(g: dict, t_done=None, t_deadline: float = 20.0) -> dict:
+    """FAKE (demo and tests only): a one-domain gate of o1_gate dressed as a camera scorer output (B81-3): the
+    common domain set equal to the union, the two t_done given (default from the G1 state: dat both 10 s, khong_dat
+    neither, chua_ket_luan only the first); G1 and the outcomes recomputed from them."""
+    g = json.loads(json.dumps(g))
+    for c in o1_gate.MEASURED:
+        g[c]['chung'] = {k: g[c][k] for k in DOMAIN_FIELDS}
+    if t_done is None:
+        t_done = {'dat': (10.0, 10.0), 'khong_dat': (None, None)}.get(g['g1']['state'], (10.0, None))
+    g['g1'].update(t_done=list(t_done), t_deadline=t_deadline)
+    st = gate_g1_state(gate_g1_fields(g['g1'], 'HW'))
+    g['g1'].update(state=st, q={'dat': 'true', 'khong_dat': 'false'}.get(st, 'inconclusive'))
+    g.update(o1_gate.evaluate_outcomes(g, g['decide']))
+    return g
 
 
 def demo(out_dir: str, seed: int = 1) -> List[dict]:
@@ -1414,7 +1745,9 @@ def demo(out_dir: str, seed: int = 1) -> List[dict]:
             resume(out_dir)
             tick(60)
             end(out_dir, 'khong_dat' if i else 'hong_he_do', completed=1, e_perp_max=0.12 + i / 100,
-                fail_cause='' if i else 'mat_khung_FAKE')
+                fail_cause='' if i else 'mat_khung_FAKE', results_dir=f'results/FAKE/a1_{i}' if i else '',
+                gate=floor_gate(fake_gate(e_trk=0.5)) if i else None,      # B81-1: a judged car run, camera gate
+                queries=fake_queries() if i else None)                    # B81-2, R134C4-1
         gfile = os.path.join(out_dir, 'FAKE_gain_G00.json')
         with open(gfile, 'w', encoding='utf-8', newline='\n') as f:
             f.write('{"FAKE": true, "kp_xy": 1.0, "ki_xy": 0.5, "kp_wz": 1.0, "ki_wz": 0.2, '
@@ -1442,14 +1775,20 @@ def demo(out_dir: str, seed: int = 1) -> List[dict]:
             begin(out_dir, 'FAKE-FH', 'RQ2', 'HIL', 'PID', 'O1-F05', '0.5', 'final_hil', gain_set='A-PID/G00')
             step(out_dir, 'run')
             tick(75)
-            end(out_dir, 'dat', completed=1, e_perp_max=0.05, results_dir=f'results/FAKE/fh_{k}', gate=fake_gate())
+            end(out_dir, 'dat', completed=1, e_perp_max=0.05, results_dir=f'results/FAKE/fh_{k}', gate=fake_gate(),
+                queries=fake_queries())                                   # B81-2: final_hil asks the boot too
         lost = None
-        for o in ('hong_he_do', 'dat', 'chua_ket_luan'):  # final on the car; the lost run is replaced
+        # final on the car; the lost run is replaced. The chua_ket_luan run: one way of using the frames did not
+        # complete (suspect frames as gaps), so G1 is inconclusive and the two frame domains differ (B81-3)
+        car_gate = {'dat': floor_gate(fake_gate()), 'chua_ket_luan': floor_gate(fake_gate(), t_done=(10.0, None))}
+        for o in ('hong_he_do', 'dat', 'chua_ket_luan'):
             begin(out_dir, 'FAKE-F1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'final', gain_set='A-PID/G00',
                   replaces_run_uid=lost if o == 'dat' else '')
             step(out_dir, 'run')
             tick(60)
-            row = end(out_dir, o, completed=1, e_perp_max=0.10, fail_cause='mat_khung_FAKE' if o == 'hong_he_do' else '')
+            row = end(out_dir, o, completed=1, e_perp_max=0.10, fail_cause='mat_khung_FAKE' if o == 'hong_he_do' else '',
+                      results_dir='' if o == 'hong_he_do' else f'results/FAKE/f1_{o}', gate=car_gate.get(o),
+                      queries=fake_queries())   # R134: judged with its gate, boot asked
             if o == 'hong_he_do':
                 lost = row['run_uid']
         gate_path = os.path.join(out_dir, 'FAKE_gate.csv')            # stands for the gate locked at C8
@@ -1485,6 +1824,8 @@ def main(argv=None) -> int:
     e.add_argument('--completed', type=int, choices=(0, 1))
     e.add_argument('--e-perp-max', type=float)
     e.add_argument('--gate-json', default='', help='scorer output with a gate_v3 block (hil_o1_score.py --out)')
+    e.add_argument('--query-before', default='', help='gain_send.py --query output just before the run (R134 (b))')
+    e.add_argument('--query-after', default='', help='gain_send.py --query output just after the run (R134 (b))')
     for name in ('fail-cause', 'results-dir', 'notes'):
         e.add_argument('--' + name, default='')
     m = sub.add_parser('machine')
@@ -1557,9 +1898,19 @@ def main(argv=None) -> int:
                 print(run['row']['run_uid'], 'paused' if run.get('paused_from') is not None else 'running',
                       json.dumps(segment_totals(segs)))
         elif a.cmd == 'end':
+            import s05_final_table as s5
+            boots = {}
+            open_run = _load_open(ds)
+            if open_run and query_files_needed(open_run['row'], a.outcome) and not (a.query_before and a.query_after):
+                raise LogError(f"a {open_run['row'].get('platform')} run at stage {open_run['row'].get('stage')} "
+                               f'judged {a.outcome} needs --query-before and --query-after (gain_send.py --query '
+                               'outputs around the run; S05 4.7 (iv), R3V-9, O1 R4)')
+            if a.query_before or a.query_after:
+                import gain_line_check as glc            # R134C3-3: the checks of the two answers, as the scorers do
+                boots = dict(queries=(glc.read_query(a.query_before), glc.read_query(a.query_after)))   # R134C4-1
             row = end(ds, a.outcome, a.completed, a.e_perp_max, a.fail_cause, a.results_dir, a.notes,
                       gate=read_gate_json(a.gate_json) if a.gate_json else None,
-                      gate_sha256=sha256_file(a.gate_json) if a.gate_json else '')
+                      gate_sha256=sha256_file(a.gate_json) if a.gate_json else '', **boots)
             print('row', row['run_uid'], {k: row[f't_{k}_s'] for k in STEPS}, 'wait', row['t_operator_wait_s'])
             note = refusal_note(ds, row)
             if note:
@@ -1590,6 +1941,10 @@ def main(argv=None) -> int:
             rows = write_summary(ds, a.out or os.path.join(ds, SUMMARY), gate, sha)
             for r in rows:
                 print(r['campaign'], r['T_operator_h'], 'h', 'N_HW', r['N_HW'], 'gate', r['gate_result'] or '-')
+            n_old = count_no_gate(read_rows(os.path.join(ds, TUNING)))         # R134C2-11 (SC3-2)
+            if n_old:
+                print(f'{NO_GATE_EVIDENCE}: {n_old} dat row(s) outside the campaigns without gate columns '
+                      '(historic; not in gate_result nor in a stop rule)')
         elif a.cmd == 'demo':
             for r in demo(a.out):
                 print(json.dumps(r, ensure_ascii=False))

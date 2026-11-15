@@ -40,7 +40,25 @@ O1 v11.9 3.5). The mapping (L98, L99) brackets the edge from the encoder counts 
 (AGV firmware in FW_COUNTS_AT_TICK; others refused) and the H7 apply times read from the MISO answers; the PWM
 side is a cross-check.
 Validity (CODE L50, STATUS_CODE CG4) is NOT decided here: the manifest counts (MISO CRC bad,
-empty frames) are copied out; the run rule is tools/s06_frames_decode.py on the same log.
+empty frames) are copied out; the run rule is tools/s06_frames_decode.py on the same log. One exception
+(O1 v11.15 3.5, B81-15; Liam 14/11 THESIS_B8 "duyệt cả", "Giữ U_p = 0, ghi giới hạn"): a plant state field that
+is NaN / inf, or x, y at the +-5 m encoding bound, is a HIL tool error and the run is refused here (tool_error, exit 2).
+
+B81-3 (S05 v3.20; the gate JSON format of CODE_R134, tools/rq3_log.py at hil 4f1a0ef: gate_g1_fields,
+_common_block; Liam 14/11 CODE_RS4 "Làm sau khi phần A gộp (Recommended)"; design RS-4 section 18.1): the
+gate_v3 block also holds
+  g1.t_deadline, g1.t_done ([t_end] when completed 'true', [null] otherwise: one way of using the frames on HIL),
+  g1.t1 (first tracking-error frame, null when none), and with t1 g1.prog_before_t1 (progress reached S - D_d at a
+  frame before t1) and g1.cond25_before_deadline (a frame before the deadline with conditions 2-5 met); without t1
+  both null. O1 v11.22 3.5, last block: the evaluators already compute them (t_first_track_err, t_progress,
+  cond2_5_ever of evaluate_v7 / evaluate_k, the same comparisons that give 'completed'); they are copied here.
+  g2..g5 'chung' {q, lo, hi, n_undef}: the common frame domain, equal to the union one on HIL (one way, O1 3.3).
+  G1 is recomputed from these fields (as rq3_log.gate_g1_state) and must agree with g1.state, else exit 2.
+  Times are written >= 0: a time within G1_T_NEG_STEPS x period below 0 (the first scored frame after the
+  mapped edge, rounding of the k0 choice) is written 0.0, one further below is an error (Codex B813-R1-1, R2-1).
+  Short log (L85 Q1 turned 'false' into 'inconclusive'): the fields cannot say "not known", so none is written
+  (all null, g1_fields_note says why; G1 stays chua_ket_luan from q; Liam 15/11 CODE_RS4 local_3b1a170b,
+  "Không ghi số chi tiết (Recommended)").
 
   python tools/hil_o1_score.py --frame-log <run>.npz --task O1-F05 [--esp-log <run>.csv] [--out score.json]
   (K1, K2 need --allow-final-set: O1 3.7, final test set only)
@@ -115,12 +133,101 @@ def log_coverage(out, t_log_end, period):
     return out
 
 
-def score(path, task, allow_final_set=False, esp_log=None):
+def tool_error(manifest, mosi, allow_pre_b81_15=False):
+    """O1 v11.15 3.5 (B81-15): a plant state field that is NaN / inf, or x, y at the +-5 m encoding bound, is a
+    HIL tool error (the run is redone), refused here (ValueError, exit 2). The evidence is the Pi's check before
+    encoding (manifest key state_out_of_range, rpi5/protocol.state_out_of_range): with the key, only the key
+    decides (a position within 76 um of the bound rounds to +-32767 without reaching it, Codex B8C-R1-3).
+    Without the key (a log from before the check) the MOSI cannot show a NaN / inf of omega, theta or v (they
+    land on in-range codes), so the run is refused as not enough evidence (B8C-R1-4), unless allow_pre_b81_15
+    (development logs only, --pre-b81-15): then x or y at +-32767 still refuses. Returns how the check was made.
+    U_p = U_psi = 0 on HIL (v11.15); theta is wrapped to [-pi, pi) by the plant (B81-8)."""
+    if 'state_out_of_range' in manifest:
+        bad = manifest['state_out_of_range']
+        if bad:
+            raise ValueError(f'HIL tool error (O1 3.5): plant state field {bad.get("field")} = {bad.get("value")} '
+                             f'at step {bad.get("step")} not finite or position at the +-5 m bound: run to be redone')
+        return 'manifest'
+    if not allow_pre_b81_15:
+        raise ValueError('frame log without state_out_of_range (before the B81-15 check on the Pi): not enough '
+                         'evidence that the plant state was finite and inside the encoding range (O1 3.5); '
+                         '--pre-b81-15 scores a development log anyway')
+    raw = np.abs(_int16(mosi, 0, 10).astype(np.int64))[:, list(P.POS_INDEX)]
+    hit = np.argwhere(raw >= 32767)
+    if len(hit):
+        k, i = int(hit[0][0]), P.POS_INDEX[int(hit[0][1])]
+        raise ValueError(f'HIL tool error (O1 3.5): MOSI state field {i} at the int16 bound at frame {k} (a clamp, '
+                         'NaN or inf of the position): run to be redone')
+    return 'pre_b81_15: x, y codes only (development log)'
+
+
+G1_FIELDS = ('t_done', 't_deadline', 't1', 'prog_before_t1', 'cond25_before_deadline')   # B81-3, one way (HIL)
+
+
+G1_T_NEG_STEPS = 2e-9                  # steps: k0 = ceil(a - 1e-9) puts the first frame >= -1e-9 step before t = 0;
+                                       # twice that covers float rounding (Codex B813-R1-1, R2-1)
+
+
+def _opt_time(x):
+    """A finite time, else None (the evaluators write NaN for 'none')."""
+    return float(x) if x is not None and not isinstance(x, bool) and math.isfinite(float(x)) else None
+
+
+def _g1_time(t, period_s):
+    """A time written in a B81-3 field (rq3_log wants >= 0). With the edge mapped, k0 = ceil(a - 1e-9) so the
+    first scored frame has t = (k0 - a) x period >= -1e-9 x period (about -1e-12 s at 1 ms), plus float rounding:
+    a time within G1_T_NEG_STEPS x period below 0 is that frame at t = 0 and is written 0.0 (Codex B813-R1-1,
+    R2-1); a time further below 0 is an error. None stays None."""
+    if t is None or t >= 0.0:
+        return t
+    if t >= -G1_T_NEG_STEPS * float(period_s):
+        return 0.0
+    raise ValueError(f'B81-3: time {t!r} s below 0 (more than the rounding of the k0 choice, '
+                     f'{G1_T_NEG_STEPS:g} step x {period_s!r} s)')
+
+
+def g1_state_from_fields(g1):
+    """G1 from its B81-3 fields, one way of using the frames (O1 3.3, 3.5 last block; rq3_log.gate_g1_state)."""
+    done = g1['t_done'][0] is not None
+    if g1['t1'] is None or g1['prog_before_t1']:          # no tracking error, or progress reached before t1
+        return 'dat' if done else 'khong_dat'
+    return 'chua_ket_luan' if g1['cond25_before_deadline'] else 'khong_dat'
+
+
+def add_b81_3(gate, out, period_s=1e-3):
+    """In place on the gate_v3 block (module docstring, B81-3): the common domain of g2..g5 and the G1 fields
+    from the evaluator summary out (period_s: the plant step of the run, for _g1_time). Raises ValueError when G1
+    from the fields differs from g1.state."""
+    for c in o1_gate.MEASURED:
+        gate[c]['chung'] = {k: gate[c][k] for k in ('q', 'lo', 'hi', 'n_undef')}
+    g1 = gate['g1']
+    if not out.get('log_covers_deadline', True) and out.get('completed_raw') == 'false':
+        g1.update(dict.fromkeys(G1_FIELDS))
+        gate['g1_fields_note'] = ('short log (L85 Q1): completed false turned inconclusive; t_done, t1 and the flags '
+                                  'cannot say "not known", so none is written (B81-3)')
+        return gate
+    t1 = _opt_time(out.get('t_first_track_err'))
+    t_prog = _opt_time(out.get('t_progress'))
+    g1.update(t_deadline=_g1_time(float(out['t_deadline']), period_s),
+              t_done=[_g1_time(float(out['t_end']), period_s) if out.get('completed') == 'true' else None],
+              t1=_g1_time(t1, period_s),
+              prog_before_t1=None if t1 is None else bool(t_prog is not None and t_prog < t1),   # evaluator times
+              cond25_before_deadline=None if t1 is None else bool(out['cond2_5_ever']))
+    st = g1_state_from_fields(g1)
+    if st != g1['state']:
+        raise ValueError(f'B81-3: G1 from t_done, t1 and the flags is {st!r}, the gate says {g1["state"]!r} '
+                         f'(completed {out.get("completed")!r})')
+    gate['g1_fields_note'] = ''
+    return gate
+
+
+def score(path, task, allow_final_set=False, esp_log=None, allow_pre_b81_15=False):
     if task not in FIG8 and task not in FINAL_SET:
         raise ValueError(f'task {task!r}: one of {tuple(FIG8) + FINAL_SET}')
     if task in FINAL_SET and not allow_final_set:
         raise ValueError(f'{task} is the final test set (O1 3.7): only with --allow-final-set')
     manifest, mosi, miso = load(path)
+    b81_15 = tool_error(manifest, mosi, allow_pre_b81_15)
     state, ref, flags, duty = decode_frames(mosi, miso)
     k_run, run_src = command_start(manifest, ref, flags)
     period = float(manifest.get('period_us', 1000)) * 1e-6
@@ -149,20 +256,22 @@ def score(path, task, allow_final_set=False, esp_log=None):
         out, _, frames = o1_gate_eval.evaluate_k(log, task)
     out['tv_duty_h7_1khz'] = out.pop('tv_duty')                          # not the S05 4.7 tv_duty (docstring)
     log_coverage(out, float(log['t'][-1]) if len(log['t']) else -1.0, period)
-    # gate v3.2 (o1_gate.py): true plant state, so U_p = U_psi = 0
+    # gate v3.2 (o1_gate.py): U_p = U_psi = 0 on HIL (O1 v11.15 3.5: the int16 MOSI quantisation, <= 0.11 mm and
+    # 4.8e-5 rad, is a stated limit, not added to U; Liam 14/11 THESIS_B8 "Giữ U_p = 0, ghi giới hạn")
     if task in FIG8:
         v_max, wz_max = o1_gate.fig8_cmd_max(Schedule(FIG8[task]))
     else:
         v_max, wz_max = o1_gate.k_cmd_max(o1_lanes.KSchedule(task))
     out['gate_v3'] = o1_gate.gate(frames, out['completed'], v_cmd_max=v_max, wz_cmd_max=wz_max, u_t=u_t,
                                   decide=decide, status=out.get('status', ''), note=note)
+    add_b81_3(out['gate_v3'], out, period)                               # B81-3 (module docstring)
     mc = manifest.get('miso_check') or {}
     out.update(frame_log=os.path.basename(path), k0=k0, k_run=k_run, t0_step=a, t0_src=t0_src,
                frames_scored=int(len(state) - k0), edge_map=em,
                start_pose=[float(v) for v in state[k0, 4:7]], plant=manifest.get('plant'),
                plant_src=manifest.get('plant_src'), imu_noise=manifest.get('imu_noise'),
                lifecycle_outcome=(manifest.get('lifecycle') or {}).get('outcome'),
-               miso_crc_bad=mc.get('crc_bad'), miso_empty=mc.get('empty'),
+               miso_crc_bad=mc.get('crc_bad'), miso_empty=mc.get('empty'), b81_15_check=b81_15,
                validity='see tools/s06_frames_decode.py (L50)',
                rule='S05 v3.7 4.6: evaluate_v7, S03 section 4; gate v3.2: o1_gate_eval + o1_gate')
     return out
@@ -189,9 +298,11 @@ def main(argv=None) -> int:
     ap.add_argument('--allow-final-set', action='store_true')
     ap.add_argument('--esp-log', default='', help='agv_logger CSV of the run: t = 0 at the run_active edge (RS-4)')
     ap.add_argument('--out', default='')
+    ap.add_argument('--pre-b81-15', action='store_true',
+                    help='score a frame log from before the Pi plant-state check (development only, O1 3.5)')
     a = ap.parse_args(argv)
     try:
-        out = _json_safe(score(a.frame_log, a.task, a.allow_final_set, a.esp_log or None))
+        out = _json_safe(score(a.frame_log, a.task, a.allow_final_set, a.esp_log or None, a.pre_b81_15))
     except (ValueError, KeyError, OSError) as exc:
         print('hil_o1_score:', exc, file=sys.stderr)
         print('#ket_qua,ma=2')

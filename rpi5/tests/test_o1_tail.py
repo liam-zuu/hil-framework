@@ -73,7 +73,7 @@ def test_zero_command_lasts_past_the_deadline_on_the_grid(task):
         assert t == pytest.approx(j / 50, abs=1e-9)        # one absolute grid, schedule and zeros
     assert tail[-1][0] >= T + o1_feasibility.T_LATE        # F-7: zeros reach the deadline T_cmd + t_late
     assert tail[-1][0] < T + o1_tasks.O1_TAIL_S
-    assert f'zeros={len(tail)},tail_planned={len(tail)},sent={n}' in lines[-1] and lines[-1].endswith('complete=1')
+    assert f'zeros={len(tail)},tail_planned={len(tail)},sent={n}' in lines[-1] and ',complete=1,' in lines[-1]
 
 
 def test_tail_is_t_late_plus_margin():
@@ -108,7 +108,7 @@ def test_interrupt_sends_zeros_at_once():
     n = pc_sender.test_loop('10.0.0.1', 'O1-F05', sock=Sock(), clock=clk, sleep=clk.sleep, out=lines.append)
     assert n == 99 and '#test_interrupted' in lines
     assert sent[100:] == [(0.0, 0.0, 0.0)] * pc_sender.LIFTED_TAIL_ZEROS
-    assert lines[-1].endswith('complete=0')
+    assert ',complete=0,' in lines[-1]
 
 
 def test_run_hil_o1_stop_covers_the_tail():

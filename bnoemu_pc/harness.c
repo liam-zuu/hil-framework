@@ -13,7 +13,13 @@
  * 30 ms delay after each Set Feature (BNO08xRpt.cpp) runs the service loop.
  *
  *   harness <scenario> [period_us] [seconds]
- *   scenarios: boot, run, collision, rst_mid, silent, stale
+ *   scenarios: boot, run, collision, rst_mid, silent, stale, hold,
+ *              stale_gap (seconds = gap with the plant frozen; 4th arg "held":
+ *              RST low during the gap, "held_wrap": same, gap ending at a
+ *              sample age of 2^32 us, see sc_stale_gap), core_wrap, pend_stale
+ *              read|disable [sensor], pend_two [off] [keep], stale_edge <period>
+ *              <due_age_us> [stale_periods]
+ *              (no host)
  * Environment BNOEMU_H7_PORT=1 (G2, 28/10): the emulator is driven the way the
  * H7 layer stm32h7/Core/Src/bno_emu_port.c drives it: core poll, new plant
  * sample and INT pin only on a 100 us tick (TIM6); MISO comes from a DMA buffer
@@ -58,6 +64,7 @@ static bool prev_int, hint_flag;
 static uint64_t next_plant;
 static bool plant_on = true;
 static uint8_t plant_seq;
+static uint64_t plant_seq_t;           /* virtual time of the last seq change */
 static uint32_t int_edges;
 
 static const uint8_t *zeros_port(void) { static const uint8_t z[(BNO_EMU_PKT_MAX + 4u + 16u)] = { 0 }; return z; }
@@ -172,12 +179,22 @@ static void plant_tick(void)
         static bno_emu_sample_t s;
         if (plant_on) {
             plant_seq++;
+            plant_seq_t = now;
             plant_sample(&s, (double)now * 1e-6);
         }
         s.seq = plant_seq;                  /* frozen plant: same seq every frame */
         if (port_mode) port_frame = s;      /* the H7 tick picks it up */
         else bno_emu_set_sample(&emu, &s, (uint32_t)now);
     }
+}
+
+/* stale_edge (Codex BNOW-R4-1): time of the first core poll at or after
+ * poll_mark (0 = not armed), as the core saw it (now at that call) */
+static uint64_t poll_mark, poll_seen;
+
+static void note_poll(void)
+{
+    if (poll_mark && !poll_seen && now >= poll_mark) poll_seen = now;
 }
 
 static void advance(uint64_t us)
@@ -190,10 +207,12 @@ static void advance(uint64_t us)
         if (port_mode) {
             while (now >= port_next_tick) {
                 port_next_tick += PORT_TICK_US;
-                port_tick();
+                port_tick();                        /* polls with now, not the tick time */
+                note_poll();
             }
         } else {
             bno_emu_poll(&emu, (uint32_t)now);
+            note_poll();
         }
         sync_int();
         if (guard_on && now >= guard_until) longjmp(abort_jmp, 1);
@@ -206,12 +225,14 @@ static uint64_t xfer_us(unsigned nbytes) { return XFER_OVERHEAD_US + (uint64_t)(
 
 static uint32_t hard_resets;          /* host timeouts that pulsed RST */
 static uint8_t zeros[512];
+static uint64_t t_rst_release;        /* virtual time of the last RST release */
 
 static void toggle_reset(void)
 {
     if (port_mode) port_reset(true); else bno_emu_set_reset(&emu, true, (uint32_t)now);
     sync_int();
     advance(RST_LOW_US);
+    t_rst_release = now;
     if (port_mode) port_reset(false); else bno_emu_set_reset(&emu, false, (uint32_t)now);
     sync_int();
     advance(RST_WAIT_US);
@@ -316,6 +337,7 @@ static uint8_t  hk_state[BNO_EMU_N_SENSORS][256];
 static int      hk_last_seq[BNO_EMU_N_SENSORS] = { -1, -1, -1 };
 static uint32_t hk_reset_done, hk_hold_on, hk_hold_off, hk_rpt_in_hold, hk_qfull;
 static uint32_t hk_built, hk_read, hk_received, hk_seq_gap, hk_read_not_built, hk_rx_not_read;
+static uint32_t hk_built_s[BNO_EMU_N_SENSORS];  /* REPORT events per sensor */
 static bool     hk_in_hold;
 
 static void hook(void *ctx, const bno_emu_event_t *ev)
@@ -329,6 +351,7 @@ static void hook(void *ctx, const bno_emu_event_t *ev)
         if (ev->flags & BNO_EV_QFULL) { hk_qfull++; hk_state[ev->sensor][ev->rpt_seq] = HK_NONE; }
         else hk_state[ev->sensor][ev->rpt_seq] = HK_QUEUED;
         hk_built++;
+        hk_built_s[ev->sensor]++;
         break;
     case BNO_EV_PKT_READ:
         for (unsigned i = 0; i < BNO_EMU_N_SENSORS; i++) {
@@ -703,6 +726,231 @@ static void sc_stale(uint32_t period)
     check_data();
 }
 
+/* Plant frozen for a long gap (14/11, CODE_RS4): the emulator clock is uint32
+ * us and wraps every 2^32 us (71.6 min). After gap_s with no new imu_seq and
+ * no host reading, the host resets and inits again, plant still frozen: the
+ * chip must answer (reset complete, product IDs, Set Feature) but send no
+ * report; reports resume when the plant moves. Bench case 14/11
+ * (CLOSED_LOOP/2026-11-14_run02): gap 7430 s, init OK on a stale sample.
+ * held: RST held low for the whole gap (host powered off, chip in reset).
+ * held_wrap: as held, gap_s ignored: the gap is chosen so that the RST release
+ * of the reinit comes 1 ms after the sample age passes 2^32 us (the age read
+ * on the wrapped clock is then near 0 while the host enables the reports).
+ * Reports built (S06 hook) are counted from 1 s after the freeze to 2 s after
+ * the reinit, so a short "fresh" window is seen even with nobody reading. */
+static void sc_stale_gap(uint32_t period, double gap_s, bool held, bool wrap)
+{
+    init_res_t r = host_init(period);
+    if (!check_init(&r, "init")) return;
+    service_for(2000000u);
+    plant_on = false;
+    service_for(1000000u);                       /* stale before the gap */
+    uint32_t built0 = hk_built;
+    uint64_t gap_us = (uint64_t)(gap_s * 1e6);
+    if (wrap) gap_us = (1ull << 32) + 1000u - RST_LOW_US - (now - plant_seq_t);
+    if (held) { if (port_mode) port_reset(true); else bno_emu_set_reset(&emu, true, (uint32_t)now); }
+    advance(gap_us);                             /* host off: nobody reads */
+    uint32_t built_gap = hk_built - built0;
+    printf("stale_gap.held=%d\n", (int)held);    /* host_init's RST pulse releases it */
+    uint32_t skips0 = emu.st.stale_skips;
+    rx_clear();
+    r = host_init(period);                       /* host reset + init, plant frozen */
+    if (!check_init(&r, "reinit")) return;
+    service_for(2000000u);
+    uint32_t during = rx[0].n + rx[1].n + rx[2].n;
+    uint32_t built_frozen = hk_built - built0;
+    gap_s = (double)gap_us * 1e-6;
+    printf("stale_gap.release_age_s=%.6f\nstale_gap.age_end_s=%.6f\nstale_gap.built_in_gap=%u\n"
+           "stale_gap.built_while_frozen=%u\n", (double)(t_rst_release - plant_seq_t) * 1e-6,
+           (double)(now - plant_seq_t) * 1e-6, built_gap, built_frozen);
+    if (built_frozen != 0) fail("%u reports built on a sample frozen up to %.0f s", built_frozen, (double)(now - plant_seq_t) * 1e-6);
+    plant_on = true;
+    uint64_t t_back = now;
+    rx_clear();
+    service_for(3000000u);
+    double resume_ms = 0.0;
+    for (unsigned i = 0; i < BNO_EMU_N_SENSORS; i++) {
+        double ms = rx[i].n ? (double)(rx[i].t_first - t_back) * 1e-3 : 1e9;
+        if (ms > resume_ms) resume_ms = ms;
+    }
+    printf("stale_gap.gap_s=%.3f\nstale_gap.reports_after_reinit=%u\nstale_gap.skips_after_gap=%u\n"
+           "stale_gap.resume_ms=%.1f\n", gap_s, during, emu.st.stale_skips - skips0, resume_ms);
+    if (during != 0) fail("%u reports after reinit on a sample frozen %.0f s", during, gap_s);
+    if (emu.st.stale_skips == skips0) fail("emulator never skipped a stale report after the gap");
+    if (resume_ms > 2.0 * period * 1e-3 + 1.0) fail("reports resumed after %.1f ms", resume_ms);
+    check_data();
+}
+
+/* Core only, no host (14/11, CODE_RS4): RST held low while the age of a frozen
+ * sample passes 2^32 us, released 1 ms after that (age counted from the time
+ * the core took the sample, t_seq_change_us); boot; sensor 0 (period 50 ms)
+ * enabled straight in the core 21 ms after the release, first report due at
+ * once: the wrapped age is then about 22 ms, under the 150 ms stale threshold
+ * (a host faster than the SH-2 driver above, whose first report comes more
+ * than 150 ms after the release). No report may be built on the old sample;
+ * reports are built again once the plant moves. */
+static void sc_core_wrap(void)
+{
+    plant_on = false;
+    plant_seq = 1;                               /* one frozen sample, seq 1 */
+    if (port_mode) port_reset(true); else bno_emu_set_reset(&emu, true, (uint32_t)now);
+    advance(1000u);                              /* the core takes the sample (20 us core, 100 us port) */
+    uint64_t t_load = emu.t_seq_change_us;       /* < 2^32 here: the 64-bit time */
+    advance(t_load + (1ull << 32) + 1000u - now);
+    uint64_t age_rel = now - t_load;
+    if (port_mode) port_reset(false); else bno_emu_set_reset(&emu, false, (uint32_t)now);
+    advance(emu.cfg.boot_delay_us + 1000u);
+    uint32_t built0 = hk_built;
+    uint64_t age_on = now - t_load;
+    emu.period_us[0] = 50000u;
+    emu.next_due_us[0] = (uint32_t)now;
+    advance(200000u);
+    uint32_t built = hk_built - built0;
+    int state = (int)emu.state;
+    plant_on = true;
+    advance(200000u);
+    uint32_t built_after = hk_built - built0 - built;
+    printf("core_wrap.state=%d\ncore_wrap.age_release_us=%llu\ncore_wrap.age_enable_us=%llu\n"
+           "core_wrap.built_frozen=%u\ncore_wrap.built_after=%u\n", state, (unsigned long long)age_rel,
+           (unsigned long long)age_on, built, built_after);
+    if (state != BNO_EMU_RUNNING) fail("emulator not running after the release (state %d)", state);
+    if (built) fail("%u reports built on a sample frozen 2^32 us", built);
+    if (built_after == 0) fail("no report built after the plant moved");
+}
+
+/* Stale threshold edge (Codex BNOW-R1-2, 14/11). Core only: sensor 0 at
+ * period_us, stale_periods n (default 3), plant frozen, first report due when
+ * the sample age is due_age_us. Prints whether a report was built (1) or not
+ * (0): built exactly when due_age_us < n x period_us (n x period in 64 bits)
+ * and due_age_us < 2^31 us. */
+static void core_read_all(void);
+static void core_set_feature(uint8_t id, uint32_t interval_us);
+static void sc_stale_edge(uint32_t period_us, uint32_t due_age_us, uint32_t n)
+{
+    advance(emu.cfg.boot_delay_us + 1000u);
+    plant_on = false;
+    advance(1000u);
+    uint64_t t_c = emu.t_seq_change_us;          /* < 2^32 */
+    emu.cfg.stale_periods = n;
+    emu.period_us[0] = period_us;
+    emu.next_due_us[0] = (uint32_t)(t_c + due_age_us);
+    uint32_t built0 = hk_built;
+    /* Codex BNOW-R3-1, R4-1: the core mode polls at the end of every advance(),
+     * so it polls exactly at sample age due_age_us; the port mode polls on its
+     * 100 us ticks, with the now of the advance() step that reaches the tick.
+     * The time printed is the one the first poll at or after the due age saw. */
+    poll_mark = t_c + due_age_us;
+    poll_seen = 0;
+    advance(t_c + due_age_us - now);
+    advance(200u);
+    uint64_t poll_t = poll_seen;
+    poll_mark = 0;
+    if (!poll_t) fail("no poll within 200 us of the due age");
+    uint32_t built = hk_built - built0;
+    printf("stale_edge.period_us=%u\nstale_edge.due_age_us=%u\nstale_edge.stale_periods=%u\n"
+           "stale_edge.first_poll_age_us=%llu\nstale_edge.built=%u\n",
+           period_us, due_age_us, n, (unsigned long long)(poll_t - t_c), built);
+    core_read_all();                             /* the input packet, if built, leaves the queue */
+    plant_on = true;
+    emu.cfg.stale_periods = 3u;
+    emu.period_us[0] = 10000u;                   /* resume check at a short period */
+    emu.next_due_us[0] = (uint32_t)now + 10000u;
+    advance(30000u);
+    if (hk_built == built0 + built) fail("no report built after the plant moved");
+}
+
+/* Two sensors, sample always fresh (Codex BNOW-R2-1, R3-2, 14/11). Core only:
+ * sensors d and k (indices 0..2) at 10 ms, enabled together; the first due
+ * builds an input packet nobody reads, the second leaves both pending. The
+ * host then disables sensor d (Set Feature, interval 0): its pending report
+ * goes, sensor k's stays; after the host reads the queue, a report of sensor
+ * k only is built. */
+static void sc_pend_two(unsigned d, unsigned k)
+{
+    if (d >= BNO_EMU_N_SENSORS || k >= BNO_EMU_N_SENSORS || d == k) { fail("pend_two: sensors %u, %u", d, k); return; }
+    advance(emu.cfg.boot_delay_us + 1000u);
+    emu.period_us[d] = emu.period_us[k] = 10000u;
+    emu.next_due_us[d] = emu.next_due_us[k] = (uint32_t)now + 10000u;
+    advance(21000u);                             /* dues at +10 ms (packet), +20 ms (pending) */
+    int pd = emu.pend[d], pk = emu.pend[k];
+    core_set_feature(k_ids[d], 0u);
+    int qd = emu.pend[d], qk = emu.pend[k];
+    uint32_t bd = hk_built_s[d], bk = hk_built_s[k];
+    core_read_all();
+    advance(2000u);                              /* next due of sensor k at +30 ms: not yet */
+    printf("pend_two.sensors=%u,%u\npend_two.before=%d,%d\npend_two.after_disable=%d,%d\n"
+           "pend_two.built_after_read=%u,%u\n", d, k, pd, pk, qd, qk, hk_built_s[d] - bd, hk_built_s[k] - bk);
+    if (!(pd && pk)) fail("both sensors not pending before the disable (scenario did not set it up)");
+    if (qd || !qk) fail("after disabling sensor %u: pending %d,%d (want 0,1)", d, qd, qk);
+    if (hk_built_s[d] != bd || hk_built_s[k] != bk + 1u)
+        fail("after the read: built %u,%u (want 0,1)", hk_built_s[d] - bd, hk_built_s[k] - bk);
+}
+
+/* Core-level host transactions for the pending tests (no SH-2 library). */
+static void core_xfer(const uint8_t *mosi, uint16_t n)
+{
+    uint16_t l;
+    if (port_mode) (void)port_cs_fall(); else (void)bno_emu_cs_fall(&emu, (uint32_t)now, &l);
+    if (port_mode) port_cs_rise(mosi, n); else bno_emu_cs_rise(&emu, mosi, n, (uint32_t)now);
+}
+
+static void core_read_all(void)                  /* the host reads every queued packet */
+{
+    static const uint8_t z[BNO_EMU_PKT_MAX + 8u] = { 0 };
+    while (emu.q_count > 0u) {
+        uint16_t l;
+        (void)bno_emu_peek_tx(&emu, &l);
+        core_xfer(z, l);
+    }
+}
+
+static void core_set_feature(uint8_t id, uint32_t interval_us)
+{
+    uint8_t p[21] = { 21, 0, 2 /* control */, 0, 0xFD, id };
+    p[9] = (uint8_t)interval_us; p[10] = (uint8_t)(interval_us >> 8);
+    p[11] = (uint8_t)(interval_us >> 16); p[12] = (uint8_t)(interval_us >> 24);
+    core_xfer(p, sizeof p);
+}
+
+/* A report pending behind the previous input packet when the sample turns
+ * stale (Codex BNOW-R1-1, 14/11). Core only, sensor 0 at 10 ms (stale after
+ * 30 ms). Enabled at about 21 ms, plant frozen 4 ms later (t_f). Due at +10,
+ * +20, +30 ms after enabling: the first builds an input packet nobody reads,
+ * the next two wait (pend). At t_f + 31 ms the sample is stale (no report due
+ * then). 'read': the host then reads the queue; 'disable': before t_f + 30 ms
+ * the host disables the sensor (Set Feature, interval 0), then reads at
+ * t_f + 31 ms. Either way no report may be built after that. Sensor s
+ * (index 0..2, Codex BNOW-R3-2) instead of 0 when given. */
+static void sc_pend_stale(const char *how, unsigned s)
+{
+    if (s >= BNO_EMU_N_SENSORS) { fail("pend_stale: sensor %u", s); return; }
+    advance(emu.cfg.boot_delay_us + 1000u);
+    emu.period_us[s] = 10000u;
+    emu.next_due_us[s] = (uint32_t)now + 10000u;
+    uint64_t t_on = now;
+    advance(4000u);
+    plant_on = false;
+    advance(1000u);
+    uint64_t t_f = emu.t_seq_change_us;          /* < 2^32 */
+    bool disable = strcmp(how, "disable") == 0;
+    advance(t_f + 28000u - now);                 /* dues at t_on + 10, 20, 30 ms passed */
+    int pend_before = (int)emu.pend[s];
+    if (disable) core_set_feature(k_ids[s], 0u);
+    advance(t_f + 31000u - now);
+    uint32_t built0 = hk_built;
+    core_read_all();
+    advance(5000u);                              /* next due t_on + 40 ms: stale anyway */
+    uint32_t built = hk_built - built0;
+    printf("pend_stale.how=%s\npend_stale.sensor=%u\npend_stale.t_freeze_after_on_ms=%.3f\npend_stale.pend_before=%d\n"
+           "pend_stale.built_after_read=%u\n", how, s, (double)(t_f - t_on) * 1e-3, pend_before, built);
+    if (!pend_before) fail("no report pending before the read (scenario did not set it up)");
+    if (built) fail("%u reports built after the sample turned stale (pending path)", built);
+    plant_on = true;
+    if (disable) core_set_feature(k_ids[s], 10000u);
+    advance(100000u);
+    if (hk_built == built0 + built) fail("no report built after the plant moved");
+}
+
 /* S06 T8 (V3-1): IMU loss injected for 1.5 s in the middle of a run */
 static void sc_hold(uint32_t period)
 {
@@ -753,6 +1001,16 @@ int main(int argc, char **argv)
     else if (strcmp(sc, "silent") == 0)    sc_silent(period);
     else if (strcmp(sc, "stale") == 0)     sc_stale(period);
     else if (strcmp(sc, "hold") == 0)      sc_hold(period);
+    else if (strcmp(sc, "stale_gap") == 0) sc_stale_gap(period, argc > 3 ? seconds : 3221.0,
+                                                        argc > 4 && strncmp(argv[4], "held", 4) == 0,
+                                                        argc > 4 && strcmp(argv[4], "held_wrap") == 0);
+    else if (strcmp(sc, "core_wrap") == 0) sc_core_wrap();
+    else if (strcmp(sc, "pend_stale") == 0) sc_pend_stale(argc > 2 ? argv[2] : "read",
+                                                          argc > 3 ? (unsigned)strtoul(argv[3], NULL, 10) : 0u);
+    else if (strcmp(sc, "pend_two") == 0)   sc_pend_two(argc > 2 ? (unsigned)strtoul(argv[2], NULL, 10) : 0u,
+                                                        argc > 3 ? (unsigned)strtoul(argv[3], NULL, 10) : 1u);
+    else if (strcmp(sc, "stale_edge") == 0) sc_stale_edge(period, argc > 3 ? (uint32_t)strtoul(argv[3], NULL, 10) : 0u,
+                                                          argc > 4 ? (uint32_t)strtoul(argv[4], NULL, 10) : 3u);
     else { printf("unknown scenario\n"); return 2; }
 
     /* S06 hook checks, every scenario */

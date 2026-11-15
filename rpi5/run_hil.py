@@ -156,6 +156,7 @@ def _run_plant(cfg, shared_state: mp.Array, shared_ref: mp.Array, use_mock: bool
     node  = HILNode(plant, config=cfg, shared_state=shared_state, shared_ref=shared_ref,
                     monitor=monitor, step_log=step_log, control=control, responder=responder)
     node.run()
+    plant_mem_snapshot()                  # S06 T2 B1 (R134C-12): this process, after the loop, before it exits
     if node.run_failed:
         sys.exit(3)
 
@@ -209,6 +210,113 @@ def _owner_tick(box, publisher) -> None:
         box.publisher_done()
     else:
         box.publisher_dead()
+
+
+MEM_SNAPSHOT_ENV ='HIL_MEM_SNAPSHOT'     # path of the plant process memory snapshot (S06 T2 B1, R134C-12)
+
+
+def _meminfo(path='/proc/meminfo'):
+    """(MemAvailable, MemTotal) in KiB, None where not readable."""
+    out = {}
+    try:
+        with open(path, encoding='ascii') as f:
+            for line in f:
+                key, _, rest = line.partition(':')
+                if key in ('MemAvailable', 'MemTotal'):
+                    out[key] = int(rest.split()[0])
+    except (OSError, ValueError, IndexError):
+        pass
+    return out.get('MemAvailable'), out.get('MemTotal')
+
+
+def mem_snapshot_setup():
+    """main(), before the processes start (S06 T2 B1): the path of the plant snapshot in the temporary folder,
+    stale files removed, put in HIL_MEM_SNAPSHOT for the plant process. Any error (no usable temporary folder,
+    a stale file that cannot be removed): a warning, HIL_MEM_SNAPSHOT unset, None (R134C2-6, R134C3-6)."""
+    try:
+        import tempfile
+        path = os.path.join(tempfile.gettempdir(), f'hil_mem_{os.getpid()}.json')
+        for stale in (path, path + '.tmp'):
+            if os.path.exists(stale):
+                os.remove(stale)
+        os.environ[MEM_SNAPSHOT_ENV] = path
+        return path
+    except Exception as exc:              # noqa: BLE001 (report only)
+        logging.getLogger('hil.main').warning('Memory snapshot (S06 T2 B1) not set up: %s', exc)
+        os.environ.pop(MEM_SNAPSHOT_ENV, None)
+        return None
+
+
+def plant_mem_snapshot(path=None, status='/proc/self/status', meminfo='/proc/meminfo'):
+    """S06 T2 B1 (Liam 12/11 THESIS local_f4d7c6ff, spec S06 T2 '[B1]'; R134 package, Liam 14/11 CODE_R134
+    "duyet goi sua code fix/r134-answers"; Codex R134C-12, Liam 14/11 "Sua + vong 2 (Recommended)"; CODE 14/11
+    allowed these lines in _run_plant). Called in the plant process right after node.run() returns, so after
+    the 1 kHz loop and before the process exits: VmHWM (peak resident set of THIS process) and VmRSS of
+    /proc/self/status, MemAvailable / MemTotal of /proc/meminfo, the PID and the wall time, as JSON to `path`
+    (default: the file named by the environment variable HIL_MEM_SNAPSHOT, set by main() before the plant
+    process starts). No path: nothing done. Any error is swallowed: a memory report never fails a run."""
+    path = path or os.environ.get(MEM_SNAPSHOT_ENV)
+    if not path:
+        return None
+    try:
+        import json
+        snap = dict(pid=os.getpid(), t_wall=time.time(), vm_hwm_kib=None, vm_rss_kib=None)
+        try:
+            with open(status, encoding='ascii') as f:
+                for line in f:
+                    key, _, rest = line.partition(':')
+                    if key in ('VmHWM', 'VmRSS'):
+                        snap['vm_hwm_kib' if key == 'VmHWM' else 'vm_rss_kib'] = int(rest.split()[0])
+        except (OSError, ValueError, IndexError):
+            pass
+        snap['mem_available_kib'], snap['mem_total_kib'] = _meminfo(meminfo)
+        with open(path + '.tmp', 'w', encoding='utf-8') as f:
+            json.dump(snap, f)
+        os.replace(path + '.tmp', path)
+        return snap
+    except Exception:                     # noqa: BLE001 (report only)
+        return None
+
+
+def mem_report(snapshot_path, plant_pid=None):
+    """S06 T2 B1 (report only, never scored; section 6.5): the snapshot plant_mem_snapshot wrote in the plant
+    process, read in the main process after the join (nothing runs in the 1 kHz loop), then removed:
+      plant_peak_rss_kib  VmHWM of the plant process (/proc/<plant pid>/status), its own peak resident set
+      plant_rss_kib       VmRSS at that moment
+      mem_available_kib, mem_total_kib   /proc/meminfo after the loop, while the plant process still lives
+      plant_pid, pid_match (snapshot PID = the plant process PID), t_wall (time of the snapshot)
+    No snapshot (the plant process ended before it, or not Linux): those fields None, 'note' says why."""
+    out = dict(plant_peak_rss_kib=None, plant_rss_kib=None, mem_available_kib=None, mem_total_kib=None,
+               plant_pid=None, pid_match=None, t_wall=None,
+               method='VmHWM, VmRSS of /proc/self/status and /proc/meminfo read in the plant process after '
+                      'its loop, before it exits (run_hil.plant_mem_snapshot)')
+    try:
+        import json
+        with open(snapshot_path, encoding='utf-8') as f:
+            snap = json.load(f)
+    except (OSError, ValueError, TypeError):
+        out['note'] = 'no snapshot from the plant process (it ended before the end of its loop, or not Linux)'
+        return out
+    finally:
+        try:
+            if snapshot_path:
+                os.remove(snapshot_path)
+        except OSError:
+            pass
+    # R134C2-6: a snapshot of another shape, or of another process, gives no number under the plant labels
+    keys = ('pid', 'vm_hwm_kib', 'vm_rss_kib', 'mem_available_kib', 'mem_total_kib', 't_wall')
+    if not isinstance(snap, dict) or any(not (snap.get(k) is None or isinstance(snap.get(k), (int, float)))
+                                         or isinstance(snap.get(k), bool) for k in keys):
+        out['note'] = 'snapshot of an unknown shape: not used'
+        return out
+    out.update(plant_pid=snap.get('pid'), t_wall=snap.get('t_wall'),
+               pid_match=None if plant_pid is None else snap.get('pid') == plant_pid)
+    if out['pid_match'] is False:
+        out['note'] = f"snapshot of PID {snap.get('pid')}, not of the plant process {plant_pid}: not used"
+        return out
+    out.update(plant_peak_rss_kib=snap.get('vm_hwm_kib'), plant_rss_kib=snap.get('vm_rss_kib'),
+               mem_available_kib=snap.get('mem_available_kib'), mem_total_kib=snap.get('mem_total_kib'))
+    return out
 
 
 class _PhaseReporter:
@@ -625,6 +733,8 @@ def main() -> int:
         from plant_blob import plant_source
         plant_src_before = plant_source()
 
+    # S06 T2 B1 (R134C-12): where the plant process writes its memory snapshot (inherited environment)
+    mem_path = mem_snapshot_setup()        # R134C2-6, R134C3-6: a memory report never stops the run
     for proc in procs:
         proc.start()
         log.info("  %s  pid=%d", proc.name, proc.pid)
@@ -649,6 +759,9 @@ def main() -> int:
     if owner is not None:
         phase_rep()                       # the last phase (END, or where an error left it)
     log.info("Plant process exited (code=%s)", p1.exitcode)
+    mem = mem_report(mem_path, p1.pid)     # S06 T2 B1: snapshot of the plant process, read after the join
+    log.info('Memory (S06 T2 B1): plant peak RSS %s KiB, MemAvailable %s KiB of %s KiB',
+             mem['plant_peak_rss_kib'], mem['mem_available_kib'], mem['mem_total_kib'])
     if step_csv is not None:
         import json
         import platform
@@ -661,6 +774,7 @@ def main() -> int:
         meta['plant_src_after'] = plant_source()
         # the two blobs only, not the method (S3E-3); limit: read in this process, not the plant one
         meta['plant_src_changed'] = not same_plant(meta['plant_src_after'], plant_src_before)
+        meta['memory'] = mem                              # S06 T2 B1 (report only)
         with open(args.step_log + '.json', 'w') as f:
             json.dump(meta, f, indent=1)
         log.info('Step log: %d rows -> %s; overflow=%d lost_or_torn=%d', meta['rows'], args.step_log,

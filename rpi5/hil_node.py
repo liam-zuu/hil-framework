@@ -39,7 +39,7 @@ from timing import PrecisionTimer, set_realtime, pin_cpu, lock_memory
 from gpio_sync import GPIOSync
 from spi_master import SPIMaster
 from protocol import (encode_state, decode_torques, TRAJ_VALID, TRAJ_NEW, OFS_MISO_SEQ, CMD_SWA_ON,
-                      miso_check, MISO_OK, MISO_EMPTY, FRAME_SIZE, new_run_id, miso_id)
+                      miso_check, MISO_OK, MISO_EMPTY, FRAME_SIZE, new_run_id, miso_id, state_out_of_range)
 from plant_interface import PlantInterface, MockPlant
 from mecanum_plant import MecanumPlant
 from imu_model import imu_from_plant
@@ -229,6 +229,7 @@ class HILNode:
         self._run_id      = new_run_id()
         self._id_match_n  = 0
         self._id_first_step: Optional[int] = None
+        self._state_bad: Optional[dict] = None   # first plant state out of its encoding range (B81-15)
         log.info('#run_id,%08x', self._run_id)
         self._ref         = (0.0, 0.0, 0.0)
         self._ref_count   = 0.0
@@ -390,10 +391,14 @@ class HILNode:
                 self._ref       = (vx_r, vy_r, wz_r)
                 traj_flags      = TRAJ_VALID | TRAJ_NEW
         state  = self.plant.get_state()
-        imu, imu_seq = self._imu_sample(state)
         frame_state = plant_to_frame_state(state) if self._mecanum else state
+        # O1 v11.15 3.5 (B81-15): the plant state as it comes, before the IMU sample (which may raise on it) and
+        # the S06 heavy block (which may overwrite omega), then the frame as encoded (Codex B8C-R1-2)
+        self._check_state(frame_state, 'plant')
+        imu, imu_seq = self._imu_sample(state)
         if self._heavy is not None:
             self._heavy.apply(self._step, frame_state)   # S06 Z8: omega to the H7 only, the plant goes on
+            self._check_state(frame_state, 'frame')
         swa = self._swa_bit()
         mosi_true = encode_state(frame_state, traj_ref=self._ref, traj_flags=traj_flags,
                                  seq=self._step, imu=imu, imu_seq=imu_seq,
@@ -482,6 +487,17 @@ class HILNode:
         if self._step % self.cfg.stats_interval == 0:
             self._log_stats()
 
+    def _check_state(self, frame_state, where: str) -> None:
+        """O1 v11.15 3.5 (B81-15): record the first state field that is not finite, or x, y at the +-5 m bound
+        (protocol.state_out_of_range): a HIL tool error, the run is failed (run_failed) and redone."""
+        if self._state_bad is not None:
+            return
+        i = state_out_of_range(frame_state)
+        if i >= 0:
+            self._state_bad = dict(step=int(self._step), field=int(i), value=repr(float(frame_state[i])), where=where)
+            log.error('plant state field %d = %r at step %d (%s): not finite or position at the +-5 m bound; '
+                      'HIL tool error, run to be redone (O1 3.5)', i, frame_state[i], self._step, where)
+
     def _swa_bit(self) -> int:
         """I8: SWA command for this frame. 'phase' reads the phase after this step's lifecycle step."""
         m = self.cfg.swa_mode
@@ -567,6 +583,7 @@ class HILNode:
                         frame_len=int(self._flog['mosi'].shape[1]), proto='mosi_v4_miso_v6',   # RS-4 P1
                         run_id=int(self._run_id), id_first_step=self._id_first_step,
                         id_confirmed=self._id_first_step is not None,                   # R10-2
+                        state_out_of_range=self._state_bad,                             # B81-15
                         xfer_us=self._xfer_stats(n), timer_overruns=int(self._timer.overruns),
                         **self.swa_tail())                                             # I8-R2-3
         np.savez(self.cfg.frame_log, manifest=np.array(json.dumps(manifest)),
@@ -626,8 +643,10 @@ class HILNode:
         """--finite-run ended in error:<reason>, or without reaching END, or (I8-R2-3, Codex round 3)
         reached END but its tail was cut (max_steps, a full frame log, a signal), so run_hil.py exits 3.
         RS-4 P1: also any run stopped because the H7 did not send the run_id back (H7 not MISO v6), and on the
-        real link any run that ended before a good-CRC reply confirmed it (Codex RS4-R10-2)."""
-        if self._stop_reason == 'h7_not_miso_v6':
+        real link any run that ended before a good-CRC reply confirmed it (Codex RS4-R10-2). O1 v11.15 3.5
+        (B81-15): also any run whose plant state was not finite or whose x, y reached the +-5 m bound (a HIL tool error,
+        the run is redone; manifest state_out_of_range)."""
+        if self._stop_reason == 'h7_not_miso_v6' or self._state_bad is not None:
             return True
         if not self.cfg.simulate_hw and self._id_first_step is None:
             return True

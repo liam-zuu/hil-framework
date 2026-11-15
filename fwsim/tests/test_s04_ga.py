@@ -5,6 +5,7 @@ import csv
 import json
 import math
 import os
+import re
 import sys
 
 import numpy as np
@@ -21,7 +22,8 @@ needs_dll = pytest.mark.skipif(not os.path.isfile(_DLL), reason='fwsim.dll not b
 
 
 def P(f1, f2, x=(1.0,), seed=1, feasible=True):
-    return dict(f1=f1, f2=f2, x=list(x), xga=list(x), ga_seed=seed, feasible=feasible, gen=1, cand_id=0, g1=0, g2=0)
+    return dict(f1=f1, f2=f2, x=list(x), xga=list(x), ga_seed=seed, feasible=feasible, gen=1, cand_id=0, g1=0, g2=0,
+                g3=0, g4=0, g5=0)
 
 
 # ── selection, Pareto, HV (sections 4.2, 5) ─────────────────────────────────────────
@@ -64,8 +66,9 @@ def test_hypervolume_staircase_and_reference():
 
 # ── scoring (section 3) ──────────────────────────────────────────────────────────────
 
-def R(completed='true', status='ok', e=0.02, tv=5.0):
-    return dict(completed=completed, status=status, e_perp_max=e, tv_duty=tv)
+def R(completed='true', status='ok', e=0.02, tv=5.0, trk=0.03, bao=0.04, th=2.0):
+    return dict(completed=completed, status=status, e_perp_max=e, tv_duty=tv, e_trk_max=trk, e_bao_max=bao,
+                e_theta_cmd_max_deg=th)
 
 
 def test_score_objectives_and_constraints():
@@ -104,9 +107,11 @@ _V8_EXTRA = [(i, 'axial') for i in range(257, 271)] + [(i, 'test') for i in rang
 
 
 def _s03_dir(tmp_path, runs=None, trial=False, mu=(0.4, 0.5, 0.6), levels=None, plant_src=None, o1c=None,
-             script=None, imu=None):
+             script=None, imu=None, gate=None):
     """levels: {controller: {factor: (L, H)}}; default a synthetic domain. plant_src, o1c, imu, script:
-    the S03 source record (S4C-2); default the source of this checkout (HEAD, clean)."""
+    the S03 source record (S4C-2); default the source of this checkout (HEAD, clean). gate: the gate
+    speeds (default s03_doe.SPEEDS); the real GA trials use 0.2 only, where the default gains meet
+    g3-g5 on fwsim (at 0.8 the PID default heading error is above 7.5 deg; R134 package)."""
     d = tmp_path / 's03'
     (d / 'sealed').mkdir(parents=True)
     with open(d / 'levels.csv', 'w', newline='') as f:
@@ -130,7 +135,7 @@ def _s03_dir(tmp_path, runs=None, trial=False, mu=(0.4, 0.5, 0.6), levels=None, 
         f'firmware:\n  dll_sha256: {dll_sha}\n'
         f'plant: {json.dumps(dict(motor_model="dc", src=plant_src or fwsim.PLANT_SRC))}\n'
         f'o1: {json.dumps(o1c or s4.o1_constants())}\nimu: {json.dumps(imu or s3.IMU)}\n'
-        f'gate_speeds: {json.dumps(list(s3.SPEEDS))}\ny3_reference: {json.dumps(y3)}\n', encoding='utf-8')
+        f'gate_speeds: {json.dumps(list(gate or s3.SPEEDS))}\ny3_reference: {json.dumps(y3)}\n', encoding='utf-8')
     if runs is not None:
         s3.write_csv(str(d / 'sealed' / 'runs.csv'), runs)
     return d
@@ -396,7 +401,7 @@ def test_lock_from_a_real_trial_catches_changed_sources(tmp_path, monkeypatch):
     stops post, and with it restored post runs; a trial whose S03 meta.yaml records another DLL
     SHA-256 stops (the S03 record is changed here, not the DLL file). The other S03 source checks
     of the first trial: test_first_trial_refuses_a_source_s03_did_not_use."""
-    d = _s03_dir(tmp_path, trial=True, mu=(0.5,), levels=_levels_near_defaults())
+    d = _s03_dir(tmp_path, trial=True, mu=(0.5,), levels=_levels_near_defaults(), gate=(0.2,))
     out = tmp_path / 'run'
     common = ['--tool-check', '--controller', 'PID', '--s03', str(d), '--pop', '4', '--gen-base', '1',
               '--gen-max', '1', '--dll', _DLL, '--out', str(out)]
@@ -527,7 +532,8 @@ class FakeEv:
         self.calls.append((gen, cand))
         f1 = 0.01 + 0.05 * abs(v[0] - 1.5)
         f2 = 1.0 + abs(v[1] - 2.0) + 0.1 * v[0]
-        return dict(f1=f1, f2=f2, g1=0.0, g2=(f1 - s4.D) / s4.D, status='ok', n_runs=1, n_false=0, n_inconclusive=0,
+        return dict(f1=f1, f2=f2, g1=0.0, g2=(f1 - s4.D) / s4.D, g3=-0.5, g4=-0.5, g5=-0.5, status='ok', n_runs=1,
+                    n_false=0, n_inconclusive=0,
                     n_track_err=0, n_run_error=0)
 
 
@@ -621,7 +627,7 @@ def test_root_meta_keeps_code_notes(tmp_path):
 def test_default_gains_must_give_a_valid_reference(monkeypatch):
     """S4C-7: no HV reference from a run_error penalty or a non-positive f2."""
     rows = iter([(dict(status='run_error', completed='', error='x'), None)])
-    monkeypatch.setattr(s3, 'safe_run', lambda *a, **k: next(rows))
+    monkeypatch.setattr(s4, 'safe_run_gate', lambda *a, **k: next(rows))
     monkeypatch.setattr(s3, 'run_in_new_process', lambda dll, jobs, work: [dict(row=dict(status='ok'), digest=None)])
     monkeypatch.setattr(s3, 'defaults', lambda fw, c: {})
     assert s4.default_f2(None, 'x.dll', 'PID', [0.2], 0.5, 'w')[3] is False
@@ -645,7 +651,7 @@ def test_run_error_retry_ok_keeps_the_first_attempt_penalty(monkeypatch):
     attempt succeeds, the candidate keeps the penalty of the first attempt."""
     ok = dict(status='ok', completed='true', e_perp_max=0.02, tv_duty=4.0)
     calls = iter([(ok, None), (dict(status='run_error', completed='', error='x'), None)])
-    monkeypatch.setattr(s3, 'safe_run', lambda *a, **k: next(calls))
+    monkeypatch.setattr(s4, 'safe_run_gate', lambda *a, **k: next(calls))
     monkeypatch.setattr(s3, 'run_in_new_process', lambda dll, jobs, work: [dict(row=ok, digest=None)])
     ev = s4.Evaluator(None, 'x.dll', 'PID', [0.2, 0.5], [0.5], 'w')
     s = ev.candidate({}, 1, 1, 0)
@@ -679,7 +685,7 @@ def test_tool_check_three_phases(tmp_path, monkeypatch, capsys):
     """trial -> lock.yaml, main (2 seeds) -> selected.csv with a send_to_HIL row whose gains read back
     from the file reproduce every GA run bit for bit in a new process (post)."""
     yaml = pytest.importorskip('yaml')
-    d = _s03_dir(tmp_path, trial=True, mu=(0.5,), levels=_levels_near_defaults())
+    d = _s03_dir(tmp_path, trial=True, mu=(0.5,), levels=_levels_near_defaults(), gate=(0.2,))
     out = tmp_path / 'run'
     for ctrl in s3.CONTROLLERS:
         common = ['--tool-check', '--controller', ctrl, '--s03', str(d), '--pop', '4', '--gen-base', '1',
@@ -736,3 +742,194 @@ def test_tool_check_three_phases(tmp_path, monkeypatch, capsys):
 def s4_args(out):
     import argparse
     return argparse.Namespace(out=str(out), dll=_DLL)
+
+
+# ── g3-g5 and penalty flags (S04 v6.2 SC-8, v6.3 RS2-8; R134 package) ─────────────────
+
+def test_score_g3_g4_g5_are_maxima_over_runs():
+    rows = [(0.5, 0.2, R(trk=0.03, bao=0.05, th=2.0)), (0.5, 0.5, R(trk=0.12, bao=0.04, th=9.0))]
+    s = s4.score(rows, False)
+    assert s['g3'] == pytest.approx((0.12 - s4.D) / s4.D) and s['g4'] == pytest.approx((0.05 - s4.D) / s4.D)
+    assert s['g5'] == pytest.approx((9.0 - 7.5) / 7.5) and s4.THETA_MAX_DEG == 7.5
+    assert (s['pen_f1'], s['n_pen_runs']) == (0, 0)
+
+
+@pytest.mark.parametrize('key', s4.PEN_KEYS)
+@pytest.mark.parametrize('bad', [None, '', 'nan', float('nan'), float('inf'), 'x'])
+def test_missing_or_non_finite_quantity_is_penalised_and_flagged(key, bad):
+    row = R()
+    if bad is None:
+        del row[key]
+    else:
+        row[key] = bad
+    vals, flags = s4.run_values(row)
+    assert vals[key] == s4.PENALTY and flags['pen_' + key] == 1
+    assert all(flags['pen_' + k] == 0 and vals[k] == float(R()[k]) for k in s4.PEN_KEYS if k != key)
+    s = s4.score([(0.5, 0.2, row), (0.5, 0.5, R())], False)
+    gi = {'e_perp_max': 'g2', 'e_trk_max': 'g3', 'e_bao_max': 'g4', 'e_theta_cmd_max_deg': 'g5'}[key]
+    lim = s4.THETA_MAX_DEG if key == 'e_theta_cmd_max_deg' else s4.D
+    assert s[gi] == pytest.approx((s4.PENALTY - lim) / lim) and s['n_pen_runs'] == 1
+    assert s['pen_f1'] == int(key == 'e_perp_max') and all(math.isfinite(s[f'g{i}']) for i in range(1, 6))
+
+
+def test_run_error_flags_every_quantity_and_penalises_every_constraint():
+    vals, flags = s4.run_values(dict(status='run_error', completed='', e_trk_max=0.01))
+    assert all(v == s4.PENALTY for v in vals.values()) and all(f == 1 for f in flags.values())
+    rows = [(0.5, 0.2, R()), (0.5, 0.5, dict(completed='', status='run_error', error='x'))]
+    s = s4.score(rows, True)
+    assert (s['f1'], s['f2'], s['g1'], s['status'], s['pen_f1'], s['n_pen_runs']) == (
+        s4.PENALTY, s4.PENALTY, 2.0, 'run_error', 1, 1)
+    assert s['g3'] == s['g4'] == pytest.approx((s4.PENALTY - s4.D) / s4.D)
+    assert s['g5'] == pytest.approx((s4.PENALTY - 7.5) / 7.5)
+
+
+def test_score_refuses_a_constraint_that_is_not_finite(monkeypatch):
+    """S04 v6.2 section 3: G is checked finite before the optimiser (forced through run_values)."""
+    monkeypatch.setattr(s4, 'run_values', lambda row: ({k: float('inf') for k in s4.PEN_KEYS},
+                                                       {'pen_' + k: 0 for k in s4.PEN_KEYS}))
+    with pytest.raises(RuntimeError, match='not finite'):
+        s4.score([(0.5, 0.2, R())], False)
+
+
+def test_evals_rows_carry_e_bao_and_the_flags(monkeypatch):
+    calls = iter([(R(bao=float('nan')), None), (R(), None)])
+    monkeypatch.setattr(s4, 'safe_run_gate', lambda *a, **k: next(calls))
+    ev = s4.Evaluator(None, 'x.dll', 'PID', [0.2, 0.5], [0.5], 'w')
+    s = ev.candidate({}, 1, 1, 0)
+    assert [e['pen_e_bao_max'] for e in ev.evals] == [1, 0] and s['g4'] == pytest.approx((s4.PENALTY - s4.D) / s4.D)
+    assert all(set(s4.PEN_COLS) <= set(e) for e in ev.evals) and {'e_bao_max'} <= set(s4.EVAL_COLS)
+
+
+def test_g5_alone_makes_the_point_infeasible():
+    from pymoo.core.individual import Individual
+    X = np.array([1.2, 2.0])
+    G = np.array([0.0, -0.5, -0.5, -0.5, 0.2])
+    ind = Individual(X=X, F=np.array([0.05, 3.0]), G=G)
+    ind.set('eval_id', (1, 0))
+    seen = {X.tobytes(): [(1, 0, (0.05, 3.0, 0.0, -0.5, -0.5, -0.5, 0.2))]}
+    p = s4.points_of([ind], DOM2, 1, seen)[0]
+    assert p['feasible'] is False and p['g5'] == 0.2 and p['id_note'] == ''
+    row = s4.population_rows('PID', {1: [p]})[0]
+    assert (row['g3'], row['g4'], row['g5']) == (-0.5, -0.5, 0.2) and set(s4.POP_COLS) >= {'g3', 'g4', 'g5'}
+
+
+GATE_FIELD = re.compile(r'^(e_bao_max|gate_[a-z_]+|g[1-5]_[a-z_]+)$')     # G1-G5 fields an s03_doe row may carry
+
+
+def _same_fields(a, b):
+    """run_gate row b against s03_doe.run_one row a: b adds e_bao_max; every field of b keeps the value of a; a field
+    of a that b has not is a G1-G5 field of an s03_doe that writes them (hil feat/s03-gate, S3G-5; CODE 15/11), and
+    an e_bao_max in a equals the one of b bit for bit."""
+    assert 'e_bao_max' in b and set(b) - set(a) <= {'e_bao_max'}
+    assert all(GATE_FIELD.match(k) for k in set(a) - set(b)), sorted(set(a) - set(b))
+    keys = [k for k in b if k != 'e_bao_max']
+    assert s3.row_text({k: a[k] for k in keys}) == s3.row_text({k: b[k] for k in keys})
+    if 'e_bao_max' in a:
+        assert s3._bits(a['e_bao_max']) == s3._bits(b['e_bao_max'])
+
+
+@needs_dll
+def test_run_gate_matches_run_one_and_adds_e_bao():
+    """The gate run is s03_doe.run_one with o1_gate_eval: every field of run_one keeps its value."""
+    fw = fwsim.FirmwareSim(_DLL)
+    if not fw.pos_cols:
+        pytest.skip('DLL without pos_ctrl.c')
+    import o1_feasibility as o1
+    path = o1.Path8()
+    g = s3.defaults(fw, 'PID')
+    a, la = s3.run_one(fw, path, 'PID', g, 0.5, 0.436)
+    b, lb = s4.run_gate(fw, path, 'PID', g, 0.5, 0.436)
+    assert s3.log_digest(la) == s3.log_digest(lb)
+    _same_fields(a, b)
+    assert math.isfinite(b['e_bao_max'])
+
+
+# ── after Codex round 1 (R134C-7, R134C-13; Liam 14/11 CODE_R134 "Sua + vong 2 (Recommended)") ──
+
+def test_safe_run_gate_lets_s03stop_through(monkeypatch):
+    """R134C-7: a tool / configuration error stops the GA as in s03_doe.safe_run, not a run_error row."""
+    def stop(*a, **k):
+        raise s3.S03Stop('PID kd != 0')
+    monkeypatch.setattr(s4, 'run_gate', stop)
+    with pytest.raises(s3.S03Stop):
+        s4.safe_run_gate(None, None, 'PID', {}, 0.5, 0.5)
+    ev = s4.Evaluator(None, 'x.dll', 'PID', [0.2], [0.5], 'w')
+    with pytest.raises(s3.S03Stop):
+        ev.candidate({}, 1, 1, 0)
+    assert ev.evals == []
+
+    def boom(*a, **k):
+        raise ValueError('evaluator')
+    monkeypatch.setattr(s4, 'run_gate', boom)
+    row, log = s4.safe_run_gate(None, None, 'PID', {}, 0.5, 0.5)
+    assert row['status'] == 'run_error' and 'ValueError' in row['error'] and log is None
+
+
+def test_g3_g4_g5_maxima_found_at_another_mu():
+    """R134C-13: the largest e_trk, e_bao, e_theta of the candidate is at the second mu, not the first."""
+    rows = [(0.4, 0.2, R(trk=0.03, bao=0.04, th=2.0)), (0.4, 0.5, R(trk=0.04, bao=0.03, th=3.0)),
+            (0.6, 0.2, R(trk=0.11, bao=0.02, th=1.0)), (0.6, 0.5, R(trk=0.05, bao=0.09, th=8.5))]
+    s = s4.score(rows, False)
+    assert s['g3'] == pytest.approx((0.11 - s4.D) / s4.D) and s['g4'] == pytest.approx((0.09 - s4.D) / s4.D)
+    assert s['g5'] == pytest.approx((8.5 - 7.5) / 7.5)
+
+
+class InfeasibleEv(FakeEv):
+    """Every candidate breaks one constraint only (g5 > 0 by default), through the real score()."""
+
+    def __init__(self, bad='g5'):
+        super().__init__()
+        self.bad = bad
+
+    def candidate(self, g, ga_seed, gen, cand):
+        self.calls.append((gen, cand))
+        r = R(e=0.02, tv=5.0, trk=0.03, bao=0.04, th=2.0)
+        r.update({'g3': dict(e_trk_max=0.2), 'g4': dict(e_bao_max=0.2), 'g5': dict(e_theta_cmd_max_deg=9.0)}[self.bad])
+        return s4.score([(0.5, 0.2, r)], False)
+
+
+@pytest.mark.parametrize('bad', ['g3', 'g4', 'g5'])
+def test_one_constraint_alone_leaves_no_feasible_point_and_no_send(bad):
+    """R134C-13: candidates that break only G3, G4 or G5, evaluated through run_seed: no feasible point,
+    HV 0 every generation, the trial goes on to gen_max (HV_base = 0), and summarise sends nothing."""
+    hist, hv_rows = [], []
+    pts, n_gen, ext = s4.run_seed(InfeasibleEv(bad), DOM2, 1, 6, None, (s4.D, 50.0), hist, hv_rows, ext=(3, 5),
+                                  log=lambda *_: None)
+    assert pts and not any(p['feasible'] for p in pts) and all(p[bad] > 0 for p in pts)
+    assert all(h['hv'] == 0.0 and h['n_feasible'] == 0 for h in hv_rows) and (ext, n_gen) == (True, 5)
+    rows, st = s4.summarise('PID', DOM2, {1: pts, 2: pts})
+    send = [r for r in rows if r['kind'] == 'send_to_HIL']
+    assert len(send) == 1 and send[0]['feasible'] is False and st['n_feasible_seeds'] == 0
+
+
+@needs_dll
+@pytest.mark.parametrize('ctrl, v, mu', [('PID', 0.2, 0.6), ('ADRC', 0.5, 0.436), ('ADRC', 0.8, 0.3)])
+def test_run_gate_matches_run_one_for_both_controllers(ctrl, v, mu):
+    """R134C-13: run_gate = s03_doe.run_one + e_bao_max for both controllers, other speeds and mu."""
+    fw = fwsim.FirmwareSim(_DLL)
+    if not fw.pos_cols:
+        pytest.skip('DLL without pos_ctrl.c')
+    import o1_feasibility as o1
+    path = o1.Path8()
+    g = s3.defaults(fw, ctrl)
+    a, la = s3.run_one(fw, path, ctrl, g, v, mu)
+    b, lb = s4.run_gate(fw, path, ctrl, g, v, mu)
+    assert s3.log_digest(la) == s3.log_digest(lb)
+    _same_fields(a, b)
+    assert math.isfinite(b['e_bao_max'])
+
+
+@pytest.mark.parametrize('bad, row_mod', [('g3', dict(e_trk_max=0.2)), ('g4', dict(e_bao_max=0.2)),
+                                          ('g5', dict(e_theta_cmd_max_deg=9.0))])
+def test_each_constraint_through_the_real_evaluator(monkeypatch, bad, row_mod):
+    """R134C2-10: G3, G4, G5 through Evaluator.candidate (only the simulation row is made up), then
+    run_seed: no feasible point, and the breaking constraint is the only one above 0."""
+    def fake_gate(fw, path, ctrl, g, v, mu):
+        return dict(R(), **row_mod), None
+    monkeypatch.setattr(s4, 'safe_run_gate', fake_gate)
+    ev = s4.Evaluator(None, 'x.dll', 'PID', [0.2, 0.5], [0.4, 0.6], 'w')
+    s = ev.candidate({}, 1, 1, 0)
+    assert s[bad] > 0 and all(s[g] <= 0 for g in ('g1', 'g2', 'g3', 'g4', 'g5') if g != bad)
+    assert len(ev.evals) == 4 and all(e['attempt'] == 1 for e in ev.evals)
+    pts, _, _ = s4.run_seed(ev, DOM2, 1, 4, 2, (s4.D, 50.0), [], [], log=lambda *_: None)
+    assert pts and not any(p['feasible'] for p in pts)
