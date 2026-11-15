@@ -207,6 +207,8 @@ class HILNode:
             self._faults = FramePatcher(self.cfg.faults)
             if self._lc is None:
                 self._faults.start(0)        # no phases: t0 = step 0
+            from fault_plant import attach as attach_plant_faults   # batch 2 plant faults (CODE_FAULT2)
+            self.plant = attach_plant_faults(plant, self._faults, self.cfg.frame_log)   # plant itself if none
         self._fault_summary: Optional[dict] = None
         self._swa       = None               # last bit sent; None before the first frame
         self._swa_events: list = []          # (step, 0/1) at every change, for the manifest

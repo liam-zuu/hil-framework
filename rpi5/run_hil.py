@@ -527,11 +527,23 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def load_faults(args, n_omega_modes: int, hil_cfg, load_schedule: bool):
+def load_faults(args, n_omega_modes: int, hil_cfg, load_schedule: bool, lifted: bool = False):
     """L82 --faults: the schedule loaded and checked for this run (fault_schedule.load), or SystemExit
     before any process or SPI is opened. Run length: RUN of --finite-run, else --steps. IMU source in the
-    priority order of HILNode._imu_sample: static, profile, plant (MecanumPlant), none."""
+    priority order of HILNode._imu_sample: static, profile, plant (MecanumPlant), none. Batch 2 (CODE_FAULT2):
+    plant faults need MecanumPlant on the ground with ground_model 'traction'; their values are checked
+    against the nominal parameters of _run_plant (--ground, --mu) here and again by fault_plant in the node."""
     import fault_schedule
+    import fault_plant
+    from params import MecanumParams
+    nominal = MecanumParams()
+    ground, mu = getattr(args, 'ground', None), getattr(args, 'mu', None)
+    if ground:
+        nominal.ground_model = ground
+    if mu is not None:
+        nominal.mu_hd = [mu] * 4
+    plant = (None if (n_omega_modes or args.mock or lifted or fault_plant.nominal_problem(nominal))
+             else 'traction')
     if load_schedule:
         raise SystemExit('--faults excludes --load-schedule (both write the wheel speeds)')
     if not args.frame_log:
@@ -549,7 +561,9 @@ def load_faults(args, n_omega_modes: int, hil_cfg, load_schedule: bool):
                   'profile' if hil_cfg.imu_profile else
                   None if (n_omega_modes or args.mock) else 'plant')
     try:
-        return fault_schedule.load(args.faults, run_ms, imu_source)
+        sched = fault_schedule.load(args.faults, run_ms, imu_source, plant)
+        fault_plant.check_params(sched.rows, nominal)
+        return sched
     except (OSError, fault_schedule.ScheduleError) as exc:
         raise SystemExit(f'--faults {args.faults}: {exc}')
 
@@ -687,7 +701,7 @@ def main() -> int:
     hil_cfg.swa_mode = resolve_swa(args.swa, args.finite_run, n_modes, args.traj, args.no_traj)
     log.info('SWA (I8): --swa %s -> %s', args.swa, hil_cfg.swa_mode)
     if args.faults is not None:
-        hil_cfg.faults = load_faults(args, n_modes, hil_cfg, load_rows is not None)
+        hil_cfg.faults = load_faults(args, n_modes, hil_cfg, load_rows is not None, lifted)
         log.info('Faults (L82): %s sha256=%s, %d rows', args.faults, hil_cfg.faults.sha256,
                  len(hil_cfg.faults.rows))
 

@@ -33,6 +33,14 @@ Checks (all must hold for ok):
      n - MISO_SKIP_FRAMES (FI2-5, FI3-3, FI3-4; a log of another frame size cannot be checked, exit 2); the
      lifecycle transitions are typed strictly, follow the phase changes RunLifecycle can make, inside the
      log (FI2-2, FI3-2).
+  11. batch 2, plant faults (design 2026-11-15 section 7.1; only for a schedule with a plant row): the plant
+     record named in the manifest (faults.plant_record) exists next to the frames with that SHA-256 and the
+     expected columns, did not overflow; its nominal values are those of rpi5/params.py (mu_hd may be the
+     four equal values of --mu); its steps are exactly the frames where a plant row is on (same window rule as
+     the frames); at every step the mask and the parameters are rebuilt here from the rows, the nominal values
+     and the recorded pose (own hub formula, own ramp in exact fractions), and x, y, theta agree with the
+     true frame of that step within half a step of their int16 scale. The frames of a plant fault are not
+     patched: expected_sent ignores plant rows. A schedule without plant rows must have no plant record.
 Exit 0 = ok, 1 = a check failed, 2 = the input cannot be checked. Writes fault_check.json.
 
 Assumptions (stated by the author, to be checked): frame k of the log is step k of the loop, and the
@@ -43,7 +51,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
+import math
 import os
 import sys
 from decimal import ROUND_HALF_UP, Decimal, Inexact, localcontext
@@ -303,6 +313,131 @@ def step_log_check(path, n):
                 json_rows=meta_d.get('rows'), problems=problems)
 
 
+PLANT_ROWS = ('wheel_jam', 'batt_sag', 'mu_time', 'mu_zone')      # batch 2 plant faults (written here again)
+REC_COLS = ('step', 'mask', 'V_batt', 'mu_fl', 'mu_fr', 'mu_rl', 'mu_rr', 'b_fl', 'b_fr', 'b_rl', 'b_rr',
+            'tc_fl', 'tc_fr', 'tc_rl', 'tc_rr', 'ts_fl', 'ts_fr', 'ts_rl', 'ts_rr', 'x', 'y', 'theta')
+OFS_X, OFS_Y = 8, 10                           # int16 x, y of [w1..w4, x, y, theta, ...] (theta: OFS_THETA)
+SUM_TOL = 1e-12                                # float sums of the Pi against the exact values here
+HUBS = {0: (1, 1), 1: (1, -1), 2: (-1, 1), 3: (-1, -1)}   # FL, FR, RL, RR: (sign of lx, sign of ly), y left
+
+
+def _row_wheels(r):
+    if r.fault == 'mu_zone':
+        return (0, 1, 2, 3)
+    return tuple(WHEEL_IDX[w] for w in r.target.split('+'))
+
+
+def ref_plant(rows, on_idx, k_rel, pose, nom):
+    """Parameters of one plant step rebuilt from the rows on (indices, row order), the relative step, the
+    pose at the start of the step and the nominal values: (V, mu[4], b[4], tc[4], ts[4]) as exact Fractions
+    (the zone membership as a set of wheels)."""
+    F = lambda v: Fraction(v) if not isinstance(v, Fraction) else v           # noqa: E731
+    V = F(nom['V_batt'])
+    mu = [F(v) for v in nom['mu_hd']]
+    b, tc, ts = ([F(v) for v in nom[k]] for k in ('motor_b', 'motor_Tc', 'motor_Ts'))
+    for i in on_idx:
+        r = rows[i]
+        if r.fault == 'wheel_jam':
+            for w in _row_wheels(r):
+                b[w] += r.p('b')
+                tc[w] += r.p('tc')
+                ts[w] += r.p('tc')
+        elif r.fault == 'batt_sag':
+            ramp, d = r.p('ramp_ms'), k_rel - r.start_ms
+            V = r.p('v1') if ramp == 0 or d >= ramp else V + (r.p('v1') - V) * Fraction(d, ramp)
+        elif r.fault == 'mu_time':
+            for w in _row_wheels(r):
+                mu[w] = r.p('mu')
+        elif r.fault == 'mu_zone':
+            x, y, th = pose
+            c, s = math.cos(th), math.sin(th)
+            for w, (sx, sy) in HUBS.items():
+                hx = x + sx * nom['lx'] * c - sy * nom['ly'] * s
+                hy = y + sx * nom['lx'] * s + sy * nom['ly'] * c
+                if r.p('x0') <= hx < r.p('x1') and r.p('y0') <= hy < r.p('y1'):
+                    mu[w] = r.p('mu')
+    return V, mu, b, tc, ts
+
+
+def nominal_problems(nom) -> list:
+    """The nominal values of the record against rpi5/params.py of this tree; mu_hd may be --mu (4 equal)."""
+    from params import MecanumParams
+    p = MecanumParams()
+    out = []
+    for k in ('V_batt', 'lx', 'ly'):
+        if nom.get(k) != float(getattr(p, k)):
+            out.append(f'nominal {k}={nom.get(k)!r} != params.py {float(getattr(p, k))}')
+    for k in ('motor_b', 'motor_Tc', 'motor_Ts'):
+        if nom.get(k) != [float(v) for v in getattr(p, k)]:
+            out.append(f'nominal {k}={nom.get(k)!r} != params.py')
+    mu = nom.get('mu_hd')
+    if not (isinstance(mu, list) and len(mu) == 4 and
+            (mu == [float(v) for v in np.broadcast_to(p.mu_hd, (4,))] or len(set(mu)) == 1)):
+        out.append(f'nominal mu_hd={mu!r}: neither params.py nor four equal values (--mu)')
+    return out
+
+
+def plant_record_check(npz_path, rows, fm, t0, stop, n, true) -> tuple:
+    """Check 11: (problems, summary)."""
+    prow = [i for i, r in enumerate(rows) if r.fault in PLANT_ROWS]
+    pr = fm.get('plant_record')
+    if not prow:
+        return (['a plant record without plant rows'] if pr is not None else []), None
+    if not isinstance(pr, dict) or not pr.get('file') or not pr.get('sha256'):
+        return [f'plant rows but no plant record in the manifest: {pr!r}'], None
+    path = os.path.join(os.path.dirname(os.path.abspath(npz_path)), pr['file'])
+    if not os.path.isfile(path):
+        return [f'plant record {pr["file"]} not found next to the frames'], None
+    with open(path, 'rb') as fh:
+        sha = hashlib.sha256(fh.read()).hexdigest()
+    probs = []
+    if sha != pr['sha256']:
+        probs.append(f'plant record sha256 {sha[:12]} != manifest {str(pr["sha256"])[:12]}')
+    g = np.load(path)
+    rec = g['record']
+    if json.loads(str(g['cols'])) != list(REC_COLS) or pr.get('cols') != list(REC_COLS) or \
+            rec.ndim != 2 or rec.shape[1] != len(REC_COLS):
+        return probs + [f'plant record columns {json.loads(str(g["cols"]))} / shape {rec.shape} not as expected'], None
+    if pr.get('overflow') is not False or pr.get('rows') != len(rec):
+        probs.append(f'plant record overflow={pr.get("overflow")!r} rows={pr.get("rows")!r}, file has {len(rec)}')
+    nom = pr.get('nominal') or {}
+    probs += nominal_problems(nom)
+    exp_steps = [k for k in range(n) if any(window_on(rows[i], k, t0, stop) for i in prow)]
+    steps = [int(v) for v in rec[:, 0]]
+    if steps != exp_steps or not np.array_equal(rec[:, 0], np.array(steps, dtype=float)):
+        probs.append(f'plant record steps differ from the windows: {len(steps)} recorded, {len(exp_steps)} expected'
+                     f'{", first " + str(steps[0]) if steps else ""}')
+        return probs, dict(file=pr['file'], rows=len(rec), steps_ok=False)
+    c = {name: j for j, name in enumerate(REC_COLS)}
+    sx, sy, sth = STATE_RANGES[4] / 32767.0, STATE_RANGES[5] / 32767.0, STATE_RANGES[6] / 32767.0
+    bad_val, bad_pose, first = 0, 0, None
+    for row in rec:
+        k = int(row[0])
+        on = [i for i in prow if window_on(rows[i], k, t0, stop)]
+        pose = (row[c['x']], row[c['y']], row[c['theta']])
+        V, mu, b, tc, ts = ref_plant(rows, on, k - t0, pose, nom)
+        ok = int(row[c['mask']]) == sum(1 << i for i in on) and abs(row[c['V_batt']] - float(V)) <= SUM_TOL
+        for w, suf in enumerate(('fl', 'fr', 'rl', 'rr')):
+            ok &= row[c['mu_' + suf]] == float(mu[w])
+            ok &= abs(row[c['b_' + suf]] - float(b[w])) <= SUM_TOL
+            ok &= abs(row[c['tc_' + suf]] - float(tc[w])) <= SUM_TOL
+            ok &= abs(row[c['ts_' + suf]] - float(ts[w])) <= SUM_TOL
+        if not ok:
+            bad_val += 1
+            first = k if first is None else first
+        fr = true[k]
+        pose_ok = (abs(_i16(fr, OFS_X) * sx - pose[0]) <= 0.5 * sx + 1e-9 and
+                   abs(_i16(fr, OFS_Y) * sy - pose[1]) <= 0.5 * sy + 1e-9 and
+                   abs(_i16(fr, OFS_THETA) * sth - math.remainder(pose[2], 2 * math.pi)) <= 0.5 * sth + 1e-9)
+        bad_pose += not pose_ok
+    if bad_val:
+        probs.append(f'{bad_val} plant steps with parameters that differ from the rows, first at frame {first}')
+    if bad_pose:
+        probs.append(f'{bad_pose} plant steps whose recorded pose differs from the true frame')
+    return probs, dict(file=pr['file'], sha256=sha, rows=len(rec), steps_ok=True, values_bad=bad_val,
+                       pose_bad=bad_pose)
+
+
 def check(npz_path: str, sched_path: str, step_log: str = None) -> dict:
     f = np.load(npz_path)
     man = json.loads(str(f['manifest']))
@@ -381,11 +516,14 @@ def check(npz_path: str, sched_path: str, step_log: str = None) -> dict:
     else:
         tl = None
         fails.append('no step log: the run does not show that no step missed its deadline (design 8.1)')
+    plant_probs, plant = plant_record_check(npz_path, rows, fm, t0, stop, n, true)      # check 11 (batch 2)
+    fails += plant_probs
     diff_frames = int(np.count_nonzero(np.any(mosi != true, axis=1)))
     out.update(ok=not fails, fails=fails, n_frames=n, t0_step=t0, stop_step=stop, sha256=sha,
                frames_bad=len(bad), first_bad=bad[0] if bad else None, frames_injected=diff_frames,
                events=exp_ev, not_run=exp_nr, complete=complete, imu_source=man.get('imu_source'),
-               miso=dict(checked=checked, crc_bad=crc_bad, empty=empty), self_check=sc, step_log=tl)
+               miso=dict(checked=checked, crc_bad=crc_bad, empty=empty), self_check=sc, step_log=tl,
+               plant=plant)
     return out
 
 

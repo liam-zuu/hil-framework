@@ -301,8 +301,8 @@ def test_cli_baseline_and_fault_run(tmp_path):
                            capture_output=True, text=True, timeout=300)
         assert r.returncode == 0, r.stderr[-800:]
         files = sorted(os.listdir(tmp_path / name))
-        assert files == ['faults.json', 'faults_imu.csv', 'faults_tick.csv', 'log.csv', 'meta.yaml',
-                         'metrics.json']
+        assert files == ['faults.json', 'faults_imu.csv', 'faults_plant.csv', 'faults_tick.csv', 'log.csv',
+                         'meta.yaml', 'metrics.json']
     meta = (tmp_path / 'loss' / 'meta.yaml').read_text(encoding='utf-8')
     assert 'faults: {' in meta and '"complete": true' in meta
     r = subprocess.run([sys.executable, os.path.join(HERE, '..', 'fault_run.py'), '--task', 'A-W1', '--mode',
