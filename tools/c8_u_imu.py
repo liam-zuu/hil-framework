@@ -195,9 +195,21 @@ def _grid(r, period_s, j_lim):
     spacings), line fit r = a + b n on the inliers, residual j. The fitted period must stay within +-2 % and at
     most MAX_LATE of the reports may be off the grid."""
     d = np.diff(r)
-    near = d[(d > 0.5 * period_s) & (d < 1.5 * period_s)]
-    b_idx = float(np.median(near)) if near.size else period_s
-    if not abs(b_idx / period_s - 1.0) <= PERIOD_TOL:       # CU3-1: use the measured spacing only when plausible
+    step = (d > 0.5 * period_s) & (d < 1.5 * period_s)     # one report apart
+    slopes = []
+    k = 0
+    while k < len(d):                                       # CU4-1: slope of each run of >= 10 consecutive reports
+        if not step[k]:
+            k += 1
+            continue
+        e = k
+        while e < len(d) and step[e]:
+            e += 1
+        if e - k >= 10:
+            slopes.append(float(np.polyfit(np.arange(e - k + 1), r[k:e + 1], 1)[0]))
+        k = e
+    b_idx = float(np.median(slopes)) if slopes else period_s
+    if not abs(b_idx / period_s - 1.0) <= PERIOD_TOL:       # CU3-1: use the measured period only when plausible
         b_idx = period_s                                     # CU2-3: never refuse on it
     n = np.zeros(len(r), dtype=int)
     i_lt = 0                                   # last trusted report
@@ -336,13 +348,13 @@ def turn_totals(S, w0, w1):
             a, b = min(ta[k], tr[k]), max(ta[k + 1], tr[k + 1])  # CU-2 (round 3): both time bases
             if tg.size < 2 or tg[0] > a or tg[-1] < b:
                 raise InputError('missing IMU reports in the window without gyro reports over the gap (CU-2)')
-            dur = b - a                                       # length of the gap
-            per = S.get('period_fit_s', PERIOD_S)
-            a, b = max(a - per, tg[0]), min(b + per, tg[-1])   # wider only to find the largest |gz|
             j0, j1 = np.searchsorted(tg, a, 'right') - 1, np.searchsorted(tg, b, 'left')
             if np.max(np.diff(tg[j0:j1 + 1])) > S.get('h_lim', H_LIM_S):
                 raise InputError('missing IMU reports in the window and gyro reports too far apart (CU-2)')
-            extra = float(np.max(np.abs(gz[j0:j1 + 1]))) * dur
+            per = S.get('period_fit_s', PERIOD_S)             # CU4-2: padding only to search the largest |gz|
+            sel = (tg >= a - per) & (tg <= b + per)
+            sel[j0:j1 + 1] = True
+            extra = float(np.max(np.abs(gz[sel]))) * (b - a)
             P += extra
             N += extra
     return P, N
@@ -700,10 +712,11 @@ def tre_one(frames, log, offset_s, s_plus=0.0, s_minus=0.0, period_s=PERIOD_S, j
     if (still & common).sum() < n_min or (win & common).sum() < n_min:
         raise InputError(f'{frames}: fewer than {n_min} still frames before t = 0 or frames in the run compared at '
                          f'every delay (CU-12)')
-    rms = []
+    rms, n_used = [], set()
     for k in range(len(taus)):
         c, _ = _align(F, tl, P[k], still & common)
         r = F['psi'][win & common] - P[k][win & common] - c
+        n_used.add(int(r.size))
         rms.append(float(np.sqrt(np.mean(r ** 2))))
     rms = np.array(rms)
     k = int(np.argmin(rms))
@@ -715,7 +728,8 @@ def tre_one(frames, log, offset_s, s_plus=0.0, s_minus=0.0, period_s=PERIOD_S, j
     if not (math.isfinite(tau) and math.isfinite(y1)):
         raise InputError(f'{frames}: delay not determined (CU-12)')
     return dict(tau_s=float(tau), rms_rad=float(y1), n_frames=int((win & common).sum()),
-                n_frames_some=int((win & np.any(np.isfinite(P), axis=0)).sum()), offset_s=offset_s,
+                n_frames_some=int((win & np.any(np.isfinite(P), axis=0)).sum()), n_used=sorted(n_used),
+                offset_s=offset_s,
                 n_late=S0['n_late'], frames=os.path.basename(frames), frames_sha256=sha256(frames),
                 log=os.path.basename(log), log_sha256=sha256(log))
 

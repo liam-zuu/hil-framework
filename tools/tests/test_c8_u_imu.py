@@ -558,7 +558,23 @@ def test_cu12_r3_common_set_smaller_than_some_set(tmp_path):
     make_log(lg, rate, a + 23.0, lat=0.004, run=(a, a + 16.0), miss={90, 91}, gyro_miss=set())
     write_frames(fr, rate, 10.0, a + 23.0, offset=0.5)
     r = U.tre_one(fr, lg, 0.5)
-    assert r['n_frames'] < r['n_frames_some']
+    assert r['n_frames'] < r['n_frames_some'] and r['n_used'] == [r['n_frames']]   # one set at every delay
+
+
+# ── Codex round 4 ──────────────────────────────────────────────────────────────────────
+
+def test_cu4_1_jitter_and_long_gap():
+    I = np.r_[np.arange(0, 100), np.arange(200, 300)]
+    r = 10.0 + 0.050 * I + 0.0008 * (I % 3)
+    n, a, b, j, inl = U._grid(r, 0.05, 0.005)
+    assert inl.all() and n[100] - n[99] == 101
+
+
+def test_cu4_2_gyro_gap_outside_the_window_ignored():
+    S = dict(t_all=np.array([0.0, 0.1]), t_recv=np.array([0.0, 0.1]), n_all=np.array([0, 2]),
+             psi_all=np.array([0.0, 0.0]), tg=np.array([-0.2, 0.0, 0.05, 0.1, 0.15]), gz=np.zeros(5),
+             period_fit_s=0.05, h_lim=0.105)
+    assert U.turn_totals(S, 0.0, 0.1) == (0.0, 0.0)
 
 
 # ── scale (thang) ─────────────────────────────────────────────────────────────────────
