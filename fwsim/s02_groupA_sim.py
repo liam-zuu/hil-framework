@@ -22,6 +22,15 @@ of the IMU fusion / heading loop (AGV ctrl-imu, spec v2.2 section 8) come from t
 firmware's own imu_fusion/heading outputs; log_seq counts the lines (no loss in SIM),
 motor_on is the firmware's EN. Left empty: the raw chip columns ax..roll (fwsim does not
 log the raw report values) and gyro_n, rv_n, reset_n (not exposed by fwsim.dll).
+
+CODE_S02 (design 03_CODE/docs/2026-11-15_Thiet_ke_CODE_S02_v1.md sections 10.1, 11; Liam 15/11 CODE_S02
+"3 s (Recommended)", "Duyet, code sau R134"; spec S02 v1.10 P2-2, P2-2b): --prep-s S (default 3) puts
+S s of setpoint 0 before k = 0 of the test (rpi5/s02_sender.prep_spec, the HIL wrapper), so the SIM run
+goes through the same preparation as HIL and the car after its cold start (fw.reset; run_active is 1 from
+the first tick: the position loop resets before t = 0; declared difference, meta.yaml). Every run also
+writes raw/<run_id>_plant.csv: the plant state at each firmware tick, same timestamp_us as the log line
+(fwsim runs plant and firmware on one clock): x, y, theta, world and body velocity, wz, wheel speeds
+w1..w4 in the plant order (rpi5/plant_step.py state 6..9).
 """
 import argparse
 import csv
@@ -39,8 +48,20 @@ import fwsim                                            # noqa: E402
 from trajectory_pub import GROUP_A, LIFTED_TESTS, get_body_velocity   # noqa: E402
 from agv_logger import COLUMNS                          # noqa: E402
 import s02_metrics                                      # noqa: E402
+from s02_sender import PREP_S_DEFAULT, prep_spec        # noqa: E402
 
 STOP_TAIL_S = 1.0
+PLANT_COLUMNS = ['timestamp_us', 'x', 'y', 'theta', 'vx_w', 'vy_w', 'vx_b', 'vy_b', 'wz', 'w1', 'w2', 'w3', 'w4']
+
+
+def plant_rows(log):
+    """raw/<run_id>_plant.csv rows: the plant state logged with each firmware tick (fwsim.simulate pose,
+    v_true = body velocity, omega), same timestamp_us as log_rows."""
+    for t, pose, vb, om in zip(log['t'], log['pose'], log['v_true'], log['omega']):
+        c, s = np.cos(pose[2]), np.sin(pose[2])
+        vxw, vyw = c * vb[0] - s * vb[1], s * vb[0] + c * vb[1]
+        yield ([int(round(t * 1e6))] + [f'{v:.6f}' for v in (pose[0], pose[1], pose[2], vxw, vyw, vb[0], vb[1], vb[2])]
+               + [f'{w:.5f}' for w in om])
 
 
 def rep_imu(imu, rep):
@@ -119,6 +140,9 @@ def main():
     ap.add_argument('--controller', choices=['PID', 'ADRC'], required=True)
     ap.add_argument('--reps', type=int, default=5)
     ap.add_argument('--order-seed', type=int, default=1)
+    ap.add_argument('--prep-s', type=float, default=PREP_S_DEFAULT,
+                    help='setpoint 0 before k = 0 of every test [s], multiple of 0.02 (S02 P2-2: 3; 0 = none, '
+                         'as before CODE_S02)')
     fwsim.add_plant_imu_args(ap)
     ap.add_argument('--out', required=True)
     a = ap.parse_args()
@@ -140,19 +164,26 @@ def main():
         for test_id in order:
             spec = GROUP_A[test_id]
             params = fwsim.plant_params(a, wheels_lifted=test_id in LIFTED_TESTS)
-            sp = (lambda s: lambda t: get_body_velocity(t, s) if t < s.duration else (0.0, 0.0, 0.0))(spec)
+            run_spec = prep_spec(spec, a.prep_s, tail_s=0.0) if a.prep_s > 0 else spec
+            sp = (lambda s: lambda t: get_body_velocity(t, s) if t < s.duration else (0.0, 0.0, 0.0))(run_spec)
             imu_r = rep_imu(imu, rep)
-            log = fwsim.simulate(fw, sp, spec.duration + STOP_TAIL_S, params, seed=rep, mode=a.controller, imu=imu_r)
+            log = fwsim.simulate(fw, sp, run_spec.duration + STOP_TAIL_S, params, seed=rep, mode=a.controller,
+                                 imu=imu_r)
             run_id = f'{test_id}_{a.controller}_r{rep}'
             path = os.path.join('raw', f'{run_id}.csv')
             with open(os.path.join(a.out, path), 'w', newline='') as f:
                 w = csv.writer(f)
                 w.writerow(COLUMNS)
                 w.writerows(log_rows(log, imu is not None))
+            with open(os.path.join(a.out, 'raw', f'{run_id}_plant.csv'), 'w', newline='') as f:
+                w = csv.writer(f)
+                w.writerow(PLANT_COLUMNS)
+                w.writerows(plant_rows(log))
             runs.append(dict(run_id=run_id, platform='sim', controller=a.controller, test_id=test_id,
                              speed_mps=spec.v, rep=rep, seed=rep,
                              noise_seed=(imu_r or {}).get('noise_seed', ''), v_batt_start='', v_batt_end='',
-                             file=path, aborted=0, reason='ok', missing_pct=0))
+                             file=path, aborted=0, reason='ok', missing_pct=0, prep_s=a.prep_s,
+                             plant_file=os.path.join('raw', f'{run_id}_plant.csv')))
     with open(os.path.join(a.out, 'runs.csv'), 'w', newline='') as f:
         w = csv.DictWriter(f, fieldnames=list(runs[0]))
         w.writeheader()
@@ -192,12 +223,14 @@ imu: {json.dumps(imu)}             # null = no IMU reports (--no-imu, only for p
 reps: {a.reps}
 seeds: "plant seed = rep (1..{a.reps}); IMU noise replay seed = rep (rep_imu, runs.csv noise_seed); the HIL run of the same repetition uses the same seed"
 order_seed: {a.order_seed}
-setpoint: "trajectory_pub.get_body_velocity held at 50 Hz, then 0 for {STOP_TAIL_S} s"
+setpoint: "{a.prep_s:g} s of 0 (preparation, S02 P2-2), then trajectory_pub.get_body_velocity held at 50 Hz, then 0 for {STOP_TAIL_S} s"
+prep_s: {a.prep_s:g}           # CODE_S02; SIM cold start (fw.reset, run_active 1 from the first tick), then the preparation: declared difference with HIL and the car (reset when the motors turn on)
 libraries: {json.dumps(fwsim.lib_versions())}
 elapsed_s: {time.time() - t_start:.0f}
 files:
   - raw/<run_id>.csv: "ESP32 logger format (tools/agv_logger.py COLUMNS, 86), 100 Hz; IMU fusion / heading columns from the firmware (empty with --no-imu); pos_* and ws_* from the firmware (empty with a DLL without pos_ctrl.c / wheel_slip.c); raw chip columns ax..roll and gyro_n, rv_n, reset_n, and traj_age_ms empty (not in fwsim)"
-  - runs.csv: "spec P2-6 columns + test_id"
+  - raw/<run_id>_plant.csv: "plant state at each firmware tick, same timestamp_us as the log (PLANT_COLUMNS: x, y, theta, world and body velocity, wz, wheel speeds w1..w4 in the plant order)"
+  - runs.csv: "spec P2-6 columns + test_id, prep_s, plant_file"
   - metrics.csv: "tools/s02_metrics.py, one line per run"
 notes: "{NOTE_NOISE if imu and imu.get('noise') == 'replay' else NOTE_NO_NOISE}"
 """)
