@@ -60,6 +60,15 @@ gate_v3 block also holds
   (all null, g1_fields_note says why; G1 stays chua_ket_luan from q; Liam 15/11 CODE_RS4 local_3b1a170b,
   "Không ghi số chi tiết (Recommended)").
 
+pi_period_ppm (S05 v3.29 4.7 (i), B81b-3, B81bR2-2, B81c-4; Liam 15/11 CODE_RS4 local_3b1a170b "Trong hil_o1_score
+(Recommended)", "Ghi null + lý do (Recommended)"; design RS-4 section 18.8): the Pi send period against the nominal on
+the steps of T, from the frame log t_send_ns at its two ends only (no fit over the run):
+  pi_period_ppm = ((t_send_ns[k_last] - t_send_ns[k_first]) / ((k_last - k_first) x period_us x 1000) - 1) x 1e6
+k_first = k0 (the frame at t = 0), k_last = the frame at t_end of the evaluator. Written with pi_period_steps
+[k_first, k_last], pi_period_n (= k_last - k_first) and pi_period_note; null with the reason in the note when the log
+has no t_send_ns, a step is outside it, an end is <= 0 or the two do not increase, t_end is not finite, or there is no
+interval. s05_final_table.py reads it (null: the 100 ppm bound).
+
   python tools/hil_o1_score.py --frame-log <run>.npz --task O1-F05 [--esp-log <run>.csv] [--out score.json]
   (K1, K2 need --allow-final-set: O1 3.7, final test set only)
 Last line: #ket_qua,ma=0 scored / 2 error.
@@ -221,6 +230,31 @@ def add_b81_3(gate, out, period_s=1e-3):
     return gate
 
 
+def pi_period(t_send_ns, k_first, k_last, period_us):
+    """pi_period_ppm on the steps [k_first, k_last] of T (module docstring): dict(pi_period_ppm, pi_period_steps,
+    pi_period_n, pi_period_note); pi_period_ppm None with the reason when it cannot be computed."""
+    out = dict(pi_period_ppm=None, pi_period_steps=[k_first, k_last], pi_period_n=None, pi_period_note='')
+    if t_send_ns is None:
+        out['pi_period_note'] = 'frame log without t_send_ns'
+        return out
+    if k_first is None or k_last is None:
+        out['pi_period_note'] = 'no last step of T (t_end not finite)'
+        return out
+    n = int(k_last) - int(k_first)
+    if n <= 0:
+        out['pi_period_note'] = f'no step interval in T (k_first {k_first}, k_last {k_last})'
+        return out
+    if not (0 <= k_first < len(t_send_ns) and 0 <= k_last < len(t_send_ns)):
+        out['pi_period_note'] = f'step {k_first} or {k_last} outside the frame log ({len(t_send_ns)} frames)'
+        return out
+    t0, t1 = int(t_send_ns[k_first]), int(t_send_ns[k_last])
+    if t0 <= 0 or t1 <= 0 or t1 <= t0:
+        out['pi_period_note'] = f't_send_ns at the ends of T not usable ({t0}, {t1})'
+        return out
+    out.update(pi_period_ppm=((t1 - t0) / (n * float(period_us) * 1000.0) - 1.0) * 1e6, pi_period_n=n)
+    return out
+
+
 def score(path, task, allow_final_set=False, esp_log=None, allow_pre_b81_15=False):
     if task not in FIG8 and task not in FINAL_SET:
         raise ValueError(f'task {task!r}: one of {tuple(FIG8) + FINAL_SET}')
@@ -255,6 +289,13 @@ def score(path, task, allow_final_set=False, esp_log=None, allow_pre_b81_15=Fals
     else:
         out, _, frames = o1_gate_eval.evaluate_k(log, task)
     out['tv_duty_h7_1khz'] = out.pop('tv_duty')                          # not the S05 4.7 tv_duty (docstring)
+    # pi_period_ppm on the steps of T (module docstring): k_last is the frame at t_end, t of frame k = (k - a) x period
+    t_end = out.get('t_end')
+    k_last = (int(k0 + round((float(t_end) - (k0 - a) * period) / period))
+              if t_end is not None and math.isfinite(float(t_end)) else None)
+    with np.load(path, allow_pickle=False) as z:
+        t_send = np.array(z['t_send_ns']) if 't_send_ns' in z.files else None
+    out.update(pi_period(t_send, k0, k_last, float(manifest.get('period_us', 1000))))
     log_coverage(out, float(log['t'][-1]) if len(log['t']) else -1.0, period)
     # gate v3.2 (o1_gate.py): U_p = U_psi = 0 on HIL (O1 v11.15 3.5: the int16 MOSI quantisation, <= 0.11 mm and
     # 4.8e-5 rad, is a stated limit, not added to U; Liam 14/11 THESIS_B8 "Giữ U_p = 0, ghi giới hạn")
