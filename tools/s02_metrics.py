@@ -361,7 +361,8 @@ def compute(log, test_id):
     ev = log.get('_every', log)          # every logged line, before the motor-off filter (S3C-8)
     m.update(run_bad_fields(pos_reset_mid(ev.get('run_active'), ev.get('pos_reset_n'), ev.get('motor_on'))))
     if '_all' in log and test_id in s02_cmd_path.GROUP_A:
-        m.update(s02_cmd_path.stats(log['_all'], test_id, log.get('_platform', '')))     # CODE_S02: t = 0, preparation, command path
+        m.update(s02_cmd_path.stats(log['_all'], test_id, log.get('_platform', ''), log.get('_us_cut'),
+                                   log.get('_prep_s')))     # CODE_S02: t = 0, preparation, command path
 
     moving =np.flatnonzero(np.any(np.abs(sp) > 1e-9, axis=1))
     t0, t1 = t[moving[0]] + WINDOW_SKIP_S, t[moving[-1]]
@@ -409,6 +410,9 @@ def run_dir_metrics(d, out_name='metrics.csv'):
             check_no_udp_taken(os.path.join(d, r['file']) + '.events.txt')
         log = load_log(os.path.join(d, r['file']))
         log['_platform'] = r['platform']                       # s02_cmd_path: SIM cold start
+        log['_us_cut'] = s02_cmd_path.us_cut_ticks(os.path.join(d, r['file']) + '.events.txt')   # S2P1-2
+        ps = (r.get('prep_s') or '').strip()
+        log['_prep_s'] = float(ps) if ps else None                                               # S2P1-5
         m = compute(log, r['test_id'])
         out.append(dict(run_id=r['run_id'], platform=r['platform'], controller=r['controller'],
                         test_id=r['test_id'], speed_mps=r['speed_mps'], rep=r['rep'], **m))

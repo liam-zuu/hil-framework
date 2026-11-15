@@ -30,7 +30,11 @@ Map t_Pi = alpha + beta t_ESP (seconds), per run.
   stops, steps, ripple) fix the offset, a wrong slope leaves a ramp of count error over a segment held at
   speed. |beta - 1| <= 2002 ppm (S05 4.7 (i)) else not mapped; fewer than MIN_TICKS used ticks: not mapped.
   Then the residual RMS (counts) over every used tick: > RESID_MAX [ĐỀ XUẤT 2] -> not mapped (family R of
-  the run undefined). Precision about 1 count / (1320 / 2 pi x |omega|): 0.5-1.2 ms at 4-10
+  the run undefined). A low residual does not show the map is fixed (S2P1-1, Codex round 1): with only
+  steady-speed ticks a time shift is a count constant, taken by the segment offsets. So the fit must
+  converge with a well-conditioned normal matrix, and the standard error of the mapped time (from that
+  matrix and the residual variance, largest at an end of the run) must be <= SIGMA_T_MAX_S [ĐỀ XUẤT 1 ms];
+  else not mapped (not_identified, sigma_t_over_max). Precision about 1 count / (1320 / 2 pi x |omega|): 0.5-1.2 ms at 4-10
   rad/s [ƯỚC LƯỢNG]; the sensor path (Pi send -> H7 receive -> EncoderGen) adds well under 1 ms.
 Plant at a tick: linear interpolation in Pi time between the two frames around alpha + beta t_ESP (theta
 unwrapped first, wrapped back to (-pi, pi]); outside the frame log: empty (no extrapolation, P2-3).
@@ -58,6 +62,8 @@ MIN_TICKS = 50                   # used (tick, wheel) pairs
 DELTA_SPAN_S = 0.060             # search half width around the anchor start value
 GRID1_S, GRID2_S = 2e-4, 1e-5
 GN_ITER, GN_TOL_S = 20, 1e-7     # Gauss-Newton passes, stop when the move is under this
+COND_MAX = 1e12                  # normal matrix condition number above which delta / beta are not identified
+SIGMA_T_MAX_S = 1e-3             # [ĐỀ XUẤT] standard error of the mapped time (S2P1-1, Codex vong 1)
 RESID_MAX = 2.0                  # [ĐỀ XUẤT] counts RMS (S02 v1.10)
 PPM_MAX = 2002.0                 # S05 4.7 (i)
 ANCHOR_LAG_S = 0.015             # middle of the 0..30 ms command anchor lag (s02_cmd_path)
@@ -157,24 +163,32 @@ def _gauss_newton(delta, beta, te, counts, tp, omega, C, use):
     """(delta, beta) of least squares, both free; the segment offsets are projected out. dC/dt is the held
     frame speed x 1320 / 2 pi, so the Jacobian of a count is -(that) x (1, t_ESP - t_ref)."""
     kc = COUNTS_PER_REV / (2 * math.pi)
+    converged, A = False, np.zeros((2, 2))
     for _ in range(GN_ITER):
-        A = np.zeros((2, 2))
-        g = np.zeros(2)
-        for r, w, idx, seg in _resid(delta, beta, te, counts, tp, C, use):
-            q = delta + beta * te[idx]
-            k = np.clip(np.searchsorted(tp, q, 'right') - 1, 0, len(tp) - 1)
-            rate = omega[k, w] * kc
-            J = np.stack([_proj(-rate, seg), _proj(-rate * te[idx], seg)], axis=1)
-            A += J.T @ J
-            g += J.T @ r
-        try:
-            step = -np.linalg.solve(A, g)
-        except np.linalg.LinAlgError:
-            break
+        A, g = _normal(delta, beta, te, counts, tp, omega, C, use, kc)
+        if not np.all(np.isfinite(A)) or np.linalg.cond(A) > COND_MAX:
+            return delta, beta, False, A                # S2P1-1: no information on delta or beta
+        step = -np.linalg.solve(A, g)
         delta, beta = delta + step[0], beta + step[1]
         if abs(step[0]) + abs(step[1]) * (te.max() - te.min()) < GN_TOL_S:
+            converged = True
             break
-    return delta, beta
+    A, _ = _normal(delta, beta, te, counts, tp, omega, C, use, kc)
+    return delta, beta, converged, A
+
+
+def _normal(delta, beta, te, counts, tp, omega, C, use, kc):
+    """Normal matrix J^T J and gradient J^T r of the projected residuals at (delta, beta)."""
+    A = np.zeros((2, 2))
+    g = np.zeros(2)
+    for r, w, idx, seg in _resid(delta, beta, te, counts, tp, C, use):
+        q = delta + beta * te[idx]
+        k = np.clip(np.searchsorted(tp, q, 'right') - 1, 0, len(tp) - 1)
+        rate = omega[k, w] * kc
+        J = np.stack([_proj(-rate, seg), _proj(-rate * te[idx], seg)], axis=1)
+        A += J.T @ J
+        g += J.T @ r
+    return A, g
 
 
 def fit_map(te, counts, tp, omega, delta0, beta0=1.0):
@@ -190,13 +204,25 @@ def fit_map(te, counts, tp, omega, delta0, beta0=1.0):
         out['reason'] = 'too_few_turning_ticks'
         return out
     d = _grid_delta(delta0, beta0, u, counts, tp, C, use)
-    d, beta = _gauss_newton(d, beta0, u, counts, tp, omega, C, use)
+    d, beta, converged, A = _gauss_newton(d, beta0, u, counts, tp, omega, C, use)
     alpha = d - beta * t_ref
     ppm = (beta - 1.0) * 1e6
     tot, n = _cost(d, beta, u, counts, tp, C, use)
+    n_seg = sum(len(np.unique(seg)) for _, _, seg in use)
+    dof = n - 2 - n_seg
+    sigma_t = float('inf')
+    if converged and dof > 0 and np.linalg.cond(A) <= COND_MAX:
+        # S2P1-1: standard error of the mapped time t_Pi = d + beta u over the run (largest at an end of u)
+        cov = (tot / dof) * np.linalg.inv(A)
+        sigma_t = max(math.sqrt(max(cov[0, 0] + 2 * x * cov[0, 1] + x * x * cov[1, 1], 0.0))
+                      for x in (0.0, float(u.max())))
     out.update(alpha=float(alpha), beta=float(beta), drift_ppm=float(ppm), resid_rms=math.sqrt(tot / n),
-               n_used=int(n))
-    if out['resid_rms'] > RESID_MAX:
+               n_used=int(n), converged=bool(converged), sigma_t_s=sigma_t)
+    if not converged or not math.isfinite(sigma_t):
+        out['reason'] = 'not_identified'
+    elif sigma_t > SIGMA_T_MAX_S:
+        out['reason'] = 'sigma_t_over_max'
+    elif out['resid_rms'] > RESID_MAX:
         out['reason'] = 'residual_over_max'
     elif abs(ppm) > PPM_MAX:
         out['reason'] = 'drift_out_of_bound'
@@ -225,10 +251,15 @@ def plant_rows(te_us, tp, state, alpha, beta):
     return rows
 
 
-def pi_anchor(tp, ref):
-    """Pi send time of the first frame with a non-zero command, or None."""
-    nz = np.flatnonzero(np.any(np.abs(ref) > 0, axis=1))
-    return None if nz.size == 0 else float(tp[nz[0]])
+def pi_anchors(tp, ref):
+    """Pi send times (a, b) of the first frame with a non-zero command and of the first zero frame after the
+    last non-zero one (None when missing): the Pi side of the command anchors of s02_cmd_path."""
+    nzm = np.any(np.abs(ref) > 0, axis=1)
+    nz = np.flatnonzero(nzm)
+    if nz.size == 0:
+        return None, None
+    after = np.flatnonzero(~nzm & (np.arange(len(tp)) > nz[-1]))
+    return float(tp[nz[0]]), (float(tp[after[0]]) if after.size else None)
 
 
 def map_run(frame_log, esp_log, test_id):
@@ -241,17 +272,21 @@ def map_run(frame_log, esp_log, test_id):
     counts = np.stack([log[w] for w in WHEELS], axis=1)[on]
     counts[counts == -2 ** 31] = np.nan                     # AGV LOG_CNT_INVALID
     anc, _, _ = s02_cmd_path.anchors(log, test_id)
-    t_pi_a = pi_anchor(tp, ref)
+    pa, pb = pi_anchors(tp, ref)
     res = dict(test=test_id, frame_log=os.path.basename(frame_log), esp_log=os.path.basename(esp_log),
                method='encoder_counts', t0_us=anc['t0_us'], t0_method=anc['t0_method'])
-    ta = anc['anchor_a_us'] if math.isfinite(anc['anchor_a_us']) else anc['anchor_b_us']
-    if t_pi_a is None or not math.isfinite(ta):
+    # S2P1-4: only an anchor s02_cmd_path kept (a dropped one is NaN there), with its own Pi side
+    if math.isfinite(anc['anchor_a_us']) and pa is not None:
+        ta, t_pi_a = anc['anchor_a_us'], pa
+    elif math.isfinite(anc['anchor_b_us']) and pb is not None:
+        ta, t_pi_a = anc['anchor_b_us'], pb
+    else:
         res.update(ok=False, reason='no_start_value (command anchors)')
         return res, [[int(t)] + [''] * (len(PLANT_COLUMNS) - 1) for t in te_us]
-    if not math.isfinite(anc['anchor_a_us']):
-        K, ka, kb = s02_cmd_path.schedule(test_id)
-        t_pi_a += (kb - ka) / s02_cmd_path.SEND_HZ          # anchor b on the Pi side
-    beta0 = 1.0 + (anc['drift_ppm'] * 1e-6 if math.isfinite(anc['drift_ppm']) else 0.0)
+    # S2P1-10: drift_ppm is the DUT span over the sender span, minus 1; t_Pi = alpha + beta t_ESP needs the inverse
+    # (the anchors carry the 10 ms hand-over: a start value only, the fit sets beta)
+    drift = anc['drift_ppm'] if math.isfinite(anc['drift_ppm']) and abs(anc['drift_ppm']) <= PPM_MAX else 0.0
+    beta0 = 1.0 / (1.0 + drift * 1e-6)
     te = te_us * 1e-6
     delta0 = t_pi_a - beta0 * (ta * 1e-6 - ANCHOR_LAG_S - te[0])     # t_Pi at the first tick
     fit = fit_map(te, counts, tp, state[:, 0:4], delta0, beta0)

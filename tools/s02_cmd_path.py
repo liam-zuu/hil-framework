@@ -13,8 +13,12 @@ only) has a first non-zero packet k_a and a first zero packet k_b after the last
 k_b = K for every test but A-K1: 150, 300). On the log (motor-on lines): t_a = timestamp_us of the first
 line whose command (sp_vx, sp_vy, sp_wz) is non-zero, t_b = the first line with a zero command after the
 last non-zero one. t_ESP(k) = t_a + (k - k_a) (t_b - t_a) / (k_b - k_a) (absorbs the sender / ESP32 clock
-rate; drift_ppm printed). A line shows a packet only after it arrived (up to a tick, the 10 ms hand-over
-of traj_task, the link): the mark is late by about 0..30 ms, the same at both anchors [ĐỀ XUẤT].
+rate; drift_ppm printed, flag drift_over_bound past ANCHOR_PPM, never clamped: S2P1-3). A line shows a
+packet only after it arrived (up to a tick, the 10 ms hand-over of traj_task, the link): each anchor is late
+by e_a, e_b in about 0..30 ms [ĐỀ XUẤT]. At k = 0 the error is e_a when k_a = 0 (10 of the 11 tests); for
+A-K1 (k_a = 150, k_b = 300) t_ESP(0) = 2 t_a - t_b, error 2 e_a - e_b, about -30..+60 ms.
+A run whose '#us_end' reports cut ticks has no t = 0 (t0_reason us_cut; S2P1-2, Liam 15/11 CODE_S02 "Moc
+t = 0 khong xac dinh"): a command cut to 0 by the ultrasonic interlock looks like a zero packet.
   An anchor whose line before (log_seq - 1) is missing is dropped (the real first line may be lost);
   anchor b is dropped when its line has traj_age_ms >= 200 or -1 (the zero came from the timeout, not
   from a zero packet: last packets lost). With both: their span must be (k_b - k_a) 20 ms within
@@ -61,11 +65,12 @@ TIMEOUT_MS = 200              # TRAJ_TIMEOUT_US of the firmware (main.c 45)
 PREP_MIN_S = 2.5              # [ĐỀ XUẤT] design 4.2 (preparation 3 s, Liam 15/11)
 ANCHOR_PPM = 2002.0           # S05 4.7 (i) sender / ESP32 clock rate bound
 ANCHOR_SLACK_US = 40_000.0    # [ĐỀ XUẤT] 2 ticks + traj_task hand-over + link, between the two anchors
+SIM_TICK_US = 10_000.0        # fwsim firmware tick (tolerance of the SIM t = 0 check)
 NAN = float('nan')
 
 FIELDS = ('t0_us', 't0_method', 't0_reason', 'drift_ppm', 'anchor_a_us', 'anchor_b_us',
           'edge_kind', 'edge_us', 'prep_s_dut', 'prep_flags', 'run_active_drop',
-          'g_valid_t0', 'bias_gz_t0', 'bias_updates_prep',
+          'g_valid_t0', 'bias_gz_t0', 'bias_updates_prep', 'us_cut_ticks', 'sim_t0_err_us',
           'cmd_age_max_ms', 'cmd_gap_n', 'cmd_age_unknown_n', 'cmd_rows', 'cmd_seq_holes', 'cmd_reason')
 
 
@@ -91,8 +96,31 @@ def _prev_received(seq, i):
     return i > 0 and seq[i - 1] == seq[i] - 1
 
 
-def anchors(log, test_id):
-    """t0_us, method, reason, drift_ppm, t_a, t_b and the map k -> t_ESP(k) (None when unknown)."""
+def us_cut_ticks(events_path):
+    """Largest cut_ticks of the '#us_end' lines of a logger .events.txt (PC time prefix allowed), or None when
+    the file or the line is missing. S2P1-2 (Liam 15/11 CODE_S02 "Moc t = 0 khong xac dinh"): a command cut to
+    0 by the ultrasonic interlock looks like a zero packet in the log, so a run with cut ticks has no t = 0."""
+    try:
+        with open(events_path, encoding='utf-8', errors='replace') as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    best = None
+    for line in lines:
+        i = line.find('#us_end,')
+        if i < 0:
+            continue
+        kv = dict(p.split('=', 1) for p in line[i:].split(',')[1:] if '=' in p)
+        try:
+            best = max(best or 0, int(kv['cut_ticks']))
+        except (KeyError, ValueError):
+            continue
+    return best
+
+
+def anchors(log, test_id, us_cut=None):
+    """t0_us, method, reason, drift_ppm, t_a, t_b and the map k -> t_ESP(k) (None when unknown).
+    us_cut: cut_ticks of the run's '#us_end' (None unknown); > 0 -> no t = 0 (S2P1-2)."""
     K, ka, kb = schedule(test_id)
     t = _col(log, 'timestamp_us')
     seq = _col(log, 'log_seq')
@@ -102,7 +130,11 @@ def anchors(log, test_id):
     sp = np.stack([_col(log, c) for c in ('sp_vx', 'sp_vy', 'sp_wz')], axis=1)
     nzl = on & np.any(np.abs(np.nan_to_num(sp)) > 0.0, axis=1)
     idx = np.flatnonzero(nzl)
-    out = dict(t0_us=NAN, t0_method='none', t0_reason='', drift_ppm=NAN, anchor_a_us=NAN, anchor_b_us=NAN)
+    out = dict(t0_us=NAN, t0_method='none', t0_reason='', drift_ppm=NAN, anchor_a_us=NAN, anchor_b_us=NAN,
+               us_cut_ticks=NAN if us_cut is None else us_cut)
+    if us_cut is not None and us_cut > 0:
+        out['t0_reason'] = 'us_cut'
+        return out, None, K
     if idx.size == 0:
         out['t0_reason'] = 'no_nonzero_command'
         return out, None, K
@@ -116,25 +148,27 @@ def anchors(log, test_id):
     if b_ok and age is not None and math.isfinite(age[ib]) and not 0 <= age[ib] < TIMEOUT_MS:
         b_ok, why_b = False, 'anchor_b_timeout'      # command 0 from the 200 ms timeout, not a zero packet
     ta, tb = t[ia], (t[ib] if ib is not None else NAN)
-    out['anchor_a_us'], out['anchor_b_us'] = (ta if a_ok else NAN), (tb if b_ok else NAN)
     reason = ''
     if a_ok and b_ok:
         span, nom = tb - ta, (kb - ka) * PERIOD_US
         if abs(span - nom) > ANCHOR_PPM * 1e-6 * nom + ANCHOR_SLACK_US:
-            # one anchor moved: a later than its packet (first packets lost, an ultrasonic cut, motors
-            # on late) makes the span short; b later (first tail zeros lost) makes it long
+            # With no ultrasonic cut (above) and b not from the timeout, each sign has one cause: a short
+            # span means a came late (first packets lost, motors on after k = 0; a cannot come early: no
+            # non-zero command exists before packet k_a), a long one means b came late (first tail zeros
+            # lost; b cannot come early: the timeout case is refused above)
             if span < nom:
                 a_ok, reason = False, 'anchor_a_late'
             else:
                 b_ok, reason = False, 'anchor_b_late'
+    out['anchor_a_us'], out['anchor_b_us'] = (ta if a_ok else NAN), (tb if b_ok else NAN)   # S2P1-4
     if a_ok and b_ok:
-        # the span carries the hand-over quantization of both anchors (10 ms) and, on HIL, a late tail
-        # (STOPPING after the owner sees DONE); over a short span that is thousands of ppm (A-K1: 3 s,
-        # CLOSED_LOOP/2026-11-14_run01 k1a -11 ms): the rate is clamped to the clock bound
-        drift = ((tb - ta) / (kb - ka) / PERIOD_US - 1.0) * 1e6
-        per = PERIOD_US * (1.0 + max(-ANCHOR_PPM, min(ANCHOR_PPM, drift)) * 1e-6)
+        # S2P1-3 (Codex round 1): the approved linear map through both anchors (spec P2-2b), not clamped;
+        # a rate past the clock bound only flags drift_over_bound (the 10 ms hand-over of each anchor over a
+        # short span, A-K1 3 s: CLOSED_LOOP/2026-11-14_run01 k1a -3741 ppm)
+        per = (tb - ta) / (kb - ka)
+        drift = (per / PERIOD_US - 1.0) * 1e6
         out.update(t0_method='two_anchors', drift_ppm=drift,
-                   t0_reason='drift_clamped' if abs(drift) > ANCHOR_PPM else '')
+                   t0_reason='drift_over_bound' if abs(drift) > ANCHOR_PPM else '')
         fmap = lambda k: ta + (k - ka) * per          # noqa: E731
     elif a_ok or b_ok:
         out.update(t0_method='one_anchor', t0_reason=reason or ('anchor_a_lost' if not a_ok else why_b))
@@ -219,11 +253,20 @@ def cmd_path(log, t0, t_end):
     return out
 
 
-def stats(log, test_id, platform=''):
-    """Every field of FIELDS for one run (log: every line, dict of arrays; platform of runs.csv)."""
-    res, fmap, K = anchors(log, test_id)
+def stats(log, test_id, platform='', us_cut=None, prep_s=None):
+    """Every field of FIELDS for one run (log: every line, dict of arrays; platform, prep_s of runs.csv;
+    us_cut: cut_ticks of the run's '#us_end', us_cut_ticks)."""
+    sim = str(platform).strip().lower() == 'sim'
+    res, fmap, K = anchors(log, test_id, us_cut)
     t0 = res['t0_us']
     t_end = fmap(K - 1) if fmap is not None else NAN
-    res.update(prep_check(log, t0, t_end, sim=str(platform).strip().lower() == 'sim'))
+    res.update(prep_check(log, t0, t_end, sim=sim))
+    res['sim_t0_err_us'] = NAN
+    if sim and prep_s is not None and math.isfinite(t0):
+        # S2P1-5 (spec v1.10 P2-2): SIM knows t = 0 (prep_s after the first tick of the log); the anchors
+        # must find it within one tick, else a tool error (sim_t0_mismatch)
+        res['sim_t0_err_us'] = float(t0 - float(prep_s) * 1e6)    # fwsim log time = simulation time
+        if abs(res['sim_t0_err_us']) > SIM_TICK_US:
+            res['prep_flags'] = ';'.join(x for x in (res['prep_flags'], 'sim_t0_mismatch') if x)
     res.update(cmd_path(log, t0, t_end))
     return {k: res[k] for k in FIELDS}

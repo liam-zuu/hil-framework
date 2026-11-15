@@ -194,14 +194,16 @@ def test_window_edges():
     assert cp.stats(log, 'A-L2')['cmd_gap_n'] == 1
 
 
-def test_short_span_rate_is_clamped():
-    """A-K1 anchors are 3 s apart: 11 ms of hand-over is -3700 ppm (CLOSED_LOOP/2026-11-14_run01 k1a)."""
+def test_short_span_rate_is_flagged_not_clamped():
+    """A-K1 anchors are 3 s apart: 10 ms of hand-over is -3300 ppm (CLOSED_LOOP/2026-11-14_run01 k1a -3741).
+    S2P1-3 (Codex round 1): the map still goes through both anchors (spec P2-2b), only flagged."""
     log, t0_true = gen('A-K1')
     nz = np.flatnonzero(np.abs(log['sp_vx']) > 0)
     log['sp_vx'][nz[-1]] = 0.0                       # the last non-zero line one tick early: b 10 ms early
     s = cp.stats(log, 'A-K1')
-    assert s['t0_method'] == 'two_anchors' and s['drift_ppm'] < -2002 and s['t0_reason'] == 'drift_clamped'
-    assert 0.0 <= s['t0_us'] - t0_true <= 30_000
+    assert s['t0_method'] == 'two_anchors' and s['drift_ppm'] < -2002 and s['t0_reason'] == 'drift_over_bound'
+    assert s['t0_us'] == pytest.approx(2 * s['anchor_a_us'] - s['anchor_b_us'], abs=1)   # k_a 150, k_b 300
+    assert -30_000 <= s['t0_us'] - t0_true <= 60_000
 
 
 def test_age_of_exactly_200_ms_is_not_over():
@@ -216,9 +218,38 @@ def test_age_of_exactly_200_ms_is_not_over():
     assert cp.stats(log, 'A-L2')['cmd_gap_n'] == 1
 
 
-def test_clamped_rate_maps_k0_from_anchor_a():
-    log, _ = gen('A-K1')
+def test_ultrasonic_cut_gives_no_t0(tmp_path):
+    """S2P1-2 (Liam 15/11 CODE_S02 "Moc t = 0 khong xac dinh"): cut ticks in '#us_end' -> no t = 0; the
+    counter-example of Codex (interlock cutting vx to the end of A-L2) is then not mapped at all."""
+    log, _ = gen('A-L2')
+    t = (log['timestamp_us'] - 5e6) * 1e-6
+    log['sp_vx'][t > 8.01] = 0.0                     # interlock from 8.01 s (5 s into the test) to the end
+    ev = tmp_path / 'r.csv.events.txt'
+    ev.write_text('2026-11-15T10:00:00.000 #us_end,boot=ab,on=1,swb=1000,changes=0,blk_ticks=99,cut_ticks=99,'
+                  'ticks=900,last_data_seq=900,line_drop=0' + chr(10), encoding='utf-8')
+    cut = cp.us_cut_ticks(str(ev))
+    assert cut == 99
+    s = cp.stats(log, 'A-L2', 'real', cut)
+    assert s['t0_method'] == 'none' and s['t0_reason'] == 'us_cut' and s['us_cut_ticks'] == 99
+    assert cp.us_cut_ticks(str(tmp_path / 'missing.txt')) is None
+
+
+def test_rejected_anchor_is_nan():
+    """S2P1-4: an anchor dropped by the span check is NaN in the output (map_run starts from the other)."""
+    log, _ = gen('A-L2')
     nz = np.flatnonzero(np.abs(log['sp_vx']) > 0)
-    log['sp_vx'][nz[-1]] = 0.0
-    s = cp.stats(log, 'A-K1')
-    assert s['t0_us'] == pytest.approx(s['anchor_a_us'] - 150 * cp.PERIOD_US * (1 - cp.ANCHOR_PPM * 1e-6), abs=1)
+    log['sp_vx'][nz[:20]] = 0.0
+    s = cp.stats(log, 'A-L2', 'hil', 0)
+    assert s['t0_reason'] == 'anchor_a_late' and math.isnan(s['anchor_a_us']) and math.isfinite(s['anchor_b_us'])
+
+
+def test_sim_t0_is_checked_against_prep_s():
+    """S2P1-5: SIM knows t = 0 = prep_s; a schedule shifted by 1 s with prep_s 3 in runs.csv is a tool error."""
+    log, _ = gen('A-K3', sim=True, swa_on_s=-1.0, link_s=0.0, offset_s=0.0, prep_s=4.0)
+    log['run_active'][:] = 1
+    s = cp.stats(log, 'A-K3', 'sim', None, 3.0)
+    assert 'sim_t0_mismatch' in s['prep_flags'] and abs(s['sim_t0_err_us'] - 1e6) < 20_000
+    s = cp.stats(log, 'A-K3', 'sim', None, 4.0)
+    log['timestamp_us'] = log['timestamp_us'] - s['sim_t0_err_us'] + 5_000   # fwsim: the tick at prep_s applies k = 0
+    s = cp.stats(log, 'A-K3', 'sim', None, 4.0)
+    assert 'sim_t0_mismatch' not in s['prep_flags'] and abs(s['sim_t0_err_us'] - 5_000) < 1

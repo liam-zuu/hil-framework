@@ -72,7 +72,7 @@ def test_map_is_found(kind, ppm):
 def test_wrong_wheel_sign_is_refused():
     te, counts, tp, om, alpha, beta = make('line', flip=1)
     fit = pt.fit_map(te, counts, tp, om, alpha + beta * te[0] + 0.01)
-    assert not fit['ok'] and fit['reason'] == 'residual_over_max'
+    assert not fit['ok'] and fit['reason'] in ('residual_over_max', 'not_identified', 'sigma_t_over_max')
 
 
 def test_still_run_is_not_mapped():
@@ -101,3 +101,22 @@ def test_expected_counts_hold_the_frame_speed():
     om = np.array([[2 * math.pi] * 4, [0.0] * 4, [0.0] * 4])
     C = pt.expected_counts(tp, om)
     assert C[1, 0] == pytest.approx(660.0) and C[2, 0] == pytest.approx(660.0)
+
+
+def test_steady_speed_only_is_not_identified():
+    """S2P1-1 (Codex round 1): wheels at one constant speed, counts = floor(1320 t): a 50 ms shift gives the
+    same residual after the segment offsets, so the map must be refused, not ok at 0.3 counts RMS."""
+    tp = 100.0 + np.arange(8000) * 1e-3
+    om = np.full((len(tp), 4), 2 * math.pi)
+    te = 5.0 + np.arange(700) * 0.01
+    q = 95.0 + te
+    C = pt.expected_counts(tp, om)
+    counts = np.stack([np.floor(np.interp(q, tp, C[:, w])) for w in range(4)], axis=1)
+    fit = pt.fit_map(te, counts, tp, om, 95.0 + te[0] + 0.05)
+    assert not fit['ok'] and fit['reason'] in ('not_identified', 'sigma_t_over_max')
+
+
+def test_sigma_is_reported_and_small_when_speed_changes():
+    te, counts, tp, om, alpha, beta = make('line', 0.0)
+    fit = pt.fit_map(te, counts, tp, om, alpha + beta * te[0] + 0.02)
+    assert fit['ok'] and 0 < fit['sigma_t_s'] < 1e-3
