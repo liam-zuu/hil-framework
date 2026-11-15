@@ -686,6 +686,17 @@ def test_cu9_1_off_grid_report_makes_its_pairs_suspect():
 
 # ── Codex round 10 ─────────────────────────────────────────────────────────────────────
 
+@pytest.mark.parametrize('shift,w0', [(-0.2, 10.025), (-0.05, 10.005)])
+def test_cu11_window_start_covered_by_sample_times(shift, w0):
+    """Round 11 test gap: tau_hat < 0 puts the first sample after the window start."""
+    r = 10.0 + 0.05 * np.arange(101)
+    tg = 9.7 + 0.001 * np.arange(5301)
+    S = dict(t_all=r - shift, t_recv=r, n_all=np.arange(101), psi_all=np.zeros(101), keep=np.ones(101, dtype=bool),
+             period_fit_s=0.05, h_lim=0.105, tg=tg, gz=np.zeros_like(tg))
+    with pytest.raises(U.InputError, match='do not cover'):
+        U.turn_totals(S, w0, 15.0)
+
+
 @pytest.mark.parametrize('shift,w1', [(0.2, 14.95), (0.05, 14.995)])
 def test_cu10_1_window_must_be_covered_by_sample_times(shift, w1):
     r = 10.0 + 0.05 * np.arange(101)
