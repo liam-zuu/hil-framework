@@ -350,7 +350,7 @@ def step_segments(t, sp, v):
     return out
 
 
-def compute(log, test_id, platform=''):
+def compute(log, test_id):
     t = (log['timestamp_us'] - log['timestamp_us'][0]) * 1e-6
     sp = np.stack([log['sp_vx'], log['sp_vy'], log['sp_wz']], axis=1)
     v = np.stack([log['vx'], log['vy'], log['wz']], axis=1)
@@ -361,7 +361,7 @@ def compute(log, test_id, platform=''):
     ev = log.get('_every', log)          # every logged line, before the motor-off filter (S3C-8)
     m.update(run_bad_fields(pos_reset_mid(ev.get('run_active'), ev.get('pos_reset_n'), ev.get('motor_on'))))
     if '_all' in log and test_id in s02_cmd_path.GROUP_A:
-        m.update(s02_cmd_path.stats(log['_all'], test_id, platform))     # CODE_S02: t = 0, preparation, command path
+        m.update(s02_cmd_path.stats(log['_all'], test_id, log.get('_platform', '')))     # CODE_S02: t = 0, preparation, command path
 
     moving =np.flatnonzero(np.any(np.abs(sp) > 1e-9, axis=1))
     t0, t1 = t[moving[0]] + WINDOW_SKIP_S, t[moving[-1]]
@@ -407,7 +407,9 @@ def run_dir_metrics(d, out_name='metrics.csv'):
             continue
         if r['platform'].strip().lower() == 'hil':
             check_no_udp_taken(os.path.join(d, r['file']) + '.events.txt')
-        m = compute(load_log(os.path.join(d, r['file'])), r['test_id'], r['platform'])
+        log = load_log(os.path.join(d, r['file']))
+        log['_platform'] = r['platform']                       # s02_cmd_path: SIM cold start
+        m = compute(log, r['test_id'])
         out.append(dict(run_id=r['run_id'], platform=r['platform'], controller=r['controller'],
                         test_id=r['test_id'], speed_mps=r['speed_mps'], rep=r['rep'], **m))
     keys = []
