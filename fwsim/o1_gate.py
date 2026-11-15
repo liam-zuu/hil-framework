@@ -201,12 +201,28 @@ def evaluate_outcomes(g: dict, decide: Iterable[str]) -> dict:
                 any_certain_fail=any(g[c]['state'] == 'khong_dat' for c in dec))
 
 
+G1_FIELD_KEYS = ('t_done', 't_deadline', 't1', 'prog_before_t1', 'cond25_before_deadline')
+
+
+def g1_state_from_fields(f: dict) -> str:
+    """G1 from its B81-3 fields, one way of using the frames (fwsim, HIL; O1 3.5 last block), the rule of
+    tools/rq3_log.gate_g1_state for one way."""
+    done = f['t_done'][0] is not None
+    if f['t1'] is None or f['prog_before_t1']:
+        return 'dat' if done else 'khong_dat'
+    return 'chua_ket_luan' if f['cond25_before_deadline'] else 'khong_dat'
+
+
 def gate(frames: dict, completed, *, v_cmd_max: float, wz_cmd_max: float, u_t: Optional[float],
          u_p: float = 0.0, u_psi_deg: float = 0.0, decide: Iterable[str] = DECIDE_ALL, status: str = '',
-         note: str = '') -> dict:
+         note: str = '', g1_fields: Optional[dict] = None) -> dict:
     """G1-G5 of one run. frames: per-frame arrays FRAME_KEYS (e_perp, e_trk, e_bao [m], e_theta_cmd_deg
     = |heading error| [deg]) on the scored frames; completed: the evaluator's G1 value.
-    u_t: bound of the time offset of the command start [s], or None = not known (G3, G5 inconclusive)."""
+    u_t: bound of the time offset of the command start [s], or None = not known (G3, G5 inconclusive).
+    g1_fields (B81-3, one way of using the frames: o1_gate_eval.g1_fields_v7): when given, the g1 block also holds
+    t_done, t_deadline, t1, prog_before_t1, cond25_before_deadline, G1 recomputed from them must equal the state
+    from completed (else ValueError), and g2..g5 hold the common domain 'chung' {q, lo, hi, n_undef}, equal to the
+    union one (one frame domain). None (default): the dict is as before."""
     decide = check_decide(decide)
     if u_p != 0.0 or u_psi_deg != 0.0:
         raise ValueError('U_p, U_psi > 0 (camera): G4 needs the projection solutions within 2 U_p (O1 3.4); '
@@ -227,6 +243,17 @@ def gate(frames: dict, completed, *, v_cmd_max: float, wz_cmd_max: float, u_t: O
         q = np.asarray(frames[FRAME_KEYS[c]], dtype=float)
         lo, hi = frame_bounds(q, us[c])
         g[c] = dict(aggregate(q, lo, hi, THRESHOLDS[c]), u=us[c])
+    if g1_fields is not None:
+        if set(g1_fields) != set(G1_FIELD_KEYS) or not (isinstance(g1_fields['t_done'], list)
+                                                       and len(g1_fields['t_done']) == 1):
+            raise ValueError(f'g1_fields {sorted(g1_fields)!r}: {G1_FIELD_KEYS}, t_done a list of one time')
+        st = g1_state_from_fields(g1_fields)
+        if st != g['g1']['state']:
+            raise ValueError(f'B81-3: G1 from t_done, t1 and the flags is {st!r}, from completed {completed!r} it is '
+                             f'{g["g1"]["state"]!r}')
+        g['g1'].update({k: (list(v) if k == 't_done' else v) for k, v in g1_fields.items()})
+        for c in MEASURED:
+            g[c]['chung'] = {k: g[c][k] for k in ('q', 'lo', 'hi', 'n_undef')}
     ratios = [g[k]['ratio'] for k in MEASURED if _finite(g[k]['ratio'])]
     return dict(version=GATE_VERSION, D=D, theta_max_deg=THETA_MAX_DEG, v_cmd_max=v_cmd_max,
                 wz_cmd_max=wz_cmd_max, u_p=u_p, u_psi_deg=u_psi_deg, u_t=u_t, **g,

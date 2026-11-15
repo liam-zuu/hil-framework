@@ -164,3 +164,36 @@ def test_rebuilt_window_checked_against_rows():
     p = O.Path8()
     with pytest.raises(ValueError, match='row e_perp'):
         E.g4_frames(rows, p, sch.vmax, lambda *a: [0.0], E.fig8_nominal)
+
+
+# -- B81-3 G1 fields of fwsim (15/11; design 03_CODE/docs/2026-11-15_Thiet_ke_bo_cham_fwsim_G1_v1.md) --
+
+def _summ(completed, t_end=30.0, t1=float('nan'), t_prog=float('nan'), c25=False):
+    return dict(completed=completed, t_end=t_end, t_deadline=40.0, t_first_track_err=t1, t_progress=t_prog,
+                cond2_5_ever=c25)
+
+
+@pytest.mark.parametrize('summ, want', [
+    (_summ('true'), dict(t_done=[30.0], t1=None, prog_before_t1=None, cond25_before_deadline=None)),
+    (_summ('false', t_end=39.99, c25=True), dict(t_done=[None], t1=None, prog_before_t1=None,
+                                                 cond25_before_deadline=None)),
+    (_summ('true', t1=35.0, t_prog=20.0, c25=True), dict(t_done=[30.0], t1=35.0, prog_before_t1=True,
+                                                         cond25_before_deadline=True)),
+    (_summ('inconclusive', t1=12.0, t_prog=20.0, c25=True), dict(t_done=[None], t1=12.0, prog_before_t1=False,
+                                                                 cond25_before_deadline=True)),
+    (_summ('false', t1=12.0, t_prog=12.0, c25=False), dict(t_done=[None], t1=12.0, prog_before_t1=False,
+                                                           cond25_before_deadline=False)),      # same frame: not before
+    (_summ('false', t1=12.0, c25=False), dict(t_done=[None], t1=12.0, prog_before_t1=False,
+                                              cond25_before_deadline=False)),                   # no progress at all
+])
+def test_g1_fields_v7_from_the_summary(summ, want):
+    f = E.g1_fields_v7(summ)
+    assert f == dict(want, t_deadline=40.0)
+    assert G.g1_state_from_fields(f) == G.g1_state(summ['completed'])
+
+
+def test_evaluate_fig8_summary_and_version_unchanged_for_hil():
+    """The G1 fields are a separate function: the evaluate_fig8 summary (written whole by tools/hil_o1_score.py)
+    and EVAL_VERSION do not change."""
+    assert E.EVAL_VERSION == 'o1_gate_eval_v2'
+    assert 'g1_fields' not in E.evaluate_fig8.__code__.co_names
