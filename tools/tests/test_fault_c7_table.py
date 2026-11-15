@@ -229,6 +229,7 @@ ESP_BREAK = {   # kind -> (row index of the fault run's ESP32 log, column, value
     'run_gap': (ESP_PRE + 400, 'run_active', 0),
     'seq_gap': (ESP_PRE + 400, 'log_seq', SEQ0 + ESP_PRE + 401),
     'half_tick': (ESP_PRE + 400, 'gyro_n', 50.5),
+    'gyro_back': (ESP_PRE + 899, 'gyro_n', 0),                  # C7T2-2: the last counter of the span back to 0
 }
 
 
@@ -242,6 +243,9 @@ def write_bench(d, kind=None):
         args = ARGS + (' --faults ~/fault_c7/enc_FL.csv' if fault else '') + f' --step-log ~/{name}_steps.csv'
         if fault and kind == 'args':
             args = args.replace('--seed 0', '--seed 1')
+        if kind == 'args_repeat':                              # C7T2-1: argparse keeps the last --ground
+            args = args.replace('--ground traction', '--ground traction --ground rigid' if fault else
+                                '--ground rigid --ground traction')
         if fault and kind == 'args_order':                     # same pairs, another order and --opt=value
             args = '--seed 0 --ground=traction --imu-noise 20 --test=A-W1 --faults ~/x.csv --step-log=~/s.csv'
         fw = dict(FW)
@@ -409,6 +413,8 @@ def test_bench_columns_extend_the_fwsim_ones(tmp_path, fake_check):
     ('run_gap', 'run_active 0 inside'),
     ('seq_gap', 'log_seq gap'),
     ('half_tick', 'gyro_n not a whole number'),
+    ('gyro_back', 'gyro_n decreases'),
+    ('args_repeat', 'option repeated'),
     ('frame_no', 'frame_no is not step_first'),
     ('run_id0', 'run_id 0'),
     ('dtype', 'uint8'),
@@ -434,6 +440,9 @@ def test_run_args_without_the_schedule():
         ct.task_duration('--test A-K1')
     with pytest.raises(ct.TableError, match='no single --test'):
         ct.task_duration('--test A-W1 --test A-W1')
+    with pytest.raises(ct.TableError, match=r"option repeated \['--ground'\]"):       # C7T2-1
+        ct._run_args('--test A-W1 --ground rigid --ground traction')
+    assert ct._run_args('--test A-W1 --faults a.csv --faults b.csv') == [('--test', 'A-W1')]   # ARG_SKIP only
 
 
 def test_thesis_path(tmp_path):
@@ -443,6 +452,15 @@ def test_thesis_path(tmp_path):
     assert os.path.normpath(got) == os.path.normpath(str(tmp_path / '05_DATA/results/FAULT_C7/r1/schedules/enc_FL.csv'))
     with pytest.raises(ct.TableError, match='not under a 05_DATA'):
         ct._thesis_path(str(tmp_path), '05_DATA/x.csv')
+
+
+@pytest.mark.skipif(os.path.normcase('A') != 'a', reason='case-insensitive paths only (Windows)')
+def test_thesis_path_any_case(tmp_path):
+    """C7T2-4: on Windows 05_data is the same folder as 05_DATA."""
+    d = tmp_path / '05_data' / 'results' / 'r2'
+    d.mkdir(parents=True)
+    got = ct._thesis_path(str(d), '05_DATA/results/r1/s.csv')
+    assert os.path.normcase(got) == os.path.normcase(str(tmp_path / '05_DATA' / 'results' / 'r1' / 's.csv'))
 
 
 FAULT_C7 = r'D:\CLAUDE_THESIS\05_DATA\results\FAULT_C7'

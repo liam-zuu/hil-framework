@@ -1,7 +1,8 @@
 """rpi5/fault_tasks.py (L82 type II, Liam 14/11 CODE_FAULT "Them A-W1 cho Pi"): the bench A-W1 setpoint is
 the fwsim one (fwsim/imu_freq_exp.a_w1, and fwsim/fault_run.task_setpoint for the task part), install() wraps
 only FaultTaskSpec and composes with o1_tasks.install(), run_hil._run_traj installs it, and run_hil --test A-W1
-takes the task (run length 8 s for the fault schedule, RUN = 8 s and the 1 s zero tail with --finite-run)."""
+takes the task (run length 8 s for the fault schedule: LifecycleConfig run_s 8 s and the 1 s zero tail with
+--finite-run; RUN itself ends when the publisher reports the end, a little later, see fault_tasks.py)."""
 import os
 import subprocess
 import sys
