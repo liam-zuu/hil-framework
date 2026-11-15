@@ -213,6 +213,39 @@ def g1_state_from_fields(f: dict) -> str:
     return 'chua_ket_luan' if f['cond25_before_deadline'] else 'khong_dat'
 
 
+def check_g1_fields(f: dict, state: str) -> None:
+    """G1F-1 (Codex round 1): the B81-3 G1 fields of one way of using the frames, checked as
+    tools/rq3_log.gate_g1_fields does for fwsim / HIL (not imported: tools/ is not in the S04 blob lock), plus
+    t_done given exactly when G1 is 'dat' (state from completed). ValueError on any failure."""
+    if not isinstance(f, dict) or set(f) != set(G1_FIELD_KEYS):
+        raise ValueError(f'g1_fields {sorted(f) if isinstance(f, dict) else f!r}: the keys {G1_FIELD_KEYS}')
+    td = f['t_done']
+    if not isinstance(td, list) or len(td) != 1:
+        raise ValueError(f'g1_fields t_done {td!r}: a list of one time (one way of using the frames)')
+
+    def time(x, what, null_ok=True):
+        if x is None and null_ok:
+            return None
+        if not _finite(x) or float(x) < 0.0:
+            raise ValueError(f'g1_fields {what} {x!r}: {"null or " if null_ok else ""}a finite time >= 0')
+        return float(x)
+    t_dl = time(f['t_deadline'], 't_deadline', null_ok=False)
+    t_done = time(td[0], 't_done')
+    if t_done is not None and not t_done < t_dl:
+        raise ValueError(f'g1_fields t_done {t_done!r} not before t_deadline {t_dl!r} (O1 3.4 condition 4)')
+    t1 = time(f['t1'], 't1')
+    for k in ('prog_before_t1', 'cond25_before_deadline'):
+        if f[k] is not None and not isinstance(f[k], bool):
+            raise ValueError(f'g1_fields {k} {f[k]!r}: null or a boolean')
+    prog, c25 = f['prog_before_t1'], f['cond25_before_deadline']
+    if t1 is None and (prog is not None or c25 is not None):
+        raise ValueError('g1_fields: prog_before_t1 / cond25_before_deadline without t1')
+    if t1 is not None and (prog is None or (not prog and c25 is None)):
+        raise ValueError('g1_fields: with t1, prog_before_t1, and cond25_before_deadline when not prog, are needed')
+    if (t_done is not None) != (state == 'dat'):
+        raise ValueError(f'g1_fields t_done {t_done!r} with G1 {state!r}: a time only for a completed run')
+
+
 def gate(frames: dict, completed, *, v_cmd_max: float, wz_cmd_max: float, u_t: Optional[float],
          u_p: float = 0.0, u_psi_deg: float = 0.0, decide: Iterable[str] = DECIDE_ALL, status: str = '',
          note: str = '', g1_fields: Optional[dict] = None) -> dict:
@@ -251,6 +284,7 @@ def gate(frames: dict, completed, *, v_cmd_max: float, wz_cmd_max: float, u_t: O
         if st != g['g1']['state']:
             raise ValueError(f'B81-3: G1 from t_done, t1 and the flags is {st!r}, from completed {completed!r} it is '
                              f'{g["g1"]["state"]!r}')
+        check_g1_fields(g1_fields, g['g1']['state'])                       # G1F-1: the rq3_log field checks
         g['g1'].update({k: (list(v) if k == 't_done' else v) for k, v in g1_fields.items()})
         for c in MEASURED:
             g[c]['chung'] = {k: g[c][k] for k in ('q', 'lo', 'hi', 'n_undef')}

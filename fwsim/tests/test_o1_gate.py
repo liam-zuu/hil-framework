@@ -255,3 +255,32 @@ def test_g1_fields_that_disagree_with_completed_are_an_error():
     with pytest.raises(ValueError, match='g1_fields'):
         G.gate(_frames(), 'true', v_cmd_max=0.7, wz_cmd_max=1.6, u_t=0.0,
                g1_fields=dict(G1_CASES[0][1], t_done=[30.0, 31.0]))
+
+
+_OK = dict(t_done=[30.0], t_deadline=40.0, t1=None, prog_before_t1=None, cond25_before_deadline=None)
+
+
+@pytest.mark.parametrize('completed, f, why', [
+    ('true', dict(_OK, t_done=[40.0]), 'not before t_deadline'),                 # Codex G1F-1 counterexample
+    ('true', dict(_OK, t_done=[-1.0]), 'finite time'),
+    ('true', dict(_OK, t_done=[NAN]), 'finite time'),
+    ('true', dict(_OK, t_deadline=NAN), 'finite time'),
+    ('true', dict(_OK, t_deadline=None), 'finite time'),
+    ('true', dict(_OK, t_deadline=True), 'finite time'),
+    ('true', dict(_OK, t1=INF, prog_before_t1=True, cond25_before_deadline=True), 'finite time'),
+    ('true', dict(_OK, t1=35.0, prog_before_t1=1, cond25_before_deadline=True), 'boolean'),
+    ('true', dict(_OK, cond25_before_deadline=True), 'without t1'),
+    ('true', dict(_OK, t1=35.0, prog_before_t1=None, cond25_before_deadline=True), 'are needed|B81-3'),  # cross-check first
+    ('false', dict(_OK, t_done=[None], t1=12.0, prog_before_t1=False, cond25_before_deadline=None), 'are needed'),
+    ('inconclusive', dict(_OK, t_done=[30.0], t1=12.0, prog_before_t1=False, cond25_before_deadline=True),
+     'only for a completed run'),
+])
+def test_g1_fields_checked_like_rq3_log(completed, f, why):
+    """G1F-1: fields that rq3_log.gate_g1_fields refuses, or a t_done on a run not completed, are refused by
+    gate() before anything is written."""
+    with pytest.raises(ValueError, match=why):
+        G.gate(_frames(), completed, v_cmd_max=0.7, wz_cmd_max=1.6, u_t=0.0, g1_fields=f)
+    r = _rq3()
+    if why != 'only for a completed run':                            # the extra rule of gate(), not in rq3_log
+        with pytest.raises((r.LogError, ValueError, TypeError)):
+            r.gate_g1_fields(dict(f, q='true', state='dat'), 'SIM')
