@@ -138,6 +138,8 @@ GATE_RUN_COLS = (['e_bao_max', 'gate_version', 'gate_decide', 'gate_u_t', 'g1_q'
                  + [f'{c}_{x}' for c in G.MEASURED for x in ('q', 'lo', 'hi', 'n_undef', 'state')]
                  + ['gate_outcome'])
 RUN_COLS = OLD_COLS + GATE_RUN_COLS
+LEVEL_COLS = ['controller', 'factor', 'L', 'H', 'centre', 'scale', 'default', 'rule_note',     # S03 v8
+              'a', 'b', 'b_n', 'L_nguon', 'H_nguon']                                          # S03 v8.3 (S83-1: fixed)
 SWEEP_ID_COLS = ('controller', 'factor', 'value', 'is_default', 'luoi', 'v', 'mu')   # sweep.csv identifiers (section 7; luoi: v8.3)
 GATE_U_T = 0.0                # s: fwsim knows the command start exactly (o1_gate docstring; as C12, S04)
 SCALE_RTOL = 1e-14            # H/L >= 4 within float rounding of the log grid (S3C-6; S3D-7: about 45 ULP)
@@ -1275,7 +1277,7 @@ def main():
     for name, rows in (('sweep.csv', sweep_rows), ('sweep_counts.csv', sweep_counts(sweep_rows)),
                        ('levels.csv', level_rows), ('design.csv', design_rows)):
         p = os.path.join(a.out, name)
-        cols = None
+        cols = LEVEL_COLS if name == 'levels.csv' else None     # S83-1: the header even when S03 stops early
         if name == 'sweep.csv':     # S3G-2, S3G2-3: one fixed header (identifiers, run columns), other keys after
             cols = list(dict.fromkeys(list(SWEEP_ID_COLS) + RUN_COLS[5:] + [k for r in rows for k in r]))
         write_csv(p, rows, cols)

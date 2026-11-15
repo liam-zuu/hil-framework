@@ -216,6 +216,29 @@ def test_v64_summarise_rows_carry_the_edge_columns():
         assert r['edge_side'] == 'a:H' and r['edge_limit'] == 'vùng ngoài biên chưa khảo sát: a:H', r['kind']
 
 
+DOMLOG = [dict(name='a', L=0.5, H=8.0, scale='log', L_src='hết lưới dưới', H_src='điểm kế tiếp không hoàn thành'),
+          dict(name='b', L=0.5, H=8.0, scale='log', L_src='0', H_src='hết lưới nối')]
+
+
+@pytest.mark.parametrize('gains, side, limit', [
+    ((2.0, 2.0), '', ''),                           # geometric centre: no flag (the gain 2 is near H on a linear axis)
+    ((0.51, 2.0), 'a:L', 'a:L'),                    # near L, a grid end below: limit
+    ((7.9, 2.0), 'a:H', ''),                        # near H, the next point did not complete: no limit
+    ((2.0, 7.9), 'b:H', 'b:H'),                     # near H, the extension end: limit
+    ((2.0, 0.51), 'b:L', ''),                       # near L = 0 source: no limit
+])
+def test_v64_summarise_uses_the_ga_coordinate_on_a_log_axis(gains, side, limit):
+    """S83-6: on a log factor the flag and its side come from the GA coordinate xga = log(gain), not from the
+    gain x; the two sides of each factor have different sources."""
+    p = [P(0.020, 9.0, x=gains, seed=1), P(0.022, 4.0, x=gains, seed=2)]
+    for q in p:
+        q['xga'] = [math.log(g) for g in gains]
+    rows, _ = s4.summarise('PID', DOMLOG, {1: [p[0]], 2: [p[1]]})
+    for r in rows:
+        assert r['edge_side'] == side, r['kind']
+        assert r['edge_limit'] == (f'vùng ngoài biên chưa khảo sát: {limit}' if limit else ''), r['kind']
+
+
 def test_mu_rule_mid_when_every_point_satisfies(tmp_path):
     d = _s03_dir(tmp_path, _runs())
     dec, rep = s4.mu_rule(str(d), 'PID', list(s3.SPEEDS), [0.4, 0.5, 0.6])
@@ -671,6 +694,7 @@ def test_root_meta_keeps_code_notes(tmp_path):
     m = yaml.safe_load(open(tmp_path / 'meta.yaml', encoding='utf-8'))
     assert m['code_notes'] == {'PID seed 3': 'rate 12 %: lane reversal, no tool error'}
     assert set(m['pymoo_files']) == set(s4.PYMOO_FILES)                  # S4C-18
+    assert m['spec'] == s4.SPEC and m['spec'].startswith('S04 v6.4 ')    # S83-2
 
 
 def test_default_gains_must_give_a_valid_reference(monkeypatch):
@@ -785,7 +809,9 @@ def test_tool_check_three_phases(tmp_path, monkeypatch, capsys):
     assert notes['notes']['PID three_mu']['done'] is False and 'NOT done' in notes['notes']['PID three_mu']['note']
     for p in [out / 'meta.yaml', out / 'meta_PID.yaml', out / 'meta_ADRC.yaml', out / 'trial' / 'PID' / 'meta.yaml',
               out / 'trial' / 'ADRC' / 'meta.yaml', out / 'lock.yaml']:
-        yaml.safe_load(open(p, encoding='utf-8'))                        # S4C-11: valid YAML on Windows paths
+        m = yaml.safe_load(open(p, encoding='utf-8'))                    # S4C-11: valid YAML on Windows paths
+        if p.name.startswith('meta'):
+            assert m['spec'] == s4.SPEC and m['spec'].startswith('S04 v6.4 '), p   # S83-2: one version line
 
 
 def s4_args(out):

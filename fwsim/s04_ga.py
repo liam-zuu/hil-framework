@@ -96,6 +96,7 @@ SEEDS = (1, 2, 3, 4, 5)
 PENALTY = 1e6                 # section 3: f1 = f2 = 1e6 for a run_error candidate
 SEED_ERR_LIMIT = 0.10         # section 3
 EDGE_FRAC = 0.05              # section 2
+SPEC = 'S04 v6.4 (06_SPECS/2026-11-05_Spec_S04_GA_chon_gain.md)'   # S83-2: one version line for every meta.yaml
 B0_FACTORS = (0.7, 0.85, 1.0, 1.15, 1.3)
 R_FACTORS = (0.8, 0.9, 1.0, 1.1, 1.2)
 REL_LIMIT = 0.5               # B0_SENS criterion: e_perp_max change > 50 %
@@ -1181,7 +1182,7 @@ def write_root_meta(out, dll, lock, running=None):
                                           'stop')}
         ctrls[c]['plant_by_mu'] = {repr(m): json.loads(fwsim.plant_meta(fwsim.plant_params(
             argparse.Namespace(ground='traction', mu=m)))) for m in (L.get('eval_mu') or [])}
-    lines = dict(spec='S04 v5 (06_SPECS/2026-11-05_Spec_S04_GA_chon_gain.md)', date=time.strftime('%Y-%m-%d'),
+    lines = dict(spec=SPEC, date=time.strftime('%Y-%m-%d'),
                  setup='sim: fwsim, ESP32 firmware C code (DLL) + rpi5/plant_step.py, NOT hardware',
                  operator='Claude (phiên CODE)', tool_check=common.get('tool_check'),
                  not_main_numbers=bool(common.get('tool_check')), running=running,
@@ -1228,7 +1229,7 @@ def write_meta(path, a, fw, ctrl, extra, pymoo, eval_mu):
     plant = {repr(m): json.loads(fwsim.plant_meta(fwsim.plant_params(argparse.Namespace(ground='traction', mu=m))))
              for m in eval_mu}
     with open(path, 'w', encoding='utf-8') as f:
-        f.write(f"""spec: S04 v6.4 (06_SPECS/2026-11-05_Spec_S04_GA_chon_gain.md)
+        f.write(f"""spec: {SPEC}
 date: {time.strftime('%Y-%m-%d')}
 setup: sim                     # fwsim: ESP32 firmware C code (DLL) + rpi5/plant_step.py, NOT hardware
 operator: Claude (phiên CODE)

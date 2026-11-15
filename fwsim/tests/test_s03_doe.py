@@ -933,6 +933,7 @@ def test_main_stops_everything_when_a_default_fails(tmp_path, monkeypatch, capsy
     assert [(r['factor'], r['v'], r['completed']) for r in sweep] == [
         ('(default check)', '0.2', 'true'), ('(default check)', '0.5', 'true'), ('(default check)', '0.8', 'false')]
     assert 'stopped in the sweep' in (out / 'meta.yaml').read_text(encoding='utf-8')
+    assert next(_csv.reader(open(out / 'levels.csv', encoding='utf-8'))) == s3.LEVEL_COLS      # S83-1: header kept
 
 
 @needs_dll
@@ -1647,6 +1648,7 @@ def test_v82_sweep_run_error_is_a_sweep_row(tmp_path, monkeypatch, capsys, mode)
     assert code == 2 and '[STOP]' in console
     head = next(_csv.reader(open(out / 'sweep.csv')))
     assert head == list(s3.SWEEP_ID_COLS) + s3.RUN_COLS[5:]                      # S3G2-3: one fixed header
+    assert next(_csv.reader(open(out / 'levels.csv', encoding='utf-8'))) == s3.LEVEL_COLS   # S83-1
     rows = list(_csv.DictReader(open(out / 'sweep.csv')))
     err = [r for r in rows if r['status'] == 'run_error']
     assert len(err) == 1 and err[0]['error'] == 'FakeSweepError: boom' and err[-1] == rows[-1]
@@ -1731,6 +1733,40 @@ GRID_CASES = [('kp_xy', 1.5, 0.0, 6.0), ('ki_xy', 0.05, 0.0, 10.0), ('pos_kp', 6
               ('kp_wz', 0.37, 0.0, 6.0),        # default off the log points
               ('kp_xy', 0.6, 0.0, 6.0),         # b = hi = 10 x default: the default is the middle log point
               ('omega_c_wz', 0.5, 1.0, 25.0)]   # a = default / 10 < lo
+
+
+# S83-3: sweep_grid of the v8 code (s03_doe.py at hil 30d8157, blob f98effa) on GRID_CASES, IEEE-754 bytes
+# (little endian) of each point; written once from that code, never from the code under test
+V8_GRID_BITS = {
+    ('kp_xy', 1.5, 0.0, 6.0): '0000000000000000 333333333333c33f 310d3228116ece3f 7228cc4b361dd83f 87db97dff01be33f b53e722f3449ee3f 000000000000f83f 40481fb9ca040340 9132bfde83240e40 69d27d17ede21740 3167a79dc0ed2240 0000000000002e40',
+    ('ki_xy', 0.05, 0.0, 10.0): '0000000000000000 7b14ae47e17a743f c8db1863dee5853f e6f57620fd69973f cd9cdbedfa08a93f 9a9999999999a93f eea82d10b4c4ba3f d9edbfc5259fcc3f 4779c18e709ade3f 9338124f6d5cf03f aa5ee43a697e0140 8da874d878b41240 0000000000002440',
+    ('pos_kp', 6.0, 0.0, 12.0): '0000000000000000 333333333333e33f 2f0d3228116eee3f 7228cc4b361df83f 87db97dff01b0340 b53e722f34490e40 0000000000001840 40481fb9ca042340 9132bfde83242e40 69d27d17ede23740 3167a79dc0ed4240 0000000000004e40',
+    ('k_psi', 1.0, 0.0, 4.0): '0000000000000000 9a9999999999b93f 75b376c56049c43f 4c70dd877913d03f b424757f967ad93f 79d4f674cd30e43f 000000000000f03f 5560d4f6b85bf93f 61ccd4e957180440 e16d521f3cd90f40 978934d2003d1940 0000000000002440',
+    ('omega_c_xy', 8.0, 1.0, 25.0): '9a9999999999e93f 76b376c56049f43f 4c70dd8779130040 b524757f967a0940 79d4f674cd301440 0000000000002040 5560d4f6b85b2940 60ccd4e957183440 e06d521f3cd93f40 968934d2003d4940 0000000000005440',
+    ('omega_o_xy', 30.0, 5.0, 48.0): '0000000000000840 23fd957d0eab0f40 d8e824a4a9e41440 b159184a9a911b40 c602c60248302240 0100000000002840 23fd957d0eab2f40 d8e824a4a9e43440 af59184a9a913b40 0000000000003e40 c502c60248304240 0000000000004840',
+    ('kp_wz', 0.37, 0.0, 6.0): '0000000000000000 8b6ce7fba9f1a23f d55dc910e682af3f 606e10733635ba3f d1d7d39f07ccc53f 44f68162e420d23f ae47e17a14aed73f f7895103a127de3f a266b3bd6314e93f cba12a0cd1dbf43f c49cfb8c1b590140 a4cca5094fdb0c40 0000000000001840',
+    ('kp_xy', 0.6, 0.0, 6.0): '0000000000000000 b81e85eb51b8ae3f 26a4c1b90d58b83f 28ed3cd6914ac33f 3f5f59ff1a93ce3f f7fef425903ad83f 333333333333e33f 330d3228116eee3f 7428cc4b361df83f 87db97dff01b0340 b53e722f34490e40 0000000000001840',
+    ('omega_c_wz', 0.5, 1.0, 25.0): '9a9999999999a93f 2db3457d3dd4b73f c3c117183e2ec63f 4f01970270a5d43f 000000000000e03f 33072641ce37e33f a7f4979b77e3f13f 436bd723aca60040 0864bbd095ff0e40 7146e49e9fda1c40 ea50bf30a3db2a40 0000000000003940',
+}
+
+
+@pytest.mark.parametrize('name, d, lo, hi', GRID_CASES)
+def test_v83_old_points_match_the_v8_code(name, d, lo, hi):
+    """S83-3: sweep_grid and the first points of sweep_grid_n are the bytes of the v8 code (30d8157)."""
+    want = V8_GRID_BITS[(name, d, lo, hi)].split()
+    grid, info = s3.sweep_grid_n(name, d, lo, hi)
+    assert [struct.pack('<d', x).hex() for x in s3.sweep_grid(name, d, lo, hi)] == want
+    assert [struct.pack('<d', x).hex() for x in grid[:len(want)]] == want and len(grid) == len(want) + info['K']
+
+
+@pytest.mark.parametrize('d, K', [
+    (0.3162277664121227, 4),     # r^4 = 9.999999995: at or above 10 (1 - 1e-9) -> K = 4 (no tolerance would give 5)
+    (0.3162277699696851, 5),     # r^4 = 9.99999995: below 10 (1 - 1e-9) -> K = 5 (a tolerance 1e-8 would give 4)
+])
+def test_v83_K_on_both_sides_of_the_tolerance(d, K):
+    """S83-4 (Codex counterexample): PID ki_xy with hi 10, a = d/10, b = 10, r^4 = (100/d)^0.4 near 10."""
+    _, info = s3.sweep_grid_n('ki_xy', d, 0.0, 10.0)
+    assert info['K'] == K and (info['r'] ** 4 >= 10 * (1 - 1e-9)) == (K == 4)
 
 
 @pytest.mark.parametrize('name, d, lo, hi', GRID_CASES)
@@ -1833,6 +1869,15 @@ def test_v83_main_writes_levels_sources_luoi_and_grid_meta(tmp_path, monkeypatch
             for x in rows:
                 assert x['luoi'] == s3.grid_label(float(x['value']), d, info['noi'])
     assert {x['luoi'] for x in sweep if x['factor'].startswith('(')} == {'mac_dinh'}
+    # S83-5: every design value (centre, outer, inner, axial, test) is the decoding of its code with the levels
+    # read back from levels.csv
+    design = list(_csv.DictReader(open(out / 'design.csv', encoding='utf-8')))
+    assert {r['box'] for r in design} == {'centre', 'outer', 'inner', 'axial', 'test'}
+    for r in design:
+        c = r['controller']
+        for k, n in enumerate(s3.FACTORS[c]):
+            L_, H_, sc = float(lv[(c, n)]['L']), float(lv[(c, n)]['H']), lv[(c, n)]['scale']
+            assert r[f'{n}_value'] == repr(s3.decode(float(r[f'X{k + 1}']), L_, H_, sc)), (c, r['point_id'], n)
     assert {r['H_nguon'] for r in lv.values()} == {'hết lưới nối', 'trần ω_o'}
     assert {r['L_nguon'] for r in lv.values()} == {'0', 'hết lưới dưới'}
     meta = (out / 'meta.yaml').read_text(encoding='utf-8')
