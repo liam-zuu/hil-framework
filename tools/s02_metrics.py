@@ -72,6 +72,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from agv_logger import (COLUMNS, MAX_US_PER_SEQ, N_IMU, OLD_LENGTHS, RATE_SLACK_US,  # noqa: E402
                         SEGMENT_COLUMNS, SEGMENT_STATUSES, file_digest, parse_run_end)
 from run_validity import pos_reset_mid, run_bad_fields  # noqa: E402
+import s02_cmd_path  # noqa: E402
 HEADS = [COLUMNS] + [COLUMNS[:n] for n in OLD_LENGTHS]     # 86, 28, 37, 66, 80, 85 columns
 
 R_WHEEL = 0.0485
@@ -117,12 +118,14 @@ def load_log(path):
     data = np.array([[float(x) if x != '' else np.nan for x in r] for r in body])
     log_seq_all = None
     every = {h: data[:, head.index(h)] for h in ('run_active', 'pos_reset_n', 'motor_on') if h in head}
+    all_cols = {h: data[:, i] for i, h in enumerate(head)}       # CODE_S02: before the motor-off filter
     if kind == 'dut':
         log_seq_all = data[:, head.index('log_seq')]
         # 10 Hz lines while the motor is off carry no controller tick: drop them
         data = data[data[:, head.index('motor_on')] == 1]
     log = {h: data[:, i] for i, h in enumerate(head)}
     log['_every'] = every                                        # L37 check on every line (S3C-8)
+    log['_all'] = all_cols                                       # s02_cmd_path: every column, every line
     if kind == 'dut':
         log['_seq_all'] = log_seq_all                            # every line, motor off ones too
         log['_run_end_last'] = run_end_last
@@ -357,8 +360,11 @@ def compute(log, test_id):
     m['missing_pct'], m['missing_tail_known'] = log_loss(log)
     ev = log.get('_every', log)          # every logged line, before the motor-off filter (S3C-8)
     m.update(run_bad_fields(pos_reset_mid(ev.get('run_active'), ev.get('pos_reset_n'), ev.get('motor_on'))))
+    if '_all' in log and test_id in s02_cmd_path.GROUP_A:
+        m.update(s02_cmd_path.stats(log['_all'], test_id, log.get('_platform', ''), log.get('_us_cut'),
+                                   log.get('_prep_s')))     # CODE_S02: t = 0, preparation, command path
 
-    moving = np.flatnonzero(np.any(np.abs(sp) > 1e-9, axis=1))
+    moving =np.flatnonzero(np.any(np.abs(sp) > 1e-9, axis=1))
     t0, t1 = t[moving[0]] + WINDOW_SKIP_S, t[moving[-1]]
     win = (t >= t0) & (t <= t1)
     e = sp[win] - v[win]
@@ -400,19 +406,32 @@ def run_dir_metrics(d, out_name='metrics.csv'):
     for r in runs:
         if r.get('aborted') not in (None, '', '0'):
             continue
+        # s02_plan.py (S2P1-9): a block re-run for the battery and a replaced run are history, not results
+        if (r.get('block_status') or '').strip() == 'battery_rerun' or (r.get('result') or '').strip() == 'replaced':
+            continue
         if r['platform'].strip().lower() == 'hil':
             check_no_udp_taken(os.path.join(d, r['file']) + '.events.txt')
-        m = compute(load_log(os.path.join(d, r['file'])), r['test_id'])
+        log = load_log(os.path.join(d, r['file']))
+        log['_platform'] = r['platform']                       # s02_cmd_path: SIM cold start
+        log['_us_cut'] = s02_cmd_path.us_cut_ticks(os.path.join(d, r['file']) + '.events.txt')   # S2P1-2
+        ps = (r.get('prep_s') or '').strip()
+        log['_prep_s'] = float(ps) if ps else None                                               # S2P1-5
+        m = compute(log, r['test_id'])
         out.append(dict(run_id=r['run_id'], platform=r['platform'], controller=r['controller'],
                         test_id=r['test_id'], speed_mps=r['speed_mps'], rep=r['rep'], **m))
     keys = []
     for o in out:
         keys += [k for k in o if k not in keys]
-    fmt = lambda x: f'{x:.6g}' if isinstance(x, float) else x   # noqa: E731
+    def fmt(k, x):
+        # S2P1-13 (Codex round 1): a timestamp in us (t0_us, anchor_*_us, edge_us, sim_t0_err_us) keeps every
+        # digit (6 significant digits lose tens of ms after hours of uptime)
+        if isinstance(x, (float, np.floating)) and k.endswith('_us'):
+            return f'{x:.0f}' if math.isfinite(x) else 'nan'
+        return f'{x:.6g}' if isinstance(x, (float, np.floating)) else x
     with open(os.path.join(d, out_name), 'w', newline='') as f:
         wr = csv.DictWriter(f, fieldnames=keys)
         wr.writeheader()
-        wr.writerows({k: fmt(o.get(k, '')) for k in keys} for o in out)
+        wr.writerows({k: fmt(k, o.get(k, '')) for k in keys} for o in out)
     return out
 
 
