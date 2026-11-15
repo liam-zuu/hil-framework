@@ -88,6 +88,8 @@ increase on every line after the edge (CP5-1); enclosing span >= nominal exactly
 window_from_wall_clock, a known limit (CP5-3); sender '#test_interrupted' or complete != 1 -> sender_incomplete.
 Round 6 (15/11): epochs as exact decimals, span compared in whole ms (CP6-1); '#test_interrupted' checked
 before the missing '#test_end' case (CP6-2).
+Round 7 (15/11; Liam 15/11 CODE_CAM "Chay vong 7"): the span kept as an exact Decimal and compared
+without rounding (CP7-1); a t_epoch that is not a finite number is a ValueError, exit 2 (CP7-2).
 B8-1c (CODE 15/11, O1 v11.23 3.5; Liam 15/11 CODE_CAM "Lam B8-1c roi vong 4 gop (Recommended)"): window end
 from the real send times (--sender, B81c-1); a pair whose tick or timestamp_us does not increase is no
 evidence for (2), (4) (B81c-7).
@@ -103,7 +105,7 @@ from __future__ import annotations
 
 import argparse
 import csv
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 import json
 import math
 import os
@@ -379,8 +381,15 @@ def read_sender_bao(path, task_id):
             raise ValueError(f'{path}: {len(ls)} different {kind[:-1]} lines of {task_id}')
         if not ls or _kv(ls[0]).get('t_epoch', '') == '':
             return None
-        got[kind] = Decimal(_kv(ls[0])['t_epoch'])       # exact decimal: no binary rounding (CP6-1)
-    return float(got['#test_end,'] - got['#test_start,'])
+        txt = _kv(ls[0])['t_epoch']
+        try:
+            d = Decimal(txt)                             # exact decimal: no binary rounding (CP6-1)
+        except InvalidOperation:
+            raise ValueError(f'{path}: {kind[:-1]} t_epoch {txt!r} is not a number') from None   # CP7-2
+        if not d.is_finite():
+            raise ValueError(f'{path}: {kind[:-1]} t_epoch {txt!r} is not finite')
+        got[kind] = d
+    return got['#test_end,'] - got['#test_start,']      # Decimal, exact (CP7-1)
 
 
 def read_sender_complete(path, task_id):
@@ -419,6 +428,10 @@ def analyse(rows, task, events=(), has_age_col=True, sched=None, bao_s=None, sen
     #   (a clock step) is no evidence. Both present: the enclosing span must not be shorter than the
     #   schedule span (the two ways must agree), else no evidence.
     nominal = (task.n_sched - 1) * T_SEND
+    # the enclosing span is compared EXACTLY (Decimal, no rounding: CP7-1); a float bao_s (tests) is taken
+    # at its shortest decimal form
+    bao_dec = None if bao_s is None else (bao_s if isinstance(bao_s, Decimal) else Decimal(repr(float(bao_s))))
+    bao_s = None if bao_dec is None else float(bao_dec)
     win_src, win_ok, span_s = None, False, nominal                     # nominal: report only
     if sched is not None:
         win_src, win_ok, span_s = 'sched', True, sched[1] - sched[0]
@@ -428,8 +441,8 @@ def analyse(rows, task, events=(), has_age_col=True, sched=None, bao_s=None, sen
                                 f'schedule send span {span_s:.3f} s: (2), (3), (4) no evidence')
     elif bao_s is not None:
         win_src, span_s = 'test_end', bao_s
-        # both on the Pi: no clock-rate term (CP5-2); compared in whole ms, the epochs have 3 decimals (CP6-1)
-        win_ok = int(round(bao_s * 1000)) >= (task.n_sched - 1) * (1000 // SEND_HZ)
+        # both on the Pi: no clock-rate term (CP5-2); exact decimal compare (CP6-1, CP7-1)
+        win_ok = bao_dec >= Decimal(task.n_sched - 1) / Decimal(SEND_HZ)
         if not win_ok:
             res['flags'].append(f'test_end_span_short: #test_start -> #test_end {bao_s:.3f} s shorter than the '
                                 f'nominal schedule {nominal:.3f} s (wall clock step?): (2), (3), (4) no evidence')

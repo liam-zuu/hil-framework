@@ -7,6 +7,8 @@ import math
 import os
 import sys
 
+from decimal import Decimal
+
 import numpy as np
 import pytest
 
@@ -531,14 +533,14 @@ def test_K1_enclosing_window_to_test_end(tmp_path):
 
 
 def test_K1_read_sender_bao(tmp_path):
-    assert cp.read_sender_bao(sender_log(tmp_path), 'O1-F05') == pytest.approx(19.0)
+    assert cp.read_sender_bao(sender_log(tmp_path), 'O1-F05') == Decimal('19.000')
     assert cp.read_sender_bao(sender_log(tmp_path, name='k.txt'), 'O1-F08') is None
     old = tmp_path / 'c6.txt'                           # C6 10/11 sender log, no sched fields
     old.write_text('#test_start,test=O1-F05,t_epoch=1794322935.904,iso=2026-11-10T22:02:15,duration_s=13.6518,'
                    'send_hz=50,dst=192.168.1.69:5010\n'
                    '#test_end,test=O1-F05,t_epoch=1794322949.749,sent=683,planned=683,complete=1\n', encoding='utf-8')
     assert cp.read_sender(str(old), 'O1-F05') is None
-    assert cp.read_sender_bao(str(old), 'O1-F05') == pytest.approx(13.845, abs=1e-6)
+    assert cp.read_sender_bao(str(old), 'O1-F05') == Decimal('13.845')
     no_start = tmp_path / 'ns.txt'
     no_start.write_text('#test_end,test=O1-F05,t_epoch=5.0,complete=1\n', encoding='utf-8')
     assert cp.read_sender_bao(str(no_start), 'O1-F05') is None
@@ -737,3 +739,34 @@ def test_CP6_2_interrupt_without_test_end(tmp_path):
     assert cp.read_sender_complete(str(f), 'O1-F05') == (False, '#test_interrupted')
     res = run(tmp_path, make_log(), sender_ok=cp.read_sender_complete(str(f), 'O1-F05'))
     assert any(x.startswith('sender_incomplete') for x in res['flags'])
+
+
+
+# ---------------------------------------------------------------- Codex Sol round 7 (CP7-1, CP7-2)
+def _sender(path, e0, e1):
+    path.write_text(f'#test_start,test=O1-F05,t_epoch={e0}\n#test_end,test=O1-F05,t_epoch={e1},complete=1\n',
+                    encoding='utf-8')
+    return str(path)
+
+
+def test_CP7_1_sub_ms_short_span_is_not_rounded_up(tmp_path):
+    rows = make_log()
+    f = _sender(tmp_path / 's.txt', '1000.000', '1013.6396')       # 0.4 ms short of 13.640 s
+    res = run(tmp_path, rows, sched=None, bao=cp.read_sender_bao(f, 'O1-F05'))
+    assert any(x.startswith('test_end_span_short') for x in res['flags'])
+    p = write(tmp_path, rows, name='c.csv')
+    assert cp.main(['--log', p, '--task', 'O1-F05', '--sender', f]) == 1
+    g = _sender(tmp_path / 'g.txt', '1000.000', '1013.6400001')      # just above: accepted
+    (tmp_path / 'g').mkdir()
+    res = run(tmp_path / 'g', rows, sched=None, bao=cp.read_sender_bao(g, 'O1-F05'))
+    assert not any(x.startswith('test_end_span_short') for x in res['flags'])
+
+
+def test_CP7_2_epoch_not_a_number_is_exit_2(tmp_path, capsys):
+    p = write(tmp_path, make_log())
+    for name, e0 in (('abc', 'abc'), ('nan', 'NaN'), ('inf', 'Infinity')):
+        f = _sender(tmp_path / f'{name}.txt', e0, '1013.640')
+        with pytest.raises(ValueError):
+            cp.read_sender_bao(f, 'O1-F05')
+        assert cp.main(['--log', p, '--task', 'O1-F05', '--sender', f]) == 2, name
+        assert capsys.readouterr().out.rstrip().endswith('#ket_qua,ma=2'), name
