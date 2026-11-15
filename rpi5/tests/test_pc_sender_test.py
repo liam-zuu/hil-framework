@@ -86,6 +86,65 @@ def test_send_times_of_the_first_and_last_schedule_packets():
     assert len(kv['sched_first_s'].split('.')[1]) == 6
 
 
+class StillClock:
+    """Time moves only by sleep() and by what a test adds; reading it costs nothing (SS1-3)."""
+    def __init__(self, t0=1000.0):
+        self.t = t0
+
+    def __call__(self):
+        return self.t
+
+    def sleep(self, d):
+        self.t += max(d, 0.0)
+
+
+def test_first_send_time_is_read_after_sendto():
+    """sendto of packet 0 takes 50 ms: sched_first_s must be 0.050000 exactly (read after the send, SS1-3)."""
+    sock, clk, lines = FakeSock(), StillClock(), []
+    real_send = sock.sendto
+
+    def send(p, a):
+        if not sock.sent:
+            clk.t += 0.05
+        real_send(p, a)
+    sock.sendto = send
+    ps.test_loop('10.0.0.2', 'A-K1', sock=sock, clock=clk, sleep=clk.sleep, out=lines.append)
+    kv = dict(p.split('=', 1) for p in lines[-1].split(',')[1:])
+    assert kv['sched_first_s'] == '0.050000'
+
+
+def test_one_packet_schedule_has_one_send_time(monkeypatch):
+    """n_total = 1: both fields are the same reading (SS1-1); n_total = 0: both empty."""
+    for n_total, want_equal in ((1, True), (0, None)):
+        monkeypatch.setattr(ps, 'test_schedule', lambda tid, allow=False: (0.02, lambda t: (0.1, 0.0, 0.0)))
+        monkeypatch.setattr(ps, 'grid_counts', lambda tid, d, n=n_total: (n, 2))
+        sock, clk, lines = FakeSock(), FakeClock(cost=0.0003), []
+        ps.test_loop('10.0.0.2', 'X', sock=sock, clock=clk, sleep=clk.sleep, out=lines.append)
+        kv = dict(p.split('=', 1) for p in lines[-1].split(',')[1:])
+        if want_equal:
+            assert kv['sched_first_s'] != '' and kv['sched_first_s'] == kv['sched_last_s']
+        else:
+            assert kv['sched_first_s'] == '' and kv['sched_last_s'] == ''
+
+
+def test_interrupt_in_the_zero_tail_keeps_both_send_times():
+    sock, clk, lines = FakeSock(), FakeClock(), []
+    real_send = sock.sendto
+    n_plan = int(round(GROUP_A['A-K1'].duration * ps.SEND_HZ))
+    hit = []
+
+    def send(p, a):
+        if len(sock.sent) == n_plan + 3 and not hit:
+            hit.append(1)
+            raise KeyboardInterrupt
+        real_send(p, a)
+    sock.sendto = send
+    ps.test_loop('10.0.0.2', 'A-K1', sock=sock, clock=clk, sleep=clk.sleep, out=lines.append)
+    kv = dict(p.split('=', 1) for p in lines[-1].split(',')[1:])
+    assert '#test_interrupted' in lines and kv['complete'] == '1'
+    assert kv['sched_first_s'] != '' and kv['sched_last_s'] != ''
+
+
 def test_late_sender_shows_in_the_last_send_time():
     """A sender stalled 0.3 s just before the last schedule packet: sched_last_s is the real (late) time,
     not the grid time; a stall mid schedule is caught up by the absolute grid (burst) and does not show."""

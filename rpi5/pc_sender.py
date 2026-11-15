@@ -133,10 +133,12 @@ def test_loop(ip: str, test_id: str, sock=None, clock=time.monotonic, sleep=time
             at(k)
             vx, vy, wz = f(k / SEND_HZ)
             sock.sendto(pack_packet(vx, vy, wz), (ip, TRAJ_PORT))
-            if k == 0:
-                sched_first = clock() - t0
-            if k == n_total - 1:
-                sched_last = clock() - t0
+            if k == 0 or k == n_total - 1:
+                t_sent = clock() - t0                  # one reading per packet (SS1-1: one packet, one time)
+                if k == 0:
+                    sched_first = t_sent
+                if k == n_total - 1:
+                    sched_last = t_sent
             n += 1
         for k in range(n_total, n_total + n_zero):
             at(k)
