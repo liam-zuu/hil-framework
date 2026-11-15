@@ -117,7 +117,7 @@ def test_link_stats_and_timestamp_prefix():
     # S25: bounded by the lines just before link up and just after the final link lost
     assert st['bounded_start'] and st['bounded_end'] and st['expected_end_loss'] == 1
     assert st['applied'] == 40000 and st['skipped'] == 0 and st['err'] == 0 and st['age_max_us_since_boot'] == 420
-    assert st['lost'] == 1 and st['rearm'] == 1 and ser.link_fails(st) == []
+    assert st['lost'] == 1 and st['rearm_bounded'] == 1 and st['rearm'] == 0 and ser.link_fails(st) == []
     assert st['link_periods'] == [dict(frames=40001, h7_ms=40256, pi_ms=40000)]
 
 
@@ -192,3 +192,33 @@ def test_t10_no_pc_time_leaves_segment_empty(tmp_path):
 def test_t10_schedule_without_heavy(tmp_path):
     code, s, _ = t10_with_schedule(tmp_path, heavy=None)
     assert code == 0 and 'heavy' not in s['segments'] and s['segments'] == {}
+
+
+
+def _rearm_log(mid_rearm=3, bump=None):
+    """make_log with the H7 rearm counter as on the bench (buổi thử S06/2026-11-15_run01_thu T2): the Link line
+    before link up and the one after the final loss show the link down with rearms counted while down; the
+    in-run 'Link: up' lines show `mid_rearm`, from line `bump` on `mid_rearm + 1` (one rearm inside the run)."""
+    lines = make_log()
+    idx = [i for i, l in enumerate(lines) if 'Link: ' in l]
+    for n, i in enumerate(idx):
+        pre, _, _ = lines[i].partition('Link: ')
+        if n == 0:
+            lines[i] = pre + 'Link: down lost=0  SPI frames=0/s err=0 rearm=0 last_err=0x0'
+        elif n == len(idx) - 1:
+            lines[i] = pre + f'Link: down lost=1  SPI frames=0/s err=0 rearm={mid_rearm + 3} last_err=0x0'
+        else:
+            r = mid_rearm + (1 if bump is not None and n >= bump else 0)     # cumulative counter
+            lines[i] = pre + f'Link: up lost=0  SPI frames=1000/s err=0 rearm={r} last_err=0x0'
+    return lines
+
+
+def test_rearm_counted_inside_the_run_only():
+    """Liam 15/11, CODE_S06 "Rearm đếm trong lượt (Recommended)": rearms while the link is down before link up
+    and after the final loss are not faults; a rearm between two in-run 'Link: up' lines is."""
+    ev = ser.parse_lines(_rearm_log())
+    st = ser.link_stats(ev, ser.run_span(ev))
+    assert st['rearm'] == 0 and st['rearm_bounded'] == 6 and st['lost'] == 1 and ser.link_fails(st) == []
+    ev = ser.parse_lines(_rearm_log(bump=3))
+    st = ser.link_stats(ev, ser.run_span(ev))
+    assert st['rearm'] == 1 and any('rearm tăng 1' in f for f in ser.link_fails(st))
