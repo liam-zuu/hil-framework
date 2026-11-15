@@ -26,7 +26,10 @@ end t_w1 = t_w0 + (sched_last_s - sched_first_s) x (1 + E_MAX) + T_SEND, the REA
 first and last schedule packets on the Pi monotonic clock, from the '#test_end' line of the sender log
 (fields sched_first_s, sched_last_s; O1 v11.23 3.5 B81c-1, the sender may be late then send in a
 burst; Liam 15/11 CODE_CAM "Tinh tu canh len (Recommended)", format agreed with CODE 15/11). No such
-time (no sender log, field empty or absent): (2), (3), (4) no evidence (sched_times_missing).
+time: the ENCLOSING window of O1 v11.24 3.5 (K-1) to '#test_end', t_w1 = t_w0 + (t_epoch #test_end -
+t_epoch #test_start) x (1 + E_MAX) + T_SEND (Liam 15/11 "Tu canh len + gio #test_end"), refused when
+shorter than the nominal schedule (wall clock step). Neither: (2), (3), (4) no evidence
+(sched_times_missing).
 E_MAX = 2002e-6 the Pi/ESP32 clock-rate bound of S05 4.7 (i),
 T_SEND = one send period. The sender has no packet before packet 0 (pc_sender.test_loop) and the
 firmware stamps a packet with its RECEIVE time (main.c 5bde4c5 88) and runs only while a packet is
@@ -75,6 +78,11 @@ with traj_age_ms < 0 is a flag. Found on the real CAR_LIFTED 14/11 logs, same ro
 carry the agv_logger time prefix (read_events); pre_edge_packet from a 200 ms lag. Round 3 (15/11;
 Liam 15/11 CODE_CAM "Sua hep + vong 4 (Recommended)"): '#run_end' bounds the '#us_end' of the run; the lag
 is an interval (age read after timestamp_us, floored to ms), across 200 ms -> pre_edge_packet_undecided.
+Round 4 (15/11; Liam 15/11 CODE_CAM "Sua + Codex vong 5"): the open upper bound (lag_hi == 200 ms is below
+200 ms); tick/timestamp increase checked to the end of the motor-on run; L <= 0 is not an anchor.
+K-1 (CODE 15/11, O1 v11.24 3.5; Liam 15/11 CODE_CAM "Tu canh len + gio #test_end (Recommended)", "Gop K-1
+vao vong 5"): no sched times -> the enclosing window to #test_end (t_epoch span), checked against the
+nominal schedule; both present -> they must agree.
 B8-1c (CODE 15/11, O1 v11.23 3.5; Liam 15/11 CODE_CAM "Lam B8-1c roi vong 4 gop (Recommended)"): window end
 from the real send times (--sender, B81c-1); a pair whose tick or timestamp_us does not increase is no
 evidence for (2), (4) (B81c-7).
@@ -350,7 +358,28 @@ def read_sender(path, task_id):
     return a, b
 
 
-def analyse(rows, task, events=(), has_age_col=True, sched=None):
+def read_sender_bao(path, task_id):
+    """t_epoch(#test_end) - t_epoch(#test_start) of task_id in the sender log [s], or None (K-1, O1 v11.24
+    3.5: the enclosing window ends at '#test_end' when the log has no send time of the last schedule
+    packet; pc_sender test_loop prints '#test_start' before packet 0 and '#test_end' after the zero tail).
+    Two different lines of either kind: error."""
+    if not path or not os.path.exists(path):
+        return None
+    ev = read_events(path)
+    got = {}
+    for kind in ('#test_start,', '#test_end,'):
+        ls = list(dict.fromkeys(e for e in ev if e.startswith(kind) and _kv(e).get('test') == task_id))
+        if len(ls) > 1:
+            raise ValueError(f'{path}: {len(ls)} different {kind[:-1]} lines of {task_id}')
+        if not ls or _kv(ls[0]).get('t_epoch', '') == '':
+            return None
+        got[kind] = float(_kv(ls[0])['t_epoch'])
+    return got['#test_end,'] - got['#test_start,']
+
+
+def analyse(rows, task, events=(), has_age_col=True, sched=None, bao_s=None):
+    """sched: (sched_first_s, sched_last_s) of the sender (B81c-1); bao_s: #test_start -> #test_end epoch
+    span of the sender (K-1), used when sched is None."""
     res = dict(task=task.id, v_cmd_max=task.v, n_sched=task.n_sched, flags=[], notes=[])
     edge, later, probs = find_edge(rows)
     res['flags'] += probs
@@ -359,14 +388,33 @@ def analyse(rows, task, events=(), has_age_col=True, sched=None):
         return res
     e = rows[edge]
     t0 = e['_t']
-    win_ok = sched is not None
-    span_s = (sched[1] - sched[0]) if win_ok else (task.n_sched - 1) * T_SEND     # nominal: report only
+    # Window end (Liam 14/11 Q1 "Tu canh len"; 15/11 "Tinh tu canh len", "Tu canh len + gio #test_end"):
+    #   sched present: edge + (sched_last_s - sched_first_s) x (1 + E_MAX) + T_SEND (last schedule packet);
+    #   else the ENCLOSING window of O1 v11.24 3.5 (K-1): edge + (t_epoch end - t_epoch start) x (1 + E_MAX)
+    #   + T_SEND. The epoch is the Pi wall clock (time.time): a span shorter than the nominal schedule
+    #   (a clock step) is no evidence. Both present: the enclosing span must not be shorter than the
+    #   schedule span (the two ways must agree), else no evidence.
+    nominal = (task.n_sched - 1) * T_SEND
+    win_src, win_ok, span_s = None, False, nominal                     # nominal: report only
+    if sched is not None:
+        win_src, win_ok, span_s = 'sched', True, sched[1] - sched[0]
+        if bao_s is not None and bao_s < span_s:
+            win_ok = False
+            res['flags'].append(f'window_mismatch: #test_start -> #test_end {bao_s:.3f} s shorter than the '
+                                f'schedule send span {span_s:.3f} s: (2), (3), (4) no evidence')
+    elif bao_s is not None:
+        win_src, span_s = 'test_end', bao_s
+        win_ok = bao_s >= nominal * (1 - E_MAX)
+        if not win_ok:
+            res['flags'].append(f'test_end_span_short: #test_start -> #test_end {bao_s:.3f} s shorter than the '
+                                f'nominal schedule {nominal:.3f} s (wall clock step?): (2), (3), (4) no evidence')
     t_w1 = t0 + int(round((span_s * (1 + E_MAX) + T_SEND) * 1e6))
     res.update(edge_seq=e['_seq'], t_w0_us=t0, t_w1_us=t_w1, edge_traj_age_ms=e['_age'],
-               sched_send_span_s=span_s if win_ok else None)
-    if not win_ok:
-        res['flags'].append('sched_times_missing: no real send time of the last schedule packet '
-                            '(sender #test_end sched_first_s, sched_last_s): (2), (3), (4) no evidence')
+               sched_send_span_s=(sched[1] - sched[0]) if sched is not None else None,
+               test_end_span_s=bao_s, window_source=win_src)
+    if win_src is None:
+        res['flags'].append('sched_times_missing: no send time of the last schedule packet and no '
+                            '#test_start/#test_end epoch in the sender log: (2), (3), (4) no evidence')
     has_age = has_age_col
     if not has_age_col:
         res['flags'].append('no_traj_age_column: (3) and the packet-before-edge check no evidence '
@@ -418,7 +466,7 @@ def analyse(rows, task, events=(), has_age_col=True, sched=None):
         span = f'{lag_lo:.1f}-{lag_hi:.1f} ms ({len(pe)} lines before the edge, 0 <= traj_age_ms < {TRAJ_TIMEOUT_MS})'
         if lag_lo >= TRAJ_TIMEOUT_MS:
             res['flags'].append(f'pre_edge_packet: a fresh packet received {span} before the edge')
-        elif lag_hi >= TRAJ_TIMEOUT_MS:
+        elif lag_hi > TRAJ_TIMEOUT_MS:                  # upper bound is open (CP4-1)
             res['flags'].append(f'pre_edge_packet_undecided: first packet {span} before the edge, '
                                 f'across {TRAJ_TIMEOUT_MS} ms')
         else:
@@ -466,8 +514,15 @@ def analyse(rows, task, events=(), has_age_col=True, sched=None):
     res['n_anchor'] = len(stretch)
 
     # a pair whose tick or timestamp_us does not increase (counter reset, vel_ctrl.c 5bde4c5 23) has no
-    # bound: (2), (4) no evidence (O1 v11.23 3.5, B81c-7)
-    nonincr = [[a['_seq'], b['_seq']] for a, b in zip(stretch[:-1], stretch[1:])
+    # bound: (2), (4) no evidence (O1 v11.23 3.5, B81c-7). Checked on every line from the edge to the end
+    # of the motor-on run, not only up to the end anchor: the end anchor is chosen by time, so a line
+    # coming back inside the window after it would be hidden (CP4-2, Codex round 4). timestamp_us is
+    # esp_timer_get_time() (main.c 399-412) and never decreases in a sound log
+    mo_hi = edge
+    while mo_hi + 1 < len(rows) and rows[mo_hi + 1]['_mo']:
+        mo_hi += 1
+    run_rows = rows[edge:max(mo_hi, edge + len(stretch) - 1) + 1]
+    nonincr = [[a['_seq'], b['_seq']] for a, b in zip(run_rows[:-1], run_rows[1:])
                if b['_tick'] <= a['_tick'] or b['_t'] <= a['_t']]
     if nonincr:
         res['flags'].append(f'pair_not_increasing: tick or timestamp_us does not increase at log_seq pairs '
@@ -533,7 +588,8 @@ def analyse(rows, task, events=(), has_age_col=True, sched=None):
 
         def L_of(r):
             nx = by_seq.get(r['_seq'] + 1)
-            return (nx['_t'] - r['_t']) if (nx is not None and nx['_mo']) else None
+            ok = nx is not None and nx['_mo'] and nx['_t'] > r['_t']      # L <= 0 is no bound (CP4-2)
+            return (nx['_t'] - r['_t']) if ok else None
 
         mo_end = end
         while mo_end + 1 < len(rows) and rows[mo_end + 1]['_mo']:
@@ -589,7 +645,7 @@ def main(argv=None):
         task = Task(a.task, a.allow_final_set)
         rows, ev_in, dup, has_age = read_log(a.log)
         ev = ev_in + read_events(a.events or (a.log + '.events.txt'))
-        res = analyse(rows, task, ev, has_age, read_sender(a.sender, a.task))
+        res = analyse(rows, task, ev, has_age, read_sender(a.sender, a.task), read_sender_bao(a.sender, a.task))
         res.update(log=os.path.basename(a.log), n_lines=len(rows), n_duplicates=dup,
                    thresholds='not locked before C8 (O1 3.5): values reported only')
         if a.json:

@@ -112,12 +112,12 @@ def sender_log(tmp_path, task_id='O1-F05', sched='nominal', name='run_sender.txt
     return str(p)
 
 
-def run(tmp_path, rows, task='O1-F05', events='auto', cols=COLS, sched='nominal', **kw):
+def run(tmp_path, rows, task='O1-F05', events='auto', cols=COLS, sched='nominal', bao=None, **kw):
     p = write(tmp_path, rows, events=events, cols=cols)
     t = cp.Task(task, kw.get('allow_final_set', False))
     rr, ev, dup, has_age = cp.read_log(p)
     return cp.analyse(rr, t, ev + cp.read_events(p + '.events.txt'), has_age,
-                      nominal_sched(t) if sched == 'nominal' else sched)
+                      nominal_sched(t) if sched == 'nominal' else sched, bao)
 
 
 def test_clean_run_has_no_flag_and_small_values(tmp_path):
@@ -458,10 +458,14 @@ def test_pre_edge_packet_lag_interval_and_200_ms(tmp_path):
     rows = make_log()
     edge = next(r['log_seq'] for r in rows if r['run_active'] == 1)
     t0 = next(r['timestamp_us'] for r in rows if r['log_seq'] == edge)
-    # line edge-1 put exactly 10 ms before the edge: for line edge-2 the lower bound is 10 ms + a
-    base = [dict(r, timestamp_us=t0 - 10000) if r['log_seq'] == edge - 1 else r for r in rows]
+    # lines edge-1, edge-2 put exactly 10, 20 ms before the edge: for line edge-2 the interval is
+    # [10 ms + a, 21 ms + a)
+    base = [dict(r, timestamp_us=t0 - 10000) if r['log_seq'] == edge - 1 else
+            dict(r, timestamp_us=t0 - 20000) if r['log_seq'] == edge - 2 else r for r in rows]
     for age, want, sub in ((190, 'pre_edge_packet:', 'a'),            # lower bound exactly 200 ms
                            (189, 'pre_edge_packet_undecided', 'b'),   # 199 ms .. above 200 ms
+                           (180, 'pre_edge_packet_undecided', 'd'),   # 190 .. 201 ms
+                           (179, None, 'e'),                          # 189 .. 200 ms: open bound, below (CP4-1)
                            (150, None, 'c')):
         (tmp_path / sub).mkdir()
         res = run(tmp_path / sub, [dict(r, traj_age_ms=age) if r['log_seq'] == edge - 2 else r for r in base])
@@ -472,6 +476,91 @@ def test_pre_edge_packet_lag_interval_and_200_ms(tmp_path):
             assert got == [] and any(n.startswith('pre_edge_packet_lag') for n in res['notes'])
         else:
             assert len(got) == 1 and got[0].startswith(want), (age, got)
+
+
+def test_CP4_3_lag_interval_from_analyse_holds_the_true_receive_time(tmp_path):
+    # the line before the edge is 10 ms before it; its age is read at t_ref (main.c 532-540), floored:
+    # the two extremes of the firmware timing must stay inside the interval analyse reports
+    rows = make_log()
+    edge = next(r['log_seq'] for r in rows if r['run_active'] == 1)
+    t0 = next(r['timestamp_us'] for r in rows if r['log_seq'] == edge)
+    t_line = t0 - 10000
+    cases = (('hi', t_line, t_line - 150999),                  # age read at the tick start, true = D + a + 0.999
+             ('lo', t_line + 9999, t_line + 9999 - 150000))    # age read just before the next tick, true ~ lower
+    for sub, t_ref, t_rx in cases:
+        a = (t_ref - t_rx) // 1000
+        true = (t0 - t_rx) / 1e3
+        lines = [dict(r, timestamp_us=t_line, traj_age_ms=a) if r['log_seq'] == edge - 1 else r for r in rows]
+        (tmp_path / sub).mkdir()
+        res = run(tmp_path / sub, lines)
+        assert res['pre_edge_packet_lag_lo_ms'] <= true < res['pre_edge_packet_lag_hi_ms'], (sub, true, res)
+
+
+def test_CP4_3_window_uses_the_send_time_difference(tmp_path):
+    rows = make_log()
+    t = cp.Task('O1-F05')
+    a, b = nominal_sched(t)
+    r0 = run(tmp_path, rows, sched=(a, b))
+    (tmp_path / 's').mkdir()
+    r2 = run(tmp_path / 's', rows, sched=(a + 2.0, b + 2.0))          # same span, later start
+    assert r2['t_w1_us'] == r0['t_w1_us'] and r2['sched_send_span_s'] == pytest.approx(b - a)
+
+
+def test_K1_enclosing_window_to_test_end(tmp_path):
+    # no send time of the last schedule packet: the window runs to #test_end (O1 v11.24 3.5, K-1)
+    rows = make_log()
+    t = cp.Task('O1-F05')
+    nominal = (t.n_sched - 1) / 50
+    n_zero = int(math.ceil((t.duration + cp.o1_tasks.O1_TAIL_S) * 50 - 1e-9)) - t.n_sched
+    bao = nominal + n_zero / 50 + 0.05                  # #test_start before packet 0, #test_end after the tail
+    res = run(tmp_path, rows, sched=None, bao=bao)
+    assert res['window_source'] == 'test_end' and res['flags'] == [], res['flags']
+    assert res['t_w1_us'] - res['t_w0_us'] == round((bao * (1 + cp.E_MAX) + cp.T_SEND) * 1e6)
+    (tmp_path / 'x').mkdir()
+    sch = run(tmp_path / 'x', rows)
+    assert res['t_w1_us'] > sch['t_w1_us']              # the enclosing window holds the schedule window
+    for sub, sched, b, flag in (('short', None, nominal - 0.5, 'test_end_span_short'),
+                                ('mismatch', nominal_sched(t), nominal - 0.5, 'window_mismatch')):
+        (tmp_path / sub).mkdir()
+        r = run(tmp_path / sub, rows, sched=sched, bao=b)
+        assert any(f.startswith(flag) for f in r['flags']), (sub, r['flags'])
+        assert r['cond2'].get('no_evidence') and r['cond3'].get('no_evidence') and r['cond4'].get('no_evidence')
+    (tmp_path / 'both').mkdir()                          # both present and agreeing: the schedule window
+    r = run(tmp_path / 'both', rows, sched=nominal_sched(t), bao=bao)
+    assert r['window_source'] == 'sched' and r['flags'] == [] and r['t_w1_us'] == sch['t_w1_us']
+
+
+def test_K1_read_sender_bao(tmp_path):
+    assert cp.read_sender_bao(sender_log(tmp_path), 'O1-F05') == pytest.approx(19.0)
+    assert cp.read_sender_bao(sender_log(tmp_path, name='k.txt'), 'O1-F08') is None
+    old = tmp_path / 'c6.txt'                           # C6 10/11 sender log, no sched fields
+    old.write_text('#test_start,test=O1-F05,t_epoch=1794322935.904,iso=2026-11-10T22:02:15,duration_s=13.6518,'
+                   'send_hz=50,dst=192.168.1.69:5010\n'
+                   '#test_end,test=O1-F05,t_epoch=1794322949.749,sent=683,planned=683,complete=1\n', encoding='utf-8')
+    assert cp.read_sender(str(old), 'O1-F05') is None
+    assert cp.read_sender_bao(str(old), 'O1-F05') == pytest.approx(13.845, abs=1e-6)
+    no_start = tmp_path / 'ns.txt'
+    no_start.write_text('#test_end,test=O1-F05,t_epoch=5.0,complete=1\n', encoding='utf-8')
+    assert cp.read_sender_bao(str(no_start), 'O1-F05') is None
+    two = tmp_path / 'two.txt'
+    two.write_text('#test_start,test=O1-F05,t_epoch=1.0\n#test_end,test=O1-F05,t_epoch=15.0\n'
+                   '#test_end,test=O1-F05,t_epoch=16.0\n', encoding='utf-8')
+    with pytest.raises(ValueError):
+        cp.read_sender_bao(str(two), 'O1-F05')
+
+
+def test_CP4_2_timestamp_going_back_with_the_tick_increasing(tmp_path):
+    rows = make_log()
+    edge = next(r['log_seq'] for r in rows if r['run_active'] == 1)
+    by = {r['log_seq']: r for r in rows}
+    clean = run(tmp_path, rows)
+    end = next(r['log_seq'] for r in rows if r['timestamp_us'] >= clean['t_w1_us'])
+    for sub, seq, t_new in (('mid', edge + 100, by[edge + 99]['timestamp_us'] - 5000),    # inside the window
+                            ('end', end + 1, by[end]['timestamp_us'] - 10000)):           # after the end anchor
+        (tmp_path / sub).mkdir()
+        res = run(tmp_path / sub, [dict(r, timestamp_us=t_new) if r['log_seq'] == seq else r for r in rows])
+        assert any(f.startswith('pair_not_increasing') for f in res['flags']), sub
+        assert res['cond2'].get('no_evidence') and res['cond4'].get('no_evidence'), sub
 
 
 def test_pre_edge_lag_interval_holds_the_true_receive_time():
