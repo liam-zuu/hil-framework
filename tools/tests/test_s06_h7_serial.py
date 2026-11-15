@@ -499,3 +499,79 @@ def test_codex_r3_2_idle_lower_plus_isr_over_window_is_rejected():
     assert w['idle_bad'] == 'idle_lo + isr_us > window' and w['load_upper_pct'] is None
     assert any('số rảnh' in p for p in s['data_lost']) and s['complete'] is False
     assert all(x['load_upper_pct'] is None or x['load_upper_pct'] >= x['isr_pct'] for x in win)
+
+
+# ── round 6: H7 prints wn (window number) and t0_ms (window start tick) (Liam 15/11, CODE_S06 'H7 in so cua so') ──
+
+def wn_log(t_up=12345, h7_ms=33000, t0s=(5000, 15000, 25000, 35000), drop=(), after_lost=(), pi_ms=None,
+           first_idle=None):
+    """H7 ticks: link up at t_up (first frame), last frame at t_up + h7_ms; one header per window start in t0s
+    (wn = index + 1, win 10000 ms, printed at window end), `drop` = wn whose block is lost on the PC, `after_lost`
+    = wn printed after the 'SPI link lost' line. PC time = H7 tick here."""
+    def blk(wn, t0):
+        lines = t10_block().splitlines()
+        if wn == 2 and first_idle:
+            lines[0] = lines[0].replace('idle_pass=900000 idle_us_est=4000000', first_idle)
+        lines[0] = lines[0] + f' wn={wn} t0_ms={t0}'
+        return [(t0 + 10000 + 1, l) for l in lines]
+    t_last = t_up + h7_ms
+    out = [(0, link()), (0, frame(0)), (t_up, f'SPI link up at t={t_up} ms'),
+           (t_up, 'S06log: pushed=1 dropped=0  print_drop=0')]
+    late = []
+    for k, t0 in enumerate(t0s, 1):
+        if k in drop:
+            continue
+        (late if k in after_lost else out).extend(blk(k, t0))
+    n = h7_ms + 1
+    out += [(t_last, 'S06log: pushed=99 dropped=0  print_drop=0'),
+            (t_last + 50, 'SPI link lost (no frame for 50 ms): encoders stopped, SPI1 restart'),
+            (t_last + 50, f'Link period: {n} frames, H7 {h7_ms} ms from first to last frame '
+                          f'(Pi: {n - 1 if pi_ms is None else pi_ms} ms at 1 kHz)')]
+    out += late + [(t_last + 500, link(lost=1, rearm=1)), (t_last + 500, frame(n))]
+    return [f'{int(1e9 + t * 1000)}\t{l}' for t, l in out]
+
+
+def test_wn_clean_run_keeps_the_full_windows():
+    s, win = _run_summary(wn_log())
+    assert s['complete'] is True, s['problems']
+    assert [w['line'] for w in win] and s['windows'] == 3                 # 15-25, 25-35, 35-45 s; 5-15 s partial
+
+
+def test_wn_lost_partial_and_first_full_window_is_data_lost():
+    """Codex rounds 3-5 R3-1 with H7 numbers: the window holding link up (wn 1) and the first full one (wn 2, load
+    100 %) both lost on the PC: the first kept window starts 12.7 s after link up: data lost, no PC times or
+    SPI1 counts needed (29ef85b ignored wn/t0_ms and kept dropping 'the first header')."""
+    s, win = _run_summary(wn_log(drop=(1, 2)))
+    assert any('cửa sổ T10 trọn đầu tiên bắt đầu 12655 ms' in p for p in s['data_lost']), s['problems']
+    assert s['windows'] == 2
+
+
+def test_wn_gap_and_last_window_lost():
+    s, _ = _run_summary(wn_log(drop=(3,)))
+    assert any('số cửa sổ T10 nhảy 2 → 4' in p for p in s['data_lost'])
+    s, _ = _run_summary(wn_log(drop=(4,)))                              # last full window, no header after it
+    assert any('mất khối cuối' in p for p in s['data_lost']), s['problems']
+
+
+def test_wn_header_printed_after_link_lost_still_counts():
+    s, _ = _run_summary(wn_log(after_lost=(4,)))
+    assert s['complete'] is True and s['windows'] == 3, s['problems']
+
+
+def test_wn_ambiguous_first_window_and_bad_link_period():
+    # window 1 (4999 .. 15050, 10051 ms, header lost) holds link up at 5000: the first full one starts 10050 ms
+    # after link up, inside (10000; 10100]: not decided (missing), not data lost
+    s, _ = _run_summary(wn_log(t_up=5000, t0s=(4999, 15050, 25050, 35050), drop=(1,), h7_ms=40100))
+    assert s['data_lost'] == [] and any('không phân biệt được mất khối đầu' in m for m in s['missing'])
+    s, _ = _run_summary(wn_log(pi_ms=12))                                # Codex round 5: pi_ms != frames - 1
+    assert any('Link period hỏng' in m for m in s['missing'])
+
+
+def test_link_period_of_a_later_segment_not_used():
+    """Codex round 5: the Link period line of a later link segment (its link up lost) must not stand for the run."""
+    lines = wn_log()
+    i = next(k for k, l in enumerate(lines) if 'Link period' in l)
+    later = lines[i]
+    lines = lines[:i] + [lines[i].split('\t')[0] + '\tSPI link up at t=99999 ms'] + [later] + lines[i + 1:]
+    s, _ = _run_summary(lines)
+    assert any('không có dòng Link period ngay sau lượt' in m for m in s['missing']), s['problems']
