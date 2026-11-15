@@ -76,6 +76,18 @@ hil_o1_score.py, or of the camera scorer with the same keys) and <results_dir>/<
   e_trk_max                          e_trk_max
   tv_duty                            tv_duty_esp32() above (NOT the scorer's tv_duty_h7_1khz)
   flag                               HIL: track_err_frames > 0; camera: n_back_frames > 0
+t_end on the ESP32 clock (S05 4.7 (i), RS-4; Liam 14/11 CODE_RS4 local_c3031475, Q4 "Giữ công thức, ghi sai
+lệch (Recommended)"; design 03_CODE/docs/2026-11-14_Thiet_ke_RS4_so_phien_MOSI_v1.md section 10): the window
+end stays t = 0 + t_end on the ESP32 log; each HIL run reports the estimated error of that end,
+  t_end_err_ms = t_end x (|esp_pi_ppm| + ESP_PPM_NOISE + |pi_period_ppm|) x 1e-3
+esp_pi_ppm: the ESP32 / Pi rate estimate of the run (score edge_map, from the logger WiFi packets);
+pi_period_ppm: the Pi step period against the nominal 1 ms (score key if present, else PI_PERIOD_PPM_BOUND);
+no esp_pi_ppm (or not finite): the whole sum in brackets is ESP_PI_PRIOR_PPM = 2000 ppm, the ESP32 / Pi bound
+built from the two assumed ranges of the mapper (ESP32 / H7 and H7 / Pi, 1000 ppm each), i.e. 2 x t_end ms
+(24 ms at 12 s), an assumed bound, not a measurement (S05 v3.20 4.7 (i), B81-13; Liam 14/11 THESIS_B8 "duyệt
+cả"); a pi_period_ppm that is not finite counts as missing. Report only; the line choice is unchanged. Car runs:
+the camera clock goes to the ESP32 through C7b, not here (column empty, 'xe: C7b').
+
 Each cell (controller x condition x platform x gain set): n_valid, n_dat / n_khong_dat / n_chua_ket_luan,
 n_flag, n_cat_t1 (runs khong_dat by the exception before t1, O1 3.5 R2V-4; R134C4-6), and per quantity median and max over the valid runs that have a number, n_m, and the reason of
 every valid run without a number. The quantity list is fixed here (do not change after seeing numbers).
@@ -97,6 +109,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import statistics
 import sys
@@ -115,6 +128,34 @@ GAIN_SETS = ('khoi_dau', 'A', 'B')
 CONTROLLERS = ('PID', 'LADRC')
 QUANTITIES = ('e_perp_max', 'e_theta_lane_max_deg', 'e_theta_cmd_max_deg', 'e_s_absmax', 'e_trk_max', 'tv_duty')
 VALID = ('dat', 'khong_dat', 'chua_ket_luan')
+# t_end error (S05 4.7 (i), Liam 14/11 CODE_RS4 Q4)
+ESP_PPM_NOISE = 50.0               # spread of the per-run esp_pi_ppm estimate (13/11: 12 runs -52..+31 ppm)
+PI_PERIOD_PPM_BOUND = 100.0        # [DE XUAT] when the score has no pi_period_ppm (run14: -12 / -12 / -13 ppm)
+ESP_PI_PRIOR_PPM = 2000.0          # S05 v3.20 4.7 (i): ESP32/H7 1000 (RHO_MAX_PPM, L100) + H7/Pi 1000, no esp_pi_ppm
+
+
+def _finite(v):
+    try:
+        return v is not None and math.isfinite(float(v))
+    except (TypeError, ValueError, OverflowError):               # OverflowError: an int too big for a float
+        return False
+
+
+def t_end_err_ms(t_end_s, esp_pi_ppm=None, pi_period_ppm=None):
+    """Estimated error (ms) of t = 0 + t_end on the ESP32 log of a HIL run (module docstring), and its source.
+    t_end not finite or < 0, or a result that is not finite: no number (Codex B8C-R1-6)."""
+    if not _finite(t_end_s) or float(t_end_s) < 0:
+        return None, 'khong co t_end'
+    t = float(t_end_s)
+    if not _finite(esp_pi_ppm):
+        v, src = t * (ESP_PI_PRIOR_PPM * 1e-3), f'khong co esp_pi_ppm: can {ESP_PI_PRIOR_PPM:g} ppm (gia dinh)'
+    else:
+        if not _finite(pi_period_ppm):
+            pi_period_ppm = None
+        pi = PI_PERIOD_PPM_BOUND if pi_period_ppm is None else abs(float(pi_period_ppm))
+        src = 'esp_pi_ppm + nhieu + ' + ('can Pi' if pi_period_ppm is None else 'pi_period_ppm')
+        v = t * ((abs(float(esp_pi_ppm)) + ESP_PPM_NOISE + pi) * 1e-3)
+    return (v, src) if math.isfinite(v) else (None, 'khong co so huu han')
 
 
 # ---------------------------------------------------------------- tv_duty
@@ -458,6 +499,12 @@ def load_runs(dataset, score_name, esp32_name, query_before_name='gain_query_bef
             run['flag'] = (int(score.get('track_err_frames') or 0) > 0 if plat[1] == 'HIL'
                            else int(score.get('n_back_frames') or 0) > 0)
             run['tv_check'] = tv
+            if plat[1] == 'HIL':
+                em = score.get('edge_map') or {}
+                run['t_end_err_ms'], run['t_end_err_src'] = t_end_err_ms(
+                    score.get('t_end'), em.get('esp_pi_ppm'), score.get('pi_period_ppm'))
+            else:
+                run['t_end_err_ms'], run['t_end_err_src'] = None, 'xe: C7b'
         runs.append(run)
     if bad:
         raise ValueError('luot da phan ma thieu bang chung bat buoc (luot hong do thao tac, sua log hay chay lai): '
@@ -644,8 +691,8 @@ def write_table(runs, out_dir):
     with open(os.path.join(out_dir, 'S05_final_table.md'), 'w', encoding='utf-8') as f:
         f.write(markdown(table))
     rcols = ['run_uid', 'platform', 'controller', 'condition', 'gain_set', 'outcome', 'flag'] + list(QUANTITIES) + \
-            ['tv_reason', 'tv_d_tick', 'tv_d_seq', 'tv_end_gap_ms', 'tv_rows_dropped', 'results_dir',
-             'gain_set_id', 'gain_file', 'gain_sha256']
+            ['tv_reason', 'tv_d_tick', 'tv_d_seq', 'tv_end_gap_ms', 'tv_rows_dropped', 't_end_err_ms', 't_end_err_src',
+             'results_dir', 'gain_set_id', 'gain_file', 'gain_sha256']
     with open(os.path.join(out_dir, 'S05_final_runs.csv'), 'w', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=rcols)
         w.writeheader()
@@ -657,6 +704,8 @@ def write_table(runs, out_dir):
                             flag=r.get('flag', ''), **{q: ('' if v.get(q) is None else v[q]) for q in QUANTITIES},
                             tv_reason=tv.get('reason', ''), tv_d_tick=tv.get('d_tick', ''), tv_d_seq=tv.get('d_seq', ''),
                             tv_end_gap_ms=tv.get('end_gap_ms', ''), tv_rows_dropped=tv.get('rows_dropped', ''),
+                            t_end_err_ms='' if r.get('t_end_err_ms') is None else r['t_end_err_ms'],
+                            t_end_err_src=r.get('t_end_err_src', ''),
                             results_dir=r['results_dir'], gain_set_id=r.get('gain_set_id', ''),
                             gain_file=r.get('gain_file', ''), gain_sha256=r.get('gain_sha256', '')))
     used = sorted({(r.get('gain_set_id', '').split('/')[0] if r.get('gain_source') == '--init-gain'

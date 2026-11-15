@@ -12,8 +12,12 @@ not a thesis number.
 
 Reads <run>.csv, <run>.csv.summary.json and <run>.csv.events.txt (agv_logger outputs). Checks:
   fw       every '#fw' line: sha = --expect-sha (prefix either way), dirty=0, env = --expect-env
-  logger   summary closed, one segment, no seq hole / duplicate / conflict / reordered line,
-           one '#run_end' group with no footer and no tail line missing, log_qdrop unchanged
+  logger   summary closed, one segment, no seq hole / conflict / reordered line,
+           one '#run_end' group with no footer and no tail line missing, log_qdrop unchanged.
+           An identical UDP duplicate (same log_seq, same text; 'duplicate' in <log>.segments.csv) is
+           dropped before the other checks and recorded, not a failure (Liam 12/11 CODE local_b80a58a2
+           "Cho sửa", after CLOSED_LOOP/2026-11-12_run01, run03); duplicates that cannot be dropped
+           (no segment file) still fail
   motor    motor_on rises once and falls once, the fall after the last non-zero setpoint
   imu      imu_init = 0 on every line; wz_src = 1 on >= 99 % of motor-on lines from T_settle
            after the rise
@@ -68,6 +72,33 @@ class InputError(Exception):
     pass
 
 
+def drop_duplicates(path, rows):
+    """UDP duplicate (Liam 12/11, CODE local_b80a58a2, "Cho sửa"): agv_logger keeps every line as received and
+    marks in <log>.segments.csv a line it already holds with the same text as 'duplicate'. Drop those, as
+    tools/s02_metrics.py does, after checking each one equals an earlier kept line. Returns (rows, n_dropped);
+    n_dropped None without a segment file (nothing can be dropped then)."""
+    seg_path = path + '.segments.csv'
+    if not os.path.isfile(seg_path):
+        return rows, None
+    with open(seg_path, newline='', encoding='utf-8') as f:
+        marks = list(csv.DictReader(f))
+    if len(marks) != len(rows):
+        raise InputError(f'{seg_path}: {len(marks)} rows for {len(rows)} data lines')
+    keep, seen, n = [], set(), 0
+    for i, (r, m) in enumerate(zip(rows, marks), start=1):
+        if m.get('row') != str(i) or m.get('log_seq') != r.get('log_seq'):
+            raise InputError(f'{seg_path} row {i} does not match CSV data line {i}')
+        key = tuple(r.items())
+        if m.get('status') == 'duplicate':
+            if key not in seen:
+                raise InputError(f'{seg_path} row {i}: marked duplicate but no earlier equal line')
+            n += 1
+            continue
+        seen.add(key)
+        keep.append(r)
+    return keep, n
+
+
 def load(path):
     if not os.path.isfile(path):
         raise InputError(f'no log {path}')
@@ -75,6 +106,7 @@ def load(path):
         rows = list(csv.DictReader(f))
     if not rows:
         raise InputError(f'{path}: no data line')
+    rows, n_dup = drop_duplicates(path, rows)
     def col(c):
         if c not in rows[0]:
             raise InputError(f'{path}: no column {c}')
@@ -83,7 +115,9 @@ def load(path):
     events = path + '.events.txt'
     if not os.path.isfile(summ) or not os.path.isfile(events):
         raise InputError(f'{path}: summary or events file missing')
-    return col, json.load(open(summ, encoding='utf-8')), open(events, encoding='utf-8').read().splitlines()
+    summary = json.load(open(summ, encoding='utf-8'))
+    summary['_dup_dropped'] = n_dup        # read by the logger check (not a logger field)
+    return col, summary, open(events, encoding='utf-8').read().splitlines()
 
 
 def expected_holds(test_id):
@@ -136,8 +170,15 @@ def check(col, summ, events, test_id, expect_sha, expect_env, t_settle=T_SETTLE_
         probs.append(f"status {summ.get('status')}")
     if len(segs) != 1:
         probs.append(f'{len(segs)} segments')
+    # an identical UDP copy carries nothing new: dropped and recorded, not a failure, when every copy the
+    # logger counted was found and dropped through the segment file (Liam 12/11 "Cho sửa")
+    dropped = summ.get('_dup_dropped')
+    n_dup = sum(s.get('duplicates', 0) for s in segs)
+    if n_dup and dropped != n_dup:
+        probs.append(f'duplicates {n_dup}' + (' (no segment file to drop them)' if dropped is None
+                                              else f', dropped {dropped}'))
     for s in segs:
-        for k in ('seq_holes', 'duplicates', 'conflicts', 'reordered'):
+        for k in ('seq_holes', 'conflicts', 'reordered'):
             if s.get(k, 0):
                 probs.append(f'{k} {s[k]}')
         g = s.get('run_end_groups', [])
@@ -149,7 +190,8 @@ def check(col, summ, events, test_id, expect_sha, expect_env, t_settle=T_SETTLE_
         qd = s.get('counters', {}).get('log_qdrop')
         if qd and qd[0] != qd[-1]:
             probs.append(f'log_qdrop {qd}')
-    add('logger', not probs, '; '.join(probs) or f"1 segment, {segs[0].get('data_lines') if segs else 0} lines, no hole")
+    add('logger', not probs, '; '.join(probs) or f"1 segment, {segs[0].get('data_lines') if segs else 0} lines, no hole"
+        + (f', {n_dup} identical UDP duplicate(s) dropped' if n_dup else ''))
 
     t = (col('timestamp_us') - col('timestamp_us')[0]) / 1e6
     motor = col('motor_on')

@@ -1,5 +1,6 @@
 /* spi1_handler.c — SPI1 slave DMA handler (RPi5 ↔ H7)
- * Frame: 40 bytes full-duplex (v3 — trajectory reference + IMU values)
+ * Frame: 48 bytes full-duplex (MOSI v4 / MISO v6, RS-4 P1 14/11/2026: v3 plus
+ * run_id + frame_no in MOSI 40-47, copied back in MISO 40-47; hil_protocol.h)
  * Re-arm inside HAL_SPI_TxRxCpltCallback — safe on H7 HAL.
  *
  * Frame consistency (29/10, S06 #3 and Codex #23 on the HIL data flow):
@@ -78,6 +79,10 @@ static uint32_t          _n_rearms;
 static uint32_t          _n_stuck;
 static uint32_t          _stuck_err;
 static uint32_t          _n_restart_fail;
+/* RS-4 P1: SPI1_Callback run time (written in the callback, taken with
+ * interrupts masked by SPI1_TakeCallbackCycles) */
+static uint32_t          _cb_min_cyc = 0xFFFFFFFFu;
+static uint32_t          _cb_max_cyc;
 static uint32_t          _n_reply_over;   /* L100: staged replies replaced before the DMA took them */
 static uint32_t          _svc_min_cyc = 0xFFFFFFFFu;
 static uint32_t          _svc_max_cyc;
@@ -156,6 +161,7 @@ static void _encode(uint8_t *buf, const SPI1_MisoInfo_t *info)
         s06_put32(&buf[HIL_MISO_RX_CYC], info->rx_cyc);
         s06_put16(&buf[HIL_MISO_RX_NF], (uint16_t)info->rx_nf);
         s06_put16(&buf[HIL_MISO_AGE], info->apply);   /* v5 apply window (L100) */
+        memcpy(&buf[HIL_MISO_ID], info->id, HIL_MOSI_ID_LEN);   /* v6 (RS-4 P1) */
     }
     buf[HIL_MISO_STATUS] = _output.status;
     buf[HIL_MISO_SEQ]    = _output.seq;
@@ -331,6 +337,9 @@ void SPI1_Callback(SPI_HandleTypeDef *hspi)
     _n_frames++;
     if (_frame_ready) _n_unread++;
     _frame_ready = 1;
+    uint32_t dt = DWT->CYCCNT - cyc;   /* RS-4 P1: callback run time ("Frm6:" line) */
+    if (dt < _cb_min_cyc) _cb_min_cyc = dt;
+    if (dt > _cb_max_cyc) _cb_max_cyc = dt;
 }
 
 void SPI1_ErrorCallback(SPI_HandleTypeDef *hspi)
@@ -410,6 +419,18 @@ void SPI1_TakeServiceCycles(uint32_t *min_cyc, uint32_t *max_cyc)
     *max_cyc = _svc_max_cyc;
     _svc_min_cyc = 0xFFFFFFFFu;
     _svc_max_cyc = 0u;
+}
+
+void SPI1_TakeCallbackCycles(uint32_t *min_cyc, uint32_t *max_cyc)
+{
+    /* written by the frame callback: copy and reset with interrupts masked */
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    *min_cyc = (_cb_min_cyc == 0xFFFFFFFFu) ? 0u : _cb_min_cyc;
+    *max_cyc = _cb_max_cyc;
+    _cb_min_cyc = 0xFFFFFFFFu;
+    _cb_max_cyc = 0u;
+    __set_PRIMASK(primask);
 }
 
 uint32_t SPI1_GetFrameCount(void)

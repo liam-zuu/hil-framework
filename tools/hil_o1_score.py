@@ -40,7 +40,9 @@ O1 v11.9 3.5). The mapping (L98, L99) brackets the edge from the encoder counts 
 (AGV firmware in FW_COUNTS_AT_TICK; others refused) and the H7 apply times read from the MISO answers; the PWM
 side is a cross-check.
 Validity (CODE L50, STATUS_CODE CG4) is NOT decided here: the manifest counts (MISO CRC bad,
-empty frames) are copied out; the run rule is tools/s06_frames_decode.py on the same log.
+empty frames) are copied out; the run rule is tools/s06_frames_decode.py on the same log. One exception
+(O1 v11.15 3.5, B81-15; Liam 14/11 THESIS_B8 "duyệt cả", "Giữ U_p = 0, ghi giới hạn"): a plant state field that
+is NaN / inf, or x, y at the +-5 m encoding bound, is a HIL tool error and the run is refused here (tool_error, exit 2).
 
   python tools/hil_o1_score.py --frame-log <run>.npz --task O1-F05 [--esp-log <run>.csv] [--out score.json]
   (K1, K2 need --allow-final-set: O1 3.7, final test set only)
@@ -115,12 +117,41 @@ def log_coverage(out, t_log_end, period):
     return out
 
 
-def score(path, task, allow_final_set=False, esp_log=None):
+def tool_error(manifest, mosi, allow_pre_b81_15=False):
+    """O1 v11.15 3.5 (B81-15): a plant state field that is NaN / inf, or x, y at the +-5 m encoding bound, is a
+    HIL tool error (the run is redone), refused here (ValueError, exit 2). The evidence is the Pi's check before
+    encoding (manifest key state_out_of_range, rpi5/protocol.state_out_of_range): with the key, only the key
+    decides (a position within 76 um of the bound rounds to +-32767 without reaching it, Codex B8C-R1-3).
+    Without the key (a log from before the check) the MOSI cannot show a NaN / inf of omega, theta or v (they
+    land on in-range codes), so the run is refused as not enough evidence (B8C-R1-4), unless allow_pre_b81_15
+    (development logs only, --pre-b81-15): then x or y at +-32767 still refuses. Returns how the check was made.
+    U_p = U_psi = 0 on HIL (v11.15); theta is wrapped to [-pi, pi) by the plant (B81-8)."""
+    if 'state_out_of_range' in manifest:
+        bad = manifest['state_out_of_range']
+        if bad:
+            raise ValueError(f'HIL tool error (O1 3.5): plant state field {bad.get("field")} = {bad.get("value")} '
+                             f'at step {bad.get("step")} not finite or position at the +-5 m bound: run to be redone')
+        return 'manifest'
+    if not allow_pre_b81_15:
+        raise ValueError('frame log without state_out_of_range (before the B81-15 check on the Pi): not enough '
+                         'evidence that the plant state was finite and inside the encoding range (O1 3.5); '
+                         '--pre-b81-15 scores a development log anyway')
+    raw = np.abs(_int16(mosi, 0, 10).astype(np.int64))[:, list(P.POS_INDEX)]
+    hit = np.argwhere(raw >= 32767)
+    if len(hit):
+        k, i = int(hit[0][0]), P.POS_INDEX[int(hit[0][1])]
+        raise ValueError(f'HIL tool error (O1 3.5): MOSI state field {i} at the int16 bound at frame {k} (a clamp, '
+                         'NaN or inf of the position): run to be redone')
+    return 'pre_b81_15: x, y codes only (development log)'
+
+
+def score(path, task, allow_final_set=False, esp_log=None, allow_pre_b81_15=False):
     if task not in FIG8 and task not in FINAL_SET:
         raise ValueError(f'task {task!r}: one of {tuple(FIG8) + FINAL_SET}')
     if task in FINAL_SET and not allow_final_set:
         raise ValueError(f'{task} is the final test set (O1 3.7): only with --allow-final-set')
     manifest, mosi, miso = load(path)
+    b81_15 = tool_error(manifest, mosi, allow_pre_b81_15)
     state, ref, flags, duty = decode_frames(mosi, miso)
     k_run, run_src = command_start(manifest, ref, flags)
     period = float(manifest.get('period_us', 1000)) * 1e-6
@@ -149,7 +180,8 @@ def score(path, task, allow_final_set=False, esp_log=None):
         out, _, frames = o1_gate_eval.evaluate_k(log, task)
     out['tv_duty_h7_1khz'] = out.pop('tv_duty')                          # not the S05 4.7 tv_duty (docstring)
     log_coverage(out, float(log['t'][-1]) if len(log['t']) else -1.0, period)
-    # gate v3.2 (o1_gate.py): true plant state, so U_p = U_psi = 0
+    # gate v3.2 (o1_gate.py): U_p = U_psi = 0 on HIL (O1 v11.15 3.5: the int16 MOSI quantisation, <= 0.11 mm and
+    # 4.8e-5 rad, is a stated limit, not added to U; Liam 14/11 THESIS_B8 "Giữ U_p = 0, ghi giới hạn")
     if task in FIG8:
         v_max, wz_max = o1_gate.fig8_cmd_max(Schedule(FIG8[task]))
     else:
@@ -162,7 +194,7 @@ def score(path, task, allow_final_set=False, esp_log=None):
                start_pose=[float(v) for v in state[k0, 4:7]], plant=manifest.get('plant'),
                plant_src=manifest.get('plant_src'), imu_noise=manifest.get('imu_noise'),
                lifecycle_outcome=(manifest.get('lifecycle') or {}).get('outcome'),
-               miso_crc_bad=mc.get('crc_bad'), miso_empty=mc.get('empty'),
+               miso_crc_bad=mc.get('crc_bad'), miso_empty=mc.get('empty'), b81_15_check=b81_15,
                validity='see tools/s06_frames_decode.py (L50)',
                rule='S05 v3.7 4.6: evaluate_v7, S03 section 4; gate v3.2: o1_gate_eval + o1_gate')
     return out
@@ -189,9 +221,11 @@ def main(argv=None) -> int:
     ap.add_argument('--allow-final-set', action='store_true')
     ap.add_argument('--esp-log', default='', help='agv_logger CSV of the run: t = 0 at the run_active edge (RS-4)')
     ap.add_argument('--out', default='')
+    ap.add_argument('--pre-b81-15', action='store_true',
+                    help='score a frame log from before the Pi plant-state check (development only, O1 3.5)')
     a = ap.parse_args(argv)
     try:
-        out = _json_safe(score(a.frame_log, a.task, a.allow_final_set, a.esp_log or None))
+        out = _json_safe(score(a.frame_log, a.task, a.allow_final_set, a.esp_log or None, a.pre_b81_15))
     except (ValueError, KeyError, OSError) as exc:
         print('hil_o1_score:', exc, file=sys.stderr)
         print('#ket_qua,ma=2')

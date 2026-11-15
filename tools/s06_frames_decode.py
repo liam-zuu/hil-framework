@@ -60,7 +60,8 @@ import numpy as np
 
 import s06_stream as stm
 
-FRAME = 40
+FRAME = 40          # end of the S06 log payload (MISO 25-39); frames are 40 bytes, or 48 since RS-4 P1 (MOSI v4 /
+                    # MISO v6: bytes 40-47 run_id + frame_no; the CRCs cover the whole frame either way)
 MOSI_SEQ, MOSI_IMU_SEQ = 21, 39
 MOSI_IMU_BYTES = list(range(22, 24)) + list(range(31, 39))      # gz, ax, ay, az, yaw (HIL_Imu_t.raw)
 MISO_CRC, MISO_MOSI_CRC, MISO_RX_CYC, MISO_STATUS, MISO_SEQ, MISO_RX_NF, MISO_AGE, MISO_LOG = \
@@ -815,8 +816,8 @@ def swa_summary(mosi, miso, settle: int = SWA_SETTLE_FRAMES) -> dict:
       per command change (until the next change): follow lag = first status equal to the new command from
         the answer lag (2 frames) on; none seen: `unobserved` when the command held for at most `settle`
         frames (end of log, or changed again), else `unfollowed`."""
-    mosi = np.asarray(mosi, dtype=np.uint8).reshape(-1, 40)
-    miso = np.asarray(miso, dtype=np.uint8).reshape(-1, 40)
+    mosi = np.atleast_2d(np.asarray(mosi, dtype=np.uint8))     # (n, 40) or (n, 48) (RS-4 P1): rows as logged
+    miso = np.atleast_2d(np.asarray(miso, dtype=np.uint8))
     n = len(mosi)
     cmd = ((mosi[:, 20] >> 3) & 1).astype(np.int16)
     ok = np.array([bool(m.any()) and crc16(bytes(m[:MISO_CRC]) + bytes(m[MISO_CRC + 2:])) == u16(m, MISO_CRC)

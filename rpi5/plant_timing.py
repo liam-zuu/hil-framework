@@ -8,15 +8,20 @@ Times, under the same scheduling as the plant loop (SCHED_FIFO 90, core 0):
                (IMU sample, state reorder, encode_state, decode_torques)
   traction_muM plant_step() with ground_model 'traction' (method A as implemented,
                mu_hd = M, sub-steps from the stability bound)
-  frame_log    the per-frame writes of run_hil.py --frame-log (hil_node.py: t_send + 40 B MOSI
-               + 40 B MISO into preallocated arrays, inside the step before t_done): extra
+  frame_log    the per-frame writes of run_hil.py --frame-log (hil_node.py: t_send, t_recv + 48 B MOSI
+               + 48 B MISO into preallocated arrays, inside the step before t_done; 40 B and no
+               t_recv before RS-4 P1, RPI5_TIMING/2026-11-03_run01): extra
                load of S06 T1/T2 runs that log frames (S06, Liam 30/10)
+  fault_idle   L82: fault_schedule.FramePatcher.patch outside every window (with a delay row,
+               so the ring write of every step is counted)
+  fault_all4   L82: the same with enc_loss (2 wheels), imu_loss, imu_delay and gyro_scale all on
+  mosi_true_log L82: the extra FRAME_SIZE-byte write of the true frame into the frame log (--faults)
   slipA_nsubN  THROWAWAY timing prototype of a minimal slip model (method A):
                body with its own dynamics, traction per wheel capped by mu*N,
                N sub-steps per 1 ms. Only for timing: parameters are guesses,
                the model is not validated and is not used anywhere else.
-Budget reference (estimates in hil_node.py, not measured): SPI 40 bytes at
-1 MHz ~320 us + GPIO pulse ~10 us, period 1000 us.
+Budget reference (estimates in hil_node.py, not measured): SPI 48 bytes at
+1 MHz ~384 us (40 bytes ~320 us before RS-4 P1) + GPIO pulse ~10 us, period 1000 us.
 
 Usage (on the Pi, nothing else running; does not touch SPI/GPIO, so the H7 can
 stay connected):
@@ -37,7 +42,7 @@ import numpy as np
 
 from params import MecanumParams
 from plant_step import plant_step, motor_torque
-from protocol import encode_state, decode_torques
+from protocol import encode_state, decode_torques, FRAME_SIZE, state_out_of_range
 from hil_node import plant_to_frame_state
 from imu_model import imu_from_plant
 from timing import set_realtime, pin_cpu
@@ -115,7 +120,9 @@ def main() -> int:
         imu = imu_from_plant(s, state['prev'], 0.001, p.g)
         state['prev'] = s
         state['seq'] = state['seq'] % 255 + 1
-        frame = encode_state(plant_to_frame_state(list(s)), traj_ref=(0.1, 0.0, 0.2), traj_flags=0,
+        fs = plant_to_frame_state(list(s))
+        state_out_of_range(fs)                     # B81-15: the check hil_node.py runs every tick
+        frame = encode_state(fs, traj_ref=(0.1, 0.0, 0.2), traj_flags=0,
                              seq=state['seq'], imu=imu, imu_seq=state['seq'])
         decode_torques(frame)
 
@@ -126,19 +133,55 @@ def main() -> int:
         pt.mu_hd = np.full(4, mu)
         variants.append((f'traction_mu{mu}', lambda pt=pt: plant_step(x, u, pt, 0.001, rng)))
     nlog = 1 << 16
-    flog = {'t_send_ns': np.zeros(nlog, dtype=np.int64), 'mosi': np.zeros((nlog, 40), dtype=np.uint8),
-            'miso': np.zeros((nlog, 40), dtype=np.uint8)}
-    mosi_b, miso_b = bytearray(40), bytearray(40)
+    # RS-4 P1: FRAME_SIZE bytes (48) and t_recv_ns, as HILNode._tick writes them now (40 bytes, no t_recv before)
+    flog = {'t_send_ns': np.zeros(nlog, dtype=np.int64), 't_recv_ns': np.zeros(nlog, dtype=np.int64),
+            'mosi': np.zeros((nlog, FRAME_SIZE), dtype=np.uint8),
+            'miso': np.zeros((nlog, FRAME_SIZE), dtype=np.uint8)}
+    mosi_b, miso_b = bytearray(FRAME_SIZE), bytearray(FRAME_SIZE)
     flog_k = [0]
 
     def frame_log():
-        # same three writes as HILNode._tick with --frame-log
+        # same writes as HILNode._tick with --frame-log
         k = flog_k[0] = (flog_k[0] + 1) % nlog
         flog['t_send_ns'][k] = time.monotonic_ns()
+        flog['t_recv_ns'][k] = time.monotonic_ns()
         flog['mosi'][k] = memoryview(bytes(mosi_b))
         flog['miso'][k] = memoryview(bytes(miso_b))
 
     variants.append(('frame_log', frame_log))
+    # L82 fault injection: FramePatcher.patch outside every window (one delay row: the ring write runs every
+    # step) and with all four faults on; the extra mosi_true write of the frame log
+    import fault_schedule as fsch
+    frame0 = encode_state(plant_to_frame_state(list(x)), imu=(0.5, 0.1, 0.2, 9.8, 0.3), imu_seq=1, seq=1)
+    head = fsch.MAGIC + '\nid,fault,target,start_ms,end_ms,params\n'
+
+    def patcher(body):
+        rows = fsch.parse(head + body)
+        fsch.check(rows, 1 << 30, 'plant')
+        pa = fsch.FramePatcher(fsch.Schedule(tuple(rows)))
+        pa.start(0)
+        return pa
+    idle = patcher(f'D1,imu_delay,imu,{1 << 29},{(1 << 29) + 1},d_ms=100\n')
+    busy = patcher(f'E1,enc_loss,FL+RR,0,{1 << 29},\nL1,imu_loss,imu,0,{1 << 29},\n'
+                   f'D1,imu_delay,imu,100,{1 << 29},d_ms=100\nS1,gyro_scale,gz,0,{1 << 29},s=0.3\n')
+    step_i, step_b = [0], [0]
+    for k in range(200):                                   # past d: the delay reads the ring
+        busy.patch(k, frame0)
+    step_b[0] = 200
+
+    def fault_idle():
+        step_i[0] += 1
+        idle.patch(step_i[0], frame0)
+
+    def fault_all4():
+        step_b[0] += 1
+        busy.patch(step_b[0], frame0)
+
+    def mosi_true_log():
+        k = flog_k[0]
+        flog['mosi'][k] = memoryview(frame0)
+
+    variants += [('fault_idle', fault_idle), ('fault_all4', fault_all4), ('mosi_true_log', mosi_true_log)]
     Minv = np.diag([1.0 / p.M, 1.0 / p.M, 1.0 / p.Iz])
     stepA = _slip_a_step(p, Minv, np.full(4, p.J_w), p.M * p.g / 4.0, 0.8, 5.0)
     v0, w0 = np.zeros(3), np.full(4, 5.0)

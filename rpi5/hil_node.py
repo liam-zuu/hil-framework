@@ -12,9 +12,10 @@ Responsibility:
 
 Real-time requirements:
   - Must complete each tick in < 1 ms (1 ms period)
-  - Typical work: GPIO pulse (~10 μs) + SPI 40 bytes (320 μs at 1 MHz,
-    72 μs at 4 MHz) + spidev overhead + plant (~50 μs)
-  - Total ≈ 400 μs at 1 MHz → still inside 1 ms; raise spi_speed_hz to
+  - Typical work: GPIO pulse (~10 μs) + SPI 48 bytes (384 μs at 1 MHz, 96 μs at 4 MHz; 40 bytes and
+    320 μs before RS-4 P1) + spidev overhead + plant (~50 μs) [estimates; the transfer time of a run is in
+    the frame log manifest, xfer_us]
+  - Total ≈ 460 μs at 1 MHz → still inside 1 ms; raise spi_speed_hz to
     2–4 MHz after the link is validated to regain margin
 
 CPU allocation:
@@ -38,7 +39,7 @@ from timing import PrecisionTimer, set_realtime, pin_cpu, lock_memory
 from gpio_sync import GPIOSync
 from spi_master import SPIMaster
 from protocol import (encode_state, decode_torques, TRAJ_VALID, TRAJ_NEW, OFS_MISO_SEQ, CMD_SWA_ON,
-                      miso_check, MISO_OK, MISO_EMPTY)
+                      miso_check, MISO_OK, MISO_EMPTY, FRAME_SIZE, new_run_id, miso_id, state_out_of_range)
 from plant_interface import PlantInterface, MockPlant
 from mecanum_plant import MecanumPlant
 from imu_model import imu_from_plant
@@ -64,6 +65,13 @@ END_TAIL_MS = 30
 # carry the reply staged in the previous link period (as s06_frames_decode `start_leftover`, L50: "không
 # tính frame rỗng ở đầu log trước câu trả lời đầu tiên (j < 2)")
 MISO_SKIP_FRAMES = 2
+# RS-4 P1 (MOSI v4 / MISO v6, 48 bytes; Liam 14/11 CODE_RS4 "Làm P1, 48 byte"): on the real link, if none of
+# the first ID_CHECK_FRAMES MISO (transfers 1..50) is a good-CRC reply carrying this run's run_id and a frame_no
+# already sent (< the transfer's step) in bytes 40-47, the H7 is not a v6 build (or the frame length differs):
+# the run stops (stop_reason 'h7_not_miso_v6'). A run that ends before a confirmation fails too (manifest
+# id_confirmed False; Codex RS4-R10-2, Liam 14/11 CODE_RS4 "Sửa hẹp + vòng 11"). The H7 answers frame N in N + 2.
+# Simulate mode confirms on the run_id alone (the echo and FakeH7 send no CRC) and never fails on it.
+ID_CHECK_FRAMES = 50
 
 log =logging.getLogger('hil.node')
 
@@ -119,6 +127,9 @@ class HILConfig:
     # load_schedule = 'path sha256' of the schedule file, kept in the run manifest
     heavy_block:       Optional[tuple] = None
     load_schedule:     str   = ''
+    # Fault injection batch 1 (L82): fault_schedule.Schedule (loaded and checked), None = no injection,
+    # the loop as before. Needs frame_log (the true frames are the record), excludes heavy_block
+    faults:            Optional[object] = None
     # --finite-run: phases of run_lifecycle.py; None = the loop as before
     lifecycle:         Optional[LifecycleConfig] = None
     # I8: SWA command bit (MOSI byte 20 bit 3), see SWA_MODES. Default 'off': a node
@@ -186,6 +197,17 @@ class HILNode:
             raise ValueError(f'swa_mode {self.cfg.swa_mode!r} not in {SWA_MODES}')
         if self.cfg.swa_mode == 'phase' and self._lc is None:
             raise ValueError("swa_mode 'phase' needs cfg.lifecycle (--finite-run)")
+        self._faults = None
+        if self.cfg.faults is not None:
+            if not self.cfg.frame_log:
+                raise ValueError('cfg.faults needs cfg.frame_log (the true frames are the record)')
+            if self.cfg.heavy_block is not None:
+                raise ValueError('cfg.faults excludes cfg.heavy_block (both write the wheel speeds)')
+            from fault_schedule import FramePatcher
+            self._faults = FramePatcher(self.cfg.faults)
+            if self._lc is None:
+                self._faults.start(0)        # no phases: t0 = step 0
+        self._fault_summary: Optional[dict] = None
         self._swa       = None               # last bit sent; None before the first frame
         self._swa_events: list = []          # (step, 0/1) at every change, for the manifest
         self._run_seen  = False              # I8-1: the lifecycle reached RUN
@@ -203,6 +225,12 @@ class HILNode:
         self._miso_first_empty: Optional[int] = None
         self._h7_seq      = -1
         self._h7_new      = False
+        # RS-4 P1: run_id sent in every MOSI (bytes 40-47 with the step); replies the H7 sent back with it
+        self._run_id      = new_run_id()
+        self._id_match_n  = 0
+        self._id_first_step: Optional[int] = None
+        self._state_bad: Optional[dict] = None   # first plant state out of its encoding range (B81-15)
+        log.info('#run_id,%08x', self._run_id)
         self._ref         = (0.0, 0.0, 0.0)
         self._ref_count   = 0.0
 
@@ -244,13 +272,18 @@ class HILNode:
             n = self.cfg.max_steps or self.cfg.frame_log_max
             # t_pulse0/1_ns: just before / just after raising the sync pulse (S06 spec line 111:
             # P_send := t_pulse_rise, the same physical edge as d_1w; tools/s06_frames_decode.py)
+            # t_recv_ns (RS-4 P1): right after the transfer returns, so the 48-byte transfer time is measured
             self._flog = {
                 't_send_ns':   np.zeros(n, dtype=np.int64),
+                't_recv_ns':   np.zeros(n, dtype=np.int64),
                 't_pulse0_ns': np.zeros(n, dtype=np.int64),
                 't_pulse1_ns': np.zeros(n, dtype=np.int64),
-                'mosi':        np.zeros((n, 40), dtype=np.uint8),
-                'miso':        np.zeros((n, 40), dtype=np.uint8),
+                'mosi':        np.zeros((n, FRAME_SIZE), dtype=np.uint8),
+                'miso':        np.zeros((n, FRAME_SIZE), dtype=np.uint8),
             }
+            if self._faults is not None:
+                # L82: the frame of today's code before the injection, every step (mosi = what was sent)
+                self._flog['mosi_true'] = np.zeros_like(self._flog['mosi'])   # same width as mosi
             self._flog_n = n
             # np.zeros maps pages lazily: without this, a page fault every ~100 frames inside the loop
             if self.cfg.rt_tune:
@@ -311,6 +344,12 @@ class HILNode:
                     # S06 T2 (Z9): t_end is taken inside record, after its fields
                     self.step_log.record(self._step - 1, self._timer.last_deadline_ns,
                                          self._timer.last_wake_ns, self._t_done_ns)
+        except BaseException as exc:
+            # L82, Codex FI1-4: the manifest and #run_end say the run broke (fault_check refuses it); only
+            # with --faults, so a run without faults keeps today's stop_reason (Codex FI3-5)
+            if self._faults is not None:
+                self._stop_reason = f'error:{type(exc).__name__}'
+            raise
         finally:
             self._shutdown()
             if self.cfg.rt_tune:
@@ -352,16 +391,36 @@ class HILNode:
                 self._ref       = (vx_r, vy_r, wz_r)
                 traj_flags      = TRAJ_VALID | TRAJ_NEW
         state  = self.plant.get_state()
-        imu, imu_seq = self._imu_sample(state)
         frame_state = plant_to_frame_state(state) if self._mecanum else state
+        # O1 v11.15 3.5 (B81-15): the plant state as it comes, before the IMU sample (which may raise on it) and
+        # the S06 heavy block (which may overwrite omega), then the frame as encoded (Codex B8C-R1-2)
+        self._check_state(frame_state, 'plant')
+        imu, imu_seq = self._imu_sample(state)
         if self._heavy is not None:
             self._heavy.apply(self._step, frame_state)   # S06 Z8: omega to the H7 only, the plant goes on
+            self._check_state(frame_state, 'frame')
         swa = self._swa_bit()
-        mosi   = encode_state(frame_state, traj_ref=self._ref, traj_flags=traj_flags,
-                              seq=self._step, imu=imu, imu_seq=imu_seq,
-                              fault_flags=CMD_SWA_ON if swa else 0)
+        mosi_true = encode_state(frame_state, traj_ref=self._ref, traj_flags=traj_flags,
+                                 seq=self._step, imu=imu, imu_seq=imu_seq,
+                                 fault_flags=CMD_SWA_ON if swa else 0,
+                                 run_id=self._run_id, frame_no=self._step)
+        # L82: the faults of the schedule patch the frame (never bytes 40-47, run_id / frame_no, rule 3.7);
+        # without a schedule mosi is mosi_true
+        mosi = mosi_true if self._faults is None else self._faults.patch(self._step, mosi_true)
         t_send = time.monotonic_ns()
         miso   = self._spi.transfer(mosi)
+        t_recv = time.monotonic_ns()
+        chk = miso_check(miso)
+        if self._id_first_step is None:
+            # RS-4 P1: first good-CRC MISO carrying this run's run_id and a frame already sent (Codex RS4-R10-2)
+            rid, fno = miso_id(miso)
+            if rid == self._run_id and (self.cfg.simulate_hw or (chk == MISO_OK and fno < self._step)):
+                self._id_first_step = self._step
+            elif self._step + 1 >= ID_CHECK_FRAMES and not self.cfg.simulate_hw:
+                log.error('MISO: no good-CRC reply with run_id %08x in %d transfers: H7 not MISO v6 (48-byte '
+                          'frame, RS-4 P1); run stopped', self._run_id, self._step + 1)
+                self._stop_reason = 'h7_not_miso_v6'
+                self._running = False
         if swa != self._swa:                 # I8-11: recorded once the frame went out
             self._swa = swa
             self._swa_events.append((self._step, swa))
@@ -378,7 +437,6 @@ class HILNode:
             self._tail_t0_ns = time.monotonic_ns()
         torques = decode_torques(miso)
         if self._step >= MISO_SKIP_FRAMES:
-            chk = miso_check(miso)
             if chk != MISO_OK:
                 if chk == MISO_EMPTY:
                     self._miso_empty += 1
@@ -394,10 +452,13 @@ class HILNode:
         if self._flog is not None:
             k = self._step
             self._flog['t_send_ns'][k] = t_send
+            self._flog['t_recv_ns'][k] = t_recv
             self._flog['t_pulse0_ns'][k] = t_p0
             self._flog['t_pulse1_ns'][k] = t_p1
             self._flog['mosi'][k] = memoryview(bytes(mosi))
             self._flog['miso'][k] = memoryview(bytes(miso))
+            if self._faults is not None:
+                self._flog['mosi_true'][k] = memoryview(mosi_true)
 
         # 3. Advance plant dynamics
         # (ARM holds the plant at its initial state: no integration of the old DUT's PWM)
@@ -426,6 +487,17 @@ class HILNode:
         if self._step % self.cfg.stats_interval == 0:
             self._log_stats()
 
+    def _check_state(self, frame_state, where: str) -> None:
+        """O1 v11.15 3.5 (B81-15): record the first state field that is not finite, or x, y at the +-5 m bound
+        (protocol.state_out_of_range): a HIL tool error, the run is failed (run_failed) and redone."""
+        if self._state_bad is not None:
+            return
+        i = state_out_of_range(frame_state)
+        if i >= 0:
+            self._state_bad = dict(step=int(self._step), field=int(i), value=repr(float(frame_state[i])), where=where)
+            log.error('plant state field %d = %r at step %d (%s): not finite or position at the +-5 m bound; '
+                      'HIL tool error, run to be redone (O1 3.5)', i, frame_state[i], self._step, where)
+
     def _swa_bit(self) -> int:
         """I8: SWA command for this frame. 'phase' reads the phase after this step's lifecycle step."""
         m = self.cfg.swa_mode
@@ -450,6 +522,10 @@ class HILNode:
                                    heartbeat_age_s=(now - box.heartbeat_ns) / 1e9))
         if self._lc.phase == RUN:
             self._run_seen = True
+            if self._faults is not None:
+                self._faults.start(self._step)       # t0 = first RUN step (once)
+        elif self._run_seen and self._faults is not None:
+            self._faults.stop(self._step)            # design 6.2: no injection once RUN is left (once)
         if out.done:
             self._stop_reason = self._lc.outcome
             self._end_seen = True                # I8-5: the loop stops after the tail (I8-R2-2)
@@ -499,15 +575,30 @@ class HILNode:
                         imu_noise=(None if self.cfg.imu_noise is None or imu_source != 'plant' else
                                    self.cfg.imu_noise.describe()),
                         plant=type(self.plant).__name__, plant_src=self._plant_src,     # L34
-                        heavy_block=self.cfg.heavy_block,
+                        heavy_block=self.cfg.heavy_block, faults=self.fault_summary(),    # L82
                         load_schedule=self.cfg.load_schedule, rt=self._rt, uname=' '.join(platform.uname()),     # X8: the kernel the run ran on
                         lifecycle=self.lifecycle_summary(),
                         swa_mode=self.cfg.swa_mode, swa_events=self.swa_events(),     # I8
                         miso_check=self.miso_summary(),                                # A3
+                        frame_len=int(self._flog['mosi'].shape[1]), proto='mosi_v4_miso_v6',   # RS-4 P1
+                        run_id=int(self._run_id), id_first_step=self._id_first_step,
+                        id_confirmed=self._id_first_step is not None,                   # R10-2
+                        state_out_of_range=self._state_bad,                             # B81-15
+                        xfer_us=self._xfer_stats(n), timer_overruns=int(self._timer.overruns),
                         **self.swa_tail())                                             # I8-R2-3
         np.savez(self.cfg.frame_log, manifest=np.array(json.dumps(manifest)),
                  **{k: v[:n] for k, v in self._flog.items()})
         log.info('Frame log: %d frames -> %s', n, self.cfg.frame_log)
+
+    def _xfer_stats(self, n: int) -> Optional[dict]:
+        """RS-4 P1 (rule "H7 code with time limits", first run of the 48-byte frame): SPI transfer time
+        t_recv - t_send over the logged frames, us: p50, p99.9, max; None without frames."""
+        import numpy as np
+        if n <= 0:
+            return None
+        d = (self._flog['t_recv_ns'][:n] - self._flog['t_send_ns'][:n]) / 1000.0
+        p50, p999 = np.percentile(d, [50.0, 99.9])
+        return dict(p50=float(p50), p99_9=float(p999), max=float(d.max()), n=int(n))
 
     def _on_signal(self, signum: int, _frame) -> None:
         log.info("Signal %d received — stopping plant loop.", signum)
@@ -532,6 +623,15 @@ class HILNode:
         return dict(swa_tail_sent=self._tail_sent,
                     swa_tail_complete=self._tail_complete if self._lc is not None else None)
 
+    def fault_summary(self) -> Optional[dict]:
+        """L82: schedule, t0, executed on/off/cut events, rows that never ran; None without --faults.
+        Taken once, at the end of the loop (windows still open then are cut at the step after the last)."""
+        if self._faults is None:
+            return None
+        if self._fault_summary is None:
+            self._fault_summary = self._faults.summary(last_step=self._step - 1)
+        return self._fault_summary
+
     def lifecycle_summary(self) -> Optional[dict]:
         """Phases and outcome of a --finite-run, with the END tail (I8-R2-3); None without it."""
         if self._lc is None:
@@ -541,7 +641,15 @@ class HILNode:
     @property
     def run_failed(self) -> bool:
         """--finite-run ended in error:<reason>, or without reaching END, or (I8-R2-3, Codex round 3)
-        reached END but its tail was cut (max_steps, a full frame log, a signal), so run_hil.py exits 3."""
+        reached END but its tail was cut (max_steps, a full frame log, a signal), so run_hil.py exits 3.
+        RS-4 P1: also any run stopped because the H7 did not send the run_id back (H7 not MISO v6), and on the
+        real link any run that ended before a good-CRC reply confirmed it (Codex RS4-R10-2). O1 v11.15 3.5
+        (B81-15): also any run whose plant state was not finite or whose x, y reached the +-5 m bound (a HIL tool error,
+        the run is redone; manifest state_out_of_range)."""
+        if self._stop_reason == 'h7_not_miso_v6' or self._state_bad is not None:
+            return True
+        if not self.cfg.simulate_hw and self._id_first_step is None:
+            return True
         if self._lc is None:
             return False
         return (self._lc.phase != END or (self._lc.outcome or '').startswith('error:')
@@ -559,6 +667,13 @@ class HILNode:
         if m['crc_bad'] or m['empty']:
             log.warning('MISO: %d frame CRC sai, %d frame rỗng trong lượt (L50: không làm số chính)',
                         m['crc_bad'], m['empty'])
+        if self._faults is not None:                                                    # L82
+            fsum = self.fault_summary()
+            log.info('#faults,sha256=%s,rows=%d,t0_step=%s,events=%d,cut=%d,not_run=%d,complete=%d',
+                     fsum['sha256'][:8], len(fsum['rows']), fsum['t0_step'], len(fsum['events']),
+                     int(fsum['cut']), len(fsum['not_run']), int(fsum['complete']))
+            if not fsum['complete']:
+                log.warning('Bơm lỗi: lịch không thi hành đủ (cut=%s, not_run=%s)', fsum['cut'], fsum['not_run'])
         log.info('#run_end,timestamp_us=%d,steps=%d,reason=%s',
                  time.monotonic_ns() // 1000, self._step, self._stop_reason)
         if self._flog is not None:

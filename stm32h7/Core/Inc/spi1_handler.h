@@ -5,7 +5,7 @@
 #include "hil_protocol.h"
 
 /*
- * SPI1 Handler — RPi5 ↔ H7 link (slave, DMA, 40-byte frames v3)
+ * SPI1 Handler — RPi5 ↔ H7 link (slave, DMA, 48-byte frames: MOSI v4 / MISO v6)
  *
  * Call order:
  *   1. SPI1_Handler_Init(&hspi1)           — in USER CODE BEGIN 2
@@ -37,6 +37,9 @@ typedef struct {
     uint32_t rx_cyc;
     uint32_t rx_nf;
     uint16_t apply;                /* v5 apply window, packed (hil_protocol.h) */
+    /* v6 (RS-4 P1): MOSI bytes 40-47 (run_id, frame_no) of the frame answered,
+     * copied from the same SPI1_FrameInfo_t.raw as mosi_crc */
+    uint8_t  id[HIL_MOSI_ID_LEN];
 } SPI1_MisoInfo_t;
 
 void    SPI1_Handler_Init(SPI_HandleTypeDef *hspi);
@@ -63,7 +66,7 @@ void    SPI1_Callback    (SPI_HandleTypeDef *hspi);
  *   9. SPI1_RequestRestart()               — e.g. from the link watchdog
  */
 typedef struct {
-    uint32_t frames;       /* completed 40-byte frames since boot          */
+    uint32_t frames;       /* completed SPI1_FRAME_LEN-byte frames since boot */
     uint32_t errors;       /* HAL_SPI_ErrorCallback calls since boot       */
     uint32_t rearms;       /* DMA restarts done by SPI1_Service()          */
     uint32_t last_error;   /* hspi->ErrorCode at the last error            */
@@ -96,5 +99,10 @@ uint32_t SPI1_GetLastFrameMs(void);
 /* Shortest and longest SPI1_Service() call in CYCCNT cycles since the last
  * call, then reset (L39: measured on the board; min = max = 0 if no call) */
 void    SPI1_TakeServiceCycles(uint32_t *min_cyc, uint32_t *max_cyc);
+/* RS-4 P1 (rule "H7 code with time limits"): shortest and longest
+ * SPI1_Callback() run in CYCCNT cycles since the last call (from its first
+ * CYCCNT read to its end; interrupts of higher priority included, none
+ * exist above SPI1), then reset; min = max = 0 if no frame came */
+void    SPI1_TakeCallbackCycles(uint32_t *min_cyc, uint32_t *max_cyc);
 
 #endif /* SPI1_HANDLER_H */

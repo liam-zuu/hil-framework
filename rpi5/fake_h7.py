@@ -43,8 +43,8 @@ from typing import Callable, Optional, Sequence
 import numpy as np
 
 from protocol import (
-    CMD_SWA_ON, FRAME_SIZE, OFS_FAULT, OFS_MISO_SEQ, OFS_PWM, OFS_SEQ, OFS_STATUS, STATUS_SWA,
-    TRAJ_NEW, TRAJ_VALID, decode_imu, decode_state, decode_traj_ref,
+    CMD_SWA_ON, FRAME_SIZE, ID_LEN, OFS_FAULT, OFS_MISO_ID, OFS_MISO_SEQ, OFS_PWM, OFS_RUN_ID, OFS_SEQ,
+    OFS_STATUS, STATUS_SWA, TRAJ_NEW, TRAJ_VALID, decode_imu, decode_state, decode_traj_ref,
 )
 
 FAULT_KINDS = ('stall', 'silent', 'miso_bad', 'torn', 'xfer_error')
@@ -67,14 +67,16 @@ def _c_int16(x: float) -> int:
     return int(np.float32(xf * np.float32(INT16_MAXF)))
 
 
-def encode_miso_like_h7(duty, seq: int, status: int = 0) -> bytes:
-    """MISO frame as the H7 builds it: torque field = duty, pwm field 0 (main.c:217-224)."""
+def encode_miso_like_h7(duty, seq: int, status: int = 0, mosi_id: bytes = bytes(ID_LEN)) -> bytes:
+    """MISO frame as the H7 builds it: torque field = duty, pwm field 0 (main.c:217-224); v6 (RS-4 P1):
+    bytes 40-47 = MOSI bytes 40-47 (run_id, frame_no) of the frame answered."""
     buf = bytearray(FRAME_SIZE)
     for i, d in enumerate(duty):
         struct.pack_into('>h', buf, i * 2, _c_int16(d))
         struct.pack_into('>h', buf, OFS_PWM + i * 2, 0)
     buf[OFS_STATUS] = status & 0xFF
     buf[OFS_MISO_SEQ] = seq & 0xFF
+    buf[OFS_MISO_ID:OFS_MISO_ID + ID_LEN] = bytes(mosi_id)[:ID_LEN]
     return bytes(buf)
 
 
@@ -170,4 +172,5 @@ class FakeH7:
         duty = list(self.duty_fn(n, state, (vx, vy, wz, flags)))
         if len(duty) != 4:
             raise ValueError("duty_fn must return 4 values")
-        self._tx = encode_miso_like_h7(duty, seq=mosi[OFS_SEQ], status=STATUS_SWA if swa else 0)
+        self._tx = encode_miso_like_h7(duty, seq=mosi[OFS_SEQ], status=STATUS_SWA if swa else 0,
+                                       mosi_id=mosi[OFS_RUN_ID:OFS_RUN_ID + ID_LEN])

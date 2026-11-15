@@ -56,7 +56,8 @@ def test_logger_rows_with_imu(fw, tmp_path):
     a = sim_args()
     log = fwsim.simulate(fw, turn, 4.0, fwsim.plant_params(a), mode='PID', imu=fwsim.imu_config(a))
     rows = list(s02_groupA_sim.log_rows(log, True))
-    assert all(len(r) == len(COLUMNS) == 85 for r in rows)   # 66 ctrl-imu + 14 pos + 5 ws (int/post-g2)
+    assert all(len(r) == len(COLUMNS) == 86 for r in rows)   # 66 ctrl-imu + 14 pos + 5 ws (int/post-g2) + traj_age_ms
+    assert all(r[-1] == '' for r in rows)                     # traj_age_ms: no command packets in fwsim
     col = {c: [r[i] for r in rows] for i, c in enumerate(COLUMNS)}
     if fw.pos_cols:                                   # P17: pos_* / ws_* filled from the firmware
         assert col['pos_on'][-1] in ('0', '1') and col['pos_reset_n'][-1] != ''

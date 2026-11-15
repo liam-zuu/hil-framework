@@ -10,7 +10,7 @@ import pytest
 
 from hil_node import HILConfig, HILNode
 from mecanum_plant import MecanumPlant
-from protocol import decode_state
+from protocol import FRAME_SIZE, OFS_RUN_ID, decode_state
 import s06_load_schedule as ls
 from trajectory_pub import GROUP_A, get_body_velocity
 
@@ -86,14 +86,16 @@ def test_block_changes_frame_only_plant_keeps_dynamics(tmp_path):
         cfg = HILConfig(simulate_hw=True, max_steps=steps, period_us=1_000, frame_log=p, heavy_block=block,
                         load_schedule='s.csv abc')
         node = HILNode(plant, config=cfg)
-        node._spi.transfer = lambda mosi: bytes([0x10, 0x00] * 4) + bytes(32)   # constant duty
+        node._spi.transfer = lambda mosi: bytes([0x10, 0x00] * 4) + bytes(FRAME_SIZE - 8)   # constant duty
         node.run()
         return plant.get_state(), np.load(p)
 
     s0, f0 = run(None)
     s1, f1 = run((130, 300))
     assert s0 == s1
-    m0, m1 = f0['mosi'], f1['mosi']
+    # RS-4 P1: bytes 40-43 are the run_id, new for every run; compared without them
+    m0, m1 = f0['mosi'][:, :OFS_RUN_ID], f1['mosi'][:, :OFS_RUN_ID]
+    assert np.array_equal(f0['mosi'][:, OFS_RUN_ID + 4:], f1['mosi'][:, OFS_RUN_ID + 4:])   # frame_no
     assert np.array_equal(m0[:130], m1[:130]) and np.array_equal(m0[300:], m1[300:])
     assert np.array_equal(m0[130:300, 8:], m1[130:300, 8:])       # everything but the 4 wheel speeds
     for k in (130, 179, 180, 299):                                # block time counts from its first step

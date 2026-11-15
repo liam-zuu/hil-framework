@@ -144,7 +144,143 @@ def test_spi_master_uses_responder_and_echo_stays_default():
 def test_encode_matches_the_h7_byte_layout():
     raw = encode_miso_like_h7([1.0, -1.0, 0.0, 0.25], seq=0x1A0 & 0xFF)
     assert raw[:8] == bytes.fromhex('7fff8001 00001fff')
-    assert raw[8:16] == bytes(8) and raw[16] == 0 and raw[17] == 0xA0 and raw[18:] == bytes(22)
+    assert raw[8:16] == bytes(8) and raw[16] == 0 and raw[17] == 0xA0 and raw[18:] == bytes(30)
+    # v6 (RS-4 P1): bytes 40-47 = MOSI 40-47 of the frame answered
+    raw = encode_miso_like_h7([0.0] * 4, seq=3, mosi_id=bytes(range(1, 9)))
+    assert len(raw) == 48 and raw[40:48] == bytes(range(1, 9)) and raw[18:40] == bytes(22)
+
+
+def test_fake_h7_sends_back_the_id_of_the_frame_it_answers():
+    """RS-4 P1: through HILNode and FakeH7, every MISO 40-47 is (run_id, frame_no) of an earlier frame of the
+    same run (the frame the fake main loop handled), and HILNode sees its run_id come back."""
+    from protocol import miso_id
+    fake = FakeH7(main_every=2)
+    node = HILNode(MockPlant(), config=HILConfig(simulate_hw=True, max_steps=60, period_us=1_000), responder=fake)
+    seen = []
+    orig = node._spi.transfer
+
+    def rec(mosi):
+        miso = orig(mosi)
+        seen.append((int.from_bytes(mosi[44:48], 'little'), miso_id(miso)))
+        return miso
+    node._spi.transfer = rec
+    node.run()
+    got = [(k, f) for k, (rid, f) in seen if rid]
+    assert len(got) > 20 and node._id_first_step is not None
+    assert all(rid in (0, node._run_id) for _, (rid, _) in seen)
+    assert all(1 <= k - f <= 3 for k, f in got)
+
+
+def _good_crc(b40, id8) -> bytes:
+    """48-byte MISO with the CRC the H7 writes (bytes 8-9, little endian, CRC-16/CCITT over 0-7 and 10-47)."""
+    import binascii
+    b = bytearray(bytes(b40)[:40] + bytes(id8))
+    crc = binascii.crc_hqx(bytes(b[:8]) + bytes(b[10:]), 0xFFFF)
+    b[8], b[9] = crc & 0xFF, crc >> 8
+    return bytes(b)
+
+
+def _real_link_node(responder, max_steps=500, frame_log=None):
+    """HILNode on the 'real link' (simulate_hw False is set after the simulated SPI is built; the guard and
+    run_failed read it), with a known run_id."""
+    node = HILNode(MockPlant(), config=HILConfig(simulate_hw=True, max_steps=max_steps, period_us=1_000,
+                                                 frame_log=frame_log), responder=responder)
+    node.cfg.simulate_hw = False
+    node._run_id = 0x9ABCDEF0
+    return node
+
+
+RID = (0x9ABCDEF0).to_bytes(4, 'little')
+
+
+@pytest.mark.parametrize('h7', ['v5', 'other_run', 'crc_bad_id', 'echo_of_the_frame_sent'])
+def test_run_stops_when_the_h7_does_not_send_the_run_id_back(h7):
+    """RS-4 P1 guard (Codex RS4-R10-2): on the real link, no good-CRC reply with this run's run_id and a frame
+    already sent in the first ID_CHECK_FRAMES transfers stops the run at transfer ID_CHECK_FRAMES: an H7 before
+    MISO v6 (bytes 40-47 not sent), replies of another run, a bad-CRC MISO whose bytes 40-47 happen to carry the
+    run_id (40 zero bytes + the id), or the MOSI id of the frame being sent echoed back (not a reply)."""
+    import hil_node as hn
+
+    def responder(mosi):
+        if h7 == 'v5':
+            return bytes(48)
+        if h7 == 'other_run':
+            return _good_crc(bytes(40), (0x12345678).to_bytes(4, 'little') + mosi[44:48])
+        if h7 == 'crc_bad_id':                   # names frame k - 2 (already sent): only the CRC is wrong
+            k = int.from_bytes(bytes(mosi[44:48]), 'little')
+            return bytes(40) + RID + max(k - 2, 0).to_bytes(4, 'little')
+        return _good_crc(bytes(40), mosi[40:48])
+    node = _real_link_node(responder)
+    node.run()
+    assert node._stop_reason == 'h7_not_miso_v6' and node._step == hn.ID_CHECK_FRAMES
+    assert node._id_first_step is None and node.run_failed          # run_hil.py exits 3
+
+
+class _BadStatePlant(MockPlant):
+    """MockPlant (frame order state) whose field `field` becomes `value` from step `at` on."""
+
+    def __init__(self, at, field, value):
+        super().__init__()
+        self._at, self._field, self._value = at, field, value
+
+    def get_state(self):
+        s = super().get_state()
+        if self._step_count >= self._at:
+            s[self._field] = self._value
+        return s
+
+
+@pytest.mark.parametrize('field, value', [(4, float('nan')), (7, float('inf')), (5, 5.0), (6, float('nan'))])
+def test_plant_state_out_of_range_fails_the_run(tmp_path, field, value):
+    """O1 v11.15 3.5 (B81-15): the first plant state field that is NaN / inf, or x, y at the +-5 m bound, is
+    recorded in the manifest and the run is failed (HIL tool error, run to be redone); theta -pi is not (B81-8),
+    nor a wheel speed at its bound (not in the spec rule)."""
+    import json
+
+    import numpy as np
+    p = str(tmp_path / 'f.npz')
+    node = HILNode(_BadStatePlant(20, field, value),
+                   config=HILConfig(simulate_hw=True, max_steps=60, period_us=1_000, frame_log=p))
+    node.run()
+    m = json.loads(str(np.load(p)['manifest']))
+    assert node.run_failed and m['state_out_of_range']['field'] == field
+    assert 19 <= m['state_out_of_range']['step'] <= 21
+    ok = HILNode(_BadStatePlant(20, 6, -3.141592653589793) if field != 5 else _BadStatePlant(20, 0, 41.0),
+                 config=HILConfig(simulate_hw=True, max_steps=60, period_us=1_000, frame_log=str(tmp_path / 'g.npz')))
+    ok.run()
+    assert not ok.run_failed and json.loads(str(np.load(tmp_path / 'g.npz')['manifest']))['state_out_of_range'] is None
+
+
+def test_good_crc_reply_confirms_v6_and_a_short_run_without_it_fails(tmp_path):
+    """Codex RS4-R10-2: a good-CRC reply naming an earlier frame of this run confirms v6 (the run goes on, not
+    failed); a run that ends before ID_CHECK_FRAMES transfers without a confirmation is failed, manifest
+    id_confirmed False (before: max_steps 50 never checked and exited 0)."""
+    import json
+
+    import numpy as np
+
+    import hil_node as hn
+    sent = []
+
+    def good(mosi):
+        sent.append(bytes(mosi[40:48]))
+        return _good_crc(bytes(40), sent[-3]) if len(sent) >= 3 else bytes(48)
+    node = _real_link_node(good, max_steps=200, frame_log=str(tmp_path / 'g.npz'))
+    node.run()
+    m = json.loads(str(np.load(tmp_path / 'g.npz')['manifest']))
+    assert node._stop_reason == 'max_steps' and node._id_first_step == 2 and not node.run_failed
+    assert m['id_confirmed'] is True and m['id_first_step'] == 2
+    for steps in (hn.ID_CHECK_FRAMES - 1, 3):
+        node = _real_link_node(lambda mosi: bytes(48), max_steps=steps, frame_log=str(tmp_path / f's{steps}.npz'))
+        node.run()
+        m = json.loads(str(np.load(tmp_path / f's{steps}.npz')['manifest']))
+        assert node._stop_reason == 'max_steps' and node.run_failed, steps
+        assert m['id_confirmed'] is False and m['id_first_step'] is None
+    # simulate mode keeps the exception: no CRC from the echo / FakeH7, never failed on it
+    sim = HILNode(MockPlant(), config=HILConfig(simulate_hw=True, max_steps=10, period_us=1_000),
+                  responder=lambda mosi: bytes(48))
+    sim.run()
+    assert sim._id_first_step is None and not sim.run_failed
 
 
 class RecPlant(MockPlant):
@@ -173,3 +309,38 @@ def test_hil_node_reads_duty_from_fake_h7_and_relays_new_setpoints():
     assert plant.torques[0] == [0.0] * 4                 # first MISO: nothing prepared yet
     assert plant.torques[-1] == pytest.approx([0.25, -0.25, 0.5, -0.5], abs=1e-4)
     assert fake.relay_attempted == 2 and fake.last_relay == pytest.approx((0.3, 0.0, 0.0), abs=1e-3)
+
+
+def test_plant_state_checked_before_the_imu_and_the_heavy_block(tmp_path):
+    """Codex B8C-R1-2: the state is checked as the plant gives it, before the IMU sample (a Mecanum theta = inf
+    makes imu_from_plant raise) and before the S06 heavy block (which overwrites omega): the first bad field is
+    in the manifest even when the run then stops on an exception, and a NaN omega under the heavy block counts."""
+    import json
+
+    import numpy as np
+
+    from mecanum_plant import MecanumPlant
+    from params import PARAMS
+
+    class InfTheta(MecanumPlant):
+        def get_state(self):
+            s = super().get_state()
+            if self._ticks >= 20:
+                s[2] = float('inf')                     # Mecanum order [x, y, theta, ...]
+            return s
+    p = str(tmp_path / 'm.npz')
+    node = HILNode(InfTheta(PARAMS, dt=0.001), config=HILConfig(simulate_hw=True, max_steps=60, period_us=1_000,
+                                                                frame_log=p))
+    try:
+        node.run()
+    except Exception:                                  # the IMU sample may raise on theta = inf
+        pass
+    m = json.loads(str(np.load(p)['manifest']))
+    assert m['state_out_of_range']['field'] == 6 and m['state_out_of_range']['where'] == 'plant'
+    assert node.run_failed
+    p2 = str(tmp_path / 'h.npz')
+    node = HILNode(_BadStatePlant(20, 0, float('nan')),
+                   config=HILConfig(simulate_hw=True, max_steps=60, period_us=1_000, frame_log=p2, heavy_block=(0, 60)))
+    node.run()
+    m = json.loads(str(np.load(p2)['manifest']))
+    assert node.run_failed and m['state_out_of_range']['field'] == 0 and m['state_out_of_range']['where'] == 'plant'

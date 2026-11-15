@@ -339,6 +339,27 @@ def test_table_cells_medians_and_reasons(tmp_path):
     assert [(u['gain_set'], u['source']) for u in used] == [('A-PID/G07', 'S05_freeze.csv'),
                                                             ('RQ2-INIT-PID', '--init-gain')]
     assert used[1]['gain_sha256'] == rl.sha256_file(os.path.join(ds, 'gain_init_PID.json'))
+    pr = {r['run_uid']: r for r in per_run}                                  # S05 4.7 (i), Liam Q4 (CODE_RS4)
+    assert float(pr['r5']['t_end_err_ms']) == pytest.approx(10.0 * T.ESP_PI_PRIOR_PPM * 1e-3)   # no esp_pi_ppm
+    assert pr['r1']['t_end_err_ms'] == '' and pr['r1']['t_end_err_src'] == 'xe: C7b'
+
+
+def test_t_end_error_estimate():
+    """S05 4.7 (i), Liam 14/11 CODE_RS4 Q4: t_end x (|esp_pi_ppm| + noise + |pi_period_ppm|); bounds when missing."""
+    v, src = T.t_end_err_ms(12.0, esp_pi_ppm=-52.0, pi_period_ppm=-12.0)
+    assert v == pytest.approx(12.0 * (52.0 + 50.0 + 12.0) * 1e-3) and 'pi_period_ppm' in src      # 1.37 ms
+    v, src = T.t_end_err_ms(12.0, esp_pi_ppm=24.6)
+    assert v == pytest.approx(12.0 * (24.6 + 50.0 + T.PI_PERIOD_PPM_BOUND) * 1e-3) and 'can Pi' in src
+    # S05 v3.20 4.7 (i) (B81-13): no esp_pi_ppm -> the whole sum is 2000 ppm, 2 x T ms (24 ms at 12 s)
+    for missing in (None, float('nan'), float('inf'), 'x', 10 ** 400):            # 10**400: OverflowError (B8C-R1-6)
+        v, src = T.t_end_err_ms(12.0, esp_pi_ppm=missing, pi_period_ppm=-12.0)
+        assert v == pytest.approx(24.0) and '2000 ppm' in src, missing
+    # Codex B8C-R1-6: t_end < 0 has no number; a large finite t_end keeps a finite result
+    assert T.t_end_err_ms(-12.0)[0] is None and T.t_end_err_ms(10 ** 400)[0] is None
+    assert T.t_end_err_ms(1e305)[0] == pytest.approx(2e305) and T.t_end_err_ms(1e306, 1e300)[0] is None
+    v, src = T.t_end_err_ms(12.0, esp_pi_ppm=24.6, pi_period_ppm=float('nan'))          # not finite: the Pi bound
+    assert v == pytest.approx(12.0 * (24.6 + 50.0 + T.PI_PERIOD_PPM_BOUND) * 1e-3) and 'can Pi' in src
+    assert T.t_end_err_ms(None) == (None, 'khong co t_end') and T.t_end_err_ms(float('nan'))[0] is None
 
 
 def test_unknown_gain_set_is_reported_not_tabled(tmp_path, capsys):

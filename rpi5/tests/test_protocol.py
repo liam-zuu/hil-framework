@@ -287,6 +287,63 @@ class TestMatchesH7Header:
                                            + [self._define('HIL_IMU_ACCEL_MAX')] * 3
                                            + [self._define('HIL_IMU_YAW_MAX')], rel=1e-6)
 
+    def test_id_offsets(self):
+        """RS-4 P1: MOSI v4 id at 40 (8 bytes), MISO v6 copy at 40."""
+        import protocol as P
+        assert self._define('HIL_MOSI_ID') == P.OFS_RUN_ID == 40 and P.OFS_FRAME_NO == 44
+        assert self._define('HIL_MOSI_ID_LEN') == P.ID_LEN == 8
+        assert self._define('HIL_MISO_ID') == P.OFS_MISO_ID == 40
+
+
+class TestRunIdFrameNo:
+    """RS-4 P1 (MOSI v4): run_id and frame_no in MOSI 40-47, little-endian; the H7 copies them back."""
+
+    def test_encode_writes_run_id_and_frame_no(self):
+        import protocol as P
+        b = P.encode_state([0.0] * 10, seq=0x1234, run_id=0xDEADBEEF, frame_no=0x01020304)
+        assert len(b) == 48 and b[21] == 0x34
+        assert struct.unpack_from('<II', b, 40) == (0xDEADBEEF, 0x01020304)
+        assert struct.unpack_from('<I', P.encode_state([0.0] * 10, seq=777), 44)[0] == 777   # default = seq
+        with pytest.raises(ValueError):
+            P.encode_state([0.0] * 10, run_id=-1)
+        with pytest.raises(ValueError):
+            P.encode_state([0.0] * 10, frame_no=1 << 32)
+
+    def test_new_run_id_never_zero_and_varies(self, monkeypatch):
+        import protocol as P
+        ids = {P.new_run_id() for _ in range(50)}
+        assert 0 not in ids and len(ids) > 45
+        draws = iter([bytes(4), bytes(4), b'\x01\x00\x00\x00'])
+        monkeypatch.setattr(P.os, 'urandom', lambda n: next(draws))
+        assert P.new_run_id() == 1                       # zero draws are skipped
+
+    def test_miso_id(self):
+        import protocol as P
+        m = bytes(40) + struct.pack('<II', 5, 6)
+        assert P.miso_id(m) == (5, 6) and P.miso_id(bytes(40)) == (0, 0)
+
+
+def test_state_out_of_range_b81_15():
+    """O1 v11.15 3.5 (B81-15): a frame state field that is NaN / inf, or x, y at the +-5 m bound, is found before
+    encoding; theta wraps to [-pi, pi) in the plant, so only finite is checked there (B81-8); the other fields
+    are checked for finite only (the spec rule)."""
+    import protocol as P
+    ok = [39.9, -39.9, 0.0, 1.0, 4.99, -4.99, math.pi, 2.99, -2.99, 9.99]
+    assert P.state_out_of_range(ok) == -1
+    assert P.state_out_of_range(ok[:6] + [-math.pi] + ok[7:]) == -1
+    for i, v in ((4, 5.0), (4, -5.0), (5, -7.0), (5, 5.0),
+                 (4, float('nan')), (6, float('nan')), (8, float('inf')), (2, float('-inf')), (9, float('nan'))):
+        s = list(ok)
+        s[i] = v
+        assert P.state_out_of_range(s) == i, (i, v)
+    for i, v in ((0, 40.0), (3, -40.0), (7, 3.0), (9, -10.0), (6, 3.15), (6, -7.0)):   # not in the rule
+        s = list(ok)
+        s[i] = v
+        assert P.state_out_of_range(s) == -1, (i, v)
+    # what the check guards: the encoder maps NaN and +-inf onto the bound, so the frame cannot show them
+    for v in (float('nan'), float('inf'), 1e9):
+        assert abs(P._to_int16(v, 5.0)) == 32767
+
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

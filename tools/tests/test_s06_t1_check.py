@@ -15,6 +15,7 @@ import pytest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 sys.path[:0] = [os.path.join(ROOT, 'tools'), os.path.join(ROOT, 'rpi5')]
+from protocol import FRAME_SIZE as FRAME_LEN  # noqa: E402  RS-4 P1: 48-byte frames
 import s06_t1_check as t1  # noqa: E402
 from protocol import encode_state  # noqa: E402
 
@@ -31,13 +32,13 @@ def build(n=N, faults=None, period_us=1000.0):
     f = faults or {}
     rng = np.random.default_rng(5)
     t_send_ns = (np.arange(n) * period_us * 1e3 + rng.uniform(-12e3, 12e3, n)).astype(np.int64)
-    mosi = np.zeros((n, 40), dtype=np.uint8)
+    mosi = np.zeros((n, FRAME_LEN), dtype=np.uint8)
     for k in range(n):
         w = 10 * np.sin(k / 300.0)
         st = [w, -w, w, -w, 0.001 * k % 5, 0.0, 0.0, 0.1, 0.0, 0.2]
         imu = (0.1 * np.sin(k / 50), 0.0, 0.0, 9.81, 0.0)
         mosi[k] = np.frombuffer(encode_state(st, seq=k, imu=imu, imu_seq=k // 10), dtype=np.uint8)
-    miso = np.zeros((n, 40), dtype=np.uint8)
+    miso = np.zeros((n, FRAME_LEN), dtype=np.uint8)
     idx, seqs, rx_shift = 0, [0, 0, 0], 0
     reps = []                                             # (kind 0..2, seq, Pi send time of the frame, µs)
     for j in range(2, n):
@@ -50,13 +51,19 @@ def build(n=N, faults=None, period_us=1000.0):
         cyc = cyc_full & 0xFFFFFFFF
         if j in f.get('empty', ()):                       # S1: the H7 did not answer this frame
             continue
-        b = bytearray(40)
+        b = bytearray(FRAME_LEN)
         mc = crc(mosi[i]) ^ (1 if j in f.get('mixed', ()) else 0)
         b[10:12] = struct.pack('<H', mc)
         b[12:16] = struct.pack('<I', cyc)
-        b[17] = mosi[i][21]
+        b[17] = mosi[i][21] ^ (0x80 if j in f.get('bad_seq', ()) else 0)    # 'bad_seq': matches no recent frame
         b[18:20] = struct.pack('<H', (i + 1 - rx_shift) & 0xFFFF)
         b[20:22] = struct.pack('<H', f.get('age', {}).get(j, 300))
+        if f.get('v5'):                                   # MISO v5: bit 7 mark, window pre_us | dur4 << 11
+            b[16] = t1.dec.STATUS_V5
+            if j in f.get('sat', ()):
+                b[20:22] = struct.pack('<H', 2047 | (5 << 11))
+            elif j in f.get('sat_dur', ()):
+                b[20:22] = struct.pack('<H', 100 | (31 << 11))
         rec = None
         if i > 20 and i % 10 == 0 and i not in f.get('no_log', ()):
             s = (i // 10) % 3
@@ -428,3 +435,45 @@ def test_cli(clean, tmp_path):
         assert open(out / name).readline().split(',')[0].strip() == first
     assert subprocess.run([sys.executable, script, str(npz), '--out', str(out)], capture_output=True,
                           text=True).returncode == 3           # 19 s scored < 600 s
+
+
+def test_saturated_apply_window_counted_apart_and_fails():
+    """S06 T1 [H7 v6] (Liam 14/11, phiên THESIS local_2bb6f593, "Đếm riêng, đòi bằng 0"): MISO v5 frames with a
+    saturated apply window (pre_us 2047 or dur4 31: age 0xFFFF in s06_frames_decode) do not enter the age
+    maximum; they are counted in n_age_unknown (per window and total) and T1 fails unless it is 0."""
+    ok = run(build(faults={'v5': True}))
+    assert ok['verdict'] == 'pass' and ok['frames']['n_age_unknown'] == 0 and ok['frames']['age_max_us'] == 300
+    assert ok['state_age']['n_age_unknown'] == 0
+    # Codex T1A-R1-2: per window, the expected count (the window of the source frame j - 2, by its send time) and a
+    # max that a saturated frame (0xFFFF) never reaches; frames 7000, 7001 and 12000 lie in two different windows
+    for key in ('sat', 'sat_dur'):
+        data = build(faults={'v5': True, key: {7000, 7001, 12000}})
+        out = run(data)
+        assert out['verdict'] == 'fail' and out['frames']['n_age_unknown'] == 3, key
+        assert out['frames']['age_max_us'] == 300 and any('n_age_unknown' in f for f in out['fails']), key
+        want = _per_window(out, data[0], {7000, 7001, 12000})
+        assert sorted(want.values()) == [0] * (len(want) - 2) + [1, 2], want
+        assert {w['window']: w['n_age_unknown'] for w in out['_windows']} == want, key
+        assert all(w['max_state_age_us'] == 300 for w in out['_windows']), key
+        assert out['state_age']['n_age_unknown'] == 3 and 'known ages only' in out['state_age']['scope']
+
+
+def _per_window(out, t_send_ns, js, lag=2):
+    """Expected n_age_unknown per window: MISO frame j answers source frame j - lag, whose send time sets the window."""
+    want = {w['window']: 0 for w in out['_windows']}
+    for j in js:
+        t = t_send_ns[j - lag] / 1e3
+        w = next(w['window'] for w in out['_windows'] if w['t_start_us'] <= t < w['t_start_us'] + 5e6)
+        want[w] += 1
+    return want
+
+
+def test_saturated_frame_with_unmatched_seq_still_counted():
+    """Codex T1A-R1-1: a saturated MISO v5 frame with a good CRC whose seq matches no recent MOSI frame
+    (answered None) is counted in n_age_unknown (window and total), besides being unanswered."""
+    data = build(faults={'v5': True, 'sat': {7000}, 'bad_seq': {7000}})
+    out = run(data)
+    assert out['verdict'] == 'fail' and out['frames']['unanswered'] == 1
+    assert out['frames']['n_age_unknown'] == 1
+    assert {w['window']: w['n_age_unknown'] for w in out['_windows']} == _per_window(out, data[0], {7000})
+    assert out['frames']['age_max_us'] == 300

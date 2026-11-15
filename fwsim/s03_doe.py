@@ -45,6 +45,15 @@ S03 does not analyse either: section 5 and the rule of 3.2 use centre, outer and
 design.csv: 371 rows per controller, checked point_id - box - codes and bounds (11.4 (i),
 (ii)) before the main design. Two diagnostic columns n_upper_frames, n_back_frames (section 4).
 
+S03 v8.2 (Liam 13/11, THESIS local_7999bf79; section 4 row G, 7, 8 condition 8; script: Liam 14/11
+CODE_FEAS local_4e9b745d "Code ngay", design 03_CODE/docs/2026-11-14_Thiet_ke_S03_G1G5_v1.md): every
+run is scored with the gate evaluator of S04 and C12, o1_gate_eval.evaluate_fig8 (it calls evaluate_v7
+UNCHANGED, so every older column keeps its value bit for bit) and o1_gate.gate(u_t = 0, DECIDE_ALL;
+U = 0 on fwsim: the true plant pose). GATE_RUN_COLS are appended after 'error' in runs.csv,
+runs_test.csv and the sweep (Liam "Co, mot cach cham"): e_bao_max (G4), gate_version, gate_decide,
+gate_u_t, g1_q, g1_state, g2..g5 q, lo, hi, n_undef, state (names of tools/rq3_log.py GATE_COLS, B81-3)
+and gate_outcome (O1 3.5 over G1-G5). G3-G5 belong to the gate and S04, not to the section 5 analysis.
+
 L56 / S03 v6 section 1: the main design results (runs.csv, effects.csv and the tables of
 section 5) are NOT looked at before campaign A ends. Nothing derived from them leaves
 sealed/ (Codex S3C-1..S3C-3): no hash of a sealed file outside it, no child-process job file
@@ -88,6 +97,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import fwsim                                            # noqa: E402
 import o1_feasibility as o1                             # noqa: E402
+import o1_gate as G                                     # noqa: E402  (S03 v8.2: G1-G5)
+import o1_gate_eval as E                                # noqa: E402  (G4 e_bao; evaluate_v7 inside, unchanged)
 import tune_ga                                          # noqa: E402
 
 CONTROLLERS = ('PID', 'ADRC')
@@ -106,12 +117,22 @@ DET_SEED = 20261106                           # S03 section 3.4: seed that draws
 THRESH = {'e_perp_max': 0.01, 'e_perp_max_cens': 0.01, 'sat_frac': 0.01}   # S03 section 5.2; tv_duty: 20 %
 Y3_REL = 0.20
 RESPONSES = ('e_perp_max', 'e_perp_max_cens', 'tv_duty', 'sat_frac')
-RUN_COLS = ['controller', 'point_id', 'box', 'mu', 'v', 'status', 'completed', 'e_perp_max', 'e_perp_max_cens',
+OLD_COLS = ['controller', 'point_id', 'box', 'mu', 'v', 'status', 'completed', 'e_perp_max', 'e_perp_max_cens',
             'e_perp_global_max', 'tv_duty', 'sat_frac', 'sat_any_frac', 'e_theta_lane_max_deg',
             'e_theta_cmd_max_deg', 'ds_absmax', 'e_trk_max', 't_end', 'e_s_absmax', 'track_err_frames',
             'cond2_5_ever', 'pos_reset_mid', 'e_perp_rms', 'e_trk_rms',
             'n_upper_frames', 'n_back_frames',      # S03 v8 section 4 (W8-Q (b)): diagnostics, not responses
             'error']                                # RMS: S3C-13; error: S3C-12
+# S03 v8.2 section 7: e_bao_max and the G1-G5 states (o1_gate.py, U = 0), appended after the S03 v8 columns.
+# Names as tools/rq3_log.py GATE_COLS (B81-3); not written: gate_json_sha256 (no gate file per run), the
+# _chung columns (one frame domain on fwsim: common = union) and the G1 fields t_done... (deferred for the
+# fwsim scorer, Liam 14/11 CODE_R134 "De goi rieng sau"). gate_outcome: O1 3.5 over G1-G5.
+GATE_RUN_COLS = (['e_bao_max', 'gate_version', 'gate_decide', 'gate_u_t', 'g1_q', 'g1_state']
+                 + [f'{c}_{x}' for c in G.MEASURED for x in ('q', 'lo', 'hi', 'n_undef', 'state')]
+                 + ['gate_outcome'])
+RUN_COLS = OLD_COLS + GATE_RUN_COLS
+SWEEP_ID_COLS = ('controller', 'factor', 'value', 'is_default', 'v', 'mu')   # sweep.csv identifiers (section 7)
+GATE_U_T = 0.0                # s: fwsim knows the command start exactly (o1_gate docstring; as C12, S04)
 SCALE_RTOL = 1e-14            # H/L >= 4 within float rounding of the log grid (S3C-6; S3D-7: about 45 ULP)
 # S03 v8 (L67): axial points and the test set for the RSM comparison of S04; not analysed here
 ANALYSED_BOXES = ('centre', 'outer', 'inner')            # section 5 and the rule of 3.2 use only these
@@ -176,13 +197,42 @@ def run_one(fw, path, ctrl, g, v, mu):
     for k in ('pose', 'v_true', 'duty', 'pwm'):
         if not np.all(np.isfinite(log[k])):
             raise FloatingPointError(f'non-finite {k} in the log')
-    res, _ = o1.evaluate_v7(log, path, sch, lsum=p.lx + p.ly)
+    # S03 v8.2: the gate evaluator; evaluate_v7 runs unchanged inside, so res holds its keys as before
+    res, _, frames = E.evaluate_fig8(log, path, sch, lsum=p.lx + p.ly)
     val = fwsim.run_validity(log)
     if val['run_bad'] == 1:
         raise RuntimeError(f"pose reset mid-run in fwsim ({val['run_bad_reason']})")
-    row = {k: res[k] for k in RUN_COLS[5:] if k in res}          # responses only (no controller..v keys)
+    v_cmd_max, wz_cmd_max = cmd_max(sch)
+    gt = G.gate(frames, res['completed'], v_cmd_max=v_cmd_max, wz_cmd_max=wz_cmd_max, u_t=GATE_U_T,
+                decide=G.DECIDE_ALL, status=res['status'])
+    row = {k: res[k] for k in OLD_COLS[5:] if k in res}          # responses only (no controller..v keys)
     row.update(pos_reset_mid=val['pos_reset_mid'])
+    row.update(gate_fields(res, gt))
     return row, log
+
+
+_CMD_MAX = {}
+
+
+def cmd_max(sch):
+    """o1_gate.fig8_cmd_max of the schedule, kept per (v, w0) as C12 does (the same numbers)."""
+    key = (sch.v, sch.w0)
+    if key not in _CMD_MAX:
+        _CMD_MAX[key] = G.fig8_cmd_max(sch)
+    return _CMD_MAX[key]
+
+
+def gate_fields(res, gt):
+    """GATE_RUN_COLS of one run from the evaluate_fig8 summary and the o1_gate.gate dict (states are the
+    gate's, never recomputed here)."""
+    out = dict(e_bao_max=res['e_bao_max'], gate_version=gt['version'], gate_decide=','.join(gt['decide']),
+               gate_u_t=gt['u_t'], g1_q=gt['g1']['q'], g1_state=gt['g1']['state'], gate_outcome=gt['outcome'])
+    for c in G.MEASURED:
+        for x in ('q', 'lo', 'hi', 'n_undef', 'state'):
+            out[f'{c}_{x}'] = gt[c][x]
+    if set(out) != set(GATE_RUN_COLS):
+        raise RuntimeError(f'gate fields {sorted(set(out) ^ set(GATE_RUN_COLS))} do not match GATE_RUN_COLS')
+    return out
 
 
 def safe_run(fw, path, ctrl, g, v, mu):
@@ -377,6 +427,24 @@ def _head_blob(p):
 
 def _rel_here(p):
     return _rel_or_abs(p, os.path.join(HERE, '..'))
+
+
+def gate_meta():
+    """meta.yaml 'gate' (S03 v8.2): versions and settings of the G1-G5 scoring."""
+    return dict(version=G.GATE_VERSION, eval_version=E.EVAL_VERSION, u_t=GATE_U_T, u_p=0.0, u_psi_deg=0.0,
+                decide=list(G.DECIDE_ALL), thresholds=G.THRESHOLDS, columns=GATE_RUN_COLS)
+
+
+def evaluator_sha256():
+    """SHA-256 of the evaluator files as imported in this process (S03 v8.2 section 8 condition 8), of the
+    bytes on disk and after CRLF -> LF (a Windows checkout holds CRLF; the git blob is LF)."""
+    out = {}
+    for m in (o1, E, G, E.L, E.L.ot):
+        with open(m.__file__, 'rb') as f:
+            b = f.read()
+        out[_rel_here(m.__file__)] = dict(sha256=hashlib.sha256(b).hexdigest(),
+                                          sha256_lf=hashlib.sha256(b.replace(b'\r\n', b'\n')).hexdigest())
+    return out
 
 
 def load_test_points(path=TEST_POINTS, trial=False):
@@ -723,6 +791,25 @@ def git_state(repo):
         return dict(commit='UNKNOWN', dirty=True, modified=[str(e)])
 
 
+def tracked_changes(repo):
+    """Tracked files that differ from HEAD (staged or not); untracked files are not sources (S3G2-2: an
+    output folder inside the repo is not a change of the code)."""
+    try:
+        out = subprocess.run(['git', '-C', repo, 'diff', '--name-only', 'HEAD'], capture_output=True, text=True,
+                             check=True).stdout
+        return sorted(p for p in out.splitlines() if p and not p.startswith(('fwsim/build/', '.vscode/')))
+    except (OSError, subprocess.CalledProcessError) as e:
+        return [f'UNKNOWN: {e}']
+
+
+def source_snapshot(repo):
+    """S3G-1, S3G2-2: git state for meta.yaml, and the key compared at the start and the end of a run: the
+    commit, the tracked files changed, the evaluator files."""
+    st = git_state(repo)
+    return dict(script=st, key=dict(commit=st['commit'], tracked=tracked_changes(repo),
+                                    evaluator=evaluator_sha256()))
+
+
 def _rel_or_abs(p, start):
     """Path of p relative to start with '/', or the absolute path when they are on different
     drives (Windows: relpath raises ValueError)."""
@@ -795,6 +882,16 @@ def main():
     if fw.build_info.get('esp32', {}).get('dirty', True):
         print('WARNING: fwsim.dll was built from a dirty firmware tree; not usable as a main result')
     path = o1.Path8()
+    # S3G-1 (Codex round 1): the script commit and the evaluator files are taken BEFORE the first run and
+    # taken again at the end; S3G2-1: the evaluator files are also compared with their hash read at the end
+    # of this module's import. A difference between these snapshots is recorded and S03 ends with exit
+    # code 2. Limits (S3G3-1, S3G3-2, deferred): only the snapshots of THIS process are compared, so a
+    # source changed and changed back between two snapshots is not seen; the hash at import is a read of
+    # the files on disk a few milliseconds after the evaluator modules were loaded, not of the loaded
+    # code itself; child processes (determinism check, run_error diagnosis) import again from disk and
+    # their sources are not locked: the determinism check of section 3.4 can see such a change only
+    # partly (its 4 points).
+    src_start = source_snapshot(os.path.join(HERE, '..'))
     t0 = time.time()
     sweep_rows, level_rows, design_rows, all_runs = [], [], [], []
     eff_rows, curv_rows, ver_rows, fail_rows, det_rows = [], [], [], [], []
@@ -803,16 +900,20 @@ def main():
     t_sweep_end = None
     tp_info = None                                    # S3V8-3: set when the test file is read (once)
 
-    def checked(ctrl, g, v, mu, ids=None, sink=None, work=None, notes_to=None):
+    def checked(ctrl, g, v, mu, ids=None, sink=None, work=None, notes_to=None, sweep=None):
         """One run; a run_error is recorded (S3C-12), rerun once in a new process for diagnosis
         (B8b-20), then S03 stops. ids = (point_id, box) for a main-design run (sealed). The test
-        set (v8) passes its own sink (rows), work folder and notes list, all under sealed_test/."""
+        set (v8) passes its own sink (rows), work folder and notes list, all under sealed_test/.
+        sweep = (factor, value, is_default) of a sweep run: its run_error row goes to sweep.csv (S3G-2)."""
         row, log = safe_run(fw, path, ctrl, g, v, mu)
         if row['status'] != 'run_error':
             return row, log
         if ids is not None:
             (all_runs if sink is None else sink).append(dict(controller=ctrl, point_id=ids[0], box=ids[1],
                                                              mu=mu, v=v, **row))
+        elif sweep is not None:
+            sweep_rows.append(dict(controller=ctrl, factor=sweep[0], value=sweep[1], is_default=sweep[2],
+                                   v=v, mu=mu, **row))
         note = dict(controller=ctrl, gains=g, v=v, mu=mu, point=ids, first=row.get('error'))
         (rerun_notes if notes_to is None else notes_to).append(note)
         try:
@@ -830,7 +931,7 @@ def main():
         for ctrl in a.controllers:
             dflts[ctrl] = defaults(fw, ctrl)
             for v in SPEEDS:
-                row, log = checked(ctrl, dflts[ctrl], v, mu_mid)
+                row, log = checked(ctrl, dflts[ctrl], v, mu_mid, sweep=('(default check)', '', True))
                 # recorded and logged before the stop test (S3D-4); public like the sweep
                 sweep_rows.append(dict(controller=ctrl, factor='(default check)', value='', is_default=True,
                                        v=v, mu=mu_mid, **row))
@@ -852,7 +953,7 @@ def main():
                     g = dict(dflt, **{name: x})
                     done = True
                     for v in SPEEDS:
-                        row, log = checked(ctrl, g, v, mu_mid)
+                        row, log = checked(ctrl, g, v, mu_mid, sweep=(name, x, x == dflt[name]))
                         sweep_rows.append(dict(controller=ctrl, factor=name, value=x, is_default=x == dflt[name],
                                                v=v, mu=mu_mid, **row))
                         if x == dflt[name]:
@@ -880,7 +981,7 @@ def main():
                 if mu == mu_mid:
                     continue
                 for v in SPEEDS:
-                    row, log = checked(ctrl, dflt, v, mu)
+                    row, log = checked(ctrl, dflt, v, mu, sweep=('(default)', '', True))
                     sweep_rows.append(dict(controller=ctrl, factor='(default)', value='', is_default=True,
                                            v=v, mu=mu, **row))
                     if row['completed'] != 'true':                      # S3C-20
@@ -1103,7 +1204,10 @@ def main():
     for name, rows in (('sweep.csv', sweep_rows), ('sweep_counts.csv', sweep_counts(sweep_rows)),
                        ('levels.csv', level_rows), ('design.csv', design_rows)):
         p = os.path.join(a.out, name)
-        write_csv(p, rows)
+        cols = None
+        if name == 'sweep.csv':     # S3G-2, S3G2-3: one fixed header (identifiers, run columns), other keys after
+            cols = list(dict.fromkeys(list(SWEEP_ID_COLS) + RUN_COLS[5:] + [k for r in rows for k in r]))
+        write_csv(p, rows, cols)
         files[name] = sha256_file(p)
     # S3C-3 (b): no count in public; a failed check stops S03 (3.4), so 'passed' iff it ran to the end
     det_public = ('not run' if stop_public else 'see sealed/ (S03 stopped in the main design)' if stop_sealed
@@ -1114,18 +1218,30 @@ def main():
     status = ('stopped in the sweep: ' + stop_public if stop_public else
               'stopped in the main design (reason sealed)' if stop_sealed else
               'stopped in the test set (reason in sealed_test/)' if stop_test else 'ran to the end')
+    # S3G-1: the sources the runs were made with are those taken at the start; the end must give the same
+    # (S3G2-1: and the evaluator files are those hashed at import; S3G2-2: untracked files do not count)
+    src_end = source_snapshot(os.path.join(HERE, '..'))
+    src_changed = (src_end['key'] != src_start['key'] or src_start['key']['evaluator'] != EVAL_SHA_AT_IMPORT)
+    source_check = (dict(result='CHANGED during the run: not usable as a main result', start=src_start['key'],
+                         end=src_end['key'], evaluator_at_import=EVAL_SHA_AT_IMPORT) if src_changed
+                    else 'same at import, start and end of the run')
+    if src_changed:
+        status += '; the script or evaluator sources changed during the run (S3G-1)'
+        print('WARNING: the script commit or the evaluator files changed during the run; see meta.yaml '
+              'source_check (not usable as a main result)', flush=True)
     # S3V8-3: what was read before the main design, not a second read of the file now
     tp_meta = tp_info if tp_info is not None else dict(file=_rel_here(a.test_points),
                                                          read='no (S03 stopped before the test file was read)')
     with open(os.path.join(a.out, 'meta.yaml'), 'w', encoding='utf-8') as f:
-        f.write(f"""spec: S03 v8 (06_SPECS/2026-11-05_Spec_S03_DOE_chon_gain.md)
+        f.write(f"""spec: S03 v8.2 (06_SPECS/2026-11-05_Spec_S03_DOE_chon_gain.md)
 date: {time.strftime('%Y-%m-%d')}
 setup: sim                     # fwsim: ESP32 firmware C code (DLL) + rpi5/plant_step.py, NOT hardware
 operator: Claude (phiên CODE)
 trial: {str(a.trial).lower()}     # true: tool check with mu 0.5 (S03 2.2, 11.3), never main numbers
 sealed: "L56 / S03 section 1: everything derived from the main-design responses is in sealed/ (with its own manifest.json) and is not looked at before campaign A ends"
 status: {json.dumps(status)}
-script: {json.dumps(git_state(os.path.join(HERE, '..')))}
+script: {json.dumps(src_start['script'])}   # taken before the first run (S3G-1)
+source_check: {json.dumps(source_check)}   # script and evaluator again at the end (S3G-1)
 firmware:
   esp32: {json.dumps(b.get('esp32'))}
   hil_framework_at_build: {json.dumps(b.get('hil_framework'))}
@@ -1149,6 +1265,8 @@ temporary_bounds_for_the_grid: {json.dumps({m: tune_ga.BOUNDS[m] for m in a.cont
 thresholds: {json.dumps(dict(THRESH, tv_duty=f'{Y3_REL:.0%} of the default-gain run, middle mu, same speed'))}
 y3_reference: {json.dumps({f'{c} v={v}': y for (c, v), y in y3_ref.items()})}
 o1: {json.dumps(dict(A=o1.A, a_r=o1.A_R, D=o1.D, D_d=o1.D, t_d=o1.T_D, t_late=o1.T_LATE, delta=o1.DELTA, v_d=o1.V_D, c_cens=o1.C_CENS))}
+gate: {json.dumps(gate_meta())}   # S03 v8.2 section 7: G1-G5 per run (o1_gate.gate), U = 0 on fwsim
+evaluator_sha256: {json.dumps(EVAL_SHA_AT_IMPORT)}   # S03 v8.2 section 8 condition 8: S03 and S04 on the same evaluator; the files as hashed when the script was imported (S3G-1, S3G2-1)
 sweep_run_error_reruns: {json.dumps([n for n in rerun_notes if n['point'] is None], default=str)}
 planned_runs_per_controller: {json.dumps(PLANNED_RUNS)}   # S03 v8 3.2, 7 (rows actually run: sealed/, sealed_test/)
 test_points: {json.dumps(tp_meta)}   # S03 v8 3.2, 7, 8.7 (S3V8-3): read once before the main design; sha256 of the bytes read, sha256_lf after CRLF -> LF, matches_head_blob_lf, generation from <name>.gen.json beside the file
@@ -1161,13 +1279,17 @@ interpretations:   # of this script, not written in S03 v8 / O1 v7; Liam or THES
   - "logs: log.csv (%.17g) of the four determinism points and npz (exact bits) of the centre and every main-design run not completed, all in sealed/logs/; npz of every sweep run not completed in logs_sweep/ (public, as the sweep)"
   - "the inner box (codes +-0.5) always runs for every controller (L41, Liam 06/11 'Chot B'), so the number of runs does not depend on the results; both boxes are always analysed (the same work), and the inner box is kept (effects, Y2 versions, fail counts; curvature is for the outer box only; at every speed, as before L41) only when the rule of S03 3.2 is on at one speed or more (> 64/128 corners 'false' at the middle mu); otherwise its runs are only rows of sealed/runs.csv"
   - "elapsed_s here is the sweep only; the total and the main-design time are in sealed/notes.json (L56, Codex S3E-1; S03 section 7 asks elapsed_s in meta.yaml)"
-  - "public channels left (L56, S3C-3, S3E-1; Liam 06/11 'Chot B', 'Duyet khuyen nghi'): status, exit code and console say that S03 stopped in the main design (S03 3.4 asks to report the stop; the reason is in sealed/stop.json); the wall-clock time still varies a little with the results (scoring a run that does not complete is a little longer, evaluate_v7 closes the window early on completion; writing the npz of the runs not completed; machine noise): accepted, not measured"
+  - "public channels left (L56, S3C-3, S3E-1; Liam 06/11 'Chot B', 'Duyet khuyen nghi'): status, exit code and console say that S03 stopped in the main design (S03 3.4 asks to report the stop; the reason is in sealed/stop.json); the wall-clock time still varies a little with the results (scoring a run that does not complete is a little longer, evaluate_v7 closes the window early on completion; v8.2: the G4 scoring of o1_gate_eval works on the scored frames and their projection solutions, so it may add to this, S3G-7; writing the npz of the runs not completed; machine noise): accepted, not measured"
   - "the upper-end tracking flag uses the 400 001-point path grid (about 15 um); at s = S the window is cut by the end of the path, not flagged (Codex S3C-5, deferred)"
   - "v8: run order per controller centre, outer, inner, axial (3 mu x 3 speeds each), then determinism and analysis; sealed/ is written and closed after every controller; then the test set of every controller (middle mu x 3 speeds); a stop before the test set means the test set does not run"
   - "v8: test-set logs follow the rule of section 7 (npz of every run not completed; there is no centre point in the test set); the compressed npz is made for every run (same work)"
   - "v8: the test-points file is read once before the main design (S3V8-3); 'committed' (section 8.7) = tracked, unmodified for git status AND the bytes read match the blob in HEAD after CRLF -> LF of both; its generation record is <name>.gen.json beside the file read, with the sha256 of the bytes read or of their LF or CRLF form (R2-2: the committed record holds the SHA-256 of the CRLF file; a clean LF checkout is the same content); a stop at this check keeps what was read in test_points (R2-4); with --trial a failed check is allowed and recorded in test_points.problems"
   - "v8 (S3V8-2): warnings, prints and tracebacks of the test phase go to sealed_test/diag.txt and any exception of the phase, writing its outputs included, is a stop recorded in sealed_test/stop.json (written first; R2-1); the warning policy in force is kept, a warning made an error stays an error (R2-3); the same channel in the main design (warnings to the console) is left as before (deferred, Codex S3V8-2)"
   - "v8: n_upper_frames, n_back_frames count the frames evaluate_v7 kept for scoring (t_k <= t_end), as section 4 defines them; they are diagnostics, never responses"
+  - "v8.2: every run (sweep, main design, axial, test set, determinism reruns) is scored by o1_gate_eval.evaluate_fig8, which calls evaluate_v7 unchanged (the S03 v8 columns keep their values), then o1_gate.gate with u_t = 0 (fwsim knows the command start; the 50 Hz hold is a property of the command path, not added to U, o1_gate docstring), U_p = U_psi = 0 (true plant pose) and every condition deciding (DECIDE_ALL)"
+  - "v8.2: G1-G5 columns use the names of tools/rq3_log.py GATE_COLS (B81-3); gate_json_sha256, the _chung columns (one frame domain on fwsim: the common domain is the union) and the G1 fields t_done... (fwsim scorer, deferred: Liam 14/11 CODE_R134) are not written; gate_outcome is the O1 3.5 outcome over G1-G5; with U = 0, lo = hi = q"
+  - "v8.2: a failure of the gate scoring (e.g. the rebuilt nearest distance of G4 not the row e_perp) is a run_error, so S03 stops (B8b-20) as for a DLL error"
+  - "v8.2: the public sweep carries the G columns too (Liam 14/11 CODE_FEAS 'Co, mot cach cham'); G3-G5 are not responses of section 5"
 elapsed_s: {sweep_s}
 file_sha256: {json.dumps(files)}
 files:
@@ -1180,7 +1302,15 @@ files:
   - sealed_test/: "SEALED separately (S03 v8 section 7): runs_test.csv, logs/, notes.json, stop.json, diag.txt (warnings, prints, traceback of the test phase), manifest.json; opened only after the RSM coefficients at the middle mu are saved and committed"
 """)
     print(f'S03 finished -> {a.out}; status: {status}')
-    return 0 if not (stop_public or stop_sealed or stop_test) else 2
+    return 0 if not (stop_public or stop_sealed or stop_test or src_changed) else 2
+
+
+# S3G2-1: the evaluator files on disk, read at the end of this module's import, a few milliseconds after
+# the evaluator modules were loaded above (the start and end snapshots of main() are compared with it).
+# Not a hash of the loaded code: a checkout changed inside that window is not seen (S3G3-1, deferred).
+# Child processes import again from disk and their sources are not locked; the determinism check of
+# section 3.4 can see such a change only partly (S3G3-2).
+EVAL_SHA_AT_IMPORT = evaluator_sha256()
 
 
 if __name__ == '__main__':
