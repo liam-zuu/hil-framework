@@ -1,0 +1,146 @@
+"""s02_sender.py (CODE_S02 design sections 3.1, 3.2): preparation zeros, the schedule from k = 0, 1 s of
+zeros, all on one absolute 50 Hz grid; the packet is pc_sender's; prep_spec for run_hil --s02-prep."""
+import hashlib
+import os
+import struct
+import subprocess
+
+import pytest
+
+import pc_sender as ps
+import s02_sender as s2
+from trajectory_pub import GROUP_A, get_body_velocity
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+class FakeSock:
+    def __init__(self, clk=None, stop_at=None):
+        self.sent, self.clk, self.stop_at = [], clk, stop_at
+
+    def sendto(self, pkt, addr):
+        if self.stop_at is not None and len(self.sent) == self.stop_at:
+            self.stop_at = None
+            raise KeyboardInterrupt
+        self.sent.append((pkt, addr, None if self.clk is None else self.clk.t))
+
+
+class FakeClock:
+    """Time advances only by sleep() plus a fixed cost per clock() call (send jitter)."""
+    def __init__(self, t0=1000.0, cost=0.0003):
+        self.t, self.cost = t0, cost
+
+    def __call__(self):
+        self.t += self.cost
+        return self.t
+
+    def sleep(self, d):
+        self.t += max(d, 0.0)
+
+
+def _decode(pkt):
+    assert len(pkt) == 14 and pkt[0] == ps.TRAJ_START
+    chk = 0
+    for b in pkt[:13]:
+        chk ^= b
+    assert pkt[13] == chk
+    return struct.unpack_from('<fff', pkt, 1)
+
+
+def _run(tid, prep_s=3.0, stop_at=None, allow_strafe=True):
+    clk = FakeClock()
+    sock, lines = FakeSock(clk, stop_at), []
+    t_start = clk.t
+    r = s2.s02_loop('10.0.0.2', tid, prep_s, allow_strafe, sock=sock, clock=clk, sleep=clk.sleep,
+                    out=lines.append, wall=lambda: 1.7e9)
+    return r, sock.sent, lines, t_start
+
+
+@pytest.mark.parametrize('tid', sorted(GROUP_A))
+def test_prep_schedule_tail(tid):
+    r, sent, lines, _ = _run(tid)
+    spec = GROUP_A[tid]
+    P, K = 150, s2.sched_count(spec)
+    assert (r['prep'], r['sched'], r['tail'], r['complete']) == (P, K, 50, 1)
+    assert len(sent) == P + K + 50
+    assert all(_decode(p) == (0.0, 0.0, 0.0) for p, _, _ in sent[:P])
+    for k in range(K):
+        assert _decode(sent[P + k][0]) == pytest.approx(get_body_velocity(k / 50, spec), abs=1e-6)
+    assert all(_decode(p) == (0.0, 0.0, 0.0) for p, _, _ in sent[P + K:])
+    assert all(a == ('10.0.0.2', ps.TRAJ_PORT) for _, a, _ in sent)
+
+
+def test_packet_bytes_are_pc_sender_packets():
+    _, sent, _, _ = _run('A-F2')
+    spec = GROUP_A['A-F2']
+    for k in (0, 7, 300):
+        assert sent[150 + k][0] == ps.pack_packet(*get_body_velocity(k / 50, spec))
+
+
+def test_grid_is_absolute():
+    """Packet j leaves at or just after t_start + j/50 (clock cost only), never drifting."""
+    _, sent, _, t_start = _run('A-K1')
+    for j, (_, _, t) in enumerate(sent):
+        assert 0.0 <= t - (t_start + j / 50) < 0.002
+
+
+def test_k0_line_and_end_fields():
+    r, sent, lines, _ = _run('A-K2')
+    assert lines[0].startswith('#s02_start,test=A-K2,') and 'prep_s=3,n_prep=150,n_sched=450,n_tail=50' in lines[0]
+    assert lines[1] == '#s02_k0,t_epoch=1700000000.000'
+    end = dict(p.split('=', 1) for p in lines[-1].split(',')[1:])
+    assert (end['sent_prep'], end['sent_sched'], end['sent_tail'], end['complete']) == ('150', '450', '50', '1')
+    assert float(end['sched_first_s']) == pytest.approx(150 / 50, abs=0.002)
+    assert float(end['sched_last_s']) == pytest.approx((150 + 449) / 50, abs=0.002)
+
+
+@pytest.mark.parametrize('stop_at,phase,k0', [(10, 'prep', False), (200, 'sched', True), (150 + 450 + 5, 'tail', True)])
+def test_ctrl_c_sends_zeros(stop_at, phase, k0):
+    r, sent, lines, _ = _run('A-K2', stop_at=stop_at)
+    assert r['complete'] == 0
+    assert f'#s02_interrupted,phase={phase}' in lines
+    assert any(l.startswith('#s02_k0') for l in lines) == k0
+    assert len(sent) == stop_at + s2.STOP_ZEROS
+    assert all(_decode(p) == (0.0, 0.0, 0.0) for p, _, _ in sent[-s2.STOP_ZEROS:])
+    assert 'complete=0' in lines[-1]
+
+
+def test_strafe_needs_flag():
+    with pytest.raises(ValueError, match='allow-strafe'):
+        _run('A-S1', allow_strafe=False)
+    with pytest.raises(ValueError, match='not a group A'):
+        s2.check_test('A-X9')
+
+
+@pytest.mark.parametrize('bad', [0.0, -1.0, 3.01, float('nan')])
+def test_prep_must_be_on_the_grid(bad):
+    with pytest.raises(ValueError, match='prep-s'):
+        s2.prep_packets(bad)
+
+
+@pytest.mark.parametrize('tid', sorted(GROUP_A))
+def test_prep_spec_is_shifted_schedule(tid):
+    spec = GROUP_A[tid]
+    w = s2.prep_spec(spec, 3.0)
+    assert w.duration == pytest.approx(3.0 + spec.duration)
+    for i in range(0, 150):
+        assert get_body_velocity(i / 50 + 0.0037, w) == (0.0, 0.0, 0.0)
+    for k in range(0, s2.sched_count(spec), 7):
+        t = k / 50 + 0.0037
+        if t < spec.duration:
+            assert get_body_velocity(3.0 + t, w) == pytest.approx(get_body_velocity(t, spec), abs=1e-12)
+
+
+def test_trajectory_pub_is_not_changed():
+    """trajectory_pub.py is in the S04 blob lock (fwsim/s04_ga.py SOURCES): this branch must not change it."""
+    out = subprocess.run(['git', 'diff', '--name-only', '68701b4', '--', 'trajectory_pub.py'],
+                         cwd=os.path.join(HERE, '..'), capture_output=True, text=True)
+    if out.returncode != 0:
+        pytest.skip('no git history here')
+    assert out.stdout.strip() == ''
+
+
+def test_main_refuses_strafe_without_flag(capsys):
+    with pytest.raises(SystemExit):
+        s2.main(['--ip', '10.0.0.2', '--test', 'A-S2'])
+    assert 'allow-strafe' in capsys.readouterr().err

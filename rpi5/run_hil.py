@@ -447,6 +447,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument('--test',          default=None,
                    help='Spec S02 group A test ID (A-L1 ... A-K3): sets trajectory, speed, '
                         'duration; A-K* also put the plant in wheels-lifted mode')
+    p.add_argument('--s02-prep',      type=float, default=None, metavar='S',
+                   help='S02 P2-2 (CODE_S02, Liam 15/11 "Them co --s02-prep"): with --test and --finite-run, '
+                        'RUN starts with S s of setpoint 0 (SWA on: run_active rises, the firmware resets) '
+                        'before k = 0 of the test (s02_sender.prep_spec; S02: 3)')
     p.add_argument('--o1',            default=None,
                    choices=['O1-F02', 'O1-F05', 'O1-F08', 'O1-K1', 'O1-K2'],
                    help='C6 (L76): O1 floor task from o1_tasks.py (figure 8 = the S03/S04 schedule of '
@@ -657,6 +661,15 @@ def main() -> int:
         lifted = args.test in LIFTED_TESTS
         args.traj = traj_spec.kind
         log.info('Group A test %s: %s', args.test, traj_spec)
+    if args.s02_prep is not None:
+        if not (args.test and args.finite_run):
+            raise SystemExit('--s02-prep needs --test and --finite-run')
+        import s02_sender
+        try:
+            traj_spec = s02_sender.prep_spec(traj_spec, args.s02_prep)
+        except ValueError as exc:
+            raise SystemExit(str(exc))
+        log.info('#s02,test=%s,prep_s=%g,run_s=%g', args.test, args.s02_prep, traj_spec.duration)
     if args.o1:
         if args.test or args.traj != 'idle' or args.duration or args.traj_loop:
             raise SystemExit('--o1 excludes --test, --traj, --duration, --traj-loop')
