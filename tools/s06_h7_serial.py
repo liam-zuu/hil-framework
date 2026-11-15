@@ -81,6 +81,12 @@ IDLE_EST_TOL_US = 1
 # [PROPOSAL CODE_S06, 100 frames = 0.1 s]
 T10_SPI_IRQ = 'SPI1'
 FIRST_SPI_FULL_MARGIN = 100
+# Premise of that check (Codex round 4; Liam 15/11 'Sua 2 + vong 5'): the Pi really sent one frame per ms. The
+# 'Link period' line after the run gives frames received and H7 ms from first to last frame: H7 ms - (frames - 1)
+# = the frame gaps of the run (+ clock drift). Gaps + LINK_DRIFT_MS must stay under FIRST_SPI_FULL_MARGIN, so no
+# window can lose 100 frames; else (or no such line, or link lost inside the run) the check has no ground: missing.
+# [PROPOSAL CODE_S06: 30 ms = 50 ppm H7-Pi over a 610 s run]
+LINK_DRIFT_MS = 30
 
 _RE = {
     'link_up': re.compile(r'SPI link up at t=(\d+) ms'),
@@ -200,8 +206,9 @@ def load_upper(rows) -> dict:
     if not lo or any(v is None for v in lo):
         return dict(load_upper_pct=None, load_upper_pct_max_window=None)
     w = [r['win_ms'] for r in rows]
+    # T10U-R3-2 round 4: the largest window bound never below that window's ISR share (float rounding)
     return dict(load_upper_pct=100.0 - sum(v * x for v, x in zip(lo, w)) / sum(w),
-                load_upper_pct_max_window=100.0 - min(lo))
+                load_upper_pct_max_window=max(max(100.0 - v, r.get('isr_pct', 0.0)) for v, r in zip(lo, rows)))
 
 
 def idle_check(h: dict) -> str:
@@ -238,6 +245,8 @@ def t10_rows(blocks, f_real_mhz: Optional[float] = None):
         unc = (1.0 / h['cal_n'] + 1.0 / h['idle_pass']) if h['cal_n'] and h['idle_pass'] else None
         bad = idle_check(h)
         lo = None if bad else idle_lower_pct(idle_pct, unc, h['idle_pass'])
+        if lo is not None:              # T10U-R3-2 round 4: idle_check passed in µs; keep that in % (float rounding)
+            lo = min(lo, 100.0 - isr_pct)
         win_rows.append(dict(window=k, line=h['line'], win_ms=h['win_ms'], isr_us=h['isr_us'],
                              isr_pct=isr_pct, idle_pass=h['idle_pass'], idle_us=h['idle_us_est'],
                              idle_pct=idle_pct,
@@ -245,7 +254,7 @@ def t10_rows(blocks, f_real_mhz: Optional[float] = None):
                              idle_rel_unc=unc,
                              cal_n=h['cal_n'], cal_cyc=h['cal_cyc'], ovh_cyc=h['ovh_cyc'],
                              meas_cost_us=n_calls * h['ovh_cyc'] / F_NOMINAL_MHZ,
-                             idle_pct_lo=lo, load_upper_pct=None if lo is None else 100.0 - lo,
+                             idle_pct_lo=lo, load_upper_pct=None if lo is None else max(100.0 - lo, isr_pct),
                              idle_bad=bad))
         for i in bl['irqs']:
             irq_rows.append(dict(window=k, irq=i['irq'], count=i['n'], excl_us=i['excl_us'],
@@ -317,6 +326,21 @@ def first_block_spi_n(ev: List[dict], span) -> Optional[int]:
         elif started and e['kind'] == 't10_irq' and e['irq'] == T10_SPI_IRQ:
             return e['n']
     return None
+
+
+def spi_premise_problem(ev: List[dict], span) -> str:
+    """'' when the run proves the Pi sent ~1 frame per ms (LINK_DRIFT_MS comment), else the reason."""
+    a, b = span
+    if link_interruptions(ev[a:b]):
+        return 'link mất rồi lên lại trong lượt'
+    lp = [e for e in ev[b:] if e['kind'] == 'link_period']
+    if not lp:
+        return 'không có dòng Link period sau lượt'
+    gaps = lp[0]['h7_ms'] - lp[0]['pi_ms']
+    if gaps + LINK_DRIFT_MS >= FIRST_SPI_FULL_MARGIN:
+        return (f"Link period: H7 {lp[0]['h7_ms']} ms, {lp[0]['frames']} frame, hở {gaps} ms "
+                f"(+ {LINK_DRIFT_MS} ms trôi >= {FIRST_SPI_FULL_MARGIN})")
+    return ''
 
 
 def t10_summary(blocks, win_rows, irq_rows, ev, span) -> dict:
@@ -397,6 +421,9 @@ def t10_summary(blocks, win_rows, irq_rows, ev, span) -> dict:
         elif n_spi >= full:
             missing.append(f'khối T10 đầu của lượt có {T10_SPI_IRQ} n={n_spi} (>= {full}): cửa sổ gần trọn sau '
                            'link up, không phân biệt được mất khối đầu với link up sát đầu cửa sổ')
+        why = spi_premise_problem(ev, span)
+        if why:
+            missing.append(f'kiểm {T10_SPI_IRQ} khối đầu không có căn cứ: {why}')
     # T10U-1: idle figures that cannot come from the H7 formula, or do not fit the window = a damaged line
     bad_idle = [(r['window'], r['idle_bad']) for r in win_rows if r.get('idle_bad')]
     if bad_idle:

@@ -54,7 +54,7 @@ def make_log(blocks=4, print_drop_end=0, pre_up_block=True, ts_prefix=False, pc=
     t_end = 1.0 + 10.0 * blocks
     out += [(t_end, f'S06log: pushed=99 dropped=0  print_drop={print_drop_end}'),
             (t_end + 0.05, 'SPI link lost (no frame for 50 ms): encoders stopped, SPI1 restart'),
-            (t_end + 0.05, 'Link period: 40001 frames, H7 40256 ms from first to last frame (Pi: 40000 ms at 1 kHz)'),
+            (t_end + 0.05, 'Link period: 40001 frames, H7 40010 ms from first to last frame (Pi: 40000 ms at 1 kHz)'),
             (t_end + 0.5, link(lost=1 + int(reconnect), rearm=1 + int(reconnect))),
             (t_end + 0.5, frame(10000 * blocks))]
     out += [(t_end + 9.0, l) for l in t10_block(isr_us=5).splitlines()]      # after the run: not used
@@ -120,7 +120,7 @@ def test_link_stats_and_timestamp_prefix():
     assert st['bounded_start'] and st['bounded_end'] and st['expected_end_loss'] == 1
     assert st['applied'] == 40000 and st['skipped'] == 0 and st['err'] == 0 and st['age_max_us_since_boot'] == 420
     assert st['lost'] == 1 and st['rearm'] == 1 and ser.link_fails(st) == []
-    assert st['link_periods'] == [dict(frames=40001, h7_ms=40256, pi_ms=40000)]
+    assert st['link_periods'] == [dict(frames=40001, h7_ms=40010, pi_ms=40000)]
 
 
 def test_link_faults_anywhere_in_the_run():
@@ -388,9 +388,10 @@ def test_cli_with_damaged_header_writes_outputs(tmp_path):
     assert s['print_delay_max_ms'] == ser.PRINT_DELAY_MAX_MS
 
 
-def first_head_log(rel_heads, spi_n, end_rel, first_idle=None, drop_first_spi=False):
+def first_head_log(rel_heads, spi_n, end_rel, first_idle=None, drop_first_spi=False, gaps_ms=5):
     """T10U-R3-1: a run with link up at 1 s and the T10 headers at `rel_heads` s after it (PC times), SPI1 n of
-    each block from `spi_n`; S06log lines at link up and at `end_rel`, then link lost."""
+    each block from `spi_n`; S06log lines at link up and at `end_rel`, then link lost and the 'Link period' line
+    with `gaps_ms` ms more H7 time than frame intervals (None: no such line)."""
     t_up = 1.0
     out = [(0.0, '--- H753 HIL boot ---'), (0.5, link()), (0.5, frame(0)),
            (t_up, 'SPI link up at t=12345 ms'), (t_up, 'S06log: pushed=1 dropped=0  print_drop=0')]
@@ -402,9 +403,39 @@ def first_head_log(rel_heads, spi_n, end_rel, first_idle=None, drop_first_spi=Fa
             lines = [l for l in lines if 'SPI1' not in l]
         out += [(t_up + r, l) for l in lines]
     out += [(t_up + end_rel, 'S06log: pushed=99 dropped=0  print_drop=0'),
-            (t_up + end_rel + 0.05, 'SPI link lost (no frame for 50 ms): encoders stopped, SPI1 restart'),
-            (t_up + end_rel + 0.5, link(lost=1, rearm=1)), (t_up + end_rel + 0.5, frame(40000))]
+            (t_up + end_rel + 0.05, 'SPI link lost (no frame for 50 ms): encoders stopped, SPI1 restart')]
+    if gaps_ms is not None:
+        nfr = int(end_rel * 1000)
+        out.append((t_up + end_rel + 0.05, f'Link period: {nfr + 1} frames, H7 {nfr + gaps_ms} ms from first to last '
+                                           f'frame (Pi: {nfr} ms at 1 kHz)'))
+    out += [(t_up + end_rel + 0.5, link(lost=1, rearm=1)), (t_up + end_rel + 0.5, frame(40000))]
     return [f'{int(1e9 + t * 1e6)}\t{l}' for t, l in out]
+
+
+def test_codex_r4_pi_gaps_make_the_spi1_check_missing():
+    """Codex round 4 R3-1 case 1 (Liam 'Sua 2 + vong 5'): the header 0.3 s after link up lost, the Pi skipped 101
+    sends in that window, so the next block has SPI1 n=9899 < 9900 and both checks passed (8f73799/781273c:
+    complete). The run's Link period shows those gaps (H7 ms - frame intervals = 101): missing, not complete."""
+    s, _ = _run_summary(first_head_log([10.3, 20.3, 30.3, 40.3], [9899, 10000, 10000, 10000], 40.95,
+                                       first_idle='idle_pass=0 idle_us_est=0', gaps_ms=101))
+    assert s['complete'] is False and s['data_lost'] == []
+    assert any('không có căn cứ' in m and 'hở 101 ms' in m for m in s['missing'])
+    s, _ = _run_summary(first_head_log([9.0, 19.0, 29.0], [9000, 10000, 10000], 31.0, gaps_ms=None))
+    assert any('Link period' in m for m in s['missing'])                 # no Link period line: no ground
+    s, _ = _run_summary(first_head_log([9.0, 19.0, 29.0], [9000, 10000, 10000], 31.0, gaps_ms=69))
+    assert s['complete'] is True                                         # 69 + 30 < 100
+    s, _ = _run_summary(first_head_log([9.0, 19.0, 29.0], [9000, 10000, 10000], 31.0, gaps_ms=70))
+    assert s['complete'] is False                                        # 70 + 30 >= 100
+
+
+def test_codex_r4_float_edge_bound_not_below_isr():
+    """Codex round 4 R3-2: isr_us=2000360 with idle 8000000 µs fits the window exactly (idle_lo + isr = 10^7 µs)
+    but 100 - idle_pct_lo came out 20.00359999999999 < isr_pct 20.0036. Bound now never below the ISR share."""
+    hdr = 'T10: win_ms=10000 isr_us=2000360 idle_pass=1800000 idle_us_est=8000000 cal=22500/48000000 ovh_cyc=24'
+    blocks, _ = ser.t10_blocks(ser.parse_lines([hdr]), all_blocks=True)
+    w = ser.t10_rows(blocks)[0][0]
+    assert w['idle_bad'] == '' and w['load_upper_pct'] >= w['isr_pct']
+    assert ser.load_upper([w])['load_upper_pct_max_window'] >= w['isr_pct']
 
 
 def test_codex_r3_1_lost_first_block_is_not_complete(tmp_path):
