@@ -149,7 +149,12 @@ WINDOWS_S = (1.0, 2.0, 3.0)      # s after the first non-zero pwm (PWM side)
 SEARCH = (-100.0, 400.0)         # steps around the RUN step
 COARSE, FINE = 0.25, 0.01        # steps (PWM side)
 # count side (L98, L99)
-FW_COUNTS_AT_TICK = ('16702ff0e688',)   # AGV firmware: counts read within J_READ_US of t_now, else LOG_CNT_INVALID
+# AGV firmware whose log counts are read within J_READ_US of t_now (else LOG_CNT_INVALID). 5bde4c5 (fix/gain-boot,
+# on 16702ff) changes only logger.c / logger.h (the #gain line gets boot) and a comment in us_state.h; src/main.c and
+# src/encoder/ are those of 16702ff (AGV git diff 16702ff 5bde4c5; a test checks when the AGV repo is there). Liam
+# 15/11 CODE_RS4 local_3b1a170b "Thêm 5bde4c5, Codex riêng (Recommended)".
+FW_COUNTS_AT_TICK = ('16702ff0e688', '5bde4c55bf3a')
+FW_COUNTS_BASE = '16702ff0e688'         # the firmware L98 was checked on; the others keep its count read path
 LOG_CNT_INVALID = -2 ** 31       # AGV main.c LOG_CNT_INVALID (INT32_MIN): line dropped
 J_READ_US = 50.0                 # AGV main.c LOG_CNT_WIN_US (a test checks)
 FIT_S = 3.0                      # s of log lines after the first count change

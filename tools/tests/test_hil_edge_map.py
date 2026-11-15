@@ -416,6 +416,12 @@ def test_refusals_firmware_clock_frames():
                      (FW + [dict(sha='54b7269abcde', dirty='0')], '54b7269abcde')):
         em = run(s, fw=fw)
         assert not em['ok'] and word in em['reason'], em['reason']
+    for fw in ([dict(sha='5bde4c55bf3a', dirty='0', env='ladrc')],              # 5bde4c5: same count read (15/11)
+               FW + [dict(sha='5bde4c55bf3a', dirty='0', env='esp32-s3-devkitc-1')]):
+        em = run(s, fw=fw)
+        assert em['ok'], em['reason']
+    em = run(s, fw=[dict(sha='5bde4c55bf3a', dirty='1')])
+    assert not em['ok'] and 'dirty=1' in em['reason']
     for ppm in (None, 150.0, -101.0):                                   # L100: the ESP32 / Pi estimate is reported only
         em = run(s, esp_pi_ppm=ppm)
         assert em['ok'] and em['esp_pi_ppm'] == ppm, em['reason']
@@ -1081,3 +1087,18 @@ def test_scorer_cli_esp_log_errors(tmp_path):
         f.write('timestamp_us,log_seq\n1,1\n')
     assert H.main(['--frame-log', p, '--task', 'O1-F05', '--esp-log', c]) == 2       # bad log: an error
     assert M.main(['--frame-log', p, '--esp-log', c]) == 2
+
+
+def test_fw_counts_at_tick_keep_the_count_read_path():
+    """Every firmware of FW_COUNTS_AT_TICK has src/main.c and src/encoder/ of FW_COUNTS_BASE (where L98 put the
+    count read at t_now), checked in the AGV repo when it is there (AGV_REPO, default the thesis checkout)."""
+    import subprocess
+    agv = os.environ.get('AGV_REPO', r'D:/CLAUDE_THESIS/03_CODE/AGV_FIRMWARE')
+    if not os.path.isdir(os.path.join(agv, '.git')):
+        pytest.skip('AGV repo not here')
+    for sha in M.FW_COUNTS_AT_TICK:
+        r = subprocess.run(['git', '-C', agv, 'diff', '--quiet', M.FW_COUNTS_BASE[:7], sha[:7], '--',
+                            'src/main.c', 'src/encoder'], capture_output=True)
+        if r.returncode not in (0, 1):
+            pytest.skip(f'AGV commit {sha[:7]} or {M.FW_COUNTS_BASE[:7]} not in {agv}')
+        assert r.returncode == 0, f'{sha}: src/main.c or src/encoder differ from {M.FW_COUNTS_BASE}'
