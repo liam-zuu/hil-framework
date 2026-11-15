@@ -220,7 +220,7 @@ def test_map_run_refuses_an_ultrasonic_cut(monkeypatch, tmp_path):
     assert not res['ok'] and res['reason'] == 'us_cut' and res['us_cut_ticks'] == 99
     assert all(r[1:] == [''] * (len(pt.PLANT_COLUMNS) - 1) for r in rows)
     res, _ = _fake_run(monkeypatch, tmp_path, us_cut=0)
-    assert res['ok'], res
+    assert res['fit_ok'], res                       # the fit runs; the map is locked (not_certified)
 
 
 def test_map_run_refuses_a_fault_run(monkeypatch, tmp_path):
@@ -246,6 +246,17 @@ def test_map_run_both_drift_signs(monkeypatch, tmp_path, ppm):
            **{w: counts[:, i] for i, w in enumerate(pt.WHEELS)}}
     monkeypatch.setattr(s02_metrics, 'load_log', lambda p: {'_all': log})
     res, _ = pt.map_run(str(tmp_path / 'r.npz'), str(tmp_path / 'r.csv'), 'A-L2')
-    assert res['ok'], res
+    assert res['fit_ok'], res
     err = (res['alpha'] + res['beta'] * te) - (alpha + beta * te)
     assert np.max(np.abs(err)) < 1.5e-3
+
+
+def test_map_run_is_locked_until_certified(monkeypatch, tmp_path):
+    """Liam 15/11 CODE_S02 "Khoa anh xa, gop phan on": a fit that would be ok gives no map (not_certified), no
+    plant rows; with the lock lifted (a test only) the same run maps."""
+    res, rows = _fake_run(monkeypatch, tmp_path)
+    assert res['fit_ok'] and not res['ok'] and res['reason'] == 'not_certified' and res['certified'] is False
+    assert all(r[1:] == [''] * (len(pt.PLANT_COLUMNS) - 1) for r in rows)
+    monkeypatch.setattr(pt, 'CERTIFIED', True)
+    res, rows = _fake_run(monkeypatch, tmp_path)
+    assert res['ok'] and any(r[1] != '' for r in rows)

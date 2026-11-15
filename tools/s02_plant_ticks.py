@@ -55,6 +55,14 @@ Map t_Pi = alpha + beta t_ESP (seconds), per run.
   t = 0 of s02_cmd_path, Liam 15/11 CODE_S02 "Moc t = 0 khong xac dinh").
 Plant at a tick: linear interpolation in Pi time between the two frames around alpha + beta t_ESP (theta
 unwrapped first, wrapped back to (-pi, pi]); outside the frame log: empty (no extrapolation, P2-3).
+
+NOT CERTIFIED (Codex Sol round 3, 15/11; thẩm định 03_CODE/docs/review/2026-11-15_Tham_dinh_S02_prep_vong3.md): a
+fixed-beta scan misses branches with another beta (S2P3-1), minima between grid points are not refined (S2P3-2),
+the command anchors do not bound the absolute lag (S2P3-3: lost packets at both ends shift both anchors), and the
+rate model ignores the EncoderGen retime of every half-period change (S2P3-7). Liam 15/11 CODE_S02, nguyen van:
+"Khoa anh xa, gop phan on (Recommended)": until the certification is redesigned (design v3), map_run reports the
+fit (fit_ok, fit_reason, alpha, beta, ...) but returns ok False, reason not_certified, and no plant rows, so no
+family R number on HIL can come out of this tool. fit_map itself is unchanged and tested.
 """
 import argparse
 import csv
@@ -89,6 +97,7 @@ ENC_OMEGA_MIN = 0.3              # rad/s, encoder_gen.c: no edges at or below
 ENC_TICKS_PER_S = 1.0e6          # encoder_gen.h ENC_TIMER_FREQ x ENC_CLOCK_CAL (1.0)
 ENC_PPR = 330
 RESID_MAX = 2.0                  # [ĐỀ XUẤT] counts RMS (S02 v1.10)
+CERTIFIED = False                # Codex round 3 S2P3-1..3, -7 open: map_run never outputs a map (module docstring)
 PPM_MAX = 2002.0                 # S05 4.7 (i)
 ANCHOR_LAG_S = 0.015             # middle of the 0..30 ms command anchor lag (s02_cmd_path)
 PLANT_COLUMNS = ['timestamp_us', 'x', 'y', 'theta', 'vx_w', 'vy_w', 'vx_b', 'vy_b', 'wz', 'w1', 'w2', 'w3', 'w4']
@@ -380,8 +389,11 @@ def map_run(frame_log, esp_log, test_id):
     delta0 = t_pi_a - beta0 * (ta * 1e-6 - ANCHOR_LAG_S - te[0])     # t_Pi at the first tick
     fit = fit_map(te, counts, tp, state[:, 0:4], delta0, beta0)
     res.update(fit)
-    rows = (plant_rows(te_us, tp, state, fit['alpha'], fit['beta']) if fit['ok'] else
-            [[int(t)] + [''] * (len(PLANT_COLUMNS) - 1) for t in te_us])
+    res.update(fit_ok=fit['ok'], fit_reason=fit['reason'], certified=CERTIFIED)
+    if fit['ok'] and not CERTIFIED:
+        # Liam 15/11 CODE_S02 "Khoa anh xa, gop phan on": the fit is reported for study, never used (fail-closed)
+        res.update(ok=False, reason='not_certified')
+    rows = (plant_rows(te_us, tp, state, fit['alpha'], fit['beta']) if res['ok'] else empty)
     return res, rows
 
 

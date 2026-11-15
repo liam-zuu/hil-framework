@@ -181,7 +181,7 @@ def test_battery_rerun_needs_its_own_sag():
     sag = [dict(r, block_status='battery_rerun') for r in
            _rows(('A-L1', 1, 'completed', '', ''), ('A-L2', 1, 'completed', '', ''), v=('12.4', '12.0'))]
     part = _rows(('A-L1', 1, 'completed', '', ''), block='2')
-    assert any('do not run again' in p for p in sp.check(sag + part))
+    assert any('does not run again' in p for p in sp.check(sag + part))
 
 
 def test_sag_of_exactly_0_3_v_is_not_over():
@@ -216,3 +216,58 @@ def test_metrics_skip_battery_rerun_and_replaced(tmp_path, monkeypatch):
     monkeypatch.setattr(s02_metrics, 'compute', lambda log, tid: {'e_vx': 0.0})
     out = s02_metrics.run_dir_metrics(str(tmp_path))
     assert [o['run_id'] for o in out] == ['c']
+
+
+def test_battery_rerun_needs_one_whole_block():
+    """S2P3-4 (Codex round 3): an old block (12.4 -> 12.0 V) re-run as two half blocks (12.4 -> 12.2, 12.2 -> 12.0 V)
+    passes each sag rule but not the whole-block rule."""
+    old = [dict(r, block_status='battery_rerun') for r in
+           _rows(('A-L1', 1, 'completed', '', ''), ('A-L2', 1, 'completed', '', ''), v=('12.4', '12.0'))]
+    b = _rows(('A-L1', 1, 'completed', '', ''), block='2', v=('12.4', '12.2'))
+    c = _rows(('A-L2', 1, 'completed', '', ''), block='3', v=('12.2', '12.0'))
+    assert any('replaced by 2 blocks' in p for p in sp.check(old + b + c))
+    whole = _rows(('A-L1', 1, 'completed', '', ''), ('A-L2', 1, 'completed', '', ''), block='2', v=('12.4', '12.2'))
+    assert sp.check(old + whole) == []
+
+
+@pytest.mark.parametrize('bad', ['inf', '-inf', '1e309'])
+def test_loss_fields_infinite_are_problems_not_errors(bad):
+    """S2P3-5 (Codex round 3): inf or an overflowing number is a reported problem, not an exception."""
+    base = _rows(('A-L1', 1, 'completed', '', ''))
+    assert sp.check([dict(base[0], gen_pause_n=bad)])
+    assert sp.check([dict(base[0], missing_pct=bad)])
+
+
+def test_every_cell_has_five_reps_and_the_manifest_is_its_plan(tmp_path):
+    """S2P3-6 (Codex round 3): drop A-L1/PID/rep 5 from the manifest and from runs.csv: the reps of the whole
+    manifest are still 1..5 but that cell has 4; and the CLI rebuilds the plan from the manifest's arguments."""
+    rows, blocks = sp.plan('hil', ['PID', 'LADRC'], 5, 7)
+    cut = [dict(bl, tests=[t for t in bl['tests'] if not (t == 'A-L1' and bl['controller'] == 'PID' and bl['rep'] == 5)])
+           for bl in blocks]
+    keep = [r for r in rows if not (r['test_id'] == 'A-L1' and r['controller'] == 'PID' and r['rep'] == 5)]
+    probs = sp.check(_filled(keep), cut, sp.REPS_MAIN)
+    assert any("('A-L1', 'PID'): planned repetitions [1, 2, 3, 4]" in p for p in probs)
+    assert sp.main(['plan', '--platform', 'hil', '--order-seed', '7', '--out', str(tmp_path)]) == 0
+    import json
+    js = tmp_path / 's02_plan.json'
+    pj = json.loads(js.read_text(encoding='utf-8'))
+    with open(tmp_path / 'runs.csv', newline='') as f:
+        rr = [dict(r, result='completed', missing_pct='0', gen_pause_n='0') for r in csv.DictReader(f)]
+    def write(rows_):
+        with open(tmp_path / 'runs.csv', 'w', newline='') as f:
+            w = csv.DictWriter(f, fieldnames=sp.COLUMNS)
+            w.writeheader()
+            w.writerows(rows_)
+    write(rr)
+    assert sp.main(['check', str(tmp_path)]) == 0
+    pj['blocks'][0]['tests'] = pj['blocks'][0]['tests'][1:]           # edited manifest, one cell gone
+    gone = pj['blocks'][0]['tests'] and blocks[0]['tests'][0]
+    js.write_text(json.dumps(pj), encoding='utf-8')
+    write([r for r in rr if not (r['block'] == '1' and r['test_id'] == gone)])
+    assert sp.main(['check', str(tmp_path)]) == 1
+    pj = json.loads(json.dumps(blocks))                                # a test order not from the seed: same cells
+    pj[0]['tests'] = pj[0]['tests'][::-1]
+    js.write_text(json.dumps(dict(json.loads(js.read_text(encoding='utf-8')), blocks=pj)), encoding='utf-8')
+    write(rr)
+    assert sp.check(_filled(rows), pj, sp.REPS_MAIN) == []             # every cell still once
+    assert sp.main(['check', str(tmp_path)]) == 1                       # but not the plan of its order_seed

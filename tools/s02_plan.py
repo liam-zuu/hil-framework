@@ -115,7 +115,7 @@ def _num(x):
         v = float(str(x).strip())
     except ValueError:
         return None
-    return v if v == v else None
+    return v if v == v and abs(v) != float('inf') else None     # S2P3-5: inf, 1e309 are not numbers here
 
 
 def _dec(x):
@@ -175,11 +175,18 @@ def check(rows, planned=None, n_reps=None):
             later = [b2 for b2, r2 in blocks.items() if order[b2] > order[b]
                      and {x['block_status'].strip() for x in r2} != {'battery_rerun'}
                      and (r2[0]['condition'], r2[0]['_rep'], r2[0]['controller']) == key]
-            again = {x['test_id'] for b2 in later for x in blocks[b2]}
             if not later:
                 out.append(f'block {b}: battery_rerun but no later block of {key}')
-            elif not tests <= again:
-                out.append(f'block {b}: the later block(s) of {key} do not run again {sorted(tests - again)}')
+            elif len(later) > 1:
+                # S2P3-4 (Codex round 3): one whole replacement block, its own battery checked as a block; small
+                # blocks whose union covers the tests would each pass the sag rule while the whole re-run sags
+                out.append(f'block {b}: battery_rerun replaced by {len(later)} blocks {sorted(later)}: one whole '
+                           'block of the same condition, repetition and controller (P2-5)')
+            else:
+                again = {x['test_id'] for x in blocks[later[0]]}
+                if not tests <= again:
+                    out.append(f'block {b}: the later block {later[0]} of {key} does not run again '
+                               f'{sorted(tests - again)}')
         if not real:
             continue
         if v0 is None or v1 is None:
@@ -228,6 +235,15 @@ def check(rows, planned=None, n_reps=None):
             out.append(f'planned repetitions {sorted(reps)} are not 1..N')
         elif n_reps is not None and reps != set(range(1, n_reps + 1)):
             out.append(f'planned repetitions {sorted(reps)} are not 1..{n_reps} (P2-4; a trial needs --trial)')
+        if n_reps is not None:
+            # S2P3-6 (Codex round 3): every planned (test, controller) has exactly the repetitions 1..n_reps
+            per = {}
+            for bl in planned:
+                for t in bl['tests']:
+                    per.setdefault((t, bl['controller']), []).append(int(bl['rep']))
+            for tc, rr in sorted(per.items()):
+                if sorted(rr) != list(range(1, n_reps + 1)):
+                    out.append(f'{tc}: planned repetitions {sorted(rr)}, not 1..{n_reps} (P2-4)')
     return out
 
 
@@ -284,6 +300,16 @@ def main(argv=None) -> int:
         planned = pj['blocks']
         if pj.get('trial') and not a.trial:
             pre.append('s02_plan.json is a trial plan: not main numbers (check --trial to check it as a trial)')
+        # S2P3-6 (Codex round 3): the manifest must be the plan of its own arguments (an edited block list, e.g.
+        # one cell dropped from it and from runs.csv, is refused)
+        try:
+            again = plan(pj['platform'], pj['controllers'].split(','), int(pj['reps']), int(pj['order_seed']),
+                         bool(pj['with_strafe']), float(pj['prep_s']), trial=True)[1]
+        except (KeyError, ValueError, TypeError) as exc:
+            again = None
+            pre.append(f's02_plan.json: cannot rebuild the plan from its arguments ({exc})')
+        if again is not None and json.loads(json.dumps(again)) != planned:
+            pre.append('s02_plan.json: the block list is not the plan of its own arguments (edited?)')
     elif a.trial:
         print('no s02_plan.json: the planned cells are not checked (trial)')
     else:

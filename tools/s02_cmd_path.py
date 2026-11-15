@@ -17,11 +17,14 @@ rate; drift_ppm printed, flag drift_over_bound past ANCHOR_PPM, never clamped: S
 packet only after it arrived (up to a tick, the 10 ms hand-over of traj_task, the link): each anchor is late
 by e_a, e_b in about 0..30 ms [ước lượng từ code, chưa đo]. Packets carry no index, so one lost first
 packet at a step command moves anchor a one sample later (+20 ms) unseen (8 of 11 tests: A-L1, A-L2, A-C1,
-A-C2, A-S1, A-S2, A-K1, A-K2; two or more lost are caught by the span check). Spec S02 v1.12 P2-2b: the
+A-C2, A-S1, A-S2, A-K1, A-K2). Two or more lost at ONE end are caught by the span check; the same number lost
+at both ends (first packets and first tail zeros) moves both anchors alike, keeps the span, and is not seen
+(S2P3-3, Codex round 3): the anchors bound the rate, not the absolute lag. Spec S02 v1.12 P2-2b: the
 uncertainty of t = 0 is 0..+50 ms for the 10 tests with k_a = 0 (error e_a); A-K1 (k_a = 150, k_b = 300)
 extrapolates t_ESP(0) = 2 t_a - t_b, error 2 e_a - e_b: -30..+60 ms, and -30..+100 ms with one packet lost at
-anchor a (the 0 -> 0.3 step). On HIL the metrics take t = 0 from the sender (spec S02 v1.13, design v3 18.1);
-these anchors stay as the check there (t0_lag_ms).
+anchor a (the 0 -> 0.3 step). This module still takes t = 0 from these anchors on every platform. Spec S02
+v1.13 and design v3 18.1 move the HIL metrics to the sender time (anchors kept as the check, t0_lag_ms): that
+is v3 work, not coded here (S2P3-8, Codex round 3).
 A run whose '#us_end' reports cut ticks has no t = 0 (t0_reason us_cut; S2P1-2, Liam 15/11 CODE_S02 "Moc
 t = 0 khong xac dinh"): a command cut to 0 by the ultrasonic interlock looks like a zero packet.
   An anchor whose line before (log_seq - 1) is missing is dropped (the real first line may be lost);
