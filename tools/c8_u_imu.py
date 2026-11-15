@@ -28,8 +28,15 @@ Sign: positive = the IMU yaw increases = 'ccw' (the scale run checks the sign th
   python tools/c8_u_imu.py troi --log <lifted / static / still logs> ... [--doan all|run_active] --out troi.json
   python tools/c8_u_imu.py tong --muc O1-F08 --c8-log a.csv [--c8-log b.csv] --thang thang.json --troi troi.json
                                 (--tre tre.json | --tre-thu TAU_S,DTAU_S) --u-g-deg X --le 0.25 --out u_imu_dong.json
-`tre` (tau_hat from camera-IMU yaw, F3) and `kiem` (closure and back check, design 5) wait for the frame format
-of CODE_CAM (through CODE); until then `tong` takes --tre-thu and marks the file "thu": true (not lockable).
+  python tools/c8_u_imu.py tre --cap frames.csv,log.csv,D [--cap ...] --thang thang.json --out tre.json
+  python tools/c8_u_imu.py kiem --frames frames.csv --log log.csv --offset-s D --u-imu u_imu_dong.json --muc O1-F08
+                                --u-psi-deg X [--u-ghep-deg Y] --out kiem.json
+frames.csv of c7_measure.py (CODE_CAM 15/11 through CODE): t_s (camera clock, s), psi (camera yaw, floor frame,
+wrapped), wz, valid, car_seen; t_log = t_s + D (o1_time_sync or --offset-s). `tre` (F3): tau_hat from the
+camera-IMU yaw on the C8 runs, a time constant only. `kiem` (design 5): back check and closure; not OK means
+U_IMU is not locked. Before the camera fit, `tong --tre-thu` marks the file "thu": true (not lockable).
+The camera scorer uses S = rv_samples(load_log(path), tau_hat=, s_plus=, s_minus=, j_lim=) and
+interp_yaw(S, t_log, h_lim) with the numbers of u_imu_dong.json.
 Paths with a part sealed, sealed_test or O1_FEAS are refused. Outputs are never overwritten (`tong` adds a
 level to an existing file only when every shared parameter is equal).
 Last line: #ket_qua,ma=0 done / 2 refused or error.
@@ -397,6 +404,138 @@ def tong(muc, logs, thang_d, troi_d, tre, u_g, le, out, period_s=PERIOD_S, j_lim
     return d
 
 
+# ── camera - IMU (design 2.3, 3 step 5, 5) ─────────────────────────────────────────────────────
+
+FRAME_NEED = ('t_s', 'psi', 'valid', 'car_seen', 'wz')    # c7_measure.py FRAME_COLS (CODE_CAM 15/11 through CODE)
+
+
+def read_frames(path):
+    """Valid frames with the car seen: t_s (camera clock), psi (unwrapped, rad), wz (rad/s)."""
+    check_path(path)
+    with open(path, newline='', encoding='utf-8') as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        raise InputError(f'{path}: no frame')
+    miss = [c for c in FRAME_NEED if c not in rows[0]]
+    if miss:
+        raise InputError(f'{path}: no column {miss}')
+    rows = [r for r in rows if r['valid'] == '1' and r['car_seen'] == '1' and r['psi'] not in ('', 'nan')]
+    if len(rows) < 2:
+        raise InputError(f'{path}: fewer than two valid frames with the car seen')
+    t = np.array([float(r['t_s']) for r in rows])
+    if np.any(np.diff(t) <= 0):
+        raise InputError(f'{path}: t_s not increasing')
+    wz = np.array([float(r['wz']) if r['wz'] not in ('', 'nan') else np.nan for r in rows])
+    return dict(t=t, psi=np.unwrap([float(r['psi']) for r in rows]), wz=wz, path=path)
+
+
+def _wrap(a):
+    return (np.asarray(a) + math.pi) % (2 * math.pi) - math.pi
+
+
+def _run_times(L):
+    if 'run_active' not in L or not (L['run_active'] == 1).any():
+        raise InputError(f'{L.get("path")}: no run_active row (t = 0 of the run)')
+    on = np.nonzero(L['run_active'] == 1)[0]
+    return L['timestamp_us'][on[0]] * 1e-6, L['timestamp_us'][on[-1]] * 1e-6
+
+
+def _still(F, tl, a, b, wz_still):
+    return (tl >= a) & (tl < b) & (np.abs(np.nan_to_num(F['wz'], nan=np.inf)) < wz_still)
+
+
+def _align(F, tl, psi_i, t0, pre_s, n_min, wz_still):
+    """Alignment constant c (median of psi_cam - psi_IMU on still frames before t = 0) and its spread."""
+    m = _still(F, tl, t0 - pre_s, t0, wz_still) & np.isfinite(psi_i)
+    if m.sum() < n_min:
+        raise InputError(f'{m.sum()} still frames with an IMU yaw before t = 0, need {n_min} (design 3 step 5)')
+    e = F['psi'][m] - psi_i[m]
+    c = float(np.median(e))
+    e = c + _wrap(e - c)
+    return c, float(e.max() - e.min())
+
+
+def tre_one(frames, log, offset_s, s_plus=0.0, s_minus=0.0, period_s=PERIOD_S, j_lim=J_LIM_S, h_lim=H_LIM_S,
+            pre_s=3.0, tail_s=1.0, n_min=30, wz_still=0.05, half_s=0.06, step_s=0.001):
+    """Delay tau of the IMU yaw against the camera yaw on one run: RMS of psi_cam - psi_IMU(t - tau) - c is
+    smallest (grid step_s in +-half_s, then a parabola through the three points around the minimum)."""
+    F = read_frames(frames)
+    L = load_log(log)
+    S0 = rv_samples(L, period_s=period_s, s_plus=s_plus, s_minus=s_minus, j_lim=j_lim)
+    t0, t1 = _run_times(L)
+    tl = F['t'] + offset_s
+    win = (tl >= t0) & (tl <= t1 + tail_s)
+    taus = np.arange(-half_s, half_s + step_s / 2, step_s)
+    rms = []
+    for tau in taus:
+        S = dict(S0, t=S0['t'] - tau)
+        psi_i = interp_yaw(S, tl, h_lim)
+        c, _ = _align(F, tl, psi_i, t0, pre_s, n_min, wz_still)
+        r = _wrap(F['psi'][win] - psi_i[win] - c)
+        r = r[np.isfinite(r)]
+        rms.append(float(np.sqrt(np.mean(r ** 2))) if r.size >= n_min else np.inf)
+    rms = np.array(rms)
+    k = int(np.argmin(rms))
+    if not np.isfinite(rms[k]):
+        raise InputError(f'{frames}: too few frames in the run window')
+    if k == 0 or k == len(taus) - 1:
+        raise InputError(f'{frames}: delay at the edge of +-{half_s * 1e3:.0f} ms (clock offset wrong?)')
+    y0, y1, y2 = rms[k - 1], rms[k], rms[k + 1]
+    den = y0 - 2 * y1 + y2
+    tau = taus[k] + (0.5 * step_s * (y0 - y2) / den if den > 0 else 0.0)
+    return dict(tau_s=float(tau), rms_rad=float(y1), n_frames=int(win.sum()), offset_s=offset_s,
+                frames=os.path.basename(frames), frames_sha256=sha256(frames), log=os.path.basename(log),
+                log_sha256=sha256(log))
+
+
+def tre(caps, thang_d, step_s=0.001, **kw):
+    """tau_hat = median over the C8 runs; dtau_fit = largest |tau_i - tau_hat| + one grid step."""
+    if not caps:
+        raise InputError('no C8 run')
+    runs = [tre_one(fr, lg, off, thang_d['s_plus'], thang_d['s_minus'], step_s=step_s, **kw) for fr, lg, off in caps]
+    t = np.array([r['tau_s'] for r in runs])
+    hat = float(np.median(t))
+    return dict(tau_hat_s=hat, dtau_fit_s=float(np.max(np.abs(t - hat)) + step_s), thu=False, runs=runs)
+
+
+def kiem(frames, log, offset_s, u, muc, u_psi, u_ghep=0.0, n_min=30, wz_still=0.05):
+    """Design 5: back check |psi_cam - psi_IMU| <= U_psi + U_IMU(m) on every compared frame, and the closure of
+    the IMU yaw against the camera between the still parts before and after the run."""
+    if muc not in u['muc']:
+        raise InputError(f'level {muc} not in the U_IMU file')
+    lev = u['muc'][muc]
+    F = read_frames(frames)
+    L = load_log(log)
+    S = rv_samples(L, period_s=u['period_s'], tau_hat=u['tau_hat_s'], s_plus=u['s_plus'], s_minus=u['s_minus'],
+                   j_lim=u['j_lim_s'])
+    t0, t1 = _run_times(L)
+    tl = F['t'] + offset_s
+    psi_i = interp_yaw(S, tl, u['h_lim_s'])
+    c, spread = _align(F, tl, psi_i, t0, u['pre_s'], n_min, wz_still)
+    res = _wrap(F['psi'] - psi_i - c)
+    win = (tl >= t0) & (tl <= t1 + u['tail_s'])
+    comp = win & np.isfinite(res)
+    lim = u_psi + lev['U_IMU_dong_rad'] + u_ghep
+    over = comp & (np.abs(res) > lim)
+    end = _still(F, tl, t1 + u['tail_s'], np.inf, wz_still) & np.isfinite(res)
+    out = dict(muc=muc, align_c_rad=c, align_spread_rad=spread, align_ok=spread <= u_psi,
+               n_win=int(win.sum()), n_compared=int(comp.sum()), n_not_compared=int((win & ~comp).sum()),
+               limit_rad=lim, n_over=int(over.sum()), t_over_s=[float(x) for x in (tl[over] - t0)[:20]],
+               max_abs_rad=float(np.max(np.abs(res[comp]))) if comp.any() else None)
+    if end.sum() >= n_min:
+        r = float(np.median(res[end]))
+        m = (S['t'] >= t0 - u['pre_s']) & (S['t'] <= tl[end].max())
+        d = np.diff(S['psi'][m])
+        P, N = float(d[d > 0].sum()), float(-d[d < 0].sum())
+        T = float(tl[end].max() - (t0 - u['pre_s']))
+        b = 2 * u_psi + (1 + u['le']) * (u['delta_plus'] * P + u['delta_minus'] * N + u['beta_max'] * T + u['q'])
+        out.update(closure_rad=r, closure_bound_rad=b, closure_ok=abs(r) <= b, closure_P=P, closure_N=N)
+    else:
+        out.update(closure_rad=None, closure_ok=None, closure_note=f'fewer than {n_min} still frames after the run')
+    out['ok'] = bool(out['align_ok'] and out['n_over'] == 0 and out['closure_ok'] is True)
+    return out
+
+
 # ── CLI ────────────────────────────────────────────────────────────────────────────────
 
 def script_state():
@@ -456,6 +595,19 @@ def main(argv=None):
     a4.add_argument('--pre-s', type=float, default=2.0)
     a4.add_argument('--tail-s', type=float, default=1.0)
     a4.add_argument('--out', required=True)
+    a5 = sub.add_parser('tre')
+    a5.add_argument('--cap', action='append', required=True, help='FRAMES.csv,LOG.csv,OFFSET_S (t_log = t_s + D)')
+    a5.add_argument('--thang', required=True)
+    a5.add_argument('--out', required=True)
+    a6 = sub.add_parser('kiem')
+    a6.add_argument('--frames', required=True)
+    a6.add_argument('--log', required=True)
+    a6.add_argument('--offset-s', type=float, required=True)
+    a6.add_argument('--u-imu', required=True)
+    a6.add_argument('--muc', required=True)
+    a6.add_argument('--u-psi-deg', type=float, required=True)
+    a6.add_argument('--u-ghep-deg', type=float, default=0.0, help='omega_max * dt_sync of the level (CODE_CAM)')
+    a6.add_argument('--out', required=True)
     a = ap.parse_args(argv)
     try:
         if a.cmd == 'thang':
@@ -477,15 +629,36 @@ def main(argv=None):
             r.update(nguon=[{'file': x['file'], 'sha256': x['sha256']} for x in r['files']], script=script_state())
             _write_new(a.out, r)
             print(f'beta_max {math.degrees(r["beta_max"]):.4f} deg/s, q {math.degrees(r["q"]):.4f} deg')
+        elif a.cmd == 'tre':
+            caps = []
+            for c in a.cap:
+                x = c.split(',')
+                if len(x) != 3:
+                    raise InputError(f'--cap {c!r}: FRAMES,LOG,OFFSET_S')
+                caps.append((x[0], x[1], float(x[2])))
+            r = tre(caps, _read_json(a.thang))
+            r.update(nguon=[{'file': x[k], 'sha256': x[k + '_sha256']} for x in r['runs'] for k in ('frames', 'log')],
+                     script=script_state())
+            _write_new(a.out, r)
+            print(f'tau_hat {r["tau_hat_s"] * 1e3:.1f} ms, dtau_fit {r["dtau_fit_s"] * 1e3:.1f} ms over {len(caps)} runs')
+        elif a.cmd == 'kiem':
+            r = kiem(a.frames, a.log, a.offset_s, _read_json(a.u_imu), a.muc, math.radians(a.u_psi_deg),
+                     math.radians(a.u_ghep_deg))
+            r.update(nguon=[{'file': os.path.basename(p), 'sha256': sha256(p)} for p in (a.frames, a.log, a.u_imu)],
+                     script=script_state())
+            _write_new(a.out, r)
+            print(f'{a.muc}: {r["n_over"]} of {r["n_compared"]} frames over {math.degrees(r["limit_rad"]):.2f} deg; '
+                  f'closure {r.get("closure_ok")}; alignment spread {math.degrees(r["align_spread_rad"]):.2f} deg; '
+                  + ('OK' if r['ok'] else 'NOT OK: do not lock U_IMU (design 5)'))
         else:
             if a.tre:
-                tre = _read_json(a.tre)
+                tre_d = _read_json(a.tre)
             else:
                 x = [float(v) for v in a.tre_thu.split(',')]
                 if len(x) != 2:
                     raise InputError('--tre-thu TAU_S,DTAU_S')
-                tre = dict(tau_hat_s=x[0], dtau_fit_s=x[1], thu=True, nguon=[])
-            d = tong(a.muc, a.c8_log, _read_json(a.thang), _read_json(a.troi), tre, math.radians(a.u_g_deg),
+                tre_d = dict(tau_hat_s=x[0], dtau_fit_s=x[1], thu=True, nguon=[])
+            d = tong(a.muc, a.c8_log, _read_json(a.thang), _read_json(a.troi), tre_d, math.radians(a.u_g_deg),
                      a.le, a.out, pre_s=a.pre_s, tail_s=a.tail_s)
             m = d['muc'][a.muc]
             print(f'{a.muc}: U_IMU,dong {m["U_IMU_dong_deg"]:.2f} deg; parts (deg) '

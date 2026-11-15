@@ -311,6 +311,106 @@ def test_main_exit_codes(tmp_path):
     assert U.main(['thang', '--log', p, '--n-vong', '5', '--chieu', 'ccw', '--cach', 'tay', '--out', out]) == 2  # no overwrite
 
 
+# ── camera - IMU (tre, kiem) ─────────────────────────────────────────────────────────────
+
+FCOLS = ['idx', 't_s', 'valid', 'car_seen', 'psi', 'wz']
+
+
+def true_yaw(rate, t_start, t_end):
+    fine = np.arange(t_start, t_end + 1e-9, 1e-3)
+    r = np.array([rate(x) for x in fine])
+    return fine, np.concatenate([[0.0], np.cumsum((r[1:] + r[:-1]) / 2 * 1e-3)]), r
+
+
+def write_frames(path, rate, t_start, t_end, offset, psi0=0.4, fps=60.0, err=None):
+    """Camera frames: t_s = t_log - offset; psi = true yaw + psi0 (+ err(t_log)), wrapped; wz exact."""
+    fine, tru, r = true_yaw(rate, t_start, t_end)
+    tl = np.arange(t_start + 0.01, t_end - 0.01, 1 / fps)
+    psi = np.interp(tl, fine, tru) + psi0 + (np.array([err(x) for x in tl]) if err else 0.0)
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(FCOLS)
+        for i, t in enumerate(tl):
+            w.writerow([i, repr(float(t - offset)), 1, 1, repr(float(wrap(psi[i]))), repr(float(rate(t)))])
+
+
+def _c8_pair(tmp_path, lat=0.004, s_plus=0.0, err=None, name='r'):
+    a = 13.0
+    t1 = a + math.radians(300) / 2.0
+    t2 = t1 + math.radians(300) / 2.0
+    rate = lambda t: 2.0 if a <= t < t1 else (-2.0 if t1 <= t < t2 else 0.0)      # noqa: E731
+    lg, fr = str(tmp_path / f'{name}.csv'), str(tmp_path / f'{name}_frames.csv')
+    make_log(lg, rate, t2 + 4.0, lat=lat, s_plus=s_plus, run=(a, t2))
+    write_frames(fr, rate, 10.0, t2 + 4.0, offset=0.5, err=err)
+    return fr, lg
+
+
+def test_tre_finds_delay(tmp_path):
+    fr, lg = _c8_pair(tmp_path, lat=0.004)
+    r = U.tre_one(fr, lg, 0.5)
+    # grid times are receive times (sample + 4 ms); the camera sees the true yaw: tau = 4 ms
+    assert r['tau_s'] == pytest.approx(0.004, abs=0.001)
+    fr2, lg2 = _c8_pair(tmp_path, lat=0.015, name='r2')
+    g = U.tre([(fr, lg, 0.5), (fr2, lg2, 0.5)], dict(s_plus=0.0, s_minus=0.0))
+    assert g['tau_hat_s'] == pytest.approx(0.0095, abs=0.001)
+    assert g['dtau_fit_s'] == pytest.approx(0.0055 + 0.001, abs=0.001)
+
+
+def test_tre_wrong_offset_refused(tmp_path):
+    fr, lg = _c8_pair(tmp_path)
+    with pytest.raises(U.InputError, match='edge'):
+        U.tre_one(fr, lg, 0.6)
+
+
+def _u_file(tmp_path, p, tau, delta=0.002, s_plus=0.0):
+    out = str(tmp_path / 'u.json')
+    th = dict(s_plus=s_plus, s_minus=0.0, delta_plus=delta, delta_minus=delta, f4_mo=False)
+    tr = dict(beta_max=math.radians(0.016), q=math.radians(0.01))
+    U.tong('O1-F08', [p], th, tr, dict(tau_hat_s=tau, dtau_fit_s=0.002), u_g=math.radians(0.5), le=0.25, out=out,
+           pre_s=2.0, tail_s=1.0)
+    return json.load(open(out, encoding='utf-8'))
+
+
+def test_kiem_clean_run_ok(tmp_path):
+    fr, lg = _c8_pair(tmp_path)
+    u = _u_file(tmp_path, lg, tau=0.004)
+    r = U.kiem(fr, lg, 0.5, u, 'O1-F08', u_psi=math.radians(0.5))
+    assert r['ok'] and r['n_over'] == 0 and r['closure_ok'] is True
+    assert r['n_compared'] > 0.95 * r['n_win']
+
+
+def test_kiem_catches_camera_error(tmp_path):
+    fr, lg = _c8_pair(tmp_path, err=lambda t: math.radians(20.0) if 15.0 <= t < 15.5 else 0.0)  # step profile: alpha 80 rad/s2, limit about 10 deg
+    u = _u_file(tmp_path, lg, tau=0.004)
+    r = U.kiem(fr, lg, 0.5, u, 'O1-F08', u_psi=math.radians(0.5))
+    assert r['n_over'] > 0 and not r['ok']
+
+
+def test_kiem_closure_catches_uncorrected_scale(tmp_path):
+    """IMU 2 % fast counter-clockwise, the U_IMU file says scale exact with a small delta: the closure
+    after +300 / -300 deg is 6 deg, beyond its bound."""
+    fr, lg = _c8_pair(tmp_path, s_plus=0.02)
+    u = _u_file(tmp_path, lg, tau=0.004, delta=0.001)
+    r = U.kiem(fr, lg, 0.5, u, 'O1-F08', u_psi=math.radians(0.5))
+    assert r['closure_ok'] is False and not r['ok']
+
+
+def test_main_tre_kiem(tmp_path):
+    fr, lg = _c8_pair(tmp_path)
+    th = str(tmp_path / 'thang.json')
+    json.dump(dict(s_plus=0.0, s_minus=0.0, delta_plus=0.002, delta_minus=0.002, f4_mo=False), open(th, 'w'))
+    tr = str(tmp_path / 'troi.json')
+    json.dump(dict(beta_max=0.0003, q=0.0002), open(tr, 'w'))
+    te = str(tmp_path / 'tre.json')
+    assert U.main(['tre', '--cap', f'{fr},{lg},0.5', '--thang', th, '--out', te]) == 0
+    uf = str(tmp_path / 'u.json')
+    assert U.main(['tong', '--muc', 'O1-F08', '--c8-log', lg, '--thang', th, '--troi', tr, '--tre', te,
+                   '--u-g-deg', '0.5', '--out', uf]) == 0
+    assert json.load(open(uf, encoding='utf-8'))['thu'] is False
+    assert U.main(['kiem', '--frames', fr, '--log', lg, '--offset-s', '0.5', '--u-imu', uf, '--muc', 'O1-F08',
+                   '--u-psi-deg', '0.5', '--out', str(tmp_path / 'k.json')]) == 0
+
+
 # ── real logs (skipped when not on this machine) ───────────────────────────────────────────────
 
 DATA = os.path.normpath(os.path.join(HERE, '..', '..', '..', '..', 'CLAUDE_THESIS', '05_DATA', 'results'))
