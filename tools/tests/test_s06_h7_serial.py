@@ -222,3 +222,18 @@ def test_rearm_counted_inside_the_run_only():
     ev = ser.parse_lines(_rearm_log(bump=3))
     st = ser.link_stats(ev, ser.run_span(ev))
     assert st['rearm'] == 1 and any('rearm tăng 1' in f for f in ser.link_fails(st))
+
+
+def test_t3t_3_rearm_not_computable_is_missing():
+    """T3T-3 (Codex 15/11; Liam 'Sua ca 10 + vong 2'): fewer than two in-run 'Link: up' lines: rearm None, reported
+    as missing evidence by link_missing (0cb41c6: silently clean); a computable rearm: nothing missing."""
+    ev = ser.parse_lines(_rearm_log())
+    st = ser.link_stats(ev, ser.run_span(ev))
+    assert ser.link_missing(st) == []
+    lines = _rearm_log()
+    ups = [i for i, l in enumerate(lines) if 'Link: up' in l]
+    lines = [l for i, l in enumerate(lines) if i not in ups[1:]]           # keep one in-run 'Link: up' line
+    ev = ser.parse_lines(lines)
+    st = ser.link_stats(ev, ser.run_span(ev))
+    assert st['rearm'] is None and ser.link_fails(st) == []
+    assert any('không tính được rearm' in m for m in ser.link_missing(st))

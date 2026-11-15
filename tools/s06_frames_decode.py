@@ -76,6 +76,11 @@ SEGMENT_GAP_US = 500_000.0
 ANSWER_LAG = 2                # the H7 answers frame N in frame N + 2 (fix/h7-frame)
 F_PRED_HZ = 483.1e6           # CYCCNT rate used only to predict the count across gaps (spec value, Phần D)
 SEQ_CUT_PERIODS = 128         # spec dòng 96: unwrap only below 128 report periods, cut the chain from 128
+# T3T-2 (Codex 15/11; Liam 'Sua ca 10 + vong 2'): match_esp32 picks the x256 shift by time, which assumes the
+# ESP32 -> Pi UDP delay (J t_rx − H7 t_pi_us) stays below half the x256 spacing (128 report periods); a delay of
+# 256 periods would alias to 0 and cannot be told from the log. Bench T4 15/11: median 5.7-6.1 ms. A chosen shift
+# whose median |delay| reaches this bound (or 128 periods, whichever is less) is not matched [ĐỀ XUẤT CODE_S06]
+ESP_UDP_DELAY_MAX_US = 200_000.0
 PAD_US = 1_000_000.0          # S38 [ĐỀ XUẤT CODE]: the Pi frames and the ESP32 IMU lines must reach this far
                               # beyond #run_start..#run_end, so every report scored inside the run has its
                               # counterpart in the files; the scored window itself is never shrunk
@@ -590,7 +595,8 @@ def seq_shifts(h7, J, off):
     (H7 epoch, kind): candidate shifts = n_J − n_H7 of each H7 report and the J with the same 8-bit seq nearest
     in Pi time (J t_rx vs H7 t_pi_us, one clock); the shift kept is the candidate with the smallest median
     |t_rx − t_pi_us| over the pairs it makes (tie: smaller |shift|). At or above SEQ_CUT_PERIODS J report
-    periods: no shift (that group is not matched, noted). Needs `seq_keys(J)` run first (J['n']).
+    periods or ESP_UDP_DELAY_MAX_US: no shift (that group is not matched, noted). Assumes the UDP delay stays below
+    half the x256 spacing (T3T-2, ESP_UDP_DELAY_MAX_US comment): a longer one aliases and is not detectable here. Needs `seq_keys(J)` run first (J['n']).
     Returns ({(epoch, kind): shift or None}, {'epoch/kind': info})."""
     shifts, info = {}, {}
     if off is None:
@@ -625,11 +631,11 @@ def seq_shifts(h7, J, off):
         if best is None or per is None:
             shifts[(ep, kd)] = None
             info[name] = dict(shift=None, note='không có cặp report cùng seq ở hai phía')
-        elif best[1] >= SEQ_CUT_PERIODS * per:
+        elif best[1] >= min(SEQ_CUT_PERIODS * per, ESP_UDP_DELAY_MAX_US):
             shifts[(ep, kd)] = None
             info[name] = dict(shift=None, dt_abs_median_us=best[1], period_us=per,
-                              note=f'trung vị |t_rx − t_pi| {best[1] / 1e3:.1f} ms ≥ {SEQ_CUT_PERIODS} chu kỳ report: '
-                                   'không ghép')
+                              note=f'trung vị |t_rx − t_pi| {best[1] / 1e3:.1f} ms ≥ min({SEQ_CUT_PERIODS} chu kỳ report, '
+                                   f'{ESP_UDP_DELAY_MAX_US / 1e3:.0f} ms): không ghép')
         else:
             shifts[(ep, kd)] = best[0]
             info[name] = dict(shift=best[0], dt_abs_median_us=best[1], dt_median_us=best[3], pairs=best[2],

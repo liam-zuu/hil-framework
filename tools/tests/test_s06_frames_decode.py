@@ -626,3 +626,18 @@ def test_report_match_no_shift_when_streams_far_apart(clean, tmp_path):
         [dict(epoch=2, kind='gyro', n=k, seq=k % 256, t_us=10_000.0 * k,
               t_rx=10_000.0 * k + (1_300_000.0 if k % 2 else -1_300_000.0)) for k in range(600)], 1)
     assert shifts[(1, 'gyro')] is None and 'không ghép' in info['1/gyro']['note']
+
+
+def test_t3t_2_udp_delay_bound():
+    """T3T-2 (Codex 15/11; Liam 'Sua ca 10 + vong 2'): the shift by time assumes the UDP delay stays below half the
+    x256 spacing; a chosen shift whose median |delay| reaches ESP_UDP_DELAY_MAX_US (200 ms) is not matched (0cb41c6
+    kept a 300 ms one: up to 1.28 s passed at 10 ms reports). Bench-like 6 ms: matched, shift 0."""
+    def run(delay_us):
+        return dec.seq_shifts(
+            [dict(epoch=1, kind='gyro', n=k, rpt_seq=k % 256, t_pi_us=10_000.0 * k) for k in range(600)],
+            [dict(epoch=2, kind='gyro', n=k, seq=k % 256, t_us=10_000.0 * k, t_rx=10_000.0 * k + delay_us)
+             for k in range(600)], 1)
+    shifts, info = run(300_000.0)
+    assert shifts[(1, 'gyro')] is None and '200 ms' in info['1/gyro']['note'], info
+    shifts, info = run(6_000.0)
+    assert shifts[(1, 'gyro')] == 0 and info['1/gyro']['dt_abs_median_us'] == 6_000.0

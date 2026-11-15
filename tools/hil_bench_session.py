@@ -477,12 +477,18 @@ def analyze_run(out, name, h7_lines=None, esp_lines=None, s06=False, check_sub='
     pi/<name>_esp (match_esp32), and tools/s06_esp32_check.py judges that log; any code but 0 = not clean."""
     z = np.load(os.path.join(out, 'frames', f'{name}_frames.npz'))
     ev = os.path.join(out, 'pi', f'{name}_esp', 'esp32_events.txt')
-    res = dec.decode(z['t_send_ns'], z['mosi'], z['miso'], ev if s06 and os.path.exists(ev) else None)
-    probs = dec.problems(res)
+    pre = []
+    try:
+        res = dec.decode(z['t_send_ns'], z['mosi'], z['miso'], ev if s06 and os.path.exists(ev) else None)
+    except dec.stm.RunProblem as ex:              # T3T-8: e.g. two #run_start in the events: judged, not raised
+        pre = [f'không xác định được một lượt ở log ESP32 ({ex}): không ghép report']
+        res = dec.decode(z['t_send_ns'], z['mosi'], z['miso'], None)
+    probs = pre + dec.problems(res)
     if s06:
+        probs += dec.conditions(res)              # T3T-6: missing evidence (±1 s pad, TICK) is not clean either
         if not os.path.exists(ev):
             probs.append(f'lượt S06 không có pi/{name}_esp/esp32_events.txt')
-        c = s06_check(out, name, check_sub)
+        c = s06_check(out, name, check_sub) if check_sub else 0
         if c != 0:
             probs.append(f's06_esp32_check mã {c} ({check_sub}/{name}/)')
     trk = tracking(z['t_send_ns'], z['mosi'], z['miso'])
@@ -547,13 +553,35 @@ S06_PROFILES = ('zero', 'heavy', 't6')
 S06_LOGGER_AFTER_S = 2          # plant first: the logger starts this long after run_hil.py
 S06_PLANT_AFTER_S = 4           # logger first: run_hil.py starts this long after the logger
 S06_PLANT_MARGIN_S = 10         # [ĐỀ XUẤT CODE_S06]: --steps >= (logger --duration + this) x 1000
-STEPS_RE = re.compile(r'(?:^|\s)--steps\s+(\d+)(?:\s|$)')
+# T3T-5 (Codex 15/11; Liam 'Sua ca 10 + vong 2'): an S06 run's ssh limit is at least the plant time (--steps / 1 kHz)
+# plus this (start, the logger's START wait and linger, frame-log save) [ĐỀ XUẤT CODE_S06, not measured]
+S06_TIMEOUT_EXTRA_S = 120
+
+
+def steps_of(args: str):
+    """T3T-9: --steps of a run_hil.py argument string as argparse reads it: shlex tokens, `--steps N` or
+    `--steps=N`, the LAST one wins. None without one; ValueError on a value that is not a whole number."""
+    import shlex
+    toks, val = shlex.split(args), None
+    for i, t in enumerate(toks):
+        if t == '--steps':
+            if i + 1 >= len(toks):
+                raise ValueError('--steps không có giá trị')
+            val = toks[i + 1]
+        elif t.startswith('--steps='):
+            val = t[len('--steps='):]
+    if val is None:
+        return None
+    if not val.isdigit():
+        raise ValueError(f'--steps {val!r} không phải số nguyên')
+    return int(val)
 
 
 def plan_s06(specs, plan, gain_query=False):
-    """--s06 TÊN=PROFILE,GIÂY[,logger-first] -> {name: dict(profile, duration, logger_first)}. Raises ValueError
-    on a run not in --run, a run given twice, a bad profile or duration, run_hil.py args without --steps or with
-    fewer than (GIÂY + S06_PLANT_MARGIN_S) x 1000 steps, or --gain-query (it reads the agv_logger UDP log)."""
+    """--s06 TÊN=PROFILE,GIÂY[,logger-first] -> {name: dict(profile, duration, logger_first, steps)}. Raises
+    ValueError on a run not in --run, a run given twice, a bad profile or duration, run_hil.py args without --steps
+    or with fewer than (GIÂY + S06_PLANT_MARGIN_S) x 1000 steps (as run_hil.py's argparse reads them, T3T-9), or
+    --gain-query (it reads the agv_logger UDP log)."""
     args_of = {n: a for n, a, _ in plan}
     out = {}
     for spec in specs:
@@ -564,29 +592,53 @@ def plan_s06(specs, plan, gain_query=False):
             raise ValueError(f'--s06 không hợp lệ: {spec!r} (cần TÊN_LƯỢT=zero|heavy|t6,GIÂY[,logger-first], '
                              'mỗi lượt một lần, lượt có ở --run)')
         dur = int(parts[1])
-        m = STEPS_RE.search(args_of[name])
+        steps = steps_of(args_of[name])
         need = (dur + S06_PLANT_MARGIN_S) * 1000
-        if not m or int(m[1]) < need:
+        if steps is None or steps < need:
             raise ValueError(f'--s06 {name}: run_hil.py cần --steps ≥ {need} (lượt ESP32 {dur} s + '
-                             f'{S06_PLANT_MARGIN_S} s), có {m[1] if m else "không có --steps"}')
+                             f'{S06_PLANT_MARGIN_S} s), có {steps if steps is not None else "không có --steps"}')
         if gain_query:
             raise ValueError('--gain-query không dùng với lượt --s06 (cần log UDP của agv_logger)')
-        out[name] = dict(profile=parts[0], duration=dur, logger_first=len(parts) == 3)
+        out[name] = dict(profile=parts[0], duration=dur, logger_first=len(parts) == 3, steps=steps)
     return out
 
 
+def s06_timeout(run_timeout: float, s06: dict) -> float:
+    """T3T-5: ssh limit of an S06 run: --run-timeout, raised to the plant time + S06_TIMEOUT_EXTRA_S."""
+    return max(run_timeout, s06['steps'] / 1000.0 + S06_TIMEOUT_EXTRA_S)
+
+
 def s06_run_cmd(pi_dir, name, args, s06, esp_ip):
-    """Pi command of one S06 run: run_hil.py (PID file as run_cmd, B) and tools/s06_logger.py into
-    <pi_dir>/<name>_esp, in the order of `s06`; prints logger_exit=, exits with the run_hil.py code."""
-    hil = (f'rm -f {pi_dir}/{name}.pid; cd ~/hil-framework/rpi5 || exit 2; python3 run_hil.py {args} --finite-run '
+    """Pi command of one S06 run: run_hil.py (PID file <name>.pid as run_cmd, B) and tools/s06_logger.py (PID file
+    <name>_logger.pid, T3T-5) into <pi_dir>/<name>_esp, in the order of `s06`; prints logger_exit=, exits with the
+    run_hil.py code. T3T-1: no --finite-run (an S06 run ends by --steps; --finite-run excludes --steps,
+    --load-schedule and the omega modes). T3T-4: exit 2 before starting anything when an output of this run name
+    is already in pi_dir (an earlier session with the same --pi-dir)."""
+    outs = ' '.join(f'{pi_dir}/{name}{s}' for s in ('_esp', '_logger.txt', '_frames.npz'))
+    guard = (f'mkdir -p {pi_dir} || exit 2; for f in {outs}; do [ -e "$f" ] && {{ echo "s06_pi_exists=$f"; exit 2; }}; '
+             f'done; rm -f {pi_dir}/{name}.pid {pi_dir}/{name}_logger.pid; ')
+    hil = (f'cd ~/hil-framework/rpi5 || exit 2; python3 run_hil.py {args} '
            f'--frame-log {pi_dir}/{name}_frames.npz & H=$!; echo $H > {pi_dir}/{name}.pid')
     log = (f'cd ~/hil-framework || exit 2; python3 tools/s06_logger.py --esp32 {esp_ip} --profile {s06["profile"]} '
-           f'--duration {s06["duration"]} --out {pi_dir}/{name}_esp > {pi_dir}/{name}_logger.txt 2>&1')
+           f'--duration {s06["duration"]} --out {pi_dir}/{name}_esp > {pi_dir}/{name}_logger.txt 2>&1 & L=$!; '
+           f'echo $L > {pi_dir}/{name}_logger.pid')
     if s06['logger_first']:
-        return (f'mkdir -p {pi_dir} || exit 2; {log} & L=$!; sleep {S06_PLANT_AFTER_S}; {hil}; wait $H; RC=$?; '
+        return (f'{guard}{log}; sleep {S06_PLANT_AFTER_S}; {hil}; wait $H; RC=$?; '
                 f'wait $L; echo logger_exit=$?; exit $RC')
-    return (f'mkdir -p {pi_dir} || exit 2; {hil}; sleep {S06_LOGGER_AFTER_S}; {log}; echo logger_exit=$?; '
+    return (f'{guard}{hil}; sleep {S06_LOGGER_AFTER_S}; {log}; wait $L; echo logger_exit=$?; '
             f'wait $H; RC=$?; exit $RC')
+
+
+def s06_cleanup_cmd(pi_dir, name):
+    """T3T-5: after an S06 run that did not end cleanly (ssh time-out, lost connection, non-zero code): SIGTERM the
+    run_hil.py and s06_logger.py of this run by their PID files when still alive and the PID is that script (as
+    pi_stop_cmd checks /proc/PID/cmdline), wait up to 5 s, then SIGKILL; prints what it did."""
+    one = ('P=$(cat {f} 2>/dev/null); if [ -n "$P" ] && kill -0 "$P" 2>/dev/null && '
+           "tr '\\0' ' ' < /proc/$P/cmdline | grep -q '{s}'; then echo \"stop {s} pid=$P\"; kill -TERM $P; "
+           'for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 $P 2>/dev/null || break; sleep 0.5; done; '
+           'kill -0 $P 2>/dev/null && {{ echo "kill {s} pid=$P"; kill -KILL $P; }}; fi; ')
+    return (one.format(f=f'{pi_dir}/{name}.pid', s='run_hil.py')
+            + one.format(f=f'{pi_dir}/{name}_logger.pid', s='s06_logger.py') + 'true')
 
 
 def s06_check(out, name, sub='check'):
@@ -837,13 +889,21 @@ def bench(a):
             t0 = time.time()                         # R134C-9: the run (and its --pi-stop / --pi-kill clock)
             if timer:                                # starts after the question before it
                 timer.start()
+            lim = s06_timeout(a.run_timeout, s06[name]) if name in s06 else a.run_timeout      # T3T-5
             try:
                 cmd = s06_run_cmd(a.pi_dir, name, args, s06[name], s_ip) if name in s06 else \
                     run_cmd(a.pi_dir, name, args, not a.no_logger, src)
-                rc, txt = ssh(a.host, cmd, timeout=a.run_timeout)
+                rc, txt = ssh(a.host, cmd, timeout=lim)
             except subprocess.TimeoutExpired:
-                rc, txt = -1, f'ssh quá {a.run_timeout} s (--run-timeout); kiểm tiến trình trên Pi'
+                rc, txt = -1, f'ssh quá {lim:.0f} s (--run-timeout, lượt S06: --steps/1000 + {S06_TIMEOUT_EXTRA_S}); kiểm tiến trình trên Pi'
                 print(f'{name}: {txt}')
+            if name in s06 and rc != 0:                # T3T-5: do not leave this run's processes on the Pi
+                try:
+                    crc, ctxt = ssh(a.host, s06_cleanup_cmd(a.pi_dir, name), timeout=30)
+                except subprocess.TimeoutExpired:
+                    crc, ctxt = -1, 'ssh quá 30 s'
+                txt += f'\n# s06_cleanup (ssh mã {crc}):\n{ctxt}'
+                print(f'{name}: dọn tiến trình S06 trên Pi (ssh mã {crc}): {ctxt.strip() or "không còn tiến trình"}')
             t1 = time.time()
             if timer:                                # R134C2-5: the run ended first: no stop sent, also not
                 timer.cancel()                       # during the question after
@@ -966,10 +1026,22 @@ def analyze_only(a):
         return 2, []
     results, code = [], 0
     runs = {x.get('name'): x for x in (sess or {}).get('runs', [])}
+    # T3T-10: s06_esp32_check of an --s06 run writes its outputs: with --write-summary into a NEW check_analyze*/
+    # folder (an earlier one is kept), else into a temporary folder outside --out (nothing written there)
+    chk_sub = None
+    if any('s06' in runs.get(n, {}) for n in names):
+        if getattr(a, 'write_summary', False):
+            chk_sub = 'check_analyze'
+            k = 2
+            while os.path.exists(os.path.join(a.out, chk_sub)):
+                chk_sub, k = f'check_analyze_{k}', k + 1
+        else:
+            import tempfile
+            chk_sub = tempfile.mkdtemp(prefix='s06_check_')
     for n in names:
-        # no PC time windows: serial logs not judged per run; an --s06 run: events matched again,
-        # s06_esp32_check into check_analyze/ (the session's check/ kept)
-        r = analyze_run(a.out, n, s06=True, check_sub='check_analyze') if 's06' in runs.get(n, {}) \
+        # no PC time windows: serial logs not judged per run; an --s06 run: events matched again, s06_esp32_check
+        # into chk_sub (the session's check/ kept), and the s06_logger exit code read again (T3T-7)
+        r = analyze_run(a.out, n, s06=True, check_sub=chk_sub) if 's06' in runs.get(n, {}) \
             else analyze_run(a.out, n)
         if 'boot' in runs.get(n, {}):                # R134C-10: a session made with --gain-query, checked again
             qb, qa = queries_of_run(a.out, n)        # from the saved answers (older sessions: no such record)
@@ -981,6 +1053,13 @@ def analyze_only(a):
             if bbad:
                 r['clean'] = False
                 r['why'].append(bbad)
+        if 's06' in runs.get(n, {}):                 # T3T-7: as the run itself judged it (s06_logger exit code)
+            tp = os.path.join(a.out, 'pi', f'{n}_pi.txt')
+            txt = open(tp, encoding='utf-8', errors='replace').read() if os.path.exists(tp) else ''
+            m = LOGGER_EXIT_RE.search(txt)
+            if not m or m[1] != '0':
+                r['clean'] = False
+                r['why'].append(f"s06_logger mã thoát {m[1] if m else 'không có'} (pi/{n}_pi.txt)")
         lc = runs.get(n, {}).get('logger_cmd')
         if lc is not None:                           # A5: only sessions made with it, old folders keep their verdict
             sp = os.path.join(a.out, 'pi', f'{n}.csv.summary.json')
@@ -1047,7 +1126,8 @@ def main(argv=None):
                          'đặt không được thì dừng (mã 2), không chạy lượt; boot của #gain_ack khác hai lần hỏi thì '
                          'lượt không sạch')
     ap.add_argument('--analyze-only', action='store_true',
-                    help='chỉ chấm thư mục đã có frames/ (không ghi gì vào thư mục, trừ khi --write-summary)')
+                    help='chỉ chấm thư mục đã có frames/ (không ghi gì vào thư mục, trừ khi --write-summary; '
+                         'lượt --s06: s06_esp32_check ghi vào thư mục tạm, với --write-summary vào check_analyze*/ mới)')
     ap.add_argument('--write-summary', action='store_true',
                     help='với --analyze-only: ghi bench_summary_analyze.json (không đụng bench_summary.json của phiên)')
     a = ap.parse_args(argv)

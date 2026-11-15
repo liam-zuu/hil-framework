@@ -361,6 +361,17 @@ def link_fails(st: dict) -> List[str]:
     return f
 
 
+def link_missing(st: dict) -> List[str]:
+    """T3T-3 (Codex 15/11; Liam 'Sua ca 10 + vong 2'): T1 evidence the serial log does not give (mã 3, not a pass).
+    `rearm` needs two in-run 'Link: up' lines (one every 0.5 s); with fewer it is not computable. Known limit kept
+    (Liam 'Rearm dem trong luot'): a rearm in the <= 0.5 s before the first or after the last such line is not
+    counted; SPIfix (stuck SPI1) is not read by this tool."""
+    if st.get('rearm') is None:
+        return [f"không tính được rearm trong lượt: {st.get('rearm_in_run_lines', 0)} dòng Link: up giữa link up "
+                'và link lost (cần ≥ 2)']
+    return []
+
+
 def write_csv(path, rows):
     cols = list(rows[0]) if rows else ['window']
     with open(path, 'w', newline='') as f:

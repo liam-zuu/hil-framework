@@ -568,8 +568,8 @@ def _plan(*runs):
 def test_s06_plan_parses_and_refuses():
     plan = _plan('t2=--load-schedule s.csv --steps 70000', 't5=--steps 620000')
     got = hb.plan_s06(['t2=heavy,60', 't5=zero,610,logger-first'], plan)
-    assert got == dict(t2=dict(profile='heavy', duration=60, logger_first=False),
-                       t5=dict(profile='zero', duration=610, logger_first=True))
+    assert got == dict(t2=dict(profile='heavy', duration=60, logger_first=False, steps=70000),
+                       t5=dict(profile='zero', duration=610, logger_first=True, steps=620000))
     bad = ['x=heavy,60',                        # no such --run
            't2=fast,60', 't2=heavy,0', 't2=heavy,6x', 't2=heavy,60,plant-first', 't2=heavy']
     for spec in bad:
@@ -618,7 +618,8 @@ def test_s06_bench_runs_s06_logger_and_records(tmp_path, monkeypatch):
     assert 'agv_logger' not in run[0]
     assert ('~/r/t2_esp', True) in scps
     s = _j.load(open(os.path.join(a.out, 'session.json'), encoding='utf-8'))
-    assert s['runs'][0]['s06'] == dict(profile='heavy', duration=60, logger_first=False, esp32_ip='192.168.1.181')
+    assert s['runs'][0]['s06'] == dict(profile='heavy', duration=60, logger_first=False, steps=70000,
+                                       esp32_ip='192.168.1.181')
     assert 'logger_cmd' not in s['runs'][0]
 
 
@@ -647,6 +648,7 @@ def test_s06_analyze_run_matches_events_and_judges_the_check(tmp_path, monkeypat
         return dict(frames=dict(frames=10, miso_crc_bad=0, empty_in_run=0, unanswered=0))
     monkeypatch.setattr(hb.dec, 'decode', fake_decode)
     monkeypatch.setattr(hb.dec, 'problems', lambda res: [])
+    monkeypatch.setattr(hb.dec, 'conditions', lambda res: [])
     monkeypatch.setattr(hb, 'tracking', lambda *x: {})
     codes = iter([1, 0])
     monkeypatch.setattr(hb, 's06_check', lambda o, n, sub='check': seen.setdefault('sub', sub) and next(codes))
@@ -678,6 +680,8 @@ def test_s06_analyze_only_passes_s06_for_s06_runs_only(tmp_path, monkeypatch):
         (out / 'frames' / f'{n}_frames.npz').write_bytes(b'')
     (out / 'session.json').write_text(_j.dumps(dict(runs=[dict(name='t2', s06=dict(profile='heavy')),
                                                          dict(name='k1')])), encoding='utf-8')
+    (out / 'pi').mkdir()
+    (out / 'pi' / 't2_pi.txt').write_text('logger_exit=0\n', encoding='utf-8')
     seen = {}
 
     def fake(o, n, *x, **kw):
@@ -686,4 +690,133 @@ def test_s06_analyze_only_passes_s06_for_s06_runs_only(tmp_path, monkeypatch):
     monkeypatch.setattr(hb, 'analyze_run', fake)
     monkeypatch.setattr(hb, 'summary_line', lambda r: r['name'])
     code, _ = hb.analyze_only(SimpleNamespace(out=str(out)))
-    assert code == 0 and seen['t2'] == dict(s06=True, check_sub='check_analyze') and seen['k1'] == {}
+    assert code == 0 and seen['t2']['s06'] is True and seen['k1'] == {}
+    assert os.path.isabs(seen['t2']['check_sub']) and not os.path.exists(out / 'check_analyze')   # T3T-10: temp
+    code, _ = hb.analyze_only(SimpleNamespace(out=str(out), write_summary=True))
+    assert seen['t2']['check_sub'] == 'check_analyze'
+
+
+# ── Codex Sol round 1 of feat/s06-t3-tools (Liam 15/11, CODE_S06 'Sua ca 10 + vong 2') ──
+
+def test_t3t_1_s06_run_has_no_finite_run():
+    """T3T-1: run_hil.py refuses --finite-run with --steps / --load-schedule / omega modes (_finite_run_config):
+    an S06 run ends by --steps, so its command must not add --finite-run (0cb41c6 did: every --s06 run died)."""
+    s = dict(profile='heavy', duration=60, logger_first=False, steps=70000)
+    for lf in (False, True):
+        c = hb.s06_run_cmd('~/r', 't2', '--load-schedule s.csv --steps 70000', dict(s, logger_first=lf), '10.0.0.2')
+        assert '--finite-run' not in c and 'run_hil.py --load-schedule s.csv --steps 70000 --frame-log' in c
+
+
+def test_t3t_4_s06_run_refuses_outputs_of_an_earlier_session():
+    """T3T-4: same --pi-dir and run name as an earlier session: exit 2 before the logger opens its files (0cb41c6
+    overwrote <name>_logger.txt and <name>_esp/)."""
+    s = dict(profile='heavy', duration=60, logger_first=False, steps=70000)
+    for lf in (False, True):
+        c = hb.s06_run_cmd('~/r', 't2', '--steps 70000', dict(s, logger_first=lf), '10.0.0.2')
+        g = c.index('s06_pi_exists')
+        assert g < c.index('run_hil.py') and g < c.index('s06_logger.py')
+        for f in ('~/r/t2_esp', '~/r/t2_logger.txt', '~/r/t2_frames.npz'):
+            assert f in c[:g]
+        assert 'echo $L > ~/r/t2_logger.pid' in c                        # T3T-5: logger PID for the cleanup
+
+
+def test_t3t_5_timeout_from_the_run_length_and_cleanup(tmp_path, monkeypatch):
+    """T3T-5: a 610 s run (--steps 620000) gets an ssh limit of 620 + 120 s, not the 600 s default; a run that times
+    out (or ends non-zero) is followed by the cleanup of its run_hil.py and s06_logger.py by PID file."""
+    assert hb.s06_timeout(600.0, dict(steps=620000)) == 740.0 and hb.s06_timeout(900.0, dict(steps=70000)) == 900.0
+    c = hb.s06_cleanup_cmd('~/r', 't2')
+    assert '~/r/t2.pid' in c and '~/r/t2_logger.pid' in c and "grep -q 'run_hil.py'" in c
+    assert "grep -q 's06_logger.py'" in c and 'kill -TERM' in c and 'kill -KILL' in c
+    import subprocess as sp
+    a, calls, _ = _bench_env(monkeypatch, tmp_path, None, run=['t2=--test A-L1 --steps 620000'],
+                             s06=['t2=heavy,610'], gain_query=False, esp32_ip='10.0.0.2', run_timeout=600.0)
+    lims = []
+
+    def fake_ssh(host, cmd, timeout=None):
+        calls.append(cmd)
+        if 'run_hil.py' in cmd and 's06_logger.py --esp32' in cmd:
+            lims.append(timeout)
+            raise sp.TimeoutExpired(cmd, timeout)
+        return 0, ''
+    monkeypatch.setattr(hb, 'ssh', fake_ssh)
+    monkeypatch.setattr(hb, 'scp', lambda host, remote, local, recursive=False: 0)
+    hb.bench(a)
+    assert lims == [740.0]
+    assert any('_logger.pid' in c and 'kill -TERM' in c for c in calls)
+
+
+def test_t3t_9_steps_as_argparse_reads_them():
+    """T3T-9: the last --steps wins, --steps=N counts, a non-number is refused (0cb41c6 took the first, missed =)."""
+    assert hb.steps_of('--steps 70000 --steps 1') == 1 and hb.steps_of('--steps=70000') == 70000
+    assert hb.steps_of("--steps '70000'") == 70000 and hb.steps_of('--test A-L1') is None
+    with pytest.raises(ValueError):
+        hb.steps_of('--steps x')
+    with pytest.raises(ValueError, match='70000'):
+        hb.plan_s06(['t2=heavy,60'], _plan('t2=--steps 70000 --steps 1'))
+    assert hb.plan_s06(['t2=heavy,60'], _plan('t2=--steps=70000'))['t2']['steps'] == 70000
+
+
+def _s06_out(tmp_path):
+    out = tmp_path / 'o'
+    (out / 'frames').mkdir(parents=True)
+    (out / 'pi' / 't2_esp').mkdir(parents=True)
+    (out / 'pi' / 't2_esp' / 'esp32_events.txt').write_text('')
+    t, mosi, miso = frames(n=10)
+    np.savez(out / 'frames' / 't2_frames.npz', t_send_ns=t, mosi=mosi, miso=miso)
+    return out
+
+
+def test_t3t_6_8_decoder_conditions_and_run_problem(tmp_path, monkeypatch):
+    """T3T-6: the decoder's conditions (±1 s pad, TICK) make an S06 run not clean (0cb41c6 read problems only).
+    T3T-8: a RunProblem (two #run_start) is judged, not raised (0cb41c6: the exception ended the session)."""
+    out = _s06_out(tmp_path)
+    res = dict(frames=dict(frames=10, miso_crc_bad=0, empty_in_run=0, unanswered=0))
+    monkeypatch.setattr(hb.dec, 'problems', lambda r: [])
+    monkeypatch.setattr(hb.dec, 'conditions', lambda r: ['thiếu đệm ±1 s'])
+    monkeypatch.setattr(hb, 'tracking', lambda *x: {})
+    monkeypatch.setattr(hb, 's06_check', lambda o, n, sub='check': 0)
+    monkeypatch.setattr(hb.dec, 'decode', lambda *x: res)
+    r = hb.analyze_run(str(out), 't2', s06=True)
+    assert not r['clean'] and 'thiếu đệm ±1 s' in r['why']
+    monkeypatch.setattr(hb.dec, 'conditions', lambda r: [])
+
+    def dec2(ts, mo, mi, ev=None):
+        if ev is not None:
+            raise hb.dec.stm.RunProblem('2 #run_start')
+        return res
+    monkeypatch.setattr(hb.dec, 'decode', dec2)
+    r = hb.analyze_run(str(out), 't2', s06=True)
+    assert not r['clean'] and any('2 #run_start' in w for w in r['why'])
+
+
+def test_t3t_7_analyze_only_reads_the_logger_exit_again(tmp_path, monkeypatch):
+    """T3T-7: --analyze-only keeps an S06 run with s06_logger exit 1 (or none) not clean (0cb41c6 dropped it)."""
+    import json as _j
+    out = tmp_path / 'o'
+    (out / 'frames').mkdir(parents=True)
+    (out / 'frames' / 't2_frames.npz').write_bytes(b'')
+    (out / 'pi').mkdir()
+    (out / 'session.json').write_text(_j.dumps(dict(runs=[dict(name='t2', s06=dict(profile='heavy'))])),
+                                      encoding='utf-8')
+    monkeypatch.setattr(hb, 'analyze_run', lambda o, n, *x, **kw: dict(name=n, clean=True, why=[]))
+    monkeypatch.setattr(hb, 'summary_line', lambda r: r['name'])
+    for txt, ok in (('logger_exit=1\n', False), ('', False), ('logger_exit=0\n', True)):
+        (out / 'pi' / 't2_pi.txt').write_text(txt, encoding='utf-8')
+        code, res = hb.analyze_only(SimpleNamespace(out=str(out)))
+        assert res[0]['clean'] is ok and code == (0 if ok else 1), (txt, res)
+
+
+def test_t3t_10_analyze_only_writes_nothing_without_write_summary(tmp_path, monkeypatch):
+    """T3T-10: s06_esp32_check output of --analyze-only goes to a temp folder; with --write-summary to a NEW
+    check_analyze*/ each time (0cb41c6 wrote and overwrote check_analyze/ always)."""
+    import json as _j
+    out = _s06_out(tmp_path)
+    (out / 'session.json').write_text(_j.dumps(dict(runs=[dict(name='t2', s06=dict(profile='heavy'))])),
+                                      encoding='utf-8')
+    (out / 'pi' / 't2_pi.txt').write_text('logger_exit=0\n', encoding='utf-8')
+    before = sorted(os.listdir(out))
+    hb.analyze_only(SimpleNamespace(out=str(out)))
+    assert sorted(os.listdir(out)) == before
+    hb.analyze_only(SimpleNamespace(out=str(out), write_summary=True))
+    hb.analyze_only(SimpleNamespace(out=str(out), write_summary=True))
+    assert (out / 'check_analyze' / 't2').is_dir() and (out / 'check_analyze_2' / 't2').is_dir()
