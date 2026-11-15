@@ -288,10 +288,10 @@ MAN_SAME = ('imu_source', 'imu_noise', 'plant_src', 'proto', 'frame_len', 'plant
 RUN_SKIP = ('faults', 'step_log')                                     # argparse dests of --faults, --step-log
 # C7T4-1: characters bash on the Pi acts on before run_hil.py sees the words (tools/hil_bench_session.py puts
 # the args of a run into a bash command line as they are): quotes, escapes, expansions, globs, comments,
-# command separators. Without them bash splits on blanks, as shlex.split does here, and expands ~ only at the
-# start of a word (C7T5-1: '--uart-port ~/u' becomes <HOME>/u, '--uart-port=~/u' stays ~/u), which shlex does
-# not do: so a ~ in the value of any option but --faults / --step-log (left out of the comparison) is refused
-# after run_hil.py's parser (run_options).
+# command separators. Without them bash splits on blanks, as shlex.split does here, but it still expands ~
+# where shlex does not (C7T5-1, C7T6-1: '--uart-port ~/u' becomes <HOME>/u, '--uart-port=~/u' stays ~/u, and
+# a word shaped like an assignment, 'a=~/u', is expanded after the '='): so a ~ anywhere in the value of any
+# option but --faults / --step-log (left out of the comparison) is refused after run_hil.py's parser.
 SHELL_CHARS = frozenset('{}[]$`*?()!;&|<>"\'\\#\n\r')
 
 
@@ -323,8 +323,8 @@ def run_options(args):
     for k, v in opts.items():                                          # C7T5-1
         vals = v if isinstance(v, (list, tuple)) else [v]
         if k not in RUN_SKIP and any(isinstance(x, str) and '~' in x for x in vals):
-            raise TableError(f'run args {args!r}: ~ in --{k.replace("_", "-")} (bash expands it at the start of a '
-                             f'word only, C7T5-1)')
+            raise TableError(f'run args {args!r}: ~ in --{k.replace("_", "-")} (bash expands ~ where shlex does '
+                             f'not, C7T5-1)')
     return opts
 
 
