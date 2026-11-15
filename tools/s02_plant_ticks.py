@@ -34,7 +34,9 @@ Map t_Pi = alpha + beta t_ESP (seconds), per run.
   steady-speed ticks a time shift is a count constant, taken by the segment offsets. So the fit must
   converge with a well-conditioned normal matrix, and the standard error of the mapped time (from that
   matrix and the residual variance, largest at an end of the run) must be <= SIGMA_T_MAX_S [ĐỀ XUẤT 1 ms];
-  else not mapped (not_identified, sigma_t_over_max). Precision about 1 count / (1320 / 2 pi x |omega|): 0.5-1.2 ms at 4-10
+  the floor quantization is correlated, so that error can be optimistic: the deterministic shift bound
+  1 count / max |speed - segment mean| must also be <= T_BOUND_MAX_S [ĐỀ XUẤT 2 ms]; else not mapped
+  (not_identified, sigma_t_over_max, weak_excitation). Precision about 1 count / (1320 / 2 pi x |omega|): 0.5-1.2 ms at 4-10
   rad/s [ƯỚC LƯỢNG]; the sensor path (Pi send -> H7 receive -> EncoderGen) adds well under 1 ms.
 Plant at a tick: linear interpolation in Pi time between the two frames around alpha + beta t_ESP (theta
 unwrapped first, wrapped back to (-pi, pi]); outside the frame log: empty (no extrapolation, P2-3).
@@ -64,6 +66,7 @@ GRID1_S, GRID2_S = 2e-4, 1e-5
 GN_ITER, GN_TOL_S = 20, 1e-7     # Gauss-Newton passes, stop when the move is under this
 COND_MAX = 1e12                  # normal matrix condition number above which delta / beta are not identified
 SIGMA_T_MAX_S = 1e-3             # [ĐỀ XUẤT] standard error of the mapped time (S2P1-1, Codex vong 1)
+T_BOUND_MAX_S = 2e-3             # [ĐỀ XUẤT] shift bound _shift_bound (CLOSED_LOOP/2026-11-14_run01: 0.96-1.03 ms)
 RESID_MAX = 2.0                  # [ĐỀ XUẤT] counts RMS (S02 v1.10)
 PPM_MAX = 2002.0                 # S05 4.7 (i)
 ANCHOR_LAG_S = 0.015             # middle of the 0..30 ms command anchor lag (s02_cmd_path)
@@ -191,6 +194,18 @@ def _normal(delta, beta, te, counts, tp, omega, C, use, kc):
     return A, g
 
 
+def _shift_bound(delta, beta, te, tp, omega, use):
+    """1 count / the largest |speed - its segment mean| (counts/s) over the used ticks, s: a time shift smaller
+    than this changes no count by more than one after the segment offsets, so a floor quantization pattern
+    (correlated, not white: the standard error alone missed a 3.9 ms bias at 0.1 rad/s ripple) can hide it."""
+    kc = COUNTS_PER_REV / (2 * math.pi)
+    m = 0.0
+    for w, idx, seg in use:
+        k = np.clip(np.searchsorted(tp, delta + beta * te[idx], 'right') - 1, 0, len(tp) - 1)
+        m = max(m, float(np.max(np.abs(_proj(omega[k, w] * kc, seg)))))
+    return 1.0 / m if m > 0 else float('inf')
+
+
 def fit_map(te, counts, tp, omega, delta0, beta0=1.0):
     """alpha, beta (t_Pi = alpha + beta t_ESP, s; t_ESP measured from the first tick) and the fit numbers; ok
     False with a reason when not mapped. delta0: start value of t_Pi at t_ESP = te[0] (beta0 slope)."""
@@ -216,12 +231,15 @@ def fit_map(te, counts, tp, omega, delta0, beta0=1.0):
         cov = (tot / dof) * np.linalg.inv(A)
         sigma_t = max(math.sqrt(max(cov[0, 0] + 2 * x * cov[0, 1] + x * x * cov[1, 1], 0.0))
                       for x in (0.0, float(u.max())))
+    t_bound = _shift_bound(d, beta, u, tp, omega, use)
     out.update(alpha=float(alpha), beta=float(beta), drift_ppm=float(ppm), resid_rms=math.sqrt(tot / n),
-               n_used=int(n), converged=bool(converged), sigma_t_s=sigma_t)
+               n_used=int(n), converged=bool(converged), sigma_t_s=sigma_t, t_bound_s=t_bound)
     if not converged or not math.isfinite(sigma_t):
         out['reason'] = 'not_identified'
     elif sigma_t > SIGMA_T_MAX_S:
         out['reason'] = 'sigma_t_over_max'
+    elif t_bound > T_BOUND_MAX_S:
+        out['reason'] = 'weak_excitation'
     elif out['resid_rms'] > RESID_MAX:
         out['reason'] = 'residual_over_max'
     elif abs(ppm) > PPM_MAX:

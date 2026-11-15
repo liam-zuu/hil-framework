@@ -120,3 +120,16 @@ def test_sigma_is_reported_and_small_when_speed_changes():
     te, counts, tp, om, alpha, beta = make('line', 0.0)
     fit = pt.fit_map(te, counts, tp, om, alpha + beta * te[0] + 0.02)
     assert fit['ok'] and 0 < fit['sigma_t_s'] < 1e-3
+
+
+@pytest.mark.parametrize('amp', [0.1, 0.3])
+def test_weak_excitation_is_refused(amp):
+    """S2P1-1: a small speed ripple on a steady speed: the white-noise standard error is 0.1-0.4 ms but the
+    real bias reaches 3.9 ms (correlated floor quantization); the shift bound refuses it."""
+    tp = 100.0 + np.arange(8000) * 1e-3
+    om = np.full((len(tp), 4), 2 * math.pi) + amp * np.sin(2 * math.pi * 0.5 * (tp - 100))[:, None]
+    te = 5.0 + np.arange(700) * 0.01
+    C = pt.expected_counts(tp, om)
+    counts = np.stack([np.floor(np.interp(95.0 + te, tp, C[:, w])) for w in range(4)], axis=1)
+    fit = pt.fit_map(te, counts, tp, om, 95.0 + te[0] + 0.005)
+    assert not fit['ok'] and fit['reason'] in ('weak_excitation', 'sigma_t_over_max') and fit['t_bound_s'] > 2e-3
