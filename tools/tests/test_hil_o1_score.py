@@ -510,6 +510,12 @@ def test_pi_period_with_a_mapped_edge_between_steps(tmp_path, monkeypatch):
     np.savez(p, **z)
     out = H.score(p, 'O1-F05', esp_log='esp.csv')
     assert out['pi_period_ppm'] == pytest.approx(2.0, abs=1e-3)
+    # Codex PIP-R2-1: the start end alone, later by 3 ns per interval: -3 ppm on top of +2 -> -1 ppm; a start value
+    # rebuilt from its neighbours (400, 402) instead of read at 401 would still give +2
+    z['t_send_ns'][401] += 3 * (j - 401)
+    np.savez(p, **z)
+    out = H.score(p, 'O1-F05', esp_log='esp.csv')
+    assert out['pi_period_ppm'] == pytest.approx(-1.0, abs=1e-3)
 
 
 def test_pi_period_short_log_and_k1(tmp_path):
