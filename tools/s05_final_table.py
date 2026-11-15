@@ -475,7 +475,9 @@ def run_gain_problem(esp32_path, want):
     R134C8-1 (Codex round 8; Liam 15/11 CODE_R134 "Sua 2 muc, goi vong 9 (Recommended)"): the firmware writes a
     motor-off data line only every 10 ticks, so a short stop leaves no 0 -> 1 edge in the CSV. Hence:
       (1) every start the events file shows ('#us,ev=start' or '#gain', by first_seq) must have its '#gain' line
-          equal to the file (one file = one run, CG7: no start of another run belongs there);
+          equal to the file (one file = one run, CG7: no start of another run belongs there); a '#gain' line
+          with first_seq = 0 is the line the firmware writes when a set is applied with the motor off
+          (logger_push_gain(0), no '#us' with it), not a start (S05 6.3; R134C9-1, Codex round 9);
       (2) every boundary of a stretch in the data must hold a start of (1) with lo < first_seq <= hi: a 0 -> 1 edge
           (lo = log_seq of the off line, hi = of the on line), or two motor-on lines one after the other with
           d log_seq != d tick (the motor was off at some tick between them: log_seq counts every pushed line, tick
@@ -495,7 +497,9 @@ def run_gain_problem(esp32_path, want):
         for line in events:
             _, text = glc.split_event(line)
             if text.startswith('#gain,'):
-                seqs.add(glc._int(glc.parse_gain_line(text)['first_seq']))
+                fs = glc._int(glc.parse_gain_line(text)['first_seq'])
+                if fs != 0:       # R134C9-1: first_seq = 0 is the line of a gain setting (S05 6.3: not counted)
+                    seqs.add(fs)
             elif text.startswith('#us,') and glc._fields(text).get('ev') == 'start':
                 seqs.add(glc._int(glc._fields(text).get('first_seq')))
         if None in seqs:

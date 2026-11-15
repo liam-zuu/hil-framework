@@ -224,6 +224,14 @@ def _ack(boot='4753dc47', mac='aa:bb', gid='7'):
     return dict(ok='1', boot=boot, mac=mac, id=gid)
 
 
+def set_line(t0='2026-11-14T09:59:50', gid=7):
+    """The events line of a gain setting with the motor off: '#gain' with first_seq = 0 (no '#us' with it)."""
+    return stamp([GAIN7.format(seq=0, drop=0).replace('#gain,id=7,', f'#gain,id={gid},')], t0)
+
+
+SET_LINE = set_line()
+
+
 def stretch_starts(rows):
     """log_seq of the first data line of every motor-on stretch: after a motor-off line, or after a motor-on line
     with d log_seq != d tick (a short stop leaves no off line; R134C8-1)."""
@@ -239,9 +247,11 @@ def stretch_starts(rows):
 
 
 def write_log(d, rows, boots=('4753dc47', '4753dc47'), gain_seq=None, name='esp32.csv', run_boot='4753dc47',
-              events=None):
+              events=None, set_line=True):
     """esp32.csv, its events file with the run's start lines (start_events, or `events`), and gain_send
-    --query outputs before / after (None: file not written)."""
+    --query outputs before / after (None: file not written). set_line: first the '#gain' line with first_seq = 0
+    the firmware writes when the set is applied with the motor off (AGV 16702ff main.c logger_push_gain(0); the
+    gain setting whose ack is written below; R134C9-1)."""
     with open(os.path.join(d, name), 'w', newline='') as f:
         w = csv.DictWriter(f, fieldnames=COLS)
         w.writeheader()
@@ -249,6 +259,8 @@ def write_log(d, rows, boots=('4753dc47', '4753dc47'), gain_seq=None, name='esp3
     ev = events if events is not None else sum(
         (start_events(s, run_boot, gain_seq if k == 0 else None, t0=f'2026-11-14T10:00:{5 * k:02d}')
          for k, s in enumerate(stretch_starts(rows))), [])
+    if set_line:
+        ev = SET_LINE + ev
     with open(os.path.join(d, name + '.events.txt'), 'w', encoding='utf-8') as f:
         f.write(''.join(f'{t}\n' for t in ev))
     for when, b, t in zip(('before', 'after'), boots or (None, None), ((100.0, 101.0), (200.0, 201.0))):
@@ -1086,3 +1098,19 @@ def test_c8_2_a_read_error_stays_with_its_candidate(tmp_path, monkeypatch):
     monkeypatch.setattr(rq3_log, 'sha256_file', lambda p: sha(p, lambda x: x in (in_ds, name)))
     with pytest.raises(ValueError, match=r'run p1: file gain cua .*khong doc duoc.*khong doc duoc'):
         LR(ds)
+
+
+# ---------------------------------------------------------------- Codex Sol round 9 (CODE_R134)
+
+def test_c9_1_gain_setting_lines_are_not_starts(tmp_path):
+    """R134C9-1 (S05 6.3: the '#gain' line with first_seq = 0 written at a gain setting is not counted): a valid
+    run with the setting line before its start, or with the same set applied again during a short stop, is
+    tabled; the table does not ask a '#us,ev=start' for first_seq = 0."""
+    r = write_run(tmp_path, 'z1', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', 0.02)
+    ds = _table_ds(tmp_path, [r])
+    ev = open(os.path.join(r['results_dir'], 'esp32.csv.events.txt'), encoding='utf-8').read()
+    assert 'first_seq=0,' in ev                                       # the fixture writes it, as the firmware does
+    assert len(LR(ds)[0]) == 1
+    _short_stop(r, extra=set_line('2026-11-14T10:00:03'))            # applied again during the stop
+    runs, _ = LR(ds)
+    assert len(runs) == 1 and runs[0]['values']['tv_duty'] is None
