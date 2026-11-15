@@ -123,11 +123,20 @@ def test_loop(ip: str, test_id: str, sock=None, clock=time.monotonic, sleep=time
             sleep(wait)
 
     n, nz, interrupted = 0, 0, False
+    # real send times of the first and last schedule packets on the same clock as t0, read just after
+    # sendto (O1 v11.23 3.5 B81c-1: the window end follows the real send time, the sender may be late then
+    # send in a burst). Format agreed with CODE 15/11; Liam 15/11 CODE_CAM "Duyet, lam khi xen duoc
+    # (Recommended)": two fields appended to '#test_end', empty when the packet was not sent.
+    sched_first = sched_last = None
     try:
         for k in range(n_total):
             at(k)
             vx, vy, wz = f(k / SEND_HZ)
             sock.sendto(pack_packet(vx, vy, wz), (ip, TRAJ_PORT))
+            if k == 0:
+                sched_first = clock() - t0
+            if k == n_total - 1:
+                sched_last = clock() - t0
             n += 1
         for k in range(n_total, n_total + n_zero):
             at(k)
@@ -142,7 +151,9 @@ def test_loop(ip: str, test_id: str, sock=None, clock=time.monotonic, sleep=time
                 sock.sendto(pack_packet(0, 0, 0), (ip, TRAJ_PORT))
                 sleep(0.02)
         out(f"#test_end,test={test_id},t_epoch={wall():.3f},zeros={nz},tail_planned={n_zero},"
-            f"sent={n},planned={n_total},complete={int(n == n_total)}")
+            f"sent={n},planned={n_total},complete={int(n == n_total)},"
+            f"sched_first_s={'' if sched_first is None else f'{sched_first:.6f}'},"
+            f"sched_last_s={'' if sched_last is None else f'{sched_last:.6f}'}")
         if own:
             sock.close()
     return n

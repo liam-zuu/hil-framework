@@ -51,7 +51,75 @@ def test_schedule_is_trajectory_pub(tid):
         assert _decode(pkt) == pytest.approx(get_body_velocity(k / ps.SEND_HZ, spec), abs=1e-6)
     assert len(tail) == 10 and all(_decode(p) == (0.0, 0.0, 0.0) for p, _ in tail)
     assert lines[0].startswith(f'#test_start,test={tid},') and 'duration_s=' in lines[0]
-    assert lines[-1].startswith(f'#test_end,test={tid},') and lines[-1].endswith(f'sent={n},planned={n_plan},complete=1')
+    assert lines[-1].startswith(f'#test_end,test={tid},')
+    assert f'sent={n},planned={n_plan},complete=1,sched_first_s=' in lines[-1]
+
+
+def _fields(line):
+    return [p.split('=', 1)[0] for p in line.split(',')[1:]]
+
+
+def test_test_end_keeps_the_seven_fields_then_the_two_send_times():
+    """'#test_end': the 7 fields of 20f1f81 unchanged in name and order, then sched_first_s, sched_last_s
+    (Liam 15/11 CODE_CAM "Duyet, lam khi xen duoc (Recommended)", format agreed with CODE 15/11)."""
+    sock, clk, lines = FakeSock(), FakeClock(), []
+    ps.test_loop('10.0.0.2', 'A-K1', sock=sock, clock=clk, sleep=clk.sleep, out=lines.append)
+    assert _fields(lines[-1]) == ['test', 't_epoch', 'zeros', 'tail_planned', 'sent', 'planned', 'complete',
+                                  'sched_first_s', 'sched_last_s']
+
+
+def test_send_times_of_the_first_and_last_schedule_packets():
+    """The two fields are clock() - t0 read just after sendto of packet 0 and of the last schedule packet,
+    on the clock of the grid: a late sender shows in sched_last_s."""
+    sock, clk, lines = FakeSock(), FakeClock(cost=0.0003), []
+    times = []
+    real_send = sock.sendto
+    sock.sendto = lambda p, a: (times.append(clk.t), real_send(p, a))
+    t_start = clk.t
+    n = ps.test_loop('10.0.0.2', 'A-K1', sock=sock, clock=clk, sleep=clk.sleep, out=lines.append)
+    kv = dict(p.split('=', 1) for p in lines[-1].split(',')[1:])
+    first, last = float(kv['sched_first_s']), float(kv['sched_last_s'])
+    t0 = t_start + clk.cost                             # first clock() call of test_loop
+    assert first == pytest.approx(times[0] - t0, abs=2 * clk.cost)
+    assert last == pytest.approx(times[n - 1] - t0, abs=2 * clk.cost)
+    assert last - first == pytest.approx((n - 1) / ps.SEND_HZ, abs=0.01)
+    assert len(kv['sched_first_s'].split('.')[1]) == 6
+
+
+def test_late_sender_shows_in_the_last_send_time():
+    """A sender stalled 0.3 s just before the last schedule packet: sched_last_s is the real (late) time,
+    not the grid time; a stall mid schedule is caught up by the absolute grid (burst) and does not show."""
+    sock, clk, lines = FakeSock(), FakeClock(cost=0.0003), []
+    real_send = sock.sendto
+    n_plan = int(round(GROUP_A['A-K1'].duration * ps.SEND_HZ))
+
+    def send(p, a):
+        if len(sock.sent) == n_plan - 1:
+            clk.t += 0.3
+        real_send(p, a)
+    sock.sendto = send
+    n = ps.test_loop('10.0.0.2', 'A-K1', sock=sock, clock=clk, sleep=clk.sleep, out=lines.append)
+    kv = dict(p.split('=', 1) for p in lines[-1].split(',')[1:])
+    assert n == n_plan
+    assert float(kv['sched_last_s']) - float(kv['sched_first_s']) >= (n - 1) / ps.SEND_HZ + 0.29
+
+
+def test_interrupted_run_leaves_the_last_send_time_empty():
+    sock, clk, lines = FakeSock(), FakeClock(), []
+    real_send = sock.sendto
+
+    hit = []
+
+    def send(p, a):
+        if len(sock.sent) == 50 and not hit:
+            hit.append(1)
+            raise KeyboardInterrupt
+        real_send(p, a)
+    sock.sendto = send
+    ps.test_loop('10.0.0.2', 'A-K1', sock=sock, clock=clk, sleep=clk.sleep, out=lines.append)
+    kv = dict(p.split('=', 1) for p in lines[-1].split(',')[1:])
+    assert '#test_interrupted' in lines and kv['complete'] == '0'
+    assert kv['sched_first_s'] != '' and kv['sched_last_s'] == ''
 
 
 def test_absolute_grid_does_not_drift():
