@@ -15,8 +15,13 @@ line whose command (sp_vx, sp_vy, sp_wz) is non-zero, t_b = the first line with 
 last non-zero one. t_ESP(k) = t_a + (k - k_a) (t_b - t_a) / (k_b - k_a) (absorbs the sender / ESP32 clock
 rate; drift_ppm printed, flag drift_over_bound past ANCHOR_PPM, never clamped: S2P1-3). A line shows a
 packet only after it arrived (up to a tick, the 10 ms hand-over of traj_task, the link): each anchor is late
-by e_a, e_b in about 0..30 ms [ĐỀ XUẤT]. At k = 0 the error is e_a when k_a = 0 (10 of the 11 tests); for
-A-K1 (k_a = 150, k_b = 300) t_ESP(0) = 2 t_a - t_b, error 2 e_a - e_b, about -30..+60 ms.
+by e_a, e_b in about 0..30 ms [ước lượng từ code, chưa đo]. Packets carry no index, so one lost first
+packet at a step command moves anchor a one sample later (+20 ms) unseen (8 of 11 tests: A-L1, A-L2, A-C1,
+A-C2, A-S1, A-S2, A-K1, A-K2; two or more lost are caught by the span check). Spec S02 v1.12 P2-2b: the
+uncertainty of t = 0 is 0..+50 ms for the 10 tests with k_a = 0 (error e_a); A-K1 (k_a = 150, k_b = 300)
+extrapolates t_ESP(0) = 2 t_a - t_b, error 2 e_a - e_b: -30..+60 ms, and -30..+100 ms with one packet lost at
+anchor a (the 0 -> 0.3 step). On HIL the metrics take t = 0 from the sender (spec S02 v1.13, design v3 18.1);
+these anchors stay as the check there (t0_lag_ms).
 A run whose '#us_end' reports cut ticks has no t = 0 (t0_reason us_cut; S2P1-2, Liam 15/11 CODE_S02 "Moc
 t = 0 khong xac dinh"): a command cut to 0 by the ultrasonic interlock looks like a zero packet.
   An anchor whose line before (log_seq - 1) is missing is dropped (the real first line may be lost);
@@ -25,9 +30,10 @@ t = 0 khong xac dinh"): a command cut to 0 by the ultrasonic interlock looks lik
   ANCHOR_PPM of it plus ANCHOR_SLACK_US; a shorter span means a came late (first packets lost, an
   ultrasonic cut, motors on after k = 0): a is dropped (anchor_a_late); a longer one means b came late
   (first tail zeros lost; on HIL also STOPPING up to about 0.1 s after the publisher ends: k2 of
-  CLOSED_LOOP/2026-11-14_run01 +59 ms): b is dropped (anchor_b_late). The rate between two anchors is
-  clamped to +-ANCHOR_PPM (drift_ppm keeps the raw value, t0_reason drift_clamped): the 10 ms hand-over of
-  each anchor is thousands of ppm over a short span. One anchor: nominal 50 Hz from it (one_anchor,
+  CLOSED_LOOP/2026-11-14_run01 +59 ms): b is dropped (anchor_b_late). The rate between two anchors is not
+  clamped (S2P1-3, Codex round 1): the map goes through both anchors; a rate past +-ANCHOR_PPM only flags
+  drift_over_bound (the 10 ms hand-over of each anchor is thousands of ppm over a short span, e.g. A-K1's
+  3 s). One anchor: nominal 50 Hz from it (one_anchor,
   uncertainty +- ANCHOR_PPM over the test). None: t0_method none; every number below is NaN with the
   reason.
 

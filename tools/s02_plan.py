@@ -7,8 +7,8 @@ local_ff3bd6e3, "Gom theo dieu kien (Recommended)"; spec S02 v1.10 P2-2 (Thu tu)
 (runs.csv), P2-7 (A-S after the S05 final check).
 
     python tools/s02_plan.py plan --platform hil|real --order-seed N --out <run_dir>
-                                  [--controllers PID,LADRC] [--reps 5] [--with-strafe] [--prep-s 3]
-    python tools/s02_plan.py check <run_dir>
+                                  [--controllers PID,LADRC] [--reps 5] [--with-strafe] [--prep-s 3] [--trial]
+    python tools/s02_plan.py check <run_dir> [--trial]
 
 plan: a block is one controller x one condition (floor or lifted) x one repetition (P2-5). Blocks grouped by
 condition (Liam 15/11): every floor block of the N repetitions, then every lifted block; inside a
@@ -30,14 +30,19 @@ exactly one completed or broken row, and with s02_plan.json in the folder every 
 (the N runs are fixed, a broken run is not re-run, P2-4). Battery (REAL, P2-5): each block has the rest
 voltage before its first and after its last run; a sag > 0.3 V needs block_status battery_rerun on every row
 of the block and a later block of the same condition, repetition and controller; battery_rerun rows stay as
-history and are not counted (tools/s02_metrics.py skips them, and replaced rows). Prints the problems;
-exit 0 none, 1 some, 2 error.
+history and are not counted (tools/s02_metrics.py skips them, and replaced rows). Codex round 2: the main
+numbers need s02_plan.json and repetitions exactly 1..5 (S2P1-8; another N only with plan --trial, checked
+with check --trial); battery_rerun only on a REAL block whose own rest voltages sagged > 0.3 V, compared as
+decimals of the written values (12.4 -> 12.1 is not over), and the later block runs every test of it again
+(S2P2-3, S2P2-4); a completed run has missing_pct 0..100 and gen_pause_n >= 0 filled in (S2P1-14). Prints the
+problems; exit 0 none, 1 some, 2 error.
 """
 import argparse
 import csv
 import json
 import os
 import sys
+from decimal import Decimal, InvalidOperation
 
 import numpy as np
 
@@ -55,7 +60,8 @@ COLUMNS = ['run_id', 'block', 'order_in_block', 'platform', 'controller', 'condi
            'missing_pct', 'gen_pause_n']          # S2P1-14: P2-6 missing_pct, generation pauses
 RESULTS = ('completed', 'broken', 'replaced')
 BLOCK_STATUS = ('', 'ok', 'battery_rerun')     # S2P1-9: a block whose battery sagged > 0.3 V (P2-5)
-SAG_MAX_V = 0.3                                # P2-5
+SAG_MAX_V = Decimal('0.3')                     # P2-5; compared as decimals of the written values (S2P2-4)
+REPS_MAIN = 5                                  # P2-4: 5 runs per cell; another N only as a declared trial (S2P1-8)
 HIL_ARGS = '--ground traction --mu 0.436 --imu-noise 20'     # S02 P2-2: traction, mu_hd 0.436, IMU 20 Hz
 
 
@@ -76,8 +82,11 @@ def command(platform, test_id, run_id, rep, prep_s):
         ' --allow-strafe' if test_id in STRAFE else '')
 
 
-def plan(platform, controllers, reps, order_seed, with_strafe=False, prep_s=3.0):
-    """runs.csv rows and the block list."""
+def plan(platform, controllers, reps, order_seed, with_strafe=False, prep_s=3.0, trial=False):
+    """runs.csv rows and the block list. reps other than REPS_MAIN only with trial (S2P1-8, Codex round 2)."""
+    if reps != REPS_MAIN and not trial:
+        raise ValueError(f'--reps {reps}: the main numbers have {REPS_MAIN} runs per cell (P2-4); a trial with '
+                         'another N needs --trial')
     if platform not in ('hil', 'real'):
         raise ValueError(f'--platform {platform}: hil or real (SIM orders its runs itself)')
     if sorted(controllers) != ['LADRC', 'PID']:
@@ -109,9 +118,25 @@ def _num(x):
     return v if v == v else None
 
 
-def check(rows, planned=None):
+def _dec(x):
+    """The written value as a Decimal (12.4 - 12.1 is exactly 0.3, S2P2-4), None if not a finite number."""
+    try:
+        v = Decimal(str(x).strip())
+    except InvalidOperation:
+        return None
+    return v if v.is_finite() else None
+
+
+def _volts(rs):
+    v0 = next((_dec(r['v_batt_start']) for r in rs if _dec(r['v_batt_start']) is not None), None)
+    v1 = next((_dec(r['v_batt_end']) for r in reversed(rs) if _dec(r['v_batt_end']) is not None), None)
+    return v0, v1
+
+
+def check(rows, planned=None, n_reps=None):
     """Problems of a filled-in runs.csv (module docstring). planned: the s02_plan.json block list, when the
-    folder has it: the exact set of cells (test x controller x repetition) the session must cover."""
+    folder has it: the exact set of cells (test x controller x repetition) the session must cover. n_reps: the
+    planned repetitions must be exactly 1..n_reps (main numbers: REPS_MAIN; None for a declared trial)."""
     out = []
     if not rows:
         return ['runs.csv has no row']
@@ -136,21 +161,31 @@ def check(rows, planned=None):
         st = {r['block_status'].strip() for r in rs}
         if 'battery_rerun' in st and st != {'battery_rerun'}:
             out.append(f'block {b}: battery_rerun on some rows only {sorted(st)}')
+        real = rs[0]['platform'].strip().lower() == 'real'
+        v0, v1 = _volts(rs) if real else (None, None)
+        sagged = v0 is not None and v1 is not None and v0 - v1 > SAG_MAX_V
         if st == {'battery_rerun'}:
+            # S2P2-3 (Codex round 2): only a block whose own rest voltages sagged > 0.3 V may be set aside, and the
+            # later block of the same condition, repetition and controller runs every test of it again
+            if not sagged:
+                why = 'not a REAL block' if not real else f'{v0} -> {v1} V'
+                out.append(f'block {b}: battery_rerun without its own sag > {SAG_MAX_V} V ({why}; P2-5)')
             key = (rs[0]['condition'], rs[0]['_rep'], rs[0]['controller'])
+            tests = {r['test_id'] for r in rs}
             later = [b2 for b2, r2 in blocks.items() if order[b2] > order[b]
                      and {x['block_status'].strip() for x in r2} != {'battery_rerun'}
                      and (r2[0]['condition'], r2[0]['_rep'], r2[0]['controller']) == key]
+            again = {x['test_id'] for b2 in later for x in blocks[b2]}
             if not later:
                 out.append(f'block {b}: battery_rerun but no later block of {key}')
-        if rs[0]['platform'].strip().lower() != 'real':
+            elif not tests <= again:
+                out.append(f'block {b}: the later block(s) of {key} do not run again {sorted(tests - again)}')
+        if not real:
             continue
-        v0 = next((_num(r['v_batt_start']) for r in rs if _num(r['v_batt_start']) is not None), None)
-        v1 = next((_num(r['v_batt_end']) for r in reversed(rs) if _num(r['v_batt_end']) is not None), None)
         if v0 is None or v1 is None:
             out.append(f'block {b}: rest voltage before / after the block missing (P2-5)')
-        elif v0 - v1 > SAG_MAX_V and st != {'battery_rerun'}:
-            out.append(f'block {b}: battery sagged {v0 - v1:.2f} V > {SAG_MAX_V} V: mark the block battery_rerun '
+        elif sagged and st != {'battery_rerun'}:
+            out.append(f'block {b}: battery sagged {v0 - v1} V > {SAG_MAX_V} V: mark the block battery_rerun '
                        'and run it again (P2-5)')
     # runs (P2-4, P2-5): outside battery_rerun blocks, each cell exactly one completed or broken run
     done = {}
@@ -172,6 +207,13 @@ def check(rows, planned=None):
             out.append(f'line {i} {r["run_id"]}: broken needs a reason (P2-5)')
         if res == 'completed' and r['aborted'].strip() not in ('', '0'):
             out.append(f'line {i} {r["run_id"]}: aborted run marked completed')
+        if res == 'completed':
+            # S2P1-14 (Codex round 2): the P2-6 loss fields filled in (empty is not 0), finite, in range
+            mp, gp = _num(r['missing_pct']), _num(r['gen_pause_n'])
+            if mp is None or not 0.0 <= mp <= 100.0:
+                out.append(f'line {i} {r["run_id"]}: missing_pct {r["missing_pct"]!r} not a percentage 0..100')
+            if gp is None or gp != int(gp) or gp < 0:
+                out.append(f'line {i} {r["run_id"]}: gen_pause_n {r["gen_pause_n"]!r} not a count >= 0')
         if cell in done:
             out.append(f'line {i} {r["run_id"]}: {cell} already has a {done[cell]} run (5 fixed runs, P2-4)')
         done[cell] = res
@@ -184,6 +226,8 @@ def check(rows, planned=None):
         reps = {int(bl['rep']) for bl in planned}
         if reps != set(range(1, max(reps) + 1)):
             out.append(f'planned repetitions {sorted(reps)} are not 1..N')
+        elif n_reps is not None and reps != set(range(1, n_reps + 1)):
+            out.append(f'planned repetitions {sorted(reps)} are not 1..{n_reps} (P2-4; a trial needs --trial)')
     return out
 
 
@@ -197,9 +241,11 @@ def main(argv=None) -> int:
     p.add_argument('--order-seed', type=int, required=True)
     p.add_argument('--with-strafe', action='store_true', help='A-S1, A-S2 (S02 P2-7: after the S05 final check)')
     p.add_argument('--prep-s', type=float, default=3.0)
+    p.add_argument('--trial', action='store_true', help=f'a trial plan (--reps other than {REPS_MAIN}): not main numbers')
     p.add_argument('--out', required=True)
     c = sub.add_parser('check')
     c.add_argument('run_dir')
+    c.add_argument('--trial', action='store_true', help='check a trial folder (no plan, or a trial plan, accepted)')
     a = ap.parse_args(argv)
     if a.cmd == 'plan':
         path = os.path.join(a.out, 'runs.csv')
@@ -208,7 +254,8 @@ def main(argv=None) -> int:
             print(f'{a.out} already has runs.csv or s02_plan.json: use a new folder')
             return 2
         try:
-            rows, blist = plan(a.platform, a.controllers.split(','), a.reps, a.order_seed, a.with_strafe, a.prep_s)
+            rows, blist = plan(a.platform, a.controllers.split(','), a.reps, a.order_seed, a.with_strafe, a.prep_s,
+                               a.trial)
         except ValueError as exc:
             print(exc)
             return 2
@@ -219,7 +266,7 @@ def main(argv=None) -> int:
             w.writerows(rows)
         with open(js, 'x', encoding='utf-8') as f:
             json.dump(dict(argv=sys.argv, platform=a.platform, controllers=a.controllers, reps=a.reps,
-                           order_seed=a.order_seed, with_strafe=a.with_strafe, prep_s=a.prep_s,
+                           order_seed=a.order_seed, with_strafe=a.with_strafe, prep_s=a.prep_s, trial=a.trial,
                            numpy=np.__version__, blocks=blist), f, indent=1)
         print(f'{len(rows)} runs in {len(blist)} blocks -> {path}; order_seed {a.order_seed} goes into meta.yaml')
         return 0
@@ -229,14 +276,20 @@ def main(argv=None) -> int:
     except OSError as exc:
         print(exc)
         return 2
-    planned = None
+    planned, pre = None, []
     js = os.path.join(a.run_dir, 's02_plan.json')
     if os.path.isfile(js):
         with open(js, encoding='utf-8') as f:
-            planned = json.load(f)['blocks']
+            pj = json.load(f)
+        planned = pj['blocks']
+        if pj.get('trial') and not a.trial:
+            pre.append('s02_plan.json is a trial plan: not main numbers (check --trial to check it as a trial)')
+    elif a.trial:
+        print('no s02_plan.json: the planned cells are not checked (trial)')
     else:
-        print('no s02_plan.json: the planned cells are not checked (P2-4)')
-    probs = check(rows, planned)
+        # S2P1-8 (Codex round 2): the main numbers need the plan, or a missing cell passes
+        pre.append('no s02_plan.json: the planned cells cannot be checked; main numbers need it (P2-4)')
+    probs = pre + check(rows, planned, None if a.trial else REPS_MAIN)
     for x in probs:
         print(x)
     print(f'#ket_qua,ma={1 if probs else 0}')

@@ -64,7 +64,10 @@ def test_finite_run_lasts_preparation_plus_test():
                            omega_schedule=None, load_schedule=None, o1=None)
     spec = s2.prep_spec(TrajectorySpec('lift_reverse', v=0.3, duration=9.0), 3.0)
     lc, _ = _finite_run_config(args, spec)
-    assert lc.run_s == pytest.approx(13.0) and lc.stop_s == 1.0            # 3 + 9 + 1 s tail (S2P1-7)
+    # 3 + 9 + 1 s: the S02 tail (k = K .. K + 49) is the publisher's 1 s inside RUN (S2P1-7). STOPPING (stop_s,
+    # 1 s of zeros after RUN) is the bench lifecycle, not the S02 tail; the metrics stop at T_cmd (S2P2-6,
+    # Codex round 2; Liam 15/11 CODE_S02 "Chi ghi ro": documented, not changed)
+    assert lc.run_s == pytest.approx(13.0) and lc.stop_s == 1.0
 
 
 @pytest.mark.parametrize('extra,msg', [

@@ -162,7 +162,7 @@ def test_stall_in_the_preparation_stops_the_run():
     sock.sendto = sendto
     r = s2.s02_loop('10.0.0.2', 'A-L2', 3.0, sock=sock, clock=clk, sleep=clk.sleep, out=lines.append)
     assert r['complete'] == 0 and r['prep'] == 4 and r['sched'] == 0
-    assert any(l.startswith('#s02_late,phase=prep,packet=3') for l in lines)
+    assert any(l.startswith('#s02_late,phase=prep,packet=4') for l in lines)    # S2P2-5: caught before sendto
     assert not any(l.startswith('#s02_k0') for l in lines)
     assert len(sock.sent) == 4 + s2.STOP_ZEROS
 
@@ -197,3 +197,51 @@ def test_ctrl_c_in_a_print(when):
     assert r['prep'] + r['sched'] + r['tail'] == len(sock.sent) - s2.STOP_ZEROS
     if when == '#s02_k0':
         assert r['sched'] == 1
+
+
+def _stall_after(n_sent, jump=4.0):
+    """s02_loop on A-L2 where the clock jumps by jump s right after the n_sent-th sendto."""
+    clk = FakeClock()
+    sock, lines = FakeSock(clk), []
+    real = sock.sendto
+
+    def sendto(p, a):
+        real(p, a)
+        if len(sock.sent) == n_sent:
+            clk.t += jump
+    sock.sendto = sendto
+    r = s2.s02_loop('10.0.0.2', 'A-L2', 3.0, sock=sock, clock=clk, sleep=clk.sleep, out=lines.append)
+    return r, sock, lines
+
+
+def test_stall_before_the_first_schedule_packet_sends_nothing_late():
+    """S2P2-5 (Codex round 2): stalled right before k = 0: the late non-zero packet is not sent (checked before
+    sendto), sent_sched 0, no '#s02_k0', sched_first_s empty, stop zeros."""
+    r, sock, lines = _stall_after(150)
+    assert r['complete'] == 0 and r['prep'] == 150 and r['sched'] == 0
+    assert any(l.startswith('#s02_late,phase=sched,packet=150') for l in lines)
+    assert not any(l.startswith('#s02_k0') for l in lines)
+    assert 'sched_first_s=,' in lines[-1]
+    assert all(_decode(p) == (0.0, 0.0, 0.0) for p, _, _ in sock.sent)
+
+
+def test_stall_after_the_last_packet_keeps_a_complete_run():
+    """S2P2-5: every packet sent on time, then the process stalls before the clock read of the last one: the
+    run is complete, no extra zeros."""
+    total = 150 + s2.sched_count(GROUP_A['A-L2']) + s2.TAIL_ZEROS
+    r, sock, lines = _stall_after(total)
+    assert r['complete'] == 1 and len(sock.sent) == total and r['late_after_n'] == 0
+    assert not any(l.startswith('#s02_late') for l in lines)
+
+
+def test_stall_after_a_schedule_sendto_is_reported_not_stopped():
+    """S2P2-5: a stall between a schedule sendto and its clock read: counted in late_after_n, the run goes on;
+    the next packet is checked before its sendto (here: the grid is 4 s behind, so it stops there)."""
+    r, sock, lines = _stall_after(160, jump=0.060)          # read 60 ms late; the next slot is then 40 ms late
+    assert r['late_after_n'] == 1 and 'late_after_n=1' in lines[-1] and r['complete'] == 1
+    assert not any(l.startswith('#s02_late') for l in lines)
+    r, sock, lines = _stall_after(160, jump=0.03 + s2.LATE_MAX_S)
+    assert r['late_after_n'] == 1
+    assert r['complete'] == 0 and any(l.startswith('#s02_late,phase=sched,packet=160') for l in lines)
+    r, sock, lines = _stall_after(160, jump=0.0)
+    assert r['late_after_n'] == 0 and r['complete'] == 1

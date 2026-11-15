@@ -21,11 +21,19 @@ One absolute 50 Hz grid from time.monotonic(): packet j at t_start + j/50.
 Lines printed (PC clock, for diagnosis only: the master clock is the ESP32, C7b section 1):
     #s02_start,test=,t_epoch=,iso=,prep_s=,n_prep=,n_sched=,n_tail=,send_hz=,dst=
     #s02_k0,t_epoch=                     right after packet k = 0 is sent
-    #s02_end,test=,t_epoch=,sent_prep=,sent_sched=,sent_tail=,complete=,sched_first_s=,sched_last_s=,late_max_ms=
+    #s02_end,test=,t_epoch=,sent_prep=,sent_sched=,sent_tail=,complete=,sched_first_s=,sched_last_s=,late_max_ms=,
+            late_after_n=
       sched_first_s / sched_last_s: send time of packets k = 0 and k = K - 1 after t_start, read just after
       sendto (as pc_sender '#test_end'), empty when not sent
 Ctrl-C in any phase: '#s02_interrupted,phase=start|prep|sched|tail', 10 zero packets at once, complete=0.
-A packet more than 50 ms after its slot: '#s02_late,phase=,packet=,late_ms=', the same stop (S2P1-6).
+Deadline (S2P1-6, S2P2-5 Codex round 2): checked right BEFORE each sendto; a packet whose slot is more than 50 ms
+past is not sent: '#s02_late,phase=,packet=,late_ms=', the same stop, complete=0. The clock read after sendto is
+an upper bound of the send time (the process can be stopped between sendto and that read): it goes into
+late_max_ms, and a schedule packet over 50 ms there counts in late_after_n (the packet may have left late, or
+not); the run is not stopped for it: the analysis reads late_after_n.
+HIL (run_hil.py --s02-prep): the 1 s of zeros after the schedule is inside RUN (prep_spec); the bench's own
+STOPPING (1 s of zeros) comes after it. STOPPING is the bench lifecycle, not the S02 tail: the S02 tail is the
+publisher's 1 s, the metrics stop at T_cmd (S2P2-6, Codex round 2; Liam 15/11 CODE_S02 "Chi ghi ro").
 A-S1, A-S2 need --allow-strafe (S02 P2-7: after the S05 final check).
 
 HIL: prep_spec() wraps the test in the 'load' kind of trajectory_pub (unchanged; it is in the S04 blob
@@ -107,18 +115,23 @@ def s02_loop(ip: str, test_id: str, prep_s: float = PREP_S_DEFAULT, allow_strafe
     first = last = None
     phase, t0 = 'start', None
     late_max = 0.0
+    late_after = 0
 
     def send(j, vx, vy, wz, key):
-        nonlocal late_max
-        wait = t0 + j / SEND_HZ - clock()
+        nonlocal late_max, late_after
+        slot = t0 + j / SEND_HZ
+        wait = slot - clock()
         if wait > 0:
             sleep(wait)
+        pre = clock() - slot
+        if pre > LATE_MAX_S:                       # S2P2-5: a packet past its deadline is never sent
+            raise _Late(j, pre)
         sock.sendto(pack_packet(vx, vy, wz), dst)
         sent[key] += 1
-        late = clock() - (t0 + j / SEND_HZ)
+        late = clock() - slot                      # upper bound of the send time
         late_max = max(late_max, late)
-        if late > LATE_MAX_S:
-            raise _Late(j, late)
+        if late > LATE_MAX_S and key == 'sched':
+            late_after += 1                        # S2P2-5: reported, not a stop (it may have left on time)
         return late
 
     try:
@@ -157,10 +170,11 @@ def s02_loop(ip: str, test_id: str, prep_s: float = PREP_S_DEFAULT, allow_strafe
         out(f"#s02_end,test={test_id},t_epoch={wall():.3f},sent_prep={sent['prep']},sent_sched={sent['sched']},"
             f"sent_tail={sent['tail']},complete={complete},"
             f"sched_first_s={'' if first is None else f'{first:.6f}'},"
-            f"sched_last_s={'' if last is None else f'{last:.6f}'},late_max_ms={late_max * 1e3:.1f}")
+            f"sched_last_s={'' if last is None else f'{last:.6f}'},late_max_ms={late_max * 1e3:.1f},"
+            f"late_after_n={late_after}")
         if own:
             sock.close()
-    return dict(sent, n_prep=n_prep, n_sched=n_sched, complete=complete)
+    return dict(sent, n_prep=n_prep, n_sched=n_sched, complete=complete, late_after_n=late_after)
 
 
 def main(argv=None) -> int:

@@ -34,10 +34,25 @@ Map t_Pi = alpha + beta t_ESP (seconds), per run.
   steady-speed ticks a time shift is a count constant, taken by the segment offsets. So the fit must
   converge with a well-conditioned normal matrix, and the standard error of the mapped time (from that
   matrix and the residual variance, largest at an end of the run) must be <= SIGMA_T_MAX_S [ĐỀ XUẤT 1 ms];
-  the floor quantization is correlated, so that error can be optimistic: the deterministic shift bound
-  1 count / max |speed - segment mean| must also be <= T_BOUND_MAX_S [ĐỀ XUẤT 2 ms]; else not mapped
-  (not_identified, sigma_t_over_max, weak_excitation). Precision about 1 count / (1320 / 2 pi x |omega|): 0.5-1.2 ms at 4-10
-  rad/s [ƯỚC LƯỢNG]; the sensor path (Pi send -> H7 receive -> EncoderGen) adds well under 1 ms.
+  the floor quantization is correlated, so that error can be optimistic: the local sensitivity scale
+  1 count / max |speed - segment mean| (a scale, not a bound: S2P2-1, Codex round 2) must also be
+  <= T_SENS_MAX_S [ĐỀ XUẤT 2 ms]; else not mapped (not_identified, sigma_t_over_max, weak_excitation).
+  Other branches (S2P2-1, Codex round 2): a speed that repeats with a period P (ripple) gives the same cost at
+  delta + P, delta + 2P, ..., so the best point of one search can be a wrong branch tens of ms away. The cost
+  is scanned at the fitted slope over the whole range the command anchors allow (start value +-AMBIG_SPAN_S:
+  the anchor lag is 0..+50 ms, spec S02 P2-2b, around the middle value used here, plus a margin); any local
+  minimum farther than AMBIG_SEP_S from the fit whose residual RMS is below the fit's + AMBIG_MARGIN
+  [ĐỀ XUẤT 0.5 count] makes the map ambiguous: not mapped (ambiguous). Precision about 1 count / (1320 / 2 pi
+  x |omega|): 0.5-1.2 ms at 4-10 rad/s [ƯỚC LƯỢNG]; the sensor path (Pi send -> H7 apply in its main loop ->
+  EncoderGen) adds well under 1 ms (a limit: the apply time is not the send time, Codex round 2).
+  Count rate of a frame (O-1, Codex round 2): the EncoderGen rate, not the ideal 1320 |omega| / 2 pi: no edges
+  at |omega| <= 0.3 rad/s (ENC_OMEGA_MIN), half period rounded to whole 1 us timer ticks in float32
+  (encoder_gen.c _half_period, ENC_CLOCK_CAL 1.0 at hil b907d98), so 2e6 / half_period counts/s (up to about
+  500 ppm off the ideal at 10 rad/s). Start, stop and retime transients are not modelled (SEG_SKIP_S drops
+  segment starts). The H7 timer clock against the ESP32 clock is a common rate, taken by beta.
+  Not mapped either: a frame log with mosi_true (a run with --faults: the H7 got patched frames, the count
+  model would need them, O-3), and a run whose '#us_end' reports cut ticks (us_cut, S2P2-2: same rule as the
+  t = 0 of s02_cmd_path, Liam 15/11 CODE_S02 "Moc t = 0 khong xac dinh").
 Plant at a tick: linear interpolation in Pi time between the two frames around alpha + beta t_ESP (theta
 unwrapped first, wrapped back to (-pi, pi]); outside the frame log: empty (no extrapolation, P2-3).
 """
@@ -66,7 +81,13 @@ GRID1_S, GRID2_S = 2e-4, 1e-5
 GN_ITER, GN_TOL_S = 20, 1e-7     # Gauss-Newton passes, stop when the move is under this
 COND_MAX = 1e12                  # normal matrix condition number above which delta / beta are not identified
 SIGMA_T_MAX_S = 1e-3             # [ĐỀ XUẤT] standard error of the mapped time (S2P1-1, Codex vong 1)
-T_BOUND_MAX_S = 2e-3             # [ĐỀ XUẤT] shift bound _shift_bound (CLOSED_LOOP/2026-11-14_run01: 0.96-1.03 ms)
+T_SENS_MAX_S = 2e-3              # [ĐỀ XUẤT] local sensitivity scale _sensitivity (CLOSED_LOOP/2026-11-14_run01: 0.96-1.03 ms)
+AMBIG_SPAN_S = 0.100             # cost scanned over the start value +- this (anchor lag 0..50 ms + margin; S2P2-1)
+AMBIG_SEP_S = 3e-3               # a local minimum farther than this from the fit is another branch
+AMBIG_MARGIN = 0.5               # [ĐỀ XUẤT] counts RMS: another branch within this of the fit -> ambiguous
+ENC_OMEGA_MIN = 0.3              # rad/s, encoder_gen.c: no edges at or below
+ENC_TICKS_PER_S = 1.0e6          # encoder_gen.h ENC_TIMER_FREQ x ENC_CLOCK_CAL (1.0)
+ENC_PPR = 330
 RESID_MAX = 2.0                  # [ĐỀ XUẤT] counts RMS (S02 v1.10)
 PPM_MAX = 2002.0                 # S05 4.7 (i)
 ANCHOR_LAG_S = 0.015             # middle of the 0..30 ms command anchor lag (s02_cmd_path)
@@ -81,10 +102,25 @@ def load_frames(path):
         t = np.asarray(z['t_send_ns'], dtype=np.float64) * 1e-9
         mosi = np.asarray(z['mosi_true'] if 'mosi_true' in z.files else z['mosi'])
         miso = np.asarray(z['miso'])
+        manifest['_has_mosi_true'] = 'mosi_true' in z.files      # O-3: a run with --faults
     state, ref, _, _ = H.decode_frames(mosi, miso)
     if len(t) < 2 or np.any(np.diff(t) <= 0):
         raise ValueError(f'{path}: t_send_ns must increase over at least two frames')
     return t, state, ref, manifest
+
+
+def encodergen_omega(omega):
+    """The wheel speed the EncoderGen edges carry for a frame speed omega (O-1, Codex round 2): 0 at |omega| <=
+    ENC_OMEGA_MIN, else sign(omega) x 2 pi / 1320 x 2 / half_period, with half_period = (uint32)(hp + 0.5f) of
+    hp = ENC_TICKS_PER_S pi / (|omega| ENC_PPR) in float32, clamped to 1..65535 (encoder_gen.c _half_period)."""
+    om = np.asarray(omega, dtype=np.float64)
+    a = np.abs(om).astype(np.float32)
+    with np.errstate(divide='ignore'):
+        hp = np.float32(ENC_TICKS_PER_S) * np.float32(math.pi) / (a * np.float32(ENC_PPR))
+    hp = np.where(hp > 65535.0, 65535.0, np.where(hp < 1.0, 1.0, np.floor(hp + np.float32(0.5))))
+    rate = 2.0 * ENC_TICKS_PER_S / hp.astype(np.float64)                 # counts per second (4 edges per cycle)
+    out = np.sign(om) * rate * 2 * math.pi / COUNTS_PER_REV
+    return np.where(om > ENC_OMEGA_MIN, out, np.where(om < -ENC_OMEGA_MIN, out, 0.0))
 
 
 def expected_counts(tp, omega):
@@ -194,10 +230,11 @@ def _normal(delta, beta, te, counts, tp, omega, C, use, kc):
     return A, g
 
 
-def _shift_bound(delta, beta, te, tp, omega, use):
-    """1 count / the largest |speed - its segment mean| (counts/s) over the used ticks, s: a time shift smaller
-    than this changes no count by more than one after the segment offsets, so a floor quantization pattern
-    (correlated, not white: the standard error alone missed a 3.9 ms bias at 0.1 rad/s ripple) can hide it."""
+def _sensitivity(delta, beta, te, tp, omega, use):
+    """1 count / the largest |speed - its segment mean| (counts/s) over the used ticks, s: the local scale below
+    which a small time shift changes no projected count by more than one, so a floor quantization pattern
+    (correlated, not white: the standard error alone missed a 3.9 ms bias at 0.1 rad/s ripple) can hide it.
+    Only a local scale, not a bound on an undetected shift (S2P2-1): other branches are checked by _branches."""
     kc = COUNTS_PER_REV / (2 * math.pi)
     m = 0.0
     for w, idx, seg in use:
@@ -206,9 +243,26 @@ def _shift_bound(delta, beta, te, tp, omega, use):
     return 1.0 / m if m > 0 else float('inf')
 
 
+def _branches(d, beta, delta0, best_rms, te, counts, tp, C, use):
+    """Other local minima of the cost at slope beta over delta0 +- AMBIG_SPAN_S (GRID1_S steps), farther than
+    AMBIG_SEP_S from d: [(delta, residual RMS)] sorted by RMS, and the RMS of the best of them (inf if none)."""
+    grid = delta0 + np.arange(-AMBIG_SPAN_S, AMBIG_SPAN_S + GRID1_S / 2, GRID1_S)
+    cost = []
+    for g in grid:
+        tot, n = _cost(g, beta, te, counts, tp, C, use)
+        cost.append(math.sqrt(tot / n) if n else float('inf'))
+    cost = np.array(cost)
+    loc = [i for i in range(len(grid))
+           if (i == 0 or cost[i] <= cost[i - 1]) and (i == len(grid) - 1 or cost[i] <= cost[i + 1])]
+    other = sorted((float(cost[i]), float(grid[i])) for i in loc if abs(grid[i] - d) > AMBIG_SEP_S)
+    return [(g, c) for c, g in other], (other[0][0] if other else float('inf'))
+
+
 def fit_map(te, counts, tp, omega, delta0, beta0=1.0):
     """alpha, beta (t_Pi = alpha + beta t_ESP, s; t_ESP measured from the first tick) and the fit numbers; ok
-    False with a reason when not mapped. delta0: start value of t_Pi at t_ESP = te[0] (beta0 slope)."""
+    False with a reason when not mapped. delta0: start value of t_Pi at t_ESP = te[0] (beta0 slope). omega: the
+    frame wheel speeds; the count model uses encodergen_omega(omega) (O-1)."""
+    omega = encodergen_omega(omega)
     C = expected_counts(tp, omega)
     t_ref = float(te[0])
     u = te - t_ref                                       # conditioning: times from the first tick
@@ -231,16 +285,23 @@ def fit_map(te, counts, tp, omega, delta0, beta0=1.0):
         cov = (tot / dof) * np.linalg.inv(A)
         sigma_t = max(math.sqrt(max(cov[0, 0] + 2 * x * cov[0, 1] + x * x * cov[1, 1], 0.0))
                       for x in (0.0, float(u.max())))
-    t_bound = _shift_bound(d, beta, u, tp, omega, use)
-    out.update(alpha=float(alpha), beta=float(beta), drift_ppm=float(ppm), resid_rms=math.sqrt(tot / n),
-               n_used=int(n), converged=bool(converged), sigma_t_s=sigma_t, t_bound_s=t_bound)
+    t_sens = _sensitivity(d, beta, u, tp, omega, use)
+    rms = math.sqrt(tot / n)
+    alts, alt_rms = _branches(d, beta, delta0, rms, u, counts, tp, C, use)
+    out.update(alpha=float(alpha), beta=float(beta), drift_ppm=float(ppm), resid_rms=rms,
+               n_used=int(n), converged=bool(converged), sigma_t_s=sigma_t, t_sens_s=t_sens,
+               alt_rms=alt_rms if math.isfinite(alt_rms) else None,            # None: no other minimum in the scan
+               alt_shift_s=(alts[0][0] - d) if alts else None,
+               alt_n=sum(1 for _, c in alts if c < rms + AMBIG_MARGIN))   # other branches within the margin
     if not converged or not math.isfinite(sigma_t):
         out['reason'] = 'not_identified'
     elif sigma_t > SIGMA_T_MAX_S:
         out['reason'] = 'sigma_t_over_max'
-    elif t_bound > T_BOUND_MAX_S:
+    elif t_sens > T_SENS_MAX_S:
         out['reason'] = 'weak_excitation'
-    elif out['resid_rms'] > RESID_MAX:
+    elif alt_rms < rms + AMBIG_MARGIN:
+        out['reason'] = 'ambiguous'                      # S2P2-1: another branch fits as well
+    elif rms > RESID_MAX:
         out['reason'] = 'residual_over_max'
     elif abs(ppm) > PPM_MAX:
         out['reason'] = 'drift_out_of_bound'
@@ -289,10 +350,20 @@ def map_run(frame_log, esp_log, test_id):
     te_us = log['timestamp_us'][on]
     counts = np.stack([log[w] for w in WHEELS], axis=1)[on]
     counts[counts == -2 ** 31] = np.nan                     # AGV LOG_CNT_INVALID
-    anc, _, _ = s02_cmd_path.anchors(log, test_id)
+    # S2P2-2 (Codex round 2): the same '#us_end' evidence as s02_metrics -> s02_cmd_path.stats
+    us_cut = s02_cmd_path.us_cut_ticks(esp_log + '.events.txt')
+    anc, _, _ = s02_cmd_path.anchors(log, test_id, us_cut)
     pa, pb = pi_anchors(tp, ref)
     res = dict(test=test_id, frame_log=os.path.basename(frame_log), esp_log=os.path.basename(esp_log),
-               method='encoder_counts', t0_us=anc['t0_us'], t0_method=anc['t0_method'])
+               method='encoder_counts', t0_us=anc['t0_us'], t0_method=anc['t0_method'],
+               us_cut_ticks=us_cut)
+    empty = [[int(t)] + [''] * (len(PLANT_COLUMNS) - 1) for t in te_us]
+    if us_cut is not None and us_cut > 0:
+        res.update(ok=False, reason='us_cut')           # Liam 15/11 CODE_S02: no t = 0, no family R
+        return res, empty
+    if manifest.get('_has_mosi_true'):
+        res.update(ok=False, reason='faults_not_supported')   # O-3: the H7 got patched frames
+        return res, empty
     # S2P1-4: only an anchor s02_cmd_path kept (a dropped one is NaN there), with its own Pi side
     if math.isfinite(anc['anchor_a_us']) and pa is not None:
         ta, t_pi_a = anc['anchor_a_us'], pa

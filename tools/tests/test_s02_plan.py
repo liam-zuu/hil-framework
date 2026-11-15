@@ -41,11 +41,11 @@ def test_order_is_from_the_seed():
 
 
 def test_commands():
-    rows, _ = sp.plan('hil', ['PID', 'LADRC'], 1, 3)
+    rows, _ = sp.plan('hil', ['PID', 'LADRC'], 1, 3, trial=True)
     r = next(x for x in rows if x['test_id'] == 'A-K2' and x['controller'] == 'PID')
     assert r['command'] == '--run A-K2_PID_r1="--test A-K2 --s02-prep 3 --ground traction --mu 0.436 --imu-noise 20 --seed 1"'
     assert r['file'] == 'pi/A-K2_PID_r1.csv' and r['noise_seed'] == 1
-    rows, _ = sp.plan('real', ['PID', 'LADRC'], 1, 3, with_strafe=True)
+    rows, _ = sp.plan('real', ['PID', 'LADRC'], 1, 3, with_strafe=True, trial=True)
     r = next(x for x in rows if x['test_id'] == 'A-S1')
     assert r['command'].endswith('--test A-S1 --prep-s 3 --allow-strafe')
 
@@ -58,10 +58,11 @@ def test_refuses_sim_and_other_controllers():
 
 
 def _rows(*specs, platform='real', block='1', v=('12.4', '12.3')):
-    base = sp.plan(platform, ['PID', 'LADRC'], 1, 3)[0][0]
+    base = sp.plan(platform, ['PID', 'LADRC'], 1, 3, trial=True)[0][0]
     out = []
     for tid, rep, res, cause, reason in specs:
-        r = dict(base, test_id=tid, rep=str(rep), result=res, cause_group=cause, reason=reason, block=block)
+        r = dict(base, test_id=tid, rep=str(rep), result=res, cause_group=cause, reason=reason, block=block,
+                 missing_pct='0.1', gen_pause_n='0')
         out.append({k: str(x) for k, x in r.items()})
     out[0]['v_batt_start'], out[-1]['v_batt_end'] = v
     return out
@@ -87,16 +88,72 @@ def test_check_rep_is_a_number():
 
 def test_check_against_the_plan(tmp_path):
     """S2P1-8: with s02_plan.json, every planned cell exactly once and no other; reps 1..N."""
-    rows, blocks = sp.plan('hil', ['PID', 'LADRC'], 2, 7)
-    full = [{k: str(x) for k, x in dict(r, result='completed').items()} for r in rows]
+    rows, blocks = sp.plan('hil', ['PID', 'LADRC'], 2, 7, trial=True)
+    full = [{k: str(x) for k, x in dict(r, result='completed', missing_pct='0', gen_pause_n='0').items()}
+            for r in rows]
     assert sp.check([dict(r) for r in full], blocks) == []
     assert any('planned, no completed' in p for p in sp.check([dict(r) for r in full[1:]], blocks))
     extra = [dict(r) for r in full] + [dict(full[0], rep='3', run_id='x')]
     assert any('not in s02_plan.json' in p for p in sp.check(extra, blocks))
-    rows6, blocks6 = sp.plan('hil', ['PID', 'LADRC'], 6, 7)
+    rows6, blocks6 = sp.plan('hil', ['PID', 'LADRC'], 6, 7, trial=True)
     bad = [b for b in blocks6 if b['rep'] != 4]
     assert any('not 1..N' in p for p in sp.check([{k: str(x) for k, x in dict(r, result='completed').items()}
                                                   for r in rows6 if r['rep'] != 4], bad))
+
+
+def _filled(rows):
+    return [{k: str(x) for k, x in dict(r, result='completed', missing_pct='0', gen_pause_n='0').items()}
+            for r in rows]
+
+
+def test_main_numbers_need_five_reps_and_the_plan(tmp_path):
+    """S2P1-8 (Codex round 2): a plan of another N than 5 only as a declared trial; check of the main numbers
+    refuses a 6-repetition plan and a folder without s02_plan.json."""
+    with pytest.raises(ValueError):
+        sp.plan('hil', ['PID', 'LADRC'], 6, 7)
+    rows6, blocks6 = sp.plan('hil', ['PID', 'LADRC'], 6, 7, trial=True)
+    assert any('not 1..5' in p for p in sp.check(_filled(rows6), blocks6, sp.REPS_MAIN))
+    assert sp.check(_filled(rows6), blocks6, None) == []
+    rows5, blocks5 = sp.plan('hil', ['PID', 'LADRC'], 5, 7)
+    assert sp.check(_filled(rows5), blocks5, sp.REPS_MAIN) == []
+    d = tmp_path / 'nojson'
+    d.mkdir()
+    with open(d / 'runs.csv', 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=sp.COLUMNS)
+        w.writeheader()
+        w.writerows(_filled(rows5[:1]))
+    assert sp.main(['check', str(d)]) == 1
+    assert sp.main(['check', str(d), '--trial']) == 0
+    t = tmp_path / 'trial'
+    assert sp.main(['plan', '--platform', 'hil', '--order-seed', '5', '--reps', '2', '--out', str(t)]) == 2
+    assert sp.main(['plan', '--platform', 'hil', '--order-seed', '5', '--reps', '2', '--trial', '--out', str(t)]) == 0
+    with open(t / 'runs.csv', newline='') as f:
+        rr = [dict(r, result='completed', missing_pct='0', gen_pause_n='0') for r in csv.DictReader(f)]
+    with open(t / 'runs.csv', 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=sp.COLUMNS)
+        w.writeheader()
+        w.writerows(rr)
+    assert sp.main(['check', str(t)]) == 1                   # a trial plan is not main numbers
+    assert sp.main(['check', str(t), '--trial']) == 0
+    t5 = tmp_path / 'trial5'                                 # a trial plan of 5 repetitions: the flag alone
+    assert sp.main(['plan', '--platform', 'hil', '--order-seed', '5', '--trial', '--out', str(t5)]) == 0
+    with open(t5 / 'runs.csv', newline='') as f:
+        rr = [dict(r, result='completed', missing_pct='0', gen_pause_n='0') for r in csv.DictReader(f)]
+    with open(t5 / 'runs.csv', 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=sp.COLUMNS)
+        w.writeheader()
+        w.writerows(rr)
+    assert sp.main(['check', str(t5)]) == 1 and sp.main(['check', str(t5), '--trial']) == 0
+
+
+def test_completed_needs_the_loss_fields():
+    """S2P1-14 (Codex round 2): a completed run has missing_pct 0..100 and gen_pause_n >= 0; empty is not 0."""
+    base = _rows(('A-L1', 1, 'completed', '', ''))
+    assert sp.check([dict(r) for r in base]) == []
+    for mp, gp in (('', '0'), ('nan', '0'), ('-1', '0'), ('0.2', ''), ('0.2', '1.5'), ('0.2', '-1')):
+        rows = [dict(base[0], missing_pct=mp, gen_pause_n=gp)]
+        assert sp.check(rows), (mp, gp)
+    assert sp.check([dict(base[0], result='broken', reason='controller', missing_pct='')]) == []
 
 
 def test_check_battery_block():
@@ -109,6 +166,28 @@ def test_check_battery_block():
     new = _rows(('A-L1', 1, 'completed', '', ''), ('A-L2', 1, 'completed', '', ''), block='2')
     assert sp.check([dict(r) for r in old] + new) == []
     assert any('rest voltage' in p for p in sp.check(_rows(('A-L1', 1, 'completed', '', ''), v=('', ''))))
+
+
+def test_battery_rerun_needs_its_own_sag():
+    """S2P2-3 (Codex round 2): a block without a sag > 0.3 V (here 12.4 -> 12.3 V, with a broken run) cannot be
+    set aside as battery_rerun; nor a HIL block; the later block must run every test of it again."""
+    keep = _rows(('A-L1', 1, 'broken', '', 'controller'), ('A-L2', 1, 'completed', '', ''), v=('12.4', '12.3'))
+    old = [dict(r, block_status='battery_rerun') for r in keep]
+    new = _rows(('A-L1', 1, 'completed', '', ''), ('A-L2', 1, 'completed', '', ''), block='2')
+    assert any('without its own sag' in p for p in sp.check(old + new))
+    hil = [dict(r, block_status='battery_rerun') for r in _rows(('A-L1', 1, 'completed', '', ''), platform='hil')]
+    hil_new = _rows(('A-L1', 1, 'completed', '', ''), platform='hil', block='2')
+    assert any('not a REAL block' in p for p in sp.check(hil + hil_new))
+    sag = [dict(r, block_status='battery_rerun') for r in
+           _rows(('A-L1', 1, 'completed', '', ''), ('A-L2', 1, 'completed', '', ''), v=('12.4', '12.0'))]
+    part = _rows(('A-L1', 1, 'completed', '', ''), block='2')
+    assert any('do not run again' in p for p in sp.check(sag + part))
+
+
+def test_sag_of_exactly_0_3_v_is_not_over():
+    """S2P2-4 (Codex round 2): 12.4 -> 12.1 V is a sag of exactly 0.3 V (not > 0.3 in float); 12.4 -> 12.09 is."""
+    assert sp.check(_rows(('A-L1', 1, 'completed', '', ''), v=('12.4', '12.1'))) == []
+    assert any('battery sagged' in p for p in sp.check(_rows(('A-L1', 1, 'completed', '', ''), v=('12.4', '12.09'))))
 
 
 def test_columns_follow_p2_6():
