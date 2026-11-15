@@ -79,7 +79,8 @@ LE = 0.25                  # Liam 15/11 "+25 %"
 MIN_STILL_S = 3.0          # design 2.1 / 9: >= 3 s still, on the gyro report times (CU-16)
 MAX_LATE = 0.2             # CU-1: at most 20 % of the reports off the grid
 SPLIT_S = 1.0              # CU6: no grid index across a gap of more than 1 s (20 reports)
-MIN_SEG = 5                # CU6: a segment needs at least 5 reports for its own grid
+MIN_SEG = 5                # CU6: a segment needs at least 5 reports for a fitted grid
+MIN_PERIOD_SEG = 20        # CU7-2: the period is measured only on segments of at least 20 reports
 END_STILL_S = 3.0          # kiem closure: still frames in [t_off + tail, t_off + tail + 3 s] (CU-14)
 T_CMD_TOL_S = 0.1          # CU-8: run_active at least T_cmd - 0.1 s
 FORBIDDEN = {'sealed', 'sealed_test', 'o1_feas'}
@@ -242,41 +243,70 @@ def _grid_segment(r, period_s, j_lim):
 def _grid(r, period_s, j_lim):
     """Sample times of the reports from their receive times. CU6: the log is cut into segments at gaps above
     SPLIT_S (no grid index is carried across such a gap: with the period known only to +-PERIOD_TOL the index step
-    over a long gap is not determined); each segment of at least MIN_SEG reports gets its own grid and line fit
-    (_grid_segment); a shorter segment has no fit, its reports are off the grid (kept only for turn totals).
-    Returns n (index, increasing, a step > 1 marks missing reports; across a segment cut at least 2), t_fit
-    (a_s + b_s n_s, or the receive time when not fitted), b (period of the longest fitted segment), j (residual,
-    NaN when not fitted), inl. Each fitted period must stay within +-PERIOD_TOL and at most MAX_LATE of all reports
-    may be off the grid (CU-1)."""
+    over a long gap is not determined).
+    - The period comes from segments of at least MIN_PERIOD_SEG reports (_grid_segment, own line fit, period
+      checked); b = the period of the longest of them (of the longest segment of at least MIN_SEG reports when
+      none is that long).
+    - A segment of MIN_SEG .. MIN_PERIOD_SEG - 1 reports takes that period and fits only its offset (CU7-2: a
+      period from a few jittered reports is not trusted nor checked).
+    - A segment under MIN_SEG reports has no fit: its reports are off the grid (kept only for turn totals), but
+      it is still indexed with that period so missing reports inside it show as steps > 1 (CU7-1).
+    Returns n (index, increasing, a step > 1 marks missing reports; across a cut at least 2), t_fit (fitted sample
+    time, or the receive time when not fitted), b, j (residual, NaN when not fitted), inl. At most MAX_LATE of all
+    reports may be off the grid (CU-1)."""
     cuts = np.nonzero(np.diff(r) > SPLIT_S)[0] + 1
-    bounds = np.r_[0, cuts, len(r)]
+    segs = list(zip(np.r_[0, cuts], np.r_[cuts, len(r)]))
     n = np.zeros(len(r), dtype=int)
     t_fit = r.astype(float).copy()
     j = np.full(len(r), np.nan)
     inl = np.zeros(len(r), dtype=bool)
-    b_main, longest, offset = None, 0, 0
-    for s0, s1 in zip(bounds[:-1], bounds[1:]):
-        rs = r[s0:s1]
-        if len(rs) >= MIN_SEG:
-            ns, a, b, js, ok = _grid_segment(rs, period_s, j_lim)
-            if not (abs(b / period_s - 1.0) <= PERIOD_TOL):
-                raise InputError(f'fitted report period {b * 1e3:.2f} ms outside {period_s * 1e3:.0f} ms '
-                                 f'+-{PERIOD_TOL:.0%} (CU-1)')
-            t_fit[s0:s1] = a + b * ns
-            j[s0:s1] = js
-            inl[s0:s1] = ok
-            if len(rs) > longest:
-                b_main, longest = b, len(rs)
-        else:
-            ns = np.arange(len(rs))
-        n[s0:s1] = offset + ns
-        if s1 < len(r):
-            offset = n[s1 - 1] + max(2, int(round((r[s1] - r[s1 - 1]) / period_s)))
-    if b_main is None:
+    lens = [e - s0 for s0, e in segs]
+    src = [k for k, L in enumerate(lens) if L >= MIN_PERIOD_SEG]
+    if not src:
+        src = [int(np.argmax(lens))] if max(lens) >= MIN_SEG else []
+    if not src:
         raise InputError(f'no run of at least {MIN_SEG} IMU reports without a gap above {SPLIT_S:.1f} s (CU-1)')
+    full, b_main = {}, None
+    for k in src:
+        s0, e = segs[k]
+        ns, a, bk, js, ok = _grid_segment(r[s0:e], period_s, j_lim)
+        if not (abs(bk / period_s - 1.0) <= PERIOD_TOL):
+            raise InputError(f'fitted report period {bk * 1e3:.2f} ms outside {period_s * 1e3:.0f} ms '
+                             f'+-{PERIOD_TOL:.0%} (CU-1)')
+        full[k] = (ns, a + bk * ns, js, ok)
+    b_main = None
+    for k in sorted(src, key=lambda k: -lens[k]):
+        s0, e = segs[k]
+        b_main = float(np.polyfit(full[k][0][full[k][3]], r[s0:e][full[k][3]], 1)[0]) if full[k][3].sum() >= 2 else None
+        if b_main is not None:
+            break
+    if b_main is None:
+        raise InputError('no segment with a usable period (CU-1)')
+    offset = 0
+    for k, (s0, e) in enumerate(segs):
+        rs = r[s0:e]
+        if k in full:
+            ns, tf, js, ok = full[k]
+            t_fit[s0:e], j[s0:e], inl[s0:e] = tf, js, ok
+        else:
+            ns = _index(rs, b_main)                              # CU7-1: missing reports inside show as steps > 1
+            if len(rs) >= MIN_SEG:                               # CU7-2: offset only, period from the long segments
+                ok = np.ones(len(rs), dtype=bool)
+                for _ in range(10):
+                    a = float(np.mean(rs[ok] - b_main * ns[ok]))
+                    js = rs - (a + b_main * ns)
+                    new = np.abs(js) <= j_lim
+                    if np.array_equal(new, ok) or new.sum() == 0:
+                        break
+                    ok = new
+                ok = np.abs(js) <= j_lim
+                t_fit[s0:e], j[s0:e], inl[s0:e] = a + b_main * ns, js, ok
+        n[s0:e] = offset + ns
+        if e < len(r):
+            offset = n[e - 1] + max(2, int(round((r[e] - r[e - 1]) / b_main)))
     if (~inl).sum() > MAX_LATE * len(r):
         raise InputError(f'{(~inl).sum()} of {len(r)} reports more than {j_lim * 1e3:.0f} ms off the grid (CU-1)')
-    return n, t_fit, float(b_main), j, inl
+    return n, t_fit, b_main, j, inl
 
 
 def gyro_samples(L):

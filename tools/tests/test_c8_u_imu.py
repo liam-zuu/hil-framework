@@ -614,6 +614,36 @@ def test_cu6_split_gap_is_a_missing_report_for_turn_totals(tmp_path):
     assert P >= 1.0 and np.all(np.diff(S['n_all']) >= 1)
 
 
+# ── Codex round 7 ──────────────────────────────────────────────────────────────────────
+
+def test_cu7_1_missing_reports_inside_a_short_segment():
+    I = np.r_[np.arange(0, 60), [100, 110, 120], np.arange(200, 260)]
+    r = 10.0 + 0.05 * I
+    n, t_fit, b, j, inl = U._grid(r, 0.05, 0.005)
+    assert list(np.diff(n)[[60, 61]]) == [10, 10]                     # the two 9-report holes are seen
+
+
+def test_cu7_1_turn_totals_bound_the_holes():
+    tg = np.arange(10.0, 23.0, 0.01)
+    gz = np.zeros_like(tg)
+    for a in (15.1, 15.6):
+        m = (tg >= a) & (tg <= a + 0.3)
+        gz[m] = np.sin(2 * np.pi * (tg[m] - a) / 0.3)
+    I = np.r_[np.arange(0, 60), [100, 110, 120], np.arange(200, 260)]
+    r = 10.0 + 0.05 * I
+    n, t_fit, b, j, inl = U._grid(r, 0.05, 0.005)
+    S = dict(t_all=t_fit, t_recv=r, n_all=n, psi_all=np.zeros(len(r)), tg=tg, gz=gz, period_fit_s=b, h_lim=0.105)
+    P, N = U.turn_totals(S, 10.1, 22.8)
+    assert P >= 2 * 0.3 / np.pi * 2 * 0.95 / 2 and N > 0      # each hole: |integral of one half sine| = 0.3/pi
+
+
+def test_cu7_2_short_jittered_segment_uses_the_long_period():
+    I = np.r_[np.arange(0, 100), np.arange(201, 206)]
+    r = 10.0 + 0.0508 * I + 0.004 * (I % 3)
+    n, t_fit, b, j, inl = U._grid(r, 0.05, 0.005)
+    assert b == pytest.approx(0.0508, rel=2e-3) and inl.sum() >= 103
+
+
 # ── scale (thang) ─────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize('sign,chieu,s', [(1, 'ccw', 0.004), (-1, 'cw', -0.007)])
