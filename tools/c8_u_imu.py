@@ -190,34 +190,39 @@ def report_rows(n, age):
     return np.array(idx, dtype=int)
 
 
-def _grid(r, period_s, j_lim):
-    """Index n of each receive time on the report grid of the LOCKED period (CU-1, CU2-3: no median of the
-    spacings), line fit r = a + b n on the inliers, residual j. The fitted period must stay within +-2 % and at
-    most MAX_LATE of the reports may be off the grid."""
-    d = np.diff(r)
-    step = (d > 0.5 * period_s) & (d < 1.5 * period_s)     # one report apart
-    slopes = []
-    k = 0
-    while k < len(d):                                       # CU4-1: slope of each run of >= 10 consecutive reports
-        if not step[k]:
-            k += 1
-            continue
-        e = k
-        while e < len(d) and step[e]:
-            e += 1
-        if e - k >= 10:
-            slopes.append(float(np.polyfit(np.arange(e - k + 1), r[k:e + 1], 1)[0]))
-        k = e
-    b_idx = float(np.median(slopes)) if slopes else period_s
-    if not abs(b_idx / period_s - 1.0) <= PERIOD_TOL:       # CU3-1: use the measured period only when plausible
-        b_idx = period_s                                     # CU2-3: never refuse on it
+def _index(r, b):
+    """Grid index of each receive time for period b, stepping from the last report that sat on the grid."""
     n = np.zeros(len(r), dtype=int)
-    i_lt = 0                                   # last trusted report
+    i_lt = 0
     for k in range(1, len(r)):
-        m = max(1, int(round((r[k] - r[i_lt]) / b_idx)))
+        m = max(1, int(round((r[k] - r[i_lt]) / b)))
         n[k] = n[i_lt] + m
-        if abs(r[k] - (r[i_lt] + m * b_idx)) <= 0.25 * b_idx:
+        if abs(r[k] - (r[i_lt] + m * b)) <= 0.25 * b:
             i_lt = k
+    return n
+
+
+def _grid(r, period_s, j_lim):
+    """Index n of each receive time on the report grid (period searched within +-2 % of T0, see below), line
+    fit r = a + b n on the inliers, residual j. The fitted period must stay within +-2 % and at most MAX_LATE of
+    the reports may be off the grid (CU-1)."""
+    # CU5-1: the indexing period is the candidate in +-PERIOD_TOL of T0 (step 0.01 ms) whose grid leaves the fewest
+    # reports more than j_lim off a line fit (ties: smallest RMS of the others). No median, no run length, so
+    # jitter (CU4-1), short runs (CU5-1), off-nominal periods (CU3-1) and late reports (CU2-3) all index right.
+    best = None
+    for b_try in np.arange(period_s * (1 - PERIOD_TOL), period_s * (1 + PERIOD_TOL) + 5e-6, 1e-5):
+        n_try = _index(r, b_try)
+        bb, aa = np.polyfit(n_try, r, 1)
+        jj = r - (aa + bb * n_try)
+        ok = np.abs(jj) <= j_lim
+        if ok.sum() >= 2:
+            bb, aa = np.polyfit(n_try[ok], r[ok], 1)
+            jj = r - (aa + bb * n_try)
+            ok = np.abs(jj) <= j_lim
+        key = (int((~ok).sum()), float(np.sqrt(np.mean(jj[ok] ** 2))) if ok.any() else math.inf)
+        if best is None or key < best[0]:
+            best = (key, n_try)
+    n = best[1]
     inl = np.ones(len(r), dtype=bool)
     for _ in range(10):
         if inl.sum() < 2:

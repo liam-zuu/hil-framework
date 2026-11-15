@@ -577,6 +577,13 @@ def test_cu4_2_gyro_gap_outside_the_window_ignored():
     assert U.turn_totals(S, 0.0, 0.1) == (0.0, 0.0)
 
 
+def test_cu5_1_short_runs_off_nominal_period():
+    I = np.r_[np.arange(0, 10), np.arange(100, 110), np.arange(200, 210)]
+    r = 10.0 + 0.0508 * I
+    n, a, b, j, inl = U._grid(r, 0.05, 0.005)
+    assert inl.all() and list(np.diff(n)[[9, 19]]) == [91, 91]
+
+
 # ── scale (thang) ─────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize('sign,chieu,s', [(1, 'ccw', 0.004), (-1, 'cw', -0.007)])
