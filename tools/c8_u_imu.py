@@ -410,31 +410,39 @@ def interp_yaw(S, t, h_lim=None):
 
 
 def turn_totals(S, w0, w1):
-    """Total CCW (P) and CW (N) turn over [w0, w1] on the SAMPLE-time base of the reports (CU2-1), from every
-    report (CU-2), with reports bounding the window on both sides. Across missing reports (grid index step > 1, or
-    a gap above 1.5 periods in receive or sample time, CU8-1)
-    a turn back and forth can hide: both P and N get max|gz| over the gap times its length (CU-2), which needs
-    gyro reports at most h_lim apart there."""
-    ta, ps, na = S['t_all'], S['psi_all'], S['n_all']
-    if ta[0] > w0 or ta[-1] < w1:
+    """Total CCW (P) and CW (N) turn over [w0, w1], from the yaw of EVERY report (CU-2). CU9-1: the grid is not
+    trusted here. Each report has a time span [min(sample, receive), max(sample, receive)] (both bases, CU2-1);
+    a pair of consecutive reports counts when its span from the first report's start to the second report's end
+    meets the window, and these spans must cover the window. A pair is suspect, and then both P and
+    N get max|gz| over its span times the span length (a turn back and forth can hide there, CU-2), when: the grid
+    index steps by more than 1, the receive or sample gap is above 1.5 periods (CU8-1), or either report is off
+    the grid (not kept: its sample time is not trusted, CU9-1). That needs gyro reports at most h_lim apart over
+    the span (else refused); the padding of one period only searches the largest |gz| (CU4-2)."""
+    ta, ps, na, tr = S['t_all'], S['psi_all'], S['n_all'], S['t_recv']
+    keep = S.get('keep', np.ones(len(ta), dtype=bool))
+    lo, hi = np.minimum(ta, tr), np.maximum(ta, tr)
+    if lo[0] > w0 or hi[-1] < w1:
         raise InputError('IMU reports do not cover the window')
-    i0 = int(np.searchsorted(ta, w0, 'right') - 1)
-    i1 = int(np.searchsorted(ta, w1, 'left'))
-    d = np.diff(ps[i0:i1 + 1])
-    P, N = float(d[d > 0].sum()), float(-d[d < 0].sum())
-    tg, gz, tr = S.get('tg', np.array([])), S.get('gz', np.array([])), S['t_recv']
-    per_m = S.get('period_fit_s', PERIOD_S)
-    for k in range(i0, i1):
-        # CU8-1: a gap longer than 1.5 periods in either time base means missing reports, whatever the grid index
-        # says (the index can be fooled by jitter); index steps > 1 still count too.
-        if na[k + 1] - na[k] > 1 or max(tr[k + 1] - tr[k], ta[k + 1] - ta[k]) > 1.5 * per_m:
-            a, b = min(ta[k], tr[k]), max(ta[k + 1], tr[k + 1])  # CU-2 (round 3): both time bases
+    tg, gz = S.get('tg', np.array([])), S.get('gz', np.array([]))
+    per = S.get('period_fit_s', PERIOD_S)
+    P = N = 0.0
+    for k in range(len(ta) - 1):
+        a, b = lo[k], hi[k + 1]
+        if b < w0 or a > w1:
+            continue
+        d = ps[k + 1] - ps[k]
+        if d > 0:
+            P += d
+        else:
+            N -= d
+        suspect = (na[k + 1] - na[k] > 1 or max(tr[k + 1] - tr[k], ta[k + 1] - ta[k]) > 1.5 * per
+                   or not keep[k] or not keep[k + 1])
+        if suspect:
             if tg.size < 2 or tg[0] > a or tg[-1] < b:
-                raise InputError('missing IMU reports in the window without gyro reports over the gap (CU-2)')
+                raise InputError('suspect IMU reports in the window without gyro reports over the gap (CU-2)')
             j0, j1 = np.searchsorted(tg, a, 'right') - 1, np.searchsorted(tg, b, 'left')
             if np.max(np.diff(tg[j0:j1 + 1])) > S.get('h_lim', H_LIM_S):
-                raise InputError('missing IMU reports in the window and gyro reports too far apart (CU-2)')
-            per = S.get('period_fit_s', PERIOD_S)             # CU4-2: padding only to search the largest |gz|
+                raise InputError('suspect IMU reports in the window and gyro reports too far apart (CU-2)')
             sel = (tg >= a - per) & (tg <= b + per)
             sel[j0:j1 + 1] = True
             extra = float(np.max(np.abs(gz[sel]))) * (b - a)

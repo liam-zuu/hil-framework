@@ -207,7 +207,8 @@ def test_cu2_turn_totals_keep_late_reports(tmp_path):
     S = U.rv_samples(U.load_log(p), period_s=T0)
     assert S['n_late'] == 1
     P, N = U.turn_totals(S, 10.5, 13.5)
-    assert P == pytest.approx(1.0, abs=0.005) and N == pytest.approx(1.0, abs=0.005)      # kept reports only: 0.9
+    # kept reports only would give 0.9; since CU9-1 the pairs of the late report are suspect and get the gyro bound
+    assert 1.0 <= P <= 1.3 and 1.0 <= N <= 1.3
 
 
 def test_cu3_long_gap_without_gyro_breaks_the_yaw(tmp_path):
@@ -666,6 +667,21 @@ def test_cu8_2_medium_segment_own_grid_when_better():
     r = np.r_[10.0 + 0.0505 * np.arange(20), 15.0 + 0.05 * np.arange(19) + 0.009 * (np.arange(19) % 2)]
     n, t_fit, b, j, inl = U._grid(r, 0.05, 0.005)
     assert inl.sum() >= 0.8 * len(r)
+
+
+# ── Codex round 9 ──────────────────────────────────────────────────────────────────────
+
+def test_cu9_1_off_grid_report_makes_its_pairs_suspect():
+    J = np.r_[0, 10, np.arange(12, 29)]
+    r = np.r_[10.0 + 0.0505 * np.arange(20), 15.0 + 0.05 * J + np.r_[0.0, 0.028, np.zeros(17)],
+              20.0 + 0.0505 * np.arange(20)]
+    n, t_fit, b, j, inl = U._grid(r, 0.05, 0.005)
+    tg = np.arange(9.9, 21.1, 0.001)
+    gz = np.where((tg >= 15.555) & (tg <= 15.595), np.sin(2 * np.pi * (tg - 15.555) / 0.040), 0.0)
+    S = dict(t_all=t_fit, t_recv=r, n_all=n, psi_all=np.zeros(len(r)), keep=inl, tg=tg, gz=gz, period_fit_s=b,
+             h_lim=0.105)
+    P, N = U.turn_totals(S, 15.552, 20.8)
+    assert P >= 0.04 / np.pi and N >= 0.04 / np.pi
 
 
 # ── scale (thang) ─────────────────────────────────────────────────────────────────────
