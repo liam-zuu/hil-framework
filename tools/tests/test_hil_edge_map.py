@@ -1119,13 +1119,18 @@ def _git(agv, *args):
 def test_fw_counts_at_tick_keep_the_count_read_path():
     """Every firmware of FW_COUNTS_AT_TICK has the src/main.c blob and the src/encoder tree of FW_COUNTS_BASE (where
     L98 put the count read at t_now), in the AGV repo. Skipped only when AGV_REPO is not set and the default
-    checkout folder does not exist; otherwise any git failure (not a repo, missing commit, wrong AGV_REPO, git error)
-    fails with git's message (Codex MAP5-R1-1, R2-1)."""
+    checkout folder is not there (os.stat: FileNotFoundError; any other error of the check, such as no access, goes
+    on to git); otherwise any git failure (not a repo, missing commit, wrong AGV_REPO, git error) fails with git's
+    message (Codex MAP5-R1-1, R2-1, R3-1)."""
     agv = os.environ.get('AGV_REPO')
     if agv is None:
         agv = AGV_DEFAULT
-        if not os.path.exists(agv):
+        try:
+            os.stat(agv)
+        except FileNotFoundError:
             pytest.skip(f'no AGV checkout at {agv} (set AGV_REPO to check)')
+        except OSError:
+            pass                                        # there but not readable: git below says why and fails
     _git(agv, 'rev-parse', '--git-dir')                 # a folder that is there must be a working git repo
     ids = {}
     for short, full in AGV_FULL_SHA.items():
@@ -1134,3 +1139,29 @@ def test_fw_counts_at_tick_keep_the_count_read_path():
                       _git(agv, 'rev-parse', '--verify', f'{full}:src/encoder'))
     for short in AGV_FULL_SHA:
         assert ids[short] == ids[M.FW_COUNTS_BASE], f'{short}: src/main.c or src/encoder differ from {M.FW_COUNTS_BASE}'
+
+
+def test_fw_counts_repo_check_skips_only_when_missing(monkeypatch):
+    """Codex MAP5-R3-1: the AGV repo check skips only when the default folder is missing (FileNotFoundError); a
+    folder the check cannot read (PermissionError of os.stat) goes on to git and fails with git's message."""
+    import sys as _sys
+    me = _sys.modules[__name__]
+    monkeypatch.delenv('AGV_REPO', raising=False)
+    monkeypatch.setattr(me, 'AGV_DEFAULT', os.path.join(HERE, '__no_such_agv_checkout__'))
+    with pytest.raises(pytest.skip.Exception, match='no AGV checkout'):
+        test_fw_counts_at_tick_keep_the_count_read_path()
+    real = os.stat
+
+    def denied(p, *a, **k):
+        if str(p) == me.AGV_DEFAULT:
+            raise PermissionError(13, 'Access is denied', str(p))
+        return real(p, *a, **k)
+    monkeypatch.setattr(os, 'stat', denied)
+    try:
+        test_fw_counts_at_tick_keep_the_count_read_path()
+    except pytest.skip.Exception as e:                  # a skip here must fail this test, not skip it
+        pytest.fail(f'skipped although the folder is there (only not readable): {e}')
+    except AssertionError as e:
+        assert 'git rev-parse --git-dir' in str(e), str(e)
+    else:
+        pytest.fail('passed although git cannot read the folder')
