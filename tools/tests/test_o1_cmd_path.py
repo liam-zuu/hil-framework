@@ -112,12 +112,12 @@ def sender_log(tmp_path, task_id='O1-F05', sched='nominal', name='run_sender.txt
     return str(p)
 
 
-def run(tmp_path, rows, task='O1-F05', events='auto', cols=COLS, sched='nominal', bao=None, **kw):
+def run(tmp_path, rows, task='O1-F05', events='auto', cols=COLS, sched='nominal', bao=None, sender_ok=None, **kw):
     p = write(tmp_path, rows, events=events, cols=cols)
     t = cp.Task(task, kw.get('allow_final_set', False))
     rr, ev, dup, has_age = cp.read_log(p)
     return cp.analyse(rr, t, ev + cp.read_events(p + '.events.txt'), has_age,
-                      nominal_sched(t) if sched == 'nominal' else sched, bao)
+                      nominal_sched(t) if sched == 'nominal' else sched, bao, sender_ok)
 
 
 def test_clean_run_has_no_flag_and_small_values(tmp_path):
@@ -607,3 +607,99 @@ def test_CP2_4_cli_prints_the_edge_age_note(tmp_path, capsys):
     assert cp.main(['--log', p, '--task', 'O1-F05', '--sender', sender_log(tmp_path)]) == 0
     out = capsys.readouterr().out
     assert '-- edge_age: traj_age_ms 39' in out and out.rstrip().endswith('#ket_qua,ma=0')
+
+
+# ---------------------------------------------------------------- Codex Sol round 5 (CP5-1 .. CP5-4), sender check
+def test_CP5_1_motor_off_line_coming_back_inside_the_window(tmp_path):
+    rows = make_log()
+    clean = run(tmp_path, rows)
+    last = rows[-1]
+    back = dict(last, log_seq=last['log_seq'] + 4, tick=last['tick'] + 4, motor_on=0, run_active=0,
+                timestamp_us=clean['t_w1_us'] - 5000)          # motor off, time back inside the window
+    (tmp_path / 'b').mkdir()
+    res = run(tmp_path / 'b', rows + [back])
+    assert any(f.startswith('pair_not_increasing') for f in res['flags'])
+
+
+def test_CP5_2_enclosing_span_must_reach_the_nominal_schedule(tmp_path):
+    rows = make_log()
+    nominal = (cp.Task('O1-F05').n_sched - 1) / 50
+    for sub, bao, short in (('eq', nominal, False), ('lt', nominal - 0.02, True)):
+        (tmp_path / sub).mkdir()
+        res = run(tmp_path / sub, rows, sched=None, bao=bao)
+        assert any(f.startswith('test_end_span_short') for f in res['flags']) is short, (sub, res['flags'])
+
+
+def test_CP5_3_wall_clock_window_is_noted(tmp_path):
+    rows = make_log()
+    nominal = (cp.Task('O1-F05').n_sched - 1) / 50
+    res = run(tmp_path, rows, sched=None, bao=nominal + 1.0)
+    assert any(n.startswith('window_from_wall_clock') for n in res['notes'])
+    (tmp_path / 's').mkdir()
+    res = run(tmp_path / 's', rows)
+    assert not any(n.startswith('window_from_wall_clock') for n in res['notes'])
+
+
+def test_CP5_4_end_anchor_needs_a_positive_L(tmp_path):
+    # the first line at or after t_w1 whose next line has the same timestamp (L = 0) is not the end anchor
+    # of (3) (the run is flagged anyway by pair_not_increasing; this checks (3) on its own)
+    rows = make_log()
+    clean = run(tmp_path, rows)
+    fin = next(r for r in rows if r['timestamp_us'] >= clean['t_w1_us'])
+    nxt = fin['log_seq'] + 1
+    (tmp_path / 'b').mkdir()
+    res = run(tmp_path / 'b', [dict(r, timestamp_us=fin['timestamp_us']) if r['log_seq'] == nxt else r for r in rows])
+    c3 = res['cond3']
+    assert c3.get('end_anchor_seq') != fin['log_seq'], c3
+
+
+def test_CP5_4_cli_with_a_sender_log_without_send_times(tmp_path):
+    p = write(tmp_path, make_log())
+    t = cp.Task('O1-F05')
+    s = tmp_path / 'old_sender.txt'
+    s.write_text(f'#test_start,test=O1-F05,t_epoch=1000.000,iso=x,duration_s={t.duration:g},send_hz=50\n'
+                 f'#test_end,test=O1-F05,t_epoch={1000.0 + (t.n_sched - 1) / 50 + 1.0:.3f},sent={t.n_sched},'
+                 f'planned={t.n_sched},complete=1\n', encoding='utf-8')
+    out = tmp_path / 'o.json'
+    assert cp.main(['--log', p, '--task', 'O1-F05', '--sender', str(s), '--json', str(out)]) == 0
+    import json
+    res = json.loads(out.read_text(encoding='utf-8'))
+    assert res['window_source'] == 'test_end' and res['test_end_span_s'] == pytest.approx((t.n_sched - 1) / 50 + 1.0)
+
+
+def test_sender_interrupted_or_incomplete_is_not_scored(tmp_path):
+    t = cp.Task('O1-F05')
+    base = (f'#test_start,test=O1-F05,t_epoch=1.000\n#test_end,test=O1-F05,t_epoch=20.000,sent={t.n_sched},'
+            f'planned={t.n_sched},complete=1,sched_first_s=0.000010,sched_last_s={(t.n_sched - 1) / 50:.6f}\n')
+    cases = (('ok', base, True), ('int', '#test_interrupted\n' + base, False),
+             ('c0', base.replace('complete=1', 'complete=0'), False))
+    for name, text, ok in cases:
+        f = tmp_path / f'{name}.txt'
+        f.write_text(text, encoding='utf-8')
+        assert cp.read_sender_complete(str(f), 'O1-F05')[0] is ok, name
+    assert cp.read_sender_complete(str(tmp_path / 'none.txt'), 'O1-F05')[0] is None
+    rows = make_log()
+    res = run(tmp_path, rows, sender_ok=(False, '#test_interrupted'))
+    assert any(f.startswith('sender_incomplete') for f in res['flags'])
+    assert res['cond2'].get('no_evidence') and res['cond3'].get('no_evidence') and res['cond4'].get('no_evidence')
+    p = write(tmp_path, rows, name='r2.csv')
+    f = tmp_path / 'int.txt'
+    assert cp.main(['--log', p, '--task', 'O1-F05', '--sender', str(f)]) == 1
+
+
+def test_tick_reset_on_motor_off_lines_is_not_a_flag(tmp_path):
+    # motor off after the run: the firmware counter restarts (vel_ctrl.c 22-23, 41, 49); a lower tick on a
+    # motor-off line is not a pair of the run (real CAR_LIFTED 14/11 K2 logs)
+    rows = make_log()
+    clean = run(tmp_path, rows)
+    t_off = clean['t_w1_us'] - 500000                   # motor off 0.5 s before the window end (inside it)
+    cut, k = [], 0
+    for r in rows:
+        if r['timestamp_us'] >= t_off:
+            r = dict(r, motor_on=0, run_active=0, tick=k)
+            k += 1
+        cut.append(r)
+    (tmp_path / 'b').mkdir()
+    res = run(tmp_path / 'b', cut)
+    assert any(f.startswith('run_active_toggle') for f in res['flags'])      # the run is lost anyway
+    assert not any(f.startswith('pair_not_increasing') for f in res['flags']), res['flags']

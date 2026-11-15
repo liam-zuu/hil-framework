@@ -83,6 +83,9 @@ Round 4 (15/11; Liam 15/11 CODE_CAM "Sua + Codex vong 5"): the open upper bound 
 K-1 (CODE 15/11, O1 v11.24 3.5; Liam 15/11 CODE_CAM "Tu canh len + gio #test_end (Recommended)", "Gop K-1
 vao vong 5"): no sched times -> the enclosing window to #test_end (t_epoch span), checked against the
 nominal schedule; both present -> they must agree.
+Round 5 (15/11; Liam 15/11 CODE_CAM "Sua + Codex vong 6", "Ghi gioi han", "Them vao vong 6"): timestamp_us
+increase on every line after the edge (CP5-1); enclosing span >= nominal exactly (CP5-2); note
+window_from_wall_clock, a known limit (CP5-3); sender '#test_interrupted' or complete != 1 -> sender_incomplete.
 B8-1c (CODE 15/11, O1 v11.23 3.5; Liam 15/11 CODE_CAM "Lam B8-1c roi vong 4 gop (Recommended)"): window end
 from the real send times (--sender, B81c-1); a pair whose tick or timestamp_us does not increase is no
 evidence for (2), (4) (B81c-7).
@@ -377,9 +380,27 @@ def read_sender_bao(path, task_id):
     return got['#test_end,'] - got['#test_start,']
 
 
-def analyse(rows, task, events=(), has_age_col=True, sched=None, bao_s=None):
+def read_sender_complete(path, task_id):
+    """(ok, why) of the sender run: ok False when the sender log has '#test_interrupted' or its '#test_end'
+    of task_id has complete other than 1 (an interrupt in the zero tail gives complete=1 with
+    '#test_interrupted', review pc_sender round 2, SS1-2); None when there is no sender log or no
+    '#test_end' (left to sched_times_missing). Liam 15/11 CODE_CAM "Them vao vong 6 (Recommended)"."""
+    if not path or not os.path.exists(path):
+        return None, 'no sender log'
+    ev = read_events(path)
+    ends = [e for e in ev if e.startswith('#test_end,') and _kv(e).get('test') == task_id]
+    if not ends:
+        return None, 'no #test_end'
+    if any(e.startswith('#test_interrupted') for e in ev):
+        return False, '#test_interrupted'
+    if any(_kv(e).get('complete') != '1' for e in ends):
+        return False, 'complete != 1'
+    return True, ''
+
+
+def analyse(rows, task, events=(), has_age_col=True, sched=None, bao_s=None, sender_ok=None):
     """sched: (sched_first_s, sched_last_s) of the sender (B81c-1); bao_s: #test_start -> #test_end epoch
-    span of the sender (K-1), used when sched is None."""
+    span of the sender (K-1), used when sched is None; sender_ok: (ok, why) of read_sender_complete."""
     res = dict(task=task.id, v_cmd_max=task.v, n_sched=task.n_sched, flags=[], notes=[])
     edge, later, probs = find_edge(rows)
     res['flags'] += probs
@@ -404,10 +425,18 @@ def analyse(rows, task, events=(), has_age_col=True, sched=None, bao_s=None):
                                 f'schedule send span {span_s:.3f} s: (2), (3), (4) no evidence')
     elif bao_s is not None:
         win_src, span_s = 'test_end', bao_s
-        win_ok = bao_s >= nominal * (1 - E_MAX)
+        win_ok = bao_s >= nominal                       # both on the Pi: no clock-rate term (CP5-2)
         if not win_ok:
             res['flags'].append(f'test_end_span_short: #test_start -> #test_end {bao_s:.3f} s shorter than the '
                                 f'nominal schedule {nominal:.3f} s (wall clock step?): (2), (3), (4) no evidence')
+        # known limit (CP5-3; Liam 15/11 "Ghi gioi han (Recommended)"): the epochs are the Pi wall clock, a
+        # step back while sending slowly is not seen; only sched_first_s / sched_last_s (monotonic) prove it
+        res['notes'].append('window_from_wall_clock: enclosing window from the #test_start/#test_end epochs '
+                            '(Pi wall clock); a clock step back during the run is not detected')
+    if sender_ok is not None and sender_ok[0] is False:
+        win_ok = False
+        res['flags'].append(f'sender_incomplete: {sender_ok[1]} in the sender log: run not scored, '
+                            f'(2), (3), (4) no evidence')
     t_w1 = t0 + int(round((span_s * (1 + E_MAX) + T_SEND) * 1e6))
     res.update(edge_seq=e['_seq'], t_w0_us=t0, t_w1_us=t_w1, edge_traj_age_ms=e['_age'],
                sched_send_span_s=(sched[1] - sched[0]) if sched is not None else None,
@@ -522,8 +551,12 @@ def analyse(rows, task, events=(), has_age_col=True, sched=None, bao_s=None):
     while mo_hi + 1 < len(rows) and rows[mo_hi + 1]['_mo']:
         mo_hi += 1
     run_rows = rows[edge:max(mo_hi, edge + len(stretch) - 1) + 1]
+    # tick on the motor-on run; timestamp_us on EVERY line after the edge, motor off too (CP5-1: a
+    # motor-off line coming back inside the window)
+    # tick only between two motor-on lines: the counter is reset at motor on (vel_ctrl.c 5bde4c5 22-23, 41, 49)
     nonincr = [[a['_seq'], b['_seq']] for a, b in zip(run_rows[:-1], run_rows[1:])
-               if b['_tick'] <= a['_tick'] or b['_t'] <= a['_t']]
+               if a['_mo'] and b['_mo'] and b['_tick'] <= a['_tick']]
+    nonincr += [[a['_seq'], b['_seq']] for a, b in zip(rows[edge:-1], rows[edge + 1:]) if b['_t'] <= a['_t']]
     if nonincr:
         res['flags'].append(f'pair_not_increasing: tick or timestamp_us does not increase at log_seq pairs '
                             f'{nonincr[:3]}: (2), (4) no evidence')
@@ -645,7 +678,8 @@ def main(argv=None):
         task = Task(a.task, a.allow_final_set)
         rows, ev_in, dup, has_age = read_log(a.log)
         ev = ev_in + read_events(a.events or (a.log + '.events.txt'))
-        res = analyse(rows, task, ev, has_age, read_sender(a.sender, a.task), read_sender_bao(a.sender, a.task))
+        res = analyse(rows, task, ev, has_age, read_sender(a.sender, a.task), read_sender_bao(a.sender, a.task),
+                      read_sender_complete(a.sender, a.task))
         res.update(log=os.path.basename(a.log), n_lines=len(rows), n_duplicates=dup,
                    thresholds='not locked before C8 (O1 3.5): values reported only')
         if a.json:
