@@ -337,3 +337,49 @@ def test_t10_load_upper_heavy_block_and_cli(tmp_path):
     assert s['load_upper_pct'] == pytest.approx(100.0 - (6 * lo40 + lo20) / 7, abs=1e-9)   # 7 kept windows
     assert s['load_upper_pct_max_window'] == pytest.approx(100.0 - lo20, abs=1e-9)
     assert 'idle_pct_lo' in rows.splitlines()[0] and 'load_upper_pct' in rows.splitlines()[0]
+
+
+def test_idle_centre_over_window_within_uncertainty_is_valid():
+    """T10U-R2-1 (Codex round 2): a header that matches the H7 integer formula exactly, idle centre + ISR
+    4 us over the window but the idle lower bound inside: a valid window with a bound, not data lost."""
+    new = 'idle_pass=1980001 idle_us_est=8800004'
+    s, win = _run_summary(with_header(make_log(), 2, 'idle_pass=900000 idle_us_est=4000000', new))
+    w = [x for x in win if x['idle_pass'] == 1980001][0]
+    assert w['idle_bad'] == '' and w['load_upper_pct'] is not None and 0.0 <= w['load_upper_pct'] <= 100.0
+    assert not any('số rảnh' in p for p in s['data_lost'])
+
+
+def test_first_header_late_within_print_delay_is_not_lost():
+    """T10U-R2-2 (Codex round 2): every header 0.8 s late (inside PRINT_DELAY_MAX_MS), link-up line on time:
+    no block lost."""
+    ev = ser.parse_lines(make_log())
+    for e in ev:
+        if e['kind'] in ('t10', 't10_irq') and e.get('t_pc_us') is not None and e['t_pc_us'] > ev[0]['t_pc_us'] + 5e6:
+            e['t_pc_us'] += 800_000
+    blocks, span = ser.t10_blocks(ev)
+    win, irq = ser.t10_rows(blocks)
+    s = ser.t10_summary(blocks, win, irq, ev, span)
+    assert not any('mất khối' in p for p in s['data_lost']), s['data_lost']
+
+
+def test_no_calibration_and_no_idle_pass_is_missing():
+    """T10U-5 (Codex round 2): cal=0/… and idle_pass=0: still no bound, so 'missing', not complete."""
+    lines = [l.replace('idle_pass=900000 idle_us_est=4000000 cal=22500/48000000',
+                       'idle_pass=0 idle_us_est=0 cal=0/48000000') for l in make_log()]
+    s, win = _run_summary(lines)
+    assert all(w['load_upper_pct'] is None for w in win)
+    assert any('hiệu chuẩn' in m for m in s['missing']) and s['complete'] is False
+
+
+def test_cli_with_damaged_header_writes_outputs(tmp_path):
+    """T10U-R2-3 (Codex round 2): the data-lost path goes through the CSV writer to T10_summary.json and code 1
+    (CSV written as UTF-8, idle_bad text ASCII)."""
+    log = tmp_path / 'h7.log'
+    log.write_text('\n'.join(with_header(make_log(), 2, 'idle_pass=900000 idle_us_est=4000000',
+                                         'idle_pass=2700000 idle_us_est=12000000')) + '\n', encoding='utf-8')
+    out = tmp_path / 'o'
+    code = ser.main([str(log), '--out', str(out)])
+    s = json.load(open(out / 'T10_summary.json', encoding='utf-8'))
+    rows = (out / 'T10_windows.csv').read_text(encoding='utf-8')
+    assert code == 1 and s['complete'] is False and 'idle_lo + isr_us > window' in rows
+    assert s['print_delay_max_ms'] == ser.PRINT_DELAY_MAX_MS

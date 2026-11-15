@@ -198,16 +198,20 @@ def load_upper(rows) -> dict:
 
 def idle_check(h: dict) -> str:
     """T10U-1: why the idle figures of a T10 header cannot be used ('' = usable). The H7 estimate must equal
-    idle_pass · cal_cyc / cal_n / f (integer divisions, ± IDLE_EST_TOL_US), and idle, ISR must fit the window."""
+    idle_pass · cal_cyc / cal_n / f (integer divisions, ± IDLE_EST_TOL_US), and the LOWER bound of the idle time
+    (estimate × (1 − rel. uncertainty), T10U-R2-1: the centre estimate may exceed the window by its own
+    uncertainty) plus the ISR time must fit the window. ASCII text (T10U-R2-3: CSV written on any code page)."""
     win_us = h['win_ms'] * 1000.0
     if win_us <= 0:
         return 'win_ms = 0'
     if h['cal_n']:
         expect = (h['idle_pass'] * h['cal_cyc'] // h['cal_n']) // int(F_NOMINAL_MHZ)
         if abs(h['idle_us_est'] - expect) > IDLE_EST_TOL_US:
-            return f'idle_us_est {h["idle_us_est"]} khác idle_pass·cal ({expect})'
-    if h['idle_us_est'] > win_us or h['isr_us'] > win_us or h['idle_us_est'] + h['isr_us'] > win_us:
-        return 'idle_us_est + isr_us vượt cửa sổ'
+            return f'idle_us_est {h["idle_us_est"]} != idle_pass*cal ({expect})'
+    unc = (1.0 / h['cal_n'] + 1.0 / h['idle_pass']) if h['cal_n'] and h['idle_pass'] else 0.0
+    idle_lo_us = h['idle_us_est'] * max(0.0, 1.0 - unc)
+    if h['isr_us'] > win_us or idle_lo_us + h['isr_us'] > win_us + IDLE_EST_TOL_US:
+        return 'idle_lo + isr_us > window'
     return ''
 
 
@@ -333,7 +337,9 @@ def t10_summary(blocks, win_rows, irq_rows, ev, span) -> dict:
         if lost:
             data_lost.append(f'khoảng giữa hai khối T10 (giờ PC) khác 10 s sau khối {lost}: mất khối')
         t_up = ev[a].get('t_pc_us') if span else None
-        if t_up is not None and (heads_all[0]['t_pc_us'] - t_up) / 1e6 > 10.0 + T10_GAP_TOL_S:
+        # T10U-R2-2: the first header may reach the PC up to PRINT_DELAY_MAX_MS late (T10U-3), the link-up line
+        # on time: allow that delay on top of 10 s + tol
+        if t_up is not None and (heads_all[0]['t_pc_us'] - t_up) / 1e6 > 10.0 + T10_GAP_TOL_S + PRINT_DELAY_MAX_MS / 1e3:
             data_lost.append(f'header T10 đầu tới sau SPI link up '
                              f'{(heads_all[0]["t_pc_us"] - t_up) / 1e6:.1f} s (> 10 s): mất khối đầu')
         ends = [e['t_pc_us'] for e in ev[a:b] if e.get('t_pc_us') is not None]
@@ -355,7 +361,7 @@ def t10_summary(blocks, win_rows, irq_rows, ev, span) -> dict:
     if bad_idle:
         data_lost.append(f'header T10 có số rảnh không dùng được (dòng hỏng?): {bad_idle}')
     # T10U-5: no idle calibration = no load bound, evidence missing (not a pass)
-    no_cal = [r['window'] for r in win_rows if r['cal_n'] == 0 and r['idle_pass']]
+    no_cal = [r['window'] for r in win_rows if r['cal_n'] == 0]           # T10U-5 round 2: idle_pass 0 too
     if no_cal:
         missing.append(f'không có hiệu chuẩn vòng rỗng (cal=0/…): không có cận tải ở cửa sổ {no_cal}')
     problems = data_lost + missing
@@ -431,7 +437,7 @@ def link_fails(st: dict) -> List[str]:
 
 def write_csv(path, rows):
     cols = list(rows[0]) if rows else ['window']
-    with open(path, 'w', newline='') as f:
+    with open(path, 'w', newline='', encoding='utf-8') as f:          # T10U-R2-3: not the local code page
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
         w.writerows(rows)
@@ -469,6 +475,11 @@ def main(argv=None) -> int:
         summ['complete'] = not summ['problems']
     summ['link'] = link_stats(ev, span)
     summ['f_nominal_mhz'], summ['f_real_mhz'] = F_NOMINAL_MHZ, a.f_real_mhz
+    # T10U-3 (Codex round 2: not verified, Liam 15/11 'Sua 4 + vong 3'): the segment split and the first-header
+    # check assume every H7 line reaches the PC within this delay; the value is a proposal, not measured
+    summ['print_delay_max_ms'] = PRINT_DELAY_MAX_MS
+    summ['print_delay_note'] = ('assumed bound on the H7 print + VCP delay, not measured: a header later than this '
+                                'can put a window in the wrong part (heavy / group A)')
     summ['run_span_lines'] = None if span is None else [ev[span[0]]['line'],
                                                         ev[span[1]]['line'] if span[1] < len(ev) else None]
     os.makedirs(a.out, exist_ok=True)
