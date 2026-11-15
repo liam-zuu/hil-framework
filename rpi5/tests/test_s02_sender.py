@@ -122,7 +122,9 @@ def test_prep_must_be_on_the_grid(bad):
 def test_prep_spec_is_shifted_schedule(tid):
     spec = GROUP_A[tid]
     w = s2.prep_spec(spec, 3.0)
-    assert w.duration == pytest.approx(3.0 + spec.duration)
+    assert w.duration == pytest.approx(3.0 + spec.duration + 1.0)          # S2P1-7: 1 s tail inside
+    for t in (3.0 + spec.duration + 0.01, 3.0 + spec.duration + 0.99):
+        assert get_body_velocity(t, w) == (0.0, 0.0, 0.0)
     for i in range(0, 150):
         assert get_body_velocity(i / 50 + 0.0037, w) == (0.0, 0.0, 0.0)
     for k in range(0, s2.sched_count(spec), 7):
@@ -144,3 +146,54 @@ def test_main_refuses_strafe_without_flag(capsys):
     with pytest.raises(SystemExit):
         s2.main(['--ip', '10.0.0.2', '--test', 'A-S2'])
     assert 'allow-strafe' in capsys.readouterr().err
+
+
+def test_stall_in_the_preparation_stops_the_run():
+    """S2P1-6: the clock jumps 4 s after packet 3 (a blocked process): the late packets are not sent in a
+    burst; the run stops with zeros and complete=0."""
+    clk = FakeClock()
+    sock, lines = FakeSock(clk), []
+    real = sock.sendto
+
+    def sendto(p, a):
+        real(p, a)
+        if len(sock.sent) == 4:
+            clk.t += 4.0
+    sock.sendto = sendto
+    r = s2.s02_loop('10.0.0.2', 'A-L2', 3.0, sock=sock, clock=clk, sleep=clk.sleep, out=lines.append)
+    assert r['complete'] == 0 and r['prep'] == 4 and r['sched'] == 0
+    assert any(l.startswith('#s02_late,phase=prep,packet=3') for l in lines)
+    assert not any(l.startswith('#s02_k0') for l in lines)
+    assert len(sock.sent) == 4 + s2.STOP_ZEROS
+
+
+def test_start_line_delay_does_not_compress_the_grid():
+    """S2P1-6: a slow start line (stdout blocked 4 s) comes before t0, so the preparation still lasts 3 s."""
+    clk = FakeClock()
+    sock, lines = FakeSock(clk), []
+
+    def out(line):
+        lines.append(line)
+        if line.startswith('#s02_start'):
+            clk.t += 4.0
+    r = s2.s02_loop('10.0.0.2', 'A-L2', 3.0, sock=sock, clock=clk, sleep=clk.sleep, out=out)
+    assert r['complete'] == 1
+    ts = [t for _, _, t in sock.sent]
+    assert ts[150] - ts[0] == pytest.approx(3.0, abs=0.002)
+
+
+@pytest.mark.parametrize('when', ['#s02_start', '#s02_k0'])
+def test_ctrl_c_in_a_print(when):
+    """S2P1-12: Ctrl-C inside a print: counters match the socket, '#s02_end' is printed, zeros sent."""
+    clk = FakeClock()
+    sock, lines = FakeSock(clk), []
+
+    def out(line):
+        lines.append(line)
+        if line.startswith(when):
+            raise KeyboardInterrupt
+    r = s2.s02_loop('10.0.0.2', 'A-K2', 3.0, sock=sock, clock=clk, sleep=clk.sleep, out=out)
+    assert r['complete'] == 0 and lines[-1].startswith('#s02_end')
+    assert r['prep'] + r['sched'] + r['tail'] == len(sock.sent) - s2.STOP_ZEROS
+    if when == '#s02_k0':
+        assert r['sched'] == 1

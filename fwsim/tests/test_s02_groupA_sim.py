@@ -48,7 +48,7 @@ def test_preparation_and_plant_file(tmp_path):
     import s02_metrics
     from trajectory_pub import GROUP_A
     fw = fwsim.FirmwareSim()
-    spec = s02.prep_spec(GROUP_A['A-L2'], 3.0)
+    spec = s02.prep_spec(GROUP_A['A-L2'], 3.0, tail_s=0.0)
     sp = lambda t: s02.get_body_velocity(t, spec) if t < spec.duration else (0.0, 0.0, 0.0)  # noqa: E731
     fw.reset()
     log = fwsim.simulate(fw, sp, spec.duration + s02.STOP_TAIL_S, None, seed=1, mode='PID',
@@ -68,8 +68,9 @@ def test_preparation_and_plant_file(tmp_path):
     assert [int(r['timestamp_us']) for r in rows] == [int(x) for x in L['_all']['timestamp_us']]
     t = L['_all']['timestamp_us']
     assert np.all(L['_all']['sp_vx'][t < 3.0e6] == 0.0) and np.all(L['_all']['sp_vx'][(t >= 3.0e6) & (t < 9.0e6)] > 0)
-    s = s02_cmd_path.stats(L['_all'], 'A-L2', 'sim')
+    s = s02_cmd_path.stats(L['_all'], 'A-L2', 'sim', None, 3.0)
     assert s['t0_method'] == 'two_anchors' and s['t0_us'] == pytest.approx(3.0e6, abs=1)
+    assert s['sim_t0_err_us'] == pytest.approx(0.0, abs=1)
     assert s['edge_kind'] == 'cold_start' and s['prep_flags'] == '' and s['cmd_reason'] == 'no_traj_age'
     # plant columns agree with the simulation (body velocity, pose, wheel 1)
     i = len(rows) // 2

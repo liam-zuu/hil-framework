@@ -253,3 +253,17 @@ def test_sim_t0_is_checked_against_prep_s():
     log['timestamp_us'] = log['timestamp_us'] - s['sim_t0_err_us'] + 5_000   # fwsim: the tick at prep_s applies k = 0
     s = cp.stats(log, 'A-K3', 'sim', None, 4.0)
     assert 'sim_t0_mismatch' not in s['prep_flags'] and abs(s['sim_t0_err_us'] - 5_000) < 1
+
+
+def test_metrics_csv_keeps_every_digit_of_a_timestamp(tmp_path, monkeypatch):
+    """S2P1-13: 36 000 045 678 us (10 h uptime) is written as is, not as 3.6e10."""
+    import csv as _csv
+    import s02_metrics
+    (tmp_path / 'runs.csv').write_text('run_id,platform,controller,test_id,speed_mps,rep,file,aborted\n'
+                                       'r1,real,PID,A-L2,0.5,1,r1.csv,\n', encoding='utf-8')
+    monkeypatch.setattr(s02_metrics, 'load_log', lambda p: {})
+    monkeypatch.setattr(s02_metrics, 'compute', lambda log, tid: {'t0_us': 36000045678.0, 'e_vx': 0.0123456789})
+    s02_metrics.run_dir_metrics(str(tmp_path))
+    with open(tmp_path / 'metrics.csv', newline='') as f:
+        row = next(_csv.DictReader(f))
+    assert row['t0_us'] == '36000045678' and row['e_vx'] == '0.0123457'

@@ -21,10 +21,11 @@ One absolute 50 Hz grid from time.monotonic(): packet j at t_start + j/50.
 Lines printed (PC clock, for diagnosis only: the master clock is the ESP32, C7b section 1):
     #s02_start,test=,t_epoch=,iso=,prep_s=,n_prep=,n_sched=,n_tail=,send_hz=,dst=
     #s02_k0,t_epoch=                     right after packet k = 0 is sent
-    #s02_end,test=,t_epoch=,sent_prep=,sent_sched=,sent_tail=,complete=,sched_first_s=,sched_last_s=
+    #s02_end,test=,t_epoch=,sent_prep=,sent_sched=,sent_tail=,complete=,sched_first_s=,sched_last_s=,late_max_ms=
       sched_first_s / sched_last_s: send time of packets k = 0 and k = K - 1 after t_start, read just after
       sendto (as pc_sender '#test_end'), empty when not sent
-Ctrl-C in any phase: '#s02_interrupted,phase=prep|sched|tail', 10 zero packets at once, complete=0.
+Ctrl-C in any phase: '#s02_interrupted,phase=start|prep|sched|tail', 10 zero packets at once, complete=0.
+A packet more than 50 ms after its slot: '#s02_late,phase=,packet=,late_ms=', the same stop (S2P1-6).
 A-S1, A-S2 need --allow-strafe (S02 P2-7: after the S05 final check).
 
 HIL: prep_spec() wraps the test in the 'load' kind of trajectory_pub (unchanged; it is in the S04 blob
@@ -41,6 +42,8 @@ from trajectory_pub import GROUP_A, TrajectorySpec, get_body_velocity
 PREP_S_DEFAULT = 3.0          # Liam 15/11 CODE_S02 "3 s (Recommended)"
 TAIL_ZEROS = 50               # 1 s of zeros after the schedule (P2-2b k = K .. K + 49)
 STOP_ZEROS = 10               # Ctrl-C: as pc_sender
+TAIL_S = TAIL_ZEROS / SEND_HZ  # 1 s of zeros (HIL: inside the publisher, prep_spec)
+LATE_MAX_S = 0.050            # [ĐỀ XUẤT] a packet later than this after its slot stops the run (S2P1-6)
 STRAFE_TESTS = ('A-S1', 'A-S2')
 
 
@@ -68,63 +71,83 @@ def sched_count(spec) -> int:
     return int(math.ceil(spec.duration * SEND_HZ - 1e-9))
 
 
-def prep_spec(spec: TrajectorySpec, prep_s: float) -> TrajectorySpec:
+def prep_spec(spec: TrajectorySpec, prep_s: float, tail_s: float = TAIL_S) -> TrajectorySpec:
     """HIL (run_hil.py --s02-prep): 0 in [0, prep_s), get_body_velocity(t - prep_s, spec) in
-    [prep_s, prep_s + T_cmd), duration prep_s + T_cmd (trajectory_pub 'load' kind, lines 163-167)."""
+    [prep_s, prep_s + T_cmd), 0 in [prep_s + T_cmd, prep_s + T_cmd + tail_s); duration all three
+    (trajectory_pub 'load' kind, lines 163-167). The tail zeros are sent by the publisher on its own clock,
+    so the command falls to 0 at the end of the schedule, not when the run owner sees the publisher done
+    (S2P1-7, Codex round 1: STOPPING could start up to one 0.1 s owner beat late). SIM passes tail_s=0
+    (fwsim_groupA_sim adds its own 1 s)."""
     if spec.duration <= 0:
         raise ValueError('prep_spec needs a finite test')
+    if not (math.isfinite(tail_s) and tail_s >= 0):
+        raise ValueError(f'tail_s {tail_s}: must be >= 0')
     prep_packets(prep_s)
-    return TrajectorySpec(kind='load', duration=prep_s + spec.duration,
+    return TrajectorySpec(kind='load', duration=prep_s + spec.duration + tail_s,
                           sequence=((prep_s, prep_s + spec.duration, spec),))
+
+
+class _Late(Exception):
+    pass
 
 
 def s02_loop(ip: str, test_id: str, prep_s: float = PREP_S_DEFAULT, allow_strafe: bool = False, sock=None,
              clock=time.monotonic, sleep=time.sleep, out=print, wall=time.time) -> dict:
-    """Send preparation zeros, the schedule, then the tail zeros on one 50 Hz grid; returns the counts."""
+    """Send preparation zeros, the schedule, then the tail zeros on one 50 Hz grid; returns the counts.
+    S2P1-6 (Codex round 1): the grid starts right before the first packet (after the start line), and a
+    packet sent more than LATE_MAX_S after its slot stops the run (a stall would send the late packets in a
+    burst, e.g. the whole preparation at once): '#s02_late', 10 zeros, complete=0. S2P1-12: a counter
+    steps right after its sendto, and the start line is inside the interrupt handling."""
     spec = check_test(test_id, allow_strafe)
     n_prep, n_sched = prep_packets(prep_s), sched_count(spec)
     own = sock is None
     sock = sock or socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     dst = (ip, TRAJ_PORT)
-    t0, e0 = clock(), wall()
-    out(f"#s02_start,test={test_id},t_epoch={e0:.3f},iso={time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(e0))},"
-        f"prep_s={prep_s:g},n_prep={n_prep},n_sched={n_sched},n_tail={TAIL_ZEROS},send_hz={SEND_HZ},"
-        f"dst={ip}:{TRAJ_PORT}")
+    sent = {'prep': 0, 'sched': 0, 'tail': 0}
+    first = last = None
+    phase, t0 = 'start', None
+    late_max = 0.0
 
-    def at(j):
+    def send(j, vx, vy, wz, key):
+        nonlocal late_max
         wait = t0 + j / SEND_HZ - clock()
         if wait > 0:
             sleep(wait)
+        sock.sendto(pack_packet(vx, vy, wz), dst)
+        sent[key] += 1
+        late = clock() - (t0 + j / SEND_HZ)
+        late_max = max(late_max, late)
+        if late > LATE_MAX_S:
+            raise _Late(j, late)
+        return late
 
-    sent = {'prep': 0, 'sched': 0, 'tail': 0}
-    first = last = None
-    phase = 'prep'
     try:
+        e0 = wall()
+        out(f"#s02_start,test={test_id},t_epoch={e0:.3f},iso={time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(e0))},"
+            f"prep_s={prep_s:g},n_prep={n_prep},n_sched={n_sched},n_tail={TAIL_ZEROS},send_hz={SEND_HZ},"
+            f"dst={ip}:{TRAJ_PORT}")
+        t0 = clock()
+        phase = 'prep'
         for j in range(n_prep):
-            at(j)
-            sock.sendto(pack_packet(0.0, 0.0, 0.0), dst)
-            sent['prep'] += 1
+            send(j, 0.0, 0.0, 0.0, 'prep')
         phase = 'sched'
         for k in range(n_sched):
-            at(n_prep + k)
             vx, vy, wz = get_body_velocity(k / SEND_HZ, spec)
-            sock.sendto(pack_packet(vx, vy, wz), dst)
-            if k == 0 or k == n_sched - 1:
-                t_sent = clock() - t0                 # one reading per packet, as pc_sender
-                if k == 0:
-                    first = t_sent
-                    out(f'#s02_k0,t_epoch={wall():.3f}')
-                if k == n_sched - 1:
-                    last = t_sent
-            sent['sched'] += 1
+            late = send(n_prep + k, vx, vy, wz, 'sched')
+            if k == 0:
+                first = n_prep / SEND_HZ + late           # send time after t0, as pc_sender sched_first_s
+                out(f'#s02_k0,t_epoch={wall():.3f}')
+            if k == n_sched - 1:
+                last = (n_prep + k) / SEND_HZ + late
         phase = 'tail'
         for j in range(n_prep + n_sched, n_prep + n_sched + TAIL_ZEROS):
-            at(j)
-            sock.sendto(pack_packet(0.0, 0.0, 0.0), dst)
-            sent['tail'] += 1
+            send(j, 0.0, 0.0, 0.0, 'tail')
         phase = 'done'
     except KeyboardInterrupt:
         out(f'#s02_interrupted,phase={phase}')
+    except _Late as exc:
+        j, late = exc.args
+        out(f'#s02_late,phase={phase},packet={j},late_ms={late * 1e3:.1f}')
     finally:
         if phase != 'done':
             for _ in range(STOP_ZEROS):
@@ -134,7 +157,7 @@ def s02_loop(ip: str, test_id: str, prep_s: float = PREP_S_DEFAULT, allow_strafe
         out(f"#s02_end,test={test_id},t_epoch={wall():.3f},sent_prep={sent['prep']},sent_sched={sent['sched']},"
             f"sent_tail={sent['tail']},complete={complete},"
             f"sched_first_s={'' if first is None else f'{first:.6f}'},"
-            f"sched_last_s={'' if last is None else f'{last:.6f}'}")
+            f"sched_last_s={'' if last is None else f'{last:.6f}'},late_max_ms={late_max * 1e3:.1f}")
         if own:
             sock.close()
     return dict(sent, n_prep=n_prep, n_sched=n_sched, complete=complete)

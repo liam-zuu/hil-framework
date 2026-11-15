@@ -419,11 +419,16 @@ def run_dir_metrics(d, out_name='metrics.csv'):
     keys = []
     for o in out:
         keys += [k for k in o if k not in keys]
-    fmt = lambda x: f'{x:.6g}' if isinstance(x, float) else x   # noqa: E731
+    def fmt(k, x):
+        # S2P1-13 (Codex round 1): a timestamp in us (t0_us, anchor_*_us, edge_us, sim_t0_err_us) keeps every
+        # digit (6 significant digits lose tens of ms after hours of uptime)
+        if isinstance(x, (float, np.floating)) and k.endswith('_us'):
+            return f'{x:.0f}' if math.isfinite(x) else 'nan'
+        return f'{x:.6g}' if isinstance(x, (float, np.floating)) else x
     with open(os.path.join(d, out_name), 'w', newline='') as f:
         wr = csv.DictWriter(f, fieldnames=keys)
         wr.writeheader()
-        wr.writerows({k: fmt(o.get(k, '')) for k in keys} for o in out)
+        wr.writerows({k: fmt(k, o.get(k, '')) for k in keys} for o in out)
     return out
 
 

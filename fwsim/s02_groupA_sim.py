@@ -164,7 +164,7 @@ def main():
         for test_id in order:
             spec = GROUP_A[test_id]
             params = fwsim.plant_params(a, wheels_lifted=test_id in LIFTED_TESTS)
-            run_spec = prep_spec(spec, a.prep_s) if a.prep_s > 0 else spec
+            run_spec = prep_spec(spec, a.prep_s, tail_s=0.0) if a.prep_s > 0 else spec
             sp = (lambda s: lambda t: get_body_velocity(t, s) if t < s.duration else (0.0, 0.0, 0.0))(run_spec)
             imu_r = rep_imu(imu, rep)
             log = fwsim.simulate(fw, sp, run_spec.duration + STOP_TAIL_S, params, seed=rep, mode=a.controller,

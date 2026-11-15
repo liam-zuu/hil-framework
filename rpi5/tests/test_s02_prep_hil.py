@@ -30,7 +30,7 @@ def _no_signal_run(pub):
 def test_publisher_sends_zero_through_the_preparation_then_the_test():
     box = ControlBox()
     box.set_phase(RUN)
-    spec = s2.prep_spec(TrajectorySpec('line', v=0.3, duration=0.3), 0.3)
+    spec = s2.prep_spec(TrajectorySpec('line', v=0.3, duration=0.3), 0.3, tail_s=0.2)
     ref = mp.Array('d', 4)
     seen = []                                       # (time after start, vx) at every new setpoint
     pub = TrajectoryPublisher(spec=spec, simulate=True, shared_ref=ref, control=box)
@@ -50,9 +50,12 @@ def test_publisher_sends_zero_through_the_preparation_then_the_test():
     zeros = [t for t, v in seen if v == 0.0]
     ones = [t for t, v in seen if v == pytest.approx(0.3)]
     assert zeros and ones and len(zeros) + len(ones) == len(seen)
-    assert max(zeros) < min(ones)                   # no test value before the last preparation zero
+    prep_z = [t for t in zeros if t < min(ones)]
+    tail_z = [t for t in zeros if t > max(ones)]
+    assert prep_z and tail_z and len(prep_z) + len(tail_z) == len(zeros)   # 0, then the test, then 0
     assert min(ones) >= 0.3 - 0.04                  # Windows sleep / monotonic granularity
-    assert 0.6 - 0.05 <= seen[-1][0] <= 0.6 + 0.1
+    assert max(ones) <= 0.6 + 0.04 and min(tail_z) <= 0.6 + 0.06            # S2P1-7: the tail on time
+    assert 0.8 - 0.05 <= seen[-1][0] <= 0.8 + 0.1
 
 
 def test_finite_run_lasts_preparation_plus_test():
@@ -61,7 +64,7 @@ def test_finite_run_lasts_preparation_plus_test():
                            omega_schedule=None, load_schedule=None, o1=None)
     spec = s2.prep_spec(TrajectorySpec('lift_reverse', v=0.3, duration=9.0), 3.0)
     lc, _ = _finite_run_config(args, spec)
-    assert lc.run_s == pytest.approx(12.0) and lc.stop_s == 1.0
+    assert lc.run_s == pytest.approx(13.0) and lc.stop_s == 1.0            # 3 + 9 + 1 s tail (S2P1-7)
 
 
 @pytest.mark.parametrize('extra,msg', [
