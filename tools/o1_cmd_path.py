@@ -90,6 +90,8 @@ Round 6 (15/11): epochs as exact decimals, span compared in whole ms (CP6-1); '#
 before the missing '#test_end' case (CP6-2).
 Round 7 (15/11; Liam 15/11 CODE_CAM "Chay vong 7"): the span kept as an exact Decimal and compared
 without rounding (CP7-1); a t_epoch that is not a finite number is a ValueError, exit 2 (CP7-2).
+Round 8 (15/11; Liam 15/11 CODE_CAM "Chay vong 8"): t_epoch must be the sender format digits.ddd (at most
+12 integer digits), anything else is exit 2, so the Decimal span is exact and finite (CP8-1, CP8-2).
 B8-1c (CODE 15/11, O1 v11.23 3.5; Liam 15/11 CODE_CAM "Lam B8-1c roi vong 4 gop (Recommended)"): window end
 from the real send times (--sender, B81c-1); a pair whose tick or timestamp_us does not increase is no
 evidence for (2), (4) (B81c-7).
@@ -105,7 +107,8 @@ from __future__ import annotations
 
 import argparse
 import csv
-from decimal import Decimal, InvalidOperation
+import re
+from decimal import Decimal
 import json
 import math
 import os
@@ -127,6 +130,7 @@ T_SEND = 1.0 / SEND_HZ
 E_MAX = 2002e-6               # S05 4.7 (i): (1 + rho)/(1 - rho) - 1, rho = 1e-3
 TRAJ_TIMEOUT_MS = 200         # main.c 5bde4c5 line 45
 EDGE_AGE_MS = 30              # [DE XUAT] edge line packet age: about one tick + transfer
+EPOCH_RE = re.compile(r'[0-9]{1,12}\.[0-9]{3}')   # sender t_epoch format (.3f), see read_sender_bao
 COORD_MAX_M = 8.0             # O1 3.5: rounding term valid for |x_ref|, |y_ref| < 8 m
 COORD_DOUBLE_M = 4.0          # from 4 m the float32 term doubles (O1 3.5, B81-18)
 R_LOG_M = 1e-4                # 0.1 mm: log 4 decimals per coordinate (logger.c 223, 249-250)
@@ -382,13 +386,13 @@ def read_sender_bao(path, task_id):
         if not ls or _kv(ls[0]).get('t_epoch', '') == '':
             return None
         txt = _kv(ls[0])['t_epoch']
-        try:
-            d = Decimal(txt)                             # exact decimal: no binary rounding (CP6-1)
-        except InvalidOperation:
-            raise ValueError(f'{path}: {kind[:-1]} t_epoch {txt!r} is not a number') from None   # CP7-2
-        if not d.is_finite():
-            raise ValueError(f'{path}: {kind[:-1]} t_epoch {txt!r} is not finite')
-        got[kind] = d
+        # only the sender's own format, f'{epoch:.3f}' (pc_sender.py 20f1f81 117, 144): digits, a point,
+        # exactly 3 decimals, at most 12 integer digits. Anything else (sign, exponent, more decimals,
+        # NaN, text) is an error, exit 2 (CP7-2, CP8-1, CP8-2): so the Decimal arithmetic below has at most
+        # 15 significant digits, is exact in the default context and never leaves the float range
+        if not EPOCH_RE.fullmatch(txt):
+            raise ValueError(f'{path}: {kind[:-1]} t_epoch {txt!r} is not the sender format digits.ddd')
+        got[kind] = Decimal(txt)                         # exact decimal: no binary rounding (CP6-1)
     return got['#test_end,'] - got['#test_start,']      # Decimal, exact (CP7-1)
 
 

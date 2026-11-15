@@ -750,16 +750,18 @@ def _sender(path, e0, e1):
 
 
 def test_CP7_1_sub_ms_short_span_is_not_rounded_up(tmp_path):
+    # since round 8 a t_epoch with more than 3 decimals is outside the sender format: exit 2, never ma=0
     rows = make_log()
-    f = _sender(tmp_path / 's.txt', '1000.000', '1013.6396')       # 0.4 ms short of 13.640 s
+    p = write(tmp_path, rows, name='c.csv')
+    for name, e1 in (('short', '1013.6396'), ('above', '1013.6400001')):
+        f = _sender(tmp_path / f'{name}.txt', '1000.000', e1)
+        with pytest.raises(ValueError):
+            cp.read_sender_bao(f, 'O1-F05')
+        assert cp.main(['--log', p, '--task', 'O1-F05', '--sender', f]) == 2, name
+    # 1 ms short in the sender format: refused as test_end_span_short (exact compare)
+    f = _sender(tmp_path / 'ms.txt', '1000.000', '1013.639')
     res = run(tmp_path, rows, sched=None, bao=cp.read_sender_bao(f, 'O1-F05'))
     assert any(x.startswith('test_end_span_short') for x in res['flags'])
-    p = write(tmp_path, rows, name='c.csv')
-    assert cp.main(['--log', p, '--task', 'O1-F05', '--sender', f]) == 1
-    g = _sender(tmp_path / 'g.txt', '1000.000', '1013.6400001')      # just above: accepted
-    (tmp_path / 'g').mkdir()
-    res = run(tmp_path / 'g', rows, sched=None, bao=cp.read_sender_bao(g, 'O1-F05'))
-    assert not any(x.startswith('test_end_span_short') for x in res['flags'])
 
 
 def test_CP7_2_epoch_not_a_number_is_exit_2(tmp_path, capsys):
@@ -770,3 +772,22 @@ def test_CP7_2_epoch_not_a_number_is_exit_2(tmp_path, capsys):
             cp.read_sender_bao(f, 'O1-F05')
         assert cp.main(['--log', p, '--task', 'O1-F05', '--sender', f]) == 2, name
         assert capsys.readouterr().out.rstrip().endswith('#ket_qua,ma=2'), name
+
+
+
+# ---------------------------------------------------------------- Codex Sol round 8 (CP8-1, CP8-2)
+def test_CP8_epoch_outside_the_sender_format_is_exit_2(tmp_path, capsys):
+    p = write(tmp_path, make_log())
+    bad = (('long', '1000.000', '1013.639999999999999999999999999999'),   # beyond the Decimal context
+           ('huge', '0.000', '1e309'),                                     # beyond the float range
+           ('sign', '+1000.000', '+1013.640'), ('exp', '1e3', '1.01364e3'),
+           ('two', '1000.00', '1013.64'), ('space', ' 1000.000', '1013.640'),
+           ('neg', '-1000.000', '1013.640'), ('digits', '1234567890123.000', '1234567890136.640'))
+    for name, e0, e1 in bad:
+        f = _sender(tmp_path / f'{name}.txt', e0, e1)
+        with pytest.raises(ValueError):
+            cp.read_sender_bao(f, 'O1-F05')
+        assert cp.main(['--log', p, '--task', 'O1-F05', '--sender', f]) == 2, name
+        assert capsys.readouterr().out.rstrip().endswith('#ket_qua,ma=2'), name
+    ok = _sender(tmp_path / 'ok.txt', '1794322935.904', '1794322949.544')     # real epoch size, 13.640 s
+    assert cp.read_sender_bao(ok, 'O1-F05') == Decimal('13.640')
