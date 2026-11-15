@@ -412,3 +412,58 @@ def test_b81_3_gate_accepted_by_rq3_log_b81_3(tmp_path):
         write_k_frame_log(p, task, yaw)
         js = json.loads(json.dumps(H._json_safe(H.score(p, task, allow_final_set=True))))
         rl.validate_gate(js['gate_v3'], 'HIL')
+
+
+# ── pi_period_ppm on the steps of T (S05 v3.29 4.7 (i), B81b-3, B81bR2-2; design RS-4 section 18.8) ──
+
+def test_pi_period_formula_and_refusals():
+    t = (np.arange(20001, dtype=np.int64) * 999988 + 5_000_000_000)          # 999.988 us per step: -12 ppm
+    o = H.pi_period(t, 1000, 13000, 1000)
+    assert o['pi_period_ppm'] == pytest.approx(-12.0, abs=1e-6) and o['pi_period_n'] == 12000
+    assert o['pi_period_steps'] == [1000, 13000] and o['pi_period_note'] == ''
+    o = H.pi_period(t, 1000, 13000, 500)                                       # period_us in the formula
+    assert o['pi_period_ppm'] == pytest.approx((999988 / 500000 - 1) * 1e6)
+    # only the two ends count (no fit): a late frame inside T changes nothing, a late end frame does
+    t2 = t.copy()
+    t2[5000] += 300_000
+    assert H.pi_period(t2, 1000, 13000, 1000)['pi_period_ppm'] == pytest.approx(-12.0, abs=1e-6)
+    t2[13000] += 120_000                                                       # end sent 120 us late: +10 ppm over 12 s
+    assert H.pi_period(t2, 1000, 13000, 1000)['pi_period_ppm'] == pytest.approx(-12.0 + 10.0, abs=1e-6)
+    for args, word in (((None, 0, 10, 1000), 'without t_send_ns'), ((t, 1000, None, 1000), 't_end not finite'),
+                       ((t, 1000, 1000, 1000), 'no step interval'), ((t, 1000, 999, 1000), 'no step interval'),
+                       ((t, 1000, 20001, 1000), 'outside'), ((t, -1, 10, 1000), 'outside')):
+        o = H.pi_period(*args)
+        assert o['pi_period_ppm'] is None and word in o['pi_period_note'], (args[1:], o)
+    for bad in (0, -5):
+        t3 = t.copy()
+        t3[1000] = bad
+        assert 'not usable' in H.pi_period(t3, 1000, 13000, 1000)['pi_period_note']
+    t3 = t.copy()
+    t3[13000] = t3[1000]
+    assert 'not usable' in H.pi_period(t3, 1000, 13000, 1000)['pi_period_note']
+
+
+def _add_t_send(path, ns_per_step, start=7_000_000_000):
+    z = dict(np.load(path, allow_pickle=False))
+    z['t_send_ns'] = np.arange(len(z['mosi']), dtype=np.int64) * ns_per_step + start
+    np.savez(path, **z)
+
+
+def test_pi_period_in_score(tmp_path):
+    """score(): k_first = k0 (t = 0), k_last = the frame at t_end; no t_send_ns in the log -> null with the reason."""
+    p = str(tmp_path / 'run.npz')
+    write_frame_log(p, 'O1-F05')
+    out = H.score(p, 'O1-F05')
+    assert out['pi_period_ppm'] is None and 'without t_send_ns' in out['pi_period_note']
+    _add_t_send(p, 1_000_050)                                                  # +50 ppm
+    out = H.score(p, 'O1-F05')
+    k_last = out['k0'] + int(round(out['t_end'] / 1e-3))
+    assert out['pi_period_steps'] == [out['k0'], k_last] and out['pi_period_n'] == k_last - out['k0']
+    assert out['pi_period_ppm'] == pytest.approx(50.0, abs=1e-6) and out['pi_period_note'] == ''
+    js = json.loads(json.dumps(H._json_safe(out)))
+    assert js['pi_period_ppm'] == pytest.approx(50.0, abs=1e-6)
+    # the S05 table takes it as the measured pi_period_ppm
+    sys.path.insert(0, os.path.join(HERE, '..'))
+    import s05_final_table as T
+    v, src = T.t_end_err_ms(js['t_end'], None, js['pi_period_ppm'])
+    assert 'pi_period_ppm' in src and 'can Pi' not in src
