@@ -12,6 +12,8 @@ gian của chương trình terminal, bỏ qua):
   Frame: unread=<n>  new seen=<n> taken=<n> repl=<n> drop=<n>  applied=<n> skipped=<n> age_max=<n>us
   S06log: pushed=<n> dropped=<n>  print_drop=<n>
   T10: win_ms=<ms> isr_us=<µs> idle_pass=<n> idle_us_est=<µs> cal=<n>/<cyc> ovh_cyc=<cyc>       mỗi 10 s
+       từ H7 feat/s06-pf3 344f21f thêm ở cuối: ` wn=<n> t0_ms=<tick> lk=<n>` (số cửa sổ, tick đầu cửa sổ, số lần
+       link up); khi có, mất khối xét bằng `wn` liền nhau và neo đầu/cuối (`wn_analyse`), không bằng giờ PC
   T10 <tên> n=<n> excl_us=<µs> max_us=<µs>.<2 số>                     một dòng mỗi handler có n > 0
 Mọi bộ đếm (trừ T10) cộng dồn từ lúc khởi động; T10 đặt lại sau mỗi lần in.
 
@@ -98,10 +100,11 @@ _RE = {
     'frame': re.compile(r'Frame: unread=(\d+)\s+new seen=(\d+) taken=(\d+) repl=(\d+) drop=(\d+)'
                         r'(?:\s+applied=(\d+) skipped=(\d+) age_max=(\d+)us)?'),
     's06log': re.compile(r'S06log: pushed=(\d+) dropped=(\d+)\s+print_drop=(\d+)'),
-    # Round 6 (Liam 15/11, CODE_S06 'H7 in so cua so + vong 6'; H7 feat/s06-pf3 60c69df): optional wn (window
-    # number since boot) and t0_ms (HAL tick at the window start) at the end of the header
+    # Rounds 6, 7 (Liam 15/11, CODE_S06 'H7 in so cua so + vong 6', 'Sua du + vong 7'; H7 feat/s06-pf3 344f21f):
+    # optional wn (window number since boot), t0_ms (HAL tick at the window start), lk (link-up count since boot)
+    # at the end of the header
     't10': re.compile(r'T10: win_ms=(\d+) isr_us=(\d+) idle_pass=(\d+) idle_us_est=(\d+) cal=(\d+)/(\d+) '
-                      r'ovh_cyc=(\d+)(?: wn=(\d+) t0_ms=(\d+))?'),
+                      r'ovh_cyc=(\d+)(?: wn=(\d+) t0_ms=(\d+)(?: lk=(\d+))?)?'),
     't10_irq': re.compile(r'T10 (\S+)\s+n=(\d+) excl_us=(\d+) max_us=(\d+)\.(\d\d)'),
     'relay': re.compile(r'Relay: sent=(\d+) dropped=(\d+)'),       # W8, tools/s06_relay_check.py
 }
@@ -111,7 +114,7 @@ _FIELDS = {
     'link': ('state', 'lost', 'fps', 'err', 'rearm', 'last_err'),
     'frame': ('unread', 'new_seen', 'taken', 'repl', 'drop', 'applied', 'skipped', 'age_max_us'),
     's06log': ('pushed', 'dropped', 'print_drop'),
-    't10': ('win_ms', 'isr_us', 'idle_pass', 'idle_us_est', 'cal_n', 'cal_cyc', 'ovh_cyc', 'wn', 't0_ms'),
+    't10': ('win_ms', 'isr_us', 'idle_pass', 'idle_us_est', 'cal_n', 'cal_cyc', 'ovh_cyc', 'wn', 't0_ms', 'lk'),
 }
 
 
@@ -181,61 +184,147 @@ def t10_blocks(ev: List[dict], all_blocks: bool = False):
             blocks.append(cur)
         elif e['kind'] == 't10_irq' and cur is not None:
             cur['irqs'].append(e)
-    if not all_blocks and span is not None and blocks:
-        if has_wn(blocks):
-            blocks = wn_blocks(ev, span)
-        else:
+    if not all_blocks and span is not None:
+        mode = wn_mode(ev)
+        if mode == 'lk':
+            blocks = wn_analyse(ev, span)['blocks']        # T10U-R6-6: from the headers it checks, even none in span
+        elif blocks:
             blocks = blocks[1:]                  # cửa sổ đầu có phần trước link up
     return blocks, span
 
 
-H7_WIN_MIN_MS = 10000      # main.c: the T10 snapshot is taken once HAL_GetTick() - _t10_last >= 10000
+# ── H7 window numbers (rounds 6, 7; Liam 15/11, CODE_S06 'H7 in so cua so + vong 6', 'Sua du + vong 7') ──
+# H7 feat/s06-pf3 344f21f: 'T10: ... wn=<n> t0_ms=<tick> lk=<n>'. S06Load_PollSnapshot takes a window only when the
+# tick is S06_WIN_MS past the start and the previous block is printed; the start of the next window is the tick the
+# snapshot read, so windows tile (t0 of wn+1 = t0 + win_ms of wn) and none is shorter than H7_WIN_MIN_MS. lk = link-up
+# count since boot at the snapshot. 60c69df (wn, t0_ms, no lk; window could be 9 999 ms) was never flashed: not
+# accepted. Ticks are HAL ms (uint32): every comparison is on the difference to the link-up tick (T10U-R6-4).
+H7_WIN_MIN_MS = 10000
+_TICK_MOD = 1 << 32
 
 
-def wn_end(ev: List[dict], span) -> int:
-    """Index where the headers of the run stop (round 6): the next 'SPI link up' after the span, or the log end.
-    A window that ended before the last frame may be printed after the 'SPI link lost' line."""
-    b = span[1]
-    return next((i for i in range(b, len(ev)) if ev[i]['kind'] == 'link_up'), len(ev))
+def tick_rel(t: int, t_ref: int) -> int:
+    """Signed ms from t_ref to t on the uint32 HAL tick (T10U-R6-4: correct across one wrap, |difference| < 2^31)."""
+    return ((t - t_ref + (1 << 31)) % _TICK_MOD) - (1 << 31)
 
 
-def wn_blocks(ev: List[dict], span):
-    """Round 6: the windows wholly inside the link period: t0_ms >= the link-up tick (first frame) and, when the
-    run's Link period line is there, t0_ms + win_ms <= the tick of the last frame; headers up to wn_end."""
-    a, _ = span
+def wn_mode(ev: List[dict]) -> Optional[str]:
+    """'lk' when a header of the log carries lk (H7 344f21f and later), 'wn' when headers carry wn but none lk
+    (60c69df, not accepted), None for older builds (the PC-time / SPI1 path). Decided on the WHOLE log
+    (T10U-R6-6: not on the headers of the span only)."""
+    heads = [e for e in ev if e['kind'] == 't10']
+    if any(h.get('lk') is not None for h in heads):
+        return 'lk'
+    if any(h.get('wn') is not None for h in heads):
+        return 'wn'
+    return None
+
+
+def _wn_full(h) -> bool:
+    return h.get('wn') is not None and h.get('t0_ms') is not None and h.get('lk') is not None
+
+
+def wn_analyse(ev: List[dict], span) -> dict:
+    """Windows of the run from the H7 numbers, and why the run is not complete. dict(blocks, data_lost, missing).
+
+    * Run: link-up tick t_up (first frame, 'SPI link up at t='); last frame t_up + h7_ms of the run's 'Link period'
+      (link_period_of_span). A window is kept when 0 <= t0 − t_up and t0 + win_ms − t_up <= h7_ms.
+    * Headers checked (log order): the last header printed BEFORE the link-up line (start anchor, when it is of the
+      same boot and link period: wn below the next one, lk one below), then every header after the link-up line up
+      to and including the END ANCHOR = the first one whose window ends after the last frame (T10U-R6-5: headers
+      after it, and after a later link up, are not the run's). Consecutive checked headers must have wn + 1 and
+      t0 = previous t0 + win_ms, else a block is lost: data lost.
+    * Start (T10U-R6-1): a checked header with t0 < t_up proves nothing was lost before the first kept window (the
+      numbers run on from it). Without one, the first kept window may start less than H7_WIN_MIN_MS after link up
+      (the window before it, >= H7_WIN_MIN_MS long, held link up); otherwise missing (cannot tell).
+    * End (T10U-R6-2): the end anchor proves nothing was lost after the last kept window. Without it, fewer than
+      H7_WIN_MIN_MS between the last checked window end and the last frame leave no room for a full window;
+      otherwise missing (the log may stop before the next header is printed).
+    * Link lost and up again inside the run ('SPI link up' lines, or lk changing among the headers after link up,
+      T10U-R6-3): missing, no windows. A header after the link-up line without wn/t0_ms/lk: damaged line, data lost
+      (T10U-R6-6)."""
+    a, b = span
+    dl, ms = [], []
     t_up = ev[a]['t_ms']
-    lp, _why = link_period_of_span(ev, span)
-    t_last = t_up + lp['h7_ms'] if lp else None
-    out, cur = [], None
-    for e in ev[a:wn_end(ev, span)]:
+    i_end = next((i for i in range(b, len(ev)) if ev[i]['kind'] == 'link_up'), len(ev))
+    blk_of, cur = {}, None
+    for i, e in enumerate(ev[:i_end]):
         if e['kind'] == 't10':
             cur = dict(head=e, irqs=[])
-            out.append(cur)
+            blk_of[i] = cur
         elif e['kind'] == 't10_irq' and cur is not None:
             cur['irqs'].append(e)
-    return [bl for bl in out if bl['head']['t0_ms'] is not None and bl['head']['t0_ms'] >= t_up
-            and (t_last is None or bl['head']['t0_ms'] + bl['head']['win_ms'] <= t_last)]
+    if link_interruptions(ev[a:b]):
+        ms.append('link mất rồi lên lại trong lượt: không lấy cửa sổ T10')
+        return dict(blocks=[], data_lost=dl, missing=ms)
+    lp, why = link_period_of_span(ev, span)
+    t_last = lp['h7_ms'] if lp else None                 # relative to t_up
+    if lp is None:
+        ms.append(f'không xác định được frame cuối của lượt: {why}')
 
+    def rel0(h):
+        return tick_rel(h['t0_ms'], t_up)
 
-def has_wn(blocks_or_heads) -> bool:
-    """Every header carries wn and t0_ms (H7 from 60c69df); mixed or none: the older path."""
-    hs = [x['head'] if 'head' in x else x for x in blocks_or_heads]
-    return bool(hs) and all(h.get('wn') is not None and h.get('t0_ms') is not None for h in hs)
+    def rel1(h):
+        return rel0(h) + h['win_ms']
+
+    post = []
+    for i in sorted(k for k in blk_of if k > a):
+        h = blk_of[i]['head']
+        if t_last is None and i > b:
+            break                                          # no last frame: no end anchor, only headers of the span
+        if not _wn_full(h):
+            dl.append(f"header T10 dòng {h['line']} thiếu wn/t0_ms/lk (dòng hỏng): mất khối")
+            continue
+        post.append(i)
+        if h['win_ms'] < H7_WIN_MIN_MS:                    # S06Load_PollSnapshot never takes a shorter one
+            dl.append(f"cửa sổ T10 wn={h['wn']} dài {h['win_ms']} ms, ngắn hơn {H7_WIN_MIN_MS} ms "
+                      '(bản H7 có lk không tạo ra): dòng hỏng')
+        if t_last is not None and rel1(h) > t_last:
+            break                                          # end anchor
+    pre = [i for i in blk_of if i < a]
+    chk = [blk_of[i]['head'] for i in post]
+    lks = sorted({h['lk'] for h in chk})
+    if len(lks) > 1:
+        ms.append(f'lk đổi giữa các header T10 sau link up {lks}: link mất rồi lên lại trong lượt, không lấy cửa sổ')
+        return dict(blocks=[], data_lost=dl, missing=ms)
+    if pre:
+        p = blk_of[pre[-1]]['head']
+        if _wn_full(p) and (not chk or (p['wn'] < chk[0]['wn'] and p['lk'] + 1 == chk[0]['lk'])):
+            chk = [p] + chk
+    for p, q in zip(chk, chk[1:]):
+        if q['wn'] != p['wn'] + 1:
+            dl.append(f"số cửa sổ T10 nhảy {p['wn']} → {q['wn']}: mất khối")
+        elif q['t0_ms'] != (p['t0_ms'] + p['win_ms']) % _TICK_MOD:
+            dl.append(f"cửa sổ T10 wn={q['wn']} bắt đầu {q['t0_ms']} ms, kỳ vọng {(p['t0_ms'] + p['win_ms']) % _TICK_MOD}")
+    kept = [blk_of[i] for i in post if rel0(blk_of[i]['head']) >= 0
+            and (t_last is None or rel1(blk_of[i]['head']) <= t_last)]
+    full = [h for h in chk if rel0(h) >= 0]
+    if full and not any(rel0(h) < 0 for h in chk) and rel0(full[0]) >= H7_WIN_MIN_MS:
+        ms.append(f"cửa sổ T10 trọn đầu tiên bắt đầu {rel0(full[0])} ms sau link up, không có header nào trước nó "
+                  'trong lượt hay ngay trước link up: không chứng minh được không mất khối đầu')
+    if t_last is not None and chk and rel1(chk[-1]) <= t_last and t_last - rel1(chk[-1]) >= H7_WIN_MIN_MS:
+        ms.append(f'còn {t_last - rel1(chk[-1])} ms frame sau cửa sổ T10 cuối, không có header của cửa sổ kế tiếp '
+                  '(log dừng sớm hay mất khối): không chứng minh được không mất khối cuối')
+    if not kept and chk:
+        ms.append('không có cửa sổ T10 nào nằm trọn trong đoạn link')
+    return dict(blocks=kept, data_lost=dl, missing=ms)
 
 
 def link_period_of_span(ev: List[dict], span):
-    """(Link period line of the run, '' ) or (None, reason): the first 'Link period' after the span's link lost,
-    before any later 'SPI link up' (Codex round 5: a later link period must not stand for this one), with
-    pi_ms == frames - 1 (the H7 prints both from the same counter: another value = a damaged line)."""
+    """(Link period line of the run, '' ) or (None, reason). The H7 prints 'SPI link lost' and 'Link period' back to
+    back in the same branch (main.c), so the run's line is the recognised line RIGHT AFTER the span's link-lost line
+    (Codex rounds 5, 6: a later segment's line, its link up and our Link period lost, must not stand for this one),
+    with pi_ms == frames - 1 (the H7 prints both from the same counter: another value = a damaged line)."""
     a, b = span
-    for e in ev[b:]:
-        if e['kind'] == 'link_up':
-            break
-        if e['kind'] == 'link_period':
-            if e['pi_ms'] != e['frames'] - 1:
-                return None, f"dòng Link period hỏng (Pi {e['pi_ms']} ms khác frames − 1 = {e['frames'] - 1})"
-            return e, ''
-    return None, 'không có dòng Link period ngay sau lượt'
+    if b >= len(ev) or ev[b]['kind'] != 'link_lost':
+        return None, 'không có dòng SPI link lost của lượt'
+    e = ev[b + 1] if b + 1 < len(ev) else None
+    if e is None or e['kind'] != 'link_period':
+        return None, 'không có dòng Link period ngay sau link lost của lượt'
+    if e['pi_ms'] != e['frames'] - 1:
+        return None, f"dòng Link period hỏng (Pi {e['pi_ms']} ms khác frames − 1 = {e['frames'] - 1})"
+    return e, ''
 
 
 def idle_lower_pct(idle_pct: Optional[float], rel_unc: Optional[float], idle_pass: int) -> Optional[float]:
@@ -398,47 +487,6 @@ def spi_premise_problem(ev: List[dict], span) -> str:
     return ''
 
 
-def wn_problems(ev: List[dict], span, blocks):
-    """Round 6 (H7 wn/t0_ms): (data_lost, missing) from the H7 window numbers and ticks, no PC times or SPI1 counts.
-    Windows tile: t0 of window k+1 = t0 + win_ms of window k (H7 ms tick). Data lost when: a gap in wn between two
-    headers of the span; a header whose t0 is not the previous one's end; the first full window (t0 >= link-up tick)
-    starts a whole window or more after link up (it and the ones before it lost); a whole window fits between the
-    end of the last kept window and the last frame of the run (link-up tick + h7_ms of the run's Link period)."""
-    a, _ = span
-    heads = [e for e in ev[a:wn_end(ev, span)] if e['kind'] == 't10']
-    dl, ms = [], []
-    for p, q in zip(heads, heads[1:]):
-        if q['wn'] != p['wn'] + 1:
-            dl.append(f"số cửa sổ T10 nhảy {p['wn']} → {q['wn']}: mất khối")
-        elif q['t0_ms'] != p['t0_ms'] + p['win_ms']:
-            dl.append(f"cửa sổ T10 wn={q['wn']} bắt đầu {q['t0_ms']} ms, kỳ vọng {p['t0_ms'] + p['win_ms']}")
-    t_up = ev[a]['t_ms']
-    first = next((h for h in heads if h['t0_ms'] >= t_up), None)
-    partial = any(h['t0_ms'] < t_up < h['t0_ms'] + h['win_ms'] for h in heads)
-    # the window holding link up was lost too: the first full one starts < its length after link up when it is the
-    # first; a full window lost before it pushes that to >= H7_WIN_MIN_MS + 1 (link up is >= 1 ms after a start)
-    # (a window may run a few ms over 10 s when the main loop is late: (10000; WIN_MS_OK[1]] is not decided)
-    if first is not None and not partial and first['t0_ms'] - t_up > WIN_MS_OK[1]:
-        dl.append(f"cửa sổ T10 trọn đầu tiên bắt đầu {first['t0_ms'] - t_up} ms sau link up: mất khối đầu")
-    elif first is not None and not partial and first['t0_ms'] - t_up > H7_WIN_MIN_MS:
-        ms.append(f"cửa sổ T10 trọn đầu tiên bắt đầu {first['t0_ms'] - t_up} ms sau link up, header cửa sổ chứa "
-                  'link up không có: không phân biệt được mất khối đầu với cửa sổ dài hơn 10 s')
-    lp, why = link_period_of_span(ev, span)
-    if lp is None:
-        ms.append(f'không kiểm được mất khối cuối: {why}')
-    elif blocks:
-        last = blocks[-1]['head']
-        t_last = t_up + lp['h7_ms']
-        nxt = any(h['wn'] == last['wn'] + 1 for h in heads)
-        # the next window ends >= H7_WIN_MIN_MS after the last kept one; if that is still inside the run its header
-        # (printed before the next link up) must be there, and it would have been kept
-        if not nxt and t_last - (last['t0_ms'] + last['win_ms']) >= H7_WIN_MIN_MS:
-            dl.append(f"còn {t_last - last['t0_ms'] - last['win_ms']} ms frame sau cửa sổ T10 giữ cuối: mất khối cuối")
-    if not blocks and heads:
-        ms.append('không có cửa sổ T10 nào nằm trọn trong đoạn link')
-    return dl, ms
-
-
 def t10_summary(blocks, win_rows, irq_rows, ev, span) -> dict:
     tot_ms = sum(r['win_ms'] for r in win_rows)
     per: Dict[str, dict] = {}
@@ -476,13 +524,16 @@ def t10_summary(blocks, win_rows, irq_rows, ev, span) -> dict:
     a, b = span if span else (0, len(ev))
     heads_all = [e for e in ev[a:b] if e['kind'] == 't10']
     heads = [bl['head'] for bl in blocks]
-    # round 6: H7 with wn/t0_ms: lost blocks from the H7 window numbers and ticks (wn_problems), not from PC times
-    # or SPI1 counts (those stay for logs of older H7 builds)
-    use_wn = span is not None and has_wn(heads_all)
+    # rounds 6, 7: H7 with wn/t0_ms/lk: lost blocks from the H7 window numbers and ticks (wn_analyse), not from PC
+    # times or SPI1 counts (those stay for logs of older H7 builds). Mode from the whole log (T10U-R6-6).
+    mode = wn_mode(ev) if span is not None else None
+    use_wn = mode == 'lk'
+    if mode == 'wn':
+        missing.append('header T10 có wn, t0_ms mà không có lk (bản H7 60c69df, chưa từng nạp): công cụ không nhận')
     if use_wn:
-        wdl, wms = wn_problems(ev, span, blocks)
-        data_lost += wdl
-        missing += wms
+        wa = wn_analyse(ev, span)
+        data_lost += wa['data_lost']
+        missing += wa['missing']
     elif heads_all and all(h.get('t_pc_us') is not None for h in heads_all):
         gaps = [(b_['t_pc_us'] - a_['t_pc_us']) / 1e6 for a_, b_ in zip(heads_all, heads_all[1:])]
         lost = [i for i, g in enumerate(gaps) if abs(g - 10.0) > T10_GAP_TOL_S]
