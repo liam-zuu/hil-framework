@@ -337,18 +337,33 @@ def gain_files(dataset, init_gain=None):
         if not gs:
             continue
         cand = [p] if os.path.isabs(p) else [os.path.join(dataset, p), p]
-        have = [(c, rl.sha256_file(c)) for c in cand if os.path.isfile(c)]
-        f, sha = next(((c, h) for c, h in have if h == r.get('gain_sha256', '')), (None, None))
+        # R134C8-2 (Codex round 8): one candidate at a time, its read error kept for it alone; the first that
+        # matches gain_sha256 is taken and the rest is not read
+        f = sha = None
+        tried, n_there = [], 0
+        for c in cand:
+            if not os.path.isfile(c):
+                tried.append(f'{c}: khong co')
+                continue
+            n_there += 1
+            try:
+                h = rl.sha256_file(c)
+            except OSError as e:
+                tried.append(f'{c}: khong doc duoc ({e})')
+                continue
+            if h == r.get('gain_sha256', ''):
+                f, sha = c, h
+                break
+            tried.append(f'{c}: sha256 {h}')
         try:
-            if not have:
+            if f is None and not n_there:
                 raise ValueError(f'S05_freeze.csv: gain_file {p!r} of {gs} not found (tried {cand})')
             if f is None:
-                raise ValueError(f'S05_freeze.csv: gain_file of {gs}: sha256 '
-                                 + ', '.join(f'{c} {h}' for c, h in have)
-                                 + f' khac gain_sha256 {r.get("gain_sha256")!r}')
+                raise ValueError(f'S05_freeze.csv: gain_file {p!r} of {gs}: moi ung vien doc duoc deu khac gain_sha256 '
+                                 f'{r.get("gain_sha256")!r} ({"; ".join(tried)})')
             out[gs] = dict(file=f, sha256=sha, source='S05_freeze.csv',
                            want=_want(f, gs.split('/')[0].split('-')[-1]))
-        except ValueError as e:
+        except (ValueError, OSError) as e:
             out[gs] = dict(error=str(e))
     for ctrl, f in (init_gain or {}).items():
         if ctrl not in CONTROLLERS:
@@ -456,25 +471,62 @@ def run_gain_problem(esp32_path, want):
     each stretch (a data line with motor_on = 1 after one with 0) must have its own '#gain' line, next to its
     '#us,ev=start' (first_seq = the first data line of the stretch; gain_line_check.run_start), equal to the file
     bit for bit. A run whose motor stopped and started again with the same set still counts (tv_duty has no number
-    then); a stretch with another set, or without its '#gain' line, refuses the run."""
+    then); a stretch with another set, or without its '#gain' line, refuses the run.
+    R134C8-1 (Codex round 8; Liam 15/11 CODE_R134 "Sua 2 muc, goi vong 9 (Recommended)"): the firmware writes a
+    motor-off data line only every 10 ticks, so a short stop leaves no 0 -> 1 edge in the CSV. Hence:
+      (1) every start the events file shows ('#us,ev=start' or '#gain', by first_seq) must have its '#gain' line
+          equal to the file (one file = one run, CG7: no start of another run belongs there);
+      (2) every boundary of a stretch in the data must hold a start of (1) with lo < first_seq <= hi: a 0 -> 1 edge
+          (lo = log_seq of the off line, hi = of the on line), or two motor-on lines one after the other with
+          d log_seq != d tick (the motor was off at some tick between them: log_seq counts every pushed line, tick
+          only the motor-on ticks; a lost data line moves both by one). A lost first data line of a stretch is
+          therefore no problem when its start is shown. A boundary without a start refuses the run."""
     if not os.path.isfile(esp32_path):
         return f'thieu {os.path.basename(esp32_path)}: khong so duoc dong #gain cua luot voi file gain'
     try:
         rows, _ = read_esp32_log_info(esp32_path)
-        on = [x.get('motor_on') == '1' for x in rows]
-        rises = [i for i in range(len(rows)) if on[i] and (i == 0 or not on[i - 1])]
-        if not rises or rises[0] == 0:
-            return 'khong xac dinh duoc dong du lieu dau luot (motor_on) de khop #gain voi file gain'
         events = read_events(esp32_path)
-        for k, i in enumerate(rises, 1):
-            seq = _int(rows[i]['log_seq'])
+        if events is None:
+            return 'thieu file events (#gain, #us,ev=start): khong so duoc dong #gain cua luot voi file gain'
+        on = [x.get('motor_on') == '1' for x in rows]
+        if not any(on) or on[0]:
+            return 'khong xac dinh duoc dong du lieu dau luot (motor_on) de khop #gain voi file gain'
+        seqs = set()
+        for line in events:
+            _, text = glc.split_event(line)
+            if text.startswith('#gain,'):
+                seqs.add(glc._int(glc.parse_gain_line(text)['first_seq']))
+            elif text.startswith('#us,') and glc._fields(text).get('ev') == 'start':
+                seqs.add(glc._int(glc._fields(text).get('first_seq')))
+        if None in seqs:
+            return 'dong #gain hay #us,ev=start co first_seq khong phai so'
+        for seq in sorted(seqs):                                                         # (1)
             st = glc.run_start(events, seq)
-            where = f'doan motor bat {k}/{len(rises)} (first_seq={seq})'
+            where = f'moc bat dau first_seq={seq} ({len(seqs)} moc trong events)'
             if st['gain'] is None:
                 return f'dong #gain cua {where}: {"; ".join(st["why"])} (S05 6.3)'
             why = glc.gain_mismatch(st['gain'], want)
             if why:
                 return f'dong #gain cua {where} khac file gain: {"; ".join(why)}'
+        seq_of = [_int(x.get('log_seq')) for x in rows]
+        tick_of = [_int(x.get('tick')) for x in rows]
+        for i in range(1, len(rows)):                                                    # (2)
+            if not on[i]:
+                continue
+            if on[i - 1]:
+                if None in (seq_of[i], seq_of[i - 1], tick_of[i], tick_of[i - 1]):
+                    return f'dong du lieu log_seq {seq_of[i]} thieu log_seq hay tick: khong tach duoc doan motor bat'
+                if seq_of[i] - seq_of[i - 1] == tick_of[i] - tick_of[i - 1]:
+                    continue
+                kind = 'motor tat ngan giua hai dong motor bat (d log_seq != d tick)'
+            else:
+                kind = 'canh motor_on 0 -> 1'
+            lo, hi = seq_of[i - 1], seq_of[i]
+            if lo is None or hi is None:
+                return f'dong du lieu quanh {kind} thieu log_seq: khong tach duoc doan motor bat'
+            if not any(lo < s <= hi for s in seqs):
+                return (f'{kind} giua log_seq {lo} va {hi}: khong co moc bat dau (#us,ev=start, #gain) trong '
+                        'events de chung minh bo gain cua doan nay')
     except (OSError, glc.InputError) as e:
         return f'dong #gain cua luot: {e}'
     return None

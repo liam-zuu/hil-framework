@@ -224,6 +224,20 @@ def _ack(boot='4753dc47', mac='aa:bb', gid='7'):
     return dict(ok='1', boot=boot, mac=mac, id=gid)
 
 
+def stretch_starts(rows):
+    """log_seq of the first data line of every motor-on stretch: after a motor-off line, or after a motor-on line
+    with d log_seq != d tick (a short stop leaves no off line; R134C8-1)."""
+    out = []
+    for i, r in enumerate(rows):
+        if r['motor_on'] != '1':
+            continue
+        p = rows[i - 1] if i else None
+        if p is None or p['motor_on'] != '1' or (int(r['log_seq']) - int(p['log_seq'])
+                                                 != int(r['tick']) - int(p['tick'])):
+            out.append(int(r['log_seq']))
+    return out
+
+
 def write_log(d, rows, boots=('4753dc47', '4753dc47'), gain_seq=None, name='esp32.csv', run_boot='4753dc47',
               events=None):
     """esp32.csv, its events file with the run's start lines (start_events, or `events`), and gain_send
@@ -232,8 +246,9 @@ def write_log(d, rows, boots=('4753dc47', '4753dc47'), gain_seq=None, name='esp3
         w = csv.DictWriter(f, fieldnames=COLS)
         w.writeheader()
         w.writerows(rows)
-    first = int(next(r['log_seq'] for r in rows if r['motor_on'] == '1'))
-    ev = events if events is not None else start_events(first, run_boot, gain_seq)
+    ev = events if events is not None else sum(
+        (start_events(s, run_boot, gain_seq if k == 0 else None, t0=f'2026-11-14T10:00:{5 * k:02d}')
+         for k, s in enumerate(stretch_starts(rows))), [])
     with open(os.path.join(d, name + '.events.txt'), 'w', encoding='utf-8') as f:
         f.write(''.join(f'{t}\n' for t in ev))
     for when, b, t in zip(('before', 'after'), boots or (None, None), ((100.0, 101.0), (200.0, 201.0))):
@@ -780,8 +795,8 @@ def test_c6_1_set_changed_after_the_ack_is_refused(tmp_path):
     r = write_run(tmp_path, 'w2', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', 0.02)
     ds = _table_ds(tmp_path, [r])
     _set_id(r, 8, ack=False, query=False)
-    with pytest.raises(ValueError, match=r'run w2: dong #gain cua doan motor bat 1/1 \(first_seq=\d+\) khac file '
-                                         r'gain: id=8, gain file id 7'):
+    with pytest.raises(ValueError, match=r'run w2: dong #gain cua moc bat dau first_seq=\d+ \(1 moc trong events\) '
+                                         r'khac file gain: id=8, gain file id 7'):
         LR(ds)
 
 
@@ -790,8 +805,8 @@ def test_c6_1_gain_values_must_match_bit_for_bit(tmp_path):
     r = write_run(tmp_path, 'w3', 'HIL', 'final_hil', 'PID', 'O1-F05', 'RQ2-INIT-PID/G00', 'dat', 0.02)
     ds = _table_ds(tmp_path, [r])
     other = write_gain_file(os.path.join(ds, 'gain_init_other.json'), gains=dict(kp_xy=1.25))
-    with pytest.raises(ValueError, match=r'run w3: dong #gain cua doan motor bat 1/1 \(first_seq=\d+\) khac file '
-                                         r'gain: kp_xy: log 1.5'):
+    with pytest.raises(ValueError, match=r'run w3: dong #gain cua moc bat dau first_seq=\d+ \(1 moc trong events\) '
+                                         r'khac file gain: kp_xy: log 1.5'):
         LR(ds, init_gain={'PID': other})
 
 
@@ -900,10 +915,12 @@ def test_c7_1_every_motor_on_stretch_shows_the_set(tmp_path):
     runs, _ = LR(ds)
     assert len(runs) == 1 and runs[0]['values']['tv_duty'] is None
     _two_stretches(r, second_gid=8)
-    with pytest.raises(ValueError, match=r'run t1: dong #gain cua doan motor bat 2/2 .* khac file gain: id=8'):
+    with pytest.raises(ValueError, match=r'run t1: dong #gain cua moc bat dau first_seq=\d+ \(2 moc .* khac file '
+                                         r'gain: id=8'):
         LR(ds)
     _two_stretches(r, second_gain=False)
-    with pytest.raises(ValueError, match=r'run t1: dong #gain cua doan motor bat 2/2 \(first_seq=\d+\): '):
+    with pytest.raises(ValueError, match=r'run t1: dong #gain cua moc bat dau first_seq=\d+ \(2 moc trong events\): '
+                                         r'.*no #gain line'):
         LR(ds)
 
 
@@ -953,4 +970,119 @@ def test_c7_3_relative_frozen_name_takes_the_candidate_with_the_sha(tmp_path, mo
     assert runs[0]['gain_file'] == 'gain_rel.json' and runs[0]['gain_sha256'] == rl.sha256_file(good)
     write_gain_file(good, gains=dict(kp_xy=1.75))                    # no candidate keeps the frozen sha256 now
     with pytest.raises(ValueError, match=r'run c1: file gain cua .*khac gain_sha256'):
+        LR(ds)
+
+
+# ---------------------------------------------------------------- Codex Sol round 8 (CODE_R134)
+
+def _short_stop(r, second_gid=7, second_start=True, lose_first=False, extra=None):
+    """Rewrite the ESP32 log of row r with a stop of 50 ms (five ticks, no motor-off data line: the firmware writes
+    one every 10 ticks; three #run_end lines take log_seq), then a start again; the second start lines with id
+    second_gid, or none; lose_first: the first data line after the stop is lost; extra: more events lines."""
+    L = Log()
+    L.off(30)
+    L.on(400, zigzag)
+    L.off(5, after_on=True)
+    L.on(604, zigzag, keep=(lambda k: k != 0) if lose_first else (lambda k: True))
+    rows = L.rows
+    seqs = [int(x['log_seq']) for x in rows]
+    hidden = [i for i in range(1, len(rows)) if rows[i]['motor_on'] == rows[i - 1]['motor_on'] == '1'
+              and seqs[i] - seqs[i - 1] != int(rows[i]['tick']) - int(rows[i - 1]['tick'])]
+    assert len(hidden) == 1 and all(x['motor_on'] == '1' for x in rows[rows.index(next(
+        x for x in rows if x['motor_on'] == '1')):])                     # no 0 -> 1 edge after the first one
+    second_seq = seqs[hidden[0]] - (1 if lose_first else 0)
+    first = next(int(x['log_seq']) for x in rows if x['motor_on'] == '1')
+    ev = start_events(first)
+    if second_start:
+        ev += [x.replace('#gain,id=7,', f'#gain,id={second_gid},')
+               for x in start_events(second_seq, t0='2026-11-14T10:00:05')]
+    write_log(r['results_dir'], rows, events=ev + (extra or []))
+    return second_seq
+
+
+def test_c8_1_a_short_stop_without_an_off_line_is_a_boundary(tmp_path):
+    """R134C8-1: a stop shorter than 10 ticks leaves no 0 -> 1 edge; the start of the second stretch is found by
+    d log_seq != d tick and must show the set of the file: same set counts (tv_duty empty), id 8 or no start
+    lines refuse the run."""
+    r = write_run(tmp_path, 'u1', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', 0.02)
+    ds = _table_ds(tmp_path, [r])
+    _short_stop(r)
+    runs, _ = LR(ds)
+    assert len(runs) == 1 and runs[0]['values']['tv_duty'] is None
+    _short_stop(r, second_gid=8)
+    with pytest.raises(ValueError, match=r'run u1: dong #gain cua moc bat dau .* khac file gain: id=8'):
+        LR(ds)
+    _short_stop(r, second_start=False)
+    with pytest.raises(ValueError, match=r'run u1: motor tat ngan giua hai dong motor bat .* khong co moc bat dau'):
+        LR(ds)
+
+
+def test_c8_1_lost_first_line_of_the_second_stretch(tmp_path):
+    """R134C8-1: the first data line after the short stop is lost; its start (first_seq = the lost line) lies in
+    the gap and is checked: same set counts, id 8 refuses."""
+    r = write_run(tmp_path, 'u2', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', 0.02)
+    ds = _table_ds(tmp_path, [r])
+    _short_stop(r, lose_first=True)
+    assert len(LR(ds)[0]) == 1
+    _short_stop(r, second_gid=8, lose_first=True)
+    with pytest.raises(ValueError, match=r'run u2: .* khac file gain: id=8'):
+        LR(ds)
+
+
+def test_c8_1_a_visible_edge_with_its_first_line_lost(tmp_path):
+    """R134C8-1: a 0 -> 1 edge whose first motor-on line is lost: the start shown in the gap proves the stretch."""
+    r = write_run(tmp_path, 'u3', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', 0.02)
+    ds = _table_ds(tmp_path, [r])
+    L = Log()
+    L.off(30)
+    L.on(1004, zigzag, keep=lambda k: k != 0)
+    first_lost = int(L.rows[next(i for i, x in enumerate(L.rows) if x['motor_on'] == '1')]['log_seq']) - 1
+    write_log(r['results_dir'], L.rows, events=start_events(first_lost))
+    assert len(LR(ds)[0]) == 1
+
+
+def test_c8_1_every_start_in_the_events_shows_the_set(tmp_path):
+    """R134C8-1 (1): a start in the events with another set refuses the run even where the data show no
+    boundary (one file = one run)."""
+    r = write_run(tmp_path, 'u4', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', 0.02)
+    ds = _table_ds(tmp_path, [r])
+    _short_stop(r, extra=[x.replace('#gain,id=7,', '#gain,id=8,') for x in start_events(900, t0='2026-11-14T10:00:20')])
+    with pytest.raises(ValueError, match=r'run u4: dong #gain cua moc bat dau first_seq=900 \(3 moc'):
+        LR(ds)
+
+
+def test_c8_2_a_read_error_stays_with_its_candidate(tmp_path, monkeypatch):
+    """R134C8-2: a frozen file that cannot be read (PermissionError) stops neither the table of other sets nor a
+    run whose set has another readable candidate with the sha256; the candidate after the matching one is not
+    read."""
+    import rq3_log
+    a = write_run(tmp_path, 'p1', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', 0.02)
+    ds = _table_ds(tmp_path, [a], frozen=(('A-PID', 'A-PID/G07'), ('B-LADRC', 'B-LADRC/G02')))
+    real, read = rq3_log.sha256_file, []
+
+    name = 'gain_A-PID_G07.json'                                     # the relative name S05_freeze.csv holds
+    in_ds = os.path.join(ds, name)                                   # candidate 1; candidate 2 is `name` (work folder)
+
+    def sha(path, bad):
+        read.append(path)
+        if bad(path):
+            raise PermissionError(13, 'Permission denied', path)
+        return real(path)
+    monkeypatch.setattr(rq3_log, 'sha256_file', lambda p: sha(p, lambda x: x.endswith('gain_B-LADRC_G02.json')))
+    assert [x['run_uid'] for x in LR(ds)[0]] == ['p1']             # unused set unreadable: table made
+    # good copy in the dataset, unreadable copy of the same name in the work folder: never read
+    work = tmp_path / 'work'
+    os.makedirs(work)
+    write_gain_file(work / name)
+    monkeypatch.chdir(work)
+    read.clear()
+    monkeypatch.setattr(rq3_log, 'sha256_file', lambda p: sha(p, lambda x: x == name))
+    assert len(LR(ds)[0]) == 1 and in_ds in read and name not in read
+    # the dataset copy unreadable, the work copy has the sha256: taken
+    monkeypatch.setattr(rq3_log, 'sha256_file', lambda p: sha(p, lambda x: x == in_ds))
+    runs, _ = LR(ds)
+    assert runs[0]['gain_file'] == name
+    # both unreadable: the run of the set is refused, the reason names both candidates
+    monkeypatch.setattr(rq3_log, 'sha256_file', lambda p: sha(p, lambda x: x in (in_ds, name)))
+    with pytest.raises(ValueError, match=r'run p1: file gain cua .*khong doc duoc.*khong doc duoc'):
         LR(ds)
