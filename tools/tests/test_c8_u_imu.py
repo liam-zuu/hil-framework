@@ -644,6 +644,30 @@ def test_cu7_2_short_jittered_segment_uses_the_long_period():
     assert b == pytest.approx(0.0508, rel=2e-3) and inl.sum() >= 103
 
 
+# ── Codex round 8 ──────────────────────────────────────────────────────────────────────
+
+def _cu8_1_r():
+    J = np.array([0, 19, 21, 30, 31, 32, 34, 35, 36, 37, 38])
+    return np.r_[10.0 + 0.0505 * np.arange(20), 15.0 + 0.05 * J + np.r_[0.009, np.zeros(10)],
+                 20.0 + 0.0505 * np.arange(20)]
+
+
+def test_cu8_1_missing_report_seen_by_time():
+    r = _cu8_1_r()
+    n, t_fit, b, j, inl = U._grid(r, 0.05, 0.005)
+    tg = np.arange(9.9, 21.1, 0.001)
+    gz = np.where((tg >= 16.61) & (tg <= 16.69), np.sin(2 * np.pi * (tg - 16.61) / 0.08), 0.0)
+    S = dict(t_all=t_fit, t_recv=r, n_all=n, psi_all=np.zeros(len(r)), tg=tg, gz=gz, period_fit_s=b, h_lim=0.105)
+    P, N = U.turn_totals(S, 10.1, 20.8)
+    assert P >= 0.08 / np.pi and N >= 0.08 / np.pi                  # each half pulse turns 0.04/pi rad; bound >= it
+
+
+def test_cu8_2_medium_segment_own_grid_when_better():
+    r = np.r_[10.0 + 0.0505 * np.arange(20), 15.0 + 0.05 * np.arange(19) + 0.009 * (np.arange(19) % 2)]
+    n, t_fit, b, j, inl = U._grid(r, 0.05, 0.005)
+    assert inl.sum() >= 0.8 * len(r)
+
+
 # ── scale (thang) ─────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize('sign,chieu,s', [(1, 'ccw', 0.004), (-1, 'cw', -0.007)])

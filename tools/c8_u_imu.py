@@ -300,7 +300,12 @@ def _grid(r, period_s, j_lim):
                         break
                     ok = new
                 ok = np.abs(js) <= j_lim
-                t_fit[s0:e], j[s0:e], inl[s0:e] = a + b_main * ns, js, ok
+                tf = a + b_main * ns
+                if not ok.all():                                 # CU8-2: its own grid if that fits more reports
+                    n2, a2, b2, j2, ok2 = _grid_segment(rs, period_s, j_lim)
+                    if abs(b2 / period_s - 1.0) <= PERIOD_TOL and ok2.sum() > ok.sum():
+                        ns, tf, js, ok = n2, a2 + b2 * n2, j2, ok2
+                t_fit[s0:e], j[s0:e], inl[s0:e] = tf, js, ok
         n[s0:e] = offset + ns
         if e < len(r):
             offset = n[e - 1] + max(2, int(round((r[e] - r[e - 1]) / b_main)))
@@ -406,7 +411,8 @@ def interp_yaw(S, t, h_lim=None):
 
 def turn_totals(S, w0, w1):
     """Total CCW (P) and CW (N) turn over [w0, w1] on the SAMPLE-time base of the reports (CU2-1), from every
-    report (CU-2), with reports bounding the window on both sides. Across missing reports (grid index step > 1)
+    report (CU-2), with reports bounding the window on both sides. Across missing reports (grid index step > 1, or
+    a gap above 1.5 periods in receive or sample time, CU8-1)
     a turn back and forth can hide: both P and N get max|gz| over the gap times its length (CU-2), which needs
     gyro reports at most h_lim apart there."""
     ta, ps, na = S['t_all'], S['psi_all'], S['n_all']
@@ -417,8 +423,11 @@ def turn_totals(S, w0, w1):
     d = np.diff(ps[i0:i1 + 1])
     P, N = float(d[d > 0].sum()), float(-d[d < 0].sum())
     tg, gz, tr = S.get('tg', np.array([])), S.get('gz', np.array([])), S['t_recv']
+    per_m = S.get('period_fit_s', PERIOD_S)
     for k in range(i0, i1):
-        if na[k + 1] - na[k] > 1:
+        # CU8-1: a gap longer than 1.5 periods in either time base means missing reports, whatever the grid index
+        # says (the index can be fooled by jitter); index steps > 1 still count too.
+        if na[k + 1] - na[k] > 1 or max(tr[k + 1] - tr[k], ta[k + 1] - ta[k]) > 1.5 * per_m:
             a, b = min(ta[k], tr[k]), max(ta[k + 1], tr[k + 1])  # CU-2 (round 3): both time bases
             if tg.size < 2 or tg[0] > a or tg[-1] < b:
                 raise InputError('missing IMU reports in the window without gyro reports over the gap (CU-2)')
