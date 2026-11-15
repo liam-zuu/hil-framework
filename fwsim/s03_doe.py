@@ -54,6 +54,13 @@ runs_test.csv and the sweep (Liam "Co, mot cach cham"): e_bao_max (G4), gate_ver
 gate_u_t, g1_q, g1_state, g2..g5 q, lo, hi, n_undef, state (names of tools/rq3_log.py GATE_COLS, B81-3)
 and gate_outcome (O1 3.5 over G1-G5). G3-G5 belong to the gate and S04, not to the section 5 analysis.
 
+S03 v8.3 (Liam 15/11, THESIS_SLIDE local_44e97934, C14-2; script: Liam 15/11 CODE_FEAS "Code ngay + Codex",
+design 03_CODE/docs/2026-11-15_Thiet_ke_S03_v83_luoi_noi_v1.md): the sweep grid is extended upward,
+sweep_grid_n = sweep_grid (unchanged; o1_feas_search keeps its box [a, b] with it) + b r^k, k = 1..K,
+r = (b/a)^(1/10), K the smallest with r^K >= 10 (1 - 1e-9); omega_o is not extended. levels.csv adds a, b,
+b_n, L_nguon, H_nguon (source of each level); sweep.csv adds luoi (log | mac_dinh | 0 | noi); meta.yaml
+records the grid per gain.
+
 L56 / S03 v6 section 1: the main design results (runs.csv, effects.csv and the tables of
 section 5) are NOT looked at before campaign A ends. Nothing derived from them leaves
 sealed/ (Codex S3C-1..S3C-3): no hash of a sealed file outside it, no child-process job file
@@ -131,7 +138,9 @@ GATE_RUN_COLS = (['e_bao_max', 'gate_version', 'gate_decide', 'gate_u_t', 'g1_q'
                  + [f'{c}_{x}' for c in G.MEASURED for x in ('q', 'lo', 'hi', 'n_undef', 'state')]
                  + ['gate_outcome'])
 RUN_COLS = OLD_COLS + GATE_RUN_COLS
-SWEEP_ID_COLS = ('controller', 'factor', 'value', 'is_default', 'v', 'mu')   # sweep.csv identifiers (section 7)
+LEVEL_COLS = ['controller', 'factor', 'L', 'H', 'centre', 'scale', 'default', 'rule_note',     # S03 v8
+              'a', 'b', 'b_n', 'L_nguon', 'H_nguon']                                          # S03 v8.3 (S83-1: fixed)
+SWEEP_ID_COLS = ('controller', 'factor', 'value', 'is_default', 'luoi', 'v', 'mu')   # sweep.csv identifiers (section 7; luoi: v8.3)
 GATE_U_T = 0.0                # s: fwsim knows the command start exactly (o1_gate docstring; as C12, S04)
 SCALE_RTOL = 1e-14            # H/L >= 4 within float rounding of the log grid (S3C-6; S3D-7: about 45 ULP)
 # S03 v8 (L67): axial points and the test set for the RSM comparison of S04; not analysed here
@@ -260,6 +269,64 @@ def sweep_grid(name, default, lo, hi):
         pts.append(0.0)
     pts = sorted(set(float(x) for x in pts))
     return [default if math.isclose(x, default, rel_tol=1e-9) else x for x in pts]
+
+
+GRID_N_TOL = 1e-9             # S03 v8.3 section 3.1: K smallest with r^K >= 10 (1 - 1e-9)
+
+
+def sweep_grid_n(name, default, lo, hi):
+    """S03 v8.3 section 3.1 (C14-2): the grid of sweep_grid (unchanged, bit for bit; C12 keeps using it for
+    its box [a, b]) plus the points b r^k, k = 1..K, r = (b/a)^(1/10) the step of the 11 log points, K the
+    smallest integer with r^K >= 10 (1 - 1e-9); omega_o keeps its cap 48 and is not extended. Returns
+    (grid, info) with info = a, b, r, K, b_n (None without extension), n_log, n_noi, n_points, noi (the
+    extension points)."""
+    base = sweep_grid(name, default, lo, hi)
+    a = default / 10.0 if lo == 0.0 else min(default / 10.0, lo)        # the same expressions as sweep_grid
+    b = max(default * 10.0, hi)
+    if name.startswith('omega_o'):
+        b = min(b, OMEGA_O_MAX)
+    r = (b / a) ** (1.0 / (N_GRID - 1))
+    noi = []
+    if not name.startswith('omega_o'):
+        k = 1
+        while r ** k < 10.0 * (1.0 - GRID_N_TOL):
+            k += 1
+        noi = [float(b * r ** j) for j in range(1, k + 1)]
+    if noi and not noi[0] > base[-1]:
+        raise S03Stop(f'{name}: the extension starts at {noi[0]!r}, not above the grid end {base[-1]!r}')
+    info = dict(a=float(a), b=float(b), r=float(r), K=len(noi), b_n=noi[-1] if noi else None, n_log=N_GRID,
+                n_noi=len(noi), n_points=len(base) + len(noi), noi=noi)
+    return base + noi, info
+
+
+def grid_label(x, default, noi):
+    """sweep.csv 'luoi' of a grid value (S03 v8.3; agreed with CODE_C13 15/11): the default first (even on a
+    log point), then 0, then the extension, else log."""
+    if x == default:
+        return 'mac_dinh'
+    if x == 0.0:
+        return '0'
+    return 'noi' if x in noi else 'log'
+
+
+L_SOURCES = ('0', 'hết lưới dưới', 'điểm kế tiếp không hoàn thành')
+H_SOURCES = ('hết lưới nối', 'trần ω_o', 'điểm kế tiếp không hoàn thành')
+
+
+def level_sources(grid, L, H, info, name):
+    """(L_nguon, H_nguon) of S03 v8.3 section 3.1. H at the top of an omega_o grid (no extension): 'trần ω_o'
+    (interpretation agreed with CODE_C13 15/11)."""
+    if L == 0.0:
+        ls = '0'
+    elif L == grid[0]:
+        ls = 'hết lưới dưới'
+    else:
+        ls = 'điểm kế tiếp không hoàn thành'
+    if H == grid[-1]:
+        hs = 'hết lưới nối' if info['K'] else 'trần ω_o'      # K = 0 only for omega_o (sweep_grid_n)
+    else:
+        hs = 'điểm kế tiếp không hoàn thành'
+    return ls, hs
 
 
 def levels_from_sweep(grid, default, ok):
@@ -896,6 +963,7 @@ def main():
     sweep_rows, level_rows, design_rows, all_runs = [], [], [], []
     eff_rows, curv_rows, ver_rows, fail_rows, det_rows = [], [], [], [], []
     y3_ref, rerun_notes, inner_rule, no_concl = {}, [], {}, {}
+    grid_info = {}                                    # S03 v8.3: (controller, factor) -> sweep_grid_n info
     stop_public, stop_sealed = None, None
     t_sweep_end = None
     tp_info = None                                    # S3V8-3: set when the test file is read (once)
@@ -912,7 +980,7 @@ def main():
             (all_runs if sink is None else sink).append(dict(controller=ctrl, point_id=ids[0], box=ids[1],
                                                              mu=mu, v=v, **row))
         elif sweep is not None:
-            sweep_rows.append(dict(controller=ctrl, factor=sweep[0], value=sweep[1], is_default=sweep[2],
+            sweep_rows.append(dict(controller=ctrl, factor=sweep[0], value=sweep[1], is_default=sweep[2], luoi=sweep[3],
                                    v=v, mu=mu, **row))
         note = dict(controller=ctrl, gains=g, v=v, mu=mu, point=ids, first=row.get('error'))
         (rerun_notes if notes_to is None else notes_to).append(note)
@@ -931,10 +999,10 @@ def main():
         for ctrl in a.controllers:
             dflts[ctrl] = defaults(fw, ctrl)
             for v in SPEEDS:
-                row, log = checked(ctrl, dflts[ctrl], v, mu_mid, sweep=('(default check)', '', True))
+                row, log = checked(ctrl, dflts[ctrl], v, mu_mid, sweep=('(default check)', '', True, 'mac_dinh'))
                 # recorded and logged before the stop test (S3D-4); public like the sweep
                 sweep_rows.append(dict(controller=ctrl, factor='(default check)', value='', is_default=True,
-                                       v=v, mu=mu_mid, **row))
+                                       luoi='mac_dinh', v=v, mu=mu_mid, **row))
                 if row['completed'] != 'true':
                     save_log(os.path.join(a.out, 'logs_sweep'), f'{ctrl}_default_check_v{v}', log)
                 if v in gate and row['completed'] != 'true':
@@ -947,15 +1015,17 @@ def main():
             lo_b, hi_b = tune_ga.BOUNDS[ctrl]
             levels[ctrl] = {}
             for j, name in enumerate(FACTORS[ctrl]):
-                grid = sweep_grid(name, dflt[name], lo_b[j], hi_b[j])
+                grid, ginfo = sweep_grid_n(name, dflt[name], lo_b[j], hi_b[j])     # S03 v8.3: with the extension
+                grid_info[(ctrl, name)] = ginfo
                 ok = []
                 for x in grid:
                     g = dict(dflt, **{name: x})
                     done = True
                     for v in SPEEDS:
-                        row, log = checked(ctrl, g, v, mu_mid, sweep=(name, x, x == dflt[name]))
+                        row, log = checked(ctrl, g, v, mu_mid, sweep=(name, x, x == dflt[name], grid_label(x, dflt[name], ginfo['noi'])))
                         sweep_rows.append(dict(controller=ctrl, factor=name, value=x, is_default=x == dflt[name],
-                                               v=v, mu=mu_mid, **row))
+                                               luoi=grid_label(x, dflt[name], ginfo['noi']), v=v, mu=mu_mid,
+                                               **row))
                         if x == dflt[name]:
                             y3_ref[(ctrl, v)] = row['tv_duty']
                         if row['completed'] != 'true':          # sweep is public: its failed logs too (S3C-20)
@@ -970,9 +1040,12 @@ def main():
                     raise S03Stop(f'{ctrl} {name}: {exc}') from None
                 sc, centre = scale_of(L, H)
                 levels[ctrl][name] = (L, H, sc)
+                l_src, h_src = level_sources(grid, L, H, ginfo, name)          # S03 v8.3
                 level_rows.append(dict(controller=ctrl, factor=name, L=L, H=H, centre=centre, scale=sc,
                                        default=dflt[name], rule_note='longest completing run of the grid with the '
-                                       'default, gate speeds ' + ' '.join(map(str, gate))))
+                                       'default, gate speeds ' + ' '.join(map(str, gate)),
+                                       a=ginfo['a'], b=ginfo['b'], b_n='' if ginfo['b_n'] is None else ginfo['b_n'],
+                                       L_nguon=l_src, H_nguon=h_src))
                 print(f'[levels {ctrl}] {name}: L={L:.4g} H={H:.4g} scale={sc}', flush=True)
             same = [n for n, (L, H, _) in levels[ctrl].items() if L == H]
             if same:
@@ -981,9 +1054,9 @@ def main():
                 if mu == mu_mid:
                     continue
                 for v in SPEEDS:
-                    row, log = checked(ctrl, dflt, v, mu, sweep=('(default)', '', True))
+                    row, log = checked(ctrl, dflt, v, mu, sweep=('(default)', '', True, 'mac_dinh'))
                     sweep_rows.append(dict(controller=ctrl, factor='(default)', value='', is_default=True,
-                                           v=v, mu=mu, **row))
+                                           luoi='mac_dinh', v=v, mu=mu, **row))
                     if row['completed'] != 'true':                      # S3C-20
                         save_log(os.path.join(a.out, 'logs_sweep'), f'{ctrl}_default_mu{mu}_v{v}', log)
         t_sweep_end = time.time()
@@ -1204,7 +1277,7 @@ def main():
     for name, rows in (('sweep.csv', sweep_rows), ('sweep_counts.csv', sweep_counts(sweep_rows)),
                        ('levels.csv', level_rows), ('design.csv', design_rows)):
         p = os.path.join(a.out, name)
-        cols = None
+        cols = LEVEL_COLS if name == 'levels.csv' else None     # S83-1: the header even when S03 stops early
         if name == 'sweep.csv':     # S3G-2, S3G2-3: one fixed header (identifiers, run columns), other keys after
             cols = list(dict.fromkeys(list(SWEEP_ID_COLS) + RUN_COLS[5:] + [k for r in rows for k in r]))
         write_csv(p, rows, cols)
@@ -1233,7 +1306,7 @@ def main():
     tp_meta = tp_info if tp_info is not None else dict(file=_rel_here(a.test_points),
                                                          read='no (S03 stopped before the test file was read)')
     with open(os.path.join(a.out, 'meta.yaml'), 'w', encoding='utf-8') as f:
-        f.write(f"""spec: S03 v8.2 (06_SPECS/2026-11-05_Spec_S03_DOE_chon_gain.md)
+        f.write(f"""spec: S03 v8.3 (06_SPECS/2026-11-05_Spec_S03_DOE_chon_gain.md)
 date: {time.strftime('%Y-%m-%d')}
 setup: sim                     # fwsim: ESP32 firmware C code (DLL) + rpi5/plant_step.py, NOT hardware
 operator: Claude (phiên CODE)
@@ -1265,6 +1338,7 @@ temporary_bounds_for_the_grid: {json.dumps({m: tune_ga.BOUNDS[m] for m in a.cont
 thresholds: {json.dumps(dict(THRESH, tv_duty=f'{Y3_REL:.0%} of the default-gain run, middle mu, same speed'))}
 y3_reference: {json.dumps({f'{c} v={v}': y for (c, v), y in y3_ref.items()})}
 o1: {json.dumps(dict(A=o1.A, a_r=o1.A_R, D=o1.D, D_d=o1.D, t_d=o1.T_D, t_late=o1.T_LATE, delta=o1.DELTA, v_d=o1.V_D, c_cens=o1.C_CENS))}
+grid: {json.dumps({f'{c} {n}': {k: v_ for k, v_ in i.items() if k != 'noi'} for (c, n), i in grid_info.items()})}   # S03 v8.3 section 3.1: a, b, r, K, b_n (extension end; null for omega_o), points per gain
 gate: {json.dumps(gate_meta())}   # S03 v8.2 section 7: G1-G5 per run (o1_gate.gate), U = 0 on fwsim
 evaluator_sha256: {json.dumps(EVAL_SHA_AT_IMPORT)}   # S03 v8.2 section 8 condition 8: S03 and S04 on the same evaluator; the files as hashed when the script was imported (S3G-1, S3G2-1)
 sweep_run_error_reruns: {json.dumps([n for n in rerun_notes if n['point'] is None], default=str)}
@@ -1289,13 +1363,15 @@ interpretations:   # of this script, not written in S03 v8 / O1 v7; Liam or THES
   - "v8.2: every run (sweep, main design, axial, test set, determinism reruns) is scored by o1_gate_eval.evaluate_fig8, which calls evaluate_v7 unchanged (the S03 v8 columns keep their values), then o1_gate.gate with u_t = 0 (fwsim knows the command start; the 50 Hz hold is a property of the command path, not added to U, o1_gate docstring), U_p = U_psi = 0 (true plant pose) and every condition deciding (DECIDE_ALL)"
   - "v8.2: G1-G5 columns use the names of tools/rq3_log.py GATE_COLS (B81-3); gate_json_sha256, the _chung columns (one frame domain on fwsim: the common domain is the union) and the G1 fields t_done... (fwsim scorer, deferred: Liam 14/11 CODE_R134) are not written; gate_outcome is the O1 3.5 outcome over G1-G5; with U = 0, lo = hi = q"
   - "v8.2: a failure of the gate scoring (e.g. the rebuilt nearest distance of G4 not the row e_perp) is a run_error, so S03 stops (B8b-20) as for a DLL error"
+  - "v8.3: the sweep grid is the v8 grid (sweep_grid, unchanged; C12 keeps it for its box [a, b]) plus b r^k, k = 1..K, r = (b/a)^(1/10), K the smallest integer with r^K >= 10 (1 - 1e-9), found by a loop on r**k; omega_o is not extended (cap 48); the level rule runs on the extended grid"
+  - "v8.3 (agreed with CODE_C13 15/11): luoi of the default value is mac_dinh even when it is on a log point, the (default check) and (default) rows are mac_dinh; H_nguon of omega_o at the top of its grid is 'trần ω_o'; L_nguon 'hết lưới dưới' when L is the lowest grid point and L > 0"
   - "v8.2: the public sweep carries the G columns too (Liam 14/11 CODE_FEAS 'Co, mot cach cham'); G3-G5 are not responses of section 5"
 elapsed_s: {sweep_s}
 file_sha256: {json.dumps(files)}
 files:
-  - sweep.csv: "one line per sweep run (section 3.1) and default gains at the other mu levels"
+  - sweep.csv: "one line per sweep run (section 3.1) and default gains at the other mu levels; v8.3: luoi = log | mac_dinh | 0 | noi (the extension)"
   - sweep_counts.csv: "section 5.3 for the sweep: runs not completed, inconclusive, saturated per factor, speed, mu"
-  - levels.csv: "L, H, centre, scale per factor"
+  - levels.csv: "L, H, centre, scale per factor; v8.3: a, b (ends of the 11 log points), b_n (end of the extension, empty for omega_o), L_nguon, H_nguon (source of each level, S03 v8.3 section 3.1)"
   - design.csv: "371 rows per controller: centre, outer box, inner box, axial points, test points (all run, L41, L67)"
   - logs_sweep/: "npz of the sweep runs not completed"
   - sealed/: "SEALED (L56): runs.csv (section 4 responses; centre, outer, inner, axial), effects.csv (every term, per box, response, speed, mu / worst / range; outer and inner only), curvature.csv (5.4), y2_versions.csv (5.1), fail_counts.csv (5.3), determinism_check.csv (3.4), notes.json, stop.json, manifest.json, logs/"
