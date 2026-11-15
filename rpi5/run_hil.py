@@ -372,6 +372,9 @@ def _run_traj(spec, port: str, simulate: bool, shared_ref: mp.Array, uart_direct
     if getattr(spec, 'task', ''):
         import o1_tasks                    # C6: O1Spec -> o1_tasks setpoint (trajectory_pub unchanged)
         o1_tasks.install()
+    if getattr(spec, 'fault_task', ''):
+        import fault_tasks                 # L82: FaultTaskSpec (A-W1) -> fault_tasks setpoint
+        fault_tasks.install()
     pub = TrajectoryPublisher(spec=spec, port=port, simulate=simulate,
                               shared_ref=shared_ref, uart_direct=uart_direct, control=control)
     pub.run()
@@ -446,7 +449,8 @@ def _parse_args() -> argparse.Namespace:
                    help='Run duration [s] (0 = forever)')
     p.add_argument('--test',          default=None,
                    help='Spec S02 group A test ID (A-L1 ... A-K3): sets trajectory, speed, '
-                        'duration; A-K* also put the plant in wheels-lifted mode')
+                        'duration; A-K* also put the plant in wheels-lifted mode. A-W1 (fault_tasks.py, '
+                        'L82 type II: turn on the spot, wz 0/+1/-1/0 rad/s, 2 s each), as fwsim fault_run.py')
     p.add_argument('--o1',            default=None,
                    choices=['O1-F02', 'O1-F05', 'O1-F08', 'O1-K1', 'O1-K2'],
                    help='C6 (L76): O1 floor task from o1_tasks.py (figure 8 = the S03/S04 schedule of '
@@ -651,12 +655,17 @@ def main() -> int:
         traj_spec = lsched.trajectory_spec(load_rows)
         args.traj = traj_spec.kind
     if args.test:
-        if args.test not in GROUP_A:
-            raise SystemExit(f'--test must be one of {sorted(GROUP_A)}')
-        traj_spec = GROUP_A[args.test]
-        lifted = args.test in LIFTED_TESTS
+        import fault_tasks                 # L82 type II: A-W1 (trajectory_pub unchanged, S04 blob lock)
+        if args.test in fault_tasks.TASKS:
+            traj_spec = fault_tasks.make_spec(args.test)
+            log.info('Fault-run task %s (L82 type II): %s', args.test, traj_spec)
+        elif args.test not in GROUP_A:
+            raise SystemExit(f'--test must be one of {sorted(GROUP_A)} or {sorted(fault_tasks.TASKS)}')
+        else:
+            traj_spec = GROUP_A[args.test]
+            lifted = args.test in LIFTED_TESTS
+            log.info('Group A test %s: %s', args.test, traj_spec)
         args.traj = traj_spec.kind
-        log.info('Group A test %s: %s', args.test, traj_spec)
     if args.o1:
         if args.test or args.traj != 'idle' or args.duration or args.traj_loop:
             raise SystemExit('--o1 excludes --test, --traj, --duration, --traj-loop')
