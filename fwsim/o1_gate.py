@@ -226,7 +226,8 @@ def check_g1_fields(f: dict, state: str) -> None:
     def time(x, what, null_ok=True):
         if x is None and null_ok:
             return None
-        if not _finite(x) or float(x) < 0.0:
+        # G1F2-1: a number of type int / float (not bool, not a numeric string), as rq3_log._time
+        if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) or x < 0.0:
             raise ValueError(f'g1_fields {what} {x!r}: {"null or " if null_ok else ""}a finite time >= 0')
         return float(x)
     t_dl = time(f['t_deadline'], 't_deadline', null_ok=False)

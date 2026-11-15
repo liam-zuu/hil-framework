@@ -267,6 +267,9 @@ _OK = dict(t_done=[30.0], t_deadline=40.0, t1=None, prog_before_t1=None, cond25_
     ('true', dict(_OK, t_deadline=NAN), 'finite time'),
     ('true', dict(_OK, t_deadline=None), 'finite time'),
     ('true', dict(_OK, t_deadline=True), 'finite time'),
+    ('true', dict(_OK, t_done=['30.0']), 'finite time'),                        # G1F2-1: numeric strings
+    ('true', dict(_OK, t_deadline='40.0'), 'finite time'),
+    ('true', dict(_OK, t1='35.0', prog_before_t1=True, cond25_before_deadline=True), 'finite time'),
     ('true', dict(_OK, t1=INF, prog_before_t1=True, cond25_before_deadline=True), 'finite time'),
     ('true', dict(_OK, t1=35.0, prog_before_t1=1, cond25_before_deadline=True), 'boolean'),
     ('true', dict(_OK, cond25_before_deadline=True), 'without t1'),
