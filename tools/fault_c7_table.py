@@ -73,9 +73,9 @@ fault_check_<run>.json. The same columns as the fwsim table, from two clocks:
   * More columns: run_s (RUN length, lifecycle), tick_gaps (ticks of [0, duration) without an ESP32 row: 0, as
     a run with one is refused), ref_first_s (first change of the MOSI reference, Pi time), esp_sp_first_s
     (first change of sp_vx, sp_vy, sp_wz in the ESP32 rows, ESP32 time).
-  * Same run but for the schedule: session.json run args equal as (option, value) pairs without --faults /
-    --step-log, in any order, --opt=value read as --opt value (C7T1-10), an option given twice refused (C7T2-1:
-    argparse keeps the last), same ESP32 and H7 #fw, same manifest
+  * Same run but for the schedule: session.json run args equal as rpi5/run_hil.py's own parser reads them
+    (run_options: abbreviations, the last of a repeated option, --opt=value, any order; C7T1-10, C7T2-1,
+    C7T3-1), without --faults / --step-log, same ESP32 and H7 #fw, same manifest
     imu_source, imu_noise, plant_src, proto, same #gain line (without first_seq, line_drop, boot), else exit 2;
     a run that bench_summary.json does not call clean cannot be tabled either. A fault run is tabled only if
     tools/fault_check.check() passes again on this folder's frame log, the schedule its fault_check_<run>.json
@@ -281,45 +281,47 @@ ESP_COLS = ('timestamp_us', 'tick', 'log_seq', 'run_active', 'wz_src', 'slip_fla
 ESP_FLAGS = ('run_active', 'wz_src', 'slip_flag', 'ws_flag')          # 0 / 1
 ESP_COUNTERS = ('tick', 'log_seq', 'gyro_n')                          # whole numbers
 GAIN_SKIP = ('first_seq', 'line_drop', 'boot')                        # differ run to run, not the gains
-ARG_SKIP = ('--faults', '--step-log')                                 # the schedule and its own step log
 MAN_SAME = ('imu_source', 'imu_noise', 'plant_src', 'proto', 'frame_len', 'plant')
 
 
-def _arg_pairs(args):
-    """run_hil.py arguments of a session run as (option, value or None) pairs, --opt=value read as --opt value."""
-    toks = []
-    for t in args.split():
-        toks.extend(t.split('=', 1) if t.startswith('--') and '=' in t else [t])
-    pairs, i = [], 0
-    while i < len(toks):
-        t = toks[i]
-        if not t.startswith('--'):
-            raise TableError(f'run args {args!r}: {t!r} is not after an option')
-        has_val = i + 1 < len(toks) and not toks[i + 1].startswith('--')
-        pairs.append((t, toks[i + 1] if has_val else None))
-        i += 2 if has_val else 1
-    return pairs
+RUN_SKIP = ('faults', 'step_log')                                     # argparse dests of --faults, --step-log
+
+
+def run_options(args):
+    """C7T3-1: the options of a session run as rpi5/run_hil.py's own parser reads them (run_hil._parse_args with
+    sys.argv set for the call): abbreviations (argparse allow_abbrev, '--grou' = '--ground'), the last of a
+    repeated option, '--opt=value' and the order are what run_hil.py makes of them. A value equal to a default
+    and the default itself stay apart (None vs 'traction'): such a pair is refused, not matched. Args run_hil.py
+    refuses are TableError."""
+    import contextlib
+    import io
+    import shlex
+    import run_hil
+    old, err = sys.argv, io.StringIO()
+    sys.argv = ['run_hil.py'] + shlex.split(args)
+    try:
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            ns = run_hil._parse_args()
+    except SystemExit:
+        raise TableError(f'run args {args!r}: run_hil.py refuses them ({err.getvalue().strip()[-300:]})')
+    finally:
+        sys.argv = old
+    return vars(ns)
 
 
 def _run_args(args):
-    """C7T1-10: the (option, value) pairs of a session run without ARG_SKIP, sorted (order does not matter).
-    C7T2-1: an option given twice is refused (run_hil.py's argparse keeps the last value, so sorting would make
-    '--ground rigid --ground traction' and '--ground traction --ground rigid' look the same)."""
-    pairs = [(o, v or '') for o, v in _arg_pairs(args) if o not in ARG_SKIP]
-    opts = [o for o, _ in pairs]
-    rep = sorted({o for o in opts if opts.count(o) > 1})
-    if rep:
-        raise TableError(f'run args {args!r}: option repeated {rep}')
-    return sorted(pairs)
+    """C7T1-10, C7T2-1, C7T3-1: the effective run_hil.py options of a session run without RUN_SKIP (the schedule
+    and its step log), as sorted (dest, repr(value)) pairs."""
+    return sorted((k, repr(v)) for k, v in run_options(args).items() if k not in RUN_SKIP)
 
 
 def task_duration(args):
-    """(task id, duration [s]) of a bench run: the --test task of rpi5/fault_tasks.py + TAIL_S (the task then
-    STOPPING of --finite-run, as fault_run.py's task + TAIL_S; RUN itself runs a little longer, docstring)."""
-    tests = [v for o, v in _arg_pairs(args) if o == '--test']
-    if len(tests) != 1 or not tests[0]:
-        raise TableError(f'run args {args!r}: no single --test task')
-    task = tests[0]
+    """(task id, duration [s]) of a bench run: the --test task (as run_hil.py reads it) of rpi5/fault_tasks.py
+    + TAIL_S (the task then STOPPING of --finite-run, as fault_run.py's task + TAIL_S; RUN itself runs a little
+    longer, docstring)."""
+    task = run_options(args).get('test')
+    if not task:
+        raise TableError(f'run args {args!r}: no --test task')
     import fault_tasks
     if task not in fault_tasks.TASKS:
         raise TableError(f'--test {task}: not a fault task of rpi5/fault_tasks.py ({sorted(fault_tasks.TASKS)})')

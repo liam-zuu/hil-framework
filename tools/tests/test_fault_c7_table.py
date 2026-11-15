@@ -243,9 +243,16 @@ def write_bench(d, kind=None):
         args = ARGS + (' --faults ~/fault_c7/enc_FL.csv' if fault else '') + f' --step-log ~/{name}_steps.csv'
         if fault and kind == 'args':
             args = args.replace('--seed 0', '--seed 1')
+        if fault and kind == 'args_bad':
+            args += ' --ground mud'
         if kind == 'args_repeat':                              # C7T2-1: argparse keeps the last --ground
             args = args.replace('--ground traction', '--ground traction --ground rigid' if fault else
                                 '--ground rigid --ground traction')
+        if kind == 'args_abbrev':                              # C7T3-1: --grou is --ground for argparse
+            args = args.replace('--ground traction', '--grou traction --ground rigid' if fault else
+                                '--ground rigid --grou traction')
+        if fault and kind == 'args_same_abbrev':               # same effective options, abbreviated
+            args = args.replace('--ground traction', '--grou=traction').replace('--imu-noise', '--imu-n')
         if fault and kind == 'args_order':                     # same pairs, another order and --opt=value
             args = '--seed 0 --ground=traction --imu-noise 20 --test=A-W1 --faults ~/x.csv --step-log=~/s.csv'
         fw = dict(FW)
@@ -414,7 +421,9 @@ def test_bench_columns_extend_the_fwsim_ones(tmp_path, fake_check):
     ('seq_gap', 'log_seq gap'),
     ('half_tick', 'gyro_n not a whole number'),
     ('gyro_back', 'gyro_n decreases'),
-    ('args_repeat', 'option repeated'),
+    ('args_repeat', 'run args'),
+    ('args_abbrev', 'run args'),
+    ('args_bad', 'run_hil.py refuses'),
     ('frame_no', 'frame_no is not step_first'),
     ('run_id0', 'run_id 0'),
     ('dtype', 'uint8'),
@@ -431,18 +440,35 @@ def test_bench_folders_that_cannot_be_tabled(tmp_path, fake_check, kind, msg):
 
 
 def test_run_args_without_the_schedule():
+    """C7T1-10, C7T2-1, C7T3-1: run args compared as run_hil.py's parser reads them."""
     a = '--test A-W1 --seed 0 --faults ~/x.csv --step-log ~/s.csv --ground traction'
-    assert ct._run_args(a) == [('--ground', 'traction'), ('--seed', '0'), ('--test', 'A-W1')]
-    assert ct._run_args('--test A-W1 --faults=~/x.csv') == [('--test', 'A-W1')]
-    assert ct._run_args('--seed 0 --test=A-W1 --finite-run') == ct._run_args('--finite-run --test A-W1 --seed 0')
-    assert ct.task_duration(a) == ('A-W1', 9.0) == ct.task_duration('--seed 0 --test=A-W1')
+    same = ct._run_args('--ground traction --seed 0 --test A-W1')
+    assert ct._run_args(a) == same                                              # order, schedule dropped
+    assert ct._run_args('--test=A-W1 --seed=0 --ground=traction') == same       # --opt=value
+    assert ct._run_args('--test A-W1 --seed 0 --grou traction') == same         # abbreviation
+    assert ct._run_args('--test A-W1 --fault y.csv --seed 0 --ground traction') == same   # --faults abbreviated
+    assert ct._run_args('--test A-W1 --ground rigid --ground traction') != \
+        ct._run_args('--test A-W1 --ground traction --ground rigid')            # C7T2-1: the last wins
+    assert ct._run_args('--test A-W1 --ground rigid --grou traction') != \
+        ct._run_args('--test A-W1 --grou traction --ground rigid')              # C7T3-1
+    assert ct._run_args('--test A-W1 --ground traction') != ct._run_args('--test A-W1')   # default None apart
+    with pytest.raises(ct.TableError, match='run_hil.py refuses'):
+        ct._run_args('--test A-W1 --ground mud')
+    with pytest.raises(ct.TableError, match='run_hil.py refuses'):
+        ct._run_args('--test A-W1 --no-such-option 1')
+    assert ct.task_duration(a) == ('A-W1', 9.0) == ct.task_duration('--seed 0 --tes=A-W1')
     with pytest.raises(ct.TableError, match='not a fault task'):
         ct.task_duration('--test A-K1')
-    with pytest.raises(ct.TableError, match='no single --test'):
-        ct.task_duration('--test A-W1 --test A-W1')
-    with pytest.raises(ct.TableError, match=r"option repeated \['--ground'\]"):       # C7T2-1
-        ct._run_args('--test A-W1 --ground rigid --ground traction')
-    assert ct._run_args('--test A-W1 --faults a.csv --faults b.csv') == [('--test', 'A-W1')]   # ARG_SKIP only
+    with pytest.raises(ct.TableError, match='not a fault task'):
+        ct.task_duration('--test A-W1 --test A-K1')                            # the last wins
+    with pytest.raises(ct.TableError, match='no --test'):
+        ct.task_duration('--seed 0')
+
+
+def test_bench_same_options_abbreviated(tmp_path, fake_check):
+    """C7T3-1: the fault run written with abbreviations and --opt=value, same effective options: tabled."""
+    write_bench(str(tmp_path), 'args_same_abbrev')
+    assert len(ct.table(str(tmp_path))) == 1
 
 
 def test_thesis_path(tmp_path):
