@@ -1089,16 +1089,47 @@ def test_scorer_cli_esp_log_errors(tmp_path):
     assert M.main(['--frame-log', p, '--esp-log', c]) == 2
 
 
-def test_fw_counts_at_tick_keep_the_count_read_path():
-    """Every firmware of FW_COUNTS_AT_TICK has src/main.c and src/encoder/ of FW_COUNTS_BASE (where L98 put the
-    count read at t_now), checked in the AGV repo when it is there (AGV_REPO, default the thesis checkout)."""
+# full AGV SHAs of FW_COUNTS_AT_TICK (the #fw line prints 12 characters; the repo check needs the commit itself)
+AGV_FULL_SHA = {'16702ff0e688': '16702ff0e6884d776c3fcc4d563d5ab8bd6d084e',
+                '5bde4c55bf3a': '5bde4c55bf3a645bad3ad84b90aca5d872204b64'}
+AGV_DEFAULT = r'D:/CLAUDE_THESIS/03_CODE/AGV_FIRMWARE'
+
+
+def test_fw_check_lists_and_refusals():
+    """fw_check alone (no gcc, no oracle; Codex MAP5-R1-1 answer 3): both listed firmware accepted, alone or
+    together; anything else, dirty, no #fw or no events file refused."""
+    assert M.fw_check([dict(sha='5bde4c55bf3a', dirty='0', env='ladrc')]) == ''
+    assert M.fw_check([dict(sha='16702ff0e688', dirty='0'), dict(sha='5bde4c55bf3a', dirty='0')]) == ''
+    for fw, word in (([dict(sha='5bde4c55bf3a', dirty='1')], 'dirty=1'), ([dict(sha='5bde4c5', dirty='0')], '5bde4c5'),
+                     ([dict(sha='2c026415dfc6', dirty='0')], '2c026415dfc6'),
+                     ([dict(sha='5bde4c55bf3a', dirty='0'), dict(sha='cfc892b0ba28', dirty='0')], 'cfc892b0ba28'),
+                     ([], 'no #fw'), (None, 'no events file')):
+        assert word in M.fw_check(fw), fw
+    assert set(AGV_FULL_SHA) == {s[:12] for s in M.FW_COUNTS_AT_TICK} and M.FW_COUNTS_BASE in AGV_FULL_SHA
+
+
+def _git(agv, *args):
     import subprocess
-    agv = os.environ.get('AGV_REPO', r'D:/CLAUDE_THESIS/03_CODE/AGV_FIRMWARE')
-    if not os.path.isdir(os.path.join(agv, '.git')):
-        pytest.skip('AGV repo not here')
-    for sha in M.FW_COUNTS_AT_TICK:
-        r = subprocess.run(['git', '-C', agv, 'diff', '--quiet', M.FW_COUNTS_BASE[:7], sha[:7], '--',
-                            'src/main.c', 'src/encoder'], capture_output=True)
-        if r.returncode not in (0, 1):
-            pytest.skip(f'AGV commit {sha[:7]} or {M.FW_COUNTS_BASE[:7]} not in {agv}')
-        assert r.returncode == 0, f'{sha}: src/main.c or src/encoder differ from {M.FW_COUNTS_BASE}'
+    r = subprocess.run(['git', '-C', agv, *args], capture_output=True, text=True)
+    assert r.returncode == 0, f'git {" ".join(args)} in {agv}: code {r.returncode}: {r.stderr.strip()}'
+    return r.stdout.strip()
+
+
+def test_fw_counts_at_tick_keep_the_count_read_path():
+    """Every firmware of FW_COUNTS_AT_TICK has the src/main.c blob and the src/encoder tree of FW_COUNTS_BASE (where
+    L98 put the count read at t_now), in the AGV repo. Skipped only when AGV_REPO is not set and the default
+    checkout is not a git repo; otherwise any git failure (missing commit, wrong AGV_REPO) fails (Codex MAP5-R1-1)."""
+    import subprocess
+    agv = os.environ.get('AGV_REPO')
+    if agv is None:
+        agv = AGV_DEFAULT
+        r = subprocess.run(['git', '-C', agv, 'rev-parse', '--git-dir'], capture_output=True, text=True)
+        if r.returncode != 0:
+            pytest.skip(f'no AGV repo at {agv} (set AGV_REPO to check)')
+    ids = {}
+    for short, full in AGV_FULL_SHA.items():
+        assert _git(agv, 'rev-parse', '--verify', f'{full}^{{commit}}') == full
+        ids[short] = (_git(agv, 'rev-parse', '--verify', f'{full}:src/main.c'),
+                      _git(agv, 'rev-parse', '--verify', f'{full}:src/encoder'))
+    for short in AGV_FULL_SHA:
+        assert ids[short] == ids[M.FW_COUNTS_BASE], f'{short}: src/main.c or src/encoder differ from {M.FW_COUNTS_BASE}'
