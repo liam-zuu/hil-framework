@@ -545,8 +545,9 @@ def test_cu4_r3_settle_flag(tmp_path):
 def test_cu3_1_long_gap_with_off_nominal_period():
     I = np.r_[np.arange(0, 100), np.arange(200, 300)]
     r = 10.0 + 0.0508 * I
-    n, a, b, j, inl = U._grid(r, 0.05, 0.005)
-    assert inl.all() and n[100] - n[99] == 101 and b == pytest.approx(0.0508)
+    n, t_fit, b, j, inl = U._grid(r, 0.05, 0.005)
+    # CU6: a gap above SPLIT_S carries no index, only 'reports missing' (step >= 2); every report on its grid
+    assert inl.all() and n[100] - n[99] >= 2 and np.all(np.abs(t_fit - r) < 1e-6) and b == pytest.approx(0.0508)
 
 
 def test_cu12_r3_common_set_smaller_than_some_set(tmp_path):
@@ -566,8 +567,8 @@ def test_cu12_r3_common_set_smaller_than_some_set(tmp_path):
 def test_cu4_1_jitter_and_long_gap():
     I = np.r_[np.arange(0, 100), np.arange(200, 300)]
     r = 10.0 + 0.050 * I + 0.0008 * (I % 3)
-    n, a, b, j, inl = U._grid(r, 0.05, 0.005)
-    assert inl.all() and n[100] - n[99] == 101
+    n, t_fit, b, j, inl = U._grid(r, 0.05, 0.005)
+    assert inl.all() and n[100] - n[99] >= 2 and np.all(np.abs(t_fit - r) < 0.005)     # CU6: no index across 5 s
 
 
 def test_cu4_2_gyro_gap_outside_the_window_ignored():
@@ -580,8 +581,37 @@ def test_cu4_2_gyro_gap_outside_the_window_ignored():
 def test_cu5_1_short_runs_off_nominal_period():
     I = np.r_[np.arange(0, 10), np.arange(100, 110), np.arange(200, 210)]
     r = 10.0 + 0.0508 * I
-    n, a, b, j, inl = U._grid(r, 0.05, 0.005)
-    assert inl.all() and list(np.diff(n)[[9, 19]]) == [91, 91]
+    n, t_fit, b, j, inl = U._grid(r, 0.05, 0.005)
+    assert inl.all() and np.all(np.diff(n)[[9, 19]] >= 2) and np.all(np.abs(t_fit - r) < 1e-6)     # CU6
+
+
+# ── Codex round 6 (Liam 15/11 "Tach doan + vong 7") ───────────────────────────────────────────
+
+@pytest.mark.parametrize('starts,L', [([0, 10000, 30000, 45000], 24), ([0, 17000, 36000, 65000], 46),
+                                      ([0, 6005, 29019, 43408], 31)])
+def test_cu6_long_gaps_split_into_segments(starts, L):
+    I = np.concatenate([np.arange(s, s + L) for s in starts])
+    r = 10.0 + 0.050805 * I
+    n, t_fit, b, j, inl = U._grid(r, 0.05, 0.005)
+    assert inl.all() and np.all(np.abs(t_fit - r) < 1e-6) and np.all(np.diff(n) >= 1)
+    assert b == pytest.approx(0.050805, rel=1e-6)
+
+
+def test_cu6_short_segment_kept_off_grid():
+    I = np.r_[np.arange(0, 60), np.arange(100, 103), np.arange(200, 260)]
+    r = 10.0 + 0.05 * I
+    n, t_fit, b, j, inl = U._grid(r, 0.05, 0.005)
+    assert inl.sum() == 120 and not inl[60:63].any() and np.all(np.isnan(j[60:63]))
+    assert np.all(np.diff(n) >= 1) and n[60] - n[59] >= 2 and n[63] - n[62] >= 2
+
+
+def test_cu6_split_gap_is_a_missing_report_for_turn_totals(tmp_path):
+    """A 2 s IMU gap (gyro present): the grid is split there and the gap still counts as missing reports."""
+    p = str(tmp_path / 'a.csv')
+    make_log(p, lambda t: 1.0 if 12.0 <= t < 13.0 else 0.0, 16.0, miss=set(range(30, 70)), gyro_miss=set())
+    S = U.rv_samples(U.load_log(p), period_s=T0)
+    P, N = U.turn_totals(S, 11.0, 15.0)
+    assert P >= 1.0 and np.all(np.diff(S['n_all']) >= 1)
 
 
 # ── scale (thang) ─────────────────────────────────────────────────────────────────────

@@ -15,10 +15,12 @@ CODE_CAM adds omega_max * dt_sync (C7b) and writes U_IMU into the C8 gate file.
 IMU yaw used here and by the camera scorer (rv_samples, interp_yaw): the game rotation vector reports of the
 ESP32 log (rv_n changes; for each report the first row with a finite age >= 0); the firmware time of a report
 is the ESP32 RECEIVE time (AGV 5bde4c5 src/imu/imu.cpp 149, 187; imu_fusion.c 226-228; timestamp_us = now_us,
-main.c 254, 608). The sensor samples on an even grid of period T0 (50 ms locked, the fit must stay within
-+-2 %), so the receive times are put on that grid (index from the last trusted report, line fit r = a + b n on
-the inliers); a report more than j_lim off the grid keeps its yaw (turn totals) but not its time. Sample time =
-a + b n - tau_hat (the yaw at frame time t is read from this shifted series). Unwrapping: steps between two
+main.c 254, 608). The sensor samples on an even grid of period T0 (50 ms, the fitted period must stay within
++-2 %), so the receive times are put on that grid: the log is cut at gaps above SPLIT_S (1 s), each segment of
+at least MIN_SEG reports gets its own index (period searched in +-2 %, chosen by the final fit) and line fit
+r = a_s + b_s n (CU5-1, CU6); a report more than j_lim off its grid, or in a segment too short to fit, keeps its
+yaw (turn totals) but not its time. Sample time = a_s + b_s n - tau_hat (the yaw at frame time t is read from
+this shifted series). Unwrapping: steps between two
 reports at most h_lim apart unwrap normally; across a longer gap the branch is chosen by the integral of gz
 over the gap (gyro reports at most h_lim apart there), else (or more than pi/2 away) the yaw after the gap is
 not usable: interp_yaw gives NaN from there. Each step divided by (1 + s_plus) when positive, by (1 + s_minus)
@@ -76,6 +78,8 @@ H_LIM_S = 0.105            # Liam 15/11 "Doi sang 105 ms"
 LE = 0.25                  # Liam 15/11 "+25 %"
 MIN_STILL_S = 3.0          # design 2.1 / 9: >= 3 s still, on the gyro report times (CU-16)
 MAX_LATE = 0.2             # CU-1: at most 20 % of the reports off the grid
+SPLIT_S = 1.0              # CU6: no grid index across a gap of more than 1 s (20 reports)
+MIN_SEG = 5                # CU6: a segment needs at least 5 reports for its own grid
 END_STILL_S = 3.0          # kiem closure: still frames in [t_off + tail, t_off + tail + 3 s] (CU-14)
 T_CMD_TOL_S = 0.1          # CU-8: run_active at least T_cmd - 0.1 s
 FORBIDDEN = {'sealed', 'sealed_test', 'o1_feas'}
@@ -202,42 +206,77 @@ def _index(r, b):
     return n
 
 
-def _grid(r, period_s, j_lim):
-    """Index n of each receive time on the report grid (period searched within +-2 % of T0, see below), line
-    fit r = a + b n on the inliers, residual j. The fitted period must stay within +-2 % and at most MAX_LATE of
-    the reports may be off the grid (CU-1)."""
-    # CU5-1: the indexing period is the candidate in +-PERIOD_TOL of T0 (step 0.01 ms) whose grid leaves the fewest
-    # reports more than j_lim off a line fit (ties: smallest RMS of the others). No median, no run length, so
-    # jitter (CU4-1), short runs (CU5-1), off-nominal periods (CU3-1) and late reports (CU2-3) all index right.
-    best = None
-    for b_try in np.arange(period_s * (1 - PERIOD_TOL), period_s * (1 + PERIOD_TOL) + 5e-6, 1e-5):
-        n_try = _index(r, b_try)
-        bb, aa = np.polyfit(n_try, r, 1)
-        jj = r - (aa + bb * n_try)
-        ok = np.abs(jj) <= j_lim
-        if ok.sum() >= 2:
-            bb, aa = np.polyfit(n_try[ok], r[ok], 1)
-            jj = r - (aa + bb * n_try)
-            ok = np.abs(jj) <= j_lim
-        key = (int((~ok).sum()), float(np.sqrt(np.mean(jj[ok] ** 2))) if ok.any() else math.inf)
-        if best is None or key < best[0]:
-            best = (key, n_try)
-    n = best[1]
+def _fit(r, n, j_lim):
+    """Iterative line fit r = a + b n on the reports within j_lim (as before CU6): a, b, residual j, inliers."""
     inl = np.ones(len(r), dtype=bool)
+    a = b = float('nan')
+    j = np.full(len(r), np.nan)
     for _ in range(10):
         if inl.sum() < 2:
-            raise InputError('fewer than two IMU reports on the grid (CU-1)')
+            return a, b, j, np.zeros(len(r), dtype=bool)
         b, a = np.polyfit(n[inl], r[inl], 1)
         j = r - (a + b * n)
         new = np.abs(j) <= j_lim
         if np.array_equal(new, inl):
             break
         inl = new
-    if not (abs(b / period_s - 1.0) <= PERIOD_TOL):
-        raise InputError(f'fitted report period {b * 1e3:.2f} ms outside {period_s * 1e3:.0f} ms +-{PERIOD_TOL:.0%} (CU-1)')
+    return a, b, j, inl
+
+
+def _grid_segment(r, period_s, j_lim):
+    """One segment (no gap above SPLIT_S): try every indexing period in +-PERIOD_TOL of T0 (step 0.01 ms, CU5-1)
+    and keep the one whose FINAL fit (CU6-2) has its period inside +-PERIOD_TOL (CU6-3), then the fewest reports
+    off the grid, then the smallest RMS of the others."""
+    best = None
+    for b_try in np.arange(period_s * (1 - PERIOD_TOL), period_s * (1 + PERIOD_TOL) + 5e-6, 1e-5):
+        n_try = _index(r, b_try)
+        a, b, j, inl = _fit(r, n_try, j_lim)
+        bad_period = not (abs(b / period_s - 1.0) <= PERIOD_TOL)
+        rms = float(np.sqrt(np.mean(j[inl] ** 2))) if inl.any() else math.inf
+        key = (bad_period, int((~inl).sum()), rms)
+        if best is None or key < best[0]:
+            best = (key, n_try, a, b, j, inl)
+    return best[1:]
+
+
+def _grid(r, period_s, j_lim):
+    """Sample times of the reports from their receive times. CU6: the log is cut into segments at gaps above
+    SPLIT_S (no grid index is carried across such a gap: with the period known only to +-PERIOD_TOL the index step
+    over a long gap is not determined); each segment of at least MIN_SEG reports gets its own grid and line fit
+    (_grid_segment); a shorter segment has no fit, its reports are off the grid (kept only for turn totals).
+    Returns n (index, increasing, a step > 1 marks missing reports; across a segment cut at least 2), t_fit
+    (a_s + b_s n_s, or the receive time when not fitted), b (period of the longest fitted segment), j (residual,
+    NaN when not fitted), inl. Each fitted period must stay within +-PERIOD_TOL and at most MAX_LATE of all reports
+    may be off the grid (CU-1)."""
+    cuts = np.nonzero(np.diff(r) > SPLIT_S)[0] + 1
+    bounds = np.r_[0, cuts, len(r)]
+    n = np.zeros(len(r), dtype=int)
+    t_fit = r.astype(float).copy()
+    j = np.full(len(r), np.nan)
+    inl = np.zeros(len(r), dtype=bool)
+    b_main, longest, offset = None, 0, 0
+    for s0, s1 in zip(bounds[:-1], bounds[1:]):
+        rs = r[s0:s1]
+        if len(rs) >= MIN_SEG:
+            ns, a, b, js, ok = _grid_segment(rs, period_s, j_lim)
+            if not (abs(b / period_s - 1.0) <= PERIOD_TOL):
+                raise InputError(f'fitted report period {b * 1e3:.2f} ms outside {period_s * 1e3:.0f} ms '
+                                 f'+-{PERIOD_TOL:.0%} (CU-1)')
+            t_fit[s0:s1] = a + b * ns
+            j[s0:s1] = js
+            inl[s0:s1] = ok
+            if len(rs) > longest:
+                b_main, longest = b, len(rs)
+        else:
+            ns = np.arange(len(rs))
+        n[s0:s1] = offset + ns
+        if s1 < len(r):
+            offset = n[s1 - 1] + max(2, int(round((r[s1] - r[s1 - 1]) / period_s)))
+    if b_main is None:
+        raise InputError(f'no run of at least {MIN_SEG} IMU reports without a gap above {SPLIT_S:.1f} s (CU-1)')
     if (~inl).sum() > MAX_LATE * len(r):
         raise InputError(f'{(~inl).sum()} of {len(r)} reports more than {j_lim * 1e3:.0f} ms off the grid (CU-1)')
-    return n, a, b, j, inl
+    return n, t_fit, float(b_main), j, inl
 
 
 def gyro_samples(L):
@@ -284,10 +323,10 @@ def rv_samples(L, period_s=PERIOD_S, tau_hat=0.0, s_plus=0.0, s_minus=0.0, j_lim
     y = L['yaw_rad'][idx]
     if not np.all(np.isfinite(y)):
         raise InputError(f'{L.get("path")}: yaw_rad not finite')
-    n, a, b, j, keep = _grid(r, period_s, j_lim)
+    n, t_fit, b, j, keep = _grid(r, period_s, j_lim)
     valid = (L['r_valid'][idx] == 1) if 'r_valid' in L else np.ones(len(idx), dtype=bool)
     keep = keep & valid                                    # CU-4: firmware settle / age flag
-    t_all = a + b * n - tau_hat
+    t_all = t_fit - tau_hat
     tg, gz = gyro_samples(L) if np.any(L['gyro_n'] > 0) else (np.array([]), np.array([]))
     d0 = (np.diff(y) + math.pi) % (2 * math.pi) - math.pi
     d = d0.copy()
