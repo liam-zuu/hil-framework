@@ -542,8 +542,11 @@ def test_K1_read_sender_bao(tmp_path):
     assert cp.read_sender(str(old), 'O1-F05') is None
     assert cp.read_sender_bao(str(old), 'O1-F05') == Decimal('13.845')
     no_start = tmp_path / 'ns.txt'
-    no_start.write_text('#test_end,test=O1-F05,t_epoch=5.0,complete=1\n', encoding='utf-8')
+    no_start.write_text('#test_end,test=O1-F05,t_epoch=5.000,complete=1\n', encoding='utf-8')
     assert cp.read_sender_bao(str(no_start), 'O1-F05') is None
+    no_start.write_text('#test_end,test=O1-F05,t_epoch=5.0,complete=1\n', encoding='utf-8')   # since round 9:
+    with pytest.raises(ValueError):                                                        # checked (CP9-3)
+        cp.read_sender_bao(str(no_start), 'O1-F05')
     two = tmp_path / 'two.txt'
     two.write_text('#test_start,test=O1-F05,t_epoch=1.0\n#test_end,test=O1-F05,t_epoch=15.0\n'
                    '#test_end,test=O1-F05,t_epoch=16.0\n', encoding='utf-8')
@@ -791,3 +794,62 @@ def test_CP8_epoch_outside_the_sender_format_is_exit_2(tmp_path, capsys):
         assert capsys.readouterr().out.rstrip().endswith('#ket_qua,ma=2'), name
     ok = _sender(tmp_path / 'ok.txt', '1794322935.904', '1794322949.544')     # real epoch size, 13.640 s
     assert cp.read_sender_bao(ok, 'O1-F05') == Decimal('13.640')
+
+
+
+# ---------------------------------------------------------------- Codex Sol round 9 (CP9-1, CP9-2, CP9-3)
+def _exit_2(f, p, capsys, name):
+    with pytest.raises(ValueError):
+        cp.read_sender_bao(f, 'O1-F05')
+    assert cp.main(['--log', p, '--task', 'O1-F05', '--sender', f]) == 2, name
+    assert capsys.readouterr().out.rstrip().endswith('#ket_qua,ma=2'), name
+
+
+def test_CP9_1_integer_part_exactly_as_the_sender_writes_it(tmp_path, capsys):
+    p = write(tmp_path, make_log())
+    for name, e0, e1 in (('pad', '01794322935.904', '01794322949.544'), ('pad0', '00.000', '13.640'),
+                         ('arabic', '١٠٠٠.000', '1013.640'),     # Unicode digits, not [0-9]
+                         ('fw_digit', '1000.000', '1013.64０'),                 # full-width zero
+                         ('d13', '1000000000000.000', '1000000000013.640')):       # 13 integer digits
+        _exit_2(_sender(tmp_path / f'{name}.txt', e0, e1), p, capsys, name)
+    for name, e0, e1, span in (('zero', '0.000', '13.640', '13.640'),
+                               ('d12', '100000000000.000', '100000000013.640', '13.640'),
+                               ('d12max', '999999999986.359', '999999999999.999', '13.640'),
+                               ('d11', '10000000000.000', '10000000013.640', '13.640')):
+        assert cp.read_sender_bao(_sender(tmp_path / f'{name}.txt', e0, e1), 'O1-F05') == Decimal(span), name
+
+
+def test_CP9_2_blank_after_the_epoch_is_not_cut(tmp_path, capsys):
+    p = write(tmp_path, make_log())
+    for name, text in (
+            ('end_space', '#test_start,test=O1-F05,t_epoch=1794322935.904 \n'          # last field of the line
+                          '#test_end,test=O1-F05,t_epoch=1794322949.544,complete=1\n'),
+            ('end_tab', '#test_start,test=O1-F05,t_epoch=1794322935.904\t\r\n'
+                        '#test_end,test=O1-F05,t_epoch=1794322949.544,complete=1\n'),
+            ('mid_space', '#test_start,test=O1-F05,t_epoch=1794322935.904\n'           # before the next comma
+                          '#test_end,test=O1-F05,t_epoch=1794322949.544 ,complete=1\n')):
+        f = tmp_path / f'{name}.txt'
+        f.write_bytes(text.encode('utf-8'))
+        _exit_2(str(f), p, capsys, name)
+    crlf = tmp_path / 'crlf.txt'                                   # a CRLF line end alone is not a blank
+    crlf.write_bytes(b'#test_start,test=O1-F05,t_epoch=1794322935.904\r\n'
+                     b'#test_end,test=O1-F05,t_epoch=1794322949.544,complete=1\r\n')
+    assert cp.read_sender_bao(str(crlf), 'O1-F05') == Decimal('13.640')
+
+
+def test_CP9_3_epoch_checked_when_the_other_line_is_missing(tmp_path, capsys):
+    p = write(tmp_path, make_log())
+    for name, text in (('end_only', '#test_end,test=O1-F05,t_epoch=abc,complete=1,sched_first_s=0.000000,'
+                                    'sched_last_s=13.640000\n'),
+                       ('start_only', '#test_start,test=O1-F05,t_epoch=1e309\n'),
+                       ('empty', '#test_start,test=O1-F05,t_epoch=\n'
+                                 '#test_end,test=O1-F05,t_epoch=1794322949.544,complete=1\n')):
+        f = tmp_path / f'{name}.txt'
+        f.write_text(text, encoding='utf-8')
+        _exit_2(str(f), p, capsys, name)
+    for name, text in (('end_ok', '#test_end,test=O1-F05,t_epoch=1794322949.544,complete=1\n'),
+                       ('no_field', '#test_start,test=O1-F05\n'
+                                    '#test_end,test=O1-F05,t_epoch=1794322949.544,complete=1\n')):
+        f = tmp_path / f'{name}.txt'
+        f.write_text(text, encoding='utf-8')
+        assert cp.read_sender_bao(str(f), 'O1-F05') is None, name

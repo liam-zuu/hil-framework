@@ -92,6 +92,9 @@ Round 7 (15/11; Liam 15/11 CODE_CAM "Chay vong 7"): the span kept as an exact De
 without rounding (CP7-1); a t_epoch that is not a finite number is a ValueError, exit 2 (CP7-2).
 Round 8 (15/11; Liam 15/11 CODE_CAM "Chay vong 8"): t_epoch must be the sender format digits.ddd (at most
 12 integer digits), anything else is exit 2, so the Decimal span is exact and finite (CP8-1, CP8-2).
+Round 9 (15/11; Liam 15/11 CODE_CAM "Sua 3 muc + vong 10"): no leading zero in the integer part (CP9-1);
+the sender log keeps the field text as written, only the line end is removed before the format check
+(CP9-2); every t_epoch present is checked before a missing line gives None (CP9-3).
 B8-1c (CODE 15/11, O1 v11.23 3.5; Liam 15/11 CODE_CAM "Lam B8-1c roi vong 4 gop (Recommended)"): window end
 from the real send times (--sender, B81c-1); a pair whose tick or timestamp_us does not increase is no
 evidence for (2), (4) (B81c-7).
@@ -130,7 +133,7 @@ T_SEND = 1.0 / SEND_HZ
 E_MAX = 2002e-6               # S05 4.7 (i): (1 + rho)/(1 - rho) - 1, rho = 1e-3
 TRAJ_TIMEOUT_MS = 200         # main.c 5bde4c5 line 45
 EDGE_AGE_MS = 30              # [DE XUAT] edge line packet age: about one tick + transfer
-EPOCH_RE = re.compile(r'[0-9]{1,12}\.[0-9]{3}')   # sender t_epoch format (.3f), see read_sender_bao
+EPOCH_RE = re.compile(r'(?:0|[1-9][0-9]{0,11})\.[0-9]{3}')   # sender t_epoch (.3f), see read_sender_bao
 COORD_MAX_M = 8.0             # O1 3.5: rounding term valid for |x_ref|, |y_ref| < 8 m
 COORD_DOUBLE_M = 4.0          # from 4 m the float32 term doubles (O1 3.5, B81-18)
 R_LOG_M = 1e-4                # 0.1 mm: log 4 decimals per coordinate (logger.c 223, 249-250)
@@ -190,19 +193,20 @@ def read_log(path):
     return out, events, dup, 'traj_age_ms' in cols
 
 
-def read_events(path):
+def read_events(path, keep_tail=False):
     """'#' lines of <log>.events.txt. agv_logger.py writes each as '<PC time ISO> <payload>' (lines 880,
     894); the time prefix is dropped so identical copies of one event compare equal. A bare '#' line
-    is kept as it is."""
+    is kept as it is. keep_tail: only the line end (CR, LF) is removed at the right, so a blank after
+    the last field stays in that field (sender t_epoch format check, CP9-2)."""
     if not path or not os.path.exists(path):
         return []
     out = []
     with open(path, encoding='utf-8') as f:
         for ln in f:
-            ln = ln.strip()
+            ln = ln.rstrip('\r\n').lstrip() if keep_tail else ln.strip()
             if not ln.startswith('#'):
                 parts = ln.split(' ', 1)
-                ln = parts[1].strip() if len(parts) == 2 else ''
+                ln = (parts[1].lstrip() if keep_tail else parts[1].strip()) if len(parts) == 2 else ''
             if ln.startswith('#'):
                 out.append(ln)
     return out
@@ -374,25 +378,29 @@ def read_sender_bao(path, task_id):
     """t_epoch(#test_end) - t_epoch(#test_start) of task_id in the sender log [s], or None (K-1, O1 v11.24
     3.5: the enclosing window ends at '#test_end' when the log has no send time of the last schedule
     packet; pc_sender test_loop prints '#test_start' before packet 0 and '#test_end' after the zero tail).
-    Two different lines of either kind: error."""
+    Two different lines of either kind: error. Every t_epoch present is checked first, also when the
+    other line is missing (CP9-3); a line without a t_epoch field gives None."""
     if not path or not os.path.exists(path):
         return None
-    ev = read_events(path)
+    ev = read_events(path, keep_tail=True)               # field text as written (CP9-2)
     got = {}
     for kind in ('#test_start,', '#test_end,'):
         ls = list(dict.fromkeys(e for e in ev if e.startswith(kind) and _kv(e).get('test') == task_id))
         if len(ls) > 1:
             raise ValueError(f'{path}: {len(ls)} different {kind[:-1]} lines of {task_id}')
-        if not ls or _kv(ls[0]).get('t_epoch', '') == '':
-            return None
+        if not ls or 't_epoch' not in _kv(ls[0]):
+            continue                                     # missing: no evidence, None below
         txt = _kv(ls[0])['t_epoch']
         # only the sender's own format, f'{epoch:.3f}' (pc_sender.py 20f1f81 117, 144): digits, a point,
-        # exactly 3 decimals, at most 12 integer digits. Anything else (sign, exponent, more decimals,
-        # NaN, text) is an error, exit 2 (CP7-2, CP8-1, CP8-2): so the Decimal arithmetic below has at most
-        # 15 significant digits, is exact in the default context and never leaves the float range
+        # exactly 3 decimals, at most 12 integer digits, no leading zero (CP9-1). Anything else (empty,
+        # sign, exponent, more decimals, blank, NaN, text) is an error, exit 2 (CP7-2, CP8-1, CP8-2): so the
+        # Decimal arithmetic below has at most 15 significant digits, is exact in the default context and
+        # never leaves the float range
         if not EPOCH_RE.fullmatch(txt):
             raise ValueError(f'{path}: {kind[:-1]} t_epoch {txt!r} is not the sender format digits.ddd')
         got[kind] = Decimal(txt)                         # exact decimal: no binary rounding (CP6-1)
+    if len(got) < 2:
+        return None
     return got['#test_end,'] - got['#test_start,']      # Decimal, exact (CP7-1)
 
 
