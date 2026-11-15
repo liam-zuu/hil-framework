@@ -413,7 +413,8 @@ def turn_totals(S, w0, w1):
     """Total CCW (P) and CW (N) turn over [w0, w1], from the yaw of EVERY report (CU-2). CU9-1: the grid is not
     trusted here. Each report has a time span [min(sample, receive), max(sample, receive)] (both bases, CU2-1);
     a pair of consecutive reports counts when its span from the first report's start to the second report's end
-    meets the window, and these spans must cover the window. A pair is suspect, and then both P and
+    meets the window; the sample times of the reports must cover the window (CU10-1: a receive time after the
+    window end does not stand for a sample). A pair is suspect, and then both P and
     N get max|gz| over its span times the span length (a turn back and forth can hide there, CU-2), when: the grid
     index steps by more than 1, the receive or sample gap is above 1.5 periods (CU8-1), or either report is off
     the grid (not kept: its sample time is not trusted, CU9-1). That needs gyro reports at most h_lim apart over
@@ -421,8 +422,8 @@ def turn_totals(S, w0, w1):
     ta, ps, na, tr = S['t_all'], S['psi_all'], S['n_all'], S['t_recv']
     keep = S.get('keep', np.ones(len(ta), dtype=bool))
     lo, hi = np.minimum(ta, tr), np.maximum(ta, tr)
-    if lo[0] > w0 or hi[-1] < w1:
-        raise InputError('IMU reports do not cover the window')
+    if ta[0] > w0 or ta[-1] < w1:                          # CU10-1: covered on the SAMPLE-time base (the yaw's)
+        raise InputError('IMU samples do not cover the window')
     tg, gz = S.get('tg', np.array([])), S.get('gz', np.array([]))
     per = S.get('period_fit_s', PERIOD_S)
     P = N = 0.0

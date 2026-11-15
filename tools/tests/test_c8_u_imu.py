@@ -684,6 +684,18 @@ def test_cu9_1_off_grid_report_makes_its_pairs_suspect():
     assert P >= 0.04 / np.pi and N >= 0.04 / np.pi
 
 
+# ── Codex round 10 ─────────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize('shift,w1', [(0.2, 14.95), (0.05, 14.995)])
+def test_cu10_1_window_must_be_covered_by_sample_times(shift, w1):
+    r = 10.0 + 0.05 * np.arange(101)
+    tg = 9.7 + 0.001 * np.arange(5301)
+    S = dict(t_all=r - shift, t_recv=r, n_all=np.arange(101), psi_all=np.zeros(101), keep=np.ones(101, dtype=bool),
+             period_fit_s=0.05, h_lim=0.105, tg=tg, gz=np.zeros_like(tg))
+    with pytest.raises(U.InputError, match='do not cover'):
+        U.turn_totals(S, 10.0, w1)
+
+
 # ── scale (thang) ─────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize('sign,chieu,s', [(1, 'ccw', 0.004), (-1, 'cw', -0.007)])
