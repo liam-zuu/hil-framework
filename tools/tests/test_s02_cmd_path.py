@@ -202,3 +202,23 @@ def test_short_span_rate_is_clamped():
     s = cp.stats(log, 'A-K1')
     assert s['t0_method'] == 'two_anchors' and s['drift_ppm'] < -2002 and s['t0_reason'] == 'drift_clamped'
     assert 0.0 <= s['t0_us'] - t0_true <= 30_000
+
+
+def test_age_of_exactly_200_ms_is_not_over():
+    """'over 200 ms' (P2-2b) is strict: the firmware timeout is age >= 200 ms, a line read at exactly 200 is not
+    counted (the age is rounded down, so the true age there is in [200, 201) ms)."""
+    log, _ = gen('A-L2')
+    t = (log['timestamp_us'] - 5e6) * 1e-6
+    i = int(np.flatnonzero(t > 5.0)[0])
+    log['traj_age_ms'][i] = 200
+    assert cp.stats(log, 'A-L2')['cmd_gap_n'] == 0
+    log['traj_age_ms'][i] = 201
+    assert cp.stats(log, 'A-L2')['cmd_gap_n'] == 1
+
+
+def test_clamped_rate_maps_k0_from_anchor_a():
+    log, _ = gen('A-K1')
+    nz = np.flatnonzero(np.abs(log['sp_vx']) > 0)
+    log['sp_vx'][nz[-1]] = 0.0
+    s = cp.stats(log, 'A-K1')
+    assert s['t0_us'] == pytest.approx(s['anchor_a_us'] - 150 * cp.PERIOD_US * (1 - cp.ANCHOR_PPM * 1e-6), abs=1)
