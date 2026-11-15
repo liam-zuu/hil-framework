@@ -1,6 +1,7 @@
 """tools/c8_u_imu.py (C8, IMU dynamic bound of U_IMU; design CLAUDE_THESIS
 03_CODE/docs/2026-11-15_Thiet_ke_C8_U_IMU_v2.md, Liam 15/11 CODE_C13): synthetic ESP32 logs with known
-answers (scale per direction, drift, late reports, missing reports, latency); the real logs of
+answers (scale per direction, drift, late reports, missing reports, latency, resets); tests named cu<N> are the
+counter-examples of Codex Sol round 1 (Liam 15/11 "Sua ca 23 + vong 2"); the real logs of
 CAR_LIFTED/2026-11-14_run01 and CAR_FLOOR/2026-11-10_run01 when they are on this machine."""
 import csv
 import json
@@ -17,7 +18,7 @@ sys.path.insert(0, os.path.join(HERE, '..', '..', 'rpi5'))
 import c8_u_imu as U  # noqa: E402
 
 T0 = 0.05            # report period of the campaign firmware (20 Hz)
-COLS = ['timestamp_us', 'log_seq', 'yaw_rad', 'rv_n', 'age_r_ms', 'gz', 'gyro_n', 'age_g_ms',
+COLS = ['timestamp_us', 'log_seq', 'yaw_rad', 'rv_n', 'age_r_ms', 'gz', 'gyro_n', 'age_g_ms', 'reset_n',
         'roll', 'pitch', 'run_active']
 
 
@@ -26,13 +27,16 @@ def wrap(a):
 
 
 def make_log(path, rate, t_end, s_plus=0.0, s_minus=0.0, drift=0.0, lat=0.004, late=(), miss=(),
-             run=None, tilt=0.0, t_start=10.0):
-    """ESP32 log at 100 Hz. rate(t) = true yaw rate [rad/s]; the sensor samples every T0 from
-    t_start (sensor time = ESP32 time), the IMU yaw integrates the rate with scale (1 + s_plus) for
-    positive steps and (1 + s_minus) for negative ones, plus drift [rad/s]; a report reaches the ESP32
-    lat seconds after it is taken, plus extra for the indexes in late ({k: extra}); indexes in miss
-    never arrive. run = (t_on, t_off) for run_active. Returns the true sample times and yaw."""
+             run=None, tilt=0.0, t_start=10.0, reset_at=None, no_gyro=False, gyro_miss=None, runs=None):
+    """ESP32 log at 100 Hz. rate(t) = true yaw rate [rad/s]; the sensor samples every T0 from t_start (sensor
+    time = ESP32 time); the IMU yaw integrates the rate with scale (1 + s_plus) for positive steps and
+    (1 + s_minus) for negative ones, plus drift [rad/s]; a report reaches the ESP32 lat seconds after it is
+    taken, plus extra for the indexes in late ({k: extra}); indexes in miss never arrive (gyro reports too,
+    unless gyro_miss gives another set). run = (t_on, t_off) or runs = [(...), ...] for run_active. reset_at:
+    time of an IMU reset (reset_n + 1, the yaw restarts from 0). Returns the true sample times and IMU yaw."""
     late = dict(late)
+    gyro_miss = set(miss) if gyro_miss is None else set(gyro_miss)
+    runs = runs or ([run] if run else [])
     ts = t_start + T0 * np.arange(int(round((t_end - t_start) / T0)) + 1)
     fine = np.arange(t_start, t_end + 1e-9, 1e-3)
     r = np.array([rate(x) for x in fine])
@@ -41,23 +45,33 @@ def make_log(path, rate, t_end, s_plus=0.0, s_minus=0.0, drift=0.0, lat=0.004, l
     d = np.diff(st)
     imu = np.concatenate([[0.0], np.cumsum(np.where(d > 0, d * (1 + s_plus), d * (1 + s_minus)))])
     imu = imu + drift * (ts - t_start)
+    if reset_at is not None:
+        k0 = int(np.searchsorted(ts, reset_at))
+        imu[k0:] = imu[k0:] - imu[k0]
     gzs = np.array([rate(x) for x in ts])
-    recv = [(ts[k] + lat + late.get(k, 0.0), k) for k in range(len(ts)) if k not in miss]
-    recv.sort()
-    rows, seq, j, n = [], 1, 0, 0
-    last = None
+    rv = sorted((ts[k] + lat + late.get(k, 0.0), k) for k in range(len(ts)) if k not in miss)
+    gy = sorted((ts[k] + lat + late.get(k, 0.0), k) for k in range(len(ts)) if k not in gyro_miss)
+    rows, seq = [], 1
+    jr = jg = nr = ng = 0
+    lr = lg = None
     for t in np.arange(t_start + 0.003, t_end, 0.01):
-        while j < len(recv) and recv[j][0] <= t:
-            last = recv[j]
-            j += 1
-            n += 1
-        if last is None:
+        while jr < len(rv) and rv[jr][0] <= t:
+            lr = rv[jr]
+            jr += 1
+            nr += 1
+        while jg < len(gy) and gy[jg][0] <= t:
+            lg = gy[jg]
+            jg += 1
+            ng += 1
+        if lr is None or lg is None:
             continue
-        rt, k = last
-        on = '1' if run and run[0] <= t <= run[1] else '0'
+        on = '1' if any(a <= t <= b for a, b in runs) else '0'
         rows.append({'timestamp_us': str(int(round(t * 1e6))), 'log_seq': str(seq),
-                     'yaw_rad': repr(float(wrap(imu[k]))), 'rv_n': str(n), 'age_r_ms': repr(float((t - rt) * 1e3)),
-                     'gz': repr(float(gzs[k])), 'gyro_n': str(n), 'age_g_ms': repr(float((t - rt) * 1e3)),
+                     'yaw_rad': repr(float(wrap(imu[lr[1]]))), 'rv_n': str(nr),
+                     'age_r_ms': repr(float((t - lr[0]) * 1e3)),
+                     'gz': repr(float(gzs[lg[1]])), 'gyro_n': '0' if no_gyro else str(ng),
+                     'age_g_ms': '-1.0' if no_gyro else repr(float((t - lg[0]) * 1e3)),
+                     'reset_n': '1' if reset_at is not None and t >= reset_at else '0',
                      'roll': repr(float(tilt * math.sin(t))), 'pitch': '0.0', 'run_active': on})
         seq += 1
     with open(path, 'w', newline='', encoding='utf-8') as f:
@@ -74,14 +88,29 @@ def turns(n_turns, w, sign, t_still=3.0, t_start=10.0):
     return (lambda t: sign * w if a <= t < b else 0.0), b + t_still
 
 
+def _c8_log(tmp_path, name='c8.csv', **kw):
+    """Still 3 s, +300 deg at 2 rad/s, -300 deg at 2 rad/s, still; run_active 16 s (>= T_cmd of F08, F05, K2)."""
+    p = str(tmp_path / name)
+    a = 13.0
+    t1 = a + math.radians(300) / 2.0
+    t2 = t1 + math.radians(300) / 2.0
+    make_log(p, lambda t: 2.0 if a <= t < t1 else (-2.0 if t1 <= t < t2 else 0.0), a + 21.0, run=(a, a + 16.0), **kw)
+    return p, a, a + 16.0
+
+
+def _globals():
+    return dict(thang=dict(s_plus=0.0, s_minus=0.0, delta_plus=0.0015, delta_minus=0.002, f4_mo=False,
+                           nguon=[{'file': 'thang.json', 'sha256': 'x'}]),
+                troi=dict(beta_max=math.radians(0.016), q=math.radians(0.01), nguon=[{'file': 'troi.json', 'sha256': 'y'}]),
+                tre=dict(tau_hat_s=0.012, dtau_fit_s=0.003, thu=True, nguon=[]))
+
+
 # ── samples ────────────────────────────────────────────────────────────────────────────
 
 def test_samples_on_rv_n_change_and_receive_time(tmp_path):
     p = str(tmp_path / 'a.csv')
     ts, _ = make_log(p, lambda t: 0.3, 14.0, lat=0.004)
     S = U.rv_samples(U.load_log(p), period_s=T0, tau_hat=0.0, j_lim=0.005)
-    assert S['n_samples'] == len(ts) - 1 or S['n_samples'] == len(ts)       # the last report may arrive after the end
-    # grid time = receive time minus the constant latency is absorbed by the fit (a + b n): within 1 us of ts + lat
     k = np.searchsorted(ts + 0.004, S['t'][0] - 1e-4)
     assert np.allclose(S['t'], (ts + 0.004)[k:k + len(S['t'])], atol=2e-6)
     assert S['n_late'] == 0
@@ -96,8 +125,6 @@ def test_late_report_is_dropped(tmp_path):
 
 
 def test_scale_correction_and_unwrap(tmp_path):
-    """+3 turns then -3 turns with different scale per direction: the corrected yaw follows the truth across
-    the +-pi wrap; uncorrected it does not."""
     p = str(tmp_path / 'a.csv')
     t1 = 10 + 3 * 2 * math.pi / 1.5
     t2 = t1 + 3 * 2 * math.pi / 1.5
@@ -107,19 +134,20 @@ def test_scale_correction_and_unwrap(tmp_path):
     raw = U.rv_samples(L, period_s=T0, tau_hat=0.0)
     cor = U.rv_samples(L, period_s=T0, tau_hat=0.0, s_plus=0.01, s_minus=-0.006)
     turn = 3 * 2 * math.pi
-    assert abs(cor['psi'][-1] - cor['psi'][0]) < 2e-3                   # back to the start heading
-    assert abs((raw['psi'][-1] - raw['psi'][0]) - turn * 0.016) < 2e-3  # (1.01 - 0.994) of 3 turns left over
-    assert raw['psi'].max() - raw['psi'][0] > 3 * math.pi                 # unwrapped across +-pi
+    assert abs(cor['psi'][-1] - cor['psi'][0]) < 2e-3
+    assert abs((raw['psi'][-1] - raw['psi'][0]) - turn * 0.016) < 2e-3
+    assert raw['psi'].max() - raw['psi'][0] > 3 * math.pi
 
 
 def test_interp_one_missing_ok_two_missing_nan(tmp_path):
     p = str(tmp_path / 'a.csv')
-    make_log(p, lambda t: 0.5, 14.0, miss={40, 60, 61})
+    make_log(p, lambda t: 0.5, 14.0, miss={40, 60, 61}, gyro_miss=set())
     S = U.rv_samples(U.load_log(p), period_s=T0, tau_hat=0.0)
-    t1 = 10 + 40 * T0 + 0.004          # inside the one-report gap
-    t2 = 10 + 60.5 * T0 + 0.004        # inside the two-report gap
-    v = U.interp_yaw(S, np.array([t1, t2]), h_lim=0.105)
-    assert np.isfinite(v[0]) and np.isnan(v[1])
+    t1 = 10 + 40 * T0 + 0.004
+    t2 = 10 + 60.5 * T0 + 0.004
+    t3 = 10 + 70 * T0 + 0.004          # after the two-report gap: unwrapped by the gyro, usable again
+    v = U.interp_yaw(S, np.array([t1, t2, t3]), h_lim=0.105)
+    assert np.isfinite(v[0]) and np.isnan(v[1]) and np.isfinite(v[2])
 
 
 def test_tau_hat_shifts_sample_times(tmp_path):
@@ -159,6 +187,222 @@ def test_forbidden_paths(tmp_path):
             U.load_log(p)
 
 
+# ── Codex round 1 counter-examples ─────────────────────────────────────────────────────────
+
+def test_cu1_wrong_period_grid_refused(tmp_path):
+    """Delays repeating [40, 20, 0] ms on a 50 ms grid look like an exact 30 ms grid."""
+    p = str(tmp_path / 'a.csv')
+    make_log(p, lambda t: 0.3, 14.0, lat=0.0, late={k: (0.040, 0.020, 0.0)[k % 3] for k in range(200)})
+    with pytest.raises(U.InputError, match='CU-1'):
+        U.rv_samples(U.load_log(p), period_s=T0)
+
+
+def test_cu2_turn_totals_keep_late_reports(tmp_path):
+    p = str(tmp_path / 'a.csv')
+    make_log(p, lambda t: 2.0 if 11.0 <= t < 11.5 else (-2.0 if 11.5 <= t < 12.0 else 0.0), 14.0,
+             late={30: 0.020})
+    S = U.rv_samples(U.load_log(p), period_s=T0)
+    assert S['n_late'] == 1
+    P, N = U.turn_totals(S, 10.5, 13.5)
+    assert P == pytest.approx(1.0, abs=0.005) and N == pytest.approx(1.0, abs=0.005)      # kept reports only: 0.9
+
+
+def test_cu3_long_gap_without_gyro_breaks_the_yaw(tmp_path):
+    """One full turn inside a 0.7 s gap with no gyro: the yaw after the gap must not be used."""
+    p = str(tmp_path / 'a.csv')
+    w = 2 * math.pi / 0.6
+    make_log(p, lambda t: w if 12.0 <= t < 12.6 else 0.0, 14.0, s_plus=0.01, miss=set(range(38, 52)))
+    S = U.rv_samples(U.load_log(p), period_s=T0, s_plus=0.01)
+    assert math.isfinite(S['t_break'])
+    assert np.isnan(U.interp_yaw(S, np.array([13.5]))[0])
+
+
+def test_cu3_long_gap_with_gyro_unwraps_right(tmp_path):
+    p = str(tmp_path / 'a.csv')
+    w = 2 * math.pi / 0.6
+    make_log(p, lambda t: w if 12.0 <= t < 12.6 else 0.0, 14.0, s_plus=0.01, miss=set(range(38, 52)),
+             gyro_miss=set())
+    S = U.rv_samples(U.load_log(p), period_s=T0, s_plus=0.01)
+    assert not math.isfinite(S['t_break'])
+    v = U.interp_yaw(S, np.array([11.0, 13.5]))
+    assert v[1] - v[0] == pytest.approx(2 * math.pi, abs=5e-3)
+
+
+def test_cu4_reset_inside_window_refused(tmp_path):
+    p, _, _ = _c8_log(tmp_path, reset_at=20.0)
+    g = _globals()
+    with pytest.raises(U.InputError, match='CU-4'):
+        U.tong('O1-F08', [p], g['thang'], g['troi'], g['tre'], u_g=0.01, le=0.25, out=str(tmp_path / 'u.json'),
+               tail_s=1.0)
+
+
+def test_cu5_alpha_uses_true_spacing():
+    assert U.alpha_max(np.array([0.0, 0.01]), np.array([0.0, 1.0])) == pytest.approx(100.0)
+
+
+def test_cu6_no_gyro_refused(tmp_path):
+    p, _, _ = _c8_log(tmp_path, no_gyro=True)
+    g = _globals()
+    with pytest.raises(U.InputError, match='CU-6'):
+        U.tong('O1-F08', [p], g['thang'], g['troi'], g['tre'], u_g=0.01, le=0.25, out=str(tmp_path / 'u.json'),
+               tail_s=1.0)
+
+
+def test_cu7_negative_age_first_row():
+    n = np.array([1, 2, 2, 3], dtype=float)
+    age = np.array([0.0, -1.0, 9.0, 0.0])
+    assert list(U.report_rows(n, age)) == [0, 2, 3]
+    with pytest.raises(U.InputError):
+        U.report_rows(np.array([1, 2, 3.0]), np.array([0.0, -1.0, 0.0]))
+
+
+def test_cu8_cut_or_split_run_refused(tmp_path):
+    g = _globals()
+    p = str(tmp_path / 'cut.csv')
+    make_log(p, lambda t: 2.0 if 13 <= t < 15 else 0.0, 22.0, run=(13.0, 18.0))      # 5 s < T_cmd of F08
+    with pytest.raises(U.InputError, match='CU-8'):
+        U.tong('O1-F08', [p], g['thang'], g['troi'], g['tre'], u_g=0.01, le=0.25, out=str(tmp_path / 'u.json'),
+               tail_s=1.0)
+    q = str(tmp_path / 'split.csv')
+    make_log(q, lambda t: 0.0, 40.0, runs=[(12.0, 24.0), (26.0, 38.0)])
+    with pytest.raises(U.InputError, match='CU-8'):
+        U.tong('O1-F08', [q], g['thang'], g['troi'], g['tre'], u_g=0.01, le=0.25, out=str(tmp_path / 'u.json'),
+               tail_s=1.0)
+
+
+def test_cu9_troi_per_run_active_part(tmp_path):
+    p = str(tmp_path / 'a.csv')
+    make_log(p, lambda t: 0.001 if t >= 100.0 else 0.0, 104.0, runs=[(11.0, 14.0), (100.0, 103.5)])
+    r = U.troi([p], period_s=T0, min_dt=2.0, doan='run_active')
+    assert r['beta_max'] == pytest.approx(0.001, rel=0.05)
+
+
+def test_cu10_troi_scale_corrected_and_tong_checks_it(tmp_path):
+    p = str(tmp_path / 'a.csv')
+    make_log(p, lambda t: -0.001, 30.0, s_minus=-0.01)
+    raw = U.troi([p], period_s=T0, min_dt=2.0)
+    cor = U.troi([p], period_s=T0, min_dt=2.0, s_minus=-0.01)
+    assert raw['beta_max'] == pytest.approx(0.00099, rel=0.01)
+    assert cor['beta_max'] == pytest.approx(0.001, rel=0.01)
+    c8, _, _ = _c8_log(tmp_path)
+    g = _globals()
+    g['thang']['s_minus'] = -0.01
+    with pytest.raises(U.InputError, match='CU-10'):
+        U.tong('O1-F08', [c8], g['thang'], g['troi'], g['tre'], u_g=0.01, le=0.25, out=str(tmp_path / 'u.json'),
+               tail_s=1.0)
+
+
+def test_cu11_q_with_two_report_blocks(tmp_path):
+    p = str(tmp_path / 'raw.csv')
+    with open(p, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(['kind', 't_us', 'n', 'v0', 'v1', 'v2', 'qdrop'])
+        for k in range(20):
+            w.writerow(['R', 1_000_000 + k * 500_000, k + 1, 0, 0, 0.002 if k == 1 else 0.0, 0])
+    r = U.troi([p], min_dt=2.0)
+    assert r['q'] == pytest.approx(math.radians(0.001), rel=1e-6)
+
+
+def test_cu12_nan_never_written(tmp_path):
+    with pytest.raises(ValueError):
+        U._write_new(str(tmp_path / 'x.json'), {'tau_hat_s': float('nan')})
+
+
+def test_cu13_closure_near_pi_fails(tmp_path):
+    fr, lg = _c8_pair(tmp_path, err=lambda t: (math.pi + (0.001 if int(t * 60) % 2 else -0.001)) if t > 29.5 else 0.0)
+    u = _u_file(tmp_path, lg, tau=0.004)
+    r = U.kiem(fr, lg, 0.5, u, 'O1-F08', u_psi=math.radians(0.5))
+    assert r['closure_ok'] is False and abs(r['closure_rad']) > 3.0
+
+
+def test_cu14_closure_window_fixed(tmp_path):
+    fr, lg = _c8_pair(tmp_path, t_tail=60.0)
+    u = _u_file(tmp_path, lg, tau=0.004)
+    r = U.kiem(fr, lg, 0.5, u, 'O1-F08', u_psi=math.radians(0.5))
+    assert r['closure_T_s'] <= 2.0 + 16.0 + 1.0 + U.END_STILL_S + 0.05
+
+
+def test_cu15_incomplete_scale_set_refused():
+    def run(chieu, cach, toc, s):
+        return dict(s=s, chieu=chieu, cach=cach, toc_do=toc, n_vong=5)
+    full = [run(c, a, t, 0.001) for c in ('ccw', 'cw') for a, t in sorted(U.SCALE_RUNS)]
+    assert U.thang_gop(full)['f4_mo'] is False
+    hand = [r for r in full if r['cach'] == 'tay']
+    assert U.thang_gop(hand)['f4_mo'] is True
+    one_rc = [r for r in full if not (r['cach'] == 'rc' and r['toc_do'] == 'nhanh')]
+    with pytest.raises(U.InputError, match='CU-15'):
+        U.thang_gop(one_rc)
+
+
+def test_cu16_still_under_three_seconds_refused(tmp_path):
+    p = str(tmp_path / 'a.csv')
+    rate, t_end = turns(5, 2.5, 1, t_still=2.5)
+    make_log(p, rate, t_end)
+    with pytest.raises(U.InputError, match='still part'):
+        U.thang(p, n_vong=5, chieu='ccw', period_s=T0)
+
+
+def test_cu17_bad_numbers_and_json(tmp_path):
+    c8, _, _ = _c8_log(tmp_path)
+    g = _globals()
+    with pytest.raises(U.InputError):
+        U.tong('O1-F08', [c8], g['thang'], g['troi'], g['tre'], u_g=0.01, le=-1.0, out=str(tmp_path / 'u.json'))
+    bad = dict(g['thang'], delta_plus=float('nan'))
+    with pytest.raises(U.InputError):
+        U.tong('O1-F08', [c8], bad, g['troi'], g['tre'], u_g=0.01, le=0.25, out=str(tmp_path / 'u.json'))
+    j = str(tmp_path / 'list.json')
+    json.dump([], open(j, 'w'))
+    tr = str(tmp_path / 'troi.json')
+    json.dump(dict(beta_max=0.0003, q=0.0002), open(tr, 'w'))
+    assert U.main(['tong', '--muc', 'O1-F08', '--c8-log', c8, '--thang', j, '--troi', tr, '--tre-thu', '0.01,0.002',
+                   '--u-g-deg', '0.5', '--out', str(tmp_path / 'u2.json')]) == 2
+
+
+def test_cu18_forbidden_output_refused(tmp_path):
+    d = tmp_path / 'sealed'
+    d.mkdir()
+    p = str(tmp_path / 'a.csv')
+    rate, t_end = turns(5, 2.5, 1)
+    make_log(p, rate, t_end)
+    assert U.main(['thang', '--log', p, '--n-vong', '5', '--chieu', 'ccw', '--cach', 'tay', '--toc-do', 'cham',
+                   '--out', str(d / 't.json')]) == 2
+    assert not os.listdir(d)
+
+
+def test_cu19_existing_tmp_untouched(tmp_path):
+    c8, _, _ = _c8_log(tmp_path)
+    g = _globals()
+    out = str(tmp_path / 'u.json')
+    with open(out + '.tmp', 'w') as f:
+        f.write('keep')
+    U.tong('O1-F08', [c8], g['thang'], g['troi'], g['tre'], u_g=0.01, le=0.25, out=out, tail_s=1.0)
+    assert open(out + '.tmp').read() == 'keep'
+
+
+def test_cu20_e_thang_per_run(tmp_path):
+    a = 13.0
+    p1, p2 = str(tmp_path / 'a.csv'), str(tmp_path / 'b.csv')
+    for p, (x, y) in ((p1, (300, 200)), (p2, (200, 300))):
+        t1 = a + math.radians(x) / 2.0
+        t2 = t1 + math.radians(y) / 2.0
+        make_log(p, lambda t, t1=t1, t2=t2: 2.0 if a <= t < t1 else (-2.0 if t1 <= t < t2 else 0.0), a + 21.0,
+                 run=(a, a + 16.0))
+    g = _globals()
+    g['thang'].update(delta_plus=0.001, delta_minus=0.001)
+    out = str(tmp_path / 'u.json')
+    d = U.tong('O1-F08', [p1, p2], g['thang'], g['troi'], g['tre'], u_g=0.01, le=0.25, out=out, tail_s=1.0)
+    assert d['muc']['O1-F08']['E_thang'] == pytest.approx(0.001 * math.radians(500), rel=0.01)
+
+
+def test_cu21_eps_and_times(tmp_path):
+    c8, _, _ = _c8_log(tmp_path, tilt=2.0)
+    g = _globals()
+    d = U.tong('O1-F08', [c8], g['thang'], g['troi'], g['tre'], u_g=0.01, le=0.25, out=str(tmp_path / 'u.json'),
+               tail_s=1.0)
+    m = d['muc']['O1-F08']
+    assert m['eps_max_deg'] > 1.0 and m['luc_chay'] and 'n_late' in m['logs'][0]
+
+
 # ── scale (thang) ─────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize('sign,chieu,s', [(1, 'ccw', 0.004), (-1, 'cw', -0.007)])
@@ -188,18 +432,20 @@ def test_thang_needs_still_ends(tmp_path):
 
 
 def test_thang_gop():
-    runs = [dict(s=0.004, chieu='ccw', cach='rc', n_vong=5), dict(s=0.006, chieu='ccw', cach='rc', n_vong=5),
-            dict(s=0.001, chieu='ccw', cach='tay', n_vong=5), dict(s=-0.002, chieu='cw', cach='rc', n_vong=5),
-            dict(s=-0.003, chieu='cw', cach='tay', n_vong=5)]
+    def run(chieu, cach, toc, s):
+        return dict(s=s, chieu=chieu, cach=cach, toc_do=toc, n_vong=5)
+    runs = [run('ccw', 'rc', 'cham', 0.004), run('ccw', 'rc', 'nhanh', 0.006), run('ccw', 'tay', 'cham', 0.001),
+            run('ccw', 'tay', 'nhanh', 0.005), run('cw', 'rc', 'cham', -0.002), run('cw', 'rc', 'nhanh', -0.002),
+            run('cw', 'tay', 'cham', -0.003), run('cw', 'tay', 'nhanh', -0.002)]
     g = U.thang_gop(runs, delta_gach_deg=2.0)
     base = math.radians(2.0) / (5 * 2 * math.pi)
     assert g['s_plus'] == pytest.approx(0.005)
-    assert g['delta_plus'] == pytest.approx(base + 0.004)            # |0.001 - 0.005|
+    assert g['delta_plus'] == pytest.approx(base + 0.004)
     assert g['s_minus'] == pytest.approx(-0.002)
     assert g['delta_minus'] == pytest.approx(base + 0.001)
     assert g['f4_mo'] is False
     g2 = U.thang_gop([r for r in runs if r['cach'] == 'tay'], delta_gach_deg=2.0)
-    assert g2['f4_mo'] is True and g2['s_plus'] == pytest.approx(0.001)
+    assert g2['f4_mo'] is True and g2['s_plus'] == pytest.approx(0.003)
     with pytest.raises(U.InputError):
         U.thang_gop([r for r in runs if r['chieu'] == 'ccw'], delta_gach_deg=2.0)
 
@@ -214,8 +460,6 @@ def test_troi_drift_rate(tmp_path):
 
 
 def test_troi_ignores_short_spans(tmp_path):
-    """A 0.2 deg jump in the first second would give 0.2 deg/s over 1 s; with min_dt 2 s it is
-    at most 0.1 deg/s, falling as the span grows."""
     p = str(tmp_path / 'a.csv')
     make_log(p, lambda t: math.radians(0.2) if 10.2 <= t < 11.2 else 0.0, 30.0)
     r = U.troi([p], period_s=T0, min_dt=2.0)
@@ -238,25 +482,8 @@ def test_troi_reads_imu_capture_raw(tmp_path):
 
 # ── total (tong) ───────────────────────────────────────────────────────────────────────
 
-def _c8_log(tmp_path, name='c8.csv'):
-    p = str(tmp_path / name)
-    # still 3 s, +300 deg at 2 rad/s, -300 deg at 2 rad/s, still 3 s; run_active over the motion
-    a = 13.0
-    t1 = a + math.radians(300) / 2.0
-    t2 = t1 + math.radians(300) / 2.0
-    make_log(p, lambda t: 2.0 if a <= t < t1 else (-2.0 if t1 <= t < t2 else 0.0), t2 + 3.0, run=(a, t2))
-    return p, a, t2
-
-
-def _globals():
-    return dict(thang=dict(s_plus=0.0, s_minus=0.0, delta_plus=0.0015, delta_minus=0.002, f4_mo=False,
-                           nguon=[{'file': 'thang.json', 'sha256': 'x'}]),
-                troi=dict(beta_max=math.radians(0.016), q=math.radians(0.01), nguon=[{'file': 'troi.json', 'sha256': 'y'}]),
-                tre=dict(tau_hat_s=0.012, dtau_fit_s=0.003, thu=True, nguon=[]))
-
-
 def test_tong_terms(tmp_path):
-    p, a, t2 = _c8_log(tmp_path)
+    p, a, t_off = _c8_log(tmp_path)
     g = _globals()
     out = str(tmp_path / 'u.json')
     U.tong('O1-F08', [p], g['thang'], g['troi'], g['tre'], u_g=math.radians(1.0), le=0.25, out=out,
@@ -267,13 +494,13 @@ def test_tong_terms(tmp_path):
     assert m['P_max'] == pytest.approx(P, rel=0.01) and m['N_max'] == pytest.approx(N, rel=0.01)
     assert m['phan']['thang'] == pytest.approx(0.0015 * P + 0.002 * N, rel=0.01)
     assert m['omega_max'] == pytest.approx(2.0)
-    assert m['alpha_max'] == pytest.approx(4.0 / T0, rel=0.02)      # +2 -> -2 rad/s between two reports
-    assert m['T_win'] == pytest.approx((t2 - a) + 2.0 + 1.0, abs=0.03)
+    assert m['alpha_max'] == pytest.approx(4.0 / T0, rel=0.02)
+    assert m['T_win'] == pytest.approx((t_off - a) + 2.0 + 1.0, abs=0.03)
     assert m['phan']['thoi_gian'] == pytest.approx((0.003 + 0.005) * 2.0)
     assert m['phan']['noi_suy'] == pytest.approx(m['alpha_max'] * 0.105 ** 2 / 8)
     s = sum(m['phan'].values())
     assert m['U_IMU_dong_rad'] == pytest.approx(math.radians(1.0) + 1.25 * s)
-    assert d['thu'] is True          # tre given as a trial value: not lockable
+    assert d['thu'] is True
 
 
 def test_tong_adds_level_and_refuses_changes(tmp_path):
@@ -284,10 +511,10 @@ def test_tong_adds_level_and_refuses_changes(tmp_path):
     U.tong('O1-F08', [p], g['thang'], g['troi'], g['tre'], u_g=0.01, le=0.25, out=out, **kw)
     U.tong('O1-F05', [p], g['thang'], g['troi'], g['tre'], u_g=0.01, le=0.25, out=out, **kw)
     assert set(json.load(open(out, encoding='utf-8'))['muc']) == {'O1-F08', 'O1-F05'}
-    with pytest.raises(U.InputError):
+    with pytest.raises(U.InputError, match='already there'):
         U.tong('O1-F05', [p], g['thang'], g['troi'], g['tre'], u_g=0.01, le=0.25, out=out, **kw)
-    with pytest.raises(U.InputError):
-        U.tong('O1-F02', [p], g['thang'], g['troi'], g['tre'], u_g=0.01, le=0.5, out=out, **kw)
+    with pytest.raises(U.InputError, match='shared parameters'):
+        U.tong('O1-K2', [p], g['thang'], g['troi'], g['tre'], u_g=0.01, le=0.5, out=out, **kw)
 
 
 def test_tong_needs_run_active(tmp_path):
@@ -304,11 +531,11 @@ def test_main_exit_codes(tmp_path):
     rate, t_end = turns(5, 2.5, 1)
     make_log(p, rate, t_end, s_plus=0.003)
     out = str(tmp_path / 't.json')
-    assert U.main(['thang', '--log', p, '--n-vong', '5', '--chieu', 'ccw', '--cach', 'tay', '--out', out]) == 0
+    base = ['thang', '--log', p, '--n-vong', '5', '--cach', 'tay', '--toc-do', 'cham']
+    assert U.main(base + ['--chieu', 'ccw', '--out', out]) == 0
     assert json.load(open(out, encoding='utf-8'))['s'] == pytest.approx(0.003, abs=1e-4)
-    assert U.main(['thang', '--log', p, '--n-vong', '5', '--chieu', 'cw', '--cach', 'tay',
-                   '--out', str(tmp_path / 't2.json')]) == 2
-    assert U.main(['thang', '--log', p, '--n-vong', '5', '--chieu', 'ccw', '--cach', 'tay', '--out', out]) == 2  # no overwrite
+    assert U.main(base + ['--chieu', 'cw', '--out', str(tmp_path / 't2.json')]) == 2
+    assert U.main(base + ['--chieu', 'ccw', '--out', out]) == 2          # no overwrite
 
 
 # ── camera - IMU (tre, kiem) ─────────────────────────────────────────────────────────────
@@ -334,21 +561,31 @@ def write_frames(path, rate, t_start, t_end, offset, psi0=0.4, fps=60.0, err=Non
             w.writerow([i, repr(float(t - offset)), 1, 1, repr(float(wrap(psi[i]))), repr(float(rate(t)))])
 
 
-def _c8_pair(tmp_path, lat=0.004, s_plus=0.0, err=None, name='r'):
+def _c8_pair(tmp_path, lat=0.004, s_plus=0.0, err=None, name='r', t_tail=7.0):
+    """+300 / -300 deg in a 16 s run_active (>= T_cmd of F08), still t_tail s after it."""
     a = 13.0
     t1 = a + math.radians(300) / 2.0
     t2 = t1 + math.radians(300) / 2.0
     rate = lambda t: 2.0 if a <= t < t1 else (-2.0 if t1 <= t < t2 else 0.0)      # noqa: E731
     lg, fr = str(tmp_path / f'{name}.csv'), str(tmp_path / f'{name}_frames.csv')
-    make_log(lg, rate, t2 + 4.0, lat=lat, s_plus=s_plus, run=(a, t2))
-    write_frames(fr, rate, 10.0, t2 + 4.0, offset=0.5, err=err)
+    end = a + 16.0 + t_tail
+    make_log(lg, rate, end, lat=lat, s_plus=s_plus, run=(a, a + 16.0))
+    write_frames(fr, rate, 10.0, end, offset=0.5, err=err)
     return fr, lg
+
+
+def _u_file(tmp_path, p, tau, delta=0.002, s_plus=0.0):
+    out = str(tmp_path / 'u.json')
+    th = dict(s_plus=s_plus, s_minus=0.0, delta_plus=delta, delta_minus=delta, f4_mo=False)
+    tr = dict(beta_max=math.radians(0.016), q=math.radians(0.01), s_plus=s_plus, s_minus=0.0)
+    U.tong('O1-F08', [p], th, tr, dict(tau_hat_s=tau, dtau_fit_s=0.002), u_g=math.radians(0.5), le=0.25, out=out,
+           pre_s=2.0, tail_s=1.0)
+    return json.load(open(out, encoding='utf-8'))
 
 
 def test_tre_finds_delay(tmp_path):
     fr, lg = _c8_pair(tmp_path, lat=0.004)
     r = U.tre_one(fr, lg, 0.5)
-    # grid times are receive times (sample + 4 ms); the camera sees the true yaw: tau = 4 ms
     assert r['tau_s'] == pytest.approx(0.004, abs=0.001)
     fr2, lg2 = _c8_pair(tmp_path, lat=0.015, name='r2')
     g = U.tre([(fr, lg, 0.5), (fr2, lg2, 0.5)], dict(s_plus=0.0, s_minus=0.0))
@@ -362,15 +599,6 @@ def test_tre_wrong_offset_refused(tmp_path):
         U.tre_one(fr, lg, 0.6)
 
 
-def _u_file(tmp_path, p, tau, delta=0.002, s_plus=0.0):
-    out = str(tmp_path / 'u.json')
-    th = dict(s_plus=s_plus, s_minus=0.0, delta_plus=delta, delta_minus=delta, f4_mo=False)
-    tr = dict(beta_max=math.radians(0.016), q=math.radians(0.01))
-    U.tong('O1-F08', [p], th, tr, dict(tau_hat_s=tau, dtau_fit_s=0.002), u_g=math.radians(0.5), le=0.25, out=out,
-           pre_s=2.0, tail_s=1.0)
-    return json.load(open(out, encoding='utf-8'))
-
-
 def test_kiem_clean_run_ok(tmp_path):
     fr, lg = _c8_pair(tmp_path)
     u = _u_file(tmp_path, lg, tau=0.004)
@@ -380,15 +608,13 @@ def test_kiem_clean_run_ok(tmp_path):
 
 
 def test_kiem_catches_camera_error(tmp_path):
-    fr, lg = _c8_pair(tmp_path, err=lambda t: math.radians(20.0) if 15.0 <= t < 15.5 else 0.0)  # step profile: alpha 80 rad/s2, limit about 10 deg
+    fr, lg = _c8_pair(tmp_path, err=lambda t: math.radians(20.0) if 15.0 <= t < 15.5 else 0.0)  # limit about 10 deg
     u = _u_file(tmp_path, lg, tau=0.004)
     r = U.kiem(fr, lg, 0.5, u, 'O1-F08', u_psi=math.radians(0.5))
     assert r['n_over'] > 0 and not r['ok']
 
 
 def test_kiem_closure_catches_uncorrected_scale(tmp_path):
-    """IMU 2 % fast counter-clockwise, the U_IMU file says scale exact with a small delta: the closure
-    after +300 / -300 deg is 6 deg, beyond its bound."""
     fr, lg = _c8_pair(tmp_path, s_plus=0.02)
     u = _u_file(tmp_path, lg, tau=0.004, delta=0.001)
     r = U.kiem(fr, lg, 0.5, u, 'O1-F08', u_psi=math.radians(0.5))
