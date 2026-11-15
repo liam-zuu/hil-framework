@@ -49,7 +49,8 @@ def test_parse_plant_rows_and_defaults():
     ('B1,batt_sag,batt,1,9,v1=7;ramp_ms=9\n', 'traction'),           # ramp longer than the window
     ('B1,batt_sag,FL,1,9,v1=7;ramp_ms=0\n', 'traction'),
     ('M1,mu_time,FL,1,9,mu=0\n', 'traction'),
-    ('M1,mu_time,all,1,9,mu=0.2\n', 'traction'),                    # mu_time takes wheels
+    ('M1,mu_time,All,1,9,mu=0.2\n', 'traction'),                    # 'all' only as written (FP1-7)
+    ('J1,wheel_jam,all,1,9,b=0.1\n', 'traction'),                    # 'all' is for mu_time only
     ('Z1,mu_zone,all,1,9,x0=2;x1=1;y0=0;y1=1;mu=0.2\n', 'traction'),
     ('Z1,mu_zone,all,1,9,x0=0;x1=1;y0=1;y1=1;mu=0.2\n', 'traction'),
     ('Z1,mu_zone,FL,1,9,x0=0;x1=1;y0=0;y1=1;mu=0.2\n', 'traction'),
@@ -271,3 +272,56 @@ def test_run_hil_accepts_plant_rows(tmp_path):
     s = run_hil.load_faults(_args(tmp_path, 'M1,mu_time,FL,1,9,mu=0.1\nJ1,wheel_jam,FR,1,9,b=0.1\n', mu=0.3),
                             0, HILConfig(simulate_hw=True), False, False)
     assert fs.has_plant_rows(s.rows)
+
+
+# ── Codex vòng 1 (FP1-1, 5, 6, 7, 11) ───────────────────────────────────────
+def test_mu_time_all_is_four_wheels():                               # FP1-7
+    r = rows('M1,mu_time,all,1,9,mu=0.2\n')
+    assert r[0].wheels == (0, 1, 2, 3)
+    p, _ = fp.PlantVariant(r, MecanumParams()).at((0,), 1, MOVING)
+    assert list(p.mu_hd) == [0.2] * 4
+    with pytest.raises(fs.ScheduleError):                             # all overlaps every wheel row
+        rows('M1,mu_time,all,1,9,mu=0.2\nM2,mu_time,RR,5,12,mu=0.1\n')
+
+
+def test_zone_bounds_are_float64_on_the_hub():                       # FP1-1
+    base = MecanumParams()
+    front = rows('Z1,mu_zone,all,0,9,x0=0.12;x1=1;y0=-1;y1=1;mu=0.05\n')[0]
+    rear = rows('Z1,mu_zone,all,0,9,x0=-0.12;x1=0.12;y0=-1;y1=1;mu=0.05\n')[0]
+    assert fp.zone_mask(front, [0, 0, 0], base) == 0b0011             # front hubs at x = 0.12 exactly: in
+    assert fp.zone_mask(rear, [0, 0, 0], base) == 0b1100              # rear at -0.12 in, front at 0.12 out
+
+
+def test_variant_follows_the_runtime_motor_enable():                 # FP1-5
+    base = MecanumParams()
+    var = fp.PlantVariant(rows('J1,wheel_jam,FL,0,9,b=0.1\n'), base)
+    assert var.at((0,), 0, MOVING)[0].motor_enable == 1.0
+    base.motor_enable = 0.0                                           # fwsim.simulate writes EN at every tick
+    assert var.at((0,), 1, MOVING)[0].motor_enable == 0.0
+
+
+def test_check_params_needs_finite_values():                         # FP1-6
+    with pytest.raises(fs.ScheduleError):
+        fp.check_params(rows('J1,wheel_jam,FL,1,9,b=' + '9' * 400 + '\n'), MecanumParams())
+    for bad in (float('nan'), float('inf'), 0.0):
+        p = MecanumParams()
+        p.mu_hd = np.full(4, bad)
+        with pytest.raises(fs.ScheduleError):
+            fp.check_params(rows('J1,wheel_jam,FL,1,9,b=0.1\n'), p)
+
+
+def test_run_hil_refuses_mu_nan(tmp_path):                           # FP1-6
+    import run_hil
+    with pytest.raises(SystemExit):
+        run_hil.load_faults(_args(tmp_path, 'J1,wheel_jam,FL,1,9,b=0.1\n', mu=float('nan')), 0,
+                            HILConfig(simulate_hw=True), False, False)
+
+
+def test_attach_refuses_a_subclass_and_records_the_inner_class(tmp_path):   # FP1-11
+    class OtherPlant(MecanumPlant):
+        pass
+    with pytest.raises(fs.ScheduleError):
+        fp.attach(OtherPlant(dt=0.001), fs.FramePatcher(sched('J1,wheel_jam,FL,1,2,b=0.1\n')), 'a.npz')
+    r = _Run('J1,wheel_jam,FL,1,2,b=0.1\n', path=str(tmp_path / 'p.npz'))
+    r.go(5)
+    assert r.patcher.summary(last_step=4)['plant_record']['inner'] == 'MecanumPlant'

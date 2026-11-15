@@ -317,14 +317,32 @@ PLANT_ROWS = ('wheel_jam', 'batt_sag', 'mu_time', 'mu_zone')      # batch 2 plan
 REC_COLS = ('step', 'mask', 'V_batt', 'mu_fl', 'mu_fr', 'mu_rl', 'mu_rr', 'b_fl', 'b_fr', 'b_rl', 'b_rr',
             'tc_fl', 'tc_fr', 'tc_rl', 'tc_rr', 'ts_fl', 'ts_fr', 'ts_rl', 'ts_rr', 'x', 'y', 'theta')
 OFS_X, OFS_Y = 8, 10                           # int16 x, y of [w1..w4, x, y, theta, ...] (theta: OFS_THETA)
-SUM_TOL = 1e-12                                # float sums of the Pi against the exact values here
+ULP_TOL = 8                                    # float sums of the Pi against the exact values here (FP1-4)
 HUBS = {0: (1, 1), 1: (1, -1), 2: (-1, 1), 3: (-1, -1)}   # FL, FR, RL, RR: (sign of lx, sign of ly), y left
 
 
+def _close(got, exact) -> bool:
+    """A float64 the Pi built by a few float additions against the exact value: within ULP_TOL units in the
+    last place of the larger of the two (Codex FP1-4: no absolute tolerance, the range has no upper bound)."""
+    e = float(exact)
+    return math.isfinite(got) and abs(got - e) <= ULP_TOL * math.ulp(max(abs(got), abs(e)))
+
+
 def _row_wheels(r):
-    if r.fault == 'mu_zone':
+    if r.fault == 'mu_zone' or r.target == 'all':        # mu_time may take 'all' (Codex FP1-7)
         return (0, 1, 2, 3)
     return tuple(WHEEL_IDX[w] for w in r.target.split('+'))
+
+
+def hubs(x, y, th, lx, ly):
+    """World hub positions FL, FR, RL, RR by the definition of the design (float64, this order; Codex FP1-1):
+    c = cos(theta), s = sin(theta), ax = sx lx, ay = sy ly, hub = ((x + c ax) - s ay, (y + s ax) + c ay)."""
+    c, s = math.cos(th), math.sin(th)
+    out = {}
+    for w, (sx, sy) in HUBS.items():
+        ax, ay = sx * lx, sy * ly
+        out[w] = ((x + c * ax) - s * ay, (y + s * ax) + c * ay)
+    return out
 
 
 def ref_plant(rows, on_idx, k_rel, pose, nom):
@@ -349,21 +367,32 @@ def ref_plant(rows, on_idx, k_rel, pose, nom):
             for w in _row_wheels(r):
                 mu[w] = r.p('mu')
         elif r.fault == 'mu_zone':
-            x, y, th = pose
-            c, s = math.cos(th), math.sin(th)
-            for w, (sx, sy) in HUBS.items():
-                hx = x + sx * nom['lx'] * c - sy * nom['ly'] * s
-                hy = y + sx * nom['lx'] * s + sy * nom['ly'] * c
-                if r.p('x0') <= hx < r.p('x1') and r.p('y0') <= hy < r.p('y1'):
+            # bounds as float64 (the decimal rounded once), as the definition says (Codex FP1-1)
+            x0, x1, y0, y1 = (float(r.p(k)) for k in ('x0', 'x1', 'y0', 'y1'))
+            for w, (hx, hy) in hubs(float(pose[0]), float(pose[1]), float(pose[2]),
+                                    float(nom['lx']), float(nom['ly'])).items():
+                if x0 <= hx < x1 and y0 <= hy < y1:
                     mu[w] = r.p('mu')
     return V, mu, b, tc, ts
 
 
-def nominal_problems(nom) -> list:
-    """The nominal values of the record against rpi5/params.py of this tree; mu_hd may be --mu (4 equal)."""
+def nominal_problems(nom, plant_src=None) -> list:
+    """The nominal values of the record against rpi5/params.py of this tree; mu_hd may be --mu (4 equal).
+    Codex FP1-2: this tree's params.py must be the blob the run imported (manifest plant_src), and every
+    nominal value finite and > 0 (lx, ly, motor_* >= 0)."""
     from params import MecanumParams
+    from plant_blob import plant_source
     p = MecanumParams()
     out = []
+    here = plant_source().get('params_py')
+    if not isinstance(plant_src, dict) or not here or plant_src.get('params_py') != here:
+        out.append(f'params.py of this tree ({str(here)[:12]}) is not the one of the run '
+                   f'({str((plant_src or {}).get("params_py"))[:12]}): the nominal values cannot be checked')
+    flat = [nom.get(k) for k in ('V_batt', 'lx', 'ly')] + [v for k in ('mu_hd', 'motor_b', 'motor_Tc', 'motor_Ts')
+                                                            for v in (nom.get(k) or [None])]
+    if not all(type(v) is float and math.isfinite(v) and v >= 0 for v in flat) or \
+            not (nom.get('V_batt', 0) > 0 and all(v > 0 for v in nom.get('mu_hd') or [0])):
+        out.append(f'nominal values not finite floats > 0: {nom!r}')
     for k in ('V_batt', 'lx', 'ly'):
         if nom.get(k) != float(getattr(p, k)):
             out.append(f'nominal {k}={nom.get(k)!r} != params.py {float(getattr(p, k))}')
@@ -377,14 +406,19 @@ def nominal_problems(nom) -> list:
     return out
 
 
-def plant_record_check(npz_path, rows, fm, t0, stop, n, true) -> tuple:
+def plant_record_check(npz_path, rows, fm, t0, stop, n, true, plant_src=None) -> tuple:
     """Check 11: (problems, summary)."""
     prow = [i for i, r in enumerate(rows) if r.fault in PLANT_ROWS]
     pr = fm.get('plant_record')
     if not prow:
         return (['a plant record without plant rows'] if pr is not None else []), None
-    if not isinstance(pr, dict) or not pr.get('file') or not pr.get('sha256'):
+    if not isinstance(pr, dict) or not isinstance(pr.get('file'), str) or not pr.get('sha256'):
         return [f'plant rows but no plant record in the manifest: {pr!r}'], None
+    # Codex FP1-9: a bare file name, next to the frames
+    if os.path.basename(pr['file']) != pr['file'] or pr['file'] in ('', '.', '..') or os.path.isabs(pr['file']):
+        return [f'plant record file {pr["file"]!r} is not a bare file name next to the frames'], None
+    if pr.get('inner') != 'MecanumPlant':                                      # Codex FP1-11
+        return [f'plant record inner plant {pr.get("inner")!r}, plant faults run on MecanumPlant only'], None
     path = os.path.join(os.path.dirname(os.path.abspath(npz_path)), pr['file'])
     if not os.path.isfile(path):
         return [f'plant record {pr["file"]} not found next to the frames'], None
@@ -398,10 +432,12 @@ def plant_record_check(npz_path, rows, fm, t0, stop, n, true) -> tuple:
     if json.loads(str(g['cols'])) != list(REC_COLS) or pr.get('cols') != list(REC_COLS) or \
             rec.ndim != 2 or rec.shape[1] != len(REC_COLS):
         return probs + [f'plant record columns {json.loads(str(g["cols"]))} / shape {rec.shape} not as expected'], None
-    if pr.get('overflow') is not False or pr.get('rows') != len(rec):
+    if pr.get('overflow') is not False or not _is_int(pr.get('rows')) or pr.get('rows') != len(rec):   # FP1-3
         probs.append(f'plant record overflow={pr.get("overflow")!r} rows={pr.get("rows")!r}, file has {len(rec)}')
-    nom = pr.get('nominal') or {}
-    probs += nominal_problems(nom)
+    nom = pr.get('nominal') if isinstance(pr.get('nominal'), dict) else {}
+    nprob = nominal_problems(nom, plant_src)
+    if nprob:
+        return probs + nprob, dict(file=pr['file'], rows=len(rec), steps_ok=None)
     exp_steps = [k for k in range(n) if any(window_on(rows[i], k, t0, stop) for i in prow)]
     steps = [int(v) for v in rec[:, 0]]
     if steps != exp_steps or not np.array_equal(rec[:, 0], np.array(steps, dtype=float)):
@@ -416,12 +452,12 @@ def plant_record_check(npz_path, rows, fm, t0, stop, n, true) -> tuple:
         on = [i for i in prow if window_on(rows[i], k, t0, stop)]
         pose = (row[c['x']], row[c['y']], row[c['theta']])
         V, mu, b, tc, ts = ref_plant(rows, on, k - t0, pose, nom)
-        ok = int(row[c['mask']]) == sum(1 << i for i in on) and abs(row[c['V_batt']] - float(V)) <= SUM_TOL
+        # FP1-3: the mask as recorded equals the expected whole number exactly (no int() cast)
+        ok = bool(row[c['mask']] == float(sum(1 << i for i in on))) and _close(row[c['V_batt']], V)
         for w, suf in enumerate(('fl', 'fr', 'rl', 'rr')):
-            ok &= row[c['mu_' + suf]] == float(mu[w])
-            ok &= abs(row[c['b_' + suf]] - float(b[w])) <= SUM_TOL
-            ok &= abs(row[c['tc_' + suf]] - float(tc[w])) <= SUM_TOL
-            ok &= abs(row[c['ts_' + suf]] - float(ts[w])) <= SUM_TOL
+            ok &= bool(row[c['mu_' + suf]] == float(mu[w]))
+            ok &= _close(row[c['b_' + suf]], b[w]) and _close(row[c['tc_' + suf]], tc[w])
+            ok &= _close(row[c['ts_' + suf]], ts[w])
         if not ok:
             bad_val += 1
             first = k if first is None else first
@@ -516,7 +552,8 @@ def check(npz_path: str, sched_path: str, step_log: str = None) -> dict:
     else:
         tl = None
         fails.append('no step log: the run does not show that no step missed its deadline (design 8.1)')
-    plant_probs, plant = plant_record_check(npz_path, rows, fm, t0, stop, n, true)      # check 11 (batch 2)
+    plant_probs, plant = plant_record_check(npz_path, rows, fm, t0, stop, n, true,
+                                             man.get('plant_src'))         # check 11 (batch 2)
     fails += plant_probs
     diff_frames = int(np.count_nonzero(np.any(mosi != true, axis=1)))
     out.update(ok=not fails, fails=fails, n_frames=n, t0_step=t0, stop_step=stop, sha256=sha,

@@ -125,9 +125,12 @@ def test_nominal_mu_from_dash_mu_is_accepted():
     p = MecanumParams()
     nom = dict(V_batt=p.V_batt, lx=p.lx, ly=p.ly, mu_hd=[0.3] * 4,
                **{k: [float(v) for v in getattr(p, k)] for k in ('motor_b', 'motor_Tc', 'motor_Ts')})
-    assert fc.nominal_problems(nom) == []
+    from plant_blob import plant_source
+    src = plant_source()
+    assert fc.nominal_problems(nom, src) == []
+    assert fc.nominal_problems(nom)                                   # no plant_src: cannot be checked
     nom['mu_hd'] = [0.3, 0.3, 0.2, 0.3]
-    assert fc.nominal_problems(nom)
+    assert fc.nominal_problems(nom, src)
 
 
 def test_record_without_plant_rows_fails(tmp_path):
@@ -151,16 +154,86 @@ def test_finite_run_record_cut_at_stop(tmp_path):
     man = json.loads(str(np.load(p)['manifest']))
     assert man['faults']['cut'] is True                             # RUN ended before the window
     r = fc.check(p, csv_, steps)
-    assert r['plant']['steps_ok'] and r['plant']['values_bad'] == 0
+    # FP1-12: the run fails because its schedule was cut (rule of batch 1), and only for that; the plant record
+    # itself is right: steps up to the stop step, values, pose
+    assert not r['ok']
+    assert all('did not run in full' in m or 'cut' in m for m in r['fails']), r['fails']
+    assert r['plant']['steps_ok'] and r['plant']['values_bad'] == 0 and r['plant']['pose_bad'] == 0
     t0, stop = r['t0_step'], r['stop_step']
     rec = np.load(_rec_path(p))['record']
-    assert int(rec[0, 0]) == t0 + 20 and int(rec[-1, 0]) == stop - 1
+    assert list(rec[:, 0].astype(int)) == list(range(t0 + 20, stop))
 
 
 def test_c7_table_pairs_a_plant_fault_run_with_its_baseline():
     import fault_c7_table as t
-    run = dict(plant='FaultPlant', faults=dict(plant_record=dict(file='x')))
+    run = dict(plant='FaultPlant', faults=dict(plant_record=dict(file='x', inner='MecanumPlant')))
     assert t._man_value(run, 'plant') == t._man_value(dict(plant='MecanumPlant'), 'plant') == 'MecanumPlant'
     assert t._man_value(dict(plant='FaultPlant', faults=dict()), 'plant') == 'FaultPlant'   # no record: not paired
     assert t._man_value(dict(plant='FaultPlant', faults=None), 'plant') == 'FaultPlant'
+    other = dict(plant='FaultPlant', faults=dict(plant_record=dict(file='x', inner='OtherPlant')))
+    assert t._man_value(other, 'plant') == 'OtherPlant'               # FP1-11: the recorded class, not a guess
+    assert t._man_value(dict(plant='FaultPlant', faults=dict(plant_record=dict(file='x'))), 'plant') == 'FaultPlant'
     assert t._man_value(run, 'imu_source') is None
+
+
+# ── Codex vòng 1 (FP1-1, 2, 3, 4, 9, 11) ────────────────────────────────────
+@pytest.mark.parametrize('zone', ['x0=0.12;x1=1;y0=-1;y1=1', 'x0=-0.12;x1=0.12;y0=-1;y1=1',
+                                  'x0=-1;x1=1;y0=0.12;y1=1', 'x0=-1;x1=1;y0=-0.12;y1=0.12'])
+def test_zone_on_the_hub_bounds_passes(tmp_path, zone):              # FP1-1: hubs exactly on a bound at step 0
+    p, csv_, steps = open_loop(tmp_path, body=f'Z1,mu_zone,all,0,1,{zone};mu=0.05\n', steps=50, name='z')
+    r = fc.check(p, csv_, steps)
+    assert r['ok'], r['fails']
+    rec = np.load(_rec_path(p))['record']
+    assert sum(rec[0, C['mu_fl']:C['mu_rr'] + 1] == 0.05) == 2       # two hubs on the closed side, two out
+
+
+def test_mask_and_rows_strict(run, tmp_path):                        # FP1-3
+    r = fc.check(*_tamper_record(run, tmp_path, _set('mask', 0, 0.5)))
+    assert not r['ok']
+    src, csv_, steps = run
+    bad = resave(src, str(tmp_path / 'rows.npz'),
+                 lambda d, m: m['faults']['plant_record'].update(rows=float(m['faults']['plant_record']['rows'])))
+    assert not fc.check(bad, csv_, steps)['ok']
+
+
+def test_large_values_compare_by_ulp():                              # FP1-4
+    from fractions import Fraction
+    from params import MecanumParams
+    import fault_plant as fp
+    base = MecanumParams()
+    r = fs.parse(HEAD + 'J1,wheel_jam,FL,0,1,tc=10000.006172835;b=12345.678901234\n')
+    p, _ = fp.PlantVariant(r, base).at((0,), 0, [0, 0, 0])
+    nom = dict(V_batt=base.V_batt, lx=base.lx, ly=base.ly, mu_hd=[float(v) for v in base.mu_hd],
+               **{k: [float(v) for v in getattr(base, k)] for k in ('motor_b', 'motor_Tc', 'motor_Ts')})
+    V, mu, b, tc, ts = fc.ref_plant(r, [0], 0, (0.0, 0.0, 0.0), nom)
+    assert fc._close(p.motor_Tc[0], tc[0]) and fc._close(p.motor_Ts[0], ts[0]) and fc._close(p.motor_b[0], b[0])
+    assert not fc._close(p.motor_Tc[0] + 1e-6, tc[0]) and not fc._close(float('nan'), Fraction(1))
+
+
+def test_nominal_tied_to_the_run_source(run, tmp_path):              # FP1-2
+    src, csv_, steps = run
+    for name, edit in (('src', lambda d, m: m['plant_src'].update(params_py='0' * 40)),
+                       ('no src', lambda d, m: m.pop('plant_src')),
+                       ('nan', lambda d, m: m['faults']['plant_record']['nominal'].update(mu_hd=[float('nan')] * 4)),
+                       ('zero', lambda d, m: m['faults']['plant_record']['nominal'].update(mu_hd=[0.0] * 4))):
+        r = fc.check(resave(src, str(tmp_path / f'{name}.npz'), edit), csv_, steps)
+        assert not r['ok'] and any('nominal' in m or 'params.py' in m for m in r['fails']), (name, r['fails'])
+
+
+def test_record_file_must_be_a_bare_name(run, tmp_path):             # FP1-9
+    src, csv_, steps = run
+    rp = _rec_path(src)
+    sub = tmp_path / 'other'
+    sub.mkdir()
+    import shutil
+    shutil.copy2(rp, sub / 'rec.npz')
+    for name, f in (('dotdot', '../' + os.path.basename(rp)), ('abs', str(sub / 'rec.npz')),
+                    ('sub', 'other/rec.npz')):
+        bad = resave(src, str(tmp_path / f'{name}.npz'), lambda d, m: m['faults']['plant_record'].update(file=f))
+        assert not fc.check(bad, csv_, steps)['ok'], name
+
+
+def test_record_inner_must_be_mecanum(run, tmp_path):                # FP1-11
+    src, csv_, steps = run
+    bad = resave(src, str(tmp_path / 'i.npz'), lambda d, m: m['faults']['plant_record'].update(inner='OtherPlant'))
+    assert not fc.check(bad, csv_, steps)['ok']

@@ -45,7 +45,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, '..', 'rpi5'))
 import fwsim                                                   # noqa: E402
 import fault_plant                                             # noqa: E402
-from fault_schedule import ActiveSet, Schedule, scale_raw      # noqa: E402
+from fault_schedule import ActiveSet, Schedule, check, has_plant_rows, scale_raw   # noqa: E402
 from imu_model import ImuNoise, imu_from_plant                 # noqa: E402
 from protocol import IMU_RANGES, _to_int16                     # noqa: E402
 
@@ -127,6 +127,9 @@ class FwsimFaults:
         for r in self.schedule.rows:
             if r.end_ms > run_ms:
                 raise ValueError(f'{r.id!r} ends at {r.end_ms} ms, after the run ({run_ms} ms)')
+        if self.schedule.rows:         # Codex FP1-8: the full check of the schedule, also for API callers
+            check(self.schedule.rows, run_ms, 'plant', None if fault_plant.nominal_problem(params) else 'traction')
+        self.has_plant = has_plant_rows(self.schedule.rows)
         self.act = ActiveSet(self.schedule.rows)
         self.X, self.theta_sent = [], np.zeros(4)
         self.rec_tick, self.rec_imu, self.rec_plant = [], [], []
@@ -194,7 +197,8 @@ class FwsimFaults:
             self.act.close(last)
         log['fault_tick'] = np.asarray(self.rec_tick, dtype=float).reshape(-1, 10)
         log['fault_imu'] = np.asarray(self.rec_imu, dtype=float).reshape(-1, 12)
-        log['fault_plant'] = np.asarray(self.rec_plant, dtype=float).reshape(-1, len(fault_plant.RECORD_COLS))
+        if self.has_plant:             # Codex FP1-10: the output of a run without plant rows stays as before
+            log['fault_plant'] = np.asarray(self.rec_plant, dtype=float).reshape(-1, len(fault_plant.RECORD_COLS))
         cut = any(e[3] == 'cut' for e in self.act.events)
         nr = self.act.not_run()
         log['faults'] = dict(self.schedule.describe(), t0_step=0, events=[list(e) for e in self.act.events],
@@ -227,8 +231,10 @@ def write_faults(out, log):
                       'count_sent_fl,count_sent_fr,count_sent_rl,count_sent_rr')
     np.savetxt(os.path.join(out, 'faults_imu.csv'), log['fault_imu'], delimiter=',', comments='', fmt='%.9g',
                header='t,mask,gz_true,ax_true,ay_true,az_true,yaw_true,gz_sent,ax_sent,ay_sent,az_sent,yaw_sent')
-    np.savetxt(os.path.join(out, 'faults_plant.csv'), log['fault_plant'], delimiter=',', comments='', fmt='%.17g',
-               header=','.join(fault_plant.RECORD_COLS))
+    plant = 'fault_plant' in log                      # only with plant rows (Codex FP1-10)
+    if plant:
+        np.savetxt(os.path.join(out, 'faults_plant.csv'), log['fault_plant'], delimiter=',', comments='',
+                   fmt='%.17g', header=','.join(fault_plant.RECORD_COLS))
     with open(os.path.join(out, 'faults.json'), 'w') as f:
         json.dump(log['faults'], f, indent=1)
     with open(os.path.join(out, 'meta.yaml'), 'a', encoding='utf-8') as f:
@@ -237,10 +243,11 @@ def write_faults(out, log):
                 "  - faults_tick.csv: \"every firmware tick: mask (bits 0-3 enc_loss wheels FL FR RL RR, 16 imu_loss, "
                 "32 imu_delay, 64 gyro_scale), counts of the plant wheel angle and counts given to the firmware\"\n"
                 "  - faults_imu.csv: \"every IMU report: mask, true values (after the noise) and values given to "
-                "firmware_view; reports of an imu_loss window are dropped after this row\"\n"
-                "  - faults_plant.csv: \"every plant step with a plant fault row on (batch 2): step, mask of the "
-                "rows on (bit = row index), the parameters used (V_batt, mu_hd, motor_b, motor_Tc, motor_Ts per "
-                "wheel FL FR RL RR) and x, y, theta at the start of the step\"\n")
+                "firmware_view; reports of an imu_loss window are dropped after this row\"\n")
+        if plant:
+            f.write("  - faults_plant.csv: \"every plant step with a plant fault row on (batch 2): step, mask of "
+                    "the rows on (bit = row index), the parameters used (V_batt, mu_hd, motor_b, motor_Tc, motor_Ts "
+                    "per wheel FL FR RL RR) and x, y, theta at the start of the step\"\n")
 
 
 def main():

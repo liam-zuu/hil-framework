@@ -524,11 +524,12 @@ def check_fault_check(run_dir, f):
 
 def _man_value(man, k):
     """Manifest value compared between a fault run and its baseline. Batch 2 (design 2026-11-15 section 4.1): a
-    run with plant faults has plant 'FaultPlant', a wrapper of the MecanumPlant of its baseline; it counts as
-    'MecanumPlant' only when its fault summary carries the plant record of that wrapper."""
+    run with plant faults has plant 'FaultPlant', a wrapper of the plant of its baseline; it counts as the
+    class its plant record names (inner, Codex FP1-11), and stays 'FaultPlant' without one."""
     v = man.get(k)
-    if k == 'plant' and v == 'FaultPlant' and isinstance((man.get('faults') or {}).get('plant_record'), dict):
-        return 'MecanumPlant'
+    pr = (man.get('faults') or {}).get('plant_record')
+    if k == 'plant' and v == 'FaultPlant' and isinstance(pr, dict) and isinstance(pr.get('inner'), str):
+        return pr['inner']
     return v
 
 

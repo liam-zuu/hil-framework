@@ -30,6 +30,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import os
 from typing import Optional, Sequence, Tuple
 
@@ -57,10 +58,22 @@ def nominal_problem(params) -> Optional[str]:
     return None
 
 
+def _finite(v, what: str) -> float:
+    """float(v) or ScheduleError when v has no finite float64 value (Codex FP1-6: a 400-digit number)."""
+    try:
+        f = float(v)
+    except (OverflowError, ValueError, TypeError):
+        raise ScheduleError(f'{what}={v!r} has no float value') from None
+    if not math.isfinite(f):
+        raise ScheduleError(f'{what}={v!r} is not finite')
+    return f
+
+
 def check_params(rows: Sequence[Row], params) -> None:
-    """The plant rows against the nominal parameters of the run: mu <= nominal mu_hd of every wheel it may
-    touch (a fault only makes the floor more slippery, and the traction sub-steps, sized from max(mu_hd), do not
-    grow), v1 <= nominal V_batt. ScheduleError otherwise."""
+    """The plant rows against the nominal parameters of the run: every parameter of a plant row and the nominal
+    mu_hd, V_batt have a finite float value, the nominal ones > 0 (Codex FP1-6); mu <= nominal mu_hd of every
+    wheel it may touch (a fault only makes the floor more slippery, and the traction sub-steps, sized from
+    max(mu_hd), do not grow), v1 <= nominal V_batt. ScheduleError otherwise."""
     if not has_plant_rows(rows):
         return
     prob = nominal_problem(params)
@@ -68,7 +81,14 @@ def check_params(rows: Sequence[Row], params) -> None:
         raise ScheduleError(prob)
     if len(rows) > MAX_ROWS:
         raise ScheduleError(f'a schedule with plant rows has at most {MAX_ROWS} rows')
-    mu0 = np.broadcast_to(np.asarray(params.mu_hd, dtype=float), (4,))
+    mu0 = [_finite(v, 'nominal mu_hd') for v in np.broadcast_to(np.asarray(params.mu_hd, dtype=float), (4,))]
+    if _finite(params.V_batt, 'nominal V_batt') <= 0 or min(mu0) <= 0:
+        raise ScheduleError(f'nominal V_batt {params.V_batt} and mu_hd {mu0} must be > 0')
+    for r in rows:
+        if r.fault in PLANT_FAULTS:
+            for k, v in r.params:
+                if not isinstance(v, int):
+                    _finite(v, f'{r.id!r} {k}')
     for r in rows:
         if r.fault in ('mu_time', 'mu_zone'):
             for w in r.wheels:
@@ -79,14 +99,21 @@ def check_params(rows: Sequence[Row], params) -> None:
 
 
 def contact_points(x, params):
-    """World (x, y) of the four wheel hubs FL, FR, RL, RR for plant state x = [x, y, theta, ...]."""
-    c, s = np.cos(x[2]), np.sin(x[2])
-    return [(x[0] + c * sx * params.lx - s * sy * params.ly, x[1] + s * sx * params.lx + c * sy * params.ly)
-            for sx, sy in HUB_SIGNS]
+    """World (x, y) of the four wheel hubs FL, FR, RL, RR for plant state x = [x, y, theta, ...]. Definition
+    (design 3, Codex FP1-1), in float64 and in this order: c = math.cos(theta), s = math.sin(theta),
+    ax = sx * lx, ay = sy * ly; hub x = (x + c * ax) - s * ay, hub y = (y + s * ax) + c * ay."""
+    px, py, th = float(x[0]), float(x[1]), float(x[2])
+    c, s = math.cos(th), math.sin(th)
+    out = []
+    for sx, sy in HUB_SIGNS:
+        ax, ay = sx * params.lx, sy * params.ly
+        out.append(((px + c * ax) - s * ay, (py + s * ax) + c * ay))
+    return out
 
 
 def zone_mask(row: Row, x, params) -> int:
-    """Bit w set when the hub of wheel w is inside [x0, x1) x [y0, y1)."""
+    """Bit w set when the hub of wheel w is inside [x0, x1) x [y0, y1), the bounds taken as float64 (the
+    decimal of the file rounded once to the nearest float64, Codex FP1-1)."""
     x0, x1, y0, y1 = (float(row.p(k)) for k in ('x0', 'x1', 'y0', 'y1'))
     m = 0
     for w, (px, py) in enumerate(contact_points(x, params)):
@@ -103,10 +130,15 @@ def batt_value(row: Row, k_rel: int, v0: float) -> float:
     return v0 + (v1 - v0) * ((k_rel - row.start_ms) / ramp)
 
 
+RUNTIME_FIELDS = ('motor_enable',)   # written on the nominal object while a run goes (fwsim.simulate: EN of every
+                                     # firmware tick); copied into the variant at every step (Codex FP1-5)
+
+
 class PlantVariant:
     """at(on, k_rel, x) -> (parameters for this step, zone mask). on = ActiveSet.plant_on (row indices of the
     plant rows on, in row order). No row on: the nominal object itself. A copy is built once per (rows on, zone
-    mask) and kept; batt_sag writes V_batt of that copy at every step (the copy is private to this object)."""
+    mask) and kept; at every step the RUNTIME_FIELDS of the nominal object are copied into it and batt_sag
+    writes its V_batt (the copy is private to this object)."""
 
     def __init__(self, rows: Sequence[Row], base):
         self.rows, self.base = list(rows), base
@@ -122,6 +154,8 @@ class PlantVariant:
         p = self._cache.get((on, zm))
         if p is None:
             p = self._cache[(on, zm)] = self._build(on, zm)
+        for f in RUNTIME_FIELDS:
+            setattr(p, f, getattr(self.base, f))
         for i in on:
             if self.rows[i].fault == 'batt_sag':
                 p.V_batt = batt_value(self.rows[i], k_rel, self.base.V_batt)
@@ -220,7 +254,7 @@ class FaultPlant(PlantInterface):
                        **{k: [float(v) for v in np.broadcast_to(np.asarray(getattr(b, k), dtype=float), (4,))]
                           for k in ('mu_hd', 'motor_b', 'motor_Tc', 'motor_Ts')})
         d = dict(file=None, sha256=None, rows=self._n, overflow=self._n > len(self._rec),
-                 cols=list(RECORD_COLS), nominal=nominal)
+                 cols=list(RECORD_COLS), nominal=nominal, inner=type(self.inner).__name__)   # FP1-11
         if self._path:
             np.savez(self._path, record=self._rec[:n], cols=np.array(json.dumps(list(RECORD_COLS))))
             with open(self._path, 'rb') as fh:
@@ -236,7 +270,7 @@ def attach(plant, patcher, frame_log: Optional[str]):
     if patcher is None or not has_plant_rows(patcher.schedule.rows):
         return plant
     from mecanum_plant import MecanumPlant
-    if not isinstance(plant, MecanumPlant):
+    if type(plant) is not MecanumPlant:            # Codex FP1-11: the class itself, not a subclass
         raise ScheduleError(f'plant faults need MecanumPlant, the run has {type(plant).__name__}')
     fp = FaultPlant(plant, patcher, record_path(frame_log) if frame_log else None)
     patcher.plant_hook = fp

@@ -34,7 +34,7 @@ Schedule file (CSV, UTF-8):
                  motor_b += b, motor_Tc += tc, motor_Ts += tc of the wheel (scenario s11)
       batt_sag   target batt; v1 (V, > 0), ramp_ms (int, 0 .. end - start): V_batt goes linearly from its
                  nominal value to v1 in ramp_ms from start (0 = a step), then stays v1 to end (s13)
-      mu_time    target wheels; mu (> 0): mu_hd of the wheel = mu (s15 in time)
+      mu_time    target wheels or all; mu (> 0): mu_hd of the wheel = mu (s15 in time)
       mu_zone    target all; x0 < x1, y0 < y1 (m, world frame), mu (> 0): mu_hd = mu for every wheel whose
                  contact point is inside the rectangle (s15 by position, per wheel, Liam 15/11 Q4)
     A plant fault needs the dynamic plant with ground model 'traction' (plant='traction' in check()); the
@@ -89,6 +89,7 @@ IMU_FAULTS = ('imu_loss', 'imu_delay', 'gyro_scale')
 FRAME_FAULTS = ('enc_loss',) + IMU_FAULTS                 # change bytes of the frame (FramePatcher)
 PLANT_FAULTS = ('wheel_jam', 'batt_sag', 'mu_time', 'mu_zone')   # change the plant (fault_plant.py)
 WHEEL_FAULTS = ('enc_loss', 'wheel_jam', 'mu_time')       # target = wheels joined with '+'
+ALL_WHEELS_OK = ('mu_time',)                              # also target 'all' = FL+FR+RL+RR (design 3, Codex FP1-7)
 # names kept for later parts of batch 2, refused for now: ibus_loss needs the H7 part (design section 5);
 # body_drag, load_dist (s14) come after the main S04 run (Liam 11/11, 15/11 Q3 "Giu sau S04")
 BATCH2 = ('ibus_loss', 'body_drag', 'load_dist')
@@ -120,6 +121,8 @@ class Row:
     def wheels(self) -> Tuple[int, ...]:
         """Wheel indices 0..3 of a wheel row (mu_zone: all four, its zone decides per step), else ()."""
         if self.fault in WHEEL_FAULTS:
+            if self.target == 'all' and self.fault in ALL_WHEELS_OK:
+                return (0, 1, 2, 3)
             return tuple(WHEELS.index(w) for w in self.target.split('+'))
         return (0, 1, 2, 3) if self.fault == 'mu_zone' else ()
 
@@ -220,7 +223,8 @@ def check(rows: Sequence[Row], run_ms: Optional[int], imu_source: Optional[str],
         targets = FAULTS[r.fault][0]
         if targets == 'wheels':
             parts = r.target.split('+')
-            ok = all(p in WHEELS for p in parts) and len(set(parts)) == len(parts)
+            ok = (all(p in WHEELS for p in parts) and len(set(parts)) == len(parts)) or \
+                (r.target == 'all' and r.fault in ALL_WHEELS_OK)
         else:
             ok = r.target in targets
         if not ok:

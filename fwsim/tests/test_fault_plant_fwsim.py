@@ -101,14 +101,16 @@ def test_refuses_values_above_nominal(fw):
 def test_pi_wrapper_and_fwsim_give_the_same_plant(fw, monkeypatch):
     """The same duty sequence through the Pi FaultPlant and through the fwsim wrapper gives the same states:
     duties of the fwsim run (held per step) replayed into a MecanumPlant wrapped by FaultPlant."""
-    s = sched('J1,wheel_jam,RL,300,1500,b=0.05;tc=0.02\nM1,mu_time,FR,800,1800,mu=0.1\n'
+    s = sched('J1,wheel_jam,RL,300,1500,b=0.05;tc=0.02\nM1,mu_time,FR,100,300,mu=0.1\n'
+              'Z1,mu_zone,all,300,2000,x0=0.15;x1=0.3;y0=-1;y1=1;mu=0.05\n'
               'B1,batt_sag,batt,500,1900,v1=9;ramp_ms=400\n', run_ms=2000)
     calls = []
     real = fwsim.plant_step
 
     def spy(x, u, p, dt, rng):
-        calls.append((np.array(x, copy=True), np.array(u, copy=True)))
-        return real(x, u, p, dt, rng)
+        x_new = real(x, u, p, dt, rng)
+        calls.append((np.array(x, copy=True), np.array(u, copy=True), np.array(x_new, copy=True)))
+        return x_new
 
     # under the fault_run wrapper: sees the duty of every step (the wrapper takes it as the real plant_step)
     monkeypatch.setattr(fwsim, 'plant_step', spy)
@@ -120,8 +122,46 @@ def test_pi_wrapper_and_fwsim_give_the_same_plant(fw, monkeypatch):
     inner.reset(list(calls[0][0]))
     plant = fp.FaultPlant(inner, patcher, None)
     patcher.start(0)
-    for k, (x, u) in enumerate(calls[:-1]):
+    for k, (x, u, x_new) in enumerate(calls):                    # every step, the last one too (FP1-12)
         assert np.array_equal(plant.get_state(), x), k
         patcher.patch(k, bytes(FRAME_SIZE))
         plant.step(list(u))
-    assert np.array_equal(plant._rec[:plant._n], log['fault_plant'][:plant._n])
+        assert np.array_equal(plant.get_state(), x_new), k
+    rec = log['fault_plant']
+    assert len(calls) == 2000 and plant._n == len(rec) == 1900               # union of the windows [100, 2000)
+    assert np.array_equal(plant._rec, rec)                                    # the whole record
+    cols = {c: i for i, c in enumerate(fp.RECORD_COLS)}
+    assert np.any(rec[:, cols['mu_fl']] == 0.05) and np.any(rec[rec[:, 0] >= 300, cols['mu_fl']] != 0.05)
+
+
+def test_motor_off_follows_en_with_a_plant_row(fw):                 # Codex FP1-5
+    """EN 0 for the whole run (SWA off): a plant row whose zone no wheel reaches must leave the plant exactly as
+    the baseline with EN 0 (the variant copies the runtime EN of every step)."""
+    far = sched('Z1,mu_zone,all,0,2000,x0=50;x1=60;y0=50;y1=60;mu=0.05\n', run_ms=2000)
+    imu = dict(IMU)
+    a = fault_run.FwsimFaults(fs.Schedule(())).run(fw, _sp, 2.0, MecanumParams(), imu=dict(imu), mode='PID',
+                                                     motor_on=False)
+    b = fault_run.FwsimFaults(far).run(fw, _sp, 2.0, MecanumParams(), imu=dict(imu), mode='PID', motor_on=False)
+    for k in ('omega', 'pose', 'duty', 'count'):
+        assert np.array_equal(a[k], b[k]), k
+    assert len(b['fault_plant']) == 2000
+
+
+def test_run_checks_the_schedule_itself(fw):                         # Codex FP1-8
+    unchecked = fs.Schedule(tuple(fs.parse(HEAD + 'J1,wheel_jam,FL,0,20,b=0.1\nJ2,wheel_jam,FL,10,30,b=0.2\n')))
+    with pytest.raises(fs.ScheduleError):
+        run(fw, unchecked)
+    assert fwsim.plant_step is fault_run._REAL_PLANT_STEP
+
+
+def test_no_plant_row_no_plant_output(fw, tmp_path):                 # Codex FP1-10
+    log = run(fw, fs.Schedule(()), duration=1.0)
+    assert 'fault_plant' not in log
+    fault_run.write_faults(str(tmp_path), log)
+    assert not (tmp_path / 'faults_plant.csv').exists()
+    assert 'faults_plant' not in (tmp_path / 'meta.yaml').read_text(encoding='utf-8')
+    log = run(fw, sched('J1,wheel_jam,FL,0,500,b=0.1\n', run_ms=1000), duration=1.0)
+    out = tmp_path / 'p'
+    out.mkdir()
+    fault_run.write_faults(str(out), log)
+    assert (out / 'faults_plant.csv').exists() and 'faults_plant.csv' in (out / 'meta.yaml').read_text(encoding='utf-8')
