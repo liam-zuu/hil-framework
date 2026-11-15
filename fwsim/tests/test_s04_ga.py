@@ -165,6 +165,55 @@ def test_domain_and_log_coding(tmp_path):
     assert s4.decode(dom, mid)[dom[0]['name']] == pytest.approx(2.0)      # geometric centre of [0.5, 8]
     assert s4.edge_flags(dom, lo + 0.04 * (hi - lo)) == [x['name'] for x in dom]
     assert s4.edge_flags(dom, mid) == []
+    assert all(x['L_src'] == '' and x['H_src'] == '' for x in dom)       # an S03 levels.csv before v8.3
+
+
+# ── S04 v6.4 (C14-2): edge side and level source (design 03_CODE/docs/2026-11-15_Thiet_ke_S03_v83_luoi_noi_v1.md 6)
+
+def test_v64_read_domain_reads_the_level_sources(tmp_path):
+    d = _s03_dir(tmp_path)
+    import csv as _csv
+    rows = list(_csv.DictReader(open(d / 'levels.csv')))
+    for r in rows:
+        r.update(L_nguon='0', H_nguon='hết lưới nối')
+    with open(d / 'levels.csv', 'w', newline='', encoding='utf-8') as f:
+        w = _csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    dom = s4.read_domain(str(d), 'PID')
+    assert all(x['L_src'] == '0' and x['H_src'] == 'hết lưới nối' for x in dom)
+
+
+DOM64 = [dict(name='a', L=1.0, H=2.0, scale='lin', L_src='hết lưới dưới', H_src='hết lưới nối'),
+         dict(name='b', L=1.0, H=3.0, scale='lin', L_src='0', H_src='điểm kế tiếp không hoàn thành'),
+         dict(name='c', L=1.0, H=2.0, scale='lin', L_src='', H_src='')]
+
+
+@pytest.mark.parametrize('x, side, limit', [
+    ((1.02, 2.0, 1.5), 'a:L', 'a:L'),                 # near L, a grid end below: limit
+    ((1.98, 2.0, 1.5), 'a:H', 'a:H'),                 # near H, the extension end: limit
+    ((1.5, 2.95, 1.5), 'b:H', ''),                    # near H, the next point did not complete: no limit
+    ((1.5, 1.02, 1.5), 'b:L', ''),                    # near L = 0 source: no limit
+    ((1.5, 2.0, 1.99), 'c:H', ''),                    # no source (S03 before v8.3): '?', no limit
+    ((1.5, 2.0, 1.5), '', ''),                        # no flag: no limit, whatever the sources
+])
+def test_v64_edge_report_side_source_and_limit(x, side, limit):
+    rep = s4.edge_report(DOM64, np.array(x))
+    assert rep['edge'] == ' '.join(s4.edge_flags(DOM64, np.array(x)))       # the old flag, unchanged
+    assert rep['edge_side'] == side and rep['edge'] == ' '.join(p.split(':')[0] for p in side.split())
+    assert rep['edge_limit'] == (f'vùng ngoài biên chưa khảo sát: {limit}' if limit else '')
+    if side:
+        n, s = side.split(':')
+        src = {('a', 'L'): 'hết lưới dưới', ('a', 'H'): 'hết lưới nối', ('b', 'H'): 'điểm kế tiếp không hoàn thành',
+               ('b', 'L'): '0', ('c', 'H'): '?'}[(n, s)]
+        assert rep['edge_src'] == f'{side}:{src}'
+
+
+def test_v64_summarise_rows_carry_the_edge_columns():
+    finals = {1: [P(0.020, 9.0, x=(1.98, 2.0, 1.5), seed=1)], 2: [P(0.022, 4.0, x=(1.98, 2.0, 1.5), seed=2)]}
+    rows, _ = s4.summarise('PID', DOM64, finals)
+    for r in rows:
+        assert r['edge_side'] == 'a:H' and r['edge_limit'] == 'vùng ngoài biên chưa khảo sát: a:H', r['kind']
 
 
 def test_mu_rule_mid_when_every_point_satisfies(tmp_path):

@@ -202,7 +202,9 @@ def read_domain(s03_dir, ctrl):
         L, H = float(by[n]['L']), float(by[n]['H'])
         if not L < H:
             sys.exit(f'{ctrl} {n}: L = {L} is not below H = {H} (S03 3.1 (ii))')
-        out.append(dict(name=n, L=L, H=H, scale=by[n]['scale']))
+        # S04 v6.4 (C14-2): the source of each level, from the S03 v8.3 levels.csv ('' for an S03 run before v8.3)
+        out.append(dict(name=n, L=L, H=H, scale=by[n]['scale'], L_src=by[n].get('L_nguon') or '',
+                        H_src=by[n].get('H_nguon') or ''))
     return out
 
 
@@ -233,6 +235,37 @@ def edge_flags(dom, x):
     """Factors within EDGE_FRAC of the coded width from a bound (section 2: reported as a limit)."""
     lo, hi = ga_bounds(dom)
     return [d['name'] for d, xi, a, b in zip(dom, x, lo, hi) if min(xi - a, b - xi) <= EDGE_FRAC * (b - a)]
+
+
+GRID_END_SOURCES = ('hết lưới nối', 'hết lưới dưới')   # S03 v8.3 level sources: the grid ended there
+
+
+def edge_sides(dom, x):
+    """[(name, 'L' | 'H')] of the factors flagged by edge_flags (same formula), with the side of the bound
+    they are near (S04 v6.4 section 2)."""
+    lo, hi = ga_bounds(dom)
+    out = []
+    for d, xi, a, b in zip(dom, x, lo, hi):
+        w = EDGE_FRAC * (b - a)
+        if xi - a <= w:
+            out.append((d['name'], 'L'))
+        elif b - xi <= w:
+            out.append((d['name'], 'H'))
+    return out
+
+
+def edge_report(dom, x):
+    """selected.csv edge columns (S04 v6.4 section 2, C14-2): edge = the flagged factors (unchanged);
+    edge_side = factor:side; edge_src = factor:side:source of that bound (S03 levels.csv, '?' when the S03 run
+    has none); edge_limit = the flagged factors whose bound on that side is a grid end ('hết lưới nối',
+    'hết lưới dưới'): the limit 'vùng ngoài biên chưa khảo sát'. No flag, no limit, whatever the sources."""
+    by = {d['name']: d for d in dom}
+    sides = edge_sides(dom, x)
+    src = [(n, s, by[n].get('L_src' if s == 'L' else 'H_src') or '') for n, s in sides]
+    lim = [f'{n}:{s}' for n, s, c in src if c in GRID_END_SOURCES]
+    return dict(edge=' '.join(edge_flags(dom, x)), edge_side=' '.join(f'{n}:{s}' for n, s in sides),
+                edge_src=' | '.join(f'{n}:{s}:{c or "?"}' for n, s, c in src),
+                edge_limit=('vùng ngoài biên chưa khảo sát: ' + ' '.join(lim)) if lim else '')
 
 
 def mu_rule(s03_dir, ctrl, gate, mu_levels):
@@ -536,7 +569,7 @@ def summarise(ctrl, dom, finals):
         feas_sets += nd
         per.append(ch)
         rows.append(dict(base, gen=ch['gen'], cand_id=ch['cand_id'], f1=ch['f1'], f2=ch['f2'],
-                         edge=' '.join(edge_flags(dom, ch['xga'])), **gain_cols(dom, ch)))
+                         **edge_report(dom, ch['xga']), **gain_cols(dom, ch)))
     n_seeds, n_feas = len(finals), len(per)
     stats = {}
     if per:
@@ -549,7 +582,7 @@ def summarise(ctrl, dom, finals):
     else:
         ch = select(feas_sets)
         rows.append(dict(kind='send_to_HIL', controller=ctrl, ga_seed=ch['ga_seed'], feasible=True, gen=ch['gen'],
-                         cand_id=ch['cand_id'], f1=ch['f1'], f2=ch['f2'], edge=' '.join(edge_flags(dom, ch['xga'])),
+                         cand_id=ch['cand_id'], f1=ch['f1'], f2=ch['f2'], **edge_report(dom, ch['xga']),
                          **gain_cols(dom, ch)))
     return rows, dict(n_seeds=n_seeds, n_feasible_seeds=n_feas, per_seed_selected=stats)
 
@@ -1195,7 +1228,7 @@ def write_meta(path, a, fw, ctrl, extra, pymoo, eval_mu):
     plant = {repr(m): json.loads(fwsim.plant_meta(fwsim.plant_params(argparse.Namespace(ground='traction', mu=m))))
              for m in eval_mu}
     with open(path, 'w', encoding='utf-8') as f:
-        f.write(f"""spec: S04 v5 (06_SPECS/2026-11-05_Spec_S04_GA_chon_gain.md)
+        f.write(f"""spec: S04 v6.4 (06_SPECS/2026-11-05_Spec_S04_GA_chon_gain.md)
 date: {time.strftime('%Y-%m-%d')}
 setup: sim                     # fwsim: ESP32 firmware C code (DLL) + rpi5/plant_step.py, NOT hardware
 operator: Claude (phiên CODE)
@@ -1219,6 +1252,7 @@ pymoo: {json.dumps(dict(version=pymoo.__version__, checked_version=PYMOO_CHECKED
 libraries: {json.dumps(fwsim.lib_versions())}
 interpretations:   # of this script, not written in S04 v5; Liam or THESIS correct if wrong
   - "a new script fwsim/s04_ga.py (S04 9.1 names tune_ga.py): tune_ga.py keeps its velocity objective for the old runs, unchanged"
+  - "S04 v6.4 (C14-2; Liam 15/11 CODE_FEAS 'Code ngay + Codex'): selected.csv keeps edge (the 5 % flag, formula unchanged) and adds edge_side (factor:L or :H), edge_src (factor:side:source of that bound from the S03 levels.csv L_nguon / H_nguon, ? when the S03 run has none) and edge_limit (the flagged factors whose bound is a grid end, 'het luoi noi' or 'het luoi duoi': the limit 'vung ngoai bien chua khao sat'); no flag, no limit; RSM candidates (section 12) are not in this script yet"
   - "mu rule: every S03 design point that ran (centre, outer, inner box: the inner box always runs since L41), every gate speed; status other than ok (track_err, run_error) or y1 inconclusive at any mu is 'not satisfied'"
   - "HV: exact 2-D staircase on the feasible non-dominated points of the population after each generation's survival, strictly inside the reference; the trial rule compares generation gen_base with gen_base - 5 (15 and 20); with --tool-check and gen_base < 6 with generation 1"
   - "pareto.csv: per seed's final population, the non-dominated points among the feasible points and, separately, among the infeasible points (column feasible; nondominated_feasible true only for the first group, nondominated_in_group true for both); always written with its header, also when empty; final_population.csv: every point of it with both flags (S04 8)"
