@@ -245,6 +245,8 @@ def write_bench(d, kind=None):
             args = args.replace('--seed 0', '--seed 1')
         if fault and kind == 'args_bad':
             args += ' --ground mud'
+        if kind == 'args_tilde':                               # C7T5-1: ~ expanded in one run only
+            args += ' --uart-port=~/uart' if fault else ' --uart-port ~/uart'
         if kind == 'args_shell':                               # C7T4-1: bash expands the braces of one run only
             args += " --uart-port {unused,--ground,rigid}" if fault else " --uart-port '{unused,--ground,rigid}'"
         if kind == 'args_repeat':                              # C7T2-1: argparse keeps the last --ground
@@ -481,8 +483,26 @@ def test_run_args_with_a_shell_character(ch):
 
 
 def test_run_args_tilde_and_blanks_kept():
-    """A leading ~ and blanks (tabs too) are what bash and shlex both handle: still read."""
-    assert ct._run_args('--test A-W1\t--seed  0 --faults ~/fault_c7/x.csv') == ct._run_args('--test A-W1 --seed 0')
+    """A ~ in --faults / --step-log (left out of the comparison) and blanks (tabs too): still read."""
+    assert ct._run_args('--test A-W1\t--seed  0 --faults ~/fault_c7/x.csv --step-log ~/s.csv') == \
+        ct._run_args('--test A-W1 --seed 0')
+    assert ct._run_args('--test A-W1 --faults=~/x.csv --step-log=~/s.csv') == ct._run_args('--test A-W1')
+
+
+@pytest.mark.parametrize('args', ['--test A-W1 --uart-port ~/uart', '--test A-W1 --uart-port=~/uart',
+                                  '--test A-W1 --uart-port /dev/tty~1'])
+def test_run_args_tilde_in_a_compared_option(args):
+    """C7T5-1: bash expands ~ at the start of a word only ('--uart-port ~/uart' -> <HOME>/uart, '=~/uart' kept),
+    shlex never: a ~ in an option that is compared is refused, in either form."""
+    with pytest.raises(ct.TableError, match='~ in --uart-port'):
+        ct._run_args(args)
+
+
+def test_bench_tilde_pair_refused(tmp_path, fake_check):
+    """C7T5-1 through a bench folder: the pair of the round-5 counterexample."""
+    write_bench(str(tmp_path), 'args_tilde')
+    with pytest.raises(ct.TableError, match='~ in --uart-port'):
+        ct.table(str(tmp_path))
 
 
 def test_bench_same_options_abbreviated(tmp_path, fake_check):

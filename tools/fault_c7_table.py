@@ -75,7 +75,8 @@ fault_check_<run>.json. The same columns as the fwsim table, from two clocks:
     (first change of sp_vx, sp_vy, sp_wz in the ESP32 rows, ESP32 time).
   * Same run but for the schedule: session.json run args equal as rpi5/run_hil.py's own parser reads them
     (run_options: abbreviations, the last of a repeated option, --opt=value, any order; C7T1-10, C7T2-1,
-    C7T3-1; args with a shell character refused, C7T4-1), without --faults / --step-log, same ESP32 and H7 #fw, same manifest
+    C7T3-1; args with a shell character refused, C7T4-1, and a ~ outside --faults / --step-log, C7T5-1),
+    without --faults / --step-log, same ESP32 and H7 #fw, same manifest
     imu_source, imu_noise, plant_src, proto, same #gain line (without first_seq, line_drop, boot), else exit 2;
     a run that bench_summary.json does not call clean cannot be tabled either. A fault run is tabled only if
     tools/fault_check.check() passes again on this folder's frame log, the schedule its fault_check_<run>.json
@@ -287,8 +288,10 @@ MAN_SAME = ('imu_source', 'imu_noise', 'plant_src', 'proto', 'frame_len', 'plant
 RUN_SKIP = ('faults', 'step_log')                                     # argparse dests of --faults, --step-log
 # C7T4-1: characters bash on the Pi acts on before run_hil.py sees the words (tools/hil_bench_session.py puts
 # the args of a run into a bash command line as they are): quotes, escapes, expansions, globs, comments,
-# command separators. Without them bash only splits on blanks and expands a leading ~ (the same for the two
-# runs of a pair on one Pi), which is what shlex.split does here.
+# command separators. Without them bash splits on blanks, as shlex.split does here, and expands ~ only at the
+# start of a word (C7T5-1: '--uart-port ~/u' becomes <HOME>/u, '--uart-port=~/u' stays ~/u), which shlex does
+# not do: so a ~ in the value of any option but --faults / --step-log (left out of the comparison) is refused
+# after run_hil.py's parser (run_options).
 SHELL_CHARS = frozenset('{}[]$`*?()!;&|<>"\'\\#\n\r')
 
 
@@ -298,7 +301,7 @@ def run_options(args):
     repeated option, '--opt=value' and the order are what run_hil.py makes of them. A value equal to a default
     and the default itself stay apart (None vs 'traction'): such a pair is refused, not matched. Args run_hil.py
     refuses are TableError, and so are args with SHELL_CHARS (C7T4-1: bash would change them before run_hil.py,
-    shlex here would not)."""
+    shlex here would not) and a ~ in any option value but faults, step_log (C7T5-1)."""
     import contextlib
     import io
     import shlex
@@ -316,7 +319,13 @@ def run_options(args):
         raise TableError(f'run args {args!r}: run_hil.py refuses them ({err.getvalue().strip()[-300:]})')
     finally:
         sys.argv = old
-    return vars(ns)
+    opts = vars(ns)
+    for k, v in opts.items():                                          # C7T5-1
+        vals = v if isinstance(v, (list, tuple)) else [v]
+        if k not in RUN_SKIP and any(isinstance(x, str) and '~' in x for x in vals):
+            raise TableError(f'run args {args!r}: ~ in --{k.replace("_", "-")} (bash expands it at the start of a '
+                             f'word only, C7T5-1)')
+    return opts
 
 
 def _run_args(args):
