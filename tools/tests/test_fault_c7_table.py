@@ -245,6 +245,8 @@ def write_bench(d, kind=None):
             args = args.replace('--seed 0', '--seed 1')
         if fault and kind == 'args_bad':
             args += ' --ground mud'
+        if kind == 'args_shell':                               # C7T4-1: bash expands the braces of one run only
+            args += " --uart-port {unused,--ground,rigid}" if fault else " --uart-port '{unused,--ground,rigid}'"
         if kind == 'args_repeat':                              # C7T2-1: argparse keeps the last --ground
             args = args.replace('--ground traction', '--ground traction --ground rigid' if fault else
                                 '--ground rigid --ground traction')
@@ -424,6 +426,7 @@ def test_bench_columns_extend_the_fwsim_ones(tmp_path, fake_check):
     ('args_repeat', 'run args'),
     ('args_abbrev', 'run args'),
     ('args_bad', 'run_hil.py refuses'),
+    ('args_shell', 'shell characters'),
     ('frame_no', 'frame_no is not step_first'),
     ('run_id0', 'run_id 0'),
     ('dtype', 'uint8'),
@@ -463,6 +466,23 @@ def test_run_args_without_the_schedule():
         ct.task_duration('--test A-W1 --test A-K1')                            # the last wins
     with pytest.raises(ct.TableError, match='no --test'):
         ct.task_duration('--seed 0')
+
+
+BASH_CHARS = list('{}[]$`*?()!;&|<>"#') + ["'", '\\', '\n', '\r']    # written here, not taken from the tool
+
+
+@pytest.mark.parametrize('ch', BASH_CHARS)
+def test_run_args_with_a_shell_character(ch):
+    """C7T4-1: every character bash acts on before run_hil.py is refused, wherever it is in the args."""
+    with pytest.raises(ct.TableError, match='shell characters'):
+        ct._run_args(f'--test A-W1 --uart-port x{ch}y')
+    with pytest.raises(ct.TableError, match='shell characters'):
+        ct.task_duration(f'--test A-W1 --faults ~/a{ch}.csv')
+
+
+def test_run_args_tilde_and_blanks_kept():
+    """A leading ~ and blanks (tabs too) are what bash and shlex both handle: still read."""
+    assert ct._run_args('--test A-W1\t--seed  0 --faults ~/fault_c7/x.csv') == ct._run_args('--test A-W1 --seed 0')
 
 
 def test_bench_same_options_abbreviated(tmp_path, fake_check):
