@@ -287,3 +287,32 @@ def test_g1_fields_checked_like_rq3_log(completed, f, why):
     if why != 'only for a completed run':                            # the extra rule of gate(), not in rq3_log
         with pytest.raises((r.LogError, ValueError, TypeError)):
             r.gate_g1_fields(dict(f, q='true', state='dat'), 'SIM')
+
+
+class _FloatInfAsFloat(float):          # stored value finite, float(x) inf
+    def __float__(self):
+        return INF
+
+
+class _FloatFiniteAsFloat(float):       # stored value inf, float(x) finite
+    def __float__(self):
+        return 35.0
+
+
+@pytest.mark.parametrize('t1, ok', [(_FloatInfAsFloat(35.0), False), (_FloatFiniteAsFloat(INF), True)])
+def test_g1_times_judged_as_rq3_log_on_float_subclasses(t1, ok):
+    """G1F3-1 (Codex round 3): the finiteness of a time is that of float(x), as rq3_log._time, so a float subclass
+    that overrides __float__ is accepted or refused the same way by gate() and by rq3_log."""
+    f = dict(_OK, t1=t1, prog_before_t1=True, cond25_before_deadline=True)
+    r = _rq3()
+    try:
+        r.gate_g1_fields(dict(f, q='true', state='dat'), 'SIM')
+        rq3_ok = True
+    except r.LogError:
+        rq3_ok = False
+    assert rq3_ok == ok
+    if ok:
+        G.gate(_frames(), 'true', v_cmd_max=0.7, wz_cmd_max=1.6, u_t=0.0, g1_fields=f)
+    else:
+        with pytest.raises(ValueError, match='finite time'):
+            G.gate(_frames(), 'true', v_cmd_max=0.7, wz_cmd_max=1.6, u_t=0.0, g1_fields=f)
