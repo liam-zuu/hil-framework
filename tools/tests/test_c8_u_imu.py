@@ -81,7 +81,7 @@ def make_log(path, rate, t_end, s_plus=0.0, s_minus=0.0, drift=0.0, lat=0.004, l
     return ts, imu
 
 
-def turns(n_turns, w, sign, t_still=3.0, t_start=10.0):
+def turns(n_turns, w, sign, t_still=3.5, t_start=10.0):
     """Rate profile: still, n_turns at |w| rad/s with sign, still. Returns (rate, t_end)."""
     t_rot = n_turns * 2 * math.pi / w
     a, b = t_start + t_still, t_start + t_still + t_rot
@@ -401,6 +401,107 @@ def test_cu21_eps_and_times(tmp_path):
                tail_s=1.0)
     m = d['muc']['O1-F08']
     assert m['eps_max_deg'] > 1.0 and m['luc_chay'] and 'n_late' in m['logs'][0]
+
+
+# ── Codex round 2 (Liam 15/11 "Sua + vong 3") ────────────────────────────────────────────────
+
+def test_cu2_1_turn_totals_on_sample_time():
+    """Step at sample time 0.095 s inside [0, 0.10]; receive times end the window one report early."""
+    S = dict(t_all=np.array([-.055, -.005, .045, .095, .145]), psi_all=np.array([0, 0, 0, .1, .1]),
+             n_all=np.arange(5), t_recv=np.array([0, .05, .10, .15, .20]))
+    P, N = U.turn_totals(S, 0.0, 0.10)
+    assert P == pytest.approx(0.1) and N == 0.0
+
+
+def test_cu2_2_no_yaw_from_the_report_before_an_unrecoverable_gap(tmp_path):
+    p = str(tmp_path / 'a.csv')
+    make_log(p, lambda t: 0.3, 13.0, miss=set(range(20, 34)), late={34: 0.004})
+    S = U.rv_samples(U.load_log(p), period_s=T0)
+    t_after = S['t'][S['t'] > 10.0 + 33 * T0][0]           # first kept report after the gap
+    t_before = S['t'][S['t'] < 10.0 + 20 * T0][-1]          # last kept report before it
+    v = U.interp_yaw(S, np.array([t_before - 0.03, t_before, t_after, t_after + 0.002]))
+    assert np.isfinite(v[0]) and np.all(np.isnan(v[1:]))
+
+
+def test_cu2_3_valid_jitter_accepted(tmp_path):
+    p = str(tmp_path / 'a.csv')
+    make_log(p, lambda t: 0.3, 15.0, lat=0.0, late={k: (0.0, 0.004, 0.008)[k % 3] for k in range(200)})
+    S = U.rv_samples(U.load_log(p), period_s=T0, j_lim=0.005)
+    assert S['n_late'] == 0 and S['period_fit_s'] == pytest.approx(T0, rel=1e-3)
+
+
+def test_cu2_missing_report_at_reversal_bounded(tmp_path):
+    """The report at the turn-around never arrives (gyro does): P, N must still cover the true 1 rad each."""
+    p = str(tmp_path / 'a.csv')
+    make_log(p, lambda t: 2.0 if 11.0 <= t < 11.5 else (-2.0 if 11.5 <= t < 12.0 else 0.0), 14.0,
+             miss={30}, gyro_miss=set())
+    S = U.rv_samples(U.load_log(p), period_s=T0)
+    P, N = U.turn_totals(S, 10.5, 13.5)
+    assert 1.0 <= P <= 1.15 and 1.0 <= N <= 1.15
+
+
+def test_cu4_api_no_yaw_after_reset(tmp_path):
+    p = str(tmp_path / 'a.csv')
+    make_log(p, lambda t: 0.3, 14.0, reset_at=12.0)
+    S = U.rv_samples(U.load_log(p), period_s=T0)
+    v = U.interp_yaw(S, np.array([11.0, 12.5, 13.5]))
+    assert np.isfinite(v[0]) and np.isnan(v[1]) and np.isnan(v[2])
+
+
+def test_cu8_log_ending_while_active_refused(tmp_path):
+    p = str(tmp_path / 'a.csv')
+    make_log(p, lambda t: 0.0, 24.0, run=(12.0, 30.0))
+    g = _globals()
+    with pytest.raises(U.InputError, match='CU-8'):
+        U.tong('O1-K1', [p], g['thang'], g['troi'], g['tre'], u_g=0.01, le=0.25, out=str(tmp_path / 'u.json'),
+               tail_s=0.5)
+    c8, _, _ = _c8_log(tmp_path, name='c.csv')
+    with pytest.raises(U.InputError):
+        U.tong('O1-F08', [c8], g['thang'], g['troi'], g['tre'], u_g=0.01, le=0.25, out=str(tmp_path / 'u.json'),
+               tail_s=0.0)
+
+
+def test_cu16_still_29_s_refused(tmp_path):
+    p = str(tmp_path / 'a.csv')
+    rate, t_end = turns(5, 2.5, 1, t_still=2.9)
+    make_log(p, rate, t_end)
+    with pytest.raises(U.InputError, match='still part'):
+        U.thang(p, n_vong=5, chieu='ccw', period_s=T0)
+
+
+def test_cu17_kiem_checks_u_file(tmp_path):
+    fr, lg = _c8_pair(tmp_path)
+    u = _u_file(tmp_path, lg, tau=0.004)
+    u['q'] = -1.0
+    with pytest.raises(U.InputError):
+        U.kiem(fr, lg, 0.5, u, 'O1-F08', u_psi=math.radians(0.5))
+    u2 = dict(u, q=0.0002, version='v0')
+    with pytest.raises(U.InputError):
+        U.kiem(fr, lg, 0.5, u2, 'O1-F08', u_psi=math.radians(0.5))
+
+
+def test_cu21_n_late_in_troi_and_kiem(tmp_path):
+    p = str(tmp_path / 'a.csv')
+    make_log(p, lambda t: 0.0, 30.0)
+    r = U.troi([p], period_s=T0, min_dt=2.0)
+    assert r['files'][0]['n_late'] == 0
+    fr, lg = _c8_pair(tmp_path)
+    u = _u_file(tmp_path, lg, tau=0.004)
+    assert U.kiem(fr, lg, 0.5, u, 'O1-F08', u_psi=math.radians(0.5))['n_late'] == 0
+
+
+def test_cu12_tre_common_frame_set(tmp_path):
+    """Two missing reports in the run: frames near the gap are compared at some delays only; the fit stays on one
+    frame set and finds the delay."""
+    a = 13.0
+    t1 = a + math.radians(300) / 2.0
+    t2 = t1 + math.radians(300) / 2.0
+    rate = lambda t: 2.0 if a <= t < t1 else (-2.0 if t1 <= t < t2 else 0.0)      # noqa: E731
+    lg, fr = str(tmp_path / 'g.csv'), str(tmp_path / 'g_frames.csv')
+    make_log(lg, rate, a + 23.0, lat=0.004, run=(a, a + 16.0), miss={90, 91}, gyro_miss=set())
+    write_frames(fr, rate, 10.0, a + 23.0, offset=0.5)
+    r = U.tre_one(fr, lg, 0.5)
+    assert r['tau_s'] == pytest.approx(0.004, abs=0.001) and math.isfinite(r['rms_rad'])
 
 
 # ── scale (thang) ─────────────────────────────────────────────────────────────────────

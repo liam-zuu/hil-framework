@@ -74,7 +74,8 @@ PERIOD_TOL = 0.02          # CU-1: the fitted period must stay within +-2 % of P
 J_LIM_S = 0.005            # design 3 step 2 [DE XUAT]
 H_LIM_S = 0.105            # Liam 15/11 "Doi sang 105 ms"
 LE = 0.25                  # Liam 15/11 "+25 %"
-MIN_STILL_S = 2.8          # design 2.1 / 9: >= 3 s still, edges known to one report (CU-16)
+MIN_STILL_S = 3.0          # design 2.1 / 9: >= 3 s still, on the gyro report times (CU-16)
+MAX_LATE = 0.2             # CU-1: at most 20 % of the reports off the grid
 END_STILL_S = 3.0          # kiem closure: still frames in [t_off + tail, t_off + tail + 3 s] (CU-14)
 T_CMD_TOL_S = 0.1          # CU-8: run_active at least T_cmd - 0.1 s
 FORBIDDEN = {'sealed', 'sealed_test', 'o1_feas'}
@@ -190,24 +191,20 @@ def report_rows(n, age):
 
 
 def _grid(r, period_s, j_lim):
-    """Index n of each receive time on the report grid (period locked, CU-1) and the residual j to the fit."""
-    d = np.diff(r)
-    good = d[(d > 0.5 * period_s) & (d < 1.5 * period_s)]
-    b_hat = float(np.median(good)) if good.size else float('nan')
-    if not (abs(b_hat / period_s - 1.0) <= PERIOD_TOL):
-        raise InputError(f'report spacing {b_hat * 1e3:.2f} ms is not the locked period {period_s * 1e3:.0f} ms '
-                         f'+-{PERIOD_TOL:.0%} (CU-1)')
+    """Index n of each receive time on the report grid of the LOCKED period (CU-1, CU2-3: no median of the
+    spacings), line fit r = a + b n on the inliers, residual j. The fitted period must stay within +-2 % and at
+    most MAX_LATE of the reports may be off the grid."""
     n = np.zeros(len(r), dtype=int)
     i_lt = 0                                   # last trusted report
     for k in range(1, len(r)):
-        m = max(1, int(round((r[k] - r[i_lt]) / b_hat)))
+        m = max(1, int(round((r[k] - r[i_lt]) / period_s)))
         n[k] = n[i_lt] + m
-        if abs(r[k] - (r[i_lt] + m * b_hat)) <= 0.25 * b_hat:
+        if abs(r[k] - (r[i_lt] + m * period_s)) <= 0.25 * period_s:
             i_lt = k
     inl = np.ones(len(r), dtype=bool)
     for _ in range(10):
         if inl.sum() < 2:
-            raise InputError('fewer than two IMU reports on the grid')
+            raise InputError('fewer than two IMU reports on the grid (CU-1)')
         b, a = np.polyfit(n[inl], r[inl], 1)
         j = r - (a + b * n)
         new = np.abs(j) <= j_lim
@@ -216,6 +213,8 @@ def _grid(r, period_s, j_lim):
         inl = new
     if not (abs(b / period_s - 1.0) <= PERIOD_TOL):
         raise InputError(f'fitted report period {b * 1e3:.2f} ms outside {period_s * 1e3:.0f} ms +-{PERIOD_TOL:.0%} (CU-1)')
+    if (~inl).sum() > MAX_LATE * len(r):
+        raise InputError(f'{(~inl).sum()} of {len(r)} reports more than {j_lim * 1e3:.0f} ms off the grid (CU-1)')
     return n, a, b, j, inl
 
 
@@ -241,9 +240,11 @@ def _gz_integral(tg, gz, a, b, h_lim):
 
 
 def rv_samples(L, period_s=PERIOD_S, tau_hat=0.0, s_plus=0.0, s_minus=0.0, j_lim=J_LIM_S, h_lim=H_LIM_S):
-    """Game rotation vector samples of a log. t, psi: the kept reports (sample time on the grid, ESP32 clock;
-    unwrapped scale-corrected yaw), usable up to t_break; psi_all, t_recv: every report (turn totals);
-    resets: receive times where reset_n changed."""
+    """Game rotation vector samples of a log. Every report: t_all (grid sample time minus tau_hat, ESP32 clock),
+    psi_all (unwrapped, scale-corrected yaw), n_all (grid index), t_recv; kept reports (on the grid): t, psi.
+    t_break (same clock as t): the yaw is not usable from the last report before a gap that could not be
+    unwrapped (CU-3, CU2-2) or before an IMU reset (CU-4); resets: row times where reset_n changed.
+    Also tg, gz: the gyro reports (receive times), for turn_totals."""
     for v, w in ((tau_hat, 'tau_hat'), (s_plus, 's_plus'), (s_minus, 's_minus'), (j_lim, 'j_lim'), (h_lim, 'h_lim')):
         _finite(v, w)
     if not (-0.1 < s_plus < 0.1 and -0.1 < s_minus < 0.1):
@@ -258,61 +259,77 @@ def rv_samples(L, period_s=PERIOD_S, tau_hat=0.0, s_plus=0.0, s_minus=0.0, j_lim
     if not np.all(np.isfinite(y)):
         raise InputError(f'{L.get("path")}: yaw_rad not finite')
     n, a, b, j, keep = _grid(r, period_s, j_lim)
+    t_all = a + b * n - tau_hat
     tg, gz = gyro_samples(L) if np.any(L['gyro_n'] > 0) else (np.array([]), np.array([]))
     d0 = (np.diff(y) + math.pi) % (2 * math.pi) - math.pi
     d = d0.copy()
     t_break = math.inf
     for k in np.nonzero(np.diff(r) > h_lim)[0]:              # CU-3: branch over a long gap from the gyro
         ig = _gz_integral(tg, gz, r[k], r[k + 1], h_lim)
-        if ig is None:
-            t_break = min(t_break, r[k + 1])
-            continue
-        m = round((ig - d0[k]) / (2 * math.pi))
-        d[k] = d0[k] + 2 * math.pi * m
-        if abs(d[k] - ig) > math.pi / 2:
-            t_break = min(t_break, r[k + 1])
-    d = np.where(d > 0, d / (1.0 + s_plus), d / (1.0 + s_minus))
-    psi = y[0] + np.concatenate([[0.0], np.cumsum(d)])
-    t = a + b * n - tau_hat
+        if ig is not None:
+            m = round((ig - d0[k]) / (2 * math.pi))
+            d[k] = d0[k] + 2 * math.pi * m
+        if ig is None or abs(d[k] - ig) > math.pi / 2:
+            t_break = min(t_break, t_all[k])                  # CU2-2: from the report BEFORE the gap
     rs = L['reset_n']
     ch = np.nonzero(np.diff(rs) != 0)[0] + 1
     resets = [float(L['timestamp_us'][i] * 1e-6) for i in ch]
-    return dict(t=t[keep], psi=psi[keep], psi_all=psi, t_recv=r, j=j, keep=keep, n_samples=int(idx.size),
-                n_late=int((~keep).sum()), period_fit_s=float(b), rows=idx, h_lim=h_lim,
-                t_break=t_break - tau_hat if math.isfinite(t_break) else math.inf, t_break_recv=t_break,
-                resets=resets)
+    for tr in resets:                                        # CU-4: no yaw from the last report before a reset
+        k = int(np.searchsorted(r, tr, 'left')) - 1
+        t_break = min(t_break, t_all[max(k, 0)])
+    d = np.where(d > 0, d / (1.0 + s_plus), d / (1.0 + s_minus))
+    psi = y[0] + np.concatenate([[0.0], np.cumsum(d)])
+    return dict(t=t_all[keep], psi=psi[keep], t_all=t_all, psi_all=psi, n_all=n, t_recv=r, j=j, keep=keep,
+                n_samples=int(idx.size), n_late=int((~keep).sum()), period_fit_s=float(b), rows=idx, h_lim=h_lim,
+                t_break=t_break, resets=resets, tg=tg, gz=gz)
 
 
 def interp_yaw(S, t, h_lim=None):
-    """IMU yaw at times t (same clock as S['t']): linear between two kept reports at most h_lim apart and
-    before a gap that could not be unwrapped (S['t_break']); NaN otherwise."""
+    """IMU yaw at times t (same clock as S['t']): linear between two kept reports at most h_lim apart, strictly
+    before S['t_break']; NaN otherwise."""
     h_lim = S.get('h_lim', H_LIM_S) if h_lim is None else h_lim
     t = np.atleast_1d(np.asarray(t, dtype=float))
     ts, ps = S['t'], S['psi']
+    tb = S.get('t_break', math.inf)
     out = np.full(t.shape, np.nan)
     i = np.searchsorted(ts, t, side='right')
-    ok = (i > 0) & (i < len(ts)) & (t < S.get('t_break', math.inf))
+    ok = (i > 0) & (i < len(ts)) & (t < tb)
     i0, i1 = i[ok] - 1, i[ok]
     gap = ts[i1] - ts[i0]
     w = (t[ok] - ts[i0]) / gap
     v = np.where(gap <= h_lim + 1e-9, ps[i0] + w * (ps[i1] - ps[i0]), np.nan)
     out[ok] = v
-    exact = np.isin(t, ts) & (t < S.get('t_break', math.inf))
+    exact = np.isin(t, ts) & (t < tb)
     if exact.any():
         out[exact] = np.interp(t[exact], ts, ps)
     return out
 
 
 def turn_totals(S, w0, w1):
-    """CU-2: total CCW (P) and CW (N) turn over [w0, w1] (receive times) from EVERY report, with the reports
-    bounding the window on both sides."""
-    tr, ps = S['t_recv'], S['psi_all']
-    if tr[0] > w0 or tr[-1] < w1:
+    """Total CCW (P) and CW (N) turn over [w0, w1] on the SAMPLE-time base of the reports (CU2-1), from every
+    report (CU-2), with reports bounding the window on both sides. Across missing reports (grid index step > 1)
+    a turn back and forth can hide: both P and N get max|gz| over the gap times its length (CU-2), which needs
+    gyro reports at most h_lim apart there."""
+    ta, ps, na = S['t_all'], S['psi_all'], S['n_all']
+    if ta[0] > w0 or ta[-1] < w1:
         raise InputError('IMU reports do not cover the window')
-    i0 = int(np.searchsorted(tr, w0, 'right') - 1)
-    i1 = int(np.searchsorted(tr, w1, 'left'))
+    i0 = int(np.searchsorted(ta, w0, 'right') - 1)
+    i1 = int(np.searchsorted(ta, w1, 'left'))
     d = np.diff(ps[i0:i1 + 1])
-    return float(d[d > 0].sum()), float(-d[d < 0].sum())
+    P, N = float(d[d > 0].sum()), float(-d[d < 0].sum())
+    tg, gz, tr = S.get('tg', np.array([])), S.get('gz', np.array([])), S['t_recv']
+    for k in range(i0, i1):
+        if na[k + 1] - na[k] > 1:
+            a, b = tr[k], tr[k + 1]
+            if tg.size < 2 or tg[0] > a or tg[-1] < b:
+                raise InputError('missing IMU reports in the window without gyro reports over the gap (CU-2)')
+            j0, j1 = np.searchsorted(tg, a, 'right') - 1, np.searchsorted(tg, b, 'left')
+            if np.max(np.diff(tg[j0:j1 + 1])) > S.get('h_lim', H_LIM_S):
+                raise InputError('missing IMU reports in the window and gyro reports too far apart (CU-2)')
+            extra = float(np.max(np.abs(gz[j0:j1 + 1]))) * (b - a)
+            P += extra
+            N += extra
+    return P, N
 
 
 def alpha_max(tg, gz):
@@ -338,6 +355,8 @@ def run_window(L):
     on = np.nonzero(L['run_active'] == 1)[0]
     if np.any(np.diff(on) != 1):
         raise InputError(f'{L.get("path")}: more than one run_active part: one run per file (CU-8)')
+    if on[-1] == len(L['run_active']) - 1:
+        raise InputError(f'{L.get("path")}: the log ends while run_active is 1: no end edge, log cut? (CU-8)')
     return L['timestamp_us'][on[0]] * 1e-6, L['timestamp_us'][on[-1]] * 1e-6
 
 
@@ -380,7 +399,7 @@ def thang(path, n_vong, chieu, period_s=PERIOD_S, g_still=0.02, min_still_s=MIN_
     S = rv_samples(L, period_s=period_s)
     if S['resets']:
         raise InputError(f'IMU reset in the scale run at {S["resets"][0]:.3f} s (CU-4)')
-    if math.isfinite(S['t_break_recv']):
+    if math.isfinite(S['t_break']):
         raise InputError('a gap in the IMU reports could not be unwrapped (CU-3)')
     tg, gz = gyro_samples(L)
     lead, trail, rot = _still_ends(tg, gz, g_still, min_still_s)
@@ -444,7 +463,7 @@ def _segments(mask):
     return list(zip(starts, ends))
 
 
-def _yaw_parts(path, doan, period_s, s_plus, s_minus):
+def _yaw_parts(path, doan, period_s, s_plus, s_minus):  # -> [(t, psi, n_late)]
     """Parts (t, psi) of a file to measure drift on: whole file, or each contiguous run_active part (CU-9)."""
     check_path(path)
     with open(path, newline='', encoding='utf-8') as f:
@@ -460,17 +479,17 @@ def _yaw_parts(path, doan, period_s, s_plus, s_minus):
         y = np.radians([float(r['v2']) for r in R])
         d = np.diff(np.unwrap(y))
         d = np.where(d > 0, d / (1.0 + s_plus), d / (1.0 + s_minus))          # CU-10
-        return [(t, y[0] + np.concatenate([[0.0], np.cumsum(d)]))]
+        return [(t, y[0] + np.concatenate([[0.0], np.cumsum(d)]), None)]
     L = load_log(path)
     S = rv_samples(L, period_s=period_s, s_plus=s_plus, s_minus=s_minus)
-    if S['resets'] or math.isfinite(S['t_break_recv']):
+    if S['resets'] or math.isfinite(S['t_break']):
         raise InputError(f'{path}: IMU reset or a gap that could not be unwrapped')
     t, psi = S['t_recv'], S['psi_all']
     if doan == 'all':
-        return [(t, psi)]
+        return [(t, psi, S['n_late'])]
     if 'run_active' not in L:
         raise InputError(f'{path}: no run_active column')
-    parts = [(t[a:b + 1], psi[a:b + 1]) for a, b in _segments(L['run_active'][S['rows']] == 1) if b > a]
+    parts = [(t[a:b + 1], psi[a:b + 1], S['n_late']) for a, b in _segments(L['run_active'][S['rows']] == 1) if b > a]
     if not parts:
         raise InputError(f'{path}: no run_active part')
     return parts
@@ -482,7 +501,7 @@ def troi(paths, period_s=PERIOD_S, min_dt=2.0, doan='all', block_s=1.0, s_plus=0
     _finite(min_dt, '--min-dt', 0.5)
     per, beta, q = [], 0.0, 0.0
     for p in paths:
-        for t, psi in _yaw_parts(p, doan, period_s, s_plus, s_minus):
+        for t, psi, n_late in _yaw_parts(p, doan, period_s, s_plus, s_minus):
             dt = t - t[0]
             m = dt >= min_dt
             b = float(np.max(np.abs(psi[m] - psi[0]) / dt[m])) if m.any() else float('nan')
@@ -492,7 +511,7 @@ def troi(paths, period_s=PERIOD_S, min_dt=2.0, doan='all', block_s=1.0, s_plus=0
                 v = psi[blk == k]
                 if v.size >= 2:
                     qq = max(qq, float(np.max(np.abs(v - np.median(v)))))
-            per.append(dict(file=os.path.basename(p), duration_s=float(dt[-1]), beta=b, q=qq))
+            per.append(dict(file=os.path.basename(p), duration_s=float(dt[-1]), beta=b, q=qq, n_late=n_late))
             if np.isfinite(b):
                 beta = max(beta, b)
             q = max(q, qq)
@@ -528,7 +547,7 @@ def _level_numbers(path, muc, tre, thang_d, period_s, j_lim, h_lim, pre_s, tail_
     S = rv_samples(L, period_s=period_s, tau_hat=tre['tau_hat_s'], s_plus=thang_d['s_plus'],
                    s_minus=thang_d['s_minus'], j_lim=j_lim, h_lim=h_lim)
     _check_no_reset(S, w0, w1, path)
-    if S['t_break_recv'] <= w1:
+    if S['t_break'] <= w1:
         raise InputError(f'{path}: a gap in the IMU reports could not be unwrapped inside the window (CU-3)')
     P, N = turn_totals(S, w0, w1)
     tg, gz = gyro_samples(L) if np.any(L['gyro_n'] > 0) else (np.array([]), np.array([]))
@@ -563,8 +582,9 @@ def tong(muc, logs, thang_d, troi_d, tre, u_g, le, out, period_s=PERIOD_S, j_lim
         raise InputError('troi was computed with another scale correction than thang (CU-10)')
     _finite(tre.get('tau_hat_s'), 'tau_hat_s', -0.2, 0.2)
     _finite(tre.get('dtau_fit_s'), 'dtau_fit_s', 0.0, 0.2)
-    for v, w in ((u_g, 'U_g'), (le, 'le'), (pre_s, 'pre_s'), (tail_s, 'tail_s')):
+    for v, w in ((u_g, 'U_g'), (le, 'le'), (pre_s, 'pre_s')):
         _finite(v, w, 0.0)
+    _finite(tail_s, 'tail_s', 0.5)                                       # CU-8
     if not logs:
         raise InputError('no C8 log for the level')
     nums = [_level_numbers(p, muc, tre, thang_d, period_s, j_lim, h_lim, pre_s, tail_s) for p in logs]
@@ -693,11 +713,34 @@ def tre(caps, thang_d, step_s=0.001, **kw):
                 luc_chay=now_iso())
 
 
+def check_u_file(u):
+    """CU-17 (round 2): version and every number kiem uses, finite and in range."""
+    if u.get('version') != VERSION:
+        raise InputError(f'U_IMU file version {u.get("version")!r}, expected {VERSION}')
+    if not isinstance(u.get('muc'), dict):
+        raise InputError('U_IMU file has no muc table')
+    _finite(u.get('period_s'), 'period_s', 0.01, 0.2)
+    _finite(u.get('tau_hat_s'), 'tau_hat_s', -0.2, 0.2)
+    _finite(u.get('j_lim_s'), 'j_lim_s', 0.0, 0.05)
+    _finite(u.get('h_lim_s'), 'h_lim_s', 0.0, 1.0)
+    _finite(u.get('pre_s'), 'pre_s', 0.0)
+    _finite(u.get('tail_s'), 'tail_s', 0.5)
+    _finite(u.get('le'), 'le', 0.0)
+    _check_thang(u)
+    for k in ('beta_max', 'q'):
+        _finite(u.get(k), k, 0.0, 0.1)
+    for m, lev in u['muc'].items():
+        if not isinstance(lev, dict):
+            raise InputError(f'level {m}: not an object')
+        _finite(lev.get('U_IMU_dong_rad'), f'{m} U_IMU_dong_rad', 0.0, math.pi)
+
+
 def kiem(frames, log, offset_s, u, muc, u_psi, u_ghep=0.0, n_min=30, wz_still=0.05):
     """Design 5: back check |psi_cam - psi_IMU| <= U_psi + U_IMU(m) on every compared frame, and the closure of
     the IMU yaw against the camera between the still parts before and after the run (unwrapped, CU-13; end part
     [t_off + tail, + END_STILL_S], CU-14)."""
-    if muc not in u.get('muc', {}):
+    check_u_file(u)
+    if muc not in u['muc']:
         raise InputError(f'level {muc} not in the U_IMU file')
     for v, w in ((offset_s, 'offset_s'), (u_psi, 'U_psi'), (u_ghep, 'u_ghep')):
         _finite(v, w, None if w == 'offset_s' else 0.0)
@@ -724,7 +767,8 @@ def kiem(frames, log, offset_s, u, muc, u_psi, u_ghep=0.0, n_min=30, wz_still=0.
     out = dict(muc=muc, align_c_rad=c, align_spread_rad=spread, align_ok=bool(spread <= u_psi),
                n_win=int(win.sum()), n_compared=int(comp.sum()), n_not_compared=int((win & ~comp).sum()),
                limit_rad=lim, n_over=int(over.sum()), t_over_s=[float(x) for x in (tl[over] - t0)[:20]],
-               max_abs_rad=float(np.max(np.abs(res[comp]))) if comp.any() else None, luc_chay=now_iso())
+               max_abs_rad=float(np.max(np.abs(res[comp]))) if comp.any() else None, n_late=S['n_late'],
+               luc_chay=now_iso())
     if end.sum() >= n_min:
         r = float(np.median(F['psi'][end] - psi_i[end]) - c)
         t_end = float(tl[end].max())
