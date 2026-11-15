@@ -619,6 +619,7 @@ def test_run_one_and_new_process_rerun_are_identical(path, tmp_path):
     assert row['pos_reset_mid'] == 0
     again = s3.run_in_new_process(_DLL, [('PID', g, 0.8, 0.5)], str(tmp_path))[0]
     assert again['digest'] == s3.log_digest(log) and s3.row_text(again['row']) == s3.row_text(row)
+    assert set(s3.GATE_RUN_COLS) <= set(row) and set(s3.GATE_RUN_COLS) <= set(s3.row_text(row))   # v8.2 (T6)
 
 
 @needs_dll
@@ -673,9 +674,24 @@ class _Calls(list):
     """The calls list of _fake, with what _run_main saw on the side."""
 
 
-def _fake(design_fail=False, default_fails=False, error_in_design=False):
+def _fake_gate_fields(ctrl, g, v):
+    """S3G-3: v8.2 gate columns of a fake run, different per gains and speed (known from the inputs)."""
+    x = float(sum(g[n] * (k + 1) for k, n in enumerate(s3.FACTORS[ctrl])))
+    bad = v == 0.8
+    f = dict(e_bao_max=1e-3 * x + v + 0.5, gate_version='gate_fake', gate_decide='g1,g2,g3,g4,g5', gate_u_t=0.0,
+             g1_q='true', g1_state='dat', gate_outcome='khong_dat' if bad else 'dat')
+    for i, c in enumerate(('g2', 'g3', 'g4', 'g5')):
+        q = 1e-3 * x + v + 0.01 * (i + 1)
+        f.update({f'{c}_q': q, f'{c}_lo': q - 1e-6, f'{c}_hi': q + 1e-6, f'{c}_n_undef': i,
+                  f'{c}_state': 'khong_dat' if bad and c == 'g5' else 'dat'})
+    return f
+
+
+def _fake(design_fail=False, default_fails=False, error_in_design=False, error_in_sweep=None):
     """Instant stand-in for safe_run: sweep runs (one factor off its default) complete; design
-    runs (several factors off) fail when X1 or X2 is above its default (96/128 corners)."""
+    runs (several factors off) fail when X1 or X2 is above its default (96/128 corners).
+    error_in_sweep (S3G-2): 'default' -> run_error at the first default check; 'factor' -> at every
+    sweep run with one factor off."""
     calls, works = _Calls(), []
 
     def fake_safe_run(fw, path, ctrl, g, v, mu):
@@ -686,6 +702,8 @@ def _fake(design_fail=False, default_fails=False, error_in_design=False):
         design = len(off) >= 2
         if error_in_design and design:
             return dict(status='run_error', completed='', error='FakeError: boom'), None
+        if (error_in_sweep == 'default' and not off) or (error_in_sweep == 'factor' and len(off) == 1):
+            return dict(status='run_error', completed='', error='FakeSweepError: boom'), None
         fail = (design_fail and design and (g[f[0]] > dflt[f[0]] or g[f[1]] > dflt[f[1]])) or \
                (default_fails and not off and v == 0.8)
         x = np.array([g[n] for n in f])
@@ -696,7 +714,8 @@ def _fake(design_fail=False, default_fails=False, error_in_design=False):
                     sat_frac=0.0, sat_any_frac=0.0, e_theta_lane_max_deg=1.0, e_theta_cmd_max_deg=1.0,
                     ds_absmax=0.0, e_trk_max=0.0, t_end=np.float64(1.25), e_s_absmax=0.0, track_err_frames=0,
                     n_upper_frames=len(off), n_back_frames=int(v == 0.8),
-                    cond2_5_ever=np.bool_(True), pos_reset_mid=0, e_perp_rms=0.0, e_trk_rms=0.0), log
+                    cond2_5_ever=np.bool_(True), pos_reset_mid=0, e_perp_rms=0.0, e_trk_rms=0.0,
+                    **_fake_gate_fields(ctrl, g, v)), log
 
     def fake_new_process(dll, runs, work):
         os.makedirs(work, exist_ok=True)              # S3V8-6: as run_in_new_process, the folder stays
@@ -1393,3 +1412,311 @@ def test_v8_uncommitted_test_points_stop_a_main_run(tmp_path, monkeypatch, capsy
                                          argv=['--mu', '0.4', '0.5', '0.6', '--test-points', str(p)])
     assert code == 2 and 'not committed' in console
     assert (out / 'design.csv').read_text().strip() == '' and not (out / 'sealed_test').exists()
+
+
+# ── S03 v8.2: e_bao_max and G1-G5 (design 03_CODE/docs/2026-11-14_Thiet_ke_S03_G1G5_v1.md) ──────────
+
+import o1_gate as G  # noqa: E402
+import o1_gate_eval as E  # noqa: E402
+
+# the 27 runs.csv columns of S03 v8 (blob 2127c69), written out here so that a change to them fails
+V8_COLS = ['controller', 'point_id', 'box', 'mu', 'v', 'status', 'completed', 'e_perp_max', 'e_perp_max_cens',
+           'e_perp_global_max', 'tv_duty', 'sat_frac', 'sat_any_frac', 'e_theta_lane_max_deg',
+           'e_theta_cmd_max_deg', 'ds_absmax', 'e_trk_max', 't_end', 'e_s_absmax', 'track_err_frames',
+           'cond2_5_ever', 'pos_reset_mid', 'e_perp_rms', 'e_trk_rms', 'n_upper_frames', 'n_back_frames', 'error']
+V82_COLS = (['e_bao_max', 'gate_version', 'gate_decide', 'gate_u_t', 'g1_q', 'g1_state']
+            + [f'g{i}_{x}' for i in range(2, 6) for x in ('q', 'lo', 'hi', 'n_undef', 'state')] + ['gate_outcome'])
+Q_OF = dict(g2='e_perp_max', g3='e_trk_max', g4='e_bao_max', g5='e_theta_cmd_max_deg')
+
+
+def test_v82_columns_appended_after_the_v8_columns():
+    assert s3.OLD_COLS == V8_COLS and s3.RUN_COLS[:len(V8_COLS)] == V8_COLS
+    assert s3.GATE_RUN_COLS == V82_COLS and s3.RUN_COLS == V8_COLS + V82_COLS
+    tools = os.path.join(HERE, '..', '..', 'tools')
+    if tools not in sys.path:
+        sys.path.insert(0, tools)
+    import rq3_log                                       # B81-3: the same names as the shared gate columns
+    assert set(V82_COLS) - {'e_bao_max', 'gate_outcome'} <= set(rq3_log.GATE_COLS)
+
+
+def _gframes(e_perp, e_trk, e_bao, th):
+    return dict(e_perp=np.array(e_perp, float), e_trk=np.array(e_trk, float), e_bao=np.array(e_bao, float),
+                e_theta_cmd_deg=np.array(th, float))
+
+
+@pytest.mark.parametrize('frames, completed, want, outcome', [
+    (_gframes([0.05, 0.02], [0.03, 0.01], [0.06, 0.04], [1.0, 2.0]), 'true',
+     dict(g1='dat', g2='dat', g3='dat', g4='dat', g5='dat'), 'dat'),
+    (_gframes([0.05, 0.02], [0.12, 0.01], [0.06, np.nan], [1.0, 2.0]), 'true',
+     dict(g1='dat', g2='dat', g3='khong_dat', g4='chua_ket_luan', g5='dat'), 'khong_dat'),
+    (_gframes([0.05, 0.02], [0.03, 0.01], [0.06, 0.04], [1.0, 8.0]), 'inconclusive',
+     dict(g1='chua_ket_luan', g2='dat', g3='dat', g4='dat', g5='khong_dat'), 'khong_dat'),
+    (_gframes([0.05, 0.10], [0.03, 0.10], [0.06, 0.10], [1.0, 7.5]), 'inconclusive',
+     dict(g1='chua_ket_luan', g2='dat', g3='dat', g4='dat', g5='dat'), 'chua_ket_luan'),
+    (_gframes([0.05, 0.02], [0.03, 0.01], [0.06, 0.04], [1.0, 2.0]), 'false',
+     dict(g1='khong_dat', g2='dat', g3='dat', g4='dat', g5='dat'), 'khong_dat'),
+])
+def test_v82_gate_fields_are_the_gate_dict(frames, completed, want, outcome):
+    """T3: gate_fields copies the o1_gate.gate states and maxima (an edge equal to the threshold passes,
+    O1 3.5)."""
+    gt = G.gate(frames, completed, v_cmd_max=0.9, wz_cmd_max=1.1, u_t=s3.GATE_U_T, decide=G.DECIDE_ALL)
+    m = float(np.max(frames['e_bao']))
+    f = s3.gate_fields(dict(e_bao_max=m), gt)
+    assert set(f) == set(V82_COLS)
+    assert {c: f[f'{c}_state'] for c in want} == want and f['gate_outcome'] == outcome
+    assert f['gate_version'] == G.GATE_VERSION and f['gate_decide'] == 'g1,g2,g3,g4,g5' and f['gate_u_t'] == 0.0
+    assert f['g1_q'] == {'dat': 'true', 'khong_dat': 'false'}.get(want['g1'], 'inconclusive')
+    assert f['g4_n_undef'] == int(np.count_nonzero(~np.isfinite(frames['e_bao'])))
+    for c in ('g2', 'g3', 'g4', 'g5'):
+        assert f[f'{c}_q'] == f[f'{c}_lo'] == f[f'{c}_hi'] == gt[c]['q']      # U = 0 on fwsim
+    assert s3.fmt(f['e_bao_max']) == repr(m)
+
+
+def test_v82_run_error_has_no_gate_values(tmp_path):
+    """T4: a run_error row (here: no DLL) has no gate value; the CSV cells are empty."""
+    row, log = s3.safe_run(None, None, 'PID', dict(FAKE_DEFAULTS['PID']), 0.8, 0.5)
+    assert row['status'] == 'run_error' and log is None and not set(V82_COLS) & set(row)
+    p = tmp_path / 'r.csv'
+    s3.write_csv(str(p), [dict(controller='PID', point_id=0, box='centre', mu=0.5, v=0.8, **row)], s3.RUN_COLS)
+    import csv as _csv
+    r = next(_csv.DictReader(open(p)))
+    assert all(r[c] == '' for c in V82_COLS)
+
+
+@pytest.fixture(scope='module')
+def v82_runs(path):
+    """Default gains of both controllers at 0.5 and 0.8 m/s, and one detuned PID run (mu 0.5):
+    [(ctrl, v, new row, log)]. The gate evaluator costs about 2-4 s a run."""
+    if not os.path.isfile(_DLL):
+        pytest.skip('fwsim.dll not built')
+    fw = fwsim.FirmwareSim(_DLL)
+    if not fw.pos_cols:
+        pytest.skip('DLL without pos_ctrl.c')
+    out = []
+    for ctrl in ('PID', 'ADRC'):
+        d = s3.defaults(fw, ctrl)
+        for v in (0.5, 0.8):
+            out.append((ctrl, v) + s3.run_one(fw, path, ctrl, d, v, 0.5))
+    d = s3.defaults(fw, 'PID')
+    out.append(('PID', 0.8) + s3.run_one(fw, path, 'PID', dict(d, kp_xy=0.15, pos_kp=0.6), 0.8, 0.5))
+    return out
+
+
+@needs_dll
+def test_v82_v8_columns_keep_their_bits(path, v82_runs):
+    """T1 (a): on the same log, the v8 scoring (evaluate_v7 alone, as blob 2127c69 did) gives every v8
+    column of the new row bit for bit."""
+    for ctrl, v, row, log in v82_runs:
+        sch = o1.Schedule(v)
+        p = fwsim.plant_params(s3.argparse.Namespace(ground='traction', mu=0.5))
+        res, _ = o1.evaluate_v7(log, path, sch, lsum=p.lx + p.ly)
+        old = {k: res[k] for k in V8_COLS[5:] if k in res}
+        old.update(pos_reset_mid=fwsim.run_validity(log)['pos_reset_mid'])
+        assert set(row) - set(V82_COLS) == set(old), (ctrl, v)
+        assert {k: s3._bits(row[k]) for k in old} == {k: s3._bits(old[k]) for k in old}, (ctrl, v)
+
+
+@needs_dll
+def test_v82_gate_maxima_are_the_v8_maxima(v82_runs):
+    """T2: G2, G3, G5 q are the evaluate_v7 maxima and G4 q is e_bao_max, bit for bit; lo = hi = q;
+    G1 follows completed; states from the thresholds."""
+    states = set()
+    for ctrl, v, row, _ in v82_runs:
+        assert all(row[f'{c}_n_undef'] == 0 for c in Q_OF), (ctrl, v)
+        for c, k in Q_OF.items():
+            assert s3._bits(row[f'{c}_q']) == s3._bits(row[k]) == s3._bits(row[f'{c}_lo']) == \
+                s3._bits(row[f'{c}_hi']), (ctrl, v, c)
+            assert row[f'{c}_state'] == ('dat' if row[k] <= G.THRESHOLDS[c] else 'khong_dat'), (ctrl, v, c)
+        assert row['g1_q'] == row['completed'] and row['g1_state'] == G.g1_state(row['completed'])
+        assert row['gate_outcome'] == G.run_outcome(row[f'g{i}_state'] for i in range(1, 6))
+        assert row['gate_u_t'] == 0.0 and row['gate_decide'] == 'g1,g2,g3,g4,g5'
+        states |= {row[f'g{i}_state'] for i in range(1, 6)}
+    assert {'dat', 'khong_dat'} <= states                 # the runs reach both sides of a threshold
+
+
+@needs_dll
+def test_v82_main_writes_the_gate_columns_and_meta(tmp_path, monkeypatch, capsys):
+    """T5, T7: runs.csv, runs_test.csv headers are the v8 columns then the v8.2 columns; the sweep has
+    them too (one scoring, Liam 14/11 'Co, mot cach cham'); meta.yaml records the gate and the evaluator."""
+    import csv as _csv
+    import hashlib as _h
+    import json as _json
+    code, out, _, _, _ = _run_main(tmp_path, monkeypatch, capsys)
+    assert code == 0
+    for f in ('sealed/runs.csv', 'sealed_test/runs_test.csv'):
+        assert next(_csv.reader(open(out / f))) == V8_COLS + V82_COLS, f
+    assert next(_csv.reader(open(out / 'sweep.csv'))) == list(s3.SWEEP_ID_COLS) + s3.RUN_COLS[5:]   # S3G2-3
+    # S3G-3: the VALUES reach the three files (fake gate fields differ per gains and speed)
+    gains = {(d['controller'], d['point_id']): {n: float(d[f'{n}_value']) for n in s3.FACTORS[d['controller']]}
+             for d in _csv.DictReader(open(out / 'design.csv'))}
+    n = 0
+    for f in ('sealed/runs.csv', 'sealed_test/runs_test.csv'):
+        for r in _csv.DictReader(open(out / f)):
+            want = _fake_gate_fields(r['controller'], gains[(r['controller'], r['point_id'])], float(r['v']))
+            assert {c: r[c] for c in V82_COLS} == {c: str(s3.fmt(want[c])) for c in V82_COLS}, (f, r['point_id'])
+            n += 1
+    for r in _csv.DictReader(open(out / 'sweep.csv')):
+        g = dict(FAKE_DEFAULTS[r['controller']])
+        if not r['factor'].startswith('('):
+            g[r['factor']] = float(r['value'])
+        want = _fake_gate_fields(r['controller'], g, float(r['v']))
+        assert {c: r[c] for c in V82_COLS} == {c: str(s3.fmt(want[c])) for c in V82_COLS}, (r['factor'], r['value'])
+        n += 1
+    assert n > 2 * (271 * 3 + 300)
+    meta = (out / 'meta.yaml').read_text(encoding='utf-8')
+    assert 'source_check: "same at import, start and end of the run"' in meta   # S3G-1, S3G2-1
+    assert meta.startswith('spec: S03 v8.2 ')
+    lines = meta.splitlines()
+    gate = _json.loads(next(x for x in lines if x.startswith('gate: ')).split('   #')[0][len('gate: '):])
+    assert gate['version'] == G.GATE_VERSION and gate['eval_version'] == E.EVAL_VERSION and gate['u_t'] == 0.0
+    assert gate['decide'] == list(G.DECIDE_ALL) and gate['columns'] == V82_COLS
+    ev = _json.loads(next(x for x in lines if x.startswith('evaluator_sha256: ')).split('   #')[0]
+                     [len('evaluator_sha256: '):])
+    assert set(ev) == {'fwsim/o1_feasibility.py', 'fwsim/o1_gate_eval.py', 'fwsim/o1_gate.py', 'tools/o1_lanes.py',
+                       'rpi5/o1_tasks.py'}
+    b = open(E.__file__, 'rb').read()
+    assert ev['fwsim/o1_gate_eval.py'] == dict(sha256=_h.sha256(b).hexdigest(),
+                                               sha256_lf=_h.sha256(b.replace(b'\r\n', b'\n')).hexdigest())
+
+
+# ── after Codex round 1 (S3G-1..4; Liam 14/11 CODE_FEAS "Sua 5 muc + vong 2 (Recommended)") ──────────
+
+@needs_dll
+def test_v82_run_one_copies_the_gate_dict_it_was_given(path, monkeypatch):
+    """S3G-4: through the real run_one: evaluate_fig8 gets the log, path, schedule and lsum; gate() gets the
+    evaluator's frames and completed, the command maxima, u_t 0, DECIDE_ALL and the status; the row copies
+    what gate() returned (marked values), never recomputing it."""
+    fw = fwsim.FirmwareSim(_DLL)
+    if not fw.pos_cols:
+        pytest.skip('DLL without pos_ctrl.c')
+    seen = {}
+    real_eval, real_gate = E.evaluate_fig8, G.gate
+
+    def spy_eval(log, p_, sch, lsum=0.24):
+        out = real_eval(log, p_, sch, lsum=lsum)
+        seen['eval'] = dict(path=p_, v=sch.v, lsum=lsum, frames=out[2], res=out[0])
+        return out
+
+    def spy_gate(frames, completed, **kw):
+        seen['gate'] = dict(frames=frames, completed=completed, **kw)
+        gt = real_gate(frames, completed, **kw)
+        gt['g3'] = dict(gt['g3'], state='SPY_STATE', q=123.0)
+        gt['outcome'] = 'SPY_OUTCOME'
+        gt['version'] = 'SPY_VERSION'
+        return gt
+    monkeypatch.setattr(E, 'evaluate_fig8', spy_eval)
+    monkeypatch.setattr(G, 'gate', spy_gate)
+    g = s3.defaults(fw, 'PID')
+    row, _ = s3.run_one(fw, path, 'PID', g, 0.8, 0.5)
+    p = fwsim.plant_params(s3.argparse.Namespace(ground='traction', mu=0.5))
+    assert seen['eval']['path'] is path and seen['eval']['v'] == 0.8 and seen['eval']['lsum'] == p.lx + p.ly
+    sg = seen['gate']
+    assert sg['frames'] is seen['eval']['frames'] and sg['completed'] == seen['eval']['res']['completed']
+    assert sg['u_t'] == 0.0 and sg['decide'] == G.DECIDE_ALL and sg['status'] == seen['eval']['res']['status']
+    assert (sg['v_cmd_max'], sg['wz_cmd_max']) == G.fig8_cmd_max(o1.Schedule(0.8))
+    assert 'u_p' not in sg and 'u_psi_deg' not in sg                     # the defaults 0 of gate()
+    assert row['g3_state'] == 'SPY_STATE' and row['g3_q'] == 123.0 and row['gate_outcome'] == 'SPY_OUTCOME'
+    assert row['gate_version'] == 'SPY_VERSION' and row['e_bao_max'] == seen['eval']['res']['e_bao_max']
+
+
+@needs_dll
+@pytest.mark.parametrize('where', ['evaluate_fig8', 'fig8_cmd_max', 'gate'])
+def test_v82_a_scoring_failure_is_a_run_error(path, monkeypatch, where):
+    """S3G-4: a failure in the evaluator, the command maxima (cache emptied) or the gate is a run_error
+    row with no gate value (S03 then stops, B8b-20)."""
+    fw = fwsim.FirmwareSim(_DLL)
+    if not fw.pos_cols:
+        pytest.skip('DLL without pos_ctrl.c')
+
+    def boom(*a, **k):
+        raise ValueError(f'boom in {where}')
+    monkeypatch.setattr(s3, '_CMD_MAX', {})
+    monkeypatch.setattr(E if where == 'evaluate_fig8' else G, where, boom)
+    row, log = s3.safe_run(fw, path, 'PID', s3.defaults(fw, 'PID'), 0.8, 0.5)
+    assert row['status'] == 'run_error' and log is None and row['error'] == f'ValueError: boom in {where}'
+    assert not set(V82_COLS) & set(row)
+
+
+@needs_dll
+@pytest.mark.parametrize('mode', ['default', 'factor'])
+def test_v82_sweep_run_error_is_a_sweep_row(tmp_path, monkeypatch, capsys, mode):
+    """S3G-2: a run_error in the sweep is a row of sweep.csv (gate cells empty) before S03 stops; the
+    header holds every run column even when the first run fails."""
+    import csv as _csv
+    code, out, console, _, _ = _run_main(tmp_path, monkeypatch, capsys, error_in_sweep=mode)
+    assert code == 2 and '[STOP]' in console
+    head = next(_csv.reader(open(out / 'sweep.csv')))
+    assert head == list(s3.SWEEP_ID_COLS) + s3.RUN_COLS[5:]                      # S3G2-3: one fixed header
+    rows = list(_csv.DictReader(open(out / 'sweep.csv')))
+    err = [r for r in rows if r['status'] == 'run_error']
+    assert len(err) == 1 and err[0]['error'] == 'FakeSweepError: boom' and err[-1] == rows[-1]
+    assert all(err[0][c] == '' for c in V82_COLS)
+    if mode == 'default':
+        assert len(rows) == 1 and err[0]['factor'] == '(default check)' and err[0]['is_default'] == 'true'
+    else:
+        f0 = s3.FACTORS['PID'][0]
+        assert err[0]['factor'] == f0 and err[0]['is_default'] == 'false' and err[0]['value'] != ''
+        assert all(r['status'] == 'ok' for r in rows[:-1])
+
+
+@needs_dll
+def test_v82_sources_taken_at_the_start_and_checked_at_the_end(tmp_path, monkeypatch, capsys):
+    """S3G-1: script and evaluator are recorded as they were before the first run; a change by the end
+    is recorded in source_check, said on the console and ends with exit code 2."""
+    calls = dict(git=0, ev=0)
+    real_git, real_ev = s3.git_state, s3.evaluator_sha256
+
+    def git_state(repo):
+        calls['git'] += 1
+        return dict(real_git(repo), commit=f'commit{calls["git"]}')
+
+    def ev():
+        calls['ev'] += 1
+        return dict(real_ev(), marker=calls['ev'])
+    monkeypatch.setattr(s3, 'git_state', git_state)
+    monkeypatch.setattr(s3, 'evaluator_sha256', ev)
+    code, out, console, _, _ = _run_main(tmp_path, monkeypatch, capsys)
+    meta = (out / 'meta.yaml').read_text(encoding='utf-8')
+    assert calls == dict(git=2, ev=2) and code == 2
+    assert '"commit": "commit1"' in next(x for x in meta.splitlines() if x.startswith('script: '))
+    ev_line = next(x for x in meta.splitlines() if x.startswith('evaluator_sha256: '))
+    import json as _json
+    assert 'marker' not in ev_line and _json.dumps(s3.EVAL_SHA_AT_IMPORT) in ev_line  # S3G2-1: as imported
+    sc = next(x for x in meta.splitlines() if x.startswith('source_check: '))
+    assert 'CHANGED' in sc and '"commit": "commit2"' in sc and 'S3G-1' in meta and 'source_check' in console
+
+
+@needs_dll
+def test_v82_evaluator_changed_before_the_start_is_caught(tmp_path, monkeypatch, capsys):
+    """S3G2-1: the evaluator hashed at import differs from the files at the start (changed in between):
+    recorded as CHANGED, exit 2, although start and end agree."""
+    monkeypatch.setattr(s3, 'EVAL_SHA_AT_IMPORT', dict(s3.EVAL_SHA_AT_IMPORT, marker='import'))
+    code, out, console, _, _ = _run_main(tmp_path, monkeypatch, capsys)
+    meta = (out / 'meta.yaml').read_text(encoding='utf-8')
+    sc = next(x for x in meta.splitlines() if x.startswith('source_check: '))
+    assert code == 2 and 'CHANGED' in sc and '"marker": "import"' in sc and 'source_check' in console
+
+
+def test_v82_untracked_files_are_not_a_source_change(tmp_path):
+    """S3G2-2: an untracked file (e.g. an output folder inside the repo) leaves the snapshot key equal; a
+    change of a tracked file does not."""
+    import subprocess as _sp
+    repo = str(tmp_path / 'repo')
+    os.makedirs(repo)
+
+    def git(*a):
+        _sp.run(['git', '-C', repo, *a], check=True, capture_output=True)
+    git('init', '-q')
+    git('config', 'user.email', 't@t')
+    git('config', 'user.name', 't')
+    (tmp_path / 'repo' / 'a.py').write_text('x = 1\n')
+    git('add', 'a.py')
+    git('commit', '-q', '-m', 'a')
+    k0 = s3.source_snapshot(repo)['key']
+    os.makedirs(os.path.join(repo, 'out', 'sealed'))
+    (tmp_path / 'repo' / 'out' / 'sealed' / 'runs.csv').write_text('a\n')
+    s1 = s3.source_snapshot(repo)
+    assert s1['key'] == k0 and s1['script']['dirty']          # meta still says untracked files are there
+    (tmp_path / 'repo' / 'a.py').write_text('x = 2\n')
+    k2 = s3.source_snapshot(repo)['key']
+    assert k2 != k0 and k2['tracked'] == ['a.py'] and k2['commit'] == k0['commit']
