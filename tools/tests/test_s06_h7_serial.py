@@ -158,9 +158,33 @@ def test_cli(tmp_path):
                           capture_output=True, text=True).returncode == 2
 
 
-def t10_with_schedule(tmp_path, heavy=(10_000, 30_000), pc=True, blocks=4):
+IDLE20 = ('idle_pass=900000 idle_us_est=4000000', 'idle_pass=450000 idle_us_est=2000000')   # 40 % -> 20 % idle
+
+
+def with_header(lines, k, old, new):
+    """Replace `old` by `new` in the k-th 'T10: win_ms' header of the run (k = 0 is the first in-run header,
+    the one dropped as partial; the pre-link-up header of make_log is not counted)."""
+    out, n = [], -1
+    seen_up = False
+    for l in lines:
+        if 'SPI link up' in l:
+            seen_up = True
+        if seen_up and 'T10: win_ms' in l:
+            n += 1
+            if n == k:
+                l = l.replace(old, new)
+        out.append(l)
+    return out
+
+
+def t10_with_schedule(tmp_path, heavy=(8_000, 52_000), pc=True, blocks=8, edit=None):
+    """Link up at 1 s; headers 10, 20, …, 80 s after it (the first dropped). With the T10U-3 margin of
+    PRINT_DELAY_MAX_MS on both sides and heavy 8–52 s: windows ending 20–50 s heavy, 60 s mixed, 70, 80 s group A."""
     log = tmp_path / 'h7.log'
-    log.write_text('\n'.join(make_log(blocks=blocks, pc=pc)) + '\n')
+    lines = make_log(blocks=blocks, pc=pc)
+    if edit:
+        lines = edit(lines)
+    log.write_text('\n'.join(lines) + '\n')
     sched = tmp_path / 's.csv'
     sched.write_text('idx,kind,test,start_ms,end_ms\n0,test,A-L1,0,50000\n'
                      + (f'1,heavy,,{heavy[0]},{heavy[1]}\n' if heavy else ''))
@@ -170,12 +194,19 @@ def t10_with_schedule(tmp_path, heavy=(10_000, 30_000), pc=True, blocks=4):
 
 
 def test_t10_segments_from_schedule(tmp_path):
-    """Spec 2.2: heavy block and group A part reported apart; a window across a block edge goes into neither.
-    Link up at 1 s; block windows end 11, 21, 31, 41 s PC time, the first is dropped."""
+    """Spec 2.2: heavy block and group A part reported apart; a window across a block edge (with the T10U-3
+    print-delay margin) goes into neither."""
     code, s, rows = t10_with_schedule(tmp_path)
     assert code == 0
-    assert s['segments']['heavy']['windows'] == 2 and s['segments']['nhom_a']['windows'] == 1
-    assert 'heavy' in rows and 'nhom_a' in rows
+    assert s['segments']['heavy']['windows'] == 4 and s['segments']['nhom_a']['windows'] == 2
+    assert 'heavy' in rows and 'nhom_a' in rows and 'mixed' in rows
+
+
+def test_t10_print_delay_margin(tmp_path):
+    """T10U-3: a window whose header comes within PRINT_DELAY_MAX_MS of the block end is mixed: heavy 8–50 s
+    leaves the window ending 50 s (true end anywhere in [49; 51] s) out of the heavy part."""
+    _, s, _ = t10_with_schedule(tmp_path, heavy=(8_000, 50_000))
+    assert s['segments']['heavy']['windows'] == 3
 
 
 def test_t10_window_across_edge_is_mixed(tmp_path):
@@ -192,6 +223,13 @@ def test_t10_no_pc_time_leaves_segment_empty(tmp_path):
 def test_t10_schedule_without_heavy(tmp_path):
     code, s, _ = t10_with_schedule(tmp_path, heavy=None)
     assert code == 0 and 'heavy' not in s['segments'] and s['segments'] == {}
+
+
+def test_t10_heavy_without_group_a_is_missing(tmp_path):
+    """T10U-6: with a heavy block in the schedule, a run with no group A window is not complete."""
+    code, s, _ = t10_with_schedule(tmp_path, heavy=(8_000, 200_000))
+    assert 'nhom_a' not in s['segments'] and s['segments']['heavy']['windows'] == 7
+    assert code == 3 and s['complete'] is False and any('nhóm A' in m for m in s['missing'])
 
 
 # B3 (S06 T10, Liam 12/11 at THESIS local_694a2f03): upper bound of the load L = 100 % - lower bound of the idle
@@ -213,11 +251,64 @@ def test_t10_load_upper_per_window_and_summary():
 
 
 def test_load_upper_mean_max_and_missing():
-    rows = [dict(idle_pct_lo=30.0), dict(idle_pct_lo=40.0)]
+    rows = [dict(idle_pct_lo=30.0, win_ms=10000), dict(idle_pct_lo=40.0, win_ms=10000)]
     assert ser.load_upper(rows) == dict(load_upper_pct=pytest.approx(65.0), load_upper_pct_max_window=70.0)
-    assert ser.load_upper(rows + [dict(idle_pct_lo=None)]) == dict(load_upper_pct=None,
-                                                                   load_upper_pct_max_window=None)
+    assert ser.load_upper(rows + [dict(idle_pct_lo=None, win_ms=10000)]) == dict(load_upper_pct=None,
+                                                                                 load_upper_pct_max_window=None)
     assert ser.load_upper([])['load_upper_pct'] is None
+
+
+def test_load_upper_time_weighted():
+    """T10U-4 (Codex counterexample): windows of 10 000 and 10 100 ms, idle bound 40 % and 0 %: the run bound
+    is the time mean, 100 − 40·10000/20100, not the plain mean 80 %."""
+    rows = [dict(idle_pct_lo=40.0, win_ms=10000), dict(idle_pct_lo=0.0, win_ms=10100)]
+    assert ser.load_upper(rows)['load_upper_pct'] == pytest.approx(100.0 - 40.0 * 10000 / 20100, abs=1e-12)
+
+
+def test_idle_lower_formula_large_uncertainty():
+    """T10U-7: idle 40 %, relative uncertainty 0.2 -> idle bound 32 %, load bound 68 % (idle / (1 + unc)
+    would give 66.67 %); absolute tolerance so a near formula cannot pass."""
+    assert ser.idle_lower_pct(40.0, 0.2, 1) == pytest.approx(32.0, abs=1e-12)
+    assert 100.0 - ser.idle_lower_pct(40.0, 0.2, 1) == pytest.approx(68.0, abs=1e-12)
+
+
+def _run_summary(lines):
+    ev = ser.parse_lines(lines)
+    blocks, span = ser.t10_blocks(ev)
+    win, irq = ser.t10_rows(blocks)
+    return ser.t10_summary(blocks, win, irq, ev, span), win
+
+
+def test_idle_out_of_window_or_inconsistent_is_data_lost():
+    """T10U-1: idle_us_est above the window (Codex: 12 000 000 µs in 10 s) or not equal to idle_pass·cal
+    (8 000 000 instead of 4 000 000): no bound for that window, data lost (code 1), never a negative bound."""
+    for new in ('idle_pass=2700000 idle_us_est=12000000', 'idle_pass=900000 idle_us_est=8000000'):
+        s, win = _run_summary(with_header(make_log(), 2, 'idle_pass=900000 idle_us_est=4000000', new))
+        bad = [w for w in win if w['idle_bad']]
+        assert len(bad) == 1 and bad[0]['load_upper_pct'] is None
+        assert all(w['load_upper_pct'] is None or 0.0 <= w['load_upper_pct'] <= 100.0 for w in win)
+        assert any('số rảnh' in p for p in s['data_lost']) and s['complete'] is False
+
+
+def test_lost_header_after_the_dropped_one_is_found():
+    """T10U-2 (Codex): the header of the first KEPT window (20 s after link up) is damaged, its IRQ lines merge
+    into the dropped first block; the kept headers alone are 10 s apart, all headers of the span are not."""
+    s, _ = _run_summary(with_header(make_log(), 1, 'ovh_cyc=24', 'ovh_cyc='))
+    assert any('mất khối' in p for p in s['data_lost']) and s['complete'] is False
+
+
+def test_lost_first_header_is_found():
+    """T10U-2: the first header of the span is damaged: the next one comes 20 s after link up."""
+    s, _ = _run_summary(with_header(make_log(), 0, 'ovh_cyc=24', 'ovh_cyc='))
+    assert any('mất khối đầu' in p for p in s['data_lost']) and s['complete'] is False
+
+
+def test_no_calibration_is_missing():
+    """T10U-5: cal=0/… gives no bound; the run is not complete (code 3), not a pass with an empty bound."""
+    lines = [l.replace('idle_us_est=4000000 cal=22500/48000000', 'idle_us_est=0 cal=0/48000000') for l in make_log()]
+    s, win = _run_summary(lines)
+    assert all(w['load_upper_pct'] is None for w in win)
+    assert s['data_lost'] == [] and any('hiệu chuẩn' in m for m in s['missing']) and s['complete'] is False
 
 
 def test_idle_lower_edge_cases():
@@ -231,9 +322,18 @@ def test_idle_lower_edge_cases():
 
 
 def test_t10_load_upper_heavy_block_and_cli(tmp_path):
-    code, s, rows = t10_with_schedule(tmp_path)
+    """T10U-8: windows differ by segment: the heavy window ending 50 s (k = 4) has 20 % idle (load bound ~80 %), every
+    other window 40 % (~60 %): the heavy mean, heavy max, group A and run values must each come out right."""
+    unc20 = 1 / 22500 + 1 / 450_000
+    code, s, rows = t10_with_schedule(tmp_path, edit=lambda ls: with_header(ls, 4, *IDLE20))
     assert code == 0
-    for seg in ('heavy', 'nhom_a'):
-        assert s['segments'][seg]['load_upper_pct'] == pytest.approx(60.0 + 40.0 * UNC)
-    assert s['load_upper_pct'] == pytest.approx(60.0 + 40.0 * UNC)          # T10_summary.json from main()
+    lo40, lo20 = 40.0 * (1 - UNC), 20.0 * (1 - unc20)
+    hv = s['segments']['heavy']
+    assert hv['load_upper_pct'] == pytest.approx(100.0 - (3 * lo40 + lo20) / 4, abs=1e-9)
+    assert hv['load_upper_pct_max_window'] == pytest.approx(100.0 - lo20, abs=1e-9)
+    na = s['segments']['nhom_a']
+    assert na['load_upper_pct'] == pytest.approx(100.0 - lo40, abs=1e-9)
+    assert na['load_upper_pct_max_window'] == pytest.approx(100.0 - lo40, abs=1e-9)
+    assert s['load_upper_pct'] == pytest.approx(100.0 - (6 * lo40 + lo20) / 7, abs=1e-9)   # 7 kept windows
+    assert s['load_upper_pct_max_window'] == pytest.approx(100.0 - lo20, abs=1e-9)
     assert 'idle_pct_lo' in rows.splitlines()[0] and 'load_upper_pct' in rows.splitlines()[0]

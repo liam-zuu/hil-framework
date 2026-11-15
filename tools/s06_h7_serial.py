@@ -66,6 +66,13 @@ F_NOMINAL_MHZ = 480.0             # SystemCoreClock danh định (HSE 8 MHz, PLL
 F_BAND_MHZ = (478.0, 486.0)       # X22: dải tần số H7 khi chưa khớp đồng hồ của lượt
 WIN_MS_OK = (9_900, 10_100)
 T10_GAP_TOL_S = 0.5               # S24 [ĐỀ XUẤT CODE]: hai header T10 liên tiếp cách 10 s ± 0,5 s theo giờ PC
+# T10U-3 (Codex 15/11, Liam "Sửa cả 8 + vòng 2"): H7 chụp cửa sổ rồi mới in (main.c S06Load_Snapshot →
+# S06Load_PrintNext ở các vòng sau), cộng thời gian truyền VCP: cửa sổ thật kết thúc sớm hơn giờ PC của header
+# một khoảng d trong [0; PRINT_DELAY_MAX_MS] [ĐỀ XUẤT CODE_S06, chưa đo].
+PRINT_DELAY_MAX_MS = 1000.0
+# T10U-1: idle_us_est H7 tính = (idle_pass · cal_cyc / cal_n) / (SystemCoreClock / 1e6), chia nguyên hai lần
+# (s06_load.c S06Load_PrintNext); công cụ tính lại và cho lệch tối đa chừng này.
+IDLE_EST_TOL_US = 1
 
 _RE = {
     'link_up': re.compile(r'SPI link up at t=(\d+) ms'),
@@ -177,13 +184,31 @@ def idle_lower_pct(idle_pct: Optional[float], rel_unc: Optional[float], idle_pas
 
 
 def load_upper(rows) -> dict:
-    """B3: L = 100 % − lower bound of the idle share. `load_upper_pct` = 100 − mean of the per-window lower
-    bounds (the windows have the same length, so this is the bound of the mean); `load_upper_pct_max_window`
-    = the largest per-window bound. None when a window has no bound (no calibration)."""
+    """B3: L = 100 % − lower bound of the idle share. `load_upper_pct` = 100 − the `win_ms`-weighted mean of
+    the per-window lower bounds (T10U-4: windows may differ in length within WIN_MS_OK, so this is the bound of
+    the time mean of the run or segment); `load_upper_pct_max_window` = the largest per-window bound. None when
+    a window has no bound (no calibration, or a window dropped by the T10U-1 check)."""
     lo = [r['idle_pct_lo'] for r in rows]
     if not lo or any(v is None for v in lo):
         return dict(load_upper_pct=None, load_upper_pct_max_window=None)
-    return dict(load_upper_pct=100.0 - sum(lo) / len(lo), load_upper_pct_max_window=100.0 - min(lo))
+    w = [r['win_ms'] for r in rows]
+    return dict(load_upper_pct=100.0 - sum(v * x for v, x in zip(lo, w)) / sum(w),
+                load_upper_pct_max_window=100.0 - min(lo))
+
+
+def idle_check(h: dict) -> str:
+    """T10U-1: why the idle figures of a T10 header cannot be used ('' = usable). The H7 estimate must equal
+    idle_pass · cal_cyc / cal_n / f (integer divisions, ± IDLE_EST_TOL_US), and idle, ISR must fit the window."""
+    win_us = h['win_ms'] * 1000.0
+    if win_us <= 0:
+        return 'win_ms = 0'
+    if h['cal_n']:
+        expect = (h['idle_pass'] * h['cal_cyc'] // h['cal_n']) // int(F_NOMINAL_MHZ)
+        if abs(h['idle_us_est'] - expect) > IDLE_EST_TOL_US:
+            return f'idle_us_est {h["idle_us_est"]} khác idle_pass·cal ({expect})'
+    if h['idle_us_est'] > win_us or h['isr_us'] > win_us or h['idle_us_est'] + h['isr_us'] > win_us:
+        return 'idle_us_est + isr_us vượt cửa sổ'
+    return ''
 
 
 def t10_rows(blocks, f_real_mhz: Optional[float] = None):
@@ -197,7 +222,8 @@ def t10_rows(blocks, f_real_mhz: Optional[float] = None):
         idle_pct = 100.0 * h['idle_us_est'] / win_us if h['cal_n'] else None
         isr_pct = 100.0 * h['isr_us'] / win_us
         unc = (1.0 / h['cal_n'] + 1.0 / h['idle_pass']) if h['cal_n'] and h['idle_pass'] else None
-        lo = idle_lower_pct(idle_pct, unc, h['idle_pass'])
+        bad = idle_check(h)
+        lo = None if bad else idle_lower_pct(idle_pct, unc, h['idle_pass'])
         win_rows.append(dict(window=k, line=h['line'], win_ms=h['win_ms'], isr_us=h['isr_us'],
                              isr_pct=isr_pct, idle_pass=h['idle_pass'], idle_us=h['idle_us_est'],
                              idle_pct=idle_pct,
@@ -205,7 +231,8 @@ def t10_rows(blocks, f_real_mhz: Optional[float] = None):
                              idle_rel_unc=unc,
                              cal_n=h['cal_n'], cal_cyc=h['cal_cyc'], ovh_cyc=h['ovh_cyc'],
                              meas_cost_us=n_calls * h['ovh_cyc'] / F_NOMINAL_MHZ,
-                             idle_pct_lo=lo, load_upper_pct=None if lo is None else 100.0 - lo))
+                             idle_pct_lo=lo, load_upper_pct=None if lo is None else 100.0 - lo,
+                             idle_bad=bad))
         for i in bl['irqs']:
             irq_rows.append(dict(window=k, irq=i['irq'], count=i['n'], excl_us=i['excl_us'],
                                  gross_us='', max_us=i['max_us'],
@@ -229,17 +256,20 @@ def read_heavy_ms(path: str) -> Optional[tuple]:
 
 
 def mark_segments(win_rows, blocks, ev, span, heavy_ms) -> None:
-    """Spec 2.2 (Z8): T10 reports the heavy block and the group A part apart. PC time of the header = end of
-    the window; time 0 = PC time of the first 'SPI link up'. A window not fully on one side of a block edge
-    is `mixed` and goes into neither. Without PC times the column stays empty."""
+    """Spec 2.2 (Z8): T10 reports the heavy block and the group A part apart. Time 0 = PC time of the first
+    'SPI link up'. A line reaches the PC a delay in [0; PRINT_DELAY_MAX_MS] after the H7 event (T10U-3), for the
+    header (window end) as for the 'SPI link up' line (time 0), so the true window lies inside
+    [b − win − d_max; b + d_max] with b the PC time of the header from time 0: a window goes to a segment only if
+    that whole span is on one side of every block edge, else `mixed` (in neither). Without PC times the column
+    stays empty."""
     t0 = ev[span[0]].get('t_pc_us') if span else None
     for r, bl in zip(win_rows, blocks):
         end = bl['head'].get('t_pc_us')
         if t0 is None or end is None or heavy_ms is None:
             r['segment'] = ''
             continue
-        b_ms = (end - t0) / 1000.0
-        a_ms = b_ms - r['win_ms']
+        a_ms = (end - t0) / 1000.0 - r['win_ms'] - PRINT_DELAY_MAX_MS
+        b_ms = (end - t0) / 1000.0 + PRINT_DELAY_MAX_MS
         if a_ms >= heavy_ms[0] and b_ms <= heavy_ms[1]:
             r['segment'] = 'heavy'
         elif b_ms <= heavy_ms[0] or a_ms >= heavy_ms[1]:
@@ -290,18 +320,27 @@ def t10_summary(blocks, win_rows, irq_rows, ev, span) -> dict:
     # (2) Mất nguyên khối: theo giờ PC đầu dòng (tools/h7_serial_capture.py), hai header liên tiếp cách
     #     10 s ± T10_GAP_TOL_S, và số khối ≈ thời gian từ header đầu tới hết đoạn / 10 s. Log không có giờ
     #     PC (PuTTY) thì không kiểm được: báo, không coi là đủ.
+    # T10U-2 (Codex 15/11): the gap check runs on EVERY header of the span, the first one (dropped from the
+    # windows because it starts before link up) included, and the first header must come within 10 s + tol
+    # of 'SPI link up'; on the kept headers only, a lost header right after the dropped one merged its IRQ
+    # lines into the dropped block and nothing saw it.
+    a, b = span if span else (0, len(ev))
+    heads_all = [e for e in ev[a:b] if e['kind'] == 't10']
     heads = [bl['head'] for bl in blocks]
-    if heads and all(h.get('t_pc_us') is not None for h in heads):
-        gaps = [(b_['t_pc_us'] - a_['t_pc_us']) / 1e6 for a_, b_ in zip(heads, heads[1:])]
+    if heads_all and all(h.get('t_pc_us') is not None for h in heads_all):
+        gaps = [(b_['t_pc_us'] - a_['t_pc_us']) / 1e6 for a_, b_ in zip(heads_all, heads_all[1:])]
         lost = [i for i, g in enumerate(gaps) if abs(g - 10.0) > T10_GAP_TOL_S]
         if lost:
             data_lost.append(f'khoảng giữa hai khối T10 (giờ PC) khác 10 s sau khối {lost}: mất khối')
-        a, b = span if span else (0, len(ev))
+        t_up = ev[a].get('t_pc_us') if span else None
+        if t_up is not None and (heads_all[0]['t_pc_us'] - t_up) / 1e6 > 10.0 + T10_GAP_TOL_S:
+            data_lost.append(f'header T10 đầu tới sau SPI link up '
+                             f'{(heads_all[0]["t_pc_us"] - t_up) / 1e6:.1f} s (> 10 s): mất khối đầu')
         ends = [e['t_pc_us'] for e in ev[a:b] if e.get('t_pc_us') is not None]
         if ends:
-            expect = int((ends[-1] - heads[0]['t_pc_us']) / 1e6 // 10.0) + 1
-            if len(heads) < expect:
-                data_lost.append(f'{len(heads)} khối T10, kỳ vọng {expect} theo giờ PC: mất khối cuối')
+            expect = int((ends[-1] - heads_all[0]['t_pc_us']) / 1e6 // 10.0) + 1
+            if len(heads_all) < expect:
+                data_lost.append(f'{len(heads_all)} khối T10, kỳ vọng {expect} theo giờ PC: mất khối cuối')
     elif heads:
         missing.append('log serial không có giờ PC đầu dòng (không ghi bằng h7_serial_capture.py): '
                        'không kiểm được mất khối T10')
@@ -311,6 +350,14 @@ def t10_summary(blocks, win_rows, irq_rows, ev, span) -> dict:
         data_lost.append(f'H7 bỏ {pd[-1] - pd[0]} dòng in trong lượt (print_drop)')
     if len(pd) < 2:
         missing.append('không đủ dòng S06log để kiểm print_drop')
+    # T10U-1: idle figures that cannot come from the H7 formula, or do not fit the window = a damaged line
+    bad_idle = [(r['window'], r['idle_bad']) for r in win_rows if r.get('idle_bad')]
+    if bad_idle:
+        data_lost.append(f'header T10 có số rảnh không dùng được (dòng hỏng?): {bad_idle}')
+    # T10U-5: no idle calibration = no load bound, evidence missing (not a pass)
+    no_cal = [r['window'] for r in win_rows if r['cal_n'] == 0 and r['idle_pass']]
+    if no_cal:
+        missing.append(f'không có hiệu chuẩn vòng rỗng (cal=0/…): không có cận tải ở cửa sổ {no_cal}')
     problems = data_lost + missing
 
     def mean(k):
@@ -412,9 +459,14 @@ def main(argv=None) -> int:
     if a.load_schedule:
         mark_segments(win_rows, blocks, ev, span, heavy_ms)
         summ['segments'] = segment_means(win_rows)
-        if heavy_ms is not None and 'heavy' not in summ['segments']:
-            summ['missing'].append('không tách được khối tải nặng (thiếu giờ PC hoặc không có cửa sổ trọn trong khối)')
-            summ['complete'] = False
+        # spec 2.2: T10 reports both parts; T10U-6 (Codex 15/11): a schedule with a heavy block needs windows
+        # of BOTH parts (a schedule without one, --no-heavy, is not split: mark_segments leaves the column empty)
+        need = ('heavy', 'nhom_a') if heavy_ms is not None else ()      # no heavy block: no split (column empty)
+        for seg, txt in (('heavy', 'khối tải nặng'), ('nhom_a', 'phần nhóm A')):
+            if seg in need and seg not in summ['segments']:
+                summ['missing'].append(f'không tách được {txt} (thiếu giờ PC hoặc không có cửa sổ trọn trong phần đó)')
+        summ['problems'] = summ['data_lost'] + summ['missing']
+        summ['complete'] = not summ['problems']
     summ['link'] = link_stats(ev, span)
     summ['f_nominal_mhz'], summ['f_real_mhz'] = F_NOMINAL_MHZ, a.f_real_mhz
     summ['run_span_lines'] = None if span is None else [ev[span[0]]['line'],
