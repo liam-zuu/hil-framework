@@ -703,3 +703,37 @@ def test_tick_reset_on_motor_off_lines_is_not_a_flag(tmp_path):
     res = run(tmp_path / 'b', cut)
     assert any(f.startswith('run_active_toggle') for f in res['flags'])      # the run is lost anyway
     assert not any(f.startswith('pair_not_increasing') for f in res['flags']), res['flags']
+
+
+
+# ---------------------------------------------------------------- Codex Sol round 6 (CP6-1, CP6-2)
+def test_CP6_1_epoch_span_equal_to_the_nominal_through_the_file(tmp_path):
+    t = cp.Task('O1-F05')
+    nom_ms = (t.n_sched - 1) * 20
+    rows = make_log()
+    for sub, e0 in (('small', '1000.000'), ('real', '1794322935.904')):
+        e1 = f"{(int(e0.replace('.', '')) + nom_ms) / 1000:.3f}"
+        f = tmp_path / f'{sub}_sender.txt'
+        f.write_text(f'#test_start,test=O1-F05,t_epoch={e0}\n'
+                     f'#test_end,test=O1-F05,t_epoch={e1},sent={t.n_sched},planned={t.n_sched},complete=1\n',
+                     encoding='utf-8')
+        bao = cp.read_sender_bao(str(f), 'O1-F05')
+        (tmp_path / sub).mkdir()
+        res = run(tmp_path / sub, rows, sched=None, bao=bao)
+        assert not any(x.startswith('test_end_span_short') for x in res['flags']), (sub, bao, res['flags'])
+        p = write(tmp_path / sub, rows, name='c.csv')
+        assert cp.main(['--log', p, '--task', 'O1-F05', '--sender', str(f)]) == 0, sub
+    short = tmp_path / 'short.txt'                      # 1 ms short of the nominal: refused
+    short.write_text(f'#test_start,test=O1-F05,t_epoch=1000.000\n#test_end,test=O1-F05,'
+                     f't_epoch={(1000000 + nom_ms - 1) / 1000:.3f},complete=1\n', encoding='utf-8')
+    (tmp_path / 'sh').mkdir()
+    res = run(tmp_path / 'sh', rows, sched=None, bao=cp.read_sender_bao(str(short), 'O1-F05'))
+    assert any(x.startswith('test_end_span_short') for x in res['flags'])
+
+
+def test_CP6_2_interrupt_without_test_end(tmp_path):
+    f = tmp_path / 's.txt'
+    f.write_text('#test_start,test=O1-F05,t_epoch=1000.000\n#test_interrupted\n', encoding='utf-8')
+    assert cp.read_sender_complete(str(f), 'O1-F05') == (False, '#test_interrupted')
+    res = run(tmp_path, make_log(), sender_ok=cp.read_sender_complete(str(f), 'O1-F05'))
+    assert any(x.startswith('sender_incomplete') for x in res['flags'])
