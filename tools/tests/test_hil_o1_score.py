@@ -207,3 +207,208 @@ def test_tool_error_plant_state_out_of_range_b81_15():
     assert H.tool_error({}, m, allow_pre_b81_15=True)                    # theta -pi: not an error
     m[1] = frames([40.0] * 4 + [0.5, -0.5, 0.0, 3.0, 0.0, 10.0])[0]
     assert H.tool_error({}, m, allow_pre_b81_15=True)                    # wheel speed, v, wz at bound: not in the rule
+
+
+# ── B81-3 (S05 v3.20; gate JSON format of CODE_R134, rq3_log 4f1a0ef; design RS-4 section 18.1) ──
+
+def write_frame_log_tmap(path, task, tmap, k0=400, tail=T_LATE + 0.5):
+    """As write_frame_log, but the plant pose at frame time t is the exact figure 8 at tmap(t) (a jump makes a
+    tracking error); velocities from the poses."""
+    sch = Schedule(H.FIG8[task])
+    t = np.arange(int((sch.Tcmd + tail) / DT)) * DT
+    pose, _ = fig8_pose(task, np.array([tmap(tk) for tk in t]))
+    pose = np.vstack([np.zeros((k0, 3)), pose])
+    vel = np.gradient(pose[:, :2], DT, axis=0)
+    wz = np.gradient(np.unwrap(pose[:, 2]), DT)
+    n = len(pose)
+    mosi = np.zeros((n, P.FRAME_SIZE), dtype=np.uint8)
+    for k in range(n):
+        st = [0.0] * 4 + [pose[k, 0], pose[k, 1], pose[k, 2], vel[k, 0], vel[k, 1], wz[k]]
+        on = k >= k0 + 3
+        mosi[k] = np.frombuffer(P.encode_state(st, traj_ref=(0.3, 0.0, 0.1) if on else None,
+                                               traj_flags=P.TRAJ_VALID if on else 0, seq=k), dtype=np.uint8)
+    manifest = dict(period_us=1000, steps=n, plant='MecanumPlant', miso_check=dict(crc_bad=0, empty=0),
+                    state_out_of_range=None,
+                    lifecycle=dict(outcome='completed', transitions=[dict(step=0, t=0, phase='ARM'),
+                                                                     dict(step=k0, t=0.4, phase='RUN')]))
+    np.savez(path, manifest=np.array(json.dumps(manifest)), mosi=mosi, miso=np.zeros((n, P.FRAME_SIZE), dtype=np.uint8))
+    return sch
+
+
+def _jump_ahead(t):
+    return t + 2.0 if t >= 3.0 else t
+
+
+def _check_b81_3_common(g):
+    for c in ('g2', 'g3', 'g4', 'g5'):
+        chung = g[c]['chung']
+        assert set(chung) == {'q', 'lo', 'hi', 'n_undef'}
+        for k in ('q', 'lo', 'hi', 'n_undef'):
+            a, b = chung[k], g[c][k]
+            assert a == b or (isinstance(a, float) and math.isnan(a) and math.isnan(b)), (c, k)
+
+
+def _rq3_new():
+    """rq3_log with the B81-3 checks (CODE_R134 fix/r134-answers 4f1a0ef), else None (before that merge)."""
+    import rq3_log
+    return rq3_log if hasattr(rq3_log, 'gate_g1_fields') else None
+
+
+def test_b81_3_fields_run_completed(tmp_path):
+    p = str(tmp_path / 'run.npz')
+    write_frame_log(p, 'O1-F05')
+    out = H.score(p, 'O1-F05')
+    g = out['gate_v3']
+    assert out['completed'] == 'true' and g['g1']['state'] == 'dat'
+    assert g['g1']['t_done'] == [out['t_end']] and g['g1']['t_deadline'] == out['t_deadline']
+    assert g['g1']['t1'] is None and g['g1']['prog_before_t1'] is None and g['g1']['cond25_before_deadline'] is None
+    assert g['g1_fields_note'] == ''
+    _check_b81_3_common(g)
+    js = json.loads(json.dumps(H._json_safe(out)))
+    assert js['gate_v3']['g1']['t_done'] == [pytest.approx(out['t_end'])]
+
+
+def test_b81_3_short_log_writes_no_g1_fields(tmp_path):
+    """L85 Q1 short log: 'false' turned 'inconclusive'; the fields cannot say "not known" (Liam 15/11 CODE_RS4)."""
+    p = str(tmp_path / 'run.npz')
+    write_frame_log(p, 'O1-F05', tail=-0.5)
+    out = H.score(p, 'O1-F05')
+    g = out['gate_v3']
+    assert out['completed'] == 'inconclusive' and out['completed_raw'] == 'false'
+    assert g['g1']['state'] == 'chua_ket_luan'
+    assert all(g['g1'][k] is None for k in H.G1_FIELDS) and 'short log' in g['g1_fields_note']
+    _check_b81_3_common(g)
+
+
+def test_b81_3_tracking_error_before_progress(tmp_path):
+    """A jump 2 s ahead at t = 3 s: tracking error (s* on the upper end) before the progress reached S - D_d;
+    the car then completes the figure and stops at the origin, so conditions 2-5 hold before the deadline:
+    G1 chua_ket_luan (O1 3.5 last block), t1 the jump frame."""
+    p = str(tmp_path / 'run.npz')
+    write_frame_log_tmap(p, 'O1-F05', _jump_ahead)
+    out = H.score(p, 'O1-F05')
+    g1 = out['gate_v3']['g1']
+    assert out['status'] == 'track_err' and out['completed'] == 'inconclusive'
+    assert g1['t1'] == pytest.approx(3.0, abs=2e-3) and g1['t1'] == out['t_first_track_err']
+    assert g1['prog_before_t1'] is False and g1['cond25_before_deadline'] is True
+    assert g1['t_done'] == [None] and g1['state'] == 'chua_ket_luan'
+
+
+def _gate_stub(completed):
+    frames = {k: np.array([0.01, 0.02]) for k in ('e_perp', 'e_trk', 'e_bao')}
+    frames['e_theta_cmd_deg'] = np.array([1.0, 2.0])
+    return H.o1_gate.gate(frames, completed, v_cmd_max=0.7, wz_cmd_max=1.0, u_t=0.008)
+
+
+NAN = float('nan')
+
+
+@pytest.mark.parametrize('completed,t_first,t_prog,c25,want', [
+    ('true', NAN, 5.0, True, dict(t1=None, prog=None, c25=None, done=True)),
+    ('false', NAN, NAN, False, dict(t1=None, prog=None, c25=None, done=False)),
+    ('true', 6.0, 5.0, True, dict(t1=6.0, prog=True, c25=True, done=True)),      # progress before t1: trusted
+    ('false', 6.0, 5.0, False, dict(t1=6.0, prog=True, c25=False, done=False)),
+    ('inconclusive', 6.0, 7.0, True, dict(t1=6.0, prog=False, c25=True, done=False)),
+    ('false', 6.0, NAN, False, dict(t1=6.0, prog=False, c25=False, done=False)),
+    ('inconclusive', 6.0, 6.0, True, dict(t1=6.0, prog=False, c25=True, done=False)),  # t_prog = t1: not before
+])
+def test_b81_3_fields_from_the_evaluator_summary(completed, t_first, t_prog, c25, want):
+    out = dict(completed=completed, t_end=9.5, t_deadline=12.0, t_first_track_err=t_first, t_progress=t_prog,
+               cond2_5_ever=c25, log_covers_deadline=True)
+    g = H.add_b81_3(_gate_stub(completed), out)
+    g1 = g['g1']
+    assert g1['t1'] == want['t1'] and g1['prog_before_t1'] is want['prog']
+    assert g1['cond25_before_deadline'] is want['c25'] and g1['t_deadline'] == 12.0
+    assert g1['t_done'] == ([9.5] if want['done'] else [None])
+    assert H.g1_state_from_fields(g1) == g1['state']
+    rl = _rq3_new()
+    if rl is not None:
+        f = rl.gate_g1_fields(json.loads(json.dumps(H._json_safe(g1))), 'HIL')
+        assert rl.gate_g1_state(f) == g1['state']
+
+
+def test_b81_3_time_just_below_zero_is_the_first_frame():
+    """Codex B813-R1-1: edge mapped at step 400.00000000000216 -> k0 = 400, t(k0) = -2.16e-15 s; a tracking error
+    on that frame gave t1 < 0, refused by rq3_log (times >= 0). Within G1_T_NEG_TOL it is written 0.0; further
+    below 0 is an error."""
+    a = 400.00000000000216
+    k0 = int(math.ceil(a - 1e-9))
+    t_first = (k0 - a) * 1e-3
+    assert k0 == 400 and -H.G1_T_NEG_STEPS * 1e-3 <= t_first < 0.0
+    out = dict(completed='false', t_end=11.9, t_deadline=12.0, t_first_track_err=t_first, t_progress=NAN,
+               cond2_5_ever=False, log_covers_deadline=True)
+    g1 = H.add_b81_3(_gate_stub('false'), out)['g1']
+    assert g1['t1'] == 0.0 and g1['prog_before_t1'] is False and g1['cond25_before_deadline'] is False
+    assert g1['state'] == 'khong_dat'
+    rl = _rq3_new()
+    if rl is not None:
+        f = rl.gate_g1_fields(json.loads(json.dumps(H._json_safe(g1))), 'HIL')
+        assert rl.gate_g1_state(f) == 'khong_dat'
+    # progress at the same (negative) time as t1 is not before it: compared on the evaluator's own times
+    out.update(t_progress=t_first, completed='false')
+    assert H.add_b81_3(_gate_stub('false'), out)['g1']['prog_before_t1'] is False
+    for bad in (-1e-6, -5e-10, -2.1e-12):            # Codex B813-R2-1: -5e-10 is 500 x the 1 ms rounding bound
+        out.update(t_first_track_err=bad)
+        with pytest.raises(ValueError, match='B81-3: time .* below 0'):
+            H.add_b81_3(_gate_stub('false'), out, 1e-3)
+    assert H._g1_time(None, 1e-3) is None and H._g1_time(0.0, 1e-3) == 0.0 and H._g1_time(3.0, 1e-3) == 3.0
+    assert H._g1_time(-2e-12, 1e-3) == 0.0 and H._g1_time(-2e-9, 1.0) == 0.0     # the bound scales with the period
+    with pytest.raises(ValueError):
+        H._g1_time(-2e-9, 1e-3)
+    # every k0 the scorer can choose: a just above / below an integer, small and large step indices (Codex R2-1:
+    # a = 10000.000000001 gives t(k0) = -1.0004e-12 s, beyond the exact -1e-12 by float rounding)
+    for base in (0, 400, 10000, 30000, 10 ** 6):
+        for d in (0.0, 2.16e-12, 1e-9, 1e-9 + 1e-15, 0.99e-9, -1e-12, 0.5, 0.999999999):
+            a = base + d
+            k0 = int(math.ceil(a - 1e-9))
+            for per in (1e-3, 5e-4, 2e-3):
+                t = (k0 - a) * per
+                assert H._g1_time(t, per) >= 0.0, (a, per, t)
+
+
+def test_b81_3_k1_run(tmp_path):
+    """K1 (evaluate_k path, Codex B813-R1-2): the car on the command point completes; G1 fields and chung."""
+    from test_gate_v3_tools import write_k_frame_log
+    p = str(tmp_path / 'k1.npz')
+    write_k_frame_log(p, 'O1-K1', 0.0)
+    out = H.score(p, 'O1-K1', allow_final_set=True)
+    g = out['gate_v3']
+    assert out['completed'] == 'true' and g['g1']['state'] == 'dat'
+    assert g['g1']['t_done'] == [out['t_end']] and g['g1']['t1'] is None
+    _check_b81_3_common(g)
+
+
+@pytest.mark.parametrize('completed,t_first,t_prog,c25', [
+    ('true', 6.0, 7.0, True),           # completed although progress came after t1: the evaluator never says so
+    ('inconclusive', NAN, 5.0, True),
+    ('inconclusive', 6.0, 7.0, False),
+    ('false', 6.0, 7.0, True),
+])
+def test_b81_3_fields_that_disagree_with_g1_are_refused(completed, t_first, t_prog, c25):
+    out = dict(completed=completed, t_end=9.5, t_deadline=12.0, t_first_track_err=t_first, t_progress=t_prog,
+               cond2_5_ever=c25, log_covers_deadline=True)
+    with pytest.raises(ValueError, match='B81-3'):
+        H.add_b81_3(_gate_stub(completed), out)
+
+
+def test_b81_3_gate_accepted_by_rq3_log_b81_3(tmp_path):
+    """The whole gate_v3 block through rq3_log.validate_gate of CODE_R134 (B81-3 checks): skipped until that
+    rq3_log is on the branch (fix/r134-answers 4f1a0ef, merged after this one, coordination 3.3)."""
+    rl = _rq3_new()
+    if rl is None:
+        pytest.skip('rq3_log without gate_g1_fields (before fix/r134-answers is merged)')
+    for name, kw in (('run.npz', {}), ('short.npz', dict(tail=-0.5))):
+        p = str(tmp_path / name)
+        write_frame_log(p, 'O1-F05', **kw)
+        js = json.loads(json.dumps(H._json_safe(H.score(p, 'O1-F05'))))
+        rl.validate_gate(js['gate_v3'], 'HIL')
+    p = str(tmp_path / 'trk.npz')
+    write_frame_log_tmap(p, 'O1-F05', _jump_ahead)
+    js = json.loads(json.dumps(H._json_safe(H.score(p, 'O1-F05'))))
+    rl.validate_gate(js['gate_v3'], 'HIL')
+    from test_gate_v3_tools import write_k_frame_log                 # K1, K2 (Codex B813-R1-2)
+    for task, yaw in (('O1-K1', 0.0), ('O1-K2', 0.0), ('O1-K1', 0.2)):
+        p = str(tmp_path / f'{task}_{yaw}.npz')
+        write_k_frame_log(p, task, yaw)
+        js = json.loads(json.dumps(H._json_safe(H.score(p, task, allow_final_set=True))))
+        rl.validate_gate(js['gate_v3'], 'HIL')
