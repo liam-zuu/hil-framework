@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import binascii
+import bisect
 import csv
 import json
 import os
@@ -582,14 +583,70 @@ def pad_check(window, t_send_us, J, I):
     return '; '.join(out)
 
 
+def seq_shifts(h7, J, off):
+    """T4 (4) (CODE_S06 15/11; Liam 15/11, CODE_S06 local_da965ab4 'Do lech x256 theo gio'): n is unwrapped on
+    each side from that side's own first report, so for the same report n_J − n_H7 is a multiple of 256 that
+    depends on where each stream starts (T4 of the bench run 15/11: every pair 2.56 s early). Per
+    (H7 epoch, kind): candidate shifts = n_J − n_H7 of each H7 report and the J with the same 8-bit seq nearest
+    in Pi time (J t_rx vs H7 t_pi_us, one clock); the shift kept is the candidate with the smallest median
+    |t_rx − t_pi_us| over the pairs it makes (tie: smaller |shift|). At or above SEQ_CUT_PERIODS J report
+    periods: no shift (that group is not matched, noted). Needs `seq_keys(J)` run first (J['n']).
+    Returns ({(epoch, kind): shift or None}, {'epoch/kind': info})."""
+    shifts, info = {}, {}
+    if off is None:
+        return shifts, info
+    jg = _group(J, lambda j: (j['epoch'], j['kind']))
+    for (ep, kd), hs in _group(h7, lambda r: (r['epoch'], r['kind'])).items():
+        js = jg.get((ep + off, kd), [])
+        by_n = {j['n']: j for j in js}
+        by_seq = defaultdict(list)
+        for j in js:
+            by_seq[j['seq']].append(j)
+        for lst in by_seq.values():
+            lst.sort(key=lambda j: j['t_rx'])
+        per = seq_chain(sorted(js, key=lambda x: x['t_us']), lambda r: r['seq'], lambda r: r['t_us'])[1] if js else None
+        timed = [r for r in hs if r.get('t_pi_us') is not None]
+        cands = set()
+        for r in timed:
+            lst = by_seq.get(r['rpt_seq'] % 256, [])
+            if lst:
+                t = [j['t_rx'] for j in lst]
+                i = bisect.bisect_left(t, r['t_pi_us'])
+                near = min((lst[x] for x in (i - 1, i) if 0 <= x < len(lst)),
+                           key=lambda j: abs(j['t_rx'] - r['t_pi_us']))
+                cands.add(near['n'] - r['n'])
+        best = None
+        for s in cands:
+            dts = [by_n[r['n'] + s]['t_rx'] - r['t_pi_us'] for r in timed if r['n'] + s in by_n]
+            med = float(np.median(np.abs(dts))) if dts else None
+            if med is not None and (best is None or (med, abs(s)) < (best[1], abs(best[0]))):
+                best = (s, med, len(dts), float(np.median(dts)))
+        name = f'{ep}/{kd}'
+        if best is None or per is None:
+            shifts[(ep, kd)] = None
+            info[name] = dict(shift=None, note='không có cặp report cùng seq ở hai phía')
+        elif best[1] >= SEQ_CUT_PERIODS * per:
+            shifts[(ep, kd)] = None
+            info[name] = dict(shift=None, dt_abs_median_us=best[1], period_us=per,
+                              note=f'trung vị |t_rx − t_pi| {best[1] / 1e3:.1f} ms ≥ {SEQ_CUT_PERIODS} chu kỳ report: '
+                                   'không ghép')
+        else:
+            shifts[(ep, kd)] = best[0]
+            info[name] = dict(shift=best[0], dt_abs_median_us=best[1], dt_median_us=best[3], pairs=best[2],
+                              period_us=per)
+    return shifts, info
+
+
 def match_esp32(h7, J, I, window=None, span=None):
-    """Match H7 reports with the ESP32 SPI port (J) and callbacks (I) on (epoch, kind, n). Only reports
+    """Match H7 reports with the ESP32 SPI port (J) and callbacks (I) on (epoch, kind, n + shift), the shift a
+    multiple of 256 chosen by time per (epoch, kind) (`seq_shifts`). Only reports
     inside `window` (Pi clock: H7 build time t_pi_us; J receive time t_rx) are scored (S32); the rest
     is counted apart. Without a window every report is scored (as before) and that is reported.
     Epochs are anchored on the J received during the Pi frames (`span`, Pi clock)."""
     jk = seq_keys(J)
     map_callbacks(I, J)
     off, note = epoch_offset(h7, [j for j in J if span is None or span[0] <= j['t_rx'] <= span[1]])
+    shifts, shift_info = seq_shifts(h7, J, off)
     cb_by_j = defaultdict(list)
     for i in I:
         if i['j'] is not None:
@@ -603,7 +660,9 @@ def match_esp32(h7, J, I, window=None, span=None):
 
     h7k = set()
     for r in h7:
-        k = None if off is None else (r['epoch'] + off, r['kind'], r['n'])
+        s = shifts.get((r['epoch'], r['kind'])) if off is not None else None
+        k = None if s is None else (r['epoch'] + off, r['kind'], r['n'] + s)
+        r['n_esp32'] = None if s is None else r['n'] + s        # n of this report on the ESP32 side (J, I)
         h7k.add(k)
         j = jk.get(k) if k is not None else None
         r['esp32_spi'] = j is not None
@@ -614,7 +673,7 @@ def match_esp32(h7, J, I, window=None, span=None):
     sc = [r for r in h7 if r['scored']]
     matched = sum(1 for r in sc if r['esp32_spi'])
     extra = [j for k, j in jk.items() if k not in h7k and inside_j(j)]
-    return dict(epoch_offset_esp32_minus_h7=off, epoch_note=note, window_pi_us=window,
+    return dict(epoch_offset_esp32_minus_h7=off, epoch_note=note, seq_shift=shift_info, window_pi_us=window,
                 h7_reports=len(h7), h7_scored=len(sc), matched_spi=matched,
                 not_at_esp32_spi=len(sc) - matched if off is not None else len(sc),
                 at_spi_not_cb=sum(1 for r in sc if r['esp32_spi'] and not r['esp32_cb']),

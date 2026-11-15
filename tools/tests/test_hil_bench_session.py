@@ -557,3 +557,133 @@ def test_campaign_env_flag_parsed():
     assert 'campaign_env' in inspect.signature(hb.lifted_env_problem).parameters
     src = inspect.getsource(hb)
     assert "'--campaign-env'" in src and "r['campaign_env'] = bool(a.campaign_env)" in src
+
+
+# ── --s06: S06 runs with tools/s06_logger.py (Liam 15/11, CODE_S06 'Mo rong hil_bench_session', 'Code ca hai') ──
+
+def _plan(*runs):
+    return hb.plan_runs(list(runs))
+
+
+def test_s06_plan_parses_and_refuses():
+    plan = _plan('t2=--load-schedule s.csv --steps 70000', 't5=--steps 620000')
+    got = hb.plan_s06(['t2=heavy,60', 't5=zero,610,logger-first'], plan)
+    assert got == dict(t2=dict(profile='heavy', duration=60, logger_first=False),
+                       t5=dict(profile='zero', duration=610, logger_first=True))
+    bad = ['x=heavy,60',                        # no such --run
+           't2=fast,60', 't2=heavy,0', 't2=heavy,6x', 't2=heavy,60,plant-first', 't2=heavy']
+    for spec in bad:
+        with pytest.raises(ValueError):
+            hb.plan_s06([spec], plan)
+    with pytest.raises(ValueError):
+        hb.plan_s06(['t2=heavy,60', 't2=heavy,60'], plan)            # given twice
+    with pytest.raises(ValueError, match='70000'):                    # the trial-run lesson: plant >= run + 10 s
+        hb.plan_s06(['t2=heavy,61'], plan)
+    with pytest.raises(ValueError, match='--steps'):
+        hb.plan_s06(['t2=heavy,60'], _plan('t2=--load-schedule s.csv'))
+    with pytest.raises(ValueError, match='gain-query'):
+        hb.plan_s06(['t2=heavy,60'], plan, gain_query=True)
+    assert hb.plan_s06([], plan) == {}
+
+
+def test_s06_run_cmd_order_and_logger():
+    s = dict(profile='heavy', duration=60, logger_first=False)
+    c = hb.s06_run_cmd('~/r', 't2', '--steps 70000', s, '192.168.1.181')
+    i_hil, i_log = c.index('run_hil.py'), c.index('s06_logger.py')
+    assert i_hil < c.index('sleep 2') < i_log                          # plant first, logger 2 s after
+    assert ('--esp32 192.168.1.181 --profile heavy --duration 60 --out ~/r/t2_esp > ~/r/t2_logger.txt' in c)
+    assert 'echo $H > ~/r/t2.pid' in c and '--frame-log ~/r/t2_frames.npz' in c
+    assert c.endswith('wait $H; RC=$?; exit $RC') and 'echo logger_exit=$?' in c
+    c = hb.s06_run_cmd('~/r', 't5', '--steps 620000', dict(s, logger_first=True), '10.0.0.2')
+    assert c.index('s06_logger.py') < c.index('sleep 4') < c.index('run_hil.py')     # T5: logger first
+    assert 'wait $L; echo logger_exit=$?; exit $RC' in c
+    assert 'agv_logger' not in c
+
+
+def test_s06_leftover_logger_found():
+    assert hb.leftovers('123 python3 tools/s06_logger.py --esp32 x') == ['123 python3 tools/s06_logger.py --esp32 x']
+
+
+def test_s06_bench_runs_s06_logger_and_records(tmp_path, monkeypatch):
+    import json as _j
+    scps = []
+    reply = lambda c: (0, '## HEAD\nabc') if 'git' in c else (0, 'logger_exit=0')  # noqa: E731
+    a, calls, _ = _bench_env(monkeypatch, tmp_path, reply, run=['t2=--test A-L1 --steps 70000'], no_logger=False,
+                             s06=['t2=heavy,60'], gain_query=False)
+    monkeypatch.setattr(hb, 'scp', lambda host, remote, local, recursive=False: scps.append((remote, recursive)) or 0)
+    _FakeSerial.lines = {'COM9': [(50.0, 'I (2069) WIFI: Got IP: 192.168.1.181 (after 0 failed attempts)')]}
+    hb.bench(a)
+    run = [c for c in calls if 'run_hil.py' in c]
+    assert run and 's06_logger.py --esp32 192.168.1.181 --profile heavy --duration 60' in run[0]
+    assert 'agv_logger' not in run[0]
+    assert ('~/r/t2_esp', True) in scps
+    s = _j.load(open(os.path.join(a.out, 'session.json'), encoding='utf-8'))
+    assert s['runs'][0]['s06'] == dict(profile='heavy', duration=60, logger_first=False, esp32_ip='192.168.1.181')
+    assert 'logger_cmd' not in s['runs'][0]
+
+
+def test_s06_bench_without_esp32_ip_stops(tmp_path, monkeypatch):
+    a, calls, _ = _bench_env(monkeypatch, tmp_path, None, run=['t2=--test A-L1 --steps 70000'], s06=['t2=heavy,60'])
+    code, _ = hb.bench(a)
+    assert code == 2 and not [c for c in calls if 'run_hil.py' in c]
+
+
+def test_s06_bench_bad_spec_stops_before_ssh(tmp_path, monkeypatch):
+    a, calls, _ = _bench_env(monkeypatch, tmp_path, None, run=['t2=--test A-L1 --steps 1000'], s06=['t2=heavy,60'])
+    assert hb.bench(a) == (2, []) and calls == []
+
+
+def test_s06_analyze_run_matches_events_and_judges_the_check(tmp_path, monkeypatch):
+    seen = {}
+    out = tmp_path / 'o'
+    (out / 'frames').mkdir(parents=True)
+    (out / 'pi' / 't2_esp').mkdir(parents=True)
+    (out / 'pi' / 't2_esp' / 'esp32_events.txt').write_text('')
+    t, mosi, miso = frames(n=10)
+    np.savez(out / 'frames' / 't2_frames.npz', t_send_ns=t, mosi=mosi, miso=miso)
+
+    def fake_decode(ts, mo, mi, ev=None):
+        seen['ev'] = ev
+        return dict(frames=dict(frames=10, miso_crc_bad=0, empty_in_run=0, unanswered=0))
+    monkeypatch.setattr(hb.dec, 'decode', fake_decode)
+    monkeypatch.setattr(hb.dec, 'problems', lambda res: [])
+    monkeypatch.setattr(hb, 'tracking', lambda *x: {})
+    codes = iter([1, 0])
+    monkeypatch.setattr(hb, 's06_check', lambda o, n, sub='check': seen.setdefault('sub', sub) and next(codes))
+    r = hb.analyze_run(str(out), 't2', s06=True)
+    assert seen['ev'].endswith(os.path.join('t2_esp', 'esp32_events.txt')) and seen['sub'] == 'check'
+    assert not r['clean'] and any('s06_esp32_check mã 1' in w for w in r['why'])
+    r = hb.analyze_run(str(out), 't2', s06=True)
+    assert r['clean']
+    seen.clear()
+    r = hb.analyze_run(str(out), 't2')                               # not an S06 run: no events, no check
+    assert seen['ev'] is None and 'sub' not in seen
+
+
+def test_s06_check_writes_outside_the_raw_folder(tmp_path):
+    out = tmp_path / 'o'
+    assert hb.s06_check(str(out), 'nope') == 2                       # no pi/<name>_esp
+    (out / 'pi' / 't2_esp').mkdir(parents=True)
+    code = hb.s06_check(str(out), 't2')
+    assert code in (1, 3) and (out / 'check' / 't2' / 'stdout.txt').exists()
+    assert not (out / 'pi' / 't2_esp' / 'check').exists()
+    assert hb.s06_check(str(out), 't2', 'check_analyze') == code and (out / 'check_analyze' / 't2').is_dir()
+
+
+def test_s06_analyze_only_passes_s06_for_s06_runs_only(tmp_path, monkeypatch):
+    import json as _j
+    out = tmp_path / 'o'
+    (out / 'frames').mkdir(parents=True)
+    for n in ('t2', 'k1'):
+        (out / 'frames' / f'{n}_frames.npz').write_bytes(b'')
+    (out / 'session.json').write_text(_j.dumps(dict(runs=[dict(name='t2', s06=dict(profile='heavy')),
+                                                         dict(name='k1')])), encoding='utf-8')
+    seen = {}
+
+    def fake(o, n, *x, **kw):
+        seen[n] = kw
+        return dict(name=n, clean=True, why=[])
+    monkeypatch.setattr(hb, 'analyze_run', fake)
+    monkeypatch.setattr(hb, 'summary_line', lambda r: r['name'])
+    code, _ = hb.analyze_only(SimpleNamespace(out=str(out)))
+    assert code == 0 and seen['t2'] == dict(s06=True, check_sub='check_analyze') and seen['k1'] == {}

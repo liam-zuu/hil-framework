@@ -577,3 +577,52 @@ def test_miso_apply_v5_and_v4():
     assert dec.miso_apply(_miso_v5(0x80, 2047, 31))['age_us'] == 0xFFFF
     assert dec.miso_apply(_miso_v5(0x80, 100, 31))['apply_ok'] is False
     assert dec.miso_apply(_miso_v5(0x01, 412, 6)) == dict(miso_v5=False)     # v4: status bit 7 never set
+
+
+def esp32_file_early(tmp_path, seqs, t0_us, early, epoch_off=1):
+    """T4 (4) (bench run 15/11): the ESP32 J/I stream holds `early` reports per kind before the first H7 report
+    of the frame log (10 ms apart), so its n starts from another seq than the H7 side. Pi clock shifted by
+    t0_us (t_send_ns + t0_us·1000 on the caller side) so those times stay positive."""
+    lines, q = [f'{t0_us + 1_500_000}\t#run_start,first_data_seq=1,timestamp_us={t0_us + 1_500_000},qseq=0'], 0
+    for s, kind in enumerate((1, 2, 8)):
+        for n in range(-early, seqs[s]):
+            q += 1
+            t = t0_us + (30 + 10 * n) * 1000 + 300 + s
+            lines.append(f'{t}\tJ,{q},{t},{kind},1,{n % 256},{1 + epoch_off}')
+            lines.append(f'{t + 50}\tI,{q},{t + 50},{kind},1,{n % 256},{1 + epoch_off},{n},{n},0,0,0')
+    end = t0_us + N * 1000 - 1_500_000
+    lines.append(f'{end}\t#run_end,last_data_seq=9,timestamp_us={end},qseq={q + 1}')
+    p = tmp_path / 'esp32_events.txt'
+    p.write_text('\n'.join(lines) + '\n')
+    return str(p)
+
+
+@pytest.mark.parametrize('early', [200, 300, 0])
+def test_report_match_shift_chosen_by_time(clean, tmp_path, early):
+    """T4 (4) (CODE_S06 15/11; Liam 'Do lech x256 theo gio'): with 200 (300) early J reports the two n bases
+    differ by 256 (512); matching on n alone paired every H7 report with the J 2.56 s (5.12 s) earlier and
+    still counted it matched. Now every scored report pairs with its own J (ESP32 time ~300 µs after the H7
+    build time, same clock here), shift −256·k chosen, nothing 'without H7'."""
+    t, mosi, miso, seqs = clean
+    t0 = 10_000_000
+    res = dec.decode(t + t0 * 1000, mosi, miso, esp32_file_early(tmp_path, seqs, t0, early))
+    m = res['esp32_match']
+    sc = [r for r in res['_reports'] if r['scored']]
+    assert sc and m['matched_spi'] == m['h7_scored'] and m['not_at_esp32_spi'] == 0
+    assert all(abs(r['esp32_t_us'] - r['t_pi_us']) < 1000 for r in sc), \
+        max(abs(r['esp32_t_us'] - r['t_pi_us']) for r in sc)
+    exp = {200: 256, 300: 512, 0: 0}[early]
+    assert {v['shift'] for v in m['seq_shift'].values()} == {exp}
+    assert m['esp32_without_h7'] == 0
+
+
+def test_report_match_no_shift_when_streams_far_apart(clean, tmp_path):
+    """Liam 'Do lech x256 theo gio': at or above 128 report periods of median |t_rx − t_pi| no shift is kept and
+    the reports are not matched (noted). Only reachable when the delays are spread (a constant delay always has a
+    multiple of 2.56 s within 1.28 s): here the J lag +1.3 s and −1.3 s in turn, |dt| ≥ 1.26 s at every shift."""
+    t, mosi, miso, seqs = clean
+    shifts, info = dec.seq_shifts(
+        [dict(epoch=1, kind='gyro', n=k, rpt_seq=k % 256, t_pi_us=10_000.0 * k) for k in range(600)],
+        [dict(epoch=2, kind='gyro', n=k, seq=k % 256, t_us=10_000.0 * k,
+              t_rx=10_000.0 * k + (1_300_000.0 if k % 2 else -1_300_000.0)) for k in range(600)], 1)
+    assert shifts[(1, 'gyro')] is None and 'không ghép' in info['1/gyro']['note']
