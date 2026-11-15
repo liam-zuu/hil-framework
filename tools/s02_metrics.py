@@ -406,6 +406,9 @@ def run_dir_metrics(d, out_name='metrics.csv'):
     for r in runs:
         if r.get('aborted') not in (None, '', '0'):
             continue
+        # s02_plan.py (S2P1-9): a block re-run for the battery and a replaced run are history, not results
+        if (r.get('block_status') or '').strip() == 'battery_rerun' or (r.get('result') or '').strip() == 'replaced':
+            continue
         if r['platform'].strip().lower() == 'hil':
             check_no_udp_taken(os.path.join(d, r['file']) + '.events.txt')
         log = load_log(os.path.join(d, r['file']))

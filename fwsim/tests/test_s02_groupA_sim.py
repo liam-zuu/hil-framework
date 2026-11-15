@@ -79,3 +79,21 @@ def test_preparation_and_plant_file(tmp_path):
     assert float(rows[i]['w1']) == pytest.approx(log['omega'][i][0], abs=1e-5)
     th = float(rows[i]['theta'])
     assert float(rows[i]['vx_w']) == pytest.approx(np.cos(th) * float(rows[i]['vx_b']) - np.sin(th) * float(rows[i]['vy_b']), abs=1e-5)
+
+
+@pytest.mark.skipif(not HAVE_DLL, reason='fwsim.dll not built')
+def test_main_writes_preparation_plant_file_and_metrics(tmp_path, monkeypatch):
+    """S2P1-11 (Codex round 1): through main() (one test, one repetition), the run has the 3 s preparation,
+    the plant file, prep_s in runs.csv, and the scorer finds t = 0 at 3 s with no flag."""
+    import csv
+    monkeypatch.setattr(s02, 'GROUP_A', {'A-L2': s02.GROUP_A['A-L2']})
+    out = tmp_path / 'run'
+    monkeypatch.setattr(sys, 'argv', ['s02_groupA_sim.py', '--controller', 'PID', '--reps', '1', '--out', str(out)])
+    s02.main()
+    with open(out / 'runs.csv', newline='') as f:
+        run = next(csv.DictReader(f))
+    assert run['prep_s'] == '3.0' and (out / run['plant_file']).is_file()
+    with open(out / 'metrics.csv', newline='') as f:
+        m = next(csv.DictReader(f))
+    assert m['t0_us'] == '3000000' and m['edge_kind'] == 'cold_start' and m['prep_flags'] == ''
+    assert m['sim_t0_err_us'] == '0'

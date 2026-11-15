@@ -76,3 +76,45 @@ def test_bad_combinations_are_refused_before_any_process(extra, msg):
     p = subprocess.run([sys.executable, 'run_hil.py', '--mock'] + extra, cwd=RPI5, capture_output=True,
                        text=True, timeout=60)
     assert p.returncode != 0 and msg in p.stderr
+
+
+class _FakeProc:
+    made = []
+
+    def __init__(self, target=None, args=(), name='', daemon=None):
+        self.target, self.args, self.name = target, args, name
+        self.pid, self.exitcode = 1, 0
+        _FakeProc.made.append(self)
+
+    def start(self):
+        pass
+
+    def is_alive(self):
+        return False
+
+    def join(self, timeout=None):
+        pass
+
+    def terminate(self):
+        pass
+
+
+@pytest.mark.parametrize('extra,run_s', [([], 9.0), (['--s02-prep', '3'], 13.0)])
+def test_main_wires_the_prepared_schedule(monkeypatch, extra, run_s):
+    """S2P1-11 (Codex round 1): through run_hil.main, the publisher process gets the wrapped schedule and the
+    lifecycle lasts preparation + test + tail; without the flag nothing changes."""
+    import run_hil
+    _FakeProc.made = []
+    monkeypatch.setattr(run_hil.mp, 'Process', _FakeProc)
+    monkeypatch.setattr(sys, 'argv', ['run_hil.py', '--mock', '--test', 'A-K2', '--finite-run'] + extra)
+    run_hil.main()
+    plant, pub = _FakeProc.made
+    spec = pub.args[0]
+    cfg = plant.args[0]
+    assert cfg.lifecycle.run_s == pytest.approx(run_s)
+    assert spec.duration == pytest.approx(run_s)
+    assert plant.args[5] is True                                   # A-K: wheels lifted either way
+    if extra:
+        assert spec.kind == 'load' and spec.sequence[0][0] == pytest.approx(3.0)
+    else:
+        assert spec.kind == 'lift_reverse'

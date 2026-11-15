@@ -23,10 +23,15 @@ there, P2-2).
   seed, noise_seed, env, command, file, then for the operator: v_batt_start, v_batt_end (REAL), aborted,
   result, reason, cause_group. tools/s02_metrics.py reads run_id, platform, controller, test_id, speed_mps,
   rep, file, aborted.
-check: every row has result completed | broken | replaced; replaced needs cause_group 1, 2 or 3 (the closed
-list of external causes, P2-5) and a later row of the same cell (test x controller x repetition); broken
-needs a reason; aborted rows are not completed; per cell at most one completed or broken row (the
-5 runs are fixed, a broken run is not re-run, P2-4). Prints the problems; exit 0 none, 1 some, 2 error.
+check (S2P1-8, -9, -14, Codex round 1): every row has result completed | broken | replaced; replaced needs
+cause_group 1, 2 or 3 (the closed list of external causes, P2-5) and a later row of the same cell (test x
+controller x repetition, rep as a number); broken needs a reason; aborted rows are not completed; per cell
+exactly one completed or broken row, and with s02_plan.json in the folder every planned cell and no other
+(the N runs are fixed, a broken run is not re-run, P2-4). Battery (REAL, P2-5): each block has the rest
+voltage before its first and after its last run; a sag > 0.3 V needs block_status battery_rerun on every row
+of the block and a later block of the same condition, repetition and controller; battery_rerun rows stay as
+history and are not counted (tools/s02_metrics.py skips them, and replaced rows). Prints the problems;
+exit 0 none, 1 some, 2 error.
 """
 import argparse
 import csv
@@ -46,8 +51,11 @@ ENV = {('PID', 'floor'): 'esp32-s3-devkitc-1', ('LADRC', 'floor'): 'ladrc',
        ('PID', 'lifted'): 'wheels_lifted', ('LADRC', 'lifted'): 'ladrc_wheels_lifted'}   # AGV platformio.ini
 COLUMNS = ['run_id', 'block', 'order_in_block', 'platform', 'controller', 'condition', 'test_id', 'speed_mps',
            'rep', 'seed', 'noise_seed', 'env', 'command', 'file',
-           'v_batt_start', 'v_batt_end', 'aborted', 'result', 'reason', 'cause_group']
+           'v_batt_start', 'v_batt_end', 'block_status', 'aborted', 'result', 'reason', 'cause_group',
+           'missing_pct', 'gen_pause_n']          # S2P1-14: P2-6 missing_pct, generation pauses
 RESULTS = ('completed', 'broken', 'replaced')
+BLOCK_STATUS = ('', 'ok', 'battery_rerun')     # S2P1-9: a block whose battery sagged > 0.3 V (P2-5)
+SAG_MAX_V = 0.3                                # P2-5
 HIL_ARGS = '--ground traction --mu 0.436 --imu-noise 20'     # S02 P2-2: traction, mu_hd 0.436, IMU 20 Hz
 
 
@@ -88,21 +96,68 @@ def plan(platform, controllers, reps, order_seed, with_strafe=False, prep_s=3.0)
                              noise_seed=rep if platform == 'hil' else '', env=ENV[(ctrl, cond)],
                              command=command(platform, tid, run_id, rep, prep_s),
                              file=('pi/' if platform == 'hil' else 'logs/') + f'{run_id}.csv',
-                             v_batt_start='', v_batt_end='', aborted='', result='', reason='', cause_group=''))
+                             v_batt_start='', v_batt_end='', block_status='', aborted='', result='', reason='',
+                             cause_group='', missing_pct='', gen_pause_n=''))
     return rows, blist
 
 
-def check(rows):
-    """Problems of a filled-in runs.csv (module docstring)."""
+def _num(x):
+    try:
+        v = float(str(x).strip())
+    except ValueError:
+        return None
+    return v if v == v else None
+
+
+def check(rows, planned=None):
+    """Problems of a filled-in runs.csv (module docstring). planned: the s02_plan.json block list, when the
+    folder has it: the exact set of cells (test x controller x repetition) the session must cover."""
     out = []
     if not rows:
         return ['runs.csv has no row']
     miss = [c for c in COLUMNS if c not in rows[0]]
     if miss:
         return [f'runs.csv lacks columns {miss}']
-    done = {}
+    # repetitions as numbers (S2P1-8: "1" and "01" are one cell)
     for i, r in enumerate(rows, start=2):
-        cell = (r['test_id'], r['controller'], r['rep'])
+        v = _num(r['rep'])
+        ok = v is not None and v == int(v) and v >= 1
+        if not ok:
+            out.append(f'line {i} {r["run_id"]}: rep {r["rep"]!r} is not a repetition number')
+        r['_rep'] = int(v) if ok else None
+        if r['block_status'].strip() not in BLOCK_STATUS:
+            out.append(f'line {i} {r["run_id"]}: block_status {r["block_status"]!r} not in {BLOCK_STATUS}')
+    # battery per block (S2P1-9, P2-5): rest voltage before the first and after the last run of the block
+    blocks = {}
+    for r in rows:
+        blocks.setdefault(r['block'], []).append(r)
+    order = {b: rows.index(rs[0]) for b, rs in blocks.items()}
+    for b, rs in blocks.items():
+        st = {r['block_status'].strip() for r in rs}
+        if 'battery_rerun' in st and st != {'battery_rerun'}:
+            out.append(f'block {b}: battery_rerun on some rows only {sorted(st)}')
+        if st == {'battery_rerun'}:
+            key = (rs[0]['condition'], rs[0]['_rep'], rs[0]['controller'])
+            later = [b2 for b2, r2 in blocks.items() if order[b2] > order[b]
+                     and {x['block_status'].strip() for x in r2} != {'battery_rerun'}
+                     and (r2[0]['condition'], r2[0]['_rep'], r2[0]['controller']) == key]
+            if not later:
+                out.append(f'block {b}: battery_rerun but no later block of {key}')
+        if rs[0]['platform'].strip().lower() != 'real':
+            continue
+        v0 = next((_num(r['v_batt_start']) for r in rs if _num(r['v_batt_start']) is not None), None)
+        v1 = next((_num(r['v_batt_end']) for r in reversed(rs) if _num(r['v_batt_end']) is not None), None)
+        if v0 is None or v1 is None:
+            out.append(f'block {b}: rest voltage before / after the block missing (P2-5)')
+        elif v0 - v1 > SAG_MAX_V and st != {'battery_rerun'}:
+            out.append(f'block {b}: battery sagged {v0 - v1:.2f} V > {SAG_MAX_V} V: mark the block battery_rerun '
+                       'and run it again (P2-5)')
+    # runs (P2-4, P2-5): outside battery_rerun blocks, each cell exactly one completed or broken run
+    done = {}
+    live = [r for r in rows if r['block_status'].strip() != 'battery_rerun']
+    for j, r in enumerate(live):
+        i = rows.index(r) + 2
+        cell = (r['test_id'], r['controller'], r['_rep'])
         res = r['result'].strip()
         if res not in RESULTS:
             out.append(f'line {i} {r["run_id"]}: result {res!r} not in {RESULTS}')
@@ -110,7 +165,7 @@ def check(rows):
         if res == 'replaced':
             if r['cause_group'].strip() not in ('1', '2', '3'):
                 out.append(f'line {i} {r["run_id"]}: replaced needs cause_group 1, 2 or 3 (P2-5)')
-            if not any((x['test_id'], x['controller'], x['rep']) == cell for x in rows[i - 1:]):
+            if not any((x['test_id'], x['controller'], x['_rep']) == cell for x in live[j + 1:]):
                 out.append(f'line {i} {r["run_id"]}: replaced but no later run of {cell}')
             continue
         if res == 'broken' and not r['reason'].strip():
@@ -120,6 +175,15 @@ def check(rows):
         if cell in done:
             out.append(f'line {i} {r["run_id"]}: {cell} already has a {done[cell]} run (5 fixed runs, P2-4)')
         done[cell] = res
+    if planned is not None:
+        want = {(t, bl['controller'], int(bl['rep'])) for bl in planned for t in bl['tests']}
+        for c in sorted(want - set(done), key=str):
+            out.append(f'cell {c}: planned, no completed or broken run (P2-4)')
+        for c in sorted(set(done) - want, key=str):
+            out.append(f'cell {c}: not in s02_plan.json')
+        reps = {int(bl['rep']) for bl in planned}
+        if reps != set(range(1, max(reps) + 1)):
+            out.append(f'planned repetitions {sorted(reps)} are not 1..N')
     return out
 
 
@@ -165,7 +229,14 @@ def main(argv=None) -> int:
     except OSError as exc:
         print(exc)
         return 2
-    probs = check(rows)
+    planned = None
+    js = os.path.join(a.run_dir, 's02_plan.json')
+    if os.path.isfile(js):
+        with open(js, encoding='utf-8') as f:
+            planned = json.load(f)['blocks']
+    else:
+        print('no s02_plan.json: the planned cells are not checked (P2-4)')
+    probs = check(rows, planned)
     for x in probs:
         print(x)
     print(f'#ket_qua,ma={1 if probs else 0}')
