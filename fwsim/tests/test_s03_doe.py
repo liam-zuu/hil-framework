@@ -1565,7 +1565,7 @@ def test_v82_main_writes_the_gate_columns_and_meta(tmp_path, monkeypatch, capsys
     assert n > 2 * (271 * 3 + 300)
     meta = (out / 'meta.yaml').read_text(encoding='utf-8')
     assert 'source_check: "same at import, start and end of the run"' in meta   # S3G-1, S3G2-1
-    assert meta.startswith('spec: S03 v8.2 ')
+    assert meta.startswith('spec: S03 v8.3 ')                                # v8.3 (keeps the v8.2 gate)
     lines = meta.splitlines()
     gate = _json.loads(next(x for x in lines if x.startswith('gate: ')).split('   #')[0][len('gate: '):])
     assert gate['version'] == G.GATE_VERSION and gate['eval_version'] == E.EVAL_VERSION and gate['u_t'] == 0.0
@@ -1720,3 +1720,123 @@ def test_v82_untracked_files_are_not_a_source_change(tmp_path):
     (tmp_path / 'repo' / 'a.py').write_text('x = 2\n')
     k2 = s3.source_snapshot(repo)['key']
     assert k2 != k0 and k2['tracked'] == ['a.py'] and k2['commit'] == k0['commit']
+
+
+# ── S03 v8.3: extended sweep grid (design 03_CODE/docs/2026-11-15_Thiet_ke_S03_v83_luoi_noi_v1.md) ─────
+
+import tune_ga as _tg  # noqa: E402
+
+GRID_CASES = [('kp_xy', 1.5, 0.0, 6.0), ('ki_xy', 0.05, 0.0, 10.0), ('pos_kp', 6.0, 0.0, 12.0),
+              ('k_psi', 1.0, 0.0, 4.0), ('omega_c_xy', 8.0, 1.0, 25.0), ('omega_o_xy', 30.0, 5.0, 48.0),
+              ('kp_wz', 0.37, 0.0, 6.0),        # default off the log points
+              ('kp_xy', 0.6, 0.0, 6.0),         # b = hi = 10 x default: the default is the middle log point
+              ('omega_c_wz', 0.5, 1.0, 25.0)]   # a = default / 10 < lo
+
+
+@pytest.mark.parametrize('name, d, lo, hi', GRID_CASES)
+def test_v83_old_points_kept_bit_for_bit(name, d, lo, hi):
+    """T1: the first points of sweep_grid_n are sweep_grid, bit for bit (11 log points, default, 0)."""
+    base = s3.sweep_grid(name, d, lo, hi)
+    grid, info = s3.sweep_grid_n(name, d, lo, hi)
+    assert [s3._bits(x) for x in grid[:len(base)]] == [s3._bits(x) for x in base]
+    assert grid[len(base):] == info['noi'] and info['n_points'] == len(grid) and grid == sorted(set(grid))
+    assert d in grid and (0.0 in grid) == (lo == 0.0)
+    a = d / 10.0 if lo == 0.0 else min(d / 10.0, lo)
+    assert info['a'] == a and info['b'] == max(base) and info['a'] == min(x for x in base if x > 0)
+
+
+@pytest.mark.parametrize('name, d, lo, hi', GRID_CASES)
+def test_v83_extension_definition(name, d, lo, hi):
+    """T2: r = (b/a)^(1/10); points b r^k, k = 1..K, K the smallest with r^K >= 10 (1 - 1e-9); omega_o not
+    extended."""
+    _, info = s3.sweep_grid_n(name, d, lo, hi)
+    r = (info['b'] / info['a']) ** 0.1
+    assert info['r'] == r
+    if name.startswith('omega_o'):
+        assert info['K'] == 0 and info['b_n'] is None and info['noi'] == []
+        return
+    K = info['K']
+    assert K >= 1 and r ** K >= 10 * (1 - 1e-9) and not r ** (K - 1) >= 10 * (1 - 1e-9)
+    assert info['noi'] == [info['b'] * r ** k for k in range(1, K + 1)] and info['b_n'] == info['noi'][-1]
+    assert info['b_n'] >= 10 * info['b'] * (1 - 1e-9) and info['b_n'] < 10 * info['b'] * r
+
+
+def test_v83_spec_example_pid_ki_xy():
+    """Spec S03 v8.3 3.1: PID ki_xy, a 0.005, b 10, K = 4, last point about 209."""
+    _, info = s3.sweep_grid_n('ki_xy', 0.05, 0.0, 10.0)
+    assert (info['a'], info['b'], info['K']) == (0.005, 10.0, 4) and 205 < info['b_n'] < 213
+
+
+@pytest.mark.parametrize('ok_lo, ok_hi, want', [
+    (None, None, ('0', 'hết lưới nối')),                                   # everything completes
+    (2, None, ('điểm kế tiếp không hoàn thành', 'hết lưới nối')),
+    (None, -3, ('0', 'điểm kế tiếp không hoàn thành')),
+])
+def test_v83_level_sources_lo_zero(ok_lo, ok_hi, want):
+    """T3: sources on a grid with the 0 point (lo = 0); ok_lo: first index that completes; ok_hi: index past
+    the last that completes."""
+    grid, info = s3.sweep_grid_n('kp_xy', 1.5, 0.0, 6.0)
+    ok = [True] * len(grid)
+    if ok_lo:
+        ok[:ok_lo] = [False] * ok_lo
+    if ok_hi:
+        ok[ok_hi:] = [False] * -ok_hi
+    L, H = s3.levels_from_sweep(grid, 1.5, ok)
+    assert s3.level_sources(grid, L, H, info, 'kp_xy') == want
+
+
+def test_v83_level_sources_lower_end_and_omega_cap():
+    """T3: 'hết lưới dưới' (L = a > 0, no lower point), 'trần ω_o' (omega_o at the top of its grid)."""
+    grid, info = s3.sweep_grid_n('omega_o_xy', 30.0, 5.0, 48.0)
+    L, H = s3.levels_from_sweep(grid, 30.0, [True] * len(grid))
+    assert L == grid[0] > 0 and H == 48.0
+    assert s3.level_sources(grid, L, H, info, 'omega_o_xy') == ('hết lưới dưới', 'trần ω_o')
+    ok = [True] * len(grid)
+    ok[-1] = False
+    L, H = s3.levels_from_sweep(grid, 30.0, ok)
+    assert s3.level_sources(grid, L, H, info, 'omega_o_xy')[1] == 'điểm kế tiếp không hoàn thành'
+
+
+def test_v83_grid_labels():
+    grid, info = s3.sweep_grid_n('kp_xy', 0.6, 0.0, 6.0)        # the default replaced the middle log point
+    lab = [s3.grid_label(x, 0.6, info['noi']) for x in grid]
+    assert lab.count('mac_dinh') == 1 and lab.count('0') == 1 and lab.count('noi') == info['K']
+    assert lab.count('log') == len(grid) - 2 - info['K'] == 10       # 11 log points, one of them the default
+
+
+@needs_dll
+def test_v83_main_writes_levels_sources_luoi_and_grid_meta(tmp_path, monkeypatch, capsys):
+    """T4: levels.csv a, b, b_n, L_nguon, H_nguon after the old columns; sweep.csv luoi per row and one row
+    per grid point and speed; design decoded within the new levels; meta spec v8.3 and the grid block."""
+    import csv as _csv
+    import json as _json
+    code, out, _, _, _ = _run_main(tmp_path, monkeypatch, capsys)
+    assert code == 0
+    head = next(_csv.reader(open(out / 'levels.csv', encoding='utf-8')))
+    assert head == ['controller', 'factor', 'L', 'H', 'centre', 'scale', 'default', 'rule_note', 'a', 'b', 'b_n',
+                    'L_nguon', 'H_nguon']
+    lv = {(r['controller'], r['factor']): r for r in _csv.DictReader(open(out / 'levels.csv', encoding='utf-8'))}
+    sweep = list(_csv.DictReader(open(out / 'sweep.csv', encoding='utf-8')))
+    for ctrl in s3.CONTROLLERS:
+        lo_b, hi_b = _tg.BOUNDS[ctrl]
+        for name, lo, hi in zip(s3.FACTORS[ctrl], lo_b, hi_b):
+            d = FAKE_DEFAULTS[ctrl][name]
+            grid, info = s3.sweep_grid_n(name, d, lo, hi)
+            r = lv[(ctrl, name)]
+            assert float(r['a']) == info['a'] and float(r['b']) == info['b']
+            assert r['b_n'] == ('' if info['b_n'] is None else repr(info['b_n']))
+            # the fake completes every sweep run: L, H are the grid ends
+            assert float(r['L']) == grid[0] and float(r['H']) == grid[-1]
+            assert (r['L_nguon'], r['H_nguon']) == s3.level_sources(grid, grid[0], grid[-1], info, name)
+            rows = [x for x in sweep if x['controller'] == ctrl and x['factor'] == name]
+            assert len(rows) == len(grid) * len(s3.SPEEDS)
+            for x in rows:
+                assert x['luoi'] == s3.grid_label(float(x['value']), d, info['noi'])
+    assert {x['luoi'] for x in sweep if x['factor'].startswith('(')} == {'mac_dinh'}
+    assert {r['H_nguon'] for r in lv.values()} == {'hết lưới nối', 'trần ω_o'}
+    assert {r['L_nguon'] for r in lv.values()} == {'0', 'hết lưới dưới'}
+    meta = (out / 'meta.yaml').read_text(encoding='utf-8')
+    assert meta.startswith('spec: S03 v8.3 ')
+    grid_meta = _json.loads(next(x for x in meta.splitlines() if x.startswith('grid: ')).split('   #')[0][6:])
+    assert set(grid_meta) == {f'{c} {n}' for c in s3.CONTROLLERS for n in s3.FACTORS[c]}
+    assert grid_meta['PID ki_xy']['K'] == 4 and grid_meta['ADRC omega_o_xy']['b_n'] is None

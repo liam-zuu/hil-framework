@@ -218,6 +218,18 @@ def test_runner_level_passes_configuration(monkeypatch):
 
 # ── domain ───────────────────────────────────────────────────────────────────────────
 
+def test_box_keeps_the_11_point_ends_not_the_v83_extension():
+    """S03 v8.3 (C14-2): the feasibility box stays [a, b] of the 11 log points (O1 3.9 step 5, spec 'Khong doi');
+    the extension of s03_doe.sweep_grid_n (up to b_n) is not in it."""
+    for ctrl in F.CONTROLLERS:
+        lo_b, hi_b = F.tune_ga.BOUNDS[ctrl]
+        for d, lo, hi in zip(F.box_of(ctrl, DEFAULTS[ctrl]), lo_b, hi_b):
+            _, info = F.s3.sweep_grid_n(d['name'], d['default'], lo, hi)
+            assert (d['a'], d['b']) == (info['a'], info['b']), (ctrl, d['name'])
+            if info['K']:
+                assert d['b'] < info['b_n']
+
+
 def test_box_positive_log_and_default_inside():
     for ctrl in F.CONTROLLERS:
         box = F.box_of(ctrl, DEFAULTS[ctrl])
