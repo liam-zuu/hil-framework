@@ -73,6 +73,14 @@ PRINT_DELAY_MAX_MS = 1000.0
 # T10U-1: idle_us_est H7 tính = (idle_pass · cal_cyc / cal_n) / (SystemCoreClock / 1e6), chia nguyên hai lần
 # (s06_load.c S06Load_PrintNext); công cụ tính lại và cho lệch tối đa chừng này.
 IDLE_EST_TOL_US = 1
+# T10U-R3-1 (Codex round 3; Liam 15/11, CODE_S06 local_da965ab4 'Them kiem SPI1'): the H7 10 s window counter
+# runs from boot (main.c _t10_last), not from link up, so PC times alone cannot tell "first header late" from
+# "first header lost". The SPI1 IRQ count of the first block of the run can: the Pi sends one frame per ms, so a
+# window that started before link up has SPI1 n below win_ms; n >= win_ms - this margin = the window lies (almost)
+# wholly after link up: the header before it may be lost, or link came up right at the window start (missing).
+# [PROPOSAL CODE_S06, 100 frames = 0.1 s]
+T10_SPI_IRQ = 'SPI1'
+FIRST_SPI_FULL_MARGIN = 100
 
 _RE = {
     'link_up': re.compile(r'SPI link up at t=(\d+) ms'),
@@ -200,7 +208,9 @@ def idle_check(h: dict) -> str:
     """T10U-1: why the idle figures of a T10 header cannot be used ('' = usable). The H7 estimate must equal
     idle_pass · cal_cyc / cal_n / f (integer divisions, ± IDLE_EST_TOL_US), and the LOWER bound of the idle time
     (estimate × (1 − rel. uncertainty), T10U-R2-1: the centre estimate may exceed the window by its own
-    uncertainty) plus the ISR time must fit the window. ASCII text (T10U-R2-3: CSV written on any code page)."""
+    uncertainty) plus the ISR time must fit the window, with no tolerance (T10U-R3-2: a tolerance there let the
+    load bound fall below the ISR share; isr_us and idle_us_est are both floored on the H7, so H7 rounding alone
+    never pushes a genuine line over the window). ASCII text (T10U-R2-3: CSV written on any code page)."""
     win_us = h['win_ms'] * 1000.0
     if win_us <= 0:
         return 'win_ms = 0'
@@ -210,7 +220,7 @@ def idle_check(h: dict) -> str:
             return f'idle_us_est {h["idle_us_est"]} != idle_pass*cal ({expect})'
     unc = (1.0 / h['cal_n'] + 1.0 / h['idle_pass']) if h['cal_n'] and h['idle_pass'] else 0.0
     idle_lo_us = h['idle_us_est'] * max(0.0, 1.0 - unc)
-    if h['isr_us'] > win_us or idle_lo_us + h['isr_us'] > win_us + IDLE_EST_TOL_US:
+    if h['isr_us'] > win_us or idle_lo_us + h['isr_us'] > win_us:
         return 'idle_lo + isr_us > window'
     return ''
 
@@ -294,6 +304,21 @@ def segment_means(win_rows) -> dict:
     return out
 
 
+def first_block_spi_n(ev: List[dict], span) -> Optional[int]:
+    """SPI1 IRQ count of the first T10 block inside the span (the IRQ lines right after its header, up to the
+    next header); None when that block has no SPI1 line."""
+    a, b = span
+    started = False
+    for e in ev[a:b]:
+        if e['kind'] == 't10':
+            if started:
+                return None
+            started = True
+        elif started and e['kind'] == 't10_irq' and e['irq'] == T10_SPI_IRQ:
+            return e['n']
+    return None
+
+
 def t10_summary(blocks, win_rows, irq_rows, ev, span) -> dict:
     tot_ms = sum(r['win_ms'] for r in win_rows)
     per: Dict[str, dict] = {}
@@ -338,10 +363,16 @@ def t10_summary(blocks, win_rows, irq_rows, ev, span) -> dict:
             data_lost.append(f'khoảng giữa hai khối T10 (giờ PC) khác 10 s sau khối {lost}: mất khối')
         t_up = ev[a].get('t_pc_us') if span else None
         # T10U-R2-2: the first header may reach the PC up to PRINT_DELAY_MAX_MS late (T10U-3), the link-up line
-        # on time: allow that delay on top of 10 s + tol
-        if t_up is not None and (heads_all[0]['t_pc_us'] - t_up) / 1e6 > 10.0 + T10_GAP_TOL_S + PRINT_DELAY_MAX_MS / 1e3:
-            data_lost.append(f'header T10 đầu tới sau SPI link up '
-                             f'{(heads_all[0]["t_pc_us"] - t_up) / 1e6:.1f} s (> 10 s): mất khối đầu')
+        # on time. T10U-R3-1 (Liam 15/11 'Sua 2 + vong 4'): the header carries no window number, so a first header
+        # in (10 + tol; 10 + tol + d_max] s may be late or may be the second one (first lost): missing, not
+        # complete; later than that it cannot be the first one: data lost
+        if t_up is not None:
+            dt = (heads_all[0]['t_pc_us'] - t_up) / 1e6
+            if dt > 10.0 + T10_GAP_TOL_S + PRINT_DELAY_MAX_MS / 1e3:
+                data_lost.append(f'header T10 đầu tới sau SPI link up {dt:.1f} s (> 10 s): mất khối đầu')
+            elif dt > 10.0 + T10_GAP_TOL_S:
+                missing.append(f'header T10 đầu tới sau SPI link up {dt:.1f} s, trong dải trễ in: '
+                               'không phân biệt được trễ in với mất khối đầu')
         ends = [e['t_pc_us'] for e in ev[a:b] if e.get('t_pc_us') is not None]
         if ends:
             expect = int((ends[-1] - heads_all[0]['t_pc_us']) / 1e6 // 10.0) + 1
@@ -356,6 +387,16 @@ def t10_summary(blocks, win_rows, irq_rows, ev, span) -> dict:
         data_lost.append(f'H7 bỏ {pd[-1] - pd[0]} dòng in trong lượt (print_drop)')
     if len(pd) < 2:
         missing.append('không đủ dòng S06log để kiểm print_drop')
+    # T10U-R3-1, SPI1 check (Liam 15/11 'Them kiem SPI1'): the first block of the span (dropped as partial) must
+    # really start before link up, i.e. hold fewer SPI1 frames than its window; independent of PC times
+    if span is not None and heads_all:
+        n_spi = first_block_spi_n(ev, span)
+        full = heads_all[0]['win_ms'] - FIRST_SPI_FULL_MARGIN
+        if n_spi is None:
+            missing.append(f'khối T10 đầu của lượt không có dòng {T10_SPI_IRQ}: không kiểm được mất khối đầu')
+        elif n_spi >= full:
+            missing.append(f'khối T10 đầu của lượt có {T10_SPI_IRQ} n={n_spi} (>= {full}): cửa sổ gần trọn sau '
+                           'link up, không phân biệt được mất khối đầu với link up sát đầu cửa sổ')
     # T10U-1: idle figures that cannot come from the H7 formula, or do not fit the window = a damaged line
     bad_idle = [(r['window'], r['idle_bad']) for r in win_rows if r.get('idle_bad')]
     if bad_idle:

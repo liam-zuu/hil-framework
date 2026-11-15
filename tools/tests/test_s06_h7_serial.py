@@ -12,11 +12,11 @@ sys.path.insert(0, os.path.join(ROOT, 'tools'))
 import s06_h7_serial as ser  # noqa: E402
 
 
-def t10_block(win_ms=10000, isr_us=1_200_000, idle_pass=900_000, idle_us_est=4_000_000, extra=''):
+def t10_block(win_ms=10000, isr_us=1_200_000, idle_pass=900_000, idle_us_est=4_000_000, extra='', spi_n=10000):
     return (f'T10: win_ms={win_ms} isr_us={isr_us} idle_pass={idle_pass} idle_us_est={idle_us_est} '
             f'cal=22500/48000000 ovh_cyc=24\r\n'
             'T10 SysTick n=10000 excl_us=2000 max_us=1.25\r\n'
-            'T10 SPI1    n=10000 excl_us=300000 max_us=35.50\r\n'
+            f'T10 SPI1    n={spi_n} excl_us=300000 max_us=35.50\r\n'
             f'T10 TIM5    n=400000 excl_us=898000 max_us=4.08{extra}\r\n')
 
 
@@ -30,9 +30,11 @@ def frame(applied, skipped=0, unread=0):
 
 
 def make_log(blocks=4, print_drop_end=0, pre_up_block=True, ts_prefix=False, pc=True, drop_block=None,
-             drop_irq=None, reconnect=False):
+             drop_irq=None, reconnect=False, first_spi_n=5000):
     """Lines as tools/h7_serial_capture.py writes them (`<t_pc_us>\\t<line>`, pc=False: as PuTTY); T10 every
-    10 s, Link/Frame lines around the run so the counters are bounded at both ends."""
+    10 s, Link/Frame lines around the run so the counters are bounded at both ends. T10U-R3-1: the first in-run
+    block started before link up, so it holds fewer SPI1 frames than its window (first_spi_n; the tool does not
+    tie n to the PC times; on the bench 15/11 link up came 8.04 s before the first header, SPI1 n=8036)."""
     out = []                                        # (t_s, line)
     out += [(0.0, '--- H753 HIL boot ---'), (0.1, 'Init done, entering main loop'), (0.5, link()), (0.5, frame(0))]
     if pre_up_block:
@@ -45,7 +47,7 @@ def make_log(blocks=4, print_drop_end=0, pre_up_block=True, ts_prefix=False, pc=
             out += [(t + 1.0, 'SPI link lost (no frame for 50 ms): encoders stopped, SPI1 restart'),
                     (t + 1.2, 'SPI link up at t=99999 ms')]
         if k != drop_block:
-            lines = t10_block().splitlines()
+            lines = t10_block(spi_n=first_spi_n if k == 0 else 10000).splitlines()
             if drop_irq is not None and k == drop_irq:
                 lines = [l for l in lines if 'SPI1' not in l]
             out += [(t + 10.0, l) for l in lines]
@@ -360,6 +362,7 @@ def test_first_header_late_within_print_delay_is_not_lost():
     win, irq = ser.t10_rows(blocks)
     s = ser.t10_summary(blocks, win, irq, ev, span)
     assert not any('mất khối' in p for p in s['data_lost']), s['data_lost']
+    assert any('dải trễ in' in m for m in s['missing'])         # T10U-R3-1: 10.8 s is in the ambiguous band
 
 
 def test_no_calibration_and_no_idle_pass_is_missing():
@@ -383,3 +386,85 @@ def test_cli_with_damaged_header_writes_outputs(tmp_path):
     rows = (out / 'T10_windows.csv').read_text(encoding='utf-8')
     assert code == 1 and s['complete'] is False and 'idle_lo + isr_us > window' in rows
     assert s['print_delay_max_ms'] == ser.PRINT_DELAY_MAX_MS
+
+
+def first_head_log(rel_heads, spi_n, end_rel, first_idle=None, drop_first_spi=False):
+    """T10U-R3-1: a run with link up at 1 s and the T10 headers at `rel_heads` s after it (PC times), SPI1 n of
+    each block from `spi_n`; S06log lines at link up and at `end_rel`, then link lost."""
+    t_up = 1.0
+    out = [(0.0, '--- H753 HIL boot ---'), (0.5, link()), (0.5, frame(0)),
+           (t_up, 'SPI link up at t=12345 ms'), (t_up, 'S06log: pushed=1 dropped=0  print_drop=0')]
+    for k, (r, n) in enumerate(zip(rel_heads, spi_n)):
+        lines = t10_block(spi_n=n).splitlines()
+        if k == 0 and first_idle:
+            lines[0] = lines[0].replace('idle_pass=900000 idle_us_est=4000000', first_idle)
+        if k == 0 and drop_first_spi:
+            lines = [l for l in lines if 'SPI1' not in l]
+        out += [(t_up + r, l) for l in lines]
+    out += [(t_up + end_rel, 'S06log: pushed=99 dropped=0  print_drop=0'),
+            (t_up + end_rel + 0.05, 'SPI link lost (no frame for 50 ms): encoders stopped, SPI1 restart'),
+            (t_up + end_rel + 0.5, link(lost=1, rearm=1)), (t_up + end_rel + 0.5, frame(40000))]
+    return [f'{int(1e9 + t * 1e6)}\t{l}' for t, l in out]
+
+
+def test_codex_r3_1_lost_first_block_is_not_complete(tmp_path):
+    """T10U-R3-1 (Codex round 3, exact case): the header 0.9 s after link up is lost; the next one, 10.9 s after
+    it, ends a window with idle_pass=0 (load bound 100 %) and is dropped as 'first'; the kept windows give ~60 %.
+    8f73799 said complete, code 0, max window ~60 %: the 100 % window was lost silently. Now: not complete."""
+    log = tmp_path / 'h7.log'
+    log.write_text('\n'.join(first_head_log([10.9, 20.9, 30.9, 40.9], [10000] * 4, 40.95,
+                                            first_idle='idle_pass=0 idle_us_est=0')) + '\n', encoding='utf-8')
+    out = tmp_path / 'o'
+    code = ser.main([str(log), '--out', str(out)])
+    s = json.load(open(out / 'T10_summary.json', encoding='utf-8'))
+    assert code == 3 and s['complete'] is False and s['data_lost'] == []
+    assert any('dải trễ in' in m for m in s['missing']) and any('SPI1 n=10000' in m for m in s['missing'])
+
+
+def test_first_header_in_print_delay_band_is_missing():
+    """T10U-R3-1, time band alone: first header 10.8 s after link up (inside (10 + tol; 10 + tol + d_max]), SPI1 n
+    partial: may be a late first header or the second one: missing, not data lost, not complete."""
+    s, _ = _run_summary(first_head_log([10.8, 20.8, 30.8], [5000, 10000, 10000], 31.0))
+    assert s['data_lost'] == [] and s['complete'] is False
+    assert any('dải trễ in' in m for m in s['missing']) and not any('SPI1 n=' in m for m in s['missing'])
+
+
+def test_first_block_with_full_spi1_is_missing():
+    """T10U-R3-1, SPI1 check alone: the header 0.3 s after link up lost, the next 10.3 s after it (inside
+    10 + tol, which PC times cannot flag); its window lies wholly after link up, SPI1 n=10000: missing."""
+    s, _ = _run_summary(first_head_log([10.3, 20.3, 30.3], [10000] * 3, 31.0))
+    assert s['data_lost'] == [] and s['complete'] is False
+    assert any('SPI1 n=10000' in m for m in s['missing']) and not any('dải trễ in' in m for m in s['missing'])
+    s, _ = _run_summary(first_head_log([10.3, 20.3, 30.3], [9900, 10000, 10000], 31.0))     # edge: win_ms - 100
+    assert any('SPI1 n=9900' in m for m in s['missing'])
+
+
+def test_first_block_without_spi1_line_is_missing():
+    s, _ = _run_summary(first_head_log([9.0, 19.0, 29.0], [9000, 10000, 10000], 31.0, drop_first_spi=True))
+    assert s['complete'] is False and any('không có dòng SPI1' in m for m in s['missing'])
+
+
+def test_first_block_partial_and_on_time_is_complete():
+    """Control for the R3-1 checks: link up 1 s into the first window (header 9 s after it, SPI1 n=9000, the
+    margin edge 9899 too): complete, code 0 path."""
+    for n in (9000, 9899):
+        s, _ = _run_summary(first_head_log([9.0, 19.0, 29.0], [n, 10000, 10000], 31.0))
+        assert s['complete'] is True and s['problems'] == [], s['problems']
+
+
+def test_first_header_beyond_band_is_data_lost():
+    """T10U-R3-1: later than 10 + tol + d_max (11.6 s) the first header cannot be the first one: data lost."""
+    s, _ = _run_summary(first_head_log([11.6, 21.6, 31.6], [5000, 10000, 10000], 32.0))
+    assert any('mất khối đầu' in p for p in s['data_lost'])
+
+
+def test_codex_r3_2_idle_lower_plus_isr_over_window_is_rejected():
+    """T10U-R3-2 (Codex round 3, exact case): header matching both H7 integer divisions, idle lower bound + ISR
+    = 10 000 000.43 µs > the 10 s window. 8f73799 let it through (1 µs tolerance) with a load bound
+    11.99999573 % below the ISR share 12 %. Now: no bound for that window, data lost."""
+    new = 'idle_pass=1980089 idle_us_est=8800396 cal=22500/48000003'
+    s, win = _run_summary(with_header(make_log(), 2, 'idle_pass=900000 idle_us_est=4000000 cal=22500/48000000', new))
+    w = [x for x in win if x['idle_pass'] == 1980089][0]
+    assert w['idle_bad'] == 'idle_lo + isr_us > window' and w['load_upper_pct'] is None
+    assert any('số rảnh' in p for p in s['data_lost']) and s['complete'] is False
+    assert all(x['load_upper_pct'] is None or x['load_upper_pct'] >= x['isr_pct'] for x in win)
