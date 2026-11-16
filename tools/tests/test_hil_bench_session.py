@@ -858,6 +858,53 @@ def test_t3t_r2_1_cleanup_stops_the_real_process_tree(tmp_path, mode):
     assert 'stop run_hil.py pid=' in cleanup and 'kill run_hil.py pids=' in cleanup, out
 
 
+FAKE_RUN_HIL_TREE = '''import os, subprocess, sys, time
+if __name__ == '__main__':
+    # run_hil.py -> child (python3) -> grandchild (sleep): a tree two levels deep
+    c = subprocess.Popen([sys.executable, '-c', 'import subprocess, sys, time; '
+                          'g = subprocess.Popen(["sleep", "120"]); '
+                          'open(sys.argv[1] + ".tmp", "w").write(str(g.pid)); '
+                          'import os; os.replace(sys.argv[1] + ".tmp", sys.argv[1]); time.sleep(120)', sys.argv[2]])
+    with open(sys.argv[1] + '.tmp', 'w') as f:
+        f.write(str(c.pid))
+    os.replace(sys.argv[1] + '.tmp', sys.argv[1])
+    time.sleep(120)
+'''
+
+
+def test_pi_kill_reaches_a_child_with_children(tmp_path):
+    """Liam 16/11, CODE_S06 'Sua, kem test' (found in t3-tools round 3): --pi-kill SIGKILLs run_hil.py and every
+    descendant of a tree two levels deep (run_hil.py -> child -> grandchild), real processes (POSIX bash or WSL).
+    1f49fbc printed the grandchild twice and never the child (bash function variable is global): the child lived."""
+    import subprocess as sp
+    r = _posix_runner()
+    if r is None:
+        pytest.skip('cần bash có /proc, pgrep, python3 (POSIX hay WSL)')
+    argv, to = r
+    d = tmp_path / 'r'
+    d.mkdir()
+    (d / 'run_hil.py').write_text(FAKE_RUN_HIL_TREE, encoding='utf-8', newline='\n')
+    D = to(d)
+    script = (f'D={D}; (python3 $D/run_hil.py $D/child.pid $D/gchild.pid & echo $! > $D/t2.pid); '
+              'for i in $(seq 1 100); do [ -s $D/child.pid ] && [ -s $D/gchild.pid ] && break; sleep 0.1; done; '
+              'P=$(cat $D/t2.pid); C=$(cat $D/child.pid); G=$(cat $D/gchild.pid); echo "pids P=$P C=$C G=$G"; '
+              f'echo "## kill"; ({hb.pi_stop_cmd(D, "t2", "kill")}); echo "kill_rc=$?"; echo "## after"; sleep 0.5; '
+              'kill -0 $P 2>/dev/null && echo alive_parent; kill -0 $C 2>/dev/null && echo alive_child; '
+              'kill -0 $G 2>/dev/null && echo alive_grandchild; kill -KILL $P $C $G 2>/dev/null; true')
+    out = sp.run(argv + [script], capture_output=True, timeout=90).stdout.decode('utf-8', 'replace')
+    assert 'pids P=' in out and 'kill_rc=0' in out, out
+    pids = dict(kv.split('=') for kv in out.split('pids ', 1)[1].splitlines()[0].split())
+    targets = out.split('targets=', 1)[1].splitlines()[0].split()
+    assert sorted(targets) == sorted([pids['P'], pids['C'], pids['G']]), out     # each once, the child included
+    after = out.split('## after', 1)[1]
+    assert 'alive' not in after, out
+
+
+def test_pi_kill_tree_printed_child_first():
+    c = hb.pi_stop_cmd('~/r', 'b5', 'kill')
+    assert 'do echo "$c"; d "$c"; done' in c and 'd "$c"; echo "$c"' not in c
+
+
 def test_t3t_r2_2_timeout_text_names_the_s06_formula_only_for_s06_runs(tmp_path, monkeypatch):
     """T3T-R2-2: an ssh time-out of a run without --s06 does not name the S06 formula (b6f23c2 did); an S06 run's
     still does."""
