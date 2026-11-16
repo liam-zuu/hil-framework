@@ -37,7 +37,8 @@ decimals of the written values (12.4 -> 12.1 is not over), and the later block r
 (S2P2-3, S2P2-4); a completed run has missing_pct 0..100 and gen_pause_n >= 0 filled in (S2P1-14). Codex round 1
 of v3 (S2M1-6): every row of a block has the same platform, controller, condition and repetition, the rows of a
 block are together, each test belongs to its condition; with s02_plan.json each planned block keeps its key and a
-row for every planned test, and a later block (not planned) has the key of a planned block and only its tests.
+row for every planned test, and a later block (not planned) has the key of a planned block and only its tests;
+S2M2-3: planned blocks in the planned order, the first run of each test of a planned block in the planned order.
 Prints the problems; exit 0 none, 1 some, 2 error.
 """
 import argparse
@@ -185,6 +186,19 @@ def _block_problems(rows, blocks, planned):
     for b in pb:
         if b not in blocks:
             out.append(f'block {b}: planned (s02_plan.json), no row in runs.csv')
+    # S2M2-3 (Codex round 2 of v3): the planned blocks run in the planned order (P2-2 "Thu tu": floor before lifted,
+    # controllers alternating), and inside a planned block the first run of each test in the planned order; later
+    # rows (a replacement in the same block, a later block) do not count for the order
+    seen = [b for b in dict.fromkeys(r['block'].strip() for r in rows) if b in pb]
+    want = [str(bl['block']).strip() for bl in planned if str(bl['block']).strip() in blocks]
+    if seen != want:
+        out.append(f'planned blocks run in the order {seen}, planned {want} (P2-2)')
+    for b, rs in blocks.items():
+        if b in pb:
+            got = [t for t in dict.fromkeys(r['test_id'].strip() for r in rs) if t in pb[b]['tests']]
+            plan_t = [t for t in pb[b]['tests'] if t in got]
+            if got != plan_t:
+                out.append(f'block {b}: tests run in the order {got}, planned {plan_t} (P2-2)')
     return out
 
 

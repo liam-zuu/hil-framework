@@ -366,6 +366,13 @@ def test_reset_on_the_line_at_t0_counts():
     log['pos_reset_n'] = np.where(t >= -0.01, 2.0, 1.0)                 # on the last line before t = 0
     m = hil(log, plant=plant_of(log))
     assert m['e_est_reason'] == '' and m['e_est_p_rms'] == pytest.approx(0.0, abs=1e-9)
+    log['pos_reset_n'] = np.where(t >= 0.0, 2.0, 1.0)
+    log['pos_reset_n'][np.flatnonzero(t < 0.0)[-1]] = np.nan          # S2M2-5: empty cell on the last line before 0
+    m = hil(log, plant=plant_of(log))
+    assert m['e_est_reason'] == 'pos_reset_in_window'
+    log['pos_reset_n'] = np.where(t >= 0.0, 2.0, np.nan)                # no value before t = 0 at all
+    m = hil(log, plant=plant_of(log))
+    assert m['e_est_reason'] == 'pos_reset_unchecked'
     late = {c: (x[t >= 0.0] if not c.startswith('_') else x) for c, x in mk().items()}
     late['_all'] = late['_every'] = late
     m = hil(late, plant=plant_of(late))
@@ -412,6 +419,7 @@ def test_loss_over_one_percent_or_a_reset_mid_run_is_broken_through_compare(tmp_
     assert [st[r]['status'] for r in ('g1', 'g2', 'g3')] == ['ok'] * 3
     assert st['lossy']['status'] == 'broken' and st['lossy']['status_reason'].startswith('missing_over')
     assert st['lossy']['missing_over'] == 1 and st['lossy']['missing_pct'] > 1.0 and 'e_vx' not in st['lossy']
+    assert all(k in st['lossy'] for k in M.BROKEN_KEEP)                 # loss and reset columns kept (S2M2-T)
     assert st['bad']['status'] == 'broken' and 'mid-run' in st['bad']['status_reason']
     assert st['bad']['run_bad'] == 1 and 'e_vx' not in st['bad'] and 'e_p_rms' not in st['bad']
     with open(os.path.join(h, 'metrics.csv'), newline='') as f:
@@ -424,6 +432,18 @@ def test_loss_over_one_percent_or_a_reset_mid_run_is_broken_through_compare(tmp_
     assert sorted(r['run_id'] for r in rows if r['platform'] == 'hil') == ['g1', 'g2', 'g3']
     x = next(x for x in C.compare(rows, info) if x['metric'] == 'e_vx' and x['platform_b'] == 'hil')
     assert x['n_b'] == 3
+
+
+def test_command_line_prints_the_cell_line(tmp_path, monkeypatch, capsys):
+    """S2M2-T (Codex round 2 of v3): the command line prints cell_line (ok / 5, broken apart)."""
+    import runpy
+    n = len(mk()['tick'])
+    drop = np.zeros(n, bool)
+    drop[np.arange(100, n, 40)] = True
+    h = _runs_dir(tmp_path / 'h', 'hil', [('g1', mk()), ('lossy', mk(drop=drop))])
+    monkeypatch.setattr(sys, 'argv', ['s02_metrics.py', h, 'm.csv'])
+    runpy.run_path(M.__file__, run_name='__main__')
+    assert '  A-L2 hil PID: ok 1 / 5, broken 1' in capsys.readouterr().out
 
 
 def test_cell_line_reports_ok_over_five_and_history_apart():

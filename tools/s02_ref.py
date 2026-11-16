@@ -212,15 +212,20 @@ def step_quantities(t_s, v, test_id, u=None):
         # segment up to its first line is held by the last line before the segment (S2M1-10, Codex round 1 of v3:
         # a lost first line no longer drops the start of the segment from the denominator); no line before the
         # segment: frac90 not defined
+        # S2M2-6 (Codex round 2 of v3): a line right at the segment start needs no line before it
         pre = np.flatnonzero(t < a - 1e-9)
-        if pre.size:
+        tf = yf = None
+        if ts[0] <= a + 1e-9:
+            tf, yf = ts, y
+        elif pre.size:
             jp = pre[np.argmax(t[pre])]
             tf, yf = np.r_[a, ts], np.r_[(v[jp] - prev) / A, y]
+        if tf is None:
+            out[f'frac90_seg{n}'] = float('nan')
+        else:
             dur = np.diff(np.append(tf, b))
             out[f'frac90_seg{n}'] = (float(np.sum(dur[yf >= STEP_HI]) / np.sum(dur)) if np.sum(dur) > 0
                                      else float('nan'))
-        else:
-            out[f'frac90_seg{n}'] = float('nan')
         xl = out[f'e_xl_seg{n}']
         out[f'rise_uninterp_seg{n}'] = (int(xl >= RISE_UNINTERP * abs(A)) if math.isfinite(xl) else float('nan'))
     return out

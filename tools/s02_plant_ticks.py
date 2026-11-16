@@ -84,6 +84,8 @@ OMEGA_MIN = EM.OMEGA_MIN              # 0.3 rad/s
 RETIME_MARGIN = 3                     # encoder_gen.c ENC_RETIME_MARGIN
 READ_US = EM.J_READ_US                # AGV LOG_CNT_WIN_US: counts read within this of t_now
 RHO_PPM = EM.RHO_MAX_PPM              # ESP32 vs H7 clock rate bound (L100)
+RHO_PI_PPM = 1000.0                   # [ĐỀ XUẤT] Pi vs H7 clock rate bound, same number as L100 (Liam 17/11
+                                      # CODE_S02 "1000 ppm nhu ESP32 (Recommended)"; not measured)
 STILL_MIN_S = 1.0                     # [ĐỀ XUẤT] Liam 16/11 CODE_S02 "Dung so de xuat"
 SPREAD_MAX_US = 2000.0                # [ĐỀ XUẤT] Liam 16/11 CODE_S02 "Dung so de xuat"
 O_FIRST = 2                           # a start forces two pins low: at most 2 counts
@@ -184,7 +186,7 @@ def simulate_edges(apply_us, width_us, om32):
                     stop_boundary(T, W)
                 m = 2 if None in level else int(level[0]) + int(level[1])
                 segs.append(dict(t0=T, w0=W, kind='start', dir=new_dir, o_lo=-m, o_hi=m, n_before=st['ncount'],
-                                 first_edge=len(t_l)))
+                                 first_edge=len(t_l), hp_min=hpn))
                 level[0] = level[1] = 0
                 st.update(dir=new_dir, hp=hpn, amb=ambn, last=None)
                 h2 = float(int(hpn) >> 1)
@@ -194,6 +196,7 @@ def simulate_edges(apply_us, width_us, om32):
                 err[0], err[1] = [-a1, W + a1], [-a1, W + a1]
                 own[0], own[1] = [0.0, 0.0], [0.0, 0.0]
                 continue
+            segs[-1]['hp_min'] = min(segs[-1]['hp_min'], hpn)
             if hpn != st['hp']:
                 # an edge just before T whose true time may be after the true apply: its callback then added the new
                 # half period and this retime saw the other channel first (the mirror case of emit_until)
@@ -283,6 +286,7 @@ class _Wheel:
         # encoder_gen.c in the tests); an untrusted edge bounds nothing
         self.trusted = np.zeros(len(self.t), bool)
         seg = ed['seg']
+        self.seg = seg
         # S2M1-2 (Codex round 1 of v3): past the first untrusted edge of a wheel the number of true edges is not known
         # either (an apply inside its window can add or drop edges at every retime: 1730 true counts against 1484
         # simulated in the Codex case, checked with encoder_gen.c), so counts beyond the trusted prefix of that segment
@@ -451,6 +455,56 @@ def _rest_bound(wheel, O):
     return max(float(wheel.t[i] + wheel.hi[i] + TOL_US), end)
 
 
+def _rest_holds(wheel, O, n_j1):
+    """S2M2-1 (Codex round 2 of v3): may the rest bound of first-start offset O be used? It places the last line at
+    c0 (j0) before c0 is left in segment 1; that fails only if j0 is read after the next boundary of segment 1 (a stop
+    or a reversal that cancels the ending edge, or brings the count back to c0 later). Then j1, the first changed
+    line, is read after that boundary too, so its count n_j1 (relative to c0) must be one the wheel can show there.
+    That range is built segment by segment (the count is monotonic inside a segment): the start offset O, each later
+    boundary's o_lo..o_hi, and per moving segment its edge count, exact before the wheel's first untrusted edge; from
+    the segment of that edge on, between the trusted edges certainly before the next boundary and an upper bound
+    4 ceil(duration / hp_min) + 4 (each channel's edges are at least hp_min / 2 apart in encoder_gen.c); a moving
+    last segment goes on past the frame log (no bound on that side). n_j1 outside the range: the bound holds. No
+    later boundary: it holds."""
+    segs = wheel.segs
+    if len(segs) <= 2:
+        return True
+    v_lo = v_hi = float(O)
+    h_lo, h_hi = math.inf, -math.inf
+    for k in range(1, len(segs)):
+        sg = segs[k]
+        if k >= 2:
+            h_lo, h_hi = min(h_lo, v_lo), max(h_hi, v_hi)          # the count at the boundary itself
+            v_lo, v_hi = v_lo + sg['o_lo'], v_hi + sg['o_hi']
+        d = sg['dir']
+        if d != 0:
+            last = k == len(segs) - 1
+            if k < wheel.broken_seg:
+                n_lo = n_hi = float(sg['n_edges'])
+            else:
+                if k == wheel.broken_seg:
+                    i = np.arange(sg['first_edge'], sg['first_edge'] + sg['n_edges'])
+                    nxt = segs[k + 1]['t0'] if not last else math.inf
+                    n_lo = float(np.sum(wheel.trusted[i] & (wheel.t[i] + wheel.hi[i] < nxt)))
+                else:
+                    n_lo = 0.0
+                if last:
+                    n_hi = math.inf
+                else:
+                    dur = segs[k + 1]['t0'] + segs[k + 1]['w0'] - sg['t0']
+                    n_hi = max(float(sg['n_edges']), 4.0 * math.ceil(dur / sg['hp_min']) + 4.0)
+            if last and k < wheel.broken_seg:
+                n_hi = math.inf                                     # it goes on past the frame log
+            lo_n, hi_n = (n_lo, n_hi) if d > 0 else (-n_hi, -n_lo)
+            if k >= 2:
+                h_lo, h_hi = min(h_lo, v_lo, v_lo + lo_n), max(h_hi, v_hi, v_hi + hi_n)
+            v_lo, v_hi = v_lo + lo_n, v_hi + hi_n
+        elif k >= 2:
+            h_lo, h_hi = min(h_lo, v_lo), max(h_hi, v_hi)
+    h_lo, h_hi = min(h_lo, v_lo), max(h_hi, v_hi)
+    return not (h_lo - 1e-9 <= float(n_j1) <= h_hi + 1e-9)
+
+
 def _mix(l, x, y):
     """(1 - l) x + l y for l in [0, 1], with an infinite end weighted 0 (l = 0 or 1) taken as 0, not NaN (0 x inf);
     a lower end is never +inf nor an upper end -inf, so no inf - inf."""
@@ -505,7 +559,9 @@ def certify(te_us, counts, apply_us, width_us, om32, t_window=None):
         i1 = wh[w].segs[1]['first_edge'] + mf
         ok1 = (wh[w].segs[1]['n_edges'] > mf and i1 < wh[w].t.size and bool(wh[w].trusted[i1]))
         e1 = wh[w].t[i1] + wh[w].hi[i1] + TOL_US if ok1 else math.inf
-        starts.append(dict(c0=c0, j0=j0, j1=j1, S=S, W=W, first_change_max=max(e1, S + W)))
+        # S2M2-1 (Codex round 2 of v3): the bound needs the last line at c0 to be read in segment 1 (_rest_holds)
+        hold = all(_rest_holds(wh[w], O, c[j1] - c0) for O in range(-mf, mf + 1))
+        starts.append(dict(c0=c0, j0=j0, j1=j1, S=S, W=W, first_change_max=max(e1, S + W) if hold else math.inf))
     uA, uB = te[0], te[-1]
     ms = MapSet(uA, uB, starts[0]['S'] - te[starts[0]['j1']])
     for st in starts:
@@ -556,7 +612,7 @@ def certify(te_us, counts, apply_us, width_us, om32, t_window=None):
             ok_O = []
             for O in O_set[w]:
                 r = _wheel_rows(ms, wh[w], te, n_obs[w], seg_of[w], O)
-                rb = _rest_bound(wh[w], O)
+                rb = _rest_bound(wh[w], O) if _rest_holds(wh[w], O, n_obs[w][starts[w]['j1']]) else math.inf
                 if r is not None and math.isfinite(rb):      # last line at c0: read before c0 is left for this O
                     A1, b1 = ms.rows_le(te[[starts[w]['j0']]], [rb])
                     r = (np.vstack([r[0], A1]), np.concatenate([r[1], b1]))
@@ -659,7 +715,8 @@ def sender_interval(g, dt_us, h7, t_send_ns, t_recv_ns):
     it is not known. The Pi takes t_send just before the SPI transfer and t_recv just after it (rpi5/hil_node.py
     _tick); the H7 receive stamp of the frame (MISO RX CYCCNT) lies between the two, so the send is in
     [rx - (t_recv - t_send), rx] (the bus time, 48 bytes at the SPI clock, is not subtracted: run_hil.py --spi-speed
-    is not in the manifest). A frame the H7 did not answer has its receive between the receives of the answered
+    is not in the manifest). Both Pi durations (t_recv - t_send, dt_us) are widened by RHO_PI_PPM on the H7 clock
+    (S2M2-2). A frame the H7 did not answer has its receive between the receives of the answered
     frames around it (hil_edge_map.h7_to_steps). dt_us: Pi time from the frame's send to the sample-0 time."""
     if t_recv_ns is None:
         return 'frame log without t_recv_ns: the send of the sender frame is not bounded on the H7 clock'
@@ -674,7 +731,9 @@ def sender_interval(g, dt_us, h7, t_send_ns, t_recv_ns):
     d = (int(t_recv_ns[g]) - int(t_send_ns[g])) * 1e-3
     if not d > 0:
         return f'frame {g}: t_recv - t_send = {d:.1f} us is not positive'
-    return r_lo - d + dt_us, r_hi + dt_us
+    # S2M2-2 (Codex round 2 of v3): d and dt_us are Pi durations; on the H7 clock each is within +-RHO_PI_PPM
+    r = RHO_PI_PPM * 1e-6
+    return r_lo - d * (1.0 + r) + dt_us - r * abs(dt_us), r_hi + dt_us + r * abs(dt_us)
 
 
 def plant_steps(s_us, anchor_k, anchor_us):

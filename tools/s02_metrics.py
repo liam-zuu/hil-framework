@@ -620,7 +620,9 @@ def _family_r(log, test_id, t, win, plant, prep_flags):
     if not why and prn is not None and np.any(np.isfinite(prn)):
         # S2M1-8 (Codex round 1 of v3): the baseline is the last line before t = 0 (t < 0), so a reset on the line
         # at t = 0 itself counts; no line before t = 0: a reset at t = 0 cannot be seen, e_est undefined
-        j0 = int(np.searchsorted(t, 0.0, 'left')) - 1
+        # S2M2-5 (Codex round 2 of v3): the last line before t = 0 with a value (an empty cell is no baseline)
+        fin = np.flatnonzero((t < 0.0) & np.isfinite(prn))
+        j0 = int(fin[-1]) if fin.size else -1
         if j0 < 0:
             why = 'pos_reset_unchecked'
         else:

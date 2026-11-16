@@ -288,9 +288,22 @@ def test_harsh_windows_keep_the_truth_in_the_set(seed):
     (2-4 ms, not certified) but still holds the true map at every line."""
     f = fake_run(seed, 600.0, windows='harsh', kind='ramp')
     res = certify(f)
+    # the whole run (reversal, stop, restart, untrusted edges): the rest bound may not hold (S2M2-1), the start
+    # offsets may then stay ambiguous: a refusal; never a set without the truth
+    assert not res['reason'].startswith('inconsistent'), res['reason']
+    if res.get('ext') is not None:
+        lo, hi = np.array([res['ext'](u) for u in f['te']]).T
+        s = f['s_true'](f['te'])
+        assert np.all((lo - 1e-6 <= s) & (s <= hi + 1e-6))
+    # up to just before the reversal (frames and lines): the set exists and holds the truth
+    k = 1500 + 2400
+    keep = f['s_true'](f['te']) < f['apply_us'][k] - 30_000.0
+    cut = dict(f, te=f['te'][keep], counts=f['counts'][keep], apply_us=f['apply_us'][:k], width_us=f['width_us'][:k],
+               om32=f['om32'][:k])
+    res = certify(cut)
     assert res.get('ext') is not None, res['reason']
-    lo, hi = np.array([res['ext'](u) for u in f['te']]).T
-    s = f['s_true'](f['te'])
+    lo, hi = np.array([res['ext'](u) for u in cut['te']]).T
+    s = cut['s_true'](cut['te'])
     assert np.all((lo - 1e-6 <= s) & (s <= hi + 1e-6))
 
 
@@ -395,13 +408,13 @@ def test_sender_frame_steps_back_k_a_packets_of_pi_time():
 # ---------------------------------------------------------------------------------------------------------------
 # map_run on made-up frame logs (helpers of test_hil_edge_map)
 
-def _bench(tmp_path, ppm, edge_ms=1600.0, n=8200, us_cut=None, fw=FW_LINE, faults=False):
+def _bench(tmp_path, ppm, edge_ms=1600.0, n=8200, us_cut=None, fw=FW_LINE, faults=False, skip=()):
     """Frame log (npz) and ESP32 log of a made-up HIL run whose command starts with the motion (frame edge_ms);
     returns the paths, the ESP32 log columns, the made-up run, the truth s_true(u) on the H7 axis of
     hil_edge_map.h7_apply, and h7_apply."""
     import protocol as P
     import test_hil_edge_map as T
-    s = T.sim(edge_ms=edge_ms, n=n, ppm=ppm, n_before=16, glitch_every=0, seed=3)
+    s = T.sim(edge_ms=edge_ms, n=n, ppm=ppm, n_before=16, glitch_every=0, seed=3, skip=skip)
     tm = s['timing']
     k_cmd = int(edge_ms)
     om = tm['om']
@@ -409,7 +422,7 @@ def _bench(tmp_path, ppm, edge_ms=1600.0, n=8200, us_cut=None, fw=FW_LINE, fault
                                   traj_ref=(0.3, 0.0, 0.0) if k >= k_cmd else None,
                                   traj_flags=P.TRAJ_VALID if k >= k_cmd else 0) for k in range(n)])
     assert np.array_equal(mosi[:, 0:8], s['frames']['mosi'][:, 0:8])          # same wheel speeds as the counts
-    miso = T.make_miso(mosi, s['duty_cap'], tm)
+    miso = T.make_miso(mosi, s['duty_cap'], tm, skip=skip)
     # Pi t_recv after the transfer: after the H7 receive (rx, 384 us of bus + 0..50 us after the send T), plus the
     # return of the call (10..60 us)
     rng = np.random.default_rng(11)
@@ -479,6 +492,30 @@ def test_map_run_on_a_made_up_bench_run(monkeypatch, tmp_path, ppm):
         k_true = np.interp(s_true(te[i]), h7['anchor_us'], h7['anchor_k'])
         w1 = np.interp(k_true, np.arange(len(om)), om[:, 0])
         assert float(rows[i][9]) == pytest.approx(w1, abs=0.05)
+
+
+@needs_gcc
+def test_map_run_leaves_rows_empty_across_unanswered_frames(monkeypatch, tmp_path):
+    """S2M2-T (Codex round 2 of v3): frames the H7 received but did not answer inside the window: rows whose mapped
+    time falls between the answered frames around the gap are empty (n_gap_rows), the others are filled."""
+    import s02_metrics
+    gap = tuple(range(4000, 4006))
+    fl, esp, log, s, s_true, h7 = _bench(tmp_path, 900.0, skip=gap)
+    monkeypatch.setattr(s02_metrics, 'load_log', lambda p: {'_all': log})
+    res, rows = pt.map_run(fl, esp, 'A-L2')
+    assert res['ok'], res['reason']
+    ak, au = h7['anchor_k'], h7['anchor_us']
+    i = int(np.searchsorted(ak, gap[0]))
+    a, b = au[i - 1], au[i]                                           # receives of the answered frames around the gap
+    te = log['timestamp_us']
+    s_map = res['a'] + res['b'] * te
+    inside = (s_map > a) & (s_map < b)
+    assert inside.sum() >= 1 and res['n_gap_rows'] == int(inside.sum())
+    full = np.array([r[1] != '' for r in rows])
+    assert not full[inside].any()
+    u0, u1 = res['window_u']
+    inw = (te >= u0) & (te <= u1) & ~inside
+    assert full[inw].all()
 
 
 @needs_gcc
@@ -664,6 +701,49 @@ def test_mix_has_no_nan_at_the_ends():
         assert list(pt._mix(l, 2.0, 4.0)) == [2.0, 3.0, 4.0]
 
 
+def test_an_ending_edge_cancelled_by_a_stop_gives_no_rest_bound():
+    """S2M2-1 (Codex round 2 of v3): FR starts at hp 1000 us with the forced-low step -2 against the motion, the
+    first two edges bring the count back to c0, the third is cancelled by a stop 2 ms after the start; the 10 ms
+    ticks miss the dip, so the count reads c0 until the restart 100 ms later and the last line at c0 is read long
+    after the edge the rest bound uses. Every frame applied 4 us late (window 4 us): the true edges are the simulated
+    ones + 4 us. The set must keep the true map (identity)."""
+    n = 2600
+    lo = 1000.0 * np.arange(n)
+    S_k = 1600
+    j = np.arange(n - S_k)
+    ramp = 9.52 + np.clip((j - 50) / 300.0, 0, 1) * 12.0
+    om = np.zeros((n, 4))
+    om[S_k:] = ramp[:, None] * np.array([1.0, -1.07, 0.94, -1.02])
+    om[S_k:S_k + 2, 1] = -9.52                                      # FR: 2 ms at hp 1000 us, stop, restart
+    om[S_k + 2:S_k + 100, 1] = 0.0
+    om[S_k + 100:, 1] = -1.07 * ramp[:n - S_k - 100]
+    om32 = om32_of(om)
+    ed = pt.simulate_edges(lo, np.full(n, 4.0), om32)
+    S = lo[S_k]
+    u = S + 5000.0 + 10_000.0 * np.arange(-120, 95)
+    read = u + np.random.default_rng(4).uniform(0, EM.J_READ_US, len(u))
+    c = np.zeros((len(u), 4))
+    for w in range(4):
+        e = ed[w]
+        sgn = np.array([e['segs'][x]['dir'] for x in e['seg']])
+        keep = np.ones(len(e['t']), bool)
+        if w == 1:
+            d = e['segs'][1]['dir']
+            assert e['segs'][1]['n_edges'] == 3 and e['segs'][2]['kind'] == 'stop'
+            assert e['t'][e['segs'][1]['first_edge'] + 2] == S + 2000.0         # true + 4 us: with the stop
+            keep[e['segs'][1]['first_edge'] + 2] = False                 # the third edge: cancelled by the stop
+            o = np.where(read >= S + 4.0, -2 * d, 0)
+        else:
+            o = 0
+        c[:, w] = 1000 + o + np.array([np.sum(sgn[keep & (e['t'] + 4.0 <= r)]) for r in read])
+    j1 = int(np.flatnonzero(c[:, 1] != 1000)[0])
+    assert read[j1 - 1] > S + 90_000                                  # the last line at c0 is read late
+    res = pt.certify(u, c, lo, np.full(n, 4.0), om32)
+    assert res.get('ext') is not None, res['reason']
+    lo_s, hi_s = np.array([res['ext'](x) for x in u]).T
+    assert np.all((lo_s - 1e-6 <= u) & (u <= hi_s + 1e-6)), float(np.max(np.maximum(lo_s - u, u - hi_s)))
+
+
 def test_rest_bound_per_start_offset():
     """S2M1-3 per offset: the count can read c0 until edge |O| + 1 when O dips against the motion, until the first edge
     when O = 0, only inside the start window when O moves with it; an untrusted ending edge gives no bound."""
@@ -699,8 +779,22 @@ def test_sender_interval_from_the_pi_transfer_and_unanswered_frames():
     h7 = dict(anchor_k=np.array([0.0, 1.0, 2.0, 5.0]), anchor_us=np.array([400.0, 1400.0, 2400.0, 5400.0]))
     ts = np.array([0, 1, 2, 3, 4, 5], dtype=np.int64) * 1_000_000
     tr = ts + 450_000
-    assert pt.sender_interval(1, 0.0, h7, ts, tr) == pytest.approx((950.0, 1400.0))
-    assert pt.sender_interval(3, -20.0, h7, ts, tr) == pytest.approx((2400.0 - 450.0 - 20.0, 5400.0 - 20.0))
+    r = pt.RHO_PI_PPM * 1e-6                                         # Pi durations on the H7 clock (S2M2-2)
+    assert pt.sender_interval(1, 0.0, h7, ts, tr) == pytest.approx((1400.0 - 450.0 * (1 + r), 1400.0))
+    assert pt.sender_interval(3, -20.0, h7, ts, tr) == pytest.approx((2400.0 - 450.0 * (1 + r) - 20.0 - 20.0 * r,
+                                                                      5400.0 - 20.0 + 20.0 * r))
     assert pt.sender_interval(1, 0.0, h7, ts, None).startswith('frame log without t_recv_ns')
     assert pt.sender_interval(7, 0.0, h7, ts, tr) == 'sender frame outside the H7 answers'
     assert 'not positive' in pt.sender_interval(1, 0.0, h7, ts, ts)
+
+
+def test_sender_interval_holds_a_pi_clock_slower_than_the_h7_clock():
+    """S2M2-2 (Codex round 2 of v3): t_recv - t_send = 450 us and dt = 49 000 us on the Pi clock, the H7 clock at
+    0.999 of the Pi rate: the receive at 440 us (H7) is inside the transfer and the true sample-0 time is 48 951 us on
+    the H7 axis (send at 0); the interval must hold it (Pi durations widened by RHO_PI_PPM)."""
+    h7 = dict(anchor_k=np.array([0.0, 1.0]), anchor_us=np.array([440.0, 99_440.0]))
+    ts = np.array([0, 99_000_000], dtype=np.int64)
+    tr = ts + 450_000
+    lo, hi = pt.sender_interval(0, 49_000.0, h7, ts, tr)
+    assert lo <= 0.999 * 49_000.0 <= hi
+    assert hi - lo <= 450.0 * 1.001 + 2 * 49_000.0 * pt.RHO_PI_PPM * 1e-6 + 1e-6

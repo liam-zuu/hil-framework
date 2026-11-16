@@ -152,6 +152,12 @@ def test_inputs_given_twice_or_one_run_in_two_files_are_refused(tmp_path):
     with pytest.raises(ValueError, match=r"run 'hil0' \(hil\) is also in"):
         C.load([s, h, h2])
     assert C.main(['--out', str(tmp_path / 'o'), s, h, h]) == 2
+    one = runs('hil', 'PID', [0.2, 0.2, 0.2])
+    s3 = write(str(tmp_path / 's3'), [dict(r, run_id='h1') for r in one])     # one run copied three times (S2M2-4)
+    with pytest.raises(ValueError, match=r"run 'h1' \(hil\) has two status ok lines"):
+        C.load([s, s3])
+    hist = [dict(one[0], run_id='h1', status='replaced'), dict(one[1], run_id='h1')]
+    assert len(C.load([write(str(tmp_path / 's4'), hist)])[0]) == 1           # a history line with the same id
     same = [dict(r, run_id=r['run_id'].replace('sim', 'hil')) for r in runs('sim', 'PID', [0.01, 0.02, 0.03])]
     s2 = write(str(tmp_path / 's2'), same)                                        # hil0..2 as SIM runs
     rows, _ = C.load([s2, h])                                                     # one run_id, two platforms

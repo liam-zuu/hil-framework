@@ -19,7 +19,8 @@ each (test, controller, metric) present on both sides.
   Test (P2-6 Kiem dinh): when side a is SIM and every value of it is the same number (SIM without a noise model: the
   runs repeat bit for bit), a one-sample t interval of side b around that number (method one_sample); otherwise
   Welch (method welch, Welch-Satterthwaite degrees of freedom; S2M1-11: a constant HIL side is Welch too).
-  Inputs: a file given twice, or one (platform, run_id) in two files, is refused (S2M1-7). CI = delta +- t_{0.975, df} se. The SIM determinism check itself
+  Inputs: a file given twice, one (platform, run_id) in two files (S2M1-7), or two status ok lines of one
+  (platform, run_id) in any file (S2M2-4), are refused. CI = delta +- t_{0.975, df} se. The SIM determinism check itself
   (Viec CODE 7) is not done here.
   delta_pct = delta / mean_a x 100, only for metrics that cannot be negative (columns info nonneg), and not when
   mean_a = 0 or, for an encoder metric, mean_a < 2 qrms.
@@ -61,7 +62,7 @@ def load(paths):
     rows, info = [], {}
     # S2M1-7 (Codex round 1 of v3): one file given twice (as a folder and as its metrics.csv too), or one run in two
     # files, would count its runs twice: refused
-    seen_path, seen_run = {}, {}
+    seen_path, seen_run, seen_ok = {}, {}, set()
     for p in paths:
         mp = _metrics_path(p)
         key = os.path.normcase(os.path.realpath(mp))
@@ -75,6 +76,11 @@ def load(paths):
             if rk in seen_run and seen_run[rk] != mp:
                 raise ValueError(f'{mp}: run {rk[1]!r} ({rk[0]}) is also in {seen_run[rk]}')
             seen_run.setdefault(rk, mp)
+            # S2M2-4 (Codex round 2 of v3): one completed run twice in the same file counts twice too
+            if (r.get('status') or '').strip() == 'ok':
+                if rk in seen_ok:
+                    raise ValueError(f'{mp}: run {rk[1]!r} ({rk[0]}) has two status ok lines')
+                seen_ok.add(rk)
         cj = os.path.splitext(mp)[0] + '_columns.json'
         if os.path.isfile(cj):
             with open(cj, encoding='utf-8') as f:

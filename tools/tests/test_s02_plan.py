@@ -272,7 +272,8 @@ def test_every_cell_has_five_reps_and_the_manifest_is_its_plan(tmp_path):
     pj[0]['tests'] = pj[0]['tests'][::-1]
     js.write_text(json.dumps(dict(json.loads(js.read_text(encoding='utf-8')), blocks=pj)), encoding='utf-8')
     write(rr)
-    assert sp.check(_filled(rows), pj, sp.REPS_MAIN) == []             # every cell still once
+    p = sp.check(_filled(rows), pj, sp.REPS_MAIN)                    # every cell still once; only the order
+    assert len(p) == 1 and p[0].startswith('block 1: tests run in the order'), p   # (S2M2-3) differs
     assert sp.main(['check', str(tmp_path)]) == 1                       # but not the plan of its order_seed
 
 
@@ -324,5 +325,11 @@ def test_blocks_are_whole_together_and_follow_the_plan():
     later6 = [dict(r) for r in full] + [dict(full[0], block='21', rep='6', run_id='x6')]   # a later block, no plan
     assert any(x.startswith("block 21: not in s02_plan.json and no planned block ('PID', 'floor', 6)")
                for x in sp.check(later6, blocks, sp.REPS_MAIN))
+    lifted_first = ([dict(r) for r in full if r['block'] == '11'] + [dict(r) for r in full if r['block'] != '11'])
+    assert any(x.startswith('planned blocks run in the order') for x in sp.check(lifted_first, blocks, sp.REPS_MAIN))
+    swapped = [dict(r) for r in full]                                    # S2M2-3: two tests of block 1 swapped
+    i = [k for k, r in enumerate(swapped) if r['block'] == '1'][:2]
+    swapped[i[0]], swapped[i[1]] = swapped[i[1]], swapped[i[0]]
+    assert any(x.startswith('block 1: tests run in the order') for x in sp.check(swapped, blocks, sp.REPS_MAIN))
     gone = [dict(r) for r in full if r['block'] != '3']
     assert any(x == 'block 3: planned (s02_plan.json), no row in runs.csv' for x in sp.check(gone, blocks, sp.REPS_MAIN))
