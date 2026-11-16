@@ -531,6 +531,9 @@ def _still_ends(tg, gz, g_still, min_still_s):
 
 
 THUA_STEP_MAX = math.pi / 2     # --log-thua: largest yaw change allowed between two logged reports (no 2 pi doubt)
+THUA_GAP_MAX = 0.3              # s, largest gap between logged RV or gyro reports [ĐỀ XUẤT]; floor 16/11: RV 150, gyro 249 ms
+THUA_W_PHYS = 4.0               # rad/s, bound on the turn rate inside a gap [ĐỀ XUẤT]: about 2x the largest seen 16/11 (1.9)
+THUA_STILL_SPAN = math.radians(1.0)   # still part: RV yaw spread at most 1 deg [ĐỀ XUẤT] (TT-2)
 
 
 def _yaw_thua(L):
@@ -551,9 +554,15 @@ def _yaw_thua(L):
     d = (np.diff(y) + math.pi) % (2 * math.pi) - math.pi
     gskip = []
     tg, gz = gyro_samples(L, gskip)
-    w = float(np.max(np.abs(gz))) if gz.size else math.inf
+    if gz.size < 2:
+        raise InputError('sparse log: fewer than two gyro reports')
+    w = max(float(np.max(np.abs(gz))), THUA_W_PHYS)       # TT-1: the logged peak alone does not bound a gap
     gap = float(np.max(np.diff(r)))
+    ggap = float(np.max(np.diff(tg)))                     # TT-2: gyro near-continuous, so a still part is still
     step = float(np.max(np.abs(d)))
+    if gap > THUA_GAP_MAX or ggap > THUA_GAP_MAX:
+        raise InputError(f'sparse log: gap between reports (RV {gap * 1e3:.0f} ms, gyro {ggap * 1e3:.0f} ms) above '
+                         f'{THUA_GAP_MAX * 1e3:.0f} ms: a turn could hide')
     if step > THUA_STEP_MAX or gap * w > THUA_STEP_MAX:
         raise InputError(f'sparse log: step {math.degrees(step):.1f} deg or gap {gap * 1e3:.0f} ms x |gz| '
                          f'{w:.2f} rad/s above {math.degrees(THUA_STEP_MAX):.0f} deg: a turn could hide')
@@ -593,6 +602,11 @@ def thang(path, n_vong, chieu, period_s=PERIOD_S, g_still=0.02, min_still_s=MIN_
     b = (t_all >= trail[0] + edge_s) & (t_all <= trail[1])
     if a.sum() < 5 or b.sum() < 5:
         raise InputError('too few IMU reports in a still part')
+    if thua:                                                              # TT-2: the yaw itself is still there
+        for name, m in (('start', a), ('end', b)):
+            span = float(np.ptp(S['psi_all'][m]))
+            if span > THUA_STILL_SPAN:
+                raise InputError(f'sparse log: yaw moves {math.degrees(span):.2f} deg in the {name} still part')
     dpsi = float(np.median(S['psi_all'][b]) - np.median(S['psi_all'][a]))
     exp = (1 if chieu == 'ccw' else -1) * n_vong * 2 * math.pi
     if not math.isfinite(dpsi) or dpsi * exp <= 0:

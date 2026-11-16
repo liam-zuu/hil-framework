@@ -1128,3 +1128,40 @@ def test_main_thang_sparse(tmp_path):
     assert U.main(base + ['--log-thua', '--out', out]) == 0
     d = json.load(open(out, encoding='utf-8'))
     assert d['thua'] is True and d['s'] == pytest.approx(-0.003, abs=3e-4)
+
+
+def test_thang_sparse_refuses_long_gap(tmp_path):
+    """TT-1 (Codex counter-example): 6 true turns, slow (0.6 rad/s) but 2 pi + 1.2 rad inside a 2 s hole in the
+    log; logged |gz| peak 0.6 and the wrapped step 1.2 rad both look safe: must be refused, not s = 0 for 5."""
+    p, q = str(tmp_path / 'a.csv'), str(tmp_path / 'a10.csv')
+    fast = (2 * math.pi + 1.2) / 2.0
+    t1 = 13.5 + (6 * 2 * math.pi - 2 * math.pi - 1.2) / 0.6 + 2.0
+    rate = lambda t: (fast if 30.0 <= t < 32.0 else 0.6) if 13.5 <= t < t1 else 0.0      # noqa: E731
+    make_log(p, rate, t1 + 3.5)
+    sparse_copy(p, q)
+    rows = list(csv.DictReader(open(q, encoding='utf-8')))
+    keep = [r for r in rows if not 30.0 <= float(r['timestamp_us']) * 1e-6 < 32.05]
+    with open(q, 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(keep)
+    with pytest.raises(U.InputError, match='gap'):
+        U.thang(q, 5, 'ccw', thua=True)
+
+
+def test_thang_sparse_refuses_long_gyro_hole(tmp_path):
+    """TT-2: gyro reports dropped (bad age) for seconds: a turn would look like a still part: refused."""
+    p, q = str(tmp_path / 'a.csv'), str(tmp_path / 'a10.csv')
+    rate, t_end = turns(5, 2.0, 1)
+    make_log(p, rate, t_end)
+    sparse_copy(p, q)
+    rows = list(csv.DictReader(open(q, encoding='utf-8')))
+    for r in rows:
+        if 10.1 <= float(r['timestamp_us']) * 1e-6 < 15.0:
+            r['age_g_ms'] = '-0.1'
+    with open(q, 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    with pytest.raises(U.InputError, match='gap'):
+        U.thang(q, 5, 'ccw', thua=True)
