@@ -246,6 +246,7 @@ def fake_eval(monkeypatch):
         state['dom'] = {c: inp.ctrl_lock(c)['domain'] for c in inp.ctrls}
         return s4.Evaluator(None, inp.dll, ctrl, speeds, mus, work)
     monkeypatch.setattr(rc, 'EVALUATOR', factory)
+    state.update(factory=factory, srg=safe_run_gate, rinp=rinp)
     state['behaviour'] = lambda i, code, mu, v: run_row(e_perp_max=q1_convex(code), tv_duty=q2_convex(code))
     return state
 
@@ -405,10 +406,27 @@ def test_fit_design_codes_and_missing_point(tmp_path, dummy_dll):
         rc.check_fit_design(d, 'PID')
 
 
-def test_duplicate_run_stops():
-    rows = [dict(controller='PID', box='outer', point_id='1', v='0.2', mu='0.5')] * 2
-    with pytest.raises(rc.Stop, match='two runs'):
-        rc.index_runs(rows, 'PID', rc.FIT_BOXES)
+def _row(**kw):
+    r = dict(controller='PID', box='outer', point_id='1', v='0.2', mu='0.5', status='ok', completed='true',
+             e_perp_max='0.03', tv_duty='5.0')
+    r.update(kw)
+    return r
+
+
+@pytest.mark.parametrize('rows', [
+    [_row(), _row()],                                   # exact duplicate
+    [_row(), _row(box='inner')],                        # RSM-7: the same condition under another box
+    [_row(), _row(v='0.2000000001')],                   # RSM-7: two rows matching one speed by isclose
+])
+def test_more_than_one_row_for_a_condition_stops(rows):
+    by = rc.index_runs(rows, 'PID', {1}, [0.2, 0.5, 0.8], [0.4, 0.5, 0.6])
+    with pytest.raises(rc.Stop, match='2 runs'):
+        rc.need_run(by, 1, 0.2, 0.5, 'PID', 'x', 'outer')
+
+
+def test_one_row_per_condition_passes_and_other_levels_are_left_aside():
+    by = rc.index_runs([_row(), _row(v='0.65')], 'PID', {1}, [0.2, 0.5, 0.8], [0.4, 0.5, 0.6])
+    assert rc.need_run(by, 1, 0.2, 0.5, 'PID', 'x', 'outer')['v'] == '0.2'
 
 
 def test_tool_check_refuses_a_real_s03(tmp_path, dummy_dll):
@@ -594,11 +612,21 @@ def test_three_mu_without_g3_g5_columns_stops(tmp_path, dummy_dll, fake_eval):
 
 
 def test_ga_points_labels(tmp_path, dummy_dll, fake_eval):
-    def tool(r, v):                                          # run_error at v 0.5 replaced: cause tool:
+    def tool(r, v):                                          # run_error at v 0.5 replaced: cause tool: on the rerun
+        if v == 0.5:
+            again = dict(r, attempt=2, cause='tool: shim crash')
+            r.update(status='run_error', completed='')
+            return [again]
+
+    def cause_on_first(r, v):                                # RSM-8: a cause on attempt 1 does not count
         if v == 0.5:
             again = dict(r, attempt=2)
             r.update(status='run_error', completed='', cause='tool: shim crash')
             return [again]
+
+    def stored_pen(r, v):                                    # RSM-9: finite 1e6 with its stored flag
+        if v == 0.2:
+            r.update(e_perp_max=1e6, pen_e_perp_max=1)
 
     def notool(r, v):
         if v == 0.5:
@@ -609,15 +637,16 @@ def test_ga_points_labels(tmp_path, dummy_dll, fake_eval):
         if v == 0.8:
             r.update(e_trk_max='', pen_e_trk_max=1)
     c0 = (0.2,) * 7
-    ga = [(c0, None), (c0, None), ((0.1,) * 7, tool), ((0.0,) * 7, notool), ((-0.1,) * 7, pen)]
+    ga = [(c0, None), (c0, None), ((0.1,) * 7, tool), ((0.0,) * 7, notool), ((-0.1,) * 7, pen),
+          ((0.3,) * 7, cause_on_first), ((-0.3,) * 7, stored_pen)]
     repo, s03, s04 = setup(tmp_path, dummy_dll, ga=ga)
     rc.run_phase('fit', str(s04), dummy_dll)
     rc.run_phase('opt', str(s04), dummy_dll)
     pts = list(csv.DictReader(open(s04 / 'rsm' / 'check' / 'ga_points.csv')))
-    assert [p['cand_id'] for p in pts] == ['0', '2']          # 1 duplicate of 0; 3 not replaced; 4 penalised
+    assert [p['cand_id'] for p in pts] == ['0', '2']          # 1 duplicate of 0; 3, 5 not replaced; 4, 6 penalised
     summ = next(r for r in csv.DictReader(open(s04 / 'rsm' / 'check' / 'ga_errors.csv')) if r['kind'] == 'summary')
-    assert summ['n_labelled'] == '2' and summ['n_unlabelled'] == '2'
-    assert json.loads(summ['unlabelled_by_reason']) == {'run_error not replaced': 1, 'penalised quantity': 1}
+    assert summ['n_labelled'] == '2' and summ['n_unlabelled'] == '4'
+    assert json.loads(summ['unlabelled_by_reason']) == {'run_error not replaced': 2, 'penalised quantity': 2}
     assert float(summ['maxabs_f1']) < 1e-9 and float(pts[0]['X1']) == pytest.approx(0.2)
 
 
@@ -641,7 +670,7 @@ def test_fit_file_changed_after_lock_stops_opt(tmp_path, dummy_dll, fake_eval):
     rc.run_phase('fit', str(s04), dummy_dll)
     p = s04 / 'rsm' / 'fit' / 'coefs.csv'
     p.write_text(p.read_text() + 'PID,main,x,f1,1,0\n')
-    with pytest.raises(rc.Stop, match='not committed'):
+    with pytest.raises(rc.Stop, match='output commit'):
         rc.run_phase('opt', str(s04), dummy_dll)
 
 
@@ -708,6 +737,295 @@ def test_test_set_missing_run_stops(tmp_path, dummy_dll, fake_eval):
         rc.run_phase('test', str(s04), dummy_dll)
 
 
+def test_test_set_missing_row_stops(tmp_path, dummy_dll, fake_eval):
+    repo, s03, s04 = setup(tmp_path, dummy_dll)
+    p = s03 / 'sealed_test' / 'runs_test.csv'
+    rows = [r for r in csv.DictReader(open(p)) if not (r['point_id'] == '301' and r['v'] == '0.5')]
+    s3.write_csv(str(p), rows)
+    rc.run_phase('fit', str(s04), dummy_dll)
+    rc.run_phase('opt', str(s04), dummy_dll)
+    with pytest.raises(rc.Stop, match='0 runs of PID point 301'):
+        rc.run_phase('test', str(s04), dummy_dll)
+
+
+# ── Codex round 1 fixes (RSM-1 .. RSM-16) ────────────────────────────────────────────
+
+def test_f2_is_max_over_mu_of_the_mean_over_speeds(tmp_path, dummy_dll):
+    """RSM-16: duty [0, 30, 0], [9, 9, 9], [8, 8, 8] over the speeds at the three mu: f2 = 10 (not 30, not 16)."""
+    duty = {0.4: (0.0, 30.0, 0.0), 0.5: (9.0, 9.0, 9.0), 0.6: (8.0, 8.0, 8.0)}
+    rows = {mu: [dict(e_perp_max=0.01 * (i + 1), tv_duty=t) for i, t in enumerate(ts)] for mu, ts in duty.items()}
+    assert rc.aggregate(rows) == (pytest.approx(0.03), pytest.approx(10.0))
+    q2 = (lambda c, mu=0.5, v=0.2: duty[mu][SPEEDS.index(v)])
+    repo, s03, s04 = setup(tmp_path, dummy_dll, q2=q2, eval_mu=MU)
+    rc.run_phase('fit', str(s04), dummy_dll)
+    co = {(r['model'], r['response'], r['term']): float(r['coef'])
+          for r in csv.DictReader(open(s04 / 'rsm' / 'fit' / 'coefs.csv')) if r['variant'] == 'base'}
+    assert co[('main', 'f2', '1')] == pytest.approx(10.0) and co[('mid', 'f2', '1')] == pytest.approx(9.0)
+
+
+def _io_log(monkeypatch):
+    events, real_open, real_commit = [], builtins.open, rc.commit_paths
+
+    def op(p, *a, **k):
+        q = str(p).replace('\\', '/')
+        if '/s03/sealed/' in q or '/s03/sealed_test/' in q:
+            events.append(('open', str(p)))
+        return real_open(p, *a, **k)
+
+    def cm(repo, rels, msg):
+        events.append(('commit', msg))
+        return real_commit(repo, rels, msg)
+    monkeypatch.setattr(builtins, 'open', op)
+    monkeypatch.setattr(rc, 'commit_paths', cm)
+    return events
+
+
+def test_no_sealed_file_is_opened_before_the_start_commit(tmp_path, dummy_dll, monkeypatch, fake_eval):
+    """RSM-1: in every phase the first open of a sealed file comes after the commit of the start row; phases 1-2
+    never open sealed_test/."""
+    repo, s03, s04 = setup(tmp_path, dummy_dll)
+    for ph in rc.PHASES:
+        ev = _io_log(monkeypatch)
+        rc.run_phase(ph, str(s04), dummy_dll)
+        start = next(i for i, e in enumerate(ev) if e[0] == 'commit' and f'start {ph}' in e[1])
+        first = next(i for i, e in enumerate(ev) if e[0] == 'open')
+        assert start < first, ev[:5]
+        if ph != 'test':
+            assert not any('/s03/sealed_test/' in e[1].replace('\\', '/') for e in ev if e[0] == 'open')
+        monkeypatch.undo()
+        monkeypatch.setattr(rc, 'EVALUATOR', fake_eval['factory'])
+        monkeypatch.setattr(s4, 'safe_run_gate', fake_eval['srg'])
+        monkeypatch.setattr(s3, 'run_in_new_process', fake_eval['rinp'])
+
+
+def test_tool_check_on_a_real_s03_opens_no_sealed_file(tmp_path, dummy_dll, monkeypatch):
+    repo, s03, s04 = setup(tmp_path, dummy_dll, fake=False)
+    ev = _io_log(monkeypatch)
+    with pytest.raises(rc.Stop, match='rsm_fake'):
+        rc.run_phase('fit', str(s04), dummy_dll)
+    assert not [e for e in ev if e[0] == 'open'] and not [e for e in ev if e[0] == 'commit']
+
+
+def _commit_all(repo, path, msg='x'):
+    subprocess.run(['git', '-C', str(repo), 'add', '--', str(path)], check=True)
+    subprocess.run(['git', '-C', str(repo), 'commit', '-q', '-m', msg, '--', str(path)], check=True)
+
+
+def test_lock_edited_and_recommitted_stops(tmp_path, dummy_dll, fake_eval):
+    """RSM-3: change coefs.csv, update fit/lock.yaml to match, commit both: the next phase stops (the files are
+    not the blobs of the fit output commit)."""
+    repo, s03, s04 = setup(tmp_path, dummy_dll)
+    rc.run_phase('fit', str(s04), dummy_dll)
+    rc.run_phase('opt', str(s04), dummy_dll)
+    fit = s04 / 'rsm' / 'fit'
+    (fit / 'coefs.csv').write_text((fit / 'coefs.csv').read_text().replace('0.03', '0.031', 1))
+    lk = json.load(open(fit / 'lock.yaml'))
+    lk['files']['fit/coefs.csv'] = dict(zip(('sha256', 'sha256_lf'), rc.file_sha(str(fit / 'coefs.csv'))))
+    (fit / 'lock.yaml').write_text(json.dumps(lk))
+    _commit_all(repo, fit, 'edit')
+    with pytest.raises(rc.Stop, match='output commit'):
+        rc.run_phase('test', str(s04), dummy_dll)
+
+
+def test_rerun_after_the_test_set_is_exploratory(tmp_path, dummy_dll, fake_eval):
+    repo, s03, s04 = setup(tmp_path, dummy_dll)
+    for ph in rc.PHASES:
+        rc.run_phase(ph, str(s04), dummy_dll)
+    meta = (s04 / 'rsm' / 'meta.yaml').read_text(encoding='utf-8')
+    assert 'comparison_kind: "main"' in meta
+    rc.run_phase('opt', str(s04), dummy_dll, abort_reason='re-run after the test set')
+    assert 'comparison_kind: "exploratory"' in (s04 / 'rsm' / 'meta.yaml').read_text(encoding='utf-8')
+    rc.run_phase('test', str(s04), dummy_dll)
+    assert 'comparison_kind: "exploratory"' in (s04 / 'rsm' / 'meta.yaml').read_text(encoding='utf-8')
+
+
+def test_attempts_append_only_and_interrupted_end(tmp_path, dummy_dll, monkeypatch, fake_eval):
+    repo, s03, s04 = setup(tmp_path, dummy_dll)
+    real = rc.write_rsm_meta
+
+    def crash(*a, **k):
+        raise KeyboardInterrupt                         # after the end row, before the commit
+    monkeypatch.setattr(rc, 'write_rsm_meta', crash)
+    with pytest.raises(KeyboardInterrupt):
+        rc.run_phase('fit', str(s04), dummy_dll)
+    monkeypatch.setattr(rc, 'write_rsm_meta', real)
+    assert not (s04 / 'rsm' / rc.RUN_LOCK).exists()
+    with pytest.raises(rc.Stop, match='not committed'):
+        rc.run_phase('fit', str(s04), dummy_dll)
+    rc.run_phase('fit', str(s04), dummy_dll, abort_reason='interrupted before the commit')
+    rc.run_phase('opt', str(s04), dummy_dll)
+    p = s04 / 'rsm' / 'attempts.csv'
+    lines = p.read_text().splitlines(True)
+    p.write_text(''.join(lines[:1] + lines[2:]))            # a committed row removed
+    with pytest.raises(rc.Stop, match='altered or removed'):
+        rc.run_phase('test', str(s04), dummy_dll)
+
+
+def test_no_flag_with_every_point_flagged(tmp_path, dummy_dll):
+    """RSM-6: no point left for no_flag: reported as not fitted, the main fit goes on."""
+    repo, s03, s04 = setup(tmp_path, dummy_dll, mods=lambda r: r.update(status='track_err') if r['v'] == 0.2 else None)
+    rc.run_phase('fit', str(s04), dummy_dll)
+    diag = (s04 / 'rsm' / 'fit' / 'fit_diag.yaml').read_text(encoding='utf-8')
+    assert 'main/no_flag/f1: rank 0 < 36' in diag
+
+
+@pytest.mark.parametrize('rows,lab', [
+    ({0.4: [R(status='run_error', completed=''), R(completed='false', v=0.5)], 0.6: [R()]}, 'not robust over mu'),
+    ({0.4: [R(e_perp_max=1e6, pen_e_perp_max=1)], 0.6: [R()]}, 'undetermined'),
+    ({0.4: [R(status='track_err')], 0.6: [R()]}, 'not robust over mu (inconclusive'),
+    ({0.4: [R()], 0.6: [R()]}, 'robust'),
+    ({0.4: [{k: v for k, v in R(e_trk_max=0.5).items() if not k.startswith('pen_')}], 0.6: [R()]},
+     'not robust over mu'),                                  # three_mu.csv rows: no pen_* columns
+])
+def test_mu_label_order(rows, lab):
+    """RSM-10: an observed violation is never hidden by a run_error at another speed; a penalty alone is not a
+    violation."""
+    assert rc.mu_label_from_rows(rows)[0].startswith(lab)
+
+
+def test_dll_changed_during_the_phase_stops(tmp_path, dummy_dll, fake_eval, monkeypatch):
+    repo, s03, s04 = setup(tmp_path, dummy_dll)
+    rc.run_phase('fit', str(s04), dummy_dll)
+    base = rc.EVALUATOR
+
+    def swap(inp, *a):
+        open(inp.dll, 'wb').write(b'another dll')
+        return base(inp, *a)
+    monkeypatch.setattr(rc, 'EVALUATOR', swap)
+    with pytest.raises(rc.Stop, match='DLL'):
+        rc.run_phase('opt', str(s04), dummy_dll)
+
+
+def test_one_run_at_a_time_and_no_stray_file(tmp_path, dummy_dll, fake_eval, monkeypatch):
+    repo, s03, s04 = setup(tmp_path, dummy_dll)
+    (s04 / 'rsm').mkdir()
+    (s04 / 'rsm' / rc.RUN_LOCK).write_text('1 x\n')
+    with pytest.raises(rc.Stop, match='run_lock'):
+        rc.run_phase('fit', str(s04), dummy_dll)
+    (s04 / 'rsm' / rc.RUN_LOCK).unlink()
+    rc.run_phase('fit', str(s04), dummy_dll)
+    base = rc.EVALUATOR
+
+    def stray(inp, *a):
+        os.makedirs(os.path.join(inp.out, 'confirm'), exist_ok=True)
+        open(os.path.join(inp.out, 'confirm', 'stray.txt'), 'w').write('x')
+        return base(inp, *a)
+    monkeypatch.setattr(rc, 'EVALUATOR', stray)
+    with pytest.raises(rc.Stop, match='not written by this run'):
+        rc.run_phase('opt', str(s04), dummy_dll)
+
+
+def test_clip_beyond_rounding_is_not_converged(tmp_path, dummy_dll, fake_eval, monkeypatch):
+    import scipy.optimize as so
+    real = so.minimize
+
+    def fake_min(fun, x0, **kw):
+        r = real(fun, x0, **kw)
+        r.x = np.array(r.x, dtype=float)
+        r.x[0] = 1.01
+        r.success = True
+        return r
+    monkeypatch.setattr(so, 'minimize', fake_min)
+    repo, s03, s04 = setup(tmp_path, dummy_dll)
+    rc.run_phase('fit', str(s04), dummy_dll)
+    rc.run_phase('opt', str(s04), dummy_dll)
+    st = list(csv.DictReader(open(s04 / 'rsm' / 'opt' / 'starts.csv')))
+    assert all(r['converged'] == 'false' and float(r['clip_move']) == pytest.approx(0.01) for r in st)
+    res = list(csv.DictReader(open(s04 / 'rsm' / 'confirm' / 'result.csv')))[0]
+    assert res['state'].startswith('R0 (i)')
+
+
+def test_candidate_filter_bounds_and_dedup():
+    f1s, e = 0.03, rc.EPS
+    pts = [dict(code=[0.0] * 7, f1_hat=f1s + rc.F1_TOL + e, f2_hat=1.0),
+           dict(code=[0.5] * 7, f1_hat=f1s + rc.F1_TOL + 2 * e, f2_hat=0.5)]
+    assert [c['f2_hat'] for c in rc.candidates(pts, f1s)] == [1.0]            # eps inclusive, 2 eps out
+    f1s = 0.095
+    pts = [dict(code=[0.0] * 7, f1_hat=rc.D + e, f2_hat=1.0), dict(code=[0.5] * 7, f1_hat=rc.D + 2 * e, f2_hat=0.5)]
+    assert [c['f2_hat'] for c in rc.candidates(pts, f1s)] == [1.0]
+    a = [0.0] * 7
+    at = [rc.DEDUP] + [0.0] * 6
+    near = [rc.DEDUP * 0.99] + [0.0] * 6
+    got = rc.candidates([dict(code=a, f1_hat=0.03, f2_hat=1.0), dict(code=at, f1_hat=0.03, f2_hat=1.0),
+                         dict(code=near, f1_hat=0.03, f2_hat=1.0)], 0.03)
+    assert [c['code'] for c in got] == [a, at]                                 # same f: codes in order; near dropped
+
+
+def test_edge_side_and_source_columns(tmp_path, dummy_dll, fake_eval):
+    repo, s03, s04 = setup(tmp_path, dummy_dll, q1=q1_flat, q2=q2_concave)
+    rc.run_phase('fit', str(s04), dummy_dll)
+    rc.run_phase('opt', str(s04), dummy_dll)
+    c = list(csv.DictReader(open(s04 / 'rsm' / 'opt' / 'candidates.csv')))[0]
+    sides = c['edge_side'].split()
+    assert len(sides) == 7 and all(s.endswith((':L', ':H')) for s in sides)
+    code = [float(x) for x in json.loads(c['code'])]
+    assert [s.endswith(':H') for s in sides] == [x > 0 for x in code]
+
+
+def test_two_controllers(tmp_path, dummy_dll, fake_eval):
+    repo, s03, s04 = setup(tmp_path, dummy_dll, ctrls=('PID', 'ADRC'))
+    for ph in rc.PHASES:
+        rc.run_phase(ph, str(s04), dummy_dll)
+    res = list(csv.DictReader(open(s04 / 'rsm' / 'confirm' / 'result.csv')))
+    assert [r['controller'] for r in res] == ['PID', 'ADRC'] and all(r['rsm_class'] == 'R2' for r in res)
+    te = list(csv.DictReader(open(s04 / 'rsm' / 'test' / 'test_errors.csv')))
+    assert [r['controller'] for r in te] == ['PID', 'ADRC']
+
+
+def test_links_are_refused(tmp_path, dummy_dll):
+    repo, s03, s04 = setup(tmp_path, dummy_dll)
+    try:
+        os.symlink(str(s03 / 'sealed_test' / 'runs_test.csv'), str(s04 / 'post_checks' / 'leak.csv'))
+    except (OSError, NotImplementedError):
+        pytest.skip('no symlink permission on this machine')
+    with pytest.raises(rc.Stop, match='link'):
+        rc.run_phase('fit', str(s04), dummy_dll)
+
+
+def _main_mode(tmp_path, dummy_dll, monkeypatch):
+    repo = make_repo(tmp_path)
+    s03 = make_s03(tmp_path, dll=dummy_dll, fake=False)
+    s04 = make_s04(repo, s03, dummy_dll)
+    lk = json.load(open(s04 / 'lock.yaml'))
+    lk['common'].update(tool_check=False, unsealed=True, fingerprint=s4.fingerprint(dummy_dll, str(s03), unsealed=True))
+    for c in lk['controllers'].values():
+        c['tool_check'] = False
+    (s04 / 'lock.yaml').write_text(json.dumps(lk, indent=1, default=str))
+    monkeypatch.setattr(s3, 'git_state', lambda repo: dict(commit='abc1234', branch='x', dirty=False, modified=[]))
+    return repo, s03, s04
+
+
+def test_main_run_needs_the_root_repo_and_committed_s04(tmp_path, dummy_dll, monkeypatch, fake_eval):
+    """RSM-2: a main run refuses a repository whose origin is not liam-zuu/hil-thesis and S04 files that are
+    not committed; with both, the fit runs."""
+    repo, s03, s04 = _main_mode(tmp_path, dummy_dll, monkeypatch)
+    monkeypatch.setattr(rc, 'check_script_blob', lambda hil: None)
+    with pytest.raises(rc.Stop, match='origin'):
+        rc.run_phase('fit', str(s04), dummy_dll)
+    subprocess.run(['git', '-C', str(repo), 'remote', 'add', 'origin', 'https://github.com/liam-zuu/hil-thesis.git'],
+                   check=True)
+    with pytest.raises(rc.Stop, match='not committed'):
+        rc.run_phase('fit', str(s04), dummy_dll)
+    _commit_all(repo, s04, 's04 run')
+    rc.run_phase('fit', str(s04), dummy_dll)
+    assert 'tool_check: false' in (s04 / 'rsm' / 'meta.yaml').read_text(encoding='utf-8')
+
+
+def test_script_blob_check(tmp_path):
+    """RSM-12: an edit hidden by assume-unchanged is still caught (content against the HEAD blob)."""
+    r = make_repo(tmp_path)
+    (r / 'fwsim').mkdir()
+    f = r / 'fwsim' / 'rsm_compare.py'
+    f.write_text('x = 1\n')
+    _commit_all(r, f)
+    rc.check_script_blob(str(r))
+    subprocess.run(['git', '-C', str(r), 'update-index', '--assume-unchanged', 'fwsim/rsm_compare.py'], check=True)
+    f.write_text('x = 2\n')
+    assert subprocess.run(['git', '-C', str(r), 'status', '--porcelain'], capture_output=True, text=True).stdout == ''
+    with pytest.raises(rc.Stop, match='HEAD blob'):
+        rc.check_script_blob(str(r))
+
+
 # ── real fwsim (needs the DLL) ───────────────────────────────────────────────────────
 
 def _levels_near_defaults():
@@ -731,9 +1049,10 @@ def test_confirm_uses_the_ga_evaluator(tmp_path, monkeypatch):
                                   **s4.gain_cols(dom, dict(x=[g[d['name']] for d in dom])))])
     x, tried, ev, _ = rc.confirm(inp, 'PID', str(cand), str(tmp_path / 'w'), {}, print)
     ref = s4.Evaluator(fwsim.FirmwareSim(_DLL), _DLL, 'PID', [0.2], [0.5], str(tmp_path / 'w2'))
-    ref.candidate({n: float(repr(v)) for n, v in g.items()}, 1, 1, 0)
+    s = ref.candidate({n: float(repr(v)) for n, v in g.items()}, 1, 1, 0)
     assert [e['log_sha256'] for e in ev] == [e['log_sha256'] for e in ref.evals] and ev[0]['log_sha256']
-    assert tried[0]['label'] in ('pass', 'violation_observed', 'inconclusive', 'run_error_excluded')
+    assert all(tried[0][k] == s[k] for k in ('f1', 'f2', 'g1', 'g2', 'g3', 'g4', 'g5'))       # RSM-16: same score
+    assert (tried[0]['label'] == 'pass') == rc.feasible(s)
 
 
 @needs_dll

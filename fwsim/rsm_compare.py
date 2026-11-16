@@ -46,6 +46,7 @@ import json
 import math
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -79,7 +80,13 @@ FIT_BOXES = ('centre', 'outer', 'axial')
 TEST_IDS = tuple(range(s3.TEST_FIRST, s3.TEST_FIRST + s3.N_TEST))
 USABLE_STATUS = ('ok', 'track_err')
 USABLE_COMPLETED = ('true', 'false', 'inconclusive')
+S03_PUBLIC = ['meta.yaml', 'design.csv', 'levels.csv']
+S03_SEALED = ['sealed/runs.csv', 'sealed/notes.json']
+S03_SEALED_TEST = ['sealed_test/runs_test.csv', 'sealed_test/notes.json']
+CLIP_TOL = 1e-9               # RSM-15: largest move of an SLSQP solution back into the box (rounding only)
 PHASES = ('fit', 'opt', 'test')
+RUN_LOCK = '.run_lock'
+WRITTEN = set()               # RSM-14: files written by the running phase (absolute paths)
 PHASE_DIRS = dict(fit=('fit',), opt=('opt', 'confirm', 'check'), test=('test',))
 PHASE_LOCK = dict(fit='fit/lock.yaml', opt='opt_lock.yaml', test=None)
 TOOL_CAUSE = 'tool:'          # evals.csv 'cause' prefix with which CODE marks a first-attempt tool error (S04 3)
@@ -101,25 +108,38 @@ INTERPRETATIONS = [
     'fits: main (base, no_flag, cens05, drop_axial_<point_id>) and mid (base only); when eval_mu is the middle '
     'mu the two base fits are the same model and are checked equal',
     'rank: numpy.linalg.matrix_rank with its default tolerance; a fit of rank < 36 has no coefficients',
-    'SLSQP with the analytic gradient; converged = scipy OptimizeResult.success; the solution is clipped to '
-    '[-1, 1]^7 (largest move recorded) and f1_hat, f2_hat are recomputed on the clipped point',
-    'duplicates: greedy in the sorted order, a candidate within 1e-4 (Euclidean, codes) of a kept one is dropped',
+    'SLSQP with the analytic gradient; converged = scipy OptimizeResult.success with a finite solution whose move '
+    'back into [-1, 1]^7 is at most 1e-9 (rounding; RSM-15); f1_hat, f2_hat on the clipped point',
+    'duplicates: greedy in the sorted order, a candidate within 1e-4 (Euclidean, codes) of a kept one is dropped '
+    '(Codex RSM-15 on chains A-B-C: kept, deterministic)',
     'code to gain: s03_doe.decode on levels.csv; bounds: s03_doe.check_bounds; edge flag and level source: '
     's04_ga.edge_report on the GA coordinate lo + (c + 1) / 2 (hi - lo)',
     'confirmation: s04_ga.Evaluator.candidate (run_gate, run_error once more in a new process, cause empty, '
     'score); a candidate is feasible when score gives status ok, g1 = 0 and g2..g5 <= 0',
     'R2 is tested first; else s04_ga.select on {x_GA, x_RSM} gives R1 (x_GA) or R3 (x_RSM)',
-    'not robust over mu: score over the attempt-1 runs of the low or of the high mu is infeasible; a run_error '
-    'there makes the label undetermined; x_GA from the low / high rows of post_checks/three_mu.csv',
+    'not robust over mu (RSM-10): the 12.4 (iii) labels over every attempt-1 row of the low and high mu: an '
+    'observed violation -> not robust; else run_error / penalty -> undetermined; else inconclusive / track_err -> '
+    'not robust (g1 convention, not observed); x_GA from the low / high rows of post_checks/three_mu.csv (pen flags '
+    'from s04_ga.run_values); per-mu labels reported',
     'GA visited points: evals_<controller>.csv of the main runs only (S04 4.3: the trial is not a result); '
-    'attempt 2 replaces a run_error only when its cause starts with "tool:" and it is ok / track_err; a '
-    'penalised quantity leaves the candidate without a label; duplicates by gain vector, first kept',
-    'cost: S03 sweep not in part (a) (12.6 counts the 2 313 design runs); confirm planned = min(K, M) x runs '
-    'per candidate; S04 post and S03 times are one shared row (controller all)',
+    'attempt 2 replaces a run_error only when the cause on the attempt-2 row starts with "tool:" (CODE writes it '
+    'when it found a tool error; S04 8 puts cause on the rerun) and it is ok / track_err; a penalised quantity '
+    '(computed or stored pen_* = 1) leaves the candidate without a label; duplicates by gain vector, first kept',
+    'cost: S03 sweep not in part (a) (12.6 counts the 2 313 design runs); n_runs_actual counts the S03 diagnosis '
+    'reruns too; confirm planned = min(K, M) x runs per candidate; S04 post and S03 times are one shared row '
+    '(controller all)',
     'test set: 100 points x the S04 lock speeds at the middle mu; feasible at the middle mu = s04_ga.score '
     'feasible on those runs; predicted feasible = f1_hat_mid <= D + eps',
-    'main comparison: the first chain of attempts.csv with fit, opt and test done whose fit ran on the script '
-    'commit of the first fit start row; any other chain is exploratory (12.7)',
+    'main comparison (RSM-4): the chain whose test start is the first test start of attempts.csv and whose fit ran '
+    'on the script commit of the first fit start; after a test start every run of any phase is exploratory',
+    'start row (RSM-1): SHA-256 of the public S03 files and of S04, and of the sealed files as the S04 lock.yaml '
+    'fingerprint recorded them; the sealed files (and sealed_test/ in phase 3) are hashed after the start commit, '
+    'checked against that record, and written in the end row and the locks',
+    'locks (RSM-3): every locked file must be the blob of the output commit of the attempt that wrote it (commit '
+    'message "rsm_compare <phase> done <run> (<attempt>)"); opt_lock.yaml records the SHA-256 of fit/lock.yaml',
+    'main run (RSM-2, RSM-12): the repository origin is liam-zuu/hil-thesis, the S04 files read are committed '
+    'unchanged, rsm_compare.py is its HEAD blob, the DLL SHA-256 is the S04 one before loading and at the end',
+    'one run at a time (RSM-14): rsm/.run_lock (O_EXCL, never committed); a phase commits only the files it wrote',
     'file SHA-256 in the locks and attempts.csv: of the bytes as written and of the bytes with CRLF -> LF '
     '(compared: the LF value, so a checkout with core.autocrlf keeps the lock valid)',
     'no x_GA (send_to_HIL infeasible in S04) stops the run: 12.5 does not define the classes without it',
@@ -143,6 +163,7 @@ def write_csv(path, rows, cols=None):
     """CSV with LF line ends (lock SHA-256 independent of core.autocrlf after the LF normalisation)."""
     cols = cols or list(dict.fromkeys(k for r in rows for k in r))
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    WRITTEN.add(os.path.abspath(path))
     with open(path, 'w', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction='ignore', lineterminator='\n')
         w.writeheader()
@@ -151,6 +172,7 @@ def write_csv(path, rows, cols=None):
 
 def write_json(path, obj):
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    WRITTEN.add(os.path.abspath(path))
     with open(path, 'w', newline='\n', encoding='utf-8') as f:
         json.dump(obj, f, indent=1, sort_keys=True, default=str, ensure_ascii=False)
         f.write('\n')
@@ -159,6 +181,7 @@ def write_json(path, obj):
 def write_yaml_lines(path, d, head):
     """key: <json> lines (valid YAML), as s04_ga.write_root_meta."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    WRITTEN.add(os.path.abspath(path))
     with open(path, 'w', newline='\n', encoding='utf-8') as f:
         f.write(f'# {head}\n')
         for k, v in d.items():
@@ -246,6 +269,9 @@ def gradient(beta, c):
 
 def fit_ls(C, y):
     """Least squares on the full quadratic: (beta or None, diag)."""
+    C = np.asarray(C, dtype=float).reshape(-1, 7)
+    if C.shape[0] == 0:                                 # RSM-6: every point dropped (no_flag)
+        return None, dict(n=0, rank=0, sv_max=None, sv_min=None)
     X = design_matrix(C)
     rank = int(np.linalg.matrix_rank(X))
     sv = np.linalg.svd(X, compute_uv=False)
@@ -260,7 +286,8 @@ def fit_ls(C, y):
 # ── git ──────────────────────────────────────────────────────────────────────────────
 
 def git(repo, *a, check=True):
-    r = subprocess.run(['git', '-C', repo] + list(a), capture_output=True, text=True)
+    # RSM-5: every path argument is a literal path, never a pattern
+    r = subprocess.run(['git', '--literal-pathspecs', '-C', repo] + list(a), capture_output=True, text=True)
     if check and r.returncode != 0:
         raise Stop(f'git {" ".join(a)} failed in {repo}: {r.stderr.strip()[-500:]}')
     return r.stdout
@@ -270,31 +297,70 @@ def repo_root(path):
     return os.path.normpath(git(path, 'rev-parse', '--show-toplevel').strip())
 
 
+def blob_at(repo, rev, rel):
+    r = subprocess.run(['git', '-C', repo, 'rev-parse', '--verify', '--quiet', f'{rev}:{rel}'],
+                       capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
 def head_text(repo, rel):
     r = subprocess.run(['git', '-C', repo, 'show', f'HEAD:{rel}'], capture_output=True)
     return r.stdout.decode('utf-8') if r.returncode == 0 else None
 
 
+def same_as(repo, rev, rel):
+    """The working file (after git's filters) is the blob of <rev>:<rel>."""
+    b = blob_at(repo, rev, rel)
+    return b is not None and git(repo, 'hash-object', '--', rel).strip() == b
+
+
 def same_as_head(repo, rel):
-    """The working file is tracked in HEAD and its blob (after git's filters) is the HEAD blob."""
-    head = subprocess.run(['git', '-C', repo, 'rev-parse', '--verify', '--quiet', f'HEAD:{rel}'],
-                          capture_output=True, text=True)
-    if head.returncode != 0:
-        return False
-    now = git(repo, 'hash-object', '--', rel).strip()
-    return now == head.stdout.strip()
+    return same_as(repo, 'HEAD', rel)
 
 
 def commit_paths(repo, rels, msg):
-    """git add + git commit --only of exactly these paths; HEAD must then hold no other path."""
+    """git add + git commit --only of exactly these paths (literal); the staged change set of these paths and
+    the commit must hold no other path (RSM-5)."""
     if not rels:
         return None
     git(repo, 'add', '--', *rels)
+    staged = {p for p in git(repo, 'diff', '--cached', '--name-only', '--', *rels).splitlines() if p.strip()}
+    if not staged <= set(rels):
+        raise Stop(f'staged paths {sorted(staged - set(rels))} are not this script\'s (nothing committed)')
     git(repo, 'commit', '--only', '-q', '-m', msg, '--', *rels)
     got = {p for p in git(repo, 'show', '--name-only', '--format=', 'HEAD').splitlines() if p.strip()}
     if not got <= set(rels):
         raise Stop(f'commit {msg!r} holds paths that are not this script\'s: {sorted(got - set(rels))}')
     return git(repo, 'rev-parse', 'HEAD').strip()
+
+
+def output_commit(inp, phase, aid):
+    """The commit that closed attempt <aid> of <phase> with 'done' (12.7: the output commit of the attempt)."""
+    out = git(inp.repo, 'log', '--format=%H', '--fixed-strings', f'--grep=rsm_compare {phase} done {inp.rel} ({aid})',
+              '--', rel(inp, 'attempts.csv')).split()
+    if len(out) != 1:
+        raise Stop(f'{len(out)} output commits for {phase} attempt {aid} (expected exactly one)')
+    return out[0]
+
+
+ROOT_ORIGIN = ('liam-zuu/hil-thesis', 'liam-zuu/hil-thesis.git')   # RSM-2: the thesis root repository
+
+
+def check_root_repo(inp):
+    """Main run (RSM-2): the repository is the thesis root (origin liam-zuu/hil-thesis) and the S04 files read
+    are committed as they are."""
+    url = git(inp.repo, 'remote', 'get-url', 'origin', check=False).strip().replace('\\', '/')
+    if not url.endswith(ROOT_ORIGIN) or url.endswith('hil-thesis-cad') or url.endswith('hil-thesis-cad.git'):
+        raise Stop(f'main RSM runs only in the thesis root repository (origin {url!r} is not liam-zuu/hil-thesis)')
+    for p in inp.s04_paths():
+        if not same_as_head(inp.repo, f'{inp.rel}/{p}'):
+            raise Stop(f'S04 file {p} is not committed as it is: commit the S04 run before RSM (RSM-2)')
+
+
+def check_script_blob(hil):
+    """Main run (RSM-12): this script's content is its HEAD blob (assume-unchanged cannot hide an edit)."""
+    if not same_as_head(hil, 'fwsim/rsm_compare.py'):
+        raise Stop('fwsim/rsm_compare.py differs from its HEAD blob: 12.7 locks a clean commit')
 
 
 # ── inputs and checks (section 3 of the design; 12.2 S46-5) ─────────────────────────
@@ -312,6 +378,8 @@ class Inputs:
         parts = rel.split('/')
         if len(parts) != 4 or parts[:3] != ['05_DATA', 'results', 'S04']:
             raise Stop(f'{self.s04} is not <repo>/05_DATA/results/S04/<run> (12.7: one canonical folder)')
+        if not re.fullmatch(r'[A-Za-z0-9_.-]+', parts[3]):
+            raise Stop(f'S04 run name {parts[3]!r}: letters, digits, _ . - only (RSM-5)')
         self.rel = rel
         self.out = os.path.join(self.s04, 'rsm')
         self.rel_out = rel + '/rsm'
@@ -329,37 +397,56 @@ class Inputs:
     def ctrl_lock(self, ctrl):
         return self.lock['controllers'][ctrl]
 
-    def s04_files(self, ctrl_only=None):
+    def s04_paths(self):
         """S04 files read by this script (S04 8: lock, meta, phases, selected, history, evals, trial/, post_checks/)."""
         names = ['lock.yaml', 'meta.yaml', 'phases.json', 'selected.csv']
         for c in self.ctrls:
             names += [f'history_{c}.csv', f'evals_{c}.csv']
-        out = {}
-        for n in names:
-            p = os.path.join(self.s04, n)
-            out[n] = file_sha(p)[1] if os.path.isfile(p) else None
-        for d in ('trial', 'post_checks'):
-            for p, h in hash_tree(self.s04, [d]).items():
-                out[p] = h['sha256_lf']
-        return out
+        return [n for n in names if os.path.isfile(os.path.join(self.s04, n))] + files_under(self.s04, ['trial', 'post_checks'])
 
-    def s03_files(self, with_test=False):
-        names = ['meta.yaml', 'design.csv', 'levels.csv', 'sealed/runs.csv', 'sealed/notes.json']
-        if with_test:
-            names += ['sealed_test/runs_test.csv', 'sealed_test/notes.json']
+    def s04_files(self):
+        return {p: file_sha(os.path.join(self.s04, p))[1] for p in self.s04_paths()}
+
+    def s03_public(self):
+        """SHA-256 (LF) of the public S03 files; no sealed file is opened (RSM-1)."""
         out = {}
-        for n in names:
+        for n in S03_PUBLIC:
             p = os.path.join(self.s03, n)
             out[n] = file_sha(p)[1] if os.path.isfile(p) else None
         return out
+
+    def s03_sealed(self, with_test=False):
+        """SHA-256 of the sealed S03 files read by a phase: only after the start row is committed (RSM-1)."""
+        names = list(S03_SEALED) + (list(S03_SEALED_TEST) if with_test else [])
+        out = {}
+        for n in names:
+            p = os.path.join(self.s03, n)
+            out[n] = dict(zip(('sha256', 'sha256_lf'), file_sha(p))) if os.path.isfile(p) else None
+        return out
+
+    def check_links(self, out_dirs=()):
+        """RSM-13: no source or output file of this script is a link or resolves elsewhere; none resolves into
+        sealed_test/ (checked from the path entries, no file content is read)."""
+        st = os.path.normcase(os.path.realpath(os.path.join(self.s03, 'sealed_test')))
+        paths = [os.path.join(self.s04, p) for p in self.s04_paths()]
+        paths += [os.path.join(self.s03, n) for n in S03_PUBLIC + S03_SEALED]
+        paths += [os.path.join(self.out, p) for p in files_under(self.out, list(out_dirs))]
+        for p in paths:
+            if not os.path.exists(p) and not os.path.islink(p):
+                continue
+            real = os.path.normcase(os.path.realpath(p))
+            if os.path.islink(p) or real != os.path.normcase(os.path.abspath(p)):
+                raise Stop(f'{p} is a link or resolves to {real}: refused (RSM-13)')
+            if real.startswith(st + os.sep) or real == st:
+                raise Stop(f'{p} resolves into sealed_test/: refused before phase 3 (RSM-13)')
 
 
 def s03_meta(inp):
     return open(os.path.join(inp.s03, 'meta.yaml'), encoding='utf-8').read()
 
 
-def check_inputs(inp):
-    """Checks of the S04 folder, the tools and the S03 record that do not read sealed/ data."""
+def check_mode(inp):
+    """Before the start row (RSM-1): the mode, from S03 meta.yaml and the S04 lock only; no sealed file is opened."""
     meta = s03_meta(inp)
     if s4.meta_value(meta, 'status') != 'ran to the end':
         raise Stop(f'S03 run {inp.s03} did not run to the end (12.2)')
@@ -378,6 +465,14 @@ def check_inputs(inp):
             raise Stop('main RSM needs the main S03 run (three mu levels, not --trial)')
         if not inp.common.get('unsealed'):
             raise Stop('main RSM needs an S04 run made with --s03-unsealed (campaign A ended, L56)')
+        check_root_repo(inp)                                # RSM-2
+        check_script_blob(inp.hil)                          # RSM-12
+    inp.check_links()                                       # RSM-13
+
+
+def check_inputs(inp):
+    """Checks after the start row is committed: the fingerprint (it reads sealed/runs.csv in a main run), the S04
+    folder, the domain."""
     # 12.4 [v6]: the same DLL and evaluator blob as the S04 run (and the same S03 files, plant, sources)
     try:
         s4.check_fingerprint(inp.common, s4.fingerprint(inp.dll, inp.s03, unsealed=inp.common.get('unsealed', False)),
@@ -441,23 +536,26 @@ def check_fit_design(design, ctrl):
     return {p: fit[p][1] for p in FIT_IDS}
 
 
-def index_runs(rows, ctrl, boxes):
+def index_runs(rows, ctrl, pids, speeds, mus):
+    """RSM-7: every row of the controller whose point_id is in pids (whatever its box) under the speed and mu
+    level it matches (math.isclose); a row matching none of the levels is not needed and left aside. A
+    condition with more than one row stops in need_run."""
     by = {}
     for r in rows:
-        if r['controller'] != ctrl or r['box'] not in boxes:
+        if r['controller'] != ctrl or int(r['point_id']) not in pids:
             continue
-        key = (int(r['point_id']), float(r['v']), float(r['mu']))
-        if key in by:
-            raise Stop(f'{ctrl}: two runs for point {key[0]} v {key[1]} mu {key[2]}')
-        by[key] = r
+        vs = [v for v in speeds if math.isclose(float(r['v']), v)]
+        ms = [m for m in mus if math.isclose(float(r['mu']), m)]
+        if len(vs) == 1 and len(ms) == 1:
+            by.setdefault((int(r['point_id']), vs[0], ms[0]), []).append(r)
     return by
 
 
 def need_run(by, pid, v, mu, ctrl, src, box):
-    key = next((k for k in by if k[0] == pid and math.isclose(k[1], v) and math.isclose(k[2], mu)), None)
-    if key is None:
-        raise Stop(f'{src}: no run of {ctrl} point {pid} at v = {v}, mu = {mu}')
-    r = by[key]
+    rs = by.get((pid, v, mu), [])
+    if len(rs) != 1:
+        raise Stop(f'{src}: {len(rs)} runs of {ctrl} point {pid} at v = {v}, mu = {mu} (exactly one needed)')
+    r = rs[0]
     if r['box'] != box:
         raise Stop(f'{src}: {ctrl} point {pid} v = {v} mu = {mu} has box {r["box"]!r}, design.csv {box!r}')
     if r['status'] == 'run_error':
@@ -483,8 +581,10 @@ def fit_points(inp, ctrl):
     L = inp.ctrl_lock(ctrl)
     speeds, eval_mu = [float(v) for v in L['speeds']], [float(m) for m in L['eval_mu']]
     codes = check_fit_design(read_design(inp.s03, ctrl), ctrl)
-    by = index_runs(read_csv(os.path.join(inp.s03, 'sealed', 'runs.csv')), ctrl, FIT_BOXES)
-    extra = sorted({k[0] for k in by} - set(FIT_IDS))
+    runs = read_csv(os.path.join(inp.s03, 'sealed', 'runs.csv'))
+    by = index_runs(runs, ctrl, set(FIT_IDS), speeds, inp.mu_levels)
+    extra = sorted({int(r['point_id']) for r in runs if r['controller'] == ctrl and r['box'] in FIT_BOXES}
+                   - set(FIT_IDS))
     if extra:
         raise Stop(f'sealed/runs.csv: {ctrl} points {extra[:5]} of the fit boxes are not in the 143 points')
     rows = []
@@ -603,41 +703,65 @@ def abort_previous(inp, phase, reason, script):
     commit_paths(inp.repo, paths, f'fw: rsm_compare abort {phase} {inp.rel}: {reason}'[:200])
 
 
-def lock_check(inp, lock_rel, dirs):
-    """A lock file and the files it lists: in HEAD, the same blobs, the same LF SHA-256 (12.7)."""
+def attempts_state(inp):
+    """RSM-4: 'none' (no attempts.csv anywhere), 'same' (as committed), 'appended' (HEAD is a prefix of the working
+    file: rows added and not committed), 'changed' (a committed row was altered or removed)."""
+    p = os.path.join(inp.out, 'attempts.csv')
+    head = head_text(inp.repo, rel(inp, 'attempts.csv'))
+    if not os.path.isfile(p):
+        return 'none' if head is None else 'changed'
+    now = open(p, encoding='utf-8', newline='').read().replace('\r\n', '\n')
+    head = (head or '').replace('\r\n', '\n')
+    if now == head:
+        return 'same'
+    return 'appended' if now.startswith(head) else 'changed'
+
+
+def require_attempts(inp, allow_appended=False):
+    st = attempts_state(inp)
+    if st == 'changed':
+        raise Stop('rsm/attempts.csv: a committed row was altered or removed (12.7: append only)')
+    if st == 'appended' and not allow_appended:
+        raise Stop('rsm/attempts.csv holds rows not committed (an interrupted phase): run again with '
+                   '--abort-previous "<reason>" (12.7)')
+
+
+def lock_check(inp, lock_rel, dirs, phase):
+    """RSM-3: a lock file and every file it lists are the blobs of the output commit of the attempt that wrote
+    them (not merely of HEAD), and their LF SHA-256 match the lock (12.7)."""
     lp = os.path.join(inp.out, lock_rel)
     if not os.path.isfile(lp):
         raise Stop(f'rsm/{lock_rel} missing')
-    if not same_as_head(inp.repo, rel(inp, lock_rel)):
-        raise Stop(f'rsm/{lock_rel} is not committed as it is')
     lk = json.load(open(lp, encoding='utf-8'))
+    c = output_commit(inp, phase, lk['attempt_id'])
+    if not same_as(inp.repo, c, rel(inp, lock_rel)) or not same_as_head(inp.repo, rel(inp, lock_rel)):
+        raise Stop(f'rsm/{lock_rel} is not its output commit {c[:10]} as it is (12.7)')
     files = lk['files']
     now = set(files_under(inp.out, dirs)) - {lock_rel}
     if now != set(files):
         raise Stop(f'rsm/{lock_rel}: the files {sorted(now ^ set(files))[:5]} differ from the lock')
     for p, h in files.items():
-        if not same_as_head(inp.repo, rel(inp, p)):
-            raise Stop(f'rsm/{p} is not committed as it is (12.7)')
+        if not same_as(inp.repo, c, rel(inp, p)) or not same_as_head(inp.repo, rel(inp, p)):
+            raise Stop(f'rsm/{p} is not the file of its output commit {c[:10]} (12.7)')
         if file_sha(os.path.join(inp.out, p))[1] != h['sha256_lf']:
             raise Stop(f'rsm/{p}: SHA-256 differs from rsm/{lock_rel} (12.7)')
     return lk
 
 
-def chain_kind(inp):
-    """'main' for the first chain with fit, opt and test done on the first fit commit, else 'exploratory'."""
+def comparison_kind(inp, phase, aid, chain_id):
+    """RSM-4 (12.7): the main comparison is the chain whose test phase is the FIRST test start of attempts.csv and
+    whose fit ran on the script commit of the first fit start; once a test start exists, every later run of any
+    phase is exploratory. Returns 'main' (test phase only), 'pending' or 'exploratory'."""
     rows = attempts(inp)
-    starts = [r for r in rows if r['kind'] == 'start' and r['phase'] == 'fit']
-    if not starts:
-        return None
-    first_commit = starts[0]['script_commit']
-    done = {}
-    for r in rows:
-        if r['kind'] == 'end' and r['status'] == 'done':
-            done.setdefault(r['chain_id'], set()).add(r['phase'])
-    for s in starts:
-        if done.get(s['attempt_id'], set()) >= set(PHASES):
-            return s['attempt_id'] if s['script_commit'] == first_commit else None
-    return None
+    fits = [r for r in rows if r['kind'] == 'start' and r['phase'] == 'fit']
+    me = next(i for i, r in enumerate(rows) if r['attempt_id'] == aid and r['kind'] == 'start')
+    chain_fit = next((r for r in fits if r['attempt_id'] == chain_id), None)
+    if not fits or chain_fit is None or chain_fit['script_commit'] != fits[0]['script_commit']:
+        return 'exploratory'
+    tests = [i for i, r in enumerate(rows) if r['kind'] == 'start' and r['phase'] == 'test']
+    if phase == 'test':
+        return 'main' if tests and tests[0] == me else 'exploratory'
+    return 'exploratory' if any(i < me for i in tests) else 'pending'
 
 
 # ── phase 1: fit ─────────────────────────────────────────────────────────────────────
@@ -713,12 +837,18 @@ def optimise(b1, b2, starts):
     def one(step, k, x0, fun, jac, cons=()):
         res = minimize(fun, x0, jac=jac, bounds=bounds, constraints=list(cons), method=SOLVER['method'],
                        options=opts)
-        x = np.clip(res.x, -1.0, 1.0)
+        raw = np.asarray(res.x, dtype=float)
+        finite = bool(np.all(np.isfinite(raw)))
+        x = np.clip(raw, -1.0, 1.0) if finite else raw
+        move = float(np.max(np.abs(raw - x))) if finite else float('inf')
+        # RSM-15: only a rounding move back into the box keeps the solver's success
+        ok = bool(res.success) and finite and move <= CLIP_TOL
         rows.append(dict(step=step, start=k, start_code=json.dumps([float(v) for v in x0]), success=bool(res.success),
-                         status=int(res.status), nit=int(getattr(res, 'nit', -1)), message=str(res.message),
-                         clip_move=float(np.max(np.abs(res.x - x))), code=json.dumps([repr(float(v)) for v in x]),
-                         f1_hat=predict(b1, x), f2_hat=predict(b2, x)))
-        return bool(res.success), x
+                         converged=ok, status=int(res.status), nit=int(getattr(res, 'nit', -1)),
+                         message=str(res.message), raw_code=json.dumps([repr(float(v)) for v in raw]), clip_move=move,
+                         code=json.dumps([repr(float(v)) for v in x]),
+                         f1_hat=predict(b1, x) if finite else '', f2_hat=predict(b2, x) if finite else ''))
+        return ok, x
 
     f1 = (lambda c: predict(b1, c)), (lambda c: gradient(b1, c))
     f2 = (lambda c: predict(b2, c)), (lambda c: gradient(b2, c))
@@ -733,17 +863,21 @@ def optimise(b1, b2, starts):
     conv2 = [x for ok, x in s2 if ok]
     if not conv2:
         return 'i', f1s, rows, []
-    cand = []
-    for x in conv2:
-        h1, h2 = predict(b1, x), predict(b2, x)
-        if h1 <= f1s + F1_TOL + EPS and h1 <= D + EPS:
-            cand.append(dict(code=[float(v) for v in x], f1_hat=h1, f2_hat=h2))
+    kept = candidates([dict(code=[float(v) for v in x], f1_hat=predict(b1, x), f2_hat=predict(b2, x)) for x in conv2],
+                      f1s)
+    return (None if kept else 'ii'), f1s, rows, kept
+
+
+def candidates(points, f1s):
+    """12.3: the converged step-2 points within f1* + 0.01 + eps and D + eps, ordered by f2_hat, f1_hat, codes;
+    a point within DEDUP (Euclidean, codes) of a kept one is the same (greedy in that order)."""
+    cand = [c for c in points if c['f1_hat'] <= f1s + F1_TOL + EPS and c['f1_hat'] <= D + EPS]
     cand.sort(key=lambda c: (c['f2_hat'], c['f1_hat'], tuple(c['code'])))
     kept = []
     for c in cand:
         if all(np.linalg.norm(np.array(c['code']) - np.array(k['code'])) >= DEDUP for k in kept):
             kept.append(c)
-    return (None if kept else 'ii'), f1s, rows, kept
+    return kept
 
 
 def to_gains(inp, ctrl, code):
@@ -765,6 +899,8 @@ def to_gains(inp, ctrl, code):
 
 def make_evaluator(inp, ctrl, mus, work, cache):
     L = inp.ctrl_lock(ctrl)
+    if s3.sha256_file(inp.dll) != inp.common['fingerprint']['dll_sha256']:              # RSM-12: before loading
+        raise Stop('the DLL is not the DLL of the S04 run')
     factory = EVALUATOR
     if factory is None:
         if 'fw' not in cache:
@@ -841,16 +977,26 @@ def confirm(inp, ctrl, cand_path, work, cache, log):
     return x, tried, evals, time.time() - t0
 
 
+MU_LABELS = dict(pass_='robust', violation_observed='not robust over mu',
+                 run_error_excluded='undetermined (run_error or penalised quantity at the low / high mu)',
+                 inconclusive='not robust over mu (inconclusive or track_err only: the g1 convention, not observed)')
+
+
+def with_flags(r):
+    """A run row with its pen_* flags: as stored, or from s04_ga.run_values when the file has none (three_mu.csv)."""
+    if all(('pen_' + k) in r for k in s4.PEN_KEYS):
+        return r
+    return dict(r, **s4.run_values(r)[1])
+
+
 def mu_label_from_rows(rows_by_mu):
-    """'robust' | 'not robust over mu' | 'undetermined (run_error)' from {mu: [attempt-1 rows]}."""
-    out = 'robust'
-    for mu, rows in sorted(rows_by_mu.items()):
-        if any(r.get('status') == 'run_error' for r in rows):
-            out = 'undetermined (run_error at mu %r)' % mu if out == 'robust' else out
-            continue
-        if not feasible(score_rows(rows)):
-            return 'not robust over mu'
-    return out
+    """RSM-10: the label of 12.5 from the attempt-1 rows of the low and high mu, by the order of 12.4 (iii) over
+    every row: an observed violation anywhere first, then run_error / penalty, then inconclusive / track_err.
+    Returns (label, per-mu labels)."""
+    rows = [with_flags(r) for rs in rows_by_mu.values() for r in rs]
+    lab = label(rows)[0]
+    per = {repr(mu): label([with_flags(r) for r in rs])[0] for mu, rs in sorted(rows_by_mu.items())}
+    return MU_LABELS['pass_' if lab == 'pass' else lab], per
 
 
 def ga_mu_label(inp, ctrl, low_high):
@@ -875,7 +1021,8 @@ def ga_mu_label(inp, ctrl, low_high):
         got = sorted(float(r['v']) for r in by.get(mu, []))
         if len(got) != len(speeds) or any(not math.isclose(a, b) for a, b in zip(got, sorted(speeds))):
             raise Stop(f'post_checks/three_mu.csv: {ctrl} mu {mu}: runs at {got}, expected {speeds}')
-    return mu_label_from_rows(by), f'post_checks/three_mu.csv:{",".join(map(str, lines))}'
+    lab, per = mu_label_from_rows(by)
+    return lab, per, f'post_checks/three_mu.csv:{",".join(map(str, lines))}'
 
 
 def classify(x_ga, x_rsm):
@@ -910,7 +1057,8 @@ def ga_points(inp, ctrl, betas):
                     reason = 'missing run'
                 elif r1['status'] == 'run_error':
                     r2 = at.get(2)
-                    if r2 is not None and str(r1.get('cause', '')).startswith(TOOL_CAUSE) and \
+                    # RSM-8: 'cause' is on the rerun row (S04 8); 'tool:' = CODE found a tool error
+                    if r2 is not None and str(r2.get('cause', '')).startswith(TOOL_CAUSE) and \
                             r2['status'] in USABLE_STATUS:
                         use.append(r2)
                     else:
@@ -919,7 +1067,8 @@ def ga_points(inp, ctrl, betas):
                     use.append(r1)
         if reason is None:
             s = score_rows(use)
-            if s['pen_f1'] or s['n_pen_runs']:
+            # RSM-9: a stored flag counts too (a finite 1e6 with pen_* = 1 is a penalty)
+            if s['pen_f1'] or s['n_pen_runs'] or any(is_on(r.get('pen_' + k, 0)) for r in use for k in s4.PEN_KEYS):
                 reason = 'penalised quantity'
         if reason:
             why_none[reason] = why_none.get(reason, 0) + 1
@@ -970,10 +1119,12 @@ def cost_rows(inp, ctrl, evals_rsm, times, n_conf_planned):
         return sum(n.get('controller') == ctrl and n.get('point') and n['point'][1] in boxes for n in reruns)
     pa = sum(s3.PLANNED_RUNS[b] for b in ('centre', 'outer', 'inner'))
     rows.append(dict(controller=ctrl, part='a', item='S03 design (centre, outer, inner)', n_runs_planned=pa,
-                     n_runs_actual=n_box(('centre', 'outer', 'inner')), n_attempt2=n_rerun(('centre', 'outer', 'inner')),
+                     n_runs_actual=n_box(('centre', 'outer', 'inner')) + n_rerun(('centre', 'outer', 'inner')),
+                     n_attempt2=n_rerun(('centre', 'outer', 'inner')),
                      row_type='measured_total', source_file='S03 sealed/runs.csv, sealed/notes.json'))
     rows.append(dict(controller=ctrl, part='b', item='S03 axial points', n_runs_planned=s3.PLANNED_RUNS['axial'],
-                     n_runs_actual=n_box(('axial',)), n_attempt2=n_rerun(('axial',)), row_type='measured_total',
+                     n_runs_actual=n_box(('axial',)) + n_rerun(('axial',)), n_attempt2=n_rerun(('axial',)),
+                     row_type='measured_total',
                      source_file='S03 sealed/runs.csv, sealed/notes.json'))
     for ph in ('confirm', 'mu3'):
         rs = [r for r in evals_rsm if r['controller'] == ctrl and r['phase'] == ph]
@@ -1060,7 +1211,7 @@ def run_opt(inp, ctx, log=print):
         send = next(r for r in sel if r['kind'] == 'send_to_HIL' and r['controller'] == ctrl)
         x_ga = dict(f1=float(send['f1']), f2=float(send['f2']), x=[float(send[n]) for n in s3.FACTORS[ctrl]],
                     ga_seed=int(send['ga_seed']), who='GA')
-        cls, mu_rsm, mu_ga, mu_src = 'R0', '', '', ''
+        cls, mu_rsm, mu_ga, mu_src, per_rsm, per_ga = 'R0', '', '', '', '', ''
         lo_hi = [m for m in inp.mu_levels if not math.isclose(m, inp.mu_mid)]
         if x is not None:
             x_rsm = dict(f1=x['f1'], f2=x['f2'], x=[x['gains'][n] for n in s3.FACTORS[ctrl]], ga_seed=0, who='RSM')
@@ -1081,8 +1232,9 @@ def run_opt(inp, ctx, log=print):
                 for e in new:
                     if int(e['attempt']) == 1:
                         by.setdefault(next(m for m in lo_hi if math.isclose(float(e['mu']), m)), []).append(e)
-                mu_rsm = mu_label_from_rows(by)
-                mu_ga, mu_src = ga_mu_label(inp, ctrl, lo_hi)
+                mu_rsm, per_rsm = mu_label_from_rows(by)
+                mu_ga, per_ga, mu_src = ga_mu_label(inp, ctrl, lo_hi)
+                per_rsm, per_ga = json.dumps(per_rsm), json.dumps(per_ga)
         counts = {k: sum(t['label'] == k for t in tried) for k in ('violation_observed', 'run_error_excluded',
                                                                     'inconclusive')}
         n_tried = len(tried)
@@ -1095,7 +1247,8 @@ def run_opt(inp, ctx, log=print):
                             n_run_error_excluded=counts['run_error_excluded'], n_inconclusive=counts['inconclusive'],
                             x_rsm_cand_id=x['cand_id'] if x else '', f1_rsm=x['f1'] if x else '',
                             f2_rsm=x['f2'] if x else '', f1_ga=x_ga['f1'], f2_ga=x_ga['f2'],
-                            mu_label_rsm=mu_rsm, mu_label_ga=mu_ga, mu_label_ga_source=mu_src,
+                            mu_label_rsm=mu_rsm, mu_label_ga=mu_ga, mu_label_rsm_per_mu=per_rsm,
+                            mu_label_ga_per_mu=per_ga, mu_label_ga_source=mu_src,
                             n_run_error_runs=sum(r['status'] == 'run_error' and int(r['attempt']) == 1 for r in ev)))
         # 12.6 GA points, axial sensitivity, cost
         pts, summ = ga_points(inp, ctrl, dict(f1=pc['b1'], f2=pc['b2']))
@@ -1141,6 +1294,7 @@ def run_opt(inp, ctx, log=print):
     write_csv(os.path.join(inp.out, 'check', 'cost.csv'), cost, COST_COLS)
     write_json(os.path.join(inp.out, 'opt_lock.yaml'), dict(
         spec=SPEC, attempt_id=ctx['attempt_id'], chain_id=ctx['chain_id'], script=ctx['script'],
+        fit_lock_sha256_lf=file_sha(os.path.join(inp.out, 'fit', 'lock.yaml'))[1],          # RSM-3
         files=hash_tree(inp.out, ['opt', 'confirm', 'check'])))
     return summary
 
@@ -1160,7 +1314,7 @@ def run_test(inp, ctx):
         tp = {p: c for p, (box, c) in design.items() if box == 'test'}
         if set(tp) != set(TEST_IDS):
             raise Stop(f'design.csv: the test points of {ctrl} are not point_id {TEST_IDS[0]}..{TEST_IDS[-1]}')
-        by = index_runs(runs, ctrl, ('test',))
+        by = index_runs(runs, ctrl, set(TEST_IDS), speeds, [inp.mu_mid])
         b1, b2 = coefs[(ctrl, 'mid', 'base', 'f1')], coefs[(ctrl, 'mid', 'base', 'f2')]
         e1, e2, mis, n_pen = [], [], 0, 0
         for pid in TEST_IDS:
@@ -1181,10 +1335,10 @@ def run_test(inp, ctx):
                              rmse_f1_mid=float(np.sqrt(np.mean(e1 ** 2))), maxabs_f1_mid=float(np.max(np.abs(e1))),
                              rmse_f2_mid=float(np.sqrt(np.mean(e2 ** 2))), maxabs_f2_mid=float(np.max(np.abs(e2))),
                              misclassified=mis, misclass_rate=mis / len(TEST_IDS)))
-        n = sum(r['controller'] == ctrl for r in runs)
+        n2 = sum(x.get('controller') == ctrl for x in (notes.get('run_error_reruns') or []))
+        n = sum(r['controller'] == ctrl for r in runs) + n2                     # RSM-11: reruns counted
         cost.append(dict(controller=ctrl, part='b', item='S03 test set (reported apart, not cost to a solution)',
-                         n_runs_planned=s3.PLANNED_RUNS['test'], n_runs_actual=n,
-                         n_attempt2=sum(x.get('controller') == ctrl for x in (notes.get('run_error_reruns') or [])),
+                         n_runs_planned=s3.PLANNED_RUNS['test'], n_runs_actual=n, n_attempt2=n2,
                          row_type='measured_total', source_file='S03 sealed_test/runs_test.csv, notes.json'))
     cost.append(dict(controller='all', part='b', item='S03 test set time', machine_s=notes.get('elapsed_s_test', ''),
                      machine_s_basis='measured', row_type='measured_total',
@@ -1219,45 +1373,65 @@ def write_rsm_meta(inp, phase, info):
              versions=dict(python=platform.python_version(), numpy=np.__version__, scipy=scipy.__version__),
              solver=SOLVER, eps=EPS, dedup=DEDUP, K=K, inputs=dict(old.get('inputs') or {}, **{phase: info['inputs']}),
              locks=['rsm/fit/lock.yaml', 'rsm/opt_lock.yaml'], attempts='rsm/attempts.csv',
-             coefs_commit_before_test=coefs_commit or None, comparison_kind=old.get('comparison_kind'),
+             coefs_commit_before_test=coefs_commit or None, comparison_kind=info['kind'],
              phases=dict(old.get('phases') or {}, **{phase: info.get('summary')}), elapsed_s=elapsed,
              interpretations=INTERPRETATIONS)
-    if phase == 'test':
-        d['comparison_kind'] = 'main' if chain_kind(inp) == info['chain_id'] else 'exploratory'
     write_yaml_lines(p, d, 'rsm/meta.yaml (written by fwsim/rsm_compare.py; every value is JSON, valid YAML)')
 
 
 def run_phase(phase, s04_dir, dll, abort_reason=None, log=print):
     inp = Inputs(s04_dir, dll)
+    os.makedirs(inp.out, exist_ok=True)
+    lock_file = os.path.join(inp.out, RUN_LOCK)
+    try:                                                    # RSM-14: one run at a time on this folder
+        fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        raise Stop(f'rsm/{RUN_LOCK} exists: another rsm_compare run is on this folder (if none runs, delete the file '
+                   f'and use --abort-previous)') from None
+    os.write(fd, f'{os.getpid()} {time.strftime("%Y-%m-%d %H:%M:%S")}\n'.encode())
+    os.close(fd)
+    try:
+        return _run_phase(inp, phase, abort_reason, log)
+    finally:
+        os.remove(lock_file)
+
+
+def _run_phase(inp, phase, abort_reason, log):
     script = s3.git_state(inp.hil)
     if not inp.tool_check and script['dirty']:
         raise Stop(f'the script tree is not clean ({script["modified"][:5]}): 12.7 locks a clean commit')
     if abort_reason:
+        require_attempts(inp, allow_appended=True)
         abort_previous(inp, phase, abort_reason, script)
+    require_attempts(inp)                                   # RSM-4: append only, nothing uncommitted
     if dangling(inp):
         raise Stop(f'attempts.csv has a start row without an end row {sorted(dangling(inp))}: run again with '
                    f'--abort-previous "<reason>" (12.7)')
-    if phase_files(inp, phase) or (phase == 'opt' and os.path.exists(os.path.join(inp.out, 'opt_lock.yaml'))):
+    if phase_files(inp, phase):
         raise Stop(f'rsm/ already holds outputs of phase {phase}: no overwrite (12.7); --abort-previous to move them')
     chain = None
-    if phase == 'opt':
-        chain = lock_check(inp, 'fit/lock.yaml', ['fit'])
-    elif phase == 'test':
-        chain = lock_check(inp, 'fit/lock.yaml', ['fit'])
-        lock_check(inp, 'opt_lock.yaml', ['opt', 'confirm', 'check'])
-        if json.load(open(os.path.join(inp.out, 'opt_lock.yaml'), encoding='utf-8'))['chain_id'] != chain['attempt_id']:
-            raise Stop('rsm/opt_lock.yaml belongs to another chain than rsm/fit/lock.yaml')
+    if phase in ('opt', 'test'):
+        chain = lock_check(inp, 'fit/lock.yaml', ['fit'], 'fit')
+    if phase == 'test':
+        ol = lock_check(inp, 'opt_lock.yaml', ['opt', 'confirm', 'check'], 'opt')
+        if ol['chain_id'] != chain['attempt_id'] or \
+                ol.get('fit_lock_sha256_lf') != file_sha(os.path.join(inp.out, 'fit', 'lock.yaml'))[1]:
+            raise Stop('rsm/opt_lock.yaml was not made from this rsm/fit/lock.yaml (RSM-3)')
     if chain is not None and chain['script']['commit'] != script['commit']:
         raise Stop(f'script commit {script["commit"]} is not the commit of rsm/fit/lock.yaml '
                    f'{chain["script"]["commit"]} (12.7: phases 2, 3 use the same commit)')
+    check_mode(inp)                                         # S03 meta.yaml and S04 only; no sealed file (RSM-1)
     aid = f'{phase}-{stamp()}'
     chain_id = aid if phase == 'fit' else chain['attempt_id']
-    # hashes only (no data read); sealed_test/ only in phase 3, after both locks passed
-    inputs = dict(s03=inp.s03_files(with_test=phase == 'test'), s04=inp.s04_files())
-    if chain is not None and inputs['s04'] != chain['inputs']['s04']:
+    # RSM-1: the start row holds the SHA-256 of the public S03 files and of S04 (read now), and of the sealed
+    # files as the S04 lock recorded them (not read now); the sealed files are hashed after the start commit
+    fp_s03 = (inp.common.get('fingerprint') or {}).get('s03_files') or {}
+    pub = dict(s03=inp.s03_public(), s04=inp.s04_files(),
+               sealed_from_s04_lock={n: fp_s03.get(n) for n in S03_SEALED})
+    if chain is not None and pub['s04'] != chain['inputs']['s04']:
         raise Stop('the S04 folder changed since rsm/fit/lock.yaml (12.7)')
     start = dict(attempt_id=aid, chain_id=chain_id, kind='start', phase=phase, time=time.strftime('%Y-%m-%d %H:%M:%S'),
-                 script_commit=script['commit'], script_dirty=script['dirty'], inputs_sha256=json.dumps(inputs),
+                 script_commit=script['commit'], script_dirty=script['dirty'], inputs_sha256=json.dumps(pub),
                  status='', reason='')
     append_attempt(inp, start)
     commit_paths(inp.repo, [rel(inp, 'attempts.csv')], f'fw: rsm_compare start {phase} {inp.rel} ({aid})')
@@ -1265,15 +1439,29 @@ def run_phase(phase, s04_dir, dll, abort_reason=None, log=print):
     if not any(r['attempt_id'] == aid and r['kind'] == 'start' for r in csv.DictReader(io.StringIO(head))):
         raise Stop(f'the start row {aid} is not in HEAD (12.7 [v4])')
     t0 = time.time()
-    ctx = dict(attempt_id=aid, chain_id=chain_id, script=script, inputs=inputs)
+    ctx = dict(attempt_id=aid, chain_id=chain_id, script=script, inputs=pub)
+    WRITTEN.clear()
+    dirs = list(PHASE_DIRS[phase]) + (['opt_lock.yaml'] if phase == 'opt' else [])
     try:
-        check_inputs(inp)                                   # reads no sealed data
+        check_inputs(inp)                                   # the fingerprint reads sealed/runs.csv (main run)
+        sealed = inp.s03_sealed(with_test=phase == 'test')
+        for n, want in pub['sealed_from_s04_lock'].items():
+            got = (sealed.get(n) or {}).get('sha256')
+            if want is not None and got != want:
+                raise Stop(f'S03 {n}: SHA-256 {got} is not the one of the S04 lock {want}')
+        ctx['inputs'] = dict(pub, sealed=sealed)
         if phase == 'fit':
             summary = run_fit(inp, ctx)
         elif phase == 'opt':
             summary = run_opt(inp, ctx, log)
         else:
             summary = run_test(inp, ctx)
+        mine = {os.path.relpath(p, inp.out).replace(os.sep, '/') for p in WRITTEN}
+        on_disk = set(files_under(inp.out, dirs))
+        if on_disk - mine:                                  # RSM-14: commit only what this run wrote
+            raise Stop(f'files not written by this run in the phase folders: {sorted(on_disk - mine)[:5]}')
+        if s3.sha256_file(inp.dll) != inp.common['fingerprint']['dll_sha256']:          # RSM-12
+            raise Stop('the DLL changed during the phase: not the DLL of the S04 run')
     except (Stop, SystemExit, Exception) as exc:            # noqa: BLE001: every failure closes the attempt
         reason = f'{type(exc).__name__}: {exc}'
         st = stamp()
@@ -1285,14 +1473,15 @@ def run_phase(phase, s04_dir, dll, abort_reason=None, log=print):
             paths += tracked_rel(inp, files_under(inp.out, [f'aborted/{st}']))
         commit_paths(inp.repo, paths, f'fw: rsm_compare stopped {phase} {inp.rel} ({aid})')
         raise
-    info = dict(script=script, inputs=ctx['inputs'], summary=summary, elapsed_s=round(time.time() - t0), chain_id=chain_id)
     append_attempt(inp, dict(start, kind='end', time=time.strftime('%Y-%m-%d %H:%M:%S'), status='done',
-                             reason='', inputs_sha256=''))
+                             reason='', inputs_sha256=json.dumps(ctx['inputs'])))
+    info = dict(script=script, inputs=ctx['inputs'], summary=summary, elapsed_s=round(time.time() - t0),
+                chain_id=chain_id, kind=comparison_kind(inp, phase, aid, chain_id))
     write_rsm_meta(inp, phase, info)
-    dirs = list(PHASE_DIRS[phase]) + (['opt_lock.yaml'] if phase == 'opt' else [])
-    paths = [rel(inp, 'attempts.csv'), rel(inp, 'meta.yaml')] + tracked_rel(inp, files_under(inp.out, dirs))
-    commit_paths(inp.repo, paths, f'fw: rsm_compare {phase} done {inp.rel} ({aid}){" tool check" if inp.tool_check else ""}')
-    log(f'rsm {phase}: done ({aid}); {json.dumps(summary, default=str)[:600]}')
+    paths = [rel(inp, 'attempts.csv'), rel(inp, 'meta.yaml')] + tracked_rel(inp, sorted(on_disk))
+    commit_paths(inp.repo, paths,
+                 f'fw: rsm_compare {phase} done {inp.rel} ({aid}){" tool check" if inp.tool_check else ""}')
+    log(f'rsm {phase}: done ({aid}), {info["kind"]}; {json.dumps(summary, default=str)[:600]}')
     return summary
 
 
