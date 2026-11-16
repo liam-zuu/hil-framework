@@ -798,6 +798,9 @@ def test_cs1_14_locked_command_thresholds_are_applied(tmp_path, cmd_ok):
     cmd_ok['cond'] = dict(cond2=dict(value_m=0.004), cond3=dict(value_ms=None), cond4=dict(value_m=0.5, applies=False))
     out, _ = run(tmp_path, hs_kw=dict(duong_lenh=th))
     assert out['outcome'] == 'hong_he_do' and 'cond3_thieu_bang_chung' in out['cmd_path']['threshold_flags'][0]
+    cmd_ok['cond'] = dict(cond2=dict(value_m=0.004), cond3=dict(value_ms=30.0), cond4=dict(value_m=0.05, applies=True))
+    out, _ = run(tmp_path, hs_kw=dict(duong_lenh=th))      # (4) applies (no ultrasonic block): compared
+    assert out['outcome'] == 'hong_he_do' and out['cmd_path']['threshold_flags'] == ['cond4_vuot_nguong: 50.0 mm > 30 mm']
     cmd_ok['cond'] = {}
     out, _ = run(tmp_path)                                 # no thresholds in a de_xuat file: values only
     assert out['outcome'] == 'dat' and out['cmd_path']['threshold_flags'] == []

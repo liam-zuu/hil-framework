@@ -259,7 +259,9 @@ def read_esp32(path):
         raise ValueError(f'{path}: the lines kept by o1_cmd_path ({len(rows)}, {dup} dropped) are not the lines left '
                          f'after the marked duplicates ({len(kept)}, {n_seg} dropped) (L92)')
     by_seq = {int(r['log_seq']): r for r in kept}
-    for r in rows:                                        # line by line, not only the counts (CS1-16)
+    # line by line, not only the counts (CS1-16). A guard: with the unique log_seq and the equal sequence lists above it
+    # cannot fire (a marked duplicate equals an earlier kept line; o1_cmd_path keeps the first); mutation 17/11 confirms
+    for r in rows:
         k = by_seq[r['_seq']]
         if any(r.get(c) != v for c, v in k.items()):
             raise ValueError(f'{path}: log_seq {r["_seq"]}: o1_cmd_path kept another line than the segments rule (L92)')
