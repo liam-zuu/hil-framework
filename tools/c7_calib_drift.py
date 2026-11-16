@@ -8,7 +8,8 @@ calibrations, and when they differ score the runs twice (O1 v11.28 section 4, ga
 (Recommended)", Q3 "Tinh hong he do (Recommended)", Q4 "Co, quay them (Recommended)"). The spec names
 the threshold eps_H (O1 v11.28; T_H is the labour time of S05). Codex Sol round 1 (CD1-2..11, Liam
 16/11 CODE_CAM "Sua 10 muc + vong 2 (Recommended)"); round 2 (CD2-1..7, Liam 16/11 CODE_CAM "Sua 7 muc +
-vong 3 (Recommended)"); round 3 (CD3-2..6, Liam 16/11 CODE_CAM "Sua 5 muc + Codex vong 4").
+vong 3 (Recommended)"); round 3 (CD3-2..6, Liam 16/11 CODE_CAM "Sua 5 muc + Codex vong 4"); round 4
+(CD4-1, CD4-2, Liam 16/11 CODE_CAM "Sua 2 muc + Codex vong 5").
 
 Why: c7_measure.py track refits the camera POSE on every frame from the 4 corners of the floor marks
 (design 3.6, Huber loss), so a rigid camera move is compensated in the floor mapping; the parallax step
@@ -54,7 +55,7 @@ gop  --drift drift.json --s0-score score.json --s0-track <dir0>/track.json
      esp32 log, U_m, D, k_start, thresholds and clock offset.
      Scope (CD2-5): the task of the score is in drift.tasks and, for K1/K2, its k_start is that of
      drift.json, below eps_H too. All these fields must be present and valid: frame count and decoded
-     sizes positive integers, thresholds finite numbers or text, no null (CD2-6, CD3-5).
+     sizes positive integers, thresholds numbers >= 0 (text only in 'status'), no null (CD2-6, CD3-5, CD4-1).
      not vuot: the H0 score unchanged. vuot: same outcome -> kept, flag calib_drift; different ->
      chua_ket_luan (calib_drift_split); hong_he_do in either -> hong_he_do (Q3, rerun, O1 3.5).
      thieu_H1: chua_ket_luan with flag thieu_H1 (Q2); hong_he_do of H0 stays hong_he_do. The whole H1
@@ -89,6 +90,7 @@ OUTCOMES = ('dat', 'khong_dat', 'chua_ket_luan', 'hong_he_do')
 SAME_KEYS = ('zc_tape_m', 'plumb_xy_m', 'tag_h_m', 'car_side_m', 'width', 'height')     # CD1-5
 SCORE_SAME = ('task', 'U_m', 'D', 'k_start', 'thresholds', 'esp32_sha256', 't0_log_us')  # CD1-4, CD1-6, CD2-4
 TRACK_SAME = ('video_sha256', 'tag_offset', 'frames', 'decoded_shapes')                 # CD2-4: track options
+THRESH_TEXT = ('status',)          # the only text field of c7_score thresholds (metadata); the rest are numbers >= 0
 
 
 def _finite(x, name, lo=None, strict=False):
@@ -425,11 +427,16 @@ def check_score(sc, tr, frames_sha, session_sha, drift, name):
     _finite(sc['D'], f'{name} score D', 0.0)
     _finite(sc['t0_log_us'], f'{name} score t0_log_us')
     th = sc['thresholds']
-    if not isinstance(th, dict) or not any(isinstance(v, (int, float)) and not isinstance(v, bool) for v in th.values()):
+    if not isinstance(th, dict) or not [k for k in th if k not in THRESH_TEXT]:
         raise ValueError(f'{name} score: thresholds {th!r}')
-    for k, v in th.items():                                                       # CD3-5: no null
-        if not isinstance(v, str):
-            _finite(v, f'{name} score thresholds.{k}')
+    for k, v in th.items():                                    # CD3-5, CD4-1: checked key by key, no null
+        if k in THRESH_TEXT:
+            if not isinstance(v, str):
+                raise ValueError(f'{name} score thresholds.{k}: text expected ({v!r})')
+        elif isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ValueError(f'{name} score thresholds.{k}: number expected ({v!r})')
+        else:
+            _finite(v, f'{name} score thresholds.{k}', 0.0)
     _sha(sc['esp32_sha256'], f'{name} score esp32_sha256')
     _sha(sc['frames_sha256'], f'{name} score frames_sha256')
     ks = _triple(sc['k_start'], f'{name} score k_start')

@@ -1,6 +1,6 @@
 """c7_calib_drift.py: compare the clips H of a session, score twice (O1 v11.28 section 4; design
 CLAUDE_THESIS 03_CODE/docs/2026-11-15_Thiet_ke_so_clip_H_dau_cuoi_v1.md; Codex Sol round 1 CD1-2..11,
-round 2 CD2-1..7, round 3 CD3-2..6). Sessions are synthetic: a truth camera sees the TRUE mark positions, the session is
+round 2 CD2-1..7, round 3 CD3-2..6, round 4 CD4-1..2). Sessions are synthetic: a truth camera sees the TRUE mark positions, the session is
 fitted to the mark FILE (as calibrate does)."""
 import itertools
 import json
@@ -249,6 +249,18 @@ def test_tag_offset_enters_the_drift(s0, off):
     assert cd.compare(s0o, s1, ['O1-K1'], ks)['D_H_mm'] == pytest.approx(d['D_H_mm'])
 
 
+def test_tag_offset_is_turned_by_a_body_heading_not_zero(s0):
+    """CD4-2: the cases above have body heading 0 on K1; here K1 runs at 35 deg with a body frame offset
+    and a tag heading offset, against the truth camera (an offset not turned by the heading fails)."""
+    ks, off = (0.8, -0.6, math.radians(35.0)), (0.05, 0.02, math.radians(3.0))
+    cam = warped(0.002)
+    d = cd.compare(s0, make_session(cam), ['O1-K1'], ks, tag_offset=off)
+    truth = truth_error_mm(s0, cam, truth_poses(['O1-K1'], ks), off)
+    assert d['D_mm']['h0_to_h1']['fit']['max'] == pytest.approx(truth, abs=0.02)
+    same = cd.compare(s0, json.loads(json.dumps(s0)), ['O1-K1'], ks, tag_offset=off)
+    assert same['D_H_mm'] < 0.01                                  # same session, offset and heading: 0
+
+
 @pytest.mark.parametrize('bad', [dict(f=0.0), dict(f=float('nan')), dict(f=-900.0), dict(k=[None, 0.0])])
 def test_bad_camera_numbers_refused(s0, bad):
     """CD3-4: f = 0 divided by zero (exit 1); now ValueError."""
@@ -433,7 +445,9 @@ def test_bad_drift_files_refused(bad, two):
                                   'no_D_both', 'no_thresholds_both', 'no_t0_both', 'no_k_start_both',
                                   'score_not_dict', 'track_not_dict', 'score_null', 'track_null',
                                   'D', 'threshold', 'frames_null_both', 'shapes_null_both', 'threshold_null_both',
-                                  'frames_bool', 'shape_zero', 'offset_not_drift_both'])
+                                  'frames_bool', 'shape_zero', 'offset_not_drift_both',
+                                  'threshold_one_null_both', 'threshold_text_both', 'threshold_bool_both',
+                                  'threshold_negative_both', 'status_number_both', 'only_status_both'])
 def test_provenance_and_scoring_set_up_checked(case):
     a, ta, fa = sc('dat'), tr('s0'), 'f0'
     b, tb, fb = sc('dat', frames='f1'), tr('s1', frames='f1'), 'f1'
@@ -504,6 +518,15 @@ def test_provenance_and_scoring_set_up_checked(case):
         ta, tb = dict(ta, frames=True), dict(tb, frames=True)
     elif case == 'shape_zero':
         ta, tb = dict(ta, decoded_shapes=[[0, 1920]]), dict(tb, decoded_shapes=[[0, 1920]])
+    elif case.startswith('threshold_') and case.endswith('_both') and case != 'threshold_null_both':
+        bad_v = {'threshold_one_null_both': None, 'threshold_text_both': 'sai', 'threshold_bool_both': True,
+                 'threshold_negative_both': -0.1}[case]            # CD4-1, CD4-2: one bad key next to good ones
+        t = dict(t_miss=0.25, t_gap=bad_v, status='khoa o C8')
+        a, b = dict(a, thresholds=t), dict(b, thresholds=dict(t))
+    elif case == 'status_number_both':
+        a, b = dict(a, thresholds=dict(t_miss=0.25, status=3)), dict(b, thresholds=dict(t_miss=0.25, status=3))
+    elif case == 'only_status_both':
+        a, b = dict(a, thresholds=dict(status='x')), dict(b, thresholds=dict(status='x'))
     elif case == 'offset_not_drift_both':                    # CD3-2: both tracks agree, the drift does not
         ta, tb = tr('s0', off=(0.03, 0.0, 0.0)), tr('s1', frames='f1', off=(0.03, 0.0, 0.0))
     with pytest.raises(ValueError):
