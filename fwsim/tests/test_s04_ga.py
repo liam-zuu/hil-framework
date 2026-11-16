@@ -896,7 +896,11 @@ def _same_fields(a, b):
     of a that b has not is a G1-G5 field of an s03_doe that writes them (hil feat/s03-gate, S3G-5; CODE 15/11), and
     an e_bao_max in a equals the one of b bit for bit."""
     assert 'e_bao_max' in b and set(b) - set(a) <= {'e_bao_max'}
-    assert all(GATE_FIELD.match(k) for k in set(a) - set(b)), sorted(set(a) - set(b))
+    # the gate columns s03_doe writes (v8.2 GATE_RUN_COLS, B81-3 G1_RUN_COLS 15/11): by name, not a pattern (the
+    # pattern missed g1_t1, g1_t_done_1)
+    gate_cols = set(getattr(s3, 'GATE_RUN_COLS', ())) | set(getattr(s3, 'G1_RUN_COLS', ()))
+    assert set(a) - set(b) <= gate_cols and all(GATE_FIELD.match(k) or k in gate_cols for k in set(a) - set(b)), \
+        sorted(set(a) - set(b) - gate_cols)
     keys = [k for k in b if k != 'e_bao_max']
     assert s3.row_text({k: a[k] for k in keys}) == s3.row_text({k: b[k] for k in keys})
     if 'e_bao_max' in a:

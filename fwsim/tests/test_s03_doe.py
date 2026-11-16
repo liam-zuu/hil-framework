@@ -684,6 +684,11 @@ def _fake_gate_fields(ctrl, g, v):
         q = 1e-3 * x + v + 0.01 * (i + 1)
         f.update({f'{c}_q': q, f'{c}_lo': q - 1e-6, f'{c}_hi': q + 1e-6, f'{c}_n_undef': i,
                   f'{c}_state': 'khong_dat' if bad and c == 'g5' else 'dat'})
+        for j, x_ in enumerate(('q', 'lo', 'hi', 'n_undef')):                 # G1F-2: the 24 B81-3 columns too
+            f[f'{c}_{x_}_chung'] = (i + 10 * j) if x_ == 'n_undef' else q + 1e-4 * (j + 1)
+    f.update(g1_ways=1, g1_t_deadline=40.0 + v, g1_t_done_1=20.0 + 1e-3 * x, g1_t_done_2=None, g1_t1=None if bad else 30.0,
+             g1_prog_before_t1=None if bad else True, g1_cond25_before_deadline=None if bad else (x > 5.0),
+             g1_cat_t1=None)
     return f
 
 
@@ -1428,11 +1433,20 @@ V8_COLS = ['controller', 'point_id', 'box', 'mu', 'v', 'status', 'completed', 'e
 V82_COLS = (['e_bao_max', 'gate_version', 'gate_decide', 'gate_u_t', 'g1_q', 'g1_state']
             + [f'g{i}_{x}' for i in range(2, 6) for x in ('q', 'lo', 'hi', 'n_undef', 'state')] + ['gate_outcome'])
 Q_OF = dict(g2='e_perp_max', g3='e_trk_max', g4='e_bao_max', g5='e_theta_cmd_max_deg')
+# B81-3 G1 fields and the common domain (15/11), after gate_outcome; names of rq3_log GATE_COLS
+G1C_COLS = ([f'g{i}_{x}_chung' for i in range(2, 6) for x in ('q', 'lo', 'hi', 'n_undef')]
+            + ['g1_ways', 'g1_t_deadline', 'g1_t_done_1', 'g1_t_done_2', 'g1_t1', 'g1_prog_before_t1',
+               'g1_cond25_before_deadline', 'g1_cat_t1'])
+G1F = {'true': dict(t_done=[5.0], t_deadline=10.0, t1=None, prog_before_t1=None, cond25_before_deadline=None),
+       'false': dict(t_done=[None], t_deadline=10.0, t1=None, prog_before_t1=None, cond25_before_deadline=None),
+       'inconclusive': dict(t_done=[None], t_deadline=10.0, t1=2.0, prog_before_t1=False,
+                            cond25_before_deadline=True)}
 
 
 def test_v82_columns_appended_after_the_v8_columns():
     assert s3.OLD_COLS == V8_COLS and s3.RUN_COLS[:len(V8_COLS)] == V8_COLS
-    assert s3.GATE_RUN_COLS == V82_COLS and s3.RUN_COLS == V8_COLS + V82_COLS
+    assert s3.GATE_RUN_COLS == V82_COLS and s3.G1_RUN_COLS == G1C_COLS
+    assert s3.RUN_COLS == V8_COLS + V82_COLS + G1C_COLS
     tools = os.path.join(HERE, '..', '..', 'tools')
     if tools not in sys.path:
         sys.path.insert(0, tools)
@@ -1460,10 +1474,11 @@ def _gframes(e_perp, e_trk, e_bao, th):
 def test_v82_gate_fields_are_the_gate_dict(frames, completed, want, outcome):
     """T3: gate_fields copies the o1_gate.gate states and maxima (an edge equal to the threshold passes,
     O1 3.5)."""
-    gt = G.gate(frames, completed, v_cmd_max=0.9, wz_cmd_max=1.1, u_t=s3.GATE_U_T, decide=G.DECIDE_ALL)
+    gt = G.gate(frames, completed, v_cmd_max=0.9, wz_cmd_max=1.1, u_t=s3.GATE_U_T, decide=G.DECIDE_ALL,
+                g1_fields=G1F[completed])
     m = float(np.max(frames['e_bao']))
     f = s3.gate_fields(dict(e_bao_max=m), gt)
-    assert set(f) == set(V82_COLS)
+    assert set(f) == set(V82_COLS) | set(G1C_COLS)
     assert {c: f[f'{c}_state'] for c in want} == want and f['gate_outcome'] == outcome
     assert f['gate_version'] == G.GATE_VERSION and f['gate_decide'] == 'g1,g2,g3,g4,g5' and f['gate_u_t'] == 0.0
     assert f['g1_q'] == {'dat': 'true', 'khong_dat': 'false'}.get(want['g1'], 'inconclusive')
@@ -1471,17 +1486,24 @@ def test_v82_gate_fields_are_the_gate_dict(frames, completed, want, outcome):
     for c in ('g2', 'g3', 'g4', 'g5'):
         assert f[f'{c}_q'] == f[f'{c}_lo'] == f[f'{c}_hi'] == gt[c]['q']      # U = 0 on fwsim
     assert s3.fmt(f['e_bao_max']) == repr(m)
+    # G1F-2: the 24 B81-3 columns are the fields of the gate dict, one by one (here prog != cond25 when inconclusive)
+    g1 = G1F[completed]
+    assert (f['g1_ways'], f['g1_t_deadline'], f['g1_t_done_1'], f['g1_t_done_2'], f['g1_t1'], f['g1_prog_before_t1'],
+            f['g1_cond25_before_deadline'], f['g1_cat_t1']) == (1, g1['t_deadline'], g1['t_done'][0], None, g1['t1'],
+                                                                 g1['prog_before_t1'], g1['cond25_before_deadline'], None)
+    for c in ('g2', 'g3', 'g4', 'g5'):
+        assert [f[f'{c}_{x}_chung'] for x in ('q', 'lo', 'hi', 'n_undef')] == [gt[c][x] for x in ('q', 'lo', 'hi', 'n_undef')]
 
 
 def test_v82_run_error_has_no_gate_values(tmp_path):
     """T4: a run_error row (here: no DLL) has no gate value; the CSV cells are empty."""
     row, log = s3.safe_run(None, None, 'PID', dict(FAKE_DEFAULTS['PID']), 0.8, 0.5)
-    assert row['status'] == 'run_error' and log is None and not set(V82_COLS) & set(row)
+    assert row['status'] == 'run_error' and log is None and not (set(V82_COLS) | set(G1C_COLS)) & set(row)
     p = tmp_path / 'r.csv'
     s3.write_csv(str(p), [dict(controller='PID', point_id=0, box='centre', mu=0.5, v=0.8, **row)], s3.RUN_COLS)
     import csv as _csv
     r = next(_csv.DictReader(open(p)))
-    assert all(r[c] == '' for c in V82_COLS)
+    assert all(r[c] == '' for c in V82_COLS + G1C_COLS)
 
 
 @pytest.fixture(scope='module')
@@ -1513,7 +1535,7 @@ def test_v82_v8_columns_keep_their_bits(path, v82_runs):
         res, _ = o1.evaluate_v7(log, path, sch, lsum=p.lx + p.ly)
         old = {k: res[k] for k in V8_COLS[5:] if k in res}
         old.update(pos_reset_mid=fwsim.run_validity(log)['pos_reset_mid'])
-        assert set(row) - set(V82_COLS) == set(old), (ctrl, v)
+        assert set(row) - set(V82_COLS) - set(G1C_COLS) == set(old), (ctrl, v)
         assert {k: s3._bits(row[k]) for k in old} == {k: s3._bits(old[k]) for k in old}, (ctrl, v)
 
 
@@ -1545,7 +1567,7 @@ def test_v82_main_writes_the_gate_columns_and_meta(tmp_path, monkeypatch, capsys
     code, out, _, _, _ = _run_main(tmp_path, monkeypatch, capsys)
     assert code == 0
     for f in ('sealed/runs.csv', 'sealed_test/runs_test.csv'):
-        assert next(_csv.reader(open(out / f))) == V8_COLS + V82_COLS, f
+        assert next(_csv.reader(open(out / f))) == V8_COLS + V82_COLS + G1C_COLS, f
     assert next(_csv.reader(open(out / 'sweep.csv'))) == list(s3.SWEEP_ID_COLS) + s3.RUN_COLS[5:]   # S3G2-3
     # S3G-3: the VALUES reach the three files (fake gate fields differ per gains and speed)
     gains = {(d['controller'], d['point_id']): {n: float(d[f'{n}_value']) for n in s3.FACTORS[d['controller']]}
@@ -1554,14 +1576,18 @@ def test_v82_main_writes_the_gate_columns_and_meta(tmp_path, monkeypatch, capsys
     for f in ('sealed/runs.csv', 'sealed_test/runs_test.csv'):
         for r in _csv.DictReader(open(out / f)):
             want = _fake_gate_fields(r['controller'], gains[(r['controller'], r['point_id'])], float(r['v']))
-            assert {c: r[c] for c in V82_COLS} == {c: str(s3.fmt(want[c])) for c in V82_COLS}, (f, r['point_id'])
+            cols = V82_COLS + G1C_COLS                                            # G1F-2: the B81-3 columns too
+            assert {c: r[c] for c in cols} == {c: str(s3.fmt(want[c])) if want[c] is not None else '' for c in cols}, \
+                (f, r['point_id'])
             n += 1
     for r in _csv.DictReader(open(out / 'sweep.csv')):
         g = dict(FAKE_DEFAULTS[r['controller']])
         if not r['factor'].startswith('('):
             g[r['factor']] = float(r['value'])
         want = _fake_gate_fields(r['controller'], g, float(r['v']))
-        assert {c: r[c] for c in V82_COLS} == {c: str(s3.fmt(want[c])) for c in V82_COLS}, (r['factor'], r['value'])
+        cols = V82_COLS + G1C_COLS
+        assert {c: r[c] for c in cols} == {c: str(s3.fmt(want[c])) if want[c] is not None else '' for c in cols}, \
+            (r['factor'], r['value'])
         n += 1
     assert n > 2 * (271 * 3 + 300)
     meta = (out / 'meta.yaml').read_text(encoding='utf-8')
@@ -1885,3 +1911,23 @@ def test_v83_main_writes_levels_sources_luoi_and_grid_meta(tmp_path, monkeypatch
     grid_meta = _json.loads(next(x for x in meta.splitlines() if x.startswith('grid: ')).split('   #')[0][6:])
     assert set(grid_meta) == {f'{c} {n}' for c in s3.CONTROLLERS for n in s3.FACTORS[c]}
     assert grid_meta['PID ki_xy']['K'] == 4 and grid_meta['ADRC omega_o_xy']['b_n'] is None
+
+
+@needs_dll
+def test_b813_g1_fields_on_real_runs(v82_runs):
+    """B81-3 (15/11): on real DLL runs, the G1 fields agree with completed and the run, the common domain is the
+    union one, and G1 recomputed from the fields is g1_state."""
+    for ctrl, v, row, _ in v82_runs:
+        assert row['g1_ways'] == 1 and row['g1_t_done_2'] is None and row['g1_cat_t1'] is None
+        assert row['g1_t_deadline'] == o1.Schedule(v).Tcmd + o1.T_LATE        # G1F-2: the deadline itself
+        if row['completed'] == 'true':
+            assert row['g1_t_done_1'] == row['t_end'] < row['g1_t_deadline']
+        else:
+            assert row['g1_t_done_1'] is None
+        assert (row['g1_t1'] is None) == (row['status'] == 'ok')
+        f = dict(t_done=[row['g1_t_done_1']], t_deadline=row['g1_t_deadline'], t1=row['g1_t1'],
+                 prog_before_t1=row['g1_prog_before_t1'], cond25_before_deadline=row['g1_cond25_before_deadline'])
+        assert G.g1_state_from_fields(f) == row['g1_state'], (ctrl, v)
+        for c in Q_OF:
+            for x in ('q', 'lo', 'hi', 'n_undef'):
+                assert s3._bits(row[f'{c}_{x}_chung']) == s3._bits(row[f'{c}_{x}'])

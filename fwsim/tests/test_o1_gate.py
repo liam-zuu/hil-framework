@@ -201,3 +201,118 @@ def test_nan_frames_count_as_undefined_and_never_pass():
     f['e_trk'][3] = NAN
     g = G.gate(f, 'true', v_cmd_max=0.7, wz_cmd_max=1.6, u_t=0.0)
     assert g['g3']['n_undef'] == 1 and g['g3']['state'] == 'chua_ket_luan' and g['outcome'] == 'chua_ket_luan'
+
+
+# ── B81-3 G1 fields and the common domain (15/11; design 03_CODE/docs/2026-11-15_Thiet_ke_bo_cham_fwsim_G1_v1.md) ──
+
+def _rq3():
+    tools = os.path.join(HERE, '..', '..', 'tools')
+    if tools not in sys.path:
+        sys.path.insert(0, tools)
+    import rq3_log
+    return rq3_log
+
+
+# (completed, fields) for every branch of O1 3.5 last block, one way of using the frames
+G1_CASES = [
+    ('true', dict(t_done=[30.0], t_deadline=40.0, t1=None, prog_before_t1=None, cond25_before_deadline=None)),
+    ('false', dict(t_done=[None], t_deadline=40.0, t1=None, prog_before_t1=None, cond25_before_deadline=None)),
+    ('true', dict(t_done=[30.0], t_deadline=40.0, t1=35.0, prog_before_t1=True, cond25_before_deadline=True)),
+    ('false', dict(t_done=[None], t_deadline=40.0, t1=12.0, prog_before_t1=True, cond25_before_deadline=False)),
+    ('inconclusive', dict(t_done=[None], t_deadline=40.0, t1=12.0, prog_before_t1=False, cond25_before_deadline=True)),
+    ('false', dict(t_done=[None], t_deadline=40.0, t1=12.0, prog_before_t1=False, cond25_before_deadline=False)),
+]
+
+
+def test_g1_fields_absent_keeps_the_dict_as_before():
+    g = G.gate(_frames(), 'true', v_cmd_max=0.7, wz_cmd_max=1.6, u_t=0.0)
+    assert set(g['g1']) == {'q', 'state'} and not any('chung' in g[c] for c in G.MEASURED)
+
+
+@pytest.mark.parametrize('completed, f', G1_CASES)
+def test_g1_fields_written_checked_and_accepted_by_rq3_log(completed, f):
+    """The fields reach g1, the common domain equals the union one, G1 from the fields is the state from
+    completed (as rq3_log.gate_g1_state), and rq3_log.validate_gate accepts the gate and recomputes it."""
+    g = G.gate(_frames(), completed, v_cmd_max=0.7, wz_cmd_max=1.6, u_t=0.0, g1_fields=f)
+    assert {k: g['g1'][k] for k in f} == f and g['g1']['state'] == G.g1_state(completed)
+    for c in G.MEASURED:
+        assert g[c]['chung'] == {k: g[c][k] for k in ('q', 'lo', 'hi', 'n_undef')}
+    r = _rq3()
+    assert r.gate_g1_state(r.gate_g1_fields(g['g1'], 'SIM')) == g['g1']['state']
+    ev = r.validate_gate(g, 'SIM')
+    assert ev['outcome'] == g['outcome']
+
+
+def test_g1_fields_that_disagree_with_completed_are_an_error():
+    for completed, f in G1_CASES:
+        for other in ('true', 'false', 'inconclusive'):
+            if G.g1_state(other) == G.g1_state(completed):
+                continue
+            with pytest.raises(ValueError, match='B81-3'):
+                G.gate(_frames(), other, v_cmd_max=0.7, wz_cmd_max=1.6, u_t=0.0, g1_fields=f)
+    with pytest.raises(ValueError, match='g1_fields'):
+        G.gate(_frames(), 'true', v_cmd_max=0.7, wz_cmd_max=1.6, u_t=0.0, g1_fields=dict(G1_CASES[0][1], t1x=1))
+    with pytest.raises(ValueError, match='g1_fields'):
+        G.gate(_frames(), 'true', v_cmd_max=0.7, wz_cmd_max=1.6, u_t=0.0,
+               g1_fields=dict(G1_CASES[0][1], t_done=[30.0, 31.0]))
+
+
+_OK = dict(t_done=[30.0], t_deadline=40.0, t1=None, prog_before_t1=None, cond25_before_deadline=None)
+
+
+@pytest.mark.parametrize('completed, f, why', [
+    ('true', dict(_OK, t_done=[40.0]), 'not before t_deadline'),                 # Codex G1F-1 counterexample
+    ('true', dict(_OK, t_done=[-1.0]), 'finite time'),
+    ('true', dict(_OK, t_done=[NAN]), 'finite time'),
+    ('true', dict(_OK, t_deadline=NAN), 'finite time'),
+    ('true', dict(_OK, t_deadline=None), 'finite time'),
+    ('true', dict(_OK, t_deadline=True), 'finite time'),
+    ('true', dict(_OK, t_done=['30.0']), 'finite time'),                        # G1F2-1: numeric strings
+    ('true', dict(_OK, t_deadline='40.0'), 'finite time'),
+    ('true', dict(_OK, t1='35.0', prog_before_t1=True, cond25_before_deadline=True), 'finite time'),
+    ('true', dict(_OK, t1=INF, prog_before_t1=True, cond25_before_deadline=True), 'finite time'),
+    ('true', dict(_OK, t1=35.0, prog_before_t1=1, cond25_before_deadline=True), 'boolean'),
+    ('true', dict(_OK, cond25_before_deadline=True), 'without t1'),
+    ('true', dict(_OK, t1=35.0, prog_before_t1=None, cond25_before_deadline=True), 'are needed|B81-3'),  # cross-check first
+    ('false', dict(_OK, t_done=[None], t1=12.0, prog_before_t1=False, cond25_before_deadline=None), 'are needed'),
+    ('inconclusive', dict(_OK, t_done=[30.0], t1=12.0, prog_before_t1=False, cond25_before_deadline=True),
+     'only for a completed run'),
+])
+def test_g1_fields_checked_like_rq3_log(completed, f, why):
+    """G1F-1: fields that rq3_log.gate_g1_fields refuses, or a t_done on a run not completed, are refused by
+    gate() before anything is written."""
+    with pytest.raises(ValueError, match=why):
+        G.gate(_frames(), completed, v_cmd_max=0.7, wz_cmd_max=1.6, u_t=0.0, g1_fields=f)
+    r = _rq3()
+    if why != 'only for a completed run':                            # the extra rule of gate(), not in rq3_log
+        with pytest.raises((r.LogError, ValueError, TypeError)):
+            r.gate_g1_fields(dict(f, q='true', state='dat'), 'SIM')
+
+
+class _FloatInfAsFloat(float):          # stored value finite, float(x) inf
+    def __float__(self):
+        return INF
+
+
+class _FloatFiniteAsFloat(float):       # stored value inf, float(x) finite
+    def __float__(self):
+        return 35.0
+
+
+@pytest.mark.parametrize('t1, ok', [(_FloatInfAsFloat(35.0), False), (_FloatFiniteAsFloat(INF), True)])
+def test_g1_times_judged_as_rq3_log_on_float_subclasses(t1, ok):
+    """G1F3-1 (Codex round 3): the finiteness of a time is that of float(x), as rq3_log._time, so a float subclass
+    that overrides __float__ is accepted or refused the same way by gate() and by rq3_log."""
+    f = dict(_OK, t1=t1, prog_before_t1=True, cond25_before_deadline=True)
+    r = _rq3()
+    try:
+        r.gate_g1_fields(dict(f, q='true', state='dat'), 'SIM')
+        rq3_ok = True
+    except r.LogError:
+        rq3_ok = False
+    assert rq3_ok == ok
+    if ok:
+        G.gate(_frames(), 'true', v_cmd_max=0.7, wz_cmd_max=1.6, u_t=0.0, g1_fields=f)
+    else:
+        with pytest.raises(ValueError, match='finite time'):
+            G.gate(_frames(), 'true', v_cmd_max=0.7, wz_cmd_max=1.6, u_t=0.0, g1_fields=f)

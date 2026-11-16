@@ -201,12 +201,62 @@ def evaluate_outcomes(g: dict, decide: Iterable[str]) -> dict:
                 any_certain_fail=any(g[c]['state'] == 'khong_dat' for c in dec))
 
 
+G1_FIELD_KEYS = ('t_done', 't_deadline', 't1', 'prog_before_t1', 'cond25_before_deadline')
+
+
+def g1_state_from_fields(f: dict) -> str:
+    """G1 from its B81-3 fields, one way of using the frames (fwsim, HIL; O1 3.5 last block), the rule of
+    tools/rq3_log.gate_g1_state for one way."""
+    done = f['t_done'][0] is not None
+    if f['t1'] is None or f['prog_before_t1']:
+        return 'dat' if done else 'khong_dat'
+    return 'chua_ket_luan' if f['cond25_before_deadline'] else 'khong_dat'
+
+
+def check_g1_fields(f: dict, state: str) -> None:
+    """G1F-1 (Codex round 1): the B81-3 G1 fields of one way of using the frames, checked as
+    tools/rq3_log.gate_g1_fields does for fwsim / HIL (not imported: tools/ is not in the S04 blob lock), plus
+    t_done given exactly when G1 is 'dat' (state from completed). ValueError on any failure."""
+    if not isinstance(f, dict) or set(f) != set(G1_FIELD_KEYS):
+        raise ValueError(f'g1_fields {sorted(f) if isinstance(f, dict) else f!r}: the keys {G1_FIELD_KEYS}')
+    td = f['t_done']
+    if not isinstance(td, list) or len(td) != 1:
+        raise ValueError(f'g1_fields t_done {td!r}: a list of one time (one way of using the frames)')
+
+    def time(x, what, null_ok=True):
+        if x is None and null_ok:
+            return None
+        # G1F2-1: a number of type int / float (not bool, not a numeric string), as rq3_log._time
+        if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(float(x)) or x < 0:   # G1F3-1
+            raise ValueError(f'g1_fields {what} {x!r}: {"null or " if null_ok else ""}a finite time >= 0')
+        return float(x)
+    t_dl = time(f['t_deadline'], 't_deadline', null_ok=False)
+    t_done = time(td[0], 't_done')
+    if t_done is not None and not t_done < t_dl:
+        raise ValueError(f'g1_fields t_done {t_done!r} not before t_deadline {t_dl!r} (O1 3.4 condition 4)')
+    t1 = time(f['t1'], 't1')
+    for k in ('prog_before_t1', 'cond25_before_deadline'):
+        if f[k] is not None and not isinstance(f[k], bool):
+            raise ValueError(f'g1_fields {k} {f[k]!r}: null or a boolean')
+    prog, c25 = f['prog_before_t1'], f['cond25_before_deadline']
+    if t1 is None and (prog is not None or c25 is not None):
+        raise ValueError('g1_fields: prog_before_t1 / cond25_before_deadline without t1')
+    if t1 is not None and (prog is None or (not prog and c25 is None)):
+        raise ValueError('g1_fields: with t1, prog_before_t1, and cond25_before_deadline when not prog, are needed')
+    if (t_done is not None) != (state == 'dat'):
+        raise ValueError(f'g1_fields t_done {t_done!r} with G1 {state!r}: a time only for a completed run')
+
+
 def gate(frames: dict, completed, *, v_cmd_max: float, wz_cmd_max: float, u_t: Optional[float],
          u_p: float = 0.0, u_psi_deg: float = 0.0, decide: Iterable[str] = DECIDE_ALL, status: str = '',
-         note: str = '') -> dict:
+         note: str = '', g1_fields: Optional[dict] = None) -> dict:
     """G1-G5 of one run. frames: per-frame arrays FRAME_KEYS (e_perp, e_trk, e_bao [m], e_theta_cmd_deg
     = |heading error| [deg]) on the scored frames; completed: the evaluator's G1 value.
-    u_t: bound of the time offset of the command start [s], or None = not known (G3, G5 inconclusive)."""
+    u_t: bound of the time offset of the command start [s], or None = not known (G3, G5 inconclusive).
+    g1_fields (B81-3, one way of using the frames: o1_gate_eval.g1_fields_v7): when given, the g1 block also holds
+    t_done, t_deadline, t1, prog_before_t1, cond25_before_deadline, G1 recomputed from them must equal the state
+    from completed (else ValueError), and g2..g5 hold the common domain 'chung' {q, lo, hi, n_undef}, equal to the
+    union one (one frame domain). None (default): the dict is as before."""
     decide = check_decide(decide)
     if u_p != 0.0 or u_psi_deg != 0.0:
         raise ValueError('U_p, U_psi > 0 (camera): G4 needs the projection solutions within 2 U_p (O1 3.4); '
@@ -227,6 +277,18 @@ def gate(frames: dict, completed, *, v_cmd_max: float, wz_cmd_max: float, u_t: O
         q = np.asarray(frames[FRAME_KEYS[c]], dtype=float)
         lo, hi = frame_bounds(q, us[c])
         g[c] = dict(aggregate(q, lo, hi, THRESHOLDS[c]), u=us[c])
+    if g1_fields is not None:
+        if set(g1_fields) != set(G1_FIELD_KEYS) or not (isinstance(g1_fields['t_done'], list)
+                                                       and len(g1_fields['t_done']) == 1):
+            raise ValueError(f'g1_fields {sorted(g1_fields)!r}: {G1_FIELD_KEYS}, t_done a list of one time')
+        st = g1_state_from_fields(g1_fields)
+        if st != g['g1']['state']:
+            raise ValueError(f'B81-3: G1 from t_done, t1 and the flags is {st!r}, from completed {completed!r} it is '
+                             f'{g["g1"]["state"]!r}')
+        check_g1_fields(g1_fields, g['g1']['state'])                       # G1F-1: the rq3_log field checks
+        g['g1'].update({k: (list(v) if k == 't_done' else v) for k, v in g1_fields.items()})
+        for c in MEASURED:
+            g[c]['chung'] = {k: g[c][k] for k in ('q', 'lo', 'hi', 'n_undef')}
     ratios = [g[k]['ratio'] for k in MEASURED if _finite(g[k]['ratio'])]
     return dict(version=GATE_VERSION, D=D, theta_max_deg=THETA_MAX_DEG, v_cmd_max=v_cmd_max,
                 wz_cmd_max=wz_cmd_max, u_p=u_p, u_psi_deg=u_psi_deg, u_t=u_t, **g,

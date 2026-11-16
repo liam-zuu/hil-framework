@@ -131,13 +131,19 @@ OLD_COLS = ['controller', 'point_id', 'box', 'mu', 'v', 'status', 'completed', '
             'n_upper_frames', 'n_back_frames',      # S03 v8 section 4 (W8-Q (b)): diagnostics, not responses
             'error']                                # RMS: S3C-13; error: S3C-12
 # S03 v8.2 section 7: e_bao_max and the G1-G5 states (o1_gate.py, U = 0), appended after the S03 v8 columns.
-# Names as tools/rq3_log.py GATE_COLS (B81-3); not written: gate_json_sha256 (no gate file per run), the
-# _chung columns (one frame domain on fwsim: common = union) and the G1 fields t_done... (deferred for the
-# fwsim scorer, Liam 14/11 CODE_R134 "De goi rieng sau"). gate_outcome: O1 3.5 over G1-G5.
+# Names as tools/rq3_log.py GATE_COLS (B81-3); not written: gate_json_sha256 (no gate file per run). The _chung
+# columns and the G1 fields are G1_RUN_COLS below (15/11; deferred before, Liam 14/11 CODE_R134 "De goi rieng
+# sau"). gate_outcome: O1 3.5 over G1-G5.
 GATE_RUN_COLS = (['e_bao_max', 'gate_version', 'gate_decide', 'gate_u_t', 'g1_q', 'g1_state']
                  + [f'{c}_{x}' for c in G.MEASURED for x in ('q', 'lo', 'hi', 'n_undef', 'state')]
                  + ['gate_outcome'])
-RUN_COLS = OLD_COLS + GATE_RUN_COLS
+# B81-3 G1 fields and the common domain (design 03_CODE/docs/2026-11-15_Thiet_ke_bo_cham_fwsim_G1_v1.md; Liam 15/11
+# CODE_FEAS "code di"): names of tools/rq3_log.py GATE_COLS; one way of using the frames on fwsim, so g1_ways = 1,
+# g1_t_done_2 and g1_cat_t1 (floor fields) empty and the _chung columns equal the union ones
+G1_RUN_COLS = ([f'{c}_{x}_chung' for c in G.MEASURED for x in ('q', 'lo', 'hi', 'n_undef')]
+               + ['g1_ways', 'g1_t_deadline', 'g1_t_done_1', 'g1_t_done_2', 'g1_t1', 'g1_prog_before_t1',
+                  'g1_cond25_before_deadline', 'g1_cat_t1'])
+RUN_COLS = OLD_COLS + GATE_RUN_COLS + G1_RUN_COLS
 LEVEL_COLS = ['controller', 'factor', 'L', 'H', 'centre', 'scale', 'default', 'rule_note',     # S03 v8
               'a', 'b', 'b_n', 'L_nguon', 'H_nguon']                                          # S03 v8.3 (S83-1: fixed)
 SWEEP_ID_COLS = ('controller', 'factor', 'value', 'is_default', 'luoi', 'v', 'mu')   # sweep.csv identifiers (section 7; luoi: v8.3)
@@ -213,7 +219,7 @@ def run_one(fw, path, ctrl, g, v, mu):
         raise RuntimeError(f"pose reset mid-run in fwsim ({val['run_bad_reason']})")
     v_cmd_max, wz_cmd_max = cmd_max(sch)
     gt = G.gate(frames, res['completed'], v_cmd_max=v_cmd_max, wz_cmd_max=wz_cmd_max, u_t=GATE_U_T,
-                decide=G.DECIDE_ALL, status=res['status'])
+                decide=G.DECIDE_ALL, status=res['status'], g1_fields=E.g1_fields_v7(res))
     row = {k: res[k] for k in OLD_COLS[5:] if k in res}          # responses only (no controller..v keys)
     row.update(pos_reset_mid=val['pos_reset_mid'])
     row.update(gate_fields(res, gt))
@@ -239,8 +245,14 @@ def gate_fields(res, gt):
     for c in G.MEASURED:
         for x in ('q', 'lo', 'hi', 'n_undef', 'state'):
             out[f'{c}_{x}'] = gt[c][x]
-    if set(out) != set(GATE_RUN_COLS):
-        raise RuntimeError(f'gate fields {sorted(set(out) ^ set(GATE_RUN_COLS))} do not match GATE_RUN_COLS')
+        for x in ('q', 'lo', 'hi', 'n_undef'):
+            out[f'{c}_{x}_chung'] = gt[c]['chung'][x]           # B81-3 common domain (one domain)
+    g1 = gt['g1']
+    out.update(g1_ways=len(g1['t_done']), g1_t_deadline=g1['t_deadline'], g1_t_done_1=g1['t_done'][0],
+               g1_t_done_2=None, g1_t1=g1['t1'], g1_prog_before_t1=g1['prog_before_t1'],
+               g1_cond25_before_deadline=g1['cond25_before_deadline'], g1_cat_t1=None)
+    if set(out) != set(GATE_RUN_COLS) | set(G1_RUN_COLS):
+        raise RuntimeError(f'gate fields {sorted(set(out) ^ (set(GATE_RUN_COLS) | set(G1_RUN_COLS)))} do not match')
     return out
 
 
@@ -499,7 +511,8 @@ def _rel_here(p):
 def gate_meta():
     """meta.yaml 'gate' (S03 v8.2): versions and settings of the G1-G5 scoring."""
     return dict(version=G.GATE_VERSION, eval_version=E.EVAL_VERSION, u_t=GATE_U_T, u_p=0.0, u_psi_deg=0.0,
-                decide=list(G.DECIDE_ALL), thresholds=G.THRESHOLDS, columns=GATE_RUN_COLS)
+                decide=list(G.DECIDE_ALL), thresholds=G.THRESHOLDS, columns=GATE_RUN_COLS,
+                g1_columns=G1_RUN_COLS, g1_fields='o1_gate_eval.g1_fields_v7 (B81-3, one way of using the frames)')
 
 
 def evaluator_sha256():
@@ -1361,8 +1374,9 @@ interpretations:   # of this script, not written in S03 v8 / O1 v7; Liam or THES
   - "v8 (S3V8-2): warnings, prints and tracebacks of the test phase go to sealed_test/diag.txt and any exception of the phase, writing its outputs included, is a stop recorded in sealed_test/stop.json (written first; R2-1); the warning policy in force is kept, a warning made an error stays an error (R2-3); the same channel in the main design (warnings to the console) is left as before (deferred, Codex S3V8-2)"
   - "v8: n_upper_frames, n_back_frames count the frames evaluate_v7 kept for scoring (t_k <= t_end), as section 4 defines them; they are diagnostics, never responses"
   - "v8.2: every run (sweep, main design, axial, test set, determinism reruns) is scored by o1_gate_eval.evaluate_fig8, which calls evaluate_v7 unchanged (the S03 v8 columns keep their values), then o1_gate.gate with u_t = 0 (fwsim knows the command start; the 50 Hz hold is a property of the command path, not added to U, o1_gate docstring), U_p = U_psi = 0 (true plant pose) and every condition deciding (DECIDE_ALL)"
-  - "v8.2: G1-G5 columns use the names of tools/rq3_log.py GATE_COLS (B81-3); gate_json_sha256, the _chung columns (one frame domain on fwsim: the common domain is the union) and the G1 fields t_done... (fwsim scorer, deferred: Liam 14/11 CODE_R134) are not written; gate_outcome is the O1 3.5 outcome over G1-G5; with U = 0, lo = hi = q"
+  - "v8.2: G1-G5 columns use the names of tools/rq3_log.py GATE_COLS (B81-3); gate_json_sha256 is not written; gate_outcome is the O1 3.5 outcome over G1-G5; with U = 0, lo = hi = q"
   - "v8.2: a failure of the gate scoring (e.g. the rebuilt nearest distance of G4 not the row e_perp) is a run_error, so S03 stops (B8b-20) as for a DLL error"
+  - "B81-3 (15/11, Liam CODE_FEAS 'code di'): the G1 fields of O1 3.5 last block and the common domain are written (G1_RUN_COLS after gate_outcome): t_done = t_end when completed 'true', t1 = first tracking-error frame, prog_before_t1 = progress strictly before t1, cond25_before_deadline = cond2_5_ever (o1_gate_eval.g1_fields_v7, from the evaluate_v7 summary, which is unchanged); G1 recomputed from them must agree with the state from completed (o1_gate.gate raises, so a run_error); one way of using the frames: g1_ways 1, g1_t_done_2 and g1_cat_t1 empty, _chung the same as the union; gate_version stays gate_v3.2 (tools/rq3_log.py accepts only that version)"
   - "v8.3: the sweep grid is the v8 grid (sweep_grid, unchanged; C12 keeps it for its box [a, b]) plus b r^k, k = 1..K, r = (b/a)^(1/10), K the smallest integer with r^K >= 10 (1 - 1e-9), found by a loop on r**k; omega_o is not extended (cap 48); the level rule runs on the extended grid"
   - "v8.3 (agreed with CODE_C13 15/11): luoi of the default value is mac_dinh even when it is on a log point, the (default check) and (default) rows are mac_dinh; H_nguon of omega_o at the top of its grid is 'trần ω_o'; L_nguon 'hết lưới dưới' when L is the lowest grid point and L > 0"
   - "v8.2: the public sweep carries the G columns too (Liam 14/11 CODE_FEAS 'Co, mot cach cham'); G3-G5 are not responses of section 5"

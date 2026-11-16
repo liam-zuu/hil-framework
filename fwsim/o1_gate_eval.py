@@ -179,6 +179,22 @@ def _summary_g4(out, e_bao, n_sol):
     return out
 
 
+def g1_fields_v7(out):
+    """B81-3 G1 fields of one fwsim run (one way of using the frames; O1 3.5 last block) from the evaluate_v7 /
+    evaluate_fig8 summary out, which stays unchanged (design 03_CODE/docs/2026-11-15_Thiet_ke_bo_cham_fwsim_G1_v1.md;
+    the same comparisons as tools/hil_o1_score.add_b81_3 on HIL and as the 'completed' of evaluate_v7):
+      t_done [t_end] when completed 'true', else [None]; t_deadline; t1 the first tracking-error frame (None when
+      none); with t1: prog_before_t1 = progress reached S - D_d at a frame strictly before t1, cond25_before_deadline
+      = a frame before the deadline with conditions 2-5 met (cond2_5_ever); without t1 both None."""
+    def opt(x):
+        return None if x is None or not math.isfinite(float(x)) else float(x)
+    t1, t_prog = opt(out.get('t_first_track_err')), opt(out.get('t_progress'))
+    return dict(t_done=[float(out['t_end']) if out['completed'] == 'true' else None],
+                t_deadline=float(out['t_deadline']), t1=t1,
+                prog_before_t1=None if t1 is None else bool(t_prog is not None and t_prog < t1),
+                cond25_before_deadline=None if t1 is None else bool(out['cond2_5_ever']))
+
+
 def evaluate_fig8(log, path, sch, lsum=0.24):
     """evaluate_v7 (unchanged) + G4 and the per-frame values. Returns (summary, rows, frames)."""
     out, rows = O.evaluate_v7(log, path, sch, lsum)
