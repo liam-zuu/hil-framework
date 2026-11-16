@@ -128,3 +128,14 @@ def test_old_metrics_without_status_refused(tmp_path):
     (d / 'metrics.csv').write_text('run_id,platform,controller,test_id,e_vx\nr,sim,PID,A-L2,0.1\n', encoding='utf-8')
     with pytest.raises(ValueError, match='no status column'):
         C.load([str(d)])
+
+
+def test_label_needs_the_whole_ci_inside_plus_minus_qrms(tmp_path):
+    """A CI that only overlaps +-qrms (one end outside) gets no below-resolution label."""
+    q = M.QRMS['e_vx']
+    a = [10 * q, 10 * q + 1e-5, 10 * q - 1e-5]
+    b = [10 * q + 0.8 * q, 10 * q + 0.9 * q, 10 * q + 1.1 * q]       # delta about 0.9 qrms, CI past qrms
+    rows, info = C.load([write(str(tmp_path / 's'), runs('sim', 'PID', a, metric='e_vx')),
+                         write(str(tmp_path / 'h'), runs('hil', 'PID', b, metric='e_vx'))])
+    x = line(C.compare(rows, info), 'e_vx', 'sim', 'hil')
+    assert x['ci_low'] < q < x['ci_high'] and x['label'] == ''

@@ -125,6 +125,7 @@ def test_e_wz_follows_wz_meas_not_encoder_wz():
     m = hil(mk('A-C2', wz_off=0.1), 'A-C2')
     assert m['e_wz'] == pytest.approx(0.1) and m['e_vx'] == pytest.approx(0.0, abs=1e-12)
     assert m['wz_src_enc_frac'] == 0.0
+    assert m['e_yaw_imu'] == pytest.approx(0.0, abs=1e-12)              # gz_fused, not wz_meas
 
 
 def test_pwm_tv_uses_the_dut_clock_with_jittered_ticks():
@@ -296,3 +297,45 @@ def test_column_info_of_step_columns():
     i = M.column_info('rise_s_true_seg2')
     assert i['family'] == 'R' and i['unit'] == 's' and i['kind'] == 'metric' and i['nonneg']
     assert M.column_info('no90_seg3')['kind'] == 'flag' and M.column_info('frac90_seg2')['nonneg'] is False
+
+
+def test_sat_pct_is_the_share_of_saturated_ticks():
+    log = mk()
+    log['sat_fl'] = 0.5 * (log['tick'] - log['tick'][0])                # half the ticks of FL saturated
+    m = hil(log)
+    assert m['sat_pct'] == pytest.approx(50.0 / 4)
+
+
+def test_loss_just_over_one_percent_and_repeated_ticks():
+    n = len(mk()['tick'])
+    drop = np.zeros(n, bool)
+    drop[np.arange(100, n, 67)] = True                                 # about 1.5 % of the lines
+    m = hil(mk(drop=drop))
+    assert 1.0 < m['missing_pct'] < 2.0 and m['missing_over'] == 1
+    log = mk()
+    rep = np.r_[np.arange(n), np.arange(200, 210)]                     # 10 ticks logged twice: not a loss
+    for c in list(log):
+        if not c.startswith('_'):
+            log[c] = log[c][np.sort(rep)]
+    m = hil(log)
+    assert m['missing_pct'] == 0.0
+
+
+@pytest.mark.parametrize('who', ['plant', 'firmware'])
+def test_heading_errors_are_wrapped(who):
+    """A heading that turns 0.8 rad/s more than the command (plant), or than the plant (firmware pose): the error
+    passes pi inside the window (A-L2: 4.8 rad at 6 s); e_psi, e_est_psi are |wrap(.)| <= pi."""
+    extra = lambda x: 0.8 * np.clip(x, 0, None)                      # noqa: E731
+    if who == 'firmware':
+        log = mk(pose=lambda x: tuple(R.pose_ref('A-L2', [x])[0][:2]) + (float(extra(x)),))
+        pl = plant_of(log)
+    else:
+        log = mk()
+        pl = plant_of(log)
+        pl['theta'] = R.wrap(pl['theta'] + extra((log['timestamp_us'] - T0) * 1e-6))
+    m = hil(log, plant=pl)
+    t = (log['timestamp_us'] - T0) * 1e-6
+    e = np.abs(R.wrap(extra(t[(t >= 1) & (t <= 6)])))
+    k = 'e_psi' if who == 'plant' else 'e_est_psi'
+    assert m[f'{k}_max'] <= math.pi + 1e-9 and m[f'{k}_max'] == pytest.approx(e.max(), abs=1e-9)
+    assert m[f'{k}_rms'] == pytest.approx(math.sqrt(np.mean(e ** 2)), abs=1e-9)

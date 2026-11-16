@@ -129,3 +129,25 @@ def test_empty_segment_is_nan():
     t = np.arange(0, 3.0, 0.01)
     q = R.step_quantities(t, np.zeros(len(t)), 'A-K1')
     assert math.isnan(q['rise_s_seg2']) and math.isnan(q['e_xl_seg3'])
+
+
+def test_strafe_moves_left_of_the_heading():
+    """A pure lateral command (vy > 0) moves the pose to the left of the heading: +y at heading 0, -x at pi/2
+    (the vy terms of the exact pose integration)."""
+    u = np.tile([0.0, 0.2, 0.0], (50, 1))                              # 1 s of vy = 0.2 m/s
+    for psi0, want in ((0.0, (0.0, 0.2)), (math.pi / 2, (-0.2, 0.0))):
+        p = R.pose_ref('A-S1', [1.0], u=u, psi0=psi0)[0]
+        assert (p[0], p[1]) == pytest.approx(want, abs=1e-12) and p[2] == pytest.approx(psi0)
+    u = np.tile([0.0, 0.2, 0.5], (50, 1))                              # strafe while turning: an arc
+    p = R.pose_ref('A-S1', [1.0], u=u, psi0=0.0)[0]
+    assert p[0] == pytest.approx(-0.2 * (1 - math.cos(0.5)) / 0.5, abs=1e-12)
+    assert p[1] == pytest.approx(0.2 * math.sin(0.5) / 0.5, abs=1e-12)
+
+
+def test_frac90_weights_lines_by_the_time_they_hold():
+    """Lines 10 ms apart before the response, then 0.5 s apart: frac90 is the time share (2.5 s of 3 s), not the
+    line share."""
+    t = np.r_[np.arange(300, 350) / 100.0, [3.5, 4.0, 4.5, 5.0, 5.5]]
+    v = np.r_[np.zeros(50), np.full(5, 0.3)]
+    q = R.step_quantities(t, v, 'A-K1')
+    assert q['frac90_seg2'] == pytest.approx(2.5 / 3.0) and q['no90_seg2'] == 0

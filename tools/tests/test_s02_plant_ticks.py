@@ -152,10 +152,11 @@ def test_simulated_edges_match_the_h7_code(seed):
 
 
 @needs_gcc
-@pytest.mark.parametrize('seed', [1, 5, 9])
+@pytest.mark.parametrize('seed', [1, 4, 7, 9])
 def test_edge_intervals_hold_the_true_edges(seed):
     """Apply windows (true apply anywhere inside): every trusted edge's interval [t + lo, t + hi] holds the true edge.
-    The true edges are the simulation with the true apply times, itself checked against encoder_gen.c here."""
+    The true edges are the simulation with the true apply times, itself checked against encoder_gen.c here. Seeds 4
+    and 7 have edges past the trusted ones whose intervals miss (test_untrusted_edges_can_miss)."""
     n = 7000
     om32 = om32_of(profile(n, seed))
     lo_app, width, true_app = apply_times(n, seed)
@@ -180,6 +181,30 @@ def test_edge_intervals_hold_the_true_edges(seed):
             used += int(tr.sum())
     assert used > 5000
 
+
+
+def test_untrusted_edges_can_miss():
+    """Why an edge past the first wide interval of its segment bounds nothing (_Wheel.trusted): with seed 7 some of
+    those edges are outside their interval (which simulated edge is which true edge is no longer certain); none of
+    the trusted ones is."""
+    n = 7000
+    om32 = om32_of(profile(n, 7))
+    lo_app, width, true_app = apply_times(n, 7)
+    ex = pt.simulate_edges(true_app, np.zeros(n), om32)
+    ed = pt.simulate_edges(lo_app, width, om32)
+    miss_untrusted = miss_trusted = 0
+    for w in range(4):
+        wh = pt._Wheel(ed[w])
+        a, b = ex[w], ed[w]
+        for s in range(1, len(b['segs'])):
+            ia, ib = np.flatnonzero(a['seg'] == s), np.flatnonzero(b['seg'] == s)
+            m = min(len(ia), len(ib))
+            d = a['t'][ia[:m]] - b['t'][ib[:m]]
+            bad = (d < b['lo'][ib[:m]] - pt.TOL_US) | (d > b['hi'][ib[:m]] + pt.TOL_US)
+            tr = wh.trusted[ib[:m]]
+            miss_trusted += int((bad & tr).sum())
+            miss_untrusted += int((bad & ~tr).sum())
+    assert miss_trusted == 0 and miss_untrusted > 0
 
 # ---------------------------------------------------------------------------------------------------------------
 # certify on made-up runs
