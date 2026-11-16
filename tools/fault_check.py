@@ -347,8 +347,8 @@ def hubs(x, y, th, lx, ly):
 
 def ref_plant(rows, on_idx, k_rel, pose, nom):
     """Parameters of one plant step rebuilt from the rows on (indices, row order), the relative step, the
-    pose at the start of the step and the nominal values: (V, mu[4], b[4], tc[4], ts[4]) as exact Fractions
-    (the zone membership as a set of wheels)."""
+    pose at the start of the step and the nominal values: (V, mu[4], b[4], tc[4], ts[4]); b, tc, ts and mu as
+    exact Fractions, V the nominal value or the float64 ramp of its definition (FP2-1)."""
     F = lambda v: Fraction(v) if not isinstance(v, Fraction) else v           # noqa: E731
     V = F(nom['V_batt'])
     mu = [F(v) for v in nom['mu_hd']]
@@ -361,8 +361,11 @@ def ref_plant(rows, on_idx, k_rel, pose, nom):
                 tc[w] += r.p('tc')
                 ts[w] += r.p('tc')
         elif r.fault == 'batt_sag':
+            # Codex FP2-1: the float64 definition of the ramp (one operation at a time, as the design states),
+            # rebuilt here and compared exactly; an exact fraction would differ by the rounding of v1 - v0
             ramp, d = r.p('ramp_ms'), k_rel - r.start_ms
-            V = r.p('v1') if ramp == 0 or d >= ramp else V + (r.p('v1') - V) * Fraction(d, ramp)
+            v0, v1 = float(nom['V_batt']), float(r.p('v1'))
+            V = v1 if ramp == 0 or d >= ramp else v0 + (v1 - v0) * (d / ramp)
         elif r.fault == 'mu_time':
             for w in _row_wheels(r):
                 mu[w] = r.p('mu')
@@ -376,10 +379,31 @@ def ref_plant(rows, on_idx, k_rel, pose, nom):
     return V, mu, b, tc, ts
 
 
-def nominal_problems(nom, plant_src=None) -> list:
-    """The nominal values of the record against rpi5/params.py of this tree; mu_hd may be --mu (4 equal).
-    Codex FP1-2: this tree's params.py must be the blob the run imported (manifest plant_src), and every
-    nominal value finite and > 0 (lx, ly, motor_* >= 0)."""
+def run_mu(argv):
+    """--mu of the run as rpi5/run_hil.py's own parser reads its command line (the argv the step log .json
+    keeps; Codex FP1-2 round 2): a float, or None without --mu. ValueError when the parser refuses it."""
+    import contextlib
+    import io
+    import run_hil
+    if not (isinstance(argv, list) and argv and all(isinstance(a, str) for a in argv)):
+        raise ValueError(f'step log argv {argv!r}')
+    old, err = sys.argv, io.StringIO()
+    sys.argv = ['run_hil.py'] + argv[1:]
+    try:
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            ns = run_hil._parse_args()
+    except SystemExit:
+        raise ValueError(f'run_hil.py refuses the argv of the step log: {err.getvalue().strip()[-200:]}') from None
+    finally:
+        sys.argv = old
+    return ns.mu
+
+
+def nominal_problems(nom, plant_src=None, argv=None) -> list:
+    """The nominal values of the record against rpi5/params.py of this tree and the command line of the run.
+    Codex FP1-2: this tree's params.py must be the blob the run imported (manifest plant_src); every nominal
+    value finite and > 0 (lx, ly, motor_* >= 0); mu_hd = four times --mu of the run's argv (step log .json),
+    or params.py mu_hd without --mu (round 2: four equal values alone are not taken as --mu)."""
     from params import MecanumParams
     from plant_blob import plant_source
     p = MecanumParams()
@@ -400,13 +424,27 @@ def nominal_problems(nom, plant_src=None) -> list:
         if nom.get(k) != [float(v) for v in getattr(p, k)]:
             out.append(f'nominal {k}={nom.get(k)!r} != params.py')
     mu = nom.get('mu_hd')
-    if not (isinstance(mu, list) and len(mu) == 4 and
-            (mu == [float(v) for v in np.broadcast_to(p.mu_hd, (4,))] or len(set(mu)) == 1)):
-        out.append(f'nominal mu_hd={mu!r}: neither params.py nor four equal values (--mu)')
+    try:
+        m = run_mu(argv)
+    except ValueError as exc:
+        out.append(f'--mu of the run unknown ({exc}): the nominal mu_hd cannot be checked')
+        return out
+    want = [float(v) for v in np.broadcast_to(p.mu_hd, (4,))] if m is None else [float(m)] * 4
+    if mu != want:
+        out.append(f'nominal mu_hd={mu!r} != {want} ({"params.py" if m is None else "--mu " + repr(m)} of the run)')
     return out
 
 
-def plant_record_check(npz_path, rows, fm, t0, stop, n, true, plant_src=None) -> tuple:
+def step_log_argv(step_log):
+    """argv of the run kept in the .json of its step log (run_hil.py), or None."""
+    if not step_log or not os.path.isfile(step_log + '.json'):
+        return None
+    with open(step_log + '.json') as fh:
+        meta = json.load(fh)
+    return meta.get('argv') if isinstance(meta, dict) else None
+
+
+def plant_record_check(npz_path, rows, fm, t0, stop, n, true, plant_src=None, argv=None) -> tuple:
     """Check 11: (problems, summary)."""
     prow = [i for i, r in enumerate(rows) if r.fault in PLANT_ROWS]
     pr = fm.get('plant_record')
@@ -435,7 +473,7 @@ def plant_record_check(npz_path, rows, fm, t0, stop, n, true, plant_src=None) ->
     if pr.get('overflow') is not False or not _is_int(pr.get('rows')) or pr.get('rows') != len(rec):   # FP1-3
         probs.append(f'plant record overflow={pr.get("overflow")!r} rows={pr.get("rows")!r}, file has {len(rec)}')
     nom = pr.get('nominal') if isinstance(pr.get('nominal'), dict) else {}
-    nprob = nominal_problems(nom, plant_src)
+    nprob = nominal_problems(nom, plant_src, argv)
     if nprob:
         return probs + nprob, dict(file=pr['file'], rows=len(rec), steps_ok=None)
     exp_steps = [k for k in range(n) if any(window_on(rows[i], k, t0, stop) for i in prow)]
@@ -453,7 +491,7 @@ def plant_record_check(npz_path, rows, fm, t0, stop, n, true, plant_src=None) ->
         pose = (row[c['x']], row[c['y']], row[c['theta']])
         V, mu, b, tc, ts = ref_plant(rows, on, k - t0, pose, nom)
         # FP1-3: the mask as recorded equals the expected whole number exactly (no int() cast)
-        ok = bool(row[c['mask']] == float(sum(1 << i for i in on))) and _close(row[c['V_batt']], V)
+        ok = bool(row[c['mask']] == float(sum(1 << i for i in on))) and bool(row[c['V_batt']] == float(V))   # FP2-1
         for w, suf in enumerate(('fl', 'fr', 'rl', 'rr')):
             ok &= bool(row[c['mu_' + suf]] == float(mu[w]))
             ok &= _close(row[c['b_' + suf]], b[w]) and _close(row[c['tc_' + suf]], tc[w])
@@ -553,7 +591,7 @@ def check(npz_path: str, sched_path: str, step_log: str = None) -> dict:
         tl = None
         fails.append('no step log: the run does not show that no step missed its deadline (design 8.1)')
     plant_probs, plant = plant_record_check(npz_path, rows, fm, t0, stop, n, true,
-                                             man.get('plant_src'))         # check 11 (batch 2)
+                                             man.get('plant_src'), step_log_argv(step_log))   # check 11 (batch 2)
     fails += plant_probs
     diff_frames = int(np.count_nonzero(np.any(mosi != true, axis=1)))
     out.update(ok=not fails, fails=fails, n_frames=n, t0_step=t0, stop_step=stop, sha256=sha,

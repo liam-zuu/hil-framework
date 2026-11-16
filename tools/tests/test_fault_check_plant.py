@@ -1,7 +1,8 @@
 """tools/fault_check.py check 11 (batch 2 plant faults, design 2026-11-15 section 7.1): a real run of the 1 kHz
 loop (simulate_hw) with plant rows passes; each tampering of the plant record fails: a value, a missing or extra
 step, the mask, the nominal values, the pose, the SHA, the file; a plant record without plant rows fails; a
-finite run cut at the stop step passes with the record cut there too.
+finite run cut at the stop step fails for that reason only (batch 1 rule), with its record right up to the stop
+step (Codex FP2-2).
 Run: python -m pytest tools/tests"""
 import hashlib
 import json
@@ -24,7 +25,7 @@ BODY = ('J1,wheel_jam,FL+RR,50,250,b=0.1;tc=0.02\nB1,batt_sag,batt,100,350,v1=8;
         'E1,enc_loss,RL,80,140,\nS1,gyro_scale,gz,150,300,s=0.3\n')
 
 
-def open_loop(tmp_path, body=BODY, steps=400, name='frames'):
+def open_loop(tmp_path, body=BODY, steps=400, name='frames', argv=('run_hil.py',)):
     csv_ = tmp_path / f'{name}.csv'
     csv_.write_text(HEAD + body)
     sched = fs.load(str(csv_), steps, 'plant', 'traction')
@@ -32,7 +33,17 @@ def open_loop(tmp_path, body=BODY, steps=400, name='frames'):
     node = HILNode(moving_plant(), config=HILConfig(simulate_hw=True, max_steps=steps, frame_log=p, faults=sched))
     node._spi.transfer = good_miso
     node.run()
-    return p, str(csv_), write_step_log(str(tmp_path / f'{name}_steps.csv'), steps)
+    return p, str(csv_), with_argv(write_step_log(str(tmp_path / f'{name}_steps.csv'), steps), argv)
+
+
+def with_argv(step_log, argv=('run_hil.py',)):
+    """run_hil.py keeps its argv in the step log .json (check 11 reads --mu from it, Codex FP1-2 round 2)."""
+    with open(step_log + '.json') as fh:
+        meta = json.load(fh)
+    meta['argv'] = list(argv)
+    with open(step_log + '.json', 'w') as fh:
+        json.dump(meta, fh)
+    return step_log
 
 
 @pytest.fixture
@@ -127,10 +138,14 @@ def test_nominal_mu_from_dash_mu_is_accepted():
                **{k: [float(v) for v in getattr(p, k)] for k in ('motor_b', 'motor_Tc', 'motor_Ts')})
     from plant_blob import plant_source
     src = plant_source()
-    assert fc.nominal_problems(nom, src) == []
-    assert fc.nominal_problems(nom)                                   # no plant_src: cannot be checked
+    assert fc.nominal_problems(nom, src, ['run_hil.py', '--mu', '0.3']) == []
+    assert fc.nominal_problems(nom, src, ['run_hil.py', '--mu=0.3', '--mock']) == []
+    assert fc.nominal_problems(nom, None, ['run_hil.py', '--mu', '0.3'])     # no plant_src: cannot be checked
+    assert fc.nominal_problems(nom, src, ['run_hil.py'])                     # four equal values without --mu
+    assert fc.nominal_problems(nom, src, None)                               # argv unknown
+    assert fc.nominal_problems(nom, src, ['run_hil.py', '--mu', '0.2'])
     nom['mu_hd'] = [0.3, 0.3, 0.2, 0.3]
-    assert fc.nominal_problems(nom, src)
+    assert fc.nominal_problems(nom, src, ['run_hil.py', '--mu', '0.3'])
 
 
 def test_record_without_plant_rows_fails(tmp_path):
@@ -151,13 +166,14 @@ def test_finite_run_record_cut_at_stop(tmp_path):
         p, csv_, steps, node = finite_run(tmp_path, 'J1,wheel_jam,FL,20,140,b=0.1\n', after=0.06)
     finally:
         fault_schedule.load = real_load
+    with_argv(steps)
     man = json.loads(str(np.load(p)['manifest']))
     assert man['faults']['cut'] is True                             # RUN ended before the window
     r = fc.check(p, csv_, steps)
     # FP1-12: the run fails because its schedule was cut (rule of batch 1), and only for that; the plant record
     # itself is right: steps up to the stop step, values, pose
     assert not r['ok']
-    assert all('did not run in full' in m or 'cut' in m for m in r['fails']), r['fails']
+    assert r['fails'] == ['the schedule did not run in full (a window cut or never started)'], r['fails']   # FP2-2
     assert r['plant']['steps_ok'] and r['plant']['values_bad'] == 0 and r['plant']['pose_bad'] == 0
     t0, stop = r['t0_step'], r['stop_step']
     rec = np.load(_rec_path(p))['record']
@@ -237,3 +253,33 @@ def test_record_inner_must_be_mecanum(run, tmp_path):                # FP1-11
     src, csv_, steps = run
     bad = resave(src, str(tmp_path / 'i.npz'), lambda d, m: m['faults']['plant_record'].update(inner='OtherPlant'))
     assert not fc.check(bad, csv_, steps)['ok']
+
+
+# ── Codex vòng 2 (FP1-2 còn, FP2-1) ─────────────────────────────────────────
+def test_low_battery_ramp_passes(tmp_path):                          # FP2-1: v1 = 0.1, cancellation near v1
+    p, csv_, steps = open_loop(tmp_path, body='B1,batt_sag,batt,0,1001,v1=0.1;ramp_ms=1000\n', steps=1100,
+                               name='batt')
+    r = fc.check(p, csv_, steps)
+    assert r['ok'], r['fails']
+    rec = np.load(_rec_path(p))['record']
+    assert rec[990, C['V_batt']] == 12.4 + (0.1 - 12.4) * (990 / 1000)
+
+
+def test_nominal_mu_and_record_mu_forged_together_fail(run, tmp_path):   # FP1-2 round 2
+    def edit(rec):
+        m = rec[:, C['mu_fl']:C['mu_rr'] + 1]
+        rec[:, C['mu_fl']:C['mu_rr'] + 1] = np.where(m == 0.436, 0.3, m)
+        return rec
+    src, csv_, steps = _tamper_record(run, tmp_path, edit)
+    bad = resave(src, str(tmp_path / 'forged.npz'),
+                 lambda d, m: m['faults']['plant_record']['nominal'].update(mu_hd=[0.3] * 4))
+    r = fc.check(bad, csv_, steps)
+    assert not r['ok'] and any('mu_hd' in m for m in r['fails']), r['fails']
+
+
+def test_run_mu_reads_the_parser():
+    assert fc.run_mu(['run_hil.py']) is None and fc.run_mu(['x', '--mu', '0.25']) == 0.25
+    with pytest.raises(ValueError):
+        fc.run_mu(['x', '--mu', 'abc'])
+    with pytest.raises(ValueError):
+        fc.run_mu(None)

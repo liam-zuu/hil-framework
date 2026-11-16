@@ -123,7 +123,9 @@ def zone_mask(row: Row, x, params) -> int:
 
 
 def batt_value(row: Row, k_rel: int, v0: float) -> float:
-    """V_batt of a batt_sag row at relative step k_rel inside its window."""
+    """V_batt of a batt_sag row at relative step k_rel inside its window. Definition (Codex FP2-1), float64,
+    one operation at a time: v1 = float(v1 of the file); d = k_rel - start (int); with ramp_ms = 0 or d >=
+    ramp_ms: v1; else v0 + (v1 - v0) * (d / ramp_ms), d / ramp_ms the float division of two ints."""
     v1, ramp = float(row.p('v1')), row.p('ramp_ms')
     if ramp == 0 or k_rel - row.start_ms >= ramp:
         return v1

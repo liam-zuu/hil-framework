@@ -165,3 +165,25 @@ def test_no_plant_row_no_plant_output(fw, tmp_path):                 # Codex FP1
     out.mkdir()
     fault_run.write_faults(str(out), log)
     assert (out / 'faults_plant.csv').exists() and 'faults_plant.csv' in (out / 'meta.yaml').read_text(encoding='utf-8')
+
+
+def test_en_reaching_the_plant_is_the_runtime_en(fw, monkeypatch):   # Codex FP2-3
+    """The EN of the parameter object that reaches plant_step at each step with a plant row on equals the EN
+    simulate wrote on the nominal object for that step; the run sees EN change (1 before the first firmware
+    tick, then the firmware's EN 0 with the motors off), so a variant that kept its EN would fail."""
+    params = MecanumParams()
+    seen = []
+    real = fwsim.plant_step
+
+    def spy(x, u, p, dt, rng):
+        seen.append((p is params, p.motor_enable, params.motor_enable))
+        return real(x, u, p, dt, rng)
+
+    monkeypatch.setattr(fwsim, 'plant_step', spy)
+    monkeypatch.setattr(fault_run, '_REAL_PLANT_STEP', spy)
+    s = sched('Z1,mu_zone,all,0,1000,x0=50;x1=60;y0=50;y1=60;mu=0.05\n', run_ms=1000)
+    fault_run.FwsimFaults(s).run(fw, _sp, 1.0, params, imu=dict(IMU), mode='PID', motor_on=False)
+    monkeypatch.undo()
+    assert len(seen) == 1000 and not any(is_base for is_base, _, _ in seen)      # the variant, every step
+    assert all(got == want for _, got, want in seen)
+    assert {want for _, _, want in seen} == {0.0, 1.0}                           # EN changed during the run
