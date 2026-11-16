@@ -810,20 +810,37 @@ def tre_one(frames, log, offset_s, s_plus=0.0, s_minus=0.0, period_s=PERIOD_S, j
         r = F['psi'][win & common] - P[k][win & common] - c
         n_used.add(int(r.size))
         rms.append(float(np.sqrt(np.mean(r ** 2))))
-    rms = np.array(rms)
-    k = int(np.argmin(rms))
-    if k == 0 or k == len(taus) - 1:
-        raise InputError(f'{frames}: delay at the edge of +-{half_s * 1e3:.0f} ms (clock offset wrong?)')
-    y0, y1, y2 = rms[k - 1], rms[k], rms[k + 1]
-    den = y0 - 2 * y1 + y2
-    tau = taus[k] + (0.5 * step_s * (y0 - y2) / den if den > 0 else 0.0)
-    if not (math.isfinite(tau) and math.isfinite(y1)):
-        raise InputError(f'{frames}: delay not determined (CU-12)')
-    return dict(tau_s=float(tau), rms_rad=float(y1), n_frames=int((win & common).sum()),
+    fit = _tau_from_rms(taus, np.array(rms), step_s, frames)
+    return dict(fit, n_frames=int((win & common).sum()),
                 n_frames_some=int((win & np.any(np.isfinite(P), axis=0)).sum()), n_used=sorted(n_used),
                 offset_s=offset_s,
                 n_late=S0['n_late'], frames=os.path.basename(frames), frames_sha256=sha256(frames),
                 log=os.path.basename(log), log_sha256=sha256(log))
+
+
+def _tau_from_rms(taus, rms, step_s, frames):
+    """Delay at the RMS minimum over the grid taus, parabola through the three points; refused when not identifiable
+    (B8S-12: RMS flat over the grid; B8SF-1: a grid neighbour shares the minimum). contrast = RMS at the grid edge /
+    RMS minimum, None when not a finite number (B8SF-2)."""
+    if not np.all(np.isfinite(rms)) or not np.ptp(rms) > 0:
+        raise InputError(f'{frames}: RMS does not change over the delay grid: no yaw motion to identify tau '
+                         f'(B8S-12)')
+    k = int(np.argmin(rms))
+    if k == 0 or k == len(taus) - 1:
+        raise InputError(f'{frames}: delay at the edge of +-{abs(taus[0]) * 1e3:.0f} ms (clock offset wrong?)')
+    y0, y1, y2 = rms[k - 1], rms[k], rms[k + 1]
+    den = y0 - 2 * y1 + y2
+    if not (y0 > y1 and y2 > y1 and den > 0):                          # B8S-12, B8SF-1: flat bottom
+        raise InputError(f'{frames}: RMS flat at its minimum (tau {taus[k] * 1e3:.0f} ms): delay not identifiable '
+                         f'(B8S-12)')
+    tau = taus[k] + 0.5 * step_s * (y0 - y2) / den
+    if not (math.isfinite(tau) and math.isfinite(y1)):
+        raise InputError(f'{frames}: delay not determined (CU-12)')
+    edge = float(min(rms[0], rms[-1]))
+    with np.errstate(over='ignore', divide='ignore'):
+        ratio = float(np.float64(edge) / np.float64(y1)) if y1 > 0 else math.nan
+    return dict(tau_s=float(tau), rms_rad=float(y1), rms_edge_rad=edge,
+                contrast=ratio if math.isfinite(ratio) else None)
 
 
 def tre(caps, thang_d, step_s=0.001, **kw):
@@ -832,11 +849,17 @@ def tre(caps, thang_d, step_s=0.001, **kw):
         raise InputError('no C8 run')
     for k in ('s_plus', 's_minus'):
         _finite(thang_d.get(k), f'thang {k}', -0.1, 0.1)
-    runs = [tre_one(fr, lg, off, thang_d['s_plus'], thang_d['s_minus'], step_s=step_s, **kw) for fr, lg, off in caps]
+    runs = []
+    for i, (fr, lg, off) in enumerate(caps, 1):
+        try:
+            runs.append(tre_one(fr, lg, off, thang_d['s_plus'], thang_d['s_minus'], step_s=step_s, **kw))
+        except InputError as exc:                                      # B8S-12: name the run that gives no tau
+            raise InputError(f'run {i} of {len(caps)} gives no delay, tau_hat not computed: {exc}')
     t = np.array([r['tau_s'] for r in runs])
     hat = float(np.median(t))
+    c = [r['contrast'] for r in runs if r['contrast'] is not None]
     return dict(tau_hat_s=hat, dtau_fit_s=float(np.max(np.abs(t - hat)) + step_s), thu=False, runs=runs,
-                luc_chay=now_iso())
+                contrast_min=float(min(c)) if c else None, luc_chay=now_iso())
 
 
 def check_u_file(u):
@@ -892,6 +915,7 @@ def kiem(frames, log, offset_s, u, muc, u_psi, u_ghep=0.0, n_min=30, wz_still=0.
     end = _still(F, tl, te, te + END_STILL_S, wz_still) & np.isfinite(psi_i)
     out = dict(muc=muc, align_c_rad=c, align_spread_rad=spread, align_ok=bool(spread <= u_psi),
                n_win=int(win.sum()), n_compared=int(comp.sum()), n_not_compared=int((win & ~comp).sum()),
+               compared_ok=bool(comp.sum() >= n_min), n_min=n_min,
                limit_rad=lim, n_over=int(over.sum()), t_over_s=[float(x) for x in (tl[over] - t0)[:20]],
                max_abs_rad=float(np.max(np.abs(res[comp]))) if comp.any() else None, n_late=S['n_late'],
                luc_chay=now_iso())
@@ -906,7 +930,7 @@ def kiem(frames, log, offset_s, u, muc, u_psi, u_ghep=0.0, n_min=30, wz_still=0.
     else:
         out.update(closure_rad=None, closure_ok=None,
                    closure_note=f'fewer than {n_min} still frames in the {END_STILL_S:.0f} s after the window')
-    out['ok'] = bool(out['align_ok'] and out['n_over'] == 0 and out['closure_ok'] is True)
+    out['ok'] = bool(out['align_ok'] and out['compared_ok'] and out['n_over'] == 0 and out['closure_ok'] is True)
     return out
 
 
@@ -1045,14 +1069,16 @@ def main(argv=None):
             r.update(nguon=[{'file': x[k], 'sha256': x[k + '_sha256']} for x in r['runs'] for k in ('frames', 'log')],
                      script=script_state())
             _write_new(a.out, r)
-            print(f'tau_hat {r["tau_hat_s"] * 1e3:.1f} ms, dtau_fit {r["dtau_fit_s"] * 1e3:.1f} ms over {len(caps)} runs')
+            print(f'tau_hat {r["tau_hat_s"] * 1e3:.1f} ms, dtau_fit {r["dtau_fit_s"] * 1e3:.1f} ms over {len(caps)} runs; '
+                  f'lowest contrast RMS edge / min {r["contrast_min"]}')
         elif a.cmd == 'kiem':
             r = kiem(a.frames, a.log, a.offset_s, _read_json(a.u_imu), a.muc, math.radians(a.u_psi_deg),
                      math.radians(a.u_ghep_deg))
             r.update(nguon=[{'file': os.path.basename(p), 'sha256': sha256(p)} for p in (a.frames, a.log, a.u_imu)],
                      script=script_state())
             _write_new(a.out, r)
-            print(f'{a.muc}: {r["n_over"]} of {r["n_compared"]} frames over {math.degrees(r["limit_rad"]):.2f} deg; '
+            print(f'{a.muc}: {r["n_over"]} of {r["n_compared"]} frames over {math.degrees(r["limit_rad"]):.2f} deg '
+                  f'(need {r["n_min"]} compared); '
                   f'closure {r.get("closure_ok")}; alignment spread {math.degrees(r["align_spread_rad"]):.2f} deg; '
                   + ('OK' if r['ok'] else 'NOT OK: do not lock U_IMU (design 5)'))
         else:
