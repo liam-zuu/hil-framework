@@ -1105,8 +1105,11 @@ def confirm_block_problem(tun_after: List[dict], ds: str, campaign: str, gain_se
     """C9D-4 (Codex C9 demo round 1; Liam 17/11 at CODE_C13 "Sửa cả 7 + vòng 2 (Recommended)"): None, or why the stop
     reason khoi_xac_nhan_dat does not hold in the log. The last block of confirm car runs of the frozen gain set (rows
     of the campaign, platform HW, stage confirm, gain_set_id = the frozen set; the block = the block_id of the last
-    such row in log order, not empty) must all have their so-h row, all be dat after the comparison, and frozen_at
-    must not be earlier than the latest so-h of the block. tun_after: the live rows after apply_so_h."""
+    such row in log order, not empty): every run judged before the comparison has its so-h row; the valid runs after
+    it (S05 4.3: a run lost to the measurement, before or at so-h, is replaced and out of the denominator) are at
+    least one and all dat; frozen_at is not earlier than the latest so-h of the block. The count 2 x |G| needs the
+    gate file and is not checked here. tun_after: the live rows after apply_so_h (a row without so-h keeps its
+    logged outcome)."""
     conf = [r for r in tun_after if r.get('campaign') == campaign and r.get('platform') == 'HW'
             and r.get('stage') == 'confirm' and r.get('gain_set_id') == gain_set]
     if not conf:
@@ -1116,14 +1119,17 @@ def confirm_block_problem(tun_after: List[dict], ds: str, campaign: str, gain_se
         return f"the last confirm car run of {gain_set} ({conf[-1].get('run_uid')}) has no block_id"
     block = [r for r in conf if r.get('block_id') == bid]
     so = {s.get('run_uid'): s for s in read_rows(os.path.join(ds, SO_H))}
-    miss = [r.get('run_uid') for r in block if r.get('run_uid') not in so]
+    miss = [r.get('run_uid') for r in block if r.get('run_uid') not in so and r.get('run_outcome') in VALID]
     if miss:
         return f'block {bid}: runs {miss} without their clip H comparison (so-h)'
-    bad = [f"{r.get('run_uid')}={r.get('run_outcome')}" for r in block if r.get('run_outcome') != 'dat']
+    valid = [r for r in block if r.get('run_outcome') in VALID]
+    if not valid:
+        return f'block {bid}: no valid run after the clip H comparison'
+    bad = [f"{r.get('run_uid')}={r.get('run_outcome')}" for r in valid if r.get('run_outcome') != 'dat']
     if bad:
         return f"block {bid}: not all dat after the clip H comparison ({', '.join(bad)})"
     try:
-        last = max(_parse_t(so[r['run_uid']]['ghi_luc']) for r in block)
+        last = max(_parse_t(so[r['run_uid']]['ghi_luc']) for r in block if r.get('run_uid') in so)
         t_frz = _parse_t(frozen_at)
     except (ValueError, TypeError, KeyError) as exc:
         return f'block {bid}: time stamps not readable ({exc})'

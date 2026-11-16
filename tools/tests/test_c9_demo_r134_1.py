@@ -459,6 +459,30 @@ def test_c9d4_freeze_needs_dat_after_the_comparison(demo_ds, tmp_path):
         _freeze_ok(demo_ds, tmp_path)
 
 
+def _lost_confirm(ds, block):
+    rl.begin(ds, 'FAKE-confirm', 'A-LADRC', 'HW', 'LADRC', 'O1-F05', '0.5', 'confirm', gain_set='A-LADRC/G01',
+             block_id=block)
+    rl.step(ds, 'run')
+    return rl.end(ds, 'hong_he_do', completed=1, fail_cause='mat_khung_FAKE')['run_uid']
+
+
+def test_c9d4_lost_runs_of_the_block_are_out_of_the_denominator(demo_ds, tmp_path):
+    # S05 4.3: a run lost to the measurement is replaced, out of the denominator; one lost at so-h likewise
+    _lost_confirm(demo_ds, 'K1')
+    uids = _confirm_block(demo_ds, tmp_path, 'K1', ('dat', 'dat', 'dat'))
+    rl.so_h(demo_ds, uids[0], _score_final(demo_ds, uids[0], 3.0, 'hong_he_do'))
+    for u in uids[1:]:
+        rl.so_h(demo_ds, u, _score_final(demo_ds, u, 0.5))
+    _freeze_ok(demo_ds, tmp_path)
+    assert {r['campaign']: r for r in _summary(demo_ds)}['A-LADRC']['stop_reason_check'] == 'ok'
+
+
+def test_c9d4_a_block_of_lost_runs_only_is_not_confirmed(demo_ds, tmp_path):
+    _lost_confirm(demo_ds, 'K1')
+    with pytest.raises(rl.LogError, match='no valid run'):
+        _freeze_ok(demo_ds, tmp_path)
+
+
 def test_c9d4_summary_mismatch_for_a_freeze_row_the_log_does_not_back(demo_ds, tmp_path):
     _confirm_block(demo_ds, tmp_path, 'K1', ('dat',))
     gf = fr.write_gain_file(str(tmp_path / 'FAKE_gain_L.json'), GAIN)
