@@ -197,6 +197,17 @@ def test_media_renamed_refused(world, capsys):
     box_ok(w)
 
 
+def test_role_formats(world, capsys):
+    """SA2-1: track.json must be JSON (a .txt is refused); SA2-5: text beginning with 'BM' is text."""
+    w = world
+    t = w['run'] / 'cam' / 'track.txt'
+    t.write_text('không phải JSON', encoding='utf-8')
+    assert C.main(args(w, tr=t)) == 2 and 'extension' in capsys.readouterr().out
+    doc = w['tmp'] / 'gioi_han_pin.md'
+    doc.write_text('BMS: điện áp tối thiểu 10,5 V\n', encoding='utf-8')
+    assert C.main(['--stra-a', str(w['sa']), 'them', '--loai', 'tai_lieu', '--nguon', str(doc), '--ly-do', 'pin']) == 0
+
+
 def test_luot_refuses_big_file_and_bad_sha(world, capsys, monkeypatch):
     w = world
     monkeypatch.setattr(C, 'MAX_BYTES', 5)
@@ -249,9 +260,15 @@ def test_box_check_archive_tampered(world, capsys):
     assert C.main(args(w, thay=True)) == 0
     box_ok(w)
     cu = next(n for n in os.listdir(w['hop'] / 'luot') if '__cu_' in n)
+    keep = (w['hop'] / 'luot' / cu / 'score.json').read_bytes()
     shutil.copy(w['hop'] / 'luot' / 'A-PID__A1__007' / 'score.json', w['hop'] / 'luot' / cu / 'score.json')
     _, bad = C.box_check(str(w['hop']))
     assert any('no older row' in x for x in bad)
+    (w['hop'] / 'luot' / cu / 'score.json').write_bytes(keep)
+    box_ok(w)
+    os.remove(w['hop'] / 'luot' / cu / 'score.json')                              # SA-17: archived copy deleted
+    _, bad = C.box_check(str(w['hop']))
+    assert any('older row' in x and 'no file on the disk' in x for x in bad)
 
 
 def test_luot_failure_leaves_nothing(world, capsys, monkeypatch):
@@ -429,6 +446,7 @@ def rename_gain(sw):
     (dict(meta=dict(script=dict(commit='x'))), 'script.dirty'),                    # SA-6
     (dict(drop=lambda c, g, x, v: (c, g, x, v) == ('PID', 'kp_xy', 1.0, '0.5')), 'speeds'),
     (dict(drop=lambda c, g, x, v: v == '0.8'), 'speeds'),                          # SA-15
+    (dict(speeds=('0.2', '0.5')), 'speeds'),                                       # SA-15: gone everywhere
     (dict(extra=dict(controller='PID', factor='extra_g', value='1.0', v='0.2', luoi='log', completed='true')),
      'need exactly'),
     (dict(sw_edit=rename_gain, lev_edit=lambda lv: lv[0].update(factor='gain_la')), 'need exactly'),   # SA-14
@@ -449,6 +467,21 @@ def test_mien_refuses(w0, capsys, kw, msg):
     assert C.main(mien_args(w0, run)) == 2
     assert msg in capsys.readouterr().out
     assert not (w0['tmp'] / 'A' / 'mien_A.csv').exists()
+
+
+def test_mien_default_alias(w0, capsys):
+    """SA2-2: '(default)' rows are accepted like '(default check)'."""
+    run = s03_run(w0['tmp'], sw_edit=lambda sw: [r.update(factor='(default)') for r in sw
+                                                 if r['factor'] == '(default check)'])
+    assert C.main(mien_args(w0, run)) == 0
+
+
+def test_mien_leftover_temp_refused(w0, capsys):
+    run = s03_run(w0['tmp'])
+    (w0['tmp'] / 'A').mkdir()
+    (w0['tmp'] / 'A' / 'mien_A.csv.tmp_mien').write_text('x', encoding='utf-8')     # SA-12
+    assert C.main(mien_args(w0, run)) == 2 and 'left by a failed run' in capsys.readouterr().out
+    assert (w0['tmp'] / 'A' / 'mien_A.csv.tmp_mien').exists() and not (w0['tmp'] / 'A' / 'mien_A.csv').exists()
 
 
 def test_mien_refuses_sealed_link_and_old_columns(w0, capsys, tmp_path):
@@ -550,8 +583,30 @@ def test_ke_khai(world, capsys, monkeypatch):
     assert any('append-only' in x for x in yaml.safe_load(open(out3, encoding='utf-8'))['loi'])
     empty = w['tmp'] / 'kk' / 'rong.yaml'
     empty.write_text('a: 1\n', encoding='utf-8')
-    assert C.main(['--stra-a', str(sa), 'ke-khai', '--out', str(w['tmp'] / 'kk' / 'o4.yaml'), '--truoc',
+    assert C.main(['--stra-a', str(sa), 'ke-khai', '--out', str(w['tmp'] / 'kk' / 'hop_thu_A_4.yaml'), '--truoc',
                    str(empty)]) == 2 and 'not a declaration' in capsys.readouterr().out
+    assert C.main(['--stra-a', str(sa), 'ke-khai', '--out', str(w['tmp'] / 'k1.yaml'), '--lan-dau']) == 2
+    assert 'hop_thu_A_' in capsys.readouterr().out                                 # SA-18: one naming, one place
+
+
+def test_declaration_problems(world, monkeypatch):
+    """SA-20, SA-22, SA2-4: a declaration is stale when NHAT_KY changed after it; bad Codex calls; bad types."""
+    w = world
+    sa = w['sa']
+    fence_files(sa, monkeypatch)
+    out = w['tmp'] / 'hop_thu_A_1.yaml'
+    C.main(['--stra-a', str(sa), 'ke-khai', '--out', str(out), '--lan-dau'])
+    kk = C.read_ke_khai(str(out))
+    kk['loi'] = []
+    assert C.declaration_problems(kk, str(sa)) == []
+    (sa / 'NHAT_KY' / '2026-11-20.md').write_text('buổi 1\nthêm\n', encoding='utf-8')
+    assert any('NHAT_KY' in x for x in C.declaration_problems(kk, str(sa)))
+    kk['tro_ly_codex']['lan_goi'] = [dict(log='log_1.txt', model='gpt-6.1-sol', effort='xhigh')]
+    assert any('Codex calls' in x for x in C.declaration_problems(kk, str(sa)))
+    bad = w['tmp'] / 'bad.yaml'
+    bad.write_text('loi: []\nhop_thu: null\nnhat_ky: {}\ntro_ly_codex: {lan_goi: []}\n', encoding='utf-8')
+    with pytest.raises(C.Refused, match='not a declaration'):
+        C.read_ke_khai(str(bad))
 
 
 @pytest.mark.parametrize('kw, msg', [(dict(bad_line=True), 'test 7'), (dict(drop='4c'), 'differ from')])

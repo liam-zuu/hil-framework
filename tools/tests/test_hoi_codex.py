@@ -30,16 +30,18 @@ def root(tmp_path, monkeypatch):
     exe = tmp_path / 'codex.exe'
     exe.write_bytes(b'x')
     monkeypatch.setattr(H, 'CODEX_EXE', str(exe))
+    monkeypatch.setattr(H, 'CODEX_SHA256', hashlib.sha256(b'x').hexdigest())
     monkeypatch.setattr(H, 'codex_version', lambda e: H.CODEX_VERSION)
     calls = []
 
-    def fake(cmd, stdin, cwd, log=GOOD_LOG, code=0, answer='Đề xuất: kp_xy 1,8\n'):
+    def fake(cmd, stdin, cwd, log=GOOD_LOG, code=0, answer='Đề xuất: kp_xy 1,8\n', stdout=''):
         calls.append((cmd, stdin, cwd))
         out = cmd[cmd.index('-o') + 1]
         if answer is not None:
             with open(out, 'w', encoding='utf-8') as f:
                 f.write(answer)
-        return code, log.replace('workdir: D:\\STRA_A', 'workdir: ' + str(r)).encode('utf-8')
+        fix = lambda x: x.replace('workdir: D:\\STRA_A', 'workdir: ' + str(r)).encode('utf-8')  # noqa: E731
+        return code, fix(stdout), fix(log)
     monkeypatch.setattr(H, 'run_codex', fake)
     yield r, calls
     os.chdir(HERE)
@@ -96,6 +98,9 @@ def test_lock_lines_after_the_header_do_not_count(root, capsys, monkeypatch):
     two = GOOD_LOG.replace('model: gpt-6.1-sol\n', 'model: gpt-6.1-sol\nmodel: gpt-5\n')
     monkeypatch.setattr(H, 'run_codex', lambda c, s, w: f(c, s, w, log=two))
     assert H.main(['--thu']) == 2
+    wrong = GOOD_LOG.replace('sandbox: custom permissions', 'sandbox: danger-full-access')
+    monkeypatch.setattr(H, 'run_codex', lambda c, s, w: f(c, s, w, log=wrong, stdout=GOOD_LOG))   # right header in stdout
+    assert H.main(['--thu']) == 2 and 'kp_xy' not in capsys.readouterr().out
 
 
 def test_pinned_program_and_version(root, capsys, monkeypatch):
@@ -104,6 +109,9 @@ def test_pinned_program_and_version(root, capsys, monkeypatch):
     monkeypatch.setenv('PATH', str(r))
     monkeypatch.setattr(H, 'codex_version', lambda e: '0.167.0-alpha.4.1')
     assert H.main(['--thu']) == 2 and 'thử rào' in capsys.readouterr().out
+    monkeypatch.setattr(H, 'codex_version', lambda e: H.CODEX_VERSION)            # right version, other program
+    (r / '..' / 'codex.exe').write_bytes(b'khac')
+    assert H.main(['--thu']) == 2 and 'SHA' in capsys.readouterr().out
     monkeypatch.setattr(H, 'CODEX_EXE', str(r / 'khong_co.exe'))
     assert H.main(['--thu']) == 2
     assert calls == []

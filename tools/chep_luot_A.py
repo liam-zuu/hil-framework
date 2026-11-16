@@ -57,7 +57,7 @@ STAGES_A = ('screen', 'confirm', 'explore')
 FORBIDDEN_PARTS = ('sealed', 'sealed_test', 'o1_feas', 's03', 's04', 'logs_sweep', 'final')   # luot, tai_lieu
 SEALED_PARTS = ('sealed', 'sealed_test', 'logs_sweep', 'o1_feas')                             # mien, s03_quet
 EXTS = ('.csv', '.json', '.txt', '.md')
-MEDIA_MAGIC = (b'\x89PNG', b'\xff\xd8\xff', b'GIF8', b'RIFF', b'\x1aE\xdf\xa3', b'BM')
+MEDIA_MAGIC = (b'\x89PNG', b'\xff\xd8\xff', b'GIF8', b'RIFF', b'\x1aE\xdf\xa3')   # SA2-5: no 'BM' (text "BMS…")
 MAX_BYTES = 20 * 1024 * 1024            # [ĐỀ XUẤT], set at C8 from real log sizes
 NOTE_MAX_BYTES = 20 * 1024
 SCORE_ESP32_SHA = 'esp32_sha256'        # C8: c7_score.py keys
@@ -66,6 +66,9 @@ SCORE_OUTCOME = 'outcome'
 SCORE_VERSION_KEYS = ('version', 'scorer_version', 'gate_version')
 ROWS_NEED = ('e_perp', 'e_theta_lane', 'e_theta_cmd')       # C8: c7_score.py --rows columns
 ROLES = ('log_esp32', 'log_segments', 'score', 'sai_so', 'quy_dao', 'theo_doi', 'ghi_chu')
+ROLE_EXT = dict(log_esp32=('.csv',), log_segments=('.csv',), score=('.json',), sai_so=('.csv',), quy_dao=('.csv',),
+                theo_doi=('.json',), ghi_chu=('.txt', '.md'))                 # SA2-1: format by role
+S03_SPEEDS = (0.2, 0.5, 0.8)            # S03 v8 §2 (O1 v7 3.1): every gain point at these speeds (SA-15)
 TUNING_NEED = ('run_uid', 'campaign', 'stage', 'platform', 'results_dir', 'gate_json_sha256', 'run_outcome')
 SPECS = ('06_SPECS/2026-10-28_Spec_S05_So_quy_trinh_RQ3.md', '06_SPECS/2026-11-04_De_xuat_O1_nhiem_vu_san_v11.md')
 S03_HISTORY = ('2026-11-10_run02',)     # S05 §3.2: history, never the A domain
@@ -335,9 +338,13 @@ def readme_new(hop, new_rows):
 def readme_write(hop, data):
     p = os.path.join(hop, 'README.md')
     tmp = p + '.tmp_chep'
-    with open(tmp, 'wb') as f:
-        f.write(data)
-    os.replace(tmp, p)
+    try:
+        with open(tmp, 'wb') as f:
+            f.write(data)
+        os.replace(tmp, p)
+    finally:
+        if os.path.exists(tmp):                                            # SA-11: no temp left on failure
+            os.remove(tmp)
 
 
 # ── luot ──────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -434,8 +441,8 @@ def luot(a):
         check_parts(p, FORBIDDEN_PARTS, role)
         if not inside(p, root):
             raise Refused(f'{role}: {p} is not inside results_dir of the run')
-        sh[role] = check_file(p, role, **(dict(exts=('.txt', '.md'), max_bytes=NOTE_MAX_BYTES)
-                                          if role == 'ghi_chu' else {}))
+        sh[role] = check_file(p, role, exts=ROLE_EXT[role],
+                              **(dict(max_bytes=NOTE_MAX_BYTES) if role == 'ghi_chu' else {}))
     if a.segments and os.path.basename(a.segments) != os.path.basename(a.esp32) + '.segments.csv':
         raise Refused('log_segments: name must be <log>.segments.csv of log_esp32')
     if os.path.dirname(real(a.track)) != os.path.dirname(real(a.frames)):
@@ -528,11 +535,14 @@ def luot(a):
             if have:
                 moved = cu_name(os.path.join(base, have))
                 os.rename(os.path.join(base, have), moved)
-            os.rename(tmp, dst)
+            placed = False
             try:
+                os.rename(tmp, dst)
+                placed = True
                 readme_write(hop, new)
-            except BaseException:
-                shutil.rmtree(dst)
+            except BaseException:                                          # SA-11: undo both steps
+                if placed:
+                    shutil.rmtree(dst)
                 if moved:
                     os.rename(moved, os.path.join(base, have))
                 raise
@@ -572,8 +582,8 @@ def _put(hop, items, thay):
         try:
             for src, n, _, _, h in items:
                 tmp = os.path.join(hop, '.tmp_chep_' + n)
+                tmps.append(tmp)                                           # SA-11: known before the copy
                 shutil.copyfile(src, tmp)
-                tmps.append(tmp)
                 if sha256(tmp) != h:
                     raise Refused(f'{n}: copy SHA-256 differs from the checked source')
             for (src, n, _, _, _), tmp in zip(items, tmps):
@@ -720,14 +730,20 @@ def mien_rows(run):
     miss = [c for c in LEVEL_COLS if c not in lcol] + [c for c in ('luoi',) if c not in scol]
     if miss:
         raise Refused(f'S03 v8.3 columns missing {miss}: run made by a tool before v8.3, a, b not guessed')
-    speeds = sorted({_f(r['v'], 'v') for r in sw})                          # SA-15: every row, default check too
+    speeds = sorted(S03_SPEEDS)                                             # SA-15: fixed by the spec
+    got = sorted({_f(r['v'], 'v') for r in sw})
+    if got != speeds:
+        raise Refused(f'sweep.csv speeds {got}, need {speeds} (S03 v8)')
     ctrls = {r['controller'] for r in sw}
     if ctrls != set(GAINS_S03):
         raise Refused(f'controllers {sorted(ctrls)}: need {sorted(GAINS_S03)}')
     for c in GAINS_S03:
-        dv = sorted(_f(r['v'], 'v') for r in sw if r['controller'] == c and r['factor'] == DEFAULT_ROWS[0])
-        if dv != speeds:
-            raise Refused(f'{c}: default check rows at speeds {dv}, need {speeds}')
+        for alias in DEFAULT_ROWS:                                         # SA2-2: either name, each complete
+            dv = sorted(_f(r['v'], 'v') for r in sw if r['controller'] == c and r['factor'] == alias)
+            if dv and dv != speeds:
+                raise Refused(f'{c}: {alias} rows at speeds {dv}, need {speeds} once each')
+        if not any(r['controller'] == c and r['factor'] in DEFAULT_ROWS for r in sw):
+            raise Refused(f'{c}: no default check rows')
     lev = {}
     for r in lv:
         if (r['controller'], r['factor']) in lev:
@@ -817,9 +833,11 @@ def mien(a):
     try:                                                                   # SA-12: the pair or nothing
         for p, b in pair:
             t = p + '.tmp_mien'
+            if os.path.exists(t):
+                raise Refused(f'{t} left by a failed run: look, then remove it by hand')
+            tmps.append(t)                                                 # SA-12: known before the write
             with open(t, 'xb') as f:
                 f.write(b)
-            tmps.append(t)
         for (p, _), t in zip(pair, tmps):
             if os.path.exists(p):
                 c = cu_name(p)
@@ -882,9 +900,11 @@ def box_check(hop):
                 bad.append(f'{rel}: SHA {s} differs from its latest row {rs[-1]}')
             if cu and s not in (rs[:-1] if cur else rs):
                 bad.append(f'{rel}: no older row of {key} with this SHA')
-    for key, rs in by.items():
-        if rs[-1] not in {s for _, s, _ in disk.get(key, [])}:
-            bad.append(f'{key}: latest row has no file on the disk')
+    for key, rs in by.items():                                             # SA-17: every row, not only the last
+        on_disk = {s for _, s, _ in disk.get(key, [])}
+        for i, s in enumerate(rs):
+            if s not in on_disk:
+                bad.append(f'{key}: {"latest" if i == len(rs) - 1 else "older"} row {s} has no file on the disk')
     return rows, bad
 
 
@@ -973,11 +993,50 @@ def nhiem(root, extra):
 
 
 def read_ke_khai(path):
+    """A declaration written by ke-khai, every field used later of the right type (SA2-4)."""
     with open(path, encoding='utf-8') as f:
         d = yaml.safe_load(f)
-    if not isinstance(d, dict) or not isinstance(d.get('nhat_ky'), dict) or 'loi' not in d or 'hop_thu' not in d:
-        raise Refused(f'{path}: not a declaration of ke-khai (no nhat_ky / loi / hop_thu)')
+    ok = (isinstance(d, dict) and isinstance(d.get('loi'), list) and isinstance(d.get('hop_thu'), dict)
+          and isinstance(d['hop_thu'].get('readme_sha256'), str) and isinstance(d.get('nhat_ky'), dict)
+          and all(isinstance(v, dict) and isinstance(v.get('co'), int) and isinstance(v.get('sha256'), str)
+                  for v in d['nhat_ky'].values())
+          and isinstance(d.get('tro_ly_codex'), dict) and isinstance(d['tro_ly_codex'].get('lan_goi'), list))
+    if not ok:
+        raise Refused(f'{path}: not a declaration of ke-khai (fields nhat_ky, loi, hop_thu, tro_ly_codex)')
     return d
+
+
+def declaration_problems(kk, root):
+    """Why a declaration is not the current state (SA-20, SA-22): errors in it, README changed after it, NHAT_KY or
+    CODEX changed after it, a Codex call not on the pinned model and effort."""
+    out = []
+    if kk['loi']:
+        out.append(f'the declaration has {len(kk["loi"])} errors')
+    if kk['hop_thu']['readme_sha256'] != sha256(os.path.join(root, HOP_THU_DIR, 'README.md')):
+        out.append('README.md changed after the declaration')
+    now_nk, _ = nhat_ky(root, None)
+    if now_nk != kk['nhat_ky']:
+        out.append('NHAT_KY or CODEX changed after the declaration')
+    hc = load_hoi_codex()
+    bad = [c.get('log') for c in kk['tro_ly_codex']['lan_goi']
+           if not isinstance(c, dict) or c.get('model') != hc.MODEL or c.get('effort') != hc.EFFORT]
+    if bad:
+        out.append(f'Codex calls not on {hc.MODEL} / {hc.EFFORT}: {bad}')
+    return out
+
+
+def load_hoi_codex():
+    """The wrapper module, for its pinned program, version, model and effort (SA2-3: one source)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('hoi_codex_src', HOI_CODEX_SRC)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def codex_cli_version():
+    exe = load_hoi_codex().CODEX_EXE
+    return _tool_version([exe, '--version']) if os.path.isfile(exe) else ''
 
 
 def ke_khai(a):
@@ -987,6 +1046,8 @@ def ke_khai(a):
         raise Refused(f'{a.out} exists: never overwritten')
     if bool(a.truoc) == bool(a.lan_dau):
         raise Refused('give --truoc <last declaration> (append-only check), or --lan-dau for the first one (SA-18)')
+    if not re.fullmatch(r'hop_thu_A_[A-Za-z0-9_-]+\.yaml', os.path.basename(a.out)):
+        raise Refused('--out: name hop_thu_A_<tag>.yaml, in the folder of A (every declaration in one place, SA-18)')
     prev = read_ke_khai(a.truoc)['nhat_ky'] if a.truoc else None
     if a.lan_dau and [n for n in os.listdir(os.path.dirname(os.path.abspath(a.out)))
                       if n.startswith('hop_thu_A') and n.endswith('.yaml')]:
@@ -1000,7 +1061,7 @@ def ke_khai(a):
                           dong=[dict(file=r[0].strip('`'), nguon=r[1], commit=r[2].strip('`'), sha16=r[3].strip('`'),
                                      ngay=r[4]) for r in rows]),
              tro_ly_claude=dict(phien=a.phien or [], claude_code=_tool_version(['claude', '--version'])),
-             tro_ly_codex=dict(cli=_tool_version(['codex', '--version']), lan_goi=codex_calls(root)),
+             tro_ly_codex=dict(cli=codex_cli_version(), lan_goi=codex_calls(root)),
              rao=rao, nhiem_thong_tin=nhiem(root, a.nhiem), nhat_ky=nk,
              cong_cu=dict(hoi_codex_sha256=sha256(hc) if os.path.isfile(hc) else None),
              truoc=dict(file=os.path.basename(a.truoc), sha256=sha256(a.truoc)) if a.truoc else None,
@@ -1034,7 +1095,7 @@ def kiem_c13(a):
     res = []
     _, bad = rao_check(root)
     res.append(('1 thử rào có, đúng bản đã duyệt; 3 SHA khóa', not bad, '; '.join(bad)))
-    vc, vx = _tool_version(['claude', '--version']), _tool_version(['codex', '--version'])
+    vc, vx = _tool_version(['claude', '--version']), codex_cli_version()
     res.append(('2 phiên bản bằng lúc thử rào', (vc, vx) == (RAO_VERSIONS['claude'], RAO_VERSIONS['codex']),
                 f'claude {vc}, codex {vx}; khác thì chạy lại thử rào'))
     cfg = os.path.join(os.path.expanduser('~'), '.codex', 'config.toml')
@@ -1058,9 +1119,8 @@ def kiem_c13(a):
     okh = os.path.isfile(hc) and sha256(hc) == sha256(HOI_CODEX_SRC)
     res.append(('6 hoi_codex.py bằng bản gốc', okh, ''))
     try:                                                                   # SA-20: parsed, no error, current
-        kk = read_ke_khai(a.ke_khai)
-        okk = kk['loi'] == [] and kk['hop_thu']['readme_sha256'] == sha256(os.path.join(hop, 'README.md'))
-        note = '' if okk else 'kê khai có lỗi hay README đã đổi sau kê khai: chạy ke-khai lại'
+        pr = declaration_problems(read_ke_khai(a.ke_khai), root)
+        okk, note = not pr, '; '.join(pr) + ('; chạy ke-khai lại' if pr else '')
     except (Refused, OSError, yaml.YAMLError) as exc:
         okk, note = False, str(exc)
     res.append(('7 hop_thu_A.yaml mới nhất, không lỗi', okk, note))
@@ -1102,9 +1162,9 @@ def dong_goi(a):
     miss = [c for c in CAMPAIGNS_A if c not in fr]
     if miss:
         raise Refused(f'{miss} not frozen yet: pack at the end of A only')
-    kk = read_ke_khai(a.ke_khai)                                           # SA-22: the last declaration
-    if kk['loi'] or kk['hop_thu']['readme_sha256'] != sha256(os.path.join(a.stra_a, HOP_THU_DIR, 'README.md')):
-        raise Refused('the last ke-khai has errors or is older than the mailbox: run ke-khai again')
+    pr = declaration_problems(read_ke_khai(a.ke_khai), a.stra_a)          # SA-22: the last declaration, current
+    if pr:
+        raise Refused('; '.join(pr) + ': run ke-khai again (with --truoc) first')
     if os.path.exists(a.dich):
         raise Refused(f'{a.dich} exists: never overwritten')
     tr = a.transcript or []

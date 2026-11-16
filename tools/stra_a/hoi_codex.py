@@ -30,6 +30,7 @@ SHA_CODEX_CONFIG = '748bf0c8c5aeb08fd222337172ee939e6bc83ea1f3caf1ff5bcacbca693c
 CODEX_EXE = (r'C:\Users\liam\AppData\Roaming\npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64'
              r'\vendor\x86_64-pc-windows-msvc\bin\codex.exe')
 CODEX_VERSION = '0.163.0'
+CODEX_SHA256 = '2692c8c7bb2cf8b0aefe638741fc90236f4b824c59578ce84994f9de58200993'   # SA-1, sha256sum 16/11
 MODEL = 'gpt-6.1-sol'
 EFFORT = 'high'
 WAIT_COLS = ['hoi', 'bat_dau', 'ket_thuc', 'giay', 'ma_thoat', 'model', 'effort', 'luot', 'codex_home']
@@ -65,9 +66,10 @@ def codex_version(exe):
 
 
 def run_codex(cmd, stdin_bytes, cwd):
-    """The only call of Codex (tests replace this function and codex_version)."""
+    """The only call of Codex (tests replace this function and codex_version). Returns (code, stdout, stderr):
+    codex exec writes its progress and header to stderr, the final message to stdout (SA-2: kept apart)."""
     r = subprocess.run(cmd, input=stdin_bytes, capture_output=True, cwd=cwd, timeout=TIMEOUT_S)
-    return r.returncode, r.stdout + r.stderr
+    return r.returncode, r.stdout, r.stderr
 
 
 def codex_cmd(out):
@@ -165,6 +167,8 @@ def main(argv=None):
             raise Refused('câu hỏi rỗng')
         if not os.path.isfile(CODEX_EXE):
             raise Refused(f'không thấy Codex ở đường dẫn ghim {CODEX_EXE}: báo Liam')
+        if sha256(CODEX_EXE) != CODEX_SHA256:                                # SA-1: the program itself
+            raise Refused('chương trình Codex khác bản đã thử rào (SHA): chạy lại thử rào, báo Liam')
         v = codex_version(CODEX_EXE)
         if v != CODEX_VERSION:
             raise Refused(f'Codex {v or "?"} khác bản đã thử rào {CODEX_VERSION}: chạy lại thử rào, báo Liam')
@@ -176,13 +180,14 @@ def main(argv=None):
         with open(q, 'xb') as f:
             f.write(body)
         try:
-            code, text = run_codex(codex_cmd(tmp), body, ROOT)
+            code, out_b, err_b = run_codex(codex_cmd(tmp), body, ROOT)
         except subprocess.TimeoutExpired as exc:                             # SA-23
-            code, text = 124, (exc.output or b'') + f'\n[hoi_codex: quá {TIMEOUT_S} s]'.encode()
+            code, out_b = 124, exc.output or b''
+            err_b = (exc.stderr or b'') + f'\n[hoi_codex: quá {TIMEOUT_S} s]'.encode()
         t1 = dt.datetime.now().astimezone()
         with open(log, 'xb') as f:
-            f.write(text)
-        s = text.decode('utf-8', 'replace')
+            f.write(b'=== stderr ===\n' + err_b + b'\n=== stdout ===\n' + out_b)
+        s = err_b.decode('utf-8', 'replace')                                 # SA-2: header from stderr only
         miss = check_log(s)
         h = log_header(s)
         wp = os.path.join(cdir, 'thoi_gian.csv')
