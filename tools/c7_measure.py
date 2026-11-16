@@ -361,7 +361,10 @@ def apply_gates(rows, rms_h, gates=None, quant=0.0):
     DEFAULT_GATES; the constants file at C8, CS1-15). quant > 0 (regate of a rounded frames.csv, CS1-17): res_sim_m
     lies in [_res_sim_lo, _res_sim_hi] of the row (else +-quant) and every scale is off by up to quant; a frame whose
     (2a) or (2b) verdict changes inside those intervals fails with why 'can_track_lai' (decide it from the video
-    with track). Returns the median scale of the frames that passed (1), (2a) (reported only)."""
+    with track). A neighbour whose (2a) is undecided may or may not be a neighbour (CS2-6): the median runs over
+    the certain neighbours plus every subset of those (keeping scale_min), and a frame whose verdict changes over
+    that range is 'can_track_lai' too. Returns the median scale of the frames that passed (1), (2a) (reported
+    only)."""
     g = DEFAULT_GATES if gates is None else check_gates(gates)
     for r in rows:
         why = []
@@ -384,24 +387,45 @@ def apply_gates(rows, rms_h, gates=None, quant=0.0):
             r[k] = float('nan')
     p12 = [k for k, r in enumerate(rows) if not r['why']]
     sc = np.array([rows[k]['scale'] for k in p12])
-    tp = np.array([rows[k]['t_s'] for k in p12])
-    for j, k in enumerate(p12):
+    # neighbours of (2b): the frames that passed (1) and (2a). With quant > 0 a frame whose ONLY failure is an
+    # undecided (2a) ('can_track_lai') may be in that set or not (CS2-6): pool them, flagged
+    pool = sorted(p12 + ([k for k, r in enumerate(rows) if r['why'] == ['can_track_lai']] if quant > 0.0 else []))
+    amb = np.array([bool(rows[k]['why']) for k in pool], bool)
+    sp = np.array([rows[k]['scale'] for k in pool])
+    tp = np.array([rows[k]['t_s'] for k in pool])
+    smin, rel = g['scale_min'], g['scale_rel']
+    for j, k in enumerate(pool):
+        if amb[j]:
+            continue
         a = int(np.searchsorted(tp, tp[j] - g['scale_win_s'] - 1e-9, side='left'))
         b = int(np.searchsorted(tp, tp[j] + g['scale_win_s'] + 1e-9, side='right'))
-        nb = np.r_[sc[a:j], sc[j + 1:b]]
-        if len(nb) < g['scale_min']:
+        idx = np.r_[np.arange(a, j), np.arange(j + 1, b)].astype(int)
+        nb, nu = sp[idx][~amb[idx]], np.sort(sp[idx][amb[idx]])
+        if len(nb) + len(nu) < smin:
             rows[k]['why'].append('ti_le_it_lan_can')
             continue
-        ref = float(np.median(nb))
+        if not len(nu):
+            ref = float(np.median(nb))
+            mmin = mmax = ref
+        else:
+            # the median over the certain neighbours plus any subset of the undecided ones that keeps at least
+            # scale_min: for a subset size the smallest (largest) undecided scales give the lowest (highest) median
+            ref = float(np.median(np.r_[nb, nu]))
+            sizes = range(max(0, smin - len(nb)), len(nu) + 1)
+            mmin = min(float(np.median(np.r_[nb, nu[:m]])) for m in sizes)
+            mmax = max(float(np.median(np.r_[nb, nu[len(nu) - m:]])) for m in sizes)
         rows[k]['scale_ref'] = ref
+        few = len(nb) < smin                # the frame may also fail for too few neighbours
         if quant > 0.0:                    # the scale and every neighbour off by up to quant: an interval of ratios
-            r_lo = (rows[k]['scale'] - quant) / (ref + quant) - 1.0
-            r_hi = (rows[k]['scale'] + quant) / (ref - quant) - 1.0
+            r_lo = (rows[k]['scale'] - quant) / (mmax + quant) - 1.0
+            r_hi = (rows[k]['scale'] + quant) / (mmin - quant) - 1.0
             dmax = max(abs(r_lo), abs(r_hi))
             dmin = 0.0 if r_lo <= 0.0 <= r_hi else min(abs(r_lo), abs(r_hi))
-            if not dmax <= g['scale_rel']:
-                rows[k]['why'].append('can_track_lai' if dmin <= g['scale_rel'] else 'ti_le')
-        elif not abs(rows[k]['scale'] / ref - 1.0) <= g['scale_rel']:
+            if not dmin <= rel:
+                rows[k]['why'].append('ti_le')
+            elif not dmax <= rel or few:
+                rows[k]['why'].append('can_track_lai')
+        elif not abs(rows[k]['scale'] / ref - 1.0) <= rel:
             rows[k]['why'].append('ti_le')
     for r in rows:
         r['valid'] = not r['why']
@@ -426,29 +450,39 @@ def res_sim_interval(res_m, scale, side, q=CSV_QUANT):
     return lo, hi
 
 
+def cell_quant(row, col):
+    """Half a unit of the last decimal written in the frames.csv cell (read_frames '_dec'); CSV_QUANT (6 decimals)
+    for a row without that record."""
+    d = (row.get('_dec') or {}).get(col)
+    return CSV_QUANT if d is None else 0.5 * 10.0 ** (-d)
+
+
 def regate(rows, session, gates=None):
-    """The gates of this version on rows read from a frames.csv written before (read_frames): res_sim_m from
-    res_m and scale where it is missing (res_sim_from), then apply_gates with the rounding of the CSV (CS1-17):
-    res_m, res_sim_m, scale are known to +-CSV_QUANT only (6 decimals), so a frame whose verdict of (2a) or (2b)
-    changes inside that interval fails with why 'can_track_lai' (counted by the caller; decide it with track on the
-    video). In place; returns the median scale. regate does NOT replace track when the pose measurement itself has
-    changed since the file was written (for example the tag-offset rotation of car_pose, 16/11): it only re-applies
-    the gates to the stored residuals and scales; the stored centres are used as they are."""
+    """The gates of this version on rows read from a frames.csv written before (read_frames): res_sim_m is ALWAYS
+    rebuilt from res_m and scale (res_sim_from: an exact identity of the two Procrustes fits) with the rounding of
+    THOSE cells (CS1-17, CS2-7: a res_sim_m written by an earlier regate is an estimate, not a measurement, and is
+    not read), then apply_gates with that rounding: a frame whose verdict of (2a) or (2b) changes inside the interval
+    fails with why 'can_track_lai' (counted by the caller; decide it with track on the video). The rounding of a cell
+    is its number of decimals (cell_quant); write_frames keeps the decimals read, so a regate of a regate gives the
+    same verdicts. In place; returns the median scale. regate does NOT replace track when the pose measurement itself
+    has changed since the file was written (for example the tag-offset rotation of car_pose, 16/11): it only
+    re-applies the gates to the stored residuals and scales; the stored centres are used as they are."""
     side = session['car_side_m']
+    q_scale = 0.0
     for r in rows:
         r.pop('_res_sim_lo', None)
         r.pop('_res_sim_hi', None)
         if not r['car_seen']:
             continue
-        if np.isfinite(r.get('res_sim_m', float('nan'))):
-            r['_res_sim_lo'], r['_res_sim_hi'] = max(0.0, r['res_sim_m'] - CSV_QUANT), r['res_sim_m'] + CSV_QUANT
-        elif np.isfinite(r['res_m']) and np.isfinite(r['scale']):
+        q = max(cell_quant(r, 'res_m'), cell_quant(r, 'scale'))
+        q_scale = max(q_scale, cell_quant(r, 'scale'))
+        if np.isfinite(r['res_m']) and np.isfinite(r['scale']):
             r['res_sim_m'] = res_sim_from(r['res_m'], r['scale'], side)
-            r['_res_sim_lo'], r['_res_sim_hi'] = res_sim_interval(r['res_m'], r['scale'], side)
+            r['_res_sim_lo'], r['_res_sim_hi'] = res_sim_interval(r['res_m'], r['scale'], side, q)
         else:
             r['res_sim_m'] = float('nan')
             r['_res_sim_lo'] = r['_res_sim_hi'] = float('nan')
-    out = apply_gates(rows, session['rms_px_H'], gates, quant=CSV_QUANT)
+    out = apply_gates(rows, session['rms_px_H'], gates, quant=q_scale or CSV_QUANT)
     for r in rows:
         r.pop('_res_sim_lo', None)
         r.pop('_res_sim_hi', None)
@@ -590,11 +624,14 @@ FINE_COLS = ('res_m', 'res_sim_m', 'scale', 'scale_ref')     # written with 10 d
 
 
 def write_frames(path, rows):
+    """FINE_COLS with 10 decimals, or with the decimals the row was read with (read_frames '_dec'; CS2-7: a regate
+    must not write a rounded value with more digits than it holds)."""
     with open(path, 'w', newline='', encoding='utf-8') as f:
         w = csv.writer(f)
         w.writerow(FRAME_COLS)
         for r in rows:
             out = []
+            dec = r.get('_dec') or {}
             for c in FRAME_COLS:
                 v = r.get(c)
                 if c == 'why':
@@ -604,17 +641,26 @@ def write_frames(path, rows):
                 elif v is None or (isinstance(v, float) and math.isnan(v)):
                     v = ''
                 elif isinstance(v, float):
-                    v = f'{v:.10f}' if c in FINE_COLS else f'{v:.6f}'
+                    v = f'{v:.{dec.get(c, 10)}f}' if c in FINE_COLS else f'{v:.6f}'
                 out.append(v)
             w.writerow(out)
 
 
+def _decimals(s):
+    s = s.strip().lower()
+    if 'e' in s:
+        return None                                       # not written by write_frames: no record
+    return len(s.split('.', 1)[1]) if '.' in s else 0
+
+
 def read_frames(path):
-    """Rows of frames.csv as dicts with numbers (NaN for empty), valid as bool."""
+    """Rows of frames.csv as dicts with numbers (NaN for empty), valid as bool; '_dec': the decimals of the
+    non-empty FINE_COLS cells (regate rounding, CS2-7)."""
     rows = []
     with open(path, newline='', encoding='utf-8') as f:
         for r in csv.DictReader(f):
             o = {}
+            dec = {}
             for c in FRAME_COLS:
                 v = r.get(c, '')
                 if c == 'why':
@@ -625,6 +671,9 @@ def read_frames(path):
                     o[c] = int(v)
                 else:
                     o[c] = float(v) if v != '' else float('nan')
+                    if c in FINE_COLS and v != '' and _decimals(v) is not None:
+                        dec[c] = _decimals(v)
+            o['_dec'] = dec
             rows.append(o)
     return rows
 

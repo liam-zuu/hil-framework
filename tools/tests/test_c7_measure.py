@@ -1,5 +1,6 @@
 """Tests for tools/c7_measure.py on SYNTHETIC clips rendered here from a known camera (NOT a measurement).
 Floor marks ID 1-24 at the print-CSV centres, check tags ID 25-33, car tag ID 0 on a plate at height h."""
+import csv
 import json
 import math
 import os
@@ -428,3 +429,106 @@ def test_cs1_15_17_regate_cli_with_constants(tmp_path):
     info = json.loads((tmp_path / 'out' / 'track.json').read_text(encoding='utf-8'))
     assert info['gates']['car_res_sim_m'] == 0.0001 and info['gates']['hang_so']['file'] == 'hs.json'
     assert info['n_valid'] == 0 and info['shift_kind'] == 'median_magnitude'      # no shift_mag_px column written
+
+
+# ---------------------------------------------------------------- Codex vong 2 (17/11): CS2-6, CS2-7, window of 00121a4
+def test_cs2_6_undecided_neighbours_may_change_the_median():
+    """Codex CS2-6: 18 frames at 120 Hz within +-0.25 s; the frame scored has scale 1.0055, eight certain neighbours
+    1.001, nine neighbours 1.000 whose residual written 0.001500 may be 1.4999 mm (pass) or 1.5001 mm (fail). Dropping
+    the nine gave median 1.001 and a pass (0.45 %); with them the median is 1.000 and the frame fails (0.55 %): the
+    verdict depends on the undecided frames, so the frame is 'can_track_lai'."""
+    rows = []
+    for k in range(18):
+        sc, res = (1.0055, 0.0002) if k == 8 else ((1.000, 0.0015) if k % 2 else (1.001, 0.0002))
+        rows.append(dict(idx=k, t_s=k / 120.0, n_marks=24, rms_px=0.3, car_seen=True, res_m=res,
+                         res_sim_m=float('nan'), scale=sc, x=0.0, y=0.0, psi=0.0))
+    cm.regate(rows, dict(car_side_m=0.1444, rms_px_H=0.3))
+    und = [r for r in rows if r['scale'] == 1.000]
+    assert len(und) == 9 and all(r['why'] == ['can_track_lai'] for r in und)
+    assert rows[8]['why'] == ['can_track_lai']
+    rows[8]['scale'] = 1.0005                                     # within 0.5 % of 1.000 and of 1.001: decided
+    cm.regate(rows, dict(car_side_m=0.1444, rms_px_H=0.3))
+    assert rows[8]['valid']
+
+
+def test_cs2_6_undecided_neighbours_and_the_neighbour_count():
+    """Seven certain neighbours plus undecided ones: the frame may fail for too few neighbours or pass: undecided."""
+    rows = [dict(idx=k, t_s=k / 60.0, n_marks=24, rms_px=0.3, car_seen=True, res_m=0.0015 if k in (1, 3) else 0.0002,
+                 res_sim_m=float('nan'), scale=1.0, x=0.0, y=0.0, psi=0.0) for k in range(10)]
+    cm.regate(rows, dict(car_side_m=0.1444, rms_px_H=0.3))
+    assert rows[0]['why'] == ['can_track_lai'] and rows[1]['why'] == ['can_track_lai']
+
+
+def _old_csv(path, rows):
+    """A frames.csv as the version before CS1-17 wrote it: 6 decimals, no res_sim_m value."""
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(cm.FRAME_COLS)
+        for r in rows:
+            w.writerow(['' if c in ('res_sim_m', 'shift_mag_px') else
+                        ('|'.join(r[c]) if c == 'why' else (int(r[c]) if isinstance(r[c], bool) else
+                                                            (f'{r[c]:.6f}' if isinstance(r[c], float) else r[c])))
+                        for c in cm.FRAME_COLS])
+
+
+def test_cs2_7_a_regate_of_a_regate_keeps_the_rounding(tmp_path):
+    """Codex CS2-7: side 0.1444 m, res_m 0.003410 and scale 0.970004 written with 6 decimals: the residual with scale
+    lies in about [1.49792, 1.50040] mm, undecided. The old first regate wrote the rebuilt 1.499163 mm with 10 decimals
+    and a second regate took it as a measurement (+-5e-7): pass. Now every regate rebuilds from res_m and scale with
+    their own decimals (kept when written again): undecided both times."""
+    side = 0.1444
+    lo, hi = cm.res_sim_interval(0.003410, 0.970004, side)
+    assert lo < 0.0015 < hi
+    row = dict(idx=0, t_s=0.0, valid=False, why=['xe_du_thua'], n_marks=24, rms_px=0.3, shift_px=0.2, cam_z=2.6,
+               car_seen=True, x=0.0, y=0.0, psi=0.0, tag_x=0.0, tag_y=0.0, res_m=0.003410, res_sim_m=float('nan'),
+               scale=0.970004, scale_ref=float('nan'), row_px=1.0, vx=float('nan'), vy=float('nan'),
+               wz=float('nan'), speed=float('nan'), shift_mag_px=float('nan'))
+    _old_csv(tmp_path / 'old.csv', [row])
+    sess = dict(car_side_m=side, rms_px_H=0.3)
+    rows = cm.read_frames(str(tmp_path / 'old.csv'))
+    cm.regate(rows, sess)
+    assert rows[0]['why'] == ['can_track_lai']
+    cm.write_frames(tmp_path / 'r1.csv', rows)
+    line = (tmp_path / 'r1.csv').read_text(encoding='utf-8').splitlines()[1].split(',')
+    assert line[cm.FRAME_COLS.index('res_m')] == '0.003410' and line[cm.FRAME_COLS.index('scale')] == '0.970004'
+    rows = cm.read_frames(str(tmp_path / 'r1.csv'))
+    cm.regate(rows, sess)
+    assert rows[0]['why'] == ['can_track_lai']
+
+
+def _scale_rows(scales, fps=120.0):
+    return [dict(idx=k, t_s=k / fps, n_marks=24, rms_px=0.3, car_seen=True, res_m=0.0002, res_sim_m=0.0002, scale=s,
+                 x=0.0, y=0.0, psi=0.0) for k, s in enumerate(scales)]
+
+
+def test_00121a4_window_of_0_25_s_not_15_frames_changes_the_median():
+    """120 fps: neighbours within +-10 frames at 1.000, from 11 to 30 frames away at 1.010. The median of +-15 frames
+    is 1.000 (the frame at 1.000 passes), that of +-0.25 s (+-30 frames) 1.010 (it fails, 0.99 %)."""
+    c = 40
+    sc = [1.000 if abs(k - c) <= 10 else 1.010 for k in range(81)]
+    rows = _scale_rows(sc)
+    cm.apply_gates(rows, 0.3)
+    assert rows[c]['scale_ref'] == pytest.approx(1.010) and rows[c]['why'] == ['ti_le']
+    win15 = [s for k, s in enumerate(sc) if k != c and abs(k - c) <= 15]
+    assert float(np.median(win15)) == pytest.approx(1.000)        # what a +-15-frame window would have used
+
+
+def test_00121a4_window_edges_and_exactly_eight_neighbours():
+    """A neighbour exactly 0.25 s away is in the window, one 1 ms beyond is not; exactly eight neighbours suffice,
+    seven do not."""
+    t = [0.0, 0.25, 0.251, -0.25, -0.251]
+    rows = [dict(idx=k, t_s=tk, n_marks=24, rms_px=0.3, car_seen=True, res_m=0.0002, res_sim_m=0.0002,
+                 scale={0.25: 1.02, -0.25: 1.02}.get(tk, 1.0), x=0.0, y=0.0, psi=0.0) for k, tk in enumerate(t)]
+    rows.sort(key=lambda r: r['t_s'])
+    base = rows[[r['t_s'] for r in rows].index(0.0)]
+    cm.apply_gates(rows, 0.3, dict(cm.DEFAULT_GATES, scale_min=2))
+    assert base['scale_ref'] == pytest.approx(1.02)                 # the two at +-0.25 s only (the +-0.251 s out)
+    ts = [0.0] + [0.01 * j for j in range(1, 9)]
+    rows = _scale_rows([1.0] * 9)
+    for r, tk in zip(rows, ts):
+        r['t_s'] = tk
+    cm.apply_gates(rows, 0.3)
+    assert rows[0]['valid']                                         # eight neighbours within 0.25 s
+    rows = _scale_rows([1.0] * 8)
+    cm.apply_gates(rows, 0.3)
+    assert all(r['why'] == ['ti_le_it_lan_can'] for r in rows)      # seven each

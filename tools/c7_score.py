@@ -21,7 +21,8 @@ Inputs
                t_trong, t_mat, bump, drift, the position-suspect rule, the yaw-suspect threshold, v_d, and the IMU
                block (c8_u_imu parameters, U_IMU per level). Required when trang_thai = khoa_c8, optional before
                (Codex 16/11 vong 1): duong_lenh (thresholds of the command path (2)-(4), CS1-14), cong_khung (the
-               frame-gate thresholds; frames.csv must have been gated with them, track.json beside it, CS1-15),
+               frame-gate thresholds; frames.csv must have been gated with them, track.json beside it with the frames_sha256 of the
+               frames.csv scored, CS1-15, CS2-5),
                gia_dinh_nghi_vi_tri ('dung' / 'khong_dung', the C8 check of the position-suspect assumption;
                'chua_kiem' before C8, CS1-18), imu.mien_dong (the locked range of U_IMU per level: angle turned,
                rate, angular acceleration, CS1-19). Schema: load_hang_so.
@@ -31,14 +32,17 @@ Clock (O1 3.4): t = 0 is the run_active rising edge of the log by o1_cmd_path.fi
 run_active = 1 whose line just before by log_seq was received with 0; that line lost: run lost to the
 measurement system). The video clock is matched by o1_time_sync.sync (C7b), or --offset-s with a reason; not
 matched: run lost to the measurement system. Command time of a frame: t = t_cam + offset - t0.
-U_t (O1 3.5 SC-12) = u_t_ghep_s (C7b residual, constants) + drift + tick (drift_bound, tick_max_s):
+U_t (O1 3.5 SC-12) = u_t_ghep_s (C7b residual, constants) [+ --offset-err-s] + drift + tick (drift_bound,
+tick_max_s):
   drift  the clock-rate part up to t_deadline (CS1-4): rate = max(C7b |offset_end - offset_start| / distance of the
          third centres, troi_ppm) x the largest distance from the centre of the C7b window to [0, t_deadline], plus
-         |offset used - mean of the thirds|; C7b short (K1): troi_ppm alone (CS1-6); --offset-s: troi_ppm x t_deadline.
+         |offset used - mean of the thirds|; C7b short (K1): troi_ppm alone (CS1-6); --offset-s: troi_ppm x the
+         largest distance from --offset-anchor-s (the command time where the offset was established) to
+         [0, t_deadline], and --offset-err-s added; no anchor or error: refused (CS2-1).
          e_max (S05 4.7 (i), Pi / ESP32) is not used: it does not bound the camera clock.
-  tick   the largest interval between consecutive RECEIVED log lines meeting [t0, t0 + t_deadline] (a lost line
-         may hide a long tick; the pairs across the window ends count; CS1-5); the log not reaching both ends:
-         no finite U_t, the run is lost to the measurement system.
+  tick   the largest interval between consecutive RECEIVED log lines meeting [t0, t0 + end of the union domain]
+         (CS2-2: the domain scored, not t_deadline; a lost line may hide a long tick; the pairs across the window
+         ends count; CS1-5); the log not reaching both ends: no finite U_t, the run is lost to the measurement system.
 
 Frames (O1 3.3)
   position-suspect  a valid frame whose centre is more than pred_m from a quadratic over +-pred_half valid
@@ -48,9 +52,11 @@ Frames (O1 3.3)
                     non-suspect frame; a suspect frame more than t_mat after the last non-suspect frame is a
                     TRACKING ERROR (R2V-1) and the later suspects of that chain are not scored. A suspect frame
                     whose search still hits the end of the window reopened to the cap is a tracking error (W11-4,
-                    as every frame; CS1-20). Not converged after 10 passes: the union of the last two passes,
-                    |p - p^| the largest seen (CS1-10). C8 check of the assumption not 'dung': lo_k of G2-G4 of a
-                    suspect frame is clamped at the threshold (no certain violation from it, O1 3.3; CS1-18).
+                    as every frame; CS1-20). Not converged after 10 passes: the union of the last two passes grown
+                    until closed, |p - p^| predicted again from the frames outside that final set; a suspect frame
+                    without nmin such neighbours has no finite U_p,k (G2-G4 undefined, n_undef; CS1-10, CS2-10).
+                    C8 check of the assumption not 'dung': for G2-G4 of a suspect frame lo_k is clamped at the
+                    threshold and hi_k is not finite: it gives chua_ket_luan only (O1 3.3; CS1-18, CS2-8).
   yaw check (IMU)   IMU yaw at the frame time from c8_u_imu.rv_samples / interp_yaw (period, tau_hat, scale, j_lim,
                     h_lim of the constants), aligned by c = median of wrap(psi_cam - psi_IMU) over >= n_min still
                     frames (|wz| < wz_still AND speed < v_d, CS1-11) in [t0 - pre_s, t0); the IMU yaw is built
@@ -69,7 +75,9 @@ Polyline.head_at, CS1-1); backward on the lane: report flag; s only grows; cut a
 count only up to the end of the union domain (CS1-7); a tracking error at the frame that starts a long gap wins
 (that frame is not before t1, CS1-8).
 G1 two ways (O1 3.3 RS2-1, R2V-3): way 1 (t_done[0]) the suspect frames are used like every frame (they push the
-progress), way 2 (t_done[1]) they are gaps, with speeds from the chain without them (CS1-9). Completion at a
+progress), way 2 (t_done[1]) they are gaps, with speeds from the chain without them (CS1-9). The speeds of both ways
+come from the frame poses of frames.csv by the derivative of c7_measure (way 1 over every valid frame), so without a
+suspect frame the two ways are the same (CS2-3); the speed column of frames.csv is reported only. Completion at a
 frame of the way: s >= S - D, t >= T_cmd,
 t < t_deadline, and over an unbroken trailing t_d of frames of the way (a gap above t_trong breaks it): speed < v_d,
 |wz| < v_d / (lx + ly), centre within D of the end point. Domains: common [0, earlier t_done], union [0, later
@@ -87,7 +95,8 @@ G2-G5 per frame (O1 3.4, 3.5): q_k with lo_k, hi_k
   States (rq3_log.cond_state2): khong_dat when lo of the common domain > threshold; else the three states on the
   union.
 Run outcome (O1 3.5):
-  hong_he_do   camera bumped (shift above bump_px: the length of the median shift vector, CS1-13), command path
+  hong_he_do   camera bumped (shift above bump_px: the length of the median shift vector, CS1-13; a frames.csv of the
+               version before 17/11, which holds the median of the lengths, is refused: track again, CS2-4), command path
                lost (o1_cmd_path flags, and (2)-(4) above the thresholds of the constants, CS1-14; fail cause
                'duong_lenh' when it is the only cause), edge unknown, clock not matched, U_t not bounded, no valid
                frame in the window, or t1
@@ -99,11 +108,12 @@ Run outcome (O1 3.5):
   else         the gate: one khong_dat -> khong_dat; else one chua_ket_luan -> chua_ket_luan; else dat.
 Reported, not deciding: placement before t = 0, pos_reset_n values, mark shift drift (design 3.6), the command path
 numbers (when the constants hold no thresholds), suspect counts, frames without a prediction, yaw check numbers, the
-first time the IMU yaw leaves the locked U_IMU range (handling: Liam decides when it happens, O1 3.3).
+first time the IMU motion leaves the locked U_IMU range (angle turned, gyro rate and acceleration as at C8, checked
+whether or not the yaw is aligned, CS2-9; handling: Liam decides when it happens, O1 3.3).
 
   python tools/c7_score.py --frames <dir>/frames.csv --esp32 <run>.csv --sender <run>_sender.txt --task O1-F05 \
-      --hang-so hang_so.json --out score.json [--offset-s D --offset-reason TEXT] [--k-start X,Y,DEG]
-      [--allow-final-set] [--events <run>.csv.events.txt] [--rows rows.csv]
+      --hang-so hang_so.json --out score.json [--offset-s D --offset-reason TEXT --offset-anchor-s T --offset-err-s E]
+      [--k-start X,Y,DEG] [--allow-final-set] [--events <run>.csv.events.txt] [--rows rows.csv]
 Last line: #ket_qua,ma=0,outcome=... scored (hong_he_do included) / 2 refused or any error (CS1-6).
 """
 from __future__ import annotations
@@ -508,36 +518,50 @@ def one_solution(lane, x, y, w_lo, w_hi, upk):
 
 
 # ---------------------------------------------------------------- frames
+def _predict(t, x, y, sus, half, nmin):
+    """|p_k - p^_k| of every frame from a quadratic over +-half frames that are NOT in sus (the frame excluded);
+    NaN when fewer than nmin such frames."""
+    n = len(t)
+    pred = np.full(n, np.nan)
+    for k in range(n):
+        lo, hi = max(0, k - half), min(n, k + half + 1)
+        idx = [j for j in range(lo, hi) if j != k and not sus[j]]
+        if len(idx) < nmin:
+            continue
+        tt = t[idx] - t[k]
+        px = np.polyfit(tt, x[idx], 2)[-1]
+        py = np.polyfit(tt, y[idx], 2)[-1]
+        pred[k] = math.hypot(x[k] - px, y[k] - py)
+    return pred
+
+
 def mark_suspects(t, x, y, thr, half, nmin):
     """Position-suspect frames (module docstring): (suspect bool array, |p - p^| array (NaN without a prediction),
-    passes used, converged). Not converged after SUSPECT_PASSES (the set cycles, CS1-10): the suspects are the UNION
-    of the last two passes and |p - p^| the largest finite value seen at the frame over all passes, so U_p,k is not
-    taken from a pass that happened to drop the frame; the flag is reported and the rule is locked at C8."""
+    passes used, converged). Converged: the prediction of every frame uses the non-suspect frames of the final set.
+    Not converged after SUSPECT_PASSES (the set cycles, CS1-10, CS2-10): start from the UNION of the last two passes,
+    add every frame outside the set whose prediction from the frames outside the set is above thr, until none is
+    added (the set only grows, so it ends); |p - p^| of every frame is then predicted again from the frames outside
+    that FINAL set only (O1 3.3: the prediction uses non-suspect frames only). A suspect frame left without nmin
+    such neighbours has NaN: no supported prediction, U_p,k is not finite (evaluate). The flag is reported; the rule
+    is locked at C8."""
     n = len(t)
     sus = np.zeros(n, bool)
     hist = []
     for it in range(1, SUSPECT_PASSES + 1):
-        new = np.zeros(n, bool)
-        pred = np.full(n, np.nan)
-        for k in range(n):
-            lo, hi = max(0, k - half), min(n, k + half + 1)
-            idx = [j for j in range(lo, hi) if j != k and not sus[j]]
-            if len(idx) < nmin:
-                continue
-            tt = t[idx] - t[k]
-            px = np.polyfit(tt, x[idx], 2)[-1]
-            py = np.polyfit(tt, y[idx], 2)[-1]
-            pred[k] = math.hypot(x[k] - px, y[k] - py)
-            new[k] = pred[k] > thr
-        hist.append((new, pred))
+        pred = _predict(t, x, y, sus, half, nmin)
+        new = pred > thr                                   # NaN > thr is False
+        hist.append(new)
         if np.array_equal(new, sus):
             return sus, pred, it, True
         sus = new
-    union = hist[-1][0] | hist[-2][0]
-    allp = np.array([p for _, p in hist])
-    pmax = np.where(np.isfinite(allp).any(axis=0), np.nanmax(np.where(np.isfinite(allp), allp, -np.inf), axis=0),
-                    np.nan)
-    return union, pmax, SUSPECT_PASSES, False
+    sus = hist[-1] | hist[-2]
+    for _ in range(n + 1):
+        pred = _predict(t, x, y, sus, half, nmin)
+        grow = ~sus & (pred > thr)
+        if not grow.any():
+            break
+        sus = sus | grow
+    return sus, pred, SUSPECT_PASSES, False
 
 
 def run_tracker(t, x, y, lane, push, t_mat, t_start=0.0):
@@ -634,25 +658,57 @@ def imu_from(L_full, t_from_us, t_align_s, imu):
 
 
 def dyn_exceed(S, t0, t_end, lim):
-    """First time [s, ESP32 clock] in [t0, t_end] where the IMU yaw of the kept reports leaves the locked range of
-    U_IMU (O1 3.3 v11.26: angle turned since t0, |rate|, |angular acceleration|), and which limit; (None, '') when it
-    stays inside (CS1-19: reported, the handling is Liam's when it happens)."""
-    m = (S['t'] >= t0) & (S['t'] <= t_end)
-    ts, ps = S['t'][m], S['psi'][m]
-    if len(ts) < 3:
-        return None, ''
-    dps = np.diff(ps)
-    turn = np.cumsum(np.abs(dps))
-    rate = dps / np.diff(ts)
-    tm = 0.5 * (ts[1:] + ts[:-1])
-    acc = np.diff(rate) / np.diff(tm)
-    cand = []
-    for vals, tt, key, conv in ((turn, ts[1:], 'goc_quay_deg', math.degrees), (np.abs(rate), tm, 'wz_dps',
-                                math.degrees), (np.abs(acc), ts[1:-1], 'alpha_dps2', math.degrees)):
-        bad = np.nonzero(np.array([conv(v) for v in vals]) > lim[key])[0]
+    """First time [s, ESP32 clock] in [t0, t_end] where the IMU motion leaves the locked range of U_IMU (O1 3.3
+    v11.26), with the quantities of the C8 range (c8_u_imu.tong / u_imu_run; CS2-9):
+      angle turned  P + N of c8_u_imu.turn_totals over [t0, t]: every report pair whose span meets the window counts
+                    in full (the pair across t = 0 too), a suspect pair adds max|gz| x its span; yaw up to t_break;
+      rate          |gz| of the gyro reports from the last one at or before t0 to the first at or after t_end (a peak
+                    between two yaw reports is in the gyro, not in the yaw difference);
+      acceleration  |dgz / dt| between those consecutive gyro reports (c8_u_imu.alpha_max).
+    Returns (time, limit key, note): (None, '', note) when it stays inside; the note says what could not be checked
+    (CS1-19: reported, the handling is Liam's when it happens)."""
+    cand, notes = [], []
+    tg, gz = S.get('tg', np.array([])), S.get('gz', np.array([]))
+    if tg.size >= 2 and tg[0] <= t0:
+        i0 = int(np.searchsorted(tg, t0, 'right')) - 1
+        i1 = min(int(np.searchsorted(tg, t_end, 'left')), tg.size - 1)
+        tw, gw = tg[i0:i1 + 1], gz[i0:i1 + 1]
+        if tg[-1] < t_end:
+            notes.append(f'gyro reports end {t_end - tg[-1]:.2f} s before the window end')
+        bad = np.nonzero(np.degrees(np.abs(gw)) > lim['wz_dps'])[0]
         if len(bad):
-            cand.append((float(tt[bad[0]]), key))
-    return min(cand) if cand else (None, '')
+            cand.append((max(t0, float(tw[bad[0]])), 'wz_dps'))
+        if tw.size >= 2:
+            acc = np.degrees(np.abs(np.diff(gw)) / np.diff(tw))
+            bad = np.nonzero(acc > lim['alpha_dps2'])[0]
+            if len(bad):
+                cand.append((max(t0, float(tw[bad[0] + 1])), 'alpha_dps2'))
+    else:
+        notes.append('no gyro report at or before t = 0: rate and acceleration not checked')
+    ta = S['t_all']
+    t_hi = min(t_end, S.get('t_break', math.inf))
+    if ta[0] > t0:
+        notes.append('IMU yaw reports start after t = 0: angle turned not checked')
+    else:
+        i0 = int(np.searchsorted(ta, t0, 'right')) - 1
+        i1 = int(np.searchsorted(ta, t_hi, 'left'))
+        if i1 >= ta.size:
+            notes.append(f'IMU yaw reports end before {"t_break" if t_hi < t_end else "the window end"}')
+            i1 = ta.size - 1
+        sub = dict(S, **{k: S[k][i0:i1 + 1] for k in ('t_all', 'psi_all', 'n_all', 't_recv', 'keep')})
+        lim_rad = math.radians(lim['goc_quay_deg'])
+        for k in range(i0 + 1, i1 + 1):
+            te = min(float(ta[k]), t_hi)
+            try:
+                p, n = cu.turn_totals(sub, t0, te)
+            except cu.InputError as exc:
+                notes.append(f'angle turned checked up to {te - t0:.2f} s: {exc}')
+                break
+            if p + n > lim_rad:
+                cand.append((max(t0, te), 'goc_quay_deg'))
+                break
+    tv, key = min(cand) if cand else (None, '')
+    return tv, key, '; '.join(notes)
 
 
 def yaw_bounds(t_log, psi_cam, wz, speed, t0, hs, level, log_path, t_end):
@@ -675,7 +731,20 @@ def yaw_bounds(t_log, psi_cam, wz, speed, t0, hs, level, log_path, t_end):
         rep['log_from_s'] = t_from - t0
     except cu.InputError as exc:
         rep['reason'] = f'IMU yaw: {exc}'
+        rep['mien_dong_note'] = 'no IMU samples: the U_IMU range not checked'
         return np.full(n, np.inf), rep
+    # the U_IMU range is checked whether or not the camera yaw can be aligned (CS2-9)
+    md = (imu.get('mien_dong') or {}).get(level)
+    if md is None:
+        rep['mien_dong_note'] = 'no locked U_IMU range for this level in the constants (before C8): not checked'
+    else:
+        tv, key, why = dyn_exceed(S, t0, t_end, md)
+        rep['mien_dong_note'] = why
+        if tv is not None:
+            rep.update(t_mien_dong_vuot=tv - t0, mien_dong_vuot=key,
+                       n_after_mien_dong=int(np.sum(np.asarray(t_log) >= tv)),
+                       mien_dong_note='; '.join(x for x in ('U_IMU no longer guaranteed after this time (O1 3.3); '
+                                                            'handling: Liam decides', why) if x))
     psi_i = cu.interp_yaw(S, np.asarray(t_log, float))      # NaN after an IMU reset or a gap (c8_u_imu)
     e = wrap(psi_cam - psi_i)
     still = ((t_log >= t0 - imu['pre_s']) & (t_log < t0) & np.isfinite(e)
@@ -701,15 +770,6 @@ def yaw_bounds(t_log, psi_cam, wz, speed, t0, hs, level, log_path, t_end):
     upk[sus] = d[sus] + u_imu
     rep.update(compared=True, n_suspect=int(sus.sum()), n_undef=int((~np.isfinite(d)).sum()),
                d_max_deg=float(np.degrees(np.nanmax(d))) if np.isfinite(d).any() else None)
-    md = (imu.get('mien_dong') or {}).get(level)
-    if md is None:
-        rep['mien_dong_note'] = 'no locked U_IMU range for this level in the constants (before C8): not checked'
-    else:
-        tv, key = dyn_exceed(S, t0, t_end, md)
-        if tv is not None:
-            rep.update(t_mien_dong_vuot=tv - t0, mien_dong_vuot=key,
-                       n_after_mien_dong=int(np.sum(np.asarray(t_log) >= tv)),
-                       mien_dong_note='U_IMU no longer guaranteed after this time (O1 3.3); handling: Liam decides')
     return upk, rep
 
 
@@ -746,9 +806,22 @@ def g1_block(t_done, t_deadline, t1, cat):
 
 
 # ---------------------------------------------------------------- scoring
+def _speeds(t, x, y, psi, idx):
+    """(speed, wz) of the frames idx from the chain of those frames only, by the derivative of c7_measure (NaN
+    elsewhere and with fewer than 5 frames)."""
+    sp, w = np.full(len(t), np.nan), np.full(len(t), np.nan)
+    if len(idx) >= 5:
+        vx, vy = cm.sg_derivative(t[idx], x[idx]), cm.sg_derivative(t[idx], y[idx])
+        sp[idx], w[idx] = np.hypot(vx, vy), cm.sg_derivative(t[idx], np.unwrap(psi[idx]))
+    return sp, w
+
+
 def evaluate(t, x, y, psi, speed, wz, lane, hs, upsi_k, u_t):
     """Camera rules on the VALID frames (command time t, increasing; pose in the lane frame); upsi_k [rad] per
-    frame. Returns (summary, per-frame rows, gate inputs), or None without a frame in the window."""
+    frame; speed, wz: those of frames.csv (reported per frame only, CS2-3). u_t: a number, or a function of the end
+    of the union domain returning U_t (CS2-2: the tick evidence is needed over the domain scored, not after the run
+    ended). Returns (summary, per-frame rows, gate inputs); None without a frame in the window; (summary, None, None)
+    when U_t is not finite."""
     t, x, y, psi = (np.asarray(a, float) for a in (t, x, y, psi))
     speed, wz, upsi_k = np.asarray(speed, float), np.asarray(wz, float), np.asarray(upsi_k, float)
     deadline = lane.Tcmd + T_LATE
@@ -758,15 +831,14 @@ def evaluate(t, x, y, psi, speed, wz, lane, hs, upsi_k, u_t):
     pre = np.nonzero(t < 0.0)[0]
     t_start = float(t[pre[-1]]) if len(pre) else 0.0
     sus_all, pred_all, passes, conv = mark_suspects(t, x, y, hs['pred_m'], hs['pred_half'], hs['pred_min'])
-    # way 2 of G1 (suspects are gaps): speeds from the chain WITHOUT the suspect frames, by the same derivative as
-    # c7_measure (CS1-9: the speeds of c7_measure use every valid frame, so a suspect frame disturbs its neighbours)
-    sp2, wz2 = np.full(len(t), np.nan), np.full(len(t), np.nan)
-    ns = np.nonzero(~sus_all)[0]
-    if len(ns) >= 5:
-        vx2, vy2 = cm.sg_derivative(t[ns], x[ns]), cm.sg_derivative(t[ns], y[ns])
-        sp2[ns], wz2[ns] = np.hypot(vx2, vy2), cm.sg_derivative(t[ns], np.unwrap(psi[ns]))
+    # G1 speeds of BOTH ways from the same numbers and the same derivative (CS2-3): the frame poses given here (from
+    # frames.csv) and the derivative of c7_measure; way 1 over every valid frame, way 2 over the chain WITHOUT the
+    # suspect frames (CS1-9: a suspect frame disturbs its neighbours). No suspect frame: the same speeds, so the two
+    # ways and the two domains coincide (O1 3.3).
+    sp1, wz1 = _speeds(t, x, y, psi, np.arange(len(t)))
+    sp2, wz2 = (sp1, wz1) if not sus_all.any() else _speeds(t, x, y, psi, np.nonzero(~sus_all)[0])
     tw, xw, yw, pw = t[win], x[win], y[win], psi[win]
-    spw, wzw, usw = speed[win], wz[win], upsi_k[win]
+    spw, wzw, usw = sp1[win], wz1[win], upsi_k[win]
     sus, pred = sus_all[win], pred_all[win]
     n = len(win)
     main = run_tracker(tw, xw, yw, lane, ~sus, hs['t_mat_s'], t_start)
@@ -778,11 +850,16 @@ def evaluate(t, x, y, psi, speed, wz, lane, hs, upsi_k, u_t):
                           hs['t_trong_s'], hs['v_d'], deadline)
     ends = [deadline if v is None else v for v in (td1, td2)]
     end_c, end_u = min(ends), max(ends)
+    if callable(u_t):
+        u_t = u_t(end_u)
+    if not math.isfinite(u_t):
+        return dict(t_end_union=end_u, t_done_way1=td1, t_done_way2=td2), None, None
     q = {c: np.full(n, np.nan) for c in o1_gate.MEASURED}
     lo = {c: np.full(n, np.nan) for c in o1_gate.MEASURED}
     hi = {c: np.full(n, np.nan) for c in o1_gate.MEASURED}
     vmax, wzmax = lane.cmd_max
-    upk_p = hs['U_p_m'] + np.where(sus, np.nan_to_num(pred, nan=0.0), 0.0)
+    # U_p,k: a suspect frame without a prediction from the final non-suspect set has no bound (CS2-10)
+    upk_p = hs['U_p_m'] + np.where(sus, np.nan_to_num(pred, nan=np.inf), 0.0)
     hg = lane.h                     # figure 8: grid step; the grid distance is >= the true one by up to h / 2 (CS1-2)
     clamp = hs.get('gia_dinh_nghi_vi_tri', 'chua_kiem') != 'dung'
     rows, n_formula = [], 0
@@ -800,10 +877,14 @@ def evaluate(t, x, y, psi, speed, wz, lane, hs, upsi_k, u_t):
         lo['g3'][j], hi['g3'][j] = e_trk - u3, e_trk + u3
         u5 = math.degrees(us + wzmax * u_t) if math.isfinite(us) else math.inf
         lo['g5'][j], hi['g5'][j] = q['g5'][j] - u5, q['g5'][j] + u5
-        formula = bool(math.isfinite(us) and not r['at_end'] and not r['reopen'] and r['e_perp'] + up <= D
+        formula = bool(math.isfinite(us) and math.isfinite(up) and not r['at_end'] and not r['reopen']
+                       and r['e_perp'] + up <= D
                        and one_solution(lane, xw[j], yw[j], r['w_lo'], r['w_hi'], up)
                        and one_heading(lane, xw[j], yw[j], r['w_lo'], r['w_hi'], up))
-        if formula:
+        if not math.isfinite(up):       # CS2-10: no supported prediction, no position bound: G2-G4 undefined
+            for c in ('g2', 'g3', 'g4'):
+                lo[c][j], hi[c][j] = -math.inf, math.inf
+        elif formula:
             u4 = up + R_C * (us + lane.kappa_eff * up + KAPPA_MAX * hg / 2.0)
             lo['g4'][j], hi['g4'][j] = e_bao - u4 - hg / 2.0, e_bao + u4
             n_formula += 1
@@ -811,16 +892,22 @@ def evaluate(t, x, y, psi, speed, wz, lane, hs, upsi_k, u_t):
             l4, h4 = g4_bounds_jk(lane, xw[j], yw[j], pw[j], r['w_lo'], r['w_hi'], up, us)
             lo['g4'][j] = min(l4, e_bao)
             hi['g4'][j] = max(h4, e_bao) if math.isfinite(us) else math.inf
-        if clamp and sus[j]:            # O1 3.3: the C8 check of the suspect assumption failed or is missing (CS1-18)
+        if clamp and sus[j]:
+            # O1 3.3 (B81-7): the C8 check of the suspect assumption failed or is missing: the frame gives chua ket
+            # luan only, never khong dat (lo clamped at the threshold, CS1-18) and never dat (hi not finite: the frame
+            # is in n_undef, CS2-8)
             for c in ('g2', 'g3', 'g4'):
                 lo[c][j] = min(lo[c][j], o1_gate.THRESHOLDS[c])
+                hi[c][j] = math.inf
         e_s = -((xw[j] - px) * math.cos(hc) + (yw[j] - py) * math.sin(hc))
         rows.append(dict(t=float(tw[j]), x=float(xw[j]), y=float(yw[j]), psi=float(pw[j]), s_cmd=s_c,
                          s_car=r['s_car'], s_car_way1=way1[j]['s_car'], s_perp=r['s_perp'], e_perp=r['e_perp'],
                          e_trk=e_trk, e_bao=e_bao, e_theta_cmd_deg=math.degrees(eth),
                          e_theta_lane_deg=math.degrees(wrap(pw[j] - r['head'])), e_s=e_s, dist_end=float(d_end[j]),
-                         speed=float(spw[j]), wz=float(wzw[j]), suspect=int(sus[j]),
+                         speed=float(spw[j]), wz=float(wzw[j]), speed_csv=float(speed[win[j]]),
+                         speed_way2=float(sp2[win[j]]), suspect=int(sus[j]),
                          pred_m=float(pred[j]), U_p_k=up, U_psi_k_deg=math.degrees(us),
+                         w_lo=float(r['w_lo']), w_hi=float(r['w_hi']),
                          track_err=int(r['trk']), miss=int(r['miss']), back=int(r['back']), reopen=int(r['reopen']),
                          at_end=int(r['at_end']), scored=int(r['scored']), g4_formula=int(formula),
                          **{f'{b}_{c}': d[c][j] for c in o1_gate.MEASURED for b, d in (('lo', lo), ('hi', hi))}))
@@ -852,7 +939,8 @@ def evaluate(t, x, y, psi, speed, wz, lane, hs, upsi_k, u_t):
                 n_unscored=int(sum(not r['scored'] for r in main)), n_g4_formula=n_formula,
                 gap_max=float(max(glen)), t_gap_long=long_gap, t1=t1, t1_kind=t1_kind, frames_window=n,
                 gia_dinh_nghi_vi_tri=hs.get('gia_dinh_nghi_vi_tri', 'chua_kiem'),
-                n_no_pred=int(np.sum(~np.isfinite(pred))))
+                n_no_pred=int(np.sum(~np.isfinite(pred))), n_suspect_no_pred=int(np.sum(sus & ~np.isfinite(pred))),
+                U_t_used_s=float(u_t))
     return summ, rows, dict(q=q, lo=lo, hi=hi, t=tw, scored=np.array([r['scored'] for r in main]), gaps=glen)
 
 
@@ -861,16 +949,22 @@ def lost_output(task, reason, cause, **extra):
                 gate_v3=None, rule=f'O1 v11.28 3.3-3.5 (camera); {VERSION}', **extra)
 
 
-def drift_bound(sync, offset_s, t0_s, deadline, troi_ppm):
+def drift_bound(sync, offset_s, t0_s, deadline, troi_ppm, anchor_s=None):
     """(drift term of U_t [s], how) over the whole run window [0, t_deadline] (O1 3.5 SC-12; CS1-4, CS1-6). With C7b:
     rate = max(|offset_end - offset_start| / distance of the two third centres, troi_ppm) (troi_ppm alone when C7b is
     short, K1), times the largest distance from the centre of the C7b window to [0, t_deadline], plus the gap between
     the offset used (the fit of the whole window) and the offset interpolated at that centre (mean of the thirds).
-    With --offset-s (no C7b): troi_ppm x t_deadline [CACH HIEU: the given offset holds somewhere in [0, t_deadline];
-    no measured bound of the camera / ESP32 clocks, reported]."""
+    With --offset-s (no C7b; CS2-1): the offset holds (within --offset-err-s, added to U_t by the caller) at the
+    command time anchor_s (--offset-anchor-s) where it was established; drift = troi_ppm x the largest distance from
+    anchor_s to [0, t_deadline]. No anchor: refused (the bound needs the time the offset was right at)."""
     lim = troi_ppm * 1e-6
     if sync is None:
-        return lim * deadline, 'troi_ppm x t_deadline (--offset-s: no C7b evidence for the camera / ESP32 clocks)'
+        if anchor_s is None or not math.isfinite(anchor_s):
+            raise ValueError('--offset-s needs --offset-anchor-s (command time where the offset was established) and '
+                             '--offset-err-s (its error): the drift bound runs from that time (CS2-1)')
+        far = max(abs(anchor_s), abs(deadline - anchor_s))
+        return lim * far, (f'troi_ppm x {far:.3f} s from the offset anchor t = {anchor_s:.3f} s (--offset-s: no C7b '
+                           'evidence for the camera / ESP32 clocks)')
     w0, w1 = sync.window_cam_s
     tc = 0.5 * (w0 + w1) + offset_s - t0_s
     far = max(abs(tc), abs(deadline - tc))
@@ -905,13 +999,21 @@ def cmd_thresholds(cmd, hs):
     return out
 
 
-def check_track_gates(hs, track_info):
-    """CS1-15: the frame gates of frames.csv (track.json beside it) must be the ones of the constants file.
-    Returns the report dict; raises ValueError on a mismatch or a missing track.json when the constants hold them."""
-    tg = (track_info or {}).get('gates')
+def check_track_gates(hs, track_info, frames_sha256=None):
+    """CS1-15: the frame gates of frames.csv (track.json beside it) must be the ones of the constants file, and
+    (CS2-5) track.json must belong to the frames.csv scored: its frames_sha256 equal to the file's. Returns the report
+    dict; raises ValueError on a mismatch, or when the constants hold the gates and track.json, its hash or the hash
+    of the frames scored is missing. A hash mismatch is refused in every case (track.json of another file)."""
+    ti = track_info or {}
+    tg = ti.get('gates')
     gk = hs.get('cong_khung')
     rep = dict(track_gates=None if tg is None else {k: tg.get(k) for k in cm.GATE_KEYS}, constants_gates=gk,
-               checked=False)
+               checked=False, frames_sha256_match=None)
+    if ti.get('frames_sha256') and frames_sha256:
+        rep['frames_sha256_match'] = ti['frames_sha256'] == frames_sha256
+        if not rep['frames_sha256_match']:
+            raise ValueError('track.json is not the one of the frames.csv scored (frames_sha256 differs, CS2-5): '
+                             'run c7_measure track or regate again')
     if gk is None:
         rep['note'] = 'constants without cong_khung (before C8): the gates of frames.csv are reported, not checked'
         return rep
@@ -922,22 +1024,41 @@ def check_track_gates(hs, track_info):
     if diff:
         raise ValueError(f'frames.csv was gated with other thresholds than the constants file: {diff} '
                          '(run c7_measure track or regate with --hang-so)')
+    if not rep['frames_sha256_match']:
+        raise ValueError('track.json without frames_sha256, or the hash of the frames.csv scored not given: the gates '
+                         'cannot be tied to the file scored (CS2-5)')
     rep['checked'] = True
     return rep
 
 
+def old_shift_frames(frames):
+    """True when frames.csv holds the shift of the version before 17/11: shift_px (median of the lengths) without
+    shift_mag_px; track always writes both together (CS1-13, CS2-4)."""
+    return any(np.isfinite(r.get('shift_px', float('nan'))) and not np.isfinite(r.get('shift_mag_px', float('nan')))
+               for r in frames)
+
+
 def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start=None, allow_final_set=False,
-          sender=None, events=None, track_info=None):
+          sender=None, events=None, track_info=None, offset_anchor_s=None, offset_err_s=None, frames_sha256=None):
     if task not in FIG8 and task not in FINAL_SET:
         raise ValueError(f'task {task!r}: one of {tuple(FIG8) + FINAL_SET}')
     if task in FINAL_SET and not allow_final_set:
         raise ValueError(f'{task} is the final test set (O1 3.7): only with --allow-final-set')
     if task in FINAL_SET and k_start is None:
         raise ValueError(f'{task}: give --k-start X,Y,HEAD_DEG (nominal start pose, locked at C8)')
-    if offset_s is not None and not offset_reason.strip():
-        raise ValueError('--offset-s needs --offset-reason (C7b skipped)')
+    if offset_s is not None:
+        if not offset_reason.strip():
+            raise ValueError('--offset-s needs --offset-reason (C7b skipped)')
+        if offset_anchor_s is None or offset_err_s is None or not math.isfinite(offset_anchor_s) \
+                or not (math.isfinite(offset_err_s) and offset_err_s >= 0.0):
+            raise ValueError('--offset-s needs --offset-anchor-s (command time [s] where the offset was established) '
+                             'and --offset-err-s (its error [s], >= 0) (CS2-1)')
+    if old_shift_frames(frames) or (track_info or {}).get('shift_kind') == 'median_magnitude':
+        raise ValueError('frames.csv holds the mark shift of the version before 17/11 (median of the lengths): the '
+                         'camera-bumped decision needs the length of the median vector, which cannot be rebuilt from '
+                         'it: run c7_measure track on the video again (CS2-4)')
     lane = Fig8Task(task) if task in FIG8 else KTask(task, k_start)
-    gate_check = check_track_gates(hs, track_info)
+    gate_check = check_track_gates(hs, track_info, frames_sha256)
     if hs['trang_thai'] == 'khoa_c8' and task not in (hs['imu'].get('mien_dong') or {}):
         raise ValueError(f'hang_so imu mien_dong: no locked U_IMU range for {task}')
     rows, ev_in, n_dup, has_age = read_esp32(esp32_path)
@@ -959,13 +1080,18 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
             return lost_output(task, f'clock not matched (C7b): {sync.why}', FAIL_MEAS, **base), []
         offset_s = sync.offset_s
     deadline = lane.Tcmd + T_LATE
-    drift, drift_src = drift_bound(sync, offset_s, t0_us / 1e6, deadline, hs['troi_ppm'])
-    tick = tick_max_s(rows, t0_us, t0_us + deadline * 1e6)
-    u_t = hs['u_t_ghep_s'] + drift + tick
-    u_t_parts = dict(ghep_s=hs['u_t_ghep_s'], drift_s=drift, drift_src=drift_src, tick_s=tick)
-    if not math.isfinite(u_t):         # CS1-6: no finite U_t is no evidence; never a gate with an unknown U_t
-        return lost_output(task, f'U_t not bounded (the log does not cover [t0, t0 + t_deadline]: tick {tick})',
-                           FAIL_MEAS, U_t_parts=u_t_parts, **base), []
+    # drift up to t_deadline (SC-12); the --offset-s error at its anchor (CS2-1) adds to the C7b residual of the
+    # constants [CACH HIEU: kept both, the larger bound]
+    drift, drift_src = drift_bound(sync, offset_s, t0_us / 1e6, deadline, hs['troi_ppm'], offset_anchor_s)
+    off_err = float(offset_err_s) if sync is None else 0.0
+    u_t_parts = dict(ghep_s=hs['u_t_ghep_s'], offset_err_s=off_err, drift_s=drift, drift_src=drift_src)
+
+    def u_t_of(end_u):
+        # tick evidence over the domain scored, [t0, t0 + end of the union domain] (CS2-2: a log ending after the
+        # run closed but before t_deadline does not spoil it); the drift still runs to t_deadline (SC-12)
+        tick = tick_max_s(rows, t0_us, t0_us + end_u * 1e6)
+        u_t_parts.update(tick_s=tick, tick_to_s=end_u)
+        return hs['u_t_ghep_s'] + off_err + drift + tick
     vi = [k for k, r in enumerate(frames) if r['valid']]
     t_log = t_cam[vi] + offset_s
     tv = t_log - t0_us / 1e6
@@ -977,18 +1103,21 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
     wzv = np.array([frames[k]['wz'] for k in vi])
     upsi_k, yaw = yaw_bounds(t_log, np.array([frames[k]['psi'] for k in vi]), wzv, sp, t0_us / 1e6, hs, task,
                              esp32_path, t0_us / 1e6 + deadline)
-    res = evaluate(tv, x, y, psi, sp, wzv, lane, hs, upsi_k, u_t)
+    res = evaluate(tv, x, y, psi, sp, wzv, lane, hs, upsi_k, u_t_of)
     if res is None:
         return lost_output(task, 'no valid camera frame in the run window', FAIL_MEAS, **base), []
     out, prow, gi = res
+    if gi is None:                     # CS1-6: no finite U_t is no evidence; never a gate with an unknown U_t
+        return lost_output(task, f'U_t not bounded (the log does not cover [t0, t0 + {out["t_end_union"]:.3f} s], '
+                                 f'the end of the union domain: tick {u_t_parts.get("tick_s")})',
+                           FAIL_MEAS, U_t_parts=u_t_parts, **base), []
+    u_t = out['U_t_used_s']
     t_end_u = out['t_end_union']
-    # camera bumped: largest mark shift of ANY frame inside [0, end of the union domain]
+    # camera bumped: largest mark shift of ANY frame inside [0, end of the union domain]; shift_px is the length of
+    # the median vector (old files refused above, CS2-4)
     t_all = t_cam + offset_s - t0_us / 1e6
     sh = np.array([r['shift_px'] for r in frames])[(t_all >= 0.0) & (t_all <= t_end_u + 1e-9)]
-    old_shift = all(not np.isfinite(r.get('shift_mag_px', float('nan'))) for r in frames)
-    shift_kind = (track_info or {}).get('shift_kind') or (
-        'median_magnitude (frames.csv before 17/11: median of the lengths, not the length of the median vector; '
-        'CS1-13)' if old_shift else 'median_vector')
+    shift_kind = 'median_vector'
     sh = sh[np.isfinite(sh)]
     shift_max = float(sh.max()) if len(sh) else float('nan')
     bumped = bool(len(sh) and shift_max > hs['bump_px'])
@@ -1079,6 +1208,8 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
                t0_log_us=t0_us, edge_log_seq=rows[i_edge]['_seq'], later_rises=later,
                offset_s=offset_s, offset_src='--offset-s' if sync is None else 'o1_time_sync',
                offset_reason=offset_reason if sync is None else '',
+               offset_anchor_s=offset_anchor_s if sync is None else None,
+               offset_err_s=offset_err_s if sync is None else None,
                sync=None if sync is None else dict(corr=sync.corr, offset_start_s=sync.offset_start_s,
                                                     offset_end_s=sync.offset_end_s,
                                                     start_end_diff_s=sync.start_end_diff_s, short=sync.short,
@@ -1121,6 +1252,9 @@ def main(argv=None):
     ap.add_argument('--events', default=None, help='default <esp32>.events.txt when it exists')
     ap.add_argument('--offset-s', type=float, default=None, help='t_log = t_cam + D, skips o1_time_sync')
     ap.add_argument('--offset-reason', default='', help='why --offset-s is given')
+    ap.add_argument('--offset-anchor-s', type=float, default=None,
+                    help='command time [s] where --offset-s was established (drift bound from it, CS2-1)')
+    ap.add_argument('--offset-err-s', type=float, default=None, help='error of --offset-s at its anchor [s]')
     ap.add_argument('--k-start', default=None, help='X,Y,HEAD_DEG nominal start pose of K1/K2 (floor frame)')
     ap.add_argument('--allow-final-set', action='store_true')
     ap.add_argument('--out', default='')
@@ -1140,9 +1274,10 @@ def main(argv=None):
         if os.path.isfile(tj):
             with open(tj, encoding='utf-8') as f:
                 track_info = json.load(f)
+        fsha = cm.sha256(a.frames)
         out, rows = score(cm.read_frames(a.frames), a.esp32, a.task, hs, a.offset_s, a.offset_reason, ks,
-                          a.allow_final_set, a.sender, a.events, track_info)
-        out.update(frames_file=os.path.basename(a.frames), frames_sha256=cm.sha256(a.frames),
+                          a.allow_final_set, a.sender, a.events, track_info, a.offset_anchor_s, a.offset_err_s, fsha)
+        out.update(frames_file=os.path.basename(a.frames), frames_sha256=fsha,
                    esp32_file=os.path.basename(a.esp32), esp32_sha256=cm.sha256(a.esp32),
                    sender_file=os.path.basename(a.sender) if a.sender else None,
                    sender_sha256=cm.sha256(a.sender) if a.sender and os.path.exists(a.sender) else None)
