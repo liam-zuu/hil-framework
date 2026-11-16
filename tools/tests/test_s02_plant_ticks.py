@@ -410,7 +410,11 @@ def _bench(tmp_path, ppm, edge_ms=1600.0, n=8200, us_cut=None, fw=FW_LINE, fault
                                   traj_flags=P.TRAJ_VALID if k >= k_cmd else 0) for k in range(n)])
     assert np.array_equal(mosi[:, 0:8], s['frames']['mosi'][:, 0:8])          # same wheel speeds as the counts
     miso = T.make_miso(mosi, s['duty_cap'], tm)
-    frames = dict(s['frames'], mosi=mosi, miso=miso)
+    # Pi t_recv after the transfer: after the H7 receive (rx, 384 us of bus + 0..50 us after the send T), plus the
+    # return of the call (10..60 us)
+    rng = np.random.default_rng(11)
+    t_recv = s['frames']['t_send_ns'] + np.round((tm['rx'] - tm['T'] + rng.uniform(10.0, 60.0, n)) * 1000.0).astype(np.int64)
+    frames = dict(s['frames'], mosi=mosi, miso=miso, t_recv_ns=t_recv)
     fl = str(tmp_path / 'r_frames.npz')
     np.savez(fl, **frames, **(dict(mosi_true=mosi) if faults else {}))
     esp = str(tmp_path / 'r.csv')
@@ -448,10 +452,13 @@ def test_map_run_on_a_made_up_bench_run(monkeypatch, tmp_path, ppm):
     assert inw.sum() > 500
     err = res['a'] + res['b'] * te[inw] - s_true(te[inw])
     assert np.max(np.abs(err)) <= 0.5 * max(res['spread_us']) + 1.0
-    # sender t = 0: the receive of the first frame with a command (k_a = 0), mapped back by the true map
+    # sender t = 0: the Pi send of the first frame with a command (k_a = 0; made-up axis T, shifted to the H7 axis
+    # as the receives), mapped back by the true map
     g = res['sender_frame']
     assert g == 1600
-    u_true = 5_000_000.0 + (h7['t_frame_us'][g] - s_true(5_000_000.0)) / (1.0 + ppm * 1e-6)
+    send_h7 = s['timing']['T'][g] + (h7['t_frame_us'][g] - s['timing']['rx'][g])
+    u_true = 5_000_000.0 + (send_h7 - s_true(5_000_000.0)) / (1.0 + ppm * 1e-6)
+    assert res['sender_h7_us'][0] <= send_h7 <= res['sender_h7_us'][1]
     assert abs(res['sender_t0_us'] - u_true) <= 0.5 * res['sender_spread_us'] + 1.0
     assert u0 == pytest.approx(res['sender_t0_us'], abs=1e-3)
     assert u1 - u0 == pytest.approx(s02_cmd_path.GROUP_A['A-L2'].duration * 1e6)
@@ -536,3 +543,88 @@ def test_map_run_on_the_real_run(run, test, ok):
     lag_ms = (cmd['t0_us'] - res['sender_t0_us']) / 1000.0
     assert 0.0 < lag_ms < 100.0, lag_ms                   # the command anchors come after the sender (path delay)
     assert sum(1 for r in rows if r[1] != '') > 0.9 * len(rows)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Codex round 1 of v3 (S2M1-2, -3, -4, -5)
+
+@needs_gcc
+def test_counts_past_the_trusted_edges_do_not_exclude_the_true_map():
+    """S2M1-2: raw 5199 / 7799 (hp 1500 / 1000 us) on alternate 1 ms frames for 1 s, 4 us windows, hp-1500 frames
+    applied at the window end, hp-1000 frames at its start: encoder_gen.c counts 1730 edges where the edge model
+    (applies at the window start) has 1484; only the first edges are trusted. The set must still hold the true map
+    (or refuse), never exclude it."""
+    n = 3200
+    lo = 1000.0 * np.arange(n)
+    k = np.arange(n)
+    on = (lo >= 1_500_000) & (lo < 2_500_000)
+    raw = np.zeros((n, 4), dtype=np.int16)
+    raw[on] = np.where(k[on] % 2 == 0, 5199, 7799)[:, None]
+    om32 = raw.astype(np.float32) * (np.float32(EM.HIL_OMEGA_MAX) / np.float32(32767.0))
+    hp, _ = EM.h7_half_period(om32)
+    true = lo + np.where(hp[:, 0] == 1500, 4.0, 0.0) * on
+    counts = O.run(true.astype(np.int64), om32.astype(np.float64), 1)
+    assert counts.at([2_490_000])[0, 0] == 1730
+    u = 30_000.0 + 10_000.0 * np.arange(300)
+    rng = np.random.default_rng(5)
+    c = counts.at(np.round(u + rng.uniform(0, EM.J_READ_US, len(u))).astype(np.int64)).astype(float)
+    res = pt.certify(u, c, lo, np.full(n, 4.0), om32)
+    assert res.get('ext') is not None or not res['ok'], res['reason']
+    if res.get('ext') is not None:
+        lo_s, hi_s = np.array([res['ext'](x) for x in u]).T
+        assert np.all((lo_s - 1e-6 <= u) & (u <= hi_s + 1e-6))
+    assert not res['reason'].startswith('inconsistent'), res['reason']
+
+
+def test_a_negative_forced_low_step_undone_by_the_first_edge():
+    """S2M1-3: the start forces a high pin low (count -1), the first edge brings the count back to c0, so a line read
+    after the first edge still shows c0; the rest bound must not place that line before the first edge."""
+    n = 5000
+    lo = 1000.0 * np.arange(n)
+    om = np.zeros((n, 4))
+    j = np.arange(n - 1500)
+    base = 9.52 + np.clip((j - 50) / 300.0, 0, 1) * 12.0                # 50 ms at hp 1000 us, then speeds up
+    om[1500:] = base[:, None] * np.array([1.0, -1.07, 0.94, -1.02])
+    om32 = om32_of(om)
+    ed = pt.simulate_edges(lo, np.zeros(n), om32)
+    S = lo[1500]
+    u = S - 8800.0 + 10_000.0 * np.arange(-150, 340)            # one line 1200 us after the start
+    read = u + np.random.default_rng(2).uniform(0, EM.J_READ_US, len(u))
+    c = np.zeros((len(u), 4))
+    for w in range(4):
+        e = ed[w]
+        assert e['t'][0] < S + 1200 < e['t'][1]                   # the first edge before the line, the second after
+        sgn = np.array([e['segs'][s]['dir'] for s in e['seg']])
+        n_e = np.array([np.sum(sgn[e['t'] - 1 <= r]) for r in read])
+        c[:, w] = 1000 + np.where(read >= S, -sgn[0], 0) + n_e    # O = -1 in the direction of motion
+    j = int(np.flatnonzero(u == S + 1200)[0])
+    assert np.all(c[j] == 1000)
+    res = pt.certify(u, c, lo, np.zeros(n), om32)
+    assert res['ok'], res['reason']
+    lo_s, hi_s = np.array([res['ext'](x) for x in u]).T
+    assert np.all((lo_s - 1e-6 <= u) & (u <= hi_s + 1e-6))
+    want = [-int(np.sign(om[1500, w])) for w in range(4)]            # -1 in the direction of motion
+    assert any(list(cb) == want for cb in res['offsets']), res['offsets']
+
+
+def test_plant_steps_at_anchors_and_across_unanswered_frames():
+    """S2M1-5: on an answered frame's receive its step (even next to a gap); between consecutive answered frames
+    interpolated; across unanswered frames, or outside, empty."""
+    ak = np.array([0.0, 1.0, 2.0, 5.0, 6.0])
+    au = np.array([0.0, 1000.0, 2000.0, 5000.0, 6000.0])
+    st, n_gap = pt.plant_steps(np.array([2000.0, 1500.0, 3000.0, 5000.0, 7000.0, -1.0]), ak, au)
+    assert st[0] == 2.0 and st[1] == 1.5 and np.isnan(st[2]) and st[3] == 5.0
+    assert np.isnan(st[4]) and np.isnan(st[5]) and n_gap == 1
+
+
+def test_sender_interval_from_the_pi_transfer_and_unanswered_frames():
+    """S2M1-4, -5: the Pi send lies in [rx - (t_recv - t_send), rx]; for a frame the H7 did not answer, rx is only
+    known between the answered frames around it; dt_us moves both ends."""
+    h7 = dict(anchor_k=np.array([0.0, 1.0, 2.0, 5.0]), anchor_us=np.array([400.0, 1400.0, 2400.0, 5400.0]))
+    ts = np.array([0, 1, 2, 3, 4, 5], dtype=np.int64) * 1_000_000
+    tr = ts + 450_000
+    assert pt.sender_interval(1, 0.0, h7, ts, tr) == pytest.approx((950.0, 1400.0))
+    assert pt.sender_interval(3, -20.0, h7, ts, tr) == pytest.approx((2400.0 - 450.0 - 20.0, 5400.0 - 20.0))
+    assert pt.sender_interval(1, 0.0, h7, ts, None).startswith('frame log without t_recv_ns')
+    assert pt.sender_interval(7, 0.0, h7, ts, tr) == 'sender frame outside the H7 answers'
+    assert 'not positive' in pt.sender_interval(1, 0.0, h7, ts, ts)

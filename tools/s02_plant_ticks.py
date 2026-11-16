@@ -47,12 +47,18 @@ the ends bound it inside). The map given is the midpoint line of the two end ran
 spread inside the window, if the model holds.
 
 Sender t = 0 (Q8 (a)). The first frame with a non-zero command carries the schedule sample k_a; the frame sent k_a x
-20 ms of Pi time earlier (t_send_ns) is the sample 0 frame; its H7 receive (hil_edge_map anchors, interpolated for a
-frame the H7 did not answer) is t = 0 on the H7 clock, mapped to the ESP32 clock by the midpoint map: sender_t0_us,
-with sender_spread_us (the spread of s there).
+20 ms of Pi time earlier (t_send_ns) is the sample 0 frame. Its Pi send on the H7 clock is only known in an interval
+(sender_interval, S2M1-4, -5): the H7 receive stamp lies between the Pi t_send and t_recv of the transfer, and a frame
+the H7 did not answer has its receive between the answered frames around it. The middle of that interval, mapped to
+the ESP32 clock by the midpoint map, is sender_t0_us; sender_spread_us = the spread of the map there + the interval
+width; certified only when it is <= SPREAD_MAX_US too.
 Plant at a tick: frame state interpolated at the fractional plant step of s (theta unwrapped, wrapped back to
-(-pi, pi]); across frames the H7 did not answer the step is only known in [a, b]: the middle is used and the largest
-such half gap is reported (step_gap_max). Outside the frame log: empty (no extrapolation, P2-3).
+(-pi, pi]); across frames the H7 did not answer the step is only known in [a, b]: the row is left empty (n_gap_rows,
+S2M1-5). Outside the frame log: empty (no extrapolation, P2-3).
+Counts the edge model cannot place (S2M1-2): past the first untrusted edge of a wheel, the number of true edges is not
+known either; lines whose count lies beyond the trusted prefix of that segment, and every later segment of the wheel,
+bound nothing. The rest bound (S2M1-3) uses edge m + 1 of the first start (m pins that may be high), since a negative
+forced-low step can be undone by the first edges.
 Not mapped either: a frame log with mosi_true (a run with --faults, O-3), a run whose '#us_end' reports cut ticks
 (us_cut, S2P2-2), a wheel that never starts, a log without STILL_MIN_S of rest before the start.
 """
@@ -277,6 +283,11 @@ class _Wheel:
         # encoder_gen.c in the tests); an untrusted edge bounds nothing
         self.trusted = np.zeros(len(self.t), bool)
         seg = ed['seg']
+        # S2M1-2 (Codex round 1 of v3): past the first untrusted edge of a wheel the number of true edges is not known
+        # either (an apply inside its window can add or drop edges at every retime: 1730 true counts against 1484
+        # simulated in the Codex case, checked with encoder_gen.c), so counts beyond the trusted prefix of that segment
+        # and every later segment of the wheel bound nothing and refuse nothing (use_until)
+        self.broken_seg, self.n_trust = len(self.segs), 0
         for k, sg in enumerate(self.segs):
             i = np.flatnonzero(seg == k)
             if i.size == 0:
@@ -285,6 +296,8 @@ class _Wheel:
             gap = np.minimum(np.r_[np.diff(tt), np.inf], np.r_[np.inf, np.diff(tt)])
             wide = np.flatnonzero(self.hi[i] - self.lo[i] > TRUST_FRAC * gap)
             self.trusted[i[:wide[0] if wide.size else i.size]] = True
+            if wide.size and k < self.broken_seg:
+                self.broken_seg, self.n_trust = k, int(wide[0])
 
     def segment_of(self, r_lo, r_hi):
         """Segment index holding the whole read interval [r_lo, r_hi] (arrays), -1 where none."""
@@ -293,9 +306,11 @@ class _Wheel:
         return np.where(ok, s, -1)
 
     def bounds(self, s, n_obs, O):
-        """Arrays (t_min, t_max, ok) of the true read time for lines on segments s with counts n_obs (relative to the
-        rest count) and first-segment offset O: the read comes at or after edge k1 and before edge k2 + 1 of the
-        segment (k edges since its start); -inf / +inf when no edge bounds it; ok False when no count fits."""
+        """Arrays (t_min, t_max, ok, use) of the true read time for lines on segments s with counts n_obs (relative
+        to the rest count) and first-segment offset O: the read comes at or after edge k1 and before edge k2 + 1 of
+        the segment (k edges since its start); -inf / +inf when no edge bounds it; ok False when no count fits; use
+        False for a line the edge model cannot place (S2M1-2: a segment after the wheel's first untrusted edge, or
+        a count beyond the trusted prefix of that segment): no bound, no refusal."""
         s = np.asarray(s, dtype=np.int64)
         n_obs = np.asarray(n_obs, dtype=float)
         first = s >= 1
@@ -309,6 +324,8 @@ class _Wheel:
         k1 = np.ceil(np.minimum(ka, kb) - 1e-9)
         k2 = np.floor(np.maximum(ka, kb) + 1e-9)
         m = self.m[s]
+        bseg = s == self.broken_seg
+        use = (s < self.broken_seg) | (bseg & (k1 <= self.n_trust))
         ok = np.where(rest, (v_lo <= n0) & (n0 <= v_hi), (k2 >= 0) & (k1 <= m) & (k1 <= k2))
         k1c = np.clip(k1, 0, None).astype(np.int64)
         k2c = np.clip(k2, None, m).astype(np.int64)
@@ -319,7 +336,7 @@ class _Wheel:
             t_max = np.where(~rest & (k2c < m) & self.trusted[i_hi], self.t[i_hi] + self.hi[i_hi] + TOL_US, np.inf)
         else:
             t_min, t_max = np.full(len(s), -np.inf), np.full(len(s), np.inf)
-        return t_min, t_max, ok
+        return t_min, t_max, ok | ~use, use
 
 
 class MapSet:
@@ -355,7 +372,8 @@ class MapSet:
         return A, b
 
     def extent(self, u, extra=()):
-        """(min, max) of s(u) over the polygon with the extra rows (H7 us), None if empty."""
+        """(min, max) of s(u) over the polygon with the extra rows (H7 us), None if empty; -inf / +inf on a side
+        the rows do not bound (an unbounded set is not an empty one)."""
         A, b = self._ab(extra)
         l = float(self.lam(u))
         c = np.array([1.0 - l, l])
@@ -363,17 +381,30 @@ class MapSet:
         if lo is None or hi is None:
             return None
         base = float(u) + self.off
-        return base + float(c @ lo), base + float(c @ hi)
+        return (-math.inf if lo is UNBOUNDED else base + float(c @ lo),
+                math.inf if hi is UNBOUNDED else base + float(c @ hi))
 
     def feasible(self, extra=()):
         A, b = self._ab(extra)
         return _lp(np.zeros(2), A, b) is not None
 
 
+UNBOUNDED = object()
+
+
 def _lp(c, A, b):
+    """Minimiser of c x subject to A x <= b; None when infeasible; UNBOUNDED when c x has no lower bound (a set
+    the counts do not bound on that side, e.g. no rest bound and no line yet: not 'inconsistent'). Any other
+    solver status raises."""
     from scipy.optimize import linprog
     r = linprog(c, A_ub=A, b_ub=b, bounds=[(None, None), (None, None)], method='highs')
-    return r.x if r.status == 0 else None
+    if r.status == 0:
+        return r.x
+    if r.status == 3:
+        return UNBOUNDED
+    if r.status == 2:
+        return None
+    raise ValueError(f'linprog status {r.status}: {r.message}')
 
 
 def _wheel_rows(ms, wheel, te, n_obs, seg_of_line, O):
@@ -383,9 +414,10 @@ def _wheel_rows(ms, wheel, te, n_obs, seg_of_line, O):
     j = np.flatnonzero(seg_of_line >= 0)
     if j.size == 0:
         return np.zeros((0, 2)), np.zeros(0)
-    t_min, t_max, ok = wheel.bounds(seg_of_line[j], n_obs[j], O)
+    t_min, t_max, ok, use = wheel.bounds(seg_of_line[j], n_obs[j], O)
     if not np.all(ok):
         return None
+    j, t_min, t_max = j[use], t_min[use], t_max[use]
     out_A, out_b = [], []
     m = np.isfinite(t_min)
     if m.any():
@@ -438,13 +470,20 @@ def certify(te_us, counts, apply_us, width_us, om32, t_window=None):
             res['reason'] = (f'no_standstill_start (wheel {w}: {(te[j0] - te[idx[0]]) * 1e-6:.3f} s of ESP32 lines at '
                              'rest)')
             return res
-        e1 = wh[w].t[0] + wh[w].hi[0] if wh[w].t.size else math.inf
+        # S2M1-3 (Codex round 1 of v3): the forced-low step of the start can be -1 or -2 and the first edges bring the
+        # count back to c0, so the count can still read c0 until edge m + 1 (m = pins that may be high, <= 2), not
+        # only until the first edge; no trusted edge there: no bound
+        mf = wh[w].first_m
+        i1 = wh[w].segs[1]['first_edge'] + mf
+        ok1 = (wh[w].segs[1]['n_edges'] > mf and i1 < wh[w].t.size and bool(wh[w].trusted[i1]))
+        e1 = wh[w].t[i1] + wh[w].hi[i1] + TOL_US if ok1 else math.inf
         starts.append(dict(c0=c0, j0=j0, j1=j1, S=S, W=W, first_change_max=max(e1, S + W)))
     uA, uB = te[0], te[-1]
     ms = MapSet(uA, uB, starts[0]['S'] - te[starts[0]['j1']])
     for st in starts:
         ms.add(*ms.rows_ge(te[[st['j1']]], [st['S'] - READ_US]))          # first changed line: read >= the start
-        ms.add(*ms.rows_le(te[[st['j0']]], [st['first_change_max']]))     # last unchanged: read before the change
+        if math.isfinite(st['first_change_max']):
+            ms.add(*ms.rows_le(te[[st['j0']]], [st['first_change_max']]))  # last unchanged: read before the change
     n_obs = [counts[:, w] - starts[w]['c0'] for w in range(4)]
     seg_of = [np.full(len(te), -1, dtype=np.int64) for _ in range(4)]
     O_set = [list(range(-wh[w].first_m, wh[w].first_m + 1)) for w in range(4)]
@@ -507,7 +546,7 @@ def certify(te_us, counts, apply_us, width_us, om32, t_window=None):
             res.update(reason='inconsistent (no map agrees with every count)', n_iter=n_iter)
             return res
         box = (ext(uA, combos), ext(uB, combos))
-        if added == 0 and box_prev is not None and all(abs(x - y) <= 0.5 for p, q in zip(box, box_prev)
+        if added == 0 and box_prev is not None and all(x == y or abs(x - y) <= 0.5 for p, q in zip(box, box_prev)
                                                         for x, y in zip(p, q)):
             break
         box_prev = box
@@ -527,6 +566,11 @@ def certify(te_us, counts, apply_us, width_us, om32, t_window=None):
         m0, m1 = 0.5 * (e0[0] + e0[1]), 0.5 * (e1[0] + e1[1])
         b = (m1 - m0) / (u1 - u0)
         return m0 - b * u0, b, e0, e1
+    e0, e1 = E(u0), E(u1)
+    if not all(math.isfinite(x) for x in e0 + e1):
+        res.update(reason='unbounded (the counts do not bound the map on one side)', ext=E,
+                   spread_us=[float(e0[1] - e0[0]), float(e1[1] - e1[0])])
+        return res
     a, b, e0, e1 = mid_line(u0, u1)
     if t_window is not None:
         for _ in range(2):                           # the window depends on the map: twice is enough (b ~ 1)
@@ -578,6 +622,50 @@ def sender_frame(ref, t_send_ns, k_a):
     return g, (target - ts[g]) * 1e-3
 
 
+def sender_interval(g, dt_us, h7, t_send_ns, t_recv_ns):
+    """[lo, hi] on the H7 clock of the Pi send of the sample-0 time (S2M1-4, -5, Codex round 1 of v3), or the reason
+    it is not known. The Pi takes t_send just before the SPI transfer and t_recv just after it (rpi5/hil_node.py
+    _tick); the H7 receive stamp of the frame (MISO RX CYCCNT) lies between the two, so the send is in
+    [rx - (t_recv - t_send), rx] (the bus time, 48 bytes at the SPI clock, is not subtracted: run_hil.py --spi-speed
+    is not in the manifest). A frame the H7 did not answer has its receive between the receives of the answered
+    frames around it (hil_edge_map.h7_to_steps). dt_us: Pi time from the frame's send to the sample-0 time."""
+    if t_recv_ns is None:
+        return 'frame log without t_recv_ns: the send of the sender frame is not bounded on the H7 clock'
+    ak, au = h7['anchor_k'], h7['anchor_us']
+    if not ak[0] <= g <= ak[-1]:
+        return 'sender frame outside the H7 answers'
+    i = int(np.searchsorted(ak, g))
+    if ak[i] == g:
+        r_lo = r_hi = float(au[i])
+    else:
+        r_lo, r_hi = float(au[i - 1]), float(au[i])
+    d = (int(t_recv_ns[g]) - int(t_send_ns[g])) * 1e-3
+    if not d > 0:
+        return f'frame {g}: t_recv - t_send = {d:.1f} us is not positive'
+    return r_lo - d + dt_us, r_hi + dt_us
+
+
+def plant_steps(s_us, anchor_k, anchor_us):
+    """(fractional plant step per H7 time, number of times left empty): on an answered frame's receive its step;
+    between two consecutive answered frames the interpolated step; across frames the H7 did not answer the step is
+    only known in [a, b] (hil_edge_map.h7_to_steps): empty (S2M1-5); outside the answered frames: empty (P2-3)."""
+    steps = np.full(len(s_us), np.nan)
+    n_gap = 0
+    for i, x in enumerate(s_us):
+        if not anchor_us[0] <= x <= anchor_us[-1]:
+            continue
+        j = int(np.searchsorted(anchor_us, x))
+        if anchor_us[j] == x:
+            steps[i] = float(anchor_k[j])
+            continue
+        lo, hi = EM.h7_to_steps(x, anchor_k, anchor_us)
+        if hi != lo:
+            n_gap += 1
+            continue
+        steps[i] = lo
+    return steps, n_gap
+
+
 def map_run(frame_log, esp_log, test_id):
     """(result dict, plant rows) of one HIL run (module docstring)."""
     import hil_o1_score as H
@@ -585,6 +673,7 @@ def map_run(frame_log, esp_log, test_id):
     frames = EM.load_frames(frame_log)
     with np.load(frame_log, allow_pickle=False) as z:
         has_true = 'mosi_true' in z.files
+        t_recv = np.array(z['t_recv_ns']) if 't_recv_ns' in z.files else None
     log = s02_metrics.load_log(esp_log)['_all']
     on = log['motor_on'] == 1
     te_us = log['timestamp_us'][on]
@@ -623,10 +712,12 @@ def map_run(frame_log, esp_log, test_id):
         res['reason'] = 'no_sender_frame'
         return res, empty
     g, dt_us = sf
-    s0 = float(h7['t_frame_us'][g]) + dt_us if math.isfinite(h7['t_frame_us'][g]) else math.nan
-    if not math.isfinite(s0):
-        res['reason'] = 'sender frame outside the H7 answers'
+    send = sender_interval(g, dt_us, h7, frames['t_send_ns'], t_recv)
+    if isinstance(send, str):
+        res['reason'] = send
         return res, empty
+    s0, send_w = 0.5 * (send[0] + send[1]), send[1] - send[0]
+    res['sender_h7_us'] = [float(send[0]), float(send[1])]
     T_us = s02_cmd_path.GROUP_A[test_id].duration * 1e6
 
     def window(a, b):
@@ -643,19 +734,16 @@ def map_run(frame_log, esp_log, test_id):
         u0 = (s0 - a) / b
         e = cert['ext'](u0)
         res['sender_t0_us'] = float(u0)
-        res['sender_spread_us'] = float(e[1] - e[0])
+        # the spread of the map at t0 plus the send-time interval (S2M1-4, -5)
+        res['sender_spread_us'] = float(e[1] - e[0]) + float(send_w)
         res['sender_frame'] = g
     if not cert['ok']:
         return res, empty
-    s = cert['a'] + cert['b'] * te_us
-    steps, gap = np.full(len(s), np.nan), 0.0
-    for i, x in enumerate(s):
-        lo, hi = EM.h7_to_steps(x, h7['anchor_k'], h7['anchor_us'])
-        if not (h7['anchor_us'][0] <= x <= h7['anchor_us'][-1]):
-            continue
-        steps[i] = 0.5 * (lo + hi)
-        gap = max(gap, 0.5 * (hi - lo))
-    res['step_gap_max'] = gap
+    if res['sender_spread_us'] > SPREAD_MAX_US:
+        res['reason'] = f"sender spread {res['sender_spread_us']:.0f} us > {SPREAD_MAX_US:.0f} us"
+        return res, empty
+    steps, n_gap = plant_steps(cert['a'] + cert['b'] * te_us, h7['anchor_k'], h7['anchor_us'])
+    res['n_gap_rows'] = n_gap
     res['ok'] = True
     return res, plant_rows(te_us, steps, state)
 
