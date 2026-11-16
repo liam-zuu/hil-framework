@@ -697,12 +697,15 @@ def pi_stop_cmd(pi_dir, name, kind):
     """B: stop the run_hil.py of run `name` by the PID in <pi_dir>/<name>.pid (written by run_cmd).
     kind 'kill' = SIGKILL to it and every descendant (the Pi dies: no STOP, no END tail, no frame log);
     'stop' = SIGTERM to it only (run_hil.py turns it into STOP: zero setpoint, then the end of the run).
-    Refuses (exit 3) without a PID file or a live process, (exit 4) when that PID is not run_hil.py."""
+    Refuses (exit 3) without a PID file or a live process, (exit 4) when that PID is not run_hil.py.
+    d() prints each child before going down into it (Liam 16/11, CODE_S06 'Sua, kem test'): a function variable in
+    bash is global, so printing $c after the recursive call printed a grandchild's PID in place of its parent's,
+    and a child with children of its own got no signal."""
     sig = {'kill': 'KILL', 'stop': 'TERM'}[kind]
     tgt = '$(d $P) $P' if kind == 'kill' else '$P'
     return (f'P=$(cat {pi_dir}/{name}.pid 2>/dev/null); [ -n "$P" ] && kill -0 "$P" 2>/dev/null || exit 3; '
             f"tr '\\0' ' ' < /proc/$P/cmdline | grep -q 'run_hil.py' || exit 4; "
-            f'd() {{ for c in $(pgrep -P "$1"); do d "$c"; echo "$c"; done; }}; T="{tgt}"; '
+            f'd() {{ for c in $(pgrep -P "$1"); do echo "$c"; d "$c"; done; }}; T="{tgt}"; '
             f'echo "pid=$P targets=$(echo $T)"; date +%s.%N; kill -{sig} $T')
 
 
