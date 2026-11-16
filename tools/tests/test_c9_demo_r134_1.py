@@ -483,6 +483,35 @@ def test_c9d4_a_block_of_lost_runs_only_is_not_confirmed(demo_ds, tmp_path):
         _freeze_ok(demo_ds, tmp_path)
 
 
+def _summary_with_levels(ds, tmp_path, levels):
+    p = str(tmp_path / 'gate_levels.csv')
+    with open(p, 'w', encoding='utf-8', newline='\n') as f:
+        f.write('level\n' + ''.join(f'{lv}\n' for lv in levels))
+    gate, sha = rl.read_gate(p)
+    return {r['campaign']: r for r in rl.summary(ds, gate, sha)}
+
+
+def test_q1_summary_needs_two_valid_runs_per_gate_level(demo_ds, tmp_path):
+    # S05 v3.40 4.3 Q1 (Liam 17/11 at THESIS "Nhờ C13 thêm kiểm (Recommended)"): a block with one valid run per level
+    # froze (freeze has no gate file), the summary with the gate file says mismatch; two valid runs say ok
+    uids = _confirm_block(demo_ds, tmp_path, 'K1', ('dat',))
+    rl.so_h(demo_ds, uids[0], _score_final(demo_ds, uids[0], 0.5))
+    _freeze_ok(demo_ds, tmp_path)
+    assert _summary_with_levels(demo_ds, tmp_path, ['O1-F05'])['A-LADRC']['stop_reason_check'] == 'mismatch'
+    assert {r['campaign']: r for r in rl.summary(demo_ds)}['A-LADRC']['stop_reason_check'] == 'ok'   # no gate file
+
+
+def test_q1_lost_runs_do_not_count_and_every_level_is_needed(demo_ds, tmp_path):
+    _lost_confirm(demo_ds, 'K1')                                        # lost: out of the two
+    uids = _confirm_block(demo_ds, tmp_path, 'K1', ('dat', 'dat'))
+    for u in uids:
+        rl.so_h(demo_ds, u, _score_final(demo_ds, u, 0.5))
+    _freeze_ok(demo_ds, tmp_path)
+    assert _summary_with_levels(demo_ds, tmp_path, ['O1-F05'])['A-LADRC']['stop_reason_check'] == 'ok'
+    s = _summary_with_levels(demo_ds, tmp_path, ['O1-F05', 'O1-F08'])['A-LADRC']    # no run at O1-F08
+    assert s['stop_reason_check'] == 'mismatch'
+
+
 def test_c9d4_summary_mismatch_for_a_freeze_row_the_log_does_not_back(demo_ds, tmp_path):
     _confirm_block(demo_ds, tmp_path, 'K1', ('dat',))
     gf = fr.write_gain_file(str(tmp_path / 'FAKE_gain_L.json'), GAIN)

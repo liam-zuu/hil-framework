@@ -1121,16 +1121,20 @@ def so_h_missing(tun: List[dict], ds: str, stages: Optional[Iterable[str]] = Non
             and r.get('run_uid') not in done]
 
 
+CONFIRM_PER_LEVEL = 2                  # S05 4.3: 2 new valid runs at every level of the gate (2 x |G|)
+
+
 def confirm_block_problem(tun_after: List[dict], ds: str, campaign: str, gain_set: str,
-                          frozen_at: str) -> Optional[str]:
+                          frozen_at: str, levels: Optional[Iterable[str]] = None) -> Optional[str]:
     """C9D-4 (Codex C9 demo round 1; Liam 17/11 at CODE_C13 "Sửa cả 7 + vòng 2 (Recommended)"): None, or why the stop
     reason khoi_xac_nhan_dat does not hold in the log. The last block of confirm car runs of the frozen gain set (rows
     of the campaign, platform HW, stage confirm, gain_set_id = the frozen set; the block = the block_id of the last
     such row in log order, not empty): every run judged before the comparison has its so-h row; the valid runs after
     it (S05 4.3: a run lost to the measurement, before or at so-h, is replaced and out of the denominator) are at
-    least one and all dat; frozen_at is not earlier than the latest so-h of the block. The count 2 x |G| needs the
-    gate file and is not checked here. tun_after: the live rows after apply_so_h (a row without so-h keeps its
-    logged outcome)."""
+    least one and all dat; frozen_at is not earlier than the latest so-h of the block. levels (the gate file, given
+    to summary, not to freeze; S05 v3.40 4.3 Q1, Liam 17/11 at THESIS "Nhờ C13 thêm kiểm (Recommended)"): at least
+    CONFIRM_PER_LEVEL valid runs at every level (trajectory) of the gate. tun_after: the live rows after apply_so_h
+    (a row without so-h keeps its logged outcome)."""
     conf = [r for r in tun_after if r.get('campaign') == campaign and r.get('platform') == 'HW'
             and r.get('stage') == 'confirm' and r.get('gain_set_id') == gain_set]
     if not conf:
@@ -1149,6 +1153,12 @@ def confirm_block_problem(tun_after: List[dict], ds: str, campaign: str, gain_se
     bad = [f"{r.get('run_uid')}={r.get('run_outcome')}" for r in valid if r.get('run_outcome') != 'dat']
     if bad:
         return f"block {bid}: not all dat after the clip H comparison ({', '.join(bad)})"
+    if levels is not None:                                                         # Q1: 2 x |G|
+        short = [f"{lv} {sum(r.get('trajectory') == lv for r in valid)}" for lv in levels
+                 if sum(r.get('trajectory') == lv for r in valid) < CONFIRM_PER_LEVEL]
+        if short:
+            return (f"block {bid}: fewer than {CONFIRM_PER_LEVEL} valid runs at gate level(s) {', '.join(short)} "
+                    '(S05 4.3, 2 x |G|)')
     try:
         last = max(_parse_t(so[r['run_uid']]['ghi_luc']) for r in block if r.get('run_uid') in so)
         t_frz = _parse_t(frozen_at)
@@ -1788,7 +1798,8 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
         time: it counts before a freeze unless its date is after the freeze date;
       * stop_reason_check: cham_tran_xe / cham_tran_gio (or khong_co_bo_danh_gia_du with that
         stop_cause) checked against the counts above ('ok' / 'mismatch'); khoi_xac_nhan_dat checked by
-        confirm_block_problem (C9D-4); the other codes 'khong_kiem_duoc';
+        confirm_block_problem (C9D-4; with `gate`: also 2 valid runs per gate level, S05 v3.40 Q1); the other
+        codes 'khong_kiem_duoc';
       * so_h_chua_n (C9D-2): judged car runs of the campaign without their clip H comparison (so-h);
       * final (§4.7 [v3.6]): final_<task>@<speed>_* by run_outcome (hong_he_do out of n_valid);
         final_hil rows are account RQ2 (§4.6) and their final_hil_<task>@<speed>_* columns go on the row
@@ -1804,6 +1815,7 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
         gain set id or with other gain values than the earlier runs of its key;
       * gate_result: gate_result() over the final runs of the gate levels (`gate`, read from the
         locked gate file by read_gate); empty without `gate` or without any final run."""
+    gate = None if gate is None else list(gate)     # used per campaign (gate_result, Q1)
     raw = live_rows(read_rows(os.path.join(ds, TUNING)))
     tun = apply_so_h(raw, ds)                       # S05 v3.37 4.3: outcomes after the clip H comparison
     so_h_open = defaultdict(int)                    # C9D-2: judged car runs whose clip H comparison is not given
@@ -2023,7 +2035,8 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
         elif basis == 'cham_tran_gio':
             check = 'ok' if 'gio' in cap else 'mismatch'
         elif reason == 'khoi_xac_nhan_dat':          # C9D-4: the last confirm block, after the clip H comparison
-            why = confirm_block_problem(tun, ds, c, f.get('gain_set_id', ''), f['frozen_at'])
+            why = confirm_block_problem(tun, ds, c, f.get('gain_set_id', ''), f['frozen_at'],
+                                        levels=None if gate is None else list(gate))      # Q1 with the gate file
             check = 'mismatch' if why else 'ok'
             if why:
                 print(f'warning: {c} khoi_xac_nhan_dat: {why}', file=sys.stderr)
