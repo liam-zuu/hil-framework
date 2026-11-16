@@ -557,3 +557,389 @@ def test_campaign_env_flag_parsed():
     assert 'campaign_env' in inspect.signature(hb.lifted_env_problem).parameters
     src = inspect.getsource(hb)
     assert "'--campaign-env'" in src and "r['campaign_env'] = bool(a.campaign_env)" in src
+
+
+# ── --s06: S06 runs with tools/s06_logger.py (Liam 15/11, CODE_S06 'Mo rong hil_bench_session', 'Code ca hai') ──
+
+def _plan(*runs):
+    return hb.plan_runs(list(runs))
+
+
+def test_s06_plan_parses_and_refuses():
+    plan = _plan('t2=--load-schedule s.csv --steps 70000', 't5=--steps 620000')
+    got = hb.plan_s06(['t2=heavy,60', 't5=zero,610,logger-first'], plan)
+    assert got == dict(t2=dict(profile='heavy', duration=60, logger_first=False, steps=70000),
+                       t5=dict(profile='zero', duration=610, logger_first=True, steps=620000))
+    bad = ['x=heavy,60',                        # no such --run
+           't2=fast,60', 't2=heavy,0', 't2=heavy,6x', 't2=heavy,60,plant-first', 't2=heavy']
+    for spec in bad:
+        with pytest.raises(ValueError):
+            hb.plan_s06([spec], plan)
+    with pytest.raises(ValueError):
+        hb.plan_s06(['t2=heavy,60', 't2=heavy,60'], plan)            # given twice
+    with pytest.raises(ValueError, match='70000'):                    # the trial-run lesson: plant >= run + 10 s
+        hb.plan_s06(['t2=heavy,61'], plan)
+    with pytest.raises(ValueError, match='--steps'):
+        hb.plan_s06(['t2=heavy,60'], _plan('t2=--load-schedule s.csv'))
+    with pytest.raises(ValueError, match='gain-query'):
+        hb.plan_s06(['t2=heavy,60'], plan, gain_query=True)
+    assert hb.plan_s06([], plan) == {}
+
+
+def test_s06_run_cmd_order_and_logger():
+    s = dict(profile='heavy', duration=60, logger_first=False)
+    c = hb.s06_run_cmd('~/r', 't2', '--steps 70000', s, '192.168.1.181')
+    i_hil, i_log = c.index('run_hil.py'), c.index('s06_logger.py')
+    assert i_hil < c.index('sleep 2') < i_log                          # plant first, logger 2 s after
+    assert ('--esp32 192.168.1.181 --profile heavy --duration 60 --out ~/r/t2_esp > ~/r/t2_logger.txt' in c)
+    assert 'echo $H > ~/r/t2.pid' in c and '--frame-log ~/r/t2_frames.npz' in c
+    assert c.endswith('wait $H; RC=$?; exit $RC') and 'echo logger_exit=$?' in c
+    c = hb.s06_run_cmd('~/r', 't5', '--steps 620000', dict(s, logger_first=True), '10.0.0.2')
+    assert c.index('s06_logger.py') < c.index('sleep 4') < c.index('run_hil.py')     # T5: logger first
+    assert 'wait $L; echo logger_exit=$?; exit $RC' in c
+    assert 'agv_logger' not in c
+
+
+def test_s06_leftover_logger_found():
+    assert hb.leftovers('123 python3 tools/s06_logger.py --esp32 x') == ['123 python3 tools/s06_logger.py --esp32 x']
+
+
+def test_s06_bench_runs_s06_logger_and_records(tmp_path, monkeypatch):
+    import json as _j
+    scps = []
+    reply = lambda c: (0, '## HEAD\nabc') if 'git' in c else (0, 'logger_exit=0')  # noqa: E731
+    a, calls, _ = _bench_env(monkeypatch, tmp_path, reply, run=['t2=--test A-L1 --steps 70000'], no_logger=False,
+                             s06=['t2=heavy,60'], gain_query=False)
+    monkeypatch.setattr(hb, 'scp', lambda host, remote, local, recursive=False: scps.append((remote, recursive)) or 0)
+    _FakeSerial.lines = {'COM9': [(50.0, 'I (2069) WIFI: Got IP: 192.168.1.181 (after 0 failed attempts)')]}
+    hb.bench(a)
+    run = [c for c in calls if 'run_hil.py' in c]
+    assert run and 's06_logger.py --esp32 192.168.1.181 --profile heavy --duration 60' in run[0]
+    assert 'agv_logger' not in run[0]
+    assert ('~/r/t2_esp', True) in scps
+    s = _j.load(open(os.path.join(a.out, 'session.json'), encoding='utf-8'))
+    assert s['runs'][0]['s06'] == dict(profile='heavy', duration=60, logger_first=False, steps=70000,
+                                       esp32_ip='192.168.1.181')
+    assert 'logger_cmd' not in s['runs'][0]
+
+
+def test_s06_bench_without_esp32_ip_stops(tmp_path, monkeypatch):
+    a, calls, _ = _bench_env(monkeypatch, tmp_path, None, run=['t2=--test A-L1 --steps 70000'], s06=['t2=heavy,60'])
+    code, _ = hb.bench(a)
+    assert code == 2 and not [c for c in calls if 'run_hil.py' in c]
+
+
+def test_s06_bench_bad_spec_stops_before_ssh(tmp_path, monkeypatch):
+    a, calls, _ = _bench_env(monkeypatch, tmp_path, None, run=['t2=--test A-L1 --steps 1000'], s06=['t2=heavy,60'])
+    assert hb.bench(a) == (2, []) and calls == []
+
+
+def test_s06_analyze_run_matches_events_and_judges_the_check(tmp_path, monkeypatch):
+    seen = {}
+    out = tmp_path / 'o'
+    (out / 'frames').mkdir(parents=True)
+    (out / 'pi' / 't2_esp').mkdir(parents=True)
+    (out / 'pi' / 't2_esp' / 'esp32_events.txt').write_text('')
+    t, mosi, miso = frames(n=10)
+    np.savez(out / 'frames' / 't2_frames.npz', t_send_ns=t, mosi=mosi, miso=miso)
+
+    def fake_decode(ts, mo, mi, ev=None):
+        seen['ev'] = ev
+        return dict(frames=dict(frames=10, miso_crc_bad=0, empty_in_run=0, unanswered=0))
+    monkeypatch.setattr(hb.dec, 'decode', fake_decode)
+    monkeypatch.setattr(hb.dec, 'problems', lambda res: [])
+    monkeypatch.setattr(hb.dec, 'conditions', lambda res: [])
+    monkeypatch.setattr(hb, 'tracking', lambda *x: {})
+    codes = iter([1, 0])
+    monkeypatch.setattr(hb, 's06_check', lambda o, n, sub='check': seen.setdefault('sub', sub) and next(codes))
+    r = hb.analyze_run(str(out), 't2', s06=True)
+    assert seen['ev'].endswith(os.path.join('t2_esp', 'esp32_events.txt')) and seen['sub'] == 'check'
+    assert not r['clean'] and any('s06_esp32_check mã 1' in w for w in r['why'])
+    r = hb.analyze_run(str(out), 't2', s06=True)
+    assert r['clean']
+    seen.clear()
+    r = hb.analyze_run(str(out), 't2')                               # not an S06 run: no events, no check
+    assert seen['ev'] is None and 'sub' not in seen
+
+
+def test_s06_check_writes_outside_the_raw_folder(tmp_path):
+    out = tmp_path / 'o'
+    assert hb.s06_check(str(out), 'nope') == 2                       # no pi/<name>_esp
+    (out / 'pi' / 't2_esp').mkdir(parents=True)
+    code = hb.s06_check(str(out), 't2')
+    assert code in (1, 3) and (out / 'check' / 't2' / 'stdout.txt').exists()
+    assert not (out / 'pi' / 't2_esp' / 'check').exists()
+    assert hb.s06_check(str(out), 't2', 'check_analyze') == code and (out / 'check_analyze' / 't2').is_dir()
+
+
+def test_s06_analyze_only_passes_s06_for_s06_runs_only(tmp_path, monkeypatch):
+    import json as _j
+    out = tmp_path / 'o'
+    (out / 'frames').mkdir(parents=True)
+    for n in ('t2', 'k1'):
+        (out / 'frames' / f'{n}_frames.npz').write_bytes(b'')
+    (out / 'session.json').write_text(_j.dumps(dict(runs=[dict(name='t2', s06=dict(profile='heavy')),
+                                                         dict(name='k1')])), encoding='utf-8')
+    (out / 'pi').mkdir()
+    (out / 'pi' / 't2_pi.txt').write_text('logger_exit=0\n', encoding='utf-8')
+    seen = {}
+
+    def fake(o, n, *x, **kw):
+        seen[n] = kw
+        return dict(name=n, clean=True, why=[])
+    monkeypatch.setattr(hb, 'analyze_run', fake)
+    monkeypatch.setattr(hb, 'summary_line', lambda r: r['name'])
+    code, _ = hb.analyze_only(SimpleNamespace(out=str(out)))
+    assert code == 0 and seen['t2']['s06'] is True and seen['k1'] == {}
+    assert os.path.isabs(seen['t2']['check_sub']) and not os.path.exists(out / 'check_analyze')   # T3T-10: temp
+    code, _ = hb.analyze_only(SimpleNamespace(out=str(out), write_summary=True))
+    assert seen['t2']['check_sub'] == 'check_analyze'
+
+
+# ── Codex Sol round 1 of feat/s06-t3-tools (Liam 15/11, CODE_S06 'Sua ca 10 + vong 2') ──
+
+def test_t3t_1_s06_run_has_no_finite_run():
+    """T3T-1: run_hil.py refuses --finite-run with --steps / --load-schedule / omega modes (_finite_run_config):
+    an S06 run ends by --steps, so its command must not add --finite-run (0cb41c6 did: every --s06 run died)."""
+    s = dict(profile='heavy', duration=60, logger_first=False, steps=70000)
+    for lf in (False, True):
+        c = hb.s06_run_cmd('~/r', 't2', '--load-schedule s.csv --steps 70000', dict(s, logger_first=lf), '10.0.0.2')
+        assert '--finite-run' not in c and 'run_hil.py --load-schedule s.csv --steps 70000 --frame-log' in c
+
+
+def test_t3t_4_s06_run_refuses_outputs_of_an_earlier_session():
+    """T3T-4: same --pi-dir and run name as an earlier session: exit 2 before the logger opens its files (0cb41c6
+    overwrote <name>_logger.txt and <name>_esp/)."""
+    s = dict(profile='heavy', duration=60, logger_first=False, steps=70000)
+    for lf in (False, True):
+        c = hb.s06_run_cmd('~/r', 't2', '--steps 70000', dict(s, logger_first=lf), '10.0.0.2')
+        g = c.index('s06_pi_exists')
+        assert g < c.index('run_hil.py') and g < c.index('s06_logger.py')
+        for f in ('~/r/t2_esp', '~/r/t2_logger.txt', '~/r/t2_frames.npz'):
+            assert f in c[:g]
+        assert 'echo $L > ~/r/t2_logger.pid' in c                        # T3T-5: logger PID for the cleanup
+
+
+def test_t3t_5_timeout_from_the_run_length_and_cleanup(tmp_path, monkeypatch):
+    """T3T-5: a 610 s run (--steps 620000) gets an ssh limit of 620 + 120 s, not the 600 s default; a run that times
+    out (or ends non-zero) is followed by the cleanup of its run_hil.py and s06_logger.py by PID file."""
+    assert hb.s06_timeout(600.0, dict(steps=620000)) == 740.0 and hb.s06_timeout(900.0, dict(steps=70000)) == 900.0
+    c = hb.s06_cleanup_cmd('~/r', 't2')
+    assert '~/r/t2.pid' in c and '~/r/t2_logger.pid' in c and "grep -q 'run_hil.py'" in c
+    assert "grep -q 's06_logger.py'" in c and 'kill -TERM' in c and 'kill -KILL' in c
+    import subprocess as sp
+    a, calls, _ = _bench_env(monkeypatch, tmp_path, None, run=['t2=--test A-L1 --steps 620000'],
+                             s06=['t2=heavy,610'], gain_query=False, esp32_ip='10.0.0.2', run_timeout=600.0)
+    lims = []
+
+    def fake_ssh(host, cmd, timeout=None):
+        calls.append(cmd)
+        if 'run_hil.py' in cmd and 's06_logger.py --esp32' in cmd:
+            lims.append(timeout)
+            raise sp.TimeoutExpired(cmd, timeout)
+        return 0, ''
+    monkeypatch.setattr(hb, 'ssh', fake_ssh)
+    monkeypatch.setattr(hb, 'scp', lambda host, remote, local, recursive=False: 0)
+    hb.bench(a)
+    assert lims == [740.0]
+    assert any('_logger.pid' in c and 'kill -TERM' in c for c in calls)
+
+
+def test_t3t_9_steps_as_argparse_reads_them():
+    """T3T-9: the last --steps wins, --steps=N counts, a non-number is refused (0cb41c6 took the first, missed =)."""
+    assert hb.steps_of('--steps 70000 --steps 1') == 1 and hb.steps_of('--steps=70000') == 70000
+    assert hb.steps_of("--steps '70000'") == 70000 and hb.steps_of('--test A-L1') is None
+    with pytest.raises(ValueError):
+        hb.steps_of('--steps x')
+    with pytest.raises(ValueError, match='70000'):
+        hb.plan_s06(['t2=heavy,60'], _plan('t2=--steps 70000 --steps 1'))
+    assert hb.plan_s06(['t2=heavy,60'], _plan('t2=--steps=70000'))['t2']['steps'] == 70000
+
+
+# ── Codex vòng 2 (T3T-R2-1, T3T-R2-2, T3T-9 còn lại; Liam 16/11 'chuyen phien, sau do sua 3 muc + vong 3') ──
+
+def test_t3t_9_r2_steps_read_by_int_as_argparse():
+    """T3T-9 (vòng 2): argparse type=int is int(): '+70000', '70_000' are 70000 (b6f23c2 refused them by isdigit)."""
+    assert hb.steps_of('--steps=+70000') == 70000 and hb.steps_of('--steps 70_000') == 70000
+    assert hb.plan_s06(['t2=heavy,60'], _plan('t2=--steps +70000'))['t2']['steps'] == 70000
+    for bad in ('--steps x', '--steps 7.0', '--steps=', '--steps 0x10'):
+        with pytest.raises(ValueError, match='không phải số nguyên'):
+            hb.steps_of(bad)
+
+
+SPAWN_CHILD = ('4908 python3 -c from multiprocessing.spawn import spawn_main; spawn_main(tracker_fd=6, '
+               'pipe_handle=8) --multiprocessing-fork')
+TRACKER = '4907 python3 -c from multiprocessing.resource_tracker import main;main(5)'
+
+
+def test_t3t_r2_1_leftovers_see_multiprocessing_children():
+    """T3T-R2-1: a 'spawn' plant child (and the resource tracker) of a dead run_hil.py is a leftover; b6f23c2 missed
+    it (its cmdline does not name run_hil.py). An unrelated python3 is still not one."""
+    txt = f'812 python3 /usr/lib/x/other.py\n{TRACKER}\n{SPAWN_CHILD}\n'
+    assert hb.leftovers(txt) == [TRACKER, SPAWN_CHILD]
+
+
+def test_t3t_r2_1_cleanup_lists_the_tree_before_the_term():
+    """T3T-R2-1: the cleanup lists each script's tree (pgrep -P, recursive) before SIGTERM, and SIGKILLs the tree."""
+    c = hb.s06_cleanup_cmd('~/r', 't2')
+    assert 'pgrep -P' in c and c.index('pgrep -P') < c.index('kill -TERM')
+    assert c.index('T="$P $(d $P)"') < c.index('kill -TERM $P') < c.index('kill -KILL $A')
+    assert 'do echo "$c"; d "$c"; done' in c                          # child printed before its own children
+
+
+def _posix_runner():
+    """bash with /proc and pgrep: this machine (POSIX), or WSL on Windows; None = skip. Returns (argv, to_path)."""
+    import shutil
+    import subprocess as sp
+    if os.name == 'posix' and os.path.isdir('/proc') and shutil.which('pgrep') and shutil.which('python3'):
+        return ['bash', '-c'], str
+    if os.name == 'nt' and shutil.which('wsl'):
+        try:
+            r = sp.run(['wsl', '-e', 'bash', '-c', 'command -v pgrep python3 >/dev/null && [ -d /proc ]'],
+                       capture_output=True, timeout=60)
+        except (OSError, sp.TimeoutExpired):
+            return None
+        if r.returncode == 0:
+            def to_wsl(p):
+                p = os.path.abspath(str(p))
+                return '/mnt/' + p[0].lower() + p[2:].replace('\\', '/')
+            return ['wsl', '-e', 'bash', '-c'], to_wsl
+    return None
+
+
+FAKE_RUN_HIL = '''import multiprocessing as mp, os, signal, sys, time
+def child():
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)   # a plant child that does not stop on its own
+    time.sleep(120)
+if __name__ == '__main__':
+    mp.set_start_method('spawn', force=True)
+    p = mp.Process(target=child, daemon=True)
+    p.start()
+    with open(sys.argv[1] + '.tmp', 'w') as f:
+        f.write(str(p.pid))
+    os.replace(sys.argv[1] + '.tmp', sys.argv[1])
+    if sys.argv[2] == 'orphan':                         # dies on SIGTERM without stopping its child
+        signal.signal(signal.SIGTERM, lambda *a: os._exit(0))
+    else:                                               # 'hang': ignores SIGTERM
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    time.sleep(120)
+'''
+
+
+@pytest.mark.parametrize('mode', ['orphan', 'hang'])
+def test_t3t_r2_1_cleanup_stops_the_real_process_tree(tmp_path, mode):
+    """T3T-R2-1, real processes (POSIX bash or WSL): a run_hil.py with a multiprocessing 'spawn' child; the cleanup
+    leaves neither alive. 'orphan': run_hil.py exits on SIGTERM and leaves the child (b6f23c2 left it running);
+    'hang': run_hil.py ignores SIGTERM (both SIGKILLed). Before the cleanup, leftovers() sees the child."""
+    import subprocess as sp
+    r = _posix_runner()
+    if r is None:
+        pytest.skip('cần bash có /proc, pgrep, python3 (POSIX hay WSL)')
+    argv, to = r
+    d = tmp_path / 'r'
+    d.mkdir()
+    (d / 'run_hil.py').write_text(FAKE_RUN_HIL, encoding='utf-8', newline='\n')
+    D = to(d)
+    script = (f'D={D}; (python3 $D/run_hil.py $D/child.pid {mode} & echo $! > $D/t2.pid); '
+              'for i in $(seq 1 100); do [ -s $D/child.pid ] && break; sleep 0.1; done; '
+              'P=$(cat $D/t2.pid); C=$(cat $D/child.pid); echo "pids P=$P C=$C"; '
+              'pgrep -u "$(id -u)" -a python3 | while read -r pid rest; do '
+              '[ "$pid" = "$C" ] && echo "left $pid $rest"; done; echo "## cleanup"; '
+              f'{hb.s06_cleanup_cmd(D, "t2")}; echo "## after"; sleep 0.3; '
+              'kill -0 $P 2>/dev/null && echo alive_parent; kill -0 $C 2>/dev/null && echo alive_child; '
+              'kill -KILL $P $C 2>/dev/null; true')
+    out = sp.run(argv + [script], capture_output=True, timeout=90).stdout.decode('utf-8', 'replace')
+    assert 'pids P=' in out and '## after' in out, out
+    left = [ln[len('left '):] for ln in out.splitlines() if ln.startswith('left ')]
+    assert len(left) == 1 and hb.leftovers(left[0]) == left, out          # the child is seen as a leftover
+    after = out.split('## after', 1)[1]
+    assert 'alive_parent' not in after and 'alive_child' not in after, out
+    cleanup = out.split('## cleanup', 1)[1].split('## after', 1)[0]
+    assert 'stop run_hil.py pid=' in cleanup and 'kill run_hil.py pids=' in cleanup, out
+
+
+def test_t3t_r2_2_timeout_text_names_the_s06_formula_only_for_s06_runs(tmp_path, monkeypatch):
+    """T3T-R2-2: an ssh time-out of a run without --s06 does not name the S06 formula (b6f23c2 did); an S06 run's
+    still does."""
+    import subprocess as sp
+    a, calls, _ = _bench_env(monkeypatch, tmp_path, None, run=['x=--test A-L1', 't2=--test A-L1 --steps 620000'],
+                             s06=['t2=heavy,610'], gain_query=False, esp32_ip='10.0.0.2', run_timeout=600.0)
+
+    def fake_ssh(host, cmd, timeout=None):
+        calls.append(cmd)
+        if 'python3 run_hil.py' in cmd:
+            raise sp.TimeoutExpired(cmd, timeout)
+        return 0, ''
+    monkeypatch.setattr(hb, 'ssh', fake_ssh)
+    monkeypatch.setattr(hb, 'scp', lambda host, remote, local, recursive=False: 0)
+    hb.bench(a)
+    x = open(os.path.join(a.out, 'pi', 'x_pi.txt'), encoding='utf-8').read()
+    assert 'ssh quá 600 s (--run-timeout)' in x and 'S06' not in x
+    t2 = open(os.path.join(a.out, 'pi', 't2_pi.txt'), encoding='utf-8').read()
+    assert 'ssh quá 740 s (--run-timeout, lượt S06: --steps/1000 + 120)' in t2
+
+
+def _s06_out(tmp_path):
+    out = tmp_path / 'o'
+    (out / 'frames').mkdir(parents=True)
+    (out / 'pi' / 't2_esp').mkdir(parents=True)
+    (out / 'pi' / 't2_esp' / 'esp32_events.txt').write_text('')
+    t, mosi, miso = frames(n=10)
+    np.savez(out / 'frames' / 't2_frames.npz', t_send_ns=t, mosi=mosi, miso=miso)
+    return out
+
+
+def test_t3t_6_8_decoder_conditions_and_run_problem(tmp_path, monkeypatch):
+    """T3T-6: the decoder's conditions (±1 s pad, TICK) make an S06 run not clean (0cb41c6 read problems only).
+    T3T-8: a RunProblem (two #run_start) is judged, not raised (0cb41c6: the exception ended the session)."""
+    out = _s06_out(tmp_path)
+    res = dict(frames=dict(frames=10, miso_crc_bad=0, empty_in_run=0, unanswered=0))
+    monkeypatch.setattr(hb.dec, 'problems', lambda r: [])
+    monkeypatch.setattr(hb.dec, 'conditions', lambda r: ['thiếu đệm ±1 s'])
+    monkeypatch.setattr(hb, 'tracking', lambda *x: {})
+    monkeypatch.setattr(hb, 's06_check', lambda o, n, sub='check': 0)
+    monkeypatch.setattr(hb.dec, 'decode', lambda *x: res)
+    r = hb.analyze_run(str(out), 't2', s06=True)
+    assert not r['clean'] and 'thiếu đệm ±1 s' in r['why']
+    monkeypatch.setattr(hb.dec, 'conditions', lambda r: [])
+
+    def dec2(ts, mo, mi, ev=None):
+        if ev is not None:
+            raise hb.dec.stm.RunProblem('2 #run_start')
+        return res
+    monkeypatch.setattr(hb.dec, 'decode', dec2)
+    r = hb.analyze_run(str(out), 't2', s06=True)
+    assert not r['clean'] and any('2 #run_start' in w for w in r['why'])
+
+
+def test_t3t_7_analyze_only_reads_the_logger_exit_again(tmp_path, monkeypatch):
+    """T3T-7: --analyze-only keeps an S06 run with s06_logger exit 1 (or none) not clean (0cb41c6 dropped it)."""
+    import json as _j
+    out = tmp_path / 'o'
+    (out / 'frames').mkdir(parents=True)
+    (out / 'frames' / 't2_frames.npz').write_bytes(b'')
+    (out / 'pi').mkdir()
+    (out / 'session.json').write_text(_j.dumps(dict(runs=[dict(name='t2', s06=dict(profile='heavy'))])),
+                                      encoding='utf-8')
+    monkeypatch.setattr(hb, 'analyze_run', lambda o, n, *x, **kw: dict(name=n, clean=True, why=[]))
+    monkeypatch.setattr(hb, 'summary_line', lambda r: r['name'])
+    for txt, ok in (('logger_exit=1\n', False), ('', False), ('logger_exit=0\n', True)):
+        (out / 'pi' / 't2_pi.txt').write_text(txt, encoding='utf-8')
+        code, res = hb.analyze_only(SimpleNamespace(out=str(out)))
+        assert res[0]['clean'] is ok and code == (0 if ok else 1), (txt, res)
+
+
+def test_t3t_10_analyze_only_writes_nothing_without_write_summary(tmp_path, monkeypatch):
+    """T3T-10: s06_esp32_check output of --analyze-only goes to a temp folder; with --write-summary to a NEW
+    check_analyze*/ each time (0cb41c6 wrote and overwrote check_analyze/ always)."""
+    import json as _j
+    out = _s06_out(tmp_path)
+    (out / 'session.json').write_text(_j.dumps(dict(runs=[dict(name='t2', s06=dict(profile='heavy'))])),
+                                      encoding='utf-8')
+    (out / 'pi' / 't2_pi.txt').write_text('logger_exit=0\n', encoding='utf-8')
+    before = sorted(os.listdir(out))
+    hb.analyze_only(SimpleNamespace(out=str(out)))
+    assert sorted(os.listdir(out)) == before
+    hb.analyze_only(SimpleNamespace(out=str(out), write_summary=True))
+    hb.analyze_only(SimpleNamespace(out=str(out), write_summary=True))
+    assert (out / 'check_analyze' / 't2').is_dir() and (out / 'check_analyze_2' / 't2').is_dir()

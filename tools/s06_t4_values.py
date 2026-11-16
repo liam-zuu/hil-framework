@@ -215,7 +215,10 @@ def check(t_send_ns, mosi, miso, events_path, data_path=None, cal=None, manifest
     off = m['epoch_offset_esp32_minus_h7']
     win = m['window_pi_us']
     esp = res.get('esp32_run_esp_us')
-    h7 = {} if off is None else {(r['epoch'] + off, r['kind'], r['n']): r for r in res['_reports']}
+    # T4 (4) (CODE_S06 15/11, Liam 'Do lech x256 theo gio'): key on the ESP32-side n of each report (n + the
+    # shift match_esp32 chose by time), not on the H7-side n: the two are unwrapped from different first reports
+    h7 = {} if off is None else {(r['epoch'] + off, r['kind'], r['n_esp32']): r for r in res['_reports']
+                                 if r.get('n_esp32') is not None}
     cb = [i for i in res['_esp32_I'] if esp is None or esp[0] <= i['t_us'] <= esp[1]]
     rows, stats = [], defaultdict(lambda: dict(n=0, applied0=0, fail=0, no_source=0, non_finite=0, max_ratio=0.0))
     covered = defaultdict(set)
@@ -332,7 +335,7 @@ def main(argv=None) -> int:
         print(f'lỗi đầu vào: {ex}', file=sys.stderr)
         return 2
     os.makedirs(a.out, exist_ok=True)
-    with open(os.path.join(a.out, 'T4_values.csv'), 'w', newline='') as fh:
+    with open(os.path.join(a.out, 'T4_values.csv'), 'w', newline='', encoding='utf-8') as fh:   # not the code page
         w = csv.DictWriter(fh, fieldnames=COLS, extrasaction='ignore')
         w.writeheader()
         w.writerows(rows)

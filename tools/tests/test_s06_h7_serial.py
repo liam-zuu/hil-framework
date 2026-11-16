@@ -119,7 +119,7 @@ def test_link_stats_and_timestamp_prefix():
     # S25: bounded by the lines just before link up and just after the final link lost
     assert st['bounded_start'] and st['bounded_end'] and st['expected_end_loss'] == 1
     assert st['applied'] == 40000 and st['skipped'] == 0 and st['err'] == 0 and st['age_max_us_since_boot'] == 420
-    assert st['lost'] == 1 and st['rearm'] == 1 and ser.link_fails(st) == []
+    assert st['lost'] == 1 and st['rearm_bounded'] == 1 and st['rearm'] == 0 and ser.link_fails(st) == []
     assert st['link_periods'] == [dict(frames=40001, h7_ms=40010, pi_ms=40000)]
 
 
@@ -777,3 +777,47 @@ def test_codex_r8_r6_5_gap_across_the_end_is_missing_not_lost():
                                drop=(5,), post=((6, 50001, 10000),)))
     assert s['data_lost'] == [] and any('qua mép lượt' in m for m in s['missing']), s['problems']
     assert s['windows'] == 2
+
+
+def _rearm_log(mid_rearm=3, bump=None):
+    """make_log with the H7 rearm counter as on the bench (buổi thử S06/2026-11-15_run01_thu T2): the Link line
+    before link up and the one after the final loss show the link down with rearms counted while down; the
+    in-run 'Link: up' lines show `mid_rearm`, from line `bump` on `mid_rearm + 1` (one rearm inside the run)."""
+    lines = make_log()
+    idx = [i for i, l in enumerate(lines) if 'Link: ' in l]
+    for n, i in enumerate(idx):
+        pre, _, _ = lines[i].partition('Link: ')
+        if n == 0:
+            lines[i] = pre + 'Link: down lost=0  SPI frames=0/s err=0 rearm=0 last_err=0x0'
+        elif n == len(idx) - 1:
+            lines[i] = pre + f'Link: down lost=1  SPI frames=0/s err=0 rearm={mid_rearm + 3} last_err=0x0'
+        else:
+            r = mid_rearm + (1 if bump is not None and n >= bump else 0)     # cumulative counter
+            lines[i] = pre + f'Link: up lost=0  SPI frames=1000/s err=0 rearm={r} last_err=0x0'
+    return lines
+
+
+def test_rearm_counted_inside_the_run_only():
+    """Liam 15/11, CODE_S06 "Rearm đếm trong lượt (Recommended)": rearms while the link is down before link up
+    and after the final loss are not faults; a rearm between two in-run 'Link: up' lines is."""
+    ev = ser.parse_lines(_rearm_log())
+    st = ser.link_stats(ev, ser.run_span(ev))
+    assert st['rearm'] == 0 and st['rearm_bounded'] == 6 and st['lost'] == 1 and ser.link_fails(st) == []
+    ev = ser.parse_lines(_rearm_log(bump=3))
+    st = ser.link_stats(ev, ser.run_span(ev))
+    assert st['rearm'] == 1 and any('rearm tăng 1' in f for f in ser.link_fails(st))
+
+
+def test_t3t_3_rearm_not_computable_is_missing():
+    """T3T-3 (Codex 15/11; Liam 'Sua ca 10 + vong 2'): fewer than two in-run 'Link: up' lines: rearm None, reported
+    as missing evidence by link_missing (0cb41c6: silently clean); a computable rearm: nothing missing."""
+    ev = ser.parse_lines(_rearm_log())
+    st = ser.link_stats(ev, ser.run_span(ev))
+    assert ser.link_missing(st) == []
+    lines = _rearm_log()
+    ups = [i for i, l in enumerate(lines) if 'Link: up' in l]
+    lines = [l for i, l in enumerate(lines) if i not in ups[1:]]           # keep one in-run 'Link: up' line
+    ev = ser.parse_lines(lines)
+    st = ser.link_stats(ev, ser.run_span(ev))
+    assert st['rearm'] is None and ser.link_fails(st) == []
+    assert any('không tính được rearm' in m for m in ser.link_missing(st))

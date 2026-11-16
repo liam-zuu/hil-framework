@@ -46,3 +46,33 @@ def test_duration_stops():
 
 def test_bad_port_exit_code(tmp_path):
     assert cap.main(['--port', 'COM_DOES_NOT_EXIST', '--out', str(tmp_path / 'x.log')]) == 2
+
+
+
+FAKE_SERIAL_RUN = r"""
+import sys, types
+class P:
+    in_waiting = 0
+    def __init__(self, *a, **k): self.n = 0
+    def read(self, n):
+        self.n += 1
+        return b'Link: up' + bytes([10]) if self.n < 3 else b''
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+m = types.ModuleType('serial'); m.Serial = P; sys.modules['serial'] = m
+sys.path.insert(0, sys.argv[1])
+import h7_serial_capture as cap
+raise SystemExit(cap.main(['--port', 'FAKE', '--out', sys.argv[2], '--duration', '0.3']))
+"""
+
+
+def test_cp1252_console_does_not_kill_the_capture(tmp_path):
+    """Buổi thử S06 15/11 (lượt T6): stdout redirected with a cp1252 code page; the Vietnamese status lines
+    printed on stdout must not raise UnicodeEncodeError (on b907d98 the capture died at its first print)."""
+    import subprocess
+    env = dict(os.environ, PYTHONIOENCODING='cp1252')
+    out = tmp_path / 'x.log'
+    r = subprocess.run([sys.executable, '-c', FAKE_SERIAL_RUN, os.path.join(ROOT, 'tools'), str(out)],
+                       capture_output=True, env=env)
+    assert r.returncode == 0 and b'UnicodeEncodeError' not in r.stderr, r.stderr
+    assert 'Link: up' in out.read_text(encoding='utf-8')

@@ -58,7 +58,18 @@ def capture(ser, out, duration_s=None, clock=now_us, max_idle_reads=None):
     return n_lines, n_bytes, reason
 
 
+def _utf8_console() -> None:
+    """Buổi thử S06 15/11 (05_DATA/results/S06/2026-11-15_run01_thu, lượt T6): with stdout redirected on
+    Windows the code page is cp1252 and the first Vietnamese print raised UnicodeEncodeError, so the capture
+    died before reading a line. Messages go out as UTF-8 whatever the environment (CODE 15/11: not relying on
+    PYTHONIOENCODING); the log file was already UTF-8."""
+    for s in (sys.stdout, sys.stderr):
+        if hasattr(s, 'reconfigure'):
+            s.reconfigure(encoding='utf-8', errors='replace')
+
+
 def main(argv=None) -> int:
+    _utf8_console()
     ap = argparse.ArgumentParser(description='Ghi log serial H7 (ST-Link VCP)')
     ap.add_argument('--port', required=True)
     ap.add_argument('--out', required=True)

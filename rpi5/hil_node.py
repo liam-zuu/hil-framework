@@ -28,6 +28,7 @@ from __future__ import annotations
 import gc
 import json
 import logging
+import math
 import multiprocessing as mp
 import os
 import signal
@@ -491,10 +492,18 @@ class HILNode:
 
     def _check_state(self, frame_state, where: str) -> None:
         """O1 v11.15 3.5 (B81-15): record the first state field that is not finite, or x, y at the +-5 m bound
-        (protocol.state_out_of_range): a HIL tool error, the run is failed (run_failed) and redone."""
+        (protocol.state_out_of_range): a HIL tool error, the run is failed (run_failed) and redone.
+        S06 load runs (cfg.load_schedule set, `--load-schedule`; Liam 15/11 at THESIS "Bỏ biên ở lượt tải
+        (Recommended)", spec S06 "Khối tải nặng tham chiếu [Z8]" and O1 line 303, gốc 6246d5de): only the
+        not-finite check; the ESP32 env s06_load drives PWM by schedule, not control, so the plant drifts past
+        +-5 m (trial S06/2026-11-15_run01_thu T2: x = 5 m at step 17061); S06 does not score the position (the
+        frame clamps it to int16), encoder and IMU come from omega."""
         if self._state_bad is not None:
             return
-        i = state_out_of_range(frame_state)
+        if self.cfg.load_schedule:
+            i = next((k for k, v in enumerate(frame_state) if not math.isfinite(float(v))), -1)
+        else:
+            i = state_out_of_range(frame_state)
         if i >= 0:
             self._state_bad = dict(step=int(self._step), field=int(i), value=repr(float(frame_state[i])), where=where)
             log.error('plant state field %d = %r at step %d (%s): not finite or position at the +-5 m bound; '

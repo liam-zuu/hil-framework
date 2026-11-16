@@ -306,6 +306,7 @@ def check(t_send_ns, mosi, miso, esp32_events=None, serial_events=None, skip_s=0
         incomplete.append('không có --h7-serial: không kiểm được bộ đếm Link/Frame của H7')
     else:
         fails += ser.link_fails(serial)
+        incomplete += ser.link_missing(serial)          # T3T-3: rearm not computable is not a pass
         if not (serial['bounded_start'] and serial['bounded_end']):
             incomplete.append('log serial không có dòng Link/Frame ngay trước link up và ngay sau link lost '
                               'cuối: bộ đếm không bao hai đầu lượt')

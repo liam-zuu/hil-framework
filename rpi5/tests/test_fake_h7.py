@@ -344,3 +344,22 @@ def test_plant_state_checked_before_the_imu_and_the_heavy_block(tmp_path):
     node.run()
     m = json.loads(str(np.load(p2)['manifest']))
     assert node.run_failed and m['state_out_of_range']['field'] == 0 and m['state_out_of_range']['where'] == 'plant'
+
+
+@pytest.mark.parametrize('field, value, failed', [(4, 6.0, False), (5, -7.5, False), (4, float('nan'), True),
+                                                  (7, float('inf'), True)])
+def test_load_schedule_run_checks_finite_only(tmp_path, field, value, failed):
+    """S06 load runs (cfg.load_schedule; Liam 15/11 at THESIS "Bỏ biên ở lượt tải (Recommended)", gốc 6246d5de):
+    x, y past +-5 m do not fail the run (the s06_load ESP32 drives PWM by schedule, the plant drifts; S06 does
+    not score the position), a field that is not finite still does. The default path is the test above."""
+    import json
+
+    import numpy as np
+    p = str(tmp_path / 'f.npz')
+    node = HILNode(_BadStatePlant(20, field, value),
+                   config=HILConfig(simulate_hw=True, max_steps=60, period_us=1_000, frame_log=p,
+                                    load_schedule='S06_load.csv 0123abcd'))
+    node.run()
+    m = json.loads(str(np.load(p)['manifest']))
+    assert node.run_failed is failed
+    assert (m['state_out_of_range'] is not None) is failed

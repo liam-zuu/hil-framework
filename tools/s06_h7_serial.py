@@ -646,8 +646,14 @@ def link_stats(ev: List[dict], span=None) -> dict:
     S25: hiệu lấy giữa dòng in **ngay trước** 'link up' đầu và dòng in **ngay sau** 'link lost' cuối
     (bao hai đầu; bộ đếm cộng dồn từ lúc khởi động), để lỗi trong 0,5 s đầu/cuối không lọt. Không có
     dòng bao một đầu thì lấy dòng trong lượt và ghi `bounded_* = false` (công cụ chấm báo không kiểm
-    đủ). Lần mất link cuối lượt (Pi dừng) làm `lost` và `rearm` tăng 1 (main.c: SPI1_RequestRestart):
-    `expected_end_loss` = 1 khi có dòng bao cuối sau 'link lost'."""
+    đủ). Lần mất link cuối lượt (Pi dừng) làm `lost` tăng 1 (main.c: SPI1_RequestRestart):
+    `expected_end_loss` = 1 khi có dòng bao cuối sau 'link lost'.
+    `rearm` (Liam 15/11, CODE_S06, hộp chọn "Rearm đếm trong lượt (Recommended)"; buổi thử
+    S06/2026-11-15_run01_thu T2): khi link down H7 khởi động lại SPI1 mỗi 200 ms (CG4), nên hiệu bao hai đầu
+    cộng cả các lần rearm lúc down trước 'link up' và sau 'link lost' (T2: 5, H7 in mỗi 0,5 s). `rearm` nay là
+    hiệu giữa dòng `Link: up` ĐẦU và CUỐI nằm trong lượt, kỳ vọng 0; `rearm_bounded` giữ hiệu bao hai đầu để
+    tra, không chấm. Giới hạn: ≤ 0,5 s đầu và cuối lượt không được phủ với `rearm` (`SPIfix: stuck=` vẫn kiểm
+    riêng, L50); `rearm_in_run_lines` = số dòng `Link: up` đã dùng (< 2: không tính được, `rearm` = None)."""
     a, b = span if span else (0, len(ev))
     out = dict(link_lines=sum(1 for e in ev[a:b] if e['kind'] == 'link'),
                frame_lines=sum(1 for e in ev[a:b] if e['kind'] == 'frame'),
@@ -657,7 +663,10 @@ def link_stats(ev: List[dict], span=None) -> dict:
     end_loss = 1 if (s1 and b < len(ev) and ev[b]['kind'] == 'link_lost') else 0
     out.update(bounded_start=s0, bounded_end=s1, expected_end_loss=end_loss)
     if f0 is not None and f1 is not None and f0 is not f1:
-        out.update(err=f1['err'] - f0['err'], rearm=f1['rearm'] - f0['rearm'], lost=f1['lost'] - f0['lost'])
+        out.update(err=f1['err'] - f0['err'], rearm_bounded=f1['rearm'] - f0['rearm'], lost=f1['lost'] - f0['lost'])
+    ups = [e for e in ev[a:b] if e['kind'] == 'link' and e['state'] == 'up']
+    out['rearm_in_run_lines'] = len(ups)
+    out['rearm'] = ups[-1]['rearm'] - ups[0]['rearm'] if len(ups) >= 2 else None
     g0, t0, g1, t1 = _bounding(ev, 'frame', a, b)
     if g0 is not None and g1 is not None and g0 is not g1 and g1['applied'] is not None and g0['applied'] is not None:
         out.update(applied=g1['applied'] - g0['applied'], skipped=g1['skipped'] - g0['skipped'],
@@ -676,10 +685,22 @@ def link_fails(st: dict) -> List[str]:
                    ('unread', 'H7 Frame unread tăng')):
         if st.get(k):
             f.append(f'{msg} {st[k]}')
-    for k in ('lost', 'rearm'):
-        if st.get(k) is not None and st[k] - st['expected_end_loss'] != 0:
-            f.append(f"H7 {k} tăng {st[k]} (kỳ vọng {st['expected_end_loss']} do mất link cuối lượt)")
+    if st.get('lost') is not None and st['lost'] - st['expected_end_loss'] != 0:
+        f.append(f"H7 lost tăng {st['lost']} (kỳ vọng {st['expected_end_loss']} do mất link cuối lượt)")
+    if st.get('rearm'):                       # in-run, between the first and last 'Link: up' lines: expect 0
+        f.append(f"H7 rearm tăng {st['rearm']} trong lượt (giữa dòng Link: up đầu và cuối; kỳ vọng 0)")
     return f
+
+
+def link_missing(st: dict) -> List[str]:
+    """T3T-3 (Codex 15/11; Liam 'Sua ca 10 + vong 2'): T1 evidence the serial log does not give (mã 3, not a pass).
+    `rearm` needs two in-run 'Link: up' lines (one every 0.5 s); with fewer it is not computable. Known limit kept
+    (Liam 'Rearm dem trong luot'): a rearm in the <= 0.5 s before the first or after the last such line is not
+    counted; SPIfix (stuck SPI1) is not read by this tool."""
+    if st.get('rearm') is None:
+        return [f"không tính được rearm trong lượt: {st.get('rearm_in_run_lines', 0)} dòng Link: up giữa link up "
+                'và link lost (cần ≥ 2)']
+    return []
 
 
 def write_csv(path, rows):
