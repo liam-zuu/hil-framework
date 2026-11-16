@@ -983,6 +983,25 @@ def test_kiem_catches_camera_error(tmp_path):
     assert r['n_over'] > 0 and not r['ok']
 
 
+def test_kiem_reports_chip_yaw_minus_gz_integral(tmp_path):
+    """Roll/pitch investigation 3.1 (Liam 16/11): kiem reports chip yaw - integral of gz over the run, raw (no
+    scale correction), for finding the cause when a check fails; not part of ok."""
+    fr, lg = _c8_pair(tmp_path)
+    u = _u_file(tmp_path, lg, tau=0.004)
+    r = U.kiem(fr, lg, 0.5, u, 'O1-F08', u_psi=math.radians(0.5))
+    g = r['yaw_tru_gz']               # step rate sampled at 20 Hz: the trapezoid itself is off by about 0.1 rad
+    assert math.isfinite(g['end_rad']) and g['n_points'] > 300 and g['het_cua_so'] is True
+    t2 = tmp_path / 'b'
+    t2.mkdir()
+    fr2, lg2 = _c8_pair(t2, s_plus=0.05, name='r2')
+    u2 = _u_file(t2, lg2, tau=0.004, s_plus=0.05)
+    r2 = U.kiem(fr2, lg2, 0.5, u2, 'O1-F08', u_psi=math.radians(0.5))
+    g2 = r2['yaw_tru_gz']
+    assert g2['end_rad'] - g['end_rad'] == pytest.approx(0.05 * math.radians(300), abs=0.01)   # raw: scale kept
+    assert g2['max_abs_rad'] >= abs(g2['end_rad'])
+    assert r2['ok'] == (r2['align_ok'] and r2['compared_ok'] and r2['n_over'] == 0 and r2['closure_ok'] is True)
+
+
 def test_kiem_closure_catches_uncorrected_scale(tmp_path):
     fr, lg = _c8_pair(tmp_path, s_plus=0.02)
     u = _u_file(tmp_path, lg, tau=0.004, delta=0.001)

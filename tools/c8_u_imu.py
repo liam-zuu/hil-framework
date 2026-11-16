@@ -884,6 +884,30 @@ def check_u_file(u):
         _finite(lev.get('U_IMU_dong_rad'), f'{m} U_IMU_dong_rad', 0.0, math.pi)
 
 
+def yaw_minus_gz(L, w0, w1, period_s=PERIOD_S, j_lim=J_LIM_S, h_lim=H_LIM_S):
+    """Diagnostic (roll/pitch investigation 3.1, Liam 16/11): raw chip yaw (no scale correction, no tau) minus the
+    integral of gz, both from the first kept rotation vector report at or after w0, on the receive-time clock,
+    up to w1 or the first gap where gz is not integrable. Not a check; kiem only reports it."""
+    S = rv_samples(L, period_s=period_s, j_lim=j_lim, h_lim=h_lim)
+    tr, psi = S['t_recv'][S['keep']], S['psi_all'][S['keep']]
+    k = np.nonzero((tr >= w0) & (tr <= w1))[0]
+    out = dict(max_abs_rad=None, end_rad=None, t_max_s=None, n_points=0, het_cua_so=False)
+    if k.size < 2:
+        return out
+    d, ig = [0.0], 0.0
+    for i in range(1, k.size):
+        g = _gz_integral(S['tg'], S['gz'], tr[k[i - 1]], tr[k[i]], h_lim)
+        if g is None:
+            break
+        ig += g
+        d.append(float(psi[k[i]] - psi[k[0]] - ig))
+    d = np.array(d)
+    m = int(np.argmax(np.abs(d)))
+    out.update(max_abs_rad=float(abs(d[m])), end_rad=float(d[-1]), t_max_s=float(tr[k[m]] - w0),
+               n_points=int(d.size), het_cua_so=bool(d.size == k.size))
+    return out
+
+
 def kiem(frames, log, offset_s, u, muc, u_psi, u_ghep=0.0, n_min=30, wz_still=0.05):
     """Design 5: back check |psi_cam - psi_IMU| <= U_psi + U_IMU(m) on every compared frame, and the closure of
     the IMU yaw against the camera between the still parts before and after the run (unwrapped, CU-13; end part
@@ -931,6 +955,7 @@ def kiem(frames, log, offset_s, u, muc, u_psi, u_ghep=0.0, n_min=30, wz_still=0.
         out.update(closure_rad=None, closure_ok=None,
                    closure_note=f'fewer than {n_min} still frames in the {END_STILL_S:.0f} s after the window')
     out['ok'] = bool(out['align_ok'] and out['compared_ok'] and out['n_over'] == 0 and out['closure_ok'] is True)
+    out['yaw_tru_gz'] = yaw_minus_gz(L, t0 - u['pre_s'], te + END_STILL_S, u['period_s'], u['j_lim_s'], u['h_lim_s'])
     return out
 
 
@@ -944,6 +969,10 @@ def script_state():
         return dict(commit=c.stdout.strip(), dirty=bool(s.stdout.strip()), luc_chay=now_iso())
     except (OSError, subprocess.SubprocessError):
         return dict(commit='', dirty=None, luc_chay=now_iso())
+
+
+def _deg(x):
+    return 'n/a' if x is None else f'{math.degrees(x):+.2f} deg'
 
 
 def _read_json(path):
@@ -1080,6 +1109,7 @@ def main(argv=None):
             print(f'{a.muc}: {r["n_over"]} of {r["n_compared"]} frames over {math.degrees(r["limit_rad"]):.2f} deg '
                   f'(need {r["n_min"]} compared); '
                   f'closure {r.get("closure_ok")}; alignment spread {math.degrees(r["align_spread_rad"]):.2f} deg; '
+                  f'chip yaw - int gz: max {_deg(r["yaw_tru_gz"]["max_abs_rad"])}, end {_deg(r["yaw_tru_gz"]["end_rad"])}; '
                   + ('OK' if r['ok'] else 'NOT OK: do not lock U_IMU (design 5)'))
         else:
             if a.tre:
