@@ -5,9 +5,11 @@
   python D:\\STRA_A\\hoi_codex.py --thu
 
 Checks before the call (else no call): working folder D:\\STRA_A, SHA of D:\\STRA_A\\.codex\\config.toml = the mark,
-every --luot / --doc inside D:\\STRA_A. No argument reaches Codex as such (no -s, -C, --cd, -c sandbox, dangerously).
-Writes CODEX\\hoi_<date>_<n>.md (new file), calls codex exec (gpt-6.1-sol, effort high: Liam 15/11 "Ghim high"),
-checks the log (workdir, sandbox, model, effort); wrong or exit != 0: the answer is NOT printed. Appends the wait
+CODEX folder is the real D:\\STRA_A\\CODEX (no link), every --luot / --doc inside D:\\STRA_A, the Codex program is
+the pinned path (not PATH) with the version of the fence test (SA-1). No argument reaches Codex as such.
+Writes CODEX\\hoi_<date>_<n>.md (new file), calls codex exec (gpt-6.1-sol, effort high: Liam 15/11 "Ghim high")
+with the answer to a temp file, checks the log HEADER (workdir, sandbox, model, effort, each once; SA-2); wrong or
+exit != 0: the answer is NOT printed. The answer is then published under its own new name (SA-21). Appends the wait
 time to CODEX\\thoi_gian.csv. The copy in D:\\STRA_A is installed by chep_luot_A.py cai-hoi-codex (SHA checked).
 """
 from __future__ import annotations
@@ -18,16 +20,21 @@ import datetime as dt
 import hashlib
 import os
 import re
-import shutil
 import subprocess
 import sys
 
 ROOT = r'D:\STRA_A'
 SHA_CODEX_CONFIG = '748bf0c8c5aeb08fd222337172ee939e6bc83ea1f3caf1ff5bcacbca693c3cf9'   # design section 6
+# npm install of the CLI version of the fence test (codex-cli 0.163.0, 14/11); the desktop app's codex.exe is another
+# version. A new version needs the fence test again (D:\STRA_A\CLAUDE.md), then this path and version.
+CODEX_EXE = (r'C:\Users\liam\AppData\Roaming\npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64'
+             r'\vendor\x86_64-pc-windows-msvc\bin\codex.exe')
+CODEX_VERSION = '0.163.0'
 MODEL = 'gpt-6.1-sol'
 EFFORT = 'high'
 WAIT_COLS = ['hoi', 'bat_dau', 'ket_thuc', 'giay', 'ma_thoat', 'model', 'effort', 'luot', 'codex_home']
 CAU_THU = 'Câu hỏi thử, không tune: liệt kê tên các file trong HOP_THU (không đọc nội dung) và trả lời "thử xong".'
+TIMEOUT_S = 3600
 
 
 class Refused(Exception):
@@ -51,15 +58,21 @@ def inside_root(p):
     return q == r or q.startswith(r.rstrip(os.sep) + os.sep)
 
 
+def codex_version(exe):
+    r = subprocess.run([exe, '--version'], capture_output=True, timeout=60)
+    m = re.search(rb'(\d+\.\d+\.\d+\S*)', r.stdout + r.stderr)
+    return m.group(1).decode() if m else ''
+
+
 def run_codex(cmd, stdin_bytes, cwd):
-    """The only call of Codex (tests replace this function; no environment variable can change the program)."""
-    r = subprocess.run(cmd, input=stdin_bytes, capture_output=True, cwd=cwd, timeout=3600)
+    """The only call of Codex (tests replace this function and codex_version)."""
+    r = subprocess.run(cmd, input=stdin_bytes, capture_output=True, cwd=cwd, timeout=TIMEOUT_S)
     return r.returncode, r.stdout + r.stderr
 
 
 def codex_cmd(out):
-    exe = shutil.which('codex') or 'codex'
-    return [exe, 'exec', '--skip-git-repo-check', '-m', MODEL, '-c', f'model_reasoning_effort={EFFORT}', '-o', out, '-']
+    return [CODEX_EXE, 'exec', '--skip-git-repo-check', '-m', MODEL, '-c', f'model_reasoning_effort={EFFORT}', '-o',
+            out, '-']
 
 
 def build_question(cau, luot, doc):
@@ -93,15 +106,31 @@ def build_question(cau, luot, doc):
 def next_name(codex_dir, day):
     n = 1
     while any(os.path.exists(os.path.join(codex_dir, f'{p}_{day}_{n}{e}'))
-              for p, e in (('hoi', '.md'), ('tra_loi', '.md'), ('log', '.txt'))):
+              for p, e in (('hoi', '.md'), ('tra_loi', '.md'), ('log', '.txt'), ('.tam_tra_loi', '.md'))):
         n += 1
     return f'{day}_{n}'
 
 
+def log_header(text):
+    """The CLI header: the lines between the first two '--------' lines, before any prompt or answer (SA-2)."""
+    lines = text.replace('\r\n', '\n').split('\n')
+    try:
+        i = lines.index('--------')
+        j = lines.index('--------', i + 1)
+    except ValueError:
+        return {}
+    out = {}
+    for x in lines[i + 1:j]:
+        k, _, v = x.partition(':')
+        out.setdefault(k.strip(), []).append(v.strip())
+    return out
+
+
 def check_log(text):
-    need = [('workdir', r'^workdir: D:\\STRA_A\s*$'), ('sandbox', r'^sandbox: custom permissions\s*$'),
-            ('model', rf'^model: {re.escape(MODEL)}\s*$'), ('effort', rf'^reasoning effort: {EFFORT}\s*$')]
-    return [k for k, pat in need if not re.search(pat, text, re.M | re.I)]
+    h = log_header(text)
+    want = dict(workdir=ROOT, sandbox='custom permissions', model=MODEL)
+    want['reasoning effort'] = EFFORT
+    return [k for k, v in want.items() if h.get(k) != [v] and [x.casefold() for x in h.get(k, [])] != [v.casefold()]]
 
 
 def main(argv=None):
@@ -119,6 +148,9 @@ def main(argv=None):
         cfg = os.path.join(ROOT, '.codex', 'config.toml')
         if not os.path.isfile(cfg) or sha256(cfg) != SHA_CODEX_CONFIG:
             raise Refused('khóa Codex (.codex\\config.toml) khác mốc: báo Liam, không gọi')
+        cdir = os.path.join(ROOT, 'CODEX')
+        if not os.path.isdir(cdir) or real(cdir) != os.path.normcase(os.path.abspath(cdir)):
+            raise Refused('CODEX không phải thư mục thật trong D:\\STRA_A')
         for x in a.luot:
             if not re.fullmatch(r'[A-Za-z0-9_-]+', x):
                 raise Refused(f'--luot {x!r}: chỉ tên thư mục lượt')
@@ -131,22 +163,28 @@ def main(argv=None):
         cau = CAU_THU if a.thu else a.cau
         if not cau.strip():
             raise Refused('câu hỏi rỗng')
-        cdir = os.path.join(ROOT, 'CODEX')
+        if not os.path.isfile(CODEX_EXE):
+            raise Refused(f'không thấy Codex ở đường dẫn ghim {CODEX_EXE}: báo Liam')
+        v = codex_version(CODEX_EXE)
+        if v != CODEX_VERSION:
+            raise Refused(f'Codex {v or "?"} khác bản đã thử rào {CODEX_VERSION}: chạy lại thử rào, báo Liam')
         t0 = dt.datetime.now().astimezone()
         tag = next_name(cdir, t0.strftime('%Y%m%d'))
-        q, out, log = (os.path.join(cdir, f'{p}_{tag}{e}') for p, e in
-                       (('hoi', '.md'), ('tra_loi', '.md'), ('log', '.txt')))
+        q, out, log, tmp = (os.path.join(cdir, f'{p}_{tag}{e}') for p, e in
+                            (('hoi', '.md'), ('tra_loi', '.md'), ('log', '.txt'), ('.tam_tra_loi', '.md')))
         body = build_question(cau, a.luot, a.doc).encode('utf-8')
         with open(q, 'xb') as f:
             f.write(body)
-        code, text = run_codex(codex_cmd(out), body, ROOT)
+        try:
+            code, text = run_codex(codex_cmd(tmp), body, ROOT)
+        except subprocess.TimeoutExpired as exc:                             # SA-23
+            code, text = 124, (exc.output or b'') + f'\n[hoi_codex: quá {TIMEOUT_S} s]'.encode()
         t1 = dt.datetime.now().astimezone()
         with open(log, 'xb') as f:
             f.write(text)
         s = text.decode('utf-8', 'replace')
         miss = check_log(s)
-        m = re.search(r'^model: (.+)$', s, re.M)
-        e = re.search(r'^reasoning effort: (.+)$', s, re.M)
+        h = log_header(s)
         wp = os.path.join(cdir, 'thoi_gian.csv')
         new = not os.path.exists(wp)
         with open(wp, 'a', newline='', encoding='utf-8') as f:
@@ -154,18 +192,20 @@ def main(argv=None):
             if new:
                 w.writerow(WAIT_COLS)
             w.writerow([os.path.basename(q), t0.isoformat(timespec='seconds'), t1.isoformat(timespec='seconds'),
-                        f'{(t1 - t0).total_seconds():.1f}', code, m.group(1).strip() if m else '',
-                        e.group(1).strip() if e else '', ' '.join(a.luot), os.environ.get('CODEX_HOME', '(mặc định)')])
-        if code != 0 or miss or not os.path.isfile(out):
-            print(f'Codex không chạy đúng khóa, báo Liam (mã {code}; thiếu {miss}; log {os.path.basename(log)})')
+                        f'{(t1 - t0).total_seconds():.1f}', code, ' / '.join(h.get('model', [])),
+                        ' / '.join(h.get('reasoning effort', [])), ' '.join(a.luot),
+                        os.environ.get('CODEX_HOME', '(mặc định)')])
+        if code != 0 or miss or not os.path.isfile(tmp):
+            print(f'Codex không chạy đúng khóa, báo Liam (mã {code}; sai {miss}; log {os.path.basename(log)})')
             print('#ket_qua,ma=2')
             return 2
+        os.rename(tmp, out)                                                  # SA-21: fails if the name exists
         with open(out, encoding='utf-8', errors='replace') as f:
             sys.stdout.write(f.read())
         print(f'\n(chờ Codex {(t1 - t0).total_seconds():.0f} giây; {os.path.basename(out)})')
         print('#ket_qua,ma=0')
         return 0
-    except (Refused, OSError) as exc:
+    except (Refused, OSError, subprocess.SubprocessError, UnicodeError) as exc:
         print(f'TỪ CHỐI: {exc}')
         print('#ket_qua,ma=2')
         return 2

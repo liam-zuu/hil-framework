@@ -14,7 +14,8 @@ import hoi_codex as H  # noqa: E402
 GOOD_LOG = ('OpenAI Codex v0.163.0\n--------\nworkdir: D:\\STRA_A\nmodel: gpt-6.1-sol\nprovider: openai\n'
             'approval: never\nsandbox: custom permissions\nreasoning effort: high\n--------\n')
 # D:\STRA_A\.claude\settings.json deny patterns (design 4 step 8)
-BLOCKED = ('.codex', 'CLAUDE_THESIS', '--cd', ' -C ', 'sandbox_mode', 'default_permissions', 'dangerously')
+BLOCKED = ('.codex', 'CLAUDE_THESIS', 'HIL_WT', 'HIL_BACKUP', 'TUNE_A', '.claude/projects', 'Claude-Data', '--cd',
+           ' -C ', 'sandbox_mode', 'default_permissions', 'dangerously', 'danger-full-access')
 
 
 @pytest.fixture
@@ -26,6 +27,10 @@ def root(tmp_path, monkeypatch):
     (r / 'HOP_THU' / 'luot' / 'A-PID__A1__007').mkdir(parents=True)
     monkeypatch.setattr(H, 'ROOT', str(r))
     monkeypatch.setattr(H, 'SHA_CODEX_CONFIG', hashlib.sha256(b'cfg').hexdigest())
+    exe = tmp_path / 'codex.exe'
+    exe.write_bytes(b'x')
+    monkeypatch.setattr(H, 'CODEX_EXE', str(exe))
+    monkeypatch.setattr(H, 'codex_version', lambda e: H.CODEX_VERSION)
     calls = []
 
     def fake(cmd, stdin, cwd, log=GOOD_LOG, code=0, answer='Đề xuất: kp_xy 1,8\n'):
@@ -34,7 +39,7 @@ def root(tmp_path, monkeypatch):
         if answer is not None:
             with open(out, 'w', encoding='utf-8') as f:
                 f.write(answer)
-        return code, log.encode('utf-8')
+        return code, log.replace('workdir: D:\\STRA_A', 'workdir: ' + str(r)).encode('utf-8')
     monkeypatch.setattr(H, 'run_codex', fake)
     yield r, calls
     os.chdir(HERE)
@@ -46,8 +51,11 @@ def test_good_call_prints_answer(root, capsys):
     out = capsys.readouterr().out
     assert 'kp_xy 1,8' in out and '#ket_qua,ma=0' in out
     cmd, stdin, cwd = calls[0]
-    assert cwd == str(r) and cmd[1:9] == ['exec', '--skip-git-repo-check', '-m', 'gpt-6.1-sol', '-c',
-                                          'model_reasoning_effort=high', '-o', cmd[8]]
+    assert cwd == str(r) and cmd[0] == H.CODEX_EXE and cmd[1:9] == ['exec', '--skip-git-repo-check', '-m',
+                                                                     'gpt-6.1-sol', '-c', 'model_reasoning_effort=high',
+                                                                     '-o', cmd[8]]
+    assert os.path.basename(cmd[8]).startswith('.tam_tra_loi_')                  # SA-21: temp, then published
+    assert not os.path.exists(cmd[8]) and any(n.startswith('tra_loi_') for n in os.listdir(r / 'CODEX'))
     q = (r / 'CODEX' / 'hoi_' ).parent
     qs = [n for n in os.listdir(q) if n.startswith('hoi_')]
     assert len(qs) == 1 and (q / qs[0]).read_bytes() == stdin
@@ -61,6 +69,7 @@ def test_numbering_never_overwrites(root):
     for _ in range(3):
         assert H.main(['--thu']) == 0
     names = sorted(n for n in os.listdir(r / 'CODEX') if n.startswith(('hoi_', 'tra_loi_', 'log_')))
+    assert not any(n.startswith('.tam_') for n in os.listdir(r / 'CODEX'))
     assert len(names) == 9 and len({os.path.splitext(n)[0].rsplit('_', 1)[-1] for n in names}) == 3
 
 
@@ -75,7 +84,46 @@ def test_wrong_lock_hides_answer(root, capsys, monkeypatch, log):
     assert H.main(['--thu']) == 2
     out = capsys.readouterr().out
     assert 'kp_xy' not in out and 'không chạy đúng khóa' in out
-    assert any(n.startswith('tra_loi_') for n in os.listdir(r / 'CODEX'))          # kept, not deleted
+    assert any(n.startswith('.tam_tra_loi_') for n in os.listdir(r / 'CODEX'))     # kept, not published
+
+
+def test_lock_lines_after_the_header_do_not_count(root, capsys, monkeypatch):
+    """SA-2: wrong header; the right lines only in the echoed prompt or the answer."""
+    bad = GOOD_LOG.replace('sandbox: custom permissions', 'sandbox: danger-full-access') + 'user\n' + GOOD_LOG
+    f = H.run_codex
+    monkeypatch.setattr(H, 'run_codex', lambda c, s, w: f(c, s, w, log=bad))
+    assert H.main(['--thu']) == 2 and 'kp_xy' not in capsys.readouterr().out
+    two = GOOD_LOG.replace('model: gpt-6.1-sol\n', 'model: gpt-6.1-sol\nmodel: gpt-5\n')
+    monkeypatch.setattr(H, 'run_codex', lambda c, s, w: f(c, s, w, log=two))
+    assert H.main(['--thu']) == 2
+
+
+def test_pinned_program_and_version(root, capsys, monkeypatch):
+    """SA-1: the program is the pinned path, not PATH; another version is refused before the call."""
+    r, calls = root
+    monkeypatch.setenv('PATH', str(r))
+    monkeypatch.setattr(H, 'codex_version', lambda e: '0.167.0-alpha.4.1')
+    assert H.main(['--thu']) == 2 and 'thử rào' in capsys.readouterr().out
+    monkeypatch.setattr(H, 'CODEX_EXE', str(r / 'khong_co.exe'))
+    assert H.main(['--thu']) == 2
+    assert calls == []
+
+
+def test_timeout_is_exit_2(root, capsys, monkeypatch):
+    def slow(c, s, w):
+        raise H.subprocess.TimeoutExpired(c, 1)
+    monkeypatch.setattr(H, 'run_codex', slow)
+    assert H.main(['--thu']) == 2 and '#ket_qua,ma=2' in capsys.readouterr().out
+
+
+def test_codex_folder_link_refused(root, capsys, tmp_path):
+    r, calls = root
+    os.rename(r / 'CODEX', tmp_path / 'CODEX_ngoai')
+    try:
+        os.symlink(tmp_path / 'CODEX_ngoai', r / 'CODEX', target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip('no symlink right on this machine')
+    assert H.main(['--thu']) == 2 and calls == []
 
 
 def test_exit_code_hides_answer(root, capsys, monkeypatch):

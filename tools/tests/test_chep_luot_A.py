@@ -1,4 +1,5 @@
-"""Tests of tools/chep_luot_A.py (design 03_CODE/docs/2026-11-15_Thiet_ke_CODE_C13_v1.md section 8, 10.4)."""
+"""Tests of tools/chep_luot_A.py (design 03_CODE/docs/2026-11-15_Thiet_ke_CODE_C13_v1.md section 8, 10.4; Codex Sol
+round 1 counter-examples SA-n)."""
 import csv
 import hashlib
 import json
@@ -34,14 +35,15 @@ def wcsv(path, cols, rows):
 
 
 @pytest.fixture
-def world(tmp_path):
-    """A STRA_A root, a run folder of an A run with its files, a tuning log with its row, an empty freeze table."""
+def world(tmp_path, monkeypatch):
+    """A thesis folder (tmp) with an A run in 05_DATA/results, a STRA_A root, a tuning log, an empty freeze table."""
+    monkeypatch.setattr(C, 'THESIS', str(tmp_path))
     sa = tmp_path / 'STRA_A'
     hop = sa / 'HOP_THU'
     hop.mkdir(parents=True)
     (hop / 'spec.md').write_text('spec\n', encoding='utf-8')
     (hop / 'README.md').write_bytes(README.format(sha=sha(hop / 'spec.md')[:16]).replace('\n', '\r\n').encode())
-    run = tmp_path / 'data' / 'S05' / 'A' / 'r1'
+    run = tmp_path / '05_DATA' / 'results' / 'S05' / 'A' / 'r1'
     (run / 'cam').mkdir(parents=True)
     esp = run / 'log.csv'
     wcsv(esp, ['timestamp_us', 'x'], [{'timestamp_us': 1, 'x': 2}])
@@ -59,7 +61,7 @@ def world(tmp_path):
                               'version': 'c7_v1'}), encoding='utf-8')
     tl = tmp_path / 'm7_tuning_log.csv'
     row = dict(session_id='A1', iter_no='7', run_uid='A1:7', campaign='A-PID', stage='screen', platform='HW',
-               results_dir=str(run), gate_json_sha256=sha(sc), run_outcome='dat', speed_mps='0.5',
+               results_dir='05_DATA/results/S05/A/r1', gate_json_sha256=sha(sc), run_outcome='dat', speed_mps='0.5',
                gain_set_id='g3', g_kp_xy='2.0', g_ki_xy='0.1')
     wcsv(tl, TCOLS, [row])
     fz = tmp_path / 'S05_freeze.csv'
@@ -85,6 +87,11 @@ def set_row(w, **kw):
     wcsv(w['tl'], TCOLS, [w['row']])
 
 
+def box_ok(w):
+    _, bad = C.box_check(str(w['hop']))
+    assert bad == []
+
+
 def test_luot_copies_run(world, capsys):
     w = world
     old = (w['hop'] / 'README.md').read_bytes()
@@ -95,12 +102,11 @@ def test_luot_copies_run(world, capsys):
     assert set(info['files']) == {'log_esp32', 'log_segments', 'score', 'sai_so', 'quy_dao', 'theo_doi', 'ghi_chu'}
     assert str(w['tmp']) not in (d / 'luot.json').read_text(encoding='utf-8')          # no thesis path
     new = (w['hop'] / 'README.md').read_bytes()
-    k = old.index(b'\r\n\r\n**Luat') if b'**Luat' in old else old.index('\r\n\r\n**Luật'.encode()) + 2
+    k = old.index('\r\n\r\n**Luật'.encode()) + 2
     assert new.startswith(old[:k]) and new.endswith(old[k:])
     add = new[k:len(new) - len(old) + k].decode()
     assert add.count('\r\n') == 8 and '(bộ chấm c7_v1)' in add and 'luot/A-PID__A1__007/luot.json' in add
-    _, bad = C.box_check(str(w['hop']))
-    assert bad == []
+    box_ok(w)
 
 
 @pytest.mark.parametrize('change, msg', [
@@ -113,6 +119,8 @@ def test_luot_copies_run(world, capsys):
     (dict(platform='HIL'), 'platform'),
     (dict(gate_json_sha256='0' * 64), 'gate_json_sha256'),
     (dict(run_outcome='khong_dat'), 'run_outcome'),
+    (dict(results_dir='.'), 'not inside 05_DATA/results'),                         # SA-7
+    (dict(results_dir='05_DATA/results/S05'), 'not a run folder'),                 # SA-7
 ])
 def test_luot_refuses_run(world, capsys, change, msg):
     w = world
@@ -143,17 +151,31 @@ def test_luot_refuses_banned_path(world, capsys, part):
     assert 'fence' in capsys.readouterr().out
 
 
-def test_luot_refuses_outside_results_dir_and_symlink(world, capsys, tmp_path):
+def test_luot_refuses_outside_results_dir_and_links(world, capsys, tmp_path):
     w = world
     p = tmp_path / 'other_rows.csv'
     shutil.copy(w['rows'], p)
     assert C.main(args(w, rows=p)) == 2 and 'not inside results_dir' in capsys.readouterr().out
+    hard = w['run'] / 'hard_rows.csv'                                              # SA-9
+    os.link(p, hard)
+    assert C.main(args(w, rows=hard)) == 2 and 'hard link' in capsys.readouterr().out
     link = w['run'] / 'link_rows.csv'
     try:
         os.symlink(p, link)
     except (OSError, NotImplementedError):
-        pytest.skip('no symlink right on this machine')
+        return
     assert C.main(args(w, rows=link)) == 2
+
+
+def test_luot_note_file_must_be_in_the_run(world, capsys):
+    w = world                                                                      # SA-8
+    other = w['tmp'] / '05_DATA' / 'results' / 'S05' / 'B' / 'r9'
+    other.mkdir(parents=True)
+    (other / 'ghi_chu.md').write_text('gain B', encoding='utf-8')
+    assert C.main(args(w, ghi_chu_file=str(other / 'ghi_chu.md'))) == 2
+    assert 'not inside results_dir' in capsys.readouterr().out
+    (w['run'] / 'ghi_chu.md').write_text('ổn', encoding='utf-8')
+    assert C.main(args(w, ghi_chu_file=str(w['run'] / 'ghi_chu.md'))) == 0
 
 
 @pytest.mark.parametrize('ext', ['.mov', '.mp4', '.jpg', '.png'])
@@ -162,6 +184,17 @@ def test_luot_refuses_media(world, capsys, ext):
     p = w['run'] / ('note' + ext)
     p.write_bytes(b'x')
     assert C.main(args(w, ghi_chu_file=str(p))) == 2
+
+
+def test_media_renamed_refused(world, capsys):
+    w = world                                                                      # SA-10
+    p = w['tmp'] / 'camera.json'
+    p.write_bytes(b'\x89PNG\r\n\x1a\n' + b'\x00' * 20)
+    base = ['--stra-a', str(w['sa']), 'them', '--loai', 'tai_lieu', '--nguon', str(p), '--ly-do', 'x']
+    assert C.main(base) == 2 and 'media' in capsys.readouterr().out
+    p.write_text('{"a": 1', encoding='utf-8')
+    assert C.main(base) == 2 and 'not JSON' in capsys.readouterr().out
+    box_ok(w)
 
 
 def test_luot_refuses_big_file_and_bad_sha(world, capsys, monkeypatch):
@@ -175,6 +208,16 @@ def test_luot_refuses_big_file_and_bad_sha(world, capsys, monkeypatch):
     fr2 = w['run'] / 'cam' / 'frames2.csv'
     wcsv(fr2, ['t_s'], [{'t_s': 1}])
     assert C.main(args(w, fr=fr2)) == 2 and 'frames_sha256' in capsys.readouterr().out
+
+
+def test_luot_refuses_case_twins(world, capsys):
+    w = world                                                                      # SA-4
+    d = w['run'] / 'err'
+    d.mkdir()
+    p = d / 'LOG.csv'
+    shutil.copy(w['rows'], p)
+    assert C.main(args(w, rows=p, seg=False)) == 2 and 'ignore case' in capsys.readouterr().out
+    assert not (w['hop'] / 'luot').exists() or os.listdir(w['hop'] / 'luot') == []
 
 
 def test_luot_refuses_missing_error_columns(world, capsys):
@@ -193,9 +236,22 @@ def test_luot_again_needs_thay_and_keeps_old(world, capsys):
     assert C.main(args(w, thay=True)) == 0
     names = os.listdir(w['hop'] / 'luot')
     assert 'A-PID__A1__007' in names and any(n.startswith('A-PID__A1__007__cu_') for n in names)
-    assert (w['hop'] / 'README.md').read_bytes().startswith(readme1[:readme1.index(b'\r\n\r\n**')])
+    box_ok(w)
+
+def test_box_check_archive_tampered(world, capsys):
+    """SA-17: the run copied again with a new score; the archived old score replaced by the current one."""
+    w = world
+    assert C.main(args(w)) == 0
+    sc2 = json.loads(w['sc'].read_text(encoding='utf-8'))
+    sc2['version'] = 'c7_v2'
+    w['sc'].write_text(json.dumps(sc2), encoding='utf-8')
+    set_row(w, gate_json_sha256=sha(w['sc']))
+    assert C.main(args(w, thay=True)) == 0
+    box_ok(w)
+    cu = next(n for n in os.listdir(w['hop'] / 'luot') if '__cu_' in n)
+    shutil.copy(w['hop'] / 'luot' / 'A-PID__A1__007' / 'score.json', w['hop'] / 'luot' / cu / 'score.json')
     _, bad = C.box_check(str(w['hop']))
-    assert bad == []
+    assert any('no older row' in x for x in bad)
 
 
 def test_luot_failure_leaves_nothing(world, capsys, monkeypatch):
@@ -210,9 +266,23 @@ def test_luot_failure_leaves_nothing(world, capsys, monkeypatch):
             raise OSError('disk full (test)')
         return real(a, b)
     monkeypatch.setattr(C.shutil, 'copyfile', flaky)
-    with pytest.raises(OSError):
-        C.main(args(w))
+    assert C.main(args(w)) == 2                                                     # SA-23: exit 2, marker
+    assert '#ket_qua,ma=2' in capsys.readouterr().out
     assert os.listdir(w['hop'] / 'luot') == [] and (w['hop'] / 'README.md').read_bytes() == old
+
+
+def test_luot_readme_failure_rolls_back(world, capsys, monkeypatch):
+    w = world                                                                      # SA-11
+    assert C.main(args(w)) == 0
+    before = sorted(os.listdir(w['hop'] / 'luot'))
+    readme = (w['hop'] / 'README.md').read_bytes()
+
+    def boom(hop, data):
+        raise OSError('README locked (test)')
+    monkeypatch.setattr(C, 'readme_write', boom)
+    assert C.main(args(w, thay=True)) == 2
+    assert sorted(os.listdir(w['hop'] / 'luot')) == before and (w['hop'] / 'README.md').read_bytes() == readme
+    box_ok(w)
 
 
 def test_luot_marks_gain_out_of_domain(world, capsys):
@@ -230,7 +300,7 @@ def test_luot_marks_gain_out_of_domain(world, capsys):
 
 def test_readme_refuses_pipe_in_cell(world):
     with pytest.raises(C.Refused, match=r'\|'):
-        C.readme_append(str(world['hop']), [('a', 'b | c', 'x', '0' * 64, 'd')])
+        C.readme_new(str(world['hop']), [('a', 'b | c', 'x', '0' * 64, 'd')])
 
 
 # ── them ───────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -245,13 +315,33 @@ def test_them_tai_lieu_and_replace(world, capsys):
     doc.write_text('gain 2\n', encoding='utf-8')
     assert C.main(base + ['--thay']) == 0
     assert any(n.startswith('gain_mac_dinh__cu_') for n in os.listdir(w['hop']))
-    _, bad = C.box_check(str(w['hop']))
-    assert bad == []
+    box_ok(w)
     s = w['tmp'] / 'sealed'
     s.mkdir()
     (s / 'x.md').write_text('x', encoding='utf-8')
     assert C.main(['--stra-a', str(w['sa']), 'them', '--loai', 'tai_lieu', '--nguon', str(s / 'x.md'),
                    '--ly-do', 'x']) == 2
+
+
+@pytest.mark.parametrize('name', ['MIEN_A.csv', 'readme.md', 'Sweep.csv', 'x__cu_20261116-1200.md'])
+def test_them_reserved_names_any_case(world, capsys, name):
+    w = world                                                                      # SA-3
+    p = w['tmp'] / name
+    p.write_text('a,b\n1,2\n' if name.endswith('.csv') else 'x\n', encoding='utf-8')
+    readme = (w['hop'] / 'README.md').read_bytes()
+    assert C.main(['--stra-a', str(w['sa']), 'them', '--loai', 'tai_lieu', '--nguon', str(p), '--ly-do', 'x',
+                   '--thay']) == 2
+    assert 'reserved' in capsys.readouterr().out and (w['hop'] / 'README.md').read_bytes() == readme
+
+
+def test_them_bad_reason_changes_nothing(world, capsys):
+    w = world                                                                      # SA-11
+    doc = w['tmp'] / 'gioi_han.md'
+    doc.write_text('x\n', encoding='utf-8')
+    files = sorted(os.listdir(w['hop']))
+    assert C.main(['--stra-a', str(w['sa']), 'them', '--loai', 'tai_lieu', '--nguon', str(doc),
+                   '--ly-do', 'a|b']) == 2
+    assert sorted(os.listdir(w['hop'])) == files
 
 
 # ── mien ───────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -263,8 +353,8 @@ ADRC_G = ['omega_c_xy', 'omega_o_xy', 'omega_c_wz', 'omega_o_wz', 'pos_kp', 'pos
 
 
 def s03_run(tmp, name='2026-11-20_run03', meta=None, speeds=('0.2', '0.5', '0.8'), drop=None, extra=None,
-            omega_hi=48.0, lev_edit=None):
-    run = tmp / 'S03x' / name
+            omega_hi=48.0, lev_edit=None, sw_edit=None):
+    run = tmp / '05_DATA' / 'results' / 'S03' / name
     run.mkdir(parents=True)
     sw, lv = [], []
     for c, gs in (('PID', PID_G), ('ADRC', ADRC_G)):
@@ -275,7 +365,7 @@ def s03_run(tmp, name='2026-11-20_run03', meta=None, speeds=('0.2', '0.5', '0.8'
             pts = [0.0, 0.5, 1.0, 2.0] + ([omega_hi] if om else [4.0, 8.0])
             for x in pts:
                 for v in speeds:
-                    if drop == (c, g, x, v):
+                    if drop and drop(c, g, x, v):
                         continue
                     lu = '0' if x == 0 else ('noi' if (not om and x == 8.0) else 'log')
                     sw.append(dict(controller=c, factor=g, value=repr(x), v=v, luoi=lu, completed='true'))
@@ -286,9 +376,12 @@ def s03_run(tmp, name='2026-11-20_run03', meta=None, speeds=('0.2', '0.5', '0.8'
         sw.append(extra)
     if lev_edit:
         lev_edit(lv)
+    if sw_edit:
+        sw_edit(sw)
     wcsv(run / 'sweep.csv', SCOLS, sw)
     wcsv(run / 'levels.csv', LCOLS, lv)
-    m = dict(trial=False, script=dict(commit='abc', dirty=False), firmware=dict(esp32=dict(dirty=False)))
+    m = dict(trial=False, date='2026-11-20', script=dict(commit='abc', dirty=False),
+             firmware=dict(esp32=dict(dirty=False)))
     m.update(meta or {})
     (run / 'meta.yaml').write_text(yaml.safe_dump(m), encoding='utf-8')
     return run
@@ -299,8 +392,7 @@ def mien_args(w, run, out=None, *more):
 
 
 @pytest.fixture
-def w0(world, monkeypatch):
-    monkeypatch.setattr(C, 'THESIS', str(world['tmp']))
+def w0(world):
     tl0 = world['tmp'] / 'tl0.csv'
     wcsv(tl0, TCOLS, [])
     world['tl0'] = tl0
@@ -316,23 +408,41 @@ def test_mien_domain(w0, capsys):
     assert (d[('PID', 'kp_xy')]['lo'], d[('PID', 'kp_xy')]['hi'], d[('PID', 'kp_xy')]['nguon_hi']) == ('0.0', '8.0', 'b_n')
     assert d[('LADRC', 'omega_o_xy')]['hi'] == '48.0' and d[('LADRC', 'omega_o_xy')]['nguon_hi'] == 'tran_omega_o'
     js = json.load(open(w0['tmp'] / 'A' / 'mien_A.json', encoding='utf-8'))
-    assert js['sha256']['sweep.csv'] == sha(run / 'sweep.csv')
+    assert js['sha256']['sweep.csv'] == sha(run / 'sweep.csv') and js['s03_run'] == '05_DATA/results/S03/2026-11-20_run03'
     assert C.main(mien_args(w0, run)) == 2                                   # no overwrite without --thay
+    assert C.main(mien_args(w0, run, None, '--thay')) == 0
+    assert len([n for n in os.listdir(w0['tmp'] / 'A') if '__cu_' in n]) == 2
+
+
+def rename_gain(sw):
+    for r in sw:
+        if r['factor'] == 'kp_xy':
+            r['factor'] = 'gain_la'
 
 
 @pytest.mark.parametrize('kw, msg', [
     (dict(name='2026-11-10_run02'), 'history'),
+    (dict(name='2026-11-10_RUN02'), 'history'),                                    # SA-6
     (dict(meta=dict(trial=True)), 'tool check'),
     (dict(meta=dict(tool_check=True)), 'tool check'),
     (dict(meta=dict(script=dict(commit='x', dirty=True))), 'dirty'),
-    (dict(drop=('PID', 'kp_xy', 1.0, '0.5')), 'speeds'),
+    (dict(meta=dict(script=dict(commit='x'))), 'script.dirty'),                    # SA-6
+    (dict(drop=lambda c, g, x, v: (c, g, x, v) == ('PID', 'kp_xy', 1.0, '0.5')), 'speeds'),
+    (dict(drop=lambda c, g, x, v: v == '0.8'), 'speeds'),                          # SA-15
     (dict(extra=dict(controller='PID', factor='extra_g', value='1.0', v='0.2', luoi='log', completed='true')),
-     'gains'),
+     'need exactly'),
+    (dict(sw_edit=rename_gain, lev_edit=lambda lv: lv[0].update(factor='gain_la')), 'need exactly'),   # SA-14
+    (dict(sw_edit=lambda sw: sw[:] if False else [sw.remove(r) for r in list(sw) if r['controller'] == 'ADRC']),
+     'controllers'),                                                                # SA-14
     (dict(omega_hi=60.0), '> 48'),
     (dict(lev_edit=lambda lv: lv[0].update(default='99')), 'default'),
     (dict(lev_edit=lambda lv: lv[0].update(H='50')), '[L, H]'),
     (dict(lev_edit=lambda lv: lv[0].update(b_n='9.0')), 'b_n'),
     (dict(lev_edit=lambda lv: lv[1].update(b='8.0', b_n='')), 'disagree'),
+    (dict(sw_edit=lambda sw: [r.update(luoi='log') for r in sw if r['factor'] == 'kp_xy' and r['value'] == '8.0']
+          + [r.update(luoi='noi') for r in sw if r['factor'] == 'kp_xy' and r['value'] == '4.0']), 'disagree'),
+    (dict(sw_edit=lambda sw: sw.append(dict(controller='PID', factor='kp_xy', value='1', v='0.2', luoi='log',
+                                            completed='true'))), 'once each'),       # SA-16
 ])
 def test_mien_refuses(w0, capsys, kw, msg):
     run = s03_run(w0['tmp'], **kw)
@@ -341,11 +451,19 @@ def test_mien_refuses(w0, capsys, kw, msg):
     assert not (w0['tmp'] / 'A' / 'mien_A.csv').exists()
 
 
-def test_mien_refuses_sealed_and_old_columns(w0, capsys):
+def test_mien_refuses_sealed_link_and_old_columns(w0, capsys, tmp_path):
     run = s03_run(w0['tmp'])
     sealed = run / 'sealed'
     shutil.copytree(run, sealed, ignore=shutil.ignore_patterns('sealed'))
     assert C.main(mien_args(w0, sealed)) == 2 and 'fence' in capsys.readouterr().out
+    other = tmp_path / 'x' / 'run04'                                               # SA-6: not under results/S03
+    shutil.copytree(run, other, ignore=shutil.ignore_patterns('sealed'))
+    assert C.main(mien_args(w0, other)) == 2 and 'S03/<run>' in capsys.readouterr().out
+    os.remove(run / 'sweep.csv')                                                    # SA-5: hard link to sealed
+    os.link(sealed / 'sweep.csv', run / 'sweep.csv')
+    assert C.main(mien_args(w0, run)) == 2 and 'hard link' in capsys.readouterr().out
+    os.remove(run / 'sweep.csv')
+    shutil.copy(sealed / 'sweep.csv', run / 'sweep.csv')
     rows = list(csv.DictReader(open(run / 'levels.csv', encoding='utf-8')))
     wcsv(run / 'levels.csv', ['controller', 'factor', 'L', 'H', 'default'],
          [{k: r[k] for k in ('controller', 'factor', 'L', 'H', 'default')} for r in rows])
@@ -356,32 +474,51 @@ def test_mien_refuses_after_first_A_run(w0, capsys):
     run = s03_run(w0['tmp'])
     w0['tl0'] = w0['tl']                                                     # has an A-PID row
     assert C.main(mien_args(w0, run)) == 2 and 'locked before the first run' in capsys.readouterr().out
+    bad = w0['tmp'] / 'tl_nocol.csv'                                         # SA-13: no campaign column
+    wcsv(bad, ['run_uid'], [])
+    w0['tl0'] = bad
+    assert C.main(mien_args(w0, run)) == 2 and 'no column' in capsys.readouterr().out
 
 
-def test_them_mien_A_refuses_hand_edit(w0, capsys, monkeypatch):
+def test_them_mien_A(w0, capsys):
     run = s03_run(w0['tmp'])
-    monkeypatch.setattr(C, 'THESIS', str(w0['tmp']))
     assert C.main(mien_args(w0, run)) == 0
     p = w0['tmp'] / 'A' / 'mien_A.csv'
     base = ['--stra-a', str(w0['sa']), 'them', '--loai', 'mien_A', '--nguon', str(p), '--ly-do', 'miền A']
-    t = p.read_text(encoding='utf-8')
-    p.write_text(t.replace('8.0', '9.0', 1), encoding='utf-8')
+    assert C.main(base) == 2 and '--tuning-log' in capsys.readouterr().out
+    base += ['--tuning-log', str(w0['tl0'])]
+    t = p.read_bytes()
+    p.write_bytes(t.replace(b'8.0', b'9.0', 1))
     assert C.main(base) == 2 and 'differs' in capsys.readouterr().out
-    p.write_text(t, encoding='utf-8')
+    p.write_bytes(t)
     assert C.main(base) == 0
     assert sha(w0['hop'] / 'mien_A.csv') == sha(p)
+    base[base.index(str(w0['tl0']))] = str(w0['tl'])                         # SA-13: after the first A run
+    assert C.main(base + ['--thay']) == 2 and 'locked' in capsys.readouterr().out
+
+
+def test_them_s03_quet_both_or_none(w0, capsys):
+    run = s03_run(w0['tmp'])
+    (run / 'levels.csv').write_bytes(b'\x89PNG\r\n')                         # SA-11: second file bad
+    files = sorted(os.listdir(w0['hop']))
+    assert C.main(['--stra-a', str(w0['sa']), 'them', '--loai', 's03_quet', '--nguon', str(run), '--ly-do', 'x']) == 2
+    assert sorted(os.listdir(w0['hop'])) == files
 
 
 # ── ke-khai ────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-def fence_files(sa, bad_line=False):
+def fence_files(sa, monkeypatch, drop=None, bad_line=False):
     (sa / '_codex_test').mkdir()
-    lines = ['codex: x', "1 doc STRA_A                 => doc duoc A", '2 ghi CODEX                  => ghi ok',
-             "2b ghi HOP_THU               => codex.exe : Set-Content : Access to the path denied",
-             '6 python trong STRA_A        => python ok 2.4.1',
-             '7 mang                       => ' + ('200' if bad_line else 'loi mang: no')]
-    (sa / '_codex_test' / 'ket_qua_2026-11-14.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    lines = ['codex: x']
+    for k in C.RAO_IDS:
+        if k == drop:
+            continue
+        res = 'chay ok' if k in C.RAO_RUNS else ('200' if bad_line and k == '7' else 'Access is denied')
+        lines.append(f'{k} bai                => {res}')
+    p = sa / '_codex_test' / 'ket_qua_2026-11-14.txt'
+    p.write_text('\n'.join(lines) + '\n', encoding='utf-8')
     (sa / C.RAO_CLAUDE).write_text('7/7', encoding='utf-8')
+    monkeypatch.setattr(C, 'SHA_RAO', {C.RAO_CLAUDE: sha(sa / C.RAO_CLAUDE), C.RAO_CODEX: sha(p)})
     (sa / 'NHAT_KY').mkdir()
     (sa / 'CODEX').mkdir()
     (sa / 'NHAT_KY' / '2026-11-20.md').write_text('buổi 1\n', encoding='utf-8')
@@ -390,32 +527,52 @@ def fence_files(sa, bad_line=False):
 def test_ke_khai(world, capsys, monkeypatch):
     w = world
     sa = w['sa']
-    fence_files(sa)
-    monkeypatch.setattr(C, 'SHA_CODEX_CONFIG', None)
-    out1 = w['tmp'] / 'k1.yaml'
-    assert C.main(['--stra-a', str(sa), 'ke-khai', '--out', str(out1)]) == 2      # lock SHAs not there
-    d = yaml.safe_load(open(out1, encoding='utf-8'))
+    fence_files(sa, monkeypatch)
+    out0 = w['tmp'] / 'kk' / 'hop_thu_A_0.yaml'
+    out0.parent.mkdir()
+    assert C.main(['--stra-a', str(sa), 'ke-khai', '--out', str(out0)]) == 2       # SA-18: --truoc or --lan-dau
+    assert '--lan-dau' in capsys.readouterr().out and not out0.exists()
+    assert C.main(['--stra-a', str(sa), 'ke-khai', '--out', str(out0), '--lan-dau']) == 2   # lock SHAs not there
+    d = yaml.safe_load(open(out0, encoding='utf-8'))
     assert any('config.toml' in x for x in d['loi']) and d['nhiem_thong_tin']['co'] is False
+    assert C.main(['--stra-a', str(sa), 'ke-khai', '--out', str(out0.parent / 'hop_thu_A_x.yaml'), '--lan-dau']) == 2
+    assert 'already' in capsys.readouterr().out
     (sa / 'NHAT_KY' / '2026-11-20.md').write_text('buổi 1\nNHIEM: lỡ thấy x\n', encoding='utf-8')
     (w['hop'] / 'la.txt').write_text('x', encoding='utf-8')
-    out2 = w['tmp'] / 'k2.yaml'
-    C.main(['--stra-a', str(sa), 'ke-khai', '--out', str(out2), '--truoc', str(out1)])
+    out2 = w['tmp'] / 'kk' / 'hop_thu_A_2.yaml'
+    C.main(['--stra-a', str(sa), 'ke-khai', '--out', str(out2), '--truoc', str(out0)])
     d2 = yaml.safe_load(open(out2, encoding='utf-8'))
     assert d2['nhiem_thong_tin']['co'] is True and any('strange file' in x for x in d2['loi'])
     assert not any('append-only' in x for x in d2['loi'])
     (sa / 'NHAT_KY' / '2026-11-20.md').write_text('sửa đầu\n', encoding='utf-8')
-    out3 = w['tmp'] / 'k3.yaml'
+    out3 = w['tmp'] / 'kk' / 'hop_thu_A_3.yaml'
     C.main(['--stra-a', str(sa), 'ke-khai', '--out', str(out3), '--truoc', str(out2)])
     assert any('append-only' in x for x in yaml.safe_load(open(out3, encoding='utf-8'))['loi'])
+    empty = w['tmp'] / 'kk' / 'rong.yaml'
+    empty.write_text('a: 1\n', encoding='utf-8')
+    assert C.main(['--stra-a', str(sa), 'ke-khai', '--out', str(w['tmp'] / 'kk' / 'o4.yaml'), '--truoc',
+                   str(empty)]) == 2 and 'not a declaration' in capsys.readouterr().out
 
 
-def test_rao_line_wrong(world):
-    fence_files(world['sa'], bad_line=True)
+@pytest.mark.parametrize('kw, msg', [(dict(bad_line=True), 'test 7'), (dict(drop='4c'), 'differ from')])
+def test_rao_wrong(world, monkeypatch, kw, msg):
+    fence_files(world['sa'], monkeypatch, **kw)                                    # SA-19
     _, bad = C.rao_check(str(world['sa']))
-    assert any('test 7' in x for x in bad)
+    assert any(msg in x for x in bad)
 
 
-def test_box_check_sha_mismatch(world):
+def test_rao_pinned(world, monkeypatch):
+    fence_files(world['sa'], monkeypatch)
+    (world['sa'] / C.RAO_CLAUDE).write_text('', encoding='utf-8')
+    _, bad = C.rao_check(str(world['sa']))
+    assert any('approved result' in x for x in bad)
+
+
+def test_box_check(world):
     (world['hop'] / 'spec.md').write_text('đổi\n', encoding='utf-8')
     _, bad = C.box_check(str(world['hop']))
     assert any('differs from its latest row' in x for x in bad)
+    os.remove(world['hop'] / 'spec.md')                                            # SA-17: reverse direction
+    (world['hop'] / '.dang_chep_x').mkdir()
+    _, bad = C.box_check(str(world['hop']))
+    assert any('no file on the disk' in x for x in bad) and any('temp folder' in x for x in bad)

@@ -3,20 +3,24 @@
 
 Design: 03_CODE/docs/2026-11-15_Thiet_ke_CODE_C13_v1.md (sections 1-4, 10; approved by Liam 15/11, CODE_C13 local_8feba1cc:
 "Ghim high", "Mỗi file một dòng", "Duyệt, code sau C8", "Duyệt, sửa luôn STRA_A"; code now: Liam 16/11, CODE_C13
-local_0fc6525a "giờ làm cái này trước đi"). S05 §2.1, §2.5, §2.6 rule 5.
+local_0fc6525a "giờ làm cái này trước đi"). S05 §2.1, §2.5, §2.6 rule 5. Codex Sol round 1 (01a1e3b7) SA-1..SA-23,
+Liam 16/11 "sửa hết + vòng 2".
 
   python tools/chep_luot_A.py luot   --run-uid S:I --tuning-log F --freeze F --esp32 F --score F --rows F
                                      --frames F --track F [--segments F] [--ghi-chu-file F | --ghi-chu TEXT] [--thay]
-  python tools/chep_luot_A.py them   --loai {spec,s03_quet,mien_A,tai_lieu} --nguon F [F] --ly-do TEXT [--thay]
+  python tools/chep_luot_A.py them   --loai {spec,s03_quet,mien_A,tai_lieu} --nguon F --ly-do TEXT [--thay]
+                                     [--tuning-log F (mien_A)]
   python tools/chep_luot_A.py mien   --s03-run DIR --tuning-log F --out DIR [--thay]
-  python tools/chep_luot_A.py ke-khai --out F [--nhiem "LUC|FILE|NOI_DUNG"] ...
-  python tools/chep_luot_A.py kiem-c13 --spec-commit SHA [--ke-khai F]
+  python tools/chep_luot_A.py ke-khai --out F (--truoc F | --lan-dau) [--nhiem "LUC|FILE|NOI_DUNG"] [--phien ...]
+  python tools/chep_luot_A.py kiem-c13 --spec-commit SHA --ke-khai F --mien-a F
   python tools/chep_luot_A.py cai-hoi-codex
-  python tools/chep_luot_A.py dong-goi --dich DIR --freeze F [--transcript F ...]
+  python tools/chep_luot_A.py dong-goi --dich DIR --freeze F --ke-khai F [--transcript F ...]
 
-Every rule refuses the whole command (nothing half copied), prints the reason, exit 2. Last line of every command:
-#ket_qua,ma=0 / ma=2. The script blocks by origin (run, path, file type); it does not understand content. Keys that
-are locked at C8 (score.json fields, error-series columns, file names of a run) are the constants below.
+Every rule refuses the whole command, prints the reason, exit 2; a failure after a change rolls the change back
+(SA-11, SA-12). Last line of every command: #ket_qua,ma=0 / ma=2. The script blocks by origin (run, path, file
+type, content type); it does not understand the meaning of text (free text --ghi-chu, --ly-do: CODE reads it,
+design 3.2). Not a defence against someone racing files during a copy (Liam 16/11: out of scope). Keys locked at
+C8 (score.json fields, error-series columns, run file layout; binding files to a run by manifest) are constants.
 """
 from __future__ import annotations
 
@@ -46,12 +50,14 @@ if not os.path.isdir(os.path.join(THESIS, '06_SPECS')):
 STRA_A = r'D:\STRA_A'
 HOP_THU_DIR = 'HOP_THU'
 LUOT_DIR = 'luot'
+RESULTS = ('05_DATA', 'results')
 CAMPAIGNS_A = ('A-PID', 'A-LADRC')
 PLATFORM_A = 'HW'
 STAGES_A = ('screen', 'confirm', 'explore')
 FORBIDDEN_PARTS = ('sealed', 'sealed_test', 'o1_feas', 's03', 's04', 'logs_sweep', 'final')   # luot, tai_lieu
 SEALED_PARTS = ('sealed', 'sealed_test', 'logs_sweep', 'o1_feas')                             # mien, s03_quet
 EXTS = ('.csv', '.json', '.txt', '.md')
+MEDIA_MAGIC = (b'\x89PNG', b'\xff\xd8\xff', b'GIF8', b'RIFF', b'\x1aE\xdf\xa3', b'BM')
 MAX_BYTES = 20 * 1024 * 1024            # [ĐỀ XUẤT], set at C8 from real log sizes
 NOTE_MAX_BYTES = 20 * 1024
 SCORE_ESP32_SHA = 'esp32_sha256'        # C8: c7_score.py keys
@@ -60,27 +66,36 @@ SCORE_OUTCOME = 'outcome'
 SCORE_VERSION_KEYS = ('version', 'scorer_version', 'gate_version')
 ROWS_NEED = ('e_perp', 'e_theta_lane', 'e_theta_cmd')       # C8: c7_score.py --rows columns
 ROLES = ('log_esp32', 'log_segments', 'score', 'sai_so', 'quy_dao', 'theo_doi', 'ghi_chu')
+TUNING_NEED = ('run_uid', 'campaign', 'stage', 'platform', 'results_dir', 'gate_json_sha256', 'run_outcome')
 SPECS = ('06_SPECS/2026-10-28_Spec_S05_So_quy_trinh_RQ3.md', '06_SPECS/2026-11-04_De_xuat_O1_nhiem_vu_san_v11.md')
 S03_HISTORY = ('2026-11-10_run02',)     # S05 §3.2: history, never the A domain
 CTRL_MAP = {'PID': 'PID', 'ADRC': 'LADRC'}
-N_GAINS = 7                             # S05 §2.4
+GAINS_S03 = {'PID': {'kp_xy', 'ki_xy', 'kp_wz', 'ki_wz', 'pos_kp', 'pos_ki', 'k_psi'},          # S05 §2.4 (SA-14)
+             'ADRC': {'omega_c_xy', 'omega_o_xy', 'omega_c_wz', 'omega_o_wz', 'pos_kp', 'pos_ki', 'k_psi'}}
 OMEGA_O = ('omega_o_xy', 'omega_o_wz')
 OMEGA_O_MAX = 48.0
 DEFAULT_ROWS = ('(default check)', '(default)')
+LUOI = ('log', 'mac_dinh', '0', 'noi')
 LEVEL_COLS = ('a', 'b', 'b_n', 'L_nguon', 'H_nguon')        # S03 v8.3 §3.1 (CODE_FEAS 15/11)
 GAIN_COL = {'kp_xy': 'g_kp_xy', 'ki_xy': 'g_ki_xy', 'kp_wz': 'g_kp_wz', 'ki_wz': 'g_ki_wz', 'pos_kp': 'g_pos_kp',
             'pos_ki': 'g_pos_ki', 'k_psi': 'g_k_psi', 'omega_c_xy': 'g_wc_xy', 'omega_o_xy': 'g_wo_xy',
             'omega_c_wz': 'g_wc_wz', 'omega_o_wz': 'g_wo_wz'}
 MIEN_COLS = ['controller_s03', 'controller', 'gain', 'lo', 'hi', 'n_diem', 'co_diem_0', 'nguon_hi']
-# design section 6 (sha256sum 15/11): the lock files; hoi_codex.py checks the same Codex one
+RESERVED = ('readme.md', 'mien_a.csv', 'sweep.csv', 'levels.csv', 'luot', 'luot.json')   # SA-3, compared casefold
+# design section 6 (sha256sum 15/11) and the fence results of 14/11 (SA-19, pinned 16/11)
 SHA_CODEX_CONFIG = '748bf0c8c5aeb08fd222337172ee939e6bc83ea1f3caf1ff5bcacbca693c3cf9'
 SHA_CLAUDE_SETTINGS = '9778ccbff6db1f22a2c2e62747d1aa4a268d7ddf98af56b545a79af63bc9f055'
 RAO_CLAUDE = '2026-11-14_Kiem_rao_cach_ly.md'
 RAO_CODEX = os.path.join('_codex_test', 'ket_qua_2026-11-14.txt')
-RAO_RUNS = ('1', '2', '6')              # kiem_quyen.ps1: these run, every other test is refused
+SHA_RAO = {RAO_CLAUDE: 'd33a82c1b15d77aa103d034445263b59a18fba7867576731a2d1a6a65d2e58c4',
+           RAO_CODEX: '584ec1c4b05f9cead1c54050ec76086511575213a6fa919721b614d7916eed92'}
+RAO_IDS = ('1', '2', '2b', '2c', '3', '3b', '3c', '3d', '4', '4b', '4c', '4d', '4e', '4f', '4g', '5', '5b', '6', '6b',
+           '7')                         # kiem_quyen.ps1
+RAO_RUNS = ('1', '2', '6')              # these run, every other test is refused
 RAO_VERSIONS = dict(claude='2.1.287', codex='0.163.0')
 HOI_CODEX_SRC = os.path.join(HERE, 'stra_a', 'hoi_codex.py')
 HOI_CODEX_DST = 'hoi_codex.py'
+CU = r'__cu_\d{8}-\d{4}(?:-\d+)?'
 
 
 class Refused(Exception):
@@ -119,22 +134,51 @@ def parts_of(path):
 
 
 def check_parts(path, banned, what):
-    bad = [x for x in parts_of(path) if x in banned]
-    if bad:
-        raise Refused(f'{what}: path has {bad[0]!r} (S05 §2.1 fence)')
+    for p in (path, os.path.abspath(path)):
+        bad = [x for x in parts_of(p) + [x.lower() for x in re.split(r'[\\/]+', p) if x] if x in banned]
+        if bad:
+            raise Refused(f'{what}: path has {bad[0]!r} (S05 §2.1 fence)')
 
 
 def check_file(path, what, exts=EXTS, max_bytes=None):
+    """A regular file: not a link, not a hard link (SA-9), allowed extension, size, and text of that type (SA-10)."""
     max_bytes = MAX_BYTES if max_bytes is None else max_bytes
     if not os.path.isfile(path):
         raise Refused(f'{what}: no file {path}')
-    if os.path.islink(path):
-        raise Refused(f'{what}: symlink refused')
+    if os.path.islink(path) or real(path) != os.path.normcase(os.path.abspath(path)):
+        raise Refused(f'{what}: link or junction in the path refused')
+    st = os.stat(path)
+    if st.st_nlink > 1:
+        raise Refused(f'{what}: hard link refused (one name per file)')
     ext = os.path.splitext(path)[1].lower()
     if ext not in exts:
         raise Refused(f'{what}: extension {ext!r} not allowed (only {", ".join(exts)}; no video, no image)')
-    if os.path.getsize(path) > max_bytes:
-        raise Refused(f'{what}: {os.path.getsize(path)} bytes > {max_bytes}')
+    if st.st_size > max_bytes:
+        raise Refused(f'{what}: {st.st_size} bytes > {max_bytes}')
+    with open(path, 'rb') as f:
+        b = f.read()
+    if any(b.startswith(m) for m in MEDIA_MAGIC) or b[4:8] == b'ftyp' or b'\x00' in b:
+        raise Refused(f'{what}: binary or media content refused')
+    try:
+        t = b.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        raise Refused(f'{what}: not UTF-8 text')
+    if ext == '.json':
+        try:
+            json.loads(t)
+        except ValueError as exc:
+            raise Refused(f'{what}: not JSON ({exc})')
+    elif ext == '.csv':
+        try:
+            r = csv.reader(io.StringIO(t))
+            head = next(r, None)
+            for _ in r:
+                pass
+        except csv.Error as exc:
+            raise Refused(f'{what}: not CSV ({exc})')
+        if not head or not any(h.strip() for h in head):
+            raise Refused(f'{what}: CSV with no header row')
+    return sha256_bytes(b)
 
 
 def read_csv(path):
@@ -198,8 +242,32 @@ def stamp():
     return now().strftime('%Y%m%d-%H%M')
 
 
+def cu_name(path):
+    """Free __cu_<stamp>[-n] name next to path (never overwrites)."""
+    b, e = (path, '') if os.path.isdir(path) else os.path.splitext(path)
+    n, cand = 0, f'{b}__cu_{stamp()}{e}'
+    while os.path.exists(cand):
+        n += 1
+        cand = f'{b}__cu_{stamp()}-{n}{e}'
+    return cand
+
+
 def safe_name(s):
     return re.sub(r'[^A-Za-z0-9_-]', '-', s)
+
+
+def existing_casefold(folder, name):
+    """The entry of folder equal to name under Windows rules (casefold), or None (SA-3, SA-4)."""
+    if not os.path.isdir(folder):
+        return None
+    for n in os.listdir(folder):
+        if n.casefold() == name.casefold():
+            return n
+    return None
+
+
+def results_root():
+    return os.path.join(THESIS, *RESULTS)
 
 
 class Lock:
@@ -226,7 +294,7 @@ README_HEAD = '| File | Nguồn | Commit repo luận văn | SHA-256 (16 ký tự
 
 
 def readme_rows(text):
-    """(index after the last row of the file table, rows as lists of cells)."""
+    """(index after the last row of the file table, rows as lists of cells, lines)."""
     lines = text.split('\n')
     try:
         h = next(i for i, x in enumerate(lines) if x.strip() == README_HEAD)
@@ -239,8 +307,14 @@ def readme_rows(text):
     return i, rows, lines
 
 
-def readme_append(hop, new_rows):
-    """Insert rows right after the last table row; every other byte kept (checked); temp file then replace."""
+def check_cells(new_rows):
+    if any(ch in str(c) for r in new_rows for c in r for ch in ('\n', '\r', '|', '`')):
+        raise Refused('README.md: a cell has a line break, | or `')
+
+
+def readme_new(hop, new_rows):
+    """(old bytes, new bytes): rows inserted right after the last table row; every other byte kept (checked)."""
+    check_cells(new_rows)
     p = os.path.join(hop, 'README.md')
     with open(p, 'rb') as f:
         old = f.read()
@@ -249,17 +323,20 @@ def readme_append(hop, new_rows):
     k = sum(len(x.encode('utf-8')) + len(nl) for x in lines[:end])     # byte offset after the last table row
     if end == len(lines) or k > len(old):
         raise Refused('README.md: table must be followed by a line')
-    if any(ch in str(c) for r in new_rows for c in r for ch in ('\n', '\r', '|', '`')):
-        raise Refused('README.md: a cell has a line break, | or `')
     add = [f'| `{a}` | {b} | `{c}` | `{d[:16]}` | {e} |' for a, b, c, d, e in new_rows]
     ins = b''.join(x.encode('utf-8') + nl for x in add)
     out = old[:k] + ins + old[k:]
     _, rows2, _ = readme_rows(out.decode('utf-8').replace('\r\n', '\n'))
     if out[:k] != old[:k] or out[k + len(ins):] != old[k:] or len(rows2) != len(rows) + len(add):
         raise Refused('README.md: the new text is not the old text plus the inserted rows')
+    return old, out
+
+
+def readme_write(hop, data):
+    p = os.path.join(hop, 'README.md')
     tmp = p + '.tmp_chep'
     with open(tmp, 'wb') as f:
-        f.write(out)
+        f.write(data)
     os.replace(tmp, p)
 
 
@@ -272,15 +349,23 @@ def frozen_campaigns(freeze):
     return {r['campaign'] for r in rows}
 
 
-def tuning_row(tuning_log, run_uid):
+def tuning_rows(tuning_log):
     rows, cols = read_csv(tuning_log)
-    for c in ('run_uid', 'campaign', 'stage', 'platform', 'results_dir', 'gate_json_sha256', 'run_outcome'):
-        if c not in cols:
-            raise Refused(f'{tuning_log}: no column {c}')
-    hit = [r for r in rows if r['run_uid'] == run_uid]
+    miss = [c for c in TUNING_NEED if c not in cols]
+    if miss:
+        raise Refused(f'{tuning_log}: no column {miss}')
+    return rows
+
+
+def tuning_row(tuning_log, run_uid):
+    hit = [r for r in tuning_rows(tuning_log) if r['run_uid'] == run_uid]
     if len(hit) != 1:
         raise Refused(f'run_uid {run_uid}: {len(hit)} rows in the tuning log (need exactly one)')
     return hit[0]
+
+
+def a_runs(tuning_log):
+    return [r for r in tuning_rows(tuning_log) if r['campaign'] in CAMPAIGNS_A]
 
 
 def check_run(row, frozen):
@@ -294,12 +379,23 @@ def check_run(row, frozen):
         raise Refused(f'{row["campaign"]} is frozen (S05_freeze.csv): not a tune run any more')
 
 
-def results_root(row, tuning_log):
+def run_folder(row):
+    """results_dir of the row: relative to the thesis folder, inside 05_DATA/results, at least three levels below
+    it (results/<code>/<campaign folder>/<run>), no banned part (SA-7)."""
     d = row['results_dir']
     if not d:
         raise Refused('the run has no results_dir')
     if not os.path.isabs(d):
         d = os.path.join(THESIS, d)
+    if not os.path.isdir(d):
+        raise Refused(f'results_dir {row["results_dir"]}: no folder')
+    root = results_root()
+    if not inside(d, root):
+        raise Refused(f'results_dir {row["results_dir"]}: not inside 05_DATA/results')
+    depth = len(os.path.relpath(os.path.realpath(d), os.path.realpath(root)).split(os.sep))
+    if depth < 3:
+        raise Refused(f'results_dir {row["results_dir"]}: not a run folder (results/<code>/<campaign>/<run>)')
+    check_parts(d, FORBIDDEN_PARTS, 'results_dir')
     return d
 
 
@@ -317,7 +413,7 @@ def mien_check(row, hop):
         v = row.get(col, '') if col else ''
         if v in ('', None):
             continue
-        x = float(v)
+        x = _f(v, f'{col}')
         if not (float(r['lo']) <= x <= float(r['hi'])):
             out.append(dict(gain=r['gain'], value=x, lo=float(r['lo']), hi=float(r['hi'])))
     return out, None
@@ -327,15 +423,19 @@ def luot(a):
     hop = a.hop_thu
     row = tuning_row(a.tuning_log, a.run_uid)
     check_run(row, frozen_campaigns(a.freeze))
-    root = results_root(row, a.tuning_log)
+    root = run_folder(row)
     files = dict(log_esp32=a.esp32, score=a.score, sai_so=a.rows, quy_dao=a.frames, theo_doi=a.track)
     if a.segments:
         files['log_segments'] = a.segments
+    if a.ghi_chu_file:
+        files['ghi_chu'] = a.ghi_chu_file
+    sh = {}
     for role, p in files.items():
         check_parts(p, FORBIDDEN_PARTS, role)
         if not inside(p, root):
             raise Refused(f'{role}: {p} is not inside results_dir of the run')
-        check_file(p, role)
+        sh[role] = check_file(p, role, **(dict(exts=('.txt', '.md'), max_bytes=NOTE_MAX_BYTES)
+                                          if role == 'ghi_chu' else {}))
     if a.segments and os.path.basename(a.segments) != os.path.basename(a.esp32) + '.segments.csv':
         raise Refused('log_segments: name must be <log>.segments.csv of log_esp32')
     if os.path.dirname(real(a.track)) != os.path.dirname(real(a.frames)):
@@ -343,7 +443,6 @@ def luot(a):
     sc = read_json(a.score)
     if not isinstance(sc, dict):
         raise Refused('score: not a JSON object')
-    sh = {r: sha256(p) for r, p in files.items()}
     if sh['score'] != row['gate_json_sha256']:
         raise Refused('score: SHA-256 differs from gate_json_sha256 of the tuning-log row')
     if sc.get(SCORE_ESP32_SHA) != sh['log_esp32']:
@@ -352,85 +451,95 @@ def luot(a):
         raise Refused(f'quy_dao: SHA-256 differs from {SCORE_FRAMES_SHA} in score.json')
     if sc.get(SCORE_OUTCOME) != row['run_outcome']:
         raise Refused(f'score: {SCORE_OUTCOME} {sc.get(SCORE_OUTCOME)!r} differs from run_outcome {row["run_outcome"]!r}')
-    read_json(a.track)
-    for role in ('log_esp32', 'quy_dao', 'log_segments'):
-        if role in files:
-            read_csv(files[role])
     _, cols = read_csv(a.rows)
     miss = [c for c in ROWS_NEED if c not in cols]
     if miss:
         raise Refused(f'sai_so: no column {miss}')
     note = None
-    if a.ghi_chu_file:
-        check_parts(a.ghi_chu_file, FORBIDDEN_PARTS, 'ghi_chu')
-        check_file(a.ghi_chu_file, 'ghi_chu', exts=('.txt', '.md'), max_bytes=NOTE_MAX_BYTES)
-        with open(a.ghi_chu_file, 'rb') as f:
-            note = f.read()
-        note.decode('utf-8')
-        note_name = os.path.basename(a.ghi_chu_file)
-    elif a.ghi_chu is not None:
+    if a.ghi_chu is not None:
         note = a.ghi_chu.encode('utf-8')
         if len(note) > NOTE_MAX_BYTES:
             raise Refused('ghi_chu: > 20 KB')
-        note_name = 'ghi_chu.txt'
-    ma = f'{safe_name(row["campaign"])}__{safe_name(row.get("session_id", "") or row["run_uid"].split(":")[0])}__' \
-         f'{int(row.get("iter_no") or row["run_uid"].split(":")[-1]):03d}'
+    names = {}
+    for role in ROLES:                                                     # SA-4: names checked before any copy
+        if role == 'ghi_chu' and note is not None:
+            n = 'ghi_chu.txt'
+        elif role in files:
+            n = os.path.basename(files[role])
+        else:
+            continue
+        if n.casefold() in {x.casefold() for x in names.values()} or n.casefold() == 'luot.json':
+            raise Refused(f'two files of the run with the name {n} (Windows names ignore case)')
+        names[role] = n
+    try:
+        it = int(row.get('iter_no') or row['run_uid'].split(':')[-1])
+    except ValueError:
+        raise Refused(f'run_uid {row["run_uid"]}: no iteration number')
+    ma = f'{safe_name(row["campaign"])}__{safe_name(row.get("session_id", "") or row["run_uid"].split(":")[0])}__{it:03d}'
     base = os.path.join(hop, LUOT_DIR)
-    dst = os.path.join(base, ma)
     out_of, note_m = mien_check(row, hop)
+    t = now()
+    ver = next((str(sc[k]) for k in SCORE_VERSION_KEYS if k in sc), '')
+    rows_add = []
+    for role, n in names.items():
+        src = files.get(role)
+        rows_add.append((f'{LUOT_DIR}/{ma}/{n}', f'lượt {row["run_uid"]}, {role}' + (
+            f' (bộ chấm {ver})' if role == 'score' and ver else ''),
+            thesis_commit(src) if src else 'ghi chú Liam',
+            sh[role] if role in sh else sha256_bytes(note), t.strftime('%d/%m/%Y %H:%M')))
+    rows_add.append((f'{LUOT_DIR}/{ma}/luot.json', f'lượt {row["run_uid"]}, kê khai lượt (chep_luot_A)',
+                     f'script {script_commit() or "?"}', '0' * 64, t.strftime('%d/%m/%Y %H:%M')))
+    check_cells(rows_add)                                                  # SA-11: before any change
     with Lock():
-        if os.path.exists(dst) and not a.thay:
-            raise Refused(f'{LUOT_DIR}/{ma} exists: --thay to copy again (old folder kept)')
         os.makedirs(base, exist_ok=True)
+        if real(base) != real(os.path.join(hop, LUOT_DIR)) or not inside(base, hop):
+            raise Refused('HOP_THU\\luot is a link')
+        have = existing_casefold(base, ma)
+        if have and not a.thay:
+            raise Refused(f'{LUOT_DIR}/{ma} exists: --thay to copy again (old folder kept)')
         tmp = os.path.join(base, '.dang_chep_' + ma)
         if os.path.exists(tmp):
-            shutil.rmtree(tmp)
+            raise Refused(f'{tmp} left by a failed copy: look, then remove it by hand')
+        dst, moved = os.path.join(base, ma), None
         try:
             os.makedirs(tmp)
-            meta, rows_add, t = {}, [], now()
-            names = set()
-            for role in ROLES:
-                if role == 'ghi_chu':
-                    if note is None:
-                        continue
-                    name = note_name
-                    with open(os.path.join(tmp, name), 'xb') as f:
+            meta = {}
+            for role, n in names.items():
+                p = os.path.join(tmp, n)
+                if role == 'ghi_chu' and note is not None:
+                    with open(p, 'xb') as f:
                         f.write(note)
-                    src_sha, src = sha256_bytes(note), None
                 else:
-                    if role not in files:
-                        continue
-                    name = os.path.basename(files[role])
-                    shutil.copyfile(files[role], os.path.join(tmp, name))
-                    src_sha, src = sh[role], files[role]
-                if name in names:
-                    raise Refused(f'two roles with the file name {name}')
-                names.add(name)
-                got = sha256(os.path.join(tmp, name))
-                if got != src_sha:
-                    raise Refused(f'{role}: copy SHA-256 differs from the source')
-                meta[role] = dict(ten=name, sha256=got, co=os.path.getsize(os.path.join(tmp, name)))
-                ver = next((str(sc[k]) for k in SCORE_VERSION_KEYS if k in sc), '') if role == 'score' else ''
-                rows_add.append((f'{LUOT_DIR}/{ma}/{name}',
-                                 f'lượt {row["run_uid"]}, {role}' + (f' (bộ chấm {ver})' if ver else ''),
-                                 thesis_commit(src) if src else 'ghi chú Liam', got, t.strftime('%d/%m/%Y %H:%M')))
+                    shutil.copyfile(files[role], p)
+                got = sha256(p)
+                if got != (sh.get(role) or sha256_bytes(note)):
+                    raise Refused(f'{role}: copy SHA-256 differs from the checked source')
+                meta[role] = dict(ten=n, sha256=got, co=os.path.getsize(p))
             info = dict(run_uid=row['run_uid'], campaign=row['campaign'], stage=row['stage'],
                         speed_mps=row.get('speed_mps', ''), gain_set_id=row.get('gain_set_id', ''), files=meta,
                         luc_chep=t.isoformat(timespec='seconds'), script=script_commit(),
                         ngoai_mien=out_of, ghi_chu_mien=note_m)
             with open(os.path.join(tmp, 'luot.json'), 'x', encoding='utf-8') as f:
                 f.write(json.dumps(info, ensure_ascii=False, indent=1, allow_nan=False))
-            js = sha256(os.path.join(tmp, 'luot.json'))
-            rows_add.append((f'{LUOT_DIR}/{ma}/luot.json', f'lượt {row["run_uid"]}, kê khai lượt (chep_luot_A)',
-                             f'script {script_commit() or "?"}', js, t.strftime('%d/%m/%Y %H:%M')))
-            if os.path.exists(dst):
-                os.rename(dst, f'{dst}__cu_{stamp()}')
+            r = list(rows_add[-1])
+            r[3] = sha256(os.path.join(tmp, 'luot.json'))
+            rows_add[-1] = tuple(r)
+            old, new = readme_new(hop, rows_add)
+            if have:
+                moved = cu_name(os.path.join(base, have))
+                os.rename(os.path.join(base, have), moved)
             os.rename(tmp, dst)
+            try:
+                readme_write(hop, new)
+            except BaseException:
+                shutil.rmtree(dst)
+                if moved:
+                    os.rename(moved, os.path.join(base, have))
+                raise
         except BaseException:
             if os.path.exists(tmp):
                 shutil.rmtree(tmp)
             raise
-        readme_append(hop, rows_add)
     for r in rows_add:
         print(f'{r[0]}  {r[3][:16]}')
     if out_of:
@@ -440,84 +549,145 @@ def luot(a):
 
 # ── them ──────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-def _put(hop, src, name, source_text, commit, thay):
-    dst = os.path.join(hop, name)
+def _put(hop, items, thay):
+    """items: (src, name, source text, commit, checked SHA). All or nothing (SA-11): rows checked first, copies
+    in temp files checked against the SHA taken at the check (SA-9), old copies renamed __cu_ only then, README
+    last; any failure undoes every step."""
+    t = now().strftime('%d/%m/%Y %H:%M')
+    rows = [(n, s, c, h, t) for _, n, s, c, h in items]
+    check_cells(rows)
+    if len({n.casefold() for _, n, _, _, _ in items}) != len(items):
+        raise Refused('two files with one name')
     with Lock():
-        if os.path.exists(dst):
-            if not thay:
-                raise Refused(f'{name} is in the mailbox: --thay (old copy renamed __cu_, its row kept)')
-            b, e = os.path.splitext(name)
-            os.rename(dst, os.path.join(hop, f'{b}__cu_{stamp()}{e}'))
-        tmp = dst + '.tmp_chep'
-        shutil.copyfile(src, tmp)
-        if sha256(tmp) != sha256(src):
-            os.remove(tmp)
-            raise Refused(f'{name}: copy SHA-256 differs')
-        os.replace(tmp, dst)
-        readme_append(hop, [(name, source_text, commit, sha256(dst), now().strftime('%d/%m/%Y %H:%M'))])
-    print(f'{name}  {sha256(dst)[:16]}')
+        _, new = readme_new(hop, rows)
+        have = {}
+        for _, n, _, _, _ in items:
+            e = existing_casefold(hop, n)
+            if e and e != n:
+                raise Refused(f'{n}: the mailbox has {e} (same name for Windows)')
+            if e and not thay:
+                raise Refused(f'{n} is in the mailbox: --thay (old copy renamed __cu_, its row kept)')
+            have[n] = e
+        tmps, moved, done = [], [], []
+        try:
+            for src, n, _, _, h in items:
+                tmp = os.path.join(hop, '.tmp_chep_' + n)
+                shutil.copyfile(src, tmp)
+                tmps.append(tmp)
+                if sha256(tmp) != h:
+                    raise Refused(f'{n}: copy SHA-256 differs from the checked source')
+            for (src, n, _, _, _), tmp in zip(items, tmps):
+                dst = os.path.join(hop, n)
+                if have[n]:
+                    c = cu_name(dst)
+                    os.rename(dst, c)
+                    moved.append((c, dst))
+                os.rename(tmp, dst)
+                done.append(dst)
+            readme_write(hop, new)
+        except BaseException:
+            for d in done:
+                if os.path.exists(d):
+                    os.remove(d)
+            for c, dst in moved:
+                os.rename(c, dst)
+            for tmp in tmps:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            raise
+    for r in rows:
+        print(f'{r[0]}  {r[3][:16]}')
 
 
 def them(a):
     hop = a.hop_thu
+    if len(a.nguon) != 1:
+        raise Refused('--nguon: one source')
+    src = a.nguon[0]
     if a.loai == 'spec':
-        src = a.nguon[0]
         rel = rel_thesis(src)
         if rel not in SPECS:
             raise Refused(f'spec: only {SPECS}')
         if git(THESIS, 'status', '--porcelain', '--', rel):
             raise Refused(f'{rel}: not clean in git (commit first)')
-        check_file(src, 'spec', exts=('.md',))
-        _put(hop, src, os.path.basename(src), f'spec ({a.ly_do})', git(THESIS, 'log', '-1', '--format=%h', '--', rel),
-             a.thay)
+        h = check_file(src, 'spec', exts=('.md',))
+        _put(hop, [(src, os.path.basename(src), f'spec ({a.ly_do})', git(THESIS, 'log', '-1', '--format=%h', '--', rel),
+                    h)], a.thay)
     elif a.loai == 's03_quet':
-        if len(a.nguon) != 1 or not os.path.isdir(a.nguon[0]):
+        if not os.path.isdir(src):
             raise Refused('s03_quet: --nguon is ONE S03 run folder')
-        run = a.nguon[0]
-        s03_run_ok(run)
+        s03_run_ok(src)
+        items = []
         for n in ('sweep.csv', 'levels.csv'):
-            p = os.path.join(run, n)
-            check_file(p, n, exts=('.csv',))
-            _put(hop, p, n, f'S03 {os.path.basename(os.path.normpath(run))}, quét công khai ({a.ly_do})',
-                 thesis_commit(p), a.thay)
+            p = s03_file(src, n)
+            items.append((p, n, f'S03 {os.path.basename(os.path.realpath(src))}, quét công khai ({a.ly_do})',
+                          thesis_commit(p), check_file(p, n, exts=('.csv',))))
+        _put(hop, items, a.thay)
     elif a.loai == 'mien_A':
-        src = a.nguon[0]
-        if os.path.basename(src) != 'mien_A.csv':
+        if not a.tuning_log:
+            raise Refused('mien_A: --tuning-log (the domain is locked before the first A run, SA-13)')
+        if a_runs(a.tuning_log):
+            raise Refused('a campaign A run is in the tuning log: the A domain is locked')
+        if os.path.basename(src).casefold() != 'mien_a.csv':
             raise Refused('mien_A: only a mien_A.csv written by the mien command')
+        h = check_file(src, 'mien_A', exts=('.csv',))
         js = read_json(os.path.join(os.path.dirname(src), 'mien_A.json'))
         run = os.path.join(THESIS, js['s03_run'])
-        rows = mien_rows(run)
         with open(src, 'rb') as f:
             got = f.read().replace(b'\r\n', b'\n')                          # git autocrlf may give CRLF
-        if _mien_csv_bytes(rows) != got:
+        if _mien_csv_bytes(mien_rows(run)) != got:
             raise Refused('mien_A.csv differs from the domain computed again from sweep.csv (hand edit?)')
-        _put(hop, src, 'mien_A.csv', f'miền A tính từ S03 {js["s03_run"]} ({a.ly_do})', thesis_commit(src), a.thay)
+        _put(hop, [(src, 'mien_A.csv', f'miền A tính từ S03 {js["s03_run"]} ({a.ly_do})', thesis_commit(src), h)],
+             a.thay)
     else:                                                                  # tai_lieu
-        src = a.nguon[0]
         check_parts(src, FORBIDDEN_PARTS, 'tai_lieu')
-        check_file(src, 'tai_lieu', exts=('.md', '.csv', '.json'))
-        if os.path.basename(src) in ('README.md', 'mien_A.csv', 'sweep.csv', 'levels.csv'):
-            raise Refused(f'tai_lieu: name {os.path.basename(src)} is reserved')
-        _put(hop, src, os.path.basename(src), f'tài liệu: {a.ly_do}', thesis_commit(src), a.thay)
+        h = check_file(src, 'tai_lieu', exts=('.md', '.csv', '.json'))
+        n = os.path.basename(src)
+        if n.casefold() in RESERVED or re.search(CU, n):
+            raise Refused(f'tai_lieu: name {n} is reserved')
+        _put(hop, [(src, n, f'tài liệu: {a.ly_do}', thesis_commit(src), h)], a.thay)
     return 0
 
 
 # ── mien (section 10) ─────────────────────────────────────────────────────────────────────────────────────────────
 
 def s03_run_ok(run):
+    """A main S03 run: folder 05_DATA/results/S03/<run> of the thesis (real path), not history, meta.yaml with
+    trial false and every dirty flag present and false (SA-6)."""
     check_parts(run, SEALED_PARTS, 's03 run')
-    if os.path.basename(os.path.normpath(run)) in S03_HISTORY:
+    s03 = os.path.join(results_root(), 'S03')
+    if os.path.dirname(real(run)) != real(s03):
+        raise Refused(f'{run}: not a run folder 05_DATA/results/S03/<run>')
+    if os.path.basename(os.path.realpath(run)).casefold() in {h.casefold() for h in S03_HISTORY}:
         raise Refused(f'{run}: history run (S05 §3.2), never the A domain')
-    with open(os.path.join(run, 'meta.yaml'), encoding='utf-8') as f:
+    p = s03_file(run, 'meta.yaml', exts=('.yaml',))
+    with open(p, encoding='utf-8') as f:
         m = yaml.safe_load(f)
     if not isinstance(m, dict):
         raise Refused('meta.yaml: not a mapping')
     if m.get('trial') is not False or m.get('tool_check') is True:
-        raise Refused('meta.yaml: tool check run (trial / tool_check), not a main S03 run')
-    dirty = [k for k, v in _walk(m) if k.endswith('dirty') and v is not False]
-    if dirty:
-        raise Refused(f'meta.yaml: dirty build {dirty}')
+        raise Refused('meta.yaml: tool check run (trial not false / tool_check), not a main S03 run')
+    flags = [(k, v) for k, v in _walk(m) if k.split('.')[-1] == 'dirty']
+    if not flags or not isinstance(m.get('script'), dict) or m['script'].get('dirty') is not False:
+        raise Refused('meta.yaml: script.dirty false is required')
+    bad = [k for k, v in flags if v is not False]
+    if bad:
+        raise Refused(f'meta.yaml: dirty build {bad}')
     return m
+
+
+def s03_file(run, name, exts=('.csv',)):
+    """A file at the root of the run, by name, checked (no link, real path in the run, SA-5)."""
+    p = os.path.join(run, name)
+    if os.path.splitext(name)[1] == '.yaml':
+        if not os.path.isfile(p) or os.path.islink(p) or os.stat(p).st_nlink > 1:
+            raise Refused(f'{name}: missing, link or hard link')
+    else:
+        check_file(p, name, exts=exts)
+    if os.path.dirname(real(p)) != real(run):
+        raise Refused(f'{name}: real path not in the run folder')
+    check_parts(p, SEALED_PARTS, name)
+    return p
 
 
 def _walk(d, pre=''):
@@ -545,37 +715,49 @@ def _f32(x):
 def mien_rows(run):
     """Opens only sweep.csv, levels.csv, meta.yaml at the root of the run (by name). The A domain per gain."""
     s03_run_ok(run)
-    sw, scol = read_csv(os.path.join(run, 'sweep.csv'))
-    lv, lcol = read_csv(os.path.join(run, 'levels.csv'))
+    sw, scol = read_csv(s03_file(run, 'sweep.csv'))
+    lv, lcol = read_csv(s03_file(run, 'levels.csv'))
     miss = [c for c in LEVEL_COLS if c not in lcol] + [c for c in ('luoi',) if c not in scol]
     if miss:
         raise Refused(f'S03 v8.3 columns missing {miss}: run made by a tool before v8.3, a, b not guessed')
-    speeds = sorted({r['v'] for r in sw if r['factor'] not in DEFAULT_ROWS})
-    lev = {(r['controller'], r['factor']): r for r in lv}
+    speeds = sorted({_f(r['v'], 'v') for r in sw})                          # SA-15: every row, default check too
+    ctrls = {r['controller'] for r in sw}
+    if ctrls != set(GAINS_S03):
+        raise Refused(f'controllers {sorted(ctrls)}: need {sorted(GAINS_S03)}')
+    for c in GAINS_S03:
+        dv = sorted(_f(r['v'], 'v') for r in sw if r['controller'] == c and r['factor'] == DEFAULT_ROWS[0])
+        if dv != speeds:
+            raise Refused(f'{c}: default check rows at speeds {dv}, need {speeds}')
+    lev = {}
+    for r in lv:
+        if (r['controller'], r['factor']) in lev:
+            raise Refused(f'levels.csv: two rows {r["controller"]} {r["factor"]}')
+        lev[(r['controller'], r['factor'])] = r
     grid = {}
     for r in sw:
         if r['factor'] in DEFAULT_ROWS:
             continue
-        if r['controller'] not in CTRL_MAP:
-            raise Refused(f'controller {r["controller"]!r}: unknown')
+        if r.get('luoi') not in LUOI:
+            raise Refused(f'{r["controller"]} {r["factor"]}: luoi {r.get("luoi")!r} not in {LUOI}')
         x = _f(r['value'], f'{r["controller"]} {r["factor"]} value')
         if x < 0:
             raise Refused(f'{r["controller"]} {r["factor"]}: value {x} < 0')
-        grid.setdefault((r['controller'], r['factor']), {}).setdefault(r['value'], []).append(r)
+        grid.setdefault((r['controller'], r['factor']), {}).setdefault(x, []).append(r)    # SA-16: numeric key
     out = []
-    for c in sorted({k[0] for k in grid}):
-        fs = sorted(f for (cc, f) in grid if cc == c)
-        if len(fs) != N_GAINS:
-            raise Refused(f'{c}: {len(fs)} gains in sweep.csv, need {N_GAINS}')
-        for fac in fs:
+    for c in sorted(GAINS_S03):
+        fs = {f for (cc, f) in grid if cc == c}
+        if fs != GAINS_S03[c]:                                                              # SA-14: exact set
+            raise Refused(f'{c}: gains {sorted(fs)} in sweep.csv, need exactly {sorted(GAINS_S03[c])}')
+        for fac in sorted(fs):
             pts = grid[(c, fac)]
             for v, rs in pts.items():
-                if sorted(r['v'] for r in rs) != speeds:
-                    raise Refused(f'{c} {fac} = {v}: rows at speeds {sorted(r["v"] for r in rs)}, need {speeds}')
+                got = sorted(_f(r['v'], 'v') for r in rs)
+                if got != speeds:
+                    raise Refused(f'{c} {fac} = {v}: rows at speeds {got}, need {speeds} once each')
             if (c, fac) not in lev:
                 raise Refused(f'{c} {fac}: no row in levels.csv')
             L = lev[(c, fac)]
-            vals = sorted(_f(v, 'value') for v in pts)
+            vals = sorted(pts)
             lo, hi = vals[0], vals[-1]
             has0 = lo == 0.0
             a_, b_ = _f(L['a'], f'{c} {fac} a'), _f(L['b'], f'{c} {fac} b')
@@ -585,11 +767,12 @@ def mien_rows(run):
             want_hi = bn if bn is not None else b_
             if hi != want_hi:
                 raise Refused(f'{c} {fac}: highest grid point {hi} is not {"b_n" if bn is not None else "b"} = {want_hi}')
-            noi = any(r.get('luoi') == 'noi' for rs in pts.values() for r in rs)
-            if (bn is not None) != noi:
-                raise Refused(f'{c} {fac}: b_n and luoi = noi points disagree')
+            noi_hi = all(r['luoi'] == 'noi' for r in pts[hi])
+            any_noi = any(r['luoi'] == 'noi' for rs in pts.values() for r in rs)
+            if (bn is not None) != any_noi or (bn is not None and not noi_hi):
+                raise Refused(f'{c} {fac}: b_n and luoi = noi points disagree (the end point must be noi)')
             if fac in OMEGA_O:
-                if bn is not None or noi:
+                if bn is not None or any_noi:
                     raise Refused(f'{c} {fac}: omega_o grid is cut, never extended')
                 if hi > OMEGA_O_MAX or _f32(hi) > OMEGA_O_MAX:
                     raise Refused(f'{c} {fac}: hi {hi!r} > {OMEGA_O_MAX} (binary64 or float32)')
@@ -602,8 +785,6 @@ def mien_rows(run):
             src = 'b_n' if bn is not None else ('tran_omega_o' if fac in OMEGA_O and hi == OMEGA_O_MAX else 'b')
             out.append(dict(controller_s03=c, controller=CTRL_MAP[c], gain=fac, lo=repr(lo), hi=repr(hi),
                             n_diem=str(len(vals)), co_diem_0='true' if has0 else 'false', nguon_hi=src))
-    if not out:
-        raise Refused('sweep.csv: no gain rows')
     return out
 
 
@@ -616,100 +797,131 @@ def _mien_csv_bytes(rows):
 
 
 def mien(a):
-    rows, _ = read_csv(a.tuning_log)
-    if any(r.get('campaign') in CAMPAIGNS_A for r in rows):
+    if a_runs(a.tuning_log):
         raise Refused('a campaign A run is in the tuning log: the A domain is locked before the first run')
-    out_rows = mien_rows(a.s03_run)
-    os.makedirs(a.out, exist_ok=True)
-    csv_p, js_p = os.path.join(a.out, 'mien_A.csv'), os.path.join(a.out, 'mien_A.json')
-    if os.path.exists(csv_p) or os.path.exists(js_p):
-        if not a.thay:
-            raise Refused(f'{csv_p} exists: --thay (no A run yet; old copy kept)')
-        st = stamp()
-        for p in (csv_p, js_p):
-            if os.path.exists(p):
-                b, e = os.path.splitext(p)
-                os.rename(p, f'{b}__cu_{st}{e}')
     run = a.s03_run
+    out_rows = mien_rows(run)
     m = s03_run_ok(run)
-    with open(csv_p, 'xb') as f:
-        f.write(_mien_csv_bytes(out_rows))
-    info = dict(s03_run=rel_thesis(run),
-                s03_commit=(m.get('script') or {}).get('commit', ''),
+    body = _mien_csv_bytes(out_rows)
+    info = dict(s03_run=rel_thesis(run), s03_commit=(m.get('script') or {}).get('commit', ''),
+                s03_date=str(m.get('date', '')),
                 sha256={n: sha256(os.path.join(run, n)) for n in ('sweep.csv', 'levels.csv', 'meta.yaml')},
-                mien_A_csv_sha256=sha256(csv_p), script=script_commit(), luc_tinh=now().isoformat(timespec='seconds'),
-                spec='S05 v3.29 §2.5, S03 v8.3 §3.1')
-    with open(js_p, 'x', encoding='utf-8') as f:
-        f.write(json.dumps(info, ensure_ascii=False, indent=1))
+                mien_A_csv_sha256=sha256_bytes(body), script=script_commit(),
+                luc_tinh=now().isoformat(timespec='seconds'), spec='S05 v3.29 §2.5, S03 v8.3 §3.1')
+    js_body = json.dumps(info, ensure_ascii=False, indent=1).encode('utf-8')
+    os.makedirs(a.out, exist_ok=True)
+    pair = [(os.path.join(a.out, 'mien_A.csv'), body), (os.path.join(a.out, 'mien_A.json'), js_body)]
+    if any(os.path.exists(p) for p, _ in pair) and not a.thay:
+        raise Refused(f'{pair[0][0]} exists: --thay (no A run yet; old copy kept)')
+    tmps, moved, done = [], [], []
+    try:                                                                   # SA-12: the pair or nothing
+        for p, b in pair:
+            t = p + '.tmp_mien'
+            with open(t, 'xb') as f:
+                f.write(b)
+            tmps.append(t)
+        for (p, _), t in zip(pair, tmps):
+            if os.path.exists(p):
+                c = cu_name(p)
+                os.rename(p, c)
+                moved.append((c, p))
+            os.rename(t, p)
+            done.append(p)
+    except BaseException:
+        for p in done:
+            os.remove(p)
+        for c, p in moved:
+            os.rename(c, p)
+        for t in tmps:
+            if os.path.exists(t):
+                os.remove(t)
+        raise
     for r in out_rows:
         print(f'{r["controller"]:6s} {r["gain"]:12s} [{r["lo"]}, {r["hi"]}]  {r["nguon_hi"]}')
-    print(f'mien_A: {csv_p} {info["mien_A_csv_sha256"][:16]}')
+    print(f'mien_A: {pair[0][0]} {info["mien_A_csv_sha256"][:16]}')
     return 0
 
 
 # ── ke-khai, kiem-c13 ─────────────────────────────────────────────────────────────────────────────────────────────
 
 def box_check(hop):
-    """Every file in the mailbox (but README.md) has its latest row with the same name and SHA; __cu_ files match
-    an older row of their name. Returns (rows, problems)."""
+    """Both ways (SA-17): every file in the mailbox (but README.md) has a row: a current file its latest row, a
+    __cu_ copy an older row of its name (any row when no current file has the name); the latest row of every
+    name is on the disk (current or __cu_ copy); temp folders or files left by a failed copy are errors."""
     with open(os.path.join(hop, 'README.md'), encoding='utf-8') as f:
         _, rows, _ = readme_rows(f.read().replace('\r\n', '\n'))
     by = {}
     for r in rows:
         by.setdefault(r[0].strip('`'), []).append(r[3].strip('`'))
-    bad = []
+    bad, disk = [], {}
     for dp, dn, fn in os.walk(hop):
-        dn[:] = [d for d in dn if not d.startswith('.dang_chep_')]
+        for d in dn:
+            if d.startswith('.dang_chep_'):
+                bad.append(f'{os.path.relpath(os.path.join(dp, d), hop)}: temp folder of a failed copy')
         for n in fn:
             p = os.path.join(dp, n)
             rel = os.path.relpath(p, hop).replace('\\', '/')
             if rel == 'README.md':
                 continue
-            s = sha256(p)[:16]
-            m = re.match(r'^(.*)__cu_\d{8}-\d{4}(\.[^/]*)?$', rel)
+            if n.startswith(('.tmp_chep_', 'README.md.tmp')):
+                bad.append(f'{rel}: temp file of a failed copy')
+                continue
             parts = rel.split('/')
-            cu_dir = len(parts) >= 3 and re.search(r'__cu_\d{8}-\d{4}$', parts[1])
-            if cu_dir:
-                key = '/'.join([parts[0], re.sub(r'__cu_\d{8}-\d{4}$', '', parts[1])] + parts[2:])
-                if s not in by.get(key, []):
-                    bad.append(f'{rel}: no row of {key} with this SHA')
-            elif m:
-                key = m.group(1) + (m.group(2) or '')
-                if s not in by.get(key, [])[:-1]:
-                    bad.append(f'{rel}: no older row of {key} with this SHA')
-            elif rel not in by:
-                bad.append(f'{rel}: file with no row (strange file)')
-            elif by[rel][-1] != s:
-                bad.append(f'{rel}: SHA {s} differs from its latest row {by[rel][-1]}')
+            key = '/'.join(re.sub(CU + r'$', '', x) if i < len(parts) - 1 else re.sub(CU + r'(?=\.[^.]*$|$)', '', x)
+                           for i, x in enumerate(parts))
+            cu = key != rel
+            disk.setdefault(key, []).append((rel, sha256(p)[:16], cu))
+    for key, lst in disk.items():
+        cur = [x for x in lst if not x[2]]
+        rs = by.get(key, [])
+        if not rs:
+            bad.extend(f'{rel}: file with no row (strange file)' for rel, _, _ in lst)
+            continue
+        for rel, s, cu in lst:
+            if not cu and s != rs[-1]:
+                bad.append(f'{rel}: SHA {s} differs from its latest row {rs[-1]}')
+            if cu and s not in (rs[:-1] if cur else rs):
+                bad.append(f'{rel}: no older row of {key} with this SHA')
+    for key, rs in by.items():
+        if rs[-1] not in {s for _, s, _ in disk.get(key, [])}:
+            bad.append(f'{key}: latest row has no file on the disk')
     return rows, bad
 
 
 def rao_check(root):
+    """Both fence results present, pinned (SA-19), the Codex one with exactly the test ids, each as expected;
+    lock files equal to their marks."""
     bad = []
-    pc = os.path.join(root, RAO_CLAUDE)
+    for rel, want in SHA_RAO.items():
+        p = os.path.join(root, rel)
+        if not os.path.isfile(p):
+            bad.append(f'{rel}: missing')
+        elif sha256(p) != want:
+            bad.append(f'{rel}: SHA differs from the approved result of 14/11 (run the fence test again)')
     px = os.path.join(root, RAO_CODEX)
-    if not os.path.isfile(pc):
-        bad.append(f'{RAO_CLAUDE}: missing')
-    if not os.path.isfile(px):
-        bad.append(f'{RAO_CODEX}: missing')
-    else:
+    if os.path.isfile(px):
+        seen = []
         with open(px, encoding='utf-8', errors='replace') as f:
             for line in f:
                 m = re.match(r'^(\d+[a-z]?) .*?=> (.*)$', line.rstrip('\n'))
                 if not m:
                     continue
                 k, res = m.group(1), m.group(2)
+                seen.append(k)
                 ok_run = k in RAO_RUNS
                 refused = re.search(r'denied|Access|Cannot find|loi mang|Traceback', res) is not None
                 if ok_run == refused:
                     bad.append(f'Codex fence test {k}: {"refused" if refused else "ran"}, expected '
                                f'{"to run" if ok_run else "a refusal"}')
+        if sorted(seen) != sorted(RAO_IDS):
+            bad.append(f'Codex fence tests {sorted(seen)} differ from {sorted(RAO_IDS)}')
     for n, want in (('.codex/config.toml', SHA_CODEX_CONFIG), ('.claude/settings.json', SHA_CLAUDE_SETTINGS)):
         p = os.path.join(root, n)
         if not os.path.isfile(p) or sha256(p) != want:
             bad.append(f'{n}: SHA differs from the mark (design section 6)')
-    return dict(claude=dict(file=RAO_CLAUDE, sha256=sha256(pc) if os.path.isfile(pc) else None),
-                codex=dict(file=RAO_CODEX.replace('\\', '/'), sha256=sha256(px) if os.path.isfile(px) else None)), bad
+    sh = {k: (sha256(os.path.join(root, k)) if os.path.isfile(os.path.join(root, k)) else None) for k in SHA_RAO}
+    return dict(claude=dict(file=RAO_CLAUDE, sha256=sh[RAO_CLAUDE]),
+                codex=dict(file=RAO_CODEX.replace('\\', '/'), sha256=sh[RAO_CODEX])), bad
 
 
 def _tool_version(cmd):
@@ -760,15 +972,27 @@ def nhiem(root, extra):
     return dict(co=bool(ev), su_kien=ev)
 
 
+def read_ke_khai(path):
+    with open(path, encoding='utf-8') as f:
+        d = yaml.safe_load(f)
+    if not isinstance(d, dict) or not isinstance(d.get('nhat_ky'), dict) or 'loi' not in d or 'hop_thu' not in d:
+        raise Refused(f'{path}: not a declaration of ke-khai (no nhat_ky / loi / hop_thu)')
+    return d
+
+
 def ke_khai(a):
     root = a.stra_a
     hop = os.path.join(root, HOP_THU_DIR)
+    if os.path.exists(a.out):
+        raise Refused(f'{a.out} exists: never overwritten')
+    if bool(a.truoc) == bool(a.lan_dau):
+        raise Refused('give --truoc <last declaration> (append-only check), or --lan-dau for the first one (SA-18)')
+    prev = read_ke_khai(a.truoc)['nhat_ky'] if a.truoc else None
+    if a.lan_dau and [n for n in os.listdir(os.path.dirname(os.path.abspath(a.out)))
+                      if n.startswith('hop_thu_A') and n.endswith('.yaml')]:
+        raise Refused('--lan-dau: a declaration hop_thu_A*.yaml is already in that folder; give --truoc')
     rows, bad = box_check(hop)
     rao, bad2 = rao_check(root)
-    prev = None
-    if a.truoc:
-        with open(a.truoc, encoding='utf-8') as f:
-            prev = (yaml.safe_load(f) or {}).get('nhat_ky')
     nk, bad3 = nhat_ky(root, prev)
     hc = os.path.join(root, HOI_CODEX_DST)
     d = dict(luc=now().isoformat(timespec='seconds'), script=script_commit(),
@@ -779,9 +1003,8 @@ def ke_khai(a):
              tro_ly_codex=dict(cli=_tool_version(['codex', '--version']), lan_goi=codex_calls(root)),
              rao=rao, nhiem_thong_tin=nhiem(root, a.nhiem), nhat_ky=nk,
              cong_cu=dict(hoi_codex_sha256=sha256(hc) if os.path.isfile(hc) else None),
+             truoc=dict(file=os.path.basename(a.truoc), sha256=sha256(a.truoc)) if a.truoc else None,
              loi=bad + bad2 + bad3)
-    if os.path.exists(a.out):
-        raise Refused(f'{a.out} exists: never overwritten')
     with open(a.out, 'x', encoding='utf-8') as f:
         yaml.safe_dump(d, f, allow_unicode=True, sort_keys=False)
     for x in d['loi']:
@@ -791,15 +1014,16 @@ def ke_khai(a):
 
 
 def codex_calls(root):
-    """model and effort of every Codex call, read from the logs (never from the configuration)."""
+    """model and effort of every Codex call, read from the log header (never from the configuration)."""
     out = []
     d = os.path.join(root, 'CODEX')
     for n in sorted(os.listdir(d)) if os.path.isdir(d) else []:
         if n.startswith('log_') and n.endswith('.txt'):
             with open(os.path.join(d, n), encoding='utf-8', errors='replace') as f:
-                t = f.read(20000)
-            m = re.search(r'^model: (.+)$', t, re.M)
-            e = re.search(r'^reasoning effort: (.+)$', t, re.M)
+                t = f.read(4000).split('\n--------\n')
+            head = t[1] if len(t) > 1 else ''
+            m = re.search(r'^model: (.+)$', head, re.M)
+            e = re.search(r'^reasoning effort: (.+)$', head, re.M)
             out.append(dict(log=n, model=m.group(1).strip() if m else None, effort=e.group(1).strip() if e else None))
     return out
 
@@ -809,7 +1033,7 @@ def kiem_c13(a):
     hop = os.path.join(root, HOP_THU_DIR)
     res = []
     _, bad = rao_check(root)
-    res.append(('1 thử rào có và đúng; 3 SHA khóa', not bad, '; '.join(bad)))
+    res.append(('1 thử rào có, đúng bản đã duyệt; 3 SHA khóa', not bad, '; '.join(bad)))
     vc, vx = _tool_version(['claude', '--version']), _tool_version(['codex', '--version'])
     res.append(('2 phiên bản bằng lúc thử rào', (vc, vx) == (RAO_VERSIONS['claude'], RAO_VERSIONS['codex']),
                 f'claude {vc}, codex {vx}; khác thì chạy lại thử rào'))
@@ -817,7 +1041,7 @@ def kiem_c13(a):
     trust = os.path.isfile(cfg) and "[projects.'D:\\STRA_A']" in open(cfg, encoding='utf-8', errors='replace').read()
     res.append(('3b dòng tin cậy D:\\STRA_A trong ~/.codex/config.toml', trust, 'có' if trust else 'không'))
     _, bb = box_check(hop)
-    res.append(('4 hộp thư chỉ có file được phép', not bb, '; '.join(bb)))
+    res.append(('4 hộp thư chỉ có file được phép, đủ file', not bb, '; '.join(bb)))
     sp = []
     for rel in SPECS:
         n = os.path.basename(rel)
@@ -833,14 +1057,27 @@ def kiem_c13(a):
     hc = os.path.join(root, HOI_CODEX_DST)
     okh = os.path.isfile(hc) and sha256(hc) == sha256(HOI_CODEX_SRC)
     res.append(('6 hoi_codex.py bằng bản gốc', okh, ''))
-    res.append(('7 có hop_thu_A.yaml', bool(a.ke_khai and os.path.isfile(a.ke_khai)), a.ke_khai or ''))
+    try:                                                                   # SA-20: parsed, no error, current
+        kk = read_ke_khai(a.ke_khai)
+        okk = kk['loi'] == [] and kk['hop_thu']['readme_sha256'] == sha256(os.path.join(hop, 'README.md'))
+        note = '' if okk else 'kê khai có lỗi hay README đã đổi sau kê khai: chạy ke-khai lại'
+    except (Refused, OSError, yaml.YAMLError) as exc:
+        okk, note = False, str(exc)
+    res.append(('7 hop_thu_A.yaml mới nhất, không lỗi', okk, note))
     mp = os.path.join(hop, 'mien_A.csv')
-    okm = True
-    note = ''
-    if a.mien_a:
-        okm = os.path.isfile(mp) and sha256(mp) == sha256(a.mien_a)
-        note = a.mien_a
-    res.append(('8 HOP_THU\\mien_A.csv bằng mien_A.csv của meta.yaml A', okm and bool(a.mien_a), note))
+    okm, note = False, ''
+    try:
+        js = read_json(os.path.join(os.path.dirname(a.mien_a), 'mien_A.json'))
+        same = os.path.isfile(mp) and sha256(mp) == sha256(a.mien_a)
+        box = all(os.path.isfile(os.path.join(hop, n)) and sha256(os.path.join(hop, n)) == js['sha256'][n]
+                  for n in ('sweep.csv', 'levels.csv'))
+        lock_day = git(THESIS, 'show', '-s', '--format=%cs', a.spec_commit)
+        after = js.get('s03_date', '') >= lock_day
+        okm = same and box and after
+        note = f'mien {same}, sweep/levels trong hộp thư cùng lượt S03 {box}, S03 {js.get("s03_date")} sau khóa {lock_day} {after}'
+    except (Refused, OSError, KeyError, ValueError) as exc:
+        note = str(exc)
+    res.append(('8 miền A: bằng meta.yaml A, cùng lượt S03 với hộp thư, S03 chạy sau khóa S05', okm, note))
     for k, ok, n in res:
         print(f'{"ĐẠT " if ok else "CHƯA"} {k}' + (f' ({n})' if n else ''))
     return 0 if all(ok for _, ok, _ in res) else 2
@@ -848,11 +1085,14 @@ def kiem_c13(a):
 
 def cai_hoi_codex(a):
     dst = os.path.join(a.stra_a, HOI_CODEX_DST)
-    if os.path.exists(dst):
-        os.rename(dst, os.path.join(a.stra_a, f'hoi_codex__cu_{stamp()}.py'))
-    shutil.copyfile(HOI_CODEX_SRC, dst)
-    if sha256(dst) != sha256(HOI_CODEX_SRC):
+    tmp = dst + '.tmp_cai'
+    shutil.copyfile(HOI_CODEX_SRC, tmp)
+    if sha256(tmp) != sha256(HOI_CODEX_SRC):
+        os.remove(tmp)
         raise Refused('hoi_codex.py: copy SHA differs')
+    if os.path.exists(dst):
+        os.rename(dst, os.path.join(a.stra_a, os.path.basename(cu_name(dst))))
+    os.rename(tmp, dst)
     print(f'{dst} {sha256(dst)}')
     return 0
 
@@ -862,29 +1102,42 @@ def dong_goi(a):
     miss = [c for c in CAMPAIGNS_A if c not in fr]
     if miss:
         raise Refused(f'{miss} not frozen yet: pack at the end of A only')
+    kk = read_ke_khai(a.ke_khai)                                           # SA-22: the last declaration
+    if kk['loi'] or kk['hop_thu']['readme_sha256'] != sha256(os.path.join(a.stra_a, HOP_THU_DIR, 'README.md')):
+        raise Refused('the last ke-khai has errors or is older than the mailbox: run ke-khai again')
     if os.path.exists(a.dich):
         raise Refused(f'{a.dich} exists: never overwritten')
-    rows = []
-    for d in ('NHAT_KY', 'CODEX', HOP_THU_DIR):
-        s = os.path.join(a.stra_a, d)
-        shutil.copytree(s, os.path.join(a.dich, d))
-    tdir = os.path.join(a.dich, 'transcript')
-    for t in a.transcript or []:
-        os.makedirs(tdir, exist_ok=True)
-        shutil.copyfile(t, os.path.join(tdir, os.path.basename(t)))
-    for dp, _, fn in os.walk(a.dich):
-        for n in sorted(fn):
-            p = os.path.join(dp, n)
-            rel = os.path.relpath(p, a.dich).replace('\\', '/')
-            if not rel.startswith('transcript/'):
-                src = os.path.join(a.stra_a, *rel.split('/'))
+    tr = a.transcript or []
+    if len({os.path.basename(t).casefold() for t in tr}) != len(tr):
+        raise Refused('two transcripts with one name')
+    stage = a.dich + '.tam_dong_goi'
+    if os.path.exists(stage):
+        raise Refused(f'{stage} left by a failed pack: look, then remove it by hand')
+    try:
+        rows = []
+        for d in ('NHAT_KY', 'CODEX', HOP_THU_DIR):
+            shutil.copytree(os.path.join(a.stra_a, d), os.path.join(stage, d))
+        for t in tr:
+            os.makedirs(os.path.join(stage, 'transcript'), exist_ok=True)
+            shutil.copyfile(t, os.path.join(stage, 'transcript', os.path.basename(t)))
+        src_of = {f'transcript/{os.path.basename(t)}': t for t in tr}
+        for dp, _, fn in os.walk(stage):
+            for n in sorted(fn):
+                p = os.path.join(dp, n)
+                rel = os.path.relpath(p, stage).replace('\\', '/')
+                src = src_of.get(rel) or os.path.join(a.stra_a, *rel.split('/'))
                 if sha256(src) != sha256(p):
                     raise Refused(f'{rel}: copy SHA differs')
-            rows.append((rel, os.path.getsize(p), sha256(p)))
-    with open(os.path.join(a.dich, 'SHA256SUMS.csv'), 'x', newline='', encoding='utf-8') as f:
-        w = csv.writer(f, lineterminator='\n')
-        w.writerow(['duong_dan', 'co', 'sha256'])
-        w.writerows(sorted(rows))
+                rows.append((rel, os.path.getsize(p), sha256(p)))
+        with open(os.path.join(stage, 'SHA256SUMS.csv'), 'x', newline='', encoding='utf-8') as f:
+            w = csv.writer(f, lineterminator='\n')
+            w.writerow(['duong_dan', 'co', 'sha256'])
+            w.writerows(sorted(rows))
+        os.rename(stage, a.dich)
+    except BaseException:
+        if os.path.exists(stage):
+            shutil.rmtree(stage)
+        raise
     print(f'{a.dich}: {len(rows)} files')
     return 0
 
@@ -892,10 +1145,10 @@ def dong_goi(a):
 # ── CLI ───────────────────────────────────────────────────────────────────────────────────────────────────────────
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    ap = argparse.ArgumentParser(description=__doc__.split('\n')[0], allow_abbrev=False)
     ap.add_argument('--stra-a', default=STRA_A, help=argparse.SUPPRESS)
     sub = ap.add_subparsers(dest='cmd', required=True)
-    p = sub.add_parser('luot')
+    p = sub.add_parser('luot', allow_abbrev=False)
     for k in ('--run-uid', '--tuning-log', '--freeze', '--esp32', '--score', '--rows', '--frames', '--track'):
         p.add_argument(k, required=True)
     p.add_argument('--segments')
@@ -904,30 +1157,33 @@ def main(argv=None):
     g.add_argument('--ghi-chu')
     p.add_argument('--thay', action='store_true')
     p.add_argument('--hop-thu')
-    p = sub.add_parser('them')
+    p = sub.add_parser('them', allow_abbrev=False)
     p.add_argument('--loai', required=True, choices=('spec', 's03_quet', 'mien_A', 'tai_lieu'))
     p.add_argument('--nguon', required=True, nargs='+')
     p.add_argument('--ly-do', required=True)
+    p.add_argument('--tuning-log')
     p.add_argument('--thay', action='store_true')
     p.add_argument('--hop-thu')
-    p = sub.add_parser('mien')
+    p = sub.add_parser('mien', allow_abbrev=False)
     p.add_argument('--s03-run', required=True)
     p.add_argument('--tuning-log', required=True)
     p.add_argument('--out', required=True)
     p.add_argument('--thay', action='store_true')
-    p = sub.add_parser('ke-khai')
+    p = sub.add_parser('ke-khai', allow_abbrev=False)
     p.add_argument('--out', required=True)
     p.add_argument('--truoc', help='previous hop_thu_A.yaml (append-only check)')
+    p.add_argument('--lan-dau', action='store_true', help='first declaration (no previous one)')
     p.add_argument('--nhiem', action='append')
     p.add_argument('--phien', action='append', help='STRA_A session: id,model,effort')
-    p = sub.add_parser('kiem-c13')
+    p = sub.add_parser('kiem-c13', allow_abbrev=False)
     p.add_argument('--spec-commit', required=True)
-    p.add_argument('--ke-khai')
-    p.add_argument('--mien-a', help='mien_A.csv named in meta.yaml of A')
-    sub.add_parser('cai-hoi-codex')
-    p = sub.add_parser('dong-goi')
+    p.add_argument('--ke-khai', required=True)
+    p.add_argument('--mien-a', required=True, help='mien_A.csv named in meta.yaml of A')
+    sub.add_parser('cai-hoi-codex', allow_abbrev=False)
+    p = sub.add_parser('dong-goi', allow_abbrev=False)
     p.add_argument('--dich', required=True)
     p.add_argument('--freeze', required=True)
+    p.add_argument('--ke-khai', required=True)
     p.add_argument('--transcript', nargs='*')
     a = ap.parse_args(argv)
     if getattr(a, 'hop_thu', None) is None and a.cmd in ('luot', 'them'):
@@ -939,9 +1195,14 @@ def main(argv=None):
     except Refused as exc:
         print(f'TỪ CHỐI: {exc}')
         ma = 2
+    except (OSError, ValueError, KeyError, csv.Error, yaml.YAMLError, subprocess.SubprocessError) as exc:  # SA-23
+        print(f'LỖI: {type(exc).__name__}: {exc}')
+        ma = 2
     print(f'#ket_qua,ma={ma}')
     return ma
 
 
 if __name__ == '__main__':
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8')
     sys.exit(main())
