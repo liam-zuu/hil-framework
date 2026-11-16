@@ -758,3 +758,22 @@ def test_wn_decreasing_is_damaged():
     """H7 restarted inside the received headers (wn not increasing): data lost, not a gap."""
     s, _ = _run_summary(wn_log(t0s=(5000, 15000, 25000, 35000), suffix={4: ' wn=1 t0_ms=35000 lk=1 up_ms=12345'}))
     assert any('không tăng' in p for p in s['data_lost']), s['problems']
+
+
+# ── round 9 (Codex Sol round 8; Liam 15/11, CODE_S06 'Sua 2 muc + vong 9') ──
+
+def test_codex_r8_1_gap_too_short_for_the_lost_windows_is_damaged():
+    """T10U-R8-1: wn 3 (load 100 %) lost and the next header damaged (t0_ms 30000 instead of 30001): the jump 2 -> 4
+    leaves 9 999 ms, less than one window: damaged line, data lost (66bd3a7: room < 10 000, jump ignored, complete)."""
+    s, _ = _run_summary(wn_log(t_up=17345, h7_ms=23000, t0s=(10001, 20001, 30001), wn0=2, drop=(3,),
+                               suffix={4: ' wn=4 t0_ms=30000 lk=1 up_ms=17345'}))
+    assert s['complete'] is False and any('dòng hỏng' in p for p in s['data_lost']), s['problems']
+
+
+def test_codex_r8_r6_5_gap_across_the_end_is_missing_not_lost():
+    """R6-5 rest (round 8): wn 5 [40000; 50001] lost, it ends 1 ms after the last frame (50000); every window wholly
+    inside the run received. The gap 4 -> 6 straddles the end: missing, not data lost (66bd3a7: data lost)."""
+    s, _ = _run_summary(wn_log(t_up=17345, h7_ms=32655, t0s=(10000, 20000, 30000, 40000), wins={5: 10001}, wn0=2,
+                               drop=(5,), post=((6, 50001, 10000),)))
+    assert s['data_lost'] == [] and any('qua mép lượt' in m for m in s['missing']), s['problems']
+    assert s['windows'] == 2

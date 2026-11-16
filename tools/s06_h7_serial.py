@@ -238,10 +238,12 @@ def wn_analyse(ev: List[dict], span) -> dict:
       or a gap before it lies wholly before the run).
     * Every checked header must carry up_ms = t_up and one lk (T10U-R6-3: a header of another link period, its link
       lines lost): else missing, no windows. A header without wn/t0_ms/lk/up_ms: damaged line, data lost (R6-6).
-    * Consecutive checked headers: wn + 1 and t0 = previous t0 + win_ms. A jump in wn loses the windows between the two;
-      it is data lost of the run only when that gap overlaps [first frame; last frame] by H7_WIN_MIN_MS or more (room
-      for a whole window of the run; T10U-R6-5, R7-2: a gap wholly or almost wholly outside the run is not the run's).
-      wn not increasing (H7 restarted) or contiguous wn with a wrong t0: damaged, data lost.
+    * Consecutive checked headers: wn + 1 and t0 = previous t0 + win_ms. A jump of wn by k + 1 loses k windows that
+      fill the gap between the two: a gap shorter than k × H7_WIN_MIN_MS cannot hold them, a header is damaged: data
+      lost (T10U-R8-1). Else, with room for a whole window inside [first frame; last frame]: data lost when the gap
+      lies wholly inside the run, missing when it straddles an edge (the lost windows' edges are unknown; R6-5 rest);
+      no such room: not the run's (T10U-R6-5, R7-2). wn not increasing (H7 restarted) or contiguous wn with a wrong
+      t0: damaged, data lost.
     * Start (T10U-R6-1): a checked header with t0 < t_up (the window holding link up) proves nothing was lost before
       the first kept window. Without one, the first kept window may start less than H7_WIN_MIN_MS after link up (the
       window before it, >= H7_WIN_MIN_MS long, held link up); otherwise missing (cannot tell).
@@ -300,9 +302,20 @@ def wn_analyse(ev: List[dict], span) -> dict:
         if q['wn'] <= p['wn']:
             dl.append(f"số cửa sổ T10 không tăng {p['wn']} → {q['wn']} (H7 khởi động lại?): dòng hỏng")
         elif q['wn'] != p['wn'] + 1:
+            lost_n, gap = q['wn'] - p['wn'] - 1, rel0(q) - rel1(p)
             room = min(rel0(q), t_end) - max(rel1(p), 0)
-            if room >= H7_WIN_MIN_MS:
+            if gap < lost_n * H7_WIN_MIN_MS:
+                # T10U-R8-1 (Codex round 8; Liam 'Sua 2 muc + vong 9'): k lost windows of >= H7_WIN_MIN_MS each
+                # cannot fit in a shorter gap: one of the two headers is damaged
+                dl.append(f"số cửa sổ T10 nhảy {p['wn']} → {q['wn']} trong {gap} ms (< {lost_n} × {H7_WIN_MIN_MS}): "
+                          'dòng hỏng, mất khối')
+            elif room >= H7_WIN_MIN_MS and rel1(p) >= 0 and rel0(q) <= t_end:
                 dl.append(f"số cửa sổ T10 nhảy {p['wn']} → {q['wn']}: mất khối")
+            elif room >= H7_WIN_MIN_MS:
+                # R6-5 rest (round 8): the gap straddles an edge of the run; the lost windows fill it but where their
+                # edges fall is unknown, so a whole window of the run may or may not be among them: cannot tell
+                ms.append(f"số cửa sổ T10 nhảy {p['wn']} → {q['wn']} qua mép lượt (chỗ trong lượt {room} ms): "
+                          'không biết cửa sổ mất có nằm trọn trong lượt không')
         elif q['t0_ms'] != (p['t0_ms'] + p['win_ms']) % _TICK_MOD:
             dl.append(f"cửa sổ T10 wn={q['wn']} bắt đầu {q['t0_ms']} ms, kỳ vọng {(p['t0_ms'] + p['win_ms']) % _TICK_MOD}")
     kept = [blk_of[i] for i in post if rel0(blk_of[i]['head']) >= 0
