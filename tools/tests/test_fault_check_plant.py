@@ -283,3 +283,12 @@ def test_run_mu_reads_the_parser():
         fc.run_mu(['x', '--mu', 'abc'])
     with pytest.raises(ValueError):
         fc.run_mu(None)
+
+
+def test_argv_of_the_step_log_decides_the_nominal_mu(tmp_path):      # FP1-2 round 2: --mu read from the run
+    body = 'J1,wheel_jam,FL,10,50,b=0.1\n'
+    p, csv_, steps = open_loop(tmp_path, body=body, steps=100, name='mu_ok', argv=('run_hil.py', '--mu', '0.436'))
+    assert fc.check(p, csv_, steps)['ok']
+    p, csv_, steps = open_loop(tmp_path, body=body, steps=100, name='mu_bad', argv=('run_hil.py', '--mu', '0.3'))
+    r = fc.check(p, csv_, steps)                                     # the plant ran 0.436, its argv says 0.3
+    assert not r['ok'] and any('mu_hd' in m for m in r['fails']), r['fails']
