@@ -807,6 +807,34 @@ def _posix_runner():
     return None
 
 
+# PSC-1 (Codex 16/11 on ca843e8; Liam 16/11, CODE_S06 'Sua test PSC-1'): `kill -0` also succeeds on a zombie (dead,
+# not yet reaped), so where nothing reaps it (a container whose PID 1 does not) a killed process looked alive. al PID:
+# the process exists and its state (field after the last ') ' of /proc/PID/stat) is not Z.
+# A non-number (an empty variable) is not a process: /proc//stat would read /proc/stat.
+ALIVE_SH = ('al() { case "$1" in ""|*[!0-9]*) return 1;; esac; '
+            's=$(sed "s/.*) //" /proc/$1/stat 2>/dev/null | cut -d" " -f1); [ -n "$s" ] && [ "$s" != Z ]; }; ')
+
+
+def test_psc1_alive_check_treats_a_zombie_as_dead():
+    """PSC-1: a zombie (its parent alive, not waiting) passes `kill -0` but not al(); a live process passes both."""
+    import subprocess as sp
+    r = _posix_runner()
+    if r is None:
+        pytest.skip('cần bash có /proc, pgrep, python3 (POSIX hay WSL)')
+    argv, _ = r
+    script = (ALIVE_SH + "python3 -c 'import os, sys, time\n"
+              "z = os.fork()\n"
+              "if z == 0: os._exit(0)\n"
+              "print(z, flush=True); time.sleep(5)' > /tmp/psc1_$$.txt & H=$!; "
+              'for i in $(seq 1 50); do [ -s /tmp/psc1_$$.txt ] && break; sleep 0.1; done; sleep 0.3; '
+              'Z=$(cat /tmp/psc1_$$.txt); rm -f /tmp/psc1_$$.txt; echo "state=$(sed "s/.*) //" /proc/$Z/stat | cut -d" " -f1)"; '
+              'kill -0 $Z 2>/dev/null && echo k0_zombie; al $Z && echo al_zombie; '
+              'kill -0 $H 2>/dev/null && echo k0_live; al $H && echo al_live; kill $H; wait $H 2>/dev/null; true')
+    out = sp.run(argv + [script], capture_output=True, timeout=60).stdout.decode('utf-8', 'replace')
+    assert 'state=Z' in out and 'k0_zombie' in out, out               # kill -0 says the zombie is there
+    assert 'al_zombie' not in out and 'k0_live' in out and 'al_live' in out, out
+
+
 FAKE_RUN_HIL = '''import multiprocessing as mp, os, signal, sys, time
 def child():
     signal.signal(signal.SIGTERM, signal.SIG_IGN)   # a plant child that does not stop on its own
@@ -842,12 +870,14 @@ def test_t3t_r2_1_cleanup_stops_the_real_process_tree(tmp_path, mode):
     D = to(d)
     script = (f'D={D}; (python3 $D/run_hil.py $D/child.pid {mode} & echo $! > $D/t2.pid); '
               'for i in $(seq 1 100); do [ -s $D/child.pid ] && break; sleep 0.1; done; '
-              'P=$(cat $D/t2.pid); C=$(cat $D/child.pid); echo "pids P=$P C=$C"; '
+              'TP=$(cat $D/t2.pid); TC=$(cat $D/child.pid); echo "pids P=$TP C=$TC"; '
               'pgrep -u "$(id -u)" -a python3 | while read -r pid rest; do '
-              '[ "$pid" = "$C" ] && echo "left $pid $rest"; done; echo "## cleanup"; '
-              f'{hb.s06_cleanup_cmd(D, "t2")}; echo "## after"; sleep 0.3; '
-              'kill -0 $P 2>/dev/null && echo alive_parent; kill -0 $C 2>/dev/null && echo alive_child; '
-              'kill -KILL $P $C 2>/dev/null; true')
+              '[ "$pid" = "$TC" ] && echo "left $pid $rest"; done; echo "## cleanup"; '
+              # PSC-1: own names: the cleanup command sets P (empty for the missing logger PID file), c, A, T
+              f'{hb.s06_cleanup_cmd(D, "t2")}; echo "## after"; ' + ALIVE_SH +
+              'for i in $(seq 1 20); do al $TP || al $TC || break; sleep 0.1; done; '        # PSC-1: a zombie is dead
+              'al $TP && echo alive_parent; al $TC && echo alive_child; '
+              'kill -KILL $TP $TC 2>/dev/null; true')
     out = sp.run(argv + [script], capture_output=True, timeout=90).stdout.decode('utf-8', 'replace')
     assert 'pids P=' in out and '## after' in out, out
     left = [ln[len('left '):] for ln in out.splitlines() if ln.startswith('left ')]
@@ -887,10 +917,12 @@ def test_pi_kill_reaches_a_child_with_children(tmp_path):
     D = to(d)
     script = (f'D={D}; (python3 $D/run_hil.py $D/child.pid $D/gchild.pid & echo $! > $D/t2.pid); '
               'for i in $(seq 1 100); do [ -s $D/child.pid ] && [ -s $D/gchild.pid ] && break; sleep 0.1; done; '
-              'P=$(cat $D/t2.pid); C=$(cat $D/child.pid); G=$(cat $D/gchild.pid); echo "pids P=$P C=$C G=$G"; '
-              f'echo "## kill"; ({hb.pi_stop_cmd(D, "t2", "kill")}); echo "kill_rc=$?"; echo "## after"; sleep 0.5; '
-              'kill -0 $P 2>/dev/null && echo alive_parent; kill -0 $C 2>/dev/null && echo alive_child; '
-              'kill -0 $G 2>/dev/null && echo alive_grandchild; kill -KILL $P $C $G 2>/dev/null; true')
+              'TP=$(cat $D/t2.pid); TC=$(cat $D/child.pid); TG=$(cat $D/gchild.pid); '
+              'echo "pids P=$TP C=$TC G=$TG"; '
+              f'echo "## kill"; ({hb.pi_stop_cmd(D, "t2", "kill")}); echo "kill_rc=$?"; echo "## after"; ' + ALIVE_SH +
+              'for i in $(seq 1 20); do al $TP || al $TC || al $TG || break; sleep 0.1; done; '   # PSC-1: zombie = dead
+              'al $TP && echo alive_parent; al $TC && echo alive_child; '
+              'al $TG && echo alive_grandchild; kill -KILL $TP $TC $TG 2>/dev/null; true')
     out = sp.run(argv + [script], capture_output=True, timeout=90).stdout.decode('utf-8', 'replace')
     assert 'pids P=' in out and 'kill_rc=0' in out, out
     pids = dict(kv.split('=') for kv in out.split('pids ', 1)[1].splitlines()[0].split())
