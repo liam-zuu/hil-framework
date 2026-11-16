@@ -572,6 +572,13 @@ def load_faults(args, n_omega_modes: int, hil_cfg, load_schedule: bool, lifted: 
     try:
         sched = fault_schedule.load(args.faults, run_ms, imu_source, plant)
         fault_plant.check_params(sched.rows, nominal)
+        if any(r.fault == 'ibus_loss' for r in sched.rows):     # batch 2 iBUS loss (CODE_FAULT2)
+            if not args.mock and not fault_schedule.IBUS_LOSS_H7:
+                raise fault_schedule.ScheduleError('ibus_loss needs the H7 part (byte 20 bit 4), not merged yet: '
+                                                   'on the bench it would change nothing (--mock only)')
+            if getattr(hil_cfg, 'swa_mode', 'off') == 'off':
+                raise fault_schedule.ScheduleError('ibus_loss with --swa off: the DUT motors are never on, '
+                                                   'the loss shows nothing')
         return sched
     except (OSError, fault_schedule.ScheduleError) as exc:
         raise SystemExit(f'--faults {args.faults}: {exc}')

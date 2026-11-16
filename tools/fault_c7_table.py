@@ -33,6 +33,22 @@ One row per (controller, fault case), each against the baseline of the same cont
   * ticks, imu_rows, imu_dropped, base_imu_rows: number of firmware ticks (log.csv rows), of IMU report rows
     (faults_imu.csv; one per report, written before an imu_loss window drops it), of those dropped (mask bit
     M_LOSS), and of the baseline's rows; ticks_expected = duration / 10 ms (design 10.1 step 5).
+  * batch 2 plant faults (design 2026-11-15_Thiet_ke_bom_loi_dot2_v1.md section 7.2, record only), in every
+    row, blank where the case has no such fault:
+      sat_frac_<w>, base_sat_frac_<w> (w = fl, fr, rl, rr): sat_frac of one wheel over the same span (s11: the
+      jammed wheel against the three others);
+      yaw_dev_max: largest |theta - theta of the baseline| (wrapped) over the span (s15);
+      ramp_end_s, err_rms_ramp_<ax>, err_rms_hold_<ax> and base_*: for a batt_sag row (the first), the RMS
+      tracking error over [start, start + ramp_ms) and over [start + ramp_ms, end + 1 s) (s13; ramp blank when
+      ramp_ms = 0);
+      zone_in_s, zone_out_s: for a mu_zone row (the first), the first plant step at which a wheel hub is inside
+      its rectangle, then the first step after it with no hub inside while the row is on (s15 by position, the
+      step each side enters, design 11.4), from the plant record (fwsim faults_plant.csv, steps from 0; bench
+      <frames>_plant_faults.npz, steps - t0) and the hub positions of rpi5/fault_plant.contact_points with the
+      nominal lx, ly of rpi5/params.py.
+    The iBUS loss columns (t_motor_off / t_motor_on against the window) come with the H7 part of ibus_loss: the
+    firmware sets run_active = motor on && AUTO && trajectory fresh (AGV 5bde4c5 src/main.c:611), so a loss
+    longer than 50 ms drops run_active inside [0, duration) and this bench table refuses such a run today.
 Exit 0 = table written, 2 = the folder cannot be tabled.
 
 Bench folders (HIL bench, a tools/hil_bench_session.py session: session.json at the top; design 10.2 step 6):
@@ -109,6 +125,7 @@ M_LOSS = 16                         # fwsim/fault_run.py mask bit of imu_loss (f
 SAME_KEYS = ('task', 'mode', 'seed', 'imu_rate', 'imu_boot_reset', 'imu_noise', 'imu_noise_seed', 'ground', 'mu',
              'no_imu', 'duration')
 AXES = ('vx', 'vy', 'wz')
+WHEELS = ('fl', 'fr', 'rl', 'rr')
 
 
 class TableError(Exception):
@@ -146,8 +163,13 @@ def load_case(folder):
     with open(os.path.join(folder, 'faults_imu.csv'), newline='') as fh:
         masks = [int(float(r['mask'])) for r in csv.DictReader(fh)]
     # fault_run.M_LOSS: the report of this row was dropped (imu_loss window)
+    plant = None
+    pp = os.path.join(folder, 'faults_plant.csv')                       # batch 2, only with plant rows
+    if os.path.isfile(pp):
+        rec = read_log(pp)
+        plant = (rec['step'], np.column_stack([rec['mask'], rec['x'], rec['y'], rec['theta']]))
     return dict(log=log, faults=faults, meta=meta, imu_rows=len(masks), folder=folder,
-                imu_dropped=sum(1 for m in masks if m & M_LOSS))
+                imu_dropped=sum(1 for m in masks if m & M_LOSS), plant=plant)
 
 
 def same_run(a, b):
@@ -200,6 +222,67 @@ def wrap(a):
     return (a + math.pi) % (2 * math.pi) - math.pi
 
 
+def wheel_sat(pw_f, pw_b):
+    """Batch 2 (s11): sat_frac of each wheel; pw_* = |pwm| columns FL, FR, RL, RR of the span."""
+    out = {}
+    for i, w in enumerate(WHEELS):
+        out[f'sat_frac_{w}'] = float(np.mean(pw_f[:, i] >= PWM_MAX))
+        out[f'base_sat_frac_{w}'] = float(np.mean(pw_b[:, i] >= PWM_MAX))
+    return out
+
+
+def _first_row(rows, fault):
+    for i, r in enumerate(rows):
+        if r['fault'] == fault:
+            return i, r
+    return None, None
+
+
+def ramp_split(rows, t, ef, eb):
+    """Batch 2 (s13): RMS tracking error over the ramp and after it, for the first batt_sag row. t: times [s] of
+    the span samples, ef / eb: (n, 3) errors of the fault run and the baseline. Blank without a batt_sag row."""
+    keys = ['ramp_end_s'] + [f'{tag}err_rms_{part}_{ax}' for tag in ('', 'base_') for part in ('ramp', 'hold')
+                             for ax in AXES]
+    out = dict.fromkeys(keys)
+    _, r = _first_row(rows, 'batt_sag')
+    if r is None:
+        return out
+    start, end = r['start_ms'] / 1000.0, r['end_ms'] / 1000.0
+    ramp_end = start + int(r['params']['ramp_ms']) / 1000.0
+    out['ramp_end_s'] = ramp_end
+    parts = (('ramp', (t >= start - 1e-9) & (t < ramp_end - 1e-9)),
+             ('hold', (t >= ramp_end - 1e-9) & (t < end + TAIL_S - 1e-9)))
+    for tag, e in (('', ef), ('base_', eb)):
+        for part, sel in parts:
+            for i, ax in enumerate(AXES):
+                out[f'{tag}err_rms_{part}_{ax}'] = float(np.sqrt(np.mean(e[sel, i] ** 2))) if sel.any() else None
+    return out
+
+
+def zone_times(rows, plant):
+    """Batch 2 (s15 by position): (zone_in_s, zone_out_s) of the first mu_zone row from the plant record. plant =
+    (relative steps, (n, 4) [mask, x, y, theta]) or None; the hub positions as fault_plant.contact_points."""
+    i, r = _first_row(rows, 'mu_zone')
+    if r is None:
+        return dict(zone_in_s=None, zone_out_s=None)
+    if plant is None:
+        raise TableError(f'mu_zone row {r["id"]!r}: no plant record')
+    import fault_plant
+    import params as _params
+    nom = _params.MecanumParams()
+    x0, x1, y0, y1 = (float(r['params'][k]) for k in ('x0', 'x1', 'y0', 'y1'))
+    steps, rec = plant
+    on = (rec[:, 0].astype(np.int64) >> i) & 1 == 1
+    inside = np.array([any(x0 <= hx < x1 and y0 <= hy < y1 for hx, hy in fault_plant.contact_points(v[1:], nom))
+                       for v in rec])
+    k_in = np.nonzero(on & inside)[0]
+    if not len(k_in):
+        return dict(zone_in_s=None, zone_out_s=None)
+    k_out = np.nonzero(on[k_in[0]:] & ~inside[k_in[0]:])[0]
+    return dict(zone_in_s=float(steps[k_in[0]]) / 1000.0,
+                zone_out_s=float(steps[k_in[0] + k_out[0]]) / 1000.0 if len(k_out) else None)
+
+
 def row_for(mode, case, f, base):
     lf, lb = f['log'], base['log']
     t = lf['t']
@@ -241,6 +324,14 @@ def row_for(mode, case, f, base):
                r_true_max=float(np.abs(lf['r_true']).max()), ticks=int(len(t)), imu_rows=int(f['imu_rows']),
                imu_dropped=int(f['imu_dropped']), base_imu_rows=int(base['imu_rows']),
                ticks_expected=int(round(float(f['meta']['config']['duration']) / TICK_S)))
+    # batch 2 plant faults (design 2026-11-15 section 7.2)
+    rows = f['faults']['rows']
+    out.update(wheel_sat(pw(lf), pw(lb)))
+    out['yaw_dev_max'] = float(np.abs(wrap(lf['theta'][span] - lb['theta'][span])).max())
+    err = lambda lg: np.column_stack([lg[f'v_{ax}'] - lg[f'sp_{ax}'] for ax in AXES])
+    out.update(ramp_split(rows, t, err(lf), err(lb)))
+    plant = None if f['plant'] is None else (f['plant'][0], f['plant'][1])     # fwsim steps count from 0 = t0
+    out.update(zone_times(rows, plant))
     return out
 
 
@@ -442,6 +533,15 @@ def esp_run_rows(name, esp_all, n_ticks, first_seq):
     return rows, pre
 
 
+def bare_name(name, f):
+    """Codex FQ1-2: the plant record named in the manifest must be a bare file name of the frames folder (a
+    string, no folder part, not absolute, not '', '.', '..'), checked before anything is opened."""
+    if (not isinstance(f, str) or f in ('', '.', '..') or os.path.isabs(f) or os.path.basename(f) != f
+            or '/' in f or '\\' in f or ':' in f):
+        raise TableError(f'{name}: plant_record file {f!r} is not a bare file name of the frames folder')
+    return f
+
+
 def load_bench_run(run_dir, srun, clean):
     name = srun['name']
     if not clean.get(name):
@@ -477,9 +577,17 @@ def load_bench_run(run_dir, srun, clean):
     n_ticks = int(round(dur / TICK_S))
     esp, pre = esp_run_rows(name, read_esp(os.path.join(run_dir, 'pi', f'{name}.csv')), n_ticks, first_seq)
     te = np.round((esp['tick'] - esp['tick'][0]) * TICK_S, 6)
+    plant = None
+    pr = (faults or {}).get('plant_record')
+    if isinstance(pr, dict) and pr.get('file') is not None:             # batch 2: <frames>_plant_faults.npz
+        zr = np.load(os.path.join(run_dir, 'frames', bare_name(name, pr['file'])))
+        cols = json.loads(str(zr['cols']))
+        rec = zr['record']
+        plant = (rec[:, cols.index('step')] - t0,
+                 rec[:, [cols.index(c) for c in ('mask', 'x', 'y', 'theta')]])
     return dict(name=name, args=srun['args'], task=task, dur=dur, man=man, faults=faults, S=S, R=R, k=k,
                 esp=esp, esp_pre=pre, te=te, gain=gain, npz=npz, esp32_fw=srun.get('esp32_fw'),
-                h7_fw=srun.get('h7_fw'), run_s=(steps['STOPPING'] - t0) / 1000.0)
+                h7_fw=srun.get('h7_fw'), run_s=(steps['STOPPING'] - t0) / 1000.0, plant=plant)
 
 
 def run_fault_check(npz, sched, step_log):
@@ -591,12 +699,14 @@ def bench_row(mode, case, f, base, H_fwd):
     out.update(age_g_max_ms=float(e['age_g_ms'][inw].max()), r_max=float(np.abs(e['r'][inw]).max()), r_th=None)
     # tracking errors on the Pi clock (true plant state vs the reference the Pi sent)
     n_span = e_ms + int(TAIL_S * 1000) - s_ms
-    err = {}
+    err, th, tk = {}, {}, None
     for tag, run in (('', f), ('base_', base)):
         sel = (run['k'] >= s_ms) & (run['k'] < e_ms + int(TAIL_S * 1000))
         if int(sel.sum()) != n_span:
             raise TableError(f'{run["name"]}: {int(sel.sum())} frames in the span, want {n_span}')
         err[tag] = _body(run['S'][sel]) - run['R'][sel]
+        th[tag] = run['S'][sel, 6]
+        tk = run['k'][sel] / 1000.0
     for i, ax in enumerate(AXES):
         ef, eb_ = err[''][:, i], err['base_'][:, i]
         out[f'err_max_{ax}'] = float(np.abs(ef).max())
@@ -607,6 +717,12 @@ def bench_row(mode, case, f, base, H_fwd):
                                                for w in ('fl', 'fr', 'rl', 'rr')]))
     out['sat_frac'] = float(np.mean(pw(te, e) >= PWM_MAX))
     out['base_sat_frac'] = float(np.mean(pw(tb, eb) >= PWM_MAX))
+    # batch 2 plant faults (design 2026-11-15 section 7.2): wheel sat on the ESP32 clock, the rest on the Pi's;
+    # placed after ticks_expected below, as in the fwsim table (the bench columns extend the fwsim ones)
+    b2 = wheel_sat(pw(te, e), pw(tb, eb))
+    b2['yaw_dev_max'] = float(np.abs(wrap(th[''] - th['base_'])).max())
+    b2.update(ramp_split(rows, tk, err[''], err['base_']))
+    b2.update(zone_times(rows, f['plant']))
     # pose at t0 + duration, r_true over (0, duration]
     pose = {}
     for tag, run in (('', f), ('base_', base)):
@@ -625,7 +741,9 @@ def bench_row(mode, case, f, base, H_fwd):
         cnt[tag] = dict(ticks=int(len(tick)), gaps=int(round(run['dur'] / TICK_S)) - len(tick),
                         gyro=int(gyro[-1] - gyro[0]))  # counted after the first tick, to the last (C7T1-7)
     out.update(ticks=cnt['']['ticks'], imu_rows=None, imu_dropped=None, base_imu_rows=None,
-               ticks_expected=int(round(f['dur'] / TICK_S)), run_s=f['run_s'], tick_gaps=cnt['']['gaps'],
+               ticks_expected=int(round(f['dur'] / TICK_S)))
+    out.update(b2)
+    out.update(run_s=f['run_s'], tick_gaps=cnt['']['gaps'],
                esp_gyro_n=cnt['']['gyro'], base_esp_gyro_n=cnt['base_']['gyro'],
                ref_first_s=_first_change(f['k'] / 1000.0, f['R']),
                esp_sp_first_s=_first_change(te, np.column_stack([e['sp_vx'], e['sp_vy'], e['sp_wz']])),

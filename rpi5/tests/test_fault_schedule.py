@@ -66,8 +66,8 @@ def test_parse_comments_crlf_and_blank_lines():
     HEAD,                                                                # no row
     HEAD + 'E1,enc_los,FL,1,2,\n',                                       # unknown fault
     HEAD + 'J1,wheel_jam,FL,1,2,b_mult=2\n',                             # unknown parameter of a batch 2 row
-    HEAD + 'I1,ibus_loss,ibus,1,2,\n',                                   # later parts of batch 2 are refused
-    HEAD + 'B1,body_drag,body,1,2,F=3.3\n',
+    HEAD + 'I1,ibus_loss,ibus,1,2,x=1\n',                                # ibus_loss has no parameter
+    HEAD + 'B1,body_drag,body,1,2,F=3.3\n',                              # later parts of batch 2 are refused
     HEAD + 'N1,load_dist,body,1,2,\n',
     HEAD + 'E1,enc_loss,FL,1.5,2,\n',                                    # not whole ms
     HEAD + 'E1,enc_loss,FL,5e3,6000,\n',
@@ -112,6 +112,10 @@ def test_parse_refuses(bad):
     ('S1,gyro_scale,imu,1,9,s=0.2\n', 'plant'),
     ('L1,imu_loss,imu,1,9,\n', None),                                    # no IMU in the frames
     ('S1,gyro_scale,gz,1,9,s=0.2\n', None),
+    ('I1,ibus_loss,imu,1,9,\n', 'plant'),                               # batch 2 iBUS loss: target ibus only
+    ('I1,ibus_loss,FL,1,9,\n', 'plant'),
+    ('I1,ibus_loss,ibus,1,9,\nI2,ibus_loss,ibus,8,12,\n', 'plant'),     # two rows on the same bit overlap
+    ('I1,ibus_loss,ibus,1,1001,\n', None),                              # ends after the run
 ])
 def test_check_refuses(body, imu):
     with pytest.raises(fs.ScheduleError):
@@ -263,3 +267,40 @@ def test_summary_at_end_of_loop_cuts_open_window_ends_window_at_last_step():
     sm = p.summary(last_step=99)
     assert sm['events'][-2:] == [[100, 'E1', 0, 'off'], [100, 'E2', 0, 'cut']]
     assert p.summary(last_step=99)['events'] == sm['events']          # idempotent
+
+
+# ── batch 2: ibus_loss (design 2026-11-15 sections 4.2, 5) ──────────────────
+def test_ibus_loss_needs_no_imu_nor_plant_and_windows_may_touch():
+    fs.check(fs.parse(HEAD + 'I1,ibus_loss,ibus,1,9,\nI2,ibus_loss,ibus,9,12,\n'), 1000, None, None)
+    fs.check(fs.parse(HEAD + 'I1,ibus_loss,ibus,0,1000,\nL1,imu_loss,imu,0,1000,\nE1,enc_loss,FL,0,9,\n'),
+             1000, 'plant')
+
+
+def test_ibus_loss_sets_bit4_keeps_swa_and_imu_loss_bits():
+    true = frames(16)                                                  # SWA bit 3 set in every true frame
+    _, sent = run_patcher(sched(HEAD + 'I1,ibus_loss,ibus,5,10,\nL1,imu_loss,imu,8,12,\n', run_ms=16), true)
+    assert [x[20] for x in sent[3:14]] == [8, 8, 24, 24, 24, 28, 28, 12, 12, 8, 8]
+    for k in range(16):                                                # nothing else of the frame changes
+        assert sent[k][:20] == true[k][:20] and sent[k][21:] == true[k][21:], k
+
+
+def test_ibus_loss_with_swa_off_and_its_window_cut():
+    true = frames(20, fault_flags=0)
+    p, sent = run_patcher(sched(HEAD + 'I1,ibus_loss,ibus,3,15,\n', run_ms=20), true, t0=2, stop=10)
+    assert [x[20] for x in sent] == [0] * 5 + [16] * 5 + [0] * 10      # t0 2 + 3 = 5 .. stop 10
+    assert p.summary(last_step=19)['events'] == [[3, 'I1', 1, 'on'], [8, 'I1', 0, 'cut']]
+
+
+def test_ibus_row_alone_is_a_frame_row():
+    a = fs.ActiveSet(fs.parse(HEAD + 'I1,ibus_loss,ibus,1,3,\n'))
+    a.advance(1)
+    assert a.ibus and a.any and a.plant_on == () and a.enc_mask == 0 and not a.loss
+    a.advance(3)
+    assert not a.ibus and not a.any
+
+
+def test_ibus_constants():
+    from protocol import CMD_IBUS_OFF, CMD_SWA_ON
+    assert CMD_IBUS_OFF == 16 and CMD_IBUS_OFF & (CMD_SWA_ON | fs.FAULT_IMU_LOSS) == 0
+    assert 'ibus_loss' in fs.FRAME_FAULTS and 'ibus_loss' not in fs.BATCH2 + fs.PLANT_FAULTS
+    assert fs.IBUS_LOSS_H7 is False                 # the H7 part is not merged: set True on its branch only
