@@ -796,6 +796,39 @@ def test_a_wide_stop_window_lets_many_edges_through():
     assert np.all((lo_s - 1e-6 <= u) & (u <= hi_s + 1e-6)), float(np.max(np.maximum(lo_s - u, u - hi_s)))
 
 
+def test_stop_boundary_holds_the_true_edge_count():
+    """S2M3-1: random runs of one wheel (start, retimes or a constant speed, a stop; frames 0.3-1.5 ms apart, windows
+    up to 2 ms on half the frames, the true apply anywhere in its window): when every edge of the run is trusted, the
+    true edges before the true stop (simulated on the true applies with no window; the edge model with no window is
+    encoder_gen.c, checked against the oracle above) minus the modelled ones lie in [o_lo, o_hi] of the stop."""
+    sc = np.float32(EM.HIL_OMEGA_MAX) / np.float32(32767.0)
+    n_checked = 0
+    for seed in range(800):
+        rng = np.random.default_rng(seed)
+        n = 60
+        lo = np.cumsum(rng.uniform(300, 1500, n)) + 10_000.0
+        raw = np.zeros(n, dtype=np.int16)
+        k1 = int(rng.integers(8, 40))
+        raw[5:k1] = rng.integers(4000, 32000, k1 - 5) * (1 if rng.uniform() < 0.5 else -1)
+        if rng.uniform() < 0.5:
+            raw[5:k1] = raw[5]
+        width = np.where(rng.uniform(size=n) < 0.5, rng.uniform(0, 2000, n), rng.uniform(0, 5, n))
+        width[:-1] = np.minimum(width[:-1], np.diff(lo) - 2)               # a window ends before the next frame
+        true = np.floor(lo + rng.uniform(0, 1, n) * width)
+        om32 = np.zeros((n, 4), np.float32)
+        om32[:, 0] = raw.astype(np.float32) * sc
+        m = pt.simulate_edges(lo, width + 1.0, om32)[0]
+        if pt._Wheel(m).broken_seg <= 1:
+            continue
+        t = pt.simulate_edges(true, np.zeros(n), om32)[0]
+        sm = next(x for x in m['segs'] if x['kind'] == 'stop')
+        st = next(x for x in t['segs'] if x['kind'] == 'stop')
+        assert sm['o_lo'] <= st['n_before'] - sm['n_before'] <= sm['o_hi'], (seed, st['n_before'] - sm['n_before'],
+                                                                             sm['o_lo'], sm['o_hi'])
+        n_checked += 1
+    assert n_checked > 150
+
+
 def _wheel_of(segs, broken_seg=None, n_edges_total=0, trusted_upto=None):
     """A stand-in for _Wheel with given segments (rest first): only what _rest_holds reads."""
     from types import SimpleNamespace
