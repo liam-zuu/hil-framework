@@ -1005,7 +1005,9 @@ def read_ke_khai(path):
           and all(isinstance(v, dict) and isinstance(v.get('co'), int) and isinstance(v.get('sha256'), str)
                   for v in d['nhat_ky'].values())
           and isinstance(d.get('tro_ly_codex'), dict) and isinstance(d['tro_ly_codex'].get('lan_goi'), list)
-          and all(isinstance(c, dict) for c in d['tro_ly_codex']['lan_goi']))       # SA3-1
+          and all(isinstance(c, dict) and isinstance(c.get('log'), str) for c in d['tro_ly_codex']['lan_goi'])
+          and isinstance(d.get('tro_ly_claude'), dict) and isinstance(d['tro_ly_claude'].get('phien'), list))
+    # SA3-1, SA4-1: typed call entries; SA-20: the STRA_A sessions list
     if not ok:
         raise Refused(f'{path}: not a declaration of ke-khai (fields nhat_ky, loi, hop_thu, tro_ly_codex)')
     return d
@@ -1026,8 +1028,10 @@ def declaration_problems(kk, root):
     bad = [c.get('log') for c in kk['tro_ly_codex']['lan_goi'] if c.get('model') != hc.MODEL or c.get('effort') != hc.EFFORT]
     if bad:
         out.append(f'Codex calls not on {hc.MODEL} / {hc.EFFORT}: {bad}')
-    if {c.get('log') for c in kk['tro_ly_codex']['lan_goi']} != {c['log'] for c in codex_calls(root)}:
-        out.append('Codex call logs differ from the declaration')
+    if list(kk['tro_ly_codex']['lan_goi']) != codex_calls(root):           # SA-20: whole entries, read again
+        out.append('Codex calls (log, model, effort) differ from the logs')
+    if not kk['tro_ly_claude']['phien']:
+        out.append('no STRA_A session (id, model, effort) in the declaration: ke-khai --phien')
     _, bb = box_check(os.path.join(root, HOP_THU_DIR))                     # SA-22: the mailbox itself, now
     out.extend(f'mailbox: {x}' for x in bb)
     return out
@@ -1074,6 +1078,9 @@ def ke_khai(a):
                     continue
                 if other > mine:
                     raise Refused(f'--truoc: {n} is newer; give the newest declaration')
+                tr = read_ke_khai(os.path.join(folder, n)).get('truoc')     # SA-18: a chain, not only the time
+                if isinstance(tr, dict) and tr.get('file') == os.path.basename(a.truoc):
+                    raise Refused(f'--truoc: {n} already follows it; give the newest declaration')
     prev = read_ke_khai(a.truoc)['nhat_ky'] if a.truoc else None
     if a.lan_dau and [n for n in os.listdir(os.path.dirname(os.path.abspath(a.out)))
                       if n.startswith('hop_thu_A') and n.endswith('.yaml')]:
@@ -1155,10 +1162,11 @@ def kiem_c13(a):
     try:
         js = read_json(os.path.join(os.path.dirname(a.mien_a), 'mien_A.json'))
         run = os.path.join(THESIS, js['s03_run'])                         # SA-20: from the S03 run, not the JSON
+        rows_again = mien_rows(run)                                        # SA4-2: files checked before any hash
         m = s03_run_ok(run)
         src = all(sha256(os.path.join(run, n)) == js['sha256'][n] for n in ('sweep.csv', 'levels.csv', 'meta.yaml'))
         with open(a.mien_a, 'rb') as f:
-            again = _mien_csv_bytes(mien_rows(run)) == f.read().replace(b'\r\n', b'\n')
+            again = _mien_csv_bytes(rows_again) == f.read().replace(b'\r\n', b'\n')
         same = os.path.isfile(mp) and sha256(mp) == sha256(a.mien_a)
         box = all(os.path.isfile(os.path.join(hop, n)) and sha256(os.path.join(hop, n)) == sha256(os.path.join(run, n))
                   for n in ('sweep.csv', 'levels.csv'))

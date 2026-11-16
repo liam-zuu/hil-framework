@@ -598,6 +598,8 @@ def test_declaration_problems(world, monkeypatch):
     C.main(['--stra-a', str(sa), 'ke-khai', '--out', str(out), '--lan-dau'])
     kk = C.read_ke_khai(str(out))
     kk['loi'] = []
+    assert any('STRA_A session' in x for x in C.declaration_problems(kk, str(sa)))
+    kk['tro_ly_claude']['phien'] = ['local_x,claude-sonnet,medium']
     assert C.declaration_problems(kk, str(sa)) == []
     (sa / 'NHAT_KY' / '2026-11-20.md').write_text('buổi 1\nthêm\n', encoding='utf-8')
     assert any('NHAT_KY' in x for x in C.declaration_problems(kk, str(sa)))
@@ -670,3 +672,33 @@ def test_round3_fixes(world, monkeypatch, capsys):
     d = C.read_ke_khai(a1)
     (w['hop'] / 'spec.md').write_text('đổi\n', encoding='utf-8')
     assert any(x.startswith('mailbox:') for x in C.declaration_problems(d, str(sa)))
+
+
+def test_round4_fixes(world, monkeypatch, capsys):
+    """SA-18 chain (two declarations in the same second); SA-20 call entries compared with the real logs;
+    SA4-1 log name typed."""
+    w = world
+    sa = w['sa']
+    fence_files(sa, monkeypatch)
+    monkeypatch.setattr(C, '_tool_version', lambda cmd: '')
+    kk = w['tmp'] / 'kk'
+    kk.mkdir()
+    a0, a1, a2 = (str(kk / f'hop_thu_A_{i}.yaml') for i in range(3))
+    C.main(['--stra-a', str(sa), 'ke-khai', '--out', a0, '--lan-dau'])
+    C.main(['--stra-a', str(sa), 'ke-khai', '--out', a1, '--truoc', a0])
+    capsys.readouterr()
+    assert C.main(['--stra-a', str(sa), 'ke-khai', '--out', a2, '--truoc', a0]) == 2
+    out = capsys.readouterr().out
+    assert 'follows' in out or 'newer' in out
+    (sa / 'CODEX' / 'log_20261120_1.txt').write_text(
+        'x\n--------\nworkdir: D:\\STRA_A\nmodel: gpt-5\nreasoning effort: high\n--------\n', encoding='utf-8')
+    d = C.read_ke_khai(a1)
+    d['loi'], d['tro_ly_claude']['phien'] = [], ['s']
+    d['tro_ly_codex']['lan_goi'] = [dict(log='log_20261120_1.txt', model='gpt-6.1-sol', effort='high')]
+    d['nhat_ky'], _ = C.nhat_ky(str(sa), None)
+    assert any('differ from the logs' in x for x in C.declaration_problems(d, str(sa)))
+    bad = w['tmp'] / 'b.yaml'
+    bad.write_text('loi: []\nhop_thu: {readme_sha256: x}\nnhat_ky: {}\ntro_ly_claude: {phien: []}\n'
+                   'tro_ly_codex: {lan_goi: [{log: [], model: m, effort: e}]}\n', encoding='utf-8')
+    with pytest.raises(C.Refused):
+        C.read_ke_khai(str(bad))
