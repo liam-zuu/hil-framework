@@ -810,28 +810,37 @@ def tre_one(frames, log, offset_s, s_plus=0.0, s_minus=0.0, period_s=PERIOD_S, j
         r = F['psi'][win & common] - P[k][win & common] - c
         n_used.add(int(r.size))
         rms.append(float(np.sqrt(np.mean(r ** 2))))
-    rms = np.array(rms)
+    fit = _tau_from_rms(taus, np.array(rms), step_s, frames)
+    return dict(fit, n_frames=int((win & common).sum()),
+                n_frames_some=int((win & np.any(np.isfinite(P), axis=0)).sum()), n_used=sorted(n_used),
+                offset_s=offset_s,
+                n_late=S0['n_late'], frames=os.path.basename(frames), frames_sha256=sha256(frames),
+                log=os.path.basename(log), log_sha256=sha256(log))
+
+
+def _tau_from_rms(taus, rms, step_s, frames):
+    """Delay at the RMS minimum over the grid taus, parabola through the three points; refused when not identifiable
+    (B8S-12: RMS flat over the grid; B8SF-1: a grid neighbour shares the minimum). contrast = RMS at the grid edge /
+    RMS minimum, None when not a finite number (B8SF-2)."""
     if not np.all(np.isfinite(rms)) or not np.ptp(rms) > 0:
         raise InputError(f'{frames}: RMS does not change over the delay grid: no yaw motion to identify tau '
                          f'(B8S-12)')
     k = int(np.argmin(rms))
     if k == 0 or k == len(taus) - 1:
-        raise InputError(f'{frames}: delay at the edge of +-{half_s * 1e3:.0f} ms (clock offset wrong?)')
+        raise InputError(f'{frames}: delay at the edge of +-{abs(taus[0]) * 1e3:.0f} ms (clock offset wrong?)')
     y0, y1, y2 = rms[k - 1], rms[k], rms[k + 1]
     den = y0 - 2 * y1 + y2
-    if not den > 0:                                                    # B8S-12: flat at the minimum, not identifiable
+    if not (y0 > y1 and y2 > y1 and den > 0):                          # B8S-12, B8SF-1: flat bottom
         raise InputError(f'{frames}: RMS flat at its minimum (tau {taus[k] * 1e3:.0f} ms): delay not identifiable '
                          f'(B8S-12)')
     tau = taus[k] + 0.5 * step_s * (y0 - y2) / den
     if not (math.isfinite(tau) and math.isfinite(y1)):
         raise InputError(f'{frames}: delay not determined (CU-12)')
     edge = float(min(rms[0], rms[-1]))
+    with np.errstate(over='ignore', divide='ignore'):
+        ratio = float(np.float64(edge) / np.float64(y1)) if y1 > 0 else math.nan
     return dict(tau_s=float(tau), rms_rad=float(y1), rms_edge_rad=edge,
-                contrast=float(edge / y1) if y1 > 0 else None, n_frames=int((win & common).sum()),
-                n_frames_some=int((win & np.any(np.isfinite(P), axis=0)).sum()), n_used=sorted(n_used),
-                offset_s=offset_s,
-                n_late=S0['n_late'], frames=os.path.basename(frames), frames_sha256=sha256(frames),
-                log=os.path.basename(log), log_sha256=sha256(log))
+                contrast=ratio if math.isfinite(ratio) else None)
 
 
 def tre(caps, thang_d, step_s=0.001, **kw):

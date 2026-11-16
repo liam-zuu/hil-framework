@@ -921,6 +921,25 @@ def test_tre_refuses_run_without_yaw_motion(tmp_path):
         U.tre_one(fr, lg, 0.5)
 
 
+def test_tau_from_rms_refuses_flat_bottom():
+    """B8SF-1 (Codex round 1 of B8S): several grid points share the minimum: not identifiable, refused."""
+    taus = np.arange(-3, 4) * 0.001
+    with pytest.raises(U.InputError, match='flat at its minimum'):
+        U._tau_from_rms(taus, np.array([3.0, 2.0, 1.0, 1.0, 1.0, 2.0, 3.0]), 0.001, 'f')
+    with pytest.raises(U.InputError, match='flat at its minimum'):
+        U._tau_from_rms(taus, np.array([3.0, 2.0, 1.0, 1.0, 2.0, 2.5, 3.0]), 0.001, 'f')
+    r = U._tau_from_rms(taus, np.array([3.0, 2.0, 1.2, 1.0, 1.2, 2.0, 3.0]), 0.001, 'f')
+    assert r['tau_s'] == pytest.approx(0.0) and r['contrast'] == pytest.approx(3.0)
+
+
+def test_tau_from_rms_contrast_overflow_is_null():
+    """B8SF-2: edge / minimum overflows to inf: contrast null, the fit still returned (JSON writable)."""
+    taus = np.arange(-2, 3) * 0.001
+    r = U._tau_from_rms(taus, np.array([1e150, 1e150, 1e-160, 1e150, 1e150]), 0.001, 'f')
+    assert r['contrast'] is None and r['tau_s'] == pytest.approx(0.0)
+    json.dumps(r, allow_nan=False)
+
+
 def test_tre_names_failed_run(tmp_path):
     """B8S-12: tre stops on a run that cannot give tau, naming it."""
     fr, lg = _c8_pair(tmp_path)
