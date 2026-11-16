@@ -1,40 +1,47 @@
 #!/usr/bin/env python3
 """
 s06_t3_score.py — chấm S06 T3 (i) trễ HIL và (ii) lượng tử cạnh, theo cửa sổ ghép (spec S06 dòng T3: V2, Z7,
-L7-10, V2-4; thiết kế 03_CODE/docs/2026-11-15_Thiet_ke_S06_T3_danh_dau_v1.md mục 4 ý 4, Liam 15/11 "Duyệt,
-code luôn"; hồ sơ lượt t3: Liam 17/11 "Hồ sơ t3 riêng (Recommended)").
+L7-10, V2-4; mục 4.1 W9, Y15; thiết kế 03_CODE/docs/2026-11-15_Thiet_ke_S06_T3_danh_dau_v1.md mục 4 ý 4, Liam 15/11
+"Duyệt, code luôn"; hồ sơ lượt t3: Liam 17/11 "Hồ sơ t3 riêng (Recommended)"; sửa sau Codex vòng 1, Liam 17/11
+"Sửa 12 + vòng 2", "Bật cả trong heavy", "Ghi giới hạn": T3C-2, 5, 6, 7, 10, 11, 12, 13).
 
 Lượt: RPi5 `run_hil.py --omega-schedule T3_schedule.csv --marker t3 --frame-log frames.npz` (lịch của
-rpi5/t3_schedule.py), ESP32 rời env `s06_load` lượt `START t3 …` (s06_logger.py --profile t3). Mọi giờ trong phép
-chấm là giờ ESP32 (`esp_timer` trong ISR GPIO), nên (i) và (ii) không qua đồng hồ Pi:
+rpi5/t3_schedule.py), ESP32 rời env `s06_load` lượt `START t3 …` (s06_logger.py --profile t3, chạy trước plant).
+Mọi giờ trong phép chấm là giờ ESP32 (`esp_timer` trong ISR GPIO), nên (i) và (ii) không qua đồng hồ Pi:
   * mốc j = cạnh M (chân đánh dấu Pi, nâng ngay trước `transfer` của frame có bậc j);
   * cửa sổ j = [mốc j; mốc j + 2·hp_cũ,j + 1 ms], hp_cũ = nửa chu kỳ H7 ở ω cũ của bánh đổi (t3_schedule.hp_ticks);
   * cạnh D = PF3 đảo (H7 vừa hẹn lại CCR); mỗi cửa sổ phải có đúng một D: 0 → bản ghi hết hạn (vượt cận), ≥ 2 →
     bậc không đạt (xung thừa); D ngoài mọi cửa sổ → H3 không đạt;
-  * (i) = t_D − t_M; (ii) = cạnh N đầu tiên của bánh đổi (kênh A hay B, sớm nhất) sau D và trong cửa sổ, trừ t_D.
-Ghép bậc j ↔ cạnh M thứ j: ghép cặp cạnh Pi (frames.npz `marker`) với cạnh M bằng s06_clock_sync (khoảng cách
-giữa bậc 60–120 ms ngẫu nhiên); mỗi cạnh Pi của lượt phải có cặp, mỗi cạnh M của lượt phải có cặp. Frame có
-marker phải theo lịch (đúng bánh, đúng ω mới đã lượng tử, đúng thứ tự).
+  * (i) = t_D − t_M; (ii) = cạnh N đầu tiên của bánh đổi (kênh A hay B, sớm nhất) sau D và trong cửa sổ, trừ t_D;
+    không có N trong cửa sổ → bản ghi hết hạn (spec: vượt cận, lỗi công cụ HIL), không đạt (T3C-5).
+  * Giới hạn (T3C-2, Liam 17/11 "Ghi giới hạn"): firmware mở ngắt encoder trong ISR của D, nên cạnh rơi giữa lúc
+    PF3 đổi và lúc ISR D chạy không được ghi, (ii) báo cạnh kế; vùng mù ≤ trễ ISR lớn nhất (`loop_cal.max_us`).
+Ghép bậc j ↔ cạnh M: ghép cạnh Pi (frames.npz `marker`) với cạnh M bằng s06_clock_sync (neo bằng lệnh START,
+capture.yaml của s06_logger); mỗi cạnh Pi phải có cặp, mỗi cạnh M của lượt phải có cặp. Frame có marker phải theo
+lịch (đúng bánh, đúng ω cũ/mới đã lượng tử, đúng thứ tự). Khoảng cách thực giữa hai bậc ≥ 50 ms trên cả giờ M
+(ESP32) và `t_send` (Pi), không thì lượt không đủ điều kiện (mã 3, T3C-13).
 
-Độ bất định của cách đo (spec ≤ 0,25 ms; mục 4.1): M, D, N cùng đi đường ISR GPIO lõi 0 của ESP32, nên phần
-chung của trễ ngắt triệt tiêu trong hiệu; còn phần dao động. Đo bằng cặp O → L (ESP32 đảo GPIO39 trong vùng tắt
-ngắt, ghi giờ ngay trước lệnh ghi; ISR GPIO37 qua dây nối tắt): u = (trễ O→L lớn nhất − nhỏ nhất) + 2 µs (độ phân
-giải `esp_timer` ở hai đầu) [ĐỀ XUẤT CODE_S06]. Ít hơn LOOP_MIN cặp → thiếu bằng chứng (mã 3). Khoảng GPIO → SPI
-phía Pi (t_send − t_pulse1 của frame có marker) là thành phần của trễ đo được (thiên an toàn), báo kèm.
+Độ bất định (spec mục 4.1, Y15, W9): M, D, N cùng đi đường ISR GPIO của ESP32, nên phần chung của trễ ngắt triệt
+tiêu trong hiệu; còn phần dao động. Hiệu chuẩn bằng cặp tự nối O → L (GPIO39 → GPIO37) của một lượt hồ sơ `heavy`
+(đủ tải; `--loop-cal`, ≥ 1 000 cặp, cặp không lỗi: s06_clock_sync.loop_cal; Liam 17/11 "Bật cả trong heavy"); cặp
+O → L của chính lượt t3 (nếu có) cũng phải không lỗi và được gộp vào: u = (trễ lớn nhất − nhỏ nhất trên mọi cặp)
++ 2 µs (độ phân giải `esp_timer` ở hai đầu) [ĐỀ XUẤT CODE_S06]. Thiếu hay hỏng hiệu chuẩn → mã 3 `thieu_bang_chung`.
+Khoảng GPIO → SPI phía Pi (t_send − t_pulse1 của frame có marker) là thành phần của trễ đo được (thiên an toàn),
+báo kèm. Mức phủ (W9): số bậc đo được / số bậc, theo dải ω mới.
 
-Kết luận (i), mục 4 spec: trễ lớn nhất + u ≤ 1 ms → đạt; trễ lớn nhất − u > 1 ms → không đạt; còn lại chưa kết luận
-(mã 3). u > 0,25 ms → chưa kết luận. (ii) chỉ báo số; một lần đo > hp_mới + u ghi `bug_class` = loi_cong_cu_HIL,
-không đổi kết luận (spec: không đặt ngưỡng H3 cho (ii)).
-PF3-4 (Codex PF3 vòng 1–2): cạnh D trước `#run_start` của lượt (giờ ESP32 `timestamp_us`) bị bỏ, đếm riêng.
+Kết luận (i), mục 4: trễ lớn nhất + u ≤ 1 ms → đạt; trễ lớn nhất − u > 1 ms → không đạt; còn lại chưa kết luận
+(mã 3); u > 0,25 ms → chưa kết luận. (ii) chỉ báo số; một lần đo > hp_mới + u ghi `bug_class` = loi_cong_cu_HIL.
+PF3-4: cạnh D trước `#run_start` của lượt (giờ ESP32 `timestamp_us`) bị bỏ, đếm riêng.
 
-Mất dữ liệu (Z19) → mã 1: luồng qseq của lượt hở (s06_stream.qseq_stream), hở `gseq` giữa các dòng T3 của lượt,
-`t3_ovf_run` > 0 ở #run_stats, cạnh Pi hay cạnh M không có cặp, frames.npz thiếu frame (manifest_check).
-Mã thoát: 0 đạt; 1 không đạt hoặc mất dữ liệu; 3 chưa kết luận / thiếu bằng chứng / không chọn được lượt;
-2 lỗi đầu vào (kể cả frame có marker không theo lịch). Dòng cuối `#ket_qua,…`.
+Mất dữ liệu (Z19) → mã 1, xét TRƯỚC mọi lỗi đầu vào khác của frame (T3C-10): frames.npz thiếu frame
+(manifest_check), luồng qseq của lượt hở, luồng T3 của lượt không đủ gseq (t3_g0; t3_g1] (T3C-11), `t3_ovf_run` > 0,
+hai cạnh D liền nhau cùng mức (lỡ một cạnh PF3, T3C-12), cạnh Pi hay cạnh M không có cặp.
+Mã thoát: 0 đạt; 1 không đạt hoặc mất dữ liệu; 3 chưa kết luận / thiếu bằng chứng / không đủ điều kiện / không chọn
+được lượt; 2 lỗi đầu vào (kể cả frame có marker không theo lịch khi frame log đủ). Dòng cuối `#ket_qua,…`.
 
 CLI:
-  python tools/s06_t3_score.py --schedule T3_schedule.csv --frames frames.npz --esp32-events esp32_events.txt \\
-      [--run N] --out <thư mục>
+  python tools/s06_t3_score.py --schedule T3_schedule.csv --frames frames.npz --esp32-events <t3>/esp32_events.txt \\
+      --loop-cal <heavy>/esp32_events.txt [--loop-cal-run M] [--capture capture.yaml] [--run N] --out <thư mục>
 """
 from __future__ import annotations
 
@@ -59,14 +66,15 @@ import t3_schedule as ts               # noqa: E402  rpi5/
 LIMIT_US = 1000.0            # (i) trễ HIL lớn nhất ≤ 1 ms
 U_MAX_US = 250.0             # độ bất định ≤ 0,25 ms (¼ mục tiêu)
 TIMER_RES_US = 1.0           # esp_timer: 1 µs
-LOOP_MIN = 10                # cặp O → L tối thiểu để có u
+GAP_MIN_US = 50_000.0        # spec L7-10: hai bậc liên tiếp cách ≥ 50 ms
+BANDS = ((2.0, 5.0), (5.0, 10.0), (10.0, 20.0), (20.0, 40.0))   # dải ω mới cho mức phủ (W9) [ĐỀ XUẤT CODE_S06]
 PIN_MARK, PIN_DBG = 38, 36
 # chân encoder ESP32 theo bánh của frame (FL, FR, RL, RR): AGV src/encoder/encoder.h (A, B)
 WHEEL_PINS = {0: (4, 5), 1: (2, 42), 2: (6, 7), 3: (20, 19)}
 
 COLUMNS = ['step', 'wheel', 'w_from', 'w_to', 'hp_old_us', 'hp_new_us', 'frame', 't_mark_esp_us',
            'win_end_esp_us', 'n_dbg', 't_dbg_esp_us', 'delay_us', 'pin_n', 't_n_esp_us', 'quant_us',
-           'gpio_spi_us', 'verdict_i', 'bug_class', 'note']
+           'gpio_spi_us', 'verdict_i', 'verdict_ii', 'bug_class', 'note']
 
 
 def marked_frames(z) -> List[dict]:
@@ -86,7 +94,7 @@ def marked_frames(z) -> List[dict]:
 
 
 def check_schedule(marks: List[dict], sched) -> List[str]:
-    """Frame có marker phải theo lịch: cùng số bậc, đúng bánh, đúng ω mới đã lượng tử, chỉ một bánh đổi."""
+    """Frame có marker phải theo lịch: cùng số bậc, đúng bánh, đúng ω cũ/mới đã lượng tử, chỉ một bánh đổi."""
     rows = sorted(sched, key=lambda r: r.t0_ms)
     bad = []
     if len(marks) != len(rows):
@@ -103,21 +111,23 @@ def check_schedule(marks: List[dict], sched) -> List[str]:
     return bad
 
 
-def loop_latency(t3_rows: List[dict]) -> dict:
-    """Trễ O → L (µs): mỗi O ghép với L đầu tiên sau nó (theo gseq) cùng mức, trước O kế."""
-    ev = sorted((r for r in t3_rows if r['src'] in 'OL'), key=lambda r: r['gseq'])
-    lat, pend = [], None
-    for r in ev:
-        if r['src'] == 'O':
-            pend = r
-        elif pend is not None and r['lvl'] == pend['lvl']:
-            lat.append(r['t_us'] - pend['t_us'])
-            pend = None
-    if len(lat) < LOOP_MIN:
-        return dict(n=len(lat), min_us=None, median_us=None, max_us=None, u_us=None)
-    a = np.array(lat, dtype=np.float64)
-    return dict(n=len(lat), min_us=float(a.min()), median_us=float(np.median(a)), max_us=float(a.max()),
-                u_us=float(a.max() - a.min() + 2 * TIMER_RES_US))
+def uncertainty(cal: Optional[dict], run_loop: dict) -> tuple:
+    """(u µs hoặc None, lý do thiếu). cal = s06_clock_sync.loop_cal của lượt heavy; run_loop = loop_latency của
+    lượt t3. u = (lớn nhất − nhỏ nhất trên mọi cặp dùng được) + 2 µs."""
+    why = []
+    if cal is None:
+        why.append('thiếu --loop-cal (hiệu chuẩn trễ ISR khi đủ tải, spec mục 4.1)')
+    elif not cal['ok']:
+        why.append('hiệu chuẩn trễ ISR không dùng được: ' + '; '.join(cal['why']))
+    if run_loop['n'] or run_loop['o_without_l'] or run_loop['l_without_o'] or run_loop['l_wrong_level']:
+        if not run_loop['ok']:
+            why.append('cặp O → L của lượt t3 lỗi (O thiếu L, L thừa hay sai mức)')
+    if why:
+        return None, why
+    lo, hi = cal['min_us'], cal['max_us']
+    if run_loop['n']:
+        lo, hi = min(lo, run_loop['min_us']), max(hi, run_loop['max_us'])
+    return float(hi - lo + 2 * TIMER_RES_US), []
 
 
 def score(steps: List[dict], t3_rows: List[dict], t_run_start: int, u_us: Optional[float]) -> dict:
@@ -139,22 +149,24 @@ def score(steps: List[dict], t3_rows: List[dict], t_run_start: int, u_us: Option
         row = dict(step=j, wheel=s['wheel'], w_from=s['w_from'], w_to=s['w_to'], hp_old_us=hp_old,
                    hp_new_us=hp_new, frame=s['frame'], t_mark_esp_us=s['t_mark'], win_end_esp_us=None,
                    n_dbg=None, t_dbg_esp_us=None, delay_us=None, pin_n=None, t_n_esp_us=None, quant_us=None,
-                   gpio_spi_us=s['gpio_spi_us'], verdict_i='', bug_class='', note='')
+                   gpio_spi_us=s['gpio_spi_us'], verdict_i='', verdict_ii='', bug_class='', note='')
         if s['t_mark'] is None:
-            row.update(verdict_i='no_data', note='không có cạnh M ghép với frame có marker')
+            row.update(verdict_i='no_data', verdict_ii='no_data', note='không có cạnh M ghép với frame có marker')
             rows.append(row)
             continue
         t0 = s['t_mark']
         t1 = t0 + 2.0 * hp_old + 1000.0
         row['win_end_esp_us'] = t1
-        i0, i1 = np.searchsorted(dbg, t0, 'left'), np.searchsorted(dbg, t1, 'right')
+        i0, i1 = int(np.searchsorted(dbg, t0, 'left')), int(np.searchsorted(dbg, t1, 'right'))
         inw = dbg[i0:i1]
         used.update(range(i0, i1))
         row['n_dbg'] = len(inw)
         if len(inw) == 0:
-            row.update(verdict_i='het_han', note='không có cạnh D trong cửa sổ: bản ghi hết hạn (vượt cận)')
+            row.update(verdict_i='het_han', verdict_ii='het_han',
+                       note='không có cạnh D trong cửa sổ: bản ghi hết hạn (vượt cận)')
         elif len(inw) > 1:
-            row.update(verdict_i='khong_dat', note=f'{len(inw)} cạnh D trong cửa sổ (xung thừa của bộ HIL)')
+            row.update(verdict_i='khong_dat', verdict_ii='khong_dat',
+                       note=f'{len(inw)} cạnh D trong cửa sổ (xung thừa của bộ HIL)')
         else:
             td = inw[0]
             row.update(t_dbg_esp_us=td, delay_us=float(td - t0), verdict_i='do_duoc')
@@ -165,18 +177,26 @@ def score(steps: List[dict], t3_rows: List[dict], t_run_start: int, u_us: Option
                 if k < len(ts_pin) and ts_pin[k] <= t1 and (best is None or ts_pin[k] < best[1]):
                     best = (pin, ts_pin[k])
             if best is None:
-                row.update(note='(ii): không có cạnh encoder của bánh sau D trong cửa sổ (bản ghi hết hạn)',
-                           bug_class='loi_cong_cu_HIL')
+                # T3C-5: spec "không có cạnh trong cửa sổ → bản ghi hết hạn (vượt cận, lỗi công cụ HIL)"
+                row.update(verdict_ii='het_han', bug_class='loi_cong_cu_HIL',
+                           note='(ii): không có cạnh encoder của bánh sau D trong cửa sổ: bản ghi hết hạn')
             else:
                 q = float(best[1] - td)
-                row.update(pin_n=best[0], t_n_esp_us=best[1], quant_us=q)
+                row.update(pin_n=best[0], t_n_esp_us=best[1], quant_us=q, verdict_ii='do_duoc')
                 if u_us is not None and q > hp_new + u_us:
                     row.update(bug_class='loi_cong_cu_HIL', note=f'(ii) {q:.0f} µs > hp mới {hp_new:.0f} + u')
         rows.append(row)
     stray = len(dbg) - len(used)
     delays = [r['delay_us'] for r in rows if r['delay_us'] is not None]
+    cover = {}
+    for lo, hi in BANDS:
+        mine = [r for r in rows if lo <= r['w_to'] < hi]
+        cover[f'{lo:g}-{hi:g}'] = dict(steps=len(mine),
+                                       measured_i=sum(1 for r in mine if r['verdict_i'] == 'do_duoc'),
+                                       measured_ii=sum(1 for r in mine if r['verdict_ii'] == 'do_duoc'))
     summ = dict(steps=len(rows), measured=len(delays),
                 expired=sum(1 for r in rows if r['verdict_i'] == 'het_han'),
+                expired_ii=sum(1 for r in rows if r['verdict_i'] == 'do_duoc' and r['verdict_ii'] == 'het_han'),
                 extra_pulse=sum(1 for r in rows if r['verdict_i'] == 'khong_dat'),
                 no_data=sum(1 for r in rows if r['verdict_i'] == 'no_data'),
                 stray_dbg=stray, dbg_before_run_start=pre,
@@ -184,18 +204,20 @@ def score(steps: List[dict], t3_rows: List[dict], t_run_start: int, u_us: Option
                 delay_median_us=float(np.median(delays)) if delays else None,
                 quant_max_us=max((r['quant_us'] for r in rows if r['quant_us'] is not None), default=None),
                 quant_bug=sum(1 for r in rows if r['bug_class']),
-                per_wheel={w: sum(1 for r in rows if r['wheel'] == w) for w in range(4)})
+                per_wheel={w: sum(1 for r in rows if r['wheel'] == w) for w in range(4)},
+                coverage=cover)
     return dict(rows=rows, summary=summ)
 
 
-def conclude(summ: dict, u_us: Optional[float], lost: List[str]) -> tuple:
+def conclude(summ: dict, u_us: Optional[float], lost: List[str], u_why: List[str], invalid: List[str]) -> tuple:
     """(mã, lý do mã 3, danh sách lý do) theo spec mục 4 và Z19."""
-    why = []
     if lost or summ['no_data']:
         return 1, [], lost + ([f"{summ['no_data']} bậc không có cạnh M"] if summ['no_data'] else [])
     fails = []
     if summ['expired']:
         fails.append(f"{summ['expired']} bậc hết hạn (không có D trong cửa sổ)")
+    if summ['expired_ii']:
+        fails.append(f"{summ['expired_ii']} bậc hết hạn ở (ii) (không có cạnh encoder sau D trong cửa sổ)")
     if summ['extra_pulse']:
         fails.append(f"{summ['extra_pulse']} bậc có ≥ 2 cạnh D")
     if summ['stray_dbg']:
@@ -205,10 +227,13 @@ def conclude(summ: dict, u_us: Optional[float], lost: List[str]) -> tuple:
         fails.append(f'trễ HIL lớn nhất {dmax:.0f} µs − u {u_us:.0f} > {LIMIT_US:.0f} µs')
     if fails:
         return 1, [], fails
+    if invalid:
+        return 3, ['khong_du_dieu_kien'], invalid
     if u_us is None:
-        return 3, ['thieu_bang_chung'], ['không đủ cặp O → L (dây GPIO39 → GPIO37) để có độ bất định']
+        return 3, ['thieu_bang_chung'], u_why
     if dmax is None:
         return 3, ['thieu_bang_chung'], ['không bậc nào đo được']
+    why = []
     if u_us > U_MAX_US:
         why.append(f'độ bất định {u_us:.0f} µs > {U_MAX_US:.0f} µs')
     if dmax + u_us > LIMIT_US:
@@ -231,7 +256,10 @@ def main(argv=None) -> int:
     ap.add_argument('--schedule', required=True, help='T3_schedule.csv của rpi5/t3_schedule.py')
     ap.add_argument('--frames', required=True, help='frames.npz của run_hil.py --marker t3 --frame-log')
     ap.add_argument('--esp32-events', required=True, help='esp32_events.txt của s06_logger.py --profile t3')
+    ap.add_argument('--capture', default=None, help='capture.yaml của s06_logger.py (mặc định cùng thư mục)')
     ap.add_argument('--run', type=int, default=None, help='số lượt (run= của #run_start) khi file có nhiều lượt')
+    ap.add_argument('--loop-cal', default=None, help='esp32_events.txt của lượt heavy có cặp O → L (spec 4.1)')
+    ap.add_argument('--loop-cal-run', type=int, default=None)
     ap.add_argument('--out', required=True)
     a = ap.parse_args(argv)
     lost: List[str] = []
@@ -248,6 +276,11 @@ def main(argv=None) -> int:
         lost += fd.manifest_check(manifest, z['t_send_ns'], z['mosi'], z['miso'])
         mk = marked_frames(z)
         bad = check_schedule(mk, sched)
+        if bad and lost:
+            # T3C-10: frame log thiếu frame → mất dữ liệu (mã 1), không đổi thành lỗi đầu vào
+            print('frame có marker không theo lịch, do frame log thiếu frame: ' + '; '.join(bad[:2]), file=sys.stderr)
+            print(' - ' + '; '.join(lost))
+            return stm.report_result(1)
         if bad:
             raise ValueError('frame có marker không theo lịch: ' + '; '.join(bad[:3]))
         marks = stm.run_marks(a.esp32_events, a.run)
@@ -258,6 +291,10 @@ def main(argv=None) -> int:
         run_id = int(kv['run'])
         t_run_start = int(kv['timestamp_us'])
         ev = chk.parse_events(chk.read_raw(a.esp32_events))
+        cap = a.capture or os.path.join(os.path.dirname(os.path.abspath(a.esp32_events)), 'capture.yaml')
+        cmds = cs.read_commands(cap) if os.path.exists(cap) else []
+        anc = cs.anchor(ev, cmds, int(marks['run_start']['t_rx']))
+        cal = cs.loop_cal(a.loop_cal, a.loop_cal_run) if a.loop_cal else None
     except stm.RunProblem as ex:
         return stm.report_run_problem(ex)
     except (OSError, ValueError, KeyError) as ex:
@@ -270,10 +307,9 @@ def main(argv=None) -> int:
     elif not qs['known']:
         lost.append('không chứng minh được luồng qseq đủ (thiếu mốc #run_start/#run_end)')
     rows3 = [r for r in ev['T3'] if r['run'] == run_id]
-    g = sorted(r['gseq'] for r in rows3)
-    gaps = sum(b - a_ - 1 for a_, b in zip(g, g[1:]) if b - a_ > 1)
-    if gaps:
-        lost.append(f'hở gseq {gaps} cạnh trong lượt (vòng đệm T3 tràn hay mất UDP)')
+    gq = cs.gseq_complete(rows3, marks)
+    if not gq['ok']:
+        lost.append(gq['why'])
     ovf = marks.get('run_stats', {}).get('kv', {}).get('t3_ovf_run')
     if ovf is None:
         lost.append('#run_stats không có t3_ovf_run (firmware chưa có T3?)')
@@ -282,42 +318,59 @@ def main(argv=None) -> int:
     dbg_lv = [r['lvl'] for r in sorted(rows3, key=lambda r: r['gseq']) if r['src'] == 'D' and r['t_us'] >= t_run_start]
     rep = sum(1 for x, y in zip(dbg_lv, dbg_lv[1:]) if x == y)
     if rep:
-        notes.append(f'{rep} lần hai cạnh D liền nhau cùng mức (lỡ một cạnh PF3?)')
+        lost.append(f'{rep} lần hai cạnh D liền nhau cùng mức: lỡ cạnh PF3 (T3C-12)')
     # ghép bậc ↔ cạnh M
     p0 = np.asarray(z['t_pulse0_ns'], dtype=np.int64)
     p1 = np.asarray(z['t_pulse1_ns'], dtype=np.int64)
     fr = np.array([m['frame'] for m in mk])
     p_us = (p0[fr] + p1[fr]) / 2000.0
     half = (p1[fr] - p0[fr]) / 2000.0
-    e, e_rx = cs.esp_marks(ev, run_id)
-    sync = cs.sync(p_us, half, e, e_rx)
+    e = cs.esp_marks(ev, run_id)
+    sync = cs.sync(p_us, half, e, anc, cal['max_us'] if cal and cal['ok'] else None)
+    invalid: List[str] = []
     pair = dict(sync.get('_pairs', []))
-    if sync['n_pairs'] < len(mk):
-        lost.append(f"{len(mk) - sync['n_pairs']} frame có marker không có cạnh M (cặp {sync['n_pairs']}/{len(mk)})")
-    if sync['esp_unmatched']:
-        lost.append(f"{sync['esp_unmatched']} cạnh M của lượt không thuộc frame có marker nào")
+    if sync['problem'] and not sync.get('_pairs'):
+        invalid.append(f"không ghép được cạnh M với frame có marker: {sync['problem']}")
+    else:
+        if sync['problem']:
+            invalid.append(sync['problem'])
+        if sync['n_pairs'] < len(mk):
+            lost.append(f"{len(mk) - sync['n_pairs']} frame có marker không có cạnh M (cặp {sync['n_pairs']}/{len(mk)})")
+        if sync['esp_unmatched']:
+            lost.append(f"{sync['esp_unmatched']} cạnh M của lượt không thuộc frame có marker nào")
+    # T3C-13: khoảng cách thực giữa hai bậc
+    t_send_us = np.asarray(z['t_send_ns'], dtype=np.int64)[fr] / 1000.0
+    gap_pi = np.diff(t_send_us)
+    if len(gap_pi) and gap_pi.min() < GAP_MIN_US:
+        invalid.append(f'hai bậc cách {gap_pi.min() / 1000:.1f} ms < 50 ms trên giờ Pi (t_send)')
     gspi = (np.asarray(z['t_send_ns'], dtype=np.int64)[fr] - p1[fr]) / 1000.0
     rows_sched = sorted(sched, key=lambda r: r.t0_ms)
     steps = [dict(wheel=r.wheel, w_from=r.w_from, w_to=r.w_to, frame=mk[j]['frame'],
                   t_mark=float(e[pair[j]]) if j in pair else None, gpio_spi_us=float(gspi[j]))
              for j, r in enumerate(rows_sched)]
-    lat = loop_latency(rows3)
-    res = score(steps, rows3, t_run_start, lat['u_us'])
+    tm = np.array([s['t_mark'] for s in steps if s['t_mark'] is not None])
+    if len(tm) > 1 and np.diff(tm).min() < GAP_MIN_US:
+        invalid.append(f'hai bậc cách {np.diff(tm).min() / 1000:.1f} ms < 50 ms trên giờ ESP32 (cạnh M)')
+    run_loop = cs.loop_latency(rows3)
+    u_us, u_why = uncertainty(cal, run_loop)
+    res = score(steps, rows3, t_run_start, u_us)
     summ = res['summary']
-    code, reasons, why = conclude(summ, lat['u_us'], lost)
+    code, reasons, why = conclude(summ, u_us, lost, u_why, invalid)
+    if cal and cal['ok']:
+        notes.append(f"giới hạn (ii) (T3C-2): vùng mù sau cạnh D ≤ trễ ISR lớn nhất {cal['max_us']:.0f} µs")
     os.makedirs(a.out, exist_ok=True)
     write_rows(os.path.join(a.out, 'T3_result.csv'), res['rows'])
-    out = dict(code=code, reasons=why, notes=notes, run=run_id, summary=summ, loop_latency=lat,
-               gpio_spi_us=dict(median=float(np.median(gspi)) if len(gspi) else None,
-                                max=float(np.max(gspi)) if len(gspi) else None),
+    out = dict(code=code, reasons=why, notes=notes, run=run_id, summary=summ, u_us=u_us, loop_cal=cal,
+               loop_run=run_loop, gpio_spi_us=dict(median=float(np.median(gspi)) if len(gspi) else None,
+                                                   max=float(np.max(gspi)) if len(gspi) else None),
                clock={k: v for k, v in sync.items() if not k.startswith('_')},
-               qseq_stream=qs, gseq_gaps=gaps, t3_ovf_run=ovf, schedule=a.schedule, frames=a.frames,
+               qseq_stream=qs, gseq=gq, t3_ovf_run=ovf, schedule=a.schedule, frames=a.frames,
                esp32_events=a.esp32_events)
     with open(os.path.join(a.out, 'T3_summary.json'), 'w', encoding='utf-8') as f:
         json.dump(out, f, ensure_ascii=False, indent=1, default=str)
-    print(f"T3: {summ['steps']} bậc, đo được {summ['measured']}, hết hạn {summ['expired']}, xung thừa "
-          f"{summ['extra_pulse']}, D ngoài cửa sổ {summ['stray_dbg']}; trễ lớn nhất {summ['delay_max_us']} µs, "
-          f"u {lat['u_us']} µs; (ii) lớn nhất {summ['quant_max_us']} µs")
+    print(f"T3: {summ['steps']} bậc, đo được {summ['measured']}, hết hạn {summ['expired']} (ii: {summ['expired_ii']}), "
+          f"xung thừa {summ['extra_pulse']}, D ngoài cửa sổ {summ['stray_dbg']}; trễ lớn nhất {summ['delay_max_us']} µs, "
+          f"u {u_us} µs; (ii) lớn nhất {summ['quant_max_us']} µs")
     for x in why + notes:
         print(' -', x)
     return stm.report_result(code, reasons)

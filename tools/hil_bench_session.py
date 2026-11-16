@@ -629,6 +629,9 @@ def plan_s06(specs, plan, gain_query=False):
             raise ValueError(f'--s06 {name}: hồ sơ {parts[0]} cần run_hil.py --marker {want}, có --marker {got}')
         if parts[0] == 't3' and not has_opt(args_of[name], '--omega-schedule'):
             raise ValueError(f'--s06 {name}: hồ sơ t3 cần run_hil.py --omega-schedule <T3_schedule.csv>')
+        if parts[0] == 't3' and len(parts) != 3:
+            # T3C-14 (Codex vòng 1): lịch T3 có bậc từ giây 1; plant trước thì bậc đầu chạy khi ESP32 chưa START
+            raise ValueError(f'--s06 {name}: hồ sơ t3 cần logger-first (ESP32 bật ngắt PF3 trước bậc đầu)')
         out[name] = dict(profile=parts[0], duration=dur, logger_first=len(parts) == 3, steps=steps,
                          marker=want, add_marker=got is None)
     return out

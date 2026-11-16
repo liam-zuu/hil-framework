@@ -1,43 +1,57 @@
 #!/usr/bin/env python3
 """
 s06_clock_sync.py — đồng hồ ESP32 ↔ RPi5 từ chân đánh dấu (S06 T3; thiết kế
-03_CODE/docs/2026-11-15_Thiet_ke_S06_T3_danh_dau_v1.md mục 4 ý 3, Liam 15/11 "Duyệt, code luôn").
+03_CODE/docs/2026-11-15_Thiet_ke_S06_T3_danh_dau_v1.md mục 4 ý 3, Liam 15/11 "Duyệt, code luôn"; sửa sau Codex
+vòng 1, Liam 17/11 "Sửa 12 + vòng 2": T3C-7, T3C-8, T3C-9, T3C-15).
 
 Hai phía của cùng một cạnh lên:
   * RPi5: `run_hil.py --marker t3|10hz --frame-log frames.npz` nâng GPIO17 ngay trước `transfer` của frame có
-    `marker` = 1; giờ cạnh = giữa `t_pulse0_ns` và `t_pulse1_ns` (hai lần đọc đồng hồ kẹp lệnh nâng chân),
-    nửa khoảng kẹp là bất định phía Pi;
+    `marker` = 1; giờ cạnh = giữa `t_pulse0_ns` và `t_pulse1_ns` (kẹp lệnh nâng chân), nửa khoảng kẹp là bất
+    định phía Pi;
   * ESP32 (`s06_load`): dòng `T3,qseq,t_us,M,38,lvl,gseq,run` (ISR GPIO38, `esp_timer`), mọi lượt và ngoài lượt.
-Ghép cặp: lấy độ lệch thô từ khoảng cách giữa các cạnh (dãy khoảng cách 100 ms ở 10hz, 60–120 ms ngẫu nhiên ở
-t3 nên không nhầm cặp), rồi ghép tham lam theo đường affine cập nhật dần, cuối cùng bình phương nhỏ nhất:
+
+Neo thô (T3C-8, T3C-15): cạnh 10 Hz cách đều 100 ms nên không ghép được theo khoảng cách, và giờ nhận `t_rx` chỉ
+cho cận DƯỚI của trễ gửi. Neo bằng khoảng kẹp của lệnh START có `#ack,ok=1`:
+    t_gửi(START, Pi, `capture.yaml` commands, lấy SAU sendto) − SEND_SLACK_US
+        < OFFSET + t_ack_esp  <  t_rx(#ack, Pi)
+`t_ack_esp` = trường `t_us` của `#ack` (giờ ESP32 lúc cmd_task xử lý lệnh). Độ rộng khoảng kẹp = thời gian khứ hồi
++ SEND_SLACK_US; rộng hơn ANCHOR_MAX_US (< nửa khoảng cách nhỏ nhất của cạnh) thì không ghép (mã 3). Từ tâm khoảng
+kẹp, ghép tham lam theo thứ tự cạnh Pi, cửa sổ MATCH_TOL_US quanh giờ dự đoán, khớp lại affine mỗi REFIT_EVERY cặp
+(bám trôi tần số thạch anh), rồi bình phương nhỏ nhất:
     t_pi_us = OFFSET + RATE · t_esp_us        (cùng quy ước `--clock-affine` của t3b_score.py)
-Phần dư = giờ Pi đo − giờ Pi suy từ ESP32, gồm cả trễ ngắt ESP32 thay đổi và nhiễu kẹp phía Pi.
-`delta_sync_us` = phần dư tuyệt đối lớn nhất + nửa khoảng kẹp lớn nhất (cận trên, [ĐỀ XUẤT CODE_S06]); trễ ngắt
-trung bình nằm trong OFFSET (cạnh M và các cạnh ESP32 khác qua cùng đường ISR).
+Affine cuối phải đặt giờ `#ack` vào trong khoảng kẹp (± MATCH_TOL_US), không thì mã 3 (ghép không đáng tin).
 
-Dùng cho:
-  * t3b_score.py `--clock-affine OFFSET RATE --delta-sync-us …` (trước đây nhập tay);
-  * T4 (4), T6, cờ X17 của T1: quy giờ ESP32 về giờ Pi;
-  * khối tải nặng (spec Z8, THESIS nhắc): khoảng in H7 (`pwm_es`, ≥ 2 s) có giờ Pi qua khớp CYCCNT với mốc
-    xung của s06_frames_decode; đổi vai bánh của `s06_load` (mỗi 15 s) có giờ ESP32 (`#run_start` timestamp_us +
-    S06_HEAVY_SWAP_US). Đặt khoảng in lên đồng hồ khối tải nặng = đổi giờ ESP32 của mốc đổi vai sang giờ Pi bằng
-    affine này (t_pi = OFFSET + RATE · t_esp), rồi so với hai đầu khoảng in; bất định thêm `delta_sync_us`.
-    Công cụ đủ tải chưa dùng file này (việc của bộ chấm khối tải nặng).
+Bất định (T3C-9): OFFSET chứa trễ ISR trung bình của cạnh M.
+  * `delta_sync_isr_us` = phần dư lớn nhất + nửa khoảng kẹp Pi lớn nhất: cho sự kiện ESP32 cũng lấy giờ trong ISR
+    GPIO (D, N, L: cùng đường ISR, trễ trung bình triệt tiêu, phần dao động nằm trong phần dư);
+  * `delta_sync_us` = phần trên + trễ O → L lớn nhất của lượt hiệu chuẩn (`--loop-cal`): cho sự kiện ESP32 lấy giờ
+    trong task (dòng E, `#run_start`), vì trễ ISR của M (≤ trễ O → L lớn nhất) không triệt tiêu. Không có
+    `--loop-cal` dùng được thì `delta_sync_us` = None và mã 3.
+Hiệu chuẩn trễ ISR (spec mục 4.1, Y15: tự nối ra → vào, N ≥ 1 000, khi `s06_load` đủ tải; Liam 17/11 "Bật cả trong
+heavy"): cặp O → L của một lượt hồ sơ `heavy` (ESP32 đảo GPIO39 mỗi 100 ms trong vùng khóa, ISR GPIO37 qua dây nối
+tắt). `loop_latency` đòi mọi O có đúng một L cùng mức trước O kế (trừ O cuối cùng của lượt), không có L thừa
+(T3C-7); có cặp lỗi thì không dùng.
 
-Mất dữ liệu: cạnh ESP32 đã chọn không ghép được với cạnh Pi nào, hay cạnh Pi nằm trong khoảng giờ của các cạnh
-ESP32 đã chọn mà không có cặp → mã 1. Ít hơn MIN_PAIRS cặp → mã 3 `thieu_bang_chung`. Cạnh Pi ngoài khoảng đó (Pi
-chạy trước hay sau lượt ESP32) không tính là mất.
+Dùng cho: t3b_score.py `--clock-affine OFFSET RATE --delta-sync-us …`; T4 (4), T6, cờ X17 của T1; khối tải nặng
+(spec Z8): khoảng in H7 (`pwm_es`, ≥ 2 s) có giờ Pi (khớp CYCCNT của s06_frames_decode), mốc đổi vai bánh của
+`s06_load` có giờ ESP32 trong task (`#run_start` timestamp_us + bội S06_HEAVY_SWAP_US): đổi sang giờ Pi bằng affine
+này, bất định `delta_sync_us`. Các công cụ đó chưa gọi file này.
+
+Mất dữ liệu: cạnh ESP32 đã chọn không ghép được, hay cạnh Pi trong khoảng giờ của các cạnh ESP32 đã chọn mà không
+có cặp → mã 1. Ít hơn MIN_PAIRS cặp, không neo được, neo không khớp, thiếu `--loop-cal` → mã 3 `thieu_bang_chung`.
 
 CLI:
-  python tools/s06_clock_sync.py --frames frames.npz --esp32-events esp32_events.txt [--run N] --out clock.json
-    --run N: chỉ cạnh M có run = N (lượt đang chạy của s06_load); bỏ trống = mọi cạnh M trong file.
-Mã thoát: 0 đủ cặp, không mất; 1 mất cạnh; 3 thiếu bằng chứng; 2 lỗi đầu vào. Dòng cuối `#ket_qua,ma=…`.
+  python tools/s06_clock_sync.py --frames frames.npz --esp32-events <lượt>/esp32_events.txt [--capture capture.yaml]
+      [--run N] [--loop-cal <lượt heavy>/esp32_events.txt [--loop-cal-run M]] --out clock.json
+    --capture: mặc định capture.yaml cùng thư mục với esp32_events.txt (s06_logger.py ghi).
+Mã thoát: 0 đủ cặp, không mất; 1 mất cạnh; 3 thiếu bằng chứng; 2 lỗi đầu vào. Dòng cuối `#ket_qua,…`.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import re
 import sys
 from typing import List, Optional, Sequence, Tuple
 
@@ -47,13 +61,18 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 import s06_esp32_check as chk   # noqa: E402
+import s06_stream as stm        # noqa: E402
 
 MIN_PAIRS = 3                 # ít nhất 3 cặp mới khớp affine có phần dư
 MATCH_TOL_US = 3000.0         # cửa sổ ghép quanh giờ dự đoán (≪ 50 ms, khoảng cách nhỏ nhất của cạnh)
-COARSE_N = 50                 # số cạnh ESP32 đầu dùng để tinh độ lệch thô
-COARSE_WIN_US = 20_000.0      # < nửa khoảng cách nhỏ nhất giữa hai cạnh (50 ms ở T3, 100 ms ở 10hz)
 REFIT_EVERY = 20
+SEND_SLACK_US = 5000.0        # giờ gửi lấy SAU sendto (s06_logger.send_cmd): nới cận dưới [ĐỀ XUẤT CODE_S06]
+ANCHOR_MAX_US = 40_000.0      # độ rộng khoảng kẹp tối đa (< 50 ms, nửa khoảng cách cạnh 10 Hz)
+LOOP_CAL_MIN = 1000           # spec mục 4.1: N = 1 000
+CMD_RE = re.compile(r'^\s*-\s*\{t_us:\s*(\d+),\s*cmd:\s*"(.*)"\}\s*$')
 
+
+# ── dữ liệu ──────────────────────────────────────────────────────────────────
 
 def pi_marks(z) -> Tuple[np.ndarray, np.ndarray]:
     """(giờ cạnh µs, nửa khoảng kẹp µs) của các frame có marker = 1 trong frames.npz."""
@@ -69,14 +88,130 @@ def pi_marks(z) -> Tuple[np.ndarray, np.ndarray]:
     return (p0 + p1) / 2000.0, (p1 - p0) / 2000.0
 
 
-def esp_marks(events, run: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
-    """(giờ ESP32 µs, giờ Pi nhận dòng t_rx µs) của các cạnh M, theo giờ ESP32; `events` = kết quả
-    s06_esp32_check.parse_events."""
-    rows = [r for r in events['T3'] if r['src'] == 'M' and (run is None or r['run'] == run)]
-    rows.sort(key=lambda r: r['t_us'])
-    return (np.array([r['t_us'] for r in rows], dtype=np.float64),
-            np.array([r['t_rx'] for r in rows], dtype=np.float64))
+def esp_marks(events, run: Optional[int] = None) -> np.ndarray:
+    """Giờ ESP32 (µs) của các cạnh M theo gseq; `events` = kết quả s06_esp32_check.parse_events."""
+    rows = sorted((r for r in events['T3'] if r['src'] == 'M' and (run is None or r['run'] == run)),
+                  key=lambda r: r['gseq'])
+    return np.array([r['t_us'] for r in rows], dtype=np.float64)
 
+
+def read_commands(path: str) -> List[Tuple[int, str]]:
+    """(giờ Pi µs sau sendto, lệnh) của mục `commands:` trong capture.yaml của s06_logger.py."""
+    out, inside = [], False
+    with open(path, encoding='utf-8') as f:
+        for line in f:
+            if line.startswith('commands:'):
+                inside = True
+                continue
+            if inside:
+                m = CMD_RE.match(line)
+                if m:
+                    out.append((int(m.group(1)), m.group(2).replace('\\"', '"').replace('\\\\', '\\')))
+                elif not line.startswith(' '):
+                    inside = False
+    return out
+
+
+def anchor(events, commands: Sequence[Tuple[int, str]], t_rx_ref: Optional[int] = None) -> Optional[dict]:
+    """Khoảng kẹp của OFFSET từ một `#ack,ok=1` của START: lo < OFFSET + t_ack < hi. Chọn #ack START ok mới nhất
+    có t_rx ≤ t_rx_ref + 2 s (t_rx_ref = t_rx của #run_start lượt chọn), không có t_rx_ref thì #ack đầu tiên.
+    Lệnh gửi = lệnh START cuối cùng gửi trước t_rx của #ack. None = không có cặp nào."""
+    acks = []
+    for r in events['text']:
+        if r['name'] != 'ack' or r['kv'].get('ok') != '1' or not r['kv'].get('cmd', '').startswith('START'):
+            continue
+        try:
+            acks.append((int(r['t_rx']), int(r['kv']['t_us'])))
+        except (KeyError, ValueError):
+            continue
+    if t_rx_ref is not None:
+        acks = [a for a in acks if a[0] <= t_rx_ref + 2_000_000][-1:]
+    else:
+        acks = acks[:1]
+    for t_rx, t_ack in acks:
+        sent = [t for t, c in commands if c.startswith('START') and t <= t_rx]
+        if not sent:
+            continue
+        lo, hi = sent[-1] - SEND_SLACK_US - t_ack, t_rx - t_ack
+        return dict(t_ack_esp=t_ack, t_rx=t_rx, t_sent=sent[-1], lo=float(lo), hi=float(hi), width=float(hi - lo))
+    return None
+
+
+def loop_latency(t3_rows: Sequence[dict]) -> dict:
+    """Trễ O → L (µs) từ dòng T3 của MỘT lượt (T3C-7): mỗi O phải có đúng một L cùng mức trước O kế; O cuối cùng
+    của lượt được phép thiếu L (lượt tắt ngay sau O). Đếm lỗi: O thiếu L, L không có O, L sai mức."""
+    ev = sorted((r for r in t3_rows if r['src'] in 'OL'), key=lambda r: r['gseq'])
+    lat: List[float] = []
+    o_no_l = l_no_o = l_bad = 0
+    pend = None
+    for r in ev:
+        if r['src'] == 'O':
+            if pend is not None:
+                o_no_l += 1
+            pend = r
+        elif pend is None:
+            l_no_o += 1
+        elif r['lvl'] != pend['lvl']:
+            l_bad += 1
+            pend = None
+        else:
+            lat.append(r['t_us'] - pend['t_us'])
+            pend = None
+    out = dict(n=len(lat), o_without_l=o_no_l, l_without_o=l_no_o, l_wrong_level=l_bad,
+               last_o_open=pend is not None, min_us=None, median_us=None, max_us=None, spread_us=None)
+    if lat:
+        a = np.array(lat, dtype=np.float64)
+        out.update(min_us=float(a.min()), median_us=float(np.median(a)), max_us=float(a.max()),
+                   spread_us=float(a.max() - a.min()))
+    out['ok'] = bool(lat) and not (o_no_l or l_no_o or l_bad)
+    return out
+
+
+def gseq_complete(rows: Sequence[dict], marks: dict) -> dict:
+    """T3C-11: mọi gseq trong (t3_g0; t3_g1] của #run_stats phải có đúng một dòng T3 của lượt, và không dòng T3
+    nào của lượt nằm ngoài khoảng đó."""
+    kv = marks.get('run_stats', {}).get('kv', {})
+    try:
+        g0, g1 = int(kv['t3_g0']), int(kv['t3_g1'])
+    except (KeyError, ValueError):
+        return dict(ok=False, why='#run_stats không có t3_g0/t3_g1: không chứng minh được luồng T3 đủ',
+                    expected=None, missing=None, dups=None, outside=None)
+    got = [r['gseq'] for r in rows]
+    inr = [g for g in got if g0 < g <= g1]
+    missing = (g1 - g0) - len(set(inr))
+    dups = len(inr) - len(set(inr))
+    outside = len(got) - len(inr)
+    ok = missing == 0 and dups == 0 and outside == 0
+    return dict(ok=ok, expected=g1 - g0, missing=missing, dups=dups, outside=outside,
+                why='' if ok else f'luồng T3 của lượt: thiếu {missing}, trùng {dups}, ngoài khoảng {outside} '
+                                  f'(gseq ({g0}; {g1}])')
+
+
+def loop_cal(path: str, run: Optional[int] = None) -> dict:
+    """Hiệu chuẩn trễ ISR từ lượt hồ sơ heavy (spec mục 4.1): loop_latency của lượt đó + điều kiện N ≥ 1 000,
+    hồ sơ heavy, luồng gseq của lượt đủ. `ok` = dùng được. RunProblem / ValueError khi không chọn được lượt."""
+    marks = stm.run_marks(path, run)
+    stm.require_run(marks)
+    kv = marks['run_start']['kv']
+    rid = int(kv['run'])
+    ev = chk.parse_events(chk.read_raw(path))
+    rows = [r for r in ev['T3'] if r['run'] == rid]
+    res = loop_latency(rows)
+    res.update(path=path, run=rid, profile=kv.get('profile'), gseq=gseq_complete(rows, marks))
+    why = []
+    if kv.get('profile') != 'heavy':
+        why.append(f"hồ sơ {kv.get('profile')!r}, cần heavy (đủ tải)")
+    if res['n'] < LOOP_CAL_MIN:
+        why.append(f"{res['n']} cặp O → L < {LOOP_CAL_MIN}")
+    if not res['ok']:
+        why.append('cặp O → L lỗi (O thiếu L, L thừa hay sai mức)')
+    if not res['gseq']['ok']:
+        why.append(res['gseq']['why'])
+    res['ok'], res['why'] = not why, why
+    return res
+
+
+# ── ghép ─────────────────────────────────────────────────────────────────────
 
 def _fit(e: Sequence[float], p: Sequence[float]) -> Tuple[float, float]:
     e = np.asarray(e, dtype=np.float64)
@@ -88,32 +223,10 @@ def _fit(e: Sequence[float], p: Sequence[float]) -> Tuple[float, float]:
     return float(a0 - b * e0), float(b)
 
 
-def coarse_offset(p: np.ndarray, e: np.ndarray, e_rx: np.ndarray) -> Optional[float]:
-    """Độ lệch thô o (t_pi ≈ t_esp + o). Cạnh 10 Hz cách đều nên không ghép được theo khoảng cách (mọi bội 100 ms
-    đều khớp); neo bằng giờ Pi nhận dòng (`t_rx`, `time.monotonic_ns` của s06_logger chạy trên chính Pi, cùng
-    đồng hồ với frames.npz): t_rx = giờ cạnh trên Pi + trễ gửi (≥ 0), nên o0 = phân vị 1 % của t_rx − t_esp. Rồi
-    tinh: trung vị của (cạnh Pi gần nhất − (t_esp + o0)) trên các cạnh lệch < COARSE_WIN_US. None = không cạnh
-    nào khớp (logger không chạy trên Pi, hay hai bên không cùng lượt)."""
-    if len(e) == 0 or len(p) == 0:
-        return None
-    o0 = float(np.percentile(e_rx - e, 1.0))
-    q = e[:COARSE_N] + o0
-    idx = np.clip(np.searchsorted(p, q), 1, len(p) - 1) if len(p) > 1 else np.zeros(len(q), int)
-    near = np.where(np.abs(p[idx] - q) <= np.abs(p[idx - 1] - q), p[idx], p[idx - 1]) if len(p) > 1 else p[idx]
-    d = near - q
-    d = d[np.abs(d) < COARSE_WIN_US]
-    if len(d) == 0:
-        return None
-    return o0 + float(np.median(d))
-
-
-def match(p: np.ndarray, e: np.ndarray, e_rx: np.ndarray, tol_us: float = MATCH_TOL_US) -> List[Tuple[int, int]]:
-    """Cặp (chỉ số Pi, chỉ số ESP32), p và e tăng dần: độ lệch thô (coarse_offset), rồi ghép tham lam theo thứ tự
-    Pi, mỗi cạnh ESP32 dùng một lần, khớp lại affine sau mỗi REFIT_EVERY cặp (trôi tần số thạch anh)."""
-    o = coarse_offset(p, e, e_rx)
-    if o is None:
-        return []
-    a, b = o, 1.0                                # t_pi = a + b·t_esp, ban đầu b = 1
+def match(p: np.ndarray, e: np.ndarray, off0: float, tol_us: float = MATCH_TOL_US) -> List[Tuple[int, int]]:
+    """Cặp (chỉ số Pi, chỉ số ESP32), p và e tăng dần, từ độ lệch thô off0 (t_pi ≈ t_esp + off0): ghép tham lam
+    theo thứ tự Pi, mỗi cạnh ESP32 dùng một lần, khớp lại affine sau mỗi REFIT_EVERY cặp."""
+    a, b = off0, 1.0
     pairs: List[Tuple[int, int]] = []
     used = set()
     for i in range(len(p)):
@@ -131,35 +244,57 @@ def match(p: np.ndarray, e: np.ndarray, e_rx: np.ndarray, tol_us: float = MATCH_
     return pairs
 
 
-def sync(p: np.ndarray, half: np.ndarray, e: np.ndarray, e_rx: np.ndarray) -> dict:
-    """Khớp affine t_pi = offset + rate·t_esp trên các cặp cạnh; p, e tăng dần."""
-    pairs = match(p, e, e_rx)
-    out = dict(n_pi=int(len(p)), n_esp=int(len(e)), n_pairs=len(pairs), offset_us=None, rate=None,
-               res_max_us=None, res_rms_us=None, half_bracket_max_us=None, delta_sync_us=None,
-               esp_unmatched=None, pi_unmatched_in_span=None, span_s=None)
+def sync(p: np.ndarray, half: np.ndarray, e: np.ndarray, anc: Optional[dict],
+         loop_max_us: Optional[float] = None) -> dict:
+    """Khớp affine t_pi = offset + rate·t_esp trên các cặp cạnh; p, e tăng dần; anc = anchor(); loop_max_us = trễ
+    O → L lớn nhất của lượt hiệu chuẩn (None: delta_sync_us không tính được)."""
+    out = dict(n_pi=int(len(p)), n_esp=int(len(e)), n_pairs=0, anchor=anc, anchor_ok=False, offset_us=None,
+               rate=None, res_max_us=None, res_rms_us=None, half_bracket_max_us=None, delta_sync_isr_us=None,
+               delta_sync_us=None, loop_max_us=loop_max_us, esp_unmatched=None, pi_unmatched_in_span=None,
+               span_s=None, problem='')
+    if anc is None:
+        out['problem'] = 'không neo được: thiếu #ack START ok=1 hay lệnh START trong capture.yaml'
+        return out
+    if anc['width'] > ANCHOR_MAX_US:
+        out['problem'] = f"khoảng kẹp neo rộng {anc['width'] / 1000:.1f} ms > {ANCHOR_MAX_US / 1000:.0f} ms"
+        return out
+    if len(p) == 0 or len(e) == 0:
+        out['problem'] = 'không có cạnh'
+        return out
+    pairs = match(p, e, 0.5 * (anc['lo'] + anc['hi']))
+    out['n_pairs'] = len(pairs)
     if len(pairs) < MIN_PAIRS:
+        out['problem'] = f'{len(pairs)} cặp < {MIN_PAIRS}'
         return out
     pi_i = np.array([i for i, _ in pairs])
     es_i = np.array([j for _, j in pairs])
     a, b = _fit(e[es_i], p[pi_i])
     res = p[pi_i] - (a + b * e[es_i])
+    t_ack_pi = a + b * anc['t_ack_esp']
+    anc_ok = (anc['t_sent'] - SEND_SLACK_US - MATCH_TOL_US) <= t_ack_pi <= (anc['t_rx'] + MATCH_TOL_US)
     lo, hi = a + b * e.min(), a + b * e.max()
     in_span = np.nonzero((p >= lo - MATCH_TOL_US) & (p <= hi + MATCH_TOL_US))[0]
-    out.update(offset_us=a, rate=b, res_max_us=float(np.max(np.abs(res))),
+    out.update(anchor_ok=bool(anc_ok), offset_us=a, rate=b, res_max_us=float(np.max(np.abs(res))),
                res_rms_us=float(np.sqrt(np.mean(res ** 2))), half_bracket_max_us=float(np.max(half[pi_i])),
                esp_unmatched=int(len(e) - len(pairs)),
                pi_unmatched_in_span=int(len(set(in_span.tolist()) - set(pi_i.tolist()))),
-               span_s=float((e.max() - e.min()) / 1e6))
-    out['delta_sync_us'] = out['res_max_us'] + out['half_bracket_max_us']
+               span_s=float((e.max() - e.min()) / 1e6), t_ack_pi_us=float(t_ack_pi))
+    out['delta_sync_isr_us'] = out['res_max_us'] + out['half_bracket_max_us']
+    if loop_max_us is not None:
+        out['delta_sync_us'] = out['delta_sync_isr_us'] + float(loop_max_us)
+    if not anc_ok:
+        out['problem'] = 'affine đặt giờ #ack START ngoài khoảng kẹp: ghép không đáng tin'
     out['_pairs'] = pairs
     return out
 
 
 def verdict(s: dict) -> Tuple[int, str]:
-    if s['n_pairs'] < MIN_PAIRS:
+    if s['problem'] or s['n_pairs'] < MIN_PAIRS:
         return 3, 'thieu_bang_chung'
     if s['esp_unmatched'] or s['pi_unmatched_in_span']:
         return 1, ''
+    if s['delta_sync_us'] is None:
+        return 3, 'thieu_bang_chung'
     return 0, ''
 
 
@@ -167,9 +302,13 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description='Đồng hồ ESP32 ↔ RPi5 từ chân đánh dấu (S06 T3)')
     ap.add_argument('--frames', required=True, help='frames.npz của run_hil.py --marker … --frame-log')
     ap.add_argument('--esp32-events', required=True, help='esp32_events.txt của s06_logger.py')
+    ap.add_argument('--capture', default=None, help='capture.yaml của s06_logger.py (mặc định cùng thư mục)')
     ap.add_argument('--run', type=int, default=None, help='chỉ cạnh M có run = N; bỏ trống = mọi cạnh')
+    ap.add_argument('--loop-cal', default=None, help='esp32_events.txt của lượt heavy có cặp O → L (spec 4.1)')
+    ap.add_argument('--loop-cal-run', type=int, default=None)
     ap.add_argument('--out', required=True, help='file JSON kết quả')
     a = ap.parse_args(argv)
+    cal = None
     try:
         z = np.load(a.frames)
         p, half = pi_marks(z)
@@ -177,24 +316,40 @@ def main(argv=None) -> int:
         if not raw:
             raise ValueError(f'{a.esp32_events}: không có dòng nào')
         ev = chk.parse_events(raw)
-        e, e_rx = esp_marks(ev, a.run)
+        e = esp_marks(ev, a.run)
         if len(e) and np.any(np.diff(e) <= 0):
             raise ValueError('giờ ESP32 của cạnh M không tăng (ESP32 khởi động lại giữa file?): chọn --run')
+        cap = a.capture or os.path.join(os.path.dirname(os.path.abspath(a.esp32_events)), 'capture.yaml')
+        cmds = read_commands(cap) if os.path.exists(cap) else []
+        t_ref = None
+        if a.run is not None:
+            mk = stm.run_marks(a.esp32_events, a.run)
+            stm.require_run(mk)
+            t_ref = int(mk['run_start']['t_rx'])
+        anc = anchor(ev, cmds, t_ref)
+        if a.loop_cal:
+            cal = loop_cal(a.loop_cal, a.loop_cal_run)
+    except stm.RunProblem as ex:
+        return stm.report_run_problem(ex)
     except (OSError, ValueError, KeyError) as ex:
         print(f'lỗi đầu vào: {ex}', file=sys.stderr)
         return 2
-    s = sync(p, half, e, e_rx)
+    s = sync(p, half, e, anc, cal['max_us'] if cal and cal['ok'] else None)
     ma, ly = verdict(s)
     res = {k: v for k, v in s.items() if not k.startswith('_')}
-    res.update(run=a.run, frames=a.frames, esp32_events=a.esp32_events, ma=ma, ly_do=ly or None)
+    res.update(run=a.run, frames=a.frames, esp32_events=a.esp32_events, loop_cal=cal, ma=ma, ly_do=ly or None)
     with open(a.out, 'w', encoding='utf-8') as f:
-        json.dump(res, f, ensure_ascii=False, indent=1)
-    print(f"cạnh Pi {s['n_pi']}, cạnh ESP32 {s['n_esp']}, cặp {s['n_pairs']}")
+        json.dump(res, f, ensure_ascii=False, indent=1, default=str)
+    print(f"cạnh Pi {s['n_pi']}, cạnh ESP32 {s['n_esp']}, cặp {s['n_pairs']}" +
+          (f"; {s['problem']}" if s['problem'] else ''))
+    if cal is not None and not cal['ok']:
+        print('hiệu chuẩn trễ ISR không dùng được: ' + '; '.join(cal['why']))
     if s['offset_us'] is not None:
         print(f"t_pi_us = {s['offset_us']:.3f} + {s['rate']:.9f} · t_esp_us; phần dư lớn nhất {s['res_max_us']:.1f} µs, "
-              f"delta_sync {s['delta_sync_us']:.1f} µs; ESP32 không cặp {s['esp_unmatched']}, "
-              f"Pi không cặp trong khoảng {s['pi_unmatched_in_span']}")
-        print(f"--clock-affine {s['offset_us']:.3f} {s['rate']:.9f} --delta-sync-us {s['delta_sync_us']:.1f}")
+              f"delta_sync_isr {s['delta_sync_isr_us']:.1f} µs, delta_sync {s['delta_sync_us']} µs; "
+              f"ESP32 không cặp {s['esp_unmatched']}, Pi không cặp trong khoảng {s['pi_unmatched_in_span']}")
+        if s['delta_sync_us'] is not None:
+            print(f"--clock-affine {s['offset_us']:.3f} {s['rate']:.9f} --delta-sync-us {s['delta_sync_us']:.1f}")
     print(f'#ket_qua,ma={ma}' + (f',ly_do={ly}' if ly else ''))
     return ma
 
