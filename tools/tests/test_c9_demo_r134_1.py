@@ -276,3 +276,58 @@ def test_so_h_lost_runs_count_in_the_n3_streak(demo_ds, tmp_path):
                                                         gate=rl.floor_gate(rl.fake_gate(), t_done=(10.0, None))))
     with pytest.raises(rl.LogError, match='lost runs in a row'):
         rl.begin(demo_ds, 'FAKE-F2', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'final', gain_set='A-PID/G00')
+
+
+# ── B8S2-1, B8S2-2 (Codex B8-SPEC round 2; S05 v3.38 4.3, Liam 17/11 at THESIS_B8 "Duyệt, áp luôn (Recommended)") ──
+def test_b8s2_1_end_refuses_a_score_final_file(demo_ds, tmp_path):
+    rl.begin(demo_ds, 'FAKE-X', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G05')
+    rl.step(demo_ds, 'run')
+    sf = _score_final(tmp_path / 'sf.json', 'khong_dat', 'dat')
+    qd = str(tmp_path / 'q')
+    rl.fake_queries('ab', folder=qd)
+    code = rl.main(['--dataset', demo_ds, 'end', '--outcome', 'chua_ket_luan', '--completed', '1',
+                    '--results-dir', qd, '--gate-json', sf, '--query-before', os.path.join(qd, 'gain_query_before.txt'),
+                    '--query-after', os.path.join(qd, 'gain_query_after.txt')])
+    assert code != 0
+    assert rl._load_open(demo_ds)                                       # the run is still open, nothing logged
+
+
+def _fourth_final_run(ds, tmp_path):
+    d = str(tmp_path / 'f1_4')
+    qs = tuple(T.glc.read_query(p) for p in fr.write_final_run(d, 'HW', GAIN))
+    rl.begin(ds, 'FAKE-F1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'final', gain_set='A-PID/G00')
+    rl.step(ds, 'run')
+    return rl.end(ds, 'dat', completed=1, e_perp_max=0.1, results_dir=d, gate=rl.floor_gate(rl.fake_gate()),
+                  queries=qs)
+
+
+def test_b8s2_2_run_after_a_stop_seen_only_at_the_comparison(demo_ds, tmp_path):
+    rows = _rows(os.path.join(demo_ds, rl.TUNING))
+    fin = {r['run_outcome']: r['run_uid'] for r in rows if r['stage'] == 'final' and r['platform'] == 'HW'}
+    late = _fourth_final_run(demo_ds, tmp_path)                         # taken before the comparison: no stop yet
+    rl.so_h(demo_ds, fin['dat'], _score_final(tmp_path / 'h.json', 'dat', 'hong_he_do',
+                                              gate=rl.floor_gate(rl.fake_gate())))
+    rl.so_h(demo_ds, fin['chua_ket_luan'], _score_final(tmp_path / 'i.json', 'chua_ket_luan', 'hong_he_do',
+                                                        gate=rl.floor_gate(rl.fake_gate(), t_done=(10.0, None))))
+    after = {r['run_uid']: r for r in rl.apply_so_h(rl.live_rows(rl.read_rows(os.path.join(demo_ds, rl.TUNING))),
+                                                    demo_ds)}
+    assert after[late['run_uid']].get(rl.RETRO_FLAG) == '1'
+    s = {r['campaign']: r for r in _summary(demo_ds)}['A-PID']        # no error: the late run is kept, flagged
+    assert s[f'{rl.RETRO_FLAG}_n'] == '1'
+    assert s.get('final_O1-F05@0.5_n_valid', '0') == '0' and s['final_O1-F05@0.5_invalid'] == '3'
+    assert s['N_HW'] == '7'                                             # 3 tune + 3 final + the late run
+    out = str(tmp_path / 'tbl')
+    os.makedirs(out)
+    assert T.main(['table', '--dataset', demo_ds, '--out', out]) == 0
+    assert late['run_uid'] not in {r['run_uid'] for r in _rows(os.path.join(out, 'S05_final_runs.csv'))}
+    with pytest.raises(rl.LogError, match='lost runs in a row'):        # and no run after it any more
+        rl.begin(demo_ds, 'FAKE-F2', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'final', gain_set='A-PID/G00')
+
+
+def test_b8s2_2_a_stop_seen_at_the_time_still_refuses_a_later_run(tmp_path):
+    rows = [dict(run_uid=f'S:{k}', stage='final', campaign='A-PID', gain_set_id='A-PID/G00', platform='HW',
+                 trajectory='O1-F05', speed_mps='0.5', run_outcome=o, fail_cause='x' if o == 'hong_he_do' else '')
+            for k, o in enumerate(('hong_he_do', 'hong_he_do', 'hong_he_do', 'dat'), start=1)]
+    assert not any(r.get(rl.RETRO_FLAG) for r in rl.mark_retro_stops(rows))
+    with pytest.raises(rl.LogError, match='no run after that'):
+        rl._final_stops(rows)

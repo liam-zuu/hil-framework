@@ -472,6 +472,10 @@ def load_runs(dataset, score_name, esp32_name, query_before_name='gain_query_bef
     runs, bad = [], []
     for r in rows:
         plat = next((p for p in PLATFORMS if r.get('platform') == p[0] and r.get('stage') == p[2]), None)
+        if plat is not None and r.get(rl.RETRO_FLAG):         # S05 v3.38 4.3 (B8S2-2): not in the final table
+            problems.append(f"run {r.get('run_uid')}: thu sau diem dung N = 3 lo ra khi so clip H "
+                            f'({rl.RETRO_FLAG}), khong vao bang (S05 v3.38 4.3)')
+            continue
         if plat is None:
             continue
         ctrl, task = r.get('controller', ''), r.get('trajectory', '')

@@ -91,6 +91,7 @@ SO_H_COLS = ['run_uid', 'outcome_tam', 'outcome_sau', 'flags', 'vuot', 'D_H_mm',
              'score_final_sha256', 'ghi_luc']
 SO_H_FLAGS = ('calib_drift', 'calib_drift_split', 'thieu_H1')
 FAIL_SO_H = 'so_clip_h'                  # fail cause of a run that became hong_he_do at the comparison
+RETRO_FLAG = 'sau_dung_hoi_to'           # S05 v3.38 4.3 (B8S2-2): run after a stop the comparison showed
 
 # R134 (1) (deferred at R134 round 4, R134C4-1; CODE 16/11 to CODE_C13, Liam 16/11 at CODE "Sửa demo + gộp R134(1)
 # (Recommended)"; Liam 16/11 at CODE_C13, hop chon, nguyen van: "Ghi đường dẫn + SHA (Recommended)"): 'end' writes
@@ -917,6 +918,17 @@ def so_h(ds: str, run_uid: str, score_final: str) -> dict:
     return row
 
 
+def is_score_final(path: str) -> bool:
+    """B8S2-1: True when the file is an output of c7_calib_drift.py gop (it carries the 'calib_drift' block); its gate
+    is that of the H0 scoring while its outcome may be the one after the comparison, so it goes to so-h, not end."""
+    try:
+        with open(path, encoding='utf-8') as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return False
+    return isinstance(d, dict) and 'calib_drift' in d
+
+
 def apply_so_h(tun: List[dict], ds: str) -> List[dict]:
     """The live tuning rows with the outcome after the clip H comparison (SO_H rows, checked again: run once, in the
     log, car run of a campaign, provisional outcome as logged, rule of O1 §4, score_final file unchanged). A run that
@@ -954,6 +966,34 @@ def apply_so_h(tun: List[dict], ds: str) -> List[dict]:
     missing = sorted(set(by_uid) - known)
     if missing:
         raise LogError(f'{SO_H}: runs {missing} not in the tuning log')
+    return mark_retro_stops(out)
+
+
+def mark_retro_stops(tun: List[dict]) -> List[dict]:
+    """S05 v3.38 4.3 (B8S2-2; Liam 17/11 at THESIS_B8 "Duyệt, áp luôn (Recommended)"): a run taken after a stop that
+    only the comparison at the end of the session showed (the N = 3 lost-run streak of 4.6 complete only with a run
+    that became hong_he_do at so-h, fail cause FAIL_SO_H) stays in the log with flag RETRO_FLAG: out of the
+    denominator, blocks and the final table; its time and N_HW still count. A stop seen without so-h keeps 4.6 (a run
+    after it is an error). Rows are copies where flagged."""
+    groups = defaultdict(list)
+    for i, r in enumerate(tun):
+        if r.get('stage') in ('final', 'final_hil'):
+            groups[final_key(r)].append(i)
+    out = list(tun)
+    for idx in groups.values():
+        streak, retro, stopped = 0, False, False
+        for i in idx:
+            r = out[i]
+            if stopped:
+                if retro:
+                    out[i] = dict(r, **{RETRO_FLAG: '1'})
+                continue
+            if r.get('run_outcome') == 'hong_he_do':
+                streak += 1
+                retro = retro or r.get('fail_cause') == FAIL_SO_H
+            else:
+                streak, retro = 0, False
+            stopped = streak >= FINAL_LOST_N
     return out
 
 
@@ -1546,6 +1586,8 @@ def _final_stops(tun: List[dict]) -> set:
         # S315-R2-3: the order of the log rows (as map_refusals, S315-4, and final_lost_streak), not wall_start
         lost = 0
         for i, r in enumerate(runs):
+            if r.get(RETRO_FLAG):                      # S05 v3.38 4.3: kept, out of the streak and the counts
+                continue
             if key in stopped:
                 raise LogError(f"{r.get('run_uid')}: {key[4]}@{key[5]} of {key[2] or key[1]} stopped after "
                                f"{FINAL_LOST_N} lost runs in a row (§4.6), no run after that")
@@ -1699,7 +1741,9 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
             for t in (t0, t1):
                 if t:
                     times[tgt].append(t)
-        if stage in ('final', 'final_hil'):
+        if stage in ('final', 'final_hil') and r.get(RETRO_FLAG):     # S05 v3.38 4.3: time, N_HW above only
+            finals[c][f'{RETRO_FLAG}_n'] += 1
+        elif stage in ('final', 'final_hil'):
             task, o, sp = r.get('trajectory', ''), r.get('run_outcome', ''), r.get('speed_mps', '')
             gs = r.get('gain_set_id', '')
             if stage == 'final':
@@ -2127,6 +2171,10 @@ def main(argv=None) -> int:
             if a.query_before or a.query_after:
                 import gain_line_check as glc            # R134C3-3: the checks of the two answers, as the scorers do
                 boots = dict(queries=(glc.read_query(a.query_before), glc.read_query(a.query_after)))   # R134C4-1
+            if a.gate_json and is_score_final(a.gate_json):                       # B8S2-1 (S05 v3.37 4.3)
+                raise LogError(f'--gate-json {a.gate_json!r} is an output of c7_calib_drift.py gop (block calib_drift): '
+                               'end logs the provisional outcome with the H0 scoring (score.json of the run), then '
+                               'so-h --run-uid <run> --score-final <this file> after the clip H comparison')
             row = end(ds, a.outcome, a.completed, a.e_perp_max, a.fail_cause, a.results_dir, a.notes,
                       gate=read_gate_json(a.gate_json) if a.gate_json else None,
                       gate_sha256=sha256_file(a.gate_json) if a.gate_json else '', **boots)
