@@ -16,13 +16,16 @@ Checks (all must hold for ok):
   4. every frame k of the log, inside and outside the windows (ARM, STOPPING, END tail too): every byte
      sent = expected_sent(), built here from the schedule, t0, the stop step and mosi_true only, with its
      own exact decimal arithmetic for gyro_scale (written apart from rpi5/fault_schedule.FramePatcher on
-     purpose: no shared state, no ring buffer, no shared rounding, FI1-1);
+     purpose: no shared state, no ring buffer, no shared rounding, FI1-1); batch 2 ibus_loss: bit 4 of
+     byte 20 (protocol.CMD_IBUS_OFF) in its window;
   5. the events, not_run, cut, complete of the manifest = those expected from the schedule, t0, the stop
      step and the number of frames; events typed strictly and in step order (FI1-7);
   6. MISO recomputed from the miso array (L50, as hil_node: frames from MISO_SKIP_FRAMES on): no bad CRC, no
      empty frame; the manifest counts must agree (FI1-8);
   7. truth self-check (FI1-9): seq byte of every true frame = k mod 256; with the plant IMU and no noise,
-     int16 yaw = int16 theta and gz = wz within half a step of each scale;
+     int16 yaw = int16 theta and gz = wz within half a step of each scale; batch 2 (Codex FQ1-1): no true
+     frame has the iBUS-off bit (byte 20 bit 4, protocol.CMD_IBUS_OFF; hil_node writes only the SWA bit there),
+     so a bit 4 put in both arrays outside a window cannot pass as "true";
   8. step log (FI1-10, FI2-6): every step of the frame log present once and in rising order, every miss
      0 or 1 and none 1, its .json rows = CSV rows and lost_or_torn, overflow present as int 0;
   9. the run ended the normal way (FI1-4, FI4-1): id_confirmed True (a MISO carried the run_id back, RS-4);
@@ -67,8 +70,8 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, '..', 'rpi5'))
 from fault_schedule import FAULT_IMU_LOSS, file_sha256, parse, rows_as_json   # noqa: E402
-from protocol import (FRAME_SIZE, IMU_RANGES, MISO_CRC_BAD, MISO_EMPTY, OFS_FAULT, OFS_IMU_ACC, OFS_IMU_GZ,   # noqa: E402
-                      OFS_IMU_YAW, OFS_SEQ, STATE_RANGES, miso_check)
+from protocol import (CMD_IBUS_OFF, FRAME_SIZE, IMU_RANGES, MISO_CRC_BAD, MISO_EMPTY, OFS_FAULT,   # noqa: E402
+                      OFS_IMU_ACC, OFS_IMU_GZ, OFS_IMU_YAW, OFS_SEQ, STATE_RANGES, miso_check)
 from hil_node import MISO_SKIP_FRAMES                                          # noqa: E402
 from run_lifecycle import _PHASES as PHASES                                    # noqa: E402
 
@@ -114,7 +117,8 @@ def window_on(row, k, t0, stop) -> bool:
 
 def expected_sent(rows, k, t0, stop, true_frames) -> bytes:
     """The frame k must be: true frame k, then enc_loss, delay (IMU bytes of true frame k - d), gyro scale,
-    loss bit, in this order."""
+    loss bit, in this order; batch 2: the iBUS-off bit (protocol.CMD_IBUS_OFF, byte 20 bit 4) of an
+    ibus_loss row, the other bits of byte 20 (SWA, IMU loss) kept."""
     b = bytearray(bytes(true_frames[k]))
     on = [r for r in rows if window_on(r, k, t0, stop)]
     for r in on:
@@ -134,6 +138,9 @@ def expected_sent(rows, k, t0, stop, true_frames) -> bytes:
     for r in on:
         if r.fault == 'imu_loss':
             b[OFS_FAULT] |= FAULT_IMU_LOSS
+    for r in on:
+        if r.fault == 'ibus_loss':
+            b[OFS_FAULT] |= CMD_IBUS_OFF
     return bytes(b)
 
 
@@ -254,6 +261,8 @@ def truth_self_check(man, true):
     """FI1-9 (design 8.1 step 5): mismatches of the invariants of the true frames."""
     bad_seq = [k for k in range(len(true)) if int(true[k][OFS_SEQ]) != k & 0xFF]
     out = dict(seq_bad=len(bad_seq), first_seq_bad=bad_seq[0] if bad_seq else None, imu_checked=False)
+    bad_ibus = [k for k in range(len(true)) if int(true[k][OFS_FAULT]) & CMD_IBUS_OFF]    # Codex FQ1-1
+    out.update(ibus_bit_bad=len(bad_ibus), first_ibus_bit_bad=bad_ibus[0] if bad_ibus else None)
     if man.get('imu_source') == 'plant' and man.get('imu_noise') is None:
         g, w = IMU_RANGES[0] / 32767.0, STATE_RANGES[9] / 32767.0
         tol = 0.5 * g + 0.5 * w + 1e-9
@@ -584,7 +593,7 @@ def check(npz_path: str, sched_path: str, step_log: str = None) -> dict:
     if checked != max(0, n - MISO_SKIP_FRAMES):                                  # FI2-5
         fails.append(f'MISO: {checked} frames checked, the run has {max(0, n - MISO_SKIP_FRAMES)}')
     sc = truth_self_check(man, true)
-    if sc['seq_bad'] or sc.get('yaw_theta_bad') or sc.get('gz_wz_bad'):
+    if sc['seq_bad'] or sc['ibus_bit_bad'] or sc.get('yaw_theta_bad') or sc.get('gz_wz_bad'):
         fails.append(f'true frames fail the self-check: {sc}')
     if step_log:
         tl = step_log_check(step_log, n)

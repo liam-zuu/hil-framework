@@ -456,7 +456,8 @@ def test_truth_self_check_plant_imu_without_noise(tmp_path):
     steps = write_step_log(str(tmp_path / 'st.csv'), 200)
     r = fc.check(p, str(csv_), steps)
     assert r['ok'], r['fails']
-    assert r['self_check'] == dict(seq_bad=0, first_seq_bad=None, imu_checked=True, yaw_theta_bad=0, gz_wz_bad=0)
+    assert r['self_check'] == dict(seq_bad=0, first_seq_bad=None, imu_checked=True, yaw_theta_bad=0, gz_wz_bad=0,
+                                   ibus_bit_bad=0, first_ibus_bit_bad=None)       # Codex FQ1-1, FQ2-1
 
     def yaw(d, m):
         for a in ('mosi', 'mosi_true'):
@@ -626,3 +627,63 @@ def test_cli_exit_codes(run, tmp_path):
     r = subprocess.run([sys.executable, tool, p2, '--faults', csv_, '--step-log', steps],
                        capture_output=True, text=True, timeout=60)
     assert r.returncode == 2 and 'Traceback' not in r.stderr, r.stderr
+
+
+# ── batch 2: ibus_loss, bit 4 of byte 20 (design 2026-11-15 section 7.1 item 1) ─
+IBUS_BODY = 'I1,ibus_loss,ibus,60,180,\nL1,imu_loss,imu,150,220,\nE1,enc_loss,RL,170,190,\nI2,ibus_loss,ibus,300,330,\n'
+
+
+def test_ibus_patcher_agrees_with_independent_reference():
+    true = frames(400, seed=5)
+    rows = fs.parse(HEAD + IBUS_BODY)
+    fs.check(rows, 400, 'plant')
+    for t0, stop in ((0, None), (13, None), (13, 170), (13, 320)):
+        pa = fs.FramePatcher(fs.Schedule(tuple(rows)))
+        for k, f in enumerate(true):
+            if k == t0:
+                pa.start(k)
+            if stop is not None and k == stop:
+                pa.stop(k)
+            assert pa.patch(k, f) == fc.expected_sent(rows, k, t0, stop, true), (t0, stop, k)
+    exp = fc.expected_sent(rows, 160, 0, None, true)
+    assert exp[20] == true[160][20] | 16 | 4 and true[160][20] == 8          # SWA kept, IMU loss and iBUS off
+
+
+def test_ibus_run_passes_and_bit4_tampering_fails(tmp_path):
+    run_ = open_loop(tmp_path, body=IBUS_BODY, name='ibus')
+    r = fc.check(*run_)
+    assert r['ok'], r['fails']
+    sent = np.load(run_[0])['mosi'][:, 20]
+    assert np.flatnonzero(sent & 16).tolist() == list(range(60, 180)) + list(range(300, 330))
+    for name, k, op in (('missing_in', 100, lambda v: v & ~16), ('late_end', 180, lambda v: v | 16),
+                        ('early', 59, lambda v: v | 16), ('second', 329, lambda v: v & ~16)):
+        def edit(d, m, k=k, op=op):
+            d['mosi'][k, 20] = op(int(d['mosi'][k, 20]))
+        q = resave(run_[0], str(tmp_path / f'{name}.npz'), edit)
+        rr = fc.check(q, run_[1], run_[2])
+        assert not rr['ok'] and rr['frames_bad'] == 1, name
+
+
+@pytest.mark.parametrize('k', [0, 59, 180, 399])        # before, between and after the ibus windows
+def test_ibus_bit_in_both_arrays_fails_the_truth_check(tmp_path, k):
+    """Codex FQ1-1: bit 4 put in mosi and mosi_true of one frame outside a window: frames_bad stays 0 (the
+    reference starts from mosi_true), the truth self-check must fail the run."""
+    run_ = open_loop(tmp_path, body=IBUS_BODY, name='ibus2')
+
+    def edit(d, m):
+        d['mosi'][k, 20] |= 16
+        d['mosi_true'][k, 20] |= 16
+    q = resave(run_[0], str(tmp_path / f'both_{k}.npz'), edit)
+    r = fc.check(q, run_[1], run_[2])
+    assert not r['ok'] and r['frames_bad'] == 0
+    assert r['self_check']['ibus_bit_bad'] == 1 and r['self_check']['first_ibus_bit_bad'] == k
+
+
+def test_ibus_bit_in_truth_fails_a_schedule_without_ibus_rows(run, tmp_path):
+    def edit(d, m):
+        d['mosi'][77, 20] |= 16
+        d['mosi_true'][77, 20] |= 16
+    q = resave(run[0], str(tmp_path / 'noibus.npz'), edit)
+    r = fc.check(q, run[1], run[2])
+    assert not r['ok'] and r['self_check']['ibus_bit_bad'] == 1
+    assert fc.check(*run)['self_check']['ibus_bit_bad'] == 0
