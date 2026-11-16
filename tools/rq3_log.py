@@ -911,7 +911,11 @@ def h0_file(r: dict, ds: str) -> str:
     for root, _, names in os.walk(d):
         for n in sorted(names):
             p = os.path.join(root, n)
-            if os.path.isfile(p) and os.path.getsize(p) <= H0_MAX_BYTES and sha256_file(p) == sha:
+            try:                                       # C9D3-1: a file that cannot be read is not the H0 file
+                hit = os.path.isfile(p) and os.path.getsize(p) <= H0_MAX_BYTES and sha256_file(p) == sha
+            except OSError:
+                continue
+            if hit:
                 if not _inside(p, d):
                     raise LogError(f'run {uid}: the H0 scorer file {p} resolves outside the results_dir {d} '
                                    '(a link; C9D-1, C9D2-5)')

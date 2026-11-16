@@ -638,6 +638,22 @@ def test_c9d2_5_h0_file_must_resolve_inside_the_run_folder(demo_ds, monkeypatch)
         rl.so_h(demo_ds, 'FAKE-A1:2', p)
 
 
+def test_c9d3_1_an_unreadable_other_file_does_not_hide_the_h0_file(demo_ds, monkeypatch):
+    d = _row(demo_ds, 'FAKE-A1:2')['results_dir']
+    with open(os.path.join(d, '00_note.txt'), 'w', encoding='utf-8') as f:
+        f.write('x')                                                    # walked before score.json
+    real = rl.sha256_file
+
+    def sha(path):
+        if os.path.basename(path) == '00_note.txt':
+            raise PermissionError(13, 'Permission denied', path)
+        return real(path)
+    monkeypatch.setattr(rl, 'sha256_file', sha)
+    _drop_so_h(demo_ds, 'FAKE-A1:2')
+    r = rl.so_h(demo_ds, 'FAKE-A1:2', _score_final(demo_ds, 'FAKE-A1:2', 1.0))
+    assert r['outcome_sau'] == 'khong_dat'
+
+
 def test_c9d2_6_h0_file_without_the_json_suffix(demo_ds):
     d = _row(demo_ds, 'FAKE-A1:2')['results_dir']
     os.replace(os.path.join(d, 'score.json'), os.path.join(d, 'score_H0'))   # end --gate-json takes any name
