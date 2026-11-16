@@ -712,15 +712,14 @@ def test_dangling_attempt_and_abort_previous(tmp_path, dummy_dll, monkeypatch, f
     assert len(ab) == 1 and (ab[0] / 'fit' / 'coefs.csv').is_file() and 'power loss' in (ab[0] / 'reason.txt').read_text()
     # RSM2-4: the partial files of the run that died stay under aborted/, not committed (named in the note row)
     st = git_out(repo, 'status', '--porcelain', '--untracked-files=all', '--', '05_DATA/results/S04/run01/rsm').split('\n')
-    st = [x for x in st if x.strip() and not x.endswith('/rsm/' + rc.RUN_LOCK)]   # RSM3-3: the lock file stays
+    st = [x for x in st if x.strip()]
     assert st and all(x.startswith('?? ') and '/rsm/aborted/' in x and '/fit/' in x for x in st)
     assert 'fit/coefs.csv' in rows[3]['reason']
     # a committed, done phase moved aside: its removal and its moved copy are committed
     rc.run_phase('opt', str(s04), dummy_dll)
     rc.run_phase('opt', str(s04), dummy_dll, abort_reason='exploratory re-run')
     st2 = [x for x in git_out(repo, 'status', '--porcelain', '--untracked-files=all', '--',
-                                '05_DATA/results/S04/run01/rsm').split('\n')
-           if x.strip() and not x.endswith('/rsm/' + rc.RUN_LOCK)]
+                                '05_DATA/results/S04/run01/rsm').split('\n') if x.strip()]
     assert sorted(st2) == sorted(st)                       # nothing new uncommitted
     rc.run_phase('test', str(s04), dummy_dll)
 
@@ -791,36 +790,57 @@ def _start_in_head(repo):
 
 
 def _sealed_ids(s03):
-    """(st_dev, st_ino) of every sealed S03 file: an alias (hard link) is caught too (RSM2-7, RSM3-2)."""
-    out = set()
+    """{(st_dev, st_ino): 'sealed' | 'sealed_test'} of every sealed S03 file: an alias (hard link) is caught too and
+    keeps the kind of the file it aliases (RSM2-7, RSM3-2, RSM4-3)."""
+    out = {}
     for d in ('sealed', 'sealed_test'):
         for n in os.listdir(os.path.join(str(s03), d)):
             st = os.stat(os.path.join(str(s03), d, n))
-            out.add((st.st_dev, st.st_ino))
+            out[(st.st_dev, st.st_ino)] = d
     return out
 
 
+def _sealed_kind(p, ids):
+    """'sealed' | 'sealed_test' | None for an opened path: by file identity, else by the path text."""
+    if isinstance(p, (str, os.PathLike)):
+        try:
+            st = os.stat(p)
+            if (st.st_dev, st.st_ino) in ids:
+                return ids[(st.st_dev, st.st_ino)]
+        except OSError:
+            pass
+        q = str(p).replace('\\', '/')
+        if '/s03/sealed_test/' in q:
+            return 'sealed_test'
+        if '/s03/sealed/' in q:
+            return 'sealed'
+    return None
+
+
 def _io_log(monkeypatch, repo=None, s03=None):
-    events, real_open, real_commit = [], builtins.open, rc.commit_paths
-    ids = _sealed_ids(s03) if s03 is not None else set()
+    """Events ('open', path, start row in HEAD, kind) of every builtins.open and os.open of a sealed file, and
+    ('commit', message) of every commit of the script (RSM4-3: os.open too)."""
+    events, real_open, real_osopen, real_commit = [], builtins.open, os.open, rc.commit_paths
+    ids = _sealed_ids(s03) if s03 is not None else {}
+
+    def note(p):
+        kind = _sealed_kind(p, ids)
+        if kind:
+            events.append(('open', str(p), _start_in_head(repo) if repo else None, kind))
 
     def op(p, *a, **k):
-        q = str(p).replace('\\', '/')
-        same = False
-        if ids and isinstance(p, (str, os.PathLike)):
-            try:
-                st = os.stat(p)
-                same = (st.st_dev, st.st_ino) in ids
-            except OSError:
-                pass
-        if '/s03/sealed/' in q or '/s03/sealed_test/' in q or same:
-            events.append(('open', str(p), _start_in_head(repo) if repo else None))
+        note(p)
         return real_open(p, *a, **k)
+
+    def oso(p, *a, **k):
+        note(p)
+        return real_osopen(p, *a, **k)
 
     def cm(repo, rels, msg):
         events.append(('commit', msg))
         return real_commit(repo, rels, msg)
     monkeypatch.setattr(builtins, 'open', op)
+    monkeypatch.setattr(os, 'open', oso)
     monkeypatch.setattr(rc, 'commit_paths', cm)
     return events
 
@@ -837,7 +857,7 @@ def test_no_sealed_file_is_opened_before_the_start_commit(tmp_path, dummy_dll, m
         assert start < first, ev[:5]
         assert all(e[2] for e in ev if e[0] == 'open')           # RSM2-7: the start row is in HEAD at each open
         if ph != 'test':
-            assert not any('/s03/sealed_test/' in e[1].replace('\\', '/') for e in ev if e[0] == 'open')
+            assert not any(e[3] == 'sealed_test' for e in ev if e[0] == 'open')     # RSM4-3: by kind
         monkeypatch.undo()
         monkeypatch.setattr(rc, 'EVALUATOR', fake_eval['factory'])
         monkeypatch.setattr(s4, 'safe_run_gate', fake_eval['srg'])
@@ -895,7 +915,7 @@ def test_attempts_append_only_and_interrupted_end(tmp_path, dummy_dll, monkeypat
     with pytest.raises(KeyboardInterrupt):
         rc.run_phase('fit', str(s04), dummy_dll)
     monkeypatch.setattr(rc, 'write_rsm_meta', real)
-    rc.release_run_lock(rc.acquire_run_lock(str(s04 / 'rsm' / rc.RUN_LOCK)))     # RSM3-3: the lock was freed
+    rc.release_run_lock(rc.acquire_run_lock(str(s04 / 'rsm')))     # RSM3-3: the lock was freed
     with pytest.raises(rc.Stop, match='not committed'):
         rc.run_phase('fit', str(s04), dummy_dll)
     rc.run_phase('fit', str(s04), dummy_dll, abort_reason='interrupted before the commit')
@@ -1109,14 +1129,10 @@ def test_output_commit_ignores_a_quoted_message(tmp_path, dummy_dll, fake_eval):
     assert git_out(repo, 'log', '-1', '--format=%s', c).startswith('fw: rsm_compare fit done')
 
 
-_HOLD = """import os, sys
-fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT)
-if os.name == 'nt':
-    import msvcrt
-    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-else:
-    import fcntl
-    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+_HOLD = """import sys
+sys.path.insert(0, sys.argv[1])
+import rsm_compare as rc
+rc.acquire_run_lock(sys.argv[2])
 print('held', flush=True)
 sys.stdin.read()
 """
@@ -1128,9 +1144,8 @@ def test_lock_held_by_another_process_then_killed(tmp_path, dummy_dll, fake_eval
     next run goes on, no file to delete by hand, no --abort-previous."""
     repo, s03, s04 = setup(tmp_path, dummy_dll)
     (s04 / 'rsm').mkdir()
-    lk = s04 / 'rsm' / rc.RUN_LOCK
-    p = subprocess.Popen([sys.executable, '-c', _HOLD, str(lk)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                         text=True)
+    p = subprocess.Popen([sys.executable, '-c', _HOLD, os.path.join(HERE, '..'), str(s04 / 'rsm')],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     try:
         assert p.stdout.readline().strip() == 'held'
         with pytest.raises(rc.Stop, match='is locked'):
@@ -1142,15 +1157,16 @@ def test_lock_held_by_another_process_then_killed(tmp_path, dummy_dll, fake_eval
         p.kill()                                            # a forced death: no cleanup code runs
         p.wait()
     rc.run_phase('fit', str(s04), dummy_dll)
-    assert att(s04)[-1]['status'] == 'done' and lk.exists()
+    assert att(s04)[-1]['status'] == 'done'
+    assert not [p for p in os.listdir(s04 / 'rsm') if 'lock' in p and p != 'opt_lock.yaml']   # RSM4-2: no lock file
 
 
 def test_lock_file_left_behind_is_no_lock_and_a_phase_holds_it(tmp_path, dummy_dll, fake_eval, monkeypatch):
-    """RSM3-3: an empty lock file (power loss right after it was made) or one naming a live process id does not
-    block the next run; RSM3-4: a second run started while a phase runs is refused for the whole phase."""
+    """RSM3-3: a lock file left by an older version (empty, or naming a live process id) does not block the next
+    run; RSM3-4: a second run started while a phase runs is refused for the whole phase (same process too)."""
     repo, s03, s04 = setup(tmp_path, dummy_dll)
     (s04 / 'rsm').mkdir()
-    lk = s04 / 'rsm' / rc.RUN_LOCK
+    lk = s04 / 'rsm' / '.run_lock'
     lk.write_text('')
     rc.run_phase('fit', str(s04), dummy_dll)
     lk.write_text(f'{os.getpid()} 2026-11-16 00:00:00\n')
@@ -1187,6 +1203,38 @@ def test_merge_that_drops_the_test_rows_stops(tmp_path, dummy_dll, fake_eval):
         rc.run_phase('test', str(s04), dummy_dll)
     with pytest.raises(rc.Stop, match='history'):
         rc.run_phase('opt', str(s04), dummy_dll, abort_reason='a new main test')
+
+
+def test_two_commits_bringing_the_same_done_row_stop(tmp_path, dummy_dll, fake_eval):
+    """RSM4-1: a branch from the fit start commit copies the fit output commit's attempts.csv, changes coefs.csv and
+    the lock hash, commits with the same message; a merge keeps that branch's fit files: two commits bring the fit
+    done row in, so no output commit is chosen and the opt phase stops (git log order does not decide)."""
+    repo, s03, s04 = setup(tmp_path, dummy_dll)
+    rc.run_phase('fit', str(s04), dummy_dll)
+    rel_rsm = '05_DATA/results/S04/run01/rsm'
+    main = git_out(repo, 'rev-parse', '--abbrev-ref', 'HEAD').strip()
+    f_commit = git_out(repo, 'rev-parse', 'HEAD').strip()
+    msg = git_out(repo, 'log', '-1', '--format=%s', 'HEAD').strip()
+    start = git_out(repo, 'rev-parse', 'HEAD~1').strip()
+    git_out(repo, 'checkout', '-q', '-b', 'other', start)
+    git_out(repo, 'checkout', f_commit, '--', rel_rsm + '/attempts.csv', rel_rsm + '/fit', rel_rsm + '/meta.yaml')
+    fit = s04 / 'rsm' / 'fit'
+    (fit / 'coefs.csv').write_text((fit / 'coefs.csv').read_text().replace('0.03', '0.031', 1))
+    lk = json.load(open(fit / 'lock.yaml'))
+    lk['files']['fit/coefs.csv'] = dict(zip(('sha256', 'sha256_lf'), rc.file_sha(str(fit / 'coefs.csv'))))
+    (fit / 'lock.yaml').write_text(json.dumps(lk))
+    git_out(repo, 'add', '--', rel_rsm)
+    git_out(repo, 'commit', '-q', '-m', msg)
+    git_out(repo, 'checkout', '-q', main)
+    git_out(repo, 'merge', '-q', '--no-ff', '--no-commit', '-s', 'ours', 'other')
+    git_out(repo, 'checkout', 'other', '--', rel_rsm + '/fit')
+    git_out(repo, 'commit', '-q', '-m', 'merge, fit files of other')
+    inp = rc.Inputs(str(s04), dummy_dll)
+    aid = att(s04)[0]['attempt_id']
+    with pytest.raises(rc.Stop, match='more than one commit'):
+        rc.output_commit(inp, 'fit', aid)
+    with pytest.raises(rc.Stop, match='more than one commit'):
+        rc.run_phase('opt', str(s04), dummy_dll)
 
 
 def test_links_refused_before_any_open(tmp_path, dummy_dll, monkeypatch):
@@ -1230,54 +1278,78 @@ def test_edge_source_and_limit(tmp_path, dummy_dll, fake_eval):
     assert (c['edge_limit'] != '') == (n_high > 0) and c['edge_limit'].count(':H') == n_high
 
 
-def test_hard_links_are_refused(tmp_path, dummy_dll):
-    """RSM3-2: a second hard link (islink false, realpath unchanged) to a sealed_test/ file, at rsm/.run_lock with
-    --abort-previous or at an S04 file, stops the run before the start row; the sealed file is not changed."""
+def _hard_link(src, dst):
+    try:
+        os.link(str(src), str(dst))
+    except (OSError, NotImplementedError, AttributeError):
+        pytest.skip('no hard link on this file system')
+
+
+def test_io_guard_catches_an_alias(tmp_path, dummy_dll, monkeypatch):
+    """RSM4-3: the I/O guard records an open of a hard link alias of a sealed_test/ file, by builtins.open and by
+    os.open, with the kind of the file it aliases."""
+    repo, s03, s04 = setup(tmp_path, dummy_dll)
+    alias = tmp_path / 'alias.csv'
+    _hard_link(s03 / 'sealed_test' / 'runs_test.csv', alias)
+    ev = _io_log(monkeypatch, s03=s03)
+    open(alias, 'rb').close()
+    os.close(os.open(str(alias), os.O_RDONLY))
+    assert [(e[0], e[3]) for e in ev] == [('open', 'sealed_test'), ('open', 'sealed_test')]
+
+
+def test_hard_links_are_refused(tmp_path, dummy_dll, monkeypatch):
+    """RSM3-2, RSM4-2, RSM4-3: a second hard link to a sealed_test/ file at an S04 file stops the run before the
+    start row; one at the old lock path rsm/.run_lock is never opened (the lock opens no file); under the I/O guard,
+    no sealed_test/ file is opened, by builtins.open or os.open."""
     repo, s03, s04 = setup(tmp_path, dummy_dll)
     src = s03 / 'sealed_test' / 'runs_test.csv'
     before = src.read_bytes()
     (s04 / 'rsm').mkdir()
-    try:
-        os.link(str(src), str(s04 / 'rsm' / rc.RUN_LOCK))
-    except (OSError, NotImplementedError, AttributeError):
-        pytest.skip('no hard link on this file system')
+    _hard_link(src, s04 / 'rsm' / '.run_lock')
+    ev = _io_log(monkeypatch, repo, s03)
+    rc.run_phase('fit', str(s04), dummy_dll, abort_reason='a run died')
+    assert not [e for e in ev if e[0] == 'open' and e[3] == 'sealed_test'] and src.read_bytes() == before
+    (s04 / 'rsm' / '.run_lock').unlink()
+    _hard_link(src, s04 / 'post_checks' / 'leak.csv')
+    ev.clear()
     with pytest.raises(rc.Stop, match='hard link'):
-        rc.run_phase('fit', str(s04), dummy_dll, abort_reason='a run died')
-    assert src.read_bytes() == before
-    (s04 / 'rsm' / rc.RUN_LOCK).unlink()
-    os.link(str(src), str(s04 / 'post_checks' / 'leak.csv'))
-    with pytest.raises(rc.Stop, match='hard link'):
-        rc.run_phase('fit', str(s04), dummy_dll)
-    assert not (s04 / 'rsm' / 'attempts.csv').exists() and src.read_bytes() == before
+        rc.run_phase('opt', str(s04), dummy_dll)
+    assert not [e for e in ev if e[0] == 'open'] and src.read_bytes() == before
+    assert [r['kind'] for r in att(s04)] == ['start', 'end']                  # stopped before the opt start row
 
 
-def _dir_link(target, link):
-    """A directory symlink, or a junction on Windows when symlinks need a privilege; False when neither works."""
-    try:
-        os.symlink(str(target), str(link), target_is_directory=True)
-        return True
-    except (OSError, NotImplementedError):
-        pass
-    if os.name == 'nt':
-        import _winapi
+def _dir_link(kind, target, link):
+    """A directory symlink or a junction (Windows); False when the machine cannot make it."""
+    if kind == 'symlink':
         try:
-            _winapi.CreateJunction(str(target), str(link))
+            os.symlink(str(target), str(link), target_is_directory=True)
             return True
-        except OSError:
-            pass
-    return False
+        except (OSError, NotImplementedError):
+            return False
+    if os.name != 'nt':
+        return False
+    import _winapi
+    try:
+        _winapi.CreateJunction(str(target), str(link))
+        return True
+    except OSError:
+        return False
 
 
-def test_nested_directory_link_is_refused(tmp_path, dummy_dll, fake_eval):
-    """RSM3-2: rsm/confirm/_work made a directory link (or junction) before the opt phase stops it before the start
-    row, whatever the link points to (here an empty folder outside rsm/)."""
+@pytest.mark.parametrize('kind', ['symlink', 'junction', 'junction_without_isjunction'])
+def test_nested_directory_link_is_refused(tmp_path, dummy_dll, fake_eval, monkeypatch, kind):
+    """RSM3-2, RSM4-4: rsm/confirm/_work made a directory symlink or a junction before the opt phase stops it
+    before the start row, whatever the link points to (here an empty folder outside rsm/), and also on a Python
+    without os.path.isjunction (simulated: the attribute removed)."""
     repo, s03, s04 = setup(tmp_path, dummy_dll)
     rc.run_phase('fit', str(s04), dummy_dll)
     outside = tmp_path / 'outside'
     outside.mkdir()
     (s04 / 'rsm' / 'confirm').mkdir()
-    if not _dir_link(outside, s04 / 'rsm' / 'confirm' / '_work'):
-        pytest.skip('no directory link on this machine')
+    if not _dir_link(kind.split('_')[0], outside, s04 / 'rsm' / 'confirm' / '_work'):
+        pytest.skip(f'no {kind.split("_")[0]} on this machine')
+    if kind == 'junction_without_isjunction':
+        monkeypatch.delattr(os.path, 'isjunction', raising=False)
     n = len(att(s04))
     with pytest.raises(rc.Stop, match='directory link'):
         rc.run_phase('opt', str(s04), dummy_dll)
@@ -1341,8 +1413,7 @@ def test_end_to_end_with_a_real_s04_tool_check(tmp_path, monkeypatch, capsys):
         n - (res[0]['state'] == 'x_RSM')
     meta = open(out / 'rsm' / 'meta.yaml', encoding='utf-8').read()
     assert 'not_main_numbers: true' in meta
-    st = git_out(repo, 'status', '--porcelain', '--', '05_DATA/results/S04/run01/rsm').splitlines()
-    assert st == ['?? 05_DATA/results/S04/run01/rsm/' + rc.RUN_LOCK]      # RSM3-3: only the lock file, untracked
+    assert git_out(repo, 'status', '--porcelain', '--', '05_DATA/results/S04/run01/rsm').strip() == ''   # RSM4-2
     cost = list(csv.DictReader(open(out / 'rsm' / 'check' / 'cost.csv')))
     main = next(r for r in cost if r['item'] == 'S04 main')
     assert main['n_runs_planned'] == main['n_runs_actual']          # the seeds run (1), not the locked ones (5)
