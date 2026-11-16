@@ -135,14 +135,16 @@ def write_queries(d: str, boot: str = BOOT, gid: int = 1, t0: float = 100.0) -> 
 
 
 def write_final_run(d: str, platform: str, gain: dict, e_perp: float = 0.05, t_end: float = 10.0,
-                    boot: str = BOOT, t0: str = '2026-11-20T10:00:00', log: Log = None, run_end_extra=()) -> dict:
-    """A FAKE final run folder with everything s05_final_table asks of a judged run (score.json, esp32.csv and its
+                    boot: str = BOOT, t0: str = '2026-11-20T10:00:00', log: Log = None, run_end_extra=(),
+                    score_extra: dict = None) -> dict:
+    """A FAKE run folder with everything s05_final_table asks of a judged run (score.json, esp32.csv and its
     events, both query outputs, the ack of the gain setting); `log`: a Log already filled (default: 0.3 s off, 10 s
-    + 3 ticks on, then off). run_end_extra: more '#run_end' log_seq values for the events (tests). Returns the
-    paths of the query outputs."""
+    + 3 ticks on, then off). run_end_extra: more '#run_end' log_seq values for the events (tests). score_extra: more
+    keys of score.json (C9D-1: 'outcome' and 'gate_v3', so score.json is the scorer file given to rq3_log end).
+    Returns the paths of the query outputs."""
     os.makedirs(d, exist_ok=True)
     score = dict(FAKE=True, e_perp_max=e_perp, e_s_absmax=0.01, e_trk_max=0.02, t_end=t_end,
-                 e_theta_lane_max_deg=5.0, e_theta_cmd_max_deg=4.0)
+                 e_theta_lane_max_deg=5.0, e_theta_cmd_max_deg=4.0, **(score_extra or {}))
     if platform == 'HIL':
         score.update(track_err_frames=0, pi_period_ppm=-12.0, edge_map=dict(esp_pi_ppm=24.6))
     else:

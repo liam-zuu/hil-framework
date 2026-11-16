@@ -465,6 +465,10 @@ def load_runs(dataset, score_name, esp32_name, query_before_name='gain_query_bef
     try:
         rl.check_gate_rows(rows)
         rl.check_map_rows(rows)
+        miss = rl.so_h_missing(rows, dataset, stages=('final',))
+        if miss:          # C9D-2 (Liam 17/11 at CODE_C13 "Sửa cả 7 + vòng 2 (Recommended)"): no table before so-h
+            raise rl.LogError('luot xe kiem cuoi da phan chua so clip H (lenh rq3_log so-h, ca luot duoi nguong): '
+                              + ', '.join(r.get('run_uid', '') for r in miss) + ' (C9D-2)')
         rows = rl.apply_so_h(rows, dataset)                  # S05 v3.37 4.3: outcomes after the clip H comparison
     except rl.LogError as e:
         raise ValueError(f'm7_tuning_log.csv: {e}')
@@ -535,7 +539,8 @@ def load_runs(dataset, score_name, esp32_name, query_before_name='gain_query_bef
 # (Recommended)"): log_seq is uint32 (AGV 16702ff logger.c) and wraps to 0 after 4294967295 (about 497 days at 100 Hz
 # without a restart). A '#gain' line with first_seq = 0 is taken for the line of a gain setting with the motor off
 # (R134C9-1); after a wrap it may be the start of a stretch whose '#us,ev=start' and data lines were lost. A file that
-# shows the wrap near (a data line or a '#run_end' seq / last_data_seq within SEQ_WRAP_MARGIN of 2^32, or log_seq
+# shows the wrap near (a data line, a '#run_end' seq / last_data_seq, or a '#gain' / '#us,ev=start' first_seq (C9D-7)
+# within SEQ_WRAP_MARGIN of 2^32, or log_seq
 # going down between data lines) and has such a line not anchored by a '#us,ev=start' with first_seq = 0 is refused.
 SEQ_MAX = 2 ** 32 - 1
 SEQ_WRAP_MARGIN = 2 ** 16          # [DE XUAT] 65536 lines, about 11 min at 100 Hz
@@ -590,8 +595,11 @@ def run_gain_problem(esp32_path, want):
                     seqs.add(fs)
                 else:
                     zero_gain = True
+                end_seqs.append(fs)       # C9D-7: a first_seq near 2^32 shows the wrap too
             elif text.startswith('#us,') and glc._fields(text).get('ev') == 'start':
-                seqs.add(glc._int(glc._fields(text).get('first_seq')))
+                fs = glc._int(glc._fields(text).get('first_seq'))
+                seqs.add(fs)
+                end_seqs.append(fs)       # C9D-7
             elif text.startswith('#run_end,'):
                 f = glc._fields(text)
                 end_seqs += [glc._int(f.get('seq')), glc._int(f.get('last_data_seq'))]

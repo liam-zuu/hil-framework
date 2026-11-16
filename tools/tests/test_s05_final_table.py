@@ -282,7 +282,14 @@ def write_run(base, uid, platform, stage, ctrl, task, gain_set_id, outcome, e_pe
     score = dict(e_perp_max=e_perp, e_s_absmax=0.01, e_trk_max=0.02, t_end=10.0,
                  track_err_frames=flag if platform == 'HIL' else 0, n_back_frames=flag if platform == 'HW' else 0)
     score.update(e_theta_start_max_deg=3.0) if k else score.update(e_theta_lane_max_deg=5.0, e_theta_cmd_max_deg=4.0)
-    json.dump(score, open(os.path.join(d, 'score.json'), 'w'))
+    gate = None
+    if outcome in T.VALID:      # C9D-1: score.json is the scorer file of the run (outcome, gate_v3), sha in the log
+        g = rl.fake_gate(e_trk=0.5 if outcome == 'khong_dat' else 0.03,
+                         completed='inconclusive' if outcome == 'chua_ket_luan' else 'true')
+        gate = rl.floor_gate(g) if platform == 'HW' else g
+        score.update(outcome=outcome, gate_v3=gate)
+    with open(os.path.join(d, 'score.json'), 'w', encoding='utf-8') as f:
+        json.dump(score, f)
     L = Log()
     L.off(30)
     L.on(1001 + 3, zigzag) if tv_ok else (L.on(400, zigzag), L.off(5, after_on=True), L.on(601 + 3, zigzag))
@@ -295,9 +302,7 @@ def write_run(base, uid, platform, stage, ctrl, task, gain_set_id, outcome, e_pe
                run_outcome=outcome, results_dir=d, fail_cause='mat_khung' if outcome == 'hong_he_do' else '',
                campaign='RQ2' if stage == 'final_hil' else gain_set_id.split('/')[0])
     if outcome in T.VALID:
-        g = rl.fake_gate(e_trk=0.5 if outcome == 'khong_dat' else 0.03,
-                         completed='inconclusive' if outcome == 'chua_ket_luan' else 'true')
-        row.update(rl.gate_columns(rl.floor_gate(g) if platform == 'HW' else g))
+        row.update(rl.gate_columns(gate, rl.sha256_file(os.path.join(d, 'score.json'))))
         row.update(boot_before='4753dc47', boot_after='4753dc47')
     return row
 
@@ -702,6 +707,16 @@ def _table_ds(tmp_path, runs, frozen=(('A-PID', 'A-PID/G07'),)):
         w.writeheader()
         w.writerows(runs)
     write_gains(ds, frozen)                                            # R134C6-1
+    # C9D-2: the clip H comparison (below eps_H, outcome kept) of every judged final car run, by the command so-h;
+    # a row the log checks refuse is left without it (the table stops on that row check first). The test's own
+    # dataset is built again on each call, so the comparison file of an earlier call goes first.
+    if os.path.exists(os.path.join(ds, rl.SO_H)):
+        os.remove(os.path.join(ds, rl.SO_H))
+    for r in rl.so_h_missing(rl.live_rows(runs), ds, stages=('final',)):
+        try:
+            rl.so_h(ds, r['run_uid'], rl.fake_score_final(r['results_dir'], 0.5))
+        except rl.LogError:
+            pass
     return ds
 
 
@@ -739,7 +754,12 @@ def test_c4_6_cat_t1_counted_per_cell(tmp_path):
     g = rl.floor_gate(rl.fake_gate(e_trk=0.5), t_done=(None, None))
     g['g1'].update(t1=6.0, cat_t1=True, state='chua_ket_luan', q='inconclusive')
     g.update(rl.o1_gate.evaluate_outcomes(g, g['decide']))
-    r.update(rl.gate_columns(g), fail_cause=rl.VIOL_BEFORE)
+    sp = os.path.join(r['results_dir'], 'score.json')                 # C9D-1: the scorer file carries this gate
+    with open(sp, encoding='utf-8') as f:
+        sc = json.load(f)
+    with open(sp, 'w', encoding='utf-8') as f:
+        json.dump(dict(sc, gate_v3=g), f)
+    r.update(rl.gate_columns(g, rl.sha256_file(sp)), fail_cause=rl.VIOL_BEFORE)
     p = write_run(tmp_path, 'v2', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'khong_dat', 0.12)
     runs, _ = LR(_table_ds(tmp_path, [r, p]))
     cell = [t for t in T.build_table(runs) if (t['condition'], t['platform'], t['gain_set'], t['quantity'])
