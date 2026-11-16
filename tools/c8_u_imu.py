@@ -177,22 +177,43 @@ def load_log(path, need=LOG_COLS):
 
 # ── IMU samples (shared with the camera scorer) ─────────────────────────────────────────────────
 
-def report_rows(n, age):
-    """CU-7: one row per report: the first row of each new count value with a finite age >= 0."""
+def report_rows(n, age, skip=None):
+    """CU-7: one row per report: the first row of each new count value with a finite age >= 0. skip (a list, sparse
+    logs only, thang --log-thua): a count with no such row is left out and appended to skip instead of refused."""
     idx, cur, want = [], None, False
     for i in range(len(n)):
         if not np.isfinite(n[i]) or n[i] <= 0:
             continue
         if n[i] != cur:
             if want:
-                raise InputError(f'report count {cur:.0f}: no row with a finite age >= 0')
+                if skip is None:
+                    raise InputError(f'report count {cur:.0f}: no row with a finite age >= 0')
+                skip.append(int(cur))
             cur, want = n[i], True
         if want and np.isfinite(age[i]) and age[i] >= 0:
             idx.append(i)
             want = False
     if want:
-        raise InputError(f'report count {cur:.0f}: no row with a finite age >= 0')
+        if skip is None:
+            raise InputError(f'report count {cur:.0f}: no row with a finite age >= 0')
+        skip.append(int(cur))
     return np.array(idx, dtype=int)
+
+
+def cut_log(L, tu_s=None, den_s=None):
+    """Rows of L with t - t(first row) in [tu_s, den_s] (thang: drop a start or end where the car was being
+    placed; Liam 16/11 'Sửa script + Codex'). Returns a new dict; L unchanged."""
+    if tu_s is None and den_s is None:
+        return L
+    t = (L['timestamp_us'] - L['timestamp_us'][0]) * 1e-6
+    lo = -math.inf if tu_s is None else _finite(tu_s, 'tu_s', 0.0)
+    hi = math.inf if den_s is None else _finite(den_s, 'den_s', 0.0)
+    m = (t >= lo) & (t <= hi)
+    if m.sum() < 2:
+        raise InputError(f'no rows in [{tu_s}, {den_s}] s')
+    out = {k: (v[m] if isinstance(v, np.ndarray) and v.shape == t.shape else v) for k, v in L.items()}
+    out.update(cut_s=[tu_s, den_s])
+    return out
 
 
 def _index(r, b):
@@ -314,10 +335,10 @@ def _grid(r, period_s, j_lim):
     return n, t_fit, b_main, j, inl
 
 
-def gyro_samples(L):
+def gyro_samples(L, skip=None):
     """Gyro reports (receive times, gz); with a g_valid column, reports at rows with g_valid != 1 are dropped
-    (firmware: age, settle time after a reset, CU-4)."""
-    idx = report_rows(L['gyro_n'], L['age_g_ms'])
+    (firmware: age, settle time after a reset, CU-4). skip: as report_rows (sparse logs only)."""
+    idx = report_rows(L['gyro_n'], L['age_g_ms'], skip)
     if 'g_valid' in L:
         idx = idx[L['g_valid'][idx] == 1]
     t = L['timestamp_us'][idx] * 1e-6 - L['age_g_ms'][idx] * 1e-3
@@ -509,19 +530,63 @@ def _still_ends(tg, gz, g_still, min_still_s):
     return lead, trail, (tg[i], tg[k])
 
 
-def thang(path, n_vong, chieu, period_s=PERIOD_S, g_still=0.02, min_still_s=MIN_STILL_S, edge_s=0.2):
-    """Scale error of one run of n_vong turns between two still parts: s = dpsi / (+-n 2 pi) - 1."""
+THUA_STEP_MAX = math.pi / 2     # --log-thua: largest yaw change allowed between two logged reports (no 2 pi doubt)
+
+
+def _yaw_thua(L):
+    """Sparse log (firmware 5bde4c5 logs 10 Hz with the motor off, so about half the 20 Hz reports never reach
+    the log): yaw of every logged report, unwrapped by the plain step, refused when a step could hide a turn:
+    |step| or (gap x largest |gz| of the run) above THUA_STEP_MAX. No grid, no tau: thang only needs the yaw
+    in the still parts. Returns (receive times, unwrapped yaw, skipped counts, largest step, largest gap)."""
+    skip = []
+    idx = report_rows(L['rv_n'], L['age_r_ms'], skip)
+    if idx.size < 2:
+        raise InputError(f'{L.get("path")}: fewer than two rotation vector reports')
+    r = L['timestamp_us'][idx] * 1e-6 - L['age_r_ms'][idx] * 1e-3
+    y = L['yaw_rad'][idx]
+    if np.any(np.diff(r) <= 0) or not np.all(np.isfinite(y)):
+        raise InputError(f'{L.get("path")}: receive times not increasing or yaw not finite')
+    if 'r_valid' in L and np.any(L['r_valid'][idx] != 1):
+        raise InputError(f'{L.get("path")}: rotation vector not valid in the run (CU-4)')
+    d = (np.diff(y) + math.pi) % (2 * math.pi) - math.pi
+    gskip = []
+    tg, gz = gyro_samples(L, gskip)
+    w = float(np.max(np.abs(gz))) if gz.size else math.inf
+    gap = float(np.max(np.diff(r)))
+    step = float(np.max(np.abs(d)))
+    if step > THUA_STEP_MAX or gap * w > THUA_STEP_MAX:
+        raise InputError(f'sparse log: step {math.degrees(step):.1f} deg or gap {gap * 1e3:.0f} ms x |gz| '
+                         f'{w:.2f} rad/s above {math.degrees(THUA_STEP_MAX):.0f} deg: a turn could hide')
+    psi = y[0] + np.concatenate([[0.0], np.cumsum(d)])
+    return r, psi, skip, gskip, step, gap, tg, gz
+
+
+def thang(path, n_vong, chieu, period_s=PERIOD_S, g_still=0.02, min_still_s=MIN_STILL_S, edge_s=0.2, thua=False,
+          tu_s=None, den_s=None):
+    """Scale error of one run of n_vong turns between two still parts: s = dpsi / (+-n 2 pi) - 1.
+    thua: sparse log (_yaw_thua); tu_s, den_s: use only rows in that time range from the first row (cut_log)."""
     if chieu not in ('ccw', 'cw'):
         raise InputError(f'--chieu {chieu!r}: ccw or cw')
     if not isinstance(n_vong, int) or n_vong < 1:
         raise InputError('--n-vong: an integer >= 1')
-    L = load_log(path)
-    S = rv_samples(L, period_s=period_s)
-    if S['resets']:
-        raise InputError(f'IMU reset in the scale run at {S["resets"][0]:.3f} s (CU-4)')
-    if math.isfinite(S['t_break']):
-        raise InputError('a gap in the IMU reports could not be unwrapped (CU-3)')
-    tg, gz = gyro_samples(L)
+    L = cut_log(load_log(path), tu_s, den_s)
+    if np.any(np.diff(L['reset_n']) != 0):
+        raise InputError('IMU reset in the scale run (CU-4)')
+    extra = {}
+    if thua:
+        t_all, psi_all, skip, gskip, step, gap, tg, gz = _yaw_thua(L)
+        S = dict(t_recv=t_all, psi_all=psi_all, n_samples=int(t_all.size), n_late=0)
+        extra = dict(thua=True, n_bo_rv=len(skip), n_bo_gyro=len(gskip), buoc_max_deg=math.degrees(step),
+                     khe_max_s=gap)
+    else:
+        S = rv_samples(L, period_s=period_s)
+        if S['resets']:
+            raise InputError(f'IMU reset in the scale run at {S["resets"][0]:.3f} s (CU-4)')
+        if math.isfinite(S['t_break']):
+            raise InputError('a gap in the IMU reports could not be unwrapped (CU-3)')
+        tg, gz = gyro_samples(L)
+    if tu_s is not None or den_s is not None:
+        extra.update(tu_s=tu_s, den_s=den_s)
     lead, trail, rot = _still_ends(tg, gz, g_still, min_still_s)
     t_all = S['t_recv']
     a = (t_all >= lead[0]) & (t_all <= lead[1] - edge_s)
@@ -539,7 +604,7 @@ def thang(path, n_vong, chieu, period_s=PERIOD_S, g_still=0.02, min_still_s=MIN_
     return dict(s=s, chieu=chieu, n_vong=n_vong, dpsi_rad=dpsi, dpsi_deg=math.degrees(dpsi),
                 still_start_s=list(lead), still_end_s=list(trail),
                 omega_median=float(np.median(np.abs(gz[rot_mask]))) if rot_mask.any() else None,
-                n_reports=S['n_samples'], n_late=S['n_late'], n_dup=L['n_dup'])
+                n_reports=S['n_samples'], n_late=S['n_late'], n_dup=L['n_dup'], **extra)
 
 
 def thang_gop(runs, delta_gach_deg=2.0):
@@ -1027,6 +1092,9 @@ def main(argv=None):
     a1.add_argument('--chieu', required=True, choices=('ccw', 'cw'))
     a1.add_argument('--cach', required=True, choices=('rc', 'tay'))
     a1.add_argument('--toc-do', required=True, choices=('cham', 'nhanh'))
+    a1.add_argument('--log-thua', action='store_true', help='sparse log (10 Hz, motor off): see _yaw_thua')
+    a1.add_argument('--tu-s', type=float, help='use rows from this time (s from the first row)')
+    a1.add_argument('--den-s', type=float, help='use rows up to this time (s from the first row)')
     a1.add_argument('--out', required=True)
     a2 = sub.add_parser('thang-gop')
     a2.add_argument('--in', dest='inp', nargs='+', required=True)
@@ -1070,7 +1138,7 @@ def main(argv=None):
         if os.path.exists(a.out) and a.cmd != 'tong':
             raise InputError(f'{a.out} exists: never overwritten')
         if a.cmd == 'thang':
-            r = thang(a.log, a.n_vong, a.chieu)
+            r = thang(a.log, a.n_vong, a.chieu, thua=a.log_thua, tu_s=a.tu_s, den_s=a.den_s)
             r.update(cach=a.cach, toc_do=a.toc_do, nguon=[{'file': os.path.basename(a.log), 'sha256': sha256(a.log)}],
                      script=script_state())
             _write_new(a.out, r)

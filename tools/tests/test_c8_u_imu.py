@@ -1067,3 +1067,64 @@ def test_real_floor_samples():
     S = U.rv_samples(U.load_log(FLOOR), period_s=T0, tau_hat=0.0, j_lim=0.005)
     assert S['n_samples'] > 150
     assert S['n_late'] <= 0.05 * S['n_samples']
+
+
+# ── thang on sparse logs (10 Hz with the motor off) and cut start (Liam 16/11 'Sua script + Codex') ─────────────
+
+def sparse_copy(src, dst, every=10, bad_age_after=None):
+    """Keep every `every`-th data row (100 Hz -> 10 Hz like firmware 5bde4c5 with the motor off); optionally give
+    the gyro age of one kept row a small negative value (-0.1 ms, seen on the floor 16/11)."""
+    rows = list(csv.DictReader(open(src, encoding='utf-8')))
+    keep = rows[::every]
+    if bad_age_after is not None:
+        k = next(i for i, r in enumerate(keep) if float(r['timestamp_us']) > bad_age_after * 1e6)
+        keep[k]['age_g_ms'] = '-0.1'
+    with open(dst, 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(keep)
+
+
+def test_thang_sparse_log(tmp_path):
+    p, q = str(tmp_path / 'a.csv'), str(tmp_path / 'a10.csv')
+    rate, t_end = turns(5, 2.0, 1)
+    make_log(p, rate, t_end, s_plus=0.004)
+    sparse_copy(p, q, bad_age_after=15.0)
+    with pytest.raises(U.InputError):
+        U.thang(q, 5, 'ccw')                                            # the default mode refuses
+    r = U.thang(q, 5, 'ccw', thua=True)
+    assert r['s'] == pytest.approx(0.004, abs=3e-4) and r['thua'] is True and r['n_bo_gyro'] >= 1
+    assert r['buoc_max_deg'] < 90 and r['khe_max_s'] < 0.2
+
+
+def test_thang_sparse_refuses_fast_turn(tmp_path):
+    p, q = str(tmp_path / 'a.csv'), str(tmp_path / 'a10.csv')
+    rate, t_end = turns(5, 20.0, 1)                                     # 20 rad/s x 0.1 s = 2 rad between rows
+    make_log(p, rate, t_end)
+    sparse_copy(p, q)
+    with pytest.raises(U.InputError, match='could hide'):
+        U.thang(q, 5, 'ccw', thua=True)
+
+
+def test_thang_cut_start(tmp_path):
+    p = str(tmp_path / 'a.csv')
+    rate0, t_end = turns(5, 2.0, 1, t_start=12.0)
+    rate = lambda t: 1.0 if 10.0 <= t < 10.6 else rate0(t)              # noqa: E731  car moved while placed
+    make_log(p, rate, t_end, s_plus=0.004)
+    with pytest.raises(U.InputError, match='still'):
+        U.thang(p, 5, 'ccw')
+    r = U.thang(p, 5, 'ccw', tu_s=1.0)
+    assert r['s'] == pytest.approx(0.004, abs=2e-4) and r['tu_s'] == 1.0
+
+
+def test_main_thang_sparse(tmp_path):
+    p, q = str(tmp_path / 'a.csv'), str(tmp_path / 'a10.csv')
+    rate, t_end = turns(5, 2.0, -1)
+    make_log(p, rate, t_end, s_minus=-0.003)
+    sparse_copy(p, q, bad_age_after=15.0)
+    out = str(tmp_path / 't.json')
+    base = ['thang', '--log', q, '--n-vong', '5', '--chieu', 'cw', '--cach', 'tay', '--toc-do', 'nhanh']
+    assert U.main(base + ['--out', out]) == 2
+    assert U.main(base + ['--log-thua', '--out', out]) == 0
+    d = json.load(open(out, encoding='utf-8'))
+    assert d['thua'] is True and d['s'] == pytest.approx(-0.003, abs=3e-4)
