@@ -35,11 +35,14 @@ Checks (all must hold for ok):
      log (FI2-2, FI3-2).
   11. batch 2, plant faults (design 2026-11-15 section 7.1; only for a schedule with a plant row): the plant
      record named in the manifest (faults.plant_record) exists next to the frames with that SHA-256 and the
-     expected columns, did not overflow; its nominal values are those of rpi5/params.py (mu_hd may be the
-     four equal values of --mu); its steps are exactly the frames where a plant row is on (same window rule as
-     the frames); at every step the mask and the parameters are rebuilt here from the rows, the nominal values
-     and the recorded pose (own hub formula, own ramp in exact fractions), and x, y, theta agree with the
-     true frame of that step within half a step of their int16 scale. The frames of a plant fault are not
+     expected columns, did not overflow, names the inner plant MecanumPlant; rpi5/params.py of this tree is
+     the blob the run imported (manifest plant_src) and the nominal values are its values, mu_hd being four
+     times --mu when the argv of the run (step log .json, read by run_hil.py's parser) has --mu; its steps are
+     exactly the frames where a plant row is on (same window rule as the frames); at every step the mask and
+     the parameters are rebuilt here from the rows, the nominal values and the recorded pose: hubs and zone
+     bounds in float64 by the definition, the battery ramp in float64 by its definition and V compared
+     exactly, b, tc, ts as exact fractions within a few ULP (Codex FP1-1..FP2-1, FP3-1); x, y, theta agree with
+     the true frame of that step within half a step of their int16 scale. The frames of a plant fault are not
      patched: expected_sent ignores plant rows. A schedule without plant rows must have no plant record.
 Exit 0 = ok, 1 = a check failed, 2 = the input cannot be checked. Writes fault_check.json.
 
