@@ -432,6 +432,25 @@ def _wheel_rows(ms, wheel, te, n_obs, seg_of_line, O):
     return np.vstack(out_A), np.concatenate(out_b)
 
 
+def _rest_bound(wheel, O):
+    """Latest H7 time at which the count of a wheel can still read its rest count c0, for first-start offset O (the
+    forced-low step of the first start; S2M1-3 per offset, Codex round 1 of v3). After the start the count is
+    c0 + O + d k (k edges, d the direction): O = 0 leaves c0 at the first edge; O d > 0 leaves it at the start and
+    never comes back; O d < 0 dips at the start and is back at c0 after |O| edges, leaving it at edge |O| + 1. The
+    start window [S, S + W] is always allowed (the forced-low step itself may pass through c0). inf when the edge
+    that ends it is not simulated or not trusted (no bound)."""
+    s1 = wheel.segs[1]
+    S, W, d = s1['t0'], s1['w0'], s1['dir']
+    end = S + W + TOL_US
+    if O * d > 0:
+        return end
+    k = abs(int(O))                                  # 0-based index of the edge that leaves c0
+    i = s1['first_edge'] + k
+    if not (s1['n_edges'] > k and i < wheel.t.size and bool(wheel.trusted[i])):
+        return math.inf
+    return max(float(wheel.t[i] + wheel.hi[i] + TOL_US), end)
+
+
 def certify(te_us, counts, apply_us, width_us, om32, t_window=None):
     """The set of maps s = a + b u (H7 us of an ESP32 time u in us) that agree with every count (module docstring).
     te_us (m,), counts (m, 4) of the motor-on ESP32 lines (NaN: not used); apply_us, width_us, om32 of the applied
@@ -511,8 +530,15 @@ def certify(te_us, counts, apply_us, width_us, om32, t_window=None):
             return res
         # localise lines: their read interval inside one segment of the wheel
         l = ms.lam(te)
-        s_lo = np.minimum((1 - l) * eA[0] + l * eB[0], (1 - l) * eA[1] + l * eB[1])
-        s_hi = np.maximum((1 - l) * eA[0] + l * eB[0], (1 - l) * eA[1] + l * eB[1])
+
+        def mix(x, y):
+            # (1 - l) x + l y with an infinite end weighted 0 at l = 0 or 1 taken as 0, not NaN (0 x inf); a lower end
+            # is never +inf nor an upper end -inf, so no inf - inf
+            with np.errstate(invalid='ignore'):
+                v = (1 - l) * x + l * y
+            return np.where(l == 0, x, np.where(l == 1, y, v))
+        s_lo = np.minimum(mix(eA[0], eB[0]), mix(eA[1], eB[1]))
+        s_hi = np.maximum(mix(eA[0], eB[0]), mix(eA[1], eB[1]))
         # (1 - l) eA + l eB is the extent of s at u only between uA and uB: there l is in [0, 1]
         added = 0
         for w in range(4):
@@ -528,6 +554,10 @@ def certify(te_us, counts, apply_us, width_us, om32, t_window=None):
             ok_O = []
             for O in O_set[w]:
                 r = _wheel_rows(ms, wh[w], te, n_obs[w], seg_of[w], O)
+                rb = _rest_bound(wh[w], O)
+                if r is not None and math.isfinite(rb):      # last line at c0: read before c0 is left for this O
+                    A1, b1 = ms.rows_le(te[[starts[w]['j0']]], [rb])
+                    r = (np.vstack([r[0], A1]), np.concatenate([r[1], b1]))
                 if r is not None and ms.feasible([r]):
                     rows[(w, O)] = r
                     ok_O.append(O)

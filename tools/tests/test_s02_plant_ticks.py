@@ -568,7 +568,10 @@ def test_counts_past_the_trusted_edges_do_not_exclude_the_true_map():
     u = 30_000.0 + 10_000.0 * np.arange(300)
     rng = np.random.default_rng(5)
     c = counts.at(np.round(u + rng.uniform(0, EM.J_READ_US, len(u))).astype(np.int64)).astype(float)
-    res = pt.certify(u, c, lo, np.full(n, 4.0), om32)
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', RuntimeWarning)      # an unbounded end gave 0 x inf = NaN in the line search
+        res = pt.certify(u, c, lo, np.full(n, 4.0), om32)
     assert res.get('ext') is not None or not res['ok'], res['reason']
     if res.get('ext') is not None:
         lo_s, hi_s = np.array([res['ext'](x) for x in u]).T
@@ -605,6 +608,25 @@ def test_a_negative_forced_low_step_undone_by_the_first_edge():
     assert np.all((lo_s - 1e-6 <= u) & (u <= hi_s + 1e-6))
     want = [-int(np.sign(om[1500, w])) for w in range(4)]            # -1 in the direction of motion
     assert any(list(cb) == want for cb in res['offsets']), res['offsets']
+
+
+def test_rest_bound_per_start_offset():
+    """S2M1-3 per offset: the count can read c0 until edge |O| + 1 when O dips against the motion, until the first edge
+    when O = 0, only inside the start window when O moves with it; an untrusted ending edge gives no bound."""
+    n = 3000
+    lo = 1000.0 * np.arange(n)
+    om = np.zeros((n, 4))
+    om[1500:] = np.array([9.52, -9.52, 9.52, -9.52])                 # hp 1000 us, constant speed
+    wh = pt._Wheel(pt.simulate_edges(lo, np.full(n, 5.0), om32_of(om))[0])
+    s1 = wh.segs[1]
+    S, W, d, i0 = s1['t0'], s1['w0'], s1['dir'], s1['first_edge']
+    assert d == 1 and W == 5.0
+    edge = lambda k: wh.t[i0 + k] + wh.hi[i0 + k] + pt.TOL_US     # noqa: E731
+    assert pt._rest_bound(wh, 0) == edge(0)
+    assert pt._rest_bound(wh, -1) == edge(1) and pt._rest_bound(wh, -2) == edge(2)
+    assert pt._rest_bound(wh, 1) == pt._rest_bound(wh, 2) == S + W + pt.TOL_US
+    wh.trusted[i0 + 1] = False
+    assert pt._rest_bound(wh, -1) == math.inf and pt._rest_bound(wh, 0) == edge(0)
 
 
 def test_plant_steps_at_anchors_and_across_unanswered_frames():
