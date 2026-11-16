@@ -39,8 +39,13 @@ Schedule file (CSV, UTF-8):
                  contact point is inside the rectangle (s15 by position, per wheel, Liam 15/11 Q4)
     A plant fault needs the dynamic plant with ground model 'traction' (plant='traction' in check()); the
     values against the nominal parameters (mu <= nominal, v1 <= nominal) are checked by fault_plant.
-  * Lines starting with '#' after the first one are comments. ibus_loss (needs the H7 part) and the s14 faults
-    body_drag, load_dist (after the main S04 run, Liam 11/11 and 15/11 Q3) are refused for now.
+  * Batch 2, iBUS loss (design section 4.2, 5; Liam 15/11 Q2 "Chi ban HIL"):
+      ibus_loss  target ibus, no parameter: byte 20 |= protocol.CMD_IBUS_OFF (bit 4); the H7 turns its iBUS
+                 port off after a 3-frame filter (a cut wire, not a lost radio link: no failsafe frames).
+                 The SWA bit (3) and the IMU loss bit (2) of the frame are kept. Bench only: fwsim has no RC
+                 model (fwsim/fault_run.py refuses it); a bench run needs the H7 part (IBUS_LOSS_H7 below).
+  * Lines starting with '#' after the first one are comments. The s14 faults body_drag, load_dist (after the
+    main S04 run, Liam 11/11 and 15/11 Q3) are refused for now.
 
 The patcher only injects in phase RUN (design 6.2): once the run leaves RUN, open windows are cut and the
 frames are the true ones again; a window that never started is 'not_run'.
@@ -60,7 +65,7 @@ import struct
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
-from protocol import (FRAME_SIZE, OFS_FAULT, OFS_IMU_ACC, OFS_IMU_GZ, OFS_IMU_YAW)
+from protocol import (CMD_IBUS_OFF, FRAME_SIZE, OFS_FAULT, OFS_IMU_ACC, OFS_IMU_GZ, OFS_IMU_YAW)
 
 MAGIC = '# hil-fault-schedule v1'
 COLUMNS = ('id', 'fault', 'target', 'start_ms', 'end_ms', 'params')
@@ -83,16 +88,22 @@ FAULTS = {
     'mu_time':    ('wheels', {'mu': Fraction}, 'mu'),
     'mu_zone':    (('all',), {'x0': Fraction, 'x1': Fraction, 'y0': Fraction, 'y1': Fraction, 'mu': Fraction},
                    'mu'),
+    # batch 2, iBUS loss (design 2026-11-15 sections 4.2, 5)
+    'ibus_loss':  (('ibus',), {}, 'ibus'),
 }
 DEFAULTS = {'wheel_jam': {'b': Fraction(0), 'tc': Fraction(0)}}   # parameters that may be left out
 IMU_FAULTS = ('imu_loss', 'imu_delay', 'gyro_scale')
-FRAME_FAULTS = ('enc_loss',) + IMU_FAULTS                 # change bytes of the frame (FramePatcher)
+FRAME_FAULTS = ('enc_loss',) + IMU_FAULTS + ('ibus_loss',)   # change bytes of the frame (FramePatcher)
 PLANT_FAULTS = ('wheel_jam', 'batt_sag', 'mu_time', 'mu_zone')   # change the plant (fault_plant.py)
 WHEEL_FAULTS = ('enc_loss', 'wheel_jam', 'mu_time')       # target = wheels joined with '+'
 ALL_WHEELS_OK = ('mu_time',)                              # also target 'all' = FL+FR+RL+RR (design 3, Codex FP1-7)
-# names kept for later parts of batch 2, refused for now: ibus_loss needs the H7 part (design section 5);
-# body_drag, load_dist (s14) come after the main S04 run (Liam 11/11, 15/11 Q3 "Giu sau S04")
-BATCH2 = ('ibus_loss', 'body_drag', 'load_dist')
+# names kept for later parts of batch 2, refused for now: body_drag, load_dist (s14) come after the main S04
+# run (Liam 11/11, 15/11 Q3 "Giu sau S04")
+BATCH2 = ('body_drag', 'load_dist')
+# The H7 firmware of today ignores byte 20 bit 4, so an ibus_loss row on the bench would change nothing the DUT
+# sees. run_hil.py refuses ibus_loss on the bench (not --mock) while this is False; the H7 branch of the iBUS
+# loss (hil_protocol.h HIL_CMD_IBUS_OFF, main.c filter; merged after feat/s06-pf3, after C8) sets it True.
+IBUS_LOSS_H7 = False
 IMU_SOURCES = ('plant', 'static', 'profile', None)
 PLANT_SOURCES = ('traction', None)   # 'traction': MecanumPlant on the ground with ground_model 'traction'
 
@@ -348,6 +359,7 @@ class ActiveSet:
         self.delay = 0
         self.scale: Optional[Fraction] = None
         self.scale_pq: Optional[Tuple[int, int]] = None
+        self.ibus = False                            # an ibus_loss row is on (batch 2)
         self.any = False                             # a frame (signal) row is on
         self.plant_on: Tuple[int, ...] = ()          # indices of the plant rows on, in row order (batch 2)
 
@@ -381,6 +393,7 @@ class ActiveSet:
 
     def _derive(self) -> None:
         self.enc_mask, self.loss, self.delay, self.scale, self.scale_pq = 0, False, 0, None, None
+        self.ibus = False
         for i in self.on:
             r = self.rows[i]
             if r.fault == 'enc_loss':
@@ -393,6 +406,8 @@ class ActiveSet:
             elif r.fault == 'gyro_scale':
                 self.scale = r.p('s')
                 self.scale_pq = scale_pq(self.scale)
+            elif r.fault == 'ibus_loss':
+                self.ibus = True
         # batch 2: plant rows do not change the frame; fault_plant reads plant_on
         self.plant_on = tuple(sorted(i for i in self.on if self.rows[i].fault in PLANT_FAULTS))
         self.any = len(self.on) > len(self.plant_on)
@@ -464,6 +479,8 @@ class FramePatcher:
             struct.pack_into('>h', b, OFS_IMU_GZ, scale_raw_pq(raw, *a.scale_pq))
         if a.loss:
             b[OFS_FAULT] |= FAULT_IMU_LOSS
+        if a.ibus:
+            b[OFS_FAULT] |= CMD_IBUS_OFF
         return bytes(b)
 
     def summary(self, last_step: Optional[int] = None) -> dict:

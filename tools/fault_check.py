@@ -16,7 +16,8 @@ Checks (all must hold for ok):
   4. every frame k of the log, inside and outside the windows (ARM, STOPPING, END tail too): every byte
      sent = expected_sent(), built here from the schedule, t0, the stop step and mosi_true only, with its
      own exact decimal arithmetic for gyro_scale (written apart from rpi5/fault_schedule.FramePatcher on
-     purpose: no shared state, no ring buffer, no shared rounding, FI1-1);
+     purpose: no shared state, no ring buffer, no shared rounding, FI1-1); batch 2 ibus_loss: bit 4 of
+     byte 20 (protocol.CMD_IBUS_OFF) in its window;
   5. the events, not_run, cut, complete of the manifest = those expected from the schedule, t0, the stop
      step and the number of frames; events typed strictly and in step order (FI1-7);
   6. MISO recomputed from the miso array (L50, as hil_node: frames from MISO_SKIP_FRAMES on): no bad CRC, no
@@ -67,8 +68,8 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, '..', 'rpi5'))
 from fault_schedule import FAULT_IMU_LOSS, file_sha256, parse, rows_as_json   # noqa: E402
-from protocol import (FRAME_SIZE, IMU_RANGES, MISO_CRC_BAD, MISO_EMPTY, OFS_FAULT, OFS_IMU_ACC, OFS_IMU_GZ,   # noqa: E402
-                      OFS_IMU_YAW, OFS_SEQ, STATE_RANGES, miso_check)
+from protocol import (CMD_IBUS_OFF, FRAME_SIZE, IMU_RANGES, MISO_CRC_BAD, MISO_EMPTY, OFS_FAULT,   # noqa: E402
+                      OFS_IMU_ACC, OFS_IMU_GZ, OFS_IMU_YAW, OFS_SEQ, STATE_RANGES, miso_check)
 from hil_node import MISO_SKIP_FRAMES                                          # noqa: E402
 from run_lifecycle import _PHASES as PHASES                                    # noqa: E402
 
@@ -114,7 +115,8 @@ def window_on(row, k, t0, stop) -> bool:
 
 def expected_sent(rows, k, t0, stop, true_frames) -> bytes:
     """The frame k must be: true frame k, then enc_loss, delay (IMU bytes of true frame k - d), gyro scale,
-    loss bit, in this order."""
+    loss bit, in this order; batch 2: the iBUS-off bit (protocol.CMD_IBUS_OFF, byte 20 bit 4) of an
+    ibus_loss row, the other bits of byte 20 (SWA, IMU loss) kept."""
     b = bytearray(bytes(true_frames[k]))
     on = [r for r in rows if window_on(r, k, t0, stop)]
     for r in on:
@@ -134,6 +136,9 @@ def expected_sent(rows, k, t0, stop, true_frames) -> bytes:
     for r in on:
         if r.fault == 'imu_loss':
             b[OFS_FAULT] |= FAULT_IMU_LOSS
+    for r in on:
+        if r.fault == 'ibus_loss':
+            b[OFS_FAULT] |= CMD_IBUS_OFF
     return bytes(b)
 
 

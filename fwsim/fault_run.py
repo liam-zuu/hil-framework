@@ -14,6 +14,8 @@ fwsim.simulate while it runs:
   5. batch 2 plant faults (rpi5/fault_plant.py, design 2026-11-15 section 6): the wrapped plant_step of step k
      gets the parameters of fault_plant.PlantVariant (the same function the Pi uses) instead of the nominal
      ones while a plant row is on; every such step is recorded (fault_plant, faults_plant.csv).
+  6. batch 2 ibus_loss is refused (BENCH_ONLY): the RC / iBUS logic is in the firmware main.c, which fwsim
+     does not run (Liam 15/11 Q2 "Chi ban HIL").
 The wrapper is removed in a finally block. Not re-entrant: one run at a time per process.
 
 Assumptions (stated by the author, to be checked): inside one fwsim step k (t = k ms) simulate calls the
@@ -45,7 +47,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, '..', 'rpi5'))
 import fwsim                                                   # noqa: E402
 import fault_plant                                             # noqa: E402
-from fault_schedule import ActiveSet, Schedule, check, has_plant_rows, scale_raw   # noqa: E402
+from fault_schedule import ActiveSet, Schedule, ScheduleError, check, has_plant_rows, scale_raw   # noqa: E402
 from imu_model import ImuNoise, imu_from_plant                 # noqa: E402
 from protocol import IMU_RANGES, _to_int16                     # noqa: E402
 
@@ -53,6 +55,14 @@ GZ_RANGE = IMU_RANGES[0]
 TAIL_S = 1.0                     # setpoint 0 after the task, as s02_groupA_sim.py STOP_TAIL_S
 # fault_tick / fault_imu mask bits: wheels 0..3, then loss, delay, scale
 M_LOSS, M_DELAY, M_SCALE = 16, 32, 64
+BENCH_ONLY = ('ibus_loss',)      # batch 2: fwsim has no RC model (design 2026-11-15 section 6, Liam 15/11 Q2)
+
+
+def refuse_bench_only(rows) -> None:
+    """ScheduleError when a row is a fault fwsim cannot run (the iBUS path is firmware main.c, not simulated)."""
+    for r in rows:
+        if r.fault in BENCH_ONLY:
+            raise ScheduleError(f'{r.id!r}: {r.fault} runs on the HIL bench only (fwsim has no RC / iBUS model)')
 
 
 class _FwProxy:
@@ -129,6 +139,7 @@ class FwsimFaults:
                 raise ValueError(f'{r.id!r} ends at {r.end_ms} ms, after the run ({run_ms} ms)')
         if self.schedule.rows:         # Codex FP1-8: the full check of the schedule, also for API callers
             check(self.schedule.rows, run_ms, 'plant', None if fault_plant.nominal_problem(params) else 'traction')
+        refuse_bench_only(self.schedule.rows)
         self.has_plant = has_plant_rows(self.schedule.rows)
         self.act = ActiveSet(self.schedule.rows)
         self.X, self.theta_sent = [], np.zeros(4)
@@ -273,6 +284,7 @@ def main():
             plant = None if fault_plant.nominal_problem(params) else 'traction'     # batch 2 plant faults
             sched = load(a.faults, int(round(duration * 1000)), 'plant', plant)
             fault_plant.check_params(sched.rows, params)
+            refuse_bench_only(sched.rows)
         except Exception as exc:                     # ScheduleError, OSError
             raise SystemExit(f'--faults {a.faults}: {exc}')
     else:
