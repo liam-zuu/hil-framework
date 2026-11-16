@@ -598,7 +598,9 @@ def test_declaration_problems(world, monkeypatch):
     C.main(['--stra-a', str(sa), 'ke-khai', '--out', str(out), '--lan-dau'])
     kk = C.read_ke_khai(str(out))
     kk['loi'] = []
-    assert any('STRA_A session' in x for x in C.declaration_problems(kk, str(sa)))
+    assert any('STRA_A sessions' in x for x in C.declaration_problems(kk, str(sa)))
+    kk['tro_ly_claude']['phien'] = ['']
+    assert any('STRA_A sessions' in x for x in C.declaration_problems(kk, str(sa)))
     kk['tro_ly_claude']['phien'] = ['local_x,claude-sonnet,medium']
     assert C.declaration_problems(kk, str(sa)) == []
     (sa / 'NHAT_KY' / '2026-11-20.md').write_text('buổi 1\nthêm\n', encoding='utf-8')
@@ -693,7 +695,7 @@ def test_round4_fixes(world, monkeypatch, capsys):
     (sa / 'CODEX' / 'log_20261120_1.txt').write_text(
         'x\n--------\nworkdir: D:\\STRA_A\nmodel: gpt-5\nreasoning effort: high\n--------\n', encoding='utf-8')
     d = C.read_ke_khai(a1)
-    d['loi'], d['tro_ly_claude']['phien'] = [], ['s']
+    d['loi'], d['tro_ly_claude']['phien'] = [], ['s,m,e']
     d['tro_ly_codex']['lan_goi'] = [dict(log='log_20261120_1.txt', model='gpt-6.1-sol', effort='high')]
     d['nhat_ky'], _ = C.nhat_ky(str(sa), None)
     assert any('differ from the logs' in x for x in C.declaration_problems(d, str(sa)))
@@ -702,3 +704,23 @@ def test_round4_fixes(world, monkeypatch, capsys):
                    'tro_ly_codex: {lan_goi: [{log: [], model: m, effort: e}]}\n', encoding='utf-8')
     with pytest.raises(C.Refused):
         C.read_ke_khai(str(bad))
+
+
+def test_baseline_name_case(world, monkeypatch, capsys):
+    """SA-18 (round 5): the predecessor named with another case is the same file on Windows."""
+    w = world
+    sa = w['sa']
+    fence_files(sa, monkeypatch)
+    monkeypatch.setattr(C, '_tool_version', lambda cmd: '')
+    kk = w['tmp'] / 'kk'
+    kk.mkdir()
+    a0, a1, a2 = (str(kk / f'hop_thu_A_{i}.yaml') for i in range(3))
+    C.main(['--stra-a', str(sa), 'ke-khai', '--out', a0, '--lan-dau'])
+    C.main(['--stra-a', str(sa), 'ke-khai', '--out', a1, '--truoc', a0])
+    d1 = yaml.safe_load(open(a1, encoding='utf-8'))
+    d1['luc'] = yaml.safe_load(open(a0, encoding='utf-8'))['luc']        # same second
+    with open(a1, 'w', encoding='utf-8') as f:
+        yaml.safe_dump(d1, f, allow_unicode=True, sort_keys=False)
+    capsys.readouterr()
+    assert C.main(['--stra-a', str(sa), 'ke-khai', '--out', a2, '--truoc', str(kk / 'HOP_THU_A_0.YAML')]) == 2
+    assert 'follows' in capsys.readouterr().out

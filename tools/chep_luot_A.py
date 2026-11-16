@@ -1030,8 +1030,10 @@ def declaration_problems(kk, root):
         out.append(f'Codex calls not on {hc.MODEL} / {hc.EFFORT}: {bad}')
     if list(kk['tro_ly_codex']['lan_goi']) != codex_calls(root):           # SA-20: whole entries, read again
         out.append('Codex calls (log, model, effort) differ from the logs')
-    if not kk['tro_ly_claude']['phien']:
-        out.append('no STRA_A session (id, model, effort) in the declaration: ke-khai --phien')
+    ph = kk['tro_ly_claude']['phien']                                      # SA-20: each entry id,model,effort
+    if not ph or not all(isinstance(x, str) and len(x.split(',')) == 3 and all(p.strip() for p in x.split(','))
+                         for x in ph):
+        out.append('STRA_A sessions missing or not "id,model,effort": ke-khai --phien ID,MODEL,EFFORT')
     _, bb = box_check(os.path.join(root, HOP_THU_DIR))                     # SA-22: the mailbox itself, now
     out.extend(f'mailbox: {x}' for x in bb)
     return out
@@ -1079,7 +1081,7 @@ def ke_khai(a):
                 if other > mine:
                     raise Refused(f'--truoc: {n} is newer; give the newest declaration')
                 tr = read_ke_khai(os.path.join(folder, n)).get('truoc')     # SA-18: a chain, not only the time
-                if isinstance(tr, dict) and tr.get('file') == os.path.basename(a.truoc):
+                if isinstance(tr, dict) and str(tr.get('file', '')).casefold() == os.path.basename(a.truoc).casefold():
                     raise Refused(f'--truoc: {n} already follows it; give the newest declaration')
     prev = read_ke_khai(a.truoc)['nhat_ky'] if a.truoc else None
     if a.lan_dau and [n for n in os.listdir(os.path.dirname(os.path.abspath(a.out)))
