@@ -33,6 +33,17 @@ Checks (all must hold for ok):
      n - MISO_SKIP_FRAMES (FI2-5, FI3-3, FI3-4; a log of another frame size cannot be checked, exit 2); the
      lifecycle transitions are typed strictly, follow the phase changes RunLifecycle can make, inside the
      log (FI2-2, FI3-2).
+  11. batch 2, plant faults (design 2026-11-15 section 7.1; only for a schedule with a plant row): the plant
+     record named in the manifest (faults.plant_record) exists next to the frames with that SHA-256 and the
+     expected columns, did not overflow, names the inner plant MecanumPlant; rpi5/params.py of this tree is
+     the blob the run imported (manifest plant_src) and the nominal values are its values, mu_hd being four
+     times --mu when the argv of the run (step log .json, read by run_hil.py's parser) has --mu; its steps are
+     exactly the frames where a plant row is on (same window rule as the frames); at every step the mask and
+     the parameters are rebuilt here from the rows, the nominal values and the recorded pose: hubs and zone
+     bounds in float64 by the definition, the battery ramp in float64 by its definition and V compared
+     exactly, b, tc, ts as exact fractions within a few ULP (Codex FP1-1..FP2-1, FP3-1); x, y, theta agree with
+     the true frame of that step within half a step of their int16 scale. The frames of a plant fault are not
+     patched: expected_sent ignores plant rows. A schedule without plant rows must have no plant record.
 Exit 0 = ok, 1 = a check failed, 2 = the input cannot be checked. Writes fault_check.json.
 
 Assumptions (stated by the author, to be checked): frame k of the log is step k of the loop, and the
@@ -43,7 +54,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
+import math
 import os
 import sys
 from decimal import ROUND_HALF_UP, Decimal, Inexact, localcontext
@@ -303,6 +316,205 @@ def step_log_check(path, n):
                 json_rows=meta_d.get('rows'), problems=problems)
 
 
+PLANT_ROWS = ('wheel_jam', 'batt_sag', 'mu_time', 'mu_zone')      # batch 2 plant faults (written here again)
+REC_COLS = ('step', 'mask', 'V_batt', 'mu_fl', 'mu_fr', 'mu_rl', 'mu_rr', 'b_fl', 'b_fr', 'b_rl', 'b_rr',
+            'tc_fl', 'tc_fr', 'tc_rl', 'tc_rr', 'ts_fl', 'ts_fr', 'ts_rl', 'ts_rr', 'x', 'y', 'theta')
+OFS_X, OFS_Y = 8, 10                           # int16 x, y of [w1..w4, x, y, theta, ...] (theta: OFS_THETA)
+ULP_TOL = 8                                    # float sums of the Pi against the exact values here (FP1-4)
+HUBS = {0: (1, 1), 1: (1, -1), 2: (-1, 1), 3: (-1, -1)}   # FL, FR, RL, RR: (sign of lx, sign of ly), y left
+
+
+def _close(got, exact) -> bool:
+    """A float64 the Pi built by a few float additions against the exact value: within ULP_TOL units in the
+    last place of the larger of the two (Codex FP1-4: no absolute tolerance, the range has no upper bound)."""
+    e = float(exact)
+    return math.isfinite(got) and abs(got - e) <= ULP_TOL * math.ulp(max(abs(got), abs(e)))
+
+
+def _row_wheels(r):
+    if r.fault == 'mu_zone' or r.target == 'all':        # mu_time may take 'all' (Codex FP1-7)
+        return (0, 1, 2, 3)
+    return tuple(WHEEL_IDX[w] for w in r.target.split('+'))
+
+
+def hubs(x, y, th, lx, ly):
+    """World hub positions FL, FR, RL, RR by the definition of the design (float64, this order; Codex FP1-1):
+    c = cos(theta), s = sin(theta), ax = sx lx, ay = sy ly, hub = ((x + c ax) - s ay, (y + s ax) + c ay)."""
+    c, s = math.cos(th), math.sin(th)
+    out = {}
+    for w, (sx, sy) in HUBS.items():
+        ax, ay = sx * lx, sy * ly
+        out[w] = ((x + c * ax) - s * ay, (y + s * ax) + c * ay)
+    return out
+
+
+def ref_plant(rows, on_idx, k_rel, pose, nom):
+    """Parameters of one plant step rebuilt from the rows on (indices, row order), the relative step, the
+    pose at the start of the step and the nominal values: (V, mu[4], b[4], tc[4], ts[4]); b, tc, ts and mu as
+    exact Fractions, V the nominal value or the float64 ramp of its definition (FP2-1)."""
+    F = lambda v: Fraction(v) if not isinstance(v, Fraction) else v           # noqa: E731
+    V = F(nom['V_batt'])
+    mu = [F(v) for v in nom['mu_hd']]
+    b, tc, ts = ([F(v) for v in nom[k]] for k in ('motor_b', 'motor_Tc', 'motor_Ts'))
+    for i in on_idx:
+        r = rows[i]
+        if r.fault == 'wheel_jam':
+            for w in _row_wheels(r):
+                b[w] += r.p('b')
+                tc[w] += r.p('tc')
+                ts[w] += r.p('tc')
+        elif r.fault == 'batt_sag':
+            # Codex FP2-1: the float64 definition of the ramp (one operation at a time, as the design states),
+            # rebuilt here and compared exactly; an exact fraction would differ by the rounding of v1 - v0
+            ramp, d = r.p('ramp_ms'), k_rel - r.start_ms
+            v0, v1 = float(nom['V_batt']), float(r.p('v1'))
+            V = v1 if ramp == 0 or d >= ramp else v0 + (v1 - v0) * (d / ramp)
+        elif r.fault == 'mu_time':
+            for w in _row_wheels(r):
+                mu[w] = r.p('mu')
+        elif r.fault == 'mu_zone':
+            # bounds as float64 (the decimal rounded once), as the definition says (Codex FP1-1)
+            x0, x1, y0, y1 = (float(r.p(k)) for k in ('x0', 'x1', 'y0', 'y1'))
+            for w, (hx, hy) in hubs(float(pose[0]), float(pose[1]), float(pose[2]),
+                                    float(nom['lx']), float(nom['ly'])).items():
+                if x0 <= hx < x1 and y0 <= hy < y1:
+                    mu[w] = r.p('mu')
+    return V, mu, b, tc, ts
+
+
+def run_mu(argv):
+    """--mu of the run as rpi5/run_hil.py's own parser reads its command line (the argv the step log .json
+    keeps; Codex FP1-2 round 2): a float, or None without --mu. ValueError when the parser refuses it."""
+    import contextlib
+    import io
+    import run_hil
+    if not (isinstance(argv, list) and argv and all(isinstance(a, str) for a in argv)):
+        raise ValueError(f'step log argv {argv!r}')
+    old, err = sys.argv, io.StringIO()
+    sys.argv = ['run_hil.py'] + argv[1:]
+    try:
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            ns = run_hil._parse_args()
+    except SystemExit:
+        raise ValueError(f'run_hil.py refuses the argv of the step log: {err.getvalue().strip()[-200:]}') from None
+    finally:
+        sys.argv = old
+    return ns.mu
+
+
+def nominal_problems(nom, plant_src=None, argv=None) -> list:
+    """The nominal values of the record against rpi5/params.py of this tree and the command line of the run.
+    Codex FP1-2: this tree's params.py must be the blob the run imported (manifest plant_src); every nominal
+    value finite and > 0 (lx, ly, motor_* >= 0); mu_hd = four times --mu of the run's argv (step log .json),
+    or params.py mu_hd without --mu (round 2: four equal values alone are not taken as --mu)."""
+    from params import MecanumParams
+    from plant_blob import plant_source
+    p = MecanumParams()
+    out = []
+    here = plant_source().get('params_py')
+    if not isinstance(plant_src, dict) or not here or plant_src.get('params_py') != here:
+        out.append(f'params.py of this tree ({str(here)[:12]}) is not the one of the run '
+                   f'({str((plant_src or {}).get("params_py"))[:12]}): the nominal values cannot be checked')
+    flat = [nom.get(k) for k in ('V_batt', 'lx', 'ly')] + [v for k in ('mu_hd', 'motor_b', 'motor_Tc', 'motor_Ts')
+                                                            for v in (nom.get(k) or [None])]
+    if not all(type(v) is float and math.isfinite(v) and v >= 0 for v in flat) or \
+            not (nom.get('V_batt', 0) > 0 and all(v > 0 for v in nom.get('mu_hd') or [0])):
+        out.append(f'nominal values not finite floats > 0: {nom!r}')
+    for k in ('V_batt', 'lx', 'ly'):
+        if nom.get(k) != float(getattr(p, k)):
+            out.append(f'nominal {k}={nom.get(k)!r} != params.py {float(getattr(p, k))}')
+    for k in ('motor_b', 'motor_Tc', 'motor_Ts'):
+        if nom.get(k) != [float(v) for v in getattr(p, k)]:
+            out.append(f'nominal {k}={nom.get(k)!r} != params.py')
+    mu = nom.get('mu_hd')
+    try:
+        m = run_mu(argv)
+    except ValueError as exc:
+        out.append(f'--mu of the run unknown ({exc}): the nominal mu_hd cannot be checked')
+        return out
+    want = [float(v) for v in np.broadcast_to(p.mu_hd, (4,))] if m is None else [float(m)] * 4
+    if mu != want:
+        out.append(f'nominal mu_hd={mu!r} != {want} ({"params.py" if m is None else "--mu " + repr(m)} of the run)')
+    return out
+
+
+def step_log_argv(step_log):
+    """argv of the run kept in the .json of its step log (run_hil.py), or None."""
+    if not step_log or not os.path.isfile(step_log + '.json'):
+        return None
+    with open(step_log + '.json') as fh:
+        meta = json.load(fh)
+    return meta.get('argv') if isinstance(meta, dict) else None
+
+
+def plant_record_check(npz_path, rows, fm, t0, stop, n, true, plant_src=None, argv=None) -> tuple:
+    """Check 11: (problems, summary)."""
+    prow = [i for i, r in enumerate(rows) if r.fault in PLANT_ROWS]
+    pr = fm.get('plant_record')
+    if not prow:
+        return (['a plant record without plant rows'] if pr is not None else []), None
+    if not isinstance(pr, dict) or not isinstance(pr.get('file'), str) or not pr.get('sha256'):
+        return [f'plant rows but no plant record in the manifest: {pr!r}'], None
+    # Codex FP1-9: a bare file name, next to the frames
+    if os.path.basename(pr['file']) != pr['file'] or pr['file'] in ('', '.', '..') or os.path.isabs(pr['file']):
+        return [f'plant record file {pr["file"]!r} is not a bare file name next to the frames'], None
+    if pr.get('inner') != 'MecanumPlant':                                      # Codex FP1-11
+        return [f'plant record inner plant {pr.get("inner")!r}, plant faults run on MecanumPlant only'], None
+    path = os.path.join(os.path.dirname(os.path.abspath(npz_path)), pr['file'])
+    if not os.path.isfile(path):
+        return [f'plant record {pr["file"]} not found next to the frames'], None
+    with open(path, 'rb') as fh:
+        sha = hashlib.sha256(fh.read()).hexdigest()
+    probs = []
+    if sha != pr['sha256']:
+        probs.append(f'plant record sha256 {sha[:12]} != manifest {str(pr["sha256"])[:12]}')
+    g = np.load(path)
+    rec = g['record']
+    if json.loads(str(g['cols'])) != list(REC_COLS) or pr.get('cols') != list(REC_COLS) or \
+            rec.ndim != 2 or rec.shape[1] != len(REC_COLS):
+        return probs + [f'plant record columns {json.loads(str(g["cols"]))} / shape {rec.shape} not as expected'], None
+    if pr.get('overflow') is not False or not _is_int(pr.get('rows')) or pr.get('rows') != len(rec):   # FP1-3
+        probs.append(f'plant record overflow={pr.get("overflow")!r} rows={pr.get("rows")!r}, file has {len(rec)}')
+    nom = pr.get('nominal') if isinstance(pr.get('nominal'), dict) else {}
+    nprob = nominal_problems(nom, plant_src, argv)
+    if nprob:
+        return probs + nprob, dict(file=pr['file'], rows=len(rec), steps_ok=None)
+    exp_steps = [k for k in range(n) if any(window_on(rows[i], k, t0, stop) for i in prow)]
+    steps = [int(v) for v in rec[:, 0]]
+    if steps != exp_steps or not np.array_equal(rec[:, 0], np.array(steps, dtype=float)):
+        probs.append(f'plant record steps differ from the windows: {len(steps)} recorded, {len(exp_steps)} expected'
+                     f'{", first " + str(steps[0]) if steps else ""}')
+        return probs, dict(file=pr['file'], rows=len(rec), steps_ok=False)
+    c = {name: j for j, name in enumerate(REC_COLS)}
+    sx, sy, sth = STATE_RANGES[4] / 32767.0, STATE_RANGES[5] / 32767.0, STATE_RANGES[6] / 32767.0
+    bad_val, bad_pose, first = 0, 0, None
+    for row in rec:
+        k = int(row[0])
+        on = [i for i in prow if window_on(rows[i], k, t0, stop)]
+        pose = (row[c['x']], row[c['y']], row[c['theta']])
+        V, mu, b, tc, ts = ref_plant(rows, on, k - t0, pose, nom)
+        # FP1-3: the mask as recorded equals the expected whole number exactly (no int() cast)
+        ok = bool(row[c['mask']] == float(sum(1 << i for i in on))) and bool(row[c['V_batt']] == float(V))   # FP2-1
+        for w, suf in enumerate(('fl', 'fr', 'rl', 'rr')):
+            ok &= bool(row[c['mu_' + suf]] == float(mu[w]))
+            ok &= _close(row[c['b_' + suf]], b[w]) and _close(row[c['tc_' + suf]], tc[w])
+            ok &= _close(row[c['ts_' + suf]], ts[w])
+        if not ok:
+            bad_val += 1
+            first = k if first is None else first
+        fr = true[k]
+        pose_ok = (abs(_i16(fr, OFS_X) * sx - pose[0]) <= 0.5 * sx + 1e-9 and
+                   abs(_i16(fr, OFS_Y) * sy - pose[1]) <= 0.5 * sy + 1e-9 and
+                   abs(_i16(fr, OFS_THETA) * sth - math.remainder(pose[2], 2 * math.pi)) <= 0.5 * sth + 1e-9)
+        bad_pose += not pose_ok
+    if bad_val:
+        probs.append(f'{bad_val} plant steps with parameters that differ from the rows, first at frame {first}')
+    if bad_pose:
+        probs.append(f'{bad_pose} plant steps whose recorded pose differs from the true frame')
+    return probs, dict(file=pr['file'], sha256=sha, rows=len(rec), steps_ok=True, values_bad=bad_val,
+                       pose_bad=bad_pose)
+
+
 def check(npz_path: str, sched_path: str, step_log: str = None) -> dict:
     f = np.load(npz_path)
     man = json.loads(str(f['manifest']))
@@ -381,11 +593,15 @@ def check(npz_path: str, sched_path: str, step_log: str = None) -> dict:
     else:
         tl = None
         fails.append('no step log: the run does not show that no step missed its deadline (design 8.1)')
+    plant_probs, plant = plant_record_check(npz_path, rows, fm, t0, stop, n, true,
+                                             man.get('plant_src'), step_log_argv(step_log))   # check 11 (batch 2)
+    fails += plant_probs
     diff_frames = int(np.count_nonzero(np.any(mosi != true, axis=1)))
     out.update(ok=not fails, fails=fails, n_frames=n, t0_step=t0, stop_step=stop, sha256=sha,
                frames_bad=len(bad), first_bad=bad[0] if bad else None, frames_injected=diff_frames,
                events=exp_ev, not_run=exp_nr, complete=complete, imu_source=man.get('imu_source'),
-               miso=dict(checked=checked, crc_bad=crc_bad, empty=empty), self_check=sc, step_log=tl)
+               miso=dict(checked=checked, crc_bad=crc_bad, empty=empty), self_check=sc, step_log=tl,
+               plant=plant)
     return out
 
 

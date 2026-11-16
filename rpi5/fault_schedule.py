@@ -27,7 +27,20 @@ Schedule file (CSV, UTF-8):
                  most S_PLACES = 9 decimal places (its exact value is a multiple of 1e-9; 0.30, 3e-1 and
                  0.300000000 are the same s) and an exponent of at most 2 digits (Codex FI2-1)
     Overlap on the IMU: delay (picks the source frame), then the gyro scale, then the loss bit.
-  * Lines starting with '#' after the first one are comments. Faults of batch 2 are refused.
+  * Faults of batch 2, plant faults (design 03_CODE/docs/2026-11-15_Thiet_ke_bom_loi_dot2_v1.md, Liam 15/11
+    CODE_FAULT2 "Duyet, code"): they change the plant itself, not the frame (rpi5/fault_plant.py applies
+    them; the frame sent stays the true frame of the faulty plant):
+      wheel_jam  target wheels as enc_loss; b (N.m.s/rad, >= 0), tc (N.m, >= 0), not both 0, default 0:
+                 motor_b += b, motor_Tc += tc, motor_Ts += tc of the wheel (scenario s11)
+      batt_sag   target batt; v1 (V, > 0), ramp_ms (int, 0 .. end - start): V_batt goes linearly from its
+                 nominal value to v1 in ramp_ms from start (0 = a step), then stays v1 to end (s13)
+      mu_time    target wheels or all; mu (> 0): mu_hd of the wheel = mu (s15 in time)
+      mu_zone    target all; x0 < x1, y0 < y1 (m, world frame), mu (> 0): mu_hd = mu for every wheel whose
+                 contact point is inside the rectangle (s15 by position, per wheel, Liam 15/11 Q4)
+    A plant fault needs the dynamic plant with ground model 'traction' (plant='traction' in check()); the
+    values against the nominal parameters (mu <= nominal, v1 <= nominal) are checked by fault_plant.
+  * Lines starting with '#' after the first one are comments. ibus_loss (needs the H7 part) and the s14 faults
+    body_drag, load_dist (after the main S04 run, Liam 11/11 and 15/11 Q3) are refused for now.
 
 The patcher only injects in phase RUN (design 6.2): once the run leaves RUN, open windows are cut and the
 frames are the true ones again; a window that never started is 'not_run'.
@@ -58,16 +71,30 @@ D_MS_MAX = 1000
 IMU_SPANS = ((OFS_IMU_GZ, OFS_IMU_GZ + 2), (OFS_IMU_ACC, OFS_IMU_YAW + 2))
 
 # fault -> (targets, {param: type}, field group). Two rows of the same group may not overlap in time
-# (for enc_loss: on the same wheel).
+# (for a group of wheel rows: on the same wheel; mu_zone counts as all four wheels).
 FAULTS = {
     'enc_loss':   ('wheels', {}, 'enc'),
     'imu_loss':   (('imu',), {}, 'imu_loss'),
     'imu_delay':  (('imu',), {'d_ms': int}, 'imu_delay'),
     'gyro_scale': (('gz',), {'s': Fraction}, 'gyro_scale'),
+    # batch 2, plant faults (design 2026-11-15 section 3)
+    'wheel_jam':  ('wheels', {'b': Fraction, 'tc': Fraction}, 'jam'),
+    'batt_sag':   (('batt',), {'v1': Fraction, 'ramp_ms': int}, 'batt'),
+    'mu_time':    ('wheels', {'mu': Fraction}, 'mu'),
+    'mu_zone':    (('all',), {'x0': Fraction, 'x1': Fraction, 'y0': Fraction, 'y1': Fraction, 'mu': Fraction},
+                   'mu'),
 }
+DEFAULTS = {'wheel_jam': {'b': Fraction(0), 'tc': Fraction(0)}}   # parameters that may be left out
 IMU_FAULTS = ('imu_loss', 'imu_delay', 'gyro_scale')
-BATCH2 = ('wheel_jam', 'batt_sag', 'mu_time', 'mu_zone', 'ibus_loss', 'body_drag')   # design section 4
+FRAME_FAULTS = ('enc_loss',) + IMU_FAULTS                 # change bytes of the frame (FramePatcher)
+PLANT_FAULTS = ('wheel_jam', 'batt_sag', 'mu_time', 'mu_zone')   # change the plant (fault_plant.py)
+WHEEL_FAULTS = ('enc_loss', 'wheel_jam', 'mu_time')       # target = wheels joined with '+'
+ALL_WHEELS_OK = ('mu_time',)                              # also target 'all' = FL+FR+RL+RR (design 3, Codex FP1-7)
+# names kept for later parts of batch 2, refused for now: ibus_loss needs the H7 part (design section 5);
+# body_drag, load_dist (s14) come after the main S04 run (Liam 11/11, 15/11 Q3 "Giu sau S04")
+BATCH2 = ('ibus_loss', 'body_drag', 'load_dist')
 IMU_SOURCES = ('plant', 'static', 'profile', None)
+PLANT_SOURCES = ('traction', None)   # 'traction': MecanumPlant on the ground with ground_model 'traction'
 
 _WHOLE = re.compile(r'^[0-9]+$')
 _DECIMAL = re.compile(r'^[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]{1,2})?$')
@@ -92,7 +119,12 @@ class Row:
 
     @property
     def wheels(self) -> Tuple[int, ...]:
-        return tuple(WHEELS.index(w) for w in self.target.split('+')) if self.fault == 'enc_loss' else ()
+        """Wheel indices 0..3 of a wheel row (mu_zone: all four, its zone decides per step), else ()."""
+        if self.fault in WHEEL_FAULTS:
+            if self.target == 'all' and self.fault in ALL_WHEELS_OK:
+                return (0, 1, 2, 3)
+            return tuple(WHEELS.index(w) for w in self.target.split('+'))
+        return (0, 1, 2, 3) if self.fault == 'mu_zone' else ()
 
 
 @dataclass(frozen=True)
@@ -113,7 +145,7 @@ def _whole(text: str, where: str, name: str) -> int:
     return int(t)
 
 
-def _parse_params(text: str, schema: dict, where: str) -> tuple:
+def _parse_params(text: str, schema: dict, where: str, defaults: Optional[dict] = None) -> tuple:
     out = {}
     for part in (p for p in text.split(';') if p.strip()):
         k, sep, v = part.partition('=')
@@ -132,9 +164,11 @@ def _parse_params(text: str, schema: dict, where: str) -> tuple:
             out[k] = Fraction(v)                      # exact value of the text (FI1-1)
             if (10 ** S_PLACES) % out[k].denominator:   # FI2-1: not a multiple of 1e-9
                 raise ScheduleError(f'{where}: parameter {k}={v!r} has more than {S_PLACES} decimal places')
-    missing = sorted(set(schema) - set(out))
+    missing = sorted(set(schema) - set(out) - set(defaults or {}))
     if missing:
         raise ScheduleError(f'{where}: missing parameter {missing}')
+    for k, v in (defaults or {}).items():
+        out.setdefault(k, v)
     return tuple(sorted(out.items()))
 
 
@@ -156,22 +190,28 @@ def parse(text: str) -> List[Row]:
         rid, fault, target = f[0].strip(), f[1].strip(), f[2].strip()
         where = f'row {n} ({rid!r})'
         if fault in BATCH2:
-            raise ScheduleError(f'{where}: {fault} belongs to batch 2, not implemented')
+            raise ScheduleError(f'{where}: {fault} belongs to a later part of batch 2, not implemented yet')
         if fault not in FAULTS:
             raise ScheduleError(f'{where}: unknown fault {fault!r}')
         a = _whole(f[3], where, 'start_ms')
         b = _whole(f[4], where, 'end_ms')
-        rows.append(Row(rid, fault, target, a, b, _parse_params(f[5], FAULTS[fault][1], where)))
+        rows.append(Row(rid, fault, target, a, b,
+                        _parse_params(f[5], FAULTS[fault][1], where, DEFAULTS.get(fault))))
     if not rows:
         raise ScheduleError('the schedule has no row')
     return rows
 
 
-def check(rows: Sequence[Row], run_ms: Optional[int], imu_source: Optional[str]) -> None:
+def check(rows: Sequence[Row], run_ms: Optional[int], imu_source: Optional[str],
+          plant: Optional[str] = None) -> None:
     """Meaning of the rows for one run. run_ms: steps of the run from t0 (None refused: a window must be
-    known to end inside the run). imu_source: the IMU of the frames ('plant', 'static', 'profile', None)."""
+    known to end inside the run). imu_source: the IMU of the frames ('plant', 'static', 'profile', None).
+    plant: 'traction' when the run has the dynamic plant on the ground with ground_model 'traction' (plant
+    faults need it), None otherwise (fixed or profile wheel speeds, --mock, wheels lifted, 'rigid')."""
     if imu_source not in IMU_SOURCES:
         raise ScheduleError(f'imu_source {imu_source!r}')
+    if plant not in PLANT_SOURCES:
+        raise ScheduleError(f'plant {plant!r}')
     if run_ms is None or run_ms <= 0:
         raise ScheduleError('the run length is not known: a fault schedule needs --finite-run or --steps')
     seen = set()
@@ -183,7 +223,8 @@ def check(rows: Sequence[Row], run_ms: Optional[int], imu_source: Optional[str])
         targets = FAULTS[r.fault][0]
         if targets == 'wheels':
             parts = r.target.split('+')
-            ok = all(p in WHEELS for p in parts) and len(set(parts)) == len(parts)
+            ok = (all(p in WHEELS for p in parts) and len(set(parts)) == len(parts)) or \
+                (r.target == 'all' and r.fault in ALL_WHEELS_OK)
         else:
             ok = r.target in targets
         if not ok:
@@ -207,13 +248,35 @@ def check(rows: Sequence[Row], run_ms: Optional[int], imu_source: Optional[str])
             s = r.p('s')
             if not (-1.0 <= s <= 1.0) or s == 0.0:
                 raise ScheduleError(f'{where}: s must be in [-1, 1], not 0')
+        if r.fault in PLANT_FAULTS:
+            if plant != 'traction':
+                raise ScheduleError(f'{where}: {r.fault} needs the dynamic plant on the ground with ground model '
+                                    f"'traction' (not --fixed-omega, --omega-steps, --mock, A-K*, --ground rigid)")
+            _check_plant_row(r, where)
     for i, a in enumerate(rows):
         for b in rows[i + 1:]:
             if FAULTS[a.fault][2] != FAULTS[b.fault][2]:
                 continue
             if a.start_ms < b.end_ms and b.start_ms < a.end_ms:
-                if a.fault != 'enc_loss' or set(a.wheels) & set(b.wheels):
+                if not a.wheels or set(a.wheels) & set(b.wheels):
                     raise ScheduleError(f'{a.id!r} and {b.id!r} drive the same field at the same time')
+
+
+def _check_plant_row(r: Row, where: str) -> None:
+    """Ranges of a plant row that do not depend on the nominal parameters (fault_plant checks those)."""
+    if r.fault == 'wheel_jam':
+        if r.p('b') < 0 or r.p('tc') < 0 or (r.p('b') == 0 and r.p('tc') == 0):
+            raise ScheduleError(f'{where}: wheel_jam needs b >= 0, tc >= 0, not both 0')
+    elif r.fault == 'batt_sag':
+        if r.p('v1') <= 0:
+            raise ScheduleError(f'{where}: batt_sag needs v1 > 0')
+        if r.p('ramp_ms') > r.end_ms - r.start_ms:
+            raise ScheduleError(f'{where}: ramp_ms longer than the window')
+    elif r.fault in ('mu_time', 'mu_zone'):
+        if r.p('mu') <= 0:
+            raise ScheduleError(f'{where}: mu must be > 0')
+        if r.fault == 'mu_zone' and not (r.p('x0') < r.p('x1') and r.p('y0') < r.p('y1')):
+            raise ScheduleError(f'{where}: mu_zone needs x0 < x1 and y0 < y1')
 
 
 def file_sha256(raw: bytes) -> str:
@@ -221,7 +284,7 @@ def file_sha256(raw: bytes) -> str:
     return hashlib.sha256(raw.replace(b'\r\n', b'\n')).hexdigest()
 
 
-def load(path: str, run_ms: Optional[int], imu_source: Optional[str]) -> Schedule:
+def load(path: str, run_ms: Optional[int], imu_source: Optional[str], plant: Optional[str] = None) -> Schedule:
     with open(path, 'rb') as f:
         raw = f.read()
     try:
@@ -229,8 +292,12 @@ def load(path: str, run_ms: Optional[int], imu_source: Optional[str]) -> Schedul
     except UnicodeDecodeError as e:
         raise ScheduleError(f'{path}: not UTF-8 ({e})') from None
     rows = parse(text)
-    check(rows, run_ms, imu_source)
+    check(rows, run_ms, imu_source, plant)
     return Schedule(tuple(rows), path, file_sha256(raw))
+
+
+def has_plant_rows(rows: Sequence[Row]) -> bool:
+    return any(r.fault in PLANT_FAULTS for r in rows)
 
 
 def rows_as_json(rows: Sequence[Row]) -> list:
@@ -281,7 +348,8 @@ class ActiveSet:
         self.delay = 0
         self.scale: Optional[Fraction] = None
         self.scale_pq: Optional[Tuple[int, int]] = None
-        self.any = False
+        self.any = False                             # a frame (signal) row is on
+        self.plant_on: Tuple[int, ...] = ()          # indices of the plant rows on, in row order (batch 2)
 
     def _pop(self, k: int) -> None:
         _, on, i = self._ev[self._i]
@@ -325,7 +393,9 @@ class ActiveSet:
             elif r.fault == 'gyro_scale':
                 self.scale = r.p('s')
                 self.scale_pq = scale_pq(self.scale)
-        self.any = bool(self.on)
+        # batch 2: plant rows do not change the frame; fault_plant reads plant_on
+        self.plant_on = tuple(sorted(i for i in self.on if self.rows[i].fault in PLANT_FAULTS))
+        self.any = len(self.on) > len(self.plant_on)
 
     def not_run(self) -> List[str]:
         return [r.id for r, s in zip(self.rows, self.started) if not s]
@@ -347,6 +417,8 @@ class FramePatcher:
         self.t0: Optional[int] = None
         self.stop_step: Optional[int] = None
         self._live = False
+        self.step: Optional[int] = None    # step of the last patch() call (fault_plant records it)
+        self.plant_hook = None             # batch 2: fault_plant.FaultPlant, its record goes in summary()
 
     def start(self, step: int) -> None:
         """Once only, and never after stop()."""
@@ -364,6 +436,7 @@ class FramePatcher:
             self.act.close(step - self.t0)
 
     def patch(self, step: int, mosi_true: bytes) -> bytes:
+        self.step = step
         ring = self._ring
         if ring is not None:
             ring[step % self._n] = mosi_true
@@ -404,4 +477,6 @@ class FramePatcher:
         d = self.schedule.describe()
         d.update(t0_step=self.t0, stop_step=self.stop_step, events=[list(e) for e in self.act.events],
                  not_run=not_run, cut=cut, complete=not cut and not not_run)
+        if self.plant_hook is not None:
+            d['plant_record'] = self.plant_hook.finish()     # batch 2: file, sha256, rows of the plant record
         return d

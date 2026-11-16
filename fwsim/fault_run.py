@@ -10,7 +10,10 @@ fwsim.simulate while it runs:
      step k - d with its noise row at (k - d) ms (delay), then gz * (1 - s) on the int16 of the frame
      (gyro scale); simulate then passes it through imu_model.firmware_view as on the HIL;
   3. imu['hook'] (fwsim extension point) drops the three reports in an imu_loss window;
-  4. the fw object is proxied: fw.tick gets the counts of the "sent" wheel angle.
+  4. the fw object is proxied: fw.tick gets the counts of the "sent" wheel angle;
+  5. batch 2 plant faults (rpi5/fault_plant.py, design 2026-11-15 section 6): the wrapped plant_step of step k
+     gets the parameters of fault_plant.PlantVariant (the same function the Pi uses) instead of the nominal
+     ones while a plant row is on; every such step is recorded (fault_plant, faults_plant.csv).
 The wrapper is removed in a finally block. Not re-entrant: one run at a time per process.
 
 Assumptions (stated by the author, to be checked): inside one fwsim step k (t = k ms) simulate calls the
@@ -41,7 +44,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, '..', 'rpi5'))
 import fwsim                                                   # noqa: E402
-from fault_schedule import ActiveSet, Schedule, scale_raw      # noqa: E402
+import fault_plant                                             # noqa: E402
+from fault_schedule import ActiveSet, Schedule, check, has_plant_rows, scale_raw   # noqa: E402
 from imu_model import ImuNoise, imu_from_plant                 # noqa: E402
 from protocol import IMU_RANGES, _to_int16                     # noqa: E402
 
@@ -94,7 +98,8 @@ class _Noise:
 class FwsimFaults:
     """run(fw, setpoint, duration, params, imu=..., **simulate kwargs) -> the log of fwsim.simulate plus
     'fault_tick' (t, mask, count_true x4, count_sent x4), 'fault_imu' (t, mask, true x5, sent x5; one row
-    per report, the reports of an imu_loss window are dropped after the row) and 'faults' (summary)."""
+    per report, the reports of an imu_loss window are dropped after the row), 'fault_plant' (one row per
+    plant step with a plant row on, columns fault_plant.RECORD_COLS) and 'faults' (summary)."""
 
     def __init__(self, schedule: Schedule):
         self.schedule = schedule
@@ -122,10 +127,15 @@ class FwsimFaults:
         for r in self.schedule.rows:
             if r.end_ms > run_ms:
                 raise ValueError(f'{r.id!r} ends at {r.end_ms} ms, after the run ({run_ms} ms)')
+        if self.schedule.rows:         # Codex FP1-8: the full check of the schedule, also for API callers
+            check(self.schedule.rows, run_ms, 'plant', None if fault_plant.nominal_problem(params) else 'traction')
+        self.has_plant = has_plant_rows(self.schedule.rows)
         self.act = ActiveSet(self.schedule.rows)
         self.X, self.theta_sent = [], np.zeros(4)
-        self.rec_tick, self.rec_imu = [], []
+        self.rec_tick, self.rec_imu, self.rec_plant = [], [], []
         self.g = params.g
+        fault_plant.check_params(self.schedule.rows, params)       # batch 2: against the nominal values
+        var = fault_plant.PlantVariant(self.schedule.rows, params)
         real = fwsim.plant_step
         j = [0]
 
@@ -133,6 +143,13 @@ class FwsimFaults:
             if not self.X:
                 self.X.append(np.array(x, copy=True))
             self.adv(j[0])
+            on = self.act.plant_on
+            if on:                                     # batch 2: the parameters of this step
+                if p is not params:
+                    raise RuntimeError('fwsim.simulate passed a parameter object other than the one of run()')
+                p, _ = var.at(on, j[0], x)
+                self.rec_plant.append((j[0], sum(1 << i for i in on), p.V_batt, *p.mu_hd, *p.motor_b,
+                                       *p.motor_Tc, *p.motor_Ts, x[0], x[1], x[2]))
             x_new = real(x, u, p, dt, rng)
             self.X.append(x_new)
             w = x_new[6:10]
@@ -180,6 +197,8 @@ class FwsimFaults:
             self.act.close(last)
         log['fault_tick'] = np.asarray(self.rec_tick, dtype=float).reshape(-1, 10)
         log['fault_imu'] = np.asarray(self.rec_imu, dtype=float).reshape(-1, 12)
+        if self.has_plant:             # Codex FP1-10: the output of a run without plant rows stays as before
+            log['fault_plant'] = np.asarray(self.rec_plant, dtype=float).reshape(-1, len(fault_plant.RECORD_COLS))
         cut = any(e[3] == 'cut' for e in self.act.events)
         nr = self.act.not_run()
         log['faults'] = dict(self.schedule.describe(), t0_step=0, events=[list(e) for e in self.act.events],
@@ -212,6 +231,10 @@ def write_faults(out, log):
                       'count_sent_fl,count_sent_fr,count_sent_rl,count_sent_rr')
     np.savetxt(os.path.join(out, 'faults_imu.csv'), log['fault_imu'], delimiter=',', comments='', fmt='%.9g',
                header='t,mask,gz_true,ax_true,ay_true,az_true,yaw_true,gz_sent,ax_sent,ay_sent,az_sent,yaw_sent')
+    plant = 'fault_plant' in log                      # only with plant rows (Codex FP1-10)
+    if plant:
+        np.savetxt(os.path.join(out, 'faults_plant.csv'), log['fault_plant'], delimiter=',', comments='',
+                   fmt='%.17g', header=','.join(fault_plant.RECORD_COLS))
     with open(os.path.join(out, 'faults.json'), 'w') as f:
         json.dump(log['faults'], f, indent=1)
     with open(os.path.join(out, 'meta.yaml'), 'a', encoding='utf-8') as f:
@@ -221,6 +244,10 @@ def write_faults(out, log):
                 "32 imu_delay, 64 gyro_scale), counts of the plant wheel angle and counts given to the firmware\"\n"
                 "  - faults_imu.csv: \"every IMU report: mask, true values (after the noise) and values given to "
                 "firmware_view; reports of an imu_loss window are dropped after this row\"\n")
+        if plant:
+            f.write("  - faults_plant.csv: \"every plant step with a plant fault row on (batch 2): step, mask of "
+                    "the rows on (bit = row index), the parameters used (V_batt, mu_hd, motor_b, motor_Tc, motor_Ts "
+                    "per wheel FL FR RL RR) and x, y, theta at the start of the step\"\n")
 
 
 def main():
@@ -240,15 +267,17 @@ def main():
     sp, dur = task_setpoint(a.task)
     duration = dur + TAIL_S
     imu = fwsim.imu_config(a)
+    params = fwsim.plant_params(a)
     if a.faults:
         try:
-            sched = load(a.faults, int(round(duration * 1000)), 'plant')
+            plant = None if fault_plant.nominal_problem(params) else 'traction'     # batch 2 plant faults
+            sched = load(a.faults, int(round(duration * 1000)), 'plant', plant)
+            fault_plant.check_params(sched.rows, params)
         except Exception as exc:                     # ScheduleError, OSError
             raise SystemExit(f'--faults {a.faults}: {exc}')
     else:
         sched = Schedule((), '', '')
     fw = fwsim.FirmwareSim()
-    params = fwsim.plant_params(a)
     log = FwsimFaults(sched).run(fw, sp, duration, params, imu=imu, seed=a.seed, mode=a.mode)
     met = fwsim.metrics(log)
     fwsim.write_run(a.out, log, met, fw, dict(vars(a), duration=duration), params)

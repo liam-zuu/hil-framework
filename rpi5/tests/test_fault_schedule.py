@@ -65,7 +65,10 @@ def test_parse_comments_crlf_and_blank_lines():
     HEAD.replace('target', 'wheel') + 'E1,enc_loss,FL,1,2,\n',          # columns
     HEAD,                                                                # no row
     HEAD + 'E1,enc_los,FL,1,2,\n',                                       # unknown fault
-    HEAD + 'J1,wheel_jam,FL,1,2,b_mult=2\n',                             # batch 2 is refused
+    HEAD + 'J1,wheel_jam,FL,1,2,b_mult=2\n',                             # unknown parameter of a batch 2 row
+    HEAD + 'I1,ibus_loss,ibus,1,2,\n',                                   # later parts of batch 2 are refused
+    HEAD + 'B1,body_drag,body,1,2,F=3.3\n',
+    HEAD + 'N1,load_dist,body,1,2,\n',
     HEAD + 'E1,enc_loss,FL,1.5,2,\n',                                    # not whole ms
     HEAD + 'E1,enc_loss,FL,5e3,6000,\n',
     HEAD + 'E1,enc_loss,FL,5_000,6000,\n',

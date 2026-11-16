@@ -522,6 +522,17 @@ def check_fault_check(run_dir, f):
                          f'({res.get("error") or res.get("fails")})')
 
 
+def _man_value(man, k):
+    """Manifest value compared between a fault run and its baseline. Batch 2 (design 2026-11-15 section 4.1): a
+    run with plant faults has plant 'FaultPlant', a wrapper of the plant of its baseline; it counts as the
+    class its plant record names (inner, Codex FP1-11), and stays 'FaultPlant' without one."""
+    v = man.get(k)
+    pr = (man.get('faults') or {}).get('plant_record')
+    if k == 'plant' and v == 'FaultPlant' and isinstance(pr, dict) and isinstance(pr.get('inner'), str):
+        return pr['inner']
+    return v
+
+
 def same_bench_run(a, b):
     """Why bench runs a and b are not the same run but for the schedule, or None."""
     if _run_args(a['args']) != _run_args(b['args']):
@@ -530,8 +541,9 @@ def same_bench_run(a, b):
         if a[k] != b[k] or not a[k]:
             return f'{k} {a[k]} != {b[k]}'
     for k in MAN_SAME:
-        if a['man'].get(k) != b['man'].get(k):
-            return f'manifest {k}: {a["man"].get(k)!r} != {b["man"].get(k)!r}'
+        va, vb = (_man_value(m['man'], k) for m in (a, b))
+        if va != vb:
+            return f'manifest {k}: {va!r} != {vb!r}'
     if a['gain'] != b['gain']:
         return f'#gain {a["gain"]} != {b["gain"]}'
     return None
