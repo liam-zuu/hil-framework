@@ -853,8 +853,9 @@ def true_yaw(rate, t_start, t_end):
     return fine, np.concatenate([[0.0], np.cumsum((r[1:] + r[:-1]) / 2 * 1e-3)]), r
 
 
-def write_frames(path, rate, t_start, t_end, offset, psi0=0.4, fps=60.0, err=None):
-    """Camera frames: t_s = t_log - offset; psi = true yaw + psi0 (+ err(t_log)), wrapped; wz exact."""
+def write_frames(path, rate, t_start, t_end, offset, psi0=0.4, fps=60.0, err=None, hide=None):
+    """Camera frames: t_s = t_log - offset; psi = true yaw + psi0 (+ err(t_log)), wrapped; wz exact; car_seen = 0
+    for t_log in hide = (a, b)."""
     fine, tru, r = true_yaw(rate, t_start, t_end)
     tl = np.arange(t_start + 0.01, t_end - 0.01, 1 / fps)
     psi = np.interp(tl, fine, tru) + psi0 + (np.array([err(x) for x in tl]) if err else 0.0)
@@ -862,19 +863,20 @@ def write_frames(path, rate, t_start, t_end, offset, psi0=0.4, fps=60.0, err=Non
         w = csv.writer(f)
         w.writerow(FCOLS)
         for i, t in enumerate(tl):
-            w.writerow([i, repr(float(t - offset)), 1, 1, repr(float(wrap(psi[i]))), repr(float(rate(t)))])
+            seen = 0 if hide and hide[0] <= t < hide[1] else 1
+            w.writerow([i, repr(float(t - offset)), 1, seen, repr(float(wrap(psi[i]))), repr(float(rate(t)))])
 
 
-def _c8_pair(tmp_path, lat=0.004, s_plus=0.0, err=None, name='r', t_tail=7.0):
-    """+300 / -300 deg in a 16 s run_active (>= T_cmd of F08), still t_tail s after it."""
+def _c8_pair(tmp_path, lat=0.004, s_plus=0.0, err=None, name='r', t_tail=7.0, hide=None, w=2.0):
+    """+300 / -300 deg (rate w) in a 16 s run_active (>= T_cmd of F08), still t_tail s after it."""
     a = 13.0
-    t1 = a + math.radians(300) / 2.0
-    t2 = t1 + math.radians(300) / 2.0
-    rate = lambda t: 2.0 if a <= t < t1 else (-2.0 if t1 <= t < t2 else 0.0)      # noqa: E731
+    t1 = a + (math.radians(300) / w if w else 0.0)
+    t2 = t1 + (math.radians(300) / w if w else 0.0)
+    rate = lambda t: w if a <= t < t1 else (-w if t1 <= t < t2 else 0.0)      # noqa: E731
     lg, fr = str(tmp_path / f'{name}.csv'), str(tmp_path / f'{name}_frames.csv')
     end = a + 16.0 + t_tail
     make_log(lg, rate, end, lat=lat, s_plus=s_plus, run=(a, a + 16.0))
-    write_frames(fr, rate, 10.0, end, offset=0.5, err=err)
+    write_frames(fr, rate, 10.0, end, offset=0.5, err=err, hide=hide)
     return fr, lg
 
 
@@ -903,11 +905,55 @@ def test_tre_wrong_offset_refused(tmp_path):
         U.tre_one(fr, lg, 0.6)
 
 
+def test_tre_reports_contrast(tmp_path):
+    """B8S-12: each run reports the RMS at the grid edges against the minimum, to judge identifiability at C8."""
+    fr, lg = _c8_pair(tmp_path, lat=0.004)
+    r = U.tre_one(fr, lg, 0.5)
+    assert r['rms_edge_rad'] > r['rms_rad'] and r['contrast'] > 2.0
+    g = U.tre([(fr, lg, 0.5)], dict(s_plus=0.0, s_minus=0.0))
+    assert g['contrast_min'] == pytest.approx(r['contrast'])
+
+
+def test_tre_refuses_run_without_yaw_motion(tmp_path):
+    """B8S-12: no yaw motion in the run: RMS flat over the grid, tau not identifiable; refused with that reason."""
+    fr, lg = _c8_pair(tmp_path, w=0.0)
+    with pytest.raises(U.InputError, match='no yaw motion'):
+        U.tre_one(fr, lg, 0.5)
+
+
+def test_tre_names_failed_run(tmp_path):
+    """B8S-12: tre stops on a run that cannot give tau, naming it."""
+    fr, lg = _c8_pair(tmp_path)
+    fr2, lg2 = _c8_pair(tmp_path, w=0.0, name='r2')
+    with pytest.raises(U.InputError, match='run 2'):
+        U.tre([(fr, lg, 0.5), (fr2, lg2, 0.5)], dict(s_plus=0.0, s_minus=0.0))
+
+
+def test_kiem_not_ok_without_compared_frames(tmp_path):
+    """B8S-15: car not seen during the run (still parts seen): no dynamic evidence, so not OK."""
+    fr, lg = _c8_pair(tmp_path, hide=(12.9, 30.0))
+    u = _u_file(tmp_path, lg, tau=0.004)
+    r = U.kiem(fr, lg, 0.5, u, 'O1-F08', u_psi=math.radians(0.5))
+    assert r['n_compared'] == 0 and r['n_over'] == 0
+    assert r['align_ok'] and r['closure_ok'] is True                  # the old rule would have said OK
+    assert r['compared_ok'] is False and not r['ok']
+
+
+def test_kiem_not_ok_with_few_compared_frames(tmp_path):
+    """B8S-15: fewer than n_min compared frames in the window: not OK, even with no frame over the limit."""
+    fr, lg = _c8_pair(tmp_path, hide=(13.3, 30.0))
+    u = _u_file(tmp_path, lg, tau=0.004)
+    r = U.kiem(fr, lg, 0.5, u, 'O1-F08', u_psi=math.radians(0.5))
+    assert 0 < r['n_compared'] < 30 and r['n_over'] == 0
+    assert r['align_ok'] and r['closure_ok'] is True
+    assert r['compared_ok'] is False and not r['ok']
+
+
 def test_kiem_clean_run_ok(tmp_path):
     fr, lg = _c8_pair(tmp_path)
     u = _u_file(tmp_path, lg, tau=0.004)
     r = U.kiem(fr, lg, 0.5, u, 'O1-F08', u_psi=math.radians(0.5))
-    assert r['ok'] and r['n_over'] == 0 and r['closure_ok'] is True
+    assert r['ok'] and r['n_over'] == 0 and r['closure_ok'] is True and r['compared_ok'] is True
     assert r['n_compared'] > 0.95 * r['n_win']
 
 
