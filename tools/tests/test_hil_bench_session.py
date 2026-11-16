@@ -568,8 +568,10 @@ def _plan(*runs):
 def test_s06_plan_parses_and_refuses():
     plan = _plan('t2=--load-schedule s.csv --steps 70000', 't5=--steps 620000')
     got = hb.plan_s06(['t2=heavy,60', 't5=zero,610,logger-first'], plan)
-    assert got == dict(t2=dict(profile='heavy', duration=60, logger_first=False, steps=70000),
-                       t5=dict(profile='zero', duration=610, logger_first=True, steps=620000))
+    assert got == dict(t2=dict(profile='heavy', duration=60, logger_first=False, steps=70000, marker='10hz',
+                               add_marker=True),
+                       t5=dict(profile='zero', duration=610, logger_first=True, steps=620000, marker='10hz',
+                               add_marker=True))
     bad = ['x=heavy,60',                        # no such --run
            't2=fast,60', 't2=heavy,0', 't2=heavy,6x', 't2=heavy,60,plant-first', 't2=heavy']
     for spec in bad:
@@ -619,7 +621,7 @@ def test_s06_bench_runs_s06_logger_and_records(tmp_path, monkeypatch):
     assert ('~/r/t2_esp', True) in scps
     s = _j.load(open(os.path.join(a.out, 'session.json'), encoding='utf-8'))
     assert s['runs'][0]['s06'] == dict(profile='heavy', duration=60, logger_first=False, steps=70000,
-                                       esp32_ip='192.168.1.181')
+                                       marker='10hz', add_marker=True, esp32_ip='192.168.1.181')
     assert 'logger_cmd' not in s['runs'][0]
 
 

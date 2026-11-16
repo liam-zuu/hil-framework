@@ -6,7 +6,8 @@ Spec S06 v3.4 mục 8 (thiết kế: 03_CODE/docs/2026-10-29_Thiet_ke_env_s06_lo
 Q-S1 = 1 ms, Q-S2 = lệnh UDP). Nhận hai luồng UDP:
   - DATA 100 Hz của logger.c (cổng 5005, CSV + dòng '#run_end' của đường motor_off);
   - sự kiện của s06_load.c (cổng 5007: J, I, R, P, E, S và dòng '#...').
-Gửi lệnh tới ESP32 (cổng 5011): `START <zero|heavy|t6> <s> <0|1>`, `STOP <lý do>`.
+Gửi lệnh tới ESP32 (cổng 5011): `START <zero|heavy|t6|t3> <s> <0|1>`, `STOP <lý do>` (t3: S06 T3, PWM 0 như zero, bật
+ngắt PF3/encoder/GPIO37 của s06_load; Liam 17/11 CODE_S06 "Hồ sơ t3 riêng (Recommended)").
 
 Ghi log thô nguyên văn: mỗi dòng nhận được ghi thành `<t_rx_us>\t<dòng>`, t_rx_us là
 time.monotonic_ns() // 1000 trên RPi5 lúc nhận gói (dùng cho luật T9: t_rx(#run_end) − t_rx(#run_start)).
@@ -279,7 +280,7 @@ def write_capture_yaml(args, cap, sent, t0_wall, t0, result, stop_reason):
 def main(argv=None):
     p = argparse.ArgumentParser(description="Nhận log ESP32 s06_load và chạy một lượt S06")
     p.add_argument("--esp32", required=True, help="IP của ESP32 (nhận lệnh UDP)")
-    p.add_argument("--profile", required=True, choices=["zero", "heavy", "t6"])
+    p.add_argument("--profile", required=True, choices=["zero", "heavy", "t6", "t3"])
     p.add_argument("--duration", required=True, type=int, help="thời lượng lượt [s]")
     p.add_argument("--no-auto-end", action="store_true",
                    help="ESP32 không tự kết thúc; Pi gửi STOP lúc t_rx(#run_start) + thời lượng (T9)")

@@ -32,6 +32,7 @@ import math
 import multiprocessing as mp
 import os
 import signal
+import struct
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -40,7 +41,8 @@ from timing import PrecisionTimer, set_realtime, pin_cpu, lock_memory
 from gpio_sync import GPIOSync
 from spi_master import SPIMaster
 from protocol import (encode_state, decode_torques, TRAJ_VALID, TRAJ_NEW, OFS_MISO_SEQ, CMD_SWA_ON,
-                      miso_check, MISO_OK, MISO_EMPTY, FRAME_SIZE, new_run_id, miso_id, state_out_of_range)
+                      miso_check, MISO_OK, MISO_EMPTY, FRAME_SIZE, new_run_id, miso_id, state_out_of_range,
+                      STATE_RANGES)
 from plant_interface import PlantInterface, MockPlant
 from mecanum_plant import MecanumPlant
 from imu_model import imu_from_plant
@@ -73,6 +75,41 @@ MISO_SKIP_FRAMES = 2
 # id_confirmed False; Codex RS4-R10-2, Liam 14/11 CODE_RS4 "Sửa hẹp + vòng 11"). The H7 answers frame N in N + 2.
 # Simulate mode confirms on the run_id alone (the echo and FakeH7 send no CRC) and never fails on it.
 ID_CHECK_FRAMES = 50
+# S06 T3 marker pin (spec S06 T3: "chân đánh dấu chỉ nâng ở frame có bậc"; T6 line: in a run that is not T3
+# the Pi raises it every 100th frame, 10 Hz, [ĐỀ XUẤT CODE_S06 15/11]; design 2026-11-15_Thiet_ke_S06_T3 4.1).
+# '' keeps the sync pulse of every frame (pulse() before get_state, the path before T3); see marker_due.
+MARKER_MODES = ('', 't3', '10hz')
+MARKER_EVERY = 100
+ENC_OMEGA_MIN = 0.3   # rad/s, encoder_gen.c ENC_OMEGA_MIN: |omega| at or below it stops the wheel
+
+
+def _frame_omega_raw(mosi) -> tuple:
+    """The four wheel speeds of a MOSI frame as int16 (bytes 0-7, big-endian; protocol.encode_state)."""
+    return struct.unpack_from('>4h', bytes(mosi[:8]))
+
+
+def marker_due(mode: str, step: int, prev_mosi, mosi) -> bool:
+    """True if the marker pin rises on this frame.
+    '10hz': every MARKER_EVERY-th frame (step 0, 100, 200, ...).
+    't3': a frame whose int16 speed of some wheel differs from the previous frame sent, with both the old
+    and the new speed past ENC_OMEGA_MIN and of the same sign, i.e. the H7 change it makes is a retime
+    (EncoderGen_SetOmega: same direction, new speed; PF3 toggles there), not a start or a stop (no PF3
+    edge). The H7 retimes only if the half period hp changes too: the T3 schedule checks that
+    (t3_schedule.py). Step 0 and a frame after none are never marked."""
+    if mode == '10hz':
+        return step % MARKER_EVERY == 0
+    if mode != 't3' or prev_mosi is None:
+        return False
+    old, new = _frame_omega_raw(prev_mosi), _frame_omega_raw(mosi)
+    for i in range(4):
+        if old[i] == new[i]:
+            continue
+        w0 = old[i] * STATE_RANGES[i] / 32767.0
+        w1 = new[i] * STATE_RANGES[i] / 32767.0
+        if abs(w0) > ENC_OMEGA_MIN and abs(w1) > ENC_OMEGA_MIN and (w0 > 0) == (w1 > 0):
+            return True
+    return False
+
 
 log =logging.getLogger('hil.node')
 
@@ -136,6 +173,10 @@ class HILConfig:
     # I8: SWA command bit (MOSI byte 20 bit 3), see SWA_MODES. Default 'off': a node
     # built without a choice never turns the DUT motors on (run_hil.py resolves --swa)
     swa_mode:          str   = 'off'
+    # S06 T3 marker pin (design 2026-11-15_Thiet_ke_S06_T3_danh_dau_v1 section 4.1, see MARKER_MODES):
+    # '' = the sync pulse of every frame as before; 't3' / '10hz' = rise right before the transfer of a
+    # marked frame, fall right after it, no pulse on the other frames
+    marker_mode:       str   = ''
     jitter_warn_us:    float = 500.0       # warn if jitter exceeds this
     stats_interval:    int   = 10_000      # print stats every N steps
 
@@ -237,6 +278,11 @@ class HILNode:
         self._ref         = (0.0, 0.0, 0.0)
         self._ref_count   = 0.0
 
+        if self.cfg.marker_mode not in MARKER_MODES:
+            raise ValueError(f'cfg.marker_mode must be one of {MARKER_MODES}, not {self.cfg.marker_mode!r}')
+        self._marker_mode = self.cfg.marker_mode
+        self._prev_mosi: Optional[bytes] = None   # wheel-speed bytes 0-7 of the last frame sent (marker 't3')
+        self._marks = 0
         self._gpio  = GPIOSync(
             pin=self.cfg.gpio_pin,
             gpiochip=self.cfg.gpio_chip,
@@ -287,6 +333,9 @@ class HILNode:
             if self._faults is not None:
                 # L82: the frame of today's code before the injection, every step (mosi = what was sent)
                 self._flog['mosi_true'] = np.zeros_like(self._flog['mosi'])   # same width as mosi
+            if self._marker_mode:
+                # S06 T3: 1 = the marker pin rose right before this frame's transfer (t_pulse0/1 bracket it)
+                self._flog['marker'] = np.zeros(n, dtype=np.uint8)
             self._flog_n = n
             # np.zeros maps pages lazily: without this, a page fault every ~100 frames inside the loop
             if self.cfg.rt_tune:
@@ -370,12 +419,15 @@ class HILNode:
           4. Write shared state
         """
         # 1. Sync pulse — H7 EXTI fires, enables DMA receive
-        if self._flog is not None:
-            t_p0 = time.monotonic_ns()
-            self._gpio.pulse()
-            t_p1 = time.monotonic_ns()
-        else:
-            self._gpio.pulse()
+        # (S06 T3 marker mode: no pulse here; the pin rises right before the transfer below)
+        marker = self._marker_mode
+        if not marker:
+            if self._flog is not None:
+                t_p0 = time.monotonic_ns()
+                self._gpio.pulse()
+                t_p1 = time.monotonic_ns()
+            else:
+                self._gpio.pulse()
 
         # 2. Encode current state + setpoint, send MOSI, receive MISO (torques from H7)
         traj_flags = 0
@@ -410,9 +462,23 @@ class HILNode:
         # L82: the faults of the schedule patch the frame (never bytes 40-47, run_id / frame_no, rule 3.7);
         # without a schedule mosi is mosi_true
         mosi = mosi_true if self._faults is None else self._faults.patch(self._step, mosi_true)
+        if marker:
+            # S06 T3 (spec T3, W9, Y15): rise right before the transfer of a marked frame, fall right after;
+            # t_pulse0/1 bracket the rise (on an unmarked frame: two clock reads at the same place, so the
+            # Pi reference time of s06_frames_decode stays defined for every frame)
+            mark = marker_due(marker, self._step, self._prev_mosi, mosi)
+            t_p0 = time.monotonic_ns()
+            if mark:
+                self._gpio.rise()
+            t_p1 = time.monotonic_ns()
         t_send = time.monotonic_ns()
         miso   = self._spi.transfer(mosi)
         t_recv = time.monotonic_ns()
+        if marker:
+            if mark:
+                self._gpio.fall()
+                self._marks += 1
+            self._prev_mosi = bytes(mosi[:8])
         chk = miso_check(miso)
         if self._id_first_step is None:
             # RS-4 P1: first good-CRC MISO carrying this run's run_id and a frame already sent (Codex RS4-R10-2)
@@ -462,6 +528,8 @@ class HILNode:
             self._flog['miso'][k] = memoryview(bytes(miso))
             if self._faults is not None:
                 self._flog['mosi_true'][k] = memoryview(mosi_true)
+            if marker:
+                self._flog['marker'][k] = mark
 
         # 3. Advance plant dynamics
         # (ARM holds the plant at its initial state: no integration of the old DUT's PWM)
@@ -597,6 +665,9 @@ class HILNode:
                         state_out_of_range=self._state_bad,                             # B81-15
                         xfer_us=self._xfer_stats(n), timer_overruns=int(self._timer.overruns),
                         **self.swa_tail())                                             # I8-R2-3
+        if self._marker_mode:
+            # S06 T3 (CODE 17/11: the default run keeps its manifest as it was): only with --marker
+            manifest.update(marker_mode=self._marker_mode, marker_frames=int(self._marks))
         np.savez(self.cfg.frame_log, manifest=np.array(json.dumps(manifest)),
                  **{k: v[:n] for k, v in self._flog.items()})
         log.info('Frame log: %d frames -> %s', n, self.cfg.frame_log)

@@ -528,6 +528,11 @@ def _parse_args() -> argparse.Namespace:
                    help='I8: RC switch SWA in the iBUS frames of the H7 (DUT motors). auto: with '
                         '--finite-run on in RUN and STOPPING only; without it on when a trajectory '
                         'runs and no omega mode is set, off otherwise (diagnostics). on / off: fixed')
+    p.add_argument('--marker',        choices=('t3', '10hz'), default=None,
+                   help='S06 T3 marker pin (GPIO17, to the ESP32 GPIO38 under s06_load): rise right before the '
+                        'transfer of a marked frame, fall after it, no sync pulse on the other frames. t3: '
+                        'frames that retime a wheel (--omega-schedule of t3_schedule.py); 10hz: every 100th '
+                        'frame (clock ESP32 <-> Pi in the other s06_load runs). Default: the pulse of every frame')
     return p.parse_args()
 
 
@@ -657,6 +662,7 @@ def main() -> int:
         rt_tune      = not args.no_rt_tune,
         heavy_block  = heavy_block,
         load_schedule = load_id,
+        marker_mode  = args.marker or '',
     )
     log.info('IMU noise (L72): %s', 'off' if hil_cfg.imu_noise is None else
              hil_cfg.imu_noise.describe())
