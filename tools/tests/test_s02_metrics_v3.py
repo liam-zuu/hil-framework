@@ -419,7 +419,9 @@ def test_loss_over_one_percent_or_a_reset_mid_run_is_broken_through_compare(tmp_
     assert [st[r]['status'] for r in ('g1', 'g2', 'g3')] == ['ok'] * 3
     assert st['lossy']['status'] == 'broken' and st['lossy']['status_reason'].startswith('missing_over')
     assert st['lossy']['missing_over'] == 1 and st['lossy']['missing_pct'] > 1.0 and 'e_vx' not in st['lossy']
-    assert all(k in st['lossy'] for k in M.BROKEN_KEEP)                 # loss and reset columns kept (S2M2-T)
+    for k in ('missing_pct', 'gen_pause_n', 'missing_over', 'missing_seq_pct', 'missing_tail_known', 'pos_reset_mid',
+              'run_bad', 'run_bad_reason'):
+        assert k in st['lossy'] and k in st['bad'], k                   # loss and reset columns kept (S2M2-T)
     assert st['bad']['status'] == 'broken' and 'mid-run' in st['bad']['status_reason']
     assert st['bad']['run_bad'] == 1 and 'e_vx' not in st['bad'] and 'e_p_rms' not in st['bad']
     with open(os.path.join(h, 'metrics.csv'), newline='') as f:

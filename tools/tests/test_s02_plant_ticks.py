@@ -744,6 +744,47 @@ def test_an_ending_edge_cancelled_by_a_stop_gives_no_rest_bound():
     assert np.all((lo_s - 1e-6 <= u) & (u <= hi_s + 1e-6)), float(np.max(np.maximum(lo_s - u, u - hi_s)))
 
 
+def _wheel_of(segs, broken_seg=None, n_edges_total=0, trusted_upto=None):
+    """A stand-in for _Wheel with given segments (rest first): only what _rest_holds reads."""
+    from types import SimpleNamespace
+    full = [dict(t0=-math.inf, w0=0.0, kind='rest', dir=0, o_lo=0, o_hi=0, n_edges=0, first_edge=0, hp_min=math.inf)]
+    e0 = 0
+    for k, sg in enumerate(segs, start=1):
+        sg = dict(dict(w0=4.0, o_lo=0, o_hi=0, n_edges=0, hp_min=math.inf, kind='start' if sg['dir'] else 'stop'), **sg,
+                  first_edge=e0)
+        e0 += sg['n_edges']
+        full.append(sg)
+    t = np.arange(e0, dtype=float) * 10.0
+    tr = np.ones(e0, bool) if trusted_upto is None else (np.arange(e0) < trusted_upto)
+    return SimpleNamespace(segs=full, broken_seg=len(full) if broken_seg is None else broken_seg, t=t, hi=np.zeros(e0),
+                           trusted=tr)
+
+
+def test_rest_holds_by_hand():
+    """S2M2-1: the counts a wheel can show after the next boundary of segment 1, by hand: a stop that may take back
+    3 edges; a moving last segment (no bound on its side); from the first untrusted edge on, the trusted edges before
+    the boundary as the lower bound and 4 ceil(dur / hp_min) + 4 as the upper bound."""
+    # start 5 edges, stop that may take back 3, a reversal of 1 edge, stop: counts after the stop in [1, 5]
+    wh = _wheel_of([dict(dir=1, t0=0.0, n_edges=5), dict(dir=0, t0=1e5, o_lo=-3), dict(dir=-1, t0=2e5, n_edges=1),
+                    dict(dir=0, t0=3e5)])
+    assert pt._rest_holds(wh, 0, 2) is False and pt._rest_holds(wh, 0, 6) is True
+    assert pt._rest_holds(wh, 0, 0) is True                              # 5 - 3 - 1 = 1 is the lowest
+    # a moving last segment goes on past the frame log
+    wh = _wheel_of([dict(dir=1, t0=0.0, n_edges=5), dict(dir=0, t0=1e5), dict(dir=1, t0=2e5, n_edges=2)])
+    assert pt._rest_holds(wh, 0, 100) is False and pt._rest_holds(wh, 0, 4) is True
+    # untrusted edges in a later reversal (broken segment 3): up to 4 ceil(100.004 ms / 1 ms) + 4 = 408 edges back
+    wh = _wheel_of([dict(dir=1, t0=0.0, n_edges=500), dict(dir=0, t0=6e5),
+                    dict(dir=-1, t0=7e5, n_edges=2, hp_min=1000.0), dict(dir=0, t0=8e5)], broken_seg=3,
+                   trusted_upto=500)
+    assert pt._rest_holds(wh, 0, 200) is False and pt._rest_holds(wh, 0, 92) is False and pt._rest_holds(wh, 0, 91)
+    # untrusted from segment 1 on: only the first 100 edges are certain before the stop; up to 4 ceil(...) + 4 edges
+    wh = _wheel_of([dict(dir=1, t0=0.0, n_edges=500, hp_min=1000.0), dict(dir=0, t0=500_000.0)], broken_seg=1,
+                   trusted_upto=100)
+    assert pt._rest_holds(wh, 0, 200) is False and pt._rest_holds(wh, 0, 99) is True
+    assert pt._rest_holds(wh, 0, 2009) is True and pt._rest_holds(wh, 0, 2008) is False   # 4 ceil(500.004) + 4
+    assert pt._rest_holds(_wheel_of([dict(dir=1, t0=0.0, n_edges=5)]), 0, 3) is True   # no later boundary
+
+
 def test_rest_bound_per_start_offset():
     """S2M1-3 per offset: the count can read c0 until edge |O| + 1 when O dips against the motion, until the first edge
     when O = 0, only inside the start window when O moves with it; an untrusted ending edge gives no bound."""
