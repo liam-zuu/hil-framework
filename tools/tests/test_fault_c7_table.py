@@ -573,3 +573,114 @@ def test_cli_bench_refuses_without_fault_check(tmp_path):
     write_bench(str(tmp_path), 'no_check')
     r = subprocess.run([sys.executable, tool, str(tmp_path)], capture_output=True, text=True, timeout=120)
     assert r.returncode == 2 and 'no fault_check' in r.stderr
+
+
+
+# ── batch 2 plant faults (design 2026-11-15 section 7.2): per-wheel saturation, yaw deviation, ramp split,
+# zone entry from the plant record ───────────────────────────────────────────
+B_ROW = dict(id='B1', fault='batt_sag', target='batt', start_ms=3000, end_ms=5000, params=dict(v1=7.44, ramp_ms=1000))
+Z_ROW = dict(id='Z1', fault='mu_zone', target='all', start_ms=3000, end_ms=5000,
+             params=dict(x0=1.0, x1=2.0, y0=-0.5, y1=0.5, mu=0.2))
+REC_COLS = ('step', 'mask', 'V_batt', 'mu_fl', 'mu_fr', 'mu_rl', 'mu_rr', 'b_fl', 'b_fr', 'b_rl', 'b_rr',
+            'tc_fl', 'tc_fr', 'tc_rl', 'tc_rr', 'ts_fl', 'ts_fr', 'ts_rl', 'ts_rr', 'x', 'y', 'theta')
+
+
+def plant_record(step0=0, mask=3, zone_on=True):
+    """Steps 3000..4999 (+ step0): x = -5 (all hubs out), 1.5 from 4000 (front hubs in), 5 from 4500 (out)."""
+    k = np.arange(3000, 5000)
+    rec = np.zeros((len(k), len(REC_COLS)))
+    rec[:, 0] = k + step0
+    rec[:, 1] = mask if zone_on else 1
+    rec[:, REC_COLS.index('x')] = np.where(k < 4000, -5.0, np.where(k < 4500, 1.5, 5.0))
+    return rec
+
+
+def plant_log():
+    lg = base_log()
+    lg['v_vx'] = lg['sp_vx'] + np.where((T >= 3.0) & (T < 4.0), 0.1, np.where((T >= 4.0) & (T < 6.0), 0.3, 0.0))
+    lg['pwm_rr'][(T >= 3.0) & (T < 4.0)] = 1000             # 100 of 300 span ticks, wheel RR only
+    lg['theta'][:] = -3.1
+    lg['theta'][T == 4.0] = 2.9                             # |2.9 - 3.1| = 0.2 > the wrapped 0.0832 elsewhere
+    return lg
+
+
+def write_plant_case(d, rows, rec=None):
+    write_case(d, plant_log(), rows=rows)
+    if rec is not None:
+        np.savetxt(os.path.join(d, 'faults_plant.csv'), rec, delimiter=',', header=','.join(REC_COLS),
+                   comments='', fmt='%.17g')
+
+
+def test_plant_columns_fwsim(tmp_path):
+    write_case(str(tmp_path / 'PID_base'), base_log())
+    write_plant_case(str(tmp_path / 'PID_sagzone'), [B_ROW, Z_ROW], plant_record())
+    r = ct.table(str(tmp_path))[0]
+    assert r['sat_frac_rr'] == pytest.approx(100 / 300) and r['sat_frac_fl'] == 0 and r['base_sat_frac_rr'] == 0
+    assert r['sat_frac'] == pytest.approx(100 / 1200)
+    assert r['yaw_dev_max'] == pytest.approx(0.2, abs=1e-6)
+    assert r['ramp_end_s'] == pytest.approx(4.0)
+    assert r['err_rms_ramp_vx'] == pytest.approx(0.1, abs=1e-6) and r['err_rms_hold_vx'] == pytest.approx(0.3, abs=1e-6)
+    assert r['base_err_rms_ramp_vx'] == 0 and r['base_err_rms_hold_vx'] == 0
+    assert r['err_rms_ramp_wz'] == pytest.approx(0.01, abs=1e-6)
+    assert (r['zone_in_s'], r['zone_out_s']) == (4.0, 4.5)
+
+
+def test_plant_columns_blank_without_such_rows(tmp_path):
+    write_case(str(tmp_path / 'PID_base'), base_log())
+    write_case(str(tmp_path / 'PID_encFL'), fault_log(), rows=[ROW])
+    r = ct.table(str(tmp_path))[0]
+    assert r['ramp_end_s'] is None and r['err_rms_ramp_vx'] is None and r['base_err_rms_hold_wz'] is None
+    assert r['zone_in_s'] is None and r['zone_out_s'] is None
+    assert r['sat_frac_fl'] == pytest.approx(50 / 300) and r['sat_frac_fr'] == 0          # always written
+    assert r['yaw_dev_max'] == pytest.approx(2 * math.pi - 6.2, abs=1e-6)
+
+
+@pytest.mark.parametrize('rec,want', [
+    (lambda: plant_record(zone_on=False), (None, None)),        # the zone row is never on in the record
+    (lambda: plant_record()[:1200], (4.0, None)),               # still inside when the record ends
+])
+def test_zone_times_edges(tmp_path, rec, want):
+    write_case(str(tmp_path / 'PID_base'), base_log())
+    write_plant_case(str(tmp_path / 'PID_zone'), [B_ROW, Z_ROW], rec())
+    r = ct.table(str(tmp_path))[0]
+    assert (r['zone_in_s'], r['zone_out_s']) == want
+
+
+def test_ramp_zero_has_no_ramp_part(tmp_path):
+    write_case(str(tmp_path / 'PID_base'), base_log())
+    write_plant_case(str(tmp_path / 'PID_sag'), [dict(B_ROW, params=dict(v1=7.44, ramp_ms=0))])
+    r = ct.table(str(tmp_path))[0]
+    assert r['ramp_end_s'] == 3.0 and r['err_rms_ramp_vx'] is None
+    assert r['err_rms_hold_vx'] == pytest.approx(math.sqrt((100 * 0.01 + 200 * 0.09) / 300), abs=1e-6)
+
+
+def test_zone_row_without_record_cannot_be_tabled(tmp_path):
+    write_case(str(tmp_path / 'PID_base'), base_log())
+    write_plant_case(str(tmp_path / 'PID_zone'), [Z_ROW])
+    assert ct.main([str(tmp_path)]) == 2
+
+
+def test_bench_plant_record_steps_from_t0(tmp_path, fake_check):
+    d = str(tmp_path)
+    write_bench(d)
+    npz = os.path.join(d, 'frames', 'PID_enc_FL_frames.npz')
+    z = np.load(npz)
+    arrs = {k: z[k] for k in z.files}
+    man = json.loads(str(arrs['manifest']))
+    rec_name = 'PID_enc_FL_frames_plant_faults.npz'
+    man['faults']['rows'] = [ROW, B_ROW, Z_ROW]
+    man['faults']['plant_record'] = dict(file=rec_name, sha256='x', rows=2000, inner='MecanumPlant')
+    man['plant'] = 'FaultPlant'
+    arrs['manifest'] = np.array(json.dumps(man))
+    np.savez(npz, **arrs)
+    np.savez(os.path.join(d, 'frames', rec_name), record=plant_record(step0=T0, mask=6),
+             cols=np.array(json.dumps(list(REC_COLS))))
+    r = ct.table(d)[0]
+    assert (r['zone_in_s'], r['zone_out_s']) == (4.0, 4.5)              # record steps - t0
+    assert r['ramp_end_s'] == 4.0
+    q = 3.0 / 32767
+    assert r['err_rms_ramp_wz'] == pytest.approx(0.01, abs=1e-3) and r['base_err_rms_ramp_vx'] == pytest.approx(0, abs=q)
+    assert r['sat_frac_fl'] == pytest.approx(50 / 300) and r['sat_frac_rr'] == 0
+    assert r['yaw_dev_max'] >= 0
+    kf = list(r)
+    assert kf.index('ticks_expected') + 1 == kf.index('sat_frac_fl') and kf[-1] == 'blank'

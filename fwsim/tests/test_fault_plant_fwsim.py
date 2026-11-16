@@ -187,3 +187,32 @@ def test_en_reaching_the_plant_is_the_runtime_en(fw, monkeypatch):   # Codex FP2
     assert len(seen) == 1000 and not any(is_base for is_base, _, _ in seen)      # the variant, every step
     assert all(got == want for _, got, want in seen)
     assert {want for _, _, want in seen} == {0.0, 1.0}                           # EN changed during the run
+
+
+
+def test_c7_table_reads_real_plant_fault_output(fw, tmp_path):
+    """tools/fault_c7_table.py (batch 2 columns, design 7.2) on folders written as fault_run.py writes them:
+    faults_plant.csv is read, the ramp of batt_sag and the zone entry of mu_zone are in the row."""
+    sys.path.insert(0, os.path.join(HERE, '..', '..', 'tools'))
+    import fault_c7_table as ct
+    cfg = dict(task='A-W1', mode='PID', seed=0, imu_rate=20.0, imu_boot_reset=-1.0, imu_noise='replay',
+               imu_noise_seed=0, ground=None, mu=None, no_imu=False, duration=4.0)
+    body = ('B1,batt_sag,batt,1000,3000,v1=7.44;ramp_ms=1000\n'
+            'Z1,mu_zone,all,1000,3000,x0=0.6;x1=5;y0=-1;y1=1;mu=0.2\n')
+    for name, s in (('PID_base', fs.Schedule(())), ('PID_sagzone', sched(body))):
+        log = run(fw, s)
+        out = str(tmp_path / name)
+        fwsim.write_run(out, log, fwsim.metrics(log), fw, dict(cfg), MecanumParams())
+        fault_run.write_faults(out, log)
+    assert os.path.isfile(str(tmp_path / 'PID_sagzone' / 'faults_plant.csv'))
+    (r,) = ct.table(str(tmp_path))
+    assert r['case'] == 'sagzone' and r['ramp_end_s'] == 2.0
+    assert r['err_rms_ramp_vx'] is not None and r['err_rms_hold_vx'] is not None
+    rec = np.loadtxt(str(tmp_path / 'PID_sagzone' / 'faults_plant.csv'), delimiter=',', skiprows=1, ndmin=2)
+    nom = MecanumParams()
+    x, y, th = rec[:, 19], rec[:, 20], rec[:, 21]
+    hub_x = np.max([x + np.cos(th) * sx * nom.lx - np.sin(th) * sy * nom.ly           # largest hub x
+                    for sx, sy in ((1, 1), (1, -1), (-1, 1), (-1, -1))], axis=0)
+    k_in = rec[np.nonzero(hub_x >= 0.6)[0][0], 0] / 1000.0                          # |y| << 1: x decides
+    assert r['zone_in_s'] == k_in and 1.0 < r['zone_in_s'] < 3.0
+    assert r['zone_out_s'] is None                          # x1 = 5 m: never left while the row is on
