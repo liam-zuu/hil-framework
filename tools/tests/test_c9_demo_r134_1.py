@@ -516,7 +516,7 @@ def test_c9d5_outcome_h1_is_the_one_of_the_h1_score(demo_ds):
 def test_c9d5_h1_gate_recomputes_to_its_outcome(demo_ds):
     _drop_so_h(demo_ds, 'FAKE-A1:2')
     p = _score_final(demo_ds, 'FAKE-A1:2', 3.0, 'dat', h1_gate=GATES['khong_dat']())
-    with pytest.raises(rl.LogError, match='disagrees with the gate of the H1 score'):
+    with pytest.raises(rl.LogError, match='the gate of the H1 score: --outcome dat disagrees with the gate'):
         rl.so_h(demo_ds, 'FAKE-A1:2', p)
 
 
@@ -549,3 +549,98 @@ def test_c9d7_first_seq_near_the_wrap_in_the_events_is_evidence(tmp_path):
         f.write(''.join(f'{x}\n' for x in lines))
     why = T.run_gain_problem(p, _want(tmp_path))
     assert why and 'R134C10-1' in why
+
+
+# ── C9D2-1…6 (Codex C9 demo round 2; Liam 17/11 at CODE_C13 "Sửa cả 6 + vòng 3 (Recommended)") ─────────────────────
+def test_c9d2_1_lost_h1_with_a_null_gate(demo_ds):
+    _drop_so_h(demo_ds, 'FAKE-A1:2')
+    p = _score_final(demo_ds, 'FAKE-A1:2', 3.0, 'hong_he_do',
+                     edit=lambda d: d['calib_drift']['h1_score'].update(gate_v3=None))
+    r = rl.so_h(demo_ds, 'FAKE-A1:2', p)
+    assert (r['outcome_sau'], r['flags']) == ('hong_he_do', 'calib_drift')
+
+
+def _t1_gate(cat: bool):
+    """A floor gate with a tracking-error frame at t1 = 6 s: cat_t1 true is the exception before t1 (khong_dat with
+    VIOL_BEFORE, test_s05_final_table test_c4_6), false a run lost to the measurement (O1 3.5, R134C4-3)."""
+    if cat:
+        g = rl.floor_gate(rl.fake_gate(e_trk=0.5), t_done=(None, None))
+        g['g1'].update(t1=6.0, cat_t1=True, state='chua_ket_luan', q='inconclusive')
+    else:
+        g = rl.floor_gate(rl.fake_gate())
+        g['g1'].update(t1=6.0, cat_t1=False)
+    g.update(rl.o1_gate.evaluate_outcomes(g, g['decide']))
+    return g
+
+
+def test_c9d2_2_h1_goes_through_the_floor_rule_of_t1(demo_ds):
+    g = _t1_gate(False)
+    assert rl.validate_gate(g, 'HW')['outcome_decide'] == 'dat'          # the gate alone still says dat
+    _drop_so_h(demo_ds, 'FAKE-A1:2')
+    with pytest.raises(rl.LogError, match='C9D-5'):
+        rl.so_h(demo_ds, 'FAKE-A1:2', _score_final(demo_ds, 'FAKE-A1:2', 3.0, 'dat', h1_gate=g))
+
+
+def test_c9d2_2_h1_with_the_exception_before_t1_is_kept(demo_ds):
+    _drop_so_h(demo_ds, 'FAKE-A1:2')                                    # H0 khong_dat, H1 khong_dat by cat_t1
+    r = rl.so_h(demo_ds, 'FAKE-A1:2', _score_final(demo_ds, 'FAKE-A1:2', 3.0, 'khong_dat', h1_gate=_t1_gate(True)))
+    assert (r['outcome_sau'], r['flags']) == ('khong_dat', 'calib_drift')
+
+
+def test_c9d2_4_retro_stop_comes_from_so_h_not_from_a_typed_cause():
+    rows = [dict(run_uid=f'S:{k}', stage='final', campaign='A-PID', gain_set_id='A-PID/G00', platform='HW',
+                 trajectory='O1-F05', speed_mps='0.5', run_outcome=o,
+                 fail_cause=rl.FAIL_SO_H if k == 3 else ('x' if o == 'hong_he_do' else ''))
+            for k, o in enumerate(('hong_he_do', 'hong_he_do', 'hong_he_do', 'dat'), start=1)]
+    assert not any(r.get(rl.RETRO_FLAG) for r in rl.mark_retro_stops(rows))
+
+
+def test_c9d2_4_log_row_with_the_so_h_cause_is_refused(demo_ds):
+    path = os.path.join(demo_ds, rl.TUNING)
+    rows = _rows(path)
+    i = next(k for k, r in enumerate(rows) if r['run_uid'] == 'FAKE-F1:1')
+    rows[i]['fail_cause'] = rl.FAIL_SO_H
+    _write_rows(path, rows)
+    with pytest.raises(rl.LogError, match=rl.FAIL_SO_H):
+        _summary(demo_ds)
+
+
+def test_c9d2_4_end_refuses_the_so_h_cause(demo_ds):
+    rl.begin(demo_ds, 'FAKE-X', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G05')
+    rl.step(demo_ds, 'run')
+    with pytest.raises(rl.LogError, match=rl.FAIL_SO_H):
+        rl.end(demo_ds, 'hong_he_do', completed=1, fail_cause=rl.FAIL_SO_H)
+
+
+def test_c9d2_5_h0_file_linked_from_outside_the_run_folder(demo_ds, tmp_path):
+    d = _row(demo_ds, 'FAKE-A1:2')['results_dir']
+    out = tmp_path / 'outside'
+    out.mkdir()
+    os.replace(os.path.join(d, 'score.json'), str(out / 'score.json'))
+    try:
+        os.symlink(str(out / 'score.json'), os.path.join(d, 'h0.json'))
+    except (OSError, NotImplementedError):
+        pytest.skip('symlinks not allowed here')
+    _drop_so_h(demo_ds, 'FAKE-A1:2')
+    p = rl.fake_score_final(d, 1.0, h0_name='h0.json')
+    with pytest.raises(rl.LogError, match='C9D-1'):
+        rl.so_h(demo_ds, 'FAKE-A1:2', p)
+
+
+def test_c9d2_5_h0_file_must_resolve_inside_the_run_folder(demo_ds, monkeypatch):
+    # where symlinks cannot be made: the H0 file resolves outside (as a link would), score_final inside
+    _drop_so_h(demo_ds, 'FAKE-A1:2')
+    p = _score_final(demo_ds, 'FAKE-A1:2', 1.0)
+    real = rl._inside
+    monkeypatch.setattr(rl, '_inside', lambda path, folder: False if os.path.basename(path) == 'score.json'
+                        else real(path, folder))
+    with pytest.raises(rl.LogError, match='C9D-1'):
+        rl.so_h(demo_ds, 'FAKE-A1:2', p)
+
+
+def test_c9d2_6_h0_file_without_the_json_suffix(demo_ds):
+    d = _row(demo_ds, 'FAKE-A1:2')['results_dir']
+    os.replace(os.path.join(d, 'score.json'), os.path.join(d, 'score_H0'))   # end --gate-json takes any name
+    _drop_so_h(demo_ds, 'FAKE-A1:2')
+    r = rl.so_h(demo_ds, 'FAKE-A1:2', rl.fake_score_final(d, 1.0, h0_name='score_H0'))
+    assert r['outcome_sau'] == 'khong_dat'

@@ -91,6 +91,7 @@ SO_H_COLS = ['run_uid', 'outcome_tam', 'outcome_sau', 'flags', 'vuot', 'D_H_mm',
              'score_final_sha256', 'ghi_luc']
 SO_H_FLAGS = ('calib_drift', 'calib_drift_split', 'thieu_H1')
 FAIL_SO_H = 'so_clip_h'                  # fail cause of a run that became hong_he_do at the comparison
+SO_H_LOST = '_so_h_lost'                 # C9D2-4: in-memory mark set by apply_so_h only (never a log column)
 RETRO_FLAG = 'sau_dung_hoi_to'           # S05 v3.38 4.3 (B8S2-2): run after a stop the comparison showed
 
 # R134 (1) (deferred at R134 round 4, R134C4-1; CODE 16/11 to CODE_C13, Liam 16/11 at CODE "Sửa demo + gộp R134(1)
@@ -894,9 +895,14 @@ def _inside(path: str, folder: str) -> bool:
         return False
 
 
+H0_MAX_BYTES = 16 * 2 ** 20            # [DE XUAT] C9D2-6: files hashed when looking for the H0 scorer file
+
+
 def h0_file(r: dict, ds: str) -> str:
-    """C9D-1 (Codex C9 demo round 1, P1): the H0 scorer file of a logged car run, the .json file under its results_dir
-    whose sha256 is the gate_json_sha256 of its row (the file given to 'end' with --gate-json)."""
+    """C9D-1 (Codex C9 demo round 1, P1): the H0 scorer file of a logged car run, the file under its results_dir
+    whose sha256 is the gate_json_sha256 of its row (the file given to 'end' with --gate-json, any name: C9D2-6).
+    Files above H0_MAX_BYTES are not hashed (clips; a scorer file is a few kB). The file must resolve inside the
+    folder, links resolved (C9D2-5)."""
     uid, sha = r.get('run_uid'), r.get('gate_json_sha256', '')
     d = _results_dir(r, ds)
     if d is None or not sha:
@@ -905,10 +911,12 @@ def h0_file(r: dict, ds: str) -> str:
     for root, _, names in os.walk(d):
         for n in sorted(names):
             p = os.path.join(root, n)
-            if n.lower().endswith('.json') and sha256_file(p) == sha:
+            if os.path.isfile(p) and os.path.getsize(p) <= H0_MAX_BYTES and sha256_file(p) == sha:
+                if not _inside(p, d):
+                    raise LogError(f'run {uid}: the H0 scorer file {p} resolves outside the results_dir {d} '
+                                   '(a link; C9D-1, C9D2-5)')
                 return p
-    raise LogError(f'run {uid}: no .json file under {d} with the gate_json_sha256 of the log (the H0 scorer file, '
-                   'C9D-1)')
+    raise LogError(f'run {uid}: no file under {d} with the gate_json_sha256 of the log (the H0 scorer file, C9D-1)')
 
 
 def _finite_number(x, what: str) -> float:
@@ -967,14 +975,19 @@ def check_score_final(r: dict, path: str, ds: str) -> tuple:
         if not isinstance(h1, dict) or h1.get('outcome') != o1:
             raise LogError(f'run {uid}: above eps_H, outcome_h1 {o1!r} must be the outcome of the kept H1 score '
                            f'(h1_score; C9D-5)')
-        if o1 in VALID or 'gate_v3' in h1:
-            if 'gate_v3' not in h1:
-                raise LogError(f'run {uid}: the H1 score judged {o1} carries no gate_v3 block (C9D-5)')
-            g1 = h1['gate_v3']
-            ev = validate_gate(g1, 'HW')
-            why = outcome_vs_gate(o1, ev, g1['decide'])
-            if why:
-                raise LogError(f'run {uid}: outcome_h1 {o1} disagrees with the gate of the H1 score ({why}; C9D-5)')
+        g1 = h1.get('gate_v3')                         # C9D2-1: a lost H1 may carry no gate, or null
+        if o1 in VALID and g1 is None:
+            raise LogError(f'run {uid}: the H1 score judged {o1} carries no gate_v3 block (C9D-5)')
+        if g1 is not None:
+            # C9D2-2: the same check as 'end' (check_outcome_vs_gate: gate recomputed, then outcome_vs_gate and the
+            # floor rule of t1, viol_before_problem); the score carries no fail cause, so the exception before t1
+            # (khong_dat, VIOL_BEFORE) is read from its G1 block (cat_t1)
+            fc = VIOL_BEFORE if isinstance(g1, dict) and isinstance(g1.get('g1'), dict) and g1['g1'].get('cat_t1') \
+                else ''
+            try:
+                check_outcome_vs_gate(o1, g1, 'HW', fc)
+            except LogError as exc:
+                raise LogError(f'run {uid}: outcome_h1 {o1} and the gate of the H1 score: {exc} (C9D-5, C9D2-2)')
     final, want = so_h_outcome(o0, o1, vuot, thieu)
     if d.get('outcome') != final or sorted(flags) != sorted(want):
         raise LogError(f"score_final {path!r}: outcome {d.get('outcome')!r}, flags {flags} disagree with "
@@ -1034,6 +1047,9 @@ def apply_so_h(tun: List[dict], ds: str) -> List[dict]:
     known = {r.get('run_uid') for r in tun}
     out = []
     for r in tun:
+        if r.get('fail_cause') == FAIL_SO_H or r.get(SO_H_LOST):                  # C9D2-4
+            raise LogError(f"run {r.get('run_uid')}: fail cause {FAIL_SO_H} in the tuning log: only the clip H "
+                           f'comparison gives it ({SO_H}), never a logged row (C9D2-4)')
         s = by_uid.get(r.get('run_uid'))
         if s is None:
             out.append(r)
@@ -1054,6 +1070,7 @@ def apply_so_h(tun: List[dict], ds: str) -> List[dict]:
         r = dict(r, run_outcome=final, so_h_flags=','.join(flags))
         if final == 'hong_he_do' and s['outcome_tam'] != 'hong_he_do':
             r['fail_cause'] = FAIL_SO_H
+            r[SO_H_LOST] = '1'                         # C9D2-4: from the checked SO_H row, not from a typed cause
         out.append(r)
     missing = sorted(set(by_uid) - known)
     if missing:
@@ -1064,8 +1081,8 @@ def apply_so_h(tun: List[dict], ds: str) -> List[dict]:
 def mark_retro_stops(tun: List[dict]) -> List[dict]:
     """S05 v3.38 4.3 (B8S2-2; Liam 17/11 at THESIS_B8 "Duyệt, áp luôn (Recommended)"): a run taken after a stop that
     only the comparison at the end of the session showed (the N = 3 lost-run streak of 4.6 complete only with a run
-    that became hong_he_do at so-h, fail cause FAIL_SO_H) stays in the log with flag RETRO_FLAG: out of the
-    denominator, blocks and the final table; its time and N_HW still count. A stop seen without so-h keeps 4.6 (a run
+    that became hong_he_do at so-h, mark SO_H_LOST of apply_so_h, C9D2-4) stays in the log with flag RETRO_FLAG: out of
+    the denominator, blocks and the final table; its time and N_HW still count. A stop seen without so-h keeps 4.6 (a run
     after it is an error). Rows are copies where flagged."""
     groups = defaultdict(list)
     for i, r in enumerate(tun):
@@ -1082,7 +1099,7 @@ def mark_retro_stops(tun: List[dict]) -> List[dict]:
                 continue
             if r.get('run_outcome') == 'hong_he_do':
                 streak += 1
-                retro = retro or r.get('fail_cause') == FAIL_SO_H
+                retro = retro or r.get(SO_H_LOST) == '1'          # C9D2-4: set by apply_so_h only
             else:
                 streak, retro = 0, False
             stopped = streak >= FINAL_LOST_N
@@ -1351,6 +1368,8 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
     run = _require_open(ds)
     if outcome not in OUTCOMES:
         raise LogError(f'--outcome one of {OUTCOMES}')
+    if fail_cause == FAIL_SO_H:                                                    # C9D2-4
+        raise LogError(f'--fail-cause {FAIL_SO_H} is given by the clip H comparison (so-h) only')
     plat, stage = run['row'].get('platform'), run['row'].get('stage')
     if queries is not None:                            # R134C4-1: the two answers checked here, not by the caller
         import gain_line_check as glc
@@ -2116,12 +2135,12 @@ def floor_gate(g: dict, t_done=None, t_deadline: float = 20.0) -> dict:
 
 
 def fake_score_final(folder: str, d_h_mm: Optional[float], h1: Optional[dict] = None, eps_h_mm: float = 2.0,
-                     name: str = 'score_final.json') -> str:
+                     name: str = 'score_final.json', h0_name: str = 'score.json') -> str:
     """FAKE (demo and tests only): the output of c7_calib_drift.py gop (combine) for the run whose H0 scorer file is
-    folder/score.json: that file with 'outcome' after the comparison and the 'calib_drift' block. d_h_mm None: clip
+    folder/<h0_name>: that file with 'outcome' after the comparison and the 'calib_drift' block. d_h_mm None: clip
     H at the end missing (thieu_H1); above eps_h_mm the H1 score `h1` (outcome, gate_v3) is kept whole. Returns the
     path of the new file (in the run folder, C9D-1)."""
-    with open(os.path.join(folder, 'score.json'), encoding='utf-8') as f:
+    with open(os.path.join(folder, h0_name), encoding='utf-8') as f:
         h0 = json.load(f)
     o0, thieu = h0['outcome'], d_h_mm is None
     vuot = thieu or d_h_mm > eps_h_mm

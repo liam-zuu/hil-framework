@@ -470,6 +470,7 @@ def load_runs(dataset, score_name, esp32_name, query_before_name='gain_query_bef
             raise rl.LogError('luot xe kiem cuoi da phan chua so clip H (lenh rq3_log so-h, ca luot duoi nguong): '
                               + ', '.join(r.get('run_uid', '') for r in miss) + ' (C9D-2)')
         rows = rl.apply_so_h(rows, dataset)                  # S05 v3.37 4.3: outcomes after the clip H comparison
+        rl._final_stops(rows)      # C9D2-3: a run after a known N = 3 stop (4.6) stops the table as the summary
     except rl.LogError as e:
         raise ValueError(f'm7_tuning_log.csv: {e}')
     files = gain_files(dataset, init_gain)                                              # R134C6-1

@@ -748,6 +748,17 @@ def test_c4_2_final_hil_without_boots_and_rows_outside_the_campaigns(tmp_path, c
                                                           for p in problems)
 
 
+def test_c9d2_3_table_refuses_a_run_after_a_known_n3_stop(tmp_path, capsys):
+    """C9D2-3 (Codex C9 demo round 2): three lost final car runs in a row (logged so, no clip H needed) stop the
+    condition (S05 4.6); a later run is an error for the table as for the summary."""
+    runs = [write_run(tmp_path, f'n{k}', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'hong_he_do', 0.9)
+            for k in range(3)]
+    runs.append(write_run(tmp_path, 'n3', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', 0.02))
+    ds = _table_ds(tmp_path, runs)
+    assert T.main(['table', '--dataset', ds, '--out', str(tmp_path / 'out')]) == 2
+    assert 'lost runs in a row' in capsys.readouterr().out
+
+
 def test_c4_6_cat_t1_counted_per_cell(tmp_path):
     """R134C4-6, O1 3.5 R2V-4: runs khong_dat by the exception before t1 are counted in their cell."""
     r = write_run(tmp_path, 'v1', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'khong_dat', 0.12)
