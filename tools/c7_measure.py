@@ -611,6 +611,7 @@ def main(argv=None):
                                progress=lambda k: print(f'... khung {k}', file=sys.stderr))
             info.update(session=os.path.abspath(a.session), session_sha256=sha256(a.session))
             write_frames(os.path.join(a.out, 'frames.csv'), rows)
+            info['frames_sha256'] = sha256(os.path.join(a.out, 'frames.csv'))   # c7_calib_drift CD2-3
             with open(os.path.join(a.out, 'track.json'), 'w', encoding='utf-8') as f:
                 json.dump(_json(info), f, ensure_ascii=False, indent=1)
             print(f'{info["frames"]} khung, {info["n_valid"]} hợp lệ; lệch độ cao camera lớn nhất '

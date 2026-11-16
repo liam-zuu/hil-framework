@@ -204,6 +204,19 @@ def test_frames_csv_round_trip(tmp_path, session, run_clip):
     assert abs(back[3]['x'] - rows[3]['x']) < 1e-6
 
 
+def test_track_cli_records_the_frames_it_wrote(tmp_path, session, run_clip):
+    """c7_calib_drift CD2-3: track.json carries the sha256 of the frames.csv written next to it."""
+    import json
+    sp = tmp_path / 'session.json'
+    sp.write_text(json.dumps(cm._json(session)), encoding='utf-8')
+    out = tmp_path / 'run'
+    assert cm.main(['track', '--video', run_clip[0], '--session', str(sp), '--max-frames', '3',
+                    '--out', str(out)]) == 0
+    t = json.loads((out / 'track.json').read_text(encoding='utf-8'))
+    assert t['frames_sha256'] == cm.sha256(str(out / 'frames.csv'))
+    assert t['session_sha256'] == cm.sha256(str(sp)) and t['frames'] == 3
+
+
 def test_gates_drop_a_jumping_frame():
     rows = []
     for k in range(20):

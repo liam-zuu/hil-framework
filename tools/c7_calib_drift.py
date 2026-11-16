@@ -7,26 +7,29 @@ calibrations, and when they differ score the runs twice (O1 v11.28 section 4, ga
 (approved Liam 15/11 CODE_CAM local_3b0bfad7: Q1 "Duyet D_H, 2 mm (Recommended)", Q2 "Chua ket luan
 (Recommended)", Q3 "Tinh hong he do (Recommended)", Q4 "Co, quay them (Recommended)"). The spec names
 the threshold eps_H (O1 v11.28; T_H is the labour time of S05). Codex Sol round 1 (CD1-2..11, Liam
-16/11 CODE_CAM "Sua 10 muc + vong 2 (Recommended)").
+16/11 CODE_CAM "Sua 10 muc + vong 2 (Recommended)"); round 2 (CD2-1..7, Liam 16/11 CODE_CAM "Sua 7 muc +
+vong 3 (Recommended)").
 
 Why: c7_measure.py track refits the camera POSE on every frame from the 4 corners of the floor marks
 (design 3.6, Huber loss), so a rigid camera move is compensated in the floor mapping; the parallax step
 (plumb point, kappa = h / Z_c) stays at the values of the session (CD1-2). Not compensated: a change of
-the intrinsics (focus, lens, heat). The end-of-session clip H catches those. Out of scope (CD1-1): an
-error common to all mark coordinates; that is the absolute accuracy, U_p and the check tags of C8.
+the intrinsics (focus, lens, heat), and a height change that a plane of marks reads as a focal change
+(CD2-1). The end-of-session clip H catches those. Out of scope (CD1-1): an error common to all mark
+coordinates; that is the absolute accuracy, U_p and the check tags of C8.
 
 so   --s0 <calib0>/session.json [--s1 <calib1>/session.json] --tasks O1-F02,O1-F05[,O1-K1 --k-start X,Y,DEG]
      --out drift.json
-     D_H [mm] = the largest error of the car position, at points every 5 cm along the lanes of the tasks
-     run in the session, if a frame of one clip H is scored with the calibration of the other clip H,
-     the way track does it (pose refit on the 4 corners of every mark, then the parallax step of the
-     scoring session):
-        p   = cam_b.project(g)                     g seen in the image at the time of clip H b
-        a'  = cam_a, pose refitted to the corners of clip H b (c7_measure.refit_pose)
-        g0  = a'.pix2floor(p)                      floor mapping error  g0 - g
-        car = (1 - kappa_a)(g0 - g) + kappa_a (C_a - g) - kappa_b (C_b - g)
-              C = plumb point; C_b = C_a + camera shift between the two fits, kappa_b = h / (Z_c + dZ)
-     both directions (a, b) = (0, 1) and (1, 0); D_H = the larger maximum. vuot = D_H > eps_H,
+     D_H [mm] = the largest error of the car (wheel centre) position, at poses every 5 cm along the lanes
+     of the tasks run in the session (heading along the lane), if a frame of one clip H is scored with
+     the calibration of the other clip H, through the measuring chain itself (CD2-2, one_way):
+        lens C at the time of b: plumb_a + camera shift of the two fits, height Z_c + dZ ("fit"), or the
+              focal change of the fits read as a height change, Z = (Z_c + dZ) f_a / f_b
+              ("focal_as_height", CD2-1);
+        the 4 corners of the car tag at height h -> their rays from C meet the floor at P' -> pixels =
+              cam_b.project(P') (cam_b maps the floor as the camera of that time);
+        a' = cam_a, pose refitted to the mark corners of clip H b (c7_measure.refit_pose);
+        c7_measure.car_pose(a', pixels, side, kappa_a, plumb_a) - true pose.
+     both directions (a, b) = (0, 1) and (1, 0), both lens hypotheses; D_H = the largest. vuot = D_H > eps_H,
      eps_H = max(--eps-mm, 2 x --d-lap-mm) (2 mm [DE XUAT], locked at C8; D_lap = D_H of the two clips H
      shot back to back at the start of C8, Q4). No --s1 (clip H at the end missing): thieu_H1, vuot.
      The two sessions must share the mark file (sha256), zc_tape, plumb, tag height, car tag side, image
@@ -35,9 +38,12 @@ so   --s0 <calib0>/session.json [--s1 <calib1>/session.json] --tasks O1-F02,O1-F
      focal length, distortion, camera height and centre of the two fits.
 gop  --drift drift.json --s0-score score.json --s0-track <dir0>/track.json
      [--s1-score score_h1.json --s1-track <dir1>/track.json] --out score_final.json
-     Provenance (CD1-4): each track.json names the session it used (sha256, = the one in drift.json), both
-     tracks are of the same video, each score's frames_sha256 = frames.csv next to its track.json, both
-     scores have the same esp32 log, U_m, D, k_start, thresholds and clock offset (CD1-6).
+     Provenance (CD1-4, CD2-3): each track.json names the session it used (sha256, = the one in
+     drift.json) and the frames.csv it wrote (frames_sha256 = the file next to it = the frames_sha256 of
+     the score). Same run (CD1-6, CD2-4): both tracks have the same video, tag offset, frame count and
+     decoded size; both scores the same task, esp32 log, U_m, D, k_start, thresholds and clock offset.
+     Scope (CD2-5): the task of the score is in drift.tasks and, for K1/K2, its k_start is that of
+     drift.json, below eps_H too. All these fields must be present and valid (CD2-6).
      not vuot: the H0 score unchanged. vuot: same outcome -> kept, flag calib_drift; different ->
      chua_ket_luan (calib_drift_split); hong_he_do in either -> hong_he_do (Q3, rerun, O1 3.5).
      thieu_H1: chua_ket_luan with flag thieu_H1 (Q2); hong_he_do of H0 stays hong_he_do. The whole H1
@@ -70,7 +76,8 @@ STEP_M = 0.05          # spacing of the lane samples (arc length)
 MIN_MARKS = 6          # common floor marks needed for the pose refit (calibrate needs 6 too)
 OUTCOMES = ('dat', 'khong_dat', 'chua_ket_luan', 'hong_he_do')
 SAME_KEYS = ('zc_tape_m', 'plumb_xy_m', 'tag_h_m', 'car_side_m', 'width', 'height')     # CD1-5
-SCORE_SAME = ('U_m', 'D', 'k_start', 'thresholds', 'esp32_sha256', 't0_log_us')         # CD1-4, CD1-6
+SCORE_SAME = ('task', 'U_m', 'D', 'k_start', 'thresholds', 'esp32_sha256', 't0_log_us')  # CD1-4, CD1-6, CD2-4
+TRACK_SAME = ('video_sha256', 'tag_offset', 'frames', 'decoded_shapes')                 # CD2-4: track options
 
 
 def _finite(x, name, lo=None, strict=False):
@@ -96,14 +103,15 @@ def parse_tasks(s):
     return sorted(set(tasks), key=tasks.index)
 
 
-def lane_points(tasks, k_start=None, step=STEP_M):
-    """(n, 2) floor points every `step` m of arc along the lanes of the tasks run in the session: the
-    figure 8 when any O1-Fxx is in tasks; K1, K2 placed on the nominal start pose k_start (x, y, heading
-    rad; the inverse of c7_score.KTask.to_lane), which is then required (CD1-8)."""
+def lane_poses(tasks, k_start=None, step=STEP_M):
+    """(n, 3) floor poses (x, y, heading rad) every `step` m of arc along the lanes of the tasks run in
+    the session: the figure 8 when any O1-Fxx is in tasks; K1, K2 placed on the nominal start pose
+    k_start (x, y, heading rad; the inverse of c7_score.KTask.to_lane), which is then required (CD1-8).
+    Heading = direction of the lane at the point (the car tag is drawn along it)."""
     pts, names = [], []
     if any(t in FIG8 for t in tasks):
         p8 = Path8(n=40001)
-        pts.append(_resample(p8.s, p8.x, p8.y, step))
+        pts.append(_with_heading(_resample(p8.s, p8.x, p8.y, step)))
         names.append('O1-F')
     ks = [t for t in tasks if t in FINAL_SET]
     if ks:
@@ -114,9 +122,20 @@ def lane_points(tasks, k_start=None, step=STEP_M):
         for task in ks:
             lane = o1_lanes.Lane(o1_lanes.k_corners(task))
             q = _resample(lane.s, lane.x, lane.y, step)
-            pts.append(np.column_stack([x0 + c * q[:, 0] - s * q[:, 1], y0 + s * q[:, 0] + c * q[:, 1]]))
+            pts.append(_with_heading(np.column_stack([x0 + c * q[:, 0] - s * q[:, 1], y0 + s * q[:, 0] + c * q[:, 1]])))
             names.append(task)
     return np.vstack(pts), names
+
+
+def lane_points(tasks, k_start=None, step=STEP_M):
+    """(n, 2) floor points of lane_poses, and the lane names."""
+    p, names = lane_poses(tasks, k_start, step)
+    return p[:, :2], names
+
+
+def _with_heading(q):
+    d = np.gradient(q, axis=0) if len(q) > 1 else np.array([[1.0, 0.0]])
+    return np.column_stack([q, np.arctan2(d[:, 1], d[:, 0])])
 
 
 def _resample(s, x, y, step):
@@ -170,27 +189,63 @@ def _per_mark(cam, marks, ids, img):
     return np.sqrt(np.mean(np.sum(r.reshape(len(ids), 4, 2) ** 2, axis=2), axis=1))
 
 
-def one_way(sa, sb, pts):
-    """Car position error [m] (vectors, (n, 2)) at pts when frames of clip H b are scored with the
-    calibration of clip H a, as track and car_pose do; plus the refit details."""
+def tag_corners(x, y, psi, side):
+    """(4, 2) floor xy of the car tag corners, ArUco order (c7_measure.car_corners_body); wheel centre
+    = tag centre (tag offset 0, as calibrate writes it until clip T is measured)."""
+    c, s = math.cos(psi), math.sin(psi)
+    b = cm.car_corners_body(side)
+    return np.column_stack([x + c * b[:, 0] - s * b[:, 1], y + s * b[:, 0] + c * b[:, 1]])
+
+
+def physical_centres(sa, cam_a, cam_b):
+    """Lens positions assumed at the time of clip H b, against the scoring session a (whose plumb
+    point and Z_c from the tape are taken as right at the time of a):
+      fit              plumb_a + the camera shift of the two fits, Z_c + their height change (CD1-2);
+      focal_as_height  the same plumb, but the focal change of the two fits read as a height change: a
+                       plane of marks cannot tell one from the other and both fits hold the height to
+                       the tape (CD2-1): Z = (Z_c + dZ) f_a / f_b.
+    D_H takes the worse of the two."""
+    dC = cam_b.centre - cam_a.centre
+    cxy = np.asarray(sa['plumb_xy_m'], float) + dC[:2]
+    z_fit = float(sa['zc_tape_m']) + float(dC[2])
+    return dict(fit=np.array([cxy[0], cxy[1], z_fit]),
+                focal_as_height=np.array([cxy[0], cxy[1], z_fit * cam_a.f / cam_b.f])), dC
+
+
+def one_way(sa, sb, poses):
+    """Car position errors [m] (dict hypothesis -> (n, 2) vectors) at the poses when frames of clip H b
+    are scored with the calibration of clip H a, the way track and car_pose do it (CD2-2):
+      1. the 4 corners of the car tag at its height h, along the lane, seen from the lens C of the time
+         of clip H b (physical_centres): their rays meet the floor at P' = C + (corner - C) Z / (Z - h);
+         cam_b maps the floor as the camera of that time does, so the corner pixels = cam_b.project(P');
+      2. a' = cam_a, pose refitted to the corners of the floor marks of clip H b (c7_measure.refit_pose);
+      3. c7_measure.car_pose(a', pixels, side, kappa_a, plumb_a): the wheel centre track would report
+         (kappa and plumb point of the scoring session a);
+      4. error = that - the true pose.
+    Same session (a = b): 0 by construction (the parallax step is exact for a pinhole over a plane)."""
     marks = {int(i): tuple(v) for i, v in sa['marks'].items()}
     ids = [int(i) for i in sorted(sb['ref_corners_px'], key=int) if int(i) in marks and int(i) in cm.FLOOR_IDS]
     if len(ids) < MIN_MARKS:
         raise ValueError(f'only {len(ids)} common floor marks between the two clips H (need {MIN_MARKS})')
     cam_a, cam_b = cm.cam_from_dict(sa['camera']), cm.cam_from_dict(sb['camera'])
-    img_b = _corners(sb, ids)
-    a_ref, rms = cm.refit_pose(cam_a, _obj(marks, ids), img_b)      # what track does (CD1-3)
-    p = cam_b.project(np.column_stack([pts, np.zeros(len(pts))]))
-    e_floor = a_ref.pix2floor(p, 0.0) - pts
-    # parallax step (CD1-2): car_pose uses the plumb point and kappa of the scoring session a
-    ka, h = float(sa['kappa']), float(sa['tag_h_m'])
-    ca = np.asarray(sa['plumb_xy_m'], float)
-    dC = cam_b.centre - cam_a.centre                                 # camera shift between the two fits
-    zc_a = float(sa['zc_tape_m'])
-    kb = h / (zc_a + dC[2])
-    cb = ca + dC[:2]
-    e = (1.0 - ka) * e_floor + ka * (ca - pts) - kb * (cb - pts)
-    return e, dict(ids=ids, rms_px=rms, camera_shift_m=dC.tolist(), kappa=[ka, kb])
+    a_ref, rms = cm.refit_pose(cam_a, _obj(marks, ids), _corners(sb, ids))      # what track does (CD1-3)
+    ka, h, side = float(sa['kappa']), float(sa['tag_h_m']), float(sa['car_side_m'])
+    plumb = [float(v) for v in sa['plumb_xy_m']]
+    cents, dC = physical_centres(sa, cam_a, cam_b)
+    errs = {}
+    for name, C in cents.items():
+        if not C[2] > h:
+            raise ValueError(f'lens height {C[2]:.3f} m ({name}) not above the tag height {h} m')
+        e = np.zeros((len(poses), 2))
+        for k, (x, y, psi) in enumerate(poses):
+            q = tag_corners(x, y, psi, side)
+            floor = C[:2] + (q - C[:2]) * (C[2] / (C[2] - h))
+            px = cam_b.project(np.column_stack([floor, np.zeros(4)]))
+            r = cm.car_pose(a_ref, px, side, ka, plumb)
+            e[k] = (r['x'] - x, r['y'] - y)
+        errs[name] = e
+    return errs, dict(ids=ids, rms_px=rms, camera_shift_m=dC.tolist(),
+                      lens_z_m={k: float(v[2]) for k, v in cents.items()})
 
 
 def compare(s0, s1, tasks, k_start=None, eps_mm=EPS_MM, d_lap_mm=None, mark_px=MARK_PX):
@@ -200,7 +255,8 @@ def compare(s0, s1, tasks, k_start=None, eps_mm=EPS_MM, d_lap_mm=None, mark_px=M
     if d_lap_mm is not None:
         d_lap_mm = _finite(d_lap_mm, '--d-lap-mm', 0.0)
     eps = max(eps_mm, 2.0 * d_lap_mm) if d_lap_mm is not None else eps_mm
-    pts, names = lane_points(tasks, k_start)                         # also checks --k-start for K1/K2
+    poses, names = lane_poses(tasks, k_start)                        # also checks --k-start for K1/K2
+    pts = poses[:, :2]
     base = dict(kind='c7_calib_drift', rule='O1 v11.28 4 (clip H dau va cuoi buoi); c7_calib_drift.py',
                 h0_video=s0.get('video'), h0_video_sha256=s0.get('video_sha256'), s0_session_sha256=s0['_sha256'],
                 tasks=list(tasks), lanes=names, n_points=int(len(pts)), step_m=STEP_M,
@@ -211,12 +267,16 @@ def compare(s0, s1, tasks, k_start=None, eps_mm=EPS_MM, d_lap_mm=None, mark_px=M
         return dict(base, thieu_H1=True, vuot=True, D_H_mm=None, s1_session_sha256=None,
                     note='thieu clip H cuoi: cac luot tu clip H dang dung toi cuoi buoi chua ket luan (Q2)')
     check_same(s0, s1)
-    e01, d01 = one_way(s0, s1, pts)
-    e10, d10 = one_way(s1, s0, pts)
-    n01, n10 = np.linalg.norm(e01, axis=1), np.linalg.norm(e10, axis=1)
-    k01, k10 = int(np.argmax(n01)), int(np.argmax(n10))
-    d_h = 1000.0 * max(n01[k01], n10[k10])
-    worst = pts[k01] if n01[k01] >= n10[k10] else pts[k10]
+    e01, d01 = one_way(s0, s1, poses)
+    e10, d10 = one_way(s1, s0, poses)
+    by = {}
+    for way, ee in (('h0_to_h1', e01), ('h1_to_h0', e10)):
+        for hyp, e in ee.items():
+            n = 1000.0 * np.linalg.norm(e, axis=1)
+            k = int(np.argmax(n))
+            by[(way, hyp)] = (float(n[k]), float(np.median(n)), k)
+    (w_way, w_hyp), (d_h, _, w_k) = max(by.items(), key=lambda kv: kv[1][0])
+    worst = pts[w_k]
     ref0 = {int(i): np.array(v, float) for i, v in s0['ref_centres_px'].items()}
     ref1 = {int(i): np.array(v, float) for i, v in s1['ref_centres_px'].items()}
     common = [i for i in sorted(ref0) if i in ref1 and i in cm.FLOOR_IDS and str(i) in s0['ref_corners_px']
@@ -234,10 +294,11 @@ def compare(s0, s1, tasks, k_start=None, eps_mm=EPS_MM, d_lap_mm=None, mark_px=M
     return dict(base, thieu_H1=False, s1_session_sha256=s1['_sha256'],
                 h1_video=s1.get('video'), h1_video_sha256=s1.get('video_sha256'),
                 D_H_mm=d_h, vuot=bool(d_h > eps),
-                D_mm={'h0_to_h1': dict(max=1000 * float(n01[k01]), median=1000 * float(np.median(n01))),
-                      'h1_to_h0': dict(max=1000 * float(n10[k10]), median=1000 * float(np.median(n10)))},
+                D_mm={way: {hyp: dict(max=by[(way, hyp)][0], median=by[(way, hyp)][1]) for hyp in e01}
+                      for way in ('h0_to_h1', 'h1_to_h0')},
+                worst=dict(direction=w_way, hypothesis=w_hyp),
                 worst_xy_m=[float(worst[0]), float(worst[1])],
-                camera_shift_m=d10['camera_shift_m'], kappa=d01['kappa'],
+                camera_shift_m=d10['camera_shift_m'], lens_z_m=dict(h0_to_h1=d01['lens_z_m'], h1_to_h0=d10['lens_z_m']),
                 shift_px=dict(median=float(np.median(list(shift.values()))) if shift else None,
                               max=max(shift.values()) if shift else None,
                               max_id=max(shift, key=shift.get) if shift else None,
@@ -252,45 +313,98 @@ def compare(s0, s1, tasks, k_start=None, eps_mm=EPS_MM, d_lap_mm=None, mark_px=M
 
 
 # ---------------------------------------------------------------- combine the two scores of a run
+def _dict(x, name):
+    if not isinstance(x, dict):
+        raise ValueError(f'{name}: not a JSON object')
+    return x
+
+
+def _need(d, keys, name):
+    miss = [k for k in keys if k not in d]
+    if miss:
+        raise ValueError(f'{name}: no {miss}')
+
+
+def _sha(x, name):
+    if not isinstance(x, str) or not x:
+        raise ValueError(f'{name}: missing or empty')
+    return x
+
+
+def _triple(x, name):
+    if not isinstance(x, (list, tuple)) or len(x) != 3:
+        raise ValueError(f'{name}: 3 numbers expected ({x!r})')
+    return [_finite(v, name) for v in x]
+
+
 def check_drift(d):
-    """Schema and consistency of a drift.json (CD1-7)."""
+    """Schema and consistency of a drift.json (CD1-7, CD2-6)."""
+    _dict(d, 'drift.json')
     if d.get('kind') != 'c7_calib_drift':
         raise ValueError('not a c7_calib_drift file')
+    _need(d, ('vuot', 'thieu_H1', 'eps_H_mm', 's0_session_sha256', 's1_session_sha256', 'D_H_mm', 'tasks', 'k_start'),
+          'drift.json')
     for k in ('vuot', 'thieu_H1'):
-        if not isinstance(d.get(k), bool):
-            raise ValueError(f'drift.json: {k!r} missing or not true/false')
-    eps = _finite(d.get('eps_H_mm'), 'drift.json eps_H_mm', 0.0, strict=True)
-    if not d.get('s0_session_sha256'):
-        raise ValueError('drift.json: no s0_session_sha256')
+        if not isinstance(d[k], bool):
+            raise ValueError(f'drift.json: {k!r} not true/false')
+    eps = _finite(d['eps_H_mm'], 'drift.json eps_H_mm', 0.0, strict=True)
+    _sha(d['s0_session_sha256'], 'drift.json s0_session_sha256')
+    tasks = d['tasks']
+    if not isinstance(tasks, list) or not tasks or not all(isinstance(t, str) for t in tasks):
+        raise ValueError(f'drift.json: tasks {tasks!r}')
+    parse_tasks(','.join(tasks))
+    if any(t in FINAL_SET for t in tasks) or d['k_start'] is not None:
+        _triple(d['k_start'], 'drift.json k_start')
     if d['thieu_H1']:
-        if not d['vuot'] or d.get('D_H_mm') is not None or d.get('s1_session_sha256') is not None:
+        if not d['vuot'] or d['D_H_mm'] is not None or d['s1_session_sha256'] is not None:
             raise ValueError('drift.json: thieu_H1 must come with vuot true, no D_H_mm, no s1 session')
     else:
-        dh = _finite(d.get('D_H_mm'), 'drift.json D_H_mm', 0.0)
-        if not d.get('s1_session_sha256'):
-            raise ValueError('drift.json: no s1_session_sha256')
+        dh = _finite(d['D_H_mm'], 'drift.json D_H_mm', 0.0)
+        _sha(d['s1_session_sha256'], 'drift.json s1_session_sha256')
         if d['vuot'] != (dh > eps):
             raise ValueError(f'drift.json: vuot {d["vuot"]} does not match D_H {dh} / eps_H {eps}')
 
 
-def check_score(sc, tr, frames_sha, session_sha, name):
-    """One score with its track.json (CD1-4)."""
-    if sc.get('outcome') not in OUTCOMES:
-        raise ValueError(f'{name} score: outcome {sc.get("outcome")!r}')
-    _finite(sc.get('offset_s'), f'{name} score offset_s')
-    _finite(sc.get('U_m'), f'{name} score U_m', 0.0)
-    if not sc.get('esp32_sha256') or not sc.get('frames_sha256'):
-        raise ValueError(f'{name} score: no esp32_sha256 / frames_sha256 (score with c7_score.py at this commit)')
-    if tr.get('session_sha256') != session_sha:
-        raise ValueError(f'{name} track.json used session {tr.get("session_sha256")!r}, drift.json has {session_sha!r}')
-    if sc['frames_sha256'] != frames_sha:
-        raise ValueError(f'{name} score is not of the frames.csv next to its track.json')
+def check_score(sc, tr, frames_sha, session_sha, drift, name):
+    """One score with its track.json (CD1-4, CD2-3, CD2-5, CD2-6)."""
+    _dict(sc, f'{name} score')
+    _dict(tr, f'{name} track.json')
+    _need(sc, ('outcome', 'offset_s', 'frames_sha256') + SCORE_SAME, f'{name} score')
+    _need(tr, ('session_sha256', 'frames_sha256') + TRACK_SAME, f'{name} track.json')
+    if sc['outcome'] not in OUTCOMES:
+        raise ValueError(f'{name} score: outcome {sc["outcome"]!r}')
+    _finite(sc['offset_s'], f'{name} score offset_s')
+    _finite(sc['U_m'], f'{name} score U_m', 0.0)
+    _finite(sc['D'], f'{name} score D', 0.0)
+    _finite(sc['t0_log_us'], f'{name} score t0_log_us')
+    if not isinstance(sc['thresholds'], dict) or not sc['thresholds']:
+        raise ValueError(f'{name} score: thresholds {sc["thresholds"]!r}')
+    _sha(sc['esp32_sha256'], f'{name} score esp32_sha256')
+    _sha(sc['frames_sha256'], f'{name} score frames_sha256')
+    ks = _triple(sc['k_start'], f'{name} score k_start')
+    # CD2-5: the run is one the drift was computed for, on the same nominal start pose
+    if sc['task'] not in drift['tasks']:
+        raise ValueError(f'{name} score is task {sc["task"]!r}, drift.json covers {drift["tasks"]}')
+    if sc['task'] in FINAL_SET:
+        dk = _triple(drift['k_start'], 'drift.json k_start')
+        if max(abs(a - b) for a, b in zip(ks, dk)) > 1e-9:
+            raise ValueError(f'{name} score k_start {ks} is not the k_start of drift.json {dk}')
+    # CD1-4, CD2-3: score -> frames.csv -> track.json -> session
+    if tr['session_sha256'] != session_sha:
+        raise ValueError(f'{name} track.json used session {tr["session_sha256"]!r}, drift.json has {session_sha!r}')
+    _sha(tr['video_sha256'], f'{name} track.json video_sha256')
+    _sha(tr['frames_sha256'], f'{name} track.json frames_sha256 (track with c7_measure.py at this commit)')
+    _triple(tr['tag_offset'], f'{name} track.json tag_offset')
+    if tr['frames_sha256'] != frames_sha:
+        raise ValueError(f'{name}: the frames.csv next to track.json is not the one that track wrote')
+    if sc['frames_sha256'] != tr['frames_sha256']:
+        raise ValueError(f'{name} score is not of the frames.csv of its track.json')
 
 
 def combine(drift, sc0, tr0, fr0_sha, sc1=None, tr1=None, fr1_sha=None):
     """score_final dict of design section 3."""
     check_drift(drift)
-    check_score(sc0, tr0, fr0_sha, drift['s0_session_sha256'], 'H0')
+    check_score(sc0, tr0, fr0_sha, drift['s0_session_sha256'], drift, 'H0')
     o0 = sc0['outcome']
     out = dict(sc0)
     info = dict(eps_H_mm=drift['eps_H_mm'], D_H_mm=drift.get('D_H_mm'), vuot=drift['vuot'],
@@ -306,12 +420,13 @@ def combine(drift, sc0, tr0, fr0_sha, sc1=None, tr1=None, fr1_sha=None):
         return out
     if sc1 is None or tr1 is None or fr1_sha is None:
         raise ValueError('drift above eps_H: give --s1-score and --s1-track (the run scored with the clip H at the end)')
-    check_score(sc1, tr1, fr1_sha, drift['s1_session_sha256'], 'H1')
-    if not tr0.get('video_sha256') or tr0.get('video_sha256') != tr1.get('video_sha256'):
-        raise ValueError('the two track.json are not of the same run video')
+    check_score(sc1, tr1, fr1_sha, drift['s1_session_sha256'], drift, 'H1')
+    for k in TRACK_SAME:
+        if tr0[k] != tr1[k]:
+            raise ValueError(f'the two track.json differ in {k}: {tr0[k]!r} / {tr1[k]!r} (same video, same options)')
     for k in SCORE_SAME:
-        if sc0.get(k) != sc1.get(k):
-            raise ValueError(f'the two scores differ in {k}: {sc0.get(k)!r} / {sc1.get(k)!r}')
+        if sc0[k] != sc1[k]:
+            raise ValueError(f'the two scores differ in {k}: {sc0[k]!r} / {sc1[k]!r}')
     if abs(float(sc0['offset_s']) - float(sc1['offset_s'])) > 1e-9:
         raise ValueError('the two scores use different clock offsets: score H1 with --offset-s of the H0 score')
     o1 = sc1['outcome']
@@ -337,7 +452,7 @@ def _no_nan(c):
 
 def _read(path):
     with open(path, encoding='utf-8') as f:
-        return json.load(f, parse_constant=_no_nan)
+        return json.load(f, parse_constant=_no_nan)                        # object: check_drift, check_score
 
 
 def _write(path, obj):
