@@ -447,7 +447,8 @@ def test_bad_drift_files_refused(bad, two):
                                   'D', 'threshold', 'frames_null_both', 'shapes_null_both', 'threshold_null_both',
                                   'frames_bool', 'shape_zero', 'offset_not_drift_both',
                                   'threshold_one_null_both', 'threshold_text_both', 'threshold_bool_both',
-                                  'threshold_negative_both', 'status_number_both', 'only_status_both'])
+                                  'threshold_negative_both', 'threshold_numeric_text_both', 'status_number_both',
+                                  'only_status_both'])
 def test_provenance_and_scoring_set_up_checked(case):
     a, ta, fa = sc('dat'), tr('s0'), 'f0'
     b, tb, fb = sc('dat', frames='f1'), tr('s1', frames='f1'), 'f1'
@@ -520,7 +521,7 @@ def test_provenance_and_scoring_set_up_checked(case):
         ta, tb = dict(ta, decoded_shapes=[[0, 1920]]), dict(tb, decoded_shapes=[[0, 1920]])
     elif case.startswith('threshold_') and case.endswith('_both') and case != 'threshold_null_both':
         bad_v = {'threshold_one_null_both': None, 'threshold_text_both': 'sai', 'threshold_bool_both': True,
-                 'threshold_negative_both': -0.1}[case]            # CD4-1, CD4-2: one bad key next to good ones
+                 'threshold_negative_both': -0.1, 'threshold_numeric_text_both': '0.10'}[case]   # CD5-1: '0.10'            # CD4-1, CD4-2: one bad key next to good ones
         t = dict(t_miss=0.25, t_gap=bad_v, status='khoa o C8')
         a, b = dict(a, thresholds=t), dict(b, thresholds=dict(t))
     elif case == 'status_number_both':
