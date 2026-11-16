@@ -1,6 +1,6 @@
 """c7_calib_drift.py: compare the clips H of a session, score twice (O1 v11.28 section 4; design
 CLAUDE_THESIS 03_CODE/docs/2026-11-15_Thiet_ke_so_clip_H_dau_cuoi_v1.md; Codex Sol round 1 CD1-2..11,
-round 2 CD2-1..7). Sessions are synthetic: a truth camera sees the TRUE mark positions, the session is
+round 2 CD2-1..7, round 3 CD3-2..6). Sessions are synthetic: a truth camera sees the TRUE mark positions, the session is
 fitted to the mark FILE (as calibrate does)."""
 import itertools
 import json
@@ -19,6 +19,7 @@ import c7_clip_probe as cp  # noqa: E402
 import c7_measure as cm  # noqa: E402
 import c7_score as cs  # noqa: E402
 import o1_lanes  # noqa: E402
+from o1_feasibility import HEAD0  # noqa: E402
 from test_c7_clip_probe import MARKS, SIDES, W, H, truth_camera  # noqa: E402
 
 TAG_H, ZC_TAPE, PLUMB, SIDE = 0.12, 2.90, [0.03, -0.02], 0.1445
@@ -47,7 +48,8 @@ def make_session(cam_true, true_marks=None, video='H.mov', drop=(), sha='s0', **
              ref_corners_px={str(i): img[4 * k:4 * k + 4].tolist() for k, i in enumerate(ids)},
              marks={str(i): list(v) for i, v in fm.items()}, zc_fit_m=float(abs(cam.centre[2])),
              zc_tape_m=ZC_TAPE, plumb_xy_m=list(PLUMB), tag_h_m=TAG_H, car_side_m=SIDE, width=W, height=H,
-             kappa=TAG_H / ZC_TAPE, markers_csv=[dict(file='moc_san_do.csv', sha256='m' * 64)], _sha256=sha)
+             kappa=TAG_H / ZC_TAPE, markers_csv=[dict(file='moc_san_do.csv', sha256='m' * 64)], _sha256=sha,
+             tag_offset=[0.0, 0.0, 0.0])
     s.update(over)
     return s
 
@@ -106,10 +108,26 @@ def test_k_lane_is_placed_on_the_start_pose(task):
     assert np.allclose(p[0], start[:2]) and np.abs(p - want).max() > 0.3
 
 
-def test_lane_heading_follows_the_lane():
-    p, _ = cd.lane_poses(['O1-K1'], (0.0, 0.0, math.radians(40)))
-    d = np.diff(p[:3, :2], axis=0)
-    assert p[1, 2] == pytest.approx(math.atan2(d[0, 1], d[0, 0]), abs=1e-6)
+@pytest.mark.parametrize('task', ['O1-K1', 'O1-K2'])
+def test_k_body_heading_is_held(task):
+    """CD3-3: K1 strafes, K2 drives a square without turning (o1_tasks): the body keeps the heading of
+    the nominal start pose everywhere, corners of K2 included."""
+    h0 = math.radians(40)
+    p, _ = cd.lane_poses([task], (0.3, 0.1, h0))
+    assert np.allclose(p[:, 2], h0)
+
+
+def test_figure_8_body_heading_is_the_tangent():
+    """o1_tasks: heading on the tangent; start at HEAD0 (45 deg, c7_score.Fig8Task.start); at x = A the
+    path goes straight down (dx/dtau = 0, dy/dtau = -A)."""
+    p, _ = cd.lane_poses(['O1-F05'])
+    assert cm.cp_wrap(p[0, 2] - HEAD0) == pytest.approx(0.0, abs=1e-3)
+    k = int(np.argmax(p[:, 0]))
+    assert cm.cp_wrap(p[k, 2] + math.pi / 2) == pytest.approx(0.0, abs=0.05)
+    d = np.diff(p[:, :2], axis=0)                                # independent: chord directions
+    chord = np.arctan2(d[:, 1], d[:, 0])
+    mid = (p[1:, 2] + p[:-1, 2]) / 2
+    assert np.max(np.abs([cm.cp_wrap(a - b) for a, b in zip(chord, mid)])) < 0.1
 
 
 def test_lane_samples_every_5_cm_and_keep_the_end():
@@ -120,22 +138,41 @@ def test_lane_samples_every_5_cm_and_keep_the_end():
 
 
 # ---------------------------------------------------------------- compare
-def truth_error_mm(s_score, cam_true, poses):
-    """Independent of one_way (CD2-7 control for CD2-1, CD2-2): the TRUTH camera of the end of the
-    session images the car tag corners at their height and the floor marks at their true place; the
-    scoring session's camera is refitted to those mark corners and c7_measure.car_pose runs with the
-    session's kappa and plumb point. Largest wheel centre error [mm]."""
+def truth_poses(tasks, ks):
+    """Wheel poses built here, not with lane_poses (CD3-3): the lane points (checked against
+    c7_score.KTask.to_lane above), body heading = chord direction on the figure 8, k_start heading on
+    K1, K2 (o1_tasks)."""
+    out = []
+    if any(t in cd.FIG8 for t in tasks):
+        q, _ = cd.lane_points(['O1-F05'])
+        d = np.gradient(q, axis=0)
+        out.append(np.column_stack([q, np.arctan2(d[:, 1], d[:, 0])]))
+    for t in tasks:
+        if t in cd.FINAL_SET:
+            q, _ = cd.lane_points([t], ks)
+            out.append(np.column_stack([q, np.full(len(q), ks[2])]))
+    return np.vstack(out)
+
+
+def truth_error_mm(s_score, cam_true, poses, off=(0.0, 0.0, 0.0)):
+    """Independent of one_way (CD2-7 control for CD2-1, CD2-2, CD3-2): the TRUTH camera of the end of
+    the session images the car tag corners at their height (tag centre = wheel + R(psi) (dx, dy), tag
+    heading psi + dpsi) and the floor marks at their true place; the scoring session's camera is
+    refitted to those mark corners and c7_measure.car_pose runs with the session's kappa and plumb
+    point and the tag offset. Largest wheel centre error [mm]."""
     fm = file_marks()
     ids = sorted(fm)
     obj = np.vstack([cp.mark_corners_floor(*fm[i]) for i in ids])
     img = cam_true.project(np.column_stack([obj, np.zeros(len(obj))]))
     a2, _ = cm.refit_pose(cm.cam_from_dict(s_score['camera']), obj, img)
     worst = 0.0
+    dx, dy, dp = off
     for x, y, psi in poses:
-        c, s = math.cos(psi), math.sin(psi)
-        q = np.array([[x + c * u - s * v, y + s * u + c * v] for u, v in cm.car_corners_body(SIDE)])
+        tx, ty = x + math.cos(psi) * dx - math.sin(psi) * dy, y + math.sin(psi) * dx + math.cos(psi) * dy
+        c, s = math.cos(psi + dp), math.sin(psi + dp)
+        q = np.array([[tx + c * u - s * v, ty + s * u + c * v] for u, v in cm.car_corners_body(SIDE)])
         px = cam_true.project(np.column_stack([q, np.full(4, TAG_H)]))
-        r = cm.car_pose(a2, px, SIDE, s_score['kappa'], s_score['plumb_xy_m'])
+        r = cm.car_pose(a2, px, SIDE, s_score['kappa'], s_score['plumb_xy_m'], off)
         worst = max(worst, math.hypot(r['x'] - x, r['y'] - y))
     return 1000.0 * worst
 
@@ -172,8 +209,7 @@ def test_d_h_covers_the_car_pose_error_of_the_truth_camera(s0, name, cam, tasks,
     """CD2-1, CD2-2: D_H (H1 frames scored with H0) is never below the error car_pose makes with the
     truth camera; where the fit sees the change (no height ambiguity) it is that error."""
     d = cd.compare(s0, make_session(cam), tasks, ks)
-    poses, _ = cd.lane_poses(tasks, ks)
-    truth = truth_error_mm(s0, cam, poses)
+    truth = truth_error_mm(s0, cam, truth_poses(tasks, ks))
     way = d['D_mm']['h0_to_h1']
     assert max(v['max'] for v in way.values()) >= truth - 0.05
     assert d['D_H_mm'] >= truth - 0.05
@@ -187,12 +223,39 @@ def test_height_change_held_by_the_tape_is_caught(s0):
     change it gives about the true error (above eps_H on the far K lane), the fit alone does not."""
     cam = moved_camera((0.0, 0.0, 0.06), 0.0)
     d = cd.compare(s0, make_session(cam), FIG + ['O1-K1'], K_FAR)
-    truth = truth_error_mm(s0, cam, cd.lane_poses(FIG + ['O1-K1'], K_FAR)[0])
+    truth = truth_error_mm(s0, cam, truth_poses(FIG + ['O1-K1'], K_FAR))
     assert truth > cd.EPS_MM
     assert d['D_mm']['h0_to_h1']['fit']['max'] < 0.5 * truth            # the fit alone misses it
     assert d['D_mm']['h0_to_h1']['focal_as_height']['max'] == pytest.approx(truth, rel=0.1)
     assert d['lens_z_m']['h0_to_h1']['focal_as_height'] == pytest.approx(ZC_TAPE + 0.06, abs=0.01)
     assert d['vuot'] and d['worst']['hypothesis'] == 'focal_as_height'
+
+
+@pytest.mark.parametrize('off', [(0.03, 0.0, 0.0), (0.03, 0.01, math.radians(2.0))])
+def test_tag_offset_enters_the_drift(s0, off):
+    """CD3-2 (Codex: K1 at 2.7,-1,0, k1 -0.050 -> -0.0491, offset (0.03, 0, 0)): the drift is computed
+    with the tag offset the runs are tracked with, and covers the truth error with that offset (body
+    frame offset and a tag heading offset, as c7_measure.car_pose takes it)."""
+    ks = (2.7, -1.0, 0.0)
+    cam = warped(0.0009)
+    s1 = make_session(cam)
+    d0 = cd.compare(s0, s1, ['O1-K1'], ks)
+    d = cd.compare(s0, s1, ['O1-K1'], ks, tag_offset=off)
+    assert d['tag_offset'] == pytest.approx(list(off)) and d0['tag_offset'] == [0.0, 0.0, 0.0]
+    truth = truth_error_mm(s0, cam, truth_poses(['O1-K1'], ks), off)
+    assert abs(d['D_H_mm'] - d0['D_H_mm']) > 0.02
+    assert d['D_mm']['h0_to_h1']['fit']['max'] == pytest.approx(truth, abs=0.05)
+    s0o = dict(s0, tag_offset=list(off))                       # default: the offset of session H0
+    assert cd.compare(s0o, s1, ['O1-K1'], ks)['D_H_mm'] == pytest.approx(d['D_H_mm'])
+
+
+@pytest.mark.parametrize('bad', [dict(f=0.0), dict(f=float('nan')), dict(f=-900.0), dict(k=[None, 0.0])])
+def test_bad_camera_numbers_refused(s0, bad):
+    """CD3-4: f = 0 divided by zero (exit 1); now ValueError."""
+    s1 = json.loads(json.dumps(s0))
+    s1['camera'].update(bad)
+    with pytest.raises(ValueError):
+        cd.compare(s0, s1, FIG)
 
 
 def test_distortion_change_trips_the_threshold(s0):
@@ -285,7 +348,8 @@ KS_K = [1.0, 0.0, -math.pi / 2]
 
 def sc(outcome, frames='f0', esp='e' * 64, t0=1000, off=0.25, U=0.005, ks=(0.0, 0.0, 0.785), task='O1-F05'):
     return dict(outcome=outcome, outcome_reasons=[], conditions={}, e_perp_max=0.01, completed='true', task=task,
-                t0_log_us=t0, offset_s=off, U_m=U, D=0.1, k_start=list(ks), thresholds=dict(t_miss=0.25),
+                t0_log_us=t0, offset_s=off, U_m=U, D=0.1, k_start=list(ks),
+                thresholds=dict(t_miss=0.25, status='khoa o C8'),
                 frames_sha256=frames, esp32_sha256=esp, frames_valid=600, gap_max=0.02, shift_max_px=0.5)
 
 
@@ -296,7 +360,7 @@ def tr(session='s0', video='r' * 64, frames='f0', off=(0.0, 0.0, 0.0), n=640, sh
 
 TASKS = ['O1-F02', 'O1-F05', 'O1-K1']
 DRIFT_OK = dict(kind='c7_calib_drift', vuot=False, thieu_H1=False, D_H_mm=0.5, eps_H_mm=2.0,
-                s0_session_sha256='s0', s1_session_sha256='s1', tasks=TASKS, k_start=KS_K)
+                s0_session_sha256='s0', s1_session_sha256='s1', tasks=TASKS, k_start=KS_K, tag_offset=[0.0, 0.0, 0.0])
 DRIFT_OVER = dict(DRIFT_OK, vuot=True, D_H_mm=3.1)
 DRIFT_MISS = dict(DRIFT_OK, vuot=True, thieu_H1=True, D_H_mm=None, s1_session_sha256=None)
 
@@ -355,7 +419,8 @@ def _drop(d, k):
     (dict(DRIFT_OK, kind='x'), False),
     (_drop(DRIFT_OK, 'tasks'), False), (dict(DRIFT_OK, tasks=[]), False), (dict(DRIFT_OK, tasks=['O1-F05', 'O1-Z']), False),
     (dict(DRIFT_OK, k_start=None), False), (dict(DRIFT_OK, k_start=[1.0, 0.0]), False),
-    (_drop(DRIFT_OK, 'D_H_mm'), False), (_drop(DRIFT_OK, 's1_session_sha256'), False), ([], False)])
+    (_drop(DRIFT_OK, 'D_H_mm'), False), (_drop(DRIFT_OK, 's1_session_sha256'), False), ([], False),
+    (_drop(DRIFT_OK, 'tag_offset'), False), (dict(DRIFT_OK, tag_offset=None), False)])
 def test_bad_drift_files_refused(bad, two):
     args = (sc('dat', frames='f1'), tr('s1', frames='f1'), 'f1') if two else ()
     with pytest.raises(ValueError):
@@ -366,7 +431,9 @@ def test_bad_drift_files_refused(bad, two):
                                   'U', 'k_start', 't0', 'offset', 'offset_nan', 'outcome', 'task', 'tag_offset',
                                   'n_frames', 'shape', 'h0_copied_into_h1', 'score_frames', 'track_no_frames_sha',
                                   'no_D_both', 'no_thresholds_both', 'no_t0_both', 'no_k_start_both',
-                                  'score_not_dict', 'track_not_dict', 'score_null', 'track_null'])
+                                  'score_not_dict', 'track_not_dict', 'score_null', 'track_null',
+                                  'D', 'threshold', 'frames_null_both', 'shapes_null_both', 'threshold_null_both',
+                                  'frames_bool', 'shape_zero', 'offset_not_drift_both'])
 def test_provenance_and_scoring_set_up_checked(case):
     a, ta, fa = sc('dat'), tr('s0'), 'f0'
     b, tb, fb = sc('dat', frames='f1'), tr('s1', frames='f1'), 'f1'
@@ -422,6 +489,23 @@ def test_provenance_and_scoring_set_up_checked(case):
         a = None
     elif case == 'track_null':
         ta = None
+    elif case == 'D':                                        # CD3-6: complete pair, only D differs
+        b = dict(b, D=0.2)
+    elif case == 'threshold':                                # CD3-6: only one threshold differs
+        b = dict(b, thresholds=dict(t_miss=0.30, status='khoa o C8'))
+    elif case == 'frames_null_both':                         # CD3-5: null on both sides is not "same"
+        ta, tb = dict(ta, frames=None), dict(tb, frames=None)
+    elif case == 'shapes_null_both':
+        ta, tb = dict(ta, decoded_shapes=None), dict(tb, decoded_shapes=None)
+    elif case == 'threshold_null_both':
+        a = dict(a, thresholds=dict(t_miss=None, status='x'))
+        b = dict(b, thresholds=dict(t_miss=None, status='x'))
+    elif case == 'frames_bool':
+        ta, tb = dict(ta, frames=True), dict(tb, frames=True)
+    elif case == 'shape_zero':
+        ta, tb = dict(ta, decoded_shapes=[[0, 1920]]), dict(tb, decoded_shapes=[[0, 1920]])
+    elif case == 'offset_not_drift_both':                    # CD3-2: both tracks agree, the drift does not
+        ta, tb = tr('s0', off=(0.03, 0.0, 0.0)), tr('s1', frames='f1', off=(0.03, 0.0, 0.0))
     with pytest.raises(ValueError):
         cd.combine(DRIFT_OVER, a, ta, fa, b, tb, fb)
 
@@ -503,10 +587,25 @@ def test_cli_round_trip(tmp_path, s0, capsys):
 
 @pytest.mark.parametrize('args', [['--tasks', 'O1-K1'], ['--tasks', 'O1-K1', '--k-start', '0,0'],
                                   ['--tasks', 'O1-K1', '--k-start', 'a,b,c'], ['--tasks', 'O1-F05', '--eps-mm', 'nan'],
-                                  ['--tasks', 'O1-Z']])
+                                  ['--tasks', 'O1-Z'], ['--tasks', 'O1-F05', '--tag-offset', '0.01,0'],
+                                  ['--tasks', 'O1-F05', '--tag-offset', '0,0,inf']])
 def test_cli_bad_arguments_exit_2(tmp_path, s0, capsys, args):
     p0 = _session_file(tmp_path, 's0', s0)
     assert cd.main(['so', '--s0', p0, '--out', str(tmp_path / 'd.json')] + args) == 2
+    assert capsys.readouterr().out.rstrip().endswith('#ket_qua,ma=2')
+
+
+def test_cli_tag_offset_and_zero_focal(tmp_path, s0, capsys):
+    p0 = _session_file(tmp_path, 's0', s0)
+    dr = str(tmp_path / 'd.json')
+    assert cd.main(['so', '--s0', p0, '--s1', p0, '--tasks', 'O1-F05', '--tag-offset', '0.03,0,1', '--out', dr]) == 0
+    d = json.loads(open(dr, encoding='utf-8').read())
+    assert d['tag_offset'] == pytest.approx([0.03, 0.0, math.radians(1.0)])
+    capsys.readouterr()
+    bad = json.loads(json.dumps(s0))
+    bad['camera']['f'] = 0.0                                   # CD3-4: was ZeroDivisionError, exit 1
+    p1 = _session_file(tmp_path, 's1', bad)
+    assert cd.main(['so', '--s0', p0, '--s1', p1, '--tasks', 'O1-F05', '--out', str(tmp_path / 'e.json')]) == 2
     assert capsys.readouterr().out.rstrip().endswith('#ket_qua,ma=2')
 
 

@@ -261,7 +261,10 @@ def rigid_fit(src, dst, with_scale=False):
 def car_pose(cam, corners_px, side, kappa, plumb, tag_offset=(0.0, 0.0, 0.0)):
     """(x, y, psi) of the WHEEL centre on the floor, tag centre (x, y), fit residual [m], apparent
     scale of the tag after the parallax correction, from the 4 corners of the car tag (design 3.4,
-    3.5). kappa = h / Z_c; plumb = (x, y) of the plumb point of the lens on the floor."""
+    3.5). kappa = h / Z_c; plumb = (x, y) of the plumb point of the lens on the floor. tag_offset =
+    (dx, dy) tag centre minus wheel centre in the BODY frame, dpsi tag heading minus body heading (as
+    track --tag-offset says): the offset is turned by the body heading ang - dpsi, not by the tag
+    heading (found 16/11 with c7_calib_drift CD3-2; the old code was off by about |offset| x dpsi)."""
     p_floor = cam.pix2floor(np.asarray(corners_px, float), 0.0)
     C = np.asarray(plumb, float)
     P = p_floor + kappa * (C - p_floor)
@@ -269,7 +272,7 @@ def car_pose(cam, corners_px, side, kappa, plumb, tag_offset=(0.0, 0.0, 0.0)):
     ang, t, _, res = rigid_fit(body, P)
     _, _, sc, _ = rigid_fit(body, P, with_scale=True)
     dx, dy, dpsi = tag_offset
-    c, s = math.cos(ang), math.sin(ang)
+    c, s = math.cos(ang - dpsi), math.sin(ang - dpsi)
     xw, yw = t[0] - (c * dx - s * dy), t[1] - (s * dx + c * dy)
     return dict(x=float(xw), y=float(yw), psi=float(cp_wrap(ang - dpsi)), tag_x=float(t[0]), tag_y=float(t[1]),
                 tag_psi=float(ang), res_m=res, scale=sc)

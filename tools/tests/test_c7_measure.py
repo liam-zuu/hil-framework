@@ -204,6 +204,23 @@ def test_frames_csv_round_trip(tmp_path, session, run_clip):
     assert abs(back[3]['x'] - rows[3]['x']) < 1e-6
 
 
+@pytest.mark.parametrize('off', [(0.05, 0.02, math.radians(3.0)), (-0.04, 0.03, math.radians(-5.0)),
+                                 (0.0, 0.0, math.radians(4.0))])
+def test_car_pose_turns_the_offset_by_the_body_heading(off):
+    """Tag offset in the BODY frame (track --tag-offset, render_car above): the exact corners of a
+    tag at height h, projected by the camera, give the wheel pose back. The
+    old code turned (dx, dy) by the TAG heading: off by |offset| x dpsi (2.8 mm for the first case)."""
+    x, y, psi = 0.6, -0.3, math.radians(25.0)
+    dx, dy, dp = off
+    tx, ty = x + math.cos(psi) * dx - math.sin(psi) * dy, y + math.sin(psi) * dx + math.cos(psi) * dy
+    c, s = math.cos(psi + dp), math.sin(psi + dp)
+    q = np.array([[tx + c * u - s * v, ty + s * u + c * v] for u, v in cm.car_corners_body(CAR_SIDE)])
+    px = CAM.project(np.column_stack([q, np.full(4, TAG_H)]))
+    r = cm.car_pose(CAM, px, CAR_SIDE, TAG_H / ZC, PLUMB, off)
+    assert math.hypot(r['x'] - x, r['y'] - y) < 1e-6
+    assert abs(cm.cp_wrap(r['psi'] - psi)) < 1e-6 and abs(cm.cp_wrap(r['tag_psi'] - psi - dp)) < 1e-6
+
+
 def test_track_cli_records_the_frames_it_wrote(tmp_path, session, run_clip):
     """c7_calib_drift CD2-3: track.json carries the sha256 of the frames.csv written next to it."""
     import json
