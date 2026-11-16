@@ -660,27 +660,59 @@ def test_zone_row_without_record_cannot_be_tabled(tmp_path):
     assert ct.main([str(tmp_path)]) == 2
 
 
-def test_bench_plant_record_steps_from_t0(tmp_path, fake_check):
-    d = str(tmp_path)
+YAW_STEP = 4000                                  # ms after t0: the fault run's true theta + YAW_RAW int16 steps
+YAW_RAW = 2086                                   # x pi / 32767 = 0.2000 rad
+
+
+def bench_plant(d, file='PID_enc_FL_frames_plant_faults.npz'):
+    """write_bench with batt_sag + mu_zone rows and a plant record (steps from the absolute frame step) in the
+    fault run; its true theta has one spike of YAW_RAW int16 steps at t0 + YAW_STEP."""
     write_bench(d)
     npz = os.path.join(d, 'frames', 'PID_enc_FL_frames.npz')
     z = np.load(npz)
-    arrs = {k: z[k] for k in z.files}
+    arrs = {k: z[k].copy() for k in z.files}
     man = json.loads(str(arrs['manifest']))
-    rec_name = 'PID_enc_FL_frames_plant_faults.npz'
     man['faults']['rows'] = [ROW, B_ROW, Z_ROW]
-    man['faults']['plant_record'] = dict(file=rec_name, sha256='x', rows=2000, inner='MecanumPlant')
+    man['faults']['plant_record'] = dict(file=file, sha256='x', rows=2000, inner='MecanumPlant')
     man['plant'] = 'FaultPlant'
     arrs['manifest'] = np.array(json.dumps(man))
+    fr = arrs['mosi_true'][T0 + YAW_STEP]
+    th = int.from_bytes(bytes(fr[12:14]), 'big', signed=True) + YAW_RAW
+    fr[12:14] = np.frombuffer(th.to_bytes(2, 'big', signed=True), np.uint8)
     np.savez(npz, **arrs)
-    np.savez(os.path.join(d, 'frames', rec_name), record=plant_record(step0=T0, mask=6),
+    np.savez(os.path.join(d, 'frames', 'PID_enc_FL_frames_plant_faults.npz'), record=plant_record(step0=T0, mask=6),
              cols=np.array(json.dumps(list(REC_COLS))))
+
+
+def test_bench_plant_record_steps_from_t0(tmp_path, fake_check):
+    d = str(tmp_path)
+    bench_plant(d)
     r = ct.table(d)[0]
     assert (r['zone_in_s'], r['zone_out_s']) == (4.0, 4.5)              # record steps - t0
     assert r['ramp_end_s'] == 4.0
     q = 3.0 / 32767
     assert r['err_rms_ramp_wz'] == pytest.approx(0.01, abs=1e-3) and r['base_err_rms_ramp_vx'] == pytest.approx(0, abs=q)
+    # Codex FQ1-3: answers known in advance; vx 0.4 at t0 + 5.9 s is in the hold part [4, 6) s, not in the ramp
+    assert r['err_rms_ramp_vx'] == pytest.approx(0, abs=q)
+    assert r['err_rms_hold_vx'] == pytest.approx(0.4 / math.sqrt(2000), rel=1e-3)
+    assert r['yaw_dev_max'] == pytest.approx(YAW_RAW * math.pi / 32767, abs=2 * math.pi / 32767)
     assert r['sat_frac_fl'] == pytest.approx(50 / 300) and r['sat_frac_rr'] == 0
-    assert r['yaw_dev_max'] >= 0
     kf = list(r)
     assert kf.index('ticks_expected') + 1 == kf.index('sat_frac_fl') and kf[-1] == 'blank'
+
+
+@pytest.mark.parametrize('bad', ['../outside.npz', 123, '', '.', '..', 'sub/x.npz', 'sub\\x.npz', 'C:x.npz',
+                                 os.path.abspath('x.npz')])
+def test_bench_plant_record_name_refused_before_opening(tmp_path, fake_check, monkeypatch, bad):
+    """Codex FQ1-2: a plant_record file that is not a bare name of the frames folder is refused before any open
+    of it: exit 2, and np.load only ever saw the frame logs."""
+    d = str(tmp_path)
+    bench_plant(d, file=bad)
+    seen, real = [], np.load
+
+    def load(path, *a, **k):
+        seen.append(str(path))
+        return real(path, *a, **k)
+    monkeypatch.setattr(ct.np, 'load', load)
+    assert ct.main([d]) == 2
+    assert seen and all(x.endswith('_frames.npz') for x in seen), seen

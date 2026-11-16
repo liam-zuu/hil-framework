@@ -24,8 +24,13 @@ Times, under the same scheduling as the plant loop (SCHED_FIFO 90, core 0):
                  jam   wheel_jam FL b=0.1 on (s11)
                  sag   batt_sag v1=7.44 on, still on its ramp (s13)
                  zone  mu_zone all wheels, mu=0.2, the four contact points every step (s15)
+                 zone_half  the same with a zone that holds only the two left wheels (y >= 0): max(mu_hd)
+                       stays nominal, so the traction sub-steps stay those of the nominal plant (Codex FQ1-4:
+                       a zone over all four wheels lowers max(mu_hd) and so the sub-steps, which is lighter)
                  all3  jam + sag + zone on together
-               The patch() of the frame is not in these numbers (fault_idle / fault_all4 above).
+               The patch() of the frame is not in these numbers (fault_idle / fault_all4 above). They are the
+               steady cost after the warm-up with one set of rows on and one zone mask: the build of a new
+               parameter copy when a window opens or the zone mask changes falls in the warm-up, not timed.
   slipA_nsubN  THROWAWAY timing prototype of a minimal slip model (method A):
                body with its own dynamics, traction per wheel capped by mu*N,
                N sub-steps per 1 ms. Only for timing: parameters are guesses,
@@ -83,6 +88,7 @@ FAULT_PLANT_ROWS = {
     'jam':  'J1,wheel_jam,FL,0,{w},b=0.1\n',
     'sag':  'B1,batt_sag,batt,0,{w},v1=7.44;ramp_ms={w}\n',
     'zone': 'Z1,mu_zone,all,0,{w},x0=-1000;x1=1000;y0=-1000;y1=1000;mu=0.2\n',
+    'zone_half': 'Z1,mu_zone,all,0,{w},x0=-1000;x1=1000;y0=0;y1=1000;mu=0.2\n',
 }
 FAULT_PLANT_STEP = 100              # patcher step of the timed calls: inside every window, batt_sag still ramping
 
@@ -108,7 +114,7 @@ def fault_plant_variants(n, x, u):
 
     base = inner()
     out = [('fault_plant_base', lambda: base.step(ul), None)]
-    for name in ('idle', 'jam', 'sag', 'zone', 'all3'):
+    for name in ('idle', 'jam', 'sag', 'zone', 'zone_half', 'all3'):
         rows = fsch.parse(head + bodies[name])
         fsch.check(rows, 2 * w, 'plant', 'traction')
         pa = fsch.FramePatcher(fsch.Schedule(tuple(rows)))

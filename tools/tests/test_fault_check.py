@@ -661,3 +661,28 @@ def test_ibus_run_passes_and_bit4_tampering_fails(tmp_path):
         q = resave(run_[0], str(tmp_path / f'{name}.npz'), edit)
         rr = fc.check(q, run_[1], run_[2])
         assert not rr['ok'] and rr['frames_bad'] == 1, name
+
+
+@pytest.mark.parametrize('k', [0, 59, 180, 399])        # before, between and after the ibus windows
+def test_ibus_bit_in_both_arrays_fails_the_truth_check(tmp_path, k):
+    """Codex FQ1-1: bit 4 put in mosi and mosi_true of one frame outside a window: frames_bad stays 0 (the
+    reference starts from mosi_true), the truth self-check must fail the run."""
+    run_ = open_loop(tmp_path, body=IBUS_BODY, name='ibus2')
+
+    def edit(d, m):
+        d['mosi'][k, 20] |= 16
+        d['mosi_true'][k, 20] |= 16
+    q = resave(run_[0], str(tmp_path / f'both_{k}.npz'), edit)
+    r = fc.check(q, run_[1], run_[2])
+    assert not r['ok'] and r['frames_bad'] == 0
+    assert r['self_check']['ibus_bit_bad'] == 1 and r['self_check']['first_ibus_bit_bad'] == k
+
+
+def test_ibus_bit_in_truth_fails_a_schedule_without_ibus_rows(run, tmp_path):
+    def edit(d, m):
+        d['mosi'][77, 20] |= 16
+        d['mosi_true'][77, 20] |= 16
+    q = resave(run[0], str(tmp_path / 'noibus.npz'), edit)
+    r = fc.check(q, run[1], run[2])
+    assert not r['ok'] and r['self_check']['ibus_bit_bad'] == 1
+    assert fc.check(*run)['self_check']['ibus_bit_bad'] == 0

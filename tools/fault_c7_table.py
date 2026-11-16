@@ -533,6 +533,15 @@ def esp_run_rows(name, esp_all, n_ticks, first_seq):
     return rows, pre
 
 
+def bare_name(name, f):
+    """Codex FQ1-2: the plant record named in the manifest must be a bare file name of the frames folder (a
+    string, no folder part, not absolute, not '', '.', '..'), checked before anything is opened."""
+    if (not isinstance(f, str) or f in ('', '.', '..') or os.path.isabs(f) or os.path.basename(f) != f
+            or '/' in f or '\\' in f or ':' in f):
+        raise TableError(f'{name}: plant_record file {f!r} is not a bare file name of the frames folder')
+    return f
+
+
 def load_bench_run(run_dir, srun, clean):
     name = srun['name']
     if not clean.get(name):
@@ -570,8 +579,8 @@ def load_bench_run(run_dir, srun, clean):
     te = np.round((esp['tick'] - esp['tick'][0]) * TICK_S, 6)
     plant = None
     pr = (faults or {}).get('plant_record')
-    if isinstance(pr, dict) and pr.get('file'):                         # batch 2: <frames>_plant_faults.npz
-        zr = np.load(os.path.join(run_dir, 'frames', pr['file']))
+    if isinstance(pr, dict) and pr.get('file') is not None:             # batch 2: <frames>_plant_faults.npz
+        zr = np.load(os.path.join(run_dir, 'frames', bare_name(name, pr['file'])))
         cols = json.loads(str(zr['cols']))
         rec = zr['record']
         plant = (rec[:, cols.index('step')] - t0,
