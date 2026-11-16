@@ -415,7 +415,8 @@ def test_imu_gap_long_before_the_run_does_not_matter(tmp_path):
         w.writeheader()
         w.writerows(rows)
     os.remove(p + '.segments.csv')
-    out, _ = cs.score(make_frames('O1-F05'), p, 'O1-F05', hs, offset_s=OFFSET, offset_reason='test')
+    out, _ = cs.score(make_frames('O1-F05'), p, 'O1-F05', hs, offset_s=OFFSET, offset_reason='test', offset_anchor_s=0.0,
+                      offset_err_s=0.0)
     assert out['yaw_check']['compared'] and out['outcome'] == 'dat'
 
 
@@ -481,6 +482,7 @@ def test_cli_writes_score_json(tmp_path):
     hs_file(tmp_path)
     args = ['--frames', str(tmp_path / 'frames.csv'), '--esp32', log, '--task', 'O1-F05', '--hang-so',
             str(tmp_path / 'hang_so.json'), '--offset-s', str(OFFSET), '--offset-reason', 'test',
+            '--offset-anchor-s', '0', '--offset-err-s', '0',
             '--out', str(tmp_path / 'score.json'), '--rows', str(tmp_path / 'rows.csv')]
     assert cs.main(args) == 0
     s = json.loads((tmp_path / 'score.json').read_text(encoding='utf-8'))
@@ -745,13 +747,14 @@ def test_cs1_9_way_2_speeds_without_the_suspect_frames(tmp_path):
 
 
 def test_cs1_10_suspects_not_converging():
-    """Codex CS1-10: 101 samples, half 2, min 3, one coordinate alternating 0.10 / 0.16 m: the passes cycle. The
-    result is the union of the last two passes with a finite |p - p^| on every suspect, flagged not converged."""
+    """Codex CS1-10: 101 samples, half 2, min 3, one coordinate alternating 0.10 / 0.16 m: the passes cycle; the
+    suspect set is not empty, flagged not converged. (Since CS2-10 a suspect without nmin non-suspect neighbours in
+    the final set has no prediction: NaN, U_p,k not finite; test_cs2_10_*.)"""
     t = np.arange(101) / 60.0
     x = np.where(np.arange(101) % 2, 0.16, 0.10)
     sus, pred, passes, conv = cs.mark_suspects(t, x, np.zeros(101), 0.02, 2, 3)
     assert not conv and passes == cs.SUSPECT_PASSES
-    assert sus.sum() > 50 and np.all(np.isfinite(pred[sus])) and np.all(pred[sus] > 0.02)
+    assert sus.sum() > 50 and np.all(np.isnan(pred[sus]) | (pred[sus] > 0.02))
 
 
 def test_cs1_11_alignment_frames_must_be_still_in_translation(tmp_path):
