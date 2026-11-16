@@ -802,14 +802,14 @@ def _sealed_ids(s03):
 
 def _sealed_kind(p, ids):
     """'sealed' | 'sealed_test' | None for an opened path: by file identity, else by the path text."""
-    if isinstance(p, (str, os.PathLike)):
+    if isinstance(p, (str, bytes, os.PathLike)):                 # RSM5-3: bytes paths too
         try:
             st = os.stat(p)
             if (st.st_dev, st.st_ino) in ids:
                 return ids[(st.st_dev, st.st_ino)]
         except OSError:
             pass
-        q = str(p).replace('\\', '/')
+        q = os.fsdecode(os.fspath(p)).replace('\\', '/')
         if '/s03/sealed_test/' in q:
             return 'sealed_test'
         if '/s03/sealed/' in q:
@@ -1286,15 +1286,45 @@ def _hard_link(src, dst):
 
 
 def test_io_guard_catches_an_alias(tmp_path, dummy_dll, monkeypatch):
-    """RSM4-3: the I/O guard records an open of a hard link alias of a sealed_test/ file, by builtins.open and by
-    os.open, with the kind of the file it aliases."""
+    """RSM4-3, RSM5-3: the I/O guard records an open of a sealed_test/ file, directly and by a hard link alias, by
+    builtins.open and by os.open, with a str, Path or bytes path, with the kind of the file it aliases."""
     repo, s03, s04 = setup(tmp_path, dummy_dll)
     alias = tmp_path / 'alias.csv'
     _hard_link(s03 / 'sealed_test' / 'runs_test.csv', alias)
+    direct = s03 / 'sealed_test' / 'runs_test.csv'
     ev = _io_log(monkeypatch, s03=s03)
     open(alias, 'rb').close()
     os.close(os.open(str(alias), os.O_RDONLY))
-    assert [(e[0], e[3]) for e in ev] == [('open', 'sealed_test'), ('open', 'sealed_test')]
+    for p in (os.fsencode(str(alias)), os.fsencode(str(direct))):
+        open(p, 'rb').close()
+        os.close(os.open(p, os.O_RDONLY))
+    assert [(e[0], e[3]) for e in ev] == [('open', 'sealed_test')] * 6
+
+
+def test_run_lock_name_is_global(tmp_path):
+    """RSM5-1: the mutex name is in the Global namespace (one per folder for every Windows logon session) and
+    depends on the real rsm/ path only."""
+    a = rc.run_lock_name(str(tmp_path / 'rsm'))
+    assert a.startswith('Global\\' + rc.RUN_LOCK_PREFIX) and a == rc.run_lock_name(str(tmp_path / 'x' / '..' / 'rsm'))
+    assert a != rc.run_lock_name(str(tmp_path / 'other' / 'rsm'))
+
+
+@pytest.mark.parametrize('tag,refused', [(0xA000000C, True),     # IO_REPARSE_TAG_SYMLINK
+                                         (0xA0000003, True),     # IO_REPARSE_TAG_MOUNT_POINT (junction)
+                                         (0x80000013, False),    # IO_REPARSE_TAG_DEDUP: storage, no other name
+                                         (0x9000001A, False)])   # IO_REPARSE_TAG_CLOUD_A (OneDrive placeholder)
+def test_reparse_tags(tmp_path, monkeypatch, tag, refused):
+    """RSM5-2: only name-surrogate reparse points are links; a storage reparse point is a plain file (simulated:
+    os.lstat of that path gives the tag)."""
+    import types
+    f = tmp_path / 'f.csv'
+    f.write_text('x\n')
+    real = os.lstat
+    fake = types.SimpleNamespace(st_mode=0o100644, st_file_attributes=0x400, st_reparse_tag=tag, st_nlink=1)
+    monkeypatch.setattr(os, 'lstat', lambda p, *a, **k: fake if os.path.normcase(str(p)) == os.path.normcase(str(f))
+                        else real(p, *a, **k))
+    monkeypatch.delattr(os.path, 'isjunction', raising=False)
+    assert rc.is_dir_link(str(f)) is refused
 
 
 def test_hard_links_are_refused(tmp_path, dummy_dll, monkeypatch):

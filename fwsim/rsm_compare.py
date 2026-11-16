@@ -146,11 +146,12 @@ INTERPRETATIONS = [
     'liam-zuu/hil-thesis, the S04 files read are committed '
     'unchanged, rsm_compare.py is its HEAD blob, the DLL SHA-256 is the S04 one before loading and at the end',
     'one run at a time (RSM-14, RSM3-3, RSM4-2): an operating-system lock that opens no file: on Windows a named '
-    'mutex Local\\rsm_compare_<SHA-256 of the real rsm/ path>, on POSIX flock on the rsm/ folder itself (O_DIRECTORY, '
+    'mutex Global\\rsm_compare_<SHA-256 of the real rsm/ path>, on POSIX flock on the rsm/ folder itself (O_DIRECTORY, '
     'O_NOFOLLOW); held for the whole phase, freed by the system when the process ends however it ends; a phase, a '
     'stop and an abort commit '
     'only the files the run wrote or that were committed (RSM2-4); paths are checked before they are opened '
-    '(RSM2-1): no symlink, no junction or other reparse point (RSM4-4), no file with a second hard link, no '
+    '(RSM2-1): no symlink, no junction or other name-surrogate reparse point (RSM4-4, RSM5-2), no file with a '
+    'second hard link, no '
     'directory entry that is a link or a junction under a folder walked (RSM3-2)',
     'file SHA-256 in the locks and attempts.csv: of the bytes as written and of the bytes with CRLF -> LF '
     '(compared: the LF value, so a checkout with core.autocrlf keeps the lock valid)',
@@ -220,16 +221,21 @@ def is_on(x):
     return str(x).strip().lower() in ('1', '1.0', 'true')
 
 
+NAME_SURROGATE = 0x20000000   # RSM5-2: reparse tag bit of a point that names another file (symlink, junction)
+
+
 def is_dir_link(p):
-    """RSM3-2, RSM4-4: p is a symlink, a junction (os.path.isjunction, Python 3.12) or, on any Python version, a
-    Windows reparse point (os.lstat st_file_attributes: junctions and symlinks are reparse points)."""
+    """RSM3-2, RSM4-4, RSM5-2: p is a symlink, a junction (os.path.isjunction, Python 3.12) or, on any Python
+    version, a Windows reparse point whose tag is a name surrogate (os.lstat st_reparse_tag: symlinks, junctions);
+    a storage reparse point (deduplication, cloud placeholder) names no other file and is not refused."""
     if os.path.islink(p) or getattr(os.path, 'isjunction', lambda q: False)(p):
         return True
     try:
         st = os.lstat(p)
     except OSError:
         return False
-    return bool(getattr(st, 'st_file_attributes', 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+    return bool(getattr(st, 'st_file_attributes', 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+                and getattr(st, 'st_reparse_tag', 0) & NAME_SURROGATE)
 
 
 def files_under(root, rel_dirs):
@@ -1506,7 +1512,8 @@ _HELD = set()                 # mutex names this process holds (a Windows mutex 
 
 def run_lock_name(out):
     real = os.path.normcase(os.path.realpath(os.path.abspath(out)))
-    return 'Local\\' + RUN_LOCK_PREFIX + hashlib.sha256(real.encode('utf-8')).hexdigest()
+    # RSM5-1: Global namespace, one mutex per folder for every Windows logon session
+    return 'Global\\' + RUN_LOCK_PREFIX + hashlib.sha256(real.encode('utf-8')).hexdigest()
 
 
 def acquire_run_lock(out):
