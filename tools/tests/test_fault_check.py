@@ -456,7 +456,8 @@ def test_truth_self_check_plant_imu_without_noise(tmp_path):
     steps = write_step_log(str(tmp_path / 'st.csv'), 200)
     r = fc.check(p, str(csv_), steps)
     assert r['ok'], r['fails']
-    assert r['self_check'] == dict(seq_bad=0, first_seq_bad=None, imu_checked=True, yaw_theta_bad=0, gz_wz_bad=0)
+    assert r['self_check'] == dict(seq_bad=0, first_seq_bad=None, imu_checked=True, yaw_theta_bad=0, gz_wz_bad=0,
+                                   ibus_bit_bad=0, first_ibus_bit_bad=None)       # Codex FQ1-1, FQ2-1
 
     def yaw(d, m):
         for a in ('mosi', 'mosi_true'):

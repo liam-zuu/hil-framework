@@ -96,6 +96,36 @@ def test_idle_is_the_nominal_path_and_faults_change_the_plant():
         assert not np.array_equal(np.array(v[name][0]()), base), name
 
 
+def test_every_call_steps_from_the_same_state():
+    """Codex FQ2-2: each call is one step from x, so two calls give the same next state, x is not written,
+    and the recorded pose is x at every call."""
+    v, _ = run(5)
+    for name in NAMES:
+        fn = v[name][0]
+        a, b = np.array(fn()), np.array(fn())
+        assert np.array_equal(a, b), name
+    for name in NAMES[2:]:
+        r = rec(v[name][1])
+        assert np.all(r['x'] == X0[0]) and np.all(r['y'] == X0[1]) and np.all(r['theta'] == X0[2]), name
+    assert np.array_equal(X0[6:10], np.full(4, 5.0)) and not np.any(X0[:6])
+
+
+def test_zone_half_keeps_its_mask_for_every_timed_call_of_a_full_run(monkeypatch):
+    """Codex FQ2-2: n = 20000 as the script's default: the two left wheels in the zone, the right ones out, at
+    every one of the WARMUP + n calls (one parameter copy, max(mu_hd) nominal)."""
+    n = 20000
+    vs = {k: (f, p) for k, f, p in pt.fault_plant_variants(n, X0, U)}
+    fn, plant = vs['fault_plant_zone_half']
+    for _ in range(pt.WARMUP + n):
+        fn()
+    r = rec(plant)
+    nom = MecanumParams()
+    assert len(r['step']) == pt.WARMUP + n
+    assert np.all(r['mu_fl'] == 0.2) and np.all(r['mu_rl'] == 0.2)
+    assert np.all(r['mu_fr'] == nom.mu_hd[1]) and np.all(r['mu_rr'] == nom.mu_hd[3])
+    assert len(plant._var._cache) == 1
+
+
 def test_window_and_record_sized_for_the_timed_calls():
     # built only, not run: the window and the record must hold WARMUP + n calls for any n (the run itself is
     # checked with n = 40 above), else the later timed calls would leave the fault path or overflow

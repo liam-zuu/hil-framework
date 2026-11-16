@@ -18,7 +18,10 @@ Times, under the same scheduling as the plant loop (SCHED_FIFO 90, core 0):
   mosi_true_log L82: the extra FRAME_SIZE-byte write of the true frame into the frame log (--faults)
   fault_plant_* batch 2 plant faults (fault_plant.py; design 2026-11-15_Thiet_ke_bom_loi_dot2_v1.md 4.3):
                one MecanumPlant.step (dc, traction, nominal params.py) with and without a FaultPlant around it,
-               the patcher held at one step inside every window, the record written at every timed call:
+               the patcher held at one step inside every window, the record written at every timed call;
+               every call steps from the same plant state x (as current / traction_mu* call plant_step(x, ...);
+               Codex FQ2-2: a plant left to run drifts out of a zone in the world frame within a few thousand
+               calls), so the code path, the zone mask and the traction sub-steps are the same in every call:
                  base  MecanumPlant.step alone (the reference of the five below)
                  idle  FaultPlant, a plant row in the schedule but outside its window (nominal path)
                  jam   wheel_jam FL b=0.1 on (s11)
@@ -96,7 +99,8 @@ FAULT_PLANT_STEP = 100              # patcher step of the timed calls: inside ev
 def fault_plant_variants(n, x, u):
     """[(name, fn, plant)] of the batch 2 plant fault timings (docstring above); plant is the FaultPlant (None
     for base) so that a test can see the fault path really ran. Each variant has its own MecanumPlant and
-    MecanumParams, started from state x; fn() is one plant step with duty u."""
+    MecanumParams; fn() is one plant step with duty u from state x (the plant state is set back to x, one
+    reference assignment, before each step)."""
     import fault_schedule as fsch
     from fault_plant import FaultPlant
     from mecanum_plant import MecanumPlant
@@ -106,14 +110,21 @@ def fault_plant_variants(n, x, u):
     bodies.update({k: v.format(w=w) for k, v in FAULT_PLANT_ROWS.items()})
     bodies['all3'] = ''.join(bodies[k] for k in ('jam', 'sag', 'zone'))
     ul = [float(v) for v in u]
+    s0 = np.array(x, dtype=float)              # plant_step returns a new array: s0 itself is never written
 
     def inner():
         pl = MecanumPlant(params=MecanumParams(), dt=0.001, seed=0)
         pl.reset(list(x))
         return pl
 
+    def from_x(pl, step):
+        def call():
+            pl._state = s0                     # Codex FQ2-2: the same state x at every call
+            return step(ul)
+        return call
+
     base = inner()
-    out = [('fault_plant_base', lambda: base.step(ul), None)]
+    out = [('fault_plant_base', from_x(base, base.step), None)]
     for name in ('idle', 'jam', 'sag', 'zone', 'zone_half', 'all3'):
         rows = fsch.parse(head + bodies[name])
         fsch.check(rows, 2 * w, 'plant', 'traction')
@@ -122,7 +133,7 @@ def fault_plant_variants(n, x, u):
         pa.patch(FAULT_PLANT_STEP, bytes(FRAME_SIZE))
         fp = FaultPlant(inner(), pa, None)
         pa.plant_hook = fp
-        out.append((f'fault_plant_{name}', lambda fp=fp: fp.step(ul), fp))
+        out.append((f'fault_plant_{name}', from_x(fp.inner, fp.step), fp))
     return out
 
 
@@ -250,10 +261,10 @@ def main() -> int:
     for ns in (int(s) for s in a.nsub.split(',') if s):
         variants.append((f'slipA_nsub{ns}', lambda ns=ns: stepA(v0, w0, u, ns)))
 
-    print(f'{"variant":<18}{"mean_us":>9}{"p50_us":>9}{"p99_us":>9}{"max_us":>9}   n={a.n}', flush=True)
+    print(f'{"variant":<22}{"mean_us":>9}{"p50_us":>9}{"p99_us":>9}{"max_us":>9}   n={a.n}', flush=True)
     for name, fn in variants:
         t = _time(fn, a.n)
-        print(f'{name:<18}{t.mean():9.1f}{np.percentile(t, 50):9.1f}{np.percentile(t, 99):9.1f}{t.max():9.1f}',
+        print(f'{name:<22}{t.mean():9.1f}{np.percentile(t, 50):9.1f}{np.percentile(t, 99):9.1f}{t.max():9.1f}',
               flush=True)
 
     print(f'machine: {platform.node()} | {platform.platform()} | python {platform.python_version()} '
