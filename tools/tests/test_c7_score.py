@@ -455,6 +455,31 @@ def test_g_range_against_dense_sampling(a, b):
         assert mn >= g.min() - 2e-4 and mx <= g.max() + 2e-4      # the grid misses a kink by < a x step / 2
 
 
+def test_g4_bounds_near_a_centre_of_curvature():
+    """Measured centre 2 mm from the centre of the tightest curve: the lane points of a long arc are almost equally
+    far, so a true centre within U_p projects far along the arc with a very different heading. J_k must take the
+    points within the smallest distance + 2 U_p (a set of one point does not bound it)."""
+    lane = lane_of('O1-F05')
+    p = lane.path
+    kap = np.gradient(np.unwrap(p.head), p.s)
+    i = int(np.argmax(np.abs(kap[1000:-1000]))) + 1000
+    r = 1.0 / kap[i]
+    cx, cy = p.x[i] - math.sin(p.head[i]) * r, p.y[i] + math.cos(p.head[i]) * r
+    x, y, psi = cx + 0.002, cy - 0.001, p.head[i] + 0.4
+    w_lo, w_hi = p.s[i] - 0.3, p.s[i] + 0.3
+    upk, ups = 0.01, math.radians(2.0)
+    lo, hi = cs.g4_bounds_jk(lane, x, y, psi, w_lo, w_hi, upk, ups)
+    rng = np.random.default_rng(3)
+    vals = []
+    for _ in range(400):
+        rr, a = upk * math.sqrt(rng.uniform()), rng.uniform(0, 2 * math.pi)
+        _, e_t, h_t, _ = p.nearest(x + rr * math.cos(a), y + rr * math.sin(a), w_lo, w_hi)
+        th = cs.wrap(psi + rng.uniform(-ups, ups) - h_t)
+        vals.append(e_t + 0.17 * abs(math.sin(th)) + 0.145 * (abs(math.cos(th)) - 1))
+    assert lo - 1e-6 <= min(vals) and max(vals) <= hi + 1e-6, (lo, min(vals), max(vals), hi)
+    assert max(vals) - min(vals) > 0.05                 # the case is hard: headings spread along the arc
+
+
 @pytest.mark.parametrize('task,ks', [('O1-F05', None), ('O1-K2', (0.0, 0.0, 0.0))])
 def test_g4_bounds_contain_every_true_pose(task, ks):
     """O1 3.4 J_k: for random true poses within U_p, U_psi of the measured one, the true G4 (nearest lane point in
