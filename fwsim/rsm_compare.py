@@ -48,6 +48,7 @@ import os
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -136,14 +137,19 @@ INTERPRETATIONS = [
     'fingerprint recorded them; the sealed files (and sealed_test/ in phase 3) are hashed after the start commit, '
     'checked against that record, and written in the end row and the locks',
     'locks (RSM-3, RSM2-3): every locked file must be the blob of the output commit of the attempt that wrote it: '
-    'the oldest commit whose attempts.csv holds its end/done row (message checked on top); opt_lock.yaml records '
-    'the SHA-256 of fit/lock.yaml; every committed version of attempts.csv must extend the one before (RSM2-2)',
+    'the oldest commit (topological order) whose attempts.csv holds its end/done row (message checked on top); '
+    'opt_lock.yaml records the SHA-256 of fit/lock.yaml; every committed version of attempts.csv in the history of '
+    'HEAD (git log --full-history: the side branches of a merge too) must be a prefix of the HEAD version (RSM2-2, '
+    'RSM3-1)',
     'main run (RSM-2, RSM-12): the repository is ROOT_PATH (the thesis root folder) with origin '
     'liam-zuu/hil-thesis, the S04 files read are committed '
     'unchanged, rsm_compare.py is its HEAD blob, the DLL SHA-256 is the S04 one before loading and at the end',
-    'one run at a time (RSM-14): rsm/.run_lock (O_EXCL, never committed; --abort-previous removes it when its '
-    'process is not running, RSM2-6); a phase, a stop and an abort commit only the files the run wrote or that '
-    'were committed (RSM2-4); paths are checked for links before they are opened (RSM2-1)',
+    'one run at a time (RSM-14, RSM3-3): an operating-system lock (msvcrt.locking on Windows, fcntl.flock on POSIX) '
+    'on rsm/.run_lock, held for the whole phase and freed by the system when the process ends however it ends; the '
+    'file is never read, written, removed or committed (it stays, untracked); a phase, a stop and an abort commit '
+    'only the files the run wrote or that were committed (RSM2-4); paths are checked before they are opened '
+    '(RSM2-1): no symlink, no junction, no file with a second hard link, no directory entry that is a link or a '
+    'junction under a folder walked (RSM3-2)',
     'file SHA-256 in the locks and attempts.csv: of the bytes as written and of the bytes with CRLF -> LF '
     '(compared: the LF value, so a checkout with core.autocrlf keeps the lock valid)',
     'no x_GA (send_to_HIL infeasible in S04) stops the run: 12.5 does not define the classes without it',
@@ -212,15 +218,24 @@ def is_on(x):
     return str(x).strip().lower() in ('1', '1.0', 'true')
 
 
+def is_dir_link(p):
+    """RSM3-2: p is a symlink or a junction (os.path.isjunction, Python 3.12)."""
+    return os.path.islink(p) or bool(getattr(os.path, 'isjunction', lambda q: False)(p))
+
+
 def files_under(root, rel_dirs):
-    """Relative (posix) paths of every file under root/<rel_dir> for each dir, sorted."""
+    """Relative (posix) paths of every file under root/<rel_dir> for each dir, sorted. A directory entry that is a
+    link or a junction stops (RSM3-2: os.walk neither lists it as a file nor goes into a directory symlink)."""
     out = []
     for d in rel_dirs:
         base = os.path.join(root, d)
         if os.path.isfile(base):
             out.append(d.replace(os.sep, '/'))
             continue
-        for dp, _, fs in os.walk(base):
+        for dp, dns, fs in os.walk(base):
+            for n in dns:
+                if is_dir_link(os.path.join(dp, n)):
+                    raise Stop(f'{os.path.join(dp, n)} is a directory link or junction: refused (RSM3-2)')
             for n in fs:
                 out.append(os.path.relpath(os.path.join(dp, n), root).replace(os.sep, '/'))
     return sorted(out)
@@ -339,10 +354,12 @@ def commit_paths(repo, rels, msg):
 
 
 def attempts_versions(inp):
-    """[(commit, text)] of every committed version of rsm/attempts.csv, oldest first (read through git, LF)."""
+    """[(commit, text)] of every committed version of rsm/attempts.csv in the history of HEAD, oldest first (read
+    through git, LF). RSM3-1: --full-history keeps the side branches of a merge that git's history simplification
+    would drop (a merge that takes one parent's attempts.csv); --topo-order puts every parent before its children."""
     path = rel(inp, 'attempts.csv')
     out = []
-    for c in git(inp.repo, 'log', '--format=%H', '--reverse', '--', path).split():
+    for c in git(inp.repo, 'log', '--full-history', '--topo-order', '--reverse', '--format=%H', '--', path).split():
         r = subprocess.run(['git', '-C', inp.repo, 'show', f'{c}:{path}'], capture_output=True)
         out.append((c, r.stdout.decode('utf-8').replace('\r\n', '\n') if r.returncode == 0 else None))
     return out
@@ -388,13 +405,17 @@ def check_script_blob(hil):
 # ── inputs and checks (section 3 of the design; 12.2 S46-5) ─────────────────────────
 
 def refuse_link(p, s03=None):
-    """RSM-13, RSM2-1: p (if it exists) is no link and resolves to itself, and not into <s03>/sealed_test/; checked
-    from the path entries, before p is opened."""
+    """RSM-13, RSM2-1, RSM3-2: p (if it exists) is no link or junction, resolves to itself, is no file with a second
+    hard link (a hard link has islink false and realpath unchanged), and not into <s03>/sealed_test/; checked from the
+    path entries, before p is opened."""
     if not os.path.exists(p) and not os.path.islink(p):
         return
     real = os.path.normcase(os.path.realpath(p))
-    if os.path.islink(p) or real != os.path.normcase(os.path.abspath(p)):
+    if is_dir_link(p) or real != os.path.normcase(os.path.abspath(p)):
         raise Stop(f'{p} is a link or resolves to {real}: refused (RSM-13)')
+    st = os.lstat(p)
+    if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
+        raise Stop(f'{p} has {st.st_nlink} hard links: refused (RSM3-2)')
     if s03 is not None:
         st = os.path.normcase(os.path.realpath(os.path.join(s03, 'sealed_test')))
         if real == st or real.startswith(st + os.sep):
@@ -774,11 +795,11 @@ def attempts_state(inp):
 
 
 def require_attempts(inp, allow_appended=False):
-    prev = ''
-    for c, text in attempts_versions(inp):                 # RSM2-2: every committed version extends the one before
-        if text is None or not text.startswith(prev):
-            raise Stop(f'rsm/attempts.csv history: commit {c[:10]} altered or removed earlier rows (12.7: append only)')
-        prev = text
+    head = (head_text(inp.repo, rel(inp, 'attempts.csv')) or '').replace('\r\n', '\n')
+    for c, text in attempts_versions(inp):     # RSM2-2, RSM3-1: every committed version is a prefix of HEAD's
+        if text is None or not head.startswith(text):
+            raise Stop(f'rsm/attempts.csv history: the version of commit {c[:10]} is not a prefix of the HEAD version '
+                       f'(rows altered or removed, or dropped by a merge; 12.7: append only)')
     st = attempts_state(inp)
     if st == 'changed':
         raise Stop('rsm/attempts.csv: a committed row was altered or removed (12.7: append only)')
@@ -1443,56 +1464,48 @@ def run_phase(phase, s04_dir, dll, abort_reason=None, log=print):
     inp = Inputs(s04_dir, dll)
     os.makedirs(inp.out, exist_ok=True)
     refuse_link(inp.out)
-    lock_file = os.path.join(inp.out, RUN_LOCK)
-    refuse_link(lock_file)
-    if os.path.exists(lock_file) and abort_reason:          # RSM2-6: a lock left by a run that died
-        clear_stale_lock(lock_file)
-    try:                                                    # RSM-14: one run at a time on this folder
-        fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        raise Stop(f'rsm/{RUN_LOCK} exists: another rsm_compare run is on this folder (a run that died: run again '
-                   f'with --abort-previous "<reason>")') from None
+    fd = acquire_run_lock(os.path.join(inp.out, RUN_LOCK))   # RSM-14, RSM3-3: one run at a time on this folder
     try:
-        try:
-            os.write(fd, f'{os.getpid()} {time.strftime("%Y-%m-%d %H:%M:%S")}\n'.encode())
-        finally:
-            os.close(fd)
         return _run_phase(inp, phase, abort_reason, log)
     finally:
-        os.remove(lock_file)
+        release_run_lock(fd)
 
 
-def pid_alive(pid):
-    """Is process <pid> running? Windows: OpenProcess + GetExitCodeProcess (no signal is sent); POSIX: kill 0."""
-    if os.name == 'nt':
-        import ctypes
-        k = ctypes.windll.kernel32
-        h = k.OpenProcess(0x1000, False, pid)              # PROCESS_QUERY_LIMITED_INFORMATION
-        if not h:
-            return k.GetLastError() == 5                       # access denied: it exists
+def acquire_run_lock(lock_file):
+    """RSM3-3..5: an operating-system lock on rsm/.run_lock (msvcrt.locking of byte 0 on Windows, fcntl.flock on
+    POSIX), not blocking; the system frees it when the process ends, however it ends (no stale lock, no process id).
+    The file is opened without truncating and never read, written or removed: removing it would let a second run
+    lock a new file while the first still holds the old one. Refused when it is a link or has a second hard link
+    (RSM3-2), checked on the path before the open and on the open handle after it."""
+    refuse_link(lock_file)
+    fd = os.open(lock_file, os.O_RDWR | os.O_CREAT | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NOFOLLOW', 0))
+    try:
+        if os.fstat(fd).st_nlink > 1:
+            raise Stop(f'rsm/{RUN_LOCK} has {os.fstat(fd).st_nlink} hard links: refused (RSM3-2)')
         try:
-            code = ctypes.c_ulong()
-            return bool(k.GetExitCodeProcess(h, ctypes.byref(code))) and code.value == 259   # STILL_ACTIVE
-        finally:
-            k.CloseHandle(h)
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+            if os.name == 'nt':
+                import msvcrt
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise Stop(f'rsm/{RUN_LOCK} is locked: another rsm_compare run is on this folder (12.7: one run at a '
+                       f'time)') from None
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
-def clear_stale_lock(lock_file):
-    """--abort-previous: remove the lock when the process it names is not running; else stop."""
+def release_run_lock(fd):
     try:
-        pid = int(open(lock_file, encoding='utf-8').read().split()[0])
-    except (OSError, ValueError, IndexError):
-        raise Stop(f'rsm/{RUN_LOCK} cannot be read: check no rsm_compare runs, then delete it by hand') from None
-    if pid_alive(pid):
-        raise Stop(f'rsm/{RUN_LOCK}: process {pid} is still running')
-    os.remove(lock_file)
+        if os.name == 'nt':
+            import msvcrt
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    finally:
+        os.close(fd)                                        # POSIX: closing the descriptor frees the flock
 
 
 def _run_phase(inp, phase, abort_reason, log):
