@@ -166,6 +166,11 @@ def test_calibration_from_floor_marks(session):
     assert max(s['check_tags_err_mm'].values()) < 3.0
     assert abs(s['kappa'] - TAG_H / ZC) < 1e-9
     assert s['tag_offset_src'].startswith('chua do')
+    # mean corners kept for c7_calib_drift (CD1-3): 4 corners per fitted mark, centre = their mean
+    assert set(s['ref_corners_px']) == {str(i) for i in s['fit_ids']}
+    for i, c in s['ref_corners_px'].items():
+        assert np.shape(c) == (4, 2)
+        assert np.allclose(np.mean(c, axis=0), s['ref_centres_px'][i])
 
 
 def test_track_recovers_wheel_centre_with_parallax_and_offset(session, run_clip):

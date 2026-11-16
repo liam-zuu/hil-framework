@@ -398,6 +398,7 @@ def calibrate(video, marks, zc, plumb, tag_h, car_side, stride=1, max_frames=Non
         kind='c7_session', video=os.path.basename(video), video_sha256=sha256(video), frames=n, stride=stride,
         width=w_px, height=h_px, camera=cam_to_dict(cam), rms_px_H=rms, model_fits=fits, cross_validation_mm=cv,
         chosen=chosen, fit_ids=ids, ref_centres_px={str(i): mean[i].mean(axis=0).tolist() for i in ids},
+        ref_corners_px={str(i): mean[i].tolist() for i in ids},   # (4, 2) mean refined corners (c7_calib_drift CD1-3)
         per_mark=per_mark, check_tags_err_mm=check, zc_tape_m=zc, zc_fit_m=float(abs(cam.centre[2])),
         plumb_xy_m=list(plumb), tag_h_m=tag_h, car_side_m=car_side, kappa=tag_h / zc_used,
         kappa_src='thuoc: h / Z_c (design 3.4 cach 1)' if zc is not None else 'h / Z_c cua phep khop (KHONG dung cho so chinh)',
