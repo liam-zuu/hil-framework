@@ -633,7 +633,7 @@ def map_run(frame_log, esp_log, test_id):
         u0 = (s0 - a) / b
         return u0, u0 + T_us
     cert = certify(te_us, counts, h7['apply_us'][applied], h7['width_us'][applied], om32, window)
-    for k in ('reason', 'a', 'b', 'spread_us', 'offsets', 'n_rows', 'n_iter', 'window_u'):
+    for k in ('reason', 'a', 'b', 'spread_us', 'offsets', 'n_rows', 'n_lines', 'n_iter', 'window_u'):
         if k in cert:
             res[k] = cert[k]
     res['h7_window_us'] = h7['window_us']
