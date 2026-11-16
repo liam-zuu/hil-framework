@@ -274,6 +274,29 @@ def test_scale_gate_needs_neighbours():
     assert all(r['valid'] for r in rows)
 
 
+def test_scale_window_is_time_not_frames():
+    """O1 v11.30 3.3 (2): neighbours within +-0.25 s. A frame alone after a 1 s hole of frames failing (2a) has 15
+    passing frames before it by index but none within 0.25 s: it fails (an index window would pass it)."""
+    rows = _gate_rows(n=120)
+    for k in range(19, 90):
+        rows[k]['res_sim_m'] = 0.01
+    rows[90]['res_sim_m'] = 0.0003
+    for k in range(91, 120):
+        rows[k]['res_sim_m'] = 0.01
+    cm.apply_gates(rows, rms_h=0.3)
+    assert rows[90]['why'] == ['ti_le_it_lan_can'] and rows[10]['valid']
+
+
+def test_scale_window_at_120_fps():
+    """120 fps: +-0.25 s holds +-30 frames; a 1 % jump is still caught, a slow drift is not."""
+    rows = [dict(r, t_s=k / 120) for k, r in enumerate(_gate_rows(n=240, scale=lambda k: 0.976 - 0.008 * k / 120))]
+    rows[100]['scale'] *= 1.01
+    cm.apply_gates(rows, rms_h=0.3)
+    assert {k for k, r in enumerate(rows) if not r['valid']} == {100}
+    nb = sum(1 for r in rows if abs(r['t_s'] - rows[50]['t_s']) <= 0.25 + 1e-9) - 1
+    assert nb == 60
+
+
 def test_scale_gate_ignores_frames_failing_shape_or_floor():
     rows = _gate_rows()
     for k in range(20, 40):

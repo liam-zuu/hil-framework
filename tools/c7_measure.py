@@ -32,8 +32,8 @@ Chain (design 0, 3.1-3.10):
   gates     frame VALID (O1 3.3 (1), (2)) only if (1) at least 8 floor marks and rms_px <= rms of
             clip H + 0.5 px; (2a) residual of the car tag fit to a square WITH SCALE (the uniform
             shrink removed) <= 1.5 mm; (2b) apparent scale within 0.5 % of the median scale of the
-            NEIGHBOUR frames (+-15 frames that passed (1) and (2a), the frame itself excluded; fewer
-            than 8 neighbours: the frame fails). Invalid frames are lost frames (no interpolation,
+            NEIGHBOUR frames (frames that passed (1) and (2a) within +-0.25 s, the frame itself excluded;
+            fewer than 8 neighbours: the frame fails; O1 v11.30 3.3 (2)). Invalid frames are lost frames (no interpolation,
             design 3.7, 3.8). Design 2026-11-16_Thiet_ke_viec_b_bo_cham_camera_v1.md; Liam 16/11 CODE_CAM
             local_a806ae7e: Q1 "Bo co deu roi kiem (Recommended)", Q2 "Trung vi truot +-0,25 s
             (Recommended)" (trial 16/11: the edge fit sits about 1.2 px inside the tag on the real
@@ -88,7 +88,8 @@ GATE_MIN_MARKS = 8
 GATE_RMS_EXTRA_PX = 0.5
 GATE_CAR_RES_M = 0.0015     # (2a) residual of the fit WITH scale
 GATE_SCALE_REL = 0.005       # (2b) against the median of the neighbours
-SCALE_HALF = 15              # (2b) neighbours each side among the frames that passed (1), (2a) (+-0.25 s at 60 fps)
+SCALE_WIN_S = 0.25           # (2b) neighbours: frames that passed (1), (2a) within +-0.25 s (O1 v11.30: by time, the
+                             #      clip may be 60 or 120 fps; +-15 frames at 60 fps)
 SCALE_MIN = 8                # (2b) fewer neighbours: the frame fails
 
 
@@ -317,8 +318,9 @@ def sg_derivative(t, x, half=SG_HALF):
 def apply_gates(rows, rms_h):
     """Sets valid / why on every frame row in place (O1 3.3 (1), (2); module docstring) and the speeds on the
     valid frames. Order: floor gate (1), shape (2a) on the residual WITH scale, then scale (2b) against the median
-    of the +-SCALE_HALF neighbours among the frames that passed (1) and (2a) (scale_ref, NaN when fewer than
-    SCALE_MIN). Returns the median scale of the frames that passed (1), (2a) (reported only)."""
+    of the neighbours within +-SCALE_WIN_S (frame times, the frame excluded) among the frames that passed (1) and
+    (2a) (scale_ref, NaN when fewer than SCALE_MIN). Frame times must increase. Returns the median scale of the
+    frames that passed (1), (2a) (reported only)."""
     for r in rows:
         why = []
         if r['n_marks'] < GATE_MIN_MARKS:
@@ -335,8 +337,11 @@ def apply_gates(rows, rms_h):
             r[k] = float('nan')
     p12 = [k for k, r in enumerate(rows) if not r['why']]
     sc = np.array([rows[k]['scale'] for k in p12])
+    tp = np.array([rows[k]['t_s'] for k in p12])
     for j, k in enumerate(p12):
-        nb = np.r_[sc[max(0, j - SCALE_HALF):j], sc[j + 1:j + SCALE_HALF + 1]]
+        a = int(np.searchsorted(tp, tp[j] - SCALE_WIN_S - 1e-9, side='left'))
+        b = int(np.searchsorted(tp, tp[j] + SCALE_WIN_S + 1e-9, side='right'))
+        nb = np.r_[sc[a:j], sc[j + 1:b]]
         if len(nb) < SCALE_MIN:
             rows[k]['why'].append('ti_le_it_lan_can')
             continue
@@ -431,7 +436,7 @@ def calibrate(video, marks, zc, plumb, tag_h, car_side, stride=1, max_frames=Non
 
 def gates_dict():
     return dict(min_marks=GATE_MIN_MARKS, rms_extra_px=GATE_RMS_EXTRA_PX, car_res_sim_m=GATE_CAR_RES_M,
-                scale_rel=GATE_SCALE_REL, scale_half=SCALE_HALF, scale_min=SCALE_MIN,
+                scale_rel=GATE_SCALE_REL, scale_win_s=SCALE_WIN_S, scale_min=SCALE_MIN,
                 rule='(2a) residual with scale, (2b) scale vs median of the neighbours (Liam 16/11 CODE_CAM)',
                 status='DE XUAT, khoa o C8')
 
