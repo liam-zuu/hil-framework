@@ -983,6 +983,49 @@ def test_kiem_catches_camera_error(tmp_path):
     assert r['n_over'] > 0 and not r['ok']
 
 
+def test_kiem_reports_chip_yaw_minus_gz_integral(tmp_path):
+    """Roll/pitch investigation 3.1 (Liam 16/11): kiem reports chip yaw - integral of gz over the run, raw (no
+    scale correction), for finding the cause when a check fails; not part of ok."""
+    fr, lg = _c8_pair(tmp_path)
+    u = _u_file(tmp_path, lg, tau=0.004)
+    r = U.kiem(fr, lg, 0.5, u, 'O1-F08', u_psi=math.radians(0.5))
+    g = r['yaw_tru_gz']               # step rate sampled at 20 Hz: the trapezoid itself is off by about 0.1 rad
+    assert math.isfinite(g['end_rad']) and g['n_points'] > 300 and g['het_cua_so'] is True
+    t2 = tmp_path / 'b'
+    t2.mkdir()
+    fr2, lg2 = _c8_pair(t2, s_plus=0.05, name='r2')
+    u2 = _u_file(t2, lg2, tau=0.004, s_plus=0.05)
+    r2 = U.kiem(fr2, lg2, 0.5, u2, 'O1-F08', u_psi=math.radians(0.5))
+    g2 = r2['yaw_tru_gz']
+    assert g2['end_rad'] - g['end_rad'] == pytest.approx(0.05 * math.radians(300), abs=0.01)   # raw: scale kept
+    assert g2['max_abs_rad'] >= abs(g2['end_rad'])
+    assert r2['ok'] == (r2['align_ok'] and r2['compared_ok'] and r2['n_over'] == 0 and r2['closure_ok'] is True)
+
+
+def test_kiem_gz_diagnostic_stops_at_bad_gz_and_short_log(tmp_path):
+    """KG-1: an empty gz cell stops the series at the finite prefix (JSON still written); KG-2: a log that ends
+    before the window end is not reported as covering it."""
+    fr, lg = _c8_pair(tmp_path)
+    u = _u_file(tmp_path, lg, tau=0.004)                     # U_IMU from the clean log (tong refuses NaN gz, CU-6)
+    rows = list(csv.DictReader(open(lg, encoding='utf-8')))
+    k = next(i for i, r in enumerate(rows) if float(r['timestamp_us']) > 20e6 and r['gyro_n'] != rows[i - 1]['gyro_n'])
+    rows[k]['gz'] = ''
+    with open(lg, 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    r = U.kiem(fr, lg, 0.5, u, 'O1-F08', u_psi=math.radians(0.5))
+    g = r['yaw_tru_gz']
+    assert math.isfinite(g['end_rad']) and g['het_cua_so'] is False and 100 < g['n_points'] < 250
+    json.dumps(r, allow_nan=False)
+    t2 = tmp_path / 'b'
+    t2.mkdir()
+    fr2, lg2 = _c8_pair(t2, t_tail=3.5)
+    u2 = _u_file(t2, lg2, tau=0.004)
+    g2 = U.kiem(fr2, lg2, 0.5, u2, 'O1-F08', u_psi=math.radians(0.5))['yaw_tru_gz']
+    assert g2['n_points'] > 300 and g2['het_cua_so'] is False
+
+
 def test_kiem_closure_catches_uncorrected_scale(tmp_path):
     fr, lg = _c8_pair(tmp_path, s_plus=0.02)
     u = _u_file(tmp_path, lg, tau=0.004, delta=0.001)
@@ -1024,3 +1067,101 @@ def test_real_floor_samples():
     S = U.rv_samples(U.load_log(FLOOR), period_s=T0, tau_hat=0.0, j_lim=0.005)
     assert S['n_samples'] > 150
     assert S['n_late'] <= 0.05 * S['n_samples']
+
+
+# ── thang on sparse logs (10 Hz with the motor off) and cut start (Liam 16/11 'Sua script + Codex') ─────────────
+
+def sparse_copy(src, dst, every=10, bad_age_after=None):
+    """Keep every `every`-th data row (100 Hz -> 10 Hz like firmware 5bde4c5 with the motor off); optionally give
+    the gyro age of one kept row a small negative value (-0.1 ms, seen on the floor 16/11)."""
+    rows = list(csv.DictReader(open(src, encoding='utf-8')))
+    keep = rows[::every]
+    if bad_age_after is not None:
+        k = next(i for i, r in enumerate(keep) if float(r['timestamp_us']) > bad_age_after * 1e6)
+        keep[k]['age_g_ms'] = '-0.1'
+    with open(dst, 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(keep)
+
+
+def test_thang_sparse_log(tmp_path):
+    p, q = str(tmp_path / 'a.csv'), str(tmp_path / 'a10.csv')
+    rate, t_end = turns(5, 2.0, 1)
+    make_log(p, rate, t_end, s_plus=0.004)
+    sparse_copy(p, q, bad_age_after=15.0)
+    with pytest.raises(U.InputError):
+        U.thang(q, 5, 'ccw')                                            # the default mode refuses
+    r = U.thang(q, 5, 'ccw', thua=True)
+    assert r['s'] == pytest.approx(0.004, abs=3e-4) and r['thua'] is True and r['n_bo_gyro'] >= 1
+    assert r['buoc_max_deg'] < 90 and r['khe_max_s'] < 0.2
+
+
+def test_thang_sparse_refuses_fast_turn(tmp_path):
+    p, q = str(tmp_path / 'a.csv'), str(tmp_path / 'a10.csv')
+    rate, t_end = turns(5, 20.0, 1)                                     # 20 rad/s x 0.1 s = 2 rad between rows
+    make_log(p, rate, t_end)
+    sparse_copy(p, q)
+    with pytest.raises(U.InputError, match='could hide'):
+        U.thang(q, 5, 'ccw', thua=True)
+
+
+def test_thang_cut_start(tmp_path):
+    p = str(tmp_path / 'a.csv')
+    rate0, t_end = turns(5, 2.0, 1, t_start=12.0)
+    rate = lambda t: 1.0 if 10.0 <= t < 10.6 else rate0(t)              # noqa: E731  car moved while placed
+    make_log(p, rate, t_end, s_plus=0.004)
+    with pytest.raises(U.InputError, match='still'):
+        U.thang(p, 5, 'ccw')
+    r = U.thang(p, 5, 'ccw', tu_s=1.0)
+    assert r['s'] == pytest.approx(0.004, abs=2e-4) and r['tu_s'] == 1.0
+
+
+def test_main_thang_sparse(tmp_path):
+    p, q = str(tmp_path / 'a.csv'), str(tmp_path / 'a10.csv')
+    rate, t_end = turns(5, 2.0, -1)
+    make_log(p, rate, t_end, s_minus=-0.003)
+    sparse_copy(p, q, bad_age_after=15.0)
+    out = str(tmp_path / 't.json')
+    base = ['thang', '--log', q, '--n-vong', '5', '--chieu', 'cw', '--cach', 'tay', '--toc-do', 'nhanh']
+    assert U.main(base + ['--out', out]) == 2
+    assert U.main(base + ['--log-thua', '--out', out]) == 0
+    d = json.load(open(out, encoding='utf-8'))
+    assert d['thua'] is True and d['s'] == pytest.approx(-0.003, abs=3e-4)
+
+
+def test_thang_sparse_refuses_long_gap(tmp_path):
+    """TT-1 (Codex counter-example): 6 true turns, slow (0.6 rad/s) but 2 pi + 1.2 rad inside a 2 s hole in the
+    log; logged |gz| peak 0.6 and the wrapped step 1.2 rad both look safe: must be refused, not s = 0 for 5."""
+    p, q = str(tmp_path / 'a.csv'), str(tmp_path / 'a10.csv')
+    fast = (2 * math.pi + 1.2) / 2.0
+    t1 = 13.5 + (6 * 2 * math.pi - 2 * math.pi - 1.2) / 0.6 + 2.0
+    rate = lambda t: (fast if 30.0 <= t < 32.0 else 0.6) if 13.5 <= t < t1 else 0.0      # noqa: E731
+    make_log(p, rate, t1 + 3.5)
+    sparse_copy(p, q)
+    rows = list(csv.DictReader(open(q, encoding='utf-8')))
+    keep = [r for r in rows if not 30.0 <= float(r['timestamp_us']) * 1e-6 < 32.05]
+    with open(q, 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(keep)
+    with pytest.raises(U.InputError, match='gap'):
+        U.thang(q, 5, 'ccw', thua=True)
+
+
+def test_thang_sparse_refuses_long_gyro_hole(tmp_path):
+    """TT-2: gyro reports dropped (bad age) for seconds: a turn would look like a still part: refused."""
+    p, q = str(tmp_path / 'a.csv'), str(tmp_path / 'a10.csv')
+    rate, t_end = turns(5, 2.0, 1)
+    make_log(p, rate, t_end)
+    sparse_copy(p, q)
+    rows = list(csv.DictReader(open(q, encoding='utf-8')))
+    for r in rows:
+        if 10.1 <= float(r['timestamp_us']) * 1e-6 < 15.0:
+            r['age_g_ms'] = '-0.1'
+    with open(q, 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    with pytest.raises(U.InputError, match='gap'):
+        U.thang(q, 5, 'ccw', thua=True)
