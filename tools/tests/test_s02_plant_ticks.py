@@ -744,6 +744,58 @@ def test_an_ending_edge_cancelled_by_a_stop_gives_no_rest_bound():
     assert np.all((lo_s - 1e-6 <= u) & (u <= hi_s + 1e-6)), float(np.max(np.maximum(lo_s - u, u - hi_s)))
 
 
+def test_a_wide_stop_window_lets_many_edges_through():
+    """S2M3-1 (Codex round 3 of v3): FR starts at hp 1000 us (raw 7799) with the forced-low step -2 against the
+    motion; two edges bring the count back to c0, the third falls after a stop; a restart at hp 250 us (raw 31194)
+    with another -2, then a stop whose window is 2 ms wide and whose true apply is at its end: some 23 true edges
+    where the model emits 7. The count after the second stop is far from what one pending edge per channel allows;
+    the rest bound must not be used, and the set must keep the true map. Truth: the edges simulated on the true
+    applies (start + 4 us, second stop + 2000 us), counts by hand."""
+    sc = np.float32(EM.HIL_OMEGA_MAX) / np.float32(32767.0)
+    n = 2600
+    S_k = 1600
+    lo = 1000.0 * np.arange(n)
+    j = np.arange(n - S_k)
+    ramp = 9.52 + np.clip((j - 50) / 300.0, 0, 1) * 12.0
+    raw = np.zeros((n, 4), dtype=np.int16)
+    for w, f in ((0, 1.0), (2, 0.94), (3, -1.02)):
+        raw[S_k:, w] = np.round(ramp * f / float(sc)).astype(np.int16)
+    raw[S_k:S_k + 2, 1] = 7799                                        # hp 1000 us
+    raw[S_k + 100, 1] = 31194                                         # hp 250 us; stop at S_k + 101
+    keep = np.ones(n, bool)
+    keep[[S_k + 102, S_k + 103]] = False                              # no frame inside the wide stop window
+    lo, raw = lo[keep], raw[keep]
+    om32 = raw.astype(np.float32) * sc
+    i_start, i_stop2 = S_k, S_k + 101
+    hp, _ = EM.h7_half_period(om32)
+    assert hp[i_start, 1] == 1000.0 and hp[i_stop2 - 1, 1] == 250.0
+    width = np.zeros(len(lo))
+    width[i_start], width[i_stop2] = 4.0, 2000.0
+    true_app = lo.copy()
+    true_app[i_start] += 4.0
+    true_app[i_stop2] += 2000.0
+    ed = pt.simulate_edges(true_app, np.zeros(len(lo)), om32)          # the true edges
+    S = lo[i_start]
+    u = S + 5000.0 + 10_000.0 * np.arange(-120, int((lo[-1] - S - 40_000.0) / 10_000.0))
+    read = u + np.random.default_rng(6).uniform(0, EM.J_READ_US, len(u))
+    c = np.zeros((len(u), 4))
+    for w in range(4):
+        e = ed[w]
+        sgn = np.array([e['segs'][x]['dir'] for x in e['seg']])
+        o = np.zeros(len(u))
+        if w == 1:
+            d = e['segs'][1]['dir']
+            assert e['segs'][1]['n_edges'] == 2 and e['segs'][3]['n_edges'] > 20
+            o = np.where(read >= S + 4.0, -2 * d, 0) + np.where(read >= lo[S_k + 100], -2 * d, 0)
+        c[:, w] = 1000 + o + np.array([np.sum(sgn[e['t'] <= r]) for r in read])
+    j1 = int(np.flatnonzero(c[:, 1] != 1000)[0])
+    assert read[j1 - 1] > S + 90_000 and c[j1, 1] - 1000 > 15             # last line at c0 late; then far from c0
+    res = pt.certify(u, c, lo, width, om32)
+    assert res.get('ext') is not None, res['reason']
+    lo_s, hi_s = np.array([res['ext'](x) for x in u]).T
+    assert np.all((lo_s - 1e-6 <= u) & (u <= hi_s + 1e-6)), float(np.max(np.maximum(lo_s - u, u - hi_s)))
+
+
 def _wheel_of(segs, broken_seg=None, n_edges_total=0, trusted_upto=None):
     """A stand-in for _Wheel with given segments (rest first): only what _rest_holds reads."""
     from types import SimpleNamespace

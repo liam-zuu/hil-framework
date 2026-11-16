@@ -38,7 +38,8 @@ decimals of the written values (12.4 -> 12.1 is not over), and the later block r
 of v3 (S2M1-6): every row of a block has the same platform, controller, condition and repetition, the rows of a
 block are together, each test belongs to its condition; with s02_plan.json each planned block keeps its key and a
 row for every planned test, and a later block (not planned) has the key of a planned block and only its tests;
-S2M2-3: planned blocks in the planned order, the first run of each test of a planned block in the planned order.
+S2M2-3: planned blocks in the planned order; S2M3-2: inside a planned block the tests in the planned order, a test
+run early allowed only as a replaced row (a wrong test run by mistake), re-runs of a passed test allowed.
 Prints the problems; exit 0 none, 1 some, 2 error.
 """
 import argparse
@@ -193,12 +194,26 @@ def _block_problems(rows, blocks, planned):
     want = [str(bl['block']).strip() for bl in planned if str(bl['block']).strip() in blocks]
     if seen != want:
         out.append(f'planned blocks run in the order {seen}, planned {want} (P2-2)')
+    # S2M3-2 (Codex round 3 of v3): walk the block with a pointer to the next planned test: that test's row (even
+    # one replaced later) moves the pointer; a test already passed is a re-run (replacement), allowed; a test not yet
+    # due is allowed only as a replaced row (a wrong test run by mistake, P2-5 group 3), else the order is wrong
     for b, rs in blocks.items():
-        if b in pb:
-            got = [t for t in dict.fromkeys(r['test_id'].strip() for r in rs) if t in pb[b]['tests']]
-            plan_t = [t for t in pb[b]['tests'] if t in got]
-            if got != plan_t:
-                out.append(f'block {b}: tests run in the order {got}, planned {plan_t} (P2-2)')
+        if b not in pb:
+            continue
+        plan_t = list(pb[b]['tests'])
+        i = 0
+        for r in rs:
+            t = r['test_id'].strip()
+            if t not in plan_t:
+                continue
+            k = plan_t.index(t)
+            if k == i:
+                i += 1
+                while i < len(plan_t) and plan_t[i] not in {x['test_id'].strip() for x in rs}:
+                    i += 1                                   # a planned test with no row is reported above
+            elif k > i and r['result'].strip() != 'replaced':
+                out.append(f"block {b}: {r['run_id']} ({t}) runs before {plan_t[i]} (planned order {plan_t}; P2-2)")
+                break
     return out
 
 

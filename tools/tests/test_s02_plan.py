@@ -273,7 +273,7 @@ def test_every_cell_has_five_reps_and_the_manifest_is_its_plan(tmp_path):
     js.write_text(json.dumps(dict(json.loads(js.read_text(encoding='utf-8')), blocks=pj)), encoding='utf-8')
     write(rr)
     p = sp.check(_filled(rows), pj, sp.REPS_MAIN)                    # every cell still once; only the order
-    assert len(p) == 1 and p[0].startswith('block 1: tests run in the order'), p   # (S2M2-3) differs
+    assert len(p) == 1 and p[0].startswith('block 1: ') and 'runs before' in p[0], p   # (S2M2-3) differs
     assert sp.main(['check', str(tmp_path)]) == 1                       # but not the plan of its order_seed
 
 
@@ -330,6 +330,21 @@ def test_blocks_are_whole_together_and_follow_the_plan():
     swapped = [dict(r) for r in full]                                    # S2M2-3: two tests of block 1 swapped
     i = [k for k, r in enumerate(swapped) if r['block'] == '1'][:2]
     swapped[i[0]], swapped[i[1]] = swapped[i[1]], swapped[i[0]]
-    assert any(x.startswith('block 1: tests run in the order') for x in sp.check(swapped, blocks, sp.REPS_MAIN))
+    assert any(x.startswith('block 1: ') and 'runs before' in x for x in sp.check(swapped, blocks, sp.REPS_MAIN))
+    # S2M3-2: a wrong test run first by mistake, replaced (group 3), then the planned order: allowed; the first test
+    # failed by an operator error and replaced at the end of the block: allowed
+    b1 = [k for k, r in enumerate(full) if r['block'] == '1']
+    t0, t1 = full[b1[0]]['test_id'], full[b1[1]]['test_id']
+    wrong = dict(full[b1[1]], result='replaced', cause_group='3', reason='wrong test run', run_id='mistake')
+    mis = [dict(r) for r in full]
+    mis.insert(b1[0], wrong)
+    assert sp.check(mis, blocks, sp.REPS_MAIN) == [], sp.check(mis, blocks, sp.REPS_MAIN)
+    late = [dict(r) for r in full]
+    late[b1[0]] = dict(late[b1[0]], result='replaced', cause_group='3', reason='operator error')
+    late.insert(b1[-1] + 1, dict(full[b1[0]], run_id='again'))
+    assert sp.check(late, blocks, sp.REPS_MAIN) == [], sp.check(late, blocks, sp.REPS_MAIN)
+    early_done = [dict(r) for r in full]                                 # run early and kept: wrong order
+    early_done.insert(b1[0], dict(full[b1[1]], run_id='early'))
+    assert any('early (' + t1 + ') runs before ' + t0 in x for x in sp.check(early_done, blocks, sp.REPS_MAIN))
     gone = [dict(r) for r in full if r['block'] != '3']
     assert any(x == 'block 3: planned (s02_plan.json), no row in runs.csv' for x in sp.check(gone, blocks, sp.REPS_MAIN))

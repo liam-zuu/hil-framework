@@ -161,9 +161,24 @@ def simulate_edges(apply_us, width_us, om32):
                         err[c2] = [err[c2][0] + lo_d, err[c2][1] + hi_d]
 
         def stop_boundary(T, W):
-            # emitted edges whose true time may be after the true stop, pending ones that may come before it
-            late = sum(1 for k in range(max(0, len(t_l) - 4), len(t_l)) if t_l[k] + hi_l[k] > T)
-            early = sum(1 for ch in (0, 1) if math.isfinite(nxt[ch]) and nxt[ch] + err[ch][0] <= T + W)
+            # emitted edges whose true time may be after the true stop (every edge of the segment with t + hi > T),
+            # and edges that may come before it: the true stop is anywhere in [T, T + W], so each channel may go on
+            # with its callbacks (+ hp each, - 1 us with float ambiguity) up to T + W; with a window wider than half a
+            # period that is many edges, not one per channel (S2M3-1, Codex round 3 of v3)
+            k0 = segs[-1]['first_edge']
+            late = sum(1 for k in range(k0, len(t_l)) if t_l[k] + hi_l[k] > T)
+            step = max(st['hp'] - (1.0 if st['amb'] else 0.0), 1.0)
+            early = 0
+            for ch in (0, 1):
+                if not math.isfinite(nxt[ch]):
+                    continue
+                first = nxt[ch] + err[ch][0]
+                lr = st['last']
+                if lr is not None and first <= lr['T'] + lr['W']:
+                    # a callback inside the last retime's window may still take the other half period
+                    first -= abs(lr['hp_old'] - lr['hp_new']) + lr['hp_new']
+                if first <= T + W:
+                    early += int(math.floor((T + W - first) / step)) + 1
             d = st['dir']
             o_lo, o_hi = (-late, early) if d > 0 else (-early, late)
             segs.append(dict(t0=T, w0=W, kind='stop', dir=0, o_lo=o_lo, o_hi=o_hi, n_before=st['ncount'],
