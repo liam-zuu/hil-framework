@@ -311,3 +311,18 @@ def test_blocks_are_whole_together_and_follow_the_plan():
     other = [dict(r) for r in full]
     other[0]['controller'] = 'LADRC'                                    # one row of block 1 with the other controller
     assert any(x.startswith('block 1: rows of 2') for x in sp.check(other, blocks, sp.REPS_MAIN))
+    p = sp.check(with_later({}), blocks, sp.REPS_MAIN)
+    assert any("block 21: tests ['A-K1'] not in the planned block 1" in x for x in p), p
+    into = [dict(r) for r in full]                                       # A-K1 moved into planned block 1
+    k = next(j for j, r in enumerate(into) if r['test_id'] == 'A-K1' and r['controller'] == 'PID' and r['rep'] == '1')
+    row = dict(into.pop(k), block='1', condition='floor')
+    into.insert(next(j for j, r in enumerate(into) if r['block'] == '1') + 1, row)
+    assert any("block 1: tests ['A-K1'] not planned in this block" in x for x in sp.check(into, blocks, sp.REPS_MAIN))
+    swap = [dict(r, controller='LADRC') if r['block'] == '1' else dict(r) for r in full]   # whole block relabelled
+    assert any(x.startswith("block 1: ('LADRC', 'floor', 1) in runs.csv, ('PID', 'floor', 1) in s02_plan.json")
+               for x in sp.check(swap, blocks, sp.REPS_MAIN))
+    later6 = [dict(r) for r in full] + [dict(full[0], block='21', rep='6', run_id='x6')]   # a later block, no plan
+    assert any(x.startswith("block 21: not in s02_plan.json and no planned block ('PID', 'floor', 6)")
+               for x in sp.check(later6, blocks, sp.REPS_MAIN))
+    gone = [dict(r) for r in full if r['block'] != '3']
+    assert any(x == 'block 3: planned (s02_plan.json), no row in runs.csv' for x in sp.check(gone, blocks, sp.REPS_MAIN))

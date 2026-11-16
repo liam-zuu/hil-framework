@@ -451,6 +451,15 @@ def _rest_bound(wheel, O):
     return max(float(wheel.t[i] + wheel.hi[i] + TOL_US), end)
 
 
+def _mix(l, x, y):
+    """(1 - l) x + l y for l in [0, 1], with an infinite end weighted 0 (l = 0 or 1) taken as 0, not NaN (0 x inf);
+    a lower end is never +inf nor an upper end -inf, so no inf - inf."""
+    l = np.asarray(l, dtype=float)
+    with np.errstate(invalid='ignore'):
+        v = (1 - l) * x + l * y
+    return np.where(l == 0, x, np.where(l == 1, y, v))
+
+
 def certify(te_us, counts, apply_us, width_us, om32, t_window=None):
     """The set of maps s = a + b u (H7 us of an ESP32 time u in us) that agree with every count (module docstring).
     te_us (m,), counts (m, 4) of the motor-on ESP32 lines (NaN: not used); apply_us, width_us, om32 of the applied
@@ -530,15 +539,8 @@ def certify(te_us, counts, apply_us, width_us, om32, t_window=None):
             return res
         # localise lines: their read interval inside one segment of the wheel
         l = ms.lam(te)
-
-        def mix(x, y):
-            # (1 - l) x + l y with an infinite end weighted 0 at l = 0 or 1 taken as 0, not NaN (0 x inf); a lower end
-            # is never +inf nor an upper end -inf, so no inf - inf
-            with np.errstate(invalid='ignore'):
-                v = (1 - l) * x + l * y
-            return np.where(l == 0, x, np.where(l == 1, y, v))
-        s_lo = np.minimum(mix(eA[0], eB[0]), mix(eA[1], eB[1]))
-        s_hi = np.maximum(mix(eA[0], eB[0]), mix(eA[1], eB[1]))
+        s_lo = np.minimum(_mix(l, eA[0], eB[0]), _mix(l, eA[1], eB[1]))
+        s_hi = np.maximum(_mix(l, eA[0], eB[0]), _mix(l, eA[1], eB[1]))
         # (1 - l) eA + l eB is the extent of s at u only between uA and uB: there l is in [0, 1]
         added = 0
         for w in range(4):

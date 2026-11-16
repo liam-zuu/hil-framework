@@ -162,3 +162,5 @@ def test_frac90_start_of_the_segment_held_by_the_line_before():
     assert q['frac90_seg2'] == pytest.approx(2.6 / 3.0)
     q = R.step_quantities(t[1:], v[1:], 'A-K1')
     assert math.isnan(q['frac90_seg2']) and q['no90_seg2'] == 0
+    q = R.step_quantities(np.r_[2.0, t], np.r_[0.3, v], 'A-K1')      # the last line before counts, not an earlier one
+    assert q['frac90_seg2'] == pytest.approx(2.6 / 3.0)

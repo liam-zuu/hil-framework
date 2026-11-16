@@ -462,6 +462,15 @@ def test_map_run_on_a_made_up_bench_run(monkeypatch, tmp_path, ppm):
     assert abs(res['sender_t0_us'] - u_true) <= 0.5 * res['sender_spread_us'] + 1.0
     assert u0 == pytest.approx(res['sender_t0_us'], abs=1e-3)
     assert u1 - u0 == pytest.approx(s02_cmd_path.GROUP_A['A-L2'].duration * 1e6)
+    # S2M1-4: the sender spread (map spread + send interval) is checked on its own: a bound between the two refuses
+    if ppm > 0:
+        lim = 0.5 * (max(res['spread_us']) + res['sender_spread_us'])
+        assert max(res['spread_us']) < lim < res['sender_spread_us']
+        monkeypatch.setattr(pt, 'SPREAD_MAX_US', lim)
+        r2, rows2 = pt.map_run(fl, esp, 'A-L2')
+        assert not r2['ok'] and r2['reason'].startswith('sender spread') and all(r[1] == '' for r in rows2)
+        monkeypatch.undo()
+        monkeypatch.setattr(s02_metrics, 'load_log', lambda p: {'_all': log})
     # plant rows: filled inside the answered frames; the wheel speed at the mapped step is the true one
     full = np.array([r[1] != '' for r in rows])
     assert full[inw].all()
@@ -608,6 +617,51 @@ def test_a_negative_forced_low_step_undone_by_the_first_edge():
     assert np.all((lo_s - 1e-6 <= u) & (u <= hi_s + 1e-6))
     want = [-int(np.sign(om[1500, w])) for w in range(4)]            # -1 in the direction of motion
     assert any(list(cb) == want for cb in res['offsets']), res['offsets']
+
+
+@needs_gcc
+def test_later_segments_after_an_untrusted_edge_bind_nothing():
+    """S2M1-2: wheel 0 runs the Codex case (raw 5199 / 7799 on alternate frames, hp-1500 frames applied at the window
+    end): encoder_gen.c counts more edges than the model, the edges past the first ones are untrusted; then a stop
+    and a clean restart, whose edges are trusted again but whose count carries the lost edges. Wheels 1-3 ramp up
+    (their offsets are pinned). The later segment must bind nothing: the set keeps the true map (using it would
+    find no offset that fits)."""
+    sc = np.float32(EM.HIL_OMEGA_MAX) / np.float32(32767.0)
+    n = 3400
+    lo = 1000.0 * np.arange(n)
+    k = np.arange(n)
+    om = np.zeros((n, 4))
+    j = np.arange(n - 1500)
+    om[1500:] = (9.52 + np.clip((j - 50) / 300.0, 0, 1) * 12.0)[:, None] * np.array([1.0, -1.07, 0.94, -1.02])
+    raw = np.round(om / float(sc)).astype(np.int16)
+    alt = (k >= 1500) & (k < 2500)
+    raw[alt, 0] = np.where(k[alt] % 2 == 0, 5199, 7799)
+    raw[(k >= 2500) & (k < 2800), 0] = 0
+    raw[k >= 2800, 0] = -raw[1500:1500 + (n - 2800), 1]
+    om32 = raw.astype(np.float32) * sc
+    hp, _ = EM.h7_half_period(om32)
+    counts = O.run((lo + np.where(alt & (hp[:, 0] == 1500), 4.0, 0.0)).astype(np.int64), om32.astype(np.float64), 1)
+    wh = pt._Wheel(pt.simulate_edges(lo, np.full(n, 4.0), om32)[0])
+    assert wh.broken_seg == 1 and len(wh.segs) == 4 and wh.segs[3]['kind'] == 'start'
+    assert counts.at([2_600_000])[0, 0] - counts.at([1_400_000])[0, 0] > wh.segs[2]['n_before'] + 100
+    u = 30_000.0 + 10_000.0 * np.arange(335)
+    rng = np.random.default_rng(5)
+    c = counts.at(np.round(u + rng.uniform(0, EM.J_READ_US, len(u))).astype(np.int64)).astype(float)
+    res = pt.certify(u, c, lo, np.full(n, 4.0), om32)
+    assert res.get('ext') is not None, res['reason']
+    lo_s, hi_s = np.array([res['ext'](x) for x in u]).T
+    assert np.all((lo_s - 1e-6 <= u) & (u <= hi_s + 1e-6))
+
+
+def test_mix_has_no_nan_at_the_ends():
+    """The line localisation mixes the set's extents at uA, uB; an unbounded end at l = 0 or 1 is not NaN."""
+    import warnings
+    l = np.array([0.0, 0.5, 1.0])
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', RuntimeWarning)
+        assert list(pt._mix(l, -math.inf, 5.0)) == [-math.inf, -math.inf, 5.0]
+        assert list(pt._mix(l, 3.0, math.inf)) == [3.0, math.inf, math.inf]
+        assert list(pt._mix(l, 2.0, 4.0)) == [2.0, 3.0, 4.0]
 
 
 def test_rest_bound_per_start_offset():
