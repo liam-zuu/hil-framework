@@ -42,14 +42,17 @@ bo phat (Recommended)", "Duyet, code sau gop (Recommended)"); spec S02 v1.13 P2-
   Family R (SIM, HIL: <run>_plant.csv on the same timestamp_us; empty cells, a missing file or a map that is not
     ok -> NaN with r_reason): floor tests e_vx_true, e_vy_true, e_wz_true, e_p_rms/max, e_psi_rms/max (poses in
     the test frame, each pose taken relative to its own value at t = 0), e_est_p_rms/max, e_est_psi_rms/max
-    (firmware pose vs plant; NaN when pos_reset_n rises in [0, T_cmd] or edge_after_t0); A-K: rms_w_err_true and
+    (firmware pose vs plant; NaN when pos_reset_n rises from the last line before t = 0 to T_cmd, when there is no
+    line before t = 0 (pos_reset_unchecked), or edge_after_t0); A-K: rms_w_err_true and
     the step quantities on fk(true wheel speeds) (<q>_true_segN). The car's family R needs the video tool
     (spec Viec CODE 5): r_reason real_needs_video.
   Loss (P2-5): missing_pct over the motor-on tick stream (1 - distinct ticks / tick span), gen_pause_n (lines one
     tick apart but > 2 ticks apart on the DUT clock), missing_over (> 1 %); missing_seq_pct the older log_seq
     number. Runs not completed (runs.csv aborted != 0, result aborted, broken or replaced, block_status
     battery_rerun): one metrics.csv line with status and status_reason, no metric, the log is not read.
-    Completed runs have status ok. Next to metrics.csv: metrics_columns.json (unit, family, source per column).
+    A completed run with missing_over = 1 or run_bad = 1 is broken too (S2M1-1): status broken, no metric, its loss
+    and reset columns kept. Other completed runs have status ok. The printed cell line is ok / 5 (P2-4) with
+    broken, aborted, and the history rows (replaced, battery_rerun) apart. Next to metrics.csv: metrics_columns.json (unit, family, source per column).
   age_pre_a_ms, age_pre_b_ms: largest traj_age_ms in the 100 ms before each kept anchor line (design 25, THESIS
     15/11 hint); flags age_pre_a_over / age_pre_b_over past AGE_PRE_MAX_MS [ĐỀ XUẤT 40 ms]: a lost first
     non-zero packet (anchor a) or lost first tail zeros (anchor b) make the DUT hold the older packet longer.
@@ -447,6 +450,10 @@ AGE_PRE_MAX_MS = 40.0                 # [ĐỀ XUẤT]
 WZ_SRC_ENC = 0                        # AGV imu_fusion.h WZ_SRC_ENC
 PLATFORMS_R = ('sim', 'hil')          # family R from <run>_plant.csv (the car: video tool, Viec CODE 5)
 STATUS_FIELDS = ('status', 'status_reason')
+# columns a broken run keeps (S2M1-1): loss and mid-run resets, no metric
+BROKEN_KEEP = ('missing_pct', 'gen_pause_n', 'missing_over', 'missing_seq_pct', 'missing_tail_known',
+               'pos_reset_mid', 'run_bad', 'run_bad_reason')
+N_REP = 5                             # spec S02 P2-4: 5 runs per cell, fixed before the runs
 ID_FIELDS = ('run_id', 'platform', 'controller', 'test_id', 'speed_mps', 'rep')
 NAN = float('nan')
 
@@ -611,12 +618,17 @@ def _family_r(log, test_id, t, win, plant, prep_flags):
         why = 'edge_after_t0'
     prn = log.get('pos_reset_n')
     if not why and prn is not None and np.any(np.isfinite(prn)):
-        j0 = max(int(np.searchsorted(t, 0.0, 'right')) - 1, 0)
-        span = (np.arange(len(t)) >= j0) & (t <= T + WINDOW_EPS_S)
-        p = prn[span]
-        p = p[np.isfinite(p)]
-        if p.size and np.max(p) > p[0]:
-            why = 'pos_reset_in_window'
+        # S2M1-8 (Codex round 1 of v3): the baseline is the last line before t = 0 (t < 0), so a reset on the line
+        # at t = 0 itself counts; no line before t = 0: a reset at t = 0 cannot be seen, e_est undefined
+        j0 = int(np.searchsorted(t, 0.0, 'left')) - 1
+        if j0 < 0:
+            why = 'pos_reset_unchecked'
+        else:
+            span = (np.arange(len(t)) >= j0) & (t <= T + WINDOW_EPS_S)
+            p = prn[span]
+            p = p[np.isfinite(p)]
+            if p.size and np.max(p) > p[0]:
+                why = 'pos_reset_in_window'
     fw = None
     if not why:
         if not all(c in log for c in ('pos_x', 'pos_y', 'pos_th')):
@@ -852,6 +864,17 @@ def run_dir_metrics(d, out_name='metrics.csv'):
         plant, preason, sender, sreason = _plant_inputs(d, r, path, platform)
         m = score_run(log, r['test_id'], platform, prep_s, s02_cmd_path.us_cut_ticks(path + '.events.txt'),
                       plant, preason, sender, sreason)
+        # S2M1-1 (Codex round 1 of v3): a completed run with loss over 1 % (P2-5) or a pose reset mid-run (run_bad,
+        # L37) is a broken run: status broken, no metric; its loss and reset columns stay (P2-5 reports them)
+        broken = []
+        if m.get('missing_over') == 1:
+            broken.append(f"missing_over ({m['missing_pct']:.3g} % > {MISSING_MAX_PCT:g} %, P2-5)")
+        if m.get('run_bad') == 1:
+            broken.append(m.get('run_bad_reason') or 'run_bad')
+        if broken:
+            out.append(dict(ids, status='broken', status_reason='; '.join(broken),
+                            **{k: m[k] for k in BROKEN_KEEP if k in m}))
+            continue
         out.append(dict(ids, status='ok', status_reason='', **m))
     keys = list(ID_FIELDS) + list(STATUS_FIELDS)
     for o in out:
@@ -882,6 +905,22 @@ def cell_counts(out):
     return cells
 
 
+HISTORY = ('replaced', 'battery_rerun')     # kept in the history, outside the 5 runs of the cell (P2-4, P2-5)
+
+
+def cell_line(key, c):
+    """Printed line of one cell (S2M1-9, Codex round 1 of v3): completed runs over the fixed N_REP (P2-4, P2-5:
+    'n_hoan_tat / 5'), the broken and aborted runs, then the history rows (replaced, battery_rerun) apart."""
+    tid, plat, ctrl = key
+    in_cell = [k for k in sorted(c) if k not in HISTORY and k != 'ok']
+    hist = [k for k in HISTORY if c.get(k)]
+    s = f'  {tid} {plat} {ctrl}: ok {c.get("ok", 0)} / {N_REP}'
+    s += ''.join(f', {k} {c[k]}' for k in in_cell)
+    if hist:
+        s += '; history: ' + ', '.join(f'{k} {c[k]}' for k in hist)
+    return s
+
+
 if __name__ == '__main__':
     if len(sys.argv) not in (2, 3):
         sys.exit(__doc__)
@@ -891,9 +930,8 @@ if __name__ == '__main__':
             sys.exit(f'{nm} already exists in {sys.argv[1]}: choose a new name (outputs are not overwritten).')
     res = run_dir_metrics(sys.argv[1], name)
     print(f'{len(res)} runs -> {os.path.join(sys.argv[1], name)}')
-    for (tid, plat, ctrl), c in sorted(cell_counts(res).items()):
-        print(f'  {tid} {plat} {ctrl}: ok {c.get("ok", 0)} / {sum(c.values())}'
-              + ''.join(f', {k} {v}' for k, v in sorted(c.items()) if k != 'ok'))
+    for key, c in sorted(cell_counts(res).items()):
+        print(cell_line(key, c))
     bad = [r['run_id'] for r in res if r.get('run_bad') == 1]
     if bad:
         print(f'BROKEN RUNS (run_bad = 1, pose reset mid-run, L37): run them again: {", ".join(bad)}')

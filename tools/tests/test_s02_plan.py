@@ -274,3 +274,40 @@ def test_every_cell_has_five_reps_and_the_manifest_is_its_plan(tmp_path):
     write(rr)
     assert sp.check(_filled(rows), pj, sp.REPS_MAIN) == []             # every cell still once
     assert sp.main(['check', str(tmp_path)]) == 1                       # but not the plan of its order_seed
+
+
+def test_blocks_are_whole_together_and_follow_the_plan():
+    """S2M1-6 (Codex round 1 of v3, S2P3-4): a test moved out of its planned block into a later block (the cell still
+    has one live run and reps 1..5), a block mixing conditions, a test of another condition, a block split in two
+    places of runs.csv: each is a problem; a replacement run in a later block of the same key is not."""
+    rows, blocks = sp.plan('real', ['PID', 'LADRC'], 5, 7)
+    full = _filled(rows)
+    for b in {r['block'] for r in full}:
+        rs = [r for r in full if r['block'] == b]
+        rs[0]['v_batt_start'], rs[-1]['v_batt_end'] = '12.4', '12.3'
+
+    def with_later(moved):
+        out = [dict(r) for r in full]
+        i = next(j for j, r in enumerate(out) if r['block'] == '1')
+        out[i]['result'], out[i]['cause_group'], out[i]['reason'] = 'replaced', '3', 'operator'
+        later = [dict(out[i], block='21', result='completed', cause_group='', reason='', run_id='again')]
+        if moved is not None:
+            k = next(j for j, r in enumerate(out) if r['test_id'] == 'A-K1' and r['controller'] == 'PID'
+                     and r['rep'] == '1')
+            later.append(dict(out.pop(k), block='21', **moved))
+        later[0]['v_batt_start'], later[-1]['v_batt_end'] = '12.4', '12.3'
+        return out + later
+    assert sp.check(with_later(None), blocks, sp.REPS_MAIN) == []
+    p = sp.check(with_later({}), blocks, sp.REPS_MAIN)                  # A-K1 moved, its row still 'lifted'
+    assert any(x.startswith('block 21: rows of 2') for x in p), p
+    assert any("planned tests ['A-K1'] have no row" in x for x in p), p
+    p = sp.check(with_later(dict(condition='floor')), blocks, sp.REPS_MAIN)   # its condition edited to floor
+    assert any("test 'A-K1' is not a 'floor' test" in x for x in p), p
+    assert any("planned tests ['A-K1'] have no row" in x for x in p), p
+    split = [dict(r) for r in full]
+    k = max(j for j, r in enumerate(split) if r['block'] == '2')
+    split.append(split.pop(k))
+    assert any(x.startswith('block 2: its rows are not together') for x in sp.check(split, blocks, sp.REPS_MAIN))
+    other = [dict(r) for r in full]
+    other[0]['controller'] = 'LADRC'                                    # one row of block 1 with the other controller
+    assert any(x.startswith('block 1: rows of 2') for x in sp.check(other, blocks, sp.REPS_MAIN))

@@ -139,3 +139,29 @@ def test_label_needs_the_whole_ci_inside_plus_minus_qrms(tmp_path):
                          write(str(tmp_path / 'h'), runs('hil', 'PID', b, metric='e_vx'))])
     x = line(C.compare(rows, info), 'e_vx', 'sim', 'hil')
     assert x['ci_low'] < q < x['ci_high'] and x['label'] == ''
+
+
+def test_inputs_given_twice_or_one_run_in_two_files_are_refused(tmp_path):
+    """S2M1-7 (Codex round 1 of v3): the same metrics.csv twice (folder and file), or one (platform, run_id) in two
+    files, would count runs twice."""
+    s = write(str(tmp_path / 's'), runs('sim', 'PID', [0.01, 0.02, 0.03]))
+    h = write(str(tmp_path / 'h'), runs('hil', 'PID', [0.02, 0.03, 0.04]))
+    with pytest.raises(ValueError, match='given twice'):
+        C.load([s, h, os.path.join(h, 'metrics.csv')])
+    h2 = write(str(tmp_path / 'h2'), runs('hil', 'PID', [0.05, 0.06, 0.07]))       # run_id hil0..2 again
+    with pytest.raises(ValueError, match=r"run 'hil0' \(hil\) is also in"):
+        C.load([s, h, h2])
+    assert C.main(['--out', str(tmp_path / 'o'), s, h, h]) == 2
+    rows, _ = C.load([s, h])                                                      # sim0 and hil0: two platforms
+    assert len(rows) == 6
+
+
+def test_one_sample_only_when_side_a_is_sim(tmp_path):
+    """S2M1-11 (Codex round 1 of v3): a constant HIL side a (HIL -> REAL) is Welch, with the same interval."""
+    a, b = [0.010] * 5, [0.020, 0.018, 0.025, 0.022, 0.019]
+    rows, info = C.load([write(str(tmp_path / 'h'), runs('hil', 'PID', a)),
+                         write(str(tmp_path / 'r'), runs('real', 'PID', b))])
+    x = line(C.compare(rows, info), 'e_p_rms', 'hil', 'real')
+    ci = sst.ttest_1samp(b, 0.010).confidence_interval(0.95)
+    assert x['method'] == 'welch' and x['df'] == pytest.approx(4)
+    assert (x['ci_low'], x['ci_high']) == pytest.approx((ci.low - 0.010, ci.high - 0.010), rel=1e-9)

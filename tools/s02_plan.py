@@ -34,8 +34,11 @@ history and are not counted (tools/s02_metrics.py skips them, and replaced rows)
 numbers need s02_plan.json and repetitions exactly 1..5 (S2P1-8; another N only with plan --trial, checked
 with check --trial); battery_rerun only on a REAL block whose own rest voltages sagged > 0.3 V, compared as
 decimals of the written values (12.4 -> 12.1 is not over), and the later block runs every test of it again
-(S2P2-3, S2P2-4); a completed run has missing_pct 0..100 and gen_pause_n >= 0 filled in (S2P1-14). Prints the
-problems; exit 0 none, 1 some, 2 error.
+(S2P2-3, S2P2-4); a completed run has missing_pct 0..100 and gen_pause_n >= 0 filled in (S2P1-14). Codex round 1
+of v3 (S2M1-6): every row of a block has the same platform, controller, condition and repetition, the rows of a
+block are together, each test belongs to its condition; with s02_plan.json each planned block keeps its key and a
+row for every planned test, and a later block (not planned) has the key of a planned block and only its tests.
+Prints the problems; exit 0 none, 1 some, 2 error.
 """
 import argparse
 import csv
@@ -133,6 +136,58 @@ def _volts(rs):
     return v0, v1
 
 
+def _block_problems(rows, blocks, planned):
+    """S2M1-6 (Codex round 1 of v3; S2P3-4): a block is one platform x one controller x one condition x one
+    repetition on every row, not only the first (P2-5 "Khoi"); its rows are together in runs.csv; each test belongs
+    to the row's condition; with s02_plan.json, a planned block keeps its controller, condition, repetition and a row
+    for every planned test of it (a test moved to another block is refused), and a block not in the plan (a later
+    block: battery re-run, replacement runs) has the key of a planned block and only its tests."""
+    out = []
+    cond_tests = {'floor': set(FLOOR) | set(STRAFE), 'lifted': set(LIFTED_TESTS)}
+    idx = {}
+    for i, r in enumerate(rows):
+        idx.setdefault(r['block'].strip(), []).append(i)
+    key = {}
+    for b, rs in blocks.items():
+        ix = idx[b]
+        if ix != list(range(ix[0], ix[-1] + 1)):
+            out.append(f'block {b}: its rows are not together in runs.csv (lines {[i + 2 for i in ix]}; P2-5)')
+        ks = {(r['platform'].strip().lower(), r['controller'].strip(), r['condition'].strip(), r['_rep']) for r in rs}
+        if len(ks) > 1:
+            out.append(f'block {b}: rows of {len(ks)} (platform, controller, condition, rep) {sorted(ks, key=str)}: '
+                       'one block is one controller x one condition x one repetition (P2-5)')
+        key[b] = (rs[0]['controller'].strip(), rs[0]['condition'].strip(), rs[0]['_rep'])
+    for i, r in enumerate(rows, start=2):
+        if r['test_id'].strip() not in cond_tests.get(r['condition'].strip(), set()):
+            out.append(f'line {i} {r["run_id"]}: test {r["test_id"]!r} is not a {r["condition"]!r} test')
+    if planned is None:
+        return out
+    pb = {str(bl['block']).strip(): bl for bl in planned}
+    pkey = {b: (bl['controller'], bl['condition'], int(bl['rep'])) for b, bl in pb.items()}
+    for b, rs in blocks.items():
+        tests = [r['test_id'].strip() for r in rs]
+        if b in pb:
+            bl = pb[b]
+            if key[b] != pkey[b]:
+                out.append(f'block {b}: {key[b]} in runs.csv, {pkey[b]} in s02_plan.json')
+            extra, miss = set(tests) - set(bl['tests']), set(bl['tests']) - set(tests)
+            if extra:
+                out.append(f'block {b}: tests {sorted(extra)} not planned in this block (s02_plan.json)')
+            if miss:
+                out.append(f'block {b}: planned tests {sorted(miss)} have no row in this block')
+        else:
+            same = [b2 for b2, k in pkey.items() if k == key[b]]
+            if not same:
+                out.append(f'block {b}: not in s02_plan.json and no planned block {key[b]}')
+            elif not set(tests) <= set(pb[same[0]]['tests']):
+                out.append(f'block {b}: tests {sorted(set(tests) - set(pb[same[0]]["tests"]))} not in the planned '
+                           f'block {same[0]} {key[b]}')
+    for b in pb:
+        if b not in blocks:
+            out.append(f'block {b}: planned (s02_plan.json), no row in runs.csv')
+    return out
+
+
 def check(rows, planned=None, n_reps=None):
     """Problems of a filled-in runs.csv (module docstring). planned: the s02_plan.json block list, when the
     folder has it: the exact set of cells (test x controller x repetition) the session must cover. n_reps: the
@@ -155,8 +210,9 @@ def check(rows, planned=None, n_reps=None):
     # battery per block (S2P1-9, P2-5): rest voltage before the first and after the last run of the block
     blocks = {}
     for r in rows:
-        blocks.setdefault(r['block'], []).append(r)
+        blocks.setdefault(r['block'].strip(), []).append(r)
     order = {b: rows.index(rs[0]) for b, rs in blocks.items()}
+    out += _block_problems(rows, blocks, planned)
     for b, rs in blocks.items():
         st = {r['block_status'].strip() for r in rs}
         if 'battery_rerun' in st and st != {'battery_rerun'}:

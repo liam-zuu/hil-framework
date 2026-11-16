@@ -208,9 +208,19 @@ def step_quantities(t_s, v, test_id, u=None):
         out[f'no90_seg{n}'] = int(i90.size == 0)
         out[f'rise_s_seg{n}'] = float(ts[i90[0]] - ts[i10[0]]) if i90.size and i10.size else float('nan')
         out[f'overshoot_pct_seg{n}'] = float(max(0.0, float(np.max(y)) - 1.0) * 100.0)
-        # time with y >= 0.9: each line holds its value until the next line (or the segment end)
-        dur = np.diff(np.append(ts, b))
-        out[f'frac90_seg{n}'] = float(np.sum(dur[y >= STEP_HI]) / np.sum(dur)) if np.sum(dur) > 0 else float('nan')
+        # time with y >= 0.9: each line holds its value until the next line (or the segment end); the start of the
+        # segment up to its first line is held by the last line before the segment (S2M1-10, Codex round 1 of v3:
+        # a lost first line no longer drops the start of the segment from the denominator); no line before the
+        # segment: frac90 not defined
+        pre = np.flatnonzero(t < a - 1e-9)
+        if pre.size:
+            jp = pre[np.argmax(t[pre])]
+            tf, yf = np.r_[a, ts], np.r_[(v[jp] - prev) / A, y]
+            dur = np.diff(np.append(tf, b))
+            out[f'frac90_seg{n}'] = (float(np.sum(dur[yf >= STEP_HI]) / np.sum(dur)) if np.sum(dur) > 0
+                                     else float('nan'))
+        else:
+            out[f'frac90_seg{n}'] = float('nan')
         xl = out[f'e_xl_seg{n}']
         out[f'rise_uninterp_seg{n}'] = (int(xl >= RISE_UNINTERP * abs(A)) if math.isfinite(xl) else float('nan'))
     return out

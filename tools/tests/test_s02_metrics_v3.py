@@ -339,3 +339,97 @@ def test_heading_errors_are_wrapped(who):
     k = 'e_psi' if who == 'plant' else 'e_est_psi'
     assert m[f'{k}_max'] <= math.pi + 1e-9 and m[f'{k}_max'] == pytest.approx(e.max(), abs=1e-9)
     assert m[f'{k}_rms'] == pytest.approx(math.sqrt(np.mean(e ** 2)), abs=1e-9)
+
+
+def test_e_yaw_imu_from_gz_fused_offset_and_empty_cell():
+    """S2M1-12 (Codex round 1 of v3): gz_fused 0.07 rad/s off the command gives e_yaw_imu 0.07 (encoder wz and
+    wz_meas unchanged); one empty gz_fused cell in the window: e_yaw_imu undefined, the other metrics kept."""
+    log = mk('A-C2')
+    log['gz_fused'] = log['gz_fused'] + 0.07
+    m = hil(log, 'A-C2')
+    assert m['e_yaw_imu'] == pytest.approx(0.07) and m['e_wz'] == pytest.approx(0.0, abs=1e-12)
+    t = (log['timestamp_us'] - T0) * 1e-6
+    log['gz_fused'] = np.where(np.abs(t - 2.0) < 0.005, np.nan, log['gz_fused'])
+    m = hil(log, 'A-C2')
+    assert math.isnan(m['e_yaw_imu']) and m['e_wz'] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_reset_on_the_line_at_t0_counts():
+    """S2M1-8 (Codex round 1 of v3): the baseline of pos_reset_n is the last line before t = 0, so a reset on the
+    line at t = 0 itself makes e_est undefined; a reset before t = 0 does not; no line before t = 0: unchecked."""
+    log = mk()
+    t = (log['timestamp_us'] - T0) * 1e-6
+    assert np.any(t == 0.0)
+    log['pos_reset_n'] = np.where(t >= 0.0, 2.0, 1.0)
+    m = hil(log, plant=plant_of(log))
+    assert m['e_est_reason'] == 'pos_reset_in_window' and math.isnan(m['e_est_p_rms'])
+    log['pos_reset_n'] = np.where(t >= -0.01, 2.0, 1.0)                 # on the last line before t = 0
+    m = hil(log, plant=plant_of(log))
+    assert m['e_est_reason'] == '' and m['e_est_p_rms'] == pytest.approx(0.0, abs=1e-9)
+    late = {c: (x[t >= 0.0] if not c.startswith('_') else x) for c, x in mk().items()}
+    late['_all'] = late['_every'] = late
+    m = hil(late, plant=plant_of(late))
+    assert m['e_est_reason'] == 'pos_reset_unchecked'
+
+
+def _runs_dir(tmp_path, platform, logs):
+    """A run folder: one log per (run_id, log, plant), runs.csv of completed runs, plant and map files (HIL)."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    lines = ['run_id,platform,controller,test_id,speed_mps,rep,file,aborted,block_status,result,reason,prep_s']
+    for i, (rid, log) in enumerate(logs, start=1):
+        _write_log(tmp_path / f'{rid}.csv', log)
+        pl = plant_of(log)
+        cols = ['timestamp_us', 'x', 'y', 'theta', 'vx_w', 'vy_w', 'vx_b', 'vy_b', 'wz', 'w1', 'w2', 'w3', 'w4']
+        with open(tmp_path / f'{rid}_plant.csv', 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(cols)
+            for k in range(len(pl['timestamp_us'])):
+                w.writerow([int(pl['timestamp_us'][k])] + [f'{pl[c][k]:.9f}' if c in pl else '0' for c in cols[1:]])
+        (tmp_path / f'{rid}_plant_map.json').write_text(json.dumps(dict(ok=True, sender_t0_us=T0)),
+                                                        encoding='utf-8')
+        lines.append(f'{rid},{platform},PID,A-L2,0.5,{i},{rid}.csv,,,completed,,{3.0}')
+    (tmp_path / 'runs.csv').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    return str(tmp_path)
+
+
+def test_loss_over_one_percent_or_a_reset_mid_run_is_broken_through_compare(tmp_path):
+    """S2M1-1 (Codex round 1 of v3): a completed run with missing_over = 1 (P2-5) or run_bad = 1 (pose reset
+    mid-run, L37) is status broken in metrics.csv, with no metric and its loss / reset columns; s02_compare then
+    leaves it out (runs.csv -> metrics.csv -> compare)."""
+    import s02_compare as C
+    n = len(mk()['tick'])
+    drop = np.zeros(n, bool)
+    drop[np.arange(100, n, 40)] = True                                 # 2.5 % lost
+    lossy = mk(drop=drop)
+    bad = mk()
+    t = (bad['timestamp_us'] - T0) * 1e-6
+    bad['pos_reset_n'] = np.where(t > 3.0, 2.0, 1.0)                     # reset mid-run
+    good = [mk(seed=s, delay_s=0.01 * s) for s in (1, 2, 3)]
+    h = _runs_dir(tmp_path / 'h', 'hil', [('g1', good[0]), ('g2', good[1]), ('g3', good[2]),
+                                           ('lossy', lossy), ('bad', bad)])
+    out = M.run_dir_metrics(h)
+    st = {o['run_id']: o for o in out}
+    assert [st[r]['status'] for r in ('g1', 'g2', 'g3')] == ['ok'] * 3
+    assert st['lossy']['status'] == 'broken' and st['lossy']['status_reason'].startswith('missing_over')
+    assert st['lossy']['missing_over'] == 1 and st['lossy']['missing_pct'] > 1.0 and 'e_vx' not in st['lossy']
+    assert st['bad']['status'] == 'broken' and 'mid-run' in st['bad']['status_reason']
+    assert st['bad']['run_bad'] == 1 and 'e_vx' not in st['bad'] and 'e_p_rms' not in st['bad']
+    with open(os.path.join(h, 'metrics.csv'), newline='') as f:
+        rows = {r['run_id']: r for r in csv.DictReader(f)}
+    assert rows['lossy']['e_vx'] == '' and rows['lossy']['missing_pct'] != '' and rows['bad']['e_p_rms'] == ''
+    assert M.cell_counts(out)[('A-L2', 'hil', 'PID')] == dict(ok=3, broken=2)
+    s = _runs_dir(tmp_path / 's', 'sim', [(f's{i}', mk(seed=i)) for i in (1, 2, 3)])
+    M.run_dir_metrics(s)
+    rows, info = C.load([s, h])
+    assert sorted(r['run_id'] for r in rows if r['platform'] == 'hil') == ['g1', 'g2', 'g3']
+    x = next(x for x in C.compare(rows, info) if x['metric'] == 'e_vx' and x['platform_b'] == 'hil')
+    assert x['n_b'] == 3
+
+
+def test_cell_line_reports_ok_over_five_and_history_apart():
+    """S2M1-9 (Codex round 1 of v3): ok / 5 (P2-4), broken and aborted in the cell, replaced and battery_rerun as
+    history, not in the denominator."""
+    c = dict(ok=3, broken=1, aborted=1, replaced=2, battery_rerun=6)
+    assert M.cell_line(('A-L2', 'hil', 'PID'), c) == \
+        '  A-L2 hil PID: ok 3 / 5, aborted 1, broken 1; history: replaced 2, battery_rerun 6'
+    assert M.cell_line(('A-K1', 'real', 'LADRC'), dict(ok=5)) == '  A-K1 real LADRC: ok 5 / 5'

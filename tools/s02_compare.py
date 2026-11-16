@@ -16,9 +16,10 @@ each (test, controller, metric) present on both sides.
   n_a, n_b: completed runs with a finite value of that metric (n_metric); n_undef_a, n_undef_b: completed runs
   where it is undefined (e.g. no 0.9 crossing: no rise time). Fewer than MIN_N on a side: label insufficient, no
   number (P2-6 "khong du gia tri").
-  Test (P2-6 Kiem dinh): when every value of side a is the same number (SIM without a noise model: the runs repeat
-  bit for bit), a one-sample t interval of side b around that number (method one_sample); otherwise Welch (method
-  welch, Welch-Satterthwaite degrees of freedom). CI = delta +- t_{0.975, df} se. The SIM determinism check itself
+  Test (P2-6 Kiem dinh): when side a is SIM and every value of it is the same number (SIM without a noise model: the
+  runs repeat bit for bit), a one-sample t interval of side b around that number (method one_sample); otherwise
+  Welch (method welch, Welch-Satterthwaite degrees of freedom; S2M1-11: a constant HIL side is Welch too).
+  Inputs: a file given twice, or one (platform, run_id) in two files, is refused (S2M1-7). CI = delta +- t_{0.975, df} se. The SIM determinism check itself
   (Viec CODE 7) is not done here.
   delta_pct = delta / mean_a x 100, only for metrics that cannot be negative (columns info nonneg), and not when
   mean_a = 0 or, for an encoder metric, mean_a < 2 qrms.
@@ -58,10 +59,22 @@ def _metrics_path(p):
 def load(paths):
     """(rows with status ok, column info) of several metrics.csv; rows keep their source file."""
     rows, info = [], {}
+    # S2M1-7 (Codex round 1 of v3): one file given twice (as a folder and as its metrics.csv too), or one run in two
+    # files, would count its runs twice: refused
+    seen_path, seen_run = {}, {}
     for p in paths:
         mp = _metrics_path(p)
+        key = os.path.normcase(os.path.realpath(mp))
+        if key in seen_path:
+            raise ValueError(f'{mp}: given twice (also as {seen_path[key]})')
+        seen_path[key] = mp
         with open(mp, newline='') as f:
             got = list(csv.DictReader(f))
+        for r in got:
+            rk = ((r.get('platform') or '').strip().lower(), (r.get('run_id') or '').strip())
+            if rk in seen_run and seen_run[rk] != mp:
+                raise ValueError(f'{mp}: run {rk[1]!r} ({rk[0]}) is also in {seen_run[rk]}')
+            seen_run.setdefault(rk, mp)
         cj = os.path.splitext(mp)[0] + '_columns.json'
         if os.path.isfile(cj):
             with open(cj, encoding='utf-8') as f:
@@ -102,10 +115,12 @@ def metric_columns(rows, info):
     return out
 
 
-def interval(a, b):
-    """(method, df, delta, ci_low, ci_high) of side b against side a (module docstring)."""
+def interval(a, b, a_is_sim=True):
+    """(method, df, delta, ci_low, ci_high) of side b against side a (module docstring). One-sample only when side a
+    is SIM (S2M1-11, Codex round 1 of v3: the method follows the platform, not the data; a constant HIL or car side
+    goes through Welch, whose interval is then the same, labelled welch)."""
     a, b = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
-    if np.all(a == a[0]):
+    if a_is_sim and np.all(a == a[0]):
         d = float(np.mean(b) - a[0])
         se = float(np.std(b, ddof=1) / math.sqrt(len(b)))
         df = len(b) - 1
@@ -156,7 +171,7 @@ def compare(rows, info):
                     line.update(label='insufficient')
                     out.append(line)
                     continue
-                method, df, d, lo, hi = interval(fa, fb)
+                method, df, d, lo, hi = interval(fa, fb, pa == 'sim')
                 line.update(method=method, df=df, delta=d, ci_low=lo, ci_high=hi, ci_width=hi - lo, label='')
                 q = _qrms(k, ra, rb)
                 ma = line['mean_a']

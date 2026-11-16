@@ -147,7 +147,18 @@ def test_strafe_moves_left_of_the_heading():
 def test_frac90_weights_lines_by_the_time_they_hold():
     """Lines 10 ms apart before the response, then 0.5 s apart: frac90 is the time share (2.5 s of 3 s), not the
     line share."""
-    t = np.r_[np.arange(300, 350) / 100.0, [3.5, 4.0, 4.5, 5.0, 5.5]]
-    v = np.r_[np.zeros(50), np.full(5, 0.3)]
+    t = np.r_[2.99, np.arange(300, 350) / 100.0, [3.5, 4.0, 4.5, 5.0, 5.5]]
+    v = np.r_[0.0, np.zeros(50), np.full(5, 0.3)]
     q = R.step_quantities(t, v, 'A-K1')
     assert q['frac90_seg2'] == pytest.approx(2.5 / 3.0) and q['no90_seg2'] == 0
+
+
+def test_frac90_start_of_the_segment_held_by_the_line_before():
+    """S2M1-10 (Codex round 1 of v3): the first lines of the segment lost: [3.0, 3.4) is held by the last line
+    before the segment (y = 0), so it is in the denominator; no line before the segment: frac90 not defined."""
+    t = np.r_[2.99, [3.4, 4.0, 5.0]]
+    v = np.r_[0.0, [0.3, 0.3, 0.3]]
+    q = R.step_quantities(t, v, 'A-K1')
+    assert q['frac90_seg2'] == pytest.approx(2.6 / 3.0)
+    q = R.step_quantities(t[1:], v[1:], 'A-K1')
+    assert math.isnan(q['frac90_seg2']) and q['no90_seg2'] == 0
