@@ -572,9 +572,10 @@ def steps_of(args: str):
             val = t[len('--steps='):]
     if val is None:
         return None
-    if not val.isdigit():
-        raise ValueError(f'--steps {val!r} không phải số nguyên')
-    return int(val)
+    try:                                     # T3T-9 (vòng 2): as argparse type=int: int() takes '+70000', '70_000'
+        return int(val)
+    except ValueError:
+        raise ValueError(f'--steps {val!r} không phải số nguyên') from None
 
 
 def plan_s06(specs, plan, gain_query=False):
@@ -630,14 +631,23 @@ def s06_run_cmd(pi_dir, name, args, s06, esp_ip):
 
 
 def s06_cleanup_cmd(pi_dir, name):
-    """T3T-5: after an S06 run that did not end cleanly (ssh time-out, lost connection, non-zero code): SIGTERM the
-    run_hil.py and s06_logger.py of this run by their PID files when still alive and the PID is that script (as
-    pi_stop_cmd checks /proc/PID/cmdline), wait up to 5 s, then SIGKILL; prints what it did."""
+    """T3T-5: after an S06 run that did not end cleanly (ssh time-out, lost connection, non-zero code): for the
+    run_hil.py and s06_logger.py of this run, by their PID files, when still alive and the PID is that script (as
+    pi_stop_cmd checks /proc/PID/cmdline). T3T-R2-1: first list its process tree (`pgrep -P`, recursive, as
+    pi_stop_cmd kind 'kill': run_hil.py runs the plant in multiprocessing 'spawn' children, whose cmdline does not
+    name run_hil.py, and a child left by a dead parent can no longer be found from the PID file), then SIGTERM the
+    script only (run_hil.py turns it into STOP), wait up to 5 s for the whole tree, then SIGKILL every process of
+    that tree still alive; prints what it did."""
+    # d() prints each child before going down into it: a function variable in bash is global, so printing $c after
+    # the recursive call would print the grandchild's PID a second time in place of the child's.
+    tree = 'd() { for c in $(pgrep -P "$1"); do echo "$c"; d "$c"; done; }; '
+    alive = 'a() { A=""; for c in $T; do kill -0 $c 2>/dev/null && A="$A $c"; done; }; '
     one = ('P=$(cat {f} 2>/dev/null); if [ -n "$P" ] && kill -0 "$P" 2>/dev/null && '
-           "tr '\\0' ' ' < /proc/$P/cmdline | grep -q '{s}'; then echo \"stop {s} pid=$P\"; kill -TERM $P; "
-           'for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 $P 2>/dev/null || break; sleep 0.5; done; '
-           'kill -0 $P 2>/dev/null && {{ echo "kill {s} pid=$P"; kill -KILL $P; }}; fi; ')
-    return (one.format(f=f'{pi_dir}/{name}.pid', s='run_hil.py')
+           "tr '\\0' ' ' < /proc/$P/cmdline | grep -q '{s}'; then T=\"$P $(d $P)\"; "
+           'echo "stop {s} pid=$P tree=$(echo $T)"; kill -TERM $P; '
+           'for i in 1 2 3 4 5 6 7 8 9 10; do a; [ -z "$A" ] && break; sleep 0.5; done; a; '
+           '[ -n "$A" ] && {{ echo "kill {s} pids=$(echo $A)"; kill -KILL $A; }}; fi; ')
+    return (tree + alive + one.format(f=f'{pi_dir}/{name}.pid', s='run_hil.py')
             + one.format(f=f'{pi_dir}/{name}_logger.pid', s='s06_logger.py') + 'true')
 
 
@@ -697,11 +707,14 @@ def pi_stop_cmd(pi_dir, name, kind):
 
 
 LEFT_CMD = 'pgrep -u "$(id -u)" -a python3'          # process name python3: the ssh bash itself never matches
-LEFT_PAT = ('run_hil.py', 'agv_logger.py', 's06_logger.py')
+# T3T-R2-1: and multiprocessing children (run_hil.py sets 'spawn': `python3 -c from multiprocessing.spawn import
+# spawn_main; ...`, plus multiprocessing.resource_tracker): a plant child left by a dead run_hil.py still holds the SPI
+LEFT_PAT = ('run_hil.py', 'agv_logger.py', 's06_logger.py', 'from multiprocessing.')
 
 
 def leftovers(pgrep_text):
-    """B: `pgrep -a python3` lines of run_hil.py / agv_logger.py / s06_logger.py processes still on the Pi."""
+    """B: `pgrep -a python3` lines of run_hil.py / agv_logger.py / s06_logger.py processes, and of multiprocessing
+    child processes (T3T-R2-1), still on the Pi."""
     return [ln.strip() for ln in pgrep_text.splitlines() if any(p in ln for p in LEFT_PAT)]
 
 
@@ -895,7 +908,9 @@ def bench(a):
                     run_cmd(a.pi_dir, name, args, not a.no_logger, src)
                 rc, txt = ssh(a.host, cmd, timeout=lim)
             except subprocess.TimeoutExpired:
-                rc, txt = -1, f'ssh quá {lim:.0f} s (--run-timeout, lượt S06: --steps/1000 + {S06_TIMEOUT_EXTRA_S}); kiểm tiến trình trên Pi'
+                how = f'--run-timeout, lượt S06: --steps/1000 + {S06_TIMEOUT_EXTRA_S}' if name in s06 \
+                    else '--run-timeout'                                             # T3T-R2-2
+                rc, txt = -1, f'ssh quá {lim:.0f} s ({how}); kiểm tiến trình trên Pi'
                 print(f'{name}: {txt}')
             if name in s06 and rc != 0:                # T3T-5: do not leave this run's processes on the Pi
                 try:

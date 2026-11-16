@@ -756,6 +756,129 @@ def test_t3t_9_steps_as_argparse_reads_them():
     assert hb.plan_s06(['t2=heavy,60'], _plan('t2=--steps=70000'))['t2']['steps'] == 70000
 
 
+# ── Codex vòng 2 (T3T-R2-1, T3T-R2-2, T3T-9 còn lại; Liam 16/11 'chuyen phien, sau do sua 3 muc + vong 3') ──
+
+def test_t3t_9_r2_steps_read_by_int_as_argparse():
+    """T3T-9 (vòng 2): argparse type=int is int(): '+70000', '70_000' are 70000 (b6f23c2 refused them by isdigit)."""
+    assert hb.steps_of('--steps=+70000') == 70000 and hb.steps_of('--steps 70_000') == 70000
+    assert hb.plan_s06(['t2=heavy,60'], _plan('t2=--steps +70000'))['t2']['steps'] == 70000
+    for bad in ('--steps x', '--steps 7.0', '--steps=', '--steps 0x10'):
+        with pytest.raises(ValueError, match='không phải số nguyên'):
+            hb.steps_of(bad)
+
+
+SPAWN_CHILD = ('4908 python3 -c from multiprocessing.spawn import spawn_main; spawn_main(tracker_fd=6, '
+               'pipe_handle=8) --multiprocessing-fork')
+TRACKER = '4907 python3 -c from multiprocessing.resource_tracker import main;main(5)'
+
+
+def test_t3t_r2_1_leftovers_see_multiprocessing_children():
+    """T3T-R2-1: a 'spawn' plant child (and the resource tracker) of a dead run_hil.py is a leftover; b6f23c2 missed
+    it (its cmdline does not name run_hil.py). An unrelated python3 is still not one."""
+    txt = f'812 python3 /usr/lib/x/other.py\n{TRACKER}\n{SPAWN_CHILD}\n'
+    assert hb.leftovers(txt) == [TRACKER, SPAWN_CHILD]
+
+
+def test_t3t_r2_1_cleanup_lists_the_tree_before_the_term():
+    """T3T-R2-1: the cleanup lists each script's tree (pgrep -P, recursive) before SIGTERM, and SIGKILLs the tree."""
+    c = hb.s06_cleanup_cmd('~/r', 't2')
+    assert 'pgrep -P' in c and c.index('pgrep -P') < c.index('kill -TERM')
+    assert c.index('T="$P $(d $P)"') < c.index('kill -TERM $P') < c.index('kill -KILL $A')
+    assert 'do echo "$c"; d "$c"; done' in c                          # child printed before its own children
+
+
+def _posix_runner():
+    """bash with /proc and pgrep: this machine (POSIX), or WSL on Windows; None = skip. Returns (argv, to_path)."""
+    import shutil
+    import subprocess as sp
+    if os.name == 'posix' and os.path.isdir('/proc') and shutil.which('pgrep') and shutil.which('python3'):
+        return ['bash', '-c'], str
+    if os.name == 'nt' and shutil.which('wsl'):
+        try:
+            r = sp.run(['wsl', '-e', 'bash', '-c', 'command -v pgrep python3 >/dev/null && [ -d /proc ]'],
+                       capture_output=True, timeout=60)
+        except (OSError, sp.TimeoutExpired):
+            return None
+        if r.returncode == 0:
+            def to_wsl(p):
+                p = os.path.abspath(str(p))
+                return '/mnt/' + p[0].lower() + p[2:].replace('\\', '/')
+            return ['wsl', '-e', 'bash', '-c'], to_wsl
+    return None
+
+
+FAKE_RUN_HIL = '''import multiprocessing as mp, os, signal, sys, time
+def child():
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)   # a plant child that does not stop on its own
+    time.sleep(120)
+if __name__ == '__main__':
+    mp.set_start_method('spawn', force=True)
+    p = mp.Process(target=child, daemon=True)
+    p.start()
+    with open(sys.argv[1] + '.tmp', 'w') as f:
+        f.write(str(p.pid))
+    os.replace(sys.argv[1] + '.tmp', sys.argv[1])
+    if sys.argv[2] == 'orphan':                         # dies on SIGTERM without stopping its child
+        signal.signal(signal.SIGTERM, lambda *a: os._exit(0))
+    else:                                               # 'hang': ignores SIGTERM
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    time.sleep(120)
+'''
+
+
+@pytest.mark.parametrize('mode', ['orphan', 'hang'])
+def test_t3t_r2_1_cleanup_stops_the_real_process_tree(tmp_path, mode):
+    """T3T-R2-1, real processes (POSIX bash or WSL): a run_hil.py with a multiprocessing 'spawn' child; the cleanup
+    leaves neither alive. 'orphan': run_hil.py exits on SIGTERM and leaves the child (b6f23c2 left it running);
+    'hang': run_hil.py ignores SIGTERM (both SIGKILLed). Before the cleanup, leftovers() sees the child."""
+    import subprocess as sp
+    r = _posix_runner()
+    if r is None:
+        pytest.skip('cần bash có /proc, pgrep, python3 (POSIX hay WSL)')
+    argv, to = r
+    d = tmp_path / 'r'
+    d.mkdir()
+    (d / 'run_hil.py').write_text(FAKE_RUN_HIL, encoding='utf-8', newline='\n')
+    D = to(d)
+    script = (f'D={D}; (python3 $D/run_hil.py $D/child.pid {mode} & echo $! > $D/t2.pid); '
+              'for i in $(seq 1 100); do [ -s $D/child.pid ] && break; sleep 0.1; done; '
+              'P=$(cat $D/t2.pid); C=$(cat $D/child.pid); echo "pids P=$P C=$C"; '
+              'pgrep -u "$(id -u)" -a python3 | while read -r pid rest; do '
+              '[ "$pid" = "$C" ] && echo "left $pid $rest"; done; echo "## cleanup"; '
+              f'{hb.s06_cleanup_cmd(D, "t2")}; echo "## after"; sleep 0.3; '
+              'kill -0 $P 2>/dev/null && echo alive_parent; kill -0 $C 2>/dev/null && echo alive_child; '
+              'kill -KILL $P $C 2>/dev/null; true')
+    out = sp.run(argv + [script], capture_output=True, timeout=90).stdout.decode('utf-8', 'replace')
+    assert 'pids P=' in out and '## after' in out, out
+    left = [ln[len('left '):] for ln in out.splitlines() if ln.startswith('left ')]
+    assert len(left) == 1 and hb.leftovers(left[0]) == left, out          # the child is seen as a leftover
+    after = out.split('## after', 1)[1]
+    assert 'alive_parent' not in after and 'alive_child' not in after, out
+    cleanup = out.split('## cleanup', 1)[1].split('## after', 1)[0]
+    assert 'stop run_hil.py pid=' in cleanup and 'kill run_hil.py pids=' in cleanup, out
+
+
+def test_t3t_r2_2_timeout_text_names_the_s06_formula_only_for_s06_runs(tmp_path, monkeypatch):
+    """T3T-R2-2: an ssh time-out of a run without --s06 does not name the S06 formula (b6f23c2 did); an S06 run's
+    still does."""
+    import subprocess as sp
+    a, calls, _ = _bench_env(monkeypatch, tmp_path, None, run=['x=--test A-L1', 't2=--test A-L1 --steps 620000'],
+                             s06=['t2=heavy,610'], gain_query=False, esp32_ip='10.0.0.2', run_timeout=600.0)
+
+    def fake_ssh(host, cmd, timeout=None):
+        calls.append(cmd)
+        if 'python3 run_hil.py' in cmd:
+            raise sp.TimeoutExpired(cmd, timeout)
+        return 0, ''
+    monkeypatch.setattr(hb, 'ssh', fake_ssh)
+    monkeypatch.setattr(hb, 'scp', lambda host, remote, local, recursive=False: 0)
+    hb.bench(a)
+    x = open(os.path.join(a.out, 'pi', 'x_pi.txt'), encoding='utf-8').read()
+    assert 'ssh quá 600 s (--run-timeout)' in x and 'S06' not in x
+    t2 = open(os.path.join(a.out, 'pi', 't2_pi.txt'), encoding='utf-8').read()
+    assert 'ssh quá 740 s (--run-timeout, lượt S06: --steps/1000 + 120)' in t2
+
+
 def _s06_out(tmp_path):
     out = tmp_path / 'o'
     (out / 'frames').mkdir(parents=True)
