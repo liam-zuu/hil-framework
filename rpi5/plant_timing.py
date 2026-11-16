@@ -16,6 +16,16 @@ Times, under the same scheduling as the plant loop (SCHED_FIFO 90, core 0):
                so the ring write of every step is counted)
   fault_all4   L82: the same with enc_loss (2 wheels), imu_loss, imu_delay and gyro_scale all on
   mosi_true_log L82: the extra FRAME_SIZE-byte write of the true frame into the frame log (--faults)
+  fault_plant_* batch 2 plant faults (fault_plant.py; design 2026-11-15_Thiet_ke_bom_loi_dot2_v1.md 4.3):
+               one MecanumPlant.step (dc, traction, nominal params.py) with and without a FaultPlant around it,
+               the patcher held at one step inside every window, the record written at every timed call:
+                 base  MecanumPlant.step alone (the reference of the five below)
+                 idle  FaultPlant, a plant row in the schedule but outside its window (nominal path)
+                 jam   wheel_jam FL b=0.1 on (s11)
+                 sag   batt_sag v1=7.44 on, still on its ramp (s13)
+                 zone  mu_zone all wheels, mu=0.2, the four contact points every step (s15)
+                 all3  jam + sag + zone on together
+               The patch() of the frame is not in these numbers (fault_idle / fault_all4 above).
   slipA_nsubN  THROWAWAY timing prototype of a minimal slip model (method A):
                body with its own dynamics, traction per wheel capped by mu*N,
                N sub-steps per 1 ms. Only for timing: parameters are guesses,
@@ -65,9 +75,54 @@ def _slip_a_step(p, Minv, Jw, N, mu, k_s):
     return step
 
 
+WARMUP = 500
+
+# batch 2 plant fault rows, {w}: window end (every warm-up and timed call is inside); values as the
+# [ĐỀ XUẤT] examples of design section 3, only to load the code path, not chosen for a run
+FAULT_PLANT_ROWS = {
+    'jam':  'J1,wheel_jam,FL,0,{w},b=0.1\n',
+    'sag':  'B1,batt_sag,batt,0,{w},v1=7.44;ramp_ms={w}\n',
+    'zone': 'Z1,mu_zone,all,0,{w},x0=-1000;x1=1000;y0=-1000;y1=1000;mu=0.2\n',
+}
+FAULT_PLANT_STEP = 100              # patcher step of the timed calls: inside every window, batt_sag still ramping
+
+
+def fault_plant_variants(n, x, u):
+    """[(name, fn, plant)] of the batch 2 plant fault timings (docstring above); plant is the FaultPlant (None
+    for base) so that a test can see the fault path really ran. Each variant has its own MecanumPlant and
+    MecanumParams, started from state x; fn() is one plant step with duty u."""
+    import fault_schedule as fsch
+    from fault_plant import FaultPlant
+    from mecanum_plant import MecanumPlant
+    w = n + WARMUP + 100
+    head = fsch.MAGIC + '\nid,fault,target,start_ms,end_ms,params\n'
+    bodies = {'idle': f'J1,wheel_jam,FL,{w},{w + 1},b=0.1\n'}
+    bodies.update({k: v.format(w=w) for k, v in FAULT_PLANT_ROWS.items()})
+    bodies['all3'] = ''.join(bodies[k] for k in ('jam', 'sag', 'zone'))
+    ul = [float(v) for v in u]
+
+    def inner():
+        pl = MecanumPlant(params=MecanumParams(), dt=0.001, seed=0)
+        pl.reset(list(x))
+        return pl
+
+    base = inner()
+    out = [('fault_plant_base', lambda: base.step(ul), None)]
+    for name in ('idle', 'jam', 'sag', 'zone', 'all3'):
+        rows = fsch.parse(head + bodies[name])
+        fsch.check(rows, 2 * w, 'plant', 'traction')
+        pa = fsch.FramePatcher(fsch.Schedule(tuple(rows)))
+        pa.start(0)
+        pa.patch(FAULT_PLANT_STEP, bytes(FRAME_SIZE))
+        fp = FaultPlant(inner(), pa, None)
+        pa.plant_hook = fp
+        out.append((f'fault_plant_{name}', lambda fp=fp: fp.step(ul), fp))
+    return out
+
+
 def _time(fn, n):
-    """Per-call times [us] of n calls after 500 warm-up calls."""
-    for _ in range(500):
+    """Per-call times [us] of n calls after WARMUP warm-up calls."""
+    for _ in range(WARMUP):
         fn()
     t = np.empty(n)
     pc = time.perf_counter_ns
@@ -182,16 +237,17 @@ def main() -> int:
         flog['mosi'][k] = memoryview(frame0)
 
     variants += [('fault_idle', fault_idle), ('fault_all4', fault_all4), ('mosi_true_log', mosi_true_log)]
+    variants += [(name, fn) for name, fn, _ in fault_plant_variants(a.n, x, u)]
     Minv = np.diag([1.0 / p.M, 1.0 / p.M, 1.0 / p.Iz])
     stepA = _slip_a_step(p, Minv, np.full(4, p.J_w), p.M * p.g / 4.0, 0.8, 5.0)
     v0, w0 = np.zeros(3), np.full(4, 5.0)
     for ns in (int(s) for s in a.nsub.split(',') if s):
         variants.append((f'slipA_nsub{ns}', lambda ns=ns: stepA(v0, w0, u, ns)))
 
-    print(f'{"variant":<16}{"mean_us":>9}{"p50_us":>9}{"p99_us":>9}{"max_us":>9}   n={a.n}', flush=True)
+    print(f'{"variant":<18}{"mean_us":>9}{"p50_us":>9}{"p99_us":>9}{"max_us":>9}   n={a.n}', flush=True)
     for name, fn in variants:
         t = _time(fn, a.n)
-        print(f'{name:<16}{t.mean():9.1f}{np.percentile(t, 50):9.1f}{np.percentile(t, 99):9.1f}{t.max():9.1f}',
+        print(f'{name:<18}{t.mean():9.1f}{np.percentile(t, 50):9.1f}{np.percentile(t, 99):9.1f}{t.max():9.1f}',
               flush=True)
 
     print(f'machine: {platform.node()} | {platform.platform()} | python {platform.python_version()} '
