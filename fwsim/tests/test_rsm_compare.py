@@ -698,14 +698,20 @@ def test_dangling_attempt_and_abort_previous(tmp_path, dummy_dll, monkeypatch, f
     rc.run_phase('fit', str(s04), dummy_dll, abort_reason='power loss in test')
     rows = att(s04)
     assert [(r['kind'], r['status']) for r in rows] == [('start', ''), ('end', 'stopped'), ('moved', 'moved'),
-                                                        ('start', ''), ('end', 'done')]
+                                                        ('note', ''), ('start', ''), ('end', 'done')]
     ab = list((s04 / 'rsm' / 'aborted').iterdir())
     assert len(ab) == 1 and (ab[0] / 'fit' / 'coefs.csv').is_file() and 'power loss' in (ab[0] / 'reason.txt').read_text()
-    assert git_out(repo, 'status', '--porcelain', '--', '05_DATA/results/S04/run01/rsm').strip() == ''
-    # a committed, done phase moved aside: its removal is committed too
+    # RSM2-4: the partial files of the run that died stay under aborted/, not committed (named in the note row)
+    st = git_out(repo, 'status', '--porcelain', '--untracked-files=all', '--', '05_DATA/results/S04/run01/rsm').split('\n')
+    st = [x for x in st if x.strip()]
+    assert st and all(x.startswith('?? ') and '/rsm/aborted/' in x and '/fit/' in x for x in st)
+    assert 'fit/coefs.csv' in rows[3]['reason']
+    # a committed, done phase moved aside: its removal and its moved copy are committed
     rc.run_phase('opt', str(s04), dummy_dll)
     rc.run_phase('opt', str(s04), dummy_dll, abort_reason='exploratory re-run')
-    assert git_out(repo, 'status', '--porcelain').count('rsm/') == 0
+    st2 = [x for x in git_out(repo, 'status', '--porcelain', '--untracked-files=all', '--',
+                                '05_DATA/results/S04/run01/rsm').split('\n') if x.strip()]
+    assert sorted(st2) == sorted(st)                       # nothing new uncommitted
     rc.run_phase('test', str(s04), dummy_dll)
 
 
@@ -763,13 +769,24 @@ def test_f2_is_max_over_mu_of_the_mean_over_speeds(tmp_path, dummy_dll):
     assert co[('main', 'f2', '1')] == pytest.approx(10.0) and co[('mid', 'f2', '1')] == pytest.approx(9.0)
 
 
-def _io_log(monkeypatch):
+def _start_in_head(repo):
+    '''A start row without an end row is in HEAD's attempts.csv (read through git, not open).'''
+    r = subprocess.run(['git', '-C', str(repo), 'show', 'HEAD:05_DATA/results/S04/run01/rsm/attempts.csv'],
+                       capture_output=True)
+    if r.returncode:
+        return False
+    rows = list(csv.DictReader(r.stdout.decode('utf-8').splitlines()))
+    ended = {x['attempt_id'] for x in rows if x['kind'] in ('end', 'moved')}
+    return any(x['kind'] == 'start' and x['attempt_id'] not in ended for x in rows)
+
+
+def _io_log(monkeypatch, repo=None):
     events, real_open, real_commit = [], builtins.open, rc.commit_paths
 
     def op(p, *a, **k):
         q = str(p).replace('\\', '/')
         if '/s03/sealed/' in q or '/s03/sealed_test/' in q:
-            events.append(('open', str(p)))
+            events.append(('open', str(p), _start_in_head(repo) if repo else None))
         return real_open(p, *a, **k)
 
     def cm(repo, rels, msg):
@@ -785,11 +802,12 @@ def test_no_sealed_file_is_opened_before_the_start_commit(tmp_path, dummy_dll, m
     never open sealed_test/."""
     repo, s03, s04 = setup(tmp_path, dummy_dll)
     for ph in rc.PHASES:
-        ev = _io_log(monkeypatch)
+        ev = _io_log(monkeypatch, repo)
         rc.run_phase(ph, str(s04), dummy_dll)
         start = next(i for i, e in enumerate(ev) if e[0] == 'commit' and f'start {ph}' in e[1])
         first = next(i for i, e in enumerate(ev) if e[0] == 'open')
         assert start < first, ev[:5]
+        assert all(e[2] for e in ev if e[0] == 'open')           # RSM2-7: the start row is in HEAD at each open
         if ph != 'test':
             assert not any('/s03/sealed_test/' in e[1].replace('\\', '/') for e in ev if e[0] == 'open')
         monkeypatch.undo()
@@ -872,7 +890,10 @@ def test_no_flag_with_every_point_flagged(tmp_path, dummy_dll):
 @pytest.mark.parametrize('rows,lab', [
     ({0.4: [R(status='run_error', completed=''), R(completed='false', v=0.5)], 0.6: [R()]}, 'not robust over mu'),
     ({0.4: [R(e_perp_max=1e6, pen_e_perp_max=1)], 0.6: [R()]}, 'undetermined'),
-    ({0.4: [R(status='track_err')], 0.6: [R()]}, 'not robust over mu (inconclusive'),
+    ({0.4: [R(status='track_err')], 0.6: [R()]}, 'inconclusive over mu'),
+    # RSM2-5: a stored flag is kept even when another flag column is missing
+    ({0.4: [{k: v for k, v in R(e_perp_max=1e6, pen_e_perp_max=1).items() if k != 'pen_e_bao_max'}], 0.6: [R()]},
+     'undetermined'),
     ({0.4: [R()], 0.6: [R()]}, 'robust'),
     ({0.4: [{k: v for k, v in R(e_trk_max=0.5).items() if not k.startswith('pen_')}], 0.6: [R()]},
      'not robust over mu'),                                  # three_mu.csv rows: no pen_* columns
@@ -913,6 +934,9 @@ def test_one_run_at_a_time_and_no_stray_file(tmp_path, dummy_dll, fake_eval, mon
     monkeypatch.setattr(rc, 'EVALUATOR', stray)
     with pytest.raises(rc.Stop, match='not written by this run'):
         rc.run_phase('opt', str(s04), dummy_dll)
+    tracked = git_out(repo, 'ls-files', '05_DATA/results/S04/run01/rsm')
+    assert 'stray.txt' not in tracked and 'reason.txt' in tracked             # RSM2-4: the stray file not committed
+    assert 'not committed (not written by this run)' in att(s04)[-1]['reason']
 
 
 def test_clip_beyond_rounding_is_not_converged(tmp_path, dummy_dll, fake_eval, monkeypatch):
@@ -949,6 +973,9 @@ def test_candidate_filter_bounds_and_dedup():
     got = rc.candidates([dict(code=a, f1_hat=0.03, f2_hat=1.0), dict(code=at, f1_hat=0.03, f2_hat=1.0),
                          dict(code=near, f1_hat=0.03, f2_hat=1.0)], 0.03)
     assert [c['code'] for c in got] == [a, at]                                 # same f: codes in order; near dropped
+    got = rc.candidates([dict(code=near, f1_hat=0.03, f2_hat=1.0), dict(code=at, f1_hat=0.03, f2_hat=1.0),
+                         dict(code=a, f1_hat=0.03, f2_hat=1.0)], 0.03)
+    assert [c['code'] for c in got] == [a, at]                                 # RSM2-7: input order reversed
 
 
 def test_edge_side_and_source_columns(tmp_path, dummy_dll, fake_eval):
@@ -1000,6 +1027,9 @@ def test_main_run_needs_the_root_repo_and_committed_s04(tmp_path, dummy_dll, mon
     not committed; with both, the fit runs."""
     repo, s03, s04 = _main_mode(tmp_path, dummy_dll, monkeypatch)
     monkeypatch.setattr(rc, 'check_script_blob', lambda hil: None)
+    with pytest.raises(rc.Stop, match='main RSM runs only in'):          # not the root folder
+        rc.run_phase('fit', str(s04), dummy_dll)
+    monkeypatch.setattr(rc, 'ROOT_PATH', str(repo))
     with pytest.raises(rc.Stop, match='origin'):
         rc.run_phase('fit', str(s04), dummy_dll)
     subprocess.run(['git', '-C', str(repo), 'remote', 'add', 'origin', 'https://github.com/liam-zuu/hil-thesis.git'],
@@ -1024,6 +1054,97 @@ def test_script_blob_check(tmp_path):
     assert subprocess.run(['git', '-C', str(r), 'status', '--porcelain'], capture_output=True, text=True).stdout == ''
     with pytest.raises(rc.Stop, match='HEAD blob'):
         rc.check_script_blob(str(r))
+
+
+# ── Codex round 2 fixes (RSM2-1 .. RSM2-7) ───────────────────────────────────────────
+
+def test_attempts_history_edited_and_recommitted_stops(tmp_path, dummy_dll, fake_eval):
+    """RSM2-2: remove the test rows of attempts.csv and commit that: the next run stops (history not append only),
+    so no new 'main' test can be made."""
+    repo, s03, s04 = setup(tmp_path, dummy_dll)
+    for ph in rc.PHASES:
+        rc.run_phase(ph, str(s04), dummy_dll)
+    p = s04 / 'rsm' / 'attempts.csv'
+    rows = list(csv.DictReader(open(p, encoding='utf-8')))
+    s3.write_csv(str(p), [r for r in rows if r['phase'] != 'test'])
+    _commit_all(repo, p, 'drop the test rows')
+    with pytest.raises(rc.Stop, match='history'):
+        rc.run_phase('opt', str(s04), dummy_dll, abort_reason='try a new main test')
+
+
+def test_output_commit_ignores_a_quoted_message(tmp_path, dummy_dll, fake_eval):
+    """RSM2-3: a later commit whose message quotes the fit output message does not count as an output commit."""
+    repo, s03, s04 = setup(tmp_path, dummy_dll)
+    rc.run_phase('fit', str(s04), dummy_dll)
+    aid = att(s04)[0]['attempt_id']
+    rc.run_phase('opt', str(s04), dummy_dll)
+    rc.run_phase('opt', str(s04), dummy_dll,
+                 abort_reason=f'checking rsm_compare fit done 05_DATA/results/S04/run01 ({aid})')
+    assert (s04 / 'rsm' / 'opt_lock.yaml').is_file()                        # the fit lock still passed
+    inp = rc.Inputs(str(s04), dummy_dll)
+    c = rc.output_commit(inp, 'fit', aid)
+    assert git_out(repo, 'log', '-1', '--format=%s', c).startswith('fw: rsm_compare fit done')
+
+
+def test_stale_lock_cleared_by_abort_previous(tmp_path, dummy_dll, fake_eval):
+    """RSM2-6: a lock left by a process that died stops a plain run and is removed by --abort-previous; a lock of
+    a running process is kept."""
+    repo, s03, s04 = setup(tmp_path, dummy_dll)
+    (s04 / 'rsm').mkdir()
+    lk = s04 / 'rsm' / rc.RUN_LOCK
+    dead = 4_000_000_000 // 4 + 7                                 # no such process id
+    lk.write_text(f'{dead} 2026-11-16 00:00:00\n')
+    with pytest.raises(rc.Stop, match='run_lock'):
+        rc.run_phase('fit', str(s04), dummy_dll)
+    lk.write_text(f'{os.getpid()} 2026-11-16 00:00:00\n')
+    with pytest.raises(rc.Stop, match='still running'):
+        rc.run_phase('fit', str(s04), dummy_dll, abort_reason='x')
+    lk.write_text(f'{dead} 2026-11-16 00:00:00\n')
+    rc.run_phase('fit', str(s04), dummy_dll, abort_reason='the previous run died')
+    assert not lk.exists() and att(s04)[-1]['status'] == 'done'
+
+
+def test_pid_alive():
+    assert rc.pid_alive(os.getpid()) and not rc.pid_alive(4_000_000_000 // 4 + 7)
+
+
+def test_links_refused_before_any_open(tmp_path, dummy_dll, monkeypatch):
+    """RSM2-1: a link at rsm/attempts.csv (simulated: os.path.islink true) stops the run before the file is opened."""
+    repo, s03, s04 = setup(tmp_path, dummy_dll)
+    (s04 / 'rsm').mkdir()
+    (s04 / 'rsm' / 'attempts.csv').write_text('x\n')
+    target = str(s04 / 'rsm' / 'attempts.csv')
+    real_islink, real_open = os.path.islink, builtins.open
+    opened = []
+    monkeypatch.setattr(os.path, 'islink', lambda p: os.path.normcase(str(p)) == os.path.normcase(target)
+                        or real_islink(p))
+
+    def op(p, *a, **k):
+        if os.path.normcase(str(p)) == os.path.normcase(target):
+            opened.append(p)
+        return real_open(p, *a, **k)
+    monkeypatch.setattr(builtins, 'open', op)
+    with pytest.raises(rc.Stop, match='link'):
+        rc.run_phase('fit', str(s04), dummy_dll)
+    assert not opened
+
+
+def test_edge_source_and_limit(tmp_path, dummy_dll, fake_eval):
+    """RSM2-7: edge_src and edge_limit from the S03 v8.3 level sources (H of every factor: 'het luoi noi')."""
+    repo = make_repo(tmp_path)
+    s03 = make_s03(tmp_path, q1=q1_flat, q2=q2_concave, dll=dummy_dll)
+    rows = list(csv.DictReader(open(s03 / 'levels.csv')))
+    for r in rows:
+        r['L_nguon'], r['H_nguon'] = '0', 'hết lưới nối'
+    s3.write_csv(str(s03 / 'levels.csv'), rows)
+    s04 = make_s04(repo, s03, dummy_dll, q1=q1_flat, q2=q2_concave)
+    rc.run_phase('fit', str(s04), dummy_dll)
+    rc.run_phase('opt', str(s04), dummy_dll)
+    c = list(csv.DictReader(open(s04 / 'rsm' / 'opt' / 'candidates.csv', encoding='utf-8')))[0]
+    code = [float(x) for x in json.loads(c['code'])]
+    n_high = sum(x > 0 for x in code)
+    assert c['edge_src'].count(':H:hết lưới nối') == n_high and c['edge_src'].count(':L:0') == 7 - n_high
+    assert (c['edge_limit'] != '') == (n_high > 0) and c['edge_limit'].count(':H') == n_high
 
 
 # ── real fwsim (needs the DLL) ───────────────────────────────────────────────────────

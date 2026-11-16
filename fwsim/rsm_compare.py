@@ -119,8 +119,8 @@ INTERPRETATIONS = [
     'R2 is tested first; else s04_ga.select on {x_GA, x_RSM} gives R1 (x_GA) or R3 (x_RSM)',
     'not robust over mu (RSM-10): the 12.4 (iii) labels over every attempt-1 row of the low and high mu: an '
     'observed violation -> not robust; else run_error / penalty -> undetermined; else inconclusive / track_err -> '
-    'not robust (g1 convention, not observed); x_GA from the low / high rows of post_checks/three_mu.csv (pen flags '
-    'from s04_ga.run_values); per-mu labels reported',
+    '"inconclusive over mu" (g1 convention, not observed; RSM2-5); x_GA from the low / high rows of '
+    'post_checks/three_mu.csv (stored pen flags kept, missing ones from s04_ga.run_values); per-mu labels reported',
     'GA visited points: evals_<controller>.csv of the main runs only (S04 4.3: the trial is not a result); '
     'attempt 2 replaces a run_error only when the cause on the attempt-2 row starts with "tool:" (CODE writes it '
     'when it found a tool error; S04 8 puts cause on the rerun) and it is ok / track_err; a penalised quantity '
@@ -135,11 +135,15 @@ INTERPRETATIONS = [
     'start row (RSM-1): SHA-256 of the public S03 files and of S04, and of the sealed files as the S04 lock.yaml '
     'fingerprint recorded them; the sealed files (and sealed_test/ in phase 3) are hashed after the start commit, '
     'checked against that record, and written in the end row and the locks',
-    'locks (RSM-3): every locked file must be the blob of the output commit of the attempt that wrote it (commit '
-    'message "rsm_compare <phase> done <run> (<attempt>)"); opt_lock.yaml records the SHA-256 of fit/lock.yaml',
-    'main run (RSM-2, RSM-12): the repository origin is liam-zuu/hil-thesis, the S04 files read are committed '
+    'locks (RSM-3, RSM2-3): every locked file must be the blob of the output commit of the attempt that wrote it: '
+    'the oldest commit whose attempts.csv holds its end/done row (message checked on top); opt_lock.yaml records '
+    'the SHA-256 of fit/lock.yaml; every committed version of attempts.csv must extend the one before (RSM2-2)',
+    'main run (RSM-2, RSM-12): the repository is ROOT_PATH (the thesis root folder) with origin '
+    'liam-zuu/hil-thesis, the S04 files read are committed '
     'unchanged, rsm_compare.py is its HEAD blob, the DLL SHA-256 is the S04 one before loading and at the end',
-    'one run at a time (RSM-14): rsm/.run_lock (O_EXCL, never committed); a phase commits only the files it wrote',
+    'one run at a time (RSM-14): rsm/.run_lock (O_EXCL, never committed; --abort-previous removes it when its '
+    'process is not running, RSM2-6); a phase, a stop and an abort commit only the files the run wrote or that '
+    'were committed (RSM2-4); paths are checked for links before they are opened (RSM2-1)',
     'file SHA-256 in the locks and attempts.csv: of the bytes as written and of the bytes with CRLF -> LF '
     '(compared: the LF value, so a checkout with core.autocrlf keeps the lock valid)',
     'no x_GA (send_to_HIL infeasible in S04) stops the run: 12.5 does not define the classes without it',
@@ -334,21 +338,39 @@ def commit_paths(repo, rels, msg):
     return git(repo, 'rev-parse', 'HEAD').strip()
 
 
+def attempts_versions(inp):
+    """[(commit, text)] of every committed version of rsm/attempts.csv, oldest first (read through git, LF)."""
+    path = rel(inp, 'attempts.csv')
+    out = []
+    for c in git(inp.repo, 'log', '--format=%H', '--reverse', '--', path).split():
+        r = subprocess.run(['git', '-C', inp.repo, 'show', f'{c}:{path}'], capture_output=True)
+        out.append((c, r.stdout.decode('utf-8').replace('\r\n', '\n') if r.returncode == 0 else None))
+    return out
+
+
 def output_commit(inp, phase, aid):
-    """The commit that closed attempt <aid> of <phase> with 'done' (12.7: the output commit of the attempt)."""
-    out = git(inp.repo, 'log', '--format=%H', '--fixed-strings', f'--grep=rsm_compare {phase} done {inp.rel} ({aid})',
-              '--', rel(inp, 'attempts.csv')).split()
-    if len(out) != 1:
-        raise Stop(f'{len(out)} output commits for {phase} attempt {aid} (expected exactly one)')
-    return out[0]
+    """RSM2-3: the oldest commit whose attempts.csv holds the end/done row of attempt <aid> of <phase> (12.7: the
+    output commit of the attempt); its message must name that attempt (a check added on top)."""
+    for c, text in attempts_versions(inp):
+        rows = list(csv.DictReader(io.StringIO(text or '')))
+        if any(r['attempt_id'] == aid and r['kind'] == 'end' and r['phase'] == phase and r['status'] == 'done'
+               for r in rows):
+            msg = git(inp.repo, 'log', '-1', '--format=%s', c)
+            if f'rsm_compare {phase} done {inp.rel} ({aid})' not in msg:
+                raise Stop(f'commit {c[:10]} adds the done row of {aid} but is not its output commit ({msg!r})')
+            return c
+    raise Stop(f'no commit holds the done row of {phase} attempt {aid}')
 
 
 ROOT_ORIGIN = ('liam-zuu/hil-thesis', 'liam-zuu/hil-thesis.git')   # RSM-2: the thesis root repository
+ROOT_PATH = r'D:\CLAUDE_THESIS'                                      # RSM-2: the root repository folder (12.7)
 
 
 def check_root_repo(inp):
     """Main run (RSM-2): the repository is the thesis root (origin liam-zuu/hil-thesis) and the S04 files read
     are committed as they are."""
+    if os.path.normcase(os.path.realpath(inp.repo)) != os.path.normcase(os.path.realpath(ROOT_PATH)):
+        raise Stop(f'main RSM runs only in {ROOT_PATH} (this repository: {inp.repo})')
     url = git(inp.repo, 'remote', 'get-url', 'origin', check=False).strip().replace('\\', '/')
     if not url.endswith(ROOT_ORIGIN) or url.endswith('hil-thesis-cad') or url.endswith('hil-thesis-cad.git'):
         raise Stop(f'main RSM runs only in the thesis root repository (origin {url!r} is not liam-zuu/hil-thesis)')
@@ -364,6 +386,23 @@ def check_script_blob(hil):
 
 
 # ── inputs and checks (section 3 of the design; 12.2 S46-5) ─────────────────────────
+
+def refuse_link(p, s03=None):
+    """RSM-13, RSM2-1: p (if it exists) is no link and resolves to itself, and not into <s03>/sealed_test/; checked
+    from the path entries, before p is opened."""
+    if not os.path.exists(p) and not os.path.islink(p):
+        return
+    real = os.path.normcase(os.path.realpath(p))
+    if os.path.islink(p) or real != os.path.normcase(os.path.abspath(p)):
+        raise Stop(f'{p} is a link or resolves to {real}: refused (RSM-13)')
+    if s03 is not None:
+        st = os.path.normcase(os.path.realpath(os.path.join(s03, 'sealed_test')))
+        if real == st or real.startswith(st + os.sep):
+            raise Stop(f'{p} resolves into sealed_test/: refused before phase 3 (RSM-13)')
+
+
+RSM_PATHS = ['attempts.csv', 'meta.yaml', 'opt_lock.yaml', 'fit', 'opt', 'confirm', 'check', 'test', 'aborted']
+
 
 class Inputs:
     """S04 folder, its lock, the S03 run, the repository and the mode."""
@@ -383,6 +422,7 @@ class Inputs:
         self.rel = rel
         self.out = os.path.join(self.s04, 'rsm')
         self.rel_out = rel + '/rsm'
+        refuse_link(os.path.join(self.s04, 'lock.yaml'))              # RSM2-1: before the first open
         self.lock = json.load(open(os.path.join(self.s04, 'lock.yaml'), encoding='utf-8'))
         self.common = self.lock.get('common')
         if not self.common:
@@ -424,24 +464,20 @@ class Inputs:
             out[n] = dict(zip(('sha256', 'sha256_lf'), file_sha(p))) if os.path.isfile(p) else None
         return out
 
-    def check_links(self, out_dirs=()):
-        """RSM-13: no source or output file of this script is a link or resolves elsewhere; none resolves into
-        sealed_test/ (checked from the path entries, no file content is read)."""
-        st = os.path.normcase(os.path.realpath(os.path.join(self.s03, 'sealed_test')))
-        paths = [os.path.join(self.s04, p) for p in self.s04_paths()]
+    def check_links(self, out_dirs=RSM_PATHS):
+        """RSM-13, RSM2-1: no source or output path of this script is a link or resolves elsewhere; none resolves
+        into sealed_test/ (checked from the path entries, no file content is read)."""
+        paths = [self.s04, os.path.join(self.s04, 'rsm')] + [os.path.join(self.s04, p) for p in self.s04_paths()]
         paths += [os.path.join(self.s03, n) for n in S03_PUBLIC + S03_SEALED]
-        paths += [os.path.join(self.out, p) for p in files_under(self.out, list(out_dirs))]
+        paths += [os.path.join(self.out, d) for d in out_dirs]
+        paths += [os.path.join(self.out, p) for p in files_under(self.out, [d for d in out_dirs
+                                                                             if os.path.isdir(os.path.join(self.out, d))])]
         for p in paths:
-            if not os.path.exists(p) and not os.path.islink(p):
-                continue
-            real = os.path.normcase(os.path.realpath(p))
-            if os.path.islink(p) or real != os.path.normcase(os.path.abspath(p)):
-                raise Stop(f'{p} is a link or resolves to {real}: refused (RSM-13)')
-            if real.startswith(st + os.sep) or real == st:
-                raise Stop(f'{p} resolves into sealed_test/: refused before phase 3 (RSM-13)')
+            refuse_link(p, self.s03)
 
 
 def s03_meta(inp):
+    refuse_link(os.path.join(inp.s03, 'meta.yaml'), inp.s03)        # RSM2-1
     return open(os.path.join(inp.s03, 'meta.yaml'), encoding='utf-8').read()
 
 
@@ -668,6 +704,17 @@ def move_aside(inp, phases, reason, stamp):
     return moved
 
 
+def split_aborted(inp, st, keep):
+    """RSM2-4: files under rsm/aborted/<st>/ to commit (reason.txt and those whose original path is in <keep>) and the
+    others (left uncommitted, named in attempts.csv)."""
+    ours, stray = [], []
+    base = f'aborted/{st}/'
+    for p in files_under(inp.out, [f'aborted/{st}']) if os.path.isdir(os.path.join(inp.out, 'aborted', st)) else []:
+        orig = p[len(base):]
+        (ours if orig == 'reason.txt' or orig in keep else stray).append(p)
+    return ours, stray
+
+
 def tracked_rel(inp, rels):
     """Repository paths of rsm-relative paths."""
     return [rel(inp, r) for r in rels]
@@ -697,10 +744,19 @@ def abort_previous(inp, phase, reason, script):
                                  time=time.strftime('%Y-%m-%d %H:%M:%S'), script_commit=script['commit'],
                                  script_dirty=script['dirty'], status='moved',
                                  reason=f'{moved} -> aborted/{st}/: {reason}'))
-    paths = [rel(inp, 'attempts.csv')] + tracked_rel(inp, files_under(inp.out, [f'aborted/{st}'])
-                                                          if os.path.isdir(os.path.join(inp.out, 'aborted', st))
-                                                          else []) + removed_paths(inp, moved)
-    commit_paths(inp.repo, paths, f'fw: rsm_compare abort {phase} {inp.rel}: {reason}'[:200])
+    removed = removed_paths(inp, moved)
+    # RSM2-4: commit the moved copies of committed files (and reason.txt); a partial file of a run that died is kept
+    # under aborted/ uncommitted and named in attempts.csv
+    keep = {p[len(inp.rel_out) + 1:] for p in removed}
+    ours, stray = split_aborted(inp, st, keep)
+    if stray:
+        append_attempt(inp, dict(attempt_id=f'M{st}', chain_id='', kind='note', phase=','.join(later),
+                                 time=time.strftime('%Y-%m-%d %H:%M:%S'), script_commit=script['commit'],
+                                 script_dirty=script['dirty'], status='', reason=f'uncommitted under aborted/: {stray}'))
+    if attempts_state(inp) in ('same', 'none') and not ours and not removed:
+        return                                              # nothing moved, nothing closed: nothing to commit
+    commit_paths(inp.repo, [rel(inp, 'attempts.csv')] + tracked_rel(inp, ours) + removed,
+                 f'fw: rsm_compare abort {phase} {inp.rel}: {reason}'[:200])
 
 
 def attempts_state(inp):
@@ -718,6 +774,11 @@ def attempts_state(inp):
 
 
 def require_attempts(inp, allow_appended=False):
+    prev = ''
+    for c, text in attempts_versions(inp):                 # RSM2-2: every committed version extends the one before
+        if text is None or not text.startswith(prev):
+            raise Stop(f'rsm/attempts.csv history: commit {c[:10]} altered or removed earlier rows (12.7: append only)')
+        prev = text
     st = attempts_state(inp)
     if st == 'changed':
         raise Stop('rsm/attempts.csv: a committed row was altered or removed (12.7: append only)')
@@ -979,14 +1040,13 @@ def confirm(inp, ctrl, cand_path, work, cache, log):
 
 MU_LABELS = dict(pass_='robust', violation_observed='not robust over mu',
                  run_error_excluded='undetermined (run_error or penalised quantity at the low / high mu)',
-                 inconclusive='not robust over mu (inconclusive or track_err only: the g1 convention, not observed)')
+                 inconclusive='inconclusive over mu (inconclusive or track_err only: g1 convention, not observed)')
 
 
 def with_flags(r):
     """A run row with its pen_* flags: as stored, or from s04_ga.run_values when the file has none (three_mu.csv)."""
-    if all(('pen_' + k) in r for k in s4.PEN_KEYS):
-        return r
-    return dict(r, **s4.run_values(r)[1])
+    computed = s4.run_values(r)[1]
+    return dict(r, **{k: v for k, v in computed.items() if k not in r})     # RSM2-5: a stored flag is kept
 
 
 def mu_label_from_rows(rows_by_mu):
@@ -1382,21 +1442,61 @@ def write_rsm_meta(inp, phase, info):
 def run_phase(phase, s04_dir, dll, abort_reason=None, log=print):
     inp = Inputs(s04_dir, dll)
     os.makedirs(inp.out, exist_ok=True)
+    refuse_link(inp.out)
     lock_file = os.path.join(inp.out, RUN_LOCK)
+    refuse_link(lock_file)
+    if os.path.exists(lock_file) and abort_reason:          # RSM2-6: a lock left by a run that died
+        clear_stale_lock(lock_file)
     try:                                                    # RSM-14: one run at a time on this folder
         fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
-        raise Stop(f'rsm/{RUN_LOCK} exists: another rsm_compare run is on this folder (if none runs, delete the file '
-                   f'and use --abort-previous)') from None
-    os.write(fd, f'{os.getpid()} {time.strftime("%Y-%m-%d %H:%M:%S")}\n'.encode())
-    os.close(fd)
+        raise Stop(f'rsm/{RUN_LOCK} exists: another rsm_compare run is on this folder (a run that died: run again '
+                   f'with --abort-previous "<reason>")') from None
     try:
+        try:
+            os.write(fd, f'{os.getpid()} {time.strftime("%Y-%m-%d %H:%M:%S")}\n'.encode())
+        finally:
+            os.close(fd)
         return _run_phase(inp, phase, abort_reason, log)
     finally:
         os.remove(lock_file)
 
 
+def pid_alive(pid):
+    """Is process <pid> running? Windows: OpenProcess + GetExitCodeProcess (no signal is sent); POSIX: kill 0."""
+    if os.name == 'nt':
+        import ctypes
+        k = ctypes.windll.kernel32
+        h = k.OpenProcess(0x1000, False, pid)              # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return k.GetLastError() == 5                       # access denied: it exists
+        try:
+            code = ctypes.c_ulong()
+            return bool(k.GetExitCodeProcess(h, ctypes.byref(code))) and code.value == 259   # STILL_ACTIVE
+        finally:
+            k.CloseHandle(h)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def clear_stale_lock(lock_file):
+    """--abort-previous: remove the lock when the process it names is not running; else stop."""
+    try:
+        pid = int(open(lock_file, encoding='utf-8').read().split()[0])
+    except (OSError, ValueError, IndexError):
+        raise Stop(f'rsm/{RUN_LOCK} cannot be read: check no rsm_compare runs, then delete it by hand') from None
+    if pid_alive(pid):
+        raise Stop(f'rsm/{RUN_LOCK}: process {pid} is still running')
+    os.remove(lock_file)
+
+
 def _run_phase(inp, phase, abort_reason, log):
+    inp.check_links()                                       # RSM2-1: before attempts.csv, locks, meta are opened
     script = s3.git_state(inp.hil)
     if not inp.tool_check and script['dirty']:
         raise Stop(f'the script tree is not clean ({script["modified"][:5]}): 12.7 locks a clean commit')
@@ -1465,13 +1565,14 @@ def _run_phase(inp, phase, abort_reason, log):
     except (Stop, SystemExit, Exception) as exc:            # noqa: BLE001: every failure closes the attempt
         reason = f'{type(exc).__name__}: {exc}'
         st = stamp()
+        mine = {os.path.relpath(p, inp.out).replace(os.sep, '/') for p in WRITTEN}
         moved = move_aside(inp, [phase], reason, st)
+        ours, stray = split_aborted(inp, st, mine)
         append_attempt(inp, dict(start, kind='end', time=time.strftime('%Y-%m-%d %H:%M:%S'), status='stopped',
-                                 reason=reason[:2000], inputs_sha256=''))
-        paths = [rel(inp, 'attempts.csv')]
-        if moved:
-            paths += tracked_rel(inp, files_under(inp.out, [f'aborted/{st}']))
-        commit_paths(inp.repo, paths, f'fw: rsm_compare stopped {phase} {inp.rel} ({aid})')
+                                 reason=(reason + (f'; not committed (not written by this run): {stray}' if stray
+                                                   else ''))[:2000], inputs_sha256=''))
+        commit_paths(inp.repo, [rel(inp, 'attempts.csv')] + tracked_rel(inp, ours),
+                     f'fw: rsm_compare stopped {phase} {inp.rel} ({aid})')
         raise
     append_attempt(inp, dict(start, kind='end', time=time.strftime('%Y-%m-%d %H:%M:%S'), status='done',
                              reason='', inputs_sha256=json.dumps(ctx['inputs'])))
