@@ -1150,6 +1150,32 @@ def test_cs2_10_not_converging_predicts_from_the_final_set():
     assert not np.any(~sus & (np.nan_to_num(pred, nan=0.0) > 0.02))
 
 
+def test_cs2_10_union_of_the_last_two_passes_is_grown_until_closed():
+    """A 14-sample series (found by search, 17/11) that does not converge: the union of the last two passes {3, 4, 5, 7}
+    leaves sample 9 predicted 0.03 m off from the samples outside it, so the set grows to {3, 4, 5, 7, 9}; starting
+    from the last pass alone would end on {3, 4, 5, 6, 7, 9} (mutants 'no growth', 'last pass only' of 17/11)."""
+    x = np.array([-0.0001, 0.0306, 0.0294, -0.0004, 0.031, -0.0003, 0.0297, 0.0308, 0.0002, 0.0, 0.0302, 0.0287,
+                  0.0304, 0.0613])
+    t = np.arange(len(x)) / 60.0
+    sus, pred, passes, conv = cs.mark_suspects(t, x, np.zeros(len(x)), 0.02, 2, 3)
+    assert not conv and np.nonzero(sus)[0].tolist() == [3, 4, 5, 7, 9]
+    assert not np.any(~sus & (np.nan_to_num(pred, nan=0.0) > 0.02))
+    assert np.allclose(pred, _ref_pred(t, x, np.zeros(len(x)), sus, 2, 3), equal_nan=True, atol=1e-12)
+
+
+def test_cs2_3_g1_does_not_read_the_speed_column(tmp_path):
+    """CS2-3 (mutant 17/11 'way 1 from the CSV speed' survived): the speed and wz columns of frames.csv replaced by
+    1 m/s and 0: both t_done stay those of the poses (the column is reported only)."""
+    base, _ = run(tmp_path)
+    fr = make_frames('O1-F05')
+    for r in fr:
+        r['speed'], r['wz'] = 1.0, 0.0
+    out, rows = run(tmp_path, frames=fr)
+    assert base['gate_v3']['g1']['t_done'][0] is not None
+    assert out['gate_v3']['g1']['t_done'] == base['gate_v3']['g1']['t_done']
+    assert all(r['speed_csv'] == 1.0 for r in rows)
+
+
 def test_cs2_10_suspect_without_a_prediction_is_undefined(tmp_path, monkeypatch):
     """A suspect frame with no supported prediction: U_p,k not finite, G2-G4 of the frame undefined (n_undef), even
     when the C8 check of the assumption held (the old code used U_p alone)."""
