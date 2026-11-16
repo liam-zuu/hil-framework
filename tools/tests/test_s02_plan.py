@@ -205,7 +205,8 @@ def test_main_never_overwrites(tmp_path):
 
 
 def test_metrics_skip_battery_rerun_and_replaced(tmp_path, monkeypatch):
-    """S2P1-9: tools/s02_metrics.py does not score the rows of a battery_rerun block nor replaced runs."""
+    """S2P1-9: tools/s02_metrics.py does not score the rows of a battery_rerun block nor replaced runs (v3: they keep
+    a status line)."""
     import s02_metrics
     (tmp_path / 'runs.csv').write_text(
         'run_id,platform,controller,test_id,speed_mps,rep,file,aborted,block_status,result\n'
@@ -213,9 +214,11 @@ def test_metrics_skip_battery_rerun_and_replaced(tmp_path, monkeypatch):
         'b,real,PID,A-L2,0.5,1,b.csv,,,replaced\n'
         'c,real,PID,A-L2,0.5,1,c.csv,,,completed\n', encoding='utf-8')
     monkeypatch.setattr(s02_metrics, 'load_log', lambda p: {})
-    monkeypatch.setattr(s02_metrics, 'compute', lambda log, tid: {'e_vx': 0.0})
+    monkeypatch.setattr(s02_metrics, 'score_run', lambda log, tid, *a, **k: {'e_vx': 0.0})
     out = s02_metrics.run_dir_metrics(str(tmp_path))
-    assert [o['run_id'] for o in out] == ['c']
+    # CODE_S02 v3 (S02 v1.13 P2-6): every row has a line, only c is scored
+    assert [(o['run_id'], o['status']) for o in out] == [('a', 'battery_rerun'), ('b', 'replaced'), ('c', 'ok')]
+    assert 'e_vx' not in out[0] and 'e_vx' not in out[1] and out[2]['e_vx'] == 0.0
 
 
 def test_battery_rerun_needs_one_whole_block():
