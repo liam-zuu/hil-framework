@@ -512,6 +512,24 @@ def test_q1_lost_runs_do_not_count_and_every_level_is_needed(demo_ds, tmp_path):
     assert s['stop_reason_check'] == 'mismatch'
 
 
+def test_q1c1_a_run_lost_from_the_start_is_not_one_of_the_two(demo_ds, tmp_path):
+    # Q1C-1 (Codex Q1 round): one dat after so-h and one run logged lost, gate O1-F05 only: mismatch
+    _lost_confirm(demo_ds, 'K1')
+    uids = _confirm_block(demo_ds, tmp_path, 'K1', ('dat',))
+    rl.so_h(demo_ds, uids[0], _score_final(demo_ds, uids[0], 0.5))
+    _freeze_ok(demo_ds, tmp_path)
+    assert _summary_with_levels(demo_ds, tmp_path, ['O1-F05'])['A-LADRC']['stop_reason_check'] == 'mismatch'
+
+
+def test_q1c1_a_run_lost_at_so_h_is_not_one_of_the_two(demo_ds, tmp_path):
+    # Q1C-1: two provisional dat, one became hong_he_do at so-h, gate O1-F05 only: mismatch
+    uids = _confirm_block(demo_ds, tmp_path, 'K1', ('dat', 'dat'))
+    rl.so_h(demo_ds, uids[0], _score_final(demo_ds, uids[0], 3.0, 'hong_he_do'))
+    rl.so_h(demo_ds, uids[1], _score_final(demo_ds, uids[1], 0.5))
+    _freeze_ok(demo_ds, tmp_path)
+    assert _summary_with_levels(demo_ds, tmp_path, ['O1-F05'])['A-LADRC']['stop_reason_check'] == 'mismatch'
+
+
 def test_c9d4_summary_mismatch_for_a_freeze_row_the_log_does_not_back(demo_ds, tmp_path):
     _confirm_block(demo_ds, tmp_path, 'K1', ('dat',))
     gf = fr.write_gain_file(str(tmp_path / 'FAKE_gain_L.json'), GAIN)
