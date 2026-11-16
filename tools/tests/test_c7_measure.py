@@ -1,5 +1,6 @@
 """Tests for tools/c7_measure.py on SYNTHETIC clips rendered here from a known camera (NOT a measurement).
 Floor marks ID 1-24 at the print-CSV centres, check tags ID 25-33, car tag ID 0 on a plate at height h."""
+import json
 import math
 import os
 import sys
@@ -356,3 +357,74 @@ def test_regate_cli_on_an_old_frames_file(tmp_path):
     assert all(r['valid'] for r in rows) and all(r['res_sim_m'] < 1e-4 for r in rows)
     t = json.loads((tmp_path / 'new' / 'track.json').read_text(encoding='utf-8'))
     assert t['n_valid'] == 40 and t['regate_of_sha256'] == cm.sha256(str(tmp_path / 'old.csv'))
+
+
+# ---------------------------------------------------------------- Codex vong 1 (16/11): CS1-13, CS1-15, CS1-17
+def _cs1_rows(n=20, res_m=0.0002, res_sim_m=0.0002, scale=1.0):
+    return [dict(idx=k, t_s=k / 60.0, n_marks=24, rms_px=0.3, car_seen=True, res_m=res_m, res_sim_m=res_sim_m,
+                 scale=scale, x=0.001 * k, y=0.0, psi=0.0) for k in range(n)]
+
+
+def test_cs1_13_shift_is_the_length_of_the_median_vector():
+    """O1 3.5: 'do lon cua trung vi vec-to dich tam': 8 shifts of 13 px in four directions have a median vector 0
+    (the old median of the lengths gave 13 px and a bumped camera)."""
+    v = [(13, 0), (-13, 0), (0, 13), (0, -13)] * 2
+    sh, mag = cm.shift_of(v)
+    assert sh == pytest.approx(0.0) and mag == pytest.approx(13.0)
+    sh, mag = cm.shift_of([(3, 4)] * 5)
+    assert sh == pytest.approx(5.0) and mag == pytest.approx(5.0)
+
+
+def test_cs1_15_gates_from_the_constants():
+    rows = _cs1_rows(res_sim_m=0.0012)
+    cm.apply_gates(rows, 0.3)
+    assert all(r['valid'] for r in rows)
+    g = dict(cm.DEFAULT_GATES, car_res_sim_m=0.001)
+    cm.apply_gates(rows, 0.3, g)
+    assert not any(r['valid'] for r in rows) and all('xe_meo' in r['why'] for r in rows)
+    with pytest.raises(ValueError):
+        cm.check_gates(dict(cm.DEFAULT_GATES, scale_min=2.5))
+
+
+def test_cs1_17_regate_rounding_that_can_flip_the_shape_gate():
+    """Codex CS1-17: side 0.1444 m, scale 0.976, true residual with scale 1.5001 mm -> rigid 2.873237145 mm, written
+    0.002873 in an old frames.csv: the value rebuilt from it (1.4996 mm) passes, the true one fails; the rounding
+    interval straddles 1.5 mm, so regate cannot decide: 'can_track_lai'."""
+    side = 0.1444
+    rig = math.sqrt(0.0015001 ** 2 + ((1 - 0.976) * side) ** 2 / 2)
+    assert rig == pytest.approx(0.002873237145, abs=1e-12)
+    rows = _cs1_rows(res_m=round(rig, 6), res_sim_m=float('nan'), scale=0.976)
+    cm.regate(rows, dict(car_side_m=side, rms_px_H=0.3))
+    assert all(r['why'] == ['can_track_lai'] for r in rows) and all(r['res_sim_m'] < 0.0015 for r in rows)
+    rows = _cs1_rows(res_m=0.0005, res_sim_m=float('nan'), scale=0.999)        # far from the threshold
+    cm.regate(rows, dict(car_side_m=side, rms_px_H=0.3))
+    assert all(r['valid'] for r in rows)
+
+
+def test_cs1_17_regate_scale_ratio_on_the_threshold():
+    rows = _cs1_rows(scale=1.0)
+    rows[10]['scale'] = 1.005                            # exactly 0.5 % from the median: rounding decides
+    cm.regate(rows, dict(car_side_m=0.1444, rms_px_H=0.3))
+    assert rows[10]['why'] == ['can_track_lai'] and rows[9]['valid']
+    rows = _cs1_rows(scale=1.0)
+    rows[10]['scale'] = 1.006
+    cm.regate(rows, dict(car_side_m=0.1444, rms_px_H=0.3))
+    assert rows[10]['why'] == ['ti_le']
+
+
+def test_cs1_15_17_regate_cli_with_constants(tmp_path):
+    rows = _cs1_rows()
+    for r in rows:
+        r.update(why=[], valid=True, shift_px=0.2, cam_z=2.6, tag_x=0.0, tag_y=0.0, scale_ref=1.0, row_px=1.0,
+                 vx=0.0, vy=0.0, wz=0.0, speed=0.0)
+    cm.write_frames(tmp_path / 'frames.csv', rows)
+    head = (tmp_path / 'frames.csv').read_text(encoding='utf-8').splitlines()
+    assert head[1].split(',')[cm.FRAME_COLS.index('res_m')] == '0.0002000000'            # 10 decimals now
+    (tmp_path / 'session.json').write_text(json.dumps(dict(car_side_m=0.1444, rms_px_H=0.3)), encoding='utf-8')
+    hs = dict(version='c7_hang_so_v1', trang_thai='de_xuat', cong_khung=dict(cm.DEFAULT_GATES, car_res_sim_m=0.0001))
+    (tmp_path / 'hs.json').write_text(json.dumps(hs), encoding='utf-8')
+    assert cm.main(['regate', '--frames', str(tmp_path / 'frames.csv'), '--session', str(tmp_path / 'session.json'),
+                    '--hang-so', str(tmp_path / 'hs.json'), '--out', str(tmp_path / 'out')]) == 0
+    info = json.loads((tmp_path / 'out' / 'track.json').read_text(encoding='utf-8'))
+    assert info['gates']['car_res_sim_m'] == 0.0001 and info['gates']['hang_so']['file'] == 'hs.json'
+    assert info['n_valid'] == 0 and info['shift_kind'] == 'median_magnitude'      # no shift_mag_px column written

@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+import c7_measure as cm  # noqa: E402
 import c7_score as cs  # noqa: E402
 import rq3_log  # noqa: E402
 
@@ -22,19 +23,24 @@ YAW0 = 0.5        # rad, IMU yaw = floor yaw - YAW0
 
 
 @pytest.fixture(autouse=True)
-def cmd_ok(monkeypatch):
-    """o1_cmd_path.analyse stubbed: no flag (tests that need a flag set CMD_FLAGS)."""
-    state = dict(flags=[])
+def cmd_ok(monkeypatch, request):
+    """o1_cmd_path.analyse stubbed: no flag (tests that need a flag set state['flags'], values state['cond']).
+    Tests named test_real_cmd_* run the real o1_cmd_path (Codex 16/11: the stub covered every scorer test)."""
+    state = dict(flags=[], cond={})
+    if request.node.name.startswith('test_real_cmd'):
+        return state
 
     def fake(rows, task, ev, has_age, sched, bao, ok):
-        return dict(flags=list(state['flags']), notes=[], cond2={}, cond3={}, cond4={})
+        c = dict(cond2={}, cond3={}, cond4={})
+        c.update(state['cond'])
+        return dict(flags=list(state['flags']), notes=[], **c)
     monkeypatch.setattr(cs.ocp, 'analyse', fake)
     return state
 
 
 def hs_file(tmp_path, **over):
     d = dict(version='c7_hang_so_v1', trang_thai='de_xuat', nguon='test', U_p_m=0.005, U_psi_deg=2.0,
-             u_t_ghep_s=0.005, e_max=0.0002, t_trong_s=0.10, t_mat_s=0.68, bump_px=12.0, drift_px=1.5, pred_m=0.02,
+             u_t_ghep_s=0.005, troi_ppm=200.0, t_trong_s=0.10, t_mat_s=0.68, bump_px=12.0, drift_px=1.5, pred_m=0.02,
              pred_half=6, pred_min=4, yaw_nghi_deg=3.0, v_d=0.01,
              imu=dict(period_s=0.05, tau_hat_s=0.0, s_plus=0.0, s_minus=0.0, j_lim_s=0.005, h_lim_s=0.105, pre_s=3.0,
                       wz_still=0.05, n_min=30,
@@ -75,10 +81,11 @@ def true_pose(task, k_start, tk, lateral=0.0, lag=0.0, back=None):
 
 
 def make_frames(task, lateral=0.0, k_start=(0.0, 0.0, 0.0), pre=4.0, post=3.0, drop=(), shift=None, lag=0.0,
-                jump=None, back=None, lat_fn=None):
+                jump=None, back=None, lat_fn=None, measured=True):
     """Car on the command (lateral offset along the lane normal, delayed by lag), still at the end after T_cmd.
     drop: command-time spans with no valid frame; jump: {frame index: (dx, dy)} added to the measured centre;
-    lat_fn(t): extra lateral offset."""
+    lat_fn(t): extra lateral offset. measured: the gates and speeds by c7_measure.apply_gates AFTER the jumps, as the
+    real chain (Codex 16/11: speeds built before the jumps hid CS1-9); False: the true speeds (0 after T_cmd)."""
     lane = lane_of(task, k_start)
     t = np.arange(-pre, lane.Tcmd + post, 1.0 / FPS)
     P = np.array([true_pose(task, k_start, tk, lateral + (lat_fn(tk) if lat_fn else 0.0), lag, back) for tk in t])
@@ -95,7 +102,10 @@ def make_frames(task, lateral=0.0, k_start=(0.0, 0.0, 0.0), pre=4.0, post=3.0, d
                          rms_px=0.3, shift_px=(shift.get(k, 0.2) if shift else 0.2), cam_z=2.6, car_seen=ok,
                          x=xs[k], y=ys[k], psi=cs.wrap(ps[k]), tag_x=xs[k], tag_y=ys[k], res_m=0.0002,
                          res_sim_m=0.0002, scale=1.0, scale_ref=1.0, row_px=500.0, vx=vx[k], vy=vy[k], wz=wz[k],
-                         speed=0.0 if tk > lane.Tcmd else math.hypot(vx[k], vy[k])))
+                         speed=0.0 if tk > lane.Tcmd else math.hypot(vx[k], vy[k]),
+                         shift_mag_px=(shift.get(k, 0.2) if shift else 0.2)))
+    if measured:
+        cm.apply_gates(rows, 0.3)
     return rows
 
 
@@ -105,11 +115,16 @@ LOG_COLS = ('timestamp_us', 'log_seq', 'tick', 'motor_on', 'run_active', 'pos_re
 
 
 def make_log(path, task, k_start=(0.0, 0.0, 0.0), pre=6.0, post=4.0, lost_before_edge=False, dup=0,
-             segments=True, yaw_err=None, no_imu=False, reset_at=None):
+             segments=True, yaw_err=None, no_imu=False, reset_at=None, cmd_real=False):
     """agv_logger-like CSV at path (100 Hz lines, IMU and gyro reports every 50 ms). yaw_err(t) [rad] added to the
-    IMU yaw; dup: that many identical lines repeated (marked in <path>.segments.csv when segments)."""
+    IMU yaw; dup: that many identical lines repeated (marked in <path>.segments.csv when segments). cmd_real: the
+    command path as the firmware logs it for an on-time sender (packets at 50 Hz from t = 0 through the zero tail,
+    traj_age_ms from them, run_active while a packet is younger than 200 ms, the command pose = the ideal schedule
+    in the firmware frame), plus <path>.events.txt with '#us' / '#us_end' and <path>_sender.txt with '#test_end'."""
     lane = lane_of(task, k_start)
     lines, k = [], 0
+    ct = cs.ocp.Task(task, True) if cmd_real else None
+    n_pk = int(math.ceil((ct.duration + cs.ocp.o1_tasks.O1_TAIL_S) * 50 - 1e-9)) if cmd_real else 0
     for tk in np.arange(-pre, lane.Tcmd + post, 0.01):
         x, y, ps = true_pose(task, k_start, tk)
         x2, y2, ps2 = true_pose(task, k_start, tk + 0.005)
@@ -124,12 +139,20 @@ def make_log(path, task, k_start=(0.0, 0.0, 0.0), pre=6.0, post=4.0, lost_before
             bvx, bvy = math.cos(h) * gx + math.sin(h) * gy, -math.sin(h) * gx + math.cos(h) * gy
         run = tk >= -1e-9
         cmd = run and tk <= lane.Tcmd
+        pxr, pyr, tage = '0', '0', '5'
+        if cmd_real:
+            j = min(int(math.floor((tk + 0.001) * 50 + 1e-9)), n_pk - 1)       # last packet arrived (k/50 - 1 ms)
+            tage = '-1' if j < 0 else str(int((tk - (j / 50 - 0.001)) * 1000))
+            run = j >= 0 and int(tage) < 200
+            if run:
+                ix, iy = ct.ideal(max(tk, 0.0))
+                pxr, pyr = f'{ix:.4f}', f'{iy:.4f}'
         rep = k // 5
         age = (k % 5) * 10
         yaw = cs.wrap(ps - YAW0 + (yaw_err(tk) if yaw_err else 0.0))
         lines.append(dict(timestamp_us=str(int(round((tk + T0) * 1e6))), log_seq=str(k), tick=str(k), motor_on='1',
-                          run_active='1' if run else '0', pos_reset_n='1', pos_x_ref='0', pos_y_ref='0',
-                          traj_age_ms='5', sp_vx=f'{bvx if cmd else 0.0:.5f}', sp_vy=f'{bvy if cmd else 0.0:.5f}',
+                          run_active='1' if run else '0', pos_reset_n='1', pos_x_ref=pxr, pos_y_ref=pyr,
+                          traj_age_ms=tage, sp_vx=f'{bvx if cmd else 0.0:.5f}', sp_vy=f'{bvy if cmd else 0.0:.5f}',
                           sp_wz='0', vx=f'{bvx:.5f}', vy=f'{bvy:.5f}', wz=f'{wzv:.5f}', yaw_rad=f'{yaw:.6f}',
                           rv_n='1' if no_imu else str(rep), age_r_ms=str(age), gz=f'{wzv:.5f}', gyro_n=str(rep),
                           age_g_ms=str(age), reset_n='4' if reset_at is not None and tk >= reset_at else '3',
@@ -156,6 +179,17 @@ def make_log(path, task, k_start=(0.0, 0.0, 0.0), pre=6.0, post=4.0, lost_before
             w.writerow(['row', 'log_seq', 'timestamp_us', 'segment', 'status'])
             for i, (r, s) in enumerate(zip(out, seg), start=1):
                 w.writerow([i, r['log_seq'], r['timestamp_us'], 0, s])
+    if cmd_real:
+        seqs = [r['log_seq'] for r in lines]
+        with open(str(path) + '.events.txt', 'w', encoding='utf-8') as f:
+            f.write(f'#us,ev=start,boot=00000001,on=1,swb=0,first_seq={seqs[0]},line_drop=0\n'
+                    f'#us_end,boot=00000001,on=1,swb=0,changes=0,blk_ticks=0,cut_ticks=0,ticks={len(seqs)},'
+                    f'last_data_seq={seqs[-1]},line_drop=0\n')
+        with open(str(path) + '_sender.txt', 'w', encoding='utf-8') as f:
+            f.write(f'#test_start,test={task},t_epoch=1.000,iso=x,duration_s={ct.duration:g},send_hz=50\n'
+                    f'#test_end,test={task},t_epoch={1.0 + n_pk / 50:.3f},zeros={n_pk - ct.n_sched},'
+                    f'tail_planned={n_pk - ct.n_sched},sent={ct.n_sched},planned={ct.n_sched},complete=1,'
+                    f'sched_first_s=0.0,sched_last_s={(ct.n_sched - 1) / 50}\n')
     return str(path)
 
 
@@ -185,7 +219,9 @@ def test_on_lane_passes(tmp_path):
     assert abs(g['g1']['t_done'][0] - (out['T_cmd'] + 1.0)) < 0.05              # still for t_d after T_cmd
     assert out['e_perp_max'] < 1e-3 and out['yaw_check']['compared'] and out['yaw_check']['n_suspect'] == 0
     assert abs(out['yaw_check']['align_c_deg'] - math.degrees(YAW0)) < 0.1
-    assert out['n_suspect_pos'] == 0 and out['n_g4_formula'] == out['frames_window']
+    # frames whose projection sits on the window end cut at 0 or S (run start, the stop at the end) use J_k (CS1-3)
+    assert out['n_suspect_pos'] == 0 and 0.8 * out['frames_window'] < out['n_g4_formula'] < out['frames_window']
+    assert all(r['g4_formula'] == 0 for r in rows if r['at_end'])
     for k in ('e_theta_lane_max_deg', 'e_theta_cmd_max_deg', 'e_s_absmax', 'e_trk_max'):   # s05_final_table keys
         assert k in out
 
@@ -201,13 +237,13 @@ def test_lateral_offset_three_states(tmp_path, lat, want):
 def test_bounds_use_U_p_and_U_t(tmp_path):
     out, rows = run(tmp_path, frames=make_frames('O1-F05', lateral=0.03))
     g = gate_ok(out)
-    up = 0.005
-    assert abs(g['g2']['hi'] - g['g2']['q'] - up) < 1e-9 and abs(g['g2']['q'] - g['g2']['lo'] - up) < 1e-9
+    up, h = 0.005, lane_of('O1-F05').h
+    assert abs(g['g2']['hi'] - g['g2']['q'] - up) < 1e-9 and abs(g['g2']['q'] - g['g2']['lo'] - up - h / 2) < 1e-9
     vmax, wzmax = out['gate_v3']['v_cmd_max'], out['gate_v3']['wz_cmd_max']
     r = rows[100]
     assert abs((r['hi_g3'] - r['e_trk']) - (up + vmax * out['U_t_s'])) < 1e-9
     assert abs((r['hi_g5'] - abs(r['e_theta_cmd_deg'])) - math.degrees(math.radians(2.0) + wzmax * out['U_t_s'])) < 1e-9
-    assert out['U_t_parts']['drift_src'].startswith('e_max')                    # --offset-s given
+    assert out['U_t_parts']['drift_src'].startswith('troi_ppm')                 # --offset-s given
     assert abs(out['U_t_s'] - (0.005 + 0.0002 * out['t_deadline'] + 0.01)) < 1e-6
 
 
@@ -288,7 +324,9 @@ def test_jump_is_kept_as_position_suspect(tmp_path):
     # U_p,k 35 mm: G2 still dat, but G4 by the formula U_p,k + r_c (U_psi + 9.2 U_p,k) = 0.115 m > D (O1 3.5)
     g = out['gate_v3']
     assert g['g2']['state'] == 'dat' and g['g4']['state'] == 'chua_ket_luan' and out['outcome'] == 'chua_ket_luan'
-    assert abs((r['hi_g4'] - r['e_bao']) - (r['U_p_k'] + cs.R_C * (math.radians(2.0) + 9.2 * r['U_p_k']))) < 1e-9
+    h = lane.h                                         # grid slack of the figure 8 (CS1-2)
+    assert abs((r['hi_g4'] - r['e_bao']) - (r['U_p_k'] + cs.R_C * (math.radians(2.0) + 9.2 * r['U_p_k']
+                                                                   + cs.KAPPA_MAX * h / 2))) < 1e-9
 
 
 def test_suspect_does_not_push_progress(tmp_path):
@@ -316,12 +354,13 @@ def test_suspect_chain_longer_than_t_mat_is_tracking_error(tmp_path):
 
 def test_two_ways_of_using_suspects(tmp_path):
     """Blocks of 8 suspect frames every 0.4 s after T_cmd: way 1 completes, way 2 (suspects as gaps above t_trong)
-    never holds t_d: G1 chua_ket_luan, the common domain ends at way 1's t_done, the union at the deadline."""
+    never holds t_d: G1 chua_ket_luan, the common domain ends at way 1's t_done, the union at the deadline. True
+    speeds (measured=False): with the speeds of c7_measure the jumps also keep way 1 from holding t_d (CS1-9)."""
     lane = lane_of('O1-F05')
     t = np.arange(-4.0, lane.Tcmd + 3.0, 1.0 / FPS)
     jump = {k: (0.03, 0.0) for k, tk in enumerate(t)
             if tk > lane.Tcmd - 0.5 and ((tk - lane.Tcmd) % 0.4) < 8.5 / FPS}
-    out, _ = run(tmp_path, frames=make_frames('O1-F05', jump=jump), hs_kw=dict(pred_half=30))
+    out, _ = run(tmp_path, frames=make_frames('O1-F05', jump=jump, measured=False), hs_kw=dict(pred_half=30))
     g = gate_ok(out)
     td = g['g1']['t_done']
     assert td[0] is not None and td[1] is None and g['g1']['state'] == 'chua_ket_luan'
@@ -410,7 +449,7 @@ def test_offset_needs_a_reason(tmp_path):
 def test_clock_from_speed_matching(tmp_path):
     out, _ = run(tmp_path, offset_s=None, offset_reason='')
     assert out['offset_src'] == 'o1_time_sync' and abs(out['offset_s'] - OFFSET) < 0.01
-    assert out['U_t_parts']['drift_src'].startswith('C7b') and out['outcome'] == 'dat'
+    assert out['U_t_parts']['drift_src'].startswith('max(C7b') and out['outcome'] == 'dat'
 
 
 def test_late_car_misses_completion(tmp_path):
@@ -503,8 +542,415 @@ def test_g4_bounds_contain_every_true_pose(task, ks):
             r, a = upk * math.sqrt(rng.uniform()), rng.uniform(0, 2 * math.pi)
             xt, yt = x + r * math.cos(a), y + r * math.sin(a)
             pt = psi + rng.uniform(-ups, ups)
-            s_t, e_t, h_t, _ = lane.path.nearest(xt, yt, w_lo, w_hi)
+            if isinstance(lane, cs.KTask):                      # K: exact, heading of Polyline.head_at (CS1-1)
+                s_t, e_t, h_t = lane.poly.solutions(xt, yt, w_lo, w_hi)[0]
+            else:
+                s_t, e_t, h_t, _ = lane.path.nearest(xt, yt, w_lo, w_hi)
             psi0, al, bl = lane.nominal(h_t)
             th = cs.wrap(pt - h_t - psi0)
             g_true = e_t + al * abs(math.sin(th)) + bl * (abs(math.cos(th)) - 1)
-            assert lo - 2e-4 <= g_true <= hi + 2e-4, (lo, g_true, hi)
+            assert lo - 1e-9 <= g_true <= hi + 1e-9, (lo, g_true, hi)      # Codex: 2e-4 hid an 8.9 um miss
+
+
+# ---------------------------------------------------------------- Codex vong 1 (16/11, CS1-1..CS1-20), each failing on
+# the code before the fixes (hil 00121a4); review 03_CODE/docs/review/2026-11-16_Tham_dinh_c7_score_o1_vong1.md
+def frame_at(rows, t):
+    return min(range(len(rows)), key=lambda i: abs(rows[i]['t'] - t))
+
+
+def suspects_stub(monkeypatch, fn=None):
+    """mark_suspects replaced: the frames where fn(t) is true are the suspects (|p - p^| 0.03 m), none by default.
+    The real rule picks neighbours by index across a gap, so a frame next to a gap still gets a prediction."""
+    def fake(t, x, y, thr, half, nmin):
+        sus = np.array([bool(fn(v)) for v in t]) if fn else np.zeros(len(t), bool)
+        return sus, np.where(sus, 0.03, np.nan), 1, True
+    monkeypatch.setattr(cs, 'mark_suspects', fake)
+
+
+def k_true_g4(lane, xt, yt, pt, w_lo, w_hi):
+    """True G4 of a K pose by the exact projection of o1_gate_eval.Polyline (heading of head_at), not the scorer."""
+    _, e, h = lane.poly.solutions(xt, yt, w_lo, w_hi)[0]
+    psi0, al, bl = lane.nominal(h)
+    return cs.o1_gate_eval.g4_value(e, pt, h, psi0, al, bl)
+
+
+def test_cs1_1_k2_closing_corner_counterexample():
+    """Codex CS1-1: K2, window [3.8, 4], the centre projects onto the closing corner s = S: the true G4 takes the
+    outgoing side (side 0); the old bounds used the incoming side only (hi 0.09832 < true 0.10036)."""
+    lane = lane_of('O1-K2', (0.0, 0.0, 0.0))
+    x, y, psi = 0.05656854, -0.05656854, 0.127
+    lo, hi = cs.g4_bounds_jk(lane, x, y, psi, 3.8, 4.0, 0.0003, math.radians(0.2))
+    g_true = k_true_g4(lane, x, y, psi, 3.8, 4.0)
+    assert abs(g_true - 0.10036423) < 1e-6 and lo <= g_true <= hi
+    assert not cs.one_heading(lane, x, y, 3.8, 4.0, 0.0003)         # no U formula with a corner in J_k
+
+
+@pytest.mark.parametrize('w', [(0.7, 1.3), (1.8, 2.2), (2.6, 3.4), (3.6, 4.0), (3.9, 4.0)])
+def test_cs1_1_k2_bounds_near_every_corner(w):
+    """True poses within U_p, U_psi around each corner of K2 (interior corners and the closing one, window cut at S):
+    the exact true G4 (Polyline.head_at) lies in [lo, hi] (CS1-1)."""
+    lane = lane_of('O1-K2', (0.0, 0.0, 0.0))
+    rng = np.random.default_rng(11)
+    s_c = [c for c in lane.poly.cum if w[0] < c <= w[1] + 1e-9][0]
+    cx, cy, _ = lane.path.point_at(min(s_c, lane.S))
+    upk, ups = 0.004, math.radians(1.0)
+    for _ in range(60):
+        x, y = cx + rng.uniform(-0.03, 0.03), cy + rng.uniform(-0.03, 0.03)
+        psi = rng.uniform(-0.4, 0.4)
+        lo, hi = cs.g4_bounds_jk(lane, x, y, psi, w[0], w[1], upk, ups)
+        for _ in range(40):
+            r, a = upk * math.sqrt(rng.uniform()), rng.uniform(0, 2 * math.pi)
+            g = k_true_g4(lane, x + r * math.cos(a), y + r * math.sin(a), psi + rng.uniform(-ups, ups), w[0], w[1])
+            assert lo - 1e-9 <= g <= hi + 1e-9, (w, lo, g, hi)
+
+
+def test_cs1_2_fig8_window_end_between_grid_samples():
+    """Codex CS1-2: Path8 window [w_lo, w_lo + 0.1] with w_lo between two grid samples; the true G4 0.0999999 m was
+    below the old lo 0.1000088 (a certain violation that is not). The window ends are now in J_k; G2 lo - h/2."""
+    lane = lane_of('O1-F05')
+    w_lo = 0.00222366062
+    xm, ym = -0.07267391251, -0.07267363911
+    xt, yt, pt = -0.06913837205, -0.06913811176, 0.78539630914
+    lo, hi = cs.g4_bounds_jk(lane, xm, ym, pt, w_lo, w_lo + 0.1, 0.005, math.radians(2.0))
+    ex, ey = np.interp(w_lo, lane.path.s, lane.path.x), np.interp(w_lo, lane.path.s, lane.path.y)
+    e_true = math.hypot(ex - xt, ey - yt)                 # the nearest lane point of the true centre is the window end
+    assert abs(e_true - 0.0999999) < 1e-6 and lo <= e_true <= hi
+    _, e_grid, _ = lane.project(xm, ym, w_lo, w_lo + 0.1)
+    assert e_grid <= math.hypot(xm - ex, ym - ey) + 1e-12      # the window end is a candidate of e_perp
+    assert e_grid - 0.005 - lane.h / 2 <= e_true              # G2 lo of the scorer
+
+
+def test_cs1_3_at_end_on_the_window_cut_at_zero():
+    """SC-4: a projection on s = 0 (window cut at 0) is at a window end: no U formula for G4 (CS1-3)."""
+    lane = lane_of('O1-F05')
+    tr = cs.run_tracker(np.array([0.01]), np.array([0.0]), np.array([0.0]), lane, np.array([True]), 0.68, 0.0)
+    assert tr[0]['s_perp'] == 0.0 and tr[0]['at_end']
+
+
+def _sync_fake(lane, offset_used, rate, short=False):
+    from o1_time_sync import SyncResult
+    c0, c1 = -0.5, lane.Tcmd + 0.5                         # C7b window, command time
+    cmid = 0.5 * (c0 + c1)
+    third = (c1 - c0) / 3.0
+    ds = OFFSET + rate * (c0 + third / 2 - cmid)
+    de = OFFSET + rate * (c1 - third / 2 - cmid)
+    if short:
+        ds = de = float('nan')
+    return SyncResult(offset_used, 0.99, ds, 0.99, de, 0.99, de - ds, OFFSET, (c0 + T0 - OFFSET, c1 + T0 - OFFSET),
+                      500, short), cmid
+
+
+@pytest.mark.parametrize('extra', [0.0, 0.002])
+def test_cs1_4_drift_covers_the_whole_window_to_the_deadline(tmp_path, monkeypatch, extra):
+    """Codex CS1-4: linear drift 1 ms/s; the old term (|end - start| / 2 x t_deadline / T_cmd) was below the offset
+    error at the deadline; the offset used may also differ from the mean of the thirds (extra)."""
+    lane = lane_of('O1-F05')
+    rate = 1e-3
+    sync, cmid = _sync_fake(lane, OFFSET + extra, rate)
+    monkeypatch.setattr(cs, 'clock_match', lambda frames, rows, task: (sync, None))
+    out, _ = run(tmp_path, offset_s=None, offset_reason='', hs_kw=dict(troi_ppm=0.0))
+    dl = out['t_deadline']
+    worst = max(abs(OFFSET + rate * (t - cmid) - (OFFSET + extra)) for t in np.linspace(0.0, dl, 2001))
+    assert out['U_t_parts']['drift_s'] >= worst - 1e-12, (out['U_t_parts'], worst)
+
+
+def test_cs1_4_troi_ppm_is_a_floor_of_the_measured_rate(tmp_path, monkeypatch):
+    lane = lane_of('O1-F05')
+    sync, cmid = _sync_fake(lane, OFFSET, 0.0)
+    monkeypatch.setattr(cs, 'clock_match', lambda frames, rows, task: (sync, None))
+    out, _ = run(tmp_path, offset_s=None, offset_reason='', hs_kw=dict(troi_ppm=100.0))
+    far = max(cmid, out['t_deadline'] - cmid)
+    assert abs(out['U_t_parts']['drift_s'] - 100e-6 * far) < 1e-12
+
+
+def test_cs1_5_tick_bound_over_lost_lines_and_window_ends():
+    """Codex CS1-5: seq 101 lost hides a 25 ms tick; the pair 100 -> 102 bounds it; pairs across the window ends
+    count; a log that does not reach both ends gives no finite bound."""
+    rows = [dict(_seq=s, _t=int(round(t * 1e6))) for s, t in ((98, 0.985), (99, 0.995), (100, 1.000), (102, 1.035),
+                                                              (103, 1.045), (104, 1.055))]
+    assert cs.tick_max_s(rows, 1.000e6, 1.040e6) == pytest.approx(0.035)
+    rows2 = [dict(_seq=s, _t=int(round(t * 1e6))) for s, t in ((1, 0.95), (2, 1.01), (3, 1.02), (4, 1.09))]
+    assert cs.tick_max_s(rows2, 1.0e6, 1.05e6) == pytest.approx(0.07)     # both window ends crossed
+    assert math.isinf(cs.tick_max_s(rows, 1.000e6, 1.2e6)) and math.isinf(cs.tick_max_s(rows, 0.9e6, 1.04e6))
+
+
+def test_cs1_6_k1_with_a_short_c7b_window_scores(tmp_path):
+    """Codex CS1-6: K1 (5 s) gives a short C7b window (no thirds): the old U_t was NaN and the scorer raised."""
+    ks = (0.3, -0.4, math.radians(30.0))
+    out, _ = run(tmp_path, 'O1-K1', frames=make_frames('O1-K1', k_start=ks), k_start=ks, allow_final_set=True,
+                 offset_s=None, offset_reason='')
+    gate_ok(out)
+    assert out['sync']['short'] and 'short' in out['U_t_parts']['drift_src'] and math.isfinite(out['U_t_s'])
+    assert out['outcome'] == 'dat'
+
+
+def test_cs1_6_cli_any_error_is_exit_2(tmp_path, monkeypatch, capsys):
+    def boom(*a, **k):
+        raise RuntimeError('bug')
+    monkeypatch.setattr(cs, 'score', boom)
+    cm.write_frames(tmp_path / 'frames.csv', make_frames('O1-F05'))
+    hs_file(tmp_path)
+    args = ['--frames', str(tmp_path / 'frames.csv'), '--esp32', 'x.csv', '--task', 'O1-F05', '--hang-so',
+            str(tmp_path / 'hang_so.json')]
+    assert cs.main(args) == 2 and '#ket_qua,ma=2' in capsys.readouterr().out
+
+
+def test_cs1_7_tracking_error_after_the_run_window_closed(tmp_path):
+    """Codex CS1-7: done at T_cmd + 1 s, then 0.8 s without frames: the frame caught after it is a tracking error
+    OUTSIDE the union domain and does not spoil the run."""
+    lane = lane_of('O1-F05')
+    out, _ = run(tmp_path, frames=make_frames('O1-F05', drop=[(lane.Tcmd + 1.1, lane.Tcmd + 1.9)]))
+    gate_ok(out)
+    assert out['outcome'] == 'dat' and out['t_first_track_err'] is None and out['t1'] is None
+
+
+def test_cs1_8_tracking_error_on_the_frame_that_starts_a_long_gap(tmp_path, monkeypatch):
+    """Codex CS1-8: the frame at t = 5 s is a tracking error (beyond the reopened window; not a suspect here, stub)
+    AND the last frame before a 0.3 s gap; its own lo exceeds D. The error wins: no violation before t1, the run is
+    lost to the measurement system (the old code took the frame as 'before t1': khong_dat)."""
+    suspects_stub(monkeypatch)
+    lane = lane_of('O1-F05')
+    k = (4 + 5) * 60
+    s5, x5, y5, _ = lane.command(5.0)
+    p = lane.path
+    xa, ya = np.interp(s5 + 1.6, p.s, p.x), np.interp(s5 + 1.6, p.s, p.y)
+    fr = make_frames('O1-F05', jump={k: (xa - x5, ya - y5)}, drop=[(5.0 + 0.5 / FPS, 5.3)])
+    out, rows = run(tmp_path, frames=fr)
+    gate_ok(out)
+    j = frame_at(rows, 5.0)
+    assert rows[j]['suspect'] == 0 and rows[j]['track_err'] == 1 and rows[j]['lo_g2'] > 0.1
+    assert out['outcome'] == 'hong_he_do' and not out['cat_t1']
+    assert out['t1_kind'] == 'loi_theo_doi' and abs(out['t1'] - 5.0) < 1e-6
+
+
+def test_cs1_9_way_2_speeds_without_the_suspect_frames(tmp_path):
+    """Codex CS1-9: still at the end after T_cmd, one frame jumps 30 mm every 0.3 s. With the speeds of c7_measure
+    (every valid frame) neither way held t_d (G1 khong_dat); way 2 (suspects as gaps) now completes: G1 chua."""
+    lane = lane_of('O1-F05')
+    t = np.arange(-4.0, lane.Tcmd + 3.0, 1.0 / FPS)
+    jump = {k: (0.03, 0.0) for k, tk in enumerate(t) if tk > lane.Tcmd + 0.05 and (k % 18) == 0}
+    out, _ = run(tmp_path, frames=make_frames('O1-F05', jump=jump))
+    g = gate_ok(out)
+    assert out['n_suspect_pos'] >= sum(1 for k in jump if t[k] < out['t_deadline']) - 1
+    assert g['g1']['t_done'][1] is not None and g['g1']['state'] == 'chua_ket_luan'
+
+
+def test_cs1_10_suspects_not_converging():
+    """Codex CS1-10: 101 samples, half 2, min 3, one coordinate alternating 0.10 / 0.16 m: the passes cycle. The
+    result is the union of the last two passes with a finite |p - p^| on every suspect, flagged not converged."""
+    t = np.arange(101) / 60.0
+    x = np.where(np.arange(101) % 2, 0.16, 0.10)
+    sus, pred, passes, conv = cs.mark_suspects(t, x, np.zeros(101), 0.02, 2, 3)
+    assert not conv and passes == cs.SUSPECT_PASSES
+    assert sus.sum() > 50 and np.all(np.isfinite(pred[sus])) and np.all(pred[sus] > 0.02)
+
+
+def test_cs1_11_alignment_frames_must_be_still_in_translation(tmp_path):
+    """Codex CS1-11: before t = 0 the car drives straight (no rotation) at 0.2 m/s: no still frame, the yaw of the run
+    is not compared (G4, G5 undefined) instead of aligning on a moving car."""
+    fr = make_frames('O1-F05', measured=False)
+    for r in fr:
+        tk = r['t_s'] - T0 + OFFSET
+        if tk < 0.0:
+            r['x'] += 0.2 * tk
+    cm.apply_gates(fr, 0.3)
+    out, _ = run(tmp_path, frames=fr)
+    gate_ok(out)
+    assert not out['yaw_check']['compared'] and 'speed' in out['yaw_check']['reason']
+    assert out['outcome'] == 'chua_ket_luan'
+
+
+def test_cs1_12_imu_reset_before_the_alignment_part(tmp_path):
+    """Codex CS1-12: an IMU reset 4 s before t = 0 (pre_s 3 s, the old cut from t0 - 5 s): the yaw after it is
+    continuous, the run is compared."""
+    out, _ = run(tmp_path, log_kw=dict(reset_at=-4.0))
+    gate_ok(out)
+    assert out['yaw_check']['compared'] and out['outcome'] == 'dat' and out['yaw_check']['log_from_s'] > -4.1
+
+
+def test_cs1_12_reset_inside_the_alignment_part_keeps_its_effect(tmp_path):
+    """A reset inside [t0 - pre_s, t0): the cut stays before the alignment part; no frame after the reset has a yaw."""
+    out, _ = run(tmp_path, log_kw=dict(reset_at=-1.0))
+    g = gate_ok(out)
+    assert out['yaw_check']['log_from_s'] < -3.0 and g['g5']['n_undef'] == g['g5']['n_frames']
+
+
+def test_cs1_13_old_frames_report_the_shift_kind(tmp_path):
+    fr = make_frames('O1-F05')
+    for r in fr:
+        r['shift_mag_px'] = float('nan')                     # frames.csv before 17/11
+    out, _ = run(tmp_path, frames=fr)
+    assert out['shift_kind'].startswith('median_magnitude')
+    out, _ = run(tmp_path)
+    assert out['shift_kind'] == 'median_vector'
+
+
+def test_cs1_14_locked_command_thresholds_are_applied(tmp_path, cmd_ok):
+    """Codex CS1-14: a packet-age bound of 150 ms with a 50 ms threshold in the constants: lost to the command path
+    (the old scorer only read the flags of o1_cmd_path); (4) blocked by the ultrasonic is not compared."""
+    cmd_ok['cond'] = dict(cond2=dict(value_m=0.004), cond3=dict(value_ms=150.0),
+                          cond4=dict(value_m=0.5, applies=False))
+    th = dict(cond2_m=0.02, cond3_ms=50.0, cond4_m=0.03)
+    out, _ = run(tmp_path, hs_kw=dict(duong_lenh=th))
+    gate_ok(out)
+    assert out['outcome'] == 'hong_he_do' and out['fail_cause'] == 'duong_lenh'
+    assert out['cmd_path']['threshold_flags'] == ['cond3_vuot_nguong: 150.0 ms > 50 ms']
+    cmd_ok['cond'] = dict(cond2=dict(value_m=0.004), cond3=dict(value_ms=None), cond4=dict(value_m=0.5, applies=False))
+    out, _ = run(tmp_path, hs_kw=dict(duong_lenh=th))
+    assert out['outcome'] == 'hong_he_do' and 'cond3_thieu_bang_chung' in out['cmd_path']['threshold_flags'][0]
+    cmd_ok['cond'] = {}
+    out, _ = run(tmp_path)                                 # no thresholds in a de_xuat file: values only
+    assert out['outcome'] == 'dat' and out['cmd_path']['threshold_flags'] == []
+
+
+def test_real_cmd_path_end_to_end(tmp_path):
+    """o1_cmd_path NOT stubbed: firmware-like command columns, '#us' / '#us_end' events, the sender '#test_end' with
+    the send times (Codex 16/11 test gap). Clean: dat with the values reported; a locked packet-age threshold below
+    the observed bound: lost to the command path."""
+    log = make_log(tmp_path / 'esp32.csv', 'O1-F05', cmd_real=True)
+    hs = hs_file(tmp_path)
+    out, _ = cs.score(make_frames('O1-F05'), log, 'O1-F05', hs, offset_s=OFFSET, offset_reason='test',
+                      sender=log + '_sender.txt')
+    gate_ok(out)
+    c = out['cmd_path']
+    assert out['outcome'] == 'dat' and c['flags'] == [] and 20.0 < c['cond3']['value_ms'] < 60.0
+    assert c['cond2']['value_m'] < 0.001 and c['cond4']['applies'] is True
+    hs = hs_file(tmp_path, duong_lenh=dict(cond2_m=0.02, cond3_ms=25.0, cond4_m=0.03))
+    out, _ = cs.score(make_frames('O1-F05'), log, 'O1-F05', hs, offset_s=OFFSET, offset_reason='test',
+                      sender=log + '_sender.txt')
+    gate_ok(out)
+    assert out['outcome'] == 'hong_he_do' and out['fail_cause'] == 'duong_lenh'
+
+
+def test_real_cmd_path_without_sender_is_lost(tmp_path):
+    log = make_log(tmp_path / 'esp32.csv', 'O1-F05', cmd_real=True)
+    out, _ = cs.score(make_frames('O1-F05'), log, 'O1-F05', hs_file(tmp_path), offset_s=OFFSET, offset_reason='test')
+    assert out['outcome'] == 'hong_he_do' and out['cmd_path']['lost']
+
+
+def test_cs1_15_frame_gates_must_match_the_constants(tmp_path):
+    """Codex CS1-15: the constants hold the frame gates; frames.csv gated with another (2a) threshold is refused,
+    without track.json it is refused, with the same gates it is scored."""
+    gk = dict(cm.DEFAULT_GATES)
+    with pytest.raises(ValueError, match='other thresholds'):
+        run(tmp_path, hs_kw=dict(cong_khung=gk), track_info=dict(gates=dict(gk, car_res_sim_m=0.001)))
+    with pytest.raises(ValueError, match='track.json'):
+        run(tmp_path, hs_kw=dict(cong_khung=gk))
+    out, _ = run(tmp_path, hs_kw=dict(cong_khung=gk), track_info=dict(gates=dict(gk, rule='x')))
+    assert out['gate_check']['checked'] and out['outcome'] == 'dat'
+
+
+def test_cs1_16_lines_without_log_seq_are_refused(tmp_path):
+    """Codex CS1-16: two identical lines with an empty log_seq (the second marked duplicate) plus one UNMARKED copy
+    of a normal line balanced the old count check (1 = 1)."""
+    p = make_log(tmp_path / 'esp32.csv', 'O1-F05')
+    rows = list(csv.DictReader(ln for ln in open(p, encoding='utf-8') if not ln.startswith('#')))
+    empty = dict(rows[50], log_seq='')
+    rows = rows[:300] + [empty, dict(empty), dict(rows[299])] + rows[300:]
+    status = ['ok'] * 301 + ['duplicate', 'ok'] + ['ok'] * (len(rows) - 303)
+    with open(p, 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=LOG_COLS)
+        w.writeheader()
+        w.writerows(rows)
+    with open(p + '.segments.csv', 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(['row', 'log_seq', 'timestamp_us', 'segment', 'status'])
+        for i, (r, s) in enumerate(zip(rows, status), start=1):
+            w.writerow([i, r['log_seq'], r['timestamp_us'], 0, s])
+    with pytest.raises(ValueError, match='without log_seq'):
+        cs.read_esp32(p)
+
+
+def test_cs1_18_suspect_assumption_not_checked_clamps_lo(tmp_path):
+    """Codex CS1-18 / O1 3.3: a suspect frame at 0.16 m among frames at 0.13 m has lo = 0.125 > D; without the C8 check
+    of the assumption ('chua_kiem', 'khong_dung') its lo is clamped at D (no certain violation from it)."""
+    lane = lane_of('O1-F05')
+    k = (4 + 5) * 60 + 30                                  # t = 5.5 s
+    _, _, _, hc = lane.command(5.5)
+    fr = make_frames('O1-F05', jump={k: (-0.03 * math.sin(hc), 0.03 * math.cos(hc))},
+                     lat_fn=lambda t: 0.13 if 5.0 <= t < 6.0 else 0.0)
+    for gd, clamped in (('chua_kiem', True), ('khong_dung', True), ('dung', False)):
+        out, rows = run(tmp_path, frames=fr, hs_kw=dict(gia_dinh_nghi_vi_tri=gd))
+        r = rows[frame_at(rows, 5.5)]
+        assert r['suspect'] == 1 and r['e_perp'] > 0.155
+        assert (r['lo_g2'] <= 0.1) == clamped and (r['lo_g4'] <= 0.1 or not clamped)
+
+
+def test_cs1_19_imu_range_exceeded_is_reported(tmp_path):
+    md = {'O1-F05': dict(goc_quay_deg=1e5, wz_dps=5.0, alpha_dps2=1e6)}
+    out, _ = run(tmp_path, hs_kw=dict(imu=dict(mien_dong=md)))
+    y = out['yaw_check']
+    assert y['mien_dong_vuot'] == 'wz_dps' and 0.0 <= y['t_mien_dong_vuot'] < 5.0 and y['n_after_mien_dong'] > 0
+    assert out['outcome'] == 'dat'                         # reported only: the handling is Liam's (O1 3.3)
+    md = {'O1-F05': dict(goc_quay_deg=1e5, wz_dps=4000.0, alpha_dps2=1e6)}
+    out, _ = run(tmp_path, hs_kw=dict(imu=dict(mien_dong=md)))
+    assert out['yaw_check']['t_mien_dong_vuot'] is None
+
+
+def test_cs1_khoa_c8_needs_every_locked_block(tmp_path):
+    full = dict(trang_thai='khoa_c8', duong_lenh=dict(cond2_m=0.02, cond3_ms=50.0, cond4_m=0.03),
+                cong_khung=dict(cm.DEFAULT_GATES), gia_dinh_nghi_vi_tri='dung',
+                imu=dict(mien_dong={m: dict(goc_quay_deg=720.0, wz_dps=200.0, alpha_dps2=2000.0)
+                                    for m in ('O1-F02', 'O1-F05', 'O1-F08', 'O1-K1', 'O1-K2')}))
+    hs = hs_file(tmp_path, **json.loads(json.dumps(full)))
+    assert hs['trang_thai'] == 'khoa_c8' and hs['gia_dinh_nghi_vi_tri'] == 'dung'
+    for drop in ('duong_lenh', 'cong_khung'):
+        bad = json.loads(json.dumps(full))
+        del bad[drop]
+        with pytest.raises(ValueError, match=drop):
+            hs_file(tmp_path, **bad)
+    for gd in ('chua_kiem', 'x'):
+        bad = json.loads(json.dumps(full))
+        bad['gia_dinh_nghi_vi_tri'] = gd
+        with pytest.raises(ValueError, match='gia_dinh'):
+            hs_file(tmp_path, **bad)
+    bad = json.loads(json.dumps(full))
+    del bad['imu']['mien_dong']['O1-K2']
+    with pytest.raises(ValueError, match='mien_dong'):
+        hs_file(tmp_path, **bad)
+
+
+def test_cs1_20_suspect_beyond_the_reopened_window_is_tracking_error(tmp_path):
+    """Codex CS1-20 / O1 W11-4: a suspect frame 1.6 m ahead along the lane still hits the end of the window reopened
+    to 1.23 m: a tracking error (the old code exempted suspect frames)."""
+    lane = lane_of('O1-F05')
+    k = (4 + 5) * 60
+    s5, x5, y5, _ = lane.command(5.0)
+    p = lane.path
+    xa, ya = np.interp(s5 + 1.6, p.s, p.x), np.interp(s5 + 1.6, p.s, p.y)
+    out, rows = run(tmp_path, frames=make_frames('O1-F05', jump={k: (xa - x5, ya - y5)}))
+    gate_ok(out)
+    j = frame_at(rows, 5.0)
+    assert rows[j]['suspect'] == 1 and rows[j]['reopen'] == 1 and rows[j]['track_err'] == 1
+    assert out['outcome'] == 'hong_he_do' and abs(out['t_first_track_err'] - 5.0) < 1e-6
+
+
+# ---------------------------------------------------------------- other test gaps Codex listed
+def test_violation_exactly_on_the_last_frame_before_a_gap(tmp_path, monkeypatch):
+    """R3V-8: 'before t1' of a long gap includes the last valid frame before it (not a suspect here, stub)."""
+    suspects_stub(monkeypatch)
+    fr = make_frames('O1-F05', drop=[(8.0, 8.3)], lat_fn=lambda t: 0.13 if 7.98 <= t < 8.0 else 0.0)
+    out, rows = run(tmp_path, frames=fr)
+    gate_ok(out)
+    assert out['t1_kind'] == 'khoang_trong' and out['outcome'] == 'khong_dat' and out['cat_t1']
+
+
+def test_window_without_any_valid_frame(tmp_path):
+    lane = lane_of('O1-F05')
+    out, _ = run(tmp_path, frames=make_frames('O1-F05', drop=[(0.0, lane.Tcmd + 3.0)]))
+    assert out['outcome'] == 'hong_he_do' and out['gate_v3'] is None
+
+
+def test_certain_violation_only_in_the_union_domain(tmp_path, monkeypatch):
+    """Two domains: way 1 done at t_done[0], way 2 never (suspect blocks of 8 frames every 0.4 s, stub); a lateral
+    0.13 m after t_done[0] is in the union only: the condition is chua_ket_luan, not khong_dat (O1 3.3 R2V-3)."""
+    lane = lane_of('O1-F05')
+    blk = lambda tk: tk > lane.Tcmd - 0.5 and ((tk - lane.Tcmd) % 0.4) < 8.5 / FPS   # noqa: E731
+    suspects_stub(monkeypatch, blk)
+    base = run(tmp_path, frames=make_frames('O1-F05', measured=False))[0]
+    td0 = base['gate_v3']['g1']['t_done'][0]
+    fr = make_frames('O1-F05', measured=False, lat_fn=lambda tt: 0.13 if td0 + 0.3 <= tt < td0 + 0.6 else 0.0)
+    out, _ = run(tmp_path, frames=fr)
+    g = gate_ok(out)
+    assert g['g1']['t_done'][0] == pytest.approx(td0) and g['g1']['t_done'][1] is None
+    assert g['g2']['chung']['lo'] <= 0.1 < g['g2']['lo'] and g['g2']['state'] == 'chua_ket_luan'

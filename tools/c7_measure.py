@@ -21,8 +21,10 @@ Chain (design 0, 3.1-3.10):
             residual, design 3.3), model by 4-fold cross-validation over the marks (simplest within
             15 % of the best); check tags NOT in the fit, their error reported (design 4.2 (a))
   per frame the camera POSE (6 dof) is refitted to the floor marks seen in that frame, intrinsics and
-            distortion from clip H (design 3.6, vibration compensation); shift_px = median distance
-            of the mark centres from clip H, rms_px = reprojection RMS of the marks after the refit
+            distortion from clip H (design 3.6, vibration compensation); shift_px = length of the
+            median VECTOR of the mark-centre shifts from clip H (O1 3.5 'dich_moc'; CS1-13, Codex 16/11;
+            shift_mag_px = median of the lengths, reported; frames.csv before 17/11 holds only the
+            median of the lengths in shift_px), rms_px = reprojection RMS of the marks after the refit
   car       the 4 corners of the car tag (ID 0) -> floor plane z = 0 with the frame camera -> parallax
             P = P' + kappa (C - P'), kappa = h / Z_c from the tape, C = PLUMB POINT measured with a
             plumb line (not the camera centre of the fit, design 3.4) -> rigid fit (Procrustes) to the
@@ -42,7 +44,8 @@ Chain (design 0, 3.1-3.10):
             RS2-1: a position-suspect frame keeps its value); c7_score.py marks those frames.
   speed     quadratic fit over +-6 valid frames on the real frame times (design 3.8), for the stop
             condition and the clock matching (C7b); NaN on invalid frames
-All thresholds are [DE XUAT] and are locked at the measurement-system trial C8 (O1 3.3, 3.9 item 4).
+All thresholds are [DE XUAT] and are locked at the measurement-system trial C8 (O1 3.3, 3.9 item 4); at C8
+they come from the constants file (--hang-so), and c7_score refuses frames gated with other thresholds.
 The run rules (gaps, tracker, completion, outcome) are in c7_score.py.
 
   python tools/c7_measure.py calib --video <clip H> --markers <csv...> --zc 2.60 --plumb X,Y \
@@ -53,7 +56,11 @@ The run rules (gaps, tracker, completion, outcome) are in c7_score.py.
                                      -> the gates of this version on a frames.csv written before, no video:
                                         res_sim_m from res_m and scale (exact for a square: rigid residual^2
                                         = residual with scale^2 + ((1 - scale) side / sqrt 2)^2 at the same
-                                        rotation), then apply_gates and the speeds again
+                                        rotation), then apply_gates and the speeds again; a verdict that the
+                                        rounding of the CSV (6 decimals) could flip fails as 'can_track_lai'
+                                        (CS1-17). Not a substitute for track when the pose measurement changed.
+  [--hang-so FILE]   track, regate: frame-gate thresholds from the 'cong_khung' block of the c7_score
+                     constants file (CS1-15), written with its sha256 to track.json; else the module defaults
   [--tag-offset DX,DY,DPSI_DEG]  tag centre minus wheel centre in the body frame (m, m, deg) and tag
                                  heading minus body heading, from the static test (C8 clip T)
 Last line: #ket_qua,ma=0 done / 2 error.
@@ -91,6 +98,12 @@ GATE_SCALE_REL = 0.005       # (2b) against the median of the neighbours
 SCALE_WIN_S = 0.25           # (2b) neighbours: frames that passed (1), (2a) within +-0.25 s (O1 v11.30: by time, the
                              #      clip may be 60 or 120 fps; +-15 frames at 60 fps)
 SCALE_MIN = 8                # (2b) fewer neighbours: the frame fails
+GATE_KEYS = ('min_marks', 'rms_extra_px', 'car_res_sim_m', 'scale_rel', 'scale_win_s', 'scale_min')
+DEFAULT_GATES = dict(min_marks=GATE_MIN_MARKS, rms_extra_px=GATE_RMS_EXTRA_PX, car_res_sim_m=GATE_CAR_RES_M,
+                     scale_rel=GATE_SCALE_REL, scale_win_s=SCALE_WIN_S, scale_min=SCALE_MIN)
+GATE_RANGES = dict(min_marks=(4, 24), rms_extra_px=(0.0, 5.0), car_res_sim_m=(0.0, 0.01), scale_rel=(0.0, 0.05),
+                   scale_win_s=(0.05, 2.0), scale_min=(1, 240))
+CSV_QUANT = 5e-7             # half a unit of the 6th decimal: rounding of res_m / scale in a frames.csv (CS1-17)
 
 
 # ---------------------------------------------------------------- detection and edge refinement
@@ -315,21 +328,55 @@ def sg_derivative(t, x, half=SG_HALF):
     return v
 
 
-def apply_gates(rows, rms_h):
+def check_gates(g, what='cong_khung'):
+    """The frame-gate thresholds (GATE_KEYS) as a checked dict (CS1-15: they come from the constants file)."""
+    if not isinstance(g, dict):
+        raise ValueError(f'{what}: a table {GATE_KEYS}')
+    out = {}
+    for k in GATE_KEYS:
+        v = g.get(k)
+        lo, hi = GATE_RANGES[k]
+        whole = k in ('min_marks', 'scale_min')
+        if isinstance(v, bool) or not isinstance(v, int if whole else (int, float)) or not math.isfinite(v) \
+                or not lo <= v <= hi:
+            raise ValueError(f'{what} {k}: {v!r} is not {"a whole number" if whole else "a number"} in [{lo}, {hi}]')
+        out[k] = v if whole else float(v)
+    return out
+
+
+def load_gates(path):
+    """(gates, sha256, trang_thai) from the 'cong_khung' block of a constants file (c7_score --hang-so, CS1-15)."""
+    with open(path, encoding='utf-8') as f:
+        d = json.load(f)
+    if not isinstance(d, dict) or 'cong_khung' not in d:
+        raise ValueError(f'{path}: no cong_khung block (frame-gate thresholds)')
+    return check_gates(d['cong_khung'], f'{os.path.basename(path)} cong_khung'), sha256(path), d.get('trang_thai')
+
+
+def apply_gates(rows, rms_h, gates=None, quant=0.0):
     """Sets valid / why on every frame row in place (O1 3.3 (1), (2); module docstring) and the speeds on the
     valid frames. Order: floor gate (1), shape (2a) on the residual WITH scale, then scale (2b) against the median
-    of the neighbours within +-SCALE_WIN_S (frame times, the frame excluded) among the frames that passed (1) and
-    (2a) (scale_ref, NaN when fewer than SCALE_MIN). Frame times must increase. Returns the median scale of the
-    frames that passed (1), (2a) (reported only)."""
+    of the neighbours within +-scale_win_s (frame times, the frame excluded) among the frames that passed (1) and
+    (2a) (scale_ref, NaN when fewer than scale_min). Frame times must increase. gates: the thresholds (default
+    DEFAULT_GATES; the constants file at C8, CS1-15). quant > 0 (regate of a rounded frames.csv, CS1-17): res_sim_m
+    lies in [_res_sim_lo, _res_sim_hi] of the row (else +-quant) and every scale is off by up to quant; a frame whose
+    (2a) or (2b) verdict changes inside those intervals fails with why 'can_track_lai' (decide it from the video
+    with track). Returns the median scale of the frames that passed (1), (2a) (reported only)."""
+    g = DEFAULT_GATES if gates is None else check_gates(gates)
     for r in rows:
         why = []
-        if r['n_marks'] < GATE_MIN_MARKS:
+        if r['n_marks'] < g['min_marks']:
             why.append('moc_it')
-        elif not (r['rms_px'] <= rms_h + GATE_RMS_EXTRA_PX):
+        elif not (r['rms_px'] <= rms_h + g['rms_extra_px']):
             why.append('moc_du_thua')
         if not r['car_seen']:
             why.append('khong_thay_xe')
-        elif not (r['res_sim_m'] <= GATE_CAR_RES_M):
+        elif quant > 0.0:
+            lo = r.get('_res_sim_lo', r['res_sim_m'] - quant)
+            hi = r.get('_res_sim_hi', r['res_sim_m'] + quant)
+            if not (hi <= g['car_res_sim_m']):
+                why.append('can_track_lai' if lo <= g['car_res_sim_m'] else 'xe_meo')
+        elif not (r['res_sim_m'] <= g['car_res_sim_m']):
             why.append('xe_meo')
         r['why'] = why
         r['scale_ref'] = float('nan')
@@ -339,15 +386,22 @@ def apply_gates(rows, rms_h):
     sc = np.array([rows[k]['scale'] for k in p12])
     tp = np.array([rows[k]['t_s'] for k in p12])
     for j, k in enumerate(p12):
-        a = int(np.searchsorted(tp, tp[j] - SCALE_WIN_S - 1e-9, side='left'))
-        b = int(np.searchsorted(tp, tp[j] + SCALE_WIN_S + 1e-9, side='right'))
+        a = int(np.searchsorted(tp, tp[j] - g['scale_win_s'] - 1e-9, side='left'))
+        b = int(np.searchsorted(tp, tp[j] + g['scale_win_s'] + 1e-9, side='right'))
         nb = np.r_[sc[a:j], sc[j + 1:b]]
-        if len(nb) < SCALE_MIN:
+        if len(nb) < g['scale_min']:
             rows[k]['why'].append('ti_le_it_lan_can')
             continue
         ref = float(np.median(nb))
         rows[k]['scale_ref'] = ref
-        if not abs(rows[k]['scale'] / ref - 1.0) <= GATE_SCALE_REL:
+        if quant > 0.0:                    # the scale and every neighbour off by up to quant: an interval of ratios
+            r_lo = (rows[k]['scale'] - quant) / (ref + quant) - 1.0
+            r_hi = (rows[k]['scale'] + quant) / (ref - quant) - 1.0
+            dmax = max(abs(r_lo), abs(r_hi))
+            dmin = 0.0 if r_lo <= 0.0 <= r_hi else min(abs(r_lo), abs(r_hi))
+            if not dmax <= g['scale_rel']:
+                rows[k]['why'].append('can_track_lai' if dmin <= g['scale_rel'] else 'ti_le')
+        elif not abs(rows[k]['scale'] / ref - 1.0) <= g['scale_rel']:
             rows[k]['why'].append('ti_le')
     for r in rows:
         r['valid'] = not r['why']
@@ -363,17 +417,42 @@ def apply_gates(rows, rms_h):
     return float(np.median(sc)) if len(sc) else float('nan')
 
 
-def regate(rows, session):
+def res_sim_interval(res_m, scale, side, q=CSV_QUANT):
+    """[lo, hi] of res_sim_from when res_m and scale are each known to +-q only (rounded CSV, CS1-17): res_sim grows
+    with res_m and falls with |1 - scale|."""
+    d = abs(1.0 - scale)
+    lo = res_sim_from(max(0.0, res_m - q), 1.0 - (d + q), side)
+    hi = res_sim_from(res_m + q, 1.0 - max(0.0, d - q), side)
+    return lo, hi
+
+
+def regate(rows, session, gates=None):
     """The gates of this version on rows read from a frames.csv written before (read_frames): res_sim_m from
-    res_m and scale where it is missing (res_sim_from), then apply_gates. In place; returns the median scale.
-    frames.csv keeps 6 decimals (1 um): near a zero residual with scale the square root magnifies that rounding to
-    about sqrt(2 res_m 5e-7), 0.05 mm at res_m = 2.5 mm; track computes res_sim_m directly."""
+    res_m and scale where it is missing (res_sim_from), then apply_gates with the rounding of the CSV (CS1-17):
+    res_m, res_sim_m, scale are known to +-CSV_QUANT only (6 decimals), so a frame whose verdict of (2a) or (2b)
+    changes inside that interval fails with why 'can_track_lai' (counted by the caller; decide it with track on the
+    video). In place; returns the median scale. regate does NOT replace track when the pose measurement itself has
+    changed since the file was written (for example the tag-offset rotation of car_pose, 16/11): it only re-applies
+    the gates to the stored residuals and scales; the stored centres are used as they are."""
     side = session['car_side_m']
     for r in rows:
-        if r['car_seen'] and not np.isfinite(r.get('res_sim_m', float('nan'))):
-            r['res_sim_m'] = (res_sim_from(r['res_m'], r['scale'], side)
-                              if np.isfinite(r['res_m']) and np.isfinite(r['scale']) else float('nan'))
-    return apply_gates(rows, session['rms_px_H'])
+        r.pop('_res_sim_lo', None)
+        r.pop('_res_sim_hi', None)
+        if not r['car_seen']:
+            continue
+        if np.isfinite(r.get('res_sim_m', float('nan'))):
+            r['_res_sim_lo'], r['_res_sim_hi'] = max(0.0, r['res_sim_m'] - CSV_QUANT), r['res_sim_m'] + CSV_QUANT
+        elif np.isfinite(r['res_m']) and np.isfinite(r['scale']):
+            r['res_sim_m'] = res_sim_from(r['res_m'], r['scale'], side)
+            r['_res_sim_lo'], r['_res_sim_hi'] = res_sim_interval(r['res_m'], r['scale'], side)
+        else:
+            r['res_sim_m'] = float('nan')
+            r['_res_sim_lo'] = r['_res_sim_hi'] = float('nan')
+    out = apply_gates(rows, session['rms_px_H'], gates, quant=CSV_QUANT)
+    for r in rows:
+        r.pop('_res_sim_lo', None)
+        r.pop('_res_sim_hi', None)
+    return out
 
 
 # ---------------------------------------------------------------- calibration (clip H)
@@ -434,16 +513,27 @@ def calibrate(video, marks, zc, plumb, tag_h, car_side, stride=1, max_frames=Non
         gates=gates_dict())
 
 
-def gates_dict():
-    return dict(min_marks=GATE_MIN_MARKS, rms_extra_px=GATE_RMS_EXTRA_PX, car_res_sim_m=GATE_CAR_RES_M,
-                scale_rel=GATE_SCALE_REL, scale_win_s=SCALE_WIN_S, scale_min=SCALE_MIN,
-                rule='(2a) residual with scale, (2b) scale vs median of the neighbours (Liam 16/11 CODE_CAM)',
-                status='DE XUAT, khoa o C8')
+def gates_dict(gates=None, src=None):
+    """The thresholds applied (written to session.json / track.json; c7_score compares them with its constants
+    file, CS1-15). src: dict(file, sha256, trang_thai) of the constants file, None for the module defaults."""
+    g = DEFAULT_GATES if gates is None else check_gates(gates)
+    return dict(g, rule='(2a) residual with scale, (2b) scale vs median of the neighbours (Liam 16/11 CODE_CAM)',
+                status='DE XUAT, khoa o C8' if src is None else f'tu file hang so ({src.get("trang_thai")})',
+                hang_so=src)
 
 
 # ---------------------------------------------------------------- tracking a run clip
-def track(video, session, tag_offset=None, max_frames=None, progress=None):
-    """Per-frame rows of a run clip with the session camera (design 3.5-3.8). Returns (rows, info)."""
+def shift_of(vectors):
+    """(shift_px, shift_mag_px) of the mark-centre shift vectors of one frame [px]: the length of the component-wise
+    median vector (O1 3.5 'do lon cua trung vi vec-to', CS1-13) and the median of the lengths (reported)."""
+    sv = np.asarray(vectors, float).reshape(-1, 2)
+    return float(np.hypot(*np.median(sv, axis=0))), float(np.median(np.linalg.norm(sv, axis=1)))
+
+
+def track(video, session, tag_offset=None, max_frames=None, progress=None, gates=None, gates_src=None):
+    """Per-frame rows of a run clip with the session camera (design 3.5-3.8). Returns (rows, info).
+    shift_px (camera bumped, O1 3.5): the LENGTH OF THE MEDIAN VECTOR of the mark-centre shifts from clip H
+    (component-wise median, CS1-13); shift_mag_px: the median of the lengths (reported only)."""
     cam0 = cam_from_dict(session['camera'])
     marks = {int(i): tuple(v) for i, v in session['marks'].items()}
     ref = {int(i): np.array(v) for i, v in session['ref_centres_px'].items()}
@@ -456,13 +546,13 @@ def track(video, session, tag_offset=None, max_frames=None, progress=None):
         d = detect_refined(det, g)
         obj, img, used = floor_obs(d, marks)
         r = dict(idx=k, t_s=t, n_marks=len(used), rms_px=float('nan'), shift_px=float('nan'), cam_z=float('nan'),
-                 car_seen=False, x=float('nan'), y=float('nan'), psi=float('nan'), tag_x=float('nan'),
+                 shift_mag_px=float('nan'), car_seen=False, x=float('nan'), y=float('nan'), psi=float('nan'), tag_x=float('nan'),
                  tag_y=float('nan'), res_m=float('nan'), res_sim_m=float('nan'), scale=float('nan'),
                  scale_ref=float('nan'), row_px=float('nan'),
                  vx=float('nan'), vy=float('nan'), wz=float('nan'), speed=float('nan'))
-        sh = [np.linalg.norm(d[i].mean(axis=0) - ref[i]) for i in used if i in ref]
+        sh = [d[i].mean(axis=0) - ref[i] for i in used if i in ref]
         if sh:
-            r['shift_px'] = float(np.median(sh))
+            r['shift_px'], r['shift_mag_px'] = shift_of(sh)
         cam = None
         if len(used) >= 4:                                 # 4 marks = 16 points: the pose is determined
             cam, r['rms_px'] = refit_pose(cam_prev, obj, img)
@@ -475,10 +565,10 @@ def track(video, session, tag_offset=None, max_frames=None, progress=None):
         rows.append(r)
         if progress and k % 100 == 0:
             progress(k)
-    med_scale = apply_gates(rows, session['rms_px_H'])
+    med_scale = apply_gates(rows, session['rms_px_H'], gates)
     info = dict(video=os.path.basename(video), video_sha256=sha256(video), frames=len(rows),
                 decoded_shapes=sorted(list(s) for s in shapes), median_scale=med_scale, tag_offset=list(off),
-                gates=gates_dict(),
+                gates=gates_dict(gates, gates_src), shift_kind='median_vector',
                 n_valid=int(sum(r['valid'] for r in rows)),
                 zc_session_m=session.get('zc_fit_m'),
                 cam_z_drift_rel=_cam_z_drift(rows, session.get('zc_fit_m')))
@@ -494,7 +584,9 @@ def _cam_z_drift(rows, zc_h):
 
 
 FRAME_COLS = ('idx', 't_s', 'valid', 'why', 'n_marks', 'rms_px', 'shift_px', 'cam_z', 'car_seen', 'x', 'y', 'psi',
-              'tag_x', 'tag_y', 'res_m', 'res_sim_m', 'scale', 'scale_ref', 'row_px', 'vx', 'vy', 'wz', 'speed')
+              'tag_x', 'tag_y', 'res_m', 'res_sim_m', 'scale', 'scale_ref', 'row_px', 'vx', 'vy', 'wz', 'speed',
+              'shift_mag_px')
+FINE_COLS = ('res_m', 'res_sim_m', 'scale', 'scale_ref')     # written with 10 decimals (CS1-17); older files: 6
 
 
 def write_frames(path, rows):
@@ -512,7 +604,7 @@ def write_frames(path, rows):
                 elif v is None or (isinstance(v, float) and math.isnan(v)):
                     v = ''
                 elif isinstance(v, float):
-                    v = f'{v:.6f}'
+                    v = f'{v:.10f}' if c in FINE_COLS else f'{v:.6f}'
                 out.append(v)
             w.writerow(out)
 
@@ -608,13 +700,19 @@ def main(argv=None):
     a2.add_argument('--session', required=True)
     a2.add_argument('--tag-offset', default=None, help='DX,DY,DPSI_DEG (m, m, deg), from the static test')
     a2.add_argument('--max-frames', type=int, default=None)
+    a2.add_argument('--hang-so', default=None, help='constants file of c7_score: frame-gate thresholds (cong_khung)')
     a2.add_argument('--out', required=True)
     a3 = sub.add_parser('regate')
     a3.add_argument('--frames', required=True, help='frames.csv written by track (this or an older version)')
     a3.add_argument('--session', required=True)
+    a3.add_argument('--hang-so', default=None, help='constants file of c7_score: frame-gate thresholds (cong_khung)')
     a3.add_argument('--out', required=True)
     a = ap.parse_args(argv)
     try:
+        gates, gsrc = None, None
+        if getattr(a, 'hang_so', None):
+            gates, gsha, gstate = load_gates(a.hang_so)
+            gsrc = dict(file=os.path.basename(a.hang_so), sha256=gsha, trang_thai=gstate)
         _new_dir(a.out)
         if a.cmd == 'calib':
             plumb = _pair(a.plumb, 2, '--plumb')
@@ -643,15 +741,19 @@ def main(argv=None):
             with open(a.session, encoding='utf-8') as f:
                 sess = json.load(f)
             rows = read_frames(a.frames)
-            med = regate(rows, sess)
+            old_shift = all(not np.isfinite(r['shift_mag_px']) for r in rows)
+            med = regate(rows, sess, gates)
             write_frames(os.path.join(a.out, 'frames.csv'), rows)
             info = dict(regate_of=os.path.abspath(a.frames), regate_of_sha256=sha256(a.frames),
                         session=os.path.abspath(a.session), session_sha256=sha256(a.session), frames=len(rows),
-                        median_scale=med, gates=gates_dict(), n_valid=int(sum(r['valid'] for r in rows)),
+                        median_scale=med, gates=gates_dict(gates, gsrc), n_valid=int(sum(r['valid'] for r in rows)),
+                        n_can_track_lai=int(sum('can_track_lai' in r['why'] for r in rows)),
+                        shift_kind='median_magnitude' if old_shift else 'median_vector',
                         frames_sha256=sha256(os.path.join(a.out, 'frames.csv')))
             with open(os.path.join(a.out, 'track.json'), 'w', encoding='utf-8') as f:
                 json.dump(_json(info), f, ensure_ascii=False, indent=1)
-            print(f'{info["frames"]} khung, {info["n_valid"]} hợp lệ (cổng chấm lại, không đọc video)')
+            print(f'{info["frames"]} khung, {info["n_valid"]} hợp lệ, {info["n_can_track_lai"]} cần track lại '
+                  f'(cổng chấm lại, không đọc video)')
         else:
             with open(a.session, encoding='utf-8') as f:
                 sess = json.load(f)
@@ -660,7 +762,7 @@ def main(argv=None):
                 dx, dy, dpsi = _pair(a.tag_offset, 3, '--tag-offset')
                 off = (dx, dy, math.radians(dpsi))
             rows, info = track(a.video, sess, off, a.max_frames,
-                               progress=lambda k: print(f'... khung {k}', file=sys.stderr))
+                               progress=lambda k: print(f'... khung {k}', file=sys.stderr), gates=gates, gates_src=gsrc)
             info.update(session=os.path.abspath(a.session), session_sha256=sha256(a.session))
             write_frames(os.path.join(a.out, 'frames.csv'), rows)
             info['frames_sha256'] = sha256(os.path.join(a.out, 'frames.csv'))   # c7_calib_drift CD2-3
