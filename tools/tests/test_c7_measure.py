@@ -234,16 +234,102 @@ def test_track_cli_records_the_frames_it_wrote(tmp_path, session, run_clip):
     assert t['session_sha256'] == cm.sha256(str(sp)) and t['frames'] == 3
 
 
-def test_gates_drop_a_jumping_frame():
-    rows = []
-    for k in range(20):
-        rows.append(dict(t_s=k / 60, n_marks=20, rms_px=0.3, car_seen=True, res_m=0.0003, scale=1.0,
-                         x=0.01 * k + (0.05 if k == 10 else 0.0), y=0.0, psi=0.0))
+def _gate_rows(n=60, scale=lambda k: 0.976):
+    return [dict(t_s=k / 60, n_marks=20, rms_px=0.3, car_seen=True, res_m=0.0025, res_sim_m=0.0003,
+                 scale=scale(k), x=0.01 * k, y=0.0, psi=0.0) for k in range(n)]
+
+
+def test_gates_shape_scale_and_no_position_gate():
+    """Liam 16/11 CODE_CAM (Q1, Q2): (2a) on the residual WITH scale, (2b) against the neighbours' median; a
+    uniformly shrunken tag (rigid residual 2.5 mm, the 16/11 trial) passes; a jump of the position is no gate
+    (O1 v11.10 RS2-1, c7_score marks it)."""
+    rows = _gate_rows(scale=lambda k: 0.976 - 0.008 * k / 60)        # slow drift (blur with speed): 0.8 % in 1 s
     rows[5]['n_marks'] = 6
-    rows[7]['res_m'] = 0.004
-    rows[15]['scale'] = 1.02
+    rows[7]['res_sim_m'] = 0.004
+    rows[30]['scale'] *= 1.01                                         # a sudden 1 % jump: a misread
+    rows[40]['x'] += 0.05                                             # 50 mm jump: kept (c7_score)
     cm.apply_gates(rows, rms_h=0.3)
     bad = {k: r['why'] for k, r in enumerate(rows) if not r['valid']}
-    assert set(bad) == {5, 7, 10, 15}
-    assert bad[10] == ['nhay_vi_tri'] and bad[5] == ['moc_it'] and bad[7] == ['xe_du_thua'] and bad[15] == ['ti_le']
+    assert bad == {5: ['moc_it'], 7: ['xe_meo'], 30: ['ti_le']}
     assert all(np.isfinite(r['speed']) for r in rows if r['valid'])
+    assert abs(rows[20]['scale_ref'] - rows[20]['scale']) < 0.001
+
+
+def test_old_gates_would_drop_the_shrunk_tag_and_the_drift():
+    """Mutation guard: the residual WITHOUT scale (2.5 mm) or a clip-wide median would fail these frames."""
+    rows = _gate_rows(scale=lambda k: 0.976 - 0.012 * k / 60)
+    cm.apply_gates(rows, rms_h=0.3)
+    assert all(r['valid'] for r in rows)
+    sc = np.array([r['scale'] for r in rows])
+    assert np.max(np.abs(sc / np.median(sc) - 1.0)) > cm.GATE_SCALE_REL           # a clip median would fail some
+    assert all(r['res_m'] > cm.GATE_CAR_RES_M for r in rows)                       # so would the rigid residual
+
+
+def test_scale_gate_needs_neighbours():
+    rows = _gate_rows(n=8)
+    cm.apply_gates(rows, rms_h=0.3)
+    assert all(r['why'] == ['ti_le_it_lan_can'] for r in rows)
+    rows = _gate_rows(n=9)
+    cm.apply_gates(rows, rms_h=0.3)
+    assert all(r['valid'] for r in rows)
+
+
+def test_scale_gate_ignores_frames_failing_shape_or_floor():
+    rows = _gate_rows()
+    for k in range(20, 40):
+        rows[k]['res_sim_m'] = 0.01                                    # 20 frames fail (2a): not neighbours
+    rows[19]['scale'] *= 1.01
+    cm.apply_gates(rows, rms_h=0.3)
+    assert rows[19]['why'] == ['ti_le'] and rows[40]['valid']
+
+
+@pytest.mark.parametrize('shrink', [0.0, 0.024, -0.01])
+def test_res_sim_of_a_uniformly_shrunk_tag(shrink):
+    """The corners of a tag drawn (1 - shrink) times its size: the fit WITH scale has no residual, the rigid one
+    has (1 - scale) side / sqrt 2 per corner, and res_sim_from gives the residual with scale back from it."""
+    x, y, psi = 0.4, 0.2, math.radians(30.0)
+    c, s = math.cos(psi), math.sin(psi)
+    q = np.array([[x + (1 - shrink) * (c * u - s * v), y + (1 - shrink) * (s * u + c * v)]
+                  for u, v in cm.car_corners_body(CAR_SIDE)])
+    px = CAM.project(np.column_stack([q, np.full(4, TAG_H)]))
+    r = cm.car_pose(CAM, px, CAR_SIDE, TAG_H / ZC, PLUMB)
+    assert r['res_sim_m'] < 1e-6 and abs(r['scale'] - (1 - shrink)) < 1e-6
+    assert abs(r['res_m'] - abs(shrink) * CAR_SIDE / math.sqrt(2.0)) < 1e-6
+    assert abs(cm.res_sim_from(r['res_m'], r['scale'], CAR_SIDE) - r['res_sim_m']) < 1e-6
+    assert math.hypot(r['x'] - x, r['y'] - y) < 1e-6 and abs(cm.cp_wrap(r['psi'] - psi)) < 1e-6
+
+
+def test_res_sim_from_a_distorted_tag():
+    """One corner moved 2 mm: res_sim_from (from res_m, scale) equals the residual of the fit with scale."""
+    x, y, psi = -0.3, 0.5, math.radians(-40.0)
+    c, s = math.cos(psi), math.sin(psi)
+    q = np.array([[x + 0.98 * (c * u - s * v), y + 0.98 * (s * u + c * v)] for u, v in cm.car_corners_body(CAR_SIDE)])
+    q[1] += [0.002, -0.001]
+    px = CAM.project(np.column_stack([q, np.full(4, TAG_H)]))
+    r = cm.car_pose(CAM, px, CAR_SIDE, TAG_H / ZC, PLUMB)
+    assert r['res_sim_m'] > 5e-4
+    assert abs(cm.res_sim_from(r['res_m'], r['scale'], CAR_SIDE) - r['res_sim_m']) < 1e-9
+
+
+def test_regate_cli_on_an_old_frames_file(tmp_path):
+    """regate: a frames.csv of the old version (pred_m, no res_sim_m, scale_ref) gets res_sim_m and the new gates."""
+    import json
+    side = CAR_SIDE
+    hdr = ('idx,t_s,valid,why,n_marks,rms_px,shift_px,cam_z,car_seen,x,y,psi,tag_x,tag_y,res_m,scale,pred_m,row_px,'
+           'vx,vy,wz,speed')
+    lines = [hdr]
+    for k in range(40):
+        sc = 0.976
+        res = (1 - sc) * side / math.sqrt(2.0)                        # pure uniform shrink: res_sim 0
+        lines.append(f'{k},{k / 60:.6f},0,xe_du_thua,24,0.3,1.0,2.6,1,{0.01 * k:.6f},0,0,{0.01 * k:.6f},0,'
+                     f'{res:.6f},{sc:.6f},,500,,,,')
+    (tmp_path / 'old.csv').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    (tmp_path / 's.json').write_text(json.dumps(dict(car_side_m=side, rms_px_H=0.3)), encoding='utf-8')
+    assert cm.main(['regate', '--frames', str(tmp_path / 'old.csv'), '--session', str(tmp_path / 's.json'),
+                    '--out', str(tmp_path / 'new')]) == 0
+    rows = cm.read_frames(str(tmp_path / 'new' / 'frames.csv'))
+    # res_m, scale have 6 decimals in the CSV: near 0, sqrt(res^2 - x^2) magnifies the rounding to about
+    # sqrt(2 res 5e-7) = 0.05 mm (regate docstring); far below the 1.5 mm gate
+    assert all(r['valid'] for r in rows) and all(r['res_sim_m'] < 1e-4 for r in rows)
+    t = json.loads((tmp_path / 'new' / 'track.json').read_text(encoding='utf-8'))
+    assert t['n_valid'] == 40 and t['regate_of_sha256'] == cm.sha256(str(tmp_path / 'old.csv'))
