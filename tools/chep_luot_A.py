@@ -900,11 +900,15 @@ def box_check(hop):
                 bad.append(f'{rel}: SHA {s} differs from its latest row {rs[-1]}')
             if cu and s not in (rs[:-1] if cur else rs):
                 bad.append(f'{rel}: no older row of {key} with this SHA')
-    for key, rs in by.items():                                             # SA-17: every row, not only the last
-        on_disk = {s for _, s, _ in disk.get(key, [])}
+    for key, rs in by.items():                                             # SA-17: one file per row
+        on_disk = [s for _, s, _ in disk.get(key, [])]
         for i, s in enumerate(rs):
             if s not in on_disk:
                 bad.append(f'{key}: {"latest" if i == len(rs) - 1 else "older"} row {s} has no file on the disk')
+            else:
+                on_disk.remove(s)
+        if on_disk and key in by:
+            bad.append(f'{key}: {len(on_disk)} more files than rows')
     return rows, bad
 
 
@@ -1000,7 +1004,8 @@ def read_ke_khai(path):
           and isinstance(d['hop_thu'].get('readme_sha256'), str) and isinstance(d.get('nhat_ky'), dict)
           and all(isinstance(v, dict) and isinstance(v.get('co'), int) and isinstance(v.get('sha256'), str)
                   for v in d['nhat_ky'].values())
-          and isinstance(d.get('tro_ly_codex'), dict) and isinstance(d['tro_ly_codex'].get('lan_goi'), list))
+          and isinstance(d.get('tro_ly_codex'), dict) and isinstance(d['tro_ly_codex'].get('lan_goi'), list)
+          and all(isinstance(c, dict) for c in d['tro_ly_codex']['lan_goi']))       # SA3-1
     if not ok:
         raise Refused(f'{path}: not a declaration of ke-khai (fields nhat_ky, loi, hop_thu, tro_ly_codex)')
     return d
@@ -1018,10 +1023,13 @@ def declaration_problems(kk, root):
     if now_nk != kk['nhat_ky']:
         out.append('NHAT_KY or CODEX changed after the declaration')
     hc = load_hoi_codex()
-    bad = [c.get('log') for c in kk['tro_ly_codex']['lan_goi']
-           if not isinstance(c, dict) or c.get('model') != hc.MODEL or c.get('effort') != hc.EFFORT]
+    bad = [c.get('log') for c in kk['tro_ly_codex']['lan_goi'] if c.get('model') != hc.MODEL or c.get('effort') != hc.EFFORT]
     if bad:
         out.append(f'Codex calls not on {hc.MODEL} / {hc.EFFORT}: {bad}')
+    if {c.get('log') for c in kk['tro_ly_codex']['lan_goi']} != {c['log'] for c in codex_calls(root)}:
+        out.append('Codex call logs differ from the declaration')
+    _, bb = box_check(os.path.join(root, HOP_THU_DIR))                     # SA-22: the mailbox itself, now
+    out.extend(f'mailbox: {x}' for x in bb)
     return out
 
 
@@ -1035,8 +1043,13 @@ def load_hoi_codex():
 
 
 def codex_cli_version():
-    exe = load_hoi_codex().CODEX_EXE
-    return _tool_version([exe, '--version']) if os.path.isfile(exe) else ''
+    """Version of the pinned Codex, asked only after its SHA matches the pin (SA3-2: never run another program)."""
+    hc = load_hoi_codex()
+    if not os.path.isfile(hc.CODEX_EXE):
+        return ''
+    if sha256(hc.CODEX_EXE) != hc.CODEX_SHA256:
+        return 'SHA khác bản đã thử rào'
+    return _tool_version([hc.CODEX_EXE, '--version'])
 
 
 def ke_khai(a):
@@ -1048,6 +1061,19 @@ def ke_khai(a):
         raise Refused('give --truoc <last declaration> (append-only check), or --lan-dau for the first one (SA-18)')
     if not re.fullmatch(r'hop_thu_A_[A-Za-z0-9_-]+\.yaml', os.path.basename(a.out)):
         raise Refused('--out: name hop_thu_A_<tag>.yaml, in the folder of A (every declaration in one place, SA-18)')
+    folder = os.path.dirname(os.path.abspath(a.out))
+    if a.truoc:                                                            # SA-18: the newest declaration only
+        if real(os.path.dirname(os.path.abspath(a.truoc))) != real(folder):
+            raise Refused('--truoc: a declaration in the same folder as --out')
+        mine = str(read_ke_khai(a.truoc).get('luc', ''))
+        for n in os.listdir(folder):
+            if re.fullmatch(r'hop_thu_A_[A-Za-z0-9_-]+\.yaml', n):
+                try:
+                    other = str(read_ke_khai(os.path.join(folder, n)).get('luc', ''))
+                except (Refused, yaml.YAMLError):
+                    continue
+                if other > mine:
+                    raise Refused(f'--truoc: {n} is newer; give the newest declaration')
     prev = read_ke_khai(a.truoc)['nhat_ky'] if a.truoc else None
     if a.lan_dau and [n for n in os.listdir(os.path.dirname(os.path.abspath(a.out)))
                       if n.startswith('hop_thu_A') and n.endswith('.yaml')]:
@@ -1128,14 +1154,22 @@ def kiem_c13(a):
     okm, note = False, ''
     try:
         js = read_json(os.path.join(os.path.dirname(a.mien_a), 'mien_A.json'))
+        run = os.path.join(THESIS, js['s03_run'])                         # SA-20: from the S03 run, not the JSON
+        m = s03_run_ok(run)
+        src = all(sha256(os.path.join(run, n)) == js['sha256'][n] for n in ('sweep.csv', 'levels.csv', 'meta.yaml'))
+        with open(a.mien_a, 'rb') as f:
+            again = _mien_csv_bytes(mien_rows(run)) == f.read().replace(b'\r\n', b'\n')
         same = os.path.isfile(mp) and sha256(mp) == sha256(a.mien_a)
-        box = all(os.path.isfile(os.path.join(hop, n)) and sha256(os.path.join(hop, n)) == js['sha256'][n]
+        box = all(os.path.isfile(os.path.join(hop, n)) and sha256(os.path.join(hop, n)) == sha256(os.path.join(run, n))
                   for n in ('sweep.csv', 'levels.csv'))
-        lock_day = git(THESIS, 'show', '-s', '--format=%cs', a.spec_commit)
-        after = js.get('s03_date', '') >= lock_day
-        okm = same and box and after
-        note = f'mien {same}, sweep/levels trong hộp thư cùng lượt S03 {box}, S03 {js.get("s03_date")} sau khóa {lock_day} {after}'
-    except (Refused, OSError, KeyError, ValueError) as exc:
+        lock_day = dt.date.fromisoformat(git(THESIS, 'show', '-s', '--format=%cs', a.spec_commit))
+        run_day = m.get('date')
+        run_day = run_day if isinstance(run_day, dt.date) else dt.date.fromisoformat(str(run_day))
+        after = run_day >= lock_day
+        okm = src and again and same and box and after
+        note = (f'nguồn S03 khớp {src}, tính lại khớp {again}, hộp thư = meta A {same}, sweep/levels hộp thư cùng '
+                f'lượt S03 {box}, S03 {run_day} sau khóa {lock_day} {after}')
+    except (Refused, OSError, KeyError, ValueError, TypeError) as exc:
         note = str(exc)
     res.append(('8 miền A: bằng meta.yaml A, cùng lượt S03 với hộp thư, S03 chạy sau khóa S05', okm, note))
     for k, ok, n in res:

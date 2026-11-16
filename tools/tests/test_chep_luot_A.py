@@ -631,3 +631,42 @@ def test_box_check(world):
     (world['hop'] / '.dang_chep_x').mkdir()
     _, bad = C.box_check(str(world['hop']))
     assert any('no file on the disk' in x for x in bad) and any('temp folder' in x for x in bad)
+
+
+def test_round3_fixes(world, monkeypatch, capsys):
+    """SA3-1 element types; SA3-2 version only after the SHA; SA-18 newest baseline; SA-17 one file per row;
+    SA-22 the mailbox itself checked against a declaration."""
+    w = world
+    sa = w['sa']
+    fence_files(sa, monkeypatch)
+    bad = w['tmp'] / 'b.yaml'
+    bad.write_text('loi: []\nhop_thu: {readme_sha256: x}\nnhat_ky: {}\ntro_ly_codex: {lan_goi: [null]}\n',
+                   encoding='utf-8')
+    with pytest.raises(C.Refused):
+        C.read_ke_khai(str(bad))
+    exe = w['tmp'] / 'codex.exe'
+    exe.write_bytes(b'gia')
+    hc = C.load_hoi_codex()
+    hc.CODEX_EXE = str(exe)
+    monkeypatch.setattr(C, 'load_hoi_codex', lambda: hc)
+    monkeypatch.setattr(C, '_tool_version', lambda cmd: pytest.fail('ran a program with a wrong SHA'))
+    assert C.codex_cli_version() == 'SHA khác bản đã thử rào'
+    monkeypatch.setattr(C, '_tool_version', lambda cmd: '')
+    kk = w['tmp'] / 'kk'
+    kk.mkdir()
+    a0, a1, a2 = (str(kk / f'hop_thu_A_{i}.yaml') for i in range(3))
+    C.main(['--stra-a', str(sa), 'ke-khai', '--out', a0, '--lan-dau'])
+    import time
+    time.sleep(1.1)
+    C.main(['--stra-a', str(sa), 'ke-khai', '--out', a1, '--truoc', a0])
+    capsys.readouterr()
+    assert C.main(['--stra-a', str(sa), 'ke-khai', '--out', a2, '--truoc', a0]) == 2
+    assert 'newer' in capsys.readouterr().out
+    assert C.main(args(w)) == 0 and C.main(args(w, thay=True)) == 0         # same bytes twice
+    cu = next(n for n in os.listdir(w['hop'] / 'luot') if '__cu_' in n)
+    os.remove(w['hop'] / 'luot' / cu / 'log.csv')
+    _, bb = C.box_check(str(w['hop']))
+    assert any('log.csv' in x and 'no file on the disk' in x for x in bb)
+    d = C.read_ke_khai(a1)
+    (w['hop'] / 'spec.md').write_text('đổi\n', encoding='utf-8')
+    assert any(x.startswith('mailbox:') for x in C.declaration_problems(d, str(sa)))
