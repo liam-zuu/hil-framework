@@ -887,7 +887,11 @@ def check_u_file(u):
 def yaw_minus_gz(L, w0, w1, period_s=PERIOD_S, j_lim=J_LIM_S, h_lim=H_LIM_S):
     """Diagnostic (roll/pitch investigation 3.1, Liam 16/11): raw chip yaw (no scale correction, no tau) minus the
     integral of gz, both from the first kept rotation vector report at or after w0, on the receive-time clock,
-    up to w1 or the first gap where gz is not integrable. Not a check; kiem only reports it."""
+    up to w1 or the first gap where gz is not integrable or not finite (KG-1). het_cua_so: the points reach both
+    ends of [w0, w1] within h_lim (KG-2). A MISMATCH indicator only (KG-3): gz is the body rate about the sensor
+    z axis; with roll or pitch not zero it differs from the yaw rate (Euler kinematics; pitch 4.6 deg over 720 deg
+    of yaw gives about 2.3 deg with perfect sensors), so a value does not by itself say which one is wrong.
+    Not a check; kiem only reports it."""
     S = rv_samples(L, period_s=period_s, j_lim=j_lim, h_lim=h_lim)
     tr, psi = S['t_recv'][S['keep']], S['psi_all'][S['keep']]
     k = np.nonzero((tr >= w0) & (tr <= w1))[0]
@@ -897,14 +901,16 @@ def yaw_minus_gz(L, w0, w1, period_s=PERIOD_S, j_lim=J_LIM_S, h_lim=H_LIM_S):
     d, ig = [0.0], 0.0
     for i in range(1, k.size):
         g = _gz_integral(S['tg'], S['gz'], tr[k[i - 1]], tr[k[i]], h_lim)
-        if g is None:
+        x = None if g is None else psi[k[i]] - psi[k[0]] - (ig + g)
+        if x is None or not (math.isfinite(g) and math.isfinite(x)):          # KG-1: keep the finite prefix
             break
         ig += g
-        d.append(float(psi[k[i]] - psi[k[0]] - ig))
+        d.append(float(x))
     d = np.array(d)
     m = int(np.argmax(np.abs(d)))
+    full = d.size == k.size and tr[k[0]] - w0 <= h_lim and w1 - tr[k[-1]] <= h_lim      # KG-2
     out.update(max_abs_rad=float(abs(d[m])), end_rad=float(d[-1]), t_max_s=float(tr[k[m]] - w0),
-               n_points=int(d.size), het_cua_so=bool(d.size == k.size))
+               n_points=int(d.size), het_cua_so=bool(full))
     return out
 
 

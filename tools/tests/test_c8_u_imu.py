@@ -1002,6 +1002,30 @@ def test_kiem_reports_chip_yaw_minus_gz_integral(tmp_path):
     assert r2['ok'] == (r2['align_ok'] and r2['compared_ok'] and r2['n_over'] == 0 and r2['closure_ok'] is True)
 
 
+def test_kiem_gz_diagnostic_stops_at_bad_gz_and_short_log(tmp_path):
+    """KG-1: an empty gz cell stops the series at the finite prefix (JSON still written); KG-2: a log that ends
+    before the window end is not reported as covering it."""
+    fr, lg = _c8_pair(tmp_path)
+    u = _u_file(tmp_path, lg, tau=0.004)                     # U_IMU from the clean log (tong refuses NaN gz, CU-6)
+    rows = list(csv.DictReader(open(lg, encoding='utf-8')))
+    k = next(i for i, r in enumerate(rows) if float(r['timestamp_us']) > 20e6 and r['gyro_n'] != rows[i - 1]['gyro_n'])
+    rows[k]['gz'] = ''
+    with open(lg, 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    r = U.kiem(fr, lg, 0.5, u, 'O1-F08', u_psi=math.radians(0.5))
+    g = r['yaw_tru_gz']
+    assert math.isfinite(g['end_rad']) and g['het_cua_so'] is False and 100 < g['n_points'] < 250
+    json.dumps(r, allow_nan=False)
+    t2 = tmp_path / 'b'
+    t2.mkdir()
+    fr2, lg2 = _c8_pair(t2, t_tail=3.5)
+    u2 = _u_file(t2, lg2, tau=0.004)
+    g2 = U.kiem(fr2, lg2, 0.5, u2, 'O1-F08', u_psi=math.radians(0.5))['yaw_tru_gz']
+    assert g2['n_points'] > 300 and g2['het_cua_so'] is False
+
+
 def test_kiem_closure_catches_uncorrected_scale(tmp_path):
     fr, lg = _c8_pair(tmp_path, s_plus=0.02)
     u = _u_file(tmp_path, lg, tau=0.004, delta=0.001)
