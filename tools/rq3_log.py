@@ -529,13 +529,24 @@ def segment_totals(segments: List[dict]) -> dict:
     return {**{f't_{k}_s': v for k, v in tot.items()}, 't_operator_wait_s': wait}
 
 
-def read_gate_json(path: str) -> dict:
-    """The gate block of a scorer output (key 'gate_v3', hil_o1_score.py) or a bare gate dict."""
+def has_gate(r: dict) -> bool:
+    """A logged row carries a gate: a gate column other than gate_json_sha256 is filled (CC1-2: a lost run may carry
+    the sha256 of its scorer file alone, without a gate)."""
+    return any(r.get(c) for c in GATE_COLS if c != 'gate_json_sha256')
+
+
+def read_gate_json(path: str, allow_null: bool = False) -> Optional[dict]:
+    """The gate block of a scorer output (key 'gate_v3', hil_o1_score.py) or a bare gate dict. allow_null (CC1-2,
+    Codex round 1 of CODE_CAM c7_calib_drift; Liam 17/11 at CODE_GATE "Sửa, gộp nhánh này (Recommended)"): a scorer
+    output of a run lost to the measurement with 'gate_v3': null gives None (the run is logged with the file's sha256
+    only, so so-h finds its H0 file)."""
     try:
         with open(path, encoding='utf-8') as f:
             d = json.load(f)
     except (OSError, ValueError) as exc:
         raise LogError(f'--gate-json {path!r}: {exc}')
+    if allow_null and isinstance(d, dict) and 'gate_v3' in d and d['gate_v3'] is None:
+        return None
     g = d.get('gate_v3', d) if isinstance(d, dict) else None
     if not isinstance(g, dict) or not str(g.get('version', '')).startswith('gate_v3'):
         raise LogError(f'--gate-json {path!r}: no gate_v3 block (fwsim/o1_gate.py)')
@@ -980,7 +991,7 @@ def outcome_vs_gate(outcome: str, ev: dict, decide, fail_cause: str = '') -> Opt
 def count_no_gate(tun: List[dict]) -> int:
     """SC3-2: dat rows outside the campaigns (historic rows) with empty gate columns, reported apart."""
     return sum(r.get('run_outcome') == 'dat' and r.get('campaign') not in CAMPAIGNS
-               and not any(r.get(c) for c in GATE_COLS) for r in tun)
+               and not has_gate(r) for r in tun)
 
 
 def query_files_needed(row: dict, outcome: str) -> bool:
@@ -1177,7 +1188,7 @@ def check_score_final(r: dict, path: str, ds: str) -> tuple:
     if d.get('outcome') != final or sorted(flags) != sorted(want):
         raise LogError(f"score_final {path!r}: outcome {d.get('outcome')!r}, flags {flags} disagree with "
                        f'the rule of O1 §4 ({final!r}, {want})')
-    if o0 != 'hong_he_do' or any(r.get(c) for c in GATE_COLS):
+    if o0 != 'hong_he_do' or has_gate(r):
         g = gate_columns(read_gate_json(path))
         diff = sorted(c for c, v in g.items() if c != 'gate_json_sha256' and str(r.get(c, '')) != v)
         if diff:
@@ -1401,7 +1412,10 @@ def check_gate_rows(tun: List[dict], gate_file=None) -> None:
             if bbad:
                 raise LogError(f"{r.get('run_uid')}: run_outcome {r.get('run_outcome')!r} but {bbad} (S05 4.7 (iv); "
                                f'a run failed by operation is hong_he_do, {BOOT_FAIL})')
-        if not any(r.get(c) for c in GATE_COLS):
+        if not has_gate(r):
+            if r.get('gate_json_sha256') and r.get('run_outcome') != 'hong_he_do':                  # CC1-2
+                raise LogError(f"{r.get('run_uid')}: a scorer file without its gate (gate_json_sha256 only) is for a "
+                               'run lost to the measurement only')
             # R134 (d) SC3-2 (HIL rows have their own rule for every judged outcome, Codex S315-1)
             if r.get('run_outcome') == 'dat' and r.get('campaign') in CAMPAIGNS and r.get('platform') != 'HIL':
                 raise LogError(f"{r.get('run_uid')}: run_outcome 'dat' without gate columns ({NO_GATE_EVIDENCE}, "
@@ -1573,7 +1587,7 @@ def check_map_rows(tun: List[dict]) -> None:
                 and map_refused([c for c in r.get('gate_decide', '').split(',') if c])):
             raise LogError(f'{uid}: fail cause {MAP_REFUSED} on a row that is not a HIL hong_he_do run with a gate '
                            'deciding g1,g2 only')
-        if r.get('platform') == 'HIL' and r.get('run_outcome') in VALID and not any(r.get(c) for c in GATE_COLS):
+        if r.get('platform') == 'HIL' and r.get('run_outcome') in VALID and not has_gate(r):
             raise LogError(f"{uid}: HIL run {r.get('run_outcome')} without its gate (--gate-json): S05 v3.15 4.5 "
                            'step 2 needs it to tell a mapped run from a refused one')
 
@@ -1713,6 +1727,12 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
     if fail_cause == MAP_REFUSED and (gate is None or run['row'].get('platform') != 'HIL'):
         raise LogError(f'--fail-cause {MAP_REFUSED}: a HIL run with its scorer output (--gate-json) showing the '
                        'refused mapping (S05 v3.15 4.5 step 2)')
+    if gate is None and gate_sha256:                   # CC1-2: the scorer file of a lost run, without a gate
+        if outcome != 'hong_he_do':
+            raise LogError(f'a scorer file without its gate (gate_v3 null) only for a run lost to the measurement, not '
+                           f'{outcome}')
+        if not results_dir:
+            raise LogError('--gate-json needs --results-dir (so-h looks for the H0 scorer file there, C9D-1)')
     if gate is not None:
         if not results_dir:
             raise LogError('--gate-json needs --results-dir (the run must be scorable again, GV3-6)')
@@ -1747,6 +1767,8 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
         row['e_perp_max_m'] = f'{e_perp_max:.4f}'
     if gate is not None:
         row.update(gate_columns(gate, gate_sha256))
+    elif gate_sha256:
+        row['gate_json_sha256'] = gate_sha256           # CC1-2
     if asked:
         row.update(boot_before=boot_before or '', boot_after=boot_after or '')
     if queries is not None:                            # R134 (1): the files the two answers came from
@@ -2766,7 +2788,7 @@ def main(argv=None) -> int:
                                'end logs the provisional outcome with the H0 scoring (score.json of the run), then '
                                'so-h --run-uid <run> --score-final <this file> after the clip H comparison')
             row = end(ds, a.outcome, a.completed, a.e_perp_max, a.fail_cause, a.results_dir, a.notes,
-                      gate=read_gate_json(a.gate_json) if a.gate_json else None,
+                      gate=read_gate_json(a.gate_json, allow_null=a.outcome == 'hong_he_do') if a.gate_json else None,
                       gate_sha256=sha256_file(a.gate_json) if a.gate_json else '',
                       gate_file=read_gate_file(a.gate_file) if a.gate_file else None, c8b_gio=a.c8b_gio or None,
                       **boots)

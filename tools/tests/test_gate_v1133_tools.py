@@ -447,3 +447,50 @@ def test_c8b_summary_refuses_an_edited_row(ds):
     rl._write_all(p, rl.TUNING_COLS, rows)
     with pytest.raises(rl.LogError, match='without fail cause'):
         rl.summary(d)
+
+
+# ── CC1-2 (Codex round 1 of CODE_CAM c7_calib_drift; Liam 17/11 at CODE_GATE "Sửa, gộp nhánh này (Recommended)"): a floor
+# run lost to the measurement whose scorer file has gate_v3 null is logged with the file's sha256, so so-h finds it ──
+
+def _lost_score(d, tmp, name):
+    import s05_fake_runs as fr
+    folder = str(tmp / name)
+    fr.write_final_run(folder, 'HW', dict(ctrl='PID', id=1, gains=dict(kp_xy=1.0, ki_xy=0.5, kp_wz=1.0, ki_wz=0.2, pos_kp=6.0, pos_ki=3.0, k_psi=1.0)),
+                       score_extra=dict(outcome='hong_he_do', gate_v3=None))
+    return folder, os.path.join(folder, 'score.json')
+
+
+def test_cc1_2_lost_run_without_gate_through_end_and_so_h(ds):
+    d, gf, tmp = ds
+    folder, sp = _lost_score(d, tmp, 'lost1')
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    assert rl.main(['--dataset', d, 'end', '--outcome', 'hong_he_do', '--fail-cause', 'mat_khung_FAKE',
+                    '--results-dir', folder, '--gate-json', sp]) == 0
+    row = rl.read_rows(os.path.join(d, rl.TUNING))[-1]
+    assert row['gate_json_sha256'] == rl.sha256_file(sp) and not rl.has_gate(row)
+    r = rl.so_h(d, row['run_uid'], rl.fake_score_final(folder, 0.8))
+    assert r['outcome_sau'] == 'hong_he_do'
+    rl.summary(d)
+
+
+def test_cc1_2_gate_null_only_for_a_lost_run(ds):
+    d, gf, tmp = ds
+    folder, sp = _lost_score(d, tmp, 'lost2')
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    with pytest.raises(rl.LogError, match='no gate_v3 block'):
+        rl.read_gate_json(sp)                                                 # judged outcomes: as before
+    with pytest.raises(rl.LogError, match='only for a run lost'):
+        rl.end(d, 'chua_ket_luan', completed=1, results_dir=folder, gate=None, gate_sha256=rl.sha256_file(sp),
+               queries=rl.fake_queries())
+    with pytest.raises(rl.LogError, match='results-dir'):
+        rl.end(d, 'hong_he_do', completed=1, fail_cause='mat_khung_FAKE', gate=None, gate_sha256=rl.sha256_file(sp))
+    rl.end(d, 'hong_he_do', completed=1, fail_cause='mat_khung_FAKE', results_dir=folder, gate=None,
+           gate_sha256=rl.sha256_file(sp))
+    p = os.path.join(d, rl.TUNING)
+    rows = rl.read_rows(p)
+    rows[-1].update(run_outcome='khong_dat', campaign='')                    # edited by hand: refused
+    rl._write_all(p, rl.TUNING_COLS, rows)
+    with pytest.raises(rl.LogError, match='lost to the measurement only'):
+        rl.summary(d)
