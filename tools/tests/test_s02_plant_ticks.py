@@ -892,18 +892,24 @@ def _reads_hold(W, counts, c0, o_true, t_reads):
 
 
 @needs_gcc
-def test_an_edge_the_model_moves_past_a_stop_does_not_exclude_the_true_count():
+@pytest.mark.parametrize('end,t_read', [('stop', 4000), ('stop_near', 1950), ('log_end', 4000)])
+def test_an_edge_the_model_moves_past_a_stop_does_not_exclude_the_true_count(end, t_read):
     """S2M5-1 (Codex round 5 of v3): FL starts (raw 6348, hp 1229 us), slows down to raw 246 (hp 31 701 us) 1187 us
-    later with a 60 us window (under the wide_windows limit, 153.6 us), stops at 6000 us. The true slow-down comes
-    after the first callback, so the other channel keeps its old edge: two true edges before the stop (encoder_gen.c),
-    one simulated. With both pins high at the start (+2) the true count +4 at 4000 us was refused for every offset."""
+    later with a 60 us window (under the wide_windows limit, 153.6 us), then stops at 6000 us ('stop'), at 2000 us
+    ('stop_near': the missing edge 154 us before the stop), or the log ends at 6000 us still moving ('log_end'). The
+    true slow-down comes after the first callback, so the other channel keeps its old edge: two true edges before the
+    end (encoder_gen.c, 1232 and 1846 us), one simulated. With both pins high at the start (+2) the true count +4 was
+    refused for every offset."""
     S = 1_600_000
-    lo = np.r_[100_000.0 + 1000.0 * np.arange(1500), S + np.array([0.0, 1187.0, 6000.0]),
-               S + 7000.0 + 1000.0 * np.arange(50)]
+    t_end = 2000.0 if end == 'stop_near' else 6000.0
+    tail = [] if end == 'log_end' else list(S + t_end + 1000.0 + 1000.0 * np.arange(50))
+    lo = np.r_[100_000.0 + 1000.0 * np.arange(1500), S + np.array([0.0, 1187.0, t_end]), tail]
     width = np.zeros(len(lo))
     width[1500], width[1501], width[1502] = 4.0, 60.0, 4.0
     raw = np.zeros(len(lo))
     raw[1500], raw[1501] = 6348, 246
+    if end == 'log_end':
+        raw[1502] = 246
     true = (lo + width).astype(np.int64)
     sc = np.float32(EM.HIL_OMEGA_MAX) / np.float32(32767.0)
     om32 = np.zeros((len(lo), 4), np.float32)
@@ -915,10 +921,10 @@ def test_an_edge_the_model_moves_past_a_stop_does_not_exclude_the_true_count():
         if o_true == 2:
             break
     assert o_true == 2
-    assert int(counts.at([S + 4000])[0, 0]) - c0 == 4                   # two true edges before the stop
+    assert int(counts.at([S + t_read])[0, 0]) - c0 == 4                 # two true edges before the end
     t_min, t_max, ok, use = W.bounds(np.array([1]), np.array([4.0]), 2)
     assert ok[0] and not use[0]
-    assert _reads_hold(W, counts, c0, o_true, np.arange(S - 500, S + 6000, 7)) > 800
+    assert _reads_hold(W, counts, c0, o_true, np.arange(S - 500, S + t_end, 7)) > 200
     assert W.segs[1]['n_edges'] == 1 and W.segs[1].get('open_hi')
 
 
