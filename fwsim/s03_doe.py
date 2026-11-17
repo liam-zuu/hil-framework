@@ -423,6 +423,21 @@ def comparable(r):
             and math.isfinite(_num(r, 'e_perp_max')) and math.isfinite(_num(r, 'tv_duty')))
 
 
+CHECK_RTOL = 1e-12   # S84-1: the bounds of S03 v8.4 3.1 are inclusive; a difference of two binary64 numbers carries
+#                      rounding (0.03 - 0.02 = 0.009999999999999998), so it is compared within 1e-12 of the largest
+#                      operand (about 3e-14 m for e_perp_max near 0.03 m): no real widening of the thresholds
+
+
+def not_above_by(x, ref, thr):
+    """x - ref <= thr ('x not higher than ref by more than thr'), within rounding (CHECK_RTOL)."""
+    return x - ref <= thr + CHECK_RTOL * max(abs(x), abs(ref), abs(thr))
+
+
+def lower_by_at_least(x, ref, thr):
+    """ref - x >= thr ('x lower than ref by at least thr'), within rounding (CHECK_RTOL)."""
+    return ref - x >= thr - CHECK_RTOL * max(abs(x), abs(ref), abs(thr))
+
+
 def classify_point(pt, bd, gate, thr):
     """S03 v8.4 section 3.1: one point outside [L, H] against the run at the nearer level. pt, bd: {v: sweep row
     or None} of the point and of the level, middle mu; gate: speeds still in the gate; thr: {v: Y3 threshold}.
@@ -439,11 +454,13 @@ def classify_point(pt, bd, gate, thr):
     else:
         e = {v: (_num(pt[v], 'e_perp_max'), _num(bd[v], 'e_perp_max')) for v in gate}
         tv = {v: (_num(pt[v], 'tv_duty'), _num(bd[v], 'tv_duty')) for v in gate}
-        not_worse = all(e[v][0] - e[v][1] <= e_thr and tv[v][0] - tv[v][1] <= thr[v] for v in gate)
-        better = any(e[v][1] - e[v][0] >= e_thr or (thr[v] > 0 and tv[v][1] - tv[v][0] >= thr[v]) for v in gate)
+        not_worse = all(not_above_by(*e[v], e_thr) and not_above_by(*tv[v], thr[v]) for v in gate)
+        better = any(lower_by_at_least(*e[v], e_thr) or (thr[v] > 0 and lower_by_at_least(*tv[v], thr[v]))
+                     for v in gate)
         res, step = ('cờ', 3) if (not_worse and better) else ('không cờ', 4)
     bao = res != 'cờ' and any(comparable(pt.get(v)) and comparable(bd.get(v))
-                              and _num(bd[v], 'e_perp_max') - _num(pt[v], 'e_perp_max') >= e_thr for v in gate)
+                              and lower_by_at_least(_num(pt[v], 'e_perp_max'), _num(bd[v], 'e_perp_max'), e_thr)
+                              for v in gate)
     return res, step, bao
 
 
@@ -1556,7 +1573,7 @@ interpretations:   # of this script, not written in S03 v8 / O1 v7; Liam or THES
   - "B81-3 (15/11, Liam CODE_FEAS 'code di'): the G1 fields of O1 3.5 last block and the common domain are written (G1_RUN_COLS after gate_outcome): t_done = t_end when completed 'true', t1 = first tracking-error frame, prog_before_t1 = progress strictly before t1, cond25_before_deadline = cond2_5_ever (o1_gate_eval.g1_fields_v7, from the evaluate_v7 summary, which is unchanged); G1 recomputed from them must agree with the state from completed (o1_gate.gate raises, so a run_error); one way of using the frames: g1_ways 1, g1_t_done_2 and g1_cat_t1 empty, _chung the same as the union; gate_version stays gate_v3.2 (tools/rq3_log.py accepts only that version)"
   - "v8.3: the sweep grid is the v8 grid (sweep_grid, unchanged; C12 keeps it for its box [a, b]) plus b r^k, k = 1..K, r = (b/a)^(1/10), K the smallest integer with r^K >= 10 (1 - 1e-9), found by a loop on r**k; omega_o is not extended (cap 48); v8.4: the extension still runs with the sweep, only for the out-of-range check; the level rule runs on the original grid (11 log points, the default, 0)"
   - "v8.3 (agreed with CODE_C13 15/11): luoi of the default value is mac_dinh even when it is on a log point, the (default check) and (default) rows are mac_dinh; L_nguon 'hết lưới dưới' when L is the lowest grid point and L > 0; v8.4: H_nguon 'hết lưới' when H = b, 'trần ω_o' instead for omega_o when b = 48; levels.csv keeps b_n (the extension end) for reference only"
-  - "v8.4 out-of-range check: a run is comparable when it exists, completed 'true', status 'ok' and its e_perp_max and tv_duty are finite; a point below L is put against the run at L, above H against H; the Y2 threshold is 0.01 m and the Y3 threshold 20 % of the default-gain run at the middle mu, same speed (section 5.2), a non-finite Y3 threshold makes the point inconclusive; the differences are compared as floats with no tolerance (e_pt - e_lvl <= 0.01, e_lvl - e_pt >= 0.01); bao_rieng = not flagged and, at one gate speed where both are comparable, e_perp_max lower by >= 0.01 m; buoc is the step of section 3.1 that matched"
+  - "v8.4 out-of-range check: a run is comparable when it exists, completed 'true', status 'ok' and its e_perp_max and tv_duty are finite; a point below L is put against the run at L, above H against H; the Y2 threshold is 0.01 m and the Y3 threshold 20 % of the default-gain run at the middle mu, same speed (section 5.2), a non-finite Y3 threshold makes the point inconclusive; the bounds are inclusive and compared within rounding, 1e-12 of the largest operand (CHECK_RTOL, S84-1: 0.03 - 0.02 is 0.009999999999999998 in binary64); bao_rieng = not flagged and, at one gate speed where both are comparable, e_perp_max lower by >= 0.01 m; buoc is the step of section 3.1 that matched"
   - "v8.4 out-of-range check totals: 'không kiểm' for every controller when S03 stopped at 3.1 (i) or (ii); 'đã kiểm đủ' when every factor of the controller has levels; else 'kiểm dở' (the sweep stopped part way): factors with levels are checked, every grid point (original and extension) of a factor without levels counts in n_chua_kiem, n_gain_chua_kiem counts those factors; every grid is computed before the first sweep run. A flagged point in any controller stops S03 before design.csv (exit code 2); inconclusive points without a flag are printed as a WARNING and S03 goes on"
   - "v8.2: the public sweep carries the G columns too (Liam 14/11 CODE_FEAS 'Co, mot cach cham'); G3-G5 are not responses of section 5"
 elapsed_s: {sweep_s}

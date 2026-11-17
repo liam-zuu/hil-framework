@@ -217,6 +217,53 @@ def test_v66_read_domain_reads_the_out_of_range_check(tmp_path):
     assert s4.read_out_of_range(str(d), 'ADRC')[('pos_kp', 'H')] == '0 điểm (lượt kiểm: kiểm dở)'
 
 
+def test_v66_fingerprint_locks_the_check_file(tmp_path):
+    """S84-2: read_domain reads kiem_ngoai_mien.csv, so the fingerprint of trial / main / post holds its SHA-256
+    (None for an S03 run without it); any byte changed after the trial changes the fingerprint."""
+    d = _s03_dir(tmp_path)
+    dll = str(d / 'design.csv')                                   # any file: only its hash is taken
+    f0 = s4.fingerprint(dll, str(d))
+    assert f0['s03_files']['kiem_ngoai_mien.csv'] is None
+    k = d / 'kiem_ngoai_mien.csv'
+    k.write_bytes('dong,controller,factor,value,can,ket_qua\n'.encode('utf-8'))
+    f1 = s4.fingerprint(dll, str(d))
+    assert f1['s03_files']['kiem_ngoai_mien.csv'] == s3.sha256_file(str(k)) and f1 != f0
+    k.write_bytes('dong,controller,factor,value,can,ket_qua\n\n'.encode('utf-8'))   # a blank line only
+    assert s4.fingerprint(dll, str(d)) != f1
+
+
+def test_v66_check_file_alias_refused_before_it_is_opened(tmp_path, monkeypatch):
+    """S84-3: a hard link (or a symbolic link, when the system allows one) at kiem_ngoai_mien.csv to a sealed file is
+    refused by read_domain and fingerprint before the file is opened or hashed."""
+    import builtins
+    d = _s03_dir(tmp_path)
+    (d / 'sealed_test').mkdir()
+    target = d / 'sealed_test' / 'runs_test.csv'
+    target.write_text('controller,point_id\n', encoding='utf-8')
+    k = d / 'kiem_ngoai_mien.csv'
+    os.link(str(target), str(k))
+    opened = []
+    real_open = builtins.open
+
+    def spy(f, *a, **kw):
+        opened.append(os.path.basename(str(f)))
+        return real_open(f, *a, **kw)
+    monkeypatch.setattr(builtins, 'open', spy)
+    with pytest.raises(SystemExit, match='one name'):
+        s4.read_domain(str(d), 'PID')
+    with pytest.raises(SystemExit, match='one name'):
+        s4.fingerprint(str(d / 'design.csv'), str(d))
+    monkeypatch.setattr(builtins, 'open', real_open)
+    assert 'kiem_ngoai_mien.csv' not in opened and 'runs_test.csv' not in opened
+    os.remove(str(k))
+    try:
+        os.symlink(str(target), str(k))
+    except (OSError, NotImplementedError):
+        return                                                    # no symlink right on this system
+    with pytest.raises(SystemExit, match='link'):
+        s4.read_domain(str(d), 'PID')
+
+
 DOM64 = [dict(name='a', L=1.0, H=2.0, scale='lin', L_src='hết lưới dưới', H_src='hết lưới', L_kiem='0 điểm',
               H_kiem='2 điểm: không cờ 2, chưa kết luận 0, cờ 0'),
          dict(name='b', L=1.0, H=3.0, scale='lin', L_src='0', H_src='điểm kế tiếp không hoàn thành'),

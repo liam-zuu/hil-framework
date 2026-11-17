@@ -363,22 +363,34 @@ def test_them_bad_reason_changes_nothing(world, capsys):
 
 # ── mien ───────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-SCOLS = ['controller', 'factor', 'value', 'v', 'luoi', 'completed']
+SCOLS = ['controller', 'factor', 'value', 'v', 'mu', 'luoi', 'completed']
 LCOLS = ['controller', 'factor', 'L', 'H', 'default', 'a', 'b', 'b_n', 'L_nguon', 'H_nguon']
 PID_G = ['kp_xy', 'ki_xy', 'kp_wz', 'ki_wz', 'pos_kp', 'pos_ki', 'k_psi']
 ADRC_G = ['omega_c_xy', 'omega_o_xy', 'omega_c_wz', 'omega_o_wz', 'pos_kp', 'pos_ki', 'k_psi']
 
 
-KCOLS = ['dong', 'controller', 'factor', 'value', 'luoi', 'can', 'can_value', 'ket_qua']
+KCOLS = ['dong', 'controller', 'factor', 'value', 'luoi', 'can', 'can_value', 'ket_qua', 'n_diem_ngoai', 'n_da_kiem',
+         'n_chua_kiem', 'n_co', 'n_chua_ket_luan', 'n_khong_co']
 
 
-def kiem_ok_rows():
-    """S03 v8.4 kiem_ngoai_mien.csv of the fixture: the extension point 8.0 of every non-omega_o gain, 'không cờ';
-    one total per controller, 'đã kiểm đủ'."""
-    rows = [dict(dong='diem', controller=c, factor=g, value='8.0', luoi='noi', can='H', can_value='2.0',
-                 ket_qua='không cờ') for c, gs in (('PID', PID_G), ('ADRC', ADRC_G)) for g in gs
-            if not g.startswith('omega_o')]
-    return rows + [dict(dong='tong', controller=c, ket_qua='đã kiểm đủ') for c in ('PID', 'ADRC')]
+def kiem_ok_rows(omega_hi=48.0):
+    """S03 v8.4 kiem_ngoai_mien.csv of the fixture: every grid point outside [L, H] = [0.5, 2] (0 against L; 4, 8 or
+    the omega_o top against H), 'không cờ'; one total per controller, 'đã kiểm đủ', with its counts (S84-5)."""
+    rows, tot = [], []
+    for c, gs in (('PID', PID_G), ('ADRC', ADRC_G)):
+        n = 0
+        for g in gs:
+            om = g.startswith('omega_o')
+            for x in [0.0, 0.5, 1.0, 2.0] + ([omega_hi] if om else [4.0, 8.0]):
+                if 0.5 <= x <= 2.0:
+                    continue
+                rows.append(dict(dong='diem', controller=c, factor=g, value=repr(x),
+                                 luoi='0' if x == 0 else ('noi' if (not om and x == 8.0) else 'log'),
+                                 can='L' if x < 0.5 else 'H', can_value='0.5' if x < 0.5 else '2.0', ket_qua='không cờ'))
+                n += 1
+        tot.append(dict(dong='tong', controller=c, ket_qua='đã kiểm đủ', n_diem_ngoai=n, n_da_kiem=n, n_chua_kiem=0,
+                        n_co=0, n_chua_ket_luan=0, n_khong_co=n))
+    return rows + tot
 
 
 def s03_run(tmp, name='2026-11-20_run03', meta=None, speeds=('0.2', '0.5', '0.8'), drop=None, extra=None,
@@ -388,7 +400,8 @@ def s03_run(tmp, name='2026-11-20_run03', meta=None, speeds=('0.2', '0.5', '0.8'
     sw, lv = [], []
     for c, gs in (('PID', PID_G), ('ADRC', ADRC_G)):
         for v in speeds:
-            sw.append(dict(controller=c, factor='(default check)', value='', v=v, luoi='mac_dinh', completed='true'))
+            sw.append(dict(controller=c, factor='(default check)', value='', v=v, mu='0.5', luoi='mac_dinh',
+                           completed='true'))
         for g in gs:
             om = g.startswith('omega_o')
             pts = [0.0, 0.5, 1.0, 2.0] + ([omega_hi] if om else [4.0, 8.0])
@@ -397,10 +410,14 @@ def s03_run(tmp, name='2026-11-20_run03', meta=None, speeds=('0.2', '0.5', '0.8'
                     if drop and drop(c, g, x, v):
                         continue
                     lu = '0' if x == 0 else ('noi' if (not om and x == 8.0) else 'log')
-                    sw.append(dict(controller=c, factor=g, value=repr(x), v=v, luoi=lu, completed='true'))
+                    sw.append(dict(controller=c, factor=g, value=repr(x), v=v, mu='0.5', luoi=lu, completed='true'))
             lv.append(dict(controller=c, factor=g, L='0.5', H='2.0', default='1.0', a='0.5',
                            b=repr(omega_hi) if om else '4.0', b_n='' if om else '8.0', L_nguon='0',
                            H_nguon='trần ω_o' if om else 'điểm kế tiếp không hoàn thành'))
+        for mu in ('0.4', '0.6'):                         # S84-4: S03 also runs the default gains at the low, high mu
+            for v in speeds:
+                sw.append(dict(controller=c, factor='(default)', value='', v=v, mu=mu, luoi='mac_dinh',
+                               completed='true'))
     if extra:
         sw.append(extra)
     if lev_edit:
@@ -409,7 +426,7 @@ def s03_run(tmp, name='2026-11-20_run03', meta=None, speeds=('0.2', '0.5', '0.8'
         sw_edit(sw)
     wcsv(run / 'sweep.csv', SCOLS, sw)
     wcsv(run / 'levels.csv', LCOLS, lv)
-    kr = kiem_ok_rows()
+    kr = kiem_ok_rows(omega_hi)
     if kiem_edit:
         kr = kiem_edit(kr)
     if kr is not None:
@@ -500,6 +517,17 @@ def rename_gain(sw):
     (dict(kiem_edit=lambda kr: kr + [dict(dong='tong', controller='PID', ket_qua='đã kiểm đủ')]), 'two total rows'),
     (dict(kiem_edit=lambda kr: [dict(kr[0], ket_qua='co')] + kr[1:]), 'not in'),
     (dict(kiem_edit=lambda kr: [dict(kr[0], dong='x')] + kr[1:]), 'is not diem or tong'),
+    # S84-5: the point rows must be exactly the points outside [L, H] of the sweep, the totals must agree
+    (dict(kiem_edit=lambda kr: [r for r in kr if r['dong'] == 'tong']), 'do not match'),
+    (dict(kiem_edit=lambda kr: [r for r in kr if not (r['dong'] == 'diem' and r['controller'] == 'PID'
+                                                     and r['factor'] == 'kp_xy' and r['can'] == 'L')]), 'do not match'),
+    (dict(kiem_edit=lambda kr: [kr[0]] + kr), 'twice'),
+    (dict(kiem_edit=lambda kr: [dict(kr[0], can='H')] + kr[1:]), 'wrong side'),
+    (dict(kiem_edit=lambda kr: kr[:-1] + [dict(kr[-1], n_khong_co=int(kr[-1]['n_khong_co']) - 1)]), 'do not agree'),
+    (dict(kiem_edit=lambda kr: kr[:-1] + [dict(kr[-1], n_chua_kiem=1)]), 'do not agree'),
+    # S84-4: the default rows are complete per mu
+    (dict(sw_edit=lambda sw: sw.remove(next(r for r in sw if r['factor'] == '(default)' and r['mu'] == '0.4'))),
+     "at mu '0.4'"),
     (dict(sw_edit=lambda sw: sw.append(dict(controller='PID', factor='kp_xy', value='1', v='0.2', luoi='log',
                                             completed='true'))), 'once each'),       # SA-16
 ])
@@ -508,6 +536,27 @@ def test_mien_refuses(w0, capsys, kw, msg):
     assert C.main(mien_args(w0, run)) == 2
     assert msg in capsys.readouterr().out
     assert not (w0['tmp'] / 'A' / 'mien_A.csv').exists()
+
+
+def test_kiem_c13_item8_sees_a_changed_check_file(w0, capsys, monkeypatch):
+    """S84-6: the check file is hashed in mien_A.json, so kiem-c13 item 8 fails when kiem_ngoai_mien.csv changes
+    after the domain was made (here one blank line: the domain computed again is the same)."""
+    run = s03_run(w0['tmp'])
+    assert C.main(mien_args(w0, run)) == 0
+    monkeypatch.setattr(C, '_tool_version', lambda cmd: '')
+    real_git = C.git
+    monkeypatch.setattr(C, 'git', lambda root, *a: '2026-11-19' if a[:2] == ('show', '-s') else real_git(root, *a))
+    cmd = ['--stra-a', str(w0['sa']), 'kiem-c13', '--spec-commit', 'HEAD', '--ke-khai', str(w0['tmp'] / 'kk.yaml'),
+           '--mien-a', str(w0['tmp'] / 'A' / 'mien_A.csv')]
+    capsys.readouterr()
+    C.main(cmd)
+    line8 = next(x for x in capsys.readouterr().out.splitlines() if ' 8 ' in x)
+    assert 'nguồn S03 khớp True' in line8 and 'tính lại khớp True' in line8
+    k = run / 'kiem_ngoai_mien.csv'
+    k.write_bytes(k.read_bytes() + b'\r\n')
+    C.main(cmd)
+    line8 = next(x for x in capsys.readouterr().out.splitlines() if ' 8 ' in x)
+    assert line8.startswith('CHƯA') and 'nguồn S03 khớp False' in line8 and 'tính lại khớp True' in line8
 
 
 def test_mien_default_alias(w0, capsys):

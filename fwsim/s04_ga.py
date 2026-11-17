@@ -71,6 +71,7 @@ import hashlib
 import json
 import math
 import os
+import stat
 import sys
 import time
 
@@ -216,12 +217,33 @@ def read_domain(s03_dir, ctrl):
     return out
 
 
+KIEM_FILE = 'kiem_ngoai_mien.csv'      # S03 v8.4 section 3.1
+
+
+def kiem_file(s03_dir):
+    """S84-3: the path of the S03 v8.4 check file, None when the S03 run has none. Refused before it is opened or
+    hashed when it is a link or junction, resolves anywhere else (a link on its path), is not a plain file or has
+    a second hard link: it must never alias a sealed file (L56; every caller of read_domain and fingerprint, the
+    RSM script too, goes through here)."""
+    p = os.path.join(s03_dir, KIEM_FILE)
+    if not os.path.lexists(p):
+        return None
+    real = os.path.normcase(os.path.realpath(p))
+    if (os.path.islink(p) or getattr(os.path, 'isjunction', lambda q: False)(p)
+            or real != os.path.normcase(os.path.abspath(p))):
+        sys.exit(f'{p} is a link or resolves to {real}: refused (S04 v6.6, L56)')
+    st = os.lstat(p)
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
+        sys.exit(f'{p}: not a plain file with one name ({st.st_nlink} links): refused (S04 v6.6, L56)')
+    return p
+
+
 def read_out_of_range(s03_dir, ctrl):
     """S04 v6.6 section 2: {(factor, 'L' | 'H'): summary} of the S03 v8.4 kiem_ngoai_mien.csv for one controller,
     e.g. '4 điểm: không cờ 4, chưa kết luận 0, cờ 0' (a side without points: '0 điểm'), with '(lượt kiểm: <total>)'
     when the total of the controller is not 'đã kiểm đủ'. {} when the S03 run has no such file (before v8.4)."""
-    p = os.path.join(s03_dir, 'kiem_ngoai_mien.csv')
-    if not os.path.isfile(p):
+    p = kiem_file(s03_dir)
+    if p is None:
         return {}
     rows = [r for r in read_csv(p) if r['controller'] == ctrl]
     tot = [r['ket_qua'] for r in rows if r['dong'] == 'tong']
@@ -1069,7 +1091,7 @@ def pymoo_file_hashes():
 
 def fingerprint(dll, s03_dir, unsealed=False):
     """S4C-2: what must not change between the trial, the main runs and the post checks of one folder
-    (S04 7): the DLL, the S03 files the domain and the mu rule come from (sealed/runs.csv only with
+    (S04 7): the DLL, the S03 files the domain and the mu rule come from (v6.6: kiem_ngoai_mien.csv too; sealed/runs.csv only with
     --s03-unsealed, L56), the plant source blobs (L34), the Python sources the simulation and the
     scoring import (SOURCES), D, the library versions and the pymoo files of PYMOO_CV."""
     names = ('meta.yaml', 'levels.csv', 'design.csv') + (('sealed/runs.csv',) if unsealed else ())
@@ -1077,6 +1099,8 @@ def fingerprint(dll, s03_dir, unsealed=False):
     for n in names:
         p = os.path.join(s03_dir, n)
         s03_files[n] = s3.sha256_file(p) if os.path.isfile(p) else None
+    kp = kiem_file(s03_dir)                     # S84-2: read_domain reads it (S04 v6.6), so it is locked too;
+    s03_files[KIEM_FILE] = s3.sha256_file(kp) if kp else None     # S84-3: checked before it is hashed
     root = os.path.join(HERE, '..')
     scripts = {n: s3.sha256_file(os.path.join(root, n)) for n in SOURCES}
     return dict(dll_sha256=s3.sha256_file(dll), s03_files=s03_files, plant_src=fwsim.PLANT_SRC, scripts=scripts, D=D,

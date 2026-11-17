@@ -1928,6 +1928,13 @@ def _all(**k):
     (_w(_all(), {0.5: _kr(e=0.03), 0.8: _kr(tv=1.5)}), _all(), GATE3, THR, ('không cờ', 4, True)),
     # step 4: nothing better
     (_all(), _all(), GATE3, THR, ('không cờ', 4, False)),
+    # S84-1: inclusive bounds between two non-zero binary64 numbers (0.03 - 0.02 = 0.009999999999999998)
+    (_w(_all(e=0.03), {0.5: _kr(e=0.02)}), _all(e=0.03), GATE3, THR, ('cờ', 3, False)),
+    (_w(_all(e=0.03), {0.2: _kr(e=0.04), 0.5: _kr(e=0.02)}), _all(e=0.03), GATE3, THR, ('cờ', 3, False)),
+    (_w(_all(), {0.8: _kr(tv=0.8)}), _all(), GATE3, THR, ('cờ', 3, False)),             # 1.0 - 0.8 against 0.2
+    (_w(_all(e=0.03), {0.5: _kr(e=0.0201)}), _all(e=0.03), GATE3, THR, ('không cờ', 4, False)),   # just short
+    (_w(_all(e=0.03), {0.5: _kr(e=0.02), 0.8: _kr(e=0.03, tv=1.5)}), _all(e=0.03), GATE3, THR,
+     ('không cờ', 4, True)),
 ])
 def test_v84_classify_point_steps(pt, bd, gate, thr, want):
     assert s3.classify_point(pt, bd, gate, thr) == want
@@ -2155,6 +2162,41 @@ def test_v84_main_check_totals_when_s03_stops_in_the_sweep(tmp_path, monkeypatch
     tmp2.mkdir()
     code, out, _, _, _ = _run_main(tmp2, monkeypatch, capsys, default_fails=True)
     assert code == 2
+    assert [r['ket_qua'] for r in _csv.DictReader(open(out / 'kiem_ngoai_mien.csv', encoding='utf-8'))] == \
+        ['không kiểm', 'không kiểm']
+
+
+@needs_dll
+def test_v84_main_case_ii_after_one_controller_is_not_checked(tmp_path, monkeypatch, capsys):
+    """S84-6: PID sweeps fully, ADRC has L = H (omega_c_xy completes only at its default): S03 stops at 3.1 (ii)
+    raised in main, both totals 'không kiểm', no point row, no main-design run."""
+    import csv as _csv
+
+    def over(ctrl, g, v):
+        return dict(completed='false') if ctrl == 'ADRC' and g['omega_c_xy'] != 8.0 else None
+    code, out, console, calls, _ = _run_main(tmp_path, monkeypatch, capsys, row_over=over)
+    assert code == 2 and '3.1 (ii)' in console and max(calls) <= 1
+    kiem = list(_csv.DictReader(open(out / 'kiem_ngoai_mien.csv', encoding='utf-8')))
+    assert [(r['dong'], r['controller'], r['ket_qua']) for r in kiem] == [('tong', 'PID', 'không kiểm'),
+                                                                          ('tong', 'ADRC', 'không kiểm')]
+    assert 'S03 stopped at 3.1 (ii)' in kiem[0]['ghi_chu']
+
+
+@needs_dll
+def test_v84_main_case_i_from_the_level_rule_keeps_its_mark(tmp_path, monkeypatch, capsys):
+    """S84-6: the default point of the PID sweep fails at 0.8 although the default check passed: levels_from_sweep
+    raises (i), main raises it again with the factor name, the mark '(i)' survives: both totals 'không kiểm'."""
+    import csv as _csv
+    seen = dict(n=0)
+
+    def over(ctrl, g, v):
+        if ctrl == 'PID' and all(g[n] == FAKE_DEFAULTS['PID'][n] for n in s3.FACTORS['PID']):
+            seen['n'] += 1
+            if seen['n'] > 3 and v == 0.8:                 # after the 3 runs of the default check
+                return dict(completed='false')
+        return None
+    code, out, console, calls, _ = _run_main(tmp_path, monkeypatch, capsys, row_over=over)
+    assert code == 2 and 'PID kp_xy: default gains do not complete' in console
     assert [r['ket_qua'] for r in _csv.DictReader(open(out / 'kiem_ngoai_mien.csv', encoding='utf-8'))] == \
         ['không kiểm', 'không kiểm']
 
