@@ -861,3 +861,37 @@ def test_cc2_2_same_gate_values_with_other_text_accepted():
 def test_cc2_2_single_track_gates_checked_below_eps():
     with pytest.raises(ValueError, match='gates'):
         cd.combine(DRIFT_OK, sc('dat'), dict(tr('s0'), gates={}), 'f0')
+
+
+# ---------------------------------------------------------------- test gaps Codex listed in round 3 (guards)
+def test_cc3_c7b_failed_keeps_a_null_offset(tmp_path, monkeypatch):
+    """The C7b match run and failed (sync.ok False): the lost file carries a null offset and source."""
+    import c7_score as cs
+    import types
+    monkeypatch.setattr(cs, 'clock_match', lambda frames, rows, task: (types.SimpleNamespace(ok=False, why='test'),
+                                                                      None))
+    b, _ = _real_score(tmp_path, 'c7b_fail', offset=False)
+    assert b['outcome'] == 'hong_he_do' and 'C7b' in b['outcome_reasons'][0]
+    assert b['offset_s'] is None and b['offset_src'] is None and b['t0_log_us'] is not None
+
+
+@pytest.mark.parametrize('field, val', [('rule', 'other'), ('hang_so', {'file': 'x.json'})])
+def test_cc3_gate_text_fields_not_compared(field, val):
+    a, ta, fa = sc('dat'), tr('s0'), 'f0'
+    b, tb, fb = sc('dat', frames='f1'), tr('s1', frames='f1'), 'f1'
+    tb = dict(tb, gates=dict(tb['gates'], **{field: val}))
+    assert cd.combine(DRIFT_OVER, a, ta, fa, b, tb, fb)['outcome'] == 'dat'
+
+
+@pytest.mark.parametrize('bad', ['missing', 'bool', 'inf'])
+def test_cc3_h1_gates_bad_while_h0_good(bad):
+    a, ta, fa = sc('dat'), tr('s0'), 'f0'
+    b, tb, fb = sc('dat', frames='f1'), tr('s1', frames='f1'), 'f1'
+    g = dict(tb['gates'])
+    k = next(iter(cm.GATE_KEYS))
+    if bad == 'missing':
+        del g[k]
+    else:
+        g[k] = True if bad == 'bool' else float('inf')
+    with pytest.raises(ValueError, match='gates'):
+        cd.combine(DRIFT_OVER, a, ta, fa, b, dict(tb, gates=g), fb)
