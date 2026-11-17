@@ -82,12 +82,13 @@ def expected(test, log, tr, t0_us):
 
 
 def frames_of(log, tr, D=D_TRUE, fps=30.0, seed=3, lost=None, rest_noise=0.0, t_end=None, speed=None,
-              lost_pose=False):
+              lost_pose=False, rate=0.0):
     """frames.csv rows (c7_measure.read_frames layout): frames every 1/fps (+- 2 ms) from 1 s before the first log
     line to t_end (s from T0; default 1 s after the last line), pose, speed, wz of the truth at the frame's true time;
     lost(t) -> True for an invalid frame (no pose; lost_pose: a wrong but finite pose, 0.5 m off, as a frame refused
     by c7_measure's gates keeps it); rest_noise: +rest_noise m on x over [-0.5, -0.25) s and -rest_noise over
-    [-0.25, 0) (mean 0 over the 0.5 s rest only); speed(t) replaces the camera speed."""
+    [-0.25, 0) (mean 0 over the 0.5 s rest only); speed(t) replaces the camera speed; rate: the video clock runs
+    fast by this fraction (t_cam = t_log - D + rate * t)."""
     rng = np.random.default_rng(seed)
     ts = log['timestamp_us'] * 1e-6
     t0, t1 = ts[0] - 1.0, (ts[-1] + 1.0 if t_end is None else T0 * 1e-6 + t_end)
@@ -105,7 +106,7 @@ def frames_of(log, tr, D=D_TRUE, fps=30.0, seed=3, lost=None, rest_noise=0.0, t_
     for k in range(len(t_log)):
         bad = bool(lost(t_rel[k])) if lost is not None else False
         no = bad and not lost_pose
-        rows.append(dict(idx=k, t_s=t_log[k] - D, valid=not bad, why=['lost'] if bad else [], n_marks=4,
+        rows.append(dict(idx=k, t_s=t_log[k] - D + rate * t_rel[k], valid=not bad, why=['lost'] if bad else [], n_marks=4,
                          rms_px=0.3, shift_px=0.1, cam_z=2.5, car_seen=not bad,
                          x=nan if no else X[k] + (0.5 if bad else 0.0), y=nan if no else Y[k],
                          psi=nan if no else float(R.wrap(PSI[k])),
@@ -133,21 +134,40 @@ def log_rows(log, tmp_path, name='log.csv'):
     return str(p), V.read_log_rows(str(p))
 
 
-def plant_dict(out):
-    """s02_metrics.load_plant of the tool's rows (cells as written)."""
-    data = np.array([[float(c) if c != '' else np.nan for c in r] for r in out]).reshape(len(out), len(V.COLUMNS))
-    pl = {c: data[:, i] for i, c in enumerate(V.COLUMNS)}
-    pl['_row'] = {int(t): i for i, t in enumerate(pl['timestamp_us'])}
+def _table(rows, cols):
+    data = np.array([[float(c) if c != '' else np.nan for c in r] for r in rows]).reshape(len(rows), len(cols))
+    t = {c: data[:, i] for i, c in enumerate(cols)}
+    t['_row'] = {int(x): i for i, x in enumerate(t['timestamp_us'])}
+    return t
+
+
+def plant_dict(out, cam=None, info=None):
+    """What s02_metrics._plant_inputs gives for the tool's rows (cells as written): the plant table with the camera
+    frames under '_cam' (and the camera t_miss)."""
+    pl = _table(out, V.COLUMNS)
+    if cam is not None:
+        pl['_cam'] = _table(cam, V.CAM_COLUMNS)
+        pl['_cam']['t_miss_s'] = info['t_miss_s'] if info else V.T_MISS
     return pl
 
 
-def scored(test, tmp_path, frames_kw=None, **kw):
+def scored(test, tmp_path, frames_kw=None, drop=None, **kw):
+    """(log, truth, info, plant, metrics) of a made-up run through the tool; drop: mask of log lines lost (taken
+    out of the log before the tool and the scoring see it)."""
     log, tr = run_of(test, **kw)
+    if drop is not None:
+        log = drop_lines(log, drop)
     _, rows = log_rows(log, tmp_path)
-    info, out = V.map_video(frames_of(log, tr, **(frames_kw or {})), rows)
-    pl = plant_dict(out) if out else None
+    info, out, cam = V.map_video(frames_of(log, tr, **(frames_kw or {})), rows)
+    pl = plant_dict(out, cam, info) if out else None
     m = M.score_run(log, test, 'real', plant=pl) if pl is not None else None
     return log, tr, info, pl, m
+
+
+def drop_lines(log, drop):
+    out = {c: x[~drop] for c, x in log.items() if not c.startswith('_')}
+    out['_all'] = out['_every'] = out
+    return out
 
 
 @pytest.mark.parametrize('test', ['A-L2', 'A-L1', 'A-C2', 'A-C1', 'A-S2', 'A-F2'])
@@ -196,10 +216,33 @@ def test_rest_pose_is_the_mean_before_t0_not_the_value_at_t0(tmp_path):
     assert np.ptp(pl['x'][rest]) > 0.01                               # the noise is on the rest lines
     ex = expected('A-L2', log, tr, t0)
     assert m['e_p_max'] == pytest.approx(ex['e_p_max'], abs=0.003)
-    pl2 = {k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in pl.items()}
-    pl2['x'][np.flatnonzero(rest)[3]] = np.nan                        # one rest line without a pose
-    m2 = M.score_run(log, 'A-L2', 'real', plant=pl2)
-    assert m2['r_reason'] == 'no_rest_pose' and math.isnan(m2['e_p_rms'])
+    pl2 = dict(pl)
+    pl2['x'] = pl['x'].copy()
+    pl2['x'][np.flatnonzero(rest)[3]] = np.nan                        # a rest log line without a pose: not used
+    assert M.score_run(log, 'A-L2', 'real', plant=pl2)['e_p_max'] == pytest.approx(m['e_p_max'], abs=1e-12)
+    cam = pl['_cam']
+    tc = (cam['timestamp_us'] - t0) * 1e-6
+    keep = ~((tc >= -0.45) & (tc < 0.0))                              # camera frames: rest no longer covered
+    pl3 = dict(pl, _cam=dict({k: v[keep] for k, v in cam.items() if k in V.CAM_COLUMNS}, t_miss_s=0.4))
+    m3 = M.score_run(log, 'A-L2', 'real', plant=pl3)
+    assert m3['r_reason'] == 'no_rest_pose' and math.isnan(m3['e_p_rms'])
+    assert M.score_run(log, 'A-L2', 'real', plant=dict(pl, _cam=None))['r_reason'] == 'no_rest_pose'
+
+
+def test_lost_log_lines_in_the_rest_do_not_move_the_rest_pose(tmp_path):
+    """S2V1-4 (Codex round 1): half of the log lines in [-0.5, -0.25) s lost (the +2 cm half of the rest noise): the
+    rest pose comes from the camera frames, so the family R is the same as with every line (a mean over the log
+    lines would move by about 1 cm)."""
+    log, tr = run_of('A-L2')
+    t = (log['timestamp_us'] - T0) * 1e-6
+    drop = np.zeros(len(t), bool)
+    drop[np.flatnonzero((t >= -0.5) & (t < -0.25))[::2]] = True          # every other line (log_seq jumps of 2)
+    (tmp_path / 'a').mkdir()
+    (tmp_path / 'b').mkdir()
+    _, _, _, _, m_all = scored('A-L2', tmp_path / 'a', frames_kw=dict(rest_noise=0.02))
+    _, _, _, _, m_drop = scored('A-L2', tmp_path / 'b', frames_kw=dict(rest_noise=0.02), drop=drop)
+    assert m_drop['e_p_max'] == pytest.approx(m_all['e_p_max'], abs=1e-4)
+    assert m_drop['e_p_rms'] == pytest.approx(m_all['e_p_rms'], abs=1e-4)
 
 
 @pytest.mark.parametrize('gap_s,lost,lost_pose', [(0.5, False, False), (0.9, True, False), (0.5, False, True),
@@ -225,17 +268,48 @@ def test_a_camera_gap_longer_than_t_miss_is_camera_lost(tmp_path, gap_s, lost, l
         assert m['r_reason'] == '' and m['e_p_max'] == pytest.approx(ex['e_p_max'], abs=0.003)
 
 
-def test_no_extrapolation_past_the_last_frame(tmp_path):
-    """The video ends at t = 4 s (inside the window [1, 6] s of A-L2; the fit window is cut there): later lines have
-    no pose and no cam_lost (the camera does not cover them, not a gap); the family R has a gap (plant_pose_gap), not
-    camera_lost. (A-L1 cut at 9 s: its last third has no camera, the clock is not ok.)"""
+def test_a_video_that_ends_before_the_stop_is_not_scored(tmp_path):
+    """The video ends at t = 4 s, before the stop of A-L2 (6 s): the stop edge is not covered (S2V1-2), the clock is
+    not ok, no pose rows (S2V1-7: the uncovered end is a camera loss, not a silent gap)."""
     log, tr, info, pl, m = scored('A-L2', tmp_path, frames_kw=dict(t_end=4.0))
+    assert not info['ok'] and info['reason'].startswith('clock_sync_failed (edges_not_covered: stop')
+    assert pl is None and info['edge_gaps_s']['start'] < V.T_GAP
+
+
+def test_frames_lost_at_both_edges_are_not_scored_with_a_wrong_offset(tmp_path):
+    """S2V1-2 (Codex round 1, reproduced: D 46 ms off, corr 0.999, ok): frames lost over [-0.15, 0.35) s and
+    [5.85, 6.35) s (gaps 0.54 s < T_MISS, a short window) -> clock_sync_failed (edges_not_covered); the same loss in
+    the middle of the run (3.0-3.5 s) is scored."""
+    log, tr, info, pl, m = scored('A-L2', tmp_path, frames_kw=dict(
+        lost=lambda t: (-0.15 <= t < 0.35) or (5.85 <= t < 6.35)))
+    assert not info['ok'] and 'edges_not_covered' in info['reason'] and pl is None
+    assert info['edge_gaps_s']['start'] > V.T_GAP and info['edge_gaps_s']['stop'] > V.T_GAP
+    (tmp_path / 'mid').mkdir()
+    log, tr, info, pl, m = scored('A-L2', tmp_path / 'mid', frames_kw=dict(lost=lambda t: 3.0 <= t < 3.5))
+    assert info['ok'] and info['offset_s'] == pytest.approx(D_TRUE, abs=0.002)
+    assert max(info['edge_gaps_s'].values()) < 0.05
+
+
+def test_frames_lost_just_inside_the_edge_span_are_refused(tmp_path):
+    """A gap of 0.15 s (> T_GAP 0.10 s) 0.5 s after the start, inside [edge - 0.2, edge + 1.0] s: refused; the same
+    gap 1.2 s after the start (outside the span) is scored."""
+    log, tr, info, pl, m = scored('A-L1', tmp_path, frames_kw=dict(lost=lambda t: 0.5 <= t < 0.65))
+    assert not info['ok'] and info['reason'].startswith('clock_sync_failed (edges_not_covered: start')
+    (tmp_path / 'b').mkdir()
+    log, tr, info, pl, m = scored('A-L1', tmp_path / 'b', frames_kw=dict(lost=lambda t: 1.25 <= t < 1.4))
     assert info['ok'], info['reason']
-    t_rel = (pl['timestamp_us'] - T0) * 1e-6
-    after = t_rel > 4.05
-    assert np.all(np.isnan(pl['x'][after])) and np.all(np.isnan(pl['cam_lost'][after]))
-    assert info['n_outside'] == int(np.sum(np.isnan(pl['cam_lost'])))
-    assert m['r_reason'] == 'plant_pose_gap' and math.isnan(m['e_p_rms'])
+
+
+def test_a_start_end_difference_over_50_ms_is_clock_sync_failed(tmp_path):
+    """S2V1-1 (Codex round 1): spec P2-3 refuses a start/end difference over 50 ms; o1_time_sync only checks
+    |D - mean(start, end)|, which a steady drift keeps near 0. A video clock 1 % fast over A-L1 (thirds about 5 s
+    apart: about 50-60 ms) is refused; 0.1 % fast is scored."""
+    log, tr, info, pl, m = scored('A-L1', tmp_path, frames_kw=dict(rate=0.012))
+    assert not info['ok'] and info['reason'].startswith('clock_sync_failed (start/end'), info['reason']
+    assert abs(info['sync']['start_end_diff_s']) > 0.05 and info['sync']['ok']       # o1_time_sync alone: ok
+    (tmp_path / 'b').mkdir()
+    log, tr, info, pl, m = scored('A-L1', tmp_path / 'b', frames_kw=dict(rate=0.001))
+    assert info['ok'], info['reason']
 
 
 def test_pose_at_by_hand():
@@ -243,7 +317,9 @@ def test_pose_at_by_hand():
     x = np.array([0.0, 1.0, 2.0, 12.0, 13.0])
     X, Y, P, L = V.pose_at(np.array([-0.01, 0.0, 0.05, 0.2, 0.7, 1.2, 1.25, 1.3, 1.31]), t, x, x, x, t_miss=0.68)
     np.testing.assert_allclose(X[[1, 2, 3, 5, 6, 7]], [0.0, 0.5, 2.0, 12.0, 12.5, 13.0])
-    assert np.isnan(X[0]) and np.isnan(L[0]) and np.isnan(X[8]) and np.isnan(L[8])     # outside: no pose, no flag
+    assert np.isnan(X[0]) and np.isnan(L[0]) and np.isnan(X[8]) and np.isnan(L[8])     # just outside: no pose, no flag
+    X2, _, _, L2 = V.pose_at(np.array([-0.69, -0.67, 1.97, 1.99]), t, x, x, x, t_miss=0.68)
+    assert np.all(np.isnan(X2)) and L2[0] == 1 and np.isnan(L2[1]) and np.isnan(L2[2]) and L2[3] == 1  # S2V1-7
     assert np.isnan(X[4]) and L[4] == 1                                                 # inside a 1 s gap
     assert L[3] == 0 and L[5] == 0                                                      # on the frames at its ends
     X, Y, P, L = V.pose_at(np.array([0.7]), t, x, x, x, t_miss=1.0)
@@ -251,32 +327,42 @@ def test_pose_at_by_hand():
 
 
 def test_the_window_starts_at_the_first_command_not_at_run_active(tmp_path):
-    """The S02 preparation (zero commands, run_active up from about -2.9 s) is not in the fit window."""
+    """The S02 preparation (zero commands, run_active up from about -2.9 s) is not in the fit window; a stray
+    non-zero command before the rising edge, or on a motor-off line, is not the run's first command (S2V1-6)."""
     log, _ = run_of('A-L2')
     _, rows = log_rows(log, tmp_path)
     ta, tb = V.s02_window(rows)
     t_first = (log['timestamp_us'][np.flatnonzero(log['sp_vx'] != 0)[0]]) * 1e-6
     assert ta == pytest.approx(t_first - 0.5) and ta > (T0 * 1e-6 - 1.0)
+    log2 = {c: (x.copy() if isinstance(x, np.ndarray) else x) for c, x in log.items()}
+    log2['sp_vx'][3] = 0.2                                            # before the rising edge (k = 10)
+    k = 50
+    log2['sp_vy'][k] = 0.3                                            # inside the run, motor off
+    log2['motor_on'][k] = 0.0
+    log2['_all'] = log2['_every'] = log2
+    _, rows2 = log_rows(log2, tmp_path, 'stray.csv')
+    assert V.s02_window(rows2) == (ta, tb)
+    assert V.run_commands(rows2)[0] == pytest.approx(t_first)
 
 
 def test_a_camera_speed_that_does_not_match_is_clock_sync_failed(tmp_path):
     rng = np.random.default_rng(5)
     log, tr, info, pl, m = scored('A-L1', tmp_path, frames_kw=dict(speed=lambda t: rng.uniform(0, 0.3, len(t))))
-    assert not info['ok'] and info['reason'].startswith('clock_sync_failed') and pl is None
-    assert info['offset_s'] is None
+    assert not info['ok'] and pl is None and info['offset_s'] is None
+    assert info['sync']['ok'] is False and info['reason'] == f"clock_sync_failed ({info['sync']['why']})"
 
 
 def test_gyro_cross_check_is_reported_only(tmp_path):
     log, tr = run_of('A-C1')
     _, rows = log_rows(log, tmp_path)
-    info, out = V.map_video(frames_of(log, tr), rows)
+    info, out, cam = V.map_video(frames_of(log, tr), rows)
     assert info['ok'] and info['gyro'] is not None and info['gyro']['channel'] == 'gyro'
     assert abs(info['gyro_minus_speed_s']) < 0.01
     fr = frames_of(log, tr)
     for f in fr:
         f['wz'] = 0.3                                                  # a gyro channel that cannot be fitted
-    info2, out2 = V.map_video(fr, rows)
-    assert info2['ok'] and info2['offset_s'] == info['offset_s'] and out2 == out
+    info2, out2, cam2 = V.map_video(fr, rows)
+    assert info2['ok'] and info2['offset_s'] == info['offset_s'] and out2 == out and cam2 == cam
 
 
 def test_duplicate_log_lines_are_dropped_and_time_must_increase(tmp_path):
@@ -285,12 +371,15 @@ def test_duplicate_log_lines_are_dropped_and_time_must_increase(tmp_path):
     lines = open(p, encoding='utf-8').read().splitlines()
     (tmp_path / 'dup.csv').write_text('\n'.join(lines[:200] + [lines[199]] + lines[200:]) + '\n', encoding='utf-8')
     assert len(V.read_log_rows(str(tmp_path / 'dup.csv'))) == len(rows)
+    sw = lines[:200] + [lines[201], lines[200]] + lines[202:]          # two lines swapped (UDP): put back in order
+    (tmp_path / 'swap.csv').write_text('\n'.join(sw) + '\n', encoding='utf-8')
+    assert V.read_log_rows(str(tmp_path / 'swap.csv')) == rows
     head = lines[0].split(',')
     back = lines[150].split(',')
-    back[head.index('vx')] = '9.5'                                     # not a byte-for-byte duplicate
+    back[head.index('vx')] = '9.5'                                     # same time, other content: refused
     (tmp_path / 'back.csv').write_text('\n'.join(lines[:200] + [','.join(back)] + lines[200:]) + '\n',
                                        encoding='utf-8')
-    with pytest.raises(ValueError, match='does not increase'):
+    with pytest.raises(ValueError, match='same timestamp_us'):
         V.read_log_rows(str(tmp_path / 'back.csv'))
 
 
@@ -307,6 +396,7 @@ def test_command_line_and_run_dir_metrics_score_the_car(tmp_path, capsys):
     assert info['ok'] and info['inputs']['frames_sha256'] == V.sha256(str(tmp_path / 'frames.csv'))
     assert info['inputs']['track_json_sha256'] == V.sha256(str(tmp_path / 'track.json'))
     assert info['inputs']['log_sha256'] == V.sha256(lp)
+    assert info['plant_sha256'] == V.sha256(out) and info['cam_sha256'] == V.sha256(str(tmp_path / 'r1_plant_cam.csv'))
     assert V.main(['--frames', str(tmp_path / 'frames.csv'), '--log', lp, '--out', out]) == 2
     assert '#ket_qua,ma=2' in capsys.readouterr().out
     pl = M.load_plant(out)
@@ -328,6 +418,24 @@ def test_command_line_and_run_dir_metrics_score_the_car(tmp_path, capsys):
     assert o[1]['r_reason'].startswith('clock_sync_failed') and math.isnan(o[1]['e_p_rms'])
     assert math.isfinite(o[1]['e_vx'])
     assert o[2]['r_reason'] == 'no_video_file'
+    # S2V1-3: the json vouches for these files only
+    import shutil
+    for what in ('plant', 'cam', 'log'):
+        d = tmp_path / f'mm_{what}'
+        d.mkdir()
+        for f in ('r1.csv', 'r1_plant.csv', 'r1_plant_cam.csv', 'r1_plant_video.json'):
+            shutil.copy(tmp_path / f, d / f)
+        f = d / ('r1.csv' if what == 'log' else f'r1_plant{"_cam" if what == "cam" else ""}.csv')
+        txt = f.read_text(encoding='utf-8').splitlines()
+        cells = txt[60].split(',')
+        cells[1] = cells[1] + '1'                                      # one digit more in one cell
+        txt[60] = ','.join(cells)
+        f.write_text('\n'.join(txt) + '\n', encoding='utf-8')
+        (d / 'runs.csv').write_text('run_id,platform,controller,test_id,speed_mps,rep,file\n'
+                                    'r1,real,PID,A-L2,0.5,1,r1.csv\n', encoding='utf-8')
+        assert M.run_dir_metrics(str(d))[0]['r_reason'] == f'video_mismatch ({what})', what
+    os.remove(tmp_path / 'r1_plant_cam.csv')
+    assert M.run_dir_metrics(str(tmp_path), 'm3.csv')[0]['r_reason'] == 'no_cam_file'
 
 
 def test_the_car_on_stands_has_no_family_r():

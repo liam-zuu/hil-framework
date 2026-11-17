@@ -486,3 +486,20 @@ def test_hil_runs_with_a_refused_map_stay_in_the_cell_and_are_counted(tmp_path, 
     txt = capsys.readouterr().out
     assert '(map refused 3: map_apply_window_too_wide 2, no_map_file 1)' in txt
     assert 'not run again (P2-4): rb' in txt and 'run them again' not in txt
+
+
+def test_map_refused_counts_only_ok_hil_runs_without_a_sender_t0():
+    """S2V1-8 (Codex round 1): a SIM run with the same reason, HIL runs that are not ok, and an ok HIL run with
+    another metric reason are not counted; HIL in any letter case is."""
+    ok = dict(status='ok', platform='hil', test_id='A-L2', controller='PID',
+              metric_reason='no_sender_t0 (map_apply_window_too_wide (1 frame-wheels; first: frame 3))')
+    rows = [ok, dict(ok, platform='HIL '), dict(ok, platform='sim'), dict(ok, platform='real'),
+            dict(ok, status='broken'), dict(ok, status='replaced'), dict(ok, status='battery_rerun'),
+            dict(ok, status='aborted'), dict(ok, metric_reason='no_window_rows'), dict(ok, metric_reason=''),
+            dict(ok, metric_reason='no_sender_t0'), dict(ok, metric_reason='no_sender_t0 (no_map_file)')]
+    assert [M.map_refused_reason(r) for r in rows] == [
+        'map_apply_window_too_wide', 'map_apply_window_too_wide', '', '', '', '', '', '', '', '', 'no_sender_t0',
+        'no_map_file']
+    assert M.cell_map_refused(rows) == {
+        ('A-L2', 'hil', 'PID'): {'map_apply_window_too_wide': 1, 'no_sender_t0': 1, 'no_map_file': 1},
+        ('A-L2', 'HIL ', 'PID'): {'map_apply_window_too_wide': 1}}

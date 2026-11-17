@@ -48,9 +48,11 @@ bo phat (Recommended)", "Duyet, code sau gop (Recommended)"); spec S02 v1.13 P2-
   Family R of the car on the floor (real; Viec CODE 5, design section 34): <run>_plant.csv of tools/
     s02_video_metrics.py (camera pose on the log lines, cam_lost) with <run>_plant_video.json (not ok, e.g.
     clock_sync_failed -> no family R, r_reason from it): e_p, e_psi, e_est only (spec P2-3 table, no *_true speeds);
-    the camera pose is taken relative to its mean over the lines in [-REST_S, 0) (spec line 155, Liam 17/11 "0,5 s
-    truoc t = 0"; every such line needs a pose, else no_rest_pose); a window line with cam_lost = 1 -> no family R,
-    r_reason camera_lost (P2-5: measuring system failed). The car on stands (A-K) has no family R (real_lifted).
+    the camera pose is taken relative to its mean over the valid camera frames (<run>_plant_cam.csv) in [-REST_S, 0)
+    (spec line 155, Liam 17/11 "0,5 s truoc t = 0", "Tinh tren khung camera"; no frame or a gap over t_miss there ->
+    no_rest_pose); a window line with cam_lost = 1 -> no family R, r_reason camera_lost (P2-5: measuring system
+    failed); the json must match the log, plant and camera files by SHA-256 (else video_mismatch (what)). The car
+    on stands (A-K) has no family R (real_lifted).
   Loss (P2-5): missing_pct over the motor-on tick stream (1 - distinct ticks / tick span), gen_pause_n (lines one
     tick apart but > 2 ticks apart on the DUT clock), missing_over (> 1 %); missing_seq_pct the older log_seq
     number. Runs not completed (runs.csv aborted != 0, result aborted, broken or replaced, block_status
@@ -103,6 +105,7 @@ vx and vy by r/4 * Q_W = 0.0058 m/s and wz by r/(4 L) * Q_W = 0.024 rad/s.
                                                      # <out_name stem>_columns.json
 """
 import csv
+import hashlib
 import json
 import math
 import os
@@ -564,18 +567,20 @@ def _rel_pose(t, x, y, th, psi0):
     return s02_ref.to_test_frame(x, y, th, z[0], z[1], z[2], psi0)
 
 
-def _rest_rel_pose(t, x, y, th, psi0):
-    """The car's camera pose in the test frame relative to its mean over the lines in [-REST_S, 0) (P2-3 line 155:
-    the rest before t = 0), or None when there is no such line or one of them has no pose."""
-    th = _unwrap_valid(th)
-    rest = (t >= -REST_S - WINDOW_EPS_S) & (t < 0.0)
-    if not rest.any():
+def _rest_rel_pose(x, y, th, psi0, cam, t0_us):
+    """The car's camera pose (x, y, th on the log lines, th already unwrapped with the frames) in the test frame
+    relative to the mean camera pose over the valid frames in [-REST_S, 0) (P2-3 line 155; S2V1-4, Codex round 1,
+    Liam 17/11 "Tinh tren khung camera (Recommended)": the frames of <run>_plant_cam.csv, not the log lines, so lost
+    log lines do not move it), or None when there is no frame there or a gap over the camera t_miss (the span ends
+    counted) leaves the rest uncovered. cam: {'timestamp_us', 'x', 'y', 'theta', 't_miss_s'}."""
+    if cam is None:
         return None
-    v = np.stack([np.asarray(x, dtype=float), np.asarray(y, dtype=float), th], axis=1)[rest]
-    if not np.all(np.isfinite(v)):
+    tc = (np.asarray(cam['timestamp_us'], dtype=float) - t0_us) * 1e-6
+    rest = (tc >= -REST_S - WINDOW_EPS_S) & (tc < 0.0)
+    if not rest.any() or np.max(np.diff(np.r_[-REST_S, tc[rest], 0.0])) > cam['t_miss_s']:
         return None
-    z = v.mean(axis=0)
-    return s02_ref.to_test_frame(x, y, th, z[0], z[1], z[2], psi0)
+    z = [float(np.mean(np.asarray(cam[k], dtype=float)[rest])) for k in ('x', 'y', 'theta')]
+    return s02_ref.to_test_frame(x, y, np.asarray(th, dtype=float), z[0], z[1], z[2], psi0)
 
 
 def _plant_series(plant, prow, name):
@@ -585,7 +590,7 @@ def _plant_series(plant, prow, name):
     return np.where(prow >= 0, plant[name][np.clip(prow, 0, None)], np.nan)
 
 
-def _family_r(log, test_id, t, win, plant, prep_flags, platform=''):
+def _family_r(log, test_id, t, win, plant, prep_flags, platform='', t0_us=NAN):
     """Family R numbers, r_reason and e_est_reason (module docstring); platform real: the camera rows of
     tools/s02_video_metrics.py."""
     m = {}
@@ -629,7 +634,7 @@ def _family_r(log, test_id, t, win, plant, prep_flags, platform=''):
             m['e_vx_true'], m['e_vy_true'], m['e_wz_true'] = rms(e[:, 0]), rms(e[:, 1]), rms(e[:, 2])
     psi0 = s02_ref.start_heading(test_id)
     xyt = [_plant_series(plant, prow, n) for n in ('x', 'y', 'theta')]
-    true = _rest_rel_pose(t, *xyt, psi0) if real else _rel_pose(t, *xyt, psi0)
+    true = _rest_rel_pose(*xyt, psi0, plant.get('_cam'), t0_us) if real else _rel_pose(t, *xyt, psi0)
     if true is None or not all(np.all(np.isfinite(c[win])) for c in true):
         reasons.append(('no_rest_pose' if real else 'no_plant_pose_at_t0') if true is None else 'plant_pose_gap')
         m['e_est_reason'] = 'no_plant_pose'
@@ -779,7 +784,7 @@ def score_run(log, test_id, platform='', prep_s=None, us_cut=None, plant=None, p
         if plant is None:
             m['r_reason'] = plant_reason or 'no_plant_file'
         else:
-            m.update(_family_r(log, test_id, t, win, plant, cmd['prep_flags'], platform))
+            m.update(_family_r(log, test_id, t, win, plant, cmd['prep_flags'], platform, t0))
     return m
 
 
@@ -878,9 +883,33 @@ def _plant_inputs(d, r, path, platform):
             vi = json.load(f)
         if vi.get('ok') is not True:
             return None, str(vi.get('reason') or 'video_not_ok'), None, ''
+        # S2V1-3 (Codex round 1): the json vouches for this log and these two files only
+        cp = os.path.splitext(pp)[0] + '_cam.csv'
+        for what, f, key in (('log', path, ('inputs', 'log_sha256')), ('plant', pp, ('plant_sha256',)),
+                             ('cam', cp, ('cam_sha256',))):
+            want = vi
+            for k in key:
+                want = want.get(k) if isinstance(want, dict) else None
+            if not os.path.isfile(f):
+                return None, f'no_{what}_file', None, ''
+            if not want or _sha256(f) != want:
+                return None, f'video_mismatch ({what})', None, ''
+        plant = load_plant(pp)
+        cam = load_plant(cp)
+        cam['t_miss_s'] = float(vi['t_miss_s'])
+        plant['_cam'] = cam
+        return plant, preason, sender, sreason
     if not os.path.isfile(pp):
         return None, 'no_plant_file', sender, sreason
     return load_plant(pp), preason, sender, sreason
+
+
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for b in iter(lambda: f.read(1 << 20), b''):
+            h.update(b)
+    return h.hexdigest()
 
 
 def run_dir_metrics(d, out_name='metrics.csv'):
