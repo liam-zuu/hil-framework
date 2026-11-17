@@ -13,17 +13,29 @@ khoa (after the C8 clips are tracked and the C8 runs have their clock files):
                  luot": a campaign run outside the C8 range of its level is not concluded)
   man_trap       {alpha_r_s_px, alpha_c_s_px, nguon}: the rolling-shutter read time per row / column x LE from test 3b
                  when it was usable; null = one frame (design 3 table, 4b; the scorer's names, CODE 17/11)
-  U_p  (m)       = LE x [largest per-frame error of the 9 check tags (test 1) + check-tag placement by tape + body-centre
-                 residual of test 2 after the tag-body offset + offset-parameter difference origin / far place of test
-                 2 + re-seating repeatability (position) + tag-height error rho |dh| / (H - h) + plumb / zc error
-                 (h / H) dn + h dzc (rho + dn) / (H (H - dzc - h)) + d_p_quay (3b)]   (plumb, zc: Liam 17/11 evening
-                 at CODE_C8B, "Them, Codex vong 7 hep (Recommended)"; C8BS-R7-1..3)
-  U_psi (deg)    = LE x [heading residual of test 2 after the mounting angle + reference heading error of test 2 (car
-                 set on the tape) + re-seating repeatability (angle) + d_psi_quay (3b)]          (design 5, C8B4-11)
-                 Parts may overlap (conservative), none subtracted. Test 5 (ruler at the stop points) is an end-to-end
-                 check: every difference <= U_p, else 'xem_lai' (not widened by itself).
-  The camera inputs (tests 1, 2, re-seating, height) come from CODE_CAM as one JSON (fields below, interface asked
-  of CODE 17/11); d_p_quay, d_psi_quay and alpha from c8b_3b.py; 3b with ga_ok false: refused (set-up redone).
+  The parts follow the sources P1-P7, A1-A5 of the approved "few hand measurements" page v10 section 2 (Liam 18/11 at
+  CODE_C8B local_8b35516c, "Duyet v10, Codex ra bo cham CAM (Recommended)"; CLAUDE_THESIS 03_CODE/docs/
+  2026-11-18_Trang_C8b_ngan_sach_khong_do_tay_v10.md), field names by v10 (Liam 18/11 at CODE_C8B local_6db0bd09,
+  "Sua c8b_u theo ten v10 (Recommended)"; design: 03_CODE/docs/2026-11-18_Thiet_ke_C8b_o_U_v10_v2.md; the sum and the
+  margin as O1 v11.39 J1, Liam 18/11 at THESIS "Duyet, ra vong khoa (Recommended)"):
+  U_p  (m)       = LE x (P1 + ... + P7),  U_psi (deg) = LE x (A1 + ... + A6), linear, parts may overlap
+                 (conservative), none subtracted; U_p, U_psi bound ONE frame (per-frame noise P7, A5 inside).
+    P1 image -> floor   max(cross-validation largest at the marks on the clip-mean pose, per frame) + mark-shift
+                        detection threshold (nguong + u_so: a shift below it stays in the fit)            [camera file]
+    P2 tag-body centre  |(dx, dy) used by the scorer - R(dpsi used) q| + du + |q| A1[rad]           [c8b_xoay.py]
+    P3 / A2 plate re-seating, position / angle (3 lifts, car still)                                  [camera file]
+    P4 / A4 3b          d_p_quay / d_psi_quay                                                         [c8b_3b.py]
+    P5 plumb / zc       (h / H) dn + h dzc (rho + dn) / (H (H - dzc - h))  (C8BS-R7-1..3)            [camera file]
+    P6 tag height       (rho + s / sqrt 2) dh / (H - h - dh), dh = max_i |c_i - h| + e   (c_i the four corner heights by
+                        caliper, h the height the scorer uses, e the caliper error)                [caliper + camera]
+    P7 / A5 noise       largest deviation from the mean of a still mark, per frame (not sigma)        [camera file]
+    A1 mounting angle   |dpsi used - angle by caliper| + atan(2 e / L) + plate-body angle from the drawing   [caliper]
+    A3 camera by area   largest pair heading error, both marks held out                               [camera file]
+    A6 tag tilt         rho (sum_i |c_i - mean c| + 8 e) / (2 sqrt 2 s (H - max c_i - e))  [rad]: the parallax step
+                        uses one h for the four corners, a corner higher by d moves out by (P_i - C) d / (H - c_i),
+                        which turns the Kabsch fit of car_pose (design v2 section 4; not in page v10: added for Liam)
+  Test 5 (ruler at the stop points, dropped in v10, kept as an option) is an end-to-end check: every difference
+  <= U_p, else 'xem_lai' (not widened by itself). 3b with ga_ok false: refused (set-up redone).
 cong (after every C8 figure-8 run is scored on its clock grid with the locked constants):
   O1 3.9 rule 2b: for each gate level, the runs of the C8 plan written before C8 (slot, task, controller); a rerun
   only replaces a lost run of its slot; runs lost to the measurement system or without a finite U_t are left out;
@@ -36,15 +48,29 @@ cong (after every C8 figure-8 run is scored on its clock grid with the locked co
   checked before the file is opened), then read back with gate_c8.read_gate_c8; an existing file is never replaced.
 
   python tools/c8b_u.py khoa --gio r1=gio_r1.json ... --tb 3b.json --cam-u c8_cam_u_vao.json \
-      [--u-imu u_imu_dong.json] [--phep5 phep5.csv] --out c8b_khoa.json
+      --thuoc-kep thuoc_kep.json --xoay xoay.json [--u-imu u_imu_dong.json] [--phep5 phep5.csv] --out c8b_khoa.json
   python tools/c8b_u.py cong --khoa c8b_khoa.json --ke-hoach ke_hoach_c8.csv --levels O1-F02,O1-F05,O1-F08 \
       --u-t-branch bo_tick --luot SLOT=RUN_ID,gio.json,luoi.json ... [--cam cam.json] --c8-dir 05_DATA/results/C8/<d> \
       --out gate_c8.json
 Last line: #ket_qua,ma=0 written / 2 refused or error.
 
-c8_cam_u_vao.json (CODE_CAM, proposed names; m and deg): {"phep1": {"loi_khung_max_m"}, "dat_ma_kiem_m",
-  "phep2": {"du_tam_m", "du_huong_deg", "chenh_tham_so_m", "huong_chuan_deg"}, "thao_dat": {"vi_tri_m", "goc_deg"},
-  "do_cao": {"rho_max_m", "dh_m", "H_m", "h_m"}, "day_doi": {"dn_m", "dzc_m", "kappa"}, "nguon": [...]}
+c8_cam_u_vao.json (CODE_CAM / CODE_KIEMCHEO / CODE_NHACTAM; m and deg; every number used finite and >= 0; other keys
+  inside a block are information; a top-level key not listed is refused; format agreed 18/11 with CODE_CAM):
+  {"version": "c8_cam_u_vao_v2",
+   "P1": {"bo_nhom_max_m", "tung_khung_max_m", ...}, "moc_dich": {"nguong_m", "u_so_m", ...},
+   "P3": {"vi_tri_max_m", ...}, "A2": {"goc_max_deg", ...}, "than_dich": {...} (information),
+   "P7": {"lech_max_m", ...}, "A3": {"max_deg", ...}, "A5": {"lech_max_deg", ...},
+   "day_doi": {"dn_m", "dzc_m", "kappa"}, "do_cao": {"rho_max_m", "h_m", "H_m"},
+   "bo_cham": {"tag_offset": [dx_m, dy_m, dpsi_rad] or null, "side_m"}, "nguon": ..., "ghi_chu": ...}
+  bo_cham.tag_offset = the offset the scorer gives c7_measure.track for the C8 runs (null = none: P2, A1 then carry
+  the whole offset and angle); side_m = the side of the black square of the car tag.
+thuoc_kep.json (CODE_C8B from the numbers Liam sends, guide B1, B2): {"version": "c8b_thuoc_kep_v1",
+  "cao_4_goc_mm": [front-left, front-right, back-right, back-left], "e_mm": caliper error,
+  "goc_dan": {"a_mm", "b_mm", "L_mm", "canh"}, (a, b: black square edge to plate edge at the two ends of one edge, L
+  the distance between the two points), "goc_dan_deg": signed angle in the convention of tag_offset dpsi (needed only
+  when bo_cham.tag_offset has dpsi != 0; |goc_dan_deg| must equal atan(|a - b| / L)),
+  "tam_than_deg": plate-body angle from the drawing (0 only with "tam_than_gioi_han" written), "nguon": ...}
+xoay.json: from c8b_xoay.py (c8b_xoay_v1; q_tag_m, du_m).
   do_cao.rho_max_m = the largest horizontal distance of the car tag centre from the plumb point over the image area
   used; do_cao.H_m, h_m = the zc and tag height of the scoring session (day_doi.kappa = its kappa, must equal h / H).
   day_doi.dn_m = bound on |plumb point used - true point under the camera centre| on the day, and day_doi.dzc_m =
@@ -66,13 +92,22 @@ import math
 import os
 import sys
 
+import numpy as np
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 for _p in (os.path.join(HERE, '..', 'rpi5'), os.path.join(HERE, '..', 'fwsim'), HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 import c8_u_imu as cu                                                    # noqa: E402
 
-VERSION = 'c8b_khoa_v2'     # C8BS-R7-4: v2 = U_p with the plumb / zc part; a v1 lock is refused by cong
+VERSION = 'c8b_khoa_v3'     # v3 = parts by page v10 (P1-P7, A1-A5); a v1, v2 lock is refused by cong (C8BS-R7-4)
+CAM_VERSION = 'c8_cam_u_vao_v2'
+CAM_KEYS = {'version', 'P1', 'moc_dich', 'P3', 'A2', 'than_dich', 'P7', 'A3', 'A5', 'day_doi', 'do_cao', 'bo_cham',
+            'nguon', 'ghi_chu'}
+TK_VERSION = 'c8b_thuoc_kep_v1'
+XOAY_VERSION = 'c8b_xoay_v1'
+P_PARTS = ('P1_anh_san', 'P2_lech_tam', 'P3_nhac_tam', 'P4_quay', 'P5_day_doi_zc', 'P6_do_cao', 'P7_nhieu_khung')
+A_PARTS = ('A1_goc_dan', 'A2_nhac_tam', 'A3_huong_vung', 'A4_quay', 'A5_nhieu_khung', 'A6_nghieng_ma')
 LE = 1.25
 CONTROLLERS = ('PID', 'LADRC')
 MASKABLE = ('g2', 'g3', 'g5')
@@ -89,6 +124,13 @@ def _num(x, what, lo=0.0):
     return float(x)
 
 
+def _fin(x, what):
+    """A finite number of either sign."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(float(x)):
+        raise UError(f'{what}: {x!r} is not a finite number')
+    return float(x)
+
+
 def _get(d, path):
     cur = d
     for k in path.split('.'):
@@ -100,8 +142,48 @@ def _get(d, path):
 
 # ── khoa ─────────────────────────────────────────────────────────────────────────────────────
 
-def u_p_u_psi(cam, tb):
-    """U_p (m), U_psi (deg) with their parts (design 5)."""
+def _tag_offset(cam):
+    bc = _get(cam, 'bo_cham')
+    if not isinstance(bc, dict) or 'tag_offset' not in bc:
+        raise UError('camera input: no field bo_cham.tag_offset (null when the scorer does not correct)')
+    off = bc['tag_offset']
+    if off is None:
+        return 0.0, 0.0, 0.0
+    if not isinstance(off, list) or len(off) != 3:
+        raise UError(f'bo_cham.tag_offset {off!r}: [dx_m, dy_m, dpsi_rad] or null')
+    return tuple(_fin(x, f'bo_cham.tag_offset[{i}]') for i, x in enumerate(off))
+
+
+def _caliper(tk):
+    if not isinstance(tk, dict) or tk.get('version') != TK_VERSION:
+        raise UError(f'caliper input: version is not {TK_VERSION}')
+    c = tk.get('cao_4_goc_mm')
+    if not isinstance(c, list) or len(c) != 4:
+        raise UError('caliper input: cao_4_goc_mm needs the four corner heights')
+    c = np.array([_num(x, f'cao_4_goc_mm[{i}]') for i, x in enumerate(c)]) * 1e-3
+    e = _num(tk.get('e_mm'), 'caliper e_mm') * 1e-3
+    g = tk.get('goc_dan')
+    if not isinstance(g, dict):
+        raise UError('caliper input: no goc_dan')
+    a, b = _num(g.get('a_mm'), 'goc_dan.a_mm'), _num(g.get('b_mm'), 'goc_dan.b_mm')
+    L = _num(g.get('L_mm'), 'goc_dan.L_mm')
+    if not L > 0:
+        raise UError('goc_dan.L_mm must be > 0')
+    tt = _num(tk.get('tam_than_deg'), 'caliper tam_than_deg')
+    if tt == 0 and not str(tk.get('tam_than_gioi_han') or '').strip():
+        raise UError('tam_than_deg 0 needs tam_than_gioi_han (the limit written: plate-body error not bounded)')
+    return c, e, a * 1e-3, b * 1e-3, L * 1e-3, tt
+
+
+def u_p_u_psi(cam, tb, tk, xo):
+    """U_p (m), U_psi (deg) with their parts P1-P7, A1-A6 (page v10 section 2; design v2)."""
+    if not isinstance(cam, dict) or cam.get('version') != CAM_VERSION:
+        raise UError(f'camera input: version is not {CAM_VERSION} (a file with the names of tests 1, 2 is refused)')
+    extra = sorted(set(cam) - CAM_KEYS)
+    if extra:
+        raise UError(f'camera input: unknown top-level fields {extra} (nothing is dropped silently)')
+    if not isinstance(xo, dict) or xo.get('version') != XOAY_VERSION:
+        raise UError(f'turning-in-place input: version is not {XOAY_VERSION}')
     if not tb.get('ga_ok'):
         raise UError('test 3b: ga_ok false (set-up not within 2 mm at the slowest part): redo 3b, numbers not used')
     dpq = _num(tb.get('d_p_quay_m'), '3b d_p_quay_m')
@@ -110,7 +192,17 @@ def u_p_u_psi(cam, tb):
     if not H > h:
         raise UError(f'do_cao: camera height {H} m not above the tag height {h} m')
     rho = _num(_get(cam, 'do_cao.rho_max_m'), 'do_cao.rho_max_m')
-    cao = rho * _num(_get(cam, 'do_cao.dh_m'), 'do_cao.dh_m') / (H - h)
+    side = _num(_get(cam, 'bo_cham.side_m'), 'bo_cham.side_m')
+    if not side > 0:
+        raise UError('bo_cham.side_m must be > 0')
+    c4, e, ga, gb, gL, tam_than = _caliper(tk)
+    dh = float(np.max(np.abs(c4 - h))) + e                  # corner heights against the h the scorer uses
+    if not H - h - dh > 0 or not H - c4.max() - e > 0:
+        raise UError('caliper heights: not below the camera')
+    cao = (rho + side / math.sqrt(2)) * dh / (H - h - dh)
+    # A6: one h for the four corners; corner i at c_i moves by (P_i - C)(c_i - h)/(H - c_i); the small-angle Kabsch
+    # turn is (sum_i delta_i a_i) x (T - C) / (2 s^2), |.| <= rho s / sqrt 2 sum |delta_i - mean delta| / (2 s^2)
+    nghieng = rho * (float(np.sum(np.abs(c4 - c4.mean()))) + 8 * e) / (2 * math.sqrt(2) * side * (H - c4.max() - e))
     # plumb point and zc reused from 16/11 (Liam 17/11): car_pose corrects P = p + kappa (C - p), kappa = h / H with
     # the H, C of the session; truth P* = p + kappa* (C* - p), |C* - p| = rho* H* / (H* - h) (central projection from
     # the true centre), so |P - P*| <= (h / H) dn + h dzc rho* / (H (H* - h)), H* >= H - dzc, rho* <= rho + dn
@@ -123,20 +215,40 @@ def u_p_u_psi(cam, tb):
     if abs(kap - h / H) > 1e-6 * (h / H):                # C8BS-R7-3: H, h here are the ones of the scoring session
         raise UError(f'day_doi.kappa {kap} is not do_cao.h_m / do_cao.H_m = {h / H} (the kappa of the scoring)')
     day_doi = h / H * dn + h * dzc * (rho + dn) / (H * (H - dzc - h))
-    p = dict(phep1_khung_max=_num(_get(cam, 'phep1.loi_khung_max_m'), 'phep1.loi_khung_max_m'),
-             dat_ma_kiem=_num(_get(cam, 'dat_ma_kiem_m'), 'dat_ma_kiem_m'),
-             phep2_du_tam=_num(_get(cam, 'phep2.du_tam_m'), 'phep2.du_tam_m'),
-             phep2_chenh_tham_so=_num(_get(cam, 'phep2.chenh_tham_so_m'), 'phep2.chenh_tham_so_m'),
-             thao_dat_vi_tri=_num(_get(cam, 'thao_dat.vi_tri_m'), 'thao_dat.vi_tri_m'),
-             do_cao=cao, day_doi_zc=day_doi, d_p_quay=dpq)
-    s = dict(phep2_du_huong=_num(_get(cam, 'phep2.du_huong_deg'), 'phep2.du_huong_deg'),
-             phep2_huong_chuan=_num(_get(cam, 'phep2.huong_chuan_deg'), 'phep2.huong_chuan_deg'),
-             thao_dat_goc=_num(_get(cam, 'thao_dat.goc_deg'), 'thao_dat.goc_deg'),
-             d_psi_quay=dsq)
+    def f(path):
+        return _num(_get(cam, path), path)
+    dx, dy, dpsi = _tag_offset(cam)
+    # A1: angle of the tag to the plate by caliper, against the dpsi the scorer uses
+    g = math.atan(abs(ga - gb) / gL)
+    if dpsi == 0.0:
+        mis = g
+    else:
+        gs = math.radians(_fin(tk.get('goc_dan_deg'), 'caliper goc_dan_deg (needed when dpsi != 0)'))
+        if abs(abs(gs) - g) > 1e-6:
+            raise UError('bo_cham.tag_offset has dpsi != 0: caliper goc_dan_deg (signed, same convention) needed, '
+                         f'its size equal to atan(|a - b| / L) = {math.degrees(g):.4f} deg')
+        mis = abs(dpsi - gs)
+    a1 = math.degrees(mis + math.atan(2 * e / gL)) + tam_than
+    # P2: q (tag minus turning centre, tag frame) from c8b_xoay; the scorer moves the tag by R(psi_body)(dx, dy), the
+    # true body offset is R(dpsi_true) q
+    q = xo.get('q_tag_m')
+    if not isinstance(q, list) or len(q) != 2:
+        raise UError('turning-in-place input: q_tag_m [x, y] needed')
+    qx, qy = (_fin(v, 'xoay q_tag_m') for v in q)
+    du = _num(xo.get('du_m'), 'xoay du_m')
+    cd, sd = math.cos(dpsi), math.sin(dpsi)
+    lech = math.hypot(dx - (cd * qx - sd * qy), dy - (sd * qx + cd * qy)) + du + math.hypot(qx, qy) * math.radians(a1)
+    moc = f('moc_dich.nguong_m') + f('moc_dich.u_so_m')
+    p = dict(P1_anh_san=max(f('P1.bo_nhom_max_m'), f('P1.tung_khung_max_m')) + moc,
+             P2_lech_tam=lech, P3_nhac_tam=f('P3.vi_tri_max_m'), P4_quay=dpq, P5_day_doi_zc=day_doi,
+             P6_do_cao=cao, P7_nhieu_khung=f('P7.lech_max_m'))
+    s = dict(A1_goc_dan=a1, A2_nhac_tam=f('A2.goc_max_deg'), A3_huong_vung=f('A3.max_deg'), A4_quay=dsq,
+             A5_nhieu_khung=f('A5.lech_max_deg'), A6_nghieng_ma=math.degrees(nghieng))
+    assert tuple(p) == P_PARTS and tuple(s) == A_PARTS
     return LE * sum(p.values()), p, LE * sum(s.values()), s
 
 
-def khoa(gios, tb, cam, u_imu=None, phep5=None, tb_name='', tb_sha=''):
+def khoa(gios, tb, cam, tk, xo, u_imu=None, phep5=None, tb_name='', tb_sha=''):
     """gios: {run_id: c8b_gio_v1 dict} of the C8 runs."""
     if not gios:
         raise UError('no C8 clock file')
@@ -156,7 +268,7 @@ def khoa(gios, tb, cam, u_imu=None, phep5=None, tb_name='', tb_sha=''):
         d['runs'].append(rid)
     if not rates:
         raise UError('no C8 run with a drift rate (every run short or not ok)')
-    U_p, p_parts, U_psi, s_parts = u_p_u_psi(cam, tb)
+    U_p, p_parts, U_psi, s_parts = u_p_u_psi(cam, tb, tk, xo)
     sh = (tb.get('B') or {}).get('shutter') or {}
     man_trap = None
     if sh.get('use_alpha'):
@@ -400,9 +512,11 @@ def _clean(o):
 
 
 def check_khoa(k, name='khoa'):
-    """C8BS-R7-4: cong takes only a lock of this version whose U_p carries the plumb / zc part."""
-    if k.get('version') != VERSION or 'day_doi_zc' not in (k.get('U_p_phan_m') or {}):
-        raise UError(f'{name}: not a {VERSION} file with the plumb / zc part of U_p')
+    """C8BS-R7-4: cong takes only a lock of this version whose U_p, U_psi carry exactly the parts P1-P7, A1-A6 (a v1
+    lock has no plumb / zc part, a v2 lock the names of tests 1, 2)."""
+    if k.get('version') != VERSION or set(k.get('U_p_phan_m') or {}) != set(P_PARTS) \
+            or set(k.get('U_psi_phan_deg') or {}) != set(A_PARTS):
+        raise UError(f'{name}: not a {VERSION} file with the parts P1-P7, A1-A6')
 
 
 def main(argv=None):
@@ -412,6 +526,8 @@ def main(argv=None):
     a1.add_argument('--gio', action='append', required=True, help='RUN_ID=gio.json (every C8 run)')
     a1.add_argument('--tb', required=True)
     a1.add_argument('--cam-u', required=True)
+    a1.add_argument('--thuoc-kep', required=True)
+    a1.add_argument('--xoay', required=True)
     a1.add_argument('--u-imu')
     a1.add_argument('--phep5')
     a1.add_argument('--out', required=True)
@@ -439,9 +555,9 @@ def main(argv=None):
                 with open(a.phep5, newline='', encoding='utf-8') as f:
                     phep5 = [(r['diem'], float(r['chenh_m'])) for r in csv.DictReader(f)]
                 src.append(a.phep5)
-            out = khoa(gios, _json(a.tb), _json(a.cam_u), _json(a.u_imu) if a.u_imu else None, phep5,
-                       os.path.basename(a.tb), cu.sha256(a.tb))
-            src += [a.tb, a.cam_u] + ([a.u_imu] if a.u_imu else [])
+            out = khoa(gios, _json(a.tb), _json(a.cam_u), _json(a.thuoc_kep), _json(a.xoay),
+                       _json(a.u_imu) if a.u_imu else None, phep5, os.path.basename(a.tb), cu.sha256(a.tb))
+            src += [a.tb, a.cam_u, a.thuoc_kep, a.xoay] + ([a.u_imu] if a.u_imu else [])
             out['nguon'] = [dict(file=os.path.basename(p), sha256=cu.sha256(p)) for p in src]
             out['script'] = cu.script_state()
             cu.check_path(a.out)

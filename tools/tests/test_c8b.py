@@ -804,14 +804,36 @@ def test_3b_window_over_turnaround_not_used():
 
 # ── c8b_u ────────────────────────────────────────────────────────────────────────────────────
 
-CAM = {"phep1": {"loi_khung_max_m": 0.002}, "dat_ma_kiem_m": 0.001,
-       "phep2": {"du_tam_m": 0.0015, "du_huong_deg": 0.2, "chenh_tham_so_m": 0.0005, "huong_chuan_deg": 0.3},
-       "thao_dat": {"vi_tri_m": 0.0008, "goc_deg": 0.1}, "do_cao": {"rho_max_m": 1.5, "dh_m": 0.002, "H_m": 2.6,
-                                                                    "h_m": 0.12},
-       "day_doi": {"dn_m": 0.016, "dzc_m": 0.01, "kappa": 0.12 / 2.6}}
+CAM = {"version": "c8_cam_u_vao_v2",
+       "P1": {"bo_nhom_max_m": 0.002, "tung_khung_max_m": 0.0018, "bo_nhom_rms_m": 0.0014},
+       "moc_dich": {"nguong_m": 0.001, "u_so_m": 0.0004, "moc_loai": []},
+       "P3": {"vi_tri_max_m": 0.0008, "n_lan": 3},
+       "A2": {"goc_max_deg": 0.1, "n_lan": 3},
+       "than_dich": {"max_m": 0.0001, "kiem_duoc": True},
+       "P7": {"lech_max_m": 0.0006, "sigma_max_m": 0.00029, "dinh_dinh_max_m": 0.0011},
+       "A3": {"max_deg": 0.15, "rms_deg": 0.074, "n_cap": 24},
+       "A5": {"lech_max_deg": 0.12, "sigma_max_deg": 0.04},
+       "day_doi": {"dn_m": 0.016, "dzc_m": 0.01, "kappa": 0.12 / 2.6},
+       "do_cao": {"rho_max_m": 1.5, "H_m": 2.6, "h_m": 0.12},
+       "bo_cham": {"tag_offset": None, "side_m": 0.0964}}
+CAM_PATHS = ('P1.bo_nhom_max_m', 'P1.tung_khung_max_m', 'moc_dich.nguong_m', 'moc_dich.u_so_m', 'P3.vi_tri_max_m',
+             'A2.goc_max_deg', 'P7.lech_max_m', 'A3.max_deg', 'A5.lech_max_deg', 'day_doi.dn_m', 'day_doi.dzc_m',
+             'day_doi.kappa', 'do_cao.rho_max_m', 'do_cao.H_m', 'do_cao.h_m', 'bo_cham.side_m')
+TK = {"version": "c8b_thuoc_kep_v1", "cao_4_goc_mm": [120.2, 120.0, 119.8, 120.1], "e_mm": 0.1,
+      "goc_dan": {"a_mm": 10.3, "b_mm": 10.1, "L_mm": 96.4, "canh": "trai"}, "tam_than_deg": 0.05}
+XO = {"version": "c8b_xoay_v1", "q_tag_m": [0.003, -0.004], "du_m": 0.0007}
 TBD = dict(ga_ok=True, d_p_quay_m=0.0007, d_psi_quay_deg=0.25,
            B=dict(shutter=dict(use_alpha=True, alpha_r_s_px=7e-6, alpha_c_s_px=1e-7, alpha_r_le_s_px=8.75e-6,
                                alpha_c_le_s_px=1.25e-7, mot_khung_s=1 / 60)))
+
+
+def _cp(d):
+    return json.loads(json.dumps(d))
+
+
+def KH(cam=None, tk=None, xo=None, tb=None, **kw):
+    return CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, tb or TBD, CAM if cam is None else cam,
+                   TK if tk is None else tk, XO if xo is None else xo, **kw)
 
 
 def gio_d(task, rate, width, gmr, ok=True, half=0.007):
@@ -819,26 +841,181 @@ def gio_d(task, rate, width, gmr, ok=True, half=0.007):
                 half_s=half)
 
 
+def _expect(cam=CAM, tk=TK, xo=XO):
+    H, h, rho, s = cam['do_cao']['H_m'], cam['do_cao']['h_m'], cam['do_cao']['rho_max_m'], cam['bo_cham']['side_m']
+    c = np.array(tk['cao_4_goc_mm']) * 1e-3
+    e = tk['e_mm'] * 1e-3
+    dh = np.max(np.abs(c - h)) + e
+    cao = (rho + s / math.sqrt(2)) * dh / (H - h - dh)
+    dn, dzc = cam['day_doi']['dn_m'], cam['day_doi']['dzc_m']
+    dd = h / H * dn + h * dzc * (rho + dn) / (H * (H - dzc - h))
+    g = tk['goc_dan']
+    a1 = math.degrees(math.atan(abs(g['a_mm'] - g['b_mm']) / g['L_mm']) + math.atan(2 * tk['e_mm'] / g['L_mm'])) \
+        + tk['tam_than_deg']
+    q = math.hypot(*xo['q_tag_m'])
+    p2 = q + xo['du_m'] + q * math.radians(a1)
+    a6 = math.degrees(rho * (np.sum(np.abs(c - c.mean())) + 8 * e) / (2 * math.sqrt(2) * s * (H - c.max() - e)))
+    p = dict(P1_anh_san=0.002 + 0.001 + 0.0004, P2_lech_tam=p2, P3_nhac_tam=0.0008, P4_quay=0.0007, P5_day_doi_zc=dd,
+             P6_do_cao=cao, P7_nhieu_khung=0.0006)
+    a = dict(A1_goc_dan=a1, A2_nhac_tam=0.1, A3_huong_vung=0.15, A4_quay=0.25, A5_nhieu_khung=0.12, A6_nghieng_ma=a6)
+    return p, a
+
+
 def test_khoa_sums():
     k = CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.010, 0.005), 'b': gio_d('O1-F05', 4e-4, 0.012, 0.003),
-                 'c': gio_d('O1-F08', 1e-4, 0.014, 0.004), 'd': gio_d('O1-F08', 9e-3, 0.5, 0.5, ok=False)}, TBD, CAM)
-    cao = 1.5 * 0.002 / (2.6 - 0.12)
-    dd = 0.12 / 2.6 * 0.016 + 0.12 * 0.01 * (1.5 + 0.016) / (2.6 * (2.6 - 0.01 - 0.12))   # plumb, zc (C8BS-R7-3)
-    assert k['U_p_m'] == pytest.approx(1.25 * (0.002 + 0.001 + 0.0015 + 0.0005 + 0.0008 + cao + dd + 0.0007))
-    assert k['U_p_phan_m']['day_doi_zc'] == pytest.approx(dd)
-    assert k['U_psi_deg'] == pytest.approx(1.25 * (0.2 + 0.3 + 0.1 + 0.25))
+                 'c': gio_d('O1-F08', 1e-4, 0.014, 0.004), 'd': gio_d('O1-F08', 9e-3, 0.5, 0.5, ok=False)},
+                TBD, CAM, TK, XO)
+    p, a = _expect()
+    assert k['U_p_phan_m'] == pytest.approx(p) and k['U_psi_phan_deg'] == pytest.approx(a)
+    assert k['U_p_m'] == pytest.approx(1.25 * sum(p.values()))
+    assert k['U_psi_deg'] == pytest.approx(1.25 * sum(a.values()))
+    # hand numbers: P1 3.4 mm; A1 = 2 atan(0.2 / 96.4) + 0.05 = 0.2877 deg; dh = 0.3 mm
+    assert p['P1_anh_san'] == pytest.approx(0.0034) and a['A1_goc_dan'] == pytest.approx(0.28773, abs=1e-4)
+    assert tuple(k['U_p_phan_m']) == CU.P_PARTS and tuple(k['U_psi_phan_deg']) == CU.A_PARTS
     assert k['troi_ppm'] == pytest.approx(1.25 * 4e-4 * 1e6)             # run d (not ok) left out
     assert k['dai']['O1-F05']['width_s'] == [0.010, 0.012] and k['dai']['O1-F05']['gyro_minus_rv_s'] == [0.003, 0.005]
     assert k['man_trap']['alpha_r_s_px'] == pytest.approx(8.75e-6) and k['man_trap_kieu'] == 'alpha'
 
 
+def test_khoa_p1_takes_the_larger_of_clip_mean_and_per_frame():
+    cam = _cp(CAM)
+    cam['P1']['tung_khung_max_m'] = 0.0031
+    assert KH(cam)['U_p_phan_m']['P1_anh_san'] == pytest.approx(0.0031 + 0.0014)
+
+
 def test_khoa_refuses_bad_3b_and_missing_field():
     with pytest.raises(CU.UError, match='ga_ok'):
-        CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, dict(TBD, ga_ok=False), CAM)
-    bad = json.loads(json.dumps(CAM))
-    del bad['phep2']['du_tam_m']
-    with pytest.raises(CU.UError, match='phep2.du_tam_m'):
-        CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, bad)
+        KH(tb=dict(TBD, ga_ok=False))
+    for path in CAM_PATHS:                                  # every number used is required, none defaults to 0
+        bad = _cp(CAM)
+        blk, fld = path.split('.')
+        del bad[blk][fld]
+        with pytest.raises(CU.UError, match=path.replace('.', r'\.')):
+            KH(bad)
+        bad[blk][fld] = -1e-6 if fld != 'kappa' else None
+        with pytest.raises(CU.UError, match=path.replace('.', r'\.')):
+            KH(bad)
+    bad = _cp(CAM)
+    del bad['bo_cham']['tag_offset']
+    with pytest.raises(CU.UError, match='bo_cham.tag_offset'):
+        KH(bad)
+    bad['bo_cham']['tag_offset'] = [0.0, 0.0]
+    with pytest.raises(CU.UError, match='bo_cham.tag_offset'):
+        KH(bad)
+
+
+def test_khoa_camera_input_names_only():
+    # Liam 18/11 at CODE_C8B: names by page v10; a file with the names of tests 1, 2 (b740f2a) is refused
+    old = {"phep1": {"loi_khung_max_m": 0.002}, "dat_ma_kiem_m": 0.0,
+           "phep2": {"du_tam_m": 0.0015, "du_huong_deg": 0.2, "chenh_tham_so_m": 0.0005, "huong_chuan_deg": 0.3},
+           "thao_dat": {"vi_tri_m": 0.0008, "goc_deg": 0.1}, "do_cao": CAM['do_cao'], "day_doi": CAM['day_doi']}
+    with pytest.raises(CU.UError, match='version is not c8_cam_u_vao_v2'):
+        KH(old)
+    with pytest.raises(CU.UError, match='unknown top-level fields'):
+        KH(dict(old, **{k: v for k, v in CAM.items() if k not in old}))
+    with pytest.raises(CU.UError, match=r"unknown top-level fields \['A6'\]"):
+        KH(dict(CAM, A6={'max_deg': 0.15}))
+    info = _cp(CAM)                                        # extra keys inside a block are information, kept out of U
+    info['A3'].update(L_m=[0.55, 0.78], cach='bo_cap')
+    info['nguon'], info['ghi_chu'] = ['x.json'], 'thu'
+    assert KH(info)['U_psi_deg'] == KH()['U_psi_deg']
+
+
+def test_khoa_per_frame_noise_inside_margin():
+    # O1 v11.39 J1: U_p, U_psi bound one frame: P7, A5 are parts of the sum and take the margin like every part
+    z = _cp(CAM)
+    z['P7']['lech_max_m'], z['A5']['lech_max_deg'] = 0.0, 0.0
+    k0, k1 = KH(z), KH()
+    assert k1['U_p_m'] - k0['U_p_m'] == pytest.approx(1.25 * 0.0006)
+    assert k1['U_psi_deg'] - k0['U_psi_deg'] == pytest.approx(1.25 * 0.12)
+
+
+def test_khoa_caliper_input():
+    for k_, v in (('version', 'x'), ('cao_4_goc_mm', [120.0, 120.0, 120.0]), ('e_mm', -0.1),
+                  ('tam_than_deg', None), ('goc_dan', None)):
+        bad = _cp(TK)
+        bad[k_] = v
+        with pytest.raises(CU.UError):
+            KH(tk=bad)
+    bad = _cp(TK)
+    bad['goc_dan']['L_mm'] = 0.0
+    with pytest.raises(CU.UError, match='L_mm'):
+        KH(tk=bad)
+    bad = _cp(TK)
+    bad['tam_than_deg'] = 0.0                              # 0 only with the limit written
+    with pytest.raises(CU.UError, match='tam_than_gioi_han'):
+        KH(tk=bad)
+    bad['tam_than_gioi_han'] = 'sai che tao tam-than ngoai ban ve chua bao'
+    assert KH(tk=bad)['U_psi_phan_deg']['A1_goc_dan'] == pytest.approx(_expect(tk=bad)[1]['A1_goc_dan'])
+    bad = _cp(TK)
+    bad['cao_4_goc_mm'] = [2700.0, 120.0, 120.0, 120.0]   # above the camera
+    with pytest.raises(CU.UError, match='not below the camera'):
+        KH(tk=bad)
+
+
+def test_khoa_offset_used_by_the_scorer():
+    # the scorer corrects by tag_offset: P2, A1 keep only what is left; a dpsi needs the signed caliper angle
+    g = math.atan(0.2 / 96.4)
+    q = XO['q_tag_m']
+    cam = _cp(CAM)
+    c, s = math.cos(g), math.sin(g)
+    cam['bo_cham']['tag_offset'] = [c * q[0] - s * q[1], s * q[0] + c * q[1], g]
+    with pytest.raises(CU.UError, match='goc_dan_deg'):
+        KH(cam)
+    tk = dict(_cp(TK), goc_dan_deg=-math.degrees(g))
+    k_bad = KH(cam, tk=tk)                                  # opposite sign: the mismatch 2 g is counted, not hidden
+    tk = dict(_cp(TK), goc_dan_deg=math.degrees(g))
+    k = KH(cam, tk=tk)
+    a1 = math.degrees(math.atan(2 * 0.1 / 96.4)) + 0.05
+    assert k['U_psi_phan_deg']['A1_goc_dan'] == pytest.approx(a1)
+    assert k_bad['U_psi_phan_deg']['A1_goc_dan'] == pytest.approx(a1 + 2 * math.degrees(g))
+    assert k['U_p_phan_m']['P2_lech_tam'] == pytest.approx(0.0007 + 0.005 * math.radians(a1))
+    bad = dict(_cp(TK), goc_dan_deg=0.5)                   # size not atan(|a - b| / L)
+    with pytest.raises(CU.UError, match='goc_dan_deg'):
+        KH(cam, tk=bad)
+    cam['bo_cham']['tag_offset'] = [0.0, 0.0, 0.0]          # offset given as zero = none: the whole q counts
+    assert KH(cam)['U_p_phan_m']['P2_lech_tam'] == pytest.approx(_expect()[0]['P2_lech_tam'])
+
+
+def test_khoa_turning_input():
+    for bad in (dict(XO, version='x'), dict(XO, q_tag_m=[0.003]), dict(XO, du_m=-1.0), dict(XO, q_tag_m=[0.003, None])):
+        with pytest.raises(CU.UError):
+            KH(xo=bad)
+
+
+class _FloorCam0:
+    def pix2floor(self, pts, z):
+        return np.asarray(pts, float)
+
+
+def test_tilt_parts_bound_car_pose():
+    # A6 and P6 checked against c7_measure.car_pose with four corner heights (not a copy of the formula)
+    import c7_measure as CM
+    rng = np.random.default_rng(11)
+    side, H = 0.0964, 2.632
+    worst = 0.0
+    for _ in range(400):
+        h = rng.uniform(0.08, 0.16)
+        c = h + rng.uniform(-0.0008, 0.0008, 4)
+        rho = rng.uniform(0.1, 1.8)
+        a = rng.uniform(0, 2 * math.pi)
+        P = np.array([rho * math.cos(a), rho * math.sin(a)])
+        psi = rng.uniform(-math.pi, math.pi)
+        cs, sn = math.cos(psi), math.sin(psi)
+        corners = P + CM.car_corners_body(side) @ np.array([[cs, sn], [-sn, cs]])
+        p = corners * (H / (H - c))[:, None]                 # central projection from (0, 0, H) of each corner
+        r = CM.car_pose(_FloorCam0(), p, side, h / H, (0.0, 0.0))
+        err_psi = abs((r['tag_psi'] - psi + math.pi) % (2 * math.pi) - math.pi)
+        err_p = math.hypot(r['tag_x'] - P[0], r['tag_y'] - P[1])
+        cam = _cp(CAM)
+        cam['do_cao'].update(H_m=H, h_m=h, rho_max_m=rho)
+        cam['day_doi'] = dict(dn_m=0.0, dzc_m=0.0, kappa=h / H)
+        tk = dict(_cp(TK), cao_4_goc_mm=list(c * 1e3), e_mm=0.0)
+        _, pp, _, aa = CU.u_p_u_psi(cam, TBD, tk, XO)
+        assert err_psi <= math.radians(aa['A6_nghieng_ma']) * (1 + 1e-6) + 1e-12
+        assert err_p <= pp['P6_do_cao'] * (1 + 1e-6) + 1e-12
+        worst = max(worst, err_psi / math.radians(aa['A6_nghieng_ma']))
+    assert worst > 0.3                                       # the bound is not loose by orders of magnitude
 
 
 def test_khoa_plumb_zc_required_and_bounded():
@@ -847,23 +1024,23 @@ def test_khoa_plumb_zc_required_and_bounded():
         bad = json.loads(json.dumps(CAM))
         del bad['day_doi'][k_]
         with pytest.raises(CU.UError, match='day_doi.' + k_):
-            CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, bad)
+            CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, bad, TK, XO)
     bad = json.loads(json.dumps(CAM))
     bad['day_doi']['dn_m'] = -0.001
     with pytest.raises(CU.UError, match='day_doi.dn_m'):
-        CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, bad)
+        CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, bad, TK, XO)
     bad['day_doi'] = dict(dn_m=0.0, dzc_m=2.5, kappa=0.12 / 2.6)    # H - dzc not above h
     with pytest.raises(CU.UError, match='not above the tag height'):
-        CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, bad)
+        CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, bad, TK, XO)
     bad['day_doi'] = dict(dn_m=0.0, dzc_m=0.01, kappa=0.12 / 2.632)   # C8BS-R7-3: H is not the zc of the scoring
     with pytest.raises(CU.UError, match='not do_cao.h_m / do_cao.H_m'):
-        CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, bad)
+        CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, bad, TK, XO)
     z = json.loads(json.dumps(CAM))
     z['day_doi'] = dict(dn_m=0.0, dzc_m=0.0, kappa=0.12 / 2.6)     # no plumb / zc error: the part is zero
-    k0 = CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, z)
-    k1 = CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, CAM)
-    assert k0['U_p_phan_m']['day_doi_zc'] == 0.0
-    assert k1['U_p_m'] - k0['U_p_m'] == pytest.approx(1.25 * k1['U_p_phan_m']['day_doi_zc'])
+    k0 = CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, z, TK, XO)
+    k1 = CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, CAM, TK, XO)
+    assert k0['U_p_phan_m']['P5_day_doi_zc'] == 0.0
+    assert k1['U_p_m'] - k0['U_p_m'] == pytest.approx(1.25 * k1['U_p_phan_m']['P5_day_doi_zc'])
     assert k1['U_psi_deg'] == k0['U_psi_deg']                       # a shift and a scale about C keep every angle
 
 
@@ -887,8 +1064,8 @@ def _plumb_case(H, h, dn, dzc, rho, Cs, Hs, P, psi, side=0.1):
     cam = json.loads(json.dumps(CAM))
     cam['do_cao'].update(H_m=H, h_m=h, rho_max_m=rho)
     cam['day_doi'] = dict(dn_m=dn, dzc_m=dzc, kappa=h / H)
-    _, parts, _, _ = CU.u_p_u_psi(cam, TBD)
-    return err, parts['day_doi_zc']
+    _, parts, _, _ = CU.u_p_u_psi(cam, TBD, TK, XO)
+    return err, parts['P5_day_doi_zc']
 
 
 def test_plumb_zc_part_bounds_car_pose():
@@ -911,20 +1088,26 @@ def test_plumb_zc_part_bounds_car_pose():
 
 def test_cong_refuses_v1_lock():
     # C8BS-R7-4: a lock written before the plumb / zc part (c8b_khoa_v1, cc22feb) cannot make the gate file
-    k = CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, CAM)
+    k = CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, CAM, TK, XO)
     CU.check_khoa(json.loads(json.dumps(CU._clean(k))))
-    old = dict(k, version='c8b_khoa_v1')
-    with pytest.raises(CU.UError, match='plumb / zc part'):
+    for ver in ('c8b_khoa_v1', 'c8b_khoa_v2'):              # v2: parts named after tests 1, 2 (b740f2a)
+        with pytest.raises(CU.UError, match='parts P1-P7, A1-A6'):
+            CU.check_khoa(dict(k, version=ver))
+    old = dict(k, U_p_phan_m={x: v for x, v in k['U_p_phan_m'].items() if x != 'P5_day_doi_zc'})
+    with pytest.raises(CU.UError, match='parts P1-P7, A1-A6'):
         CU.check_khoa(old)
-    old = dict(k, U_p_phan_m={x: v for x, v in k['U_p_phan_m'].items() if x != 'day_doi_zc'})
-    with pytest.raises(CU.UError, match='plumb / zc part'):
+    old = dict(k, U_psi_phan_deg={x: v for x, v in k['U_psi_phan_deg'].items() if x != 'A5_nhieu_khung'})
+    with pytest.raises(CU.UError, match='parts P1-P7, A1-A6'):
+        CU.check_khoa(old)
+    old = dict(k, U_p_phan_m=dict(k['U_p_phan_m'], phep1_khung_max=0.002))
+    with pytest.raises(CU.UError, match='parts P1-P7, A1-A6'):
         CU.check_khoa(old)
 
 
 def test_khoa_phep5_and_one_frame():
     tb = json.loads(json.dumps(TBD))
     tb['B']['shutter']['use_alpha'] = False
-    k = CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, tb, CAM, phep5=[('d1', 0.003), ('d2', -0.02)])
+    k = CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, tb, CAM, TK, XO, phep5=[('d1', 0.003), ('d2', -0.02)])
     assert k['man_trap_kieu'] == 'mot_khung' and k['man_trap'] is None
     assert k['phep5']['ket_qua'] == 'xem_lai' and k['phep5']['vuot'] == ['d2']
 
