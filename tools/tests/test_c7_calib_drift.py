@@ -363,12 +363,13 @@ def sc(outcome, frames='f0', esp='e' * 64, t0=1000, off=0.25, hs='h' * 64, ks=(0
                 t0_log_us=t0, offset_s=off, offset_src='o1_time_sync', version='c7_score_v2',
                 hang_so=dict(file='hang_so.json', sha256=hs, trang_thai='thu', nguon='test'), k_start=list(ks),
                 thresholds=dict(t_miss=0.25, status='khoa o C8'),
-                frames_sha256=frames, esp32_sha256=esp, frames_valid=600, gap_max=0.02, shift_max_px=0.5)
+                frames_sha256=frames, esp32_sha256=esp, frames_valid=600, gap_max=0.02, shift_max_px=0.5,
+                sender_sha256='s' * 64, events_sha256=None)
 
 
 def tr(session='s0', video='r' * 64, frames='f0', off=(0.0, 0.0, 0.0), n=640, shape=((1080, 1920),)):
     return dict(session_sha256=session, video_sha256=video, frames_sha256=frames, tag_offset=list(off), frames=n,
-                decoded_shapes=[list(s) for s in shape])
+                decoded_shapes=[list(s) for s in shape], gates=dict(min_marks=8, rms_extra_px=0.5))
 
 
 TASKS = ['O1-F02', 'O1-F05', 'O1-K1']
@@ -449,7 +450,7 @@ def test_bad_drift_files_refused(bad, two):
                                   'frames_bool', 'shape_zero', 'offset_not_drift_both',
                                   'threshold_one_null_both', 'threshold_text_both', 'threshold_bool_both',
                                   'threshold_negative_both', 'threshold_numeric_text_both', 'status_number_both',
-                                  'only_status_both'])
+                                  'only_status_both', 'sender', 'events', 'gates'])
 def test_provenance_and_scoring_set_up_checked(case):
     a, ta, fa = sc('dat'), tr('s0'), 'f0'
     b, tb, fb = sc('dat', frames='f1'), tr('s1', frames='f1'), 'f1'
@@ -535,6 +536,12 @@ def test_provenance_and_scoring_set_up_checked(case):
         a, b = dict(a, thresholds=dict(t_miss=0.25, status=3)), dict(b, thresholds=dict(t_miss=0.25, status=3))
     elif case == 'only_status_both':
         a, b = dict(a, thresholds=dict(status='x')), dict(b, thresholds=dict(status='x'))
+    elif case == 'sender':                                   # Codex CC1-3: another sender log
+        b = dict(b, sender_sha256='z' * 64)
+    elif case == 'events':                                   # CC1-3: another events file
+        b = dict(b, events_sha256='v' * 64)
+    elif case == 'gates':                                    # CC1-4: another frame gate in the H1 track
+        tb = dict(tb, gates=dict(min_marks=6, rms_extra_px=0.5))
     elif case == 'offset_not_drift_both':                    # CD3-2: both tracks agree, the drift does not
         ta, tb = tr('s0', off=(0.03, 0.0, 0.0)), tr('s1', frames='f1', off=(0.03, 0.0, 0.0))
     with pytest.raises(ValueError):
@@ -694,3 +701,123 @@ def test_combined_file_is_the_h0_file_with_outcome_and_calib_drift_only():
         r = cd.combine(drift, dict(a), tr('s0'), 'f0', *two)
         assert {k: v for k, v in r.items() if k not in ('outcome', 'calib_drift')} == \
             {k: v for k, v in a.items() if k != 'outcome'}
+
+
+# ---------------------------------------------------------------- Codex CC1-1, T1, T3 (17/11): files written by c7_score itself
+from test_c7_score import cmd_ok  # noqa: E402,F401  (autouse: o1_cmd_path.analyse stubbed as in the scorer tests)
+
+
+def _real_score(tmp_path, name, valid=True, lost_edge=False, drop=(), post=4.0):
+    """A score file written by c7_score main on the synthetic F05 run of its tests (frames.csv, log, constants); valid
+    False: no valid frame (lost before the clock match: offset null); lost_edge: the line before the edge lost (t = 0
+    not known: t0 null). Returns (score dict, track dict naming that frames.csv)."""
+    import c7_score as cs
+    import test_c7_score as T
+    d = tmp_path / name
+    d.mkdir()
+    fr = T.make_frames('O1-F05', drop=drop)
+    if not valid:
+        for r in fr:
+            r['valid'] = False
+    cm.write_frames(d / 'frames.csv', fr)
+    log = T.make_log(d / 'esp32.csv', 'O1-F05', lost_before_edge=lost_edge, post=post)
+    T.hs_file(d)
+    out = d / 'score.json'
+    args = ['--frames', str(d / 'frames.csv'), '--esp32', log, '--task', 'O1-F05', '--hang-so', str(d / 'hang_so.json'),
+            '--offset-s', str(T.OFFSET), '--offset-reason', 'test', '--offset-anchor-s', '0', '--offset-err-s', '0',
+            '--out', str(out)]
+    assert cs.main(args) == 0
+    sc0 = json.loads(out.read_text(encoding='utf-8'))
+    fsha = cm.sha256(str(d / 'frames.csv'))
+    return sc0, fsha
+
+
+def _real_track(session, fsha):
+    t = tr(session, frames=fsha)
+    return t
+
+
+def _same_inputs(a, b):
+    """The two synthetic runs are written in two folders: same log bytes, so the same esp32 sha256; the constants file
+    of the same content has the same sha256 too."""
+    assert a['esp32_sha256'] == b['esp32_sha256'] and a['hang_so'] == b['hang_so']
+
+
+def test_cc1_1_real_lost_h1_above_eps_is_lost(tmp_path):
+    """H0 judged (dat), H1 written by c7_score with no valid frame (lost before the clock match: offset null): gop
+    applies Q3, hong_he_do with flag calib_drift (before: refused for missing fields)."""
+    a, fa = _real_score(tmp_path, 'h0')
+    b, fb = _real_score(tmp_path, 'h1', valid=False)
+    _same_inputs(a, b)
+    assert a['outcome'] == 'dat' and b['outcome'] == 'hong_he_do' and b['offset_s'] is None and b['gate_v3'] is None
+    r = cd.combine(DRIFT_OVER, a, _real_track('s0', fa), fa, b, _real_track('s1', fb), fb)
+    assert r['outcome'] == 'hong_he_do' and r['calib_drift']['flags'] == ['calib_drift']
+    assert r['calib_drift']['offset_s_h1'] is None and r['calib_drift']['h1_score'] == b
+
+
+@pytest.mark.parametrize('lost_edge', [False, True])
+def test_cc1_1_real_lost_h0_in_every_branch(tmp_path, lost_edge):
+    """H0 lost early (no valid frame; or the edge line lost: t0 null): below eps_H kept hong_he_do, clip H at the end
+    missing stays hong_he_do (flag thieu_H1), above eps_H with a lost H1 too: hong_he_do."""
+    a, fa = _real_score(tmp_path, 'h0', valid=False, lost_edge=lost_edge)
+    assert a['outcome'] == 'hong_he_do' and (a['t0_log_us'] is None) == lost_edge
+    ta = _real_track('s0', fa)
+    assert cd.combine(DRIFT_OK, a, ta, fa)['outcome'] == 'hong_he_do'
+    r = cd.combine(DRIFT_MISS, a, ta, fa)
+    assert r['outcome'] == 'hong_he_do' and r['calib_drift']['flags'] == ['thieu_H1']
+    b, fb = _real_score(tmp_path, 'h1', valid=False, lost_edge=lost_edge)
+    r = cd.combine(DRIFT_OVER, a, ta, fa, b, _real_track('s1', fb), fb)
+    assert r['outcome'] == 'hong_he_do'
+    assert {k: v for k, v in r.items() if k not in ('outcome', 'calib_drift')} == \
+        {k: v for k, v in a.items() if k != 'outcome'}                      # rq3_log so-h contract (C9D-1)
+
+
+def test_cc1_1_real_judged_pair_and_a_lost_pair_of_another_run(tmp_path):
+    """Both judged by c7_score (dat): kept, calib_drift; a lost H1 of another log is still refused (esp32 sha256)."""
+    a, fa = _real_score(tmp_path, 'h0')
+    b, fb = _real_score(tmp_path, 'h1')
+    r = cd.combine(DRIFT_OVER, a, _real_track('s0', fa), fa, b, _real_track('s1', fb), fb)
+    assert r['outcome'] == 'dat' and r['calib_drift']['flags'] == ['calib_drift']
+    c, fc = _real_score(tmp_path, 'h1x', valid=False)
+    c = dict(c, esp32_sha256='x' * 64)
+    with pytest.raises(ValueError, match='esp32_sha256'):
+        cd.combine(DRIFT_OVER, a, _real_track('s0', fa), fa, c, _real_track('s1', fc), fc)
+
+
+def test_cc1_1_judged_score_still_needs_its_offset():
+    """Only a run lost to the measurement system may carry a null offset or t0 (a judged one is refused)."""
+    for k in ('offset_s', 't0_log_us'):
+        with pytest.raises(ValueError, match=k):
+            cd.combine(DRIFT_OK, dict(sc('dat'), **{k: None}), tr('s0'), 'f0')
+        cd.combine(DRIFT_OK, dict(sc('hong_he_do'), **{k: None}), tr('s0'), 'f0')
+
+
+def test_t6_clip_h_shot_again_closes_the_part_before(tmp_path):
+    """B8S-9 (O1 v11.31 4) with the tools as they are: H_A -> part A -> H_B -> part B -> H_C. so(A, B) closes part A
+    (gop of its runs with A and B), so(B, C) part B; H_C missing: part B by the missing-H1 branch only. A run of part
+    B is refused against so(A, B) (its H0 track used session B, the drift has A as s0)."""
+    ab = dict(DRIFT_OVER, s0_session_sha256='sA', s1_session_sha256='sB')
+    bc = dict(DRIFT_OVER, s0_session_sha256='sB', s1_session_sha256='sC')
+    bc_miss = dict(DRIFT_MISS, s0_session_sha256='sB')
+    run_a = (sc('dat'), tr('sA'), 'f0', sc('dat', frames='f1'), tr('sB', frames='f1'), 'f1')
+    assert cd.combine(ab, *run_a)['outcome'] == 'dat'
+    run_b = (sc('dat', frames='g0'), tr('sB', frames='g0'), 'g0', sc('khong_dat', frames='g1'), tr('sC', frames='g1'),
+             'g1')
+    r = cd.combine(bc, *run_b)
+    assert r['outcome'] == 'chua_ket_luan' and 'calib_drift_split' in r['calib_drift']['flags']
+    r = cd.combine(bc_miss, *run_b[:3])
+    assert r['outcome'] == 'chua_ket_luan' and r['calib_drift']['flags'] == ['thieu_H1']
+    with pytest.raises(ValueError, match='session'):
+        cd.combine(ab, *run_b)
+
+
+
+def test_cc1_1_real_lost_after_the_clock_match_keeps_its_offset(tmp_path):
+    """The log ends before the end of the scored domain (U_t not bounded): lost after the offset is known, no gate; the
+    file carries the offset and its source, and gop applies Q3."""
+    a, fa = _real_score(tmp_path, 'h0', post=0.0)
+    b, fb = _real_score(tmp_path, 'h1', post=0.0)
+    assert b['outcome'] == 'hong_he_do' and b['gate_v3'] is None and 'U_t not bounded' in b['outcome_reasons'][0]
+    assert b['offset_s'] == 0.25 and b['offset_src'] == '--offset-s'
+    r = cd.combine(DRIFT_OVER, a, _real_track('s0', fa), fa, b, _real_track('s1', fb), fb)
+    assert r['outcome'] == 'hong_he_do' and r['calib_drift']['offset_s_h1'] == a['offset_s']

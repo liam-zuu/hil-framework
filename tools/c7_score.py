@@ -178,6 +178,8 @@ HS_STATES = ('de_xuat', 'khoa_c8')
 HS_CMD = {'cond2_m': (0.0, 1.0), 'cond3_ms': (0.0, 10000.0), 'cond4_m': (0.0, 1.0)}     # O1 3.5 command path (2)-(4)
 HS_DYN = {'goc_quay_deg': (0.0, 100000.0), 'wz_dps': (0.0, 5000.0), 'alpha_dps2': (0.0, 1e6)}  # O1 3.3 U_IMU range
 GIA_DINH = ('dung', 'khong_dung', 'chua_kiem')       # O1 3.3 position-suspect assumption checked at C8 (CS1-18)
+THRESH_KEYS = ('U_p_m', 'U_psi_deg', 'u_t_ghep_s', 'troi_ppm', 't_trong_s', 't_mat_s', 'bump_px', 'pred_m',
+               'pred_half', 'pred_min', 'yaw_nghi_deg', 'v_d')      # the 'thresholds' block of every output
 REPORT_ONLY_OK = frozenset(('g2', 'g3', 'g5'))     # O1 v11.33 3.9 rule 2b: G1, G4 always decide
 NHANH_TICK = ('giu', 'bo')       # O1 v11.33 SC-12 (OG2-1, OG3-4): the tick part of U_t kept / dropped, locked before C8
 
@@ -1294,14 +1296,18 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
     if hs['trang_thai'] == 'khoa_c8' and task not in (hs['imu'].get('mien_dong') or {}):
         raise ValueError(f'hang_so imu mien_dong: no locked U_IMU range for {task}')
     rows, ev_in, n_dup, has_age = read_esp32(esp32_path)
+    # Codex CC1-1 (17/11): a run lost early carries the scoring set-up known so far (constants, start pose, t = 0 and
+    # clock offset when known, else null), so c7_calib_drift gop can apply O1 4 (Q3) to it
     base = dict(hang_so=dict(file=hs['file'], sha256=hs['sha256'], trang_thai=hs['trang_thai'], nguon=hs['nguon']),
-                n_duplicates=n_dup)
+                n_duplicates=n_dup, thresholds={k: hs[k] for k in THRESH_KEYS}, k_start=list(lane.start),
+                t0_log_us=None, offset_s=None, offset_src=None)
     i_edge, later, probs = ocp.find_edge(rows)
     if i_edge is None:
         if any(p.startswith('edge_unknown') for p in probs):
             return lost_output(task, probs[0], FAIL_MEAS, **base), []
         raise ValueError('; '.join(probs))
     t0_us = float(rows[i_edge]['_t'])
+    base['t0_log_us'] = t0_us
     if not any(r['valid'] for r in frames):
         return lost_output(task, 'no valid camera frame in the clip', FAIL_MEAS, **base), []
     t_cam = np.array([r['t_s'] for r in frames])
@@ -1313,6 +1319,8 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
         if not sync.ok:
             return lost_output(task, f'clock not matched (C7b): {sync.why}', FAIL_MEAS, **base), []
         offset_s = sync.offset_s
+    base.update(offset_s=offset_s,
+                offset_src='c8b_gio' if gio is not None else ('--offset-s' if sync is None else 'o1_time_sync'))
     deadline = lane.Tcmd + T_LATE
     # drift up to t_deadline (SC-12); the --offset-s error at its anchor (CS2-1) adds to the C7b residual of the
     # constants [CACH HIEU: kept both, the larger bound]
@@ -1505,8 +1513,7 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
                gate_check=gate_check, shift_kind=shift_kind,
                pos_reset_n_values=resets, pos_reset_mid=len(resets) > 1,
                frames_total=len(frames), frames_valid=len(vi), k_start=list(lane.start),
-               thresholds={k: hs[k] for k in ('U_p_m', 'U_psi_deg', 'u_t_ghep_s', 'troi_ppm', 't_trong_s', 't_mat_s',
-                                              'bump_px', 'pred_m', 'pred_half', 'pred_min', 'yaw_nghi_deg', 'v_d')},
+               thresholds={k: hs[k] for k in THRESH_KEYS},
                rule=f'O1 v11.28 3.3-3.5, 3.7 (camera); {VERSION}')
     return out, prow
 
@@ -1562,13 +1569,17 @@ def main(argv=None):
         if (a.gio_c8b is None) != (a.nut is None):
             raise ValueError('--gio-c8b and --nut go together')
         gio = load_gio(a.gio_c8b, a.nut) if a.gio_c8b else None
+        # Codex CC1-3: the events file actually read (given, or the default beside the log), by name and sha256
+        evp = a.events or (a.esp32 + '.events.txt')
+        evp = evp if os.path.exists(evp) else None
         out, rows = score(cm.read_frames(a.frames), a.esp32, a.task, hs, a.offset_s, a.offset_reason, ks,
                           a.allow_final_set, a.sender, a.events, track_info, a.offset_anchor_s, a.offset_err_s, fsha,
                           gio=gio)
         out.update(frames_file=os.path.basename(a.frames), frames_sha256=fsha,
                    esp32_file=os.path.basename(a.esp32), esp32_sha256=cm.sha256(a.esp32),
                    sender_file=os.path.basename(a.sender) if a.sender else None,
-                   sender_sha256=cm.sha256(a.sender) if a.sender and os.path.exists(a.sender) else None)
+                   sender_sha256=cm.sha256(a.sender) if a.sender and os.path.exists(a.sender) else None,
+                   events_file=os.path.basename(evp) if evp else None, events_sha256=cm.sha256(evp) if evp else None)
     except Exception as exc:            # CS1-6: any error ends with exit 2, never a traceback without a verdict
         print(f'c7_score: {type(exc).__name__}: {exc}', file=sys.stderr)
         print('#ket_qua,ma=2')

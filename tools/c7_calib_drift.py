@@ -52,7 +52,9 @@ gop  --drift drift.json --s0-score score.json --s0-track <dir0>/track.json
      drift.json) and the frames.csv it wrote (frames_sha256 = the file next to it = the frames_sha256 of
      the score). Same run (CD1-6, CD2-4): both tracks have the same video, tag offset, frame count and
      decoded size, and that tag offset is the one of drift.json (CD3-2); both scores of c7_score_v2, the
-     same task, esp32 log, t = 0 (t0_log_us), k_start, thresholds and constants file (hang_so: file, sha256).
+     same task, esp32 log, t = 0 (t0_log_us), k_start, thresholds, constants file (hang_so: file, sha256), sender
+     log and events file (sha256, CC1-3); both tracks the same frame gates (CC1-4). A score lost to the measurement
+     system early (c7_score lost_output) carries the same fields, offset and t = 0 null when not known (CC1-1).
      Clock (Liam 17/11 CODE_CAM local_4a972073, box, verbatim: "Moi lan tu ghep gio (Recommended)"): each
      score matches the clocks on its own frames (C7b, or --offset-s as for any run), so the two scorings
      differ by the calibration and what follows from it, U_t included; the two offsets are kept in the
@@ -95,9 +97,10 @@ STEP_M = 0.05          # spacing of the lane samples (arc length)
 MIN_MARKS = 6          # common floor marks needed for the pose refit (calibrate needs 6 too)
 OUTCOMES = ('dat', 'khong_dat', 'chua_ket_luan', 'hong_he_do')
 SAME_KEYS = ('zc_tape_m', 'plumb_xy_m', 'tag_h_m', 'car_side_m', 'width', 'height')     # CD1-5
-SCORE_SAME = ('version', 'task', 'hang_so', 'k_start', 'thresholds', 'esp32_sha256', 't0_log_us')  # CD1-4, CD2-4
+SCORE_SAME = ('version', 'task', 'hang_so', 'k_start', 'thresholds', 'esp32_sha256', 't0_log_us',  # CD1-4, CD2-4
+              'sender_sha256', 'events_sha256')        # Codex CC1-3 (17/11): the same command-path inputs
 SCORE_VERSION = 'c7_score_v2'      # the scorer whose output this combines (U_m, D of the version before are gone)
-TRACK_SAME = ('video_sha256', 'tag_offset', 'frames', 'decoded_shapes')                 # CD2-4: track options
+TRACK_SAME = ('video_sha256', 'tag_offset', 'frames', 'decoded_shapes', 'gates')       # CD2-4, CC1-4: track options
 THRESH_TEXT = ('status',)          # the only text field of c7_score thresholds (metadata); the rest are numbers >= 0
 
 
@@ -433,8 +436,12 @@ def check_score(sc, tr, frames_sha, session_sha, drift, name):
     if sc['version'] != SCORE_VERSION:
         raise ValueError(f'{name} score: version {sc["version"]!r}, expected {SCORE_VERSION} (score again with '
                          'c7_score.py at this commit)')
-    _finite(sc['offset_s'], f'{name} score offset_s')
-    _finite(sc['t0_log_us'], f'{name} score t0_log_us')
+    # Codex CC1-1: a run lost to the measurement system early has no clock offset (C7b failed) or no t = 0 (edge
+    # lost): null there, never a number made up; any judged run has both
+    lost = sc['outcome'] == 'hong_he_do'
+    for k in ('offset_s', 't0_log_us'):
+        if not (lost and sc[k] is None):
+            _finite(sc[k], f'{name} score {k}')
     hs = _dict(sc['hang_so'], f'{name} score hang_so')
     _need(hs, ('file', 'sha256'), f'{name} score hang_so')
     _sha(hs['sha256'], f'{name} score hang_so.sha256')
@@ -511,7 +518,7 @@ def combine(drift, sc0, tr0, fr0_sha, sc1=None, tr1=None, fr1_sha=None):
     o1 = sc1['outcome']
     info['outcome_h1'] = o1
     # Liam 17/11 "Moi lan tu ghep gio": each score matched the clocks on its own frames; both kept, not averaged
-    info.update(offset_s_h0=float(sc0['offset_s']), offset_s_h1=float(sc1['offset_s']),
+    info.update(offset_s_h0=sc0['offset_s'], offset_s_h1=sc1['offset_s'],          # null: that scoring lost it
                 offset_src_h0=sc0.get('offset_src'), offset_src_h1=sc1.get('offset_src'))
     info['flags'] = ['calib_drift']
     if 'hong_he_do' in (o0, o1):

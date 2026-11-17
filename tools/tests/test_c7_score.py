@@ -1783,3 +1783,22 @@ def test_cs5_2_one_finite_report_still_checks_the_rate():
     ta = np.arange(-0.05, 1.0, 0.05)
     r = cs.dyn_exceed(_dyn_S(ta, np.zeros_like(ta), [-0.5, 0.5, 1.5], [0.0, 1.0, 0.0]), 0.0, 0.9, dict(BIGL, wz_dps=30.0))
     assert r[1] == 'wz_dps' and r[0] == pytest.approx(0.5) and 'acceleration not checked' in r[2]
+
+
+def test_cc1_3_cli_records_the_events_file_it_read(tmp_path):
+    """Codex CC1-3: the events file actually read (default <log>.events.txt) by name and sha256; none: null."""
+    import c7_measure as cm
+    cm.write_frames(tmp_path / 'frames.csv', make_frames('O1-F05'))
+    log = make_log(tmp_path / 'esp32.csv', 'O1-F05')
+    hs_file(tmp_path)
+    base = ['--frames', str(tmp_path / 'frames.csv'), '--esp32', log, '--task', 'O1-F05', '--hang-so',
+            str(tmp_path / 'hang_so.json'), '--offset-s', str(OFFSET), '--offset-reason', 'test',
+            '--offset-anchor-s', '0', '--offset-err-s', '0']
+    assert cs.main(base + ['--out', str(tmp_path / 's1.json')]) == 0
+    s = json.loads((tmp_path / 's1.json').read_text(encoding='utf-8'))
+    assert s['events_file'] is None and s['events_sha256'] is None
+    ev = tmp_path / 'esp32.csv.events.txt'
+    ev.write_text('2026-11-17T10:00:00 #us 1\n', encoding='utf-8')
+    assert cs.main(base + ['--out', str(tmp_path / 's2.json')]) == 0
+    s = json.loads((tmp_path / 's2.json').read_text(encoding='utf-8'))
+    assert s['events_file'] == 'esp32.csv.events.txt' and s['events_sha256'] == cm.sha256(str(ev))
