@@ -668,10 +668,12 @@ def dyn_exceed(S, t0, t_end, lim):
       angle turned  P + N of c8_u_imu.turn_totals over [t0, t]: every report pair whose span (sample and receive
                     times, both bases, CS3-4) meets the window counts in full, a suspect pair adds max|gz| x its span;
                     yaw up to t_break;
-      rate          |gz| of every finite gyro report from the last one at or before t0 to the first at or after t_end
-                    (a peak between two yaw reports is in the gyro, not in the yaw difference);
-      acceleration  |dgz / dt| between consecutive finite gyro reports there (c8_u_imu.alpha_max; across a gap the
-                    difference quotient still bounds the true peak from below, so an excess is certain).
+      rate          |gz| of every finite gyro report inside [t0, t_end] (a peak between two yaw reports is in the
+                    gyro, not in the yaw difference; a report outside the window is coverage only, CS4-5);
+      acceleration  |dgz / dt| between consecutive FINITE gyro reports inside the window (c8_u_imu.alpha_max; a NaN
+                    between them is skipped, CS4-4; across a gap the difference quotient still bounds the true peak from
+                    below, so an excess is certain).
+    The yaw pairs stop at t_break (CS4-3: a step after a reset is not a turn).
     Every excess seen is reported, even when the evidence does not cover the whole window (CS3-5); what could not be
     checked (no report at or before t0 or after t_end, a gyro gap above h_lim, values not finite, yaw reports not
     covering the window) is said in the note. Returns (time, limit key, note): (None, '', note) when nothing is seen
@@ -679,35 +681,42 @@ def dyn_exceed(S, t0, t_end, lim):
     cand, notes = [], []
     tg, gz = np.asarray(S.get('tg', np.array([])), float), np.asarray(S.get('gz', np.array([])), float)
     if tg.size:
-        i0 = max(int(np.searchsorted(tg, t0, 'right')) - 1, 0)
-        i1 = min(int(np.searchsorted(tg, t_end, 'left')), tg.size - 1)
-        tw, gw = tg[i0:i1 + 1], gz[i0:i1 + 1]
+        h_lim = S.get('h_lim', cu.H_LIM_S)
         if tg[0] > t0:
             notes.append(f'gyro reports start {tg[0] - t0:.3f} s after t = 0')
         if tg[-1] < t_end:
             notes.append(f'gyro reports end {t_end - tg[-1]:.2f} s before the window end')
+        c0 = max(int(np.searchsorted(tg, t0, 'right')) - 1, 0)       # coverage: the reports bracketing the window
+        c1 = min(int(np.searchsorted(tg, t_end, 'left')), tg.size - 1)
+        tc = tg[c0:c1 + 1]
+        if tc.size >= 2 and np.max(np.diff(tc)) > h_lim:
+            notes.append(f'gyro gap {np.max(np.diff(tc)):.3f} s above h_lim {h_lim:.3f} s (a peak may be missed)')
+        inw = (tg >= t0) & (tg <= t_end)                               # CS4-5: an excess counts inside the window only
+        tw, gw = tg[inw], gz[inw]
         fin = np.isfinite(gw)
         if not fin.all():
             notes.append(f'{int((~fin).sum())} gyro values not finite (not checked)')
-        h_lim = S.get('h_lim', cu.H_LIM_S)
-        if tw.size >= 2 and np.max(np.diff(tw)) > h_lim:
-            notes.append(f'gyro gap {np.max(np.diff(tw)):.3f} s above h_lim {h_lim:.3f} s (a peak may be missed)')
-        bad = np.nonzero(fin & (np.degrees(np.abs(np.nan_to_num(gw))) > lim['wz_dps']))[0]
+        if not tw.size:
+            notes.append('no gyro report inside the window: rate and acceleration not checked')
+        tf, gf = tw[fin], gw[fin]                                      # CS4-4: consecutive FINITE reports
+        bad = np.nonzero(np.degrees(np.abs(gf)) > lim['wz_dps'])[0]
         if len(bad):
-            cand.append((max(t0, float(tw[bad[0]])), 'wz_dps'))
-        if tw.size >= 2:
-            ok = fin[1:] & fin[:-1]
-            acc = np.degrees(np.abs(np.diff(np.nan_to_num(gw))) / np.diff(tw))
-            bad = np.nonzero(ok & (acc > lim['alpha_dps2']))[0]
+            cand.append((float(tf[bad[0]]), 'wz_dps'))
+        if tf.size >= 2:
+            acc = np.degrees(np.abs(np.diff(gf)) / np.diff(tf))
+            bad = np.nonzero(acc > lim['alpha_dps2'])[0]
             if len(bad):
-                cand.append((max(t0, float(tw[bad[0] + 1])), 'alpha_dps2'))
+                cand.append((float(tf[bad[0] + 1]), 'alpha_dps2'))
     else:
         notes.append('no gyro report: rate and acceleration not checked')
     ta, tr = S['t_all'], S['t_recv']
-    t_hi = min(t_end, S.get('t_break', math.inf))
+    t_br = S.get('t_break', math.inf)
+    t_hi = min(t_end, t_br)
+    if t_br < t_end:
+        notes.append(f'IMU yaw not usable after t_break ({t_br - t0:.2f} s): angle turned checked up to it')
     if ta[0] > t0:
         notes.append('IMU yaw reports start after t = 0: angle turned not checked')
-    else:
+    elif t_hi >= t0:
         lo_s, hi_s = np.minimum(ta, tr), np.maximum(ta, tr)
         # the pairs turn_totals counts for [t0, te]: span from lo of the first to hi of the second meets the window
         meet = np.nonzero(hi_s[1:] >= t0)[0]
@@ -715,9 +724,11 @@ def dyn_exceed(S, t0, t_end, lim):
         i0 = max(0, min(int(meet[0]) if len(meet) else ta.size - 1, k_cov))
         last = np.nonzero(lo_s <= t_hi)[0]
         i1 = max(int(np.searchsorted(ta, t_hi, 'left')), int(last[-1]) + 1 if len(last) else 0)
-        if i1 >= ta.size:
-            notes.append(f'IMU yaw reports end before {"t_break" if t_hi < t_end else "the window end"}')
-            i1 = ta.size - 1
+        cap = int(np.searchsorted(ta, t_br, 'right')) - 1 if math.isfinite(t_br) else ta.size - 1
+        i1 = min(i1, cap, ta.size - 1)                                 # CS4-3: no report after t_break
+        if ta[i1] < t_hi:                                              # CS4-6: by time, not by array index
+            notes.append(f'IMU yaw reports end {t_hi - ta[i1]:.3f} s before '
+                         f'{"t_break" if t_hi < t_end else "the window end"}')
         sub = dict(S, **{k: S[k][i0:i1 + 1] for k in ('t_all', 'psi_all', 'n_all', 't_recv', 'keep')})
         lim_rad = math.radians(lim['goc_quay_deg'])
         for k in range(i0, i1 + 1):
@@ -1188,6 +1199,13 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
     if cat:
         dom_c = dom_u = before
         g1 = g1_block([None, None], deadline, max(0.0, t1), True)
+        if out['U_t_scope'] == 'truoc_t1':
+            # CS4-1: U_t holds before t1 only: the rows after it carry no bound (not finite), flagged mien_U_t = 0
+            for r, m in zip(prow, before):
+                r['mien_U_t'] = int(bool(m))
+                if not m:
+                    for c in o1_gate.MEASURED:
+                        r[f'lo_{c}'] = r[f'hi_{c}'] = float('nan')
         reasons.append(f'vi pham chac chan truoc t1 = {t1:.3f} s (R2V-4)'
                        + (' (U_t tren [0, t1]: log khong phu mien hop, CS3-1)' if out['U_t_scope'] == 'truoc_t1'
                           else ''))

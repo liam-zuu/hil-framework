@@ -1380,3 +1380,71 @@ def test_cs2_8_undefined_suspect_does_not_hide_a_certain_violation_before_t1(tmp
     r = rows[frame_at(rows, 3.0)]
     assert r['suspect'] == 1 and math.isinf(r['hi_g2'])
     assert out['outcome'] == 'khong_dat' and out['cat_t1']
+
+
+# ---------------------------------------------------------------- Codex vong 4 (17/11, CS4-1, CS4-3..CS4-6), each failing
+# on hil cc375d4; review 03_CODE/docs/review/2026-11-17_Tham_dinh_c7_score_o1_vong4.md
+def test_cs4_1_rows_after_t1_carry_no_bound_when_u_t_holds_before_t1(tmp_path):
+    """Codex CS4-1: the CS3-1 run (U_t over [0, t1] only): the frames after t1 were written with finite bounds from a
+    U_t that holds before t1 only (G3 [0.117, 0.143] m at 6.5 s). They now carry no bound, flagged mien_U_t = 0."""
+    fr = make_frames('O1-K1', k_start=K1S, lateral=0.13, drop=[(5.2 + 0.5 / FPS, 5.5)])
+    out, rows = run(tmp_path, 'O1-K1', frames=fr, k_start=K1S, allow_final_set=True, log_kw=dict(post=1.0))
+    assert out['outcome'] == 'khong_dat' and out['U_t_scope'] == 'truoc_t1'
+    after = [r for r in rows if r['t'] > out['t1'] + 1e-9]
+    before = [r for r in rows if r['t'] <= out['t1'] + 1e-9]
+    assert after and all(r['mien_U_t'] == 0 and math.isnan(r['hi_g3']) and math.isnan(r['lo_g2']) for r in after)
+    assert all(r['mien_U_t'] == 1 and math.isfinite(r['hi_g3']) for r in before)
+
+
+def test_cs4_3_no_turn_counted_after_t_break():
+    """Codex CS4-3: a reset at 0.075 s (t_break 0.05 s) and a 1 rad step after it: the old span widening of CS3-4 took
+    the pair [0.05, 0.10] and reported 2 deg exceeded at 0.05 s; the yaw up to t_break turned 0 rad."""
+    S = _dyn_S([-0.05, 0.0, 0.05, 0.10, 0.15], [0, 0, 0, 1, 1], [-0.05, 0.0, 0.05, 0.10, 0.15], [0.0] * 5)
+    S['t_break'] = 0.05
+    r = cs.dyn_exceed(S, 0.0, 0.15, dict(goc_quay_deg=2.0, wz_dps=1e4, alpha_dps2=1e9))
+    assert r[0] is None and 't_break' in r[2]
+
+
+def test_cs4_4_acceleration_between_finite_reports_across_a_nan():
+    """Codex CS4-4: gz 0, NaN, 1 rad/s at 0, 0.05, 0.10 s: the two finite reports give 573 deg/s^2 > 500: reported
+    (the old code paired the NaN with each neighbour and saw nothing)."""
+    S = _dyn_S([-0.05, 0.0, 0.05, 0.10, 0.15], [0.0] * 5, [0.0, 0.05, 0.10], [0.0, float('nan'), 1.0])
+    r = cs.dyn_exceed(S, 0.0, 0.10, dict(goc_quay_deg=1e5, wz_dps=1e4, alpha_dps2=500.0))
+    assert r[1] == 'alpha_dps2' and r[0] == pytest.approx(0.10) and 'not finite' in r[2]
+
+
+def test_cs4_5_gyro_only_after_the_window_is_no_excess():
+    """Codex CS4-5: window [0, 1], gyro reports at 2 and 3 s only (1 rad/s at 2 s): the old code reported an excess
+    at 2 s; it is outside the run: no excess, the coverage is noted."""
+    S = _dyn_S(np.arange(-0.05, 1.1, 0.05), np.zeros(23), [2.0, 3.0], [1.0, 0.0])
+    r = cs.dyn_exceed(S, 0.0, 1.0, dict(goc_quay_deg=1e5, wz_dps=30.0, alpha_dps2=1e9))
+    assert r[0] is None and 'no gyro report inside the window' in r[2]
+
+
+def test_cs4_6_last_yaw_report_on_the_window_end_is_coverage():
+    S = _dyn_S([-0.05, 0.0, 0.05, 0.10], [0.0] * 4, [-0.05, 0.0, 0.05, 0.10], [0.0] * 4)
+    r = cs.dyn_exceed(S, 0.0, 0.10, dict(goc_quay_deg=2.0, wz_dps=1e4, alpha_dps2=1e9))
+    assert r == (None, '', '')
+
+
+def test_cs3_5_acceleration_across_a_gyro_gap_is_an_excess():
+    """The author's choice checked by Codex round 4: across a gap above h_lim the difference quotient still bounds the
+    true peak from below (1 rad/s in 0.5 s = 115 deg/s^2 > 100): reported, and the gap is noted."""
+    S = _dyn_S(np.arange(-0.05, 0.6, 0.05), np.zeros(13), [0.0, 0.5], [0.0, 1.0])
+    r = cs.dyn_exceed(S, 0.0, 0.5, dict(goc_quay_deg=1e5, wz_dps=1e4, alpha_dps2=100.0))
+    assert r[1] == 'alpha_dps2' and r[0] == pytest.approx(0.5) and 'h_lim' in r[2]
+
+
+def test_cs3_2_suspects_inside_and_outside_the_window(tmp_path):
+    """A suspect inside the window (2.5 s) and one after the deadline (7.0167 s): way 2 drops the one inside only, so
+    near the window end (no suspect inside around it) both ways have the same speeds (the frame after the deadline is
+    context of both)."""
+    lane = lane_of('O1-K1', K1S)
+    _, _, _, hc = lane.command(2.5)
+    jump = {int(round((4.0 + 2.5) * FPS)): (-0.03 * math.sin(hc), 0.03 * math.cos(hc)),
+            int(round((4.0 + 7.016667) * FPS)): (0.0, 0.03)}
+    fr = make_frames('O1-K1', k_start=K1S, jump=jump, lat_fn=lambda t: 0.02 * (min(t, 5.91) - 5.0) if t > 5.0 else 0.0)
+    out, rows = run(tmp_path, 'O1-K1', frames=fr, k_start=K1S, allow_final_set=True)
+    assert rows[frame_at(rows, 2.5)]['suspect'] == 1
+    end = [r for r in rows if 6.8 <= r['t'] < 7.0]
+    assert end and all(r['speed_way2'] == pytest.approx(r['speed'], abs=1e-12) for r in end)

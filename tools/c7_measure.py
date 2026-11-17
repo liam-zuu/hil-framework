@@ -475,6 +475,11 @@ def regate(rows, session, gates=None):
         if not r['car_seen']:
             continue
         dec = r.setdefault('_dec', {})
+        for c in ('res_m', 'scale'):                     # CS4-2: the fallback rounding (6 decimals) needs values on that
+            v = r[c]                                     # grid, else writing 6 decimals would move the interval
+            if c not in dec and np.isfinite(v) and abs(v * 1e6 - round(v * 1e6)) > 1e-6:
+                raise ValueError(f'frame {r.get("idx")}: {c} {v!r} is not on the 6-decimal grid and its rounding is not '
+                                 "given ('_dec'): regate cannot bound it (CS4-2)")
         for c in ('res_m', 'scale', 'res_sim_m'):        # CS3-3: a row on the fallback rounding is written back with
             dec.setdefault(c, 6)                         # 6 decimals, never with digits it does not hold
         q = max(cell_quant(r, 'res_m'), cell_quant(r, 'scale'))
