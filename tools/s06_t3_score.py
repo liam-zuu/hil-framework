@@ -41,7 +41,8 @@ Mất dữ liệu (Z19) → mã 1, xét TRƯỚC mọi lỗi đầu vào khác c
 (manifest_check), luồng qseq của lượt hở, luồng T3 của lượt không đủ gseq (t3_g0; t3_g1] (T3C-11), `t3_ovf_run` > 0,
 hai cạnh D liền nhau cùng mức (lỡ một cạnh PF3, T3C-12), cạnh Pi hay cạnh M không có cặp. Đã biết mất frame thì lỗi
 của bước đọc marker và so lịch cũng là mã 1 (T3C-10). Đồng hồ không ghép được (không neo, neo không khớp affine) → mã 3
-`thieu_bang_chung`, xét sau mất dữ liệu thật, và bậc không tính thành "không có cạnh M" (T3C-R2-2).
+`thieu_bang_chung`, xét sau mất dữ liệu thật, và bậc không tính thành "không có cạnh M" (T3C-R2-2); nhưng số cạnh M
+của lượt khác số frame có marker vẫn là mất cạnh đã chứng minh, mã 1 (T3C-R3-1).
 Mã thoát: 0 đạt; 1 không đạt hoặc mất dữ liệu; 3 chưa kết luận / thiếu bằng chứng / không đủ điều kiện / không chọn
 được lượt; 2 lỗi đầu vào (kể cả frame có marker không theo lịch khi frame log đủ). Dòng cuối `#ket_qua,…`.
 
@@ -362,6 +363,11 @@ def main(argv=None) -> int:
         # bằng chứng (mã 3), không tính bậc thành no_data hay cạnh không cặp thành mất dữ liệu
         nosync.append(f"không ghép được cạnh M với frame có marker: {sync['problem']}")
         pair = {}
+        # T3C-R3-1 (Codex vòng 3): số lượng khác nhau thì không affine nào ghép một–một được: mất cạnh đã chứng minh
+        # (ít hơn: frame có marker không có cạnh M; nhiều hơn: cạnh M không thuộc frame có marker nào), mã 1
+        if len(e) != len(mk):
+            lost.append(f"{len(e)} cạnh M của lượt, {len(mk)} frame có marker: không ghép một–một được, ít nhất "
+                        f"{abs(len(mk) - len(e))} cạnh không có cặp (dù không neo được đồng hồ)")
     else:
         if sync['n_pairs'] < len(mk):
             lost.append(f"{len(mk) - sync['n_pairs']} frame có marker không có cạnh M (cặp {sync['n_pairs']}/{len(mk)})")

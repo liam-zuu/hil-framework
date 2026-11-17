@@ -6,9 +6,10 @@ Spec S06 v3.4 mục 8 (thiết kế: 03_CODE/docs/2026-10-29_Thiet_ke_env_s06_lo
 Q-S1 = 1 ms, Q-S2 = lệnh UDP). Nhận hai luồng UDP:
   - DATA 100 Hz của logger.c (cổng 5005, CSV + dòng '#run_end' của đường motor_off);
   - sự kiện của s06_load.c (cổng 5007: J, I, R, P, E, S và dòng '#...').
-Gửi lệnh tới ESP32 (cổng 5011): `START <zero|heavy|t6|t3> <s> <0|1> n=<k>`, `STOP <lý do>` (t3: S06 T3, PWM 0 như
-zero, bật ngắt PF3/encoder/GPIO37 của s06_load; Liam 17/11 CODE_S06 "Hồ sơ t3 riêng (Recommended)"). `n=<k>` = lần gửi
-thứ k của START (T3C-8, Liam 17/11 "Sửa 5 + vòng 3"): firmware bỏ qua, `#ack` chép lại. Giờ ở `commands:` của
+Gửi lệnh tới ESP32 (cổng 5011): `START <zero|heavy|t6|t3> <s> <0|1> n=<mã>.<k>`, `STOP <lý do>` (t3: S06 T3, PWM 0 như
+zero, bật ngắt PF3/encoder/GPIO37 của s06_load; Liam 17/11 CODE_S06 "Hồ sơ t3 riêng (Recommended)"). `n=<mã>.<k>` = mã
+capture (8 hex ngẫu nhiên, `start_nonce` của capture.yaml) và lần gửi thứ k của START (T3C-8, Liam 17/11 "Sửa 5 + vòng
+3", "Sửa 3 + vòng 4"): firmware bỏ qua, `#ack` chép lại. Giờ ở `commands:` của
 capture.yaml lấy trước sendto.
 
 Ghi log thô nguyên văn: mỗi dòng nhận được ghi thành `<t_rx_us>\t<dòng>`, t_rx_us là
@@ -25,6 +26,7 @@ Usage:
 import argparse
 import datetime
 import os
+import secrets
 import selectors
 import socket
 import subprocess
@@ -169,6 +171,8 @@ def run(args):
     dest = (args.esp32, args.cmd_port)
     auto_end = 0 if args.no_auto_end else 1
     start_text = f"START {args.profile} {args.duration} {auto_end}"
+    # T3C-8 (Codex vòng 3): mã capture ngẫu nhiên, để #ack của lần chạy logger khác (đến muộn) không trùng chuỗi
+    nonce = secrets.token_hex(4)
     sent = []                 # (t_us, lệnh)
     stop_reason = None
     result = "ok"
@@ -183,9 +187,9 @@ def run(args):
         # START, gửi lại tới khi ESP32 trả lời
         for k in range(1, START_TRIES + 1):
             n_ack = len(cap.acks)
-            # T3C-8: mã lần gửi ở cuối; s06_load đọc ba trường đầu bằng sscanf (bỏ qua phần thừa) và #ack chép lại
-            # cmd=, nên s06_clock_sync ghép #ack với đúng lần gửi
-            text = f"{start_text} n={k}"
+            # T3C-8: mã capture + lần gửi ở cuối; s06_load đọc ba trường đầu bằng sscanf (bỏ qua phần thừa) và #ack
+            # chép lại cmd=, nên s06_clock_sync ghép #ack với đúng lần gửi của đúng capture
+            text = f"{start_text} n={nonce}.{k}"
             sent.append((send_cmd(cmd, dest, text), text))
             t_end = time.monotonic() + 1.0
             while time.monotonic() < t_end and cap.run_start is None and len(cap.acks) == n_ack:
@@ -232,7 +236,7 @@ def run(args):
     finally:
         cap.close()
         cmd.close()
-    write_capture_yaml(args, cap, sent, t0_wall, t0, result, stop_reason)
+    write_capture_yaml(args, cap, sent, t0_wall, t0, result, stop_reason, nonce)
     print(f"[PI] Kết quả: {result}; data {cap.lines['data']} dòng, events {cap.lines['events']} dòng "
           f"-> {args.out}")
     return 0 if result == "ok" else 1
@@ -243,7 +247,7 @@ def yq(v):
     return '"' + str(v).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def write_capture_yaml(args, cap, sent, t0_wall, t0, result, stop_reason):
+def write_capture_yaml(args, cap, sent, t0_wall, t0, result, stop_reason, nonce=""):
     sha, dirty = git_rev(os.path.dirname(os.path.abspath(__file__)))
     env = text_field(cap.fw, "env") if cap.fw else None
     if cap.run_start is not None:
@@ -263,6 +267,7 @@ def write_capture_yaml(args, cap, sent, t0_wall, t0, result, stop_reason):
         f"profile: {args.profile}",
         f"duration_s: {args.duration}",
         f"auto_end: {0 if args.no_auto_end else 1}",
+        f"start_nonce: {yq(nonce)}",
         f"result: {result}",
         f"pi_stop_reason: {yq(stop_reason or '')}",
         f"fw_line: {yq(cap.fw or '')}",

@@ -152,16 +152,16 @@ def test_clock_sync_delta_sync_adds_isr_latency():
 
 def test_read_commands_and_anchor(tmp_path):
     cap = tmp_path / 'capture.yaml'
-    cap.write_text('profile: t3\ncommands:\n  - {t_us: 1000000, cmd: "START t3 20 1 n=1"}\n'
-                   '  - {t_us: 1500000, cmd: "START t3 20 1 n=2"}\nacks:\n  - {t_rx_us: 1, line: "x"}\n',
+    cap.write_text('profile: t3\ncommands:\n  - {t_us: 1000000, cmd: "START t3 20 1 n=0a1b2c3d.1"}\n'
+                   '  - {t_us: 1500000, cmd: "START t3 20 1 n=0a1b2c3d.2"}\nacks:\n  - {t_rx_us: 1, line: "x"}\n',
                    encoding='utf-8')
     cmds = cs.read_commands(str(cap))
-    assert cmds == [(1000000, 'START t3 20 1 n=1'), (1500000, 'START t3 20 1 n=2')]
-    ev = chk.parse_events([(1_520_000, '#ack,t_us=7000,ok=1,why=ok,cmd=START t3 20 1 n=2,qseq=5')])
+    assert cmds == [(1000000, 'START t3 20 1 n=0a1b2c3d.1'), (1500000, 'START t3 20 1 n=0a1b2c3d.2')]
+    ev = chk.parse_events([(1_520_000, '#ack,t_us=7000,ok=1,why=ok,cmd=START t3 20 1 n=0a1b2c3d.2,qseq=5')])
     anc = cs.anchor(ev, cmds)
     assert anc['t_sent'] == 1_500_000 and anc['lo'] == 1_500_000 - 7000
     assert anc['hi'] == 1_520_000 - 7000
-    ev = chk.parse_events([(1_520_000, '#ack,t_us=7000,ok=0,why=busy,cmd=START t3 20 1 n=2,qseq=5')])
+    ev = chk.parse_events([(1_520_000, '#ack,t_us=7000,ok=0,why=busy,cmd=START t3 20 1 n=0a1b2c3d.2,qseq=5')])
     assert cs.anchor(ev, cmds) is None
 
 
@@ -169,16 +169,18 @@ def test_anchor_ack_paired_by_command_text_t3c8():
     """T3C-8 (Codex round 2): two START tries, the #ack of the first (n=1) arrives after the second was sent. The
     #ack is paired with the send of the same text, never with the last START before it; the same text sent twice
     (an old log without n=<k>) cannot be paired surely → no anchor."""
-    cmds = [(9_499_500, 'START t3 20 1 n=1'), (10_499_500, 'START t3 20 1 n=2')]
-    ev = chk.parse_events([(10_501_500, '#ack,t_us=9376544,ok=1,why=ok,cmd=START t3 20 1 n=1,qseq=5'),
-                           (10_501_600, '#ack,t_us=10376544,ok=0,why=busy,cmd=START t3 20 1 n=2,qseq=6')])
+    cmds = [(9_499_500, 'START t3 20 1 n=0a1b2c3d.1'), (10_499_500, 'START t3 20 1 n=0a1b2c3d.2')]
+    ev = chk.parse_events([(10_501_500, '#ack,t_us=9376544,ok=1,why=ok,cmd=START t3 20 1 n=0a1b2c3d.1,qseq=5'),
+                           (10_501_600, '#ack,t_us=10376544,ok=0,why=busy,cmd=START t3 20 1 n=0a1b2c3d.2,qseq=6')])
     anc = cs.anchor(ev, cmds)
-    assert anc['t_sent'] == 9_499_500 and anc['cmd'] == 'START t3 20 1 n=1'
+    assert anc['t_sent'] == 9_499_500 and anc['cmd'] == 'START t3 20 1 n=0a1b2c3d.1'
     assert anc['width'] == 10_501_500 - 9_499_500                       # 1 s wide: refused by sync, below
-    same = [(9_499_500, 'START t3 20 1'), (10_499_500, 'START t3 20 1')]
-    ev = chk.parse_events([(10_501_500, '#ack,t_us=9376544,ok=1,why=ok,cmd=START t3 20 1,qseq=5')])
+    same = [(9_499_500, 'START t3 20 1 n=0a1b2c3d.1'), (10_499_500, 'START t3 20 1 n=0a1b2c3d.1')]
+    ev = chk.parse_events([(10_501_500, '#ack,t_us=9376544,ok=1,why=ok,cmd=START t3 20 1 n=0a1b2c3d.1,qseq=5')])
     assert cs.anchor(ev, same) is None
-    assert cs.anchor(ev, [(10_600_000, 'START t3 20 1')]) is None       # sent after the #ack was received
+    assert cs.anchor(ev, [(10_600_000, 'START t3 20 1 n=0a1b2c3d.1')]) is None   # sent after the #ack was received
+    ev = chk.parse_events([(10_501_500, '#ack,t_us=9376544,ok=1,why=ok,cmd=START t3 20 1,qseq=5')])
+    assert cs.anchor(ev, [(9_499_500, 'START t3 20 1')]) is None        # old logger: no capture code
 
 
 def test_clock_sync_late_ack_of_first_start_not_shifted_t3c8():
@@ -187,11 +189,30 @@ def test_clock_sync_late_ack_of_first_start_not_shifted_t3c8():
     Round 2 paired the #ack with the second send and returned offset 1 123 456 with code 0; now never code 0."""
     p = 5_000_000.0 + 100_000.0 * np.arange(600)
     e = p[50:550] - 123_456.0
-    cmds = [(9_499_500, 'START t3 20 1 n=1'), (10_499_500, 'START t3 20 1 n=2')]
-    ev = chk.parse_events([(10_501_500, '#ack,t_us=9376544,ok=1,why=ok,cmd=START t3 20 1 n=1,qseq=5')])
+    cmds = [(9_499_500, 'START t3 20 1 n=0a1b2c3d.1'), (10_499_500, 'START t3 20 1 n=0a1b2c3d.2')]
+    ev = chk.parse_events([(10_501_500, '#ack,t_us=9376544,ok=1,why=ok,cmd=START t3 20 1 n=0a1b2c3d.1,qseq=5')])
     s = cs.sync(p, np.full(len(p), 1.0), e, cs.anchor(ev, cmds), loop_max_us=12.0)
     assert cs.verdict(s)[0] != 0
     assert s['offset_us'] is None or abs(s['offset_us'] - 123_456.0) < 100
+
+
+def test_anchor_ignores_late_ack_of_another_capture_t3c8_round3():
+    """T3C-8, Codex round 3 counterexample: two logger runs both sent `n=1`; the #ack of the previous capture
+    (t_ack_esp 9 376 544, true Pi time 9 500 000) arrives late at 28 511 500, after this capture's own #ack
+    (28 501 000). Round 3 took the latest #ack and paired 19 s off with code 0. Now the capture code differs, the
+    stale #ack is ignored, this capture's #ack anchors right; without it, no anchor (code 3), never a shifted fit."""
+    p = 5_000_000.0 + 100_000.0 * np.arange(800)
+    e = p[236:425] - 123_456.0
+    cmds = [(28_499_500, 'START heavy 19 1 n=c0ffee02.1')]
+    own = (28_501_000, '#ack,t_us=28376544,ok=1,why=ok,cmd=START heavy 19 1 n=c0ffee02.1,qseq=7')
+    stale = (28_511_500, '#ack,t_us=9376544,ok=1,why=ok,cmd=START heavy 19 1 n=c0ffee01.1,qseq=3')
+    anc = cs.anchor(chk.parse_events([own, stale]), cmds, t_rx_ref=28_502_000)
+    assert anc['t_ack_esp'] == 28_376_544 and anc['cmd'].endswith('c0ffee02.1')
+    s = cs.sync(p, np.full(len(p), 1.0), e, anc, loop_max_us=12.0)
+    assert cs.verdict(s) == (0, '') and abs(s['offset_us'] - 123_456.0) < 1
+    anc = cs.anchor(chk.parse_events([stale]), cmds, t_rx_ref=28_502_000)
+    assert anc is None
+    assert cs.verdict(cs.sync(p, np.full(len(p), 1.0), e, anc, loop_max_us=12.0))[0] == 3
 
 
 def test_logger_send_time_taken_before_sendto_t3c8(monkeypatch):
@@ -205,7 +226,7 @@ def test_logger_send_time_taken_before_sendto_t3c8(monkeypatch):
         def sendto(self, data, addr):
             clock[0] += 100_000                                       # the process is held 100 ms in sendto
 
-    assert lg.send_cmd(Sock(), ('127.0.0.1', 1), 'START t3 20 1 n=1') == 1_000_000
+    assert lg.send_cmd(Sock(), ('127.0.0.1', 1), 'START t3 20 1 n=0a1b2c3d.1') == 1_000_000
 
 
 def test_logger_start_tries_carry_try_number_t3c8(tmp_path):
@@ -260,12 +281,15 @@ def test_logger_start_tries_carry_try_number_t3c8(tmp_path):
         stop.set()
         th.join(1)
     assert rc == 0
-    assert got[:2] == ['START zero 1 1 n=1', 'START zero 1 1 n=2']
+    import re
+    y = (out / 'capture.yaml').read_text(encoding='utf-8')
+    code = re.search(r'^start_nonce: "([0-9a-f]{8})"$', y, re.M).group(1)
+    assert got[:2] == [f'START zero 1 1 n={code}.1', f'START zero 1 1 n={code}.2']
     cmds = cs.read_commands(str(out / 'capture.yaml'))
-    assert [c for _, c in cmds] == ['START zero 1 1 n=1', 'START zero 1 1 n=2']
+    assert [c for _, c in cmds] == got[:2]
     ev = chk.parse_events(chk.read_raw(str(out / 'esp32_events.txt')))
     anc = cs.anchor(ev, cmds)
-    assert anc['cmd'] == 'START zero 1 1 n=2' and anc['t_sent'] == cmds[1][0]
+    assert anc['cmd'] == got[1] and anc['t_sent'] == cmds[1][0]
 
 
 def test_clock_sync_bracket_off_centre_still_pairs_r2_1():
@@ -351,7 +375,7 @@ def _make_cal(tmp_path, n_pairs=1100, profile='heavy', o_without_l=0, lat=(5.0, 
 
 def _make_run(tmp_path, delay=lambda j: 300.0 + 7 * (j % 5), quant_frac=0.5, drop_dbg=(), extra_dbg=(),
               stray_dbg=0, loop=True, gseq_hole=None, profile='t3', pf3_before=1, t3_ovf=0, delay_override=None,
-              drop_n=(), same_level_d=None, drop_tail=0, frame_us=1000, drop_marker_frame=None):
+              drop_n=(), same_level_d=None, drop_tail=0, frame_us=1000, drop_marker_frame=None, drop_m=()):
     sched = ts.make_schedule(1)
     write_csv(str(tmp_path / 'T3_schedule.csv'), sched)
     plant = ScheduleOmegaPlant(sched)
@@ -383,7 +407,8 @@ def _make_run(tmp_path, delay=lambda j: 300.0 + 7 * (j % 5), quant_frac=0.5, dro
     lvl = 0
     for j, k in enumerate(mk):
         t_m = to_esp((p0[k] + p1[k]) / 2000.0) + 4.0
-        ev.append((t_m, 'M', 38, 1))
+        if j not in drop_m:                            # T3C-R3-1: an M edge never recorded (qseq, gseq whole)
+            ev.append((t_m, 'M', 38, 1))
         if j in drop_dbg:
             continue
         d = delay(j) if delay_override is None else delay_override.get(j, delay(j))
@@ -424,8 +449,9 @@ def _make_run(tmp_path, delay=lambda j: 300.0 + 7 * (j % 5), quant_frac=0.5, dro
     lines, q, g = [], 1, 0
     t_rx = lambda te: int(OFF_US + RATE * te + 2500)
     t_ack = t_start - 300.0
-    lines.append((t_rx(t_ack) + 4000, f'#ack,t_us={int(t_ack)},ok=1,why=ok,cmd=START {profile} 20 1,qseq={q}'))
-    cmds = [(int(OFF_US + RATE * t_ack) - 2000, f'START {profile} 20 1')]
+    lines.append((t_rx(t_ack) + 4000, f'#ack,t_us={int(t_ack)},ok=1,why=ok,cmd=START {profile} 20 1 n=5e6f7a8b.1,'
+                                            f'qseq={q}'))
+    cmds = [(int(OFF_US + RATE * t_ack) - 2000, f'START {profile} 20 1 n=5e6f7a8b.1')]
     q += 1
     lines.append((t_rx(t_start), f'#run_start,run=1,timestamp_us={int(t_start)},profile={profile},duration_s=20,'
                                  f'auto_end=1,qseq={q}'))
@@ -619,6 +645,21 @@ def test_t3_no_anchor_with_real_loss_is_still_loss_r2_2(tmp_path):
     """T3C-R2-2: a true Z19 loss (gseq hole) is judged before the missing anchor → code 1."""
     d = _make_run(tmp_path, gseq_hole=50)
     os.remove(d / 'capture.yaml')
+    assert _score(d) == 1
+
+
+def test_t3_no_anchor_but_missing_m_edge_is_loss_r3_1(tmp_path):
+    """T3C-R3-1 (Codex round 3): 100 marked frames, the ESP32 recorded only 99 M edges (qseq, gseq whole) and
+    capture.yaml is missing: 99 edges cannot pair one-to-one with 100 frames whatever the affine → code 1, not 3."""
+    d = _make_run(tmp_path, drop_m=(37,))
+    os.remove(d / 'capture.yaml')
+    assert _score(d) == 1
+    assert any('99 cạnh M' in r for r in _summary(d)['reasons'])
+
+
+def test_t3_missing_m_edge_with_anchor_is_loss(tmp_path):
+    """Guard (normal path): the same missing M edge with the anchor present is a loss too (code 1)."""
+    d = _make_run(tmp_path, drop_m=(37,))
     assert _score(d) == 1
 
 

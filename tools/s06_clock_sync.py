@@ -15,10 +15,11 @@ Neo thô (T3C-8, T3C-15): cạnh 10 Hz cách đều 100 ms nên không ghép đ�
 cho cận DƯỚI của trễ gửi. Neo bằng khoảng kẹp của lệnh START có `#ack,ok=1`:
     t_gửi(START, Pi, `capture.yaml` commands, lấy TRƯỚC sendto)  ≤  OFFSET + t_ack_esp  ≤  t_rx(#ack, Pi)
 `t_ack_esp` = trường `t_us` của `#ack` (giờ ESP32 lúc cmd_task xử lý lệnh). Sửa sau Codex vòng 2 (Liam 17/11 "Sửa 5 +
-vòng 3"): `#ack` chỉ ghép với lệnh START có CÙNG chuỗi (`s06_logger.py` thêm mã lần gửi `n=<k>` vào cuối mỗi lần gửi
-START; `s06_load` đọc ba trường đầu bằng `sscanf`, bỏ qua phần thừa, `#ack` chép lại `cmd=` nguyên chuỗi); không có
-lệnh cùng chuỗi, hay chuỗi đó gửi hơn một lần (log cũ gửi lại cùng chuỗi) thì không neo (mã 3). Độ rộng khoảng kẹp =
-thời gian khứ hồi; rộng hơn ANCHOR_MAX_US thì không ghép (mã 3).
+vòng 3"; sau Codex vòng 3, "Sửa 3 + vòng 4"): `#ack` chỉ ghép với lệnh START có CÙNG chuỗi (`s06_logger.py` thêm
+`n=<mã capture>.<k>` vào cuối mỗi lần gửi START: mã capture 8 hex ngẫu nhiên mỗi lần chạy logger, k = lần gửi;
+`s06_load` đọc ba trường đầu bằng `sscanf`, bỏ qua phần thừa, `#ack` chép lại `cmd=` nguyên chuỗi), nên #ack của lần
+chạy logger khác không ghép được; không có lệnh cùng chuỗi, chuỗi đó gửi hơn một lần, hay lệnh không có mã capture
+(logger cũ) thì không neo (mã 3). Độ rộng khoảng kẹp = thời gian khứ hồi; rộng hơn ANCHOR_MAX_US thì không ghép (mã 3).
 Độ lệch thô (T3C-R2-1): với các cạnh ESP32 gần `#ack` nhất (trong ANCHOR_SPAN_US, tối đa REFIT_EVERY cạnh), ứng viên là
 cạnh Pi có (t_pi − t_esp) trong khoảng kẹp ± MATCH_TOL_US; khoảng đó rộng ≤ ANCHOR_MAX_US + 2·MATCH_TOL_US = 46 ms < 50 ms
 (khoảng cách nhỏ nhất của cạnh Pi), nên mỗi cạnh ESP32 có tối đa một ứng viên. Độ lệch thô = trung vị các ứng viên;
@@ -79,6 +80,8 @@ ANCHOR_MAX_US = 40_000.0      # độ rộng khoảng kẹp tối đa: + 2·MATC
 ANCHOR_SPAN_US = 20_000_000.0
 LOOP_CAL_MIN = 1000           # spec mục 4.1: N = 1 000
 CMD_RE = re.compile(r'^\s*-\s*\{t_us:\s*(\d+),\s*cmd:\s*"(.*)"\}\s*$')
+# Lệnh START của s06_logger (T3C-8, Codex vòng 3): mã capture 8 hex ngẫu nhiên + số lần gửi
+START_RE = re.compile(r'^START \S+ \d+ [01] n=[0-9a-f]{8}\.\d+$')
 
 
 # ── dữ liệu ──────────────────────────────────────────────────────────────────
@@ -122,28 +125,34 @@ def read_commands(path: str) -> List[Tuple[int, str]]:
 
 
 def anchor(events, commands: Sequence[Tuple[int, str]], t_rx_ref: Optional[int] = None) -> Optional[dict]:
-    """Khoảng kẹp của OFFSET từ một `#ack,ok=1` của START: lo ≤ OFFSET + t_ack ≤ hi. Chọn #ack START ok mới nhất
+    """Khoảng kẹp của OFFSET từ một `#ack,ok=1` của START: lo ≤ OFFSET + t_ack ≤ hi. Chỉ xét #ack có chuỗi `cmd=`
+    bằng đúng một lệnh START của capture này (T3C-8: `n=<mã capture>.<k>` của s06_logger, START_RE), lệnh đó gửi
+    đúng một lần và không sau t_rx của #ack; #ack của capture khác (mã khác) bị bỏ. Trong số đó chọn #ack mới nhất
     có t_rx ≤ t_rx_ref + 2 s (t_rx_ref = t_rx của #run_start lượt chọn), không có t_rx_ref thì #ack đầu tiên.
-    Lệnh gửi = lệnh START có đúng chuỗi `cmd=` của #ack (T3C-8: mã lần gửi `n=<k>` của s06_logger), gửi đúng một
-    lần và không sau t_rx. None = không neo được."""
+    None = không neo được (kể cả log của logger cũ, lệnh không có mã capture)."""
+    sent_of = {}
+    for t, c in commands:
+        if START_RE.match(c):
+            sent_of.setdefault(c, []).append(t)
     acks = []
     for r in events['text']:
-        if r['name'] != 'ack' or r['kv'].get('ok') != '1' or not r['kv'].get('cmd', '').startswith('START'):
+        if r['name'] != 'ack' or r['kv'].get('ok') != '1':
             continue
+        text = r['kv'].get('cmd', '')
         try:
-            acks.append((int(r['t_rx']), int(r['kv']['t_us']), r['kv']['cmd']))
+            t_rx, t_ack = int(r['t_rx']), int(r['kv']['t_us'])
         except (KeyError, ValueError):
             continue
+        sent = sent_of.get(text, [])
+        if len(sent) == 1 and sent[0] <= t_rx:   # không có, hay cùng chuỗi gửi hơn một lần: không gắn chắc
+            acks.append((t_rx, t_ack, text, sent[0]))
     if t_rx_ref is not None:
         acks = [a for a in acks if a[0] <= t_rx_ref + 2_000_000][-1:]
     else:
         acks = acks[:1]
-    for t_rx, t_ack, text in acks:
-        sent = [t for t, c in commands if c == text]
-        if len(sent) != 1 or sent[0] > t_rx:     # không có, hay cùng chuỗi gửi hơn một lần: không gắn chắc
-            continue
-        lo, hi = sent[0] - t_ack, t_rx - t_ack
-        return dict(t_ack_esp=t_ack, t_rx=t_rx, t_sent=sent[0], cmd=text, lo=float(lo), hi=float(hi),
+    for t_rx, t_ack, text, t_sent in acks:
+        lo, hi = t_sent - t_ack, t_rx - t_ack
+        return dict(t_ack_esp=t_ack, t_rx=t_rx, t_sent=t_sent, cmd=text, lo=float(lo), hi=float(hi),
                     width=float(hi - lo))
     return None
 
