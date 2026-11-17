@@ -284,8 +284,7 @@ def test_grid_centre_fields_must_match_their_node(ds):
 def test_grid_every_node_lost_is_a_lost_run(ds):
     d, gf, tmp = ds
     _floor_run(d)
-    base = rl.floor_gate(_gate(gf, level='O1-F05', platform='HW', stage='screen', campaign='A-PID', th=3.0),
-                         t_done=(10.0, None))                              # centre fields: G1 chua_ket_luan
+    base = _undef(_t1_base(gf, t_done=(None, None)))                         # GT1-1: the centre lost by its t1
     g = _grid_gate(gf, ['chua_ket_luan'] * 3, hong=[True] * 3, base=base)
     with pytest.raises(rl.LogError, match='every grid node lost'):
         rl.end(d, 'chua_ket_luan', completed=1, results_dir=str(tmp), gate=g, gate_file=gf, queries=rl.fake_queries())
@@ -358,37 +357,36 @@ def test_grid_only_on_the_floor(ds):
 # ── design v2 section 6: reruns after the C8b time check (O1 v11.37 D1, S05 v3.43 D2, D3; Liam 17/11 THESIS "Chỉ lượt
 # trượt kiểm giờ", "Tổng", "Bắt buộc file", "Luật §4.6: 3 hỏng liên tiếp"; the code: Liam 17/11 at CODE_GATE) ──
 
-def _gio(tmp, name, ok=False, fmt='c8b_gio_v1'):
-    p = str(tmp / f'{name}.json')
+def _gio(tmp, name, ok=False, fmt='c8b_gio_v1', **extra):
+    """A FAKE C8b time file; its name goes into it, so two files never share a sha256 (GT1-8)."""
+    p = os.path.join(str(tmp), f'{name}.json')
     with open(p, 'w', encoding='utf-8') as f:
-        json.dump(dict(format=fmt, ok=ok, nodes_s=[0.01, 0.011], FAKE=True), f)
+        json.dump(dict(format=fmt, ok=ok, nodes_s=[0.01, 0.011], FAKE=True, name=name, **extra), f)
     return p
 
 
-def _lost_gio(d, tmp, name, task='O1-F05', stage='screen', gs='A-PID/G01'):
-    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', task, str(rl.FIG8[task]), stage, gain_set=gs)
+def _lost_gio(d, tmp, name, task='O1-F05', stage='screen', gs='A-PID/G01', gains=''):
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', task, str(rl.FIG8[task]), stage, gain_set=gs, gains=gains)
     rl.step(d, 'run')
     return rl.end(d, 'hong_he_do', completed=1, fail_cause=rl.C8B_GIO_FAIL, c8b_gio=_gio(tmp, name),
-                  queries=rl.fake_queries())
+                  results_dir=str(tmp), queries=rl.fake_queries())
 
 
 def test_c8b_check_needs_its_file_ok_false(ds):
     d, gf, tmp = ds
     rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
     rl.step(d, 'run')
+    kw = dict(completed=1, results_dir=str(tmp), queries=rl.fake_queries())
     with pytest.raises(rl.LogError, match='go together'):
-        rl.end(d, 'hong_he_do', completed=1, fail_cause=rl.C8B_GIO_FAIL, queries=rl.fake_queries())
+        rl.end(d, 'hong_he_do', fail_cause=rl.C8B_GIO_FAIL, **kw)
     with pytest.raises(rl.LogError, match='ok false'):
-        rl.end(d, 'hong_he_do', completed=1, fail_cause=rl.C8B_GIO_FAIL, c8b_gio=_gio(tmp, 'okt', ok=True),
-               queries=rl.fake_queries())
+        rl.end(d, 'hong_he_do', fail_cause=rl.C8B_GIO_FAIL, c8b_gio=_gio(tmp, 'okt', ok=True), **kw)
     with pytest.raises(rl.LogError, match='ok false'):
-        rl.end(d, 'hong_he_do', completed=1, fail_cause=rl.C8B_GIO_FAIL, c8b_gio=_gio(tmp, 'fmt', fmt='x'),
-               queries=rl.fake_queries())
+        rl.end(d, 'hong_he_do', fail_cause=rl.C8B_GIO_FAIL, c8b_gio=_gio(tmp, 'fmt', fmt='x'), **kw)
     with pytest.raises(rl.LogError, match='go together'):
-        rl.end(d, 'hong_he_do', completed=1, fail_cause='mat_khung_FAKE', c8b_gio=_gio(tmp, 'g0'),
-               queries=rl.fake_queries())
+        rl.end(d, 'hong_he_do', fail_cause='mat_khung_FAKE', c8b_gio=_gio(tmp, 'g0'), **kw)
     p = _gio(tmp, 'g1')
-    row = rl.end(d, 'hong_he_do', completed=1, fail_cause=rl.C8B_GIO_FAIL, c8b_gio=p, queries=rl.fake_queries())
+    row = rl.end(d, 'hong_he_do', fail_cause=rl.C8B_GIO_FAIL, c8b_gio=p, **kw)
     assert row['c8b_gio_sha256'] == rl.sha256_file(p)
 
 
@@ -427,7 +425,7 @@ def test_c8b_final_follows_the_lost_in_a_row_rule(ds):
         rl.step(d, 'run')
         if i < 2:
             rl.end(d, 'hong_he_do', completed=1, fail_cause=rl.C8B_GIO_FAIL, c8b_gio=_gio(tmp, f'f{i}'),
-                   queries=rl.fake_queries())
+                   results_dir=str(tmp), queries=rl.fake_queries())
         else:
             rl.end(d, 'dat', completed=1, e_perp_max=0.02, results_dir=str(tmp),
                    gate=rl.floor_gate(rl.fake_gate(gate_file=gf)), gate_file=gf, queries=rl.fake_queries())
@@ -466,12 +464,12 @@ def test_cc1_2_lost_run_without_gate_through_end_and_so_h(ds):
     rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
     rl.step(d, 'run')
     assert rl.main(['--dataset', d, 'end', '--outcome', 'hong_he_do', '--fail-cause', 'mat_khung_FAKE',
-                    '--results-dir', folder, '--gate-json', sp]) == 0
+                    '--results-dir', folder, '--gate-json', sp, '--gate-file', str(tmp / 'gate_c8.json')]) == 0
     row = rl.read_rows(os.path.join(d, rl.TUNING))[-1]
     assert row['gate_json_sha256'] == rl.sha256_file(sp) and not rl.has_gate(row)
     r = rl.so_h(d, row['run_uid'], rl.fake_score_final(folder, 0.8))
     assert r['outcome_sau'] == 'hong_he_do'
-    rl.summary(d)
+    rl.summary(d, gate_file=gf)
 
 
 def test_cc1_2_gate_null_only_for_a_lost_run(ds):
@@ -487,10 +485,213 @@ def test_cc1_2_gate_null_only_for_a_lost_run(ds):
     with pytest.raises(rl.LogError, match='results-dir'):
         rl.end(d, 'hong_he_do', completed=1, fail_cause='mat_khung_FAKE', gate=None, gate_sha256=rl.sha256_file(sp))
     rl.end(d, 'hong_he_do', completed=1, fail_cause='mat_khung_FAKE', results_dir=folder, gate=None,
-           gate_sha256=rl.sha256_file(sp))
+           gate_sha256=rl.sha256_file(sp), gate_file=gf)
     p = os.path.join(d, rl.TUNING)
     rows = rl.read_rows(p)
     rows[-1].update(run_outcome='khong_dat', campaign='')                    # edited by hand: refused
     rl._write_all(p, rl.TUNING_COLS, rows)
     with pytest.raises(rl.LogError, match='lost to the measurement only'):
+        rl.summary(d)
+
+
+# ── Codex round 1 of CODE_GATE (GT1-1, -4, -5, -6, -7, -8; Liam 17/11 at CODE_GATE "Sửa theo bảng (Recommended)"). Each
+# test fails on 9f27de8 (the branch before the fixes) ──
+
+def _f05(gf, **kw):
+    return _gate(gf, level='O1-F05', platform='HW', stage='screen', campaign='A-PID', th=3.0, **kw)
+
+
+def _req(gf, level='O1-F05'):
+    return gf.required(level, 'HW', 'screen', 'A-PID')
+
+
+def _t1_base(gf, t_done=(10.0, 10.0), cat=False):
+    """A FAKE floor gate whose G1 fields carry t1 (a tracking error or a gap above t_trong) and cat_t1."""
+    g = rl.floor_gate(_f05(gf), t_done=t_done)
+    g['g1'].update(t1=6.0, cat_t1=cat)
+    st = rl.gate_g1_state(rl.gate_g1_fields(g['g1'], 'HW'))
+    g['g1'].update(state=st, q={'dat': 'true', 'khong_dat': 'false'}.get(st, 'inconclusive'))
+    g.update(o1_gate.evaluate_outcomes(g, g['decide'], g['required']))
+    return g
+
+
+def _undef(g):
+    """Every measured condition given one undefined frame of the union (what a lost grid node brings, O1 L1); states
+    and outcomes recomputed."""
+    for c, thr in o1_gate.THRESHOLDS.items():
+        g[c]['n_undef'] = 1
+        com = g[c].get('chung') or g[c]
+        g[c]['state'] = rl.cond_state2(com['lo'], g[c]['lo'], g[c]['hi'], 1, thr)
+    g.update(o1_gate.evaluate_outcomes(g, g['decide'], g['required']))
+    return g
+
+
+def test_gt1_1_a_grid_of_one_node_keeps_the_rule_of_t1(ds):
+    d, gf, tmp = ds
+    plain = _t1_base(gf)                                                     # t1 without the exception, no grid
+    with pytest.raises(rl.LogError, match='hong_he_do'):
+        rl.check_outcome_vs_gate('dat', plain, 'HW', '', _req(gf))
+    rl.check_outcome_vs_gate('hong_he_do', plain, 'HW', 'mat_khung_FAKE', _req(gf))
+    one = _grid_gate(gf, ['dat'], base=_t1_base(gf))                         # Codex GT1-1: the node not marked lost
+    with pytest.raises(rl.LogError, match='nut_tam'):
+        rl.check_outcome_vs_gate('dat', one, 'HW', '', _req(gf))
+    lost = _grid_gate(gf, ['chua_ket_luan'], hong=[True], base=_undef(_t1_base(gf)))
+    with pytest.raises(rl.LogError, match='hong_he_do'):
+        rl.check_outcome_vs_gate('chua_ket_luan', lost, 'HW', '', _req(gf))
+    rl.check_outcome_vs_gate('hong_he_do', lost, 'HW', 'mat_khung_FAKE', _req(gf))
+
+
+def test_gt1_1_a_lost_centre_node_is_lost_by_its_t1(ds):
+    d, gf, tmp = ds
+    nodes, hong = ['dat', 'chua_ket_luan', 'dat'], [False, True, False]
+    g = _grid_gate(gf, nodes, hong=hong, nut_tam=1, base=_undef(_t1_base(gf, t_done=(None, None))))
+    assert g['outcome_decide'] == 'chua_ket_luan'
+    rl.check_outcome_vs_gate('chua_ket_luan', g, 'HW', '', _req(gf))         # the fields alone would say khong_dat
+    no_t1 = _grid_gate(gf, nodes, hong=hong, nut_tam=1, base=_undef(rl.floor_gate(_f05(gf), t_done=(10.0, None))))
+    with pytest.raises(rl.LogError, match='nut_tam'):                       # lost, but its fields have no t1
+        rl.check_outcome_vs_gate('chua_ket_luan', no_t1, 'HW', '', _req(gf))
+    cat = _grid_gate(gf, nodes, cat=[False, True, False], nut_tam=1, base=rl.floor_gate(_f05(gf), t_done=(10.0, None)))
+    with pytest.raises(rl.LogError, match='nut_tam'):                       # the exception, but no cat_t1 in the fields
+        rl.check_outcome_vs_gate('chua_ket_luan', cat, 'HW', '', _req(gf))
+
+
+def test_gt1_4_a_lost_node_leaves_every_measured_condition_undefined(ds):
+    d, gf, tmp = ds
+    nodes, hong = ['dat', 'chua_ket_luan', 'dat'], [False, True, False]
+    g = _grid_gate(gf, nodes, hong=hong, nut_tam=0, base=rl.floor_gate(_f05(gf)))
+    assert all(g[c]['state'] == 'dat' for c in o1_gate.MEASURED)
+    with pytest.raises(rl.LogError, match='n_undef'):
+        rl.check_outcome_vs_gate('chua_ket_luan', g, 'HW', '', _req(gf))
+    g = _grid_gate(gf, nodes, hong=hong, nut_tam=0, base=_undef(rl.floor_gate(_f05(gf))))
+    rl.check_outcome_vs_gate('chua_ket_luan', g, 'HW', '', _req(gf))
+
+
+def _judged(d, tmp, name, gate, outcome, gf, task='O1-F05'):
+    """A FAKE floor run logged with its scorer file (outcome, gate_v3) in its own folder."""
+    folder = os.path.join(str(tmp), name)
+    os.makedirs(folder)
+    sp = os.path.join(folder, 'score.json')
+    with open(sp, 'w', encoding='utf-8') as f:
+        json.dump(dict(FAKE=True, outcome=outcome, gate_v3=gate), f)
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', task, str(rl.FIG8[task]), 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    row = rl.end(d, outcome, completed=1, results_dir=folder, gate=rl.read_gate_json(sp),
+                 gate_sha256=rl.sha256_file(sp), gate_file=gf, queries=rl.fake_queries())
+    return row, folder
+
+
+def test_gt1_5_so_h_reads_the_exception_from_every_node(ds):
+    d, gf, tmp = ds
+    row, folder = _judged(d, tmp, 'h5', rl.floor_gate(_f05(gf), t_done=(10.0, None)), 'chua_ket_luan', gf)
+    base = rl.floor_gate(_f05(gf), t_done=(None, None))
+    base['g1'].update(t1=6.0, cat_t1=True)                                   # the centre node has the exception
+    h1 = _grid_gate(gf, ['dat', 'chua_ket_luan', 'dat'], cat=[False, True, False], nut_tam=1, base=base)
+    assert h1['outcome_decide'] == 'chua_ket_luan'
+    rl.check_outcome_vs_gate('chua_ket_luan', h1, 'HW', '', _req(gf))        # 'end' takes it without a fail cause
+    sf = rl.fake_score_final(folder, 3.0, h1=dict(FAKE=True, outcome='chua_ket_luan', gate_v3=h1))
+    assert rl.so_h(d, row['run_uid'], sf)['outcome_sau'] == 'chua_ket_luan'
+
+
+def test_gt1_5_one_rule_for_the_exception(ds):
+    d, gf, tmp = ds
+    base = rl.floor_gate(_f05(gf), t_done=(None, None))
+    base['g1'].update(t1=6.0, cat_t1=True)
+    part = _grid_gate(gf, ['dat', 'chua_ket_luan', 'dat'], cat=[False, True, False], nut_tam=1, base=base)
+    assert not rl.viol_before_exception(part)
+    assert rl.viol_before_exception(_grid_gate(gf, ['chua_ket_luan'] * 3, cat=[True] * 3, base=_cat_base(gf)))
+    assert rl.viol_before_exception(_cat_base(gf)) and not rl.viol_before_exception(rl.floor_gate(_f05(gf)))
+
+
+def test_gt1_6_a_lost_run_without_gate_keeps_its_gate_file_for_so_h(ds):
+    d, gf, tmp = ds
+    folder, sp = _lost_score(d, tmp, 'lost6')
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F08', str(rl.FIG8['O1-F08']), 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    with pytest.raises(rl.LogError, match='--gate-file'):
+        rl.end(d, 'hong_he_do', completed=1, fail_cause='mat_khung_FAKE', results_dir=folder, gate=None,
+               gate_sha256=rl.sha256_file(sp))
+    assert rl.main(['--dataset', d, 'end', '--outcome', 'hong_he_do', '--fail-cause', 'mat_khung_FAKE',
+                    '--results-dir', folder, '--gate-json', sp, '--gate-file', str(tmp / 'gate_c8.json')]) == 0
+    row = rl.read_rows(os.path.join(d, rl.TUNING))[-1]
+    assert (row['gate_file_sha256'], row['gate_report_only']) == (gf.sha256, 'g5') and not rl.has_gate(row)
+    h1 = rl.floor_gate(rl.fake_gate(gate_file=gf, level='O1-F08', platform='HW', stage='screen', campaign='A-PID'))
+    assert h1['report_only'] == ['g5'] and h1['outcome_decide'] == 'dat'
+    sf = rl.fake_score_final(folder, 3.0, h1=dict(FAKE=True, outcome='dat', gate_v3=h1))   # above eps_H
+    assert rl.so_h(d, row['run_uid'], sf)['outcome_sau'] == 'hong_he_do'
+    rl.summary(d, gate_file=gf)
+    p = os.path.join(d, rl.TUNING)
+    rows = rl.read_rows(p)
+    rows[-1]['gate_report_only'] = ''                                        # edited by hand: refused (by the
+    rl._write_all(p, rl.TUNING_COLS, rows)                                   # so-h check again, or the row check)
+    with pytest.raises(rl.LogError, match='GT1-6|report-only'):
+        rl.summary(d, gate_file=gf)
+    rows[-1]['gate_file_sha256'] = 'ab' * 32
+    rows[-1]['gate_report_only'] = 'g5'
+    rl._write_all(p, rl.TUNING_COLS, rows)
+    with pytest.raises(rl.LogError, match='GT1-6|gate file SHA'):
+        rl.summary(d, gate_file=gf)
+
+
+G01 = 'kp_xy=1.0,ki_xy=0.5,kp_wz=1.0'
+
+
+def test_gt1_7_a_floor_campaign_run_carries_its_gain_set(ds):
+    d, gf, tmp = ds
+    with pytest.raises(rl.LogError, match='--gain-set'):
+        rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'confirm')
+    p = os.path.join(d, rl.TUNING)                                           # and in the summary
+    _lost_gio(d, tmp, 'x')
+    rows = rl.read_rows(p)
+    rows[-1]['gain_set_id'] = ''
+    rl._write_all(p, rl.TUNING_COLS, rows)
+    with pytest.raises(rl.LogError, match='gain set id'):
+        rl.summary(d)
+
+
+def test_gt1_7_another_name_or_other_values_do_not_reopen_a_stopped_level(ds):
+    d, gf, tmp = ds
+    for i in range(4):
+        _lost_gio(d, tmp, f'r{i}', gains=G01)
+    with pytest.raises(rl.LogError, match='stopped'):                        # the same gains under another name
+        rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'confirm', gain_set='A-PID/G09', gains=G01)
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F08', str(rl.FIG8['O1-F08']), 'confirm', gain_set='A-PID/G09',
+             gains=G01)                                                      # another level: still runs
+    rl.cancel(d)
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'confirm', gain_set='A-PID/G09',
+             gains='kp_xy=1.1,ki_xy=0.5,kp_wz=1.0')                          # other gains: another candidate
+    rl.cancel(d)
+    _lost_gio(d, tmp, 'g2', gs='A-PID/G02', gains='kp_xy=2.0,ki_xy=0.5,kp_wz=1.0')
+    with pytest.raises(rl.LogError, match='other values'):                   # one gain set, one gain
+        rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G02', gains=G01)
+
+
+def test_gt1_8_the_time_file_belongs_to_the_run(ds):
+    d, gf, tmp = ds
+    run1, run2 = (os.path.join(str(tmp), n) for n in ('run1', 'run2'))
+    os.makedirs(run1)
+    os.makedirs(run2)
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    kw = dict(completed=1, fail_cause=rl.C8B_GIO_FAIL, queries=rl.fake_queries())
+    with pytest.raises(rl.LogError, match='results-dir'):
+        rl.end(d, 'hong_he_do', c8b_gio=_gio(tmp, 'outside'), results_dir=run1, **kw)   # not under the run folder
+    with pytest.raises(rl.LogError, match='results-dir'):
+        rl.end(d, 'hong_he_do', c8b_gio=_gio(run1, 'nodir'), **kw)
+    with pytest.raises(rl.LogError, match='task'):
+        rl.end(d, 'hong_he_do', c8b_gio=_gio(run1, 'f08', task='O1-F08'), results_dir=run1, **kw)
+    p = _gio(run1, 'own', task='O1-F05')
+    rl.end(d, 'hong_he_do', c8b_gio=p, results_dir=run1, **kw)
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    q = os.path.join(run2, 'copy.json')
+    with open(p, 'rb') as a, open(q, 'wb') as b:
+        b.write(a.read())
+    with pytest.raises(rl.LogError, match='another run'):                    # the same file again
+        rl.end(d, 'hong_he_do', c8b_gio=q, results_dir=run2, **kw)
+    rl.end(d, 'hong_he_do', c8b_gio=_gio(run2, 'own2'), results_dir=run2, **kw)
+    path = os.path.join(d, rl.TUNING)
+    rows = rl.read_rows(path)
+    rows[-1]['c8b_gio_sha256'] = rows[-2]['c8b_gio_sha256']                  # edited by hand: refused
+    rl._write_all(path, rl.TUNING_COLS, rows)
+    with pytest.raises(rl.LogError, match='another run'):
         rl.summary(d)

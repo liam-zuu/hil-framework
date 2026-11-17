@@ -121,6 +121,48 @@ def test_cmd_rate_frames_matches_the_camera_scorer(task):
             assert abs(vk[k] - cv) <= cam.pad[0] + 2e-3 and abs(wk[k] - cw) <= cam.pad[1] + 2e-2, (task, u, tk)
 
 
+def _sup_1us(f, t_cmd, tk, us, turn, step=1e-6):
+    """{u: (sup speed, sup |wz|)} over [tk - u, tk + u] within [0, t_cmd] on a 1 us grid centred on tk (rates 0
+    outside the command)."""
+    n = int(round(max(us) / step))
+    i = np.arange(-n, n + 1)
+    xs = tk + i * step
+    ok = (xs >= 0.0) & (xs <= t_cmd)
+    vals = np.array([f(float(x)) for x in xs[ok]]).reshape(-1, 3)
+    sp = np.hypot(vals[:, 0], vals[:, 1]) if len(vals) else np.zeros(0)
+    w = np.abs(vals[:, 2]) if (turn and len(vals)) else np.zeros(len(vals))
+    out = {}
+    for u in us:
+        m = np.abs(i[ok]) <= int(round(u / step))
+        out[u] = (float(sp[m].max()) if m.any() else 0.0, float(w[m].max()) if m.any() else 0.0)
+    return out
+
+
+@pytest.mark.parametrize('task', ['O1-F02', 'O1-F05', 'O1-F08', 'O1-K1', 'O1-K2'])
+def test_gt1_3_cmd_rate_frames_bounds_the_sup_on_the_five_o1_commands(task):
+    """GT1-3 (Codex round 1 of CODE_GATE; Liam 17/11 at CODE_GATE "Sửa theo bảng (Recommended)"), never skipped: on each
+    O1 command at U_t 0, 5, 14, 30 ms and many frames (spread over the run, both ends, and packed around the peaks of
+    the speed and of the turn rate), V_k and W_k are upper bounds of the sup on a 1 us grid and close to it. A numeric
+    check on these five commands only (o1_gate.cmd_rate_frames docstring); no analytic bound (DEFERRED)."""
+    us = (0.0, 0.005, 0.014, 0.030)
+    fig8 = task in OT.FIG8
+    t_cmd, f = OT.task(task, allow_final_set=True)
+    cap = G.fig8_cmd_max(O.Schedule(OT.FIG8[task])) if fig8 else (OT.K_V * 10.0, None)
+    grid = np.linspace(0.0, t_cmd, 4001)
+    c = np.array([f(float(x)) for x in grid])
+    peaks = [grid[int(np.argmax(np.hypot(c[:, 0], c[:, 1])))]] + ([grid[int(np.argmax(np.abs(c[:, 2])))]] if fig8 else [])
+    rng = np.random.default_rng(13)
+    t = np.concatenate([np.linspace(-0.05, t_cmd + 0.05, 21), [-0.01, 0.0, 0.004, t_cmd - 0.004, t_cmd, t_cmd + 0.01],
+                        *[p + np.linspace(-0.04, 0.04, 9) for p in peaks], rng.uniform(0.0, t_cmd, 4)])
+    sups = [_sup_1us(f, t_cmd, tk, us, fig8) for tk in t]
+    for u in us:
+        vk, wk = G.cmd_rate_frames(f, t_cmd, t, u, turn=fig8, v_cap=cap[0], wz_cap=cap[1])
+        for k, tk in enumerate(t):
+            ts, tw = sups[k][u]
+            assert vk[k] >= ts - 1e-12 and wk[k] >= tw - 1e-12, (task, u, tk, vk[k], ts, wk[k], tw)
+            assert vk[k] <= ts + 2e-3 and wk[k] <= tw + 2e-2, (task, u, tk, vk[k], ts, wk[k], tw)
+
+
 def test_cmd_rate_frames_k_tasks_no_turn():
     t_cmd, f = OT.task('O1-K2', allow_final_set=True)
     t = np.linspace(-0.5, t_cmd + 0.5, 40)

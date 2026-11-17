@@ -97,7 +97,7 @@ def _gate(decide=G.DECIDE_ALL, u_t=0.0, completed='true', n=20, **peak):
 
 def _open(d, clock, platform='HW'):
     rl.begin(d, 'S', 'A-PID', platform, 'PID', 'O1-F05', '0.5', 'screen',
-             gain_set='A-PID/G1' if platform == 'HIL' else '')         # a counted HIL run names its gain set
+             gain_set='A-PID/G1')         # a counted HIL run names its gain set
     rl.step(d, 'run')
     clock[0] += dt.timedelta(seconds=60)
 
@@ -761,7 +761,7 @@ def test_cli_end_requires_the_query_files(ds, tmp_path, capsys, platform, stage,
     needed."""
     assert rl.query_files_needed(dict(platform=platform, stage=stage), outcome) is needed
     d, clock = ds
-    campaign, gs = {('HW', 'screen'): ('A-PID', ''), ('HW', 'final'): ('A-PID', 'A-PID/G0'), ('HIL', 'final_hil'): ('RQ2', 'RQ2-INIT-PID/G0'), ('HIL', 'hil_check'): ('B-PID', 'B-PID/GA1'), ('SIM', 'screen'): ('B-PID', '')}[(platform, stage)]
+    campaign, gs = {('HW', 'screen'): ('A-PID', 'A-PID/G1'), ('HW', 'final'): ('A-PID', 'A-PID/G0'), ('HIL', 'final_hil'): ('RQ2', 'RQ2-INIT-PID/G0'), ('HIL', 'hil_check'): ('B-PID', 'B-PID/GA1'), ('SIM', 'screen'): ('B-PID', '')}[(platform, stage)]
     rl.begin(d, 'S', campaign, platform, 'PID', 'O1-F05', '0.5', stage, gain_set=gs)
     rl.step(d, 'run')
     clock[0] += dt.timedelta(seconds=60)

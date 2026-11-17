@@ -223,8 +223,13 @@ def cmd_rate_frames(f, t_cmd: float, t, u_t: float, turn: bool = True, v_cap: Op
     rotation does not change it). turn False (K1, K2: G5 against the start heading, O1 3.7): W_k = 0.
     Outside [0, t_cmd] the reference holds its end values, so both rates are 0 there; a window wholly outside
     gives 0. The sup is bounded from above on a grid of RATE_STEP: the largest grid value on the window widened
-    by one step, plus the largest grid difference next to it (a Lipschitz allowance of twice the half step), times
-    1 + CMD_MARGIN; then capped by v_cap / wz_cap (the peak of the schedule, always an upper bound) when given."""
+    by one step, plus the largest grid difference next to it (an allowance for the rise between two grid points),
+    times 1 + CMD_MARGIN; then capped by v_cap / wz_cap (the peak of the schedule, always an upper bound) when given.
+    Scope (GT1-3, Codex round 1 of CODE_GATE; Liam 17/11 at CODE_GATE "Sửa theo bảng (Recommended)"): only for the
+    five O1 commands (rpi5/o1_tasks.task F02, F05, F08, K1, K2; smooth at the scale of RATE_STEP), where
+    fwsim/tests/test_o1_gate_v1133.py checks the bound against the sup on a 1 us grid at several U_t and many frames.
+    The allowance is not a proven Lipschitz bound for any f: a feature narrower than RATE_STEP can be missed, so
+    another command needs its own check. DEFERRED: an analytic derivative bound per segment of the five commands."""
     t = np.asarray(t, dtype=float)
     if not _finite(u_t) or float(u_t) < 0.0:
         raise ValueError(f'u_t {u_t!r}: a finite number >= 0')

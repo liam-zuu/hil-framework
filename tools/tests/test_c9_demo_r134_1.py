@@ -481,6 +481,33 @@ def test_c9d4_lost_runs_of_the_block_are_out_of_the_denominator(demo_ds, tmp_pat
     assert {r['campaign']: r for r in _summary(demo_ds)}['A-LADRC']['stop_reason_check'] == 'ok'
 
 
+def test_gt1_2_a_level_stopped_by_the_c8b_time_check_is_not_confirmed(demo_ds, tmp_path):
+    # GT1-2 (Codex round 1 of CODE_GATE; Liam 17/11 at CODE_GATE "Sửa theo bảng (Recommended)"): two dat confirmed at
+    # so-h, then four runs that failed the C8b time check at the same level: the level is chua_ket_luan (O1 3.5
+    # v11.37), so neither freeze nor the summary takes khoi_xac_nhan_dat
+    uids = _confirm_block(demo_ds, tmp_path, 'K1', ('dat', 'dat'))
+    for u in uids:
+        rl.so_h(demo_ds, u, _score_final(demo_ds, u, 0.5))
+    for i in range(4):
+        folder = str(tmp_path / f'gio_{i}')
+        os.makedirs(folder)
+        p = os.path.join(folder, 'c8b_gio.json')
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump(dict(format='c8b_gio_v1', ok=False, FAKE=True, run=i), f)
+        rl.begin(demo_ds, 'FAKE-confirm', 'A-LADRC', 'HW', 'LADRC', 'O1-F05', '0.5', 'confirm',
+                 gain_set='A-LADRC/G01', block_id='K1')
+        rl.step(demo_ds, 'run')
+        rl.end(demo_ds, 'hong_he_do', completed=1, fail_cause=rl.C8B_GIO_FAIL, c8b_gio=p, results_dir=folder)
+    with pytest.raises(rl.LogError, match='C8b time check'):
+        _freeze_ok(demo_ds, tmp_path)
+    gfile = fr.write_gain_file(str(tmp_path / 'FAKE_gain_L.json'), GAIN)
+    rl.append_row(os.path.join(demo_ds, rl.FREEZE), rl.FREEZE_COLS, dict(
+        campaign='A-LADRC', frozen_at='2030-01-01T00:00:00', stop_reason='khoi_xac_nhan_dat', stop_cause='',
+        gain_set_id='A-LADRC/G01', gain_file=gfile, gain_sha256=rl.sha256_file(gfile), notes='FAKE: by hand'))
+    s = {r['campaign']: r for r in _summary(demo_ds)}['A-LADRC']
+    assert s['stop_reason_check'] == 'mismatch' and s['san_gio_c8b_dung'] == 'A-LADRC/G01 O1-F05@0.5'
+
+
 def test_c9d4_a_block_of_lost_runs_only_is_not_confirmed(demo_ds, tmp_path):
     _lost_confirm(demo_ds, 'K1')
     with pytest.raises(rl.LogError, match='no valid run'):
