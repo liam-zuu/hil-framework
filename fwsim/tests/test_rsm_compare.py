@@ -1259,13 +1259,13 @@ def test_links_refused_before_any_open(tmp_path, dummy_dll, monkeypatch):
 
 
 def test_edge_source_and_limit(tmp_path, dummy_dll, fake_eval):
-    """RSM2-7, RSM3-6: edge_src and edge_limit from the S03 v8.3 level sources (H of every factor: 'het luoi noi');
+    """RSM2-7, RSM3-6: edge_src and edge_limit from the S03 v8.4 level sources (H of every factor: 'het luoi');
     the candidate has factors on both sides, so the H branch is checked with a non-empty edge_limit."""
     repo = make_repo(tmp_path)
     s03 = make_s03(tmp_path, q1=q1_flat, q2=q2_mixed, dll=dummy_dll)
     rows = list(csv.DictReader(open(s03 / 'levels.csv')))
     for r in rows:
-        r['L_nguon'], r['H_nguon'] = '0', 'hết lưới nối'
+        r['L_nguon'], r['H_nguon'] = '0', 'hết lưới'
     s3.write_csv(str(s03 / 'levels.csv'), rows)
     s04 = make_s04(repo, s03, dummy_dll, q1=q1_flat, q2=q2_mixed)
     rc.run_phase('fit', str(s04), dummy_dll)
@@ -1274,7 +1274,7 @@ def test_edge_source_and_limit(tmp_path, dummy_dll, fake_eval):
     code = [float(x) for x in json.loads(c['code'])]
     n_high = sum(x > 0 for x in code)
     assert 0 < n_high < 7                                      # RSM3-6: both sides present
-    assert c['edge_src'].count(':H:hết lưới nối') == n_high and c['edge_src'].count(':L:0') == 7 - n_high
+    assert c['edge_src'].count(':H:hết lưới') == n_high and c['edge_src'].count(':L:0') == 7 - n_high
     assert (c['edge_limit'] != '') == (n_high > 0) and c['edge_limit'].count(':H') == n_high
 
 
