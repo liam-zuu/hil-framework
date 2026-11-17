@@ -275,14 +275,19 @@ def _glc():
 
 
 def answer_problem(q, name: str):
-    """--pause-swa (Codex WS-4): None, or why one gain_line_check.read_query answer (None = unreadable) is not a
-    complete '#gain_running' of one board: mac, id, applied_n, ctrl PID|ADRC and exactly the 7 gains of that ctrl
-    (gain_send.NAMES) as finite numbers; boot is checked by read_query."""
+    """--pause-swa (Codex WS-4, round 2): None, or why one gain_line_check.read_query answer (None = unreadable) is
+    not a complete '#gain_running' of one board: sha, env, mac (aa:bb:cc:dd:ee:ff), id, applied_n (decimal),
+    ctrl PID|ADRC and exactly the 7 gains of that ctrl (gain_send.NAMES) as finite numbers; boot is checked by
+    read_query."""
     glc, gs = _glc()
     if q is None:
         return f'no readable answer ({name})'
-    why = [k for k in ('mac', 'id', 'applied_n') if not q.get(k)]
-    why += [k for k in ('id', 'applied_n') if q.get(k) and not q[k].isdigit()]
+    why = [k for k in ('sha', 'env', 'mac', 'id', 'applied_n') if not q.get(k)]
+    why += [k for k in ('id', 'applied_n') if q.get(k) and not (q[k].isascii() and q[k].isdigit())]
+    mac = (q.get('mac') or '').split(':')
+    if q.get('mac') and not (len(mac) == 6 and all(len(x) == 2 and all(c in '0123456789abcdefABCDEF' for c in x)
+                                                    for x in mac)):
+        why.append(f"mac={q.get('mac')!r}")
     ctrl = q.get('ctrl')
     if ctrl not in gs.NAMES:
         why.append(f'ctrl={ctrl!r}')
@@ -332,7 +337,9 @@ def wait_for_swa(inp=input, out=print, wall=time.time, clock=time.monotonic) -> 
     """--pause-swa: ask the operator to turn SWA on and press Enter. True on an empty line (Enter); any other line
     is refused and the question asked again (Codex WS-2); False on Ctrl-C or end of input (then nothing is sent:
     the schedule has not started). The Enter is the operator's word that SWA is on, not a measurement of SWA: the
-    '#gain_get' answer has no motor field."""
+    '#gain_get' answer has no motor field. Limit (Codex WS-2, kept): stdin may be a pipe (the runner sends the
+    Enter when the operator says SWA is on), so a newline already in the pipe passes; nothing may be written to
+    stdin before that word."""
     t0 = clock()
     out(f"#pause_swa,cho,t_epoch={wall():.3f}")
     out(">>> Bat SWA (motor) roi nhan Enter de gui lich. Ctrl-C: thoat, khong gui lich.")   # ASCII: safe on a cp1252 pipe
@@ -342,7 +349,7 @@ def wait_for_swa(inp=input, out=print, wall=time.time, clock=time.monotonic) -> 
         except (KeyboardInterrupt, EOFError):
             out(f"#pause_swa,huy,t_epoch={wall():.3f},waited_s={clock() - t0:.1f}")
             return False
-        if line.strip() == '':
+        if line.rstrip('\r') == '':                 # an empty line only (WS-2 round 2: spaces are not Enter)
             break
         out(">>> Chi nhan Enter trong (dong vua go khong rong). Bat SWA roi nhan Enter; Ctrl-C: thoat.")
     out(f"#pause_swa,enter,t_epoch={wall():.3f},waited_s={clock() - t0:.1f}")

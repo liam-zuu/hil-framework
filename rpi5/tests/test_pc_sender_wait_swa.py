@@ -175,10 +175,10 @@ def test_pause_abort_sends_no_schedule(tmp_path, how):
 
 def test_pause_only_an_empty_line_goes_on(tmp_path):
     """WS-2: a typed line is not the Enter; the question is asked again."""
-    r = Rec(lines=('abc', '  x ', '', ))
+    r = Rec(lines=('abc', '  x ', '   ', '\t', ''))     # spaces or a tab are not Enter (WS-2 round 2)
     assert ps.o1_main('1.2.3.4', 'O1-F05', None, None, False, pause_swa=True, **r.kw()) == 0
-    assert r.calls == [('input',), ('input',), ('input',), ('test', 'O1-F05', False)]
-    assert sum('Chi nhan Enter trong' in s for s in r.lines) == 2
+    assert r.calls == [('input',)] * 5 + [('test', 'O1-F05', False)]
+    assert sum('Chi nhan Enter trong' in s for s in r.lines) == 4
     r = Rec(lines=('abc', 'EOF'))
     assert ps.o1_main('1.2.3.4', 'O1-F05', None, None, False, pause_swa=True, **r.kw()) == 2
     assert ('test', 'O1-F05', False) not in r.calls
@@ -288,6 +288,36 @@ def test_real_file_flow_other_answer_stops(tmp_path, swa):
     assert ('test', 'O1-F05', False) not in r.calls
 
 
+@pytest.mark.parametrize('swa', [answer(PID_LINE.replace('kp_wz=1,', 'kp_wz=1.2,'), t=(20, 20.4)),
+                                 answer(PID_LINE.replace('boot=4753dc47', 'boot=0badf00d'), t=(20, 20.4))])
+def test_no_datagram_when_the_swa_answer_differs(tmp_path, monkeypatch, swa):
+    """WS-7 round 2: after the Enter, nothing at all goes out while the answer after SWA is not the one before."""
+    r = Rec(files={'gain_query_before.txt': BEFORE, ps.SWA_QUERY_NAME: swa})
+    monkeypatch.setattr(ps.socket, 'socket', FakeSockets(r.calls))
+    kw = r.kw(real=('swa_check', 'before_check'))
+    kw['run_test'] = _real_loop
+    assert ps.o1_main('1.2.3.4', 'O1-F02', str(tmp_path), None, False, pause_swa=True, **kw) == 2
+    assert [c for c in r.calls if c[0] == 'send'] == []
+
+
+def test_main_old_path_exit_code_when_the_gain_is_not_applied(tmp_path, monkeypatch, capsys):
+    """WS-7 round 2: without --pause-swa, a gain that is not applied still ends __main__ with exit 2, no schedule."""
+    import runpy
+    from types import SimpleNamespace
+    gfile = tmp_path / 'gain_x.json'
+    gfile.write_text('{}', encoding='utf-8')
+    monkeypatch.setattr(subprocess, 'run', lambda *a, **k: SimpleNamespace(stdout='#ket_qua,ma=3\n', stderr='',
+                                                                          returncode=3))
+    calls = []
+    monkeypatch.setattr(socket, 'socket', FakeSockets(calls))
+    monkeypatch.setattr(sys, 'argv', ['pc_sender.py', '--ip', '127.0.0.1', '--o1', 'O1-F02', '--gain-query-dir',
+                                      str(tmp_path / 'q'), '--gain-file', str(gfile)])
+    with pytest.raises(SystemExit) as e:
+        runpy.run_path(os.path.join(RPI5, 'pc_sender.py'), run_name='__main__')
+    assert e.value.code == 2 and calls == []
+    assert 'not applied' in capsys.readouterr().out
+
+
 def test_real_file_flow_bad_before_asks_no_swa(tmp_path):
     r = Rec(files={'gain_query_before.txt': '#query_pc,t_start=1,t_end=2\n#ket_qua,ma=3\n'})
     assert ps.o1_main('1.2.3.4', 'O1-F05', str(tmp_path), None, False, pause_swa=True,
@@ -337,7 +367,7 @@ def test_swa_query_problem_other_ctrl(tmp_path):
     assert 'ctrl' in ps.swa_query_problem(str(tmp_path))
 
 
-@pytest.mark.parametrize('drop', ['mac', 'id', 'applied_n', 'k_psi', 'kp_xy'])
+@pytest.mark.parametrize('drop', ['mac', 'id', 'applied_n', 'k_psi', 'kp_xy', 'sha', 'env'])
 def test_answer_missing_the_same_field_on_both_sides(tmp_path, drop):
     """WS-4: two answers that both lack a field are not 'equal answers'."""
     line = ','.join(p for p in PID_LINE.split(',') if not p.startswith(drop + '='))
@@ -346,7 +376,10 @@ def test_answer_missing_the_same_field_on_both_sides(tmp_path, drop):
     assert bad and 'incomplete answer' in bad and drop in bad
 
 
-@pytest.mark.parametrize('old,new', [('mac=aa:bb:cc:dd:ee:ff', 'mac='), ('k_psi=1', 'k_psi=nan'),
+@pytest.mark.parametrize('old,new', [('mac=aa:bb:cc:dd:ee:ff', 'mac='), ('mac=aa:bb:cc:dd:ee:ff', 'mac=?'),
+                                     ('mac=aa:bb:cc:dd:ee:ff', 'mac=aa:bb:cc:dd:ee'),
+                                     ('mac=aa:bb:cc:dd:ee:ff', 'mac=aa:bb:cc:dd:ee:fg'), ('sha=5bde4c55bf3a', 'sha='),
+                                     (',applied_n=1,', ',applied_n=١,'), ('k_psi=1', 'k_psi=nan'),
                                      ('k_psi=1', 'k_psi=abc'), (',id=1,', ',id=x,'), ('ctrl=PID', 'ctrl=LQR')])
 def test_answer_with_an_empty_or_bad_field(tmp_path, old, new):
     line = PID_LINE.replace(old, new)
