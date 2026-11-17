@@ -857,6 +857,121 @@ def test_stop_boundary_holds_the_true_edge_count():
     assert n_checked > 150
 
 
+def _one_wheel_truth(lo, width, true, raw, prior_raw, seed):
+    """Oracle counts (encoder_gen.c) of wheel 0 for frames applied at the integer ticks true (raw speeds), after an
+    earlier motion prior_raw that leaves the pins at some level; the model of the frames from lo on (rest first).
+    Returns (wheel model, counts, c0, true first-start offset), None when the wheel never starts."""
+    sc = np.float32(EM.HIL_OMEGA_MAX) / np.float32(32767.0)
+    om32 = np.zeros((len(lo), 4), np.float32)
+    om32[:, 0] = np.asarray(raw, dtype=np.float32) * sc
+    pr = np.zeros((40, 4), np.float32)
+    pr[5:5 + len(prior_raw), 0] = np.asarray(prior_raw, dtype=np.float32) * sc
+    t_pr = int(lo[0]) - 60_000 + 1000 * np.arange(40)               # ends 20 ms before the first frame
+    counts = O.run(np.r_[t_pr, true].astype(np.int64), np.vstack([pr, om32]).astype(np.float64), seed)
+    W = pt._Wheel(pt.simulate_edges(lo, width, om32)[0])
+    if len(W.segs) < 2:
+        return None                                                    # the wheel never starts
+    T = int(true[int(np.searchsorted(lo, W.segs[1]['t0']))])
+    c0 = int(counts.at([T - 1])[0, 0])
+    o_true = int(counts.at([T])[0, 0]) - c0
+    return W, counts, c0, o_true
+
+
+def _reads_hold(W, counts, c0, o_true, t_reads):
+    """Lines read at every tick of t_reads inside a segment: the true count with the true offset is never refused,
+    and a used line's true read time lies inside its bounds. Returns the number of lines checked."""
+    t_reads = np.asarray(t_reads, dtype=float)
+    seg = W.segment_of(t_reads, t_reads)
+    j = np.flatnonzero(seg >= 0)
+    n = counts.at(t_reads[j].astype(np.int64))[:, 0] - c0
+    t_min, t_max, ok, use = W.bounds(seg[j], n.astype(float), o_true)
+    bad = np.flatnonzero(~ok | (use & ((t_reads[j] < t_min) | (t_reads[j] >= t_max))))
+    assert bad.size == 0, [(float(t_reads[j][b]), int(n[b]), int(seg[j][b]), bool(ok[b]), float(t_min[b]),
+                            float(t_max[b])) for b in bad[:3]]
+    return j.size
+
+
+@needs_gcc
+def test_an_edge_the_model_moves_past_a_stop_does_not_exclude_the_true_count():
+    """S2M5-1 (Codex round 5 of v3): FL starts (raw 6348, hp 1229 us), slows down to raw 246 (hp 31 701 us) 1187 us
+    later with a 60 us window (under the wide_windows limit, 153.6 us), stops at 6000 us. The true slow-down comes
+    after the first callback, so the other channel keeps its old edge: two true edges before the stop (encoder_gen.c),
+    one simulated. With both pins high at the start (+2) the true count +4 at 4000 us was refused for every offset."""
+    S = 1_600_000
+    lo = np.r_[100_000.0 + 1000.0 * np.arange(1500), S + np.array([0.0, 1187.0, 6000.0]),
+               S + 7000.0 + 1000.0 * np.arange(50)]
+    width = np.zeros(len(lo))
+    width[1500], width[1501], width[1502] = 4.0, 60.0, 4.0
+    raw = np.zeros(len(lo))
+    raw[1500], raw[1501] = 6348, 246
+    true = (lo + width).astype(np.int64)
+    sc = np.float32(EM.HIL_OMEGA_MAX) / np.float32(32767.0)
+    om32 = np.zeros((len(lo), 4), np.float32)
+    om32[:, 0] = raw.astype(np.float32) * sc
+    assert not pt.wide_windows(width, om32)
+    # pins both high at the start: an earlier motion of 2 edges (one per channel) from the oracle's low pins
+    for prior in ([6348] * k for k in range(1, 30)):
+        W, counts, c0, o_true = _one_wheel_truth(lo, width, true, raw, prior, 1)
+        if o_true == 2:
+            break
+    assert o_true == 2
+    assert int(counts.at([S + 4000])[0, 0]) - c0 == 4                   # two true edges before the stop
+    t_min, t_max, ok, use = W.bounds(np.array([1]), np.array([4.0]), 2)
+    assert ok[0] and not use[0]
+    assert _reads_hold(W, counts, c0, o_true, np.arange(S - 500, S + 6000, 7)) > 800
+    assert W.segs[1]['n_edges'] == 1 and W.segs[1].get('open_hi')
+
+
+@needs_gcc
+def test_reads_inside_segments_hold_the_true_count():
+    """S2M5-1: random runs of one wheel (an earlier motion, rest, a start, retimes with strong slow-downs and
+    speed-ups or a constant speed, then a stop, a reversal or the end of the log while moving; frames 1 ms apart, every
+    apply window under the wide_windows limit, the true apply anywhere in it): every line read inside a segment, with
+    its true count from encoder_gen.c and the true first-start offset, is not refused, and a used line's read time
+    lies inside its bounds."""
+    sc = np.float32(EM.HIL_OMEGA_MAX) / np.float32(32767.0)
+    n_lines = n_open = 0
+    for seed in range(300):
+        rng = np.random.default_rng(1000 + seed)
+        n = 70
+        lo = np.round(1_200_000.0 + 1000.0 * np.arange(n) + rng.uniform(-150, 150, n))
+        raw = np.zeros(n)
+        k0, k1 = 5, int(rng.integers(20, 60))
+        sgn = 1 if rng.uniform() < 0.5 else -1
+        cls = rng.integers(0, 3, k1 - k0)
+        levels = np.where(cls == 0, rng.integers(150, 600, k1 - k0),
+                          np.where(cls == 1, rng.integers(600, 4000, k1 - k0), rng.integers(4000, 32000, k1 - k0)))
+        if rng.uniform() < 0.3:
+            levels[:] = levels[0]
+        raw[k0:k1] = sgn * levels
+        end = rng.uniform()
+        if end < 0.3:
+            raw[k1:] = sgn * levels[-1]                                 # the log ends while moving
+        elif end < 0.5:
+            raw[k1:k1 + 10] = -sgn * rng.integers(150, 32000)            # a reversal, then a stop
+        om32 = np.zeros((n, 4), np.float32)
+        om32[:, 0] = raw.astype(np.float32) * sc
+        hp, _ = EM.h7_half_period(om32)
+        mv = np.abs(om32[:, 0]) > np.float32(pt.OMEGA_MIN)
+        hpm = np.where(mv, hp[:, 0], np.inf)
+        lim = pt.TRUST_FRAC * np.minimum(hpm, np.r_[np.inf, hpm[:-1]]) / 2.0
+        lim = np.where(np.isfinite(lim), lim, 5.0)
+        width = np.where(rng.uniform(size=n) < 0.6, np.floor(rng.uniform(0, 1, n) * np.minimum(lim, 900.0)),
+                         np.floor(rng.uniform(0, 5, n)))
+        width = np.minimum(width, np.floor(lim))
+        assert not pt.wide_windows(width, om32)
+        true = (lo + np.floor(rng.uniform(0, 1, n) * (width + 1))).astype(np.int64)
+        true = np.minimum(true, (lo + width).astype(np.int64))
+        prior = [6348] * int(rng.integers(0, 12))
+        truth = _one_wheel_truth(lo, width, true, raw, prior, seed)
+        if truth is None:
+            continue
+        W, counts, c0, o_true = truth
+        n_open += int(any(s.get('open_hi') for s in W.segs))
+        n_lines += _reads_hold(W, counts, c0, o_true, np.arange(lo[k0] - 300, lo[-1], 53))
+    assert n_lines > 50_000 and n_open >= 5, (n_lines, n_open)
+
+
 def _wheel_of(segs, broken_seg=None, n_edges_total=0, trusted_upto=None):
     """A stand-in for _Wheel with given segments (rest first): only what _rest_holds reads."""
     from types import SimpleNamespace

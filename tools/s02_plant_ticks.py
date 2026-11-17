@@ -110,7 +110,8 @@ def simulate_edges(apply_us, width_us, om32):
       segs        per segment: t0, w0 (its boundary's apply window), kind ('rest', 'start', 'stop'), dir,
                   o_lo, o_hi (count the boundary itself may add: forced-low pins at a start, |o| <= pins high;
                   edges that may fall either side of a stop), n_before (simulated signed count before it),
-                  first_edge (index of its first edge), n_edges
+                  first_edge (index of its first edge), n_edges; open_hi (moving segment only, S2M5-1): a pending
+                  edge may truly come before its end, so the segment may hold more true edges than n_edges
       t_end       last apply time (edges are simulated up to it)."""
     apply_us = np.asarray(apply_us, dtype=float)
     width_us = np.asarray(width_us, dtype=float)
@@ -162,23 +163,37 @@ def simulate_edges(apply_us, width_us, om32):
                     for c2 in (0, 1):
                         err[c2] = [err[c2][0] + lo_d, err[c2][1] + hi_d]
 
+        def earliest(ch):
+            """Earliest true time of the pending edge of channel ch (inf when none)."""
+            if not math.isfinite(nxt[ch]):
+                return math.inf
+            first = nxt[ch] + err[ch][0]
+            lr = st['last']
+            if lr is not None and first <= lr['T'] + lr['W']:
+                # a callback inside the last retime's window may still take the other half period
+                first -= abs(lr['hp_old'] - lr['hp_new']) + lr['hp_new']
+            return first
+
+        def close_open(T):
+            # S2M5-1 (Codex round 5 of v3): a pending edge whose simulated time is past the end T of the moving
+            # segment (stop, reversal, end of the log) but whose true time may come before it (a callback in a retime
+            # window, the other channel then first: _retime) is a true edge of this segment the model never emits, so
+            # counts above the segment's simulated edges bind nothing there (_Wheel.bounds), as past an untrusted edge
+            if st['dir'] != 0 and min(earliest(0), earliest(1)) <= T + TOL_US:
+                segs[-1]['open_hi'] = True
+
         def stop_boundary(T, W):
             # emitted edges whose true time may be after the true stop (every edge of the segment with t + hi > T),
             # and edges that may come before it: the true stop is anywhere in [T, T + W], so each channel may go on
             # with its callbacks (+ hp each, - 1 us with float ambiguity) up to T + W; with a window wider than half a
             # period that is many edges, not one per channel (S2M3-1, Codex round 3 of v3)
+            close_open(T)
             k0 = segs[-1]['first_edge']
             late = sum(1 for k in range(k0, len(t_l)) if t_l[k] + hi_l[k] > T)
             step = max(st['hp'] - (1.0 if st['amb'] else 0.0), 1.0)
             early = 0
             for ch in (0, 1):
-                if not math.isfinite(nxt[ch]):
-                    continue
-                first = nxt[ch] + err[ch][0]
-                lr = st['last']
-                if lr is not None and first <= lr['T'] + lr['W']:
-                    # a callback inside the last retime's window may still take the other half period
-                    first -= abs(lr['hp_old'] - lr['hp_new']) + lr['hp_new']
+                first = earliest(ch)
                 if first <= T + W:
                     early += int(math.floor((T + W - first) / step)) + 1
             d = st['dir']
@@ -242,6 +257,8 @@ def simulate_edges(apply_us, width_us, om32):
                 st.update(hp=hpn, amb=ambn)
             else:
                 st['amb'] = st['amb'] or ambn
+        if len(apply_us):
+            close_open(float(apply_us[-1]))           # lines are placed up to the last apply only (segment_of)
         ed = dict(t=np.array(t_l), lo=np.array(lo_l), hi=np.array(hi_l), seg=np.array(sg_l, dtype=np.int64),
                   segs=segs, t_end=float(apply_us[-1]) if len(apply_us) else -math.inf)
         cnt = np.bincount(ed['seg'], minlength=len(segs)) if len(t_l) else np.zeros(len(segs), dtype=np.int64)
@@ -290,6 +307,7 @@ class _Wheel:
         self.n0 = np.array([s['n_before'] for s in self.segs], dtype=float)
         self.e0 = np.array([s['first_edge'] for s in self.segs], dtype=np.int64)
         self.m = np.array([s['n_edges'] for s in self.segs], dtype=np.int64)
+        self.open_hi = np.array([bool(s.get('open_hi', False)) for s in self.segs])
         # offset of segment s >= 1 is O (first start) + what boundaries 2..s may add
         add_lo = np.zeros(len(self.segs))
         add_hi = np.zeros(len(self.segs))
@@ -347,6 +365,7 @@ class _Wheel:
         m = self.m[s]
         bseg = s == self.broken_seg
         use = (s < self.broken_seg) | (bseg & (k1 <= self.n_trust))
+        use &= ~(self.open_hi[s] & (k1 > m))            # S2M5-1: more true edges than simulated may come before its end
         ok = np.where(rest, (v_lo <= n0) & (n0 <= v_hi), (k2 >= 0) & (k1 <= m) & (k1 <= k2))
         k1c = np.clip(k1, 0, None).astype(np.int64)
         k2c = np.clip(k2, None, m).astype(np.int64)
