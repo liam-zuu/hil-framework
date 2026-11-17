@@ -1757,3 +1757,29 @@ def test_c8b_rows_common_and_union_domains_differ(tmp_path, monkeypatch):
     assert out['t_end_common'] < out['t_end_union']
     assert all(r['mien_chung'] == int(bool(r['scored']) and r['t'] <= out['t_end_common'] + 1e-12) for r in rows)
     assert any(r['mien_hop'] and not r['mien_chung'] for r in rows)
+
+
+# ---------------------------------------------------------------- test gaps Codex listed in round 6 (guards)
+def test_cs5_1_rate_still_checked_at_a_report_of_a_pair_across_a_reset():
+    """Only the acceleration across a reset is dropped: a rate excess at a report of that pair is still reported."""
+    ta = np.arange(0.0, 1.0001, 0.05)
+    S = _dyn_S(ta, np.zeros_like(ta), [0.0, 1.0], [0.0, 1.0])
+    S['resets'], S['t_break'] = [0.5], 0.45
+    r = cs.dyn_exceed(S, 0.0, 1.0, dict(BIGL, wz_dps=30.0, alpha_dps2=0.5))
+    assert r[1] == 'wz_dps' and r[0] == pytest.approx(1.0) and 'reset' in r[2]
+
+
+def test_cs5_2_edges_from_the_finite_reports_not_all_reports_inside():
+    """NaN at the first and last report inside the window, finite in the middle: the edges noted are those of the
+    finite reports (tw would give none)."""
+    ta = np.arange(-0.05, 1.05, 0.05)
+    tg = [0.0, 0.2, 0.4, 0.6, 1.0]
+    S = _dyn_S(ta, np.zeros_like(ta), tg, [float('nan'), 0.0, 0.0, 0.0, float('nan')])
+    r = cs.dyn_exceed(S, 0.0, 1.0, BIGL)
+    assert 'used start 0.200 s after t = 0' in r[2] and 'used end 0.400 s before the window end' in r[2]
+
+
+def test_cs5_2_one_finite_report_still_checks_the_rate():
+    ta = np.arange(-0.05, 1.0, 0.05)
+    r = cs.dyn_exceed(_dyn_S(ta, np.zeros_like(ta), [-0.5, 0.5, 1.5], [0.0, 1.0, 0.0]), 0.0, 0.9, dict(BIGL, wz_dps=30.0))
+    assert r[1] == 'wz_dps' and r[0] == pytest.approx(0.5) and 'acceleration not checked' in r[2]
