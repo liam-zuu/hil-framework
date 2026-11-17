@@ -481,6 +481,20 @@ def test_c9d4_lost_runs_of_the_block_are_out_of_the_denominator(demo_ds, tmp_pat
     assert {r['campaign']: r for r in _summary(demo_ds)}['A-LADRC']['stop_reason_check'] == 'ok'
 
 
+def _fake_gio(folder, task, run):
+    """A FAKE c8b_gio_v1 file (ok false) and the two FAKE inputs it names, in the run folder (GT1-8)."""
+    sha = {}
+    for k in ('esp32', 'frames'):
+        q = os.path.join(folder, f'{k}.csv')
+        with open(q, 'w', encoding='utf-8', newline='\n') as f:
+            f.write(f'FAKE,{k},{folder}\n')
+        sha[k] = rl.sha256_file(q)
+    p = os.path.join(folder, 'c8b_gio.json')
+    with open(p, 'w', encoding='utf-8') as f:
+        json.dump(dict(format='c8b_gio_v1', ok=False, FAKE=True, run=run, task=task, sha256=sha), f)
+    return p
+
+
 def test_gt1_2_a_level_stopped_by_the_c8b_time_check_is_not_confirmed(demo_ds, tmp_path):
     # GT1-2 (Codex round 1 of CODE_GATE; Liam 17/11 at CODE_GATE "Sửa theo bảng (Recommended)"): two dat confirmed at
     # so-h, then four runs that failed the C8b time check at the same level: the level is chua_ket_luan (O1 3.5
@@ -491,9 +505,7 @@ def test_gt1_2_a_level_stopped_by_the_c8b_time_check_is_not_confirmed(demo_ds, t
     for i in range(4):
         folder = str(tmp_path / f'gio_{i}')
         os.makedirs(folder)
-        p = os.path.join(folder, 'c8b_gio.json')
-        with open(p, 'w', encoding='utf-8') as f:
-            json.dump(dict(format='c8b_gio_v1', ok=False, FAKE=True, run=i), f)
+        p = _fake_gio(folder, 'O1-F05', i)
         rl.begin(demo_ds, 'FAKE-confirm', 'A-LADRC', 'HW', 'LADRC', 'O1-F05', '0.5', 'confirm',
                  gain_set='A-LADRC/G01', block_id='K1')
         rl.step(demo_ds, 'run')
@@ -514,9 +526,7 @@ def test_gt2_2_a_level_outside_the_block_and_the_gate_does_not_stop_the_confirma
     for i in range(4):
         folder = str(tmp_path / f'gio8_{i}')
         os.makedirs(folder)
-        p = os.path.join(folder, 'c8b_gio.json')
-        with open(p, 'w', encoding='utf-8') as f:
-            json.dump(dict(format='c8b_gio_v1', ok=False, FAKE=True, run=i, task='O1-F08'), f)
+        p = _fake_gio(folder, 'O1-F08', i)
         rl.begin(demo_ds, 'FAKE-explore', 'A-LADRC', 'HW', 'LADRC', 'O1-F08', '0.8', 'explore', gain_set='A-LADRC/G01')
         rl.step(demo_ds, 'run')
         rl.end(demo_ds, 'hong_he_do', completed=1, fail_cause=rl.C8B_GIO_FAIL, c8b_gio=p, results_dir=folder)
