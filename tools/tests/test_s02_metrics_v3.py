@@ -148,7 +148,7 @@ def test_car_uses_the_anchors_and_sim_the_exact_prep():
     log = mk(lag_us=20_000.0)
     m = M.score_run(log, 'A-L2', 'real')
     assert m['t0_metric_method'] == 'two_anchors' and m['t0_metric_us'] == pytest.approx(T0 + 20_000, abs=1)
-    assert m['r_reason'] == 'real_needs_video' and 'e_p_rms' not in m
+    assert m['r_reason'] == 'no_plant_file' and math.isnan(m['e_p_rms'])          # Viec CODE 5: real has family R
     sim = mk(lag_us=0.0)
     sim['timestamp_us'] = sim['timestamp_us'] - T0 + 3e6               # fwsim clock: t = 0 at prep_s
     m = M.score_run(sim, 'A-L2', 'sim', prep_s=3.0, plant=None)
@@ -455,3 +455,34 @@ def test_cell_line_reports_ok_over_five_and_history_apart():
     assert M.cell_line(('A-L2', 'hil', 'PID'), c) == \
         '  A-L2 hil PID: ok 3 / 5, aborted 1, broken 1; history: replaced 2, battery_rerun 6'
     assert M.cell_line(('A-K1', 'real', 'LADRC'), dict(ok=5)) == '  A-K1 real LADRC: ok 5 / 5'
+
+
+def test_hil_runs_with_a_refused_map_stay_in_the_cell_and_are_counted(tmp_path, monkeypatch, capsys):
+    """Spec S02 v1.16 S8 (Liam 17/11, THESIS local_11f2c5a8, "Giu, bao so luot (Recommended)"): an ok HIL run whose
+    plant map is refused (apply_window_too_wide, no map file) keeps status ok, its timed metrics empty, and the
+    cell line reports it per reason; the broken-run line says it is not run again (P2-4)."""
+    import runpy
+    n = len(mk()['tick'])
+    pr = np.ones(n)
+    pr[300:] = 2.0                                                     # a pose reset mid-run: run_bad, broken
+    h = _runs_dir(tmp_path / 'h', 'hil', [('g1', mk()), ('w1', mk()), ('w2', mk()), ('nm', mk()),
+                                           ('rb', dict(mk(), pos_reset_n=pr))])
+    bad = dict(ok=False, reason='apply_window_too_wide (4 frame-wheels; first: frame 9, wheel 0: 80 us > 70 us)')
+    for rid in ('w1', 'w2'):
+        with open(os.path.join(h, f'{rid}_plant_map.json'), 'w', encoding='utf-8') as f:
+            json.dump(bad, f)
+    os.remove(os.path.join(h, 'nm_plant_map.json'))
+    out = M.run_dir_metrics(h)
+    assert [o['status'] for o in out] == ['ok', 'ok', 'ok', 'ok', 'broken']
+    assert [M.map_refused_reason(o) for o in out] == ['', 'map_apply_window_too_wide', 'map_apply_window_too_wide',
+                                                      'no_map_file', '']
+    ref = M.cell_map_refused(out)
+    assert ref == {('A-L2', 'hil', 'PID'): {'map_apply_window_too_wide': 2, 'no_map_file': 1}}
+    assert M.cell_line(('A-L2', 'hil', 'PID'), M.cell_counts(out)[('A-L2', 'hil', 'PID')],
+                       ref[('A-L2', 'hil', 'PID')]) == \
+        '  A-L2 hil PID: ok 4 / 5 (map refused 3: map_apply_window_too_wide 2, no_map_file 1), broken 1'
+    monkeypatch.setattr(sys, 'argv', ['s02_metrics.py', h, 'm.csv'])
+    runpy.run_path(M.__file__, run_name='__main__')
+    txt = capsys.readouterr().out
+    assert '(map refused 3: map_apply_window_too_wide 2, no_map_file 1)' in txt
+    assert 'not run again (P2-4): rb' in txt and 'run them again' not in txt

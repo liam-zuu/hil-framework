@@ -44,8 +44,13 @@ bo phat (Recommended)", "Duyet, code sau gop (Recommended)"); spec S02 v1.13 P2-
     the test frame, each pose taken relative to its own value at t = 0), e_est_p_rms/max, e_est_psi_rms/max
     (firmware pose vs plant; NaN when pos_reset_n rises from the last line before t = 0 to T_cmd, when there is no
     line before t = 0 (pos_reset_unchecked), or edge_after_t0); A-K: rms_w_err_true and
-    the step quantities on fk(true wheel speeds) (<q>_true_segN). The car's family R needs the video tool
-    (spec Viec CODE 5): r_reason real_needs_video.
+    the step quantities on fk(true wheel speeds) (<q>_true_segN).
+  Family R of the car on the floor (real; Viec CODE 5, design section 34): <run>_plant.csv of tools/
+    s02_video_metrics.py (camera pose on the log lines, cam_lost) with <run>_plant_video.json (not ok, e.g.
+    clock_sync_failed -> no family R, r_reason from it): e_p, e_psi, e_est only (spec P2-3 table, no *_true speeds);
+    the camera pose is taken relative to its mean over the lines in [-REST_S, 0) (spec line 155, Liam 17/11 "0,5 s
+    truoc t = 0"; every such line needs a pose, else no_rest_pose); a window line with cam_lost = 1 -> no family R,
+    r_reason camera_lost (P2-5: measuring system failed). The car on stands (A-K) has no family R (real_lifted).
   Loss (P2-5): missing_pct over the motor-on tick stream (1 - distinct ticks / tick span), gen_pause_n (lines one
     tick apart but > 2 ticks apart on the DUT clock), missing_over (> 1 %); missing_seq_pct the older log_seq
     number. Runs not completed (runs.csv aborted != 0, result aborted, broken or replaced, block_status
@@ -448,7 +453,8 @@ GEN_PAUSE_US = 2 * TICK_S * 1e6       # P2-5: two lines one tick apart but more 
 AGE_PRE_S = 0.100                     # design 25 (THESIS hint): traj_age_ms over the 100 ms before an anchor
 AGE_PRE_MAX_MS = 40.0                 # [ĐỀ XUẤT]
 WZ_SRC_ENC = 0                        # AGV imu_fusion.h WZ_SRC_ENC
-PLATFORMS_R = ('sim', 'hil')          # family R from <run>_plant.csv (the car: video tool, Viec CODE 5)
+PLATFORMS_R = ('sim', 'hil', 'real')  # family R from <run>_plant.csv (the car: tools/s02_video_metrics.py)
+REST_S = 0.5                          # s, the car's rest pose: mean over [-REST_S, 0) (spec P2-3 line 155)
 STATUS_FIELDS = ('status', 'status_reason')
 # columns a broken run keeps (S2M1-1): loss and mid-run resets, no metric
 BROKEN_KEEP = ('missing_pct', 'gen_pause_n', 'missing_over', 'missing_seq_pct', 'missing_tail_known',
@@ -558,6 +564,20 @@ def _rel_pose(t, x, y, th, psi0):
     return s02_ref.to_test_frame(x, y, th, z[0], z[1], z[2], psi0)
 
 
+def _rest_rel_pose(t, x, y, th, psi0):
+    """The car's camera pose in the test frame relative to its mean over the lines in [-REST_S, 0) (P2-3 line 155:
+    the rest before t = 0), or None when there is no such line or one of them has no pose."""
+    th = _unwrap_valid(th)
+    rest = (t >= -REST_S - WINDOW_EPS_S) & (t < 0.0)
+    if not rest.any():
+        return None
+    v = np.stack([np.asarray(x, dtype=float), np.asarray(y, dtype=float), th], axis=1)[rest]
+    if not np.all(np.isfinite(v)):
+        return None
+    z = v.mean(axis=0)
+    return s02_ref.to_test_frame(x, y, th, z[0], z[1], z[2], psi0)
+
+
 def _plant_series(plant, prow, name):
     """Plant column on every log line (NaN where the line has no plant row)."""
     if name not in plant:
@@ -565,8 +585,9 @@ def _plant_series(plant, prow, name):
     return np.where(prow >= 0, plant[name][np.clip(prow, 0, None)], np.nan)
 
 
-def _family_r(log, test_id, t, win, plant, prep_flags):
-    """Family R numbers, r_reason and e_est_reason (module docstring)."""
+def _family_r(log, test_id, t, win, plant, prep_flags, platform=''):
+    """Family R numbers, r_reason and e_est_reason (module docstring); platform real: the camera rows of
+    tools/s02_video_metrics.py."""
     m = {}
     prow = np.array([plant['_row'].get(int(x), -1) for x in log['timestamp_us']], dtype=np.int64)
     T = s02_ref.t_cmd(test_id)
@@ -592,16 +613,25 @@ def _family_r(log, test_id, t, win, plant, prep_flags):
     for k in R_FLOOR:
         m[k] = NAN
     m['e_est_reason'] = ''
-    V = _plant_cols(plant, prow, ['vx_b', 'vy_b', 'wz'], win)
-    if V is None:
-        reasons.append('plant_gap')
+    real = platform == 'real'
+    if real:
+        # the car: pose only (spec P2-3 table); a window line in a camera gap longer than t_miss: the measuring
+        # system failed (P2-5), no family R
+        if np.any(_plant_series(plant, prow, 'cam_lost')[win] == 1):
+            m['e_est_reason'] = m['r_reason'] = 'camera_lost'
+            return m
     else:
-        e = r - V
-        m['e_vx_true'], m['e_vy_true'], m['e_wz_true'] = rms(e[:, 0]), rms(e[:, 1]), rms(e[:, 2])
+        V = _plant_cols(plant, prow, ['vx_b', 'vy_b', 'wz'], win)
+        if V is None:
+            reasons.append('plant_gap')
+        else:
+            e = r - V
+            m['e_vx_true'], m['e_vy_true'], m['e_wz_true'] = rms(e[:, 0]), rms(e[:, 1]), rms(e[:, 2])
     psi0 = s02_ref.start_heading(test_id)
-    true = _rel_pose(t, *(_plant_series(plant, prow, n) for n in ('x', 'y', 'theta')), psi0)
+    xyt = [_plant_series(plant, prow, n) for n in ('x', 'y', 'theta')]
+    true = _rest_rel_pose(t, *xyt, psi0) if real else _rel_pose(t, *xyt, psi0)
     if true is None or not all(np.all(np.isfinite(c[win])) for c in true):
-        reasons.append('no_plant_pose_at_t0' if true is None else 'plant_pose_gap')
+        reasons.append(('no_rest_pose' if real else 'no_plant_pose_at_t0') if true is None else 'plant_pose_gap')
         m['e_est_reason'] = 'no_plant_pose'
         m['r_reason'] = ';'.join(dict.fromkeys(reasons))
         return m
@@ -695,11 +725,11 @@ def score_run(log, test_id, platform='', prep_s=None, us_cut=None, plant=None, p
     for k in STEPS:
         m[f'step_{k}'] = STEPS[k]
         m[f'qrms_{k}'] = QRMS[k]
-    r_family = platform in PLATFORMS_R
+    r_family = platform in PLATFORMS_R and not (platform == 'real' and test_id in LIFTED)
     if r_family:
         for k in (R_LIFTED if test_id in LIFTED else R_FLOOR):
             m[k] = NAN
-    m['r_reason'] = 'real_needs_video' if platform == 'real' else ('' if r_family else 'platform_unknown')
+    m['r_reason'] = ('' if r_family else 'real_lifted' if platform in PLATFORMS_R else 'platform_unknown')
     if not math.isfinite(t0):
         if r_family:
             m['r_reason'] = 'no_t0'
@@ -749,7 +779,7 @@ def score_run(log, test_id, platform='', prep_s=None, us_cut=None, plant=None, p
         if plant is None:
             m['r_reason'] = plant_reason or 'no_plant_file'
         else:
-            m.update(_family_r(log, test_id, t, win, plant, cmd['prep_flags']))
+            m.update(_family_r(log, test_id, t, win, plant, cmd['prep_flags'], platform))
     return m
 
 
@@ -840,6 +870,14 @@ def _plant_inputs(d, r, path, platform):
         s = mj.get('sender_t0_us')
         sender = float(s) if isinstance(s, (int, float)) and math.isfinite(float(s)) else None
         sreason = '' if sender is not None else 'no_sender_frame'
+    if platform == 'real':
+        vj = os.path.splitext(pp)[0] + '_video.json'       # tools/s02_video_metrics.py
+        if not os.path.isfile(vj):
+            return None, 'no_video_file', None, ''
+        with open(vj, encoding='utf-8') as f:
+            vi = json.load(f)
+        if vi.get('ok') is not True:
+            return None, str(vi.get('reason') or 'video_not_ok'), None, ''
     if not os.path.isfile(pp):
         return None, 'no_plant_file', sender, sreason
     return load_plant(pp), preason, sender, sreason
@@ -910,13 +948,43 @@ def cell_counts(out):
 HISTORY = ('replaced', 'battery_rerun')     # kept in the history, outside the 5 runs of the cell (P2-4, P2-5)
 
 
-def cell_line(key, c):
+def map_refused_reason(o):
+    """Short reason of a completed (ok) HIL run whose plant map gave no t = 0 (metric_reason no_sender_t0: map not
+    certified, e.g. map_apply_window_too_wide, no map file, no sender frame); '' for any other row. Spec S02 v1.16
+    S8 (P2-5): such a run is not an outside cause, it stays in the 5 and the cell reports how many, per reason."""
+    if o.get('status') != 'ok' or str(o.get('platform', '')).strip().lower() != 'hil':
+        return ''
+    mr = str(o.get('metric_reason') or '')
+    if not mr.startswith('no_sender_t0'):
+        return ''
+    inner = mr[len('no_sender_t0'):].strip()
+    if inner.startswith('(') and inner.endswith(')'):
+        inner = inner[1:-1]
+    return inner.split(' ')[0] or 'no_sender_t0'
+
+
+def cell_map_refused(out):
+    """{(test_id, platform, controller): {reason: n}} of the ok HIL runs without a map t = 0 (map_refused_reason)."""
+    cells = {}
+    for o in out:
+        why = map_refused_reason(o)
+        if why:
+            c = cells.setdefault((o.get('test_id', ''), o.get('platform', ''), o.get('controller', '')), {})
+            c[why] = c.get(why, 0) + 1
+    return cells
+
+
+def cell_line(key, c, refused=None):
     """Printed line of one cell (S2M1-9, Codex round 1 of v3): completed runs over the fixed N_REP (P2-4, P2-5:
-    'n_hoan_tat / 5'), the broken and aborted runs, then the history rows (replaced, battery_rerun) apart."""
+    'n_hoan_tat / 5'), the broken and aborted runs, the ok HIL runs whose map was refused, per reason (refused:
+    {reason: n} of cell_map_refused; spec v1.16 S8), then the history rows (replaced, battery_rerun) apart."""
     tid, plat, ctrl = key
     in_cell = [k for k in sorted(c) if k not in HISTORY and k != 'ok']
     hist = [k for k in HISTORY if c.get(k)]
     s = f'  {tid} {plat} {ctrl}: ok {c.get("ok", 0)} / {N_REP}'
+    if refused:
+        s += (f' (map refused {sum(refused.values())}: '
+              + ', '.join(f'{k} {refused[k]}' for k in sorted(refused)) + ')')
     s += ''.join(f', {k} {c[k]}' for k in in_cell)
     if hist:
         s += '; history: ' + ', '.join(f'{k} {c[k]}' for k in hist)
@@ -932,11 +1000,13 @@ if __name__ == '__main__':
             sys.exit(f'{nm} already exists in {sys.argv[1]}: choose a new name (outputs are not overwritten).')
     res = run_dir_metrics(sys.argv[1], name)
     print(f'{len(res)} runs -> {os.path.join(sys.argv[1], name)}')
+    refused = cell_map_refused(res)
     for key, c in sorted(cell_counts(res).items()):
-        print(cell_line(key, c))
+        print(cell_line(key, c, refused.get(key)))
     bad = [r['run_id'] for r in res if r.get('run_bad') == 1]
     if bad:
-        print(f'BROKEN RUNS (run_bad = 1, pose reset mid-run, L37): run them again: {", ".join(bad)}')
+        print(f'BROKEN RUNS (run_bad = 1, pose reset mid-run, L37): broken run, inside the 5 of its cell, not run '
+              f'again (P2-4): {", ".join(bad)}')
     over = [r['run_id'] for r in res if r.get('missing_over') == 1]
     if over:
         print(f'LOSS OVER {MISSING_MAX_PCT:g} % (P2-5, broken run unless the logger tool failed): {", ".join(over)}')
