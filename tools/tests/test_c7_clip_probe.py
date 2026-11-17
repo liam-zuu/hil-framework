@@ -160,3 +160,14 @@ def test_refuses_a_folder_with_files(marks_csv, still_clip, tmp_path):
     (tmp_path / 'x.txt').write_text('x')
     with pytest.raises(SystemExit):
         cp.main(['--video', still_clip, '--markers', marks_csv, '--out', str(tmp_path)])
+
+
+def test_floor_ids_by_role(tmp_path):
+    # 18/11 (trang C8b v10): ID 25-33 taped for good as floor marks (vai_tro moc_giua) enter the fit; ID 1-24 always
+    # (print files label them moc_san / moc_vung_noi); a check tag with another role and the car tag never
+    p = tmp_path / 'm.csv'
+    p.write_text('id,vai_tro,x_cm,y_cm,canh_den_mm,dict\n0,noc_xe,,,150,D\n1,moc_san,0,0,100,D\n13,moc_vung_noi,10,0,150,D\n'
+                 '24,,20,0,150,D\n25,moc_giua,50,0,100,D\n26,ma_kiem_clip_H,-50,0,100,D\n', encoding='utf-8')
+    marks = cp.load_marks([str(p)])
+    assert cp.floor_ids(marks, cp.load_roles([str(p)])) == [1, 13, 24, 25]
+    assert cp.floor_ids(marks, {}) == [1, 13, 24]          # no roles: as before 18/11

@@ -69,6 +69,13 @@ CORNER_DIST_LIMIT = 0.10     # distortion at the frame corner below this: no che
 # every real mark. [DE XUAT, lock at C8]
 SQ_SIDE_RATIO = 0.7          # shortest side / longest side of the detected quad, at least
 SQ_DIAG_RATIO = 0.8          # shorter diagonal / longer diagonal, at least
+# Floor marks that enter the camera fit, by the vai_tro column of the mark CSVs: moc_san (ID 1-24, taped 10/11) and
+# moc_giua (the check tags ID 25-33 taped for good mid-field 18/11, measured once like the floor marks; trang C8b
+# v10 ĐÃ DUYỆT, Liam 18/11 at CODE_C8B: "Duyệt v10, Codex rà bộ chấm CAM (Recommended)"). A CSV row without
+# vai_tro: ID 1-24 are floor marks whatever the column says (as before 18/11; the print files label them moc_san and
+# moc_vung_noi).
+FLOOR_ROLES = ('moc_san', 'moc_vung_noi', 'moc_giua')
+LEGACY_FLOOR_IDS = tuple(range(1, 25))
 
 
 # ---------------------------------------------------------------- floor marks
@@ -82,6 +89,23 @@ def load_marks(paths):
                     continue
                 marks[int(r['id'])] = (float(r['x_cm']) / 100, float(r['y_cm']) / 100, float(r['canh_den_mm']) / 1000)
     return marks
+
+
+def load_roles(paths):
+    """{id: vai_tro} of the mark CSVs ('' when the column is missing or empty)."""
+    roles = {}
+    for p in paths:
+        with open(p, newline='', encoding='utf-8') as f:
+            for r in csv.DictReader(f):
+                if r.get('id', '').strip():
+                    roles[int(r['id'])] = (r.get('vai_tro') or '').strip()
+    return roles
+
+
+def floor_ids(marks, roles):
+    """Sorted IDs of marks with a centre that enter the camera fit: ID 1-24 (always, as before 18/11), and any other
+    ID whose vai_tro is in FLOOR_ROLES (moc_giua: ID 25-33 taped for good). The car tag ID 0 never."""
+    return sorted(i for i in marks if i != 0 and (i in LEGACY_FLOOR_IDS or roles.get(i, '') in FLOOR_ROLES))
 
 
 def mark_corners_floor(x, y, side):
@@ -386,9 +410,11 @@ def mean_corners(dets, min_frac=0.5):
     return {i: np.mean(np.array(v), axis=0) for i, v in acc.items() if len(v) >= min_frac * n}
 
 
-def lens_analysis(dets, marks, w, h, zc):
+def lens_analysis(dets, marks, w, h, zc, floor=None):
+    """floor: IDs of the floor marks (floor_ids); None: ID 1-24 (before 18/11)."""
+    floor = set(LEGACY_FLOOR_IDS if floor is None else floor)
     mc = mean_corners(dets)
-    ids = [i for i in mc if i in marks and 1 <= i <= 24]       # fit only on the floor marks (3.3)
+    ids = [i for i in mc if i in marks and i in floor]          # fit only on the floor marks (3.3)
     out = dict(fit_ids=sorted(ids))
     if len(ids) < 6:
         out['note'] = f'only {len(ids)} floor marks seen in at least half of the frames; no fit'
@@ -407,7 +433,7 @@ def lens_analysis(dets, marks, w, h, zc):
     out['cross_validation_mm'] = cv
     ch = choose_model(cv)
     out['chosen'] = ch
-    check = [i for i in mc if i in marks and 25 <= i <= 33]
+    check = [i for i in mc if i in marks and i not in floor and i != 0]   # known marks outside the fit
     if ch and check:
         cam, _ = fit_camera(ch, obj, img, w, h, zc)
         e = {i: float(np.hypot(*(cam.pix2floor(mc[i].mean(axis=0, keepdims=True))[0] - np.array(marks[i][:2]))) * 1000)
@@ -453,7 +479,7 @@ def report_text(clip, man, info, ft, table, dr, lens):
                      f'Z_c {fi["Zc_m"]:.3f} m, nghiêng {fi["tilt_deg"]:.1f}°, méo ở góc khung {fi["corner_distortion"]:.1%}; {cvs}')
         L.append(f'    chọn: {lens["chosen"]}; bàn cờ: {lens.get("checkerboard")}')
         if lens.get('check_marks_err_mm'):
-            L.append(f'    mã kiểm 25-33 (không vào khớp): {{{", ".join(f"{k}: {v:.1f}" for k, v in lens["check_marks_err_mm"].items())}}} mm')
+            L.append(f'    mã ngoài khớp (vai_tro khác mốc sàn): {{{", ".join(f"{k}: {v:.1f}" for k, v in lens["check_marks_err_mm"].items())}}} mm')
     else:
         L.append(f'(2) Ống kính: {lens.get("note")}')
     L.append('(6) Thời gian phơi sáng: CHƯA ĐỌC (laptop không có ffprobe hay exiftool; thêm công cụ phải hỏi Liam)')
@@ -473,6 +499,7 @@ def main(argv=None):
         sys.exit(f'{a.out} already holds files: use a new folder')
     os.makedirs(a.out, exist_ok=True)
     marks = load_marks(a.markers)
+    floor = floor_ids(marks, load_roles(a.markers))
     man = dict(file=os.path.basename(a.video), size_bytes=os.path.getsize(a.video), sha256=sha256(a.video))
     with open(os.path.join(a.out, 'clip_manifest.csv'), 'w', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=list(man)); w.writeheader(); w.writerow(man)
@@ -486,7 +513,7 @@ def main(argv=None):
     ft = frame_times(times, info['fps_nominal'])
     per, dr = drift(dets)
     table = mark_table(dets, W, H, marks)
-    lens = lens_analysis(dets, marks, W, H, a.zc)
+    lens = lens_analysis(dets, marks, W, H, a.zc, floor)
     with open(os.path.join(a.out, 'marks.csv'), 'w', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=list(table[0])); w.writeheader(); w.writerows(table)
     with open(os.path.join(a.out, 'frames.csv'), 'w', newline='', encoding='utf-8') as f:

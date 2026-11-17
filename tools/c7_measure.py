@@ -85,8 +85,9 @@ if HERE not in sys.path:
 import c7_clip_probe as cp                                               # noqa: E402
 
 CAR_ID = 0
-FLOOR_IDS = tuple(range(1, 25))
-CHECK_IDS = tuple(range(25, 34))
+FLOOR_IDS = tuple(range(1, 25))     # floor marks of a session without 'floor_ids' (before 18/11)
+CHECK_IDS = tuple(range(25, 34))    # print IDs of the check tags; since 18/11 taped for good as floor marks (vai_tro
+                                    # moc_giua, c7_clip_probe.FLOOR_ROLES), then they enter the fit
 HALF_FLOOR_PX = 6.0          # design 3.2: half width of the edge profiles, floor marks
 HALF_CAR_PX = 9.0            #             car tag (room for blur up to about 6 px)
 SG_HALF = 6                  # design 3.8: +-6 frames (0.2 s at 60 fps)
@@ -249,6 +250,11 @@ def refit_pose(cam, obj_xy, img):
     c = make(sol.x)
     r = c.project(obj) - img
     return c, float(np.sqrt(np.mean(np.sum(r ** 2, axis=1))))
+
+
+def session_floor_ids(session):
+    """Floor-mark IDs of a session: its 'floor_ids' (written from 18/11, by vai_tro), else ID 1-24."""
+    return tuple(int(i) for i in session.get('floor_ids', FLOOR_IDS))
 
 
 def floor_obs(dets, marks, ids=FLOOR_IDS):
@@ -498,8 +504,10 @@ def regate(rows, session, gates=None):
 
 
 # ---------------------------------------------------------------- calibration (clip H)
-def calibrate(video, marks, zc, plumb, tag_h, car_side, stride=1, max_frames=None, min_frac=0.5):
-    """Session camera from the static clip H (design 3.0, 3.3, 4.2 (a)). Returns the session dict."""
+def calibrate(video, marks, zc, plumb, tag_h, car_side, stride=1, max_frames=None, min_frac=0.5, floor=None):
+    """Session camera from the static clip H (design 3.0, 3.3, 4.2 (a)). Returns the session dict.
+    floor: IDs of the floor marks (c7_clip_probe.floor_ids, by vai_tro); None: ID 1-24."""
+    floor = tuple(sorted(FLOOR_IDS if floor is None else floor))
     det = make_detector()
     dets, shape, n = [], None, 0
     for k, t, g in iter_frames(video, max_frames):
@@ -518,7 +526,7 @@ def calibrate(video, marks, zc, plumb, tag_h, car_side, stride=1, max_frames=Non
     mean = {i: np.mean(np.array(v), axis=0) for i, v in acc.items() if len(v) >= min_frac * len(dets)}
     spread = {i: float(np.max(np.linalg.norm(np.array(v).mean(axis=1) - np.array(v).mean(axis=(0, 1)), axis=1)))
               for i, v in acc.items() if i in mean}
-    ids = [i for i in sorted(mean) if i in marks and i in FLOOR_IDS]
+    ids = [i for i in sorted(mean) if i in marks and i in floor]
     if len(ids) < 6:
         raise ValueError(f'only {len(ids)} floor marks seen in at least half of the frames: no calibration')
     obj = np.vstack([cp.mark_corners_floor(*marks[i]) for i in ids])
@@ -537,15 +545,15 @@ def calibrate(video, marks, zc, plumb, tag_h, car_side, stride=1, max_frames=Non
     for i in ids:
         r = cam.project(np.column_stack([cp.mark_corners_floor(*marks[i]), np.zeros(4)])) - mean[i]
         ctr = cam.pix2floor(mean[i].mean(axis=0, keepdims=True))[0]
-        per_mark.append(dict(id=i, ring='ngoai' if i >= 13 else 'trong', rms_px=float(np.sqrt(np.mean(np.sum(r ** 2, axis=1)))),
+        per_mark.append(dict(id=i, ring='giua' if i >= 25 else ('ngoai' if i >= 13 else 'trong'), rms_px=float(np.sqrt(np.mean(np.sum(r ** 2, axis=1)))),
                              err_mm=float(np.hypot(*(ctr - np.array(marks[i][:2]))) * 1000), spread_px=spread[i]))
     check = {i: float(np.hypot(*(cam.pix2floor(mean[i].mean(axis=0, keepdims=True))[0] - np.array(marks[i][:2]))) * 1000)
-             for i in sorted(mean) if i in marks and i in CHECK_IDS}
+             for i in sorted(mean) if i in marks and i not in floor and i != CAR_ID}
     zc_used = zc if zc is not None else float(abs(cam.centre[2]))
     return dict(
         kind='c7_session', video=os.path.basename(video), video_sha256=sha256(video), frames=n, stride=stride,
         width=w_px, height=h_px, camera=cam_to_dict(cam), rms_px_H=rms, model_fits=fits, cross_validation_mm=cv,
-        chosen=chosen, fit_ids=ids, ref_centres_px={str(i): mean[i].mean(axis=0).tolist() for i in ids},
+        chosen=chosen, fit_ids=ids, floor_ids=list(floor), ref_centres_px={str(i): mean[i].mean(axis=0).tolist() for i in ids},
         ref_corners_px={str(i): mean[i].tolist() for i in ids},   # (4, 2) mean refined corners (c7_calib_drift CD1-3)
         per_mark=per_mark, check_tags_err_mm=check, zc_tape_m=zc, zc_fit_m=float(abs(cam.centre[2])),
         plumb_xy_m=list(plumb), tag_h_m=tag_h, car_side_m=car_side, kappa=tag_h / zc_used,
@@ -581,12 +589,13 @@ def track(video, session, tag_offset=None, max_frames=None, progress=None, gates
     ref = {int(i): np.array(v) for i, v in session['ref_centres_px'].items()}
     side, kappa, plumb = session['car_side_m'], session['kappa'], session['plumb_xy_m']
     off = tag_offset if tag_offset is not None else session['tag_offset']
+    fl_ids = session_floor_ids(session)
     det = make_detector()
     rows, cam_prev, shapes = [], cam0, set()
     for k, t, g in iter_frames(video, max_frames):
         shapes.add(g.shape)
         d = detect_refined(det, g)
-        obj, img, used = floor_obs(d, marks)
+        obj, img, used = floor_obs(d, marks, fl_ids)
         r = dict(idx=k, t_s=t, n_marks=len(used), rms_px=float('nan'), shift_px=float('nan'), cam_z=float('nan'),
                  shift_mag_px=float('nan'), car_seen=False, x=float('nan'), y=float('nan'), psi=float('nan'), tag_x=float('nan'),
                  tag_y=float('nan'), res_m=float('nan'), res_sim_m=float('nan'), scale=float('nan'),
@@ -738,11 +747,10 @@ def calib_report(s):
         rings.setdefault(p['ring'], []).append(p['rms_px'])
     L.append('Dư thừa theo vòng mốc (px RMS, design 7 mục 7): ' +
              ', '.join(f'{k} {float(np.sqrt(np.mean(np.square(v)))):.2f}' for k, v in rings.items()))
+    L.append(f"Mốc sàn vào khớp: {len(s['fit_ids'])} ({', '.join(str(i) for i in s['fit_ids'])})")
     if s['check_tags_err_mm']:
-        L.append('Mã kiểm 25–33 (không vào khớp; tâm DANH ĐỊNH tới khi đo thước): ' +
+        L.append('Mã có tọa độ nhưng ngoài khớp (vai_tro khác mốc sàn): ' +
                  ', '.join(f'{k}: {v:.1f}' for k, v in s['check_tags_err_mm'].items()) + ' mm')
-    else:
-        L.append('Mã kiểm 25–33: không thấy trong clip')
     L.append(f'Lệch mã nóc xe: {s["tag_offset"]} ({s["tag_offset_src"]})')
     return '\n'.join(L) + '\n'
 
@@ -782,6 +790,7 @@ def main(argv=None):
         if a.cmd == 'calib':
             plumb = _pair(a.plumb, 2, '--plumb')
             marks = cp.load_marks(a.markers)
+            floor = cp.floor_ids(marks, cp.load_roles(a.markers))
             side = a.car_side
             if side is None:
                 for p in a.markers:
@@ -791,7 +800,7 @@ def main(argv=None):
                                 side = float(r['canh_den_mm']) / 1000
             if side is None:
                 raise ValueError('car tag side: give --car-side or a CSV with ID 0')
-            s = calibrate(a.video, marks, a.zc, plumb, a.tag_h, side, a.stride, a.max_frames)
+            s = calibrate(a.video, marks, a.zc, plumb, a.tag_h, side, a.stride, a.max_frames, floor=floor)
             s['markers_csv'] = [dict(file=os.path.basename(p), sha256=sha256(p)) for p in a.markers]
             with open(os.path.join(a.out, 'session.json'), 'w', encoding='utf-8') as f:
                 json.dump(_json(s), f, ensure_ascii=False, indent=1)
