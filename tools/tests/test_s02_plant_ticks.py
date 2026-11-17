@@ -790,10 +790,38 @@ def test_a_wide_stop_window_lets_many_edges_through():
         c[:, w] = 1000 + o + np.array([np.sum(sgn[e['t'] <= r]) for r in read])
     j1 = int(np.flatnonzero(c[:, 1] != 1000)[0])
     assert read[j1 - 1] > S + 90_000 and c[j1, 1] - 1000 > 15             # last line at c0 late; then far from c0
+    # S2M4-1 (Liam 17/11): a 2 ms window at hp 250 us is past a quarter of the half period: no map
     res = pt.certify(u, c, lo, width, om32)
-    assert res.get('ext') is not None, res['reason']
-    lo_s, hi_s = np.array([res['ext'](x) for x in u]).T
-    assert np.all((lo_s - 1e-6 <= u) & (u <= hi_s + 1e-6)), float(np.max(np.maximum(lo_s - u, u - hi_s)))
+    assert not res['ok'] and res['reason'].startswith('apply_window_too_wide'), res['reason']
+    assert (i_stop2, 1, 2000.0, 31.25) in pt.wide_windows(width, om32)
+
+
+def test_a_wide_retime_window_before_a_stop_is_refused():
+    """S2M4-1 (Codex round 4 of v3): hp 250 us, then a slow-down to raw 246 (hp 31 701 us) whose window is 2 ms
+    wide (the old half period runs on until the true apply: 16 more edges than the model), then a stop: refused
+    (apply_window_too_wide), before any count is used."""
+    sc = np.float32(EM.HIL_OMEGA_MAX) / np.float32(32767.0)
+    lo = np.r_[1000.0 * np.arange(1700), 1_700_000.0 + np.array([540.0, 4000.0, 5000.0]), 1_706_000.0 + 1000.0 * np.arange(400)]
+    raw = np.zeros((len(lo), 4), dtype=np.int16)
+    raw[1700, :] = 31194
+    raw[1701, :] = 246
+    om32 = raw.astype(np.float32) * sc
+    hp, _ = EM.h7_half_period(om32)
+    assert hp[1700, 0] == 250.0 and hp[1701, 0] > 31000.0
+    width = np.zeros(len(lo))
+    width[1701] = 2000.0
+    u = 1_000_000.0 + 10_000.0 * np.arange(100)
+    res = pt.certify(u, np.zeros((len(u), 4)), lo, width, om32)
+    assert res['reason'].startswith('apply_window_too_wide') and 'frame 1701' in res['reason'], res['reason']
+    width[1701] = 0.25 * 250.0 / 2.0                                    # right at the limit: not refused for it
+    assert not pt.wide_windows(width, om32)
+    width[1701] += 0.01
+    assert [(f, w) for f, w, _, _ in pt.wide_windows(width, om32)] == [(1701, 0), (1701, 1), (1701, 2), (1701, 3)]
+    width[1701] = 0.0
+    width[1702] = 0.25 * 31701.0 / 2.0 - 1.0                            # the stop: limit from the old half period
+    assert not pt.wide_windows(width, om32)
+    width[1702] = 0.25 * 31701.0 / 2.0 + 1.0
+    assert pt.wide_windows(width, om32)[0][0] == 1702
 
 
 def test_stop_boundary_holds_the_true_edge_count():

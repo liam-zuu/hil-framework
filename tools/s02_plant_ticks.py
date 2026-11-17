@@ -59,7 +59,9 @@ Counts the edge model cannot place (S2M1-2): past the first untrusted edge of a 
 known either; lines whose count lies beyond the trusted prefix of that segment, and every later segment of the wheel,
 bound nothing. The rest bound (S2M1-3) uses edge m + 1 of the first start (m pins that may be high), since a negative
 forced-low step can be undone by the first edges.
-Not mapped either: a frame log with mosi_true (a run with --faults, O-3), a run whose '#us_end' reports cut ticks
+Not mapped either (S2M4-1): a run with a frame whose apply window is wider than a quarter of the half period in
+effect around it (wide_windows: the edge model's one-callback-per-window assumption). Not mapped either: a frame log
+with mosi_true (a run with --faults, O-3), a run whose '#us_end' reports cut ticks
 (us_cut, S2P2-2), a wheel that never starts, a log without STILL_MIN_S of rest before the start.
 """
 import argparse
@@ -529,6 +531,23 @@ def _mix(l, x, y):
     return np.where(l == 0, x, np.where(l == 1, y, v))
 
 
+def wide_windows(width_us, om32):
+    """S2M4-1 (Codex round 4 of v3; Liam 17/11 CODE_S02 "Tu choi luot cua so rong (Recommended)"): (frame, wheel,
+    window, limit) of the frames whose apply window is wider than TRUST_FRAC x half of the smaller half period in
+    effect around it (the previous frame's or its own, moving wheels only). The edge model assumes at most one
+    callback per channel inside one window (a retime or a stop keeps the old half period until its true apply);
+    a wider window can hide many edges (Codex rounds 3, 4: windows of 2 ms). CLOSED_LOOP/2026-11-14_run01: the
+    largest window over that limit's base is 0.08-0.10, i.e. a third of it."""
+    hp, _ = EM.h7_half_period(om32)
+    moving = np.abs(np.asarray(om32)) > np.float32(OMEGA_MIN)
+    hpm = np.where(moving, hp, np.inf)
+    prev = np.vstack([np.full((1, hpm.shape[1]), np.inf), hpm[:-1]])
+    lim = TRUST_FRAC * np.minimum(hpm, prev) / 2.0
+    w = np.asarray(width_us, dtype=float)[:, None]
+    f, wh = np.nonzero(w > lim)
+    return [(int(a), int(b), float(w[a, 0]), float(lim[a, b])) for a, b in zip(f, wh)]
+
+
 def certify(te_us, counts, apply_us, width_us, om32, t_window=None):
     """The set of maps s = a + b u (H7 us of an ESP32 time u in us) that agree with every count (module docstring).
     te_us (m,), counts (m, 4) of the motor-on ESP32 lines (NaN: not used); apply_us, width_us, om32 of the applied
@@ -540,6 +559,12 @@ def certify(te_us, counts, apply_us, width_us, om32, t_window=None):
     res = dict(ok=False, reason='', a=None, b=None, spread_us=None, offsets=None, n_rows=0, n_iter=0)
     if len(te) < 2:
         res['reason'] = 'fewer than two ESP32 lines'
+        return res
+    wide = wide_windows(width_us, om32)
+    if wide:
+        f, w, wd, lim = wide[0]
+        res['reason'] = (f'apply_window_too_wide ({len(wide)} frame-wheels; first: frame {f}, wheel {w}: '
+                         f'{wd:.0f} us > {lim:.0f} us)')
         return res
     wh = [_Wheel(e) for e in simulate_edges(apply_us, width_us, om32)]
     starts = []
