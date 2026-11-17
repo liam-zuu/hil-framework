@@ -34,6 +34,39 @@ def wcsv(path, cols, rows):
         w.writerows(rows)
 
 
+@pytest.fixture(autouse=True)
+def own_lock_dir(tmp_path_factory, monkeypatch):
+    """Every test takes the copy lock in a folder of its own. The tool's lock, chep_luot_A.lock in %TEMP%, is shared
+    by every process on the machine, so two test runs at once collided (CODE 17/11, int 34c7f49:
+    test_luot_again_needs_thay_and_keeps_old 'another chep_luot_A is running'). Only the tests move: the tool still
+    locks in %TEMP% (tempfile.gettempdir())."""
+    d = tmp_path_factory.mktemp('lock')
+    monkeypatch.setattr(C.tempfile, 'tempdir', str(d))
+    return d
+
+
+def test_lock_is_in_the_folder_of_the_test(own_lock_dir):
+    assert os.path.dirname(C.Lock().path) == str(own_lock_dir)
+
+
+def test_two_lock_folders_do_not_collide_one_folder_does(tmp_path, monkeypatch):
+    """Two test runs at once (two folders) both take the lock; a second copy in one folder is refused while the
+    first holds it, and the lock is gone when it ends."""
+    a, b = tmp_path / 'a', tmp_path / 'b'
+    a.mkdir()
+    b.mkdir()
+    monkeypatch.setattr(C.tempfile, 'tempdir', str(a))
+    with C.Lock() as la:
+        monkeypatch.setattr(C.tempfile, 'tempdir', str(b))
+        with C.Lock() as lb:
+            assert os.path.isfile(la.path) and os.path.isfile(lb.path) and la.path != lb.path
+        monkeypatch.setattr(C.tempfile, 'tempdir', str(a))
+        with pytest.raises(C.Refused, match='another chep_luot_A is running'):
+            with C.Lock():
+                pass
+    assert not os.listdir(a) and not os.listdir(b)
+
+
 @pytest.fixture
 def world(tmp_path, monkeypatch):
     """A thesis folder (tmp) with an A run in 05_DATA/results, a STRA_A root, a tuning log, an empty freeze table."""
