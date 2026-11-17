@@ -32,12 +32,15 @@ Clock (O1 3.4): t = 0 is the run_active rising edge of the log by o1_cmd_path.fi
 run_active = 1 whose line just before by log_seq was received with 0; that line lost: run lost to the
 measurement system). The video clock is matched by o1_time_sync.sync (C7b), or --offset-s with a reason; not
 matched: run lost to the measurement system. Command time of a frame: t = t_cam + offset - t0.
-U_t (O1 3.5 SC-12) = u_t_ghep_s (C7b residual, constants) [+ --offset-err-s] + drift + tick (drift_bound,
-tick_max_s):
+U_t (O1 3.5 SC-12; C8b v4 3) = parts in U_t_parts: C7b match: u_t_ghep_s (its residual, constants) + drift +
+shutter + tick; --offset-s (a node of the C8b time grid, or any given offset): --offset-err-s (luoi_s, the grid
+step) + drift + shutter + tick, u_t_ghep_s not added (no C7b match) (drift_bound, shutter_bound, tick_max_s):
+  shutter  hang_so man_trap absent: one frame (median frame interval); else |alpha_r| row span + |alpha_c| column
+         span of the car tag over the match window and the domain to t_deadline (C8B4R2-6, -9, C8B4R4-1).
   drift  the clock-rate part up to t_deadline (CS1-4): rate = max(C7b |offset_end - offset_start| / distance of the
          third centres, troi_ppm) x the largest distance from the centre of the C7b window to [0, t_deadline], plus
          |offset used - mean of the thirds|; C7b short (K1): troi_ppm alone (CS1-6); --offset-s: troi_ppm x the
-         largest distance from --offset-anchor-s (the command time where the offset was established) to
+         largest distance from any point of --offset-anchor-s (T, or the match window A,B, C8B4R2-4) to any point of
          [0, t_deadline], and --offset-err-s added; no anchor or error: refused (CS2-1).
          e_max (S05 4.7 (i), Pi / ESP32) is not used: it does not bound the camera clock.
   tick   the largest interval between consecutive RECEIVED log lines meeting [t0, t0 + end of the union domain]
@@ -119,7 +122,7 @@ first time the IMU motion leaves the locked U_IMU range (angle turned, gyro rate
 whether or not the yaw is aligned, CS2-9; handling: Liam decides when it happens, O1 3.3).
 
   python tools/c7_score.py --frames <dir>/frames.csv --esp32 <run>.csv --sender <run>_sender.txt --task O1-F05 \
-      --hang-so hang_so.json --out score.json [--offset-s D --offset-reason TEXT --offset-anchor-s T --offset-err-s E]
+      --hang-so hang_so.json --out score.json [--offset-s D --offset-reason TEXT --offset-anchor-s T|A,B --offset-err-s E]
       [--k-start X,Y,DEG] [--allow-final-set] [--events <run>.csv.events.txt] [--rows rows.csv]
 Last line: #ket_qua,ma=0,outcome=... scored (hong_he_do included) / 2 refused or any error (CS1-6).
 """
@@ -244,6 +247,12 @@ def load_hang_so(path):
         raise ValueError(f'hang_so nhanh_tick: {nt!r}, one of {NHANH_TICK} (O1 v11.33 SC-12: the tick part of U_t '
                          'kept or dropped, chosen before the C8 runs are scored; required when khoa_c8)')
     out['nhanh_tick'] = nt
+    mt = d.get('man_trap')                         # C8b v4 3: rolling shutter by row, column (phep 3b); none: one frame
+    if mt is not None:
+        if not isinstance(mt, dict) or not isinstance(mt.get('nguon'), str) or not mt['nguon'].strip():
+            raise ValueError('hang_so man_trap: {alpha_r_s_px, alpha_c_s_px, nguon} (C8b v4 3, phep 3b)')
+        mt = {k: _num(mt, k, -1e-3, 1e-3, 'hang_so man_trap') for k in ('alpha_r_s_px', 'alpha_c_s_px')}
+    out['man_trap'] = mt
     md = imu.get('mien_dong')
     if md is None and locked:
         raise ValueError('hang_so imu mien_dong: the locked range of U_IMU per level is required when khoa_c8')
@@ -1049,7 +1058,7 @@ def evaluate(t, x, y, psi, speed, wz, lane, hs, upsi_k, u_t):
                 lo[c][j] = min(lo[c][j], o1_gate.THRESHOLDS[c])
                 hi[c][j] = math.inf
         e_s = -((xw[j] - px) * math.cos(hc) + (yw[j] - py) * math.sin(hc))
-        rows.append(dict(t=float(tw[j]), x=float(xw[j]), y=float(yw[j]), psi=float(pw[j]), s_cmd=s_c,
+        rows.append(dict(t=float(tw[j]), iv=int(win[j]), x=float(xw[j]), y=float(yw[j]), psi=float(pw[j]), s_cmd=s_c,
                          s_car=r['s_car'], s_car_way1=way1[j]['s_car'], s_perp=r['s_perp'], e_perp=r['e_perp'],
                          e_trk=e_trk, e_bao=e_bao, e_theta_cmd_deg=math.degrees(eth),
                          e_theta_lane_deg=math.degrees(wrap(pw[j] - r['head'])), e_s=e_s, dist_end=float(d_end[j]),
@@ -1079,21 +1088,105 @@ def lost_output(task, reason, cause, **extra):
                 gate_v3=None, rule=f'O1 v11.28 3.3-3.5 (camera); {VERSION}', **extra)
 
 
+def anchor_window(anchor_s):
+    """--offset-anchor-s as (a0, a1): one command time T (the offset established at T, CS2-1) or a window A,B (C8b v4
+    3: the match window, the offset right at an unknown point of it); refused when missing, not finite or B < A."""
+    if isinstance(anchor_s, str):
+        try:
+            v = tuple(float(x) for x in anchor_s.split(','))
+        except ValueError:
+            v = ()
+    elif isinstance(anchor_s, (tuple, list)):
+        v = tuple(float(x) for x in anchor_s)
+    elif anchor_s is None:
+        v = ()
+    else:
+        v = (float(anchor_s),)
+    if len(v) == 1:
+        v = (v[0], v[0])
+    if len(v) != 2 or not all(math.isfinite(x) for x in v) or v[1] < v[0]:
+        raise ValueError(f'--offset-anchor-s {anchor_s!r}: T or A,B (command time [s] where --offset-s was established, '
+                         'finite, B >= A) (CS2-1, C8b v4 3)')
+    return v
+
+
+def shutter_bound(frames, mt, t_cmd, lo, hi):
+    """(rolling-shutter term of U_t [s], how) (C8b v4 3, C8B4R2-6, -9): without hang_so man_trap one frame (the
+    median frame interval of frames.csv); with man_trap {alpha_r_s_px, alpha_c_s_px} (measured by phep 3b, margin
+    already in) |alpha_r| x (row span) + |alpha_c| x (column span) of the car tag over the frames with the car seen
+    whose command time t_cmd is in [lo, hi] (the match window and the scored domain to t_deadline; the row, column
+    the offset belongs to is not known, C8B4-5). A column term without col_px in frames.csv: refused."""
+    if mt is None:
+        t = np.array([r['t_s'] for r in frames], float)
+        dt = np.diff(t)
+        dt = dt[np.isfinite(dt) & (dt > 0)]
+        if not dt.size:
+            raise ValueError('frames.csv: no frame interval for the rolling-shutter term (one frame)')
+        f = float(np.median(dt))
+        return f, f'one frame ({f * 1e3:.2f} ms, no man_trap in hang_so)'
+    sel = [r for r, tc in zip(frames, t_cmd) if r.get('car_seen') and lo <= tc <= hi]
+    out = 0.0
+    parts = []
+    for key, col in (('alpha_r_s_px', 'row_px'), ('alpha_c_s_px', 'col_px')):
+        a = abs(mt[key])
+        if a == 0.0:
+            continue
+        v = np.array([r.get(col, float('nan')) for r in sel], float)
+        if not v.size or not np.all(np.isfinite(v)):
+            raise ValueError(f'hang_so man_trap {key} != 0 needs {col} on every frame with the car seen in '
+                             f'[{lo:.3f}, {hi:.3f}] s (track again with c7_measure at this commit)')
+        span = float(v.max() - v.min())
+        out += a * span
+        parts.append(f'{a:g} s/px x {span:.1f} px ({col})')
+    return out, 'man_trap: ' + (' + '.join(parts) if parts else '0')
+
+
+GIO_FORMAT = 'c8b_gio_v1'
+
+
+def load_gio(path, nut):
+    """The time-grid file of the C8b script (c8b_gio_v1, CODE_C8B; interface 1 of CODE 17/11) at node nut: D =
+    nodes_s[nut] (t_log = t_cam + D), the match window cua_so_ghep_log_s [a, b] (ESP32 clock, s), the grid step (the
+    largest gap between adjacent nodes, 0 for one node). Refused unless moc_mau and ok are true, the nodes finite and
+    increasing, the window finite with a <= b, nut a node index."""
+    with open(path, encoding='utf-8') as f:
+        d = json.load(f, parse_constant=lambda c: (_ for _ in ()).throw(ValueError(f'{c} in {path}')))
+    if not isinstance(d, dict) or d.get('format', GIO_FORMAT) != GIO_FORMAT:
+        raise ValueError(f'{path}: not a {GIO_FORMAT} file')
+    if d.get('moc_mau') is not True or d.get('ok') is not True:
+        raise ValueError(f'{path}: moc_mau and ok must be true (C8b v4 3, 7: the match on sample marks, every check '
+                         f'passed): moc_mau {d.get("moc_mau")!r}, ok {d.get("ok")!r}')
+    nodes = d.get('nodes_s')
+    if not isinstance(nodes, list) or not nodes or not all(
+            isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) for x in nodes) \
+            or any(b <= a for a, b in zip(nodes[:-1], nodes[1:])):
+        raise ValueError(f'{path}: nodes_s must be finite numbers, increasing, not empty')
+    w = d.get('cua_so_ghep_log_s')
+    if not isinstance(w, list) or len(w) != 2 or not all(
+            isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) for x in w) or w[1] < w[0]:
+        raise ValueError(f'{path}: cua_so_ghep_log_s [a, b] finite, a <= b')
+    if isinstance(nut, bool) or not isinstance(nut, int) or not 0 <= nut < len(nodes):
+        raise ValueError(f'--nut {nut!r}: a node index 0..{len(nodes) - 1}')
+    step = max((b - a for a, b in zip(nodes[:-1], nodes[1:])), default=0.0)
+    return dict(file=os.path.basename(path), sha256=cm.sha256(path), nut=nut, D=float(nodes[nut]),
+                win_log_s=[float(w[0]), float(w[1])], step_s=float(step), n_nodes=len(nodes))
+
+
 def drift_bound(sync, offset_s, t0_s, deadline, troi_ppm, anchor_s=None):
     """(drift term of U_t [s], how) over the whole run window [0, t_deadline] (O1 3.5 SC-12; CS1-4, CS1-6). With C7b:
     rate = max(|offset_end - offset_start| / distance of the two third centres, troi_ppm) (troi_ppm alone when C7b is
     short, K1), times the largest distance from the centre of the C7b window to [0, t_deadline], plus the gap between
     the offset used (the fit of the whole window) and the offset interpolated at that centre (mean of the thirds).
-    With --offset-s (no C7b; CS2-1): the offset holds (within --offset-err-s, added to U_t by the caller) at the
-    command time anchor_s (--offset-anchor-s) where it was established; drift = troi_ppm x the largest distance from
-    anchor_s to [0, t_deadline]. No anchor: refused (the bound needs the time the offset was right at)."""
+    With --offset-s (no C7b; CS2-1): the offset holds (within --offset-err-s, added to U_t by the caller) at a point
+    of anchor_s (--offset-anchor-s: one command time, or the match window A,B of C8b v4 3); drift = troi_ppm x the
+    largest distance from any point of it to any point of [0, t_deadline]. No anchor: refused."""
     lim = troi_ppm * 1e-6
     if sync is None:
-        if anchor_s is None or not math.isfinite(anchor_s):
-            raise ValueError('--offset-s needs --offset-anchor-s (command time where the offset was established) and '
-                             '--offset-err-s (its error): the drift bound runs from that time (CS2-1)')
-        far = max(abs(anchor_s), abs(deadline - anchor_s))
-        return lim * far, (f'troi_ppm x {far:.3f} s from the offset anchor t = {anchor_s:.3f} s (--offset-s: no C7b '
+        a0, a1 = anchor_window(anchor_s)
+        # C8b v4 3 (C8B4R2-4): the offset is right at an unknown point of the match window [a0, a1]: the largest
+        # distance from any point of it to any point of [0, t_deadline]
+        far = max(abs(x - y) for x in (a0, a1) for y in (0.0, deadline))
+        return lim * far, (f'troi_ppm x {far:.3f} s from the offset window [{a0:.3f}, {a1:.3f}] s (--offset-s: no C7b '
                            'evidence for the camera / ESP32 clocks)')
     w0, w1 = sync.window_cam_s
     tc = 0.5 * (w0 + w1) + offset_s - t0_s
@@ -1170,7 +1263,7 @@ def old_shift_frames(frames):
 
 def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start=None, allow_final_set=False,
           sender=None, events=None, track_info=None, offset_anchor_s=None, offset_err_s=None, frames_sha256=None,
-          report_only=frozenset()):
+          report_only=frozenset(), gio=None):
     if task not in FIG8 and task not in FINAL_SET:
         raise ValueError(f'task {task!r}: one of {tuple(FIG8) + FINAL_SET}')
     # O1 v11.33 3.9 rule 2b: conditions only reported at the level of the run (from the C8 gate file; G1, G4 always
@@ -1183,13 +1276,15 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
         raise ValueError(f'{task} is the final test set (O1 3.7): only with --allow-final-set')
     if task in FINAL_SET and k_start is None:
         raise ValueError(f'{task}: give --k-start X,Y,HEAD_DEG (nominal start pose, locked at C8)')
+    if gio is not None and offset_s is not None:
+        raise ValueError('--gio-c8b and --offset-s: one clock source only')
     if offset_s is not None:
         if not offset_reason.strip():
             raise ValueError('--offset-s needs --offset-reason (C7b skipped)')
-        if offset_anchor_s is None or offset_err_s is None or not math.isfinite(offset_anchor_s) \
-                or not (math.isfinite(offset_err_s) and offset_err_s >= 0.0):
+        if offset_anchor_s is None or offset_err_s is None or not (math.isfinite(offset_err_s) and offset_err_s >= 0.0):
             raise ValueError('--offset-s needs --offset-anchor-s (command time [s] where the offset was established) '
                              'and --offset-err-s (its error [s], >= 0) (CS2-1)')
+        offset_anchor_s = anchor_window(offset_anchor_s)
     if old_shift_frames(frames) or (track_info or {}).get('shift_kind') == 'median_magnitude':
         raise ValueError('frames.csv holds the mark shift of the version before 17/11 (median of the lengths): the '
                          'camera-bumped decision needs the length of the median vector, which cannot be rebuilt from '
@@ -1211,7 +1306,9 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
         return lost_output(task, 'no valid camera frame in the clip', FAIL_MEAS, **base), []
     t_cam = np.array([r['t_s'] for r in frames])
     sync, sync_gyro = None, None
-    if offset_s is None:
+    if gio is not None:                                # C8b v4 3: a node of the C8b time grid, no o1_time_sync
+        offset_s = gio['D']
+    elif offset_s is None:
         sync, sync_gyro = clock_match(frames, rows, task)
         if not sync.ok:
             return lost_output(task, f'clock not matched (C7b): {sync.why}', FAIL_MEAS, **base), []
@@ -1219,17 +1316,31 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
     deadline = lane.Tcmd + T_LATE
     # drift up to t_deadline (SC-12); the --offset-s error at its anchor (CS2-1) adds to the C7b residual of the
     # constants [CACH HIEU: kept both, the larger bound]
-    drift, drift_src = drift_bound(sync, offset_s, t0_us / 1e6, deadline, hs['troi_ppm'], offset_anchor_s)
-    off_err = float(offset_err_s) if sync is None else 0.0
-    u_t_parts = dict(ghep_s=hs['u_t_ghep_s'], offset_err_s=off_err, drift_s=drift, drift_src=drift_src)
+    if gio is None:
+        drift, drift_src = drift_bound(sync, offset_s, t0_us / 1e6, deadline, hs['troi_ppm'], offset_anchor_s)
+        off_err = float(offset_err_s) if sync is None else 0.0
+        ghep, luoi, shut = hs['u_t_ghep_s'], 0.0, 0.0
+        u_t_parts = dict(ghep_s=ghep, offset_err_s=off_err, drift_s=drift, drift_src=drift_src)
+    else:
+        # C8b v4 3, table of U_t at a node (CODE 17/11, interface 1): grid step (whole step), drift from the match
+        # window (log clock) to the scored domain incl. t_deadline, rolling shutter; no C7b residual, no offset error
+        win = (gio['win_log_s'][0] - t0_us / 1e6, gio['win_log_s'][1] - t0_us / 1e6)     # command time
+        lim = hs['troi_ppm'] * 1e-6
+        far = max(abs(x - y) for x in win for y in (0.0, deadline))
+        drift, drift_src = lim * far, f'troi_ppm x {far:.3f} s from the match window [{win[0]:.3f}, {win[1]:.3f}] s'
+        ghep, off_err, luoi = 0.0, 0.0, gio['step_s']
+        shut, shut_src = shutter_bound(frames, hs.get('man_trap'), t_cam + offset_s - t0_us / 1e6,
+                                       min(win[0], 0.0), max(win[1], deadline))
+        u_t_parts = dict(ghep_s=0.0, offset_err_s=0.0, luoi_s=luoi, drift_s=drift, drift_src=drift_src,
+                         man_trap_s=shut, man_trap_src=shut_src)
 
     # O1 v11.33 SC-12 (OG2-1, OG3-4): the tick part leaves U_t only on the branch 'bo', which needs the clock match
     # on sample marks at their true times (C8b); without it that branch cannot score the run
     drop_tick = hs['nhanh_tick'] == 'bo'
-    if drop_tick and not (sync is not None and getattr(sync, 'moc_mau', False)):
+    if drop_tick and gio is None:
         raise ValueError('hang_so nhanh_tick bo: the tick part leaves U_t only with the clock match on sample marks at '
-                         'their true times (C8b, O1 v11.33 SC-12); this match is not ' +
-                         ('used (--offset-s)' if sync is None else 'available in o1_time_sync'))
+                         'their true times (C8b, O1 v11.33 SC-12): score at the nodes of the C8b grid (--gio-c8b); '
+                         'o1_time_sync and --offset-s do not carry it')
     u_t_parts['nhanh_tick'] = hs['nhanh_tick']
 
     def u_t_of(end_u):
@@ -1240,7 +1351,7 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
         u_t_parts.update(tick_s=tick, tick_to_s=end_u)
         if not math.isfinite(tick):
             return math.inf
-        return hs['u_t_ghep_s'] + off_err + drift + (0.0 if drop_tick else tick)
+        return ghep + off_err + luoi + drift + shut + (0.0 if drop_tick else tick)
     vi = [k for k, r in enumerate(frames) if r['valid']]
     t_log = t_cam[vi] + offset_s
     tv = t_log - t0_us / 1e6
@@ -1323,6 +1434,12 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
     note = (f'camera O1 v11.28; constants {hs["trang_thai"]} ({hs["file"]}); U_t = {u_t * 1e3:.1f} ms; '
             f'yaw check {"on" if yaw["compared"] else "off: " + yaw["reason"]}')
     gate = build_gate(per, dom_c, dom_u, lane, u_t, hs, g1, note)
+    # C8b v4 3 (CODE 17/11, interface 1): per frame its camera time (the key that joins a frame across the nodes of
+    # the C8b grid) and whether it is in the common / union domain at this node (cat_t1: the part before t1)
+    tcv = t_cam[vi]
+    for r, mc, mu in zip(prow, dom_c, dom_u):
+        r['t_cam_s'] = float(tcv[r.pop('iv')])
+        r['mien_chung'], r['mien_hop'] = int(bool(mc)), int(bool(mu))
     if cat:
         outcome, fail_cause = 'khong_dat', FAIL_VIOL
     elif reasons:
@@ -1368,10 +1485,12 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
                shift_drift_note=('quay lai clip H truoc luot sau (design 3.6)'
                                  if drift is not None and drift > hs['drift_px'] else ''),
                t0_log_us=t0_us, edge_log_seq=rows[i_edge]['_seq'], later_rises=later,
-               offset_s=offset_s, offset_src='--offset-s' if sync is None else 'o1_time_sync',
-               offset_reason=offset_reason if sync is None else '',
-               offset_anchor_s=offset_anchor_s if sync is None else None,
-               offset_err_s=offset_err_s if sync is None else None,
+               offset_s=offset_s,
+               offset_src='c8b_gio' if gio is not None else ('--offset-s' if sync is None else 'o1_time_sync'),
+               offset_reason=offset_reason if sync is None and gio is None else '',
+               offset_anchor_s=offset_anchor_s if sync is None and gio is None else None,
+               offset_err_s=offset_err_s if sync is None and gio is None else None,
+               gio_c8b=None if gio is None else {k: gio[k] for k in ('file', 'sha256', 'nut', 'D', 'win_log_s', 'step_s')},
                sync=None if sync is None else dict(corr=sync.corr, offset_start_s=sync.offset_start_s,
                                                     offset_end_s=sync.offset_end_s,
                                                     start_end_diff_s=sync.start_end_diff_s, short=sync.short,
@@ -1414,9 +1533,12 @@ def main(argv=None):
     ap.add_argument('--events', default=None, help='default <esp32>.events.txt when it exists')
     ap.add_argument('--offset-s', type=float, default=None, help='t_log = t_cam + D, skips o1_time_sync')
     ap.add_argument('--offset-reason', default='', help='why --offset-s is given')
-    ap.add_argument('--offset-anchor-s', type=float, default=None,
-                    help='command time [s] where --offset-s was established (drift bound from it, CS2-1)')
+    ap.add_argument('--offset-anchor-s', default=None,
+                    help='T or A,B: command time [s], or the match window, where --offset-s was established (drift '
+                         'bound from it, CS2-1; C8b v4 3)')
     ap.add_argument('--offset-err-s', type=float, default=None, help='error of --offset-s at its anchor [s]')
+    ap.add_argument('--gio-c8b', default=None, help='time-grid file of the C8b script (c8b_gio_v1): score at --nut')
+    ap.add_argument('--nut', type=int, default=None, help='node index of --gio-c8b (D = nodes_s[nut])')
     ap.add_argument('--k-start', default=None, help='X,Y,HEAD_DEG nominal start pose of K1/K2 (floor frame)')
     ap.add_argument('--allow-final-set', action='store_true')
     ap.add_argument('--out', default='')
@@ -1437,8 +1559,12 @@ def main(argv=None):
             with open(tj, encoding='utf-8') as f:
                 track_info = json.load(f)
         fsha = cm.sha256(a.frames)
+        if (a.gio_c8b is None) != (a.nut is None):
+            raise ValueError('--gio-c8b and --nut go together')
+        gio = load_gio(a.gio_c8b, a.nut) if a.gio_c8b else None
         out, rows = score(cm.read_frames(a.frames), a.esp32, a.task, hs, a.offset_s, a.offset_reason, ks,
-                          a.allow_final_set, a.sender, a.events, track_info, a.offset_anchor_s, a.offset_err_s, fsha)
+                          a.allow_final_set, a.sender, a.events, track_info, a.offset_anchor_s, a.offset_err_s, fsha,
+                          gio=gio)
         out.update(frames_file=os.path.basename(a.frames), frames_sha256=fsha,
                    esp32_file=os.path.basename(a.esp32), esp32_sha256=cm.sha256(a.esp32),
                    sender_file=os.path.basename(a.sender) if a.sender else None,

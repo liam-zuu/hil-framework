@@ -257,6 +257,7 @@ def test_bounds_use_U_p_and_U_t(tmp_path):
     assert abs((r['hi_g5'] - abs(r['e_theta_cmd_deg'])) - math.degrees(math.radians(2.0) + wk * ut)) < 1e-9
     assert out['U_t_parts']['drift_src'].startswith('troi_ppm')                 # --offset-s given
     assert abs(out['U_t_s'] - (0.005 + 0.0002 * out['t_deadline'] + 0.01)) < 1e-6
+    assert 'man_trap_s' not in out['U_t_parts'] and out['gio_c8b'] is None     # C8b v4 table only with --gio-c8b
 
 
 # ---------------------------------------------------------------- lost runs and the exception
@@ -1030,7 +1031,7 @@ def test_cs2_1_offset_needs_an_anchor_and_the_drift_runs_from_it(tmp_path):
     p = out['U_t_parts']
     assert p['drift_s'] == pytest.approx(1e-3 * (100.0 + dl))
     assert out['U_t_s'] == pytest.approx(p['ghep_s'] + 0.004 + p['drift_s'] + p['tick_s'])
-    assert out['offset_anchor_s'] == -100.0 and out['offset_err_s'] == 0.004
+    assert list(out['offset_anchor_s']) == [-100.0, -100.0] and out['offset_err_s'] == 0.004
     out, _ = run(tmp_path, hs_kw=dict(troi_ppm=1000.0), offset_anchor_s=2.0, offset_err_s=0.0)
     assert out['U_t_parts']['drift_s'] == pytest.approx(1e-3 * max(2.0, dl - 2.0))
 
@@ -1612,18 +1613,13 @@ def test_v11_33_drop_tick_needs_the_sample_mark_match(tmp_path, monkeypatch):
         run(tmp_path, offset_s=None, offset_reason='', hs_kw=dict(nhanh_tick='bo'))
 
 
-def test_v11_33_drop_tick_with_the_sample_mark_match(tmp_path, monkeypatch):
-    """Branch 'bo' with a match on sample marks (C8b; here a stand-in carrying moc_mau): U_t without the tick part,
-    the tick still measured (coverage of both ends, OG2-8)."""
-    import types
-    lane = lane_of('O1-F05')
-    sync, _ = _sync_fake(lane, OFFSET, 0.0)
-    s2 = types.SimpleNamespace(**vars(sync), moc_mau=True)
-    monkeypatch.setattr(cs, 'clock_match', lambda frames, rows, task: (s2, None))
-    out, _ = run(tmp_path, offset_s=None, offset_reason='', hs_kw=dict(nhanh_tick='bo'))
+def test_v11_33_drop_tick_with_the_sample_mark_match(tmp_path):
+    """Branch 'bo' at a node of the C8b grid (match on sample marks): U_t without the tick part, the tick still
+    measured (coverage of both ends, OG2-8)."""
+    out, _ = run_gio(tmp_path, hs_kw=dict(nhanh_tick='bo'))
     p = out['U_t_parts']
     assert p['nhanh_tick'] == 'bo' and math.isfinite(p['tick_s']) and p['tick_s'] > 0
-    assert out['U_t_s'] == pytest.approx(p['ghep_s'] + p['offset_err_s'] + p['drift_s'])
+    assert out['U_t_s'] == pytest.approx(p['luoi_s'] + p['drift_s'] + p['man_trap_s'])
 
 
 def test_v11_33_tick_branch_value_checked(tmp_path):
@@ -1655,3 +1651,109 @@ def test_v11_33_window_narrower_than_the_grid_uses_its_ends():
     v, w = cr.sup(a, a + 0.0004)
     ra, rb = lane.rate(a), lane.rate(a + 0.0004)
     assert v >= max(ra[0], rb[0]) and w >= max(ra[1], rb[1]) and v > 0.1
+
+
+# ---------------------------------------------------------------- C8b v4 3 (17/11): U_t at a node (--gio-c8b)
+NODES = [OFFSET - 0.002, OFFSET - 0.0015, OFFSET, OFFSET + 0.001]       # gaps 0.5, 1.5, 1.0 ms: step 1.5 ms
+
+
+def gio_file(tmp_path, **over):
+    d = dict(format='c8b_gio_v1', moc_mau=True, ok=True, nodes_s=NODES, cua_so_ghep_log_s=[T0 + 3.0, T0 + 9.0],
+             sha256={'esp32': 'e' * 64})
+    d.update(over)
+    p = tmp_path / 'gio.json'
+    p.write_text(json.dumps(d), encoding='utf-8')
+    return str(p)
+
+
+def run_gio(tmp_path, nut=2, gio_kw=None, **kw):
+    return run(tmp_path, offset_s=None, offset_reason='', gio=cs.load_gio(gio_file(tmp_path, **(gio_kw or {})), nut),
+               **kw)
+
+
+def test_c8b_node_u_t_table(tmp_path):
+    """At node 2 (D = OFFSET): U_t = whole grid step (largest gap, 1.5 ms) + troi_ppm x the farthest distance from the
+    match window [3, 9] s (command time) to [0, t_deadline] + rolling shutter (one frame) + tick; u_t_ghep_s and
+    --offset-err-s not added; o1_time_sync not run (offset_src c8b_gio)."""
+    out, _ = run_gio(tmp_path, hs_kw=dict(troi_ppm=1000.0, u_t_ghep_s=0.05))
+    p, dl = out['U_t_parts'], out['t_deadline']
+    assert out['offset_src'] == 'c8b_gio' and out['offset_s'] == OFFSET and out['gio_c8b']['nut'] == 2
+    assert p['luoi_s'] == pytest.approx(0.0015) and p['ghep_s'] == 0.0 and p['offset_err_s'] == 0.0
+    assert p['drift_s'] == pytest.approx(1e-3 * max(9.0, dl - 3.0))
+    assert p['man_trap_s'] == pytest.approx(1.0 / FPS)
+    assert out['U_t_s'] == pytest.approx(0.0015 + p['drift_s'] + p['man_trap_s'] + p['tick_s'])
+
+
+def test_c8b_node_scores_with_the_node_offset(tmp_path):
+    out, _ = run_gio(tmp_path, nut=0)
+    assert out['offset_s'] == NODES[0]
+
+
+@pytest.mark.parametrize('bad', [dict(moc_mau=False), dict(ok=False), dict(nodes_s=[]),
+                                 dict(nodes_s=[1.0, 1.0]), dict(cua_so_ghep_log_s=[2.0, 1.0]),
+                                 dict(cua_so_ghep_log_s=[1.0]), dict(format='x')])
+def test_c8b_bad_grid_file_refused(tmp_path, bad):
+    with pytest.raises(ValueError):
+        cs.load_gio(gio_file(tmp_path, **bad), 0)
+
+
+def test_c8b_node_index_and_one_clock_source(tmp_path):
+    with pytest.raises(ValueError, match='nut'):
+        cs.load_gio(gio_file(tmp_path), 4)
+    with pytest.raises(ValueError, match='one clock source'):
+        run(tmp_path, gio=cs.load_gio(gio_file(tmp_path), 0))         # run() gives --offset-s by default
+
+
+def test_c8b_one_node_has_no_grid_step(tmp_path):
+    out, _ = run_gio(tmp_path, nut=0, gio_kw=dict(nodes_s=[OFFSET]))
+    assert out['U_t_parts']['luoi_s'] == 0.0
+
+
+def test_c8b_shutter_by_row_and_column_spans(tmp_path):
+    """man_trap alpha_r 8e-6 s/px, alpha_c -2e-6 s/px (absolute value, C8B4R4-1): the term is |a_r| x row span +
+    |a_c| x column span of the car tag over the frames seen in [min(window, 0), max(window, t_deadline)]."""
+    fr = make_frames('O1-F05')
+    for k, r in enumerate(fr):
+        r['row_px'], r['col_px'] = 1000.0 + (k % 7), 2000.0 + 3 * (k % 5)
+    mt = dict(alpha_r_s_px=8e-6, alpha_c_s_px=-2e-6, nguon='test')
+    out, _ = run_gio(tmp_path, frames=fr, hs_kw=dict(man_trap=mt))
+    assert out['U_t_parts']['man_trap_s'] == pytest.approx(8e-6 * 6 + 2e-6 * 12)
+    for r in fr:
+        r['col_px'] = float('nan')
+    with pytest.raises(ValueError, match='col_px'):
+        run_gio(tmp_path, frames=fr, hs_kw=dict(man_trap=mt))
+    with pytest.raises(ValueError, match='man_trap'):
+        hs_file(tmp_path, man_trap=dict(alpha_r_s_px=8e-6, alpha_c_s_px=0.0))          # no nguon
+
+
+def test_c8b_one_frame_is_the_median_frame_interval(tmp_path):
+    """Every third frame 3 ms late: intervals 13.7 / 16.7 / 19.7 ms; one frame is the median, 16.7 ms."""
+    fr = make_frames('O1-F05')
+    for k, r in enumerate(fr):
+        if k % 3 == 0:
+            r['t_s'] += 0.003
+    out, _ = run_gio(tmp_path, frames=fr)
+    assert out['U_t_parts']['man_trap_s'] == pytest.approx(1.0 / FPS, abs=1e-6)
+
+
+def test_c8b_rows_carry_camera_time_and_domains(tmp_path):
+    """--rows for the grid merge: t_cam_s is the frame's own t_s (the join key across nodes), mien_chung <= mien_hop,
+    and the union-domain frames are the frames the gate counted."""
+    fr = make_frames('O1-F05')
+    out, rows = run_gio(tmp_path, frames=fr)
+    ts = {r['t_s'] for r in fr}
+    assert rows and all(r['t_cam_s'] in ts and 'iv' not in r for r in rows)
+    assert all(r['t_cam_s'] + OFFSET - T0 == pytest.approx(r['t'], abs=1e-9) for r in rows)
+    assert all(r['mien_chung'] <= r['mien_hop'] for r in rows)
+    assert sum(r['mien_hop'] for r in rows) == out['gate_v3']['g2']['n_frames']
+
+
+def test_c8b_rows_common_and_union_domains_differ(tmp_path, monkeypatch):
+    """As test_two_ways_of_using_suspects (common domain to way 1's t_done, union to the deadline): mien_chung marks
+    the scored frames up to t_end_common, mien_hop those up to t_end_union, so some frames are in the union only."""
+    lane = lane_of('O1-F05')
+    suspects_stub(monkeypatch, lambda tk: tk > lane.Tcmd - 0.5 and ((tk - lane.Tcmd) % 0.4) < 8.5 / FPS)
+    out, rows = run_gio(tmp_path, frames=make_frames('O1-F05'), hs_kw=dict(pred_half=30, gia_dinh_nghi_vi_tri='dung'))
+    assert out['t_end_common'] < out['t_end_union']
+    assert all(r['mien_chung'] == int(bool(r['scored']) and r['t'] <= out['t_end_common'] + 1e-12) for r in rows)
+    assert any(r['mien_hop'] and not r['mien_chung'] for r in rows)
