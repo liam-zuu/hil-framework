@@ -1953,10 +1953,33 @@ def test_v84_classify_point_steps(pt, bd, gate, thr, want):
     ('not_above', 0.04, 0.03, 0.01, True),              # 0.04 - 0.03 = 0.010000000000000002
     ('not_above', 0.04000000000001, 0.03, 0.01, False),  # 1e-14 m over
     ('not_above', 1.0 + 1e-13, 1.0, 0.0, False),        # threshold 0: higher is higher
+    # S84V3-1: exact, no tolerance at all
+    ('lower', 1.0, 1.0, 0.2 * 5e-16, False),            # equal, threshold about 1e-16
+    ('lower', 0.020000000000000007, 0.03, 0.01, False),  # 2 ULP short
+    ('not_above', 0.040000000000000015, 0.03, 0.01, False),  # 2 ULP over
+    ('not_above', 1.0000000000000002, 1.0, 0.0, False),  # 1 ULP over, threshold 0
+    ('lower', 0.0, 0.0, 5e-324, False),                 # zeros, the smallest positive threshold
+    ('lower', 0.0, 0.01, 0.01, True),
+    ('not_above', 0.0, 0.0, 0.0, True),
 ])
 def test_v84_bound_helpers(fn, x, ref, thr, want):
     f = s3.lower_by_at_least if fn == 'lower' else s3.not_above_by
     assert f(x, ref, thr) is want
+
+
+def test_v84_y3_threshold_exact():
+    """S84V3-1: the Y3 threshold is the exact 0.2 x tv_duty of the decimals (binary64 0.2 * 0.9 is
+    0.18000000000000002, 0.2 * 0.7 is 0.13999999999999999); non-finite stays non-finite."""
+    from fractions import Fraction
+    assert s3.y3_threshold(0.9) == Fraction('0.18') and s3.y3_threshold(0.7) == Fraction('0.14')
+    assert math.isnan(s3.y3_threshold(float('nan'))) and math.isinf(s3.y3_threshold(float('inf')))
+    t09 = {v: s3.y3_threshold(0.9) for v in GATE3}
+    t07 = {v: s3.y3_threshold(0.7) for v in GATE3}
+    # tv lower by exactly 0.2 x 0.9 = 0.18 at one speed: flag
+    assert s3.classify_point(_w(_all(tv=0.9), {0.8: _kr(tv=0.72)}), _all(tv=0.9), GATE3, t09) == ('cờ', 3, False)
+    # tv higher by exactly 0.2 x 0.7 = 0.14 at one speed is not worse: the e lower elsewhere flags
+    assert s3.classify_point(_w(_all(tv=0.7), {0.2: _kr(tv=0.84), 0.5: _kr(e=0.0, tv=0.7)}), _all(tv=0.7), GATE3,
+                             t07) == ('cờ', 3, False)
 
 
 def _kiem_rows(ctrl, grids, fn, mu=0.5):
@@ -2018,6 +2041,26 @@ def test_v84_check_totals_and_rows():
     assert (t['n_co'], t['n_chua_ket_luan'], t['n_khong_co'], t['n_chua_kiem']) == (1, 1, n_noi, 0)
     assert summ['PID']['co'] == [f'ki_xy={ki_noi[0]!r}']
     assert set(s3.KIEM_COLS) >= set(k for r in rows for k in r)
+
+
+def test_v84_check_y3_threshold_exact():
+    """S84V3-1: out_of_range_check takes the Y3 threshold as the exact 0.2 x tv_duty of the default run: with a
+    default tv_duty of 0.9 a point whose tv_duty is 0.18 lower at one speed is flagged (the binary64 product
+    0.18000000000000002 would miss it); the CSV column holds the float threshold."""
+    grids, levels, y3 = _kiem_setup()
+    y3 = {k: 0.9 for k in y3}
+    ki_noi = grids[('PID', 'ki_xy')][1]['noi']
+
+    def fn(name, x, v):
+        if name == 'ki_xy' and x == ki_noi[0] and v == 0.8:
+            return _kr(tv=0.72)
+        return _kr(tv=0.9)
+    rows, _ = s3.out_of_range_check(_kiem_rows('PID', grids, fn), levels, grids, FAKE_DEFAULTS, ['PID'],
+                                    list(s3.SPEEDS), 0.5, y3, None)
+    by = {(r['factor'], r['value']): r for r in rows if r['dong'] == 'diem'}
+    assert (by[('ki_xy', ki_noi[0])]['ket_qua'], by[('ki_xy', ki_noi[0])]['buoc']) == ('cờ', 3)
+    assert by[('ki_xy', ki_noi[0])]['nguong_tv_v0.8'] == 0.18 and type(by[('ki_xy', ki_noi[0])]['nguong_tv_v0.8']) is float
+    assert by[('ki_xy', ki_noi[1])]['ket_qua'] == 'không cờ'
 
 
 def test_v84_check_gate_speeds_only_and_bao_rieng():

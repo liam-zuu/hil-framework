@@ -423,22 +423,30 @@ def comparable(r):
             and math.isfinite(_num(r, 'e_perp_max')) and math.isfinite(_num(r, 'tv_duty')))
 
 
-def check_tol(x, ref, thr):
-    """Rounding of one binary64 subtraction against a threshold (S84-1, S84V2-1): the bounds of S03 v8.4 3.1 are
-    inclusive, and x - ref carries rounding (0.03 - 0.02 = 0.009999999999999998), so the comparison allows
-    2 ulp(max(|x|, |ref|)) + ulp(thr), the size of that rounding and no more (about 1e-17 m for e_perp_max near
-    0.03 m); a relative tolerance would widen the comparison (equal responses, threshold 1e-13: 'lower')."""
-    return 2.0 * math.ulp(max(abs(x), abs(ref))) + math.ulp(thr)
+def exact(x):
+    """S84-1, S84V2-1, S84V3-1: the bounds of S03 v8.4 3.1 are inclusive and compared exactly, with no tolerance, on
+    the decimal of each number as written in the CSV files (S03 writes a float as repr, the shortest decimal that
+    reads back to the same binary64): 0.03 - 0.02 is 0.01 (binary64 subtraction gives 0.009999999999999998), two
+    identical responses are never lower by a positive threshold, a point a few ULP past a bound is past it. A
+    Fraction is already exact."""
+    return x if isinstance(x, Fraction) else Fraction(repr(float(x)))
 
 
 def not_above_by(x, ref, thr):
-    """x - ref <= thr ('x not higher than ref by more than thr'), within the rounding of the subtraction."""
-    return x - ref <= thr + check_tol(x, ref, thr)
+    """x - ref <= thr ('x not higher than ref by more than thr'), exactly (see exact)."""
+    return exact(x) - exact(ref) <= exact(thr)
 
 
 def lower_by_at_least(x, ref, thr):
-    """ref - x >= thr ('x lower than ref by at least thr'), within the rounding of the subtraction."""
-    return ref - x >= thr - check_tol(x, ref, thr)
+    """ref - x >= thr ('x lower than ref by at least thr'), exactly (see exact)."""
+    return exact(ref) - exact(x) >= exact(thr)
+
+
+def y3_threshold(ref):
+    """S84V3-1: the Y3 threshold of the check, Y3_REL x tv_duty of the default-gain run (section 5.2), exactly
+    (0.2 x 0.9 is 0.18; the binary64 product is 0.18000000000000002). A non-finite tv_duty gives a non-finite
+    threshold (the point is inconclusive, step 2)."""
+    return exact(Y3_REL) * exact(ref) if math.isfinite(ref) else Y3_REL * ref
 
 
 def classify_point(pt, bd, gate, thr):
@@ -500,7 +508,7 @@ def out_of_range_check(sweep_rows, levels, grids, defaults_by, controllers, gate
                 L, H = lv[0], lv[1]
                 grid, info = grids[(ctrl, name)]
                 dflt = defaults_by[ctrl][name]
-                thr = {v: (Y3_REL * y3_ref[(ctrl, v)]) if (ctrl, v) in y3_ref else float('nan') for v in SPEEDS}
+                thr = {v: y3_threshold(y3_ref[(ctrl, v)]) if (ctrl, v) in y3_ref else float('nan') for v in SPEEDS}
                 for x in grid:
                     if L <= x <= H:
                         continue
@@ -518,7 +526,7 @@ def out_of_range_check(sweep_rows, levels, grids, defaults_by, controllers, gate
                                     f'e_diem_v{v}': p.get('e_perp_max', ''), f'tv_diem_v{v}': p.get('tv_duty', ''),
                                     f'y1_can_v{v}': b.get('completed', ''), f'status_can_v{v}': b.get('status', ''),
                                     f'e_can_v{v}': b.get('e_perp_max', ''), f'tv_can_v{v}': b.get('tv_duty', ''),
-                                    f'nguong_tv_v{v}': thr[v]})
+                                    f'nguong_tv_v{v}': float(thr[v])})      # CSV: the threshold as a float
                     rows.append(row)
                     n['n_diem_ngoai'] += 1
                     n['n_da_kiem'] += 1
@@ -1576,7 +1584,7 @@ interpretations:   # of this script, not written in S03 v8 / O1 v7; Liam or THES
   - "B81-3 (15/11, Liam CODE_FEAS 'code di'): the G1 fields of O1 3.5 last block and the common domain are written (G1_RUN_COLS after gate_outcome): t_done = t_end when completed 'true', t1 = first tracking-error frame, prog_before_t1 = progress strictly before t1, cond25_before_deadline = cond2_5_ever (o1_gate_eval.g1_fields_v7, from the evaluate_v7 summary, which is unchanged); G1 recomputed from them must agree with the state from completed (o1_gate.gate raises, so a run_error); one way of using the frames: g1_ways 1, g1_t_done_2 and g1_cat_t1 empty, _chung the same as the union; gate_version stays gate_v3.2 (tools/rq3_log.py accepts only that version)"
   - "v8.3: the sweep grid is the v8 grid (sweep_grid, unchanged; C12 keeps it for its box [a, b]) plus b r^k, k = 1..K, r = (b/a)^(1/10), K the smallest integer with r^K >= 10 (1 - 1e-9), found by a loop on r**k; omega_o is not extended (cap 48); v8.4: the extension still runs with the sweep, only for the out-of-range check; the level rule runs on the original grid (11 log points, the default, 0)"
   - "v8.3 (agreed with CODE_C13 15/11): luoi of the default value is mac_dinh even when it is on a log point, the (default check) and (default) rows are mac_dinh; L_nguon 'hết lưới dưới' when L is the lowest grid point and L > 0; v8.4: H_nguon 'hết lưới' when H = b, 'trần ω_o' instead for omega_o when b = 48; levels.csv keeps b_n (the extension end) for reference only"
-  - "v8.4 out-of-range check: a run is comparable when it exists, completed 'true', status 'ok' and its e_perp_max and tv_duty are finite; a point below L is put against the run at L, above H against H; the Y2 threshold is 0.01 m and the Y3 threshold 20 % of the default-gain run at the middle mu, same speed (section 5.2), a non-finite Y3 threshold makes the point inconclusive; the bounds are inclusive and compared within the rounding of one subtraction, 2 ulp(max(|x|, |ref|)) + ulp(threshold) (check_tol; S84-1, S84V2-1: 0.03 - 0.02 is 0.009999999999999998 in binary64, and two identical responses never count as lower by a positive threshold); bao_rieng = not flagged and, at one gate speed where both are comparable, e_perp_max lower by >= 0.01 m; buoc is the step of section 3.1 that matched"
+  - "v8.4 out-of-range check: a run is comparable when it exists, completed 'true', status 'ok' and its e_perp_max and tv_duty are finite; a point below L is put against the run at L, above H against H; the Y2 threshold is 0.01 m and the Y3 threshold 20 % of the default-gain run at the middle mu, same speed (section 5.2), a non-finite Y3 threshold makes the point inconclusive; the bounds are inclusive and compared exactly, with no tolerance, on the decimal of each number as written in the CSV (repr of the float), the Y3 threshold an exact product (S84-1, S84V2-1, S84V3-1: 0.03 - 0.02 is 0.01, not the binary64 0.009999999999999998; two identical responses never count as lower by a positive threshold; a point a few ULP past a bound is past it; the column nguong_tv holds the threshold as a float); bao_rieng = not flagged and, at one gate speed where both are comparable, e_perp_max lower by >= 0.01 m; buoc is the step of section 3.1 that matched"
   - "v8.4 out-of-range check totals: 'không kiểm' for every controller when S03 stopped at 3.1 (i) or (ii); 'đã kiểm đủ' when every factor of the controller has levels; else 'kiểm dở' (the sweep stopped part way): factors with levels are checked, every grid point (original and extension) of a factor without levels counts in n_chua_kiem, n_gain_chua_kiem counts those factors; every grid is computed before the first sweep run. A flagged point in any controller stops S03 before design.csv (exit code 2); inconclusive points without a flag are printed as a WARNING and S03 goes on"
   - "v8.2: the public sweep carries the G columns too (Liam 14/11 CODE_FEAS 'Co, mot cach cham'); G3-G5 are not responses of section 5"
 elapsed_s: {sweep_s}
