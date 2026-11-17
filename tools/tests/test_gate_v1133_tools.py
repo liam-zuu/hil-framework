@@ -216,3 +216,136 @@ def test_hil_score_gate_accepted_by_rq3_log(tmp_path, monkeypatch):
 def test_hil_score_cli_stage_without_gate_file(tmp_path):
     out = H.main(['--frame-log', str(tmp_path / 'x.npz'), '--task', 'O1-F08', '--stage', 'hil_check'])
     assert out == 2
+
+
+# ── design v2: the C8b time grid block 'luoi' (Liam 17/11 at CODE_GATE "Duyệt, code luôn (Recommended)"; the exception
+# before t1 "Khi mọi nút đều có (Recommended)") ──
+
+def _grid_gate(gf, g1_nut, hong=None, cat=None, nut_tam=None, base=None):
+    """A FAKE floor gate on a grid of len(g1_nut) nodes; the G1 fields of the gate are those of node nut_tam."""
+    g = base if base is not None else rl.floor_gate(_gate(gf, level='O1-F05', platform='HW', stage='screen', campaign='A-PID', th=3.0))
+    n = len(g1_nut)
+    k = n // 2 if nut_tam is None else nut_tam
+    g['luoi'] = dict(format='luoi_v1', gio_sha256='cd' * 32, n_nut=n, d_dau_s=0.010,
+                     d_cuoi_s=0.010 + 0.001 * (n - 1), buoc_max_s=0.001 if n > 1 else 0.0, nut_tam=k,
+                     g1_nut=list(g1_nut), hong_nut=list(hong or [False] * n), cat_nut=list(cat or [False] * n),
+                     g1_state=rl.luoi_g1(g1_nut))
+    st = g['luoi']['g1_state']
+    g['g1'].update(state=st, q={'dat': 'true', 'khong_dat': 'false'}.get(st, 'inconclusive'))
+    g.update(o1_gate.evaluate_outcomes(g, g['decide'], g['required']))
+    return g
+
+
+def _floor_run(d, task='O1-F05'):
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', task, str(rl.FIG8[task]), 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+
+
+@pytest.mark.parametrize('nodes, want', [(['dat'], 'dat'), (['chua_ket_luan'], 'chua_ket_luan'),
+                                         (['dat'] * 3, 'dat'), (['khong_dat'] * 3, 'khong_dat'),
+                                         (['dat', 'dat', 'khong_dat'], 'chua_ket_luan'),
+                                         (['khong_dat', 'chua_ket_luan', 'khong_dat'], 'chua_ket_luan')])
+def test_luoi_g1_rule(nodes, want):
+    assert rl.luoi_g1(nodes) == want
+
+
+def test_grid_run_g1_from_the_nodes_end_and_summary(ds):
+    d, gf, tmp = ds
+    _floor_run(d)
+    g = _grid_gate(gf, ['dat', 'dat', 'khong_dat'])                         # centre node dat, one node not
+    assert g['g1']['state'] == 'chua_ket_luan' and g['outcome_decide'] == 'chua_ket_luan'
+    with pytest.raises(rl.LogError, match='gate outcome chua_ket_luan'):
+        rl.end(d, 'dat', completed=1, results_dir=str(tmp), gate=g, gate_file=gf, queries=rl.fake_queries())
+    row = rl.end(d, 'chua_ket_luan', completed=1, results_dir=str(tmp), gate=g, gate_file=gf,
+                 queries=rl.fake_queries())
+    assert (row['luoi_g1_nut'], row['luoi_g1_state'], row['luoi_n_nut']) == ('ddk', 'chua_ket_luan', '3')
+    rl.summary(d, gate_file=gf)                                               # the row read back and recomputed
+
+
+def test_grid_g1_state_must_be_the_grid_one(ds):
+    d, gf, tmp = ds
+    _floor_run(d)
+    g = _grid_gate(gf, ['dat', 'dat', 'khong_dat'])
+    g['g1'].update(state='dat', q='true')
+    g.update(o1_gate.evaluate_outcomes(g, g['decide'], g['required']))
+    with pytest.raises(rl.LogError, match='grid gives'):
+        rl.end(d, 'dat', completed=1, results_dir=str(tmp), gate=g, gate_file=gf, queries=rl.fake_queries())
+
+
+def test_grid_centre_fields_must_match_their_node(ds):
+    d, gf, tmp = ds
+    _floor_run(d)
+    g = _grid_gate(gf, ['dat', 'khong_dat', 'dat'])                         # centre khong_dat, its fields say dat
+    with pytest.raises(rl.LogError, match='grid node nut_tam'):
+        rl.end(d, 'chua_ket_luan', completed=1, results_dir=str(tmp), gate=g, gate_file=gf,
+               queries=rl.fake_queries())
+
+
+def test_grid_every_node_lost_is_a_lost_run(ds):
+    d, gf, tmp = ds
+    _floor_run(d)
+    g = _grid_gate(gf, ['dat'] * 3, hong=[True] * 3)
+    with pytest.raises(rl.LogError, match='every grid node lost'):
+        rl.end(d, 'dat', completed=1, results_dir=str(tmp), gate=g, gate_file=gf, queries=rl.fake_queries())
+    row = rl.end(d, 'hong_he_do', completed=1, fail_cause='mat_khung_FAKE', results_dir=str(tmp), gate=g,
+                 gate_file=gf, queries=rl.fake_queries())
+    assert row['luoi_hong_nut'] == '111'
+
+
+def _cat_base(gf):
+    g = rl.floor_gate(_gate(gf, level='O1-F05', platform='HW', stage='screen', campaign='A-PID', th=3.0, e_trk=0.5),
+                      t_done=(None, None))
+    g['g1'].update(t1=6.0, cat_t1=True, state='chua_ket_luan', q='inconclusive')
+    return g
+
+
+def test_grid_exception_before_t1_only_when_every_node_has_it(ds):
+    d, gf, tmp = ds
+    _floor_run(d)
+    part = _grid_gate(gf, ['chua_ket_luan'] * 3, cat=[True, True, False], nut_tam=0, base=_cat_base(gf))
+    assert part['outcome_decide'] == 'khong_dat'                              # G3 certainly above D
+    with pytest.raises(rl.LogError, match='every node has it'):
+        rl.end(d, 'khong_dat', completed=1, fail_cause=rl.VIOL_BEFORE, results_dir=str(tmp), gate=part,
+               gate_file=gf, queries=rl.fake_queries())
+    full = _grid_gate(gf, ['chua_ket_luan'] * 3, cat=[True] * 3, base=_cat_base(gf))
+    row = rl.end(d, 'khong_dat', completed=1, fail_cause=rl.VIOL_BEFORE, results_dir=str(tmp), gate=full,
+                 gate_file=gf, queries=rl.fake_queries())
+    assert row['luoi_cat_nut'] == '111'
+    rl.summary(d, gate_file=gf)
+
+
+def test_grid_skips_the_one_domain_equality(ds):
+    d, gf, tmp = ds
+    g = rl.floor_gate(_gate(gf, level='O1-F05', platform='HW', stage='screen', campaign='A-PID', th=3.0))
+    g['g3']['chung']['lo'] = g['g3']['lo'] - 0.001                            # grid numbers: common below union
+    g['g3']['chung']['q'] = g['g3']['q'] - 0.001
+    with pytest.raises(rl.LogError, match='one frame domain'):
+        rl.validate_gate(g, 'HW')
+    rl.validate_gate(_grid_gate(gf, ['dat'] * 2, base=g), 'HW')
+
+
+@pytest.mark.parametrize('edit, msg', [
+    (lambda lb: lb.update(buoc_max_s=0.0015), 'buoc_max_s'),
+    (lambda lb: lb.update(d_cuoi_s=lb['d_dau_s'] + 0.005), 'buoc_max_s'),     # 3 nodes cannot cover 5 ms at 1 ms
+    (lambda lb: lb.update(n_nut=1, g1_nut=['dat'], hong_nut=[False], cat_nut=[False], nut_tam=0), 'd_dau_s'),
+    (lambda lb: lb.update(nut_tam=3), 'nut_tam'),
+    (lambda lb: lb.update(g1_nut=['dat', 'dat']), 'g1_nut'),
+    (lambda lb: lb.update(hong_nut=[0, 0, 0]), 'hong_nut'),
+    (lambda lb: lb.update(hong_nut=[True, False, False], cat_nut=[True, False, False]), 'both lost'),
+    (lambda lb: lb.update(gio_sha256='x'), 'gio_sha256'),
+    (lambda lb: lb.update(format='luoi_v0'), 'format'),
+    (lambda lb: lb.update(extra=1), 'exactly'),
+])
+def test_grid_block_refusals(ds, edit, msg):
+    d, gf, tmp = ds
+    g = _grid_gate(gf, ['dat'] * 3)
+    edit(g['luoi'])
+    with pytest.raises(rl.LogError, match=msg):
+        rl.validate_gate(g, 'HW')
+
+
+def test_grid_only_on_the_floor(ds):
+    d, gf, tmp = ds
+    g = _grid_gate(gf, ['dat'] * 3)
+    with pytest.raises(rl.LogError, match='floor gate|2 way'):          # refused either way
+        rl.validate_gate(g, 'HIL')

@@ -153,9 +153,19 @@ G1_COLS = ['g1_ways', 'g1_t_deadline', 'g1_t_done_1', 'g1_t_done_2', 'g1_t1', 'g
 # (tools/gate_c8.py, --gate-file of end / summary), never taken from the row: a row whose report-only list differs
 # from the file is an error. Empty in gate_v3.2 rows (all five required).
 GATE_V1133_COLS = ['gate_file_sha256', 'gate_report_only']
+# C8b time grid (CODE_GATE design v2 section 2; Liam 17/11 at CODE_GATE "Duyệt, code luôn (Recommended)", the exception
+# before t1 "Khi mọi nút đều có (Recommended)"): a floor gate scored on the nodes of the C8b time grid carries a block
+# 'luoi' (format luoi_v1): G1 per node, lost / exception-before-t1 per node; G1 of the run is recomputed from it
+# (luoi_g1), the G1 fields of the gate are those of node nut_tam. Columns luoi_* below, empty without a grid.
+LUOI_FORMAT = 'luoi_v1'
+LUOI_STEP_MAX_S = 1e-3                     # C8b v4 section 3: nodes at most 1 ms apart
+LUOI_COLS = ['luoi_gio_sha256', 'luoi_n_nut', 'luoi_d_dau_s', 'luoi_d_cuoi_s', 'luoi_buoc_max_s', 'luoi_nut_tam',
+             'luoi_g1_nut', 'luoi_hong_nut', 'luoi_cat_nut', 'luoi_g1_state']
+_G1_LETTER = {'dat': 'd', 'khong_dat': 'k', 'chua_ket_luan': 'c'}
 GATE_COLS = (['gate_version', 'gate_decide', 'gate_json_sha256', 'gate_u_t', 'g1_q', 'g1_state']
              + [f'{g}_{x}' for g in o1_gate.MEASURED for x in GATE_FIELDS]
-             + [f'{g}_{x}_chung' for g in o1_gate.MEASURED for x in DOMAIN_FIELDS] + G1_COLS + GATE_V1133_COLS)
+             + [f'{g}_{x}_chung' for g in o1_gate.MEASURED for x in DOMAIN_FIELDS] + G1_COLS + GATE_V1133_COLS
+             + LUOI_COLS)
 TUNING_COLS = TUNING_OLD + TUNING_NEW + GATE_COLS
 EFFORT_OLD = ['ngay', 'bat_dau', 'ket_thuc', 'gio', 'buoc', 'giai_doan', 'mot_lan_hay_thich_nghi', 'dut',
               'ghi_chu', 'chien_dich', 'lap_lai']
@@ -715,10 +725,20 @@ def _recompute(gate: dict, platform: Optional[str] = None, required=None) -> dic
     if q1 not in _G1_Q or gate['g1'].get('state') != o1_gate.g1_state(q1):
         raise LogError(f'gate g1: q {q1!r} and state {gate["g1"].get("state")!r} do not agree (O1 3.4 completed)')
     f1 = gate_g1_fields(gate['g1'], platform)                                   # B81-3
-    if f1 is not None and gate_g1_state(f1) != gate['g1']['state']:
-        raise LogError(f'gate g1: state {gate["g1"]["state"]!r}, recomputed from t_done, t1 and the flags: '
-                       f'{gate_g1_state(f1)!r} (O1 3.3, 3.5)')
-    one = domains_one(f1)
+    lb = None
+    if gate.get('luoi') is not None:                                            # C8b time grid (design v2)
+        if gate.get('version') != o1_gate.GATE_VERSION_V1133 or platform not in (None, 'HW') or f1 is None:
+            raise LogError('gate luoi: only in a gate_v3.3 floor gate with its G1 fields')
+        lb = check_luoi(gate['luoi'])
+        if gate['g1']['state'] != lb['g1_state']:
+            raise LogError(f'gate g1: state {gate["g1"]["state"]!r}, the grid gives {lb["g1_state"]!r} (luoi)')
+        if 'cat_t1' in gate['g1'] and bool(gate['g1'].get('cat_t1')) != lb['cat_nut'][lb['nut_tam']]:
+            raise LogError('gate g1 cat_t1: not that of the grid node nut_tam (luoi)')
+    want1 = gate['g1']['state'] if lb is None else lb['g1_nut'][lb['nut_tam']]
+    if f1 is not None and gate_g1_state(f1) != want1:
+        raise LogError(f'gate g1: state {want1!r}{" (grid node nut_tam)" if lb else ""}, recomputed from t_done, t1 '
+                       f'and the flags: {gate_g1_state(f1)!r} (O1 3.3, 3.5)')
+    one = domains_one(f1) and lb is None             # grid numbers are not those of one node (design v2 section 2)
     for c, thr in o1_gate.THRESHOLDS.items():
         union = _domain_nums(gate[c], c)
         com = _common_block(gate, c, union, one, platform)
@@ -727,6 +747,56 @@ def _recompute(gate: dict, platform: Optional[str] = None, required=None) -> dic
             raise LogError(f'gate {c}: state {gate[c].get("state")!r}, recomputed from lo of the common domain, '
                            f'hi and n_undef of the union: {st!r}')
     return o1_gate.evaluate_outcomes(gate, decide, req)
+
+
+def luoi_g1(states) -> str:
+    """G1 of a run on the C8b time grid (C8b v4 section 3, C8B4R5-1, -2): one node, its state; every node dat,
+    dat; every node khong_dat, khong_dat (then the state does not change between the two nodes of any cell); else
+    chua_ket_luan."""
+    states = list(states)
+    if len(states) == 1:
+        return states[0]
+    for st in ('dat', 'khong_dat'):
+        if all(x == st for x in states):
+            return st
+    return 'chua_ket_luan'
+
+
+def check_luoi(lb) -> dict:
+    """The grid block of a floor gate checked (design v2 section 2); returns it. LogError on any problem."""
+    keys = ('format', 'gio_sha256', 'n_nut', 'd_dau_s', 'd_cuoi_s', 'buoc_max_s', 'nut_tam', 'g1_nut', 'hong_nut',
+            'cat_nut', 'g1_state')
+    if not isinstance(lb, dict) or set(lb) != set(keys):
+        raise LogError(f'gate luoi: an object with exactly {keys}')
+    if lb['format'] != LUOI_FORMAT:
+        raise LogError(f'gate luoi format {lb["format"]!r}: {LUOI_FORMAT!r}')
+    sha = lb['gio_sha256']
+    if not isinstance(sha, str) or len(sha) != 64 or any(ch not in '0123456789abcdef' for ch in sha):
+        raise LogError(f'gate luoi gio_sha256 {sha!r}: 64 lowercase hex digits')
+    n = lb['n_nut']
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        raise LogError(f'gate luoi n_nut {n!r}: a whole number >= 1')
+    d0, d1 = _qnum(lb['d_dau_s'], 'luoi d_dau_s'), _qnum(lb['d_cuoi_s'], 'luoi d_cuoi_s')
+    st = _qnum(lb['buoc_max_s'], 'luoi buoc_max_s')
+    if math.isnan(d0) or math.isnan(d1) or math.isnan(st) or d0 > d1 or (n == 1) != (d0 == d1):
+        raise LogError(f'gate luoi: d_dau_s {d0!r} <= d_cuoi_s {d1!r}, equal exactly when n_nut = 1')
+    if st < 0.0 or st > LUOI_STEP_MAX_S or (n > 1 and (st == 0.0 or st * (n - 1) < d1 - d0 - 1e-12)):
+        raise LogError(f'gate luoi buoc_max_s {st!r}: the nodes are at most {LUOI_STEP_MAX_S} s apart and cover '
+                       f'[{d0!r}, {d1!r}] with {n} nodes (C8b v4 section 3)')
+    k = lb['nut_tam']
+    if isinstance(k, bool) or not isinstance(k, int) or not 0 <= k < n:
+        raise LogError(f'gate luoi nut_tam {k!r}: an index of the {n} nodes')
+    if not isinstance(lb['g1_nut'], list) or len(lb['g1_nut']) != n or any(x not in o1_gate.STATES
+                                                                         for x in lb['g1_nut']):
+        raise LogError(f'gate luoi g1_nut: {n} states of {o1_gate.STATES}')
+    for key in ('hong_nut', 'cat_nut'):
+        if not isinstance(lb[key], list) or len(lb[key]) != n or any(not isinstance(x, bool) for x in lb[key]):
+            raise LogError(f'gate luoi {key}: {n} booleans')
+    if any(h and c for h, c in zip(lb['hong_nut'], lb['cat_nut'])):
+        raise LogError('gate luoi: a node both lost to the measurement and with the exception before t1')
+    if lb['g1_state'] != luoi_g1(lb['g1_nut']):
+        raise LogError(f'gate luoi g1_state {lb["g1_state"]!r}: from g1_nut it is {luoi_g1(lb["g1_nut"])!r}')
+    return lb
 
 
 def gate_required(gate: dict, required=None) -> tuple:
@@ -812,6 +882,28 @@ def gate_from_row(row: dict) -> dict:
             raise LogError(f"{row.get('run_uid')}: gate_report_only: {exc}")
         g.update(report_only=ro, required=rq, gate_file_sha256=row.get('gate_file_sha256') or None,
                  level=row.get('trajectory') or None)
+        if row.get('luoi_n_nut', ''):                                           # C8b grid (design v2)
+            letters = {v: k for k, v in _G1_LETTER.items()}
+
+            def bits(k):
+                s_ = row.get(k, '')
+                if any(ch not in '01' for ch in s_):
+                    raise LogError(f"{row.get('run_uid')}: {k} {s_!r}: 0 / 1 per node")
+                return [ch == '1' for ch in s_]
+            try:
+                g['luoi'] = dict(format=LUOI_FORMAT, gio_sha256=row.get('luoi_gio_sha256', ''),
+                                 n_nut=int(row['luoi_n_nut']), d_dau_s=num(row.get('luoi_d_dau_s')),
+                                 d_cuoi_s=num(row.get('luoi_d_cuoi_s')), buoc_max_s=num(row.get('luoi_buoc_max_s')),
+                                 nut_tam=int(row.get('luoi_nut_tam', '')),
+                                 g1_nut=[letters[ch] for ch in row.get('luoi_g1_nut', '')],
+                                 hong_nut=bits('luoi_hong_nut'), cat_nut=bits('luoi_cat_nut'),
+                                 g1_state=row.get('luoi_g1_state', ''))
+            except (KeyError, ValueError) as exc:
+                raise LogError(f"{row.get('run_uid')}: luoi columns: {exc}")
+        elif any(row.get(c) for c in LUOI_COLS):
+            raise LogError(f"{row.get('run_uid')}: luoi_* columns without luoi_n_nut")
+    elif any(row.get(c) for c in LUOI_COLS):
+        raise LogError(f"{row.get('run_uid')}: luoi_* columns on a {row.get('gate_version')!r} row")
     elif row.get('gate_file_sha256') or row.get('gate_report_only'):
         raise LogError(f"{row.get('run_uid')}: gate_file_sha256 / gate_report_only on a "
                        f"{row.get('gate_version')!r} row")
@@ -1321,6 +1413,14 @@ def gate_columns(gate: dict, gate_sha256: str = '') -> dict:
            'g1_q': str(gate['g1'].get('q')), 'g1_state': gate['g1'].get('state', ''),
            'gate_file_sha256': gate.get('gate_file_sha256') or '',                       # O1 v11.33
            'gate_report_only': ','.join(gate.get('report_only') or [])}
+    lb = gate.get('luoi')                                                          # C8b grid (design v2)
+    out.update({c: '' for c in LUOI_COLS})
+    if lb is not None:
+        out.update(luoi_gio_sha256=lb['gio_sha256'], luoi_n_nut=str(int(lb['n_nut'])), luoi_d_dau_s=_num(lb['d_dau_s']),
+                   luoi_d_cuoi_s=_num(lb['d_cuoi_s']), luoi_buoc_max_s=_num(lb['buoc_max_s']),
+                   luoi_nut_tam=str(int(lb['nut_tam'])), luoi_g1_nut=''.join(_G1_LETTER[x] for x in lb['g1_nut']),
+                   luoi_hong_nut=''.join('1' if x else '0' for x in lb['hong_nut']),
+                   luoi_cat_nut=''.join('1' if x else '0' for x in lb['cat_nut']), luoi_g1_state=lb['g1_state'])
     def cell(v):
         return '' if v is None or (isinstance(v, float) and math.isnan(v)) else _num(v)
 
@@ -1349,6 +1449,16 @@ def viol_before_problem(outcome: str, fail_cause: str, gate: Optional[dict]) -> 
     """O1 3.5 R2V-4 (B81-3): the floor exception before t1 is khong_dat with fail cause VIOL_BEFORE and a gate whose
     G1 has cat_t1 true; one without the other is an error."""
     g1 = (gate or {}).get('g1') or {}
+    lb = (gate or {}).get('luoi')
+    if lb is not None:                         # C8b grid (design v2 section 2 points 4, 5; Liam 17/11)
+        cat = all(lb['cat_nut'])
+        if cat != (fail_cause == VIOL_BEFORE) or (cat and outcome != 'khong_dat'):
+            return (f'grid with the exception before t1 at {sum(lb["cat_nut"])} of {lb["n_nut"]} nodes, outcome '
+                    f'{outcome!r}, fail cause {fail_cause!r}: khong_dat with {VIOL_BEFORE} exactly when every node '
+                    'has it (Liam 17/11 at CODE_GATE)')
+        if all(lb['hong_nut']) and outcome != 'hong_he_do':
+            return f'every grid node lost to the measurement: the run is hong_he_do, not {outcome} (C8b v4 section 3)'
+        return None
     cat = bool(g1.get('cat_t1'))
     if cat != (fail_cause == VIOL_BEFORE) or (cat and outcome != 'khong_dat'):
         return (f'cat_t1 {cat} with outcome {outcome!r}, fail cause {fail_cause!r}: the floor exception before t1 is '

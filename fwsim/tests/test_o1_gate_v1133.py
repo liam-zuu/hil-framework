@@ -87,6 +87,40 @@ def test_cmd_rate_frames_bound_and_ends():
     assert max(vk) < v or math.isclose(max(vk), v)
 
 
+def _cam_cmd_rates():
+    """CODE_CAM's CmdRates and lanes of tools/c7_score.py (hil feat/c7-score-o1), or None before that branch is in
+    (CODE 17/11: two copies, no import from the scorer at run time; this test only compares them)."""
+    sys.path.insert(0, os.path.join(HERE, '..', '..', 'tools'))
+    try:
+        import c7_score as C
+    except Exception:                                    # noqa: BLE001  (not on this branch, or its deps missing)
+        return None
+    return C if all(hasattr(C, n) for n in ('CmdRates', 'Fig8Task', 'KTask')) else None
+
+
+@pytest.mark.parametrize('task', ['O1-F02', 'O1-F05', 'O1-F08', 'O1-K1', 'O1-K2'])
+def test_cmd_rate_frames_matches_the_camera_scorer(task):
+    """Design v2 section 3: o1_gate.cmd_rate_frames and CODE_CAM CmdRates on every O1 task at several U_t: both upper
+    bounds of the sup on a 1 us grid, and apart by no more than their two grid margins."""
+    C = _cam_cmd_rates()
+    if C is None:
+        pytest.skip('tools/c7_score.py without CmdRates (before feat/c7-score-o1 is merged)')
+    fig8 = task in OT.FIG8
+    lane = C.Fig8Task(task) if fig8 else C.KTask(task, (0.0, 0.0, 0.0))
+    cam = C.CmdRates(lane)
+    t_cmd, f = OT.task(task, allow_final_set=True)
+    cap = G.fig8_cmd_max(O.Schedule(OT.FIG8[task])) if fig8 else (OT.K_V * 10.0, 0.0)
+    t = np.linspace(-0.05, t_cmd + 0.05, 37)
+    for u in (0.0, 0.005, 0.014, 0.030):
+        vk, wk = G.cmd_rate_frames(f, t_cmd, t, u, turn=fig8, v_cap=cap[0], wz_cap=cap[1] if fig8 else None)
+        for k, tk in enumerate(t):
+            cv, cw = cam.sup(tk - u, tk + u)
+            ts, tw = _true_sup(f, t_cmd, tk, u, fig8)
+            assert vk[k] >= ts - 1e-12 and cv >= ts - 1e-12, (task, u, tk)
+            assert wk[k] >= tw - 1e-12 and cw >= tw - 1e-12, (task, u, tk)
+            assert abs(vk[k] - cv) <= cam.pad[0] + 2e-3 and abs(wk[k] - cw) <= cam.pad[1] + 2e-2, (task, u, tk)
+
+
 def test_cmd_rate_frames_k_tasks_no_turn():
     t_cmd, f = OT.task('O1-K2', allow_final_set=True)
     t = np.linspace(-0.5, t_cmd + 0.5, 40)
