@@ -594,8 +594,10 @@ def test_the_constants_file_is_required_and_checked(tmp_path, capsys):
     base = ['--frames', str(tmp_path / 'frames.csv'), '--log', lp, '--out', str(tmp_path / 'p.csv')]
     with pytest.raises(SystemExit):
         V.main(base)
+    imu = json.loads(open(hang_so(tmp_path, name='ok.json'), encoding='utf-8').read())['imu']
     for k, over in enumerate((dict(t_trong_s=0.68), dict(version='x'), dict(duong_lenh=[]), dict(imu=[]),
-                              dict(imu=dict(U_IMU_deg=[1.0])))):            # S2H1-1: wrong structure too
+                              dict(imu=dict(imu, U_IMU_deg=[1.0])),        # S2H1-1: wrong structure too
+                              dict(U_p_m=10 ** 400))):                      # S2H2-1: an integer too large for a float
         hs = hang_so(tmp_path, name=f'bad{k}.json', **over)
         assert V.main(base + ['--hang-so', hs]) == 2
         assert '#ket_qua,ma=2' in capsys.readouterr().out
