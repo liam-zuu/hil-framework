@@ -461,14 +461,15 @@ def test_cs2_6_undecided_neighbours_and_the_neighbour_count():
 
 def _old_csv(path, rows):
     """A frames.csv as the version before CS1-17 wrote it: 6 decimals, no res_sim_m value."""
+    cols = [c for c in cm.FRAME_COLS if c != 'col_px']        # that version had no col_px (C8b v4, 17/11)
     with open(path, 'w', newline='', encoding='utf-8') as f:
         w = csv.writer(f)
-        w.writerow(cm.FRAME_COLS)
+        w.writerow(cols)
         for r in rows:
             w.writerow(['' if c in ('res_sim_m', 'shift_mag_px') else
                         ('|'.join(r[c]) if c == 'why' else (int(r[c]) if isinstance(r[c], bool) else
                                                             (f'{r[c]:.6f}' if isinstance(r[c], float) else r[c])))
-                        for c in cm.FRAME_COLS])
+                        for c in cols])
 
 
 def test_cs2_7_a_regate_of_a_regate_keeps_the_rounding(tmp_path):
@@ -630,3 +631,22 @@ def test_cs4_2_one_column_off_the_grid_is_refused(res_m, scale):
     rows = [dict(base, idx=k, t_s=0.01 * k, res_m=res_m, scale=scale) for k in range(9)]
     with pytest.raises(ValueError, match='CS4-2'):
         cm.regate(rows, dict(car_side_m=0.1444, rms_px_H=0.3))
+
+
+# ---------------------------------------------------------------- C8b v4 3 (17/11): col_px for the rolling shutter term
+def test_c8b_col_px_is_the_mean_column_of_the_car_tag(session, run_clip):
+    video, _ = run_clip
+    rows, _ = cm.track(video, session, tag_offset=OFFSET, max_frames=4)
+    seen = [r for r in rows if r['car_seen']]
+    assert seen and all(math.isfinite(r['col_px']) and math.isfinite(r['row_px']) for r in seen)
+    assert all(math.isnan(r['col_px']) for r in rows if not r['car_seen'])
+    assert len({round(r['col_px'], 3) for r in seen}) > 1 or len(seen) == 1     # follows the car
+
+
+def test_c8b_frames_file_without_col_px_reads_nan(tmp_path):
+    p = tmp_path / 'frames.csv'
+    cols = [c for c in cm.FRAME_COLS if c != 'col_px']
+    vals = {'idx': '0', 'valid': '1', 'car_seen': '1', 'n_marks': '24', 'why': ''}
+    p.write_text(','.join(cols) + '\n' + ','.join(vals.get(c, '0.5') for c in cols) + '\n', encoding='utf-8')
+    r = cm.read_frames(str(p))[0]
+    assert math.isnan(r['col_px']) and r['row_px'] == 0.5

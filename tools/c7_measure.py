@@ -590,7 +590,7 @@ def track(video, session, tag_offset=None, max_frames=None, progress=None, gates
         r = dict(idx=k, t_s=t, n_marks=len(used), rms_px=float('nan'), shift_px=float('nan'), cam_z=float('nan'),
                  shift_mag_px=float('nan'), car_seen=False, x=float('nan'), y=float('nan'), psi=float('nan'), tag_x=float('nan'),
                  tag_y=float('nan'), res_m=float('nan'), res_sim_m=float('nan'), scale=float('nan'),
-                 scale_ref=float('nan'), row_px=float('nan'),
+                 scale_ref=float('nan'), row_px=float('nan'), col_px=float('nan'),
                  vx=float('nan'), vy=float('nan'), wz=float('nan'), speed=float('nan'))
         sh = [d[i].mean(axis=0) - ref[i] for i in used if i in ref]
         if sh:
@@ -604,6 +604,7 @@ def track(video, session, tag_offset=None, max_frames=None, progress=None, gates
             r.update(car_pose(cam, d[CAR_ID], side, kappa, plumb, off))
             r['car_seen'] = True
             r['row_px'] = float(d[CAR_ID][:, 1].mean())
+            r['col_px'] = float(d[CAR_ID][:, 0].mean())      # C8b v4 3: rolling shutter by row and column
         rows.append(r)
         if progress and k % 100 == 0:
             progress(k)
@@ -627,7 +628,7 @@ def _cam_z_drift(rows, zc_h):
 
 FRAME_COLS = ('idx', 't_s', 'valid', 'why', 'n_marks', 'rms_px', 'shift_px', 'cam_z', 'car_seen', 'x', 'y', 'psi',
               'tag_x', 'tag_y', 'res_m', 'res_sim_m', 'scale', 'scale_ref', 'row_px', 'vx', 'vy', 'wz', 'speed',
-              'shift_mag_px')
+              'shift_mag_px', 'col_px')      # col_px: C8b v4 3 (17/11); a file without it reads NaN
 FINE_COLS = ('res_m', 'res_sim_m', 'scale', 'scale_ref')     # written with 10 decimals (CS1-17); older files: 6
 
 
