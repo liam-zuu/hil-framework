@@ -1860,6 +1860,8 @@ def test_vg1_1_grid_file_of_another_log_or_other_frames_is_refused(tmp_path):
     gio = cs.load_gio(gio_file(tmp_path, cm.sha256(log)), 2, cm.sha256(log), FSHA)
     with pytest.raises(ValueError, match='VG1-1'):          # the frames scored not tied to the grid file
         run(tmp_path, offset_s=None, offset_reason='', gio=gio)
+    with pytest.raises(ValueError, match='VG1-1'):          # Codex VG2-2: other frames (valid hash), the right log
+        run(tmp_path, offset_s=None, offset_reason='', gio=gio, frames_sha256='a' * 64)
     with pytest.raises(ValueError, match='VG1-1'):          # another log scored with this grid (one duplicate line)
         run(tmp_path, offset_s=None, offset_reason='', gio=gio, frames_sha256=FSHA, log_kw=dict(dup=1))
     out, _ = run_gio(tmp_path)
@@ -1944,29 +1946,39 @@ def test_kt4_report_only_through_score_on_a_figure_8(tmp_path):
 
 
 def _fd_sup(lane, a, b, n=3001):
-    """Oracle independent of lane.rate (Codex P3, KT5): the largest |dp|/dt and |dpsi|/dt of the COMMAND itself
-    (figure 8: path_point at the schedule's tau, heading unwrapped; K: the command point at s_cmd) between adjacent
-    points of a fine grid of [a, b] cut to [0, T_cmd]. By the mean-value bound each is at most the sup of the true
-    rate over [a, b], so a correct upper bound is never below it."""
+    """Oracle independent of lane.rate (Codex P3, KT5), from the COMMAND itself on [a, b] cut to [0, T_cmd]; each value
+    is at most the sup of the true rate over [a, b] on that window, so a correct upper bound is never below it.
+    Figure 8: the largest |dp|/dt, |dpsi|/dt between adjacent points of a fine grid, p and psi from path_point at the
+    ANALYTIC tau(t) of the schedule (heading unwrapped): the chord over a step is at most the sup of the derivative
+    over that step. K (Codex VG2-1): o1_lanes.KSchedule.s_cmd interpolates a trapezoid table of step 1e-4 s linearly,
+    so two points inside one cell give the cell's mean speed, which can exceed the sup over a narrow window; the
+    oracle therefore takes ds/dt only between adjacent TABLE NODES inside [a, b]: a trapezoid cell's slope is the
+    mean of the speeds at its two nodes, at most the larger of them, so at most the sup over that cell; no heading
+    (the K reference heading is the fixed start heading, W = 0; the lane heading of the table is not it). Fewer than
+    two nodes inside: (0, 0), nothing to compare."""
     a, b = max(a, 0.0), min(b, lane.Tcmd)
     if not b > a:
         return 0.0, 0.0
-    tt = np.linspace(a, b, n)
     if isinstance(lane, cs.Fig8Task):
+        tt = np.linspace(a, b, n)
         P = np.array([cs.path_point(lane.sch.tau(float(t))[0]) for t in tt])
-    else:
-        P = np.array([lane.command(float(t))[1:] for t in tt])
-    dt = np.diff(tt)
-    v = np.hypot(np.diff(P[:, 0]), np.diff(P[:, 1])) / dt
-    w = np.abs(np.diff(np.unwrap(P[:, 2]))) / dt
-    return float(v.max()), float(w.max())
+        dt = np.diff(tt)
+        v = np.hypot(np.diff(P[:, 0]), np.diff(P[:, 1])) / dt
+        w = np.abs(np.diff(np.unwrap(P[:, 2]))) / dt
+        return float(v.max()), float(w.max())
+    m = (lane.sch._t >= a) & (lane.sch._t <= b)
+    tt, ss = lane.sch._t[m], lane.sch._s[m]
+    if len(tt) < 2:
+        return 0.0, 0.0
+    return float(np.max(np.diff(ss) / np.diff(tt))), 0.0
 
 
 @pytest.mark.parametrize('task', ['O1-F02', 'O1-F05', 'O1-F08', 'O1-K1', 'O1-K2'])
 def test_v11_33_cmd_rates_against_a_finite_difference_oracle(task):
-    """KT5: V_k, W_k never below the finite-difference oracle (independent of rate()) and at most 2 % of the peak above
-    it, on random windows, windows at 0 and T_cmd, windows across a +-pi wrap of the figure-8 heading, very narrow
-    windows (0.5 ms, as U_t near 0) and U_t = 0 (a single instant: at least the oracle over +-1 us). K: W = 0."""
+    """KT5: on the windows tried here (not a proof for the whole schedule), V_k, W_k never below the finite-difference
+    oracle (independent of rate(), _fd_sup) and at most 2 % of the peak above it: random windows, windows at 0 and
+    T_cmd, windows across a +-pi wrap of the figure-8 heading, very narrow windows (0.5 ms, as U_t near 0), and for
+    the figure 8 U_t = 0 (a single instant: at least the oracle over +-1 us). K: W = 0 (fixed start heading)."""
     lane = lane_of(task, K1S if task.startswith('O1-K') else None)
     cr = cs.CmdRates(lane)
     vmax, wmax = lane.cmd_max
@@ -1978,6 +1990,8 @@ def test_v11_33_cmd_rates_against_a_finite_difference_oracle(task):
         jumps = np.nonzero(np.abs(np.diff(hc)) > math.pi)[0]
         assert len(jumps)                                    # the wrapped heading does cross +-pi
         starts += [float(tt[j]) - 0.02 for j in jumps[:3]]
+    else:
+        starts += [0.50001]        # Codex VG2-1: the window [0.50001, 0.50051] s inside the K1 ramp-down of a side
     for a in starts:
         for width in (0.0005, 0.04):
             v, w = cr.sup(a, a + width)
@@ -1987,10 +2001,12 @@ def test_v11_33_cmd_rates_against_a_finite_difference_oracle(task):
                 assert w >= ow - 1e-9 and w <= ow + 0.02 * wmax, (task, a, width, w, ow)
             else:
                 assert w == 0.0
+    if not isinstance(lane, cs.Fig8Task):
+        return                     # K: no table node within +-1 us of an instant (VG2-1), U_t = 0 not compared
     for a in rng.uniform(0.01, lane.Tcmd - 0.01, 6):
         v, w = cr.sup(a, a)                                  # U_t = 0
         ov, ow = _fd_sup(lane, a - 1e-6, a + 1e-6, n=3)
-        assert v >= ov * (1 - 1e-6) - 1e-9 and (w >= ow * (1 - 1e-6) - 1e-9 or not isinstance(lane, cs.Fig8Task))
+        assert v >= ov * (1 - 1e-6) - 1e-9 and w >= ow * (1 - 1e-6) - 1e-9
 
 
 def test_kt6_drop_tick_still_needs_the_log_over_the_domain(tmp_path):
