@@ -45,7 +45,9 @@ One row per (controller, fault case), each against the baseline of the same cont
       its rectangle, then the first step after it with no hub inside while the row is on (s15 by position, the
       step each side enters, design 11.4), from the plant record (fwsim faults_plant.csv, steps from 0; bench
       <frames>_plant_faults.npz, steps - t0) and the hub positions of rpi5/fault_plant.contact_points with the
-      nominal lx, ly of rpi5/params.py.
+      nominal lx, ly of rpi5/params.py;
+      pwm_mean, base_pwm_mean: mean |pwm| of the four wheels over the same span as sat_frac (s14: the extra
+      effort a body load asks for; firmware PWM units, PWM_MAX = 1000).
     The iBUS loss columns (t_motor_off / t_motor_on against the window) come with the H7 part of ibus_loss: the
     firmware sets run_active = motor on && AUTO && trajectory fresh (AGV 5bde4c5 src/main.c:611), so a loss
     longer than 50 ms drops run_active inside [0, duration) and this bench table refuses such a run today.
@@ -231,6 +233,11 @@ def wheel_sat(pw_f, pw_b):
     return out
 
 
+def pwm_mean(pw_f, pw_b):
+    """Batch 2 (s14): mean |pwm| of the four wheels over the span; pw_* = |pwm| columns FL, FR, RL, RR."""
+    return dict(pwm_mean=float(np.mean(pw_f)), base_pwm_mean=float(np.mean(pw_b)))
+
+
 def _first_row(rows, fault):
     for i, r in enumerate(rows):
         if r['fault'] == fault:
@@ -332,6 +339,7 @@ def row_for(mode, case, f, base):
     out.update(ramp_split(rows, t, err(lf), err(lb)))
     plant = None if f['plant'] is None else (f['plant'][0], f['plant'][1])     # fwsim steps count from 0 = t0
     out.update(zone_times(rows, plant))
+    out.update(pwm_mean(pw(lf), pw(lb)))
     return out
 
 
@@ -426,16 +434,21 @@ def _run_args(args):
 
 
 def task_duration(args):
-    """(task id, duration [s]) of a bench run: the --test task (as run_hil.py reads it) of rpi5/fault_tasks.py
-    + TAIL_S (the task then STOPPING of --finite-run, as fault_run.py's task + TAIL_S; RUN itself runs a little
-    longer, docstring)."""
+    """(task id, duration [s]) of a bench run: the --test task (as run_hil.py reads it) + TAIL_S (the task then
+    STOPPING of --finite-run, as fault_run.py's task + TAIL_S; RUN itself runs a little longer, docstring). The
+    tasks fwsim/fault_run.py task_setpoint takes (design 2026-11-15 14.9 G1): A-W1 of rpi5/fault_tasks.py, or a
+    group A test on the ground (rpi5/trajectory_pub.GROUP_A, not LIFTED_TESTS) with its spec duration."""
     task = run_options(args).get('test')
     if not task:
         raise TableError(f'run args {args!r}: no --test task')
     import fault_tasks
-    if task not in fault_tasks.TASKS:
-        raise TableError(f'--test {task}: not a fault task of rpi5/fault_tasks.py ({sorted(fault_tasks.TASKS)})')
-    return task, fault_tasks.TASKS[task][0] + TAIL_S
+    if task in fault_tasks.TASKS:
+        return task, fault_tasks.TASKS[task][0] + TAIL_S
+    from trajectory_pub import GROUP_A, LIFTED_TESTS
+    if task not in GROUP_A or task in LIFTED_TESTS:
+        raise TableError(f'--test {task}: not a fault task ({sorted(fault_tasks.TASKS)} or a group A test on the '
+                         f'ground)')
+    return task, GROUP_A[task].duration + TAIL_S
 
 
 def read_esp(path):
@@ -723,6 +736,7 @@ def bench_row(mode, case, f, base, H_fwd):
     b2['yaw_dev_max'] = float(np.abs(wrap(th[''] - th['base_'])).max())
     b2.update(ramp_split(rows, tk, err[''], err['base_']))
     b2.update(zone_times(rows, f['plant']))
+    b2.update(pwm_mean(pw(te, e), pw(tb, eb)))
     # pose at t0 + duration, r_true over (0, duration]
     pose = {}
     for tag, run in (('', f), ('base_', base)):

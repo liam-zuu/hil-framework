@@ -31,6 +31,10 @@ Times, under the same scheduling as the plant loop (SCHED_FIFO 90, core 0):
                        stays nominal, so the traction sub-steps stay those of the nominal plant (Codex FQ1-4:
                        a zone over all four wheels lowers max(mu_hd) and so the sub-steps, which is lighter)
                  all3  jam + sag + zone on together
+                 body  s14 body_drag F=3.3 and load_dist on together (the f_ext force called at every traction
+                       sub-step, fault_plant.body_step); its calls start from x with the world vx set to 0.3 m/s
+                       (BODY_VX), so the drag branch (|v| >= 1e-3) runs from the first sub-step (x itself has the
+                       body at rest)
                The patch() of the frame is not in these numbers (fault_idle / fault_all4 above). They are the
                steady cost after the warm-up with one set of rows on and one zone mask: the build of a new
                parameter copy when a window opens or the zone mask changes falls in the warm-up, not timed.
@@ -92,7 +96,10 @@ FAULT_PLANT_ROWS = {
     'sag':  'B1,batt_sag,batt,0,{w},v1=7.44;ramp_ms={w}\n',
     'zone': 'Z1,mu_zone,all,0,{w},x0=-1000;x1=1000;y0=-1000;y1=1000;mu=0.2\n',
     'zone_half': 'Z1,mu_zone,all,0,{w},x0=-1000;x1=1000;y0=0;y1=1000;mu=0.2\n',
+    'body': 'D1,body_drag,body,0,{w},F=3.3\nL1,load_dist,body,0,{w},F0=2.5;rate=0.8;Fmax=1.5;sigma=1.6;seed=0;'
+            'dir_deg=90\n',
 }
+BODY_VX = 0.3                       # [m/s] world vx of the start state of the body variant (drag branch on)
 FAULT_PLANT_STEP = 100              # patcher step of the timed calls: inside every window, batt_sag still ramping
 
 
@@ -117,15 +124,18 @@ def fault_plant_variants(n, x, u):
         pl.reset(list(x))
         return pl
 
-    def from_x(pl, step):
+    sb = s0.copy()
+    sb[3] = BODY_VX                            # body variant: the body moving, so the drag acts
+
+    def from_x(pl, step, start=s0):
         def call():
-            pl._state = s0                     # Codex FQ2-2: the same state x at every call
+            pl._state = start                  # Codex FQ2-2: the same state x at every call
             return step(ul)
         return call
 
     base = inner()
     out = [('fault_plant_base', from_x(base, base.step), None)]
-    for name in ('idle', 'jam', 'sag', 'zone', 'zone_half', 'all3'):
+    for name in ('idle', 'jam', 'sag', 'zone', 'zone_half', 'all3', 'body'):
         rows = fsch.parse(head + bodies[name])
         fsch.check(rows, 2 * w, 'plant', 'traction')
         pa = fsch.FramePatcher(fsch.Schedule(tuple(rows)))
@@ -133,7 +143,7 @@ def fault_plant_variants(n, x, u):
         pa.patch(FAULT_PLANT_STEP, bytes(FRAME_SIZE))
         fp = FaultPlant(inner(), pa, None)
         pa.plant_hook = fp
-        out.append((f'fault_plant_{name}', from_x(fp.inner, fp.step), fp))
+        out.append((f'fault_plant_{name}', from_x(fp.inner, fp.step, sb if name == 'body' else s0), fp))
     return out
 
 

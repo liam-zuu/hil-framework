@@ -716,3 +716,50 @@ def test_bench_plant_record_name_refused_before_opening(tmp_path, fake_check, mo
     monkeypatch.setattr(ct.np, 'load', load)
     assert ct.main([d]) == 2
     assert seen and all(x.endswith('_frames.npz') for x in seen), seen
+
+
+# ── s14 (design 2026-11-15 sections 7.2, 14.9 G1, 14.10; Liam 17/11 CODE_FAULT2 "lam s14 ngay di") ──
+def test_task_duration_takes_the_tasks_of_fault_run():
+    """G1: the bench table takes the tasks fwsim/fault_run.py task_setpoint takes: A-W1, or a group A test on the
+    ground with its spec duration, + TAIL_S; the lifted tests and unknown ids are refused."""
+    sys.path.insert(0, os.path.join(ROOT, 'rpi5'))
+    from trajectory_pub import GROUP_A, LIFTED_TESTS
+    assert ct.task_duration('--test A-W1') == ('A-W1', 9.0)
+    for task in ('A-C1', 'A-L1', 'A-F2', 'A-S1'):
+        assert ct.task_duration(f'--test {task}') == (task, GROUP_A[task].duration + 1.0), task
+    for task in LIFTED_TESTS + ('A-ZZ',):
+        with pytest.raises(ct.TableError, match='not a fault task'):
+            ct.task_duration(f'--test {task}')
+
+
+def test_task_duration_agrees_with_fault_run():
+    sys.path.insert(0, os.path.join(ROOT, 'fwsim'))
+    from trajectory_pub import GROUP_A, LIFTED_TESTS
+    try:
+        import fault_run
+    except Exception as exc:                          # the fwsim DLL is not built here
+        pytest.skip(f'fwsim not importable: {exc}')
+    for task in ['A-W1'] + [t for t in GROUP_A if t not in LIFTED_TESTS]:
+        assert ct.task_duration(f'--test {task}')[1] == fault_run.task_setpoint(task)[1] + fault_run.TAIL_S, task
+
+
+def test_pwm_mean_fwsim(tmp_path):
+    write_case(str(tmp_path / 'PID_base'), base_log())
+    write_plant_case(str(tmp_path / 'PID_sagzone'), [B_ROW, Z_ROW], plant_record())
+    write_case(str(tmp_path / 'PID_encFL'), fault_log(), rows=[ROW])
+    rs = {r['case']: r for r in ct.table(str(tmp_path))}
+    assert rs['sagzone']['pwm_mean'] == pytest.approx(1000 * 100 / 1200) and rs['sagzone']['base_pwm_mean'] == 0
+    assert rs['encFL']['pwm_mean'] == pytest.approx(1000 * 50 / 1200)
+    k = list(rs['encFL'])
+    assert k.index('zone_out_s') + 1 == k.index('pwm_mean') and k[-1] == 'base_pwm_mean'
+
+
+def test_pwm_mean_bench(tmp_path, fake_check):
+    d = str(tmp_path)
+    bench_plant(d)
+    r = ct.table(d)[0]
+    # esp_rows: FL -1000 for 50 of the 300 span ticks and 100 for the rest (fault run), 100 throughout (baseline)
+    assert r['pwm_mean'] == pytest.approx((50 * 1000 + 250 * 100) / 1200)
+    assert r['base_pwm_mean'] == pytest.approx(300 * 100 / 1200)
+    kf = list(r)
+    assert kf.index('zone_out_s') + 1 == kf.index('pwm_mean') and kf.index('base_pwm_mean') + 1 == kf.index('run_s')
