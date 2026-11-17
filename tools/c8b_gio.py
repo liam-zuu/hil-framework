@@ -57,6 +57,7 @@ import csv
 import json
 import math
 import os
+import subprocess
 import sys
 
 import numpy as np
@@ -100,6 +101,26 @@ class GioError(Exception):
     pass
 
 
+C8B_FILES = ('tools/c8b_gio.py', 'tools/c8b_luoi.py', 'tools/c8b_u.py', 'tools/c8b_3b.py', 'tools/c7_score.py',
+             'tools/o1_time_sync.py', 'tools/c8_u_imu.py', 'tools/gate_c8.py', 'fwsim/o1_gate.py')
+
+
+def repo_state(path_in_repo=None):
+    """C8BS-16: commit of the repo of path_in_repo (default this file) and whether ANY file of the C8b chain
+    (C8B_FILES: the C8b scripts, the scorer, the clock match, gate files) has a change not committed there."""
+    here = os.path.dirname(os.path.abspath(path_in_repo or __file__))
+    try:
+        top = subprocess.run(['git', '-C', here, 'rev-parse', '--show-toplevel'], capture_output=True, text=True,
+                             timeout=10).stdout.strip()
+        c = subprocess.run(['git', '-C', top, 'rev-parse', 'HEAD'], capture_output=True, text=True, timeout=10)
+        s = subprocess.run(['git', '-C', top, 'status', '--porcelain', '--', *C8B_FILES], capture_output=True,
+                           text=True, timeout=10)
+        return dict(commit=c.stdout.strip(), dirty=bool(s.stdout.strip()) or c.returncode != 0,
+                    luc_chay=cu.now_iso())
+    except (OSError, subprocess.SubprocessError):
+        return dict(commit='', dirty=None, luc_chay=cu.now_iso())
+
+
 # ── log ──────────────────────────────────────────────────────────────────────────────────────
 
 def read_log(path):
@@ -128,6 +149,22 @@ def read_log(path):
     if np.any(np.diff(t) <= 0):
         raise GioError(f'{path}: timestamp_us does not increase')
     return rows, int(n_dup or 0)
+
+
+def controller_of(log_path):
+    """C8BS-14: the controller of the run from the '#gain ... ctrl=X' lines of the logger events file
+    (<log>.events.txt); None when the file or the lines are missing or name more than one controller."""
+    ev = log_path + '.events.txt'
+    if not os.path.isfile(ev):
+        return None, None
+    found = set()
+    with open(ev, encoding='utf-8', errors='replace') as f:
+        for line in f:
+            if '#gain,' in line:
+                for part in line.strip().split(','):
+                    if part.startswith('ctrl='):
+                        found.add(part[5:])
+    return (found.pop() if len(found) == 1 else None), ev
 
 
 def _col(rows, c):
@@ -632,9 +669,11 @@ def main(argv=None):
             with open(a.khoa, encoding='utf-8') as f:
                 khoa = json.load(f)
         out, _, _ = analyse(a.frames, a.esp32, a.task, khoa, a.startup_s)
+        ctrl, ev = controller_of(a.esp32)
+        out['controller'] = ctrl
         out['nguon'] = [dict(file=os.path.basename(p), sha256=cu.sha256(p)) for p in (a.frames, a.esp32)
-                        + ((a.khoa,) if a.khoa else ())]
-        out['script'] = cu.script_state()
+                        + ((a.khoa,) if a.khoa else ()) + ((ev,) if ev else ())]
+        out['script'] = repo_state()
         cu.check_path(a.out)
         with open(a.out, 'x', encoding='utf-8') as f:
             f.write(json.dumps(_clean(out), indent=1, ensure_ascii=False, allow_nan=False))

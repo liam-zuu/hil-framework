@@ -252,14 +252,34 @@ def test_startup_bounds_planted(base_run):
     assert 1.234 - 0.08 < st['lo_s'] <= 1.234 + 0.003
 
 
-def test_startup_intersection_counterexample(base_run, monkeypatch):
-    # C8BS-4: lower 1.015, upper 1.005 both inside [1.000, 1.020] but no common time: inconsistent
-    def fake(*a, **k):
-        return dict(lo_s=1.015, hi_s=1.005, lo_why='', hi_why='', t_start_log_s=4.0, e_p_m=0, e_psi_deg=0)
-    monkeypatch.setattr(G, 'startup', fake)
-    monkeypatch.setattr(G, 'nodes', lambda c, h, step=G.STEP_S: [c])
+@pytest.mark.parametrize('lo,hi,want', [(1.015, 1.005, 'khong_nhat_quan'), (1.005, 1.015, 'nhat_quan'),
+                                          (1.025, None, 'khong_nhat_quan'), (None, 0.995, 'khong_nhat_quan')])
+def test_startup_intersection_counterexample(base_run, monkeypatch, lo, hi, want):
+    # C8BS-4, C8BS-17: L = 1.002, U~ = 1.018 -> scoring interval exactly [1.000, 1.020]; drift 0
+    D = dict(speed_cnt=1.002, wz_cnt=1.002, gyro_rx=1.018, rv_rx=1.018)
+
+    def fake_match(t_cam, v_cam, valid, t_log, v_log, window_log, coarse):
+        ch = fake_match.order.pop(0)
+        return dict(D_s=D[ch], corr=0.99, window_cam_s=[3.0, 20.0], window_log_s=[4.0, 21.0], short=False,
+                    D_start_s=D[ch], D_end_s=D[ch], corr_start=0.99, corr_end=0.99, rate=0.0, ok=True, why='')
+    fake_match.order = list(G.CHANNELS)
+    monkeypatch.setattr(G, 'match', fake_match)
+    monkeypatch.setattr(G, 'startup', lambda *a, **k: dict(lo_s=lo, hi_s=hi, lo_why='', hi_why='', t_start_log_s=4.0,
+                                                           e_p_m=0, e_psi_deg=0))
     out, _, _ = G.analyse(base_run[1], base_run[2], 'O1-F05')
-    assert out['khoi_dong']['ket_qua'] == 'khong_nhat_quan' and out['ket_luan'] == 'hong_he_do'
+    assert out['center_s'] - out['half_s'] == pytest.approx(1.000) and out['center_s'] + out['half_s'] == pytest.approx(1.020)
+    assert out['khoi_dong']['ket_qua'] == want
+    assert (out['ket_luan'] == 'hong_he_do') == (want == 'khong_nhat_quan')
+
+
+def test_controller_from_events(tmp_path):
+    lp = tmp_path / 'run.csv'
+    lp.write_text('x\n')
+    assert G.controller_of(str(lp)) == (None, None)
+    (tmp_path / 'run.csv.events.txt').write_text('t #gain,id=0,ctrl=LADRC,kp_xy=1\nt #gain,id=0,ctrl=LADRC,kp_xy=1\n')
+    assert G.controller_of(str(lp))[0] == 'LADRC'
+    (tmp_path / 'run.csv.events.txt').write_text('t #gain,ctrl=LADRC\nt #gain,ctrl=PID\n')
+    assert G.controller_of(str(lp))[0] is None
 
 
 def test_startup_not_bridged(tmp_path):
@@ -465,6 +485,20 @@ def test_domain_end_moves_between_nodes():
     assert LU.combine([a, node(['dat'] * 5, rows_with(), bien=(10.0, 10.0))])['states']['g2'] == 'dat'
 
 
+def test_domain_moves_with_violation_gives_no_finite_lo():
+    # C8BS-R2-1: frame 0.2 violates G3 in both domains but the domain moves: not concluded, written (not refused)
+    a = node(['dat', 'dat', 'khong_dat', 'dat', 'dat'], rows_with(0.2), bien=(10.0, 10.0))
+    b = node(['dat', 'dat', 'khong_dat', 'dat', 'dat'], rows_with(0.2), bien=(10.0, 10.016667))
+    res = LU.combine([a, b])
+    assert res['states']['g3'] == 'chua_ket_luan' and math.isnan(res['nums']['g3']['chung']['lo'])
+    assert all(res['bieu_dien'][c] for c in LU.MEASURED)
+
+
+def test_domain_key_needs_t0_and_D():
+    with pytest.raises(LU.LuoiError, match='C8BS-6'):
+        LU.domain_key(dict(t0_log_us=5e6), dict(g1=dict(t_done=[2.0, 3.0])))
+
+
 def test_domain_key_camera_clock():
     sc = dict(t0_log_us=5e6, gio_c8b=dict(D=1.5), cat_t1=False)
     g = dict(g1=dict(t_done=[2.0, None]))
@@ -534,7 +568,7 @@ def _write_node(d, k, states, rows, u_t=0.031):
         hi = lo + 0.02 if s != 'dat' else min(lo + 0.02, LU.THRESHOLDS[c])
         g[c] = dict(state=s, q=lo + 0.01, lo=lo, hi=hi, n_undef=0, chung=dict(q=lo + 0.01, lo=lo, hi=hi, n_undef=0))
     with open(os.path.join(d, f'nut_{k:03d}.json'), 'w', encoding='utf-8') as f:
-        json.dump(dict(outcome='dat', gate_v3=g, U_t_s=u_t), f)
+        json.dump(dict(outcome='dat', gate_v3=g, U_t_s=u_t, t0_log_us=5e6, gio_c8b=dict(D=1.0 + 0.001 * k)), f)
     with open(os.path.join(d, f'nut_{k:03d}_rows.csv'), 'w', newline='', encoding='utf-8') as f:
         w = csv.writer(f)
         w.writerow(['t', 't_cam_s', 'mien_chung', 'mien_hop'] + [f'lo_{c}' for c in LU.MEASURED])
@@ -563,7 +597,7 @@ def test_node_rows_without_c8b_columns_is_error(tmp_path):
     g = {c: dict(state='dat', q=0.05, lo=0.04, hi=0.06, n_undef=0, chung=dict(q=0.05, lo=0.04, hi=0.06, n_undef=0))
          for c in LU.MEASURED}
     g['g1'] = dict(state='dat')
-    json.dump(dict(outcome='dat', gate_v3=g), open(sp, 'w'))
+    json.dump(dict(outcome='dat', gate_v3=g, t0_log_us=5e6, gio_c8b=dict(D=1.0)), open(sp, 'w'))
     rp = tmp_path / 'r.csv'
     rp.write_text('t,lo_g2,lo_g3,lo_g4,lo_g5\n0,0,0,0,0\n')
     n = LU.node_from_files(str(sp), str(rp))
@@ -585,12 +619,17 @@ import sys, json, csv
 a = sys.argv[1:]
 g = lambda k: a[a.index(k) + 1]
 k = int(g('--nut'))
-st = 'khong_dat' if k < 3 else 'chua_ket_luan'
-gate = {'g1': {'state': 'dat'}}
+lo3 = 0.13 if k < 3 else 0.05
+gate = {'g1': {'state': 'dat', 't_done': [None, None]}}
 for c in ('g2', 'g3', 'g4', 'g5'):
-    s = st if c == 'g3' else 'dat'
-    gate[c] = dict(state=s, q=0.05, lo=0.04, hi=0.06, n_undef=0, chung=dict(q=0.05, lo=0.04, hi=0.06, n_undef=0))
-json.dump(dict(outcome='khong_dat', gate_v3=gate, U_t_s=0.02 + 0.001 * k), open(g('--out'), 'w'))
+    lo = lo3 if c == 'g3' else 0.05
+    thr = 7.5 if c == 'g5' else 0.10
+    lo = 1.0 if c == 'g5' else lo
+    s = 'khong_dat' if lo > thr else 'dat'
+    hi = lo + 0.01
+    gate[c] = dict(state=s, q=lo, lo=lo, hi=hi, n_undef=0, chung=dict(q=lo, lo=lo, hi=hi, n_undef=0))
+json.dump(dict(outcome='x', gate_v3=gate, U_t_s=0.02 + 0.001 * k, t0_log_us=5e6, gio_c8b=dict(D=1.0 + 0.001 * k)),
+          open(g('--out'), 'w'))
 with open(g('--rows'), 'w', newline='') as f:
     w = csv.writer(f); w.writerow(['t_cam_s', 'mien_chung', 'mien_hop', 'lo_g2', 'lo_g3', 'lo_g4', 'lo_g5'])
     w.writerow([5.0, 1 if k < 3 else 0, 1, 0.05, 0.13 if k < 3 else 0.05, 0.05, 1.0])   # out of the domain at node 3
@@ -610,6 +649,7 @@ def test_run_nodes_with_fake_scorer(tmp_path):
     assert rc == 0
     r = json.load(open(os.path.join(d, 'luoi.json'), encoding='utf-8'))
     assert r['n_nodes'] == 4 and r['states']['g3'] == 'chua_ket_luan'       # last cell: frame not in both domains
+    assert r['nodes_ok'] == [True] * 4 and not any(r['node_errors'])
     assert r['u_t_nodes'] == pytest.approx([0.02, 0.021, 0.022, 0.023])
 
 
@@ -707,6 +747,39 @@ def test_3b_consistency_both_coefficients(wheel, monkeypatch):
     assert not sh['use_alpha'] and 'spread' in sh['why']
 
 
+def test_3b_check_fit_without_col(wheel, monkeypatch):
+    real = TB.fit_shutter
+    calls = []
+
+    def fake(*a, **k):
+        f = real(*a, **k)
+        calls.append(1)
+        if len(calls) == 3:                       # one check fit without columns
+            f['groups'][0]['has_col'] = False
+        return f
+    monkeypatch.setattr(TB, 'fit_shutter', fake)
+    sh = TB.analyse(*wheel)['B']['shutter']
+    assert not sh['use_alpha'] and 'col_px' in sh['why']
+
+
+def test_3b_envelope_covers_every_check_fit(wheel, monkeypatch):
+    # C8BS-12 round 2: alpha_r = 10 everywhere, alpha_c = -1, +1, -1, +1 us/px, whole (10, 0): the value used must
+    # cover a check fit at any span (Dr 10, Dc 700: 0.8 ms)
+    vals = iter([(10e-6, 0.0), (10e-6, -1e-6), (10e-6, 1e-6), (10e-6, -1e-6), (10e-6, 1e-6)])
+    real = TB.fit_shutter
+
+    def fake(*a, **k):
+        f = real(*a, **k)
+        ar, ac = next(vals)
+        f['groups'][0].update(alpha_r_s_px=ar, alpha_c_s_px=ac, has_col=True)
+        return f
+    monkeypatch.setattr(TB, 'fit_shutter', fake)
+    sh = TB.analyse(*wheel)['B']['shutter']
+    assert sh['use_alpha']
+    used = sh['alpha_r_le_s_px'] * 10 + sh['alpha_c_le_s_px'] * 700
+    assert used >= 10e-6 * 10 + 1e-6 * 700
+
+
 def test_3b_window_over_turnaround_not_used():
     T = 1 / 60
     tt = np.arange(0, 80, T)
@@ -768,13 +841,13 @@ META = dict(nhanh_tick='bo_tick', commit_hil='abc1234')
 SCRIPT = dict(commit='abc1234ffff', dirty=False)
 
 
-def _pair(rid, task, half, outcome, ut, nodes=None, gio_ok=True):
+def _pair(rid, task, half, outcome, ut, nodes=None, gio_ok=True, ctrl='PID'):
     nodes = nodes or [1.0 + 0.001 * i for i in range(len(ut) or 1)]
     g = dict(gio_d(task, 1e-4, 0.01, 0.0, ok=gio_ok, half=half), nodes_s=nodes, script=SCRIPT,
-             ket_luan='ok' if gio_ok else 'hong_he_do')
+             ket_luan='ok' if gio_ok else 'hong_he_do', controller=ctrl)
     sha = f'{rid:0<64}'[:64]
     l = dict(version='c8b_luoi_v1', gio_sha256=sha, task=task, nodes_s=nodes, report_only=[], outcome=outcome,
-             u_t_nodes=ut, script=SCRIPT, nhanh_tick=['bo'])
+             u_t_nodes=ut, script=SCRIPT, scorer=SCRIPT, nhanh_tick=['bo'])
     return g, l, sha
 
 
@@ -782,12 +855,13 @@ def _luot(lost_first=False):
     out = []
     if lost_first:
         g, l, s = _pair('r3a', 'O1-F08', 0.009, 'hong_he_do', [], gio_ok=True)
+        l['nhanh_tick'] = []
         out.append(('3', 'r3a', g, l, s))
     for slot, rid, task, half, outc, ut in (('1', 'r1', 'O1-F05', 0.006, 'dat', [0.020, 0.021]),
                                             ('2', 'r2', 'O1-F05', 0.008, 'dat', [0.020, 0.021]),
                                             ('3', 'r3', 'O1-F08', 0.009, 'dat', [0.020, 0.021]),
                                             ('4', 'r4', 'O1-F08', 0.007, 'khong_dat', [0.03])):
-        g, l, s = _pair(rid, task, half, outc, ut)
+        g, l, s = _pair(rid, task, half, outc, ut, ctrl=_plan()[slot]['controller'])
         out.append((slot, rid, g, l, s))
     return out
 
@@ -828,6 +902,7 @@ def test_cong_needs_both_controllers_and_rerun_rule():
     with pytest.raises(CU.UError, match='rerun only replaces'):
         CU.cong(K, _plan(), _luot() + [('1', 'r1b', g, l, s)], ['O1-F05'], 'bo_tick', 'x', meta=META)
     g, l, s = _pair('r9', 'O1-F05', 0.006, 'dat', [0.02, 0.02])
+    l = dict(l)
     with pytest.raises(CU.UError, match='not in the C8 plan'):
         CU.cong(K, _plan(), _luot() + [('9', 'r9', g, l, s)], ['O1-F05'], 'bo_tick', 'x', meta=META)
     lu = [(sl, r, g, dict(l, u_t_nodes=[math.inf, 0.02]) if r == 'r2' else l, sh) for sl, r, g, l, sh in _luot()]
@@ -837,7 +912,7 @@ def test_cong_needs_both_controllers_and_rerun_rule():
 
 def test_cong_refuses_run_twice_and_foreign_grid():
     lu = _luot()
-    dup = [lu[0], ('2', lu[0][1], lu[0][2], lu[0][3], lu[0][4])] + lu[2:]       # one run in the PID and LADRC slot
+    dup = [lu[0], ('2', lu[0][1], dict(lu[0][2], controller='LADRC'), lu[0][3], lu[0][4])] + lu[2:]   # one run, 2 slots
     with pytest.raises(CU.UError, match='twice'):
         CU.cong(K, _plan(), dup, ['O1-F05'], 'bo_tick', 'x', meta=META)
     s0, r0, g0, l0, sh0 = lu[0]
@@ -859,12 +934,29 @@ def test_cong_branch_and_commit_from_plan():
     with pytest.raises(CU.UError, match='needs commit_hil'):
         CU.cong(K, _plan(), lu, ['O1-F05'], 'bo_tick', 'x', meta=dict(nhanh_tick='bo_tick'))
     s0, r0, g0, l0, sh0 = lu[0]
-    with pytest.raises(CU.UError, match='not made by commit_hil'):
+    with pytest.raises(CU.UError, match='not from commit_hil'):
         CU.cong(K, _plan(), [(s0, r0, g0, dict(l0, script=dict(commit='abc1234', dirty=True)), sh0)] + lu[1:],
                 ['O1-F05'], 'bo_tick', 'x', meta=META)
     with pytest.raises(CU.UError, match='tick branch'):
         CU.cong(K, _plan(), [(s0, r0, g0, dict(l0, nhanh_tick=['giu']), sh0)] + lu[1:], ['O1-F05'], 'bo_tick', 'x',
                 meta=META)
+    with pytest.raises(CU.UError, match='tick branch'):                 # no evidence of the branch: refused
+        CU.cong(K, _plan(), [(s0, r0, g0, dict(l0, nhanh_tick=[]), sh0)] + lu[1:], ['O1-F05'], 'bo_tick', 'x',
+                meta=META)
+    with pytest.raises(CU.UError, match='scorer not from commit_hil'):
+        CU.cong(K, _plan(), [(s0, r0, g0, dict(l0, scorer=dict(commit='abc1234', dirty=True)), sh0)] + lu[1:],
+                ['O1-F05'], 'bo_tick', 'x', meta=META)
+
+
+def test_cong_controller_from_log():
+    lu = _luot()
+    s1, r1, g1, l1, h1 = lu[1]                       # slot 2 is LADRC; its log says PID
+    with pytest.raises(CU.UError, match='C8BS-14'):
+        CU.cong(K, _plan(), [lu[0], (s1, r1, dict(g1, controller='PID'), l1, h1)] + lu[2:], ['O1-F05'], 'bo_tick',
+                'x', meta=META)
+    with pytest.raises(CU.UError, match='C8BS-14'):
+        CU.cong(K, _plan(), [lu[0], (s1, r1, dict(g1, controller=None), l1, h1)] + lu[2:], ['O1-F05'], 'bo_tick',
+                'x', meta=META)
 
 
 def test_read_plan_meta(tmp_path):

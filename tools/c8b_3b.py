@@ -66,6 +66,8 @@ SPREAD_MAX = 0.30           # [DE XUAT] design 4b
 DR_REF, DC_REF = 700.0, 700.0   # reference span (rows 700-1450 of the car runs; columns of the same size)
 SHUTTER_MIN_RAD_S = 2.0     # [DE XUAT] shutter fit only above 2 rad/s: below, one smooth piece of >= 1 turn lasts
                             # too long for a cubic, and the shutter term is small (synthetic test: bias at 0.3-1.5 rad/s)
+PHU_FRAC = 0.8              # [DE XUAT] C8BS-10: a part counts as measured up to the F08 peak when its used data reach
+                            # 80 % of the peak in each direction
 SUBSET_MIN = 120            # frames per check fit (design 4b consistency)
 DERIV_HALF = 3              # frames each side for the rate (central quadratic fit)
 
@@ -139,7 +141,7 @@ def analyse_a(F, wz_max):
     dev = np.hypot(x - px, y - py)
     use = np.isfinite(om) & (np.abs(om) > MOVE_RAD_S) & (np.abs(om) <= wz_max)
     # heading residual after a quadratic over every 0.5 s window (step a quarter window)
-    res_max, bands, n_win = 0.0, [], 0
+    res_max, bands, n_win, win_rates = 0.0, [], 0, []
     t0 = t[0]
     while t0 + WIN_S <= t[-1]:
         m = (t >= t0) & (t < t0 + WIN_S)
@@ -154,11 +156,14 @@ def analyse_a(F, wz_max):
             if math.isfinite(w) and MOVE_RAD_S < w <= wz_max:
                 res_max = max(res_max, float(np.max(np.abs(r))))
                 n_win += 1
+                win_rates.append(float(np.sign(om_m[0])) * w)
             bands.append((w, float(np.max(np.abs(r)))))
         t0 += WIN_S / 4
-    cov = coverage(om, wz_max)
+    cov_h = coverage(np.array(win_rates), wz_max)           # the heading windows used, each direction
+    cov_p = coverage(om[use], wz_max)                        # the position frames used, each direction
     return dict(fixed_point=[px, py], slow_n=int(len(sl)), slow_rate_rad_s=float(np.median(np.abs(om[sl]))),
-                ga_dev_m=dev_sl, ga_ok=bool(dev_sl <= GA_TOL_M), du_phu=cov['ok'], phu=cov, n_win=n_win,
+                ga_dev_m=dev_sl, ga_ok=bool(dev_sl <= GA_TOL_M), du_phu=cov_h['ok'] and cov_p['ok'],
+                phu=dict(huong=cov_h, vi_tri=cov_p), n_win=n_win,
                 psi_osc_deg=math.degrees(res_max) if n_win else None,
                 p_dev_m=float(np.max(dev[use])) if use.any() else None,
                 rate_max_rad_s=float(np.nanmax(np.abs(om))), n_used=int(use.sum()),
@@ -182,12 +187,15 @@ def _binned(pairs, nb=6):
 
 # ── (B) tag off the axis ─────────────────────────────────────────────────────────────────────────
 
-def coverage(om, need):
-    """Spinning frames reach |Omega| >= need in BOTH directions (C8BS-10)."""
-    f = np.isfinite(om)
-    pos = float(np.max(om[f])) if f.any() else 0.0
-    neg = float(-np.min(om[f])) if f.any() else 0.0
-    return dict(ok=bool(pos >= need and neg >= need), can_rad_s=need, max_duong_rad_s=pos, max_am_rad_s=neg)
+def coverage(rates, need):
+    """C8BS-10: the samples (or windows) a part actually uses reach PHU_FRAC x need in EACH direction (signed
+    rates or speeds; need: the F08 peak) [DE XUAT]."""
+    r = np.asarray(rates, float)
+    r = r[np.isfinite(r)]
+    pos = float(np.max(r[r > 0])) if (r > 0).any() else 0.0
+    neg = float(-np.min(r[r < 0])) if (r < 0).any() else 0.0
+    return dict(ok=bool(pos >= PHU_FRAC * need and neg >= PHU_FRAC * need), can=need, phan=PHU_FRAC,
+                max_duong=pos, max_am=neg)
 
 
 def circle_fit(x, y):
@@ -300,7 +308,7 @@ def analyse_b(F, v_max, wz_max, frame_s):
     phi_sl = float(np.median(phi[sl]))
     v_t = np.abs(om) * R0
     use_p = np.isfinite(om) & (np.abs(om) > MOVE_RAD_S) & (v_t <= v_max)
-    cov = coverage(om, v_max / R0)                  # tangential speed up to v_max of the level, both ways
+    cov = coverage(om[use_p] * R0, v_max)          # the frames used: tangential speed up to v_max, each direction
     rad_dev = float(np.max(np.abs(r[use_p] - R0))) if use_p.any() else None
     hp_dev = float(np.max(np.abs(phi[use_p] - phi_sl))) if use_p.any() else None
     # rolling shutter: one alpha over all spinning frames, and one per speed band x direction (pieces and
@@ -329,8 +337,8 @@ def analyse_b(F, v_max, wz_max, frame_s):
         why = 'no fit'
     elif len(subsets) < 4:
         why = f'{len(subsets)} of 4 check fits (two bands, two directions) with {SUBSET_MIN} frames'
-    elif not whole['has_col']:
-        why = 'no col_px: alpha_c not measured, one frame kept (C8BS-11)'
+    elif not (whole['has_col'] and all(d['has_col'] for d in subsets)):
+        why = 'no col_px in the whole fit or a check fit: alpha_c not measured, one frame kept (C8BS-11)'
     else:
         # C8BS-12: both coefficients, not only one summary number: alpha_r within SPREAD_MAX of its mean and one sign;
         # alpha_c within SPREAD_MAX x |mean alpha_r| of its mean (alpha_c may be near 0) [DE XUAT]; and the whole fit
@@ -352,6 +360,10 @@ def analyse_b(F, v_max, wz_max, frame_s):
             why = 'the whole fit is outside the check fits'
         else:
             use_alpha = True
+    # C8BS-12: the value used covers every check fit: the envelope of |alpha_r|, |alpha_c| over the whole fit and
+    # the check fits (each coefficient on its own), so |a_r| Dr + |a_c| Dc is not below any fit for any span
+    env_r = max([abs(whole['alpha_r_s_px'])] + [abs(d['alpha_r_s_px']) for d in subsets]) if whole else None
+    env_c = max([abs(whole['alpha_c_s_px'])] + [abs(d['alpha_c_s_px']) for d in subsets]) if whole else None
     rows = F['row'][spin]
     return dict(centre=[cx, cy], R0_m=R0, slow_n=int(len(sl)), slow_rate_rad_s=float(np.median(np.abs(om[sl]))),
                 ga_dev_m=ga_dev, ga_ok=bool(ga_dev <= GA_TOL_M), du_phu=cov['ok'], phu=cov, rad_dev_m=rad_dev,
@@ -359,10 +371,11 @@ def analyse_b(F, v_max, wz_max, frame_s):
                 rate_max_rad_s=float(np.nanmax(np.abs(om))), v_t_max_m_s=float(np.nanmax(v_t)),
                 row_span_px=[float(np.nanmin(rows)), float(np.nanmax(rows))] if len(rows) else None,
                 shutter=dict(whole=whole, subsets=subsets, use_alpha=use_alpha, why=why,
-                             alpha_r_s_px=whole['alpha_r_s_px'] if use_alpha else None,
-                             alpha_c_s_px=whole['alpha_c_s_px'] if use_alpha else None,
-                             alpha_r_le_s_px=LE * whole['alpha_r_s_px'] if use_alpha else None,
-                             alpha_c_le_s_px=LE * whole['alpha_c_s_px'] if use_alpha else None,
+                             alpha_r_s_px=env_r if use_alpha else None,
+                             alpha_c_s_px=env_c if use_alpha else None,
+                             alpha_r_le_s_px=LE * env_r if use_alpha else None,
+                             alpha_c_le_s_px=LE * env_c if use_alpha else None,
+                             alpha_kieu='bao |alpha| cua fit chung va cac fit kiem (C8BS-12)',
                              mot_khung_s=frame_s))
 
 

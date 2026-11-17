@@ -113,7 +113,11 @@ def node_from_files(score_path, rows_path):
         nm = nums[c]
         if _state_from_numbers(nm['lo_chung'], nm['lo'], nm['hi'], nm['n_undef'], THRESHOLDS[c]) != st[c]:
             return dict(out, ok=False, kind='loi', why=f'gate {c}: state {st[c]} does not follow its numbers')
-    out.update(states=st, nums=nums, gate=gate, bien=domain_key(sc, gate))
+    try:
+        bien = domain_key(sc, gate)
+    except LuoiError as exc:
+        return dict(out, ok=False, kind='loi', why=str(exc))
+    out.update(states=st, nums=nums, gate=gate, bien=bien)
     try:
         with open(rows_path, newline='', encoding='utf-8') as f:
             rr = list(csv.DictReader(f))
@@ -140,13 +144,17 @@ def domain_key(sc, gate):
     Command time t <-> camera time t + t0 - D."""
     g1 = gate.get('g1') or {}
     t0 = _f(sc.get('t0_log_us')) * 1e-6
-    D = _f((sc.get('gio_c8b') or {}).get('D', sc.get('offset_s')))
+    D = _f((sc.get('gio_c8b') or {}).get('D'))
+    if not (math.isfinite(t0) and math.isfinite(D)):
+        raise LuoiError('score file without t0_log_us or gio_c8b.D: the domain ends cannot be compared (C8BS-6)')
 
     def cam(x):
         if x is None:
             return None
         v = _f(x) + t0 - D
-        return round(v, KEY_DEC) if math.isfinite(v) else 'nan'
+        if not math.isfinite(v):
+            raise LuoiError(f'domain end {x!r} not finite (C8BS-6)')
+        return round(v, KEY_DEC)
     key = [cam(x) for x in (g1.get('t_done') or [])]
     if sc.get('cat_t1'):
         key.append(('t1', cam(g1.get('t1'))))
@@ -222,7 +230,7 @@ def combine(nodes, report_only=frozenset()):
         elif all(s == 'dat' for s in st):
             states[c] = 'dat'
         else:
-            cells = [cell_violation(nodes[i], nodes[i + 1], c) for i in range(n - 1)]
+            cells = [math.nan if bien_doi[i] else cell_violation(nodes[i], nodes[i + 1], c) for i in range(n - 1)]
             lo_cells[c] = cells
             states[c] = 'khong_dat' if all(math.isfinite(v) and v > THRESHOLDS[c] for v in cells) else 'chua_ket_luan'
     # numbers for the gate block (CODE_GATE v2 section 2 point 3: a node not scored adds n_undef >= 1)
@@ -234,7 +242,9 @@ def combine(nodes, report_only=frozenset()):
         else:
             cells = lo_cells.get(c)
             if cells is None:                        # dat everywhere: the cell values from the rows
-                cells = [cell_violation(nodes[i], nodes[i + 1], c) for i in range(n - 1)]
+                cells = [math.nan if bien_doi[i] else cell_violation(nodes[i], nodes[i + 1], c)
+                         for i in range(n - 1)]
+            # C8BS-R2-1: a cell whose domain moves gives no finite violation, so the combined lo is not finite
             lo_c = min(cells) if cells and all(math.isfinite(v) for v in cells) else math.nan
 
         def mx(k):
@@ -434,8 +444,10 @@ def main(argv=None):
             if bad and any(x['ok'] for x in nodes):
                 raise LuoiError(f'combined numbers do not give the grid state for {bad} (C8BS-9): not written')
             res['gate_v3'] = gate_block(nodes, res, gio, cu.sha256(a.gio), task, gsha)
+        import c8b_gio
         res.update(version=VERSION, task=task, nodes_s=gio.get('nodes_s', []), gio_sha256=cu.sha256(a.gio),
-                   gate_file_sha256=gsha, script=cu.script_state())
+                   gate_file_sha256=gsha, script=c8b_gio.repo_state(),
+                   scorer=c8b_gio.repo_state(a.scorer or os.path.join(HERE, 'c7_score.py')))
         os.makedirs(a.out_dir, exist_ok=True)
         out = os.path.join(a.out_dir, 'luoi.json')
         with open(out, 'x', encoding='utf-8') as f:

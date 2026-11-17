@@ -239,6 +239,9 @@ def slot_runs(plan, luot):
             raise UError(f'run {rid}: slot {slot} not in the C8 plan (no run added after the plan, O1 3.9 2b)')
         if g.get('task') != plan[slot]['task']:
             raise UError(f'run {rid}: task {g.get("task")} but slot {slot} is {plan[slot]["task"]}')
+        if g.get('controller') != plan[slot]['controller']:
+            raise UError(f'run {rid}: controller from its log {g.get("controller")!r} but slot {slot} is '
+                         f'{plan[slot]["controller"]} (C8BS-14)')
         if rid in seen_id or gsha in seen_sha:
             raise UError(f'run {rid}: the same run or clock file given twice (C8BS-14)')
         seen_id.add(rid)
@@ -268,12 +271,14 @@ def check_branch(branch, meta, luot):
         raise UError('bo_tick needs commit_hil (the scripts gone through Codex) in the C8 plan (O1 v11.34 Q4)')
     want = {'bo_tick': 'bo', 'giu_tick': 'giu'}[branch]
     for slot, rid, g, l, _ in luot:
-        for nm, d in (('clock', g), ('grid', l)):
-            sc = d.get('script') or {}
+        for nm, sc in (('clock', g.get('script')), ('grid', l.get('script')), ('scorer', l.get('scorer'))):
+            sc = sc or {}
             if commit and (not str(sc.get('commit', '')).startswith(commit) or sc.get('dirty') is not False):
-                raise UError(f'run {rid}: {nm} file not made by commit_hil {commit} (clean)')
+                raise UError(f'run {rid}: {nm} not from commit_hil {commit} with the C8b chain clean')
+        if l.get('outcome') == 'hong_he_do' or not g.get('ok'):
+            continue                                   # no node scored: no branch to check, the run is not used
         used = set(l.get('nhanh_tick') or [])
-        if used and used != {want}:
+        if used != {want}:
             raise UError(f'run {rid}: nodes scored with tick branch {sorted(used)}, the plan says {want}')
 
 
