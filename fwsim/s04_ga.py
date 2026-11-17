@@ -71,6 +71,7 @@ import hashlib
 import json
 import math
 import os
+import stat
 import sys
 import time
 
@@ -96,7 +97,7 @@ SEEDS = (1, 2, 3, 4, 5)
 PENALTY = 1e6                 # section 3: f1 = f2 = 1e6 for a run_error candidate
 SEED_ERR_LIMIT = 0.10         # section 3
 EDGE_FRAC = 0.05              # section 2
-SPEC = 'S04 v6.4 (06_SPECS/2026-11-05_Spec_S04_GA_chon_gain.md)'   # S83-2: one version line for every meta.yaml
+SPEC = 'S04 v6.6 (06_SPECS/2026-11-05_Spec_S04_GA_chon_gain.md)'   # S83-2: one version line for every meta.yaml
 B0_FACTORS = (0.7, 0.85, 1.0, 1.15, 1.3)
 R_FACTORS = (0.8, 0.9, 1.0, 1.1, 1.2)
 REL_LIMIT = 0.5               # B0_SENS criterion: e_perp_max change > 50 %
@@ -196,6 +197,7 @@ def read_domain(s03_dir, ctrl):
     """[(name, L, H, scale)] of the controller from the S03 levels.csv (S03 order of FACTORS)."""
     rows = [r for r in read_csv(os.path.join(s03_dir, 'levels.csv')) if r['controller'] == ctrl]
     by = {r['factor']: r for r in rows}
+    kiem = read_out_of_range(s03_dir, ctrl)
     out = []
     for n in s3.FACTORS[ctrl]:
         if n not in by:
@@ -203,9 +205,55 @@ def read_domain(s03_dir, ctrl):
         L, H = float(by[n]['L']), float(by[n]['H'])
         if not L < H:
             sys.exit(f'{ctrl} {n}: L = {L} is not below H = {H} (S03 3.1 (ii))')
-        # S04 v6.4 (C14-2): the source of each level, from the S03 v8.3 levels.csv ('' for an S03 run before v8.3)
+        # S04 v6.6: the GA domain is [L, H] of the ORIGINAL grid (S03 v8.4 3.1); levels of S03 v8.3 (set on the
+        # extension) are refused
+        if (by[n].get('H_nguon') or '') == 'hết lưới nối' or ((by[n].get('b') or '') != '' and H > float(by[n]['b'])):
+            sys.exit(f'{ctrl} {n}: H = {H} is set on the extension of the S03 grid (S03 v8.3 levels): S04 v6.6 needs '
+                     f'the levels of S03 v8.4 (original grid only)')
+        # S04 v6.4 (C14-2): the source of each level, from the S03 levels.csv ('' for an S03 run before v8.3);
+        # v6.6: with the result of the out-of-range check on each side (S03 v8.4 kiem_ngoai_mien.csv, '' without it)
         out.append(dict(name=n, L=L, H=H, scale=by[n]['scale'], L_src=by[n].get('L_nguon') or '',
-                        H_src=by[n].get('H_nguon') or ''))
+                        H_src=by[n].get('H_nguon') or '', L_kiem=kiem.get((n, 'L'), ''), H_kiem=kiem.get((n, 'H'), '')))
+    return out
+
+
+KIEM_FILE = 'kiem_ngoai_mien.csv'      # S03 v8.4 section 3.1
+
+
+def kiem_file(s03_dir):
+    """S84-3: the path of the S03 v8.4 check file, None when the S03 run has none. Refused before it is opened or
+    hashed when it is a link or junction, resolves anywhere else (a link on its path), is not a plain file or has
+    a second hard link: it must never alias a sealed file (L56; every caller of read_domain and fingerprint, the
+    RSM script too, goes through here)."""
+    p = os.path.join(s03_dir, KIEM_FILE)
+    if not os.path.lexists(p):
+        return None
+    real = os.path.normcase(os.path.realpath(p))
+    if (os.path.islink(p) or getattr(os.path, 'isjunction', lambda q: False)(p)
+            or real != os.path.normcase(os.path.abspath(p))):
+        sys.exit(f'{p} is a link or resolves to {real}: refused (S04 v6.6, L56)')
+    st = os.lstat(p)
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
+        sys.exit(f'{p}: not a plain file with one name ({st.st_nlink} links): refused (S04 v6.6, L56)')
+    return p
+
+
+def read_out_of_range(s03_dir, ctrl):
+    """S04 v6.6 section 2: {(factor, 'L' | 'H'): summary} of the S03 v8.4 kiem_ngoai_mien.csv for one controller,
+    e.g. '4 điểm: không cờ 4, chưa kết luận 0, cờ 0' (a side without points: '0 điểm'), with '(lượt kiểm: <total>)'
+    when the total of the controller is not 'đã kiểm đủ'. {} when the S03 run has no such file (before v8.4)."""
+    p = kiem_file(s03_dir)
+    if p is None:
+        return {}
+    rows = [r for r in read_csv(p) if r['controller'] == ctrl]
+    tot = [r['ket_qua'] for r in rows if r['dong'] == 'tong']
+    tail = '' if tot == ['đã kiểm đủ'] else f' (lượt kiểm: {" ".join(tot) or "không có dòng tổng"})'
+    out = {}
+    for n in s3.FACTORS[ctrl]:
+        for side in ('L', 'H'):
+            res = [r['ket_qua'] for r in rows if r['dong'] == 'diem' and r['factor'] == n and r['can'] == side]
+            out[(n, side)] = (f'{len(res)} điểm' + (': ' + ', '.join(f'{k} {res.count(k)}' for k in s3.KIEM_POINT)
+                                                    if res else '') + tail)
     return out
 
 
@@ -238,7 +286,7 @@ def edge_flags(dom, x):
     return [d['name'] for d, xi, a, b in zip(dom, x, lo, hi) if min(xi - a, b - xi) <= EDGE_FRAC * (b - a)]
 
 
-GRID_END_SOURCES = ('hết lưới nối', 'hết lưới dưới')   # S03 v8.3 level sources: the grid ended there
+GRID_END_SOURCES = ('hết lưới', 'hết lưới dưới')   # S03 v8.4 level sources: the original grid ended there (v6.6)
 
 
 def edge_sides(dom, x):
@@ -256,17 +304,19 @@ def edge_sides(dom, x):
 
 
 def edge_report(dom, x):
-    """selected.csv edge columns (S04 v6.4 section 2, C14-2): edge = the flagged factors (unchanged);
+    """selected.csv edge columns (S04 v6.4 section 2, C14-2; v6.6): edge = the flagged factors (unchanged);
     edge_side = factor:side; edge_src = factor:side:source of that bound (S03 levels.csv, '?' when the S03 run
-    has none); edge_limit = the flagged factors whose bound on that side is a grid end ('hết lưới nối',
-    'hết lưới dưới'): the limit 'vùng ngoài biên chưa khảo sát'. No flag, no limit, whatever the sources."""
+    has none); edge_limit = the flagged factors whose bound on that side is a grid end ('hết lưới',
+    'hết lưới dưới'): the limit 'vùng ngoài biên chưa khảo sát bằng GA', each with the result of the S03 v8.4
+    out-of-range check on that side ('?' when the S03 run has no check file). No flag, no limit, whatever the
+    sources. The four keys are fixed (rsm_compare.py writes them for the RSM candidates, section 12)."""
     by = {d['name']: d for d in dom}
     sides = edge_sides(dom, x)
     src = [(n, s, by[n].get('L_src' if s == 'L' else 'H_src') or '') for n, s in sides]
-    lim = [f'{n}:{s}' for n, s, c in src if c in GRID_END_SOURCES]
+    lim = [f'{n}:{s} [kiểm ngoài miền: {by[n].get(s + "_kiem") or "?"}]' for n, s, c in src if c in GRID_END_SOURCES]
     return dict(edge=' '.join(edge_flags(dom, x)), edge_side=' '.join(f'{n}:{s}' for n, s in sides),
                 edge_src=' | '.join(f'{n}:{s}:{c or "?"}' for n, s, c in src),
-                edge_limit=('vùng ngoài biên chưa khảo sát: ' + ' '.join(lim)) if lim else '')
+                edge_limit=('vùng ngoài biên chưa khảo sát bằng GA: ' + ' '.join(lim)) if lim else '')
 
 
 def mu_rule(s03_dir, ctrl, gate, mu_levels):
@@ -1041,7 +1091,7 @@ def pymoo_file_hashes():
 
 def fingerprint(dll, s03_dir, unsealed=False):
     """S4C-2: what must not change between the trial, the main runs and the post checks of one folder
-    (S04 7): the DLL, the S03 files the domain and the mu rule come from (sealed/runs.csv only with
+    (S04 7): the DLL, the S03 files the domain and the mu rule come from (v6.6: kiem_ngoai_mien.csv too; sealed/runs.csv only with
     --s03-unsealed, L56), the plant source blobs (L34), the Python sources the simulation and the
     scoring import (SOURCES), D, the library versions and the pymoo files of PYMOO_CV."""
     names = ('meta.yaml', 'levels.csv', 'design.csv') + (('sealed/runs.csv',) if unsealed else ())
@@ -1049,6 +1099,8 @@ def fingerprint(dll, s03_dir, unsealed=False):
     for n in names:
         p = os.path.join(s03_dir, n)
         s03_files[n] = s3.sha256_file(p) if os.path.isfile(p) else None
+    kp = kiem_file(s03_dir)                     # S84-2: read_domain reads it (S04 v6.6), so it is locked too;
+    s03_files[KIEM_FILE] = s3.sha256_file(kp) if kp else None     # S84-3: checked before it is hashed
     root = os.path.join(HERE, '..')
     scripts = {n: s3.sha256_file(os.path.join(root, n)) for n in SOURCES}
     return dict(dll_sha256=s3.sha256_file(dll), s03_files=s03_files, plant_src=fwsim.PLANT_SRC, scripts=scripts, D=D,
@@ -1254,6 +1306,7 @@ libraries: {json.dumps(fwsim.lib_versions())}
 interpretations:   # of this script, not written in S04 v5; Liam or THESIS correct if wrong
   - "a new script fwsim/s04_ga.py (S04 9.1 names tune_ga.py): tune_ga.py keeps its velocity objective for the old runs, unchanged"
   - "S04 v6.4 (C14-2; Liam 15/11 CODE_FEAS 'Code ngay + Codex'): selected.csv keeps edge (the 5 % flag, formula unchanged) and adds edge_side (factor:L or :H), edge_src (factor:side:source of that bound from the S03 levels.csv L_nguon / H_nguon, ? when the S03 run has none) and edge_limit (the flagged factors whose bound is a grid end, 'het luoi noi' or 'het luoi duoi': the limit 'vung ngoai bien chua khao sat'); no flag, no limit; RSM candidates (section 12) are not in this script yet"
+  - "S04 v6.6 (Liam 17/11 THESIS_SLIDE; script: Liam 17/11 CODE_FEAS 'Code + Codex 2 vong'): the GA domain is [L, H] of the original S03 grid (S03 v8.4: the extension only for the out-of-range check); levels of S03 v8.3 (H_nguon 'het luoi noi' or H above b) are refused; edge_limit names the grid ends 'het luoi', 'het luoi duoi' (limit 'vung ngoai bien chua khao sat bang GA') with the S03 kiem_ngoai_mien.csv result on that side (? without the file)"
   - "mu rule: every S03 design point that ran (centre, outer, inner box: the inner box always runs since L41), every gate speed; status other than ok (track_err, run_error) or y1 inconclusive at any mu is 'not satisfied'"
   - "HV: exact 2-D staircase on the feasible non-dominated points of the population after each generation's survival, strictly inside the reference; the trial rule compares generation gen_base with gen_base - 5 (15 and 20); with --tool-check and gen_base < 6 with generation 1"
   - "pareto.csv: per seed's final population, the non-dominated points among the feasible points and, separately, among the infeasible points (column feasible; nondominated_feasible true only for the first group, nondominated_in_group true for both); always written with its header, also when empty; final_population.csv: every point of it with both flags (S04 8)"
