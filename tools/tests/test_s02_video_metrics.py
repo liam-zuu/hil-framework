@@ -24,6 +24,8 @@ import s02_video_metrics as V  # noqa: E402
 from agv_logger import COLUMNS  # noqa: E402
 from test_s02_metrics_v3 import T0, mk  # noqa: E402
 
+T_MAT, T_TRONG = 0.68, 0.10        # s, test values of t_mat_s, t_trong_s (the O1 draft numbers; the tool reads them
+                                   # only from the C8 constants file, fix/s02-video-hang-so)
 D_TRUE = 1_234.5678                  # s: t_log = t_cam + D (video clock far from the ESP32 clock)
 OFF = (1.30, -0.75, 2.40)            # world pose of the test frame origin (x0, y0, heading at the start)
 TAU = 0.12                           # s, the car's lag behind r(t)
@@ -128,6 +130,21 @@ def _write_log(path, log):
             w.writerow(row)
 
 
+def hang_so(tmp_path, name='hang_so.json', **over):
+    """A valid C8 constants file (c7_hang_so_v1, the keys tools/c7_score.load_hang_so checks) with t_mat_s, t_trong_s
+    = T_MAT, T_TRONG unless overridden; returns its path."""
+    d = dict(version='c7_hang_so_v1', trang_thai='de_xuat', nguon='test', U_p_m=0.005, U_psi_deg=2.0,
+             u_t_ghep_s=0.005, troi_ppm=200.0, t_trong_s=T_TRONG, t_mat_s=T_MAT, bump_px=12.0, drift_px=1.5,
+             pred_m=0.02, pred_half=6, pred_min=4, yaw_nghi_deg=3.0, v_d=0.01,
+             imu=dict(period_s=0.05, tau_hat_s=0.0, s_plus=0.0, s_minus=0.0, j_lim_s=0.005, h_lim_s=0.105, pre_s=3.0,
+                      wz_still=0.05, n_min=30,
+                      U_IMU_deg={'O1-F02': 1.0, 'O1-F05': 1.0, 'O1-F08': 1.0, 'O1-K1': 1.0, 'O1-K2': 1.0}))
+    d.update(over)
+    path = tmp_path / name
+    path.write_text(json.dumps(d), encoding='utf-8')
+    return str(path)
+
+
 def log_rows(log, tmp_path, name='log.csv'):
     p = tmp_path / name
     _write_log(p, log)
@@ -147,7 +164,7 @@ def plant_dict(out, cam=None, info=None):
     pl = _table(out, V.COLUMNS)
     if cam is not None:
         pl['_cam'] = _table(cam, V.CAM_COLUMNS)
-        pl['_cam']['t_miss_s'] = info['t_miss_s'] if info else V.T_MISS
+        pl['_cam']['t_miss_s'] = info['t_miss_s'] if info else T_MAT
     return pl
 
 
@@ -158,7 +175,7 @@ def scored(test, tmp_path, frames_kw=None, drop=None, **kw):
     if drop is not None:
         log = drop_lines(log, drop)
     _, rows = log_rows(log, tmp_path)
-    info, out, cam = V.map_video(frames_of(log, tr, **(frames_kw or {})), rows)
+    info, out, cam = V.map_video(frames_of(log, tr, **(frames_kw or {})), rows, T_MAT, T_TRONG)
     pl = plant_dict(out, cam, info) if out else None
     m = M.score_run(log, test, 'real', plant=pl) if pl is not None else None
     return log, tr, info, pl, m
@@ -230,12 +247,12 @@ def test_rest_pose_is_the_mean_before_t0_not_the_value_at_t0(tmp_path):
 
 
 def test_a_camera_gap_across_the_rest_is_no_rest_pose(tmp_path):
-    """S2V2-1 (Codex round 2): frames lost over [-1.0, -0.26) s, a gap of about 0.77 s (> T_MISS 0.68 s) that meets
+    """S2V2-1 (Codex round 2): frames lost over [-1.0, -0.26) s, a gap of about 0.77 s (> T_MAT 0.68 s) that meets
     the rest [-0.5, 0) though only about 0.25 s of it lies inside: no rest pose, with the default t_miss (the clock
     itself is fine: the start span begins about 0.18 s before t = 0, after the gap)."""
     log, tr, info, pl, m = scored('A-L1', tmp_path, frames_kw=dict(lost=lambda t: -1.0 <= t < -0.26))
     assert info['ok'], info['reason']
-    assert pl['_cam']['t_miss_s'] == V.T_MISS
+    assert pl['_cam']['t_miss_s'] == T_MAT
     assert m['r_reason'] == 'no_rest_pose' and math.isnan(m['e_p_rms'])
 
 
@@ -258,10 +275,9 @@ def test_lost_log_lines_in_the_rest_do_not_move_the_rest_pose(tmp_path):
 @pytest.mark.parametrize('gap_s,lost,lost_pose', [(0.5, False, False), (0.9, True, False), (0.5, False, True),
                                                    (0.9, True, True)])
 def test_a_camera_gap_longer_than_t_miss_is_camera_lost(tmp_path, gap_s, lost, lost_pose):
-    """Frames lost over gap_s in the window: below T_MISS (0.68 s) the pose is interpolated across (cam_lost 0);
+    """Frames lost over gap_s in the window: below T_MAT (0.68 s) the pose is interpolated across (cam_lost 0);
     above it the lines have no pose, cam_lost 1 and the family R is refused (camera_lost). Invalid frames that keep a
     (wrong) pose are not used either."""
-    assert V.T_MISS == 0.68
     log, tr, info, pl, m = scored('A-L1', tmp_path, frames_kw=dict(lost=lambda t: 5.0 <= t < 5.0 + gap_s,
                                                                    lost_pose=lost_pose))
     assert info['ok'] and info['largest_gap_s'] == pytest.approx(gap_s, abs=0.04)
@@ -283,17 +299,17 @@ def test_a_video_that_ends_before_the_stop_is_not_scored(tmp_path):
     not ok, no pose rows (S2V1-7: the uncovered end is a camera loss, not a silent gap)."""
     log, tr, info, pl, m = scored('A-L2', tmp_path, frames_kw=dict(t_end=4.0))
     assert not info['ok'] and info['reason'].startswith('clock_sync_failed (edges_not_covered: stop')
-    assert pl is None and info['edge_gaps_s']['start'] < V.T_GAP
+    assert pl is None and info['edge_gaps_s']['start'] < T_TRONG
 
 
 def test_frames_lost_at_both_edges_are_not_scored_with_a_wrong_offset(tmp_path):
     """S2V1-2 (Codex round 1, reproduced: D 46 ms off, corr 0.999, ok): frames lost over [-0.15, 0.35) s and
-    [5.85, 6.35) s (gaps 0.54 s < T_MISS, a short window) -> clock_sync_failed (edges_not_covered); the same loss in
+    [5.85, 6.35) s (gaps 0.54 s < T_MAT, a short window) -> clock_sync_failed (edges_not_covered); the same loss in
     the middle of the run (3.0-3.5 s) is scored."""
     log, tr, info, pl, m = scored('A-L2', tmp_path, frames_kw=dict(
         lost=lambda t: (-0.15 <= t < 0.35) or (5.85 <= t < 6.35)))
     assert not info['ok'] and 'edges_not_covered' in info['reason'] and pl is None
-    assert info['edge_gaps_s']['start'] > V.T_GAP and info['edge_gaps_s']['stop'] > V.T_GAP
+    assert info['edge_gaps_s']['start'] > T_TRONG and info['edge_gaps_s']['stop'] > T_TRONG
     (tmp_path / 'mid').mkdir()
     log, tr, info, pl, m = scored('A-L2', tmp_path / 'mid', frames_kw=dict(lost=lambda t: 3.0 <= t < 3.5))
     assert info['ok'] and info['offset_s'] == pytest.approx(D_TRUE, abs=0.002)
@@ -301,7 +317,7 @@ def test_frames_lost_at_both_edges_are_not_scored_with_a_wrong_offset(tmp_path):
 
 
 def test_frames_lost_just_inside_the_edge_span_are_refused(tmp_path):
-    """A gap of 0.15 s (> T_GAP 0.10 s) 0.5 s after the start, inside [edge - 0.2, edge + 1.0] s: refused; the same
+    """A gap of 0.15 s (> T_TRONG 0.10 s) 0.5 s after the start, inside [edge - 0.2, edge + 1.0] s: refused; the same
     gap 1.2 s after the start (outside the span) is scored."""
     log, tr, info, pl, m = scored('A-L1', tmp_path, frames_kw=dict(lost=lambda t: 0.5 <= t < 0.65))
     assert not info['ok'] and info['reason'].startswith('clock_sync_failed (edges_not_covered: start')
@@ -312,11 +328,11 @@ def test_frames_lost_just_inside_the_edge_span_are_refused(tmp_path):
 
 def test_a_gap_across_the_edge_span_counts_whole(tmp_path):
     """S2V2-2 (Codex round 2): frames lost over 0.14 s straddling the start of the span [first command - 0.2 s, ...]:
-    the part inside is only 0.07 s, the gap between the real frames 0.14 s > T_GAP: refused."""
+    the part inside is only 0.07 s, the gap between the real frames 0.14 s > T_TRONG: refused."""
     log, tr = run_of('A-L1')
     _, rows = log_rows(log, tmp_path)
     a = V.run_commands(rows)[0] - T0 * 1e-6 - V.EDGE_BEFORE_S
-    info, out, cam = V.map_video(frames_of(log, tr, lost=lambda t: a - 0.07 <= t < a + 0.07), rows)
+    info, out, cam = V.map_video(frames_of(log, tr, lost=lambda t: a - 0.07 <= t < a + 0.07), rows, T_MAT, T_TRONG)
     assert not info['ok'] and info['reason'].startswith('clock_sync_failed (edges_not_covered: start')
     assert info['edge_gaps_s']['start'] > 0.13
 
@@ -389,13 +405,13 @@ def test_a_camera_speed_that_does_not_match_is_clock_sync_failed(tmp_path):
 def test_gyro_cross_check_is_reported_only(tmp_path):
     log, tr = run_of('A-C1')
     _, rows = log_rows(log, tmp_path)
-    info, out, cam = V.map_video(frames_of(log, tr), rows)
+    info, out, cam = V.map_video(frames_of(log, tr), rows, T_MAT, T_TRONG)
     assert info['ok'] and info['gyro'] is not None and info['gyro']['channel'] == 'gyro'
     assert abs(info['gyro_minus_speed_s']) < 0.01
     fr = frames_of(log, tr)
     for f in fr:
         f['wz'] = 0.3                                                  # a gyro channel that cannot be fitted
-    info2, out2, cam2 = V.map_video(fr, rows)
+    info2, out2, cam2 = V.map_video(fr, rows, T_MAT, T_TRONG)
     assert info2['ok'] and info2['offset_s'] == info['offset_s'] and out2 == out and cam2 == cam
 
 
@@ -438,20 +454,21 @@ def test_command_line_and_run_dir_metrics_score_the_car(tmp_path, capsys):
     c7_measure.write_frames(str(tmp_path / 'frames.csv'), frames_of(log, tr))
     (tmp_path / 'track.json').write_text('{}', encoding='utf-8')
     out = str(tmp_path / 'r1_plant.csv')
-    assert V.main(['--frames', str(tmp_path / 'frames.csv'), '--log', lp, '--out', out]) == 0
+    hs = hang_so(tmp_path)
+    assert V.main(['--frames', str(tmp_path / 'frames.csv'), '--log', lp, '--hang-so', hs, '--out', out]) == 0
     info = json.loads((tmp_path / 'r1_plant_video.json').read_text(encoding='utf-8'))
     assert info['ok'] and info['inputs']['frames_sha256'] == V.sha256(str(tmp_path / 'frames.csv'))
     assert info['inputs']['track_json_sha256'] == V.sha256(str(tmp_path / 'track.json'))
     assert info['inputs']['log_sha256'] == V.sha256(lp)
     assert info['plant_sha256'] == V.sha256(out) and info['cam_sha256'] == V.sha256(str(tmp_path / 'r1_plant_cam.csv'))
-    assert V.main(['--frames', str(tmp_path / 'frames.csv'), '--log', lp, '--out', out]) == 2
+    assert V.main(['--frames', str(tmp_path / 'frames.csv'), '--log', lp, '--hang-so', hs, '--out', out]) == 2
     assert '#ket_qua,ma=2' in capsys.readouterr().out
     pl = M.load_plant(out)
     assert set(V.COLUMNS) <= set(pl) and np.all(np.isnan(pl['vx_b']))
     rng = np.random.default_rng(9)                                     # r2: camera speed unrelated -> exit 1
     lp2, _ = log_rows(log, tmp_path, 'r2.csv')
     c7_measure.write_frames(str(tmp_path / 'f2.csv'), frames_of(log, tr, speed=lambda t: rng.uniform(0, 0.3, len(t))))
-    assert V.main(['--frames', str(tmp_path / 'f2.csv'), '--log', lp2, '--out', str(tmp_path / 'r2_plant.csv')]) == 1
+    assert V.main(['--frames', str(tmp_path / 'f2.csv'), '--log', lp2, '--hang-so', hs, '--out', str(tmp_path / 'r2_plant.csv')]) == 1
     log_rows(log, tmp_path, 'r3.csv')                                  # r3: no video at all
     (tmp_path / 'runs.csv').write_text(
         'run_id,platform,controller,test_id,speed_mps,rep,file,aborted,block_status,result,reason\n'
@@ -534,3 +551,55 @@ def test_read_log_rows_takes_a_path_object(tmp_path):
     p, rows = log_rows(log, tmp_path)
     import pathlib
     assert V.read_log_rows(pathlib.Path(p)) == rows
+
+
+def test_the_thresholds_come_only_from_the_c8_constants_file(tmp_path, capsys):
+    """fix/s02-video-hang-so (CODE 17/11): no number kept in the tool (the c7_score constants T_MISS, T_GAP are gone);
+    t_mat_s, t_trong_s of --hang-so decide. A 0.5 s camera gap mid-run: interpolated with t_mat_s 0.68, camera_lost
+    with 0.4; a 0.15 s gap 0.5 s after the start: edges_not_covered with t_trong_s 0.10, covered with 0.20. The json
+    binds the constants file (SHA-256, version, trang_thai)."""
+    assert not hasattr(V, 'T_MISS') and not hasattr(V, 'T_GAP')
+    log, tr = run_of('A-L2')
+    lp, _ = log_rows(log, tmp_path, 'r.csv')
+
+    def run(name, lost, **hs_over):
+        d = tmp_path / name
+        d.mkdir()
+        c7_measure.write_frames(str(d / 'frames.csv'), frames_of(log, tr, lost=lost))
+        hs = hang_so(d, **hs_over)
+        code = V.main(['--frames', str(d / 'frames.csv'), '--log', lp, '--hang-so', hs, '--out', str(d / 'p.csv')])
+        info = json.loads((d / 'p_video.json').read_text(encoding='utf-8'))
+        return code, info, hs
+
+    mid = lambda t: 3.0 <= t < 3.5                                     # noqa: E731
+    code, info, hs = run('a', mid)
+    assert code == 0 and info['ok'] and info['n_lost'] == 0 and info['t_miss_s'] == 0.68
+    assert info['inputs']['hang_so_sha256'] == V.sha256(hs) and info['inputs']['hang_so_trang_thai'] == 'de_xuat'
+    assert info['inputs']['hang_so_version'] == 'c7_hang_so_v1'
+    code, info, _ = run('b', mid, t_mat_s=0.4)
+    assert code == 0 and info['n_lost'] > 0 and info['t_miss_s'] == 0.4
+    edge = lambda t: 0.5 <= t < 0.65                                   # noqa: E731
+    code, info, _ = run('c', edge)
+    assert code == 1 and 'edges_not_covered' in info['reason'] and info['t_gap_s'] == 0.10
+    code, info, _ = run('d', edge, t_trong_s=0.20)
+    assert code == 0 and info['ok'] and info['t_gap_s'] == 0.20
+
+
+def test_the_constants_file_is_required_and_checked(tmp_path, capsys):
+    """--hang-so is required; a file c7_score.load_hang_so refuses (t_trong_s not below t_mat_s, another version) is
+    an error (exit 2), nothing written."""
+    log, tr = run_of('A-L1')
+    lp, _ = log_rows(log, tmp_path, 'r.csv')
+    c7_measure.write_frames(str(tmp_path / 'frames.csv'), frames_of(log, tr))
+    base = ['--frames', str(tmp_path / 'frames.csv'), '--log', lp, '--out', str(tmp_path / 'p.csv')]
+    with pytest.raises(SystemExit):
+        V.main(base)
+    imu = json.loads(open(hang_so(tmp_path, name='ok.json'), encoding='utf-8').read())['imu']
+    for k, over in enumerate((dict(t_trong_s=0.68), dict(version='x'), dict(duong_lenh=[]), dict(imu=[]),
+                              dict(imu=dict(imu, U_IMU_deg=[1.0])),        # S2H1-1: wrong structure too
+                              dict(U_p_m=10 ** 400))):                      # S2H2-1: an integer too large for a float
+        hs = hang_so(tmp_path, name=f'bad{k}.json', **over)
+        assert V.main(base + ['--hang-so', hs]) == 2
+        assert '#ket_qua,ma=2' in capsys.readouterr().out
+        assert not (tmp_path / 'p.csv').exists() and not (tmp_path / 'p_video.json').exists()
+        assert not (tmp_path / 'p_cam.csv').exists()

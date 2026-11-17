@@ -15,15 +15,16 @@ timestamp_us).
    but started at the run's first non-zero command (s02_window, run_commands: from the run_active edge, motor on;
    the zero commands of the S02 preparation). Not ok -> no pose, reason clock_sync_failed: the o1_time_sync result
    not ok (correlation below MIN_CORR, |D - mean(start, end)| over SPLIT_TOL_S, no fit); the start and end thirds
-   more than SPLIT_TOL_S (50 ms) apart (S2V1-1: spec P2-3 line 137); a gap over T_GAP (c7_score, O1 O-3, 0.10 s,
-   [DE XUAT, khoa o C8]) between valid frames within [-0.2 s, +1.0 s] of the run's first or last non-zero command
+   more than SPLIT_TOL_S (50 ms) apart (S2V1-1: spec P2-3 line 137); a gap over t_gap (t_trong_s of the C8
+   constants file, --hang-so, read by c7_score.load_hang_so; O1 O-3) between valid frames within [-0.2 s, +1.0 s] of the run's first or last non-zero command
    (S2V1-2, Liam 17/11 "Doi camera phu hai canh (Recommended)": the start and the stop carry the timing; without
    them a short window fits a wrong D with a high correlation). The gyro channel (camera wz against gz_fused) is
    fitted too and only reported (cross-check, Liam "gyro kiem cheo").
 2. Pose on the log grid (P2-3 line 135): for every data line of the log (byte-for-byte duplicates dropped, sorted
    by timestamp_us), the camera pose at t_cam = t_log - D, linear between the two valid frames around it, psi
-   unwrapped over the valid frames first; never extrapolated. Two valid frames more than T_MISS apart
-   (c7_score.T_MISS, O1 3.3, 0.68 s, [DE XUAT, chot o C8]), or a line more than T_MISS before the first or after the
+   unwrapped over the valid frames first; never extrapolated. Two valid frames more than t_miss apart
+   (t_mat_s of the C8 constants file, O1 3.3; Liam 17/11 "0,68 s nhu O1": the O1 number, locked at C8), or a line
+   more than t_miss before the first or after the
    last valid frame (S2V1-7): no pose and cam_lost = 1 (P2-5 line 170: the measuring system failed, group 1);
    s02_metrics refuses the family R of a run with such a line inside its metric window (camera_lost). Lines just
    outside the camera span: no pose, cam_lost empty.
@@ -31,14 +32,18 @@ timestamp_us).
    only timestamp_us, x, y, theta filled) and cam_lost, so s02_metrics.score_run reads it as for SIM and HIL;
    <run>_plant_cam.csv, the valid frames on the log clock (timestamp_us, x, y, theta unwrapped as in the plant
    rows); <run>_plant_video.json (ok, reason, the fit, the edge gaps, the gyro cross-check, the largest gap between
-   valid frames, counts, SHA-256 of the inputs and of the two files, S2V1-3: s02_metrics checks them).
+   valid frames, counts, SHA-256 of the inputs (the constants file too, with its version and trang_thai) and of the
+   two files, S2V1-3: s02_metrics checks them).
 
 The rest pose p(0), psi(0) (mean camera pose over the 0.5 s before t = 0, P2-3 line 155, Liam 17/11 "0,5 s truoc
 t = 0", "Tinh tren khung camera (Recommended)") is taken by s02_metrics on the frames of <run>_plant_cam.csv: only
 score_run knows t = 0 (the two command anchors). No measurement uncertainty label (P2-3 line 157: the sign of a
 family-R difference on the car is read only once the C8b model is locked; Liam "Chi ghi so").
 
-  python tools/s02_video_metrics.py --frames <frames.csv> --log <esp32 log csv> --out <run>_plant.csv
+  python tools/s02_video_metrics.py --frames <frames.csv> --log <esp32 log csv> --hang-so <hang_so.json>
+                                    --out <run>_plant.csv
+The thresholds t_mat_s, t_trong_s come only from the C8 constants file (fix/s02-video-hang-so, CODE 17/11: the
+c7_score constants T_MISS, T_GAP were removed when the figure-8 scorer moved them into that file).
 Last line: #ket_qua,ma=0 pose written / 1 not ok (clock) / 2 error.
 """
 import argparse
@@ -58,7 +63,7 @@ for _p in (os.path.join(HERE, '..', 'rpi5'), os.path.join(HERE, '..', 'fwsim'), 
 import c7_measure                                                        # noqa: E402
 import s02_metrics                                                       # noqa: E402
 import o1_time_sync                                                      # noqa: E402
-from c7_score import T_GAP, T_MISS                                       # noqa: E402
+import c7_score                                                          # noqa: E402
 from s02_plant_ticks import PLANT_COLUMNS                                # noqa: E402
 
 COLUMNS = list(PLANT_COLUMNS) + ['cam_lost']
@@ -123,7 +128,7 @@ def camera_series(frames):
     return t, x, y, np.unwrap(psi)
 
 
-def pose_at(tq, t, x, y, psi, t_miss=T_MISS):
+def pose_at(tq, t, x, y, psi, t_miss):
     """Camera pose at the query times tq (camera clock): (x, y, psi, lost). Linear between the two valid frames
     around a query (a query on a frame takes it); none between two frames more than t_miss apart (lost 1); none
     outside [t[0], t[-1]] (never extrapolated): lost 1 when the nearest valid frame is more than t_miss away
@@ -232,8 +237,9 @@ def clock(frames, rows):
     return r, g, ''
 
 
-def map_video(frames, rows, t_miss=T_MISS, t_gap=T_GAP):
-    """(info, plant rows, camera rows) of one run (module docstring). Plant rows: lists in COLUMNS order, empty
+def map_video(frames, rows, t_miss, t_gap):
+    """(info, plant rows, camera rows) of one run (module docstring); t_miss, t_gap: t_mat_s, t_trong_s of the C8
+    constants file (no number kept here: they are locked at C8 with O1). Plant rows: lists in COLUMNS order, empty
     strings for the cells without a value; camera rows: the valid frames on the log clock (CAM_COLUMNS; S2V1-4: the
     rest pose is their mean); none when the clock is not ok."""
     info = dict(ok=False, reason='', t_miss_s=t_miss, t_gap_s=t_gap, offset_s=None, sync=None, gyro=None,
@@ -280,6 +286,8 @@ def main(argv=None) -> int:
     ap.add_argument('--log', required=True, help='ESP32 log of the run (agv_logger CSV)')
     ap.add_argument('--out', required=True, help='<run>_plant.csv (new file); the camera frames go to '
                     '<run>_plant_cam.csv, the info to <run>_plant_video.json')
+    ap.add_argument('--hang-so', required=True, help='the C8 constants file (c7_hang_so_v1, as tools/c7_score.py): '
+                    't_mat_s (camera loss) and t_trong_s (edge coverage)')
     a = ap.parse_args(argv)
     js = os.path.splitext(a.out)[0] + '_video.json'
     cp = os.path.splitext(a.out)[0] + '_cam.csv'
@@ -291,7 +299,12 @@ def main(argv=None) -> int:
     try:
         frames = c7_measure.read_frames(a.frames)
         rows = read_log_rows(a.log)
-        info, out, cam = map_video(frames, rows)
+        try:
+            hs = c7_score.load_hang_so(a.hang_so)
+        except Exception as exc:                        # noqa: BLE001  S2H1-1, S2H2-1 (Codex rounds 1, 2): any failure of
+            # the loader on the file (wrong structure, an integer too large for a float, ...) is an error of the file
+            raise ValueError(f'{a.hang_so}: not a c7_hang_so_v1 constants file ({type(exc).__name__}: {exc})') from exc
+        info, out, cam = map_video(frames, rows, hs['t_mat_s'], hs['t_trong_s'])
     except (OSError, ValueError, KeyError) as exc:
         print(f'error: {exc}')
         print('#ket_qua,ma=2')
@@ -299,7 +312,9 @@ def main(argv=None) -> int:
     tj = os.path.join(os.path.dirname(os.path.abspath(a.frames)), 'track.json')
     info['inputs'] = dict(frames=os.path.abspath(a.frames), frames_sha256=sha256(a.frames),
                           track_json_sha256=sha256(tj) if os.path.isfile(tj) else None,
-                          log=os.path.abspath(a.log), log_sha256=sha256(a.log))
+                          log=os.path.abspath(a.log), log_sha256=sha256(a.log),
+                          hang_so=os.path.abspath(a.hang_so), hang_so_sha256=hs['sha256'],
+                          hang_so_version=hs['version'], hang_so_trang_thai=hs['trang_thai'])
     for path, cols, data in ((a.out, COLUMNS, out), (cp, CAM_COLUMNS, cam)):
         with open(path, 'x', newline='') as f:
             w = csv.writer(f)
