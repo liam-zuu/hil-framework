@@ -508,6 +508,26 @@ def test_gt1_2_a_level_stopped_by_the_c8b_time_check_is_not_confirmed(demo_ds, t
     assert s['stop_reason_check'] == 'mismatch' and s['san_gio_c8b_dung'] == 'A-LADRC/G01 O1-F05@0.5'
 
 
+def test_gt2_2_a_level_outside_the_block_and_the_gate_does_not_stop_the_confirmation(demo_ds, tmp_path):
+    # GT2-2 (Codex round 2 of CODE_GATE; Liam 17/11 at CODE_GATE "Sửa 4 + Codex vòng 3 (Recommended)"): the gate of
+    # the demo has O1-F05 only; O1-F08 of the set stopped in explore runs; the F05 block confirms
+    for i in range(4):
+        folder = str(tmp_path / f'gio8_{i}')
+        os.makedirs(folder)
+        p = os.path.join(folder, 'c8b_gio.json')
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump(dict(format='c8b_gio_v1', ok=False, FAKE=True, run=i, task='O1-F08'), f)
+        rl.begin(demo_ds, 'FAKE-explore', 'A-LADRC', 'HW', 'LADRC', 'O1-F08', '0.8', 'explore', gain_set='A-LADRC/G01')
+        rl.step(demo_ds, 'run')
+        rl.end(demo_ds, 'hong_he_do', completed=1, fail_cause=rl.C8B_GIO_FAIL, c8b_gio=p, results_dir=folder)
+    uids = _confirm_block(demo_ds, tmp_path, 'K1', ('dat', 'dat'))
+    for u in uids:
+        rl.so_h(demo_ds, u, _score_final(demo_ds, u, 0.5))
+    _freeze_ok(demo_ds, tmp_path)
+    s = {r['campaign']: r for r in _summary(demo_ds)}['A-LADRC']
+    assert s['stop_reason_check'] == 'ok' and s['san_gio_c8b_dung'] == 'A-LADRC/G01 O1-F08@0.8'
+
+
 def test_c9d4_a_block_of_lost_runs_only_is_not_confirmed(demo_ds, tmp_path):
     _lost_confirm(demo_ds, 'K1')
     with pytest.raises(rl.LogError, match='no valid run'):

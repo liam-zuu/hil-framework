@@ -1349,13 +1349,6 @@ def confirm_block_problem(tun_after: List[dict], ds: str, campaign: str, gain_se
     to summary, not to freeze; S05 v3.40 4.3 Q1, Liam 17/11 at THESIS "Nhờ C13 thêm kiểm (Recommended)"): at least
     CONFIRM_PER_LEVEL valid runs at every level (trajectory) of the gate. tun_after: the live rows after apply_so_h
     (a row without so-h keeps its logged outcome)."""
-    # GT1-2 (Codex round 1 of CODE_GATE; Liam 17/11 at CODE_GATE "Sửa theo bảng (Recommended)"): a level of the gain
-    # set stopped after the reruns of the C8b time check is chua_ket_luan (O1 3.5 v11.37), so the set is not confirmed
-    stop = sorted(f'{k[2]}@{k[3]}' for k, n in c8b_refusals(tun_after).items()
-                  if k[0] == campaign and k[1] == gain_set and n > C8B_RERUNS_MAX)
-    if stop:
-        return (f"{gain_set}: level(s) {', '.join(stop)} stopped after {C8B_RERUNS_MAX} reruns for the C8b time check "
-                '(chua_ket_luan, O1 3.5 v11.37; GT1-2)')
     conf = [r for r in tun_after if r.get('campaign') == campaign and r.get('platform') == 'HW'
             and r.get('stage') == 'confirm' and r.get('gain_set_id') == gain_set]
     if not conf:
@@ -1364,6 +1357,16 @@ def confirm_block_problem(tun_after: List[dict], ds: str, campaign: str, gain_se
     if not bid:
         return f"the last confirm car run of {gain_set} ({conf[-1].get('run_uid')}) has no block_id"
     block = [r for r in conf if r.get('block_id') == bid]
+    # GT1-2 (Codex round 1 of CODE_GATE; Liam 17/11 at CODE_GATE "Sửa theo bảng (Recommended)"): a level of the gain
+    # set stopped after the reruns of the C8b time check is chua_ket_luan (O1 3.5 v11.37), so the set is not confirmed.
+    # GT2-2 (round 2): only a level of the gate counts (`levels`, the gate file of the summary; freeze has none: the
+    # levels of the block)
+    lv = set(levels) if levels is not None else {r.get('trajectory') for r in block}
+    stop = sorted(f'{k[2]}@{k[3]}' for k, n in c8b_refusals(tun_after).items()
+                  if k[0] == campaign and k[1] == gain_set and k[2] in lv and n > C8B_RERUNS_MAX)
+    if stop:
+        return (f"{gain_set}: level(s) {', '.join(stop)} stopped after {C8B_RERUNS_MAX} reruns for the C8b time check "
+                '(chua_ket_luan, O1 3.5 v11.37; GT1-2)')
     so = {s.get('run_uid'): s for s in read_rows(os.path.join(ds, SO_H))}
     miss = [r.get('run_uid') for r in block if r.get('run_uid') not in so and r.get('run_outcome') in VALID]
     if miss:
@@ -1436,18 +1439,10 @@ def lost_gate_file_cols(r: dict, gate_file=None) -> dict:
 
 def gate_file_cols_problem(r: dict, gate_file=None) -> Optional[str]:
     """GT1-6 on a logged row without a gate: gate_file_sha256 / gate_report_only only on a lost run with its scorer
-    file SHA (CC1-2), equal to what the gate file in use gives (lost_gate_file_cols); a campaign run on a level that
-    may carry report-only conditions with a scorer file but without them, when the gate file is given, is an error."""
+    file SHA (CC1-2), equal to what the gate file in use gives (lost_gate_file_cols). GT2-1 (Codex round 2): a lost
+    run logged without a gate file keeps the CC1-2 path (no columns, all five required)."""
     sha, ro = r.get('gate_file_sha256', ''), r.get('gate_report_only', '')
     if not sha and not ro:
-        if gate_file is not None and r.get('gate_json_sha256') and r.get('campaign') in CAMPAIGNS:
-            try:
-                mask = gate_c8.mask_applies(r.get('platform', ''), r.get('stage', ''), r.get('campaign', ''))
-            except gate_c8.GateFileError as exc:
-                return str(exc)
-            if mask:
-                return ('a lost campaign run with its scorer file but without the gate file columns (its H1 score at '
-                        'so-h needs them; GT1-6)')
         return None
     if r.get('run_outcome') != 'hong_he_do' or not r.get('gate_json_sha256'):
         return 'gate_file_sha256 / gate_report_only without a gate: only for a lost run with its scorer file (GT1-6)'
@@ -1709,27 +1704,37 @@ def c8b_refusals(tun: List[dict]) -> Dict[tuple, int]:
         if not _c8b_counted(r):
             continue
         uid, k = r.get('run_uid'), map_key(r)
-        if not r.get('gain_set_id') and r.get('campaign') in GAIN_OWNERS:
+        own = r.get('campaign') in GAIN_OWNERS   # GT2-3: the identity checks only for runs of a campaign with gain sets
+        if not r.get('gain_set_id') and own:
             raise LogError(f"{uid}: a floor run of {r.get('campaign')} outside the final session carries its gain set "
                            'id (--gain-set): the reruns after the C8b time check are counted per gain set (GT1-7)')
-        g = {x: _num_text(r.get('g_' + x)) for x in GAINS if r.get('g_' + x, '') != ''}
-        old = gains.setdefault(k, dict(g))
-        diff = sorted(x for x in set(g) & set(old) if g[x] != old[x])
-        if diff:
-            raise LogError(f"{uid}: gain set {r.get('gain_set_id')} with other values of {', '.join(diff)} than an "
-                           f"earlier floor run at {r.get('trajectory')}@{r.get('speed_mps')} (one gain set, one gain; "
-                           'GT1-7)')
-        old.update(g)
         lvl = (k[0], k[2], k[3])
         if n[k] > C8B_RERUNS_MAX:
             raise LogError(f"{uid}: {r.get('trajectory')}@{r.get('speed_mps')} of {r.get('gain_set_id')} "
                            f'stopped after {C8B_RERUNS_MAX} reruns for the C8b time check (O1 3.5 v11.37: the level is '
                            'chua_ket_luan), no run after that')
-        twin = [gs for gs, gg in stopped[lvl] if gs != k[1] and g and gg == g]
-        if twin:
-            raise LogError(f"{uid}: the gains of {r.get('gain_set_id') or '(no gain set)'} at {r.get('trajectory')}@"
-                           f"{r.get('speed_mps')} are those of {twin[0]}, stopped after {C8B_RERUNS_MAX} reruns for "
-                           'the C8b time check: one candidate under another name, no run after that (GT1-7)')
+        old = gains.setdefault(k, {})
+        if own:
+            g = {x: _num_text(r.get('g_' + x)) for x in GAINS if r.get('g_' + x, '') != ''}
+            diff = sorted(x for x in set(g) & set(old) if g[x] != old[x])
+            if diff:
+                raise LogError(f"{uid}: gain set {r.get('gain_set_id')} with other values of {', '.join(diff)} than an "
+                               f"earlier floor run at {r.get('trajectory')}@{r.get('speed_mps')} (one gain set, one "
+                               'gain; GT1-7)')
+            old.update(g)
+            # GT1-7 (round 2): against a stopped set, the gains known for this gain set at this level (this row and
+            # the earlier ones); none known: it cannot be told from the stopped set, so it is refused
+            others = [(gs, gg) for gs, gg in stopped[lvl] if gs != k[1]]
+            if others and not old:
+                raise LogError(f"{uid}: {r.get('gain_set_id')} at {r.get('trajectory')}@{r.get('speed_mps')} without gain "
+                               f'values (--gains), where {others[0][0]} stopped after {C8B_RERUNS_MAX} reruns for the '
+                               'C8b time check: it cannot be told from the stopped set (GT1-7)')
+            twin = [gs for gs, gg in others if set(gg) & set(old) and all(gg[x] == old[x] for x in set(gg) & set(old))]
+            if twin:
+                raise LogError(f"{uid}: the gains of {r.get('gain_set_id')} at {r.get('trajectory')}@"
+                               f"{r.get('speed_mps')} agree with those of {twin[0]}, stopped after {C8B_RERUNS_MAX} reruns "
+                               'for the C8b time check: one candidate under another name, no run after that (give the '
+                               'full gains of a new candidate; GT1-7)')
         if r.get('fail_cause') == C8B_GIO_FAIL:
             if not r.get('gain_set_id'):
                 raise LogError(f"{uid}: a {C8B_GIO_FAIL} run carries its gain set id (counted per gain set)")
@@ -1854,14 +1859,6 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
                            f'{outcome}')
         if not results_dir:
             raise LogError('--gate-json needs --results-dir (so-h looks for the H0 scorer file there, C9D-1)')
-        if gate_file is None and run['row'].get('campaign') in CAMPAIGNS:                    # GT1-6
-            try:
-                mask = gate_c8.mask_applies(plat or '', stage or '', run['row'].get('campaign', ''))
-            except gate_c8.GateFileError as exc:
-                raise LogError(str(exc))
-            if mask:
-                raise LogError('a lost campaign run with its scorer file on a level that may carry report-only '
-                               'conditions needs --gate-file (the H1 score of so-h is checked against it; GT1-6)')
     if gate is not None:
         if not results_dir:
             raise LogError('--gate-json needs --results-dir (the run must be scorable again, GV3-6)')

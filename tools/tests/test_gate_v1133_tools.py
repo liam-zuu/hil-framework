@@ -412,8 +412,9 @@ def test_c8b_fourth_failure_stops_the_level_in_total_not_in_a_row(ds):
     assert 'chua ket luan' in rl.refusal_note(d, row)
     with pytest.raises(rl.LogError, match='stopped after 3 reruns for the C8b time check'):
         rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'confirm', gain_set='A-PID/G01')
-    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G02')   # other gain still runs
-    rl.cancel(d)
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G02',
+             gains='kp_xy=2.0')                                               # other gain still runs (its gains given:
+    rl.cancel(d)                                                              # GT1-7 round 2)
     s = {r['campaign']: r for r in rl.summary(d)}['A-PID']
     assert s['san_gio_c8b_n'] == '6' and s['san_gio_c8b_dung'] == 'A-PID/G01 O1-F05@0.5'
 
@@ -464,12 +465,13 @@ def test_cc1_2_lost_run_without_gate_through_end_and_so_h(ds):
     rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
     rl.step(d, 'run')
     assert rl.main(['--dataset', d, 'end', '--outcome', 'hong_he_do', '--fail-cause', 'mat_khung_FAKE',
-                    '--results-dir', folder, '--gate-json', sp, '--gate-file', str(tmp / 'gate_c8.json')]) == 0
+                    '--results-dir', folder, '--gate-json', sp]) == 0      # GT2-1: no gate file, as CC1-2
     row = rl.read_rows(os.path.join(d, rl.TUNING))[-1]
     assert row['gate_json_sha256'] == rl.sha256_file(sp) and not rl.has_gate(row)
+    assert (row['gate_file_sha256'], row['gate_report_only']) == ('', '')
     r = rl.so_h(d, row['run_uid'], rl.fake_score_final(folder, 0.8))
     assert r['outcome_sau'] == 'hong_he_do'
-    rl.summary(d, gate_file=gf)
+    rl.summary(d)
 
 
 def test_cc1_2_gate_null_only_for_a_lost_run(ds):
@@ -485,7 +487,7 @@ def test_cc1_2_gate_null_only_for_a_lost_run(ds):
     with pytest.raises(rl.LogError, match='results-dir'):
         rl.end(d, 'hong_he_do', completed=1, fail_cause='mat_khung_FAKE', gate=None, gate_sha256=rl.sha256_file(sp))
     rl.end(d, 'hong_he_do', completed=1, fail_cause='mat_khung_FAKE', results_dir=folder, gate=None,
-           gate_sha256=rl.sha256_file(sp), gate_file=gf)
+           gate_sha256=rl.sha256_file(sp))
     p = os.path.join(d, rl.TUNING)
     rows = rl.read_rows(p)
     rows[-1].update(run_outcome='khong_dat', campaign='')                    # edited by hand: refused
@@ -607,9 +609,6 @@ def test_gt1_6_a_lost_run_without_gate_keeps_its_gate_file_for_so_h(ds):
     folder, sp = _lost_score(d, tmp, 'lost6')
     rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F08', str(rl.FIG8['O1-F08']), 'screen', gain_set='A-PID/G01')
     rl.step(d, 'run')
-    with pytest.raises(rl.LogError, match='--gate-file'):
-        rl.end(d, 'hong_he_do', completed=1, fail_cause='mat_khung_FAKE', results_dir=folder, gate=None,
-               gate_sha256=rl.sha256_file(sp))
     assert rl.main(['--dataset', d, 'end', '--outcome', 'hong_he_do', '--fail-cause', 'mat_khung_FAKE',
                     '--results-dir', folder, '--gate-json', sp, '--gate-file', str(tmp / 'gate_c8.json')]) == 0
     row = rl.read_rows(os.path.join(d, rl.TUNING))[-1]
@@ -695,3 +694,54 @@ def test_gt1_8_the_time_file_belongs_to_the_run(ds):
     rl._write_all(path, rl.TUNING_COLS, rows)
     with pytest.raises(rl.LogError, match='another run'):
         rl.summary(d)
+
+
+# ── Codex round 2 of CODE_GATE (GT1-7 rest, GT2-1, GT2-3; Liam 17/11 at CODE_GATE "Sửa 4 + Codex vòng 3
+# (Recommended)"). Each test fails on 7623570 ──
+
+def _lost_plain(d, gs, gains='', task='O1-F05'):
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', task, str(rl.FIG8[task]), 'screen', gain_set=gs, gains=gains)
+    rl.step(d, 'run')
+    return rl.end(d, 'hong_he_do', completed=1, fail_cause='mat_khung_FAKE', queries=rl.fake_queries())
+
+
+def test_gt1_7_round2_a_known_name_without_its_gains_does_not_reopen_a_stopped_level(ds):
+    d, gf, tmp = ds
+    _lost_plain(d, 'A-PID/G09', gains=G01)                                   # G09 known with the gains G01
+    for i in range(4):
+        _lost_gio(d, tmp, f'r{i}', gains=G01)                                # G01 (same gains) stops at F05
+    with pytest.raises(rl.LogError, match='stopped'):                        # Codex round 2: --gains left out
+        rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G09')
+    with pytest.raises(rl.LogError, match='without gain values'):            # a new name with no gains at all
+        rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G10')
+    with pytest.raises(rl.LogError, match='agree'):                          # part of the gains, all equal
+        rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G10', gains='kp_xy=1.0')
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G10',
+             gains='kp_xy=1.0,ki_xy=0.7,kp_wz=1.0')                          # another candidate
+    rl.cancel(d)
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F08', str(rl.FIG8['O1-F08']), 'screen', gain_set='A-PID/G10')
+    rl.cancel(d)                                                             # no stop at F08: no gains needed
+
+
+def test_gt2_1_a_lost_run_without_gate_needs_no_gate_file(ds):
+    d, gf, tmp = ds
+    folder, sp = _lost_score(d, tmp, 'lost21')
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F08', str(rl.FIG8['O1-F08']), 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    row = rl.end(d, 'hong_he_do', completed=1, fail_cause='mat_khung_FAKE', results_dir=folder, gate=None,
+                 gate_sha256=rl.sha256_file(sp))                             # CC1-2 without the gate file
+    assert (row.get('gate_file_sha256', ''), row.get('gate_report_only', '')) == ('', '')
+    rl.summary(d)
+    rl.summary(d, gate_file=gf)
+
+
+def test_gt2_3_rows_without_campaign_are_not_checked_for_one_gain(ds):
+    d, gf, tmp = ds
+    _lost_plain(d, 'A-PID/G01', gains='kp_xy=1.0')
+    _lost_plain(d, 'A-PID/G02', gains='kp_xy=2.0')
+    p = os.path.join(d, rl.TUNING)
+    rows = rl.read_rows(p)
+    for r in rows:                                                           # historic rows: no campaign, no gain set
+        r.update(campaign='', gain_set_id='')
+    rl._write_all(p, rl.TUNING_COLS, rows)
+    rl.summary(d)
