@@ -232,6 +232,13 @@ def test_cli_wait_swa_refuses_a_folder_with_an_old_swa_answer(tmp_path):
     assert '#gain_query' not in p.stdout and '#wait_swa' not in p.stdout
 
 
+def test_cli_wait_swa_prompt_survives_a_cp1252_pipe():
+    env = dict(os.environ, PYTHONIOENCODING='cp1252')           # stdout a pipe in the Windows code page
+    p = subprocess.run([sys.executable, os.path.join(RPI5, 'pc_sender.py'), '--ip', '127.0.0.1', '--o1', 'O1-F02',
+                        '--wait-swa'], capture_output=True, stdin=subprocess.DEVNULL, env=env, timeout=60)
+    assert b'UnicodeEncodeError' not in p.stderr and b'Bat SWA' in p.stdout and p.returncode == 2
+
+
 def test_cli_wait_swa_eof_sends_nothing():
     p = _cli('--o1', 'O1-F02', '--wait-swa')                   # stdin closed: EOF at the wait
     assert p.returncode == 2
