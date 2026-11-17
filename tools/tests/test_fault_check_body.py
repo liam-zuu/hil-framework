@@ -134,13 +134,15 @@ def test_dist_tolerance_finite_and_not_widened_by_the_record():
 def test_noise_one_ulp_apart_passes(run, tmp_path):
     # ARM/PC: a normal draw one ULP apart (numpy's ziggurat tail uses libm log): the f_dist it gives passes
     n = np.random.default_rng(3).standard_normal(250)
-    k0, d = 200, 200 - 150
+    k0, d = 153, 153 - 150                 # Codex FS3-2: at d = 50 the draw one ULP apart gave the same force
 
     def edit(rec):
         i = int(np.nonzero(rec[:, 0] == k0)[0][0])
         a = 2.5 + min(1.5, (0.8 * d) / 1000.0)
-        assert rec[i, C['f_dist']] == a + 1.6 * n[d]                       # the run's value, rebuilt here
+        old = rec[i, C['f_dist']]
+        assert old == a + 1.6 * n[d]                                        # the run's value, rebuilt here
         rec[i, C['f_dist']] = a + 1.6 * np.nextafter(n[d], np.inf)
+        assert rec[i, C['f_dist']] != old                                   # the force really changes
         return rec
     r = fc.check(*_tamper_record(run, tmp_path, edit))
     assert r['ok'], r['fails']

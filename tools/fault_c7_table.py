@@ -142,14 +142,21 @@ def fwsim_ticks(duration) -> int:
 def bench_ticks(duration) -> int:
     """ESP32 rows of [0, duration) on the bench: the number of j = 0, 1, .. whose ESP32 time round(j x 10 ms, 6)
     (the te of load_bench_run) is < duration (Codex FS1-1: not round(duration / 10 ms), 13.194 s has 1320 of
-    them; FS2-1: the duration is not rounded first, 9.000000001 s has 901)."""
+    them; FS2-1: the duration is not rounded first, 9.000000001 s has 901). Takes 0 <= duration <= BENCH_MAX_S,
+    ValueError otherwise (Codex FS3-1: there the whole numbers up to duration / 10 ms stay apart as floats, so
+    the two loops below run a few times at most; a run of a fault task lasts under a minute)."""
     d = float(duration)
+    if not 0.0 <= d <= BENCH_MAX_S:                  # NaN fails too
+        raise ValueError(f'duration {duration!r} s: bench_ticks takes 0 .. {BENCH_MAX_S:g} s')
     n = max(0, math.ceil(d / TICK_S) - 1)
     while round(n * TICK_S, 6) < d:
         n += 1
     while n > 0 and round((n - 1) * TICK_S, 6) >= d:
         n -= 1
     return n
+
+
+BENCH_MAX_S = 1e9                   # bench_ticks domain [s] (Codex FS3-1)
 M_LOSS = 16                         # fwsim/fault_run.py mask bit of imu_loss (faults_imu.csv)
 SAME_KEYS = ('task', 'mode', 'seed', 'imu_rate', 'imu_boot_reset', 'imu_noise', 'imu_noise_seed', 'ground', 'mu',
              'no_imu', 'duration')

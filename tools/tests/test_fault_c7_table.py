@@ -796,3 +796,16 @@ def test_tick_counts_at_the_half_ms_and_just_after_a_tick():
     for d in (0.3, 1.0695, 9.0, 13.19444694, 32.41592653589793):
         n = ct.bench_ticks(d)
         assert round((n - 1) * ct.TICK_S, 6) < d <= round(n * ct.TICK_S, 6), d
+
+
+# -- Codex round 3 (FS3-1) --
+def test_bench_ticks_domain():
+    import time
+    t = time.perf_counter()
+    for d in (ct.BENCH_MAX_S, 123456789.123456, 1e6 + 0.005):        # the largest taken: a few loop turns only
+        n = ct.bench_ticks(d)
+        assert round((n - 1) * ct.TICK_S, 6) < d <= round(n * ct.TICK_S, 6), d
+    assert time.perf_counter() - t < 1.0
+    for d in (1e307, 2.0 ** 100, ct.BENCH_MAX_S * 1.0000001, -0.001, float('nan'), float('inf')):
+        with pytest.raises(ValueError):
+            ct.bench_ticks(d)
