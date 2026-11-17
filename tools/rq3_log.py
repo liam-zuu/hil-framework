@@ -1766,10 +1766,35 @@ def _hex64(x) -> bool:
     return isinstance(x, str) and len(x) == 64 and all(ch in '0123456789abcdef' for ch in x)
 
 
-def read_c8b_gio(path: str, task: Optional[str] = None) -> str:
-    """The C8b time file of a run that failed its check (format c8b_gio_v1, ok false); returns its sha256. task (GT1-8):
-    the run's task; a 'task' field of the file, when it has one, must be it. DEFERRED (GT1-8): the SHA of the scored
-    inputs inside the file, until CODE_C8B fixes c8b_gio_v1."""
+C8B_GIO_INPUTS = ('esp32', 'frames')     # c8b_gio_v1 'sha256': the ESP32 log and the frames of ITS run (CODE_C8B)
+C8B_HASH_MAX_BYTES = 200 * 2 ** 20       # [DE XUAT] files hashed when looking for them under the run folder
+C8B_HASH_SKIP = ('.mov', '.mp4', '.m4v')  # clips (L88) are never the scored inputs
+
+
+def _hashes_under(folder: str, skip: str = '') -> set:
+    """sha256 of the files under `folder` that may be scored inputs (links resolved inside it; clips, files above
+    C8B_HASH_MAX_BYTES, unreadable files and `skip` left out)."""
+    out = set()
+    for root, _, names in os.walk(folder):
+        for n in names:
+            p = os.path.join(root, n)
+            if n.lower().endswith(C8B_HASH_SKIP) or (skip and os.path.normcase(os.path.realpath(p))
+                                                       == os.path.normcase(os.path.realpath(skip))):
+                continue
+            try:
+                if os.path.isfile(p) and os.path.getsize(p) <= C8B_HASH_MAX_BYTES and _inside(p, folder):
+                    out.add(sha256_file(p))
+            except OSError:
+                continue
+    return out
+
+
+def read_c8b_gio(path: str, task: Optional[str] = None, results_dir: Optional[str] = None) -> str:
+    """The C8b time file of a run that failed its check (format c8b_gio_v1, ok false); returns its sha256.
+    GT1-8 (Codex round 1 of CODE_GATE; the deferred part closed when CODE_C8B fixed c8b_gio_v1, Liam 17/11 at CODE_GATE
+    "Làm, nhánh nhỏ + Codex (Recommended)"): task, the run's task, must be the 'task' of the file; with results_dir, the
+    file's 'sha256' {esp32, frames} (64 lowercase hex each) must each be the sha256 of a file under the run folder, so
+    the time file is the one scored on this run's own log and frames."""
     try:
         with open(path, encoding='utf-8') as f:
             d = json.load(f)
@@ -1778,8 +1803,18 @@ def read_c8b_gio(path: str, task: Optional[str] = None) -> str:
     if not isinstance(d, dict) or d.get('format') != C8B_GIO_FORMAT or d.get('ok') is not False:
         raise LogError(f'--c8b-gio {path!r}: not a {C8B_GIO_FORMAT} file with ok false (the run must have failed the '
                        'C8b time check, O1 3.5 v11.37)')
-    if task is not None and 'task' in d and d['task'] != task:
-        raise LogError(f'--c8b-gio {path!r}: the time file of task {d["task"]!r}, the run is {task!r} (GT1-8)')
+    if task is not None and d.get('task') != task:
+        raise LogError(f'--c8b-gio {path!r}: the time file of task {d.get("task")!r}, the run is {task!r} (GT1-8)')
+    if results_dir is not None:
+        sh = d.get('sha256')
+        if not isinstance(sh, dict) or any(not _hex64(sh.get(k)) for k in C8B_GIO_INPUTS):
+            raise LogError(f'--c8b-gio {path!r}: no sha256 {{{", ".join(C8B_GIO_INPUTS)}}} of 64 lowercase hex digits '
+                           f'({C8B_GIO_FORMAT}, the inputs of the run; GT1-8)')
+        have = _hashes_under(results_dir, skip=path)
+        miss = [k for k in C8B_GIO_INPUTS if sh[k] not in have]
+        if miss:
+            raise LogError(f'--c8b-gio {path!r}: the {" and ".join(miss)} input(s) it was made from are not files under '
+                           f'the run folder {results_dir!r} (the time file of another run? GT1-8)')
     return sha256_file(path)
 
 
@@ -1847,7 +1882,7 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
         if not results_dir or not os.path.isdir(results_dir) or not _inside(c8b_gio, results_dir):   # GT1-8
             raise LogError(f'--c8b-gio {c8b_gio!r}: the C8b time file of this run, under its --results-dir folder '
                            f'({results_dir!r}; GT1-8)')
-        c8b_sha = read_c8b_gio(c8b_gio, task=run['row'].get('trajectory'))
+        c8b_sha = read_c8b_gio(c8b_gio, task=run['row'].get('trajectory'), results_dir=results_dir)
     if fail_cause == MAP_REFUSED and (gate is None or run['row'].get('platform') != 'HIL'):
         raise LogError(f'--fail-cause {MAP_REFUSED}: a HIL run with its scorer output (--gate-json) showing the '
                        'refused mapping (S05 v3.15 4.5 step 2)')

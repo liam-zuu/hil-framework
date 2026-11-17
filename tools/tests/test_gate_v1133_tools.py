@@ -357,18 +357,29 @@ def test_grid_only_on_the_floor(ds):
 # ── design v2 section 6: reruns after the C8b time check (O1 v11.37 D1, S05 v3.43 D2, D3; Liam 17/11 THESIS "Chỉ lượt
 # trượt kiểm giờ", "Tổng", "Bắt buộc file", "Luật §4.6: 3 hỏng liên tiếp"; the code: Liam 17/11 at CODE_GATE) ──
 
-def _gio(tmp, name, ok=False, fmt='c8b_gio_v1', **extra):
-    """A FAKE C8b time file; its name goes into it, so two files never share a sha256 (GT1-8)."""
+def _gio(tmp, name, ok=False, fmt='c8b_gio_v1', task='O1-F05', inputs_in=None, **extra):
+    """A FAKE C8b time file (c8b_gio_v1: task, sha256 {esp32, frames}) and the two FAKE inputs it names, written in
+    `inputs_in` (default: next to it); its name goes into every file, so no two share a sha256 (GT1-8)."""
+    folder = str(tmp if inputs_in is None else inputs_in)
+    sha = {}
+    for k in ('esp32', 'frames'):
+        q = os.path.join(folder, f'{name}_{k}.csv')
+        with open(q, 'w', encoding='utf-8', newline='\n') as f:
+            f.write(f'FAKE,{k},{name}\n')
+        sha[k] = rl.sha256_file(q)
     p = os.path.join(str(tmp), f'{name}.json')
+    d = dict(format=fmt, ok=ok, nodes_s=[0.01, 0.011], FAKE=True, name=name, sha256=sha, **extra)
+    if task is not None:
+        d['task'] = task
     with open(p, 'w', encoding='utf-8') as f:
-        json.dump(dict(format=fmt, ok=ok, nodes_s=[0.01, 0.011], FAKE=True, name=name, **extra), f)
+        json.dump(d, f)
     return p
 
 
 def _lost_gio(d, tmp, name, task='O1-F05', stage='screen', gs='A-PID/G01', gains=''):
     rl.begin(d, 'S', 'A-PID', 'HW', 'PID', task, str(rl.FIG8[task]), stage, gain_set=gs, gains=gains)
     rl.step(d, 'run')
-    return rl.end(d, 'hong_he_do', completed=1, fail_cause=rl.C8B_GIO_FAIL, c8b_gio=_gio(tmp, name),
+    return rl.end(d, 'hong_he_do', completed=1, fail_cause=rl.C8B_GIO_FAIL, c8b_gio=_gio(tmp, name, task=task),
                   results_dir=str(tmp), queries=rl.fake_queries())
 
 
@@ -683,8 +694,10 @@ def test_gt1_8_the_time_file_belongs_to_the_run(ds):
     rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
     rl.step(d, 'run')
     q = os.path.join(run2, 'copy.json')
-    with open(p, 'rb') as a, open(q, 'wb') as b:
-        b.write(a.read())
+    for src, dst in ((p, q),) + tuple((os.path.join(run1, f'own_{k}.csv'), os.path.join(run2, f'own_{k}.csv'))
+                                      for k in ('esp32', 'frames')):
+        with open(src, 'rb') as a, open(dst, 'wb') as b:                     # the file and its inputs copied
+            b.write(a.read())
     with pytest.raises(rl.LogError, match='another run'):                    # the same file again
         rl.end(d, 'hong_he_do', c8b_gio=q, results_dir=run2, **kw)
     rl.end(d, 'hong_he_do', c8b_gio=_gio(run2, 'own2'), results_dir=run2, **kw)
@@ -694,6 +707,39 @@ def test_gt1_8_the_time_file_belongs_to_the_run(ds):
     rl._write_all(path, rl.TUNING_COLS, rows)
     with pytest.raises(rl.LogError, match='another run'):
         rl.summary(d)
+
+
+def test_gt1_8_the_time_file_was_made_from_the_inputs_of_the_run(ds):
+    # GT1-8, the part deferred until CODE_C8B fixed c8b_gio_v1 (Liam 17/11 at CODE_GATE "Làm, nhánh nhỏ + Codex
+    # (Recommended)"): 'task' required, and sha256 {esp32, frames} are files under the run folder. Fails on 3f07c2a
+    d, gf, tmp = ds
+    run, other = (os.path.join(str(tmp), n) for n in ('run', 'other'))
+    os.makedirs(run)
+    os.makedirs(other)
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    kw = dict(completed=1, fail_cause=rl.C8B_GIO_FAIL, results_dir=run, queries=rl.fake_queries())
+    with pytest.raises(rl.LogError, match='input'):                          # made from the log of another run
+        rl.end(d, 'hong_he_do', c8b_gio=_gio(run, 'foreign', inputs_in=other), **kw)
+    with pytest.raises(rl.LogError, match='task'):                           # no task in the file
+        rl.end(d, 'hong_he_do', c8b_gio=_gio(run, 'notask', task=None), **kw)
+    p = _gio(run, 'nosha')
+    with open(p, encoding='utf-8') as f:
+        g = json.load(f)
+    for bad in ({}, {'esp32': g['sha256']['esp32']}, {'esp32': 'AB' * 32, 'frames': g['sha256']['frames']}):
+        g['sha256'] = bad
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump(g, f)
+        with pytest.raises(rl.LogError, match='sha256'):                     # missing, half, upper case
+            rl.end(d, 'hong_he_do', c8b_gio=p, **kw)
+    clip = _gio(run, 'clip')
+    os.replace(os.path.join(run, 'clip_esp32.csv'), os.path.join(run, 'clip_esp32.mp4'))
+    with pytest.raises(rl.LogError, match='esp32'):                          # a clip is never a scored input
+        rl.end(d, 'hong_he_do', c8b_gio=clip, **kw)
+    sub = os.path.join(run, 'sub')
+    os.makedirs(sub)
+    row = rl.end(d, 'hong_he_do', c8b_gio=_gio(run, 'mine', inputs_in=sub), **kw)   # inputs in a sub folder: fine
+    assert row['c8b_gio_sha256']
 
 
 # ── Codex round 2 of CODE_GATE (GT1-7 rest, GT2-1, GT2-3; Liam 17/11 at CODE_GATE "Sửa 4 + Codex vòng 3
