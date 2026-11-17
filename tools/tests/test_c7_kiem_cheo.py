@@ -55,7 +55,9 @@ def test_exact_scene_gives_zero(scene):
     groups = kc.make_groups(sorted(img))
     cams = kc.group_cams(img, marks, groups, 'B1', W, H, ZC)
     p1 = kc.p1_clip(img, marks, groups, cams)
-    assert set(p1) == set(img) and max(np.linalg.norm(v) for v in p1.values()) < 1e-5
+    # the centre is the back-projected MEAN of the image corners (CAM v2 1, KCC1-1): under perspective it is not the
+    # square's centre, a definition bias of < 0.1 mm here that P1 carries
+    assert set(p1) == set(img) and max(np.linalg.norm(v) for v in p1.values()) < 2e-4
     res, _ = _uso(img, img, [img] * 40, marks, groups)
     assert max(max(c['u_so_m'], c['u_so_tho_m']) for c in res.values()) < 1e-6
 
@@ -124,6 +126,7 @@ def test_p1_reports_the_tape_error_of_a_held_out_mark(scene):
 
 def _uso(img_a, img_b, frames_b, marks, groups, tap=None, frames_a=None, fps=60.0):
     frames_a = frames_a or [img_a] * 20
+    frames_b = frames_b or [img_b] * 20
     gc = kc.GroupCams(img_a, marks, groups, 'B1', W, H, ZC)
     ta = [k / fps for k in range(len(frames_a))]
     tb = [k / fps for k in range(len(frames_b))]
@@ -170,8 +173,11 @@ def test_u_so_counts_the_run_mark_sets(scene):
     assert res0['xe']['u_so_m'] < 1e-6
     hidden = [{1, 2, 3, 8, 9, 10, 15, 16, 17, 30, 31}, {20, 21, 22, 27, 28, 29}]
     tap = [sorted(set(img) - h) for h in hidden]
-    res, info = _uso(img, img, [], marks, groups, tap)
+    res, info = _uso(img, img, [], marks, groups, {'xe': tap})
     assert info['co_tap_luot'] and res['xe']['u_so_m'] > 2e-4
+    # KCC1-2: the sets of chain xe never enter another chain's u_so
+    assert all(res[c]['u_so_m'] == pytest.approx(res0[c]['u_so_m'], abs=1e-12) for c in res if c != 'xe')
+    assert any(x['tap'] != sorted(set(img) - set(groups[x['nhom_dich']])) for x in res['xe']['tap_tinh'])
 
 
 def test_u_so_window_and_raw_terms(scene):
@@ -208,7 +214,8 @@ def test_u_so_flags_sets_it_cannot_compute(scene):
     half_b = {i: c for i, c in img.items() if not i % 2}
     frames = [half_a, half_b] * 20
     res, _ = _uso(img, img, frames, marks, groups)
-    assert all(any(x['vi'] == 'cua_so' for x in c['khong_tinh_duoc']) for c in res.values())
+    assert all(any(x['vi'] in ('tho', 'cua_so') for x in c['khong_tinh_duoc']) for c in res.values())
+    assert all(c['tap_tinh'] == [] or all(x['tap'] for x in c['tap_tinh']) for c in res.values())
     r = kc.kiem_h(frames, sorted(img))
     assert r['ti_le_cung_luc'] == 0.0 and min(r['ti_le_moc'].values()) == 0.5
 
@@ -321,7 +328,8 @@ def test_c8b_u_reads_the_export():
     xo = {"version": "c8b_xoay_v1", "q_tag_m": [0.003, -0.004], "du_m": 0.0007}
     tb = dict(ga_ok=True, d_p_quay_m=0.0007, d_psi_quay_deg=0.25)
     up, p, upsi, s = CU.u_p_u_psi(cam, tb, tk, xo)
-    assert p['P1_anh_san'] == pytest.approx(0.0034 + 0.001 + 0.0003)
+    # KC1-3 / KCC1-13: the undetected shift adds nguong + 2 u_so (C8B d338af4); 1 x u_so is refused here
+    assert p['P1_anh_san'] == pytest.approx(0.0034 + 0.001 + 2 * 0.0003)
     assert s['A3_huong_vung'] == pytest.approx(0.15) and s['A5_nhieu_khung'] == pytest.approx(0.4)
     assert p['P7_nhieu_khung'] == pytest.approx(0.0006)
 
@@ -387,7 +395,7 @@ def _kc_file(tmp_path, **over):
     kcres = dict(version=kc.VERSION, buoi='C8_x', model='B1', nhom=[[1, 5], [2, 6]], thu=False,
                  sessions={n: dict(file=n, sha256='0' * 64) for n in kc.CLIPS_REQUIRED},
                  **{b: dict(blk, buoi='C8_x') for b, blk in _own().items() if b != '_src'})
-    kcres.update(u_so_sha256='5' * 64, moc=[dict(file='moc.csv', sha256='6' * 64)])
+    kcres.update(u_so_sha256='5' * 64, moc=[dict(file='moc.csv', sha256='6' * 64)], hang_so_sha256='4' * 64)
     kcres.update(over)
     p = tmp_path / 'kiem_cheo.json'
     p.write_text(json.dumps(kcres), encoding='utf-8')
@@ -397,7 +405,8 @@ def _kc_file(tmp_path, **over):
 def _xuat_args(tmp_path, kcp, tk_over=None, part_buoi='C8_x', buoi='C8_x'):
     tk = dict(version=kc.TUNG_KHUNG_VERSION, buoi='C8_x', model='B1', nhom=[[1, 5], [2, 6]], cham_lai=True,
               tung_khung_max_m=0.003, kiem_cheo_sha256=kc.sha256_file(str(kcp)), u_so_sha256='5' * 64,
-              session_sha256='0' * 64, moc=[dict(file='moc.csv', sha256='6' * 64)])
+              session_sha256='0' * 64, moc=[dict(file='moc.csv', sha256='6' * 64)], hang_so_sha256='4' * 64,
+              hoan_tat=True, luot_chua_co=[], mau_thuan=[], luot_thieu=['r3'])
     tk.update(tk_over or {})
     tkp = tmp_path / 'tk.json'
     tkp.write_text(json.dumps(tk), encoding='utf-8')
@@ -416,7 +425,8 @@ def test_xuat_ok(tmp_path):
 
 
 @pytest.mark.parametrize('bad', ['thu', 'no_Hm', 'tk_buoi', 'tk_nhom', 'tk_model', 'tk_sha', 'tk_not_rescored',
-                                 'part_buoi', 'arg_buoi', 'tk_u_so', 'tk_session', 'tk_moc'])
+                                 'part_buoi', 'arg_buoi', 'tk_u_so', 'tk_session', 'tk_moc', 'tk_hang_so',
+                                 'tk_not_complete', 'tk_contradiction'])
 def test_xuat_refuses_mixed_inputs(tmp_path, bad, capsys):
     """KC1-10: results of another session, grouping, model, kiem_cheo file, or before the rescoring are refused."""
     over = dict(thu=True) if bad == 'thu' else {}
@@ -426,70 +436,123 @@ def test_xuat_refuses_mixed_inputs(tmp_path, bad, capsys):
     tk_over = {'tk_buoi': dict(buoi='C8_y'), 'tk_nhom': dict(nhom=[[1], [2]]), 'tk_model': dict(model='B2'),
                'tk_sha': dict(kiem_cheo_sha256='f' * 64), 'tk_not_rescored': dict(cham_lai=False),
                'tk_u_so': dict(u_so_sha256='7' * 64), 'tk_session': dict(session_sha256='9' * 64),
-               'tk_moc': dict(moc=[dict(file='moc.csv', sha256='8' * 64)])}.get(bad)
+               'tk_moc': dict(moc=[dict(file='moc.csv', sha256='8' * 64)]),
+               'tk_hang_so': dict(hang_so_sha256='3' * 64),
+               'tk_not_complete': dict(hoan_tat=False, luot_chua_co=['r9']),
+               'tk_contradiction': dict(mau_thuan=[dict(clip='H_m', moc=25)])}.get(bad)
     args = _xuat_args(tmp_path, kcp, tk_over, part_buoi='C8_y' if bad == 'part_buoi' else 'C8_x',
                       buoi='C8_y' if bad == 'arg_buoi' else 'C8_x')
     assert kc.main(args) == 2
     assert not (tmp_path / 'o.json').exists()
 
 
-# ---------------------------------------------------------------- tung_khung (design v4 5, KC1-4, KC1-6, KC3-2)
+# ---------------------------------------------------------------- tung_khung (KC1-4, KC1-6, KC3-2, KCC1-3..12)
 GR = [[1, 5], [2, 6], [3, 7], [4, 8]]
+ALL8 = list(range(1, 9))
 
 
-def _frames(n=100, fps=60.0, no_check=(), invalid=(), sets=None):
+def _chains(anchor_sets=(ALL8,)):
+    """u_so.json 'chuoi' with every comparator's fit set of the given anchor sets computed (tap_tinh)."""
+    out = {}
+    gmap = {i: k for k, g in enumerate(GR) for i in g}
+    for c, cmp_ in kc.comparators(GR).items():
+        tinh = []
+        for t, E in cmp_.items():
+            for A in anchor_sets:
+                fit = sorted(i for i in A if gmap[i] not in E)
+                if dict(nhom_dich=t, tap=fit) not in tinh:
+                    tinh.append(dict(nhom_dich=t, tap=fit))
+        out[c] = dict(tap_tinh=tinh, khong_tinh_duoc=[], nguong_m=0.0013, nguong_tho_m=0.0015)
+    return out
+
+
+def _frames(n=100, fps=60.0, invalid=(), anchors=None):
     rows = []
     for k in range(n):
-        r = dict(idx=str(k), t_s=repr(k / fps), valid='0' if k in invalid else '1',
-                 moc_dung=';'.join(str(i) for i in (sets or {}).get(k, range(1, 9))))
-        for g in range(4):
-            r[f'kc_ok_{g}'] = '0' if k in no_check else '1'
+        r = dict(idx=str(k), t_s=repr(k / fps), valid='0' if k in invalid else '1')
+        for c in kc.comparators(GR):
+            r[f'moc_neo_{c}'] = ';'.join(str(i) for i in (anchors or {}).get(k, ALL8))
         rows.append(r)
     return rows
 
 
-def _khung(n=100, big=None):
-    rows = [dict(khung=str(k), moc='5', nhom='0', ex='0.001', ey='0.0') for k in range(n)]
+def _khung(n=100, big=None, skip=()):
+    rows = [dict(khung=str(k), moc='5', nhom='0', ex='0.001', ey='0.0') for k in range(n) if k not in skip]
     if big:
-        rows.append(dict(khung=str(big[0]), moc=str(big[1]), nhom='0', ex=repr(big[2]), ey='0.0'))
+        rows.append(dict(khung=str(big[0]), moc=str(big[1]), nhom=str(next(g for g, m in enumerate(GR) if big[1] in m)),
+                         ex=repr(big[2]), ey='0.0'))
     return rows
 
 
+def test_centre_is_the_back_projected_image_mean():
+    """KCC1-1: with a tilted, distorted camera the two centre definitions differ; ours is CAM's."""
+    cam = true_cam(k=-0.08, tilt=(0.25, -0.2))
+    c4 = cam.project(np.column_stack([cp.mark_corners_floor(1.5, 1.0, 0.1445), np.zeros(4)]))
+    want = cam.pix2floor(c4.mean(axis=0, keepdims=True), 0.0)[0]
+    other = cam.pix2floor(c4, 0.0).mean(axis=0)
+    assert np.linalg.norm(want - other) > 1e-5
+    assert np.allclose(kc.centre_floor(cam, c4), want, atol=1e-12)
+
+
 def test_frame_check_raw_max_on_valid_frames_only():
-    """KC1-4: the raw error of a single frame counts (no median); invalid frames and a mark after its t_bd do not."""
-    r = kc.run_frame_check(_frames(), _khung(big=(40, 5, 0.005)), {}, GR)
-    assert r['max_m'] == pytest.approx(0.005)
-    r = kc.run_frame_check(_frames(invalid={40}), _khung(big=(40, 5, 0.005)), {}, GR)
+    """KC1-4: the raw error of a single frame counts (no median); invalid frames and a mark after its chain-xe t_bd do
+    not; the t_bd of other chains does not end the target (KCC1-7), whatever the order of the records."""
+    ch = _chains()
+    r = kc.run_frame_check(_frames(), _khung(big=(40, 5, 0.005)), {}, GR, ch)
+    assert r['max_m'] == pytest.approx(0.005) and not r['thieu']
+    r = kc.run_frame_check(_frames(invalid={40}), _khung(big=(40, 5, 0.005)), {}, GR, ch)
     assert r['max_m'] == pytest.approx(0.001)
-    r = kc.run_frame_check(_frames(), _khung(big=(40, 5, 0.005)), dict(moc_loai=[dict(id=5, t_bd=30 / 60)]), GR)
-    assert r['max_m'] == pytest.approx(0.001)                 # frames 0-29 only: the 5 mm at frame 40 is after t_bd
+    recs = [dict(chuoi='xe', id=5, t_bd=30 / 60), dict(chuoi='1', id=5, t_bd=90 / 60)]
+    for order in (recs, recs[::-1]):
+        r = kc.run_frame_check(_frames(), _khung(big=(40, 5, 0.005)), dict(moc_loai=order), GR, ch)
+        assert r['max_m'] == pytest.approx(0.001)
+    r = kc.run_frame_check(_frames(), _khung(big=(40, 5, 0.005)), dict(moc_loai=[dict(chuoi='1', id=5, t_bd=0.1)]),
+                           GR, ch)
+    assert r['max_m'] == pytest.approx(0.005)
+    with pytest.raises(kc.KCError, match='chuoi'):
+        kc.run_frame_check(_frames(), _khung(), dict(moc_loai=[dict(id=5, t_bd=0.1)]), GR, ch)
 
 
-@pytest.mark.parametrize('no_check, thieu', [(set(range(10)), False), (set(range(11)), True),
-                                             (set(range(20, 80, 2)), True), (set(range(30, 89)), True),
-                                             (set(range(30, 89, 10)), False), ({1}, False)])
-def test_frame_check_coverage_both_sides(no_check, thieu):
-    """KC1-6: at most 10 % of the valid frames without check value and no gap over 1 s: both sides of each limit
-    (10 of 100 ok, 11 not; a 59-frame gap of 0.98 s ok on 100 frames but 59 % missing not)."""
-    r = kc.run_frame_check(_frames(), _khung(), {}, GR)
-    assert not r['thieu']
-    r = kc.run_frame_check(_frames(no_check=no_check), _khung(), {}, GR)
+@pytest.mark.parametrize('bad', ['nan', 'empty', 'unknown_frame', 'wrong_group'])
+def test_frame_check_refuses_bad_rows(bad):
+    """KCC1-6: a check row must be finite, of a known frame, mark and its own group."""
+    rows = _khung()
+    rows[3] = dict(rows[3], **{'nan': dict(ex='nan'), 'empty': dict(ey=''), 'unknown_frame': dict(khung='999'),
+                               'wrong_group': dict(nhom='2')}[bad])
+    with pytest.raises(kc.KCError, match='KCC1-6'):
+        kc.run_frame_check(_frames(), rows, {}, GR, _chains())
+
+
+def test_frame_check_no_rows_or_all_targets_ended():
+    """KCC1-6: no accepted check row is not a P1 of 0: max None and the run is short of checks."""
+    r = kc.run_frame_check(_frames(), [], {}, GR, _chains())
+    assert r['max_m'] is None and r['thieu']
+    r = kc.run_frame_check(_frames(), _khung(), dict(moc_loai=[dict(chuoi='xe', id=5, t_bd=0.0)]), GR, _chains())
+    assert r['max_m'] is None and r['thieu']
+
+
+@pytest.mark.parametrize('skip, thieu', [(set(range(10)), False), (set(range(11)), True),
+                                         (set(range(20, 80, 2)), True), (set(range(30, 89, 10)), False), ({1}, False)])
+def test_frame_check_coverage_both_sides(skip, thieu):
+    """KC1-6: at most 10 % of the valid frames without an accepted check row: 10 of 100 ok, 11 not."""
+    r = kc.run_frame_check(_frames(), _khung(skip=skip), {}, GR, _chains())
     assert r['thieu'] is thieu
 
 
 def test_frame_check_gap_over_one_second():
-    r = kc.run_frame_check(_frames(n=200, no_check=set(range(50, 112))), _khung(200), {}, GR)
+    r = kc.run_frame_check(_frames(n=200), _khung(200, skip=set(range(50, 112))), {}, GR, _chains())
     assert r['khoang_mat_max_s'] > 1.0 and r['thieu']
-    r = kc.run_frame_check(_frames(n=700, no_check=set(range(50, 109))), _khung(700), {}, GR)
+    r = kc.run_frame_check(_frames(n=700), _khung(700, skip=set(range(50, 109))), {}, GR, _chains())
     assert r['khoang_mat_max_s'] < 1.0 and not r['thieu']
 
 
-def test_frame_check_run_using_a_set_without_u_so():
-    """KC3-2: only the run whose frames used a set that u_so could not compute is short of checks."""
-    bad = {'xe': [dict(nhom_dich=0, tap=[2, 3, 4, 6, 7, 8])]}
-    r = kc.run_frame_check(_frames(), _khung(), {}, GR, bad)
-    assert r['thieu'] and any('KC3-2' in x for x in r['ly_do'])
-    r = kc.run_frame_check(_frames(sets={k: [1, 2, 3, 4, 5, 6, 7] for k in range(100)}), _khung(), {}, GR, bad)
+def test_frame_check_sets_must_be_computed_in_every_frame():
+    """KCC1-3, KCC1-4: a comparator fit set that u_so never computed, even in an invalid frame, makes the run short
+    of checks; sets u_so computed pass."""
+    small = [1, 2, 3, 4, 5, 6, 7]
+    r = kc.run_frame_check(_frames(invalid={10}, anchors={10: small}), _khung(), {}, GR, _chains())
+    assert r['thieu'] and any('KCC1-3' in x for x in r['ly_do'])
+    r = kc.run_frame_check(_frames(invalid={10}, anchors={10: small}), _khung(), {}, GR, _chains((ALL8, small)))
     assert not r['thieu']
 
 
@@ -501,22 +564,24 @@ def _write_csv(path, rows):
         w.writerows(rows)
 
 
-@pytest.mark.parametrize('bad', [None, 'u_so', 'session', 'model', 'nhom', 'not_rescored', 'thu'])
-def test_tung_khung_cli_checks_the_track(tmp_path, bad):
-    """KC1-10, KC2-1: the track must name the u_so.json, H_a session, model, groups of the kiem_cheo result, and be
-    rescored when marks were excluded."""
+def _tk_setup(tmp_path, bad=None, theo=None):
     us = tmp_path / 'u_so.json'
-    us.write_text(json.dumps(dict(version=kc.U_SO_VERSION, chuoi={'xe': dict(khong_tinh_duoc=[])})), encoding='utf-8')
+    us.write_text(json.dumps(dict(version=kc.U_SO_VERSION, chuoi=_chains())), encoding='utf-8')
     kcp = tmp_path / 'kiem_cheo.json'
     kcp.write_text(json.dumps(dict(version=kc.VERSION, buoi='C8_x', model='B1', nhom=GR, thu=bad == 'thu',
-                                   sessions=dict(H_a=dict(file='a', sha256='1' * 64)), moc=[],
-                                   u_so_sha256=kc.sha256_file(str(us)))), encoding='utf-8')
+                                   sessions=dict(H_a=dict(file='a', sha256='1' * 64)), moc=[], hang_so_sha256='4' * 64,
+                                   u_so_sha256=kc.sha256_file(str(us)), theo_thoi_gian=theo or {})), encoding='utf-8')
+    plan = tmp_path / 'plan.txt'
+    plan.write_text('# luot\nr1\n' + ('r2\n' if bad == 'plan_more' else ''), encoding='utf-8')
     d = tmp_path / 'r1'
     d.mkdir()
     _write_csv(d / 'frames.csv', _frames())
     _write_csv(d / 'kiem_cheo_khung.csv', _khung(big=(40, 5, 0.004)))
     tr = dict(u_so_sha256=kc.sha256_file(str(us)), session_sha256='1' * 64, model_khoa='B1', nhom=GR,
-              moc_loai=[], cham_lai=1)
+              moc_loai=[], cham_lai=1, hang_so_sha256='4' * 64,
+              nguong_dung={c: dict(nguong_m=0.0013, nguong_tho_m=0.0015) for c in kc.comparators(GR)},
+              frames_sha256=kc.sha256_file(str(d / 'frames.csv')),
+              kiem_cheo_khung_sha256=kc.sha256_file(str(d / 'kiem_cheo_khung.csv')))
     if bad == 'u_so':
         tr['u_so_sha256'] = '2' * 64
     elif bad == 'session':
@@ -526,15 +591,93 @@ def test_tung_khung_cli_checks_the_track(tmp_path, bad):
     elif bad == 'nhom':
         tr['nhom'] = [[1, 2], [3, 4], [5, 6], [7, 8]]
     elif bad == 'not_rescored':
-        tr['moc_loai'] = [dict(id=5, t_bd=1.0)]
+        tr['moc_loai'] = [dict(chuoi='xe', id=5, t_bd=1.0)]
+    elif bad == 'nguong':
+        tr['nguong_dung']['2']['nguong_m'] = 0.0012
+    elif bad == 'hang_so':
+        tr['hang_so_sha256'] = '5' * 64
+    elif bad == 'frames_swapped':
+        _write_csv(d / 'frames.csv', _frames(invalid={3}))
+    elif bad == 'khung_swapped':
+        _write_csv(d / 'kiem_cheo_khung.csv', _khung())
     (d / 'track.json').write_text(json.dumps(tr), encoding='utf-8')
     out = tmp_path / 'tk.json'
-    rc = kc.main(['tung_khung', '--buoi', 'C8_x', '--kiem-cheo', str(kcp), '--u-so', str(us), '--luot', f'r1={d}',
-                  '--out', str(out)])
+    args = ['tung_khung', '--buoi', 'C8_x', '--kiem-cheo', str(kcp), '--u-so', str(us), '--ke-hoach', str(plan),
+            '--luot', f'r1={d}', '--out', str(out)]
+    return args, out
+
+
+@pytest.mark.parametrize('bad', [None, 'u_so', 'session', 'model', 'nhom', 'not_rescored', 'thu', 'nguong', 'hang_so',
+                                 'frames_swapped', 'khung_swapped'])
+def test_tung_khung_cli_checks_the_track(tmp_path, bad):
+    """KC1-10, KCC1-8, KCC1-9: the track must name the u_so.json, H_a session, model, groups, constants file and the
+    thresholds it used, and the two CSV it was read with; rescored when marks were excluded."""
+    args, out = _tk_setup(tmp_path, bad)
+    rc = kc.main(args)
     if bad is None:
         assert rc == 0
         t = json.loads(out.read_text(encoding='utf-8'))
-        assert t['tung_khung_max_m'] == pytest.approx(0.004) and t['luot_thieu'] == []
-        assert t['session_sha256'] == '1' * 64 and t['kiem_cheo_sha256'] == kc.sha256_file(str(kcp))
+        assert t['tung_khung_max_m'] == pytest.approx(0.004) and t['luot_thieu'] == [] and t['hoan_tat']
     else:
         assert rc == 2 and not out.exists()
+
+
+def test_tung_khung_not_complete_without_every_planned_run(tmp_path):
+    """KCC1-11: a planned run missing: written but not complete (xuat refuses it)."""
+    args, out = _tk_setup(tmp_path, 'plan_more')
+    assert kc.main(args) == 0
+    t = json.loads(out.read_text(encoding='utf-8'))
+    assert not t['hoan_tat'] and t['luot_chua_co'] == ['r2']
+
+
+def test_tung_khung_contradiction_at_a_later_clip(tmp_path):
+    """KCC1-12: a mark whose own shift at H_m is above the chain-xe threshold but that no run excluded."""
+    args, out = _tk_setup(tmp_path, theo={'H_m': dict(rieng_m={'5': 0.0020, '6': 0.0005})})
+    assert kc.main(args) == 0
+    t = json.loads(out.read_text(encoding='utf-8'))
+    assert t['mau_thuan'] == [dict(clip='H_m', moc=5)] and not t['hoan_tat']
+
+
+def test_session_groups_must_partition_the_fit_marks():
+    """KCC1-14."""
+    with pytest.raises(kc.KCError, match='KCC1-14'):
+        kc.session_groups(dict(kiem_cheo=dict(nhom=[[1, 5], [2, 6], [3], [4, 8]])), ALL8)
+    assert kc.session_groups(dict(kiem_cheo=dict(nhom=GR)), ALL8) == GR
+
+
+def test_a3_limits_are_exported_in_full(scene):
+    """KCC1-15: limits (a)-(f), no claim of conservatism, not a car-tag heading bound."""
+    marks, cam, img = scene
+    out = kc.a3_summary({'H_a': kc.a3_clip(img, marks, 'B1', W, H, ZC, l_max=0.8)})
+    assert len(out['gioi_han']) == 6 and out['gioi_han'][0].startswith('(a)')
+    assert 'khong chung minh bao thu' in out['gioi_han'][0] and 'quy_ve_ma_noc' in out['loai']
+    assert 'quy_ve_ma_noc' not in out
+
+
+def test_cut_clip_is_a_trial():
+    """KCC1-10."""
+    assert kc.thu_flag(False, 20) and kc.thu_flag(True, None) and not kc.thu_flag(False, None)
+
+
+def test_u_so_needs_h_b_frames(scene):
+    """KCC1-5: without H_b frames the noise terms cannot be computed: refused, not 0."""
+    marks, cam, img = scene
+    groups = kc.make_groups(sorted(img))
+    gc = kc.GroupCams(img, marks, groups, 'B1', W, H, ZC)
+    with pytest.raises(kc.KCError, match='KCC1-5'):
+        kc.u_so_family([0.0] * 20, [img] * 20, img, [], [], marks, groups, gc)
+
+
+def test_u_so_flags_a_single_target_without_window(scene):
+    """KCC1-5: one target mark missing from the H_b frames is flagged even when its group mates have windows."""
+    marks, cam, img = scene
+    groups = kc.make_groups(sorted(img))
+    j = groups[0][0]
+    frames = [img] * 20 + [{i: c for i, c in img.items() if i != j}] * 20
+    gc = kc.GroupCams(img, marks, groups, 'B1', W, H, ZC)
+    t = [k / 60 for k in range(40)]
+    fit_full = sorted(set(img) - set(groups[0]))
+    res, _ = kc.u_so_family(t[:20], [img] * 20, img, t, [{i: c for i, c in f.items() if i != j} for f in frames],
+                            marks, groups, gc)
+    assert any(x.get('moc') == j and x['vi'] in ('tho', 'cua_so') for x in res['xe']['khong_tinh_duoc'])
+    assert dict(nhom_dich=0, tap=fit_full) not in res['xe']['tap_tinh']
