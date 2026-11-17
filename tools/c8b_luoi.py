@@ -376,8 +376,17 @@ def run_nodes(gio, gio_path, a, out_dir):
     for k, D in enumerate(gio['nodes_s']):
         score = os.path.join(out_dir, f'nut_{k:03d}.json')
         rows = os.path.join(out_dir, f'nut_{k:03d}_rows.csv')
+        import c8b_gio
+        scorer_path = a.scorer or os.path.join(HERE, 'c7_score.py')
+        before = c8b_gio.repo_state(scorer_path)
         p = subprocess.run(scorer_cmd(gio_path, k, a, score, rows, gio['task']), capture_output=True, text=True,
                            encoding='utf-8', errors='replace')
+        after = c8b_gio.repo_state(scorer_path)
+        # C8BS-16: the scorer state of THIS node scoring, written beside its results (read by --gop-only)
+        same = before.get('commit') == after.get('commit') and before.get('dirty') == after.get('dirty')
+        with open(os.path.join(out_dir, f'nut_{k:03d}_nguon.json'), 'x', encoding='utf-8') as f:
+            json.dump(dict(scorer=dict(before, dirty=before.get('dirty') if same else True, changed=not same),
+                           gio_sha256=cu.sha256(gio_path), D_s=D), f)
         with open(os.path.join(out_dir, f'nut_{k:03d}_stdout.txt'), 'w', encoding='utf-8') as f:
             f.write(f'D_s={D!r}\nexit={p.returncode}\n--- stdout\n{p.stdout}\n--- stderr\n{p.stderr}')
         last = (p.stdout.strip().splitlines() or [''])[-1]
@@ -394,6 +403,23 @@ def load_nodes(gio, out_dir):
         res.append(node_from_files(os.path.join(out_dir, f'nut_{k:03d}.json'),
                                    os.path.join(out_dir, f'nut_{k:03d}_rows.csv')))
     return res
+
+
+def node_provenance(gio, gio_sha, out_dir):
+    """C8BS-16: the scorer commit and clean state of every node, as recorded when that node was scored
+    (nut_KKK_nguon.json); a node without it, or scored for another clock file, is refused."""
+    out = []
+    for k, D in enumerate(gio['nodes_s']):
+        p = os.path.join(out_dir, f'nut_{k:03d}_nguon.json')
+        try:
+            with open(p, encoding='utf-8') as f:
+                d = json.load(f)
+        except (OSError, ValueError) as exc:
+            raise LuoiError(f'node {k}: no provenance of its scoring ({exc}): score the nodes again (C8BS-16)')
+        if d.get('gio_sha256') != gio_sha or d.get('D_s') != D:
+            raise LuoiError(f'node {k}: provenance for another clock file or node (C8BS-16)')
+        out.append(d['scorer'])
+    return out
 
 
 def report_only_of(gate_file, task):
@@ -429,6 +455,7 @@ def main(argv=None):
         if task != gio['task']:
             raise LuoiError(f'--task {task} but the clock file is for {gio["task"]}')
         ro, gsha = report_only_of(a.gate_file, task)
+        prov_scorer = None
         if not gio.get('ok'):
             res = not_bounded(gio)
         else:
@@ -439,6 +466,12 @@ def main(argv=None):
                 nodes = run_nodes(gio, a.gio, a, a.out_dir)
             else:
                 nodes = load_nodes(gio, a.out_dir)
+            prov = node_provenance(gio, cu.sha256(a.gio), a.out_dir)
+            commits = {x.get('commit') for x in prov}
+            prov_scorer = dict(commit=commits.pop() if len(commits) == 1 else '',
+                               dirty=not (len({x.get('commit') for x in prov}) == 1
+                                          and all(x.get('dirty') is False for x in prov)),
+                               nut=prov)
             res = combine(nodes, ro)
             bad = [c for c in MEASURED if not res['bieu_dien'][c]]
             if bad and any(x['ok'] for x in nodes):
@@ -446,8 +479,7 @@ def main(argv=None):
             res['gate_v3'] = gate_block(nodes, res, gio, cu.sha256(a.gio), task, gsha)
         import c8b_gio
         res.update(version=VERSION, task=task, nodes_s=gio.get('nodes_s', []), gio_sha256=cu.sha256(a.gio),
-                   gate_file_sha256=gsha, script=c8b_gio.repo_state(),
-                   scorer=c8b_gio.repo_state(a.scorer or os.path.join(HERE, 'c7_score.py')))
+                   gate_file_sha256=gsha, script=c8b_gio.repo_state(), scorer=prov_scorer)
         os.makedirs(a.out_dir, exist_ok=True)
         out = os.path.join(a.out_dir, 'luoi.json')
         with open(out, 'x', encoding='utf-8') as f:

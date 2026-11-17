@@ -329,12 +329,19 @@ def write_gate(path, d):
     except ImportError:
         raise UError('tools/gate_c8.py (CODE_GATE) is not on this branch: the gate file cannot be checked, not written')
     cu.check_path(path)
-    if os.path.exists(path):
+    # C8BS-R3-1: claim the path with an exclusive create (atomic: of two writers only one gets it), then let
+    # gate_c8.write_gate (which opens 'wb') replace our own empty placeholder; refused -> placeholder removed
+    try:
+        with open(path, 'xb'):
+            pass
+    except FileExistsError:
         raise UError(f'{path} exists: the C8 gate file is written once')
     try:
         sha = gate_c8.write_gate(path, d)
         g = gate_c8.read_gate_c8(path)
     except gate_c8.GateFileError as exc:
+        if os.path.exists(path) and os.path.getsize(path) == 0:
+            os.remove(path)
         raise UError(f'gate_c8 refused the content: {exc}')
     if g.sha256 != sha:
         raise UError(f'{path}: SHA read back {g.sha256} differs from the bytes written {sha}')

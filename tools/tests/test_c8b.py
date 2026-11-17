@@ -151,8 +151,11 @@ def test_interval_planted(base_run):
 
 def test_nodes_zero_width():
     assert G.nodes(1.0, 0.0) == [1.0]
+    for h in (0.005, 0.0105, 0.00631, 0.0125, 0.003 * 7 / 3):
+        nd = G.nodes(1.234, h)
+        assert max(np.diff(nd)) <= 0.001 and nd[0] == pytest.approx(1.234 - h) and nd[-1] == pytest.approx(1.234 + h)
     n = G.nodes(1.0, 0.0105)
-    assert len(n) == 22 and max(np.diff(n)) <= 0.001 + 1e-12
+    assert len(n) in (22, 23) and max(np.diff(n)) <= 0.001     # 23 when float rounding puts a step above 1 ms
 
 
 def test_drift_distance_and_spans(base_run):
@@ -328,6 +331,8 @@ def test_cli_writes_once(tmp_path, base_run):
     assert G.main(args) == 0
     d = json.load(open(out_p, encoding='utf-8'))
     assert d['format'] == 'c8b_gio_v1' and len(d['nguon']) == 2
+    import c8_u_imu
+    assert d['sha256'] == dict(esp32=c8_u_imu.sha256(base_run[2]), frames=c8_u_imu.sha256(base_run[1]))
     assert G.main(args) == 2                                   # never overwritten
 
 
@@ -582,7 +587,11 @@ def test_node_files_and_gop_only(tmp_path):
     gio = dict(format='c8b_gio_v1', task='O1-F05', ok=True, nodes_s=[1.0, 1.001])
     gp = str(tmp_path / 'gio.json')
     json.dump(gio, open(gp, 'w', encoding='utf-8'))
+    import c8_u_imu
     for k in range(2):
+        with open(os.path.join(d, f'nut_{k:03d}_nguon.json'), 'w', encoding='utf-8') as f:
+            json.dump(dict(scorer=dict(commit='abc1234', dirty=False), gio_sha256=c8_u_imu.sha256(gp),
+                           D_s=gio['nodes_s'][k]), f)
         _write_node(d, k, ['dat', 'dat', 'khong_dat', 'dat', 'dat'],
                     [(10.000001, 1, [0.05, 0.12, 0.05, 1.0]), (10.016668, 1, [0.05, 0.05, 0.05, 1.0])])
     with open(os.path.join(d, 'nut_000.json'), encoding='utf-8') as f:
@@ -590,6 +599,10 @@ def test_node_files_and_gop_only(tmp_path):
     assert LU.main(['--gio', gp, '--out-dir', d, '--gop-only']) == 0
     r = json.load(open(os.path.join(d, 'luoi.json'), encoding='utf-8'))
     assert r['states']['g3'] == 'khong_dat' and r['outcome'] == 'khong_dat' and r['u_t_nodes'] == [0.031, 0.031]
+    assert r['scorer']['commit'] == 'abc1234' and r['scorer']['dirty'] is False      # from the node records
+    os.remove(os.path.join(d, 'luoi.json'))
+    os.remove(os.path.join(d, 'nut_001_nguon.json'))                                # C8BS-16: no record, refused
+    assert LU.main(['--gio', gp, '--out-dir', d, '--gop-only']) == 2
 
 
 def test_node_rows_without_c8b_columns_is_error(tmp_path):
@@ -648,6 +661,7 @@ def test_run_nodes_with_fake_scorer(tmp_path):
                   '--scorer', str(sc)])
     assert rc == 0
     r = json.load(open(os.path.join(d, 'luoi.json'), encoding='utf-8'))
+    assert len(r['scorer']['nut']) == 4 and all('commit' in x for x in r['scorer']['nut'])
     assert r['n_nodes'] == 4 and r['states']['g3'] == 'chua_ket_luan'       # last cell: frame not in both domains
     assert r['nodes_ok'] == [True] * 4 and not any(r['node_errors'])
     assert r['u_t_nodes'] == pytest.approx([0.02, 0.021, 0.022, 0.023])
@@ -896,6 +910,10 @@ def test_cong_written_and_read_back_with_real_reader(tmp_path):
     assert tuple(g.report_only('O1-F08')) == tuple(d['dieu_2b']['per_level']['O1-F08']['report_only'])
     with pytest.raises(CU.UError, match='written once'):
         CU.write_gate(str(tmp_path / 'gate_c8.json'), CU._clean(d))
+    (tmp_path / 'claimed.json').write_bytes(b'')                     # C8BS-R3-1: another writer holds the path
+    with pytest.raises(CU.UError, match='written once'):
+        CU.write_gate(str(tmp_path / 'claimed.json'), CU._clean(d))
+    assert (tmp_path / 'claimed.json').read_bytes() == b''
     bad = json.loads(json.dumps(CU._clean(d)))
     bad['dieu_2b']['per_level']['O1-F08']['report_only'] = []    # contradicts uhat: the reader refuses, no file
     if d['dieu_2b']['per_level']['O1-F08']['report_only']:

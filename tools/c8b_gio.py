@@ -479,8 +479,12 @@ def startup(F, t0_log, D_guess, tm, vel, br, t_rv, yaw_rv, startup_s=STARTUP_S, 
 def nodes(c, h, step=STEP_S):
     if h <= 0.0:
         return [float(c)]
-    n = int(math.ceil(2.0 * h / step - 1e-9)) + 1
-    return [float(x) for x in np.linspace(c - h, c + h, n)]
+    k = max(1, int(math.ceil(2.0 * h / step - 1e-9)))
+    while True:                                   # spacing never above step, even by rounding (CAM check, CODE 17/11)
+        nd = np.linspace(c - h, c + h, k + 1)
+        if np.max(np.diff(nd)) <= step:
+            return [float(x) for x in nd]
+        k += 1
 
 
 def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S):
@@ -671,6 +675,8 @@ def main(argv=None):
         out, _, _ = analyse(a.frames, a.esp32, a.task, khoa, a.startup_s)
         ctrl, ev = controller_of(a.esp32)
         out['controller'] = ctrl
+        # contract of c7_score --gio-c8b (CODE 17/11, VG1-1): the clock file names the log and frames of ITS run
+        out['sha256'] = dict(esp32=cu.sha256(a.esp32), frames=cu.sha256(a.frames))
         out['nguon'] = [dict(file=os.path.basename(p), sha256=cu.sha256(p)) for p in (a.frames, a.esp32)
                         + ((a.khoa,) if a.khoa else ()) + ((ev,) if ev else ())]
         out['script'] = repo_state()

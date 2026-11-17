@@ -15,8 +15,9 @@ What it gives (names as in design 4b, C8B4R2-5, C8B4R3-3):
       window; position error from spinning: the tag centre against the fixed point of the slowest part.
   (B) speed-dependent heading-position error: (tag heading - angle of the tag centre about the axis) against the
       slowest part, by speed and direction; radial position error: radius against the slowest part.
-  d_psi_quay, d_p_quay = the largest of these parts up to the F08 rates (heading: |Omega| <= wz_max of O1-F08 for
-      (A); position and the (B) heading-position part: tangential speed |Omega| R <= v_max of O1-F08).
+  d_psi_quay, d_p_quay = the largest of these parts up to the F08 rates, taken over the data up to CAP (1.1) x the
+      peak (heading: |Omega| vs wz_max of O1-F08 for (A); position and the (B) heading-position part: tangential speed
+      |Omega| R vs v_max of O1-F08); each part must reach the peak in each direction (C8BS-10), else no number.
   Rolling shutter (F8; C8B4R2-6, R4-1): at (B) the angle of the centre is moved by Omega (alpha_r dr + alpha_c dc)
       (dr, dc: pixel offset of the tag from its mean over a turn), once per turn, proportional to the rotation rate,
       sign flipping with the direction. Model: per piece (one direction, at most PIECE_TURNS turns) a cubic in time,
@@ -66,8 +67,12 @@ SPREAD_MAX = 0.30           # [DE XUAT] design 4b
 DR_REF, DC_REF = 700.0, 700.0   # reference span (rows 700-1450 of the car runs; columns of the same size)
 SHUTTER_MIN_RAD_S = 2.0     # [DE XUAT] shutter fit only above 2 rad/s: below, one smooth piece of >= 1 turn lasts
                             # too long for a cubic, and the shutter term is small (synthetic test: bias at 0.3-1.5 rad/s)
-PHU_FRAC = 0.8              # [DE XUAT] C8BS-10: a part counts as measured up to the F08 peak when its used data reach
-                            # 80 % of the peak in each direction
+PHU_FRAC = 1.0              # C8BS-10 round 3: a part counts as measured up to the F08 peak only when its used data
+                            # reach the peak itself in each direction (design 4b: (A) spin above wz peak 2.61 rad/s,
+                            # 0.42 turn/s; (B) above v peak / R, 0.74 turn/s at 25 cm)
+CAP = 1.1                   # [DE XUAT] each part uses the data up to 1.1 x the F08 peak (a superset of the range up to
+                            # the peak: the largest error over it is not below the largest up to the peak), so the
+                            # hand spin, which slows down continuously, passes through the whole range up to the peak
 SUBSET_MIN = 120            # frames per check fit (design 4b consistency)
 DERIV_HALF = 3              # frames each side for the rate (central quadratic fit)
 
@@ -139,7 +144,7 @@ def analyse_a(F, wz_max):
     px, py = float(np.median(x[sl])), float(np.median(y[sl]))
     dev_sl = float(np.max(np.hypot(x[sl] - px, y[sl] - py)))
     dev = np.hypot(x - px, y - py)
-    use = np.isfinite(om) & (np.abs(om) > MOVE_RAD_S) & (np.abs(om) <= wz_max)
+    use = np.isfinite(om) & (np.abs(om) > MOVE_RAD_S) & (np.abs(om) <= CAP * wz_max)
     # heading residual after a quadratic over every 0.5 s window (step a quarter window)
     res_max, bands, n_win, win_rates = 0.0, [], 0, []
     t0 = t[0]
@@ -153,7 +158,7 @@ def analyse_a(F, wz_max):
             tt = t[m] - t[m].mean()
             r = psi[m] - np.polyval(np.polyfit(tt, psi[m], 2), tt)
             w = float(np.nanmean(np.abs(om[m]))) if np.isfinite(om[m]).any() else math.nan
-            if math.isfinite(w) and MOVE_RAD_S < w <= wz_max:
+            if math.isfinite(w) and MOVE_RAD_S < w <= CAP * wz_max:
                 res_max = max(res_max, float(np.max(np.abs(r))))
                 n_win += 1
                 win_rates.append(float(np.sign(om_m[0])) * w)
@@ -307,7 +312,7 @@ def analyse_b(F, v_max, wz_max, frame_s):
     phi = psi - th
     phi_sl = float(np.median(phi[sl]))
     v_t = np.abs(om) * R0
-    use_p = np.isfinite(om) & (np.abs(om) > MOVE_RAD_S) & (v_t <= v_max)
+    use_p = np.isfinite(om) & (np.abs(om) > MOVE_RAD_S) & (v_t <= CAP * v_max)
     cov = coverage(om[use_p] * R0, v_max)          # the frames used: tangential speed up to v_max, each direction
     rad_dev = float(np.max(np.abs(r[use_p] - R0))) if use_p.any() else None
     hp_dev = float(np.max(np.abs(phi[use_p] - phi_sl))) if use_p.any() else None
