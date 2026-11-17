@@ -401,14 +401,14 @@ def test_c8b_check_only_on_the_floor_lost(ds):
 def test_c8b_fourth_failure_stops_the_level_in_total_not_in_a_row(ds):
     d, gf, tmp = ds
     for i in range(2):
-        _lost_gio(d, tmp, f'a{i}')
+        _lost_gio(d, tmp, f'a{i}', gains='kp_xy=1.0')                         # gains logged (GT1-7 round 3)
     _lost_gio(d, tmp, 'other_gain', gs='A-PID/G02')                          # another gain: its own count
     _lost_gio(d, tmp, 'other_level', task='O1-F08')                           # another level: its own count
     rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')   # a run that passes
     rl.step(d, 'run')
     rl.end(d, 'hong_he_do', completed=1, fail_cause='mat_khung_FAKE', queries=rl.fake_queries())   # other cause
     for i in range(2, 4):                                                     # total 4 (not reset by the runs between)
-        row = _lost_gio(d, tmp, f'a{i}')
+        row = _lost_gio(d, tmp, f'a{i}', gains='kp_xy=1.0')
     assert 'chua ket luan' in rl.refusal_note(d, row)
     with pytest.raises(rl.LogError, match='stopped after 3 reruns for the C8b time check'):
         rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'confirm', gain_set='A-PID/G01')
@@ -712,15 +712,32 @@ def test_gt1_7_round2_a_known_name_without_its_gains_does_not_reopen_a_stopped_l
         _lost_gio(d, tmp, f'r{i}', gains=G01)                                # G01 (same gains) stops at F05
     with pytest.raises(rl.LogError, match='stopped'):                        # Codex round 2: --gains left out
         rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G09')
-    with pytest.raises(rl.LogError, match='without gain values'):            # a new name with no gains at all
+    with pytest.raises(rl.LogError, match='cannot be told'):                 # a new name with no gains at all
         rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G10')
-    with pytest.raises(rl.LogError, match='agree'):                          # part of the gains, all equal
+    with pytest.raises(rl.LogError, match='cannot be told'):                 # part of the gains, all equal
         rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G10', gains='kp_xy=1.0')
     rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G10',
              gains='kp_xy=1.0,ki_xy=0.7,kp_wz=1.0')                          # another candidate
     rl.cancel(d)
     rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F08', str(rl.FIG8['O1-F08']), 'screen', gain_set='A-PID/G10')
     rl.cancel(d)                                                             # no stop at F08: no gains needed
+
+
+def test_gt1_7_round3_no_gain_name_in_common_is_no_evidence(ds):
+    # GT1-7 (Codex round 3; Liam 17/11 at CODE_GATE "Sửa + Codex vòng 4 (Recommended)"): fails on 1d32334
+    d, gf, tmp = ds
+    for i in range(4):
+        _lost_gio(d, tmp, f'k{i}', gains='kp_xy=1.0')                         # G01 stops with kp_xy only
+    with pytest.raises(rl.LogError, match='cannot be told'):                 # names apart: no evidence
+        rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G09', gains='ki_xy=0.5')
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G09',
+             gains='kp_xy=1.5,ki_xy=0.5')                                    # kp_xy in common, another value
+    rl.cancel(d)
+    for i in range(4):                                                       # G03 stops at F08 with no gains logged
+        _lost_gio(d, tmp, f'e{i}', task='O1-F08', gs='A-PID/G03')
+    with pytest.raises(rl.LogError, match='cannot be told'):                 # nothing can tell another set from it
+        rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F08', str(rl.FIG8['O1-F08']), 'screen', gain_set='A-PID/G04',
+                 gains='kp_xy=9.0')
 
 
 def test_gt2_1_a_lost_run_without_gate_needs_no_gate_file(ds):

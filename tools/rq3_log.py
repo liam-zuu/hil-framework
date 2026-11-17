@@ -1361,6 +1361,7 @@ def confirm_block_problem(tun_after: List[dict], ds: str, campaign: str, gain_se
     # set stopped after the reruns of the C8b time check is chua_ket_luan (O1 3.5 v11.37), so the set is not confirmed.
     # GT2-2 (round 2): only a level of the gate counts (`levels`, the gate file of the summary; freeze has none: the
     # levels of the block)
+    levels = None if levels is None else tuple(levels)          # GT3-2: an iterator is read once, used twice
     lv = set(levels) if levels is not None else {r.get('trajectory') for r in block}
     stop = sorted(f'{k[2]}@{k[3]}' for k, n in c8b_refusals(tun_after).items()
                   if k[0] == campaign and k[1] == gain_set and k[2] in lv and n > C8B_RERUNS_MAX)
@@ -1722,19 +1723,16 @@ def c8b_refusals(tun: List[dict]) -> Dict[tuple, int]:
                                f"earlier floor run at {r.get('trajectory')}@{r.get('speed_mps')} (one gain set, one "
                                'gain; GT1-7)')
             old.update(g)
-            # GT1-7 (round 2): against a stopped set, the gains known for this gain set at this level (this row and
-            # the earlier ones); none known: it cannot be told from the stopped set, so it is refused
+            # GT1-7 (rounds 2, 3): another gain set at a level where a set stopped runs only with evidence that it is
+            # another candidate: against EVERY stopped set, a gain name known for both (this row and the earlier rows
+            # of the key, the stopped set's rows) with another value. No name in common is no evidence: refused
             others = [(gs, gg) for gs, gg in stopped[lvl] if gs != k[1]]
-            if others and not old:
-                raise LogError(f"{uid}: {r.get('gain_set_id')} at {r.get('trajectory')}@{r.get('speed_mps')} without gain "
-                               f'values (--gains), where {others[0][0]} stopped after {C8B_RERUNS_MAX} reruns for the '
-                               'C8b time check: it cannot be told from the stopped set (GT1-7)')
-            twin = [gs for gs, gg in others if set(gg) & set(old) and all(gg[x] == old[x] for x in set(gg) & set(old))]
+            twin = [gs for gs, gg in others if not any(x in old and old[x] != gg[x] for x in gg)]
             if twin:
-                raise LogError(f"{uid}: the gains of {r.get('gain_set_id')} at {r.get('trajectory')}@"
-                               f"{r.get('speed_mps')} agree with those of {twin[0]}, stopped after {C8B_RERUNS_MAX} reruns "
-                               'for the C8b time check: one candidate under another name, no run after that (give the '
-                               'full gains of a new candidate; GT1-7)')
+                raise LogError(f"{uid}: {r.get('gain_set_id')} at {r.get('trajectory')}@{r.get('speed_mps')} cannot be "
+                               f'told from {twin[0]}, stopped after {C8B_RERUNS_MAX} reruns for the C8b time check: no '
+                               'gain known for both with another value (one candidate under another name is refused; '
+                               'give the gains of a new candidate with --gains; GT1-7)')
         if r.get('fail_cause') == C8B_GIO_FAIL:
             if not r.get('gain_set_id'):
                 raise LogError(f"{uid}: a {C8B_GIO_FAIL} run carries its gain set id (counted per gain set)")

@@ -528,6 +528,17 @@ def test_gt2_2_a_level_outside_the_block_and_the_gate_does_not_stop_the_confirma
     assert s['stop_reason_check'] == 'ok' and s['san_gio_c8b_dung'] == 'A-LADRC/G01 O1-F08@0.8'
 
 
+def test_gt3_2_levels_may_be_an_iterator(demo_ds, tmp_path):
+    # GT3-2 (Codex round 3 of CODE_GATE; Liam 17/11 at CODE_GATE "Sửa + Codex vòng 4 (Recommended)"): the levels are
+    # read once for the stops and again for 2 x |G|; fails on 1d32334
+    uids = _confirm_block(demo_ds, tmp_path, 'K1', ('dat',))
+    rl.so_h(demo_ds, uids[0], _score_final(demo_ds, uids[0], 0.5))
+    tun = rl.apply_so_h(rl.live_rows(rl.read_rows(os.path.join(demo_ds, rl.TUNING))), demo_ds)
+    why = rl.confirm_block_problem(tun, demo_ds, 'A-LADRC', 'A-LADRC/G01', '2030-01-01T00:00:00',
+                                   levels=iter(['O1-F05', 'O1-F08']))
+    assert why and 'fewer than 2' in why
+
+
 def test_c9d4_a_block_of_lost_runs_only_is_not_confirmed(demo_ds, tmp_path):
     _lost_confirm(demo_ds, 'K1')
     with pytest.raises(rl.LogError, match='no valid run'):
