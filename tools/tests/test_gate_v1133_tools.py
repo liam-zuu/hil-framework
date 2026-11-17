@@ -709,6 +709,21 @@ def test_gt1_8_the_time_file_belongs_to_the_run(ds):
         rl.summary(d)
 
 
+def test_g8_1_a_link_to_a_clip_is_left_out(tmp_path, monkeypatch):
+    # G8-1 (Codex round 1 of the GT1-8 branch): a file named .csv that resolves to a clip is not hashed. The link is
+    # simulated (os.path.realpath), so the test runs where links cannot be made; fails on aed821f
+    clip = tmp_path / 'clip.mp4'
+    clip.write_bytes(b'FAKE clip')
+    alias = tmp_path / 'esp32_alias.csv'
+    alias.write_bytes(b'FAKE clip')                                          # what reading through the link gives
+    real = os.path.realpath
+    monkeypatch.setattr(rl.os.path, 'realpath',
+                        lambda p: str(clip) if os.path.basename(str(p)) == 'esp32_alias.csv' else real(p))
+    assert rl.sha256_file(str(alias)) not in rl._hashes_under(str(tmp_path))
+    (tmp_path / 'plain.csv').write_bytes(b'FAKE log')
+    assert rl.sha256_file(str(tmp_path / 'plain.csv')) in rl._hashes_under(str(tmp_path))
+
+
 def test_gt1_8_the_time_file_was_made_from_the_inputs_of_the_run(ds):
     # GT1-8, the part deferred until CODE_C8B fixed c8b_gio_v1 (Liam 17/11 at CODE_GATE "Làm, nhánh nhỏ + Codex
     # (Recommended)"): 'task' required, and sha256 {esp32, frames} are files under the run folder. Fails on 3f07c2a
@@ -721,6 +736,11 @@ def test_gt1_8_the_time_file_was_made_from_the_inputs_of_the_run(ds):
     kw = dict(completed=1, fail_cause=rl.C8B_GIO_FAIL, results_dir=run, queries=rl.fake_queries())
     with pytest.raises(rl.LogError, match='input'):                          # made from the log of another run
         rl.end(d, 'hong_he_do', c8b_gio=_gio(run, 'foreign', inputs_in=other), **kw)
+    for k in ('esp32', 'frames'):                                            # G8-2: only one of the two outside
+        p = _gio(run, f'half_{k}')
+        os.replace(os.path.join(run, f'half_{k}_{k}.csv'), os.path.join(other, f'half_{k}_{k}.csv'))
+        with pytest.raises(rl.LogError, match=f'the {k} input'):
+            rl.end(d, 'hong_he_do', c8b_gio=p, **kw)
     with pytest.raises(rl.LogError, match='task'):                           # no task in the file
         rl.end(d, 'hong_he_do', c8b_gio=_gio(run, 'notask', task=None), **kw)
     p = _gio(run, 'nosha')
@@ -736,6 +756,15 @@ def test_gt1_8_the_time_file_was_made_from_the_inputs_of_the_run(ds):
     os.replace(os.path.join(run, 'clip_esp32.csv'), os.path.join(run, 'clip_esp32.mp4'))
     with pytest.raises(rl.LogError, match='esp32'):                          # a clip is never a scored input
         rl.end(d, 'hong_he_do', c8b_gio=clip, **kw)
+    try:                                                                     # G8-1: nor through a link named .csv
+        os.symlink(os.path.join(run, 'clip_esp32.mp4'), os.path.join(run, 'esp32_alias.csv'))
+        linked = True
+    except (OSError, NotImplementedError):
+        linked = False                                                       # no link rights on this machine
+    if linked:
+        with pytest.raises(rl.LogError, match='esp32'):
+            rl.end(d, 'hong_he_do', c8b_gio=clip, **kw)
+        os.remove(os.path.join(run, 'esp32_alias.csv'))
     sub = os.path.join(run, 'sub')
     os.makedirs(sub)
     row = rl.end(d, 'hong_he_do', c8b_gio=_gio(run, 'mine', inputs_in=sub), **kw)   # inputs in a sub folder: fine

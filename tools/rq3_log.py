@@ -1778,8 +1778,10 @@ def _hashes_under(folder: str, skip: str = '') -> set:
     for root, _, names in os.walk(folder):
         for n in names:
             p = os.path.join(root, n)
-            if n.lower().endswith(C8B_HASH_SKIP) or (skip and os.path.normcase(os.path.realpath(p))
-                                                       == os.path.normcase(os.path.realpath(skip))):
+            real = os.path.realpath(p)
+            # G8-1: the clip test on the name walked and on the file a link resolves to
+            if n.lower().endswith(C8B_HASH_SKIP) or real.lower().endswith(C8B_HASH_SKIP) or (
+                    skip and os.path.normcase(real) == os.path.normcase(os.path.realpath(skip))):
                 continue
             try:
                 if os.path.isfile(p) and os.path.getsize(p) <= C8B_HASH_MAX_BYTES and _inside(p, folder):
