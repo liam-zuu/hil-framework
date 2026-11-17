@@ -594,8 +594,10 @@ def test_the_constants_file_is_required_and_checked(tmp_path, capsys):
     base = ['--frames', str(tmp_path / 'frames.csv'), '--log', lp, '--out', str(tmp_path / 'p.csv')]
     with pytest.raises(SystemExit):
         V.main(base)
-    for k, over in enumerate((dict(t_trong_s=0.68), dict(version='x'))):
+    for k, over in enumerate((dict(t_trong_s=0.68), dict(version='x'), dict(duong_lenh=[]), dict(imu=[]),
+                              dict(imu=dict(U_IMU_deg=[1.0])))):            # S2H1-1: wrong structure too
         hs = hang_so(tmp_path, name=f'bad{k}.json', **over)
         assert V.main(base + ['--hang-so', hs]) == 2
         assert '#ket_qua,ma=2' in capsys.readouterr().out
         assert not (tmp_path / 'p.csv').exists() and not (tmp_path / 'p_video.json').exists()
+        assert not (tmp_path / 'p_cam.csv').exists()

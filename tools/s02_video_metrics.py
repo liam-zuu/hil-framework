@@ -299,7 +299,10 @@ def main(argv=None) -> int:
     try:
         frames = c7_measure.read_frames(a.frames)
         rows = read_log_rows(a.log)
-        hs = c7_score.load_hang_so(a.hang_so)
+        try:
+            hs = c7_score.load_hang_so(a.hang_so)
+        except (TypeError, AttributeError) as exc:      # S2H1-1 (Codex round 1): a wrong structure is an error too
+            raise ValueError(f'{a.hang_so}: not a c7_hang_so_v1 constants file ({type(exc).__name__}: {exc})') from exc
         info, out, cam = map_video(frames, rows, hs['t_mat_s'], hs['t_trong_s'])
     except (OSError, ValueError, KeyError) as exc:
         print(f'error: {exc}')
