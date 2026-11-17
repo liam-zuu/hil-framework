@@ -80,7 +80,8 @@ def read_log_rows(path):
     rounds 1, 2: the same DUT checks as the scorer): a logger header (s02_metrics.HEADS); a DUT log (log_seq,
     motor_on) through s02_metrics.dut_rows (duplicates dropped, log_seq order, the logger segment or the sample-time
     rule against a restart or conflicting lines); an older log without log_seq: byte-for-byte duplicates dropped,
-    sorted by timestamp_us. timestamp_us must then increase strictly."""
+    sorted by timestamp_us. timestamp_us must then increase strictly. path may be a pathlib.Path (S2V3-2)."""
+    path = os.fspath(path)
     with open(path, newline='', encoding='utf-8') as f:
         rows = [r for r in csv.reader(f) if r and not r[0].startswith('#')]
     if not rows:

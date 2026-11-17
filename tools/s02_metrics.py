@@ -571,12 +571,14 @@ def _rel_pose(t, x, y, th, psi0):
 def largest_gap(t, a, b):
     """Largest interval between consecutive times of t (sorted, s) that meets the open span (a, b); the time before
     the first and after the last one is infinite (S2V2-1, S2V2-2, Codex round 2 of Viec CODE 5: real frames only;
-    the span ends are not frames, a gap across them counts whole). inf when t is empty."""
+    the span ends are not frames, a gap across them counts whole). An interval meets the span only by more than
+    TIME_EPS_S (S2V3-1, Codex round 3: a span end computed as e - D + margin may sit 1e-15 s past a frame on it; that
+    frame then bounds the span, the infinite time after it does not meet it). inf when t is empty."""
     t = np.asarray(t, dtype=float)
     if t.size == 0:
         return math.inf
     left, right = np.r_[-math.inf, t], np.r_[t, math.inf]
-    meet = (right > a) & (left < b)
+    meet = (right > a + TIME_EPS_S) & (left < b - TIME_EPS_S)
     return float(np.max((right - left)[meet])) if meet.any() else 0.0
 
 

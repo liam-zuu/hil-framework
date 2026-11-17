@@ -510,3 +510,27 @@ def test_an_older_log_without_log_seq_is_deduplicated_and_sorted(tmp_path):
     (tmp_path / 'old_bad.csv').write_text('\n'.join([lines[0]] + body + [','.join(bad)]) + '\n', encoding='utf-8')
     with pytest.raises(ValueError, match='does not increase'):
         V.read_log_rows(str(tmp_path / 'old_bad.csv'))
+
+
+def test_span_ends_a_float_step_off_a_frame_do_not_flip_the_gap():
+    """S2V3-1 (Codex round 3): a span end computed as e - D + margin sits 1e-15 s past the last frame (or past a
+    frame that ends a long gap): the frame bounds the span, neither the infinite time after the last frame nor the
+    long gap ending on the start end meets it."""
+    t = np.r_[np.arange(0.0, 8.02, 1 / 30.0)[:-1], 8.02]
+    b = 56.02 - 49 + 1                                                # 8.020000000000003 > 8.02
+    assert b > t[-1]
+    assert M.largest_gap(t, b - 1.2, b) < 0.06                        # not inf
+    t2 = np.r_[np.arange(2.0, 2.96, 1 / 30.0), 3.1, 3.1 + np.arange(1, 30) / 30.0]   # a 0.14 s gap ending at 3.1
+    a = 3.3 - 0.2                                                     # 3.0999999999999996 < 3.1
+    assert a < 3.1
+    assert M.largest_gap(t2, a, a + 0.5) < 0.05
+    assert M.largest_gap(t2, a - 0.01, a + 0.5) > 0.13                 # the gap really inside the span: counted
+    assert M.largest_gap(t, 8.03, 9.0) == math.inf                     # after the last frame by more: still inf
+
+
+def test_read_log_rows_takes_a_path_object(tmp_path):
+    """S2V3-2 (Codex round 3): a pathlib.Path works for a DUT log (dut_rows joins strings)."""
+    log, _ = run_of('A-L2')
+    p, rows = log_rows(log, tmp_path)
+    import pathlib
+    assert V.read_log_rows(pathlib.Path(p)) == rows
