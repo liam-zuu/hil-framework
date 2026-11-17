@@ -1148,6 +1148,7 @@ def test_cs2_10_not_converging_predicts_from_the_final_set():
     y = np.zeros(101)
     sus, pred, passes, conv = cs.mark_suspects(t, x, y, 0.02, 2, 3)
     ref = _ref_pred(t, x, y, sus, 2, 3)
+    ref = np.where(sus & ~(ref > 0.02), np.nan, ref)            # CS3-6: in the set, not above thr: unclassified
     assert not conv and np.allclose(pred, ref, equal_nan=True, atol=1e-12)
     assert np.isnan(pred[sus]).sum() > 50
     assert not np.any(~sus & (np.nan_to_num(pred, nan=0.0) > 0.02))
@@ -1163,7 +1164,8 @@ def test_cs2_10_union_of_the_last_two_passes_is_grown_until_closed():
     sus, pred, passes, conv = cs.mark_suspects(t, x, np.zeros(len(x)), 0.02, 2, 3)
     assert not conv and np.nonzero(sus)[0].tolist() == [3, 4, 5, 7, 9]
     assert not np.any(~sus & (np.nan_to_num(pred, nan=0.0) > 0.02))
-    assert np.allclose(pred, _ref_pred(t, x, np.zeros(len(x)), sus, 2, 3), equal_nan=True, atol=1e-12)
+    ref = _ref_pred(t, x, np.zeros(len(x)), sus, 2, 3)
+    assert np.allclose(pred, np.where(sus & ~(ref > 0.02), np.nan, ref), equal_nan=True, atol=1e-12)
 
 
 def test_cs2_3_g1_does_not_read_the_speed_column(tmp_path):
@@ -1271,3 +1273,110 @@ def test_cs1_16_unmarked_copy_with_segments_is_refused(tmp_path):
                 w.writerow([i, r['log_seq'], r['timestamp_us'], 0, st_i])
         with pytest.raises(ValueError):
             cs.read_esp32(p)
+
+
+# ---------------------------------------------------------------- Codex vong 3 (17/11, CS3-1..CS3-6), each failing on
+# hil 4a5f9ee; review 03_CODE/docs/review/2026-11-17_Tham_dinh_c7_score_o1_vong3.md
+K1S = (0.0, 0.0, 0.0)
+
+
+def test_cs3_1_log_missing_after_t1_keeps_the_certain_violation_before(tmp_path):
+    """Codex CS3-1: K1 (T_cmd 5 s, deadline 7 s), the car 0.13 m off the lane all along (G2 lo 0.125 m > D, never
+    done), a camera gap [5.2, 5.5] s (t1 = 5.2), the log up to 6 s. The old scorer asked for ticks up to the deadline
+    first: U_t infinite, hong_he_do. U_t over [0, t1] bounds the frames before t1: khong_dat (R2V-4). Without a
+    violation the run is still lost to the measurement system."""
+    kw = dict(k_start=K1S, allow_final_set=True, log_kw=dict(post=1.0))
+    fr = make_frames('O1-K1', k_start=K1S, lateral=0.13, drop=[(5.2 + 0.5 / FPS, 5.5)])
+    out, _ = run(tmp_path, 'O1-K1', frames=fr, **kw)
+    gate_ok(out)
+    assert out['outcome'] == 'khong_dat' and out['fail_cause'] == cs.FAIL_VIOL and out['cat_t1']
+    assert out['U_t_scope'] == 'truoc_t1' and out['U_t_parts']['tick_to_s'] == pytest.approx(out['t1'])
+    assert out['U_t_parts']['drift_s'] == pytest.approx(200e-6 * out['t_deadline'])     # drift still to the deadline
+    fr = make_frames('O1-K1', k_start=K1S, drop=[(5.2 + 0.5 / FPS, 5.5)])
+    out, _ = run(tmp_path, 'O1-K1', frames=fr, **kw)
+    assert out['outcome'] == 'hong_he_do' and 'no certain violation before t1' in out['outcome_reasons'][0]
+
+
+def test_cs3_2_suspect_outside_the_window_does_not_split_g1(tmp_path):
+    """Codex CS3-2: K1, after 5 s the car slides 0.02 m/s until 5.91 s; one frame 30 mm off at 7.016667 s, AFTER the
+    deadline (7 s): the only suspect, none in the run window. The old way 1 kept the jump in its derivative (0.059 m/s
+    at 6.92 s, not done) while way 2 dropped it (done): G1 chua_ket_luan with no suspect in the run. Frames outside
+    the window are now context common to both ways."""
+    k = int(round((4.0 + 7.016667) * FPS))
+    fr = make_frames('O1-K1', k_start=K1S, jump={k: (0.0, 0.03)},
+                     lat_fn=lambda t: 0.02 * (min(t, 5.91) - 5.0) if t > 5.0 else 0.0)
+    out, _ = run(tmp_path, 'O1-K1', frames=fr, k_start=K1S, allow_final_set=True)
+    g = gate_ok(out)
+    assert out['n_suspect_pos'] == 0
+    assert g['g1']['t_done'][0] == g['g1']['t_done'][1] and out['t_end_common'] == out['t_end_union']
+
+
+def test_cs3_4_turn_counts_pairs_by_both_time_bases():
+    """Codex CS3-4: receive times 0.1 s after the sample times (tau_hat 0.1 s): the yaw step between the samples at
+    -0.075 and -0.025 s has a receive span meeting [0, 0.12]; turn_totals of C8 counts it (0.1 rad > 2 deg), the old
+    cut from the last sample at or before t = 0 did not."""
+    S = _dyn_S([-0.125, -0.075, -0.025, 0.025, 0.075, 0.125], [0.0, 0.0, 0.1, 0.1, 0.1, 0.1])
+    S['t_recv'] = S['t_all'] + 0.1
+    big = dict(goc_quay_deg=2.0, wz_dps=1e4, alpha_dps2=1e9)
+    assert sum(cs.cu.turn_totals(S, 0.0, 0.12)) == pytest.approx(0.1)
+    r = cs.dyn_exceed(S, 0.0, 0.12, big)
+    assert r[1] == 'goc_quay_deg' and r[0] is not None
+
+
+def test_cs3_5_gyro_without_a_report_before_t0_or_with_a_gap():
+    """Codex CS3-5: gyro reports from 0.01 s only, a 57 deg/s peak at 0.02 s: reported (the old code skipped every
+    gyro check without a report at or before t = 0). A 0.5 s gyro gap (h_lim 0.105 s) with flat values: no excess
+    seen, but the note says the gap; a value not finite is skipped and said."""
+    lim = dict(goc_quay_deg=1e5, wz_dps=30.0, alpha_dps2=1e9)
+    S = _dyn_S(np.arange(-0.1, 0.2, 0.05), np.zeros(6), [0.01, 0.02, 0.03, 0.04], [0.0, 1.0, 0.0, 0.0])
+    r = cs.dyn_exceed(S, 0.0, 0.04, lim)
+    assert r[1] == 'wz_dps' and r[0] == pytest.approx(0.02) and 'start' in r[2]
+    tg = np.r_[np.arange(-0.1, 0.1, 0.01), np.arange(0.6, 0.8, 0.01)]
+    S = _dyn_S(np.arange(-0.1, 0.8, 0.05), np.zeros(18), tg, np.zeros(len(tg)))
+    r = cs.dyn_exceed(S, 0.0, 0.75, lim)
+    assert r[0] is None and 'h_lim' in r[2]
+    gz = np.zeros(len(tg))
+    gz[15] = np.nan                                         # t = 0.05 s, inside the window
+    S = _dyn_S(np.arange(-0.1, 0.8, 0.05), np.zeros(18), tg, gz)
+    assert 'not finite' in cs.dyn_exceed(S, 0.0, 0.75, lim)[2]
+
+
+def test_cs3_6_unclassified_frame_of_a_cycle_has_no_bound():
+    """Codex CS3-6: x = [0.0432, 0.0080, 0.0439, 0.0226, 0.0167, 0.0536, 0.0575] does not converge; the set {1, 2, 5}
+    holds frame 2 whose final prediction is 14.9 mm, below 20 mm: unclassified (Liam 17/11: 'Coi la chua ket luan'),
+    so no prediction (NaN, U_p,k not finite) instead of a finite bound from a flag the final prediction does not
+    support."""
+    x = np.array([0.0432, 0.0080, 0.0439, 0.0226, 0.0167, 0.0536, 0.0575])
+    t = np.arange(7) / 60.0
+    sus, pred, _, conv = cs.mark_suspects(t, x, np.zeros(7), 0.02, 2, 3)
+    assert not conv and np.nonzero(sus)[0].tolist() == [1, 2, 5]
+    assert math.isnan(pred[2]) and pred[5] > 0.02
+    assert _ref_pred(t, x, np.zeros(7), sus, 2, 3)[2] == pytest.approx(0.014916667, abs=1e-6)
+
+
+# ---------------------------------------------------------------- test gaps Codex listed in round 3
+def test_cs2_1_offset_error_must_be_finite_and_not_negative(tmp_path):
+    for bad in (-0.001, float('nan'), float('inf')):
+        with pytest.raises(ValueError, match='offset-err-s'):
+            run(tmp_path, offset_err_s=bad)
+    with pytest.raises(ValueError, match='offset-anchor-s'):
+        run(tmp_path, offset_anchor_s=float('nan'))
+
+
+def test_cs2_4_one_old_row_inside_a_new_file_is_refused(tmp_path):
+    fr = make_frames('O1-F05')
+    fr[200]['shift_mag_px'] = float('nan')                  # one row of the old version, shift_px kept
+    with pytest.raises(ValueError, match='CS2-4'):
+        run(tmp_path, frames=fr)
+
+
+def test_cs2_8_undefined_suspect_does_not_hide_a_certain_violation_before_t1(tmp_path, monkeypatch):
+    """A suspect frame at 3 s (stub; assumption not checked: hi infinite) and a certain violation on the frames just
+    before a long gap at 8 s: the run is still khong_dat by R2V-4."""
+    suspects_stub(monkeypatch, lambda tk: abs(tk - 3.0) < 0.5 / FPS)
+    fr = make_frames('O1-F05', drop=[(8.0, 8.3)], lat_fn=lambda t: 0.13 if 7.9 <= t < 8.0 else 0.0)
+    out, rows = run(tmp_path, frames=fr)
+    gate_ok(out)
+    r = rows[frame_at(rows, 3.0)]
+    assert r['suspect'] == 1 and math.isinf(r['hi_g2'])
+    assert out['outcome'] == 'khong_dat' and out['cat_t1']

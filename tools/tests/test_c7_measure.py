@@ -532,3 +532,74 @@ def test_00121a4_window_edges_and_exactly_eight_neighbours():
     rows = _scale_rows([1.0] * 8)
     cm.apply_gates(rows, 0.3)
     assert all(r['why'] == ['ti_le_it_lan_can'] for r in rows)      # seven each
+
+
+# ---------------------------------------------------------------- Codex vong 3 (17/11): CS3-3, oracle of CS2-6
+def test_cs3_3_scientific_cells_and_rows_without_decimals_keep_their_rounding(tmp_path):
+    """Codex CS3-3: res_m '3.410e-3', scale '9.70004e-1' (6 places): undecided ((2a) in [1.49792, 1.50040] mm). The
+    old reader kept no record, the writer then wrote 10 decimals and the next regate passed. A row given without
+    '_dec' (the fallback rounding) is written back with 6 decimals."""
+    sess = dict(car_side_m=0.1444, rms_px_H=0.3)
+    row = dict(idx=0, t_s=0.0, valid=False, why=['xe_du_thua'], n_marks=24, rms_px=0.3, shift_px=0.2, cam_z=2.6,
+               car_seen=True, x=0.0, y=0.0, psi=0.0, tag_x=0.0, tag_y=0.0, res_m=0.00341, res_sim_m=float('nan'),
+               scale=0.970004, scale_ref=float('nan'), row_px=1.0, vx=float('nan'), vy=float('nan'),
+               wz=float('nan'), speed=float('nan'), shift_mag_px=float('nan'))
+    _old_csv(tmp_path / 'old.csv', [row])
+    txt = (tmp_path / 'old.csv').read_text(encoding='utf-8')
+    txt = txt.replace('0.003410', '3.410e-3').replace('0.970004', '9.70004e-1')
+    (tmp_path / 'sci.csv').write_text(txt, encoding='utf-8')
+    assert cm._decimals('3.410e-3') == 6 and cm._decimals('9.70004e-1') == 6 and cm._decimals('12') == 0
+    rows = cm.read_frames(str(tmp_path / 'sci.csv'))
+    for _ in range(2):
+        cm.regate(rows, sess)
+        assert rows[0]['why'] == ['can_track_lai']
+        cm.write_frames(tmp_path / 'again.csv', rows)
+        rows = cm.read_frames(str(tmp_path / 'again.csv'))
+    rows = [dict(row)]                                      # API row, no '_dec'
+    cm.regate(rows, sess)
+    cm.write_frames(tmp_path / 'api.csv', rows)
+    line = (tmp_path / 'api.csv').read_text(encoding='utf-8').splitlines()[1].split(',')
+    assert line[cm.FRAME_COLS.index('res_m')] == '0.003410' and line[cm.FRAME_COLS.index('scale')] == '0.970004'
+    rows = cm.read_frames(str(tmp_path / 'api.csv'))
+    cm.regate(rows, sess)
+    assert rows[0]['why'] == ['can_track_lai']
+
+
+def test_cs2_6_undecided_neighbours_against_an_exhaustive_oracle():
+    """Random small windows (CS2-6, Codex round 3 test gap): the verdict of (2b) is never 'certain' when some subset of
+    the undecided neighbours gives the other verdict (oracle over every subset, rounding +-q on every scale)."""
+    import itertools
+    rng = np.random.default_rng(5)
+    q, rel, smin = cm.CSV_QUANT, 0.005, 8
+    for trial in range(300):
+        nc, na = int(rng.integers(5, 11)), int(rng.integers(1, 6))
+        cert = list(np.round(1.0 + rng.normal(0, 0.004, nc), 6))
+        und = list(np.round(1.0 + rng.normal(0, 0.006, na), 6))
+        s0 = float(np.round(1.0 + rng.normal(0, 0.005), 6))
+        rows = [dict(idx=0, t_s=0.0, n_marks=24, rms_px=0.3, car_seen=True, res_m=0.0002, res_sim_m=float('nan'),
+                     scale=s0, x=0.0, y=0.0, psi=0.0)]
+        for j, s in enumerate(cert + und):
+            res = round(math.sqrt(0.0015 ** 2 + ((1 - s) * 0.1444) ** 2 / 2), 6) if j >= nc else 0.0002
+            rows.append(dict(rows[0], idx=j + 1, t_s=0.01 * (j + 1), scale=s, res_m=res))   # j >= nc: (2a) undecided
+        cm.regate(rows, dict(car_side_m=0.1444, rms_px_H=0.3))
+        assert all(r['why'] == ['can_track_lai'] for r in rows[1 + nc:])
+        outcomes = set()
+        for m in range(na + 1):
+            for sub in itertools.combinations(und, m):
+                nb = cert + list(sub)
+                if len(nb) < smin:
+                    outcomes.add('fail')
+                    continue
+                ref = float(np.median(nb))
+                r_lo, r_hi = (s0 - q) / (ref + q) - 1.0, (s0 + q) / (ref - q) - 1.0
+                if max(abs(r_lo), abs(r_hi)) <= rel:
+                    outcomes.add('pass')
+                elif (0.0 if r_lo <= 0.0 <= r_hi else min(abs(r_lo), abs(r_hi))) > rel:
+                    outcomes.add('fail')
+                else:
+                    outcomes.update(('pass', 'fail'))
+        got = rows[0]['why']
+        if got == []:
+            assert outcomes == {'pass'}, (trial, outcomes)
+        elif got != ['can_track_lai']:
+            assert outcomes == {'fail'}, (trial, got, outcomes)

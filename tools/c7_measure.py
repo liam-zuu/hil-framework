@@ -474,6 +474,9 @@ def regate(rows, session, gates=None):
         r.pop('_res_sim_hi', None)
         if not r['car_seen']:
             continue
+        dec = r.setdefault('_dec', {})
+        for c in ('res_m', 'scale', 'res_sim_m'):        # CS3-3: a row on the fallback rounding is written back with
+            dec.setdefault(c, 6)                         # 6 decimals, never with digits it does not hold
         q = max(cell_quant(r, 'res_m'), cell_quant(r, 'scale'))
         q_scale = max(q_scale, cell_quant(r, 'scale'))
         if np.isfinite(r['res_m']) and np.isfinite(r['scale']):
@@ -647,10 +650,17 @@ def write_frames(path, rows):
 
 
 def _decimals(s):
+    """Decimal places a number cell resolves: the digits after the point, minus the exponent of a scientific form
+    ('3.410e-3' resolves 6 places, CS3-3); never below 0."""
     s = s.strip().lower()
-    if 'e' in s:
-        return None                                       # not written by write_frames: no record
-    return len(s.split('.', 1)[1]) if '.' in s else 0
+    mant, _, exp = s.partition('e')
+    d = len(mant.split('.', 1)[1]) if '.' in mant else 0
+    if exp:
+        try:
+            d -= int(exp)
+        except ValueError:
+            return None
+    return max(d, 0)
 
 
 def read_frames(path):

@@ -542,8 +542,8 @@ def mark_suspects(t, x, y, thr, half, nmin):
     add every frame outside the set whose prediction from the frames outside the set is above thr, until none is
     added (the set only grows, so it ends); |p - p^| of every frame is then predicted again from the frames outside
     that FINAL set only (O1 3.3: the prediction uses non-suspect frames only). A suspect frame left without nmin
-    such neighbours has NaN: no supported prediction, U_p,k is not finite (evaluate). The flag is reported; the rule
-    is locked at C8."""
+    such neighbours, or whose final prediction is not above thr (unclassified, CS3-6), has NaN: U_p,k is not finite
+    (evaluate). The flag is reported; the rule is locked at C8."""
     n = len(t)
     sus = np.zeros(n, bool)
     hist = []
@@ -561,6 +561,11 @@ def mark_suspects(t, x, y, thr, half, nmin):
         if not grow.any():
             break
         sus = sus | grow
+    # CS3-6 (Liam 17/11 CODE_CAM local_bab5dc33: 'Coi la chua ket luan (Recommended)'): a frame of the final set whose
+    # final prediction is NOT above thr is unclassified (the cycle kept its flag): it stays in the set (G1 two ways and
+    # the tracker treat it as a suspect, the two ways cover both cases) and gets no prediction (NaN): U_p,k not finite,
+    # G2-G4 undefined, so it never gives dat or khong dat
+    pred = np.where(sus & ~(pred > thr), np.nan, pred)
     return sus, pred, SUSPECT_PASSES, False
 
 
@@ -660,45 +665,65 @@ def imu_from(L_full, t_from_us, t_align_s, imu):
 def dyn_exceed(S, t0, t_end, lim):
     """First time [s, ESP32 clock] in [t0, t_end] where the IMU motion leaves the locked range of U_IMU (O1 3.3
     v11.26), with the quantities of the C8 range (c8_u_imu.tong / u_imu_run; CS2-9):
-      angle turned  P + N of c8_u_imu.turn_totals over [t0, t]: every report pair whose span meets the window counts
-                    in full (the pair across t = 0 too), a suspect pair adds max|gz| x its span; yaw up to t_break;
-      rate          |gz| of the gyro reports from the last one at or before t0 to the first at or after t_end (a peak
-                    between two yaw reports is in the gyro, not in the yaw difference);
-      acceleration  |dgz / dt| between those consecutive gyro reports (c8_u_imu.alpha_max).
-    Returns (time, limit key, note): (None, '', note) when it stays inside; the note says what could not be checked
-    (CS1-19: reported, the handling is Liam's when it happens)."""
+      angle turned  P + N of c8_u_imu.turn_totals over [t0, t]: every report pair whose span (sample and receive
+                    times, both bases, CS3-4) meets the window counts in full, a suspect pair adds max|gz| x its span;
+                    yaw up to t_break;
+      rate          |gz| of every finite gyro report from the last one at or before t0 to the first at or after t_end
+                    (a peak between two yaw reports is in the gyro, not in the yaw difference);
+      acceleration  |dgz / dt| between consecutive finite gyro reports there (c8_u_imu.alpha_max; across a gap the
+                    difference quotient still bounds the true peak from below, so an excess is certain).
+    Every excess seen is reported, even when the evidence does not cover the whole window (CS3-5); what could not be
+    checked (no report at or before t0 or after t_end, a gyro gap above h_lim, values not finite, yaw reports not
+    covering the window) is said in the note. Returns (time, limit key, note): (None, '', note) when nothing is seen
+    above the limits (CS1-19: reported, the handling is Liam's when it happens)."""
     cand, notes = [], []
-    tg, gz = S.get('tg', np.array([])), S.get('gz', np.array([]))
-    if tg.size >= 2 and tg[0] <= t0:
-        i0 = int(np.searchsorted(tg, t0, 'right')) - 1
+    tg, gz = np.asarray(S.get('tg', np.array([])), float), np.asarray(S.get('gz', np.array([])), float)
+    if tg.size:
+        i0 = max(int(np.searchsorted(tg, t0, 'right')) - 1, 0)
         i1 = min(int(np.searchsorted(tg, t_end, 'left')), tg.size - 1)
         tw, gw = tg[i0:i1 + 1], gz[i0:i1 + 1]
+        if tg[0] > t0:
+            notes.append(f'gyro reports start {tg[0] - t0:.3f} s after t = 0')
         if tg[-1] < t_end:
             notes.append(f'gyro reports end {t_end - tg[-1]:.2f} s before the window end')
-        bad = np.nonzero(np.degrees(np.abs(gw)) > lim['wz_dps'])[0]
+        fin = np.isfinite(gw)
+        if not fin.all():
+            notes.append(f'{int((~fin).sum())} gyro values not finite (not checked)')
+        h_lim = S.get('h_lim', cu.H_LIM_S)
+        if tw.size >= 2 and np.max(np.diff(tw)) > h_lim:
+            notes.append(f'gyro gap {np.max(np.diff(tw)):.3f} s above h_lim {h_lim:.3f} s (a peak may be missed)')
+        bad = np.nonzero(fin & (np.degrees(np.abs(np.nan_to_num(gw))) > lim['wz_dps']))[0]
         if len(bad):
             cand.append((max(t0, float(tw[bad[0]])), 'wz_dps'))
         if tw.size >= 2:
-            acc = np.degrees(np.abs(np.diff(gw)) / np.diff(tw))
-            bad = np.nonzero(acc > lim['alpha_dps2'])[0]
+            ok = fin[1:] & fin[:-1]
+            acc = np.degrees(np.abs(np.diff(np.nan_to_num(gw))) / np.diff(tw))
+            bad = np.nonzero(ok & (acc > lim['alpha_dps2']))[0]
             if len(bad):
                 cand.append((max(t0, float(tw[bad[0] + 1])), 'alpha_dps2'))
     else:
-        notes.append('no gyro report at or before t = 0: rate and acceleration not checked')
-    ta = S['t_all']
+        notes.append('no gyro report: rate and acceleration not checked')
+    ta, tr = S['t_all'], S['t_recv']
     t_hi = min(t_end, S.get('t_break', math.inf))
     if ta[0] > t0:
         notes.append('IMU yaw reports start after t = 0: angle turned not checked')
     else:
-        i0 = int(np.searchsorted(ta, t0, 'right')) - 1
-        i1 = int(np.searchsorted(ta, t_hi, 'left'))
+        lo_s, hi_s = np.minimum(ta, tr), np.maximum(ta, tr)
+        # the pairs turn_totals counts for [t0, te]: span from lo of the first to hi of the second meets the window
+        meet = np.nonzero(hi_s[1:] >= t0)[0]
+        k_cov = int(np.searchsorted(ta, t0, 'right')) - 1             # turn_totals needs a sample at or before t0
+        i0 = max(0, min(int(meet[0]) if len(meet) else ta.size - 1, k_cov))
+        last = np.nonzero(lo_s <= t_hi)[0]
+        i1 = max(int(np.searchsorted(ta, t_hi, 'left')), int(last[-1]) + 1 if len(last) else 0)
         if i1 >= ta.size:
             notes.append(f'IMU yaw reports end before {"t_break" if t_hi < t_end else "the window end"}')
             i1 = ta.size - 1
         sub = dict(S, **{k: S[k][i0:i1 + 1] for k in ('t_all', 'psi_all', 'n_all', 't_recv', 'keep')})
         lim_rad = math.radians(lim['goc_quay_deg'])
-        for k in range(i0 + 1, i1 + 1):
+        for k in range(i0, i1 + 1):
             te = min(float(ta[k]), t_hi)
+            if te < t0:
+                continue
             try:
                 p, n = cu.turn_totals(sub, t0, te)
             except cu.InputError as exc:
@@ -833,10 +858,12 @@ def evaluate(t, x, y, psi, speed, wz, lane, hs, upsi_k, u_t):
     sus_all, pred_all, passes, conv = mark_suspects(t, x, y, hs['pred_m'], hs['pred_half'], hs['pred_min'])
     # G1 speeds of BOTH ways from the same numbers and the same derivative (CS2-3): the frame poses given here (from
     # frames.csv) and the derivative of c7_measure; way 1 over every valid frame, way 2 over the chain WITHOUT the
-    # suspect frames (CS1-9: a suspect frame disturbs its neighbours). No suspect frame: the same speeds, so the two
-    # ways and the two domains coincide (O1 3.3).
+    # suspect frames OF THE RUN WINDOW (CS1-9: a suspect frame disturbs its neighbours; CS3-2: frames outside the
+    # window are context common to both ways). No suspect frame in the window: the same speeds, so the two ways and
+    # the two domains coincide (O1 3.3).
+    sus_win = sus_all & (t >= 0.0) & (t < deadline - 1e-12)
     sp1, wz1 = _speeds(t, x, y, psi, np.arange(len(t)))
-    sp2, wz2 = (sp1, wz1) if not sus_all.any() else _speeds(t, x, y, psi, np.nonzero(~sus_all)[0])
+    sp2, wz2 = (sp1, wz1) if not sus_win.any() else _speeds(t, x, y, psi, np.nonzero(~sus_win)[0])
     tw, xw, yw, pw = t[win], x[win], y[win], psi[win]
     spw, wzw, usw = sp1[win], wz1[win], upsi_k[win]
     sus, pred = sus_all[win], pred_all[win]
@@ -850,10 +877,37 @@ def evaluate(t, x, y, psi, speed, wz, lane, hs, upsi_k, u_t):
                           hs['t_trong_s'], hs['v_d'], deadline)
     ends = [deadline if v is None else v for v in (td1, td2)]
     end_c, end_u = min(ends), max(ends)
+    # gaps over [0, end of the union domain], both ends included (RB-2); suspects are valid frames
+    gaps, prev = [], 0.0
+    for j in range(n):
+        if tw[j] > end_u + 1e-9:
+            break
+        gaps.append((prev, float(tw[j])))
+        prev = float(tw[j])
+    gaps.append((prev, end_u))
+    glen = [b - a for a, b in gaps]
+    long_gap = next((a for a, b in gaps if b - a > hs['t_trong_s'] + 1e-12), None)
+    # tracking errors only inside the union domain (CS1-7: frames after the run window closed do not spoil the run)
+    trk_t = next((float(tw[j]) for j in range(n) if main[j]['trk'] and tw[j] <= end_u + 1e-9), None)
+    # t1 and its kind (CS1-8): on a tie the tracking error wins, so the error frame is not 'before t1'
+    if trk_t is not None and (long_gap is None or trk_t <= long_gap):
+        t1, t1_kind = trk_t, 'loi_theo_doi'
+    elif long_gap is not None:
+        t1, t1_kind = long_gap, 'khoang_trong'
+    else:
+        t1, t1_kind = None, ''
+    # U_t (CS2-2, CS3-1): the tick evidence over the domain scored; when the log does not cover the union domain but
+    # covers [0, t1], U_t over [0, t1] still bounds the frames before t1, so a certain violation before t1 (R2V-4)
+    # is decided (U_t_scope 'truoc_t1'; the caller uses it for the frames before t1 only)
+    u_scope = 'mien_hop'
     if callable(u_t):
-        u_t = u_t(end_u)
+        fn, u_t = u_t, u_t(end_u)
+        if not math.isfinite(u_t) and t1 is not None:
+            u_t1 = fn(max(0.0, t1))
+            if math.isfinite(u_t1):
+                u_t, u_scope = u_t1, 'truoc_t1'
     if not math.isfinite(u_t):
-        return dict(t_end_union=end_u, t_done_way1=td1, t_done_way2=td2), None, None
+        return dict(t_end_union=end_u, t_done_way1=td1, t_done_way2=td2, t1=t1, t1_kind=t1_kind), None, None
     q = {c: np.full(n, np.nan) for c in o1_gate.MEASURED}
     lo = {c: np.full(n, np.nan) for c in o1_gate.MEASURED}
     hi = {c: np.full(n, np.nan) for c in o1_gate.MEASURED}
@@ -911,25 +965,6 @@ def evaluate(t, x, y, psi, speed, wz, lane, hs, upsi_k, u_t):
                          track_err=int(r['trk']), miss=int(r['miss']), back=int(r['back']), reopen=int(r['reopen']),
                          at_end=int(r['at_end']), scored=int(r['scored']), g4_formula=int(formula),
                          **{f'{b}_{c}': d[c][j] for c in o1_gate.MEASURED for b, d in (('lo', lo), ('hi', hi))}))
-    # gaps over [0, end of the union domain], both ends included (RB-2); suspects are valid frames
-    gaps, prev = [], 0.0
-    for j in range(n):
-        if tw[j] > end_u + 1e-9:
-            break
-        gaps.append((prev, float(tw[j])))
-        prev = float(tw[j])
-    gaps.append((prev, end_u))
-    glen = [b - a for a, b in gaps]
-    long_gap = next((a for a, b in gaps if b - a > hs['t_trong_s'] + 1e-12), None)
-    # tracking errors only inside the union domain (CS1-7: frames after the run window closed do not spoil the run)
-    trk_t = next((float(tw[j]) for j in range(n) if main[j]['trk'] and tw[j] <= end_u + 1e-9), None)
-    # t1 and its kind (CS1-8): on a tie the tracking error wins, so the error frame is not 'before t1'
-    if trk_t is not None and (long_gap is None or trk_t <= long_gap):
-        t1, t1_kind = trk_t, 'loi_theo_doi'
-    elif long_gap is not None:
-        t1, t1_kind = long_gap, 'khoang_trong'
-    else:
-        t1, t1_kind = None, ''
     summ = dict(task=lane.task, v=lane.v, T_cmd=lane.Tcmd, t_deadline=deadline, t_done_way1=td1, t_done_way2=td2,
                 t_end_common=end_c, t_end_union=end_u, n_suspect_pos=int(sus.sum()),
                 suspect_passes=passes, suspect_converged=conv,
@@ -940,7 +975,7 @@ def evaluate(t, x, y, psi, speed, wz, lane, hs, upsi_k, u_t):
                 gap_max=float(max(glen)), t_gap_long=long_gap, t1=t1, t1_kind=t1_kind, frames_window=n,
                 gia_dinh_nghi_vi_tri=hs.get('gia_dinh_nghi_vi_tri', 'chua_kiem'),
                 n_no_pred=int(np.sum(~np.isfinite(pred))), n_suspect_no_pred=int(np.sum(sus & ~np.isfinite(pred))),
-                U_t_used_s=float(u_t))
+                U_t_used_s=float(u_t), U_t_scope=u_scope)
     return summ, rows, dict(q=q, lo=lo, hi=hi, t=tw, scored=np.array([r['scored'] for r in main]), gaps=glen)
 
 
@@ -1145,10 +1180,17 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
         reasons.append('duong lenh: ' + '; '.join(cmd_flags))
     per = {c: (gi['q'][c], gi['lo'][c], gi['hi'][c]) for c in o1_gate.MEASURED}
     cat = bool(t1 is not None and viol_before and not bumped and not cmd_lost)
+    if out['U_t_scope'] == 'truoc_t1' and not cat:
+        # CS3-1: U_t holds before t1 only; without a certain violation before t1 the run is lost as before
+        return lost_output(task, '; '.join(reasons + [
+            f'U_t not bounded over the union domain (the log does not cover [t0, t0 + {t_end_u:.3f} s]); no certain '
+            f'violation before t1 = {t1:.3f} s']), FAIL_MEAS, U_t_parts=u_t_parts, **base), []
     if cat:
         dom_c = dom_u = before
         g1 = g1_block([None, None], deadline, max(0.0, t1), True)
-        reasons.append(f'vi pham chac chan truoc t1 = {t1:.3f} s (R2V-4)')
+        reasons.append(f'vi pham chac chan truoc t1 = {t1:.3f} s (R2V-4)'
+                       + (' (U_t tren [0, t1]: log khong phu mien hop, CS3-1)' if out['U_t_scope'] == 'truoc_t1'
+                          else ''))
     else:
         dom_c = sc & (gi['t'] <= out['t_end_common'] + 1e-12)
         dom_u = sc & (gi['t'] <= t_end_u + 1e-12)
