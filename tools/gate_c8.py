@@ -20,12 +20,11 @@ bytes) is "the gate file SHA" carried by S05_summary.csv, meta.yaml and every ru
 
 Every number is recomputed: uhat = uhat_of(...) (the time maximum of the per-frame bound is the bound at the peak
 of the schedule, so the peak formula) from the RECOMPUTED peaks, never the stored ones; report_only =
-report_only_of(that canonical uhat) (strict '>' against half the threshold; within REL_TOL of half the condition
-still decides, the side of '=' in O1 rule 2b, GC1-1, GC1-3). Any difference refuses the whole file (GateFileError):
+report_only_of(that canonical uhat) (strict '>' against half the threshold, GC1-1, GC2-1). Any difference refuses the whole file (GateFileError):
 stored numbers further than REL_TOL from the recomputed ones, non-finite results (GC1-2), a duplicate JSON key at any
 level (GC1-4), a number that does not convert (GC1-5). The writer (C8b script) builds each level with level_block
 and calls check() (write_gate does) before the file leaves C8.
-Codex Sol round 1 (17/11, account 1, session 01a1e87f): GC1-1 ... GC1-6 fixed here.
+Codex Sol rounds 1, 2 (17/11, account 1, session 01a1e87f): GC1-1 ... GC1-6, GC2-1 ... GC2-4 fixed here.
 
 required(level, platform, stage, campaign): the conditions that decide a run (design section 4):
   SIM                                   all five
@@ -105,15 +104,15 @@ def uhat_of(u_p_m: float, u_psi_deg: float, u_t_s: float, v_cmd_max: float, wz_c
 
 
 def report_only_of(uhat: Dict[str, float]) -> Tuple[str, ...]:
-    """Conditions whose base bound is above half the threshold ('>' strict: equal still decides; a bound within
-    REL_TOL above half is taken as equal, so it decides: the numbers cannot tell those apart, GC1-1, GC1-3).
+    """Conditions whose base bound is above half the threshold ('>' strict, O1 rule 2b: equal still decides;
+    GC2-1: no tolerance band in the rule itself; check() classifies the canonical bound, never a stored one).
     A bound that is not finite is an error."""
     out = []
     for c in MASKABLE:
         x = float(uhat[c])
         if not math.isfinite(x):
             raise GateFileError(f'uhat {c} {x!r}: not finite')
-        if x > 0.5 * o1_gate.THRESHOLDS[c] * (1.0 + REL_TOL):
+        if x > 0.5 * o1_gate.THRESHOLDS[c]:
             out.append(c)
     return tuple(out)
 
@@ -122,7 +121,10 @@ def level_block(level: str, u_p_m: float, u_psi_deg: float, runs) -> dict:
     """The per_level block of a gate level as check() wants it, for the writer (C8b script): runs [{run_id,
     controller, u_t_s}]; peaks, U_t,C8, uhat and report_only computed here."""
     v, wz = schedule_peaks(level)
-    runs = [dict(run_id=r['run_id'], controller=r['controller'], u_t_s=float(r['u_t_s'])) for r in runs]
+    runs = [dict(run_id=r['run_id'], controller=r['controller'],          # GC2-3: types checked, not converted
+                 u_t_s=_num(r['u_t_s'], f'{level} runs[{i}].u_t_s', positive=True)) for i, r in enumerate(runs)]
+    u_p_m = _num(u_p_m, f'{level} u_p_m')
+    u_psi_deg = _num(u_psi_deg, f'{level} u_psi_deg')
     u_t = max(r['u_t_s'] for r in runs)
     uh = uhat_of(u_p_m, u_psi_deg, u_t, v, wz)
     return dict(v_cmd_max=v, wz_cmd_max=wz, u_t_c8_s=u_t, runs=runs, uhat=uh, report_only=list(report_only_of(uh)))
@@ -297,9 +299,15 @@ def fake_gate(levels=('O1-F05',), u_p_m=0.002, u_psi_deg=2.0, u_t_s=0.010) -> di
 
 
 def write_gate(path: str, d: dict) -> str:
-    """Write a gate content (checked first) and return the SHA-256 of the bytes."""
+    """Write a gate content and return the SHA-256 of the bytes. GC2-2: the serialised bytes are read back in memory
+    as read_gate_c8 reads them (duplicate keys refused) and checked before the file is opened, so a file the reader
+    refuses is never written."""
     check(d)
     raw = (json.dumps(d, indent=1, ensure_ascii=False) + '\n').encode('utf-8')
+    try:
+        check(json.loads(raw.decode('utf-8'), object_pairs_hook=_no_duplicate_keys))
+    except GateFileError as exc:
+        raise GateFileError(f'not written: {exc}')
     with open(path, 'wb') as f:
         f.write(raw)
     return hashlib.sha256(raw).hexdigest()

@@ -142,17 +142,52 @@ def test_gc1_1_tolerance_cannot_exempt_a_condition_at_half(tmp_path):
 
 
 def test_gc1_1_stored_peak_within_tolerance_does_not_move_the_mask(tmp_path):
-    # the file's peak a hair above the schedule's: uhat and the mask still come from the recomputed peak
+    # GC2-4 (round 2): the canonical G3 just below half, a stored peak within REL_TOL that would put it above half;
+    # the other report-only conditions kept as they are, so only G3 differs
     sch_v = GC.schedule_peaks('O1-F02')[0]
-    u_t = (0.05 - 0.002) / sch_v                                             # G3 exactly at half with the true peak
+    u_t = (0.05 - 1e-12 - 0.002) / sch_v                                     # canonical G3 = half - 1e-12
     d = GC.fake_gate(('O1-F02',), u_p_m=0.002, u_psi_deg=0.0, u_t_s=u_t)
     e = d['dieu_2b']['per_level']['O1-F02']
-    assert 'g3' not in e['report_only']                                     # equal (within REL_TOL): decides
-    e['v_cmd_max'] *= 1 + 5e-10
-    e['uhat']['g3'] = 0.002 + u_t * e['v_cmd_max']
-    e['report_only'] = ['g3']
+    assert 'g3' not in e['report_only']
+    stored_v = e['v_cmd_max'] * (1 + 5e-10)
+    stored_g3 = 0.002 + u_t * stored_v
+    assert stored_g3 > 0.05 and GC._close(stored_g3, e['uhat']['g3'])        # above half, within REL_TOL
+    e['v_cmd_max'] = stored_v
+    e['uhat']['g3'] = stored_g3
+    e['report_only'] = sorted(set(e['report_only']) | {'g3'}, key=GC.MASKABLE.index)
     with pytest.raises(GC.GateFileError, match='report_only'):
         GC.check(d)
+
+
+def test_gc2_1_strict_greater_than_half(tmp_path):
+    # G2 canonical bound 0.050000000025 > 0.05: report only (no tolerance band in the rule, GC2-1)
+    d = GC.fake_gate(('O1-F08',), u_p_m=0.050000000025, u_psi_deg=0.0, u_t_s=0.001)
+    e = d['dieu_2b']['per_level']['O1-F08']
+    assert 'g2' in e['report_only']
+    GC.read_gate_c8(_write(tmp_path, d))
+    e['report_only'] = [c for c in e['report_only'] if c != 'g2']
+    with pytest.raises(GC.GateFileError, match='report_only'):
+        GC.check(d)
+    assert GC.report_only_of({'g2': 0.05, 'g3': 0.05, 'g5': 3.75}) == ()
+
+
+def test_gc2_2_writer_never_writes_a_file_the_reader_refuses(tmp_path):
+    d = GC.fake_gate()
+    d['camera'] = {1: 0, '1': 1}                                             # two keys that serialise to one
+    p = str(tmp_path / 'w.json')
+    with pytest.raises(GC.GateFileError, match='duplicate'):
+        GC.write_gate(p, d)
+    assert not os.path.exists(p)
+
+
+@pytest.mark.parametrize('bad', [True, '0.014', float('nan'), 0.0, 10 ** 400])
+def test_gc2_3_level_block_checks_types(bad):
+    with pytest.raises(GC.GateFileError):
+        GC.level_block('O1-F08', 0.002, 2.0, [dict(run_id='p', controller='PID', u_t_s=bad),
+                                              dict(run_id='l', controller='LADRC', u_t_s=0.014)])
+    with pytest.raises(GC.GateFileError):
+        GC.level_block('O1-F08', True, 2.0, [dict(run_id='p', controller='PID', u_t_s=0.01),
+                                             dict(run_id='l', controller='LADRC', u_t_s=0.014)])
 
 
 def test_gc1_2_overflow_in_the_recomputed_bound(tmp_path):
