@@ -853,6 +853,8 @@ def _plan():
 
 META = dict(nhanh_tick='bo_tick', commit_hil='abc1234')
 SCRIPT = dict(commit='abc1234ffff', dirty=False)
+SCORER = dict(commit='abc1234ffff', dirty=False, nut=[dict(commit='abc1234ffff', dirty=False, file='tools/c7_score.py',
+                                                            tracked=True)])
 
 
 def _pair(rid, task, half, outcome, ut, nodes=None, gio_ok=True, ctrl='PID'):
@@ -861,7 +863,7 @@ def _pair(rid, task, half, outcome, ut, nodes=None, gio_ok=True, ctrl='PID'):
              ket_luan='ok' if gio_ok else 'hong_he_do', controller=ctrl)
     sha = f'{rid:0<64}'[:64]
     l = dict(version='c8b_luoi_v1', gio_sha256=sha, task=task, nodes_s=nodes, report_only=[], outcome=outcome,
-             u_t_nodes=ut, script=SCRIPT, scorer=SCRIPT, nhanh_tick=['bo'])
+             u_t_nodes=ut, script=SCRIPT, scorer=SCORER, nhanh_tick=['bo'])
     return g, l, sha
 
 
@@ -983,6 +985,31 @@ def test_cong_branch_and_commit_from_plan():
     with pytest.raises(CU.UError, match='scorer not from commit_hil'):
         CU.cong(K, _plan(), [(s0, r0, g0, dict(l0, scorer=dict(commit='abc1234', dirty=True)), sh0)] + lu[1:],
                 ['O1-F05'], 'bo_tick', 'x', meta=META)
+
+
+def test_cong_scorer_must_be_canonical_and_lost_run_needs_none():
+    lu = _luot()
+    s0, r0, g0, l0, sh0 = lu[0]
+    other = dict(SCORER, nut=[dict(SCORER['nut'][0], file='tools/scorer_thu.py', tracked=False)])
+    with pytest.raises(CU.UError, match='C8BS-16'):
+        CU.cong(K, _plan(), [(s0, r0, g0, dict(l0, scorer=other), sh0)] + lu[1:], ['O1-F05'], 'bo_tick', 'x', meta=META)
+    # C8BS-R4-1: slot 1 lost at the clock check (no node, scorer None), then a valid rerun: accepted
+    g, l, s = _pair('r1x', 'O1-F05', 0.006, 'chua_ket_luan', [], gio_ok=False)
+    l = dict(l, scorer=None, nhanh_tick=[], outcome='hong_he_do')
+    d = CU.cong(K, _plan(), [('1', 'r1x', g, l, s)] + lu, ['O1-F05'], 'bo_tick', 'x', meta=META)
+    assert [r['run_id'] for r in d['dieu_2b']['per_level']['O1-F05']['runs']] == ['r1', 'r2']
+
+
+def test_repo_state_marks_untracked_scorer(tmp_path):
+    p = os.path.join(HERE, '..', 'c8b_tmp_untracked_scorer.py')
+    open(p, 'w').write('# temporary, untracked' + chr(10))
+    try:
+        st = G.repo_state(p)
+        assert st['tracked'] is False and st['dirty'] is True and st['file'].endswith('c8b_tmp_untracked_scorer.py')
+    finally:
+        os.remove(p)
+    st = G.repo_state(os.path.join(HERE, '..', 'c7_score.py'))
+    assert st['file'] == 'tools/c7_score.py' and st['tracked'] is True
 
 
 def test_cong_controller_from_log():

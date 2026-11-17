@@ -115,8 +115,24 @@ def repo_state(path_in_repo=None):
         c = subprocess.run(['git', '-C', top, 'rev-parse', 'HEAD'], capture_output=True, text=True, timeout=10)
         s = subprocess.run(['git', '-C', top, 'status', '--porcelain', '--', *C8B_FILES], capture_output=True,
                            text=True, timeout=10)
-        return dict(commit=c.stdout.strip(), dirty=bool(s.stdout.strip()) or c.returncode != 0,
-                    luc_chay=cu.now_iso())
+        out = dict(commit=c.stdout.strip(), dirty=bool(s.stdout.strip()) or c.returncode != 0, luc_chay=cu.now_iso())
+        if path_in_repo:
+            # C8BS-16 round 4: the very file given (the scorer actually called): its path in the repo, tracked by git
+            # and without a change not committed; else dirty
+            try:
+                rel = os.path.relpath(os.path.abspath(path_in_repo), top).replace(os.sep, '/')
+            except ValueError:                        # another drive: not in this repo
+                rel = None
+            if rel is None or rel.startswith('..'):
+                out.update(file=os.path.abspath(path_in_repo), tracked=False, dirty=True)
+                return out
+            tr = subprocess.run(['git', '-C', top, 'ls-files', '--error-unmatch', '--', rel], capture_output=True,
+                                text=True, timeout=10)
+            st = subprocess.run(['git', '-C', top, 'status', '--porcelain', '--', rel], capture_output=True, text=True,
+                                timeout=10)
+            tracked = tr.returncode == 0
+            out.update(file=rel, tracked=tracked, dirty=out['dirty'] or not tracked or bool(st.stdout.strip()))
+        return out
     except (OSError, subprocess.SubprocessError):
         return dict(commit='', dirty=None, luc_chay=cu.now_iso())
 

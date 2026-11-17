@@ -270,12 +270,20 @@ def check_branch(branch, meta, luot):
         raise UError('bo_tick needs commit_hil (the scripts gone through Codex) in the C8 plan (O1 v11.34 Q4)')
     want = {'bo_tick': 'bo', 'giu_tick': 'giu'}[branch]
     for slot, rid, g, l, _ in luot:
-        for nm, sc in (('clock', g.get('script')), ('grid', l.get('script')), ('scorer', l.get('scorer'))):
+        scored = bool(g.get('ok')) and l.get('outcome') != 'hong_he_do'
+        checks = [('clock', g.get('script')), ('grid', l.get('script'))]
+        if scored:                                     # C8BS-R4-1: a run lost before any node has no scorer
+            checks.append(('scorer', l.get('scorer')))
+        for nm, sc in checks:
             sc = sc or {}
             if commit and (not str(sc.get('commit', '')).startswith(commit) or sc.get('dirty') is not False):
                 raise UError(f'run {rid}: {nm} not from commit_hil {commit} with the C8b chain clean')
-        if l.get('outcome') == 'hong_he_do' or not g.get('ok'):
+        if not scored:
             continue                                   # no node scored: no branch to check, the run is not used
+        # C8BS-16 round 4: every node scored by the canonical scorer of the repo, tracked and clean
+        for k, nd in enumerate((l.get('scorer') or {}).get('nut') or [None]):
+            if not nd or nd.get('file') != 'tools/c7_score.py' or nd.get('tracked') is not True                     or nd.get('dirty') is not False:
+                raise UError(f'run {rid}: node {k} not scored by the tracked, clean tools/c7_score.py (C8BS-16)')
         used = set(l.get('nhanh_tick') or [])
         if used != {want}:
             raise UError(f'run {rid}: nodes scored with tick branch {sorted(used)}, the plan says {want}')
