@@ -28,11 +28,10 @@ cong (after every C8 figure-8 run is scored on its clock grid with the locked co
   each level needs at least one PID and one LADRC run (else C8 is not finished: refused).
   u_t_s of a run = the largest node U_t of its grid + the half width of its clock interval (design 9: so that U-hat
   keeps the clock part the grid carries; node scoring itself uses U_t without the half width).
-  U_t,C8(level) = max u_t_s; U-hat: G2 = U_p, G3 = U_p + U_t,C8 v_cmd_max, G5 = U_psi + deg(U_t,C8 wz_cmd_max)
-  (the time maximum of the per-frame bound is the bound at the schedule peak, o1_gate.fig8_cmd_max); report-only:
-  U-hat > half the threshold (strict). G1, G4 always decide. Written in gate_c8_v1, then read back with
-  tools/gate_c8.read_gate_c8 (CODE_GATE) before the command reports success; a file it refuses is renamed
-  *.TU_CHOI and the command fails.
+  U_t,C8(level) = max u_t_s; U-hat: G2 = U_p, G3 = U_p + U_t,C8 v_cmd_max, G5 = U_psi + deg(U_t,C8 wz_cmd_max), with
+  the schedule peaks WITHOUT the upper-bound margin; report-only: U-hat > half the threshold (strict). G1, G4 always
+  decide. The level blocks come from gate_c8.level_block and the file is written with gate_c8.write_gate (CODE_GATE:
+  checked before the file is opened), then read back with gate_c8.read_gate_c8; an existing file is never replaced.
 
   python tools/c8b_u.py khoa --gio r1=gio_r1.json ... --tb 3b.json --cam-u c8_cam_u_vao.json \
       [--u-imu u_imu_dong.json] [--phep5 phep5.csv] --out c8b_khoa.json
@@ -282,13 +281,9 @@ def check_branch(branch, meta, luot):
             raise UError(f'run {rid}: nodes scored with tick branch {sorted(used)}, the plan says {want}')
 
 
-def uhat(u_p, u_psi_deg, u_t, v, wz):
-    return dict(g2=u_p, g3=u_p + u_t * v, g5=u_psi_deg + math.degrees(u_t * wz))
-
-
 def cong(k, plan, luot, levels, branch, c8_dir, cam=None, written_by=None, meta=None):
+    import gate_c8
     import o1_gate
-    from o1_feasibility import Schedule
     from o1_tasks import FIG8
     if branch not in BRANCHES:
         raise UError(f'u_t_branch {branch!r}: {BRANCHES}')
@@ -314,11 +309,9 @@ def cong(k, plan, luot, levels, branch, c8_dir, cam=None, written_by=None, meta=
         if not set(CONTROLLERS) <= ctl:
             raise UError(f'{lv}: needs a run of each controller not lost and with a finite U_t (has {sorted(ctl)}): '
                          f'C8 not finished (O1 3.9 2b)')
-        v, wz = o1_gate.fig8_cmd_max(Schedule(FIG8[lv]))
-        utc = max(r['u_t_s'] for r in runs)
-        uh = uhat(k['U_p_m'], k['U_psi_deg'], utc, v, wz)
-        per[lv] = dict(v_cmd_max=v, wz_cmd_max=wz, u_t_c8_s=utc, runs=runs, uhat=uh,
-                       report_only=[c for c in MASKABLE if uh[c] > 0.5 * thr[c]])
+        # CODE_GATE (17/11): the level block comes from gate_c8.level_block: peaks of the schedule WITHOUT the upper-bound
+        # margin (schedule_peaks), U_t,C8 = max u_t_s, uhat, report_only by '>' on the recomputed bound
+        per[lv] = gate_c8.level_block(lv, k['U_p_m'], k['U_psi_deg'], runs)
     return dict(format='gate_c8_v1', c8_dir=c8_dir, written_by=written_by or {},
                 written_at=datetime.datetime.now().astimezone().isoformat(timespec='seconds'),
                 levels=list(levels), u_t_branch=branch,
@@ -328,21 +321,24 @@ def cong(k, plan, luot, levels, branch, c8_dir, cam=None, written_by=None, meta=
 
 
 def write_gate(path, d):
-    """Write, then read back with gate_c8.read_gate_c8 (CODE_GATE); refused: renamed *.TU_CHOI, UError."""
+    """Write with gate_c8.write_gate (CODE_GATE: the bytes are checked as the reader reads them before the file is
+    opened, so a file the reader refuses is never written), then read it back with read_gate_c8. An existing file is
+    never replaced (one gate file per C8, written once). Returns the GateC8 read back."""
     try:
         import gate_c8
     except ImportError:
-        raise UError('tools/gate_c8.py (CODE_GATE, feat/gate-v1133) is not on this branch: the gate file cannot be '
-                     'checked, not written')
+        raise UError('tools/gate_c8.py (CODE_GATE) is not on this branch: the gate file cannot be checked, not written')
     cu.check_path(path)
-    text = json.dumps(d, indent=1, ensure_ascii=False, allow_nan=False)
-    with open(path, 'x', encoding='utf-8') as f:
-        f.write(text)
+    if os.path.exists(path):
+        raise UError(f'{path} exists: the C8 gate file is written once')
     try:
-        return gate_c8.read_gate_c8(path)
-    except Exception as exc:                            # any refusal of the reader
-        os.replace(path, path + '.TU_CHOI')
-        raise UError(f'gate_c8.read_gate_c8 refused the file ({exc}); kept as {path}.TU_CHOI')
+        sha = gate_c8.write_gate(path, d)
+        g = gate_c8.read_gate_c8(path)
+    except gate_c8.GateFileError as exc:
+        raise UError(f'gate_c8 refused the content: {exc}')
+    if g.sha256 != sha:
+        raise UError(f'{path}: SHA read back {g.sha256} differs from the bytes written {sha}')
+    return g
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────────────────────

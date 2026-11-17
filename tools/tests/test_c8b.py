@@ -870,13 +870,13 @@ K = dict(U_p_m=0.004, U_psi_deg=2.0)
 
 
 def test_cong_rule_2b():
+    import gate_c8
     import o1_gate
-    from o1_feasibility import Schedule
-    from o1_tasks import FIG8
     d = CU.cong(K, _plan(), _luot(lost_first=True), ['O1-F05', 'O1-F08'], 'bo_tick', 'C8/x', meta=META)
     p8 = d['dieu_2b']['per_level']['O1-F08']
     assert p8['u_t_c8_s'] == pytest.approx(max(0.021 + 0.009, 0.03 + 0.007))
-    v, wz = o1_gate.fig8_cmd_max(Schedule(FIG8['O1-F08']))
+    v, wz = gate_c8.schedule_peaks('O1-F08')                    # peaks without the margin (CODE_GATE GC1-3)
+    assert (p8['v_cmd_max'], p8['wz_cmd_max']) == (v, wz)
     assert p8['uhat']['g3'] == pytest.approx(0.004 + p8['u_t_c8_s'] * v)
     assert p8['uhat']['g5'] == pytest.approx(2.0 + math.degrees(p8['u_t_c8_s'] * wz))
     assert p8['report_only'] == [c for c in ('g2', 'g3', 'g5') if p8['uhat'][c] > 0.5 * o1_gate.THRESHOLDS[c]]
@@ -884,11 +884,30 @@ def test_cong_rule_2b():
     lu = d['camera']['c8b']['u_t_luot_c8']
     assert lu['r3']['h_s'] == pytest.approx(0.009) and lu['r3']['u_max_s'] == pytest.approx(0.021)
     assert d['format'] == 'gate_c8_v1' and d['u_t_branch'] == 'bo_tick'
+    gate_c8.check(d)                                             # the real contract of the gate file
+
+
+def test_cong_written_and_read_back_with_real_reader(tmp_path):
+    k = dict(K, version=CU.VERSION)
+    d = CU.cong(k, _plan(), _luot(), ['O1-F05', 'O1-F08'], 'bo_tick', 'C8/x', meta=META,
+                written_by=dict(script='tools/c8b_u.py', repo='hil-framework', commit='abc1234', dirty=False))
+    g = CU.write_gate(str(tmp_path / 'gate_c8.json'), CU._clean(d))
+    assert g.levels == ('O1-F05', 'O1-F08') or list(g.levels) == ['O1-F05', 'O1-F08']
+    assert tuple(g.report_only('O1-F08')) == tuple(d['dieu_2b']['per_level']['O1-F08']['report_only'])
+    with pytest.raises(CU.UError, match='written once'):
+        CU.write_gate(str(tmp_path / 'gate_c8.json'), CU._clean(d))
+    bad = json.loads(json.dumps(CU._clean(d)))
+    bad['dieu_2b']['per_level']['O1-F08']['report_only'] = []    # contradicts uhat: the reader refuses, no file
+    if d['dieu_2b']['per_level']['O1-F08']['report_only']:
+        with pytest.raises(CU.UError, match='refused'):
+            CU.write_gate(str(tmp_path / 'g2.json'), bad)
+        assert not (tmp_path / 'g2.json').exists()
 
 
 def test_cong_strict_half():
-    assert CU.uhat(0.05, 1.0, 0.0, 1.0, 1.0)['g2'] == 0.05
-    lu = [(s, r, dict(g, half_s=0.0), dict(l, u_t_nodes=[0.0] * len(l['u_t_nodes'])), sh)
+    import gate_c8
+    assert gate_c8.uhat_of(0.05, 1.0, 0.0, 1.0, 1.0)['g2'] == 0.05
+    lu = [(s, r, dict(g, half_s=0.0), dict(l, u_t_nodes=[0.001] * len(l['u_t_nodes'])), sh)
           for s, r, g, l, sh in _luot()]
     d = CU.cong(dict(U_p_m=0.05, U_psi_deg=1.0), _plan(), lu, ['O1-F05'], 'bo_tick', 'x', meta=META)
     assert 'g2' not in d['dieu_2b']['per_level']['O1-F05']['report_only']      # 0.05 = half of D: still decides
@@ -972,23 +991,3 @@ def test_write_gate_needs_reader(tmp_path, monkeypatch):
     with pytest.raises(CU.UError, match='gate_c8'):
         CU.write_gate(str(tmp_path / 'g.json'), {})
     assert not (tmp_path / 'g.json').exists()
-
-
-def test_write_gate_reads_back_and_refuses(tmp_path, monkeypatch):
-    import types
-    calls = []
-
-    def ok_reader(path):
-        calls.append(path)
-        return types.SimpleNamespace(sha256='x')
-
-    monkeypatch.setitem(sys.modules, 'gate_c8', types.SimpleNamespace(read_gate_c8=ok_reader))
-    g = CU.write_gate(str(tmp_path / 'g.json'), {'format': 'gate_c8_v1'})
-    assert calls == [str(tmp_path / 'g.json')] and g.sha256 == 'x'
-
-    def bad_reader(path):
-        raise ValueError('uhat differs')
-    monkeypatch.setitem(sys.modules, 'gate_c8', types.SimpleNamespace(read_gate_c8=bad_reader))
-    with pytest.raises(CU.UError, match='refused'):
-        CU.write_gate(str(tmp_path / 'h.json'), {'format': 'gate_c8_v1'})
-    assert not (tmp_path / 'h.json').exists() and (tmp_path / 'h.json.TU_CHOI').exists()
