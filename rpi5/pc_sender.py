@@ -251,12 +251,169 @@ QUERY_NAMES = ('gain_query_before.txt', 'gain_query_after.txt')
 ACK_NAME = 'gain_ack.txt'                       # B81-14: s05_final_table --gain-ack-name default
 
 
-def query_dir_problem(d: str, with_ack: bool = False):
+SWA_QUERY_NAME = 'gain_query_swa.txt'          # --pause-swa: question after SWA on, before the schedule
+
+
+def query_dir_problem(d: str, with_ack: bool = False, with_swa: bool = False):
     """R134C-11: one folder per run. A file of an earlier run (before or after, and the gain ack with
-    --gain-file) refuses the run before '#test_start', so a new 'before' can never sit next to an old 'after'.
-    None when the folder is free."""
-    old = [n for n in QUERY_NAMES + ((ACK_NAME,) if with_ack else ()) if os.path.exists(os.path.join(d, n))]
+    --gain-file, and the answer after SWA on with --pause-swa) refuses the run before '#test_start', so a new
+    'before' can never sit next to an old 'after'. None when the folder is free. With --pause-swa a name that is a
+    broken link counts too (os.path.lexists; Codex WS-5); without it the check of 9476500 is kept."""
+    names = QUERY_NAMES + ((ACK_NAME,) if with_ack else ()) + ((SWA_QUERY_NAME,) if with_swa else ())
+    there = os.path.lexists if with_swa else os.path.exists
+    old = [n for n in names if there(os.path.join(d, n))]
     return f"--gain-query-dir {d} already holds {', '.join(old)}: use a new folder for each run" if old else None
+
+
+def _glc():
+    tools = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tools')
+    if tools not in sys.path:
+        sys.path.insert(0, tools)
+    import gain_line_check as glc
+    import gain_send as gs
+    return glc, gs
+
+
+def answer_problem(q, name: str):
+    """--pause-swa (Codex WS-4, round 2): None, or why one gain_line_check.read_query answer (None = unreadable) is
+    not a complete '#gain_running' of one board: sha, env, mac (aa:bb:cc:dd:ee:ff), id, applied_n (decimal),
+    ctrl PID|ADRC and exactly the 7 gains of that ctrl (gain_send.NAMES) as finite numbers; boot is checked by
+    read_query."""
+    glc, gs = _glc()
+    if q is None:
+        return f'no readable answer ({name})'
+    why = [k for k in ('sha', 'env', 'mac', 'id', 'applied_n') if not q.get(k)]
+    why += [k for k in ('id', 'applied_n') if q.get(k) and not (q[k].isascii() and q[k].isdigit())]
+    mac = (q.get('mac') or '').split(':')
+    if q.get('mac') and not (len(mac) == 6 and all(len(x) == 2 and all(c in '0123456789abcdefABCDEF' for c in x)
+                                                    for x in mac)):
+        why.append(f"mac={q.get('mac')!r}")
+    ctrl = q.get('ctrl')
+    if ctrl not in gs.NAMES:
+        why.append(f'ctrl={ctrl!r}')
+    else:
+        for n in gs.NAMES[ctrl]:
+            try:
+                ok = math.isfinite(float(q.get(n, '')))
+            except ValueError:
+                ok = False
+            if not ok:
+                why.append(f'{n}={q.get(n)!r}')
+    return f"incomplete answer in {name}: {', '.join(why)}" if why else None
+
+
+def before_problem(d: str):
+    """--pause-swa (Codex WS-6): None, or why the question before (DIR/gain_query_before.txt) is not a complete
+    answer; checked before the operator is asked to turn SWA on."""
+    glc, _ = _glc()
+    return answer_problem(glc.read_query(os.path.join(d, 'gain_query_before.txt')), 'gain_query_before.txt')
+
+
+def swa_query_problem(d: str):
+    """--pause-swa (CODE_GAIN0 17/11; Liam 17/11 at the CODE session "Them cho dung, GAIN0 sua (Recommended)"):
+    None, or why the answer asked after SWA went on (DIR/gain_query_swa.txt) is not the answer before the wait
+    (DIR/gain_query_before.txt): either not complete (answer_problem), not two questions in order, another boot or
+    board (gain_line_check.query_problem), or any field of '#gain_running' (id, applied_n, ctrl, the 7 gains, sha,
+    env, ...) different. The firmware answers #gain_get with the motors on (AGV 5bde4c5 main.c 623-627, R134-7).
+    Limit (Codex WS-3, kept): two equal snapshots say nothing of the time between the second one and the first
+    schedule packet; the question after the task and gain_line_check (the run's '#gain' lines, boot) cover it after
+    the run."""
+    glc, _ = _glc()
+    before = glc.read_query(os.path.join(d, 'gain_query_before.txt'))
+    swa = glc.read_query(os.path.join(d, SWA_QUERY_NAME))
+    for q, name in ((before, 'gain_query_before.txt'), (swa, SWA_QUERY_NAME)):
+        bad = answer_problem(q, name)
+        if bad:
+            return bad
+    bad = glc.query_problem(before, swa, check_run_boot=False)
+    if bad:
+        return bad
+    keys = sorted(k for k in set(before) | set(swa) if not k.startswith('_'))
+    diff = [f'{k}: {before.get(k)} -> {swa.get(k)}' for k in keys if before.get(k) != swa.get(k)]
+    return f"running set changed while SWA went on ({'; '.join(diff)})" if diff else None
+
+
+def wait_for_swa(inp=input, out=print, wall=time.time, clock=time.monotonic) -> bool:
+    """--pause-swa: ask the operator to turn SWA on and press Enter. True on an empty line (Enter); any other line
+    is refused and the question asked again (Codex WS-2); False on Ctrl-C or end of input (then nothing is sent:
+    the schedule has not started). The Enter is the operator's word that SWA is on, not a measurement of SWA: the
+    '#gain_get' answer has no motor field. Limit (Codex WS-2, kept): stdin may be a pipe (the runner sends the
+    Enter when the operator says SWA is on), so a newline already in the pipe passes; nothing may be written to
+    stdin before that word."""
+    t0 = clock()
+    out(f"#pause_swa,cho,t_epoch={wall():.3f}")
+    out(">>> Bat SWA (motor) roi nhan Enter de gui lich. Ctrl-C: thoat, khong gui lich.")   # ASCII: safe on a cp1252 pipe
+    while True:
+        try:
+            line = inp('')
+        except (KeyboardInterrupt, EOFError):
+            out(f"#pause_swa,huy,t_epoch={wall():.3f},waited_s={clock() - t0:.1f}")
+            return False
+        if line.rstrip('\r') == '':                 # an empty line only (WS-2 round 2: spaces are not Enter)
+            break
+        out(">>> Chi nhan Enter trong (dong vua go khong rong). Bat SWA roi nhan Enter; Ctrl-C: thoat.")
+    out(f"#pause_swa,enter,t_epoch={wall():.3f},waited_s={clock() - t0:.1f}")
+    return True
+
+
+class ScheduleError(ValueError):
+    """A ValueError of the task schedule (test_schedule / test_loop): __main__ turns it into parser.error."""
+
+
+def o1_main(ip: str, o1: str, gain_query_dir, gain_file, allow_final_set: bool, pause_swa: bool = False, *,
+            out=print, inp=input, set_gain=None, query=None, ack_check=None, run_test=None, swa_check=None,
+            before_check=None) -> int:
+    """The --o1 run of __main__ (moved here unchanged so it can be tested, CODE_GAIN0 17/11); returns the exit code
+    (0, or 2: no schedule sent). Without pause_swa: set the gain (--gain-file), question before, ack check,
+    schedule, question after, as in 9476500. pause_swa: the schedule is checked first; after the ack check the
+    question before must be a complete answer, the operator turns SWA on and presses Enter, the running set is
+    asked again (with gain_query_dir) and must be the answer before, then the schedule. A ValueError of the
+    schedule is raised as ScheduleError."""
+    set_gain = set_gain or gain_set_file
+    query = query or gain_query_file
+    ack_check = ack_check or ack_before_problem
+    run_test = run_test or test_loop
+    swa_check = swa_check or swa_query_problem
+    before_check = before_check or before_problem
+    if pause_swa:
+        try:                                        # a wrong task stops before the operator turns SWA on
+            test_schedule(o1, allow_final_set)
+        except ValueError as exc:
+            raise ScheduleError(str(exc)) from exc
+    if gain_query_dir:
+        if gain_file:                               # B81-14: set the gain, keep the ack, then ask the boot
+            gcode = set_gain(ip, gain_file, os.path.join(gain_query_dir, ACK_NAME))
+            out(f"#gain_set,exit={gcode}")
+            if gcode != 0:
+                out(f"gain {gain_file} not applied (see {ACK_NAME}): no task sent")
+                return 2
+        out(f"#gain_query,when=before,exit={query(ip, os.path.join(gain_query_dir, 'gain_query_before.txt'))}")
+        if gain_file:                               # R134C4-5: a restart between the set and the question
+            bad = ack_check(gain_query_dir)
+            if bad:
+                out(f"{bad}: no task sent")
+                return 2
+    if pause_swa:
+        if gain_query_dir:                          # WS-6: no SWA for a run whose question before already failed
+            bad = before_check(gain_query_dir)
+            if bad:
+                out(f"{bad}: no task sent")
+                return 2
+        if not wait_for_swa(inp=inp, out=out):
+            return 2
+        if gain_query_dir:
+            out(f"#gain_query,when=swa,exit={query(ip, os.path.join(gain_query_dir, SWA_QUERY_NAME))}")
+            bad = swa_check(gain_query_dir)
+            if bad:
+                out(f"{bad}: no task sent")
+                return 2
+    try:
+        run_test(ip, o1, allow_final_set=allow_final_set)
+    except ValueError as exc:
+        raise ScheduleError(str(exc)) from exc
+    if gain_query_dir:
+        out(f"#gain_query,when=after,exit={query(ip, os.path.join(gain_query_dir, 'gain_query_after.txt'))}")
+    return 0
 
 
 if __name__ == "__main__":
@@ -280,7 +437,13 @@ if __name__ == "__main__":
     parser.add_argument("--gain-file", default=None,
                         help="with --gain-query-dir: set this gain file (gain_send.py --file, motors off) before the "
                              "question 'before', output to DIR/gain_ack.txt; not applied: stop, no task (B81-14)")
+    parser.add_argument("--pause-swa", action="store_true",
+                        help="--o1 on the car: after the gain set and the question before, wait for SWA on + Enter, "
+                             "ask the running set again (DIR/gain_query_swa.txt, must equal 'before'), then send "
+                             "the schedule; Ctrl-C at the wait: nothing sent (CODE_GAIN0 17/11)")
     args = parser.parse_args()
+    if args.pause_swa and not args.o1:
+        parser.error("--pause-swa goes with --o1")
     if args.gain_query_dir and not args.o1:
         parser.error("--gain-query-dir goes with --o1")
     if args.gain_file and not args.gain_query_dir:
@@ -295,27 +458,16 @@ if __name__ == "__main__":
     if args.o1:
         if args.gain_query_dir:
             os.makedirs(args.gain_query_dir, exist_ok=True)
-            bad = query_dir_problem(args.gain_query_dir, with_ack=bool(args.gain_file))
+            bad = query_dir_problem(args.gain_query_dir, with_ack=bool(args.gain_file), with_swa=args.pause_swa)
             if bad:
                 parser.error(bad)
-            if args.gain_file:                      # B81-14: set the gain, keep the ack, then ask the boot
-                gcode = gain_set_file(args.ip, args.gain_file, os.path.join(args.gain_query_dir, ACK_NAME))
-                print(f"#gain_set,exit={gcode}")
-                if gcode != 0:
-                    print(f"gain {args.gain_file} not applied (see {ACK_NAME}): no task sent")
-                    sys.exit(2)
-            print(f"#gain_query,when=before,exit={gain_query_file(args.ip, os.path.join(args.gain_query_dir, 'gain_query_before.txt'))}")
-            if args.gain_file:                      # R134C4-5: a restart between the set and the question
-                bad = ack_before_problem(args.gain_query_dir)
-                if bad:
-                    print(f"{bad}: no task sent")
-                    sys.exit(2)
         try:
-            test_loop(args.ip, args.o1, allow_final_set=args.allow_final_set)
-        except ValueError as exc:
+            code = o1_main(args.ip, args.o1, args.gain_query_dir, args.gain_file, args.allow_final_set,
+                           pause_swa=args.pause_swa)
+        except ScheduleError as exc:
             parser.error(str(exc))
-        if args.gain_query_dir:
-            print(f"#gain_query,when=after,exit={gain_query_file(args.ip, os.path.join(args.gain_query_dir, 'gain_query_after.txt'))}")
+        if code:
+            sys.exit(code)
     elif args.test:
         test_loop(args.ip, args.test)
     elif args.sweep:
