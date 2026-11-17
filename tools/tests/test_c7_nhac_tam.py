@@ -1,4 +1,4 @@
-"""Tests for tools/c7_nhac_tam.py (plate lift test of C8, design 2026-11-18_Thiet_ke_c7_nhac_tam_v2.md section 4).
+"""Tests for tools/c7_nhac_tam.py (plate lift test of C8, design 2026-11-18_Thiet_ke_c7_nhac_tam_v3.md section 4).
 Synthetic data and clips rendered here from a known camera (NOT a measurement). The floor scene reuses the mark
 layout and the camera of test_c7_clip_probe; the car (body with textured tape, plate with the tag) is drawn here."""
 import json
@@ -25,7 +25,7 @@ BOX_BODY = [(0.15, 0.125), (-0.15, -0.125)]  # tape centres in the body frame (o
 CAM = truth_camera()
 PLUMB = tuple(CAM.centre[:2])
 ZC = float(CAM.centre[2])
-TEST_CFG = dict(trim_s=0.0, min_frames_s1=3, r_min_frames_s1=3, min_frac=0.5)
+TEST_CFG = dict(trim_s=0.0, min_frames_s1=3, min_frames_abs=3, r_min_frames_s1=3, r_min_frames_abs=3, min_frac=0.5)
 CFG = dict(nt.DEFAULTS)
 R_OK = dict(dat=True)
 
@@ -48,7 +48,8 @@ def summaries(body, plate, boxes_on_plate=False, bend=None, cam=(0.0, 0.0, 2.9))
             pts = [R @ b + t for b in bb]
         if bend is not None and j == bend[0]:
             pts[0] = pts[0] + np.array([bend[1], 0.0])
-        out.append(dict(ok=True, tag=[tag[0], tag[1], nt.wrap(a + dp)], box=[p.tolist() for p in pts], cam=list(cam)))
+        out.append(dict(ok=True, tag=[tag[0], tag[1], nt.wrap(a + dp)], box=[p.tolist() for p in pts], cam=list(cam),
+                        scale=1.0))
     return out
 
 
@@ -96,8 +97,8 @@ def test_nt3_inverse_of_rigid_fit():
     c = np.array([0.1, 0.0])
     t = (rot(a) - np.eye(2)) @ c
     bb = [np.array([0.13, 0.11]), np.array([-0.13, -0.11])]
-    s0 = dict(tag=[0.0, 0.0, 0.0], box=[b.tolist() for b in bb], cam=[0, 0, 2.9])
-    s1 = dict(tag=[0.0, 0.0, 0.0], box=[(rot(a) @ b + t).tolist() for b in bb], cam=[0, 0, 2.9])
+    s0 = dict(tag=[0.0, 0.0, 0.0], box=[b.tolist() for b in bb], cam=[0, 0, 2.9], scale=1.0)
+    s1 = dict(tag=[0.0, 0.0, 0.0], box=[(rot(a) @ b + t).tolist() for b in bb], cam=[0, 0, 2.9], scale=1.0)
     res = nt.analyse([s0, s1, s0, s0], dict(CFG, dh_m=0.0), R_OK)
     assert res['tho']['vi_tri_m'] == pytest.approx(0.0, abs=1e-12)
     assert res['tru_than']['vi_tri_m'] == pytest.approx(0.000349, abs=2e-6)
@@ -161,8 +162,52 @@ def test_angles_wrap_around_180_raw_and_body_removed():
     assert res['tho']['goc_deg'] < 1.0
 
 
+def test_nt2_1_body_turn_seen_through_a_height_error():
+    """Codex NT2-1: boxes really at z_b = 0.09 m, projected at h = 0.12 m, camera C off O; body turned 1 deg with the
+    translation that makes the projected box motion a pure rotation (t = 0); tag still at O turning with the body.
+    The tag moved relative to the body; eps must cover it."""
+    H, h, zb = 2.632, 0.12, 0.09
+    C = np.array([-0.4802, -0.0329])
+    a = (H - h) / (H - zb)
+    R = rot(math.radians(1.0))
+    T = -(1 - a) * (np.eye(2) - R) @ C / a
+    q = [np.array([0.13, 0.11]), np.array([-0.13, -0.11])]
+    proj = lambda P: C + a * (P - C)                                    # noqa: E731
+    box0 = [proj(x).tolist() for x in q]
+    box1 = [proj(R @ x + T).tolist() for x in q]
+    cam = [C[0], C[1], H]
+    s0 = dict(tag=[0.0, 0.0, 0.0], box=box0, cam=cam, scale=1.0)
+    s1 = dict(tag=[0.0, 0.0, math.radians(1.0)], box=box1, cam=cam, scale=1.0)
+    truth = float(np.hypot(*(R.T @ (np.zeros(2) - T))))                 # tag relative to the body, real
+    assert truth == pytest.approx(0.0001003, abs=2e-7)
+    res = nt.analyse([s0, s1, s0, s0], CFG, R_OK, tag_h=h)
+    assert res['tru_than']['vi_tri_m'] - 0.0 >= truth                  # corrected ~0, eps covers
+    assert res['than'][1]['quay_quanh_camera_m'] == pytest.approx(float(np.hypot(*((R - np.eye(2)) @ C))), rel=1e-6)
+
+
+def test_nt7_plate_seated_higher_is_covered_by_the_scale():
+    """Codex NT-7: plate 3 mm higher in one placement with a real 0.575 mm shift that projects to the same centre on
+    z = h: same centre, scale up 3 mm / (H - h); eps_h = |s - 1| |p - C0| covers it."""
+    H, h = 2.632, 0.12
+    C = [-0.4802, -0.0329, H]
+    s = summaries([(0.0, 0.0, 0.0)] * 4, [(0.0, 0.0, 0.0)] * 4, cam=C)
+    s[1]['scale'] = 1.0 + 0.003 / (H - h)
+    res = nt.analyse(s, CFG, R_OK, tag_h=h)
+    real = 0.003 / (H - h) * math.hypot(C[0], C[1])
+    assert real == pytest.approx(0.000575, abs=2e-6)
+    assert res['vi_tri_m'] >= real - 1e-9 and res['tho']['vi_tri_m'] >= real - 1e-9
+
+
+def test_two_boxes_must_be_apart():
+    s = summaries(STILL, PLATE_OFF)
+    for x in s:
+        x['box'] = [x['box'][0], [x['box'][0][0] + 0.03, x['box'][0][1]]]
+    res = nt.analyse(s, CFG, R_OK)
+    assert not res['kiem_than'] and any(w.startswith('vung_gan_nhau') for w in res['ly_do_khong_kiem_than'])
+
+
 # ---------------------------------------------------------------- unit: clip summaries
-def _rows(n=40, jump=None, corr=0.99, n_box=2, tag_seen=True, rms=0.5, res_sim=0.0005, outlier=None):
+def _rows(n=40, jump=None, corr=0.99, n_box=2, tag_seen=True, rms=0.5, res_sim=0.0005, outlier=None, peak2=0.5):
     rows = []
     for k in range(n):
         x = 0.1
@@ -172,7 +217,8 @@ def _rows(n=40, jump=None, corr=0.99, n_box=2, tag_seen=True, rms=0.5, res_sim=0
             x += outlier[1]
         rows.append(dict(idx=k, t_s=k / 60.0, n_marks=20, rms_px=rms, gate_marks=rms <= 1.0, cam_x=0.0, cam_y=0.0,
                          cam_z=2.9, tag_seen=tag_seen, tag_x=x if tag_seen else math.nan, tag_y=0.2, tag_psi=0.3,
-                         tag_res_sim_m=res_sim, box=[(0.2 + i, 0.1, corr, 0.0, 0.0) for i in range(n_box)]))
+                         tag_res_sim_m=res_sim, tag_scale=1.0,
+                         box=[(0.2 + i, 0.1, corr, 0.0, 0.0, peak2) for i in range(n_box)]))
     return rows
 
 
@@ -187,8 +233,9 @@ def test_still_clip_moving_clip_and_one_bad_frame():
 
 
 def test_frame_gates_and_frame_count():
-    cfg = dict(CFG, **dict(TEST_CFG, min_frames_s1=10))
-    for rows in (_rows(corr=0.5), _rows(tag_seen=False), _rows(n=5), _rows(rms=3.0), _rows(res_sim=0.003)):
+    cfg = dict(CFG, **dict(TEST_CFG, min_frames_s1=10, min_frames_abs=3))
+    for rows in (_rows(corr=0.5), _rows(tag_seen=False), _rows(n=5), _rows(rms=3.0), _rows(res_sim=0.003),
+                 _rows(peak2=0.95)):
         assert nt.clip_summary(rows, 2, cfg)['flags'] == ['thieu_khung']
     assert nt.clip_summary(_rows(n=8), 2, cfg, stride=2)['ok']        # ceil(10 / 2) = 5 needed
     s = nt.clip_summary(_rows(n=30), 2, dict(cfg, trim_s=0.11))
@@ -198,13 +245,15 @@ def test_frame_gates_and_frame_count():
 def test_clip_r():
     cfg = dict(CFG, **TEST_CFG)
     ref_box, ref_tag = [[0.2, 0.1], [1.2, 0.1]], [0.1, 0.2]
-    s = nt.rong_summary(_rows(tag_seen=False), ref_box, ref_tag, 2, cfg)
+    s = nt.rong_summary(_rows(jump=(0, 0.5)), ref_box, ref_tag, 2, cfg)  # tag 0.5 m away, boxes found
     assert s['dat'] and s['lech_vung_so_N0_m'] == [0.0, 0.0]
     s = nt.rong_summary(_rows(), ref_box, ref_tag, 2, cfg)              # tag still at its place: no proof
     assert not s['dat'] and s['n_ok'] == 0
-    s = nt.rong_summary(_rows(jump=(0, 0.5)), ref_box, ref_tag, 2, cfg)  # tag 0.5 m away, boxes found
-    assert s['dat']
-    s = nt.rong_summary(_rows(tag_seen=False, corr=0.3), ref_box, ref_tag, 2, cfg)   # boxes left with the plate
+    s = nt.rong_summary(_rows(tag_seen=False), ref_box, ref_tag, 2, cfg)  # NT2-3: tag not seen is no proof
+    assert not s['dat']
+    s = nt.rong_summary(_rows(jump=(0, 0.5), corr=0.3), ref_box, ref_tag, 2, cfg)   # boxes left with the plate
+    assert not s['dat']
+    s = nt.rong_summary(_rows(jump=(0, 0.5), peak2=0.97), ref_box, ref_tag, 2, cfg)  # ambiguous match
     assert not s['dat']
 
 
@@ -230,8 +279,8 @@ def test_box_match_sub_pixel(dx, dy):
     M = np.float32([[1, 0, dx], [0, 1, dy]])
     moved = cv2.warpAffine(img, M, (320, 240), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
     b = nt.Box(img.astype(np.uint8), (140, 100, 40, 40), 25)
-    u, v, c = b.match(moved.astype(np.uint8))
-    assert c > 0.95
+    u, v, c, q = b.match(moved.astype(np.uint8))
+    assert c > 0.95 and q < 0.9                                       # unambiguous peak
     assert u - b.u0 == pytest.approx(dx, abs=0.05) and v - b.v0 == pytest.approx(dy, abs=0.05)
 
 
@@ -287,7 +336,10 @@ def plate_tex():
 PLATE_TEX = plate_tex()
 
 
-def render_car(frame, body, plate, half=200):
+PLATE_AWAY = (0.0, -0.32, 0.0)          # clip R: plate lying next to the car (drawn at TAG_H, synthetic)
+
+
+def render_car(frame, body, plate, half=320):
     """Car body at pose body = (x, y, psi), plate (tag centre) at plate = (dx, dy, dpsi) in the body frame, or None
     (plate off the car, clip R); both faces at TAG_H in this synthetic scene."""
     x, y, a = body
@@ -303,6 +355,7 @@ def render_car(frame, body, plate, half=200):
                    ((BODY_W / 2 - yb) / RES).reshape(u.shape).astype(np.float32), cv2.INTER_LINEAR).ravel()
     in_b = (np.abs(xb) <= BODY_L / 2) & (np.abs(yb) <= BODY_W / 2)
     out[in_b] = mb[in_b]
+    # (a plate drawn outside the body, as in clip R, is drawn over the floor)
     msk = in_b
     if plate is not None:
         dx, dy, dp = plate
@@ -364,7 +417,7 @@ def test_end_to_end_plate_moves_body_still(scene, tmp_path):
     d, floor = scene
     body = [(0.05, -0.03, math.radians(20.0))] * 5
     clips = make_clips(d, floor, body, PLATE_OFF, 'still')
-    rong = make_clip(d, floor, body[0], None, 'still_R')
+    rong = make_clip(d, floor, body[0], PLATE_AWAY, 'still_R')
     out = tmp_path / 'o'
     code = nt.run_do(clips, str(d / 'session.json'), boxes_px(body[0]), str(out), rong=rong, cfg=TEST_CFG)
     r = json.load(open(out / 'nhac_tam.json', encoding='utf-8'))
@@ -386,7 +439,7 @@ def test_end_to_end_body_pushed(scene, tmp_path):
     body = [(0.05, -0.03, math.radians(20.0)), (0.0535, -0.03, math.radians(20.6)), (0.05, -0.027, math.radians(19.7)),
             (0.051, -0.031, math.radians(20.2)), (0.052, -0.029, math.radians(20.1))]
     clips = make_clips(d, floor, body, PLATE_OFF, 'push')
-    rong = make_clip(d, floor, body[0], None, 'push_R')
+    rong = make_clip(d, floor, body[0], PLATE_AWAY, 'push_R')
     out = tmp_path / 'o'
     code = nt.run_do(clips, str(d / 'session.json'), boxes_px(body[0]), str(out), rong=rong, cfg=TEST_CFG)
     r = json.load(open(out / 'nhac_tam.json', encoding='utf-8'))
@@ -436,3 +489,37 @@ def test_cli_last_line(scene, tmp_path, capsys):
     code = nt.main(['do', '--clip', 'a', 'b', '--session', str(d / 'session.json'), '--vung-than', '1,1,20,20',
                     '--out', str(tmp_path / 'c')])
     assert code == 2 and capsys.readouterr().out.strip().splitlines()[-1] == '#ket_qua,ma=2'
+
+
+def test_end_to_end_stride_above_3_is_a_quick_look(scene, tmp_path):
+    d, floor = scene
+    body = [(0.05, -0.03, math.radians(20.0))] * 4
+    clips = [make_clip(d, floor, b, p, f'qs_N{j}', n=16) for j, (b, p) in enumerate(zip(body, PLATE_OFF[:4]))]
+    out = tmp_path / 'o'
+    code = nt.run_do(clips, str(d / 'session.json'), boxes_px(body[0]), str(out), stride=4, cfg=TEST_CFG)
+    r = json.load(open(out / 'nhac_tam.json', encoding='utf-8'))
+    assert code == 2 and 'stride_xem_nhanh' in r['co'] and not (out / 'c8_phan_nhac_tam.json').exists()
+
+
+def test_kiem_one_clip_and_rejected_list(scene, tmp_path):
+    d, floor = scene
+    b0 = (0.05, -0.03, math.radians(20.0))
+    n0 = make_clip(d, floor, b0, PLATE_OFF[0], 'k_N0')
+    r = make_clip(d, floor, b0, PLATE_AWAY, 'k_R')
+    rbad = make_clip(d, floor, b0, PLATE_OFF[1], 'k_Rbad')            # plate still on the car: not a clip R
+    ok, txt = nt.run_kiem(n0, str(d / 'session.json'), boxes_px(b0), n0, str(tmp_path / 'a'), stride=1, cfg=TEST_CFG)
+    assert ok and txt.endswith('ĐƯỢC')
+    ok, _ = nt.run_kiem(r, str(d / 'session.json'), boxes_px(b0), n0, str(tmp_path / 'b'), rong=True, stride=1,
+                        cfg=TEST_CFG)
+    assert ok and (tmp_path / 'b' / 'khung_R.png').exists()
+    ok, txt = nt.run_kiem(rbad, str(d / 'session.json'), boxes_px(b0), n0, str(tmp_path / 'c'), rong=True, stride=1,
+                          cfg=TEST_CFG)
+    assert not ok and 'QUAY LẠI' in txt
+    clips = [n0] + [make_clip(d, floor, b0, p, f'k_N{j}') for j, p in enumerate(PLATE_OFF[1:4], 1)]
+    out = tmp_path / 'o'
+    code = nt.run_do(clips, str(d / 'session.json'), boxes_px(b0), str(out), rong=r, cfg=TEST_CFG,
+                     loai=[f'{rbad}=khong phai clip R'])
+    j = json.load(open(out / 'nhac_tam.json', encoding='utf-8'))
+    assert code == 0 and j['clip_bi_loai'][0]['file'] == 'k_Rbad.avi' and len(j['clip_bi_loai'][0]['sha256']) == 64
+    with pytest.raises(ValueError):
+        nt.parse_rejected(['khong_co_dau_bang'])
