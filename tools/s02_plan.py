@@ -40,6 +40,10 @@ block are together, each test belongs to its condition; with s02_plan.json each 
 row for every planned test, and a later block (not planned) has the key of a planned block and only its tests;
 S2M2-3: planned blocks in the planned order; S2M3-2: inside a planned block the tests in the planned order, a test
 run early allowed only as a replaced row (a wrong test run by mistake), re-runs of a passed test allowed.
+S02 v1.17 P2-5 (Liam 17/11, CODE_S02 "Nhanh nho sau khi gop", "Them kiem nhom 1"; design section 40): the operator
+copies the s02_metrics r_reason into reason; a run replaced for clock_sync_failed or camera_lost (measuring system
+fault) needs cause_group 1; 3 runs in a row of one test and one controller replaced for clock_sync_failed -> stop
+that test and tell Liam.
 Prints the problems; exit 0 none, 1 some, 2 error.
 """
 import argparse
@@ -217,6 +221,35 @@ def _block_problems(rows, blocks, planned):
     return out
 
 
+SYSTEM_FAULTS = ('clock_sync_failed', 'camera_lost')    # s02_metrics r_reason of a measuring system fault (P2-5)
+SYNC_FAIL_STOP = 3                                       # S02 v1.17 P2-5: runs in a row before the test stops
+
+
+def _system_fault(r):
+    """The measuring system fault of a row's reason (the s02_metrics r_reason copied by the operator, case and
+    leading spaces ignored), or ''."""
+    why = r['reason'].strip().lower()
+    return next((f for f in SYSTEM_FAULTS if why.startswith(f)), '')
+
+
+def _sync_fail_streaks(rows):
+    """S02 v1.17 P2-5 (Liam 17/11, CODE_S02): SYNC_FAIL_STOP runs in a row of one test and one controller (rows of
+    the pair in file order, across repetitions, a battery_rerun block included: its video was matched all the same)
+    replaced for clock_sync_failed: the test stops and Liam is told (the fault is then in the clock matching, not in
+    the run). Any other row of the pair resets the count."""
+    out, run = [], {}
+    for i, r in enumerate(rows, start=2):
+        pair = (r['test_id'].strip(), r['controller'].strip())
+        if r['result'].strip() == 'replaced' and _system_fault(r) == 'clock_sync_failed':
+            run.setdefault(pair, []).append(i)
+            if len(run[pair]) == SYNC_FAIL_STOP:
+                out.append(f'{pair[0]} {pair[1]}: {SYNC_FAIL_STOP} runs in a row replaced for clock_sync_failed '
+                           f'(lines {run[pair]}): stop this test and tell Liam (S02 v1.17 P2-5)')
+        else:
+            run[pair] = []
+    return out
+
+
 def check(rows, planned=None, n_reps=None):
     """Problems of a filled-in runs.csv (module docstring). planned: the s02_plan.json block list, when the
     folder has it: the exact set of cells (test x controller x repetition) the session must cover. n_reps: the
@@ -292,6 +325,9 @@ def check(rows, planned=None, n_reps=None):
         if res == 'replaced':
             if r['cause_group'].strip() not in ('1', '2', '3'):
                 out.append(f'line {i} {r["run_id"]}: replaced needs cause_group 1, 2 or 3 (P2-5)')
+            elif _system_fault(r) and r['cause_group'].strip() != '1':
+                out.append(f'line {i} {r["run_id"]}: replaced for {_system_fault(r)} needs cause_group 1 '
+                           '(measuring system fault, S02 v1.17 P2-5)')
             if not any((x['test_id'], x['controller'], x['_rep']) == cell for x in live[j + 1:]):
                 out.append(f'line {i} {r["run_id"]}: replaced but no later run of {cell}')
             continue
@@ -309,6 +345,7 @@ def check(rows, planned=None, n_reps=None):
         if cell in done:
             out.append(f'line {i} {r["run_id"]}: {cell} already has a {done[cell]} run (5 fixed runs, P2-4)')
         done[cell] = res
+    out += _sync_fail_streaks(rows)
     if planned is not None:
         want = {(t, bl['controller'], int(bl['rep'])) for bl in planned for t in bl['tests']}
         for c in sorted(want - set(done), key=str):

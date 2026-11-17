@@ -348,3 +348,50 @@ def test_blocks_are_whole_together_and_follow_the_plan():
     assert any('early (' + t1 + ') runs before ' + t0 in x for x in sp.check(early_done, blocks, sp.REPS_MAIN))
     gone = [dict(r) for r in full if r['block'] != '3']
     assert any(x == 'block 3: planned (s02_plan.json), no row in runs.csv' for x in sp.check(gone, blocks, sp.REPS_MAIN))
+
+
+CSF = 'clock_sync_failed (corr 0.71 < 0.90)'
+
+
+def test_three_clock_sync_failed_in_a_row_stop_the_test():
+    """S02 v1.17 P2-5 (Liam 17/11, CODE_S02 'Nhanh nho sau khi gop', 'Them kiem nhom 1'): 3 runs in a row of one
+    test and one controller replaced for clock_sync_failed -> stop the test, tell Liam."""
+    two = _rows(('A-L1', 1, 'replaced', '1', CSF), ('A-L1', 1, 'replaced', '1', CSF), ('A-L1', 1, 'completed', '', ''))
+    assert sp.check(two) == []
+    three = _rows(('A-L1', 1, 'replaced', '1', CSF), ('A-L1', 1, 'replaced', '1', 'Clock_sync_failed (edges_not_covered)'),
+                  ('A-L1', 1, 'replaced', '1', CSF), ('A-L1', 1, 'completed', '', ''))
+    p = [x for x in sp.check(three) if 'clock_sync_failed' in x]
+    assert len(p) == 1 and 'stop' in p[0] and 'Liam' in p[0] and 'lines [2, 3, 4]' in p[0]
+    # across repetitions of the same test and controller (rows in file order), the other tests in between do not reset
+    across = _rows(('A-L1', 1, 'replaced', '1', CSF), ('A-L1', 1, 'completed', '', ''))[:1] + \
+        _rows(('A-L2', 1, 'completed', '', ''))[:1] + \
+        _rows(('A-L1', 1, 'replaced', '1', CSF), ('A-L1', 1, 'replaced', '1', CSF), ('A-L1', 1, 'completed', '', ''))
+    for r in across:
+        r['v_batt_start'] = r['v_batt_end'] = '12.4'
+    assert any('stop' in x and 'A-L1' in x for x in sp.check(across))
+
+
+def test_another_run_of_the_pair_resets_the_count():
+    reset = _rows(('A-L1', 1, 'replaced', '1', CSF), ('A-L1', 1, 'replaced', '1', CSF),
+                  ('A-L1', 1, 'replaced', '1', 'camera_lost'), ('A-L1', 1, 'replaced', '1', CSF),
+                  ('A-L1', 1, 'completed', '', ''))
+    assert not any('stop' in x for x in sp.check(reset))
+    other_ctrl = _rows(('A-L1', 1, 'replaced', '1', CSF), ('A-L1', 1, 'replaced', '1', CSF),
+                       ('A-L1', 1, 'replaced', '1', CSF), ('A-L1', 1, 'completed', '', ''),
+                       ('A-L1', 1, 'completed', '', ''))
+    other_ctrl[1]['controller'] = other_ctrl[4]['controller'] = 'LADRC'   # PID, LADRC, PID in a row: 2 + 1, no stop
+    assert not any('stop' in x for x in sp.check(other_ctrl))
+    not_replaced = _rows(('A-L1', 1, 'replaced', '1', CSF), ('A-L1', 1, 'replaced', '1', CSF),
+                         ('A-L1', 1, 'broken', '', CSF))
+    assert not any('stop' in x for x in sp.check(not_replaced))
+
+
+def test_measuring_system_faults_need_cause_group_1():
+    for why in (CSF, 'camera_lost', ' camera_lost (2 lines)'):
+        bad = _rows(('A-L1', 1, 'replaced', '2', why), ('A-L1', 1, 'completed', '', ''))
+        p = sp.check(bad)
+        assert len(p) == 1 and 'cause_group 1' in p[0], (why, p)
+    assert sp.check(_rows(('A-L1', 1, 'replaced', '1', 'camera_lost'), ('A-L1', 1, 'completed', '', ''))) == []
+    assert sp.check(_rows(('A-L1', 1, 'replaced', '3', 'wrong test run'), ('A-L1', 1, 'completed', '', ''))) == []
+    empty = sp.check(_rows(('A-L1', 1, 'replaced', '', CSF), ('A-L1', 1, 'completed', '', '')))
+    assert len(empty) == 1 and 'cause_group 1, 2 or 3' in empty[0]
