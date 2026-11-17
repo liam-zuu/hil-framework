@@ -72,6 +72,7 @@ T_AGE_PERIODS = 2.5           # T4: hở gyro ≤ T_age = 2,5 chu kỳ report (i
 ENC_COUNT_TOL = 1             # [ĐỀ XUẤT CODE 29/10] số lần đọc encoder = thời lượng / chu kỳ ± 1
 RESET_NEAR_US = 1_000_000     # V4-1: thông báo reset trong ±1 s quanh #run_start
 SEQ_MOD = 256                 # số thứ tự report SH-2 8 bit
+T3_SRC = frozenset("MDNOL")   # dòng T3 của s06_load (S06 T3): M đánh dấu Pi, D PF3, N encoder, O/L cặp đo trễ ngắt
 
 # Vị trí cột trong DATA của logger.c khi không bắt được dòng tiêu đề (tiêu đề gửi một lần lúc khởi động)
 DATA_COLS_DEFAULT = {"timestamp_us": 0, "log_seq": 37, "log_qdrop": 38, "log_send_err": 39}
@@ -111,7 +112,7 @@ def parse_text(line):
 
 def parse_events(raw):
     """Tách luồng sự kiện theo loại dòng. Dòng hỏng đếm ở 'bad'."""
-    ev = {"J": [], "I": [], "R": [], "P": [], "E": [], "S": [], "text": [], "bad": 0, "qseq": []}
+    ev = {"J": [], "I": [], "R": [], "P": [], "E": [], "S": [], "T3": [], "text": [], "bad": 0, "qseq": []}
     for t_rx, line in raw:
         try:
             if line.startswith("#"):
@@ -140,6 +141,10 @@ def parse_events(raw):
                 ev["E"].append(dict(eseq=int(f[1]), t_before=int(f[2]), t_after=int(f[3]),
                                     c=tuple(int(x) for x in f[4:8]), run_id=int(f[8]) if len(f) == 9 else None))
                 continue
+            elif k == "T3" and len(f) == 8 and f[3] in T3_SRC:
+                # S06 T3 (s06_load, CODE 17/11): một cạnh chân, giờ esp_timer trong ISR; dùng chung qseq
+                r = dict(qseq=int(f[1]), t_us=int(f[2]), src=f[3], gpio=int(f[4]), lvl=int(f[5]),
+                         gseq=int(f[6]), run=int(f[7]))
             elif k == "S" and len(f) in (15, 16):
                 # 16 trường từ s06_load có temp_c (nhiệt độ chip ESP32-S3, T5, 30/10); bản cũ 15 trường
                 r = dict(qseq=int(f[1]), t_us=int(f[2]), run=int(f[3]), ev_qdrop=int(f[4]),

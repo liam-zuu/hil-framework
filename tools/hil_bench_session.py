@@ -68,7 +68,10 @@ cho một `--run` chạy `tools/s06_logger.py --esp32 IP --profile PROFILE --dur
 mẫu `s06_run_lf.sh`). `--steps` của lượt phải ≥ (GIÂY + 10) × 1000, để plant chạy dài hơn lượt ESP32 (bài học buổi
 thử: IMU ngừng, frame không phủ lượt). Sau lượt: scp `TÊN_esp/` về `pi/`, bộ giải ghép report với `esp32_events.txt`
 (`match_esp32`), `tools/s06_esp32_check.py` ghi `check/TÊN/`; mã khác 0, `s06_logger` mã thoát khác 0 thì lượt
-không sạch. Không dùng cùng `--gain-query`.
+không sạch. Không dùng cùng `--gain-query`. S06 T3 (thiết kế T3 mục 4.1; hồ sơ t3: Liam 17/11 CODE_S06 "Hồ sơ t3
+riêng (Recommended)"): lượt hồ sơ `t3` cần `--omega-schedule` (lịch `rpi5/t3_schedule.py`) và chạy `run_hil.py --marker
+t3`; lượt khác `--marker 10hz` (chân đánh dấu cho đồng hồ ESP32 ↔ Pi); thiếu `--marker` thì công cụ tự thêm, khác thì
+từ chối.
 
 Usage:
   python tools/hil_bench_session.py --out <thư mục lượt> --pi-dir '~/run14' --boot \
@@ -549,13 +552,31 @@ def scp(host, remote, local_dir, recursive=False):
 # Template: the trial scripts of S06/2026-11-15_run01_thu/flash (s06_run.sh: plant first, logger 2 s after;
 # s06_run_lf.sh: logger first, plant 4 s after). Lesson of that run (NOTES.md mục 3): the plant must outlast the
 # ESP32 run, or the IMU stops and the frames do not cover the run (S38).
-S06_PROFILES = ('zero', 'heavy', 't6')
+S06_PROFILES = ('zero', 'heavy', 't6', 't3')     # t3: Liam 17/11 CODE_S06 "Hồ sơ t3 riêng (Recommended)"
 S06_LOGGER_AFTER_S = 2          # plant first: the logger starts this long after run_hil.py
 S06_PLANT_AFTER_S = 4           # logger first: run_hil.py starts this long after the logger
 S06_PLANT_MARGIN_S = 10         # [ĐỀ XUẤT CODE_S06]: --steps >= (logger --duration + this) x 1000
 # T3T-5 (Codex 15/11; Liam 'Sua ca 10 + vong 2'): an S06 run's ssh limit is at least the plant time (--steps / 1 kHz)
 # plus this (start, the logger's START wait and linger, frame-log save) [ĐỀ XUẤT CODE_S06, not measured]
 S06_TIMEOUT_EXTRA_S = 120
+
+
+def marker_of(args: str):
+    """S06 T3: --marker of a run_hil.py argument string (shlex, `--marker X` or `--marker=X`, the last wins);
+    None without one."""
+    import shlex
+    toks, val = shlex.split(args), None
+    for i, t in enumerate(toks):
+        if t == '--marker':
+            val = toks[i + 1] if i + 1 < len(toks) else ''
+        elif t.startswith('--marker='):
+            val = t[len('--marker='):]
+    return val
+
+
+def has_opt(args: str, opt: str) -> bool:
+    import shlex
+    return any(t == opt or t.startswith(opt + '=') for t in shlex.split(args))
 
 
 def steps_of(args: str):
@@ -590,7 +611,7 @@ def plan_s06(specs, plan, gain_query=False):
         parts = rest.split(',')
         if name not in args_of or name in out or len(parts) not in (2, 3) or parts[0] not in S06_PROFILES \
                 or not parts[1].isdigit() or int(parts[1]) <= 0 or (len(parts) == 3 and parts[2] != 'logger-first'):
-            raise ValueError(f'--s06 không hợp lệ: {spec!r} (cần TÊN_LƯỢT=zero|heavy|t6,GIÂY[,logger-first], '
+            raise ValueError(f'--s06 không hợp lệ: {spec!r} (cần TÊN_LƯỢT=zero|heavy|t6|t3,GIÂY[,logger-first], '
                              'mỗi lượt một lần, lượt có ở --run)')
         dur = int(parts[1])
         steps = steps_of(args_of[name])
@@ -600,7 +621,19 @@ def plan_s06(specs, plan, gain_query=False):
                              f'{S06_PLANT_MARGIN_S} s), có {steps if steps is not None else "không có --steps"}')
         if gain_query:
             raise ValueError('--gain-query không dùng với lượt --s06 (cần log UDP của agv_logger)')
-        out[name] = dict(profile=parts[0], duration=dur, logger_first=len(parts) == 3, steps=steps)
+        # S06 T3 (thiết kế T3 mục 4.1): chân đánh dấu ở mọi lượt S06; t3 nâng ở frame có bậc, lượt khác 10 Hz.
+        # Thiếu --marker thì thêm (không có thì Pi phát xung mỗi frame: 1000 ngắt/s ở GPIO38 của s06_load)
+        want = 't3' if parts[0] == 't3' else '10hz'
+        got = marker_of(args_of[name])
+        if got not in (None, want):
+            raise ValueError(f'--s06 {name}: hồ sơ {parts[0]} cần run_hil.py --marker {want}, có --marker {got}')
+        if parts[0] == 't3' and not has_opt(args_of[name], '--omega-schedule'):
+            raise ValueError(f'--s06 {name}: hồ sơ t3 cần run_hil.py --omega-schedule <T3_schedule.csv>')
+        if parts[0] == 't3' and len(parts) != 3:
+            # T3C-14 (Codex vòng 1): lịch T3 có bậc từ giây 1; plant trước thì bậc đầu chạy khi ESP32 chưa START
+            raise ValueError(f'--s06 {name}: hồ sơ t3 cần logger-first (ESP32 bật ngắt PF3 trước bậc đầu)')
+        out[name] = dict(profile=parts[0], duration=dur, logger_first=len(parts) == 3, steps=steps,
+                         marker=want, add_marker=got is None)
     return out
 
 
@@ -616,6 +649,8 @@ def s06_run_cmd(pi_dir, name, args, s06, esp_ip):
     --load-schedule and the omega modes). T3T-4: exit 2 before starting anything when an output of this run name
     is already in pi_dir (an earlier session with the same --pi-dir)."""
     outs = ' '.join(f'{pi_dir}/{name}{s}' for s in ('_esp', '_logger.txt', '_frames.npz'))
+    if s06.get('add_marker'):
+        args = f'{args} --marker {s06["marker"]}'
     guard = (f'mkdir -p {pi_dir} || exit 2; for f in {outs}; do [ -e "$f" ] && {{ echo "s06_pi_exists=$f"; exit 2; }}; '
              f'done; rm -f {pi_dir}/{name}.pid {pi_dir}/{name}_logger.pid; ')
     hil = (f'cd ~/hil-framework/rpi5 || exit 2; python3 run_hil.py {args} '

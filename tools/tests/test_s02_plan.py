@@ -205,7 +205,8 @@ def test_main_never_overwrites(tmp_path):
 
 
 def test_metrics_skip_battery_rerun_and_replaced(tmp_path, monkeypatch):
-    """S2P1-9: tools/s02_metrics.py does not score the rows of a battery_rerun block nor replaced runs."""
+    """S2P1-9: tools/s02_metrics.py does not score the rows of a battery_rerun block nor replaced runs (v3: they keep
+    a status line)."""
     import s02_metrics
     (tmp_path / 'runs.csv').write_text(
         'run_id,platform,controller,test_id,speed_mps,rep,file,aborted,block_status,result\n'
@@ -213,9 +214,11 @@ def test_metrics_skip_battery_rerun_and_replaced(tmp_path, monkeypatch):
         'b,real,PID,A-L2,0.5,1,b.csv,,,replaced\n'
         'c,real,PID,A-L2,0.5,1,c.csv,,,completed\n', encoding='utf-8')
     monkeypatch.setattr(s02_metrics, 'load_log', lambda p: {})
-    monkeypatch.setattr(s02_metrics, 'compute', lambda log, tid: {'e_vx': 0.0})
+    monkeypatch.setattr(s02_metrics, 'score_run', lambda log, tid, *a, **k: {'e_vx': 0.0})
     out = s02_metrics.run_dir_metrics(str(tmp_path))
-    assert [o['run_id'] for o in out] == ['c']
+    # CODE_S02 v3 (S02 v1.13 P2-6): every row has a line, only c is scored
+    assert [(o['run_id'], o['status']) for o in out] == [('a', 'battery_rerun'), ('b', 'replaced'), ('c', 'ok')]
+    assert 'e_vx' not in out[0] and 'e_vx' not in out[1] and out[2]['e_vx'] == 0.0
 
 
 def test_battery_rerun_needs_one_whole_block():
@@ -269,5 +272,79 @@ def test_every_cell_has_five_reps_and_the_manifest_is_its_plan(tmp_path):
     pj[0]['tests'] = pj[0]['tests'][::-1]
     js.write_text(json.dumps(dict(json.loads(js.read_text(encoding='utf-8')), blocks=pj)), encoding='utf-8')
     write(rr)
-    assert sp.check(_filled(rows), pj, sp.REPS_MAIN) == []             # every cell still once
+    p = sp.check(_filled(rows), pj, sp.REPS_MAIN)                    # every cell still once; only the order
+    assert len(p) == 1 and p[0].startswith('block 1: ') and 'runs before' in p[0], p   # (S2M2-3) differs
     assert sp.main(['check', str(tmp_path)]) == 1                       # but not the plan of its order_seed
+
+
+def test_blocks_are_whole_together_and_follow_the_plan():
+    """S2M1-6 (Codex round 1 of v3, S2P3-4): a test moved out of its planned block into a later block (the cell still
+    has one live run and reps 1..5), a block mixing conditions, a test of another condition, a block split in two
+    places of runs.csv: each is a problem; a replacement run in a later block of the same key is not."""
+    rows, blocks = sp.plan('real', ['PID', 'LADRC'], 5, 7)
+    full = _filled(rows)
+    for b in {r['block'] for r in full}:
+        rs = [r for r in full if r['block'] == b]
+        rs[0]['v_batt_start'], rs[-1]['v_batt_end'] = '12.4', '12.3'
+
+    def with_later(moved):
+        out = [dict(r) for r in full]
+        i = next(j for j, r in enumerate(out) if r['block'] == '1')
+        out[i]['result'], out[i]['cause_group'], out[i]['reason'] = 'replaced', '3', 'operator'
+        later = [dict(out[i], block='21', result='completed', cause_group='', reason='', run_id='again')]
+        if moved is not None:
+            k = next(j for j, r in enumerate(out) if r['test_id'] == 'A-K1' and r['controller'] == 'PID'
+                     and r['rep'] == '1')
+            later.append(dict(out.pop(k), block='21', **moved))
+        later[0]['v_batt_start'], later[-1]['v_batt_end'] = '12.4', '12.3'
+        return out + later
+    assert sp.check(with_later(None), blocks, sp.REPS_MAIN) == []
+    p = sp.check(with_later({}), blocks, sp.REPS_MAIN)                  # A-K1 moved, its row still 'lifted'
+    assert any(x.startswith('block 21: rows of 2') for x in p), p
+    assert any("planned tests ['A-K1'] have no row" in x for x in p), p
+    p = sp.check(with_later(dict(condition='floor')), blocks, sp.REPS_MAIN)   # its condition edited to floor
+    assert any("test 'A-K1' is not a 'floor' test" in x for x in p), p
+    assert any("planned tests ['A-K1'] have no row" in x for x in p), p
+    split = [dict(r) for r in full]
+    k = max(j for j, r in enumerate(split) if r['block'] == '2')
+    split.append(split.pop(k))
+    assert any(x.startswith('block 2: its rows are not together') for x in sp.check(split, blocks, sp.REPS_MAIN))
+    other = [dict(r) for r in full]
+    other[0]['controller'] = 'LADRC'                                    # one row of block 1 with the other controller
+    assert any(x.startswith('block 1: rows of 2') for x in sp.check(other, blocks, sp.REPS_MAIN))
+    p = sp.check(with_later({}), blocks, sp.REPS_MAIN)
+    assert any("block 21: tests ['A-K1'] not in the planned block 1" in x for x in p), p
+    into = [dict(r) for r in full]                                       # A-K1 moved into planned block 1
+    k = next(j for j, r in enumerate(into) if r['test_id'] == 'A-K1' and r['controller'] == 'PID' and r['rep'] == '1')
+    row = dict(into.pop(k), block='1', condition='floor')
+    into.insert(next(j for j, r in enumerate(into) if r['block'] == '1') + 1, row)
+    assert any("block 1: tests ['A-K1'] not planned in this block" in x for x in sp.check(into, blocks, sp.REPS_MAIN))
+    swap = [dict(r, controller='LADRC') if r['block'] == '1' else dict(r) for r in full]   # whole block relabelled
+    assert any(x.startswith("block 1: ('LADRC', 'floor', 1) in runs.csv, ('PID', 'floor', 1) in s02_plan.json")
+               for x in sp.check(swap, blocks, sp.REPS_MAIN))
+    later6 = [dict(r) for r in full] + [dict(full[0], block='21', rep='6', run_id='x6')]   # a later block, no plan
+    assert any(x.startswith("block 21: not in s02_plan.json and no planned block ('PID', 'floor', 6)")
+               for x in sp.check(later6, blocks, sp.REPS_MAIN))
+    lifted_first = ([dict(r) for r in full if r['block'] == '11'] + [dict(r) for r in full if r['block'] != '11'])
+    assert any(x.startswith('planned blocks run in the order') for x in sp.check(lifted_first, blocks, sp.REPS_MAIN))
+    swapped = [dict(r) for r in full]                                    # S2M2-3: two tests of block 1 swapped
+    i = [k for k, r in enumerate(swapped) if r['block'] == '1'][:2]
+    swapped[i[0]], swapped[i[1]] = swapped[i[1]], swapped[i[0]]
+    assert any(x.startswith('block 1: ') and 'runs before' in x for x in sp.check(swapped, blocks, sp.REPS_MAIN))
+    # S2M3-2: a wrong test run first by mistake, replaced (group 3), then the planned order: allowed; the first test
+    # failed by an operator error and replaced at the end of the block: allowed
+    b1 = [k for k, r in enumerate(full) if r['block'] == '1']
+    t0, t1 = full[b1[0]]['test_id'], full[b1[1]]['test_id']
+    wrong = dict(full[b1[1]], result='replaced', cause_group='3', reason='wrong test run', run_id='mistake')
+    mis = [dict(r) for r in full]
+    mis.insert(b1[0], wrong)
+    assert sp.check(mis, blocks, sp.REPS_MAIN) == [], sp.check(mis, blocks, sp.REPS_MAIN)
+    late = [dict(r) for r in full]
+    late[b1[0]] = dict(late[b1[0]], result='replaced', cause_group='3', reason='operator error')
+    late.insert(b1[-1] + 1, dict(full[b1[0]], run_id='again'))
+    assert sp.check(late, blocks, sp.REPS_MAIN) == [], sp.check(late, blocks, sp.REPS_MAIN)
+    early_done = [dict(r) for r in full]                                 # run early and kept: wrong order
+    early_done.insert(b1[0], dict(full[b1[1]], run_id='early'))
+    assert any('early (' + t1 + ') runs before ' + t0 in x for x in sp.check(early_done, blocks, sp.REPS_MAIN))
+    gone = [dict(r) for r in full if r['block'] != '3']
+    assert any(x == 'block 3: planned (s02_plan.json), no row in runs.csv' for x in sp.check(gone, blocks, sp.REPS_MAIN))
