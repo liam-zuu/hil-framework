@@ -114,7 +114,8 @@ TUNING_NEW = (['run_uid', 'campaign', 'script_run_id', 'gain_set_id', 'speed_mps
               + ['g_' + g for g in GAINS]
               + ['t_operator_wait_s', 't_machine_s', 'wall_start', 'wall_end', 'n_sim_evals']
               + ['boot_before', 'boot_after']           # R134 (b): S05 4.7 (iv), R3V-9
-              + list(QUERY_FILE_COLS))                  # R134 (1), summary reads the two answers again
+              + list(QUERY_FILE_COLS)                   # R134 (1), summary reads the two answers again
+              + ['c8b_gio_sha256'])                     # O1 v11.37 D1, S05 v3.43 D3: kiem_gio_c8b (CODE_GATE)
 # tune stop gate v3 (dossier 00_OVERVIEW/2026-11-12_De_xuat_cong_dung_tune_bam_huong_van_toc_v3.md section 6,
 # CG2-12; Liam 12/11 CODE local_87282b70 "làm ngay đi"): per run the measured maximum q, its bound U and
 # the state of each condition, so stopping, the S05 4.4 ranking and gate_result can be recomputed.
@@ -188,6 +189,17 @@ FINAL_LOST_N = 3                         # S05 §4.6: stop a condition after 3 l
 # level counted, in a row or not; final_hil keeps its own rule (§4.6, FINAL_LOST_N lost runs in a row).
 MAP_REFUSED = 'anh_xa_tu_choi'           # --fail-cause of such a run
 MAP_RERUNS_MAX = 3
+# O1 v11.37 §3.5 D1, S05 v3.43 §4.6 D2, §6.1 D3 (Liam 17/11 THESIS local_11f2c5a8: "Chỉ lượt trượt kiểm giờ
+# (Recommended)", "Tổng (Recommended)", "Bắt buộc file (Recommended)", "Luật §4.6: 3 hỏng liên tiếp (Recommended)";
+# the code: CODE_GATE design v2 section 6, Liam 17/11 at CODE_GATE "Duyệt, code luôn (Recommended)"): a floor run
+# that fails the per-run check of the C8b time file is lost to the measurement, fail cause C8B_GIO_FAIL, with that
+# file (format c8b_gio_v1, ok false) whose sha256 goes to c8b_gio_sha256. Only these runs are counted, in total (not
+# in a row), per campaign, gain set and level (map_key), in the order of the log, stages other than final (final:
+# S05 4.6, FINAL_LOST_N lost runs in a row, every cause); the fourth one (1 + C8B_RERUNS_MAX) makes the level of that
+# gain set chua_ket_luan, a run of it after that is refused.
+C8B_GIO_FAIL = 'kiem_gio_c8b'
+C8B_RERUNS_MAX = 3
+C8B_GIO_FORMAT = 'c8b_gio_v1'
 # R134 package (Liam 14/11 CODE_R134 local_eb9f3b5c "duyet goi sua code fix/r134-answers"):
 # (b) S05 v3.13-v3.17 4.7 (iv), R3V-9, O1 v11.10 R4: the boot of gain_send.py --query just before and just after
 #     the run go to the run history (boot_before, boot_after). Both given and equal: one ESP32 boot over the run.
@@ -230,7 +242,7 @@ TUNE_STAGES = ('screen', 'confirm')     # [CÁCH HIỂU] 'explore' is not a tune
 SKIP_PREFIX = ('EXAMPLE', 'PREHIL')      # rows of the June files: examples, reconstruction
 # fields begin / end set themselves; begin refuses them as extra fields (Codex S315-R3-1)
 OWN_FIELDS = ('session_id', 'iter_no', 'run_uid', 'date', 'wall_start', 'wall_end', 'run_outcome', 'fail_cause',
-              'results_dir', 'completed', 'e_perp_max_m') + tuple(f't_{k}_s' for k in ('flash', 'setup', 'run', 'log',
+              'results_dir', 'completed', 'e_perp_max_m', 'c8b_gio_sha256') + tuple(f't_{k}_s' for k in ('flash', 'setup', 'run', 'log',
                                                                                         'analysis', 'operator_wait'))
 
 
@@ -442,6 +454,9 @@ def begin(ds: str, session: str, campaign: str, platform: str, controller: str, 
         if map_stopped(map_refusals(tun + [row]).get(map_key(row), 0)):
             raise LogError(f'{task}@{speed} of {gain_set}: stopped after {MAP_RERUNS_MAX} reruns for a refused '
                            'mapping (S05 v3.15 4.5 step 2): the level is chua_ket_luan, no further run')
+    if _c8b_counted(row) and c8b_refusals(tun + [row]).get(map_key(row), 0) > C8B_RERUNS_MAX:
+        raise LogError(f'{task}@{speed} of {gain_set}: stopped after {C8B_RERUNS_MAX} reruns for the C8b time check '
+                       '(O1 3.5 v11.37): the level is chua_ket_luan, no further run')
     if stage in ('final', 'final_hil') and final_key(row) in _final_stops(tun):
         raise LogError(f'{task}@{speed} of {gain_set or campaign}: stopped after {FINAL_LOST_N} lost runs in a row '
                        '(S05 4.6), no further run')
@@ -1578,6 +1593,61 @@ def final_lost_streak(tun: List[dict], key: tuple) -> int:
     return s
 
 
+def _c8b_counted(r: dict) -> bool:
+    return r.get('platform') == 'HW' and r.get('stage') != 'final'
+
+
+def c8b_refusals(tun: List[dict]) -> Dict[tuple, int]:
+    """O1 v11.37 D1: kiem_gio_c8b runs per (campaign, gain set, level) (map_key), stages but final, in the order of
+    the log. A counted run of a key after its 1 + C8B_RERUNS_MAX-th such run is an error (LogError), as is a
+    kiem_gio_c8b run without gain set id."""
+    n = defaultdict(int)
+    for r in tun:
+        if not _c8b_counted(r):
+            continue
+        k = map_key(r)
+        if n[k] > C8B_RERUNS_MAX:
+            raise LogError(f"{r.get('run_uid')}: {r.get('trajectory')}@{r.get('speed_mps')} of {r.get('gain_set_id')} "
+                           f'stopped after {C8B_RERUNS_MAX} reruns for the C8b time check (O1 3.5 v11.37: the level is '
+                           'chua_ket_luan), no run after that')
+        if r.get('fail_cause') == C8B_GIO_FAIL:
+            if not r.get('gain_set_id'):
+                raise LogError(f"{r.get('run_uid')}: a {C8B_GIO_FAIL} run carries its gain set id (counted per gain set)")
+            n[k] += 1
+    return dict(n)
+
+
+def check_c8b_rows(tun: List[dict]) -> None:
+    """S05 v3.43 D3 on logged rows: a kiem_gio_c8b row is a floor hong_he_do row with the sha256 of its C8b time file;
+    c8b_gio_sha256 only on such a row; and the count (c8b_refusals)."""
+    for r in tun:
+        sha = r.get('c8b_gio_sha256', '')
+        if r.get('fail_cause') == C8B_GIO_FAIL:
+            if r.get('platform') != 'HW' or r.get('run_outcome') != 'hong_he_do' or not _hex64(sha):
+                raise LogError(f"{r.get('run_uid')}: fail cause {C8B_GIO_FAIL} on a row that is not a floor hong_he_do "
+                               'run with the sha256 of its C8b time file (S05 v3.43 6.1)')
+        elif sha:
+            raise LogError(f"{r.get('run_uid')}: c8b_gio_sha256 without fail cause {C8B_GIO_FAIL}")
+    c8b_refusals(tun)
+
+
+def _hex64(x) -> bool:
+    return isinstance(x, str) and len(x) == 64 and all(ch in '0123456789abcdef' for ch in x)
+
+
+def read_c8b_gio(path: str) -> str:
+    """The C8b time file of a run that failed its check (format c8b_gio_v1, ok false); returns its sha256."""
+    try:
+        with open(path, encoding='utf-8') as f:
+            d = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise LogError(f'--c8b-gio {path!r}: {exc}')
+    if not isinstance(d, dict) or d.get('format') != C8B_GIO_FORMAT or d.get('ok') is not False:
+        raise LogError(f'--c8b-gio {path!r}: not a {C8B_GIO_FORMAT} file with ok false (the run must have failed the '
+                       'C8b time check, O1 3.5 v11.37)')
+    return sha256_file(path)
+
+
 def map_stopped(n_refused: int) -> bool:
     return n_refused > MAP_RERUNS_MAX
 
@@ -1600,7 +1670,8 @@ def boot_problem(before, after) -> Optional[str]:
 def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Optional[float] = None,
         fail_cause: str = '', results_dir: str = '', notes: str = '', gate: Optional[dict] = None,
         gate_sha256: str = '', boot_before: Optional[str] = None, boot_after: Optional[str] = None,
-        query_problem: Optional[str] = None, queries: Optional[tuple] = None, gate_file=None) -> dict:
+        query_problem: Optional[str] = None, queries: Optional[tuple] = None, gate_file=None,
+        c8b_gio: Optional[str] = None) -> dict:
     """query_problem (R134C3-3): why the two query answer files given on the command line are not two
     questions before and after the run (gain_line_check.query_problem); handled as missing / different boot.
     queries (R134C4-1): the two answers as read by gain_line_check.read_query (before, after; None = missing);
@@ -1631,6 +1702,14 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
                        '(S05 4.7 (iv), R3V-9)')
     if fail_cause == BOOT_FAIL and not bbad:
         raise LogError(f'fail cause {BOOT_FAIL} needs the two boot answers showing it (missing or different)')
+    if (fail_cause == C8B_GIO_FAIL) != bool(c8b_gio):                             # O1 v11.37 D1, S05 v3.43 D3
+        raise LogError(f'fail cause {C8B_GIO_FAIL} and --c8b-gio go together (the C8b time file of the run, ok false)')
+    c8b_sha = ''
+    if c8b_gio:
+        if plat != 'HW' or outcome != 'hong_he_do':
+            raise LogError(f'fail cause {C8B_GIO_FAIL}: a floor run lost to the measurement (hong_he_do), not '
+                           f'{plat} {outcome}')
+        c8b_sha = read_c8b_gio(c8b_gio)
     if fail_cause == MAP_REFUSED and (gate is None or run['row'].get('platform') != 'HIL'):
         raise LogError(f'--fail-cause {MAP_REFUSED}: a HIL run with its scorer output (--gate-json) showing the '
                        'refused mapping (S05 v3.15 4.5 step 2)')
@@ -1677,9 +1756,17 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
                 row.update({cf: os.path.abspath(p), cs: sha256_file(p)})
     if notes:
         row['notes'] = (row.get('notes', '') + ' ' + notes).strip()
+    if c8b_sha:
+        row['c8b_gio_sha256'] = c8b_sha
     # Codex S315-5: the log as it will be, this row included, checked before the row is written
     after = live_rows(read_rows(os.path.join(ds, TUNING))) + [row]
     check_map_rows([row])
+    check_c8b_rows([row])
+    if _c8b_counted(row):
+        try:
+            c8b_refusals(after)
+        except LogError as exc:
+            raise LogError(f'the run is not logged: {exc}')
     if _map_counted(row):
         try:
             map_refusals(after)
@@ -1694,6 +1781,16 @@ def refusal_note(ds: str, row: dict) -> str:
     """What the operator does next after a refused-mapping run (printed by the CLI after the row is written;
     the row was checked before it was written, so a failed recount here is only reported, Codex S315-5).
     final_hil follows S05 4.6 (lost runs in a row), the other HIL stages 4.5 step 2 (Codex S315-6)."""
+    if row.get('fail_cause') == C8B_GIO_FAIL:
+        if not _c8b_counted(row):
+            return 'kiem gio C8b truot o kiem cuoi: luot hong do he do theo S05 4.6 (thay luot, 3 hong lien thi dung)'
+        try:
+            n = c8b_refusals(live_rows(read_rows(os.path.join(ds, TUNING)))).get(map_key(row), 0)
+        except LogError as exc:
+            return f'canh bao: dong da ghi, nhung khong dem lai duoc ({exc})'
+        return f'kiem gio C8b truot lan {n}: ' + (
+            f'qua {C8B_RERUNS_MAX} lan chay lai, muc nay cua bo gain chua ket luan, ghi o san_gio_c8b_dung cua summary'
+            if n > C8B_RERUNS_MAX else f'chay lai cung gain (con {C8B_RERUNS_MAX + 1 - n} lan)')
     if row.get('fail_cause') != MAP_REFUSED:
         return ''
     try:
@@ -2095,6 +2192,13 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
     check_query_rows(raw, ds)                       # R134 (1): the two saved answers read again
     stopped = _final_stops(tun)
     check_map_rows(tun)                             # S05 v3.15 4.5 step 2 (Codex S315-1)
+    check_c8b_rows(tun)                             # O1 v11.37 D1, S05 v3.43 D3
+    c8b_rep = defaultdict(lambda: {'n': 0, 'stopped': []})
+    for k, n in c8b_refusals(tun).items():
+        if n:
+            c8b_rep[k[0]]['n'] += n
+            if n > C8B_RERUNS_MAX:
+                c8b_rep[k[0]]['stopped'].append(f'{k[1]} {k[2]}@{k[3]}')
     map_n = map_refusals(tun)                       # refused mappings, levels stopped
     map_rep = defaultdict(lambda: {'n': 0, 'stopped': []})
     for k, n in map_n.items():
@@ -2310,6 +2414,9 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
         if c in map_rep:                            # extra columns, only for a campaign with refused mappings
             row['hil_map_refused_n'] = str(map_rep[c]['n'])
             row['hil_map_stopped'] = '; '.join(sorted(map_rep[c]['stopped']))
+        if c in c8b_rep:                            # O1 v11.37: only for a campaign with C8b time check failures
+            row['san_gio_c8b_n'] = str(c8b_rep[c]['n'])
+            row['san_gio_c8b_dung'] = '; '.join(sorted(c8b_rep[c]['stopped']))
         out.append(row)
     if unassigned:
         print(f'note: {unassigned} tuning row(s) without campaign left out', file=sys.stderr)
@@ -2563,6 +2670,8 @@ def main(argv=None) -> int:
     e.add_argument('--completed', type=int, choices=(0, 1))
     e.add_argument('--e-perp-max', type=float)
     e.add_argument('--gate-json', default='', help='scorer output with a gate_v3 block (hil_o1_score.py --out)')
+    e.add_argument('--c8b-gio', default='', help=f'C8b time file of the run ({C8B_GIO_FORMAT}, ok false) with '
+                   f'--fail-cause {C8B_GIO_FAIL} (O1 v11.37)')
     e.add_argument('--gate-file', default='', help='the locked C8 gate file (gate_c8_v1): report-only conditions of '
                    'the level (O1 v11.33); needed when the scorer used it')
     e.add_argument('--query-before', default='', help='gain_send.py --query output just before the run (R134 (b))')
@@ -2659,7 +2768,8 @@ def main(argv=None) -> int:
             row = end(ds, a.outcome, a.completed, a.e_perp_max, a.fail_cause, a.results_dir, a.notes,
                       gate=read_gate_json(a.gate_json) if a.gate_json else None,
                       gate_sha256=sha256_file(a.gate_json) if a.gate_json else '',
-                      gate_file=read_gate_file(a.gate_file) if a.gate_file else None, **boots)
+                      gate_file=read_gate_file(a.gate_file) if a.gate_file else None, c8b_gio=a.c8b_gio or None,
+                      **boots)
             print('row', row['run_uid'], {k: row[f't_{k}_s'] for k in STEPS}, 'wait', row['t_operator_wait_s'])
             note = refusal_note(ds, row)
             if note:

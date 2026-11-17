@@ -353,3 +353,97 @@ def test_grid_only_on_the_floor(ds):
     g = _grid_gate(gf, ['dat'] * 3)
     with pytest.raises(rl.LogError, match='floor gate|2 way'):          # refused either way
         rl.validate_gate(g, 'HIL')
+
+
+# ── design v2 section 6: reruns after the C8b time check (O1 v11.37 D1, S05 v3.43 D2, D3; Liam 17/11 THESIS "Chỉ lượt
+# trượt kiểm giờ", "Tổng", "Bắt buộc file", "Luật §4.6: 3 hỏng liên tiếp"; the code: Liam 17/11 at CODE_GATE) ──
+
+def _gio(tmp, name, ok=False, fmt='c8b_gio_v1'):
+    p = str(tmp / f'{name}.json')
+    with open(p, 'w', encoding='utf-8') as f:
+        json.dump(dict(format=fmt, ok=ok, nodes_s=[0.01, 0.011], FAKE=True), f)
+    return p
+
+
+def _lost_gio(d, tmp, name, task='O1-F05', stage='screen', gs='A-PID/G01'):
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', task, str(rl.FIG8[task]), stage, gain_set=gs)
+    rl.step(d, 'run')
+    return rl.end(d, 'hong_he_do', completed=1, fail_cause=rl.C8B_GIO_FAIL, c8b_gio=_gio(tmp, name),
+                  queries=rl.fake_queries())
+
+
+def test_c8b_check_needs_its_file_ok_false(ds):
+    d, gf, tmp = ds
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    with pytest.raises(rl.LogError, match='go together'):
+        rl.end(d, 'hong_he_do', completed=1, fail_cause=rl.C8B_GIO_FAIL, queries=rl.fake_queries())
+    with pytest.raises(rl.LogError, match='ok false'):
+        rl.end(d, 'hong_he_do', completed=1, fail_cause=rl.C8B_GIO_FAIL, c8b_gio=_gio(tmp, 'okt', ok=True),
+               queries=rl.fake_queries())
+    with pytest.raises(rl.LogError, match='ok false'):
+        rl.end(d, 'hong_he_do', completed=1, fail_cause=rl.C8B_GIO_FAIL, c8b_gio=_gio(tmp, 'fmt', fmt='x'),
+               queries=rl.fake_queries())
+    with pytest.raises(rl.LogError, match='go together'):
+        rl.end(d, 'hong_he_do', completed=1, fail_cause='mat_khung_FAKE', c8b_gio=_gio(tmp, 'g0'),
+               queries=rl.fake_queries())
+    p = _gio(tmp, 'g1')
+    row = rl.end(d, 'hong_he_do', completed=1, fail_cause=rl.C8B_GIO_FAIL, c8b_gio=p, queries=rl.fake_queries())
+    assert row['c8b_gio_sha256'] == rl.sha256_file(p)
+
+
+def test_c8b_check_only_on_the_floor_lost(ds):
+    d, gf, tmp = ds
+    _hil_b(d)
+    with pytest.raises(rl.LogError, match='floor run lost'):
+        rl.end(d, 'hong_he_do', completed=1, fail_cause=rl.C8B_GIO_FAIL, c8b_gio=_gio(tmp, 'h'),
+               gate=_gate(gf), gate_file=gf, results_dir=str(tmp))
+
+
+def test_c8b_fourth_failure_stops_the_level_in_total_not_in_a_row(ds):
+    d, gf, tmp = ds
+    for i in range(2):
+        _lost_gio(d, tmp, f'a{i}')
+    _lost_gio(d, tmp, 'other_gain', gs='A-PID/G02')                          # another gain: its own count
+    _lost_gio(d, tmp, 'other_level', task='O1-F08')                           # another level: its own count
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')   # a run that passes
+    rl.step(d, 'run')
+    rl.end(d, 'hong_he_do', completed=1, fail_cause='mat_khung_FAKE', queries=rl.fake_queries())   # other cause
+    for i in range(2, 4):                                                     # total 4 (not reset by the runs between)
+        row = _lost_gio(d, tmp, f'a{i}')
+    assert 'chua ket luan' in rl.refusal_note(d, row)
+    with pytest.raises(rl.LogError, match='stopped after 3 reruns for the C8b time check'):
+        rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'confirm', gain_set='A-PID/G01')
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G02')   # other gain still runs
+    rl.cancel(d)
+    s = {r['campaign']: r for r in rl.summary(d)}['A-PID']
+    assert s['san_gio_c8b_n'] == '6' and s['san_gio_c8b_dung'] == 'A-PID/G01 O1-F05@0.5'
+
+
+def test_c8b_final_follows_the_lost_in_a_row_rule(ds):
+    d, gf, tmp = ds
+    for i in range(5):                                                        # final: no limit of 3 reruns here
+        rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'final', gain_set='A-PID/G00')
+        rl.step(d, 'run')
+        if i < 2:
+            rl.end(d, 'hong_he_do', completed=1, fail_cause=rl.C8B_GIO_FAIL, c8b_gio=_gio(tmp, f'f{i}'),
+                   queries=rl.fake_queries())
+        else:
+            rl.end(d, 'dat', completed=1, e_perp_max=0.02, results_dir=str(tmp),
+                   gate=rl.floor_gate(rl.fake_gate(gate_file=gf)), gate_file=gf, queries=rl.fake_queries())
+    assert rl.c8b_refusals(rl.read_rows(os.path.join(d, rl.TUNING))) == {}
+
+
+def test_c8b_summary_refuses_an_edited_row(ds):
+    d, gf, tmp = ds
+    _lost_gio(d, tmp, 'x')
+    p = os.path.join(d, rl.TUNING)
+    rows = rl.read_rows(p)
+    rows[-1]['c8b_gio_sha256'] = ''
+    rl._write_all(p, rl.TUNING_COLS, rows)
+    with pytest.raises(rl.LogError, match='sha256 of its C8b time file'):
+        rl.summary(d)
+    rows[-1].update(c8b_gio_sha256='ab' * 32, fail_cause='mat_khung_FAKE')
+    rl._write_all(p, rl.TUNING_COLS, rows)
+    with pytest.raises(rl.LogError, match='without fail cause'):
+        rl.summary(d)
