@@ -13,7 +13,9 @@ fwsim.simulate while it runs:
   4. the fw object is proxied: fw.tick gets the counts of the "sent" wheel angle;
   5. batch 2 plant faults (rpi5/fault_plant.py, design 2026-11-15 section 6): the wrapped plant_step of step k
      gets the parameters of fault_plant.PlantVariant (the same function the Pi uses) instead of the nominal
-     ones while a plant row is on; every such step is recorded (fault_plant, faults_plant.csv).
+     ones while a plant row is on; every such step is recorded (fault_plant, faults_plant.csv). A step with an s14
+     body row on (body_drag, load_dist) is fault_plant.body_step with the force of fault_plant.BodyForce instead
+     of plant_step (the same traction branch with f_ext; the Pi does the same in FaultPlant.step).
   6. batch 2 ibus_loss is refused (BENCH_ONLY): the RC / iBUS logic is in the firmware main.c, which fwsim
      does not run (Liam 15/11 Q2 "Chi ban HIL").
 The wrapper is removed in a finally block. Not re-entrant: one run at a time per process.
@@ -147,6 +149,7 @@ class FwsimFaults:
         self.g = params.g
         fault_plant.check_params(self.schedule.rows, params)       # batch 2: against the nominal values
         var = fault_plant.PlantVariant(self.schedule.rows, params)
+        body = fault_plant.BodyForce(self.schedule.rows)              # s14 body loads
         real = fwsim.plant_step
         j = [0]
 
@@ -155,13 +158,15 @@ class FwsimFaults:
                 self.X.append(np.array(x, copy=True))
             self.adv(j[0])
             on = self.act.plant_on
+            f = None
             if on:                                     # batch 2: the parameters of this step
                 if p is not params:
                     raise RuntimeError('fwsim.simulate passed a parameter object other than the one of run()')
                 p, _ = var.at(on, j[0], x)
-                self.rec_plant.append((j[0], sum(1 << i for i in on), p.V_batt, *p.mu_hd, *p.motor_b,
-                                       *p.motor_Tc, *p.motor_Ts, x[0], x[1], x[2]))
-            x_new = real(x, u, p, dt, rng)
+                f, fd, fdist = body.at(on, j[0], x)
+                self.rec_plant.append((j[0], sum(1 << i for i in on), p.V_batt, *fault_plant.mu4(p), *p.motor_b,
+                                       *p.motor_Tc, *p.motor_Ts, x[0], x[1], x[2], x[3], x[4], fd, fdist))
+            x_new = real(x, u, p, dt, rng) if f is None else fault_plant.body_step(x, u, p, dt, f)
             self.X.append(x_new)
             w = x_new[6:10]
             m = self.act.enc_mask
@@ -258,7 +263,9 @@ def write_faults(out, log):
         if plant:
             f.write("  - faults_plant.csv: \"every plant step with a plant fault row on (batch 2): step, mask of "
                     "the rows on (bit = row index), the parameters used (V_batt, mu_hd, motor_b, motor_Tc, motor_Ts "
-                    "per wheel FL FR RL RR) and x, y, theta at the start of the step\"\n")
+                    "per wheel FL FR RL RR), x, y, theta, vx, vy (world) at the start of the step, f_drag (the drag "
+                    "F of a body_drag row on, 0 while |v| < 1e-3 m/s at the start of the step) and f_dist (F(k) of "
+                    "a load_dist row on), 0 without such a row\"\n")
 
 
 def main():
