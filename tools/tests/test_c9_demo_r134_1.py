@@ -40,7 +40,7 @@ def demo_ds(tmp_path):
 def test_demo_final_table_runs_the_whole_chain(demo_ds, tmp_path):
     out = str(tmp_path / 'tbl')
     os.makedirs(out)
-    assert T.main(['table', '--dataset', demo_ds, '--out', out]) == 0
+    assert T.main(['table', '--dataset', demo_ds, '--out', out, '--gate-file', os.path.join(demo_ds, 'FAKE_gate_c8.json')]) == 0
     runs = _rows(os.path.join(out, 'S05_final_runs.csv'))
     judged = [r for r in runs if r.get('outcome') in T.VALID]
     assert len(judged) == 4                                      # two final_hil, two judged car final runs
@@ -63,9 +63,13 @@ def test_demo_rows_name_their_query_files(demo_ds):
 
 
 # ── R134 (1): the summary reads the two saved answers again ───────────────────────────────────────────────────────
+def _gf(ds):
+    """The FAKE C8 gate file of the demo (O1 v11.33, gate_c8_v1)."""
+    return rl.read_gate_file(os.path.join(ds, 'FAKE_gate_c8.json'))
+
+
 def _summary(ds):
-    gate, sha = rl.read_gate(os.path.join(ds, 'FAKE_gate.csv'))
-    return rl.summary(ds, gate, sha)
+    return rl.summary(ds, gate_file=_gf(ds))
 
 
 def _judged_car_row(rows):
@@ -225,9 +229,9 @@ def test_so_h_refuses_twice_and_a_changed_file(demo_ds):
         _summary(demo_ds)
 
 
-GATES = {'dat': lambda: rl.floor_gate(rl.fake_gate()),                    # camera gates that recompute to the outcome
-         'khong_dat': lambda: rl.floor_gate(rl.fake_gate(e_trk=0.5)),
-         'chua_ket_luan': lambda: rl.floor_gate(rl.fake_gate(), t_done=(10.0, None))}
+GATES = {'dat': lambda gf=None: rl.floor_gate(rl.fake_gate(gate_file=gf)),   # camera gates that recompute to the outcome
+         'khong_dat': lambda gf=None: rl.floor_gate(rl.fake_gate(e_trk=0.5, gate_file=gf)),
+         'chua_ket_luan': lambda gf=None: rl.floor_gate(rl.fake_gate(gate_file=gf), t_done=(10.0, None))}
 
 
 def _row(ds, uid):
@@ -253,7 +257,7 @@ def _score_final(ds, uid, d_h, o1=None, h1_gate=None, name='sf_test.json', edit=
     if o1 is not None:
         h1 = dict(FAKE=True, outcome=o1)
         if h1_gate is not None or o1 in GATES:
-            h1['gate_v3'] = h1_gate if h1_gate is not None else GATES[o1]()
+            h1['gate_v3'] = h1_gate if h1_gate is not None else GATES[o1](_gf(ds))
     p = rl.fake_score_final(folder, d_h, h1=h1, name=name)
     if edit:
         with open(p, encoding='utf-8') as f:
@@ -293,7 +297,7 @@ def test_so_h_final_car_run_lost_after_the_comparison_leaves_the_table(demo_ds, 
     rl.so_h(demo_ds, fin['run_uid'], _score_final(demo_ds, fin['run_uid'], 3.0, 'hong_he_do'))
     out = str(tmp_path / 'tbl')
     os.makedirs(out)
-    assert T.main(['table', '--dataset', demo_ds, '--out', out]) == 0
+    assert T.main(['table', '--dataset', demo_ds, '--out', out, '--gate-file', os.path.join(demo_ds, 'FAKE_gate_c8.json')]) == 0
     runs = {r['run_uid']: r for r in _rows(os.path.join(out, 'S05_final_runs.csv'))}
     assert runs[fin['run_uid']]['outcome'] == 'hong_he_do' and runs[fin['run_uid']]['so_h_flags'] == 'calib_drift'
     assert _summary(demo_ds)
@@ -327,13 +331,13 @@ def test_b8s2_1_end_refuses_a_score_final_file(demo_ds, tmp_path):
 def _judged_run(ds, d, campaign, ctrl, stage, outcome, gain_set, block_id='', platform='HW'):
     """A judged run with its folder and scorer file score.json (outcome, gate_v3) given to end with its sha256."""
     qs = tuple(T.glc.read_query(p) for p in fr.write_final_run(
-        d, platform, GAIN, score_extra=dict(outcome=outcome, gate_v3=GATES[outcome]())))
+        d, platform, GAIN, score_extra=dict(outcome=outcome, gate_v3=GATES[outcome](_gf(ds)))))
     sp = os.path.join(d, 'score.json')
     rl.begin(ds, 'FAKE-' + stage, campaign, platform, ctrl, 'O1-F05', '0.5', stage, gain_set=gain_set,
              block_id=block_id)
     rl.step(ds, 'run')
     return rl.end(ds, outcome, completed=1, e_perp_max=0.1, results_dir=d, gate=rl.read_gate_json(sp),
-                  gate_sha256=rl.sha256_file(sp), queries=qs)
+                  gate_sha256=rl.sha256_file(sp), queries=qs, gate_file=_gf(ds))
 
 
 def _fourth_final_run(ds, tmp_path):
@@ -357,7 +361,7 @@ def test_b8s2_2_run_after_a_stop_seen_only_at_the_comparison(demo_ds, tmp_path):
     assert s['N_HW'] == '7'                                             # 3 tune + 3 final + the late run
     out = str(tmp_path / 'tbl')
     os.makedirs(out)
-    assert T.main(['table', '--dataset', demo_ds, '--out', out]) == 0
+    assert T.main(['table', '--dataset', demo_ds, '--out', out, '--gate-file', os.path.join(demo_ds, 'FAKE_gate_c8.json')]) == 0
     assert late['run_uid'] not in {r['run_uid'] for r in _rows(os.path.join(out, 'S05_final_runs.csv'))}
     with pytest.raises(rl.LogError, match='lost runs in a row'):        # and no run after it any more
         rl.begin(demo_ds, 'FAKE-F2', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'final', gain_set='A-PID/G00')
@@ -417,7 +421,7 @@ def test_c9d2_final_table_stops_before_so_h_of_a_final_car_run(demo_ds, tmp_path
     _drop_so_h(demo_ds, 'FAKE-F1:3')
     out = str(tmp_path / 'tbl')
     os.makedirs(out)
-    assert T.main(['table', '--dataset', demo_ds, '--out', out]) != 0
+    assert T.main(['table', '--dataset', demo_ds, '--out', out, '--gate-file', os.path.join(demo_ds, 'FAKE_gate_c8.json')]) != 0
     assert not os.path.exists(os.path.join(out, 'S05_final_runs.csv'))
 
 
@@ -425,7 +429,7 @@ def test_c9d2_final_table_does_not_need_so_h_of_tune_runs(demo_ds, tmp_path):
     _drop_so_h(demo_ds, 'FAKE-A1:2')                                   # screen run: counted in the summary only
     out = str(tmp_path / 'tbl')
     os.makedirs(out)
-    assert T.main(['table', '--dataset', demo_ds, '--out', out]) == 0
+    assert T.main(['table', '--dataset', demo_ds, '--out', out, '--gate-file', os.path.join(demo_ds, 'FAKE_gate_c8.json')]) == 0
 
 
 def _confirm_block(ds, tmp_path, block, outcomes):
@@ -477,6 +481,74 @@ def test_c9d4_lost_runs_of_the_block_are_out_of_the_denominator(demo_ds, tmp_pat
     assert {r['campaign']: r for r in _summary(demo_ds)}['A-LADRC']['stop_reason_check'] == 'ok'
 
 
+def _fake_gio(folder, task, run):
+    """A FAKE c8b_gio_v1 file (ok false) and the two FAKE inputs it names, in the run folder (GT1-8)."""
+    sha = {}
+    for k in ('esp32', 'frames'):
+        q = os.path.join(folder, f'{k}.csv')
+        with open(q, 'w', encoding='utf-8', newline='\n') as f:
+            f.write(f'FAKE,{k},{folder}\n')
+        sha[k] = rl.sha256_file(q)
+    p = os.path.join(folder, 'c8b_gio.json')
+    with open(p, 'w', encoding='utf-8') as f:
+        json.dump(dict(format='c8b_gio_v1', ok=False, FAKE=True, run=run, task=task, sha256=sha), f)
+    return p
+
+
+def test_gt1_2_a_level_stopped_by_the_c8b_time_check_is_not_confirmed(demo_ds, tmp_path):
+    # GT1-2 (Codex round 1 of CODE_GATE; Liam 17/11 at CODE_GATE "Sửa theo bảng (Recommended)"): two dat confirmed at
+    # so-h, then four runs that failed the C8b time check at the same level: the level is chua_ket_luan (O1 3.5
+    # v11.37), so neither freeze nor the summary takes khoi_xac_nhan_dat
+    uids = _confirm_block(demo_ds, tmp_path, 'K1', ('dat', 'dat'))
+    for u in uids:
+        rl.so_h(demo_ds, u, _score_final(demo_ds, u, 0.5))
+    for i in range(4):
+        folder = str(tmp_path / f'gio_{i}')
+        os.makedirs(folder)
+        p = _fake_gio(folder, 'O1-F05', i)
+        rl.begin(demo_ds, 'FAKE-confirm', 'A-LADRC', 'HW', 'LADRC', 'O1-F05', '0.5', 'confirm',
+                 gain_set='A-LADRC/G01', block_id='K1')
+        rl.step(demo_ds, 'run')
+        rl.end(demo_ds, 'hong_he_do', completed=1, fail_cause=rl.C8B_GIO_FAIL, c8b_gio=p, results_dir=folder)
+    with pytest.raises(rl.LogError, match='C8b time check'):
+        _freeze_ok(demo_ds, tmp_path)
+    gfile = fr.write_gain_file(str(tmp_path / 'FAKE_gain_L.json'), GAIN)
+    rl.append_row(os.path.join(demo_ds, rl.FREEZE), rl.FREEZE_COLS, dict(
+        campaign='A-LADRC', frozen_at='2030-01-01T00:00:00', stop_reason='khoi_xac_nhan_dat', stop_cause='',
+        gain_set_id='A-LADRC/G01', gain_file=gfile, gain_sha256=rl.sha256_file(gfile), notes='FAKE: by hand'))
+    s = {r['campaign']: r for r in _summary(demo_ds)}['A-LADRC']
+    assert s['stop_reason_check'] == 'mismatch' and s['san_gio_c8b_dung'] == 'A-LADRC/G01 O1-F05@0.5'
+
+
+def test_gt2_2_a_level_outside_the_block_and_the_gate_does_not_stop_the_confirmation(demo_ds, tmp_path):
+    # GT2-2 (Codex round 2 of CODE_GATE; Liam 17/11 at CODE_GATE "Sửa 4 + Codex vòng 3 (Recommended)"): the gate of
+    # the demo has O1-F05 only; O1-F08 of the set stopped in explore runs; the F05 block confirms
+    for i in range(4):
+        folder = str(tmp_path / f'gio8_{i}')
+        os.makedirs(folder)
+        p = _fake_gio(folder, 'O1-F08', i)
+        rl.begin(demo_ds, 'FAKE-explore', 'A-LADRC', 'HW', 'LADRC', 'O1-F08', '0.8', 'explore', gain_set='A-LADRC/G01')
+        rl.step(demo_ds, 'run')
+        rl.end(demo_ds, 'hong_he_do', completed=1, fail_cause=rl.C8B_GIO_FAIL, c8b_gio=p, results_dir=folder)
+    uids = _confirm_block(demo_ds, tmp_path, 'K1', ('dat', 'dat'))
+    for u in uids:
+        rl.so_h(demo_ds, u, _score_final(demo_ds, u, 0.5))
+    _freeze_ok(demo_ds, tmp_path)
+    s = {r['campaign']: r for r in _summary(demo_ds)}['A-LADRC']
+    assert s['stop_reason_check'] == 'ok' and s['san_gio_c8b_dung'] == 'A-LADRC/G01 O1-F08@0.8'
+
+
+def test_gt3_2_levels_may_be_an_iterator(demo_ds, tmp_path):
+    # GT3-2 (Codex round 3 of CODE_GATE; Liam 17/11 at CODE_GATE "Sửa + Codex vòng 4 (Recommended)"): the levels are
+    # read once for the stops and again for 2 x |G|; fails on 1d32334
+    uids = _confirm_block(demo_ds, tmp_path, 'K1', ('dat',))
+    rl.so_h(demo_ds, uids[0], _score_final(demo_ds, uids[0], 0.5))
+    tun = rl.apply_so_h(rl.live_rows(rl.read_rows(os.path.join(demo_ds, rl.TUNING))), demo_ds)
+    why = rl.confirm_block_problem(tun, demo_ds, 'A-LADRC', 'A-LADRC/G01', '2030-01-01T00:00:00',
+                                   levels=iter(['O1-F05', 'O1-F08']))
+    assert why and 'fewer than 2' in why
+
+
 def test_c9d4_a_block_of_lost_runs_only_is_not_confirmed(demo_ds, tmp_path):
     _lost_confirm(demo_ds, 'K1')
     with pytest.raises(rl.LogError, match='no valid run'):
@@ -484,11 +556,11 @@ def test_c9d4_a_block_of_lost_runs_only_is_not_confirmed(demo_ds, tmp_path):
 
 
 def _summary_with_levels(ds, tmp_path, levels):
-    p = str(tmp_path / 'gate_levels.csv')
-    with open(p, 'w', encoding='utf-8', newline='\n') as f:
-        f.write('level\n' + ''.join(f'{lv}\n' for lv in levels))
-    gate, sha = rl.read_gate(p)
-    return {r['campaign']: r for r in rl.summary(ds, gate, sha)}
+    """O1 v11.33: the rows carry the SHA of the gate file they were scored with, so the gate file of the summary is
+    the one of the demo (its levels made by rl.demo(levels=...))."""
+    gf = _gf(ds)
+    assert list(gf.levels) == list(levels)
+    return {r['campaign']: r for r in rl.summary(ds, gate_file=gf)}
 
 
 def test_q1_summary_needs_two_valid_runs_per_gate_level(demo_ds, tmp_path):
@@ -498,18 +570,21 @@ def test_q1_summary_needs_two_valid_runs_per_gate_level(demo_ds, tmp_path):
     rl.so_h(demo_ds, uids[0], _score_final(demo_ds, uids[0], 0.5))
     _freeze_ok(demo_ds, tmp_path)
     assert _summary_with_levels(demo_ds, tmp_path, ['O1-F05'])['A-LADRC']['stop_reason_check'] == 'mismatch'
-    assert {r['campaign']: r for r in rl.summary(demo_ds)}['A-LADRC']['stop_reason_check'] == 'ok'   # no gate file
+    with pytest.raises(rl.LogError, match='not given here'):     # O1 v11.33: rows scored with the gate file need it
+        rl.summary(demo_ds)
 
 
-def test_q1_lost_runs_do_not_count_and_every_level_is_needed(demo_ds, tmp_path):
+@pytest.mark.parametrize('levels, want', [(('O1-F05',), 'ok'), (('O1-F05', 'O1-F08'), 'mismatch')])
+def test_q1_lost_runs_do_not_count_and_every_level_is_needed(tmp_path, levels, want):
+    demo_ds = str(tmp_path / 'dry')
+    rl.demo(demo_ds, levels=levels)          # O1 v11.33: a gate file per level set, the runs scored with it
     _lost_confirm(demo_ds, 'K1')                                        # lost: out of the two
     uids = _confirm_block(demo_ds, tmp_path, 'K1', ('dat', 'dat'))
     for u in uids:
         rl.so_h(demo_ds, u, _score_final(demo_ds, u, 0.5))
     _freeze_ok(demo_ds, tmp_path)
-    assert _summary_with_levels(demo_ds, tmp_path, ['O1-F05'])['A-LADRC']['stop_reason_check'] == 'ok'
-    s = _summary_with_levels(demo_ds, tmp_path, ['O1-F05', 'O1-F08'])['A-LADRC']    # no run at O1-F08
-    assert s['stop_reason_check'] == 'mismatch'
+    s = _summary_with_levels(demo_ds, tmp_path, list(levels))['A-LADRC']    # no run at O1-F08
+    assert s['stop_reason_check'] == want
 
 
 def test_q1c1_a_run_lost_from_the_start_is_not_one_of_the_two(demo_ds, tmp_path):
@@ -562,7 +637,7 @@ def test_c9d5_outcome_h1_is_the_one_of_the_h1_score(demo_ds):
 
 def test_c9d5_h1_gate_recomputes_to_its_outcome(demo_ds):
     _drop_so_h(demo_ds, 'FAKE-A1:2')
-    p = _score_final(demo_ds, 'FAKE-A1:2', 3.0, 'dat', h1_gate=GATES['khong_dat']())
+    p = _score_final(demo_ds, 'FAKE-A1:2', 3.0, 'dat', h1_gate=GATES['khong_dat'](_gf(demo_ds)))
     with pytest.raises(rl.LogError, match='the gate of the H1 score: --outcome dat disagrees with the gate'):
         rl.so_h(demo_ds, 'FAKE-A1:2', p)
 
@@ -607,21 +682,21 @@ def test_c9d2_1_lost_h1_with_a_null_gate(demo_ds):
     assert (r['outcome_sau'], r['flags']) == ('hong_he_do', 'calib_drift')
 
 
-def _t1_gate(cat: bool):
+def _t1_gate(cat: bool, gf=None):
     """A floor gate with a tracking-error frame at t1 = 6 s: cat_t1 true is the exception before t1 (khong_dat with
     VIOL_BEFORE, test_s05_final_table test_c4_6), false a run lost to the measurement (O1 3.5, R134C4-3)."""
     if cat:
-        g = rl.floor_gate(rl.fake_gate(e_trk=0.5), t_done=(None, None))
+        g = rl.floor_gate(rl.fake_gate(e_trk=0.5, gate_file=gf), t_done=(None, None))
         g['g1'].update(t1=6.0, cat_t1=True, state='chua_ket_luan', q='inconclusive')
     else:
-        g = rl.floor_gate(rl.fake_gate())
+        g = rl.floor_gate(rl.fake_gate(gate_file=gf))
         g['g1'].update(t1=6.0, cat_t1=False)
-    g.update(rl.o1_gate.evaluate_outcomes(g, g['decide']))
+    g.update(rl.o1_gate.evaluate_outcomes(g, g['decide'], g.get('required')))
     return g
 
 
 def test_c9d2_2_h1_goes_through_the_floor_rule_of_t1(demo_ds):
-    g = _t1_gate(False)
+    g = _t1_gate(False, _gf(demo_ds))
     assert rl.validate_gate(g, 'HW')['outcome_decide'] == 'dat'          # the gate alone still says dat
     _drop_so_h(demo_ds, 'FAKE-A1:2')
     with pytest.raises(rl.LogError, match='C9D-5'):
@@ -630,7 +705,7 @@ def test_c9d2_2_h1_goes_through_the_floor_rule_of_t1(demo_ds):
 
 def test_c9d2_2_h1_with_the_exception_before_t1_is_kept(demo_ds):
     _drop_so_h(demo_ds, 'FAKE-A1:2')                                    # H0 khong_dat, H1 khong_dat by cat_t1
-    r = rl.so_h(demo_ds, 'FAKE-A1:2', _score_final(demo_ds, 'FAKE-A1:2', 3.0, 'khong_dat', h1_gate=_t1_gate(True)))
+    r = rl.so_h(demo_ds, 'FAKE-A1:2', _score_final(demo_ds, 'FAKE-A1:2', 3.0, 'khong_dat', h1_gate=_t1_gate(True, _gf(demo_ds))))
     assert (r['outcome_sau'], r['flags']) == ('khong_dat', 'calib_drift')
 
 

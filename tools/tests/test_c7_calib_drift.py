@@ -358,16 +358,18 @@ def test_session_without_corners_refused(tmp_path, s0):
 KS_K = [1.0, 0.0, -math.pi / 2]
 
 
-def sc(outcome, frames='f0', esp='e' * 64, t0=1000, off=0.25, U=0.005, ks=(0.0, 0.0, 0.785), task='O1-F05'):
+def sc(outcome, frames='f0', esp='e' * 64, t0=1000, off=0.25, hs='h' * 64, ks=(0.0, 0.0, 0.785), task='O1-F05'):
     return dict(outcome=outcome, outcome_reasons=[], conditions={}, e_perp_max=0.01, completed='true', task=task,
-                t0_log_us=t0, offset_s=off, U_m=U, D=0.1, k_start=list(ks),
+                t0_log_us=t0, offset_s=off, offset_src='o1_time_sync', version='c7_score_v2',
+                hang_so=dict(file='hang_so.json', sha256=hs, trang_thai='thu', nguon='test'), k_start=list(ks),
                 thresholds=dict(t_miss=0.25, status='khoa o C8'),
-                frames_sha256=frames, esp32_sha256=esp, frames_valid=600, gap_max=0.02, shift_max_px=0.5)
+                frames_sha256=frames, esp32_sha256=esp, frames_valid=600, gap_max=0.02, shift_max_px=0.5,
+                sender_sha256='s' * 64, events_sha256=None)
 
 
 def tr(session='s0', video='r' * 64, frames='f0', off=(0.0, 0.0, 0.0), n=640, shape=((1080, 1920),)):
     return dict(session_sha256=session, video_sha256=video, frames_sha256=frames, tag_offset=list(off), frames=n,
-                decoded_shapes=[list(s) for s in shape])
+                decoded_shapes=[list(s) for s in shape], gates=dict(cm.DEFAULT_GATES, status='x'))
 
 
 TASKS = ['O1-F02', 'O1-F05', 'O1-K1']
@@ -440,15 +442,16 @@ def test_bad_drift_files_refused(bad, two):
 
 
 @pytest.mark.parametrize('case', ['no_second', 'session0', 'session1', 'video', 'frames0', 'frames1', 'esp32',
-                                  'U', 'k_start', 't0', 'offset', 'offset_nan', 'outcome', 'task', 'tag_offset',
+                                  'hang_so', 'k_start', 't0', 'offset_nan', 'outcome', 'task', 'tag_offset',
                                   'n_frames', 'shape', 'h0_copied_into_h1', 'score_frames', 'track_no_frames_sha',
-                                  'no_D_both', 'no_thresholds_both', 'no_t0_both', 'no_k_start_both',
+                                  'no_hang_so_both', 'no_version_both', 'no_thresholds_both', 'no_t0_both', 'no_k_start_both',
                                   'score_not_dict', 'track_not_dict', 'score_null', 'track_null',
-                                  'D', 'threshold', 'frames_null_both', 'shapes_null_both', 'threshold_null_both',
+                                  'hang_so_file', 'version_old_both', 'hang_so_no_sha_both', 'hang_so_empty_sha_both', 'threshold', 'frames_null_both', 'shapes_null_both', 'threshold_null_both',
                                   'frames_bool', 'shape_zero', 'offset_not_drift_both',
                                   'threshold_one_null_both', 'threshold_text_both', 'threshold_bool_both',
                                   'threshold_negative_both', 'threshold_numeric_text_both', 'status_number_both',
-                                  'only_status_both'])
+                                  'only_status_both', 'sender', 'events', 'gates', 'gates_null_both',
+                                  'gates_empty_both', 'gates_bad_both'])
 def test_provenance_and_scoring_set_up_checked(case):
     a, ta, fa = sc('dat'), tr('s0'), 'f0'
     b, tb, fb = sc('dat', frames='f1'), tr('s1', frames='f1'), 'f1'
@@ -466,14 +469,12 @@ def test_provenance_and_scoring_set_up_checked(case):
         fb = 'f0'
     elif case == 'esp32':
         b = sc('dat', frames='f1', esp='z' * 64)
-    elif case == 'U':
-        b = sc('dat', frames='f1', U=0.0)
+    elif case == 'hang_so':                                  # another constants file
+        b = sc('dat', frames='f1', hs='g' * 64)
     elif case == 'k_start':
         b = sc('dat', frames='f1', ks=(0.1, 0.0, 0.785))
     elif case == 't0':
         b = sc('dat', frames='f1', t0=2000)
-    elif case == 'offset':
-        b = sc('dat', frames='f1', off=0.26)
     elif case == 'offset_nan':
         b = sc('dat', frames='f1', off=float('nan'))
     elif case == 'outcome':
@@ -493,7 +494,7 @@ def test_provenance_and_scoring_set_up_checked(case):
     elif case == 'track_no_frames_sha':
         tb = _drop(tr('s1', frames='f1'), 'frames_sha256')
     elif case.startswith('no_') and case.endswith('_both'):  # CD2-6: absent on both sides is not "same"
-        k = {'no_D_both': 'D', 'no_thresholds_both': 'thresholds', 'no_t0_both': 't0_log_us',
+        k = {'no_hang_so_both': 'hang_so', 'no_version_both': 'version', 'no_thresholds_both': 'thresholds', 'no_t0_both': 't0_log_us',
              'no_k_start_both': 'k_start'}[case]
         a, b = _drop(a, k), _drop(b, k)
     elif case == 'score_not_dict':
@@ -504,8 +505,16 @@ def test_provenance_and_scoring_set_up_checked(case):
         a = None
     elif case == 'track_null':
         ta = None
-    elif case == 'D':                                        # CD3-6: complete pair, only D differs
-        b = dict(b, D=0.2)
+    elif case == 'hang_so_file':                             # CD3-6: complete pair, only the file name differs
+        b = dict(b, hang_so=dict(b['hang_so'], file='other.json'))
+    elif case == 'version_old_both':                         # a score of the version before (U_m, D): refused
+        a, b = dict(a, version='c7_score_v1'), dict(b, version='c7_score_v1')
+    elif case == 'hang_so_no_sha_both':
+        a = dict(a, hang_so=dict(file='hang_so.json'))
+        b = dict(b, hang_so=dict(file='hang_so.json'))
+    elif case == 'hang_so_empty_sha_both':
+        a = dict(a, hang_so=dict(file='hang_so.json', sha256=''))
+        b = dict(b, hang_so=dict(file='hang_so.json', sha256=''))
     elif case == 'threshold':                                # CD3-6: only one threshold differs
         b = dict(b, thresholds=dict(t_miss=0.30, status='khoa o C8'))
     elif case == 'frames_null_both':                         # CD3-5: null on both sides is not "same"
@@ -528,6 +537,16 @@ def test_provenance_and_scoring_set_up_checked(case):
         a, b = dict(a, thresholds=dict(t_miss=0.25, status=3)), dict(b, thresholds=dict(t_miss=0.25, status=3))
     elif case == 'only_status_both':
         a, b = dict(a, thresholds=dict(status='x')), dict(b, thresholds=dict(status='x'))
+    elif case == 'sender':                                   # Codex CC1-3: another sender log
+        b = dict(b, sender_sha256='z' * 64)
+    elif case == 'events':                                   # CC1-3: another events file
+        b = dict(b, events_sha256='v' * 64)
+    elif case == 'gates':                                    # CC1-4: another frame gate in the H1 track
+        tb = dict(tb, gates=dict(cm.DEFAULT_GATES, min_marks=cm.DEFAULT_GATES['min_marks'] + 1))
+    elif case in ('gates_null_both', 'gates_empty_both', 'gates_bad_both'):   # Codex CC2-2: no evidence of the gates
+        g = {'gates_null_both': None, 'gates_empty_both': {},
+             'gates_bad_both': dict(cm.DEFAULT_GATES, min_marks='8')}[case]
+        ta, tb = dict(ta, gates=g), dict(tb, gates=g)
     elif case == 'offset_not_drift_both':                    # CD3-2: both tracks agree, the drift does not
         ta, tb = tr('s0', off=(0.03, 0.0, 0.0)), tr('s1', frames='f1', off=(0.03, 0.0, 0.0))
     with pytest.raises(ValueError):
@@ -665,3 +684,216 @@ def test_cli_json_not_an_object_exit_2(tmp_path, s0, capsys, text):
     """CD2-6: valid JSON that is not an object ends with code 2, not a traceback."""
     assert _gop_below(tmp_path, s0, text) == 2
     assert capsys.readouterr().out.rstrip().endswith('#ket_qua,ma=2')
+
+
+# ---------------------------------------------------------------- (C) 17/11: c7_score_v2 output, each scoring its own clock
+def test_each_scoring_matches_its_own_clock_both_offsets_kept():
+    """Liam 17/11 CODE_CAM local_4a972073 'Moi lan tu ghep gio (Recommended)': H1 matched the clocks on its own frames
+    (C7b) and found 0.2513 s against 0.25 s of H0: accepted (the rule before refused it), both offsets kept."""
+    r = cd.combine(DRIFT_OVER, sc('dat'), tr('s0'), 'f0', sc('dat', frames='f1', off=0.2513), tr('s1', frames='f1'),
+                   'f1')
+    c = r['calib_drift']
+    assert r['outcome'] == 'dat' and c['offset_s_h0'] == 0.25 and c['offset_s_h1'] == 0.2513
+    assert c['offset_src_h0'] == c['offset_src_h1'] == 'o1_time_sync'
+
+
+def test_combined_file_is_the_h0_file_with_outcome_and_calib_drift_only():
+    """The contract of rq3_log so-h (C9D-1): the output of gop is the H0 scorer file with only 'outcome' and the
+    'calib_drift' block changed, in every branch."""
+    a = sc('dat')
+    for drift, two in ((DRIFT_OK, ()), (DRIFT_MISS, ()),
+                       (DRIFT_OVER, (sc('khong_dat', frames='f1'), tr('s1', frames='f1'), 'f1'))):
+        r = cd.combine(drift, dict(a), tr('s0'), 'f0', *two)
+        assert {k: v for k, v in r.items() if k not in ('outcome', 'calib_drift')} == \
+            {k: v for k, v in a.items() if k != 'outcome'}
+
+
+# ---------------------------------------------------------------- Codex CC1-1, T1, T3 (17/11): files written by c7_score itself
+from test_c7_score import cmd_ok  # noqa: E402,F401  (autouse: o1_cmd_path.analyse stubbed as in the scorer tests)
+
+
+def _real_score(tmp_path, name, valid=True, lost_edge=False, drop=(), post=4.0, offset=True, gio=None):
+    """A score file written by c7_score main on the synthetic F05 run of its tests (frames.csv, log, constants); valid
+    False: no valid frame (lost before the clock match: offset null); lost_edge: the line before the edge lost (t = 0
+    not known: t0 null). Returns (score dict, track dict naming that frames.csv)."""
+    import c7_score as cs
+    import test_c7_score as T
+    d = tmp_path / name
+    d.mkdir()
+    fr = T.make_frames('O1-F05', drop=drop)
+    if not valid:
+        for r in fr:
+            r['valid'] = False
+    cm.write_frames(d / 'frames.csv', fr)
+    log = T.make_log(d / 'esp32.csv', 'O1-F05', lost_before_edge=lost_edge, post=post)
+    T.hs_file(d)
+    out = d / 'score.json'
+    args = ['--frames', str(d / 'frames.csv'), '--esp32', log, '--task', 'O1-F05', '--hang-so', str(d / 'hang_so.json'),
+            '--out', str(out)]
+    if offset:
+        args += ['--offset-s', str(T.OFFSET), '--offset-reason', 'test', '--offset-anchor-s', '0', '--offset-err-s', '0']
+    if gio is not None:
+        g = d / 'gio.json'
+        # the grid file names the log and frames.csv it was made from, as c8b_gio writes it (c7_score Codex VG1-1)
+        gio = dict(gio, sha256=dict(esp32=cm.sha256(log), frames=cm.sha256(str(d / 'frames.csv'))))
+        g.write_text(json.dumps(gio), encoding='utf-8')
+        args += ['--gio-c8b', str(g), '--nut', '0']
+    assert cs.main(args) == 0
+    sc0 = json.loads(out.read_text(encoding='utf-8'))
+    fsha = cm.sha256(str(d / 'frames.csv'))
+    return sc0, fsha
+
+
+def _real_track(session, fsha):
+    t = tr(session, frames=fsha)
+    return t
+
+
+def _same_inputs(a, b):
+    """The two synthetic runs are written in two folders: same log bytes, so the same esp32 sha256; the constants file
+    of the same content has the same sha256 too."""
+    assert a['esp32_sha256'] == b['esp32_sha256'] and a['hang_so'] == b['hang_so']
+
+
+def test_cc1_1_real_lost_h1_above_eps_is_lost(tmp_path):
+    """H0 judged (dat), H1 written by c7_score with no valid frame (lost before the clock match: offset null): gop
+    applies Q3, hong_he_do with flag calib_drift (before: refused for missing fields)."""
+    a, fa = _real_score(tmp_path, 'h0')
+    b, fb = _real_score(tmp_path, 'h1', valid=False)
+    _same_inputs(a, b)
+    assert a['outcome'] == 'dat' and b['outcome'] == 'hong_he_do' and b['gate_v3'] is None
+    assert b['offset_s'] == 0.25 and b['offset_src'] == '--offset-s'          # CC2-1: the offset given is kept
+    r = cd.combine(DRIFT_OVER, a, _real_track('s0', fa), fa, b, _real_track('s1', fb), fb)
+    assert r['outcome'] == 'hong_he_do' and r['calib_drift']['flags'] == ['calib_drift']
+    assert r['calib_drift']['offset_s_h1'] == 0.25 and r['calib_drift']['h1_score'] == b
+
+
+@pytest.mark.parametrize('lost_edge', [False, True])
+def test_cc1_1_real_lost_h0_in_every_branch(tmp_path, lost_edge):
+    """H0 lost early (no valid frame; or the edge line lost: t0 null): below eps_H kept hong_he_do, clip H at the end
+    missing stays hong_he_do (flag thieu_H1), above eps_H with a lost H1 too: hong_he_do."""
+    a, fa = _real_score(tmp_path, 'h0', valid=False, lost_edge=lost_edge)
+    assert a['outcome'] == 'hong_he_do' and (a['t0_log_us'] is None) == lost_edge
+    ta = _real_track('s0', fa)
+    assert cd.combine(DRIFT_OK, a, ta, fa)['outcome'] == 'hong_he_do'
+    r = cd.combine(DRIFT_MISS, a, ta, fa)
+    assert r['outcome'] == 'hong_he_do' and r['calib_drift']['flags'] == ['thieu_H1']
+    b, fb = _real_score(tmp_path, 'h1', valid=False, lost_edge=lost_edge)
+    r = cd.combine(DRIFT_OVER, a, ta, fa, b, _real_track('s1', fb), fb)
+    assert r['outcome'] == 'hong_he_do'
+    assert {k: v for k, v in r.items() if k not in ('outcome', 'calib_drift')} == \
+        {k: v for k, v in a.items() if k != 'outcome'}                      # rq3_log so-h contract (C9D-1)
+
+
+def test_cc1_1_real_judged_pair_and_a_lost_pair_of_another_run(tmp_path):
+    """Both judged by c7_score (dat): kept, calib_drift; a lost H1 of another log is still refused (esp32 sha256)."""
+    a, fa = _real_score(tmp_path, 'h0')
+    b, fb = _real_score(tmp_path, 'h1')
+    r = cd.combine(DRIFT_OVER, a, _real_track('s0', fa), fa, b, _real_track('s1', fb), fb)
+    assert r['outcome'] == 'dat' and r['calib_drift']['flags'] == ['calib_drift']
+    c, fc = _real_score(tmp_path, 'h1x', valid=False)
+    c = dict(c, esp32_sha256='x' * 64)
+    with pytest.raises(ValueError, match='esp32_sha256'):
+        cd.combine(DRIFT_OVER, a, _real_track('s0', fa), fa, c, _real_track('s1', fc), fc)
+
+
+def test_cc1_1_judged_score_still_needs_its_offset():
+    """Only a run lost to the measurement system may carry a null offset or t0 (a judged one is refused)."""
+    for k in ('offset_s', 't0_log_us'):
+        with pytest.raises(ValueError, match=k):
+            cd.combine(DRIFT_OK, dict(sc('dat'), **{k: None}), tr('s0'), 'f0')
+        cd.combine(DRIFT_OK, dict(sc('hong_he_do'), **{k: None}), tr('s0'), 'f0')
+
+
+def test_t6_clip_h_shot_again_closes_the_part_before(tmp_path):
+    """B8S-9 (O1 v11.31 4) with the tools as they are: H_A -> part A -> H_B -> part B -> H_C. so(A, B) closes part A
+    (gop of its runs with A and B), so(B, C) part B; H_C missing: part B by the missing-H1 branch only. A run of part
+    B is refused against so(A, B) (its H0 track used session B, the drift has A as s0)."""
+    ab = dict(DRIFT_OVER, s0_session_sha256='sA', s1_session_sha256='sB')
+    bc = dict(DRIFT_OVER, s0_session_sha256='sB', s1_session_sha256='sC')
+    bc_miss = dict(DRIFT_MISS, s0_session_sha256='sB')
+    run_a = (sc('dat'), tr('sA'), 'f0', sc('dat', frames='f1'), tr('sB', frames='f1'), 'f1')
+    assert cd.combine(ab, *run_a)['outcome'] == 'dat'
+    run_b = (sc('dat', frames='g0'), tr('sB', frames='g0'), 'g0', sc('khong_dat', frames='g1'), tr('sC', frames='g1'),
+             'g1')
+    r = cd.combine(bc, *run_b)
+    assert r['outcome'] == 'chua_ket_luan' and 'calib_drift_split' in r['calib_drift']['flags']
+    r = cd.combine(bc_miss, *run_b[:3])
+    assert r['outcome'] == 'chua_ket_luan' and r['calib_drift']['flags'] == ['thieu_H1']
+    with pytest.raises(ValueError, match='session'):
+        cd.combine(ab, *run_b)
+
+
+
+def test_cc1_1_real_lost_after_the_clock_match_keeps_its_offset(tmp_path):
+    """The log ends before the end of the scored domain (U_t not bounded): lost after the offset is known, no gate; the
+    file carries the offset and its source, and gop applies Q3."""
+    a, fa = _real_score(tmp_path, 'h0', post=0.0)
+    b, fb = _real_score(tmp_path, 'h1', post=0.0)
+    assert b['outcome'] == 'hong_he_do' and b['gate_v3'] is None and 'U_t not bounded' in b['outcome_reasons'][0]
+    assert b['offset_s'] == 0.25 and b['offset_src'] == '--offset-s'
+    r = cd.combine(DRIFT_OVER, a, _real_track('s0', fa), fa, b, _real_track('s1', fb), fb)
+    assert r['outcome'] == 'hong_he_do' and r['calib_drift']['offset_s_h1'] == a['offset_s']
+
+
+
+def test_cc2_1_offset_known_or_null_by_its_source(tmp_path):
+    """Codex CC2-1: lost before the clock match: --offset-s given -> that offset; a grid node -> its D; the C7b match
+    not run (no --offset-s) -> null; the edge line lost (t0 null) with --offset-s -> the offset still kept."""
+    import test_c7_score as T
+    a, _ = _real_score(tmp_path, 'given', valid=False)
+    assert a['offset_s'] == T.OFFSET and a['offset_src'] == '--offset-s'
+    b, _ = _real_score(tmp_path, 'c7b', valid=False, offset=False)
+    assert b['offset_s'] is None and b['offset_src'] is None
+    gio = dict(format='c8b_gio_v1', moc_mau=True, ok=True, nodes_s=[0.2504, 0.2514], cua_so_ghep_log_s=[23.0, 29.0])
+    c, _ = _real_score(tmp_path, 'gio', valid=False, offset=False, gio=gio)
+    assert c['offset_s'] == 0.2504 and c['offset_src'] == 'c8b_gio'
+    e, _ = _real_score(tmp_path, 'edge', valid=False, lost_edge=True)
+    assert e['t0_log_us'] is None and e['offset_s'] == T.OFFSET
+
+
+def test_cc2_2_same_gate_values_with_other_text_accepted():
+    """The gates compared are the checked thresholds; the text fields beside them (status, rule) may differ."""
+    a, ta, fa = sc('dat'), tr('s0'), 'f0'
+    b, tb, fb = sc('dat', frames='f1'), tr('s1', frames='f1'), 'f1'
+    tb = dict(tb, gates=dict(tb['gates'], status='other text'))
+    assert cd.combine(DRIFT_OVER, a, ta, fa, b, tb, fb)['outcome'] == 'dat'
+
+
+def test_cc2_2_single_track_gates_checked_below_eps():
+    with pytest.raises(ValueError, match='gates'):
+        cd.combine(DRIFT_OK, sc('dat'), dict(tr('s0'), gates={}), 'f0')
+
+
+# ---------------------------------------------------------------- test gaps Codex listed in round 3 (guards)
+def test_cc3_c7b_failed_keeps_a_null_offset(tmp_path, monkeypatch):
+    """The C7b match run and failed (sync.ok False): the lost file carries a null offset and source."""
+    import c7_score as cs
+    import types
+    monkeypatch.setattr(cs, 'clock_match', lambda frames, rows, task: (types.SimpleNamespace(ok=False, why='test'),
+                                                                      None))
+    b, _ = _real_score(tmp_path, 'c7b_fail', offset=False)
+    assert b['outcome'] == 'hong_he_do' and 'C7b' in b['outcome_reasons'][0]
+    assert b['offset_s'] is None and b['offset_src'] is None and b['t0_log_us'] is not None
+
+
+@pytest.mark.parametrize('field, val', [('rule', 'other'), ('hang_so', {'file': 'x.json'})])
+def test_cc3_gate_text_fields_not_compared(field, val):
+    a, ta, fa = sc('dat'), tr('s0'), 'f0'
+    b, tb, fb = sc('dat', frames='f1'), tr('s1', frames='f1'), 'f1'
+    tb = dict(tb, gates=dict(tb['gates'], **{field: val}))
+    assert cd.combine(DRIFT_OVER, a, ta, fa, b, tb, fb)['outcome'] == 'dat'
+
+
+@pytest.mark.parametrize('bad', ['missing', 'bool', 'inf'])
+def test_cc3_h1_gates_bad_while_h0_good(bad):
+    a, ta, fa = sc('dat'), tr('s0'), 'f0'
+    b, tb, fb = sc('dat', frames='f1'), tr('s1', frames='f1'), 'f1'
+    g = dict(tb['gates'])
+    k = next(iter(cm.GATE_KEYS))
+    if bad == 'missing':
+        del g[k]
+    else:
+        g[k] = True if bad == 'bool' else float('inf')
+    with pytest.raises(ValueError, match='gates'):
+        cd.combine(DRIFT_OVER, a, ta, fa, b, dict(tb, gates=g), fb)

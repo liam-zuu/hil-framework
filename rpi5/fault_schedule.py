@@ -44,8 +44,18 @@ Schedule file (CSV, UTF-8):
                  port off after a 3-frame filter (a cut wire, not a lost radio link: no failsafe frames).
                  The SWA bit (3) and the IMU loss bit (2) of the frame are kept. Bench only: fwsim has no RC
                  model (fwsim/fault_run.py refuses it); a bench run needs the H7 part (IBUS_LOSS_H7 below).
-  * Lines starting with '#' after the first one are comments. The s14 faults body_drag, load_dist (after the
-    main S04 run, Liam 11/11 and 15/11 Q3) are refused for now.
+  * Batch 2, s14 body loads (design section 3; Liam 17/11 CODE_FAULT2 "lam s14 ngay di", which replaces 15/11
+    Q3 "Giu sau S04"): an external force on the body in the world frame, the plant's _traction_step f_ext
+    (rpi5/fault_plant.py; plant_step.py unchanged); plant faults, so they need plant 'traction' too:
+      body_drag  target body; F (N, > 0): f = -F * v / |v| against the world velocity of the body at every
+                 traction sub-step, 0 while |v| < DRAG_V_MIN = 1e-3 m/s (s14 drag load)
+      load_dist  target body; F0, rate (N/s), Fmax, sigma (N, >= 0, not all 0), seed (int), dir_deg (degrees,
+                 world frame): f = F(k) * (cos dir, sin dir), F(k) = F0 + min(Fmax, rate * d / 1000) +
+                 sigma * n[d], d = k - start, n = default_rng(seed).standard_normal(end - start), its own
+                 generator (not the plant's) (s14 load disturbance)
+    A body_drag and a load_dist row may overlap (the forces add up: the s14 "combined" case); two rows of the
+    same one may not.
+  * Lines starting with '#' after the first one are comments.
 
 The patcher only injects in phase RUN (design 6.2): once the run leaves RUN, open windows are cut and the
 frames are the true ones again; a window that never started is 'not_run'.
@@ -90,16 +100,21 @@ FAULTS = {
                    'mu'),
     # batch 2, iBUS loss (design 2026-11-15 sections 4.2, 5)
     'ibus_loss':  (('ibus',), {}, 'ibus'),
+    # batch 2, s14 body loads (design 2026-11-15 section 3; Liam 17/11 "lam s14 ngay di")
+    'body_drag':  (('body',), {'F': Fraction}, 'body_drag'),
+    'load_dist':  (('body',), {'F0': Fraction, 'rate': Fraction, 'Fmax': Fraction, 'sigma': Fraction, 'seed': int,
+                               'dir_deg': Fraction}, 'load_dist'),
 }
 DEFAULTS = {'wheel_jam': {'b': Fraction(0), 'tc': Fraction(0)}}   # parameters that may be left out
 IMU_FAULTS = ('imu_loss', 'imu_delay', 'gyro_scale')
 FRAME_FAULTS = ('enc_loss',) + IMU_FAULTS + ('ibus_loss',)   # change bytes of the frame (FramePatcher)
-PLANT_FAULTS = ('wheel_jam', 'batt_sag', 'mu_time', 'mu_zone')   # change the plant (fault_plant.py)
+BODY_FAULTS = ('body_drag', 'load_dist')                  # a force on the body, f_ext of _traction_step (s14)
+PLANT_FAULTS = ('wheel_jam', 'batt_sag', 'mu_time', 'mu_zone') + BODY_FAULTS   # change the plant (fault_plant.py)
 WHEEL_FAULTS = ('enc_loss', 'wheel_jam', 'mu_time')       # target = wheels joined with '+'
 ALL_WHEELS_OK = ('mu_time',)                              # also target 'all' = FL+FR+RL+RR (design 3, Codex FP1-7)
-# names kept for later parts of batch 2, refused for now: body_drag, load_dist (s14) come after the main S04
-# run (Liam 11/11, 15/11 Q3 "Giu sau S04")
-BATCH2 = ('body_drag', 'load_dist')
+# names kept for later parts of batch 2, refused for now: none left (s14 body_drag, load_dist: Liam 17/11 "lam s14
+# ngay di", replacing 15/11 Q3 "Giu sau S04")
+BATCH2 = ()
 # The H7 firmware of today ignores byte 20 bit 4, so an ibus_loss row on the bench would change nothing the DUT
 # sees. run_hil.py refuses ibus_loss on the bench (not --mock) while this is False; the H7 branch of the iBUS
 # loss (hil_protocol.h HIL_CMD_IBUS_OFF, main.c filter; merged after feat/s06-pf3, after C8) sets it True.
@@ -288,6 +303,16 @@ def _check_plant_row(r: Row, where: str) -> None:
             raise ScheduleError(f'{where}: mu must be > 0')
         if r.fault == 'mu_zone' and not (r.p('x0') < r.p('x1') and r.p('y0') < r.p('y1')):
             raise ScheduleError(f'{where}: mu_zone needs x0 < x1 and y0 < y1')
+    elif r.fault == 'body_drag':
+        if r.p('F') <= 0:
+            raise ScheduleError(f'{where}: body_drag needs F > 0')
+    elif r.fault == 'load_dist':
+        mags = [r.p(k) for k in ('F0', 'rate', 'Fmax', 'sigma')]
+        if any(v < 0 for v in mags) or all(v == 0 for v in mags):
+            raise ScheduleError(f'{where}: load_dist needs F0, rate, Fmax, sigma >= 0, not all 0')
+        if (r.p('rate') > 0) != (r.p('Fmax') > 0):
+            raise ScheduleError(f'{where}: load_dist needs rate and Fmax both 0 (no ramp) or both > 0 (the ramp '
+                                f'rate * t is capped at Fmax)')
 
 
 def file_sha256(raw: bytes) -> str:

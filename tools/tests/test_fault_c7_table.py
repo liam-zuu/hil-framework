@@ -716,3 +716,96 @@ def test_bench_plant_record_name_refused_before_opening(tmp_path, fake_check, mo
     monkeypatch.setattr(ct.np, 'load', load)
     assert ct.main([d]) == 2
     assert seen and all(x.endswith('_frames.npz') for x in seen), seen
+
+
+# ── s14 (design 2026-11-15 sections 7.2, 14.9 G1, 14.10; Liam 17/11 CODE_FAULT2 "lam s14 ngay di") ──
+def test_task_duration_takes_the_tasks_of_fault_run():
+    """G1: the bench table takes the tasks fwsim/fault_run.py task_setpoint takes: A-W1, or a group A test on the
+    ground with its spec duration, + TAIL_S; the lifted tests and unknown ids are refused."""
+    sys.path.insert(0, os.path.join(ROOT, 'rpi5'))
+    from trajectory_pub import GROUP_A, LIFTED_TESTS
+    assert ct.task_duration('--test A-W1') == ('A-W1', 9.0)
+    for task in ('A-C1', 'A-L1', 'A-F2', 'A-S1'):
+        assert ct.task_duration(f'--test {task}') == (task, GROUP_A[task].duration + 1.0), task
+    for task in LIFTED_TESTS + ('A-ZZ',):
+        with pytest.raises(ct.TableError, match='not a fault task'):
+            ct.task_duration(f'--test {task}')
+
+
+def test_task_duration_agrees_with_fault_run():
+    sys.path.insert(0, os.path.join(ROOT, 'fwsim'))
+    from trajectory_pub import GROUP_A, LIFTED_TESTS
+    try:
+        import fault_run
+    except Exception as exc:                          # the fwsim DLL is not built here
+        pytest.skip(f'fwsim not importable: {exc}')
+    for task in ['A-W1'] + [t for t in GROUP_A if t not in LIFTED_TESTS]:
+        assert ct.task_duration(f'--test {task}')[1] == fault_run.task_setpoint(task)[1] + fault_run.TAIL_S, task
+
+
+def test_pwm_mean_fwsim(tmp_path):
+    write_case(str(tmp_path / 'PID_base'), base_log())
+    write_plant_case(str(tmp_path / 'PID_sagzone'), [B_ROW, Z_ROW], plant_record())
+    write_case(str(tmp_path / 'PID_encFL'), fault_log(), rows=[ROW])
+    rs = {r['case']: r for r in ct.table(str(tmp_path))}
+    assert rs['sagzone']['pwm_mean'] == pytest.approx(1000 * 100 / 1200) and rs['sagzone']['base_pwm_mean'] == 0
+    assert rs['encFL']['pwm_mean'] == pytest.approx(1000 * 50 / 1200)
+    k = list(rs['encFL'])
+    assert k.index('zone_out_s') + 1 == k.index('pwm_mean') and k[-1] == 'base_pwm_mean'
+
+
+def test_pwm_mean_bench(tmp_path, fake_check):
+    d = str(tmp_path)
+    bench_plant(d)
+    r = ct.table(d)[0]
+    # esp_rows: FL -1000 for 50 of the 300 span ticks and 100 for the rest (fault run), 100 throughout (baseline)
+    assert r['pwm_mean'] == pytest.approx((50 * 1000 + 250 * 100) / 1200)
+    assert r['base_pwm_mean'] == pytest.approx(300 * 100 / 1200)
+    kf = list(r)
+    assert kf.index('zone_out_s') + 1 == kf.index('pwm_mean') and kf.index('base_pwm_mean') + 1 == kf.index('run_s')
+
+
+# -- Codex round 1 (FS1-1, FS1-4) --
+def test_tick_counts_of_a_duration():
+    # FS1-1: fwsim ticks at 10 .. round(d / 1 ms) // 10 x 10 ms; the bench rows j x 10 ms < d
+    assert ct.fwsim_ticks(9.0) == 900 and ct.bench_ticks(9.0) == 900
+    assert ct.fwsim_ticks(16.0) == 1600 and ct.bench_ticks(16.0) == 1600
+    sys.path.insert(0, os.path.join(ROOT, 'rpi5'))
+    from trajectory_pub import GROUP_A
+    c1 = GROUP_A['A-C1'].duration + 1.0                 # 32.4159.. s
+    assert ct.fwsim_ticks(c1) == 3241 and ct.bench_ticks(c1) == 3242
+    f2 = GROUP_A['A-F2'].duration + 1.0
+    assert ct.bench_ticks(f2) == math.ceil(f2 * 100) and ct.bench_ticks(f2) - 1 < f2 * 100 <= ct.bench_ticks(f2)
+
+
+def test_s02_prep_is_not_a_fault_task():
+    # FS1-4: --s02-prep runs a longer, shifted task than --test alone
+    with pytest.raises(ct.TableError, match='s02-prep'):
+        ct.task_duration('--test A-L1 --finite-run --s02-prep 3')
+    assert ct.task_duration('--test A-L1 --finite-run') == ('A-L1', 16.0)
+
+
+# -- Codex round 2 (FS2-1) --
+def test_tick_counts_at_the_half_ms_and_just_after_a_tick():
+    # fwsim_ticks: the division of fwsim.simulate (duration / 0.001), not duration * 1000
+    assert 1.0695 / 0.001 < 1069.5 <= 1.0695 * 1000          # the two roundings differ here
+    assert ct.fwsim_ticks(1.0695) == int(round(1.0695 / 0.001)) // 10 == 106
+    # bench_ticks: rows j x 10 ms < duration, the duration not rounded first
+    assert ct.bench_ticks(9.000000001) == 901 and ct.bench_ticks(8.999999999) == 900
+    assert ct.bench_ticks(0.0) == 0 and ct.bench_ticks(0.005) == 1 and ct.bench_ticks(0.01) == 1
+    for d in (0.3, 1.0695, 9.0, 13.19444694, 32.41592653589793):
+        n = ct.bench_ticks(d)
+        assert round((n - 1) * ct.TICK_S, 6) < d <= round(n * ct.TICK_S, 6), d
+
+
+# -- Codex round 3 (FS3-1) --
+def test_bench_ticks_domain():
+    import time
+    t = time.perf_counter()
+    for d in (ct.BENCH_MAX_S, 123456789.123456, 1e6 + 0.005):        # the largest taken: a few loop turns only
+        n = ct.bench_ticks(d)
+        assert round((n - 1) * ct.TICK_S, 6) < d <= round(n * ct.TICK_S, 6), d
+    assert time.perf_counter() - t < 1.0
+    for d in (1e307, 2.0 ** 100, ct.BENCH_MAX_S * 1.0000001, -0.001, float('nan'), float('inf')):
+        with pytest.raises(ValueError):
+            ct.bench_ticks(d)

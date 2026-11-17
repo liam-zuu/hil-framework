@@ -15,10 +15,10 @@ X0 = np.zeros(10)
 X0[6:10] = 5.0
 U = np.full(4, 0.3)
 NAMES = ['fault_plant_base', 'fault_plant_idle', 'fault_plant_jam', 'fault_plant_sag', 'fault_plant_zone',
-         'fault_plant_zone_half', 'fault_plant_all3']
+         'fault_plant_zone_half', 'fault_plant_all3', 'fault_plant_body']
 FAULTS = {'fault_plant_idle': ['wheel_jam'], 'fault_plant_jam': ['wheel_jam'], 'fault_plant_sag': ['batt_sag'],
           'fault_plant_zone': ['mu_zone'], 'fault_plant_zone_half': ['mu_zone'],
-          'fault_plant_all3': ['wheel_jam', 'batt_sag', 'mu_zone']}
+          'fault_plant_all3': ['wheel_jam', 'batt_sag', 'mu_zone'], 'fault_plant_body': ['body_drag', 'load_dist']}
 ZONE = ('fault_plant_zone', 'fault_plant_zone_half', 'fault_plant_all3')
 
 
@@ -50,9 +50,9 @@ def rec(plant):
 
 def test_names_and_the_row_of_each_variant():
     vs = pt.fault_plant_variants(10, X0, U)
-    assert [v[0] for v in vs] == NAMES
-    assert vs[0][2] is None
-    for name, _, plant in vs[1:]:
+    assert [v[0] for v in vs] == NAMES + ['fault_plant_base_moving']
+    assert vs[0][2] is None and vs[-1][2] is None
+    for name, _, plant in vs[1:-1]:
         assert [r.fault for r in plant._p.schedule.rows] == FAULTS[name], name
 
 
@@ -84,6 +84,32 @@ def test_every_timed_call_is_inside_the_window_and_recorded():
     # zone_half: the left wheels (FL, RL) in the zone at every call, the right ones out: max(mu_hd) nominal
     assert np.all(h['mu_fl'] == 0.2) and np.all(h['mu_rl'] == 0.2)
     assert np.all(h['mu_fr'] == nom.mu_hd[1]) and np.all(h['mu_rr'] == nom.mu_hd[3])
+    # body (s14): drag on (the body moving at BODY_VX), the load F(k) of the step, no parameter changed
+    b = rec(v['fault_plant_body'][1])
+    rows = v['fault_plant_body'][1]._p.schedule.rows
+    want = fault_plant.dist_value(rows[1], pt.FAULT_PLANT_STEP, fault_plant.dist_noise(rows[1]))
+    assert np.all(b['vx'] == pt.BODY_VX) and np.all(b['vy'] == 0.0)
+    assert np.all(b['f_drag'] == 3.3) and np.all(b['f_dist'] == want) and want != 0.0
+    assert np.all(b['V_batt'] == nom.V_batt) and np.all(b['b_fl'] == nom.motor_b[0]) and np.all(b['mu_fl'] == nom.mu_hd[0])
+    for name in NAMES[2:-1]:
+        r = rec(v[name][1])
+        assert np.all(r['f_drag'] == 0.0) and np.all(r['f_dist'] == 0.0), name
+
+
+def test_body_variant_steps_with_the_force():
+    """s14: the body variant is one traction step from x with vx = BODY_VX and the force on: it differs from the
+    same step without the force (MecanumPlant alone from that state)."""
+    from mecanum_plant import MecanumPlant
+    v, _ = run(5)
+    got = np.array(v['fault_plant_body'][0]())
+    x = X0.copy()
+    x[3] = pt.BODY_VX
+    pl = MecanumPlant(params=MecanumParams(), dt=0.001, seed=0)
+    pl.reset(list(x))
+    plain = np.array(pl.step(list(U)))
+    assert not np.array_equal(got, plain)
+    assert np.array_equal(np.array(v['fault_plant_base_moving'][0]()), plain)    # FS1-6: its no-force reference
+    assert got[3] < plain[3]                    # the drag (and the load along +y) slow the body along +x
 
 
 def test_idle_is_the_nominal_path_and_faults_change_the_plant():
@@ -131,7 +157,7 @@ def test_window_and_record_sized_for_the_timed_calls():
     # checked with n = 40 above), else the later timed calls would leave the fault path or overflow
     for n in (1, 20000):
         vs = pt.fault_plant_variants(n, X0, U)
-        for name, _, plant in vs[2:]:
+        for name, _, plant in vs[2:-1]:
             assert len(plant._rec) >= pt.WARMUP + n, name
             assert all(r.end_ms > pt.FAULT_PLANT_STEP + pt.WARMUP + n - 1 for r in plant._p.schedule.rows)
             assert plant._act.plant_on, name

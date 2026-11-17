@@ -4,7 +4,10 @@
 Design: 03_CODE/docs/2026-11-15_Thiet_ke_CODE_C13_v1.md (sections 1-4, 10; approved by Liam 15/11, CODE_C13 local_8feba1cc:
 "Ghim high", "Mỗi file một dòng", "Duyệt, code sau C8", "Duyệt, sửa luôn STRA_A"; code now: Liam 16/11, CODE_C13
 local_0fc6525a "giờ làm cái này trước đi"). S05 §2.1, §2.5, §2.6 rule 5. Codex Sol round 1 (01a1e3b7) SA-1..SA-23,
-Liam 16/11 "sửa hết + vòng 2".
+Liam 16/11 "sửa hết + vòng 2". S03 v8.4 / S05 v3.41 (CODE_FEAS 17/11, Liam "Code + Codex 2 vòng"; design
+03_CODE/docs/2026-11-17_Thiet_ke_S03_v84_kiem_ngoai_mien_v1.md section 3): mien takes the original grid up to b (the
+extension points luoi noi are not in the A domain) and needs kiem_ngoai_mien.csv 'đã kiểm đủ' for both controllers
+with no point 'cờ'.
 
   python tools/chep_luot_A.py luot   --run-uid S:I --tuning-log F --freeze F --esp32 F --score F --rows F
                                      --frames F --track F [--segments F] [--ghi-chu-file F | --ghi-chu TEXT] [--thay]
@@ -79,7 +82,15 @@ OMEGA_O = ('omega_o_xy', 'omega_o_wz')
 OMEGA_O_MAX = 48.0
 DEFAULT_ROWS = ('(default check)', '(default)')
 LUOI = ('log', 'mac_dinh', '0', 'noi')
-LEVEL_COLS = ('a', 'b', 'b_n', 'L_nguon', 'H_nguon')        # S03 v8.3 §3.1 (CODE_FEAS 15/11)
+LEVEL_COLS = ('a', 'b', 'L_nguon', 'H_nguon')               # S03 v8.3/v8.4 §3.1 (CODE_FEAS); b_n not needed (v8.4)
+# S03 v8.4 §3.1, S05 v3.41 §2.5 (CODE_FEAS 17/11, design 03_CODE/docs/2026-11-17_Thiet_ke_S03_v84_kiem_ngoai_mien_v1.md
+# section 3): the A domain only from a sweep whose out-of-range check is 'đã kiểm đủ' for both controllers, no 'cờ'
+KIEM_FILE = 'kiem_ngoai_mien.csv'
+KIEM_NEED = ('dong', 'controller', 'factor', 'value', 'can', 'can_value', 'ket_qua', 'n_diem_ngoai', 'n_da_kiem',
+             'n_chua_kiem', 'n_co', 'n_chua_ket_luan', 'n_khong_co')
+KIEM_POINT = ('không cờ', 'chưa kết luận', 'cờ')
+KIEM_TOTAL = ('đã kiểm đủ', 'kiểm dở', 'không kiểm')
+S03_PUBLIC = ('sweep.csv', 'levels.csv', KIEM_FILE, 'meta.yaml')     # opened by mien, hashed in mien_A.json
 GAIN_COL = {'kp_xy': 'g_kp_xy', 'ki_xy': 'g_ki_xy', 'kp_wz': 'g_kp_wz', 'ki_wz': 'g_ki_wz', 'pos_kp': 'g_pos_kp',
             'pos_ki': 'g_pos_ki', 'k_psi': 'g_k_psi', 'omega_c_xy': 'g_wc_xy', 'omega_o_xy': 'g_wo_xy',
             'omega_c_wz': 'g_wc_wz', 'omega_o_wz': 'g_wo_wz'}
@@ -722,9 +733,75 @@ def _f32(x):
     return struct.unpack('f', struct.pack('f', x))[0]
 
 
+def kiem_check(run):
+    """S03 v8.4 §3.1, S05 v3.41 §2.5: kiem_ngoai_mien.csv at the root of the run (by name) has one total row per
+    controller, each 'đã kiểm đủ', and no point 'cờ'; anything else refuses the domain. Returns (point rows, total
+    rows by controller) for kiem_points (S84-5: the rows must match the points outside [L, H] of the sweep)."""
+    rows, cols = read_csv(s03_file(run, KIEM_FILE))
+    miss = [c for c in KIEM_NEED if c not in cols]
+    if miss:
+        raise Refused(f'{KIEM_FILE}: columns missing {miss}')
+    tot, pts, flagged = {}, [], []
+    for r in rows:
+        if r['dong'] == 'tong':
+            if r['controller'] in tot:
+                raise Refused(f'{KIEM_FILE}: two total rows for {r["controller"]}')
+            if r['ket_qua'] not in KIEM_TOTAL:
+                raise Refused(f'{KIEM_FILE}: total {r["ket_qua"]!r} not in {KIEM_TOTAL}')
+            tot[r['controller']] = r
+        elif r['dong'] == 'diem':
+            if r['ket_qua'] not in KIEM_POINT:
+                raise Refused(f'{KIEM_FILE}: result {r["ket_qua"]!r} not in {KIEM_POINT}')
+            if r['ket_qua'] == 'cờ':
+                flagged.append(f'{r["controller"]} {r["factor"]}={r["value"]}')
+            pts.append(r)
+        else:
+            raise Refused(f'{KIEM_FILE}: dong {r["dong"]!r} is not diem or tong')
+    if set(tot) != set(GAINS_S03):
+        raise Refused(f'{KIEM_FILE}: total rows for {sorted(tot)}, need {sorted(GAINS_S03)}')
+    bad = {c: t['ket_qua'] for c, t in tot.items() if t['ket_qua'] != 'đã kiểm đủ'}
+    if bad:
+        raise Refused(f'{KIEM_FILE}: {bad}: the A domain needs a sweep checked in full (S05 v3.41 §2.5)')
+    if flagged:
+        raise Refused(f'{KIEM_FILE}: flagged points {flagged}: Liam decides first (S03 v8.4 §3.1, S05 v3.41 §2.5)')
+    return pts, tot
+
+
+def kiem_points(pts, tot, want):
+    """S84-5: the point rows of kiem_ngoai_mien.csv are exactly the points outside [L, H] found from the public
+    sweep.csv and levels.csv (want: {(controller, factor, value): ('L', L) | ('H', H)}), one row each, on the right
+    side against the right level (S84V2-2: can_value finite and equal to L or H of levels.csv), and the counts of
+    each total row agree with them (nothing checked twice, nothing left out)."""
+    got = {}
+    for r in pts:
+        key = (r['controller'], r['factor'], _f(r['value'], f'{KIEM_FILE} value'))
+        if key in got:
+            raise Refused(f'{KIEM_FILE}: point {key} twice')
+        got[key] = r
+    if set(got) != set(want):
+        raise Refused(f'{KIEM_FILE}: points do not match the sweep outside [L, H]: missing '
+                      f'{sorted(set(want) - set(got))[:5]}, extra {sorted(set(got) - set(want))[:5]}')
+    side = [k for k, (s, _) in want.items() if got[k]['can'] != s]
+    if side:
+        raise Refused(f'{KIEM_FILE}: level compared on the wrong side for {side[:5]}')
+    lvl = [k for k, (_, x) in want.items() if _f(got[k]['can_value'], f'{KIEM_FILE} can_value {k}') != x]
+    if lvl:
+        raise Refused(f'{KIEM_FILE}: can_value is not the L or H of levels.csv for {lvl[:5]}')
+    for c, t in tot.items():
+        res = [got[k]['ket_qua'] for k in got if k[0] == c]
+        need = dict(n_diem_ngoai=len(res), n_da_kiem=len(res), n_chua_kiem=0, n_co=res.count('cờ'),
+                    n_chua_ket_luan=res.count('chưa kết luận'), n_khong_co=res.count('không cờ'))
+        bad = {k: t.get(k) for k, v in need.items() if t.get(k) != str(v)}
+        if bad:
+            raise Refused(f'{KIEM_FILE}: {c} total {bad} do not agree with its {len(res)} point rows')
+
+
 def mien_rows(run):
-    """Opens only sweep.csv, levels.csv, meta.yaml at the root of the run (by name). The A domain per gain."""
+    """Opens only sweep.csv, levels.csv, kiem_ngoai_mien.csv, meta.yaml at the root of the run (by name). The A
+    domain per gain: the ORIGINAL grid of the sweep, up to b (S05 v3.41 §2.5; the extension points, luoi noi, are
+    only for the check of S03 v8.4 §3.1)."""
     s03_run_ok(run)
+    k_pts, k_tot = kiem_check(run)
     sw, scol = read_csv(s03_file(run, 'sweep.csv'))
     lv, lcol = read_csv(s03_file(run, 'levels.csv'))
     miss = [c for c in LEVEL_COLS if c not in lcol] + [c for c in ('luoi',) if c not in scol]
@@ -739,9 +816,13 @@ def mien_rows(run):
         raise Refused(f'controllers {sorted(ctrls)}: need {sorted(GAINS_S03)}')
     for c in GAINS_S03:
         for alias in DEFAULT_ROWS:                                         # SA2-2: either name, each complete
-            dv = sorted(_f(r['v'], 'v') for r in sw if r['controller'] == c and r['factor'] == alias)
-            if dv and dv != speeds:
-                raise Refused(f'{c}: {alias} rows at speeds {dv}, need {speeds} once each')
+            by_mu = {}                   # S84-4: S03 writes the default gains at the middle mu AND at the low, high mu
+            for r in sw:
+                if r['controller'] == c and r['factor'] == alias:
+                    by_mu.setdefault(r.get('mu', ''), []).append(_f(r['v'], 'v'))
+            for mu, dv in by_mu.items():
+                if sorted(dv) != speeds:
+                    raise Refused(f'{c}: {alias} rows at mu {mu!r}: speeds {sorted(dv)}, need {speeds} once each')
         if not any(r['controller'] == c and r['factor'] in DEFAULT_ROWS for r in sw):
             raise Refused(f'{c}: no default check rows')
     lev = {}
@@ -759,7 +840,7 @@ def mien_rows(run):
         if x < 0:
             raise Refused(f'{r["controller"]} {r["factor"]}: value {x} < 0')
         grid.setdefault((r['controller'], r['factor']), {}).setdefault(x, []).append(r)    # SA-16: numeric key
-    out = []
+    out, want = [], {}
     for c in sorted(GAINS_S03):
         fs = {f for (cc, f) in grid if cc == c}
         if fs != GAINS_S03[c]:                                                              # SA-14: exact set
@@ -773,22 +854,27 @@ def mien_rows(run):
             if (c, fac) not in lev:
                 raise Refused(f'{c} {fac}: no row in levels.csv')
             L = lev[(c, fac)]
-            vals = sorted(pts)
+            lab = {}
+            for v, rs in pts.items():                                   # S03 v8.4: one part of the grid per point
+                ls = {r['luoi'] for r in rs}
+                if len(ls) != 1:
+                    raise Refused(f'{c} {fac} = {v}: luoi {sorted(ls)} differs between the rows of one point')
+                lab[v] = ls.pop()
+            vals = sorted(v for v in pts if lab[v] != 'noi')             # the original grid: the A domain
+            noi = sorted(v for v in pts if lab[v] == 'noi')              # the extension: only for the check
+            if not vals:
+                raise Refused(f'{c} {fac}: no point of the original grid')
             lo, hi = vals[0], vals[-1]
             has0 = lo == 0.0
             a_, b_ = _f(L['a'], f'{c} {fac} a'), _f(L['b'], f'{c} {fac} b')
-            bn = _f(L['b_n'], f'{c} {fac} b_n') if L['b_n'] not in ('', None) else None
             if not has0 and lo != a_:
                 raise Refused(f'{c} {fac}: lowest grid point {lo} is not a = {a_}')
-            want_hi = bn if bn is not None else b_
-            if hi != want_hi:
-                raise Refused(f'{c} {fac}: highest grid point {hi} is not {"b_n" if bn is not None else "b"} = {want_hi}')
-            noi_hi = all(r['luoi'] == 'noi' for r in pts[hi])
-            any_noi = any(r['luoi'] == 'noi' for rs in pts.values() for r in rs)
-            if (bn is not None) != any_noi or (bn is not None and not noi_hi):
-                raise Refused(f'{c} {fac}: b_n and luoi = noi points disagree (the end point must be noi)')
+            if hi != b_:                                                 # S05 v3.41 §2.5: hi = b of levels.csv
+                raise Refused(f'{c} {fac}: highest point of the original grid {hi} is not b = {b_}')
+            if any(x <= b_ for x in noi):
+                raise Refused(f'{c} {fac}: an extension point (luoi noi) is not above b = {b_}')
             if fac in OMEGA_O:
-                if bn is not None or any_noi:
+                if noi:
                     raise Refused(f'{c} {fac}: omega_o grid is cut, never extended')
                 if hi > OMEGA_O_MAX or _f32(hi) > OMEGA_O_MAX:
                     raise Refused(f'{c} {fac}: hi {hi!r} > {OMEGA_O_MAX} (binary64 or float32)')
@@ -798,9 +884,13 @@ def mien_rows(run):
                 raise Refused(f'{c} {fac}: default {d} outside [{lo}, {hi}]')
             if not (lo <= Lo <= Hi <= hi):
                 raise Refused(f'{c} {fac}: [L, H] = [{Lo}, {Hi}] not inside [{lo}, {hi}]')
-            src = 'b_n' if bn is not None else ('tran_omega_o' if fac in OMEGA_O and hi == OMEGA_O_MAX else 'b')
+            src = 'tran_omega_o' if fac in OMEGA_O and hi == OMEGA_O_MAX else 'b'
             out.append(dict(controller_s03=c, controller=CTRL_MAP[c], gain=fac, lo=repr(lo), hi=repr(hi),
                             n_diem=str(len(vals)), co_diem_0='true' if has0 else 'false', nguon_hi=src))
+            for x in pts:                                      # S84-5: every point (original or extension) outside
+                if x < Lo or x > Hi:                           # [L, H] must have its row in kiem_ngoai_mien.csv
+                    want[(c, fac, x)] = ('L', Lo) if x < Lo else ('H', Hi)    # S84V2-2: side and level value
+    kiem_points(k_pts, k_tot, want)
     return out
 
 
@@ -821,9 +911,9 @@ def mien(a):
     body = _mien_csv_bytes(out_rows)
     info = dict(s03_run=rel_thesis(run), s03_commit=(m.get('script') or {}).get('commit', ''),
                 s03_date=str(m.get('date', '')),
-                sha256={n: sha256(os.path.join(run, n)) for n in ('sweep.csv', 'levels.csv', 'meta.yaml')},
+                sha256={n: sha256(os.path.join(run, n)) for n in S03_PUBLIC},
                 mien_A_csv_sha256=sha256_bytes(body), script=script_commit(),
-                luc_tinh=now().isoformat(timespec='seconds'), spec='S05 v3.29 §2.5, S03 v8.3 §3.1')
+                luc_tinh=now().isoformat(timespec='seconds'), spec='S05 v3.41 §2.5, S03 v8.4 §3.1')
     js_body = json.dumps(info, ensure_ascii=False, indent=1).encode('utf-8')
     os.makedirs(a.out, exist_ok=True)
     pair = [(os.path.join(a.out, 'mien_A.csv'), body), (os.path.join(a.out, 'mien_A.json'), js_body)]
@@ -1166,7 +1256,7 @@ def kiem_c13(a):
         run = os.path.join(THESIS, js['s03_run'])                         # SA-20: from the S03 run, not the JSON
         rows_again = mien_rows(run)                                        # SA4-2: files checked before any hash
         m = s03_run_ok(run)
-        src = all(sha256(os.path.join(run, n)) == js['sha256'][n] for n in ('sweep.csv', 'levels.csv', 'meta.yaml'))
+        src = all(sha256(os.path.join(run, n)) == js['sha256'][n] for n in S03_PUBLIC)    # v8.4: the check file too
         with open(a.mien_a, 'rb') as f:
             again = _mien_csv_bytes(rows_again) == f.read().replace(b'\r\n', b'\n')
         same = os.path.isfile(mp) and sha256(mp) == sha256(a.mien_a)

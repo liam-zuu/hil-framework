@@ -31,7 +31,7 @@ def ds(tmp_path, monkeypatch):
 
 def _open(d, clock, platform='HW', stage='screen'):
     rl.begin(d, 'S', 'A-PID', platform, 'PID', 'O1-F05', '0.5', stage,
-             gain_set='A-PID/G1' if platform == 'HIL' or stage == 'final' else '')
+             gain_set='A-PID/G1')
     rl.step(d, 'run')
     clock[0] += dt.timedelta(seconds=60)
 
@@ -110,7 +110,7 @@ def test_next_iter_no_counts_the_open_run_of_the_same_session(ds):
     """S05 v3.15 Codex round 5 P3 (DEFERRED there; Liam 14/11 CODE_R134 "Lam cung goi (Recommended)"):
     begin(session='MACHINE') then machine gave two MACHINE:1."""
     d, clock = ds
-    rl.begin(d, 'MACHINE', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen')
+    rl.begin(d, 'MACHINE', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G1')
     assert rl.next_iter_no(d, 'MACHINE') == 2 and rl.next_iter_no(d, 'OTHER') == 1
     m = rl.machine(d, 'A-PID', 'PID', 'X', 'r', 1, 10, '2026-11-20T09:00:00', '2026-11-20T09:01:00')
     rl.step(d, 'run')
@@ -219,7 +219,7 @@ def test_b81_1_summary_refuses_a_judged_car_row_without_gate_columns(ds):
                                                     ('HIL', 'final_hil', True), ('HIL', 'hil_check', False)])
 def test_b81_2_end_and_summary_need_both_boots(ds, platform, stage, needed):
     d, clock = ds
-    campaign, gs = {('HW', 'screen'): ('A-PID', ''), ('HW', 'final'): ('A-PID', 'A-PID/G0'),
+    campaign, gs = {('HW', 'screen'): ('A-PID', 'A-PID/G1'), ('HW', 'final'): ('A-PID', 'A-PID/G0'),
                     ('HIL', 'final_hil'): ('RQ2', 'RQ2-INIT-PID/G0'), ('HIL', 'hil_check'): ('B-PID', 'B-PID/GA1')}[
         (platform, stage)]
     rl.begin(d, 'S', campaign, platform, 'PID', 'O1-F05', '0.5', stage, gain_set=gs)

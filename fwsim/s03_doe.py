@@ -61,6 +61,15 @@ r = (b/a)^(1/10), K the smallest with r^K >= 10 (1 - 1e-9); omega_o is not exten
 b_n, L_nguon, H_nguon (source of each level); sweep.csv adds luoi (log | mac_dinh | 0 | noi); meta.yaml
 records the grid per gain.
 
+S03 v8.4 (Liam 17/11, THESIS_SLIDE local_44e97934 "sua tat ca cho nao ban thay di"; script: Liam 17/11
+CODE_FEAS local_1557d33f "Code + Codex 2 vong", design 03_CODE/docs/2026-11-17_Thiet_ke_S03_v84_kiem_ngoai_mien_v1.md):
+the extension still runs with the sweep but only for a check. The level rule runs on the ORIGINAL grid (11 log
+points, the default, 0); H_nguon 'hết lưới' (H = b), 'trần ω_o' first for omega_o at 48. The out-of-range check
+(out_of_range_check) puts every original or extension point outside [L, H] against the run at the nearer level,
+middle mu, gate speeds, in the order of section 3.1 (không cờ / chưa kết luận / cờ / không cờ), writes
+kiem_ngoai_mien.csv (one row per point, one total row per controller: đã kiểm đủ / kiểm dở / không kiểm) and
+stops S03 before the main design when a point is 'cờ' (Liam decides).
+
 L56 / S03 v6 section 1: the main design results (runs.csv, effects.csv and the tables of
 section 5) are NOT looked at before campaign A ends. Nothing derived from them leaves
 sealed/ (Codex S3C-1..S3C-3): no hash of a sealed file outside it, no child-process job file
@@ -161,7 +170,12 @@ PLANNED_RUNS = dict(centre=9, outer=1152, inner=1152, axial=126, test=300)   # p
 
 
 class S03Stop(Exception):
-    """A stop the spec orders (3.1 (i), (ii); 3.4; B8b-20): report, do not go on."""
+    """A stop the spec orders (3.1 (i), (ii); 3.4; B8b-20): report, do not go on. case = '(i)' or '(ii)' for the
+    two cases of section 3.1 (S03 v8.4: the out-of-range check is then 'không kiểm'), None for the others."""
+
+    def __init__(self, msg, case=None):
+        super().__init__(msg)
+        self.case = case
 
 
 # ── gains and one run ────────────────────────────────────────────────────────────────
@@ -322,20 +336,29 @@ def grid_label(x, default, noi):
 
 
 L_SOURCES = ('0', 'hết lưới dưới', 'điểm kế tiếp không hoàn thành')
-H_SOURCES = ('hết lưới nối', 'trần ω_o', 'điểm kế tiếp không hoàn thành')
+H_SOURCES = ('hết lưới', 'trần ω_o', 'điểm kế tiếp không hoàn thành')     # S03 v8.4 ('hết lưới nối' of v8.3 gone)
 
 
-def level_sources(grid, L, H, info, name):
-    """(L_nguon, H_nguon) of S03 v8.3 section 3.1. H at the top of an omega_o grid (no extension): 'trần ω_o'
-    (interpretation agreed with CODE_C13 15/11)."""
+def base_grid(grid, info):
+    """The original grid of S03 v8.4 section 3.1 (11 log points, the default, 0): the grid of sweep_grid_n
+    without its extension points, which come last."""
+    base = grid[:len(grid) - info['n_noi']]
+    if info['n_noi'] and not base[-1] < grid[len(base)]:
+        raise S03Stop('the extension points are not after the original grid')
+    return base
+
+
+def level_sources(base, L, H, info, name):
+    """(L_nguon, H_nguon) of S03 v8.4 section 3.1 on the ORIGINAL grid base: H = b is 'trần ω_o' for omega_o when
+    b = 48 (the label comes first), else 'hết lưới'."""
     if L == 0.0:
         ls = '0'
-    elif L == grid[0]:
+    elif L == base[0]:
         ls = 'hết lưới dưới'
     else:
         ls = 'điểm kế tiếp không hoàn thành'
-    if H == grid[-1]:
-        hs = 'hết lưới nối' if info['K'] else 'trần ω_o'      # K = 0 only for omega_o (sweep_grid_n)
+    if H == base[-1]:
+        hs = 'trần ω_o' if name.startswith('omega_o') and info['b'] == OMEGA_O_MAX else 'hết lưới'
     else:
         hs = 'điểm kế tiếp không hoàn thành'
     return ls, hs
@@ -346,7 +369,7 @@ def levels_from_sweep(grid, default, ok):
     which ok[i] (completes at every gate speed). Raises S03Stop for case (i)."""
     i0 = grid.index(default)
     if not ok[i0]:
-        raise S03Stop('default gains do not complete at a gate speed (S03 3.1 (i))')
+        raise S03Stop('default gains do not complete at a gate speed (S03 3.1 (i))', case='(i)')
     lo = hi = i0
     while lo - 1 >= 0 and ok[lo - 1]:
         lo -= 1
@@ -370,6 +393,156 @@ def decode(code, L, H, scale):
     if scale == 'log':
         return math.sqrt(L * H) * (H / L) ** (code / 2.0)
     return (L + H) / 2.0 + code * (H - L) / 2.0
+
+
+# ── 3.1 out-of-range check (S03 v8.4, C14-2) ─────────────────────────────────────────
+
+KIEM_POINT = ('không cờ', 'chưa kết luận', 'cờ')
+KIEM_TOTAL = ('đã kiểm đủ', 'kiểm dở', 'không kiểm')
+KIEM_SPEED = ('trong_cong', 'y1_diem', 'status_diem', 'e_diem', 'tv_diem', 'y1_can', 'status_can', 'e_can', 'tv_can',
+              'nguong_tv')
+KIEM_COUNTS = ('n_diem_ngoai', 'n_da_kiem', 'n_chua_kiem', 'n_co', 'n_chua_ket_luan', 'n_khong_co', 'n_bao_rieng',
+               'n_gain_chua_kiem')
+KIEM_COLS = (['dong', 'controller', 'factor', 'value', 'luoi', 'can', 'can_value', 'ket_qua', 'buoc', 'bao_rieng']
+             + [f'{k}_v{v}' for v in SPEEDS for k in KIEM_SPEED] + list(KIEM_COUNTS) + ['ghi_chu'])
+
+
+def _num(r, k):
+    try:
+        x = float(r.get(k))
+    except (TypeError, ValueError):
+        return float('nan')
+    return x
+
+
+def comparable(r):
+    """A run that can be compared (S03 v8.4 section 3.1): it exists, completes ('true'), status 'ok' (no
+    track_err, no run_error, so Y2 carries no inconclusive flag), and its e_perp_max, tv_duty are finite
+    (a non-finite value is not comparable: interpretation)."""
+    return (r is not None and r.get('completed') == 'true' and r.get('status') == 'ok'
+            and math.isfinite(_num(r, 'e_perp_max')) and math.isfinite(_num(r, 'tv_duty')))
+
+
+def exact(x):
+    """S84-1, S84V2-1, S84V3-1: the bounds of S03 v8.4 3.1 are inclusive and compared exactly, with no tolerance, on
+    the decimal of each number as written in the CSV files (S03 writes a float as repr, the shortest decimal that
+    reads back to the same binary64): 0.03 - 0.02 is 0.01 (binary64 subtraction gives 0.009999999999999998), two
+    identical responses are never lower by a positive threshold, a point a few ULP past a bound is past it. A
+    Fraction is already exact."""
+    return x if isinstance(x, Fraction) else Fraction(repr(float(x)))
+
+
+def not_above_by(x, ref, thr):
+    """x - ref <= thr ('x not higher than ref by more than thr'), exactly (see exact)."""
+    return exact(x) - exact(ref) <= exact(thr)
+
+
+def lower_by_at_least(x, ref, thr):
+    """ref - x >= thr ('x lower than ref by at least thr'), exactly (see exact)."""
+    return exact(ref) - exact(x) >= exact(thr)
+
+
+def y3_threshold(ref):
+    """S84V3-1: the Y3 threshold of the check, Y3_REL x tv_duty of the default-gain run (section 5.2), exactly
+    (0.2 x 0.9 is 0.18; the binary64 product is 0.18000000000000002). A non-finite tv_duty gives a non-finite
+    threshold (the point is inconclusive, step 2)."""
+    return exact(Y3_REL) * exact(ref) if math.isfinite(ref) else Y3_REL * ref
+
+
+def classify_point(pt, bd, gate, thr):
+    """S03 v8.4 section 3.1: one point outside [L, H] against the run at the nearer level. pt, bd: {v: sweep row
+    or None} of the point and of the level, middle mu; gate: speeds still in the gate; thr: {v: Y3 threshold}.
+    Steps in order, the first that matches: 1 'không cờ' (at one gate speed the point has y1 'false' with
+    status 'ok'), 2 'chưa kết luận' (at one gate speed the point or the level is not comparable; a non-finite Y3
+    threshold too), 3 'cờ' (at every gate speed e_pt - e_lvl <= 0.01 m and tv_pt - tv_lvl <= thr; at one,
+    e_lvl - e_pt >= 0.01 m or, thr > 0, tv_lvl - tv_pt >= thr), 4 'không cờ'. Returns (result, step, bao_rieng):
+    bao_rieng = not 'cờ' and, at one gate speed where both are comparable, e_lvl - e_pt >= 0.01 m."""
+    e_thr = THRESH['e_perp_max']
+    if any(pt.get(v) is not None and pt[v].get('completed') == 'false' and pt[v].get('status') == 'ok' for v in gate):
+        res, step = 'không cờ', 1
+    elif any(not comparable(pt.get(v)) or not comparable(bd.get(v)) or not math.isfinite(thr[v]) for v in gate):
+        res, step = 'chưa kết luận', 2
+    else:
+        e = {v: (_num(pt[v], 'e_perp_max'), _num(bd[v], 'e_perp_max')) for v in gate}
+        tv = {v: (_num(pt[v], 'tv_duty'), _num(bd[v], 'tv_duty')) for v in gate}
+        not_worse = all(not_above_by(*e[v], e_thr) and not_above_by(*tv[v], thr[v]) for v in gate)
+        better = any(lower_by_at_least(*e[v], e_thr) or (thr[v] > 0 and lower_by_at_least(*tv[v], thr[v]))
+                     for v in gate)
+        res, step = ('cờ', 3) if (not_worse and better) else ('không cờ', 4)
+    bao = res != 'cờ' and any(comparable(pt.get(v)) and comparable(bd.get(v))
+                              and lower_by_at_least(_num(pt[v], 'e_perp_max'), _num(bd[v], 'e_perp_max'), e_thr)
+                              for v in gate)
+    return res, step, bao
+
+
+def out_of_range_check(sweep_rows, levels, grids, defaults_by, controllers, gate, mu_mid, y3_ref, stop_case):
+    """S03 v8.4 section 3.1 'Kiểm ngoài miền'. levels: {ctrl: {factor: (L, H, scale)}} (factors whose level rule
+    ran); grids: {(ctrl, factor): (grid, info)} of sweep_grid_n (original + extension); defaults_by: {ctrl:
+    {factor: default}}; stop_case: '(i)' / '(ii)' when S03 stopped there (then 'không kiểm' for every controller).
+    A controller is 'đã kiểm đủ' when every factor has levels (every point outside them gets a result), else
+    'kiểm dở' (the sweep stopped part way): the factors with levels are checked, every grid point of a factor
+    without levels counts as not checked (which of them would be outside is not known). Returns (rows for
+    kiem_ngoai_mien.csv: the points, then one total row per controller; summary {ctrl: ...})."""
+    idx = {}
+    for r in sweep_rows:
+        if r.get('factor') in FACTORS.get(r.get('controller'), ()) and r.get('mu') == mu_mid:
+            idx[(r['controller'], r['factor'], r['value'], r['v'])] = r
+    rows, totals, summary = [], [], {}
+    for ctrl in controllers:
+        n = dict.fromkeys(KIEM_COUNTS, 0)
+        lists = dict(co=[], chua_ket_luan=[], bao_rieng=[])
+        notes = []
+        if stop_case in ('(i)', '(ii)'):
+            total = 'không kiểm'
+            notes.append(f'S03 stopped at 3.1 {stop_case}')
+        else:
+            for name in FACTORS[ctrl]:
+                lv = levels.get(ctrl, {}).get(name)
+                if lv is None:
+                    n['n_gain_chua_kiem'] += 1
+                    if (ctrl, name) in grids:
+                        n['n_chua_kiem'] += len(grids[(ctrl, name)][0])
+                    else:
+                        notes.append(f'{name}: grid not known')
+                    continue
+                L, H = lv[0], lv[1]
+                grid, info = grids[(ctrl, name)]
+                dflt = defaults_by[ctrl][name]
+                thr = {v: y3_threshold(y3_ref[(ctrl, v)]) if (ctrl, v) in y3_ref else float('nan') for v in SPEEDS}
+                for x in grid:
+                    if L <= x <= H:
+                        continue
+                    side, lvl = ('L', L) if x < L else ('H', H)
+                    pt = {v: idx.get((ctrl, name, x, v)) for v in SPEEDS}
+                    bd = {v: idx.get((ctrl, name, lvl, v)) for v in SPEEDS}
+                    res, step, bao = classify_point(pt, bd, gate, thr)
+                    row = dict(dong='diem', controller=ctrl, factor=name, value=x,
+                               luoi=grid_label(x, dflt, info['noi']), can=side, can_value=lvl, ket_qua=res,
+                               buoc=step, bao_rieng=bao)
+                    for v in SPEEDS:
+                        p, b = pt[v] or {}, bd[v] or {}
+                        row.update({f'trong_cong_v{v}': v in gate,
+                                    f'y1_diem_v{v}': p.get('completed', ''), f'status_diem_v{v}': p.get('status', ''),
+                                    f'e_diem_v{v}': p.get('e_perp_max', ''), f'tv_diem_v{v}': p.get('tv_duty', ''),
+                                    f'y1_can_v{v}': b.get('completed', ''), f'status_can_v{v}': b.get('status', ''),
+                                    f'e_can_v{v}': b.get('e_perp_max', ''), f'tv_can_v{v}': b.get('tv_duty', ''),
+                                    f'nguong_tv_v{v}': float(thr[v])})      # CSV: the threshold as a float
+                    rows.append(row)
+                    n['n_diem_ngoai'] += 1
+                    n['n_da_kiem'] += 1
+                    n[{'cờ': 'n_co', 'chưa kết luận': 'n_chua_ket_luan', 'không cờ': 'n_khong_co'}[res]] += 1
+                    tag = f'{name}={x!r}'
+                    if res == 'cờ':
+                        lists['co'].append(tag)
+                    elif res == 'chưa kết luận':
+                        lists['chua_ket_luan'].append(tag)
+                    if bao:
+                        n['n_bao_rieng'] += 1
+                        lists['bao_rieng'].append(tag)
+            total = 'đã kiểm đủ' if n['n_gain_chua_kiem'] == 0 else 'kiểm dở'
+        totals.append(dict(dong='tong', controller=ctrl, ket_qua=total, **n, ghi_chu='; '.join(notes)))
+        summary[ctrl] = dict(ket_qua=total, **n, **lists)
+    return rows + totals, summary
 
 
 # ── 3.2 design ───────────────────────────────────────────────────────────────────────
@@ -977,6 +1150,10 @@ def main():
     eff_rows, curv_rows, ver_rows, fail_rows, det_rows = [], [], [], [], []
     y3_ref, rerun_notes, inner_rule, no_concl = {}, [], {}, {}
     grid_info = {}                                    # S03 v8.3: (controller, factor) -> sweep_grid_n info
+    grids = {}                                        # S03 v8.4: (controller, factor) -> (grid, info) for the check
+    levels, dflts = {}, {}
+    stop_case = None                                  # S03 v8.4: '(i)' / '(ii)' when the sweep stopped there
+    kiem_rows, kiem_sum = [], {}
     stop_public, stop_sealed = None, None
     t_sweep_end = None
     tp_info = None                                    # S3V8-3: set when the test file is read (once)
@@ -1008,7 +1185,6 @@ def main():
 
     try:
         # 3.1 (i) first, for every controller, so S03 stops before any sweep (S3C-9)
-        dflts = {}
         for ctrl in a.controllers:
             dflts[ctrl] = defaults(fw, ctrl)
             for v in SPEEDS:
@@ -1020,16 +1196,21 @@ def main():
                     save_log(os.path.join(a.out, 'logs_sweep'), f'{ctrl}_default_check_v{v}', log)
                 if v in gate and row['completed'] != 'true':
                     raise S03Stop(f'{ctrl}: default gains do not complete at gate speed {v} (y1 '
-                                  f'{row["completed"]}, S03 3.1 (i))')
+                                  f'{row["completed"]}, S03 3.1 (i))', case='(i)')
+        # S03 v8.4: every grid is known before the first sweep run, so a sweep that stops part way can count
+        # the points it did not check (kiem_ngoai_mien.csv 'kiểm dở')
+        for ctrl in a.controllers:
+            lo_b, hi_b = tune_ga.BOUNDS[ctrl]
+            for j, name in enumerate(FACTORS[ctrl]):
+                grids[(ctrl, name)] = sweep_grid_n(name, dflts[ctrl][name], lo_b[j], hi_b[j])   # with the extension
+                grid_info[(ctrl, name)] = grids[(ctrl, name)][1]
         # 3.1 sweep and levels, every controller (S3C-9: a stop ends S03)
-        levels = {}
         for ctrl in a.controllers:
             dflt = dflts[ctrl]
-            lo_b, hi_b = tune_ga.BOUNDS[ctrl]
             levels[ctrl] = {}
             for j, name in enumerate(FACTORS[ctrl]):
-                grid, ginfo = sweep_grid_n(name, dflt[name], lo_b[j], hi_b[j])     # S03 v8.3: with the extension
-                grid_info[(ctrl, name)] = ginfo
+                grid, ginfo = grids[(ctrl, name)]
+                base = base_grid(grid, ginfo)                  # S03 v8.4: the level rule runs on it only
                 ok = []
                 for x in grid:
                     g = dict(dflt, **{name: x})
@@ -1048,21 +1229,21 @@ def main():
                     ok.append(done)
                     print(f'[sweep {ctrl}] {name} = {x:.4g}: completes at gate speeds = {done}', flush=True)
                 try:
-                    L, H = levels_from_sweep(grid, dflt[name], ok)
+                    L, H = levels_from_sweep(base, dflt[name], ok[:len(base)])    # S03 v8.4: original grid only
                 except S03Stop as exc:
-                    raise S03Stop(f'{ctrl} {name}: {exc}') from None
+                    raise S03Stop(f'{ctrl} {name}: {exc}', case=exc.case) from None
                 sc, centre = scale_of(L, H)
                 levels[ctrl][name] = (L, H, sc)
-                l_src, h_src = level_sources(grid, L, H, ginfo, name)          # S03 v8.3
+                l_src, h_src = level_sources(base, L, H, ginfo, name)          # S03 v8.4
                 level_rows.append(dict(controller=ctrl, factor=name, L=L, H=H, centre=centre, scale=sc,
-                                       default=dflt[name], rule_note='longest completing run of the grid with the '
-                                       'default, gate speeds ' + ' '.join(map(str, gate)),
+                                       default=dflt[name], rule_note='longest completing run of the original grid '
+                                       'with the default, gate speeds ' + ' '.join(map(str, gate)),
                                        a=ginfo['a'], b=ginfo['b'], b_n='' if ginfo['b_n'] is None else ginfo['b_n'],
                                        L_nguon=l_src, H_nguon=h_src))
                 print(f'[levels {ctrl}] {name}: L={L:.4g} H={H:.4g} scale={sc}', flush=True)
             same = [n for n, (L, H, _) in levels[ctrl].items() if L == H]
             if same:
-                raise S03Stop(f'{ctrl}: L = H for {same} (S03 3.1 (ii)): Liam decides, no main design')
+                raise S03Stop(f'{ctrl}: L = H for {same} (S03 3.1 (ii)): Liam decides, no main design', case='(ii)')
             for mu in mu_levels:        # default gains at low / high mu too (5.2: reported, not the base)
                 if mu == mu_mid:
                     continue
@@ -1075,7 +1256,29 @@ def main():
         t_sweep_end = time.time()
     except S03Stop as exc:
         stop_public = str(exc)                          # sweep phase: public (S03 3.1 is not sealed)
+        stop_case = exc.case
         print(f'[STOP] {exc}', flush=True)
+
+    # S03 v8.4 section 3.1: the out-of-range check, from the public sweep only, before the main design
+    kiem_rows, kiem_sum = out_of_range_check(sweep_rows, levels, grids, dflts, a.controllers, gate, mu_mid, y3_ref,
+                                             stop_case)
+    for ctrl, s in kiem_sum.items():
+        print(f'[out-of-range check {ctrl}] {s["ket_qua"]}: {s["n_diem_ngoai"]} points outside, cờ {s["n_co"]}, '
+              f'chưa kết luận {s["n_chua_ket_luan"]}, không cờ {s["n_khong_co"]}, not checked {s["n_chua_kiem"]}',
+              flush=True)
+        if s['bao_rieng']:
+            print(f'[out-of-range check {ctrl}] e_perp_max lower by >= 0.01 m at one speed, not flagged: '
+                  f'{" ".join(s["bao_rieng"])}', flush=True)
+    flagged = {c: s['co'] for c, s in kiem_sum.items() if s['co']}
+    if flagged and stop_public is None:
+        stop_public = ('out-of-range check (S03 v8.4 3.1): flagged points ' +
+                       '; '.join(f'{c}: {" ".join(p)}' for c, p in flagged.items()) +
+                       ': Liam decides, no main design')
+        print(f'[STOP] {stop_public}', flush=True)
+    elif not flagged and any(s['chua_ket_luan'] for s in kiem_sum.values()):
+        print('WARNING: out-of-range check has inconclusive points (S03 v8.4 3.1: report to Liam, S03 goes on): ' +
+              '; '.join(f'{c}: {" ".join(s["chua_ket_luan"])}' for c, s in kiem_sum.items() if s['chua_ket_luan']),
+              flush=True)
 
     plan = {}
     if stop_public is None:
@@ -1288,9 +1491,10 @@ def main():
     # public outputs: sweep only (S03 3.1 is a source of campaign A's domain) and the design points
     files = {}
     for name, rows in (('sweep.csv', sweep_rows), ('sweep_counts.csv', sweep_counts(sweep_rows)),
-                       ('levels.csv', level_rows), ('design.csv', design_rows)):
+                       ('levels.csv', level_rows), ('kiem_ngoai_mien.csv', kiem_rows), ('design.csv', design_rows)):
         p = os.path.join(a.out, name)
-        cols = LEVEL_COLS if name == 'levels.csv' else None     # S83-1: the header even when S03 stops early
+        cols = (LEVEL_COLS if name == 'levels.csv' else      # S83-1: the header even when S03 stops early
+                KIEM_COLS if name == 'kiem_ngoai_mien.csv' else None)   # S03 v8.4: fixed header too
         if name == 'sweep.csv':     # S3G-2, S3G2-3: one fixed header (identifiers, run columns), other keys after
             cols = list(dict.fromkeys(list(SWEEP_ID_COLS) + RUN_COLS[5:] + [k for r in rows for k in r]))
         write_csv(p, rows, cols)
@@ -1319,7 +1523,7 @@ def main():
     tp_meta = tp_info if tp_info is not None else dict(file=_rel_here(a.test_points),
                                                          read='no (S03 stopped before the test file was read)')
     with open(os.path.join(a.out, 'meta.yaml'), 'w', encoding='utf-8') as f:
-        f.write(f"""spec: S03 v8.3 (06_SPECS/2026-11-05_Spec_S03_DOE_chon_gain.md)
+        f.write(f"""spec: S03 v8.4 (06_SPECS/2026-11-05_Spec_S03_DOE_chon_gain.md)
 date: {time.strftime('%Y-%m-%d')}
 setup: sim                     # fwsim: ESP32 firmware C code (DLL) + rpi5/plant_step.py, NOT hardware
 operator: Claude (phiên CODE)
@@ -1352,6 +1556,7 @@ thresholds: {json.dumps(dict(THRESH, tv_duty=f'{Y3_REL:.0%} of the default-gain 
 y3_reference: {json.dumps({f'{c} v={v}': y for (c, v), y in y3_ref.items()})}
 o1: {json.dumps(dict(A=o1.A, a_r=o1.A_R, D=o1.D, D_d=o1.D, t_d=o1.T_D, t_late=o1.T_LATE, delta=o1.DELTA, v_d=o1.V_D, c_cens=o1.C_CENS))}
 grid: {json.dumps({f'{c} {n}': {k: v_ for k, v_ in i.items() if k != 'noi'} for (c, n), i in grid_info.items()})}   # S03 v8.3 section 3.1: a, b, r, K, b_n (extension end; null for omega_o), points per gain
+kiem_ngoai_mien: {json.dumps(kiem_sum, ensure_ascii=False)}   # S03 v8.4 section 3.1: total per controller (đã kiểm đủ / kiểm dở / không kiểm), counts, flagged (co), inconclusive (chua_ket_luan) and bao_rieng points; detail in kiem_ngoai_mien.csv
 gate: {json.dumps(gate_meta())}   # S03 v8.2 section 7: G1-G5 per run (o1_gate.gate), U = 0 on fwsim
 evaluator_sha256: {json.dumps(EVAL_SHA_AT_IMPORT)}   # S03 v8.2 section 8 condition 8: S03 and S04 on the same evaluator; the files as hashed when the script was imported (S3G-1, S3G2-1)
 sweep_run_error_reruns: {json.dumps([n for n in rerun_notes if n['point'] is None], default=str)}
@@ -1377,15 +1582,18 @@ interpretations:   # of this script, not written in S03 v8 / O1 v7; Liam or THES
   - "v8.2: G1-G5 columns use the names of tools/rq3_log.py GATE_COLS (B81-3); gate_json_sha256 is not written; gate_outcome is the O1 3.5 outcome over G1-G5; with U = 0, lo = hi = q"
   - "v8.2: a failure of the gate scoring (e.g. the rebuilt nearest distance of G4 not the row e_perp) is a run_error, so S03 stops (B8b-20) as for a DLL error"
   - "B81-3 (15/11, Liam CODE_FEAS 'code di'): the G1 fields of O1 3.5 last block and the common domain are written (G1_RUN_COLS after gate_outcome): t_done = t_end when completed 'true', t1 = first tracking-error frame, prog_before_t1 = progress strictly before t1, cond25_before_deadline = cond2_5_ever (o1_gate_eval.g1_fields_v7, from the evaluate_v7 summary, which is unchanged); G1 recomputed from them must agree with the state from completed (o1_gate.gate raises, so a run_error); one way of using the frames: g1_ways 1, g1_t_done_2 and g1_cat_t1 empty, _chung the same as the union; gate_version stays gate_v3.2 (tools/rq3_log.py accepts only that version)"
-  - "v8.3: the sweep grid is the v8 grid (sweep_grid, unchanged; C12 keeps it for its box [a, b]) plus b r^k, k = 1..K, r = (b/a)^(1/10), K the smallest integer with r^K >= 10 (1 - 1e-9), found by a loop on r**k; omega_o is not extended (cap 48); the level rule runs on the extended grid"
-  - "v8.3 (agreed with CODE_C13 15/11): luoi of the default value is mac_dinh even when it is on a log point, the (default check) and (default) rows are mac_dinh; H_nguon of omega_o at the top of its grid is 'trần ω_o'; L_nguon 'hết lưới dưới' when L is the lowest grid point and L > 0"
+  - "v8.3: the sweep grid is the v8 grid (sweep_grid, unchanged; C12 keeps it for its box [a, b]) plus b r^k, k = 1..K, r = (b/a)^(1/10), K the smallest integer with r^K >= 10 (1 - 1e-9), found by a loop on r**k; omega_o is not extended (cap 48); v8.4: the extension still runs with the sweep, only for the out-of-range check; the level rule runs on the original grid (11 log points, the default, 0)"
+  - "v8.3 (agreed with CODE_C13 15/11): luoi of the default value is mac_dinh even when it is on a log point, the (default check) and (default) rows are mac_dinh; L_nguon 'hết lưới dưới' when L is the lowest grid point and L > 0; v8.4: H_nguon 'hết lưới' when H = b, 'trần ω_o' instead for omega_o when b = 48; levels.csv keeps b_n (the extension end) for reference only"
+  - "v8.4 out-of-range check: a run is comparable when it exists, completed 'true', status 'ok' and its e_perp_max and tv_duty are finite; a point below L is put against the run at L, above H against H; the Y2 threshold is 0.01 m and the Y3 threshold 20 % of the default-gain run at the middle mu, same speed (section 5.2), a non-finite Y3 threshold makes the point inconclusive; the bounds are inclusive and compared exactly, with no tolerance, on the decimal of each number as written in the CSV (repr of the float), the Y3 threshold an exact product (S84-1, S84V2-1, S84V3-1: 0.03 - 0.02 is 0.01, not the binary64 0.009999999999999998; two identical responses never count as lower by a positive threshold; a point a few ULP past a bound is past it; the column nguong_tv holds the threshold as a float); bao_rieng = not flagged and, at one gate speed where both are comparable, e_perp_max lower by >= 0.01 m; buoc is the step of section 3.1 that matched"
+  - "v8.4 out-of-range check totals: 'không kiểm' for every controller when S03 stopped at 3.1 (i) or (ii); 'đã kiểm đủ' when every factor of the controller has levels; else 'kiểm dở' (the sweep stopped part way): factors with levels are checked, every grid point (original and extension) of a factor without levels counts in n_chua_kiem, n_gain_chua_kiem counts those factors; every grid is computed before the first sweep run. A flagged point in any controller stops S03 before design.csv (exit code 2); inconclusive points without a flag are printed as a WARNING and S03 goes on"
   - "v8.2: the public sweep carries the G columns too (Liam 14/11 CODE_FEAS 'Co, mot cach cham'); G3-G5 are not responses of section 5"
 elapsed_s: {sweep_s}
 file_sha256: {json.dumps(files)}
 files:
   - sweep.csv: "one line per sweep run (section 3.1) and default gains at the other mu levels; v8.3: luoi = log | mac_dinh | 0 | noi (the extension)"
   - sweep_counts.csv: "section 5.3 for the sweep: runs not completed, inconclusive, saturated per factor, speed, mu"
-  - levels.csv: "L, H, centre, scale per factor; v8.3: a, b (ends of the 11 log points), b_n (end of the extension, empty for omega_o), L_nguon, H_nguon (source of each level, S03 v8.3 section 3.1)"
+  - levels.csv: "L, H, centre, scale per factor (v8.4: on the original grid); v8.3: a, b (ends of the 11 log points), b_n (end of the extension, empty for omega_o; reference only from v8.4), L_nguon, H_nguon (source of each level, S03 v8.4 section 3.1)"
+  - kiem_ngoai_mien.csv: "S03 v8.4 section 3.1: one row (dong diem) per original or extension point outside [L, H]: luoi, level compared (can L or H, can_value), ket_qua (không cờ / chưa kết luận / cờ), buoc, bao_rieng, per speed: in the gate, y1, status, e_perp_max, tv_duty of the point and of the level, Y3 threshold; one total row (dong tong) per controller: đã kiểm đủ / kiểm dở / không kiểm and counts"
   - design.csv: "371 rows per controller: centre, outer box, inner box, axial points, test points (all run, L41, L67)"
   - logs_sweep/: "npz of the sweep runs not completed"
   - sealed/: "SEALED (L56): runs.csv (section 4 responses; centre, outer, inner, axial), effects.csv (every term, per box, response, speed, mu / worst / range; outer and inner only), curvature.csv (5.4), y2_versions.csv (5.1), fail_counts.csv (5.3), determinism_check.csv (3.4), notes.json, stop.json, manifest.json, logs/"

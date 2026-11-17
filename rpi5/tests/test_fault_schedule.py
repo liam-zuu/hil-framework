@@ -67,8 +67,10 @@ def test_parse_comments_crlf_and_blank_lines():
     HEAD + 'E1,enc_los,FL,1,2,\n',                                       # unknown fault
     HEAD + 'J1,wheel_jam,FL,1,2,b_mult=2\n',                             # unknown parameter of a batch 2 row
     HEAD + 'I1,ibus_loss,ibus,1,2,x=1\n',                                # ibus_loss has no parameter
-    HEAD + 'B1,body_drag,body,1,2,F=3.3\n',                              # later parts of batch 2 are refused
-    HEAD + 'N1,load_dist,body,1,2,\n',
+    HEAD + 'B1,body_drag,body,1,2,\n',                                   # s14: missing F
+    HEAD + 'N1,load_dist,body,1,2,\n',                                   # s14: missing parameters
+    HEAD + 'N1,load_dist,body,1,2,F0=1;rate=0;Fmax=0;sigma=0;seed=1.5;dir_deg=0\n',   # seed not whole
+    HEAD + 'B1,body_drag,body,1,2,F=1;G=2\n',                            # unknown parameter
     HEAD + 'E1,enc_loss,FL,1.5,2,\n',                                    # not whole ms
     HEAD + 'E1,enc_loss,FL,5e3,6000,\n',
     HEAD + 'E1,enc_loss,FL,5_000,6000,\n',

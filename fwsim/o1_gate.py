@@ -45,6 +45,20 @@ publisher is held for the 100 Hz firmware (about 5 ms, an estimate): a property 
 not added to U (dossier 5.2, CG4-6).
 Command maxima (GV3-7): the grid maximum is refined around its peak and raised by a relative margin
 CMD_MARGIN, so the value used is an upper bound of the continuous maximum.
+
+O1 v11.33 (THESIS spec 06_SPECS/2026-11-17_De_xuat_O1_G5_F08_muc_do_duoc_v4.md, Liam 17/11 THESIS "Duyệt, rà vòng 3
+bản khóa (Recommended)"; CODE_GATE design 03_CODE/docs/2026-11-17_Thiet_ke_CODE_GATE_v1.md, Liam 17/11 at CODE_GATE
+"Duyệt, gửi CODE luôn (Recommended)"), version gate_v3.3, only when the caller asks for it (fwsim, S03, S04 call
+gate as before and get the gate_v3.2 dict, number for number):
+  per-frame bounds   U_k(G3) = U_p + U_t V_k, U_k(G5) = U_psi + U_t W_k (O1 lines 315, 317; OG-12, OG-14): V_k, W_k
+                     = sup |dp_cmd/dt|, |dpsi_cmd/dt| over [t_k - U_t, t_k + U_t] (cmd_rate_frames; the reference
+                     holds its end values outside the command, OG2-2; heading rate on the continuous branch,
+                     OG2-9); lo, hi stay the maxima of lo_k, hi_k taken apart (O1 line 301). U = 0: the same numbers.
+  report-only        the conditions of O1 3.9 rule 2b at the run's level, from the C8 gate file (tools/gate_c8.py;
+                     never from the run record, OG2-7): still computed and stored; required = CONDS less them;
+                     decide = required within DECIDE_ALL / DECIDE_HIL; complete = decide is required (O1 line 321);
+                     outcome_decide, any_certain_fail over decide only (so a report-only condition never triggers
+                     the violation-before-a-measurement-fault exception, OG2-3).
 """
 from __future__ import annotations
 
@@ -54,6 +68,7 @@ from typing import Iterable, Optional
 import numpy as np
 
 GATE_VERSION = 'gate_v3.2'              # G1-G5, per-frame lo / hi / n_undef (gate_v3_g1235 before 13/11)
+GATE_VERSION_V1133 = 'gate_v3.3'        # O1 v11.33: per-frame U of G3, G5 and the report-only conditions (CODE_GATE)
 D = 0.10                                # m, O1 3.9 (1); same value as o1_feasibility.D (a test checks)
 THETA_MAX_DEG = 7.5                     # deg, dossier v3 section 2 (US-015 datasheet, author's choice)
 BODY_HALF_LEN = 0.17                    # m, half of 340 mm along the car x axis (O1 3.4, section 6)
@@ -79,8 +94,20 @@ def _finite(x) -> bool:
 
 
 def frame_bounds(q_k, u):
-    """(lo_k, hi_k) = (q_k - u, q_k + u); u None / NaN / negative -> NaN bounds (not known)."""
+    """(lo_k, hi_k) = (q_k - u, q_k + u); u None / NaN / negative -> NaN bounds (not known).
+    u may be an array, one bound per frame (O1 v11.33: G3, G5 per frame): a frame whose u is not finite gets NaN
+    bounds; a negative u is an error."""
     q = np.asarray(q_k, dtype=float)
+    if isinstance(u, np.ndarray):
+        uk = np.asarray(u, dtype=float)
+        if uk.shape != q.shape:
+            raise ValueError(f'per-frame u of shape {uk.shape}, frames {q.shape}')
+        if np.any(uk[np.isfinite(uk)] < 0.0):
+            raise ValueError('per-frame u below 0')
+        ok = np.isfinite(uk)
+        lo, hi = np.full(q.shape, np.nan), np.full(q.shape, np.nan)
+        lo[ok], hi[ok] = q[ok] - uk[ok], q[ok] + uk[ok]
+        return lo, hi
     if not _finite(u) or float(u) < 0.0:
         nan = np.full(q.shape, np.nan)
         return nan, nan.copy()
@@ -183,6 +210,69 @@ def k_cmd_max(sch):
     return float(sch.vmax), 0.0
 
 
+RATE_STEP = 1e-4                        # s, grid of the command rates for cmd_rate_frames
+
+
+def cmd_rate_frames(f, t_cmd: float, t, u_t: float, turn: bool = True, v_cap: Optional[float] = None,
+                    wz_cap: Optional[float] = None):
+    """(V_k, W_k) per frame (O1 v11.33 lines 315, 317; OG-12, OG2-2, OG2-9): V_k = sup |dp_cmd/dt| and
+    W_k = sup |dpsi_cmd/dt| [rad/s] over [t_k - u_t, t_k + u_t].
+    f(t) -> (vx, vy, wz): the body-frame command of the task (rpi5/o1_tasks.task; figure 8: Schedule.setpoint,
+    heading on the tangent, wz = d(psi_cmd)/dt from the analytic tangent, i.e. on the continuous branch of the
+    heading, never a difference of wrapped angles). |dp_cmd/dt| = hypot(vx, vy) (the body speed: the frame
+    rotation does not change it). turn False (K1, K2: G5 against the start heading, O1 3.7): W_k = 0.
+    Outside [0, t_cmd] the reference holds its end values, so both rates are 0 there; a window wholly outside
+    gives 0. The sup is bounded from above on a grid of RATE_STEP: the largest grid value on the window widened
+    by one step, plus the largest grid difference next to it (an allowance for the rise between two grid points),
+    times 1 + CMD_MARGIN; then capped by v_cap / wz_cap (the peak of the schedule, always an upper bound) when given.
+    Scope (GT1-3, Codex round 1 of CODE_GATE; Liam 17/11 at CODE_GATE "Sửa theo bảng (Recommended)"): only for the
+    five O1 commands (rpi5/o1_tasks.task F02, F05, F08, K1, K2; smooth at the scale of RATE_STEP), where
+    fwsim/tests/test_o1_gate_v1133.py checks the bound against the sup on a 1 us grid at several U_t and many frames.
+    The allowance is not a proven Lipschitz bound for any f: a feature narrower than RATE_STEP can be missed, so
+    another command needs its own check. DEFERRED: an analytic derivative bound per segment of the five commands."""
+    t = np.asarray(t, dtype=float)
+    if not _finite(u_t) or float(u_t) < 0.0:
+        raise ValueError(f'u_t {u_t!r}: a finite number >= 0')
+    u = float(u_t)
+    n = max(2, int(math.ceil(float(t_cmd) / RATE_STEP)) + 1)
+    tt = np.linspace(0.0, float(t_cmd), n)
+    h = tt[1] - tt[0]
+    sp = np.empty(n)
+    wz = np.zeros(n)
+    for i, x in enumerate(tt):
+        c = f(float(x))
+        sp[i] = math.hypot(float(c[0]), float(c[1]))
+        if turn:
+            wz[i] = abs(float(c[2]))
+    dsp = np.r_[np.abs(np.diff(sp)), 0.0]
+    dwz = np.r_[np.abs(np.diff(wz)), 0.0]
+
+    def sup(y, dy, a, b):
+        if b < 0.0 or a > tt[-1]:
+            return 0.0
+        i0 = max(0, int(math.floor(max(a, 0.0) / h)) - 1)
+        i1 = min(n - 1, int(math.ceil(min(b, tt[-1]) / h)) + 1)
+        return (float(y[i0:i1 + 1].max()) + float(dy[max(0, i0 - 1):i1 + 1].max())) * (1.0 + CMD_MARGIN)
+    v_k = np.array([sup(sp, dsp, tk - u, tk + u) for tk in t])
+    w_k = np.array([sup(wz, dwz, tk - u, tk + u) for tk in t]) if turn else np.zeros(len(t))
+    if v_cap is not None:
+        v_k = np.minimum(v_k, float(v_cap))
+    if wz_cap is not None:
+        w_k = np.minimum(w_k, float(wz_cap))
+    return v_k, w_k
+
+
+MASKABLE = ('g2', 'g3', 'g5')           # O1 v11.33 3.9 rule 2b: conditions that may be report only (G1, G4 never)
+
+
+def required_of(report_only: Iterable[str]) -> tuple:
+    """The conditions that must decide (CONDS order) when `report_only` are report only at the run's level."""
+    ro = list(report_only)
+    if len(set(ro)) != len(ro) or set(ro) - set(MASKABLE):
+        raise ValueError(f'report_only {ro!r}: distinct conditions of {MASKABLE}')
+    return tuple(c for c in CONDS if c not in set(ro))
+
+
 def check_decide(decide) -> tuple:
     """`decide` as a tuple in CONDS order; it must be DECIDE_ALL or DECIDE_HIL (as a set)."""
     raw = list(decide)                                   # once: an iterator is consumed (GV3-R2-5)
@@ -191,13 +281,25 @@ def check_decide(decide) -> tuple:
     return tuple(c for c in CONDS if c in set(raw))
 
 
-def evaluate_outcomes(g: dict, decide: Iterable[str]) -> dict:
-    """outcome, outcome_decide, complete, any_certain_fail of a gate dict with states g1..g5."""
+def check_decide_masked(decide, required) -> tuple:
+    """O1 v11.33 (OG2-6, OG2-7): `decide` must be `required` intersected with DECIDE_ALL or DECIDE_HIL. Returns
+    it in CONDS order."""
+    raw, req = list(decide), set(required)
+    allowed = [set(s) & req for s in DECIDE_SETS]
+    if len(set(raw)) != len(raw) or set(raw) not in allowed:
+        raise ValueError(f'decide {raw!r} with required {sorted(req)!r}: one of {[sorted(a) for a in allowed]}')
+    return tuple(c for c in CONDS if c in set(raw))
+
+
+def evaluate_outcomes(g: dict, decide: Iterable[str], required: Optional[Iterable[str]] = None) -> dict:
+    """outcome, outcome_decide, complete, any_certain_fail of a gate dict with states g1..g5. complete: every
+    required condition decides (O1 v11.33 line 321; required None = all five, as gate_v3.2)."""
     dset = set(decide)                                   # once: an iterator is consumed (GV3-R2-5)
     dec = [c for c in CONDS if c in dset]
+    req = set(CONDS) if required is None else set(required)
     return dict(outcome=run_outcome(g[c]['state'] for c in CONDS),
                 outcome_decide=run_outcome(g[c]['state'] for c in dec),
-                complete=dset == set(CONDS),
+                complete=dset == req,
                 any_certain_fail=any(g[c]['state'] == 'khong_dat' for c in dec))
 
 
@@ -249,15 +351,40 @@ def check_g1_fields(f: dict, state: str) -> None:
 
 def gate(frames: dict, completed, *, v_cmd_max: float, wz_cmd_max: float, u_t: Optional[float],
          u_p: float = 0.0, u_psi_deg: float = 0.0, decide: Iterable[str] = DECIDE_ALL, status: str = '',
-         note: str = '', g1_fields: Optional[dict] = None) -> dict:
+         note: str = '', g1_fields: Optional[dict] = None, v_k=None, w_k=None,
+         report_only: Optional[Iterable[str]] = None, level: Optional[str] = None,
+         gate_file_sha256: Optional[str] = None) -> dict:
     """G1-G5 of one run. frames: per-frame arrays FRAME_KEYS (e_perp, e_trk, e_bao [m], e_theta_cmd_deg
     = |heading error| [deg]) on the scored frames; completed: the evaluator's G1 value.
     u_t: bound of the time offset of the command start [s], or None = not known (G3, G5 inconclusive).
     g1_fields (B81-3, one way of using the frames: o1_gate_eval.g1_fields_v7): when given, the g1 block also holds
     t_done, t_deadline, t1, prog_before_t1, cond25_before_deadline, G1 recomputed from them must equal the state
     from completed (else ValueError), and g2..g5 hold the common domain 'chung' {q, lo, hi, n_undef}, equal to the
-    union one (one frame domain). None (default): the dict is as before."""
+    union one (one frame domain). None (default): the dict is as before.
+    O1 v11.33 (design 03_CODE/docs/2026-11-17_Thiet_ke_CODE_GATE_v1.md sections 3, 4), version GATE_VERSION_V1133
+    when any of the following is given, else the dict is exactly the gate_v3.2 one:
+      v_k, w_k     per-frame command rates (cmd_rate_frames, [m/s], [rad/s]): U_k(G3) = U_p + U_t V_k,
+                   U_k(G5) = U_psi + deg(U_t W_k); lo, hi stay the maxima of lo_k, hi_k taken apart (O1 line 301).
+                   Each condition gets u = max_k U_k and the dict u_mode 'khung' ('hang' without them).
+      report_only  the report-only conditions at the run's level from the C8 gate file (tools/gate_c8.py), with
+                   level and gate_file_sha256 (OG2-7: never taken from the run record): required = CONDS minus them;
+                   decide = required intersected with `decide`; complete = decide is required (O1 line 321)."""
     decide = check_decide(decide)
+    v1133 = v_k is not None or w_k is not None or report_only is not None
+    if (v_k is None) != (w_k is None):
+        raise ValueError('v_k and w_k go together')
+    if report_only is None:
+        if level is not None or gate_file_sha256 is not None:
+            raise ValueError('level / gate_file_sha256 without report_only (the gate file gives all three)')
+        required = CONDS
+    else:
+        required = required_of(report_only)
+        if not isinstance(level, str) or not level:
+            raise ValueError(f'level {level!r}: the task of the run (a gate level or another task)')
+        if (not isinstance(gate_file_sha256, str) or len(gate_file_sha256) != 64
+                or any(ch not in '0123456789abcdef' for ch in gate_file_sha256)):
+            raise ValueError(f'gate_file_sha256 {gate_file_sha256!r}: 64 lowercase hex digits')
+    decide = tuple(c for c in decide if c in required)
     if u_p != 0.0 or u_psi_deg != 0.0:
         raise ValueError('U_p, U_psi > 0 (camera): G4 needs the projection solutions within 2 U_p (O1 3.4); '
                          'not in this module')
@@ -267,7 +394,14 @@ def gate(frames: dict, completed, *, v_cmd_max: float, wz_cmd_max: float, u_t: O
     else:
         if not _finite(u_t) or float(u_t) < 0.0:
             raise ValueError(f'u_t {u_t!r}: None or a finite number >= 0')
-        us.update(g3=u_p + v_cmd_max * float(u_t), g5=u_psi_deg + math.degrees(wz_cmd_max * float(u_t)))
+        if v_k is None:
+            us.update(g3=u_p + v_cmd_max * float(u_t), g5=u_psi_deg + math.degrees(wz_cmd_max * float(u_t)))
+        else:
+            n = len(np.asarray(frames.get(FRAME_KEYS['g3'], [])))
+            vk, wk = (np.asarray(x, dtype=float).ravel() for x in (v_k, w_k))
+            if len(vk) != n or len(wk) != n or not (np.all(np.isfinite(vk)) and np.all(np.isfinite(wk)))                     or np.any(vk < 0.0) or np.any(wk < 0.0):
+                raise ValueError(f'v_k, w_k: {n} finite numbers >= 0 each (one per frame)')
+            us.update(g3=u_p + vk * float(u_t), g5=u_psi_deg + np.degrees(wk * float(u_t)))
     c1 = completed
     q1 = {'dat': 'true', 'khong_dat': 'false'}.get(g1_state(c1), 'inconclusive')   # always a string (GV3-R3-2)
     g = dict(g1=dict(q=q1, state=g1_state(c1)))
@@ -276,7 +410,8 @@ def gate(frames: dict, completed, *, v_cmd_max: float, wz_cmd_max: float, u_t: O
             raise ValueError(f'frames: {FRAME_KEYS[c]!r} missing')
         q = np.asarray(frames[FRAME_KEYS[c]], dtype=float)
         lo, hi = frame_bounds(q, us[c])
-        g[c] = dict(aggregate(q, lo, hi, THRESHOLDS[c]), u=us[c])
+        u_rep = (float(np.max(us[c])) if len(us[c]) else 0.0) if isinstance(us[c], np.ndarray) else us[c]
+        g[c] = dict(aggregate(q, lo, hi, THRESHOLDS[c]), u=u_rep)
     if g1_fields is not None:
         if set(g1_fields) != set(G1_FIELD_KEYS) or not (isinstance(g1_fields['t_done'], list)
                                                        and len(g1_fields['t_done']) == 1):
@@ -290,7 +425,11 @@ def gate(frames: dict, completed, *, v_cmd_max: float, wz_cmd_max: float, u_t: O
         for c in MEASURED:
             g[c]['chung'] = {k: g[c][k] for k in ('q', 'lo', 'hi', 'n_undef')}
     ratios = [g[k]['ratio'] for k in MEASURED if _finite(g[k]['ratio'])]
-    return dict(version=GATE_VERSION, D=D, theta_max_deg=THETA_MAX_DEG, v_cmd_max=v_cmd_max,
-                wz_cmd_max=wz_cmd_max, u_p=u_p, u_psi_deg=u_psi_deg, u_t=u_t, **g,
-                **evaluate_outcomes(g, decide), decide=list(decide), conditions='G1,G2,G3,G4,G5',
-                max_ratio=max(ratios) if ratios else float('nan'), track_err=status == 'track_err', note=note)
+    out = dict(version=GATE_VERSION_V1133 if v1133 else GATE_VERSION, D=D, theta_max_deg=THETA_MAX_DEG,
+               v_cmd_max=v_cmd_max, wz_cmd_max=wz_cmd_max, u_p=u_p, u_psi_deg=u_psi_deg, u_t=u_t, **g,
+               **evaluate_outcomes(g, decide, required), decide=list(decide), conditions='G1,G2,G3,G4,G5',
+               max_ratio=max(ratios) if ratios else float('nan'), track_err=status == 'track_err', note=note)
+    if v1133:
+        out.update(u_mode='khung' if v_k is not None else 'hang', level=level, gate_file_sha256=gate_file_sha256,
+                   report_only=[c for c in MASKABLE if c not in required], required=list(required))
+    return out

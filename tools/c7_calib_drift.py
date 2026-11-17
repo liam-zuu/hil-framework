@@ -51,8 +51,17 @@ gop  --drift drift.json --s0-score score.json --s0-track <dir0>/track.json
      Provenance (CD1-4, CD2-3): each track.json names the session it used (sha256, = the one in
      drift.json) and the frames.csv it wrote (frames_sha256 = the file next to it = the frames_sha256 of
      the score). Same run (CD1-6, CD2-4): both tracks have the same video, tag offset, frame count and
-     decoded size, and that tag offset is the one of drift.json (CD3-2); both scores the same task,
-     esp32 log, U_m, D, k_start, thresholds and clock offset.
+     decoded size, and that tag offset is the one of drift.json (CD3-2); both scores of c7_score_v2, the
+     same task, esp32 log, t = 0 (t0_log_us), k_start, thresholds, constants file (hang_so: file, sha256), sender
+     log and events file (sha256, CC1-3); both tracks the same frame gates (CC1-4). A score lost to the measurement
+     system early (c7_score lost_output) carries the same fields, offset and t = 0 null when not known (CC1-1).
+     Clock (Liam 17/11 CODE_CAM local_4a972073, box, verbatim: "Moi lan tu ghep gio (Recommended)"): each
+     score matches the clocks on its own frames (C7b, or --offset-s as for any run), so the two scorings
+     differ by the calibration and what follows from it, U_t included; the two offsets are kept in the
+     result (calib_drift.offset_s_h0, offset_s_h1), not required equal (the old rule of CD1-6).
+     Clip H shot again inside a session (O1 v11.31 4, B8S-9): the new clip closes the part before it:
+     so --s0 <clip H in use> --s1 <new clip H> --tasks <tasks run in that part>, then gop for every run of
+     that part; the runs after it are scored with the new clip H (it is the s0 of the next part).
      Scope (CD2-5): the task of the score is in drift.tasks and, for K1/K2, its k_start is that of
      drift.json, below eps_H too. All these fields must be present and valid: frame count and decoded
      sizes positive integers, thresholds numbers >= 0 (text only in 'status'), no null (CD2-6, CD3-5, CD4-1).
@@ -88,8 +97,10 @@ STEP_M = 0.05          # spacing of the lane samples (arc length)
 MIN_MARKS = 6          # common floor marks needed for the pose refit (calibrate needs 6 too)
 OUTCOMES = ('dat', 'khong_dat', 'chua_ket_luan', 'hong_he_do')
 SAME_KEYS = ('zc_tape_m', 'plumb_xy_m', 'tag_h_m', 'car_side_m', 'width', 'height')     # CD1-5
-SCORE_SAME = ('task', 'U_m', 'D', 'k_start', 'thresholds', 'esp32_sha256', 't0_log_us')  # CD1-4, CD1-6, CD2-4
-TRACK_SAME = ('video_sha256', 'tag_offset', 'frames', 'decoded_shapes')                 # CD2-4: track options
+SCORE_SAME = ('version', 'task', 'hang_so', 'k_start', 'thresholds', 'esp32_sha256', 't0_log_us',  # CD1-4, CD2-4
+              'sender_sha256', 'events_sha256')        # Codex CC1-3 (17/11): the same command-path inputs
+SCORE_VERSION = 'c7_score_v2'      # the scorer whose output this combines (U_m, D of the version before are gone)
+TRACK_SAME = ('video_sha256', 'tag_offset', 'frames', 'decoded_shapes')       # CD2-4: track options (gates: CC1-4)
 THRESH_TEXT = ('status',)          # the only text field of c7_score thresholds (metadata); the rest are numbers >= 0
 
 
@@ -419,13 +430,24 @@ def check_score(sc, tr, frames_sha, session_sha, drift, name):
     _dict(sc, f'{name} score')
     _dict(tr, f'{name} track.json')
     _need(sc, ('outcome', 'offset_s', 'frames_sha256') + SCORE_SAME, f'{name} score')
-    _need(tr, ('session_sha256', 'frames_sha256') + TRACK_SAME, f'{name} track.json')
+    _need(tr, ('session_sha256', 'frames_sha256', 'gates') + TRACK_SAME, f'{name} track.json')
+    # Codex CC1-4, CC2-2: the frame gates the track applied, checked (null, empty or a bad threshold refused); the two
+    # tracks are compared on these values in combine
+    cm.check_gates(tr['gates'], f'{name} track.json gates')
     if sc['outcome'] not in OUTCOMES:
         raise ValueError(f'{name} score: outcome {sc["outcome"]!r}')
-    _finite(sc['offset_s'], f'{name} score offset_s')
-    _finite(sc['U_m'], f'{name} score U_m', 0.0)
-    _finite(sc['D'], f'{name} score D', 0.0)
-    _finite(sc['t0_log_us'], f'{name} score t0_log_us')
+    if sc['version'] != SCORE_VERSION:
+        raise ValueError(f'{name} score: version {sc["version"]!r}, expected {SCORE_VERSION} (score again with '
+                         'c7_score.py at this commit)')
+    # Codex CC1-1: a run lost to the measurement system early has no clock offset (C7b failed) or no t = 0 (edge
+    # lost): null there, never a number made up; any judged run has both
+    lost = sc['outcome'] == 'hong_he_do'
+    for k in ('offset_s', 't0_log_us'):
+        if not (lost and sc[k] is None):
+            _finite(sc[k], f'{name} score {k}')
+    hs = _dict(sc['hang_so'], f'{name} score hang_so')
+    _need(hs, ('file', 'sha256'), f'{name} score hang_so')
+    _sha(hs['sha256'], f'{name} score hang_so.sha256')
     th = sc['thresholds']
     if not isinstance(th, dict) or not [k for k in th if k not in THRESH_TEXT]:
         raise ValueError(f'{name} score: thresholds {th!r}')
@@ -493,13 +515,17 @@ def combine(drift, sc0, tr0, fr0_sha, sc1=None, tr1=None, fr1_sha=None):
     for k in TRACK_SAME:
         if tr0[k] != tr1[k]:
             raise ValueError(f'the two track.json differ in {k}: {tr0[k]!r} / {tr1[k]!r} (same video, same options)')
+    g0, g1 = cm.check_gates(tr0['gates']), cm.check_gates(tr1['gates'])
+    if g0 != g1:
+        raise ValueError(f'the two track.json applied other frame gates: {g0!r} / {g1!r} (CC1-4)')
     for k in SCORE_SAME:
         if sc0[k] != sc1[k]:
             raise ValueError(f'the two scores differ in {k}: {sc0[k]!r} / {sc1[k]!r}')
-    if abs(float(sc0['offset_s']) - float(sc1['offset_s'])) > 1e-9:
-        raise ValueError('the two scores use different clock offsets: score H1 with --offset-s of the H0 score')
     o1 = sc1['outcome']
     info['outcome_h1'] = o1
+    # Liam 17/11 "Moi lan tu ghep gio": each score matched the clocks on its own frames; both kept, not averaged
+    info.update(offset_s_h0=sc0['offset_s'], offset_s_h1=sc1['offset_s'],          # null: that scoring lost it
+                offset_src_h0=sc0.get('offset_src'), offset_src_h1=sc1.get('offset_src'))
     info['flags'] = ['calib_drift']
     if 'hong_he_do' in (o0, o1):
         final = 'hong_he_do'                                          # Q3

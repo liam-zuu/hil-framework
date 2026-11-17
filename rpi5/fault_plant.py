@@ -12,9 +12,16 @@ of a plant fault is the record of the parameters used at every step (finish()), 
   mu_time   (s15)   mu_hd[i] = mu for the target wheels
   mu_zone   (s15)   mu_hd[i] = mu for every wheel whose contact point (centre + R(theta) (+-lx, +-ly)) is inside
                     [x0, x1) x [y0, y1) at the start of the step (world frame, per wheel)
+  body_drag (s14)   a world-frame force on the body at every traction sub-step: -F * ((vx, vy) / |v|), |v| =
+                    math.hypot(vx, vy) of the sub-step, 0 while |v| < DRAG_V_MIN (Liam 17/11 "lam s14 ngay di")
+  load_dist (s14)   a world-frame force F(k) * (cos dir, sin dir), constant over the step: F(k) = (F0 + min(Fmax,
+                    (rate * d) / 1000)) + sigma * n[d], d = k - start, n = default_rng(seed).standard_normal(end -
+                    start) drawn once for the row (not the plant's generator, and the same whatever steps run)
+The two body loads change no parameter: the step is plant_step's traction branch with the force as f_ext
+(body_step: plant_step._traction_step(x, u, p, dt, f_ext=f), the call plant_step itself makes with f_ext None).
 
-One definition, two users: PlantVariant is used by FaultPlant (Pi, wraps MecanumPlant.step) and by
-fwsim/fault_run.py (wraps fwsim.plant_step); tools/fault_check.py rebuilds the values on its own.
+One definition, two users: PlantVariant and BodyForce are used by FaultPlant (Pi, wraps MecanumPlant.step) and
+by fwsim/fault_run.py (wraps fwsim.plant_step); tools/fault_check.py rebuilds the values on its own.
 
 The rows on at relative step k come from the ActiveSet of the FramePatcher of the run (fault_schedule.py), which
 the patcher has advanced to step k before the plant steps (hil_node._tick: patch, SPI, then plant.step), so the
@@ -36,15 +43,20 @@ from typing import Optional, Sequence, Tuple
 
 import numpy as np
 
-from fault_schedule import PLANT_FAULTS, Row, ScheduleError, has_plant_rows
+from fault_schedule import BODY_FAULTS, PLANT_FAULTS, Row, ScheduleError, has_plant_rows
 from plant_interface import PlantInterface
+from plant_step import _traction_step
 
 # body-frame position signs of the wheel hubs FL, FR, RL, RR (x forward, y left; params.py H_inv rows)
 HUB_SIGNS = ((1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0))
 # columns of the record: one row per plant step with a plant row on
+# (s14: vx, vy the world velocity at the start of the step; f_drag the drag F of a body_drag row on when |v| >=
+# DRAG_V_MIN at the start of the step, else 0; f_dist F(k) of a load_dist row on, else 0)
 RECORD_COLS = ('step', 'mask', 'V_batt', 'mu_fl', 'mu_fr', 'mu_rl', 'mu_rr', 'b_fl', 'b_fr', 'b_rl', 'b_rr',
-               'tc_fl', 'tc_fr', 'tc_rl', 'tc_rr', 'ts_fl', 'ts_fr', 'ts_rl', 'ts_rr', 'x', 'y', 'theta')
+               'tc_fl', 'tc_fr', 'tc_rl', 'tc_rr', 'ts_fl', 'ts_fr', 'ts_rl', 'ts_rr', 'x', 'y', 'theta',
+               'vx', 'vy', 'f_drag', 'f_dist')
 MAX_ROWS = 52                      # mask of the record is a float64: row index bits must stay exact
+DRAG_V_MIN = 1e-3                  # [m/s] body_drag acts only at |v| >= this (design 3)
 
 
 def nominal_problem(params) -> Optional[str]:
@@ -147,6 +159,7 @@ class PlantVariant:
         self._cache = {}
 
     def at(self, on: Tuple[int, ...], k_rel: int, x):
+        on = tuple(i for i in on if self.rows[i].fault not in BODY_FAULTS)     # s14 body rows change no parameter
         if not on:
             return self.base, 0
         zm = 0
@@ -188,6 +201,98 @@ class PlantVariant:
         return p
 
 
+def dist_noise(row: Row) -> np.ndarray:
+    """n[d], d = 0 .. end - start - 1, of a load_dist row: its own generator, drawn once (design 3)."""
+    return np.random.default_rng(int(row.p('seed'))).standard_normal(row.end_ms - row.start_ms)
+
+
+def dist_value(row: Row, k_rel: int, n: np.ndarray) -> float:
+    """F(k) of a load_dist row at relative step k_rel inside its window. Definition, float64, one operation at a
+    time: d = k_rel - start (int); ramp = (float(rate) * d) / 1000.0; F = (float(F0) + min(float(Fmax), ramp)) +
+    float(sigma) * float(n[d])."""
+    d = k_rel - row.start_ms
+    ramp = (float(row.p('rate')) * d) / 1000.0
+    return (float(row.p('F0')) + min(float(row.p('Fmax')), ramp)) + float(row.p('sigma')) * float(n[d])
+
+
+def dist_dir(row: Row) -> Tuple[float, float]:
+    """(cos, sin) of dir_deg of a load_dist row: math.radians(float(dir_deg)), then math.cos, math.sin."""
+    a = math.radians(float(row.p('dir_deg')))
+    return math.cos(a), math.sin(a)
+
+
+class BodyForce:
+    """at(on, k_rel, x) -> (f, f_drag, f_dist): f the f_ext of _traction_step for this step (None when no body
+    row is on), f_drag and f_dist the record values (RECORD_COLS). At most one body_drag and one load_dist row
+    are on at a time (fault_schedule.check: same group, no overlap); the noise of every load_dist row is drawn
+    here, once."""
+
+    def __init__(self, rows: Sequence[Row]):
+        self.rows = list(rows)
+        self._noise = {i: dist_noise(r) for i, r in enumerate(self.rows) if r.fault == 'load_dist'}
+        self._dir = {i: dist_dir(r) for i, r in enumerate(self.rows) if r.fault == 'load_dist'}
+        # Codex FS1-5: every F(k) of a load_dist row must be a finite float, and so must the drag F plus the
+        # largest |F(k)| over the steps where the two windows overlap (Codex FS2-4: only there do they add up);
+        # each parameter alone is checked by check_params, a sum or a product may still overflow
+        vals = {}
+        for i, n in self._noise.items():
+            r = self.rows[i]
+            d = np.arange(len(n), dtype=float)
+            with np.errstate(over='ignore', invalid='ignore'):     # an overflow is what is looked for here
+                v = (float(r.p('F0')) + np.minimum(float(r.p('Fmax')), (float(r.p('rate')) * d) / 1000.0)) + \
+                    float(r.p('sigma')) * n
+            if not np.all(np.isfinite(v)):
+                raise ScheduleError(f'{r.id!r}: load_dist force F(k) has no finite value')
+            vals[i] = v
+        for rd in (r for r in self.rows if r.fault == 'body_drag'):
+            for i, v in vals.items():
+                rl = self.rows[i]
+                lo, hi = max(rd.start_ms, rl.start_ms), min(rd.end_ms, rl.end_ms)
+                if lo < hi and not math.isfinite(float(rd.p('F')) + float(np.max(np.abs(
+                        v[lo - rl.start_ms:hi - rl.start_ms])))):
+                    raise ScheduleError(f'{rd.id!r} + {rl.id!r}: drag F plus the load |F(k)| where they overlap has '
+                                        f'no finite value')
+
+    def at(self, on: Tuple[int, ...], k_rel: int, x):
+        fd, fdist, cd, sd = 0.0, 0.0, 0.0, 0.0
+        drag = dist = False
+        for i in on:
+            r = self.rows[i]
+            if r.fault == 'body_drag':
+                drag, fd = True, float(r.p('F'))
+            elif r.fault == 'load_dist':
+                dist, fdist = True, dist_value(r, k_rel, self._noise[i])
+                cd, sd = self._dir[i]
+        if not (drag or dist):
+            return None, 0.0, 0.0
+        gx0, gy0 = fdist * cd, fdist * sd              # the load disturbance, constant over the step
+
+        def f(xw, yw, vxw, vyw):
+            gx, gy = gx0, gy0
+            if drag:
+                v = math.hypot(vxw, vyw)
+                if v >= DRAG_V_MIN:
+                    gx = gx - fd * (vxw / v)       # Codex FS1-5: unit vector first, no overflow of F * vx
+                    gy = gy - fd * (vyw / v)
+            return gx, gy
+
+        rec_drag = fd if drag and math.hypot(float(x[3]), float(x[4])) >= DRAG_V_MIN else 0.0
+        return f, rec_drag, fdist
+
+
+def mu4(p):
+    """The four mu_hd values of a parameter object (a scalar mu_hd broadcast, as check_params and plant_step read
+    it; Codex FS1-3: a body row alone keeps the nominal object, whose mu_hd may be a scalar)."""
+    return np.broadcast_to(np.asarray(p.mu_hd, dtype=float), (4,))
+
+
+def body_step(x, u, p, dt, f):
+    """One plant step with the body force f: plant_step's traction branch (plant_step.py: _traction_step(
+    np.asarray(x, float), np.asarray(tau, float), params, dt)) with f_ext = f. plant_step.py is not changed (S04
+    blob lock)."""
+    return _traction_step(np.asarray(x, dtype=float), np.asarray(u, dtype=float), p, dt, f_ext=f)
+
+
 def plant_window_steps(rows: Sequence[Row]) -> int:
     """Relative steps covered by the union of the plant windows (record size)."""
     cover = set()
@@ -214,6 +319,7 @@ class FaultPlant(PlantInterface):
         self._base = inner._params
         check_params(patcher.schedule.rows, self._base)
         self._var = PlantVariant(patcher.schedule.rows, self._base)
+        self._body = BodyForce(patcher.schedule.rows)
         self._path = path
         self._rec = np.zeros((plant_window_steps(patcher.schedule.rows), len(RECORD_COLS)))
         self._n = 0
@@ -227,10 +333,15 @@ class FaultPlant(PlantInterface):
         inner, k = self.inner, self._p.step
         x = inner._state
         p, _ = self._var.at(on, k - self._p.t0, x)
+        f, fd, fdist = self._body.at(on, k - self._p.t0, x)
         if self._n < len(self._rec):              # the union of windows bounds the steps with a row on
-            self._rec[self._n] = (k, sum(1 << i for i in on), p.V_batt, *p.mu_hd, *p.motor_b, *p.motor_Tc,
-                                  *p.motor_Ts, x[0], x[1], x[2])
+            self._rec[self._n] = (k, sum(1 << i for i in on), p.V_batt, *mu4(p), *p.motor_b, *p.motor_Tc,
+                                  *p.motor_Ts, x[0], x[1], x[2], x[3], x[4], fd, fdist)
         self._n += 1
+        if f is not None:                         # s14: MecanumPlant.step with the body force (no RNG on traction)
+            inner._state = body_step(x, torques, p, inner._dt, f)
+            inner._ticks += 1
+            return inner._state.tolist()
         inner._params = p
         try:
             return inner.step(torques)
