@@ -734,6 +734,8 @@ def _real_score(tmp_path, name, valid=True, lost_edge=False, drop=(), post=4.0, 
         args += ['--offset-s', str(T.OFFSET), '--offset-reason', 'test', '--offset-anchor-s', '0', '--offset-err-s', '0']
     if gio is not None:
         g = d / 'gio.json'
+        # the grid file names the log and frames.csv it was made from, as c8b_gio writes it (c7_score Codex VG1-1)
+        gio = dict(gio, sha256=dict(esp32=cm.sha256(log), frames=cm.sha256(str(d / 'frames.csv'))))
         g.write_text(json.dumps(gio), encoding='utf-8')
         args += ['--gio-c8b', str(g), '--nut', '0']
     assert cs.main(args) == 0

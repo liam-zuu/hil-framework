@@ -1654,34 +1654,39 @@ def test_v11_33_window_narrower_than_the_grid_uses_its_ends():
 
 
 # ---------------------------------------------------------------- C8b v4 3 (17/11): U_t at a node (--gio-c8b)
-NODES = [OFFSET - 0.002, OFFSET - 0.0015, OFFSET, OFFSET + 0.001]       # gaps 0.5, 1.5, 1.0 ms: step 1.5 ms
+NODES = [OFFSET - 0.0015, OFFSET - 0.001, OFFSET, OFFSET + 0.00075]      # gaps 0.5, 1.0, 0.75 ms: step 1.0 ms
+FSHA = 'f' * 64       # sha256 of the frames scored: the frames here are in memory (score() is given this hash)
 
 
-def gio_file(tmp_path, **over):
+def gio_file(tmp_path, esp32_sha='e' * 64, **over):
     d = dict(format='c8b_gio_v1', moc_mau=True, ok=True, nodes_s=NODES, cua_so_ghep_log_s=[T0 + 3.0, T0 + 9.0],
-             sha256={'esp32': 'e' * 64})
+             sha256={'esp32': esp32_sha, 'frames': FSHA})
     d.update(over)
     p = tmp_path / 'gio.json'
     p.write_text(json.dumps(d), encoding='utf-8')
     return str(p)
 
 
-def run_gio(tmp_path, nut=2, gio_kw=None, **kw):
-    return run(tmp_path, offset_s=None, offset_reason='', gio=cs.load_gio(gio_file(tmp_path, **(gio_kw or {})), nut),
-               **kw)
+def run_gio(tmp_path, nut=2, gio_kw=None, task='O1-F05', **kw):
+    """As run() at a node of a grid file made from the log run() writes (the same bytes: make_log is deterministic)
+    and from the frames of hash FSHA (Codex VG1-1)."""
+    log = make_log(tmp_path / 'esp32.csv', task, kw.get('k_start') or (0.0, 0.0, 0.0), **(kw.get('log_kw') or {}))
+    esha = cm.sha256(log)
+    gio = cs.load_gio(gio_file(tmp_path, esha, **(gio_kw or {})), nut, esha, FSHA)
+    return run(tmp_path, task, offset_s=None, offset_reason='', gio=gio, frames_sha256=FSHA, **kw)
 
 
 def test_c8b_node_u_t_table(tmp_path):
-    """At node 2 (D = OFFSET): U_t = whole grid step (largest gap, 1.5 ms) + troi_ppm x the farthest distance from the
+    """At node 2 (D = OFFSET): U_t = whole grid step (largest gap, 1.0 ms) + troi_ppm x the farthest distance from the
     match window [3, 9] s (command time) to [0, t_deadline] + rolling shutter (one frame) + tick; u_t_ghep_s and
     --offset-err-s not added; o1_time_sync not run (offset_src c8b_gio)."""
     out, _ = run_gio(tmp_path, hs_kw=dict(troi_ppm=1000.0, u_t_ghep_s=0.05))
     p, dl = out['U_t_parts'], out['t_deadline']
     assert out['offset_src'] == 'c8b_gio' and out['offset_s'] == OFFSET and out['gio_c8b']['nut'] == 2
-    assert p['luoi_s'] == pytest.approx(0.0015) and p['ghep_s'] == 0.0 and p['offset_err_s'] == 0.0
+    assert p['luoi_s'] == pytest.approx(0.001) and p['ghep_s'] == 0.0 and p['offset_err_s'] == 0.0
     assert p['drift_s'] == pytest.approx(1e-3 * max(9.0, dl - 3.0))
     assert p['man_trap_s'] == pytest.approx(1.0 / FPS)
-    assert out['U_t_s'] == pytest.approx(0.0015 + p['drift_s'] + p['man_trap_s'] + p['tick_s'])
+    assert out['U_t_s'] == pytest.approx(0.001 + p['drift_s'] + p['man_trap_s'] + p['tick_s'])
 
 
 def test_c8b_node_scores_with_the_node_offset(tmp_path):
@@ -1694,14 +1699,14 @@ def test_c8b_node_scores_with_the_node_offset(tmp_path):
                                  dict(cua_so_ghep_log_s=[1.0]), dict(format='x')])
 def test_c8b_bad_grid_file_refused(tmp_path, bad):
     with pytest.raises(ValueError):
-        cs.load_gio(gio_file(tmp_path, **bad), 0)
+        cs.load_gio(gio_file(tmp_path, **bad), 0, 'e' * 64, FSHA)
 
 
 def test_c8b_node_index_and_one_clock_source(tmp_path):
     with pytest.raises(ValueError, match='nut'):
-        cs.load_gio(gio_file(tmp_path), 4)
+        cs.load_gio(gio_file(tmp_path), 4, 'e' * 64, FSHA)
     with pytest.raises(ValueError, match='one clock source'):
-        run(tmp_path, gio=cs.load_gio(gio_file(tmp_path), 0))         # run() gives --offset-s by default
+        run(tmp_path, gio=cs.load_gio(gio_file(tmp_path), 0, 'e' * 64, FSHA))   # run() gives --offset-s by default
 
 
 def test_c8b_one_node_has_no_grid_step(tmp_path):
@@ -1711,7 +1716,8 @@ def test_c8b_one_node_has_no_grid_step(tmp_path):
 
 def test_c8b_shutter_by_row_and_column_spans(tmp_path):
     """man_trap alpha_r 8e-6 s/px, alpha_c -2e-6 s/px (absolute value, C8B4R4-1): the term is |a_r| x row span +
-    |a_c| x column span of the car tag over the frames seen in [min(window, 0), max(window, t_deadline)]."""
+    |a_c| x column span of the car tag over the frames seen in the match window U [0, t_deadline] (here the window
+    [3, 9] s lies inside [0, t_deadline]: every frame of [0, t_deadline])."""
     fr = make_frames('O1-F05')
     for k, r in enumerate(fr):
         r['row_px'], r['col_px'] = 1000.0 + (k % 7), 2000.0 + 3 * (k % 5)
@@ -1820,3 +1826,248 @@ def test_cc2_t4_explicit_events_wins_over_the_default(tmp_path):
     assert cs.main(args) == 0
     s = json.loads((tmp_path / 's.json').read_text(encoding='utf-8'))
     assert s['events_file'] == 'other_events.txt' and s['events_sha256'] == cm.sha256(str(ev))
+
+
+# ---------------------------------------------------------------- Codex round 1 of v11.33 + C8b v4 (VG1-1..4, P3, KT)
+@pytest.mark.parametrize('sha', [None, 'x', {'esp32': 'e' * 64}, {'frames': FSHA}, {'esp32': 'E' * 64, 'frames': FSHA},
+                                 {'esp32': 'e' * 63, 'frames': FSHA}, {'esp32': 1, 'frames': FSHA}])
+def test_vg1_1_grid_file_without_the_input_hashes_is_refused(tmp_path, sha):
+    """KT1: sha256 {esp32, frames} (64 lowercase hex each) is required; missing, partial or badly formed: refused."""
+    p = gio_file(tmp_path)
+    d = json.loads(open(p, encoding='utf-8').read())
+    if sha is None:
+        del d['sha256']
+    else:
+        d['sha256'] = sha
+    open(p, 'w', encoding='utf-8').write(json.dumps(d))
+    with pytest.raises(ValueError, match='VG1-1'):
+        cs.load_gio(p, 0, 'e' * 64, FSHA)
+
+
+def test_vg1_1_grid_file_of_another_log_or_other_frames_is_refused(tmp_path):
+    """KT1: a grid file made from log A / frames A does not score log B / frames B (D, match window and the tick
+    branch 'bo' of A never applied to B), at load_gio and again in score() for a grid dict built for other files."""
+    p = gio_file(tmp_path)
+    assert cs.load_gio(p, 0, 'e' * 64, FSHA)['vao'] == {'esp32': 'e' * 64, 'frames': FSHA}
+    with pytest.raises(ValueError, match='another esp32'):
+        cs.load_gio(p, 0, 'd' * 64, FSHA)
+    with pytest.raises(ValueError, match='another frames'):
+        cs.load_gio(p, 0, 'e' * 64, 'a' * 64)
+    gio = cs.load_gio(p, 2, 'e' * 64, FSHA)               # made for a log of hash e..e, not the log run() writes
+    with pytest.raises(ValueError, match='VG1-1'):
+        run(tmp_path, offset_s=None, offset_reason='', gio=gio, frames_sha256=FSHA)
+    log = make_log(tmp_path / 'esp32.csv', 'O1-F05')
+    gio = cs.load_gio(gio_file(tmp_path, cm.sha256(log)), 2, cm.sha256(log), FSHA)
+    with pytest.raises(ValueError, match='VG1-1'):          # the frames scored not tied to the grid file
+        run(tmp_path, offset_s=None, offset_reason='', gio=gio)
+    with pytest.raises(ValueError, match='VG1-1'):          # another log scored with this grid (one duplicate line)
+        run(tmp_path, offset_s=None, offset_reason='', gio=gio, frames_sha256=FSHA, log_kw=dict(dup=1))
+    out, _ = run_gio(tmp_path)
+    assert out['gio_c8b']['vao'] == {'esp32': cm.sha256(str(tmp_path / 'esp32.csv')), 'frames': FSHA}
+
+
+def test_vg1_2_shutter_over_the_union_not_the_hull(tmp_path):
+    """KT2: match window [-3, -2] s (command time) apart from [0, t_deadline]; rows 500 everywhere, 600 on one frame
+    inside the window, 1400 on the frames between the two parts and 2000 after t_deadline. alpha_r 1e-5 s/px: the
+    union gives a span of 100 px (1 ms); the hull [-3, t_deadline] would give 900 px (9 ms)."""
+    fr = make_frames('O1-F05', pre=4.0)
+    dl = lane_of('O1-F05').Tcmd + cs.T_LATE
+    k_in = None
+    for k, r in enumerate(fr):
+        tk = r['t_s'] - T0 + OFFSET
+        if -1.9 < tk < -0.1:
+            r['row_px'] = 1400.0
+        elif tk > dl + 0.05:
+            r['row_px'] = 2000.0
+        elif k_in is None and -2.6 < tk < -2.4:
+            r['row_px'], k_in = 600.0, k
+    assert k_in is not None
+    mt = dict(alpha_r_s_px=1e-5, alpha_c_s_px=0.0, nguon='test')
+    out, _ = run_gio(tmp_path, frames=fr, hs_kw=dict(man_trap=mt), gio_kw=dict(cua_so_ghep_log_s=[T0 - 3.0, T0 - 2.0]))
+    assert out['U_t_parts']['man_trap_s'] == pytest.approx(1e-5 * 100.0)
+    fr[k_in]['row_px'] = 500.0                              # nothing but 500 in the union: no shutter span
+    out, _ = run_gio(tmp_path, frames=fr, hs_kw=dict(man_trap=mt), gio_kw=dict(cua_so_ghep_log_s=[T0 - 3.0, T0 - 2.0]))
+    assert out['U_t_parts']['man_trap_s'] == 0.0
+
+
+@pytest.mark.parametrize('nodes,ok', [([0.0, 0.001], True), ([100.0 + 0.001 * k for k in range(6)], True),
+                                      ([0.0, 0.001 + 5e-10], True), ([0.25], True),
+                                      ([0.0, 0.0015], False), ([0.0, 0.001 + 1e-8], False),
+                                      ([0.0, 0.0005, 0.0016], False)])
+def test_vg1_3_adjacent_nodes_at_most_1_ms(tmp_path, nodes, ok):
+    """KT3: C8b v4 3, adjacent nodes at most 1 ms apart (float tolerance 1e-9 s); one node keeps step 0."""
+    p = gio_file(tmp_path, nodes_s=nodes)
+    if ok:
+        g = cs.load_gio(p, 0, 'e' * 64, FSHA)
+        assert g['step_s'] <= 1e-3 + 1e-9 and (len(nodes) > 1 or g['step_s'] == 0.0)
+    else:
+        with pytest.raises(ValueError, match='VG1-3'):
+            cs.load_gio(p, 0, 'e' * 64, FSHA)
+
+
+@pytest.mark.parametrize('task', ['O1-K1', 'O1-K2'])
+def test_vg1_4_k_tasks_refuse_report_only(tmp_path, task):
+    """CODE_GATE 4: K1, K2 decide on all five conditions: a report-only set is refused (an empty one is the default)."""
+    with pytest.raises(ValueError, match='VG1-4'):
+        run(tmp_path, task, frames=make_frames(task), k_start=K1S, allow_final_set=True, report_only=frozenset({'g3'}))
+    out, _ = run(tmp_path, task, frames=make_frames(task), k_start=K1S, allow_final_set=True, report_only=frozenset())
+    assert out['outcome'] == 'dat'
+
+
+def test_kt4_report_only_through_score_on_a_figure_8(tmp_path):
+    """KT4 through score(): F05 with a camera gap [8.0, 8.3] s (t1 = 8.0). (a) the car pulled back up to 0.3 s in
+    [5, 6] s: a certain G3 violation only (lo above D); khong_dat, and hong_he_do when G3 is report-only (G5 alone
+    report-only changes nothing). (b) the heading turned 14 deg in [5, 6] s (camera and IMU alike): G5 only;
+    report-only G5 gives hong_he_do. (c) 0.13 m off the lane: G2, G3, G4 violated; with G2, G3, G5 report-only the G4
+    violation still gives khong_dat."""
+    fr = make_frames('O1-F05', drop=[(8.0, 8.3)], back=(5.0, 6.0, 0.3))
+    out, _ = run(tmp_path, frames=fr)
+    assert out['outcome'] == 'khong_dat' and out['cat_t1']
+    out, _ = run(tmp_path, frames=fr, report_only=frozenset({'g5'}))
+    assert out['outcome'] == 'khong_dat'
+    out, _ = run(tmp_path, frames=fr, report_only=frozenset({'g3'}))
+    assert out['outcome'] == 'hong_he_do' and not out['cat_t1']
+    off = math.radians(14.0)
+    fr = make_frames('O1-F05', drop=[(8.0, 8.3)])
+    for r in fr:
+        if 5.0 <= r['t_s'] - T0 + OFFSET < 6.0:
+            r['psi'] = cs.wrap(r['psi'] + off)
+    lk = dict(yaw_err=lambda t: off if 5.0 <= t < 6.0 else 0.0)
+    out, rows = run(tmp_path, frames=fr, log_kw=lk)
+    assert out['outcome'] == 'khong_dat'
+    assert not any(r[f'lo_{c}'] > 0.1 for r in rows for c in ('g2', 'g3', 'g4') if np.isfinite(r[f'lo_{c}']))
+    out, _ = run(tmp_path, frames=fr, log_kw=lk, report_only=frozenset({'g5'}))
+    assert out['outcome'] == 'hong_he_do'
+    fr = make_frames('O1-F05', drop=[(8.0, 8.3)], lat_fn=lambda t: 0.13 if 5.0 <= t < 6.0 else 0.0)
+    out, _ = run(tmp_path, frames=fr, report_only=frozenset({'g2', 'g3', 'g5'}))
+    assert out['outcome'] == 'khong_dat' and out['fail_cause'] == cs.FAIL_VIOL
+
+
+def _fd_sup(lane, a, b, n=3001):
+    """Oracle independent of lane.rate (Codex P3, KT5): the largest |dp|/dt and |dpsi|/dt of the COMMAND itself
+    (figure 8: path_point at the schedule's tau, heading unwrapped; K: the command point at s_cmd) between adjacent
+    points of a fine grid of [a, b] cut to [0, T_cmd]. By the mean-value bound each is at most the sup of the true
+    rate over [a, b], so a correct upper bound is never below it."""
+    a, b = max(a, 0.0), min(b, lane.Tcmd)
+    if not b > a:
+        return 0.0, 0.0
+    tt = np.linspace(a, b, n)
+    if isinstance(lane, cs.Fig8Task):
+        P = np.array([cs.path_point(lane.sch.tau(float(t))[0]) for t in tt])
+    else:
+        P = np.array([lane.command(float(t))[1:] for t in tt])
+    dt = np.diff(tt)
+    v = np.hypot(np.diff(P[:, 0]), np.diff(P[:, 1])) / dt
+    w = np.abs(np.diff(np.unwrap(P[:, 2]))) / dt
+    return float(v.max()), float(w.max())
+
+
+@pytest.mark.parametrize('task', ['O1-F02', 'O1-F05', 'O1-F08', 'O1-K1', 'O1-K2'])
+def test_v11_33_cmd_rates_against_a_finite_difference_oracle(task):
+    """KT5: V_k, W_k never below the finite-difference oracle (independent of rate()) and at most 2 % of the peak above
+    it, on random windows, windows at 0 and T_cmd, windows across a +-pi wrap of the figure-8 heading, very narrow
+    windows (0.5 ms, as U_t near 0) and U_t = 0 (a single instant: at least the oracle over +-1 us). K: W = 0."""
+    lane = lane_of(task, K1S if task.startswith('O1-K') else None)
+    cr = cs.CmdRates(lane)
+    vmax, wmax = lane.cmd_max
+    rng = np.random.default_rng(7)
+    starts = list(rng.uniform(-0.3, lane.Tcmd + 0.1, 12)) + [-0.02, 0.0, lane.Tcmd - 0.04, lane.Tcmd - 0.01]
+    if isinstance(lane, cs.Fig8Task):
+        tt = np.linspace(0.0, lane.Tcmd, 4001)
+        hc = np.array([cs.path_point(lane.sch.tau(float(t))[0])[2] for t in tt])
+        jumps = np.nonzero(np.abs(np.diff(hc)) > math.pi)[0]
+        assert len(jumps)                                    # the wrapped heading does cross +-pi
+        starts += [float(tt[j]) - 0.02 for j in jumps[:3]]
+    for a in starts:
+        for width in (0.0005, 0.04):
+            v, w = cr.sup(a, a + width)
+            ov, ow = _fd_sup(lane, a, a + width)
+            assert v >= ov - 1e-9 and v <= ov + 0.02 * vmax, (task, a, width, v, ov)
+            if isinstance(lane, cs.Fig8Task):
+                assert w >= ow - 1e-9 and w <= ow + 0.02 * wmax, (task, a, width, w, ow)
+            else:
+                assert w == 0.0
+    for a in rng.uniform(0.01, lane.Tcmd - 0.01, 6):
+        v, w = cr.sup(a, a)                                  # U_t = 0
+        ov, ow = _fd_sup(lane, a - 1e-6, a + 1e-6, n=3)
+        assert v >= ov * (1 - 1e-6) - 1e-9 and (w >= ow * (1 - 1e-6) - 1e-9 or not isinstance(lane, cs.Fig8Task))
+
+
+def test_kt6_drop_tick_still_needs_the_log_over_the_domain(tmp_path):
+    """KT6: branch 'bo' (tick part not added) with the log ending 1 s before T_cmd: the coverage check holds on both
+    branches (OG2-8): no finite U_t, the run is lost to the measurement system, never scored without tick evidence."""
+    out, _ = run_gio(tmp_path, hs_kw=dict(nhanh_tick='bo'), log_kw=dict(post=-1.0))
+    assert out['outcome'] == 'hong_he_do' and 'U_t not bounded' in out['outcome_reasons'][0]
+    assert out['U_t_parts']['nhanh_tick'] == 'bo' and not math.isfinite(out['U_t_parts']['tick_s'])
+
+
+def test_kt6_drop_tick_with_u_t_before_t1_and_report_only(tmp_path):
+    """KT6: branch 'bo', the log covering [0, t1] but not the union domain (U_t holds before t1, CS3-1), a G3 violation
+    before t1: khong_dat with U_t_scope truoc_t1; with G3 report-only no certain violation is left: hong_he_do."""
+    T = lane_of('O1-F05').Tcmd
+    assert T > 9.0
+    fr = make_frames('O1-F05', drop=[(8.0, 8.3)], back=(5.0, 6.0, 0.3))
+    kw = dict(hs_kw=dict(nhanh_tick='bo'), log_kw=dict(post=8.6 - T), frames=fr)
+    out, _ = run_gio(tmp_path, **kw)
+    assert out['outcome'] == 'khong_dat' and out['U_t_scope'] == 'truoc_t1'
+    assert out['U_t_s'] == pytest.approx(sum(out['U_t_parts'][k] for k in ('luoi_s', 'drift_s', 'man_trap_s')))
+    out, _ = run_gio(tmp_path, report_only=frozenset({'g3'}), **kw)
+    assert out['outcome'] == 'hong_he_do' and 'no certain violation before t1' in out['outcome_reasons'][0]
+
+
+def test_kt8_cli_gio_nut_rows(tmp_path, monkeypatch, capsys):
+    """KT8 through main(): --gio-c8b --nut --rows scores without o1_time_sync (clock_match raises if called), writes
+    gio_c8b with the input hashes and rows with t_cam_s, mien_chung, mien_hop; the same frames joined across two
+    nodes by t_cam_s, their command times D apart. Refused (exit 2): one of the pair alone, another log, other
+    frames."""
+    def boom(*a, **k):
+        raise AssertionError('clock_match must not run at a node of the C8b grid')
+    monkeypatch.setattr(cs, 'clock_match', boom)
+    fp = tmp_path / 'frames.csv'
+    cm.write_frames(fp, make_frames('O1-F05'))
+    log = make_log(tmp_path / 'esp32.csv', 'O1-F05')
+    hs_file(tmp_path)
+    g = gio_file(tmp_path, cm.sha256(log), sha256={'esp32': cm.sha256(log), 'frames': cm.sha256(str(fp))})
+    base = ['--frames', str(fp), '--esp32', log, '--task', 'O1-F05', '--hang-so', str(tmp_path / 'hang_so.json')]
+    rows = {}
+    for nut in (1, 2):
+        o, r = tmp_path / f's{nut}.json', tmp_path / f'r{nut}.csv'
+        assert cs.main(base + ['--gio-c8b', g, '--nut', str(nut), '--rows', str(r), '--out', str(o)]) == 0
+        s = json.loads(o.read_text(encoding='utf-8'))
+        assert s['offset_src'] == 'c8b_gio' and s['sync'] is None and s['gio_c8b']['nut'] == nut
+        assert s['gio_c8b']['vao'] == {'esp32': cm.sha256(log), 'frames': cm.sha256(str(fp))}
+        with open(r, encoding='utf-8') as f:
+            rows[nut] = {float(x['t_cam_s']): x for x in csv.DictReader(f)}
+        assert all({'t_cam_s', 'mien_chung', 'mien_hop'} <= set(x) for x in rows[nut].values())
+    common = set(rows[1]) & set(rows[2])
+    assert len(common) > 0.95 * min(len(rows[1]), len(rows[2]))
+    assert all(float(rows[2][k]['t']) - float(rows[1][k]['t']) == pytest.approx(NODES[2] - NODES[1], abs=1e-9)
+               for k in common)
+    assert cs.main(base + ['--gio-c8b', g, '--out', str(tmp_path / 'x1.json')]) == 2
+    assert cs.main(base + ['--nut', '2', '--out', str(tmp_path / 'x2.json')]) == 2
+    log2 = tmp_path / 'esp32b.csv'
+    log2.write_bytes(open(log, 'rb').read().replace(b'# synthetic log', b'# synthetic log2', 1))
+    args = ['--frames', str(fp), '--esp32', str(log2), '--task', 'O1-F05', '--hang-so', str(tmp_path / 'hang_so.json'),
+            '--gio-c8b', g, '--nut', '2', '--out', str(tmp_path / 'x3.json')]
+    capsys.readouterr()
+    assert cs.main(args) == 2 and 'another esp32' in capsys.readouterr().err
+    fp2 = tmp_path / 'other' / 'frames.csv'
+    fp2.parent.mkdir()
+    cm.write_frames(fp2, make_frames('O1-F05')[1:])
+    args = ['--frames', str(fp2), '--esp32', log] + base[4:] + ['--gio-c8b', g, '--nut', '2', '--out',
+                                                                 str(tmp_path / 'x4.json')]
+    assert cs.main(args) == 2 and 'another frames' in capsys.readouterr().err
+    assert not any((tmp_path / f'x{i}.json').exists() for i in range(1, 5))
+
+
+def test_kt8_rows_domain_flags_on_the_cat_t1_branch(tmp_path):
+    """KT8: at a node, a certain violation before t1 (cat_t1): both domains are the scored frames before t1, so
+    mien_chung = mien_hop = 1 exactly on those rows."""
+    fr = make_frames('O1-F05', drop=[(8.0, 8.3)], lat_fn=lambda t: 0.13 if 5.0 <= t < 6.0 else 0.0)
+    out, rows = run_gio(tmp_path, frames=fr)
+    assert out['cat_t1'] and out['outcome'] == 'khong_dat'
+    t1 = out['t1']
+    assert out['t1_kind'] == 'khoang_trong'               # a gap: the frame that starts it is before t1 (t <= t1)
+    assert all(r['mien_chung'] == r['mien_hop'] == int(bool(r['scored']) and r['t'] <= t1 + 1e-12) for r in rows)
+    assert any(r['scored'] and r['t'] > t1 and not r['mien_hop'] for r in rows)
+    assert sum(r['mien_hop'] for r in rows) == out['gate_v3']['g2']['n_frames']

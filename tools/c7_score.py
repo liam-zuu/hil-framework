@@ -32,22 +32,30 @@ Clock (O1 3.4): t = 0 is the run_active rising edge of the log by o1_cmd_path.fi
 run_active = 1 whose line just before by log_seq was received with 0; that line lost: run lost to the
 measurement system). The video clock is matched by o1_time_sync.sync (C7b), or --offset-s with a reason; not
 matched: run lost to the measurement system. Command time of a frame: t = t_cam + offset - t0.
-U_t (O1 3.5 SC-12; C8b v4 3) = parts in U_t_parts: C7b match: u_t_ghep_s (its residual, constants) + drift +
-shutter + tick; --offset-s (a node of the C8b time grid, or any given offset): --offset-err-s (luoi_s, the grid
-step) + drift + shutter + tick, u_t_ghep_s not added (no C7b match) (drift_bound, shutter_bound, tick_max_s):
-  shutter  hang_so man_trap absent: one frame (median frame interval); else |alpha_r| row span + |alpha_c| column
-         span of the car tag over the match window and the domain to t_deadline (C8B4R2-6, -9, C8B4R4-1).
+U_t (O1 3.5 SC-12) = parts in U_t_parts (drift_bound, shutter_bound, tick_max_s). The budget of C8b v4 3 holds ONLY
+at a node of the C8b time grid; without --gio-c8b the earlier budget is kept (Codex round 1 of v11.33):
+  C7b match (o1_time_sync)  u_t_ghep_s (its residual, constants) + drift + tick; no shutter part.
+  --offset-s                u_t_ghep_s + --offset-err-s + drift + tick; no shutter part.
+  --gio-c8b FILE --nut K    D = nodes_s[K]: luoi_s (the whole grid step, largest gap of adjacent nodes, each at most
+                            1 ms) + drift + shutter + tick by branch; u_t_ghep_s and --offset-err-s not added. FILE must
+                            name, by sha256 {esp32, frames}, the log and frames.csv scored (Codex VG1-1).
+  shutter  (--gio-c8b only) hang_so man_trap absent: one frame (median frame interval); else |alpha_r| row span +
+         |alpha_c| column span of the car tag over the frames in the match window UNION [0, t_deadline] (C8B4R2-6,
+         -9, C8B4R4-1; Codex VG1-2).
   drift  the clock-rate part up to t_deadline (CS1-4): rate = max(C7b |offset_end - offset_start| / distance of the
          third centres, troi_ppm) x the largest distance from the centre of the C7b window to [0, t_deadline], plus
          |offset used - mean of the thirds|; C7b short (K1): troi_ppm alone (CS1-6); --offset-s: troi_ppm x the
          largest distance from any point of --offset-anchor-s (T, or the match window A,B, C8B4R2-4) to any point of
-         [0, t_deadline], and --offset-err-s added; no anchor or error: refused (CS2-1).
+         [0, t_deadline], and --offset-err-s added; no anchor or error: refused (CS2-1); --gio-c8b: troi_ppm x the
+         largest distance from any point of the match window cua_so_ghep_log_s (command time) to any point of
+         [0, t_deadline] (C8b v4 3).
          e_max (S05 4.7 (i), Pi / ESP32) is not used: it does not bound the camera clock.
   tick   the largest interval between consecutive RECEIVED log lines meeting [t0, t0 + end of the union domain]
          (CS2-2: the domain scored, not t_deadline; a lost line may hide a long tick; the pairs across the window
          ends count; CS1-5); the log not reaching both ends: no finite U_t, the run is lost to the measurement system.
          O1 v11.33 SC-12 (OG2-1, OG3-4): hang_so nhanh_tick 'giu' keeps this part (default before C8), 'bo' drops it
-         and needs the clock match on sample marks at their true times (C8b; a match without it is refused); the
+         and needs the clock match on sample marks at their true times (C8b, --gio-c8b; a match without it is refused,
+         and the log must still cover both ends, else the run is lost as on 'giu', KT6); the
          branch is required in a locked file. The coverage check above holds on both branches (OG2-8).
 
 Frames (O1 3.3)
@@ -122,7 +130,8 @@ first time the IMU motion leaves the locked U_IMU range (angle turned, gyro rate
 whether or not the yaw is aligned, CS2-9; handling: Liam decides when it happens, O1 3.3).
 
   python tools/c7_score.py --frames <dir>/frames.csv --esp32 <run>.csv --sender <run>_sender.txt --task O1-F05 \
-      --hang-so hang_so.json --out score.json [--offset-s D --offset-reason TEXT --offset-anchor-s T|A,B --offset-err-s E]
+      --hang-so hang_so.json --out score.json [--offset-s D --offset-reason TEXT --offset-anchor-s T|A,B --offset-err-s E
+      | --gio-c8b gio.json --nut K]
       [--k-start X,Y,DEG] [--allow-final-set] [--events <run>.csv.events.txt] [--rows rows.csv]
 Last line: #ket_qua,ma=0,outcome=... scored (hong_he_do included) / 2 refused or any error (CS1-6).
 """
@@ -354,9 +363,13 @@ class CmdRates:
     """V(t) = |dp_cmd/dt|, W(t) = |dpsi_cmd/dt| of a lane on its true schedule, and their sup over an interval.
     rate(t) -> (V, W) is exact at t (figure 8: |p'(tau)| tau_dot, |dpsi/dtau| tau_dot; K: the task speed, W = 0); it is
     continuous on [0, T_cmd] and 0 outside (the command holds its end values, OG2-2). sup(a, b): the largest value on
-    a grid of step DT plus the two ends of [a, b] cut to [0, T_cmd], plus L DT / 2, L = 2 x the largest slope seen
-    between grid points (a Lipschitz bound with margin: between two grid points the function cannot rise above the
-    larger end by more than L DT / 2)."""
+    a grid of step DT plus the two ends of [a, b] cut to [0, T_cmd], plus a margin pad = the largest change of the
+    sampled rate between two adjacent grid points over the whole schedule (pad = L DT / 2 with L = 2 x that change /
+    DT). This is a SAMPLED bound with a margin, not a proven one (Codex round 1 of v11.33, P3): the margin covers a
+    rise between two grid points of up to twice the largest sampled slope, which holds for these schedules (smooth
+    between their few breakpoints, checked by test_v11_33_cmd_rates_against_a_finite_difference_oracle, an oracle
+    built from the command positions and headings, not from rate()), but is not derived from a bound on the second
+    derivative."""
     DT = 1e-3
 
     def __init__(self, lane):
@@ -1112,12 +1125,13 @@ def anchor_window(anchor_s):
     return v
 
 
-def shutter_bound(frames, mt, t_cmd, lo, hi):
+def shutter_bound(frames, mt, t_cmd, spans):
     """(rolling-shutter term of U_t [s], how) (C8b v4 3, C8B4R2-6, -9): without hang_so man_trap one frame (the
     median frame interval of frames.csv); with man_trap {alpha_r_s_px, alpha_c_s_px} (measured by phep 3b, margin
     already in) |alpha_r| x (row span) + |alpha_c| x (column span) of the car tag over the frames with the car seen
-    whose command time t_cmd is in [lo, hi] (the match window and the scored domain to t_deadline; the row, column
-    the offset belongs to is not known, C8B4-5). A column term without col_px in frames.csv: refused."""
+    whose command time t_cmd lies in the UNION of the closed intervals spans (the match window and the scored domain
+    [0, t_deadline]; Codex VG1-2: the union, not the hull, so a frame between two disjoint parts does not count; the
+    row, column the offset belongs to is not known, C8B4-5). A column term without col_px in frames.csv: refused."""
     if mt is None:
         t = np.array([r['t_s'] for r in frames], float)
         dt = np.diff(t)
@@ -1126,7 +1140,8 @@ def shutter_bound(frames, mt, t_cmd, lo, hi):
             raise ValueError('frames.csv: no frame interval for the rolling-shutter term (one frame)')
         f = float(np.median(dt))
         return f, f'one frame ({f * 1e3:.2f} ms, no man_trap in hang_so)'
-    sel = [r for r, tc in zip(frames, t_cmd) if r.get('car_seen') and lo <= tc <= hi]
+    spans = [(float(a), float(b)) for a, b in spans]
+    sel = [r for r, tc in zip(frames, t_cmd) if r.get('car_seen') and any(a <= tc <= b for a, b in spans)]
     out = 0.0
     parts = []
     for key, col in (('alpha_r_s_px', 'row_px'), ('alpha_c_s_px', 'col_px')):
@@ -1135,8 +1150,9 @@ def shutter_bound(frames, mt, t_cmd, lo, hi):
             continue
         v = np.array([r.get(col, float('nan')) for r in sel], float)
         if not v.size or not np.all(np.isfinite(v)):
+            where = ' U '.join(f'[{a0:.3f}, {b0:.3f}]' for a0, b0 in spans)
             raise ValueError(f'hang_so man_trap {key} != 0 needs {col} on every frame with the car seen in '
-                             f'[{lo:.3f}, {hi:.3f}] s (track again with c7_measure at this commit)')
+                             f'{where} s (track again with c7_measure at this commit)')
         span = float(v.max() - v.min())
         out += a * span
         parts.append(f'{a:g} s/px x {span:.1f} px ({col})')
@@ -1144,13 +1160,23 @@ def shutter_bound(frames, mt, t_cmd, lo, hi):
 
 
 GIO_FORMAT = 'c8b_gio_v1'
+GIO_STEP_MAX_S = 1e-3          # C8b v4 3: adjacent nodes at most 1 ms apart (Codex VG1-3)
+GIO_STEP_TOL_S = 1e-9          # float tolerance on that limit
+GIO_SHA_KEYS = ('esp32', 'frames')     # c8b_gio writes sha256 {esp32, frames} of the files it matched (Codex VG1-1)
 
 
-def load_gio(path, nut):
+def _hex64(v):
+    return isinstance(v, str) and len(v) == 64 and all(c in '0123456789abcdef' for c in v)
+
+
+def load_gio(path, nut, esp32_sha256, frames_sha256):
     """The time-grid file of the C8b script (c8b_gio_v1, CODE_C8B; interface 1 of CODE 17/11) at node nut: D =
     nodes_s[nut] (t_log = t_cam + D), the match window cua_so_ghep_log_s [a, b] (ESP32 clock, s), the grid step (the
     largest gap between adjacent nodes, 0 for one node). Refused unless moc_mau and ok are true, the nodes finite and
-    increasing, the window finite with a <= b, nut a node index."""
+    increasing with adjacent nodes at most 1 ms apart (C8b v4 3; Codex VG1-3), the window finite with a <= b, nut a
+    node index, and (Codex VG1-1) the file's sha256 {esp32, frames} (64 lowercase hex each) equal to the sha256 of the
+    ESP32 log and the frames.csv being scored: a grid file of another run, or one without that evidence, never gives
+    D, the match window or the tick branch 'bo' to this run."""
     with open(path, encoding='utf-8') as f:
         d = json.load(f, parse_constant=lambda c: (_ for _ in ()).throw(ValueError(f'{c} in {path}')))
     if not isinstance(d, dict) or d.get('format', GIO_FORMAT) != GIO_FORMAT:
@@ -1158,11 +1184,24 @@ def load_gio(path, nut):
     if d.get('moc_mau') is not True or d.get('ok') is not True:
         raise ValueError(f'{path}: moc_mau and ok must be true (C8b v4 3, 7: the match on sample marks, every check '
                          f'passed): moc_mau {d.get("moc_mau")!r}, ok {d.get("ok")!r}')
+    sha = d.get('sha256')
+    if not isinstance(sha, dict) or not all(_hex64(sha.get(k)) for k in GIO_SHA_KEYS):
+        raise ValueError(f'{path}: sha256 {{esp32, frames}} (64 lowercase hex each) of the files the grid was made from '
+                         f'is required (Codex VG1-1): {sha!r}')
+    for k, want in zip(GIO_SHA_KEYS, (esp32_sha256, frames_sha256)):
+        if sha[k] != want:
+            raise ValueError(f'{path}: made from another {k} file (sha256 {sha[k]} != {want} of the file scored; '
+                             'Codex VG1-1)')
     nodes = d.get('nodes_s')
     if not isinstance(nodes, list) or not nodes or not all(
             isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) for x in nodes) \
             or any(b <= a for a, b in zip(nodes[:-1], nodes[1:])):
         raise ValueError(f'{path}: nodes_s must be finite numbers, increasing, not empty')
+    wide = [(i, b - a) for i, (a, b) in enumerate(zip(nodes[:-1], nodes[1:])) if b - a > GIO_STEP_MAX_S + GIO_STEP_TOL_S]
+    if wide:
+        i, g = wide[0]
+        raise ValueError(f'{path}: nodes_s {i}, {i + 1} are {g * 1e3:.6f} ms apart; adjacent nodes at most 1 ms '
+                         '(C8b v4 3; Codex VG1-3)')
     w = d.get('cua_so_ghep_log_s')
     if not isinstance(w, list) or len(w) != 2 or not all(
             isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) for x in w) or w[1] < w[0]:
@@ -1171,7 +1210,8 @@ def load_gio(path, nut):
         raise ValueError(f'--nut {nut!r}: a node index 0..{len(nodes) - 1}')
     step = max((b - a for a, b in zip(nodes[:-1], nodes[1:])), default=0.0)
     return dict(file=os.path.basename(path), sha256=cm.sha256(path), nut=nut, D=float(nodes[nut]),
-                win_log_s=[float(w[0]), float(w[1])], step_s=float(step), n_nodes=len(nodes))
+                win_log_s=[float(w[0]), float(w[1])], step_s=float(step), n_nodes=len(nodes),
+                vao={k: sha[k] for k in GIO_SHA_KEYS})
 
 
 def drift_bound(sync, offset_s, t0_s, deadline, troi_ppm, anchor_s=None):
@@ -1278,8 +1318,18 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
         raise ValueError(f'{task} is the final test set (O1 3.7): only with --allow-final-set')
     if task in FINAL_SET and k_start is None:
         raise ValueError(f'{task}: give --k-start X,Y,HEAD_DEG (nominal start pose, locked at C8)')
+    if report_only and task not in FIG8:
+        raise ValueError(f'report_only {sorted(report_only)} on {task}: K1, K2 decide on all five conditions '
+                         '(CODE_GATE 4; Codex VG1-4)')
     if gio is not None and offset_s is not None:
         raise ValueError('--gio-c8b and --offset-s: one clock source only')
+    if gio is not None:
+        # Codex VG1-1: the grid file must name the log and the frames scored (load_gio checks it at the CLI; checked
+        # again here for a grid dict handed to score() directly)
+        vao = gio.get('vao') or {}
+        if frames_sha256 is None or vao.get('frames') != frames_sha256 or vao.get('esp32') != cm.sha256(esp32_path):
+            raise ValueError('--gio-c8b: the grid file was not made from the ESP32 log and frames.csv scored '
+                             '(sha256 esp32 / frames differ or not given; Codex VG1-1)')
     if offset_s is not None:
         if not offset_reason.strip():
             raise ValueError('--offset-s needs --offset-reason (C7b skipped)')
@@ -1342,7 +1392,7 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
         drift, drift_src = lim * far, f'troi_ppm x {far:.3f} s from the match window [{win[0]:.3f}, {win[1]:.3f}] s'
         ghep, off_err, luoi = 0.0, 0.0, gio['step_s']
         shut, shut_src = shutter_bound(frames, hs.get('man_trap'), t_cam + offset_s - t0_us / 1e6,
-                                       min(win[0], 0.0), max(win[1], deadline))
+                                       [win, (0.0, deadline)])
         u_t_parts = dict(ghep_s=0.0, offset_err_s=0.0, luoi_s=luoi, drift_s=drift, drift_src=drift_src,
                          man_trap_s=shut, man_trap_src=shut_src)
 
@@ -1502,7 +1552,8 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
                offset_reason=offset_reason if sync is None and gio is None else '',
                offset_anchor_s=offset_anchor_s if sync is None and gio is None else None,
                offset_err_s=offset_err_s if sync is None and gio is None else None,
-               gio_c8b=None if gio is None else {k: gio[k] for k in ('file', 'sha256', 'nut', 'D', 'win_log_s', 'step_s')},
+               gio_c8b=None if gio is None else {k: gio[k] for k in ('file', 'sha256', 'nut', 'D', 'win_log_s', 'step_s',
+                                                                    'vao')},
                sync=None if sync is None else dict(corr=sync.corr, offset_start_s=sync.offset_start_s,
                                                     offset_end_s=sync.offset_end_s,
                                                     start_end_diff_s=sync.start_end_diff_s, short=sync.short,
@@ -1572,7 +1623,7 @@ def main(argv=None):
         fsha = cm.sha256(a.frames)
         if (a.gio_c8b is None) != (a.nut is None):
             raise ValueError('--gio-c8b and --nut go together')
-        gio = load_gio(a.gio_c8b, a.nut) if a.gio_c8b else None
+        gio = load_gio(a.gio_c8b, a.nut, cm.sha256(a.esp32), fsha) if a.gio_c8b else None
         # Codex CC1-3: the events file actually read (given, or the default beside the log), by name and sha256
         evp = a.events or (a.esp32 + '.events.txt')
         evp = evp if os.path.exists(evp) else None
