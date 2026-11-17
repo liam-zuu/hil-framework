@@ -317,19 +317,26 @@ def test_build_cam_u_refuses(bad):
 
 
 def test_c8b_u_reads_the_export():
-    """The file written by build_cam_u is read by c8b_u.u_p_u_psi (CODE_C8B, hil feat/c8b-u 67c229a); runs on the
-    integration branch where both files are, skipped before."""
+    """KCC1-13: the file written by build_cam_u, read by CODE_C8B's c8b_u (hil feat/c8b-u d338af4: check_cam,
+    nguong + 2 u_so, A3.quy_ve_ma_noc required); runs where c8b_u v2 with check_cam is importable (integration
+    branch), skipped before. (1) Our export is refused while A3 is not carried to the car tag (no quy_ve_ma_noc);
+    (2) with the flag set here ONLY to reach the formula, the mark-shift part of P1 is nguong + 2 u_so (u 0.3 mm:
+    1.6 mm, not 1.3 mm)."""
     CU = pytest.importorskip('c8b_u')
-    if getattr(CU, 'CAM_VERSION', None) != kc.CAM_U_VERSION:
-        pytest.skip('c8b_u of another camera-file version')
+    if getattr(CU, 'CAM_VERSION', None) != kc.CAM_U_VERSION or not hasattr(CU, 'check_cam'):
+        pytest.skip('c8b_u of another camera-file version (before d338af4)')
     cam = json.loads(json.dumps(kc.build_cam_u(_own(), _parts())))
-    tk = {"version": "c8b_thuoc_kep_v1", "cao_4_goc_mm": [120.2, 120.0, 119.8, 120.1], "e_mm": 0.1,
-          "goc_dan": {"a_mm": 10.3, "b_mm": 10.1, "L_mm": 96.4, "canh": "trai"}, "tam_than_deg": 0.05}
+    with pytest.raises(CU.UError, match='quy_ve_ma_noc'):
+        CU.check_cam(cam)
+    cam['A3']['quy_ve_ma_noc'] = True                                   # test only: the method is not approved yet
+    CU.check_cam(cam)
+    tk = {"version": "c8b_thuoc_kep_v2", "cao_4_goc_mm": [120.2, 120.0, 119.8, 120.1], "e_mm": 0.1, "s_mm": 96.4,
+          "canh": {"truoc": [10.3, 10.1], "phai": [10.2, 10.0], "sau": [10.1, 10.3], "trai": [10.0, 10.2]},
+          "tam_than_deg": 0.05}
     xo = {"version": "c8b_xoay_v1", "q_tag_m": [0.003, -0.004], "du_m": 0.0007}
     tb = dict(ga_ok=True, d_p_quay_m=0.0007, d_psi_quay_deg=0.25)
     up, p, upsi, s = CU.u_p_u_psi(cam, tb, tk, xo)
-    # KC1-3 / KCC1-13: the undetected shift adds nguong + 2 u_so (C8B d338af4); 1 x u_so is refused here
-    assert p['P1_anh_san'] == pytest.approx(0.0034 + 0.001 + 2 * 0.0003)
+    assert p['P1_anh_san'] == pytest.approx(max(0.0034, 0.003) + 0.001 + 2 * 0.0003)
     assert s['A3_huong_vung'] == pytest.approx(0.15) and s['A5_nhieu_khung'] == pytest.approx(0.4)
     assert p['P7_nhieu_khung'] == pytest.approx(0.0006)
 
@@ -422,6 +429,7 @@ def test_xuat_ok(tmp_path):
     assert kc.main(_xuat_args(tmp_path, _kc_file(tmp_path))) == 0
     out = json.loads((tmp_path / 'o.json').read_text(encoding='utf-8'))
     assert out['P1']['tung_khung_max_m'] == 0.003 and out['version'] == 'c8_cam_u_vao_v2'
+    assert out['P1']['luot_thieu_kiem'] == ['r3']                     # KCC1-11: runs short of checks stay marked
 
 
 @pytest.mark.parametrize('bad', ['thu', 'no_Hm', 'tk_buoi', 'tk_nhom', 'tk_model', 'tk_sha', 'tk_not_rescored',
@@ -681,3 +689,102 @@ def test_u_so_flags_a_single_target_without_window(scene):
                             marks, groups, gc)
     assert any(x.get('moc') == j and x['vi'] in ('tho', 'cua_so') for x in res['xe']['khong_tinh_duoc'])
     assert dict(nhom_dich=0, tap=fit_full) not in res['xe']['tap_tinh']
+
+
+def test_u_so_raw_counts_without_a_window(scene):
+    """KCC2-2: samples too short for a window (fewer than 10 in a row) still give the raw maximum."""
+    marks, cam, img = scene
+    groups = kc.make_groups(sorted(img))
+    j = groups[0][0]
+    jump = dict(marks)
+    jump[j] = (marks[j][0] + 0.005, marks[j][1], SIDE)
+    seen = image_of(cam, jump)
+    blank = {i: c for i, c in img.items() if i != j}
+    frames = [seen if k % 12 == 0 else blank for k in range(48)]     # j seen once every 0.2 s: never 10 in a row
+    gc = kc.GroupCams(img, marks, groups, 'B1', W, H, ZC)
+    t = [k / 60 for k in range(48)]
+    res, _ = kc.u_so_family(t[:20], [img] * 20, img, t, frames, marks, groups, gc)
+    assert res['xe']['tho_m'] >= 0.005 - 3e-5
+    assert any(x.get('moc') == j and x['vi'] == 'cua_so' for x in res['xe']['khong_tinh_duoc'])
+
+
+def test_frame_check_idle_comparator_not_checked():
+    """KCC1-4: a comparator with no target in the frame (its whole group hidden) is not checked."""
+    no_g0 = [2, 3, 4, 6, 7]                                           # group 0 = {1, 5} and mark 8 hidden
+    computed = _chains()                                              # only the full-set fits computed
+    r = kc.run_frame_check(_frames(anchors={k: no_g0 for k in range(100)}),
+                           [dict(khung=str(k), moc='6', nhom='1', ex='0.001', ey='0.0') for k in range(100)],
+                           {}, GR, computed)
+    lost_target0 = [x for x in r['tap_chua_tinh'] if x['nhom_dich'] == 0]
+    assert lost_target0 == []
+
+
+def test_tung_khung_contradiction_needs_the_chain_xe_schedule(tmp_path):
+    """KCC1-12: an exclusion of the mark in another chain does not clear a chain-xe contradiction; KCC2-1: a large
+    own part at H_b is not a contradiction (H_b sets u_so)."""
+    args, out = _tk_setup(tmp_path, theo={'H_m': dict(rieng_m={'5': 0.0020}), 'H_b': dict(rieng_m={'6': 0.004})})
+    d = tmp_path / 'r1'
+    tr = json.loads((d / 'track.json').read_text(encoding='utf-8'))
+    tr['moc_loai'] = [dict(chuoi='1', id=5, t_bd=1.0)]
+    tr['cham_lai'] = 2
+    (d / 'track.json').write_text(json.dumps(tr), encoding='utf-8')
+    assert kc.main(args) == 0
+    t = json.loads(out.read_text(encoding='utf-8'))
+    assert t['mau_thuan'] == [dict(clip='H_m', moc=5)]
+
+
+def _fake_session(tmp_path, name, img, marks, video):
+    s = dict(kind='c7_session', model_khoa='B1', chosen='B1', width=W, height=H, zc_tape_m=ZC,
+             fit_ids=sorted(img), marks={str(i): list(m) for i, m in marks.items()},
+             ref_corners_px={str(i): c.tolist() for i, c in img.items()}, video_sha256=kc.sha256_file(str(video)))
+    p = tmp_path / f'{name}.json'
+    p.write_text(json.dumps(s), encoding='utf-8')
+    return p
+
+
+def _phan_tich_args(tmp_path, scene, extra_mark=False, cut=False):
+    marks, cam, img = scene
+    video = tmp_path / 'clip.mov'
+    video.write_bytes(b'not a video')
+    moc = tmp_path / 'moc.csv'
+    rows = ['id,vai_tro,x_cm,y_cm,canh_den_mm,dict,sigma_x_mm,sigma_y_mm,canh_nguon']
+    for i, (x, y, sd) in marks.items():
+        rows.append(f'{i},moc_san,{x * 100!r},{y * 100!r},{sd * 1000!r},DICT_4X4_50,0.8,0.9,do')
+    if extra_mark:
+        rows.append('33,moc_giua,10,10,96.4,DICT_4X4_50,0.8,0.9,do')
+    moc.write_text('\n'.join(rows) + '\n', encoding='utf-8')
+    hs = tmp_path / 'hang_so.json'
+    hs.write_text('{}', encoding='utf-8')
+    args = ['phan_tich', '--buoi', 'C8_x', '--model', 'B1', '--moc', str(moc), '--hang-so', str(hs), '--L-max', '0.6',
+            '--out', str(tmp_path / 'kc')]
+    for n in ('a', 'b', 'm', 'z'):
+        args += [f'--H-{n}', str(_fake_session(tmp_path, n, img, marks, video)), f'--video-{n}', str(video)]
+    if cut:
+        args += ['--max-frames', '20']
+    return args
+
+
+def test_phan_tich_cut_clip_is_a_trial_and_not_exported(tmp_path, scene, monkeypatch):
+    """KCC1-10 on the production path: --max-frames makes the kiem_cheo result a trial; tung_khung refuses it."""
+    marks, cam, img = scene
+    monkeypatch.setattr(kc, 'clip_dets', lambda v, ids, max_frames=None: ([k / 60 for k in range(20)], [img] * 20))
+    assert kc.main(_phan_tich_args(tmp_path, scene, cut=True)) == 0
+    r = json.loads((tmp_path / 'kc' / 'kiem_cheo.json').read_text(encoding='utf-8'))
+    assert r['thu'] is True
+    assert kc.main(['tung_khung', '--buoi', 'C8_x', '--kiem-cheo', str(tmp_path / 'kc' / 'kiem_cheo.json'),
+                    '--u-so', str(tmp_path / 'kc' / 'u_so.json'), '--ke-hoach', str(tmp_path / 'moc.csv'),
+                    '--luot', f'r1={tmp_path}', '--out', str(tmp_path / 'tk.json')]) == 2
+
+
+def test_phan_tich_full_run_and_missing_measured_mark(tmp_path, scene, monkeypatch):
+    """The production path runs end to end (not a trial); a measured floor mark absent from the sessions is refused
+    (KCC1-14)."""
+    marks, cam, img = scene
+    monkeypatch.setattr(kc, 'clip_dets', lambda v, ids, max_frames=None: ([k / 60 for k in range(20)], [img] * 20))
+    assert kc.main(_phan_tich_args(tmp_path, scene)) == 0
+    r = json.loads((tmp_path / 'kc' / 'kiem_cheo.json').read_text(encoding='utf-8'))
+    assert r['thu'] is False and r['u_so_sha256'] == kc.sha256_file(str(tmp_path / 'kc' / 'u_so.json'))
+    t2 = tmp_path / 'second'
+    t2.mkdir()
+    assert kc.main(_phan_tich_args(t2, scene, extra_mark=True)) == 2
+    assert not (t2 / 'kc' / 'kiem_cheo.json').exists()

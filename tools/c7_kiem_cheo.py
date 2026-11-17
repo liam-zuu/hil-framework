@@ -412,12 +412,13 @@ def u_so_family(times_a, dets_a, img_b, times_b, dets_b, marks, groups, gcams, t
                             continue
                         seq = [None if p is None or j not in p else p[j] for p in fb]
                         got = [v for v in seq if v is not None]
+                        if got:                              # KCC2-2: the raw maximum counts even without a window
+                            raw = max(raw, max(float(np.linalg.norm(v - pb[j])) for v in got))
                         wins = windows_by_time(times_b, seq, win_s, min_n, gap_s)
                         if not got or not wins:
                             khong.append(dict(nhom_dich=t, tap=sorted(fit), moc=j, vi='tho' if not got else 'cua_so'))
                             ok = False
                             continue
-                        raw = max(raw, max(float(np.linalg.norm(v - pb[j])) for v in got))
                         filt = max(filt, max(float(np.linalg.norm(m - pb[j])) for m in wins))
                 if ok:
                     tinh.append(dict(nhom_dich=t, tap=sorted(fit)))
@@ -633,6 +634,8 @@ def run_frame_check(frames, khung, track, groups, u_so_chains, max_thieu=COVER_M
         for c, cmp_ in comp.items():
             A = _ids(r[f'moc_neo_{c}'])
             for tg, E in cmp_.items():
+                if not any(gmap.get(i) == tg for i in A):
+                    continue                       # KCC1-4: no target of group tg in this frame, the comparator is idle
                 fit = frozenset(i for i in A if gmap.get(i) not in E)
                 if len(fit) >= MIN_TRAIN and (c, tg, fit) not in done:
                     lost_sets.add((c, tg, tuple(sorted(fit))))
@@ -713,11 +716,11 @@ def tung_khung(a):
         luot[rid] = r
         if r['max_m'] is not None:
             e_all = r['max_m'] if e_all is None else max(e_all, r['max_m'])
-        loai |= {int(m['id']) for m in tr.get('moc_loai') or []}
+        loai |= {int(m['id']) for m in tr.get('moc_loai') or [] if str(m.get('chuoi')) == 'xe'}   # KCC1-12
     thieu_luot = sorted(set(plan) - set(luot))
     # KCC1-12: a mark whose own shift at H_m / H_z is above the chain-xe threshold but that no run excluded
     ng = chains['xe']['nguong_m']
-    mau = sorted({(n, int(i)) for n, tc in (kc.get('theo_thoi_gian') or {}).items()
+    mau = sorted({(n, int(i)) for n, tc in (kc.get('theo_thoi_gian') or {}).items() if n in ('H_m', 'H_z')  # KCC2-1
                   for i, r in (tc.get('rieng_m') or {}).items() if r > ng and int(i) not in loai})
     out = dict(version=TUNG_KHUNG_VERSION, buoi=a.buoi, model=kc['model'], nhom=groups, moc=kc.get('moc'),
                hang_so_sha256=kc.get('hang_so_sha256'), kiem_cheo_sha256=sha256_file(a.kiem_cheo), u_so_sha256=sha_u,
@@ -761,6 +764,11 @@ def phan_tich(a):
         if any(mk[i] != mk_a[i] for i in mk if i in mk_a):
             raise KCError(f'{n}: mark coordinates differ from H_a (one marker file per session)')
     moc_rows = load_moc(a.moc)
+    need = {i for i in moc_rows if i != 0}
+    for n, (img, *_r) in clips.items():
+        lack = sorted(need - set(img))
+        if lack and not a.thu:
+            raise KCError(f'{n}: measured floor marks {lack} not in the session fit (no baseline, KCC1-14)')
     sig = check_moc(moc_rows, mk_a, sorted(set().union(*[set(c[0]) for c in clips.values()])), a.thu)
     groups = session_groups(raw['H_a'], ids_a, a.groups)
     tap = None
@@ -907,7 +915,7 @@ def kiem_h_cli(a):
     missing = sorted(set(ids) - {int(i) for i in s['fit_ids']})
     r = kiem_h(clip_dets(a.video, set(ids))[1], ids)
     if missing:
-        print(f'kiem_h: moc khong co trong session: {missing}')
+        raise KCError(f'clip H khong dat: moc {missing} khong co trong session (KCC1-14), quay lai clip H')
     low = [i for i, v in r['ti_le_moc'].items() if v < a.nguong]
     print(f"kiem_h: {r['n_khung']} khung, cung luc moi moc {r['ti_le_cung_luc'] * 100:.1f} % (can >= "
           f"{a.nguong * 100:.0f} %); moc duoi nguong: {low}")
