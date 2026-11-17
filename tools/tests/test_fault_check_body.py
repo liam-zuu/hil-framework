@@ -70,6 +70,37 @@ def test_drag_below_the_threshold_is_recorded_zero():
     """ref_body: F when hypot(vx, vy) >= 1e-3 at the start of the step, else 0."""
     import fault_schedule as fs
     rows = fs.parse(fs.MAGIC + '\nid,fault,target,start_ms,end_ms,params\nD1,body_drag,body,0,10,F=2\n')
-    assert fc.ref_body(rows, [0], 3, (6e-4, 7e-4), {}) == (0.0, 0.0)
-    assert fc.ref_body(rows, [0], 3, (6e-4, 8e-4), {}) == (2.0, 0.0)
-    assert fc.ref_body(rows, [], 3, (1.0, 0.0), {}) == (0.0, 0.0)
+    assert fc.ref_body(rows, [0], 3, (6e-4, 7e-4), {}) == (0.0, 0.0, 0.0)
+    assert fc.ref_body(rows, [0], 3, (6e-4, 8e-4), {}) == (2.0, 0.0, 0.0)
+    assert fc.ref_body(rows, [], 3, (1.0, 0.0), {}) == (0.0, 0.0, 0.0)
+
+
+# -- Codex round 1 (FS1-2, ARM/PC note) --
+def test_speed_beyond_the_frame_range_passes(tmp_path):
+    # FS1-2: a valid speed beyond +-3 m/s is clamped by the frame encoding, not a mismatch
+    body = 'L1,load_dist,body,0,2,F0=20000;rate=0;Fmax=0;sigma=0;seed=0;dir_deg=0' + chr(10)
+    run = open_loop(tmp_path, body=body)
+    import json
+    man = json.loads(str(np.load(run[0])['manifest']))
+    rec = np.load(os.path.join(os.path.dirname(run[0]), man['faults']['plant_record']['file']))['record']
+    assert rec[-1, C['vx']] > 3.0                       # the start of step 1: already beyond the frame range
+    r = fc.check(*run)
+    assert r['ok'], r['fails']
+
+
+def test_vel_ok_clamps_both_signs():
+    s = 3.0 / 32767
+    assert fc._vel_ok(3.0, 3.1, 3.0, s) and fc._vel_ok(-3.0, -7.0, 3.0, s) and fc._vel_ok(2.5, 2.5 + 0.4 * s, 3.0, s)
+    assert not fc._vel_ok(2.9, 3.1, 3.0, s) and not fc._vel_ok(3.0, float('nan'), 3.0, s)
+    assert not fc._vel_ok(3.0, float('inf'), 3.0, s)
+
+
+@pytest.mark.parametrize('ulps,ok', [(1, True), (8, True), (64, False)])
+def test_f_dist_within_a_few_ulp(run, tmp_path, ulps, ok):
+    # ARM/PC: numpy's normal draws may differ by an ULP (libm log in the ziggurat tail): f_dist within ULP_TOL
+    def edit(rec):
+        v = rec[200, C['f_dist']]
+        rec[200, C['f_dist']] = v + ulps * np.spacing(abs(v))
+        return rec
+    r = fc.check(*_tamper_record(run, tmp_path, edit))
+    assert r['ok'] is ok, r['fails']

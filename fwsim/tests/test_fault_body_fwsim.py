@@ -129,3 +129,30 @@ def test_c7_table_reads_body_output(fw, tmp_path):
     assert len(rows) == 1 and rows[0]['case'] == 'drag'
     assert rows[0]['pwm_mean'] > rows[0]['base_pwm_mean']
     assert rows[0]['faults'].startswith('body_drag:body:')
+
+
+# -- Codex round 1 (FS1-1, FS1-3) --
+def test_c7_table_ticks_of_a_duration_not_whole_10ms(fw, tmp_path):
+    """FS1-1: a run of 2.0159 s has round(2015.9) // 10 = 201 firmware ticks, the table's ticks_expected."""
+    import fault_c7_table as ct
+    cfg = dict(task='T', mode='PID', seed=0, imu_rate=20.0, imu_boot_reset=-1.0, imu_noise='replay',
+               imu_noise_seed=0, ground='traction', mu=None, no_imu=False, duration=2.0159)
+    for case, sch in (('base', fs.Schedule(())), ('drag', sched('D1,body_drag,body,500,1500,F=3.3\n', run_ms=2016))):
+        log = run(fw, sch, duration=2.0159)
+        d = os.path.join(str(tmp_path), f'PID_{case}')
+        fwsim.write_run(d, log, fwsim.metrics(log), fw, dict(cfg), MecanumParams())
+        fault_run.write_faults(d, log)
+    (r,) = ct.table(str(tmp_path))
+    assert r['ticks'] == r['ticks_expected'] == 201
+
+
+def test_scalar_mu_hd_with_a_body_row_alone(fw):
+    """FS1-3: a scalar mu_hd on the parameter object, a body row alone: the record holds four mu values."""
+    p = MecanumParams()
+    p.mu_hd = 0.436
+    log = run(fw, sched('D1,body_drag,body,500,1000,F=3.3\n'), params=p, duration=1.5)
+    rec = log['fault_plant']
+    cols = {c: i for i, c in enumerate(fp.RECORD_COLS)}
+    assert rec.shape == (500, len(fp.RECORD_COLS))
+    assert np.all(rec[:, cols['mu_fl']:cols['mu_rr'] + 1] == 0.436)
+

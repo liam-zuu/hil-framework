@@ -35,6 +35,8 @@ Times, under the same scheduling as the plant loop (SCHED_FIFO 90, core 0):
                        sub-step, fault_plant.body_step); its calls start from x with the world vx set to 0.3 m/s
                        (BODY_VX), so the drag branch (|v| >= 1e-3) runs from the first sub-step (x itself has the
                        body at rest)
+                 base_moving  MecanumPlant.step alone from that same moving state (Codex FS1-6: the reference
+                       of body, so body - base_moving is the cost of the force alone)
                The patch() of the frame is not in these numbers (fault_idle / fault_all4 above). They are the
                steady cost after the warm-up with one set of rows on and one zone mask: the build of a new
                parameter copy when a window opens or the zone mask changes falls in the warm-up, not timed.
@@ -144,6 +146,8 @@ def fault_plant_variants(n, x, u):
         fp = FaultPlant(inner(), pa, None)
         pa.plant_hook = fp
         out.append((f'fault_plant_{name}', from_x(fp.inner, fp.step, sb if name == 'body' else s0), fp))
+    moving = inner()
+    out.append(('fault_plant_base_moving', from_x(moving, moving.step, sb), None))     # Codex FS1-6
     return out
 
 

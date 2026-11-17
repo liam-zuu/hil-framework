@@ -32,7 +32,9 @@ One row per (controller, fault case), each against the baseline of the same cont
     a gyro_scale case is read with |r_true| < r_th / 2);
   * ticks, imu_rows, imu_dropped, base_imu_rows: number of firmware ticks (log.csv rows), of IMU report rows
     (faults_imu.csv; one per report, written before an imu_loss window drops it), of those dropped (mask bit
-    M_LOSS), and of the baseline's rows; ticks_expected = duration / 10 ms (design 10.1 step 5).
+    M_LOSS), and of the baseline's rows; ticks_expected = fwsim_ticks(duration) (design 10.1 step 5): the ticks
+    at 10, 20, .. ms up to the last plant step, round(duration / 1 ms) // 10 (Codex FS1-1: a task length that is
+    not a whole number of 10 ms, A-C1 32.416 s, has 3241 ticks, not round(duration / 10 ms) = 3242).
   * batch 2 plant faults (design 2026-11-15_Thiet_ke_bom_loi_dot2_v1.md section 7.2, record only), in every
     row, blank where the case has no such fault:
       sat_frac_<w>, base_sat_frac_<w> (w = fl, fr, rl, rr): sat_frac of one wheel over the same span (s11: the
@@ -61,8 +63,10 @@ fault_check_<run>.json. The same columns as the fwsim table, from two clocks:
   * Pi time: t = (frame step - t0) / 1 kHz, t0 = the first RUN step (lifecycle; = manifest faults t0_step, the
     origin of the schedule). True plant state from mosi_true (mosi in the baseline, which has no faults):
     body velocity = world velocity rotated by -theta (fwsim.body_velocity), setpoint = the MOSI reference the
-    Pi sent; err_*, end pose (frame t0 + duration, duration = the task's + TAIL_S, as fault_run.py), r_true_max
-    over (0, duration] (params.MecanumParams H_fwd, as fwsim, whose ticks are 0.01 .. duration s). The span is
+    Pi sent; err_*, end pose (frame t0 + t_end, t_end = 10 ms x fwsim_ticks(duration), the time of the last
+    fwsim tick, duration = the task's + TAIL_S, as fault_run.py; = duration when it is a whole number of 10 ms,
+    as A-W1's 9 s; Codex FS1-1), r_true_max over (0, t_end] (params.MecanumParams H_fwd, as fwsim, whose ticks
+    are 0.01 .. t_end s). The span is
     taken on the 1 ms frames, the fwsim table on 10 ms ticks. The frame log must hold one uint8 frame of
     protocol.FRAME_SIZE bytes per step: frame_no (MOSI bytes 44-47) = step_first + row, one run_id (40-43)
     != 0, step_last = step_first + steps - 1, period_us 1000, in the baseline too (C7T1-5).
@@ -79,7 +83,7 @@ fault_check_<run>.json. The same columns as the fwsim table, from two clocks:
     The tick, not timestamp_us, so the grid is the 10 ms of the fwsim table. The start of the run must be in
     the log (C7T1-2): the row just before the first run_active row is there, with run_active 0, tick one less
     and log_seq one less, and that first row's log_seq is the #gain line's first_seq; the rows of [0, duration)
-    are exactly duration / 10 ms rows with consecutive tick and log_seq and run_active 1, every ESP_COLS value
+    are exactly bench_ticks(duration) rows (j x 10 ms < duration; ticks_expected) with consecutive tick and log_seq and run_active 1, every ESP_COLS value
     finite, flags 0 / 1, counters whole (C7T1-6), gyro_n not decreasing from the row before the run (C7T2-2). wz_src, slip_flag, ws_flag edges, age_g_max_ms, r_max,
     sat_frac (|pwm| >= PWM_MAX of the ESP32 rows) and ticks (ESP32 rows in [0, duration)) come from it.
   * Left blank on the bench (column blank lists them): r_th (no column in the ESP32 CSV); imu_rows,
@@ -123,6 +127,18 @@ import protocol as P                # noqa: E402  (frame layout, decode_state / 
 PWM_MAX = 1000                     # AGV src/motor/motor.h PWM_MAX
 TAIL_S = 1.0                        # errors over the window and 1 s after it (spec S06 T8, type II)
 TICK_S = 0.010                      # firmware tick (FW_DT_US)
+
+
+def fwsim_ticks(duration) -> int:
+    """Firmware ticks of a fwsim run of this duration [s]: fwsim.simulate runs round(duration / 1 ms) plant steps
+    and ticks at every 10th, so 10, 20, .. ms (Codex FS1-1)."""
+    return int(round(float(duration) * 1000)) // 10
+
+
+def bench_ticks(duration) -> int:
+    """ESP32 rows of [0, duration) on the bench: the ticks j x 10 ms < duration, j = 0, 1, .. (Codex FS1-1:
+    ceil, not round; 13.194 s has 1320 of them)."""
+    return math.ceil(round(float(duration) / TICK_S, 6))
 M_LOSS = 16                         # fwsim/fault_run.py mask bit of imu_loss (faults_imu.csv)
 SAME_KEYS = ('task', 'mode', 'seed', 'imu_rate', 'imu_boot_reset', 'imu_noise', 'imu_noise_seed', 'ground', 'mu',
              'no_imu', 'duration')
@@ -330,7 +346,7 @@ def row_for(mode, case, f, base):
                end_dtheta=float(wrap(lf['theta'][-1] - lb['theta'][-1])),
                r_true_max=float(np.abs(lf['r_true']).max()), ticks=int(len(t)), imu_rows=int(f['imu_rows']),
                imu_dropped=int(f['imu_dropped']), base_imu_rows=int(base['imu_rows']),
-               ticks_expected=int(round(float(f['meta']['config']['duration']) / TICK_S)))
+               ticks_expected=fwsim_ticks(f['meta']['config']['duration']))
     # batch 2 plant faults (design 2026-11-15 section 7.2)
     rows = f['faults']['rows']
     out.update(wheel_sat(pw(lf), pw(lb)))
@@ -438,9 +454,12 @@ def task_duration(args):
     STOPPING of --finite-run, as fault_run.py's task + TAIL_S; RUN itself runs a little longer, docstring). The
     tasks fwsim/fault_run.py task_setpoint takes (design 2026-11-15 14.9 G1): A-W1 of rpi5/fault_tasks.py, or a
     group A test on the ground (rpi5/trajectory_pub.GROUP_A, not LIFTED_TESTS) with its spec duration."""
-    task = run_options(args).get('test')
+    opts = run_options(args)
+    task = opts.get('test')
     if not task:
         raise TableError(f'run args {args!r}: no --test task')
+    if opts.get('s02_prep') is not None:           # Codex FS1-4: --s02-prep changes the task's length and timing
+        raise TableError(f'run args {args!r}: --s02-prep runs another task than --test alone (not a fault task)')
     import fault_tasks
     if task in fault_tasks.TASKS:
         return task, fault_tasks.TASKS[task][0] + TAIL_S
@@ -587,7 +606,7 @@ def load_bench_run(run_dir, srun, clean):
     gain, first_seq = read_gain(os.path.join(run_dir, 'pi', f'{name}.csv.events.txt'))
     # ESP32 clock = the firmware tick counter from the first run_active row; rows of [0, duration) only
     # (the fwsim run ends at duration; the ESP32 log goes on through the motor-off switch)
-    n_ticks = int(round(dur / TICK_S))
+    n_ticks = bench_ticks(dur)
     esp, pre = esp_run_rows(name, read_esp(os.path.join(run_dir, 'pi', f'{name}.csv')), n_ticks, first_seq)
     te = np.round((esp['tick'] - esp['tick'][0]) * TICK_S, 6)
     plant = None
@@ -691,7 +710,7 @@ def bench_row(mode, case, f, base, H_fwd):
     if not rows:
         raise TableError(f'{f["name"]}: no schedule rows')
     s_ms, e_ms = min(int(r['start_ms']) for r in rows), max(int(r['end_ms']) for r in rows)
-    dur_ms = int(round(f['dur'] * 1000))
+    end_ms = 10 * fwsim_ticks(f['dur'])                    # the last fwsim tick (Codex FS1-1)
     start, end = s_ms / 1000.0, e_ms / 1000.0
     out = dict(controller=mode, case=case,
                faults=';'.join(f'{r["fault"]}:{r["target"]}:{r.get("params") or {}}' for r in rows),
@@ -737,14 +756,14 @@ def bench_row(mode, case, f, base, H_fwd):
     b2.update(ramp_split(rows, tk, err[''], err['base_']))
     b2.update(zone_times(rows, f['plant']))
     b2.update(pwm_mean(pw(te, e), pw(tb, eb)))
-    # pose at t0 + duration, r_true over (0, duration]
+    # pose at t0 + end_ms, r_true over (0, end_ms] (end_ms = duration for a whole number of 10 ms)
     pose = {}
     for tag, run in (('', f), ('base_', base)):
-        at = np.nonzero(run['k'] == dur_ms)[0]
+        at = np.nonzero(run['k'] == end_ms)[0]
         if not len(at):
-            raise TableError(f'{run["name"]}: no frame at t0 + {dur_ms} ms')
+            raise TableError(f'{run["name"]}: no frame at t0 + {end_ms} ms')
         pose[tag] = run['S'][at[0], 4:7]
-    rs = (f['k'] > 0) & (f['k'] <= dur_ms)                         # (0, duration], as fwsim (C7T1-8)
+    rs = (f['k'] > 0) & (f['k'] <= end_ms)                         # (0, end_ms], as fwsim (C7T1-8)
     r_true = (f['S'][rs, :4] @ np.asarray(H_fwd)[2]) - f['S'][rs, 9]
     out.update(end_dx=float(pose[''][0] - pose['base_'][0]), end_dy=float(pose[''][1] - pose['base_'][1]),
                end_dtheta=float(wrap(pose[''][2] - pose['base_'][2])), r_true_max=float(np.abs(r_true).max()))
@@ -752,10 +771,10 @@ def bench_row(mode, case, f, base, H_fwd):
     cnt = {}
     for tag, run in (('', f), ('base_', base)):
         tick, gyro = run['esp']['tick'], run['esp']['gyro_n']          # rows of [0, duration), consecutive
-        cnt[tag] = dict(ticks=int(len(tick)), gaps=int(round(run['dur'] / TICK_S)) - len(tick),
+        cnt[tag] = dict(ticks=int(len(tick)), gaps=bench_ticks(run['dur']) - len(tick),
                         gyro=int(gyro[-1] - gyro[0]))  # counted after the first tick, to the last (C7T1-7)
     out.update(ticks=cnt['']['ticks'], imu_rows=None, imu_dropped=None, base_imu_rows=None,
-               ticks_expected=int(round(f['dur'] / TICK_S)))
+               ticks_expected=bench_ticks(f['dur']))
     out.update(b2)
     out.update(run_s=f['run_s'], tick_gaps=cnt['']['gaps'],
                esp_gyro_n=cnt['']['gyro'], base_esp_gyro_n=cnt['base_']['gyro'],

@@ -763,3 +763,24 @@ def test_pwm_mean_bench(tmp_path, fake_check):
     assert r['base_pwm_mean'] == pytest.approx(300 * 100 / 1200)
     kf = list(r)
     assert kf.index('zone_out_s') + 1 == kf.index('pwm_mean') and kf.index('base_pwm_mean') + 1 == kf.index('run_s')
+
+
+# -- Codex round 1 (FS1-1, FS1-4) --
+def test_tick_counts_of_a_duration():
+    # FS1-1: fwsim ticks at 10 .. round(d / 1 ms) // 10 x 10 ms; the bench rows j x 10 ms < d
+    assert ct.fwsim_ticks(9.0) == 900 and ct.bench_ticks(9.0) == 900
+    assert ct.fwsim_ticks(16.0) == 1600 and ct.bench_ticks(16.0) == 1600
+    sys.path.insert(0, os.path.join(ROOT, 'rpi5'))
+    from trajectory_pub import GROUP_A
+    c1 = GROUP_A['A-C1'].duration + 1.0                 # 32.4159.. s
+    assert ct.fwsim_ticks(c1) == 3241 and ct.bench_ticks(c1) == 3242
+    f2 = GROUP_A['A-F2'].duration + 1.0
+    assert ct.bench_ticks(f2) == math.ceil(f2 * 100) and ct.bench_ticks(f2) - 1 < f2 * 100 <= ct.bench_ticks(f2)
+
+
+def test_s02_prep_is_not_a_fault_task():
+    # FS1-4: --s02-prep runs a longer, shifted task than --test alone
+    with pytest.raises(ct.TableError, match='s02-prep'):
+        ct.task_duration('--test A-L1 --finite-run --s02-prep 3')
+    assert ct.task_duration('--test A-L1 --finite-run') == ('A-L1', 16.0)
+

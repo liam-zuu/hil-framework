@@ -164,7 +164,7 @@ class FwsimFaults:
                     raise RuntimeError('fwsim.simulate passed a parameter object other than the one of run()')
                 p, _ = var.at(on, j[0], x)
                 f, fd, fdist = body.at(on, j[0], x)
-                self.rec_plant.append((j[0], sum(1 << i for i in on), p.V_batt, *p.mu_hd, *p.motor_b,
+                self.rec_plant.append((j[0], sum(1 << i for i in on), p.V_batt, *fault_plant.mu4(p), *p.motor_b,
                                        *p.motor_Tc, *p.motor_Ts, x[0], x[1], x[2], x[3], x[4], fd, fdist))
             x_new = real(x, u, p, dt, rng) if f is None else fault_plant.body_step(x, u, p, dt, f)
             self.X.append(x_new)

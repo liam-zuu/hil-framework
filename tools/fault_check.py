@@ -50,8 +50,12 @@ Checks (all must hold for ok):
      s14 body rows (Liam 17/11 "lam s14 ngay di"): vx, vy of the record agree with the true frame as x, y do;
      f_drag = F of the body_drag row on when math.hypot(vx, vy) >= 1e-3 at the start of the step, else 0, and
      f_dist = F(k) of the load_dist row on, else 0, both rebuilt here in float64 by the definition (F(k) =
-     (F0 + min(Fmax, (rate * d) / 1000)) + sigma * n[d], n drawn here from numpy default_rng(seed)) and compared
-     exactly. The force inside the sub-steps is not rebuilt (no record of it; the plant's own code).
+     (F0 + min(Fmax, (rate * d) / 1000)) + sigma * n[d], n drawn here from numpy default_rng(seed)); f_drag
+     compared exactly, f_dist within ULP_TOL units in the last place of |F0 + min(..)| + |sigma n[d]| (the normal
+     draws use libm log in the tail of numpy's ziggurat, which may differ by an ULP between the Pi's ARM and a PC);
+     vx, vy against the true frame after the frame's own clamp to +-STATE_RANGES (Codex FS1-2). The force inside
+     the sub-steps is not rebuilt (no record of it; the plant's own code): that the plant used the force is not
+     checked here (Codex FS1-7, DEFERRED: design 7.1 keeps the plant replay optional).
 Exit 0 = ok, 1 = a check failed, 2 = the input cannot be checked. Writes fault_check.json.
 
 Assumptions (stated by the author, to be checked): frame k of the log is step k of the loop, and the
@@ -400,9 +404,10 @@ def ref_plant(rows, on_idx, k_rel, pose, nom):
 
 
 def ref_body(rows, on_idx, k_rel, vel, noise):
-    """(f_drag, f_dist) of one plant step rebuilt from the rows on, the relative step and the world velocity at
-    the start of the step (s14). noise: {row index: n} drawn by the caller for every load_dist row."""
-    fd = fdist = 0.0
+    """(f_drag, f_dist, scale) of one plant step rebuilt from the rows on, the relative step and the world
+    velocity at the start of the step (s14). noise: {row index: n} drawn by the caller for every load_dist row;
+    scale = |F0 + min(..)| + |sigma n[d]|, the size the tolerance of f_dist is taken from."""
+    fd = fdist = scale = 0.0
     for i in on_idx:
         r = rows[i]
         if r.fault == 'body_drag':
@@ -410,8 +415,22 @@ def ref_body(rows, on_idx, k_rel, vel, noise):
         elif r.fault == 'load_dist':
             d = k_rel - r.start_ms
             ramp = (float(r.p('rate')) * d) / 1000.0
-            fdist = (float(r.p('F0')) + min(float(r.p('Fmax')), ramp)) + float(r.p('sigma')) * float(noise[i][d])
-    return fd, fdist
+            a = float(r.p('F0')) + min(float(r.p('Fmax')), ramp)
+            b = float(r.p('sigma')) * float(noise[i][d])
+            fdist, scale = a + b, abs(a) + abs(b)
+    return fd, fdist, scale
+
+
+def _vel_ok(frame_v, rec_v, rng, step) -> bool:
+    """A recorded velocity against the true frame: finite, and the frame within half a step of the value clamped
+    to +-rng as the frame encoding clamps it (Codex FS1-2: a valid speed beyond the range is not a mismatch)."""
+    v = float(rec_v)
+    return math.isfinite(v) and abs(frame_v - min(rng, max(-rng, v))) <= 0.5 * step + 1e-9
+
+
+def _dist_close(got, want, scale) -> bool:
+    """f_dist of the record against the rebuilt value: within ULP_TOL units in the last place of scale."""
+    return math.isfinite(got) and abs(got - want) <= ULP_TOL * math.ulp(max(scale, abs(got), abs(want)))
 
 
 def run_mu(argv):
@@ -534,8 +553,8 @@ def plant_record_check(npz_path, rows, fm, t0, stop, n, true, plant_src=None, ar
             ok &= bool(row[c['mu_' + suf]] == float(mu[w]))
             ok &= _close(row[c['b_' + suf]], b[w]) and _close(row[c['tc_' + suf]], tc[w])
             ok &= _close(row[c['ts_' + suf]], ts[w])
-        fd, fdist = ref_body(rows, on, k - t0, (row[c['vx']], row[c['vy']]), noise)     # s14
-        ok &= bool(row[c['f_drag']] == fd) and bool(row[c['f_dist']] == fdist)
+        fd, fdist, scale = ref_body(rows, on, k - t0, (row[c['vx']], row[c['vy']]), noise)     # s14
+        ok &= bool(row[c['f_drag']] == fd) and _dist_close(float(row[c['f_dist']]), fdist, scale)
         if not ok:
             bad_val += 1
             first = k if first is None else first
@@ -543,8 +562,8 @@ def plant_record_check(npz_path, rows, fm, t0, stop, n, true, plant_src=None, ar
         pose_ok = (abs(_i16(fr, OFS_X) * sx - pose[0]) <= 0.5 * sx + 1e-9 and
                    abs(_i16(fr, OFS_Y) * sy - pose[1]) <= 0.5 * sy + 1e-9 and
                    abs(_i16(fr, OFS_THETA) * sth - math.remainder(pose[2], 2 * math.pi)) <= 0.5 * sth + 1e-9 and
-                   abs(_i16(fr, OFS_VX) * svx - row[c['vx']]) <= 0.5 * svx + 1e-9 and
-                   abs(_i16(fr, OFS_VY) * svy - row[c['vy']]) <= 0.5 * svy + 1e-9)
+                   _vel_ok(_i16(fr, OFS_VX) * svx, row[c['vx']], STATE_RANGES[7], svx) and
+                   _vel_ok(_i16(fr, OFS_VY) * svy, row[c['vy']], STATE_RANGES[8], svy))
         bad_pose += not pose_ok
     if bad_val:
         probs.append(f'{bad_val} plant steps with parameters that differ from the rows, first at frame {first}')

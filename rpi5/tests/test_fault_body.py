@@ -166,7 +166,9 @@ def test_drag_stops_the_car_sooner():
     s = _Run('D1,body_drag,body,0,1500,F=3.3\n', run_ms=1500).go(n, duty=(0, 0, 0, 0))
     assert s[-1, 0] < s0[-1, 0]
     v, v0 = np.hypot(s[:, 3], s[:, 4]), np.hypot(s0[:, 3], s0[:, 4])
-    assert np.argmax(v < 1e-3) < np.argmax(v0 < 1e-3) or v0[-1] >= 1e-3
+    # Codex FS1-1 test note: both runs must really reach rest (no "or" escape), the drag one first
+    assert (v < 1e-3).any() and (v0 < 1e-3).any()
+    assert np.argmax(v < 1e-3) < np.argmax(v0 < 1e-3)
     assert np.all(v[100:] <= v0[100:] + 1e-12)
 
 
@@ -244,3 +246,85 @@ def test_run_hil_accepts_body_rows(tmp_path):
     s = run_hil.load_faults(_args(tmp_path, 'D1,body_drag,body,1,9,F=3.3\n' + DIST.format(a=1, b=9)),
                             0, HILConfig(simulate_hw=True), False, False)
     assert [r.fault for r in s.rows] == ['body_drag', 'load_dist']
+
+
+# ── Codex vòng 1 (FS1-3, FS1-5, test notes) ──────────────────────────────────
+def _own_force(F, F0, rate, Fmax, sigma, seed, dir_deg, start, k, drag_on, dist_on, n_win):
+    """The force of the design written here again, for _traction_step's f_ext (independent of fault_plant)."""
+    n = np.random.default_rng(seed).standard_normal(n_win)
+    d = k - start
+    fk = (F0 + min(Fmax, (rate * d) / 1000.0)) + sigma * float(n[d]) if dist_on else 0.0
+    a = math.radians(dir_deg)
+    c, s = math.cos(a), math.sin(a)
+
+    def f(xw, yw, vxw, vyw):
+        gx, gy = fk * c, fk * s
+        if drag_on:
+            v = math.hypot(vxw, vyw)
+            if v >= 1e-3:
+                gx, gy = gx - F * (vxw / v), gy - F * (vyw / v)
+        return gx, gy
+    return f
+
+
+def test_pi_step_matches_traction_step_with_an_own_force():
+    """Codex test note: FaultPlant against plant_step._traction_step with a force written here (not
+    fault_plant.body_step), heading not 0, the body slowing through the 1e-3 m/s threshold inside the steps."""
+    from plant_step import _traction_step
+    body = ('D1,body_drag,body,0,400,F=3.3\n'
+            'L1,load_dist,body,50,400,F0=0.5;rate=0.8;Fmax=1.5;sigma=0.2;seed=11;dir_deg=-30\n')
+    start = [0.2, -0.1, 0.7, 0.004 * math.cos(0.7), 0.004 * math.sin(0.7), 0.0, 0, 0, 0, 0]
+    r = _Run(body, state=start)
+    got = r.go(400, duty=(0, 0, 0, 0))
+    p = MecanumParams()
+    x = np.array(start, dtype=float)
+    crossed = False
+    for k in range(400):
+        f = _own_force(3.3, 0.5, 0.8, 1.5, 0.2, 11, -30.0, 50, k, True, k >= 50, 350)
+        x0 = x
+        x = _traction_step(x, np.zeros(4), p, 0.001, f_ext=f)
+        crossed |= math.hypot(x0[3], x0[4]) >= 1e-3 > math.hypot(x[3], x[4])
+        assert np.array_equal(got[k], x), k
+    assert crossed
+
+
+def test_scalar_mu_hd_with_a_body_row_alone(tmp_path):
+    """Codex FS1-3: a body row alone keeps the nominal parameter object; a scalar mu_hd is recorded as four."""
+    p = MecanumParams()
+    p.mu_hd = 0.436
+    pa = fs.FramePatcher(sched('D1,body_drag,body,0,50,F=3.3\n', 100))
+    inner = MecanumPlant(params=p, dt=0.001, seed=0)
+    inner.reset(list(MOVING))
+    plant = fp.FaultPlant(inner, pa, str(tmp_path / 'r_plant_faults.npz'))
+    pa.plant_hook = plant
+    pa.start(0)
+    for k in range(60):
+        pa.patch(k, bytes(fs.FRAME_SIZE))
+        plant.step([0.3] * 4)
+    rec = np.load(str(tmp_path / 'r_plant_faults.npz')) if plant.finish()['rows'] else None
+    c = {n: i for i, n in enumerate(fp.RECORD_COLS)}
+    assert rec is not None and np.all(rec['record'][:, c['mu_fl']:c['mu_rr'] + 1] == 0.436)
+    assert rec['record'].shape == (50, len(fp.RECORD_COLS))
+
+
+def test_drag_of_a_huge_F_stays_finite():
+    """Codex FS1-5: F as large as a float64 still gives the force of the definition (unit vector first)."""
+    big = '1' + '0' * 308
+    r = fs.parse(HEAD + f'D1,body_drag,body,0,10,F={big}\n')
+    fp.check_params(r, MecanumParams())
+    f = fp.BodyForce(r).at((0,), 0, np.zeros(10))[0]
+    assert f(0.0, 0.0, 2.0, 0.0) == (-1e308, 0.0)
+
+
+@pytest.mark.parametrize('body', [
+    'L1,load_dist,body,0,10,F0={b};rate=0;Fmax=0;sigma={b};seed=1;dir_deg=0\n',                 # F0 + sigma n
+    'D1,body_drag,body,0,10,F={b}\nL1,load_dist,body,0,10,F0={b};rate=0;Fmax=0;sigma=0;seed=1;dir_deg=0\n',
+])
+def test_force_without_a_finite_value_is_refused(body):
+    """Codex FS1-5: each parameter finite, but F(k), or the drag plus the load, overflows."""
+    big = '1' + '0' * 308
+    r = fs.parse(HEAD + body.format(b=big))
+    fp.check_params(r, MecanumParams())
+    with pytest.raises(fs.ScheduleError):
+        fp.BodyForce(r)
+

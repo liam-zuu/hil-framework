@@ -50,9 +50,9 @@ def rec(plant):
 
 def test_names_and_the_row_of_each_variant():
     vs = pt.fault_plant_variants(10, X0, U)
-    assert [v[0] for v in vs] == NAMES
-    assert vs[0][2] is None
-    for name, _, plant in vs[1:]:
+    assert [v[0] for v in vs] == NAMES + ['fault_plant_base_moving']
+    assert vs[0][2] is None and vs[-1][2] is None
+    for name, _, plant in vs[1:-1]:
         assert [r.fault for r in plant._p.schedule.rows] == FAULTS[name], name
 
 
@@ -108,6 +108,7 @@ def test_body_variant_steps_with_the_force():
     pl.reset(list(x))
     plain = np.array(pl.step(list(U)))
     assert not np.array_equal(got, plain)
+    assert np.array_equal(np.array(v['fault_plant_base_moving'][0]()), plain)    # FS1-6: its no-force reference
     assert got[3] < plain[3]                    # the drag (and the load along +y) slow the body along +x
 
 
@@ -156,7 +157,7 @@ def test_window_and_record_sized_for_the_timed_calls():
     # checked with n = 40 above), else the later timed calls would leave the fault path or overflow
     for n in (1, 20000):
         vs = pt.fault_plant_variants(n, X0, U)
-        for name, _, plant in vs[2:]:
+        for name, _, plant in vs[2:-1]:
             assert len(plant._rec) >= pt.WARMUP + n, name
             assert all(r.end_ms > pt.FAULT_PLANT_STEP + pt.WARMUP + n - 1 for r in plant._p.schedule.rows)
             assert plant._act.plant_on, name

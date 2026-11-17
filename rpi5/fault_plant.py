@@ -12,7 +12,7 @@ of a plant fault is the record of the parameters used at every step (finish()), 
   mu_time   (s15)   mu_hd[i] = mu for the target wheels
   mu_zone   (s15)   mu_hd[i] = mu for every wheel whose contact point (centre + R(theta) (+-lx, +-ly)) is inside
                     [x0, x1) x [y0, y1) at the start of the step (world frame, per wheel)
-  body_drag (s14)   a world-frame force on the body at every traction sub-step: -F * (vx, vy) / |v|, |v| =
+  body_drag (s14)   a world-frame force on the body at every traction sub-step: -F * ((vx, vy) / |v|), |v| =
                     math.hypot(vx, vy) of the sub-step, 0 while |v| < DRAG_V_MIN (Liam 17/11 "lam s14 ngay di")
   load_dist (s14)   a world-frame force F(k) * (cos dir, sin dir), constant over the step: F(k) = (F0 + min(Fmax,
                     (rate * d) / 1000)) + sigma * n[d], d = k - start, n = default_rng(seed).standard_normal(end -
@@ -231,6 +231,21 @@ class BodyForce:
         self.rows = list(rows)
         self._noise = {i: dist_noise(r) for i, r in enumerate(self.rows) if r.fault == 'load_dist'}
         self._dir = {i: dist_dir(r) for i, r in enumerate(self.rows) if r.fault == 'load_dist'}
+        # Codex FS1-5: every F(k) of a load_dist row, and the largest drag plus the largest |F(k)|, must be finite
+        # floats (each parameter alone is checked by check_params; a sum or a product may still overflow)
+        big = 0.0
+        for i, n in self._noise.items():
+            r = self.rows[i]
+            d = np.arange(len(n), dtype=float)
+            with np.errstate(over='ignore', invalid='ignore'):     # an overflow is what is looked for here
+                v = (float(r.p('F0')) + np.minimum(float(r.p('Fmax')), (float(r.p('rate')) * d) / 1000.0)) + \
+                    float(r.p('sigma')) * n
+            if not np.all(np.isfinite(v)):
+                raise ScheduleError(f'{r.id!r}: load_dist force F(k) has no finite value')
+            big = max(big, float(np.max(np.abs(v))) if len(v) else 0.0)
+        drag = max([float(r.p('F')) for r in self.rows if r.fault == 'body_drag'], default=0.0)
+        if not math.isfinite(drag + big):
+            raise ScheduleError('body_drag F plus the largest load_dist |F(k)| has no finite value')
 
     def at(self, on: Tuple[int, ...], k_rel: int, x):
         fd, fdist, cd, sd = 0.0, 0.0, 0.0, 0.0
@@ -251,12 +266,18 @@ class BodyForce:
             if drag:
                 v = math.hypot(vxw, vyw)
                 if v >= DRAG_V_MIN:
-                    gx = gx - fd * vxw / v
-                    gy = gy - fd * vyw / v
+                    gx = gx - fd * (vxw / v)       # Codex FS1-5: unit vector first, no overflow of F * vx
+                    gy = gy - fd * (vyw / v)
             return gx, gy
 
         rec_drag = fd if drag and math.hypot(float(x[3]), float(x[4])) >= DRAG_V_MIN else 0.0
         return f, rec_drag, fdist
+
+
+def mu4(p):
+    """The four mu_hd values of a parameter object (a scalar mu_hd broadcast, as check_params and plant_step read
+    it; Codex FS1-3: a body row alone keeps the nominal object, whose mu_hd may be a scalar)."""
+    return np.broadcast_to(np.asarray(p.mu_hd, dtype=float), (4,))
 
 
 def body_step(x, u, p, dt, f):
@@ -308,7 +329,7 @@ class FaultPlant(PlantInterface):
         p, _ = self._var.at(on, k - self._p.t0, x)
         f, fd, fdist = self._body.at(on, k - self._p.t0, x)
         if self._n < len(self._rec):              # the union of windows bounds the steps with a row on
-            self._rec[self._n] = (k, sum(1 << i for i in on), p.V_batt, *p.mu_hd, *p.motor_b, *p.motor_Tc,
+            self._rec[self._n] = (k, sum(1 << i for i in on), p.V_batt, *mu4(p), *p.motor_b, *p.motor_Tc,
                                   *p.motor_Ts, x[0], x[1], x[2], x[3], x[4], fd, fdist)
         self._n += 1
         if f is not None:                         # s14: MecanumPlant.step with the body force (no RNG on traction)
