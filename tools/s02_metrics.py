@@ -457,6 +457,7 @@ AGE_PRE_S = 0.100                     # design 25 (THESIS hint): traj_age_ms ove
 AGE_PRE_MAX_MS = 40.0                 # [ĐỀ XUẤT]
 WZ_SRC_ENC = 0                        # AGV imu_fusion.h WZ_SRC_ENC
 PLATFORMS_R = ('sim', 'hil', 'real')  # family R from <run>_plant.csv (the car: tools/s02_video_metrics.py)
+TIME_EPS_S = 1e-6                     # s, float slack of a time comparison (S2V2-4: 1.1 - 1.0 > 0.1 in floats)
 REST_S = 0.5                          # s, the car's rest pose: mean over [-REST_S, 0) (spec P2-3 line 155)
 STATUS_FIELDS = ('status', 'status_reason')
 # columns a broken run keeps (S2M1-1): loss and mid-run resets, no metric
@@ -567,17 +568,34 @@ def _rel_pose(t, x, y, th, psi0):
     return s02_ref.to_test_frame(x, y, th, z[0], z[1], z[2], psi0)
 
 
+def largest_gap(t, a, b):
+    """Largest interval between consecutive times of t (sorted, s) that meets the open span (a, b); the time before
+    the first and after the last one is infinite (S2V2-1, S2V2-2, Codex round 2 of Viec CODE 5: real frames only;
+    the span ends are not frames, a gap across them counts whole). inf when t is empty."""
+    t = np.asarray(t, dtype=float)
+    if t.size == 0:
+        return math.inf
+    left, right = np.r_[-math.inf, t], np.r_[t, math.inf]
+    meet = (right > a) & (left < b)
+    return float(np.max((right - left)[meet])) if meet.any() else 0.0
+
+
+def too_wide(gap, limit):
+    """gap > limit beyond float slack (S2V2-4: a gap of exactly the limit passes)."""
+    return gap > limit + TIME_EPS_S
+
+
 def _rest_rel_pose(x, y, th, psi0, cam, t0_us):
     """The car's camera pose (x, y, th on the log lines, th already unwrapped with the frames) in the test frame
     relative to the mean camera pose over the valid frames in [-REST_S, 0) (P2-3 line 155; S2V1-4, Codex round 1,
     Liam 17/11 "Tinh tren khung camera (Recommended)": the frames of <run>_plant_cam.csv, not the log lines, so lost
-    log lines do not move it), or None when there is no frame there or a gap over the camera t_miss (the span ends
-    counted) leaves the rest uncovered. cam: {'timestamp_us', 'x', 'y', 'theta', 't_miss_s'}."""
+    log lines do not move it), or None when there is no frame there or a gap over the camera t_miss meets it (real
+    counted whole, largest_gap) leaves the rest uncovered. cam: {'timestamp_us', 'x', 'y', 'theta', 't_miss_s'}."""
     if cam is None:
         return None
     tc = (np.asarray(cam['timestamp_us'], dtype=float) - t0_us) * 1e-6
     rest = (tc >= -REST_S - WINDOW_EPS_S) & (tc < 0.0)
-    if not rest.any() or np.max(np.diff(np.r_[-REST_S, tc[rest], 0.0])) > cam['t_miss_s']:
+    if not rest.any() or too_wide(largest_gap(tc, -REST_S, 0.0), cam['t_miss_s']):
         return None
     z = [float(np.mean(np.asarray(cam[k], dtype=float)[rest])) for k in ('x', 'y', 'theta')]
     return s02_ref.to_test_frame(x, y, np.asarray(th, dtype=float), z[0], z[1], z[2], psi0)

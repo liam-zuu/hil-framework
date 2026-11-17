@@ -56,6 +56,7 @@ for _p in (os.path.join(HERE, '..', 'rpi5'), os.path.join(HERE, '..', 'fwsim'), 
     if _p not in sys.path:
         sys.path.insert(0, _p)
 import c7_measure                                                        # noqa: E402
+import s02_metrics                                                       # noqa: E402
 import o1_time_sync                                                      # noqa: E402
 from c7_score import T_GAP, T_MISS                                       # noqa: E402
 from s02_plant_ticks import PLANT_COLUMNS                                # noqa: E402
@@ -75,21 +76,35 @@ def sha256(path):
 
 
 def read_log_rows(path):
-    """Data lines of the ESP32 log (o1_time_sync.read_log); lines repeated byte for byte (UDP duplicates, spec P2-5)
-    dropped, the rest sorted by timestamp_us (S2V1-5, Codex round 1: UDP may swap lines, s02_metrics.load_log puts
-    them back in order); two different lines with the same timestamp_us are refused."""
-    rows, seen = [], set()
-    for r in o1_time_sync.read_log(path):
-        key = tuple(r.items())
-        if key in seen:
-            continue
-        seen.add(key)
-        rows.append(r)
-    rows.sort(key=lambda r: float(r['timestamp_us']))
-    t = np.array([float(r['timestamp_us']) for r in rows])
-    if np.any(np.diff(t) <= 0):
-        raise ValueError(f'{path}: two different lines with the same timestamp_us')
-    return rows
+    """Data lines of the ESP32 log as dicts of text, in the order s02_metrics.load_log uses (S2V1-5, S2V2-3, Codex
+    rounds 1, 2: the same DUT checks as the scorer): a logger header (s02_metrics.HEADS); a DUT log (log_seq,
+    motor_on) through s02_metrics.dut_rows (duplicates dropped, log_seq order, the logger segment or the sample-time
+    rule against a restart or conflicting lines); an older log without log_seq: byte-for-byte duplicates dropped,
+    sorted by timestamp_us. timestamp_us must then increase strictly."""
+    with open(path, newline='', encoding='utf-8') as f:
+        rows = [r for r in csv.reader(f) if r and not r[0].startswith('#')]
+    if not rows:
+        raise ValueError(f'{path}: empty')
+    head, body = rows[0], rows[1:]
+    if head not in s02_metrics.HEADS:
+        raise ValueError(f'{path}: header is not a logger format')
+    if any(len(r) != len(head) for r in body):
+        raise ValueError(f'{path}: a line does not have {len(head)} columns')
+    if 'log_seq' in head and 'motor_on' in head:
+        s, mo = head.index('log_seq'), head.index('motor_on')
+        kinds = {r[s] != '' and r[mo] != '' for r in body}
+        if len(kinds) > 1:
+            raise ValueError(f'{path}: lines with and without log_seq / motor_on')
+        if kinds == {True}:
+            body, _ = s02_metrics.dut_rows(body, path)
+    if 'log_seq' not in head or not body or body[0][head.index('log_seq')] == '':
+        uniq = list(dict.fromkeys(tuple(r) for r in body))
+        body = sorted(uniq, key=lambda r: float(r[head.index('timestamp_us')]))
+    out = [dict(zip(head, r)) for r in body]
+    t = np.array([float(r['timestamp_us']) for r in out])
+    if not out or np.any(np.diff(t) <= 0):
+        raise ValueError(f'{path}: no data line, or timestamp_us does not increase')
+    return out
 
 
 def camera_series(frames):
@@ -118,7 +133,7 @@ def pose_at(tq, t, x, y, psi, t_miss=T_MISS):
     if t.size == 0:
         return X, Y, P, L
     inside = (tq >= t[0]) & (tq <= t[-1])
-    L[~inside & (np.maximum(t[0] - tq, tq - t[-1]) > t_miss)] = 1.0
+    L[~inside & s02_metrics.too_wide(np.maximum(t[0] - tq, tq - t[-1]), t_miss)] = 1.0
     j = np.clip(np.searchsorted(t, tq, side='right') - 1, 0, max(t.size - 2, 0))
     if t.size == 1:
         on = inside                                        # tq == t[0]
@@ -126,7 +141,7 @@ def pose_at(tq, t, x, y, psi, t_miss=T_MISS):
         return X, Y, P, L
     t0, t1 = t[j], t[j + 1]
     gap = t1 - t0
-    lost = inside & (gap > t_miss) & (tq != t0) & (tq != t1)
+    lost = inside & s02_metrics.too_wide(gap, t_miss) & (tq != t0) & (tq != t1)
     good = inside & ~lost
     w = np.where(good, (tq - t0) / np.where(gap > 0, gap, 1.0), 0.0)
     for out, v in ((X, x), (Y, y), (P, psi)):
@@ -179,14 +194,11 @@ def edge_gaps(t_valid, D, rows):
     """S2V1-2 (Codex round 1; Liam 17/11 "Doi camera phu hai canh (Recommended)"): the largest gap between valid
     frames (camera clock t_valid) over [edge - EDGE_BEFORE_S, edge + EDGE_AFTER_S] around the run's first and last
     non-zero command (the start and the stop carry the timing of the fit; a gap there lets a high correlation sit at
-    a wrong D), the span ends counted as frames: {'start': s, 'stop': s}."""
+    a wrong D), between real frames only (s02_metrics.largest_gap; S2V2-2: a gap across the span ends counts whole):
+    {'start': s, 'stop': s}."""
     cmd = run_commands(rows)
-    out = {}
-    for name, e in (('start', cmd[0]), ('stop', cmd[-1])):
-        a, b = e - D - EDGE_BEFORE_S, e - D + EDGE_AFTER_S
-        pts = t_valid[(t_valid > a) & (t_valid < b)]
-        out[name] = float(np.max(np.diff(np.r_[a, pts, b])))
-    return out
+    return {name: s02_metrics.largest_gap(t_valid, e - D - EDGE_BEFORE_S, e - D + EDGE_AFTER_S)
+            for name, e in (('start', cmd[0]), ('stop', cmd[-1]))}
 
 
 def clock(frames, rows):
@@ -236,7 +248,7 @@ def map_video(frames, rows, t_miss=T_MISS, t_gap=T_GAP):
     t, x, y, psi = camera_series(frames)
     eg = edge_gaps(t, D, rows)
     info['edge_gaps_s'] = eg
-    bad = [f'{k} {v:.2f} s' for k, v in eg.items() if v > t_gap]
+    bad = [f'{k} {v:.2f} s' for k, v in eg.items() if s02_metrics.too_wide(v, t_gap)]
     if bad:
         info['reason'] = f'clock_sync_failed (edges_not_covered: {", ".join(bad)} > {t_gap:.2f} s)'
         return info, [], []

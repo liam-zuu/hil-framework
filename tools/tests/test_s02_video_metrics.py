@@ -229,6 +229,16 @@ def test_rest_pose_is_the_mean_before_t0_not_the_value_at_t0(tmp_path):
     assert M.score_run(log, 'A-L2', 'real', plant=dict(pl, _cam=None))['r_reason'] == 'no_rest_pose'
 
 
+def test_a_camera_gap_across_the_rest_is_no_rest_pose(tmp_path):
+    """S2V2-1 (Codex round 2): frames lost over [-1.0, -0.26) s, a gap of about 0.77 s (> T_MISS 0.68 s) that meets
+    the rest [-0.5, 0) though only about 0.25 s of it lies inside: no rest pose, with the default t_miss (the clock
+    itself is fine: the start span begins about 0.18 s before t = 0, after the gap)."""
+    log, tr, info, pl, m = scored('A-L1', tmp_path, frames_kw=dict(lost=lambda t: -1.0 <= t < -0.26))
+    assert info['ok'], info['reason']
+    assert pl['_cam']['t_miss_s'] == V.T_MISS
+    assert m['r_reason'] == 'no_rest_pose' and math.isnan(m['e_p_rms'])
+
+
 def test_lost_log_lines_in_the_rest_do_not_move_the_rest_pose(tmp_path):
     """S2V1-4 (Codex round 1): half of the log lines in [-0.5, -0.25) s lost (the +2 cm half of the rest noise): the
     rest pose comes from the camera frames, so the family R is the same as with every line (a mean over the log
@@ -298,6 +308,30 @@ def test_frames_lost_just_inside_the_edge_span_are_refused(tmp_path):
     (tmp_path / 'b').mkdir()
     log, tr, info, pl, m = scored('A-L1', tmp_path / 'b', frames_kw=dict(lost=lambda t: 1.25 <= t < 1.4))
     assert info['ok'], info['reason']
+
+
+def test_a_gap_across_the_edge_span_counts_whole(tmp_path):
+    """S2V2-2 (Codex round 2): frames lost over 0.14 s straddling the start of the span [first command - 0.2 s, ...]:
+    the part inside is only 0.07 s, the gap between the real frames 0.14 s > T_GAP: refused."""
+    log, tr = run_of('A-L1')
+    _, rows = log_rows(log, tmp_path)
+    a = V.run_commands(rows)[0] - T0 * 1e-6 - V.EDGE_BEFORE_S
+    info, out, cam = V.map_video(frames_of(log, tr, lost=lambda t: a - 0.07 <= t < a + 0.07), rows)
+    assert not info['ok'] and info['reason'].startswith('clock_sync_failed (edges_not_covered: start')
+    assert info['edge_gaps_s']['start'] > 0.13
+
+
+def test_largest_gap_and_too_wide_by_hand():
+    """S2V2-1, -2, -4: real points only, the time beyond the first / last point infinite, a gap of exactly the
+    limit passes."""
+    t = np.array([-1.0, -0.2, -0.1, 0.0, 0.1])
+    assert M.largest_gap(t, -0.5, 0.0) == pytest.approx(0.8)          # (-1.0, -0.2) meets (-0.5, 0)
+    assert M.largest_gap(t, -0.15, 0.05) == pytest.approx(0.1)
+    assert M.largest_gap(t, 0.05, 0.3) == math.inf                     # after the last point
+    assert M.largest_gap(t, -3.0, -2.0) == math.inf
+    assert M.largest_gap(np.array([]), 0.0, 1.0) == math.inf
+    assert not M.too_wide(1.1 - 1.0, 0.1) and M.too_wide(0.1 + 2e-6, 0.1)
+    assert not M.too_wide(0.68, 0.68) and M.too_wide(0.69, 0.68)
 
 
 def test_a_start_end_difference_over_50_ms_is_clock_sync_failed(tmp_path):
@@ -379,8 +413,21 @@ def test_duplicate_log_lines_are_dropped_and_time_must_increase(tmp_path):
     back[head.index('vx')] = '9.5'                                     # same time, other content: refused
     (tmp_path / 'back.csv').write_text('\n'.join(lines[:200] + [','.join(back)] + lines[200:]) + '\n',
                                        encoding='utf-8')
-    with pytest.raises(ValueError, match='same timestamp_us'):
+    with pytest.raises(ValueError, match='conflicting lines'):            # same log_seq, other content
         V.read_log_rows(str(tmp_path / 'back.csv'))
+    # S2V2-3 (Codex round 2): lines of another boot (log_seq goes on, time goes back) are refused as the scorer does
+    seq, ts = head.index('log_seq'), head.index('timestamp_us')
+    last = lines[-1].split(',')
+    boot = []
+    for k in range(5):
+        c = list(last)
+        c[seq], c[ts] = str(int(last[seq]) + 1 + k), str(100_000 + 10_000 * k)
+        boot.append(','.join(c))
+    (tmp_path / 'boot.csv').write_text('\n'.join(lines + boot) + '\n', encoding='utf-8')
+    with pytest.raises(ValueError, match='DUT restart'):
+        V.read_log_rows(str(tmp_path / 'boot.csv'))
+    with pytest.raises(ValueError, match='DUT restart'):
+        M.load_log(str(tmp_path / 'boot.csv'))
 
 
 def test_command_line_and_run_dir_metrics_score_the_car(tmp_path, capsys):
@@ -441,3 +488,25 @@ def test_command_line_and_run_dir_metrics_score_the_car(tmp_path, capsys):
 def test_the_car_on_stands_has_no_family_r():
     m = M.score_run(mk('A-K1'), 'A-K1', 'real')
     assert m['r_reason'] == 'real_lifted' and 'rms_w_err_true' not in m and 'e_p_rms' not in m
+
+
+def test_an_older_log_without_log_seq_is_deduplicated_and_sorted(tmp_path):
+    """A 37-column log (no log_seq, no motor_on): byte-for-byte duplicates dropped, lines sorted by timestamp_us;
+    two different lines at one time refused."""
+    log, _ = run_of('A-L2')
+    head = COLUMNS[:37]
+    assert 'log_seq' not in head
+    lines = [','.join(head)]
+    for i in range(300):
+        lines.append(','.join(str(int(x)) if float(x).is_integer() else f'{float(x):.9f}'
+                              for x in (log[c][i] if c in log else 0.0 for c in head)))
+    body = lines[1:]
+    mixed = body[:100] + [body[99], body[99]] + [body[101], body[100]] + body[102:]
+    (tmp_path / 'old.csv').write_text('\n'.join([lines[0]] + mixed) + '\n', encoding='utf-8')
+    rows = V.read_log_rows(str(tmp_path / 'old.csv'))
+    assert len(rows) == 300 and [r['timestamp_us'] for r in rows] == [b.split(',')[0] for b in body]
+    bad = body[50].split(',')
+    bad[head.index('vx')] = '9.5'
+    (tmp_path / 'old_bad.csv').write_text('\n'.join([lines[0]] + body + [','.join(bad)]) + '\n', encoding='utf-8')
+    with pytest.raises(ValueError, match='does not increase'):
+        V.read_log_rows(str(tmp_path / 'old_bad.csv'))
