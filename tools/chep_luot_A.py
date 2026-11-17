@@ -86,8 +86,8 @@ LEVEL_COLS = ('a', 'b', 'L_nguon', 'H_nguon')               # S03 v8.3/v8.4 §3.
 # S03 v8.4 §3.1, S05 v3.41 §2.5 (CODE_FEAS 17/11, design 03_CODE/docs/2026-11-17_Thiet_ke_S03_v84_kiem_ngoai_mien_v1.md
 # section 3): the A domain only from a sweep whose out-of-range check is 'đã kiểm đủ' for both controllers, no 'cờ'
 KIEM_FILE = 'kiem_ngoai_mien.csv'
-KIEM_NEED = ('dong', 'controller', 'factor', 'value', 'can', 'ket_qua', 'n_diem_ngoai', 'n_da_kiem', 'n_chua_kiem',
-             'n_co', 'n_chua_ket_luan', 'n_khong_co')
+KIEM_NEED = ('dong', 'controller', 'factor', 'value', 'can', 'can_value', 'ket_qua', 'n_diem_ngoai', 'n_da_kiem',
+             'n_chua_kiem', 'n_co', 'n_chua_ket_luan', 'n_khong_co')
 KIEM_POINT = ('không cờ', 'chưa kết luận', 'cờ')
 KIEM_TOTAL = ('đã kiểm đủ', 'kiểm dở', 'không kiểm')
 S03_PUBLIC = ('sweep.csv', 'levels.csv', KIEM_FILE, 'meta.yaml')     # opened by mien, hashed in mien_A.json
@@ -769,8 +769,9 @@ def kiem_check(run):
 
 def kiem_points(pts, tot, want):
     """S84-5: the point rows of kiem_ngoai_mien.csv are exactly the points outside [L, H] found from the public
-    sweep.csv and levels.csv (want: {(controller, factor, value): 'L' | 'H'}), one row each, on the right side, and
-    the counts of each total row agree with them (nothing checked twice, nothing left out)."""
+    sweep.csv and levels.csv (want: {(controller, factor, value): ('L', L) | ('H', H)}), one row each, on the right
+    side against the right level (S84V2-2: can_value finite and equal to L or H of levels.csv), and the counts of
+    each total row agree with them (nothing checked twice, nothing left out)."""
     got = {}
     for r in pts:
         key = (r['controller'], r['factor'], _f(r['value'], f'{KIEM_FILE} value'))
@@ -780,9 +781,12 @@ def kiem_points(pts, tot, want):
     if set(got) != set(want):
         raise Refused(f'{KIEM_FILE}: points do not match the sweep outside [L, H]: missing '
                       f'{sorted(set(want) - set(got))[:5]}, extra {sorted(set(got) - set(want))[:5]}')
-    side = [k for k, s in want.items() if got[k]['can'] != s]
+    side = [k for k, (s, _) in want.items() if got[k]['can'] != s]
     if side:
         raise Refused(f'{KIEM_FILE}: level compared on the wrong side for {side[:5]}')
+    lvl = [k for k, (_, x) in want.items() if _f(got[k]['can_value'], f'{KIEM_FILE} can_value {k}') != x]
+    if lvl:
+        raise Refused(f'{KIEM_FILE}: can_value is not the L or H of levels.csv for {lvl[:5]}')
     for c, t in tot.items():
         res = [got[k]['ket_qua'] for k in got if k[0] == c]
         need = dict(n_diem_ngoai=len(res), n_da_kiem=len(res), n_chua_kiem=0, n_co=res.count('cờ'),
@@ -885,7 +889,7 @@ def mien_rows(run):
                             n_diem=str(len(vals)), co_diem_0='true' if has0 else 'false', nguon_hi=src))
             for x in pts:                                      # S84-5: every point (original or extension) outside
                 if x < Lo or x > Hi:                           # [L, H] must have its row in kiem_ngoai_mien.csv
-                    want[(c, fac, x)] = 'L' if x < Lo else 'H'
+                    want[(c, fac, x)] = ('L', Lo) if x < Lo else ('H', Hi)    # S84V2-2: side and level value
     kiem_points(k_pts, k_tot, want)
     return out
 

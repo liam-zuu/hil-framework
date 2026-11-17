@@ -523,6 +523,12 @@ def rename_gain(sw):
                                                      and r['factor'] == 'kp_xy' and r['can'] == 'L')]), 'do not match'),
     (dict(kiem_edit=lambda kr: [kr[0]] + kr), 'twice'),
     (dict(kiem_edit=lambda kr: [dict(kr[0], can='H')] + kr[1:]), 'wrong side'),
+    # S84V2-2: can_value is the L or H of levels.csv, finite, present
+    (dict(kiem_edit=lambda kr: [dict(kr[0], can_value='1.0')] + kr[1:]), 'can_value is not'),          # L side
+    (dict(kiem_edit=lambda kr: [dict(r, can_value='4.0') if r['dong'] == 'diem' and r['can'] == 'H' else r
+                                for r in kr]), 'can_value is not'),                                  # H side: b, not H
+    (dict(kiem_edit=lambda kr: [dict(kr[0], can_value='nan')] + kr[1:]), 'not finite'),
+    (dict(kiem_edit=lambda kr: [dict(kr[0], can_value='')] + kr[1:]), 'not a number'),
     (dict(kiem_edit=lambda kr: kr[:-1] + [dict(kr[-1], n_khong_co=int(kr[-1]['n_khong_co']) - 1)]), 'do not agree'),
     (dict(kiem_edit=lambda kr: kr[:-1] + [dict(kr[-1], n_chua_kiem=1)]), 'do not agree'),
     # S84-4: the default rows are complete per mu
@@ -540,9 +546,14 @@ def test_mien_refuses(w0, capsys, kw, msg):
 
 def test_kiem_c13_item8_sees_a_changed_check_file(w0, capsys, monkeypatch):
     """S84-6: the check file is hashed in mien_A.json, so kiem-c13 item 8 fails when kiem_ngoai_mien.csv changes
-    after the domain was made (here one blank line: the domain computed again is the same)."""
+    after the domain was made (here one blank line: the domain computed again is the same). S84V2-3: the mailbox
+    holds mien_A.csv, sweep.csv, levels.csv of that run, so item 8 passes first and only the check file fails it."""
     run = s03_run(w0['tmp'])
     assert C.main(mien_args(w0, run)) == 0
+    hop = w0['sa'] / 'HOP_THU'
+    shutil.copy(w0['tmp'] / 'A' / 'mien_A.csv', hop / 'mien_A.csv')
+    for n in ('sweep.csv', 'levels.csv'):
+        shutil.copy(run / n, hop / n)
     monkeypatch.setattr(C, '_tool_version', lambda cmd: '')
     real_git = C.git
     monkeypatch.setattr(C, 'git', lambda root, *a: '2026-11-19' if a[:2] == ('show', '-s') else real_git(root, *a))
@@ -551,12 +562,22 @@ def test_kiem_c13_item8_sees_a_changed_check_file(w0, capsys, monkeypatch):
     capsys.readouterr()
     C.main(cmd)
     line8 = next(x for x in capsys.readouterr().out.splitlines() if ' 8 ' in x)
-    assert 'nguồn S03 khớp True' in line8 and 'tính lại khớp True' in line8
+    assert line8.startswith('ĐẠT ') and 'nguồn S03 khớp True' in line8 and 'tính lại khớp True' in line8
     k = run / 'kiem_ngoai_mien.csv'
     k.write_bytes(k.read_bytes() + b'\r\n')
     C.main(cmd)
     line8 = next(x for x in capsys.readouterr().out.splitlines() if ' 8 ' in x)
     assert line8.startswith('CHƯA') and 'nguồn S03 khớp False' in line8 and 'tính lại khớp True' in line8
+
+
+def test_mien_refuses_check_file_without_can_value(w0, capsys):
+    """S84V2-2: the column can_value is required in kiem_ngoai_mien.csv."""
+    run = s03_run(w0['tmp'])
+    rows = list(csv.DictReader(open(run / 'kiem_ngoai_mien.csv', encoding='utf-8')))
+    cols = [c for c in KCOLS if c != 'can_value']
+    wcsv(run / 'kiem_ngoai_mien.csv', cols, [{k: r[k] for k in cols} for r in rows])
+    assert C.main(mien_args(w0, run)) == 2 and "columns missing ['can_value']" in capsys.readouterr().out
+    assert not (w0['tmp'] / 'A' / 'mien_A.csv').exists()
 
 
 def test_mien_default_alias(w0, capsys):

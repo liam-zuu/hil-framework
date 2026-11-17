@@ -1933,11 +1933,30 @@ def _all(**k):
     (_w(_all(e=0.03), {0.2: _kr(e=0.04), 0.5: _kr(e=0.02)}), _all(e=0.03), GATE3, THR, ('cờ', 3, False)),
     (_w(_all(), {0.8: _kr(tv=0.8)}), _all(), GATE3, THR, ('cờ', 3, False)),             # 1.0 - 0.8 against 0.2
     (_w(_all(e=0.03), {0.5: _kr(e=0.0201)}), _all(e=0.03), GATE3, THR, ('không cờ', 4, False)),   # just short
+    # S84V2-1: the rounding allowance is one subtraction's, not relative: 1e-14 m short of 0.01 is not 'lower'
+    (_w(_all(e=0.03), {0.5: _kr(e=0.02000000000001)}), _all(e=0.03), GATE3, THR, ('không cờ', 4, False)),
+    # S84V2-1: equal responses with a tiny positive Y3 threshold are not 'lower by the threshold'
+    (_all(), _all(), GATE3, {0.2: 1e-13, 0.5: 1e-13, 0.8: 1e-13}, ('không cờ', 4, False)),
     (_w(_all(e=0.03), {0.5: _kr(e=0.02), 0.8: _kr(e=0.03, tv=1.5)}), _all(e=0.03), GATE3, THR,
      ('không cờ', 4, True)),
 ])
 def test_v84_classify_point_steps(pt, bd, gate, thr, want):
     assert s3.classify_point(pt, bd, gate, thr) == want
+
+
+@pytest.mark.parametrize('fn, x, ref, thr, want', [
+    # S84V2-1: inclusive bounds within one subtraction's rounding, no wider
+    ('lower', 1.0, 1.0, 1e-13, False),                  # equal: not lower by a positive threshold
+    ('lower', 0.02000000000001, 0.03, 0.01, False),     # 1e-14 m short
+    ('lower', 0.02, 0.03, 0.01, True),                  # 0.03 - 0.02 = 0.009999999999999998
+    ('lower', 0.8, 1.0, 0.2, True),                     # Y3: 1.0 - 0.8 = 0.19999999999999996
+    ('not_above', 0.04, 0.03, 0.01, True),              # 0.04 - 0.03 = 0.010000000000000002
+    ('not_above', 0.04000000000001, 0.03, 0.01, False),  # 1e-14 m over
+    ('not_above', 1.0 + 1e-13, 1.0, 0.0, False),        # threshold 0: higher is higher
+])
+def test_v84_bound_helpers(fn, x, ref, thr, want):
+    f = s3.lower_by_at_least if fn == 'lower' else s3.not_above_by
+    assert f(x, ref, thr) is want
 
 
 def _kiem_rows(ctrl, grids, fn, mu=0.5):
