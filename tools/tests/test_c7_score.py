@@ -1991,7 +1991,7 @@ def test_v11_33_cmd_rates_against_a_finite_difference_oracle(task):
         assert len(jumps)                                    # the wrapped heading does cross +-pi
         starts += [float(tt[j]) - 0.02 for j in jumps[:3]]
     else:
-        starts += [0.50001]        # Codex VG2-1: the window [0.50001, 0.50051] s inside the K1 ramp-down of a side
+        starts += [0.50001]        # Codex VG2-1: the window [0.50001, 0.50051] s inside the K1 ramp-up of the first side (Codex VG3-1)
     for a in starts:
         for width in (0.0005, 0.04):
             v, w = cr.sup(a, a + width)
