@@ -168,8 +168,8 @@ def test_drift_distance_and_spans(base_run):
 def test_imu_lead_gives_L_above_U(tmp_path):
     fp, lp = make_run(str(tmp_path), lam_g=-0.010, lam_r=-0.012)      # IMU ahead of the wheels: assumption broken
     out, _, _ = G.analyse(fp, lp, 'O1-F05')
-    assert not out['ok'] and out['ket_luan'] == 'chua_ket_luan'
-    assert any('> U~' in x for x in out['ly_do']) and out['nodes_s'] == []
+    assert not out['ok'] and out['ket_luan'] == 'hong_he_do'               # O1 v11.34 Q2: per-run check -> lost
+    assert any('> U~' in x for x in out['ly_do_hong']) and out['nodes_s'] == []
 
 
 def test_pairs_invalid_lost(tmp_path):
@@ -229,7 +229,7 @@ def test_c8_range_check(tmp_path, base_run):
     w = out['width_s']
     khoa = dict(dai={'O1-F05': dict(width_s=[w + 0.002, w + 0.004], gyro_minus_rv_s=[-1, 1])})
     out2, _, _ = G.analyse(base_run[1], base_run[2], 'O1-F05', khoa)
-    assert out2['ket_luan'] == 'chua_ket_luan' and any('C8 range' in x for x in out2['ly_do_chua'])
+    assert out2['ket_luan'] == 'hong_he_do' and any('C8 range' in x for x in out2['ly_do_hong'])
     khoa['dai']['O1-F05']['width_s'] = [w - 0.001, w + 0.001]
     out3, _, _ = G.analyse(base_run[1], base_run[2], 'O1-F05', khoa)
     assert out3['ok']
@@ -275,13 +275,15 @@ def test_sealed_path_refused(tmp_path, base_run):
 
 # ── c8b_luoi ─────────────────────────────────────────────────────────────────────────────────
 
-def node(states, rows=None, nums=None, ok=True, u_t=0.03):
+def node(states, rows=None, nums=None, ok=True, u_t=0.03, kind='hong', cat=False):
     if not ok:
-        return dict(ok=False, why='lost')
+        return dict(ok=False, kind=kind, why=kind)
     st = dict(zip(LU.CONDS, states)) if isinstance(states, (list, tuple)) else states
     nm = nums or {c: dict(q=0.05, lo=0.04, hi=0.06, n_undef=0, q_chung=0.05, lo_chung=0.04, hi_chung=0.06,
                           n_undef_chung=0) for c in LU.MEASURED}
-    return dict(ok=True, outcome='x', states=st, nums=nm, rows=rows or {}, u_t_s=u_t)
+    gate = {c: dict(state=st[c]) for c in LU.CONDS}
+    gate['g1'] = dict(state=st['g1'], t_done=[1.0, 1.0])
+    return dict(ok=True, kind='ok', outcome='x', states=st, nums=nm, rows=rows or {}, u_t_s=u_t, cat=cat, gate=gate)
 
 
 def rows_with(viol_key=None, c='g3', lo=0.12, in_dom=True, extra=()):
@@ -366,9 +368,37 @@ def test_error_node_chua_and_all_lost():
     n[1] = node(None, ok=False)
     res = LU.combine(n)
     assert all(v == 'chua_ket_luan' for v in res['states'].values()) and res['outcome'] == 'chua_ket_luan'
-    assert not res['bieu_dien']['g2']
+    assert res['nums']['g2']['n_undef'] >= 1 and res['nums']['g2']['chung']['n_undef'] >= 1   # GATE v2 2 point 3
+    assert res['bieu_dien']['g2'] and res['hong_nut'] == [False, True, False]
     res2 = LU.combine([node(None, ok=False)] * 3)
-    assert res2['outcome'] == 'hong_he_do'
+    assert res2['outcome'] == 'hong_he_do' and res2['nut_tam'] is None
+    res3 = LU.combine([node(None, ok=False, kind='loi')] * 3)          # tool problems are not the measurement
+    assert res3['outcome'] == 'chua_ket_luan' and res3['hong_nut'] == [False] * 3
+
+
+def test_cat_every_node():
+    st = ['chua_ket_luan', 'dat', 'khong_dat', 'dat', 'dat']
+    n = [node(st, rows_with(0.2), cat=True) for _ in range(3)]
+    res = LU.combine(n)
+    assert res['outcome'] == 'khong_dat' and res['fail_cause'] == 'vi_pham_truoc_loi_he_do' and all(res['cat_nut'])
+    n[1] = node(st, rows_with(0.2), cat=False)
+    res = LU.combine(n)
+    assert res['fail_cause'] == '' and res['cat_nut'] == [True, False, True]
+
+
+def test_gate_block_and_luoi_v1():
+    st = ['dat', 'dat', 'khong_dat', 'dat', 'dat']
+    n = [node(st, rows_with(0.2), u_t=0.02 + 0.001 * i) for i in range(5)]
+    n[2] = node(None, ok=False)                     # centre lost: nut_tam the nearest scored node
+    res = LU.combine(n)
+    gio = dict(nodes_s=[1.0, 1.001, 1.002, 1.003, 1.004])
+    g = LU.gate_block(n, res, gio, 'a' * 64)
+    lb = g['luoi']
+    assert lb['format'] == 'luoi_v1' and lb['n_nut'] == 5 and lb['nut_tam'] == 1 and lb['d_dau_s'] == 1.0
+    assert lb['buoc_max_s'] == pytest.approx(0.001) and lb['hong_nut'] == [False, False, True, False, False]
+    assert lb['g1_nut'][2] == 'chua_ket_luan' and lb['g1_state'] == 'chua_ket_luan' == g['g1']['state']
+    assert g['g1']['t_done'] == [1.0, 1.0] and g['u_t'] == pytest.approx(0.024)
+    assert g['g3']['state'] == 'chua_ket_luan' and g['g3']['n_undef'] >= 1
 
 
 def test_single_node_uses_its_state():
@@ -560,9 +590,9 @@ def test_khoa_sums():
     cao = 1.5 * 0.002 / (2.6 - 0.12)
     assert k['U_p_m'] == pytest.approx(1.25 * (0.002 + 0.001 + 0.0015 + 0.0005 + 0.0008 + cao + 0.0007))
     assert k['U_psi_deg'] == pytest.approx(1.25 * (0.2 + 0.3 + 0.1 + 0.25))
-    assert k['troi_rate'] == pytest.approx(1.25 * 4e-4)                  # run d (not ok) left out
+    assert k['troi_ppm'] == pytest.approx(1.25 * 4e-4 * 1e6)             # run d (not ok) left out
     assert k['dai']['O1-F05']['width_s'] == [0.010, 0.012] and k['dai']['O1-F05']['gyro_minus_rv_s'] == [0.003, 0.005]
-    assert k['alpha']['alpha_r_s_px'] == pytest.approx(8.75e-6) and k['man_trap'] == 'alpha'
+    assert k['man_trap']['alpha_r_s_px'] == pytest.approx(8.75e-6) and k['man_trap_kieu'] == 'alpha'
 
 
 def test_khoa_refuses_bad_3b_and_missing_field():
@@ -578,7 +608,7 @@ def test_khoa_phep5_and_one_frame():
     tb = json.loads(json.dumps(TBD))
     tb['B']['shutter']['use_alpha'] = False
     k = CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, tb, CAM, phep5=[('d1', 0.003), ('d2', -0.02)])
-    assert k['man_trap'] == 'mot_khung' and k['alpha'] is None
+    assert k['man_trap_kieu'] == 'mot_khung' and k['man_trap'] is None
     assert k['phep5']['ket_qua'] == 'xem_lai' and k['phep5']['vuot'] == ['d2']
 
 
@@ -612,6 +642,8 @@ def test_cong_rule_2b():
     assert p8['uhat']['g5'] == pytest.approx(2.0 + math.degrees(p8['u_t_c8_s'] * wz))
     assert p8['report_only'] == [c for c in ('g2', 'g3', 'g5') if p8['uhat'][c] > 0.5 * o1_gate.THRESHOLDS[c]]
     assert [r['run_id'] for r in p8['runs']] == ['r3', 'r4']
+    lu = d['camera']['c8b']['u_t_luot_c8']
+    assert lu['r3']['h_s'] == pytest.approx(0.009) and lu['r3']['u_max_s'] == pytest.approx(0.021)
     assert d['format'] == 'gate_c8_v1' and d['u_t_branch'] == 'bo_tick'
 
 

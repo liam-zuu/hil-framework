@@ -6,12 +6,13 @@ gate file format gate_c8_v1: 03_CODE/docs/2026-11-17_Thiet_ke_CODE_GATE_v1.md se
 Written by CODE_C8B local_21b7debc on feat/c8b-u.
 
 khoa (after the C8 clips are tracked and the C8 runs have their clock files):
-  troi_rate      drift rate bound = LE x the largest |D_end - D_start| / distance of the third centres over the two
-                 bound channels of every C8 run (design 3 table, C8B4R2-4; a convention: fit noise may hide drift)
+  troi_ppm       drift rate bound [ppm] = LE x the largest |D_end - D_start| / distance of the third centres over the
+                 two bound channels of every C8 run (design 3 table, C8B4R2-4; a convention: fit noise may hide drift);
+                 name of the camera scorer's constants file (CODE 17/11)
   dai            per level: [min, max] over the C8 runs of the width U~ - L and of D_gyro - D_RV (design 3 "Kiem moi
                  luot": a campaign run outside the C8 range of its level is not concluded)
-  alpha          the rolling-shutter read time per row / column x LE from test 3b when it was usable, else null (one
-                 frame; design 3 table, 4b)
+  man_trap       {alpha_r_s_px, alpha_c_s_px, nguon}: the rolling-shutter read time per row / column x LE from test 3b
+                 when it was usable; null = one frame (design 3 table, 4b; the scorer's names, CODE 17/11)
   U_p  (m)       = LE x [largest per-frame error of the 9 check tags (test 1) + check-tag placement by tape + body-centre
                  residual of test 2 after the tag-body offset + offset-parameter difference origin / far place of test
                  2 + re-seating repeatability (position) + tag-height error rho |dh| / (H - h) + d_p_quay (3b)]
@@ -113,7 +114,7 @@ def u_p_u_psi(cam, tb):
     return LE * sum(p.values()), p, LE * sum(s.values()), s
 
 
-def khoa(gios, tb, cam, u_imu=None, phep5=None):
+def khoa(gios, tb, cam, u_imu=None, phep5=None, tb_name='', tb_sha=''):
     """gios: {run_id: c8b_gio_v1 dict} of the C8 runs."""
     if not gios:
         raise UError('no C8 clock file')
@@ -135,13 +136,14 @@ def khoa(gios, tb, cam, u_imu=None, phep5=None):
         raise UError('no C8 run with a drift rate (every run short or not ok)')
     U_p, p_parts, U_psi, s_parts = u_p_u_psi(cam, tb)
     sh = (tb.get('B') or {}).get('shutter') or {}
-    alpha = None
+    man_trap = None
     if sh.get('use_alpha'):
-        alpha = dict(alpha_r_s_px=_num(abs(sh['alpha_r_le_s_px']), 'alpha_r'),
-                     alpha_c_s_px=_num(abs(sh['alpha_c_le_s_px']), 'alpha_c'), le=LE,
-                     do=dict(alpha_r_s_px=sh['alpha_r_s_px'], alpha_c_s_px=sh['alpha_c_s_px']))
-    out = dict(version=VERSION, le=LE, troi_rate=LE * max(rates), troi_rate_luot=sorted(rates),
-               dai=dai, alpha=alpha, man_trap='alpha' if alpha else 'mot_khung',
+        man_trap = dict(alpha_r_s_px=_num(abs(sh['alpha_r_le_s_px']), 'alpha_r'),
+                        alpha_c_s_px=_num(abs(sh['alpha_c_le_s_px']), 'alpha_c'),
+                        nguon=dict(file=tb_name, sha256=tb_sha, le=LE,
+                                   do=dict(alpha_r_s_px=sh['alpha_r_s_px'], alpha_c_s_px=sh['alpha_c_s_px'])))
+    out = dict(version=VERSION, le=LE, troi_ppm=LE * max(rates) * 1e6, troi_rate_luot=sorted(rates),
+               dai=dai, man_trap=man_trap, man_trap_kieu='alpha' if man_trap else 'mot_khung',
                mot_khung_s=sh.get('mot_khung_s'), U_p_m=U_p, U_p_phan_m=p_parts, U_psi_deg=U_psi,
                U_psi_phan_deg=s_parts)
     if u_imu is not None:
@@ -175,14 +177,20 @@ def read_plan(path):
     return plan
 
 
-def run_u_t(gio, luoi):
-    """u_t_s of one C8 run for rule 2b, or None (lost, or U_t not finite at every node)."""
+def run_u_t_parts(gio, luoi):
+    """(u_t_s, parts) of one C8 run for rule 2b (O1 v11.34 3.9 2b: h + u_max), or (None, why): lost, or U_t not
+    finite at every node."""
     if not gio.get('ok') or luoi.get('outcome') == 'hong_he_do':
-        return None
+        return None, 'lost to the measurement system'
     ut = luoi.get('u_t_nodes') or []
-    if not ut or any(not isinstance(x, (int, float)) or not math.isfinite(x) for x in ut):
-        return None
-    return max(ut) + float(gio['half_s'])
+    if not ut or any(isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) for x in ut):
+        return None, 'U_t not finite at every node'
+    h = float(gio['half_s'])
+    return max(ut) + h, dict(u_max_s=max(ut), h_s=h, n_nut=len(ut))
+
+
+def run_u_t(gio, luoi):
+    return run_u_t_parts(gio, luoi)[0]
 
 
 def slot_runs(plan, luot):
@@ -203,8 +211,8 @@ def slot_runs(plan, luot):
             if chosen is not None:
                 raise UError(f'slot {slot}: run {rid} after a run that was not lost (a rerun only replaces a lost run)')
             if not lost:
-                chosen = (rid, run_u_t(g, l))
-        out[slot] = chosen if chosen is not None else (lst[-1][0], None)
+                chosen = (rid,) + run_u_t_parts(g, l)
+        out[slot] = chosen if chosen is not None else (lst[-1][0], None, 'every run of the slot lost')
     return out
 
 
@@ -222,7 +230,7 @@ def cong(k, plan, luot, levels, branch, c8_dir, cam=None, written_by=None):
         raise UError(f'levels {levels!r}: distinct figure-8 tasks')
     chosen = slot_runs(plan, luot)
     thr = {c: o1_gate.THRESHOLDS[c] for c in MASKABLE}
-    per = {}
+    per, parts = {}, {}
     for lv in levels:
         runs = []
         for slot, p in plan.items():
@@ -230,7 +238,9 @@ def cong(k, plan, luot, levels, branch, c8_dir, cam=None, written_by=None):
                 continue
             if slot not in chosen:
                 raise UError(f'slot {slot} ({lv}, {p["controller"]}) has no run')
-            rid, ut = chosen[slot]
+            rid, ut, part = chosen[slot]
+            parts[rid] = dict(slot=slot, task=lv, controller=p['controller'], u_t_s=ut,
+                              **(part if isinstance(part, dict) else dict(bo_ra=part)))
             if ut is not None:
                 runs.append(dict(run_id=rid, controller=p['controller'], u_t_s=ut))
         ctl = {r['controller'] for r in runs}
@@ -247,7 +257,7 @@ def cong(k, plan, luot, levels, branch, c8_dir, cam=None, written_by=None):
                 levels=list(levels), u_t_branch=branch,
                 dieu_2b=dict(rule='report_only = {c in g2,g3,g5 : uhat[c] > 0.5 * threshold[c]}', thresholds=thr,
                              u_p_m=k['U_p_m'], u_psi_deg=k['U_psi_deg'], per_level=per),
-                camera=dict(c8b=k, cam=cam or {}))
+                camera=dict(c8b=dict(k, u_t_luot_c8=parts), cam=cam or {}))
 
 
 def write_gate(path, d):
@@ -320,15 +330,16 @@ def main(argv=None):
                 with open(a.phep5, newline='', encoding='utf-8') as f:
                     phep5 = [(r['diem'], float(r['chenh_m'])) for r in csv.DictReader(f)]
                 src.append(a.phep5)
-            out = khoa(gios, _json(a.tb), _json(a.cam_u), _json(a.u_imu) if a.u_imu else None, phep5)
+            out = khoa(gios, _json(a.tb), _json(a.cam_u), _json(a.u_imu) if a.u_imu else None, phep5,
+                       os.path.basename(a.tb), cu.sha256(a.tb))
             src += [a.tb, a.cam_u] + ([a.u_imu] if a.u_imu else [])
             out['nguon'] = [dict(file=os.path.basename(p), sha256=cu.sha256(p)) for p in src]
             out['script'] = cu.script_state()
             cu.check_path(a.out)
             with open(a.out, 'x', encoding='utf-8') as f:
                 f.write(json.dumps(_clean(out), indent=1, ensure_ascii=False, allow_nan=False))
-            print(f'U_p {out["U_p_m"] * 1e3:.2f} mm, U_psi {out["U_psi_deg"]:.3f} deg, troi_rate '
-                  f'{out["troi_rate"] * 1e6:.0f} ppm, man trap {out["man_trap"]}')
+            print(f'U_p {out["U_p_m"] * 1e3:.2f} mm, U_psi {out["U_psi_deg"]:.3f} deg, troi '
+                  f'{out["troi_ppm"]:.0f} ppm, man trap {out["man_trap_kieu"]}')
         else:
             k = _json(a.khoa)
             if k.get('version') != VERSION:

@@ -22,14 +22,17 @@ U~ = smaller D of the two IMU channels (assumption: the IMU gives no apparent le
 half width LE x (U~ - L)/2 (LE = 1.25, author's convention). An estimate with assumptions, not a proven bound.
 Grid nodes (F3; C8B4R2-1, -2): spacing <= 1 ms, both ends included; zero width (L = U~): one node (C8B4R5-2).
 
-Checks that BLOCK (section 7, C8B4-13). Lost to the measurement system (ket_luan hong_he_do: the run is run again
-with the same gains): fewer than PAIR_MIN (95 % [DE XUAT]) of the consecutive line pairs of the log window valid,
-or a log hole above LOG_HOLE_S (100 ms [DE XUAT]). No finite clock bound (ket_luan chua_ket_luan: G1-G5 not
-concluded; THESIS writes the rule): reset_n not constant, g_valid or r_valid 0 in the log window; an IMU age below
-AGE_NEG_LIM_MS (-2 ms [DE XUAT]); a channel fit not ok (correlation, start / end thirds, o1_time_sync limits);
-L > U~; the start-up check inconsistent; with a C8 lock file, the width U~ - L or the gyro - RV difference outside the
-range of the C8 runs of the same level. Refused (exit 2): duplicate log lines not marked by the logger segments file
-(a repeated log_seq, L92), a log_seq jump in the run window (o1_time_sync.log_window), times not increasing.
+Checks that BLOCK (section 7, C8B4-13; O1 v11.34 3.5, Liam 17/11 at THESIS Q2 "Hong he do, chay lai <=3
+(Recommended)"). Lost to the measurement system (ket_luan hong_he_do: run again with the same gains; the count of
+reruns, at most 3 per gain set and level, is kept outside this script): fewer than PAIR_MIN (95 % [DE XUAT]) of the
+consecutive line pairs of the log window valid, a log hole above LOG_HOLE_S (100 ms [DE XUAT]), and the per-run
+checks of section 3: a channel fit not ok (correlation, start / end thirds, o1_time_sync limits), L > U~, the
+start-up estimate not meeting the scoring interval, and, with a C8 lock file, the width U~ - L or the gyro - RV
+difference outside the range of the C8 runs of the same level (at C8 itself only the first two). No finite clock
+bound (ket_luan chua_ket_luan: G1-G5 not concluded; design 7): reset_n not constant, g_valid or r_valid 0 in the log
+window, an IMU age below AGE_NEG_LIM_MS (-2 ms [DE XUAT]), a lock file without the range of the level. Refused
+(exit 2): duplicate log lines not marked by the logger segments file (a repeated log_seq, L92), a log_seq jump in the
+run window (o1_time_sync.log_window), times not increasing.
 Start-up check (F5; C8B4R2-3; a consistency check only, never narrows the interval): from standstill, over the
 first STARTUP_S after the car leaves its place, a lower estimate from the wheel path (D >= t_enc(s_k) - t_cam,k:
 the tag does not go farther than the wheels rolled) and an upper estimate from the RV yaw (D <= t_rv - t_cam(dpsi):
@@ -44,7 +47,7 @@ intervals reported), and the drift rate of this run on the two bound channels (|
 third centres; the bound used is the largest over the C8 runs x 1.25, c8b_u.py).
 
   python tools/c8b_gio.py --frames <run>/frames.csv --esp32 <run>.csv --task O1-F08 --out gio.json \
-      [--khoa c8b_khoa.json] [--startup-s 0.5]
+      [--khoa c8b_khoa.json (troi_ppm, U_p_m, U_psi_deg, dai)] [--startup-s 0.5]
 Last line: #ket_qua,ma=0,ok=1|0 written (ok = 0: written, the run has no finite clock bound) / 2 refused or error.
 """
 from __future__ import annotations
@@ -438,7 +441,7 @@ def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S):
     t0 = float(tl[i0])
     inw = (tl >= win[0]) & (tl <= win[1])
     fails = []          # the run has no finite clock bound: G1-G5 not concluded (design 3, 7)
-    hong = []           # count pairs below PAIR_MIN or a log hole: run lost to the measurement system (design 7)
+    hong = []           # run lost to the measurement system, run again (design 7; O1 v11.34 3.5 Q2: the per-run checks)
     kiem = {}
     # section 7 checks on the log window
     kiem['n_dup_dropped'] = n_dup
@@ -497,7 +500,7 @@ def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S):
         except GioError as exc:
             kenh[ch] = dict(D_s=None, ok=False, why=str(exc))
         if not kenh[ch]['ok']:
-            fails.append(f'{ch}: {kenh[ch]["why"]}')
+            hong.append(f'{ch}: {kenh[ch]["why"]}')
     out = dict(format=FORMAT, task=task, t0_log_s=t0, window_log_s=list(win), coarse_s=coarse, kenh=kenh, kiem=kiem,
                moc_mau=True, step_s=STEP_S, le=LE)
     if any(kenh[c]['D_s'] is None for c in CHANNELS):
@@ -511,7 +514,7 @@ def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S):
     out.update(L_s=L, U_s=U, L_kenh=L_ch, U_kenh=U_ch, width_s=U - L, center_s=c, half_s=h,
                gyro_minus_rv_s=kenh['gyro_rx']['D_s'] - kenh['rv_rx']['D_s'])
     if L > U:
-        fails.append(f'L {L * 1e3:.1f} ms > U~ {U * 1e3:.1f} ms')
+        hong.append(f'L {L * 1e3:.1f} ms > U~ {U * 1e3:.1f} ms')
         out['nodes_s'] = []
     else:
         out['nodes_s'] = nodes(c, h)
@@ -542,7 +545,7 @@ def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S):
     kk = khoa or {}
     st = startup(F, t0, c, tm, vel, tr, yr, startup_s, kk.get('U_p_m', STARTUP_E_P_M),
                  math.radians(kk.get('U_psi_deg', STARTUP_E_PSI_DEG)))
-    rate_b = (khoa or {}).get('troi_rate') or out['rate_luot'] or 0.0
+    rate_b = ((khoa or {}).get('troi_ppm') or 0.0) * 1e-6 or out['rate_luot'] or 0.0
     wid = 0.0
     if st['t_start_log_s'] is not None:
         mid = 0.5 * (cw[0] + cw[1])
@@ -555,7 +558,7 @@ def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S):
     else:
         st['ket_qua'] = 'nhat_quan' if (lo_ok and hi_ok) else 'khong_nhat_quan'
         if not (lo_ok and hi_ok):
-            fails.append('start-up estimate does not meet the scoring interval')
+            hong.append('start-up estimate does not meet the scoring interval')
     out['khoi_dong'] = st
     # C8 range of the same level (campaign runs)
     if khoa is not None:
@@ -568,7 +571,7 @@ def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S):
                 inr = lo_ - 1e-12 <= v_ <= hi_ + 1e-12
                 kiem[f'{k_}_in_c8_range'] = inr
                 if not inr:
-                    fails.append(f'{k_} {v_ * 1e3:.1f} ms outside the C8 range [{lo_ * 1e3:.1f}, {hi_ * 1e3:.1f}] ms')
+                    hong.append(f'{k_} {v_ * 1e3:.1f} ms outside the C8 range [{lo_ * 1e3:.1f}, {hi_ * 1e3:.1f}] ms')
     else:
         kiem['c8_range'] = 'khong kiem (luot C8 hay chua khoa)'
     out.update(ok=not (fails or hong), ly_do=hong + fails, ly_do_hong=hong, ly_do_chua=fails,
