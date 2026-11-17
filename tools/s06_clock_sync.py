@@ -2,7 +2,8 @@
 """
 s06_clock_sync.py — đồng hồ ESP32 ↔ RPi5 từ chân đánh dấu (S06 T3; thiết kế
 03_CODE/docs/2026-11-15_Thiet_ke_S06_T3_danh_dau_v1.md mục 4 ý 3, Liam 15/11 "Duyệt, code luôn"; sửa sau Codex
-vòng 1, Liam 17/11 "Sửa 12 + vòng 2": T3C-7, T3C-8, T3C-9, T3C-15).
+vòng 1, Liam 17/11 "Sửa 12 + vòng 2": T3C-7, T3C-8, T3C-9, T3C-15; sau Codex vòng 2, Liam 17/11 "Sửa 5 + vòng 3":
+T3C-8, T3C-R2-1).
 
 Hai phía của cùng một cạnh lên:
   * RPi5: `run_hil.py --marker t3|10hz --frame-log frames.npz` nâng GPIO17 ngay trước `transfer` của frame có
@@ -12,12 +13,18 @@ Hai phía của cùng một cạnh lên:
 
 Neo thô (T3C-8, T3C-15): cạnh 10 Hz cách đều 100 ms nên không ghép được theo khoảng cách, và giờ nhận `t_rx` chỉ
 cho cận DƯỚI của trễ gửi. Neo bằng khoảng kẹp của lệnh START có `#ack,ok=1`:
-    t_gửi(START, Pi, `capture.yaml` commands, lấy SAU sendto) − SEND_SLACK_US
-        < OFFSET + t_ack_esp  <  t_rx(#ack, Pi)
-`t_ack_esp` = trường `t_us` của `#ack` (giờ ESP32 lúc cmd_task xử lý lệnh). Độ rộng khoảng kẹp = thời gian khứ hồi
-+ SEND_SLACK_US; rộng hơn ANCHOR_MAX_US (< nửa khoảng cách nhỏ nhất của cạnh) thì không ghép (mã 3). Từ tâm khoảng
-kẹp, ghép tham lam theo thứ tự cạnh Pi, cửa sổ MATCH_TOL_US quanh giờ dự đoán, khớp lại affine mỗi REFIT_EVERY cặp
-(bám trôi tần số thạch anh), rồi bình phương nhỏ nhất:
+    t_gửi(START, Pi, `capture.yaml` commands, lấy TRƯỚC sendto)  ≤  OFFSET + t_ack_esp  ≤  t_rx(#ack, Pi)
+`t_ack_esp` = trường `t_us` của `#ack` (giờ ESP32 lúc cmd_task xử lý lệnh). Sửa sau Codex vòng 2 (Liam 17/11 "Sửa 5 +
+vòng 3"): `#ack` chỉ ghép với lệnh START có CÙNG chuỗi (`s06_logger.py` thêm mã lần gửi `n=<k>` vào cuối mỗi lần gửi
+START; `s06_load` đọc ba trường đầu bằng `sscanf`, bỏ qua phần thừa, `#ack` chép lại `cmd=` nguyên chuỗi); không có
+lệnh cùng chuỗi, hay chuỗi đó gửi hơn một lần (log cũ gửi lại cùng chuỗi) thì không neo (mã 3). Độ rộng khoảng kẹp =
+thời gian khứ hồi; rộng hơn ANCHOR_MAX_US thì không ghép (mã 3).
+Độ lệch thô (T3C-R2-1): với các cạnh ESP32 gần `#ack` nhất (trong ANCHOR_SPAN_US, tối đa REFIT_EVERY cạnh), ứng viên là
+cạnh Pi có (t_pi − t_esp) trong khoảng kẹp ± MATCH_TOL_US; khoảng đó rộng ≤ ANCHOR_MAX_US + 2·MATCH_TOL_US = 46 ms < 50 ms
+(khoảng cách nhỏ nhất của cạnh Pi), nên mỗi cạnh ESP32 có tối đa một ứng viên. Độ lệch thô = trung vị các ứng viên;
+ít hơn MIN_PAIRS ứng viên, hay ứng viên lệch trung vị quá MATCH_TOL_US, thì không ghép (mã 3). Từ độ lệch thô, ghép
+tham lam theo thứ tự cạnh Pi, cửa sổ MATCH_TOL_US quanh giờ dự đoán, khớp lại affine mỗi REFIT_EVERY cặp (bám trôi
+tần số thạch anh), rồi bình phương nhỏ nhất:
     t_pi_us = OFFSET + RATE · t_esp_us        (cùng quy ước `--clock-affine` của t3b_score.py)
 Affine cuối phải đặt giờ `#ack` vào trong khoảng kẹp (± MATCH_TOL_US), không thì mã 3 (ghép không đáng tin).
 
@@ -66,8 +73,10 @@ import s06_stream as stm        # noqa: E402
 MIN_PAIRS = 3                 # ít nhất 3 cặp mới khớp affine có phần dư
 MATCH_TOL_US = 3000.0         # cửa sổ ghép quanh giờ dự đoán (≪ 50 ms, khoảng cách nhỏ nhất của cạnh)
 REFIT_EVERY = 20
-SEND_SLACK_US = 5000.0        # giờ gửi lấy SAU sendto (s06_logger.send_cmd): nới cận dưới [ĐỀ XUẤT CODE_S06]
-ANCHOR_MAX_US = 40_000.0      # độ rộng khoảng kẹp tối đa (< 50 ms, nửa khoảng cách cạnh 10 Hz)
+ANCHOR_MAX_US = 40_000.0      # độ rộng khoảng kẹp tối đa: + 2·MATCH_TOL_US vẫn < 50 ms (khoảng cách cạnh nhỏ nhất)
+# Cạnh ESP32 dùng cho độ lệch thô cách #ack không quá chừng này: trôi 100 ppm × 20 s = 2 ms, dưới biên 7 ms
+# (50 − 40 − 3) để cạnh Pi kề bên không lọt vào khoảng kẹp [ĐỀ XUẤT CODE_S06]
+ANCHOR_SPAN_US = 20_000_000.0
 LOOP_CAL_MIN = 1000           # spec mục 4.1: N = 1 000
 CMD_RE = re.compile(r'^\s*-\s*\{t_us:\s*(\d+),\s*cmd:\s*"(.*)"\}\s*$')
 
@@ -96,7 +105,7 @@ def esp_marks(events, run: Optional[int] = None) -> np.ndarray:
 
 
 def read_commands(path: str) -> List[Tuple[int, str]]:
-    """(giờ Pi µs sau sendto, lệnh) của mục `commands:` trong capture.yaml của s06_logger.py."""
+    """(giờ Pi µs lấy trước sendto, lệnh) của mục `commands:` trong capture.yaml của s06_logger.py."""
     out, inside = [], False
     with open(path, encoding='utf-8') as f:
         for line in f:
@@ -113,27 +122,29 @@ def read_commands(path: str) -> List[Tuple[int, str]]:
 
 
 def anchor(events, commands: Sequence[Tuple[int, str]], t_rx_ref: Optional[int] = None) -> Optional[dict]:
-    """Khoảng kẹp của OFFSET từ một `#ack,ok=1` của START: lo < OFFSET + t_ack < hi. Chọn #ack START ok mới nhất
+    """Khoảng kẹp của OFFSET từ một `#ack,ok=1` của START: lo ≤ OFFSET + t_ack ≤ hi. Chọn #ack START ok mới nhất
     có t_rx ≤ t_rx_ref + 2 s (t_rx_ref = t_rx của #run_start lượt chọn), không có t_rx_ref thì #ack đầu tiên.
-    Lệnh gửi = lệnh START cuối cùng gửi trước t_rx của #ack. None = không có cặp nào."""
+    Lệnh gửi = lệnh START có đúng chuỗi `cmd=` của #ack (T3C-8: mã lần gửi `n=<k>` của s06_logger), gửi đúng một
+    lần và không sau t_rx. None = không neo được."""
     acks = []
     for r in events['text']:
         if r['name'] != 'ack' or r['kv'].get('ok') != '1' or not r['kv'].get('cmd', '').startswith('START'):
             continue
         try:
-            acks.append((int(r['t_rx']), int(r['kv']['t_us'])))
+            acks.append((int(r['t_rx']), int(r['kv']['t_us']), r['kv']['cmd']))
         except (KeyError, ValueError):
             continue
     if t_rx_ref is not None:
         acks = [a for a in acks if a[0] <= t_rx_ref + 2_000_000][-1:]
     else:
         acks = acks[:1]
-    for t_rx, t_ack in acks:
-        sent = [t for t, c in commands if c.startswith('START') and t <= t_rx]
-        if not sent:
+    for t_rx, t_ack, text in acks:
+        sent = [t for t, c in commands if c == text]
+        if len(sent) != 1 or sent[0] > t_rx:     # không có, hay cùng chuỗi gửi hơn một lần: không gắn chắc
             continue
-        lo, hi = sent[-1] - SEND_SLACK_US - t_ack, t_rx - t_ack
-        return dict(t_ack_esp=t_ack, t_rx=t_rx, t_sent=sent[-1], lo=float(lo), hi=float(hi), width=float(hi - lo))
+        lo, hi = sent[0] - t_ack, t_rx - t_ack
+        return dict(t_ack_esp=t_ack, t_rx=t_rx, t_sent=sent[0], cmd=text, lo=float(lo), hi=float(hi),
+                    width=float(hi - lo))
     return None
 
 
@@ -244,6 +255,29 @@ def match(p: np.ndarray, e: np.ndarray, off0: float, tol_us: float = MATCH_TOL_U
     return pairs
 
 
+def coarse_offset(p: np.ndarray, e: np.ndarray, anc: dict, tol_us: float = MATCH_TOL_US) -> dict:
+    """T3C-R2-1: độ lệch thô t_pi − t_esp từ khoảng kẹp neo. Với tối đa REFIT_EVERY cạnh ESP32 gần #ack nhất (cách
+    ≤ ANCHOR_SPAN_US), ứng viên = cạnh Pi có (t_pi − t_esp) ∈ [lo − tol; hi + tol] (khoảng < 50 ms: tối đa một ứng
+    viên mỗi cạnh). off = trung vị ứng viên; None khi < MIN_PAIRS ứng viên hay ứng viên lệch trung vị > tol."""
+    near = np.argsort(np.abs(e - anc['t_ack_esp']), kind='stable')
+    near = [j for j in near if abs(e[j] - anc['t_ack_esp']) <= ANCHOR_SPAN_US][:REFIT_EVERY]
+    d, multi = [], 0
+    for j in near:
+        c = p[(p - e[j] >= anc['lo'] - tol_us) & (p - e[j] <= anc['hi'] + tol_us)]
+        if len(c) == 1:
+            d.append(float(c[0] - e[j]))
+        elif len(c) > 1:
+            multi += 1
+    out = dict(offset=None, n_cand=len(d), n_near=len(near), n_multi=multi, spread_us=None)
+    if len(d) < MIN_PAIRS or multi:
+        return out
+    med = float(np.median(d))
+    out['spread_us'] = float(max(abs(x - med) for x in d))
+    if out['spread_us'] <= tol_us:
+        out['offset'] = med
+    return out
+
+
 def sync(p: np.ndarray, half: np.ndarray, e: np.ndarray, anc: Optional[dict],
          loop_max_us: Optional[float] = None) -> dict:
     """Khớp affine t_pi = offset + rate·t_esp trên các cặp cạnh; p, e tăng dần; anc = anchor(); loop_max_us = trễ
@@ -251,9 +285,10 @@ def sync(p: np.ndarray, half: np.ndarray, e: np.ndarray, anc: Optional[dict],
     out = dict(n_pi=int(len(p)), n_esp=int(len(e)), n_pairs=0, anchor=anc, anchor_ok=False, offset_us=None,
                rate=None, res_max_us=None, res_rms_us=None, half_bracket_max_us=None, delta_sync_isr_us=None,
                delta_sync_us=None, loop_max_us=loop_max_us, esp_unmatched=None, pi_unmatched_in_span=None,
-               span_s=None, problem='')
+               span_s=None, coarse=None, problem='')
     if anc is None:
-        out['problem'] = 'không neo được: thiếu #ack START ok=1 hay lệnh START trong capture.yaml'
+        out['problem'] = ('không neo được: thiếu #ack START ok=1, hay capture.yaml không có lệnh START cùng chuỗi '
+                          'cmd= (hoặc chuỗi đó gửi hơn một lần)')
         return out
     if anc['width'] > ANCHOR_MAX_US:
         out['problem'] = f"khoảng kẹp neo rộng {anc['width'] / 1000:.1f} ms > {ANCHOR_MAX_US / 1000:.0f} ms"
@@ -261,7 +296,13 @@ def sync(p: np.ndarray, half: np.ndarray, e: np.ndarray, anc: Optional[dict],
     if len(p) == 0 or len(e) == 0:
         out['problem'] = 'không có cạnh'
         return out
-    pairs = match(p, e, 0.5 * (anc['lo'] + anc['hi']))
+    co = coarse_offset(p, e, anc)
+    out['coarse'] = co
+    if co['offset'] is None:
+        out['problem'] = (f"không có độ lệch thô trong khoảng kẹp: {co['n_cand']} ứng viên / {co['n_near']} cạnh ESP32 "
+                          f"gần #ack, {co['n_multi']} cạnh nhiều ứng viên, lệch trung vị {co['spread_us']} µs")
+        return out
+    pairs = match(p, e, co['offset'])
     out['n_pairs'] = len(pairs)
     if len(pairs) < MIN_PAIRS:
         out['problem'] = f'{len(pairs)} cặp < {MIN_PAIRS}'
@@ -271,7 +312,7 @@ def sync(p: np.ndarray, half: np.ndarray, e: np.ndarray, anc: Optional[dict],
     a, b = _fit(e[es_i], p[pi_i])
     res = p[pi_i] - (a + b * e[es_i])
     t_ack_pi = a + b * anc['t_ack_esp']
-    anc_ok = (anc['t_sent'] - SEND_SLACK_US - MATCH_TOL_US) <= t_ack_pi <= (anc['t_rx'] + MATCH_TOL_US)
+    anc_ok = (anc['t_sent'] - MATCH_TOL_US) <= t_ack_pi <= (anc['t_rx'] + MATCH_TOL_US)
     lo, hi = a + b * e.min(), a + b * e.max()
     in_span = np.nonzero((p >= lo - MATCH_TOL_US) & (p <= hi + MATCH_TOL_US))[0]
     out.update(anchor_ok=bool(anc_ok), offset_us=a, rate=b, res_max_us=float(np.max(np.abs(res))),

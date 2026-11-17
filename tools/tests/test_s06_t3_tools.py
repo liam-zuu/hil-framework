@@ -88,7 +88,7 @@ def _periodic(n=600, start=50, stop=550, drift=40e-6, lose=(), lat_rx=(1500, 300
     t_ack = float(e[0] - 500_000.0)
     t_ack_pi = off + (1 + drift) * t_ack
     anc = dict(t_ack_esp=t_ack, t_rx=t_ack_pi + 8000.0, t_sent=t_ack_pi - 3000.0)
-    anc.update(lo=anc['t_sent'] - cs.SEND_SLACK_US - t_ack, hi=anc['t_rx'] - t_ack)
+    anc.update(lo=anc['t_sent'] - t_ack, hi=anc['t_rx'] - t_ack)
     anc['width'] = anc['hi'] - anc['lo']
     return p, e, anc
 
@@ -152,16 +152,146 @@ def test_clock_sync_delta_sync_adds_isr_latency():
 
 def test_read_commands_and_anchor(tmp_path):
     cap = tmp_path / 'capture.yaml'
-    cap.write_text('profile: t3\ncommands:\n  - {t_us: 1000000, cmd: "START t3 20 1"}\n'
-                   '  - {t_us: 1500000, cmd: "START t3 20 1"}\nacks:\n  - {t_rx_us: 1, line: "x"}\n', encoding='utf-8')
+    cap.write_text('profile: t3\ncommands:\n  - {t_us: 1000000, cmd: "START t3 20 1 n=1"}\n'
+                   '  - {t_us: 1500000, cmd: "START t3 20 1 n=2"}\nacks:\n  - {t_rx_us: 1, line: "x"}\n',
+                   encoding='utf-8')
     cmds = cs.read_commands(str(cap))
-    assert cmds == [(1000000, 'START t3 20 1'), (1500000, 'START t3 20 1')]
-    ev = chk.parse_events([(1_520_000, '#ack,t_us=7000,ok=1,why=ok,cmd=START t3 20 1,qseq=5')])
+    assert cmds == [(1000000, 'START t3 20 1 n=1'), (1500000, 'START t3 20 1 n=2')]
+    ev = chk.parse_events([(1_520_000, '#ack,t_us=7000,ok=1,why=ok,cmd=START t3 20 1 n=2,qseq=5')])
     anc = cs.anchor(ev, cmds)
-    assert anc['t_sent'] == 1_500_000 and anc['lo'] == 1_500_000 - cs.SEND_SLACK_US - 7000
+    assert anc['t_sent'] == 1_500_000 and anc['lo'] == 1_500_000 - 7000
     assert anc['hi'] == 1_520_000 - 7000
-    ev = chk.parse_events([(1_520_000, '#ack,t_us=7000,ok=0,why=busy,cmd=START t3 20 1,qseq=5')])
+    ev = chk.parse_events([(1_520_000, '#ack,t_us=7000,ok=0,why=busy,cmd=START t3 20 1 n=2,qseq=5')])
     assert cs.anchor(ev, cmds) is None
+
+
+def test_anchor_ack_paired_by_command_text_t3c8():
+    """T3C-8 (Codex round 2): two START tries, the #ack of the first (n=1) arrives after the second was sent. The
+    #ack is paired with the send of the same text, never with the last START before it; the same text sent twice
+    (an old log without n=<k>) cannot be paired surely → no anchor."""
+    cmds = [(9_499_500, 'START t3 20 1 n=1'), (10_499_500, 'START t3 20 1 n=2')]
+    ev = chk.parse_events([(10_501_500, '#ack,t_us=9376544,ok=1,why=ok,cmd=START t3 20 1 n=1,qseq=5'),
+                           (10_501_600, '#ack,t_us=10376544,ok=0,why=busy,cmd=START t3 20 1 n=2,qseq=6')])
+    anc = cs.anchor(ev, cmds)
+    assert anc['t_sent'] == 9_499_500 and anc['cmd'] == 'START t3 20 1 n=1'
+    assert anc['width'] == 10_501_500 - 9_499_500                       # 1 s wide: refused by sync, below
+    same = [(9_499_500, 'START t3 20 1'), (10_499_500, 'START t3 20 1')]
+    ev = chk.parse_events([(10_501_500, '#ack,t_us=9376544,ok=1,why=ok,cmd=START t3 20 1,qseq=5')])
+    assert cs.anchor(ev, same) is None
+    assert cs.anchor(ev, [(10_600_000, 'START t3 20 1')]) is None       # sent after the #ack was received
+
+
+def test_clock_sync_late_ack_of_first_start_not_shifted_t3c8():
+    """T3C-8, Codex round 2 counterexample: Pi marks 5 s + 100 ms·i, ESP32 has marks 50..549 (offset 123 456,
+    rate 1); the #ack of the first START (sent 9 499 500) arrives at 10 501 500, after the second START (10 499 500).
+    Round 2 paired the #ack with the second send and returned offset 1 123 456 with code 0; now never code 0."""
+    p = 5_000_000.0 + 100_000.0 * np.arange(600)
+    e = p[50:550] - 123_456.0
+    cmds = [(9_499_500, 'START t3 20 1 n=1'), (10_499_500, 'START t3 20 1 n=2')]
+    ev = chk.parse_events([(10_501_500, '#ack,t_us=9376544,ok=1,why=ok,cmd=START t3 20 1 n=1,qseq=5')])
+    s = cs.sync(p, np.full(len(p), 1.0), e, cs.anchor(ev, cmds), loop_max_us=12.0)
+    assert cs.verdict(s)[0] != 0
+    assert s['offset_us'] is None or abs(s['offset_us'] - 123_456.0) < 100
+
+
+def test_logger_send_time_taken_before_sendto_t3c8(monkeypatch):
+    """T3C-8: the command time in capture.yaml is a lower bound of the ESP32 receive time: taken before sendto
+    (and before print), not after."""
+    import s06_logger as lg
+    clock = [1_000_000]
+    monkeypatch.setattr(lg, 'now_us', lambda: clock[0])
+
+    class Sock:
+        def sendto(self, data, addr):
+            clock[0] += 100_000                                       # the process is held 100 ms in sendto
+
+    assert lg.send_cmd(Sock(), ('127.0.0.1', 1), 'START t3 20 1 n=1') == 1_000_000
+
+
+def test_logger_start_tries_carry_try_number_t3c8(tmp_path):
+    """T3C-8: each START try ends with n=<k>; a fake s06_load that drops the first try answers the second with
+    #ack echoing the text (cmd=), and the anchor pairs it with the second send."""
+    import socket
+    import threading
+    import s06_logger as lg
+
+    def port():
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(('127.0.0.1', 0))
+        n = s.getsockname()[1]
+        s.close()
+        return n
+
+    cmd_p, data_p, evt_p = port(), port(), port()
+    stop = threading.Event()
+    got = []
+
+    def esp():
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(('127.0.0.1', cmd_p))
+        s.settimeout(0.1)
+        o = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        q = 0
+        while not stop.is_set():
+            try:
+                msg = s.recv(200).decode()
+            except socket.timeout:
+                continue
+            got.append(msg)
+            if msg.startswith('START') and len(got) == 1:
+                continue                                              # first try lost
+            for line in (f'#ack,t_us=5000,ok=1,why=ok,cmd={msg},qseq={q + 1}',
+                         f'#run_start,timestamp_us=6000,profile=zero,duration_s=1,auto_end=1,qseq={q + 2}',
+                         f'#run_end,timestamp_us=7000,reason=duration,qseq={q + 3}'):
+                o.sendto((line + '\n').encode(), ('127.0.0.1', evt_p))
+            q += 3
+        s.close()
+        o.close()
+
+    th = threading.Thread(target=esp, daemon=True)
+    th.start()
+    out = tmp_path / 'cap'
+    (tmp_path / 'temp').write_text('45000\n')
+    try:
+        rc = lg.main(['--esp32', '127.0.0.1', '--profile', 'zero', '--duration', '1', '--out', str(out),
+                      '--listen-before', '0.1', '--linger', '0.2', '--bind', '127.0.0.1', '--cmd-port', str(cmd_p),
+                      '--data-port', str(data_p), '--evt-port', str(evt_p), '--temp-path', str(tmp_path / 'temp')])
+    finally:
+        stop.set()
+        th.join(1)
+    assert rc == 0
+    assert got[:2] == ['START zero 1 1 n=1', 'START zero 1 1 n=2']
+    cmds = cs.read_commands(str(out / 'capture.yaml'))
+    assert [c for _, c in cmds] == ['START zero 1 1 n=1', 'START zero 1 1 n=2']
+    ev = chk.parse_events(chk.read_raw(str(out / 'esp32_events.txt')))
+    anc = cs.anchor(ev, cmds)
+    assert anc['cmd'] == 'START zero 1 1 n=2' and anc['t_sent'] == cmds[1][0]
+
+
+def test_clock_sync_bracket_off_centre_still_pairs_r2_1():
+    """T3C-R2-1 (Codex round 2): send 2 ms before the #ack, receive 20 ms after: the bracket is 22 ms wide and its
+    centre is 9 ms off the true offset, outside the ±3 ms pairing window. Round 2 found 0 pairs (code 3) on a whole
+    10 Hz run; the coarse offset now comes from the Pi edges inside the bracket."""
+    p, e, anc = _periodic()
+    t_ack_pi = anc['t_sent'] + 3000.0
+    anc = dict(anc, t_sent=t_ack_pi - 2000.0, t_rx=t_ack_pi + 20_000.0)
+    anc.update(lo=anc['t_sent'] - anc['t_ack_esp'], hi=anc['t_rx'] - anc['t_ack_esp'])
+    anc['width'] = anc['hi'] - anc['lo']
+    s = cs.sync(p, np.full(len(p), 1.0), e, anc, loop_max_us=12.0)
+    assert s['n_pairs'] == len(e) and s['anchor_ok'] and cs.verdict(s) == (0, '')
+    assert all(i == j + 50 for i, j in s['_pairs'])
+
+
+def test_clock_sync_bracket_wide_at_limit_pairs_r2_1():
+    """T3C-R2-1: a 40 ms bracket (the limit) with the true offset at its low edge still pairs right, never one
+    period off."""
+    p, e, anc = _periodic()
+    t_ack_pi = anc['t_sent'] + 3000.0
+    anc = dict(anc, t_sent=t_ack_pi - 100.0, t_rx=t_ack_pi + 39_900.0)
+    anc.update(lo=anc['t_sent'] - anc['t_ack_esp'], hi=anc['t_rx'] - anc['t_ack_esp'])
+    anc['width'] = anc['hi'] - anc['lo']
+    s = cs.sync(p, np.full(len(p), 1.0), e, anc, loop_max_us=12.0)
+    assert cs.verdict(s) == (0, '') and all(i == j + 50 for i, j in s['_pairs'])
 
 
 @pytest.mark.parametrize('rows,ok,counts', [
@@ -447,6 +577,62 @@ def test_t3_overflow_counter_is_data_loss(tmp_path):
 def test_t3_lost_marked_frame_is_data_loss_not_input_error_t3c10(tmp_path):
     d = _make_run(tmp_path, drop_marker_frame=20)
     assert _score(d) == 1
+
+
+def test_t3_lost_prefix_marker_at_row0_is_data_loss_t3c10(tmp_path):
+    """T3C-10 (Codex round 2): the frame log lost its first rows (manifest intact), so the first marked frame is
+    row 0 and marked_frames() cannot read ω old. The frame loss is known from manifest_check → code 1, not 2."""
+    d = _make_run(tmp_path)
+    z = np.load(d / 'frames.npz')
+    k0 = int(np.nonzero(z['marker'])[0][0])
+    arrs = {k: z[k][k0:] for k in z.files if k != 'manifest'}
+    man = z['manifest']
+    z.close()
+    np.savez(d / 'frames.npz', manifest=man, **arrs)
+    assert _score(d) == 1
+
+
+def test_t3_no_anchor_is_missing_evidence_not_lost_edges_r2_2(tmp_path, capsys):
+    """T3C-R2-2 (Codex round 2): a clean run whose capture.yaml is missing cannot be anchored. Round 2 made 100
+    no_data steps and code 1 ('100 bậc không có cạnh M'); now code 3 thieu_bang_chung, no step counted no_data."""
+    d = _make_run(tmp_path)
+    os.remove(d / 'capture.yaml')
+    assert _score(d) == 3
+    assert 'ly_do=thieu_bang_chung' in capsys.readouterr().out
+    s = _summary(d)['summary']
+    assert s['no_data'] == 0 and s['unsynced'] == 100
+
+
+def test_t3_wide_bracket_is_missing_evidence_r2_2(tmp_path):
+    """T3C-R2-2: the #ack received 60 ms after the send (bracket > 40 ms) → not anchored → code 3, not 1."""
+    d = _make_run(tmp_path)
+    p = d / 'esp32_events.txt'
+    lines = p.read_text(encoding='utf-8').splitlines()
+    i = next(k for k, l in enumerate(lines) if '\t#ack,' in l)
+    t, rest = lines[i].split('\t', 1)
+    lines[i] = f'{int(t) + 60_000}\t{rest}'
+    p.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    assert _score(d) == 3
+
+
+def test_t3_no_anchor_with_real_loss_is_still_loss_r2_2(tmp_path):
+    """T3C-R2-2: a true Z19 loss (gseq hole) is judged before the missing anchor → code 1."""
+    d = _make_run(tmp_path, gseq_hole=50)
+    os.remove(d / 'capture.yaml')
+    assert _score(d) == 1
+
+
+def test_t3_blind_zone_note_r2_3(tmp_path):
+    """T3C-R2-3 (Codex round 2): the (ii) blind zone note names the ISR latency of D plus the lock wait, record and
+    pin opening (not measured), with the largest O→L latency of BOTH the heavy run and the t3 run (here the t3
+    run's 8 µs is larger than the heavy run's 6 µs), never '≤ loop_cal.max_us' alone."""
+    d = _make_run(tmp_path)
+    _make_cal(tmp_path, lat=(5.0, 6.0))
+    assert _score(d) == 0
+    s = _summary(d)
+    assert s['loop_cal']['max_us'] == 6 and s['loop_run']['max_us'] == 8
+    note = next(n for n in s['notes'] if 'vùng mù' in n)
+    assert '8 µs' in note and 'chờ khóa' in note and 'chưa đo' in note and '≤' not in note
 
 
 def test_t3_steps_closer_than_50ms_not_valid_t3c13(tmp_path, capsys):
