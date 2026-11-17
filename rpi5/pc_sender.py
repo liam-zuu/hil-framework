@@ -291,7 +291,7 @@ def wait_for_swa(inp=input, out=print, wall=time.time) -> bool:
     """--wait-swa: ask the operator to turn SWA on and press Enter. True on Enter; False on Ctrl-C or end of
     input (then nothing is sent: the schedule has not started)."""
     out(f"#wait_swa,cho,t_epoch={wall():.3f}")
-    out(">>> Bật SWA (motor) rồi nhấn Enter để gửi lịch. Ctrl-C: thoát, không gửi lịch.")
+    out(">>> Bat SWA (motor) roi nhan Enter de gui lich. Ctrl-C: thoat, khong gui lich.")   # ASCII: safe on a cp1252 pipe
     try:
         inp('')
     except (KeyboardInterrupt, EOFError):

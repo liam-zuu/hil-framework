@@ -113,10 +113,10 @@ def test_wait_swa_order(tmp_path):
                        ('query', ps.SWA_QUERY_NAME), ('swa_check',), ('test', 'O1-F05', False),
                        ('query', 'gain_query_after.txt')]
     txt = '\n'.join(r.lines)
-    assert '#wait_swa,cho,' in txt and 'Bật SWA' in txt and '#wait_swa,enter,' in txt
+    assert '#wait_swa,cho,' in txt and 'Bat SWA' in txt and '#wait_swa,enter,' in txt
     assert '#gain_query,when=swa,exit=0' in txt
     # the prompt is printed after the ack check and before the wait
-    assert r.lines.index('#gain_query,when=before,exit=0') < [i for i, s in enumerate(r.lines) if 'Bật SWA' in s][0]
+    assert r.lines.index('#gain_query,when=before,exit=0') < [i for i, s in enumerate(r.lines) if 'Bat SWA' in s][0]
 
 
 @pytest.mark.parametrize('how', ['ctrl_c', 'eof'])
@@ -221,7 +221,7 @@ def test_cli_wait_swa_needs_o1():
 
 def test_cli_wait_swa_refuses_a_final_task_before_the_prompt():
     p = _cli('--o1', 'O1-K1', '--wait-swa')
-    assert p.returncode == 2 and 'Bật SWA' not in p.stdout and '#wait_swa' not in p.stdout
+    assert p.returncode == 2 and 'Bat SWA' not in p.stdout and '#wait_swa' not in p.stdout
     assert 'only with --allow-final-set' in p.stderr                  # refused for the schedule, not the flag
 
 
