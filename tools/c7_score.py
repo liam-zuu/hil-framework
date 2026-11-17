@@ -43,6 +43,9 @@ tick_max_s):
   tick   the largest interval between consecutive RECEIVED log lines meeting [t0, t0 + end of the union domain]
          (CS2-2: the domain scored, not t_deadline; a lost line may hide a long tick; the pairs across the window
          ends count; CS1-5); the log not reaching both ends: no finite U_t, the run is lost to the measurement system.
+         O1 v11.33 SC-12 (OG2-1, OG3-4): hang_so nhanh_tick 'giu' keeps this part (default before C8), 'bo' drops it
+         and needs the clock match on sample marks at their true times (C8b; a match without it is refused); the
+         branch is required in a locked file. The coverage check above holds on both branches (OG2-8).
 
 Frames (O1 3.3)
   position-suspect  a valid frame whose centre is more than pred_m from a quadratic over +-pred_half valid
@@ -84,14 +87,18 @@ t < t_deadline, and over an unbroken trailing t_d of frames of the way (a gap ab
 t_done] (no t_done: t_deadline). G1: both ways done dat, neither khong_dat, else chua_ket_luan.
 G2-G5 per frame (O1 3.4, 3.5): q_k with lo_k, hi_k
   G2 e_perp +- U_p,k (figure 8: lo also - h/2, the grid distance is above the true one by up to h/2, CS1-2);
-  G3 e_trk +- (U_p,k + v_cmd_max U_t);  G5 |e_theta_cmd| +- (U_psi,k + wz_cmd_max U_t) (deg);
+  G3 e_trk +- (U_p,k + U_t V_k);  G5 |e_theta_cmd| +- (U_psi,k + U_t W_k) (deg) (O1 v11.33 2, OG-12): V_k, W_k the
+     sup of |dp_cmd/dt|, |dpsi_cmd/dt| over [t_k - U_t, t_k + U_t] on the true schedule of the level (CmdRates); the
+     command holds its end values outside [0, T_cmd] (rate 0 there, OG2-2); psi_cmd on its continuous branch
+     (OG2-9; figure 8: the tangent, K1, K2: the start heading, W_k = 0);
   G4 e_bao +- (U_p,k + r_c (U_psi,k + kappa_eff U_p,k)) (figure 8: + r_c kappa_max h/2, lo - h/2) when the four
      conditions hold (one projection solution within the smallest distance + 2 U_p,k, not at an end of the window
      cut at 0 and S (CS1-3), not a re-searched frame, e_perp + U_p,k <= D; K1, K2 also: one lane heading over
      J_k, no corner, CS1-1), else the bounds over J_k (O1 3.4: figure 8 on the lane grid of step h plus the two
      window ends, with h/2 and kappa_max h/2; K1, K2 exact per straight side, a corner point with the outgoing
      heading). U_psi,k infinite: hi_k infinite (n_undef), lo_k from J_k.
-  K1, K2: G5 uses |psi - start heading| (as o1_gate_eval). v_cmd_max, wz_cmd_max: o1_gate.fig8_cmd_max / k_cmd_max.
+  K1, K2: G5 uses |psi - start heading| (as o1_gate_eval). v_cmd_max, wz_cmd_max (o1_gate.fig8_cmd_max /
+  k_cmd_max, the peaks of the schedule) stay in the gate block as report and as assumption (i) of O1 3.5.
   States (rq3_log.cond_state2): khong_dat when lo of the common domain > threshold; else the three states on the
   union.
 Run outcome (O1 3.5):
@@ -139,6 +146,7 @@ import o1_gate_eval                                                      # noqa:
 import o1_lanes                                                          # noqa: E402
 import o1_time_sync                                                      # noqa: E402
 import rq3_log                                                           # noqa: E402
+from o1_feasibility import A as A8                                      # noqa: E402
 from o1_feasibility import D, DELTA, HEAD0, T_D, T_LATE, Path8, Schedule, path_point, wrap  # noqa: E402
 from o1_tasks import FIG8, FINAL_SET                                     # noqa: E402
 
@@ -167,6 +175,8 @@ HS_STATES = ('de_xuat', 'khoa_c8')
 HS_CMD = {'cond2_m': (0.0, 1.0), 'cond3_ms': (0.0, 10000.0), 'cond4_m': (0.0, 1.0)}     # O1 3.5 command path (2)-(4)
 HS_DYN = {'goc_quay_deg': (0.0, 100000.0), 'wz_dps': (0.0, 5000.0), 'alpha_dps2': (0.0, 1e6)}  # O1 3.3 U_IMU range
 GIA_DINH = ('dung', 'khong_dung', 'chua_kiem')       # O1 3.3 position-suspect assumption checked at C8 (CS1-18)
+REPORT_ONLY_OK = frozenset(('g2', 'g3', 'g5'))     # O1 v11.33 3.9 rule 2b: G1, G4 always decide
+NHANH_TICK = ('giu', 'bo')       # O1 v11.33 SC-12 (OG2-1, OG3-4): the tick part of U_t kept / dropped, locked before C8
 
 
 # ---------------------------------------------------------------- constants
@@ -229,6 +239,11 @@ def load_hang_so(path):
         raise ValueError(f'hang_so gia_dinh_nghi_vi_tri: {gd!r}, one of {GIA_DINH[:2] if locked else GIA_DINH} '
                          '(the C8 check of the position-suspect assumption, O1 3.3)')
     out['gia_dinh_nghi_vi_tri'] = gd
+    nt = d.get('nhanh_tick', None if locked else 'giu')
+    if nt not in NHANH_TICK:
+        raise ValueError(f'hang_so nhanh_tick: {nt!r}, one of {NHANH_TICK} (O1 v11.33 SC-12: the tick part of U_t '
+                         'kept or dropped, chosen before the C8 runs are scored; required when khoa_c8)')
+    out['nhanh_tick'] = nt
     md = imu.get('mien_dong')
     if md is None and locked:
         raise ValueError('hang_so imu mien_dong: the locked range of U_IMU per level is required when khoa_c8')
@@ -323,6 +338,38 @@ def tick_max_s(rows, t0_us, t_end_us):
     return best
 
 
+# ---------------------------------------------------------------- command rates (O1 v11.33 2: bounds per frame)
+class CmdRates:
+    """V(t) = |dp_cmd/dt|, W(t) = |dpsi_cmd/dt| of a lane on its true schedule, and their sup over an interval.
+    rate(t) -> (V, W) is exact at t (figure 8: |p'(tau)| tau_dot, |dpsi/dtau| tau_dot; K: the task speed, W = 0); it is
+    continuous on [0, T_cmd] and 0 outside (the command holds its end values, OG2-2). sup(a, b): the largest value on
+    a grid of step DT plus the two ends of [a, b] cut to [0, T_cmd], plus L DT / 2, L = 2 x the largest slope seen
+    between grid points (a Lipschitz bound with margin: between two grid points the function cannot rise above the
+    larger end by more than L DT / 2)."""
+    DT = 1e-3
+
+    def __init__(self, lane):
+        self.lane, self.T = lane, float(lane.Tcmd)
+        n = max(int(math.ceil(self.T / self.DT)), 1)
+        self.t = np.linspace(0.0, self.T, n + 1)
+        r = np.array([lane.rate(float(x)) for x in self.t])
+        self.v, self.w = r[:, 0], r[:, 1]
+        # L DT / 2 with L = 2 max|diff| / dt is max|diff| itself
+        self.pad = [float(np.max(np.abs(np.diff(c)))) if c.size > 1 else 0.0 for c in (self.v, self.w)]
+
+    def sup(self, a, b):
+        a, b = max(a, 0.0), min(b, self.T)
+        if not (math.isfinite(a) and math.isfinite(b)) or b < a:
+            return 0.0, 0.0                                   # the whole interval outside the command
+        i0, i1 = int(np.searchsorted(self.t, a, 'left')), int(np.searchsorted(self.t, b, 'right'))
+        ea, eb = self.lane.rate(a), self.lane.rate(b)
+        out = []
+        for c, (ra, rb), p in zip((self.v, self.w), ((ea[0], eb[0]), (ea[1], eb[1])), self.pad):
+            m = max(ra, rb, float(np.max(c[i0:i1])) if i1 > i0 else 0.0)
+            out.append(m + p if m > 0.0 or p > 0.0 else 0.0)
+        return out[0], out[1]
+
+
 # ---------------------------------------------------------------- lanes
 class Fig8Task:
     def __init__(self, task):
@@ -356,6 +403,14 @@ class Fig8Task:
         tau, _ = self.sch.tau(t)
         px, py, hc = path_point(tau)
         return float(self.path.s_of_tau(tau)), px, py, hc
+
+    def rate(self, t):
+        """(|dp_cmd/dt|, |dpsi_cmd/dt|) at t: p = (A sin tau, A/2 sin 2 tau), psi on the tangent, both times tau_dot
+        (0 before 0 and after T_cmd: the schedule holds tau there)."""
+        tau, td = self.sch.tau(t)
+        dx, dy = A8 * math.cos(tau), A8 * math.cos(2.0 * tau)
+        ddx, ddy = -A8 * math.sin(tau), -2.0 * A8 * math.sin(2.0 * tau)
+        return math.hypot(dx, dy) * td, abs(dx * ddy - dy * ddx) / (dx * dx + dy * dy) * td
 
     def theta_err(self, psi, hc):
         return wrap(psi - hc)
@@ -394,6 +449,14 @@ class KTask:
         s_c = self.sch.s_cmd(t)
         px, py, hc = self.path.point_at(s_c)
         return s_c, px, py, hc
+
+    def rate(self, t):
+        """(|dp_cmd/dt|, 0): the speed of the task command (rpi5/o1_tasks, body frame, no rotation); the G5 reference is
+        the start heading, constant (O1 3.7), so W = 0. 0 outside [0, T_cmd]."""
+        if not 0.0 <= t <= self.Tcmd:
+            return 0.0, 0.0
+        vx, vy = self.sch.f(t)[:2]
+        return math.hypot(vx, vy), 0.0
 
     def theta_err(self, psi, hc):
         return wrap(psi)                                   # K1, K2: against the start heading (O1 3.4)
@@ -822,6 +885,13 @@ def yaw_bounds(t_log, psi_cam, wz, speed, t0, hs, level, log_path, t_end):
     return upk, rep
 
 
+def certain_violations(lo, mask, report_only=frozenset()):
+    """Conditions G2-G5 with a certain violation (finite lo_k above the threshold) on the frames of mask (R2V-4);
+    O1 v11.33 3.5 (OG2-3): a condition only reported at the level of the run (3.9 rule 2b) is not looked at."""
+    return [c for c in o1_gate.MEASURED if c not in report_only
+            and bool(np.any(np.isfinite(lo[c][mask]) & (lo[c][mask] > o1_gate.THRESHOLDS[c])))]
+
+
 # ---------------------------------------------------------------- gate
 def build_gate(per, dom_common, dom_union, lane, u_t, hs, g1, note):
     """gate_v3 block in the B81-3 floor format (rq3_log.validate_gate 'HW')."""
@@ -935,7 +1005,7 @@ def evaluate(t, x, y, psi, speed, wz, lane, hs, upsi_k, u_t):
     q = {c: np.full(n, np.nan) for c in o1_gate.MEASURED}
     lo = {c: np.full(n, np.nan) for c in o1_gate.MEASURED}
     hi = {c: np.full(n, np.nan) for c in o1_gate.MEASURED}
-    vmax, wzmax = lane.cmd_max
+    cr = CmdRates(lane)                 # O1 v11.33 2: V_k, W_k over [t_k - U_t, t_k + U_t] (command time)
     # U_p,k: a suspect frame without a prediction from the final non-suspect set has no bound (CS2-10)
     upk_p = hs['U_p_m'] + np.where(sus, np.nan_to_num(pred, nan=np.inf), 0.0)
     hg = lane.h                     # figure 8: grid step; the grid distance is >= the true one by up to h / 2 (CS1-2)
@@ -951,9 +1021,10 @@ def evaluate(t, x, y, psi, speed, wz, lane, hs, upsi_k, u_t):
         up, us = float(upk_p[j]), float(usw[j])
         q['g2'][j], q['g3'][j], q['g4'][j], q['g5'][j] = r['e_perp'], e_trk, e_bao, abs(math.degrees(eth))
         lo['g2'][j], hi['g2'][j] = r['e_perp'] - up - hg / 2.0, r['e_perp'] + up
-        u3 = up + vmax * u_t
+        vk, wk = cr.sup(float(tw[j]) - u_t, float(tw[j]) + u_t)
+        u3 = up + vk * u_t
         lo['g3'][j], hi['g3'][j] = e_trk - u3, e_trk + u3
-        u5 = math.degrees(us + wzmax * u_t) if math.isfinite(us) else math.inf
+        u5 = math.degrees(us + wk * u_t) if math.isfinite(us) else math.inf
         lo['g5'][j], hi['g5'][j] = q['g5'][j] - u5, q['g5'][j] + u5
         formula = bool(math.isfinite(us) and math.isfinite(up) and not r['at_end'] and not r['reopen']
                        and r['e_perp'] + up <= D
@@ -1098,9 +1169,16 @@ def old_shift_frames(frames):
 
 
 def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start=None, allow_final_set=False,
-          sender=None, events=None, track_info=None, offset_anchor_s=None, offset_err_s=None, frames_sha256=None):
+          sender=None, events=None, track_info=None, offset_anchor_s=None, offset_err_s=None, frames_sha256=None,
+          report_only=frozenset()):
     if task not in FIG8 and task not in FINAL_SET:
         raise ValueError(f'task {task!r}: one of {tuple(FIG8) + FINAL_SET}')
+    # O1 v11.33 3.9 rule 2b: conditions only reported at the level of the run (from the C8 gate file; G1, G4 always
+    # decide). Used here only by the exception "violation before a measurement-system fault" (OG2-3); the deciding
+    # set of the gate block follows the C8 gate file format (not yet fixed: CODE_GATE)
+    report_only = frozenset(report_only)
+    if not report_only <= REPORT_ONLY_OK:
+        raise ValueError(f'report_only {sorted(report_only)}: only {sorted(REPORT_ONLY_OK)} can be report-only (O1 3.9 2b)')
     if task in FINAL_SET and not allow_final_set:
         raise ValueError(f'{task} is the final test set (O1 3.7): only with --allow-final-set')
     if task in FINAL_SET and k_start is None:
@@ -1145,12 +1223,24 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
     off_err = float(offset_err_s) if sync is None else 0.0
     u_t_parts = dict(ghep_s=hs['u_t_ghep_s'], offset_err_s=off_err, drift_s=drift, drift_src=drift_src)
 
+    # O1 v11.33 SC-12 (OG2-1, OG3-4): the tick part leaves U_t only on the branch 'bo', which needs the clock match
+    # on sample marks at their true times (C8b); without it that branch cannot score the run
+    drop_tick = hs['nhanh_tick'] == 'bo'
+    if drop_tick and not (sync is not None and getattr(sync, 'moc_mau', False)):
+        raise ValueError('hang_so nhanh_tick bo: the tick part leaves U_t only with the clock match on sample marks at '
+                         'their true times (C8b, O1 v11.33 SC-12); this match is not ' +
+                         ('used (--offset-s)' if sync is None else 'available in o1_time_sync'))
+    u_t_parts['nhanh_tick'] = hs['nhanh_tick']
+
     def u_t_of(end_u):
         # tick evidence over the domain scored, [t0, t0 + end of the union domain] (CS2-2: a log ending after the
-        # run closed but before t_deadline does not spoil it); the drift still runs to t_deadline (SC-12)
+        # run closed but before t_deadline does not spoil it); the drift still runs to t_deadline (SC-12). The
+        # check that the log covers both ends (finite tick) holds on both branches (OG2-8).
         tick = tick_max_s(rows, t0_us, t0_us + end_u * 1e6)
         u_t_parts.update(tick_s=tick, tick_to_s=end_u)
-        return hs['u_t_ghep_s'] + off_err + drift + tick
+        if not math.isfinite(tick):
+            return math.inf
+        return hs['u_t_ghep_s'] + off_err + drift + (0.0 if drop_tick else tick)
     vi = [k for k, r in enumerate(frames) if r['valid']]
     t_log = t_cam[vi] + offset_s
     tv = t_log - t0_us / 1e6
@@ -1195,8 +1285,7 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
     if t1 is not None:
         gap_case = out['t1_kind'] == 'khoang_trong'
         before = sc & ((gi['t'] <= t1 + 1e-12) if gap_case else (gi['t'] < t1 - 1e-12))
-        viol_before = any(bool(np.any(np.isfinite(gi['lo'][c][before])
-                                      & (gi['lo'][c][before] > o1_gate.THRESHOLDS[c]))) for c in o1_gate.MEASURED)
+        viol_before = bool(certain_violations(gi['lo'], before, report_only))
     reasons, fail_cause = [], ''
     if bumped:
         reasons.append(f'may quay bi va (dich moc {shift_max:.1f} px > {hs["bump_px"]:g} px)')

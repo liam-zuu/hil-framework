@@ -250,9 +250,11 @@ def test_bounds_use_U_p_and_U_t(tmp_path):
     up, h = 0.005, lane_of('O1-F05').h
     assert abs(g['g2']['hi'] - g['g2']['q'] - up) < 1e-9 and abs(g['g2']['q'] - g['g2']['lo'] - up - h / 2) < 1e-9
     vmax, wzmax = out['gate_v3']['v_cmd_max'], out['gate_v3']['wz_cmd_max']
-    r = rows[100]
-    assert abs((r['hi_g3'] - r['e_trk']) - (up + vmax * out['U_t_s'])) < 1e-9
-    assert abs((r['hi_g5'] - abs(r['e_theta_cmd_deg'])) - math.degrees(math.radians(2.0) + wzmax * out['U_t_s'])) < 1e-9
+    r, ut = rows[100], out['U_t_s']
+    vk, wk = cs.CmdRates(lane_of('O1-F05')).sup(r['t'] - ut, r['t'] + ut)      # O1 v11.33 2: per frame
+    assert vk < vmax and wk < wzmax                     # rows[100] (t about 1.7 s) is on the ramp, below the peaks
+    assert abs((r['hi_g3'] - r['e_trk']) - (up + vk * ut)) < 1e-9
+    assert abs((r['hi_g5'] - abs(r['e_theta_cmd_deg'])) - math.degrees(math.radians(2.0) + wk * ut)) < 1e-9
     assert out['U_t_parts']['drift_src'].startswith('troi_ppm')                 # --offset-s given
     assert abs(out['U_t_s'] - (0.005 + 0.0002 * out['t_deadline'] + 0.01)) < 1e-6
 
@@ -946,12 +948,12 @@ def test_cs1_19_imu_range_exceeded_is_reported(tmp_path):
 
 def test_cs1_khoa_c8_needs_every_locked_block(tmp_path):
     full = dict(trang_thai='khoa_c8', duong_lenh=dict(cond2_m=0.02, cond3_ms=50.0, cond4_m=0.03),
-                cong_khung=dict(cm.DEFAULT_GATES), gia_dinh_nghi_vi_tri='dung',
+                cong_khung=dict(cm.DEFAULT_GATES), gia_dinh_nghi_vi_tri='dung', nhanh_tick='giu',
                 imu=dict(mien_dong={m: dict(goc_quay_deg=720.0, wz_dps=200.0, alpha_dps2=2000.0)
                                     for m in ('O1-F02', 'O1-F05', 'O1-F08', 'O1-K1', 'O1-K2')}))
     hs = hs_file(tmp_path, **json.loads(json.dumps(full)))
     assert hs['trang_thai'] == 'khoa_c8' and hs['gia_dinh_nghi_vi_tri'] == 'dung'
-    for drop in ('duong_lenh', 'cong_khung'):
+    for drop in ('duong_lenh', 'cong_khung', 'nhanh_tick'):          # nhanh_tick: O1 v11.33 OG3-4
         bad = json.loads(json.dumps(full))
         del bad[drop]
         with pytest.raises(ValueError, match=drop):
@@ -1548,3 +1550,108 @@ def test_cs5_1_reset_on_a_receive_time_follows_the_yaw_rule(t_reset, excess):
     S['resets'] = [t_reset]
     r = cs.dyn_exceed(S, 0.0, 0.05, dict(BIGL, alpha_dps2=500.0))
     assert (r[1] == 'alpha_dps2') == excess
+
+
+# ---------------------------------------------------------------- O1 v11.33 (17/11): G3, G5 bounds per frame (V_k, W_k)
+def _brute_sup(lane, a, b, n=20001):
+    tt = np.linspace(a, b, n)
+    r = np.array([lane.rate(float(x)) for x in tt])
+    return float(r[:, 0].max()), float(r[:, 1].max())
+
+
+@pytest.mark.parametrize('task', ['O1-F02', 'O1-F05', 'O1-F08'])
+def test_v11_33_cmd_rates_bound_the_sup_from_above_and_tightly(task):
+    """V_k, W_k: never below the sup of a fine sampling (20001 points) of the exact rates, at most 1 % of the peak above
+    it; the peaks are those of o1_gate.fig8_cmd_max (the schedule has tau_dot <= w0)."""
+    lane = lane_of(task)
+    cr = cs.CmdRates(lane)
+    vmax, wzmax = lane.cmd_max
+    rng = np.random.default_rng(3)
+    for a in list(rng.uniform(-0.5, lane.Tcmd + 0.5, 25)) + [0.0, lane.Tcmd - 0.03]:
+        b = a + 0.06
+        v, w = cr.sup(a, b)
+        bv, bw = _brute_sup(lane, max(a, 0.0), min(b, lane.Tcmd)) if b > 0 and a < lane.Tcmd else (0.0, 0.0)
+        assert bv - 1e-12 <= v <= bv + 0.01 * vmax and bw - 1e-12 <= w <= bw + 0.01 * wzmax, (a, v, bv, w, bw)
+    v, w = cr.sup(0.0, lane.Tcmd)
+    assert v == pytest.approx(vmax, rel=0.01) and w == pytest.approx(wzmax, rel=0.01)
+
+
+def test_v11_33_rates_are_zero_outside_the_command():
+    """OG2-2: the reference holds its end values before t = 0 and after T_cmd: V = W = 0 on an interval wholly outside."""
+    for task in ('O1-F05', 'O1-K1'):
+        lane = lane_of(task, K1S) if task == 'O1-K1' else lane_of(task)
+        cr = cs.CmdRates(lane)
+        assert cr.sup(-0.2, -0.01) == (0.0, 0.0) and cr.sup(lane.Tcmd + 0.01, lane.Tcmd + 0.3) == (0.0, 0.0)
+
+
+def test_v11_33_k_task_has_no_heading_rate():
+    """K1: G5 against the start heading (constant): W_k = 0 everywhere; V_k at most the task speed K_V."""
+    lane = lane_of('O1-K1', K1S)
+    cr = cs.CmdRates(lane)
+    v, w = cr.sup(0.0, lane.Tcmd)
+    assert w == 0.0 and v <= lane.vmax * 1.01
+
+
+# ---------------------------------------------------------------- O1 v11.33 SC-12: tick part kept / dropped (OG2-1, OG3-4)
+def test_v11_33_tick_kept_by_default_before_c8(tmp_path):
+    out, _ = run(tmp_path)
+    p = out['U_t_parts']
+    assert p['nhanh_tick'] == 'giu' and p['tick_s'] > 0
+    assert out['U_t_s'] == pytest.approx(p['ghep_s'] + p['offset_err_s'] + p['drift_s'] + p['tick_s'])
+
+
+def test_v11_33_drop_tick_needs_the_sample_mark_match(tmp_path, monkeypatch):
+    """Branch 'bo' with the clock match of o1_time_sync (no sample marks) or with --offset-s: refused, never a U_t
+    without the tick part on a match that does not carry it."""
+    with pytest.raises(ValueError, match='nhanh_tick'):
+        run(tmp_path, hs_kw=dict(nhanh_tick='bo'))
+    lane = lane_of('O1-F05')
+    sync, _ = _sync_fake(lane, OFFSET, 0.0)
+    monkeypatch.setattr(cs, 'clock_match', lambda frames, rows, task: (sync, None))
+    with pytest.raises(ValueError, match='nhanh_tick'):
+        run(tmp_path, offset_s=None, offset_reason='', hs_kw=dict(nhanh_tick='bo'))
+
+
+def test_v11_33_drop_tick_with_the_sample_mark_match(tmp_path, monkeypatch):
+    """Branch 'bo' with a match on sample marks (C8b; here a stand-in carrying moc_mau): U_t without the tick part,
+    the tick still measured (coverage of both ends, OG2-8)."""
+    import types
+    lane = lane_of('O1-F05')
+    sync, _ = _sync_fake(lane, OFFSET, 0.0)
+    s2 = types.SimpleNamespace(**vars(sync), moc_mau=True)
+    monkeypatch.setattr(cs, 'clock_match', lambda frames, rows, task: (s2, None))
+    out, _ = run(tmp_path, offset_s=None, offset_reason='', hs_kw=dict(nhanh_tick='bo'))
+    p = out['U_t_parts']
+    assert p['nhanh_tick'] == 'bo' and math.isfinite(p['tick_s']) and p['tick_s'] > 0
+    assert out['U_t_s'] == pytest.approx(p['ghep_s'] + p['offset_err_s'] + p['drift_s'])
+
+
+def test_v11_33_tick_branch_value_checked(tmp_path):
+    with pytest.raises(ValueError, match='nhanh_tick'):
+        hs_file(tmp_path, nhanh_tick='x')
+
+
+# ---------------------------------------------------------------- O1 v11.33 3.5 (OG2-3): report-only conditions and R2V-4
+def test_v11_33_report_only_condition_does_not_make_a_violation_before_t1(tmp_path):
+    """A certain violation of G3 only (lo 0.12 > D) before t1: the exception R2V-4 sees it; with G3 report-only at the
+    level of the run it does not; G4 is never report-only."""
+    n = 4
+    lo = {c: np.zeros(n) for c in cs.o1_gate.MEASURED}
+    lo['g3'][1] = 0.12
+    mask = np.ones(n, bool)
+    assert cs.certain_violations(lo, mask) == ['g3']
+    assert cs.certain_violations(lo, mask, frozenset({'g3'})) == []
+    lo['g4'][2] = 0.12
+    assert cs.certain_violations(lo, mask, frozenset({'g2', 'g3', 'g5'})) == ['g4']
+    with pytest.raises(ValueError, match='report_only'):
+        run(tmp_path, report_only=frozenset({'g4'}))
+
+
+def test_v11_33_window_narrower_than_the_grid_uses_its_ends():
+    """A window of 0.4 ms between two grid points (step 1 ms): the bound is at least the rate at its ends."""
+    lane = lane_of('O1-F05')
+    cr = cs.CmdRates(lane)
+    a = 5.0003
+    v, w = cr.sup(a, a + 0.0004)
+    ra, rb = lane.rate(a), lane.rate(a + 0.0004)
+    assert v >= max(ra[0], rb[0]) and w >= max(ra[1], rb[1]) and v > 0.1
