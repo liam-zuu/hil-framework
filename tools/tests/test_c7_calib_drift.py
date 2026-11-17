@@ -358,9 +358,10 @@ def test_session_without_corners_refused(tmp_path, s0):
 KS_K = [1.0, 0.0, -math.pi / 2]
 
 
-def sc(outcome, frames='f0', esp='e' * 64, t0=1000, off=0.25, U=0.005, ks=(0.0, 0.0, 0.785), task='O1-F05'):
+def sc(outcome, frames='f0', esp='e' * 64, t0=1000, off=0.25, hs='h' * 64, ks=(0.0, 0.0, 0.785), task='O1-F05'):
     return dict(outcome=outcome, outcome_reasons=[], conditions={}, e_perp_max=0.01, completed='true', task=task,
-                t0_log_us=t0, offset_s=off, U_m=U, D=0.1, k_start=list(ks),
+                t0_log_us=t0, offset_s=off, offset_src='o1_time_sync', version='c7_score_v2',
+                hang_so=dict(file='hang_so.json', sha256=hs, trang_thai='thu', nguon='test'), k_start=list(ks),
                 thresholds=dict(t_miss=0.25, status='khoa o C8'),
                 frames_sha256=frames, esp32_sha256=esp, frames_valid=600, gap_max=0.02, shift_max_px=0.5)
 
@@ -440,11 +441,11 @@ def test_bad_drift_files_refused(bad, two):
 
 
 @pytest.mark.parametrize('case', ['no_second', 'session0', 'session1', 'video', 'frames0', 'frames1', 'esp32',
-                                  'U', 'k_start', 't0', 'offset', 'offset_nan', 'outcome', 'task', 'tag_offset',
+                                  'hang_so', 'k_start', 't0', 'offset_nan', 'outcome', 'task', 'tag_offset',
                                   'n_frames', 'shape', 'h0_copied_into_h1', 'score_frames', 'track_no_frames_sha',
-                                  'no_D_both', 'no_thresholds_both', 'no_t0_both', 'no_k_start_both',
+                                  'no_hang_so_both', 'no_version_both', 'no_thresholds_both', 'no_t0_both', 'no_k_start_both',
                                   'score_not_dict', 'track_not_dict', 'score_null', 'track_null',
-                                  'D', 'threshold', 'frames_null_both', 'shapes_null_both', 'threshold_null_both',
+                                  'hang_so_file', 'version_old_both', 'hang_so_no_sha_both', 'hang_so_empty_sha_both', 'threshold', 'frames_null_both', 'shapes_null_both', 'threshold_null_both',
                                   'frames_bool', 'shape_zero', 'offset_not_drift_both',
                                   'threshold_one_null_both', 'threshold_text_both', 'threshold_bool_both',
                                   'threshold_negative_both', 'threshold_numeric_text_both', 'status_number_both',
@@ -466,14 +467,12 @@ def test_provenance_and_scoring_set_up_checked(case):
         fb = 'f0'
     elif case == 'esp32':
         b = sc('dat', frames='f1', esp='z' * 64)
-    elif case == 'U':
-        b = sc('dat', frames='f1', U=0.0)
+    elif case == 'hang_so':                                  # another constants file
+        b = sc('dat', frames='f1', hs='g' * 64)
     elif case == 'k_start':
         b = sc('dat', frames='f1', ks=(0.1, 0.0, 0.785))
     elif case == 't0':
         b = sc('dat', frames='f1', t0=2000)
-    elif case == 'offset':
-        b = sc('dat', frames='f1', off=0.26)
     elif case == 'offset_nan':
         b = sc('dat', frames='f1', off=float('nan'))
     elif case == 'outcome':
@@ -493,7 +492,7 @@ def test_provenance_and_scoring_set_up_checked(case):
     elif case == 'track_no_frames_sha':
         tb = _drop(tr('s1', frames='f1'), 'frames_sha256')
     elif case.startswith('no_') and case.endswith('_both'):  # CD2-6: absent on both sides is not "same"
-        k = {'no_D_both': 'D', 'no_thresholds_both': 'thresholds', 'no_t0_both': 't0_log_us',
+        k = {'no_hang_so_both': 'hang_so', 'no_version_both': 'version', 'no_thresholds_both': 'thresholds', 'no_t0_both': 't0_log_us',
              'no_k_start_both': 'k_start'}[case]
         a, b = _drop(a, k), _drop(b, k)
     elif case == 'score_not_dict':
@@ -504,8 +503,16 @@ def test_provenance_and_scoring_set_up_checked(case):
         a = None
     elif case == 'track_null':
         ta = None
-    elif case == 'D':                                        # CD3-6: complete pair, only D differs
-        b = dict(b, D=0.2)
+    elif case == 'hang_so_file':                             # CD3-6: complete pair, only the file name differs
+        b = dict(b, hang_so=dict(b['hang_so'], file='other.json'))
+    elif case == 'version_old_both':                         # a score of the version before (U_m, D): refused
+        a, b = dict(a, version='c7_score_v1'), dict(b, version='c7_score_v1')
+    elif case == 'hang_so_no_sha_both':
+        a = dict(a, hang_so=dict(file='hang_so.json'))
+        b = dict(b, hang_so=dict(file='hang_so.json'))
+    elif case == 'hang_so_empty_sha_both':
+        a = dict(a, hang_so=dict(file='hang_so.json', sha256=''))
+        b = dict(b, hang_so=dict(file='hang_so.json', sha256=''))
     elif case == 'threshold':                                # CD3-6: only one threshold differs
         b = dict(b, thresholds=dict(t_miss=0.30, status='khoa o C8'))
     elif case == 'frames_null_both':                         # CD3-5: null on both sides is not "same"
@@ -665,3 +672,25 @@ def test_cli_json_not_an_object_exit_2(tmp_path, s0, capsys, text):
     """CD2-6: valid JSON that is not an object ends with code 2, not a traceback."""
     assert _gop_below(tmp_path, s0, text) == 2
     assert capsys.readouterr().out.rstrip().endswith('#ket_qua,ma=2')
+
+
+# ---------------------------------------------------------------- (C) 17/11: c7_score_v2 output, each scoring its own clock
+def test_each_scoring_matches_its_own_clock_both_offsets_kept():
+    """Liam 17/11 CODE_CAM local_4a972073 'Moi lan tu ghep gio (Recommended)': H1 matched the clocks on its own frames
+    (C7b) and found 0.2513 s against 0.25 s of H0: accepted (the rule before refused it), both offsets kept."""
+    r = cd.combine(DRIFT_OVER, sc('dat'), tr('s0'), 'f0', sc('dat', frames='f1', off=0.2513), tr('s1', frames='f1'),
+                   'f1')
+    c = r['calib_drift']
+    assert r['outcome'] == 'dat' and c['offset_s_h0'] == 0.25 and c['offset_s_h1'] == 0.2513
+    assert c['offset_src_h0'] == c['offset_src_h1'] == 'o1_time_sync'
+
+
+def test_combined_file_is_the_h0_file_with_outcome_and_calib_drift_only():
+    """The contract of rq3_log so-h (C9D-1): the output of gop is the H0 scorer file with only 'outcome' and the
+    'calib_drift' block changed, in every branch."""
+    a = sc('dat')
+    for drift, two in ((DRIFT_OK, ()), (DRIFT_MISS, ()),
+                       (DRIFT_OVER, (sc('khong_dat', frames='f1'), tr('s1', frames='f1'), 'f1'))):
+        r = cd.combine(drift, dict(a), tr('s0'), 'f0', *two)
+        assert {k: v for k, v in r.items() if k not in ('outcome', 'calib_drift')} == \
+            {k: v for k, v in a.items() if k != 'outcome'}
