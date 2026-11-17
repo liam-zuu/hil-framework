@@ -127,9 +127,62 @@ def test_each_run_sends_a_snapshot_of_its_own_file(tmp_path, monkeypatch):
 
 def test_relative_path_is_recorded_absolute(tmp_path, monkeypatch):
     gfile(tmp_path, 'gain_1.json')
+    (tmp_path / 'sub').mkdir()
     monkeypatch.chdir(tmp_path)
-    a, ev, code, _, sent = bench(monkeypatch, tmp_path, runs=RUNS[:1], gain_per_run=['r=gain_1.json'])
-    assert runs_of(a)[0]['gain_ack']['gain_file'] == str(tmp_path / 'gain_1.json')
+    a, ev, code, _, sent = bench(monkeypatch, tmp_path, runs=RUNS[:1], gain_per_run=['r=sub/../gain_1.json'])
+    assert runs_of(a)[0]['gain_ack']['gain_file'] == os.path.realpath(str(tmp_path / 'gain_1.json'))
+
+
+def test_path_through_a_link_and_dotdot_is_the_file_the_os_opens(tmp_path, monkeypatch):
+    """RG2-1: 'link/../g.json' with link -> real/sub is real/g.json for the OS; a text-only normalisation would pick
+    the g.json next to link."""
+    (tmp_path / 'real' / 'sub').mkdir(parents=True)
+    a_bytes, b_bytes = b'{"tag": "A"}', b'{"tag": "B"}'
+    (tmp_path / 'real' / 'g.json').write_bytes(a_bytes)
+    (tmp_path / 'w').mkdir()
+    (tmp_path / 'w' / 'g.json').write_bytes(b_bytes)
+    try:
+        os.symlink(str(tmp_path / 'real' / 'sub'), str(tmp_path / 'w' / 'link'), target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip('no symlink on this machine')
+    monkeypatch.chdir(tmp_path / 'w')
+    a, ev, code, _, sent = bench(monkeypatch, tmp_path, runs=RUNS[:1], gain_per_run=['r=link/../g.json'])
+    assert sent['r'][1] == a_bytes
+
+
+def test_realpath_is_used_not_text_normalisation(tmp_path, monkeypatch):
+    """RG2-1 without a real link (this machine may not allow one): the recorded path is os.path.realpath of the
+    argument, and abspath is not used for it."""
+    g = gfile(tmp_path, 'gain_1.json')
+    seen = []
+    real = os.path.realpath
+    monkeypatch.setattr(B.os.path, 'realpath', lambda p: seen.append(p) or real(p))
+    monkeypatch.setattr(B.os.path, 'abspath', lambda p: (_ for _ in ()).throw(AssertionError('abspath used')))
+    assert B.plan_run_gains([f'r={g}'], [('r', '', None)]) == {'r': real(g)} and g in seen
+
+
+def test_the_source_is_read_once(tmp_path, monkeypatch):
+    """RG-3: a file that changes right after the first read: what is hashed, written and sent is the first read."""
+    g = gfile(tmp_path, 'gain_1.json', b'{"v": 1}')
+    first, n = b'{"v": 1}', [0]
+    real_open = open
+
+    def watch_open(path, mode='r', *x, **k):
+        fh = real_open(path, mode, *x, **k)
+        if os.path.realpath(str(path)) == os.path.realpath(g) and 'r' in mode:
+            n[0] += 1
+            data = fh.read()
+            fh.close()
+            with real_open(g, 'wb') as w:                      # the file changes just after this read
+                w.write(b'{"v": 2}')
+            import io
+            return io.BytesIO(data) if 'b' in mode else io.StringIO(data.decode())
+        return fh
+    monkeypatch.setattr(B, 'open', watch_open, raising=False)
+    a, ev, code, _, sent = bench(monkeypatch, tmp_path, runs=RUNS[:1], gain_per_run=[f'r={g}'])
+    snap = os.path.join(a.out, 'pi', 'r_gain_src.json')
+    assert n[0] == 1 and sent['r'] == (snap, first) and open(snap, 'rb').read() == first
+    assert runs_of(a)[0]['gain_ack']['gain_sha256'] == sha(first)
 
 
 def test_file_changed_after_the_planning_the_bytes_at_the_set_are_sent_and_hashed(tmp_path, monkeypatch):
@@ -224,6 +277,83 @@ def test_main_gain_per_run_needs_gain_query(monkeypatch, capsys, tmp_path):
         B.main(['--out', str(tmp_path / 'x'), '--run', 'a=b', '--gain-per-run', f'a={g}'])
     assert '--gain-per-run đi cùng --gain-query' in capsys.readouterr().err
     assert not os.path.exists(tmp_path / 'x')
+
+
+# ── a run that goes all the way (frame log, clean analysis, run log with the boot) ───────────────────────────────
+
+def _full(monkeypatch, tmp_path, after_boot='4753dc47', **kw):
+    """bench() where each run leaves its frame log and its run log (boot 4753dc47); analyze_run says clean; the
+    question after answers after_boot. Returns (args, exit code, results)."""
+    from test_bench_gain_query import write_run_log
+    holder = {}
+
+    def reply(c):
+        if 'run_hil.py' in c and 'finite-run' in c:
+            name = re.search(r'/([A-Za-z0-9_\-]+)_frames\.npz', c).group(1)
+            open(os.path.join(holder['a'].out, 'frames', f'{name}_frames.npz'), 'w').close()
+            write_run_log(holder['a'].out, name)
+            return (0, 'ok')
+        return (0, '## HEAD\nabc') if 'git' in c else (1, '')
+    a, calls, timers = _bench_env(monkeypatch, tmp_path, reply, run=['r=--test A-L1', 's=--test A-L1'],
+                                  gain_query=True, esp32_ip='1.2.3.4', campaign_env=False, **kw)
+    holder['a'] = a
+
+    def fake_set(ip, gain_file, path, run=None):
+        import gain_line_check as glc
+        with open(path, 'x', encoding='utf-8') as f:
+            f.write(ACK)
+        return glc.read_ack(path)
+
+    tick = [10.0]
+
+    def fake_query(ip, path, run=None):                 # like gain_query: the file, read back by read_query
+        import gain_line_check as glc
+        after = path.endswith('after.txt')
+        tick[0] += 10.0
+        with open(path, 'x', encoding='utf-8') as f:
+            f.write(glc.query_pc_line(tick[0], tick[0] + 0.5)
+                    + (ANSWER.replace('4753dc47', after_boot) if after else ANSWER))
+        return glc.read_query(path)
+    monkeypatch.setattr(B, 'gain_set', fake_set)
+    monkeypatch.setattr(B, 'gain_query', fake_query)
+    monkeypatch.setattr(B, 'analyze_run', lambda o, n, *x, **k: dict(name=n, clean=True, why=[]))
+    monkeypatch.setattr(B, 'summary_line', lambda r: r['name'])         # as test_bench_gain_query does
+    code, res = B.bench(a)
+    return a, code, res
+
+
+def test_full_runs_exit_0(tmp_path, monkeypatch):
+    g0, g1 = gfile(tmp_path, 'gain_0.json'), gfile(tmp_path, 'gain_1.json')
+    a, code, res = _full(monkeypatch, tmp_path, gain_file=g0, gain_per_run=[f'r={g1}'])
+    assert code == 0 and [r['name'] for r in res] == ['r', 's'] and all(r['clean'] for r in res), res
+    by = {r['name']: r for r in runs_of(a)}
+    assert by['r']['gain_ack']['gain_snapshot'] == 'r_gain_src.json' and 'gain_snapshot' not in by['s']['gain_ack']
+
+
+def test_full_runs_boot_after_differs_not_clean(tmp_path, monkeypatch):
+    """The checks after the run still apply to a --gain-per-run run (ESP32 restart during the run)."""
+    g1 = gfile(tmp_path, 'gain_1.json')
+    a, code, res = _full(monkeypatch, tmp_path, after_boot='0badf00d', gain_per_run=[f'r={g1}', f's={g1}'])
+    assert code == 1 and not any(r['clean'] for r in res)
+    assert all(any('boot' in w for w in r['why']) for r in res), res
+
+
+def test_a_snapshot_left_in_the_folder_refuses_the_session(tmp_path, monkeypatch, capsys):
+    g1 = gfile(tmp_path, 'gain_1.json')
+    os.makedirs(tmp_path / 's' / 'pi')
+    (tmp_path / 's' / 'pi' / 'r_gain_src.json').write_bytes(b'old')
+    a, ev, code, calls, _ = bench(monkeypatch, tmp_path, gain_per_run=[f'r={g1}'])
+    assert code == 2 and calls == [] and ev == [] and (tmp_path / 's' / 'pi' / 'r_gain_src.json').read_bytes() == b'old'
+
+
+def test_analyze_only_leaves_the_snapshot_as_it_is(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    g1 = gfile(tmp_path, 'gain_1.json')
+    a, code, res = _full(monkeypatch, tmp_path, gain_per_run=[f'r={g1}'])
+    snap = os.path.join(a.out, 'pi', 'r_gain_src.json')
+    before = (open(snap, 'rb').read(), os.path.getmtime(snap))
+    B.analyze_only(SimpleNamespace(out=a.out))
+    assert (open(snap, 'rb').read(), os.path.getmtime(snap)) == before
 
 
 @pytest.mark.parametrize('abbrev', ['--run-', '--run-t'])

@@ -816,7 +816,7 @@ def plan_run_gains(specs, plan, gain_query=True):
             raise ValueError(f'lượt {name!r} có hai --gain-per-run')
         if not os.path.isfile(f):
             raise ValueError(f'--gain-per-run {spec!r}: không có file {f}')
-        out[name] = os.path.abspath(f)
+        out[name] = os.path.realpath(f)           # RG2-1: resolved as the OS opens it (links, ..), not by text
     if out and not gain_query:
         raise ValueError('--gain-per-run đi cùng --gain-query (boot của #gain_ack so với hai lần hỏi, B81-14)')
     return out
