@@ -11,15 +11,21 @@ bytes) is "the gate file SHA" carried by S05_summary.csv, meta.yaml and every ru
   levels        the gate levels (figure-8 tasks, O1 3.9 rules 2, 5), each once
   u_t_branch    'bo_tick' / 'giu_tick' (O1 SC-12, OG3-4), recorded only
   dieu_2b       thresholds {g2, g3, g5} (= fwsim/o1_gate.THRESHOLDS), u_p_m, u_psi_deg (locked at C8),
-                per_level {level: v_cmd_max, wz_cmd_max (o1_gate.fig8_cmd_max of the level's schedule),
+                per_level {level: v_cmd_max, wz_cmd_max (schedule_peaks: the peaks of the level's schedule, the
+                           refined maxima of o1_gate.fig8_cmd_max without its upper-bound margin, GC1-3),
                            runs [{run_id, controller, u_t_s}] (C8 figure-8 runs not lost to the measurement, U_t
                            finite; at least one PID and one LADRC run), u_t_c8_s (= max u_t_s),
                            uhat {g2, g3, g5}, report_only [subset of g2, g3, g5 in that order]}
   camera        other C8 numbers (CODE_C8B, CODE_CAM): not read here, covered by the SHA
 
 Every number is recomputed: uhat = uhat_of(...) (the time maximum of the per-frame bound is the bound at the peak
-of the schedule, so the peak formula), report_only = report_only_of(uhat) (strict '>' against half the threshold).
-Any difference refuses the whole file (GateFileError). The writer (C8b script) calls check() right after writing.
+of the schedule, so the peak formula) from the RECOMPUTED peaks, never the stored ones; report_only =
+report_only_of(that canonical uhat) (strict '>' against half the threshold; within REL_TOL of half the condition
+still decides, the side of '=' in O1 rule 2b, GC1-1, GC1-3). Any difference refuses the whole file (GateFileError):
+stored numbers further than REL_TOL from the recomputed ones, non-finite results (GC1-2), a duplicate JSON key at any
+level (GC1-4), a number that does not convert (GC1-5). The writer (C8b script) builds each level with level_block
+and calls check() (write_gate does) before the file leaves C8.
+Codex Sol round 1 (17/11, account 1, session 01a1e87f): GC1-1 ... GC1-6 fixed here.
 
 required(level, platform, stage, campaign): the conditions that decide a run (design section 4):
   SIM                                   all five
@@ -64,15 +70,31 @@ class GateFileError(ValueError):
 
 def _num(x, what: str, positive: bool = False) -> float:
     """A JSON number (int / float, not bool), finite, >= 0 (> 0 when positive)."""
-    if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(float(x)):
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
         raise GateFileError(f'{what} {x!r}: a finite number')
-    if float(x) < 0.0 or (positive and float(x) == 0.0):
+    try:
+        v = float(x)
+    except (OverflowError, ValueError):                 # GC1-5: an integer beyond the float range
+        raise GateFileError(f'{what}: a number beyond the float range')
+    if not math.isfinite(v):
+        raise GateFileError(f'{what} {x!r}: a finite number')
+    if v < 0.0 or (positive and v == 0.0):
         raise GateFileError(f'{what} {x!r}: {"> 0" if positive else ">= 0"}')
-    return float(x)
+    return v
 
 
 def _close(a: float, b: float) -> bool:
-    return abs(a - b) <= REL_TOL * max(abs(a), abs(b), 1e-300)
+    """Equal within REL_TOL, both finite (GC1-2: inf never matches)."""
+    a, b = float(a), float(b)
+    return math.isfinite(a) and math.isfinite(b) and abs(a - b) <= REL_TOL * max(abs(a), abs(b), 1e-300)
+
+
+def schedule_peaks(level: str) -> Tuple[float, float]:
+    """(v, wz) peaks [m/s, rad/s] of the figure-8 schedule of a level: the refined maxima of o1_gate.fig8_cmd_max
+    WITHOUT its upper-bound margin CMD_MARGIN (GC1-3: rule 2b classifies the peak itself; the margin belongs to the
+    bounds used when scoring frames). The refinement (grid, golden section) is accurate far below REL_TOL."""
+    v, wz = o1_gate.fig8_cmd_max(Schedule(FIG8[level]))
+    return v / (1.0 + o1_gate.CMD_MARGIN), wz / (1.0 + o1_gate.CMD_MARGIN)
 
 
 def uhat_of(u_p_m: float, u_psi_deg: float, u_t_s: float, v_cmd_max: float, wz_cmd_max: float) -> Dict[str, float]:
@@ -83,8 +105,27 @@ def uhat_of(u_p_m: float, u_psi_deg: float, u_t_s: float, v_cmd_max: float, wz_c
 
 
 def report_only_of(uhat: Dict[str, float]) -> Tuple[str, ...]:
-    """Conditions whose base bound is above half the threshold ('>' strict: equal still decides)."""
-    return tuple(c for c in MASKABLE if float(uhat[c]) > 0.5 * o1_gate.THRESHOLDS[c])
+    """Conditions whose base bound is above half the threshold ('>' strict: equal still decides; a bound within
+    REL_TOL above half is taken as equal, so it decides: the numbers cannot tell those apart, GC1-1, GC1-3).
+    A bound that is not finite is an error."""
+    out = []
+    for c in MASKABLE:
+        x = float(uhat[c])
+        if not math.isfinite(x):
+            raise GateFileError(f'uhat {c} {x!r}: not finite')
+        if x > 0.5 * o1_gate.THRESHOLDS[c] * (1.0 + REL_TOL):
+            out.append(c)
+    return tuple(out)
+
+
+def level_block(level: str, u_p_m: float, u_psi_deg: float, runs) -> dict:
+    """The per_level block of a gate level as check() wants it, for the writer (C8b script): runs [{run_id,
+    controller, u_t_s}]; peaks, U_t,C8, uhat and report_only computed here."""
+    v, wz = schedule_peaks(level)
+    runs = [dict(run_id=r['run_id'], controller=r['controller'], u_t_s=float(r['u_t_s'])) for r in runs]
+    u_t = max(r['u_t_s'] for r in runs)
+    uh = uhat_of(u_p_m, u_psi_deg, u_t, v, wz)
+    return dict(v_cmd_max=v, wz_cmd_max=wz, u_t_c8_s=u_t, runs=runs, uhat=uh, report_only=list(report_only_of(uh)))
 
 
 def required_set(report_only: Iterable[str]) -> Tuple[str, ...]:
@@ -145,11 +186,11 @@ def check(d) -> dict:
         e, w = pl[name], f'dieu_2b.per_level.{name}'
         if not isinstance(e, dict) or any(k not in e for k in LEVEL_KEYS):
             raise GateFileError(f'{w}: an object with {LEVEL_KEYS}')
-        v_max, wz_max = o1_gate.fig8_cmd_max(Schedule(FIG8[name]))
+        v_max, wz_max = schedule_peaks(name)
         if not _close(_num(e['v_cmd_max'], f'{w}.v_cmd_max'), v_max):
-            raise GateFileError(f'{w}.v_cmd_max {e["v_cmd_max"]!r}: o1_gate.fig8_cmd_max gives {v_max!r}')
+            raise GateFileError(f'{w}.v_cmd_max {e["v_cmd_max"]!r}: schedule_peaks gives {v_max!r}')
         if not _close(_num(e['wz_cmd_max'], f'{w}.wz_cmd_max'), wz_max):
-            raise GateFileError(f'{w}.wz_cmd_max {e["wz_cmd_max"]!r}: o1_gate.fig8_cmd_max gives {wz_max!r}')
+            raise GateFileError(f'{w}.wz_cmd_max {e["wz_cmd_max"]!r}: schedule_peaks gives {wz_max!r}')
         runs = e['runs']
         if not isinstance(runs, list) or not runs:
             raise GateFileError(f'{w}.runs: a non-empty list')
@@ -173,16 +214,18 @@ def check(d) -> dict:
         uh = e['uhat']
         if not isinstance(uh, dict) or set(uh) != set(MASKABLE):
             raise GateFileError(f'{w}.uhat {uh!r}: keys {MASKABLE}')
-        want = uhat_of(u_p, u_psi, u_t, float(e['v_cmd_max']), float(e['wz_cmd_max']))
+        want = uhat_of(u_p, u_psi, u_t, v_max, wz_max)                # GC1-1: the recomputed peaks, not the file's
         for c in MASKABLE:
+            if not math.isfinite(want[c]):                            # GC1-2
+                raise GateFileError(f'{w}.uhat.{c}: the recomputed bound is not finite ({want[c]!r})')
             if not _close(_num(uh[c], f'{w}.uhat.{c}'), want[c]):
                 raise GateFileError(f'{w}.uhat.{c} {uh[c]!r}: recomputed {want[c]!r}')
         ro = e['report_only']
         if not isinstance(ro, list) or any(not isinstance(c, str) for c in ro):
             raise GateFileError(f'{w}.report_only {ro!r}: a list of condition names')
-        if tuple(ro) != report_only_of(uh):
-            raise GateFileError(f'{w}.report_only {ro!r}: from uhat (> half the threshold) it is '
-                                f'{list(report_only_of(uh))!r}')
+        if tuple(ro) != report_only_of(want):                         # GC1-1: classified on the canonical bound
+            raise GateFileError(f'{w}.report_only {ro!r}: from the recomputed uhat (> half the threshold) it is '
+                                f'{list(report_only_of(want))!r}')
     return d
 
 
@@ -209,6 +252,15 @@ class GateC8:
         return required_set(self.run_report_only(level, platform, stage, campaign))
 
 
+def _no_duplicate_keys(pairs):
+    """GC1-4: a JSON object with a key twice is refused (json keeps the last one silently)."""
+    keys = [k for k, _ in pairs]
+    dup = sorted({k for k in keys if keys.count(k) > 1})
+    if dup:
+        raise GateFileError(f'duplicate JSON key(s) {dup}')
+    return dict(pairs)
+
+
 def read_gate_c8(path: str) -> GateC8:
     """Read and check a gate file; GateFileError (a ValueError) on any problem."""
     if not os.path.isfile(path):
@@ -216,7 +268,9 @@ def read_gate_c8(path: str) -> GateC8:
     with open(path, 'rb') as f:
         raw = f.read()
     try:
-        d = json.loads(raw.decode('utf-8'))
+        d = json.loads(raw.decode('utf-8'), object_pairs_hook=_no_duplicate_keys)
+    except GateFileError as exc:
+        raise GateFileError(f'gate file {path!r}: {exc}')
     except (UnicodeDecodeError, ValueError) as exc:
         raise GateFileError(f'gate file {path!r}: not UTF-8 JSON ({exc})')
     try:
@@ -227,16 +281,14 @@ def read_gate_c8(path: str) -> GateC8:
 
 def fake_gate(levels=('O1-F05',), u_p_m=0.002, u_psi_deg=2.0, u_t_s=0.010) -> dict:
     """A gate file content for tests and the rq3_log demo (FAKE numbers, not measured). u_t_s: one number, or a
-    dict {level: U_t,C8}; uhat and report_only are computed as the C8b script must."""
+    dict {level: U_t,C8 or (U_t PID, U_t LADRC)}; the blocks are built by level_block, as the C8b script must."""
     per = {}
     for name in levels:
-        v_max, wz_max = o1_gate.fig8_cmd_max(Schedule(FIG8[name]))
-        ut = float(u_t_s[name] if isinstance(u_t_s, dict) else u_t_s)
-        uh = uhat_of(u_p_m, u_psi_deg, ut, v_max, wz_max)
-        per[name] = dict(v_cmd_max=v_max, wz_cmd_max=wz_max, u_t_c8_s=ut,
-                         runs=[dict(run_id=f'FAKE_{name}_PID', controller='PID', u_t_s=ut),
-                               dict(run_id=f'FAKE_{name}_LADRC', controller='LADRC', u_t_s=ut)],
-                         uhat=uh, report_only=list(report_only_of(uh)))
+        ut = u_t_s[name] if isinstance(u_t_s, dict) else u_t_s
+        uts = tuple(ut) if isinstance(ut, (tuple, list)) else (ut, ut)       # (PID, LADRC)
+        per[name] = level_block(name, u_p_m, u_psi_deg,
+                                [dict(run_id=f'FAKE_{name}_PID', controller='PID', u_t_s=uts[0]),
+                                 dict(run_id=f'FAKE_{name}_LADRC', controller='LADRC', u_t_s=uts[1])])
     return dict(format=FORMAT, c8_dir='FAKE', written_by=dict(script='FAKE', commit='', dirty=True),
                 levels=list(levels), u_t_branch='bo_tick',
                 dieu_2b=dict(thresholds={c: o1_gate.THRESHOLDS[c] for c in MASKABLE}, u_p_m=float(u_p_m),

@@ -124,3 +124,116 @@ def test_write_gate_sha(tmp_path):
         d['levels'] = []
         GC.write_gate(str(tmp_path / 'bad.json'), d)                          # never written when it does not check
     assert not os.path.exists(str(tmp_path / 'bad.json'))
+
+
+# ── Codex Sol round 1 (17/11, account 1, session 01a1e87f): GC1-1 ... GC1-6 ──
+
+def test_gc1_1_tolerance_cannot_exempt_a_condition_at_half(tmp_path):
+    # G2 recomputed exactly at half the threshold must decide; a stored uhat 5e-10 above it may not exempt it
+    d = GC.fake_gate(('O1-F08',), u_p_m=0.05, u_psi_deg=0.0, u_t_s=0.001)
+    e = d['dieu_2b']['per_level']['O1-F08']
+    assert 'g2' not in e['report_only']
+    e['uhat']['g2'] = 0.050000000025
+    e['report_only'] = ['g2'] + [c for c in e['report_only'] if c != 'g2']
+    with pytest.raises(GC.GateFileError, match='report_only'):
+        GC.read_gate_c8(_write(tmp_path, d))
+    with pytest.raises(GC.GateFileError, match='report_only'):
+        GC.write_gate(str(tmp_path / 'w.json'), d)
+
+
+def test_gc1_1_stored_peak_within_tolerance_does_not_move_the_mask(tmp_path):
+    # the file's peak a hair above the schedule's: uhat and the mask still come from the recomputed peak
+    sch_v = GC.schedule_peaks('O1-F02')[0]
+    u_t = (0.05 - 0.002) / sch_v                                             # G3 exactly at half with the true peak
+    d = GC.fake_gate(('O1-F02',), u_p_m=0.002, u_psi_deg=0.0, u_t_s=u_t)
+    e = d['dieu_2b']['per_level']['O1-F02']
+    assert 'g3' not in e['report_only']                                     # equal (within REL_TOL): decides
+    e['v_cmd_max'] *= 1 + 5e-10
+    e['uhat']['g3'] = 0.002 + u_t * e['v_cmd_max']
+    e['report_only'] = ['g3']
+    with pytest.raises(GC.GateFileError, match='report_only'):
+        GC.check(d)
+
+
+def test_gc1_2_overflow_in_the_recomputed_bound(tmp_path):
+    d = GC.fake_gate(('O1-F02',))
+    e = d['dieu_2b']['per_level']['O1-F02']
+    for r in e['runs']:
+        r['u_t_s'] = 1e307
+    e['u_t_c8_s'] = 1e307
+    e['uhat']['g3'] = GC.uhat_of(0.002, 2.0, 1e307, *GC.schedule_peaks('O1-F02'))['g3']    # finite, matches
+    e['uhat']['g5'] = 0.0                                                    # its recomputed value overflows to inf
+    with pytest.raises(GC.GateFileError, match='not finite'):
+        GC.read_gate_c8(_write(tmp_path, d))
+    assert not GC._close(1.0, float('inf')) and not GC._close(float('inf'), float('inf'))
+
+
+def test_gc1_3_peak_without_the_margin():
+    # F02: the speed peak is sqrt(2) A w0 = Schedule.vmax (tau = 0, pi on the hold); U_t that puts the true G3 just
+    # below / above half: decides / report only (the margin of fig8_cmd_max must not decide it)
+    vmax = GC.Schedule(GC.FIG8['O1-F02']).vmax
+    assert GC.schedule_peaks('O1-F02')[0] == pytest.approx(vmax, rel=1e-12)
+    below = GC.level_block('O1-F02', 0.002, 0.0, [dict(run_id='a', controller='PID', u_t_s=(0.04999999 - 0.002) / vmax),
+                                                    dict(run_id='b', controller='LADRC', u_t_s=0.001)])
+    above = GC.level_block('O1-F02', 0.002, 0.0, [dict(run_id='a', controller='PID', u_t_s=(0.05000001 - 0.002) / vmax),
+                                                    dict(run_id='b', controller='LADRC', u_t_s=0.001)])
+    assert 'g3' not in below['report_only'] and 'g3' in above['report_only']
+
+
+@pytest.mark.parametrize('old, new', [('"g5": 7.5', '"g5": 0, "g5": 7.5'),
+                                      ('"run_id": "FAKE_O1-F08_PID"', '"run_id": "x", "run_id": "FAKE_O1-F08_PID"')])
+def test_gc1_4_duplicate_json_keys_refused(tmp_path, old, new):
+    raw = json.dumps(_good())
+    assert old in raw
+    p = str(tmp_path / 'dup.json')
+    with open(p, 'w', encoding='utf-8') as f:
+        f.write(raw.replace(old, new, 1))
+    with pytest.raises(GC.GateFileError, match='duplicate'):
+        GC.read_gate_c8(p)
+
+
+def test_gc1_4_duplicate_level_block_refused(tmp_path):
+    d = _good()
+    blk = json.dumps(d['dieu_2b']['per_level']['O1-F05'])
+    raw = json.dumps(d).replace('"O1-F05": ' + blk, '"O1-F05": {"x": 1}, "O1-F05": ' + blk, 1)
+    p = str(tmp_path / 'dup.json')
+    with open(p, 'w', encoding='utf-8') as f:
+        f.write(raw)
+    with pytest.raises(GC.GateFileError, match='duplicate'):
+        GC.read_gate_c8(p)
+
+
+def test_gc1_5_integer_beyond_float(tmp_path):
+    d = _good()
+    d['dieu_2b']['u_p_m'] = 10 ** 400
+    with pytest.raises(GC.GateFileError, match='float range'):
+        GC.check(d)
+    with pytest.raises(GC.GateFileError):
+        GC.read_gate_c8(_write(tmp_path, d))
+
+
+@pytest.mark.parametrize('uts', [(0.010, 0.014), (0.014, 0.010)])
+def test_gc1_6_u_t_c8_is_the_largest_of_different_runs(tmp_path, uts):
+    d = GC.fake_gate(('O1-F08',), u_t_s={'O1-F08': uts})
+    assert d['dieu_2b']['per_level']['O1-F08']['u_t_c8_s'] == 0.014
+    GC.read_gate_c8(_write(tmp_path, d))
+    d['dieu_2b']['per_level']['O1-F08']['u_t_c8_s'] = 0.010
+    with pytest.raises(GC.GateFileError, match='u_t_c8_s'):
+        GC.check(d)
+
+
+@pytest.mark.parametrize('level, platform, stage, campaign, want', [
+    ('O1-F08', 'HIL', 'final_hil', 'B-PID', o1_gate.CONDS),             # B campaign but not the candidate check
+    ('O1-F08', 'HIL', 'hil_check', 'A-PID', o1_gate.CONDS),             # candidate check stage but not B
+    ('O1-F08', 'HIL', 'hil_check', 'B-chung', o1_gate.CONDS),
+    ('O1-K2', 'HW', 'final', 'A-LADRC', o1_gate.CONDS),
+    ('O1-F02', 'HW', 'screen', 'A-PID', o1_gate.CONDS),                 # a gate level with nothing report only
+])
+def test_gc1_6_required_more_cases(tmp_path, level, platform, stage, campaign, want):
+    gf = GC.read_gate_c8(_write(tmp_path, _good()))
+    assert gf.required(level, platform, stage, campaign) == tuple(want)
+    d = _good()
+    d['levels'] = ['O1-F05', 'O1-F08']
+    del d['dieu_2b']['per_level']['O1-F02']
+    gf2 = GC.read_gate_c8(_write(tmp_path, d, 'two.json'))
+    assert gf2.required('O1-F02', 'HW', 'screen', 'A-PID') == o1_gate.CONDS   # a level outside the gate levels
