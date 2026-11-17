@@ -76,6 +76,20 @@ def test_a3_sees_a_moved_mark_exactly(scene):
     assert rows[(m, j)]['dtheta_deg'] == pytest.approx(exp, abs=2e-3)
 
 
+def test_a3_shift_along_the_pair_gives_zero_angle(scene):
+    """KC2-4: dtheta = atan2(d_perp, L + d_par); a shift along the pair alone turns nothing."""
+    marks, cam, _ = scene
+    m, j = 30, 32
+    vt = np.array(marks[j][:2]) - np.array(marks[m][:2])
+    u = vt / np.linalg.norm(vt)
+    L = float(np.linalg.norm(vt))
+    for d_par, d_perp in ((0.002, 0.0), (0.002, 0.001)):
+        true = dict(marks)
+        true[j] = (marks[j][0] + d_par * u[0] - d_perp * u[1], marks[j][1] + d_par * u[1] + d_perp * u[0], SIDE)
+        rows = {(r['i'], r['j']): r for r in kc.a3_clip(image_of(cam, true), marks, 'B1', W, H, ZC, l_max=0.8)}
+        assert rows[(m, j)]['dtheta_deg'] == pytest.approx(math.degrees(math.atan2(d_perp, L + d_par)), abs=2e-3)
+
+
 def test_held_out_marks_do_not_enter_their_fit(scene):
     """Independence (R6-2): changing the tape coordinates AND image corners of the held-out marks leaves the
     camera used to predict them unchanged; changing a training mark changes it (the test is not empty)."""
@@ -153,6 +167,21 @@ def test_u_so_window_term(scene):
     frames = frames[:5] + [image_of(cam, true)] * 30 + frames[35:]   # a full window with mark 12 moved 1 mm
     u, info = kc.u_so_v2(img, img, frames, marks, groups, cams, win=30)
     assert info['cua_so_m'] == pytest.approx(0.001, abs=3e-5)
+
+
+def test_u_so_flags_sets_it_cannot_compute(scene):
+    """KC2-2: every mark in half the H_b frames but never all at once: the run set gets no window, flagged, not
+    replaced by a smaller set; kiem_h shows 0 % at once."""
+    marks, cam, img = scene
+    groups = kc.make_groups(sorted(img))
+    cams = kc.group_cams(img, marks, groups, 'B1', W, H, ZC)
+    half_a = {i: c for i, c in img.items() if i % 2}
+    half_b = {i: c for i, c in img.items() if not i % 2}
+    frames = [half_a, half_b] * 20
+    u, info = kc.u_so_v2(img, img, frames, marks, groups, cams, win=10)
+    assert info['thieu'] and any(x['vi'] == 'cua_so' for x in info['khong_tinh_duoc'])
+    r = kc.kiem_h(frames, sorted(img))
+    assert r['ti_le_cung_luc'] == 0.0 and min(r['ti_le_moc'].values()) == 0.5
 
 
 def test_session_model_lock():
@@ -320,6 +349,7 @@ def _kc_file(tmp_path, **over):
     kcres = dict(version=kc.VERSION, buoi='C8_x', model='B1', nhom=[[1, 5], [2, 6]], thu=False,
                  sessions={n: dict(file=n, sha256='0' * 64) for n in kc.CLIPS_REQUIRED},
                  **{b: dict(blk, buoi='C8_x') for b, blk in _own().items() if b != '_src'})
+    kcres.update(u_so_sha256='5' * 64, nguong_track_m=0.0013, moc=[dict(file='moc.csv', sha256='6' * 64)])
     kcres.update(over)
     p = tmp_path / 'kiem_cheo.json'
     p.write_text(json.dumps(kcres), encoding='utf-8')
@@ -328,7 +358,8 @@ def _kc_file(tmp_path, **over):
 
 def _xuat_args(tmp_path, kcp, tk_over=None, part_buoi='C8_x', buoi='C8_x'):
     tk = dict(version=kc.TUNG_KHUNG_VERSION, buoi='C8_x', model='B1', nhom=[[1, 5], [2, 6]], cham_lai=True,
-              tung_khung_max_m=0.003, kiem_cheo_sha256=kc.sha256_file(str(kcp)))
+              tung_khung_max_m=0.003, kiem_cheo_sha256=kc.sha256_file(str(kcp)), u_so_sha256='5' * 64,
+              nguong_track_m=0.0013, moc=[dict(file='moc.csv', sha256='6' * 64)])
     tk.update(tk_over or {})
     tkp = tmp_path / 'tk.json'
     tkp.write_text(json.dumps(tk), encoding='utf-8')
@@ -347,15 +378,19 @@ def test_xuat_ok(tmp_path):
 
 
 @pytest.mark.parametrize('bad', ['thu', 'no_Hm', 'tk_buoi', 'tk_nhom', 'tk_model', 'tk_sha', 'tk_not_rescored',
-                                 'part_buoi', 'arg_buoi'])
+                                 'part_buoi', 'arg_buoi', 'tk_u_so', 'tk_nguong', 'tk_moc', 'u_so_thieu'])
 def test_xuat_refuses_mixed_inputs(tmp_path, bad, capsys):
     """KC1-10: results of another session, grouping, model, kiem_cheo file, or before the rescoring are refused."""
     over = dict(thu=True) if bad == 'thu' else {}
+    if bad == 'u_so_thieu':
+        over['moc_dich'] = dict(_own()['moc_dich'], buoi='C8_x', thieu=True)
     if bad == 'no_Hm':
         over['sessions'] = {n: dict(file=n, sha256='0' * 64) for n in ('H_a', 'H_b', 'H_z')}
     kcp = _kc_file(tmp_path, **over)
     tk_over = {'tk_buoi': dict(buoi='C8_y'), 'tk_nhom': dict(nhom=[[1], [2]]), 'tk_model': dict(model='B2'),
-               'tk_sha': dict(kiem_cheo_sha256='f' * 64), 'tk_not_rescored': dict(cham_lai=False)}.get(bad)
+               'tk_sha': dict(kiem_cheo_sha256='f' * 64), 'tk_not_rescored': dict(cham_lai=False),
+               'tk_u_so': dict(u_so_sha256='7' * 64), 'tk_nguong': dict(nguong_track_m=0.0011),
+               'tk_moc': dict(moc=[dict(file='moc.csv', sha256='8' * 64)])}.get(bad)
     args = _xuat_args(tmp_path, kcp, tk_over, part_buoi='C8_y' if bad == 'part_buoi' else 'C8_x',
                       buoi='C8_y' if bad == 'arg_buoi' else 'C8_x')
     assert kc.main(args) == 2
