@@ -60,6 +60,14 @@ gate_v3 block also holds
   (all null, g1_fields_note says why; G1 stays chua_ket_luan from q; Liam 15/11 CODE_RS4 local_3b1a170b,
   "Không ghi số chi tiết (Recommended)").
 
+O1 v11.33 (CODE_GATE 17/11/2026, design CLAUDE_THESIS 03_CODE/docs/2026-11-17_Thiet_ke_CODE_GATE_v1.md sections 3, 4;
+Liam 17/11 at CODE_GATE "Duyệt, gửi CODE luôn (Recommended)"): with the edge mapped (U_t known) G3, G5 get the per-frame
+bounds U_t V_k, U_t W_k (o1_gate.cmd_rate_frames on the task's command; gate_v3.3, u_mode 'khung'). --gate-file C8
+gate file (tools/gate_c8.py) with --stage, --campaign of the run: the report-only conditions of the level that apply
+to it (the HIL candidate check of procedure B, stage hil_check, campaign B-PID / B-LADRC: Liam 17/11 THESIS "HIL dùng
+cùng mặt nạ (Recommended)"; any other run: none) go to the gate with the level and the file's SHA-256; they are still
+computed and stored. Without --gate-file the run is scored with all five as before.
+
 pi_period_ppm (S05 v3.29 4.7 (i), B81b-3, B81bR2-2, B81c-4; Liam 15/11 CODE_RS4 local_3b1a170b "Trong hil_o1_score
 (Recommended)", "Ghi null + lý do (Recommended)"; design RS-4 section 18.8): the Pi send period against the nominal on
 the steps of T, from the frame log t_send_ns at its two ends only (no fit over the run):
@@ -70,6 +78,7 @@ has no t_send_ns, a step is outside it, an end is <= 0 or the two do not increas
 interval. s05_final_table.py reads it (null: the 100 ppm bound).
 
   python tools/hil_o1_score.py --frame-log <run>.npz --task O1-F05 [--esp-log <run>.csv] [--out score.json]
+      [--gate-file gate_c8.json --stage hil_check --campaign B-PID]
   (K1, K2 need --allow-final-set: O1 3.7, final test set only)
 Last line: #ket_qua,ma=0 scored / 2 error.
 """
@@ -94,6 +103,8 @@ import o1_gate_eval                                                      # noqa:
 import hil_edge_map                                                      # noqa: E402
 from o1_feasibility import Path8, Schedule                               # noqa: E402
 from o1_tasks import FIG8, FINAL_SET                                     # noqa: E402
+import o1_tasks                                                          # noqa: E402
+import gate_c8                                                           # noqa: E402
 
 
 def _int16(a, ofs, n):
@@ -255,7 +266,8 @@ def pi_period(t_send_ns, k_first, k_last, period_us):
     return out
 
 
-def score(path, task, allow_final_set=False, esp_log=None, allow_pre_b81_15=False):
+def score(path, task, allow_final_set=False, esp_log=None, allow_pre_b81_15=False, gate_file=None, stage='',
+          campaign=''):
     if task not in FIG8 and task not in FINAL_SET:
         raise ValueError(f'task {task!r}: one of {tuple(FIG8) + FINAL_SET}')
     if task in FINAL_SET and not allow_final_set:
@@ -303,8 +315,21 @@ def score(path, task, allow_final_set=False, esp_log=None, allow_pre_b81_15=Fals
         v_max, wz_max = o1_gate.fig8_cmd_max(Schedule(FIG8[task]))
     else:
         v_max, wz_max = o1_gate.k_cmd_max(o1_lanes.KSchedule(task))
+    # O1 v11.33 (CODE_GATE design sections 3, 4): per-frame G3, G5 bounds when U_t is known; the report-only
+    # conditions of the C8 gate file at this level when --gate-file is given (they apply to the HIL candidate check
+    # of procedure B only, gate_c8.mask_applies; recorded with the file's SHA either way)
+    extra = {}
+    if u_t is not None:
+        t_cmd, f_cmd = o1_tasks.task(task, allow_final_set=True)
+        extra['v_k'], extra['w_k'] = o1_gate.cmd_rate_frames(f_cmd, t_cmd, frames['t'], u_t, turn=task in FIG8,
+                                                             v_cap=v_max, wz_cap=wz_max)
+    if gate_file:
+        gf = gate_c8.read_gate_c8(gate_file)
+        extra.update(report_only=gf.run_report_only(task, 'HIL', stage, campaign), level=task,
+                     gate_file_sha256=gf.sha256)
+        out['gate_file'] = os.path.basename(gate_file)
     out['gate_v3'] = o1_gate.gate(frames, out['completed'], v_cmd_max=v_max, wz_cmd_max=wz_max, u_t=u_t,
-                                  decide=decide, status=out.get('status', ''), note=note)
+                                  decide=decide, status=out.get('status', ''), note=note, **extra)
     add_b81_3(out['gate_v3'], out, period)                               # B81-3 (module docstring)
     mc = manifest.get('miso_check') or {}
     out.update(frame_log=os.path.basename(path), k0=k0, k_run=k_run, t0_step=a, t0_src=t0_src,
@@ -339,11 +364,18 @@ def main(argv=None) -> int:
     ap.add_argument('--allow-final-set', action='store_true')
     ap.add_argument('--esp-log', default='', help='agv_logger CSV of the run: t = 0 at the run_active edge (RS-4)')
     ap.add_argument('--out', default='')
+    ap.add_argument('--gate-file', default='', help='C8 gate file (gate_c8_v1, tools/gate_c8.py): report-only '
+                    'conditions of the level (HIL candidate check of B: --stage hil_check --campaign B-PID / B-LADRC)')
+    ap.add_argument('--stage', default='', help='rq3_log stage of the run (with --gate-file)')
+    ap.add_argument('--campaign', default='', help='rq3_log campaign of the run (with --gate-file)')
     ap.add_argument('--pre-b81-15', action='store_true',
                     help='score a frame log from before the Pi plant-state check (development only, O1 3.5)')
     a = ap.parse_args(argv)
     try:
-        out = _json_safe(score(a.frame_log, a.task, a.allow_final_set, a.esp_log or None, a.pre_b81_15))
+        if (a.stage or a.campaign) and not a.gate_file:
+            raise ValueError('--stage / --campaign only with --gate-file')
+        out = _json_safe(score(a.frame_log, a.task, a.allow_final_set, a.esp_log or None, a.pre_b81_15,
+                               a.gate_file or None, a.stage, a.campaign))
     except (ValueError, KeyError, OSError) as exc:
         print('hil_o1_score:', exc, file=sys.stderr)
         print('#ket_qua,ma=2')

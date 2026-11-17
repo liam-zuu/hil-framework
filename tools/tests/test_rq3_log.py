@@ -298,7 +298,7 @@ def test_c9_dry_run_recomputes_summary(tmp_path):
     with open(out / rl.SUMMARY, newline='', encoding='utf-8') as f:
         written = list(csv.DictReader(f))
     assert [r['campaign'] for r in written] == list(rl.SUMMARY_ROWS)
-    again = rl.summary(str(out), *rl.read_gate(str(out / 'FAKE_gate.csv')))
+    again = rl.summary(str(out), gate_file=rl.read_gate_file(str(out / 'FAKE_gate_c8.json')))
     assert [{k: v for k, v in r.items()} for r in again] == rows1
     for w, r in zip(written, rows1):
         assert all(w[k] == r.get(k, '') for k in w)
@@ -507,12 +507,18 @@ def test_ea9_task_level_and_locked_gate_file(ds, tmp_path):
         rl.begin(d, 'A1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.8', 'screen')
     with pytest.raises(rl.LogError, match='figure-8 names'):
         rl.begin(d, 'A1', 'A-PID', 'HW', 'PID', 'O1-F09', '0.9', 'screen')
-    gp = tmp_path / 'gate.csv'
-    for bad in ('lv\nO1-F05\n', 'level\nO1-F05@0.5\n', 'level\nO1-F05\nO1-F05\n', 'level\n'):
+    # O1 v11.33 (CODE_GATE): the gate file is the gate_c8_v1 JSON (tools/gate_c8.py); the old CSV is refused
+    import json
+    gp = tmp_path / 'gate.json'
+    good = rl.gate_c8.fake_gate(('O1-F05', 'O1-F08'))
+    bads = ['level\nO1-F05\nO1-F08\n', json.dumps(dict(good, levels=['O1-F05@0.5'])),
+            json.dumps(dict(good, levels=['O1-F05', 'O1-F05'])), json.dumps(dict(good, levels=[])),
+            json.dumps(dict(good, format='gate_c8_v0'))]
+    for bad in bads:
         gp.write_text(bad, encoding='utf-8')
         with pytest.raises(rl.LogError, match='gate file'):
             rl.read_gate(str(gp))
-    gp.write_text('level\nO1-F05\nO1-F08\n', encoding='utf-8')
+    gp.write_text(json.dumps(good), encoding='utf-8')
     levels, sha = rl.read_gate(str(gp))
     import hashlib
     assert levels == ['O1-F05', 'O1-F08'] and sha == hashlib.sha256(gp.read_bytes()).hexdigest()

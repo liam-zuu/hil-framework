@@ -166,7 +166,10 @@ def g4_frames(rows, grid_lane, vmax, heads_of, nominal):
 
 
 def _frames(rows, e_bao, theta_key):
-    return dict(e_perp=np.array([r['e_perp'] for r in rows], dtype=float),
+    """Per-frame arrays for o1_gate.gate, plus t (the frame times, for o1_gate.cmd_rate_frames; O1 v11.33 per-frame
+    bounds, CODE_GATE 17/11; gate does not read it)."""
+    return dict(t=np.array([r['t'] for r in rows], dtype=float),
+                e_perp=np.array([r['e_perp'] for r in rows], dtype=float),
                 e_trk=np.array([r['e_trk'] for r in rows], dtype=float),
                 e_bao=np.asarray(e_bao, dtype=float),
                 e_theta_cmd_deg=np.degrees(np.abs(np.array([r[theta_key] for r in rows], dtype=float))))
