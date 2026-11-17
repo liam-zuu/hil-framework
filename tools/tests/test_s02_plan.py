@@ -395,3 +395,44 @@ def test_measuring_system_faults_need_cause_group_1():
     assert sp.check(_rows(('A-L1', 1, 'replaced', '3', 'wrong test run'), ('A-L1', 1, 'completed', '', ''))) == []
     empty = sp.check(_rows(('A-L1', 1, 'replaced', '', CSF), ('A-L1', 1, 'completed', '', '')))
     assert len(empty) == 1 and 'cause_group 1, 2 or 3' in empty[0]
+
+
+def test_streaks_across_repetitions_and_battery_history():
+    """S2C1-2 (Codex round 1): the count runs across repetitions (blocks of rep 1, 2, 3, the replacements later) and
+    through a battery_rerun block's history (two there, one in the re-run block)."""
+    reps = []
+    for b, rep in (('1', 1), ('2', 2), ('3', 3)):
+        reps += _rows(('A-L1', rep, 'replaced', '1', CSF), block=b)
+    for b, rep in (('4', 1), ('5', 2), ('6', 3)):
+        reps += _rows(('A-L1', rep, 'completed', '', ''), block=b)
+    p = sp.check(reps)
+    assert len(p) == 1 and 'stop' in p[0] and 'lines [2, 3, 4]' in p[0], p
+    old = [dict(r, block_status='battery_rerun') for r in
+           _rows(('A-L1', 1, 'replaced', '1', CSF), ('A-L1', 1, 'replaced', '1', CSF), ('A-L2', 1, 'completed', '', ''),
+                 v=('12.4', '12.0'))]
+    new = _rows(('A-L1', 1, 'replaced', '1', CSF), ('A-L1', 1, 'completed', '', ''), ('A-L2', 1, 'completed', '', ''),
+                block='2')
+    p = sp.check(old + new)
+    assert len(p) == 1 and 'stop' in p[0] and 'lines [2, 3, 5]' in p[0], p
+
+
+@pytest.mark.parametrize('end', [('completed', '', ''), ('broken', '', 'controller')])
+def test_a_completed_or_broken_run_resets_before_the_next_repetition(end):
+    """S2C1-3 (Codex round 1): rep 1 CSF, CSF, then its completed (or broken) run; rep 2 CSF, completed: 2 + 1, no
+    stop (skipping the non-replaced rows instead of resetting would count 3)."""
+    rows = _rows(('A-L1', 1, 'replaced', '1', CSF), ('A-L1', 1, 'replaced', '1', CSF), ('A-L1', 1) + end) +         _rows(('A-L1', 2, 'replaced', '1', CSF), ('A-L1', 2, 'completed', '', ''), block='2')
+    assert sp.check(rows) == []
+
+
+@pytest.mark.parametrize('why', [CSF, 'camera_lost'])
+@pytest.mark.parametrize('group', ['2', '3', ''])
+def test_group_1_also_in_a_battery_rerun_history(why, group):
+    """S2C1-1 (Codex round 1): the battery_rerun rows are history, not counted, but a measuring system fault there
+    still needs cause_group 1."""
+    old = [dict(r, block_status='battery_rerun') for r in
+           _rows(('A-L1', 1, 'replaced', group, why), ('A-L1', 1, 'completed', '', ''), v=('12.4', '12.0'))]
+    new = _rows(('A-L1', 1, 'completed', '', ''), block='2')
+    p = sp.check(old + new)
+    assert len(p) == 1 and 'cause_group 1' in p[0] and p[0].startswith('line 2 '), p
+    old[0]['cause_group'] = '1'
+    assert sp.check(old + new) == []

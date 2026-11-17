@@ -325,9 +325,6 @@ def check(rows, planned=None, n_reps=None):
         if res == 'replaced':
             if r['cause_group'].strip() not in ('1', '2', '3'):
                 out.append(f'line {i} {r["run_id"]}: replaced needs cause_group 1, 2 or 3 (P2-5)')
-            elif _system_fault(r) and r['cause_group'].strip() != '1':
-                out.append(f'line {i} {r["run_id"]}: replaced for {_system_fault(r)} needs cause_group 1 '
-                           '(measuring system fault, S02 v1.17 P2-5)')
             if not any((x['test_id'], x['controller'], x['_rep']) == cell for x in live[j + 1:]):
                 out.append(f'line {i} {r["run_id"]}: replaced but no later run of {cell}')
             continue
@@ -345,6 +342,14 @@ def check(rows, planned=None, n_reps=None):
         if cell in done:
             out.append(f'line {i} {r["run_id"]}: {cell} already has a {done[cell]} run (5 fixed runs, P2-4)')
         done[cell] = res
+    # S02 v1.17 P2-5: a run replaced for a measuring system fault is group 1, on every row (S2C1-1, Codex round 1:
+    # a battery_rerun block's history included); an empty or unknown group of a counted row is reported above
+    for i, r in enumerate(rows, start=2):
+        g = r['cause_group'].strip()
+        hist = r['block_status'].strip() == 'battery_rerun'
+        if r['result'].strip() == 'replaced' and _system_fault(r) and g != '1' and (hist or g in ('2', '3')):
+            out.append(f'line {i} {r["run_id"]}: replaced for {_system_fault(r)} needs cause_group 1 '
+                       '(measuring system fault, S02 v1.17 P2-5)')
     out += _sync_fail_streaks(rows)
     if planned is not None:
         want = {(t, bl['controller'], int(bl['rep'])) for bl in planned for t in bl['tests']}
