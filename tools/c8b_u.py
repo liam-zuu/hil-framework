@@ -23,18 +23,24 @@ khoa (after the C8 clips are tracked and the C8 runs have their clock files):
     P1 image -> floor   max(cross-validation largest at the marks on the clip-mean pose, per frame) + the largest
                         true shift of a mark left in the fit, nguong + 2 u_so (dropped when the observed shift
                         exceeds nguong + u_so; the comparison error u_so may hide as much again)          [camera file]
-    P2 tag-body centre  |(dx, dy) used by the scorer - R(dpsi used) q| + du + |q| A1[rad]           [c8b_xoay.py]
+    P2 tag-body centre  |o_u - R(dpsi_u) q| + du + (|q| + du) A1 + |o_u| (A1 + ... + A6)  [rad; o_u = (dx, dy), dpsi_u
+                        the tag_offset of the scorer; last term: the heading error turns the correction vector,
+                        C8BU-R1-3]                                                                 [c8b_xoay.py]
     P3 / A2 plate re-seating, position / angle (3 lifts, car still)                                  [camera file]
     P4 / A4 3b          d_p_quay / d_psi_quay                                                         [c8b_3b.py]
     P5 plumb / zc       (h / H) dn + h dzc (rho + dn) / (H (H - dzc - h))  (C8BS-R7-1..3)            [camera file]
     P6 tag height       (rho + s / sqrt 2) dh / (H - h - dh), dh = max_i |c_i - h| + e   (c_i the four corner heights by
                         caliper, h the height the scorer uses, e the caliper error)                [caliper + camera]
     P7 / A5 noise       largest deviation from the mean of a still mark, per frame (not sigma)        [camera file]
-    A1 mounting angle   |dpsi used - angle by caliper| + atan(2 e / L) + plate-body angle from the drawing   [caliper]
-    A3 camera by area   largest pair heading error, both marks held out                               [camera file]
-    A6 tag tilt         rho (sum_i |c_i - mean c| + 8 e) / (2 sqrt 2 s (H - max c_i - e))  [rad]: the parallax step
-                        uses one h for the four corners, a corner higher by d moves out by (P_i - C) d / (H - c_i),
-                        which turns the Kabsch fit of car_pose (design v2 section 4; not in page v10: added for Liam)
+    A1 mounting angle   |dpsi_u - theta| + atan(2 e / s) + max edge angle^2 + plate-body angle from the drawing; theta
+                        = the Kabsch angle of the black square on the plate, mean of its four edge angles by caliper
+                        (a distorted print is seen, C8BU-R1-6; Liam 18/11 at CODE_C8B "Thuoc kep 4 canh")  [caliper]
+    A3 camera by area   bound on the Kabsch heading of the car tag (96.4 mm) from the camera model, carried from the
+                        held-out mark pairs (page v10 A3; A3.quy_ve_ma_noc must be true, C8BU-R1-4)    [camera file]
+    A6 tag tilt         rho (sum_i |c_i - mean c| + 8 e) / (2 sqrt 2 s (H - dzc - max c_i - e))  [rad]: the parallax
+                        step uses one h for the four corners, a corner higher by d moves out by (P_i - C) d / (H - c_i),
+                        which turns the Kabsch fit of car_pose; domain enforced: sum |c_i - mean| <= 2 mm, rho <= 3 m
+                        (C8BU-R1-8). Not in page v10: Liam 18/11 at CODE_C8B "Them A6 (Recommended)"
   Test 5 (ruler at the stop points, dropped in v10, kept as an option) is an end-to-end check: every difference
   <= U_p, else 'xem_lai' (not widened by itself). 3b with ga_ok false: refused (set-up redone).
 cong (after every C8 figure-8 run is scored on its clock grid with the locked constants):
@@ -60,17 +66,17 @@ c8_cam_u_vao.json (CODE_CAM / CODE_KIEMCHEO / CODE_NHACTAM; m and deg; every num
   {"version": "c8_cam_u_vao_v2",
    "P1": {"bo_nhom_max_m", "tung_khung_max_m", ...}, "moc_dich": {"nguong_m", "u_so_m", ...},
    "P3": {"vi_tri_max_m", ...}, "A2": {"goc_max_deg", ...}, "than_dich": {...} (information),
-   "P7": {"lech_max_m", ...}, "A3": {"max_deg", ...}, "A5": {"lech_max_deg", ...},
+   "P7": {"lech_max_m", ...}, "A3": {"max_deg", "quy_ve_ma_noc": true, ...}, "A5": {"lech_max_deg", ...},
    "day_doi": {"dn_m", "dzc_m", "kappa"}, "do_cao": {"rho_max_m", "h_m", "H_m"},
    "bo_cham": {"tag_offset": [dx_m, dy_m, dpsi_rad] or null, "side_m"}, "nguon": ..., "ghi_chu": ...}
   bo_cham.tag_offset = the offset the scorer gives c7_measure.track for the C8 runs (null = none: P2, A1 then carry
   the whole offset and angle); side_m = the side of the black square of the car tag.
-thuoc_kep.json (CODE_C8B from the numbers Liam sends, guide B1, B2): {"version": "c8b_thuoc_kep_v1",
-  "cao_4_goc_mm": [front-left, front-right, back-right, back-left], "e_mm": caliper error,
-  "goc_dan": {"a_mm", "b_mm", "L_mm", "canh"}, (a, b: black square edge to plate edge at the two ends of one edge, L
-  the distance between the two points), "goc_dan_deg": signed angle in the convention of tag_offset dpsi (needed only
-  when bo_cham.tag_offset has dpsi != 0; |goc_dan_deg| must equal atan(|a - b| / L)),
-  "tam_than_deg": plate-body angle from the drawing (0 only with "tam_than_gioi_han" written), "nguon": ...}
+thuoc_kep.json (CODE_C8B from the numbers Liam sends; guide C2.4 and B1 extended to four edges):
+  {"version": "c8b_thuoc_kep_v2", "cao_4_goc_mm": [front-left, front-right, back-right, back-left] (on the car, after
+  the last re-seating), "e_mm": caliper error, "s_mm": side of the black square (distance between the two points of an
+  edge), "canh": {"truoc": [a, b], "phai": [a, b], "sau": [a, b], "trai": [a, b]} (black edge to plate edge at the two
+  corners of that edge; a at the FRONT corner for phai / trai, at the LEFT corner for truoc / sau),
+  "tam_than_deg": plate-body angle from the drawing (0 only with "tam_than_gioi_han" written), "nguon", "ghi_chu"}
 xoay.json: from c8b_xoay.py (c8b_xoay_v1; q_tag_m, du_m).
   do_cao.rho_max_m = the largest horizontal distance of the car tag centre from the plumb point over the image area
   used; do_cao.H_m, h_m = the zc and tag height of the scoring session (day_doi.kappa = its kappa, must equal h / H).
@@ -105,8 +111,10 @@ VERSION = 'c8b_khoa_v3'     # v3 = parts by page v10 (P1-P7, A1-A5); a v1, v2 lo
 CAM_VERSION = 'c8_cam_u_vao_v2'
 CAM_KEYS = {'version', 'P1', 'moc_dich', 'P3', 'A2', 'than_dich', 'P7', 'A3', 'A5', 'day_doi', 'do_cao', 'bo_cham',
             'nguon', 'ghi_chu'}
-TK_VERSION = 'c8b_thuoc_kep_v1'
+TK_VERSION = 'c8b_thuoc_kep_v2'      # v2: four edges (C8BU-R1-6, Liam 18/11 "Thuoc kep 4 canh")
 XOAY_VERSION = 'c8b_xoay_v1'
+XOAY_KEYS = {'version', 'q_tag_m', 'du_m', 'spread_m', 'se3_m', 'n_doan', 'n_uoc', 'cho', 'troi_lon', 'quy_uoc',
+             'gioi_han', 'written_at', 'script'}
 P_PARTS = ('P1_anh_san', 'P2_lech_tam', 'P3_nhac_tam', 'P4_quay', 'P5_day_doi_zc', 'P6_do_cao', 'P7_nhieu_khung')
 A_PARTS = ('A1_goc_dan', 'A2_nhac_tam', 'A3_huong_vung', 'A4_quay', 'A5_nhieu_khung', 'A6_nghieng_ma')
 LE = 1.25
@@ -155,25 +163,52 @@ def _tag_offset(cam):
     return tuple(_fin(x, f'bo_cham.tag_offset[{i}]') for i, x in enumerate(off))
 
 
+EDGE_SIGN = {'truoc': 1, 'phai': 1, 'sau': -1, 'trai': -1}
+EDGE_MAX_RAD = 0.05        # each edge angle within about 2.9 deg: the small-angle mean below holds [DE XUAT]
+TK_KEYS = {'version', 'cao_4_goc_mm', 'e_mm', 's_mm', 'canh', 'tam_than_deg', 'tam_than_gioi_han', 'nguon', 'ghi_chu'}
+
+
 def _caliper(tk):
+    """Caliper file c8b_thuoc_kep_v2 (Liam 18/11 at CODE_C8B: four edges, C8BU-R1-6). canh: for each edge of the black
+    square (truoc, phai, sau, trai of the car), [a, b] mm = black edge to plate edge at the two corners of that edge,
+    a at the FRONT corner for phai / trai and at the LEFT corner for truoc / sau; s_mm = the distance between the two
+    corners (the side of the black square). Edge angle (tag minus plate, counter-clockwise +): +atan((a - b) / s) for
+    truoc, phai, -atan((a - b) / s) for sau, trai. For small distortions the Kabsch angle of the four corners is the
+    mean of the four edge angles (sum of a_i x d_i over 8 h^2, each edge contributing 2 h^2 theta_edge), so a sheared
+    or bent print, which one edge alone does not show, is taken in."""
     if not isinstance(tk, dict) or tk.get('version') != TK_VERSION:
         raise UError(f'caliper input: version is not {TK_VERSION}')
+    extra = sorted(set(tk) - TK_KEYS)
+    if extra:
+        raise UError(f'caliper input: unknown top-level fields {extra}')
     c = tk.get('cao_4_goc_mm')
     if not isinstance(c, list) or len(c) != 4:
         raise UError('caliper input: cao_4_goc_mm needs the four corner heights')
     c = np.array([_num(x, f'cao_4_goc_mm[{i}]') for i, x in enumerate(c)]) * 1e-3
     e = _num(tk.get('e_mm'), 'caliper e_mm') * 1e-3
-    g = tk.get('goc_dan')
-    if not isinstance(g, dict):
-        raise UError('caliper input: no goc_dan')
-    a, b = _num(g.get('a_mm'), 'goc_dan.a_mm'), _num(g.get('b_mm'), 'goc_dan.b_mm')
-    L = _num(g.get('L_mm'), 'goc_dan.L_mm')
-    if not L > 0:
-        raise UError('goc_dan.L_mm must be > 0')
+    s = _num(tk.get('s_mm'), 'caliper s_mm') * 1e-3
+    if not s > 0:
+        raise UError('caliper s_mm must be > 0')
+    canh = tk.get('canh')
+    if not isinstance(canh, dict) or set(canh) != set(EDGE_SIGN):
+        raise UError(f'caliper canh: the four edges {sorted(EDGE_SIGN)} needed (one edge does not show a distorted '
+                     f'print, C8BU-R1-6)')
+    goc = {}
+    for k, sg in EDGE_SIGN.items():
+        v = canh[k]
+        if not isinstance(v, list) or len(v) != 2:
+            raise UError(f'caliper canh.{k}: [a_mm, b_mm]')
+        a, b = (_num(x, f'caliper canh.{k}') * 1e-3 for x in v)
+        goc[k] = sg * math.atan((a - b) / s)
+        if abs(goc[k]) > EDGE_MAX_RAD:
+            raise UError(f'caliper canh.{k}: edge angle {math.degrees(goc[k]):.2f} deg beyond '
+                         f'{math.degrees(EDGE_MAX_RAD):.1f} deg (small-angle mean not valid; check the numbers)')
+    theta = sum(goc.values()) / 4
+    xap_xi = max(v * v for v in goc.values())     # second-order rest of the small-angle mean (<= 2.5e-3 rad in domain)
     tt = _num(tk.get('tam_than_deg'), 'caliper tam_than_deg')
     if tt == 0 and not str(tk.get('tam_than_gioi_han') or '').strip():
         raise UError('tam_than_deg 0 needs tam_than_gioi_han (the limit written: plate-body error not bounded)')
-    return c, e, a * 1e-3, b * 1e-3, L * 1e-3, tt
+    return c, e, s, theta, tt, {k: math.degrees(v) for k, v in goc.items()}, xap_xi
 
 
 CAM_NUMS = ('P1.bo_nhom_max_m', 'P1.tung_khung_max_m', 'moc_dich.nguong_m', 'moc_dich.u_so_m', 'P3.vi_tri_max_m',
@@ -191,6 +226,9 @@ def check_cam(cam):
         raise UError(f'camera input: unknown top-level fields {extra} (nothing is dropped silently)')
     v = {p: _num(_get(cam, p), p) for p in CAM_NUMS}
     _tag_offset(cam)
+    if _get(cam, 'A3').get('quy_ve_ma_noc') is not True:
+        raise UError('A3.quy_ve_ma_noc must be true: A3.max_deg bounds the Kabsch heading of the car tag (96.4 mm), '
+                     'carried from the mark pairs through the camera model (page v10 A3, C8BU-R1-4), not a pair angle')
     if not v['bo_cham.side_m'] > 0:
         raise UError('bo_cham.side_m must be > 0')
     H, h = v['do_cao.H_m'], v['do_cao.h_m']
@@ -208,68 +246,62 @@ def u_p_u_psi(cam, tb, tk, xo):
     check_cam(cam)
     if not isinstance(xo, dict) or xo.get('version') != XOAY_VERSION:
         raise UError(f'turning-in-place input: version is not {XOAY_VERSION}')
-    if not tb.get('ga_ok'):
-        raise UError('test 3b: ga_ok false (set-up not within 2 mm at the slowest part): redo 3b, numbers not used')
+    extra = sorted(set(xo) - XOAY_KEYS)
+    if extra:
+        raise UError(f'turning-in-place input: unknown top-level fields {extra}')
+    if tb.get('ga_ok') is not True:                     # C8BU-R1-9: a real boolean, not a truthy string
+        raise UError('test 3b: ga_ok not true (set-up not within 2 mm at the slowest part): redo 3b, numbers not used')
     dpq = _num(tb.get('d_p_quay_m'), '3b d_p_quay_m')
     dsq = _num(tb.get('d_psi_quay_deg'), '3b d_psi_quay_deg')
     H, h = _num(_get(cam, 'do_cao.H_m'), 'do_cao.H_m'), _num(_get(cam, 'do_cao.h_m'), 'do_cao.h_m')
-    if not H > h:
-        raise UError(f'do_cao: camera height {H} m not above the tag height {h} m')
     rho = _num(_get(cam, 'do_cao.rho_max_m'), 'do_cao.rho_max_m')
     side = _num(_get(cam, 'bo_cham.side_m'), 'bo_cham.side_m')
-    if not side > 0:
-        raise UError('bo_cham.side_m must be > 0')
-    c4, e, ga, gb, gL, tam_than = _caliper(tk)
+    dzc = _num(_get(cam, 'day_doi.dzc_m'), 'day_doi.dzc_m')
+    c4, e, s_cal, theta, tam_than, goc_canh, xap_xi = _caliper(tk)
+    Hl = H - dzc                                            # lowest camera height allowed by the zc bound (R1-8)
     dh = float(np.max(np.abs(c4 - h))) + e                  # corner heights against the h the scorer uses
-    if not H - h - dh > 0 or not H - c4.max() - e > 0:
+    if not Hl - h - dh > 0 or not Hl - c4.max() - e > 0:
         raise UError('caliper heights: not below the camera')
-    cao = (rho + side / math.sqrt(2)) * dh / (H - h - dh)
+    cao = (rho + side / math.sqrt(2)) * dh / (Hl - h - dh)
     # A6: one h for the four corners; corner i at c_i moves by (P_i - C)(c_i - h)/(H - c_i); the small-angle Kabsch
-    # turn is (sum_i delta_i a_i) x (T - C) / (2 s^2), |.| <= rho s / sqrt 2 sum |delta_i - mean delta| / (2 s^2)
-    nghieng = rho * (float(np.sum(np.abs(c4 - c4.mean()))) + 8 * e) / (2 * math.sqrt(2) * side * (H - c4.max() - e))
+    # turn is (sum_i delta_i a_i) x (T - C) / (2 s^2), |.| <= rho s / sqrt 2 sum |delta_i - mean delta| / (2 s^2).
+    # Domain of the small-angle form enforced (C8BU-R1-8): corners within 2 mm in all, rho within 3 m
+    spread_c = float(np.sum(np.abs(c4 - c4.mean())))
+    if spread_c > 0.002 + 1e-12 or rho > 3.0:
+        raise UError(f'tag tilt: sum |c_i - mean| {spread_c * 1e3:.2f} mm (<= 2) or rho {rho} m (<= 3) outside the '
+                     f'domain of the A6 bound')
+    nghieng = rho * (spread_c + 8 * e) / (2 * math.sqrt(2) * side * (Hl - c4.max() - e))
     # plumb point and zc reused from 16/11 (Liam 17/11): car_pose corrects P = p + kappa (C - p), kappa = h / H with
     # the H, C of the session; truth P* = p + kappa* (C* - p), |C* - p| = rho* H* / (H* - h) (central projection from
     # the true centre), so |P - P*| <= (h / H) dn + h dzc rho* / (H (H* - h)), H* >= H - dzc, rho* <= rho + dn
     # (C8BS-R7-1..3: dn, dzc bound the absolute error of the camera centre position and height, not a check threshold)
     dn = _num(_get(cam, 'day_doi.dn_m'), 'day_doi.dn_m')
-    dzc = _num(_get(cam, 'day_doi.dzc_m'), 'day_doi.dzc_m')
-    if not H - dzc > h:
-        raise UError(f'day_doi.dzc_m {dzc} m: camera height {H} m minus it not above the tag height {h} m')
-    kap = _num(_get(cam, 'day_doi.kappa'), 'day_doi.kappa')
-    if abs(kap - h / H) > 1e-6 * (h / H):                # C8BS-R7-3: H, h here are the ones of the scoring session
-        raise UError(f'day_doi.kappa {kap} is not do_cao.h_m / do_cao.H_m = {h / H} (the kappa of the scoring)')
     day_doi = h / H * dn + h * dzc * (rho + dn) / (H * (H - dzc - h))
     def f(path):
         return _num(_get(cam, path), path)
     dx, dy, dpsi = _tag_offset(cam)
-    # A1: angle of the tag to the plate by caliper, against the dpsi the scorer uses
-    g = math.atan(abs(ga - gb) / gL)
-    if dpsi == 0.0:
-        mis = g
-    else:
-        gs = math.radians(_fin(tk.get('goc_dan_deg'), 'caliper goc_dan_deg (needed when dpsi != 0)'))
-        if abs(abs(gs) - g) > 1e-6:
-            raise UError('bo_cham.tag_offset has dpsi != 0: caliper goc_dan_deg (signed, same convention) needed, '
-                         f'its size equal to atan(|a - b| / L) = {math.degrees(g):.4f} deg')
-        mis = abs(dpsi - gs)
-    a1 = math.degrees(mis + math.atan(2 * e / gL)) + tam_than
-    # P2: q (tag minus turning centre, tag frame) from c8b_xoay; the scorer moves the tag by R(psi_body)(dx, dy), the
-    # true body offset is R(dpsi_true) q
+    # A1: Kabsch angle of the tag to the plate from the four edges (caliper), against the dpsi the scorer uses
+    a1 = math.degrees(abs(dpsi - theta) + math.atan(2 * e / s_cal) + xap_xi) + tam_than
+    s = dict(A1_goc_dan=a1, A2_nhac_tam=f('A2.goc_max_deg'), A3_huong_vung=f('A3.max_deg'), A4_quay=dsq,
+             A5_nhieu_khung=f('A5.lech_max_deg'), A6_nghieng_ma=math.degrees(nghieng))
+    # P2: q (tag minus turning centre, tag frame) from c8b_xoay. The scorer takes the body centre as tag -
+    # R(psi_body_measured) o_u, o_u = (dx, dy); truth: tag - R(psi_body) o, o = R(dpsi_true) q_true. So the error is
+    # <= |o - o_u| + |o_u| |psi_body error| <= |o_u - R(dpsi_u) q| + du + (|q| + du) A1 + |o_u| (A1 + ... + A6)
+    # (C8BU-R1-3: the heading error turns the correction vector)
     q = xo.get('q_tag_m')
     if not isinstance(q, list) or len(q) != 2:
         raise UError('turning-in-place input: q_tag_m [x, y] needed')
     qx, qy = (_fin(v, 'xoay q_tag_m') for v in q)
     du = _num(xo.get('du_m'), 'xoay du_m')
     cd, sd = math.cos(dpsi), math.sin(dpsi)
-    lech = math.hypot(dx - (cd * qx - sd * qy), dy - (sd * qx + cd * qy)) + du + math.hypot(qx, qy) * math.radians(a1)
+    lech = (math.hypot(dx - (cd * qx - sd * qy), dy - (sd * qx + cd * qy)) + du
+            + (math.hypot(qx, qy) + du) * math.radians(a1) + math.hypot(dx, dy) * math.radians(sum(s.values())))
     # a mark is dropped when |observed shift| > nguong + u_so; not dropped only says |true shift| <= nguong + 2 u_so
     # (the comparison error may pull the observed shift down by u_so; CODE_KIEMCHEO 18/11, Codex KC1-3)
     moc = f('moc_dich.nguong_m') + 2 * f('moc_dich.u_so_m')
     p = dict(P1_anh_san=max(f('P1.bo_nhom_max_m'), f('P1.tung_khung_max_m')) + moc,
              P2_lech_tam=lech, P3_nhac_tam=f('P3.vi_tri_max_m'), P4_quay=dpq, P5_day_doi_zc=day_doi,
              P6_do_cao=cao, P7_nhieu_khung=f('P7.lech_max_m'))
-    s = dict(A1_goc_dan=a1, A2_nhac_tam=f('A2.goc_max_deg'), A3_huong_vung=f('A3.max_deg'), A4_quay=dsq,
-             A5_nhieu_khung=f('A5.lech_max_deg'), A6_nghieng_ma=math.degrees(nghieng))
     assert tuple(p) == P_PARTS and tuple(s) == A_PARTS
     return LE * sum(p.values()), p, LE * sum(s.values()), s
 
@@ -295,6 +327,7 @@ def khoa(gios, tb, cam, tk, xo, u_imu=None, phep5=None, tb_name='', tb_sha=''):
     if not rates:
         raise UError('no C8 run with a drift rate (every run short or not ok)')
     U_p, p_parts, U_psi, s_parts = u_p_u_psi(cam, tb, tk, xo)
+    _, _, _, theta, _, goc_canh, _ = _caliper(tk)
     sh = (tb.get('B') or {}).get('shutter') or {}
     man_trap = None
     if sh.get('use_alpha'):
@@ -305,7 +338,7 @@ def khoa(gios, tb, cam, tk, xo, u_imu=None, phep5=None, tb_name='', tb_sha=''):
     out = dict(version=VERSION, le=LE, troi_ppm=LE * max(rates) * 1e6, troi_rate_luot=sorted(rates),
                dai=dai, man_trap=man_trap, man_trap_kieu='alpha' if man_trap else 'mot_khung',
                mot_khung_s=sh.get('mot_khung_s'), U_p_m=U_p, U_p_phan_m=p_parts, U_psi_deg=U_psi,
-               U_psi_phan_deg=s_parts)
+               U_psi_phan_deg=s_parts, thuoc_kep=dict(goc_canh_deg=goc_canh, goc_kabsch_deg=math.degrees(theta)))
     if u_imu is not None:
         if u_imu.get('version') != 'u_imu_dong_v2':
             raise UError('u_imu file: version is not u_imu_dong_v2')
@@ -456,6 +489,7 @@ def cong(k, plan, luot, levels, branch, c8_dir, cam=None, written_by=None, meta=
     import gate_c8
     import o1_gate
     from o1_tasks import FIG8
+    check_khoa(k)                                       # C8BU-R1-7: also when called from code, not only from the CLI
     if branch not in BRANCHES:
         raise UError(f'u_t_branch {branch!r}: {BRANCHES}')
     if not levels or len(set(levels)) != len(levels) or any(lv not in FIG8 for lv in levels):
@@ -543,6 +577,14 @@ def check_khoa(k, name='khoa'):
     if k.get('version') != VERSION or set(k.get('U_p_phan_m') or {}) != set(P_PARTS) \
             or set(k.get('U_psi_phan_deg') or {}) != set(A_PARTS):
         raise UError(f'{name}: not a {VERSION} file with the parts P1-P7, A1-A6')
+    # C8BU-R1-7: every part a finite number >= 0, the margin LE, each total equal to LE x the sum of its parts
+    if k.get('le') != LE:
+        raise UError(f'{name}: le {k.get("le")!r} is not {LE}')
+    for tot, parts in (('U_p_m', 'U_p_phan_m'), ('U_psi_deg', 'U_psi_phan_deg')):
+        vals = [_num(v, f'{name} {parts}.{x}') for x, v in k[parts].items()]
+        t = _num(k.get(tot), f'{name} {tot}')
+        if not math.isclose(t, LE * sum(vals), rel_tol=1e-9, abs_tol=1e-15):
+            raise UError(f'{name}: {tot} {t} is not {LE} x the sum of {parts} ({LE * sum(vals)})')
 
 
 def main(argv=None):

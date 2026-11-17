@@ -22,9 +22,13 @@ Model (one turning interval = one place, one direction, at least one full turn):
 
 Outputs (c8b_xoay_v1):
   q_tag_m      mean of q over the intervals (at least 2 places, each with both directions)
-  du_m         = spread (largest |q_k - q_mean|, covers origin / far place and the two directions)
-                 + 3 x the largest standard error of q_k (least squares, white-noise convention; the spread is the
-                 main term)
+  du_m         = spread + 3 x the largest standard error (least squares, white-noise convention, a minor term).
+                 spread = largest |q_est - q_mean| over EVERY estimate: per interval with a linear drift, per
+                 interval with a quadratic drift, and per whole turn with a linear drift (C8BU-R1-2: a curved creep
+                 biases q the same way in both directions, so the spread of the linear fits alone does not show it;
+                 within one turn the creep is close to linear). It covers origin / far place and the two directions.
+                 A creep that is neither close to quadratic over an interval nor close to linear over one turn is a
+                 stated limit (the drift flag shows a large creep).
   per interval: t0, t1, direction, turns, frames, q, se, drift v and |v| x duration, residual RMS / max
   imu (optional, --log PLACE=log.csv): camera heading minus IMU yaw (c8_u_imu.rv_samples) after a clock offset
   found by cross-correlating the turn rates, then a + b (psi_imu - psi_imu(t0)) removed per interval (IMU offset and
@@ -130,31 +134,49 @@ def intervals(F, w_min=W_MIN, gap_s=GAP_S, min_turn=MIN_TURN):
     return out, short
 
 
-def fit_interval(F, i0, i1):
+def fit_interval(F, i0, i1, deg=1):
+    """tag = sum_k c_k tau^k (k <= deg: the centre and its drift, polynomial in time) + R(psi) q; least squares."""
     t, x, y, psi = (F[k][i0:i1 + 1] for k in ('t', 'x', 'y', 'psi'))
     n = len(t)
     tau = t - t.mean()
     c, s = np.cos(psi), np.sin(psi)
-    A = np.zeros((2 * n, 6))
-    A[0::2, 0], A[0::2, 2], A[0::2, 4], A[0::2, 5] = 1, tau, c, -s
-    A[1::2, 1], A[1::2, 3], A[1::2, 4], A[1::2, 5] = 1, tau, s, c
+    m = 2 * (deg + 1)
+    A = np.zeros((2 * n, m + 2))
+    for k in range(deg + 1):
+        A[0::2, 2 * k], A[1::2, 2 * k + 1] = tau ** k, tau ** k
+    A[0::2, m], A[0::2, m + 1] = c, -s
+    A[1::2, m], A[1::2, m + 1] = s, c
     b = np.empty(2 * n)
     b[0::2], b[1::2] = x, y
     sol, *_ = np.linalg.lstsq(A, b, rcond=None)
     r = b - A @ sol
-    dof = 2 * n - 6
+    dof = 2 * n - (m + 2)
     if dof <= 0:
         raise XError('too few frames in a turning interval')
     s2 = float(r @ r) / dof
-    cov = s2 * np.linalg.inv(A.T @ A)
-    se = math.sqrt(max(np.linalg.eigvalsh(cov[4:, 4:])))
+    cov = s2 * np.linalg.pinv(A.T @ A)
+    se = math.sqrt(max(np.linalg.eigvalsh(cov[m:, m:])))
     rr = np.hypot(r[0::2], r[1::2])
     dur = float(t[-1] - t[0])
-    v = sol[2:4]
+    v = sol[2:4] if deg >= 1 else np.zeros(2)
+    centre = sum(np.outer(tau ** k, sol[2 * k:2 * k + 2]) for k in range(deg + 1))   # fitted centre path
     return dict(t0=float(t[0]), t1=float(t[-1]), n=int(n), vong=float(abs(psi[-1] - psi[0]) / (2 * math.pi)),
-                c0_m=[float(sol[0]), float(sol[1])], v_m_s=[float(v[0]), float(v[1])],
-                troi_m=float(np.hypot(*v) * dur), q_m=[float(sol[4]), float(sol[5])], se_m=se,
-                res_rms_m=float(np.sqrt(np.mean(rr ** 2))), res_max_m=float(rr.max()))
+                bac=deg, c0_m=[float(sol[0]), float(sol[1])], v_m_s=[float(v[0]), float(v[1])],
+                troi_m=float(np.max(np.hypot(*(centre - centre[0]).T))), q_m=[float(sol[m]), float(sol[m + 1])],
+                se_m=se, res_rms_m=float(np.sqrt(np.mean(rr ** 2))), res_max_m=float(rr.max()))
+
+
+def revolutions(F, i0, i1):
+    """Index windows of each whole turn inside an interval (heading change 2 pi from the window start)."""
+    psi = F['psi']
+    out, a = [], i0
+    while True:
+        k = np.nonzero(np.abs(psi[a:i1 + 1] - psi[a]) >= 2 * math.pi)[0]
+        if k.size == 0:
+            return out
+        b = a + int(k[0])
+        out.append((a, b))
+        a = b
 
 
 def imu_check(F, L, segs):
@@ -214,7 +236,7 @@ def analyse(places, logs=None):
     """places: {name: frames path}; logs: {name: log path}. Returns the c8b_xoay_v1 dict."""
     if len(places) < 2:
         raise XError('need at least two places (origin and a far place, page v10 P2)')
-    res, qs, ses = {}, [], []
+    res, qs, ses, alts = {}, [], [], []
     for name, path in places.items():
         F = read_frames(path)
         segs, short = intervals(F)
@@ -225,20 +247,26 @@ def analyse(places, logs=None):
         doan = []
         for (i0, i1, sg) in segs:
             d = dict(fit_interval(F, i0, i1), chieu=sg)
-            d['troi_lon'] = d['troi_m'] > DRIFT_WARN_M
+            d2 = fit_interval(F, i0, i1, deg=2)                 # C8BU-R1-2: a curved drift is not linear
+            vong = [fit_interval(F, a, b) for (a, b) in revolutions(F, i0, i1)]   # drift ~linear within one turn
+            d['bac2'] = dict(q_m=d2['q_m'], se_m=d2['se_m'], troi_m=d2['troi_m'])
+            d['tung_vong'] = [dict(t0=v['t0'], t1=v['t1'], q_m=v['q_m'], se_m=v['se_m']) for v in vong]
+            d['troi_lon'] = max(d['troi_m'], d2['troi_m']) > DRIFT_WARN_M
             doan.append(d)
             qs.append(d['q_m'])
-            ses.append(d['se_m'])
+            alts.extend([d2['q_m']] + [v['q_m'] for v in vong])
+            ses.extend([d['se_m'], d2['se_m']] + [v['se_m'] for v in vong])
         entry = dict(file=os.path.basename(path), sha256=cu.sha256(path), doan=doan, ngan=short)
         if logs and name in logs:
             entry['imu'] = imu_check(F, cu.load_log(logs[name]), segs)
         res[name] = entry
     Q = np.array(qs)
     qm = Q.mean(axis=0)
-    spread = float(np.max(np.hypot(*(Q - qm).T)))
+    E = np.array(qs + alts)                                  # every estimate: linear, quadratic drift, each turn
+    spread = float(np.max(np.hypot(*(E - qm).T)))
     se3 = 3.0 * float(max(ses))
     return dict(version=VERSION, q_tag_m=[float(qm[0]), float(qm[1])], du_m=spread + se3, spread_m=spread,
-                se3_m=se3, n_doan=len(qs), cho=res,
+                se3_m=se3, n_doan=len(qs), n_uoc=len(E), cho=res,
                 troi_lon=[f'{n}:{d["t0"]:.2f}' for n, e in res.items() for d in e['doan'] if d['troi_lon']],
                 quy_uoc=dict(w_min=W_MIN, smooth_s=SMOOTH_S, gap_s=GAP_S, drift_warn_m=DRIFT_WARN_M),
                 gioi_han=['turning centre = centre of the four wheels and of the IMU unless the wheels slip; a slip '
