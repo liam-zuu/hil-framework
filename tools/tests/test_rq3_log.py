@@ -255,7 +255,7 @@ def test_gate_result_rule_of_4_7(outs, gate, want):
 def test_finals_gate_replacement_and_final_hil_join(ds):
     d, clock = ds
     rl.migrate(d)
-    rl.freeze(d, 'A-PID', 'khoi_xac_nhan_dat', 'A-PID/G7', gain_file(d))
+    rl.freeze(d, 'A-PID', 'het_ung_vien', 'A-PID/G7', gain_file(d))   # C9D-4: no confirm block here
     lost = car_run(d, clock, 'A-PID', 'final', 'hong_he_do', session='F')['run_uid']
     car_run(d, clock, 'A-PID', 'final', 'dat', session='F', replaces_run_uid=lost)
     for _ in range(4):

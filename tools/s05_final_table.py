@@ -465,12 +465,22 @@ def load_runs(dataset, score_name, esp32_name, query_before_name='gain_query_bef
     try:
         rl.check_gate_rows(rows)
         rl.check_map_rows(rows)
+        miss = rl.so_h_missing(rows, dataset, stages=('final',))
+        if miss:          # C9D-2 (Liam 17/11 at CODE_C13 "Sửa cả 7 + vòng 2 (Recommended)"): no table before so-h
+            raise rl.LogError('luot xe kiem cuoi da phan chua so clip H (lenh rq3_log so-h, ca luot duoi nguong): '
+                              + ', '.join(r.get('run_uid', '') for r in miss) + ' (C9D-2)')
+        rows = rl.apply_so_h(rows, dataset)                  # S05 v3.37 4.3: outcomes after the clip H comparison
+        rl._final_stops(rows)      # C9D2-3: a run after a known N = 3 stop (4.6) stops the table as the summary
     except rl.LogError as e:
         raise ValueError(f'm7_tuning_log.csv: {e}')
     files = gain_files(dataset, init_gain)                                              # R134C6-1
     runs, bad = [], []
     for r in rows:
         plat = next((p for p in PLATFORMS if r.get('platform') == p[0] and r.get('stage') == p[2]), None)
+        if plat is not None and r.get(rl.RETRO_FLAG):         # S05 v3.38 4.3 (B8S2-2): not in the final table
+            problems.append(f"run {r.get('run_uid')}: thu sau diem dung N = 3 lo ra khi so clip H "
+                            f'({rl.RETRO_FLAG}), khong vao bang (S05 v3.38 4.3)')
+            continue
         if plat is None:
             continue
         ctrl, task = r.get('controller', ''), r.get('trajectory', '')
@@ -488,7 +498,8 @@ def load_runs(dataset, score_name, esp32_name, query_before_name='gain_query_bef
                    outcome=r.get('run_outcome'), results_dir=r.get('results_dir', ''),
                    cat_t1=r.get('g1_cat_t1') == 'true',      # R134C4-6: O1 3.5 R2V-4, counted per cell
                    gain_set_id=r.get('gain_set_id', ''), gain_file=(gf or {}).get('file', ''),
-                   gain_sha256=(gf or {}).get('sha256', ''), gain_source=(gf or {}).get('source', ''))
+                   gain_sha256=(gf or {}).get('sha256', ''), gain_source=(gf or {}).get('source', ''),
+                   so_h_flags=r.get('so_h_flags', ''))                 # S05 v3.37 4.3, O1 4 clip H
         if run['outcome'] in VALID:
             d = run['results_dir']
             score, tv = {}, dict(reason='')
@@ -525,6 +536,29 @@ def load_runs(dataset, score_name, esp32_name, query_before_name='gain_query_bef
     return runs, problems
 
 
+# R134C10-1 (Codex R134 round 10, P3 DEFERRED; CODE 16/11 to CODE_C13, Liam 16/11 at CODE "Sửa demo + gộp R134(1)
+# (Recommended)"): log_seq is uint32 (AGV 16702ff logger.c) and wraps to 0 after 4294967295 (about 497 days at 100 Hz
+# without a restart). A '#gain' line with first_seq = 0 is taken for the line of a gain setting with the motor off
+# (R134C9-1); after a wrap it may be the start of a stretch whose '#us,ev=start' and data lines were lost. A file that
+# shows the wrap near (a data line, a '#run_end' seq / last_data_seq, or a '#gain' / '#us,ev=start' first_seq (C9D-7)
+# within SEQ_WRAP_MARGIN of 2^32, or log_seq
+# going down between data lines) and has such a line not anchored by a '#us,ev=start' with first_seq = 0 is refused.
+SEQ_MAX = 2 ** 32 - 1
+SEQ_WRAP_MARGIN = 2 ** 16          # [DE XUAT] 65536 lines, about 11 min at 100 Hz
+
+
+def seq_wrap_evidence(data_seqs, end_seqs):
+    """None, or why the log shows log_seq near its wrap (R134C10-1); None entries are skipped."""
+    near = [s for s in list(data_seqs) + list(end_seqs) if s is not None and s > SEQ_MAX - SEQ_WRAP_MARGIN]
+    if near:
+        return f'log_seq {max(near)} gan {SEQ_MAX} (bo dem 32 bit sap quay vong)'
+    d = [s for s in data_seqs if s is not None]
+    down = next((i for i in range(1, len(d)) if d[i] < d[i - 1]), None)
+    if down is not None:
+        return f'log_seq giam tu {d[down - 1]} xuong {d[down]} giua hai dong du lieu (bo dem quay vong?)'
+    return None
+
+
 def run_gain_problem(esp32_path, want):
     """R134C6-1, R134C7-1 (Codex rounds 6, 7; Liam 15/11 CODE_R134 hop chon "Kiem gain moi doan (Recommended)"):
     None, or why the run does not show the set of the gain file `want` in EVERY motor-on stretch of its ESP32 log:
@@ -553,17 +587,30 @@ def run_gain_problem(esp32_path, want):
         on = [x.get('motor_on') == '1' for x in rows]
         if not any(on) or on[0]:
             return 'khong xac dinh duoc dong du lieu dau luot (motor_on) de khop #gain voi file gain'
-        seqs = set()
+        seqs, zero_gain, end_seqs = set(), False, []
         for line in events:
             _, text = glc.split_event(line)
             if text.startswith('#gain,'):
                 fs = glc._int(glc.parse_gain_line(text)['first_seq'])
                 if fs != 0:       # R134C9-1: first_seq = 0 is the line of a gain setting (S05 6.3: not counted)
                     seqs.add(fs)
+                else:
+                    zero_gain = True
+                end_seqs.append(fs)       # C9D-7: a first_seq near 2^32 shows the wrap too
             elif text.startswith('#us,') and glc._fields(text).get('ev') == 'start':
-                seqs.add(glc._int(glc._fields(text).get('first_seq')))
+                fs = glc._int(glc._fields(text).get('first_seq'))
+                seqs.add(fs)
+                end_seqs.append(fs)       # C9D-7
+            elif text.startswith('#run_end,'):
+                f = glc._fields(text)
+                end_seqs += [glc._int(f.get('seq')), glc._int(f.get('last_data_seq'))]
         if None in seqs:
             return 'dong #gain hay #us,ev=start co first_seq khong phai so'
+        if zero_gain and 0 not in seqs:                                                  # R134C10-1
+            why = seq_wrap_evidence([_int(x.get('log_seq')) for x in rows], end_seqs)
+            if why:
+                return (f'{why}: dong #gain first_seq=0 khong tach duoc dong dat gain (motor tat) voi moc bat dau that '
+                        'sau khi log_seq quay vong ve 0 (khong co #us,ev=start first_seq=0 gan moc; R134C10-1)')
         for seq in sorted(seqs):                                                         # (1)
             st = glc.run_start(events, seq)
             where = f'moc bat dau first_seq={seq} ({len(seqs)} moc trong events)'
@@ -705,7 +752,7 @@ def write_table(runs, out_dir):
         f.write(markdown(table))
     rcols = ['run_uid', 'platform', 'controller', 'condition', 'gain_set', 'outcome', 'flag'] + list(QUANTITIES) + \
             ['tv_reason', 'tv_d_tick', 'tv_d_seq', 'tv_end_gap_ms', 'tv_rows_dropped', 't_end_err_ms', 't_end_err_src',
-             'results_dir', 'gain_set_id', 'gain_file', 'gain_sha256']
+             'results_dir', 'gain_set_id', 'gain_file', 'gain_sha256', 'so_h_flags']
     with open(os.path.join(out_dir, 'S05_final_runs.csv'), 'w', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=rcols)
         w.writeheader()
@@ -720,7 +767,8 @@ def write_table(runs, out_dir):
                             t_end_err_ms='' if r.get('t_end_err_ms') is None else r['t_end_err_ms'],
                             t_end_err_src=r.get('t_end_err_src', ''),
                             results_dir=r['results_dir'], gain_set_id=r.get('gain_set_id', ''),
-                            gain_file=r.get('gain_file', ''), gain_sha256=r.get('gain_sha256', '')))
+                            gain_file=r.get('gain_file', ''), gain_sha256=r.get('gain_sha256', ''),
+                            so_h_flags=r.get('so_h_flags', '')))
     used = sorted({(r.get('gain_set_id', '').split('/')[0] if r.get('gain_source') == '--init-gain'
                     else r.get('gain_set_id', ''), r.get('gain_file', ''), r.get('gain_sha256', ''),
                     r.get('gain_source', '')) for r in runs if r.get('gain_file')})
