@@ -369,7 +369,7 @@ def sc(outcome, frames='f0', esp='e' * 64, t0=1000, off=0.25, hs='h' * 64, ks=(0
 
 def tr(session='s0', video='r' * 64, frames='f0', off=(0.0, 0.0, 0.0), n=640, shape=((1080, 1920),)):
     return dict(session_sha256=session, video_sha256=video, frames_sha256=frames, tag_offset=list(off), frames=n,
-                decoded_shapes=[list(s) for s in shape], gates=dict(min_marks=8, rms_extra_px=0.5))
+                decoded_shapes=[list(s) for s in shape], gates=dict(cm.DEFAULT_GATES, status='x'))
 
 
 TASKS = ['O1-F02', 'O1-F05', 'O1-K1']
@@ -450,7 +450,8 @@ def test_bad_drift_files_refused(bad, two):
                                   'frames_bool', 'shape_zero', 'offset_not_drift_both',
                                   'threshold_one_null_both', 'threshold_text_both', 'threshold_bool_both',
                                   'threshold_negative_both', 'threshold_numeric_text_both', 'status_number_both',
-                                  'only_status_both', 'sender', 'events', 'gates'])
+                                  'only_status_both', 'sender', 'events', 'gates', 'gates_null_both',
+                                  'gates_empty_both', 'gates_bad_both'])
 def test_provenance_and_scoring_set_up_checked(case):
     a, ta, fa = sc('dat'), tr('s0'), 'f0'
     b, tb, fb = sc('dat', frames='f1'), tr('s1', frames='f1'), 'f1'
@@ -541,7 +542,11 @@ def test_provenance_and_scoring_set_up_checked(case):
     elif case == 'events':                                   # CC1-3: another events file
         b = dict(b, events_sha256='v' * 64)
     elif case == 'gates':                                    # CC1-4: another frame gate in the H1 track
-        tb = dict(tb, gates=dict(min_marks=6, rms_extra_px=0.5))
+        tb = dict(tb, gates=dict(cm.DEFAULT_GATES, min_marks=cm.DEFAULT_GATES['min_marks'] + 1))
+    elif case in ('gates_null_both', 'gates_empty_both', 'gates_bad_both'):   # Codex CC2-2: no evidence of the gates
+        g = {'gates_null_both': None, 'gates_empty_both': {},
+             'gates_bad_both': dict(cm.DEFAULT_GATES, min_marks='8')}[case]
+        ta, tb = dict(ta, gates=g), dict(tb, gates=g)
     elif case == 'offset_not_drift_both':                    # CD3-2: both tracks agree, the drift does not
         ta, tb = tr('s0', off=(0.03, 0.0, 0.0)), tr('s1', frames='f1', off=(0.03, 0.0, 0.0))
     with pytest.raises(ValueError):
@@ -707,7 +712,7 @@ def test_combined_file_is_the_h0_file_with_outcome_and_calib_drift_only():
 from test_c7_score import cmd_ok  # noqa: E402,F401  (autouse: o1_cmd_path.analyse stubbed as in the scorer tests)
 
 
-def _real_score(tmp_path, name, valid=True, lost_edge=False, drop=(), post=4.0):
+def _real_score(tmp_path, name, valid=True, lost_edge=False, drop=(), post=4.0, offset=True, gio=None):
     """A score file written by c7_score main on the synthetic F05 run of its tests (frames.csv, log, constants); valid
     False: no valid frame (lost before the clock match: offset null); lost_edge: the line before the edge lost (t = 0
     not known: t0 null). Returns (score dict, track dict naming that frames.csv)."""
@@ -724,8 +729,13 @@ def _real_score(tmp_path, name, valid=True, lost_edge=False, drop=(), post=4.0):
     T.hs_file(d)
     out = d / 'score.json'
     args = ['--frames', str(d / 'frames.csv'), '--esp32', log, '--task', 'O1-F05', '--hang-so', str(d / 'hang_so.json'),
-            '--offset-s', str(T.OFFSET), '--offset-reason', 'test', '--offset-anchor-s', '0', '--offset-err-s', '0',
             '--out', str(out)]
+    if offset:
+        args += ['--offset-s', str(T.OFFSET), '--offset-reason', 'test', '--offset-anchor-s', '0', '--offset-err-s', '0']
+    if gio is not None:
+        g = d / 'gio.json'
+        g.write_text(json.dumps(gio), encoding='utf-8')
+        args += ['--gio-c8b', str(g), '--nut', '0']
     assert cs.main(args) == 0
     sc0 = json.loads(out.read_text(encoding='utf-8'))
     fsha = cm.sha256(str(d / 'frames.csv'))
@@ -749,10 +759,11 @@ def test_cc1_1_real_lost_h1_above_eps_is_lost(tmp_path):
     a, fa = _real_score(tmp_path, 'h0')
     b, fb = _real_score(tmp_path, 'h1', valid=False)
     _same_inputs(a, b)
-    assert a['outcome'] == 'dat' and b['outcome'] == 'hong_he_do' and b['offset_s'] is None and b['gate_v3'] is None
+    assert a['outcome'] == 'dat' and b['outcome'] == 'hong_he_do' and b['gate_v3'] is None
+    assert b['offset_s'] == 0.25 and b['offset_src'] == '--offset-s'          # CC2-1: the offset given is kept
     r = cd.combine(DRIFT_OVER, a, _real_track('s0', fa), fa, b, _real_track('s1', fb), fb)
     assert r['outcome'] == 'hong_he_do' and r['calib_drift']['flags'] == ['calib_drift']
-    assert r['calib_drift']['offset_s_h1'] is None and r['calib_drift']['h1_score'] == b
+    assert r['calib_drift']['offset_s_h1'] == 0.25 and r['calib_drift']['h1_score'] == b
 
 
 @pytest.mark.parametrize('lost_edge', [False, True])
@@ -821,3 +832,32 @@ def test_cc1_1_real_lost_after_the_clock_match_keeps_its_offset(tmp_path):
     assert b['offset_s'] == 0.25 and b['offset_src'] == '--offset-s'
     r = cd.combine(DRIFT_OVER, a, _real_track('s0', fa), fa, b, _real_track('s1', fb), fb)
     assert r['outcome'] == 'hong_he_do' and r['calib_drift']['offset_s_h1'] == a['offset_s']
+
+
+
+def test_cc2_1_offset_known_or_null_by_its_source(tmp_path):
+    """Codex CC2-1: lost before the clock match: --offset-s given -> that offset; a grid node -> its D; the C7b match
+    not run (no --offset-s) -> null; the edge line lost (t0 null) with --offset-s -> the offset still kept."""
+    import test_c7_score as T
+    a, _ = _real_score(tmp_path, 'given', valid=False)
+    assert a['offset_s'] == T.OFFSET and a['offset_src'] == '--offset-s'
+    b, _ = _real_score(tmp_path, 'c7b', valid=False, offset=False)
+    assert b['offset_s'] is None and b['offset_src'] is None
+    gio = dict(format='c8b_gio_v1', moc_mau=True, ok=True, nodes_s=[0.2504, 0.2514], cua_so_ghep_log_s=[23.0, 29.0])
+    c, _ = _real_score(tmp_path, 'gio', valid=False, offset=False, gio=gio)
+    assert c['offset_s'] == 0.2504 and c['offset_src'] == 'c8b_gio'
+    e, _ = _real_score(tmp_path, 'edge', valid=False, lost_edge=True)
+    assert e['t0_log_us'] is None and e['offset_s'] == T.OFFSET
+
+
+def test_cc2_2_same_gate_values_with_other_text_accepted():
+    """The gates compared are the checked thresholds; the text fields beside them (status, rule) may differ."""
+    a, ta, fa = sc('dat'), tr('s0'), 'f0'
+    b, tb, fb = sc('dat', frames='f1'), tr('s1', frames='f1'), 'f1'
+    tb = dict(tb, gates=dict(tb['gates'], status='other text'))
+    assert cd.combine(DRIFT_OVER, a, ta, fa, b, tb, fb)['outcome'] == 'dat'
+
+
+def test_cc2_2_single_track_gates_checked_below_eps():
+    with pytest.raises(ValueError, match='gates'):
+        cd.combine(DRIFT_OK, sc('dat'), dict(tr('s0'), gates={}), 'f0')

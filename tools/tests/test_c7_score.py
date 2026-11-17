@@ -1802,3 +1802,21 @@ def test_cc1_3_cli_records_the_events_file_it_read(tmp_path):
     assert cs.main(base + ['--out', str(tmp_path / 's2.json')]) == 0
     s = json.loads((tmp_path / 's2.json').read_text(encoding='utf-8'))
     assert s['events_file'] == 'esp32.csv.events.txt' and s['events_sha256'] == cm.sha256(str(ev))
+
+
+
+def test_cc2_t4_explicit_events_wins_over_the_default(tmp_path):
+    """Codex round 2 T4: --events given and the default <log>.events.txt both exist: the given one is read and hashed."""
+    import c7_measure as cm
+    cm.write_frames(tmp_path / 'frames.csv', make_frames('O1-F05'))
+    log = make_log(tmp_path / 'esp32.csv', 'O1-F05')
+    hs_file(tmp_path)
+    (tmp_path / 'esp32.csv.events.txt').write_text('2026-11-17T10:00:00 #us 1\n', encoding='utf-8')
+    ev = tmp_path / 'other_events.txt'
+    ev.write_text('2026-11-17T10:00:00 #us 2\n', encoding='utf-8')
+    args = ['--frames', str(tmp_path / 'frames.csv'), '--esp32', log, '--task', 'O1-F05', '--hang-so',
+            str(tmp_path / 'hang_so.json'), '--offset-s', str(OFFSET), '--offset-reason', 'test',
+            '--offset-anchor-s', '0', '--offset-err-s', '0', '--events', str(ev), '--out', str(tmp_path / 's.json')]
+    assert cs.main(args) == 0
+    s = json.loads((tmp_path / 's.json').read_text(encoding='utf-8'))
+    assert s['events_file'] == 'other_events.txt' and s['events_sha256'] == cm.sha256(str(ev))

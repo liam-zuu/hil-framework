@@ -1300,7 +1300,11 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
     # clock offset when known, else null), so c7_calib_drift gop can apply O1 4 (Q3) to it
     base = dict(hang_so=dict(file=hs['file'], sha256=hs['sha256'], trang_thai=hs['trang_thai'], nguon=hs['nguon']),
                 n_duplicates=n_dup, thresholds={k: hs[k] for k in THRESH_KEYS}, k_start=list(lane.start),
-                t0_log_us=None, offset_s=None, offset_src=None)
+                t0_log_us=None,
+                # Codex CC2-1: an offset given (--offset-s) or a grid node (gio D) is known from the start; null only
+                # while the C7b match has not run or when it failed
+                offset_s=gio['D'] if gio is not None else offset_s,
+                offset_src='c8b_gio' if gio is not None else ('--offset-s' if offset_s is not None else None))
     i_edge, later, probs = ocp.find_edge(rows)
     if i_edge is None:
         if any(p.startswith('edge_unknown') for p in probs):

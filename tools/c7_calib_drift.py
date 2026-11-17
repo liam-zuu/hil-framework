@@ -100,7 +100,7 @@ SAME_KEYS = ('zc_tape_m', 'plumb_xy_m', 'tag_h_m', 'car_side_m', 'width', 'heigh
 SCORE_SAME = ('version', 'task', 'hang_so', 'k_start', 'thresholds', 'esp32_sha256', 't0_log_us',  # CD1-4, CD2-4
               'sender_sha256', 'events_sha256')        # Codex CC1-3 (17/11): the same command-path inputs
 SCORE_VERSION = 'c7_score_v2'      # the scorer whose output this combines (U_m, D of the version before are gone)
-TRACK_SAME = ('video_sha256', 'tag_offset', 'frames', 'decoded_shapes', 'gates')       # CD2-4, CC1-4: track options
+TRACK_SAME = ('video_sha256', 'tag_offset', 'frames', 'decoded_shapes')       # CD2-4: track options (gates: CC1-4)
 THRESH_TEXT = ('status',)          # the only text field of c7_score thresholds (metadata); the rest are numbers >= 0
 
 
@@ -430,7 +430,10 @@ def check_score(sc, tr, frames_sha, session_sha, drift, name):
     _dict(sc, f'{name} score')
     _dict(tr, f'{name} track.json')
     _need(sc, ('outcome', 'offset_s', 'frames_sha256') + SCORE_SAME, f'{name} score')
-    _need(tr, ('session_sha256', 'frames_sha256') + TRACK_SAME, f'{name} track.json')
+    _need(tr, ('session_sha256', 'frames_sha256', 'gates') + TRACK_SAME, f'{name} track.json')
+    # Codex CC1-4, CC2-2: the frame gates the track applied, checked (null, empty or a bad threshold refused); the two
+    # tracks are compared on these values in combine
+    cm.check_gates(tr['gates'], f'{name} track.json gates')
     if sc['outcome'] not in OUTCOMES:
         raise ValueError(f'{name} score: outcome {sc["outcome"]!r}')
     if sc['version'] != SCORE_VERSION:
@@ -512,6 +515,9 @@ def combine(drift, sc0, tr0, fr0_sha, sc1=None, tr1=None, fr1_sha=None):
     for k in TRACK_SAME:
         if tr0[k] != tr1[k]:
             raise ValueError(f'the two track.json differ in {k}: {tr0[k]!r} / {tr1[k]!r} (same video, same options)')
+    g0, g1 = cm.check_gates(tr0['gates']), cm.check_gates(tr1['gates'])
+    if g0 != g1:
+        raise ValueError(f'the two track.json applied other frame gates: {g0!r} / {g1!r} (CC1-4)')
     for k in SCORE_SAME:
         if sc0[k] != sc1[k]:
             raise ValueError(f'the two scores differ in {k}: {sc0[k]!r} / {sc1[k]!r}')
