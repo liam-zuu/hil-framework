@@ -91,7 +91,8 @@ def node_from_files(score_path, rows_path):
     except (OSError, ValueError) as exc:
         return dict(ok=False, kind='loi', why=f'score file: {exc}')
     out = dict(ok=True, kind='ok', outcome=sc.get('outcome'), fail_cause=sc.get('fail_cause', ''),
-               reasons=sc.get('outcome_reasons', []), u_t_s=sc.get('U_t_s'), cat=bool(sc.get('cat_t1')))
+               reasons=sc.get('outcome_reasons', []), u_t_s=sc.get('U_t_s'), cat=bool(sc.get('cat_t1')),
+               nhanh_tick=(sc.get('U_t_parts') or {}).get('nhanh_tick'))
     if out['outcome'] == 'hong_he_do':
         return dict(out, ok=False, kind='hong', why='run lost at this node: ' + '; '.join(map(str, out['reasons'])))
     gate = sc.get('gate_v3')
@@ -108,7 +109,11 @@ def node_from_files(score_path, rows_path):
             nums[c] = dict(q=_f(b.get('q')), lo=_f(b.get('lo')), hi=_f(b.get('hi')), n_undef=b.get('n_undef'),
                            q_chung=_f(ch.get('q')), lo_chung=_f(ch.get('lo')), hi_chung=_f(ch.get('hi')),
                            n_undef_chung=ch.get('n_undef'), n_frames=b.get('n_frames'))
-    out.update(states=st, nums=nums, gate=gate)
+    for c in MEASURED:                                  # C8BS-9: the recorded state must follow the stored numbers
+        nm = nums[c]
+        if _state_from_numbers(nm['lo_chung'], nm['lo'], nm['hi'], nm['n_undef'], THRESHOLDS[c]) != st[c]:
+            return dict(out, ok=False, kind='loi', why=f'gate {c}: state {st[c]} does not follow its numbers')
+    out.update(states=st, nums=nums, gate=gate, bien=domain_key(sc, gate))
     try:
         with open(rows_path, newline='', encoding='utf-8') as f:
             rr = list(csv.DictReader(f))
@@ -126,6 +131,26 @@ def node_from_files(score_path, rows_path):
         rows[k] = dict(mien_chung=r['mien_chung'] == '1', **{c: _f(r[f'lo_{c}']) for c in MEASURED})
     out['rows'] = rows
     return out
+
+
+def domain_key(sc, gate):
+    """The frame-dependent ends of the scoring domains at a node, on the CAMERA clock (C8BS-6; design 3: an end that
+    depends on the frames themselves, as t_done, must not change between two adjacent nodes): the camera time of each
+    t_done (None = not completed: the end is t_deadline, fixed in command time) and, on the cat_t1 branch, of t1.
+    Command time t <-> camera time t + t0 - D."""
+    g1 = gate.get('g1') or {}
+    t0 = _f(sc.get('t0_log_us')) * 1e-6
+    D = _f((sc.get('gio_c8b') or {}).get('D', sc.get('offset_s')))
+
+    def cam(x):
+        if x is None:
+            return None
+        v = _f(x) + t0 - D
+        return round(v, KEY_DEC) if math.isfinite(v) else 'nan'
+    key = [cam(x) for x in (g1.get('t_done') or [])]
+    if sc.get('cat_t1'):
+        key.append(('t1', cam(g1.get('t1'))))
+    return tuple(key)
 
 
 # ── combination ──────────────────────────────────────────────────────────────────────────────
@@ -148,6 +173,20 @@ def cell_violation(a, b, c):
     return best
 
 
+def _cat_check(x, report_only):
+    """C8BS-7 (O1 3.5 OG2-3): the exception 'violation before t1' counts only for a DECIDING condition. A node whose
+    exception rests only on report-only conditions is a node where the run is lost (t1 without a deciding certain
+    violation before it)."""
+    if not (x['ok'] and x.get('cat')) or not report_only:
+        return x
+    dec = [c for c in MEASURED if c not in report_only]
+    hit = any(r['mien_chung'] and math.isfinite(r[c]) and r[c] > THRESHOLDS[c] for r in x['rows'].values() for c in dec)
+    if hit:
+        return x
+    return dict(x, ok=False, kind='hong', cat=False,
+                why='violation before t1 only in report-only conditions: run lost at this node (OG2-3)')
+
+
 def g1_rule(node_st):
     """G1 over the grid (C8B4R5-1, R5-2; luoi_v1 of CODE_GATE v2 section 2)."""
     if len(node_st) == 1:
@@ -164,8 +203,12 @@ def combine(nodes, report_only=frozenset()):
     if not nodes:
         raise LuoiError('no node')
     n = len(nodes)
+    nodes = [_cat_check(x, report_only) for x in nodes]
     ok = [x['ok'] for x in nodes]
     hong = [x.get('kind') == 'hong' for x in nodes]
+    # C8BS-6: a frame-dependent domain end that changes between two adjacent scored nodes
+    bien_doi = [bool(nodes[i]['ok'] and nodes[i + 1]['ok'] and nodes[i].get('bien') != nodes[i + 1].get('bien'))
+                for i in range(n - 1)]
     cat = [bool(x['ok'] and x.get('cat')) for x in nodes]
     states, lo_cells, bieu = {}, {}, {}
     node_st = {c: [x['states'][c] if x['ok'] else 'chua_ket_luan' for x in nodes] for c in CONDS}
@@ -174,6 +217,8 @@ def combine(nodes, report_only=frozenset()):
         st = node_st[c]
         if n == 1:
             states[c] = st[0]
+        elif any(bien_doi):
+            states[c] = 'chua_ket_luan'                  # design 3: the domain moves inside a cell
         elif all(s == 'dat' for s in st):
             states[c] = 'dat'
         else:
@@ -199,7 +244,7 @@ def combine(nodes, report_only=frozenset()):
         def mxn(k):
             v = [g[k] for g in good if isinstance(g[k], int) and not isinstance(g[k], bool)]
             m = max(v) if v else None
-            if not all(ok):
+            if not all(ok) or any(bien_doi):          # not scored / domain moves: at least one undefined frame
                 m = max(m or 0, 1)
             return m
         nums[c] = dict(chung=dict(q=mx('q_chung'), lo=lo_c, hi=mx('hi_chung'), n_undef=mxn('n_undef_chung')),
@@ -226,12 +271,18 @@ def combine(nodes, report_only=frozenset()):
     nut_tam = min(scored, key=lambda i: (abs(i - centre), i)) if scored else None
     return dict(states=states, outcome=outcome, fail_cause=fail_cause, decide=decide,
                 report_only=sorted(report_only), nums=nums, lo_cells={c: v for c, v in lo_cells.items()},
-                bieu_dien=bieu, nodes_ok=ok, n_nodes=n, nut_tam=nut_tam,
+                bieu_dien=bieu, nodes_ok=ok, n_nodes=n, nut_tam=nut_tam, bien_doi=bien_doi,
+                nhanh_tick=sorted({str(x.get('nhanh_tick')) for x in nodes if x['ok']}),
                 g1_nut=node_st['g1'], hong_nut=hong, cat_nut=cat,
                 loi_nut=[None if x.get('kind') != 'loi' else x.get('why') for x in nodes],
                 node_states=[x.get('states') if x['ok'] else None for x in nodes],
                 u_t_nodes=[x.get('u_t_s') for x in nodes],
                 node_errors=[None if x['ok'] else x.get('why') for x in nodes])
+
+
+def _order(states):
+    st = list(states)
+    return 'khong_dat' if 'khong_dat' in st else ('chua_ket_luan' if 'chua_ket_luan' in st else 'dat')
 
 
 def luoi_block(res, gio, gio_sha):
@@ -242,7 +293,7 @@ def luoi_block(res, gio, gio_sha):
                 g1_nut=res['g1_nut'], hong_nut=res['hong_nut'], cat_nut=res['cat_nut'], g1_state=res['states']['g1'])
 
 
-def gate_block(nodes, res, gio, gio_sha):
+def gate_block(nodes, res, gio, gio_sha, task='', gate_sha=None):
     """The combined gate block of the run: the gate_v3 block of the node nut_tam (G1 fields, constants) with G2-G5
     replaced by the combined numbers and states, G1 state = the combined one, u_t = the largest node U_t, and the
     luoi block. None when no node is scored."""
@@ -260,13 +311,16 @@ def gate_block(nodes, res, gio, gio_sha):
                     state=res['states'][c], chung=nm['chung'])
     ut = [x for x in res['u_t_nodes'] if isinstance(x, (int, float)) and math.isfinite(x)]
     g['u_t'] = max(ut) if ut else math.nan
-    try:
-        import o1_gate
-        g.update(o1_gate.evaluate_outcomes(g, g.get('decide') or o1_gate.DECIDE_ALL))
-        r = [g[c]['ratio'] for c in MEASURED if o1_gate._finite(g[c]['ratio'])]
-        g['max_ratio'] = max(r) if r else math.nan
-    except (ImportError, KeyError, ValueError):
-        pass
+    # C8BS-8: the deciding set and the outcome fields of the COMBINED block (gate_v3.3 fields when a mask applies;
+    # CODE_GATE v1 section 4: complete = decide is the required set)
+    dec = list(res['decide'])
+    g['decide'] = dec
+    if res['report_only']:
+        g.update(report_only=list(res['report_only']), required=dec, level=task, gate_file_sha256=gate_sha)
+    g.update(outcome=_order(res['states'][c] for c in CONDS), outcome_decide=_order(res['states'][c] for c in dec),
+             complete=True, any_certain_fail=any(res['states'][c] == 'khong_dat' for c in dec))
+    r = [g[c]['ratio'] for c in MEASURED if math.isfinite(g[c]['ratio'])]
+    g['max_ratio'] = max(r) if r else math.nan
     g['luoi'] = luoi_block(res, gio, gio_sha)
     g['note'] = (g.get('note') or '') + f'; c8b_luoi: {len(nodes)} nodes, node {res["nut_tam"]} for G1 fields'
     return g
@@ -376,7 +430,10 @@ def main(argv=None):
             else:
                 nodes = load_nodes(gio, a.out_dir)
             res = combine(nodes, ro)
-            res['gate_v3'] = gate_block(nodes, res, gio, cu.sha256(a.gio))
+            bad = [c for c in MEASURED if not res['bieu_dien'][c]]
+            if bad and any(x['ok'] for x in nodes):
+                raise LuoiError(f'combined numbers do not give the grid state for {bad} (C8BS-9): not written')
+            res['gate_v3'] = gate_block(nodes, res, gio, cu.sha256(a.gio), task, gsha)
         res.update(version=VERSION, task=task, nodes_s=gio.get('nodes_s', []), gio_sha256=cu.sha256(a.gio),
                    gate_file_sha256=gsha, script=cu.script_state())
         os.makedirs(a.out_dir, exist_ok=True)

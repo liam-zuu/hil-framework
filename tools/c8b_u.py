@@ -44,7 +44,9 @@ Last line: #ket_qua,ma=0 written / 2 refused or error.
 c8_cam_u_vao.json (CODE_CAM, proposed names; m and deg): {"phep1": {"loi_khung_max_m"}, "dat_ma_kiem_m",
   "phep2": {"du_tam_m", "du_huong_deg", "chenh_tham_so_m", "huong_chuan_deg"}, "thao_dat": {"vi_tri_m", "goc_deg"},
   "do_cao": {"rho_max_m", "dh_m", "H_m", "h_m"}, "nguon": [...]}
-ke_hoach_c8.csv: slot, task, controller (PID / LADRC), written before C8.
+ke_hoach_c8.csv (written before C8): lines '# nhanh_tick=bo_tick|giu_tick', '# commit_hil=<sha>' (O1 v11.34 Q4),
+  then the CSV slot, task, controller (PID / LADRC). Each --luot grid file must come from its clock file
+  (gio_sha256, task, nodes), be scored with all five conditions deciding, by commit_hil, on the plan's tick branch.
 phep5.csv: diem, chenh_m (ruler minus camera at a stop point, absolute or signed).
 """
 from __future__ import annotations
@@ -162,11 +164,20 @@ def khoa(gios, tb, cam, u_imu=None, phep5=None, tb_name='', tb_sha=''):
 # ── cong (rule 2b, gate file) ─────────────────────────────────────────────────────────────────────
 
 def read_plan(path):
+    """The C8 plan written before C8: '# key=value' lines (nhanh_tick = bo_tick / giu_tick; commit_hil = the hil
+    commit of the C8b scripts and the scorer, gone through Codex, O1 v11.34 Q4: without it the branch is giu_tick),
+    then the CSV slot, task, controller."""
     cu.check_path(path)
+    meta, body = {}, []
     with open(path, newline='', encoding='utf-8') as f:
-        rows = list(csv.DictReader(f))
+        for line in f:
+            if line.startswith('#'):
+                k, _, v = line[1:].strip().partition('=')
+                meta[k.strip()] = v.strip()
+            elif line.strip():
+                body.append(line)
     plan = {}
-    for r in rows:
+    for r in csv.DictReader(body):
         if r.get('controller') not in CONTROLLERS:
             raise UError(f'{path}: controller {r.get("controller")!r} (PID / LADRC)')
         if r['slot'] in plan:
@@ -174,18 +185,39 @@ def read_plan(path):
         plan[r['slot']] = dict(task=r['task'], controller=r['controller'])
     if not plan:
         raise UError(f'{path}: empty plan')
-    return plan
+    return plan, meta
+
+
+def check_pair(rid, gio, luoi, gio_sha):
+    """C8BS-13: the grid result belongs to this clock file (SHA, task, nodes); C8BS-15: it was scored with all five
+    conditions deciding (the classification of rule 2b is frozen before the report-only list)."""
+    if gio.get('format') != 'c8b_gio_v1':
+        raise UError(f'run {rid}: not a c8b_gio_v1 clock file')
+    if luoi.get('version') != 'c8b_luoi_v1':
+        raise UError(f'run {rid}: not a c8b_luoi_v1 grid file')
+    if luoi.get('gio_sha256') != gio_sha:
+        raise UError(f'run {rid}: the grid file was made from another clock file (gio_sha256)')
+    if luoi.get('task') != gio.get('task'):
+        raise UError(f'run {rid}: grid task {luoi.get("task")} but clock task {gio.get("task")}')
+    if list(luoi.get('nodes_s') or []) != list(gio.get('nodes_s') or []):
+        raise UError(f'run {rid}: grid nodes differ from the clock file nodes')
+    if luoi.get('report_only'):
+        raise UError(f'run {rid}: scored with report-only conditions {luoi["report_only"]}: rule 2b needs the '
+                     f'classification with all five deciding (O1 3.9 2b, C8BS-15)')
 
 
 def run_u_t_parts(gio, luoi):
     """(u_t_s, parts) of one C8 run for rule 2b (O1 v11.34 3.9 2b: h + u_max), or (None, why): lost, or U_t not
     finite at every node."""
     if not gio.get('ok') or luoi.get('outcome') == 'hong_he_do':
-        return None, 'lost to the measurement system'
+        return None, 'lost to the measurement system or no finite clock bound'
     ut = luoi.get('u_t_nodes') or []
-    if not ut or any(isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) for x in ut):
-        return None, 'U_t not finite at every node'
-    h = float(gio['half_s'])
+    if not ut or any(isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) or x < 0
+                     for x in ut):
+        return None, 'U_t not finite (or negative) at every node'
+    h = _num(gio.get('half_s'), 'half_s')
+    if len(ut) != len(gio.get('nodes_s') or []):
+        raise UError('U_t of every node needed')
     return max(ut) + h, dict(u_max_s=max(ut), h_s=h, n_nut=len(ut))
 
 
@@ -193,34 +225,63 @@ def run_u_t(gio, luoi):
     return run_u_t_parts(gio, luoi)[0]
 
 
+def _lost(gio, luoi):
+    return gio.get('ket_luan') == 'hong_he_do' or luoi.get('outcome') == 'hong_he_do'
+
+
 def slot_runs(plan, luot):
-    """luot: [(slot, run_id, gio, luoi)] in the order run. Returns {slot: (run_id, u_t_s or None)} with the rerun
-    rule: a later run of a slot only after a lost one."""
-    by = {}
-    for slot, rid, g, l in luot:
+    """luot: [(slot, run_id, gio, luoi, gio_sha256)] in the order run. Returns {slot: (run_id, u_t_s or None, parts
+    or why)} with the rerun rule: a later run of a slot only after a lost one. A run (id or clock file) in two slots
+    is refused (C8BS-14)."""
+    by, seen_id, seen_sha = {}, set(), set()
+    for slot, rid, g, l, gsha in luot:
         if slot not in plan:
             raise UError(f'run {rid}: slot {slot} not in the C8 plan (no run added after the plan, O1 3.9 2b)')
         if g.get('task') != plan[slot]['task']:
             raise UError(f'run {rid}: task {g.get("task")} but slot {slot} is {plan[slot]["task"]}')
+        if rid in seen_id or gsha in seen_sha:
+            raise UError(f'run {rid}: the same run or clock file given twice (C8BS-14)')
+        seen_id.add(rid)
+        seen_sha.add(gsha)
+        check_pair(rid, g, l, gsha)
         by.setdefault(slot, []).append((rid, g, l))
     out = {}
     for slot, lst in by.items():
         chosen = None
-        for i, (rid, g, l) in enumerate(lst):
-            lost = l.get('outcome') == 'hong_he_do'
+        for rid, g, l in lst:
             if chosen is not None:
                 raise UError(f'slot {slot}: run {rid} after a run that was not lost (a rerun only replaces a lost run)')
-            if not lost:
+            if not _lost(g, l):
                 chosen = (rid,) + run_u_t_parts(g, l)
         out[slot] = chosen if chosen is not None else (lst[-1][0], None, 'every run of the slot lost')
     return out
+
+
+def check_branch(branch, meta, luot):
+    """C8BS-16 (O1 v11.34 SC-12 Q4): the branch is the one written in the plan before C8; 'bo_tick' needs the commit
+    of the scripts in the plan, and every clock and grid file made by that commit, not dirty; every scored node used
+    that branch."""
+    if meta.get('nhanh_tick') != branch:
+        raise UError(f'u_t_branch {branch} but the C8 plan says {meta.get("nhanh_tick")!r}')
+    commit = meta.get('commit_hil', '')
+    if branch == 'bo_tick' and len(commit) < 7:
+        raise UError('bo_tick needs commit_hil (the scripts gone through Codex) in the C8 plan (O1 v11.34 Q4)')
+    want = {'bo_tick': 'bo', 'giu_tick': 'giu'}[branch]
+    for slot, rid, g, l, _ in luot:
+        for nm, d in (('clock', g), ('grid', l)):
+            sc = d.get('script') or {}
+            if commit and (not str(sc.get('commit', '')).startswith(commit) or sc.get('dirty') is not False):
+                raise UError(f'run {rid}: {nm} file not made by commit_hil {commit} (clean)')
+        used = set(l.get('nhanh_tick') or [])
+        if used and used != {want}:
+            raise UError(f'run {rid}: nodes scored with tick branch {sorted(used)}, the plan says {want}')
 
 
 def uhat(u_p, u_psi_deg, u_t, v, wz):
     return dict(g2=u_p, g3=u_p + u_t * v, g5=u_psi_deg + math.degrees(u_t * wz))
 
 
-def cong(k, plan, luot, levels, branch, c8_dir, cam=None, written_by=None):
+def cong(k, plan, luot, levels, branch, c8_dir, cam=None, written_by=None, meta=None):
     import o1_gate
     from o1_feasibility import Schedule
     from o1_tasks import FIG8
@@ -228,6 +289,7 @@ def cong(k, plan, luot, levels, branch, c8_dir, cam=None, written_by=None):
         raise UError(f'u_t_branch {branch!r}: {BRANCHES}')
     if not levels or len(set(levels)) != len(levels) or any(lv not in FIG8 for lv in levels):
         raise UError(f'levels {levels!r}: distinct figure-8 tasks')
+    check_branch(branch, meta or {}, luot)
     chosen = slot_runs(plan, luot)
     thr = {c: o1_gate.THRESHOLDS[c] for c in MASKABLE}
     per, parts = {}, {}
@@ -344,16 +406,17 @@ def main(argv=None):
             k = _json(a.khoa)
             if k.get('version') != VERSION:
                 raise UError(f'{a.khoa}: not a {VERSION} file')
-            plan = read_plan(a.ke_hoach)
+            plan, meta = read_plan(a.ke_hoach)
             luot = []
             for s in a.luot:
                 slot, rest = s.split('=', 1)
                 rid, g, l = rest.split(',')
-                luot.append((slot, rid, _json(g), _json(l)))
+                luot.append((slot, rid, _json(g), _json(l), cu.sha256(g)))
             st = cu.script_state()
             d = cong(k, plan, luot, [x.strip() for x in a.levels.split(',')], a.u_t_branch, a.c8_dir,
                      _json(a.cam) if a.cam else None,
-                     dict(script='tools/c8b_u.py', repo='hil-framework', commit=st.get('commit'), dirty=st.get('dirty')))
+                     dict(script='tools/c8b_u.py', repo='hil-framework', commit=st.get('commit'), dirty=st.get('dirty')),
+                     meta)
             g = write_gate(a.out, _clean(d))
             print(f'gate file {a.out} sha256 {g.sha256}; ' + '; '.join(
                 f'{lv}: report_only {d["dieu_2b"]["per_level"][lv]["report_only"]}' for lv in d['levels']))

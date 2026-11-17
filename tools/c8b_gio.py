@@ -75,6 +75,9 @@ R_W = 0.0485               # m, wheel radius, AGV 5bde4c5 kinematics.h
 LXY = 0.24                 # m, lx + ly, AGV 5bde4c5 kinematics.h
 IMU_P = 0.050              # s, IMU_REPORT_PERIOD_US 50000 (imu.h), campaign 20 Hz
 IMU_GAP_S = 2 * IMU_P + 0.010   # section 7: no bridging across a larger IMU report gap
+LOG_P = 0.010              # s, control / log tick of the campaign firmware (10 ms)
+LOG_GAP_S = 2 * LOG_P + 0.010   # section 7: a count pair over a larger time gap is not used (C8BS-2), even with
+                                # consecutive log_seq; the whole run is lost only above LOG_HOLE_S
 AGE_NEG_LIM_MS = -2.0      # [DE XUAT] section 7: a negative age down to -2 ms is valid (design 2), below is an error
 PAIR_MIN = 0.95            # [DE XUAT] section 7
 LOG_HOLE_S = 0.100         # [DE XUAT] section 7
@@ -86,8 +89,8 @@ STARTUP_LEAVE_M = 0.005    # [DE XUAT] the car has left when the tag is 5 mm fro
 STARTUP_MIN_S_M = 0.030    # [DE XUAT] lower estimate only with at least 30 mm of tag path in the window
 STARTUP_USE_S_M = 0.010    # [DE XUAT] frames with less tag displacement are below the camera noise: not used
 STARTUP_MIN_PSI_DEG = 1.0  # [DE XUAT] upper estimate only with at least 1 deg turned one way
-STARTUP_E_P_M = 0.005      # [DE XUAT] camera position error allowed before C8 (U_p of the khoa file after C8)
-STARTUP_E_PSI_DEG = 0.5    # [DE XUAT] camera heading error allowed before C8 (U_psi of the khoa file after C8)
+STARTUP_E_P_M = 0.005      # [DE XUAT] O1 v11.36: allowed error of a camera displacement before C8 (2 U_p after C8)
+STARTUP_E_PSI_DEG = 0.5    # [DE XUAT] O1 v11.36: allowed error of a camera angle change before C8 (2 U_psi after C8)
 PRE_S = (1.0, 0.1)         # s before t0: standing place from the frames in [t0 - 1.0, t0 - 0.1] (camera clock)
 CHANNELS = ('speed_cnt', 'wz_cnt', 'gyro_rx', 'rv_rx')
 LOWER, UPPER = ('speed_cnt', 'wz_cnt'), ('gyro_rx', 'rv_rx')
@@ -153,13 +156,14 @@ def _gapped(t, v, breaks):
 
 
 def count_pairs(rows, tl):
-    """Encoder pairs: lines consecutive by log_seq, both with four valid counts. Returns (mid times, rate (n, 4),
-    breaks (bool, between pair k and k+1: not adjacent pairs), valid flags of every consecutive line pair)."""
+    """Encoder pairs: lines consecutive by log_seq, both with four valid counts, at most LOG_GAP_S apart. Returns
+    (mid times, rate (n, 4), breaks (bool, between pair k and k+1: not adjacent pairs), valid flags of every
+    consecutive line pair, line index of each pair)."""
     seq = np.array([int(float(r['log_seq'])) for r in rows])
     C = np.array([[int(float(r[c])) for c in ('fl_count', 'fr_count', 'rl_count', 'rr_count')] for r in rows], float)
     good = np.all(C != INT32_MIN, axis=1)
     adj = np.diff(seq) == 1
-    pair_ok = adj & good[1:] & good[:-1]
+    pair_ok = adj & good[1:] & good[:-1] & (np.diff(tl) <= LOG_GAP_S)
     i = np.flatnonzero(pair_ok)
     rate = (C[i + 1] - C[i]) / (tl[i + 1] - tl[i])[:, None]
     tm = 0.5 * (tl[i + 1] + tl[i])
@@ -278,6 +282,9 @@ def match(t_cam, v_cam, valid, t_log, v_log, window_log, coarse):
                    rate=abs(De_ - Ds_) / (w1 - w0 - third))            # distance of the third centres
         if abs(D - 0.5 * (Ds_ + De_)) > ts.SPLIT_TOL_S:
             why.append(f'|D - mean(start, end)| > {ts.SPLIT_TOL_S * 1e3:.0f} ms')
+        for nm, cc in (('start', cs_), ('end', ce_)):         # design 7: each third well correlated (C8BS-1)
+            if cc < ts.MIN_CORR:
+                why.append(f'corr of the {nm} third {cc:.3f} < {ts.MIN_CORR}')
     if c < ts.MIN_CORR:
         why.append(f'corr {c:.3f} < {ts.MIN_CORR}')
     out.update(ok=not why, why='; '.join(why))
@@ -323,15 +330,18 @@ def t_deadline(task):
 
 # ── start-up check (F5) ─────────────────────────────────────────────────────────────────────────
 
-def startup(F, t0_log, D_guess, tm, vel, t_rv, yaw_rv, startup_s=STARTUP_S, e_p=STARTUP_E_P_M,
+def startup(F, t0_log, D_guess, tm, vel, br, t_rv, yaw_rv, startup_s=STARTUP_S, e_p=STARTUP_E_P_M,
             e_psi=math.radians(STARTUP_E_PSI_DEG)):
     """Lower / upper estimate of D from the standstill start (see the module text). D_guess only places the
     standing-place window and the RV search window; the estimates do not use it otherwise.
-    [CACH HIEU] the camera error is allowed for, so that the check only flags a real disagreement (trial 16/11:
-    camera and RV yaw differ by up to 0.2 deg at about 3 deg/s just after the start, which alone moves a yaw
+    [CACH HIEU; O1 v11.36] the camera error is allowed for, so that the check only flags a real disagreement (trial
+    16/11: camera and RV yaw differ by up to 0.2 deg at about 3 deg/s just after the start, which alone moves a yaw
     crossing by about 60 ms): lower D >= t_enc(d_k - e_p) - t_k (the true tag displacement is at least the measured
-    one minus e_p); upper D <= t_rv - t_cam(a - e_psi) (the true camera angle reaches a no earlier than the measured
-    one reaches a - e_psi). e_p, e_psi: U_p, U_psi locked at C8 (khoa file), before C8 the [DE XUAT] defaults."""
+    one minus e_p); upper D <= t_rv - t_cam(a - e_psi) (the true camera angle change reaches a no earlier than the
+    measured one reaches a - e_psi). e_p, e_psi bound the error of a DIFFERENCE of two camera poses (the standing place
+    and the frame; C8BS-5): before C8 the [DE XUAT] 5 mm, 0.5 deg of O1 v11.36, after C8 2 U_p, 2 U_psi.
+    Nothing bridged (C8BS-3): the wheel path only over count pairs without a break from t0 - 0.5 s to the end of the
+    window; the camera crossing only over valid frames next to each other; else 'khong_xac_dinh' for that side."""
     t = F['t_s']
     v = F['valid'] & np.isfinite(F['x']) & np.isfinite(F['y'])
     t0c = t0_log - D_guess
@@ -353,9 +363,14 @@ def startup(F, t0_log, D_guess, tm, vel, t_rv, yaw_rv, startup_s=STARTUP_S, e_p=
     res['t_start_log_s'] = tl0 + D_guess
     # lower: wheel path length (sum of |FK translation| over the count pairs from standstill) against the tag chord
     vxy = np.hypot(vel[:, 0], vel[:, 1])
-    k0 = np.searchsorted(tm, t0_log - 0.5)
-    tt, vv = tm[k0:], vxy[k0:]
-    if len(tt) > 1:
+    k0 = int(np.searchsorted(tm, t0_log - 0.5))
+    k1 = int(np.searchsorted(tm, tl0 + startup_s + D_guess + 0.2))
+    tt, vv = tm[k0:k1 + 1], vxy[k0:k1 + 1]
+    if len(tt) < 2:
+        res['lo_why'] = 'no count pair after t0 - 0.5 s'
+    elif np.any(br[k0:min(k1, len(br))]):
+        res['lo_why'] = 'a break in the count pairs between t0 - 0.5 s and the end of the start-up window'
+    else:
         s_enc = np.r_[0.0, np.cumsum(0.5 * (vv[1:] + vv[:-1]) * np.diff(tt))]
         dd = d - e_p
         use = win & (dd >= STARTUP_USE_S_M)
@@ -367,9 +382,8 @@ def startup(F, t0_log, D_guess, tm, vel, t_rv, yaw_rv, startup_s=STARTUP_S, e_p=
             else:
                 res['lo_why'] = 'the wheel path does not reach the tag displacement'
         else:
-            res['lo_why'] = f'tag path below {STARTUP_MIN_S_M * 1e3:.0f} mm (or minus e_p below '                             f'{STARTUP_USE_S_M * 1e3:.0f} mm) in the start-up window'
-    else:
-        res['lo_why'] = 'no count pair after t0 - 0.5 s'
+            res['lo_why'] = (f'tag path below {STARTUP_MIN_S_M * 1e3:.0f} mm (or minus e_p below '
+                             f'{STARTUP_USE_S_M * 1e3:.0f} mm) in the start-up window')
     # upper: the RV yaw change against the camera yaw change, one way only
     psi = F['psi']
     m = v & np.isfinite(psi)
@@ -380,10 +394,16 @@ def startup(F, t0_log, D_guess, tm, vel, t_rv, yaw_rv, startup_s=STARTUP_S, e_p=
     if psi0 is None or rv_pre.sum() < 3:
         res['hi_why'] = 'no standing yaw before t0 (camera or RV)'
         return res
+    span = (t > t0c - PRE_S[1]) & (t <= tl0 + startup_s)          # every frame of the span, valid or not
+    per = float(np.median(np.diff(t)))
+    ts_ = t[span]
+    if not np.all(m[span]) or (len(ts_) > 1 and np.max(np.diff(ts_)) > CAM_GAP_FACTOR * per):
+        res['hi_why'] = 'a rejected or lost camera frame in the start-up span: no crossing time without bridging'
+        return res
     yw = np.unwrap(yaw_rv)
     y0 = float(np.median(yw[rv_pre]))
     dc = pu - psi0
-    wc = after & m & (t <= tl0 + startup_s)               # from the end of the standing part, not only after leaving
+    wc = span
     lim = math.radians(STARTUP_MIN_PSI_DEG)
     if not (wc & win).any() or np.nanmax(np.abs(dc[wc & win])) < lim + e_psi:
         res['hi_why'] = f'camera yaw turns less than {STARTUP_MIN_PSI_DEG:g} deg + e_psi in the start-up window'
@@ -543,21 +563,25 @@ def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S):
                       n_over_1_5=int(np.sum(dts > 1.5 * per)), n_under_0_5=int(np.sum(dts < 0.5 * per)))
     # start-up check
     kk = khoa or {}
-    st = startup(F, t0, c, tm, vel, tr, yr, startup_s, kk.get('U_p_m', STARTUP_E_P_M),
-                 math.radians(kk.get('U_psi_deg', STARTUP_E_PSI_DEG)))
+    # C8BS-5: the allowance bounds the DIFFERENCE of two poses (standing place and frame): 2 U_p, 2 U_psi after C8
+    e_p = 2.0 * kk['U_p_m'] if 'U_p_m' in kk else STARTUP_E_P_M
+    e_psi = math.radians(2.0 * kk['U_psi_deg'] if 'U_psi_deg' in kk else STARTUP_E_PSI_DEG)
+    st = startup(F, t0, c, tm, vel, br, tr, yr, startup_s, e_p, e_psi)
     rate_b = ((khoa or {}).get('troi_ppm') or 0.0) * 1e-6 or out['rate_luot'] or 0.0
     wid = 0.0
     if st['t_start_log_s'] is not None:
         mid = 0.5 * (cw[0] + cw[1])
         wid = rate_b * max(abs(st['t_start_log_s'] - cw[0]), abs(st['t_start_log_s'] - cw[1]), abs(st['t_start_log_s'] - mid))
     st['troi_s'] = wid
-    lo_ok = st['lo_s'] is None or st['lo_s'] - wid <= c + h + 1e-12
-    hi_ok = st['hi_s'] is None or st['hi_s'] + wid >= c - h - 1e-12
+    # C8BS-4: one interval meeting the scoring interval AND both start-up bounds (a missing bound is unbounded)
+    lo_b = -math.inf if st['lo_s'] is None else st['lo_s'] - wid
+    hi_b = math.inf if st['hi_s'] is None else st['hi_s'] + wid
     if st['lo_s'] is None and st['hi_s'] is None:
         st['ket_qua'] = 'khong_xac_dinh'
     else:
-        st['ket_qua'] = 'nhat_quan' if (lo_ok and hi_ok) else 'khong_nhat_quan'
-        if not (lo_ok and hi_ok):
+        meet = max(c - h, lo_b) <= min(c + h, hi_b) + 1e-12
+        st['ket_qua'] = 'nhat_quan' if meet else 'khong_nhat_quan'
+        if not meet:
             hong.append('start-up estimate does not meet the scoring interval')
     out['khoi_dong'] = st
     # C8 range of the same level (campaign runs)

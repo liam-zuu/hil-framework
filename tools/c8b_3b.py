@@ -64,6 +64,8 @@ MIN_PIECE_TURNS = 1.0       # [DE XUAT] a piece shorter than one turn is not use
                             # absorbs the once-per-turn terms)
 SPREAD_MAX = 0.30           # [DE XUAT] design 4b
 DR_REF, DC_REF = 700.0, 700.0   # reference span (rows 700-1450 of the car runs; columns of the same size)
+SHUTTER_MIN_RAD_S = 2.0     # [DE XUAT] shutter fit only above 2 rad/s: below, one smooth piece of >= 1 turn lasts
+                            # too long for a cubic, and the shutter term is small (synthetic test: bias at 0.3-1.5 rad/s)
 SUBSET_MIN = 120            # frames per check fit (design 4b consistency)
 DERIV_HALF = 3              # frames each side for the rate (central quadratic fit)
 
@@ -137,7 +139,7 @@ def analyse_a(F, wz_max):
     dev = np.hypot(x - px, y - py)
     use = np.isfinite(om) & (np.abs(om) > MOVE_RAD_S) & (np.abs(om) <= wz_max)
     # heading residual after a quadratic over every 0.5 s window (step a quarter window)
-    res_max, bands = 0.0, []
+    res_max, bands, n_win = 0.0, [], 0
     t0 = t[0]
     while t0 + WIN_S <= t[-1]:
         m = (t >= t0) & (t < t0 + WIN_S)
@@ -151,11 +153,14 @@ def analyse_a(F, wz_max):
             w = float(np.nanmean(np.abs(om[m]))) if np.isfinite(om[m]).any() else math.nan
             if math.isfinite(w) and MOVE_RAD_S < w <= wz_max:
                 res_max = max(res_max, float(np.max(np.abs(r))))
+                n_win += 1
             bands.append((w, float(np.max(np.abs(r)))))
         t0 += WIN_S / 4
+    cov = coverage(om, wz_max)
     return dict(fixed_point=[px, py], slow_n=int(len(sl)), slow_rate_rad_s=float(np.median(np.abs(om[sl]))),
-                ga_dev_m=dev_sl, ga_ok=bool(dev_sl <= GA_TOL_M),
-                psi_osc_deg=math.degrees(res_max), p_dev_m=float(np.max(dev[use])) if use.any() else None,
+                ga_dev_m=dev_sl, ga_ok=bool(dev_sl <= GA_TOL_M), du_phu=cov['ok'], phu=cov, n_win=n_win,
+                psi_osc_deg=math.degrees(res_max) if n_win else None,
+                p_dev_m=float(np.max(dev[use])) if use.any() else None,
                 rate_max_rad_s=float(np.nanmax(np.abs(om))), n_used=int(use.sum()),
                 by_rate=_binned(bands))
 
@@ -176,6 +181,14 @@ def _binned(pairs, nb=6):
 
 
 # ── (B) tag off the axis ─────────────────────────────────────────────────────────────────────────
+
+def coverage(om, need):
+    """Spinning frames reach |Omega| >= need in BOTH directions (C8BS-10)."""
+    f = np.isfinite(om)
+    pos = float(np.max(om[f])) if f.any() else 0.0
+    neg = float(-np.min(om[f])) if f.any() else 0.0
+    return dict(ok=bool(pos >= need and neg >= need), can_rad_s=need, max_duong_rad_s=pos, max_am_rad_s=neg)
+
 
 def circle_fit(x, y):
     """Algebraic (Kasa) circle fit: centre, radius."""
@@ -287,13 +300,13 @@ def analyse_b(F, v_max, wz_max, frame_s):
     phi_sl = float(np.median(phi[sl]))
     v_t = np.abs(om) * R0
     use_p = np.isfinite(om) & (np.abs(om) > MOVE_RAD_S) & (v_t <= v_max)
-    use_h = use_p & (np.abs(om) <= wz_max) if wz_max is not None else use_p
+    cov = coverage(om, v_max / R0)                  # tangential speed up to v_max of the level, both ways
     rad_dev = float(np.max(np.abs(r[use_p] - R0))) if use_p.any() else None
     hp_dev = float(np.max(np.abs(phi[use_p] - phi_sl))) if use_p.any() else None
     # rolling shutter: one alpha over all spinning frames, and one per speed band x direction (pieces and
     # harmonics shared: within one band the rate hardly changes, so a band alone cannot tell the shutter term from
     # the first harmonic)
-    spin = trim_runs(t, om, np.isfinite(om) & (np.abs(om) > MOVE_RAD_S))
+    spin = trim_runs(t, om, np.isfinite(om) & (np.abs(om) > SHUTTER_MIN_RAD_S))
     w = fit_shutter(t, th, om, F['row'], F['col'], spin)
     whole = dict(w['groups'][0], pieces=w['pieces'], rms_rad=w['rms_rad']) if w else None
     # consistency (design 4b: the same alpha over the speed bands and the two directions): the shutter term is told
@@ -316,20 +329,32 @@ def analyse_b(F, v_max, wz_max, frame_s):
         why = 'no fit'
     elif len(subsets) < 4:
         why = f'{len(subsets)} of 4 check fits (two bands, two directions) with {SUBSET_MIN} frames'
+    elif not whole['has_col']:
+        why = 'no col_px: alpha_c not measured, one frame kept (C8BS-11)'
     else:
-        sh = np.array([d['shift_ref_s'] for d in subsets])
-        spread = float((sh.max() - sh.min()) / sh.mean()) if sh.mean() > 0 else math.inf
-        sg = {int(np.sign(d['alpha_r_s_px'])) for d in subsets}
-        whole['spread'] = spread
-        if spread > SPREAD_MAX:
-            why = f'spread {spread:.2f} > {SPREAD_MAX}'
-        elif len(sg) != 1:
-            why = 'alpha_r changes sign between subsets'
+        # C8BS-12: both coefficients, not only one summary number: alpha_r within SPREAD_MAX of its mean and one sign;
+        # alpha_c within SPREAD_MAX x |mean alpha_r| of its mean (alpha_c may be near 0) [DE XUAT]; and the whole fit
+        # inside the spread of the check fits
+        ar = np.array([d['alpha_r_s_px'] for d in subsets])
+        ac = np.array([d['alpha_c_s_px'] for d in subsets])
+        m_r = float(np.mean(ar))
+        spread = float((ar.max() - ar.min()) / abs(m_r)) if m_r != 0 else math.inf
+        spread_c = float((ac.max() - ac.min()) / abs(m_r)) if m_r != 0 else math.inf
+        whole.update(spread=spread, spread_c=spread_c)
+        if len({int(np.sign(v)) for v in ar}) != 1:
+            why = 'alpha_r changes sign between the check fits'
+        elif spread > SPREAD_MAX:
+            why = f'alpha_r spread {spread:.2f} > {SPREAD_MAX}'
+        elif spread_c > SPREAD_MAX:
+            why = f'alpha_c spread {spread_c:.2f} x |alpha_r| > {SPREAD_MAX}'
+        elif not (ar.min() - 1e-15 <= whole['alpha_r_s_px'] <= ar.max() + 1e-15
+                  and ac.min() - 1e-15 <= whole['alpha_c_s_px'] <= ac.max() + 1e-15):
+            why = 'the whole fit is outside the check fits'
         else:
             use_alpha = True
     rows = F['row'][spin]
     return dict(centre=[cx, cy], R0_m=R0, slow_n=int(len(sl)), slow_rate_rad_s=float(np.median(np.abs(om[sl]))),
-                ga_dev_m=ga_dev, ga_ok=bool(ga_dev <= GA_TOL_M), rad_dev_m=rad_dev,
+                ga_dev_m=ga_dev, ga_ok=bool(ga_dev <= GA_TOL_M), du_phu=cov['ok'], phu=cov, rad_dev_m=rad_dev,
                 hp_dev_deg=math.degrees(hp_dev) if hp_dev is not None else None,
                 rate_max_rad_s=float(np.nanmax(np.abs(om))), v_t_max_m_s=float(np.nanmax(v_t)),
                 row_span_px=[float(np.nanmin(rows)), float(np.nanmax(rows))] if len(rows) else None,
@@ -352,11 +377,17 @@ def analyse(fa, fb, task='O1-F08'):
     a = analyse_a(A, wz_max)
     b = analyse_b(B, v_max, wz_max, frame_s)
     ga_ok = a['ga_ok'] and b['ga_ok']
-    dpsi = [v for v in (a['psi_osc_deg'], b['hp_dev_deg']) if v is not None]
-    dp = [v for v in (a['p_dev_m'], b['rad_dev_m']) if v is not None]
-    return dict(version=VERSION, task_rates=task, v_max=v_max, wz_max=wz_max, A=a, B=b, ga_ok=ga_ok,
-                d_psi_quay_deg=max(dpsi) if dpsi and ga_ok else None,
-                d_p_quay_m=max(dp) if dp and ga_ok else None,
+    # C8BS-10: every part measured over the required rates and both ways, else no number (nothing replaced by 0)
+    parts_psi = [a['psi_osc_deg'], b['hp_dev_deg']]
+    parts_p = [a['p_dev_m'], b['rad_dev_m']]
+    thieu = [nm for nm, ok_ in (('A phu toc do / hai chieu', a['du_phu']), ('B phu toc do / hai chieu', b['du_phu']),
+                                ('A dao dong huong', parts_psi[0] is not None), ('B huong-vi tri', parts_psi[1] is not None),
+                                ('A vi tri', parts_p[0] is not None), ('B ban kinh', parts_p[1] is not None)) if not ok_]
+    usable = ga_ok and not thieu
+    return dict(version=VERSION, task_rates=task, v_max=v_max, wz_max=wz_max, A=a, B=b, ga_ok=ga_ok, thieu=thieu,
+                dung_duoc=usable,
+                d_psi_quay_deg=max(parts_psi) if usable else None,
+                d_p_quay_m=max(parts_p) if usable else None,
                 gioi_han=['sai tron bi khop hap thu', 'sai pha chung huong va vi tri tiep tuyen', 'lech khong doi '
                           'theo toc do (phep 2)', 'rung, nghieng xe that'])
 
@@ -394,7 +425,7 @@ def main(argv=None):
         print('#ket_qua,ma=2')
         return 2
     sh = out['B']['shutter']
-    print(f'ga_ok {out["ga_ok"]}; d_psi_quay {out["d_psi_quay_deg"]} deg; d_p_quay {out["d_p_quay_m"]} m; '
+    print(f'ga_ok {out["ga_ok"]}; thieu {out["thieu"]}; d_psi_quay {out["d_psi_quay_deg"]} deg; d_p_quay {out["d_p_quay_m"]} m; '
           f'alpha {"dung" if sh["use_alpha"] else "khong dung: " + sh["why"]}')
     print(f'#ket_qua,ma=0,ga_ok={int(out["ga_ok"])},alpha_dung={int(sh["use_alpha"])}')
     return 0

@@ -235,26 +235,71 @@ def test_c8_range_check(tmp_path, base_run):
     assert out3['ok']
 
 
-def test_startup_consistent_and_inconsistent(base_run):
-    out = base_run[0]
-    st = out['khoi_dong']
-    assert st['ket_qua'] in ('nhat_quan', 'khong_xac_dinh')
-    if st['lo_s'] is not None:
-        assert st['lo_s'] <= out['center_s'] + out['half_s'] + 1e-9
-
-
-def test_startup_lower_estimate_flags_far_offset(tmp_path):
-    # camera clock shifted 80 ms after the matching: the start-up lower estimate must disagree with a forced interval
-    fp, lp = make_run(str(tmp_path))
+def _startup_inputs(fp, lp):
     F = G.read_frames(fp)
     rows, _ = G.read_log(lp)
     tl = np.array([float(r['timestamp_us']) for r in rows]) * 1e-6
     tm, rate, br, _, _ = G.count_pairs(rows, tl)
     tr, yr, _ = G.imu_reports(rows, tl, 'rv_n', 'age_r_ms', 'yaw_rad')
-    t0 = 2.9003
-    st = G.startup(F, t0, 1.234, tm, G.fk(rate), tr, yr)
-    assert st['lo_s'] is not None and st['lo_s'] <= 1.234 + 0.01
-    assert st['lo_s'] > 1.234 - 0.2
+    return F, tm, G.fk(rate), br, tr, yr
+
+
+def test_startup_bounds_planted(base_run):
+    out = base_run[0]
+    st = out['khoi_dong']
+    assert st['ket_qua'] == 'nhat_quan' and st['lo_s'] is not None
+    # synthetic: the tag is the wheel centre, no slip: the lower estimate sits at D0 (within the camera allowance)
+    assert 1.234 - 0.08 < st['lo_s'] <= 1.234 + 0.003
+
+
+def test_startup_intersection_counterexample(base_run, monkeypatch):
+    # C8BS-4: lower 1.015, upper 1.005 both inside [1.000, 1.020] but no common time: inconsistent
+    def fake(*a, **k):
+        return dict(lo_s=1.015, hi_s=1.005, lo_why='', hi_why='', t_start_log_s=4.0, e_p_m=0, e_psi_deg=0)
+    monkeypatch.setattr(G, 'startup', fake)
+    monkeypatch.setattr(G, 'nodes', lambda c, h, step=G.STEP_S: [c])
+    out, _, _ = G.analyse(base_run[1], base_run[2], 'O1-F05')
+    assert out['khoi_dong']['ket_qua'] == 'khong_nhat_quan' and out['ket_luan'] == 'hong_he_do'
+
+
+def test_startup_not_bridged(tmp_path):
+    def fm(fr):                                           # a rejected frame just after the car leaves
+        for r in fr:
+            if 2.9 + 0.5 < float(r['t_s']) + 1.234 < 2.9 + 0.52:
+                r['valid'] = 0
+    fp, lp = make_run(str(tmp_path), frames_mutate=fm)
+    F, tm, vel, br, tr, yr = _startup_inputs(fp, lp)
+    st = G.startup(F, 2.9003, 1.234, tm, vel, br, tr, yr)
+    assert st['hi_s'] is None and 'rejected or lost camera frame' in st['hi_why']
+    br2 = br.copy()
+    k = int(np.searchsorted(tm, 3.2))
+    br2[k] = True                                         # a break in the count pairs inside the start-up span
+    st2 = G.startup(F, 2.9003, 1.234, tm, vel, br2, tr, yr)
+    assert st2['lo_s'] is None and 'break in the count pairs' in st2['lo_why']
+
+
+def test_third_correlation_checked(monkeypatch):
+    # C8BS-1: whole window 0.96, thirds 0.2 / 0.3: not ok
+    seq = iter([(1.0, 0.96), (1.0, 0.2), (1.0, 0.3)])
+    monkeypatch.setattr(G, '_fit', lambda *a, **k: next(seq))
+    t = np.arange(0, 30, 1 / 60)
+    r = G.match(t, np.ones_like(t), np.ones_like(t, bool), t, np.ones_like(t), (0.0, 29.0), 0.0)
+    assert not r['ok'] and 'start third' in r['why'] and 'end third' in r['why']
+
+
+def test_count_pair_time_gap_not_used(tmp_path):
+    def m(rows):
+        for r in rows[1000:]:
+            r['timestamp_us'] = int(r['timestamp_us']) + 40000           # 50 ms between two lines, log_seq +1
+    fp, lp = make_run(str(tmp_path), mutate=m)
+    rows, _ = G.read_log(lp)
+    tl = np.array([float(r['timestamp_us']) for r in rows]) * 1e-6
+    tm, rate, br, pair_ok, ip = G.count_pairs(rows, tl)
+    assert not pair_ok[999] and pair_ok[998] and pair_ok[1000]
+    j = int(np.searchsorted(ip, 999))
+    assert br[j - 1]                                      # the pairs on both sides are not joined
+    out, _, _ = G.analyse(fp, lp, 'O1-F05')
+    assert out['ok']                                      # 50 ms < LOG_HOLE_S: the run itself is not lost
 
 
 def test_cli_writes_once(tmp_path, base_run):
@@ -275,15 +320,24 @@ def test_sealed_path_refused(tmp_path, base_run):
 
 # ── c8b_luoi ─────────────────────────────────────────────────────────────────────────────────
 
-def node(states, rows=None, nums=None, ok=True, u_t=0.03, kind='hong', cat=False):
+def node(states, rows=None, nums=None, ok=True, u_t=0.03, kind='hong', cat=False, bien=(None, None)):
     if not ok:
         return dict(ok=False, kind=kind, why=kind)
     st = dict(zip(LU.CONDS, states)) if isinstance(states, (list, tuple)) else states
-    nm = nums or {c: dict(q=0.05, lo=0.04, hi=0.06, n_undef=0, q_chung=0.05, lo_chung=0.04, hi_chung=0.06,
-                          n_undef_chung=0) for c in LU.MEASURED}
+    nm = nums or {}
+    for c in LU.MEASURED:                         # numbers that follow the rows and the state (C8BS-17)
+        if c in nm:
+            continue
+        los = [r[c] for r in (rows or {}).values() if r['mien_chung']] or [0.04]
+        lo = max(los)
+        hi = (LU.THRESHOLDS[c] + 0.05 if st[c] != 'dat' else max(lo + 0.02, 0.06)) if lo <= LU.THRESHOLDS[c] \
+            else lo + 0.02
+        nm[c] = dict(q=lo + 0.01, lo=lo, hi=hi, n_undef=0, q_chung=lo + 0.01, lo_chung=lo, hi_chung=hi,
+                     n_undef_chung=0)
     gate = {c: dict(state=st[c]) for c in LU.CONDS}
     gate['g1'] = dict(state=st['g1'], t_done=[1.0, 1.0])
-    return dict(ok=True, kind='ok', outcome='x', states=st, nums=nm, rows=rows or {}, u_t_s=u_t, cat=cat, gate=gate)
+    return dict(ok=True, kind='ok', outcome='x', states=st, nums=nm, rows=rows or {}, u_t_s=u_t, cat=cat, gate=gate,
+                bien=bien)
 
 
 def rows_with(viol_key=None, c='g3', lo=0.12, in_dom=True, extra=()):
@@ -401,6 +455,55 @@ def test_gate_block_and_luoi_v1():
     assert g['g3']['state'] == 'chua_ket_luan' and g['g3']['n_undef'] >= 1
 
 
+def test_domain_end_moves_between_nodes():
+    # C8BS-6: both nodes dat, but t_done is set by another frame at the next node: not concluded
+    a = node(['dat'] * 5, rows_with(), bien=(10.0, 10.0))
+    b = node(['dat'] * 5, rows_with(), bien=(10.0, 10.016667))
+    res = LU.combine([a, b])
+    assert all(res['states'][c] == 'chua_ket_luan' for c in LU.MEASURED) and res['bien_doi'] == [True]
+    assert res['nums']['g2']['n_undef'] >= 1 and res['bieu_dien']['g2']
+    assert LU.combine([a, node(['dat'] * 5, rows_with(), bien=(10.0, 10.0))])['states']['g2'] == 'dat'
+
+
+def test_domain_key_camera_clock():
+    sc = dict(t0_log_us=5e6, gio_c8b=dict(D=1.5), cat_t1=False)
+    g = dict(g1=dict(t_done=[2.0, None]))
+    assert LU.domain_key(sc, g) == (5.5, None)               # 2.0 + 5.0 - 1.5 on the camera clock
+
+
+def test_cat_only_report_only_is_lost():
+    # C8BS-7: the exception rests only on G5, which is report-only: the node is lost, not khong_dat
+    st = ['chua_ket_luan', 'dat', 'dat', 'dat', 'khong_dat']
+    n = [node(st, rows_with(0.2, c='g5', lo=8.0), cat=True) for _ in range(3)]
+    assert LU.combine(n)['outcome'] == 'khong_dat'
+    res = LU.combine(n, frozenset({'g5'}))
+    assert res['outcome'] == 'hong_he_do' and res['hong_nut'] == [True] * 3 and res['cat_nut'] == [False] * 3
+
+
+def test_gate_block_decide_follows_mask():
+    # C8BS-8: G5 report-only: the combined block decides G1-G4 and its outcome_decide is dat
+    st = ['dat', 'dat', 'dat', 'dat', 'khong_dat']
+    n = [node(st, rows_with(0.2, c='g5', lo=8.0)) for _ in range(2)]
+    res = LU.combine(n, frozenset({'g5'}))
+    g = LU.gate_block(n, res, dict(nodes_s=[1.0, 1.001]), 'a' * 64, 'O1-F08', 'b' * 64)
+    assert g['decide'] == ['g1', 'g2', 'g3', 'g4'] and g['outcome_decide'] == 'dat' and g['outcome'] == 'khong_dat'
+    assert g['report_only'] == ['g5'] and g['gate_file_sha256'] == 'b' * 64 and g['level'] == 'O1-F08'
+
+
+def test_node_state_must_follow_numbers(tmp_path):
+    # C8BS-9: the recorded G3 state dat with lo 0.12 > 0.10 in its own numbers: the node is a tool error
+    sp = tmp_path / 's.json'
+    g = {'g1': dict(state='dat')}
+    for c in LU.MEASURED:
+        lo = 0.12 if c == 'g3' else 0.04
+        g[c] = dict(state='dat', q=lo, lo=lo, hi=lo + 0.01, n_undef=0, chung=dict(q=lo, lo=lo, hi=lo + 0.01, n_undef=0))
+    json.dump(dict(outcome='dat', gate_v3=g), open(sp, 'w'))
+    rp = tmp_path / 'r.csv'
+    rp.write_text('t_cam_s,mien_chung,mien_hop,lo_g2,lo_g3,lo_g4,lo_g5\n1,1,1,0,0,0,0\n')
+    n = LU.node_from_files(str(sp), str(rp))
+    assert not n['ok'] and n['kind'] == 'loi' and 'does not follow' in n['why']
+
+
 def test_single_node_uses_its_state():
     res = LU.combine([node(['dat', 'chua_ket_luan', 'khong_dat', 'dat', 'dat'], rows_with(0.2))])
     assert res['states']['g2'] == 'chua_ket_luan' and res['states']['g3'] == 'khong_dat'
@@ -426,8 +529,10 @@ def test_state_from_numbers_matches_rq3_log():
 
 def _write_node(d, k, states, rows, u_t=0.031):
     g = {'g1': dict(state=states[0])}
-    for c, s in zip(LU.MEASURED, states[1:]):
-        g[c] = dict(state=s, q=0.05, lo=0.04, hi=0.06, n_undef=0, chung=dict(q=0.05, lo=0.04, hi=0.06, n_undef=0))
+    for i, (c, s) in enumerate(zip(LU.MEASURED, states[1:])):
+        lo = max(r[2][i] for r in rows)                  # numbers that follow the rows and the state (C8BS-17)
+        hi = lo + 0.02 if s != 'dat' else min(lo + 0.02, LU.THRESHOLDS[c])
+        g[c] = dict(state=s, q=lo + 0.01, lo=lo, hi=hi, n_undef=0, chung=dict(q=lo + 0.01, lo=lo, hi=hi, n_undef=0))
     with open(os.path.join(d, f'nut_{k:03d}.json'), 'w', encoding='utf-8') as f:
         json.dump(dict(outcome='dat', gate_v3=g, U_t_s=u_t), f)
     with open(os.path.join(d, f'nut_{k:03d}_rows.csv'), 'w', newline='', encoding='utf-8') as f:
@@ -446,6 +551,8 @@ def test_node_files_and_gop_only(tmp_path):
     for k in range(2):
         _write_node(d, k, ['dat', 'dat', 'khong_dat', 'dat', 'dat'],
                     [(10.000001, 1, [0.05, 0.12, 0.05, 1.0]), (10.016668, 1, [0.05, 0.05, 0.05, 1.0])])
+    with open(os.path.join(d, 'nut_000.json'), encoding='utf-8') as f:
+        assert json.load(f)['gate_v3']['g3']['lo'] == 0.12
     assert LU.main(['--gio', gp, '--out-dir', d, '--gop-only']) == 0
     r = json.load(open(os.path.join(d, 'luoi.json'), encoding='utf-8'))
     assert r['states']['g3'] == 'khong_dat' and r['outcome'] == 'khong_dat' and r['u_t_nodes'] == [0.031, 0.031]
@@ -453,7 +560,10 @@ def test_node_files_and_gop_only(tmp_path):
 
 def test_node_rows_without_c8b_columns_is_error(tmp_path):
     sp = tmp_path / 's.json'
-    json.dump(dict(outcome='dat', gate_v3={c: dict(state='dat') for c in LU.CONDS}), open(sp, 'w'))
+    g = {c: dict(state='dat', q=0.05, lo=0.04, hi=0.06, n_undef=0, chung=dict(q=0.05, lo=0.04, hi=0.06, n_undef=0))
+         for c in LU.MEASURED}
+    g['g1'] = dict(state='dat')
+    json.dump(dict(outcome='dat', gate_v3=g), open(sp, 'w'))
     rp = tmp_path / 'r.csv'
     rp.write_text('t,lo_g2,lo_g3,lo_g4,lo_g5\n0,0,0,0,0\n')
     n = LU.node_from_files(str(sp), str(rp))
@@ -505,11 +615,16 @@ def test_run_nodes_with_fake_scorer(tmp_path):
 
 # ── c8b_3b ───────────────────────────────────────────────────────────────────────────────────
 
-def make_wheel(path, R, alpha_r=7.7e-6, wob=0.002, noise=0.0002, seed=1, drift_centre=0.0):
+def make_wheel(path, R, alpha_r=7.7e-6, wob=0.002, noise=0.0001, seed=1, drift_centre=0.0, one_way=False,
+               slow=False, with_col=True):
     rng = np.random.default_rng(seed)
     T = 1 / 60
     tt = np.arange(0, 70, T)
     om = np.where(tt < 34, 6.0 * np.exp(-tt / 12) + 0.3, np.where(tt < 35, 0.0, -(6.0 * np.exp(-(tt - 35) / 12) + 0.3)))
+    if one_way:
+        om = np.abs(om)
+    if slow:
+        om = np.clip(om, -1.0, 1.0)
     th = np.cumsum(om) * T
     out = []
     for ti, a, w in zip(tt, th, om):
@@ -521,7 +636,7 @@ def make_wheel(path, R, alpha_r=7.7e-6, wob=0.002, noise=0.0002, seed=1, drift_c
         ym = 0.5 + R * math.sin(a2) + rng.normal(0, noise)
         psi = a2 + 0.3 + rng.normal(0, 0.0003)
         out.append(dict(t_s=f'{ti:.6f}', valid=1, x=xm, y=ym, tag_x=xm, tag_y=ym,
-                        psi=math.remainder(psi, 2 * math.pi), row_px=row, col_px=col))
+                        psi=math.remainder(psi, 2 * math.pi), row_px=row, col_px=col if with_col else ''))
     with open(path, 'w', newline='') as f:
         w = csv.DictWriter(f, fieldnames=list(out[0]))
         w.writeheader()
@@ -542,8 +657,9 @@ def test_3b_alpha_recovered(wheel):
     assert sh['whole']['alpha_r_s_px'] == pytest.approx(7.7e-6, rel=0.08)
     assert abs(sh['whole']['alpha_c_s_px']) < 1e-6
     assert r['ga_ok'] and r['B']['R0_m'] == pytest.approx(0.25, abs=0.002)
-    if sh['use_alpha']:
-        assert sh['alpha_r_le_s_px'] == pytest.approx(1.25 * sh['alpha_r_s_px'])
+    assert sh['use_alpha'], sh['why']
+    assert sh['alpha_r_le_s_px'] == pytest.approx(1.25 * sh['alpha_r_s_px'])
+    assert r['dung_duoc'] and r['d_psi_quay_deg'] is not None and r['d_p_quay_m'] is not None
 
 
 def test_3b_no_shutter_gives_small_alpha(tmp_path):
@@ -558,6 +674,37 @@ def test_3b_ga_fail(tmp_path):
     make_wheel(str(tmp_path / 'b.csv'), 0.25)
     r = TB.analyse(str(tmp_path / 'a.csv'), str(tmp_path / 'b.csv'))
     assert not r['A']['ga_ok'] and not r['ga_ok'] and r['d_p_quay_m'] is None
+
+
+def test_3b_no_col_one_frame(tmp_path):
+    make_wheel(str(tmp_path / 'a.csv'), 0.0005, wob=0.0)
+    make_wheel(str(tmp_path / 'b.csv'), 0.25, with_col=False)
+    sh = TB.analyse(str(tmp_path / 'a.csv'), str(tmp_path / 'b.csv'))['B']['shutter']
+    assert not sh['use_alpha'] and 'col_px' in sh['why']
+
+
+@pytest.mark.parametrize('kw,part', [(dict(one_way=True), 'phu'), (dict(slow=True), 'phu')])
+def test_3b_coverage_needed(tmp_path, kw, part):
+    make_wheel(str(tmp_path / 'a.csv'), 0.0005, wob=0.0, **kw)
+    make_wheel(str(tmp_path / 'b.csv'), 0.25, **kw)
+    r = TB.analyse(str(tmp_path / 'a.csv'), str(tmp_path / 'b.csv'))
+    assert not r['dung_duoc'] and r['d_psi_quay_deg'] is None and r['d_p_quay_m'] is None
+    assert any(part in x for x in r['thieu'])
+
+
+def test_3b_consistency_both_coefficients(wheel, monkeypatch):
+    # C8BS-12: four check fits with the same summary number but different (alpha_r, alpha_c): not used
+    vals = iter([(5.5e-6, 4.5e-6), (10e-6, 0.0), (1e-6, 9e-6), (5.5e-6, 4.5e-6), (5.5e-6, 4.5e-6)])
+    real = TB.fit_shutter
+
+    def fake(*a, **k):
+        f = real(*a, **k)
+        ar, ac = next(vals)
+        f['groups'][0].update(alpha_r_s_px=ar, alpha_c_s_px=ac, has_col=True)
+        return f
+    monkeypatch.setattr(TB, 'fit_shutter', fake)
+    sh = TB.analyse(*wheel)['B']['shutter']
+    assert not sh['use_alpha'] and 'spread' in sh['why']
 
 
 def test_3b_window_over_turnaround_not_used():
@@ -617,24 +764,42 @@ def _plan():
             '3': dict(task='O1-F08', controller='PID'), '4': dict(task='O1-F08', controller='LADRC')}
 
 
+META = dict(nhanh_tick='bo_tick', commit_hil='abc1234')
+SCRIPT = dict(commit='abc1234ffff', dirty=False)
+
+
+def _pair(rid, task, half, outcome, ut, nodes=None, gio_ok=True):
+    nodes = nodes or [1.0 + 0.001 * i for i in range(len(ut) or 1)]
+    g = dict(gio_d(task, 1e-4, 0.01, 0.0, ok=gio_ok, half=half), nodes_s=nodes, script=SCRIPT,
+             ket_luan='ok' if gio_ok else 'hong_he_do')
+    sha = f'{rid:0<64}'[:64]
+    l = dict(version='c8b_luoi_v1', gio_sha256=sha, task=task, nodes_s=nodes, report_only=[], outcome=outcome,
+             u_t_nodes=ut, script=SCRIPT, nhanh_tick=['bo'])
+    return g, l, sha
+
+
 def _luot(lost_first=False):
-    ok = dict(outcome='dat', u_t_nodes=[0.020, 0.021])
     out = []
     if lost_first:
-        out.append(('3', 'r3a', gio_d('O1-F08', 1e-4, 0.01, 0.0), dict(outcome='hong_he_do', u_t_nodes=[])))
-    out += [('1', 'r1', gio_d('O1-F05', 1e-4, 0.01, 0.0, half=0.006), ok),
-            ('2', 'r2', gio_d('O1-F05', 1e-4, 0.01, 0.0, half=0.008), ok),
-            ('3', 'r3', gio_d('O1-F08', 1e-4, 0.01, 0.0, half=0.009), ok),
-            ('4', 'r4', gio_d('O1-F08', 1e-4, 0.01, 0.0, half=0.007), dict(outcome='khong_dat', u_t_nodes=[0.03]))]
+        g, l, s = _pair('r3a', 'O1-F08', 0.009, 'hong_he_do', [], gio_ok=True)
+        out.append(('3', 'r3a', g, l, s))
+    for slot, rid, task, half, outc, ut in (('1', 'r1', 'O1-F05', 0.006, 'dat', [0.020, 0.021]),
+                                            ('2', 'r2', 'O1-F05', 0.008, 'dat', [0.020, 0.021]),
+                                            ('3', 'r3', 'O1-F08', 0.009, 'dat', [0.020, 0.021]),
+                                            ('4', 'r4', 'O1-F08', 0.007, 'khong_dat', [0.03])):
+        g, l, s = _pair(rid, task, half, outc, ut)
+        out.append((slot, rid, g, l, s))
     return out
+
+
+K = dict(U_p_m=0.004, U_psi_deg=2.0)
 
 
 def test_cong_rule_2b():
     import o1_gate
     from o1_feasibility import Schedule
     from o1_tasks import FIG8
-    k = dict(U_p_m=0.004, U_psi_deg=2.0)
-    d = CU.cong(k, _plan(), _luot(lost_first=True), ['O1-F05', 'O1-F08'], 'bo_tick', 'C8/x')
+    d = CU.cong(K, _plan(), _luot(lost_first=True), ['O1-F05', 'O1-F08'], 'bo_tick', 'C8/x', meta=META)
     p8 = d['dieu_2b']['per_level']['O1-F08']
     assert p8['u_t_c8_s'] == pytest.approx(max(0.021 + 0.009, 0.03 + 0.007))
     v, wz = o1_gate.fig8_cmd_max(Schedule(FIG8['O1-F08']))
@@ -649,27 +814,65 @@ def test_cong_rule_2b():
 
 def test_cong_strict_half():
     assert CU.uhat(0.05, 1.0, 0.0, 1.0, 1.0)['g2'] == 0.05
-    k = dict(U_p_m=0.05, U_psi_deg=1.0)
-    lu = [(s, r, g, dict(l, u_t_nodes=[0.0])) for s, r, g, l in _luot()]
-    lu = [(s, r, dict(g, half_s=0.0), l) for s, r, g, l in lu]
-    d = CU.cong(k, _plan(), lu, ['O1-F05'], 'bo_tick', 'x')
+    lu = [(s, r, dict(g, half_s=0.0), dict(l, u_t_nodes=[0.0] * len(l['u_t_nodes'])), sh)
+          for s, r, g, l, sh in _luot()]
+    d = CU.cong(dict(U_p_m=0.05, U_psi_deg=1.0), _plan(), lu, ['O1-F05'], 'bo_tick', 'x', meta=META)
     assert 'g2' not in d['dieu_2b']['per_level']['O1-F05']['report_only']      # 0.05 = half of D: still decides
 
 
 def test_cong_needs_both_controllers_and_rerun_rule():
-    k = dict(U_p_m=0.004, U_psi_deg=2.0)
     lu = [x for x in _luot() if x[0] != '2']
     with pytest.raises(CU.UError, match='no run'):
-        CU.cong(k, _plan(), lu, ['O1-F05'], 'bo_tick', 'x')
-    lu = _luot() + [('1', 'r1b', gio_d('O1-F05', 1e-4, 0.01, 0.0), dict(outcome='dat', u_t_nodes=[0.02]))]
+        CU.cong(K, _plan(), lu, ['O1-F05'], 'bo_tick', 'x', meta=META)
+    g, l, s = _pair('r1b', 'O1-F05', 0.006, 'dat', [0.02, 0.02])
     with pytest.raises(CU.UError, match='rerun only replaces'):
-        CU.cong(k, _plan(), lu, ['O1-F05'], 'bo_tick', 'x')
-    lu = _luot() + [('9', 'r9', gio_d('O1-F05', 1e-4, 0.01, 0.0), dict(outcome='dat', u_t_nodes=[0.02]))]
+        CU.cong(K, _plan(), _luot() + [('1', 'r1b', g, l, s)], ['O1-F05'], 'bo_tick', 'x', meta=META)
+    g, l, s = _pair('r9', 'O1-F05', 0.006, 'dat', [0.02, 0.02])
     with pytest.raises(CU.UError, match='not in the C8 plan'):
-        CU.cong(k, _plan(), lu, ['O1-F05'], 'bo_tick', 'x')
-    lu = [(s, r, g, dict(l, u_t_nodes=[math.inf]) if r == 'r2' else l) for s, r, g, l in _luot()]
+        CU.cong(K, _plan(), _luot() + [('9', 'r9', g, l, s)], ['O1-F05'], 'bo_tick', 'x', meta=META)
+    lu = [(sl, r, g, dict(l, u_t_nodes=[math.inf, 0.02]) if r == 'r2' else l, sh) for sl, r, g, l, sh in _luot()]
     with pytest.raises(CU.UError, match='each controller'):
-        CU.cong(k, _plan(), lu, ['O1-F05'], 'bo_tick', 'x')
+        CU.cong(K, _plan(), lu, ['O1-F05'], 'bo_tick', 'x', meta=META)
+
+
+def test_cong_refuses_run_twice_and_foreign_grid():
+    lu = _luot()
+    dup = [lu[0], ('2', lu[0][1], lu[0][2], lu[0][3], lu[0][4])] + lu[2:]       # one run in the PID and LADRC slot
+    with pytest.raises(CU.UError, match='twice'):
+        CU.cong(K, _plan(), dup, ['O1-F05'], 'bo_tick', 'x', meta=META)
+    s0, r0, g0, l0, sh0 = lu[0]
+    with pytest.raises(CU.UError, match='another clock file'):
+        CU.cong(K, _plan(), [(s0, r0, g0, dict(l0, gio_sha256='f' * 64), sh0)] + lu[1:], ['O1-F05'], 'bo_tick', 'x',
+                meta=META)
+    with pytest.raises(CU.UError, match='nodes differ'):
+        CU.cong(K, _plan(), [(s0, r0, g0, dict(l0, nodes_s=[9.0]), sh0)] + lu[1:], ['O1-F05'], 'bo_tick', 'x',
+                meta=META)
+    with pytest.raises(CU.UError, match='all five deciding'):
+        CU.cong(K, _plan(), [(s0, r0, g0, dict(l0, report_only=['g5']), sh0)] + lu[1:], ['O1-F05'], 'bo_tick',
+                'x', meta=META)
+
+
+def test_cong_branch_and_commit_from_plan():
+    lu = _luot()
+    with pytest.raises(CU.UError, match='the C8 plan says'):
+        CU.cong(K, _plan(), lu, ['O1-F05'], 'giu_tick', 'x', meta=META)
+    with pytest.raises(CU.UError, match='needs commit_hil'):
+        CU.cong(K, _plan(), lu, ['O1-F05'], 'bo_tick', 'x', meta=dict(nhanh_tick='bo_tick'))
+    s0, r0, g0, l0, sh0 = lu[0]
+    with pytest.raises(CU.UError, match='not made by commit_hil'):
+        CU.cong(K, _plan(), [(s0, r0, g0, dict(l0, script=dict(commit='abc1234', dirty=True)), sh0)] + lu[1:],
+                ['O1-F05'], 'bo_tick', 'x', meta=META)
+    with pytest.raises(CU.UError, match='tick branch'):
+        CU.cong(K, _plan(), [(s0, r0, g0, dict(l0, nhanh_tick=['giu']), sh0)] + lu[1:], ['O1-F05'], 'bo_tick', 'x',
+                meta=META)
+
+
+def test_read_plan_meta(tmp_path):
+    p = tmp_path / 'ke_hoach.csv'
+    p.write_text('# nhanh_tick=bo_tick\n# commit_hil=abc1234\nslot,task,controller\n1,O1-F05,PID\n2,O1-F05,LADRC\n',
+                 encoding='utf-8')
+    plan, meta = CU.read_plan(str(p))
+    assert meta == META and plan['2'] == dict(task='O1-F05', controller='LADRC')
 
 
 def test_write_gate_needs_reader(tmp_path, monkeypatch):
@@ -677,3 +880,23 @@ def test_write_gate_needs_reader(tmp_path, monkeypatch):
     with pytest.raises(CU.UError, match='gate_c8'):
         CU.write_gate(str(tmp_path / 'g.json'), {})
     assert not (tmp_path / 'g.json').exists()
+
+
+def test_write_gate_reads_back_and_refuses(tmp_path, monkeypatch):
+    import types
+    calls = []
+
+    def ok_reader(path):
+        calls.append(path)
+        return types.SimpleNamespace(sha256='x')
+
+    monkeypatch.setitem(sys.modules, 'gate_c8', types.SimpleNamespace(read_gate_c8=ok_reader))
+    g = CU.write_gate(str(tmp_path / 'g.json'), {'format': 'gate_c8_v1'})
+    assert calls == [str(tmp_path / 'g.json')] and g.sha256 == 'x'
+
+    def bad_reader(path):
+        raise ValueError('uhat differs')
+    monkeypatch.setitem(sys.modules, 'gate_c8', types.SimpleNamespace(read_gate_c8=bad_reader))
+    with pytest.raises(CU.UError, match='refused'):
+        CU.write_gate(str(tmp_path / 'h.json'), {'format': 'gate_c8_v1'})
+    assert not (tmp_path / 'h.json').exists() and (tmp_path / 'h.json.TU_CHOI').exists()
