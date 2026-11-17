@@ -692,11 +692,11 @@ def _fake_gate_fields(ctrl, g, v):
     return f
 
 
-def _fake(design_fail=False, default_fails=False, error_in_design=False, error_in_sweep=None):
+def _fake(design_fail=False, default_fails=False, error_in_design=False, error_in_sweep=None, row_over=None):
     """Instant stand-in for safe_run: sweep runs (one factor off its default) complete; design
     runs (several factors off) fail when X1 or X2 is above its default (96/128 corners).
     error_in_sweep (S3G-2): 'default' -> run_error at the first default check; 'factor' -> at every
-    sweep run with one factor off."""
+    sweep run with one factor off. row_over (S03 v8.4): f(ctrl, g, v) -> dict of row fields to replace, or None."""
     calls, works = _Calls(), []
 
     def fake_safe_run(fw, path, ctrl, g, v, mu):
@@ -714,13 +714,16 @@ def _fake(design_fail=False, default_fails=False, error_in_design=False, error_i
         x = np.array([g[n] for n in f])
         log = dict(t=np.arange(3.0) * 0.01, duty=np.zeros((3, 4)) + x.sum())
         # S3V8-7: the two diagnostic counts carry known values (factors off the default; v = 0.8)
-        return dict(status='ok', completed='false' if fail else 'true', e_perp_max=0.01 + 1e-3 * float(x[0]),
-                    e_perp_max_cens=0.01, e_perp_global_max=0.01, tv_duty=np.float64(1.0 + float(x[1])),
-                    sat_frac=0.0, sat_any_frac=0.0, e_theta_lane_max_deg=1.0, e_theta_cmd_max_deg=1.0,
-                    ds_absmax=0.0, e_trk_max=0.0, t_end=np.float64(1.25), e_s_absmax=0.0, track_err_frames=0,
-                    n_upper_frames=len(off), n_back_frames=int(v == 0.8),
-                    cond2_5_ever=np.bool_(True), pos_reset_mid=0, e_perp_rms=0.0, e_trk_rms=0.0,
-                    **_fake_gate_fields(ctrl, g, v)), log
+        row = dict(status='ok', completed='false' if fail else 'true', e_perp_max=0.01 + 1e-3 * float(x[0]),
+                   e_perp_max_cens=0.01, e_perp_global_max=0.01, tv_duty=np.float64(1.0 + float(x[1])),
+                   sat_frac=0.0, sat_any_frac=0.0, e_theta_lane_max_deg=1.0, e_theta_cmd_max_deg=1.0,
+                   ds_absmax=0.0, e_trk_max=0.0, t_end=np.float64(1.25), e_s_absmax=0.0, track_err_frames=0,
+                   n_upper_frames=len(off), n_back_frames=int(v == 0.8),
+                   cond2_5_ever=np.bool_(True), pos_reset_mid=0, e_perp_rms=0.0, e_trk_rms=0.0,
+                   **_fake_gate_fields(ctrl, g, v))
+        if row_over is not None and len(off) <= 1:
+            row.update(row_over(ctrl, g, v) or {})
+        return row, log
 
     def fake_new_process(dll, runs, work):
         os.makedirs(work, exist_ok=True)              # S3V8-6: as run_in_new_process, the folder stays
@@ -1592,7 +1595,7 @@ def test_v82_main_writes_the_gate_columns_and_meta(tmp_path, monkeypatch, capsys
     assert n > 2 * (271 * 3 + 300)
     meta = (out / 'meta.yaml').read_text(encoding='utf-8')
     assert 'source_check: "same at import, start and end of the run"' in meta   # S3G-1, S3G2-1
-    assert meta.startswith('spec: S03 v8.3 ')                                # v8.3 (keeps the v8.2 gate)
+    assert meta.startswith('spec: S03 v8.4 ')                                # v8.4 (keeps the v8.2 gate)
     lines = meta.splitlines()
     gate = _json.loads(next(x for x in lines if x.startswith('gate: ')).split('   #')[0][len('gate: '):])
     assert gate['version'] == G.GATE_VERSION and gate['eval_version'] == E.EVAL_VERSION and gate['u_t'] == 0.0
@@ -1830,33 +1833,198 @@ def test_v83_spec_example_pid_ki_xy():
 
 
 @pytest.mark.parametrize('ok_lo, ok_hi, want', [
-    (None, None, ('0', 'hết lưới nối')),                                   # everything completes
-    (2, None, ('điểm kế tiếp không hoàn thành', 'hết lưới nối')),
+    (None, None, ('0', 'hết lưới')),                                       # everything completes (v8.4: H = b)
+    (2, None, ('điểm kế tiếp không hoàn thành', 'hết lưới')),
     (None, -3, ('0', 'điểm kế tiếp không hoàn thành')),
 ])
-def test_v83_level_sources_lo_zero(ok_lo, ok_hi, want):
-    """T3: sources on a grid with the 0 point (lo = 0); ok_lo: first index that completes; ok_hi: index past
-    the last that completes."""
+def test_v84_level_sources_lo_zero(ok_lo, ok_hi, want):
+    """T3 (v8.4): sources on the original grid with the 0 point (lo = 0); ok_lo: first index that completes;
+    ok_hi: index past the last that completes."""
     grid, info = s3.sweep_grid_n('kp_xy', 1.5, 0.0, 6.0)
-    ok = [True] * len(grid)
+    base = s3.base_grid(grid, info)
+    assert base == s3.sweep_grid('kp_xy', 1.5, 0.0, 6.0) and len(grid) - len(base) == info['K'] > 0
+    ok = [True] * len(base)
     if ok_lo:
         ok[:ok_lo] = [False] * ok_lo
     if ok_hi:
         ok[ok_hi:] = [False] * -ok_hi
-    L, H = s3.levels_from_sweep(grid, 1.5, ok)
-    assert s3.level_sources(grid, L, H, info, 'kp_xy') == want
+    L, H = s3.levels_from_sweep(base, 1.5, ok)
+    assert s3.level_sources(base, L, H, info, 'kp_xy') == want
+    assert H <= info['b']
 
 
-def test_v83_level_sources_lower_end_and_omega_cap():
-    """T3: 'hết lưới dưới' (L = a > 0, no lower point), 'trần ω_o' (omega_o at the top of its grid)."""
+def test_v84_level_sources_lower_end_and_omega_cap():
+    """T3: 'hết lưới dưới' (L = a > 0, no lower point), 'trần ω_o' (omega_o at b = 48, first over 'hết lưới');
+    an omega_o grid that does not reach 48 ends with 'hết lưới'."""
     grid, info = s3.sweep_grid_n('omega_o_xy', 30.0, 5.0, 48.0)
-    L, H = s3.levels_from_sweep(grid, 30.0, [True] * len(grid))
-    assert L == grid[0] > 0 and H == 48.0
-    assert s3.level_sources(grid, L, H, info, 'omega_o_xy') == ('hết lưới dưới', 'trần ω_o')
-    ok = [True] * len(grid)
+    base = s3.base_grid(grid, info)
+    assert base == grid
+    L, H = s3.levels_from_sweep(base, 30.0, [True] * len(base))
+    assert L == base[0] > 0 and H == 48.0
+    assert s3.level_sources(base, L, H, info, 'omega_o_xy') == ('hết lưới dưới', 'trần ω_o')
+    ok = [True] * len(base)
     ok[-1] = False
-    L, H = s3.levels_from_sweep(grid, 30.0, ok)
-    assert s3.level_sources(grid, L, H, info, 'omega_o_xy')[1] == 'điểm kế tiếp không hoàn thành'
+    L, H = s3.levels_from_sweep(base, 30.0, ok)
+    assert s3.level_sources(base, L, H, info, 'omega_o_xy')[1] == 'điểm kế tiếp không hoàn thành'
+    grid, info = s3.sweep_grid_n('omega_o_wz', 3.0, 1.0, 20.0)            # b = 30 < 48: no cut
+    assert info['b'] < s3.OMEGA_O_MAX
+    L, H = s3.levels_from_sweep(grid, 3.0, [True] * len(grid))
+    assert s3.level_sources(grid, L, H, info, 'omega_o_wz')[1] == 'hết lưới'
+
+
+def test_v84_levels_ignore_the_extension():
+    """S03 v8.4: extension points that complete never move H above b (the level rule runs on the original grid)."""
+    grid, info = s3.sweep_grid_n('ki_xy', 0.05, 0.0, 10.0)
+    base = s3.base_grid(grid, info)
+    assert grid[len(base):] == info['noi'] and min(info['noi']) > info['b'] == base[-1]
+    L, H = s3.levels_from_sweep(base, 0.05, [True] * len(base))
+    assert H == info['b'] < info['b_n']
+    with pytest.raises(s3.S03Stop) as e:
+        s3.levels_from_sweep(base, 0.05, [False] * len(base))
+    assert e.value.case == '(i)'
+
+
+# ── S03 v8.4 out-of-range check ───────────────────────────────────────────────────
+
+def _kr(completed='true', status='ok', e=0.05, tv=1.0):
+    return dict(completed=completed, status=status, e_perp_max=e, tv_duty=tv)
+
+
+GATE3 = (0.2, 0.5, 0.8)
+THR = {0.2: 0.2, 0.5: 0.2, 0.8: 0.2}
+
+
+def _w(base, upd):
+    return {**base, **upd}
+
+
+def _all(**k):
+    return {v: _kr(**k) for v in GATE3}
+
+
+@pytest.mark.parametrize('pt, bd, gate, thr, want', [
+    # step 1: not completing (concluded, status ok) at one gate speed, even if another speed is not comparable
+    (_w(_all(), {0.2: _kr(completed='false'), 0.8: _kr(status='track_err')}), _all(), GATE3, THR,
+     ('không cờ', 1, False)),
+    # a 'false' with track_err is not step 1: not comparable, step 2
+    (_w(_all(), {0.2: _kr(completed='false', status='track_err')}), _all(), GATE3, THR, ('chưa kết luận', 2, False)),
+    # step 2: inconclusive y1, missing run of the level, non-finite threshold, non-finite e
+    (_w(_all(), {0.5: _kr(completed='inconclusive')}), _all(), GATE3, THR, ('chưa kết luận', 2, False)),
+    (_all(), _w(_all(), {0.8: None}), GATE3, THR, ('chưa kết luận', 2, False)),
+    (_all(), _all(), GATE3, {0.2: 0.2, 0.5: float('nan'), 0.8: 0.2}, ('chưa kết luận', 2, False)),
+    (_w(_all(), {0.5: _kr(e=float('nan'))}), _all(), GATE3, THR, ('chưa kết luận', 2, False)),
+    # a speed out of the gate does not count: its 'false' is not step 1, its bad level run is not step 2
+    (_w(_all(e=0.0), {0.2: _kr(completed='false')}), _w(_all(e=0.01), {0.2: None}), (0.5, 0.8), THR,
+     ('cờ', 3, False)),
+    # step 3 by e: lower by exactly 0.01 at one speed, not higher elsewhere
+    (_w(_all(e=0.01), {0.5: _kr(e=0.0)}), _all(e=0.01), GATE3, THR, ('cờ', 3, False)),
+    # step 3 by Y3: tv lower by the threshold, e the same
+    (_w(_all(), {0.8: _kr(tv=0.75)}), _all(), GATE3, THR, ('cờ', 3, False)),
+    # threshold 0: a lower tv does not flag; a higher tv is worse
+    (_w(_all(), {0.8: _kr(tv=0.5)}), _all(), GATE3, {0.2: 0.0, 0.5: 0.0, 0.8: 0.0}, ('không cờ', 4, False)),
+    # higher by exactly 0.01 m is not worse: the e lower elsewhere flags
+    (_w(_all(e=0.0), {0.2: _kr(e=0.01)}), _w(_all(e=0.01), {0.2: _kr(e=0.0)}), GATE3, THR, ('cờ', 3, False)),
+    # step 4: better at one speed but worse (tv above the threshold) at another; bao_rieng
+    (_w(_all(), {0.5: _kr(e=0.03), 0.8: _kr(tv=1.5)}), _all(), GATE3, THR, ('không cờ', 4, True)),
+    # step 4: nothing better
+    (_all(), _all(), GATE3, THR, ('không cờ', 4, False)),
+])
+def test_v84_classify_point_steps(pt, bd, gate, thr, want):
+    assert s3.classify_point(pt, bd, gate, thr) == want
+
+
+def _kiem_rows(ctrl, grids, fn, mu=0.5):
+    """Sweep rows of every grid point at every speed, fields from fn(name, x, v)."""
+    out = []
+    for (c, name), (grid, _) in grids.items():
+        if c != ctrl:
+            continue
+        for x in grid:
+            for v in s3.SPEEDS:
+                out.append(dict(controller=c, factor=name, value=x, v=v, mu=mu, **fn(name, x, v)))
+    return out
+
+
+def _kiem_setup(ctrl='PID'):
+    lo_b, hi_b = _tg.BOUNDS[ctrl]
+    grids = {(ctrl, n): s3.sweep_grid_n(n, FAKE_DEFAULTS[ctrl][n], lo, hi)
+             for n, lo, hi in zip(s3.FACTORS[ctrl], lo_b, hi_b)}
+    levels = {ctrl: {}}
+    for (c, n), (grid, info) in grids.items():
+        base = s3.base_grid(grid, info)
+        levels[c][n] = (base[0], base[-1], 'lin')
+    y3 = {(ctrl, v): 1.0 for v in s3.SPEEDS}
+    return grids, levels, y3
+
+
+def test_v84_check_totals_and_rows():
+    """Every extension point is outside [L, H] = the original grid ends and compared with H; a factor whose L is
+    above the lowest point has its lower points compared with L; the totals count them."""
+    grids, levels, y3 = _kiem_setup()
+    grid, info = grids[('PID', 'kp_xy')]
+    base = s3.base_grid(grid, info)
+    levels['PID']['kp_xy'] = (base[2], base[-1], 'lin')               # two original points below L
+    ki_noi = grids[('PID', 'ki_xy')][1]['noi']
+
+    def fn(name, x, v):
+        if name == 'ki_xy' and x == ki_noi[0]:
+            return _kr(e=0.03)                                        # better by 0.02 m: flag
+        if name == 'ki_xy' and x == ki_noi[1]:
+            return _kr(status='track_err')                            # not comparable
+        return _kr()
+    rows, summ = s3.out_of_range_check(_kiem_rows('PID', grids, fn), levels, grids, FAKE_DEFAULTS, ['PID'],
+                                       list(s3.SPEEDS), 0.5, y3, None)
+    pts = [r for r in rows if r['dong'] == 'diem']
+    tot = [r for r in rows if r['dong'] == 'tong']
+    n_noi = sum(i['n_noi'] for _, i in grids.values())
+    assert len(pts) == n_noi + 2 and len(tot) == 1
+    low = [r for r in pts if r['factor'] == 'kp_xy' and r['can'] == 'L']
+    assert [r['value'] for r in low] == base[:2] and all(r['can_value'] == base[2] for r in low)
+    assert {r['luoi'] for r in low} == {'0', 'log'}
+    assert all(r['can'] == 'H' and r['luoi'] == 'noi' for r in pts if r not in low)
+    by = {(r['factor'], r['value']): r for r in pts}
+    assert by[('ki_xy', ki_noi[0])]['ket_qua'] == 'cờ' and by[('ki_xy', ki_noi[0])]['buoc'] == 3
+    assert by[('ki_xy', ki_noi[1])]['ket_qua'] == 'chưa kết luận'
+    assert by[('ki_xy', ki_noi[0])]['e_diem_v0.5'] == 0.03 and by[('ki_xy', ki_noi[0])]['e_can_v0.5'] == 0.05
+    assert by[('ki_xy', ki_noi[0])]['nguong_tv_v0.5'] == pytest.approx(0.2)
+    t = tot[0]
+    assert t['ket_qua'] == 'đã kiểm đủ' and t['n_diem_ngoai'] == t['n_da_kiem'] == n_noi + 2
+    assert (t['n_co'], t['n_chua_ket_luan'], t['n_khong_co'], t['n_chua_kiem']) == (1, 1, n_noi, 0)
+    assert summ['PID']['co'] == [f'ki_xy={ki_noi[0]!r}']
+    assert set(s3.KIEM_COLS) >= set(k for r in rows for k in r)
+
+
+def test_v84_check_gate_speeds_only_and_bao_rieng():
+    grids, levels, y3 = _kiem_setup()
+    k_noi = grids[('PID', 'k_psi')][1]['noi']
+
+    def fn(name, x, v):
+        if name == 'k_psi' and x == k_noi[0]:
+            return _kr(e=0.02) if v == 0.5 else _kr(tv=2.0) if v == 0.8 else _kr(completed='false')
+        return _kr()
+    rows, summ = s3.out_of_range_check(_kiem_rows('PID', grids, fn), levels, grids, FAKE_DEFAULTS, ['PID'],
+                                       [0.5, 0.8], 0.5, y3, None)
+    r = next(x for x in rows if x['dong'] == 'diem' and x['factor'] == 'k_psi' and x['value'] == k_noi[0])
+    assert (r['ket_qua'], r['buoc'], r['bao_rieng']) == ('không cờ', 4, True)     # 0.2 is out of the gate
+    assert r['trong_cong_v0.2'] is False and r['trong_cong_v0.5'] is True
+    assert summ['PID']['bao_rieng'] == [f'k_psi={k_noi[0]!r}'] and summ['PID']['n_bao_rieng'] == 1
+
+
+def test_v84_check_part_way_and_not_checked():
+    grids, levels, y3 = _kiem_setup()
+    del levels['PID']['pos_ki']
+    rows, summ = s3.out_of_range_check(_kiem_rows('PID', grids, lambda *a: _kr()), levels, grids, FAKE_DEFAULTS,
+                                       ['PID', 'ADRC'], list(s3.SPEEDS), 0.5, y3, None)
+    tot = {r['controller']: r for r in rows if r['dong'] == 'tong'}
+    assert tot['PID']['ket_qua'] == 'kiểm dở' and tot['PID']['n_gain_chua_kiem'] == 1
+    assert tot['PID']['n_chua_kiem'] == len(grids[('PID', 'pos_ki')][0])
+    assert tot['ADRC']['ket_qua'] == 'kiểm dở' and tot['ADRC']['n_gain_chua_kiem'] == 7      # sweep not reached
+    assert 'grid not known' in tot['ADRC']['ghi_chu'] and tot['ADRC']['n_da_kiem'] == 0
+    for case in ('(i)', '(ii)'):
+        rows, summ = s3.out_of_range_check(_kiem_rows('PID', grids, lambda *a: _kr()), levels, grids,
+                                           FAKE_DEFAULTS, ['PID', 'ADRC'], list(s3.SPEEDS), 0.5, y3, case)
+        assert [r['ket_qua'] for r in rows] == ['không kiểm', 'không kiểm']
+        assert summ['PID']['n_da_kiem'] == 0
 
 
 def test_v83_grid_labels():
@@ -1884,12 +2052,13 @@ def test_v83_main_writes_levels_sources_luoi_and_grid_meta(tmp_path, monkeypatch
         for name, lo, hi in zip(s3.FACTORS[ctrl], lo_b, hi_b):
             d = FAKE_DEFAULTS[ctrl][name]
             grid, info = s3.sweep_grid_n(name, d, lo, hi)
+            base = s3.base_grid(grid, info)
             r = lv[(ctrl, name)]
             assert float(r['a']) == info['a'] and float(r['b']) == info['b']
             assert r['b_n'] == ('' if info['b_n'] is None else repr(info['b_n']))
-            # the fake completes every sweep run: L, H are the grid ends
-            assert float(r['L']) == grid[0] and float(r['H']) == grid[-1]
-            assert (r['L_nguon'], r['H_nguon']) == s3.level_sources(grid, grid[0], grid[-1], info, name)
+            # the fake completes every sweep run: L, H are the ends of the ORIGINAL grid (v8.4)
+            assert float(r['L']) == base[0] and float(r['H']) == base[-1] == info['b']
+            assert (r['L_nguon'], r['H_nguon']) == s3.level_sources(base, base[0], base[-1], info, name)
             rows = [x for x in sweep if x['controller'] == ctrl and x['factor'] == name]
             assert len(rows) == len(grid) * len(s3.SPEEDS)
             for x in rows:
@@ -1904,13 +2073,90 @@ def test_v83_main_writes_levels_sources_luoi_and_grid_meta(tmp_path, monkeypatch
         for k, n in enumerate(s3.FACTORS[c]):
             L_, H_, sc = float(lv[(c, n)]['L']), float(lv[(c, n)]['H']), lv[(c, n)]['scale']
             assert r[f'{n}_value'] == repr(s3.decode(float(r[f'X{k + 1}']), L_, H_, sc)), (c, r['point_id'], n)
-    assert {r['H_nguon'] for r in lv.values()} == {'hết lưới nối', 'trần ω_o'}
+    assert {r['H_nguon'] for r in lv.values()} == {'hết lưới', 'trần ω_o'}
     assert {r['L_nguon'] for r in lv.values()} == {'0', 'hết lưới dưới'}
     meta = (out / 'meta.yaml').read_text(encoding='utf-8')
-    assert meta.startswith('spec: S03 v8.3 ')
+    assert meta.startswith('spec: S03 v8.4 ')
     grid_meta = _json.loads(next(x for x in meta.splitlines() if x.startswith('grid: ')).split('   #')[0][6:])
     assert set(grid_meta) == {f'{c} {n}' for c in s3.CONTROLLERS for n in s3.FACTORS[c]}
     assert grid_meta['PID ki_xy']['K'] == 4 and grid_meta['ADRC omega_o_xy']['b_n'] is None
+    # v8.4: the check file, fixed header; with the fake every extension point is 'không cờ'
+    kiem = list(_csv.DictReader(open(out / 'kiem_ngoai_mien.csv', encoding='utf-8')))
+    assert next(_csv.reader(open(out / 'kiem_ngoai_mien.csv', encoding='utf-8'))) == s3.KIEM_COLS
+    pts = [r for r in kiem if r['dong'] == 'diem']
+    n_noi = sum(i['n_noi'] for i in (s3.sweep_grid_n(n, FAKE_DEFAULTS[c][n], lo, hi)[1] for c in s3.CONTROLLERS
+                                     for n, lo, hi in zip(s3.FACTORS[c], *_tg.BOUNDS[c])))
+    assert len(pts) == n_noi and {r['luoi'] for r in pts} == {'noi'} and {r['ket_qua'] for r in pts} == {'không cờ'}
+    assert [(r['controller'], r['ket_qua']) for r in kiem if r['dong'] == 'tong'] == \
+        [('PID', 'đã kiểm đủ'), ('ADRC', 'đã kiểm đủ')]
+    assert 'kiem_ngoai_mien.csv' in _json.loads(next(x for x in meta.splitlines()
+                                                     if x.startswith('file_sha256: '))[13:])
+    km = _json.loads(next(x for x in meta.splitlines() if x.startswith('kiem_ngoai_mien: ')).split('   #')[0][17:])
+    assert km['PID']['ket_qua'] == 'đã kiểm đủ' and km['ADRC']['co'] == []
+
+
+def _over_k_psi(ctrl_want, fields):
+    """row_over of _fake: the given fields for the k_psi extension points of one controller (above b)."""
+    lo_b, hi_b = _tg.BOUNDS[ctrl_want]
+    j = s3.FACTORS[ctrl_want].index('k_psi')
+    b = s3.sweep_grid_n('k_psi', 1.0, lo_b[j], hi_b[j])[1]['b']
+
+    def over(ctrl, g, v):
+        return fields if ctrl == ctrl_want and g['k_psi'] > b else None
+    return over
+
+
+@needs_dll
+def test_v84_main_flag_stops_before_the_main_design(tmp_path, monkeypatch, capsys):
+    """A flagged extension point (e_perp_max lower by 0.02 m, tv the same) stops S03 before design.csv: exit 2,
+    no main-design run, no sealed runs; the check file says 'cờ'; levels and sweep are written."""
+    import csv as _csv
+    code, out, console, calls, _ = _run_main(tmp_path, monkeypatch, capsys,
+                                             row_over=_over_k_psi('ADRC', dict(e_perp_max=0.0)))
+    assert code == 2
+    assert max(calls) <= 1                                        # no run with two factors off
+    runs = out / 'sealed' / 'runs.csv'
+    assert not runs.exists() or len(runs.read_text().strip().splitlines()) <= 1   # header only
+    assert (out / 'design.csv').read_text().strip() == ''
+    kiem = list(_csv.DictReader(open(out / 'kiem_ngoai_mien.csv', encoding='utf-8')))
+    co = [r for r in kiem if r['ket_qua'] == 'cờ']
+    assert co and {(r['controller'], r['factor'], r['can']) for r in co} == {('ADRC', 'k_psi', 'H')}
+    assert '[STOP] out-of-range check' in console and 'Liam decides' in console
+    meta = (out / 'meta.yaml').read_text(encoding='utf-8')
+    assert 'stopped in the sweep: out-of-range check' in meta
+
+
+@needs_dll
+def test_v84_main_inconclusive_warns_and_goes_on(tmp_path, monkeypatch, capsys):
+    import csv as _csv
+    code, out, console, _, _ = _run_main(tmp_path, monkeypatch, capsys,
+                                         row_over=_over_k_psi('PID', dict(status='track_err')))
+    assert code == 0 and (out / 'sealed' / 'runs.csv').exists()
+    assert 'WARNING: out-of-range check has inconclusive points' in console
+    kiem = list(_csv.DictReader(open(out / 'kiem_ngoai_mien.csv', encoding='utf-8')))
+    assert {r['ket_qua'] for r in kiem if r['dong'] == 'diem' and r['factor'] == 'k_psi' and
+            r['controller'] == 'PID'} == {'chưa kết luận'}
+
+
+@needs_dll
+def test_v84_main_check_totals_when_s03_stops_in_the_sweep(tmp_path, monkeypatch, capsys):
+    """'kiểm dở' when a run_error stops the sweep (every grid point counted as not checked), 'không kiểm' at 3.1 (i)."""
+    import csv as _csv
+    code, out, _, _, _ = _run_main(tmp_path, monkeypatch, capsys, error_in_sweep='factor')
+    assert code == 2
+    tot = {r['controller']: r for r in _csv.DictReader(open(out / 'kiem_ngoai_mien.csv', encoding='utf-8'))
+           if r['dong'] == 'tong'}
+    n_all = {c: sum(len(s3.sweep_grid_n(n, FAKE_DEFAULTS[c][n], lo, hi)[0])
+                    for n, lo, hi in zip(s3.FACTORS[c], *_tg.BOUNDS[c])) for c in s3.CONTROLLERS}
+    for c in s3.CONTROLLERS:
+        assert tot[c]['ket_qua'] == 'kiểm dở' and tot[c]['n_gain_chua_kiem'] == '7'
+        assert tot[c]['n_chua_kiem'] == str(n_all[c]) and tot[c]['n_da_kiem'] == '0'
+    tmp2 = tmp_path / 'b'
+    tmp2.mkdir()
+    code, out, _, _, _ = _run_main(tmp2, monkeypatch, capsys, default_fails=True)
+    assert code == 2
+    assert [r['ket_qua'] for r in _csv.DictReader(open(out / 'kiem_ngoai_mien.csv', encoding='utf-8'))] == \
+        ['không kiểm', 'không kiểm']
 
 
 @needs_dll

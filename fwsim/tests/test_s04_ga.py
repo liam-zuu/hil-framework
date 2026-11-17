@@ -170,23 +170,66 @@ def test_domain_and_log_coding(tmp_path):
 
 # ── S04 v6.4 (C14-2): edge side and level source (design 03_CODE/docs/2026-11-15_Thiet_ke_S03_v83_luoi_noi_v1.md 6)
 
-def test_v64_read_domain_reads_the_level_sources(tmp_path):
-    d = _s03_dir(tmp_path)
+def _edit_levels(d, **upd):
     import csv as _csv
-    rows = list(_csv.DictReader(open(d / 'levels.csv')))
+    rows = list(_csv.DictReader(open(d / 'levels.csv', encoding='utf-8')))
     for r in rows:
-        r.update(L_nguon='0', H_nguon='hết lưới nối')
+        r.update(upd)
     with open(d / 'levels.csv', 'w', newline='', encoding='utf-8') as f:
         w = _csv.DictWriter(f, fieldnames=list(rows[0]))
         w.writeheader()
         w.writerows(rows)
+
+
+def test_v64_read_domain_reads_the_level_sources(tmp_path):
+    d = _s03_dir(tmp_path)
+    _edit_levels(d, L_nguon='0', H_nguon='hết lưới', b='8.0')
     dom = s4.read_domain(str(d), 'PID')
-    assert all(x['L_src'] == '0' and x['H_src'] == 'hết lưới nối' for x in dom)
+    assert all(x['L_src'] == '0' and x['H_src'] == 'hết lưới' for x in dom)
+    assert all(x['L_kiem'] == '' and x['H_kiem'] == '' for x in dom)           # no S03 v8.4 check file
 
 
-DOM64 = [dict(name='a', L=1.0, H=2.0, scale='lin', L_src='hết lưới dưới', H_src='hết lưới nối'),
+@pytest.mark.parametrize('upd', [dict(H_nguon='hết lưới nối'), dict(b='2.0')])
+def test_v66_read_domain_refuses_levels_on_the_extension(tmp_path, upd):
+    """S04 v6.6: the GA domain is [L, H] of the original grid; S03 v8.3 levels (H on the extension) are refused."""
+    d = _s03_dir(tmp_path)
+    _edit_levels(d, L_nguon='0', **upd)
+    with pytest.raises(SystemExit, match='extension'):
+        s4.read_domain(str(d), 'PID')
+
+
+def test_v66_read_domain_reads_the_out_of_range_check(tmp_path):
+    import csv as _csv
+    d = _s03_dir(tmp_path)
+    cols = ['dong', 'controller', 'factor', 'value', 'can', 'ket_qua']
+    rows = [dict(dong='diem', controller='PID', factor='kp_xy', value=str(9 + i), can='H', ket_qua=k)
+            for i, k in enumerate(('không cờ', 'không cờ', 'chưa kết luận'))]
+    rows += [dict(dong='diem', controller='ADRC', factor='kp_xy', value='9', can='H', ket_qua='cờ'),
+             dict(dong='tong', controller='PID', ket_qua='đã kiểm đủ'), dict(dong='tong', controller='ADRC',
+                                                                            ket_qua='kiểm dở')]
+    with open(d / 'kiem_ngoai_mien.csv', 'w', newline='', encoding='utf-8') as f:
+        w = _csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        w.writerows(rows)
+    by = {x['name']: x for x in s4.read_domain(str(d), 'PID')}
+    assert by['kp_xy']['H_kiem'] == '3 điểm: không cờ 2, chưa kết luận 1, cờ 0'
+    assert by['kp_xy']['L_kiem'] == '0 điểm' and by['ki_xy']['H_kiem'] == '0 điểm'
+    assert s4.read_out_of_range(str(d), 'ADRC')[('pos_kp', 'H')] == '0 điểm (lượt kiểm: kiểm dở)'
+
+
+DOM64 = [dict(name='a', L=1.0, H=2.0, scale='lin', L_src='hết lưới dưới', H_src='hết lưới', L_kiem='0 điểm',
+              H_kiem='2 điểm: không cờ 2, chưa kết luận 0, cờ 0'),
          dict(name='b', L=1.0, H=3.0, scale='lin', L_src='0', H_src='điểm kế tiếp không hoàn thành'),
          dict(name='c', L=1.0, H=2.0, scale='lin', L_src='', H_src='')]
+
+
+def _limit(dom, limit):
+    """S04 v6.6 edge_limit text: 'vùng ngoài biên chưa khảo sát bằng GA: ' + factor:side [kiểm ngoài miền: ...]."""
+    if not limit:
+        return ''
+    by = {d['name']: d for d in dom}
+    return 'vùng ngoài biên chưa khảo sát bằng GA: ' + ' '.join(
+        f'{n}:{s} [kiểm ngoài miền: {by[n].get(s + "_kiem") or "?"}]' for n, s in (p.split(':') for p in limit.split()))
 
 
 @pytest.mark.parametrize('x, side, limit', [
@@ -201,10 +244,10 @@ def test_v64_edge_report_side_source_and_limit(x, side, limit):
     rep = s4.edge_report(DOM64, np.array(x))
     assert rep['edge'] == ' '.join(s4.edge_flags(DOM64, np.array(x)))       # the old flag, unchanged
     assert rep['edge_side'] == side and rep['edge'] == ' '.join(p.split(':')[0] for p in side.split())
-    assert rep['edge_limit'] == (f'vùng ngoài biên chưa khảo sát: {limit}' if limit else '')
+    assert rep['edge_limit'] == _limit(DOM64, limit)
     if side:
         n, s = side.split(':')
-        src = {('a', 'L'): 'hết lưới dưới', ('a', 'H'): 'hết lưới nối', ('b', 'H'): 'điểm kế tiếp không hoàn thành',
+        src = {('a', 'L'): 'hết lưới dưới', ('a', 'H'): 'hết lưới', ('b', 'H'): 'điểm kế tiếp không hoàn thành',
                ('b', 'L'): '0', ('c', 'H'): '?'}[(n, s)]
         assert rep['edge_src'] == f'{side}:{src}'
 
@@ -213,11 +256,12 @@ def test_v64_summarise_rows_carry_the_edge_columns():
     finals = {1: [P(0.020, 9.0, x=(1.98, 2.0, 1.5), seed=1)], 2: [P(0.022, 4.0, x=(1.98, 2.0, 1.5), seed=2)]}
     rows, _ = s4.summarise('PID', DOM64, finals)
     for r in rows:
-        assert r['edge_side'] == 'a:H' and r['edge_limit'] == 'vùng ngoài biên chưa khảo sát: a:H', r['kind']
+        assert r['edge_side'] == 'a:H' and r['edge_limit'] == _limit(DOM64, 'a:H'), r['kind']
+        assert r['edge_limit'].endswith('a:H [kiểm ngoài miền: 2 điểm: không cờ 2, chưa kết luận 0, cờ 0]')
 
 
 DOMLOG = [dict(name='a', L=0.5, H=8.0, scale='log', L_src='hết lưới dưới', H_src='điểm kế tiếp không hoàn thành'),
-          dict(name='b', L=0.5, H=8.0, scale='log', L_src='0', H_src='hết lưới nối')]
+          dict(name='b', L=0.5, H=8.0, scale='log', L_src='0', H_src='hết lưới')]
 
 
 @pytest.mark.parametrize('gains, side, limit', [
@@ -236,7 +280,7 @@ def test_v64_summarise_uses_the_ga_coordinate_on_a_log_axis(gains, side, limit):
     rows, _ = s4.summarise('PID', DOMLOG, {1: [p[0]], 2: [p[1]]})
     for r in rows:
         assert r['edge_side'] == side, r['kind']
-        assert r['edge_limit'] == (f'vùng ngoài biên chưa khảo sát: {limit}' if limit else ''), r['kind']
+        assert r['edge_limit'] == _limit(DOMLOG, limit), r['kind']
 
 
 def test_mu_rule_mid_when_every_point_satisfies(tmp_path):

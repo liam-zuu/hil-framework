@@ -369,8 +369,20 @@ PID_G = ['kp_xy', 'ki_xy', 'kp_wz', 'ki_wz', 'pos_kp', 'pos_ki', 'k_psi']
 ADRC_G = ['omega_c_xy', 'omega_o_xy', 'omega_c_wz', 'omega_o_wz', 'pos_kp', 'pos_ki', 'k_psi']
 
 
+KCOLS = ['dong', 'controller', 'factor', 'value', 'luoi', 'can', 'can_value', 'ket_qua']
+
+
+def kiem_ok_rows():
+    """S03 v8.4 kiem_ngoai_mien.csv of the fixture: the extension point 8.0 of every non-omega_o gain, 'không cờ';
+    one total per controller, 'đã kiểm đủ'."""
+    rows = [dict(dong='diem', controller=c, factor=g, value='8.0', luoi='noi', can='H', can_value='2.0',
+                 ket_qua='không cờ') for c, gs in (('PID', PID_G), ('ADRC', ADRC_G)) for g in gs
+            if not g.startswith('omega_o')]
+    return rows + [dict(dong='tong', controller=c, ket_qua='đã kiểm đủ') for c in ('PID', 'ADRC')]
+
+
 def s03_run(tmp, name='2026-11-20_run03', meta=None, speeds=('0.2', '0.5', '0.8'), drop=None, extra=None,
-            omega_hi=48.0, lev_edit=None, sw_edit=None):
+            omega_hi=48.0, lev_edit=None, sw_edit=None, kiem_edit=None):
     run = tmp / '05_DATA' / 'results' / 'S03' / name
     run.mkdir(parents=True)
     sw, lv = [], []
@@ -388,7 +400,7 @@ def s03_run(tmp, name='2026-11-20_run03', meta=None, speeds=('0.2', '0.5', '0.8'
                     sw.append(dict(controller=c, factor=g, value=repr(x), v=v, luoi=lu, completed='true'))
             lv.append(dict(controller=c, factor=g, L='0.5', H='2.0', default='1.0', a='0.5',
                            b=repr(omega_hi) if om else '4.0', b_n='' if om else '8.0', L_nguon='0',
-                           H_nguon='trần ω_o' if om else 'hết lưới nối'))
+                           H_nguon='trần ω_o' if om else 'điểm kế tiếp không hoàn thành'))
     if extra:
         sw.append(extra)
     if lev_edit:
@@ -397,6 +409,11 @@ def s03_run(tmp, name='2026-11-20_run03', meta=None, speeds=('0.2', '0.5', '0.8'
         sw_edit(sw)
     wcsv(run / 'sweep.csv', SCOLS, sw)
     wcsv(run / 'levels.csv', LCOLS, lv)
+    kr = kiem_ok_rows()
+    if kiem_edit:
+        kr = kiem_edit(kr)
+    if kr is not None:
+        wcsv(run / 'kiem_ngoai_mien.csv', KCOLS, kr)
     m = dict(trial=False, date='2026-11-20', script=dict(commit='abc', dirty=False),
              firmware=dict(esp32=dict(dirty=False)))
     m.update(meta or {})
@@ -422,10 +439,13 @@ def test_mien_domain(w0, capsys):
     rows = list(csv.DictReader(open(w0['tmp'] / 'A' / 'mien_A.csv', encoding='utf-8')))
     d = {(r['controller'], r['gain']): r for r in rows}
     assert len(rows) == 14
-    assert (d[('PID', 'kp_xy')]['lo'], d[('PID', 'kp_xy')]['hi'], d[('PID', 'kp_xy')]['nguon_hi']) == ('0.0', '8.0', 'b_n')
+    # S03 v8.4 / S05 v3.41: the original grid up to b; the extension point 8.0 (luoi noi) is not in the domain
+    assert (d[('PID', 'kp_xy')]['lo'], d[('PID', 'kp_xy')]['hi'], d[('PID', 'kp_xy')]['nguon_hi']) == ('0.0', '4.0', 'b')
+    assert d[('PID', 'kp_xy')]['n_diem'] == '5' and {r['nguon_hi'] for r in rows} == {'b', 'tran_omega_o'}
     assert d[('LADRC', 'omega_o_xy')]['hi'] == '48.0' and d[('LADRC', 'omega_o_xy')]['nguon_hi'] == 'tran_omega_o'
     js = json.load(open(w0['tmp'] / 'A' / 'mien_A.json', encoding='utf-8'))
     assert js['sha256']['sweep.csv'] == sha(run / 'sweep.csv') and js['s03_run'] == '05_DATA/results/S03/2026-11-20_run03'
+    assert js['sha256']['kiem_ngoai_mien.csv'] == sha(run / 'kiem_ngoai_mien.csv') and 'S03 v8.4' in js['spec']
     assert C.main(mien_args(w0, run)) == 2                                   # no overwrite without --thay
     assert C.main(mien_args(w0, run, None, '--thay')) == 0
     assert len([n for n in os.listdir(w0['tmp'] / 'A') if '__cu_' in n]) == 2
@@ -455,10 +475,31 @@ def rename_gain(sw):
     (dict(omega_hi=60.0), '> 48'),
     (dict(lev_edit=lambda lv: lv[0].update(default='99')), 'default'),
     (dict(lev_edit=lambda lv: lv[0].update(H='50')), '[L, H]'),
-    (dict(lev_edit=lambda lv: lv[0].update(b_n='9.0')), 'b_n'),
-    (dict(lev_edit=lambda lv: lv[1].update(b='8.0', b_n='')), 'disagree'),
-    (dict(sw_edit=lambda sw: [r.update(luoi='log') for r in sw if r['factor'] == 'kp_xy' and r['value'] == '8.0']
-          + [r.update(luoi='noi') for r in sw if r['factor'] == 'kp_xy' and r['value'] == '4.0']), 'disagree'),
+    # S03 v8.4: hi = b, the extension is not the domain
+    (dict(lev_edit=lambda lv: lv[1].update(b='8.0', b_n='')), 'is not b'),
+    (dict(lev_edit=lambda lv: lv[0].update(H='8.0')), '[L, H]'),                    # a level on the extension
+    (dict(sw_edit=lambda sw: [r.update(luoi='log') for r in sw if r['factor'] == 'kp_xy' and r['value'] == '8.0']),
+     'is not b'),
+    (dict(sw_edit=lambda sw: [r.update(luoi='noi') for r in sw if r['factor'] == 'kp_xy' and r['value'] == '4.0']),
+     'is not b'),
+    (dict(sw_edit=lambda sw: next(r for r in sw if r['factor'] == 'kp_xy' and r['value'] == '8.0').update(luoi='log')),
+     'differs'),
+    (dict(sw_edit=lambda sw: sw.extend(dict(controller='PID', factor='kp_xy', value='3.0', v=v, luoi='noi',
+                                            completed='true') for v in ('0.2', '0.5', '0.8'))), 'not above b'),
+    (dict(sw_edit=lambda sw: sw.extend(dict(controller='ADRC', factor='omega_o_xy', value='96.0', v=v, luoi='noi',
+                                            completed='true') for v in ('0.2', '0.5', '0.8'))), 'never extended'),
+    # S03 v8.4 out-of-range check
+    (dict(kiem_edit=lambda kr: None), 'kiem_ngoai_mien.csv: no file'),
+    (dict(kiem_edit=lambda kr: [dict(r, ket_qua='kiểm dở') if r['controller'] == 'ADRC' and r['dong'] == 'tong'
+                                else r for r in kr]), 'checked in full'),
+    (dict(kiem_edit=lambda kr: [dict(r, ket_qua='không kiểm') if r['dong'] == 'tong' else r for r in kr]),
+     'checked in full'),
+    (dict(kiem_edit=lambda kr: [dict(kr[0], ket_qua='cờ')] + kr[1:]), 'flagged'),
+    (dict(kiem_edit=lambda kr: [r for r in kr if not (r['dong'] == 'tong' and r['controller'] == 'ADRC')]),
+     'total rows for'),
+    (dict(kiem_edit=lambda kr: kr + [dict(dong='tong', controller='PID', ket_qua='đã kiểm đủ')]), 'two total rows'),
+    (dict(kiem_edit=lambda kr: [dict(kr[0], ket_qua='co')] + kr[1:]), 'not in'),
+    (dict(kiem_edit=lambda kr: [dict(kr[0], dong='x')] + kr[1:]), 'is not diem or tong'),
     (dict(sw_edit=lambda sw: sw.append(dict(controller='PID', factor='kp_xy', value='1', v='0.2', luoi='log',
                                             completed='true'))), 'once each'),       # SA-16
 ])
@@ -521,7 +562,7 @@ def test_them_mien_A(w0, capsys):
     assert C.main(base) == 2 and '--tuning-log' in capsys.readouterr().out
     base += ['--tuning-log', str(w0['tl0'])]
     t = p.read_bytes()
-    p.write_bytes(t.replace(b'8.0', b'9.0', 1))
+    p.write_bytes(t.replace(b'4.0', b'5.0', 1))
     assert C.main(base) == 2 and 'differs' in capsys.readouterr().out
     p.write_bytes(t)
     assert C.main(base) == 0
