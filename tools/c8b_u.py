@@ -16,8 +16,8 @@ khoa (after the C8 clips are tracked and the C8 runs have their clock files):
   U_p  (m)       = LE x [largest per-frame error of the 9 check tags (test 1) + check-tag placement by tape + body-centre
                  residual of test 2 after the tag-body offset + offset-parameter difference origin / far place of test
                  2 + re-seating repeatability (position) + tag-height error rho |dh| / (H - h) + plumb / zc error
-                 (h / H) dn + rho h dzc / (H (H - dzc)) + d_p_quay (3b)]   (plumb, zc: Liam 17/11 evening at CODE_C8B,
-                 "Them, Codex vong 7 hep (Recommended)"; dn, dzc = the bounds of the automatic check after clip H)
+                 (h / H) dn + h dzc (rho + dn) / (H (H - dzc - h)) + d_p_quay (3b)]   (plumb, zc: Liam 17/11 evening
+                 at CODE_C8B, "Them, Codex vong 7 hep (Recommended)"; C8BS-R7-1..3)
   U_psi (deg)    = LE x [heading residual of test 2 after the mounting angle + reference heading error of test 2 (car
                  set on the tape) + re-seating repeatability (angle) + d_psi_quay (3b)]          (design 5, C8B4-11)
                  Parts may overlap (conservative), none subtracted. Test 5 (ruler at the stop points) is an end-to-end
@@ -44,9 +44,13 @@ Last line: #ket_qua,ma=0 written / 2 refused or error.
 
 c8_cam_u_vao.json (CODE_CAM, proposed names; m and deg): {"phep1": {"loi_khung_max_m"}, "dat_ma_kiem_m",
   "phep2": {"du_tam_m", "du_huong_deg", "chenh_tham_so_m", "huong_chuan_deg"}, "thao_dat": {"vi_tri_m", "goc_deg"},
-  "do_cao": {"rho_max_m", "dh_m", "H_m", "h_m"}, "day_doi": {"dn_m", "dzc_m"}, "nguon": [...]}
-  day_doi.dn_m = plumb measurement error of 16/11 + the image shift allowed by the automatic check, on the floor;
-  day_doi.dzc_m = the zc difference allowed by that check (bounds, not the values seen on the day).
+  "do_cao": {"rho_max_m", "dh_m", "H_m", "h_m"}, "day_doi": {"dn_m", "dzc_m", "kappa"}, "nguon": [...]}
+  do_cao.rho_max_m = the largest horizontal distance of the car tag centre from the plumb point over the image area
+  used; do_cao.H_m, h_m = the zc and tag height of the scoring session (day_doi.kappa = its kappa, must equal h / H).
+  day_doi.dn_m = bound on |plumb point used - true point under the camera centre| on the day, and day_doi.dzc_m =
+  bound on |zc used - true camera height| on the day: each the absolute error of the 16/11 measurement plus what
+  the camera may have moved since, shown by a camera-centre estimate with its own error (C8BS-R7-1, R7-2: a median
+  shift of the floor marks in the image, or a zc fit with zc as its prior, is not such a bound).
 ke_hoach_c8.csv (written before C8): lines '# nhanh_tick=bo_tick|giu_tick', '# commit_hil=<sha>' (O1 v11.34 Q4),
   then the CSV slot, task, controller (PID / LADRC). Each --luot grid file must come from its clock file
   (gio_sha256, task, nodes), be scored with all five conditions deciding, by commit_hil, on the plan's tick branch.
@@ -68,7 +72,7 @@ for _p in (os.path.join(HERE, '..', 'rpi5'), os.path.join(HERE, '..', 'fwsim'), 
         sys.path.insert(0, _p)
 import c8_u_imu as cu                                                    # noqa: E402
 
-VERSION = 'c8b_khoa_v1'
+VERSION = 'c8b_khoa_v2'     # C8BS-R7-4: v2 = U_p with the plumb / zc part; a v1 lock is refused by cong
 LE = 1.25
 CONTROLLERS = ('PID', 'LADRC')
 MASKABLE = ('g2', 'g3', 'g5')
@@ -107,13 +111,18 @@ def u_p_u_psi(cam, tb):
         raise UError(f'do_cao: camera height {H} m not above the tag height {h} m')
     rho = _num(_get(cam, 'do_cao.rho_max_m'), 'do_cao.rho_max_m')
     cao = rho * _num(_get(cam, 'do_cao.dh_m'), 'do_cao.dh_m') / (H - h)
-    # plumb point and zc reused from 16/11 (Liam 17/11): parallax P = p + kappa (C - p), kappa = h / zc, so a plumb
-    # error dn shifts the tag by kappa dn and a zc error dzc scales about C by h dzc / (zc (zc - dzc)) (worst sign)
+    # plumb point and zc reused from 16/11 (Liam 17/11): car_pose corrects P = p + kappa (C - p), kappa = h / H with
+    # the H, C of the session; truth P* = p + kappa* (C* - p), |C* - p| = rho* H* / (H* - h) (central projection from
+    # the true centre), so |P - P*| <= (h / H) dn + h dzc rho* / (H (H* - h)), H* >= H - dzc, rho* <= rho + dn
+    # (C8BS-R7-1..3: dn, dzc bound the absolute error of the camera centre position and height, not a check threshold)
     dn = _num(_get(cam, 'day_doi.dn_m'), 'day_doi.dn_m')
     dzc = _num(_get(cam, 'day_doi.dzc_m'), 'day_doi.dzc_m')
-    if not dzc < H:
-        raise UError(f'day_doi.dzc_m {dzc} m not below the camera height {H} m')
-    day_doi = h / H * dn + rho * h * dzc / (H * (H - dzc))
+    if not H - dzc > h:
+        raise UError(f'day_doi.dzc_m {dzc} m: camera height {H} m minus it not above the tag height {h} m')
+    kap = _num(_get(cam, 'day_doi.kappa'), 'day_doi.kappa')
+    if abs(kap - h / H) > 1e-6 * (h / H):                # C8BS-R7-3: H, h here are the ones of the scoring session
+        raise UError(f'day_doi.kappa {kap} is not do_cao.h_m / do_cao.H_m = {h / H} (the kappa of the scoring)')
+    day_doi = h / H * dn + h * dzc * (rho + dn) / (H * (H - dzc - h))
     p = dict(phep1_khung_max=_num(_get(cam, 'phep1.loi_khung_max_m'), 'phep1.loi_khung_max_m'),
              dat_ma_kiem=_num(_get(cam, 'dat_ma_kiem_m'), 'dat_ma_kiem_m'),
              phep2_du_tam=_num(_get(cam, 'phep2.du_tam_m'), 'phep2.du_tam_m'),
@@ -390,6 +399,12 @@ def _clean(o):
     return o
 
 
+def check_khoa(k, name='khoa'):
+    """C8BS-R7-4: cong takes only a lock of this version whose U_p carries the plumb / zc part."""
+    if k.get('version') != VERSION or 'day_doi_zc' not in (k.get('U_p_phan_m') or {}):
+        raise UError(f'{name}: not a {VERSION} file with the plumb / zc part of U_p')
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest='cmd', required=True)
@@ -436,8 +451,7 @@ def main(argv=None):
                   f'{out["troi_ppm"]:.0f} ppm, man trap {out["man_trap_kieu"]}')
         else:
             k = _json(a.khoa)
-            if k.get('version') != VERSION:
-                raise UError(f'{a.khoa}: not a {VERSION} file')
+            check_khoa(k, a.khoa)
             plan, meta = read_plan(a.ke_hoach)
             luot = []
             for s in a.luot:

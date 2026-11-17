@@ -808,7 +808,7 @@ CAM = {"phep1": {"loi_khung_max_m": 0.002}, "dat_ma_kiem_m": 0.001,
        "phep2": {"du_tam_m": 0.0015, "du_huong_deg": 0.2, "chenh_tham_so_m": 0.0005, "huong_chuan_deg": 0.3},
        "thao_dat": {"vi_tri_m": 0.0008, "goc_deg": 0.1}, "do_cao": {"rho_max_m": 1.5, "dh_m": 0.002, "H_m": 2.6,
                                                                     "h_m": 0.12},
-       "day_doi": {"dn_m": 0.016, "dzc_m": 0.01}}
+       "day_doi": {"dn_m": 0.016, "dzc_m": 0.01, "kappa": 0.12 / 2.6}}
 TBD = dict(ga_ok=True, d_p_quay_m=0.0007, d_psi_quay_deg=0.25,
            B=dict(shutter=dict(use_alpha=True, alpha_r_s_px=7e-6, alpha_c_s_px=1e-7, alpha_r_le_s_px=8.75e-6,
                                alpha_c_le_s_px=1.25e-7, mot_khung_s=1 / 60)))
@@ -823,7 +823,7 @@ def test_khoa_sums():
     k = CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.010, 0.005), 'b': gio_d('O1-F05', 4e-4, 0.012, 0.003),
                  'c': gio_d('O1-F08', 1e-4, 0.014, 0.004), 'd': gio_d('O1-F08', 9e-3, 0.5, 0.5, ok=False)}, TBD, CAM)
     cao = 1.5 * 0.002 / (2.6 - 0.12)
-    dd = 0.12 / 2.6 * 0.016 + 1.5 * 0.12 * 0.01 / (2.6 * (2.6 - 0.01))     # plumb, zc reused (Liam 17/11 evening)
+    dd = 0.12 / 2.6 * 0.016 + 0.12 * 0.01 * (1.5 + 0.016) / (2.6 * (2.6 - 0.01 - 0.12))   # plumb, zc (C8BS-R7-3)
     assert k['U_p_m'] == pytest.approx(1.25 * (0.002 + 0.001 + 0.0015 + 0.0005 + 0.0008 + cao + dd + 0.0007))
     assert k['U_p_phan_m']['day_doi_zc'] == pytest.approx(dd)
     assert k['U_psi_deg'] == pytest.approx(1.25 * (0.2 + 0.3 + 0.1 + 0.25))
@@ -843,7 +843,7 @@ def test_khoa_refuses_bad_3b_and_missing_field():
 
 def test_khoa_plumb_zc_required_and_bounded():
     # plumb point, zc reused from 16/11 (Liam 17/11 evening): both bounds required, zc bound below the camera height
-    for k_ in ('dn_m', 'dzc_m'):
+    for k_ in ('dn_m', 'dzc_m', 'kappa'):
         bad = json.loads(json.dumps(CAM))
         del bad['day_doi'][k_]
         with pytest.raises(CU.UError, match='day_doi.' + k_):
@@ -852,16 +852,73 @@ def test_khoa_plumb_zc_required_and_bounded():
     bad['day_doi']['dn_m'] = -0.001
     with pytest.raises(CU.UError, match='day_doi.dn_m'):
         CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, bad)
-    bad['day_doi'] = dict(dn_m=0.0, dzc_m=2.6)
-    with pytest.raises(CU.UError, match='not below the camera height'):
+    bad['day_doi'] = dict(dn_m=0.0, dzc_m=2.5, kappa=0.12 / 2.6)    # H - dzc not above h
+    with pytest.raises(CU.UError, match='not above the tag height'):
+        CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, bad)
+    bad['day_doi'] = dict(dn_m=0.0, dzc_m=0.01, kappa=0.12 / 2.632)   # C8BS-R7-3: H is not the zc of the scoring
+    with pytest.raises(CU.UError, match='not do_cao.h_m / do_cao.H_m'):
         CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, bad)
     z = json.loads(json.dumps(CAM))
-    z['day_doi'] = dict(dn_m=0.0, dzc_m=0.0)                       # no plumb / zc error: the part is zero
+    z['day_doi'] = dict(dn_m=0.0, dzc_m=0.0, kappa=0.12 / 2.6)     # no plumb / zc error: the part is zero
     k0 = CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, z)
     k1 = CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, CAM)
     assert k0['U_p_phan_m']['day_doi_zc'] == 0.0
     assert k1['U_p_m'] - k0['U_p_m'] == pytest.approx(1.25 * k1['U_p_phan_m']['day_doi_zc'])
     assert k1['U_psi_deg'] == k0['U_psi_deg']                       # a shift and a scale about C keep every angle
+
+
+class _FloorCam:
+    """pix2floor of a camera whose 'pixels' are already floor points (the parallax step of car_pose alone)."""
+    def pix2floor(self, pts, z):
+        return np.asarray(pts, float)
+
+
+def _plumb_case(H, h, dn, dzc, rho, Cs, Hs, P, psi, side=0.1):
+    """car_pose tag-centre error with the session's C = (0, 0), zc = H, when the camera centre is truly over Cs at
+    Hs and the tag centre is at P (height h); and the c8b_u part for the bounds dn, dzc, rho."""
+    import c7_measure as CM
+    c, s = math.cos(psi), math.sin(psi)
+    body = CM.car_corners_body(side)
+    Pc = np.asarray(P, float) + body @ np.array([[c, s], [-s, c]])
+    Cs = np.asarray(Cs, float)
+    p = Cs + (Pc - Cs) * Hs / (Hs - h)                                # central projection onto the floor
+    r = CM.car_pose(_FloorCam(), p, side, h / H, (0.0, 0.0))
+    err = math.hypot(r['tag_x'] - P[0], r['tag_y'] - P[1])
+    cam = json.loads(json.dumps(CAM))
+    cam['do_cao'].update(H_m=H, h_m=h, rho_max_m=rho)
+    cam['day_doi'] = dict(dn_m=dn, dzc_m=dzc, kappa=h / H)
+    _, parts, _, _ = CU.u_p_u_psi(cam, TBD)
+    return err, parts['day_doi_zc']
+
+
+def test_plumb_zc_part_bounds_car_pose():
+    # C8BS-R7-3: checked against the parallax step of c7_measure.car_pose, not a copy of the formula
+    err, b = _plumb_case(2.6, 1.0, 0.0, 0.01, 1.5, (0, 0), 2.59, (1.5, 0.0), 0.3)   # Codex counter-example
+    assert err == pytest.approx(0.003628, abs=2e-6) and err <= b * (1 + 1e-9)
+    err, b = _plumb_case(2.632, 0.12, 0.0, 0.02, 1.5, (0, 0), 2.612, (1.5, 0.0), 0.0)
+    assert err <= b * (1 + 1e-9) and err >= 0.99 * b                  # the worst sign of dzc reaches the bound
+    rng = np.random.default_rng(7)
+    for _ in range(300):
+        H, h = 2.632, rng.uniform(0.05, 0.5)
+        dn, dzc, rho = rng.uniform(0, 0.03), rng.uniform(0, 0.03), rng.uniform(0.1, 2.0)
+        a, rr = rng.uniform(0, 2 * math.pi), rng.uniform(0, dn)
+        Cs = (rr * math.cos(a), rr * math.sin(a))
+        a, rr = rng.uniform(0, 2 * math.pi), rng.uniform(0, rho)
+        err, b = _plumb_case(H, h, dn, dzc, rho, Cs, H + rng.uniform(-dzc, dzc), (rr * math.cos(a), rr * math.sin(a)),
+                             rng.uniform(-math.pi, math.pi))
+        assert err <= b * (1 + 1e-9) + 1e-12
+
+
+def test_cong_refuses_v1_lock():
+    # C8BS-R7-4: a lock written before the plumb / zc part (c8b_khoa_v1, cc22feb) cannot make the gate file
+    k = CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, CAM)
+    CU.check_khoa(json.loads(json.dumps(CU._clean(k))))
+    old = dict(k, version='c8b_khoa_v1')
+    with pytest.raises(CU.UError, match='plumb / zc part'):
+        CU.check_khoa(old)
+    old = dict(k, U_p_phan_m={x: v for x, v in k['U_p_phan_m'].items() if x != 'day_doi_zc'})
+    with pytest.raises(CU.UError, match='plumb / zc part'):
+        CU.check_khoa(old)
 
 
 def test_khoa_phep5_and_one_frame():
