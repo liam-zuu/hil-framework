@@ -555,6 +555,48 @@ def test_t3_stray_dbg_fails(tmp_path):
     assert _summary(d)['summary']['stray_dbg'] == 1
 
 
+def _stray(d):
+    import csv
+    return list(csv.DictReader(open(d / 'out' / 'T3_stray.csv', encoding='utf-8')))
+
+
+def test_t3_stray_file_lists_each_stray_pulse(tmp_path):
+    """Spec S06 §5 (Liam 17/11, THESIS, Q1 'Nhờ CODE_S06 ghi file'): T3_stray.csv lists every D pulse outside all
+    windows with its ESP32 time, level and gseq (the raw T3 line can be found again); a second D inside a window
+    (extra pulse) and the D before #run_start (PF3-4) are not listed."""
+    d = _make_run(tmp_path, stray_dbg=2, extra_dbg=(60,))
+    assert _score(d) == 1
+    rows = _stray(d)
+    assert len(rows) == 2 == _summary(d)['summary']['stray_dbg']
+    raw = {}
+    for l in (d / 'esp32_events.txt').read_text(encoding='utf-8').splitlines():
+        f = l.split('	', 1)[1].split(',')
+        if f[0] == 'T3' and f[3] == 'D':
+            raw[int(f[6])] = (int(f[2]), int(f[5]))
+    for r in rows:
+        assert raw[int(r['gseq'])] == (int(r['t_dbg_esp_us']), int(r['lvl']))
+    t_first = min(int(r['t_dbg_esp_us']) for r in rows)
+    assert int(rows[1]['t_dbg_esp_us']) - t_first == 100_000             # in time order
+    assert _summary(d)['summary']['stray_file'] == 'T3_stray.csv'
+
+
+def test_t3_stray_file_empty_on_pass(tmp_path):
+    d = _make_run(tmp_path)
+    assert _score(d) == 0
+    assert _stray(d) == [] and (d / 'out' / 'T3_stray.csv').read_text(encoding='utf-8').startswith('t_dbg_esp_us,')
+
+
+def test_t3_stray_file_absent_without_clock_pairing(tmp_path):
+    """No windows without the clock pairing: no stray list (and a stale file of an earlier scoring is removed)."""
+    d = _make_run(tmp_path)
+    assert _score(d) == 0 and (d / 'out' / 'T3_stray.csv').exists()
+    os.remove(d / 'capture.yaml')
+    assert _score(d) == 3
+    assert not (d / 'out' / 'T3_stray.csv').exists()
+    s = _summary(d)['summary']
+    assert s['stray_dbg'] is None and s['stray_file'] is None
+
+
 def test_t3_same_level_dbg_is_loss_t3c12(tmp_path):
     d = _make_run(tmp_path, same_level_d=40)
     assert _score(d) == 1

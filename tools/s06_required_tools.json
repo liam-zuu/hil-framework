@@ -1,10 +1,11 @@
 {
-  "_nguon": "spec S06 muc 3.1 dong CB3, Liam 30/10 toi, phien local_32992edd, nguyen van: Ghi vao spec. T3, T7, T8, T9, T11 chua co cong cu, them khi khoa tieu chi tung phep.",
+  "_nguon": "spec S06 muc 3.1 dong CB3, Liam 30/10 toi, phien local_32992edd, nguyen van: Ghi vao spec. T3: spec CB3 17/11 (Liam 17/11 phien THESIS local_8d9e5701: Duyet, ra o vong 4 S06), luot heavy hieu chuan tre ISR dong theo danh sach T2. T7, T8, T9, T11, T12 chua co cong cu, them khi khoa tieu chi tung phep.",
   "T2": ["s06_t2_check.py", "s06_t1_check.py", "s06_h7_serial.py", "s06_load_activity.py", "s06_esp32_check.py", "s06_relay_check.py"],
   "T3b": ["t3b_score.py", "s06_esp32_check.py"],
   "T4": ["s06_t4_values.py", "s06_esp32_check.py"],
   "T5": ["s06_t5_score.py", "s06_esp32_check.py"],
   "T6": ["s06_t6_check.py", "s06_esp32_check.py"],
   "CB5": ["s06_t2_check.py", "s06_esp32_check.py", "s06_frames_decode.py", "s06_enc_alive.py"],
+  "T3": ["s06_t3_score.py", "s06_esp32_check.py"],
   "dung_chung": {"T1": "T2", "T10": "T2"}
 }

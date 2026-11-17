@@ -45,6 +45,9 @@ của bước đọc marker và so lịch cũng là mã 1 (T3C-10). Đồng hồ
 của lượt khác số frame có marker vẫn là mất cạnh đã chứng minh, mã 1 (T3C-R3-1).
 Mã thoát: 0 đạt; 1 không đạt hoặc mất dữ liệu; 3 chưa kết luận / thiếu bằng chứng / không đủ điều kiện / không chọn
 được lượt; 2 lỗi đầu vào (kể cả frame có marker không theo lịch khi frame log đủ). Dòng cuối `#ket_qua,…`.
+Đầu ra (spec S06 §5) trong `--out`: `T3_result.csv` (mỗi bậc một dòng), `T3_summary.json`, `T3_stray.csv` (mỗi xung D
+ngoài mọi cửa sổ: giờ ESP32, mức, gseq; Liam 17/11 phiên THESIS, Q1 "Nhờ CODE_S06 ghi file (Recommended)"; chỉ ghi
+khi đồng hồ ghép được, không thì không có file và `stray_dbg` = None).
 
 CLI:
   python tools/s06_t3_score.py --schedule T3_schedule.csv --frames frames.npz --esp32-events <t3>/esp32_events.txt \\
@@ -142,7 +145,9 @@ def score(steps: List[dict], t3_rows: List[dict], t_run_start: int, u_us: Option
     """steps: mỗi bậc có wheel, w_from, w_to, t_mark (giờ ESP32 của cạnh M ghép được, None nếu không có), frame,
     gpio_spi_us. synced = False: đồng hồ không ghép được (T3C-R2-2), bậc ghi `chua_ghep`, không tính no_data.
     Trả các dòng kết quả và tổng hợp."""
-    dbg = sorted(r['t_us'] for r in t3_rows if r['src'] == 'D' and r['t_us'] >= t_run_start)
+    dbg_rows = sorted((r for r in t3_rows if r['src'] == 'D' and r['t_us'] >= t_run_start),
+                      key=lambda r: (r['t_us'], r['gseq']))
+    dbg = [r['t_us'] for r in dbg_rows]
     pre = sum(1 for r in t3_rows if r['src'] == 'D' and r['t_us'] < t_run_start)
     enc: Dict[int, List[int]] = {}
     for r in t3_rows:
@@ -201,6 +206,9 @@ def score(steps: List[dict], t3_rows: List[dict], t_run_start: int, u_us: Option
                     row.update(bug_class='loi_cong_cu_HIL', note=f'(ii) {q:.0f} µs > hp mới {hp_new:.0f} + u')
         rows.append(row)
     stray = len(dbg) - len(used) if synced else None     # không có cửa sổ thì không đếm D ngoài cửa sổ
+    # T3_stray.csv (spec S06 §5, Liam 17/11 Q1 "Nhờ CODE_S06 ghi file"): từng xung D ngoài mọi cửa sổ
+    stray_rows = ([dict(t_dbg_esp_us=r['t_us'], lvl=r['lvl'], gseq=r['gseq'])
+                   for i, r in enumerate(dbg_rows) if i not in used] if synced else None)
     delays = [r['delay_us'] for r in rows if r['delay_us'] is not None]
     cover = {}
     for lo, hi in BANDS:
@@ -221,7 +229,7 @@ def score(steps: List[dict], t3_rows: List[dict], t_run_start: int, u_us: Option
                 quant_bug=sum(1 for r in rows if r['bug_class']),
                 per_wheel={w: sum(1 for r in rows if r['wheel'] == w) for w in range(4)},
                 coverage=cover)
-    return dict(rows=rows, summary=summ)
+    return dict(rows=rows, summary=summ, stray=stray_rows)
 
 
 def conclude(summ: dict, u_us: Optional[float], lost: List[str], u_why: List[str], invalid: List[str],
@@ -262,6 +270,20 @@ def conclude(summ: dict, u_us: Optional[float], lost: List[str], u_why: List[str
     if why:
         return 3, ['chua_ket_luan'], why
     return 0, [], []
+
+
+STRAY_COLUMNS = ['t_dbg_esp_us', 'lvl', 'gseq']
+
+
+def write_stray(path: str, rows: List[dict]) -> None:
+    """T3_stray.csv: mỗi xung D ngoài mọi cửa sổ (sau #run_start của lượt) một dòng: giờ ESP32 (µs), mức PF3 sau
+    cạnh, gseq (tra dòng T3 trong esp32_events.txt). Chỉ ghi khi đồng hồ ghép được (có cửa sổ); không ghép được thì
+    không có file, summary `stray_dbg` = None."""
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=STRAY_COLUMNS)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
 
 
 def write_rows(path: str, rows: List[dict]) -> None:
@@ -398,6 +420,12 @@ def main(argv=None) -> int:
                  ' + thời gian chờ khóa, ghi bản ghi và mở 8 chân (phần này chưa đo)')
     os.makedirs(a.out, exist_ok=True)
     write_rows(os.path.join(a.out, 'T3_result.csv'), res['rows'])
+    stray_path = os.path.join(a.out, 'T3_stray.csv')
+    if res['stray'] is not None:
+        write_stray(stray_path, res['stray'])
+    elif os.path.exists(stray_path):
+        os.remove(stray_path)             # chấm lại thư mục cũ: không để file của lần chấm trước
+    summ['stray_file'] = 'T3_stray.csv' if res['stray'] is not None else None
     out = dict(code=code, reasons=why, notes=notes, run=run_id, summary=summ, u_us=u_us, loop_cal=cal,
                loop_run=run_loop, gpio_spi_us=dict(median=float(np.median(gspi)) if len(gspi) else None,
                                                    max=float(np.max(gspi)) if len(gspi) else None),
