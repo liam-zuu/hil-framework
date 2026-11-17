@@ -19,7 +19,10 @@ Commands (the operator types them while working; every time stamp is the PC cloc
                                          (--wait: waiting for the machine, also in t_operator_wait_s)
   pause / resume                         other work in between: not counted (S05 §3.1)
   end    --outcome dat|khong_dat|chua_ket_luan|hong_he_do [--e-perp-max M] [--completed 0|1]
-         [--fail-cause X] [--results-dir D] [--gate-json F]   close the run, append its row;
+         [--fail-cause X] [--results-dir D] [--gate-json F] [--gate-file C]   close the run, append its row;
+                                         C = the C8 gate file (O1 v11.33): the conditions that must
+                                         decide are recomputed from it (level = task, platform, stage,
+                                         campaign); needed when F was scored with it (gate_v3.3)
                                          F = scorer output with a gate_v3 block (fwsim/o1_gate.py,
                                          version gate_v3.2): checked and recomputed from q, lo, hi,
                                          n_undef (O1 3.5, SC3-1); those, the state per condition, U_t
@@ -50,8 +53,9 @@ Commands (the operator types them while working; every time stamp is the PC cloc
   freeze --campaign C --stop-reason R [--stop-cause K] --gain-set C/G --gain-file F [--at T]
                                          (sha256 of F computed; gain set id prefixed by the campaign)
   summary [--gate-file F] [--out S05_summary.csv]   recompute the summary from the logs;
-                                         F = the locked gate (figure-8 levels, locked at C8), one
-                                         level per row under the header "level"; its sha256 is reported
+                                         F = the locked C8 gate file (gate_c8_v1 JSON, tools/gate_c8.py:
+                                         gate levels, report-only conditions per level); its sha256 is
+                                         reported; every gate row is checked against it (O1 v11.33)
   so-h   --run-uid UID --score-final F   S05 v3.37 4.3: outcome of a car run after the clip H comparison at the end
                                          of the session (F = c7_calib_drift.py gop output); appended to
                                          m7_so_clip_h.csv; summary, begin, s05_final_table use the outcome after it
@@ -110,7 +114,8 @@ TUNING_NEW = (['run_uid', 'campaign', 'script_run_id', 'gain_set_id', 'speed_mps
               + ['g_' + g for g in GAINS]
               + ['t_operator_wait_s', 't_machine_s', 'wall_start', 'wall_end', 'n_sim_evals']
               + ['boot_before', 'boot_after']           # R134 (b): S05 4.7 (iv), R3V-9
-              + list(QUERY_FILE_COLS))                  # R134 (1), summary reads the two answers again
+              + list(QUERY_FILE_COLS)                   # R134 (1), summary reads the two answers again
+              + ['c8b_gio_sha256'])                     # O1 v11.37 D1, S05 v3.43 D3: kiem_gio_c8b (CODE_GATE)
 # tune stop gate v3 (dossier 00_OVERVIEW/2026-11-12_De_xuat_cong_dung_tune_bam_huong_van_toc_v3.md section 6,
 # CG2-12; Liam 12/11 CODE local_87282b70 "làm ngay đi"): per run the measured maximum q, its bound U and
 # the state of each condition, so stopping, the S05 4.4 ranking and gate_result can be recomputed.
@@ -120,7 +125,9 @@ _FWSIM = os.path.normpath(os.path.join(HERE, '..', 'fwsim'))
 if _FWSIM not in sys.path:
     sys.path.insert(0, _FWSIM)
 import o1_gate                                                          # noqa: E402
+import gate_c8                                                          # noqa: E402  (C8 gate file, O1 v11.33)
 GATE_CONDS = o1_gate.CONDS
+GATE_VERSIONS = (o1_gate.GATE_VERSION, o1_gate.GATE_VERSION_V1133)
 # 13/11 gate v3.2 (SC-1, SC3-1; Liam CODE local_7f7b0ef4 "Duyệt gộp luôn lo/hi"): per condition G2-G5 the
 # maxima over the frames of q, lo, hi (each field over its finite frames) and n_undef; G1 q is 'completed';
 # gate_u_t = the U_t used (empty = not known: HIL run without the run_active edge mapping, RS-4)
@@ -141,9 +148,25 @@ OLD_GATE_U = tuple(f'g{i}_u' for i in range(1, 6))       # gate_v3_g1235 columns
 DOMAIN_FIELDS = ('q', 'lo', 'hi', 'n_undef')
 G1_COLS = ['g1_ways', 'g1_t_deadline', 'g1_t_done_1', 'g1_t_done_2', 'g1_t1', 'g1_prog_before_t1',
            'g1_cond25_before_deadline', 'g1_cat_t1']
+# O1 v11.33 (CODE_GATE 17/11, design 03_CODE/docs/2026-11-17_Thiet_ke_CODE_GATE_v1.md section 4; Liam 17/11 at
+# CODE_GATE "Duyệt, gửi CODE luôn (Recommended)"): gate_v3.3 rows carry the C8 gate file SHA and the report-only
+# conditions of their level (O1 3.9 rule 2b, OG2-7). The required set is recomputed from the gate file
+# (tools/gate_c8.py, --gate-file of end / summary), never taken from the row: a row whose report-only list differs
+# from the file is an error. Empty in gate_v3.2 rows (all five required).
+GATE_V1133_COLS = ['gate_file_sha256', 'gate_report_only']
+# C8b time grid (CODE_GATE design v2 section 2; Liam 17/11 at CODE_GATE "Duyệt, code luôn (Recommended)", the exception
+# before t1 "Khi mọi nút đều có (Recommended)"): a floor gate scored on the nodes of the C8b time grid carries a block
+# 'luoi' (format luoi_v1): G1 per node, lost / exception-before-t1 per node; G1 of the run is recomputed from it
+# (luoi_g1), the G1 fields of the gate are those of node nut_tam. Columns luoi_* below, empty without a grid.
+LUOI_FORMAT = 'luoi_v1'
+LUOI_STEP_MAX_S = 1e-3                     # C8b v4 section 3: nodes at most 1 ms apart
+LUOI_COLS = ['luoi_gio_sha256', 'luoi_n_nut', 'luoi_d_dau_s', 'luoi_d_cuoi_s', 'luoi_buoc_max_s', 'luoi_nut_tam',
+             'luoi_g1_nut', 'luoi_hong_nut', 'luoi_cat_nut', 'luoi_g1_state']
+_G1_LETTER = {'dat': 'd', 'khong_dat': 'k', 'chua_ket_luan': 'c'}
 GATE_COLS = (['gate_version', 'gate_decide', 'gate_json_sha256', 'gate_u_t', 'g1_q', 'g1_state']
              + [f'{g}_{x}' for g in o1_gate.MEASURED for x in GATE_FIELDS]
-             + [f'{g}_{x}_chung' for g in o1_gate.MEASURED for x in DOMAIN_FIELDS] + G1_COLS)
+             + [f'{g}_{x}_chung' for g in o1_gate.MEASURED for x in DOMAIN_FIELDS] + G1_COLS + GATE_V1133_COLS
+             + LUOI_COLS)
 TUNING_COLS = TUNING_OLD + TUNING_NEW + GATE_COLS
 EFFORT_OLD = ['ngay', 'bat_dau', 'ket_thuc', 'gio', 'buoc', 'giai_doan', 'mot_lan_hay_thich_nghi', 'dut',
               'ghi_chu', 'chien_dich', 'lap_lai']
@@ -166,6 +189,17 @@ FINAL_LOST_N = 3                         # S05 §4.6: stop a condition after 3 l
 # level counted, in a row or not; final_hil keeps its own rule (§4.6, FINAL_LOST_N lost runs in a row).
 MAP_REFUSED = 'anh_xa_tu_choi'           # --fail-cause of such a run
 MAP_RERUNS_MAX = 3
+# O1 v11.37 §3.5 D1, S05 v3.43 §4.6 D2, §6.1 D3 (Liam 17/11 THESIS local_11f2c5a8: "Chỉ lượt trượt kiểm giờ
+# (Recommended)", "Tổng (Recommended)", "Bắt buộc file (Recommended)", "Luật §4.6: 3 hỏng liên tiếp (Recommended)";
+# the code: CODE_GATE design v2 section 6, Liam 17/11 at CODE_GATE "Duyệt, code luôn (Recommended)"): a floor run
+# that fails the per-run check of the C8b time file is lost to the measurement, fail cause C8B_GIO_FAIL, with that
+# file (format c8b_gio_v1, ok false) whose sha256 goes to c8b_gio_sha256. Only these runs are counted, in total (not
+# in a row), per campaign, gain set and level (map_key), in the order of the log, stages other than final (final:
+# S05 4.6, FINAL_LOST_N lost runs in a row, every cause); the fourth one (1 + C8B_RERUNS_MAX) makes the level of that
+# gain set chua_ket_luan, a run of it after that is refused.
+C8B_GIO_FAIL = 'kiem_gio_c8b'
+C8B_RERUNS_MAX = 3
+C8B_GIO_FORMAT = 'c8b_gio_v1'
 # R134 package (Liam 14/11 CODE_R134 local_eb9f3b5c "duyet goi sua code fix/r134-answers"):
 # (b) S05 v3.13-v3.17 4.7 (iv), R3V-9, O1 v11.10 R4: the boot of gain_send.py --query just before and just after
 #     the run go to the run history (boot_before, boot_after). Both given and equal: one ESP32 boot over the run.
@@ -208,7 +242,7 @@ TUNE_STAGES = ('screen', 'confirm')     # [CÁCH HIỂU] 'explore' is not a tune
 SKIP_PREFIX = ('EXAMPLE', 'PREHIL')      # rows of the June files: examples, reconstruction
 # fields begin / end set themselves; begin refuses them as extra fields (Codex S315-R3-1)
 OWN_FIELDS = ('session_id', 'iter_no', 'run_uid', 'date', 'wall_start', 'wall_end', 'run_outcome', 'fail_cause',
-              'results_dir', 'completed', 'e_perp_max_m') + tuple(f't_{k}_s' for k in ('flash', 'setup', 'run', 'log',
+              'results_dir', 'completed', 'e_perp_max_m', 'c8b_gio_sha256') + tuple(f't_{k}_s' for k in ('flash', 'setup', 'run', 'log',
                                                                                         'analysis', 'operator_wait'))
 
 
@@ -420,6 +454,12 @@ def begin(ds: str, session: str, campaign: str, platform: str, controller: str, 
         if map_stopped(map_refusals(tun + [row]).get(map_key(row), 0)):
             raise LogError(f'{task}@{speed} of {gain_set}: stopped after {MAP_RERUNS_MAX} reruns for a refused '
                            'mapping (S05 v3.15 4.5 step 2): the level is chua_ket_luan, no further run')
+    if _c8b_counted(row) and campaign in GAIN_OWNERS and not gain_set:                     # GT1-7
+        raise LogError(f'a floor run of {campaign} outside the final session needs --gain-set (the reruns after the C8b '
+                       'time check are counted per gain set, O1 3.5 v11.37; GT1-7)')
+    if _c8b_counted(row) and c8b_refusals(tun + [row]).get(map_key(row), 0) > C8B_RERUNS_MAX:
+        raise LogError(f'{task}@{speed} of {gain_set}: stopped after {C8B_RERUNS_MAX} reruns for the C8b time check '
+                       '(O1 3.5 v11.37): the level is chua_ket_luan, no further run')
     if stage in ('final', 'final_hil') and final_key(row) in _final_stops(tun):
         raise LogError(f'{task}@{speed} of {gain_set or campaign}: stopped after {FINAL_LOST_N} lost runs in a row '
                        '(S05 4.6), no further run')
@@ -492,13 +532,28 @@ def segment_totals(segments: List[dict]) -> dict:
     return {**{f't_{k}_s': v for k, v in tot.items()}, 't_operator_wait_s': wait}
 
 
-def read_gate_json(path: str) -> dict:
-    """The gate block of a scorer output (key 'gate_v3', hil_o1_score.py) or a bare gate dict."""
+GATE_FILE_COLS = ('gate_file_sha256', 'gate_report_only')   # O1 v11.33: the C8 gate file the run was scored with
+NOT_A_GATE = ('gate_json_sha256',) + GATE_FILE_COLS
+
+
+def has_gate(r: dict) -> bool:
+    """A logged row carries a gate: a gate column other than NOT_A_GATE is filled (CC1-2: a lost run may carry the
+    sha256 of its scorer file alone, without a gate; GT1-6: and the gate file it was scored with)."""
+    return any(r.get(c) for c in GATE_COLS if c not in NOT_A_GATE)
+
+
+def read_gate_json(path: str, allow_null: bool = False) -> Optional[dict]:
+    """The gate block of a scorer output (key 'gate_v3', hil_o1_score.py) or a bare gate dict. allow_null (CC1-2,
+    Codex round 1 of CODE_CAM c7_calib_drift; Liam 17/11 at CODE_GATE "Sửa, gộp nhánh này (Recommended)"): a scorer
+    output of a run lost to the measurement with 'gate_v3': null gives None (the run is logged with the file's sha256
+    only, so so-h finds its H0 file)."""
     try:
         with open(path, encoding='utf-8') as f:
             d = json.load(f)
     except (OSError, ValueError) as exc:
         raise LogError(f'--gate-json {path!r}: {exc}')
+    if allow_null and isinstance(d, dict) and 'gate_v3' in d and d['gate_v3'] is None:
+        return None
     g = d.get('gate_v3', d) if isinstance(d, dict) else None
     if not isinstance(g, dict) or not str(g.get('version', '')).startswith('gate_v3'):
         raise LogError(f'--gate-json {path!r}: no gate_v3 block (fwsim/o1_gate.py)')
@@ -528,15 +583,19 @@ _BOOL_KEYS = ('complete', 'any_certain_fail')
 _COND_KEYS = ('q', 'lo', 'hi', 'n_undef', 'threshold', 'state')
 
 
-def _check_decide(decide, platform: Optional[str] = None) -> List[str]:
+def _check_decide(decide, platform: Optional[str] = None, required=None) -> List[str]:
+    """required (O1 v11.33): the conditions that must decide at the run's level, from the gate file (None = all five);
+    decide must be required intersected with a deciding set of the platform."""
+    req = set(GATE_CONDS if required is None else required)
     if (not isinstance(decide, list) or not decide or len(set(decide)) != len(decide)
             or any(not isinstance(c, str) for c in decide) or set(decide) - set(GATE_CONDS)):
         raise LogError(f'gate decide {decide!r}: a non-empty list of distinct {GATE_CONDS}')
-    if set(decide) not in [set(x) for x in o1_gate.DECIDE_SETS]:
-        raise LogError(f'gate decide {decide!r}: {list(o1_gate.DECIDE_ALL)} or {list(o1_gate.DECIDE_HIL)}')
+    if set(decide) not in [set(x) & req for x in o1_gate.DECIDE_SETS]:
+        raise LogError(f'gate decide {decide!r}: {list(o1_gate.DECIDE_ALL)} or {list(o1_gate.DECIDE_HIL)}, less the '
+                       f'report-only conditions {sorted(set(GATE_CONDS) - req)} of the gate file')
     if platform is not None:
         want = DECIDE_BY_PLATFORM.get(platform)
-        if want is None or set(decide) not in [set(x) for x in want]:
+        if want is None or set(decide) not in [set(x) & req for x in want]:
             raise LogError(f'gate decide {decide!r} on platform {platform!r}: must be one of '
                            f'{[list(x) for x in (want or ())]} (GV3-R2-2)')
     return decide
@@ -678,29 +737,57 @@ def _common_block(gate: dict, c: str, union: tuple, one: bool, platform: Optiona
     return com
 
 
-def _recompute(gate: dict, platform: Optional[str] = None) -> dict:
+def _recompute(gate: dict, platform: Optional[str] = None, required=None) -> dict:
     """States and outcomes recomputed from q, lo, hi, n_undef with fwsim/o1_gate (thresholds, O1 3.5
     three states SC3-1, O1 3.5 order); shared by the JSON path (end) and the logged rows (summary).
     B81-3: G2-G5 on the common and the union frame domain (cond_state2), G1 from its fields (gate_g1_state)
     when the gate has them (always on the car). Returns the outcomes."""
-    if gate.get('version') != o1_gate.GATE_VERSION:
-        raise LogError(f'gate version {gate.get("version")!r}: only {o1_gate.GATE_VERSION} is supported')
-    decide = _check_decide(gate.get('decide'), platform)
+    if gate.get('version') not in GATE_VERSIONS:
+        raise LogError(f'gate version {gate.get("version")!r}: only {GATE_VERSIONS} are supported')
+    req = gate_required(gate, required)
+    decide = _check_decide(gate.get('decide'), platform, req)
     u_t = _qnum(gate.get('u_t'), 'u_t')
     if u_t < 0.0:
         raise LogError(f'gate u_t: {u_t!r} is negative (a bound is >= 0)')
-    # U_t known <=> G3, G5 may decide (RS-4): a HIL gate without the mapping cannot claim all five
-    if (set(decide) == set(o1_gate.DECIDE_ALL)) == math.isnan(u_t):
-        raise LogError(f'gate decide {decide!r} with u_t {gate.get("u_t")!r}: all five decide exactly when U_t '
-                       'is known (RS-4)')
+    # U_t known <=> G3, G5 may decide (RS-4): a HIL gate without the mapping cannot claim them. O1 v11.33: G4 is never
+    # report only, so 'G4 decides' tells a mapped run from a refused one also when the level has report-only ones
+    if ('g4' in decide) == math.isnan(u_t):
+        raise LogError(f'gate decide {decide!r} with u_t {gate.get("u_t")!r}: G3, G4, G5 may decide exactly when '
+                       'U_t is known (RS-4)')
     q1 = gate['g1'].get('q')
     if q1 not in _G1_Q or gate['g1'].get('state') != o1_gate.g1_state(q1):
         raise LogError(f'gate g1: q {q1!r} and state {gate["g1"].get("state")!r} do not agree (O1 3.4 completed)')
     f1 = gate_g1_fields(gate['g1'], platform)                                   # B81-3
-    if f1 is not None and gate_g1_state(f1) != gate['g1']['state']:
-        raise LogError(f'gate g1: state {gate["g1"]["state"]!r}, recomputed from t_done, t1 and the flags: '
-                       f'{gate_g1_state(f1)!r} (O1 3.3, 3.5)')
-    one = domains_one(f1)
+    lb = None
+    if gate.get('luoi') is not None:                                            # C8b time grid (design v2)
+        if (gate.get('version') != o1_gate.GATE_VERSION_V1133 or platform not in (None, 'HW') or f1 is None
+                or f1['ways'] != 2):
+            raise LogError('gate luoi: only in a gate_v3.3 floor gate with its G1 fields (2 ways)')
+        lb = check_luoi(gate['luoi'])
+        if gate['g1']['state'] != lb['g1_state']:
+            raise LogError(f'gate g1: state {gate["g1"]["state"]!r}, the grid gives {lb["g1_state"]!r} (luoi)')
+        # GT1-1 (Codex round 1 of CODE_GATE; Liam 17/11 at CODE_GATE "Sửa theo bảng (Recommended)"): the node nut_tam
+        # follows the rule of one run on its own G1 fields: lost exactly when t1 is given without the exception before
+        # it (R134C4-3), the exception exactly when cat_t1 (R2V-4); so a grid of one node keeps the rule of a run
+        # without a grid
+        k = lb['nut_tam']
+        lost = f1['t1'] is not None and not f1['cat_t1']
+        if lb['hong_nut'][k] != lost or lb['cat_nut'][k] != f1['cat_t1']:
+            raise LogError(f'gate luoi: node nut_tam {k} lost {lb["hong_nut"][k]}, exception before t1 '
+                           f'{lb["cat_nut"][k]}; its G1 fields (t1 {f1["t1"]!r}, cat_t1 {f1["cat_t1"]!r}) give lost '
+                           f'{lost}, exception {f1["cat_t1"]} (a node is lost exactly when t1 is given without the '
+                           'exception before it, R134C4-3, O1 3.5 R2V-4; GT1-1)')
+        if any(lb['hong_nut']):                                                 # GT1-4: O1 L1
+            short = [c for c in o1_gate.MEASURED if _n_undef(gate[c].get('n_undef'), f'{c} n_undef') < 1]
+            if short:
+                raise LogError(f'gate luoi: a node lost to the measurement, but n_undef 0 in {short} (a lost node gives '
+                               'every measured condition at least one undefined frame of the union, O1 L1; GT1-4)')
+    want1 = gate['g1']['state'] if lb is None else lb['g1_nut'][lb['nut_tam']]
+    centre_lost = lb is not None and lb['hong_nut'][lb['nut_tam']]       # GT1-1: its G1 is chua_ket_luan (check_luoi)
+    if f1 is not None and not centre_lost and gate_g1_state(f1) != want1:
+        raise LogError(f'gate g1: state {want1!r}{" (grid node nut_tam)" if lb else ""}, recomputed from t_done, t1 '
+                       f'and the flags: {gate_g1_state(f1)!r} (O1 3.3, 3.5)')
+    one = domains_one(f1) and lb is None             # grid numbers are not those of one node (design v2 section 2)
     for c, thr in o1_gate.THRESHOLDS.items():
         union = _domain_nums(gate[c], c)
         com = _common_block(gate, c, union, one, platform)
@@ -708,10 +795,97 @@ def _recompute(gate: dict, platform: Optional[str] = None) -> dict:
         if st != gate[c].get('state'):
             raise LogError(f'gate {c}: state {gate[c].get("state")!r}, recomputed from lo of the common domain, '
                            f'hi and n_undef of the union: {st!r}')
-    return o1_gate.evaluate_outcomes(gate, decide)
+    return o1_gate.evaluate_outcomes(gate, decide, req)
 
 
-def validate_gate(gate: dict, platform: Optional[str] = None) -> dict:
+def luoi_g1(states) -> str:
+    """G1 of a run on the C8b time grid (C8b v4 section 3, C8B4R5-1, -2): one node, its state; every node dat,
+    dat; every node khong_dat, khong_dat (then the state does not change between the two nodes of any cell); else
+    chua_ket_luan."""
+    states = list(states)
+    if len(states) == 1:
+        return states[0]
+    for st in ('dat', 'khong_dat'):
+        if all(x == st for x in states):
+            return st
+    return 'chua_ket_luan'
+
+
+def check_luoi(lb) -> dict:
+    """The grid block of a floor gate checked (design v2 section 2); returns it. LogError on any problem."""
+    keys = ('format', 'gio_sha256', 'n_nut', 'd_dau_s', 'd_cuoi_s', 'buoc_max_s', 'nut_tam', 'g1_nut', 'hong_nut',
+            'cat_nut', 'g1_state')
+    if not isinstance(lb, dict) or set(lb) != set(keys):
+        raise LogError(f'gate luoi: an object with exactly {keys}')
+    if lb['format'] != LUOI_FORMAT:
+        raise LogError(f'gate luoi format {lb["format"]!r}: {LUOI_FORMAT!r}')
+    sha = lb['gio_sha256']
+    if not isinstance(sha, str) or len(sha) != 64 or any(ch not in '0123456789abcdef' for ch in sha):
+        raise LogError(f'gate luoi gio_sha256 {sha!r}: 64 lowercase hex digits')
+    n = lb['n_nut']
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        raise LogError(f'gate luoi n_nut {n!r}: a whole number >= 1')
+    d0, d1 = _qnum(lb['d_dau_s'], 'luoi d_dau_s'), _qnum(lb['d_cuoi_s'], 'luoi d_cuoi_s')
+    st = _qnum(lb['buoc_max_s'], 'luoi buoc_max_s')
+    if math.isnan(d0) or math.isnan(d1) or math.isnan(st) or d0 > d1 or (n == 1) != (d0 == d1):
+        raise LogError(f'gate luoi: d_dau_s {d0!r} <= d_cuoi_s {d1!r}, equal exactly when n_nut = 1')
+    if st < 0.0 or st > LUOI_STEP_MAX_S or (n > 1 and (st == 0.0 or st * (n - 1) < d1 - d0 - 1e-12)):
+        raise LogError(f'gate luoi buoc_max_s {st!r}: the nodes are at most {LUOI_STEP_MAX_S} s apart and cover '
+                       f'[{d0!r}, {d1!r}] with {n} nodes (C8b v4 section 3)')
+    k = lb['nut_tam']
+    if isinstance(k, bool) or not isinstance(k, int) or not 0 <= k < n:
+        raise LogError(f'gate luoi nut_tam {k!r}: an index of the {n} nodes')
+    if not isinstance(lb['g1_nut'], list) or len(lb['g1_nut']) != n or any(x not in o1_gate.STATES
+                                                                         for x in lb['g1_nut']):
+        raise LogError(f'gate luoi g1_nut: {n} states of {o1_gate.STATES}')
+    for key in ('hong_nut', 'cat_nut'):
+        if not isinstance(lb[key], list) or len(lb[key]) != n or any(not isinstance(x, bool) for x in lb[key]):
+            raise LogError(f'gate luoi {key}: {n} booleans')
+    if any(h and c for h, c in zip(lb['hong_nut'], lb['cat_nut'])):
+        raise LogError('gate luoi: a node both lost to the measurement and with the exception before t1 (a node with '
+                       'the exception is not a lost node: the exception replaces the loss, O1 3.5)')
+    # O1 v11.35 (CODE asked CODE_GATE to confirm 17/11): a lost node and a node with the exception before t1 carry G1
+    # chua_ket_luan (they cannot show the run completed, nor that it did not: O1 3.5 R2V-4 for the exception)
+    bad = [i for i, (st_, h, c) in enumerate(zip(lb['g1_nut'], lb['hong_nut'], lb['cat_nut']))
+           if (h or c) and st_ != 'chua_ket_luan']
+    if bad:
+        raise LogError(f'gate luoi g1_nut: node(s) {bad} lost or with the exception before t1 but G1 not chua_ket_luan')
+    if lb['g1_state'] != luoi_g1(lb['g1_nut']):
+        raise LogError(f'gate luoi g1_state {lb["g1_state"]!r}: from g1_nut it is {luoi_g1(lb["g1_nut"])!r}')
+    return lb
+
+
+def gate_required(gate: dict, required=None) -> tuple:
+    """O1 v11.33 (OG2-7): the required set of a gate, checked against the one of the gate file (`required`, from
+    gate_c8.GateC8.required for the run; None = no gate file: all five). A gate_v3.2 gate has no report-only
+    conditions. A gate_v3.3 gate states its report_only, required and gate_file_sha256; they must agree with each
+    other and with `required` (a condition missing from the run is never taken as exempt)."""
+    want = tuple(GATE_CONDS) if required is None else tuple(c for c in GATE_CONDS if c in set(required))
+    if gate.get('version') == o1_gate.GATE_VERSION:
+        for k in ('report_only', 'required', 'gate_file_sha256'):
+            if gate.get(k) not in (None, [], ''):
+                raise LogError(f'gate {k} {gate.get(k)!r}: not a {o1_gate.GATE_VERSION} field')
+        ro = []
+    else:
+        ro, rq, sha = gate.get('report_only'), gate.get('required'), gate.get('gate_file_sha256')
+        if not isinstance(ro, list) or not isinstance(rq, list):
+            raise LogError(f'gate report_only {ro!r} / required {rq!r}: lists ({o1_gate.GATE_VERSION_V1133})')
+        try:
+            if tuple(rq) != o1_gate.required_of(ro):
+                raise LogError(f'gate required {rq!r}: not all five less report_only {ro!r}')
+        except ValueError as exc:
+            raise LogError(f'gate {exc}')
+        if sha is None and ro:
+            raise LogError(f'gate report_only {ro!r} without gate_file_sha256: no condition is exempt without the '
+                           'C8 gate file (O1 v11.33, OG2-7)')
+    got = tuple(c for c in GATE_CONDS if c not in set(ro))
+    if got != want:
+        raise LogError(f'gate report-only conditions {list(ro)!r}, the C8 gate file gives '
+                       f'{[c for c in GATE_CONDS if c not in want]!r} for this run (O1 v11.33 3.9 rule 2b, OG2-7)')
+    return want
+
+
+def validate_gate(gate: dict, platform: Optional[str] = None, required=None) -> dict:
     """GV3-5, GV3-R2-3: a gate JSON checked key by key (a missing key is an error, null is 'unknown';
     booleans by type; thresholds), then every state and outcome recomputed (_recompute); any difference
     is an error. The outcome fields of the JSON are never trusted. platform: the run's platform, whose
@@ -731,7 +905,7 @@ def validate_gate(gate: dict, platform: Optional[str] = None) -> dict:
     for k in _BOOL_KEYS:
         if not isinstance(gate[k], bool):
             raise LogError(f'gate {k}: {gate[k]!r} is not a boolean')
-    ev = _recompute(gate, platform)
+    ev = _recompute(gate, platform, required)
     for k, v in ev.items():
         if type(gate[k]) is not type(v) or gate[k] != v:
             raise LogError(f'gate {k}: {gate[k]!r}, recomputed: {v!r}')
@@ -756,6 +930,39 @@ def gate_from_row(row: dict) -> dict:
 
     g = {'version': row.get('gate_version'), 'decide': [c for c in row.get('gate_decide', '').split(',') if c],
          'u_t': num(row.get('gate_u_t')), 'g1': {'q': row.get('g1_q'), 'state': row.get('g1_state')}}
+    if row.get('gate_version') == o1_gate.GATE_VERSION_V1133:                   # O1 v11.33
+        ro = [c for c in row.get('gate_report_only', '').split(',') if c]
+        try:
+            rq = list(o1_gate.required_of(ro))
+        except ValueError as exc:
+            raise LogError(f"{row.get('run_uid')}: gate_report_only: {exc}")
+        g.update(report_only=ro, required=rq, gate_file_sha256=row.get('gate_file_sha256') or None,
+                 level=row.get('trajectory') or None)
+        if row.get('luoi_n_nut', ''):                                           # C8b grid (design v2)
+            letters = {v: k for k, v in _G1_LETTER.items()}
+
+            def bits(k):
+                s_ = row.get(k, '')
+                if any(ch not in '01' for ch in s_):
+                    raise LogError(f"{row.get('run_uid')}: {k} {s_!r}: 0 / 1 per node")
+                return [ch == '1' for ch in s_]
+            try:
+                g['luoi'] = dict(format=LUOI_FORMAT, gio_sha256=row.get('luoi_gio_sha256', ''),
+                                 n_nut=int(row['luoi_n_nut']), d_dau_s=num(row.get('luoi_d_dau_s')),
+                                 d_cuoi_s=num(row.get('luoi_d_cuoi_s')), buoc_max_s=num(row.get('luoi_buoc_max_s')),
+                                 nut_tam=int(row.get('luoi_nut_tam', '')),
+                                 g1_nut=[letters[ch] for ch in row.get('luoi_g1_nut', '')],
+                                 hong_nut=bits('luoi_hong_nut'), cat_nut=bits('luoi_cat_nut'),
+                                 g1_state=row.get('luoi_g1_state', ''))
+            except (KeyError, ValueError) as exc:
+                raise LogError(f"{row.get('run_uid')}: luoi columns: {exc}")
+        elif any(row.get(c) for c in LUOI_COLS):
+            raise LogError(f"{row.get('run_uid')}: luoi_* columns without luoi_n_nut")
+    elif any(row.get(c) for c in LUOI_COLS):
+        raise LogError(f"{row.get('run_uid')}: luoi_* columns on a {row.get('gate_version')!r} row")
+    elif row.get('gate_file_sha256') or row.get('gate_report_only'):
+        raise LogError(f"{row.get('run_uid')}: gate_file_sha256 / gate_report_only on a "
+                       f"{row.get('gate_version')!r} row")
     ways = row.get('g1_ways', '')                                               # B81-3
     if ways:
         if ways not in ('1', '2') or (ways == '1' and row.get('g1_t_done_2', '') != ''):
@@ -775,8 +982,10 @@ def gate_from_row(row: dict) -> dict:
 
 
 def map_refused(decide) -> bool:
-    """The gate of a HIL run whose run_active edge was not mapped (only G1, G2 decide, O1 v11.12 §3.4)."""
-    return set(decide) == set(o1_gate.DECIDE_HIL)
+    """The gate of a HIL run whose run_active edge was not mapped (only G1, G2 decide, O1 v11.12 §3.4; O1 v11.33: G1,
+    G2 less a report-only G2): G4, never report only, does not decide."""
+    d = set(decide)
+    return bool(d) and d <= set(o1_gate.DECIDE_HIL)
 
 
 def outcome_vs_gate(outcome: str, ev: dict, decide, fail_cause: str = '') -> Optional[str]:
@@ -805,7 +1014,7 @@ def outcome_vs_gate(outcome: str, ev: dict, decide, fail_cause: str = '') -> Opt
 def count_no_gate(tun: List[dict]) -> int:
     """SC3-2: dat rows outside the campaigns (historic rows) with empty gate columns, reported apart."""
     return sum(r.get('run_outcome') == 'dat' and r.get('campaign') not in CAMPAIGNS
-               and not any(r.get(c) for c in GATE_COLS) for r in tun)
+               and not has_gate(r) for r in tun)
 
 
 def query_files_needed(row: dict, outcome: str) -> bool:
@@ -985,18 +1194,23 @@ def check_score_final(r: dict, path: str, ds: str) -> tuple:
         if g1 is not None:
             # C9D2-2: the same check as 'end' (check_outcome_vs_gate: gate recomputed, then outcome_vs_gate and the
             # floor rule of t1, viol_before_problem); the score carries no fail cause, so the exception before t1
-            # (khong_dat, VIOL_BEFORE) is read from its G1 block (cat_t1)
-            fc = VIOL_BEFORE if isinstance(g1, dict) and isinstance(g1.get('g1'), dict) and g1['g1'].get('cat_t1') \
-                else ''
+            # (khong_dat, VIOL_BEFORE) is read from its gate by the rule of 'end' (GT1-5: every grid node, else cat_t1)
+            fc = VIOL_BEFORE if viol_before_exception(g1) else ''
             try:
-                check_outcome_vs_gate(o1, g1, 'HW', fc)
+                # O1 v11.33: the H1 score uses the gate file of the logged row (checked against the file at end and in
+                # the summary): same SHA, the required set of the row; GT1-6: a lost H0 without a gate carries them too
+                if isinstance(g1, dict) and (g1.get('gate_file_sha256') or '') != r.get('gate_file_sha256', ''):
+                    raise LogError('gate file SHA of the H1 score differs from the logged run')
+                req = (list(o1_gate.required_of([c for c in r.get('gate_report_only', '').split(',') if c]))
+                       if r.get('gate_version') == o1_gate.GATE_VERSION_V1133 or r.get('gate_file_sha256') else None)
+                check_outcome_vs_gate(o1, g1, 'HW', fc, req)
             except LogError as exc:
                 raise LogError(f'run {uid}: outcome_h1 {o1} and the gate of the H1 score: {exc} (C9D-5, C9D2-2)')
     final, want = so_h_outcome(o0, o1, vuot, thieu)
     if d.get('outcome') != final or sorted(flags) != sorted(want):
         raise LogError(f"score_final {path!r}: outcome {d.get('outcome')!r}, flags {flags} disagree with "
                        f'the rule of O1 §4 ({final!r}, {want})')
-    if o0 != 'hong_he_do' or any(r.get(c) for c in GATE_COLS):
+    if o0 != 'hong_he_do' or has_gate(r):
         g = gate_columns(read_gate_json(path))
         diff = sorted(c for c, v in g.items() if c != 'gate_json_sha256' and str(r.get(c, '')) != v)
         if diff:
@@ -1143,6 +1357,17 @@ def confirm_block_problem(tun_after: List[dict], ds: str, campaign: str, gain_se
     if not bid:
         return f"the last confirm car run of {gain_set} ({conf[-1].get('run_uid')}) has no block_id"
     block = [r for r in conf if r.get('block_id') == bid]
+    # GT1-2 (Codex round 1 of CODE_GATE; Liam 17/11 at CODE_GATE "Sửa theo bảng (Recommended)"): a level of the gain
+    # set stopped after the reruns of the C8b time check is chua_ket_luan (O1 3.5 v11.37), so the set is not confirmed.
+    # GT2-2 (round 2): only a level of the gate counts (`levels`, the gate file of the summary; freeze has none: the
+    # levels of the block)
+    levels = None if levels is None else tuple(levels)          # GT3-2: an iterator is read once, used twice
+    lv = set(levels) if levels is not None else {r.get('trajectory') for r in block}
+    stop = sorted(f'{k[2]}@{k[3]}' for k, n in c8b_refusals(tun_after).items()
+                  if k[0] == campaign and k[1] == gain_set and k[2] in lv and n > C8B_RERUNS_MAX)
+    if stop:
+        return (f"{gain_set}: level(s) {', '.join(stop)} stopped after {C8B_RERUNS_MAX} reruns for the C8b time check "
+                '(chua_ket_luan, O1 3.5 v11.37; GT1-2)')
     so = {s.get('run_uid'): s for s in read_rows(os.path.join(ds, SO_H))}
     miss = [r.get('run_uid') for r in block if r.get('run_uid') not in so and r.get('run_outcome') in VALID]
     if miss:
@@ -1169,11 +1394,76 @@ def confirm_block_problem(tun_after: List[dict], ds: str, campaign: str, gain_se
     return None
 
 
-def check_gate_rows(tun: List[dict]) -> None:
+def row_required(r: dict, gate_file=None):
+    """O1 v11.33: the conditions that must decide for a run (row fields trajectory, platform, stage, campaign) from
+    the C8 gate file (gate_c8.GateC8); None without a gate file (all five)."""
+    if gate_file is None:
+        return None
+    try:
+        return gate_file.required(r.get('trajectory', ''), r.get('platform', ''), r.get('stage', ''),
+                                  r.get('campaign', ''))
+    except gate_c8.GateFileError as exc:
+        raise LogError(f"{r.get('run_uid')}: {exc}")
+
+
+def gate_file_problem(r: dict, gate_sha: str, gate_file=None) -> Optional[str]:
+    """O1 v11.33 (OG2-7): None when the gate file SHA of a run's gate (gate_sha, '' = none) fits the gate file in use,
+    else why not. A gate scored with a gate file needs that file here; a campaign run whose level may carry
+    report-only conditions (gate_c8.mask_applies: the floor, the HIL candidate check of B) must be scored with the
+    gate file in use (the run record carries its level and the file SHA)."""
+    if gate_sha and gate_file is None:
+        return (f'its gate was scored with the C8 gate file {gate_sha[:12]}..., not given here (--gate-file): the '
+                'report-only conditions are recomputed from the file (OG2-7)')
+    if gate_file is None:
+        return None
+    if gate_sha and gate_sha != gate_file.sha256:
+        return f'its gate was scored with the gate file {gate_sha[:12]}..., not {gate_file.sha256[:12]}... (given)'
+    try:
+        mask = gate_c8.mask_applies(r.get('platform', ''), r.get('stage', ''), r.get('campaign', ''))
+    except gate_c8.GateFileError as exc:
+        return str(exc)
+    if not gate_sha and mask and r.get('campaign') in CAMPAIGNS:
+        return ('a campaign run on the floor / HIL candidate check of B scored without the C8 gate file (its record '
+                'carries the level and the gate file SHA, O1 v11.33 OG2-7)')
+    return None
+
+
+def lost_gate_file_cols(r: dict, gate_file=None) -> dict:
+    """GT1-6 (Codex round 1 of CODE_GATE): the gate file columns of a run lost to the measurement whose scorer file has
+    no gate (CC1-2): the SHA of the C8 gate file and the report-only conditions of the run's level from it, so the H1
+    score of so-h is checked against the same file and required set. {} without a gate file."""
+    if gate_file is None:
+        return {}
+    req = row_required(r, gate_file)
+    return dict(gate_file_sha256=gate_file.sha256, gate_report_only=','.join(c for c in GATE_CONDS if c not in req))
+
+
+def gate_file_cols_problem(r: dict, gate_file=None) -> Optional[str]:
+    """GT1-6 on a logged row without a gate: gate_file_sha256 / gate_report_only only on a lost run with its scorer
+    file SHA (CC1-2), equal to what the gate file in use gives (lost_gate_file_cols). GT2-1 (Codex round 2): a lost
+    run logged without a gate file keeps the CC1-2 path (no columns, all five required)."""
+    sha, ro = r.get('gate_file_sha256', ''), r.get('gate_report_only', '')
+    if not sha and not ro:
+        return None
+    if r.get('run_outcome') != 'hong_he_do' or not r.get('gate_json_sha256'):
+        return 'gate_file_sha256 / gate_report_only without a gate: only for a lost run with its scorer file (GT1-6)'
+    if gate_file is None:
+        return (f'scored with the C8 gate file {sha[:12]}..., not given here (--gate-file): the report-only conditions '
+                'are recomputed from the file (OG2-7, GT1-6)')
+    want = lost_gate_file_cols(r, gate_file)
+    if (sha, ro) != (want['gate_file_sha256'], want['gate_report_only']):
+        return (f'gate_file_sha256 {sha[:12]}... / gate_report_only {ro!r}: the gate file in use gives '
+                f'{want["gate_file_sha256"][:12]}... / {want["gate_report_only"]!r} (GT1-6)')
+    return None
+
+
+def check_gate_rows(tun: List[dict], gate_file=None) -> None:
     """GV3-1, GV3-R2-1: every logged row that carries a gate is recomputed from its q, lo, hi, n_undef
     (version, deciding set of its platform, thresholds, states); its run_outcome must agree as at `end`.
     Rows whose gate columns are ALL empty (before gate v3, or written without --gate-json) are not
-    checked; any non-empty gate cell makes the row a gate row, with a supported version (GV3-R3-1)."""
+    checked; any non-empty gate cell makes the row a gate row, with a supported version (GV3-R3-1).
+    O1 v11.33: gate_file (gate_c8.GateC8, the summary's --gate-file) gives the required set of every gate row
+    (row_required) and the SHA its gate must carry (gate_file_problem)."""
     for r in tun:
         judged = r.get('run_outcome') in VALID
         camp = r.get('campaign') in CAMPAIGNS           # [CACH HIEU] historic rows (no campaign): SC3-2 note above
@@ -1184,7 +1474,13 @@ def check_gate_rows(tun: List[dict]) -> None:
             if bbad:
                 raise LogError(f"{r.get('run_uid')}: run_outcome {r.get('run_outcome')!r} but {bbad} (S05 4.7 (iv); "
                                f'a run failed by operation is hong_he_do, {BOOT_FAIL})')
-        if not any(r.get(c) for c in GATE_COLS):
+        if not has_gate(r):
+            if r.get('gate_json_sha256') and r.get('run_outcome') != 'hong_he_do':                  # CC1-2
+                raise LogError(f"{r.get('run_uid')}: a scorer file without its gate (gate_json_sha256 only) is for a "
+                               'run lost to the measurement only')
+            gbad = gate_file_cols_problem(r, gate_file)                                             # GT1-6
+            if gbad:
+                raise LogError(f"{r.get('run_uid')}: {gbad}")
             # R134 (d) SC3-2 (HIL rows have their own rule for every judged outcome, Codex S315-1)
             if r.get('run_outcome') == 'dat' and r.get('campaign') in CAMPAIGNS and r.get('platform') != 'HIL':
                 raise LogError(f"{r.get('run_uid')}: run_outcome 'dat' without gate columns ({NO_GATE_EVIDENCE}, "
@@ -1196,8 +1492,11 @@ def check_gate_rows(tun: List[dict]) -> None:
                 raise LogError(f"{r.get('run_uid')}: {viol_before_problem(r.get('run_outcome', ''), VIOL_BEFORE, None)}")
             continue
         g = gate_from_row(r)
+        gbad = gate_file_problem(r, r.get('gate_file_sha256', ''), gate_file)
+        if gbad:
+            raise LogError(f"{r.get('run_uid')}: {gbad}")
         try:
-            ev = _recompute(g, r.get('platform'))
+            ev = _recompute(g, r.get('platform'), row_required(r, gate_file))
         except LogError as exc:
             raise LogError(f"{r.get('run_uid')}: {exc}")
         why = (outcome_vs_gate(r.get('run_outcome', ''), ev, g['decide'], r.get('fail_cause', ''))
@@ -1212,7 +1511,17 @@ def gate_columns(gate: dict, gate_sha256: str = '') -> dict:
     'completed' (true / false / inconclusive)."""
     out = {'gate_version': gate['version'], 'gate_decide': ','.join(gate['decide']),
            'gate_json_sha256': gate_sha256, 'gate_u_t': _num(gate.get('u_t')),
-           'g1_q': str(gate['g1'].get('q')), 'g1_state': gate['g1'].get('state', '')}
+           'g1_q': str(gate['g1'].get('q')), 'g1_state': gate['g1'].get('state', ''),
+           'gate_file_sha256': gate.get('gate_file_sha256') or '',                       # O1 v11.33
+           'gate_report_only': ','.join(gate.get('report_only') or [])}
+    lb = gate.get('luoi')                                                          # C8b grid (design v2)
+    out.update({c: '' for c in LUOI_COLS})
+    if lb is not None:
+        out.update(luoi_gio_sha256=lb['gio_sha256'], luoi_n_nut=str(int(lb['n_nut'])), luoi_d_dau_s=_num(lb['d_dau_s']),
+                   luoi_d_cuoi_s=_num(lb['d_cuoi_s']), luoi_buoc_max_s=_num(lb['buoc_max_s']),
+                   luoi_nut_tam=str(int(lb['nut_tam'])), luoi_g1_nut=''.join(_G1_LETTER[x] for x in lb['g1_nut']),
+                   luoi_hong_nut=''.join('1' if x else '0' for x in lb['hong_nut']),
+                   luoi_cat_nut=''.join('1' if x else '0' for x in lb['cat_nut']), luoi_g1_state=lb['g1_state'])
     def cell(v):
         return '' if v is None or (isinstance(v, float) and math.isnan(v)) else _num(v)
 
@@ -1237,11 +1546,35 @@ def gate_columns(gate: dict, gate_sha256: str = '') -> dict:
     return out
 
 
+def viol_before_exception(gate) -> bool:
+    """GT1-5 (Codex round 1 of CODE_GATE): whether a gate shows the floor exception before t1 (O1 3.5 R2V-4): with a
+    C8b grid, every node has it (design v2 section 2 point 5, Liam 17/11 "Khi mọi nút đều có (Recommended)"); without
+    one, its G1 cat_t1. One rule for 'end', the summary and the H1 score of so-h."""
+    if not isinstance(gate, dict):
+        return False
+    lb = gate.get('luoi')
+    if lb is not None:
+        cat = lb.get('cat_nut') if isinstance(lb, dict) else None
+        return isinstance(cat, list) and bool(cat) and all(x is True for x in cat)
+    g1 = gate.get('g1')
+    return isinstance(g1, dict) and bool(g1.get('cat_t1'))
+
+
 def viol_before_problem(outcome: str, fail_cause: str, gate: Optional[dict]) -> Optional[str]:
     """O1 3.5 R2V-4 (B81-3): the floor exception before t1 is khong_dat with fail cause VIOL_BEFORE and a gate whose
     G1 has cat_t1 true; one without the other is an error."""
     g1 = (gate or {}).get('g1') or {}
-    cat = bool(g1.get('cat_t1'))
+    lb = (gate or {}).get('luoi')
+    if lb is not None:                         # C8b grid (design v2 section 2 points 4, 5; Liam 17/11)
+        cat = viol_before_exception(gate)
+        if cat != (fail_cause == VIOL_BEFORE) or (cat and outcome != 'khong_dat'):
+            return (f'grid with the exception before t1 at {sum(lb["cat_nut"])} of {lb["n_nut"]} nodes, outcome '
+                    f'{outcome!r}, fail cause {fail_cause!r}: khong_dat with {VIOL_BEFORE} exactly when every node '
+                    'has it (Liam 17/11 at CODE_GATE)')
+        if all(lb['hong_nut']) and outcome != 'hong_he_do':
+            return f'every grid node lost to the measurement: the run is hong_he_do, not {outcome} (C8b v4 section 3)'
+        return None
+    cat = viol_before_exception(gate)
     if cat != (fail_cause == VIOL_BEFORE) or (cat and outcome != 'khong_dat'):
         return (f'cat_t1 {cat} with outcome {outcome!r}, fail cause {fail_cause!r}: the floor exception before t1 is '
                 f'khong_dat with fail cause {VIOL_BEFORE} and cat_t1 true (O1 3.5 R2V-4), and only that')
@@ -1252,9 +1585,11 @@ def viol_before_problem(outcome: str, fail_cause: str, gate: Optional[dict]) -> 
     return None
 
 
-def check_outcome_vs_gate(outcome: str, gate: dict, platform: Optional[str] = None, fail_cause: str = '') -> None:
-    """The run outcome typed by the operator against the gate, validated and recomputed first (GV3-5)."""
-    ev = validate_gate(gate, platform)
+def check_outcome_vs_gate(outcome: str, gate: dict, platform: Optional[str] = None, fail_cause: str = '',
+                          required=None) -> None:
+    """The run outcome typed by the operator against the gate, validated and recomputed first (GV3-5);
+    required: the required set of the run from the gate file (row_required; None = all five)."""
+    ev = validate_gate(gate, platform, required)
     why = outcome_vs_gate(outcome, ev, gate['decide'], fail_cause) or viol_before_problem(outcome, fail_cause, gate)
     if why:
         raise LogError(f'--outcome {outcome} disagrees with the gate ({why}); check the scoring')
@@ -1331,7 +1666,7 @@ def check_map_rows(tun: List[dict]) -> None:
                 and map_refused([c for c in r.get('gate_decide', '').split(',') if c])):
             raise LogError(f'{uid}: fail cause {MAP_REFUSED} on a row that is not a HIL hong_he_do run with a gate '
                            'deciding g1,g2 only')
-        if r.get('platform') == 'HIL' and r.get('run_outcome') in VALID and not any(r.get(c) for c in GATE_COLS):
+        if r.get('platform') == 'HIL' and r.get('run_outcome') in VALID and not has_gate(r):
             raise LogError(f"{uid}: HIL run {r.get('run_outcome')} without its gate (--gate-json): S05 v3.15 4.5 "
                            'step 2 needs it to tell a mapped run from a refused one')
 
@@ -1349,6 +1684,103 @@ def final_lost_streak(tun: List[dict], key: tuple) -> int:
         if r.get('stage') in ('final', 'final_hil') and final_key(r) == key:
             s = s + 1 if r.get('run_outcome') == 'hong_he_do' else 0
     return s
+
+
+def _c8b_counted(r: dict) -> bool:
+    return r.get('platform') == 'HW' and r.get('stage') != 'final'
+
+
+def c8b_refusals(tun: List[dict]) -> Dict[tuple, int]:
+    """O1 v11.37 D1: kiem_gio_c8b runs per (campaign, gain set, level) (map_key), stages but final, in the order of
+    the log. A counted run of a key after its 1 + C8B_RERUNS_MAX-th such run is an error (LogError), as is a
+    kiem_gio_c8b run without gain set id.
+    GT1-7 (Codex round 1 of CODE_GATE; Liam 17/11 at CODE_GATE "Sửa theo bảng (Recommended)"): the count cannot be
+    reset by the gain identity: every counted run of a campaign that owns gain sets carries its gain set id; the gain
+    values of one key agree (as numbers, as S315-2 on HIL); after a key stopped, a run at the same level of the
+    campaign with exactly the gain values of the stopped set under another id is an error."""
+    n = defaultdict(int)
+    gains = {}
+    stopped = defaultdict(list)                  # (campaign, task, speed) -> [(gain set id, its gain values)]
+    for r in tun:
+        if not _c8b_counted(r):
+            continue
+        uid, k = r.get('run_uid'), map_key(r)
+        own = r.get('campaign') in GAIN_OWNERS   # GT2-3: the identity checks only for runs of a campaign with gain sets
+        if not r.get('gain_set_id') and own:
+            raise LogError(f"{uid}: a floor run of {r.get('campaign')} outside the final session carries its gain set "
+                           'id (--gain-set): the reruns after the C8b time check are counted per gain set (GT1-7)')
+        lvl = (k[0], k[2], k[3])
+        if n[k] > C8B_RERUNS_MAX:
+            raise LogError(f"{uid}: {r.get('trajectory')}@{r.get('speed_mps')} of {r.get('gain_set_id')} "
+                           f'stopped after {C8B_RERUNS_MAX} reruns for the C8b time check (O1 3.5 v11.37: the level is '
+                           'chua_ket_luan), no run after that')
+        old = gains.setdefault(k, {})
+        if own:
+            g = {x: _num_text(r.get('g_' + x)) for x in GAINS if r.get('g_' + x, '') != ''}
+            diff = sorted(x for x in set(g) & set(old) if g[x] != old[x])
+            if diff:
+                raise LogError(f"{uid}: gain set {r.get('gain_set_id')} with other values of {', '.join(diff)} than an "
+                               f"earlier floor run at {r.get('trajectory')}@{r.get('speed_mps')} (one gain set, one "
+                               'gain; GT1-7)')
+            old.update(g)
+            # GT1-7 (rounds 2, 3): another gain set at a level where a set stopped runs only with evidence that it is
+            # another candidate: against EVERY stopped set, a gain name known for both (this row and the earlier rows
+            # of the key, the stopped set's rows) with another value. No name in common is no evidence: refused
+            others = [(gs, gg) for gs, gg in stopped[lvl] if gs != k[1]]
+            twin = [gs for gs, gg in others if not any(x in old and old[x] != gg[x] for x in gg)]
+            if twin:
+                raise LogError(f"{uid}: {r.get('gain_set_id')} at {r.get('trajectory')}@{r.get('speed_mps')} cannot be "
+                               f'told from {twin[0]}, stopped after {C8B_RERUNS_MAX} reruns for the C8b time check: no '
+                               'gain known for both with another value (one candidate under another name is refused; '
+                               'give the gains of a new candidate with --gains; GT1-7)')
+        if r.get('fail_cause') == C8B_GIO_FAIL:
+            if not r.get('gain_set_id'):
+                raise LogError(f"{uid}: a {C8B_GIO_FAIL} run carries its gain set id (counted per gain set)")
+            n[k] += 1
+            if n[k] == C8B_RERUNS_MAX + 1:
+                stopped[lvl].append((k[1], old))
+    return dict(n)
+
+
+def check_c8b_rows(tun: List[dict]) -> None:
+    """S05 v3.43 D3 on logged rows: a kiem_gio_c8b row is a floor hong_he_do row with the sha256 of its C8b time file;
+    c8b_gio_sha256 only on such a row, never the same file on two runs (GT1-8); and the count (c8b_refusals)."""
+    seen = {}
+    for r in tun:
+        sha = r.get('c8b_gio_sha256', '')
+        if r.get('fail_cause') == C8B_GIO_FAIL:
+            if r.get('platform') != 'HW' or r.get('run_outcome') != 'hong_he_do' or not _hex64(sha):
+                raise LogError(f"{r.get('run_uid')}: fail cause {C8B_GIO_FAIL} on a row that is not a floor hong_he_do "
+                               'run with the sha256 of its C8b time file (S05 v3.43 6.1)')
+        elif sha:
+            raise LogError(f"{r.get('run_uid')}: c8b_gio_sha256 without fail cause {C8B_GIO_FAIL}")
+        if sha:
+            if sha in seen:
+                raise LogError(f"{r.get('run_uid')}: the C8b time file {sha[:12]}... is that of another run "
+                               f'({seen[sha]}): one file per run (GT1-8)')
+            seen[sha] = r.get('run_uid')
+    c8b_refusals(tun)
+
+
+def _hex64(x) -> bool:
+    return isinstance(x, str) and len(x) == 64 and all(ch in '0123456789abcdef' for ch in x)
+
+
+def read_c8b_gio(path: str, task: Optional[str] = None) -> str:
+    """The C8b time file of a run that failed its check (format c8b_gio_v1, ok false); returns its sha256. task (GT1-8):
+    the run's task; a 'task' field of the file, when it has one, must be it. DEFERRED (GT1-8): the SHA of the scored
+    inputs inside the file, until CODE_C8B fixes c8b_gio_v1."""
+    try:
+        with open(path, encoding='utf-8') as f:
+            d = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise LogError(f'--c8b-gio {path!r}: {exc}')
+    if not isinstance(d, dict) or d.get('format') != C8B_GIO_FORMAT or d.get('ok') is not False:
+        raise LogError(f'--c8b-gio {path!r}: not a {C8B_GIO_FORMAT} file with ok false (the run must have failed the '
+                       'C8b time check, O1 3.5 v11.37)')
+    if task is not None and 'task' in d and d['task'] != task:
+        raise LogError(f'--c8b-gio {path!r}: the time file of task {d["task"]!r}, the run is {task!r} (GT1-8)')
+    return sha256_file(path)
 
 
 def map_stopped(n_refused: int) -> bool:
@@ -1373,12 +1805,15 @@ def boot_problem(before, after) -> Optional[str]:
 def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Optional[float] = None,
         fail_cause: str = '', results_dir: str = '', notes: str = '', gate: Optional[dict] = None,
         gate_sha256: str = '', boot_before: Optional[str] = None, boot_after: Optional[str] = None,
-        query_problem: Optional[str] = None, queries: Optional[tuple] = None) -> dict:
+        query_problem: Optional[str] = None, queries: Optional[tuple] = None, gate_file=None,
+        c8b_gio: Optional[str] = None) -> dict:
     """query_problem (R134C3-3): why the two query answer files given on the command line are not two
     questions before and after the run (gain_line_check.query_problem); handled as missing / different boot.
     queries (R134C4-1): the two answers as read by gain_line_check.read_query (before, after; None = missing);
     end checks them itself (query_problem, without the run's boot) and takes boot_before / boot_after from them.
-    A judged car / final_hil run needs them: two boot strings alone do not show two questions."""
+    A judged car / final_hil run needs them: two boot strings alone do not show two questions.
+    gate_file (O1 v11.33): the C8 gate file (gate_c8.GateC8, CLI --gate-file); the run's required set is taken from it
+    (row_required), and a gate scored with a gate file needs it (gate_file_problem)."""
     run = _require_open(ds)
     if outcome not in OUTCOMES:
         raise LogError(f'--outcome one of {OUTCOMES}')
@@ -1402,13 +1837,34 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
                        '(S05 4.7 (iv), R3V-9)')
     if fail_cause == BOOT_FAIL and not bbad:
         raise LogError(f'fail cause {BOOT_FAIL} needs the two boot answers showing it (missing or different)')
+    if (fail_cause == C8B_GIO_FAIL) != bool(c8b_gio):                             # O1 v11.37 D1, S05 v3.43 D3
+        raise LogError(f'fail cause {C8B_GIO_FAIL} and --c8b-gio go together (the C8b time file of the run, ok false)')
+    c8b_sha = ''
+    if c8b_gio:
+        if plat != 'HW' or outcome != 'hong_he_do':
+            raise LogError(f'fail cause {C8B_GIO_FAIL}: a floor run lost to the measurement (hong_he_do), not '
+                           f'{plat} {outcome}')
+        if not results_dir or not os.path.isdir(results_dir) or not _inside(c8b_gio, results_dir):   # GT1-8
+            raise LogError(f'--c8b-gio {c8b_gio!r}: the C8b time file of this run, under its --results-dir folder '
+                           f'({results_dir!r}; GT1-8)')
+        c8b_sha = read_c8b_gio(c8b_gio, task=run['row'].get('trajectory'))
     if fail_cause == MAP_REFUSED and (gate is None or run['row'].get('platform') != 'HIL'):
         raise LogError(f'--fail-cause {MAP_REFUSED}: a HIL run with its scorer output (--gate-json) showing the '
                        'refused mapping (S05 v3.15 4.5 step 2)')
+    if gate is None and gate_sha256:                   # CC1-2: the scorer file of a lost run, without a gate
+        if outcome != 'hong_he_do':
+            raise LogError(f'a scorer file without its gate (gate_v3 null) only for a run lost to the measurement, not '
+                           f'{outcome}')
+        if not results_dir:
+            raise LogError('--gate-json needs --results-dir (so-h looks for the H0 scorer file there, C9D-1)')
     if gate is not None:
         if not results_dir:
             raise LogError('--gate-json needs --results-dir (the run must be scorable again, GV3-6)')
-        check_outcome_vs_gate(outcome, gate, run['row'].get('platform'), fail_cause)
+        gbad = gate_file_problem(run['row'], gate.get('gate_file_sha256') or '', gate_file)
+        if gbad:
+            raise LogError(f'--gate-json: {gbad}')
+        check_outcome_vs_gate(outcome, gate, run['row'].get('platform'), fail_cause,
+                              row_required(run['row'], gate_file))
     if outcome == 'hong_he_do' and not fail_cause:
         raise LogError('hong_he_do needs --fail-cause (S05 §6.1)')
     if run['row'].get('platform') == 'HIL' and outcome in VALID and gate is None:
@@ -1435,6 +1891,9 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
         row['e_perp_max_m'] = f'{e_perp_max:.4f}'
     if gate is not None:
         row.update(gate_columns(gate, gate_sha256))
+    elif gate_sha256:
+        row['gate_json_sha256'] = gate_sha256           # CC1-2
+        row.update(lost_gate_file_cols(run['row'], gate_file))                  # GT1-6
     if asked:
         row.update(boot_before=boot_before or '', boot_after=boot_after or '')
     if queries is not None:                            # R134 (1): the files the two answers came from
@@ -1444,9 +1903,17 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
                 row.update({cf: os.path.abspath(p), cs: sha256_file(p)})
     if notes:
         row['notes'] = (row.get('notes', '') + ' ' + notes).strip()
+    if c8b_sha:
+        row['c8b_gio_sha256'] = c8b_sha
     # Codex S315-5: the log as it will be, this row included, checked before the row is written
     after = live_rows(read_rows(os.path.join(ds, TUNING))) + [row]
     check_map_rows([row])
+    check_c8b_rows(after)                              # GT1-8: the time file of no other run
+    if _c8b_counted(row):
+        try:
+            c8b_refusals(after)
+        except LogError as exc:
+            raise LogError(f'the run is not logged: {exc}')
     if _map_counted(row):
         try:
             map_refusals(after)
@@ -1461,6 +1928,16 @@ def refusal_note(ds: str, row: dict) -> str:
     """What the operator does next after a refused-mapping run (printed by the CLI after the row is written;
     the row was checked before it was written, so a failed recount here is only reported, Codex S315-5).
     final_hil follows S05 4.6 (lost runs in a row), the other HIL stages 4.5 step 2 (Codex S315-6)."""
+    if row.get('fail_cause') == C8B_GIO_FAIL:
+        if not _c8b_counted(row):
+            return 'kiem gio C8b truot o kiem cuoi: luot hong do he do theo S05 4.6 (thay luot, 3 hong lien thi dung)'
+        try:
+            n = c8b_refusals(live_rows(read_rows(os.path.join(ds, TUNING)))).get(map_key(row), 0)
+        except LogError as exc:
+            return f'canh bao: dong da ghi, nhung khong dem lai duoc ({exc})'
+        return f'kiem gio C8b truot lan {n}: ' + (
+            f'qua {C8B_RERUNS_MAX} lan chay lai, muc nay cua bo gain chua ket luan, ghi o san_gio_c8b_dung cua summary'
+            if n > C8B_RERUNS_MAX else f'chay lai cung gain (con {C8B_RERUNS_MAX + 1 - n} lan)')
     if row.get('fail_cause') != MAP_REFUSED:
         return ''
     try:
@@ -1675,15 +2152,20 @@ _COUNT = {'dat': 'pass', 'khong_dat': 'fail', 'chua_ket_luan': 'inconclusive', '
 _SAME_CONDITION = ('campaign', 'platform', 'stage', 'trajectory', 'speed_mps', 'gain_set_id')
 
 
+def read_gate_file(path: str):
+    """EA-9, O1 v11.33: the locked C8 gate file (format gate_c8_v1, tools/gate_c8.py: levels, report-only conditions
+    per level), never typed again; a gate_c8.GateC8 (its sha256 is that of the file bytes)."""
+    try:
+        return gate_c8.read_gate_c8(path)
+    except gate_c8.GateFileError as exc:
+        raise LogError(str(exc))
+
+
 def read_gate(path: str):
-    """EA-9: the gate is read from its locked file (one figure-8 level per row, header `level`),
-    never typed again; returns (levels, sha256 of the file)."""
-    if not os.path.isfile(path):
-        raise LogError(f'gate file {path!r}: no such file')
-    levels = [r.get('level', '').strip() for r in read_rows(path)]
-    if not levels or any(lv not in FIG8 for lv in levels) or len(set(levels)) != len(levels):
-        raise LogError(f'gate file {path!r}: column "level", figure-8 names {sorted(FIG8)}, each once')
-    return levels, sha256_file(path)
+    """(levels, sha256) of the locked gate file (read_gate_file). The CSV with one column `level` (before O1 v11.33)
+    is no longer read."""
+    gf = read_gate_file(path)
+    return list(gf.levels), gf.sha256
 
 
 def gate_result(runs_by_task: Dict[str, List[str]], gate: Iterable[str]) -> str:
@@ -1777,7 +2259,7 @@ def _final_stops(tun: List[dict]) -> set:
     return stopped
 
 
-def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = '') -> List[dict]:
+def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = '', gate_file=None) -> List[dict]:
     """S05_summary.csv rows (S05 v3.7). Accounts (§3.2):
       * a tuning row counts for its `campaign`; an effort row for `chien_dich`, or `khoan` when it is empty;
         a hardware-failure row for `chien_dich` (B-chung split like the effort rows);
@@ -1814,7 +2296,13 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
         a HIL hong_he_do row with a g1,g2 gate, a HIL row judged without its gate, a counted HIL row without
         gain set id or with other gain values than the earlier runs of its key;
       * gate_result: gate_result() over the final runs of the gate levels (`gate`, read from the
-        locked gate file by read_gate); empty without `gate` or without any final run."""
+        locked gate file by read_gate); empty without `gate` or without any final run.
+      * O1 v11.33: gate_file (gate_c8.GateC8): the levels and the SHA come from it (gate, gate_sha256 must then be
+        None / '' or the same), and every gate row is checked against it (check_gate_rows)."""
+    if gate_file is not None:
+        if (gate is not None and list(gate) != list(gate_file.levels)) or (gate_sha256 and gate_sha256 != gate_file.sha256):
+            raise LogError('summary: gate / gate_sha256 given with another gate file')
+        gate, gate_sha256 = list(gate_file.levels), gate_file.sha256
     gate = None if gate is None else list(gate)     # used per campaign (gate_result, Q1)
     raw = live_rows(read_rows(os.path.join(ds, TUNING)))
     tun = apply_so_h(raw, ds)                       # S05 v3.37 4.3: outcomes after the clip H comparison
@@ -1847,10 +2335,17 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
             except LogError as exc:
                 raise LogError(f"{r.get('run_uid')}: {exc}")
     _check_replacements(tun)
-    check_gate_rows(raw)                            # GV3-1, GV3-R2-1: gate rows recomputed (logged outcome)
+    check_gate_rows(raw, gate_file)                 # GV3-1, GV3-R2-1: gate rows recomputed (logged outcome)
     check_query_rows(raw, ds)                       # R134 (1): the two saved answers read again
     stopped = _final_stops(tun)
     check_map_rows(tun)                             # S05 v3.15 4.5 step 2 (Codex S315-1)
+    check_c8b_rows(tun)                             # O1 v11.37 D1, S05 v3.43 D3
+    c8b_rep = defaultdict(lambda: {'n': 0, 'stopped': []})
+    for k, n in c8b_refusals(tun).items():
+        if n:
+            c8b_rep[k[0]]['n'] += n
+            if n > C8B_RERUNS_MAX:
+                c8b_rep[k[0]]['stopped'].append(f'{k[1]} {k[2]}@{k[3]}')
     map_n = map_refusals(tun)                       # refused mappings, levels stopped
     map_rep = defaultdict(lambda: {'n': 0, 'stopped': []})
     for k, n in map_n.items():
@@ -2066,14 +2561,18 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
         if c in map_rep:                            # extra columns, only for a campaign with refused mappings
             row['hil_map_refused_n'] = str(map_rep[c]['n'])
             row['hil_map_stopped'] = '; '.join(sorted(map_rep[c]['stopped']))
+        if c in c8b_rep:                            # O1 v11.37: only for a campaign with C8b time check failures
+            row['san_gio_c8b_n'] = str(c8b_rep[c]['n'])
+            row['san_gio_c8b_dung'] = '; '.join(sorted(c8b_rep[c]['stopped']))
         out.append(row)
     if unassigned:
         print(f'note: {unassigned} tuning row(s) without campaign left out', file=sys.stderr)
     return out
 
 
-def write_summary(ds: str, out_path: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = '') -> List[dict]:
-    rows = summary(ds, gate, gate_sha256)
+def write_summary(ds: str, out_path: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = '',
+                  gate_file=None) -> List[dict]:
+    rows = summary(ds, gate, gate_sha256, gate_file)
     extra = sorted({k for r in rows for k in r} - set(SUMMARY_HEAD))
     _write_all(out_path, SUMMARY_HEAD + extra, rows)
     return rows
@@ -2093,13 +2592,21 @@ def _plain(o):
     return o
 
 
-def fake_gate(e_trk: float = 0.03, mapped: bool = True, completed: str = 'true') -> dict:
+def fake_gate(e_trk: float = 0.03, mapped: bool = True, completed: str = 'true', gate_file=None,
+              level: str = 'O1-F05', platform: str = 'HW', stage: str = 'final', campaign: str = 'A-PID',
+              e_theta_deg: float = 3.0) -> dict:
     """A made-up gate (FAKE: demo and tests only, no measurement): 20 frames of constant errors, e_trk as given;
-    mapped: U_t known and all five decide, else the HIL set without the run_active edge mapping (G1, G2)."""
+    mapped: U_t known and all five decide, else the HIL set without the run_active edge mapping (G1, G2).
+    gate_file (gate_c8.GateC8, O1 v11.33): a gate_v3.3 gate scored with it, the report-only conditions of `level`
+    for a run of platform / stage / campaign."""
     n = 20
-    frames = {'e_perp': [0.02] * n, 'e_trk': [e_trk] * n, 'e_bao': [0.04] * n, 'e_theta_cmd_deg': [3.0] * n}
+    frames = {'e_perp': [0.02] * n, 'e_trk': [e_trk] * n, 'e_bao': [0.04] * n, 'e_theta_cmd_deg': [e_theta_deg] * n}
+    kw = {}
+    if gate_file is not None:
+        kw = dict(report_only=gate_file.run_report_only(level, platform, stage, campaign), level=level,
+                  gate_file_sha256=gate_file.sha256)
     return _plain(o1_gate.gate(frames, completed, v_cmd_max=0.729, wz_cmd_max=1.634, u_t=0.0015 if mapped else None,
-                               decide=o1_gate.DECIDE_ALL if mapped else o1_gate.DECIDE_HIL, note='FAKE'))
+                               decide=o1_gate.DECIDE_ALL if mapped else o1_gate.DECIDE_HIL, note='FAKE', **kw))
 
 
 _FAKE_Q = {'dir': None, 'n': 0}
@@ -2147,7 +2654,7 @@ def floor_gate(g: dict, t_done=None, t_deadline: float = 20.0) -> dict:
     g['g1'].update(t_done=list(t_done), t_deadline=t_deadline)
     st = gate_g1_state(gate_g1_fields(g['g1'], 'HW'))
     g['g1'].update(state=st, q={'dat': 'true', 'khong_dat': 'false'}.get(st, 'inconclusive'))
-    g.update(o1_gate.evaluate_outcomes(g, g['decide']))
+    g.update(o1_gate.evaluate_outcomes(g, g['decide'], g.get('required')))
     return g
 
 
@@ -2172,9 +2679,10 @@ def fake_score_final(folder: str, d_h_mm: Optional[float], h1: Optional[dict] = 
     return p
 
 
-def demo(out_dir: str, seed: int = 1) -> List[dict]:
+def demo(out_dir: str, seed: int = 1, levels=('O1-F05',)) -> List[dict]:
     """A made-up A-PID, B-chung, B-PID, final session, written through the same commands, then
-    the summary. Every number is invented (labelled FAKE); nothing here is a measurement."""
+    the summary. Every number is invented (labelled FAKE); nothing here is a measurement.
+    levels: the gate levels of the FAKE C8 gate file (FAKE_gate_c8.json in out_dir, O1 v11.33)."""
     global now
     os.makedirs(out_dir, exist_ok=False)
     rnd = random.Random(seed)
@@ -2185,6 +2693,10 @@ def demo(out_dir: str, seed: int = 1) -> List[dict]:
         import gain_line_check as glc
         import s05_fake_runs as fr       # R134 (1), C9 dry05: every judged run gets its folder (s05_final_table)
         migrate(out_dir)
+        # O1 v11.33: the C8 gate file (FAKE numbers) the scorers and end use; the summary reads it at the end
+        gate_path = os.path.join(out_dir, 'FAKE_gate_c8.json')        # stands for the gate locked at C8
+        gate_c8.write_gate(gate_path, gate_c8.fake_gate(tuple(levels)))
+        gf = read_gate_file(gate_path)
         gain = dict(ctrl='PID', id=1, gains=dict(kp_xy=1.0, ki_xy=0.5, kp_wz=1.0, ki_wz=0.2, pos_kp=6.0, pos_ki=3.0,
                                                  k_psi=1.0))
 
@@ -2196,7 +2708,7 @@ def demo(out_dir: str, seed: int = 1) -> List[dict]:
             d = run_dir(name)
             qp = fr.write_final_run(d, platform, gain, score_extra=dict(outcome=outcome, gate_v3=g))
             sp = os.path.join(d, 'score.json')
-            kw = dict(results_dir=d, gate=read_gate_json(sp), gate_sha256=sha256_file(sp))
+            kw = dict(results_dir=d, gate=read_gate_json(sp), gate_sha256=sha256_file(sp), gate_file=gf)
             if ask:
                 kw['queries'] = tuple(glc.read_query(p) for p in qp)
             return kw
@@ -2221,7 +2733,8 @@ def demo(out_dir: str, seed: int = 1) -> List[dict]:
             tick(60)
             if i:                                      # B81-1: a judged car run, camera gate; C9D-6: its folder
                 a1.append(end(out_dir, 'khong_dat', completed=1, e_perp_max=0.12 + i / 100,
-                              **judged(f'a1_{i}', 'HW', 'khong_dat', floor_gate(fake_gate(e_trk=0.5)))))
+                              **judged(f'a1_{i}', 'HW', 'khong_dat', floor_gate(fake_gate(
+                                  e_trk=0.5, gate_file=gf, level='O1-F0' + sp[-1], stage='screen')))))
             else:
                 end(out_dir, 'hong_he_do', completed=1, e_perp_max=0.12, fail_cause='mat_khung_FAKE')
         # S05 v3.37 4.3, C9D-2: the clip H comparison at the end of the session, for every judged car run. FAKE-A1:2
@@ -2229,7 +2742,7 @@ def demo(out_dir: str, seed: int = 1) -> List[dict]:
         # the two outcomes differ, chua_ket_luan with calib_drift_split (O1 4 clip H)
         so_h(out_dir, a1[0]['run_uid'], fake_score_final(run_dir('a1_1'), 1.2))
         so_h(out_dir, a1[1]['run_uid'], fake_score_final(run_dir('a1_2'), 3.1, h1=dict(
-            FAKE=True, outcome='dat', gate_v3=floor_gate(fake_gate()))))
+            FAKE=True, outcome='dat', gate_v3=floor_gate(fake_gate(gate_file=gf, level='O1-F08', stage='screen')))))
         gfile = fr.write_gain_file(os.path.join(out_dir, 'FAKE_gain_G00.json'), gain)   # gain_send file format
         freeze(out_dir, 'A-PID', 'khong_du_luot_xac_nhan', 'A-PID/G00', gfile, at=_iso(clock[0]),
                notes='FAKE')
@@ -2244,11 +2757,13 @@ def demo(out_dir: str, seed: int = 1) -> List[dict]:
         step(out_dir, 'run')
         tick(90)                                        # S05 v3.15 4.5 step 2: mapping refused, run again
         end(out_dir, 'hong_he_do', completed=1, fail_cause=MAP_REFUSED,
-            **judged('b1_1', 'HIL', 'hong_he_do', fake_gate(mapped=False), ask=False))
+            **judged('b1_1', 'HIL', 'hong_he_do', fake_gate(mapped=False, gate_file=gf, platform='HIL',
+                                                            stage='hil_check', campaign='B-PID'), ask=False))
         begin(out_dir, 'FAKE-B1', 'B-PID', 'HIL', 'PID', 'O1-F05', '0.5', 'hil_check', gain_set='B-PID/GA1')
         step(out_dir, 'run')
         tick(90)
-        end(out_dir, 'dat', completed=1, e_perp_max=0.04, **judged('b1_2', 'HIL', 'dat', fake_gate(), ask=False))
+        end(out_dir, 'dat', completed=1, e_perp_max=0.04, **judged('b1_2', 'HIL', 'dat', fake_gate(
+            gate_file=gf, platform='HIL', stage='hil_check', campaign='B-PID'), ask=False))
         hwfail(out_dir, '2026-11-20', 'FAKE-B1', 'B-PID', 'HW', 'FAKE: tuot banh', 'phan_cung_ngau_nhien', 0.5)
         for k in range(2):                              # final on HIL: account RQ2, joined by gain set
             begin(out_dir, 'FAKE-FH', 'RQ2', 'HIL', 'PID', 'O1-F05', '0.5', 'final_hil', gain_set='A-PID/G00')
@@ -2259,7 +2774,8 @@ def demo(out_dir: str, seed: int = 1) -> List[dict]:
         lost, fin = None, []
         # final on the car; the lost run is replaced. The chua_ket_luan run: one way of using the frames did not
         # complete (suspect frames as gaps), so G1 is inconclusive and the two frame domains differ (B81-3)
-        car_gate = {'dat': floor_gate(fake_gate()), 'chua_ket_luan': floor_gate(fake_gate(), t_done=(10.0, None))}
+        car_gate = {'dat': floor_gate(fake_gate(gate_file=gf)),
+                    'chua_ket_luan': floor_gate(fake_gate(gate_file=gf), t_done=(10.0, None))}
         for o in ('hong_he_do', 'dat', 'chua_ket_luan'):
             begin(out_dir, 'FAKE-F1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'final', gain_set='A-PID/G00',
                   replaces_run_uid=lost if o == 'dat' else '')
@@ -2272,11 +2788,7 @@ def demo(out_dir: str, seed: int = 1) -> List[dict]:
                 fin.append(end(out_dir, o, completed=1, e_perp_max=0.10, **judged(f'f1_{o}', 'HW', o, car_gate[o])))
         for r in fin:                                   # C9D-2: clip H of the final session below eps_H
             so_h(out_dir, r['run_uid'], fake_score_final(r['results_dir'], 0.8))
-        gate_path = os.path.join(out_dir, 'FAKE_gate.csv')            # stands for the gate locked at C8
-        with open(gate_path, 'w', encoding='utf-8', newline='\n') as f:
-            f.write('level\nO1-F05\n')
-        gate, sha = read_gate(gate_path)
-        return write_summary(out_dir, os.path.join(out_dir, SUMMARY), gate=gate, gate_sha256=sha)
+        return write_summary(out_dir, os.path.join(out_dir, SUMMARY), gate_file=gf)
     finally:
         now = real_now
 
@@ -2305,6 +2817,10 @@ def main(argv=None) -> int:
     e.add_argument('--completed', type=int, choices=(0, 1))
     e.add_argument('--e-perp-max', type=float)
     e.add_argument('--gate-json', default='', help='scorer output with a gate_v3 block (hil_o1_score.py --out)')
+    e.add_argument('--c8b-gio', default='', help=f'C8b time file of the run ({C8B_GIO_FORMAT}, ok false) with '
+                   f'--fail-cause {C8B_GIO_FAIL} (O1 v11.37)')
+    e.add_argument('--gate-file', default='', help='the locked C8 gate file (gate_c8_v1): report-only conditions of '
+                   'the level (O1 v11.33); needed when the scorer used it')
     e.add_argument('--query-before', default='', help='gain_send.py --query output just before the run (R134 (b))')
     e.add_argument('--query-after', default='', help='gain_send.py --query output just after the run (R134 (b))')
     for name in ('fail-cause', 'results-dir', 'notes'):
@@ -2345,7 +2861,7 @@ def main(argv=None) -> int:
     z.add_argument('--stop-cause', default='', choices=('',) + STOP_CAUSES)
     o = sub.add_parser('summary')
     o.add_argument('--out', default='')
-    o.add_argument('--gate-file', default=None, help='the locked gate (column "level": O1-F05, ...; locked at C8)')
+    o.add_argument('--gate-file', default=None, help='the locked C8 gate file (gate_c8_v1 JSON, tools/gate_c8.py)')
     d = sub.add_parser('demo')
     d.add_argument('--out', required=True)
     sh = sub.add_parser('so-h', help='outcome of a car run after the clip H comparison (S05 v3.37 4.3)')
@@ -2397,8 +2913,10 @@ def main(argv=None) -> int:
                                'end logs the provisional outcome with the H0 scoring (score.json of the run), then '
                                'so-h --run-uid <run> --score-final <this file> after the clip H comparison')
             row = end(ds, a.outcome, a.completed, a.e_perp_max, a.fail_cause, a.results_dir, a.notes,
-                      gate=read_gate_json(a.gate_json) if a.gate_json else None,
-                      gate_sha256=sha256_file(a.gate_json) if a.gate_json else '', **boots)
+                      gate=read_gate_json(a.gate_json, allow_null=a.outcome == 'hong_he_do') if a.gate_json else None,
+                      gate_sha256=sha256_file(a.gate_json) if a.gate_json else '',
+                      gate_file=read_gate_file(a.gate_file) if a.gate_file else None, c8b_gio=a.c8b_gio or None,
+                      **boots)
             print('row', row['run_uid'], {k: row[f't_{k}_s'] for k in STEPS}, 'wait', row['t_operator_wait_s'])
             note = refusal_note(ds, row)
             if note:
@@ -2425,8 +2943,8 @@ def main(argv=None) -> int:
             row = freeze(ds, a.campaign, a.stop_reason, a.gain_set, a.gain_file, a.at, a.notes, a.stop_cause)
             print('frozen', a.campaign, row['gain_sha256'])
         elif a.cmd == 'summary':
-            gate, sha = read_gate(a.gate_file) if a.gate_file else (None, '')
-            rows = write_summary(ds, a.out or os.path.join(ds, SUMMARY), gate, sha)
+            gf = read_gate_file(a.gate_file) if a.gate_file else None
+            rows = write_summary(ds, a.out or os.path.join(ds, SUMMARY), gate_file=gf)
             for r in rows:
                 print(r['campaign'], r['T_operator_h'], 'h', 'N_HW', r['N_HW'], 'gate', r['gate_result'] or '-')
             n_old = count_no_gate(read_rows(os.path.join(ds, TUNING)))         # R134C2-11 (SC3-2)

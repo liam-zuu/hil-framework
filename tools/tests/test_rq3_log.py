@@ -48,6 +48,8 @@ def gain_file(d, name='gain_G0.json'):
 
 def car_run(d, clock, campaign, stage, outcome, task='O1-F05', speed='0.5', s=60, **kw):
     platform = kw.pop('platform', 'HW')
+    if platform == 'HW' and stage != 'final' and campaign in rl.GAIN_OWNERS:   # GT1-7: a floor campaign run names
+        kw.setdefault('gain_set', f'{campaign}/G1')                            # its gain set
     rl.begin(d, kw.pop('session', 'S'), campaign, platform, 'PID', task, speed, stage, **kw)
     rl.step(d, 'run')
     tick(clock, s)
@@ -122,7 +124,7 @@ def test_live_run_segments_pause_and_wait(ds):
     assert row['g_kp_xy'] == '1.2' and row['g_k_psi'] == '1' and row['e_perp_max_m'] == '0.1230'
     assert row['wall_start'] == '2026-11-20T08:00:00' and row['wall_end'] == '2026-11-20T08:21:20'
     assert not os.path.exists(os.path.join(d, rl.OPEN_RUN))
-    rl.begin(d, 'A1', 'A-PID', 'HW', 'PID', 'O1-F08', '0.8', 'screen')
+    rl.begin(d, 'A1', 'A-PID', 'HW', 'PID', 'O1-F08', '0.8', 'screen', gain_set='A-PID/G1')
     assert rl._load_open(d)['row']['iter_no'] == '2'
 
 
@@ -134,12 +136,12 @@ def test_refusals(ds):
     with pytest.raises(rl.LogError):
         rl.begin(d, 'A:1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen')
     with pytest.raises(rl.LogError):
-        rl.begin(d, 'A1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gains='kd=1')
+        rl.begin(d, 'A1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gains='kd=1', gain_set='A-PID/G1')
     with pytest.raises(rl.LogError, match='no open run'):
         rl.step(d, 'run')
-    rl.begin(d, 'A1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen')
+    rl.begin(d, 'A1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G1')
     with pytest.raises(rl.LogError, match='open'):
-        rl.begin(d, 'A1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen')
+        rl.begin(d, 'A1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G1')
     with pytest.raises(rl.LogError, match='fail-cause'):
         end_(d, 'hong_he_do')
     rl.pause(d)
@@ -182,7 +184,7 @@ def test_summary_accounts_split_caps_and_finals(ds):
     rl.migrate(d)
     # A-PID: 2 tune car runs of 600 s active, one final run 100 s, 1 h hoc, 1 h other work
     for sp in ('0.2', '0.5'):
-        rl.begin(d, 'A1', 'A-PID', 'HW', 'PID', 'O1-F0' + sp[-1], sp, 'screen'); rl.step(d, 'setup'); tick(clock, 600)
+        rl.begin(d, 'A1', 'A-PID', 'HW', 'PID', 'O1-F0' + sp[-1], sp, 'screen', gain_set='A-PID/G1'); rl.step(d, 'setup'); tick(clock, 600)
         end_(d, 'khong_dat')
     rl.begin(d, 'F1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'final'); rl.step(d, 'run'); tick(clock, 100)
     end_(d, 'dat', results_dir='r', gate=rl.fake_gate())               # R134 (d) SC3-2: dat with its gate
@@ -221,7 +223,7 @@ def test_caps(ds):
     d, clock = ds
     rl.migrate(d)
     for _ in range(rl.CAP_HW):
-        rl.begin(d, 'A1', 'A-LADRC', 'HW', 'LADRC', 'O1-F05', '0.5', 'confirm'); rl.step(d, 'run'); tick(clock, 300)
+        rl.begin(d, 'A1', 'A-LADRC', 'HW', 'LADRC', 'O1-F05', '0.5', 'confirm', gain_set='A-LADRC/G1'); rl.step(d, 'run'); tick(clock, 300)
         end_(d, 'khong_dat')
     a = {r['campaign']: r for r in rl.summary(d)}['A-LADRC']
     assert a['cap_hit'] == 'xe+gio' and a['N_HW_tune'] == '120' and a['T_tune_no_hoc_h'] == '10.000'
@@ -298,7 +300,7 @@ def test_c9_dry_run_recomputes_summary(tmp_path):
     with open(out / rl.SUMMARY, newline='', encoding='utf-8') as f:
         written = list(csv.DictReader(f))
     assert [r['campaign'] for r in written] == list(rl.SUMMARY_ROWS)
-    again = rl.summary(str(out), *rl.read_gate(str(out / 'FAKE_gate.csv')))
+    again = rl.summary(str(out), gate_file=rl.read_gate_file(str(out / 'FAKE_gate_c8.json')))
     assert [{k: v for k, v in r.items()} for r in again] == rows1
     for w, r in zip(written, rows1):
         assert all(w[k] == r.get(k, '') for k in w)
@@ -318,7 +320,7 @@ def test_c9_dry_run_recomputes_summary(tmp_path):
 def test_ea1_repair_in_T_and_refused_while_a_run_is_open(ds):
     d, clock = ds
     rl.migrate(d)
-    rl.begin(d, 'A1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen'); rl.step(d, 'run')
+    rl.begin(d, 'A1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G1'); rl.step(d, 'run')
     with pytest.raises(rl.LogError, match='run is open'):
         rl.hwfail(d, '2026-11-20', 'A1', 'A-PID', 'HW', 'tuot banh', 'phan_cung_ngau_nhien', 1.0)
     tick(clock, 60)
@@ -426,13 +428,13 @@ def test_ea4_n_sim_zero_and_empty(ds):
 def test_ea6_cancel_only_before_the_run_step(ds):
     d, clock = ds
     rl.migrate(d)
-    rl.begin(d, 'A1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen')
+    rl.begin(d, 'A1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G1')
     rl.step(d, 'setup'); tick(clock, 300)
     rl.step(d, 'run'); tick(clock, 5)
     with pytest.raises(rl.LogError, match='run counts'):
         rl.cancel(d)
     end_(d, 'hong_he_do', fail_cause='dung_som')
-    rl.begin(d, 'A1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen')
+    rl.begin(d, 'A1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G1')
     rl.step(d, 'flash'); tick(clock, 120)
     rl.pause(d); tick(clock, 600)
     eff = rl.cancel(d)['effort_row']
@@ -449,7 +451,7 @@ def test_ea7_hoc_stamped_by_the_script_manual_flagged(ds):
         rl.hoc_start(d, 'B-chung', 'doc')
     rl.hoc_start(d, 'A-PID', 'doc huong dan tune')
     with pytest.raises(rl.LogError, match='hoc segment is open'):
-        rl.begin(d, 'A1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen')
+        rl.begin(d, 'A1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G1')
     with pytest.raises(rl.LogError, match='open'):
         rl.hoc_start(d, 'A-PID', 'x')
     tick(clock, 1800)
@@ -504,15 +506,21 @@ def test_ea9_task_level_and_locked_gate_file(ds, tmp_path):
     d, clock = ds
     rl.migrate(d)
     with pytest.raises(rl.LogError, match='level 0.5'):
-        rl.begin(d, 'A1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.8', 'screen')
+        rl.begin(d, 'A1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.8', 'screen', gain_set='A-PID/G1')
     with pytest.raises(rl.LogError, match='figure-8 names'):
-        rl.begin(d, 'A1', 'A-PID', 'HW', 'PID', 'O1-F09', '0.9', 'screen')
-    gp = tmp_path / 'gate.csv'
-    for bad in ('lv\nO1-F05\n', 'level\nO1-F05@0.5\n', 'level\nO1-F05\nO1-F05\n', 'level\n'):
+        rl.begin(d, 'A1', 'A-PID', 'HW', 'PID', 'O1-F09', '0.9', 'screen', gain_set='A-PID/G1')
+    # O1 v11.33 (CODE_GATE): the gate file is the gate_c8_v1 JSON (tools/gate_c8.py); the old CSV is refused
+    import json
+    gp = tmp_path / 'gate.json'
+    good = rl.gate_c8.fake_gate(('O1-F05', 'O1-F08'))
+    bads = ['level\nO1-F05\nO1-F08\n', json.dumps(dict(good, levels=['O1-F05@0.5'])),
+            json.dumps(dict(good, levels=['O1-F05', 'O1-F05'])), json.dumps(dict(good, levels=[])),
+            json.dumps(dict(good, format='gate_c8_v0'))]
+    for bad in bads:
         gp.write_text(bad, encoding='utf-8')
         with pytest.raises(rl.LogError, match='gate file'):
             rl.read_gate(str(gp))
-    gp.write_text('level\nO1-F05\nO1-F08\n', encoding='utf-8')
+    gp.write_text(json.dumps(good), encoding='utf-8')
     levels, sha = rl.read_gate(str(gp))
     import hashlib
     assert levels == ['O1-F05', 'O1-F08'] and sha == hashlib.sha256(gp.read_bytes()).hexdigest()

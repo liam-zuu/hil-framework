@@ -56,7 +56,8 @@ def test_fig8_summary_is_evaluate_v7_plus_g4():
     out, rows, fr = E.evaluate_fig8(lg, O.Path8(), sch)
     for k, v in ref.items():                                     # every evaluate_v7 field unchanged
         assert (out[k] == v) or (isinstance(v, float) and math.isnan(v) and math.isnan(out[k])), k
-    assert len(rows) == len(ref_rows) and set(fr) == set(G.FRAME_KEYS.values())
+    assert len(rows) == len(ref_rows) and set(fr) == set(G.FRAME_KEYS.values()) | {'t'}   # t: CODE_GATE (O1 v11.33)
+    assert list(fr['t']) == [r['t'] for r in rows]
     assert all(len(a) == len(rows) for a in fr.values())
     # on the path with the heading on the tangent: G4 = e_perp (no turn), tiny
     assert out['e_bao_max'] == pytest.approx(out['e_perp_max'], abs=1e-6) and out['e_bao_max'] < 1e-3
@@ -192,118 +193,232 @@ def test_g1_fields_v7_from_the_summary(summ, want):
     assert G.g1_state_from_fields(f) == G.g1_state(summ['completed'])
 
 
-# G1F-3 (Codex round 1): the whole evaluate_fig8 summary of the base code (hil 09ff237, run from its own source tree
-# with the same fig8_log) on two logs: every key and the exact value (IEEE-754 bytes of floats, repr of strings).
-# tools/hil_o1_score.py writes this summary whole, so a key added here would change the HIL output.
-BASE_SUMMARY_09FF237 = {
-    (0.5, 0.03, 0.05): {
-        'S': 'f2804a28c8e631840',
-        'T': 'f5a04a28c8e632840',
-        'T_cmd': 'fece3ebd6b74d2b40',
-        'T_r': 'f90fc4e524a51f73f',
-        'completed': "r'true'",
-        'cond2_5_ever': 'bTrue',
-        'ds_absmax': 'f0000708e323ae73e',
-        'ds_max': 'f00002879a01be73e',
-        'ds_min': 'f0000708e323ae7be',
-        'e_bao_max': 'fe95f7647959ea33f',
-        'e_bao_phys_max': 'fe95f7647959ea33f',
-        'e_meas_note': "r'no firmware pose columns'",
-        'e_meas_perp_max': 'f000000000000f87f',
-        'e_perp_global_max': 'f9094630e52b89e3f',
-        'e_perp_max': 'f60bba10e52b89e3f',
-        'e_perp_max_cens': 'f60bba10e52b89e3f',
-        'e_perp_max_le_D': 'bTrue',
-        'e_perp_rms': 'f1f1855f151b89e3f',
-        'e_s_absmax': 'f000000000080b53c',
-        'e_theta_cmd_max_deg': 'fb601837b16eb0640',
-        'e_theta_lane_max_deg': 'f8ecfa1acfded0640',
-        'e_trk_max': 'f251f85eb51b89e3f',
-        'e_trk_rms': 'fb91e85eb51b89e3f',
-        'eval_version': "r'o1_gate_eval_v2'",
-        'g4_tie_frames': 'i0',
-        'n_back_frames': 'i0',
-        'n_upper_frames': 'i0',
-        's_car_end': 'f2804a28c8e631840',
-        'sat_any_frac': 'f0000000000000000',
-        'sat_frac': 'f0000000000000000',
-        'status': "r'ok'",
-        'stop_dist_origin': 'fba1e85eb51b89e3f',
-        'stop_heading_err_deg': 'f7c01837b16eb0640',
-        'stop_x': 'fee43fffbe9b895bf',
-        'stop_y': 'f6043fffbe9b8953f',
-        't_deadline': 'fece3ebd6b74d2f40',
-        't_end': 'f48e17a14ae472d40',
-        't_first_track_err': 'f000000000000f87f',
-        't_progress': 'f0ad7a3703d0a2a40',
-        'track_err_frames': 'i0',
-        'tv_duty': 'f0000000000000000',
-        'v': 'f000000000000e03f',
-    },
-    (0.8, 0.0, 0.0): {
-        'S': 'f2804a28c8e631840',
-        'T': 'f7085ca2f727c1e40',
-        'T_cmd': 'fd50ef5c114e82340',
-        'T_r': 'f74303fa86ea70240',
-        'completed': "r'true'",
-        'cond2_5_ever': 'bTrue',
-        'ds_absmax': 'f6062bc2d4638e73e',
-        'ds_max': 'f000078101a01e73e',
-        'ds_min': 'f6062bc2d4638e7be',
-        'e_bao_max': 'fb0beb70e1961e73e',
-        'e_bao_phys_max': 'fb0beb70e1961e73e',
-        'e_meas_note': "r'no firmware pose columns'",
-        'e_meas_perp_max': 'f000000000000f87f',
-        'e_perp_global_max': 'f88137c2d4638e73e',
-        'e_perp_max': 'f88137c2d4638e73e',
-        'e_perp_max_cens': 'f88137c2d4638e73e',
-        'e_perp_max_le_D': 'bTrue',
-        'e_perp_rms': 'ffaed8e9bc19ad33e',
-        'e_s_absmax': 'f6b263d4b898fb33c',
-        'e_theta_cmd_max_deg': 'f0000000000000000',
-        'e_theta_lane_max_deg': 'f6a8f2444b958573f',
-        'e_trk_max': 'f535bda3a584cb93c',
-        'e_trk_rms': 'fd4f66955ebe9a03c',
-        'eval_version': "r'o1_gate_eval_v2'",
-        'g4_tie_frames': 'i0',
-        'n_back_frames': 'i0',
-        'n_upper_frames': 'i0',
-        's_car_end': 'f2804a28c8e631840',
-        'sat_any_frac': 'f0000000000000000',
-        'sat_frac': 'f0000000000000000',
-        'status': "r'ok'",
-        'stop_dist_origin': 'fd78e03bea0f5b83c',
-        'stop_heading_err_deg': 'f0000000000000000',
-        'stop_x': 'f085c143326a6b1bc',
-        'stop_y': 'f085c143326a6b1bc',
-        't_deadline': 'fd50ef5c114e82740',
-        't_end': 'fe17a14ae47e12540',
-        't_first_track_err': 'f000000000000f87f',
-        't_progress': 'f295c8fc2f5a82240',
-        'track_err_frames': 'i0',
-        'tv_duty': 'f0000000000000000',
-        'v': 'f9a9999999999e93f',
-    },
-}
-
-
-def _bits(x):
-    if isinstance(x, (bool, np.bool_)):
-        return 'b' + str(bool(x))
-    if isinstance(x, (float, np.floating)):
-        import struct
-        return 'f' + struct.pack('<d', float(x)).hex()
-    if isinstance(x, (int, np.integer)):
-        return 'i' + str(int(x))
-    return 'r' + repr(x)
-
-
-@pytest.mark.parametrize('args', sorted(BASE_SUMMARY_09FF237))
-def test_evaluate_fig8_summary_and_version_unchanged_for_hil(args):
-    """G1F-3: the evaluate_fig8 summary has exactly the keys and values of the base code (no key added, none
-    changed) and EVAL_VERSION is unchanged; the G1 fields are the separate function g1_fields_v7."""
-    lg, sch = fig8_log(v=args[0], lateral=args[1], yaw=args[2])
-    out, _, _ = E.evaluate_fig8(lg, O.Path8(), sch)
-    assert {k: _bits(v) for k, v in out.items()} == BASE_SUMMARY_09FF237[args]
-    assert E.EVAL_VERSION == 'o1_gate_eval_v2'
+# G1F-3 (Codex round 1): the whole evaluate_fig8 summary of the base code (hil 09ff237, run from its own source tree
+
+# with the same fig8_log) on two logs: every key and the exact value (IEEE-754 bytes of floats, repr of strings).
+
+# tools/hil_o1_score.py writes this summary whole, so a key added here would change the HIL output.
+
+BASE_SUMMARY_09FF237 = {
+
+    (0.5, 0.03, 0.05): {
+
+        'S': 'f2804a28c8e631840',
+
+        'T': 'f5a04a28c8e632840',
+
+        'T_cmd': 'fece3ebd6b74d2b40',
+
+        'T_r': 'f90fc4e524a51f73f',
+
+        'completed': "r'true'",
+
+        'cond2_5_ever': 'bTrue',
+
+        'ds_absmax': 'f0000708e323ae73e',
+
+        'ds_max': 'f00002879a01be73e',
+
+        'ds_min': 'f0000708e323ae7be',
+
+        'e_bao_max': 'fe95f7647959ea33f',
+
+        'e_bao_phys_max': 'fe95f7647959ea33f',
+
+        'e_meas_note': "r'no firmware pose columns'",
+
+        'e_meas_perp_max': 'f000000000000f87f',
+
+        'e_perp_global_max': 'f9094630e52b89e3f',
+
+        'e_perp_max': 'f60bba10e52b89e3f',
+
+        'e_perp_max_cens': 'f60bba10e52b89e3f',
+
+        'e_perp_max_le_D': 'bTrue',
+
+        'e_perp_rms': 'f1f1855f151b89e3f',
+
+        'e_s_absmax': 'f000000000080b53c',
+
+        'e_theta_cmd_max_deg': 'fb601837b16eb0640',
+
+        'e_theta_lane_max_deg': 'f8ecfa1acfded0640',
+
+        'e_trk_max': 'f251f85eb51b89e3f',
+
+        'e_trk_rms': 'fb91e85eb51b89e3f',
+
+        'eval_version': "r'o1_gate_eval_v2'",
+
+        'g4_tie_frames': 'i0',
+
+        'n_back_frames': 'i0',
+
+        'n_upper_frames': 'i0',
+
+        's_car_end': 'f2804a28c8e631840',
+
+        'sat_any_frac': 'f0000000000000000',
+
+        'sat_frac': 'f0000000000000000',
+
+        'status': "r'ok'",
+
+        'stop_dist_origin': 'fba1e85eb51b89e3f',
+
+        'stop_heading_err_deg': 'f7c01837b16eb0640',
+
+        'stop_x': 'fee43fffbe9b895bf',
+
+        'stop_y': 'f6043fffbe9b8953f',
+
+        't_deadline': 'fece3ebd6b74d2f40',
+
+        't_end': 'f48e17a14ae472d40',
+
+        't_first_track_err': 'f000000000000f87f',
+
+        't_progress': 'f0ad7a3703d0a2a40',
+
+        'track_err_frames': 'i0',
+
+        'tv_duty': 'f0000000000000000',
+
+        'v': 'f000000000000e03f',
+
+    },
+
+    (0.8, 0.0, 0.0): {
+
+        'S': 'f2804a28c8e631840',
+
+        'T': 'f7085ca2f727c1e40',
+
+        'T_cmd': 'fd50ef5c114e82340',
+
+        'T_r': 'f74303fa86ea70240',
+
+        'completed': "r'true'",
+
+        'cond2_5_ever': 'bTrue',
+
+        'ds_absmax': 'f6062bc2d4638e73e',
+
+        'ds_max': 'f000078101a01e73e',
+
+        'ds_min': 'f6062bc2d4638e7be',
+
+        'e_bao_max': 'fb0beb70e1961e73e',
+
+        'e_bao_phys_max': 'fb0beb70e1961e73e',
+
+        'e_meas_note': "r'no firmware pose columns'",
+
+        'e_meas_perp_max': 'f000000000000f87f',
+
+        'e_perp_global_max': 'f88137c2d4638e73e',
+
+        'e_perp_max': 'f88137c2d4638e73e',
+
+        'e_perp_max_cens': 'f88137c2d4638e73e',
+
+        'e_perp_max_le_D': 'bTrue',
+
+        'e_perp_rms': 'ffaed8e9bc19ad33e',
+
+        'e_s_absmax': 'f6b263d4b898fb33c',
+
+        'e_theta_cmd_max_deg': 'f0000000000000000',
+
+        'e_theta_lane_max_deg': 'f6a8f2444b958573f',
+
+        'e_trk_max': 'f535bda3a584cb93c',
+
+        'e_trk_rms': 'fd4f66955ebe9a03c',
+
+        'eval_version': "r'o1_gate_eval_v2'",
+
+        'g4_tie_frames': 'i0',
+
+        'n_back_frames': 'i0',
+
+        'n_upper_frames': 'i0',
+
+        's_car_end': 'f2804a28c8e631840',
+
+        'sat_any_frac': 'f0000000000000000',
+
+        'sat_frac': 'f0000000000000000',
+
+        'status': "r'ok'",
+
+        'stop_dist_origin': 'fd78e03bea0f5b83c',
+
+        'stop_heading_err_deg': 'f0000000000000000',
+
+        'stop_x': 'f085c143326a6b1bc',
+
+        'stop_y': 'f085c143326a6b1bc',
+
+        't_deadline': 'fd50ef5c114e82740',
+
+        't_end': 'fe17a14ae47e12540',
+
+        't_first_track_err': 'f000000000000f87f',
+
+        't_progress': 'f295c8fc2f5a82240',
+
+        'track_err_frames': 'i0',
+
+        'tv_duty': 'f0000000000000000',
+
+        'v': 'f9a9999999999e93f',
+
+    },
+
+}
+
+
+
+
+
+def _bits(x):
+
+    if isinstance(x, (bool, np.bool_)):
+
+        return 'b' + str(bool(x))
+
+    if isinstance(x, (float, np.floating)):
+
+        import struct
+
+        return 'f' + struct.pack('<d', float(x)).hex()
+
+    if isinstance(x, (int, np.integer)):
+
+        return 'i' + str(int(x))
+
+    return 'r' + repr(x)
+
+
+
+
+
+@pytest.mark.parametrize('args', sorted(BASE_SUMMARY_09FF237))
+
+def test_evaluate_fig8_summary_and_version_unchanged_for_hil(args):
+
+    """G1F-3: the evaluate_fig8 summary has exactly the keys and values of the base code (no key added, none
+
+    changed) and EVAL_VERSION is unchanged; the G1 fields are the separate function g1_fields_v7."""
+
+    lg, sch = fig8_log(v=args[0], lateral=args[1], yaw=args[2])
+
+    out, _, _ = E.evaluate_fig8(lg, O.Path8(), sch)
+
+    assert {k: _bits(v) for k, v in out.items()} == BASE_SUMMARY_09FF237[args]
+
+    assert E.EVAL_VERSION == 'o1_gate_eval_v2'
+
 
