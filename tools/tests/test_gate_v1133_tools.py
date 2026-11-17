@@ -284,9 +284,11 @@ def test_grid_centre_fields_must_match_their_node(ds):
 def test_grid_every_node_lost_is_a_lost_run(ds):
     d, gf, tmp = ds
     _floor_run(d)
-    g = _grid_gate(gf, ['dat'] * 3, hong=[True] * 3)
+    base = rl.floor_gate(_gate(gf, level='O1-F05', platform='HW', stage='screen', campaign='A-PID', th=3.0),
+                         t_done=(10.0, None))                              # centre fields: G1 chua_ket_luan
+    g = _grid_gate(gf, ['chua_ket_luan'] * 3, hong=[True] * 3, base=base)
     with pytest.raises(rl.LogError, match='every grid node lost'):
-        rl.end(d, 'dat', completed=1, results_dir=str(tmp), gate=g, gate_file=gf, queries=rl.fake_queries())
+        rl.end(d, 'chua_ket_luan', completed=1, results_dir=str(tmp), gate=g, gate_file=gf, queries=rl.fake_queries())
     row = rl.end(d, 'hong_he_do', completed=1, fail_cause='mat_khung_FAKE', results_dir=str(tmp), gate=g,
                  gate_file=gf, queries=rl.fake_queries())
     assert row['luoi_hong_nut'] == '111'
@@ -332,6 +334,8 @@ def test_grid_skips_the_one_domain_equality(ds):
     (lambda lb: lb.update(g1_nut=['dat', 'dat']), 'g1_nut'),
     (lambda lb: lb.update(hong_nut=[0, 0, 0]), 'hong_nut'),
     (lambda lb: lb.update(hong_nut=[True, False, False], cat_nut=[True, False, False]), 'both lost'),
+    (lambda lb: lb.update(hong_nut=[True, False, False]), 'not chua_ket_luan'),   # a lost node with G1 dat
+    (lambda lb: lb.update(cat_nut=[False, False, True]), 'not chua_ket_luan'),
     (lambda lb: lb.update(gio_sha256='x'), 'gio_sha256'),
     (lambda lb: lb.update(format='luoi_v0'), 'format'),
     (lambda lb: lb.update(extra=1), 'exactly'),

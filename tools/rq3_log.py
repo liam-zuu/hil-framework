@@ -793,7 +793,14 @@ def check_luoi(lb) -> dict:
         if not isinstance(lb[key], list) or len(lb[key]) != n or any(not isinstance(x, bool) for x in lb[key]):
             raise LogError(f'gate luoi {key}: {n} booleans')
     if any(h and c for h, c in zip(lb['hong_nut'], lb['cat_nut'])):
-        raise LogError('gate luoi: a node both lost to the measurement and with the exception before t1')
+        raise LogError('gate luoi: a node both lost to the measurement and with the exception before t1 (a node with '
+                       'the exception is not a lost node: the exception replaces the loss, O1 3.5)')
+    # O1 v11.35 (CODE asked CODE_GATE to confirm 17/11): a lost node and a node with the exception before t1 carry G1
+    # chua_ket_luan (they cannot show the run completed, nor that it did not: O1 3.5 R2V-4 for the exception)
+    bad = [i for i, (st_, h, c) in enumerate(zip(lb['g1_nut'], lb['hong_nut'], lb['cat_nut']))
+           if (h or c) and st_ != 'chua_ket_luan']
+    if bad:
+        raise LogError(f'gate luoi g1_nut: node(s) {bad} lost or with the exception before t1 but G1 not chua_ket_luan')
     if lb['g1_state'] != luoi_g1(lb['g1_nut']):
         raise LogError(f'gate luoi g1_state {lb["g1_state"]!r}: from g1_nut it is {luoi_g1(lb["g1_nut"])!r}')
     return lb
