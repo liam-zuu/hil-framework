@@ -344,10 +344,13 @@ def check(rows, planned=None, n_reps=None):
         done[cell] = res
     # S02 v1.17 P2-5: a run replaced for a measuring system fault is group 1, on every row (S2C1-1, Codex round 1:
     # a battery_rerun block's history included); an empty or unknown group of a counted row is reported above
+    # S2C2-1 (Codex round 2): cause_group read only on such a row, None (a short CSV line) as empty
     for i, r in enumerate(rows, start=2):
-        g = r['cause_group'].strip()
+        if r['result'].strip() != 'replaced' or not _system_fault(r):
+            continue
+        g = (r['cause_group'] or '').strip()
         hist = r['block_status'].strip() == 'battery_rerun'
-        if r['result'].strip() == 'replaced' and _system_fault(r) and g != '1' and (hist or g in ('2', '3')):
+        if g != '1' and (hist or g in ('2', '3')):
             out.append(f'line {i} {r["run_id"]}: replaced for {_system_fault(r)} needs cause_group 1 '
                        '(measuring system fault, S02 v1.17 P2-5)')
     out += _sync_fail_streaks(rows)

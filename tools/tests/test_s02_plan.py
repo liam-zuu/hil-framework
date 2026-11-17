@@ -436,3 +436,18 @@ def test_group_1_also_in_a_battery_rerun_history(why, group):
     assert len(p) == 1 and 'cause_group 1' in p[0] and p[0].startswith('line 2 '), p
     old[0]['cause_group'] = '1'
     assert sp.check(old + new) == []
+
+
+def test_a_short_csv_line_of_a_broken_run_still_checks():
+    """S2C2-1 (Codex round 2): a broken row whose CSV line ends at reason (DictReader fills None) was accepted
+    before the group-1 check and must still be: the check reads cause_group only on a replaced measuring fault."""
+    rows = _rows(('A-L1', 1, 'broken', '', 'controller'))
+    rows[0].update(cause_group=None, missing_pct=None, gen_pause_n=None)
+    assert sp.check(rows) == []
+    short = _rows(('A-L1', 1, 'replaced', '1', CSF), ('A-L1', 1, 'completed', '', ''))
+    old = [dict(r, block_status='battery_rerun') for r in
+           _rows(('A-L1', 1, 'replaced', '1', 'camera_lost'), ('A-L1', 1, 'completed', '', ''), v=('12.4', '12.0'))]
+    old[0]['cause_group'] = None
+    p = sp.check(old + _rows(('A-L1', 1, 'completed', '', ''), block='2'))
+    assert len(p) == 1 and 'cause_group 1' in p[0], p
+    assert sp.check(short) == []
