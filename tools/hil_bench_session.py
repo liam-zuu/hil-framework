@@ -89,6 +89,7 @@ import argparse
 import csv
 import datetime
 import glob
+import hashlib
 import json
 import os
 import re
@@ -797,6 +798,33 @@ def plan_runs(runs, kills=(), stops=()):
     return [tuple(r) for r in out]
 
 
+def plan_run_gains(specs, plan):
+    """--run-gain TÊN=FILE (CODE_GAIN0 17/11; Liam 17/11 at the CODE session "GAIN0 sua sau (A) (Recommended)"):
+    {run name: gain file} of the session's runs. Raises ValueError on a spec without '=' or file, a name that is
+    not a --run of the session, two --run-gain for one run, or a file that is not there. A run without --run-gain
+    uses --gain-file (if any), as before."""
+    names = {r[0] for r in plan}
+    out = {}
+    for spec in specs or ():
+        name, sep, f = spec.partition('=')
+        if not sep or not name or not f:
+            raise ValueError(f'--run-gain không hợp lệ: {spec!r} (cần TÊN=FILE)')
+        if name not in names:
+            raise ValueError(f'--run-gain {spec!r}: không có lượt {name!r} trong các --run')
+        if name in out:
+            raise ValueError(f'lượt {name!r} có hai --run-gain')
+        if not os.path.isfile(f):
+            raise ValueError(f'--run-gain {spec!r}: không có file {f}')
+        out[name] = f
+    return out
+
+
+def gain_src(path):
+    """--run-gain: the file and the sha256 of its bytes, read just before the set (recorded with the run's ack)."""
+    with open(path, 'rb') as fh:
+        return dict(gain_file=path, gain_sha256=hashlib.sha256(fh.read()).hexdigest())
+
+
 def pi_leftovers(host):
     """B: run_hil.py / agv_logger.py still running on the Pi (None if SSH failed)."""
     rc, txt = ssh(host, LEFT_CMD, 30)
@@ -830,6 +858,7 @@ def bench(a):
     try:
         plan = plan_runs(a.run, a.pi_kill, a.pi_stop)
         s06 = plan_s06(getattr(a, 's06', None) or [], plan, getattr(a, 'gain_query', False))
+        run_gains = plan_run_gains(getattr(a, 'run_gain', None), plan)
     except ValueError as ex:
         print(ex)
         return 2, []
@@ -914,16 +943,19 @@ def bench(a):
                     sess['runs'].append(dict(name=name, args=args, s06=s06[name], esp32_ip=None))
                     code = 2
                     break
-            boots, qrec, ack = None, None, None
+            boots, qrec, ack, gsrc = None, None, None, {}
             if getattr(a, 'gain_query', False):                         # S05 4.7 (iv): ask boot just before the run
                 q_ip = a.esp32_ip or esp32_ip([s for _, s in esp.since(0)])
-                if getattr(a, 'gain_file', None):                       # B81-14: set the gain first, keep its ack
-                    ack = gain_set(q_ip, a.gain_file, os.path.join(a.out, 'pi', f'{name}_gain_ack.txt'))
+                gfile = run_gains.get(name) or getattr(a, 'gain_file', None)   # --run-gain of the run, else --gain-file
+                if name in run_gains:                                   # its file and sha256 go with the run's ack
+                    gsrc = gain_src(gfile)
+                if gfile:                                               # B81-14: set the gain first, keep its ack
+                    ack = gain_set(q_ip, gfile, os.path.join(a.out, 'pi', f'{name}_gain_ack.txt'))
                     if ack is None:
-                        print(f'{name}: DỪNG: không đặt được gain {a.gain_file} (pi/{name}_gain_ack.txt); '
+                        print(f'{name}: DỪNG: không đặt được gain {gfile} (pi/{name}_gain_ack.txt); '
                               'không chạy lượt này và các lượt sau')
                         sess['runs'].append(dict(name=name, args=args, gain_ack=dict(file=f'{name}_gain_ack.txt',
-                                                                                     applied=False)))
+                                                                                     applied=False, **gsrc)))
                         code = 2
                         break
                 q, rb = timed_query(q_ip, os.path.join(a.out, 'pi', f'{name}_gain_query_before.txt'))
@@ -934,7 +966,7 @@ def bench(a):
                     if abad:
                         print(f'{name}: DỪNG: {abad}; không chạy lượt này và các lượt sau')
                         sess['runs'].append(dict(name=name, args=args, boot=qrec, gain_ack=dict(
-                            file=f'{name}_gain_ack.txt', applied=True, boot=ack.get('boot'), problem=abad)))
+                            file=f'{name}_gain_ack.txt', applied=True, boot=ack.get('boot'), problem=abad, **gsrc)))
                         code = 2
                         break
             t0 = time.time()                         # R134C-9: the run (and its --pi-stop / --pi-kill clock)
@@ -980,7 +1012,7 @@ def bench(a):
                 run_rec['boot'] = qrec
             if ack is not None:
                 run_rec['gain_ack'] = dict(file=f'{name}_gain_ack.txt', applied=True, boot=ack.get('boot'),
-                                           mac=ack.get('mac'), id=ack.get('id'))
+                                           mac=ack.get('mac'), id=ack.get('id'), **gsrc)
             if name in s06:
                 run_rec['s06'] = dict(s06[name], esp32_ip=s_ip)
             elif not a.no_logger:
@@ -1178,6 +1210,11 @@ def main(argv=None):
                          'FILE bằng gain_send.py --file (motor phải tắt), lưu nguyên đầu ra thành pi/<TÊN>_gain_ack.txt; '
                          'đặt không được thì dừng (mã 2), không chạy lượt; boot của #gain_ack khác hai lần hỏi thì '
                          'lượt không sạch')
+    ap.add_argument('--run-gain', action='append', default=[], metavar='TÊN=FILE',
+                    help='CODE_GAIN0 17/11 (kiểm cuối S05 4.6, sáu bộ gain trộn ngẫu nhiên): với --gain-query, lượt TÊN '
+                         'đặt bộ gain FILE (thay --gain-file cho riêng lượt đó; cách đặt, ack, dừng như --gain-file); '
+                         'file và sha256 ghi vào gain_ack của lượt; tên không phải --run, hai lần một lượt hay file '
+                         'không có thì dừng trước mọi bước')
     ap.add_argument('--analyze-only', action='store_true',
                     help='chỉ chấm thư mục đã có frames/ (không ghi gì vào thư mục, trừ khi --write-summary; '
                          'lượt --s06: s06_esp32_check ghi vào thư mục tạm, với --write-summary vào check_analyze*/ mới)')
@@ -1198,6 +1235,8 @@ def main(argv=None):
         ap.error('--gain-file đi cùng --gain-query (boot của #gain_ack so với hai lần hỏi, B81-14)')
     if a.gain_file and not os.path.isfile(a.gain_file):
         ap.error(f'--gain-file {a.gain_file}: không có file')
+    if a.run_gain and not a.gain_query:
+        ap.error('--run-gain đi cùng --gain-query (boot của #gain_ack so với hai lần hỏi, B81-14)')
     code, results = analyze_only(a) if a.analyze_only else bench(a)
     if results and a.analyze_only and a.write_summary:
         with open(os.path.join(a.out, 'bench_summary_analyze.json'), 'w', encoding='utf-8') as f:
