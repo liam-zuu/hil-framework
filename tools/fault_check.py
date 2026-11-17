@@ -51,9 +51,12 @@ Checks (all must hold for ok):
      f_drag = F of the body_drag row on when math.hypot(vx, vy) >= 1e-3 at the start of the step, else 0, and
      f_dist = F(k) of the load_dist row on, else 0, both rebuilt here in float64 by the definition (F(k) =
      (F0 + min(Fmax, (rate * d) / 1000)) + sigma * n[d], n drawn here from numpy default_rng(seed)); f_drag
-     compared exactly, f_dist within ULP_TOL units in the last place of |F0 + min(..)| + |sigma n[d]| (the normal
-     draws use libm log in the tail of numpy's ziggurat, which may differ by an ULP between the Pi's ARM and a PC);
-     vx, vy against the true frame after the frame's own clamp to +-STATE_RANGES (Codex FS1-2). The force inside
+     compared exactly, f_dist within ULP_TOL x the largest ULP of F0 + min(..), sigma n[d] and the rebuilt value,
+     all three finite (the normal draws use libm log in the tail of numpy's ziggurat, which may differ by an ULP
+     between the Pi's ARM and a PC; Codex FS2-3: the tolerance stays finite and does not depend on the recorded
+     value); vx, vy against the true frame after the frame's own clamp to +-STATE_RANGES (Codex FS1-2): a recorded
+     speed beyond the range is only checked to be finite and on the right side of the range, the frame holding no
+     more (Codex FS2-5, as x, y at +-5 m). The force inside
      the sub-steps is not rebuilt (no record of it; the plant's own code): that the plant used the force is not
      checked here (Codex FS1-7, DEFERRED: design 7.1 keeps the plant replay optional).
 Exit 0 = ok, 1 = a check failed, 2 = the input cannot be checked. Writes fault_check.json.
@@ -404,10 +407,11 @@ def ref_plant(rows, on_idx, k_rel, pose, nom):
 
 
 def ref_body(rows, on_idx, k_rel, vel, noise):
-    """(f_drag, f_dist, scale) of one plant step rebuilt from the rows on, the relative step and the world
+    """(f_drag, f_dist, tol) of one plant step rebuilt from the rows on, the relative step and the world
     velocity at the start of the step (s14). noise: {row index: n} drawn by the caller for every load_dist row;
-    scale = |F0 + min(..)| + |sigma n[d]|, the size the tolerance of f_dist is taken from."""
-    fd = fdist = scale = 0.0
+    tol = ULP_TOL x max(ulp(F0 + min(..)), ulp(sigma n[d]), ulp(f_dist)), NaN when one of them is not finite
+    (Codex FS2-3); 0 without a load_dist row (f_dist then 0 exactly)."""
+    fd = fdist = tol = 0.0
     for i in on_idx:
         r = rows[i]
         if r.fault == 'body_drag':
@@ -417,8 +421,10 @@ def ref_body(rows, on_idx, k_rel, vel, noise):
             ramp = (float(r.p('rate')) * d) / 1000.0
             a = float(r.p('F0')) + min(float(r.p('Fmax')), ramp)
             b = float(r.p('sigma')) * float(noise[i][d])
-            fdist, scale = a + b, abs(a) + abs(b)
-    return fd, fdist, scale
+            fdist = a + b
+            parts = (a, b, fdist)
+            tol = ULP_TOL * max(math.ulp(v) for v in parts) if all(math.isfinite(v) for v in parts) else math.nan
+    return fd, fdist, tol
 
 
 def _vel_ok(frame_v, rec_v, rng, step) -> bool:
@@ -428,9 +434,10 @@ def _vel_ok(frame_v, rec_v, rng, step) -> bool:
     return math.isfinite(v) and abs(frame_v - min(rng, max(-rng, v))) <= 0.5 * step + 1e-9
 
 
-def _dist_close(got, want, scale) -> bool:
-    """f_dist of the record against the rebuilt value: within ULP_TOL units in the last place of scale."""
-    return math.isfinite(got) and abs(got - want) <= ULP_TOL * math.ulp(max(scale, abs(got), abs(want)))
+def _dist_close(got, want, tol) -> bool:
+    """f_dist of the record against the rebuilt value: all finite and |got - want| <= tol (ref_body; Codex FS2-3:
+    a tolerance from the rebuilt parts only, never infinite, not widened by the recorded value)."""
+    return math.isfinite(got) and math.isfinite(want) and math.isfinite(tol) and abs(got - want) <= tol
 
 
 def run_mu(argv):
@@ -553,8 +560,8 @@ def plant_record_check(npz_path, rows, fm, t0, stop, n, true, plant_src=None, ar
             ok &= bool(row[c['mu_' + suf]] == float(mu[w]))
             ok &= _close(row[c['b_' + suf]], b[w]) and _close(row[c['tc_' + suf]], tc[w])
             ok &= _close(row[c['ts_' + suf]], ts[w])
-        fd, fdist, scale = ref_body(rows, on, k - t0, (row[c['vx']], row[c['vy']]), noise)     # s14
-        ok &= bool(row[c['f_drag']] == fd) and _dist_close(float(row[c['f_dist']]), fdist, scale)
+        fd, fdist, tol = ref_body(rows, on, k - t0, (row[c['vx']], row[c['vy']]), noise)     # s14
+        ok &= bool(row[c['f_drag']] == fd) and _dist_close(float(row[c['f_dist']]), fdist, tol)
         if not ok:
             bad_val += 1
             first = k if first is None else first

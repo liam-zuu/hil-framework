@@ -104,3 +104,43 @@ def test_f_dist_within_a_few_ulp(run, tmp_path, ulps, ok):
         return rec
     r = fc.check(*_tamper_record(run, tmp_path, edit))
     assert r['ok'] is ok, r['fails']
+
+
+# -- Codex round 2 (FS2-3) --
+HEAD_S = fc.parse.__globals__['MAGIC'] + '\nid,fault,target,start_ms,end_ms,params\n'
+
+
+def test_dist_tolerance_finite_and_not_widened_by_the_record():
+    import math
+    # a + b finite but |a| + |b| overflows: the tolerance stays finite, a wrong value fails
+    f0 = '14' + '0' * 307                                   # 1.4e308
+    rows_big = fc.parse(HEAD_S + f'L1,load_dist,body,0,10,F0={f0};rate=0;Fmax=0;sigma=1;seed=0;dir_deg=0\n')
+    fd, want, tol = fc.ref_body(rows_big, [0], 0, (0.0, 0.0), {0: np.full(10, -6.5e307)})
+    assert want == 1.4e308 - 6.5e307 and math.isfinite(tol)
+    assert not fc._dist_close(1.0, want, tol) and fc._dist_close(want, want, tol)
+    # an infinite or undefined rebuilt value or tolerance never passes
+    assert not fc._dist_close(1.0, math.inf, 1.0) and not fc._dist_close(1.0, 1.0, math.inf)
+    assert not fc._dist_close(1.0, 1.0, math.nan) and not fc._dist_close(math.inf, 1.0, 1.0)
+    # the recorded value does not widen it: ULP_TOL ULP of the rebuilt parts pass, 15 fail (Codex example)
+    rows = fc.parse(HEAD_S + 'L1,load_dist,body,0,10,F0=1;rate=0;Fmax=0;sigma=1;seed=0;dir_deg=0\n')
+    b = math.nextafter(math.nextafter(1.0, 0.0), 0.0)          # 1 - 2 ULP(1): 1 + b = nextafter(2, 0) exactly
+    fd, want, tol = fc.ref_body(rows, [0], 3, (0.0, 0.0), {0: np.full(10, b)})
+    assert want == math.nextafter(2.0, 0.0)
+    assert tol == fc.ULP_TOL * max(math.ulp(1.0), math.ulp(b), math.ulp(want))
+    assert fc._dist_close(want - fc.ULP_TOL * math.ulp(want), want, tol)          # same binade: exactly tol
+    assert not fc._dist_close(2.0 + 7 * math.ulp(2.0), want, tol)            # 15 ULP of want
+
+
+def test_noise_one_ulp_apart_passes(run, tmp_path):
+    # ARM/PC: a normal draw one ULP apart (numpy's ziggurat tail uses libm log): the f_dist it gives passes
+    n = np.random.default_rng(3).standard_normal(250)
+    k0, d = 200, 200 - 150
+
+    def edit(rec):
+        i = int(np.nonzero(rec[:, 0] == k0)[0][0])
+        a = 2.5 + min(1.5, (0.8 * d) / 1000.0)
+        assert rec[i, C['f_dist']] == a + 1.6 * n[d]                       # the run's value, rebuilt here
+        rec[i, C['f_dist']] = a + 1.6 * np.nextafter(n[d], np.inf)
+        return rec
+    r = fc.check(*_tamper_record(run, tmp_path, edit))
+    assert r['ok'], r['fails']

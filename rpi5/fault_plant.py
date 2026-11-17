@@ -231,9 +231,10 @@ class BodyForce:
         self.rows = list(rows)
         self._noise = {i: dist_noise(r) for i, r in enumerate(self.rows) if r.fault == 'load_dist'}
         self._dir = {i: dist_dir(r) for i, r in enumerate(self.rows) if r.fault == 'load_dist'}
-        # Codex FS1-5: every F(k) of a load_dist row, and the largest drag plus the largest |F(k)|, must be finite
-        # floats (each parameter alone is checked by check_params; a sum or a product may still overflow)
-        big = 0.0
+        # Codex FS1-5: every F(k) of a load_dist row must be a finite float, and so must the drag F plus the
+        # largest |F(k)| over the steps where the two windows overlap (Codex FS2-4: only there do they add up);
+        # each parameter alone is checked by check_params, a sum or a product may still overflow
+        vals = {}
         for i, n in self._noise.items():
             r = self.rows[i]
             d = np.arange(len(n), dtype=float)
@@ -242,10 +243,15 @@ class BodyForce:
                     float(r.p('sigma')) * n
             if not np.all(np.isfinite(v)):
                 raise ScheduleError(f'{r.id!r}: load_dist force F(k) has no finite value')
-            big = max(big, float(np.max(np.abs(v))) if len(v) else 0.0)
-        drag = max([float(r.p('F')) for r in self.rows if r.fault == 'body_drag'], default=0.0)
-        if not math.isfinite(drag + big):
-            raise ScheduleError('body_drag F plus the largest load_dist |F(k)| has no finite value')
+            vals[i] = v
+        for rd in (r for r in self.rows if r.fault == 'body_drag'):
+            for i, v in vals.items():
+                rl = self.rows[i]
+                lo, hi = max(rd.start_ms, rl.start_ms), min(rd.end_ms, rl.end_ms)
+                if lo < hi and not math.isfinite(float(rd.p('F')) + float(np.max(np.abs(
+                        v[lo - rl.start_ms:hi - rl.start_ms])))):
+                    raise ScheduleError(f'{rd.id!r} + {rl.id!r}: drag F plus the load |F(k)| where they overlap has '
+                                        f'no finite value')
 
     def at(self, on: Tuple[int, ...], k_rel: int, x):
         fd, fdist, cd, sd = 0.0, 0.0, 0.0, 0.0

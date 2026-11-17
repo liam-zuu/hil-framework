@@ -328,3 +328,35 @@ def test_force_without_a_finite_value_is_refused(body):
     with pytest.raises(fs.ScheduleError):
         fp.BodyForce(r)
 
+
+# -- Codex round 2 (FS2-4, oracle note) --
+def test_huge_forces_in_windows_that_do_not_overlap_are_taken():
+    """FS2-4: drag and load each finite and never on together (adjacent windows): not refused."""
+    big = '1' + '0' * 308
+    r = fs.parse(HEAD + f'D1,body_drag,body,0,10,F={big}\nL1,load_dist,body,10,20,F0={big};rate=0;Fmax=0;sigma=0;'
+                 f'seed=0;dir_deg=0\n')
+    fp.check_params(r, MecanumParams())
+    bf = fp.BodyForce(r)
+    assert bf.at((1,), 10, np.zeros(10))[2] == 1e308
+    r2 = fs.parse(HEAD + f'D1,body_drag,body,0,11,F={big}\nL1,load_dist,body,10,20,F0={big};rate=0;Fmax=0;'
+                  f'sigma=0;seed=0;dir_deg=0\n')                       # one step of overlap
+    with pytest.raises(fs.ScheduleError):
+        fp.BodyForce(r2)
+
+
+def test_own_force_oracle_sees_both_drag_branches_in_one_step():
+    """Codex test note: inside one plant step the sub-steps call the force at |v| >= 1e-3 and then below it."""
+    from plant_step import _traction_step
+    p = MecanumParams()
+    x = np.array([0.0, 0.0, 0.7, 0.004 * math.cos(0.7), 0.004 * math.sin(0.7), 0.0, 0, 0, 0, 0])
+    both = False
+    for k in range(400):
+        f = _own_force(3.3, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0, k, True, False, 1)
+        seen = []
+
+        def g(xw, yw, vxw, vyw, f=f):
+            seen.append(math.hypot(vxw, vyw))
+            return f(xw, yw, vxw, vyw)
+        x = _traction_step(x, np.zeros(4), p, 0.001, f_ext=g)
+        both |= any(v >= 1e-3 for v in seen) and any(v < 1e-3 for v in seen)
+    assert both

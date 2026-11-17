@@ -784,3 +784,15 @@ def test_s02_prep_is_not_a_fault_task():
         ct.task_duration('--test A-L1 --finite-run --s02-prep 3')
     assert ct.task_duration('--test A-L1 --finite-run') == ('A-L1', 16.0)
 
+
+# -- Codex round 2 (FS2-1) --
+def test_tick_counts_at_the_half_ms_and_just_after_a_tick():
+    # fwsim_ticks: the division of fwsim.simulate (duration / 0.001), not duration * 1000
+    assert 1.0695 / 0.001 < 1069.5 <= 1.0695 * 1000          # the two roundings differ here
+    assert ct.fwsim_ticks(1.0695) == int(round(1.0695 / 0.001)) // 10 == 106
+    # bench_ticks: rows j x 10 ms < duration, the duration not rounded first
+    assert ct.bench_ticks(9.000000001) == 901 and ct.bench_ticks(8.999999999) == 900
+    assert ct.bench_ticks(0.0) == 0 and ct.bench_ticks(0.005) == 1 and ct.bench_ticks(0.01) == 1
+    for d in (0.3, 1.0695, 9.0, 13.19444694, 32.41592653589793):
+        n = ct.bench_ticks(d)
+        assert round((n - 1) * ct.TICK_S, 6) < d <= round(n * ct.TICK_S, 6), d

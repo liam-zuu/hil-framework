@@ -129,16 +129,27 @@ TAIL_S = 1.0                        # errors over the window and 1 s after it (s
 TICK_S = 0.010                      # firmware tick (FW_DT_US)
 
 
+PLANT_DT = 0.001                    # fwsim.simulate dt (fault_run.py passes the default)
+
+
 def fwsim_ticks(duration) -> int:
-    """Firmware ticks of a fwsim run of this duration [s]: fwsim.simulate runs round(duration / 1 ms) plant steps
+    """Firmware ticks of a fwsim run of this duration [s]: fwsim.simulate runs int(round(duration / dt)) plant
+    steps, dt = 0.001, the same division here (Codex FS2-1: duration * 1000 rounds otherwise at some half ms),
     and ticks at every 10th, so 10, 20, .. ms (Codex FS1-1)."""
-    return int(round(float(duration) * 1000)) // 10
+    return int(round(float(duration) / PLANT_DT)) // 10
 
 
 def bench_ticks(duration) -> int:
-    """ESP32 rows of [0, duration) on the bench: the ticks j x 10 ms < duration, j = 0, 1, .. (Codex FS1-1:
-    ceil, not round; 13.194 s has 1320 of them)."""
-    return math.ceil(round(float(duration) / TICK_S, 6))
+    """ESP32 rows of [0, duration) on the bench: the number of j = 0, 1, .. whose ESP32 time round(j x 10 ms, 6)
+    (the te of load_bench_run) is < duration (Codex FS1-1: not round(duration / 10 ms), 13.194 s has 1320 of
+    them; FS2-1: the duration is not rounded first, 9.000000001 s has 901)."""
+    d = float(duration)
+    n = max(0, math.ceil(d / TICK_S) - 1)
+    while round(n * TICK_S, 6) < d:
+        n += 1
+    while n > 0 and round((n - 1) * TICK_S, 6) >= d:
+        n -= 1
+    return n
 M_LOSS = 16                         # fwsim/fault_run.py mask bit of imu_loss (faults_imu.csv)
 SAME_KEYS = ('task', 'mode', 'seed', 'imu_rate', 'imu_boot_reset', 'imu_noise', 'imu_noise_seed', 'ground', 'mu',
              'no_imu', 'duration')
