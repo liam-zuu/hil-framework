@@ -159,7 +159,7 @@ def test_run_dir_metrics_refuses_only_hil_runs(tmp_path, monkeypatch, platform, 
         f'r1,{platform},PID,A-L1,0.3,1,a.csv,0\n', encoding='utf-8')
     (tmp_path / 'a.csv.events.txt').write_text(udp_end(9, 0, take=1) + '\n', encoding='utf-8')
     monkeypatch.setattr(s02_metrics, 'load_log', lambda path: {})
-    monkeypatch.setattr(s02_metrics, 'compute', lambda log, test_id: {'e_vx': 0.0})
+    monkeypatch.setattr(s02_metrics, 'score_run', lambda log, test_id, *a, **k: {'e_vx': 0.0})   # CODE_S02 v3 scorer
     if refused:
         with pytest.raises(ValueError, match='udp_take=1'):
             s02_metrics.run_dir_metrics(str(tmp_path))
@@ -172,4 +172,5 @@ def test_aborted_hil_run_is_skipped_before_the_check(tmp_path, monkeypatch):
         'run_id,platform,controller,test_id,speed_mps,rep,file,aborted\n'
         'r1,HIL,PID,A-L1,0.3,1,a.csv,1\n', encoding='utf-8')
     (tmp_path / 'a.csv.events.txt').write_text(udp_end(9, 0, take=1) + '\n', encoding='utf-8')
-    assert s02_metrics.run_dir_metrics(str(tmp_path)) == []
+    # CODE_S02 v3 (spec S02 v1.13 P2-6): the aborted run has one status line, its log and events are not read
+    assert [(o['run_id'], o['status']) for o in s02_metrics.run_dir_metrics(str(tmp_path))] == [('r1', 'aborted')]
