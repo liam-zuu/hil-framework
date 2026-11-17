@@ -738,7 +738,7 @@ def test_root_meta_keeps_code_notes(tmp_path):
     m = yaml.safe_load(open(tmp_path / 'meta.yaml', encoding='utf-8'))
     assert m['code_notes'] == {'PID seed 3': 'rate 12 %: lane reversal, no tool error'}
     assert set(m['pymoo_files']) == set(s4.PYMOO_FILES)                  # S4C-18
-    assert m['spec'] == s4.SPEC and m['spec'].startswith('S04 v6.4 ')    # S83-2
+    assert m['spec'] == s4.SPEC and m['spec'].startswith('S04 v6.6 ')    # S83-2
 
 
 def test_default_gains_must_give_a_valid_reference(monkeypatch):
@@ -855,7 +855,7 @@ def test_tool_check_three_phases(tmp_path, monkeypatch, capsys):
               out / 'trial' / 'ADRC' / 'meta.yaml', out / 'lock.yaml']:
         m = yaml.safe_load(open(p, encoding='utf-8'))                    # S4C-11: valid YAML on Windows paths
         if p.name.startswith('meta'):
-            assert m['spec'] == s4.SPEC and m['spec'].startswith('S04 v6.4 '), p   # S83-2: one version line
+            assert m['spec'] == s4.SPEC and m['spec'].startswith('S04 v6.6 '), p   # S83-2: one version line
 
 
 def s4_args(out):
