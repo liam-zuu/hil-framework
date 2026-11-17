@@ -807,7 +807,8 @@ def test_3b_window_over_turnaround_not_used():
 CAM = {"phep1": {"loi_khung_max_m": 0.002}, "dat_ma_kiem_m": 0.001,
        "phep2": {"du_tam_m": 0.0015, "du_huong_deg": 0.2, "chenh_tham_so_m": 0.0005, "huong_chuan_deg": 0.3},
        "thao_dat": {"vi_tri_m": 0.0008, "goc_deg": 0.1}, "do_cao": {"rho_max_m": 1.5, "dh_m": 0.002, "H_m": 2.6,
-                                                                    "h_m": 0.12}}
+                                                                    "h_m": 0.12},
+       "day_doi": {"dn_m": 0.016, "dzc_m": 0.01}}
 TBD = dict(ga_ok=True, d_p_quay_m=0.0007, d_psi_quay_deg=0.25,
            B=dict(shutter=dict(use_alpha=True, alpha_r_s_px=7e-6, alpha_c_s_px=1e-7, alpha_r_le_s_px=8.75e-6,
                                alpha_c_le_s_px=1.25e-7, mot_khung_s=1 / 60)))
@@ -822,7 +823,9 @@ def test_khoa_sums():
     k = CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.010, 0.005), 'b': gio_d('O1-F05', 4e-4, 0.012, 0.003),
                  'c': gio_d('O1-F08', 1e-4, 0.014, 0.004), 'd': gio_d('O1-F08', 9e-3, 0.5, 0.5, ok=False)}, TBD, CAM)
     cao = 1.5 * 0.002 / (2.6 - 0.12)
-    assert k['U_p_m'] == pytest.approx(1.25 * (0.002 + 0.001 + 0.0015 + 0.0005 + 0.0008 + cao + 0.0007))
+    dd = 0.12 / 2.6 * 0.016 + 1.5 * 0.12 * 0.01 / (2.6 * (2.6 - 0.01))     # plumb, zc reused (Liam 17/11 evening)
+    assert k['U_p_m'] == pytest.approx(1.25 * (0.002 + 0.001 + 0.0015 + 0.0005 + 0.0008 + cao + dd + 0.0007))
+    assert k['U_p_phan_m']['day_doi_zc'] == pytest.approx(dd)
     assert k['U_psi_deg'] == pytest.approx(1.25 * (0.2 + 0.3 + 0.1 + 0.25))
     assert k['troi_ppm'] == pytest.approx(1.25 * 4e-4 * 1e6)             # run d (not ok) left out
     assert k['dai']['O1-F05']['width_s'] == [0.010, 0.012] and k['dai']['O1-F05']['gyro_minus_rv_s'] == [0.003, 0.005]
@@ -836,6 +839,29 @@ def test_khoa_refuses_bad_3b_and_missing_field():
     del bad['phep2']['du_tam_m']
     with pytest.raises(CU.UError, match='phep2.du_tam_m'):
         CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, bad)
+
+
+def test_khoa_plumb_zc_required_and_bounded():
+    # plumb point, zc reused from 16/11 (Liam 17/11 evening): both bounds required, zc bound below the camera height
+    for k_ in ('dn_m', 'dzc_m'):
+        bad = json.loads(json.dumps(CAM))
+        del bad['day_doi'][k_]
+        with pytest.raises(CU.UError, match='day_doi.' + k_):
+            CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, bad)
+    bad = json.loads(json.dumps(CAM))
+    bad['day_doi']['dn_m'] = -0.001
+    with pytest.raises(CU.UError, match='day_doi.dn_m'):
+        CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, bad)
+    bad['day_doi'] = dict(dn_m=0.0, dzc_m=2.6)
+    with pytest.raises(CU.UError, match='not below the camera height'):
+        CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, bad)
+    z = json.loads(json.dumps(CAM))
+    z['day_doi'] = dict(dn_m=0.0, dzc_m=0.0)                       # no plumb / zc error: the part is zero
+    k0 = CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, z)
+    k1 = CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, CAM)
+    assert k0['U_p_phan_m']['day_doi_zc'] == 0.0
+    assert k1['U_p_m'] - k0['U_p_m'] == pytest.approx(1.25 * k1['U_p_phan_m']['day_doi_zc'])
+    assert k1['U_psi_deg'] == k0['U_psi_deg']                       # a shift and a scale about C keep every angle
 
 
 def test_khoa_phep5_and_one_frame():

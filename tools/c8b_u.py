@@ -15,7 +15,9 @@ khoa (after the C8 clips are tracked and the C8 runs have their clock files):
                  when it was usable; null = one frame (design 3 table, 4b; the scorer's names, CODE 17/11)
   U_p  (m)       = LE x [largest per-frame error of the 9 check tags (test 1) + check-tag placement by tape + body-centre
                  residual of test 2 after the tag-body offset + offset-parameter difference origin / far place of test
-                 2 + re-seating repeatability (position) + tag-height error rho |dh| / (H - h) + d_p_quay (3b)]
+                 2 + re-seating repeatability (position) + tag-height error rho |dh| / (H - h) + plumb / zc error
+                 (h / H) dn + rho h dzc / (H (H - dzc)) + d_p_quay (3b)]   (plumb, zc: Liam 17/11 evening at CODE_C8B,
+                 "Them, Codex vong 7 hep (Recommended)"; dn, dzc = the bounds of the automatic check after clip H)
   U_psi (deg)    = LE x [heading residual of test 2 after the mounting angle + reference heading error of test 2 (car
                  set on the tape) + re-seating repeatability (angle) + d_psi_quay (3b)]          (design 5, C8B4-11)
                  Parts may overlap (conservative), none subtracted. Test 5 (ruler at the stop points) is an end-to-end
@@ -42,7 +44,9 @@ Last line: #ket_qua,ma=0 written / 2 refused or error.
 
 c8_cam_u_vao.json (CODE_CAM, proposed names; m and deg): {"phep1": {"loi_khung_max_m"}, "dat_ma_kiem_m",
   "phep2": {"du_tam_m", "du_huong_deg", "chenh_tham_so_m", "huong_chuan_deg"}, "thao_dat": {"vi_tri_m", "goc_deg"},
-  "do_cao": {"rho_max_m", "dh_m", "H_m", "h_m"}, "nguon": [...]}
+  "do_cao": {"rho_max_m", "dh_m", "H_m", "h_m"}, "day_doi": {"dn_m", "dzc_m"}, "nguon": [...]}
+  day_doi.dn_m = plumb measurement error of 16/11 + the image shift allowed by the automatic check, on the floor;
+  day_doi.dzc_m = the zc difference allowed by that check (bounds, not the values seen on the day).
 ke_hoach_c8.csv (written before C8): lines '# nhanh_tick=bo_tick|giu_tick', '# commit_hil=<sha>' (O1 v11.34 Q4),
   then the CSV slot, task, controller (PID / LADRC). Each --luot grid file must come from its clock file
   (gio_sha256, task, nodes), be scored with all five conditions deciding, by commit_hil, on the plan's tick branch.
@@ -101,13 +105,21 @@ def u_p_u_psi(cam, tb):
     H, h = _num(_get(cam, 'do_cao.H_m'), 'do_cao.H_m'), _num(_get(cam, 'do_cao.h_m'), 'do_cao.h_m')
     if not H > h:
         raise UError(f'do_cao: camera height {H} m not above the tag height {h} m')
-    cao = _num(_get(cam, 'do_cao.rho_max_m'), 'do_cao.rho_max_m') * _num(_get(cam, 'do_cao.dh_m'), 'do_cao.dh_m') / (H - h)
+    rho = _num(_get(cam, 'do_cao.rho_max_m'), 'do_cao.rho_max_m')
+    cao = rho * _num(_get(cam, 'do_cao.dh_m'), 'do_cao.dh_m') / (H - h)
+    # plumb point and zc reused from 16/11 (Liam 17/11): parallax P = p + kappa (C - p), kappa = h / zc, so a plumb
+    # error dn shifts the tag by kappa dn and a zc error dzc scales about C by h dzc / (zc (zc - dzc)) (worst sign)
+    dn = _num(_get(cam, 'day_doi.dn_m'), 'day_doi.dn_m')
+    dzc = _num(_get(cam, 'day_doi.dzc_m'), 'day_doi.dzc_m')
+    if not dzc < H:
+        raise UError(f'day_doi.dzc_m {dzc} m not below the camera height {H} m')
+    day_doi = h / H * dn + rho * h * dzc / (H * (H - dzc))
     p = dict(phep1_khung_max=_num(_get(cam, 'phep1.loi_khung_max_m'), 'phep1.loi_khung_max_m'),
              dat_ma_kiem=_num(_get(cam, 'dat_ma_kiem_m'), 'dat_ma_kiem_m'),
              phep2_du_tam=_num(_get(cam, 'phep2.du_tam_m'), 'phep2.du_tam_m'),
              phep2_chenh_tham_so=_num(_get(cam, 'phep2.chenh_tham_so_m'), 'phep2.chenh_tham_so_m'),
              thao_dat_vi_tri=_num(_get(cam, 'thao_dat.vi_tri_m'), 'thao_dat.vi_tri_m'),
-             do_cao=cao, d_p_quay=dpq)
+             do_cao=cao, day_doi_zc=day_doi, d_p_quay=dpq)
     s = dict(phep2_du_huong=_num(_get(cam, 'phep2.du_huong_deg'), 'phep2.du_huong_deg'),
              phep2_huong_chuan=_num(_get(cam, 'phep2.huong_chuan_deg'), 'phep2.huong_chuan_deg'),
              thao_dat_goc=_num(_get(cam, 'thao_dat.goc_deg'), 'thao_dat.goc_deg'),
