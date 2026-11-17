@@ -56,8 +56,8 @@ def test_exact_scene_gives_zero(scene):
     cams = kc.group_cams(img, marks, groups, 'B1', W, H, ZC)
     p1 = kc.p1_clip(img, marks, groups, cams)
     assert set(p1) == set(img) and max(np.linalg.norm(v) for v in p1.values()) < 1e-5
-    d, thieu = kc.u_so(img, img, marks, groups, cams)
-    assert not thieu and max(d.values()) < 1e-6
+    u, info = kc.u_so_v2(img, img, [img] * 40, marks, groups, cams)
+    assert u < 1e-6 and info['tinh_m'] < 1e-6 and info['cua_so_m'] < 1e-6
 
 
 def test_a3_sees_a_moved_mark_exactly(scene):
@@ -109,22 +109,85 @@ def test_p1_reports_the_tape_error_of_a_held_out_mark(scene):
 
 
 def test_u_so_sees_a_shift_in_clip_b(scene):
+    """A mark moved 1.5 mm (metres, projected) in H_b: the static term of u_so sees it on that mark."""
     marks, cam, img = scene
     groups = kc.make_groups(sorted(img))
     cams = kc.group_cams(img, marks, groups, 'B1', W, H, ZC)
     true = dict(marks)
     true[5] = (marks[5][0] + 0.0015, marks[5][1], SIDE)
     img_b = image_of(cam, true)
-    d, thieu = kc.u_so(img, img_b, marks, groups, cams)
-    assert not thieu
-    assert d[5] == pytest.approx(0.0015, abs=2e-5)
-    assert max(v for j, v in d.items() if j != 5) < 3e-4
+    u, info = kc.u_so_v2(img, img_b, [], marks, groups, cams)
+    assert float(info['d_tinh_m']['5']) == pytest.approx(0.0015, abs=2e-5)
+    assert u == pytest.approx(0.0015, abs=2e-5)
+
+
+def _taped(marks, seed=3, sd=0.0015):
+    """Tape coordinates with errors (the image stays true): fits on different mark sets disagree."""
+    rng = np.random.default_rng(seed)
+    return {i: (x + rng.normal(0, sd), y + rng.normal(0, sd), s) for i, (x, y, s) in marks.items()}
+
+
+def test_u_so_counts_the_run_mark_sets(scene):
+    """KC1-2: with tape errors, a smaller fit set (marks hidden by the car) moves the prediction although nothing
+    moved; u_so with the run sets is larger than with the full set only, and equal clips still give 0."""
+    marks0, cam, img = scene
+    marks = _taped(marks0)
+    groups = kc.make_groups(sorted(img))
+    cams = kc.group_cams(img, marks, groups, 'B1', W, H, ZC)
+    u_full, _ = kc.u_so_v2(img, img, [], marks, groups, cams)
+    assert u_full < 1e-6
+    hidden = [{1, 2, 3, 8, 9, 10, 15, 16, 17, 30, 31}, {20, 21, 22, 27, 28, 29}]
+    tap = [sorted(set(img) - h) for h in hidden]
+    u_set, info = kc.u_so_v2(img, img, [], marks, groups, cams, tap_moc=tap)
+    assert info['co_tap_luot'] and u_set > 2e-4
+
+
+def test_u_so_window_term(scene):
+    """The window term is the largest |window median - clip mean| of the frames of H_b."""
+    marks, cam, img = scene
+    groups = kc.make_groups(sorted(img))
+    cams = kc.group_cams(img, marks, groups, 'B1', W, H, ZC)
+    frames = [img] * 40
+    true = dict(marks)
+    true[12] = (marks[12][0], marks[12][1] + 0.001, SIDE)
+    frames = frames[:5] + [image_of(cam, true)] * 30 + frames[35:]   # a full window with mark 12 moved 1 mm
+    u, info = kc.u_so_v2(img, img, frames, marks, groups, cams, win=30)
+    assert info['cua_so_m'] == pytest.approx(0.001, abs=3e-5)
 
 
 def test_session_model_lock():
-    s = dict(kind='c7_session', chosen='B2', marks={}, fit_ids=[], ref_corners_px={}, width=W, height=H)
+    s = dict(kind='c7_session', chosen='B1', marks={}, fit_ids=[], ref_corners_px={}, width=W, height=H)
+    with pytest.raises(kc.KCError, match='model_khoa'):
+        kc.clip_from_session(s, 'B1')                       # chosen by cross-validation, not forced
+    kc.clip_from_session(dict(s, model_khoa='B1'), 'B1')
+    kc.clip_from_session(s, 'B1', thu=True)
     with pytest.raises(kc.KCError, match='locked model'):
-        kc.clip_from_session(s, 'B1')
+        kc.clip_from_session(dict(s, chosen='B2'), 'B1', thu=True)
+
+
+def _moc_rows(marks):
+    return {i: dict(id=str(i), x_cm=repr(x * 100), y_cm=repr(y * 100), canh_den_mm=repr(s * 1000), sigma_x_mm='0.8',
+                    sigma_y_mm='0.9', canh_nguon='do') for i, (x, y, s) in marks.items()}
+
+
+@pytest.mark.parametrize('bad', ['layout', 'no_sigma', 'side', 'moved', 'absent'])
+def test_check_moc_refuses(scene, bad):
+    marks = scene[0]
+    rows = _moc_rows(marks)
+    kc.check_moc(rows, marks, sorted(marks))
+    r = rows[25]
+    if bad == 'layout':
+        r.update(canh_den_mm='100.0', canh_nguon='', sigma_x_mm='', sigma_y_mm='')
+    elif bad == 'no_sigma':
+        r['sigma_x_mm'] = ''
+    elif bad == 'side':
+        r['canh_nguon'] = 'thiet_ke'
+    elif bad == 'moved':
+        r['x_cm'] = repr(marks[25][0] * 100 + 0.1)
+    elif bad == 'absent':
+        del rows[25]
+    with pytest.raises(kc.KCError, match='KC1-9'):
+        kc.check_moc(rows, marks, sorted(marks))
 
 
 def _own():
@@ -244,10 +307,56 @@ def test_regression_trial_16_11():
     for n in ('calib0', 'calib1'):
         with open(os.path.join(C7, '2026-11-16_buoi_thu', n, 'session.json'), encoding='utf-8') as f:
             s = json.load(f)
-        img, marks, w, h, zc = kc.clip_from_session(s, 'B1')
+        img, marks, w, h, zc = kc.clip_from_session(s, 'B1', thu=True)
         rows = kc.a3_clip(img, marks, 'B1', w, h, zc, l_max=0.8)
         d = np.array([r['dtheta_deg'] for r in rows])
         out[n] = (len(rows), float(np.sqrt(np.mean(d ** 2))), float(np.max(np.abs(d))))
     assert out['calib0'][0] == out['calib1'][0] == 24
     assert out['calib0'][1] == pytest.approx(0.074, abs=1e-3) and out['calib0'][2] == pytest.approx(0.148, abs=1e-3)
     assert out['calib1'][1] == pytest.approx(0.072, abs=1e-3) and out['calib1'][2] == pytest.approx(0.139, abs=1e-3)
+
+
+def _kc_file(tmp_path, **over):
+    kcres = dict(version=kc.VERSION, buoi='C8_x', model='B1', nhom=[[1, 5], [2, 6]], thu=False,
+                 sessions={n: dict(file=n, sha256='0' * 64) for n in kc.CLIPS_REQUIRED},
+                 **{b: dict(blk, buoi='C8_x') for b, blk in _own().items() if b != '_src'})
+    kcres.update(over)
+    p = tmp_path / 'kiem_cheo.json'
+    p.write_text(json.dumps(kcres), encoding='utf-8')
+    return p
+
+
+def _xuat_args(tmp_path, kcp, tk_over=None, part_buoi='C8_x', buoi='C8_x'):
+    tk = dict(version=kc.TUNG_KHUNG_VERSION, buoi='C8_x', model='B1', nhom=[[1, 5], [2, 6]], cham_lai=True,
+              tung_khung_max_m=0.003, kiem_cheo_sha256=kc.sha256_file(str(kcp)))
+    tk.update(tk_over or {})
+    tkp = tmp_path / 'tk.json'
+    tkp.write_text(json.dumps(tk), encoding='utf-8')
+    args = ['xuat', '--buoi', buoi, '--kiem-cheo', str(kcp), '--tung-khung', str(tkp), '--out', str(tmp_path / 'o.json')]
+    for n, (blk, _, _) in _parts().items():
+        q = tmp_path / f'{n}.json'
+        q.write_text(json.dumps(dict(blk, buoi=part_buoi)), encoding='utf-8')
+        args += ['--phan', f'{n}={q}']
+    return args
+
+
+def test_xuat_ok(tmp_path):
+    assert kc.main(_xuat_args(tmp_path, _kc_file(tmp_path))) == 0
+    out = json.loads((tmp_path / 'o.json').read_text(encoding='utf-8'))
+    assert out['P1']['tung_khung_max_m'] == 0.003 and out['version'] == 'c8_cam_u_vao_v2'
+
+
+@pytest.mark.parametrize('bad', ['thu', 'no_Hm', 'tk_buoi', 'tk_nhom', 'tk_model', 'tk_sha', 'tk_not_rescored',
+                                 'part_buoi', 'arg_buoi'])
+def test_xuat_refuses_mixed_inputs(tmp_path, bad, capsys):
+    """KC1-10: results of another session, grouping, model, kiem_cheo file, or before the rescoring are refused."""
+    over = dict(thu=True) if bad == 'thu' else {}
+    if bad == 'no_Hm':
+        over['sessions'] = {n: dict(file=n, sha256='0' * 64) for n in ('H_a', 'H_b', 'H_z')}
+    kcp = _kc_file(tmp_path, **over)
+    tk_over = {'tk_buoi': dict(buoi='C8_y'), 'tk_nhom': dict(nhom=[[1], [2]]), 'tk_model': dict(model='B2'),
+               'tk_sha': dict(kiem_cheo_sha256='f' * 64), 'tk_not_rescored': dict(cham_lai=False)}.get(bad)
+    args = _xuat_args(tmp_path, kcp, tk_over, part_buoi='C8_y' if bad == 'part_buoi' else 'C8_x',
+                      buoi='C8_y' if bad == 'arg_buoi' else 'C8_x')
+    assert kc.main(args) == 2
+    assert not (tmp_path / 'o.json').exists()
