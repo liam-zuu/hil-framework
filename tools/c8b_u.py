@@ -20,8 +20,9 @@ khoa (after the C8 clips are tracked and the C8 runs have their clock files):
   margin as O1 v11.39 J1, Liam 18/11 at THESIS "Duyet, ra vong khoa (Recommended)"):
   U_p  (m)       = LE x (P1 + ... + P7),  U_psi (deg) = LE x (A1 + ... + A6), linear, parts may overlap
                  (conservative), none subtracted; U_p, U_psi bound ONE frame (per-frame noise P7, A5 inside).
-    P1 image -> floor   max(cross-validation largest at the marks on the clip-mean pose, per frame) + mark-shift
-                        detection threshold (nguong + u_so: a shift below it stays in the fit)            [camera file]
+    P1 image -> floor   max(cross-validation largest at the marks on the clip-mean pose, per frame) + the largest
+                        true shift of a mark left in the fit, nguong + 2 u_so (dropped when the observed shift
+                        exceeds nguong + u_so; the comparison error u_so may hide as much again)          [camera file]
     P2 tag-body centre  |(dx, dy) used by the scorer - R(dpsi used) q| + du + |q| A1[rad]           [c8b_xoay.py]
     P3 / A2 plate re-seating, position / angle (3 lifts, car still)                                  [camera file]
     P4 / A4 3b          d_p_quay / d_psi_quay                                                         [c8b_3b.py]
@@ -175,13 +176,36 @@ def _caliper(tk):
     return c, e, a * 1e-3, b * 1e-3, L * 1e-3, tt
 
 
-def u_p_u_psi(cam, tb, tk, xo):
-    """U_p (m), U_psi (deg) with their parts P1-P7, A1-A6 (page v10 section 2; design v2)."""
+CAM_NUMS = ('P1.bo_nhom_max_m', 'P1.tung_khung_max_m', 'moc_dich.nguong_m', 'moc_dich.u_so_m', 'P3.vi_tri_max_m',
+            'A2.goc_max_deg', 'P7.lech_max_m', 'A3.max_deg', 'A5.lech_max_deg', 'day_doi.dn_m', 'day_doi.dzc_m',
+            'day_doi.kappa', 'do_cao.rho_max_m', 'do_cao.H_m', 'do_cao.h_m', 'bo_cham.side_m')
+
+
+def check_cam(cam):
+    """The camera file alone (for the writers' tests, CODE_KIEMCHEO 18/11): version, top-level keys, every number
+    used finite and >= 0, tag_offset, side > 0, kappa = h / H, H - dzc > h. Raises UError; returns None."""
     if not isinstance(cam, dict) or cam.get('version') != CAM_VERSION:
         raise UError(f'camera input: version is not {CAM_VERSION} (a file with the names of tests 1, 2 is refused)')
     extra = sorted(set(cam) - CAM_KEYS)
     if extra:
         raise UError(f'camera input: unknown top-level fields {extra} (nothing is dropped silently)')
+    v = {p: _num(_get(cam, p), p) for p in CAM_NUMS}
+    _tag_offset(cam)
+    if not v['bo_cham.side_m'] > 0:
+        raise UError('bo_cham.side_m must be > 0')
+    H, h = v['do_cao.H_m'], v['do_cao.h_m']
+    if not H > h:
+        raise UError(f'do_cao: camera height {H} m not above the tag height {h} m')
+    if not H - v['day_doi.dzc_m'] > h:
+        raise UError(f'day_doi.dzc_m {v["day_doi.dzc_m"]} m: camera height {H} m minus it not above the tag height {h} m')
+    if abs(v['day_doi.kappa'] - h / H) > 1e-6 * (h / H):  # C8BS-R7-3: H, h here are the ones of the scoring session
+        raise UError(f'day_doi.kappa {v["day_doi.kappa"]} is not do_cao.h_m / do_cao.H_m = {h / H} (the kappa of the '
+                     f'scoring)')
+
+
+def u_p_u_psi(cam, tb, tk, xo):
+    """U_p (m), U_psi (deg) with their parts P1-P7, A1-A6 (page v10 section 2; design v2)."""
+    check_cam(cam)
     if not isinstance(xo, dict) or xo.get('version') != XOAY_VERSION:
         raise UError(f'turning-in-place input: version is not {XOAY_VERSION}')
     if not tb.get('ga_ok'):
@@ -238,7 +262,9 @@ def u_p_u_psi(cam, tb, tk, xo):
     du = _num(xo.get('du_m'), 'xoay du_m')
     cd, sd = math.cos(dpsi), math.sin(dpsi)
     lech = math.hypot(dx - (cd * qx - sd * qy), dy - (sd * qx + cd * qy)) + du + math.hypot(qx, qy) * math.radians(a1)
-    moc = f('moc_dich.nguong_m') + f('moc_dich.u_so_m')
+    # a mark is dropped when |observed shift| > nguong + u_so; not dropped only says |true shift| <= nguong + 2 u_so
+    # (the comparison error may pull the observed shift down by u_so; CODE_KIEMCHEO 18/11, Codex KC1-3)
+    moc = f('moc_dich.nguong_m') + 2 * f('moc_dich.u_so_m')
     p = dict(P1_anh_san=max(f('P1.bo_nhom_max_m'), f('P1.tung_khung_max_m')) + moc,
              P2_lech_tam=lech, P3_nhac_tam=f('P3.vi_tri_max_m'), P4_quay=dpq, P5_day_doi_zc=day_doi,
              P6_do_cao=cao, P7_nhieu_khung=f('P7.lech_max_m'))

@@ -40,10 +40,11 @@ def make_place(tmp_path, name, q=(0.004, -0.0025), c0=(1.0, 0.0), v=(0.0, 0.0), 
     p = tmp_path / f'frames_{name}.csv'
     with open(p, 'w', newline='', encoding='utf-8') as f:
         wr = csv.writer(f)
-        wr.writerow(['t_s', 'valid', 'car_seen', 'tag_x', 'tag_y', 'tag_psi'])
-        for k in range(len(t)):
+        wr.writerow(['t_s', 'valid', 'why', 'car_seen', 'x', 'y', 'psi', 'tag_x', 'tag_y', 'res_m'])
+        for k in range(len(t)):          # c7_measure.track columns (CODE_CAM 18/11); tag_offset 0: x, y = tag_x, tag_y
             a = (psi_cam[k] + math.pi) % (2 * math.pi) - math.pi
-            wr.writerow([f'{t[k]:.6f}', 1, 1, f'{tag[k, 0]:.6f}', f'{tag[k, 1]:.6f}', f'{a:.7f}'])
+            x, y = f'{tag[k, 0]:.6f}', f'{tag[k, 1]:.6f}'
+            wr.writerow([f'{t[k]:.6f}', 1, '', 1, x, y, f'{a:.7f}', x, y, '0.0003'])
     return str(p), t, psi
 
 
@@ -105,6 +106,14 @@ def test_refusals(tmp_path):
     p.write_text('t_s,valid,car_seen,tag_x,tag_y\n0,1,1,0,0\n', encoding='utf-8')
     with pytest.raises(X.XError, match='no column'):
         X.analyse({'O': pO, 'K1': str(p)})
+    rows = open(pO, encoding='utf-8').read().splitlines()   # a clip tracked with a tag_offset: x differs from tag_x
+    h, r1 = rows[0].split(','), rows[5].split(',')
+    r1[h.index('x')] = str(float(r1[h.index('x')]) + 0.003)
+    rows[5] = ','.join(r1)
+    q = tmp_path / 'offset.csv'
+    q.write_text('\n'.join(rows) + '\n', encoding='utf-8')
+    with pytest.raises(X.XError, match='tag_offset 0'):
+        X.analyse({'O': str(q), 'K1': pO})
 
 
 def test_short_turn_not_an_interval(tmp_path):

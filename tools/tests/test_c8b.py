@@ -855,7 +855,7 @@ def _expect(cam=CAM, tk=TK, xo=XO):
     q = math.hypot(*xo['q_tag_m'])
     p2 = q + xo['du_m'] + q * math.radians(a1)
     a6 = math.degrees(rho * (np.sum(np.abs(c - c.mean())) + 8 * e) / (2 * math.sqrt(2) * s * (H - c.max() - e)))
-    p = dict(P1_anh_san=0.002 + 0.001 + 0.0004, P2_lech_tam=p2, P3_nhac_tam=0.0008, P4_quay=0.0007, P5_day_doi_zc=dd,
+    p = dict(P1_anh_san=0.002 + 0.001 + 2 * 0.0004, P2_lech_tam=p2, P3_nhac_tam=0.0008, P4_quay=0.0007, P5_day_doi_zc=dd,
              P6_do_cao=cao, P7_nhieu_khung=0.0006)
     a = dict(A1_goc_dan=a1, A2_nhac_tam=0.1, A3_huong_vung=0.15, A4_quay=0.25, A5_nhieu_khung=0.12, A6_nghieng_ma=a6)
     return p, a
@@ -869,8 +869,8 @@ def test_khoa_sums():
     assert k['U_p_phan_m'] == pytest.approx(p) and k['U_psi_phan_deg'] == pytest.approx(a)
     assert k['U_p_m'] == pytest.approx(1.25 * sum(p.values()))
     assert k['U_psi_deg'] == pytest.approx(1.25 * sum(a.values()))
-    # hand numbers: P1 3.4 mm; A1 = 2 atan(0.2 / 96.4) + 0.05 = 0.2877 deg; dh = 0.3 mm
-    assert p['P1_anh_san'] == pytest.approx(0.0034) and a['A1_goc_dan'] == pytest.approx(0.28773, abs=1e-4)
+    # hand numbers: P1 = 2 + 1 + 2 x 0.4 = 3.8 mm; A1 = 2 atan(0.2 / 96.4) + 0.05 = 0.2877 deg; dh = 0.3 mm
+    assert p['P1_anh_san'] == pytest.approx(0.0038) and a['A1_goc_dan'] == pytest.approx(0.28773, abs=1e-4)
     assert tuple(k['U_p_phan_m']) == CU.P_PARTS and tuple(k['U_psi_phan_deg']) == CU.A_PARTS
     assert k['troi_ppm'] == pytest.approx(1.25 * 4e-4 * 1e6)             # run d (not ok) left out
     assert k['dai']['O1-F05']['width_s'] == [0.010, 0.012] and k['dai']['O1-F05']['gyro_minus_rv_s'] == [0.003, 0.005]
@@ -880,7 +880,7 @@ def test_khoa_sums():
 def test_khoa_p1_takes_the_larger_of_clip_mean_and_per_frame():
     cam = _cp(CAM)
     cam['P1']['tung_khung_max_m'] = 0.0031
-    assert KH(cam)['U_p_phan_m']['P1_anh_san'] == pytest.approx(0.0031 + 0.0014)
+    assert KH(cam)['U_p_phan_m']['P1_anh_san'] == pytest.approx(0.0031 + 0.0018)
 
 
 def test_khoa_refuses_bad_3b_and_missing_field():
@@ -915,6 +915,9 @@ def test_khoa_camera_input_names_only():
         KH(dict(old, **{k: v for k, v in CAM.items() if k not in old}))
     with pytest.raises(CU.UError, match=r"unknown top-level fields \['A6'\]"):
         KH(dict(CAM, A6={'max_deg': 0.15}))
+    assert CU.check_cam(_cp(CAM)) is None                   # the camera file alone (for its writers' tests)
+    with pytest.raises(CU.UError, match='version is not'):
+        CU.check_cam(old)
     info = _cp(CAM)                                        # extra keys inside a block are information, kept out of U
     info['A3'].update(L_m=[0.55, 0.78], cach='bo_cap')
     info['nguon'], info['ghi_chu'] = ['x.json'], 'thu'

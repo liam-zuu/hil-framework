@@ -8,7 +8,9 @@ slowly with the hand controller, about 2 turns one way, stop, 2 turns the other 
 design: 03_CODE/docs/2026-11-18_Thiet_ke_C8b_o_U_v10_v2.md section 3.
 
 Input per place: the frames CSV of c7_measure.track on the clip of that place, run WITH tag_offset 0 (columns t_s,
-valid, car_seen, tag_x, tag_y, tag_psi; tag_* are the tag centre and the tag heading after the parallax step).
+valid, car_seen, x, y, psi, tag_x, tag_y; with tag_offset 0, psi is the tag heading and x, y equal tag_x, tag_y, the
+tag centre after the parallax step; a file whose x, y differ from tag_x, tag_y is refused. CODE_CAM 18/11: the frames
+CSV has no tag_psi column).
 
 Model (one turning interval = one place, one direction, at least one full turn):
   tag(t) = c0 + v (t - t_mid) + R(psi_tag(t)) q
@@ -57,7 +59,8 @@ GAP_S = 0.5           # s: an interval is not bridged over a gap of more frames 
 MIN_TURN = 2 * math.pi
 DRIFT_WARN_M = 0.01   # m: drift of the centre over an interval above this is flagged (slip) [DE XUAT]
 GRID_S = 0.05         # s: grid of the cross-correlation
-FRAME_NEED = ('t_s', 'valid', 'car_seen', 'tag_x', 'tag_y', 'tag_psi')
+FRAME_NEED = ('t_s', 'valid', 'car_seen', 'x', 'y', 'psi', 'tag_x', 'tag_y')
+OFFSET_TOL_M = 1e-6   # x, y must equal tag_x, tag_y: the clip was tracked with tag_offset 0
 
 
 class XError(Exception):
@@ -78,11 +81,14 @@ def read_frames(path):
         if r['valid'] != '1' or r['car_seen'] != '1':
             continue
         try:
-            v = [float(r[c]) for c in ('t_s', 'tag_x', 'tag_y', 'tag_psi')]
+            v = [float(r[c]) for c in ('t_s', 'tag_x', 'tag_y', 'psi', 'x', 'y')]
         except ValueError:
             continue
         if all(math.isfinite(x) for x in v):
-            keep.append(v)
+            if abs(v[4] - v[1]) > OFFSET_TOL_M or abs(v[5] - v[2]) > OFFSET_TOL_M:
+                raise XError(f'{path}: x, y differ from tag_x, tag_y at t_s {v[0]}: tracked with a tag_offset; '
+                             f'track the clip with tag_offset 0')
+            keep.append(v[:4])
     if len(keep) < 10:
         raise XError(f'{path}: fewer than 10 valid frames with the tag seen')
     a = np.array(keep)
