@@ -672,20 +672,17 @@ def dyn_exceed(S, t0, t_end, lim):
                     gyro, not in the yaw difference; a report outside the window is coverage only, CS4-5);
       acceleration  |dgz / dt| between consecutive FINITE gyro reports inside the window (c8_u_imu.alpha_max; a NaN
                     between them is skipped, CS4-4; across a gap the difference quotient still bounds the true peak from
-                    below, so an excess is certain).
+                    below, so an excess is certain; never across an IMU reset, CS5-1).
     The yaw pairs stop at t_break (CS4-3: a step after a reset is not a turn).
     Every excess seen is reported, even when the evidence does not cover the whole window (CS3-5); what could not be
-    checked (no report at or before t0 or after t_end, a gyro gap above h_lim, values not finite, yaw reports not
-    covering the window) is said in the note. Returns (time, limit key, note): (None, '', note) when nothing is seen
+    checked (the edges before the first and after the last finite gyro report used, CS5-2; fewer than two of them; a
+    gyro gap above h_lim; values not finite; a pair across a reset; yaw reports not covering the window) is said in
+    the note. Returns (time, limit key, note): (None, '', note) when nothing is seen
     above the limits (CS1-19: reported, the handling is Liam's when it happens)."""
     cand, notes = [], []
     tg, gz = np.asarray(S.get('tg', np.array([])), float), np.asarray(S.get('gz', np.array([])), float)
     if tg.size:
         h_lim = S.get('h_lim', cu.H_LIM_S)
-        if tg[0] > t0:
-            notes.append(f'gyro reports start {tg[0] - t0:.3f} s after t = 0')
-        if tg[-1] < t_end:
-            notes.append(f'gyro reports end {t_end - tg[-1]:.2f} s before the window end')
         c0 = max(int(np.searchsorted(tg, t0, 'right')) - 1, 0)       # coverage: the reports bracketing the window
         c1 = min(int(np.searchsorted(tg, t_end, 'left')), tg.size - 1)
         tc = tg[c0:c1 + 1]
@@ -696,15 +693,31 @@ def dyn_exceed(S, t0, t_end, lim):
         fin = np.isfinite(gw)
         if not fin.all():
             notes.append(f'{int((~fin).sum())} gyro values not finite (not checked)')
+        tf, gf = tw[fin], gw[fin]                                      # CS4-4: consecutive FINITE reports
         if not tw.size:
             notes.append('no gyro report inside the window: rate and acceleration not checked')
-        tf, gf = tw[fin], gw[fin]                                      # CS4-4: consecutive FINITE reports
+        elif not tf.size:
+            notes.append('no finite gyro report inside the window: rate and acceleration not checked')
+        else:                                                          # CS5-2: the edges of the reports USED
+            if tf[0] > t0:
+                notes.append(f'gyro reports used start {tf[0] - t0:.3f} s after t = 0 (not checked before)')
+            if tf[-1] < t_end:
+                notes.append(f'gyro reports used end {t_end - tf[-1]:.3f} s before the window end (not checked after)')
+            if tf.size < 2:
+                notes.append('one finite gyro report inside the window: acceleration not checked')
         bad = np.nonzero(np.degrees(np.abs(gf)) > lim['wz_dps'])[0]
         if len(bad):
             cand.append((float(tf[bad[0]]), 'wz_dps'))
         if tf.size >= 2:
             acc = np.degrees(np.abs(np.diff(gf)) / np.diff(tf))
-            bad = np.nonzero(acc > lim['alpha_dps2'])[0]
+            # CS5-1: no difference across an IMU reset (two sensor starts). Same rule as the yaw (c8_u_imu.rv_samples):
+            # a report received before the reset row is before it. The part across a reset is not checked.
+            rs = np.asarray(S.get('resets', []), float)
+            cross = np.array([bool(np.any((rs > a) & (rs <= b))) for a, b in zip(tf[:-1], tf[1:])], bool)
+            if cross.any():
+                r_in = rs[(rs > tf[0]) & (rs <= tf[-1])]
+                notes.append(f'IMU reset at {r_in[0] - t0:.3f} s: acceleration across it not checked')
+            bad = np.nonzero(~cross & (acc > lim['alpha_dps2']))[0]
             if len(bad):
                 cand.append((float(tf[bad[0] + 1]), 'alpha_dps2'))
     else:

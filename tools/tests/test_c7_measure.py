@@ -619,3 +619,14 @@ def test_cs4_2_api_rows_off_the_6_decimal_grid_need_their_rounding():
     cm.regate(rows, dict(car_side_m=0.1444, rms_px_H=0.3))
     lo, hi = cm.res_sim_interval(0.00341049, 0.97000249, 0.1444, 5e-9)
     assert hi < 0.0015 and all(r['valid'] for r in rows)           # 8 decimals: decided, below 1.5 mm
+
+
+# ---------------------------------------------------------------- test gaps Codex listed in round 5 (guard, passes on 05ccfc4)
+@pytest.mark.parametrize('res_m, scale', [(0.00341049, 0.970002), (0.003410, 0.97000249)])
+def test_cs4_2_one_column_off_the_grid_is_refused(res_m, scale):
+    """CS4-2 guard: only res_m, or only scale, off the 6-decimal grid without '_dec': refused (a fix checking one
+    column would pass the CS4-2 test)."""
+    base = dict(n_marks=24, rms_px=0.3, car_seen=True, res_sim_m=float('nan'), x=0.0, y=0.0, psi=0.0)
+    rows = [dict(base, idx=k, t_s=0.01 * k, res_m=res_m, scale=scale) for k in range(9)]
+    with pytest.raises(ValueError, match='CS4-2'):
+        cm.regate(rows, dict(car_side_m=0.1444, rms_px_H=0.3))

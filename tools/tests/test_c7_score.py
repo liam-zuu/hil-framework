@@ -1448,3 +1448,103 @@ def test_cs3_2_suspects_inside_and_outside_the_window(tmp_path):
     assert rows[frame_at(rows, 2.5)]['suspect'] == 1
     end = [r for r in rows if 6.8 <= r['t'] < 7.0]
     assert end and all(r['speed_way2'] == pytest.approx(r['speed'], abs=1e-12) for r in end)
+
+
+# ---------------------------------------------------------------- Codex vong 5 (17/11, CS5-1, CS5-2), each failing on
+# hil 05ccfc4; review 03_CODE/docs/review/2026-11-17_Tham_dinh_c7_score_o1_vong5.md
+BIGL = dict(goc_quay_deg=1e5, wz_dps=1e5, alpha_dps2=1e9)
+
+
+def test_cs5_1_no_acceleration_across_an_imu_reset():
+    """Codex CS5-1: gz 0, NaN, 0.01 rad/s at 0, 0.05, 1 s and a reset at 0.075 s: the two finite reports belong to two
+    sensor starts, so their difference is no motion (05ccfc4 reported 0.573 deg/s^2 > 0.5 at 1 s); the note says the
+    acceleration across the reset was not checked."""
+    ta = np.arange(0.0, 1.0001, 0.05)
+    S = _dyn_S(ta, np.zeros_like(ta), [0.0, 0.05, 1.0], [0.0, float('nan'), 0.01])
+    S['resets'], S['t_break'] = [0.075], 0.05
+    r = cs.dyn_exceed(S, 0.0, 1.0, dict(BIGL, alpha_dps2=0.5))
+    assert r[0] is None and 'reset' in r[2] and 'acceleration' in r[2]
+
+
+def test_cs5_1_true_excess_inside_one_segment_is_still_reported():
+    """Gyro 0, 0, 0.5, 1.5 rad/s at 0, 0.05, 0.5, 0.55 s, reset at 0.3 s, limit 50 deg/s^2: the pair across the reset
+    (0.5 rad/s in 0.45 s, 64 deg/s^2) is not used (05ccfc4: excess at 0.5 s); the pair after it (1 rad/s in 0.05 s,
+    1146 deg/s^2) is an excess at 0.55 s."""
+    ta = np.arange(0.0, 0.6001, 0.05)
+    S = _dyn_S(ta, np.zeros_like(ta), [0.0, 0.05, 0.5, 0.55], [0.0, 0.0, 0.5, 1.5])
+    S['resets'], S['t_break'] = [0.3], 0.25
+    r = cs.dyn_exceed(S, 0.0, 0.6, dict(BIGL, alpha_dps2=50.0))
+    assert r[1] == 'alpha_dps2' and r[0] == pytest.approx(0.55)
+
+
+def test_cs5_2_edges_of_the_reports_used_are_noted():
+    """Codex CS5-2: window [0, 7], gyro every 50 ms from -0.025 s: the reports used (inside the window) run from 0.025
+    to 6.975 s, the 25 ms at each edge is not checked; 05ccfc4 gave an empty note (it looked at the whole series)."""
+    tg = -0.025 + 0.05 * np.arange(142)
+    ta = np.arange(-0.05, 7.05, 0.05)
+    r = cs.dyn_exceed(_dyn_S(ta, np.zeros_like(ta), tg, np.zeros_like(tg)), 0.0, 7.0, BIGL)
+    assert r[0] is None and 'start 0.025 s after t = 0' in r[2] and 'end 0.025 s before the window end' in r[2]
+
+
+def test_cs5_2_one_finite_report_inside_says_acceleration_not_checked():
+    ta = np.arange(-0.05, 1.0, 0.05)
+    r = cs.dyn_exceed(_dyn_S(ta, np.zeros_like(ta), [-0.5, 0.5, 1.5], [0.0, 0.0, 0.0]), 0.0, 0.9, BIGL)
+    assert r[0] is None and 'acceleration not checked' in r[2]
+
+
+def test_cs5_2_all_reports_inside_not_finite_says_rate_not_checked():
+    ta = np.arange(-0.05, 1.0, 0.05)
+    S = _dyn_S(ta, np.zeros_like(ta), [-0.05, 0.4, 0.8, 0.95], [0.0, float('nan'), float('nan'), 0.0])
+    r = cs.dyn_exceed(S, 0.0, 0.9, BIGL)
+    assert r[0] is None and 'rate and acceleration not checked' in r[2]
+
+
+# ---------------------------------------------------------------- test gaps Codex listed in round 5 (guards: pass on
+# 05ccfc4, each fails on a narrower fix)
+def test_cs4_1_all_eight_bounds_after_t1_and_one_key_set(tmp_path):
+    """CS4-1: every lo_/hi_ of g2..g5 is NaN after t1 (not only lo_g2, hi_g3), and every row has the same keys so the
+    rows.csv writer (csv.DictWriter on rows[0]) takes them all."""
+    fr = make_frames('O1-K1', k_start=K1S, lateral=0.13, drop=[(5.2 + 0.5 / FPS, 5.5)])
+    out, rows = run(tmp_path, 'O1-K1', frames=fr, k_start=K1S, allow_final_set=True, log_kw=dict(post=1.0))
+    assert out['U_t_scope'] == 'truoc_t1'
+    cols = [f'{s}_{c}' for c in cs.o1_gate.MEASURED for s in ('lo', 'hi')]
+    after = [r for r in rows if r['t'] > out['t1'] + 1e-9]
+    assert len(cols) == 8 and after and all(math.isnan(r[c]) for r in after for c in cols)
+    assert all(set(r) == set(rows[0]) for r in rows)
+
+
+def test_cs4_3_turn_before_t_break_is_still_an_excess():
+    """CS4-3 guard: 0.1 rad (5.7 deg) between 0 and 0.05 s, t_break at 0.05 s, then a 1 rad step: the turn before the
+    break is an excess (a fix that dropped the whole angle check at t_break would pass the CS4-3 test)."""
+    S = _dyn_S([-0.05, 0.0, 0.05, 0.10, 0.15], [0, 0, 0.1, 1.1, 1.1], [-0.05, 0.0, 0.05, 0.10, 0.15], [0.0] * 5)
+    S['t_break'] = 0.05
+    r = cs.dyn_exceed(S, 0.0, 0.15, dict(BIGL, goc_quay_deg=2.0))
+    assert r[1] == 'goc_quay_deg' and r[0] <= 0.05 + 1e-9
+
+
+@pytest.mark.parametrize('k', [0, 2])
+def test_cs4_5_reports_on_t0_and_t_end_count(k):
+    """CS4-5 guard: a 1 rad/s report exactly at t0 (k = 0) or at t_end (k = 2) is inside the window."""
+    gz = [0.0, 0.0, 0.0]
+    gz[k] = 1.0
+    ta = np.arange(-0.05, 1.1, 0.05)
+    r = cs.dyn_exceed(_dyn_S(ta, np.zeros_like(ta), [0.0, 0.05, 0.10], gz), 0.0, 0.10, dict(BIGL, wz_dps=30.0))
+    assert r[1] == 'wz_dps' and r[0] == pytest.approx(0.05 * k)
+
+
+def test_cs4_6_last_yaw_report_before_the_window_end_is_noted():
+    """CS4-6 guard: the last yaw report at 0.05 s, window end 0.10 s: the 0.050 s not covered is noted."""
+    S = _dyn_S([-0.05, 0.0, 0.05], [0.0] * 3, [-0.05, 0.0, 0.05, 0.10], [0.0] * 4)
+    r = cs.dyn_exceed(S, 0.0, 0.10, dict(BIGL, goc_quay_deg=2.0))
+    assert 'IMU yaw reports end 0.050 s before the window end' in r[2]
+
+
+@pytest.mark.parametrize('t_reset, excess', [(0.05, False), (0.0, True)])
+def test_cs5_1_reset_on_a_receive_time_follows_the_yaw_rule(t_reset, excess):
+    """As c8_u_imu.rv_samples: a report received at the reset row time is after the reset. Reset at 0.05 s (the second
+    report): the pair crosses it, no acceleration; reset at 0.0 s (the first report): both after it, 1146 deg/s^2."""
+    ta = np.arange(-0.05, 0.11, 0.05)
+    S = _dyn_S(ta, np.zeros_like(ta), [0.0, 0.05], [0.0, 1.0])
+    S['resets'] = [t_reset]
+    r = cs.dyn_exceed(S, 0.0, 0.05, dict(BIGL, alpha_dps2=500.0))
+    assert (r[1] == 'alpha_dps2') == excess
