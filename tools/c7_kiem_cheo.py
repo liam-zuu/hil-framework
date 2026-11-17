@@ -56,14 +56,18 @@ if HERE not in sys.path:
 import c7_clip_probe as cp                                               # noqa: E402
 import c7_measure as cm                                                  # noqa: E402
 
-VERSION = 'c7_kiem_cheo_v3'                  # v3: design v3 (Codex rounds 1, 2)
-U_SO_VERSION = 'c7_u_so_v2'
-TUNG_KHUNG_VERSION = 'c7_tung_khung_v1'
+VERSION = 'c7_kiem_cheo_v4'                  # v4: design v4 (Codex rounds 1-3; Liam: rest in the code review)
+U_SO_VERSION = 'c7_u_so_v3'
+TUNG_KHUNG_VERSION = 'c7_tung_khung_v2'
 CAM_U_VERSION = 'c8_cam_u_vao_v2'           # c8b_u.CAM_VERSION (CODE_C8B, format agreed 18/11 with CODE_CAM)
 NGUONG_CO_DINH_M = 0.001                     # page v10 7a: 1 mm + the uncertainty of the comparison (u_so)
 L_MAX_M = 1.05                               # [DE XUAT] pair length of A3, locked before C8 (v2, KC1-7: the
                                              # centre pairs 25-26, 27-28 at 1.0 m; 84 pairs with 32 marks)
-WIN_FRAMES = 30                              # [DE XUAT] window of the mark-shift median: 0.5 s at 60 fps (CODE_CAM)
+WIN_S = 0.5                                  # [DE XUAT] window of the mark-shift median (CODE_CAM design v2 3)
+WIN_MIN_N = 10                               #   at least 10 samples
+WIN_GAP_S = 0.1                              #   a gap above 0.1 s restarts the window
+COVER_MAX_MISS = 0.10                        # [DE XUAT] design v4 5: valid frames without a check value, at most
+COVER_MAX_GAP_S = 1.0                        #   and no gap without check longer than this
 N_SMALL_SETS = 3                             # per group: the smallest run mark sets also get the window term
 KIEM_H_MIN = 0.95                            # [DE XUAT] design v3 7 (KC2-2): share of frames with every mark at once
 CLIPS_REQUIRED = ('H_a', 'H_b', 'H_m', 'H_z')  # design v2 7: two at the start, one mid-session, one after the last run
@@ -270,7 +274,9 @@ def pos_with(cam_k, corners, marks, fit_ids, targets):
     """Positions {i: (2,)} of the marks `targets` from one set of corners (a frame or the clip mean): the pose is
     refitted from cam_k (the clip-H camera of the group, never a previous frame: KC1-1) on the marks fit_ids seen,
     intrinsics of cam_k. None when fewer than MIN_TRAIN marks."""
-    use = sorted(i for i in fit_ids if i in corners)
+    if not set(fit_ids) <= set(corners):
+        return None                                   # KC2-2: the set must be seen whole, never shrunk to what is seen
+    use = sorted(fit_ids)
     if len(use) < MIN_TRAIN:
         return None
     obj = np.vstack([cp.mark_corners_floor(*marks[i]) for i in use])
@@ -279,76 +285,126 @@ def pos_with(cam_k, corners, marks, fit_ids, targets):
     return {i: centre_floor(cam, corners[i]) for i in targets if i in corners}
 
 
-def run_sets(groups, all_ids, tap_moc):
-    """Per group k: the distinct fit sets S minus k that occur in the runs (track's marks used per frame), plus the
-    full set; sets with fewer than MIN_TRAIN marks are dropped (no check value there, KC1-6 counts them)."""
-    out = []
-    for g in groups:
-        sets = {frozenset(set(all_ids) - set(g))}
-        for S in tap_moc or ():
-            T = frozenset(set(S) - set(g)) & frozenset(all_ids)
-            if len(T) >= MIN_TRAIN:
-                sets.add(T)
-        out.append(sorted(sets, key=lambda t: (len(t), sorted(t))))
+def run_sets(all_ids, tap_moc):
+    """The distinct mark sets of the runs (track `moc_dung`, after each exclusion pass: KC2-1) plus the full set."""
+    sets = {frozenset(all_ids)}
+    for S in tap_moc or ():
+        T = frozenset(S) & frozenset(all_ids)
+        if T:
+            sets.add(T)
+    return sorted(sets, key=lambda t: (len(t), sorted(t)))
+
+
+def comparators(groups):
+    """design v4 2: {chain: {target group t: excluded groups}}. Chain 'xe' (the car camera's mark-shift rule): mark j
+    is compared by the camera without its own group. Chain k (the check camera k, run on data without group k,
+    KC1-1): mark j outside k by the camera without k and without the group of j (CODE_CAM T33-4)."""
+    G = len(groups)
+    out = {'xe': {t: frozenset([t]) for t in range(G)}}
+    for k in range(G):
+        out[str(k)] = {t: frozenset([k, t]) for t in range(G) if t != k}
     return out
 
 
-def vec_median_windows(seq, win):
-    """Component-wise median of each run of `win` consecutive positions (a window with a missing frame is
-    skipped). seq: list of (2,) or None."""
-    out = []
-    for a in range(0, len(seq) - win + 1):
-        w = seq[a:a + win]
-        if any(v is None for v in w):
+def windows_by_time(times, seq, win_s=WIN_S, min_n=WIN_MIN_N, gap_s=WIN_GAP_S):
+    """Medians of the window of the mark-shift rule (CODE_CAM design v2 3): samples of the last continuous sighting
+    within win_s before each frame, a gap above gap_s restarts it, at least min_n samples. seq: (2,) or None."""
+    out, start = [], None
+    last_t = None
+    for e, (t, v) in enumerate(zip(times, seq)):
+        if v is None:
             continue
-        out.append(np.median(np.array(w), axis=0))
+        if last_t is None or t - last_t > gap_s:
+            start = e
+        last_t = t
+        w = [seq[i] for i in range(start, e + 1) if seq[i] is not None and t - times[i] < win_s]
+        if len(w) >= min_n:
+            out.append(np.median(np.array(w), axis=0))
     return out
 
 
-def u_so_v2(img_a, img_b, dets_b, marks, groups, cams_a, tap_moc=None, win=WIN_FRAMES, n_small=N_SMALL_SETS):
-    """u_so by the comparison of track (design v2 4). Baseline of mark i in group k: the pose of the clip-H_a camera
-    of group k refitted on the H_a mean corners of the marks outside k, then i predicted (symmetric with the rest:
-    two equal clips give 0, KC1-8). At H_b:
-      static term  max over the run sets S (outside k) of |pos_S(H_b mean) - baseline|   (sets of the runs)
-      window term  max over windows of |median_win pos_S(H_b frames) - pos_S(H_b mean)| for the full set and the
-                   n_small smallest sets of each group (fewer marks: noisier pose)
-    u_so = static + window (triangle inequality on pos_S(window) - baseline). Returns (u_so, details)."""
-    all_ids = sorted(img_a)
-    sets = run_sets(groups, all_ids, tap_moc)
-    stat, wind, per, khong = 0.0, 0.0, {}, []
-    for k, g in enumerate(groups):
-        base = pos_with(cams_a[k], img_a, marks, frozenset(set(all_ids) - set(g)), g)
-        if base is None:
-            raise KCError(f'group {k}: fewer than {MIN_TRAIN} marks outside it in H_a')
-        small = set(sets[k][:n_small]) | {frozenset(set(all_ids) - set(g))}
-        for S in sets[k]:
-            pb = pos_with(cams_a[k], img_b, marks, S, g)
-            if pb is None:
-                khong.append(dict(nhom=k, tap=sorted(S), vi='tinh'))       # KC2-2: never replaced by a smaller set
-                continue
-            for i, v in pb.items():
-                if i in base:
-                    d = float(np.linalg.norm(v - base[i]))
-                    stat = max(stat, d)
-                    per[i] = max(per.get(i, 0.0), d)
-            if S in small and dets_b:
-                seq = {i: [] for i in g}
-                for fr in dets_b:
-                    pf = pos_with(cams_a[k], fr, marks, S, g)
-                    for i in g:
-                        seq[i].append(None if pf is None or i not in pf else pf[i])
-                n_win = 0
-                for i in g:
-                    if i not in pb:
-                        continue
-                    for m in vec_median_windows(seq[i], win):
-                        n_win += 1
-                        wind = max(wind, float(np.linalg.norm(m - pb[i])))
-                if n_win == 0:
-                    khong.append(dict(nhom=k, tap=sorted(S), vi='cua_so'))
-    return stat + wind, dict(tinh_m=stat, cua_so_m=wind, d_tinh_m={str(i): v for i, v in per.items()},
-                             n_tap={str(k): len(s) for k, s in enumerate(sets)}, cua_so_khung=win,
-                             co_tap_luot=bool(tap_moc), khong_tinh_duoc=khong, thieu=bool(khong))
+class GroupCams:
+    """Cameras (intrinsics + pose) fitted on the H_a mean corners without a set of groups; cached."""
+
+    def __init__(self, img, marks, groups, model, w, h, zc):
+        self.img, self.marks, self.groups, self.args = img, marks, groups, (model, w, h, zc)
+        self.cache = {}
+
+    def ids_without(self, E):
+        out = set().union(*[set(self.groups[e]) for e in E]) if E else set()
+        return frozenset(i for i in self.img if i not in out)
+
+    def __call__(self, E):
+        E = frozenset(E)
+        if E not in self.cache:
+            self.cache[E] = fit_without(self.img, self.marks, sorted(self.ids_without(E)), *self.args)
+        return self.cache[E]
+
+
+def u_so_family(times_a, dets_a, img_b, times_b, dets_b, marks, groups, gcams, tap_moc=None, n_small=N_SMALL_SETS,
+                win_s=WIN_S, min_n=WIN_MIN_N, gap_s=WIN_GAP_S):
+    """u_so of every chain by its own comparators (design v4 4; KC1-1, KC1-8, KC3-1):
+      baseline   of target j: MEAN over the H_a frames of the per-frame position of j (pose refitted from the camera
+                 without E on every mark outside E seen in the frame), as the track (CODE_CAM design v2 3);
+      static     max over the run sets S of |pos(H_b mean corners, fit S minus E) - baseline|;
+      noise      for the full set and the n_small smallest sets: per frame of H_b, |pos - pos(H_b mean)| (raw) and
+                 |window median - pos(H_b mean)| (filtered, the window of the rule);
+      u_so = static + filtered noise, u_so_tho = static + raw noise (triangle inequality).
+    A (chain, target group, S) that cannot be computed is listed (KC2-2, KC3-2), never replaced by a smaller set.
+    A mark without a baseline in H_a: KCError (the whole session). Returns {chain: dict}."""
+    all_ids = sorted(gcams.img)
+    sets = run_sets(all_ids, tap_moc)
+    res, cache = {}, {}
+
+    def frame_pos(E, fit, frames, targets):
+        key = (id(frames), E, fit, tuple(targets))   # E = {k, t} serves chain k target t and chain t target k
+        if key not in cache:
+            cam = gcams(E)
+            cache[key] = [pos_with(cam, fr, marks, fit, targets) for fr in frames]
+        return cache[key]
+
+    for chain, comp in comparators(groups).items():
+        stat = raw = filt = 0.0
+        khong = []
+        for t, E in comp.items():
+            targets = groups[t]
+            out_E = gcams.ids_without(E)
+            cam = gcams(E)
+            fa = frame_pos(E, out_E, dets_a, targets)
+            base = {}
+            for j in targets:
+                v = [p[j] for p in fa if p is not None and j in p]
+                if not v:
+                    raise KCError(f'chain {chain}: mark {j} has no baseline in H_a (KC3-2: the whole session)')
+                base[j] = np.mean(np.array(v), axis=0)
+            fits = sorted({S & out_E for S in sets}, key=lambda s: (len(s), sorted(s)))
+            small = set(fits[:n_small]) | {out_E}
+            for fit in fits:
+                pb = pos_with(cam, img_b, marks, fit, targets)
+                if pb is None:
+                    khong.append(dict(nhom_dich=t, tap=sorted(fit), vi='tinh'))
+                    continue
+                for j, v in pb.items():
+                    stat = max(stat, float(np.linalg.norm(v - base[j])))
+                if fit in small and dets_b:
+                    fb = frame_pos(E, fit, dets_b, targets)
+                    n_w = 0
+                    for j in targets:
+                        if j not in pb:
+                            continue
+                        seq = [None if p is None or j not in p else p[j] for p in fb]
+                        for v in seq:
+                            if v is not None:
+                                raw = max(raw, float(np.linalg.norm(v - pb[j])))
+                        for m in windows_by_time(times_b, seq, win_s, min_n, gap_s):
+                            n_w += 1
+                            filt = max(filt, float(np.linalg.norm(m - pb[j])))
+                    if n_w == 0:
+                        khong.append(dict(nhom_dich=t, tap=sorted(fit), vi='cua_so'))
+        res[chain] = dict(u_so_m=stat + filt, u_so_tho_m=stat + raw, tinh_m=stat, cua_so_m=filt, tho_m=raw,
+                          nguong_m=NGUONG_CO_DINH_M + stat + filt, nguong_tho_m=NGUONG_CO_DINH_M + stat + raw,
+                          khong_tinh_duoc=khong)
+    return res, dict(n_tap=len(sets), co_tap_luot=bool(tap_moc), cua_so_s=win_s, toi_thieu_mau=min_n, mat_dau_s=gap_s)
 
 
 def time_check(img_a, img_t, marks, groups, cams_a):
@@ -377,15 +433,17 @@ def time_check(img_a, img_t, marks, groups, cams_a):
 
 # ---------------------------------------------------------------- P7, A5 (frame noise of the static marks)
 def clip_dets(video, ids, max_frames=None):
-    """Per-frame refined corners {id: (4, 2)} of the floor marks `ids` in a clip (c7_measure detection)."""
+    """(times [s, from the presentation time], per-frame refined corners {id: (4, 2)}) of the floor marks `ids` in a
+    clip (c7_measure detection)."""
     det = cm.make_detector()
-    out = []
-    for _, _, g in cm.iter_frames(video, max_frames):
+    times, out = [], []
+    for _, t, g in cm.iter_frames(video, max_frames):
         d = cm.detect_refined(det, g)
+        times.append(t)
         out.append({i: np.asarray(c, float) for i, c in d.items() if i in ids})
     if not out:
         raise KCError(f'{video}: no frame read')
-    return out
+    return times, out
 
 
 def kiem_h(dets, ids):
@@ -493,6 +551,111 @@ def write_new(path, obj):
         json.dump(obj, f, indent=1, ensure_ascii=False)
 
 
+# ---------------------------------------------------------------- frame-by-frame P1 and coverage (tung_khung)
+def _read_csv(path):
+    with open(path, newline='', encoding='utf-8') as f:
+        return list(csv.DictReader(f))
+
+
+def run_frame_check(frames, khung, track, groups, khong_by_chain=None, max_thieu=COVER_MAX_MISS,
+                    max_gap_s=COVER_MAX_GAP_S):
+    """One run (design v4 5). frames: rows of frames.csv (idx, t_s, valid, moc_dung 'id;id', kc_ok_<k>); khung: rows
+    of kiem_cheo_khung.csv (khung, moc, nhom, ex, ey) [CODE_CAM design v2 2]; track: track.json (moc_loai with
+    id, t_bd). Returns dict(max_m, n_valid, ti_le_thieu, khoang_mat_max_s, thieu, ly_do).
+      P1 frame part: the RAW check error |(ex, ey)| on the frames used to score the car (valid), no median (KC1-4);
+      a mark is no target after its t_bd (moc_loai).
+      coverage: a valid frame has a check value when some kc_ok_<k> is 1; the run is short of checks when more than
+      max_thieu of its valid frames have none, or a gap without check is longer than max_gap_s, or a frame used a
+      mark set whose u_so could not be computed (KC3-2)."""
+    G = len(groups)
+    cols = {'idx', 't_s', 'valid', 'moc_dung'} | {f'kc_ok_{k}' for k in range(G)}
+    if frames and not cols <= set(frames[0]):
+        raise KCError(f'frames.csv: missing columns {sorted(cols - set(frames[0]))}')
+    t_bd = {int(m['id']): float(m['t_bd']) for m in track.get('moc_loai') or []}
+    t_of = {int(r['idx']): float(r['t_s']) for r in frames}
+    valid = [r for r in frames if str(r['valid']).strip() in ('1', 'True', 'true')]
+    vset = {int(r['idx']) for r in valid}
+    e_max = 0.0
+    for r in khung:
+        f, j = int(r['khung']), int(r['moc'])
+        if f not in vset or (j in t_bd and t_of[f] >= t_bd[j]):
+            continue
+        e_max = max(e_max, math.hypot(float(r['ex']), float(r['ey'])))
+    gmap = {i: k for k, g in enumerate(groups) for i in g}
+    bad_sets = set()
+    for chain, lst in (khong_by_chain or {}).items():
+        for x in lst:
+            bad_sets.add((chain, x['nhom_dich'], frozenset(x['tap'])))
+    comp = comparators(groups)
+    miss, gap, gap_max, ly_do, used_bad = 0, None, 0.0, [], False
+    for r in sorted(valid, key=lambda r: float(r['t_s'])):
+        t = float(r['t_s'])
+        ok = any(str(r[f'kc_ok_{k}']).strip() in ('1', 'True', 'true') for k in range(G))
+        if not ok:
+            miss += 1
+            gap = t if gap is None else gap
+            gap_max = max(gap_max, t - gap)
+        else:
+            if gap is not None:
+                gap_max = max(gap_max, t - gap)
+            gap = None
+        if bad_sets and not used_bad:
+            S = frozenset(int(x) for x in str(r['moc_dung']).split(';') if x.strip())
+            for chain, cmp_ in comp.items():
+                for tg, E in cmp_.items():
+                    outE = frozenset(i for i in S if gmap.get(i) not in E)
+                    if (chain, tg, outE) in bad_sets:
+                        used_bad = True
+    frac = miss / len(valid) if valid else 1.0
+    if frac > max_thieu:
+        ly_do.append(f'{frac * 100:.1f} % khung cham xe khong co so kiem (> {max_thieu * 100:.0f} %)')
+    if gap_max > max_gap_s:
+        ly_do.append(f'khoang mat kiem {gap_max:.2f} s (> {max_gap_s} s)')
+    if used_bad:
+        ly_do.append('khung dung tap moc ma u_so khong tinh duoc (KC3-2)')
+    if not valid:
+        ly_do.append('khong co khung cham xe')
+    return dict(max_m=e_max, n_valid=len(valid), ti_le_thieu=frac, khoang_mat_max_s=gap_max, thieu=bool(ly_do),
+                ly_do=ly_do)
+
+
+def tung_khung(a):
+    kc = _load_json(a.kiem_cheo)
+    if kc.get('version') != VERSION or kc.get('buoi') != a.buoi:
+        raise KCError(f'{a.kiem_cheo}: not a {VERSION} result of buoi {a.buoi}')
+    if kc.get('thu'):
+        raise KCError('kiem_cheo result made with --thu')
+    us = _load_json(a.u_so)
+    sha_u = sha256_file(a.u_so)
+    if sha_u != kc.get('u_so_sha256'):
+        raise KCError('u_so.json is not the one of the kiem_cheo result (sha256)')
+    groups = kc['nhom']
+    sha_ha = kc['sessions']['H_a']['sha256']
+    luot, e_all = {}, 0.0
+    for spec in a.luot:
+        rid, _, d = spec.partition('=')
+        if not d or rid in luot:
+            raise KCError(f'--luot {spec!r}: RUN=dir, each run once')
+        tr = _load_json(os.path.join(d, 'track.json'))
+        for k, want in (('u_so_sha256', sha_u), ('session_sha256', sha_ha), ('model_khoa', kc['model']),
+                        ('nhom', groups)):
+            if tr.get(k) != want:
+                raise KCError(f'{rid}: track {k} {tr.get(k)!r} is not {want!r} (KC1-10, KC2-1)')
+        if tr.get('moc_loai') and tr.get('cham_lai') != 2:
+            raise KCError(f'{rid}: marks excluded but the track was not rescored (cham_lai 2)')
+        r = run_frame_check(_read_csv(os.path.join(d, 'frames.csv')), _read_csv(os.path.join(d, 'kiem_cheo_khung.csv')),
+                            tr, groups, {c: v['khong_tinh_duoc'] for c, v in us['chuoi'].items()})
+        r['track_sha256'] = sha256_file(os.path.join(d, 'track.json'))
+        luot[rid] = r
+        e_all = max(e_all, r['max_m'])
+    out = dict(version=TUNG_KHUNG_VERSION, buoi=a.buoi, model=kc['model'], nhom=groups, moc=kc.get('moc'),
+               kiem_cheo_sha256=sha256_file(a.kiem_cheo), u_so_sha256=sha_u, session_sha256=sha_ha, cham_lai=True,
+               tung_khung_max_m=e_all, luot=luot, luot_thieu=sorted(r for r, v in luot.items() if v['thieu']),
+               luat=dict(max_thieu=COVER_MAX_MISS, max_gap_s=COVER_MAX_GAP_S))
+    write_new(a.out, out)
+    print(f"tung_khung: {len(luot)} luot, max {e_all * 1000:.2f} mm; thieu kiem: {out['luot_thieu']}")
+
+
 # ---------------------------------------------------------------- CLI
 def _load_json(p):
     with open(p, encoding='utf-8') as f:
@@ -520,7 +683,7 @@ def phan_tich(a):
     groups = session_groups(raw['H_a'], ids_a, a.groups)
     tap = None
     if a.tap_moc:
-        tap = [sorted(int(i) for i in S) for S in _load_json(a.tap_moc)['tap']]
+        tap = [sorted(int(i) for i in S) for S in _load_json(a.tap_moc)['tap']]   # every pass of KC2-1, merged
     # A3 over every clip H
     a3 = {n: a3_clip(img, mk, a.model, w, h, zc, a.L_max, sig) for n, (img, mk, w, h, zc) in clips.items()}
     roles = {i: r.get('vai_tro', '') for i, r in moc_rows.items()}
@@ -540,8 +703,12 @@ def phan_tich(a):
         if sha256_file(v) != raw[n].get('video_sha256'):
             raise KCError(f'{n}: {v} is not the video of the session (sha256)')
         dets[n] = clip_dets(v, set(clips[n][0]), a.max_frames)
-    uso, uso_info = u_so_v2(img_a, clips['H_b'][0], dets['H_b'], mk_a, groups, cams['H_a'], tap, a.win)
-    nz = {n: noise_clip(dets[n], clips[n][1], groups, cams[n]) for n in clips}
+    gc = GroupCams(img_a, mk_a, groups, a.model, *clips['H_a'][2:])
+    chuoi, uso_info = u_so_family(dets['H_a'][0], dets['H_a'][1], clips['H_b'][0], dets['H_b'][0], dets['H_b'][1],
+                                  mk_a, groups, gc, tap)
+    xe = chuoi['xe']
+    uso = max(xe['u_so_m'], xe['u_so_tho_m'])        # the car chain detects by both thresholds (CODE_CAM v2 3)
+    nz = {n: noise_clip(dets[n][1], clips[n][1], groups, cams[n]) for n in clips}
     allz = [(n, i, r) for n, d in nz.items() for i, r in d.items()]
     zp = max(allz, key=lambda t: t[2]['lech_max_m'])
     za = max(allz, key=lambda t: t[2]['lech_max_deg'])
@@ -553,8 +720,9 @@ def phan_tich(a):
                P1=dict(bo_nhom_max_m=worst[2], tung_khung_max_m=None, max_clip=worst[0], max_id=worst[1], buoi=a.buoi,
                        tung_khung='tu file tung_khung (lenh tung_khung, track sau cham lai cua CODE_CAM)',
                        theo_clip={n: {str(i): [float(v[0]), float(v[1])] for i, v in d.items()} for n, d in p1.items()}),
-               moc_dich=dict(nguong_m=NGUONG_CO_DINH_M, u_so_m=uso, buoi=a.buoi, **uso_info,
-                             nghia='nguong quyet dinh T = nguong_m + u_so_m; dich chua phat hien <= T + u_so_m (KC1-3)'),
+               moc_dich=dict(nguong_m=NGUONG_CO_DINH_M, u_so_m=uso, buoi=a.buoi, chuoi_xe=xe, **uso_info,
+                             nghia='u_so_m = max(u_so, u_so_tho) cua chuoi xe; nguong T = nguong_m + u_so; neu u_so '
+                                   'chan sai phep so thi dich chua phat hien <= T + u_so (KC1-3)'),
                P7=dict(lech_max_m=zp[2]['lech_max_m'], max_clip=zp[0], max_id=zp[1], buoi=a.buoi,
                        sd_max_m=max(r['sd_m'] for _, _, r in allz)),
                A5=dict(lech_max_deg=za[2]['lech_max_deg'], max_clip=za[0], max_id=za[1], buoi=a.buoi,
@@ -566,11 +734,10 @@ def phan_tich(a):
                                for n in clips if n != 'H_a'})
     os.makedirs(a.out, exist_ok=True)
     up = os.path.join(a.out, 'u_so.json')
-    write_new(up, dict(version=U_SO_VERSION, buoi=a.buoi, u_so_m=uso, nguong_m=NGUONG_CO_DINH_M + uso, nhom=groups,
-                       chi_tiet=uso_info, sessions=sess, tao_luc=datetime.datetime.now().isoformat(timespec='seconds')))
-    res['u_so_sha256'] = sha256_file(up)              # KC1-10: the final track must say it used this threshold
-    res['nguong_track_m'] = NGUONG_CO_DINH_M + uso
-    res['kiem_h'] = {n: kiem_h(dets[n], clips[n][0]) for n in clips}
+    write_new(up, dict(version=U_SO_VERSION, buoi=a.buoi, model=a.model, nhom=groups, chuoi=chuoi, chi_tiet=uso_info,
+                       sessions=sess, tao_luc=datetime.datetime.now().isoformat(timespec='seconds')))
+    res['u_so_sha256'] = sha256_file(up)              # KC1-10: the final track must say it used this file
+    res['kiem_h'] = {n: kiem_h(dets[n][1], clips[n][0]) for n in clips}
     write_new(os.path.join(a.out, 'kiem_cheo.json'), res)
     with open(os.path.join(a.out, 'a3_cap.csv'), 'x', newline='', encoding='utf-8') as f:
         cols = ['clip', 'i', 'j', 'L_m', 'dtheta_deg', 'sigma_thuoc_deg', 'mid_x', 'mid_y']
@@ -580,8 +747,8 @@ def phan_tich(a):
             for r in rows:
                 wr.writerow(dict({k: r.get(k, '') for k in cols[1:]}, clip=n))
     print(f"A3: {A3['n_cap']} cap, max {A3['max_deg']:.3f} deg, RMS {A3['rms_deg']:.3f} deg; "
-          f"P1 clip H: max {worst[2] * 1000:.2f} mm (moc {worst[1]}, {worst[0]}); u_so {uso * 1000:.2f} mm "
-          f"(tinh {uso_info['tinh_m'] * 1000:.2f} + cua so {uso_info['cua_so_m'] * 1000:.2f}); "
+          f"P1 clip H: max {worst[2] * 1000:.2f} mm (moc {worst[1]}, {worst[0]}); u_so xe {uso * 1000:.2f} mm "
+          f"(tinh {xe['tinh_m'] * 1000:.2f}, loc {xe['cua_so_m'] * 1000:.2f}, tho {xe['tho_m'] * 1000:.2f}); "
           f"P7 {zp[2]['lech_max_m'] * 1000:.2f} mm; A5 {za[2]['lech_max_deg']:.3f} deg"
           + ('  [THU: khong xuat duoc]' if a.thu else ''))
 
@@ -598,14 +765,11 @@ def check_compat(kc, tk):
     for k in ('buoi', 'model', 'nhom'):
         if tk.get(k) != kc.get(k):
             raise KCError(f'frame-by-frame file: {k} {tk.get(k)!r} differs from the kiem_cheo result {kc.get(k)!r}')
-    for k in ('u_so_sha256', 'nguong_track_m'):
-        if tk.get(k) != kc.get(k):
-            raise KCError(f'frame-by-frame file: {k} {tk.get(k)!r} is not the one of the kiem_cheo result (the track '
-                          'must be rescored with this threshold, KC1-10, KC2-1)')
+    for k, want in (('u_so_sha256', kc.get('u_so_sha256')), ('session_sha256', kc['sessions']['H_a']['sha256'])):
+        if tk.get(k) != want:
+            raise KCError(f'frame-by-frame file: {k} {tk.get(k)!r} is not the one of the kiem_cheo result (KC1-10)')
     if sorted(m['sha256'] for m in tk.get('moc') or []) != sorted(m['sha256'] for m in kc.get('moc') or []):
         raise KCError('frame-by-frame file: another marker file (KC1-10)')
-    if (kc.get('moc_dich') or {}).get('thieu'):
-        raise KCError('u_so has (group, set) pairs that could not be computed (KC2-2): not exported')
     if not tk.get('cham_lai'):
         raise KCError('frame-by-frame file: track not rescored after the mark-shift rule (cham_lai missing)')
     v = tk.get('tung_khung_max_m')
@@ -646,7 +810,7 @@ def kiem_h_cli(a):
     """In-session check right after a clip H (design v3 7): refuses below the share (quay lai clip H)."""
     s = _load_json(a.session)
     ids = [int(i) for i in s['fit_ids']]
-    r = kiem_h(clip_dets(a.video, set(ids), a.max_frames), ids)
+    r = kiem_h(clip_dets(a.video, set(ids), a.max_frames)[1], ids)
     low = [i for i, v in r['ti_le_moc'].items() if v < a.nguong]
     print(f"kiem_h: {r['n_khung']} khung, cung luc moi moc {r['ti_le_cung_luc'] * 100:.1f} % (can >= "
           f"{a.nguong * 100:.0f} %); moc duoi nguong: {low}")
@@ -665,7 +829,6 @@ def main(argv=None):
         p.add_argument(f'--video-{n}', dest=f'video_{n}')
     p.add_argument('--moc', nargs='+', required=True, help='measured marker CSVs (c7_marks_from_tape)')
     p.add_argument('--tap-moc', dest='tap_moc', help='JSON {"tap": [[ids], ...]}: mark sets used by track in the runs')
-    p.add_argument('--win', type=int, default=WIN_FRAMES)
     p.add_argument('--max-frames', dest='max_frames', type=int)
     p.add_argument('--groups', type=int, default=GROUPS)
     p.add_argument('--L-max', dest='L_max', type=float, default=L_MAX_M)
@@ -678,6 +841,13 @@ def main(argv=None):
     x.add_argument('--phan', action='append')
     x.add_argument('--ghi-chu', dest='ghi_chu')
     x.add_argument('--out', required=True)
+    t = sub.add_parser('tung_khung')
+    t.add_argument('--buoi', required=True)
+    t.add_argument('--kiem-cheo', dest='kiem_cheo', required=True)
+    t.add_argument('--u-so', dest='u_so', required=True)
+    t.add_argument('--luot', action='append', required=True, help='RUN=<track dir> (frames.csv, kiem_cheo_khung.csv, '
+                   'track.json of CODE_CAM)')
+    t.add_argument('--out', required=True)
     h = sub.add_parser('kiem_h')
     h.add_argument('--video', required=True)
     h.add_argument('--session', required=True)
@@ -685,7 +855,7 @@ def main(argv=None):
     h.add_argument('--max-frames', dest='max_frames', type=int)
     a = ap.parse_args(argv)
     try:
-        {'phan_tich': phan_tich, 'xuat': xuat, 'kiem_h': kiem_h_cli}[a.cmd](a)
+        {'phan_tich': phan_tich, 'xuat': xuat, 'kiem_h': kiem_h_cli, 'tung_khung': tung_khung}[a.cmd](a)
     except (KCError, OSError, ValueError, KeyError) as e:
         print(f'loi: {e}')
         print('#ket_qua,ma=2')
