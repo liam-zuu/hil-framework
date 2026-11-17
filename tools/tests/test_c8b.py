@@ -1000,6 +1000,19 @@ def test_cong_scorer_must_be_canonical_and_lost_run_needs_none():
     assert [r['run_id'] for r in d['dieu_2b']['per_level']['O1-F05']['runs']] == ['r1', 'r2']
 
 
+def test_cong_scorer_checked_when_every_node_lost():
+    # C8BS-R5-1: clock ok, nodes scored by another commit, every node lost: the scorer is still checked
+    lu = _luot()
+    g, l, s = _pair('r1y', 'O1-F05', 0.006, 'hong_he_do', [0.02, 0.02])
+    bad = dict(SCORER, commit='bbbbbbb', nut=[dict(SCORER['nut'][0], commit='bbbbbbb')])
+    l = dict(l, scorer=bad, nhanh_tick=[])
+    with pytest.raises(CU.UError, match='scorer not from commit_hil'):
+        CU.cong(K, _plan(), [('1', 'r1y', g, l, s)] + lu, ['O1-F05'], 'bo_tick', 'x', meta=META)
+    l = dict(l, scorer=SCORER)                       # same run scored by the planned commit: lost, rerun accepted
+    d = CU.cong(K, _plan(), [('1', 'r1y', g, l, s)] + lu, ['O1-F05'], 'bo_tick', 'x', meta=META)
+    assert [r['run_id'] for r in d['dieu_2b']['per_level']['O1-F05']['runs']] == ['r1', 'r2']
+
+
 def test_repo_state_marks_untracked_scorer(tmp_path):
     p = os.path.join(HERE, '..', 'c8b_tmp_untracked_scorer.py')
     open(p, 'w').write('# temporary, untracked' + chr(10))
