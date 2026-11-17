@@ -106,6 +106,9 @@ TRAJ_NEW   = 1 << 1
 # MISO byte 16 bit 0 = SWA of the last iBUS frame the H7 started.
 CMD_SWA_ON = 1 << 3
 STATUS_SWA = 1 << 0
+# Fault injection batch 2 (CODE_FAULT2; design 2026-11-15 section 5): MOSI byte 20 bit 4 = 1 -> the H7 turns
+# its iBUS port off (after a 3-frame filter, as the SWA bit). hil_protocol.h HIL_CMD_IBUS_OFF (H7 part later).
+CMD_IBUS_OFF = 1 << 4
 
 # Must match hil_protocol.h defines exactly — field order: [ω1,ω2,ω3,ω4, x,y,θ, vx,vy,wz]
 STATE_RANGES: list[float] = [40.0, 40.0, 40.0, 40.0,   # omega[0..3]  HIL_OMEGA_MAX

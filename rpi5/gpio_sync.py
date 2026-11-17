@@ -105,6 +105,23 @@ class GPIOSync:
             pass
         _lgpio.gpio_write(self._handle, self.pin, 0)
 
+    # ── Marker pin, split rise / fall (S06 T3, spec line T3: W9, Y15) ────
+
+    def rise(self) -> None:
+        """Raise the pin (marker edge). S06 T3: called right before the SPI transfer of a marked frame,
+        the matching fall() right after it; the ESP32 under s06_load timestamps this rising edge
+        (GPIO38). Counted in pulse_count like pulse(). No-op in simulate mode."""
+        self._n_pulses += 1
+        if self.simulate:
+            return
+        _lgpio.gpio_write(self._handle, self.pin, 1)
+
+    def fall(self) -> None:
+        """Lower the pin after rise(). No-op in simulate mode."""
+        if self.simulate:
+            return
+        _lgpio.gpio_write(self._handle, self.pin, 0)
+
     # ── Cleanup ───────────────────────────────────────────────────────────
 
     def close(self) -> None:

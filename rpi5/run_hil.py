@@ -528,6 +528,11 @@ def _parse_args() -> argparse.Namespace:
                    help='I8: RC switch SWA in the iBUS frames of the H7 (DUT motors). auto: with '
                         '--finite-run on in RUN and STOPPING only; without it on when a trajectory '
                         'runs and no omega mode is set, off otherwise (diagnostics). on / off: fixed')
+    p.add_argument('--marker',        choices=('t3', '10hz'), default=None,
+                   help='S06 T3 marker pin (GPIO17, to the ESP32 GPIO38 under s06_load): rise right before the '
+                        'transfer of a marked frame, fall after it, no sync pulse on the other frames. t3: '
+                        'frames that retime a wheel (--omega-schedule of t3_schedule.py); 10hz: every 100th '
+                        'frame (clock ESP32 <-> Pi in the other s06_load runs). Default: the pulse of every frame')
     return p.parse_args()
 
 
@@ -567,6 +572,13 @@ def load_faults(args, n_omega_modes: int, hil_cfg, load_schedule: bool, lifted: 
     try:
         sched = fault_schedule.load(args.faults, run_ms, imu_source, plant)
         fault_plant.check_params(sched.rows, nominal)
+        if any(r.fault == 'ibus_loss' for r in sched.rows):     # batch 2 iBUS loss (CODE_FAULT2)
+            if not args.mock and not fault_schedule.IBUS_LOSS_H7:
+                raise fault_schedule.ScheduleError('ibus_loss needs the H7 part (byte 20 bit 4), not merged yet: '
+                                                   'on the bench it would change nothing (--mock only)')
+            if getattr(hil_cfg, 'swa_mode', 'off') == 'off':
+                raise fault_schedule.ScheduleError('ibus_loss with --swa off: the DUT motors are never on, '
+                                                   'the loss shows nothing')
         return sched
     except (OSError, fault_schedule.ScheduleError) as exc:
         raise SystemExit(f'--faults {args.faults}: {exc}')
@@ -657,6 +669,7 @@ def main() -> int:
         rt_tune      = not args.no_rt_tune,
         heavy_block  = heavy_block,
         load_schedule = load_id,
+        marker_mode  = args.marker or '',
     )
     log.info('IMU noise (L72): %s', 'off' if hil_cfg.imu_noise is None else
              hil_cfg.imu_noise.describe())

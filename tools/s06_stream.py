@@ -252,6 +252,9 @@ def enc_stream(eseq, t_before, t0_us: float, t1_us: float, marks: Optional[dict]
 
 
 QSEQ_FIELDS = {'J': (7,), 'I': (12,), 'R': (4,), 'P': (10, 11), 'S': (15, 16)}   # P 11: + run (manifest lượt)
+# S06 T3 (s06_load, định dạng CODE đồng ý 17/11): T3,qseq,t_us,src,gpio,lvl,gseq,run; src là một chữ, còn lại số nguyên
+QSEQ_FIELDS['T3'] = (8,)
+T3_SRC = frozenset('MDNOL')
 
 
 FLOAT_FROM = {'I': 9, 'S': 15}     # first field printed with %g/%f (s06_load.c); the fields before it are integers
@@ -273,6 +276,10 @@ def _line_ok(p) -> bool:
     received is never dropped later."""
     if p[0] not in QSEQ_FIELDS or len(p) not in QSEQ_FIELDS[p[0]]:
         return False
+    if p[0] == 'T3':                      # trường src (chữ) kiểm riêng, các trường còn lại là số nguyên
+        if p[3] not in T3_SRC:
+            return False
+        p = p[:3] + p[4:]
     n = FLOAT_FROM.get(p[0], len(p))
     try:
         for x in p[1:n]:

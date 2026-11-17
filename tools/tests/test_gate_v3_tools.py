@@ -239,6 +239,45 @@ def test_refused_mapping_cap_not_on_final_hil(ds):
     _hil_check(d, clock, **fh)                                             # 3 in a row: stopped
     with pytest.raises(rl.LogError, match='lost runs in a row'):
         rl.begin(d, 'H', 'RQ2', 'HIL', 'PID', 'O1-F05', '0.5', 'final_hil', gain_set='RQ2-INIT-PID/G0')
+
+
+def _final_hil_tool_error(d, clock, gain_set='RQ2-INIT-PID/G0'):
+    """A final_hil run lost to a HIL tool error of the bench (L50: CRC MISO, empty frame, SPIfix stuck)."""
+    rl.begin(d, 'H', 'RQ2', 'HIL', 'PID', 'O1-F05', '0.5', 'final_hil', gain_set=gain_set)
+    rl.step(d, 'run')
+    clock[0] += dt.timedelta(seconds=60)
+    return _end(d, 'hong_he_do', fail_cause='crc_miso_FAKE', results_dir='r')
+
+
+@pytest.mark.parametrize('order', [('map', 'tool', 'map'), ('tool', 'map', 'tool'), ('tool', 'tool', 'map')])
+def test_v3_33_final_hil_refused_mapping_counts_with_tool_errors(ds, order):
+    # S05 v3.33 §4.6 (B82-10; Liam 15/11 THESIS_B8 "Đếm chung N = 3 liên tiếp (Recommended)"): a final_hil run
+    # refused by the mapping is lost to the measurement and is counted together with the HIL tool errors: after
+    # N = 3 lost runs in a row (any cause of the bench) in one condition of one gain set, the condition stops
+    d, clock = ds
+    fh = dict(stage='final_hil', campaign='RQ2', gain_set='RQ2-INIT-PID/G0')
+    for k, cause in enumerate(order):
+        if cause == 'map':
+            _hil_check(d, clock, **fh)
+        else:
+            _final_hil_tool_error(d, clock)
+        if k < len(order) - 1:
+            rl.summary(d)                                                  # fewer than 3 in a row: not stopped
+    with pytest.raises(rl.LogError, match='lost runs in a row'):
+        rl.begin(d, 'H', 'RQ2', 'HIL', 'PID', 'O1-F05', '0.5', 'final_hil', gain_set='RQ2-INIT-PID/G0')
+    _final_hil_tool_error(d, clock, gain_set='RQ2-INIT-PID/G1')           # another gain set: its own streak
+    rl.summary(d)
+
+
+def test_v3_33_a_judged_final_hil_run_restarts_the_streak(ds):
+    d, clock = ds
+    fh = dict(stage='final_hil', campaign='RQ2', gain_set='RQ2-INIT-PID/G0')
+    _hil_check(d, clock, **fh)
+    _final_hil_tool_error(d, clock)
+    _hil_check(d, clock, mapped=True, **fh)                                # judged: the streak restarts
+    _final_hil_tool_error(d, clock)
+    _hil_check(d, clock, **fh)
+    rl.begin(d, 'H', 'RQ2', 'HIL', 'PID', 'O1-F05', '0.5', 'final_hil', gain_set='RQ2-INIT-PID/G0')   # 2 in a row
     rl.summary(d)
 
 

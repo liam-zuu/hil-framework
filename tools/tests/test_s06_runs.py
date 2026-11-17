@@ -131,7 +131,8 @@ def test_required_tools_are_the_spec_table():
         'T1': t2, 'T2': t2, 'T10': t2, 'T3b': ['t3b_score.py', 's06_esp32_check.py'],
         'T4': ['s06_t4_values.py', 's06_esp32_check.py'], 'T5': ['s06_t5_score.py', 's06_esp32_check.py'],
         'T6': ['s06_t6_check.py', 's06_esp32_check.py'],
-        'CB5': ['s06_t2_check.py', 's06_esp32_check.py', 's06_frames_decode.py', 's06_enc_alive.py']}
+        'CB5': ['s06_t2_check.py', 's06_esp32_check.py', 's06_frames_decode.py', 's06_enc_alive.py'],
+        'T3': ['s06_t3_score.py', 's06_esp32_check.py']}                # CB3 17/11 (THESIS 6102a2b6)
 
 
 def test_every_required_tool_closes_the_run(f, tmp_path, capsys):
@@ -145,7 +146,7 @@ def test_every_required_tool_closes_the_run(f, tmp_path, capsys):
     assert status(f, capsys)[0] == 0
 
 
-@pytest.mark.parametrize('test', ['T3', 'T7', 'T8', 'T9', 'T11'])
+@pytest.mark.parametrize('test', ['T7', 'T8', 'T9', 'T11'])
 def test_test_without_a_list_stays_open(f, tmp_path, capsys, test):
     opened(f, test=test)
     result(f, tmp_path, '#ket_qua,ma=0\n')
