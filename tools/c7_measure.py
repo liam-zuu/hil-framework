@@ -1079,7 +1079,7 @@ def track_chains(frames, video_name, video_sha, session, tag_offset=None, gates=
     ctx = ChainCtx(session)
     marks = ctx.marks
     ref = {int(i): np.array(v) for i, v in session['ref_centres_px'].items()}
-    final_why = verify_final(lich, u_so, u_so_sha, session, session_sha, run, dets_sha) if lich is not None         else ['no schedule']
+    final_why = verify_final(lich, u_so, u_so_sha, session, session_sha, run, dets_sha, frames) if lich is not None         else ['no schedule']
     side, kappa, plumb = session['car_side_m'], session['kappa'], session['plumb_xy_m']
     off = tag_offset if tag_offset is not None else session['tag_offset']
     sched, q = None, None
@@ -1223,7 +1223,7 @@ def build_lich(session, session_sha, runs, u_so=None, u_so_sha=None, prev=None, 
     tap_moc sha) equals prev's; a repeat of an older step = cycle; more than 10 steps = not converged. Returns lich."""
     ctx = ChainCtx(session)
     empty = dict(loai={}, moc_nghi=[], nen_doi=[], bat_dinh_moc=[])
-    clips = [dict(name=n, kind=k, dets_sha256=s, n=len(f)) for n, k, f, s in runs]
+    clips = [dict(name=n, kind=k, dets_sha256=s, n=len(f), frames_fp=frames_fingerprint(f)) for n, k, f, s in runs]
     if len({c['name'] for c in clips}) != len(clips):
         raise ValueError('run names must be unique')
     if prev is not None:
@@ -1317,7 +1317,21 @@ LICH_VERSION = 'c7_lich_v3'                  # v2 (Codex C33-5b): converged = re
                                              # dets sha, order), the final pass checks its run and detections
 
 
-def verify_final(lich, u_so, u_so_sha, session, session_sha, run=None, dets_sha=None):
+def frames_fingerprint(frames):
+    """SHA-256 of the detections THEMSELVES (Codex round 4 of the 33-mark code: a declared file sha does not bind the
+    frames an API caller passes): frame idx, time and every (id, 4 corners) in ID order, as float64 / int64 bytes."""
+    h = hashlib.sha256()
+    for idx, t, d in frames:
+        h.update(np.array([idx], np.int64).tobytes())
+        h.update(np.array([t], np.float64).tobytes())
+        for i in sorted(d):
+            h.update(np.array([i], np.int64).tobytes())
+            h.update(np.ascontiguousarray(np.asarray(d[i], np.float64).reshape(4, 2)).tobytes())
+        h.update(b'|')
+    return h.hexdigest()
+
+
+def verify_final(lich, u_so, u_so_sha, session, session_sha, run=None, dets_sha=None, frames=None):
     """Reasons ([] = none) why lich.json cannot be the converged schedule of a final pass (Codex C33-5b: the final
     pass re-checks, it does not trust the file's hoi_tu): version, session and u_so sha, u_so source (check_u_so_source),
     the thresholds used are those of u_so, the stored sha of tap_moc and of the schedule body recomputed, the schedule
@@ -1344,6 +1358,8 @@ def verify_final(lich, u_so, u_so_sha, session, session_sha, run=None, dets_sha=
     names = [c.get('name') for c in clips]
     if run is None or dets_sha is None or run not in names or clips[names.index(run)].get('dets_sha256') != dets_sha:
         why.append(f'run {run!r} with detections {dets_sha!r} is not a clip of the schedule')
+    elif frames is None or clips[names.index(run)].get('frames_fp') != frames_fingerprint(frames):
+        why.append(f'the frames given are not the detections run {run!r} of the schedule was built on (fingerprint)')
     body = dict(chuoi=lich.get('chuoi'), nguong_dung=lich.get('nguong_dung'), tap_moc_sha256=lich.get('tap_moc_sha256'),
                 clips=clips)
     if md.schedule_sha256(body) != lich.get('lich_sha256'):
@@ -1618,7 +1634,7 @@ def track_cli_chains(a, sess, off, gates, gsrc):
         if lich is not None and lich.get('u_so_sha256') != u_sha:
             raise ValueError('u_so.json is not the one the schedule was built with (sha256)')
         if lich is not None and not a.thu:
-            why = verify_final(lich, u_so, u_sha, sess, sess_sha, a.run, sha256(a.dets))
+            why = verify_final(lich, u_so, u_sha, sess, sess_sha, a.run, sha256(a.dets), load_dets(a.dets)[0])
             if why:
                 raise ValueError(f'lich.json is not a converged final schedule: {why} (run the lich steps on, or --thu)')
     shapes = None
