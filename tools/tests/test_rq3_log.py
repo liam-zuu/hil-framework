@@ -94,14 +94,15 @@ def end_(d, outcome, gate=None, **kw):
 def test_migrate_adds_columns_keeps_values_and_is_idempotent(ds):
     d, _ = ds
     before = {n: rows(os.path.join(d, n)) for n in (rl.TUNING, rl.EFFORT)}
-    assert rl.migrate(d) == {rl.TUNING: 'migrated', rl.EFFORT: 'migrated', rl.HWFAIL: 'ok'}
+    assert rl.migrate(d) == {rl.TUNING: 'migrated', rl.EFFORT: 'migrated', rl.HWFAIL: 'ok',
+                             rl.U_MOC: 'created', rl.TIEN_DE: 'created'}      # C8b v3 §5 (RC1-5)
     for n, cols in ((rl.TUNING, rl.TUNING_COLS), (rl.EFFORT, rl.EFFORT_COLS)):
         after = rows(os.path.join(d, n))
         assert list(after[0]) == cols and len(after) == len(before[n])
         for b, a in zip(before[n], after):
             assert all(a[k] == v for k, v in b.items())          # every old value kept
             assert all(a[k] == '' for k in cols if k not in b)
-    assert rl.migrate(d) == {rl.TUNING: 'ok', rl.EFFORT: 'ok', rl.HWFAIL: 'ok'}
+    assert rl.migrate(d) == {rl.TUNING: 'ok', rl.EFFORT: 'ok', rl.HWFAIL: 'ok', rl.U_MOC: 'ok', rl.TIEN_DE: 'ok'}
 
 
 def test_migrate_refuses_unknown_columns(ds):

@@ -63,7 +63,8 @@ class World:
     def save(self):
         rl._write_all(os.path.join(self.ds, rl.TUNING), rl.TUNING_COLS, self.rows)
 
-    def run(self, it, session='S1', date='2026-11-20', outcome='dat', luoi=False, stage='screen', block=''):
+    def run(self, it, session='S1', date='2026-11-20', outcome='dat', luoi=False, stage='screen', block='',
+            so_h=True):
         uid = f'{session}:{it}'
         rd = self.tmp / 'runs' / uid.replace(':', '_')
         frames = wt(rd / 'frames.csv', f'FAKE frames {uid}')
@@ -82,6 +83,10 @@ class World:
                               wall_start=f'{date}T08:{it:02d}:00', wall_end=f'{date}T08:{it:02d}:30'))
         self.runs[uid] = dict(rd=rd, frames=frames, gio=gio, score=score)
         self.save()
+        if so_h:                                       # RC1-2: a run is judged after its clip H comparison
+            rl.append_row(os.path.join(self.ds, rl.SO_H), rl.SO_H_COLS,
+                          dict(run_uid=uid, outcome_tam=outcome, outcome_sau=outcome, flags='', vuot='false',
+                               D_H_mm='0.5', ghi_luc='2026-01-01T00:00:00'))
         return uid
 
     def u(self, uid, lan='H0', ok=True, xy=0.005, psi=0.20, frames=None, name=None, drop=(), **over):
@@ -113,13 +118,14 @@ class World:
                  nguon=[dict(vai_tro='u_so', duong_dan=self.u_so, sha256=sha(self.u_so)),
                         dict(vai_tro='sessions', duong_dan=self.ses, sha256=sha(self.ses))],
                  sha256=dict(u_so=sha(self.u_so), sessions={'H_a': sha(self.ses)},
-                             luot={k: dict(frames=sha(p)) for k, p in luot.items()}),
+                             luot={k: (dict(frames=sha(p)) if isinstance(p, str) else
+                                       dict(frames=sha(p[0]), lan_cham=p[1])) for k, p in luot.items()}),
                  luot=list(luot), luot_thieu_kiem=list(thieu), mau_thuan=[], tap_neo={}, h1_ho_tro=h1)
         d.update(over)
         return wj(self.tmp / 'td' / (name or f'{session}_{kq}.json'), d)
 
     def after(self):
-        return {r['run_uid']: r for r in rl.apply_after(rl.live_rows(rl.read_rows(os.path.join(self.ds, rl.TUNING))),
+        return {r['run_uid']: r for r in rl.apply_moc(rl.live_rows(rl.read_rows(os.path.join(self.ds, rl.TUNING))),
                                                         self.ds)}
 
     def moc(self):
@@ -423,12 +429,12 @@ def h1_setup(w, uid, h1_in_luot=True, thieu=(), xy_h1=0.005):
     rl.u_moc(w.ds, uid, 'H1', w.u(uid, lan='H1', frames=f1, xy=xy_h1), w.gate)
     luot = {f'L{k}': w.runs[u]['frames'] for k, u in enumerate(w.runs)}
     if h1_in_luot:
-        luot[f"L{list(w.runs).index(uid)}@H1"] = f1
+        luot[f"L{list(w.runs).index(uid)}@H1"] = (f1, 'H1')
     rl.tien_de(w.ds, 'S1', w.td(luot=luot, thieu=thieu, h1=h1_in_luot))
 
 
 def test_8b_h1_covered_and_below_the_lock_keeps_dat(w):
-    a, b = w.run(1), w.run(2)
+    a, b = w.run(1, so_h=False), w.run(2)
     rl.u_moc(w.ds, b, 'H0', w.u(b), w.gate)
     h1_setup(w, a)
     got = w.moc()
@@ -436,14 +442,14 @@ def test_8b_h1_covered_and_below_the_lock_keeps_dat(w):
 
 
 def test_8b_h1_above_the_lock(w):
-    a = w.run(1)
+    a = w.run(1, so_h=False)
     h1_setup(w, a, xy_h1=0.02)
     assert w.moc()[a]['moc_flags'] == 'u_moc_vuot'
     assert w.moc()[a]['U_moc_xy_m'] == '0.02'
 
 
 def test_8b_h1_not_covered_lowers_that_run_only(w):
-    a, b = w.run(1), w.run(2)
+    a, b = w.run(1, so_h=False), w.run(2)
     rl.u_moc(w.ds, b, 'H0', w.u(b), w.gate)
     h1_setup(w, a, h1_in_luot=False)
     got = w.moc()
@@ -451,7 +457,7 @@ def test_8b_h1_not_covered_lowers_that_run_only(w):
 
 
 def test_8b_h1_id_in_luot_thieu_kiem(w):
-    a, b = w.run(1), w.run(2)
+    a, b = w.run(1, so_h=False), w.run(2)
     rl.u_moc(w.ds, b, 'H0', w.u(b), w.gate)
     h1_setup(w, a, thieu=('L0@H1',))
     got = w.moc()
@@ -459,16 +465,16 @@ def test_8b_h1_id_in_luot_thieu_kiem(w):
 
 
 def test_8b_h1_row_missing_and_so_h_row_removed(w):
-    a = w.run(1)
+    a = w.run(1, so_h=False)
     h1_setup(w, a)
     w.drop_row(rl.U_MOC, lambda r: r['lan'] != 'H1')
     assert w.moc()[a]['moc_flags'] == 'cho_u_moc'
     rl._write_all(os.path.join(w.ds, rl.SO_H), rl.SO_H_COLS, [])
-    assert w.moc()[a]['run_outcome'] == 'dat'            # no so-h above eps_H: H0 alone
+    assert w.moc()[a]['moc_flags'] == 'cho_so_h'         # RC1-2: no so-h row, the scorings needed are unknown
 
 
 def test_8b_h1_row_without_so_h_stops(w):
-    a = w.run(1)
+    a = w.run(1, so_h=False)
     h1_setup(w, a)
     rl._write_all(os.path.join(w.ds, rl.SO_H), rl.SO_H_COLS, [])
     with pytest.raises(rl.LogError, match='H1'):
@@ -481,6 +487,7 @@ def test_10_summary_counts_and_gate_file(w, monkeypatch):
     # the row checks of R134 / O1 v11.33 (boot answers, gate columns) are tested elsewhere; these FAKE rows lack them
     monkeypatch.setattr(rl, 'check_query_rows', lambda tun, ds: None)
     monkeypatch.setattr(rl, 'check_gate_rows', lambda tun, gate_file=None: None)
+    monkeypatch.setattr(rl, 'apply_so_h', lambda tun, ds: tun)        # raw so-h rows (World); real ones: demo tests
     a, b = w.run(1), w.run(2)
     rl.u_moc(w.ds, a, 'H0', w.u(a, xy=0.02), w.gate)                  # lowered
     rl.tien_de(w.ds, 'S1', w.td())                                     # b waits for its U file
@@ -493,11 +500,7 @@ def test_10_summary_counts_and_gate_file(w, monkeypatch):
 
 def test_11_freeze_confirm_block(w, monkeypatch):
     monkeypatch.setattr(rl, 'apply_so_h', lambda tun, ds: tun)        # so-h rows written directly below
-    a = w.run(1, stage='confirm', block='B1')
-    for uid in (a,):
-        rl.append_row(os.path.join(w.ds, rl.SO_H), rl.SO_H_COLS,
-                      dict(run_uid=uid, outcome_tam='dat', outcome_sau='dat', flags='', vuot='false',
-                           ghi_luc='2026-01-01T00:00:00'))
+    a = w.run(1, stage='confirm', block='B1')                         # its so-h row: ghi_luc 2026-01-01
     gain = wt(w.tmp / 'gain_A_PID_G1.json', '{"FAKE": 1}')
     with pytest.raises(rl.LogError, match='not all dat'):             # no U / premise files: chua_ket_luan
         rl.freeze(w.ds, 'A-PID', 'khoi_xac_nhan_dat', 'A-PID/G1', gain, at='2099-01-01T00:00:00')
@@ -521,7 +524,8 @@ def test_12_final_table_uses_the_outcome_after_both(w, monkeypatch):
     assert seen == [1]
 
 
-def test_12_begin_does_not_use_the_rule(w):
+def test_12_begin_does_not_use_the_rule(w, monkeypatch):
+    monkeypatch.setattr(rl, 'apply_so_h', lambda tun, ds: tun)        # raw so-h rows (World)
     a = w.run(1)
     rl.u_moc(w.ds, a, 'H0', w.u(a, xy=0.02), w.gate)                  # a lowered by the rule
     run = rl.begin(w.ds, 'S1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G1')
@@ -550,7 +554,7 @@ def test_s6_10_luot_is_the_list_of_ids(w):
 
 def test_s6_10_h1_not_supported_lowers_every_run_needing_h1(w):
     """TD3-1 of CODE_KIEMCHEO: h1_ho_tro false, even with the H1 frames listed, every run needing H1 is lowered."""
-    a, b = w.run(1), w.run(2)
+    a, b = w.run(1, so_h=False), w.run(2)
     rl.u_moc(w.ds, b, 'H0', w.u(b), w.gate)
     h1_setup(w, a)
     p = os.path.join(w.ds, rl.TIEN_DE)
@@ -564,7 +568,7 @@ def test_s6_10_h1_not_supported_lowers_every_run_needing_h1(w):
 
 def test_s6_10_h1_frames_under_the_h0_id_do_not_cover_h1(w):
     """TD3-1: the H1 scoring with the same frames sha256 as H0 (one id in luot) is not an H1 coverage, h1_ho_tro or not."""
-    a = w.run(1)
+    a = w.run(1, so_h=False)
     rd, f0 = w.runs[a]['rd'], w.runs[a]['frames']
     sf = wj(rd / 'score_final.json', {'outcome': 'dat', 'calib_drift': {'h1_score': {'frames_sha256': sha(f0)}}})
     rl.append_row(os.path.join(w.ds, rl.SO_H), rl.SO_H_COLS,
@@ -574,3 +578,123 @@ def test_s6_10_h1_frames_under_the_h0_id_do_not_cover_h1(w):
     rl.u_moc(w.ds, a, 'H1', w.u(a, lan='H1'), w.gate)
     rl.tien_de(w.ds, 'S1', w.td(h1=True))                       # luot = [L0] with the frames of H0 = H1
     assert w.moc()[a]['moc_flags'] == 'tien_de_khong_phu_h1'
+
+
+def test_rc1_3_h1_record_needs_lan_cham_h1(w):
+    """RC1-3: a second id with the H1 frames but no lan_cham is a record of H0, not a coverage of H1."""
+    a = w.run(1, so_h=False)
+    h1_setup(w, a, h1_in_luot=False)
+    p = os.path.join(w.ds, rl.TIEN_DE)
+    d = json.load(open(rl.read_rows(p)[0]['file']))
+    rl._write_all(p, rl.TIEN_DE_COLS, [])
+    d['luot'].append('X')
+    d['sha256']['luot']['X'] = dict(frames=sha(w.runs[a]['f1']))       # no lan_cham: H0
+    d['h1_ho_tro'] = True
+    rl.tien_de(w.ds, 'S1', wj(w.tmp / 'td' / 'h1_no_lan.json', d))
+    assert w.moc()[a]['moc_flags'] == 'tien_de_khong_phu_h1'
+
+
+def test_rc1_4_gate_sha_of_every_u_row(w):
+    a, b = w.run(1), w.run(2)
+    full(w, a, b)
+    p = os.path.join(w.ds, rl.U_MOC)
+    rows = rl.read_rows(p)
+    rows[1]['gate_file_sha256'] = 'b' * 64
+    rl._write_all(p, rl.U_MOC_COLS, rows)
+    with pytest.raises(rl.LogError, match='gate_file_sha256 of the row'):
+        w.after()
+
+
+# ── the demo: the whole chain with the real so-h (RC1-1, RC1-2, RC1-6) ─────────────────────────────────────────
+
+@pytest.fixture
+def demo(tmp_path):
+    d = str(tmp_path / 'dry')
+    rl.demo(d)
+    return d
+
+
+def _after(ds):
+    return {r['run_uid']: r for r in rl.apply_after(rl.live_rows(rl.read_rows(os.path.join(ds, rl.TUNING))), ds)}
+
+
+def _rows_of(path):
+    with open(path, newline='', encoding='utf-8') as f:
+        return list(csv.DictReader(f))
+
+
+def _drop(ds, name, cols, keep):
+    rl._write_all(os.path.join(ds, name), cols, [r for r in rl.read_rows(os.path.join(ds, name)) if keep(r)])
+
+
+def _final_dat(ds):
+    return next(r for r in rl.read_rows(os.path.join(ds, rl.TUNING))
+                if r['session_id'] == 'FAKE-F1' and r['run_outcome'] == 'dat')
+
+
+def _table(ds, out):
+    import s05_final_table as T
+    os.makedirs(out)
+    assert T.main(['table', '--dataset', ds, '--out', out, '--gate-file', os.path.join(ds, 'FAKE_gate_c8.json')]) == 0
+    return {r['run_uid']: r for r in _rows_of(os.path.join(out, 'S05_final_runs.csv'))}
+
+
+def test_demo_chain_keeps_every_judged_car_run(demo):
+    got = _after(demo)
+    car = [r for r in got.values() if r['platform'] == 'HW' and 'moc_flags' in r]
+    # FAKE-A1:2 (khong_dat), the final dat run; FAKE-A1:3 is chua_ket_luan at so-h (split), not under the rule
+    assert len(car) == 2 and all(r['moc_flags'] == '' and r['U_moc_xy_m'] == '0.004' for r in car)
+    rows = {r['campaign']: r for r in _rows_of(os.path.join(demo, rl.SUMMARY))}
+    assert all((r['moc_cho_n'], r['moc_ha_n']) == ('0', '0') for r in rows.values())
+
+
+def test_demo_final_table_exports_the_outcome_flags_and_u(demo, tmp_path):
+    uid = _final_dat(demo)['run_uid']
+    t = _table(demo, str(tmp_path / 't1'))
+    assert (t[uid]['outcome'], t[uid]['moc_flags'], t[uid]['U_moc_xy_m']) == ('dat', '', '0.004')
+    _drop(demo, rl.TIEN_DE, rl.TIEN_DE_COLS, lambda r: r['session_id'] != 'FAKE-F1')
+    t = _table(demo, str(tmp_path / 't2'))
+    assert (t[uid]['outcome'], t[uid]['moc_flags']) == ('chua_ket_luan', 'cho_tien_de')
+
+
+def test_demo_rc1_1_vuot_edited_by_hand_stops(demo):
+    uid = _final_dat(demo)['run_uid']
+    p = os.path.join(demo, rl.SO_H)
+    rows = rl.read_rows(p)
+    for r in rows:
+        if r['run_uid'] == uid:
+            r['vuot'] = 'true'
+    rl._write_all(p, rl.SO_H_COLS, rows)
+    with pytest.raises(rl.LogError, match='vuot'):
+        _after(demo)
+
+
+def test_demo_rc1_2_so_h_row_removed_waits(demo):
+    uid = _final_dat(demo)['run_uid']
+    _drop(demo, rl.SO_H, rl.SO_H_COLS, lambda r: r['run_uid'] != uid)
+    got = _after(demo)[uid]
+    assert (got['run_outcome'], got['moc_flags']) == ('chua_ket_luan', 'cho_so_h')
+    row = {r['campaign']: r for r in rl.summary(demo, gate_file=rl.read_gate_file(
+        os.path.join(demo, 'FAKE_gate_c8.json')))}['A-PID']
+    assert row['moc_cho_n'] == '1'
+
+
+def test_demo_real_so_h_above_eps_needs_and_checks_h1(demo):
+    """so-h above eps_H with H0 and H1 both khong_dat (real so-h, checked by check_score_final): U of H1 needed;
+    with it, the premise (h1_ho_tro false) does not cover H1, so the run is chua_ket_luan (S6-10b TD3-1)."""
+    uid = 'FAKE-A1:2'
+    r = next(x for x in rl.read_rows(os.path.join(demo, rl.TUNING)) if x['run_uid'] == uid)
+    d = r['results_dir']
+    gf = rl.read_gate_file(os.path.join(demo, 'FAKE_gate_c8.json'))
+    f1 = rl.fake_frames(os.path.join(d, 'h1'), 'H1 ' + uid)
+    h1 = dict(FAKE=True, outcome='khong_dat', frames_sha256=sha(f1), gate_v3=rl.floor_gate(rl.fake_gate(
+        e_trk=0.5, gate_file=gf, level=r['trajectory'], stage='screen')))
+    _drop(demo, rl.SO_H, rl.SO_H_COLS, lambda x: x['run_uid'] != uid)
+    rl.so_h(demo, uid, rl.fake_score_final(d, 3.0, h1=h1, name='sf_h1.json'))
+    got = _after(demo)[uid]
+    assert (got['run_outcome'], got['moc_flags']) == ('chua_ket_luan', 'tien_de_khong_phu_h1,cho_u_moc')
+    common = {k: os.path.join(demo, 'FAKE_moc', f'FAKE_{k}.json') for k in ('tap_moc', 'u_so', 'session')}
+    rl.u_moc(demo, uid, 'H1', rl.fake_u_moc(d, r['trajectory'], common, lan='H1', frames=f1, xy=0.02),
+             os.path.join(demo, 'FAKE_gate_c8.json'))
+    got = _after(demo)[uid]
+    assert got['moc_flags'] == 'tien_de_khong_phu_h1,u_moc_vuot' and got['U_moc_xy_m'] == '0.02'

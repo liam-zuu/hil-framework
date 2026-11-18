@@ -346,9 +346,8 @@ def migrate(ds: str) -> Dict[str, str]:
            for name, cols in ((TUNING, TUNING_COLS), (EFFORT, EFFORT_COLS), (HWFAIL, HWFAIL_COLS))}
     if os.path.exists(os.path.join(ds, FREEZE)):              # v3.6 file without stop_cause (v3.7)
         out[FREEZE] = migrate_file(os.path.join(ds, FREEZE), FREEZE_COLS)
-    for name, cols in ((U_MOC, U_MOC_COLS), (TIEN_DE, TIEN_DE_COLS)):   # C8b v3 §5: created by their first row
-        if os.path.exists(os.path.join(ds, name)):                       # (append_row), checked here when present
-            out[name] = migrate_file(os.path.join(ds, name), cols)
+    for name, cols in ((U_MOC, U_MOC_COLS), (TIEN_DE, TIEN_DE_COLS)):   # C8b v3 §5, design section 4 (RC1-5)
+        out[name] = migrate_file(os.path.join(ds, name), cols)
     return out
 
 
@@ -1291,9 +1290,11 @@ def apply_so_h(tun: List[dict], ds: str) -> List[dict]:
         if not os.path.isfile(p) or sha256_file(p) != s.get('score_final_sha256'):
             raise LogError(f"{SO_H}: run {r.get('run_uid')}: {p!r} missing or changed since so-h")
         try:                                           # C9D-1, C9D-5: the same checks as at so-h
-            final, want, _ = check_score_final(r, p, ds)
+            final, want, cd = check_score_final(r, p, ds)
         except LogError as exc:
             raise LogError(f'{SO_H}: {exc}')
+        if s.get('vuot') != ('true' if cd['vuot'] else 'false'):      # RC1-1: vuot decides the H1 scoring (apply_moc)
+            raise LogError(f"{SO_H}: run {r.get('run_uid')}: vuot {s.get('vuot')!r} is not that of the score_final file")
         if (final, sorted(want)) != (s.get('outcome_sau'), sorted(flags)):
             raise LogError(f"{SO_H}: run {r.get('run_uid')}: outcome_sau / flags disagree with the rule of O1 §4")
         r = dict(r, run_outcome=final, so_h_flags=','.join(flags))
@@ -1853,7 +1854,7 @@ LANS = ('H0', 'H1')                       # the scoring of the run (H0) and, aft
 U_ROLES = ('frames', 'lich', 'tap_moc', 'u_so', 'dets', 'session')    # design 3.1, + 'gio' for a luoi.json scoring
 TIEN_DE_KQ = ('dat', 'khong_dat', 'thieu_du_lieu')
 MOC_DK = ('dat', 'khong_dat')             # the outcomes the rule can turn into chua_ket_luan
-MOC_FLAGS = ('khong_gan_duoc_lan_cham', 'cho_tien_de', 'tien_de_khong_dat', 'tien_de_thieu', 'tien_de_khac_ngay',
+MOC_FLAGS = ('cho_so_h', 'khong_gan_duoc_lan_cham', 'cho_tien_de', 'tien_de_khong_dat', 'tien_de_thieu', 'tien_de_khac_ngay',
              'tien_de_pham_vi_thieu', 'tien_de_khong_phu_h1', 'tien_de_luot_thieu', 'cho_u_moc', 'u_moc_khong_tinh',
              'u_moc_nguon_khac_khoa', 'u_moc_khac_buoi', 'u_moc_vuot')
 
@@ -2049,17 +2050,21 @@ def read_tien_de(path: str, session: str) -> dict:
     if not isinstance(luot, dict) or set(luot) != set(ids) or any(not isinstance(v, dict) or not _hex64(v.get('frames'))
                                                                   for v in luot.values()):
         raise LogError(f'{w}: sha256.luot must give {{frames: sha256}} for every id of luot, no other')
-    fr = {}
+    fr, fr1, seen = {}, {}, set()      # RC1-3 (S6-10b): a record of the H1 scoring says lan_cham H1; none says H0
     for k in ids:
-        f = luot[k]['frames']
-        if f in fr:
-            raise LogError(f'{w}: frames {f[:12]} of two runs ({fr[f]}, {k})')
-        fr[f] = k
+        f, lan = luot[k]['frames'], luot[k].get('lan_cham', 'H0')
+        if lan not in LANS:
+            raise LogError(f'{w}: sha256.luot[{k!r}].lan_cham {lan!r}: H0 or H1')
+        if f in seen:
+            raise LogError(f'{w}: frames {f[:12]} on two records ({k})')
+        seen.add(f)
+        (fr if lan == 'H0' else fr1)[f] = k
     if not isinstance(thieu, list) or any(x not in ids for x in thieu):
         raise LogError(f'{w}: luot_thieu_kiem must list ids of luot')
     if not isinstance(h1, bool):
         raise LogError(f'{w}: h1_ho_tro must be true or false')
-    out.update(u_so=sh['u_so'], sessions=set(ses.values()), frames=fr, thieu=set(thieu), h1=h1)
+    out.update(u_so=sh['u_so'], sessions=set(ses.values()), frames=fr, frames_h1=fr1 if h1 else {}, thieu=set(thieu),
+               h1=h1)
     return out
 
 
@@ -2152,6 +2157,8 @@ def apply_moc(tun: List[dict], ds: str) -> List[dict]:
                 raise LogError(f'{w}: gate file {gp!r} missing or changed since u-moc')
             gates[gp] = _gate_lock(gp, r)
         gf, lock = gates[gp]
+        if x.get('gate_file_sha256') != gf.sha256:              # RC1-4: every row, the cache only saves the hash
+            raise LogError(f'{w}: gate_file_sha256 of the row is not that of {gp!r}')
         if gf.sha256 != r.get('gate_file_sha256'):
             raise LogError(f"{w}: gate file {gp!r} is not the one of the run (gate_file_sha256)")
         if (x.get('khoa_xy_m'), x.get('khoa_psi_deg'), x.get('khoa_sha256')) != \
@@ -2199,8 +2206,11 @@ def apply_moc(tun: List[dict], ds: str) -> List[dict]:
             out.append(r)
             continue
         uid = r.get('run_uid')
-        lans = ('H0', 'H1') if h1_needed(_so_h_row(ds, uid), r.get('run_outcome')) else ('H0',)
+        so_row = _so_h_row(ds, uid)
+        lans = ('H0', 'H1') if h1_needed(so_row, r.get('run_outcome')) else ('H0',)
         fl = set()
+        if so_row is None:                            # RC1-2: the scorings needed are not known before so-h
+            fl.add('cho_so_h')
         fr = {lan: frames_l(r, lan) for lan in lans}
         if any(v is None for v in fr.values()):
             fl.add('khong_gan_duoc_lan_cham')
@@ -2214,11 +2224,11 @@ def apply_moc(tun: List[dict], ds: str) -> List[dict]:
                 fl.add('tien_de_khac_ngay')
             if not scope_ok.get(r.get('session_id')):
                 fl.add('tien_de_pham_vi_thieu')
-            # RM3-2; S6-10 TD3-1: H1 covered only by a file that says it covers H1, under an id other than H0's
-            if 'H1' in lans and (not td['h1'] or fr.get('H1') not in td['frames']
-                                 or td['frames'].get(fr.get('H1')) == td['frames'].get(fr.get('H0'))):
+            # RM3-2; S6-10 TD3-1, RC1-3: H1 covered only by a record of the H1 scoring (lan_cham H1, h1_ho_tro true)
+            if 'H1' in lans and fr.get('H1') not in td['frames_h1']:
                 fl.add('tien_de_khong_phu_h1')
-            if any(td['frames'].get(f) in td['thieu'] for f in fr.values() if f is not None):    # RM4-1
+            ids_l = [td['frames'].get(fr['H0'])] + ([td['frames_h1'].get(fr['H1'])] if 'H1' in lans else [])
+            if any(i in td['thieu'] for i in ids_l if i is not None):                              # RM4-1
                 fl.add('tien_de_luot_thieu')
         xs, ps = [], []
         for lan in lans:
@@ -3168,6 +3178,69 @@ def fake_score_final(folder: str, d_h_mm: Optional[float], h1: Optional[dict] = 
     return p
 
 
+def fake_moc_lock(folder: str) -> tuple:
+    """FAKE (demo and tests only): the camera.c8b block of a C8 gate file with a moc_dich lock (C8b v3 §4, CODE_C8B
+    field names, FAKE numbers) and the common FAKE files of a session it names (tap_moc, u_so, camera session)."""
+    os.makedirs(folder, exist_ok=True)
+    common = {}
+    for k, text in (('tap_moc', 'FAKE tap_moc'), ('u_so', 'FAKE u_so'), ('session', 'FAKE session H_a')):
+        common[k] = os.path.join(folder, f'FAKE_{k}.json')
+        with open(common[k], 'w', encoding='utf-8', newline='\n') as f:
+            f.write(text)
+    md = dict(U_moc_xy_m=0.010, U_moc_psi_deg=0.50, phuong_phap_duyet='FAKE', tien_de_buoi='dat',
+              nguon=dict(bo_lay_mau='FAKE_blm_v1', car_pose=dict(tag_offset=None, side_m=0.1445, h_m=0.20),
+                         tap_moc=sha256_file(common['tap_moc'])))
+    return {'c8b': {'moc_dich': md, 'khoa_sha256': 'f' * 64}}, common
+
+
+def fake_frames(run_dir: str, label: str, name: str = 'frames.csv') -> str:
+    """FAKE frames file of a run folder (its sha256 goes to the scorer file as frames_sha256)."""
+    os.makedirs(run_dir, exist_ok=True)
+    p = os.path.join(run_dir, name)
+    with open(p, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(f'FAKE frames {label}\n')
+    return p
+
+
+def fake_u_moc(run_dir: str, task: str, common: dict, lan: str = 'H0', frames: str = '', xy: float = 0.004,
+               psi: float = 0.20, name: str = '') -> str:
+    """FAKE (demo and tests only): a U file (u_moc_luot_v1, design 3.1) of scoring `lan` in the run folder, every
+    source with its absolute path (FAKE lich and dets written beside it)."""
+    frames = frames or os.path.join(run_dir, 'frames.csv')
+    src = dict(frames=frames, tap_moc=common['tap_moc'], u_so=common['u_so'], session=common['session'])
+    for k in ('lich', 'dets'):
+        src[k] = os.path.join(run_dir, f'FAKE_{k}_{lan}.txt')
+        with open(src[k], 'w', encoding='utf-8', newline='\n') as f:
+            f.write(f'FAKE {k} {lan}')
+    d = dict(format=U_MOC_FORMAT, task=task, ok=True, ly_do=[], thieu=[], sha256=dict(frames=sha256_file(frames)),
+             nguon=[dict(vai_tro=k, duong_dan=os.path.abspath(v), sha256=sha256_file(v)) for k, v in src.items()],
+             U_moc_xy_m=xy, U_moc_psi_deg=psi, bo_lay_mau='FAKE_blm_v1',
+             car_pose=dict(tag_offset=None, side_m=0.1445, h_m=0.20), n_khung=0, n_to_hop=200, FAKE=True)
+    p = os.path.join(run_dir, name or f'FAKE_u_moc_{lan}.json')
+    with open(p, 'w', encoding='utf-8', newline='\n') as f:
+        json.dump(d, f)
+    return p
+
+
+def fake_tien_de(path: str, session: str, ngay: str, records: list, common: dict, ket_qua: str = 'dat',
+                 h1: bool = False, thieu=()) -> str:
+    """FAKE (demo and tests only): a session premise file (tien_de_buoi_v1, S6 / S6-10 of CODE_KIEMCHEO field names);
+    records: [(id, frames path[, lan_cham])]."""
+    luot = {}
+    for rec in records:
+        luot[rec[0]] = dict(frames=sha256_file(rec[1]), **({'lan_cham': rec[2]} if len(rec) > 2 else {}))
+    d = dict(format=TIEN_DE_FORMAT, session_id=session, buoi=session, ngay=ngay, ket_qua=ket_qua, ly_do=[],
+             nguon=[dict(vai_tro=k, duong_dan=os.path.abspath(common[k]), sha256=sha256_file(common[k]))
+                    for k in ('u_so', 'session')],
+             sha256=dict(u_so=sha256_file(common['u_so']), sessions={'H_a': sha256_file(common['session'])},
+                         luot=luot),
+             luot=list(luot), luot_thieu_kiem=list(thieu), mau_thuan=[], tap_neo={}, h1_ho_tro=h1, FAKE=True)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, 'w', encoding='utf-8', newline='\n') as f:
+        json.dump(d, f)
+    return path
+
+
 def demo(out_dir: str, seed: int = 1, levels=('O1-F05',)) -> List[dict]:
     """A made-up A-PID, B-chung, B-PID, final session, written through the same commands, then
     the summary. Every number is invented (labelled FAKE); nothing here is a measurement.
@@ -3184,7 +3257,9 @@ def demo(out_dir: str, seed: int = 1, levels=('O1-F05',)) -> List[dict]:
         migrate(out_dir)
         # O1 v11.33: the C8 gate file (FAKE numbers) the scorers and end use; the summary reads it at the end
         gate_path = os.path.join(out_dir, 'FAKE_gate_c8.json')        # stands for the gate locked at C8
-        gate_c8.write_gate(gate_path, gate_c8.fake_gate(tuple(levels)))
+        gate_d = gate_c8.fake_gate(tuple(levels))
+        gate_d['camera'], moc_common = fake_moc_lock(os.path.join(out_dir, 'FAKE_moc'))   # C8b v3 §5 (CODE_GATE)
+        gate_c8.write_gate(gate_path, gate_d)
         gf = read_gate_file(gate_path)
         gain = dict(ctrl='PID', id=1, gains=dict(kp_xy=1.0, ki_xy=0.5, kp_wz=1.0, ki_wz=0.2, pos_kp=6.0, pos_ki=3.0,
                                                  k_psi=1.0))
@@ -3195,7 +3270,10 @@ def demo(out_dir: str, seed: int = 1, levels=('O1-F05',)) -> List[dict]:
         def judged(name, platform, outcome, g, ask=True):
             """C9D-1, C9D-6: the run's folder with its scorer file score.json (outcome, gate_v3); kwargs of end."""
             d = run_dir(name)
-            qp = fr.write_final_run(d, platform, gain, score_extra=dict(outcome=outcome, gate_v3=g))
+            extra = dict(outcome=outcome, gate_v3=g)
+            if platform == 'HW':                       # C8b v3 §5: the frames of the car scoring (design 3.0)
+                extra['frames_sha256'] = sha256_file(fake_frames(d, name))
+            qp = fr.write_final_run(d, platform, gain, score_extra=extra)
             sp = os.path.join(d, 'score.json')
             kw = dict(results_dir=d, gate=read_gate_json(sp), gate_sha256=sha256_file(sp), gate_file=gf)
             if ask:
@@ -3232,6 +3310,13 @@ def demo(out_dir: str, seed: int = 1, levels=('O1-F05',)) -> List[dict]:
         so_h(out_dir, a1[0]['run_uid'], fake_score_final(run_dir('a1_1'), 1.2))
         so_h(out_dir, a1[1]['run_uid'], fake_score_final(run_dir('a1_2'), 3.1, h1=dict(
             FAKE=True, outcome='dat', gate_v3=floor_gate(fake_gate(gate_file=gf, level='O1-F08', stage='screen')))))
+        # C8b v3 §5 (CODE_GATE 18/11): the U file of every judged car run, the premise file of the session
+        for k, r in enumerate(a1):
+            u_moc(out_dir, r['run_uid'], 'H0', fake_u_moc(run_dir(f'a1_{k + 1}'), r['trajectory'], moc_common),
+                  gate_path)
+        tien_de(out_dir, 'FAKE-A1', fake_tien_de(
+            os.path.join(out_dir, 'FAKE_moc', 'tien_de_FAKE-A1.json'), 'FAKE-A1', a1[0]['date'],
+            [(f'a1_{k + 1}', os.path.join(run_dir(f'a1_{k + 1}'), 'frames.csv')) for k in range(len(a1))], moc_common))
         gfile = fr.write_gain_file(os.path.join(out_dir, 'FAKE_gain_G00.json'), gain)   # gain_send file format
         freeze(out_dir, 'A-PID', 'khong_du_luot_xac_nhan', 'A-PID/G00', gfile, at=_iso(clock[0]),
                notes='FAKE')
@@ -3277,6 +3362,11 @@ def demo(out_dir: str, seed: int = 1, levels=('O1-F05',)) -> List[dict]:
                 fin.append(end(out_dir, o, completed=1, e_perp_max=0.10, **judged(f'f1_{o}', 'HW', o, car_gate[o])))
         for r in fin:                                   # C9D-2: clip H of the final session below eps_H
             so_h(out_dir, r['run_uid'], fake_score_final(r['results_dir'], 0.8))
+            u_moc(out_dir, r['run_uid'], 'H0', fake_u_moc(r['results_dir'], r['trajectory'], moc_common), gate_path)
+        tien_de(out_dir, 'FAKE-F1', fake_tien_de(
+            os.path.join(out_dir, 'FAKE_moc', 'tien_de_FAKE-F1.json'), 'FAKE-F1', fin[0]['date'],
+            [(os.path.basename(r['results_dir']), os.path.join(r['results_dir'], 'frames.csv')) for r in fin],
+            moc_common))
         return write_summary(out_dir, os.path.join(out_dir, SUMMARY), gate_file=gf)
     finally:
         now = real_now
