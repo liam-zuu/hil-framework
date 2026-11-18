@@ -56,14 +56,24 @@ if HERE not in sys.path:
 import c7_clip_probe as cp                                               # noqa: E402
 import c7_measure as cm                                                  # noqa: E402
 
-VERSION = 'c7_kiem_cheo_v5'                  # v5: Codex code review round 1 (KCC1-1..15)
+VERSION = 'c7_kiem_cheo_v6'                  # v6: A3 carried to the car tag (design v5 S5-1); v5: Codex code review round 1
 U_SO_VERSION = 'c7_u_so_v4'
 TUNG_KHUNG_VERSION = 'c7_tung_khung_v3'
 CAM_U_VERSION = 'c8_cam_u_vao_v2'           # c8b_u.CAM_VERSION (CODE_C8B, format agreed 18/11 with CODE_CAM)
 NGUONG_CO_DINH_M = 0.001                     # page v10 7a: 1 mm + the uncertainty of the comparison (u_so)
 L_MAX_M = 1.05                               # [DE XUAT] pair length of A3, locked before C8 (v2, KC1-7: the
                                              # centre pairs 25-26, 27-28 at 1.0 m; 84 pairs with 32 marks)
-WIN_S = 0.5                                  # [DE XUAT] window of the mark-shift median (CODE_CAM design v2 3)
+# A3 carried to the car tag (design v5 S5-1): virtual car tags (session car_side_m, tag_h_m) at these points of every
+# pair segment and these headings (a square repeats every 90 deg), seen through the full camera, measured through
+# the camera without the pair
+A3_TAG_T = (0.0, 0.25, 0.5, 0.75, 1.0)       # [DE XUAT] fractions along i -> j (CODE_C8B 18/11: several points)
+A3_TAG_PHI_DEG = (0.0, 15.0, 30.0, 45.0, 60.0, 75.0)  # [DE XUAT]
+A3_VUONG_R_M = 0.7                           # [DE XUAT] information only: a pair has a perpendicular partner when
+A3_VUONG_DELTA_DEG = 2.0                     #   a pair of the same clip has its midpoint within R, angle 90 +- delta
+# Liam has NOT approved the method of design v5 S5-1 (18/11): c8b_u refuses A3 until this is True. Set it True only
+# with Liam's words copied here and into the design (CODE_KIEMCHEO handover 3.1).
+A3_QUY_DUYET = False
+WIN_S = 0.5                                 # [DE XUAT] window of the mark-shift median (CODE_CAM design v2 3)
 WIN_MIN_N = 10                               #   at least 10 samples
 WIN_GAP_S = 0.1                              #   a gap above 0.1 s restarts the window
 COVER_MAX_MISS = 0.10                        # [DE XUAT] design v4 5: valid frames without a check value, at most
@@ -205,10 +215,66 @@ def session_groups(s, ids, n=GROUPS):
 
 
 # ---------------------------------------------------------------- A3
-def a3_clip(img, marks, model, w, h, zc, l_max=L_MAX_M, sigma=None):
-    """Rows per pair (i < j, tape distance <= l_max), both left out of the fit."""
+def pair_angle_diff(cam_see, cam_meas, mi, mj):
+    """Angle [rad] of the pair i -> j measured through cam_meas minus through cam_see, both on the image that
+    cam_see makes of the two floor marks mi, mj = (x, y, side) (centre = back-projected mean of the image corners, as
+    centre_floor). 0 when the two cameras are the same."""
+    pix = [cam_see.project(np.column_stack([cp.mark_corners_floor(*m), np.zeros(4)])) for m in (mi, mj)]
+    v_see = centre_floor(cam_see, pix[1]) - centre_floor(cam_see, pix[0])
+    v_meas = centre_floor(cam_meas, pix[1]) - centre_floor(cam_meas, pix[0])
+    return math.radians(signed_angle_deg(v_see, v_meas))
+
+
+def tag_heading_diff(cam_see, cam_meas, x, y, phi, side, tag_h):
+    """Kabsch heading [rad] of a car tag (side, top at height tag_h, centre (x, y), heading phi) measured through
+    cam_meas minus through cam_see, both on the image cam_see makes of it. As c7_measure.car_pose: the corners go to
+    z = 0, then a homothety about the plumb point (factor 1 - kappa), which keeps the Kabsch angle, so the heading
+    depends neither on kappa nor on the plumb point (design v5 S5-1)."""
+    body = cm.car_corners_body(side)
+    c, s = math.cos(phi), math.sin(phi)
+    P = body @ np.array([[c, s], [-s, c]]) + np.array([x, y])
+    pix = cam_see.project(np.column_stack([P, np.full(4, float(tag_h))]))
+    a_see = cm.rigid_fit(body, cam_see.pix2floor(pix, 0.0))[0]
+    a_meas = cm.rigid_fit(body, cam_meas.pix2floor(pix, 0.0))[0]
+    return cm.cp_wrap(a_meas - a_see)
+
+
+def a3_tag_gap(cam_full, cam_ij, mi, mj, side, tag_h, ts=A3_TAG_T, phis=A3_TAG_PHI_DEG):
+    """Design v5 S5-1 (b): over virtual car tags along the segment i -> j and the headings phis, the largest
+    |tag heading difference - pair angle difference| [deg] between the full camera (seen through) and the camera
+    without the pair (measured through), and the largest |tag heading difference| [deg] (information)."""
+    dp = pair_angle_diff(cam_full, cam_ij, mi, mj)
+    pi, pj = np.array(mi[:2], float), np.array(mj[:2], float)
+    gap = dpsi = 0.0
+    for t in ts:
+        x, y = (1.0 - t) * pi + t * pj
+        for ph in phis:
+            d = tag_heading_diff(cam_full, cam_ij, x, y, math.radians(ph), side, tag_h)
+            gap, dpsi = max(gap, abs(d - dp)), max(dpsi, abs(d))
+    return math.degrees(gap), math.degrees(dpsi), math.degrees(dp)
+
+
+def session_tag(raws):
+    """(car_side_m, tag_h_m) of the car tag, the same in every session (design v5 S5-1); refused when missing, not a
+    finite number > 0 (side) / >= 0 (height), or different between the clips H."""
+    vals = set()
+    for n, s in raws.items():
+        side, th = s.get('car_side_m'), s.get('tag_h_m')
+        for k, v, lo_ok in (('car_side_m', side, lambda x: x > 0), ('tag_h_m', th, lambda x: x >= 0)):
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not lo_ok(v):
+                raise KCError(f'{n}: session {k} {v!r} (A3 is carried to the car tag, design v5 S5-1)')
+        vals.add((float(side), float(th)))
+    if len(vals) != 1:
+        raise KCError(f'car tag differs between the clips H: {sorted(vals)}')
+    return vals.pop()
+
+
+def a3_clip(img, marks, model, w, h, zc, l_max=L_MAX_M, sigma=None, tag=None):
+    """Rows per pair (i < j, tape distance <= l_max), both left out of the fit. tag = (car_side_m, tag_h_m): each
+    row also gets the conversion to the car tag (design v5 S5-1): gap_deg (b), quy_deg = |dtheta| + gap_deg."""
     ids = sorted(img)
     rows = []
+    cam_full = fit_without(img, marks, ids, model, w, h, zc) if tag is not None else None
     for a in range(len(ids)):
         for b in range(a + 1, len(ids)):
             i, j = ids[a], ids[b]
@@ -219,7 +285,11 @@ def a3_clip(img, marks, model, w, h, zc, l_max=L_MAX_M, sigma=None):
             cam = fit_without(img, marks, [k for k in ids if k not in (i, j)], model, w, h, zc)
             vc = centre_floor(cam, img[j]) - centre_floor(cam, img[i])
             r = dict(i=i, j=j, L_m=L, dtheta_deg=signed_angle_deg(vt, vc),
-                     mid_x=float((marks[i][0] + marks[j][0]) / 2), mid_y=float((marks[i][1] + marks[j][1]) / 2))
+                     mid_x=float((marks[i][0] + marks[j][0]) / 2), mid_y=float((marks[i][1] + marks[j][1]) / 2),
+                     huong_deg=math.degrees(math.atan2(vt[1], vt[0])))
+            if tag is not None:
+                g, dpsi, dp = a3_tag_gap(cam_full, cam, marks[i], marks[j], *tag)
+                r.update(gap_deg=g, dpsi_ma_max_deg=dpsi, dtheta_hai_cam_deg=dp, quy_deg=abs(r['dtheta_deg']) + g)
             if sigma and i in sigma and j in sigma:
                 n = np.array([-vt[1], vt[0]]) / L
                 sp = math.sqrt(sum((sigma[m][0] * n[0]) ** 2 + (sigma[m][1] * n[1]) ** 2 for m in (i, j)))
@@ -228,7 +298,25 @@ def a3_clip(img, marks, model, w, h, zc, l_max=L_MAX_M, sigma=None):
     return rows
 
 
+def a3_perpendicular(rows, r_m=A3_VUONG_R_M, delta_deg=A3_VUONG_DELTA_DEG):
+    """Information for design v5 S5-1 (a): the pairs of one clip that have a partner pair with its midpoint within
+    r_m and a direction 90 +- delta_deg away (the local-linear argument needs two perpendicular pairs in one area)."""
+    n = 0
+    for p in rows:
+        for q in rows:
+            if q is p or math.hypot(q['mid_x'] - p['mid_x'], q['mid_y'] - p['mid_y']) > r_m:
+                continue
+            d = abs(((q['huong_deg'] - p['huong_deg']) % 180.0) - 90.0)
+            if d <= delta_deg:
+                n += 1
+                break
+    return n
+
+
 def a3_summary(rows_by_clip, new_ids=()):
+    """A3 over every clip H. When every row carries the conversion to the car tag (a3_clip tag=...), max_deg is the
+    converted bound max(|dtheta| + gap) (design v5 S5-1) and max_deg_cap the pair angle alone; else max_deg is the
+    pair angle and the block says it is not converted. quy_ve_ma_noc = A3_QUY_DUYET (Liam's approval) only then."""
     allr = [r for rows in rows_by_clip.values() for r in rows]
     if not allr:
         raise KCError('A3: no pair')
@@ -237,7 +325,7 @@ def a3_summary(rows_by_clip, new_ids=()):
     worst = allr[int(np.argmax(np.abs(d)))]
     out = dict(max_deg=float(np.max(np.abs(d))), rms_deg=float(np.sqrt(np.mean(d ** 2))), n_cap=len(allr),
                L_m=[float(min(r['L_m'] for r in allr)), float(max(r['L_m'] for r in allr))],
-               cap_lon_nhat=dict(clip=next(c for c, rows in rows_by_clip.items() if worst in rows),
+               cap_lon_nhat=dict(clip=next(c for c, rows in rows_by_clip.items() if any(worst is r for r in rows)),
                                  i=worst['i'], j=worst['j'], dtheta_deg=worst['dtheta_deg']),
                theo_clip={c: dict(n_cap=len(rows), max_deg=float(max(abs(r['dtheta_deg']) for r in rows)),
                                   rms_deg=float(np.sqrt(np.mean([r['dtheta_deg'] ** 2 for r in rows]))))
@@ -251,7 +339,24 @@ def a3_summary(rows_by_clip, new_ids=()):
         rs = float(np.sqrt(np.mean(np.square(st))))
         out['rms_sigma_thuoc_deg'] = rs
         out['rms_tru_thuoc_deg_tham_khao'] = float(math.sqrt(max(0.0, out['rms_deg'] ** 2 - rs ** 2)))
-    out['loai'] = 'cuc dai thuc nghiem goc cap moc, chua quy ve huong ma noc (khong ghi quy_ve_ma_noc)'
+    conv = all('quy_deg' in r for r in allr)
+    if conv:
+        q = allr[int(np.argmax([r['quy_deg'] for r in allr]))]
+        out.update(max_deg_cap=out['max_deg'], max_deg=float(q['quy_deg']),
+                   gap_max_deg=float(max(r['gap_deg'] for r in allr)),
+                   dpsi_ma_max_deg=float(max(r['dpsi_ma_max_deg'] for r in allr)),
+                   cap_quy_lon_nhat=dict(clip=next(c for c, rows in rows_by_clip.items() if any(q is r for r in rows)), i=q['i'],
+                                         j=q['j'], dtheta_deg=q['dtheta_deg'], gap_deg=q['gap_deg']),
+                   ma_ao=dict(t=list(A3_TAG_T), phi_deg=list(A3_TAG_PHI_DEG)),
+                   vuong_goc=dict(R_m=A3_VUONG_R_M, delta_deg=A3_VUONG_DELTA_DEG, thong_tin=True,
+                                  theo_clip={c: dict(n_cap=len(rows), n_co_doi=a3_perpendicular(rows))
+                                             for c, rows in rows_by_clip.items() if rows}),
+                   quy_ve_ma_noc=bool(A3_QUY_DUYET))
+        out['loai'] = ('quy ve huong Kabsch ma noc (thiet ke v5 S5-1): max qua cap, clip cua |dtheta| + gap; gap = '
+                       'max |dpsi_ma - dtheta_cap| giua camera day du va camera bo cap, ma ao doc doan noi cap'
+                       + ('' if A3_QUY_DUYET else '; CACH QUY CHUA DUOC LIAM DUYET: quy_ve_ma_noc false'))
+    else:
+        out['loai'] = 'cuc dai thuc nghiem goc cap moc, chua quy ve huong ma noc (khong ghi quy_ve_ma_noc)'
     out['gioi_han'] = [
         '(a) khong tru sai thuoc, nhung sai thuoc co the triet tieu mot phan sai camera: khong chung minh bao thu',
         '(b) goc cap tren doan L chi bang goc cuc bo cua ma khi dao ham truong sai bien thien it trong doan va voi '
@@ -260,6 +365,16 @@ def a3_summary(rows_by_clip, new_ids=()):
         '(d) do tren mat san; ma noc o do cao 0,12 m',
         '(e) camera clip H, khong phai camera tung khung khi track',
         '(f) so tru thuoc chi tham khao, gia dinh sai thuoc doc lap voi sai camera']
+    if conv:
+        out['gioi_han'] += [
+            '(g) gap chi bao sai trong ho mo hinh camera (model khoa): khac nhau giua camera day du va camera bo cap '
+            'dai dien cho khac nhau giua camera that va camera bo cap; sai ngoai ho (meo khong mo hinh, san khong '
+            'phang) o thang nho hon doan noi cap khong bi chan',
+            '(h) phan |dtheta| dua tren lap luan tuyen tinh cuc bo (a): hai cap vuong goc cung vung cho tong 2 omega; '
+            'dieu kien nay chi la thong tin (vuong_goc), khong phai cong',
+            '(i) ma ao chi dat doc doan noi cap (A3_TAG_T) va cac huong A3_TAG_PHI_DEG; vung ngoai cac doan khong '
+            'lay mau',
+            '(j) camera bo cap va camera day du khop tren clip H; track khop lai tu the tung khung']
     return out
 
 
@@ -780,8 +895,9 @@ def phan_tich(a):
     a.thu = thu_flag(a.thu, a.max_frames)
     if not a.thu and not a.hang_so:
         raise KCError('--hang-so needed (KCC1-9)')
-    # A3 over every clip H
-    a3 = {n: a3_clip(img, mk, a.model, w, h, zc, a.L_max, sig) for n, (img, mk, w, h, zc) in clips.items()}
+    # A3 over every clip H, carried to the car tag of the sessions (design v5 S5-1)
+    tag = session_tag(raw)
+    a3 = {n: a3_clip(img, mk, a.model, w, h, zc, a.L_max, sig, tag=tag) for n, (img, mk, w, h, zc) in clips.items()}
     roles = {i: r.get('vai_tro', '') for i, r in moc_rows.items()}
     A3 = a3_summary(a3, [i for i in ids_a if roles.get(i) == 'moc_giua'])
     # P1 at clip H; group cameras of every clip
@@ -837,13 +953,15 @@ def phan_tich(a):
     res['kiem_h'] = {n: kiem_h(dets[n][1], clips[n][0]) for n in clips}
     write_new(os.path.join(a.out, 'kiem_cheo.json'), res)
     with open(os.path.join(a.out, 'a3_cap.csv'), 'x', newline='', encoding='utf-8') as f:
-        cols = ['clip', 'i', 'j', 'L_m', 'dtheta_deg', 'sigma_thuoc_deg', 'mid_x', 'mid_y']
+        cols = ['clip', 'i', 'j', 'L_m', 'dtheta_deg', 'sigma_thuoc_deg', 'mid_x', 'mid_y', 'huong_deg', 'gap_deg',
+                'quy_deg', 'dpsi_ma_max_deg', 'dtheta_hai_cam_deg']
         wr = csv.DictWriter(f, fieldnames=cols)
         wr.writeheader()
         for n, rows in a3.items():
             for r in rows:
                 wr.writerow(dict({k: r.get(k, '') for k in cols[1:]}, clip=n))
-    print(f"A3: {A3['n_cap']} cap, max {A3['max_deg']:.3f} deg, RMS {A3['rms_deg']:.3f} deg; "
+    print(f"A3: {A3['n_cap']} cap, quy ve ma noc max {A3['max_deg']:.3f} deg (cap {A3['max_deg_cap']:.3f}, gap "
+          f"{A3['gap_max_deg']:.3f}; quy_ve_ma_noc {A3['quy_ve_ma_noc']}), RMS cap {A3['rms_deg']:.3f} deg; "
           f"P1 clip H: max {worst[2] * 1000:.2f} mm (moc {worst[1]}, {worst[0]}); u_so xe {uso * 1000:.2f} mm "
           f"(tinh {xe['tinh_m'] * 1000:.2f}, loc {xe['cua_so_m'] * 1000:.2f}, tho {xe['tho_m'] * 1000:.2f}); "
           f"P7 {zp[2]['lech_max_m'] * 1000:.2f} mm; A5 {za[2]['lech_max_deg']:.3f} deg"

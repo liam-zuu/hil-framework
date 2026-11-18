@@ -332,7 +332,7 @@ def test_c8b_u_reads_the_export():
     CU.check_cam(cam)
     tk = {"version": "c8b_thuoc_kep_v2", "cao_4_goc_mm": [120.2, 120.0, 119.8, 120.1], "e_mm": 0.1, "s_mm": 96.4,
           "canh": {"truoc": [10.3, 10.1], "phai": [10.2, 10.0], "sau": [10.1, 10.3], "trai": [10.0, 10.2]},
-          "tam_than_deg": 0.05}
+          "tam_than_deg": 0.05, "tam_tam_mm": [3.0, -4.0], "tam_tam_dung_sai_mm": 0.5, "ban_ve_nguon": "test"}
     xo = {"version": "c8b_xoay_v1", "q_tag_m": [0.003, -0.004], "du_m": 0.0007}
     tb = dict(ga_ok=True, d_p_quay_m=0.0007, d_psi_quay_deg=0.25)
     up, p, upsi, s = CU.u_p_u_psi(cam, tb, tk, xo)
@@ -735,7 +735,8 @@ def test_tung_khung_contradiction_needs_the_chain_xe_schedule(tmp_path):
 
 
 def _fake_session(tmp_path, name, img, marks, video):
-    s = dict(kind='c7_session', model_khoa='B1', chosen='B1', width=W, height=H, zc_tape_m=ZC,
+    s = dict(kind='c7_session', model_khoa='B1', chosen='B1', width=W, height=H, zc_tape_m=ZC, car_side_m=0.1445,
+             tag_h_m=0.119,
              fit_ids=sorted(img), marks={str(i): list(m) for i, m in marks.items()},
              ref_corners_px={str(i): c.tolist() for i, c in img.items()}, video_sha256=kc.sha256_file(str(video)))
     p = tmp_path / f'{name}.json'
@@ -829,3 +830,119 @@ def test_kiem_h_cli_at_the_floor(tmp_path, scene, monkeypatch):
     t3 = tmp_path / 'c'
     t3.mkdir()
     assert kc.main(_kiem_h_files(t3, scene, sorted(img))) == 2
+
+
+# ---------------------------------------------------------------- design v5 S5-1: A3 carried to the car tag
+class _Lin:
+    """A camera whose floor map is the linear map I + D (project ignores z): the local-linear field of S5-1 (a)."""
+
+    def __init__(self, D=((0.0, 0.0), (0.0, 0.0))):
+        self.M = np.eye(2) + np.asarray(D, float)
+
+    def project(self, P):
+        return np.asarray(P, float)[:, :2].copy()
+
+    def pix2floor(self, uv, z=0.0):
+        return np.asarray(uv, float).reshape(-1, 2) @ self.M.T
+
+
+def _yawed(cam, d):
+    """cam with the whole world turned by d about the vertical axis: everything it measures is turned by d."""
+    c, s = math.cos(d), math.sin(d)
+    Rz = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+    R = cam.R @ Rz.T
+    C = Rz @ cam.centre
+    return cp.Camera(cam.model, cam.f, cam.cx, cam.cy, cam.k, cv_rvec(R), -R @ C)
+
+
+def test_tag_heading_through_its_own_camera_is_exact(scene):
+    """S5-1: rays to z = 0 then a homothety keep the Kabsch angle, so the tag at 0.119 m seen and measured through
+    one camera gives its heading back (difference 0), and so does a pair."""
+    marks, cam, _ = scene
+    import c7_measure as cm
+    body = cm.car_corners_body(0.1445)
+    for ph in (0.0, 0.3, 1.2):
+        c, s = math.cos(ph), math.sin(ph)
+        P = body @ np.array([[c, s], [-s, c]]) + np.array([0.4, -0.3])
+        pix = cam.project(np.column_stack([P, np.full(4, 0.119)]))
+        assert cm.rigid_fit(body, cam.pix2floor(pix, 0.0))[0] == pytest.approx(ph, abs=1e-12)
+        assert kc.tag_heading_diff(cam, cam, 0.4, -0.3, ph, 0.1445, 0.119) == pytest.approx(0.0, abs=1e-12)
+    assert kc.pair_angle_diff(cam, cam, marks[1], marks[2]) == pytest.approx(0.0, abs=1e-12)
+
+
+def test_yaw_of_the_camera_turns_tag_and_pair_alike(scene):
+    """A rotation of the whole camera about the vertical is a pure omega field: the tag heading and the pair angle
+    change by the same angle, the gap is 0."""
+    marks, cam, _ = scene
+    d = math.radians(0.3)
+    g, dpsi, dp = kc.a3_tag_gap(cam, _yawed(cam, d), marks[30], marks[32], 0.1445, 0.119)
+    assert dp == pytest.approx(0.3, abs=1e-6) and dpsi == pytest.approx(0.3, abs=1e-6) and g < 1e-6
+
+
+def test_linear_field_gives_omega_for_the_tag_and_omega_plus_strain_for_a_pair():
+    """S5-1 (a): under the map I + D, D = S + omega J, the tag heading changes by the antisymmetric part only, a pair
+    along u by omega + n^T S u; two perpendicular pairs add to 2 omega; the gap is exactly tag - pair."""
+    a, b, c, w = 0.004, 0.003, -0.002, 0.001
+    D = ((a, b - w), (b + w, c))
+    I, L = _Lin(), _Lin(D)
+    tag = kc.tag_heading_diff(I, L, 0.2, 0.1, 0.4, 0.1445, 0.0)
+    assert tag == pytest.approx(math.atan2(2 * w, 2 + a + c), abs=1e-12)
+    px = kc.pair_angle_diff(I, L, (0.0, 0.0, SIDE), (0.5, 0.0, SIDE))
+    py = kc.pair_angle_diff(I, L, (0.0, 0.0, SIDE), (0.0, 0.5, SIDE))
+    assert px == pytest.approx(math.atan2(b + w, 1 + a), abs=1e-12)
+    assert py == pytest.approx(math.atan2(w - b, 1 + c), abs=1e-12)
+    assert (px + py) / 2 == pytest.approx(w, abs=2e-5)          # 2 omega to first order
+    g, dpsi, dp = kc.a3_tag_gap(I, L, (0.0, 0.0, SIDE), (0.5, 0.0, SIDE), 0.1445, 0.0)
+    assert dp == pytest.approx(math.degrees(px)) and dpsi == pytest.approx(math.degrees(abs(tag)))
+    assert g == pytest.approx(math.degrees(abs(tag - px)), abs=1e-9)   # the same at every point and heading
+
+
+def test_a3_converted_on_an_exact_scene_and_flag_follows_approval(scene, monkeypatch):
+    """Exact data: every pair and gap 0, max_deg is the converted bound, quy_ve_ma_noc false until approved."""
+    marks, cam, img = scene
+    rows = kc.a3_clip(img, marks, 'B1', W, H, ZC, l_max=0.8, tag=(0.1445, 0.119))
+    assert rows and all(r['gap_deg'] < 1e-3 and r['quy_deg'] < 2e-3 for r in rows)
+    out = kc.a3_summary({'H_a': rows})
+    assert out['quy_ve_ma_noc'] is False and 'CHUA DUOC LIAM DUYET' in out['loai']
+    assert out['max_deg'] == pytest.approx(max(r['quy_deg'] for r in rows)) and 'max_deg_cap' in out
+    assert len(out['gioi_han']) == 10 and out['vuong_goc']['thong_tin'] is True
+    monkeypatch.setattr(kc, 'A3_QUY_DUYET', True)
+    assert kc.a3_summary({'H_a': rows})['quy_ve_ma_noc'] is True
+
+
+def test_a3_converted_bound_covers_the_pair_angle(scene):
+    """Tape of mark 30 wrong by 2 mm across the pair 30-32: quy_deg = |dtheta| + gap >= |dtheta|, and max_deg is the
+    largest converted value, never below the pair maximum."""
+    marks, cam, _ = scene
+    m, j = 30, 32
+    vt = np.array(marks[j][:2]) - np.array(marks[m][:2])
+    n = np.array([-vt[1], vt[0]]) / np.linalg.norm(vt)
+    true = dict(marks)
+    true[m] = (marks[m][0] + 0.002 * n[0], marks[m][1] + 0.002 * n[1], SIDE)
+    rows = kc.a3_clip(image_of(cam, true), marks, 'B1', W, H, ZC, l_max=0.8, tag=(0.1445, 0.119))
+    r = next(r for r in rows if (r['i'], r['j']) == (m, j))
+    assert r['quy_deg'] == pytest.approx(abs(r['dtheta_deg']) + r['gap_deg']) and r['gap_deg'] > 0
+    out = kc.a3_summary({'H_a': rows, 'H_b': rows[:3]})
+    assert out['max_deg'] >= out['max_deg_cap'] and out['cap_quy_lon_nhat']['clip'] == 'H_a'
+
+
+def test_session_tag_is_required_and_the_same():
+    good = dict(car_side_m=0.1445, tag_h_m=0.119)
+    assert kc.session_tag({'H_a': good, 'H_b': dict(good)}) == (0.1445, 0.119)
+    for bad in (dict(tag_h_m=0.119), dict(car_side_m=0.0, tag_h_m=0.119), dict(car_side_m=0.1445, tag_h_m=-0.1),
+                dict(car_side_m=True, tag_h_m=0.119), dict(car_side_m=0.1445, tag_h_m=float('nan'))):
+        with pytest.raises(kc.KCError):
+            kc.session_tag({'H_a': good, 'H_b': bad})
+    with pytest.raises(kc.KCError, match='differs'):
+        kc.session_tag({'H_a': good, 'H_b': dict(car_side_m=0.1445, tag_h_m=0.12)})
+
+
+def test_phan_tich_writes_the_converted_a3(tmp_path, scene, monkeypatch):
+    """Production path: A3 block converted (quy_ve_ma_noc false before approval), a3_cap.csv has quy_deg."""
+    marks, cam, img = scene
+    monkeypatch.setattr(kc, 'clip_dets', lambda v, ids, max_frames=None: ([k / 60 for k in range(20)], [img] * 20))
+    assert kc.main(_phan_tich_args(tmp_path, scene)) == 0
+    r = json.loads((tmp_path / 'kc' / 'kiem_cheo.json').read_text(encoding='utf-8'))
+    assert r['A3']['quy_ve_ma_noc'] is False and 'gap_max_deg' in r['A3'] and r['version'] == 'c7_kiem_cheo_v6'
+    head = (tmp_path / 'kc' / 'a3_cap.csv').read_text(encoding='utf-8').splitlines()[0]
+    assert 'quy_deg' in head and 'gap_deg' in head
