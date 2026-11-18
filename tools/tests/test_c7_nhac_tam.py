@@ -1,4 +1,4 @@
-"""Tests for tools/c7_nhac_tam.py (plate lift test of C8, design 2026-11-18_Thiet_ke_c7_nhac_tam_v3.md section 4).
+"""Tests for tools/c7_nhac_tam.py (plate lift test of C8, design 2026-11-18_Thiet_ke_c7_nhac_tam_v4.md section 4).
 Synthetic data and clips rendered here from a known camera (NOT a measurement). The floor scene reuses the mark
 layout and the camera of test_c7_clip_probe; the car (body with textured tape, plate with the tag) is drawn here."""
 import json
@@ -144,8 +144,8 @@ def test_camera_shift_enters_eps():
     s = summaries(STILL, PLATE_OFF)
     s[3]['cam'] = [0.005, 0.0, 2.9]
     res = nt.analyse(s, CFG, R_OK, tag_h=0.12)
-    eps = [0.0, 0.0, 0.0, 0.005 * CFG['dh_m'] / (2.9 - 0.12), 0.0]
-    assert res['than'][3]['camera_dich_m'] == pytest.approx(0.005)
+    eps = [0.0, 0.0, 0.0, 0.005 * CFG['dh_m'] / (2.9 - 0.12), 0.0]                 # dH = 0
+    assert res['than'][3]['camera_dich_xy_m'] == pytest.approx(0.005)
     assert res['vi_tri_m'] == pytest.approx(truth_rep(PLATE_OFF, eps)[0], abs=1e-9)
 
 
@@ -191,11 +191,58 @@ def test_nt7_plate_seated_higher_is_covered_by_the_scale():
     H, h = 2.632, 0.12
     C = [-0.4802, -0.0329, H]
     s = summaries([(0.0, 0.0, 0.0)] * 4, [(0.0, 0.0, 0.0)] * 4, cam=C)
-    s[1]['scale'] = 1.0 + 0.003 / (H - h)
+    s[1]['scale'] = (H - h) / (H - (h + 0.003))                       # projection p = C + a (P - C), a = (H-h)/(H-z)
     res = nt.analyse(s, CFG, R_OK, tag_h=h)
-    real = 0.003 / (H - h) * math.hypot(C[0], C[1])
-    assert real == pytest.approx(0.000575, abs=2e-6)
-    assert res['vi_tri_m'] >= real - 1e-9 and res['tho']['vi_tri_m'] >= real - 1e-9
+    real = 0.003 / (H - h) * math.hypot(C[0], C[1])                    # |P - p| = |1 - 1/a| |p - C|
+    assert real == pytest.approx(0.000574832, abs=1e-9)
+    assert res['vi_tri_m'] >= real * (1 - 1e-9) and res['tho']['vi_tri_m'] >= real * (1 - 1e-9)
+
+
+def test_nt3_2_plate_seated_lower_uses_one_minus_one_over_r():
+    """Codex NT3-2: plate 3 mm LOWER, same projected centre; real shift 0.574832 mm; |r - 1| alone gives 0.574146."""
+    H, h = 2.632, 0.12
+    C = [-0.4802, -0.0329, H]
+    s = summaries([(0.0, 0.0, 0.0)] * 4, [(0.0, 0.0, 0.0)] * 4, cam=C)
+    a = (H - h) / (H - (h - 0.003))
+    s[1]['scale'] = a
+    real = abs(1.0 - 1.0 / a) * math.hypot(C[0], C[1])
+    assert real == pytest.approx(0.000574832, abs=1e-9)
+    res = nt.analyse(s, CFG, R_OK, tag_h=h)
+    assert res['vi_tri_m'] >= real
+
+
+def test_nt3_1_scale_noise_widens_the_interval():
+    """Codex NT3-1: a scale that looks equal to N0 still carries its statistical uncertainty."""
+    H, h = 2.632, 0.12
+    C = [-0.4802, -0.0329, H]
+    s = summaries([(0.0, 0.0, 0.0)] * 4, [(0.0, 0.0, 0.0)] * 4, cam=C)
+    for x in s:
+        x['scale_u'] = 0.0005
+    res = nt.analyse(s, CFG, R_OK, tag_h=h)
+    assert res['than'][1]['eps_h_m'] > 0.00045                                   # ~0.1 % x 0.48 m
+    assert res['than'][0]['eps_h_m'] == 0.0
+
+
+def test_nt3_3_camera_height_change_with_a_lever_arm():
+    """Codex NT3-3: camera centre moves by +-dC (x, y, z) in two clips; boxes really at 0.09 m projected at 0.12 m;
+    body moved so the projected box centre stays put (t = 0); tag still at O. Real repeatability 0.098967 mm."""
+    H0, h, zb = 2.632, 0.12, 0.09
+    C0 = np.array([-0.4802, -0.0329])
+    dC = np.array([0.003990645, 0.000273412, 0.000757397])
+    q = [np.array([-0.11, 0.0]), np.array([0.11, 0.0])]
+    a0 = (H0 - h) / (H0 - zb)
+    summ, Ts = [], []
+    for sgn in (0, 1, -1, 0):
+        Ci, Hi = C0 + sgn * dC[:2], H0 + sgn * dC[2]
+        ai = (Hi - h) / (Hi - zb)
+        T = ((1 - a0) * C0 - (1 - ai) * Ci) / ai
+        Ts.append(T)
+        box = [(Ci + ai * (x + T - Ci)).tolist() for x in q]
+        summ.append(dict(tag=[0.0, 0.0, 0.0], box=box, cam=[Ci[0], Ci[1], Hi], scale=1.0))
+    real = float(np.hypot(*(Ts[1] - Ts[2])))
+    assert real == pytest.approx(0.000098967, abs=2e-9)
+    res = nt.analyse(summ, CFG, R_OK, tag_h=h)
+    assert res['kiem_than'] and res['vi_tri_m'] >= real
 
 
 def test_two_boxes_must_be_apart():

@@ -4,8 +4,8 @@ c7_nhac_tam.py: plate lift test of C8 (trang C8b v10 DA DUYET, P3 / A2, section 
 car tag position and heading RELATIVE TO THE CAR BODY over the placements of the tag plate; the body is watched through
 two textured tape patches stuck on the body.
 
-Design: CLAUDE_THESIS 03_CODE/docs/2026-11-18_Thiet_ke_c7_nhac_tam_v3.md (CODE_NHACTAM local_f8bebd94, 18/11/2026;
-v2 after Codex Sol round 1, NT-1..NT-14; v3 after round 2, NT2-1..NT2-4). Measurement (design 0, 5): car still at O, control power off;
+Design: CLAUDE_THESIS 03_CODE/docs/2026-11-18_Thiet_ke_c7_nhac_tam_v4.md (CODE_NHACTAM local_f8bebd94, 18/11/2026;
+v2 after Codex Sol round 1, NT-1..NT-14; v3 after round 2, NT2-1..NT2-4; v4 after round 3, NT3-1..NT3-4). Measurement (design 0, 5): car still at O, control power off;
 N0 = plate fitted on its pins, N1.. = lifted and put back, the last one after the calliper heights (B1); one clip of
 10 s per placement, nobody in the frame; clip R = plate lying on the floor >= 0.5 m from the car (5 s).
 
@@ -20,7 +20,8 @@ the frames considered; medians; still if the 95th percentile of the deviations i
 Body (2.3): rigid 2D fit of the box points N0 -> Nj; clip R proves the boxes belong to the body (boxes found where they
 were in N0 while the tag is SEEN >= 0.2 m away, NT2-3); kiem_than = R passed, two boxes >= 0.10 m apart, fit residual ok.
 Repeatability (2.4): tag mapped back to the N0 body frame p' = R^T (p - t), psi' = psi - angle(R); largest over pairs
-of |p'_j - p'_k| + eps_j + eps_k (eps_j = (|t_j| + |dC_j| + |(R_j - I) C0|) dh / (H - h) + |s_j / s_0 - 1| |p_j - C0|; NT2-1, NT-7) and of
+of |p'_j - p'_k| + eps_j + eps_k (eps_j = (|t_j| + |dC_xy,j| + |(R_j - I) C0|) dh / (H - h) + dh |dH_j| / (H - h)^2
+|qbar_0 - C0| + max|1 - 1/r| |p_j - C0| over r in the scale interval; NT2-1, NT3-3, NT-7, NT3-1, NT3-2) and of
 |wrap(psi'_j - psi'_k)|. Value for U: body removed when kiem_than, else raw (limitation of v10 section 3).
 
   python tools/c7_nhac_tam.py khung --clip N0.MOV --session S/session.json --out D
@@ -55,7 +56,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 import c7_measure as cm                                                  # noqa: E402
 
-VERSION = 'c7_nhac_tam_v3'
+VERSION = 'c7_nhac_tam_v4'
 MIN_PLACEMENTS = 4
 DEFAULTS = dict(
     trim_s=0.5,            # 2.2: dropped at both ends of a clip
@@ -77,9 +78,10 @@ DEFAULTS = dict(
     r_min_frames_s1=100,   #      gated R frames: max(r_min_frames_abs, ceil(100 / stride))
     r_min_frames_abs=40,
     dh_m=0.03,             # 2.4: height bound of the boxes [uoc luong]
+    scale_k=3.0,           # 2.4: scale interval = median +- k x standard error of the median (NT3-1)
     search_px=25,          # 2.1: template search half-window
 )
-THRESH_STATUS = 'DE XUAT (thiet ke c7_nhac_tam v3 muc 2)'
+THRESH_STATUS = 'DE XUAT (thiet ke c7_nhac_tam v4 muc 2)'
 NAN = float('nan')
 
 
@@ -314,7 +316,9 @@ def clip_summary(rows, n_boxes, cfg, stride=1):
     if not still:
         out['flags'].append('clip_co_dong')
     cam = [float(np.median([r[c] for r in used])) for c in ('cam_x', 'cam_y', 'cam_z')]
-    out.update(ok=still, still=still, tag=[mx, my, mp], scale=float(np.median([r['tag_scale'] for r in used])),
+    sc = np.array([r['tag_scale'] for r in used])
+    out.update(ok=still, still=still, tag=[mx, my, mp], scale=float(np.median(sc)),
+               scale_u=float(cfg['scale_k'] * 1.2533 * sc.std(ddof=1) / math.sqrt(len(sc))) if len(sc) > 1 else NAN,
                tag_p95_m=p95(dpos), tag_p95_deg=p95(dang),
                tag_max_m=float(dpos.max()), tag_max_deg=float(dang.max()), box=bmed.tolist(), box_p95_m=box95,
                corr_min=[float(min(r['box'][i][2] for r in used)) for i in range(n_boxes)], cam=cam,
@@ -345,6 +349,16 @@ def rong_summary(rows, ref_box, ref_tag, n_boxes, cfg, stride=1):
 
 
 # ---------------------------------------------------------------- body motion, repeatability
+def scale_interval(sj, uj, s0, u0, same):
+    """Interval of r = s_j / s_0 with the statistical uncertainties of both medians (NT3-1); N0 against itself is 1.
+    Systematic edge bias between clips is NOT inside (limitation)."""
+    if same:
+        return 1.0, 1.0
+    uj = 0.0 if not math.isfinite(uj) else uj
+    u0 = 0.0 if not math.isfinite(u0) else u0
+    return (sj - uj) / (s0 + u0), (sj + uj) / (s0 - u0)
+
+
 def rot2(a):
     return np.array([[math.cos(a), -math.sin(a)], [math.sin(a), math.cos(a)]])
 
@@ -401,22 +415,29 @@ def analyse(summaries, cfg, rong=None, tag_h=0.12):
             why.append(f'N{j}_du_khop_{m[2] * 1000:.2f}mm')
     cam0 = np.array(summaries[0]['cam'], float)
     c0, H = cam0[:2], float(cam0[2])
-    s0 = summaries[0].get('scale', 1.0)
+    s0, u0 = summaries[0].get('scale', 1.0), summaries[0].get('scale_u', 0.0)
+    qbar0 = np.mean(np.array(summaries[0]['box'], float), axis=0) if nb >= 1 else c0
     eps, eps_h, body = [], [], []
     for j, (s, m) in enumerate(zip(summaries, motions)):
-        dc = float(np.linalg.norm(np.array(s['cam'], float) - cam0))           # x, y, z (NT2-1)
-        eh = abs(s.get('scale', 1.0) / s0 - 1.0) * float(np.hypot(*(np.array(s['tag'][:2]) - c0)))  # NT-7
-        eps_h.append(eh)
+        cj = np.array(s['cam'], float)
+        dc = float(np.hypot(*(cj[:2] - c0)))                                   # x, y (NT3-3)
+        dH = abs(float(cj[2]) - H)
+        r_lo, r_hi = scale_interval(s.get('scale', 1.0), s.get('scale_u', 0.0), s0, u0, j == 0)
+        eh = max(abs(1.0 - 1.0 / r_lo), abs(1.0 - 1.0 / r_hi)) * float(np.hypot(*(np.array(s['tag'][:2]) - c0)))
+        eps_h.append(eh)                                                       # NT-7, NT3-1, NT3-2
         if nb >= 2:
             tj = float(np.hypot(*m[1]))
             rot_c = float(np.hypot(*((rot2(m[0]) - np.eye(2)) @ c0)))         # |(R - I) C0| (NT2-1)
-            eps.append((tj + dc + rot_c) * cfg['dh_m'] / (H - tag_h) + eh)
+            den = H - dH - tag_h                     # the lower camera height: first-order terms stay an upper bound
+            e_H = cfg['dh_m'] * dH / den ** 2 * float(np.hypot(*(qbar0 - c0)))       # NT3-3
+            eps.append((tj + dc + rot_c) * cfg['dh_m'] / den + e_H + eh)
         else:
-            tj, rot_c = NAN, NAN
+            tj, rot_c, e_H = NAN, NAN, NAN
             eps.append(NAN)
         body.append(dict(lan=f'N{j}', dich_m=tj, quay_deg=math.degrees(m[0]) if nb >= 2 else NAN,
-                         du_khop_m=m[2], camera_dich_m=dc, quay_quanh_camera_m=rot_c, eps_m=eps[-1], eps_h_m=eh,
-                         thang_so_N0=s.get('scale', 1.0) / s0))
+                         du_khop_m=m[2], camera_dich_xy_m=dc, camera_dich_z_m=dH, quay_quanh_camera_m=rot_c,
+                         eps_H_m=e_H, eps_m=eps[-1], eps_h_m=eh, thang_so_N0=s.get('scale', 1.0) / s0,
+                         thang_khoang=[r_lo, r_hi]))
     kiem_than = not why
     res = dict(tho=pairwise(raw, eps_h), kiem_than=kiem_than, ly_do_khong_kiem_than=why, than=body)
     if nb >= 2:
@@ -432,9 +453,11 @@ def analyse(summaries, cfg, rong=None, tag_h=0.12):
 
 
 GIOI_HAN = ('Do lap QUAN SAT DUOC cua {n} lan dat (mau nho; khong phai can moi lan dat sau, khong nhan he so; le 1,25 do '
-            'c8b_u; so dung cho chien dich do CODE_C8B/Liam quyet khi khoa U). Tam cao/nghieng on dinh tren chot: bao boi P6 '
-            '(B1 tren lan dat cuoi). Chot mon qua cac buoi chua bao. Do tai mot cho (goc O). Can sai do cao vung than dh '
-            '{dh} m [uoc luong]; goc khong cong eps.')
+            'c8b_u; so dung cho chien dich do CODE_C8B/Liam quyet khi khoa U). Tam ngoi chot cao thap giua cac lan: '
+            'eps_h tu thang bieu kien cua ma voi bat dinh thong ke; LECH HE THONG cua do canh giua hai clip (co deu '
+            'khoang 0,06 px) co the che tam cao 3 mm (~0,6 mm) va CHUA bao (NT3-1). Tam nghieng, hai o khac do cao chua '
+            'bao. Chot mon qua cac buoi chua bao. Do tai mot cho (goc O). Can sai do cao vung than dh {dh} m [uoc '
+            'luong]; goc khong cong eps.')
 GIOI_HAN_THO = (' KHONG kiem duoc than ({why}): so tho gom ca than dich khi nhac tam; than dich cung luc tam dich nguoc '
                 'chieu co the triet tieu (trang v10 muc 3).')
 
