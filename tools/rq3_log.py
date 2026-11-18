@@ -241,6 +241,7 @@ KHOAN = ('T_H', 'C_chung', 'RQ2')
 STAGES = ('screen', 'confirm', 'final', 'explore', 'hil_check', 'final_hil', 'script')   # script: v3.7 §3.3
 FIG8 = {'O1-F02': 0.2, 'O1-F05': 0.5, 'O1-F08': 0.8}     # same as rpi5/o1_tasks.py FIG8 (a test checks)
 MANUAL = '[nhap_tay]'                    # flag of a hoc row typed by hand (S05 §3.1 R-2, EA-7)
+CLIP_H_NOTE = 'clip_h'                   # S05 v3.44 §3.2 H6: ghi_chu of an effort row of clip H filming
 OUTCOMES = ('dat', 'khong_dat', 'chua_ket_luan', 'hong_he_do')
 PLATFORMS = ('SIM', 'HIL', 'HW')
 STEPS = ('flash', 'setup', 'run', 'log', 'analysis')
@@ -2634,7 +2635,7 @@ SUMMARY_HEAD = ['campaign', 'T_operator_h', 'T_operator_no_hoc_h', 'T_machine_h'
                 'N_HW', 'N_hong', 'T_sua_h', 'stop_reason', 'stop_cause', 'stop_reason_check', 'cap_hit',
                 'T_tune_no_hoc_h', 'N_HW_tune', 'gate_result', 'gate_sha256', 'T_wall_end_src', 'B_chung_share',
                 'B_chung_after_freeze_h', 'hoc_nhap_tay_n', 'explore_T_operator_h', 'explore_N_SIM',
-                'explore_N_HIL', 'explore_N_HW', 'so_h_chua_n', 'moc_cho_n', 'moc_ha_n']
+                'explore_N_HIL', 'explore_N_HW', 'so_h_chua_n', 'moc_cho_n', 'moc_ha_n', 'T_clip_h_h']
 VALID = ('dat', 'khong_dat', 'chua_ket_luan')
 _COUNT = {'dat': 'pass', 'khong_dat': 'fail', 'chua_ket_luan': 'inconclusive', 'hong_he_do': 'invalid'}
 _SAME_CONDITION = ('campaign', 'platform', 'stage', 'trajectory', 'speed_mps', 'gain_set_id')
@@ -2771,6 +2772,11 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
         confirm_block_problem (C9D-4; with `gate`: also 2 valid runs per gate level, S05 v3.40 Q1); the other
         codes 'khong_kiem_duoc';
       * so_h_chua_n (C9D-2): judged car runs of the campaign without their clip H comparison (so-h);
+      * moc_cho_n, moc_ha_n (C8b v3 §5, apply_moc): car runs waiting for a file / lowered by a check; they stay in
+        N_HW, N_HW_tune and the time like any chua_ket_luan run (S05 v3.44 §4.3 H4-H5);
+      * T_clip_h_h (S05 v3.44 §3.2 H6): hours of the effort rows whose ghi_chu starts with 'clip_h' (clip H filming
+        of the floor sessions); they are in T_operator and T_tune like any effort row, given apart so that §6.4
+        reports T without clip H too;
       * final (§4.7 [v3.6]): final_<task>@<speed>_* by run_outcome (hong_he_do out of n_valid);
         final_hil rows are account RQ2 (§4.6) and their final_hil_<task>@<speed>_* columns go on the row
         of the campaign whose frozen gain_set_id they carry, or of RQ2-INIT-* by the prefix of the id;
@@ -2959,13 +2965,18 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
         h = _f(r.get('gio')) * 3600
         hoc = r.get('nhan') == 'hoc'
         t, t_end = _effort_span(r)
+        clip_h = r.get('ghi_chu', '').startswith(CLIP_H_NOTE)     # S05 v3.44 H6: in T and the caps, also apart
         if c == 'B-chung':
             add('B-chung', 'T_op_s', h)
             if not hoc:
                 add('B-chung', 'T_noh_s', h)
+            if clip_h:
+                add('B-chung', 'clip_h_s', h)
         targets = b_split(c) if c else [(k, 1.0)]
         for tgt, share in targets:
             add(tgt, 'T_op_s', h, share)
+            if clip_h:
+                add(tgt, 'clip_h_s', h, share)
             if hoc:
                 if r.get('ghi_chu', '').startswith(MANUAL):
                     add(tgt, 'hoc_manual', 1.0)
@@ -3055,7 +3066,8 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
                'explore_T_operator_h': _fmt(a.get('X_T_s', 0) / 3600, 3),
                'explore_N_SIM': str(int(round(a.get('X_N_SIM', 0)))), 'explore_N_HIL': str(int(a.get('X_N_HIL', 0))),
                'explore_N_HW': str(int(a.get('X_N_HW', 0))), 'so_h_chua_n': str(so_h_open.get(c, 0)),
-               'moc_cho_n': str(moc_cho.get(c, 0)), 'moc_ha_n': str(moc_ha.get(c, 0))}
+               'moc_cho_n': str(moc_cho.get(c, 0)), 'moc_ha_n': str(moc_ha.get(c, 0)),
+               'T_clip_h_h': _fmt(a.get('clip_h_s', 0) / 3600, 3)}
         row.update({k: str(v) for k, v in sorted(finals.get(c, {}).items())})
         if c in map_rep:                            # extra columns, only for a campaign with refused mappings
             row['hil_map_refused_n'] = str(map_rep[c]['n'])

@@ -698,3 +698,36 @@ def test_demo_real_so_h_above_eps_needs_and_checks_h1(demo):
              os.path.join(demo, 'FAKE_gate_c8.json'))
     got = _after(demo)[uid]
     assert got['moc_flags'] == 'tien_de_khong_phu_h1,u_moc_vuot' and got['U_moc_xy_m'] == '0.02'
+
+
+# ── S05 v3.44 (O1 v11.40): caps and clip H hours (CODE 18/11) ─────────────────────────────────────────────────────
+
+def _summary_rows(ds):
+    gf = rl.read_gate_file(os.path.join(ds, 'FAKE_gate_c8.json'))
+    return {r['campaign']: r for r in rl.summary(ds, gate_file=gf)}
+
+
+def test_s05_h4_h5_lowered_runs_stay_in_the_caps(demo):
+    """S05 v3.44 §4.3 H4-H5: a run made chua_ket_luan by the premise / anchor rule still counts in the car-run and
+    hour caps (§4.1), like any chua_ket_luan run."""
+    keep = ('N_HW', 'N_HW_tune', 'N_hong', 'T_operator_h', 'T_tune_no_hoc_h', 'cap_hit')
+    before = {k: _summary_rows(demo)['A-PID'][k] for k in keep}
+    _drop(demo, rl.TIEN_DE, rl.TIEN_DE_COLS, lambda r: r['session_id'] != 'FAKE-A1')
+    after = _summary_rows(demo)['A-PID']
+    assert after['moc_cho_n'] == '1'                                   # FAKE-A1:2 waits for its premise file
+    assert {k: after[k] for k in keep} == before
+
+
+def test_s05_h6_clip_h_hours_in_t_and_apart(demo):
+    """S05 v3.44 §3.2 H6: an effort row of clip H filming (ghi_chu 'clip_h ...', the campaign code) is in T_operator
+    and T_tune like any effort row, and given apart in T_clip_h_h; a B-chung row is split like the others."""
+    b = _summary_rows(demo)
+    rl.effort(demo, '2026-11-20', '07:00', '07:15', campaign='A-PID', ghi_chu='clip_h FAKE 4 clip H buoi FAKE-A1')
+    rl.effort(demo, '2026-11-20', '07:15', '07:21', campaign='A-PID', ghi_chu='FAKE other work')
+    rl.effort(demo, '2026-11-20', '12:00', '12:30', campaign='B-chung', ghi_chu='clip_h FAKE buoi chung')
+    a = _summary_rows(demo)
+    assert a['A-PID']['T_clip_h_h'] == '0.250' and b['A-PID']['T_clip_h_h'] == '0.000'
+    for k in ('T_operator_h', 'T_tune_no_hoc_h'):
+        assert abs(float(a['A-PID'][k]) - float(b['A-PID'][k]) - 0.35) < 1e-9, k
+    assert a['B-chung']['T_clip_h_h'] == '0.500'
+    assert float(a['B-PID']['T_clip_h_h']) + float(a['B-LADRC']['T_clip_h_h']) == 0.5
