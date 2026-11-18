@@ -879,7 +879,7 @@ def track_doc(run, cam=CAM, **over):
     off = (cam.get('bo_cham') or {}).get('tag_offset')
     d = dict(frames_sha256=_fsha(run), session_sha256=MOC_SHA['session'], u_so_sha256=MOC_SHA['u_so'],
              lich_sha256=LICH_BODY, cham_lai=2, thu=False, tag_offset=list(off) if off else [0.0, 0.0, 0.0],
-             run='clip_' + run, dets_sha256=_dsha(run))
+             run='clip_' + run, dets_sha256=_dsha(run), lich_file_sha256=MOC_SHA['lich'])
     d.update(over)
     return d
 
@@ -1623,7 +1623,7 @@ def test_cong_written_and_read_back_with_real_reader(tmp_path):
         assert not (tmp_path / 'g2.json').exists()
 
 
-def _scoring(d, tag, cam, runs=('r1', 'r2', 'r3', 'r4'), body=None, clip_tag=None):
+def _scoring(d, tag, cam, runs=('r1', 'r2', 'r3', 'r4'), body=None, clip_tag=None, reverse=False):
     """Files of one scoring in directory d/tag, chained as c7_measure writes them (CODE_CAM feat/c8-33-moc e8af52b):
     session.json, u_so.json, tap_moc.json, lich.json (session_sha256, u_so_sha256, tap_moc_file_sha256), frames.csv and
     track.json of each run (frames_sha256, session_sha256, u_so_sha256, lich_sha256, cham_lai 2, tag_offset), the clock
@@ -1640,6 +1640,7 @@ def _scoring(d, tag, cam, runs=('r1', 'r2', 'r3', 'r4'), body=None, clip_tag=Non
     body = body or hashlib.sha256(('lich ' + tag).encode()).hexdigest()
     ct = clip_tag or tag                                             # the clips (name, dets) this schedule was built on
     clips = [dict(name=f'clip_{r}', kind='luot', dets_sha256=_dsha(r + ct), n=100) for r in runs]
+    clips = clips[::-1] if reverse else clips
     (p / 'lich.json').write_text(json.dumps(dict(lich_sha256=body, session_sha256=sh['session'], u_so_sha256=sh['u_so'],
                                                  tap_moc_file_sha256=sh['tap_moc'], hoi_tu=True, clips=clips)),
                                  encoding='utf-8')
@@ -1656,7 +1657,8 @@ def _scoring(d, tag, cam, runs=('r1', 'r2', 'r3', 'r4'), body=None, clip_tag=Non
         tp = p / f'track_{rid}.json'
         tp.write_text(json.dumps(dict(frames_sha256=fr_sha[rid], session_sha256=sh['session'], u_so_sha256=sh['u_so'],
                                       lich_sha256=body, cham_lai=2, thu=False, tag_offset=list(off),
-                                      run=f'clip_{rid}', dets_sha256=_dsha(rid + tag))),
+                                      run=f'clip_{rid}', dets_sha256=_dsha(rid + (clip_tag or tag)),
+                                      lich_file_sha256=sh['lich'])),
                       encoding='utf-8')
         gp = p / f'gio_{rid}.json'
         gp.write_text(json.dumps(dict(g, sha256=dict(frames=fr_sha[rid], esp32='0' * 64))), encoding='utf-8')
@@ -1805,6 +1807,48 @@ def test_moc_cli_same_schedule_body_other_clips_refused(tmp_path):
     assert CU.main(_khoa_args(d, dict(A, cam=str(d / 'A' / 'cam_B.json')), files=files)
                    + ['--out', str(d / 'k.json')]) == 2
     assert not (d / 'k.json').exists()
+
+
+def test_moc_cli_schedule_clips_reordered_refused(tmp_path):
+    # C8BU4-R3-1 (Codex): a schedule with the same body, the same clips (names, detections) in another order: the clip
+    # index of an event then names another clip. Tracks of A, schedule file of B: refused by lich_file_sha256
+    import c8_u_imu as cu
+    d = tmp_path
+    A, _ = _scoring(d, 'A', sync(CAM))
+    body_a = json.loads(open(A['files']['lich'], encoding='utf-8').read())['lich_sha256']
+    B, _ = _scoring(d, 'B', sync(CAM), body=body_a, clip_tag='A', reverse=True)
+    files = dict(A['files'], lich=B['files']['lich'], tap_moc=B['files']['tap_moc'], u_so=B['files']['u_so'],
+                 session=B['files']['session'])
+    c = json.loads(open(A['cam'], encoding='utf-8').read())
+    c['moc_dich']['nguon'].update(**{k: cu.sha256(files[k]) for k in ('lich', 'tap_moc', 'u_so', 'session')})
+    (d / 'A' / 'cam_B.json').write_text(json.dumps(c), encoding='utf-8')
+    for r in A['track']:                       # every other link of the tracks made to agree with B
+        t = json.loads(open(A['track'][r], encoding='utf-8').read())
+        t.update(session_sha256=cu.sha256(files['session']), u_so_sha256=cu.sha256(files['u_so']))
+        open(A['track'][r], 'w', encoding='utf-8').write(json.dumps(t))
+    args = _khoa_args(d, dict(A, cam=str(d / 'A' / 'cam_B.json')), files=files)
+    assert CU.main(args + ['--out', str(d / 'k.json')]) == 2
+    assert not (d / 'k.json').exists()
+    for r in A['track']:                       # with the tracks naming B's file it passes: only that field tells
+        t = json.loads(open(A['track'][r], encoding='utf-8').read())
+        t['lich_file_sha256'] = cu.sha256(files['lich'])
+        open(A['track'][r], 'w', encoding='utf-8').write(json.dumps(t))
+    assert CU.main(args + ['--out', str(d / 'k2.json')]) == 0
+
+
+def test_moc_api_lich_file_and_clip_names():
+    # C8BU4-R3-1: a track without lich_file_sha256 (CAM before the field) or with another: refused;
+    # C8BU4-R3-2: a clip name not a string: refused with UError (not a TypeError)
+    for val in (None, 'f' * 64):
+        mt = MT()
+        mt['track']['a']['lich_file_sha256'] = val
+        with pytest.raises(CU.UError, match='lich_file_sha256'):
+            KH(moc_tep=mt)
+    for val in ([], {}, '', None):
+        mt = MT()
+        mt['lich_doc']['clips'][0]['name'] = val
+        with pytest.raises(CU.UError, match='clip name'):
+            KH(moc_tep=mt)
 
 
 def test_moc_api_track_clip_in_schedule():

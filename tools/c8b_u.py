@@ -378,7 +378,7 @@ def check_moc(cam, moc_tep, gios):
       every C8 run with an ok clock has frames; no frames outside the C8 clock files; frames SHA = the clock file's
       sha256.frames (c7_score scores only the frames of its clock file) whenever the clock file names one;
       track.json of each run: frames_sha256 = frames, session_sha256 = session, u_so_sha256 = u_so, lich_sha256 = the
-      lich_sha256 inside lich.json, cham_lai 2 and not thu (the final scoring), tag_offset (the one the frames were
+      lich_sha256 inside lich.json, lich_file_sha256 = lich (C8BU4-R3-1), cham_lai 2 and not thu (the final scoring), tag_offset (the one the frames were
       computed with) = bo_cham.tag_offset (null = 0, 0, 0);
       lich.json: session_sha256, u_so_sha256, tap_moc_file_sha256 = the files given; its clips hold the clip of each
       track (track.run, dets_sha256), a different clip per run (C8BU4-R2-1);
@@ -445,6 +445,9 @@ def check_moc(cam, moc_tep, gios):
         _eq(t.get('session_sha256'), ng['session'], f'track.json of {rid} session_sha256')
         _eq(t.get('u_so_sha256'), ng['u_so'], f'track.json of {rid} u_so_sha256')
         _eq(t.get('lich_sha256'), lich_body, f'track.json of {rid} lich_sha256')
+        # C8BU4-R3-1: the schedule FILE the track used (clips and their order included: c7_measure takes the clip
+        # index from the position in lich.json clips); field asked of CODE_CAM 18/11; missing: refused
+        _eq(t.get('lich_file_sha256'), ng['lich'], f'track.json of {rid} lich_file_sha256')
         if t.get('cham_lai') != 2 or t.get('thu') is not False:
             raise UError(f'track.json of {rid}: cham_lai {t.get("cham_lai")!r}, thu {t.get("thu")!r}: not the final '
                          f'scoring (cham_lai 2, thu false)')
@@ -453,12 +456,14 @@ def check_moc(cam, moc_tep, gios):
                          f'U_moc and the frames were computed with another tag offset')
     # C8BU4-R2-1: lich_sha256 hashes the schedule body, not its clips; tie each track to its own clip in lich.json
     # (clips: [{name, kind, dets_sha256, n}]): the clip named by track.run with the track's dets_sha256, every run a
-    # different clip. A schedule with the same body and clips in another order is left to c7_measure verify_final.
+    # different clip (the order is tied by lich_file_sha256 above, C8BU4-R3-1).
     clips = lich.get('clips')
     if not isinstance(clips, list) or not all(isinstance(c, dict) for c in clips):
         raise UError('lich.json has no clips list')
     by_name = {}
     for c in clips:
+        if not isinstance(c.get('name'), str) or not c['name']:              # C8BU4-R3-2
+            raise UError(f'lich.json: clip name {c.get("name")!r} is not a non-empty string')
         if c.get('name') in by_name:
             raise UError(f'lich.json: clip {c.get("name")!r} twice')
         by_name[c.get('name')] = c
