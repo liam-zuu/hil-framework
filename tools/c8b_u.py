@@ -335,6 +335,15 @@ def _nguon_shape(ng, where):
     cp = ng['car_pose']
     if not isinstance(cp, dict) or set(cp) != {'tag_offset', 'side_m', 'h_m'}:
         raise UError(f'{where}: moc_dich.nguon.car_pose needs exactly tag_offset, side_m, h_m')
+    # C8BU4-R2-3: values too (the lock does not go through the camera-file comparison)
+    to = cp['tag_offset']
+    if to is not None and (not isinstance(to, list) or len(to) != 3):
+        raise UError(f'{where}: moc_dich.nguon.car_pose.tag_offset {to!r}: [dx_m, dy_m, dpsi_rad] or null')
+    for i, x in enumerate(to or []):
+        _fin(x, f'{where} moc_dich.nguon.car_pose.tag_offset[{i}]')
+    if not _num(cp['side_m'], f'{where} moc_dich.nguon.car_pose.side_m') > 0:
+        raise UError(f'{where}: moc_dich.nguon.car_pose.side_m must be > 0')
+    _num(cp['h_m'], f'{where} moc_dich.nguon.car_pose.h_m')
 
 
 def _moc_shape(cam):
@@ -371,7 +380,8 @@ def check_moc(cam, moc_tep, gios):
       track.json of each run: frames_sha256 = frames, session_sha256 = session, u_so_sha256 = u_so, lich_sha256 = the
       lich_sha256 inside lich.json, cham_lai 2 and not thu (the final scoring), tag_offset (the one the frames were
       computed with) = bo_cham.tag_offset (null = 0, 0, 0);
-      lich.json: session_sha256, u_so_sha256, tap_moc_file_sha256 = the files given;
+      lich.json: session_sha256, u_so_sha256, tap_moc_file_sha256 = the files given; its clips hold the clip of each
+      track (track.run, dets_sha256), a different clip per run (C8BU4-R2-1);
       session.json: car_side_m = bo_cham.side_m, tag_h_m = do_cao.h_m, kappa = day_doi.kappa."""
     _moc_shape(cam)
     md = cam['moc_dich']
@@ -441,6 +451,28 @@ def check_moc(cam, moc_tep, gios):
         if not _same(t.get('tag_offset'), off):
             raise UError(f'track.json of {rid} tag_offset {t.get("tag_offset")!r} is not bo_cham.tag_offset {off}: '
                          f'U_moc and the frames were computed with another tag offset')
+    # C8BU4-R2-1: lich_sha256 hashes the schedule body, not its clips; tie each track to its own clip in lich.json
+    # (clips: [{name, kind, dets_sha256, n}]): the clip named by track.run with the track's dets_sha256, every run a
+    # different clip. A schedule with the same body and clips in another order is left to c7_measure verify_final.
+    clips = lich.get('clips')
+    if not isinstance(clips, list) or not all(isinstance(c, dict) for c in clips):
+        raise UError('lich.json has no clips list')
+    by_name = {}
+    for c in clips:
+        if c.get('name') in by_name:
+            raise UError(f'lich.json: clip {c.get("name")!r} twice')
+        by_name[c.get('name')] = c
+    seen = {}
+    for rid in sorted(fr):
+        t = tracks[rid]
+        nm = t.get('run')
+        if not isinstance(nm, str) or not nm or nm not in by_name:
+            raise UError(f'track.json of {rid}: run {nm!r} is not a clip of lich.json: U_moc is of another schedule')
+        if nm in seen:
+            raise UError(f'track.json of {rid} and of {seen[nm]} are the same clip {nm!r}')
+        seen[nm] = rid
+        _sha_hex(t.get('dets_sha256'), f'track.json of {rid} dets_sha256')
+        _eq(by_name[nm].get('dets_sha256'), t['dets_sha256'], f'lich.json clip {nm} dets_sha256 vs track.json of {rid}')
 
 
 def u_p_u_psi(cam, tb, tk, xo, info=None):
@@ -747,6 +779,12 @@ def cong(k, plan, luot, levels, branch, c8_dir, cam=None, written_by=None, meta=
             raise UError(f'run {rid} (slot {slot}) is not a C8 run of the lock: the lock was made from other runs')
         if gsha != lk[rid]['gio_sha256']:
             raise UError(f'run {rid}: its clock file is not the one the lock was made from (gio_sha256 differs)')
+        # C8BU4-R2-2: a run with an ok clock has its frames in the lock, the frames of that clock file
+        if _g.get('ok'):
+            g_fr = (_g.get('sha256') or {}).get('frames') if isinstance(_g.get('sha256'), dict) else None
+            if lk[rid].get('frames_sha256') is None or lk[rid]['frames_sha256'] != g_fr:
+                raise UError(f'run {rid}: the lock has no U_moc frames for it, or not the frames of its clock file '
+                             f'(sha256.frames)')
     chosen = slot_runs(plan, luot)
     thr = {c: o1_gate.THRESHOLDS[c] for c in MASKABLE}
     per, parts = {}, {}
@@ -870,6 +908,8 @@ def check_khoa(k, name='khoa'):
         if not isinstance(v, dict):
             raise UError(f'{name}: luot_c8.{rid} not an object')
         _sha_hex(v.get('gio_sha256'), f'{name} luot_c8.{rid}.gio_sha256')
+        if v.get('frames_sha256') is not None:                 # null only for a run whose clock was not ok
+            _sha_hex(v['frames_sha256'], f'{name} luot_c8.{rid}.frames_sha256')
     fr = md['nguon']['frames']
     extra = sorted(set(fr) - set(lk))
     if extra:
@@ -963,7 +1003,8 @@ def main(argv=None):
             for s in a.luot:
                 slot, rest = s.split('=', 1)
                 rid, g, l = rest.split(',')
-                luot.append((slot, rid, _json(g), _json(l), cu.sha256(g)))
+                gd, gsha = _json_sha(g)                 # C8BU4-R2-4: content and SHA from the same bytes
+                luot.append((slot, rid, gd, _json(l), gsha))
             st = cu.script_state()
             d = cong(k, plan, luot, [x.strip() for x in a.levels.split(',')], a.u_t_branch, a.c8_dir,
                      _json(a.cam) if a.cam else None,
