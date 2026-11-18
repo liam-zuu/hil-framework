@@ -748,8 +748,8 @@ def test_rs1_1_clip_h_is_never_hoc(demo):
 
 
 def test_rs1_2_short_effort_rows_keep_their_time(demo):
-    """RS1-2 (Liam 18/11 "Sửa luôn"): gio with 4 decimals; four 1-minute clip_h rows give the same hours as one
-    4-minute row (0.01 h rounding lost or added up to 36 s per row before)."""
+    """RS1-2 (Liam 18/11 "Sửa luôn"): gio with 4 decimals (0.36 s); four 1-minute clip_h rows give the hours of one
+    4-minute row within the quantum (0.18 s per row; RS3-1), a 5 s row no longer vanishes (0.01 h was 36 s per row)."""
     b = _summary_rows(demo)['A-PID']
     for m in range(4):
         r = rl.effort(demo, '2026-11-20', f'07:0{m}', f'07:0{m + 1}', campaign='A-PID', ghi_chu=f'clip_h FAKE {m}')
@@ -758,3 +758,15 @@ def test_rs1_2_short_effort_rows_keep_their_time(demo):
     a = _summary_rows(demo)['A-PID']
     assert a['T_clip_h_h'] == '0.068'                                   # 4 x 0.0167 + 0.0014 h
     assert abs(float(a['T_tune_no_hoc_h']) - float(b['T_tune_no_hoc_h']) - 0.068) < 0.0015
+
+
+def test_rs3_1_split_and_joined_rows_agree_within_the_quantum(tmp_path):
+    """RS3-1: the same 4 minutes as four rows or as one row; the stored gio sums differ by at most 0.18 s per row."""
+    d = str(tmp_path / 'e')
+    os.makedirs(d)
+    split = [float(rl.effort(d, '2026-11-20', f'07:0{m}', f'07:0{m + 1}', campaign='A-PID', ghi_chu='clip_h x')['gio'])
+             for m in range(4)]
+    joined = float(rl.effort(d, '2026-11-20', '08:00', '08:04', campaign='A-PID', ghi_chu='clip_h y')['gio'])
+    assert abs(sum(split) - 4 / 60) * 3600 <= 0.18 * 4 + 1e-9
+    assert abs(joined - 4 / 60) * 3600 <= 0.18 + 1e-9
+    assert abs(sum(split) - joined) * 3600 <= 0.18 * 5 + 1e-9
