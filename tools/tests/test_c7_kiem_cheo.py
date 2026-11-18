@@ -474,10 +474,11 @@ def _chains(anchor_sets=(ALL8,)):
     return out
 
 
-def _frames(n=100, fps=60.0, invalid=(), anchors=None):
+def _frames(n=100, fps=60.0, invalid=(), anchors=None, seen=None):
     rows = []
     for k in range(n):
-        r = dict(idx=str(k), t_s=repr(k / fps), valid='0' if k in invalid else '1')
+        r = dict(idx=str(k), t_s=repr(k / fps), valid='0' if k in invalid else '1',
+                 moc_thay=';'.join(str(i) for i in (seen or {}).get(k, (anchors or {}).get(k, ALL8))))
         for c in kc.comparators(GR):
             r[f'moc_neo_{c}'] = ';'.join(str(i) for i in (anchors or {}).get(k, ALL8))
         rows.append(r)
@@ -788,3 +789,43 @@ def test_phan_tich_full_run_and_missing_measured_mark(tmp_path, scene, monkeypat
     t2.mkdir()
     assert kc.main(_phan_tich_args(t2, scene, extra_mark=True)) == 2
     assert not (t2 / 'kc' / 'kiem_cheo.json').exists()
+
+
+def test_frame_check_seen_target_out_of_the_anchors_is_checked():
+    """KCC3-1: a mark of group 0 still seen (a target) but left out of the anchors: its comparator is active, and
+    an uncomputed fit set makes the run short of checks."""
+    no_g0 = [2, 3, 4, 6, 7]
+    r = kc.run_frame_check(_frames(anchors={k: no_g0 for k in range(100)}, seen={k: no_g0 + [1] for k in range(100)}),
+                           [dict(khung=str(k), moc='6', nhom='1', ex='0.001', ey='0.0') for k in range(100)],
+                           {}, GR, _chains())
+    assert any(x['nhom_dich'] == 0 for x in r['tap_chua_tinh']) and r['thieu']
+
+
+def _kiem_h_files(tmp_path, scene, session_ids):
+    marks, cam, img = scene
+    video = tmp_path / 'h.mov'
+    video.write_bytes(b'x')
+    sess = tmp_path / 's.json'
+    sess.write_text(json.dumps(dict(fit_ids=session_ids)), encoding='utf-8')
+    moc = tmp_path / 'moc.csv'
+    rows = ['id,vai_tro,x_cm,y_cm,canh_den_mm,dict,sigma_x_mm,sigma_y_mm,canh_nguon']
+    rows += [f'{i},moc_san,{x * 100!r},{y * 100!r},{s * 1000!r},DICT_4X4_50,0.8,0.9,do' for i, (x, y, s) in marks.items()]
+    moc.write_text('\n'.join(rows) + '\n', encoding='utf-8')
+    return ['kiem_h', '--video', str(video), '--session', str(sess), '--moc', str(moc)]
+
+
+def test_kiem_h_cli_at_the_floor(tmp_path, scene, monkeypatch):
+    """KCC1-14 through the command used at C8: every mark seen at once and in the session: 0; the video sees every
+    mark but the session lacks a measured one: 2 (quay lai clip H); fewer than 95 % at once: 2."""
+    marks, cam, img = scene
+    monkeypatch.setattr(kc, 'clip_dets', lambda v, ids, max_frames=None: ([k / 60 for k in range(40)], [img] * 40))
+    assert kc.main(_kiem_h_files(tmp_path, scene, sorted(img))) == 0
+    t2 = tmp_path / 'b'
+    t2.mkdir()
+    assert kc.main(_kiem_h_files(t2, scene, sorted(img)[1:])) == 2
+    part = {i: c for i, c in img.items() if i != 3}
+    monkeypatch.setattr(kc, 'clip_dets', lambda v, ids, max_frames=None: ([k / 60 for k in range(40)],
+                                                                          [img] * 37 + [part] * 3))
+    t3 = tmp_path / 'c'
+    t3.mkdir()
+    assert kc.main(_kiem_h_files(t3, scene, sorted(img))) == 2

@@ -597,12 +597,14 @@ def run_frame_check(frames, khung, track, groups, u_so_chains, max_thieu=COVER_M
       mark and its own group (KCC1-6); no accepted row on a valid frame = no check value there.
       coverage: counted from the accepted rows, not from flags (KCC1-6): short of checks when more than max_thieu of
       the valid frames have none, or a gap without check is longer than max_gap_s, or no accepted row at all.
-      sets: in EVERY frame (valid or not, KCC1-4), each comparator's fit set (anchors of the chain minus the excluded
-      groups), when large enough to fit, must be among the sets u_so computed (tap_tinh, KCC1-3); else short of checks.
+      sets: in EVERY frame (valid or not, KCC1-4), each comparator with a target of its group SEEN in the frame
+      (moc_thay, KCC3-1: a seen mark left out of the anchors is still a target) must have its fit set (anchors of the
+      chain minus the excluded groups), when large enough to fit, among the sets u_so computed (tap_tinh, KCC1-3);
+      else short of checks.
     Returns dict(max_m (None without rows), n_valid, ti_le_thieu, khoang_mat_max_s, thieu, ly_do)."""
     G = len(groups)
     comp = comparators(groups)
-    need = {'idx', 't_s', 'valid'} | {f'moc_neo_{c}' for c in comp}
+    need = {'idx', 't_s', 'valid', 'moc_thay'} | {f'moc_neo_{c}' for c in comp}
     if not frames or not need <= set(frames[0]):
         raise KCError(f'frames.csv: missing columns {sorted(need - set(frames[0] if frames else ()))}')
     gmap = {i: k for k, g in enumerate(groups) for i in g}
@@ -631,11 +633,12 @@ def run_frame_check(frames, khung, track, groups, u_so_chains, max_thieu=COVER_M
     done = {(c, x['nhom_dich'], frozenset(x['tap'])) for c, v in u_so_chains.items() for x in v.get('tap_tinh', [])}
     lost_sets = set()
     for r in frames:
+        seen = _ids(r['moc_thay'])                 # KCC3-1: floor marks detected in the frame (targets), not the anchors
         for c, cmp_ in comp.items():
             A = _ids(r[f'moc_neo_{c}'])
             for tg, E in cmp_.items():
-                if not any(gmap.get(i) == tg for i in A):
-                    continue                       # KCC1-4: no target of group tg in this frame, the comparator is idle
+                if not any(gmap.get(i) == tg for i in seen):
+                    continue                       # KCC1-4: no mark of group tg seen in this frame, the comparator is idle
                 fit = frozenset(i for i in A if gmap.get(i) not in E)
                 if len(fit) >= MIN_TRAIN and (c, tg, fit) not in done:
                     lost_sets.add((c, tg, tuple(sorted(fit))))
