@@ -57,8 +57,11 @@ khoa (after the C8 clips are tracked and the C8 runs have their clock files):
   The lock keeps moc_dich (U_moc_xy_m, U_moc_psi_deg BEFORE the margin, with their sources) so that a later run can
   compare the same quantity (proposal v3 sections 3, 5). khoa refuses (proposal v3 section 4, "Tu choi khoa"): a
   missing field, phuong_phap_duyet empty, tien_de_buoi not 'dat', or a SHA-256 in moc_dich.nguon that is not the one
-  of the file khoa is given (frames of each run, schedule, tap_moc, u_so, session), or a car_pose set-up in nguon
-  other than the one of the camera file.
+  of the file khoa is given (frames of each run, schedule, tap_moc, u_so, session), or sources that do not chain
+  (frames = the clock file's frames; track.json of each run, lich.json, session.json name these same files, the
+  final scoring, and the tag offset, tag side, tag height, kappa of the camera file: check_moc, C8BU4-R1-1, R1-2).
+  The lock keeps luot_c8 {RUN: gio_sha256, frames_sha256}; cong takes only those runs with those clock files
+  (C8BU4-R1-3).
   Test 5 (ruler at the stop points, dropped in v10, kept as an option) is an end-to-end check: every difference
   <= U_p, else 'xem_lai' (not widened by itself). 3b with ga_ok false: refused (set-up redone).
 cong (after every C8 figure-8 run is scored on its clock grid with the locked constants):
@@ -73,7 +76,8 @@ cong (after every C8 figure-8 run is scored on its clock grid with the locked co
   checked before the file is opened), then read back with gate_c8.read_gate_c8; an existing file is never replaced.
 
   python tools/c8b_u.py khoa --gio r1=gio_r1.json ... --tb 3b.json --cam-u c8_cam_u_vao.json \
-      --thuoc-kep thuoc_kep.json --xoay xoay.json --moc-frames r1=frames_r1.csv ... --moc-lich lich.json \
+      --thuoc-kep thuoc_kep.json --xoay xoay.json --moc-frames r1=frames_r1.csv ... \
+      --moc-track r1=track_r1.json ... --moc-lich lich.json \
       --moc-tap-moc tap_moc.json --moc-u-so u_so.json --moc-session session.json \
       [--u-imu u_imu_dong.json] [--phep5 phep5.csv] --out c8b_khoa.json
   python tools/c8b_u.py cong --khoa c8b_khoa.json --ke-hoach ke_hoach_c8.csv --levels O1-F02,O1-F05,O1-F08 \
@@ -310,32 +314,39 @@ def _same(a, b):
     return math.isclose(float(a), float(b), rel_tol=1e-12, abs_tol=0.0)
 
 
-def _moc_shape(cam):
-    """Block moc_dich of c8_cam_u_vao_v3 (proposal v3 section 4): every field present and of its type; the car_pose
-    set-up in nguon equal to the one of this file. The values khoa needs ('dat', an approval, SHAs of the files it is
-    given) are checked by check_moc."""
-    md = _get(cam, 'moc_dich')
-    for k in ('phuong_phap_duyet', 'tien_de_buoi'):
-        if not isinstance(md.get(k), str):
-            raise UError(f'camera input: moc_dich.{k} missing or not a string (proposal v3 section 4)')
-    ng = md.get('nguon')
+def _nguon_shape(ng, where):
+    """moc_dich.nguon (proposal v3 section 4): frames {RUN: sha}, lich, tap_moc, u_so, session (SHA-256 of the files),
+    car_pose {tag_offset, side_m, h_m}, bo_lay_mau (sampler version). Shared by the camera file and the lock
+    (C8BU4-R1-4)."""
     if not isinstance(ng, dict):
-        raise UError('camera input: moc_dich.nguon missing (the sources of U_moc, proposal v3 section 4)')
+        raise UError(f'{where}: moc_dich.nguon missing (the sources of U_moc, proposal v3 section 4)')
     miss = sorted(MOC_NGUON_KEYS - set(ng))
     if miss:
-        raise UError(f'camera input: moc_dich.nguon lacks {miss}')
+        raise UError(f'{where}: moc_dich.nguon lacks {miss}')
     fr = ng['frames']
     if not isinstance(fr, dict) or not fr:
-        raise UError('camera input: moc_dich.nguon.frames: {RUN_ID: sha256} of every C8 run needed')
+        raise UError(f'{where}: moc_dich.nguon.frames: {{RUN_ID: sha256}} of every C8 run needed')
     for rid, sha in fr.items():
         _sha_hex(sha, f'moc_dich.nguon.frames.{rid}')
     for k in MOC_FILES:
         _sha_hex(ng[k], f'moc_dich.nguon.{k}')
     if not isinstance(ng['bo_lay_mau'], str) or not ng['bo_lay_mau'].strip():
-        raise UError('camera input: moc_dich.nguon.bo_lay_mau (the sampler version) empty')
+        raise UError(f'{where}: moc_dich.nguon.bo_lay_mau (the sampler version) empty')
     cp = ng['car_pose']
     if not isinstance(cp, dict) or set(cp) != {'tag_offset', 'side_m', 'h_m'}:
-        raise UError('camera input: moc_dich.nguon.car_pose needs exactly tag_offset, side_m, h_m')
+        raise UError(f'{where}: moc_dich.nguon.car_pose needs exactly tag_offset, side_m, h_m')
+
+
+def _moc_shape(cam):
+    """Block moc_dich of c8_cam_u_vao_v3 (proposal v3 section 4): every field present and of its type; the car_pose
+    set-up in nguon equal to the one of this file. The values khoa needs ('dat', an approval, the files of the scoring
+    it is given) are checked by check_moc."""
+    md = _get(cam, 'moc_dich')
+    for k in ('phuong_phap_duyet', 'tien_de_buoi'):
+        if not isinstance(md.get(k), str):
+            raise UError(f'camera input: moc_dich.{k} missing or not a string (proposal v3 section 4)')
+    _nguon_shape(md.get('nguon'), 'camera input')
+    cp = md['nguon']['car_pose']
     want = dict(tag_offset=_get(cam, 'bo_cham.tag_offset'), side_m=_get(cam, 'bo_cham.side_m'),
                 h_m=_get(cam, 'do_cao.h_m'))
     for k, w in want.items():
@@ -344,11 +355,24 @@ def _moc_shape(cam):
                          f'computed with another car_pose set-up')
 
 
-def check_moc(cam, moc_tep, run_ids, ok_ids):
+def _eq(got, want, what):
+    if got != want:
+        raise UError(f'{what}: {got!r}, expected {want!r}: U_moc is of another scoring (the sources do not chain)')
+
+
+def check_moc(cam, moc_tep, gios):
     """proposal v3 section 4 ("Tu choi khoa", Liam 18/11): the lock is refused when phuong_phap_duyet is empty,
-    tien_de_buoi is not 'dat', or a SHA in moc_dich.nguon is not the SHA of the file khoa is given (moc_tep: {'frames':
-    {RUN_ID: sha}, 'lich': sha, 'tap_moc': sha, 'u_so': sha, 'session': sha}). Frames: one per C8 run, every run whose
-    clock file is ok, no run outside the C8 clock files (run_ids)."""
+    tien_de_buoi is not 'dat', or the sources in moc_dich.nguon are not the files of the final scoring khoa is given.
+    moc_tep (the CLI reads the files): {'frames': {RUN: sha}, 'track': {RUN: track.json}, 'lich': sha, 'lich_doc':
+    lich.json, 'tap_moc': sha, 'u_so': sha, 'session': sha, 'session_doc': session.json}.
+    Chain (C8BU4-R1-1, R1-2; field names of c7_measure, CODE_CAM feat/c8-33-moc e8af52b):
+      every C8 run with an ok clock has frames; no frames outside the C8 clock files; frames SHA = the clock file's
+      sha256.frames (c7_score scores only the frames of its clock file) whenever the clock file names one;
+      track.json of each run: frames_sha256 = frames, session_sha256 = session, u_so_sha256 = u_so, lich_sha256 = the
+      lich_sha256 inside lich.json, cham_lai 2 and not thu (the final scoring), tag_offset (the one the frames were
+      computed with) = bo_cham.tag_offset (null = 0, 0, 0);
+      lich.json: session_sha256, u_so_sha256, tap_moc_file_sha256 = the files given;
+      session.json: car_side_m = bo_cham.side_m, tag_h_m = do_cao.h_m, kappa = day_doi.kappa."""
     _moc_shape(cam)
     md = cam['moc_dich']
     if not md['phuong_phap_duyet'].strip():
@@ -357,7 +381,7 @@ def check_moc(cam, moc_tep, run_ids, ok_ids):
         raise UError(f'moc_dich.tien_de_buoi {md["tien_de_buoi"]!r} is not dat: the session did not pass the '
                      f'empirical confirmation of u_so, the lock is refused (proposal v3 section 4)')
     if not isinstance(moc_tep, dict):
-        raise UError('the files of the final scoring (frames, lich, tap_moc, u_so, session) are needed to check '
+        raise UError('the files of the final scoring (frames, track, lich, tap_moc, u_so, session) are needed to check '
                      'moc_dich.nguon (C8BM-R2-2)')
     ng = md['nguon']
     for k in MOC_FILES:
@@ -373,10 +397,50 @@ def check_moc(cam, moc_tep, run_ids, ok_ids):
         if fr[rid] != got[rid]:
             raise UError(f'moc_dich.nguon.frames.{rid} is not the SHA-256 of the frames file given for {rid}: U_moc is '
                          f'of another scoring of that run')
-    extra, lack = sorted(set(fr) - set(run_ids)), sorted(set(ok_ids) - set(fr))
+    ok_ids = [r for r, g in gios.items() if isinstance(g, dict) and g.get('ok')]
+    extra, lack = sorted(set(fr) - set(gios)), sorted(set(ok_ids) - set(fr))
     if extra or lack:
         raise UError(f'U_moc frames runs vs the C8 clock files: not a C8 run {extra}, C8 run with an ok clock missing '
                      f'{lack} (U_moc must cover every scored frame of every C8 run)')
+    # C8BU4-R1-1: the frames of U_moc are the frames of the clock file (the ones the nodes score)
+    for rid in sorted(fr):
+        g_fr = ((gios[rid].get('sha256') or {}) if isinstance(gios[rid].get('sha256'), dict) else {}).get('frames')
+        if g_fr is None and rid in ok_ids:
+            raise UError(f'clock file of {rid} names no frames (sha256.frames): U_moc cannot be tied to it')
+        if g_fr is not None:
+            _eq(fr[rid], g_fr, f'moc_dich.nguon.frames.{rid} vs the clock file sha256.frames')
+    # C8BU4-R1-2: the set-up and the schedule actually used, from the files of the scoring
+    lich, sess, tracks = moc_tep.get('lich_doc'), moc_tep.get('session_doc'), moc_tep.get('track') or {}
+    if not isinstance(lich, dict) or not isinstance(sess, dict):
+        raise UError('lich.json and session.json contents needed (the schedule and the set-up actually used)')
+    lich_body = lich.get('lich_sha256')
+    if not isinstance(lich_body, str) or not lich_body:
+        raise UError('lich.json has no lich_sha256')
+    _eq(lich.get('session_sha256'), ng['session'], 'lich.json session_sha256')
+    _eq(lich.get('u_so_sha256'), ng['u_so'], 'lich.json u_so_sha256')
+    _eq(lich.get('tap_moc_file_sha256'), ng['tap_moc'], 'lich.json tap_moc_file_sha256')
+    for key, want, what in (('car_side_m', _get(cam, 'bo_cham.side_m'), 'bo_cham.side_m'),
+                            ('tag_h_m', _get(cam, 'do_cao.h_m'), 'do_cao.h_m'),
+                            ('kappa', _get(cam, 'day_doi.kappa'), 'day_doi.kappa')):
+        if not _same(sess.get(key), want):
+            raise UError(f'session.json {key} {sess.get(key)!r} is not {what} {want!r} of the camera file')
+    off = list(_tag_offset(cam))
+    if set(tracks) != set(fr):
+        raise UError(f'track.json runs {sorted(tracks)} are not the frames runs {sorted(fr)}')
+    for rid in sorted(fr):
+        t = tracks[rid]
+        if not isinstance(t, dict):
+            raise UError(f'track.json of {rid}: not a JSON object')
+        _eq(t.get('frames_sha256'), fr[rid], f'track.json of {rid} frames_sha256')
+        _eq(t.get('session_sha256'), ng['session'], f'track.json of {rid} session_sha256')
+        _eq(t.get('u_so_sha256'), ng['u_so'], f'track.json of {rid} u_so_sha256')
+        _eq(t.get('lich_sha256'), lich_body, f'track.json of {rid} lich_sha256')
+        if t.get('cham_lai') != 2 or t.get('thu') is not False:
+            raise UError(f'track.json of {rid}: cham_lai {t.get("cham_lai")!r}, thu {t.get("thu")!r}: not the final '
+                         f'scoring (cham_lai 2, thu false)')
+        if not _same(t.get('tag_offset'), off):
+            raise UError(f'track.json of {rid} tag_offset {t.get("tag_offset")!r} is not bo_cham.tag_offset {off}: '
+                         f'U_moc and the frames were computed with another tag offset')
 
 
 def u_p_u_psi(cam, tb, tk, xo, info=None):
@@ -466,17 +530,23 @@ def u_p_u_psi(cam, tb, tk, xo, info=None):
     return LE * sum(p.values()), p, LE * sum(s.values()), s
 
 
-def khoa(gios, tb, cam, tk, xo, u_imu=None, phep5=None, tb_name='', tb_sha='', moc_tep=None):
-    """gios: {run_id: c8b_gio_v1 dict} of the C8 runs. moc_tep: SHA-256 of the files of the final scoring that khoa is
-    given, {'frames': {run_id: sha}, 'lich', 'tap_moc', 'u_so', 'session': sha} (check_moc; proposal v3 section 4)."""
+def khoa(gios, tb, cam, tk, xo, u_imu=None, phep5=None, tb_name='', tb_sha='', moc_tep=None, gio_sha=None):
+    """gios: {run_id: c8b_gio_v1 dict} of the C8 runs; gio_sha: {run_id: SHA-256 of its clock file} (the lock keeps
+    them so that cong takes only these runs, C8BU4-R1-3). moc_tep: the files of the final scoring khoa is given
+    (check_moc; proposal v3 section 4)."""
     if not gios:
         raise UError('no C8 clock file')
+    for rid, g in gios.items():
+        if not isinstance(g, dict) or g.get('format') != 'c8b_gio_v1':
+            raise UError(f'{rid}: not a c8b_gio_v1 file')
+    if not isinstance(gio_sha, dict) or set(gio_sha) != set(gios):
+        raise UError('the SHA-256 of every C8 clock file is needed (the lock ties the gate runs to them)')
+    for rid, sha in gio_sha.items():
+        _sha_hex(sha, f'clock file SHA of {rid}')
     check_cam(cam)
-    check_moc(cam, moc_tep, list(gios), [r for r, g in gios.items() if isinstance(g, dict) and g.get('ok')])
+    check_moc(cam, moc_tep, gios)
     rates, dai = [], {}
     for rid, g in gios.items():
-        if g.get('format') != 'c8b_gio_v1':
-            raise UError(f'{rid}: not a c8b_gio_v1 file')
         if not g.get('ok'):
             continue                                  # a run without a finite clock bound gives no range, no rate
         if g.get('rate_luot') is not None:
@@ -507,7 +577,10 @@ def khoa(gios, tb, cam, tk, xo, u_imu=None, phep5=None, tb_name='', tb_sha='', m
                                                       o_hinh_hoc_m=list(Kc['o_g'])),
                kiem_xoay=kx,          # gap, room; truot_bat_chac_tu_m: a slip at least this large is surely refused
                # proposal v3 section 3 (C8BM-R2-2): U_moc_* BEFORE the margin with their sources, for later runs
-               moc_dich=json.loads(json.dumps(cam['moc_dich'])))
+               moc_dich=json.loads(json.dumps(cam['moc_dich'])),
+               # C8BU4-R1-3: the C8 runs of this lock; cong takes only these clock files
+               luot_c8={rid: dict(gio_sha256=gio_sha[rid], frames_sha256=cam['moc_dich']['nguon']['frames'].get(rid))
+                        for rid in sorted(gios)})
     if u_imu is not None:
         if u_imu.get('version') != 'u_imu_dong_v2':
             raise UError('u_imu file: version is not u_imu_dong_v2')
@@ -666,6 +739,14 @@ def cong(k, plan, luot, levels, branch, c8_dir, cam=None, written_by=None, meta=
     if not levels or len(set(levels)) != len(levels) or any(lv not in FIG8 for lv in levels):
         raise UError(f'levels {levels!r}: distinct figure-8 tasks')
     check_branch(branch, meta or {}, luot)
+    # C8BU4-R1-3: every run given (lost ones too, before the rerun rule drops any) is a C8 run of this lock with the
+    # same clock file
+    lk = k['luot_c8']
+    for slot, rid, _g, _l, gsha in luot:
+        if rid not in lk:
+            raise UError(f'run {rid} (slot {slot}) is not a C8 run of the lock: the lock was made from other runs')
+        if gsha != lk[rid]['gio_sha256']:
+            raise UError(f'run {rid}: its clock file is not the one the lock was made from (gio_sha256 differs)')
     chosen = slot_runs(plan, luot)
     thr = {c: o1_gate.THRESHOLDS[c] for c in MASKABLE}
     per, parts = {}, {}
@@ -732,6 +813,15 @@ def _json(path):
         return json.load(f)
 
 
+def _json_sha(path):
+    """(parsed JSON, SHA-256) from the same bytes (the content checked is the content hashed)."""
+    import hashlib
+    cu.check_path(path)
+    with open(path, 'rb') as f:
+        b = f.read()
+    return json.loads(b.decode('utf-8')), hashlib.sha256(b).hexdigest()
+
+
 def _clean(o):
     if isinstance(o, dict):
         return {k: _clean(v) for k, v in o.items()}
@@ -770,6 +860,23 @@ def check_khoa(k, name='khoa'):
         raise UError(f'{name}: A7_moc_dich {k["U_psi_phan_deg"]["A7_moc_dich"]} is not moc_dich.U_moc_psi_deg {upsi}')
     if k['U_p_phan_m']['P1_anh_san'] < uxy:
         raise UError(f'{name}: P1_anh_san {k["U_p_phan_m"]["P1_anh_san"]} below moc_dich.U_moc_xy_m {uxy}')
+    # C8BU4-R1-4: the sources in the lock have the shape of the camera file's; C8BU4-R1-3: the C8 runs with their clock
+    # file SHA, and the frames of U_moc are frames of these runs
+    _nguon_shape(md['nguon'], name)
+    lk = k.get('luot_c8')
+    if not isinstance(lk, dict) or not lk:
+        raise UError(f'{name}: no luot_c8 (the C8 runs and their clock files)')
+    for rid, v in lk.items():
+        if not isinstance(v, dict):
+            raise UError(f'{name}: luot_c8.{rid} not an object')
+        _sha_hex(v.get('gio_sha256'), f'{name} luot_c8.{rid}.gio_sha256')
+    fr = md['nguon']['frames']
+    extra = sorted(set(fr) - set(lk))
+    if extra:
+        raise UError(f'{name}: moc_dich.nguon.frames of runs not in luot_c8 {extra}')
+    for rid, v in lk.items():
+        if v.get('frames_sha256') != fr.get(rid):
+            raise UError(f'{name}: luot_c8.{rid}.frames_sha256 is not moc_dich.nguon.frames.{rid}')
 
 
 def main(argv=None):
@@ -783,6 +890,8 @@ def main(argv=None):
     a1.add_argument('--xoay', required=True)
     a1.add_argument('--moc-frames', action='append', required=True,
                     help='RUN_ID=frames.csv: the final frames of every C8 run (U_moc sources, proposal v3 section 4)')
+    a1.add_argument('--moc-track', action='append', required=True,
+                    help='RUN_ID=track.json: the track.json beside each frames.csv (C8BU4-R1-2)')
     for kind in MOC_FILES:
         a1.add_argument('--moc-' + kind.replace('_', '-'), required=True, dest='moc_' + kind,
                         help=f'the {kind} file of the final scoring (its SHA-256 must be moc_dich.nguon.{kind})')
@@ -801,19 +910,19 @@ def main(argv=None):
     a = ap.parse_args(argv)
     try:
         if a.cmd == 'khoa':
-            gios, src = {}, []
+            gios, gio_sha, src = {}, {}, []
             for s in a.gio:
                 rid, p = s.split('=', 1)
                 if rid in gios:
                     raise UError(f'run {rid} twice')
-                gios[rid] = _json(p)
+                gios[rid], gio_sha[rid] = _json_sha(p)
                 src.append(p)
             phep5 = None
             if a.phep5:
                 with open(a.phep5, newline='', encoding='utf-8') as f:
                     phep5 = [(r['diem'], float(r['chenh_m'])) for r in csv.DictReader(f)]
                 src.append(a.phep5)
-            moc_tep, moc_src = dict(frames={}), []
+            moc_tep, moc_src = dict(frames={}, track={}), []
             for s in a.moc_frames:
                 rid, p = s.split('=', 1)
                 if rid in moc_tep['frames']:
@@ -821,14 +930,23 @@ def main(argv=None):
                 cu.check_path(p)
                 moc_tep['frames'][rid] = cu.sha256(p)
                 moc_src.append(p)
+            for s in a.moc_track:
+                rid, p = s.split('=', 1)
+                if rid in moc_tep['track']:
+                    raise UError(f'--moc-track: run {rid} twice')
+                moc_tep['track'][rid] = _json_sha(p)[0]
+                moc_src.append(p)
             for kind in MOC_FILES:
                 p = getattr(a, 'moc_' + kind)
-                cu.check_path(p)
-                moc_tep[kind] = cu.sha256(p)
+                if kind in ('lich', 'session'):                   # read: the schedule and the set-up used
+                    moc_tep[kind + '_doc'], moc_tep[kind] = _json_sha(p)
+                else:
+                    cu.check_path(p)
+                    moc_tep[kind] = cu.sha256(p)
                 moc_src.append(p)
             out = khoa(gios, _json(a.tb), _json(a.cam_u), _json(a.thuoc_kep), _json(a.xoay),
                        _json(a.u_imu) if a.u_imu else None, phep5, os.path.basename(a.tb), cu.sha256(a.tb),
-                       moc_tep=moc_tep)
+                       moc_tep=moc_tep, gio_sha=gio_sha)
             src += [a.tb, a.cam_u, a.thuoc_kep, a.xoay] + ([a.u_imu] if a.u_imu else []) + moc_src
             out['nguon'] = [dict(file=os.path.basename(p), sha256=cu.sha256(p)) for p in src]
             out['script'] = cu.script_state()

@@ -1,6 +1,7 @@
 """Tests of the C8b scripts (c8b_gio, c8b_luoi, c8b_3b, c8b_u), CODE_C8B 17/11/2026, design
 CLAUDE_THESIS 03_CODE/docs/2026-11-17_Thiet_ke_C8b_v4.md. Synthetic data with the answers planted."""
 import csv
+import hashlib
 import json
 import math
 import os
@@ -815,7 +816,7 @@ CAM = {"version": "c8_cam_u_vao_v3",
        "P1": {"bo_nhom_max_m": 0.002, "tung_khung_max_m": 0.0018, "bo_nhom_rms_m": 0.0014},
        # proposal v3 (Liam 18/11 "Duyet ban 3"): U_moc before the margin, approved method, session passed, sources;
        # nguong_m, u_so_m only information
-       "moc_dich": {"U_moc_xy_m": 0.0018, "U_moc_psi_deg": 0.07, "phuong_phap_duyet": "Liam dd/mm, phien X (thu)",
+       "moc_dich": {"U_moc_xy_m": 0.0021, "U_moc_psi_deg": 0.07, "phuong_phap_duyet": "Liam dd/mm, phien X (thu)",
                     "tien_de_buoi": "dat",
                     "nguon": dict(frames={'a': _fsha('a')}, **MOC_SHA, bo_lay_mau='c7_moc_lay_mau_v1 (thu)',
                                   car_pose=dict(tag_offset=None, side_m=0.0964, h_m=0.12)),
@@ -859,11 +860,46 @@ def sync(cam, runs=None):
     return cam
 
 
-def MT(runs=('a',), **over):
-    """SHA-256 of the files khoa is given (the right ones unless overridden)."""
-    d = dict(frames={r: _fsha(r) for r in runs}, **MOC_SHA)
+LICH_BODY = '9' * 64                          # the lich_sha256 inside lich.json (a schedule-body hash, not the file's)
+
+
+def _gsha(run):
+    """A stand-in SHA-256 of the clock file of a run."""
+    import hashlib
+    return hashlib.sha256(('gio ' + run).encode()).hexdigest()
+
+
+def track_doc(run, cam=CAM, **over):
+    """track.json of the final scoring of a run (c7_measure, CODE_CAM feat/c8-33-moc e8af52b), consistent with cam."""
+    off = (cam.get('bo_cham') or {}).get('tag_offset')
+    d = dict(frames_sha256=_fsha(run), session_sha256=MOC_SHA['session'], u_so_sha256=MOC_SHA['u_so'],
+             lich_sha256=LICH_BODY, cham_lai=2, thu=False, tag_offset=list(off) if off else [0.0, 0.0, 0.0])
     d.update(over)
     return d
+
+
+def MT(runs=('a',), cam=CAM, **over):
+    """The files khoa is given (the right ones, consistent with cam, unless overridden): SHAs, track.json of each run,
+    lich.json and session.json contents."""
+    bc, dc, dd = cam.get('bo_cham') or {}, cam.get('do_cao') or {}, cam.get('day_doi') or {}
+    d = dict(frames={r: _fsha(r) for r in runs}, track={r: track_doc(r, cam) for r in runs}, **MOC_SHA,
+             lich_doc=dict(lich_sha256=LICH_BODY, session_sha256=MOC_SHA['session'], u_so_sha256=MOC_SHA['u_so'],
+                           tap_moc_file_sha256=MOC_SHA['tap_moc']),
+             session_doc=dict(car_side_m=bc.get('side_m'), tag_h_m=dc.get('h_m'), kappa=dd.get('kappa')))
+    d.update(over)
+    return d
+
+
+def GIOS(gios):
+    """Clock files naming the frames of their run (c8b_gio writes sha256.frames)."""
+    return {r: dict(g, sha256=g.get('sha256', dict(frames=_fsha(r), esp32='0' * 64))) for r, g in gios.items()}
+
+
+def KHG(gios, cam, moc_tep=None, tb=None, tk=None, xo=None, **kw):
+    """khoa with the clock-file SHAs and (unless given) the right files of the scoring; cam not synced."""
+    runs = sorted((((cam.get('moc_dich') or {}).get('nguon') or {}).get('frames') or {'a': 0}))
+    return CU.khoa(GIOS(gios), tb or TBD, cam, TK if tk is None else tk, XO if xo is None else xo,
+                   moc_tep=MT(runs, cam) if moc_tep is None else moc_tep, gio_sha={r: _gsha(r) for r in gios}, **kw)
 
 
 def UPP(cam, *a, **k):
@@ -871,9 +907,7 @@ def UPP(cam, *a, **k):
 
 
 def KH(cam=None, tk=None, xo=None, tb=None, moc_tep=None, **kw):
-    return CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, tb or TBD, sync(CAM if cam is None else cam),
-                   TK if tk is None else tk, XO if xo is None else xo, moc_tep=MT() if moc_tep is None else moc_tep,
-                   **kw)
+    return KHG({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, sync(CAM if cam is None else cam), moc_tep, tb, tk, xo, **kw)
 
 
 def gio_d(task, rate, width, gmr, ok=True, half=0.007):
@@ -911,15 +945,15 @@ def _expect(cam=CAM, tk=TK, xo=XO):
 
 
 def test_khoa_sums():
-    k = CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.010, 0.005), 'b': gio_d('O1-F05', 4e-4, 0.012, 0.003),
+    k = KHG({'a': gio_d('O1-F05', 3e-4, 0.010, 0.005), 'b': gio_d('O1-F05', 4e-4, 0.012, 0.003),
                  'c': gio_d('O1-F08', 1e-4, 0.014, 0.004), 'd': gio_d('O1-F08', 9e-3, 0.5, 0.5, ok=False)},
-                TBD, sync(CAM, 'abc'), TK, XO, moc_tep=MT('abc'))      # run d (clock not ok) needs no frames
+                sync(CAM, 'abc'))                                       # run d (clock not ok) needs no frames
     p, a = _expect()
     assert k['U_p_phan_m'] == pytest.approx(p) and k['U_psi_phan_deg'] == pytest.approx(a)
     assert k['U_p_m'] == pytest.approx(1.25 * sum(p.values()))
     assert k['U_psi_deg'] == pytest.approx(1.25 * sum(a.values()))
-    # hand numbers: P1 = 2 + U_moc 1.8 = 3.8 mm (nguong + 2 u_so no longer added, proposal v3); A1 = 2 atan(0.2 / 96.4) + atan(0.2 / 96.4)^2 + 0.01^2 + 0.05 = 0.2937 deg
-    assert p['P1_anh_san'] == pytest.approx(0.0038) and a['A1_goc_dan'] == pytest.approx(0.29372, abs=2e-5)
+    # hand numbers: P1 = 2 + U_moc 2.1 = 4.1 mm (not 2 + 1 + 2 x 0.4: nguong + 2 u_so no longer added, proposal v3); A1 = 2 atan(0.2 / 96.4) + atan(0.2 / 96.4)^2 + 0.01^2 + 0.05 = 0.2937 deg
+    assert p['P1_anh_san'] == pytest.approx(0.0041) and a['A1_goc_dan'] == pytest.approx(0.29372, abs=2e-5)
     assert tuple(k['U_p_phan_m']) == CU.P_PARTS and tuple(k['U_psi_phan_deg']) == CU.A_PARTS
     assert k['troi_ppm'] == pytest.approx(1.25 * 4e-4 * 1e6)             # run d (not ok) left out
     assert k['dai']['O1-F05']['width_s'] == [0.010, 0.012] and k['dai']['O1-F05']['gyro_minus_rv_s'] == [0.003, 0.005]
@@ -929,7 +963,7 @@ def test_khoa_sums():
 def test_khoa_p1_takes_the_larger_of_clip_mean_and_per_frame():
     cam = _cp(CAM)
     cam['P1']['tung_khung_max_m'] = 0.0031
-    assert KH(cam)['U_p_phan_m']['P1_anh_san'] == pytest.approx(0.0031 + 0.0018)
+    assert KH(cam)['U_p_phan_m']['P1_anh_san'] == pytest.approx(0.0031 + 0.0021)
 
 
 def test_khoa_refuses_bad_3b_and_missing_field():
@@ -1325,7 +1359,7 @@ def test_cong_refuses_v1_lock():
 def test_moc_parts_used_and_kept_before_margin():
     # P1 = max(clip, per frame) + U_moc_xy_m; A7 = U_moc_psi_deg; nguong + 2 u_so is information only
     k = KH()
-    assert k['U_p_phan_m']['P1_anh_san'] == pytest.approx(0.002 + 0.0018)
+    assert k['U_p_phan_m']['P1_anh_san'] == pytest.approx(0.002 + 0.0021)
     assert k['U_psi_phan_deg']['A7_moc_dich'] == 0.07
     big = _cp(CAM)
     big['moc_dich'].update(nguong_m=0.5, u_so_m=0.5)
@@ -1333,7 +1367,7 @@ def test_moc_parts_used_and_kept_before_margin():
     cam = _cp(CAM)
     cam['moc_dich'].update(U_moc_xy_m=0.0048, U_moc_psi_deg=0.57)
     k2 = KH(cam)
-    assert k2['U_p_phan_m']['P1_anh_san'] - k['U_p_phan_m']['P1_anh_san'] == pytest.approx(0.003)
+    assert k2['U_p_phan_m']['P1_anh_san'] - k['U_p_phan_m']['P1_anh_san'] == pytest.approx(0.0027)
     assert k2['U_psi_deg'] - k['U_psi_deg'] == pytest.approx(1.25 * 0.5)
     # the lock keeps U_moc BEFORE the margin, the method, the session result and the sources
     assert k2['moc_dich']['U_moc_xy_m'] == 0.0048 and k2['moc_dich']['U_moc_psi_deg'] == 0.57
@@ -1377,7 +1411,7 @@ def test_moc_missing_fields_refused():
         bad = _cp(CAM)
         del bad['moc_dich']['nguon'][fld]
         with pytest.raises(CU.UError, match=fld):        # not through KH: its sync would put car_pose back
-            CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, bad, TK, XO, moc_tep=MT())
+            KHG({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, bad, MT())
     for fld, val in (('lich', 'A' * 64), ('u_so', 'a' * 63), ('session', None), ('bo_lay_mau', ' ')):
         bad = _cp(CAM)
         bad['moc_dich']['nguon'][fld] = val
@@ -1413,7 +1447,7 @@ def test_moc_method_and_session_needed():
 def test_moc_sha_of_the_files_given():
     # C8BM-R2-2: every SHA in moc_dich.nguon must be the SHA of the file khoa is given
     with pytest.raises(CU.UError, match='files of the final scoring'):
-        CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, sync(CAM), TK, XO)          # no files: refused
+        CU.khoa(GIOS({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}), TBD, sync(CAM), TK, XO, gio_sha={'a': _gsha('a')})
     for kind in ('lich', 'tap_moc', 'u_so', 'session'):
         with pytest.raises(CU.UError, match=f'nguon.{kind} '):
             KH(moc_tep=MT(**{kind: 'e' * 64}))
@@ -1429,11 +1463,11 @@ def test_moc_sha_of_the_files_given():
     gios = {'a': gio_d('O1-F05', 3e-4, 0.01, 0.0), 'b': gio_d('O1-F05', 3e-4, 0.01, 0.0),
             'c': gio_d('O1-F05', 3e-4, 0.01, 0.0, ok=False)}
     with pytest.raises(CU.UError, match=r"ok clock missing \['b'\]"):
-        CU.khoa(gios, TBD, sync(CAM, 'a'), TK, XO, moc_tep=MT('a'))
+        KHG(gios, sync(CAM, 'a'), MT('a'))
     with pytest.raises(CU.UError, match=r"not a C8 run \['z'\]"):
-        CU.khoa(gios, TBD, sync(CAM, 'abz'), TK, XO, moc_tep=MT('abz'))
-    CU.khoa(gios, TBD, sync(CAM, 'ab'), TK, XO, moc_tep=MT('ab'))                      # c not ok: may lack frames
-    CU.khoa(gios, TBD, sync(CAM, 'abc'), TK, XO, moc_tep=MT('abc'))
+        KHG(gios, sync(CAM, 'abz'), MT('abz'))
+    KHG(gios, sync(CAM, 'ab'), MT('ab'))                      # c not ok: may lack frames
+    KHG(gios, sync(CAM, 'abc'), MT('abc'))
 
 
 def test_moc_car_pose_set_up_must_match():
@@ -1444,7 +1478,7 @@ def test_moc_car_pose_set_up_must_match():
         with pytest.raises(CU.UError, match=f'car_pose.{path}'):
             CU.check_cam(bad)
         with pytest.raises(CU.UError, match=f'car_pose.{path}'):
-            CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, bad, TK, XO, moc_tep=MT())
+            KHG({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, bad, MT())
     bad = _cp(CAM)
     bad['moc_dich']['nguon']['car_pose']['extra'] = 1
     with pytest.raises(CU.UError, match='car_pose needs exactly'):
@@ -1461,7 +1495,7 @@ def test_check_khoa_moc_block():
     for fld, val, txt in (('tien_de_buoi', 'khong_dat', 'session that passed'),
                           ('phuong_phap_duyet', '', 'approved method'),
                           ('U_moc_xy_m', -1.0, 'U_moc_xy_m'), ('U_moc_psi_deg', None, 'U_moc_psi_deg'),
-                          ('U_moc_psi_deg', 0.08, 'A7_moc_dich'), ('U_moc_xy_m', 0.0039, 'below')):
+                          ('U_moc_psi_deg', 0.08, 'A7_moc_dich'), ('U_moc_xy_m', 0.0042, 'below')):
         bad = json.loads(json.dumps(k))
         bad['moc_dich'][fld] = val
         with pytest.raises(CU.UError, match=txt):
@@ -1493,7 +1527,7 @@ def _pair(rid, task, half, outcome, ut, nodes=None, gio_ok=True, ctrl='PID'):
     nodes = nodes or [1.0 + 0.001 * i for i in range(len(ut) or 1)]
     g = dict(gio_d(task, 1e-4, 0.01, 0.0, ok=gio_ok, half=half), nodes_s=nodes, script=SCRIPT,
              ket_luan='ok' if gio_ok else 'hong_he_do', controller=ctrl)
-    sha = f'{rid:0<64}'[:64]
+    sha = _gsha(rid)
     l = dict(version='c8b_luoi_v1', gio_sha256=sha, task=task, nodes_s=nodes, report_only=[], outcome=outcome,
              u_t_nodes=ut, script=SCRIPT, scorer=SCORER, nhanh_tick=['bo'])
     return g, l, sha
@@ -1514,13 +1548,17 @@ def _luot(lost_first=False):
     return out
 
 
+LOCK_RUNS = ('r1', 'r2', 'r3', 'r4', 'r3a', 'r1b', 'r9', 'r1x', 'r1y')   # every run the cong tests give
+
+
 def _lock(U_p, U_psi):
     """A lock that check_khoa accepts (cong checks it, C8BU-R1-7): all of U_p in P1, all of U_psi in A1."""
     return dict(version=CU.VERSION, le=CU.LE, U_p_m=U_p, U_psi_deg=U_psi,
                 U_p_phan_m={x: (U_p / CU.LE if x == 'P1_anh_san' else 0.0) for x in CU.P_PARTS},
                 U_psi_phan_deg={x: (U_psi / CU.LE if x == 'A1_goc_dan' else 0.0) for x in CU.A_PARTS},
                 moc_dich=dict(U_moc_xy_m=0.0, U_moc_psi_deg=0.0, phuong_phap_duyet='thu', tien_de_buoi='dat',
-                              nguon={}))
+                              nguon=dict(CAM['moc_dich']['nguon'], frames={r: _fsha(r) for r in LOCK_RUNS})),
+                luot_c8={r: dict(gio_sha256=_gsha(r), frames_sha256=_fsha(r)) for r in LOCK_RUNS})
 
 
 K = _lock(0.004, 2.0)
@@ -1577,65 +1615,224 @@ def test_cong_written_and_read_back_with_real_reader(tmp_path):
         assert not (tmp_path / 'g2.json').exists()
 
 
+def _scoring(d, tag, cam, runs=('r1', 'r2', 'r3', 'r4')):
+    """Files of one scoring in directory d/tag, chained as c7_measure writes them (CODE_CAM feat/c8-33-moc e8af52b):
+    session.json, u_so.json, tap_moc.json, lich.json (session_sha256, u_so_sha256, tap_moc_file_sha256), frames.csv and
+    track.json of each run (frames_sha256, session_sha256, u_so_sha256, lich_sha256, cham_lai 2, tag_offset), the clock
+    file of each run naming its frames (sha256.frames). Returns (paths, camera file consistent with them)."""
+    import c8_u_imu as cu
+    p = d / tag
+    p.mkdir()
+    off = cam['bo_cham']['tag_offset'] or [0.0, 0.0, 0.0]
+    (p / 'session.json').write_text(json.dumps(dict(car_side_m=cam['bo_cham']['side_m'], tag_h_m=cam['do_cao']['h_m'],
+                                                    kappa=cam['day_doi']['kappa'], buoi=tag)), encoding='utf-8')
+    (p / 'u_so.json').write_text(json.dumps({'buoi': tag}), encoding='utf-8')
+    (p / 'tap_moc.json').write_text(json.dumps({'C1': [[1, 2, 3]], 'buoi': tag}), encoding='utf-8')
+    sh = {k: cu.sha256(str(p / f'{k}.json')) for k in ('session', 'u_so', 'tap_moc')}
+    body = hashlib.sha256(('lich ' + tag).encode()).hexdigest()
+    (p / 'lich.json').write_text(json.dumps(dict(lich_sha256=body, session_sha256=sh['session'], u_so_sha256=sh['u_so'],
+                                                 tap_moc_file_sha256=sh['tap_moc'], hoi_tu=True)), encoding='utf-8')
+    sh['lich'] = cu.sha256(str(p / 'lich.json'))
+    out = dict(files={k: str(p / f'{k}.json') for k in ('lich', 'tap_moc', 'u_so', 'session')}, frames={}, track={},
+               gio={}, luoi={}, slot={})
+    fr_sha = {}
+    for slot, rid, g, l, _ in _luot():
+        if rid not in runs:
+            continue
+        fp = p / f'frames_{rid}.csv'
+        fp.write_text(f't_s,x\n0,{rid}{tag}\n', encoding='utf-8')
+        fr_sha[rid] = cu.sha256(str(fp))
+        tp = p / f'track_{rid}.json'
+        tp.write_text(json.dumps(dict(frames_sha256=fr_sha[rid], session_sha256=sh['session'], u_so_sha256=sh['u_so'],
+                                      lich_sha256=body, cham_lai=2, thu=False, tag_offset=list(off))),
+                      encoding='utf-8')
+        gp = p / f'gio_{rid}.json'
+        gp.write_text(json.dumps(dict(g, sha256=dict(frames=fr_sha[rid], esp32='0' * 64))), encoding='utf-8')
+        lp = p / f'luoi_{rid}.json'
+        lp.write_text(json.dumps(dict(l, gio_sha256=cu.sha256(str(gp)))), encoding='utf-8')
+        out['frames'][rid], out['track'][rid], out['gio'][rid], out['luoi'][rid] = str(fp), str(tp), str(gp), str(lp)
+        out['slot'][rid] = slot
+    c = _cp(cam)
+    c['moc_dich']['nguon'].update(frames=fr_sha, **{k: sh[k] for k in ('lich', 'tap_moc', 'u_so', 'session')})
+    (p / 'cam.json').write_text(json.dumps(c), encoding='utf-8')
+    out['cam'] = str(p / 'cam.json')
+    return out, c
+
+
+def _khoa_args(d, S, gio=None, track=None, files=None):
+    for name, obj in (('tb.json', TBD), ('tk.json', TK), ('xo.json', XO)):
+        if not (d / name).exists():
+            (d / name).write_text(json.dumps(obj), encoding='utf-8')
+    gio, track, files = gio or S['gio'], track or S['track'], files or S['files']
+    a = ['khoa']
+    for r in sorted(S['frames']):
+        a += ['--gio', f'{r}={gio[r]}', '--moc-frames', f'{r}={S["frames"][r]}', '--moc-track', f'{r}={track[r]}']
+    a += ['--tb', str(d / 'tb.json'), '--cam-u', S['cam'], '--thuoc-kep', str(d / 'tk.json'), '--xoay',
+          str(d / 'xo.json'), '--moc-lich', files['lich'], '--moc-tap-moc', files['tap_moc'], '--moc-u-so',
+          files['u_so'], '--moc-session', files['session']]
+    return a
+
+
+def _cong_args(d, kp, S, out):
+    if not (d / 'kh.csv').exists():
+        (d / 'kh.csv').write_text('# nhanh_tick=bo_tick\n# commit_hil=abc1234\nslot,task,controller\n' + ''.join(
+            f'{s},{p["task"]},{p["controller"]}\n' for s, p in _plan().items()), encoding='utf-8')
+    a = ['cong', '--khoa', str(kp), '--ke-hoach', str(d / 'kh.csv'), '--levels', 'O1-F05,O1-F08', '--u-t-branch',
+         'bo_tick', '--c8-dir', 'C8/x', '--out', str(out)]
+    for r in sorted(S['gio']):
+        a += ['--luot', f'{S["slot"][r]}={r},{S["gio"][r]},{S["luoi"][r]}']
+    return a
+
+
 def test_moc_cli_export_lock_gate(tmp_path):
-    # C8BM-R2-4: the path camera file (as exported) -> khoa (CLI, real files and SHA) -> cong (CLI) -> gate file; the
-    # gate file carries the lock (camera.c8b.moc_dich before the margin) and the SHA of the lock file (CODE_GATE 18/11)
+    # C8BM-R2-4: camera file (as exported) -> khoa (CLI, real files and SHA) -> cong (CLI) -> gate file; the gate file
+    # carries the lock (camera.c8b.moc_dich before the margin) and the SHA of the lock file (CODE_GATE 18/11)
     import c8_u_imu as cu
     import gate_c8
     d = tmp_path
-    files = {}
-    for name in ('lich.json', 'tap_moc.json', 'u_so.json', 'session.json'):
-        (d / name).write_text(json.dumps({'thu': name}), encoding='utf-8')
-        files[name.split('.')[0]] = str(d / name)
-    luot_args, gio_args, frames_args, fr_sha = [], [], [], {}
-    for slot, rid, g, l, _ in _luot():
-        gp, fp = d / f'gio_{rid}.json', d / f'frames_{rid}.csv'
-        gp.write_text(json.dumps(g), encoding='utf-8')
-        fp.write_text(f't_s,x\n0,{rid}\n', encoding='utf-8')
-        l = dict(l, gio_sha256=cu.sha256(str(gp)))
-        lp = d / f'luoi_{rid}.json'
-        lp.write_text(json.dumps(l), encoding='utf-8')
-        gio_args += ['--gio', f'{rid}={gp}']
-        frames_args += ['--moc-frames', f'{rid}={fp}']
-        luot_args += ['--luot', f'{slot}={rid},{gp},{lp}']
-        fr_sha[rid] = cu.sha256(str(fp))
-    cam = sync(CAM)
-    cam['moc_dich']['nguon'].update(frames=fr_sha, **{k: cu.sha256(p) for k, p in files.items()})
-    for name, obj in (('cam.json', cam), ('tb.json', TBD), ('tk.json', TK), ('xo.json', XO)):
-        (d / name).write_text(json.dumps(obj), encoding='utf-8')
-    base = ['khoa'] + gio_args + ['--tb', str(d / 'tb.json'), '--cam-u', str(d / 'cam.json'), '--thuoc-kep',
-                                  str(d / 'tk.json'), '--xoay', str(d / 'xo.json')] + frames_args
-    mf = ['--moc-lich', files['lich'], '--moc-tap-moc', files['tap_moc'], '--moc-u-so', files['u_so'],
-          '--moc-session', files['session']]
-    # a file changed after the export (its SHA no longer the one in nguon): refused, no lock written
-    (d / 'u_so_moi.json').write_text('{"thu": 2}', encoding='utf-8')
-    bad = mf[:5] + [str(d / 'u_so_moi.json')] + mf[6:]
-    assert CU.main(base + bad + ['--out', str(d / 'khoa_x.json')]) == 2
-    assert not (d / 'khoa_x.json').exists()
+    S, cam = _scoring(d, 'A', sync(CAM))
     kp = d / 'khoa.json'
-    assert CU.main(base + mf + ['--out', str(kp)]) == 0
+    assert CU.main(_khoa_args(d, S) + ['--out', str(kp)]) == 0
     k = json.loads(kp.read_text(encoding='utf-8'))
-    assert k['version'] == 'c8b_khoa_v4' and k['moc_dich']['U_moc_xy_m'] == 0.0018
-    assert {n['file'] for n in k['nguon']} >= {'lich.json', 'u_so.json', 'frames_r1.csv'}
-    (d / 'kh.csv').write_text('# nhanh_tick=bo_tick\n# commit_hil=abc1234\nslot,task,controller\n' + ''.join(
-        f'{s},{p["task"]},{p["controller"]}\n' for s, p in _plan().items()), encoding='utf-8')
+    assert k['version'] == 'c8b_khoa_v4' and k['moc_dich']['U_moc_xy_m'] == 0.0021
+    assert {n['file'] for n in k['nguon']} >= {'lich.json', 'u_so.json', 'frames_r1.csv', 'track_r1.json'}
+    assert k['luot_c8']['r2'] == dict(gio_sha256=cu.sha256(S['gio']['r2']), frames_sha256=cu.sha256(S['frames']['r2']))
     gp = d / 'gate_c8.json'
-    assert CU.main(['cong', '--khoa', str(kp), '--ke-hoach', str(d / 'kh.csv'), '--levels', 'O1-F05,O1-F08',
-                    '--u-t-branch', 'bo_tick', '--c8-dir', 'C8/x', '--out', str(gp)] + luot_args) == 0
+    assert CU.main(_cong_args(d, kp, S, gp)) == 0
     g = gate_c8.read_gate_c8(str(gp))
     raw = json.loads(gp.read_text(encoding='utf-8'))
     c8b = raw['camera']['c8b']
-    assert c8b['khoa_sha256'] == cu.sha256(str(kp))
-    assert c8b['moc_dich']['U_moc_xy_m'] == 0.0018 and c8b['moc_dich']['U_moc_psi_deg'] == 0.07
+    assert c8b['khoa_sha256'] == cu.sha256(str(kp)) and g.sha256
+    assert c8b['moc_dich']['U_moc_xy_m'] == 0.0021 and c8b['moc_dich']['U_moc_psi_deg'] == 0.07
     assert c8b['moc_dich']['nguon']['bo_lay_mau'] == cam['moc_dich']['nguon']['bo_lay_mau']
-    assert raw['dieu_2b']['u_psi_deg'] == pytest.approx(k['U_psi_deg']) and g.sha256
+    assert raw['dieu_2b']['u_psi_deg'] == pytest.approx(k['U_psi_deg'])
     # a v3 lock (before this proposal) cannot make a gate file
-    old = dict(k, version='c8b_khoa_v3')
-    (d / 'khoa_v3.json').write_text(json.dumps(old), encoding='utf-8')
-    assert CU.main(['cong', '--khoa', str(d / 'khoa_v3.json'), '--ke-hoach', str(d / 'kh.csv'), '--levels',
-                    'O1-F05,O1-F08', '--u-t-branch', 'bo_tick', '--c8-dir', 'C8/x', '--out', str(d / 'g3.json')]
-                   + luot_args) == 2
+    (d / 'khoa_v3.json').write_text(json.dumps(dict(k, version='c8b_khoa_v3')), encoding='utf-8')
+    assert CU.main(_cong_args(d, d / 'khoa_v3.json', S, d / 'g3.json')) == 2
     assert not (d / 'g3.json').exists()
+
+
+def test_moc_cli_sources_of_another_scoring_refused(tmp_path):
+    # C8BU4-R1-1, R1-2 (Codex): an older scoring A and the final scoring B of the SAME runs; the camera file and every
+    # --moc-* file of A agree among themselves, but the clock files are B's: refused, no lock. Each link alone too.
+    import c8_u_imu as cu
+    d = tmp_path
+    A, camA = _scoring(d, 'A', sync(CAM))
+    B, camB = _scoring(d, 'B', sync(CAM))
+    for name, args in (('clock files of B', _khoa_args(d, A, gio=B['gio'])),
+                       ('track.json of B', _khoa_args(d, A, track=B['track'])),
+                       ('lich of B', _khoa_args(d, A, files=dict(A['files'], lich=B['files']['lich']))),
+                       ('session of B', _khoa_args(d, A, files=dict(A['files'], session=B['files']['session'])))):
+        out = d / f'k_{name.replace(" ", "_")}.json'
+        assert CU.main(args + ['--out', str(out)]) == 2, name
+        assert not out.exists()
+    # the set-up used: a scorer offset written in both places of the camera file but not the one of the tracks
+    off = _cp(camA)
+    off['bo_cham']['tag_offset'] = [0.03, -0.04, 0.0]
+    off['moc_dich']['nguon']['car_pose']['tag_offset'] = [0.03, -0.04, 0.0]
+    (d / 'A' / 'cam_off.json').write_text(json.dumps(off), encoding='utf-8')
+    S = dict(A, cam=str(d / 'A' / 'cam_off.json'))
+    assert CU.main(_khoa_args(d, S) + ['--out', str(d / 'k_off.json')]) == 2
+    # tag side, tag height, kappa of the session differ from the camera file (in both of its places)
+    for key, path in (('side_m', ('bo_cham', 'side_m')), ('h_m', ('do_cao', 'h_m'))):
+        c = _cp(camA)
+        v = c[path[0]][path[1]] + 0.001
+        c[path[0]][path[1]] = v
+        c['moc_dich']['nguon']['car_pose'][key] = v
+        if key == 'h_m':
+            c['day_doi']['kappa'] = v / c['do_cao']['H_m']
+        (d / 'A' / f'cam_{key}.json').write_text(json.dumps(c), encoding='utf-8')
+        S = dict(A, cam=str(d / 'A' / f'cam_{key}.json'))
+        assert CU.main(_khoa_args(d, S) + ['--out', str(d / f'k_{key}.json')]) == 2, key
+    # B alone is accepted
+    assert CU.main(_khoa_args(d, B) + ['--out', str(d / 'kB.json')]) == 0
+    assert cu.sha256(B['frames']['r1']) == json.loads((d / 'kB.json').read_text())['luot_c8']['r1']['frames_sha256']
+
+
+def test_moc_cli_gate_runs_must_be_the_lock_runs(tmp_path):
+    # C8BU4-R1-3: a lock made from scoring A cannot make the gate file of the runs of B (same run ids, other clock
+    # files), nor of a run the lock does not have
+    d = tmp_path
+    A, _ = _scoring(d, 'A', sync(CAM))
+    B, _ = _scoring(d, 'B', sync(CAM))
+    kp = d / 'kA.json'
+    assert CU.main(_khoa_args(d, A) + ['--out', str(kp)]) == 0
+    assert CU.main(_cong_args(d, kp, B, d / 'gAB.json')) == 2
+    assert not (d / 'gAB.json').exists()
+    k = json.loads(kp.read_text(encoding='utf-8'))
+    with pytest.raises(CU.UError, match='not the one the lock was made from'):
+        CU.cong(k, _plan(), [(s, r, g, l, cu_sha) for s, r, g, l, cu_sha in _luot()], ['O1-F05'], 'bo_tick', 'x',
+                meta=META)
+    k2 = json.loads(json.dumps(k))
+    del k2['luot_c8']['r1']
+    del k2['moc_dich']['nguon']['frames']['r1']
+    with pytest.raises(CU.UError, match='not a C8 run of the lock'):
+        CU.cong(k2, _plan(), _luot(), ['O1-F05'], 'bo_tick', 'x', meta=META)
+    assert CU.main(_cong_args(d, kp, A, d / 'gA.json')) == 0
+
+
+def test_check_khoa_sources_shape_and_runs():
+    # C8BU4-R1-4: the lock's sources checked like the camera file's, and tied to luot_c8
+    k = json.loads(json.dumps(CU._clean(KH())))
+    CU.check_khoa(k)
+    for fld in ('frames', 'lich', 'tap_moc', 'u_so', 'session', 'car_pose', 'bo_lay_mau'):
+        bad = json.loads(json.dumps(k))
+        del bad['moc_dich']['nguon'][fld]
+        with pytest.raises(CU.UError, match=fld):
+            CU.check_khoa(bad)
+    bad = json.loads(json.dumps(k))
+    bad['moc_dich']['nguon'] = {}
+    with pytest.raises(CU.UError, match='lacks'):
+        CU.check_khoa(bad)
+    with pytest.raises(CU.UError, match='lacks'):
+        CU.cong(bad, _plan(), _luot(), ['O1-F05'], 'bo_tick', 'x', meta=META)
+    bad = json.loads(json.dumps(k))
+    bad['moc_dich']['nguon']['lich'] = 'x' * 64
+    with pytest.raises(CU.UError, match='nguon.lich'):
+        CU.check_khoa(bad)
+    bad = json.loads(json.dumps(k))
+    del bad['luot_c8']
+    with pytest.raises(CU.UError, match='no luot_c8'):
+        CU.check_khoa(bad)
+    bad = json.loads(json.dumps(k))
+    bad['moc_dich']['nguon']['frames']['zz'] = _fsha('zz')
+    with pytest.raises(CU.UError, match='not in luot_c8'):
+        CU.check_khoa(bad)
+    bad = json.loads(json.dumps(k))
+    bad['luot_c8']['a']['frames_sha256'] = 'f' * 64
+    with pytest.raises(CU.UError, match='luot_c8.a.frames_sha256'):
+        CU.check_khoa(bad)
+
+
+def test_moc_api_chain_links():
+    # each link of check_moc alone (C8BU4-R1-1, R1-2), through the API
+    with pytest.raises(CU.UError, match='sha256.frames'):                 # the clock file names other frames
+        CU.khoa({'a': dict(gio_d('O1-F05', 3e-4, 0.01, 0.0), sha256=dict(frames='f' * 64))}, TBD, sync(CAM), TK, XO,
+                moc_tep=MT(), gio_sha={'a': _gsha('a')})
+    with pytest.raises(CU.UError, match='names no frames'):               # an ok clock file naming no frames
+        CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, sync(CAM), TK, XO, moc_tep=MT(),
+                gio_sha={'a': _gsha('a')})
+    with pytest.raises(CU.UError, match='SHA-256 of every C8 clock file'):
+        CU.khoa(GIOS({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}), TBD, sync(CAM), TK, XO, moc_tep=MT())
+    for key, val in (('frames_sha256', 'f' * 64), ('session_sha256', 'f' * 64), ('u_so_sha256', 'f' * 64),
+                     ('lich_sha256', 'f' * 64), ('cham_lai', 1), ('thu', True), ('tag_offset', [0.001, 0, 0])):
+        mt = MT()
+        mt['track']['a'][key] = val
+        with pytest.raises(CU.UError, match=key if key not in ('cham_lai', 'thu') else 'final scoring'):
+            KH(moc_tep=mt)
+    with pytest.raises(CU.UError, match='track.json runs'):
+        KH(moc_tep=MT(track={}))
+    for key in ('session_sha256', 'u_so_sha256', 'tap_moc_file_sha256', 'lich_sha256'):
+        mt = MT()
+        mt['lich_doc'][key] = 'f' * 64 if key != 'lich_sha256' else None
+        with pytest.raises(CU.UError, match=key if key != 'lich_sha256' else 'no lich_sha256'):
+            KH(moc_tep=mt)
+    for key in ('car_side_m', 'tag_h_m', 'kappa'):
+        mt = MT()
+        mt['session_doc'][key] = mt['session_doc'][key] * 1.01
+        with pytest.raises(CU.UError, match=f'session.json {key}'):
+            KH(moc_tep=mt)
+    KH()                                                                    # the consistent set is accepted
 
 
 def test_cong_strict_half():
