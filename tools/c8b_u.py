@@ -42,7 +42,7 @@ khoa (after the C8 clips are tracked and the C8 runs have their clock files):
                         assumed, C8BU-R2-4) + plate-body angle from the drawing; theta
                         = the Kabsch angle of the black square on the plate, mean of its four edge angles by caliper
                         (a distorted print is seen, C8BU-R1-6; Liam 18/11 at CODE_C8B "Thuoc kep 4 canh")  [caliper]
-    A3 camera by area   bound on the Kabsch heading of the car tag (96.4 mm) from the camera model, carried from the
+    A3 camera by area   bound on the Kabsch heading of the car tag (144.5 mm) from the camera model, carried from the
                         held-out mark pairs (page v10 A3; A3.quy_ve_ma_noc must be true, C8BU-R1-4)    [camera file]
     A6 tag tilt         (rho + dn) (sum_i |c_i - mean c| + 8 e) / (2 sqrt 2 s (H - dzc - max c_i - e))  [rad; camera
                         at least 1 m above every corner, C8BU-R2-3]: the parallax
@@ -256,7 +256,8 @@ def check_cam(cam):
     v = {p: _num(_get(cam, p), p) for p in CAM_NUMS}
     _tag_offset(cam)
     if _get(cam, 'A3').get('quy_ve_ma_noc') is not True:
-        raise UError('A3.quy_ve_ma_noc must be true: A3.max_deg bounds the Kabsch heading of the car tag (96.4 mm), '
+        raise UError('A3.quy_ve_ma_noc must be true: A3.max_deg bounds the Kabsch heading of the car tag (side '
+                     f'bo_cham.side_m = {(_get(cam, "bo_cham") or {}).get("side_m")} m), '
                      'carried from the mark pairs through the camera model (page v10 A3, C8BU-R1-4), not a pair angle')
     if not v['bo_cham.side_m'] > 0:
         raise UError('bo_cham.side_m must be > 0')
