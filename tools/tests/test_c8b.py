@@ -1086,12 +1086,18 @@ def test_offset_part_bounds_car_pose():
 
 
 def test_cross_check_strength_recorded():
-    # C8BU-R4-3: the lock says whether the turning cross-check could see a 2 mm slip (room < 2 mm)
+    # C8BU-R4-3, R5-1: the lock gives the slip size surely refused, room + u_g + du (a smaller slip may pass when the
+    # drawing tolerance and the noise cancel it, Codex R5-1: tolerance 1 mm, slip 2 mm, gap 1 mm passes)
     k = KH()
-    assert k['kiem_xoay']['room_m'] > k['kiem_xoay']['gap_m']
-    assert k['kiem_xoay']['bat_duoc_lech_2mm'] is True
-    loose = dict(_cp(TK), tam_tam_dung_sai_mm=1.5)
-    assert KH(tk=loose)['kiem_xoay']['bat_duoc_lech_2mm'] is False
+    kx = k['kiem_xoay']
+    u_g = 0.0005 + math.sqrt(2) * 0.0001
+    assert kx['room_m'] > kx['gap_m']
+    assert kx['truot_bat_chac_tu_m'] == pytest.approx(kx['room_m'] + u_g + XO['du_m'])
+    tk = dict(_cp(TK), tam_tam_mm=[0.0, 0.0], tam_tam_dung_sai_mm=1.0, e_mm=0.1)
+    tk['canh'] = dict(truoc=[10.0, 10.0], sau=[10.0, 10.0], phai=[10.0, 10.0], trai=[10.0, 10.0])
+    xo = dict(XO, q_tag_m=[0.001, 0.0], du_m=0.0004)            # Codex R5-1 case: true centre -1 mm, slip 2 mm
+    kx = KH(tk=tk, xo=xo)['kiem_xoay']                          # passes (gap 1 mm < room) ...
+    assert kx['gap_m'] < kx['room_m'] and kx['truot_bat_chac_tu_m'] > 0.002   # ... and the lock says it may
 
 
 def test_khoa_turning_input():

@@ -26,7 +26,8 @@ khoa (after the C8 clips are tracked and the C8 runs have their clock files):
     P2 tag-body centre  |o_u - o_g| + u_g + |o_u| (A1 + ... + A6)  [rad; o_u = (dx, dy) of the scorer's tag_offset;
                         o_g = drawing (plate centre - wheel centre) + r (tag centre on the plate by caliper), u_g =
                         drawing tolerance (Euclidean) + sqrt 2 e + |r| x plate-body angle (C8BU-R4-1, R4-2); the lock
-                        records the cross-check gap, room and whether it can see a 2 mm slip (R4-3); last term: the
+                        records the cross-check gap, room and the slip size surely refused, room + u_g + du (R4-3,
+                        R5-1: a smaller slip may pass when the tolerance and the noise cancel it); last term: the
                         heading error turns the correction
                         vector, C8BU-R1-3]. Geometry, not turning in place (C8BU-R3-2, Liam 18/11 at CODE_C8B "Lay
                         tam tu hinh hoc (Recommended)"): turning in place (c8b_xoay.py) is a cross-check; its offset
@@ -336,8 +337,10 @@ def u_p_u_psi(cam, tb, tk, xo, info=None):
     o_s = (ct * qx - st * qy, st * qx + ct * qy)
     gap = math.hypot(o_s[0] - ogx, o_s[1] - ogy)
     room = u_g + du + (math.hypot(qx, qy) + du) * math.radians(a1)
-    if info is not None:                                    # C8BU-R4-3: how strong the cross-check is
-        info.update(gap_m=gap, room_m=room, bat_duoc_lech_2mm=room < 0.002)
+    if info is not None:
+        # C8BU-R4-3, R5-1: how strong the cross-check is. The turning offset is o_true + slip + noise (<= du) and
+        # |o_true - o_g| <= u_g, so gap >= |slip| - u_g - du: a slip larger than room + u_g + du is surely refused
+        info.update(gap_m=gap, room_m=room, truot_bat_chac_tu_m=room + u_g + du)
     if gap > room:
         raise UError(f'turning in place gives the tag-body offset ({o_s[0] * 1e3:.2f}, {o_s[1] * 1e3:.2f}) mm, the '
                      f'drawing and caliper ({ogx * 1e3:.2f}, {ogy * 1e3:.2f}) mm: {gap * 1e3:.2f} mm apart, more than '
@@ -388,7 +391,7 @@ def khoa(gios, tb, cam, tk, xo, u_imu=None, phep5=None, tb_name='', tb_sha=''):
                mot_khung_s=sh.get('mot_khung_s'), U_p_m=U_p, U_p_phan_m=p_parts, U_psi_deg=U_psi,
                U_psi_phan_deg=s_parts, thuoc_kep=dict(goc_canh_deg=goc_canh, goc_kabsch_deg=math.degrees(theta),
                                                       o_hinh_hoc_m=list(Kc['o_g'])),
-               kiem_xoay=kx)          # gap, room; bat_duoc_lech_2mm false: the cross-check cannot see a 2 mm slip
+               kiem_xoay=kx)          # gap, room; truot_bat_chac_tu_m: a slip at least this large is surely refused
     if u_imu is not None:
         if u_imu.get('version') != 'u_imu_dong_v2':
             raise UError('u_imu file: version is not u_imu_dong_v2')
