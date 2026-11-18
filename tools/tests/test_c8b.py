@@ -822,8 +822,8 @@ CAM_PATHS = ('P1.bo_nhom_max_m', 'P1.tung_khung_max_m', 'moc_dich.nguong_m', 'mo
 TK = {"version": "c8b_thuoc_kep_v2", "cao_4_goc_mm": [120.2, 120.0, 119.8, 120.1], "e_mm": 0.1, "s_mm": 96.4,
       # a tag turned counter-clockwise by atan(0.2 / 96.4) on the plate: every edge shows the same angle
       "canh": {"truoc": [10.3, 10.1], "phai": [10.2, 10.0], "sau": [10.1, 10.3], "trai": [10.0, 10.2]},
-      "tam_than_deg": 0.05}
-XO = {"version": "c8b_xoay_v1", "q_tag_m": [0.003, -0.004], "du_m": 0.0007}
+      "tam_than_deg": 0.05, "tam_tam_mm": [0.4, -0.3], "tam_tam_dung_sai_mm": 0.5, "ban_ve_nguon": "CAD tam ma (thu)"}
+XO = {"version": "c8b_xoay_v1", "q_tag_m": [0.0006, -0.0005], "du_m": 0.0007}   # near the geometry o_g = (0.4, -0.3) mm
 TBD = dict(ga_ok=True, d_p_quay_m=0.0007, d_psi_quay_deg=0.25,
            B=dict(shutter=dict(use_alpha=True, alpha_r_s_px=7e-6, alpha_c_s_px=1e-7, alpha_r_le_s_px=8.75e-6,
                                alpha_c_le_s_px=1.25e-7, mot_khung_s=1 / 60)))
@@ -860,10 +860,11 @@ def _expect(cam=CAM, tk=TK, xo=XO):
     a6 = math.degrees((rho + dn) * (np.sum(np.abs(c - c.mean())) + 8 * e) / (2 * math.sqrt(2) * s * (Hl - c.max() - e)))
     a = dict(A1_goc_dan=a1, A2_nhac_tam=0.1, A3_huong_vung=0.15, A4_quay=0.25, A5_nhieu_khung=0.12, A6_nghieng_ma=a6)
     dx, dy, dp = cam['bo_cham']['tag_offset'] or [0, 0, 0]
-    qx, qy = xo['q_tag_m']
-    du = xo['du_m']
-    p2 = (math.hypot(dx - (math.cos(dp) * qx - math.sin(dp) * qy), dy - (math.sin(dp) * qx + math.cos(dp) * qy)) + du
-          + (math.hypot(qx, qy) + du) * math.radians(a1) + math.hypot(dx, dy) * math.radians(sum(a.values())))
+    m = {k: (a + b) / 2 for k, (a, b) in tk['canh'].items()}
+    ogx = (tk['tam_tam_mm'][0] + (m['sau'] - m['truoc']) / 2) * 1e-3
+    ogy = (tk['tam_tam_mm'][1] + (m['phai'] - m['trai']) / 2) * 1e-3
+    u_g = (tk['tam_tam_dung_sai_mm'] + tk['e_mm']) * 1e-3 + math.hypot(ogx, ogy) * math.radians(tk['tam_than_deg'])
+    p2 = math.hypot(dx - ogx, dy - ogy) + u_g + math.hypot(dx, dy) * math.radians(sum(a.values()))
     p = dict(P1_anh_san=0.002 + 0.001 + 2 * 0.0004, P2_lech_tam=p2, P3_nhac_tam=0.0008, P4_quay=0.0007, P5_day_doi_zc=dd,
              P6_do_cao=cao, P7_nhieu_khung=0.0006)
     return p, a
@@ -990,53 +991,76 @@ def test_caliper_sheared_print_is_seen():
 
 
 def test_khoa_offset_used_by_the_scorer():
-    # the scorer corrects by tag_offset = (R(dpsi) q, dpsi) with dpsi the caliper angle: P2, A1 keep what is left
+    # the scorer corrects by tag_offset = (o_g, dpsi) with o_g the geometric offset and dpsi the caliper angle: P2 keeps
+    # the tolerance and the heading term, A1 what is left of the angle
     g = math.atan(0.2 / 96.4)                                # the angle of TK
-    q = XO['q_tag_m']
     cam = _cp(CAM)
-    c, s = math.cos(g), math.sin(g)
-    cam['bo_cham']['tag_offset'] = [c * q[0] - s * q[1], s * q[0] + c * q[1], g]
+    cam['bo_cham']['tag_offset'] = [0.0004, -0.0003, g]       # o_g of TK
     k = KH(cam)
     a1 = math.degrees(math.atan(2 * 0.1 / 96.4) + g * g + 1e-4) + 0.05
     assert k['U_psi_phan_deg']['A1_goc_dan'] == pytest.approx(a1)
     assert k['U_p_phan_m'] == pytest.approx(_expect(cam=cam)[0])
     sumA = sum(k['U_psi_phan_deg'].values())
-    assert k['U_p_phan_m']['P2_lech_tam'] == pytest.approx(0.0007 + (0.005 + 0.0007) * math.radians(a1)
-                                                           + 0.005 * math.radians(sumA))
+    u_g = 0.0006 + 0.0005 * math.radians(0.05)
+    assert k['U_p_phan_m']['P2_lech_tam'] == pytest.approx(u_g + 0.0005 * math.radians(sumA))
+    assert k['thuoc_kep']['o_hinh_hoc_m'] == pytest.approx([0.0004, -0.0003])
     cam['bo_cham']['tag_offset'][2] = -g                       # opposite sign: the mismatch 2 g is counted
     assert KH(cam)['U_psi_phan_deg']['A1_goc_dan'] == pytest.approx(a1 + 2 * math.degrees(g))
 
 
+def test_geometric_offset_from_the_edges():
+    # tag centre on the plate: x = (back - front) / 2, y = (right - left) / 2 (no plate size needed)
+    tk = _cp(TK)
+    tk['canh'] = dict(truoc=[9.0, 9.0], sau=[11.0, 11.0], phai=[10.5, 10.5], trai=[9.5, 9.5])
+    tk['tam_tam_mm'] = [0.0, 0.0]
+    xo = dict(XO, q_tag_m=[0.001, 0.0005])
+    assert KH(tk=tk, xo=xo)['thuoc_kep']['o_hinh_hoc_m'] == pytest.approx([0.001, 0.0005])
+    for k_ in ('tam_tam_mm', 'tam_tam_dung_sai_mm', 'ban_ve_nguon'):
+        bad = _cp(TK)
+        del bad[k_]
+        with pytest.raises(CU.UError, match=k_):
+            KH(tk=bad)
+
+
+def test_turning_cross_check_refuses_a_disagreement():
+    # C8BU-R3-2: turning in place is a cross-check of the geometry; a slip about an off-centre point shows as an offset
+    # away from the drawing and stops the lock ('xem lai') instead of entering U
+    with pytest.raises(CU.UError, match='xem lai'):
+        KH(xo=dict(XO, q_tag_m=[0.004, -0.0003]))
+    KH(xo=dict(XO, q_tag_m=[0.0012, -0.0003]))                # within u_g + du + ...: passes
+
+
 def test_offset_part_bounds_car_pose():
-    # C8BU-R1-3: with a tag offset the heading error turns the correction vector; P2 bounds the body-centre error of
-    # c7_measure.car_pose when the true q is within du, the true dpsi within A1 and the heading error within sum A
+    # C8BU-R1-3, R3-2: P2 bounds the body-centre error of c7_measure.car_pose when the true offset is within u_g of the
+    # geometric one and the heading error within sum A
     import c7_measure as CM
     rng = np.random.default_rng(5)
-    side = 0.0964
+    side = 0.1445
     worst = 0.0
     for _ in range(300):
-        q_hat = rng.uniform(-0.03, 0.03, 2)
-        du = rng.uniform(0, 0.002)
+        o_g = rng.uniform(-0.03, 0.03, 2)
+        tk = _cp(TK)
+        tk['canh'] = dict(truoc=[10.0, 10.0], sau=[10.0, 10.0], phai=[10.0, 10.0], trai=[10.0, 10.0])
+        tk['tam_tam_mm'] = list(o_g * 1e3)
+        tk['tam_tam_dung_sai_mm'] = rng.uniform(0, 1.0)
         dpsi_u = rng.uniform(-0.02, 0.02)
+        o_u = o_g + rng.uniform(-0.002, 0.002, 2)                 # the scorer may use another offset
         cam = _cp(CAM)
-        o_u = [math.cos(dpsi_u) * q_hat[0] - math.sin(dpsi_u) * q_hat[1],
-               math.sin(dpsi_u) * q_hat[0] + math.cos(dpsi_u) * q_hat[1]]
-        cam['bo_cham']['tag_offset'] = [o_u[0], o_u[1], dpsi_u]
-        xo = dict(XO, q_tag_m=list(q_hat), du_m=du)
-        _, pp, _, aa = CU.u_p_u_psi(cam, TBD, TK, xo)
-        a1, sumA = math.radians(aa['A1_goc_dan']), math.radians(sum(aa.values()))
-        r = rng.uniform(0, du)
+        cam['bo_cham']['tag_offset'] = [float(o_u[0]), float(o_u[1]), dpsi_u]
+        cam['bo_cham']['side_m'] = side
+        xo = dict(XO, q_tag_m=list(o_g), du_m=0.0007)
+        _, pp, _, aa = CU.u_p_u_psi(cam, TBD, tk, xo)
+        u_g = (tk['tam_tam_dung_sai_mm'] + tk['e_mm']) * 1e-3 + math.hypot(*o_g) * math.radians(tk['tam_than_deg'])
+        sumA = math.radians(sum(aa.values()))
+        r = rng.uniform(0, u_g)
         ang = rng.uniform(0, 2 * math.pi)
-        q_t = q_hat + r * np.array([math.cos(ang), math.sin(ang)])
-        dpsi_t = dpsi_u + rng.choice([-1, 1]) * rng.uniform(0, a1)
-        err = rng.choice([-1, 1]) * rng.uniform(0, sumA - a1)     # the other heading parts
+        o_t = o_g + r * np.array([math.cos(ang), math.sin(ang)])
+        err = rng.choice([-1, 1]) * rng.uniform(0, sumA)       # body heading error seen by the scorer
         B = rng.uniform(-1.5, 1.5, 2)
         psi_b = rng.uniform(-math.pi, math.pi)
-        o_t = np.array([math.cos(dpsi_t) * q_t[0] - math.sin(dpsi_t) * q_t[1],
-                        math.sin(dpsi_t) * q_t[0] + math.cos(dpsi_t) * q_t[1]])
         cb, sb = math.cos(psi_b), math.sin(psi_b)
         T = B + np.array([cb * o_t[0] - sb * o_t[1], sb * o_t[0] + cb * o_t[1]])
-        psi_tag_seen = psi_b + dpsi_t + err
+        psi_tag_seen = psi_b + dpsi_u + err                    # car_pose: body heading = tag heading - dpsi_u
         ct, st = math.cos(psi_tag_seen), math.sin(psi_tag_seen)
         corners = T + CM.car_corners_body(side) @ np.array([[ct, st], [-st, ct]])
         res = CM.car_pose(_FloorCam0(), corners, side, 0.0, (0.0, 0.0), tag_offset=(o_u[0], o_u[1], dpsi_u))

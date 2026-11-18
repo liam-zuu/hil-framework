@@ -101,6 +101,9 @@ def read_frames(path):
         raise XError(f'{tj}: tag_offset {off!r}: the clip must be tracked with tag_offset [0, 0, 0]')
     if info.get('frames') != len(rows):
         raise XError(f'{tj}: frames {info.get("frames")!r} but {path} has {len(rows)} rows (not its track.json)')
+    if info.get('frames_sha256') != cu.sha256(path):          # C8BU-R3-1: another tracking of the same clip
+        raise XError(f'{tj}: frames_sha256 is not the SHA-256 of {path} (not its track.json; a regate output has no '
+                     f'tag_offset: use the track output)')
     keep = []
     for r in rows:
         if r['valid'] != '1' or r['car_seen'] != '1':

@@ -53,8 +53,8 @@ def make_place(tmp_path, name, q=(0.004, -0.0025), c0=(1.0, 0.0), v=(0.0, 0.0), 
     d.mkdir(exist_ok=True)
     p = d / 'frames.csv'
     CM.write_frames(str(p), rows)
-    (d / 'track.json').write_text(json.dumps(dict(video=f'{name}.mov', frames=len(rows), tag_offset=list(tag_offset))),
-                                  encoding='utf-8')
+    (d / 'track.json').write_text(json.dumps(dict(video=f'{name}.mov', frames=len(rows), tag_offset=list(tag_offset),
+                                                  frames_sha256=CM.sha256(str(p)))), encoding='utf-8')
     return str(p), t, psi
 
 
@@ -173,7 +173,9 @@ def test_refusals(tmp_path):
     od = tmp_path / 'off'
     od.mkdir()
     (od / 'frames.csv').write_text('\n'.join(rows) + '\n', encoding='utf-8')
-    (od / 'track.json').write_text(json.dumps(dict(frames=len(rows) - 1, tag_offset=[0, 0, 0])), encoding='utf-8')
+    (od / 'track.json').write_text(json.dumps(dict(frames=len(rows) - 1, tag_offset=[0, 0, 0],
+                                                   frames_sha256=X.cu.sha256(str(od / 'frames.csv')))),
+                                   encoding='utf-8')
     with pytest.raises(X.XError, match='tag_offset 0'):
         X.analyse({'O': str(od / 'frames.csv'), 'K1': pO})
 
@@ -189,9 +191,16 @@ def test_track_json_needed_and_zero_offset(tmp_path):
         X.read_frames(pO)
     pA, *_ = make_place(tmp_path, 'A', seed=43)
     tj = os.path.join(os.path.dirname(pA), 'track.json')
+    with open(tj, encoding='utf-8') as f:
+        good = json.load(f)
     with open(tj, 'w', encoding='utf-8') as f:
-        json.dump(dict(frames=5, tag_offset=[0, 0, 0]), f)            # not the track.json of this frames file
+        json.dump(dict(good, frames=5), f)                           # not the track.json of this frames file
     with pytest.raises(X.XError, match='not its track.json'):
+        X.read_frames(pA)
+    # C8BU-R3-1 counter-example: the track.json (offset 0) of another tracking of the same clip, same row count
+    with open(tj, 'w', encoding='utf-8') as f:
+        json.dump(dict(good, frames_sha256='0' * 64), f)
+    with pytest.raises(X.XError, match='frames_sha256'):
         X.read_frames(pA)
 
 
