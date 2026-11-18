@@ -22,7 +22,12 @@ Model (one turning interval = one place, one direction, at least one full turn):
 
 Outputs (c8b_xoay_v1):
   q_tag_m      mean of q over the intervals (at least 2 places, each with both directions)
-  du_m         = spread + 3 x the largest standard error (least squares, white-noise convention, a minor term).
+  An interval is NOT used (C8BU-R2-2) when its quadratic centre path departs from its linear one by more than 1 mm,
+  or its residual RMS (linear drift) exceeds 1 mm [DE XUAT]; each place must keep a usable interval in each direction,
+  else refused (turn again there). A creep moving in step with the turn cannot be told from another q (page v10 P2):
+  what passes these checks is a stated limit, not bounded.
+  du_m         = spread + 3 x the largest standard error (least squares, white-noise convention, a minor term)
+                 + the largest residual RMS of a used interval (motion outside the model leaves a residual).
                  spread = largest |q_est - q_mean| over EVERY estimate: per interval with a linear drift, per
                  interval with a quadratic drift, and per whole turn with a linear drift (C8BU-R1-2: a curved creep
                  biases q the same way in both directions, so the spread of the linear fits alone does not show it;
@@ -62,6 +67,8 @@ SMOOTH_S = 0.5        # s: window of the rate estimate
 GAP_S = 0.5           # s: an interval is not bridged over a gap of more frames than this
 MIN_TURN = 2 * math.pi
 DRIFT_WARN_M = 0.01   # m: drift of the centre over an interval above this is flagged (slip) [DE XUAT]
+CURVE_MAX_M = 0.001   # m: an interval whose quadratic centre path departs from its linear one by more is not used
+RES_MAX_M = 0.001     # m: an interval whose residual RMS (linear drift) is larger is not used (C8BU-R2-2) [DE XUAT]
 GRID_S = 0.05         # s: grid of the cross-correlation
 FRAME_NEED = ('t_s', 'valid', 'car_seen', 'x', 'y', 'psi', 'tag_x', 'tag_y')
 OFFSET_TOL_M = 1e-6   # x, y must equal tag_x, tag_y: the clip was tracked with tag_offset 0
@@ -80,6 +87,20 @@ def read_frames(path):
     miss = [c for c in FRAME_NEED if c not in rows[0]]
     if miss:
         raise XError(f'{path}: no column {miss} (frames CSV of c7_measure.track)')
+    # C8BU-R2-1: x = tag_x shows only dx = dy = 0; a dpsi of the tracking turns psi and so q. c7_measure.track writes
+    # track.json (tag_offset, frames) next to frames.csv: it must say [0, 0, 0] and the same number of frames
+    tj = os.path.join(os.path.dirname(os.path.abspath(path)), 'track.json')
+    if not os.path.isfile(tj):
+        raise XError(f'{path}: no track.json beside it (c7_measure.track output): the tag_offset of the tracking '
+                     f'cannot be checked')
+    with open(tj, encoding='utf-8') as f:
+        info = json.load(f)
+    off = info.get('tag_offset')
+    if not isinstance(off, list) or len(off) != 3 or any(isinstance(x, bool) or not isinstance(x, (int, float))
+                                                         or x != 0 for x in off):
+        raise XError(f'{tj}: tag_offset {off!r}: the clip must be tracked with tag_offset [0, 0, 0]')
+    if info.get('frames') != len(rows):
+        raise XError(f'{tj}: frames {info.get("frames")!r} but {path} has {len(rows)} rows (not its track.json)')
     keep = []
     for r in rows:
         if r['valid'] != '1' or r['car_seen'] != '1':
@@ -163,7 +184,7 @@ def fit_interval(F, i0, i1, deg=1):
     return dict(t0=float(t[0]), t1=float(t[-1]), n=int(n), vong=float(abs(psi[-1] - psi[0]) / (2 * math.pi)),
                 bac=deg, c0_m=[float(sol[0]), float(sol[1])], v_m_s=[float(v[0]), float(v[1])],
                 troi_m=float(np.max(np.hypot(*(centre - centre[0]).T))), q_m=[float(sol[m]), float(sol[m + 1])],
-                se_m=se, res_rms_m=float(np.sqrt(np.mean(rr ** 2))), res_max_m=float(rr.max()))
+                se_m=se, res_rms_m=float(np.sqrt(np.mean(rr ** 2))), res_max_m=float(rr.max()), _centre=centre)
 
 
 def revolutions(F, i0, i1):
@@ -236,26 +257,39 @@ def analyse(places, logs=None):
     """places: {name: frames path}; logs: {name: log path}. Returns the c8b_xoay_v1 dict."""
     if len(places) < 2:
         raise XError('need at least two places (origin and a far place, page v10 P2)')
-    res, qs, ses, alts = {}, [], [], []
+    res, qs, ses, alts, rms = {}, [], [], [], []
     for name, path in places.items():
         F = read_frames(path)
         segs, short = intervals(F)
-        dirs = {s for (_, _, s) in segs}
-        if dirs != {1, -1}:
-            raise XError(f'place {name}: needs a turning interval of at least one full turn in each direction '
-                         f'(has {sorted(dirs)}; shorter intervals: {short})')
-        doan = []
+        doan, used = [], []
         for (i0, i1, sg) in segs:
             d = dict(fit_interval(F, i0, i1), chieu=sg)
             d2 = fit_interval(F, i0, i1, deg=2)                 # C8BU-R1-2: a curved drift is not linear
             vong = [fit_interval(F, a, b) for (a, b) in revolutions(F, i0, i1)]   # drift ~linear within one turn
-            d['bac2'] = dict(q_m=d2['q_m'], se_m=d2['se_m'], troi_m=d2['troi_m'])
+            # C8BU-R2-2: a creep moving in step with the turn cannot be told from another q (page v10 P2 limit), so
+            # an interval whose centre path is visibly not linear, or whose residual is large, is not used
+            cong = float(np.max(np.hypot(*(d2.pop('_centre') - d.pop('_centre')).T)))
+            for v in vong:
+                v.pop('_centre')
+            d['bac2'] = dict(q_m=d2['q_m'], se_m=d2['se_m'], troi_m=d2['troi_m'], lech_tuyen_tinh_m=cong)
             d['tung_vong'] = [dict(t0=v['t0'], t1=v['t1'], q_m=v['q_m'], se_m=v['se_m']) for v in vong]
             d['troi_lon'] = max(d['troi_m'], d2['troi_m']) > DRIFT_WARN_M
+            why = ([f'centre path curved by {cong * 1e3:.2f} mm > {CURVE_MAX_M * 1e3:.1f}'] if cong > CURVE_MAX_M
+                   else []) + ([f'residual RMS {d["res_rms_m"] * 1e3:.2f} mm > {RES_MAX_M * 1e3:.1f}']
+                               if d['res_rms_m'] > RES_MAX_M else [])
+            d['dung'], d['bo_vi'] = not why, why
             doan.append(d)
+            if why:
+                continue
+            used.append(sg)
             qs.append(d['q_m'])
+            rms.append(d['res_rms_m'])
             alts.extend([d2['q_m']] + [v['q_m'] for v in vong])
             ses.extend([d['se_m'], d2['se_m']] + [v['se_m'] for v in vong])
+        if set(used) != {1, -1}:
+            raise XError(f'place {name}: needs a usable turning interval of at least one full turn in each direction '
+                         f'(usable {sorted(set(used))}; left out: {[(x["chieu"], x["bo_vi"]) for x in doan if not x["dung"]]}'
+                         f'; shorter intervals: {short}): turn again there, slowly and evenly')
         entry = dict(file=os.path.basename(path), sha256=cu.sha256(path), doan=doan, ngan=short)
         if logs and name in logs:
             entry['imu'] = imu_check(F, cu.load_log(logs[name]), segs)
@@ -265,12 +299,17 @@ def analyse(places, logs=None):
     E = np.array(qs + alts)                                  # every estimate: linear, quadratic drift, each turn
     spread = float(np.max(np.hypot(*(E - qm).T)))
     se3 = 3.0 * float(max(ses))
-    return dict(version=VERSION, q_tag_m=[float(qm[0]), float(qm[1])], du_m=spread + se3, spread_m=spread,
-                se3_m=se3, n_doan=len(qs), n_uoc=len(E), cho=res,
+    res_term = float(max(rms))                               # motion outside the model leaves a residual (R2-2)
+    return dict(version=VERSION, q_tag_m=[float(qm[0]), float(qm[1])], du_m=spread + se3 + res_term,
+                spread_m=spread, se3_m=se3, res_m=res_term, n_doan=len(qs), n_uoc=len(E), cho=res,
                 troi_lon=[f'{n}:{d["t0"]:.2f}' for n, e in res.items() for d in e['doan'] if d['troi_lon']],
-                quy_uoc=dict(w_min=W_MIN, smooth_s=SMOOTH_S, gap_s=GAP_S, drift_warn_m=DRIFT_WARN_M),
+                quy_uoc=dict(w_min=W_MIN, smooth_s=SMOOTH_S, gap_s=GAP_S, drift_warn_m=DRIFT_WARN_M,
+                             curve_max_m=CURVE_MAX_M, res_max_m=RES_MAX_M),
                 gioi_han=['turning centre = centre of the four wheels and of the IMU unless the wheels slip; a slip '
                           'repeated about an off-centre point is not seen (page v10 P2)',
+                          'a creep of the centre moving in step with the turn cannot be told from another q; intervals '
+                          'with a visibly curved centre path or a large residual are left out, the rest is not bounded '
+                          '(C8BU-R2-2)',
                           'imu: a check only, not in U'],
                 written_at=datetime.datetime.now().astimezone().isoformat(timespec='seconds'))
 

@@ -29,15 +29,17 @@ khoa (after the C8 clips are tracked and the C8 runs have their clock files):
     P3 / A2 plate re-seating, position / angle (3 lifts, car still)                                  [camera file]
     P4 / A4 3b          d_p_quay / d_psi_quay                                                         [c8b_3b.py]
     P5 plumb / zc       (h / H) dn + h dzc (rho + dn) / (H (H - dzc - h))  (C8BS-R7-1..3)            [camera file]
-    P6 tag height       (rho + s / sqrt 2) dh / (H - h - dh), dh = max_i |c_i - h| + e   (c_i the four corner heights by
+    P6 tag height       (rho + dn + s / sqrt 2) dh / (H - dzc - h - dh), dh = max_i |c_i - h| + e   (c_i the corners by
                         caliper, h the height the scorer uses, e the caliper error)                [caliper + camera]
     P7 / A5 noise       largest deviation from the mean of a still mark, per frame (not sigma)        [camera file]
-    A1 mounting angle   |dpsi_u - theta| + atan(2 e / s) + max edge angle^2 + plate-body angle from the drawing; theta
+    A1 mounting angle   |dpsi_u - theta| + atan(2 e / s) + max edge angle^2 + 0.01^2 (print scale difference <= 1 %,
+                        assumed, C8BU-R2-4) + plate-body angle from the drawing; theta
                         = the Kabsch angle of the black square on the plate, mean of its four edge angles by caliper
                         (a distorted print is seen, C8BU-R1-6; Liam 18/11 at CODE_C8B "Thuoc kep 4 canh")  [caliper]
     A3 camera by area   bound on the Kabsch heading of the car tag (96.4 mm) from the camera model, carried from the
                         held-out mark pairs (page v10 A3; A3.quy_ve_ma_noc must be true, C8BU-R1-4)    [camera file]
-    A6 tag tilt         rho (sum_i |c_i - mean c| + 8 e) / (2 sqrt 2 s (H - dzc - max c_i - e))  [rad]: the parallax
+    A6 tag tilt         (rho + dn) (sum_i |c_i - mean c| + 8 e) / (2 sqrt 2 s (H - dzc - max c_i - e))  [rad; camera
+                        at least 1 m above every corner, C8BU-R2-3]: the parallax
                         step uses one h for the four corners, a corner higher by d moves out by (P_i - C) d / (H - c_i),
                         which turns the Kabsch fit of car_pose; domain enforced: sum |c_i - mean| <= 2 mm, rho <= 3 m
                         (C8BU-R1-8). Not in page v10: Liam 18/11 at CODE_C8B "Them A6 (Recommended)"
@@ -113,8 +115,8 @@ CAM_KEYS = {'version', 'P1', 'moc_dich', 'P3', 'A2', 'than_dich', 'P7', 'A3', 'A
             'nguon', 'ghi_chu'}
 TK_VERSION = 'c8b_thuoc_kep_v2'      # v2: four edges (C8BU-R1-6, Liam 18/11 "Thuoc kep 4 canh")
 XOAY_VERSION = 'c8b_xoay_v1'
-XOAY_KEYS = {'version', 'q_tag_m', 'du_m', 'spread_m', 'se3_m', 'n_doan', 'n_uoc', 'cho', 'troi_lon', 'quy_uoc',
-             'gioi_han', 'written_at', 'script'}
+XOAY_KEYS = {'version', 'q_tag_m', 'du_m', 'spread_m', 'se3_m', 'res_m', 'n_doan', 'n_uoc', 'cho', 'troi_lon',
+             'quy_uoc', 'gioi_han', 'written_at', 'script'}
 P_PARTS = ('P1_anh_san', 'P2_lech_tam', 'P3_nhac_tam', 'P4_quay', 'P5_day_doi_zc', 'P6_do_cao', 'P7_nhieu_khung')
 A_PARTS = ('A1_goc_dan', 'A2_nhac_tam', 'A3_huong_vung', 'A4_quay', 'A5_nhieu_khung', 'A6_nghieng_ma')
 LE = 1.25
@@ -165,6 +167,8 @@ def _tag_offset(cam):
 
 EDGE_SIGN = {'truoc': 1, 'phai': 1, 'sau': -1, 'trai': -1}
 EDGE_MAX_RAD = 0.05        # each edge angle within about 2.9 deg: the small-angle mean below holds [DE XUAT]
+S_IN_MAX = 0.01            # assumed largest difference of the print scale along the two axes (C8BU-R2-4) [DE XUAT]
+H_MIN_M = 1.0              # camera at least 1 m above the highest tag corner (C8BU-R2-3: the A6 form needs it)
 TK_KEYS = {'version', 'cao_4_goc_mm', 'e_mm', 's_mm', 'canh', 'tam_than_deg', 'tam_than_gioi_han', 'nguon', 'ghi_chu'}
 
 
@@ -204,7 +208,9 @@ def _caliper(tk):
             raise UError(f'caliper canh.{k}: edge angle {math.degrees(goc[k]):.2f} deg beyond '
                          f'{math.degrees(EDGE_MAX_RAD):.1f} deg (small-angle mean not valid; check the numbers)')
     theta = sum(goc.values()) / 4
-    xap_xi = max(v * v for v in goc.values())     # second-order rest of the small-angle mean (<= 2.5e-3 rad in domain)
+    # second-order rest of the small-angle mean: edge angles squared, plus |S|^2 for an unequal print scale along the
+    # two axes that edge angles do not show (C8BU-R2-4; assumption: print scale differs by at most 1 % [DE XUAT])
+    xap_xi = max(v * v for v in goc.values()) + S_IN_MAX ** 2
     tt = _num(tk.get('tam_than_deg'), 'caliper tam_than_deg')
     if tt == 0 and not str(tk.get('tam_than_gioi_han') or '').strip():
         raise UError('tam_than_deg 0 needs tam_than_gioi_han (the limit written: plate-body error not bounded)')
@@ -257,12 +263,14 @@ def u_p_u_psi(cam, tb, tk, xo):
     rho = _num(_get(cam, 'do_cao.rho_max_m'), 'do_cao.rho_max_m')
     side = _num(_get(cam, 'bo_cham.side_m'), 'bo_cham.side_m')
     dzc = _num(_get(cam, 'day_doi.dzc_m'), 'day_doi.dzc_m')
+    dn = _num(_get(cam, 'day_doi.dn_m'), 'day_doi.dn_m')
     c4, e, s_cal, theta, tam_than, goc_canh, xap_xi = _caliper(tk)
     Hl = H - dzc                                            # lowest camera height allowed by the zc bound (R1-8)
+    rho_t = rho + dn                                        # distance from the TRUE point under the camera (R2-3)
     dh = float(np.max(np.abs(c4 - h))) + e                  # corner heights against the h the scorer uses
-    if not Hl - h - dh > 0 or not Hl - c4.max() - e > 0:
-        raise UError('caliper heights: not below the camera')
-    cao = (rho + side / math.sqrt(2)) * dh / (Hl - h - dh)
+    if not Hl - c4.max() - e >= H_MIN_M or not Hl - h - dh > 0:
+        raise UError(f'caliper heights: camera (zc - dzc = {Hl} m) not at least {H_MIN_M} m above the tag corners')
+    cao = (rho_t + side / math.sqrt(2)) * dh / (Hl - h - dh)
     # A6: one h for the four corners; corner i at c_i moves by (P_i - C)(c_i - h)/(H - c_i); the small-angle Kabsch
     # turn is (sum_i delta_i a_i) x (T - C) / (2 s^2), |.| <= rho s / sqrt 2 sum |delta_i - mean delta| / (2 s^2).
     # Domain of the small-angle form enforced (C8BU-R1-8): corners within 2 mm in all, rho within 3 m
@@ -270,12 +278,11 @@ def u_p_u_psi(cam, tb, tk, xo):
     if spread_c > 0.002 + 1e-12 or rho > 3.0:
         raise UError(f'tag tilt: sum |c_i - mean| {spread_c * 1e3:.2f} mm (<= 2) or rho {rho} m (<= 3) outside the '
                      f'domain of the A6 bound')
-    nghieng = rho * (spread_c + 8 * e) / (2 * math.sqrt(2) * side * (Hl - c4.max() - e))
+    nghieng = rho_t * (spread_c + 8 * e) / (2 * math.sqrt(2) * side * (Hl - c4.max() - e))
     # plumb point and zc reused from 16/11 (Liam 17/11): car_pose corrects P = p + kappa (C - p), kappa = h / H with
     # the H, C of the session; truth P* = p + kappa* (C* - p), |C* - p| = rho* H* / (H* - h) (central projection from
     # the true centre), so |P - P*| <= (h / H) dn + h dzc rho* / (H (H* - h)), H* >= H - dzc, rho* <= rho + dn
     # (C8BS-R7-1..3: dn, dzc bound the absolute error of the camera centre position and height, not a check threshold)
-    dn = _num(_get(cam, 'day_doi.dn_m'), 'day_doi.dn_m')
     day_doi = h / H * dn + h * dzc * (rho + dn) / (H * (H - dzc - h))
     def f(path):
         return _num(_get(cam, path), path)

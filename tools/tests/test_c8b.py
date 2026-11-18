@@ -850,14 +850,14 @@ def _expect(cam=CAM, tk=TK, xo=XO):
     dn, dzc = cam['day_doi']['dn_m'], cam['day_doi']['dzc_m']
     Hl = H - dzc
     dh = np.max(np.abs(c - h)) + e
-    cao = (rho + s / math.sqrt(2)) * dh / (Hl - h - dh)
+    cao = (rho + dn + s / math.sqrt(2)) * dh / (Hl - h - dh)
     dd = h / H * dn + h * dzc * (rho + dn) / (H * (H - dzc - h))
     sg = dict(truoc=1, phai=1, sau=-1, trai=-1)
     theta = sum(sg[k] * math.atan((a - b) / tk['s_mm']) for k, (a, b) in tk['canh'].items()) / 4
     dpsi = (cam['bo_cham']['tag_offset'] or [0, 0, 0])[2]
-    xx = max(math.atan((a - b) / tk['s_mm']) ** 2 for (a, b) in tk['canh'].values())
+    xx = max(math.atan((a - b) / tk['s_mm']) ** 2 for (a, b) in tk['canh'].values()) + 0.01 ** 2
     a1 = math.degrees(abs(dpsi - theta) + math.atan(2 * tk['e_mm'] / tk['s_mm']) + xx) + tk['tam_than_deg']
-    a6 = math.degrees(rho * (np.sum(np.abs(c - c.mean())) + 8 * e) / (2 * math.sqrt(2) * s * (Hl - c.max() - e)))
+    a6 = math.degrees((rho + dn) * (np.sum(np.abs(c - c.mean())) + 8 * e) / (2 * math.sqrt(2) * s * (Hl - c.max() - e)))
     a = dict(A1_goc_dan=a1, A2_nhac_tam=0.1, A3_huong_vung=0.15, A4_quay=0.25, A5_nhieu_khung=0.12, A6_nghieng_ma=a6)
     dx, dy, dp = cam['bo_cham']['tag_offset'] or [0, 0, 0]
     qx, qy = xo['q_tag_m']
@@ -877,8 +877,8 @@ def test_khoa_sums():
     assert k['U_p_phan_m'] == pytest.approx(p) and k['U_psi_phan_deg'] == pytest.approx(a)
     assert k['U_p_m'] == pytest.approx(1.25 * sum(p.values()))
     assert k['U_psi_deg'] == pytest.approx(1.25 * sum(a.values()))
-    # hand numbers: P1 = 2 + 1 + 2 x 0.4 = 3.8 mm; A1 = 2 atan(0.2 / 96.4) + atan(0.2 / 96.4)^2 + 0.05 = 0.2880 deg
-    assert p['P1_anh_san'] == pytest.approx(0.0038) and a['A1_goc_dan'] == pytest.approx(0.28799, abs=2e-5)
+    # hand numbers: P1 = 2 + 1 + 2 x 0.4 = 3.8 mm; A1 = 2 atan(0.2 / 96.4) + atan(0.2 / 96.4)^2 + 0.01^2 + 0.05 = 0.2937 deg
+    assert p['P1_anh_san'] == pytest.approx(0.0038) and a['A1_goc_dan'] == pytest.approx(0.29372, abs=2e-5)
     assert tuple(k['U_p_phan_m']) == CU.P_PARTS and tuple(k['U_psi_phan_deg']) == CU.A_PARTS
     assert k['troi_ppm'] == pytest.approx(1.25 * 4e-4 * 1e6)             # run d (not ok) left out
     assert k['dai']['O1-F05']['width_s'] == [0.010, 0.012] and k['dai']['O1-F05']['gyro_minus_rv_s'] == [0.003, 0.005]
@@ -997,7 +997,7 @@ def test_khoa_offset_used_by_the_scorer():
     c, s = math.cos(g), math.sin(g)
     cam['bo_cham']['tag_offset'] = [c * q[0] - s * q[1], s * q[0] + c * q[1], g]
     k = KH(cam)
-    a1 = math.degrees(math.atan(2 * 0.1 / 96.4) + g * g) + 0.05
+    a1 = math.degrees(math.atan(2 * 0.1 / 96.4) + g * g + 1e-4) + 0.05
     assert k['U_psi_phan_deg']['A1_goc_dan'] == pytest.approx(a1)
     assert k['U_p_phan_m'] == pytest.approx(_expect(cam=cam)[0])
     sumA = sum(k['U_psi_phan_deg'].values())
@@ -1112,6 +1112,21 @@ def test_tilt_domain_edges():
             err_psi, err_p = _tilt_case(c, h, 3.0, psi, H)
             assert err_psi <= math.radians(aa['A6_nghieng_ma']) * (1 + 1e-6)
             assert err_p <= pp['P6_do_cao'] * (1 + 1e-6)
+    # C8BU-R2-3 counter-example: rho 0 but dn 16 mm: the tag may sit 16 mm from the true point under the camera
+    c = h + np.array([0.0005, -0.0005, -0.0005, 0.0005])
+    cam = _cp(CAM)
+    cam['do_cao'].update(H_m=H, h_m=h, rho_max_m=0.0)
+    cam['day_doi'] = dict(dn_m=0.016, dzc_m=0.0, kappa=h / H)
+    _, pp, _, aa = CU.u_p_u_psi(cam, TBD, dict(_cp(TK), cao_4_goc_mm=list(c * 1e3), e_mm=0.0), XO)
+    assert aa['A6_nghieng_ma'] > 0
+    for psi in np.linspace(-math.pi, math.pi, 73):
+        err_psi, err_p = _tilt_case(c, h, 0.016, psi, H)
+        assert err_psi <= math.radians(aa['A6_nghieng_ma']) * (1 + 1e-6)
+    cam = _cp(CAM)                                             # camera too low for the A6 form: refused
+    cam['do_cao'].update(H_m=0.131, h_m=0.12)
+    cam['day_doi'] = dict(dn_m=0.0, dzc_m=0.0, kappa=0.12 / 0.131)
+    with pytest.raises(CU.UError, match='at least'):
+        KH(cam, tk=dict(_cp(TK), cao_4_goc_mm=[120.5, 119.5, 119.5, 120.5]))
     cam = _cp(CAM)
     cam['do_cao']['rho_max_m'] = 3.1
     with pytest.raises(CU.UError, match='domain'):
