@@ -72,7 +72,8 @@ def test_body_pushed_is_removed_with_eps():
     body = [(0.0, 0.0, 0.0), (0.002, -0.001, math.radians(0.5)), (0.0015, 0.0, math.radians(-0.4)),
             (0.0, 0.002, math.radians(0.2)), (0.001, 0.001, 0.0)]
     res = nt.analyse(summaries(body, PLATE_OFF), CFG, R_OK, tag_h=0.12)
-    eps = [math.hypot(b[0], b[1]) * CFG['dh_m'] / (2.9 - 0.12) for b in body]
+    dz = CFG['dh_m'] + CFG['dz_tag_m']                                  # NC3-1: tag and boxes off their planes
+    eps = [math.hypot(b[0], b[1]) * dz / (2.9 - 0.12 - CFG['dz_tag_m']) for b in body]
     tp, ta = truth_rep(PLATE_OFF, eps)
     assert res['kiem_than'] and res['so_dung'] == 'tru_than'
     assert res['tru_than']['vi_tri_m'] == pytest.approx(tp / A0, abs=1e-9)
@@ -110,7 +111,7 @@ def test_opposite_body_and_plate_motion():
     """Body -0.8 mm, plate +0.8 mm relative to the body: the tag stays put on the floor (raw 0); body removed finds it."""
     body = [(0.0, 0.0, 0.0), (-0.0008, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)]
     plate = [(0.0, 0.0, 0.0), (0.0008, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)]
-    res = nt.analyse(summaries(body, plate), dict(CFG, dh_m=0.0), R_OK)
+    res = nt.analyse(summaries(body, plate), dict(CFG, dh_m=0.0, dz_tag_m=0.0), R_OK)
     assert res['tho']['vi_tri_m'] == pytest.approx(0.0, abs=1e-12)
     assert res['vi_tri_m'] == pytest.approx(0.0008 / A0, abs=1e-9)
 
@@ -494,7 +495,7 @@ def test_end_to_end_body_pushed(scene, tmp_path):
     tp, ta = truth_rep(PLATE_OFF)
     assert code == 0, r['co']
     k = r['ket_qua']
-    assert k['tru_than']['vi_tri_m'] == pytest.approx(tp, abs=1.5e-4)
+    assert tp - 1.5e-4 <= k['tru_than']['vi_tri_m'] <= tp / A0 + 3e-4      # + eps of a 3.5 mm push (NC3-1)
     assert k['tru_than']['goc_deg'] == pytest.approx(ta, abs=0.05)
     assert k['than_dich_max_m'] == pytest.approx(0.0035, abs=2e-4)
     assert k['than_dich_max_deg'] == pytest.approx(0.6, abs=0.05)
@@ -795,3 +796,49 @@ def test_nc1_ecc_moving_more_than_1_px_is_refused(monkeypatch):
     assert b.ecc(img[75:165, 115:205].astype(np.float32), 25.0, 25.0) is None
     u, v, c, q = b.match(img.astype(np.uint8))
     assert math.isnan(u)
+
+
+# ---------------------------------------------------------------- Codex code round 3 (NC3-1, NC3-2)
+def test_nc3_1_tag_and_boxes_both_off_their_planes():
+    """Codex NC3-1: tag at 0.13 (1 cm off), boxes at 0.09 (3 cm off), camera fixed; body moves 50 mm in N1 while the
+    plate moves d = -(a - b) T / a inside the body: tag and boxes move the same on the plane, body-removed 0."""
+    H, h = 2.632, 0.12
+    C = np.array([-0.4802, -0.0329])
+    a = (H - h) / (H - 0.13)
+    b = (H - h) / (H - 0.09)
+    T = np.array([0.05, 0.0])
+    d = -(a - b) * T / a
+    q = [np.array([0.13, 0.11]), np.array([-0.13, -0.11])]
+    proj = lambda P, k: C + k * (P - C)                                # noqa: E731
+    s = []
+    for j in range(4):
+        Tj = T if j == 1 else np.zeros(2)
+        dj = d if j == 1 else np.zeros(2)
+        tag = proj(Tj + dj, a)
+        s.append(dict(tag=[tag[0], tag[1], 0.0], box=[proj(x + Tj, b).tolist() for x in q], cam=[C[0], C[1], H],
+                      scale=1.0, scale_u=0.0))
+    real = float(np.hypot(*d))
+    assert real == pytest.approx(0.000786782, abs=1e-9)
+    res = nt.analyse(s, CFG, R_OK, tag_h=h)
+    assert res['kiem_than'] and res['tru_than']['vi_tri_m'] >= real
+
+
+def test_nc3_2_template_frame_uses_the_real_time(scene, monkeypatch):
+    d, floor = scene
+    b0 = (0.05, -0.03, math.radians(20.0))
+    good = floor.copy()
+    render_car(good, b0, PLATE_OFF[0])
+    path = d / 'pts_N0.avi'
+    write_video(path, [good] * 6)
+    real_iter = nt.cm.iter_frames
+
+    def nan_pts(video, max_frames=None):
+        for k, t, g in real_iter(video, max_frames):
+            yield k, (math.nan if k == 3 else t), g
+    monkeypatch.setattr(nt.cm, 'iter_frames', nan_pts)
+    with open(d / 'session.json', encoding='utf-8') as f:
+        ctx = nt.Ctx(json.load(f), TAG_H, dict(nt.DEFAULTS))
+    with pytest.raises(ValueError):
+        nt.template_at(str(path), ctx, 3, nt.parse_boxes(boxes_px(b0)))
+    i, g = nt.pick_template_frame(str(path), ctx, 6, nt.parse_boxes(boxes_px(b0)))
+    assert i == 2                                                      # middle 3 has no time: nearest other

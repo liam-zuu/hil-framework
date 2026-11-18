@@ -5,7 +5,7 @@ car tag position and heading RELATIVE TO THE CAR BODY over the placements of the
 two textured tape patches stuck on the body.
 
 Design: CLAUDE_THESIS 03_CODE/docs/2026-11-18_Thiet_ke_c7_nhac_tam_v4.md (CODE_NHACTAM local_f8bebd94, 18/11/2026;
-v2 after Codex Sol round 1, NT-1..NT-14; v3 after round 2, NT2-1..NT2-4; v4 after round 3, NT3-1..NT3-4; v5 after Codex code round 1, NC-1..NC-9; v6 after code round 2, NC2-1..NC2-4). Measurement (design 0, 5): car still at O, control power off;
+v2 after Codex Sol round 1, NT-1..NT-14; v3 after round 2, NT2-1..NT2-4; v4 after round 3, NT3-1..NT3-4; v5 after Codex code round 1, NC-1..NC-9; v6 after code round 2, NC2-1..NC2-4; v7 after code round 3, NC3-1..NC3-2). Measurement (design 0, 5): car still at O, control power off;
 N0 = plate fitted on its pins, N1.. = lifted and put back, the last one after the calliper heights (B1); one clip of
 10 s per placement, nobody in the frame; clip R = plate lying on the floor >= 0.5 m from the car (5 s).
 
@@ -57,7 +57,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 import c7_measure as cm                                                  # noqa: E402
 
-VERSION = 'c7_nhac_tam_v6'
+VERSION = 'c7_nhac_tam_v7'
 MIN_PLACEMENTS = 4
 DEFAULTS = dict(
     trim_s=0.5,            # 2.2: dropped at both ends of a clip
@@ -83,6 +83,7 @@ DEFAULTS = dict(
     search_px=60,          # 2.1: template search half-window (about 9 cm); a peak on its border is rejected (NC-1)
     still_scale_rel=0.003, # 2.2: 95th percentile of |scale / median - 1| (NC-3: a scattered scale is not a still clip)
     a0_min=0.996,          # 2.4: lower bound of the true scale of N0, |height error| <= 1 cm [uoc luong] (NC-2)
+    dz_tag_m=0.01,         # 2.4: the same 1 cm bound on the tag height, used in eps with dh (NC3-1)
 )
 THRESH_STATUS = 'DE XUAT (thiet ke c7_nhac_tam v4 muc 2)'
 NAN = float('nan')
@@ -172,12 +173,12 @@ class Box:
         return ex, ey
 
 
-def frames_of(video, wanted):
-    """{index: grey frame} for the wanted indices, one decoding pass."""
+def frames_of(video, wanted, with_time=False):
+    """{index: grey frame} (or {index: (t_s, grey frame)} with with_time) for the wanted indices, one decoding pass."""
     out, wanted = {}, set(wanted)
     for k, t, g in cm.iter_frames(video):
         if k in wanted:
-            out[k] = g
+            out[k] = (t, g) if with_time else g
         if len(out) == len(wanted):
             break
     return out
@@ -195,10 +196,11 @@ def check_template(g, box, cfg):
 
 def template_at(video, ctx, idx, boxes_px):
     """The template frame given by its index (from khung_N0.json): every box must be usable there (NC2-2)."""
-    g = frames_of(video, [idx]).get(idx)
-    if g is None:
+    tg = frames_of(video, [idx], with_time=True).get(idx)
+    if tg is None:
         raise ValueError(f'{video}: no frame {idx}')
-    r, _ = measure_frame(ctx, ctx.cam0, idx, 0.0, g, [])
+    t, g = tg
+    r, _ = measure_frame(ctx, ctx.cam0, idx, t, g, [])                    # real PTS (NC3-2)
     if not (core_finite(r) and r['gate_marks'] and r['tag_seen'] and r['tag_res_sim_m'] <= ctx.cfg['tag_res_sim_m']):
         raise ValueError(f'{video}: frame {idx} does not pass the gates')
     return idx, g, [check_template(g, b, ctx.cfg) for b in boxes_px]
@@ -308,12 +310,13 @@ def pick_template_frame(video, ctx, n, boxes_px=None, batch=16):
     order = sorted(range(n), key=lambda i: (abs(i - mid), i))
     for b0 in range(0, len(order), batch):
         part = order[b0:b0 + batch]
-        frames = frames_of(video, part)
+        frames = frames_of(video, part, with_time=True)
         for i in part:
-            g = frames.get(i)
-            if g is None:
+            tg = frames.get(i)
+            if tg is None:
                 continue
-            r, _ = measure_frame(ctx, ctx.cam0, i, 0.0, g, [])
+            t, g = tg
+            r, _ = measure_frame(ctx, ctx.cam0, i, t, g, [])                    # real PTS (NC3-2)
             if not (core_finite(r) and r['gate_marks'] and r['tag_seen']
                     and r['tag_res_sim_m'] <= ctx.cfg['tag_res_sim_m']):              # NC2-4
                 continue
@@ -495,11 +498,14 @@ def analyse(summaries, cfg, rong=None, tag_h=0.12, boxes_px=None):
         if nb >= 2:
             tj = float(np.hypot(*m[1]))
             rot_c = float(np.hypot(*((rot2(m[0]) - np.eye(2)) @ c0)))         # |(R - I) C0| (NT2-1)
-            den = H - dH - tag_h                     # the lower camera height: first-order terms stay an upper bound
+            # NC3-1: the tag (|dz| <= dz_tag) and the boxes (|dz| <= dh) may both be off their planes; the body removal
+            # then leaves |a - b| / b x (motion) with |a - b| / b <= (dh + dz_tag) / (H - |dH| - h - dz_tag)
+            dz = cfg['dh_m'] + cfg['dz_tag_m']
+            den = H - dH - tag_h - cfg['dz_tag_m']   # the lower camera height and the higher plane: an upper bound
             if not den > 0:
-                raise ValueError(f'H - |dH| - h = {den} <= 0 (NC-3)')
-            e_H = cfg['dh_m'] * dH / den ** 2 * float(np.hypot(*(qbar0 - c0)))       # NT3-3
-            eps.append((tj + dc + rot_c) * cfg['dh_m'] / den + e_H + eh)
+                raise ValueError(f'H - |dH| - h - dz_tag = {den} <= 0 (NC-3)')
+            e_H = dz * dH / den ** 2 * float(np.hypot(*(qbar0 - c0)))                 # NT3-3
+            eps.append((tj + dc + rot_c) * dz / den + e_H + eh)
         else:
             tj, rot_c, e_H = NAN, NAN, NAN
             eps.append(NAN)
