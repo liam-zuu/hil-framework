@@ -2041,18 +2041,25 @@ def read_tien_de(path: str, session: str) -> dict:
     ses = sh.get('sessions')
     if not isinstance(ses, dict) or not ses or any(not _hex64(v) for v in ses.values()):       # RM2-4: a mapping
         raise LogError(f'{w}: sha256.sessions must be a mapping {{name: sha256}}')
-    luot, thieu = sh.get('luot'), d.get('luot_thieu_kiem')
-    if not isinstance(luot, dict) or not luot or any(not isinstance(v, dict) or not _hex64(v.get('frames'))
-                                                     for v in luot.values()):
-        raise LogError(f'{w}: ket_qua dat needs sha256.luot {{id: {{frames: sha256}}}}')
+    # S6-10 of CODE_KIEMCHEO (approved 18/11 at KIEMCHEO): 'luot' is the list of run ids (lost runs with a scoring
+    # included), their frames at sha256.luot[id].frames; h1_ho_tro false: the file covers no H1 scoring
+    ids, luot, thieu, h1 = d.get('luot'), sh.get('luot'), d.get('luot_thieu_kiem'), d.get('h1_ho_tro', False)
+    if not isinstance(ids, list) or not ids or any(not isinstance(x, str) for x in ids) or len(set(ids)) != len(ids):
+        raise LogError(f'{w}: ket_qua dat needs luot, the list of run ids')
+    if not isinstance(luot, dict) or set(luot) != set(ids) or any(not isinstance(v, dict) or not _hex64(v.get('frames'))
+                                                                  for v in luot.values()):
+        raise LogError(f'{w}: sha256.luot must give {{frames: sha256}} for every id of luot, no other')
     fr = {}
-    for k, v in luot.items():
-        if v['frames'] in fr:
-            raise LogError(f"{w}: frames {v['frames'][:12]} of two runs ({fr[v['frames']]}, {k})")
-        fr[v['frames']] = k
-    if not isinstance(thieu, list) or any(x not in luot for x in thieu):
+    for k in ids:
+        f = luot[k]['frames']
+        if f in fr:
+            raise LogError(f'{w}: frames {f[:12]} of two runs ({fr[f]}, {k})')
+        fr[f] = k
+    if not isinstance(thieu, list) or any(x not in ids for x in thieu):
         raise LogError(f'{w}: luot_thieu_kiem must list ids of luot')
-    out.update(u_so=sh['u_so'], sessions=set(ses.values()), frames=fr, thieu=set(thieu))
+    if not isinstance(h1, bool):
+        raise LogError(f'{w}: h1_ho_tro must be true or false')
+    out.update(u_so=sh['u_so'], sessions=set(ses.values()), frames=fr, thieu=set(thieu), h1=h1)
     return out
 
 
@@ -2207,7 +2214,9 @@ def apply_moc(tun: List[dict], ds: str) -> List[dict]:
                 fl.add('tien_de_khac_ngay')
             if not scope_ok.get(r.get('session_id')):
                 fl.add('tien_de_pham_vi_thieu')
-            if 'H1' in lans and fr.get('H1') not in td['frames']:
+            # RM3-2; S6-10 TD3-1: H1 covered only by a file that says it covers H1, under an id other than H0's
+            if 'H1' in lans and (not td['h1'] or fr.get('H1') not in td['frames']
+                                 or td['frames'].get(fr.get('H1')) == td['frames'].get(fr.get('H0'))):
                 fl.add('tien_de_khong_phu_h1')
             if any(td['frames'].get(f) in td['thieu'] for f in fr.values() if f is not None):    # RM4-1
                 fl.add('tien_de_luot_thieu')

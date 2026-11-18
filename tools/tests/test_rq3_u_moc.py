@@ -105,7 +105,7 @@ class World:
         d.update(over)
         return wj(rd / (name or f'u_moc_{lan}.json'), d)
 
-    def td(self, session='S1', ngay='2026-11-20', kq='dat', luot=None, thieu=(), name=None, **over):
+    def td(self, session='S1', ngay='2026-11-20', kq='dat', luot=None, thieu=(), name=None, h1=False, **over):
         """A premise file of a session; luot: {id: frames path}, by default every run of the session."""
         if luot is None:
             luot = {f'L{k}': self.runs[uid]['frames'] for k, uid in enumerate(self.runs) if uid.startswith(session)}
@@ -114,7 +114,7 @@ class World:
                         dict(vai_tro='sessions', duong_dan=self.ses, sha256=sha(self.ses))],
                  sha256=dict(u_so=sha(self.u_so), sessions={'H_a': sha(self.ses)},
                              luot={k: dict(frames=sha(p)) for k, p in luot.items()}),
-                 luot_thieu_kiem=list(thieu), mau_thuan=[], tap_neo={})
+                 luot=list(luot), luot_thieu_kiem=list(thieu), mau_thuan=[], tap_neo={}, h1_ho_tro=h1)
         d.update(over)
         return wj(self.tmp / 'td' / (name or f'{session}_{kq}.json'), d)
 
@@ -424,7 +424,7 @@ def h1_setup(w, uid, h1_in_luot=True, thieu=(), xy_h1=0.005):
     luot = {f'L{k}': w.runs[u]['frames'] for k, u in enumerate(w.runs)}
     if h1_in_luot:
         luot[f"L{list(w.runs).index(uid)}@H1"] = f1
-    rl.tien_de(w.ds, 'S1', w.td(luot=luot, thieu=thieu))
+    rl.tien_de(w.ds, 'S1', w.td(luot=luot, thieu=thieu, h1=h1_in_luot))
 
 
 def test_8b_h1_covered_and_below_the_lock_keeps_dat(w):
@@ -536,3 +536,41 @@ def test_cli_u_moc_and_tien_de(w, capsys):
     with open(os.path.join(w.ds, rl.U_MOC), newline='', encoding='utf-8') as f:
         assert next(csv.reader(f)) == rl.U_MOC_COLS
     assert w.after()[a]['run_outcome'] == 'dat'
+
+
+def test_s6_10_luot_is_the_list_of_ids(w):
+    a = w.run(1)
+    rl.u_moc(w.ds, a, 'H0', w.u(a), w.gate)
+    good = json.load(open(w.td()))
+    with pytest.raises(rl.LogError, match='list of run ids'):              # a mapping instead of the list
+        rl.tien_de(w.ds, 'S1', wj(w.tmp / 'td' / 'x1.json', dict(good, luot={'L0': 1})))
+    with pytest.raises(rl.LogError, match='every id of luot'):             # an id without frames
+        rl.tien_de(w.ds, 'S1', wj(w.tmp / 'td' / 'x2.json', dict(json.load(open(w.td())), luot=['L0', 'L9'])))
+
+
+def test_s6_10_h1_not_supported_lowers_every_run_needing_h1(w):
+    """TD3-1 of CODE_KIEMCHEO: h1_ho_tro false, even with the H1 frames listed, every run needing H1 is lowered."""
+    a, b = w.run(1), w.run(2)
+    rl.u_moc(w.ds, b, 'H0', w.u(b), w.gate)
+    h1_setup(w, a)
+    p = os.path.join(w.ds, rl.TIEN_DE)
+    td_file = rl.read_rows(p)[0]['file']
+    d = json.load(open(td_file))
+    rl._write_all(p, rl.TIEN_DE_COLS, [])
+    rl.tien_de(w.ds, 'S1', wj(w.tmp / 'td' / 'no_h1.json', dict(d, h1_ho_tro=False)))
+    got = w.moc()
+    assert (got[a]['moc_flags'], got[b]['run_outcome']) == ('tien_de_khong_phu_h1', 'dat')
+
+
+def test_s6_10_h1_frames_under_the_h0_id_do_not_cover_h1(w):
+    """TD3-1: the H1 scoring with the same frames sha256 as H0 (one id in luot) is not an H1 coverage, h1_ho_tro or not."""
+    a = w.run(1)
+    rd, f0 = w.runs[a]['rd'], w.runs[a]['frames']
+    sf = wj(rd / 'score_final.json', {'outcome': 'dat', 'calib_drift': {'h1_score': {'frames_sha256': sha(f0)}}})
+    rl.append_row(os.path.join(w.ds, rl.SO_H), rl.SO_H_COLS,
+                  dict(run_uid=a, outcome_tam='dat', outcome_sau='dat', flags='calib_drift', vuot='true',
+                       D_H_mm='3', score_final_file=sf, score_final_sha256=sha(sf), ghi_luc='2026-11-20T10:00:00'))
+    rl.u_moc(w.ds, a, 'H0', w.u(a), w.gate)
+    rl.u_moc(w.ds, a, 'H1', w.u(a, lan='H1'), w.gate)
+    rl.tien_de(w.ds, 'S1', w.td(h1=True))                       # luot = [L0] with the frames of H0 = H1
+    assert w.moc()[a]['moc_flags'] == 'tien_de_khong_phu_h1'
