@@ -905,7 +905,7 @@ def test_a3_converted_on_an_exact_scene_and_flag_follows_approval(scene, monkeyp
     out = kc.a3_summary({'H_a': rows})
     assert out['quy_ve_ma_noc'] is False and 'CHUA DUOC LIAM DUYET' in out['loai']
     assert out['max_deg'] == pytest.approx(max(r['quy_deg'] for r in rows)) and 'max_deg_cap' in out
-    assert len(out['gioi_han']) == 10 and out['vuong_goc']['thong_tin'] is True
+    assert len(out['gioi_han']) == 13 and out['vuong_goc']['thong_tin'] is True and 'KHONG phai can' in out['loai']
     monkeypatch.setattr(kc, 'A3_QUY_DUYET', True)
     assert kc.a3_summary({'H_a': rows})['quy_ve_ma_noc'] is True
 
@@ -946,3 +946,61 @@ def test_phan_tich_writes_the_converted_a3(tmp_path, scene, monkeypatch):
     assert r['A3']['quy_ve_ma_noc'] is False and 'gap_max_deg' in r['A3'] and r['version'] == 'c7_kiem_cheo_v6'
     head = (tmp_path / 'kc' / 'a3_cap.csv').read_text(encoding='utf-8').splitlines()[0]
     assert 'quy_deg' in head and 'gap_deg' in head
+
+
+def _tilted(f, k, C, ry, rx):
+    R0 = np.diag([1.0, -1.0, -1.0])
+    cy_, sy_, cx_, sx_ = math.cos(ry), math.sin(ry), math.cos(rx), math.sin(rx)
+    R = R0 @ np.array([[cy_, 0, sy_], [0, 1, 0], [-sy_, 0, cy_]]) @ np.array([[1, 0, 0], [0, cx_, -sx_], [0, sx_, cx_]])
+    return cp.Camera('B1', f, W / 2, H / 2, [k], cv_rvec(R), -R @ np.array(C))
+
+
+def test_a3_gap_uses_the_tag_height_and_both_segment_ends():
+    """Codex KCA1-4 (case of Codex, one direction full -> without pair: 0.014101 / midpoint 0.012243 / z = 0 0.013721,
+    reproduced by the author); both directions (v5b): 0.014102, maximum at t = 1, phi = 75 deg; midpoint only 0.012247,
+    tag at z = 0 0.013723: a conversion that drops the height or the segment ends is seen."""
+    F = _tilted(1200, -0.020, (0.030, -0.020, 2.632), 0.150, -0.200)
+    c = _tilted(1202, -0.018, (0.031, -0.019, 2.634), 0.151, -0.201)
+    mi, mj = (1.1, 0.8, SIDE), (1.7, 1.1, SIDE)
+    full = kc.a3_tag_gap(F, c, mi, mj, 0.1445, 0.119)[0]
+    assert full == pytest.approx(0.0141020, abs=5e-7)
+    assert kc.a3_tag_gap(F, c, mi, mj, 0.1445, 0.119, ts=(0.5,))[0] == pytest.approx(0.0122470, abs=5e-7)
+    assert kc.a3_tag_gap(F, c, mi, mj, 0.1445, 0.0)[0] == pytest.approx(0.0137229, abs=5e-7)
+    assert kc.a3_tag_gap(F, c, mi, mj, 0.1445, 0.119, ts=(1.0,), phis=(75.0,))[0] == pytest.approx(full, abs=1e-9)
+
+
+def test_a3_clip_passes_the_session_tag_to_the_conversion(scene, monkeypatch):
+    marks, cam, img = scene
+    seen = []
+    monkeypatch.setattr(kc, 'a3_tag_gap', lambda F, c, mi, mj, side, h: seen.append((side, h)) or (0.0, 0.0, 0.0))
+    kc.a3_clip(img, marks, 'B1', W, H, ZC, l_max=0.6, tag=(0.1445, 0.119))
+    assert seen and set(seen) == {(0.1445, 0.119)}
+
+
+def _a3_conv(**over):
+    a3 = dict(max_deg=0.16, max_deg_cap=0.15, rms_deg=0.07, quy_ve_ma_noc=False,
+              ma_ao=dict(t=list(kc.A3_TAG_T), phi_deg=list(kc.A3_TAG_PHI_DEG), hai_chieu=True, canh_m=0.1445, cao_m=0.12))
+    a3.update(over)
+    return a3
+
+
+@pytest.mark.parametrize('case', ['flag_true', 'side', 'height', 'no_geom'])
+def test_xuat_refuses_unapproved_flag_and_other_tag(tmp_path, case):
+    """Codex KCA1-2: an input A3 with quy_ve_ma_noc true is refused while A3_QUY_DUYET is False; KCA1-3: a converted A3
+    must name the tag the scorer uses (bo_cham.side_m 0.1445, do_cao.h_m 0.12 in the parts)."""
+    a3 = dict(flag_true=_a3_conv(quy_ve_ma_noc=True), side=_a3_conv(ma_ao=dict(canh_m=0.0964, cao_m=0.12)),
+              height=_a3_conv(ma_ao=dict(canh_m=0.1445, cao_m=0.0)), no_geom=_a3_conv(ma_ao={}))[case]
+    kcp = _kc_file(tmp_path, A3=dict(a3, buoi='C8_x'))
+    assert kc.main(_xuat_args(tmp_path, kcp)) == 2
+    assert not (tmp_path / 'o.json').exists()
+
+
+def test_xuat_converted_a3_ok_and_flag_only_after_approval(tmp_path, monkeypatch):
+    kcp = _kc_file(tmp_path, A3=dict(_a3_conv(), buoi='C8_x'))
+    assert kc.main(_xuat_args(tmp_path, kcp)) == 0
+    assert json.loads((tmp_path / 'o.json').read_text(encoding='utf-8'))['A3']['quy_ve_ma_noc'] is False
+    t2 = tmp_path / 'b'
+    t2.mkdir()
+    monkeypatch.setattr(kc, 'A3_QUY_DUYET', True)
+    kcp = _kc_file(t2, A3=dict(_a3_conv(quy_ve_ma_noc=True), buoi='C8_x'))
+    assert kc.main(_xuat_args(t2, kcp)) == 0
