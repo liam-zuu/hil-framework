@@ -2523,7 +2523,9 @@ def effort(ds: str, date: str, start: str, end_: str, campaign: str = '', khoan:
     t1 = dt.datetime.fromisoformat(f'{date}T{end_}')
     if t1 <= t0:
         t1 += dt.timedelta(days=1)                      # past midnight
-    row = {'ngay': date, 'bat_dau': start, 'ket_thuc': end_, 'gio': f'{(t1 - t0).total_seconds() / 3600:.2f}',
+    # RS1-2 (Liam 18/11 at CODE_GATE "Sửa luôn"): 4 decimals like cancel and hoc-end, so short rows (clip H) do not
+    # vanish nor depend on how the time is split into rows (0.01 h was 36 s per row)
+    row = {'ngay': date, 'bat_dau': start, 'ket_thuc': end_, 'gio': f'{(t1 - t0).total_seconds() / 3600:.4f}',
            'chien_dich': campaign, 'khoan': khoan, 'nhan': nhan, 'ghi_chu': ghi_chu}
     row.update({k: v for k, v in extra.items() if v not in (None, '')})
     append_row(os.path.join(ds, EFFORT), EFFORT_COLS, row)

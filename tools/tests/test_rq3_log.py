@@ -186,7 +186,7 @@ def test_refusals(ds):
 def test_effort_past_midnight(ds):
     d, _ = ds
     rl.migrate(d)
-    assert rl.effort(d, '2026-11-20', '23:30', '00:15', khoan='T_H', ghi_chu='x')['gio'] == '0.75'
+    assert rl.effort(d, '2026-11-20', '23:30', '00:15', khoan='T_H', ghi_chu='x')['gio'] == '0.7500'   # RS1-2
 
 
 def test_summary_accounts_split_caps_and_finals(ds, no_moc):
