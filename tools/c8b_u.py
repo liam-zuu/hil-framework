@@ -18,12 +18,14 @@ khoa (after the C8 clips are tracked and the C8 runs have their clock files):
   2026-11-18_Trang_C8b_ngan_sach_khong_do_tay_v10.md), field names by v10 (Liam 18/11 at CODE_C8B local_6db0bd09,
   "Sua c8b_u theo ten v10 (Recommended)"; design: 03_CODE/docs/2026-11-18_Thiet_ke_C8b_o_U_v10_v2.md; the sum and the
   margin as O1 v11.39 J1, Liam 18/11 at THESIS "Duyet, ra vong khoa (Recommended)"):
-  U_p  (m)       = LE x (P1 + ... + P7),  U_psi (deg) = LE x (A1 + ... + A6), linear, parts may overlap
+  U_p  (m)       = LE x (P1 + ... + P7),  U_psi (deg) = LE x (A1 + ... + A7), linear, parts may overlap
                  (conservative), none subtracted; U_p, U_psi bound ONE frame (per-frame noise P7, A5 inside).
-    P1 image -> floor   max(cross-validation largest at the marks on the clip-mean pose, per frame) + the largest
-                        true shift of a mark left in the fit, nguong + 2 u_so (dropped when the observed shift
-                        exceeds nguong + u_so; the comparison error u_so may hide as much again)          [camera file]
-    P2 tag-body centre  |o_u - o_g| + u_g + |o_u| (A1 + ... + A6)  [rad; o_u = (dx, dy) of the scorer's tag_offset;
+    P1 image -> floor   max(cross-validation largest at the marks on the clip-mean pose, per frame) + U_moc_xy_m
+                        (marks shifting while left in the fit, carried to the car output: the empirical bound of the
+                        approved proposal v3, Liam 18/11 at CODE_C8B local_6db0bd09, "Duyet ban 3 (Recommended)";
+                        CLAUDE_THESIS 03_CODE/docs/2026-11-18_De_xuat_C8b_can_moc_dich_v3.md section 3; it replaces
+                        nguong + 2 u_so, kept in the camera file as information only)                   [camera file]
+    P2 tag-body centre  |o_u - o_g| + u_g + |o_u| (A1 + ... + A7)  [rad; o_u = (dx, dy) of the scorer's tag_offset;
                         o_g = drawing (plate centre - wheel centre) + r (tag centre on the plate by caliper), u_g =
                         drawing tolerance (Euclidean) + sqrt 2 e + |r| x plate-body angle (C8BU-R4-1, R4-2); the lock
                         records the cross-check gap, room and the slip size surely refused, room + u_g + du (R4-3,
@@ -49,6 +51,14 @@ khoa (after the C8 clips are tracked and the C8 runs have their clock files):
                         step uses one h for the four corners, a corner higher by d moves out by (P_i - C) d / (H - c_i),
                         which turns the Kabsch fit of car_pose; domain enforced: sum |c_i - mean| <= 2 mm, rho <= 3 m
                         (C8BU-R1-8). Not in page v10: Liam 18/11 at CODE_C8B "Them A6 (Recommended)"
+    A7 mark shift       U_moc_psi_deg: the heading part of the same empirical bound (proposal v3 section 3); also in
+                        the A sum of P2 (counted again with U_moc_xy_m, which is after the offset: conservative)
+                                                                                                      [camera file]
+  The lock keeps moc_dich (U_moc_xy_m, U_moc_psi_deg BEFORE the margin, with their sources) so that a later run can
+  compare the same quantity (proposal v3 sections 3, 5). khoa refuses (proposal v3 section 4, "Tu choi khoa"): a
+  missing field, phuong_phap_duyet empty, tien_de_buoi not 'dat', or a SHA-256 in moc_dich.nguon that is not the one
+  of the file khoa is given (frames of each run, schedule, tap_moc, u_so, session), or a car_pose set-up in nguon
+  other than the one of the camera file.
   Test 5 (ruler at the stop points, dropped in v10, kept as an option) is an end-to-end check: every difference
   <= U_p, else 'xem_lai' (not widened by itself). 3b with ga_ok false: refused (set-up redone).
 cong (after every C8 figure-8 run is scored on its clock grid with the locked constants):
@@ -63,7 +73,9 @@ cong (after every C8 figure-8 run is scored on its clock grid with the locked co
   checked before the file is opened), then read back with gate_c8.read_gate_c8; an existing file is never replaced.
 
   python tools/c8b_u.py khoa --gio r1=gio_r1.json ... --tb 3b.json --cam-u c8_cam_u_vao.json \
-      --thuoc-kep thuoc_kep.json --xoay xoay.json [--u-imu u_imu_dong.json] [--phep5 phep5.csv] --out c8b_khoa.json
+      --thuoc-kep thuoc_kep.json --xoay xoay.json --moc-frames r1=frames_r1.csv ... --moc-lich lich.json \
+      --moc-tap-moc tap_moc.json --moc-u-so u_so.json --moc-session session.json \
+      [--u-imu u_imu_dong.json] [--phep5 phep5.csv] --out c8b_khoa.json
   python tools/c8b_u.py cong --khoa c8b_khoa.json --ke-hoach ke_hoach_c8.csv --levels O1-F02,O1-F05,O1-F08 \
       --u-t-branch bo_tick --luot SLOT=RUN_ID,gio.json,luoi.json ... [--cam cam.json] --c8-dir 05_DATA/results/C8/<d> \
       --out gate_c8.json
@@ -71,8 +83,15 @@ Last line: #ket_qua,ma=0 written / 2 refused or error.
 
 c8_cam_u_vao.json (CODE_CAM / CODE_KIEMCHEO / CODE_NHACTAM; m and deg; every number used finite and >= 0; other keys
   inside a block are information; a top-level key not listed is refused; format agreed 18/11 with CODE_CAM):
-  {"version": "c8_cam_u_vao_v2",
-   "P1": {"bo_nhom_max_m", "tung_khung_max_m", ...}, "moc_dich": {"nguong_m", "u_so_m", ...},
+  {"version": "c8_cam_u_vao_v3",       (v3: proposal v3 section 4, C8BM-R1-4; a v2 file is refused)
+   "P1": {"bo_nhom_max_m", "tung_khung_max_m", ...},
+   "moc_dich": {"U_moc_xy_m", "U_moc_psi_deg" (largest over every scored frame, BEFORE the margin),
+                "phuong_phap_duyet": Liam's approval of the method after Codex, with date and place (non-empty),
+                "tien_de_buoi": "dat" when the session passed the empirical confirmation (proposal v3 section 4),
+                "nguon": {"frames": {RUN_ID: sha256 of the final frames.csv of that run, every C8 run},
+                          "lich", "tap_moc", "u_so", "session": sha256 of those files (64 lowercase hex),
+                          "car_pose": {"tag_offset", "side_m", "h_m"} (equal to bo_cham.tag_offset, bo_cham.side_m,
+                          do_cao.h_m), "bo_lay_mau": the version of the sampler}, nguong_m, u_so_m, ... (information)},
    "P3": {"vi_tri_max_m", ...}, "A2": {"goc_max_deg", ...}, "than_dich": {...} (information),
    "P7": {"lech_max_m", ...}, "A3": {"max_deg", "quy_ve_ma_noc": true, ...}, "A5": {"lech_max_deg", ...},
    "day_doi": {"dn_m", "dzc_m", "kappa"}, "do_cao": {"rho_max_m", "h_m", "H_m"},
@@ -117,8 +136,8 @@ for _p in (os.path.join(HERE, '..', 'rpi5'), os.path.join(HERE, '..', 'fwsim'), 
         sys.path.insert(0, _p)
 import c8_u_imu as cu                                                    # noqa: E402
 
-VERSION = 'c8b_khoa_v3'     # v3 = parts by page v10 (P1-P7, A1-A5); a v1, v2 lock is refused by cong (C8BS-R7-4)
-CAM_VERSION = 'c8_cam_u_vao_v2'
+VERSION = 'c8b_khoa_v4'     # v4 = v3 (page v10 parts) + U_moc in P1, A7, block moc_dich (proposal v3); older refused
+CAM_VERSION = 'c8_cam_u_vao_v3'
 CAM_KEYS = {'version', 'P1', 'moc_dich', 'P3', 'A2', 'than_dich', 'P7', 'A3', 'A5', 'day_doi', 'do_cao', 'bo_cham',
             'nguon', 'ghi_chu'}
 TK_VERSION = 'c8b_thuoc_kep_v2'      # v2: four edges (C8BU-R1-6, Liam 18/11 "Thuoc kep 4 canh")
@@ -126,7 +145,9 @@ XOAY_VERSION = 'c8b_xoay_v1'
 XOAY_KEYS = {'version', 'q_tag_m', 'du_m', 'spread_m', 'se3_m', 'res_m', 'n_doan', 'n_uoc', 'cho', 'troi_lon',
              'quy_uoc', 'gioi_han', 'written_at', 'script'}
 P_PARTS = ('P1_anh_san', 'P2_lech_tam', 'P3_nhac_tam', 'P4_quay', 'P5_day_doi_zc', 'P6_do_cao', 'P7_nhieu_khung')
-A_PARTS = ('A1_goc_dan', 'A2_nhac_tam', 'A3_huong_vung', 'A4_quay', 'A5_nhieu_khung', 'A6_nghieng_ma')
+A_PARTS = ('A1_goc_dan', 'A2_nhac_tam', 'A3_huong_vung', 'A4_quay', 'A5_nhieu_khung', 'A6_nghieng_ma', 'A7_moc_dich')
+MOC_FILES = ('lich', 'tap_moc', 'u_so', 'session')      # proposal v3 section 4: files whose SHA khoa checks
+MOC_NGUON_KEYS = {'frames', 'car_pose', 'bo_lay_mau'} | set(MOC_FILES)
 LE = 1.25
 CONTROLLERS = ('PID', 'LADRC')
 MASKABLE = ('g2', 'g3', 'g5')
@@ -240,7 +261,7 @@ def _caliper(tk):
                 xap_xi=xap_xi, o_g=o_g, r=r, tol=tol)
 
 
-CAM_NUMS = ('P1.bo_nhom_max_m', 'P1.tung_khung_max_m', 'moc_dich.nguong_m', 'moc_dich.u_so_m', 'P3.vi_tri_max_m',
+CAM_NUMS = ('P1.bo_nhom_max_m', 'P1.tung_khung_max_m', 'moc_dich.U_moc_xy_m', 'moc_dich.U_moc_psi_deg', 'P3.vi_tri_max_m',
             'A2.goc_max_deg', 'P7.lech_max_m', 'A3.max_deg', 'A5.lech_max_deg', 'day_doi.dn_m', 'day_doi.dzc_m',
             'day_doi.kappa', 'do_cao.rho_max_m', 'do_cao.H_m', 'do_cao.h_m', 'bo_cham.side_m')
 
@@ -269,10 +290,97 @@ def check_cam(cam):
     if abs(v['day_doi.kappa'] - h / H) > 1e-6 * (h / H):  # C8BS-R7-3: H, h here are the ones of the scoring session
         raise UError(f'day_doi.kappa {v["day_doi.kappa"]} is not do_cao.h_m / do_cao.H_m = {h / H} (the kappa of the '
                      f'scoring)')
+    _moc_shape(cam)
+
+
+def _sha_hex(x, what):
+    if not isinstance(x, str) or len(x) != 64 or any(ch not in '0123456789abcdef' for ch in x):
+        raise UError(f'{what}: {x!r} is not a SHA-256 (64 lowercase hex)')
+    return x
+
+
+def _same(a, b):
+    """Equal set-up numbers (null = null; numbers within 1e-12 relative)."""
+    if a is None or b is None:
+        return a is None and b is None
+    if isinstance(a, list) or isinstance(b, list):
+        return isinstance(a, list) and isinstance(b, list) and len(a) == len(b) and all(map(_same, a, b))
+    if isinstance(a, bool) or isinstance(b, bool) or not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
+        return False
+    return math.isclose(float(a), float(b), rel_tol=1e-12, abs_tol=0.0)
+
+
+def _moc_shape(cam):
+    """Block moc_dich of c8_cam_u_vao_v3 (proposal v3 section 4): every field present and of its type; the car_pose
+    set-up in nguon equal to the one of this file. The values khoa needs ('dat', an approval, SHAs of the files it is
+    given) are checked by check_moc."""
+    md = _get(cam, 'moc_dich')
+    for k in ('phuong_phap_duyet', 'tien_de_buoi'):
+        if not isinstance(md.get(k), str):
+            raise UError(f'camera input: moc_dich.{k} missing or not a string (proposal v3 section 4)')
+    ng = md.get('nguon')
+    if not isinstance(ng, dict):
+        raise UError('camera input: moc_dich.nguon missing (the sources of U_moc, proposal v3 section 4)')
+    miss = sorted(MOC_NGUON_KEYS - set(ng))
+    if miss:
+        raise UError(f'camera input: moc_dich.nguon lacks {miss}')
+    fr = ng['frames']
+    if not isinstance(fr, dict) or not fr:
+        raise UError('camera input: moc_dich.nguon.frames: {RUN_ID: sha256} of every C8 run needed')
+    for rid, sha in fr.items():
+        _sha_hex(sha, f'moc_dich.nguon.frames.{rid}')
+    for k in MOC_FILES:
+        _sha_hex(ng[k], f'moc_dich.nguon.{k}')
+    if not isinstance(ng['bo_lay_mau'], str) or not ng['bo_lay_mau'].strip():
+        raise UError('camera input: moc_dich.nguon.bo_lay_mau (the sampler version) empty')
+    cp = ng['car_pose']
+    if not isinstance(cp, dict) or set(cp) != {'tag_offset', 'side_m', 'h_m'}:
+        raise UError('camera input: moc_dich.nguon.car_pose needs exactly tag_offset, side_m, h_m')
+    want = dict(tag_offset=_get(cam, 'bo_cham.tag_offset'), side_m=_get(cam, 'bo_cham.side_m'),
+                h_m=_get(cam, 'do_cao.h_m'))
+    for k, w in want.items():
+        if not _same(cp[k], w):
+            raise UError(f'moc_dich.nguon.car_pose.{k} {cp[k]!r} is not the one of this camera file {w!r}: U_moc was '
+                         f'computed with another car_pose set-up')
+
+
+def check_moc(cam, moc_tep, run_ids, ok_ids):
+    """proposal v3 section 4 ("Tu choi khoa", Liam 18/11): the lock is refused when phuong_phap_duyet is empty,
+    tien_de_buoi is not 'dat', or a SHA in moc_dich.nguon is not the SHA of the file khoa is given (moc_tep: {'frames':
+    {RUN_ID: sha}, 'lich': sha, 'tap_moc': sha, 'u_so': sha, 'session': sha}). Frames: one per C8 run, every run whose
+    clock file is ok, no run outside the C8 clock files (run_ids)."""
+    _moc_shape(cam)
+    md = cam['moc_dich']
+    if not md['phuong_phap_duyet'].strip():
+        raise UError('moc_dich.phuong_phap_duyet empty: the method of U_moc is not approved, the lock is refused')
+    if md['tien_de_buoi'] != 'dat':
+        raise UError(f'moc_dich.tien_de_buoi {md["tien_de_buoi"]!r} is not dat: the session did not pass the '
+                     f'empirical confirmation of u_so, the lock is refused (proposal v3 section 4)')
+    if not isinstance(moc_tep, dict):
+        raise UError('the files of the final scoring (frames, lich, tap_moc, u_so, session) are needed to check '
+                     'moc_dich.nguon (C8BM-R2-2)')
+    ng = md['nguon']
+    for k in MOC_FILES:
+        if moc_tep.get(k) is None:
+            raise UError(f'file {k} not given: moc_dich.nguon.{k} cannot be checked')
+        if ng[k] != moc_tep[k]:
+            raise UError(f'moc_dich.nguon.{k} {ng[k]} is not the SHA-256 of the {k} file given ({moc_tep[k]}): U_moc '
+                         f'is of another scoring')
+    fr, got = ng['frames'], moc_tep.get('frames') or {}
+    if set(fr) != set(got):
+        raise UError(f'moc_dich.nguon.frames runs {sorted(fr)} are not the frames files given {sorted(got)}')
+    for rid in sorted(fr):
+        if fr[rid] != got[rid]:
+            raise UError(f'moc_dich.nguon.frames.{rid} is not the SHA-256 of the frames file given for {rid}: U_moc is '
+                         f'of another scoring of that run')
+    extra, lack = sorted(set(fr) - set(run_ids)), sorted(set(ok_ids) - set(fr))
+    if extra or lack:
+        raise UError(f'U_moc frames runs vs the C8 clock files: not a C8 run {extra}, C8 run with an ok clock missing '
+                     f'{lack} (U_moc must cover every scored frame of every C8 run)')
 
 
 def u_p_u_psi(cam, tb, tk, xo, info=None):
-    """U_p (m), U_psi (deg) with their parts P1-P7, A1-A6 (page v10 section 2; design v2)."""
+    """U_p (m), U_psi (deg) with their parts P1-P7, A1-A7 (page v10 section 2; design v2; A7 proposal v3)."""
     check_cam(cam)
     if not isinstance(xo, dict) or xo.get('version') != XOAY_VERSION:
         raise UError(f'turning-in-place input: version is not {XOAY_VERSION}')
@@ -316,12 +424,14 @@ def u_p_u_psi(cam, tb, tk, xo, info=None):
     dx, dy, dpsi = _tag_offset(cam)
     # A1: Kabsch angle of the tag to the plate from the four edges (caliper), against the dpsi the scorer uses
     a1 = math.degrees(abs(dpsi - theta) + math.atan(2 * e / s_cal) + xap_xi) + tam_than
+    # A7 (proposal v3 section 3): the heading part of the empirical mark-shift bound, before the margin
     s = dict(A1_goc_dan=a1, A2_nhac_tam=f('A2.goc_max_deg'), A3_huong_vung=f('A3.max_deg'), A4_quay=dsq,
-             A5_nhieu_khung=f('A5.lech_max_deg'), A6_nghieng_ma=math.degrees(nghieng))
+             A5_nhieu_khung=f('A5.lech_max_deg'), A6_nghieng_ma=math.degrees(nghieng),
+             A7_moc_dich=f('moc_dich.U_moc_psi_deg'))
     # P2 (C8BU-R3-2, Liam 18/11 at CODE_C8B "Lay tam tu hinh hoc (Recommended)"): the body offset o (tag centre minus
     # wheel centre, body frame) from geometry: o_g = drawing (plate centre - wheel centre) + tag centre on the plate by
     # caliper; u_g = drawing tolerance + e + |o_g| x the plate-body angle. The scorer takes the body centre as tag -
-    # R(psi_body_measured) o_u, so the error is <= |o_u - o_g| + u_g + |o_u| (A1 + ... + A6) (C8BU-R1-3: the heading
+    # R(psi_body_measured) o_u, so the error is <= |o_u - o_g| + u_g + |o_u| (A1 + ... + A7) (C8BU-R1-3: the heading
     # error turns the correction vector). Turning in place is only a cross-check: it cannot tell a slip about an
     # off-centre point from another offset (page v10 P2, C8BU-R3-2)
     ogx, ogy = K['o_g']
@@ -346,20 +456,23 @@ def u_p_u_psi(cam, tb, tk, xo, info=None):
         raise UError(f'turning in place gives the tag-body offset ({o_s[0] * 1e3:.2f}, {o_s[1] * 1e3:.2f}) mm, the '
                      f'drawing and caliper ({ogx * 1e3:.2f}, {ogy * 1e3:.2f}) mm: {gap * 1e3:.2f} mm apart, more than '
                      f'{room * 1e3:.2f} mm: xem lai (wheel slip while turning, or the drawing numbers)')
-    # a mark is dropped when |observed shift| > nguong + u_so; not dropped only says |true shift| <= nguong + 2 u_so
-    # (the comparison error may pull the observed shift down by u_so; CODE_KIEMCHEO 18/11, Codex KC1-3)
-    moc = f('moc_dich.nguong_m') + 2 * f('moc_dich.u_so_m')
-    p = dict(P1_anh_san=max(f('P1.bo_nhom_max_m'), f('P1.tung_khung_max_m')) + moc,
+    # proposal v3 section 3 (C33-13): the marks left in the fit while shifted, carried to the car output by refitting
+    # (U_moc_xy_m, after the offset, before the margin); nguong + 2 u_so is a bound at the mark, not at the car, and is
+    # no longer a floor (kept in the camera file as information)
+    p = dict(P1_anh_san=max(f('P1.bo_nhom_max_m'), f('P1.tung_khung_max_m')) + f('moc_dich.U_moc_xy_m'),
              P2_lech_tam=lech, P3_nhac_tam=f('P3.vi_tri_max_m'), P4_quay=dpq, P5_day_doi_zc=day_doi,
              P6_do_cao=cao, P7_nhieu_khung=f('P7.lech_max_m'))
     assert tuple(p) == P_PARTS and tuple(s) == A_PARTS
     return LE * sum(p.values()), p, LE * sum(s.values()), s
 
 
-def khoa(gios, tb, cam, tk, xo, u_imu=None, phep5=None, tb_name='', tb_sha=''):
-    """gios: {run_id: c8b_gio_v1 dict} of the C8 runs."""
+def khoa(gios, tb, cam, tk, xo, u_imu=None, phep5=None, tb_name='', tb_sha='', moc_tep=None):
+    """gios: {run_id: c8b_gio_v1 dict} of the C8 runs. moc_tep: SHA-256 of the files of the final scoring that khoa is
+    given, {'frames': {run_id: sha}, 'lich', 'tap_moc', 'u_so', 'session': sha} (check_moc; proposal v3 section 4)."""
     if not gios:
         raise UError('no C8 clock file')
+    check_cam(cam)
+    check_moc(cam, moc_tep, list(gios), [r for r, g in gios.items() if isinstance(g, dict) and g.get('ok')])
     rates, dai = [], {}
     for rid, g in gios.items():
         if g.get('format') != 'c8b_gio_v1':
@@ -392,7 +505,9 @@ def khoa(gios, tb, cam, tk, xo, u_imu=None, phep5=None, tb_name='', tb_sha=''):
                mot_khung_s=sh.get('mot_khung_s'), U_p_m=U_p, U_p_phan_m=p_parts, U_psi_deg=U_psi,
                U_psi_phan_deg=s_parts, thuoc_kep=dict(goc_canh_deg=goc_canh, goc_kabsch_deg=math.degrees(theta),
                                                       o_hinh_hoc_m=list(Kc['o_g'])),
-               kiem_xoay=kx)          # gap, room; truot_bat_chac_tu_m: a slip at least this large is surely refused
+               kiem_xoay=kx,          # gap, room; truot_bat_chac_tu_m: a slip at least this large is surely refused
+               # proposal v3 section 3 (C8BM-R2-2): U_moc_* BEFORE the margin with their sources, for later runs
+               moc_dich=json.loads(json.dumps(cam['moc_dich'])))
     if u_imu is not None:
         if u_imu.get('version') != 'u_imu_dong_v2':
             raise UError('u_imu file: version is not u_imu_dong_v2')
@@ -539,7 +654,9 @@ def check_branch(branch, meta, luot):
             raise UError(f'run {rid}: nodes scored with tick branch {sorted(used)}, the plan says {want}')
 
 
-def cong(k, plan, luot, levels, branch, c8_dir, cam=None, written_by=None, meta=None):
+def cong(k, plan, luot, levels, branch, c8_dir, cam=None, written_by=None, meta=None, khoa_sha256=None):
+    """The gate file; camera.c8b is the lock itself (so camera.c8b.moc_dich carries U_moc before the margin, for the
+    later runs, CODE_GATE 18/11) plus khoa_sha256, the SHA-256 of the lock file read (None when called from code)."""
     import gate_c8
     import o1_gate
     from o1_tasks import FIG8
@@ -576,7 +693,7 @@ def cong(k, plan, luot, levels, branch, c8_dir, cam=None, written_by=None, meta=
                 levels=list(levels), u_t_branch=branch,
                 dieu_2b=dict(rule='report_only = {c in g2,g3,g5 : uhat[c] > 0.5 * threshold[c]}', thresholds=thr,
                              u_p_m=k['U_p_m'], u_psi_deg=k['U_psi_deg'], per_level=per),
-                camera=dict(c8b=dict(k, u_t_luot_c8=parts), cam=cam or {}))
+                camera=dict(c8b=dict(k, u_t_luot_c8=parts, khoa_sha256=khoa_sha256), cam=cam or {}))
 
 
 def write_gate(path, d):
@@ -626,11 +743,11 @@ def _clean(o):
 
 
 def check_khoa(k, name='khoa'):
-    """C8BS-R7-4: cong takes only a lock of this version whose U_p, U_psi carry exactly the parts P1-P7, A1-A6 (a v1
-    lock has no plumb / zc part, a v2 lock the names of tests 1, 2)."""
+    """C8BS-R7-4: cong takes only a lock of this version whose U_p, U_psi carry exactly the parts P1-P7, A1-A7 (a v1
+    lock has no plumb / zc part, a v2 lock the names of tests 1, 2, a v3 lock no U_moc, no A7: proposal v3 4)."""
     if k.get('version') != VERSION or set(k.get('U_p_phan_m') or {}) != set(P_PARTS) \
             or set(k.get('U_psi_phan_deg') or {}) != set(A_PARTS):
-        raise UError(f'{name}: not a {VERSION} file with the parts P1-P7, A1-A6')
+        raise UError(f'{name}: not a {VERSION} file with the parts P1-P7, A1-A7')
     # C8BU-R1-7: every part a finite number >= 0, the margin LE, each total equal to LE x the sum of its parts
     if k.get('le') != LE:
         raise UError(f'{name}: le {k.get("le")!r} is not {LE}')
@@ -639,6 +756,20 @@ def check_khoa(k, name='khoa'):
         t = _num(k.get(tot), f'{name} {tot}')
         if not math.isclose(t, LE * sum(vals), rel_tol=1e-9, abs_tol=1e-15):
             raise UError(f'{name}: {tot} {t} is not {LE} x the sum of {parts} ({LE * sum(vals)})')
+    # proposal v3 sections 3, 4: the lock keeps U_moc before the margin, its sources, an approved method and a session
+    # that passed; A7 is U_moc_psi_deg and P1 holds U_moc_xy_m
+    md = k.get('moc_dich')
+    if not isinstance(md, dict):
+        raise UError(f'{name}: no block moc_dich (U_moc before the margin, proposal v3 section 3)')
+    uxy = _num(md.get('U_moc_xy_m'), f'{name} moc_dich.U_moc_xy_m')
+    upsi = _num(md.get('U_moc_psi_deg'), f'{name} moc_dich.U_moc_psi_deg')
+    if not isinstance(md.get('phuong_phap_duyet'), str) or not md['phuong_phap_duyet'].strip() \
+            or md.get('tien_de_buoi') != 'dat' or not isinstance(md.get('nguon'), dict):
+        raise UError(f'{name}: moc_dich without an approved method, a session that passed (dat) or its sources')
+    if not math.isclose(k['U_psi_phan_deg']['A7_moc_dich'], upsi, rel_tol=1e-12, abs_tol=0.0):
+        raise UError(f'{name}: A7_moc_dich {k["U_psi_phan_deg"]["A7_moc_dich"]} is not moc_dich.U_moc_psi_deg {upsi}')
+    if k['U_p_phan_m']['P1_anh_san'] < uxy:
+        raise UError(f'{name}: P1_anh_san {k["U_p_phan_m"]["P1_anh_san"]} below moc_dich.U_moc_xy_m {uxy}')
 
 
 def main(argv=None):
@@ -650,6 +781,11 @@ def main(argv=None):
     a1.add_argument('--cam-u', required=True)
     a1.add_argument('--thuoc-kep', required=True)
     a1.add_argument('--xoay', required=True)
+    a1.add_argument('--moc-frames', action='append', required=True,
+                    help='RUN_ID=frames.csv: the final frames of every C8 run (U_moc sources, proposal v3 section 4)')
+    for kind in MOC_FILES:
+        a1.add_argument('--moc-' + kind.replace('_', '-'), required=True, dest='moc_' + kind,
+                        help=f'the {kind} file of the final scoring (its SHA-256 must be moc_dich.nguon.{kind})')
     a1.add_argument('--u-imu')
     a1.add_argument('--phep5')
     a1.add_argument('--out', required=True)
@@ -677,9 +813,23 @@ def main(argv=None):
                 with open(a.phep5, newline='', encoding='utf-8') as f:
                     phep5 = [(r['diem'], float(r['chenh_m'])) for r in csv.DictReader(f)]
                 src.append(a.phep5)
+            moc_tep, moc_src = dict(frames={}), []
+            for s in a.moc_frames:
+                rid, p = s.split('=', 1)
+                if rid in moc_tep['frames']:
+                    raise UError(f'--moc-frames: run {rid} twice')
+                cu.check_path(p)
+                moc_tep['frames'][rid] = cu.sha256(p)
+                moc_src.append(p)
+            for kind in MOC_FILES:
+                p = getattr(a, 'moc_' + kind)
+                cu.check_path(p)
+                moc_tep[kind] = cu.sha256(p)
+                moc_src.append(p)
             out = khoa(gios, _json(a.tb), _json(a.cam_u), _json(a.thuoc_kep), _json(a.xoay),
-                       _json(a.u_imu) if a.u_imu else None, phep5, os.path.basename(a.tb), cu.sha256(a.tb))
-            src += [a.tb, a.cam_u, a.thuoc_kep, a.xoay] + ([a.u_imu] if a.u_imu else [])
+                       _json(a.u_imu) if a.u_imu else None, phep5, os.path.basename(a.tb), cu.sha256(a.tb),
+                       moc_tep=moc_tep)
+            src += [a.tb, a.cam_u, a.thuoc_kep, a.xoay] + ([a.u_imu] if a.u_imu else []) + moc_src
             out['nguon'] = [dict(file=os.path.basename(p), sha256=cu.sha256(p)) for p in src]
             out['script'] = cu.script_state()
             cu.check_path(a.out)
@@ -700,7 +850,7 @@ def main(argv=None):
             d = cong(k, plan, luot, [x.strip() for x in a.levels.split(',')], a.u_t_branch, a.c8_dir,
                      _json(a.cam) if a.cam else None,
                      dict(script='tools/c8b_u.py', repo='hil-framework', commit=st.get('commit'), dirty=st.get('dirty')),
-                     meta)
+                     meta, khoa_sha256=cu.sha256(a.khoa))
             g = write_gate(a.out, _clean(d))
             print(f'gate file {a.out} sha256 {g.sha256}; ' + '; '.join(
                 f'{lv}: report_only {d["dieu_2b"]["per_level"][lv]["report_only"]}' for lv in d['levels']))

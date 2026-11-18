@@ -804,9 +804,22 @@ def test_3b_window_over_turnaround_not_used():
 
 # ── c8b_u ────────────────────────────────────────────────────────────────────────────────────
 
-CAM = {"version": "c8_cam_u_vao_v2",
+def _fsha(run):
+    """A stand-in SHA-256 of the final frames.csv of a run."""
+    import hashlib
+    return hashlib.sha256(('frames ' + run).encode()).hexdigest()
+
+
+MOC_SHA = {k: ch * 64 for k, ch in zip(('lich', 'tap_moc', 'u_so', 'session'), 'abcd')}
+CAM = {"version": "c8_cam_u_vao_v3",
        "P1": {"bo_nhom_max_m": 0.002, "tung_khung_max_m": 0.0018, "bo_nhom_rms_m": 0.0014},
-       "moc_dich": {"nguong_m": 0.001, "u_so_m": 0.0004, "moc_loai": []},
+       # proposal v3 (Liam 18/11 "Duyet ban 3"): U_moc before the margin, approved method, session passed, sources;
+       # nguong_m, u_so_m only information
+       "moc_dich": {"U_moc_xy_m": 0.0018, "U_moc_psi_deg": 0.07, "phuong_phap_duyet": "Liam dd/mm, phien X (thu)",
+                    "tien_de_buoi": "dat",
+                    "nguon": dict(frames={'a': _fsha('a')}, **MOC_SHA, bo_lay_mau='c7_moc_lay_mau_v1 (thu)',
+                                  car_pose=dict(tag_offset=None, side_m=0.0964, h_m=0.12)),
+                    "nguong_m": 0.001, "u_so_m": 0.0004, "moc_loai": []},
        "P3": {"vi_tri_max_m": 0.0008, "n_lan": 3},
        "A2": {"goc_max_deg": 0.1, "n_lan": 3},
        "than_dich": {"max_m": 0.0001, "kiem_duoc": True},
@@ -816,7 +829,7 @@ CAM = {"version": "c8_cam_u_vao_v2",
        "day_doi": {"dn_m": 0.016, "dzc_m": 0.01, "kappa": 0.12 / 2.6},
        "do_cao": {"rho_max_m": 1.5, "H_m": 2.6, "h_m": 0.12},
        "bo_cham": {"tag_offset": None, "side_m": 0.0964}}
-CAM_PATHS = ('P1.bo_nhom_max_m', 'P1.tung_khung_max_m', 'moc_dich.nguong_m', 'moc_dich.u_so_m', 'P3.vi_tri_max_m',
+CAM_PATHS = ('P1.bo_nhom_max_m', 'P1.tung_khung_max_m', 'moc_dich.U_moc_xy_m', 'moc_dich.U_moc_psi_deg', 'P3.vi_tri_max_m',
              'A2.goc_max_deg', 'P7.lech_max_m', 'A3.max_deg', 'A5.lech_max_deg', 'day_doi.dn_m', 'day_doi.dzc_m',
              'day_doi.kappa', 'do_cao.rho_max_m', 'do_cao.H_m', 'do_cao.h_m', 'bo_cham.side_m')
 TK = {"version": "c8b_thuoc_kep_v2", "cao_4_goc_mm": [120.2, 120.0, 119.8, 120.1], "e_mm": 0.1, "s_mm": 96.4,
@@ -833,9 +846,34 @@ def _cp(d):
     return json.loads(json.dumps(d))
 
 
-def KH(cam=None, tk=None, xo=None, tb=None, **kw):
-    return CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, tb or TBD, CAM if cam is None else cam,
-                   TK if tk is None else tk, XO if xo is None else xo, **kw)
+def sync(cam, runs=None):
+    """The camera file with moc_dich.nguon.car_pose set to its own set-up (as the exporter writes it), and frames of
+    the given runs; a file without the block is left as it is."""
+    cam = _cp(cam)
+    md = cam.get('moc_dich')
+    if isinstance(md, dict) and isinstance(md.get('nguon'), dict):
+        bc, dc = cam.get('bo_cham') or {}, cam.get('do_cao') or {}
+        md['nguon']['car_pose'] = dict(tag_offset=bc.get('tag_offset'), side_m=bc.get('side_m'), h_m=dc.get('h_m'))
+        if runs is not None:
+            md['nguon']['frames'] = {r: _fsha(r) for r in runs}
+    return cam
+
+
+def MT(runs=('a',), **over):
+    """SHA-256 of the files khoa is given (the right ones unless overridden)."""
+    d = dict(frames={r: _fsha(r) for r in runs}, **MOC_SHA)
+    d.update(over)
+    return d
+
+
+def UPP(cam, *a, **k):
+    return CU.u_p_u_psi(sync(cam), *a, **k)
+
+
+def KH(cam=None, tk=None, xo=None, tb=None, moc_tep=None, **kw):
+    return CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, tb or TBD, sync(CAM if cam is None else cam),
+                   TK if tk is None else tk, XO if xo is None else xo, moc_tep=MT() if moc_tep is None else moc_tep,
+                   **kw)
 
 
 def gio_d(task, rate, width, gmr, ok=True, half=0.007):
@@ -858,7 +896,8 @@ def _expect(cam=CAM, tk=TK, xo=XO):
     xx = max(math.atan((a - b) / tk['s_mm']) ** 2 for (a, b) in tk['canh'].values()) + 0.01 ** 2
     a1 = math.degrees(abs(dpsi - theta) + math.atan(2 * tk['e_mm'] / tk['s_mm']) + xx) + tk['tam_than_deg']
     a6 = math.degrees((rho + dn) * (np.sum(np.abs(c - c.mean())) + 8 * e) / (2 * math.sqrt(2) * s * (Hl - c.max() - e)))
-    a = dict(A1_goc_dan=a1, A2_nhac_tam=0.1, A3_huong_vung=0.15, A4_quay=0.25, A5_nhieu_khung=0.12, A6_nghieng_ma=a6)
+    a = dict(A1_goc_dan=a1, A2_nhac_tam=0.1, A3_huong_vung=0.15, A4_quay=0.25, A5_nhieu_khung=0.12, A6_nghieng_ma=a6,
+             A7_moc_dich=cam['moc_dich']['U_moc_psi_deg'])
     dx, dy, dp = cam['bo_cham']['tag_offset'] or [0, 0, 0]
     m = {k: (a + b) / 2 for k, (a, b) in tk['canh'].items()}
     ogx = (tk['tam_tam_mm'][0] + (m['sau'] - m['truoc']) / 2) * 1e-3
@@ -866,7 +905,7 @@ def _expect(cam=CAM, tk=TK, xo=XO):
     rx, ry = (m['sau'] - m['truoc']) / 2 * 1e-3, (m['phai'] - m['trai']) / 2 * 1e-3
     u_g = (tk['tam_tam_dung_sai_mm'] + math.sqrt(2) * tk['e_mm']) * 1e-3 + math.hypot(rx, ry) * math.radians(tk['tam_than_deg'])
     p2 = math.hypot(dx - ogx, dy - ogy) + u_g + math.hypot(dx, dy) * math.radians(sum(a.values()))
-    p = dict(P1_anh_san=0.002 + 0.001 + 2 * 0.0004, P2_lech_tam=p2, P3_nhac_tam=0.0008, P4_quay=0.0007, P5_day_doi_zc=dd,
+    p = dict(P1_anh_san=0.002 + cam['moc_dich']['U_moc_xy_m'], P2_lech_tam=p2, P3_nhac_tam=0.0008, P4_quay=0.0007, P5_day_doi_zc=dd,
              P6_do_cao=cao, P7_nhieu_khung=0.0006)
     return p, a
 
@@ -874,12 +913,12 @@ def _expect(cam=CAM, tk=TK, xo=XO):
 def test_khoa_sums():
     k = CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.010, 0.005), 'b': gio_d('O1-F05', 4e-4, 0.012, 0.003),
                  'c': gio_d('O1-F08', 1e-4, 0.014, 0.004), 'd': gio_d('O1-F08', 9e-3, 0.5, 0.5, ok=False)},
-                TBD, CAM, TK, XO)
+                TBD, sync(CAM, 'abc'), TK, XO, moc_tep=MT('abc'))      # run d (clock not ok) needs no frames
     p, a = _expect()
     assert k['U_p_phan_m'] == pytest.approx(p) and k['U_psi_phan_deg'] == pytest.approx(a)
     assert k['U_p_m'] == pytest.approx(1.25 * sum(p.values()))
     assert k['U_psi_deg'] == pytest.approx(1.25 * sum(a.values()))
-    # hand numbers: P1 = 2 + 1 + 2 x 0.4 = 3.8 mm; A1 = 2 atan(0.2 / 96.4) + atan(0.2 / 96.4)^2 + 0.01^2 + 0.05 = 0.2937 deg
+    # hand numbers: P1 = 2 + U_moc 1.8 = 3.8 mm (nguong + 2 u_so no longer added, proposal v3); A1 = 2 atan(0.2 / 96.4) + atan(0.2 / 96.4)^2 + 0.01^2 + 0.05 = 0.2937 deg
     assert p['P1_anh_san'] == pytest.approx(0.0038) and a['A1_goc_dan'] == pytest.approx(0.29372, abs=2e-5)
     assert tuple(k['U_p_phan_m']) == CU.P_PARTS and tuple(k['U_psi_phan_deg']) == CU.A_PARTS
     assert k['troi_ppm'] == pytest.approx(1.25 * 4e-4 * 1e6)             # run d (not ok) left out
@@ -919,7 +958,7 @@ def test_khoa_camera_input_names_only():
     old = {"phep1": {"loi_khung_max_m": 0.002}, "dat_ma_kiem_m": 0.0,
            "phep2": {"du_tam_m": 0.0015, "du_huong_deg": 0.2, "chenh_tham_so_m": 0.0005, "huong_chuan_deg": 0.3},
            "thao_dat": {"vi_tri_m": 0.0008, "goc_deg": 0.1}, "do_cao": CAM['do_cao'], "day_doi": CAM['day_doi']}
-    with pytest.raises(CU.UError, match='version is not c8_cam_u_vao_v2'):
+    with pytest.raises(CU.UError, match='version is not c8_cam_u_vao_v3'):
         KH(old)
     with pytest.raises(CU.UError, match='unknown top-level fields'):
         KH(dict(old, **{k: v for k, v in CAM.items() if k not in old}))
@@ -1061,7 +1100,7 @@ def test_offset_part_bounds_car_pose():
         cam['bo_cham']['tag_offset'] = [float(o_u[0]), float(o_u[1]), dpsi_u]
         cam['bo_cham']['side_m'] = side
         xo = dict(XO, q_tag_m=list(o_g), du_m=0.0007)
-        _, pp, _, aa = CU.u_p_u_psi(cam, TBD, tk, xo)
+        _, pp, _, aa = UPP(cam, TBD, tk, xo)
         sumA = math.radians(sum(aa.values()))
         for sgn in (1, -1):
             ang = rng.uniform(0, 2 * math.pi)
@@ -1146,7 +1185,7 @@ def test_tilt_parts_bound_car_pose():
         cam['do_cao'].update(H_m=H, h_m=h, rho_max_m=rho)
         cam['day_doi'] = dict(dn_m=0.0, dzc_m=0.0, kappa=h / H)
         tk = dict(_cp(TK), cao_4_goc_mm=list(c * 1e3), e_mm=0.0)
-        _, pp, _, aa = CU.u_p_u_psi(cam, TBD, tk, XO)
+        _, pp, _, aa = UPP(cam, TBD, tk, XO)
         assert err_psi <= math.radians(aa['A6_nghieng_ma']) * (1 + 1e-6) + 1e-12
         assert err_p <= pp['P6_do_cao'] * (1 + 1e-6) + 1e-12
         worst = max(worst, err_psi / math.radians(aa['A6_nghieng_ma']))
@@ -1161,7 +1200,7 @@ def test_tilt_domain_edges():
         cam = _cp(CAM)
         cam['do_cao'].update(H_m=H, h_m=h, rho_max_m=3.0)
         cam['day_doi'] = dict(dn_m=0.0, dzc_m=0.0, kappa=h / H)
-        _, pp, _, aa = CU.u_p_u_psi(cam, TBD, dict(_cp(TK), cao_4_goc_mm=list(c * 1e3), e_mm=0.0), XO)
+        _, pp, _, aa = UPP(cam, TBD, dict(_cp(TK), cao_4_goc_mm=list(c * 1e3), e_mm=0.0), XO)
         for psi in np.linspace(-math.pi, math.pi, 73):
             err_psi, err_p = _tilt_case(c, h, 3.0, psi, H)
             assert err_psi <= math.radians(aa['A6_nghieng_ma']) * (1 + 1e-6)
@@ -1171,7 +1210,7 @@ def test_tilt_domain_edges():
     cam = _cp(CAM)
     cam['do_cao'].update(H_m=H, h_m=h, rho_max_m=0.0)
     cam['day_doi'] = dict(dn_m=0.016, dzc_m=0.0, kappa=h / H)
-    _, pp, _, aa = CU.u_p_u_psi(cam, TBD, dict(_cp(TK), cao_4_goc_mm=list(c * 1e3), e_mm=0.0), XO)
+    _, pp, _, aa = UPP(cam, TBD, dict(_cp(TK), cao_4_goc_mm=list(c * 1e3), e_mm=0.0), XO)
     assert aa['A6_nghieng_ma'] > 0
     for psi in np.linspace(-math.pi, math.pi, 73):
         err_psi, err_p = _tilt_case(c, h, 0.016, psi, H)
@@ -1195,21 +1234,21 @@ def test_khoa_plumb_zc_required_and_bounded():
         bad = json.loads(json.dumps(CAM))
         del bad['day_doi'][k_]
         with pytest.raises(CU.UError, match='day_doi.' + k_):
-            CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, bad, TK, XO)
+            KH(bad)
     bad = json.loads(json.dumps(CAM))
     bad['day_doi']['dn_m'] = -0.001
     with pytest.raises(CU.UError, match='day_doi.dn_m'):
-        CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, bad, TK, XO)
+        KH(bad)
     bad['day_doi'] = dict(dn_m=0.0, dzc_m=2.5, kappa=0.12 / 2.6)    # H - dzc not above h
     with pytest.raises(CU.UError, match='not above the tag height'):
-        CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, bad, TK, XO)
+        KH(bad)
     bad['day_doi'] = dict(dn_m=0.0, dzc_m=0.01, kappa=0.12 / 2.632)   # C8BS-R7-3: H is not the zc of the scoring
     with pytest.raises(CU.UError, match='not do_cao.h_m / do_cao.H_m'):
-        CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, bad, TK, XO)
+        KH(bad)
     z = json.loads(json.dumps(CAM))
     z['day_doi'] = dict(dn_m=0.0, dzc_m=0.0, kappa=0.12 / 2.6)     # no plumb / zc error: the part is zero
-    k0 = CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, z, TK, XO)
-    k1 = CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, CAM, TK, XO)
+    k0 = KH(z)
+    k1 = KH()
     assert k0['U_p_phan_m']['P5_day_doi_zc'] == 0.0
     # the zc bound also lowers the camera height used in P6, A6 (C8BU-R1-8), and A6 enters P2 only through |o_u| = 0
     dP = {x: k1['U_p_phan_m'][x] - k0['U_p_phan_m'][x] for x in CU.P_PARTS}
@@ -1239,7 +1278,7 @@ def _plumb_case(H, h, dn, dzc, rho, Cs, Hs, P, psi, side=0.1):
     cam = json.loads(json.dumps(CAM))
     cam['do_cao'].update(H_m=H, h_m=h, rho_max_m=rho)
     cam['day_doi'] = dict(dn_m=dn, dzc_m=dzc, kappa=h / H)
-    _, parts, _, _ = CU.u_p_u_psi(cam, TBD, TK, XO)
+    _, parts, _, _ = UPP(cam, TBD, TK, XO)
     return err, parts['P5_day_doi_zc']
 
 
@@ -1263,26 +1302,178 @@ def test_plumb_zc_part_bounds_car_pose():
 
 def test_cong_refuses_v1_lock():
     # C8BS-R7-4: a lock written before the plumb / zc part (c8b_khoa_v1, cc22feb) cannot make the gate file
-    k = CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, CAM, TK, XO)
+    k = KH()
     CU.check_khoa(json.loads(json.dumps(CU._clean(k))))
-    for ver in ('c8b_khoa_v1', 'c8b_khoa_v2'):              # v2: parts named after tests 1, 2 (b740f2a)
-        with pytest.raises(CU.UError, match='parts P1-P7, A1-A6'):
+    # v2: parts named after tests 1, 2 (b740f2a); v3: no U_moc, no A7 (f295020; proposal v3 section 4)
+    for ver in ('c8b_khoa_v1', 'c8b_khoa_v2', 'c8b_khoa_v3'):
+        with pytest.raises(CU.UError, match='parts P1-P7, A1-A7'):
             CU.check_khoa(dict(k, version=ver))
     old = dict(k, U_p_phan_m={x: v for x, v in k['U_p_phan_m'].items() if x != 'P5_day_doi_zc'})
-    with pytest.raises(CU.UError, match='parts P1-P7, A1-A6'):
+    with pytest.raises(CU.UError, match='parts P1-P7, A1-A7'):
         CU.check_khoa(old)
-    old = dict(k, U_psi_phan_deg={x: v for x, v in k['U_psi_phan_deg'].items() if x != 'A5_nhieu_khung'})
-    with pytest.raises(CU.UError, match='parts P1-P7, A1-A6'):
-        CU.check_khoa(old)
+    for drop in ('A5_nhieu_khung', 'A7_moc_dich'):          # a lock without A7 (a v3 lock renamed) is refused
+        old = dict(k, U_psi_phan_deg={x: v for x, v in k['U_psi_phan_deg'].items() if x != drop})
+        with pytest.raises(CU.UError, match='parts P1-P7, A1-A7'):
+            CU.check_khoa(old)
     old = dict(k, U_p_phan_m=dict(k['U_p_phan_m'], phep1_khung_max=0.002))
-    with pytest.raises(CU.UError, match='parts P1-P7, A1-A6'):
+    with pytest.raises(CU.UError, match='parts P1-P7, A1-A7'):
         CU.check_khoa(old)
+
+
+# ── c8b_u: mark-shift bound (proposal v3, Liam 18/11 "Duyet ban 3 (Recommended)") ──────────────────────────────────
+
+def test_moc_parts_used_and_kept_before_margin():
+    # P1 = max(clip, per frame) + U_moc_xy_m; A7 = U_moc_psi_deg; nguong + 2 u_so is information only
+    k = KH()
+    assert k['U_p_phan_m']['P1_anh_san'] == pytest.approx(0.002 + 0.0018)
+    assert k['U_psi_phan_deg']['A7_moc_dich'] == 0.07
+    big = _cp(CAM)
+    big['moc_dich'].update(nguong_m=0.5, u_so_m=0.5)
+    assert KH(big)['U_p_m'] == k['U_p_m']
+    cam = _cp(CAM)
+    cam['moc_dich'].update(U_moc_xy_m=0.0048, U_moc_psi_deg=0.57)
+    k2 = KH(cam)
+    assert k2['U_p_phan_m']['P1_anh_san'] - k['U_p_phan_m']['P1_anh_san'] == pytest.approx(0.003)
+    assert k2['U_psi_deg'] - k['U_psi_deg'] == pytest.approx(1.25 * 0.5)
+    # the lock keeps U_moc BEFORE the margin, the method, the session result and the sources
+    assert k2['moc_dich']['U_moc_xy_m'] == 0.0048 and k2['moc_dich']['U_moc_psi_deg'] == 0.57
+    assert k2['moc_dich']['tien_de_buoi'] == 'dat' and k2['moc_dich']['nguon']['lich'] == MOC_SHA['lich']
+    CU.check_khoa(json.loads(json.dumps(CU._clean(k2))))
+
+
+def test_moc_a7_enters_p2_through_the_offset():
+    # proposal v3 section 3: A7 is in the A sum of P2 (|o_u| x sum A, the heading error turns the offset vector)
+    cam = _cp(CAM)
+    cam['bo_cham']['tag_offset'] = [0.03, -0.04, 0.0]                  # |o_u| = 50 mm
+    cam2 = _cp(cam)
+    cam2['moc_dich']['U_moc_psi_deg'] = 1.07
+    d = KH(cam2)['U_p_phan_m']['P2_lech_tam'] - KH(cam)['U_p_phan_m']['P2_lech_tam']
+    assert d == pytest.approx(0.05 * math.radians(1.0))
+
+
+def test_moc_refuses_v2_camera_file():
+    v2 = _cp(CAM)
+    v2['version'] = 'c8_cam_u_vao_v2'
+    with pytest.raises(CU.UError, match='version is not c8_cam_u_vao_v3'):
+        CU.check_cam(v2)
+    with pytest.raises(CU.UError, match='version is not c8_cam_u_vao_v3'):
+        KH(v2)
+    # a v2-shaped moc_dich (nguong, u_so only) under the v3 name is refused for the missing numbers
+    old = _cp(CAM)
+    old['moc_dich'] = {"nguong_m": 0.001, "u_so_m": 0.0004, "moc_loai": []}
+    with pytest.raises(CU.UError, match='moc_dich.U_moc_xy_m'):
+        CU.check_cam(old)
+
+
+def test_moc_missing_fields_refused():
+    for fld in ('phuong_phap_duyet', 'tien_de_buoi', 'nguon'):
+        bad = _cp(CAM)
+        del bad['moc_dich'][fld]
+        with pytest.raises(CU.UError, match=fld):
+            CU.check_cam(bad)
+        with pytest.raises(CU.UError, match=fld):
+            KH(bad)
+    for fld in ('frames', 'lich', 'tap_moc', 'u_so', 'session', 'car_pose', 'bo_lay_mau'):
+        bad = _cp(CAM)
+        del bad['moc_dich']['nguon'][fld]
+        with pytest.raises(CU.UError, match=fld):        # not through KH: its sync would put car_pose back
+            CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, bad, TK, XO, moc_tep=MT())
+    for fld, val in (('lich', 'A' * 64), ('u_so', 'a' * 63), ('session', None), ('bo_lay_mau', ' ')):
+        bad = _cp(CAM)
+        bad['moc_dich']['nguon'][fld] = val
+        with pytest.raises(CU.UError, match=fld):
+            KH(bad)
+    bad = _cp(CAM)
+    bad['moc_dich']['nguon']['frames'] = {}
+    with pytest.raises(CU.UError, match='frames'):
+        KH(bad)
+
+
+def test_moc_method_and_session_needed():
+    # "Tu choi khoa" (Liam 18/11): no approved method, or a session that did not pass: the lock is refused; the camera
+    # file alone is still well formed (its writers may export a session that did not pass)
+    for val in ('', '   '):
+        bad = _cp(CAM)
+        bad['moc_dich']['phuong_phap_duyet'] = val
+        CU.check_cam(bad)
+        with pytest.raises(CU.UError, match='phuong_phap_duyet empty'):
+            KH(bad)
+    for val in ('khong_dat', 'chua', 'DAT', ''):
+        bad = _cp(CAM)
+        bad['moc_dich']['tien_de_buoi'] = val
+        CU.check_cam(bad)
+        with pytest.raises(CU.UError, match='tien_de_buoi'):
+            KH(bad)
+    bad = _cp(CAM)
+    bad['moc_dich']['tien_de_buoi'] = True
+    with pytest.raises(CU.UError, match='tien_de_buoi'):
+        CU.check_cam(bad)
+
+
+def test_moc_sha_of_the_files_given():
+    # C8BM-R2-2: every SHA in moc_dich.nguon must be the SHA of the file khoa is given
+    with pytest.raises(CU.UError, match='files of the final scoring'):
+        CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, sync(CAM), TK, XO)          # no files: refused
+    for kind in ('lich', 'tap_moc', 'u_so', 'session'):
+        with pytest.raises(CU.UError, match=f'nguon.{kind} '):
+            KH(moc_tep=MT(**{kind: 'e' * 64}))
+        mt = MT()
+        del mt[kind]
+        with pytest.raises(CU.UError, match=f'file {kind} not given'):
+            KH(moc_tep=mt)
+    with pytest.raises(CU.UError, match=r'nguon.frames.a is not'):
+        KH(moc_tep=MT(frames={'a': 'f' * 64}))
+    with pytest.raises(CU.UError, match='frames files given'):
+        KH(moc_tep=MT(('a', 'b')))
+    # the runs of U_moc against the C8 clock files: a run outside them, or an ok run missing, refused
+    gios = {'a': gio_d('O1-F05', 3e-4, 0.01, 0.0), 'b': gio_d('O1-F05', 3e-4, 0.01, 0.0),
+            'c': gio_d('O1-F05', 3e-4, 0.01, 0.0, ok=False)}
+    with pytest.raises(CU.UError, match=r"ok clock missing \['b'\]"):
+        CU.khoa(gios, TBD, sync(CAM, 'a'), TK, XO, moc_tep=MT('a'))
+    with pytest.raises(CU.UError, match=r"not a C8 run \['z'\]"):
+        CU.khoa(gios, TBD, sync(CAM, 'abz'), TK, XO, moc_tep=MT('abz'))
+    CU.khoa(gios, TBD, sync(CAM, 'ab'), TK, XO, moc_tep=MT('ab'))                      # c not ok: may lack frames
+    CU.khoa(gios, TBD, sync(CAM, 'abc'), TK, XO, moc_tep=MT('abc'))
+
+
+def test_moc_car_pose_set_up_must_match():
+    # U_moc computed with another tag_offset, tag side or tag height than the scorer's: refused (also check_cam)
+    for path, val in (('tag_offset', [0.001, 0.0, 0.0]), ('side_m', 0.1445), ('h_m', 0.121)):
+        bad = _cp(CAM)
+        bad['moc_dich']['nguon']['car_pose'][path] = val
+        with pytest.raises(CU.UError, match=f'car_pose.{path}'):
+            CU.check_cam(bad)
+        with pytest.raises(CU.UError, match=f'car_pose.{path}'):
+            CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, TBD, bad, TK, XO, moc_tep=MT())
+    bad = _cp(CAM)
+    bad['moc_dich']['nguon']['car_pose']['extra'] = 1
+    with pytest.raises(CU.UError, match='car_pose needs exactly'):
+        CU.check_cam(bad)
+
+
+def test_check_khoa_moc_block():
+    k = json.loads(json.dumps(CU._clean(KH())))
+    CU.check_khoa(k)
+    bad = dict(k)
+    del bad['moc_dich']
+    with pytest.raises(CU.UError, match='no block moc_dich'):
+        CU.check_khoa(bad)
+    for fld, val, txt in (('tien_de_buoi', 'khong_dat', 'session that passed'),
+                          ('phuong_phap_duyet', '', 'approved method'),
+                          ('U_moc_xy_m', -1.0, 'U_moc_xy_m'), ('U_moc_psi_deg', None, 'U_moc_psi_deg'),
+                          ('U_moc_psi_deg', 0.08, 'A7_moc_dich'), ('U_moc_xy_m', 0.0039, 'below')):
+        bad = json.loads(json.dumps(k))
+        bad['moc_dich'][fld] = val
+        with pytest.raises(CU.UError, match=txt):
+            CU.check_khoa(bad)
+        with pytest.raises(CU.UError, match=txt):
+            CU.cong(bad, _plan(), _luot(), ['O1-F05'], 'bo_tick', 'x', meta=META)
 
 
 def test_khoa_phep5_and_one_frame():
     tb = json.loads(json.dumps(TBD))
     tb['B']['shutter']['use_alpha'] = False
-    k = CU.khoa({'a': gio_d('O1-F05', 3e-4, 0.01, 0.0)}, tb, CAM, TK, XO, phep5=[('d1', 0.003), ('d2', -0.02)])
+    k = KH(tb=tb, phep5=[('d1', 0.003), ('d2', -0.02)])
     assert k['man_trap_kieu'] == 'mot_khung' and k['man_trap'] is None
     assert k['phep5']['ket_qua'] == 'xem_lai' and k['phep5']['vuot'] == ['d2']
 
@@ -1327,7 +1518,9 @@ def _lock(U_p, U_psi):
     """A lock that check_khoa accepts (cong checks it, C8BU-R1-7): all of U_p in P1, all of U_psi in A1."""
     return dict(version=CU.VERSION, le=CU.LE, U_p_m=U_p, U_psi_deg=U_psi,
                 U_p_phan_m={x: (U_p / CU.LE if x == 'P1_anh_san' else 0.0) for x in CU.P_PARTS},
-                U_psi_phan_deg={x: (U_psi / CU.LE if x == 'A1_goc_dan' else 0.0) for x in CU.A_PARTS})
+                U_psi_phan_deg={x: (U_psi / CU.LE if x == 'A1_goc_dan' else 0.0) for x in CU.A_PARTS},
+                moc_dich=dict(U_moc_xy_m=0.0, U_moc_psi_deg=0.0, phuong_phap_duyet='thu', tien_de_buoi='dat',
+                              nguon={}))
 
 
 K = _lock(0.004, 2.0)
@@ -1382,6 +1575,67 @@ def test_cong_written_and_read_back_with_real_reader(tmp_path):
         with pytest.raises(CU.UError, match='refused'):
             CU.write_gate(str(tmp_path / 'g2.json'), bad)
         assert not (tmp_path / 'g2.json').exists()
+
+
+def test_moc_cli_export_lock_gate(tmp_path):
+    # C8BM-R2-4: the path camera file (as exported) -> khoa (CLI, real files and SHA) -> cong (CLI) -> gate file; the
+    # gate file carries the lock (camera.c8b.moc_dich before the margin) and the SHA of the lock file (CODE_GATE 18/11)
+    import c8_u_imu as cu
+    import gate_c8
+    d = tmp_path
+    files = {}
+    for name in ('lich.json', 'tap_moc.json', 'u_so.json', 'session.json'):
+        (d / name).write_text(json.dumps({'thu': name}), encoding='utf-8')
+        files[name.split('.')[0]] = str(d / name)
+    luot_args, gio_args, frames_args, fr_sha = [], [], [], {}
+    for slot, rid, g, l, _ in _luot():
+        gp, fp = d / f'gio_{rid}.json', d / f'frames_{rid}.csv'
+        gp.write_text(json.dumps(g), encoding='utf-8')
+        fp.write_text(f't_s,x\n0,{rid}\n', encoding='utf-8')
+        l = dict(l, gio_sha256=cu.sha256(str(gp)))
+        lp = d / f'luoi_{rid}.json'
+        lp.write_text(json.dumps(l), encoding='utf-8')
+        gio_args += ['--gio', f'{rid}={gp}']
+        frames_args += ['--moc-frames', f'{rid}={fp}']
+        luot_args += ['--luot', f'{slot}={rid},{gp},{lp}']
+        fr_sha[rid] = cu.sha256(str(fp))
+    cam = sync(CAM)
+    cam['moc_dich']['nguon'].update(frames=fr_sha, **{k: cu.sha256(p) for k, p in files.items()})
+    for name, obj in (('cam.json', cam), ('tb.json', TBD), ('tk.json', TK), ('xo.json', XO)):
+        (d / name).write_text(json.dumps(obj), encoding='utf-8')
+    base = ['khoa'] + gio_args + ['--tb', str(d / 'tb.json'), '--cam-u', str(d / 'cam.json'), '--thuoc-kep',
+                                  str(d / 'tk.json'), '--xoay', str(d / 'xo.json')] + frames_args
+    mf = ['--moc-lich', files['lich'], '--moc-tap-moc', files['tap_moc'], '--moc-u-so', files['u_so'],
+          '--moc-session', files['session']]
+    # a file changed after the export (its SHA no longer the one in nguon): refused, no lock written
+    (d / 'u_so_moi.json').write_text('{"thu": 2}', encoding='utf-8')
+    bad = mf[:5] + [str(d / 'u_so_moi.json')] + mf[6:]
+    assert CU.main(base + bad + ['--out', str(d / 'khoa_x.json')]) == 2
+    assert not (d / 'khoa_x.json').exists()
+    kp = d / 'khoa.json'
+    assert CU.main(base + mf + ['--out', str(kp)]) == 0
+    k = json.loads(kp.read_text(encoding='utf-8'))
+    assert k['version'] == 'c8b_khoa_v4' and k['moc_dich']['U_moc_xy_m'] == 0.0018
+    assert {n['file'] for n in k['nguon']} >= {'lich.json', 'u_so.json', 'frames_r1.csv'}
+    (d / 'kh.csv').write_text('# nhanh_tick=bo_tick\n# commit_hil=abc1234\nslot,task,controller\n' + ''.join(
+        f'{s},{p["task"]},{p["controller"]}\n' for s, p in _plan().items()), encoding='utf-8')
+    gp = d / 'gate_c8.json'
+    assert CU.main(['cong', '--khoa', str(kp), '--ke-hoach', str(d / 'kh.csv'), '--levels', 'O1-F05,O1-F08',
+                    '--u-t-branch', 'bo_tick', '--c8-dir', 'C8/x', '--out', str(gp)] + luot_args) == 0
+    g = gate_c8.read_gate_c8(str(gp))
+    raw = json.loads(gp.read_text(encoding='utf-8'))
+    c8b = raw['camera']['c8b']
+    assert c8b['khoa_sha256'] == cu.sha256(str(kp))
+    assert c8b['moc_dich']['U_moc_xy_m'] == 0.0018 and c8b['moc_dich']['U_moc_psi_deg'] == 0.07
+    assert c8b['moc_dich']['nguon']['bo_lay_mau'] == cam['moc_dich']['nguon']['bo_lay_mau']
+    assert raw['dieu_2b']['u_psi_deg'] == pytest.approx(k['U_psi_deg']) and g.sha256
+    # a v3 lock (before this proposal) cannot make a gate file
+    old = dict(k, version='c8b_khoa_v3')
+    (d / 'khoa_v3.json').write_text(json.dumps(old), encoding='utf-8')
+    assert CU.main(['cong', '--khoa', str(d / 'khoa_v3.json'), '--ke-hoach', str(d / 'kh.csv'), '--levels',
+                    'O1-F05,O1-F08', '--u-t-branch', 'bo_tick', '--c8-dir', 'C8/x', '--out', str(d / 'g3.json')]
+                   + luot_args) == 2
+    assert not (d / 'g3.json').exists()
 
 
 def test_cong_strict_half():
