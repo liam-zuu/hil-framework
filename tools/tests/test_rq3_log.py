@@ -23,6 +23,15 @@ OLD_HW = 'ngay,session_id,chien_dich,nen_tang,thu_hong,nguyen_nhan,gio_sua,ghi_c
 
 
 @pytest.fixture
+def no_moc(monkeypatch):
+    """C8b v3 §5 (CODE_GATE 18/11, design 03_CODE/docs/2026-11-18_Thiet_ke_rq3_u_moc_v4.md): a car run of a campaign
+    without its U / premise files is chua_ket_luan after rq3_log.apply_moc. The tests using this fixture check rules
+    written before §5 on car runs that have no such files, so the §5 rule is set aside here; it is tested, with
+    summary, freeze and s05_final_table, in test_rq3_u_moc.py."""
+    monkeypatch.setattr(rl, 'apply_moc', lambda tun, ds: tun)
+
+
+@pytest.fixture
 def ds(tmp_path, monkeypatch):
     (tmp_path / rl.TUNING).write_text(OLD_TUNING, encoding='utf-8')
     (tmp_path / rl.EFFORT).write_text(OLD_EFFORT, encoding='utf-8')
@@ -179,7 +188,7 @@ def test_effort_past_midnight(ds):
     assert rl.effort(d, '2026-11-20', '23:30', '00:15', khoan='T_H', ghi_chu='x')['gio'] == '0.75'
 
 
-def test_summary_accounts_split_caps_and_finals(ds):
+def test_summary_accounts_split_caps_and_finals(ds, no_moc):
     d, clock = ds
     rl.migrate(d)
     # A-PID: 2 tune car runs of 600 s active, one final run 100 s, 1 h hoc, 1 h other work
@@ -254,7 +263,7 @@ def test_gate_result_rule_of_4_7(outs, gate, want):
     assert rl.gate_result(outs, gate) == want
 
 
-def test_finals_gate_replacement_and_final_hil_join(ds):
+def test_finals_gate_replacement_and_final_hil_join(ds, no_moc):
     d, clock = ds
     rl.migrate(d)
     rl.freeze(d, 'A-PID', 'het_ung_vien', 'A-PID/G7', gain_file(d))   # C9D-4: no confirm block here

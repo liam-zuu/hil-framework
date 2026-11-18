@@ -254,6 +254,60 @@ class GateC8:
         return required_set(self.run_report_only(level, platform, stage, campaign))
 
 
+def _hex64(x) -> bool:
+    return isinstance(x, str) and len(x) == 64 and all(ch in '0123456789abcdef' for ch in x)
+
+
+def _finite(x, what: str, lo: float, strict: bool = False) -> float:
+    if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) or \
+            (x <= lo if strict else x < lo):
+        raise GateFileError(f'{what} {x!r}: a finite number {">" if strict else ">="} {lo}')
+    return float(x)
+
+
+def car_pose_of(cp, what: str) -> dict:
+    """The car_pose configuration {tag_offset, side_m, h_m} (C8B 18/11, c8b_u check_khoa): side_m > 0, h_m >= 0 finite;
+    tag_offset null or [dx_m, dy_m, dpsi_rad] three finite numbers, null read as [0, 0, 0]."""
+    if not isinstance(cp, dict) or set(cp) != {'tag_offset', 'side_m', 'h_m'}:
+        raise GateFileError(f'{what}: car_pose must be {{tag_offset, side_m, h_m}}, got {cp!r}')
+    to = cp['tag_offset']
+    if to is None:
+        to = [0.0, 0.0, 0.0]
+    elif not isinstance(to, list) or len(to) != 3:
+        raise GateFileError(f'{what}: car_pose.tag_offset {to!r}: null or [dx_m, dy_m, dpsi_rad]')
+    else:
+        to = [_finite(v, f'{what}: car_pose.tag_offset', -math.inf) for v in to]
+    return dict(tag_offset=to, side_m=_finite(cp['side_m'], f'{what}: car_pose.side_m', 0.0, strict=True),
+                h_m=_finite(cp['h_m'], f'{what}: car_pose.h_m', 0.0))
+
+
+def moc_dich_of(gate: 'GateC8') -> dict:
+    """The C8 lock of the shifted-anchor bound (C8b proposal v3 sections 3-5, approved 18/11; CODE_GATE design
+    03_CODE/docs/2026-11-18_Thiet_ke_rq3_u_moc_v4.md section 3.3): c8b_u cong copies the c8b_khoa_v4 lock into
+    camera.c8b; read here camera.c8b.moc_dich {U_moc_xy_m, U_moc_psi_deg (before the margin), nguon {bo_lay_mau,
+    car_pose, tap_moc}} and camera.c8b.khoa_sha256. GateFileError when any is missing or of the wrong type."""
+    w = f'gate file {gate.path!r}: camera.c8b'
+    cam = gate.data.get('camera')
+    c8b = cam.get('c8b') if isinstance(cam, dict) else None
+    md = c8b.get('moc_dich') if isinstance(c8b, dict) else None
+    if not isinstance(md, dict):
+        raise GateFileError(f'{w}.moc_dich: missing (a gate file of a C8 lock before c8b_khoa_v4)')
+    ng = md.get('nguon')
+    if not isinstance(ng, dict):
+        raise GateFileError(f'{w}.moc_dich.nguon: missing')
+    blm = ng.get('bo_lay_mau')
+    if not isinstance(blm, str) or not blm:
+        raise GateFileError(f'{w}.moc_dich.nguon.bo_lay_mau {blm!r}: a version string')
+    if not _hex64(ng.get('tap_moc')):
+        raise GateFileError(f'{w}.moc_dich.nguon.tap_moc {ng.get("tap_moc")!r}: sha256 of tap_moc.json (64 hex)')
+    if not _hex64(c8b.get('khoa_sha256')):
+        raise GateFileError(f'{w}.khoa_sha256 {c8b.get("khoa_sha256")!r}: sha256 of the lock file (64 hex)')
+    return dict(U_moc_xy_m=_finite(md.get('U_moc_xy_m'), f'{w}.moc_dich.U_moc_xy_m', 0.0),
+                U_moc_psi_deg=_finite(md.get('U_moc_psi_deg'), f'{w}.moc_dich.U_moc_psi_deg', 0.0),
+                bo_lay_mau=blm, car_pose=car_pose_of(ng.get('car_pose'), f'{w}.moc_dich.nguon'),
+                tap_moc=ng['tap_moc'], khoa_sha256=c8b['khoa_sha256'])
+
+
 def _no_duplicate_keys(pairs):
     """GC1-4: a JSON object with a key twice is refused (json keeps the last one silently)."""
     keys = [k for k, _ in pairs]

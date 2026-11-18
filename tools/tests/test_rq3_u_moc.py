@@ -1,0 +1,538 @@
+"""C8b v3 §5 in rq3_log: session premise and shifted-anchor bound of campaign car runs (CODE_GATE 18/11/2026).
+
+Design CLAUDE_THESIS 03_CODE/docs/2026-11-18_Thiet_ke_rq3_u_moc_v4.md (Liam 18/11 at CODE_GATE, hop chon, nguyen van:
+"Duyệt, code luôn (Recommended)"); the numbers in the test test names refer to its section 8. Every file here is FAKE
+(made-up content, no measured number): the U files (u_moc_luot_v1, CODE_CAM), the premise files (tien_de_buoi_v1,
+CODE_KIEMCHEO) and the C8 gate file with a camera.c8b lock (c8b_khoa_v4, CODE_C8B) follow the field names of the design.
+"""
+import csv
+import hashlib
+import json
+import os
+import sys
+
+import pytest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, '..'))
+import gate_c8  # noqa: E402
+import rq3_log as rl  # noqa: E402
+
+LOCK_XY, LOCK_PSI = 0.010, 0.50          # FAKE lock numbers (m, deg, before the margin)
+CP = dict(tag_offset=None, side_m=0.1445, h_m=0.20)
+
+
+def sha(p) -> str:
+    with open(p, 'rb') as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def wt(p, text: str) -> str:
+    os.makedirs(os.path.dirname(str(p)), exist_ok=True)
+    with open(p, 'w', encoding='utf-8') as f:
+        f.write(text)
+    return str(p)
+
+
+def wj(p, d) -> str:
+    return wt(p, json.dumps(d))
+
+
+class World:
+    """A FAKE dataset: car runs of A-PID written straight into the tuning log, their H0 scorings, a C8 gate file."""
+
+    def __init__(self, tmp, lock=None):
+        self.tmp = tmp
+        self.ds = str(tmp / 'ds')
+        os.makedirs(self.ds)
+        c = tmp / 'common'
+        self.tap = wt(c / 'tap_moc.json', 'FAKE tap_moc')
+        self.u_so = wt(c / 'u_so.json', 'FAKE u_so')
+        self.ses = wt(c / 'session_Ha.json', 'FAKE session H_a')
+        self.gate = self.gate_file(tmp / 'gate_c8.json', lock)
+        self.rows, self.runs = [], {}
+
+    def gate_file(self, p, lock=None, **md_over):
+        g = gate_c8.fake_gate()
+        md = dict(U_moc_xy_m=LOCK_XY, U_moc_psi_deg=LOCK_PSI, phuong_phap_duyet='FAKE', tien_de_buoi='dat',
+                  nguon=dict(bo_lay_mau='blm_FAKE_v1', car_pose=dict(CP), tap_moc=sha(self.tap)))
+        md.update(md_over)
+        g['camera'] = {'c8b': {'moc_dich': md if lock is None else lock, 'khoa_sha256': 'a' * 64}}
+        return wj(p, g)
+
+    def save(self):
+        rl._write_all(os.path.join(self.ds, rl.TUNING), rl.TUNING_COLS, self.rows)
+
+    def run(self, it, session='S1', date='2026-11-20', outcome='dat', luoi=False, stage='screen', block=''):
+        uid = f'{session}:{it}'
+        rd = self.tmp / 'runs' / uid.replace(':', '_')
+        frames = wt(rd / 'frames.csv', f'FAKE frames {uid}')
+        gio = None
+        if luoi:                                       # RM2-5: the time file outside the results_dir
+            gio = wj(self.tmp / 'gio' / f"{uid.replace(':', '_')}.json", {'sha256': {'frames': sha(frames)}})
+            score = wj(rd / 'luoi' / 'luoi.json', {'gio_sha256': sha(gio), 'outcome': outcome})
+        else:
+            score = wj(rd / 'score.json', {'frames_sha256': sha(frames), 'outcome': outcome})
+        wt(rd / 'lich.json', f'FAKE lich {uid}')
+        wt(rd / 'dets.npz', f'FAKE dets {uid}')
+        self.rows.append(dict(session_id=session, date=date, platform='HW', controller='PID', trajectory='O1-F05',
+                              iter_no=str(it), run_uid=uid, campaign='A-PID', gain_set_id='A-PID/G1',
+                              speed_mps='0.5', stage=stage, block_id=block, run_outcome=outcome, results_dir=str(rd),
+                              gate_json_sha256=sha(score), gate_file_sha256=sha(self.gate),
+                              wall_start=f'{date}T08:{it:02d}:00', wall_end=f'{date}T08:{it:02d}:30'))
+        self.runs[uid] = dict(rd=rd, frames=frames, gio=gio, score=score)
+        self.save()
+        return uid
+
+    def u(self, uid, lan='H0', ok=True, xy=0.005, psi=0.20, frames=None, name=None, drop=(), **over):
+        """A U file of scoring lan of run uid, under its results_dir."""
+        run = self.runs[uid]
+        rd = run['rd']
+        fr = frames or run['frames']
+        ng = [dict(vai_tro='frames', duong_dan=fr, sha256=sha(fr)),
+              dict(vai_tro='lich', duong_dan='lich.json', sha256=sha(rd / 'lich.json')),
+              dict(vai_tro='tap_moc', duong_dan=self.tap, sha256=sha(self.tap)),
+              dict(vai_tro='u_so', duong_dan=self.u_so, sha256=sha(self.u_so)),
+              dict(vai_tro='dets', duong_dan='dets.npz', sha256=sha(rd / 'dets.npz')),
+              dict(vai_tro='session', duong_dan=self.ses, sha256=sha(self.ses))]
+        if run['gio']:
+            ng.append(dict(vai_tro='gio', duong_dan=run['gio'], sha256=sha(run['gio'])))
+        ng = [e for e in ng if e['vai_tro'] not in drop]
+        d = dict(format='u_moc_luot_v1', task='O1-F05', ok=ok, ly_do=[] if ok else ['khop thu loi (FAKE)'],
+                 thieu=list(drop), sha256=dict(frames=sha(fr)), nguon=ng, U_moc_xy_m=xy if ok else None,
+                 U_moc_psi_deg=psi if ok else None, bo_lay_mau='blm_FAKE_v1' if ok else None,
+                 car_pose=dict(CP) if ok else None, n_khung=10, n_to_hop=200)
+        d.update(over)
+        return wj(rd / (name or f'u_moc_{lan}.json'), d)
+
+    def td(self, session='S1', ngay='2026-11-20', kq='dat', luot=None, thieu=(), name=None, **over):
+        """A premise file of a session; luot: {id: frames path}, by default every run of the session."""
+        if luot is None:
+            luot = {f'L{k}': self.runs[uid]['frames'] for k, uid in enumerate(self.runs) if uid.startswith(session)}
+        d = dict(format='tien_de_buoi_v1', session_id=session, buoi=session, ngay=ngay, ket_qua=kq, ly_do=[],
+                 nguon=[dict(vai_tro='u_so', duong_dan=self.u_so, sha256=sha(self.u_so)),
+                        dict(vai_tro='sessions', duong_dan=self.ses, sha256=sha(self.ses))],
+                 sha256=dict(u_so=sha(self.u_so), sessions={'H_a': sha(self.ses)},
+                             luot={k: dict(frames=sha(p)) for k, p in luot.items()}),
+                 luot_thieu_kiem=list(thieu), mau_thuan=[], tap_neo={})
+        d.update(over)
+        return wj(self.tmp / 'td' / (name or f'{session}_{kq}.json'), d)
+
+    def after(self):
+        return {r['run_uid']: r for r in rl.apply_after(rl.live_rows(rl.read_rows(os.path.join(self.ds, rl.TUNING))),
+                                                        self.ds)}
+
+    def moc(self):
+        return {r['run_uid']: r for r in rl.apply_moc(rl.live_rows(rl.read_rows(os.path.join(self.ds, rl.TUNING))),
+                                                      self.ds)}
+
+    def drop_row(self, name, keep):
+        p = os.path.join(self.ds, name)
+        rows = [r for r in rl.read_rows(p) if keep(r)]
+        rl._write_all(p, rl.U_MOC_COLS if name == rl.U_MOC else rl.TIEN_DE_COLS, rows)
+
+
+@pytest.fixture
+def w(tmp_path):
+    return World(tmp_path)
+
+
+def full(w, *uids, session='S1', **td):
+    for uid in uids:
+        rl.u_moc(w.ds, uid, 'H0', w.u(uid), w.gate)
+    rl.tien_de(w.ds, session, w.td(session, **td))
+
+
+# ── 1, 2: every condition, missing files ────────────────────────────────────────────────────────────────────────
+
+def test_1_all_conditions_hold_keep_dat_and_khong_dat(w):
+    a, b = w.run(1), w.run(2, outcome='khong_dat')
+    full(w, a, b)
+    got = w.after()
+    assert (got[a]['run_outcome'], got[a]['moc_flags']) == ('dat', '')
+    assert (got[b]['run_outcome'], got[b]['moc_flags']) == ('khong_dat', '')
+    assert got[a]['U_moc_xy_m'] == '0.005'
+
+
+def test_2_missing_files_never_keep_the_outcome(w):
+    a = w.run(1)
+    assert w.after()[a]['run_outcome'] == 'chua_ket_luan'
+    assert w.after()[a]['moc_flags'] == 'cho_tien_de,cho_u_moc'
+    full(w, a)
+    assert w.after()[a]['run_outcome'] == 'dat'
+    w.drop_row(rl.U_MOC, lambda r: False)                                  # RM1-1: deleting a row cannot raise it
+    assert (w.after()[a]['run_outcome'], w.after()[a]['moc_flags']) == ('chua_ket_luan', 'cho_u_moc')
+    w.drop_row(rl.TIEN_DE, lambda r: False)
+    assert w.after()[a]['moc_flags'] == 'cho_tien_de,cho_u_moc'
+
+
+def test_2_lost_and_inconclusive_runs_are_kept(w):
+    a, b = w.run(1, outcome='hong_he_do'), w.run(2, outcome='chua_ket_luan')
+    got = w.after()
+    assert got[a]['run_outcome'] == 'hong_he_do' and got[b]['run_outcome'] == 'chua_ket_luan'
+    assert 'moc_flags' not in got[a]
+
+
+# ── session premise ─────────────────────────────────────────────────────────────────────────────────────────────
+
+def test_premise_not_dat_lowers_every_run_null_schema_accepted(w):
+    a, b = w.run(1), w.run(2)
+    for uid in (a, b):
+        rl.u_moc(w.ds, uid, 'H0', w.u(uid), w.gate)
+    # RM2-3: the missing-data schema of S6 (sha256.luot, sha256.u_so null, no tung_khung)
+    rl.tien_de(w.ds, 'S1', w.td(kq='thieu_du_lieu', sha256=dict(u_so=None, luot=None, sessions=None)))
+    got = w.after()
+    assert {got[a]['moc_flags'], got[b]['moc_flags']} == {'tien_de_thieu'}
+
+
+def test_premise_khong_dat(w):
+    a = w.run(1)
+    full(w, a, kq='khong_dat')
+    assert w.after()[a]['moc_flags'] == 'tien_de_khong_dat'
+
+
+def test_5_premise_of_another_day(w):
+    a = w.run(1, date='2026-11-21')
+    full(w, a)                                           # premise ngay 2026-11-20
+    assert w.after()[a]['moc_flags'] == 'tien_de_khac_ngay'
+
+
+def test_5_a_run_outside_the_scope_lowers_the_whole_session(w):
+    a = w.run(1)
+    b = w.run(2)
+    for uid in (a, b):
+        rl.u_moc(w.ds, uid, 'H0', w.u(uid), w.gate)
+    rl.tien_de(w.ds, 'S1', w.td(luot={'L0': w.runs[a]['frames']}))
+    got = w.after()
+    assert got[a]['moc_flags'] == got[b]['moc_flags'] == 'tien_de_pham_vi_thieu'
+
+
+def test_5_luot_thieu_kiem_lowers_that_run_only(w):
+    a, b = w.run(1), w.run(2)
+    full(w, a, b, thieu=('L1',))
+    got = w.after()
+    assert (got[a]['run_outcome'], got[b]['moc_flags']) == ('dat', 'tien_de_luot_thieu')
+
+
+def test_5_a_lost_run_with_a_scoring_counts_in_the_scope(w):
+    a, c = w.run(1), w.run(2, outcome='hong_he_do')
+    rl.u_moc(w.ds, a, 'H0', w.u(a), w.gate)
+    rl.tien_de(w.ds, 'S1', w.td(luot={'L0': w.runs[a]['frames']}))
+    assert w.after()[a]['moc_flags'] == 'tien_de_pham_vi_thieu'
+
+
+def test_8d_scope_taken_from_the_log_deleting_a_u_row_does_not_shrink_it(w):
+    a, b = w.run(1), w.run(2, luoi=True)
+    for uid in (a, b):
+        rl.u_moc(w.ds, uid, 'H0', w.u(uid), w.gate)
+    rl.tien_de(w.ds, 'S1', w.td(luot={'L0': w.runs[a]['frames']}))
+    assert w.after()[a]['moc_flags'] == 'tien_de_pham_vi_thieu'
+    w.drop_row(rl.U_MOC, lambda r: r['run_uid'] != b)                    # RM3-1
+    got = w.after()
+    assert got[a]['moc_flags'] == 'tien_de_pham_vi_thieu'                # b cannot be resolved: still in the scope
+    assert got[b]['moc_flags'] == 'khong_gan_duoc_lan_cham,tien_de_pham_vi_thieu,cho_u_moc'
+
+
+def test_4_luoi_scoring_through_the_time_file_outside_the_results_dir(w):
+    a, b = w.run(1), w.run(2, luoi=True)
+    full(w, a, b)
+    got = w.after()
+    assert got[a]['run_outcome'] == got[b]['run_outcome'] == 'dat'
+
+
+def test_4_luoi_scoring_needs_the_gio_source(w):
+    b = w.run(1, luoi=True)
+    with pytest.raises(rl.LogError, match='gio'):
+        rl.u_moc(w.ds, b, 'H0', w.u(b, drop=('gio',)), w.gate)
+    other = wj(w.tmp / 'gio' / 'other.json', {'sha256': {'frames': 'c' * 64}})
+    with pytest.raises(rl.LogError, match='gio_sha256 differs'):
+        ng = json.load(open(w.u(b)))['nguon']
+        ng = [e if e['vai_tro'] != 'gio' else dict(e, duong_dan=other, sha256=sha(other)) for e in ng]
+        rl.u_moc(w.ds, b, 'H0', w.u(b, name='u2.json', nguon=ng), w.gate)
+
+
+def test_4_frames_sha256_and_time_file_must_agree(w):
+    b = w.run(1, luoi=True)
+    sc = json.load(open(w.runs[b]['score']))
+    sc['frames_sha256'] = 'd' * 64
+    with pytest.raises(rl.LogError, match='differ'):
+        rl.frames_of(sc, ('gio', w.runs[b]['gio'], sha(w.runs[b]['gio'])), 'x')
+
+
+# ── U of the run ────────────────────────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize('xy, psi, want', [(LOCK_XY, LOCK_PSI, ''), (0.0101, 0.2, 'u_moc_vuot'),
+                                           (0.005, 0.51, 'u_moc_vuot'), (0.0, 0.0, '')])
+def test_7_each_component_against_the_lock(w, xy, psi, want):
+    a = w.run(1)
+    rl.u_moc(w.ds, a, 'H0', w.u(a, xy=xy, psi=psi), w.gate)
+    rl.tien_de(w.ds, 'S1', w.td())
+    assert w.after()[a]['moc_flags'] == want
+
+
+@pytest.mark.parametrize('bad', [float('nan'), -0.001, True, '0.005', None])
+def test_7_invalid_u_numbers_refused(w, bad):
+    a = w.run(1)
+    with pytest.raises(rl.LogError):
+        rl.u_moc(w.ds, a, 'H0', w.u(a, U_moc_xy_m=bad), w.gate)
+
+
+def test_8_ok_false_null_branch(w):
+    a = w.run(1)
+    rl.u_moc(w.ds, a, 'H0', w.u(a, ok=False, drop=('u_so', 'session', 'dets')), w.gate)
+    rl.tien_de(w.ds, 'S1', w.td())
+    assert w.after()[a]['moc_flags'] == 'u_moc_khong_tinh'
+    with pytest.raises(rl.LogError, match='ly_do'):
+        rl.u_moc(w.ds, w.run(2), 'H0', w.u('S1:2', ok=False, ly_do=[]), w.gate)
+    with pytest.raises(rl.LogError, match='sha256.frames'):
+        rl.u_moc(w.ds, 'S1:2', 'H0', w.u('S1:2', ok=False, sha256={}), w.gate)
+    with pytest.raises(rl.LogError, match='task'):
+        rl.u_moc(w.ds, 'S1:2', 'H0', w.u('S1:2', ok=False, task=None), w.gate)
+
+
+def test_8_ok_true_needs_every_source(w):
+    a = w.run(1)
+    with pytest.raises(rl.LogError, match='missing'):
+        rl.u_moc(w.ds, a, 'H0', w.u(a, drop=('dets',)), w.gate)
+
+
+@pytest.mark.parametrize('over, want', [
+    (dict(car_pose=dict(CP, side_m=0.145)), 'u_moc_nguon_khac_khoa'),
+    (dict(car_pose=dict(CP, tag_offset=[0.0, 0.0, 0.0])), ''),            # null = [0, 0, 0] (C8B 18/11)
+    (dict(car_pose=dict(CP, tag_offset=[0.0, 0.001, 0.0])), 'u_moc_nguon_khac_khoa'),
+    (dict(bo_lay_mau='blm_FAKE_v2'), 'u_moc_nguon_khac_khoa')])
+def test_7_sources_against_the_lock(w, over, want):
+    a = w.run(1)
+    rl.u_moc(w.ds, a, 'H0', w.u(a, **over), w.gate)
+    rl.tien_de(w.ds, 'S1', w.td())
+    assert w.after()[a]['moc_flags'] == want
+
+
+def test_7_another_tap_moc_file(w):
+    a = w.run(1)
+    tap2 = wt(w.tmp / 'common' / 'tap_moc_2.json', 'FAKE other tap_moc')
+    ng = [e if e['vai_tro'] != 'tap_moc' else dict(e, duong_dan=tap2, sha256=sha(tap2))
+          for e in json.load(open(w.u(a)))['nguon']]
+    rl.u_moc(w.ds, a, 'H0', w.u(a, name='u2.json', nguon=ng), w.gate)
+    rl.tien_de(w.ds, 'S1', w.td())
+    assert w.after()[a]['moc_flags'] == 'u_moc_nguon_khac_khoa'
+
+
+def test_8c_u_so_and_session_of_another_session(w):
+    a, b = w.run(1), w.run(2)
+    u2 = wt(w.tmp / 'common' / 'u_so_2.json', 'FAKE other u_so')
+    ng = [e if e['vai_tro'] != 'u_so' else dict(e, duong_dan=u2, sha256=sha(u2)) for e in json.load(open(w.u(a)))['nguon']]
+    rl.u_moc(w.ds, a, 'H0', w.u(a, name='u2.json', nguon=ng), w.gate)
+    rl.u_moc(w.ds, b, 'H0', w.u(b), w.gate)
+    # RM2-4: the session sha256 of b is a KEY of the mapping, not a value
+    rl.tien_de(w.ds, 'S1', w.td(sha256=dict(u_so=sha(w.u_so), sessions={sha(w.ses): 'e' * 64},
+                                            luot={f'L{k}': dict(frames=sha(w.runs[u]['frames']))
+                                                  for k, u in enumerate((a, b))})))
+    got = w.after()
+    assert got[a]['moc_flags'] == got[b]['moc_flags'] == 'u_moc_khac_buoi'
+
+
+def test_8c_sessions_must_be_a_mapping(w):
+    w.run(1)
+    with pytest.raises(rl.LogError, match='mapping'):
+        rl.tien_de(w.ds, 'S1', w.td(sha256=dict(u_so=sha(w.u_so), sessions=[sha(w.ses)], luot={})))
+
+
+# ── binding (RM1-2, RM1-4, RM1-5) ──────────────────────────────────────────────────────────────────────────────
+
+def test_3_u_file_of_another_run_refused(w):
+    a, b = w.run(1), w.run(2)
+    # every source of the file exists and is unchanged, but its frames are those of run b (same task, same session)
+    with pytest.raises(rl.LogError, match='not the frames of scoring H0'):
+        rl.u_moc(w.ds, a, 'H0', w.u(a, frames=w.runs[b]['frames'], name='u_of_b.json'), w.gate)
+
+
+def test_3_refusals_at_the_command(w):
+    a = w.run(1)
+    with pytest.raises(rl.LogError, match='results_dir'):
+        rl.u_moc(w.ds, a, 'H0', wj(w.tmp / 'elsewhere.json', json.load(open(w.u(a)))), w.gate)
+    with pytest.raises(rl.LogError, match='task'):
+        rl.u_moc(w.ds, a, 'H0', w.u(a, task='O1-F02'), w.gate)
+    with pytest.raises(rl.LogError, match='format'):
+        rl.u_moc(w.ds, a, 'H0', w.u(a, format='u_moc_luot_v0'), w.gate)
+    g2 = w.gate_file(w.tmp / 'gate2.json', U_moc_xy_m=0.02)
+    with pytest.raises(rl.LogError, match='not the one of the run'):
+        rl.u_moc(w.ds, a, 'H0', w.u(a), g2)
+    with pytest.raises(rl.LogError, match='H1'):
+        rl.u_moc(w.ds, a, 'H1', w.u(a), w.gate)
+    rl.u_moc(w.ds, a, 'H0', w.u(a), w.gate)
+    with pytest.raises(rl.LogError, match='already'):
+        rl.u_moc(w.ds, a, 'H0', w.u(a), w.gate)
+
+
+def test_3_gate_file_without_the_lock_refused(tmp_path):
+    w = World(tmp_path, lock='x')
+    w.gate = wj(tmp_path / 'g_old.json', dict(gate_c8.fake_gate()))      # camera {}: a lock before c8b_khoa_v4
+    a = w.run(1)
+    with pytest.raises(rl.LogError, match='moc_dich'):
+        rl.u_moc(w.ds, a, 'H0', w.u(a), w.gate)
+
+
+@pytest.mark.parametrize('what', ['lich', 'dets', 'tap_moc', 'u_so_td', 'u_file', 'td_file', 'gate'])
+def test_6_a_changed_source_stops_the_apply(w, what):
+    a = w.run(1)
+    full(w, a)
+    p = dict(lich=w.runs[a]['rd'] / 'lich.json', dets=w.runs[a]['rd'] / 'dets.npz', tap_moc=w.tap, u_so_td=w.u_so,
+             u_file=w.runs[a]['rd'] / 'u_moc_H0.json', td_file=w.tmp / 'td' / 'S1_dat.json', gate=w.gate)[what]
+    with open(p, 'a', encoding='utf-8') as f:
+        f.write(' ')
+    with pytest.raises(rl.LogError):
+        w.after()
+
+
+def test_lock_numbers_read_again(w):
+    a = w.run(1)
+    full(w, a)
+    p = os.path.join(w.ds, rl.U_MOC)
+    rows = rl.read_rows(p)
+    rows[0]['khoa_xy_m'] = '0.5'
+    rl._write_all(p, rl.U_MOC_COLS, rows)
+    with pytest.raises(rl.LogError, match='lock numbers'):
+        w.after()
+
+
+@pytest.mark.parametrize('md_over', [dict(U_moc_xy_m=True), dict(U_moc_psi_deg=float('inf')),
+                                     dict(U_moc_xy_m=-1.0), dict(nguon=dict(bo_lay_mau='', car_pose=CP, tap_moc='a' * 64)),
+                                     dict(nguon=dict(bo_lay_mau='b', car_pose=dict(CP, tag_offset=[0, 0]),
+                                                     tap_moc='a' * 64)),
+                                     dict(nguon=dict(bo_lay_mau='b', car_pose=dict(CP, side_m=0), tap_moc='a' * 64))])
+def test_moc_dich_of_refuses_bad_locks(w, md_over):
+    g = gate_c8.read_gate_c8(w.gate_file(w.tmp / 'gbad.json', **md_over))
+    with pytest.raises(gate_c8.GateFileError):
+        gate_c8.moc_dich_of(g)
+
+
+# ── H1 (RM2-1, RM3-2, RM4-1) ───────────────────────────────────────────────────────────────────────────────────
+
+def h1_setup(w, uid, h1_in_luot=True, thieu=(), xy_h1=0.005):
+    """so-h above eps_H, H0 and H1 judged dat (so-h row written directly: apply_moc is tested alone here)."""
+    rd = w.runs[uid]['rd']
+    f1 = wt(rd / 'h1' / 'frames.csv', f'FAKE frames H1 {uid}')
+    sf = wj(rd / 'score_final.json', {'outcome': 'dat', 'calib_drift': {'h1_score': {'frames_sha256': sha(f1)},
+                                                                         'vuot': True, 'thieu_H1': False}})
+    rl.append_row(os.path.join(w.ds, rl.SO_H), rl.SO_H_COLS,
+                  dict(run_uid=uid, outcome_tam='dat', outcome_sau='dat', flags='calib_drift', vuot='true',
+                       D_H_mm='3', score_final_file=sf, score_final_sha256=sha(sf), ghi_luc='2026-11-20T10:00:00'))
+    w.runs[uid]['f1'] = f1
+    rl.u_moc(w.ds, uid, 'H0', w.u(uid), w.gate)
+    rl.u_moc(w.ds, uid, 'H1', w.u(uid, lan='H1', frames=f1, xy=xy_h1), w.gate)
+    luot = {f'L{k}': w.runs[u]['frames'] for k, u in enumerate(w.runs)}
+    if h1_in_luot:
+        luot[f"L{list(w.runs).index(uid)}@H1"] = f1
+    rl.tien_de(w.ds, 'S1', w.td(luot=luot, thieu=thieu))
+
+
+def test_8b_h1_covered_and_below_the_lock_keeps_dat(w):
+    a, b = w.run(1), w.run(2)
+    rl.u_moc(w.ds, b, 'H0', w.u(b), w.gate)
+    h1_setup(w, a)
+    got = w.moc()
+    assert got[a]['run_outcome'] == 'dat' and got[b]['run_outcome'] == 'dat'
+
+
+def test_8b_h1_above_the_lock(w):
+    a = w.run(1)
+    h1_setup(w, a, xy_h1=0.02)
+    assert w.moc()[a]['moc_flags'] == 'u_moc_vuot'
+    assert w.moc()[a]['U_moc_xy_m'] == '0.02'
+
+
+def test_8b_h1_not_covered_lowers_that_run_only(w):
+    a, b = w.run(1), w.run(2)
+    rl.u_moc(w.ds, b, 'H0', w.u(b), w.gate)
+    h1_setup(w, a, h1_in_luot=False)
+    got = w.moc()
+    assert (got[a]['moc_flags'], got[b]['run_outcome']) == ('tien_de_khong_phu_h1', 'dat')
+
+
+def test_8b_h1_id_in_luot_thieu_kiem(w):
+    a, b = w.run(1), w.run(2)
+    rl.u_moc(w.ds, b, 'H0', w.u(b), w.gate)
+    h1_setup(w, a, thieu=('L0@H1',))
+    got = w.moc()
+    assert (got[a]['moc_flags'], got[b]['run_outcome']) == ('tien_de_luot_thieu', 'dat')
+
+
+def test_8b_h1_row_missing_and_so_h_row_removed(w):
+    a = w.run(1)
+    h1_setup(w, a)
+    w.drop_row(rl.U_MOC, lambda r: r['lan'] != 'H1')
+    assert w.moc()[a]['moc_flags'] == 'cho_u_moc'
+    rl._write_all(os.path.join(w.ds, rl.SO_H), rl.SO_H_COLS, [])
+    assert w.moc()[a]['run_outcome'] == 'dat'            # no so-h above eps_H: H0 alone
+
+
+def test_8b_h1_row_without_so_h_stops(w):
+    a = w.run(1)
+    h1_setup(w, a)
+    rl._write_all(os.path.join(w.ds, rl.SO_H), rl.SO_H_COLS, [])
+    with pytest.raises(rl.LogError, match='H1'):
+        w.moc()
+
+
+# ── summary, freeze, s05_final_table, begin ─────────────────────────────────────────────────────────────────────
+
+def test_10_summary_counts_and_gate_file(w, monkeypatch):
+    # the row checks of R134 / O1 v11.33 (boot answers, gate columns) are tested elsewhere; these FAKE rows lack them
+    monkeypatch.setattr(rl, 'check_query_rows', lambda tun, ds: None)
+    monkeypatch.setattr(rl, 'check_gate_rows', lambda tun, gate_file=None: None)
+    a, b = w.run(1), w.run(2)
+    rl.u_moc(w.ds, a, 'H0', w.u(a, xy=0.02), w.gate)                  # lowered
+    rl.tien_de(w.ds, 'S1', w.td())                                     # b waits for its U file
+    row = {r['campaign']: r for r in rl.summary(w.ds)}['A-PID']
+    assert (row['moc_ha_n'], row['moc_cho_n']) == ('1', '1')
+    g2 = rl.read_gate_file(w.gate_file(w.tmp / 'gate2.json', U_moc_xy_m=0.02))
+    with pytest.raises(rl.LogError, match='another gate file'):
+        rl.summary(w.ds, gate_file=g2)
+
+
+def test_11_freeze_confirm_block(w, monkeypatch):
+    monkeypatch.setattr(rl, 'apply_so_h', lambda tun, ds: tun)        # so-h rows written directly below
+    a = w.run(1, stage='confirm', block='B1')
+    for uid in (a,):
+        rl.append_row(os.path.join(w.ds, rl.SO_H), rl.SO_H_COLS,
+                      dict(run_uid=uid, outcome_tam='dat', outcome_sau='dat', flags='', vuot='false',
+                           ghi_luc='2026-01-01T00:00:00'))
+    gain = wt(w.tmp / 'gain_A_PID_G1.json', '{"FAKE": 1}')
+    with pytest.raises(rl.LogError, match='not all dat'):             # no U / premise files: chua_ket_luan
+        rl.freeze(w.ds, 'A-PID', 'khoi_xac_nhan_dat', 'A-PID/G1', gain, at='2099-01-01T00:00:00')
+    full(w, a)
+    with pytest.raises(rl.LogError, match='u-moc / tien-de'):           # u-moc / tien-de rows written now
+        rl.freeze(w.ds, 'A-PID', 'khoi_xac_nhan_dat', 'A-PID/G1', gain, at='2026-01-02T00:00:00')
+    rl.freeze(w.ds, 'A-PID', 'khoi_xac_nhan_dat', 'A-PID/G1', gain, at='2099-01-01T00:00:00')
+
+
+def test_12_final_table_uses_the_outcome_after_both(w, monkeypatch):
+    import s05_final_table as s5
+    w.run(1, stage='final', outcome='hong_he_do')
+    seen = []
+
+    def spy(tun, ds):
+        seen.append(len(tun))
+        raise rl.LogError('SPY')
+    monkeypatch.setattr(rl, 'apply_after', spy)
+    with pytest.raises(ValueError, match='SPY'):
+        s5.load_runs(w.ds, 'score.json', 'esp32.csv', gate_file=w.gate)
+    assert seen == [1]
+
+
+def test_12_begin_does_not_use_the_rule(w):
+    a = w.run(1)
+    rl.u_moc(w.ds, a, 'H0', w.u(a, xy=0.02), w.gate)                  # a lowered by the rule
+    run = rl.begin(w.ds, 'S1', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G1')
+    assert run['row']['run_uid'] == 'S1:2'
+
+
+def test_cli_u_moc_and_tien_de(w, capsys):
+    a = w.run(1)
+    assert rl.main(['--dataset', w.ds, 'u-moc', '--run-uid', a, '--file', w.u(a), '--gate-file', w.gate]) == 0
+    assert rl.main(['--dataset', w.ds, 'tien-de', '--session', 'S1', '--file', w.td()]) == 0
+    assert rl.main(['--dataset', w.ds, 'tien-de', '--session', 'S1', '--file', w.td()]) == 2
+    with open(os.path.join(w.ds, rl.U_MOC), newline='', encoding='utf-8') as f:
+        assert next(csv.reader(f)) == rl.U_MOC_COLS
+    assert w.after()[a]['run_outcome'] == 'dat'

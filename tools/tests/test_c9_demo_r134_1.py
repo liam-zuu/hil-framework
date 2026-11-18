@@ -17,6 +17,15 @@ import s05_fake_runs as fr  # noqa: E402
 GAIN = dict(ctrl='PID', id=1, gains=dict(kp_xy=1.0, ki_xy=0.5, kp_wz=1.0, ki_wz=0.2, pos_kp=6.0, pos_ki=3.0, k_psi=1.0))
 
 
+@pytest.fixture
+def no_moc(monkeypatch):
+    """C8b v3 §5 (CODE_GATE 18/11, design 03_CODE/docs/2026-11-18_Thiet_ke_rq3_u_moc_v4.md): a car run of a campaign
+    without its U / premise files is chua_ket_luan after rq3_log.apply_moc. The tests using this fixture check rules
+    written before §5 on car runs that have no such files, so the §5 rule is set aside here; it is tested, with
+    summary, freeze and s05_final_table, in test_rq3_u_moc.py."""
+    monkeypatch.setattr(rl, 'apply_moc', lambda tun, ds: tun)
+
+
 def _rows(path):
     with open(path, newline='', encoding='utf-8') as f:
         return list(csv.DictReader(f))
@@ -442,7 +451,7 @@ def _freeze_ok(ds, tmp_path, at=''):
                      fr.write_gain_file(str(tmp_path / 'FAKE_gain_L.json'), GAIN), at=at)
 
 
-def test_c9d4_freeze_needs_the_so_h_of_the_last_block(demo_ds, tmp_path):
+def test_c9d4_freeze_needs_the_so_h_of_the_last_block(demo_ds, tmp_path, no_moc):
     uids = _confirm_block(demo_ds, tmp_path, 'K1', ('dat', 'dat'))
     with pytest.raises(rl.LogError, match='without their clip H comparison'):
         _freeze_ok(demo_ds, tmp_path)
@@ -470,7 +479,7 @@ def _lost_confirm(ds, block):
     return rl.end(ds, 'hong_he_do', completed=1, fail_cause='mat_khung_FAKE')['run_uid']
 
 
-def test_c9d4_lost_runs_of_the_block_are_out_of_the_denominator(demo_ds, tmp_path):
+def test_c9d4_lost_runs_of_the_block_are_out_of_the_denominator(demo_ds, tmp_path, no_moc):
     # S05 4.3: a run lost to the measurement is replaced, out of the denominator; one lost at so-h likewise
     _lost_confirm(demo_ds, 'K1')
     uids = _confirm_block(demo_ds, tmp_path, 'K1', ('dat', 'dat', 'dat'))
@@ -520,7 +529,7 @@ def test_gt1_2_a_level_stopped_by_the_c8b_time_check_is_not_confirmed(demo_ds, t
     assert s['stop_reason_check'] == 'mismatch' and s['san_gio_c8b_dung'] == 'A-LADRC/G01 O1-F05@0.5'
 
 
-def test_gt2_2_a_level_outside_the_block_and_the_gate_does_not_stop_the_confirmation(demo_ds, tmp_path):
+def test_gt2_2_a_level_outside_the_block_and_the_gate_does_not_stop_the_confirmation(demo_ds, tmp_path, no_moc):
     # GT2-2 (Codex round 2 of CODE_GATE; Liam 17/11 at CODE_GATE "Sửa 4 + Codex vòng 3 (Recommended)"): the gate of
     # the demo has O1-F05 only; O1-F08 of the set stopped in explore runs; the F05 block confirms
     for i in range(4):
@@ -563,7 +572,7 @@ def _summary_with_levels(ds, tmp_path, levels):
     return {r['campaign']: r for r in rl.summary(ds, gate_file=gf)}
 
 
-def test_q1_summary_needs_two_valid_runs_per_gate_level(demo_ds, tmp_path):
+def test_q1_summary_needs_two_valid_runs_per_gate_level(demo_ds, tmp_path, no_moc):
     # S05 v3.40 4.3 Q1 (Liam 17/11 at THESIS "Nhờ C13 thêm kiểm (Recommended)"): a block with one valid run per level
     # froze (freeze has no gate file), the summary with the gate file says mismatch; two valid runs say ok
     uids = _confirm_block(demo_ds, tmp_path, 'K1', ('dat',))
@@ -575,7 +584,7 @@ def test_q1_summary_needs_two_valid_runs_per_gate_level(demo_ds, tmp_path):
 
 
 @pytest.mark.parametrize('levels, want', [(('O1-F05',), 'ok'), (('O1-F05', 'O1-F08'), 'mismatch')])
-def test_q1_lost_runs_do_not_count_and_every_level_is_needed(tmp_path, levels, want):
+def test_q1_lost_runs_do_not_count_and_every_level_is_needed(tmp_path, levels, want, no_moc):
     demo_ds = str(tmp_path / 'dry')
     rl.demo(demo_ds, levels=levels)          # O1 v11.33: a gate file per level set, the runs scored with it
     _lost_confirm(demo_ds, 'K1')                                        # lost: out of the two
@@ -587,7 +596,7 @@ def test_q1_lost_runs_do_not_count_and_every_level_is_needed(tmp_path, levels, w
     assert s['stop_reason_check'] == want
 
 
-def test_q1c1_a_run_lost_from_the_start_is_not_one_of_the_two(demo_ds, tmp_path):
+def test_q1c1_a_run_lost_from_the_start_is_not_one_of_the_two(demo_ds, tmp_path, no_moc):
     # Q1C-1 (Codex Q1 round): one dat after so-h and one run logged lost, gate O1-F05 only: mismatch
     _lost_confirm(demo_ds, 'K1')
     uids = _confirm_block(demo_ds, tmp_path, 'K1', ('dat',))
@@ -596,7 +605,7 @@ def test_q1c1_a_run_lost_from_the_start_is_not_one_of_the_two(demo_ds, tmp_path)
     assert _summary_with_levels(demo_ds, tmp_path, ['O1-F05'])['A-LADRC']['stop_reason_check'] == 'mismatch'
 
 
-def test_q1c1_a_run_lost_at_so_h_is_not_one_of_the_two(demo_ds, tmp_path):
+def test_q1c1_a_run_lost_at_so_h_is_not_one_of_the_two(demo_ds, tmp_path, no_moc):
     # Q1C-1: two provisional dat, one became hong_he_do at so-h, gate O1-F05 only: mismatch
     uids = _confirm_block(demo_ds, tmp_path, 'K1', ('dat', 'dat'))
     rl.so_h(demo_ds, uids[0], _score_final(demo_ds, uids[0], 3.0, 'hong_he_do'))

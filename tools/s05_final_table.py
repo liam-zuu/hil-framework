@@ -471,7 +471,7 @@ def load_runs(dataset, score_name, esp32_name, query_before_name='gain_query_bef
         if miss:          # C9D-2 (Liam 17/11 at CODE_C13 "Sửa cả 7 + vòng 2 (Recommended)"): no table before so-h
             raise rl.LogError('luot xe kiem cuoi da phan chua so clip H (lenh rq3_log so-h, ca luot duoi nguong): '
                               + ', '.join(r.get('run_uid', '') for r in miss) + ' (C9D-2)')
-        rows = rl.apply_so_h(rows, dataset)                  # S05 v3.37 4.3: outcomes after the clip H comparison
+        rows = rl.apply_after(rows, dataset)    # S05 v3.37 4.3 clip H comparison, then C8b v3 §5 (rq3_log.apply_moc)
         rl._final_stops(rows)      # C9D2-3: a run after a known N = 3 stop (4.6) stops the table as the summary
     except rl.LogError as e:
         raise ValueError(f'm7_tuning_log.csv: {e}')
@@ -501,7 +501,9 @@ def load_runs(dataset, score_name, esp32_name, query_before_name='gain_query_bef
                    cat_t1=r.get('g1_cat_t1') == 'true',      # R134C4-6: O1 3.5 R2V-4, counted per cell
                    gain_set_id=r.get('gain_set_id', ''), gain_file=(gf or {}).get('file', ''),
                    gain_sha256=(gf or {}).get('sha256', ''), gain_source=(gf or {}).get('source', ''),
-                   so_h_flags=r.get('so_h_flags', ''))                 # S05 v3.37 4.3, O1 4 clip H
+                   so_h_flags=r.get('so_h_flags', ''),                 # S05 v3.37 4.3, O1 4 clip H
+                   moc_flags=r.get('moc_flags', ''), U_moc_xy_m=r.get('U_moc_xy_m', ''),
+                   U_moc_psi_deg=r.get('U_moc_psi_deg', ''))           # C8b v3 §5 (CODE_GATE design 6)
         if run['outcome'] in VALID:
             d = run['results_dir']
             score, tv = {}, dict(reason='')
@@ -754,7 +756,8 @@ def write_table(runs, out_dir):
         f.write(markdown(table))
     rcols = ['run_uid', 'platform', 'controller', 'condition', 'gain_set', 'outcome', 'flag'] + list(QUANTITIES) + \
             ['tv_reason', 'tv_d_tick', 'tv_d_seq', 'tv_end_gap_ms', 'tv_rows_dropped', 't_end_err_ms', 't_end_err_src',
-             'results_dir', 'gain_set_id', 'gain_file', 'gain_sha256', 'so_h_flags']
+             'results_dir', 'gain_set_id', 'gain_file', 'gain_sha256', 'so_h_flags', 'moc_flags', 'U_moc_xy_m',
+             'U_moc_psi_deg']
     with open(os.path.join(out_dir, 'S05_final_runs.csv'), 'w', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=rcols)
         w.writeheader()
@@ -770,7 +773,8 @@ def write_table(runs, out_dir):
                             t_end_err_src=r.get('t_end_err_src', ''),
                             results_dir=r['results_dir'], gain_set_id=r.get('gain_set_id', ''),
                             gain_file=r.get('gain_file', ''), gain_sha256=r.get('gain_sha256', ''),
-                            so_h_flags=r.get('so_h_flags', '')))
+                            so_h_flags=r.get('so_h_flags', ''), moc_flags=r.get('moc_flags', ''),
+                            U_moc_xy_m=r.get('U_moc_xy_m', ''), U_moc_psi_deg=r.get('U_moc_psi_deg', '')))
     used = sorted({(r.get('gain_set_id', '').split('/')[0] if r.get('gain_source') == '--init-gain'
                     else r.get('gain_set_id', ''), r.get('gain_file', ''), r.get('gain_sha256', ''),
                     r.get('gain_source', '')) for r in runs if r.get('gain_file')})
