@@ -731,3 +731,17 @@ def test_s05_h6_clip_h_hours_in_t_and_apart(demo):
         assert abs(float(a['A-PID'][k]) - float(b['A-PID'][k]) - 0.35) < 1e-9, k
     assert a['B-chung']['T_clip_h_h'] == '0.500'
     assert float(a['B-PID']['T_clip_h_h']) + float(a['B-LADRC']['T_clip_h_h']) == 0.5
+
+
+def test_rs1_1_clip_h_is_never_hoc(demo):
+    """RS1-1: clip H filming counts in the hour cap, so a clip_h row cannot carry the hoc label."""
+    with pytest.raises(rl.LogError, match='not hoc'):
+        rl.effort(demo, '2026-11-20', '07:00', '07:15', campaign='A-PID', nhan='hoc', ghi_chu='clip_h FAKE')
+    with pytest.raises(rl.LogError, match='not hoc'):
+        rl.hoc_start(demo, 'A-PID', 'clip_h FAKE')
+    p = os.path.join(demo, rl.EFFORT)
+    rows = rl.read_rows(p)
+    rows.append(dict(rows[0], chien_dich='A-PID', khoan='', nhan='hoc', ghi_chu=f'{rl.MANUAL} clip_h FAKE by hand'))
+    rl._write_all(p, rl.EFFORT_COLS, rows)
+    with pytest.raises(rl.LogError, match='cannot be hoc'):
+        _summary_rows(demo)

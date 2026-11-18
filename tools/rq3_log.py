@@ -242,6 +242,14 @@ STAGES = ('screen', 'confirm', 'final', 'explore', 'hil_check', 'final_hil', 'sc
 FIG8 = {'O1-F02': 0.2, 'O1-F05': 0.5, 'O1-F08': 0.8}     # same as rpi5/o1_tasks.py FIG8 (a test checks)
 MANUAL = '[nhap_tay]'                    # flag of a hoc row typed by hand (S05 §3.1 R-2, EA-7)
 CLIP_H_NOTE = 'clip_h'                   # S05 v3.44 §3.2 H6: ghi_chu of an effort row of clip H filming
+
+
+def is_clip_h(ghi_chu: str) -> bool:
+    """S05 v3.44 H6: an effort row of clip H filming (ghi_chu starts with 'clip_h', after the [nhap_tay] flag)."""
+    g = ghi_chu or ''
+    if g.startswith(MANUAL):
+        g = g[len(MANUAL):].lstrip()
+    return g.startswith(CLIP_H_NOTE)
 OUTCOMES = ('dat', 'khong_dat', 'chua_ket_luan', 'hong_he_do')
 PLATFORMS = ('SIM', 'HIL', 'HW')
 STEPS = ('flash', 'setup', 'run', 'log', 'analysis')
@@ -2507,6 +2515,8 @@ def effort(ds: str, date: str, start: str, end_: str, campaign: str = '', khoan:
         raise LogError('--nhan hoc or nothing')
     if nhan == 'hoc' and not ghi_chu:
         raise LogError('a hoc row names what was read (S05 §3.1)')
+    if nhan == 'hoc' and is_clip_h(ghi_chu):                    # RS1-1: clip H filming is work in the caps
+        raise LogError(f'ghi_chu {CLIP_H_NOTE}: clip H filming is campaign work, not hoc (S05 v3.44 §3.2 H6)')
     if nhan == 'hoc' and not ghi_chu.startswith(MANUAL):
         ghi_chu = f'{MANUAL} {ghi_chu}'                 # EA-7: times typed, not stamped by the script
     t0 = dt.datetime.fromisoformat(f'{date}T{start}')
@@ -2538,6 +2548,8 @@ def hoc_start(ds: str, campaign: str, ghi_chu: str) -> dict:
         raise LogError(f'--campaign one of {TUNED} (hoc of a campaign, S05 §3.1)')
     if not ghi_chu:
         raise LogError('a hoc row names what was read (S05 §3.1)')
+    if is_clip_h(ghi_chu):                                       # RS1-1
+        raise LogError(f'ghi_chu {CLIP_H_NOTE}: clip H filming is campaign work, not hoc (S05 v3.44 §3.2 H6)')
     if _load_hoc(ds):
         raise LogError('a hoc segment is open: "hoc-end" first (one segment at a time)')
     if _load_open(ds):
@@ -2965,7 +2977,10 @@ def summary(ds: str, gate: Optional[Iterable[str]] = None, gate_sha256: str = ''
         h = _f(r.get('gio')) * 3600
         hoc = r.get('nhan') == 'hoc'
         t, t_end = _effort_span(r)
-        clip_h = r.get('ghi_chu', '').startswith(CLIP_H_NOTE)     # S05 v3.44 H6: in T and the caps, also apart
+        clip_h = is_clip_h(r.get('ghi_chu', ''))                 # S05 v3.44 H6: in T and the caps, also apart
+        if clip_h and hoc:                                        # RS1-1: a row typed into the CSV by hand
+            raise LogError(f"{EFFORT}: row {r.get('ngay')} {r.get('bat_dau')}: a clip_h row cannot be hoc "
+                           '(S05 v3.44 §3.2 H6: clip H filming counts in the hour cap)')
         if c == 'B-chung':
             add('B-chung', 'T_op_s', h)
             if not hoc:
