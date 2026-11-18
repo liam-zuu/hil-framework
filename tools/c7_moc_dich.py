@@ -48,7 +48,8 @@ WIN_MIN_N = 10         # [DE XUAT] at least 10 samples
 WIN_GAP_S = 0.1        # [DE XUAT] a gap above this restarts the sighting
 NEN_WIN_S = 1.0        # [DE XUAT] two alarms within 1 s: common (v3 3); a base check span of 1 s closes it (v4 2)
 NEN_RAW_FRAC = 0.25    # [DE XUAT] a quarter of the seen marks over T_raw in one frame: common
-NEN_RAW_MIN = 2        #   and at least two of them (one mark over T_raw is a moc_nghi, not a base change)
+NEN_RAW_MIN = 1        #   (design v3 3: >= 1/4; Codex C33 round 1 item 5: no extra 'at least two', the count is over
+                       #   the marks WITH a comparison, which can be few in a frame)
 KIEM_H_MIN = 0.95      # [DE XUAT] clip H closing a nen_doi: every mark seen in this share of the frames (c7_kiem_cheo)
 SCHEDULE_VERSION = 'c7_moc_dich_v1'
 
@@ -135,18 +136,39 @@ def schedule(clips, T, T_raw, ids, win_s=WIN_S, min_n=WIN_MIN_N, gap_s=WIN_GAP_S
         return [q, int(clips[q].idx[e])]
 
     def h_ok(q):
-        """A clip H closes an open nen_doi: every mark of the chain seen in >= kiem_h_min of the frames and every
-        window of the clip with m <= T."""
+        """A clip H closes an open nen_doi: in >= kiem_h_min of its frames EVERY mark of the chain's universe has a
+        comparison at once (the kiem_h condition on U_c, Codex C33-10: each mark alone at 96.9 % may never be seen all
+        together), and every window of the clip has m <= T."""
         c = clips[q]
         if c.kind != 'H' or not len(c.t):
             return False
+        together = np.ones(len(c.t), bool)
         for j in ids:
-            if np.mean(np.isfinite(R[q][j])) < kiem_h_min:
-                return False
+            together &= np.isfinite(R[q][j])
+        if np.mean(together) < kiem_h_min:
+            return False
+        for j in ids:
             mm = M[q][j][np.isfinite(M[q][j])]
             if not len(mm) or np.any(mm > T):
                 return False
         return True
+
+    def start_of(j, q, e):
+        """Conservative start of the shift of j alarmed at (q, e) (v4 1): (position (q, e_pos), bat_dinh). The window
+        start of the last frame before e in the same sighting with m <= T; none there: W*, the last such frame before
+        (earlier sighting or clip), bat_dinh; none at all: the session start, bat_dinh."""
+        sg, prev = SG[q][j][e], None
+        for e2 in range(e - 1, -1, -1):
+            if SG[q][j][e2] >= 0 and SG[q][j][e2] != sg:
+                break                                    # an earlier sighting: W is not in this one
+            if SG[q][j][e2] == sg and np.isfinite(M[q][j][e2]) and M[q][j][e2] <= T:
+                prev = e2
+                break
+        if prev is not None:
+            return (q, int(WS[q][j][prev])), False
+        if last_ok[j] is not None:
+            return last_ok[j], True
+        return (0, 0), True
 
     E = {}                       # j -> exclusion record
     nen, bat = [], []
@@ -182,23 +204,15 @@ def schedule(clips, T, T_raw, ids, win_s=WIN_S, min_n=WIN_MIN_N, gap_s=WIN_GAP_S
                                 break
                 if base_raw or len(on) >= 2 or partners:
                     state = 'nen'
-                    episode = dict(tu=pos(*last_check) if last_check else pos(0, 0), den=None, moc=sorted(set(on) | partners | (set(over) if base_raw else set())))
+                    # Codex C33-2: the interval also covers the conservative start (W, W*) of every alarmed mark
+                    starts = [last_check if last_check else (0, 0)] + [start_of(j, q, e)[0] for j in on]
+                    ep_start = min(starts)
+                    episode = dict(tu=pos(*ep_start), den=None,
+                                   moc=sorted(set(on) | partners | (set(over) if base_raw else set())))
                     span = None
                 else:
                     for j in on:
-                        sg, prev = SG[q][j][e], None
-                        for e2 in range(e - 1, -1, -1):
-                            if SG[q][j][e2] >= 0 and SG[q][j][e2] != sg:
-                                break                    # an earlier sighting: W is not in this one
-                            if SG[q][j][e2] == sg and np.isfinite(M[q][j][e2]) and M[q][j][e2] <= T:
-                                prev = e2
-                                break
-                        if prev is not None:
-                            tu, bd = (q, int(WS[q][j][prev])), False
-                        elif last_ok[j] is not None:
-                            tu, bd = last_ok[j], True
-                        else:
-                            tu, bd = (0, 0), True
+                        tu, bd = start_of(j, q, e)
                         E[j] = dict(tu=pos(*tu), t_s=float(clips[tu[0]].t[tu[1]]), bao_dong=pos(q, e), bat_dinh=bd)
                         if bd:
                             bat.append(dict(moc=j, tu=pos(*tu), den=pos(q, e)))
@@ -207,6 +221,11 @@ def schedule(clips, T, T_raw, ids, win_s=WIN_S, min_n=WIN_MIN_N, gap_s=WIN_GAP_S
                     if seen and len(win) == len(seen) and all(M[q][j][e] <= T for j in seen):
                         last_check = (q, int(min(WS[q][j][e] for j in seen)))
             else:
+                for j in on:                                     # a later alarm reaches back to its own start
+                    st = start_of(j, q, e)[0]
+                    if st < ep_start:
+                        ep_start = st
+                        episode['tu'] = pos(*ep_start)
                 episode['moc'] = sorted(set(episode['moc']) | set(on) | (set(over) if base_raw else set()))
                 al = episode['moc']
                 ok = all(j in E or (np.isfinite(M[q][j][e]) and M[q][j][e] <= T) for j in al) and \

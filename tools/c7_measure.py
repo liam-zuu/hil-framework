@@ -63,7 +63,10 @@ The run rules (gaps, tracker, completion, outcome) are in c7_score.py.
                      constants file (CS1-15), written with its sha256 to track.json; else the module defaults
   [--tag-offset DX,DY,DPSI_DEG]  tag centre minus wheel centre in the body frame (m, m, deg) and tag
                                  heading minus body heading, from the static test (C8 clip T)
-Last line: #ket_qua,ma=0 done / 2 error.
+  33 marks (session of calib --model): track writes dets.npz, frames.csv (+ moc_thay, moc_dung, moc_neo_<chain>,
+  kc_*_k, nen_doi, bat_dinh_moc, chua_ket_luan_xe), kiem_cheo_khung.csv, track.json; lich builds the session schedule
+  (one fixed-point step; c7_kiem_cheo phan_tich --tap-moc between steps); track --lich --run --u-so --dets = final pass.
+Last line: #ket_qua,ma=0 done / 2 error / 3 final 33-mark pass with frames or check rows not concluded.
 """
 from __future__ import annotations
 
@@ -263,11 +266,15 @@ def refit_pose(cam, obj_xy, img):
     return c, float(np.sqrt(np.mean(np.sum(r ** 2, axis=1))))
 
 
-def refit_pose_checked(cam_h, obj_xy, img, zc_h, cond_max=COND_MAX, camz_tol=CAMZ_TOL_M):
+def refit_pose_checked(cam_h, obj_xy, img, zc_h=None, cond_max=COND_MAX, camz_tol=CAMZ_TOL_M):
     """Pose only, STARTED FROM cam_h (a clip-H camera, never a previous frame: v3 2 T33-8), with the trust flags of
     v3 2 (T33-3, T33-17) on the training marks only: success, cost not above the start value, |camera height - zc_h|
     <= camz_tol, condition number of the column-normalised Jacobian <= cond_max. obj_xy (4n, 2) floor corners, img
-    (4n, 2) pixels. Returns (camera, rms px, ok, ly_do, cond); ly_do '' when ok, else khop_khong_tin / dieu_kien."""
+    (4n, 2) pixels. Returns (camera, rms px, ok, ly_do, cond); ly_do '' when ok, else khop_khong_tin / dieu_kien.
+    zc_h None: the height of cam_h ITSELF (Codex C33-3: a reference from the camera with every mark would let the data of
+    a held-out group into the flag of a check chain)."""
+    if zc_h is None:
+        zc_h = float(abs(cam_h.centre[2]))
     obj = np.column_stack([obj_xy, np.zeros(len(obj_xy))])
 
     def make(x):
@@ -643,7 +650,8 @@ def calibrate(video, marks, zc, plumb, tag_h, car_side, stride=1, max_frames=Non
     extra = {}
     if model is not None:
         extra = dict(model_khoa=model, vai_tro={str(i): (roles or {}).get(i, '') for i in sorted(marks)},
-                     kiem_cheo=kiem_cheo_block(dets, mean, marks, ids, cam, model, w_px, h_px, zc, n_groups))
+                     kiem_cheo=kiem_cheo_block(dets, mean, marks, ids, cam, model, w_px, h_px, zc, n_groups,
+                                               floor_all=[i for i in floor if i in marks and i != CAR_ID]))
     return dict(
         **extra,
         kind='c7_session', video=os.path.basename(video), video_sha256=sha256(video) if os.path.isfile(video) else None,
@@ -669,14 +677,18 @@ def gates_dict(gates=None, src=None):
 
 
 # ---------------------------------------------------------------- 33 marks: chains, comparators (design v3 2, 3)
-def kiem_cheo_block(dets, mean, marks, ids, cam, model, w, h, zc, n_groups=KC_GROUPS, cond_max=COND_MAX):
+def kiem_cheo_block(dets, mean, marks, ids, cam, model, w, h, zc, n_groups=KC_GROUPS, cond_max=COND_MAX, floor_all=None):
     """Block 'kiem_cheo' of a session calibrated with a locked model (v3 1, 2; v4 3): groups; clip-H cameras (intrinsics
     + pose, fit_two_pass as the main one, model locked) without each group k and each pair {a, b}; their convergence;
     the BASELINE of every chain c and target j = mean over the clip-H frames of the position of j by its comparator
     (pose refitted from the comparator camera on every mark outside the comparator's groups, that set SEEN WHOLE in the
     frame, v4 3 / KC4); marks of a chain without a baseline (nen_thieu: track refuses the session); the condition numbers
-    of the main per-frame refit on H (to lock COND_MAX at C8); the centre-definition difference with d59197a."""
-    groups = make_groups(ids, n_groups)
+    of the main per-frame refit on H (to lock COND_MAX at C8); the centre-definition difference with d59197a.
+    floor_all: every floor mark of the marker files (Codex C33-15: the groups and universes are those of the locked
+    list, not of the marks seen in clip H; a floor mark missing from H is a mark without baseline, it blocks the
+    session, it does not leave the universe)."""
+    floor_all = sorted(set(ids) | set(floor_all or ()))
+    groups = make_groups(floor_all, n_groups)
     G = len(groups)
     gmap = {i: k for k, g in enumerate(groups) for i in g}
     cams, khop = {CHAIN_XE: cam}, {CHAIN_XE: cam.fit_info}
@@ -708,7 +720,7 @@ def kiem_cheo_block(dets, mean, marks, ids, cam, model, w, h, zc, n_groups=KC_GR
                 key = cam_key(ex)
                 if key not in fits:
                     obj = np.vstack([cp.mark_corners_floor(*marks[i]) for i in anchors])
-                    fits[key] = refit_pose_checked(cams[key], obj, np.vstack([d[i] for i in anchors]), zc_h, cond_max)
+                    fits[key] = refit_pose_checked(cams[key], obj, np.vstack([d[i] for i in anchors]), None, cond_max)
                 fc, _, ok, _, _ = fits[key]
                 if not ok:
                     continue
@@ -717,10 +729,10 @@ def kiem_cheo_block(dets, mean, marks, ids, cam, model, w, h, zc, n_groups=KC_GR
                         acc[c].setdefault(j, []).append(mark_centre_floor(fc, d[j]))
         if set(ids) <= set(d):
             obj = np.vstack([cp.mark_corners_floor(*marks[i]) for i in ids])
-            conds.append(refit_pose_checked(cam, obj, np.vstack([d[i] for i in ids]), zc_h, math.inf)[4])
+            conds.append(refit_pose_checked(cam, obj, np.vstack([d[i] for i in ids]), None, math.inf)[4])
     nen, nen_n, thieu = {}, {}, []
     for c in chains:
-        uc = [i for i in ids if c == CHAIN_XE or gmap[i] != int(c)]
+        uc = [i for i in floor_all if c == CHAIN_XE or gmap[i] != int(c)]
         nen[c] = {str(j): np.mean(np.array(acc[c][j]), axis=0).tolist() for j in uc if acc[c].get(j)}
         nen_n[c] = {str(j): len(acc[c].get(j, [])) for j in uc}
         thieu += [[c, j] for j in uc if not acc[c].get(j)]
@@ -770,7 +782,7 @@ class ChainCtx:
             c0 = self.cams[key]
             return cp.Camera(c0.model, c0.f, c0.cx, c0.cy, c0.k, x[:3], x[3:]), rms, ok, ly, cond
         obj = np.vstack([cp.mark_corners_floor(*self.marks[i]) for i in anchors])
-        out = refit_pose_checked(self.cams[key], obj, np.vstack([d[i] for i in anchors]), self.zc_h, self.cond_max)
+        out = refit_pose_checked(self.cams[key], obj, np.vstack([d[i] for i in anchors]), None, self.cond_max)
         if cache is not None and fkey is not None:
             cache[ck] = (np.r_[out[0].rvec, out[0].tvec], out[1], out[2], out[3], out[4])
         return out
@@ -940,6 +952,32 @@ def u_so_thresholds(u_so, chains):
     return out
 
 
+U_SO_NGUONG_CO_DINH_M = 0.001          # c7_kiem_cheo NGUONG_CO_DINH_M: T = 1 mm + u_so (page v10 7a)
+
+
+def check_u_so_source(u_so, session, session_sha, ctx):
+    """u_so.json must be of THIS session and setup (Codex C33-5): H_a session sha, locked model, groups, not a trial;
+    every chain's numbers >= 0 and T = 1 mm + u_so, T_raw = 1 mm + u_so_raw."""
+    ha = ((u_so.get('sessions') or {}).get('H_a') or {}).get('sha256')
+    if ha != session_sha:
+        raise ValueError(f'u_so.json is of another H_a session ({ha!r}, not {session_sha!r})')
+    if u_so.get('model') != session.get('model_khoa'):
+        raise ValueError(f"u_so.json model {u_so.get('model')!r} is not the session's {session.get('model_khoa')!r}")
+    if [sorted(int(i) for i in g) for g in (u_so.get('nhom') or [])] != ctx.groups:
+        raise ValueError('u_so.json groups are not the session groups')
+    if u_so.get('thu'):
+        raise ValueError('u_so.json is a trial (--thu)')
+    for c in ctx.chains:
+        v = (u_so.get('chuoi') or {}).get(c) or {}
+        for k in ('u_so_m', 'u_so_tho_m'):
+            x = v.get(k)
+            if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) or x < 0:
+                raise ValueError(f'u_so.json chuoi {c} {k}: {x!r} (finite, >= 0)')
+        for t_, u_ in (('nguong_m', 'u_so_m'), ('nguong_tho_m', 'u_so_tho_m')):
+            if not abs(v.get(t_, math.nan) - (U_SO_NGUONG_CO_DINH_M + v[u_])) <= 1e-12:
+                raise ValueError(f'u_so.json chuoi {c}: {t_} is not 1 mm + {u_}')
+
+
 def undetected_bound(u_so):
     """D (m) of chain xe (v3 3, v4 4): the larger of T + u_so (a shift lasting a window or more) and T_raw + u_so_raw (a
     shorter one, the frames over T_raw were left out). Conditional: a bound only if u_so bounds the comparison error."""
@@ -1005,7 +1043,10 @@ def car_sensitivity(cam, anchors, d, marks, car_px, side, kappa, plumb, off, D, 
                 Pv = P.copy()
                 Pv[4 * m:4 * m + 4, 0] += vx_
                 Pv[4 * m:4 * m + 4, 1] += vy_
-                cv_, _, _, _, _ = refit_pose_checked(mk(x), Pv[:, :2], img, abs(cam.centre[2]), math.inf, math.inf)
+                cv_, _, okv, _, _ = refit_pose_checked(mk(x), Pv[:, :2], img, abs(cam.centre[2]), math.inf, math.inf)
+                if not okv:                                  # Codex C33-14: an untrusted vertex fit voids the ratio
+                    ratio_xy = ratio_psi = math.inf
+                    continue
                 dlt = car(cv_) - c0
                 dlt[2] = cp_wrap(dlt[2])
                 L = math.hypot(vx_, vy_)
@@ -1055,6 +1096,7 @@ def track_chains(frames, video_name, video_sha, session, tag_offset=None, gates=
                  khop_ok=bool(ok), khop_ly_do=ly, cond=cond, moc_thay=_ids_cell(fr['seen']), moc_dung=_ids_cell(used))
         for c in ctx.chains:
             r[f'moc_neo_{c}'] = _ids_cell(fr['neo'][c])
+        n_khung0 = len(khung)
         for k, v in fr['kc'].items():
             r[f'kc_ok_{k}'], r[f'kc_n_{k}'], r[f'kc_err_max_{k}'], r[f'kc_ly_do_{k}'] = int(v['ok']), v['n'], \
                 v['err_max'], v['ly_do']
@@ -1067,6 +1109,9 @@ def track_chains(frames, video_name, video_sha, session, tag_offset=None, gates=
                 if a:
                     nen_c.append(c)
                 bd += [f'{c}:{j}' for j in b]
+        inc = set(nen_c) | {x.split(':')[0] for x in bd}           # chains not concluded at this frame (Codex C33-1)
+        for row in khung[n_khung0:]:
+            row['chua_ket_luan'] = int(row['chuoi'] in inc)
         r['nen_doi'] = ';'.join(nen_c)
         r['bat_dinh_moc'] = ';'.join(bd)
         r['chua_ket_luan_xe'] = int(CHAIN_XE in nen_c or any(s.startswith(CHAIN_XE + ':') for s in bd))
@@ -1100,13 +1145,17 @@ def track_chains(frames, video_name, video_sha, session, tag_offset=None, gates=
                            do_nhay_psi=s['s_psi_max'])
         nl = dict(D_m=D, D_dieu_kien='chi la can neu u_so chan sai phep so luc chay (v4 4)', ratio_xy_max=rx,
                   ratio_psi_max=rp, he_so_xy=fx, he_so_psi=fp, moi_n_khung=NONLIN_EVERY, n_khung=len(out),
-                  gioi_han='can thuc nghiem: tuyen tinh tai nghiem, dinh hop +-D tren mau moi 30 khung hop le')
+                  gioi_han='can thuc nghiem: tuyen tinh tai nghiem, dinh hop +-D tren mau moi 30 khung hop le',
+                  vai_tro='THAM DO, khong phai can da xac nhan (Codex C33-14: he so day cung, IRLS co dinh, moi mau '
+                          '30 khung; C33-13: cach truyen U sang xe do C8B chot)')
     info = dict(video=video_name, video_sha256=video_sha, frames=len(rows),
                 decoded_shapes=sorted(list(s) for s in (shapes or ())), median_scale=med_scale, tag_offset=list(off),
                 gates=gates_dict(gates, gates_src), hang_so_sha256=(gates_src or {}).get('sha256'),
                 shift_kind='median_vector', n_valid=int(sum(r['valid'] for r in rows)),
                 n_khop_khong_tin=int(sum(not r['khop_ok'] for r in rows)),
                 n_chua_ket_luan_xe=int(sum(r['chua_ket_luan_xe'] for r in rows)),
+                n_chua_ket_luan_xe_hop_le=int(sum(r['chua_ket_luan_xe'] and r['valid'] for r in rows)),
+                n_hang_kiem_chua_ket_luan=int(sum(k_['chua_ket_luan'] for k_ in khung)),
                 zc_session_m=session.get('zc_fit_m'), cam_z_drift_rel=_cam_z_drift(rows, session.get('zc_fit_m')),
                 model_khoa=session['model_khoa'], nhom=ctx.groups, chuoi=ctx.chains, run=run, do_nhay=nl,
                 u_so_sha256=u_so_sha, nguong_dung=u_so_thresholds(u_so, ctx.chains) if u_so is not None else None,
@@ -1175,6 +1224,8 @@ def build_lich(session, session_sha, runs, u_so=None, u_so_sha=None, prev=None, 
         if u_so is None:
             raise ValueError('a step after the first needs --u-so (c7_kiem_cheo phan_tich --tap-moc <prev tap_moc.json>)')
     old = prev['chuoi'] if prev else {c: empty for c in ctx.chains}
+    if u_so is not None:
+        check_u_so_source(u_so, session, session_sha, ctx)
     nguong = u_so_thresholds(u_so, ctx.chains) if u_so is not None else None
     tap = {c: {tuple(S) for S in (prev or {}).get('tap_moc', {}).get(c, [])} for c in ctx.chains}
     canh_bao = []
@@ -1188,7 +1239,7 @@ def build_lich(session, session_sha, runs, u_so=None, u_so_sha=None, prev=None, 
     per_chain = {c: [] for c in ctx.chains}
     caches = {}
     for q, (name, kind, frames, _) in enumerate(runs):
-        cache = caches[name] = _load_cache(cache_dir, name, session_sha) if cache_dir else {}
+        cache = caches[name] = _load_cache(cache_dir, name, session_sha, runs[q][3]) if cache_dir else {}
         n = len(frames)
         dd = {c: {j: np.full((n, 2), np.nan) for j in ctx.universe[c]} for c in ctx.chains}
         for e, (idx, t, d) in enumerate(frames):
@@ -1210,13 +1261,13 @@ def build_lich(session, session_sha, runs, u_so=None, u_so_sha=None, prev=None, 
         for c in ctx.chains:
             T_c, Tr_c = nguong[c]['nguong_m'], nguong[c]['nguong_tho_m']
             S = md.schedule(per_chain[c], T_c, Tr_c, ctx.universe[c])
-            S, per_chain[c] = _explain_base_changes(ctx, runs, old, c, S, per_chain[c], T_c, Tr_c, caches, giai_thich)
+            _explain_base_changes(ctx, runs, old, c, S, per_chain[c], T_c, Tr_c, caches, giai_thich)
             new[c] = S
     else:
         new = {c: empty for c in ctx.chains}
     if cache_dir:
         for name, cache in caches.items():
-            _save_cache(cache_dir, name, session_sha, cache)
+            _save_cache(cache_dir, name, session_sha, cache, _dets_sha_of(runs, name))
     for q, (name, kind, frames, _) in enumerate(runs):           # anchor sets the new schedule will use (no fit)
         for idx, t, d in frames:
             seen = [i for i in d if i in ctx.gmap]
@@ -1231,13 +1282,22 @@ def build_lich(session, session_sha, runs, u_so=None, u_so_sha=None, prev=None, 
                                                     n_moc_nghi={c: len(new[c]['moc_nghi']) for c in ctx.chains},
                                                     n_nen_doi={c: len(new[c]['nen_doi']) for c in ctx.chains},
                                                     u_so_sha256=u_so_sha)]
-    hoi_tu = prev is not None and u_so is not None and prev.get('lich_sha256') == sha
+    # Codex C33-5: a repeated schedule is FINAL only when u_so computed every comparator set the schedule uses
+    thieu_tap = _tap_cover_missing(tap_json, u_so, ctx.groups) if u_so is not None else []
+    if thieu_tap:
+        canh_bao.append(dict(loai='u_so_chua_tinh_tap_lich_moi', n=len(thieu_tap),
+                             mau=[list(m[:2]) + [list(m[2])] for m in thieu_tap[:20]]))
+    lap_lai = prev is not None and u_so is not None and prev.get('lich_sha256') == sha
+    hoi_tu = lap_lai and not thieu_tap
     chu_trinh = not hoi_tu and sha in [h['lich_sha256'] for h in lap[:-2]]
     return dict(version='c7_lich_v1', session_sha256=session_sha, u_so_sha256=u_so_sha, clips=clips, chuoi=new,
                 giai_thich_nen_doi=giai_thich,
                 nguong_dung=nguong, tap_moc=tap_json, tap_moc_sha256=tap_sha, lich_sha256=sha, lap=lap, hoi_tu=hoi_tu,
                 chu_trinh=chu_trinh, qua_10=(len(lap) > 10 and not hoi_tu), canh_bao=canh_bao,
-                ket_luan=('hoi tu' if hoi_tu else 'chu trinh: chua ket luan' if chu_trinh else
+                lap_lai=lap_lai, thieu_tap_u_so=len(thieu_tap),
+                ket_luan=('hoi tu' if hoi_tu else 'lich lap lai nhung u_so thieu tap: chay c7_kiem_cheo phan_tich '
+                          '--tap-moc <tap_moc.json nay> roi lich tiep' if lap_lai else
+                          'chu trinh: chua ket luan' if chu_trinh else
                           'qua 10 lan: chua ket luan' if len(lap) > 10 else 'chua hoi tu: chay tiep'),
                 luat=dict(win_s=md.WIN_S, win_min_n=md.WIN_MIN_N, win_gap_s=md.WIN_GAP_S, nen_win_s=md.NEN_WIN_S,
                           nen_raw_frac=md.NEN_RAW_FRAC, nen_raw_min=md.NEN_RAW_MIN, kiem_h_min=md.KIEM_H_MIN,
@@ -1276,12 +1336,13 @@ def _peak(clips, a, ep):
 
 
 def _explain_base_changes(ctx, runs, old, c, S, clips, T_c, Tr_c, caches, log):
-    """[DE XUAT, beyond design v4; found 18/11 by test (ii)] One shifted ANCHOR moves the comparators of other marks too
-    (20 mm on one mark: 1.7 mm on another, synthetic), so a single shift can look like two alarms (a nen_doi) and would
-    never be excluded. For every base-change episode of chain c, the alarmed mark with the largest |delta| inside it is
-    taken out of the chain's anchors from the episode start and the deltas recomputed: if the rule then excludes that
-    mark and has fewer base-change episodes, the episode is explained by that one mark (it becomes its exclusion);
-    else it stays a base change. Every trial is logged (giai_thich_nen_doi)."""
+    """INFORMATION ONLY (Codex C33-9: 'largest |delta|' and 'fewer episodes' do not prove which mark moved; a good mark
+    can be picked). One shifted ANCHOR moves the comparators of other marks too (20 mm on one mark: 1.7 mm on another,
+    synthetic, test (ii)), so a single shift can look like two alarms: the episode stays a nen_doi (not concluded).
+    For every base-change episode of chain c the alarmed mark with the largest |delta| inside it is taken out of the
+    chain's anchors from the episode start and the deltas recomputed; the result (would the rule then exclude that mark
+    with fewer episodes?) is logged in giai_thich_nen_doi as a hint for re-measuring that mark's tape position. The
+    schedule is NOT changed."""
     tried = set()
     while True:
         cand = None
@@ -1298,30 +1359,45 @@ def _explain_base_changes(ctx, runs, old, c, S, clips, T_c, Tr_c, caches, log):
         clips2 = _chain_clips(ctx, runs, old, c, {a: tuple(ep['tu'])}, caches)
         S2 = md.schedule(clips2, T_c, Tr_c, ctx.universe[c])
         ok = str(a) in S2['loai'] and len(S2['nen_doi']) < len(S['nen_doi'])
-        log.append(dict(chuoi=c, moc=int(a), tu=ep['tu'], dinh_m=_peak(clips, a, ep), chap_nhan=bool(ok)))
-        if ok:
-            S, clips = S2, clips2
+        log.append(dict(chuoi=c, moc=int(a), tu=ep['tu'], dinh_m=_peak(clips, a, ep), mot_moc_giai_thich=bool(ok),
+                        nghia='chi thong tin, lich khong doi (Codex C33-9)'))
 
 
 def _cache_path(cache_dir, name):
     return os.path.join(cache_dir, f'pose_cache_{name}.pkl')
 
 
-def _load_cache(cache_dir, name, session_sha):
+CACHE_VERSION = 'c7_pose_cache_v2'
+
+
+def _cache_tag(session_sha, dets_sha):
+    """What a cached pose depends on (Codex C33-4): the session, the detections of the clip, the fit rule."""
+    return dict(version=CACHE_VERSION, session_sha256=session_sha, dets_sha256=dets_sha, cond_max=COND_MAX,
+                camz_tol_m=CAMZ_TOL_M, min_train=MIN_TRAIN)
+
+
+def _dets_sha_of(runs, name):
+    return {r[0]: r[3] for r in runs}[name]
+
+
+def _load_cache(cache_dir, name, session_sha, dets_sha):
+    """The pose cache of a clip, or {} when anything it depends on differs (never another clip's poses)."""
     import pickle
     p = _cache_path(cache_dir, name)
-    if not os.path.isfile(p):
+    if not os.path.isfile(p) or not dets_sha:
         return {}
     with open(p, 'rb') as f:
         obj = pickle.load(f)                                  # our own file (written by _save_cache)
-    return obj.get('cache', {}) if obj.get('session_sha256') == session_sha else {}
+    return obj.get('cache', {}) if obj.get('tag') == _cache_tag(session_sha, dets_sha) else {}
 
 
-def _save_cache(cache_dir, name, session_sha, cache):
+def _save_cache(cache_dir, name, session_sha, cache, dets_sha):
     import pickle
+    if not dets_sha:
+        return
     os.makedirs(cache_dir, exist_ok=True)
     with open(_cache_path(cache_dir, name), 'wb') as f:
-        pickle.dump(dict(session_sha256=session_sha, cache=cache), f, protocol=4)
+        pickle.dump(dict(tag=_cache_tag(session_sha, dets_sha), cache=cache), f, protocol=4)
 
 
 FRAME_COLS = ('idx', 't_s', 'valid', 'why', 'n_marks', 'rms_px', 'shift_px', 'cam_z', 'car_seen', 'x', 'y', 'psi',
@@ -1465,7 +1541,7 @@ def calib_report(s):
     return '\n'.join(L) + '\n'
 
 
-KHUNG_COLS = ('clip', 'khung', 'moc', 'nhom', 'chuoi', 'ex', 'ey', 'x_doan', 'y_doan', 'ngoai_suy_m')
+KHUNG_COLS = ('clip', 'khung', 'moc', 'nhom', 'chuoi', 'ex', 'ey', 'x_doan', 'y_doan', 'ngoai_suy_m', 'chua_ket_luan')
 
 
 def track_cli_chains(a, sess, off, gates, gsrc):
@@ -1514,11 +1590,11 @@ def track_cli_chains(a, sess, off, gates, gsrc):
     else:
         save_dets(os.path.join(a.out, 'dets.npz'), frames, vsha, shape)
         dets_sha = sha256(os.path.join(a.out, 'dets.npz'))
-    cache = _load_cache(a.cache, a.run or vname or 'clip', sess_sha) if a.cache else None
+    cache = _load_cache(a.cache, a.run or vname or 'clip', sess_sha, dets_sha) if a.cache else None
     rows, khung, info = track_chains(frames, vname, vsha, sess, off, gates, gsrc, lich, a.run, u_so, u_sha, cache,
                                      shapes, a.thu or a.max_frames is not None)
     if a.cache:
-        _save_cache(a.cache, a.run or vname or 'clip', sess_sha, cache)
+        _save_cache(a.cache, a.run or vname or 'clip', sess_sha, cache, dets_sha)
     fp, kp = os.path.join(a.out, 'frames.csv'), os.path.join(a.out, 'kiem_cheo_khung.csv')
     write_frames(fp, rows)
     with open(kp, 'w', newline='', encoding='utf-8') as f:
@@ -1527,6 +1603,10 @@ def track_cli_chains(a, sess, off, gates, gsrc):
         for r in khung:
             if all(math.isfinite(r[k]) for k in ('ex', 'ey', 'x_doan', 'y_doan')):
                 w.writerow({k: (f'{r[k]:.9f}' if isinstance(r[k], float) else r[k]) for k in KHUNG_COLS})
+    inc = info['n_chua_ket_luan_xe_hop_le'] + info['n_hang_kiem_chua_ket_luan']
+    info['ket_luan'] = ('lan_dau (cham_lai 1, chua co lich)' if lich is None else
+                        'chua_ket_luan (nen_doi / bat_dinh_moc tren khung hop le hay hang kiem; Codex C33-1)' if inc else
+                        'thu (lich chua hoi tu)' if info['cham_lai'] != 2 else 'ket_luan')
     info.update(session=os.path.abspath(a.session), session_sha256=sess_sha, frames_sha256=sha256(fp),
                 kiem_cheo_khung_sha256=sha256(kp), dets_sha256=dets_sha, dets_file=os.path.abspath(a.dets) if a.dets
                 else os.path.abspath(os.path.join(a.out, 'dets.npz')),
@@ -1534,7 +1614,9 @@ def track_cli_chains(a, sess, off, gates, gsrc):
     with open(os.path.join(a.out, 'track.json'), 'w', encoding='utf-8') as f:
         json.dump(_json(info), f, ensure_ascii=False, indent=1)
     print(f'{info["frames"]} khung, {info["n_valid"]} hợp lệ, {info["n_khop_khong_tin"]} khớp không tin, '
-          f'{info["n_chua_ket_luan_xe"]} chưa kết luận (chuỗi xe); cham_lai {info["cham_lai"]}')
+          f'{info["n_chua_ket_luan_xe"]} chưa kết luận (chuỗi xe), {info["n_hang_kiem_chua_ket_luan"]} hàng kiểm chưa '
+          f'kết luận; cham_lai {info["cham_lai"]}; {info["ket_luan"]}')
+    return 3 if (lich is not None and inc) else 0
 
 
 def main(argv=None):
@@ -1670,9 +1752,9 @@ def main(argv=None):
                 dx, dy, dpsi = _pair(a.tag_offset, 3, '--tag-offset')
                 off = (dx, dy, math.radians(dpsi))
             if sess.get('kiem_cheo'):
-                track_cli_chains(a, sess, off, gates, gsrc)
-                print('#ket_qua,ma=0')
-                return 0
+                code = track_cli_chains(a, sess, off, gates, gsrc)
+                print(f'#ket_qua,ma={code}')               # 3: final pass with frames not concluded (Codex C33-1)
+                return code
             if a.video is None:
                 raise ValueError('--video needed (a session without kiem_cheo reads the video)')
             rows, info = track(a.video, sess, off, a.max_frames,

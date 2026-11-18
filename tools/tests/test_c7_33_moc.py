@@ -63,9 +63,27 @@ def sess():
     return make_session()
 
 
-def fake_u_so(chains, t=T, tr=TR):
+def fake_u_so(ctx, t=T, tr=TR, ha='S', tap=None):
+    """A u_so.json of the form c7_kiem_cheo writes (test numbers); tap: {chain: [[ids]]} whose comparator sets are
+    listed as computed (tap_tinh), else none."""
+    chains = ctx if isinstance(ctx, list) else ctx.chains
     ch = {c: dict(nguong_m=t, nguong_tho_m=tr, u_so_m=t - 0.001, u_so_tho_m=tr - 0.001, tap_tinh=[]) for c in chains}
-    return dict(version='c7_u_so_v4', chuoi=ch, chi_tiet=dict(co_tap_luot=True))
+    u = dict(version='c7_u_so_v4', model='B2', nhom=None if isinstance(ctx, list) else ctx.groups, chuoi=ch,
+             chi_tiet=dict(co_tap_luot=True), sessions=dict(H_a=dict(file='session.json', sha256=ha)))
+    if tap is not None:
+        gmap = ctx.gmap
+        for c, sets in tap.items():
+            done = set()
+            for S in sets:
+                for t_ in range(ctx.G):
+                    if c != 'xe' and t_ == int(c):
+                        continue
+                    ex = cm.comparator_excl(c, t_)
+                    fit = tuple(sorted(i for i in S if gmap[i] not in ex))
+                    if len(fit) >= cm.MIN_TRAIN and (t_, fit) not in done:
+                        done.add((t_, fit))
+                        ch[c]['tap_tinh'].append(dict(nhom_dich=t_, tap=list(fit)))
+    return u
 
 
 def run_frames(n, fps=30.0, t0=0.0, noise=0.02, seed=5, moved_at=None, car=None):
@@ -157,18 +175,17 @@ def test_ii_extreme_mark_of_group_k_does_not_touch_E_k(sess):
     ctx = cm.ChainCtx(sess)
     assert ctx.gmap[j] == 1
     frames = run_frames(90, moved_at=lambda k: {j: (0.02, 0.0)} if k >= 30 else {})
-    lich = cm.build_lich(sess, 'S', [('r1', 'luot', frames, 'D')], fake_u_so(ctx.chains), 'U')
+    lich = cm.build_lich(sess, 'S', [('r1', 'luot', frames, 'D')], fake_u_so(ctx), 'U')
     assert lich['chuoi']['1']['loai'] == {}                        # chain 1 never sees group 1
-    for c in ('xe', '0', '2', '3'):
+    # chain 0: the 20 mm anchor moved another mark's comparator by about 1.7 mm (two alarms): a base change, not
+    # concluded (Codex C33-9: the one-mark explanation is a hint only, the schedule is not changed)
+    assert lich['chuoi']['0']['loai'] == {} and lich['chuoi']['0']['nen_doi']
+    assert any(g['chuoi'] == '0' and g['moc'] == j and g['mot_moc_giai_thich'] for g in lich['giai_thich_nen_doi'])
+    for c in ('xe', '2', '3'):
         assert list(lich['chuoi'][c]['loai']) == [str(j)], c
         assert lich['chuoi'][c]['loai'][str(j)]['t_s'] <= 1.0 + 1e-9
         assert lich['chuoi'][c]['nen_doi'] == []
         assert not [m for m in lich['chuoi'][c]['moc_nghi'] if m[0] == j]     # excluded: never a moc_nghi after
-    # the 20 mm anchor moved another mark's comparator of chain 0 by about 1.7 mm (two alarms): explained by mark 6
-    assert [g for g in lich['giai_thich_nen_doi'] if g['chap_nhan']] == \
-        [dict(chuoi='0', moc=j, tu=g['tu'], dinh_m=g['dinh_m'], chap_nhan=True) for g in lich['giai_thich_nen_doi']
-         if g['chap_nhan']]
-    assert any(g['chuoi'] == '0' and g['moc'] == j and g['chap_nhan'] for g in lich['giai_thich_nen_doi'])
 
 
 # ---------------------------------------------------------------- pure rule: (iii) (iv) (vi) (xiii) (xiv) (xv)
@@ -196,8 +213,11 @@ def test_iv_short_shift_is_not_alarmed_and_is_within_the_raw_bound():
 
 def test_raw_spike_is_a_moc_nghi_only():
     t, d = series(lambda tt: [0.0025 if abs(tt - 1.0) < 1e-6 else 0.0, 0.0], 120)
-    s = md.schedule([clip_of(t, {7: d})], T, TR, [7])
-    assert s['loai'] == {} and s['moc_nghi'] == [[7, 0, 60]]
+    z = np.zeros_like(d)
+    s = md.schedule([clip_of(t, {7: d, 1: z, 2: z, 3: z, 4: z})], T, TR, [1, 2, 3, 4, 7])
+    assert s['loai'] == {} and s['nen_doi'] == [] and s['moc_nghi'] == [[7, 0, 60]]
+    s = md.schedule([clip_of(t, {7: d, 1: z, 2: z})], T, TR, [1, 2, 7])    # 1 of 3 >= 1/4: a base change (item 5)
+    assert s['moc_nghi'] == [[7, 0, 60]] and len(s['nen_doi']) == 1
 
 
 def test_vi_two_marks_at_once_is_a_base_change_not_an_exclusion():
@@ -300,14 +320,17 @@ def spike_run(sess):
 def test_vii_xvi_moc_nghi_changes_the_schedule_and_the_track(sess, spike_run):
     j, frames = spike_run
     ctx = cm.ChainCtx(sess)
-    u = fake_u_so(ctx.chains)
     runs = [('r1', 'luot', frames, 'D')]
     L0 = cm.build_lich(sess, 'S', runs)                            # step 1: no thresholds yet
     assert all(v == dict(loai={}, moc_nghi=[], nen_doi=[], bat_dinh_moc=[]) for v in L0['chuoi'].values())
-    L1 = cm.build_lich(sess, 'S', runs, u, 'U', L0)
+    L1 = cm.build_lich(sess, 'S', runs, fake_u_so(ctx, tap=L0['tap_moc']), 'U0', L0)
     assert not L1['hoi_tu']
     assert [j, 0, 40] in L1['chuoi']['xe']['moc_nghi'] and L1['chuoi']['xe']['loai'] == {}
+    u = fake_u_so(ctx, tap=L1['tap_moc'])                          # KIEMCHEO again on the new sets
     L2 = cm.build_lich(sess, 'S', runs, u, 'U', L1)
+    # C33-5: the same schedule with a u_so that lacks the sets is repeated but NOT final
+    L2b = cm.build_lich(sess, 'S', runs, fake_u_so(ctx, tap=L0['tap_moc']), 'U0', L1)
+    assert L2b['lap_lai'] and not L2b['hoi_tu'] and L2b['thieu_tap_u_so'] > 0
     assert L2['hoi_tu'] and L2['lich_sha256'] == L1['lich_sha256'] and len(L2['lap']) == 3
     r0, _, i0 = cm.track_chains(frames, 'r1.mov', 'V', sess, OFFSET, run='r1')
     r2, _, i2 = cm.track_chains(frames, 'r1.mov', 'V', sess, OFFSET, lich=L2, run='r1', u_so=u, u_so_sha='U')
@@ -322,7 +345,7 @@ def test_vii_xvi_moc_nghi_changes_the_schedule_and_the_track(sess, spike_run):
 def test_viii_a_cycle_is_not_converged(sess, spike_run):
     _, frames = spike_run
     ctx = cm.ChainCtx(sess)
-    u = fake_u_so(ctx.chains)
+    u = fake_u_so(ctx)
     runs = [('r1', 'luot', frames, 'D')]
     L0 = cm.build_lich(sess, 'S', runs)
     L1 = cm.build_lich(sess, 'S', runs, u, 'U', L0)
@@ -338,12 +361,12 @@ def test_lich_refuses_u_so_without_the_previous_sets(sess, spike_run):
     ctx = cm.ChainCtx(sess)
     runs = [('r1', 'luot', frames, 'D')]
     L0 = cm.build_lich(sess, 'S', runs)
-    u = fake_u_so(ctx.chains)
+    u = fake_u_so(ctx)
     u['chi_tiet']['co_tap_luot'] = False
     with pytest.raises(ValueError, match='tap-moc'):
         cm.build_lich(sess, 'S', runs, u, 'U', L0)
     with pytest.raises(ValueError, match='other session'):
-        cm.build_lich(sess, 'S2', runs, fake_u_so(ctx.chains), 'U', L0)
+        cm.build_lich(sess, 'S2', runs, fake_u_so(ctx), 'U', L0)
 
 
 # ---------------------------------------------------------------- (ix) fit flags
@@ -405,7 +428,7 @@ def test_xi_xvii_sensitivity_matches_a_refit_and_uses_the_wheel_centre(sess, off
 def test_final_track_writes_the_sensitivity(sess, spike_run):
     j, frames = spike_run
     ctx = cm.ChainCtx(sess)
-    u = fake_u_so(ctx.chains)
+    u = fake_u_so(ctx)
     runs = [('r1', 'luot', frames, 'D')]
     L1 = cm.build_lich(sess, 'S', runs, u, 'U', cm.build_lich(sess, 'S', runs))
     rows, khung, info = cm.track_chains(frames, 'r1.mov', 'V', sess, OFFSET, lich=L1, run='r1', u_so=u, u_so_sha='U')
@@ -422,6 +445,7 @@ def test_cli_track_lich_track(tmp_path, sess, spike_run, monkeypatch):
     _, frames = spike_run
     sp = tmp_path / 'session.json'
     sp.write_text(json.dumps(cm._json(sess)), encoding='utf-8')
+    ctx = cm.ChainCtx(sess)
     d1 = tmp_path / 'r1'
     d1.mkdir()
     cm.save_dets(str(d1 / 'dets.npz'), frames, 'V', (H, W))
@@ -433,9 +457,10 @@ def test_cli_track_lich_track(tmp_path, sess, spike_run, monkeypatch):
         {f'kc_{n}_{k}' for n in ('ok', 'n', 'err_max', 'ly_do') for k in range(4)}
     assert need <= set(fr[0])
     assert cm.main(['lich', '--session', str(sp), '--luot', f'r1={d1}', '--out', str(tmp_path / 'L0')]) == 0
-    u = fake_u_so(['xe', '0', '1', '2', '3'])
-    (tmp_path / 'u.json').write_text(json.dumps(u), encoding='utf-8')
     for a, b in (('L0', 'L1'), ('L1', 'L2')):
+        tap = json.loads((tmp_path / a / 'tap_moc.json').read_text(encoding='utf-8'))
+        u = fake_u_so(ctx, ha=cm.sha256(str(sp)), tap=tap)
+        (tmp_path / 'u.json').write_text(json.dumps(u), encoding='utf-8')
         assert cm.main(['lich', '--session', str(sp), '--luot', f'r1={d1}', '--u-so', str(tmp_path / 'u.json'),
                         '--truoc', str(tmp_path / a / 'lich.json'), '--out', str(tmp_path / b)]) == 0
     L2 = json.loads((tmp_path / 'L2' / 'lich.json').read_text(encoding='utf-8'))
