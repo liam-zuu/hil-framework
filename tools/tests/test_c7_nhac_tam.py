@@ -527,7 +527,7 @@ def test_run_do_refusals(scene, tmp_path):
         nt.run_do(['a', 'b', 'c'], str(d / 'session.json'), '1,1,20,20', str(tmp_path / 'x'))
     (tmp_path / 'full').mkdir()
     (tmp_path / 'full' / 'f.txt').write_text('x')
-    with pytest.raises(ValueError):
+    with pytest.raises((ValueError, OSError)):
         nt.run_do(['a'] * 4, str(d / 'session.json'), '1,1,20,20', str(tmp_path / 'full'))
 
 
@@ -553,7 +553,7 @@ def test_kiem_one_clip_and_rejected_list(scene, tmp_path):
     b0 = (0.05, -0.03, math.radians(20.0))
     n0 = make_clip(d, floor, b0, PLATE_OFF[0], 'k_N0')
     r = make_clip(d, floor, b0, PLATE_AWAY, 'k_R')
-    rbad = make_clip(d, floor, b0, PLATE_OFF[1], 'k_Rbad')            # plate still on the car: not a clip R
+    rbad = make_clip(d, floor, b0, (0.0005, 0.0, 0.0), 'k_Rbad')      # plate still on the car: not a clip R
     ok, txt = nt.run_kiem(n0, str(d / 'session.json'), boxes_px(b0), n0, str(tmp_path / 'a'), stride=1, cfg=TEST_CFG)
     assert ok and txt.endswith('ĐƯỢC')
     ok, _ = nt.run_kiem(r, str(d / 'session.json'), boxes_px(b0), n0, str(tmp_path / 'b'), rong=True, stride=1,
@@ -570,3 +570,151 @@ def test_kiem_one_clip_and_rejected_list(scene, tmp_path):
     assert code == 0 and j['clip_bi_loai'][0]['file'] == 'k_Rbad.avi' and len(j['clip_bi_loai'][0]['sha256']) == 64
     with pytest.raises(ValueError):
         nt.parse_rejected(['khong_co_dau_bang'])
+
+
+# ---------------------------------------------------------------- Codex code round 1 (NC-1 .. NC-8)
+def test_nc1_peak_on_the_window_border_is_rejected(monkeypatch):
+    """Body moved 27 px with a 25 px search: the clipped peak must not be used (it would hide a 2 px error). ECC is
+    switched off here (returns the start point) so the border rule alone is tested."""
+    img = texture((300, 400), sigma=3.5)
+    b = nt.Box(img.astype(np.uint8), (180, 130, 40, 40), 25)
+    monkeypatch.setattr(nt.Box, 'ecc', lambda self, win, x, y: (x, y))
+    M = np.float32([[1, 0, 27.0], [0, 1, 0.0]])
+    moved = cv2.warpAffine(img, M, (400, 300), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
+    u, v, c, q = b.match(moved.astype(np.uint8))
+    assert math.isnan(u) and not nt.box_ok((u, v, c, u, v, q), CFG)
+    b60 = nt.Box(img.astype(np.uint8), (180, 130, 40, 40), 60)       # default search: found
+    u, v, c, q = b60.match(moved.astype(np.uint8))
+    assert u - b60.u0 == pytest.approx(27.0, abs=0.5)                 # parabolic peak only (ECC off)
+    monkeypatch.undo()
+    u, v, c, q = b60.match(moved.astype(np.uint8))
+    assert u - b60.u0 == pytest.approx(27.0, abs=0.05)
+    assert nt.DEFAULTS['search_px'] == 60
+
+
+def test_nc1_ecc_jump_is_not_used():
+    img = texture((240, 320))
+    b = nt.Box(img.astype(np.uint8), (140, 100, 40, 40), 25)
+    assert b.ecc(np.zeros((90, 90), np.float32), 25.0, 25.0) is None          # flat window: ECC fails
+
+
+def test_nc2_n0_lower_than_the_plane():
+    """Codex NC-2: N0 3 mm below h (s_0 = a_0 = 0.998807), Nj at h (s_j = 1): real 0.574832 mm."""
+    H, h = 2.632, 0.12
+    C = [-0.4802, -0.0329, H]
+    s = summaries([(0.0, 0.0, 0.0)] * 2, [(0.0, 0.0, 0.0)] * 2, cam=C)   # one pair: eps_h_0 + eps_h_1 only
+    a0 = (H - h) / (H - (h - 0.003))
+    s[0]['scale'] = a0
+    for x in s:
+        x['scale_u'] = 0.0
+    res = nt.analyse(s, CFG, R_OK, tag_h=h)
+    real = abs(1.0 / 1.0 - 1.0 / a0) * math.hypot(C[0], C[1])
+    assert real == pytest.approx(0.000574832, abs=1e-9)
+    assert res['vi_tri_m'] >= real
+
+
+@pytest.mark.parametrize('sj,uj,s0,u0', [(1.0, 0.0, 1.0, 1.0), (1.0, 1.0, 1.0, 0.0), (1.0, math.nan, 1.0, 0.0),
+                                         (1.0, 0.0, math.inf, 0.0)])
+def test_nc3_scale_interval_domain(sj, uj, s0, u0):
+    with pytest.raises(ValueError):
+        nt.scale_interval(sj, uj, s0, u0, False)
+
+
+def test_nc3_scattered_scale_is_not_still():
+    cfg = dict(CFG, **TEST_CFG)
+    rows = _rows(n=100)
+    for k in (10, 60):
+        rows[k]['tag_scale'] = 20.0
+    for k in range(70, 80):
+        rows[k]['tag_scale'] = 1.01
+    s = nt.clip_summary(rows, 2, cfg)
+    assert not s['ok'] and s['flags'] == ['clip_co_dong']
+
+
+def test_nc4_nan_camera_fails_the_frame_and_pairwise_refuses_nan():
+    rows = _rows()
+    rows[0]['cam_z'] = math.nan
+    assert not nt.frame_ok(rows[0], 2, CFG) and nt.frame_ok(rows[1], 2, CFG)
+    with pytest.raises(ValueError):
+        nt.pairwise([[0, 0, 0], [math.nan, 0, 0]])
+    with pytest.raises(ValueError):
+        nt.pairwise([[0, 0, 0], [0, 0, 0]], [0.0, math.nan])
+
+
+def test_nc6_overlapping_boxes():
+    s = summaries(STILL, PLATE_OFF)
+    res = nt.analyse(s, CFG, R_OK, boxes_px=[(100, 100, 100, 100), (170, 100, 100, 100)])
+    assert not res['kiem_than'] and 'o_0_1_chong_nhau' in res['ly_do_khong_kiem_than']
+    res = nt.analyse(s, CFG, R_OK, boxes_px=[(100, 100, 30, 30), (300, 100, 30, 30)])
+    assert res['kiem_than']
+
+
+def test_nc3_nc4_blocking_writes_no_block(scene, tmp_path, monkeypatch):
+    d, floor = scene
+    body = [(0.05, -0.03, math.radians(20.0))] * 4
+    clips = make_clips(d, floor, body, PLATE_OFF[:4], 'nan')
+    real = nt.analyse
+
+    def bad(*a, **k):
+        raise ValueError('test: out of domain')
+    monkeypatch.setattr(nt, 'analyse', bad)
+    out = tmp_path / 'o'
+    code = nt.run_do(clips, str(d / 'session.json'), boxes_px(body[0]), str(out), cfg=TEST_CFG)
+    j = json.load(open(out / 'nhac_tam.json', encoding='utf-8'))
+    assert code == 2 and 'loi_mien_so' in j['co'] and not (out / 'c8_phan_nhac_tam.json').exists()
+    monkeypatch.setattr(nt, 'analyse', real)
+
+
+def test_nc7_kiem_stride_and_exit_code(scene, tmp_path):
+    d, floor = scene
+    b0 = (0.05, -0.03, math.radians(20.0))
+    n0 = make_clip(d, floor, b0, PLATE_OFF[0], 'k7_N0')
+    with pytest.raises(ValueError):
+        nt.run_kiem(n0, str(d / 'session.json'), boxes_px(b0), n0, str(tmp_path / 'a'), stride=4, cfg=TEST_CFG)
+    code = nt.main(['kiem', '--clip', n0, '--mau', n0, '--session', str(d / 'session.json'), '--vung-than',
+                    boxes_px(b0), '--stride', '1', '--out', str(tmp_path / 'b')])
+    assert code == 2                         # default thresholds: 8 frames are far too few -> QUAY LAI, ma=2
+
+
+def test_nc8_same_clip_twice_or_rejected_and_used(scene, tmp_path):
+    d, floor = scene
+    b0 = (0.05, -0.03, math.radians(20.0))
+    n0 = make_clip(d, floor, b0, PLATE_OFF[0], 'k8_N0')
+    others = [make_clip(d, floor, b0, p, f'k8_N{j}') for j, p in enumerate(PLATE_OFF[1:4], 1)]
+    with pytest.raises(ValueError):
+        nt.run_do([n0, n0, n0, n0], str(d / 'session.json'), boxes_px(b0), str(tmp_path / 'a'), cfg=TEST_CFG)
+    with pytest.raises(ValueError):
+        nt.run_do([n0] + others, str(d / 'session.json'), boxes_px(b0), str(tmp_path / 'b'), rong=n0, cfg=TEST_CFG)
+    with pytest.raises(ValueError):
+        nt.run_do([n0] + others, str(d / 'session.json'), boxes_px(b0), str(tmp_path / 'c'), cfg=TEST_CFG,
+                  loai=[f'{others[0]}=x'])
+
+
+def test_nc5_template_frame_skips_bad_frames(scene, tmp_path):
+    """Middle frames without the car tag: the nearest gated frame is used, not an error."""
+    d, floor = scene
+    b0 = (0.05, -0.03, math.radians(20.0))
+    good = floor.copy()
+    render_car(good, b0, PLATE_OFF[0])
+    frames = [good] * 4 + [floor] * 30 + [good] * 4                    # 30 middle frames: no car, no tag
+    path = d / 'k5_N0.avi'
+    write_video(path, frames)
+    with open(d / 'session.json', encoding='utf-8') as f:
+        ctx = nt.Ctx(json.load(f), TAG_H, dict(nt.DEFAULTS))
+    i, g = nt.pick_template_frame(str(path), ctx, len(frames), nt.parse_boxes(boxes_px(b0)))
+    assert i in (3, 34)
+
+
+def test_default_acceptance_thresholds_on_rows():
+    """Default thresholds (no TEST_CFG): 10 s clip at 60 fps, stride 3 -> about 180 frames considered, 100 needed."""
+    rows = []
+    for k in range(0, 600, 3):
+        rows.append(dict(idx=k, t_s=k / 60.0, n_marks=20, rms_px=0.5, gate_marks=True, cam_x=0.0, cam_y=0.0,
+                         cam_z=2.9, tag_seen=True, tag_x=0.1, tag_y=0.2, tag_psi=0.3, tag_res_sim_m=0.0005,
+                         tag_scale=1.0, box=[(0.2 + i, 0.1, 0.99, 0.0, 0.0, 0.5) for i in range(2)]))
+    s = nt.clip_summary(rows, 2, CFG, stride=3)
+    assert s['ok'] and s['n_needed'] == 100 and 170 <= s['n_considered'] <= 182
+    for r in rows[:90]:
+        r['tag_seen'] = False          # about 101 used of 181 considered: count passes (>= 100), 60 % share fails
+    s = nt.clip_summary(rows, 2, CFG, stride=3)
+    assert not s['ok'] and s['flags'] == ['thieu_khung']

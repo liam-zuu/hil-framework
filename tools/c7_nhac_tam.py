@@ -5,7 +5,7 @@ car tag position and heading RELATIVE TO THE CAR BODY over the placements of the
 two textured tape patches stuck on the body.
 
 Design: CLAUDE_THESIS 03_CODE/docs/2026-11-18_Thiet_ke_c7_nhac_tam_v4.md (CODE_NHACTAM local_f8bebd94, 18/11/2026;
-v2 after Codex Sol round 1, NT-1..NT-14; v3 after round 2, NT2-1..NT2-4; v4 after round 3, NT3-1..NT3-4). Measurement (design 0, 5): car still at O, control power off;
+v2 after Codex Sol round 1, NT-1..NT-14; v3 after round 2, NT2-1..NT2-4; v4 after round 3, NT3-1..NT3-4; v5 after Codex code round 1, NC-1..NC-9). Measurement (design 0, 5): car still at O, control power off;
 N0 = plate fitted on its pins, N1.. = lifted and put back, the last one after the calliper heights (B1); one clip of
 10 s per placement, nobody in the frame; clip R = plate lying on the floor >= 0.5 m from the car (5 s).
 
@@ -28,7 +28,7 @@ of |p'_j - p'_k| + eps_j + eps_k (eps_j = (|t_j| + |dC_xy,j| + |(R_j - I) C0|) d
         -> D/khung_N0.png (crop around the car, pixel grid, proposed boxes), D/khung_N0.json
   python tools/c7_nhac_tam.py kiem --clip X.MOV --mau N0.MOV [--rong] --session S/session.json \
         --vung-than "u,v,w,h;u,v,w,h" [--stride 3] --out D
-        -> one clip checked at the floor BEFORE the plate is lifted again (NT2-4): prints DUOC / QUAY LAI; ma=0 / 1
+        -> one clip checked at the floor BEFORE the plate is lifted again (NT2-4): prints DUOC / QUAY LAI; ma=0 / 2
   python tools/c7_nhac_tam.py do --clip N0.MOV N1.MOV N2.MOV N3.MOV N4.MOV --rong R.MOV --session S/session.json \
         --vung-than "u,v,w,h;u,v,w,h" [--h-than M] [--stride K<=3] [--loai FILE=REASON ...] --out D
         -> D/nhac_tam.json, D/frames_nhac_tam.csv, D/bao_cao.txt and, without a blocking error,
@@ -56,7 +56,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 import c7_measure as cm                                                  # noqa: E402
 
-VERSION = 'c7_nhac_tam_v4'
+VERSION = 'c7_nhac_tam_v5'
 MIN_PLACEMENTS = 4
 DEFAULTS = dict(
     trim_s=0.5,            # 2.2: dropped at both ends of a clip
@@ -79,7 +79,9 @@ DEFAULTS = dict(
     r_min_frames_abs=40,
     dh_m=0.03,             # 2.4: height bound of the boxes [uoc luong]
     scale_k=3.0,           # 2.4: scale interval = median +- k x standard error of the median (NT3-1)
-    search_px=25,          # 2.1: template search half-window
+    search_px=60,          # 2.1: template search half-window (about 9 cm); a peak on its border is rejected (NC-1)
+    still_scale_rel=0.003, # 2.2: 95th percentile of |scale / median - 1| (NC-3: a scattered scale is not a still clip)
+    a0_min=0.996,          # 2.4: lower bound of the true scale of N0, |height error| <= 1 cm [uoc luong] (NC-2)
 )
 THRESH_STATUS = 'DE XUAT (thiet ke c7_nhac_tam v4 muc 2)'
 NAN = float('nan')
@@ -142,25 +144,30 @@ class Box:
         win = gray[v - s:v + h + s, u - s:u + w + s].astype(np.float32)
         r = cv2.matchTemplate(win, self.tpl, cv2.TM_CCOEFF_NORMED)
         _, mx, _, loc = cv2.minMaxLoc(r)
+        if loc[0] in (0, r.shape[1] - 1) or loc[1] in (0, r.shape[0] - 1):
+            return NAN, NAN, NAN, 1.0             # NC-1: peak on the window border, the true one may lie outside
         r2 = r.copy()
         r2[max(0, loc[1] - 3):loc[1] + 4, max(0, loc[0] - 3):loc[0] + 4] = -1.0
         ratio = float(r2.max() / mx) if mx > 0 else 1.0
         x, y = subpix(r, *loc)
-        x, y = self.ecc(win, x, y)
+        e = self.ecc(win, x, y)
+        if e is None:
+            return NAN, NAN, NAN, 1.0             # NC-1: ECC failed or moved more than 1 px: no trusted sub-pixel peak
+        x, y = e
         return self.u0 + x - s, self.v0 + y - s, float(mx), ratio
 
     def ecc(self, win, x, y):
-        """Sub-pixel translation by ECC (cv2.findTransformECC) started at the correlation peak; the parabolic peak is
-        kept when ECC fails or moves more than 1 px from it."""
+        """Sub-pixel translation by ECC (cv2.findTransformECC) started at the correlation peak; None when ECC fails or
+        moves more than 1 px from it (NC-1: the match is then not used)."""
         warp = np.array([[1.0, 0.0, x], [0.0, 1.0, y]], np.float32)
         try:
             _, warp = cv2.findTransformECC(self.tpl, win, warp, cv2.MOTION_TRANSLATION,
                                            (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 100, 1e-5), None, 1)
         except cv2.error:
-            return x, y
+            return None
         ex, ey = float(warp[0, 2]), float(warp[1, 2])
         if not (math.isfinite(ex) and math.isfinite(ey)) or math.hypot(ex - x, ey - y) > 1.0:
-            return x, y
+            return None
         return ex, ey
 
 
@@ -244,13 +251,14 @@ def measure_frame(ctx, cam_prev, k, t, g, boxes):
 
 
 def box_ok(b, cfg):
-    """Box match gate (2.1): finite, correlation, unambiguous peak."""
-    return bool(all(math.isfinite(v) for v in b[:3]) and b[2] >= cfg['corr_min'] and b[5] < cfg['peak2_ratio'])
+    """Box match gate (2.1): finite (floor point, correlation, pixel), correlation, unambiguous peak."""
+    return bool(all(math.isfinite(v) for v in b[:6]) and b[2] >= cfg['corr_min'] and b[5] < cfg['peak2_ratio'])
 
 
 def frame_ok(r, n_boxes, cfg):
-    """Full frame gate of a placement clip (2.1)."""
-    vals = [r['tag_x'], r['tag_y'], r['tag_psi'], r['tag_res_sim_m'], r['tag_scale']]
+    """Full frame gate of a placement clip (2.1); every number used later must be finite (NC-4)."""
+    vals = [r['t_s'], r['cam_x'], r['cam_y'], r['cam_z'], r['tag_x'], r['tag_y'], r['tag_psi'], r['tag_res_sim_m'],
+            r['tag_scale']]
     return bool(r['gate_marks'] and r['tag_seen'] and len(r['box']) == n_boxes and all(math.isfinite(v) for v in vals)
                 and r['tag_res_sim_m'] <= cfg['tag_res_sim_m'] and all(box_ok(b, cfg) for b in r['box']))
 
@@ -266,20 +274,29 @@ def measure_clip(video, ctx, boxes, stride=1, max_frames=None):
     return rows
 
 
-def pick_template_frame(video, ctx, n, tries=12, step=15):
-    """Index and grey image of the gated frame of N0 nearest its middle (NT-9): middle, middle +- step, ..."""
+def pick_template_frame(video, ctx, n, boxes_px=None, batch=16):
+    """Index and grey image of the gated frame of N0 nearest its middle (NT-9, NC-5): frames in order of distance to
+    the middle, in batches of `batch` decoded frames, until one passes the mark and tag gates and gives a usable
+    template for every box."""
     mid = n // 2
-    order = [mid] + [mid + s * step * q for q in range(1, tries) for s in (-1, 1)]
-    order = [i for i in order if 0 <= i < n][:tries]
-    frames = frames_of(video, order)
-    for i in order:
-        g = frames.get(i)
-        if g is None:
-            continue
-        r, _ = measure_frame(ctx, ctx.cam0, i, 0.0, g, [])
-        if r['gate_marks'] and r['tag_seen'] and r['tag_res_sim_m'] <= ctx.cfg['tag_res_sim_m']:
+    order = sorted(range(n), key=lambda i: (abs(i - mid), i))
+    for b0 in range(0, len(order), batch):
+        part = order[b0:b0 + batch]
+        frames = frames_of(video, part)
+        for i in part:
+            g = frames.get(i)
+            if g is None:
+                continue
+            r, _ = measure_frame(ctx, ctx.cam0, i, 0.0, g, [])
+            if not (r['gate_marks'] and r['tag_seen'] and r['tag_res_sim_m'] <= ctx.cfg['tag_res_sim_m']):
+                continue
+            try:
+                for b in boxes_px or []:
+                    Box(g, b, ctx.cfg['search_px'])
+            except ValueError:
+                continue
             return i, g
-    raise ValueError(f'{video}: no gated frame near the middle for the box templates')
+    raise ValueError(f'{video}: no gated frame with usable box templates')
 
 
 # ---------------------------------------------------------------- per clip
@@ -311,13 +328,14 @@ def clip_summary(rows, n_boxes, cfg, stride=1):
     bdev = np.linalg.norm(bxy - bmed[None], axis=2)                   # (n, boxes)
     p95 = lambda a: float(np.percentile(a, 95))                        # noqa: E731
     box95 = [p95(bdev[:, i]) for i in range(n_boxes)]
+    sc = np.array([r['tag_scale'] for r in used])
+    sc95 = p95(np.abs(sc / np.median(sc) - 1.0))
     still = (p95(dpos) <= cfg['still_tag_m'] and p95(dang) <= cfg['still_tag_deg']
-             and all(v <= cfg['still_box_m'] for v in box95))
+             and all(v <= cfg['still_box_m'] for v in box95) and sc95 <= cfg['still_scale_rel'])
     if not still:
         out['flags'].append('clip_co_dong')
     cam = [float(np.median([r[c] for r in used])) for c in ('cam_x', 'cam_y', 'cam_z')]
-    sc = np.array([r['tag_scale'] for r in used])
-    out.update(ok=still, still=still, tag=[mx, my, mp], scale=float(np.median(sc)),
+    out.update(ok=still, still=still, tag=[mx, my, mp], scale=float(np.median(sc)), scale_p95_rel=sc95,
                scale_u=float(cfg['scale_k'] * 1.2533 * sc.std(ddof=1) / math.sqrt(len(sc))) if len(sc) > 1 else NAN,
                tag_p95_m=p95(dpos), tag_p95_deg=p95(dang),
                tag_max_m=float(dpos.max()), tag_max_deg=float(dang.max()), box=bmed.tolist(), box_p95_m=box95,
@@ -354,8 +372,9 @@ def scale_interval(sj, uj, s0, u0, same):
     Systematic edge bias between clips is NOT inside (limitation)."""
     if same:
         return 1.0, 1.0
-    uj = 0.0 if not math.isfinite(uj) else uj
-    u0 = 0.0 if not math.isfinite(u0) else u0
+    vals = (sj, uj, s0, u0)
+    if not all(math.isfinite(v) for v in vals) or uj < 0 or u0 < 0 or sj - uj <= 0 or s0 - u0 <= 0:
+        raise ValueError(f'thang ngoai mien: s_j {sj}, u_j {uj}, s_0 {s0}, u_0 {u0} (NC-3)')
     return (sj - uj) / (s0 + u0), (sj + uj) / (s0 - u0)
 
 
@@ -380,6 +399,8 @@ def to_body0(tag, motion):
 def pairwise(poses, eps=None):
     """Largest |p_j - p_k| + eps_j + eps_k (m) and |wrap(psi_j - psi_k)| (deg) over all pairs, with the pairs."""
     eps = eps or [0.0] * len(poses)
+    if not all(math.isfinite(v) for p in poses for v in p[:3]) or not all(math.isfinite(e) for e in eps):
+        raise ValueError('pairwise: non-finite pose or eps (NC-4)')
     best_p, best_a, pp, pa = 0.0, 0.0, None, None
     for j, k in itertools.combinations(range(len(poses)), 2):
         dp = math.hypot(poses[j][0] - poses[k][0], poses[j][1] - poses[k][1]) + eps[j] + eps[k]
@@ -391,7 +412,7 @@ def pairwise(poses, eps=None):
     return dict(vi_tri_m=best_p, cap_vi_tri=pp, goc_deg=best_a, cap_goc=pa)
 
 
-def analyse(summaries, cfg, rong=None, tag_h=0.12):
+def analyse(summaries, cfg, rong=None, tag_h=0.12, boxes_px=None):
     """Design 2.3, 2.4 on the placement summaries (all ok). rong: summary of clip R (None = no clip R)."""
     raw = [s['tag'] for s in summaries]
     nb = len(summaries[0]['box'])
@@ -402,6 +423,10 @@ def analyse(summaries, cfg, rong=None, tag_h=0.12):
         why.append('khong_co_clip_R')
     elif not rong['dat']:
         why.append('clip_R_khong_dat')
+    if boxes_px is not None:
+        for (i, a), (k, b) in itertools.combinations(enumerate(boxes_px), 2):
+            if a[0] < b[0] + b[2] and b[0] < a[0] + a[2] and a[1] < b[1] + b[3] and b[1] < a[1] + a[3]:
+                why.append(f'o_{i}_{k}_chong_nhau')                            # NC-6
     if nb >= 2:
         b0 = np.array(summaries[0]['box'])
         sep = min(float(np.hypot(*(b0[i] - b0[k]))) for i in range(nb) for k in range(i + 1, nb))
@@ -423,12 +448,16 @@ def analyse(summaries, cfg, rong=None, tag_h=0.12):
         dc = float(np.hypot(*(cj[:2] - c0)))                                   # x, y (NT3-3)
         dH = abs(float(cj[2]) - H)
         r_lo, r_hi = scale_interval(s.get('scale', 1.0), s.get('scale_u', 0.0), s0, u0, j == 0)
-        eh = max(abs(1.0 - 1.0 / r_lo), abs(1.0 - 1.0 / r_hi)) * float(np.hypot(*(np.array(s['tag'][:2]) - c0)))
-        eps_h.append(eh)                                                       # NT-7, NT3-1, NT3-2
+        arm = max(float(np.hypot(*(np.array(s['tag'][:2]) - cj[:2]))), float(np.hypot(*(np.array(summaries[0]['tag'][:2]) - c0))))
+        # NC-2: |1/a_j - 1/a_0| = |1 - 1/r| / a_0, a_0 the true scale of N0 (>= a0_min); arm from each clip's camera
+        eh = max(abs(1.0 - 1.0 / r_lo), abs(1.0 - 1.0 / r_hi)) / cfg['a0_min'] * arm
+        eps_h.append(eh)                                                       # NT-7, NT3-1, NT3-2, NC-2
         if nb >= 2:
             tj = float(np.hypot(*m[1]))
             rot_c = float(np.hypot(*((rot2(m[0]) - np.eye(2)) @ c0)))         # |(R - I) C0| (NT2-1)
             den = H - dH - tag_h                     # the lower camera height: first-order terms stay an upper bound
+            if not den > 0:
+                raise ValueError(f'H - |dH| - h = {den} <= 0 (NC-3)')
             e_H = cfg['dh_m'] * dH / den ** 2 * float(np.hypot(*(qbar0 - c0)))       # NT3-3
             eps.append((tj + dc + rot_c) * cfg['dh_m'] / den + e_H + eh)
         else:
@@ -555,7 +584,7 @@ def _setup(session_path, boxes_spec, n0_clip, h_than, cfg):
         session = json.load(f)
     ctx = Ctx(session, session['tag_h_m'] if h_than is None else h_than, cfg)
     boxes_px = parse_boxes(boxes_spec)
-    tidx, tframe = pick_template_frame(n0_clip, ctx, frame_count(n0_clip))
+    tidx, tframe = pick_template_frame(n0_clip, ctx, frame_count(n0_clip), boxes_px)
     return ctx, boxes_px, tidx, [Box(tframe, b, cfg['search_px']) for b in boxes_px]
 
 
@@ -586,6 +615,11 @@ def run_do(clips, session_path, boxes_spec, out_dir, rong=None, h_than=None, str
     if stride < 1:
         raise ValueError('stride >= 1')
     rejected = parse_rejected(loai)
+    shas = [cm.sha256(v) for v in clips] + ([cm.sha256(rong)] if rong is not None else [])
+    if len(set(shas)) != len(shas):
+        raise ValueError('the same clip is given twice (placements / R must be different recordings; NC-8)')
+    if {r['sha256'] for r in rejected} & set(shas):
+        raise ValueError('a rejected clip (--loai) is also used (NC-8)')
     cm._new_dir(out_dir)
     ctx, boxes_px, tidx, boxes = _setup(session_path, boxes_spec, clips[0], h_than, cfg)
     named_rows, clip_out = [], []
@@ -611,22 +645,33 @@ def run_do(clips, session_path, boxes_spec, out_dir, rong=None, h_than=None, str
                nguong=dict(cfg, trang_thai=THRESH_STATUS), clips=clip_out, rong=rong_out, clip_bi_loai=rejected,
                ket_qua=None)
     write_frames(os.path.join(out_dir, 'frames_nhac_tam.csv'), named_rows)
+    out.update(co=list(flags), ma=2)
+    blk = None
     if not all(c['tom_tat']['ok'] for c in clip_out):
-        out.update(co=flags, ket_luan='LỖI CHẶN: có clip hỏng (không ghi khối U)', ma=2)
+        out['ket_luan'] = 'LỖI CHẶN: có clip hỏng (không ghi khối U)'
     else:
-        res = analyse([c['tom_tat'] for c in clip_out], cfg, None if rong_out is None else rong_out['tom_tat'],
-                      ctx.tag_h)
-        out['ket_qua'] = res
-        out['co'] = flags + ([] if res['kiem_than'] else ['khong_kiem_than'])
-        if stride > cfg['max_stride']:                  # NT2-2: quick look only, no U block
-            out['co'].append('stride_xem_nhanh')
-            out.update(ma=2, ket_luan=f'XEM NHANH (stride {stride} > {cfg["max_stride"]}): không ghi khối U')
-        else:
-            out['ma'] = 0 if res['kiem_than'] else 1
-            out['ket_luan'] = 'đạt' if res['kiem_than'] else 'đạt có giới hạn (không kiểm được thân)'
+        try:                                     # NC-3, NC-4: out of the numeric domain -> blocking, no U block
+            res = analyse([c['tom_tat'] for c in clip_out], cfg, None if rong_out is None else rong_out['tom_tat'],
+                          ctx.tag_h, boxes_px)
+            out['ket_qua'] = res
+            out['co'] += [] if res['kiem_than'] else ['khong_kiem_than']
             blk = block(res, clip_out, rong_out, out['session'], out['session_sha256'], cfg)
-            with open(os.path.join(out_dir, 'c8_phan_nhac_tam.json'), 'w', encoding='utf-8') as f:
-                json.dump(_jsonable(blk), f, ensure_ascii=False, indent=1)
+            if not all(math.isfinite(float(blk[k])) and float(blk[k]) >= 0 for k in ('vi_tri_m', 'goc_deg')):
+                raise ValueError(f'U block not finite: {blk["vi_tri_m"]}, {blk["goc_deg"]}')
+        except ValueError as e:
+            blk = None
+            out['co'].append('loi_mien_so')
+            out['ket_luan'] = f'LỖI CHẶN: {e} (không ghi khối U)'
+        if blk is not None and stride > cfg['max_stride']:          # NT2-2: quick look only, no U block
+            blk = None
+            out['co'].append('stride_xem_nhanh')
+            out['ket_luan'] = f'XEM NHANH (stride {stride} > {cfg["max_stride"]}): không ghi khối U'
+        elif blk is not None:
+            out['ma'] = 0 if out['ket_qua']['kiem_than'] else 1
+            out['ket_luan'] = 'đạt' if out['ma'] == 0 else 'đạt có giới hạn (không kiểm được thân)'
+    if blk is not None:
+        with open(os.path.join(out_dir, 'c8_phan_nhac_tam.json'), 'w', encoding='utf-8') as f:
+            json.dump(_jsonable(blk), f, ensure_ascii=False, indent=1, allow_nan=False)
     with open(os.path.join(out_dir, 'nhac_tam.json'), 'w', encoding='utf-8') as f:
         json.dump(_jsonable(out), f, ensure_ascii=False, indent=1)
     with open(os.path.join(out_dir, 'bao_cao.txt'), 'w', encoding='utf-8') as f:
@@ -639,6 +684,8 @@ def run_kiem(clip, session_path, boxes_spec, n0_clip, out_dir, rong=False, h_tha
     gated frames, still. Clip R: the R conditions against N0 (n0_clip must already be checked). Returns (ok, text);
     writes kiem.json in out_dir. No U block."""
     cfg = dict(DEFAULTS, **(cfg or {}))
+    if not 1 <= stride <= cfg['max_stride']:
+        raise ValueError(f'kiem: stride must be 1..{cfg["max_stride"]} (NC-7)')
     cm._new_dir(out_dir)
     ctx, boxes_px, tidx, boxes = _setup(session_path, boxes_spec, n0_clip, h_than, cfg)
     rows = measure_clip(clip, ctx, boxes, stride)
@@ -693,9 +740,12 @@ def propose_boxes(gray, tag_c, tag_side_px, n=4, size=40, exclude=0.75, reach=3.
 
 
 def run_khung(clip, session_path, out_dir):
+    """Crop around the car on the SAME template frame that do / kiem use (NC-5)."""
     cm._new_dir(out_dir)
-    mid = frame_count(clip) // 2
-    g = frames_of(clip, [mid])[mid]
+    with open(session_path, encoding='utf-8') as f:
+        ses = json.load(f)
+    ctx = Ctx(ses, ses['tag_h_m'], dict(DEFAULTS))
+    mid, g = pick_template_frame(clip, ctx, frame_count(clip))
     d = cm.detect_refined(cm.make_detector(), g)
     if cm.CAR_ID not in d:
         raise ValueError(f'{clip}: car tag not seen in frame {mid}')
@@ -763,7 +813,7 @@ def main(argv=None):
                 raise ValueError('--stride >= 1')
             ok, txt = run_kiem(a.clip, a.session, a.vung_than, a.mau, a.out, a.rong, a.h_than, a.stride)
             print(txt)
-            code = 0 if ok else 1
+            code = 0 if ok else 2                  # NC-7: a failed clip is a blocking result (contract of section 3)
         else:
             code = run_do(a.clip, a.session, a.vung_than, a.out, a.rong, a.h_than, a.stride, loai=a.loai)
             with open(os.path.join(a.out, 'bao_cao.txt'), encoding='utf-8') as f:
