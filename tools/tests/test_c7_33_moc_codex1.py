@@ -144,8 +144,9 @@ def _converged(sess, frames):
 def test_c33_5b_final_pass_rechecks_the_schedule(sess, spike_run):
     _, frames = spike_run
     L, u = _converged(sess, frames)
-    assert cm.verify_final(L, u, 'U', sess, 'S') == []
-    _, _, info = cm.track_chains(frames, 'r1.mov', 'V', sess, lich=L, run='r1', u_so=u, u_so_sha='U', session_sha='S')
+    assert cm.verify_final(L, u, 'U', sess, 'S', 'r1', 'D') == []
+    _, _, info = cm.track_chains(frames, 'r1.mov', 'V', sess, lich=L, run='r1', u_so=u, u_so_sha='U', session_sha='S',
+                                 dets_sha='D')
     assert info['cham_lai'] == 2
     bad = []
     old = dict(L, version='c7_lich_v1')                             # a schedule of b684258
@@ -154,13 +155,13 @@ def test_c33_5b_final_pass_rechecks_the_schedule(sess, spike_run):
     bad.append(forged)
     u_less = fake_u_so(cm.ChainCtx(sess))                           # the sets of tap_moc not computed
     for lich, uu in [(b, u) for b in bad] + [(L, u_less)]:
-        assert cm.verify_final(lich, uu, 'U', sess, 'S')
+        assert cm.verify_final(lich, uu, 'U', sess, 'S', 'r1', 'D')
         _, _, info = cm.track_chains(frames, 'r1.mov', 'V', sess, lich=lich, run='r1', u_so=uu, u_so_sha='U',
                                      session_sha='S')
         assert info['cham_lai'] == 1 and info['lich_chua_duoc_nhan']
     edited = json.loads(json.dumps(L))                              # schedule body edited after the sha
     edited['chuoi']['xe']['moc_nghi'] = []
-    assert any('lich_sha256' in w for w in cm.verify_final(edited, u, 'U', sess, 'S'))
+    assert any('lich_sha256' in w for w in cm.verify_final(edited, u, 'U', sess, 'S', 'r1', 'D'))
 
 
 def test_c33_1_final_pass_reports_not_concluded(tmp_path, sess):
@@ -200,3 +201,28 @@ def test_c33_1_final_pass_reports_not_concluded(tmp_path, sess):
         rows = list(csv.DictReader(f))
     assert '1' in {r['chua_ket_luan'] for r in rows if r['chuoi'] == '2'}
     assert '0' in {r['chua_ket_luan'] for r in rows if r['chuoi'] == '2'}      # before the shift: concluded
+
+
+def test_c8bu4_r3_1_clip_order_is_part_of_the_schedule(sess, spike_run):
+    """C8B Codex C8BU4-R3-1: a schedule with the same body but the clips in another order (or another run / other
+    detections) is not accepted at the final pass."""
+    _, frames = spike_run
+    ctx = cm.ChainCtx(sess)
+    runs = [('r1', 'luot', frames, 'D'), ('r2', 'luot', [(k, 10.0 + t, d) for k, t, d in frames], 'D2')]
+    L = cm.build_lich(sess, 'S', runs)
+    for _ in range(5):
+        u = fake_u_so(ctx, tap=L['tap_moc'])
+        L = cm.build_lich(sess, 'S', runs, u, 'U', L)
+        if L['hoi_tu']:
+            break
+    assert L['hoi_tu'] and cm.verify_final(L, u, 'U', sess, 'S', 'r1', 'D') == []
+    assert cm.verify_final(L, u, 'U', sess, 'S', 'r2', 'D2') == []
+    swapped = json.loads(json.dumps(L))
+    swapped['clips'] = swapped['clips'][::-1]                      # same body, other clip order
+    assert any('lich_sha256' in w for w in cm.verify_final(swapped, u, 'U', sess, 'S', 'r1', 'D'))
+    assert cm.verify_final(L, u, 'U', sess, 'S', 'r1', 'D2')       # r1 with the detections of r2
+    assert cm.verify_final(L, u, 'U', sess, 'S', 'r3', 'D')        # not a clip of the schedule
+    assert cm.verify_final(L, u, 'U', sess, 'S', None, None)
+    _, _, info = cm.track_chains(frames, 'r1.mov', 'V', sess, lich=L, run='r1', u_so=u, u_so_sha='U', session_sha='S',
+                                 dets_sha='D2')
+    assert info['cham_lai'] == 1 and info['lich_chua_duoc_nhan']

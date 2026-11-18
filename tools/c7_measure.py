@@ -1069,7 +1069,7 @@ def _ids_cell(ids):
 
 
 def track_chains(frames, video_name, video_sha, session, tag_offset=None, gates=None, gates_src=None, lich=None,
-                 run=None, u_so=None, u_so_sha=None, cache=None, shapes=None, thu=False, session_sha=None):
+                 run=None, u_so=None, u_so_sha=None, cache=None, shapes=None, thu=False, session_sha=None, dets_sha=None):
     """track for a session with a 'kiem_cheo' block (design 33 marks v3 + v4). frames: [(idx, t_s, detections)] of the
     clip (detect_video or load_dets). Every pose is refitted from a clip-H camera (stateless, T33-8) with the trust flags;
     the main fit (chain xe) leaves out the marks the schedule excludes at that frame (lich: the converged schedule of the
@@ -1079,7 +1079,7 @@ def track_chains(frames, video_name, video_sha, session, tag_offset=None, gates=
     ctx = ChainCtx(session)
     marks = ctx.marks
     ref = {int(i): np.array(v) for i, v in session['ref_centres_px'].items()}
-    final_why = verify_final(lich, u_so, u_so_sha, session, session_sha) if lich is not None else ['no schedule']
+    final_why = verify_final(lich, u_so, u_so_sha, session, session_sha, run, dets_sha) if lich is not None         else ['no schedule']
     side, kappa, plumb = session['car_side_m'], session['kappa'], session['plumb_xy_m']
     off = tag_offset if tag_offset is not None else session['tag_offset']
     sched, q = None, None
@@ -1284,7 +1284,7 @@ def build_lich(session, session_sha, runs, u_so=None, u_so_sha=None, prev=None, 
                 tap[c].add(tuple(sorted(i for i in seen if i in ctx.universe[c] and i not in ex)))
     tap_json = {c: sorted([list(S) for S in tap[c] if S], key=lambda s: (len(s), s)) for c in ctx.chains}
     tap_sha = md.schedule_sha256(tap_json)
-    body = dict(chuoi=new, nguong_dung=nguong, tap_moc_sha256=tap_sha)
+    body = dict(chuoi=new, nguong_dung=nguong, tap_moc_sha256=tap_sha, clips=clips)   # v3: the clip order is hashed
     sha = md.schedule_sha256(body)
     lap = list((prev or {}).get('lap', [])) + [dict(lich_sha256=sha, loai={c: sorted(new[c]['loai']) for c in ctx.chains},
                                                     n_moc_nghi={c: len(new[c]['moc_nghi']) for c in ctx.chains},
@@ -1312,14 +1312,17 @@ def build_lich(session, session_sha, runs, u_so=None, u_so_sha=None, prev=None, 
                           version=md.SCHEDULE_VERSION))
 
 
-LICH_VERSION = 'c7_lich_v2'                  # v2 (Codex C33-5b): converged = repeated AND every comparator set computed
+LICH_VERSION = 'c7_lich_v3'                  # v2 (Codex C33-5b): converged = repeated AND every comparator set computed;
+                                             # v3 (Codex C8BU4-R3-1 of C8B): lich_sha256 hashes the clips (names, kinds,
+                                             # dets sha, order), the final pass checks its run and detections
 
 
-def verify_final(lich, u_so, u_so_sha, session, session_sha):
+def verify_final(lich, u_so, u_so_sha, session, session_sha, run=None, dets_sha=None):
     """Reasons ([] = none) why lich.json cannot be the converged schedule of a final pass (Codex C33-5b: the final
     pass re-checks, it does not trust the file's hoi_tu): version, session and u_so sha, u_so source (check_u_so_source),
     the thresholds used are those of u_so, the stored sha of tap_moc and of the schedule body recomputed, the schedule
-    repeated the previous step, and u_so computed every comparator set of tap_moc."""
+    repeated the previous step, and u_so computed every comparator set of tap_moc; run and dets_sha (the final pass's
+    clip) name a clip of lich['clips'] with those detections (v3: the clip list is inside lich_sha256)."""
     why = []
     if lich.get('version') != LICH_VERSION:
         return [f"version {lich.get('version')!r} is not {LICH_VERSION} (rebuild the schedule)"]
@@ -1337,7 +1340,12 @@ def verify_final(lich, u_so, u_so_sha, session, session_sha):
     tap = lich.get('tap_moc') or {}
     if md.schedule_sha256(tap) != lich.get('tap_moc_sha256'):
         why.append('tap_moc does not match its sha')
-    body = dict(chuoi=lich.get('chuoi'), nguong_dung=lich.get('nguong_dung'), tap_moc_sha256=lich.get('tap_moc_sha256'))
+    clips = lich.get('clips') or []
+    names = [c.get('name') for c in clips]
+    if run is None or dets_sha is None or run not in names or clips[names.index(run)].get('dets_sha256') != dets_sha:
+        why.append(f'run {run!r} with detections {dets_sha!r} is not a clip of the schedule')
+    body = dict(chuoi=lich.get('chuoi'), nguong_dung=lich.get('nguong_dung'), tap_moc_sha256=lich.get('tap_moc_sha256'),
+                clips=clips)
     if md.schedule_sha256(body) != lich.get('lich_sha256'):
         why.append('schedule body does not match lich_sha256')
     lap = lich.get('lap') or []
@@ -1610,7 +1618,7 @@ def track_cli_chains(a, sess, off, gates, gsrc):
         if lich is not None and lich.get('u_so_sha256') != u_sha:
             raise ValueError('u_so.json is not the one the schedule was built with (sha256)')
         if lich is not None and not a.thu:
-            why = verify_final(lich, u_so, u_sha, sess, sess_sha)
+            why = verify_final(lich, u_so, u_sha, sess, sess_sha, a.run, sha256(a.dets))
             if why:
                 raise ValueError(f'lich.json is not a converged final schedule: {why} (run the lich steps on, or --thu)')
     shapes = None
@@ -1640,7 +1648,7 @@ def track_cli_chains(a, sess, off, gates, gsrc):
         dets_sha = sha256(os.path.join(a.out, 'dets.npz'))
     cache = _load_cache(a.cache, a.run or vname or 'clip', sess_sha, dets_sha) if a.cache else None
     rows, khung, info = track_chains(frames, vname, vsha, sess, off, gates, gsrc, lich, a.run, u_so, u_sha, cache,
-                                     shapes, a.thu or a.max_frames is not None, session_sha=sess_sha)
+                                     shapes, a.thu or a.max_frames is not None, session_sha=sess_sha, dets_sha=dets_sha)
     if a.cache:
         _save_cache(a.cache, a.run or vname or 'clip', sess_sha, cache, dets_sha)
     fp, kp = os.path.join(a.out, 'frames.csv'), os.path.join(a.out, 'kiem_cheo_khung.csv')
@@ -1658,7 +1666,8 @@ def track_cli_chains(a, sess, off, gates, gsrc):
     info.update(session=os.path.abspath(a.session), session_sha256=sess_sha, frames_sha256=sha256(fp),
                 kiem_cheo_khung_sha256=sha256(kp), dets_sha256=dets_sha, dets_file=os.path.abspath(a.dets) if a.dets
                 else os.path.abspath(os.path.join(a.out, 'dets.npz')),
-                lich_file=os.path.abspath(a.lich) if a.lich else None)
+                lich_file=os.path.abspath(a.lich) if a.lich else None,
+                lich_file_sha256=sha256(a.lich) if a.lich else None)   # C8B C8BU4-R3-1: c8b_u khoa binds the file
     with open(os.path.join(a.out, 'track.json'), 'w', encoding='utf-8') as f:
         json.dump(_json(info), f, ensure_ascii=False, indent=1)
     print(f'{info["frames"]} khung, {info["n_valid"]} hợp lệ, {info["n_khop_khong_tin"]} khớp không tin, '

@@ -334,7 +334,7 @@ def test_vii_xvi_moc_nghi_changes_the_schedule_and_the_track(sess, spike_run):
     assert L2['hoi_tu'] and L2['lich_sha256'] == L1['lich_sha256'] and len(L2['lap']) == 3
     r0, _, i0 = cm.track_chains(frames, 'r1.mov', 'V', sess, OFFSET, run='r1')
     r2, _, i2 = cm.track_chains(frames, 'r1.mov', 'V', sess, OFFSET, lich=L2, run='r1', u_so=u, u_so_sha='U',
-                                session_sha='S')
+                                session_sha='S', dets_sha='D')
     assert i0['cham_lai'] == 1 and i2['cham_lai'] == 2 and i2['lich_sha256'] == L2['lich_sha256']
     assert str(j) not in r2[40]['moc_dung'].split(';') and str(j) in r0[40]['moc_dung'].split(';')
     for k in range(40):                                            # before the first change: the same poses
@@ -474,6 +474,7 @@ def test_cli_track_lich_track(tmp_path, sess, spike_run, monkeypatch):
     assert cm.main(args + ['--lich', str(tmp_path / 'L2' / 'lich.json'), '--out', str(tmp_path / 't2')]) == 0
     tr2 = json.loads((tmp_path / 't2' / 'track.json').read_text(encoding='utf-8'))
     assert tr2['cham_lai'] == 2 and tr2['u_so_sha256'] == cm.sha256(str(tmp_path / 'u.json'))
+    assert tr2['lich_file_sha256'] == cm.sha256(str(tmp_path / 'L2' / 'lich.json')) and tr['lich_file_sha256'] is None
     assert tr2['frames_sha256'] == cm.sha256(str(tmp_path / 't2' / 'frames.csv'))
     assert tr2['kiem_cheo_khung_sha256'] == cm.sha256(str(tmp_path / 't2' / 'kiem_cheo_khung.csv'))
     # regate keeps the 33-mark columns and the khop gate
