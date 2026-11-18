@@ -863,7 +863,8 @@ def _expect(cam=CAM, tk=TK, xo=XO):
     m = {k: (a + b) / 2 for k, (a, b) in tk['canh'].items()}
     ogx = (tk['tam_tam_mm'][0] + (m['sau'] - m['truoc']) / 2) * 1e-3
     ogy = (tk['tam_tam_mm'][1] + (m['phai'] - m['trai']) / 2) * 1e-3
-    u_g = (tk['tam_tam_dung_sai_mm'] + tk['e_mm']) * 1e-3 + math.hypot(ogx, ogy) * math.radians(tk['tam_than_deg'])
+    rx, ry = (m['sau'] - m['truoc']) / 2 * 1e-3, (m['phai'] - m['trai']) / 2 * 1e-3
+    u_g = (tk['tam_tam_dung_sai_mm'] + math.sqrt(2) * tk['e_mm']) * 1e-3 + math.hypot(rx, ry) * math.radians(tk['tam_than_deg'])
     p2 = math.hypot(dx - ogx, dy - ogy) + u_g + math.hypot(dx, dy) * math.radians(sum(a.values()))
     p = dict(P1_anh_san=0.002 + 0.001 + 2 * 0.0004, P2_lech_tam=p2, P3_nhac_tam=0.0008, P4_quay=0.0007, P5_day_doi_zc=dd,
              P6_do_cao=cao, P7_nhieu_khung=0.0006)
@@ -1001,7 +1002,7 @@ def test_khoa_offset_used_by_the_scorer():
     assert k['U_psi_phan_deg']['A1_goc_dan'] == pytest.approx(a1)
     assert k['U_p_phan_m'] == pytest.approx(_expect(cam=cam)[0])
     sumA = sum(k['U_psi_phan_deg'].values())
-    u_g = 0.0006 + 0.0005 * math.radians(0.05)
+    u_g = 0.0005 + math.sqrt(2) * 0.0001                          # r = 0 in TK: no plate-angle term (R4-1)
     assert k['U_p_phan_m']['P2_lech_tam'] == pytest.approx(u_g + 0.0005 * math.radians(sumA))
     assert k['thuoc_kep']['o_hinh_hoc_m'] == pytest.approx([0.0004, -0.0003])
     cam['bo_cham']['tag_offset'][2] = -g                       # opposite sign: the mismatch 2 g is counted
@@ -1030,44 +1031,67 @@ def test_turning_cross_check_refuses_a_disagreement():
     KH(xo=dict(XO, q_tag_m=[0.0012, -0.0003]))                # within u_g + du + ...: passes
 
 
+def _geo_case(tc, r_meas, tol, tt_deg, e_mm=0.1):
+    """Caliper file whose geometry gives o_g = tc + r_meas (mm, body / plate frame), all edges parallel."""
+    tk = _cp(TK)
+    rx, ry = r_meas
+    tk['canh'] = dict(truoc=[50.0 - rx, 50.0 - rx], sau=[50.0 + rx, 50.0 + rx],
+                      trai=[50.0 - ry, 50.0 - ry], phai=[50.0 + ry, 50.0 + ry])
+    tk.update(tam_tam_mm=list(tc), tam_tam_dung_sai_mm=tol, tam_than_deg=tt_deg, e_mm=e_mm)
+    return tk
+
+
 def test_offset_part_bounds_car_pose():
-    # C8BU-R1-3, R3-2: P2 bounds the body-centre error of c7_measure.car_pose when the true offset is within u_g of the
-    # geometric one and the heading error within sum A
+    # C8BU-R1-3, R3-2, R4-1, R4-2: P2 bounds the body-centre error of c7_measure.car_pose for a true offset built from
+    # real geometry: the drawing centre within its tolerance, the plate turned by up to the plate-body angle, each
+    # caliper coordinate off by up to e, and the heading error within sum A
     import c7_measure as CM
     rng = np.random.default_rng(5)
     side = 0.1445
     worst = 0.0
-    for _ in range(300):
-        o_g = rng.uniform(-0.03, 0.03, 2)
-        tk = _cp(TK)
-        tk['canh'] = dict(truoc=[10.0, 10.0], sau=[10.0, 10.0], phai=[10.0, 10.0], trai=[10.0, 10.0])
-        tk['tam_tam_mm'] = list(o_g * 1e3)
-        tk['tam_tam_dung_sai_mm'] = rng.uniform(0, 1.0)
+    cases = [((40.0, 0.0), (-40.0, 0.0), 0.1, 1.0)]                   # Codex R4-1: o_g = 0, plate turned 1 deg
+    cases += [(tuple(rng.uniform(-30, 30, 2)), tuple(rng.uniform(-30, 30, 2)), rng.uniform(0.05, 1.0),
+               rng.uniform(0.05, 1.0)) for _ in range(300)]
+    for tc, r_meas, tol, tt in cases:
+        tk = _geo_case(tc, r_meas, tol, tt)
+        o_g = (np.array(tc) + np.array(r_meas)) * 1e-3
         dpsi_u = rng.uniform(-0.02, 0.02)
-        o_u = o_g + rng.uniform(-0.002, 0.002, 2)                 # the scorer may use another offset
+        o_u = o_g + rng.uniform(-0.002, 0.002, 2)
         cam = _cp(CAM)
         cam['bo_cham']['tag_offset'] = [float(o_u[0]), float(o_u[1]), dpsi_u]
         cam['bo_cham']['side_m'] = side
         xo = dict(XO, q_tag_m=list(o_g), du_m=0.0007)
         _, pp, _, aa = CU.u_p_u_psi(cam, TBD, tk, xo)
-        u_g = (tk['tam_tam_dung_sai_mm'] + tk['e_mm']) * 1e-3 + math.hypot(*o_g) * math.radians(tk['tam_than_deg'])
         sumA = math.radians(sum(aa.values()))
-        r = rng.uniform(0, u_g)
-        ang = rng.uniform(0, 2 * math.pi)
-        o_t = o_g + r * np.array([math.cos(ang), math.sin(ang)])
-        err = rng.choice([-1, 1]) * rng.uniform(0, sumA)       # body heading error seen by the scorer
-        B = rng.uniform(-1.5, 1.5, 2)
-        psi_b = rng.uniform(-math.pi, math.pi)
-        cb, sb = math.cos(psi_b), math.sin(psi_b)
-        T = B + np.array([cb * o_t[0] - sb * o_t[1], sb * o_t[0] + cb * o_t[1]])
-        psi_tag_seen = psi_b + dpsi_u + err                    # car_pose: body heading = tag heading - dpsi_u
-        ct, st = math.cos(psi_tag_seen), math.sin(psi_tag_seen)
-        corners = T + CM.car_corners_body(side) @ np.array([[ct, st], [-st, ct]])
-        res = CM.car_pose(_FloorCam0(), corners, side, 0.0, (0.0, 0.0), tag_offset=(o_u[0], o_u[1], dpsi_u))
-        e_b = math.hypot(res['x'] - B[0], res['y'] - B[1])
-        assert e_b <= pp['P2_lech_tam'] * (1 + 1e-9) + 1e-12
-        worst = max(worst, e_b / pp['P2_lech_tam'])
+        for sgn in (1, -1):
+            ang = rng.uniform(0, 2 * math.pi)
+            tc_t = np.array(tc) * 1e-3 + rng.uniform(0, tol * 1e-3) * np.array([math.cos(ang), math.sin(ang)])
+            r_t = np.array(r_meas) * 1e-3 + rng.choice([-1, 1], 2) * 0.1e-3          # each coordinate off by e
+            d = sgn * math.radians(tt)
+            o_t = tc_t + np.array([math.cos(d) * r_t[0] - math.sin(d) * r_t[1],
+                                   math.sin(d) * r_t[0] + math.cos(d) * r_t[1]])
+            err = rng.choice([-1, 1]) * rng.uniform(0, sumA)
+            B = rng.uniform(-1.5, 1.5, 2)
+            psi_b = rng.uniform(-math.pi, math.pi)
+            cb, sb = math.cos(psi_b), math.sin(psi_b)
+            T = B + np.array([cb * o_t[0] - sb * o_t[1], sb * o_t[0] + cb * o_t[1]])
+            psi_tag_seen = psi_b + dpsi_u + err                # car_pose: body heading = tag heading - dpsi_u
+            ct, st = math.cos(psi_tag_seen), math.sin(psi_tag_seen)
+            corners = T + CM.car_corners_body(side) @ np.array([[ct, st], [-st, ct]])
+            res = CM.car_pose(_FloorCam0(), corners, side, 0.0, (0.0, 0.0), tag_offset=(o_u[0], o_u[1], dpsi_u))
+            e_b = math.hypot(res['x'] - B[0], res['y'] - B[1])
+            assert e_b <= pp['P2_lech_tam'] * (1 + 1e-9) + 1e-12, (tc, r_meas, tol, tt)
+            worst = max(worst, e_b / pp['P2_lech_tam'])
     assert worst > 0.3
+
+
+def test_cross_check_strength_recorded():
+    # C8BU-R4-3: the lock says whether the turning cross-check could see a 2 mm slip (room < 2 mm)
+    k = KH()
+    assert k['kiem_xoay']['room_m'] > k['kiem_xoay']['gap_m']
+    assert k['kiem_xoay']['bat_duoc_lech_2mm'] is True
+    loose = dict(_cp(TK), tam_tam_dung_sai_mm=1.5)
+    assert KH(tk=loose)['kiem_xoay']['bat_duoc_lech_2mm'] is False
 
 
 def test_khoa_turning_input():

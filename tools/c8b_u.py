@@ -24,8 +24,10 @@ khoa (after the C8 clips are tracked and the C8 runs have their clock files):
                         true shift of a mark left in the fit, nguong + 2 u_so (dropped when the observed shift
                         exceeds nguong + u_so; the comparison error u_so may hide as much again)          [camera file]
     P2 tag-body centre  |o_u - o_g| + u_g + |o_u| (A1 + ... + A6)  [rad; o_u = (dx, dy) of the scorer's tag_offset;
-                        o_g = drawing (plate centre - wheel centre) + tag centre on the plate by caliper, u_g = drawing
-                        tolerance + e + |o_g| x plate-body angle; last term: the heading error turns the correction
+                        o_g = drawing (plate centre - wheel centre) + r (tag centre on the plate by caliper), u_g =
+                        drawing tolerance (Euclidean) + sqrt 2 e + |r| x plate-body angle (C8BU-R4-1, R4-2); the lock
+                        records the cross-check gap, room and whether it can see a 2 mm slip (R4-3); last term: the
+                        heading error turns the correction
                         vector, C8BU-R1-3]. Geometry, not turning in place (C8BU-R3-2, Liam 18/11 at CODE_C8B "Lay
                         tam tu hinh hoc (Recommended)"): turning in place (c8b_xoay.py) is a cross-check; its offset
                         R(theta) q must lie within u_g + du + (|q| + du) A1 of o_g, else refused ('xem lai')  [caliper]
@@ -231,9 +233,10 @@ def _caliper(tk):
     tol = _num(tk.get('tam_tam_dung_sai_mm'), 'caliper tam_tam_dung_sai_mm') * 1e-3
     if not str(tk.get('ban_ve_nguon') or '').strip():
         raise UError('caliper ban_ve_nguon: where tam_tam_mm, tam_tam_dung_sai_mm, tam_than_deg come from (drawing)')
-    o_g = (tcx + (tb_canh['sau'] - tb_canh['truoc']) / 2, tcy + (tb_canh['phai'] - tb_canh['trai']) / 2)
+    r = ((tb_canh['sau'] - tb_canh['truoc']) / 2, (tb_canh['phai'] - tb_canh['trai']) / 2)   # plate frame
+    o_g = (tcx + r[0], tcy + r[1])
     return dict(c=c, e=e, s=s, theta=theta, tam_than=tt, goc_canh={k: math.degrees(v) for k, v in goc.items()},
-                xap_xi=xap_xi, o_g=o_g, tol=tol)
+                xap_xi=xap_xi, o_g=o_g, r=r, tol=tol)
 
 
 CAM_NUMS = ('P1.bo_nhom_max_m', 'P1.tung_khung_max_m', 'moc_dich.nguong_m', 'moc_dich.u_so_m', 'P3.vi_tri_max_m',
@@ -266,7 +269,7 @@ def check_cam(cam):
                      f'scoring)')
 
 
-def u_p_u_psi(cam, tb, tk, xo):
+def u_p_u_psi(cam, tb, tk, xo, info=None):
     """U_p (m), U_psi (deg) with their parts P1-P7, A1-A6 (page v10 section 2; design v2)."""
     check_cam(cam)
     if not isinstance(xo, dict) or xo.get('version') != XOAY_VERSION:
@@ -320,7 +323,9 @@ def u_p_u_psi(cam, tb, tk, xo):
     # error turns the correction vector). Turning in place is only a cross-check: it cannot tell a slip about an
     # off-centre point from another offset (page v10 P2, C8BU-R3-2)
     ogx, ogy = K['o_g']
-    u_g = K['tol'] + e + math.hypot(ogx, ogy) * math.radians(tam_than)
+    # C8BU-R4-1: only the tag-on-plate vector r turns with the plate (the drawing offset is in the body frame);
+    # C8BU-R4-2: each coordinate of r is off by <= e, so the vector by <= sqrt 2 e; tol is a Euclidean bound
+    u_g = K['tol'] + math.sqrt(2) * e + math.hypot(*K['r']) * math.radians(tam_than)
     lech = math.hypot(dx - ogx, dy - ogy) + u_g + math.hypot(dx, dy) * math.radians(sum(s.values()))
     q = xo.get('q_tag_m')
     if not isinstance(q, list) or len(q) != 2:
@@ -331,6 +336,8 @@ def u_p_u_psi(cam, tb, tk, xo):
     o_s = (ct * qx - st * qy, st * qx + ct * qy)
     gap = math.hypot(o_s[0] - ogx, o_s[1] - ogy)
     room = u_g + du + (math.hypot(qx, qy) + du) * math.radians(a1)
+    if info is not None:                                    # C8BU-R4-3: how strong the cross-check is
+        info.update(gap_m=gap, room_m=room, bat_duoc_lech_2mm=room < 0.002)
     if gap > room:
         raise UError(f'turning in place gives the tag-body offset ({o_s[0] * 1e3:.2f}, {o_s[1] * 1e3:.2f}) mm, the '
                      f'drawing and caliper ({ogx * 1e3:.2f}, {ogy * 1e3:.2f}) mm: {gap * 1e3:.2f} mm apart, more than '
@@ -365,7 +372,8 @@ def khoa(gios, tb, cam, tk, xo, u_imu=None, phep5=None, tb_name='', tb_sha=''):
         d['runs'].append(rid)
     if not rates:
         raise UError('no C8 run with a drift rate (every run short or not ok)')
-    U_p, p_parts, U_psi, s_parts = u_p_u_psi(cam, tb, tk, xo)
+    kx = {}
+    U_p, p_parts, U_psi, s_parts = u_p_u_psi(cam, tb, tk, xo, kx)
     Kc = _caliper(tk)
     goc_canh, theta = Kc['goc_canh'], Kc['theta']
     sh = (tb.get('B') or {}).get('shutter') or {}
@@ -379,7 +387,8 @@ def khoa(gios, tb, cam, tk, xo, u_imu=None, phep5=None, tb_name='', tb_sha=''):
                dai=dai, man_trap=man_trap, man_trap_kieu='alpha' if man_trap else 'mot_khung',
                mot_khung_s=sh.get('mot_khung_s'), U_p_m=U_p, U_p_phan_m=p_parts, U_psi_deg=U_psi,
                U_psi_phan_deg=s_parts, thuoc_kep=dict(goc_canh_deg=goc_canh, goc_kabsch_deg=math.degrees(theta),
-                                                      o_hinh_hoc_m=list(Kc['o_g'])))
+                                                      o_hinh_hoc_m=list(Kc['o_g'])),
+               kiem_xoay=kx)          # gap, room; bat_duoc_lech_2mm false: the cross-check cannot see a 2 mm slip
     if u_imu is not None:
         if u_imu.get('version') != 'u_imu_dong_v2':
             raise UError('u_imu file: version is not u_imu_dong_v2')
