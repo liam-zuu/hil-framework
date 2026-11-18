@@ -28,6 +28,7 @@ ZC = float(CAM.centre[2])
 TEST_CFG = dict(trim_s=0.0, min_frames_s1=3, min_frames_abs=3, r_min_frames_s1=3, r_min_frames_abs=3, min_frac=0.5)
 CFG = dict(nt.DEFAULTS)
 R_OK = dict(dat=True)
+A0 = nt.DEFAULTS['a0_min']                   # NC2-1: distances on z = tag_h divided by the lower bound of the true scale
 
 
 # ---------------------------------------------------------------- unit: analysis on synthetic summaries
@@ -74,7 +75,7 @@ def test_body_pushed_is_removed_with_eps():
     eps = [math.hypot(b[0], b[1]) * CFG['dh_m'] / (2.9 - 0.12) for b in body]
     tp, ta = truth_rep(PLATE_OFF, eps)
     assert res['kiem_than'] and res['so_dung'] == 'tru_than'
-    assert res['tru_than']['vi_tri_m'] == pytest.approx(tp, abs=1e-9)
+    assert res['tru_than']['vi_tri_m'] == pytest.approx(tp / A0, abs=1e-9)
     assert res['tru_than']['goc_deg'] == pytest.approx(ta, abs=1e-9)
     assert res['vi_tri_m'] == res['tru_than']['vi_tri_m'] and res['goc_deg'] == res['tru_than']['goc_deg']
     assert res['tho']['vi_tri_m'] > tp
@@ -86,7 +87,7 @@ def test_still_body_gives_the_plate_repeatability():
     res = nt.analyse(summaries(STILL, PLATE_OFF), CFG, R_OK)
     tp, ta = truth_rep(PLATE_OFF)
     assert res['kiem_than']
-    assert res['vi_tri_m'] == pytest.approx(tp, abs=1e-9) and res['goc_deg'] == pytest.approx(ta, abs=1e-9)
+    assert res['vi_tri_m'] == pytest.approx(tp / A0, abs=1e-9) and res['goc_deg'] == pytest.approx(ta, abs=1e-9)
     assert res['than_dich_max_m'] == pytest.approx(0.0, abs=1e-12)
 
 
@@ -101,7 +102,7 @@ def test_nt3_inverse_of_rigid_fit():
     s1 = dict(tag=[0.0, 0.0, 0.0], box=[(rot(a) @ b + t).tolist() for b in bb], cam=[0, 0, 2.9], scale=1.0)
     res = nt.analyse([s0, s1, s0, s0], dict(CFG, dh_m=0.0), R_OK)
     assert res['tho']['vi_tri_m'] == pytest.approx(0.0, abs=1e-12)
-    assert res['tru_than']['vi_tri_m'] == pytest.approx(0.000349, abs=2e-6)
+    assert res['tru_than']['vi_tri_m'] == pytest.approx(0.000349 / A0, abs=2e-6)
     assert res['vi_tri_m'] == res['tru_than']['vi_tri_m']
 
 
@@ -111,7 +112,7 @@ def test_opposite_body_and_plate_motion():
     plate = [(0.0, 0.0, 0.0), (0.0008, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)]
     res = nt.analyse(summaries(body, plate), dict(CFG, dh_m=0.0), R_OK)
     assert res['tho']['vi_tri_m'] == pytest.approx(0.0, abs=1e-12)
-    assert res['vi_tri_m'] == pytest.approx(0.0008, abs=1e-9)
+    assert res['vi_tri_m'] == pytest.approx(0.0008 / A0, abs=1e-9)
 
 
 def test_tape_on_the_plate_without_clip_r_proof_falls_back_to_raw():
@@ -121,7 +122,7 @@ def test_tape_on_the_plate_without_clip_r_proof_falls_back_to_raw():
     tp, ta = truth_rep(PLATE_OFF)
     assert res['tru_than']['vi_tri_m'] < 3e-5                         # only eps (about 1 % of the plate motion)
     assert not res['kiem_than'] and 'clip_R_khong_dat' in res['ly_do_khong_kiem_than'] and res['so_dung'] == 'tho'
-    assert res['vi_tri_m'] == pytest.approx(tp, abs=1e-9) and res['goc_deg'] == pytest.approx(ta, abs=1e-9)
+    assert res['vi_tri_m'] == pytest.approx(tp / A0, abs=1e-9) and res['goc_deg'] == pytest.approx(ta, abs=1e-9)
     res = nt.analyse(summaries(body, PLATE_OFF), CFG, None)
     assert not res['kiem_than'] and res['ly_do_khong_kiem_than'] == ['khong_co_clip_R']
 
@@ -146,7 +147,7 @@ def test_camera_shift_enters_eps():
     res = nt.analyse(s, CFG, R_OK, tag_h=0.12)
     eps = [0.0, 0.0, 0.0, 0.005 * CFG['dh_m'] / (2.9 - 0.12), 0.0]                 # dH = 0
     assert res['than'][3]['camera_dich_xy_m'] == pytest.approx(0.005)
-    assert res['vi_tri_m'] == pytest.approx(truth_rep(PLATE_OFF, eps)[0], abs=1e-9)
+    assert res['vi_tri_m'] == pytest.approx(truth_rep(PLATE_OFF, eps)[0] / A0, abs=1e-9)
 
 
 def test_angles_wrap_around_180_raw_and_body_removed():
@@ -628,7 +629,7 @@ def test_nc3_scattered_scale_is_not_still():
     for k in range(70, 80):
         rows[k]['tag_scale'] = 1.01
     s = nt.clip_summary(rows, 2, cfg)
-    assert not s['ok'] and s['flags'] == ['clip_co_dong']
+    assert not s['ok'] and 'clip_co_dong' in s['flags']
 
 
 def test_nc4_nan_camera_fails_the_frame_and_pairwise_refuses_nan():
@@ -702,7 +703,7 @@ def test_nc5_template_frame_skips_bad_frames(scene, tmp_path):
     with open(d / 'session.json', encoding='utf-8') as f:
         ctx = nt.Ctx(json.load(f), TAG_H, dict(nt.DEFAULTS))
     i, g = nt.pick_template_frame(str(path), ctx, len(frames), nt.parse_boxes(boxes_px(b0)))
-    assert i in (3, 34)
+    assert i == 34                                                     # middle 19: 34 is nearer than 3
 
 
 def test_default_acceptance_thresholds_on_rows():
@@ -718,3 +719,79 @@ def test_default_acceptance_thresholds_on_rows():
         r['tag_seen'] = False          # about 101 used of 181 considered: count passes (>= 100), 60 % share fails
     s = nt.clip_summary(rows, 2, CFG, stride=3)
     assert not s['ok'] and s['flags'] == ['thieu_khung']
+
+
+# ---------------------------------------------------------------- Codex code round 2 (NC2-1 .. NC2-4)
+def test_nc2_1_every_placement_at_the_same_wrong_height():
+    """Codex NC2-1: all placements 3 mm low (r = 1, eps_h = 0), shifts 0, 1, 3, 5 mm: true 5 mm, measured x a."""
+    H, h = 2.632, 0.12
+    a = (H - h) / (H - (h - 0.003))
+    C = [-0.4802, -0.0329, H]
+    plate = [(0.0, 0.0, 0.0), (0.001 * a, 0.0, 0.0), (0.003 * a, 0.0, 0.0), (0.005 * a, 0.0, 0.0)]
+    s = summaries([(0.0, 0.0, 0.0)] * 4, plate, cam=C)
+    res = nt.analyse(s, dict(CFG, dh_m=0.0), R_OK, tag_h=h)
+    assert res['tru_than']['vi_tri_m'] >= 0.005 and res['tho']['vi_tri_m'] >= 0.005
+
+
+def test_nc2_3_scale_uncertainty_beyond_the_scale_fails_the_clip():
+    rows = []
+    for k in range(0, 600, 3):
+        rows.append(dict(idx=k, t_s=k / 60.0, n_marks=20, rms_px=0.5, gate_marks=True, cam_x=0.0, cam_y=0.0,
+                         cam_z=2.9, tag_seen=True, tag_x=0.1, tag_y=0.2, tag_psi=0.3, tag_res_sim_m=0.0005,
+                         tag_scale=1.0, box=[(0.2 + i, 0.1, 0.99, 0.0, 0.0, 0.5) for i in range(2)]))
+    rows[50]['tag_scale'] = rows[120]['tag_scale'] = 36.0
+    s = nt.clip_summary(rows, 2, CFG, stride=3)
+    assert not s['ok'] and 'thang_ngoai_mien' in s['flags']
+
+
+def test_nc2_4_clip_r_needs_a_finite_camera():
+    cfg = dict(CFG, **TEST_CFG)
+    rows = _rows(jump=(0, 0.5))
+    for r in rows:
+        r['cam_z'] = math.nan
+    s = nt.rong_summary(rows, [[0.2, 0.1], [1.2, 0.1]], [0.1, 0.2], 2, cfg)
+    assert not s['dat'] and s['n_ok'] == 0
+
+
+def test_nc2_2_periodic_template_is_refused():
+    img = np.tile(np.kron(np.indices((8, 8)).sum(axis=0) % 2, np.ones((8, 8))) * 200 + 25, (3, 3)).astype(np.uint8)
+    with pytest.raises(ValueError):
+        nt.check_template(img, (60, 60, 32, 32), dict(CFG, search_px=20))
+    good = texture((240, 320)).astype(np.uint8)
+    assert nt.check_template(good, (140, 100, 40, 40), dict(CFG, search_px=25)) is not None
+
+
+def test_nc2_2_template_index_is_used_as_given(scene, tmp_path):
+    d, floor = scene
+    b0 = (0.05, -0.03, math.radians(20.0))
+    good = floor.copy()
+    render_car(good, b0, PLATE_OFF[0])
+    frames = [good] * 10
+    path = d / 'm_N0.avi'
+    write_video(path, frames)
+    with open(d / 'session.json', encoding='utf-8') as f:
+        ses = json.load(f)
+    ctx, boxes_px, tidx, boxes = nt._setup(str(d / 'session.json'), boxes_px_fn(b0), str(path), None,
+                                           dict(nt.DEFAULTS), mau_idx=2)
+    assert tidx == 2
+    with pytest.raises(ValueError):
+        nt._setup(str(d / 'session.json'), '5,5,20,20;300,300,20,20', str(path), None, dict(nt.DEFAULTS), mau_idx=2)
+    assert ses['width'] == W
+
+
+def boxes_px_fn(b0):
+    return boxes_px(b0)
+
+
+def test_nc1_ecc_moving_more_than_1_px_is_refused(monkeypatch):
+    img = texture((240, 320))
+    b = nt.Box(img.astype(np.uint8), (140, 100, 40, 40), 25)
+
+    def far(tpl, win, warp, *a, **k):
+        w = warp.copy()
+        w[0, 2] += 1.5
+        return 1.0, w
+    monkeypatch.setattr(nt.cv2, 'findTransformECC', far)
+    assert b.ecc(img[75:165, 115:205].astype(np.float32), 25.0, 25.0) is None
+    u, v, c, q = b.match(img.astype(np.uint8))
+    assert math.isnan(u)
