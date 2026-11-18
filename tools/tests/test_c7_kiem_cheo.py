@@ -326,9 +326,10 @@ def test_c8b_u_reads_the_export():
     if getattr(CU, 'CAM_VERSION', None) != kc.CAM_U_VERSION or not hasattr(CU, 'check_cam'):
         pytest.skip('c8b_u of another camera-file version (before d338af4)')
     cam = json.loads(json.dumps(kc.build_cam_u(_own(), _parts())))
-    with pytest.raises(CU.UError, match='quy_ve_ma_noc'):
+    with pytest.raises(CU.UError, match='quy_ve_ma_noc'):              # a pair angle not carried to the tag
         CU.check_cam(cam)
-    cam['A3']['quy_ve_ma_noc'] = True                                   # test only: the method is not approved yet
+    own = dict(_own(), A3=_a3_conv(quy_ve_ma_noc=True))                  # approved (Liam 18/11): the real export path
+    cam = json.loads(json.dumps(kc.build_cam_u(own, _parts())))
     CU.check_cam(cam)
     tk = {"version": "c8b_thuoc_kep_v2", "cao_4_goc_mm": [120.2, 120.0, 119.8, 120.1], "e_mm": 0.1, "s_mm": 96.4,
           "canh": {"truoc": [10.3, 10.1], "phai": [10.2, 10.0], "sau": [10.1, 10.3], "trai": [10.0, 10.2]},
@@ -337,7 +338,7 @@ def test_c8b_u_reads_the_export():
     tb = dict(ga_ok=True, d_p_quay_m=0.0007, d_psi_quay_deg=0.25)
     up, p, upsi, s = CU.u_p_u_psi(cam, tb, tk, xo)
     assert p['P1_anh_san'] == pytest.approx(max(0.0034, 0.003) + 0.001 + 2 * 0.0003)
-    assert s['A3_huong_vung'] == pytest.approx(0.15) and s['A5_nhieu_khung'] == pytest.approx(0.4)
+    assert s['A3_huong_vung'] == pytest.approx(0.16) and s['A5_nhieu_khung'] == pytest.approx(0.4)
     assert p['P7_nhieu_khung'] == pytest.approx(0.0006)
 
 
@@ -902,12 +903,13 @@ def test_a3_converted_on_an_exact_scene_and_flag_follows_approval(scene, monkeyp
     marks, cam, img = scene
     rows = kc.a3_clip(img, marks, 'B1', W, H, ZC, l_max=0.8, tag=(0.1445, 0.119))
     assert rows and all(r['gap_deg'] < 1e-3 and r['quy_deg'] < 2e-3 for r in rows)
+    assert kc.A3_QUY_DUYET is True                                       # Liam 18/11 "Duyet (Recommended)"
+    assert kc.a3_summary({'H_a': rows})['quy_ve_ma_noc'] is True
+    monkeypatch.setattr(kc, 'A3_QUY_DUYET', False)
     out = kc.a3_summary({'H_a': rows})
     assert out['quy_ve_ma_noc'] is False and 'CHUA DUOC LIAM DUYET' in out['loai']
     assert out['max_deg'] == pytest.approx(max(r['quy_deg'] for r in rows)) and 'max_deg_cap' in out
     assert len(out['gioi_han']) == 13 and out['vuong_goc']['thong_tin'] is True and 'KHONG phai can' in out['loai']
-    monkeypatch.setattr(kc, 'A3_QUY_DUYET', True)
-    assert kc.a3_summary({'H_a': rows})['quy_ve_ma_noc'] is True
 
 
 def test_a3_converted_bound_covers_the_pair_angle(scene):
@@ -943,7 +945,7 @@ def test_phan_tich_writes_the_converted_a3(tmp_path, scene, monkeypatch):
     monkeypatch.setattr(kc, 'clip_dets', lambda v, ids, max_frames=None: ([k / 60 for k in range(20)], [img] * 20))
     assert kc.main(_phan_tich_args(tmp_path, scene)) == 0
     r = json.loads((tmp_path / 'kc' / 'kiem_cheo.json').read_text(encoding='utf-8'))
-    assert r['A3']['quy_ve_ma_noc'] is False and 'gap_max_deg' in r['A3'] and r['version'] == 'c7_kiem_cheo_v6'
+    assert r['A3']['quy_ve_ma_noc'] is True and 'gap_max_deg' in r['A3'] and r['version'] == 'c7_kiem_cheo_v6'
     head = (tmp_path / 'kc' / 'a3_cap.csv').read_text(encoding='utf-8').splitlines()[0]
     assert 'quy_deg' in head and 'gap_deg' in head
 
@@ -988,17 +990,20 @@ def _a3_conv(**over):
 
 
 @pytest.mark.parametrize('case', ['flag_true', 'side', 'height', 'no_geom'])
-def test_xuat_refuses_unapproved_flag_and_other_tag(tmp_path, case):
+def test_xuat_refuses_unapproved_flag_and_other_tag(tmp_path, case, monkeypatch):
     """Codex KCA1-2: an input A3 with quy_ve_ma_noc true is refused while A3_QUY_DUYET is False; KCA1-3: a converted A3
     must name the tag the scorer uses (bo_cham.side_m 0.1445, do_cao.h_m 0.12 in the parts)."""
     a3 = dict(flag_true=_a3_conv(quy_ve_ma_noc=True), side=_a3_conv(ma_ao=dict(canh_m=0.0964, cao_m=0.12)),
               height=_a3_conv(ma_ao=dict(canh_m=0.1445, cao_m=0.0)), no_geom=_a3_conv(ma_ao={}))[case]
+    if case == 'flag_true':
+        monkeypatch.setattr(kc, 'A3_QUY_DUYET', False)
     kcp = _kc_file(tmp_path, A3=dict(a3, buoi='C8_x'))
     assert kc.main(_xuat_args(tmp_path, kcp)) == 2
     assert not (tmp_path / 'o.json').exists()
 
 
 def test_xuat_converted_a3_ok_and_flag_only_after_approval(tmp_path, monkeypatch):
+    monkeypatch.setattr(kc, 'A3_QUY_DUYET', False)
     kcp = _kc_file(tmp_path, A3=dict(_a3_conv(), buoi='C8_x'))
     assert kc.main(_xuat_args(tmp_path, kcp)) == 0
     assert json.loads((tmp_path / 'o.json').read_text(encoding='utf-8'))['A3']['quy_ve_ma_noc'] is False

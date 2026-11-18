@@ -70,9 +70,10 @@ A3_TAG_T = (0.0, 0.25, 0.5, 0.75, 1.0)       # [DE XUAT] fractions along i -> j 
 A3_TAG_PHI_DEG = (0.0, 15.0, 30.0, 45.0, 60.0, 75.0)  # [DE XUAT]
 A3_VUONG_R_M = 0.7                           # [DE XUAT] information only: a pair has a perpendicular partner when
 A3_VUONG_DELTA_DEG = 2.0                     #   a pair of the same clip has its midpoint within R, angle 90 +- delta
-# Liam has NOT approved the method of design v5 S5-1 (18/11): c8b_u refuses A3 until this is True. Set it True only
-# with Liam's words copied here and into the design (CODE_KIEMCHEO handover 3.1).
-A3_QUY_DUYET = False
+# Approved: Liam 18/11/2026 at CODE_KIEMCHEO (local_bba4e18e), choice box on the method of design v5 S5 (A3 an empirical
+# cross-check index carried to the car tag, limits (a)-(m)), verbatim: "Duyet (Recommended)". c8b_u refuses A3 unless
+# the export says quy_ve_ma_noc true, which only this constant allows (check_a3_export).
+A3_QUY_DUYET = True
 WIN_S = 0.5                                 # [DE XUAT] window of the mark-shift median (CODE_CAM design v2 3)
 WIN_MIN_N = 10                               #   at least 10 samples
 WIN_GAP_S = 0.1                              #   a gap above 0.1 s restarts the window
