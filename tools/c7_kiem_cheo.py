@@ -317,7 +317,8 @@ def a3_perpendicular(rows, r_m=A3_VUONG_R_M, delta_deg=A3_VUONG_DELTA_DEG):
 
 def a3_summary(rows_by_clip, new_ids=(), tag=None):
     """A3 over every clip H. When every row carries the conversion to the car tag (a3_clip tag=...), max_deg is the
-    converted bound max(|dtheta| + gap) (design v5 S5-1) and max_deg_cap the pair angle alone; else max_deg is the
+    empirical cross-check index carried to the car tag, max(|dtheta| + gap) (design v5 S5-1; not a bound, it can be
+    below the true tag error at a sample: limits (k), (l)) and max_deg_cap the pair angle alone; else max_deg is the
     pair angle and the block says it is not converted. quy_ve_ma_noc = A3_QUY_DUYET (Liam's approval) only then."""
     allr = [r for rows in rows_by_clip.values() for r in rows]
     if not allr:
@@ -371,10 +372,10 @@ def a3_summary(rows_by_clip, new_ids=(), tag=None):
         '(f) so tru thuoc chi tham khao, gia dinh sai thuoc doc lap voi sai camera']
     if conv:
         out['gioi_han'] += [
-            '(g) gap chi bao sai trong ho mo hinh camera (model khoa): khac nhau giua camera day du va camera bo cap '
-            'dai dien cho khac nhau giua camera that va camera bo cap; sai ngoai ho (meo khong mo hinh, san khong '
-            'phang) o thang nho hon doan noi cap khong bi chan',
-            '(h) phan |dtheta| dua tren lap luan tuyen tinh cuc bo (a): hai cap vuong goc cung vung cho tong 2 omega; '
+            '(g) gap mo phong chenh lech giua cac camera da khop trong ho mo hinh (model khoa), camera day du va '
+            'camera bo cap; dung no thay cho chenh lech giua camera that va camera bo cap la gia dinh; sai ngoai ho '
+            '(meo khong mo hinh, san khong phang) o thang nho hon doan noi cap khong bi chan',
+            '(h) phan |dtheta| dua tren lap luan tuyen tinh cuc bo (a): hai cap vuong goc cung vung cho tong 2 omega (bac nhat); '
             'dieu kien nay chi la thong tin (vuong_goc), khong phai cong',
             '(i) ma ao chi dat doc doan noi cap (A3_TAG_T) va cac huong A3_TAG_PHI_DEG; vung ngoai cac doan khong '
             'lay mau',
@@ -382,8 +383,10 @@ def a3_summary(rows_by_clip, new_ids=(), tag=None):
             '(k) sai chung cua moi phep do goc anh moc hieu chuan (vi du lech do tim goc theo vi tri anh ma ma noc '
             'khong chiu) khong lo ra o cap giu ra: moi camera khop cung lech, dtheta va gap bang 0 trong khi ma noc lech '
             '(Codex KCA1-1: yaw 0,01 do, lech goc anh <= 0,2 px)',
-            '(l) |dtheta| + gap la sai cua camera BO CAP tai doan giu ra; dung no cho camera day du giua cac moc la gia '
-            'dinh kiem cheo (camera it moc hon sai khong kem camera day du o cho khong co moc), khong chung minh',
+            '(l) |dtheta| + gap la chi so kiem cheo quy doi tu goc cap (so thuoc) va chenh lech giua cac camera da '
+            'khop, khong phai phep do truc tiep hay can bao dam cua sai huong that, ca cua camera bo cap lan camera '
+            'day du; co the thap hon sai that ngay tai mau (k); dung cho camera day du giua cac moc la gia dinh kiem '
+            'cheo; chua gan voi muc bao phu xac suat',
             '(m) phep vi tu cua car_pose giu goc khi 1 - kappa > 0 (H > h); lap luan (a) can cung mot anh xa cuc bo '
             'cho hai cap vuong goc, hai camera bo cap khac nhau chua tu thoa']
     return out

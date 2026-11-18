@@ -967,6 +967,9 @@ def test_a3_gap_uses_the_tag_height_and_both_segment_ends():
     assert kc.a3_tag_gap(F, c, mi, mj, 0.1445, 0.119, ts=(0.5,))[0] == pytest.approx(0.0122470, abs=5e-7)
     assert kc.a3_tag_gap(F, c, mi, mj, 0.1445, 0.0)[0] == pytest.approx(0.0137229, abs=5e-7)
     assert kc.a3_tag_gap(F, c, mi, mj, 0.1445, 0.119, ts=(1.0,), phis=(75.0,))[0] == pytest.approx(full, abs=1e-9)
+    # Codex KCA2 (round 2): the pair reversed puts the maximum at t = 0; dropping t = 0 gives 0.0131368 only
+    assert kc.a3_tag_gap(F, c, mj, mi, 0.1445, 0.119)[0] == pytest.approx(full, abs=1e-9)
+    assert kc.a3_tag_gap(F, c, mj, mi, 0.1445, 0.119, ts=(0.25, 0.5, 0.75, 1.0))[0] == pytest.approx(0.0131368, abs=5e-7)
 
 
 def test_a3_clip_passes_the_session_tag_to_the_conversion(scene, monkeypatch):
