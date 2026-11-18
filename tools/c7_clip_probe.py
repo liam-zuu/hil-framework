@@ -226,7 +226,19 @@ def fit_camera(model, obj_xy, img, w, h, zc=None, f0=None, sigma_px=0.3):
     sol = least_squares(res, x0, loss='huber', f_scale=1.0, max_nfev=4000)
     cam = unpack(sol.x)
     rep = cam.project(obj) - img
+    # convergence record (design 33 marks v3 2, T33-17): success, and the cost did not grow from the start value
+    cost0 = huber_cost(res(x0))
+    cam.fit_info = dict(success=bool(sol.success), status=int(sol.status), nfev=int(sol.nfev), cost0=cost0,
+                        cost=float(sol.cost), ok=bool(sol.success) and float(sol.cost) <= cost0 * (1 + 1e-12))
     return cam, float(np.sqrt(np.mean(np.sum(rep ** 2, axis=1))))
+
+
+def huber_cost(r, f_scale=1.0):
+    """The cost scipy least_squares minimises with loss='huber': 0.5 * sum rho(r^2), rho(z) = z (z <= 1), 2 sqrt(z) - 1
+    (z > 1), on r / f_scale, times f_scale^2."""
+    z = (np.asarray(r, float) / f_scale) ** 2
+    rho = np.where(z <= 1.0, z, 2.0 * np.sqrt(z) - 1.0)
+    return float(0.5 * f_scale ** 2 * np.sum(rho))
 
 
 def homography_check(obj_xy, img):
