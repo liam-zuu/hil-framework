@@ -104,16 +104,63 @@ def test_c33_5_u_so_of_another_session_or_setup_is_refused(sess, spike_run):
         cm.build_lich(sess, 'S', runs, u, 'U', L0)
 
 
-def test_c33_15_floor_mark_missing_from_clip_h_blocks_the_session():
+@pytest.mark.parametrize('seen_in', [0, 4])                       # never; 4 frames of 10 (round 2: under half)
+def test_c33_15_floor_mark_missing_from_clip_h_blocks_the_session(seen_in):
     fr = h_frames()
-    for d in fr:
-        d.pop(14)                                                  # never seen in clip H
-    s = make_session(MK, fr)
-    kc = s['kiem_cheo']
-    assert 14 in [i for g in kc['nhom'] for i in g]                # still in its group
-    assert ['xe', 14] in kc['nen_thieu']
-    with pytest.raises(ValueError, match='baseline'):
-        cm.ChainCtx(s)
+    for k, d in enumerate(fr):
+        if k >= seen_in:
+            d.pop(14)
+    with pytest.raises(ValueError, match=r'floor marks \[14\]'):
+        make_session(MK, fr)
+
+
+def test_c33_5a_u_so_without_a_false_thu_is_refused(sess, spike_run):
+    _, frames = spike_run
+    ctx = cm.ChainCtx(sess)
+    runs = [('r1', 'luot', frames, 'D')]
+    L0 = cm.build_lich(sess, 'S', runs)
+    for v in ('missing', True, 0):
+        u = fake_u_so(ctx, tap=L0['tap_moc'])
+        if v == 'missing':
+            u.pop('thu')
+        else:
+            u['thu'] = v
+        with pytest.raises(ValueError, match='thu'):
+            cm.build_lich(sess, 'S', runs, u, 'U', L0)
+
+
+def _converged(sess, frames):
+    ctx = cm.ChainCtx(sess)
+    runs = [('r1', 'luot', frames, 'D')]
+    L = cm.build_lich(sess, 'S', runs)
+    for _ in range(5):
+        u = fake_u_so(ctx, tap=L['tap_moc'])
+        L = cm.build_lich(sess, 'S', runs, u, 'U', L)
+        if L['hoi_tu']:
+            return L, u
+    raise AssertionError('no convergence')
+
+
+def test_c33_5b_final_pass_rechecks_the_schedule(sess, spike_run):
+    _, frames = spike_run
+    L, u = _converged(sess, frames)
+    assert cm.verify_final(L, u, 'U', sess, 'S') == []
+    _, _, info = cm.track_chains(frames, 'r1.mov', 'V', sess, lich=L, run='r1', u_so=u, u_so_sha='U', session_sha='S')
+    assert info['cham_lai'] == 2
+    bad = []
+    old = dict(L, version='c7_lich_v1')                             # a schedule of b684258
+    bad.append(old)
+    forged = dict(L, hoi_tu=True, lap_lai=False)                    # hoi_tu written, the repeat not shown
+    bad.append(forged)
+    u_less = fake_u_so(cm.ChainCtx(sess))                           # the sets of tap_moc not computed
+    for lich, uu in [(b, u) for b in bad] + [(L, u_less)]:
+        assert cm.verify_final(lich, uu, 'U', sess, 'S')
+        _, _, info = cm.track_chains(frames, 'r1.mov', 'V', sess, lich=lich, run='r1', u_so=uu, u_so_sha='U',
+                                     session_sha='S')
+        assert info['cham_lai'] == 1 and info['lich_chua_duoc_nhan']
+    edited = json.loads(json.dumps(L))                              # schedule body edited after the sha
+    edited['chuoi']['xe']['moc_nghi'] = []
+    assert any('lich_sha256' in w for w in cm.verify_final(edited, u, 'U', sess, 'S'))
 
 
 def test_c33_1_final_pass_reports_not_concluded(tmp_path, sess):

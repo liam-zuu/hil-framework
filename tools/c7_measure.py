@@ -638,6 +638,11 @@ def calibrate(video, marks, zc, plumb, tag_h, car_side, stride=1, max_frames=Non
     cam, rms = fit_two_pass(chosen, obj, img, w_px, h_px, zc)
     if model is not None and not cam.fit_info['ok']:
         raise ValueError(f'clip H camera fit did not converge: {cam.fit_info} (v3 2, T33-17)')
+    if model is not None:                    # Codex C33-15 round 2: every floor mark must be in the fit (seen in >= half of
+        miss = [i for i in floor if i in marks and i != CAR_ID and i not in ids]          # the H frames)
+        if miss:
+            raise ValueError(f'floor marks {miss} not seen in at least half of the clip-H frames: the 33-mark session is '
+                             'blocked (no baseline; Codex C33-15); re-shoot clip H')
     per_mark = []
     for i in ids:
         r = cam.project(np.column_stack([cp.mark_corners_floor(*marks[i]), np.zeros(4)])) - mean[i]
@@ -965,8 +970,9 @@ def check_u_so_source(u_so, session, session_sha, ctx):
         raise ValueError(f"u_so.json model {u_so.get('model')!r} is not the session's {session.get('model_khoa')!r}")
     if [sorted(int(i) for i in g) for g in (u_so.get('nhom') or [])] != ctx.groups:
         raise ValueError('u_so.json groups are not the session groups')
-    if u_so.get('thu'):
-        raise ValueError('u_so.json is a trial (--thu)')
+    if u_so.get('thu') is not False:         # Codex C33-5a: the producer must say it is NOT a trial (--thu, --max-frames)
+        raise ValueError(f"u_so.json thu {u_so.get('thu')!r}: must be false (c7_kiem_cheo writes it; trial analyses "
+                         'are refused)')
     for c in ctx.chains:
         v = (u_so.get('chuoi') or {}).get(c) or {}
         for k in ('u_so_m', 'u_so_tho_m'):
@@ -1063,7 +1069,7 @@ def _ids_cell(ids):
 
 
 def track_chains(frames, video_name, video_sha, session, tag_offset=None, gates=None, gates_src=None, lich=None,
-                 run=None, u_so=None, u_so_sha=None, cache=None, shapes=None, thu=False):
+                 run=None, u_so=None, u_so_sha=None, cache=None, shapes=None, thu=False, session_sha=None):
     """track for a session with a 'kiem_cheo' block (design 33 marks v3 + v4). frames: [(idx, t_s, detections)] of the
     clip (detect_video or load_dets). Every pose is refitted from a clip-H camera (stateless, T33-8) with the trust flags;
     the main fit (chain xe) leaves out the marks the schedule excludes at that frame (lich: the converged schedule of the
@@ -1073,6 +1079,7 @@ def track_chains(frames, video_name, video_sha, session, tag_offset=None, gates=
     ctx = ChainCtx(session)
     marks = ctx.marks
     ref = {int(i): np.array(v) for i, v in session['ref_centres_px'].items()}
+    final_why = verify_final(lich, u_so, u_so_sha, session, session_sha) if lich is not None else ['no schedule']
     side, kappa, plumb = session['car_side_m'], session['kappa'], session['plumb_xy_m']
     off = tag_offset if tag_offset is not None else session['tag_offset']
     sched, q = None, None
@@ -1159,7 +1166,8 @@ def track_chains(frames, video_name, video_sha, session, tag_offset=None, gates=
                 zc_session_m=session.get('zc_fit_m'), cam_z_drift_rel=_cam_z_drift(rows, session.get('zc_fit_m')),
                 model_khoa=session['model_khoa'], nhom=ctx.groups, chuoi=ctx.chains, run=run, do_nhay=nl,
                 u_so_sha256=u_so_sha, nguong_dung=u_so_thresholds(u_so, ctx.chains) if u_so is not None else None,
-                cham_lai=2 if (lich is not None and lich.get('hoi_tu') and not thu) else 1, thu=bool(thu))
+                cham_lai=2 if (not final_why and not thu) else 1, thu=bool(thu),
+                lich_chua_duoc_nhan=final_why if lich is not None else None)
     if lich is not None:
         info.update(lich_sha256=lich['lich_sha256'], lap_E=lich.get('lap'), **schedule_for_run(lich, q, frames))
     else:
@@ -1290,7 +1298,7 @@ def build_lich(session, session_sha, runs, u_so=None, u_so_sha=None, prev=None, 
     lap_lai = prev is not None and u_so is not None and prev.get('lich_sha256') == sha
     hoi_tu = lap_lai and not thieu_tap
     chu_trinh = not hoi_tu and sha in [h['lich_sha256'] for h in lap[:-2]]
-    return dict(version='c7_lich_v1', session_sha256=session_sha, u_so_sha256=u_so_sha, clips=clips, chuoi=new,
+    return dict(version=LICH_VERSION, session_sha256=session_sha, u_so_sha256=u_so_sha, clips=clips, chuoi=new,
                 giai_thich_nen_doi=giai_thich,
                 nguong_dung=nguong, tap_moc=tap_json, tap_moc_sha256=tap_sha, lich_sha256=sha, lap=lap, hoi_tu=hoi_tu,
                 chu_trinh=chu_trinh, qua_10=(len(lap) > 10 and not hoi_tu), canh_bao=canh_bao,
@@ -1302,6 +1310,43 @@ def build_lich(session, session_sha, runs, u_so=None, u_so_sha=None, prev=None, 
                 luat=dict(win_s=md.WIN_S, win_min_n=md.WIN_MIN_N, win_gap_s=md.WIN_GAP_S, nen_win_s=md.NEN_WIN_S,
                           nen_raw_frac=md.NEN_RAW_FRAC, nen_raw_min=md.NEN_RAW_MIN, kiem_h_min=md.KIEM_H_MIN,
                           version=md.SCHEDULE_VERSION))
+
+
+LICH_VERSION = 'c7_lich_v2'                  # v2 (Codex C33-5b): converged = repeated AND every comparator set computed
+
+
+def verify_final(lich, u_so, u_so_sha, session, session_sha):
+    """Reasons ([] = none) why lich.json cannot be the converged schedule of a final pass (Codex C33-5b: the final
+    pass re-checks, it does not trust the file's hoi_tu): version, session and u_so sha, u_so source (check_u_so_source),
+    the thresholds used are those of u_so, the stored sha of tap_moc and of the schedule body recomputed, the schedule
+    repeated the previous step, and u_so computed every comparator set of tap_moc."""
+    why = []
+    if lich.get('version') != LICH_VERSION:
+        return [f"version {lich.get('version')!r} is not {LICH_VERSION} (rebuild the schedule)"]
+    if lich.get('session_sha256') != session_sha:
+        why.append('other session')
+    if u_so is None or lich.get('u_so_sha256') != u_so_sha:
+        return why + ['u_so.json is not the one the schedule was built with (sha256)']
+    try:
+        ctx = ChainCtx(session)
+        check_u_so_source(u_so, session, session_sha, ctx)
+        if lich.get('nguong_dung') != u_so_thresholds(u_so, ctx.chains):
+            why.append('thresholds of the schedule are not those of u_so')
+    except ValueError as exc:
+        return why + [str(exc)]
+    tap = lich.get('tap_moc') or {}
+    if md.schedule_sha256(tap) != lich.get('tap_moc_sha256'):
+        why.append('tap_moc does not match its sha')
+    body = dict(chuoi=lich.get('chuoi'), nguong_dung=lich.get('nguong_dung'), tap_moc_sha256=lich.get('tap_moc_sha256'))
+    if md.schedule_sha256(body) != lich.get('lich_sha256'):
+        why.append('schedule body does not match lich_sha256')
+    lap = lich.get('lap') or []
+    if not (lich.get('lap_lai') and len(lap) >= 2 and lap[-2].get('lich_sha256') == lich.get('lich_sha256')):
+        why.append('the schedule did not repeat the previous step')
+    miss = _tap_cover_missing(tap, u_so, ctx.groups)
+    if miss:
+        why.append(f'u_so did not compute {len(miss)} comparator sets of tap_moc')
+    return why
 
 
 def _chain_clips(ctx, runs, old, c, extra, caches):
@@ -1555,8 +1600,7 @@ def track_cli_chains(a, sess, off, gates, gsrc):
             lich = json.load(f)
         if lich.get('session_sha256') != sess_sha:
             raise ValueError('lich.json is of another session')
-        if not lich.get('hoi_tu') and not a.thu:
-            raise ValueError(f"lich.json has not converged ({lich.get('ket_luan')}): run the lich steps on, or --thu")
+        pass                                           # verified below with u_so (verify_final, Codex C33-5b)
     elif a.u_so:
         raise ValueError('--u-so only with --lich (final pass)')
     if a.u_so:
@@ -1565,6 +1609,10 @@ def track_cli_chains(a, sess, off, gates, gsrc):
         u_sha = sha256(a.u_so)
         if lich is not None and lich.get('u_so_sha256') != u_sha:
             raise ValueError('u_so.json is not the one the schedule was built with (sha256)')
+        if lich is not None and not a.thu:
+            why = verify_final(lich, u_so, u_sha, sess, sess_sha)
+            if why:
+                raise ValueError(f'lich.json is not a converged final schedule: {why} (run the lich steps on, or --thu)')
     shapes = None
     if a.dets:
         frames, vsha, shape = load_dets(a.dets)
@@ -1592,7 +1640,7 @@ def track_cli_chains(a, sess, off, gates, gsrc):
         dets_sha = sha256(os.path.join(a.out, 'dets.npz'))
     cache = _load_cache(a.cache, a.run or vname or 'clip', sess_sha, dets_sha) if a.cache else None
     rows, khung, info = track_chains(frames, vname, vsha, sess, off, gates, gsrc, lich, a.run, u_so, u_sha, cache,
-                                     shapes, a.thu or a.max_frames is not None)
+                                     shapes, a.thu or a.max_frames is not None, session_sha=sess_sha)
     if a.cache:
         _save_cache(a.cache, a.run or vname or 'clip', sess_sha, cache, dets_sha)
     fp, kp = os.path.join(a.out, 'frames.csv'), os.path.join(a.out, 'kiem_cheo_khung.csv')

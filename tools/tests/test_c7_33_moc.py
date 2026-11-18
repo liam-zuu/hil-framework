@@ -69,7 +69,7 @@ def fake_u_so(ctx, t=T, tr=TR, ha='S', tap=None):
     chains = ctx if isinstance(ctx, list) else ctx.chains
     ch = {c: dict(nguong_m=t, nguong_tho_m=tr, u_so_m=t - 0.001, u_so_tho_m=tr - 0.001, tap_tinh=[]) for c in chains}
     u = dict(version='c7_u_so_v4', model='B2', nhom=None if isinstance(ctx, list) else ctx.groups, chuoi=ch,
-             chi_tiet=dict(co_tap_luot=True), sessions=dict(H_a=dict(file='session.json', sha256=ha)))
+             chi_tiet=dict(co_tap_luot=True), sessions=dict(H_a=dict(file='session.json', sha256=ha)), thu=False)
     if tap is not None:
         gmap = ctx.gmap
         for c, sets in tap.items():
@@ -333,7 +333,8 @@ def test_vii_xvi_moc_nghi_changes_the_schedule_and_the_track(sess, spike_run):
     assert L2b['lap_lai'] and not L2b['hoi_tu'] and L2b['thieu_tap_u_so'] > 0
     assert L2['hoi_tu'] and L2['lich_sha256'] == L1['lich_sha256'] and len(L2['lap']) == 3
     r0, _, i0 = cm.track_chains(frames, 'r1.mov', 'V', sess, OFFSET, run='r1')
-    r2, _, i2 = cm.track_chains(frames, 'r1.mov', 'V', sess, OFFSET, lich=L2, run='r1', u_so=u, u_so_sha='U')
+    r2, _, i2 = cm.track_chains(frames, 'r1.mov', 'V', sess, OFFSET, lich=L2, run='r1', u_so=u, u_so_sha='U',
+                                session_sha='S')
     assert i0['cham_lai'] == 1 and i2['cham_lai'] == 2 and i2['lich_sha256'] == L2['lich_sha256']
     assert str(j) not in r2[40]['moc_dung'].split(';') and str(j) in r0[40]['moc_dung'].split(';')
     for k in range(40):                                            # before the first change: the same poses
