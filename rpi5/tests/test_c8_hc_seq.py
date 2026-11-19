@@ -487,18 +487,40 @@ def test_e2e_real_logger_posix(tmp_path, ctrl_c):
 
 
 # ------------------------------------------------------------------ Codex code review round 2 (HCC2-1)
+READY_COLS = ('timestamp_us', 'log_seq', 'motor_on', 'run_active', 'sp_vx', 'sp_vy', 'sp_wz', 'traj_age_ms')
+
+
+def write_raw(path, seqs, t0=100.0, step=0.01, tail=b''):
+    """<csv>.raw.jsonl as agv_logger writes it: one JSON per datagram, t_mono_ns at reception, b64 payload."""
+    import base64
+    import json
+    with open(path, 'wb') as f:
+        for k, s in enumerate(seqs):
+            line = f'{k},{s},1,1,0.000,0.000,0.000,10\n'.encode()
+            f.write(json.dumps(dict(t_mono_ns=int((t0 + k * step) * 1e9), ip='1.2.3.4', port=1, len=len(line),
+                                    b64=base64.b64encode(line).decode())).encode() + b'\n')
+        f.write(tail)
+
+
 def test_ready_check_needs_a_moving_log(tmp_path):
-    """HCC2-1 (Codex): 20 old ready rows kept passing; the second check needs log_seq to advance and a fresh file."""
+    """HCC2-1, HCC5-3, HCC5-4: freshness from the logger receive time (not from when the file is read), log_seq must
+    advance and never go back, an unfinished last datagram line is ignored."""
     p = str(tmp_path / 'log.csv')
-    cols = ('timestamp_us', 'log_seq', 'motor_on', 'run_active', 'sp_vx', 'sp_vy', 'sp_wz', 'traj_age_ms')
-    write_log(p, [(i, i, 1, 1, '0.000', '0.000', '0.000', 10) for i in range(40)], cols)
-    now = lambda: os.path.getmtime(p) + 0.05                                     # noqa: E731
-    rc = hs.ReadyCheck(p, clock=now)
+    write_log(p, [(i, i, 1, 1, '0.000', '0.000', '0.000', 10) for i in range(40)], READY_COLS)
+    write_raw(p + '.raw.jsonl', range(40))                                      # newest received at 100.39 s
+    rc = hs.ReadyCheck(p, mono=lambda: 100.45)
     assert rc() is None
-    assert 'chi tang' in rc()                                                   # same rows: the stream stopped
-    write_log(p, [(i, i, 1, 1, '0.000', '0.000', '0.000', 10) for i in range(80)], cols)
+    assert 'chi tang' in rc()                                                   # same datagrams: the stream stopped
+    write_raw(p + '.raw.jsonl', range(80))                                      # newest at 100.79 s
+    rc.mono = lambda: 100.85
     assert rc() is None
-    assert 'log dung' in hs.ReadyCheck(p, clock=lambda: os.path.getmtime(p) + 1.0)()
+    rc.mono = lambda: 101.20                                                    # read late: still 0.41 s old
+    assert rc.stale_s() > hs.READY_FRESH_S and 'log dung' in rc()
+    write_raw(p + '.raw.jsonl', list(range(80)) + [50])                         # log_seq back
+    rc.mono = lambda: 100.85
+    assert rc.stale_s() == float('inf')
+    write_raw(p + '.raw.jsonl', range(80), tail=b'{"t_mono_ns": 999000000000, "b64": "MTAx')   # unfinished line
+    assert rc.stale_s() == pytest.approx(100.85 - 100.79, abs=1e-6)
 
 
 def test_late_sample_is_chosen_again_not_sent_twice():
@@ -620,16 +642,43 @@ class BudgetSock(EmitSock):
 
 
 def test_no_motion_packet_after_the_100ms_budget():
-    """HCC4-1 (Codex): 95 ms after a motion packet, a sendto blocked 10 ms sent another motion packet at 105 ms."""
+    """HCC4-1, HCC5-1: the socket is non-blocking (a full buffer raises instead of sending late); a check 99.5 ms
+    after the previous one aborts before sending, so no motion packet leaves after the 100 ms budget."""
     segs = hs.schedule('K2')
     k_move = hs.first_motion_k(segs)
-    clock = FakeClock(stall={k_move + 20: 0.075})                               # next check 95 ms after the last
-    sock = BudgetSock(clock, delay={k_move + 20: 0.010})                         # the packet right after the stall
+    clock = FakeClock(stall={k_move + 20: 0.0795})                              # next check 99.5 ms after the last
+    sock = EmitSock(clock)
     r, err, out, _ = run_send(segs, clock, sock=sock)
-    moving = [(tm, p) for tm, p in zip(sock.times, sock.sent) if p != (0.0, 0.0, 0.0)]
-    t_prev = [tm for tm, p in moving][:k_move + 21]
-    gaps = [b - a for a, b in zip(t_prev[:-1], t_prev[1:])]
-    assert err is not None and max(gaps) <= hs.GAP_ABORT_S + 1e-9
+    moving = [tm for tm, p in zip(sock.times, sock.sent) if p != (0.0, 0.0, 0.0)]
+    gaps = [b - a for a, b in zip(moving[:-1], moving[1:])]
+    assert err is not None and err.why == 'tre_gui' and max(gaps) <= hs.GAP_ABORT_S + 1e-9
+
+
+def test_abort_zeros_get_their_own_budget():
+    """HCC5-2 (Codex): the abort zeros kept the shortened motion timeout and 0/25 left; they get a fresh budget and
+    the count of zeros sent is logged."""
+    segs = hs.schedule('K2')
+
+    class Sock(FakeSock):
+        timeout, blocking = 0.005, False
+
+        def setblocking(self, b):
+            self.blocking = b
+
+        def settimeout(self, v):
+            self.timeout = v
+
+        def sendto(self, pkt, addr):
+            if not self.blocking or self.timeout < 0.010:                    # this socket needs 10 ms to send
+                raise OSError('would block')
+            super().sendto(pkt, addr)
+    sock = Sock()
+    clock = FakeClock(ctrl_c_at=300)
+    got = []
+    with pytest.raises(hs.Abort):
+        hs.send_schedule('1.2.3.4', segs, sock, got.append, clock, clock.sleep, lambda: 1.0e9)
+    assert len(sock.sent) == int(round(hs.ABORT_ZERO_S * hs.SEND_HZ))
+    assert any('goi0=25/25' in ln for ln in got)
 
 
 def test_stall_jumping_into_motion_refuses_before_moving():

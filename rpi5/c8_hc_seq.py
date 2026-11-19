@@ -42,8 +42,10 @@ sender (pgrep snapshot + lock; a sender started after the check that does not ta
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import io
+import json
 import math
 import os
 import signal
@@ -70,6 +72,8 @@ SENDTO_MAX_S = 0.020               # one sendto longer than this aborts (HCC1-1)
 READY_LEAD_S = 0.1                 # the final car-ready check runs this long before the first motion packet (HCC3-1)
 MIN_SPACING_S = 0.010              # DT/2 between the end of a sendto and the next one (HCC3-2)
 BUDGET_MIN_S = 0.001               # less time left than this inside the 100 ms gap budget: abort, no packet (HCC4-1)
+# residual (HCC5-1): the process can still be preempted between the last clock read and the sendto syscall; the
+# gap is then checked right after the sendto (abort) and the firmware 200 ms timeout stays the last stop
 READY_FRESH_S = 0.20               # newest log row at most this old at the first motion packet (HCC4-2)
 READY_ROWS = 20                    # logger rows (~0.2 s at 10 ms) that must show a ready car
 READY_PRIME_K = 25                 # first ready check 0.5 s before the final one; the log must advance between
@@ -294,6 +298,16 @@ def send_schedule(ip, segs, sock, out, clock=time.monotonic, sleep=time.sleep, w
             else:
                 vx = vy = wz = 0.0
             pkt = pack_packet(vx, vy, wz)
+            if k >= k_move and not st['moved'] and not st.get('fresh_ok'):
+                # HCC4-2, HCC5-3: the data stream must still be fresh (logger receive time) at the first motion
+                # packet; read here, BEFORE the clock read that gates the send, so its time is accounted for
+                fr = getattr(ready, 'stale_s', None)
+                stale = fr() if callable(fr) else 0.0
+                buf.append(f'#log_moi_truoc_goi_dong,cu_s={stale:.3f}')
+                if stale > READY_FRESH_S:
+                    raise Abort('log_cu', k=k, cu_s=f'{stale:.3f}')
+                st['fresh_ok'] = True
+                continue                                  # read the clock again after the file read
             # HCC3-2: never closer than DT/2 to the END of the previous sendto (a packet leaves at the latest when
             # sendto returns), so two packets cannot go out together even when a sendto blocked
             if last_done is not None:
@@ -304,22 +318,15 @@ def send_schedule(ip, segs, sock, out, clock=time.monotonic, sleep=time.sleep, w
             chk = clock() - t0                           # immediately before sendto
             if chk >= (k + 1) * DT:                      # the cell of sample k is over: choose again (HCC2-1)
                 continue
-            budget = SENDTO_MAX_S if last_chk is None else min(SENDTO_MAX_S, GAP_ABORT_S - (chk - last_chk))
-            if budget < BUDGET_MIN_S:
-                # HCC4-1: not enough time left to send inside 100 ms of the previous packet: zeros, never motion
+            if last_chk is not None and GAP_ABORT_S - (chk - last_chk) < BUDGET_MIN_S:
+                # HCC4-1, HCC5-1: not enough time left inside 100 ms of the previous packet: zeros, never motion.
+                # The socket is non-blocking (run_attempt), so nothing that can block runs between this last clock
+                # read and the sendto; the bound is checked again from the clock after the sendto
                 st['gap_max'] = max(st['gap_max'], chk - last_chk)
                 raise Abort('tre_gui', k=k, gap_ms=f'{(chk - last_chk) * 1000:.1f}')
             if k >= k_move and not st['moved']:
-                fr = getattr(ready, 'stale_s', None)
-                stale = fr() if callable(fr) else 0.0
-                buf.append(f'#log_moi_truoc_goi_dong,cu_s={stale:.3f}')
-                if stale > READY_FRESH_S:                # HCC4-2: the log must still move at the first motion packet
-                    raise Abort('log_cu', k=k, cu_s=f'{stale:.3f}')
                 st['moved'] = True                       # HCC4-3: set BEFORE the first motion sendto
             try:
-                st_to = getattr(sock, 'settimeout', None)
-                if callable(st_to):
-                    st_to(budget)                        # a sendto blocked past the budget raises: nothing sent
                 sock.sendto(pkt, (ip, TRAJ_PORT))
             except OSError as exc:
                 raise Abort('socket', k=k, loi=str(exc).replace(',', ';'))
@@ -348,7 +355,8 @@ def send_schedule(ip, segs, sock, out, clock=time.monotonic, sleep=time.sleep, w
         ab = exc if isinstance(exc, Abort) else Abort(
             'ctrl_c' if isinstance(exc, KeyboardInterrupt) else 'loi_' + type(exc).__name__, k=st['k'])
         ab.moved = st['moved']                           # no motion packet sent yet -> the attempt is refused (2)
-        _abort_zeros(ip, sock, sleep)
+        n0 = _abort_zeros(ip, sock, sleep)
+        ab.kv['goi0'] = f'{n0}/{int(round(ABORT_ZERO_S * SEND_HZ))}'   # 0/25: the stop relies on the firmware timeout
         _flush(out, buf)
         _end(out, wall, st, total, complete=0)
         out('#seq_huy,ly_do=' + ab.why + ''.join(f',{a}={b}' for a, b in ab.kv.items()))
@@ -371,16 +379,25 @@ def _flush(out, buf):
 
 
 def _abort_zeros(ip, sock, sleep):
-    """ABORT_ZERO_S of zero packets; nothing here may stop the zeros (Ctrl-C again, socket errors)."""
+    """ABORT_ZERO_S of zero packets; nothing here may stop the zeros (Ctrl-C again, socket errors). The socket gets
+    its own blocking budget SENDTO_MAX_S per packet (HCC5-2: not the motion settings); returns how many left."""
+    try:
+        sock.setblocking(True)
+        sock.settimeout(SENDTO_MAX_S)
+    except (AttributeError, OSError, ValueError):
+        pass
+    n_ok = 0
     for _ in range(int(round(ABORT_ZERO_S * SEND_HZ))):
         try:
             sock.sendto(pack_packet(0.0, 0.0, 0.0), (ip, TRAJ_PORT))
+            n_ok += 1
         except (OSError, ValueError):
             pass
         try:
             sleep(DT)
         except KeyboardInterrupt:
             pass
+    return n_ok
 
 
 def _end(out, wall, st, total, complete):
@@ -474,57 +491,74 @@ def car_ready(csv_path, n=READY_ROWS):
 
 
 class ReadyCheck:
-    """car_ready() called twice before the first motion packet (HCC2-1): the second call also needs the newest
-    log_seq to have moved by READY_ADVANCE since the first one (a logger alive but no longer receiving keeps
-    old rows that would pass), and the newest row read within the last 0.2 s of the Pi clock (file mtime)."""
-    def __init__(self, csv_path, clock=time.time, mono=time.monotonic, poll_s=0.02, thread=True):
-        self.csv, self.clock, self.seq = csv_path, clock, None
-        self.mono, self.poll_s = mono, poll_s
-        self._last_seq, self._t_adv = None, None
-        self._stop = None
-        if thread:
-            import threading
-            self._stop = threading.Event()
-            threading.Thread(target=self._watch, daemon=True).start()
+    """car_ready() called twice before the first motion packet (HCC2-1), plus the freshness of the data stream
+    measured on the logger's own receive time (HCC5-3): agv_logger writes every datagram to <csv>.raw.jsonl with
+    t_mono_ns = time.monotonic_ns() at reception (same CLOCK_MONOTONIC as this process on the Pi), so the age of the
+    newest data line does not depend on when it is read. Only complete JSON lines whose payload is one data line
+    with the header's number of fields count (HCC5-4); log_seq must only go forward (backward -> refused). No
+    background thread (HCC5-5): stale_s() reads the file once, just before the first motion packet."""
+    def __init__(self, csv_path, clock=time.time, mono=time.monotonic):
+        self.csv, self.raw, self.clock, self.mono = csv_path, csv_path + '.raw.jsonl', clock, mono
+        self.seq = None
 
-    def _poll(self):
-        """One read of the newest log_seq; remembers the monotonic time it last advanced."""
+    def newest(self, nbytes=16384):
+        """(t_rx [s, monotonic], log_seq) of the newest complete data datagram, or None. base64/json are imported at
+        module level: a first import here took ~100 ms in WSL (path lookups) and stalled the zeros."""
         try:
-            cols, rows = _tail_rows(self.csv, 4096)
-            seq = int(float(rows[-1].split(',')[cols.index('log_seq')]))
-        except (OSError, ValueError, IndexError):
-            return
-        if seq != self._last_seq:
-            self._last_seq, self._t_adv = seq, self.mono()
-
-    def _watch(self):
-        while not self._stop.is_set():
-            self._poll()
-            self._stop.wait(self.poll_s)
+            cols, _ = _tail_rows(self.csv, 1)
+            ix = cols.index('log_seq')
+            with open(self.raw, 'rb') as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - nbytes))
+                buf = f.read()
+        except (OSError, ValueError):
+            return None
+        lines = buf.split(b'\n')
+        lines = lines[1:-1] if size > nbytes else lines[:-1]       # drop a cut first line and the unfinished tail
+        for ln in reversed(lines):
+            try:
+                r = json.loads(ln)
+                txt = base64.b64decode(r['b64']).decode('ascii')
+            except (ValueError, KeyError, UnicodeDecodeError):
+                continue
+            rows = [x for x in txt.split('\n') if x.strip() and not x.startswith('#')]
+            if len(rows) != 1:
+                continue
+            f_ = rows[0].strip().split(',')
+            if len(f_) != len(cols) or f_ == cols:
+                continue
+            try:
+                return int(r['t_mono_ns']) * 1e-9, int(float(f_[ix]))
+            except (ValueError, KeyError):
+                continue
+        return None
 
     def stale_s(self):
-        """Seconds since the newest log_seq last advanced (inf before the first row); a memory read (HCC4-2)."""
-        return float('inf') if self._t_adv is None else self.mono() - self._t_adv
+        """Seconds since the logger received the newest data line (inf when none, or when log_seq went back)."""
+        n = self.newest()
+        if n is None or (self.seq is not None and n[1] < self.seq):
+            return float('inf')
+        return self.mono() - n[0]
 
     def close(self):
-        if self._stop is not None:
-            self._stop.set()
+        pass
 
     def __call__(self):
         why = car_ready(self.csv)
         if why is not None:
             return why
-        try:
-            cols, rows = _tail_rows(self.csv)
-            seq = int(float(rows[-1].split(',')[cols.index('log_seq')]))
-            age = self.clock() - os.path.getmtime(self.csv)
-        except (OSError, ValueError, IndexError):
-            return 'log_seq khong doc duoc'
-        if age > 0.2:
-            return f'log dung {age:.2f} s'
-        prev, self.seq = self.seq, seq
-        if prev is not None and seq - prev < READY_ADVANCE:
-            return f'log_seq chi tang {seq - prev}'
+        n = self.newest()
+        if n is None:
+            return 'raw.jsonl: khong co dong du lieu'
+        age = self.mono() - n[0]
+        if age > READY_FRESH_S:
+            return f'log dung {age:.2f} s (gio nhan cua logger)'
+        prev, self.seq = self.seq, n[1]
+        if prev is not None and n[1] < prev:
+            return f'log_seq lui {prev}->{n[1]}'
+        if prev is not None and n[1] - prev < READY_ADVANCE:
+            return f'log_seq chi tang {n[1] - prev}'
         return None
 
 
@@ -656,7 +690,7 @@ def _attempt(a, segs, d, out, clock, sleep, wall, sock, popen, query, pgrep, rea
         s = sock
         if own:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.settimeout(SENDTO_MAX_S)                    # a blocked sendto raises (HCC1-1)
+            s.setblocking(False)                          # HCC5-1: a sendto never blocks (full buffer raises)
         rd = ready or ReadyCheck(csv_path)
         own_rd = ready is None
         try:
