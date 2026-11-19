@@ -164,6 +164,14 @@ def _num(r, k):
     return v if math.isfinite(v) else None
 
 
+def _thr_us(age_max_ms):
+    """Threshold in us as an exact decimal from its text (no float rounding); finite and > 0."""
+    d = Decimal(str(age_max_ms)) * 1000
+    if not d.is_finite() or d <= 0:
+        raise ValueError(f'age_max_ms {age_max_ms!r}: must be a finite number > 0')
+    return d
+
+
 def ref_cond1(rows, age_max_ms, end_seq=None, edge_seq=None):
     """Reference reading of J v6 section 5 command-path condition (1) on the log rows of one run (one boot,
     sorted by log_seq; the caller checks the boot and duplicate log_seq). Not the scorer: the scorer has its
@@ -180,12 +188,13 @@ def ref_cond1(rows, age_max_ms, end_seq=None, edge_seq=None):
     compared with their value on the edge row.
     Edge row: r_valid = 1, rv_n > 0, head_on = 1, psi_ref = 0 (O1 v8 line 94; J line 127).
     Yaw age at the latch (J line 127), integer microseconds: age_r_ms as printed (0.1 ms) + 50 us (half
-    print step) + gap to the next row (tick start -> latch <= gap, T9 doc section 2.1) + 3 us (1 us clock
-    steps at three stamps, float conversion), only when the edge row meets every condition above, the next
-    row is log_seq + 1 with a later timestamp, and the logged age lies in the proven domain
+    print step) + gap to the bound row (tick start -> latch <= gap, T9 doc section 2.1) + 2 us (clock steps)
+    + the float32 error of the age (max(1 us, ceil(|age| / 2^23))), only when the edge row meets every
+    condition above, a bound row exists (the next data row, or the first later row with a larger log_seq
+    and a later time: CODE 19/11), and the logged age lies in the domain
     [-gap - 0.05 ms, t_age + 0.05 ms] (t_age = 125 ms at 20 Hz; outside it the flags and the age disagree);
     otherwise not determinable, which J counts as bad. Bad when the bound exceeds age_max_ms (exact
-    decimal comparison, no rounding of the threshold)."""
+    decimal comparison from the threshold's text; non-finite or <= 0 is a ValueError)."""
     reasons, info = [], {}
     seq = [_num(r, 'log_seq') for r in rows]
     ra = [_num(r, 'run_active') for r in rows]
@@ -194,12 +203,11 @@ def ref_cond1(rows, age_max_ms, end_seq=None, edge_seq=None):
         if i_edge is None or ra[i_edge] != 1:
             return True, ['khong_co_dong_canh'], {'edge_seq': edge_seq, 'loai': 'he_do'}
     else:
-        i_edge = next((i for i in range(1, len(rows)) if ra[i] == 1 and ra[i - 1] == 0), None)
+        # the first active row is the edge; a later 0 -> 1 change is a re-edge inside the run, never the
+        # edge (a log that starts active is missing the run start: no edge evidence below)
+        i_edge = next((i for i in range(len(rows)) if ra[i] == 1), None)
         if i_edge is None:
-            first = next((i for i in range(len(rows)) if ra[i] == 1), None)
-            if first is None:
-                return True, ['no_edge'], {'loai': 'duong_lenh'}
-            i_edge = first                    # active without a readable 0 -> 1 change: no edge evidence
+            return True, ['no_edge'], {'loai': 'duong_lenh'}
     e = rows[i_edge]
     info['edge_seq'] = seq[i_edge]
     if (i_edge == 0 or seq[i_edge] is None or seq[i_edge - 1] != seq[i_edge] - 1
@@ -225,20 +233,28 @@ def ref_cond1(rows, age_max_ms, end_seq=None, edge_seq=None):
             reasons.append(f'{c}_changed')
             info[c] = sorted(vals, key=lambda v: (v is None, v))
     age = _num(e, 'age_r_ms')
-    nxt = rows[i_edge + 1] if i_edge + 1 < len(rows) else None
+    # bound row: the next data row (log_seq + 1), or, missing it, the first later row of the same boot with a
+    # larger log_seq and a later time (CODE 19/11: every later data row is stamped after the latch)
+    t0 = _num(e, 'timestamp_us')
     gap_us = None
-    if nxt is not None and seq[i_edge + 1] == seq[i_edge] + 1:
-        t0, t1 = _num(e, 'timestamp_us'), _num(nxt, 'timestamp_us')
-        if t0 is not None and t1 is not None and t1 > t0:
+    for k in range(i_edge + 1, len(rows)):
+        t1 = _num(rows[k], 'timestamp_us')
+        if seq[k] is not None and seq[i_edge] is not None and seq[k] > seq[i_edge] and t0 is not None \
+                and t1 is not None and t1 > t0:
             gap_us = int(t1 - t0)
+            info['bound_seq'] = seq[k]
+            break
     age_us = None if age is None else int(round(age * 10)) * 100
     if (not latched or age_us is None or gap_us is None
             or not (-gap_us - 50 <= age_us <= T_AGE_US + 50)):
         reasons.append('age_bound_undetermined')
     else:
-        bound_us = age_us + 50 + gap_us + 3
+        # 50 us half print step; 2 us for 1 us clock steps (t_now, rv_t_us; latch vs next stamp handled by <=
+        # plus 1 us); float32 error of a * 1e-3f: two roundings, relative 2^-23 of |a|, rounded up, at least 1 us
+        f_us = max(1, -(-abs(age_us) // (1 << 23)))
+        bound_us = age_us + 50 + gap_us + 2 + f_us
         info.update(age_r_ms=age, gap_ms=gap_us / 1000, age_bound_ms=bound_us / 1000)
-        if Decimal(bound_us) > Decimal(str(age_max_ms)) * 1000:
+        if Decimal(bound_us) > _thr_us(age_max_ms):
             reasons.append('age_bound_over')
     if reasons:
         info['loai'] = 'duong_lenh'
@@ -248,14 +264,15 @@ def ref_cond1(rows, age_max_ms, end_seq=None, edge_seq=None):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--out', required=True)
-    ap.add_argument('--age-max-ms', type=float, default=60.0,
+    ap.add_argument('--age-max-ms', type=Decimal, default=Decimal('60'),
                     help='demo threshold for the age bound (J locks it at C8; not a proposal)')
     a = ap.parse_args(argv)
+    _thr_us(a.age_max_ms)
     fw = fwsim.FirmwareSim()
     if fw.pos_cols == 0:
         sys.exit('fwsim.dll has no position loop: build it from firmware with pos_ctrl.c')
     os.makedirs(a.out, exist_ok=True)
-    summary = {'fwsim_build': fw.build_info, 'age_max_ms': a.age_max_ms, 'cases': {}}
+    summary = {'fwsim_build': fw.build_info, 'age_max_ms': str(a.age_max_ms), 'cases': {}}
     for c in cases():
         rows = as_logged(simulate(fw, c))
         with open(os.path.join(a.out, f'{c.name}.csv'), 'w', newline='') as f:

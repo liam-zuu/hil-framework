@@ -227,8 +227,7 @@ def test_window_covers_run_active_zero_stretch_and_end_anchor():
     assert bad and why == ['reset_n_changed']
 
 
-@pytest.mark.parametrize('nxt', [dict(row(), log_seq=12, timestamp_us=10_000),     # not log_seq + 1
-                                 dict(row(), log_seq=11, timestamp_us=0),          # not later (T9-3)
+@pytest.mark.parametrize('nxt', [dict(row(), log_seq=11, timestamp_us=0),          # not later (T9-3)
                                  dict(row(), log_seq=11, timestamp_us=-5_000)])
 def test_age_bound_needs_a_later_next_row(nxt):
     rows = trio(nxt=nxt)
@@ -345,3 +344,54 @@ def test_edge_seq_on_an_inactive_row_is_refused():
     rows = [dict(row(), log_seq=8, run_active=0, head_on=0, timestamp_us=-20_000)] + trio()
     bad, why, info = T.ref_cond1(rows, AGE_MAX, edge_seq=9)
     assert bad and why == ['khong_co_dong_canh'] and info['loai'] == 'he_do'
+
+
+
+# ---- after Codex Sol round 3 (T9-1, T9-6, T9-7, T9R-1, T9S-2) ----
+
+def test_later_row_of_the_same_boot_bounds_when_the_next_is_missing():
+    """T9-6, CODE 19/11: log_seq + 1 missing, a later row with larger log_seq and later time gives the bound."""
+    rows = trio(nxt=dict(row(), log_seq=12, timestamp_us=20_000))
+    bad, why, info = T.ref_cond1(rows, AGE_MAX)
+    assert not bad and info['bound_seq'] == 12 and info['age_bound_ms'] == pytest.approx(25.053)
+
+
+def test_log_missing_the_run_start_is_not_saved_by_a_re_edge():
+    """T9-1: rows 10-14 with run_active 1,1,0,1,1: the edge is row 10 (no row before), not the re-edge 13."""
+    rows = [dict(row(), log_seq=10 + k, timestamp_us=10_000 * k, run_active=v)
+            for k, v in enumerate([1, 1, 0, 1, 1])]
+    bad, why, info = T.ref_cond1(rows, AGE_MAX)
+    assert bad and why == ['thieu_dong_truoc_canh'] and info['loai'] == 'he_do' and info['edge_seq'] == 10
+    rows[0] = dict(rows[0], run_active='')                     # unreadable first row: still no evidence
+    assert T.ref_cond1(rows, AGE_MAX)[1] == ['thieu_dong_truoc_canh']
+
+
+def test_float_error_grows_with_the_age():
+    """T9-7: age -33 555.1 ms with a 33.68 s gap: the bound covers a + gap (125 001 us) and more."""
+    rows = trio(edge=row(age_r_ms=-33555.1), nxt=dict(row(), log_seq=11, timestamp_us=33_680_047))
+    bad, why, info = T.ref_cond1(rows, 1e9)
+    assert not bad and info['age_bound_ms'] * 1000 >= -33_555_046 + 33_680_047
+
+
+@pytest.mark.parametrize('thr', ['13.9999999999999999', T.Decimal('13.9999999999999999')])
+def test_threshold_text_is_kept_exact(thr):
+    """T9R-1: a threshold just under 14 ms given as text / Decimal is not rounded up to 14."""
+    rows = trio(edge=row(age_r_ms=8.3), nxt=dict(row(), log_seq=11, timestamp_us=5_647))
+    assert T.ref_cond1(rows, thr)[1] == ['age_bound_over']
+
+
+@pytest.mark.parametrize('thr', [float('inf'), 'inf', 'nan', 0, -5])
+def test_bad_threshold_is_refused(thr):
+    """T9S-2."""
+    with pytest.raises(ValueError):
+        T.ref_cond1(trio(), thr)
+    with pytest.raises((SystemExit, ValueError, Exception)):
+        T.main(['--out', os.devnull, '--age-max-ms', str(thr)])
+
+
+def test_a_duplicate_of_the_edge_row_is_not_a_bound_row():
+    """The bound row needs a larger log_seq: a second copy of the edge row with a later time is skipped."""
+    pre, e, nxt = trio()
+    rows = [pre, e, dict(e, timestamp_us=5_000), nxt]
+    bad, why, info = T.ref_cond1(rows, AGE_MAX)
+    assert info['bound_seq'] == 11 and info['gap_ms'] == 10.0

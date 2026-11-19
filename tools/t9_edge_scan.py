@@ -11,10 +11,12 @@ anchor), boot and failure order belong to the scorer; this tool shows the edge e
                         the next edge then shows pos_reset_n + 1 and 'since_prev_ms', the time from the end
                         of the previous stretch); gap to the next row; and, only when the row before the
                         edge is log_seq - 1 with run_active 0, the edge row shows the full latch (r_valid 1,
-                        rv_n > 0, head_on 1, psi_ref 0), the next row is log_seq + 1 and later, and the
-                        logged age lies in [-gap - 0.05 ms, 125.05 ms], the age bound
-                        age_r_ms + 50 us + gap + 3 us (integer us, as ref_cond1 of
-                        fwsim/t9_heading_cases.py); plus all motor-on consecutive-row gaps
+                        rv_n > 0, head_on 1, psi_ref 0), a bound row exists (next data row, or the first
+                        later row with larger log_seq and later time, CODE 19/11), and the logged age lies
+                        in [-gap - 0.05 ms, 125.05 ms], the age bound age_r_ms + 50 us + gap + 2 us +
+                        float error (as ref_cond1 of fwsim/t9_heading_cases.py); a file with conflicting
+                        duplicates, non-increasing or unreadable times gives no bounds; plus all motor-on
+                        consecutive-row gaps
   s06 <run_dir ...>     S06 runs (env s06_load, pi/esp/esp32_data.txt + esp32_events.txt): P line
                         t_before (first compare write of the tick, after vel_ctrl_step) minus t_now of
                         the same tick (latest data row timestamp_us <= t_before, next row log_seq + 1)
@@ -64,7 +66,8 @@ def q(v, p):
 def edges(paths):
     bounds, gaps = [], []
     for path in paths:
-        rs = [r for r in rows_of(path) if num(r, 'log_seq') is not None and num(r, 'timestamp_us') is not None]
+        # rows with an unreadable log_seq cannot be placed; an unreadable time is kept until the duplicate check
+        rs = [r for r in rows_of(path) if num(r, 'log_seq') is not None]
         if not rs or 'run_active' not in rs[0]:
             print(f'{path}: no run_active column')
             continue
@@ -77,15 +80,17 @@ def edges(paths):
                 continue
             uniq.append(r)
         n_same = len(rs) - len(uniq) - conflict
-        rs = uniq
+        bad_t = sum(1 for r in uniq if num(r, 'timestamp_us') is None)
+        rs = [r for r in uniq if num(r, 'timestamp_us') is not None]
         seqs = [num(r, 'log_seq') for r in rs]
         ts = [num(r, 'timestamp_us') for r in rs]
         nonmono = sum(1 for a, b in zip(ts, ts[1:]) if b <= a)
-        trusted = conflict == 0 and nonmono == 0
+        trusted = conflict == 0 and nonmono == 0 and bad_t == 0
         if n_same:
             print(f'{path}: bo {n_same} dong trung y het (cung log_seq, cung noi dung)')
         if not trusted:
-            print(f'{path}: CANH_BAO log_seq trung khac noi dung={conflict}, gio khong tang={nonmono}: '
+            print(f'{path}: CANH_BAO log_seq trung khac noi dung={conflict}, gio khong tang={nonmono}, '
+                  f'gio khong doc duoc={bad_t}: '
                   f'nghi nhieu boot hay file tron; khong tinh can tu file nay')
         for i in range(len(rs) - 1):
             a, b = rs[i], rs[i + 1]
@@ -106,14 +111,15 @@ def edges(paths):
             pre_ok = i > 0 and seqs[i - 1] == seqs[i] - 1 and num(rs[i - 1], 'run_active') == 0
             latched = (num(e, 'r_valid') == 1 and (num(e, 'rv_n') or 0) > 0 and num(e, 'head_on') == 1
                        and num(e, 'psi_ref') == 0.0)
-            gap_us = (int(ts[i + 1] - ts[i]) if i + 1 < len(rs) and seqs[i + 1] == seqs[i] + 1
-                      and ts[i + 1] > ts[i] else None)
+            # bound row: next data row, or the first later row with larger log_seq and later time (CODE 19/11)
+            k = next((k for k in range(i + 1, len(rs)) if seqs[k] > seqs[i] and ts[k] > ts[i]), None)
+            gap_us = None if k is None else int(ts[k] - ts[i])
             age = num(e, 'age_r_ms')
             age_us = None if age is None else int(round(age * 10)) * 100
             bound = None
             if (trusted and pre_ok and latched and gap_us is not None and age_us is not None
                     and -gap_us - 50 <= age_us <= T_AGE_US + 50):
-                bound = (age_us + 50 + gap_us + 3) / 1000
+                bound = (age_us + 50 + gap_us + 2 + max(1, -(-abs(age_us) // (1 << 23)))) / 1000
                 bounds.append(bound)
             print(f"{path}: seq={e['log_seq']} pre_ok={pre_ok} "
                   f"r_valid={e.get('r_valid')} rv_n={e.get('rv_n')} head_on={e.get('head_on')} "
