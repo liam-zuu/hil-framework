@@ -1431,9 +1431,10 @@ def _cp(d):
     return json.loads(json.dumps(d))
 
 
-def sync(cam, runs=None):
+def sync(cam, runs=None, vang=()):
     """The camera file with moc_dich.nguon.car_pose set to its own set-up (as the exporter writes it), and frames of
-    the given runs; a file without the block is left as it is."""
+    the given runs; luot_cham = the runs with frames plus vang (scored runs without U_moc frames, KCJ3-1, as
+    c7_kiem_cheo 565c0b7 writes them); a file without the block is left as it is."""
     cam = _cp(cam)
     md = cam.get('moc_dich')
     if isinstance(md, dict) and isinstance(md.get('nguon'), dict):
@@ -1441,6 +1442,10 @@ def sync(cam, runs=None):
         md['nguon']['car_pose'] = dict(tag_offset=bc.get('tag_offset'), side_m=bc.get('side_m'), h_m=dc.get('h_m'))
         if runs is not None:
             md['nguon']['frames'] = {r: _fsha(r) for r in runs}
+        fr = md['nguon'].get('frames')
+        if isinstance(fr, dict):
+            md['luot_cham'] = dict(fr, **{v: _fsha(v) for v in vang})
+            md['luot_vang_u_moc'] = sorted(vang)
     return cam
 
 
@@ -1538,7 +1543,7 @@ def _expect(cam=CAM, tk=TK, xo=XO):
 def test_khoa_sums():
     k = KHG({'a': gio_d('O1-F05', 3e-4, 0.010, 0.005), 'b': gio_d('O1-F05', 4e-4, 0.012, 0.003),
                  'c': gio_d('O1-F08', 1e-4, 0.014, 0.004), 'd': gio_d('O1-F08', 9e-3, 0.5, 0.5, ok=False)},
-                sync(CAM, 'abc'))                                       # run d (clock not ok) needs no frames
+                sync(CAM, 'abc', vang='d'))                             # run d (clock not ok) needs no frames
     p, a = _expect()
     assert k['U_p_phan_m'] == pytest.approx(p) and k['U_psi_phan_deg'] == pytest.approx(a)
     assert k['U_p_m'] == pytest.approx(1.25 * sum(p.values()))
@@ -2053,12 +2058,44 @@ def test_moc_sha_of_the_files_given():
     # the runs of U_moc against the C8 clock files: a run outside them, or an ok run missing, refused
     gios = {'a': gio_d('O1-F05', 3e-4, 0.01, 0.0), 'b': gio_d('O1-F05', 3e-4, 0.01, 0.0),
             'c': gio_d('O1-F05', 3e-4, 0.01, 0.0, ok=False)}
-    with pytest.raises(CU.UError, match=r"ok clock missing \['b'\]"):
-        KHG(gios, sync(CAM, 'a'), MT('a'))
-    with pytest.raises(CU.UError, match=r"not a C8 run \['z'\]"):
-        KHG(gios, sync(CAM, 'abz'), MT('abz'))
-    KHG(gios, sync(CAM, 'ab'), MT('ab'))                      # c not ok: may lack frames
+    # (KCJ3-1: every scored run is in luot_cham; a run without U_moc frames must have a failed clock)
+    with pytest.raises(CU.UError, match=r"run b has no U_moc frames .*ok is not false"):
+        KHG(gios, sync(CAM, 'a', vang='bc'), MT('a'))
+    with pytest.raises(CU.UError, match=r"clock file missing for \['z'\]"):
+        KHG(gios, sync(CAM, 'abz', vang='c'), MT('abz'))
+    KHG(gios, sync(CAM, 'ab', vang='c'), MT('ab'))            # c not ok: may lack frames
     KHG(gios, sync(CAM, 'abc'), MT('abc'))
+
+
+def test_khoa_kcj3_1_every_scored_run_needs_its_clock_file():
+    # Codex KCJ3-1 (KIEMCHEO J round 3): two scored runs, drift 3e-4 and 6e-4; a lock given the clock file of run a only
+    # took 1.25 x 300 = 375 ppm instead of 750 ppm. Now refused: luot_cham names b, its clock file is missing
+    gios = {'a': gio_d('O1-F05', 3e-4, 0.01, 0.0), 'b': gio_d('O1-F05', 6e-4, 0.01, 0.0)}
+    cam = sync(CAM, 'ab')
+    with pytest.raises(CU.UError, match=r"clock file missing for \['b'\]"):
+        KHG({'a': gios['a']}, cam, MT('ab'))
+    # the counterexample itself: b written as a run without U_moc and its clock file left out (the old check passed it
+    # and locked 375 ppm)
+    with pytest.raises(CU.UError, match=r"clock file missing for \['b'\]"):
+        KHG({'a': gios['a']}, sync(CAM, 'a', vang='b'), MT('a'))
+    # claiming b has no U_moc frames does not help while its clock is ok
+    with pytest.raises(CU.UError, match=r"run b has no U_moc frames"):
+        KHG(gios, sync(CAM, 'a', vang='b'), MT('a'))
+    k = KHG(gios, cam, MT('ab'))
+    assert k['troi_ppm'] == pytest.approx(750.0)
+    # a camera file without the KCJ3-1 fields (older writer) is refused; luot_cham must agree with nguon.frames
+    old = _cp(cam)
+    del old['moc_dich']['luot_cham']
+    with pytest.raises(CU.UError, match='luot_cham'):
+        KHG(gios, old, MT('ab'))
+    bad = _cp(cam)
+    bad['moc_dich']['luot_cham']['b'] = 'e' * 64
+    with pytest.raises(CU.UError, match=r'nguon.frames.b vs moc_dich.luot_cham.b'):
+        KHG(gios, bad, MT('ab'))
+    bad = _cp(cam)
+    bad['moc_dich']['luot_vang_u_moc'] = ['b']
+    with pytest.raises(CU.UError, match='luot_vang_u_moc'):
+        KHG(gios, bad, MT('ab'))
 
 
 def test_moc_car_pose_set_up_must_match():
@@ -2252,6 +2289,7 @@ def _scoring(d, tag, cam, runs=('r1', 'r2', 'r3', 'r4'), body=None, clip_tag=Non
         out['slot'][rid] = slot
     c = _cp(cam)
     c['moc_dich']['nguon'].update(frames=fr_sha, **{k: sh[k] for k in ('lich', 'tap_moc', 'u_so', 'session')})
+    c['moc_dich'].update(luot_cham=dict(fr_sha), luot_vang_u_moc=[])          # KCJ3-1 (c7_kiem_cheo 565c0b7)
     (p / 'cam.json').write_text(json.dumps(c), encoding='utf-8')
     out['cam'] = str(p / 'cam.json')
     return out, c

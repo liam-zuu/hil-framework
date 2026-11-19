@@ -407,6 +407,35 @@ def check_moc(cam, moc_tep, gios):
         if fr[rid] != got[rid]:
             raise UError(f'moc_dich.nguon.frames.{rid} is not the SHA-256 of the frames file given for {rid}: U_moc is '
                          f'of another scoring of that run')
+    # KCJ3-1 (Codex, KIEMCHEO J round 3; writer c7_kiem_cheo 565c0b7): the lock is over EVERY scored run of the session
+    # (moc_dich.luot_cham {run: frames sha} of tung_khung): a clock file for each, none outside; a run may lack U_moc
+    # (moc_dich.luot_vang_u_moc) only when its clock file shows the clock failed (ok false). A lock over a subset of the
+    # runs would take the drift rate of that subset only (Codex: 375 ppm instead of 750 ppm)
+    lc, vang = md.get('luot_cham'), md.get('luot_vang_u_moc')
+    if not isinstance(lc, dict) or not lc or not isinstance(vang, list):
+        raise UError('moc_dich.luot_cham {run: frames sha256} and moc_dich.luot_vang_u_moc [runs] needed (every scored '
+                     'run of the session, c7_kiem_cheo KCJ3-1): the lock is refused')
+    for rid, sha in lc.items():
+        _sha_hex(sha, f'moc_dich.luot_cham.{rid}')
+    lack_g, extra_g = sorted(set(lc) - set(gios)), sorted(set(gios) - set(lc))
+    if lack_g or extra_g:
+        raise UError(f'C8 clock files vs the scored runs (moc_dich.luot_cham): clock file missing for {lack_g}, not a '
+                     f'scored run {extra_g}: the lock must be over every scored run (KCJ3-1), not locked')
+    if sorted(vang) != sorted(set(lc) - set(fr)) or len(set(vang)) != len(vang):
+        raise UError(f'moc_dich.luot_vang_u_moc {sorted(vang)} is not the scored runs without U_moc frames '
+                     f'{sorted(set(lc) - set(fr))}')
+    for rid in sorted(fr):
+        if rid not in lc:
+            raise UError(f'moc_dich.nguon.frames.{rid}: not a scored run (moc_dich.luot_cham)')
+        _eq(fr[rid], lc[rid], f'moc_dich.nguon.frames.{rid} vs moc_dich.luot_cham.{rid}')
+    for rid in sorted(vang):
+        g = gios[rid]
+        if not isinstance(g, dict) or g.get('ok') is not False:
+            raise UError(f'run {rid} has no U_moc frames (luot_vang_u_moc) but its clock file does not show a failed '
+                         f'clock (ok is not false): U_moc does not cover every scored frame, not locked')
+        g_fr = (g.get('sha256') or {}).get('frames') if isinstance(g.get('sha256'), dict) else None
+        if g_fr is not None:
+            _eq(lc[rid], g_fr, f'moc_dich.luot_cham.{rid} vs the clock file sha256.frames')
     ok_ids = [r for r, g in gios.items() if isinstance(g, dict) and g.get('ok')]
     extra, lack = sorted(set(fr) - set(gios)), sorted(set(ok_ids) - set(fr))
     if extra or lack:
