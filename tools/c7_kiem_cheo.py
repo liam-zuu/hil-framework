@@ -1558,6 +1558,11 @@ def _session_ctx(path, want_sha, model):
     for k in ('camera', 'kappa', 'plumb_xy_m', 'tag_h_m', 'car_side_m'):
         if k not in s:
             raise KCError(f'{path}: session without {k} (car_pose convention)')
+    nums = [s['kappa'], s['tag_h_m'], s['car_side_m']] + list(s['plumb_xy_m'] or [])
+    if len(s['plumb_xy_m'] or []) != 2 or not all(_fin_ge0(abs(v)) if isinstance(v, (int, float)) and
+                                                  not isinstance(v, bool) else False for v in nums) \
+            or not 0 < s['kappa'] < 1 or not s['tag_h_m'] > 0 or not s['car_side_m'] > 0:
+        raise KCError(f'{path}: kappa / tag_h_m / car_side_m / plumb_xy_m not finite or out of range (KCF1-6)')
     return s, sha, mk, PairCams(img, mk, model, w, h, zc), cm.cam_from_dict(s['camera']), float(s['kappa']), \
         np.asarray(s['plumb_xy_m'], float)
 
@@ -1576,7 +1581,7 @@ def _ids_sha_forms(ids):
             hashlib.sha256(json.dumps(v, separators=(',', ':')).encode()).hexdigest()}
 
 
-def _check_h_bar(path, h_used):
+def _check_h_bar(path, h_used, C=None, Zc=None):
     """KCF1-6: the tag height of the session against h-bar of the plate (c8b_a6_v2 field h_m), when given."""
     if not path:
         return dict(da_kiem=False, ly_do='khong co --a6: h_m cua session chua doi chieu voi h-bar cua tam')
@@ -1586,6 +1591,12 @@ def _check_h_bar(path, h_used):
     hb = d.get('h_m')
     if isinstance(hb, bool) or not isinstance(hb, (int, float)) or not math.isfinite(hb) or abs(float(hb) - h_used) > 1e-6:
         raise KCError(f'--a6: h_m {hb!r} is not the session tag height {h_used} (KCF1-6)')
+    pl, H = d.get('plumb_xy_m'), d.get('H_m')
+    if not isinstance(pl, list) or len(pl) != 2 or not isinstance(H, (int, float)) or isinstance(H, bool) or \
+            any(not isinstance(v, (int, float)) or isinstance(v, bool) for v in pl) or \
+            (C is not None and max(abs(float(pl[0]) - C[0]), abs(float(pl[1]) - C[1])) > 1e-9) or \
+            (Zc is not None and abs(float(H) - Zc) > 1e-9):
+        raise KCError('--a6: plumb_xy_m / H_m are not the car_pose set-up of the session (KCF1-6)')
     return dict(da_kiem=True, file=os.path.abspath(path), sha256=sha, h_m=float(hb))
 
 
@@ -1617,8 +1628,9 @@ def meo_E(a):
     by = {k: [r for r in ew if r['loai'] == k] for k in ('E_dau', 'E_cuoi')}
     if len(by['E_dau']) != 1 or len(by['E_cuoi']) != 1:
         raise KCError(f'cua_so_v1: need exactly one E_dau and one E_cuoi window of {a.cho} for this clip (KCF1-8)')
-    if by['E_dau'][0].get('luot_id') != by['E_cuoi'][0].get('luot_id'):
-        raise KCError('cua_so_v1: E_dau and E_cuoi of different runs (KCF1-8)')
+    lid = by['E_dau'][0].get('luot_id')
+    if not isinstance(lid, str) or not lid or by['E_cuoi'][0].get('luot_id') != lid:
+        raise KCError('cua_so_v1: E_dau and E_cuoi without the same run id (KCF1-8)')
     import io
     try:
         t_of = {int(r['idx']): float(r['t_s']) for r in csv.DictReader(io.StringIO(fb.decode('utf-8')))}
@@ -1635,6 +1647,8 @@ def meo_E(a):
                 and abs(float(x['pts_s']) - t_of[x['id']]) <= 1e-6 for x in kh):
             raise KCError(f'cua_so_v1 {k}: khung missing, malformed or not the frames of the track (KCF1-8)')
         ids[k] = [x['id'] for x in kh]
+        if any(b <= a_ for a_, b in zip(ids[k], ids[k][1:])):
+            raise KCError(f'cua_so_v1 {k}: frame ids repeated or out of order (KCF1-8)')
     lo, hi = max(ids['E_dau']), min(ids['E_cuoi'])
     if not lo < hi:
         raise KCError('cua_so_v1: E_dau does not end before E_cuoi starts (KCF1-8)')
@@ -1672,7 +1686,7 @@ def meo_E(a):
         mien_E=dict(sau_E_dau=lo, truoc_E_cuoi=hi, khung_dong=len(khung)),
         ban_do=dict(phien_ban=VERSION, session_sha256=ses_sha, full='session.camera', H32_ids=hid, R_XP_M=rx,
                     ca=[dict(ten=n, bo_ids=ids_) for n, ids_, _ in cases]),
-        h_m=float(s['tag_h_m']), h_bar=_check_h_bar(a.a6, float(s['tag_h_m'])), kappa=kappa,
+        h_m=float(s['tag_h_m']), h_bar=_check_h_bar(a.a6, float(s['tag_h_m']), C, float(s['tag_h_m']) / kappa), kappa=kappa,
         plumb_xy_m=[float(x) for x in C], Zc_m=float(s['tag_h_m']) / kappa, tag_offset=[float(v) for v in to],
         khung=khung, commit_hil=commit_hil(),
         gioi_han=['chi so thuc nghiem truoc le; truong du ban do giua camera bo moc H32 va camera cham, trong ho mo hinh',
@@ -1708,7 +1722,7 @@ def meo_bang(a):
     if ll.get('schema') != 'lan_lap_v1':
         raise KCError(f'lan_lap.json: schema {ll.get("schema")!r} is not lan_lap_v1 (KCF1-7)')
     ten = list(ll.get('neo_ten') or [])
-    if ten[:2] != ['A', 'B'] or any(not (t in ('A', 'B') or (isinstance(t, str) and t.startswith('oc') and len(t) > 2))
+    if ten[:2] != ['A', 'B'] or any(not (t in ('A', 'B') or (isinstance(t, str) and t.startswith('oc')))
                                     for t in ten) or len(set(ten)) != len(ten):
         raise KCError(f'lan_lap.json: neo_ten {ten!r} is not A, B, oc* (F15, KCF2-1)')
     thieu_oc = not any(t.startswith('oc') for t in ten)
@@ -1726,7 +1740,9 @@ def meo_bang(a):
                 raise KCError(f'lan_lap.json {r.get("luot_id")} {dau}: session sha missing or another (KCF1-7)')
             _hex(x.get('khung_neo_sha256'), f'lan_lap.json {r.get("luot_id")} {dau} khung_neo_sha256')
             kn = x.get('khung_neo') or {}
+            _hex(x.get('clip_sha256'), f'lan_lap.json {r.get("luot_id")} {dau} clip_sha256')
             if not isinstance(kn, dict) or not isinstance(kn.get('id'), list) \
+                    or not all(isinstance(v, int) and not isinstance(v, bool) for v in kn['id']) \
                     or x['khung_neo_sha256'] not in _ids_sha_forms(kn['id']):
                 raise KCError(f'lan_lap.json {r.get("luot_id")} {dau}: khung_neo_sha256 is not its frame set (KCF1-7)')
             items.append(dict(nguon='lan_lap', luot_id=r.get('luot_id'), dau=dau, cho=x.get('cho') or r.get('cho'),
@@ -1738,6 +1754,8 @@ def meo_bang(a):
         f6, sha6 = load_json_sha(hc['file'])
         if sha6 != _hex(hc.get('sha256'), 'lan_lap.hieu_chuan.sha256'):
             raise KCError('hieu_chuan_neo.json: sha256 is not the one lan_lap.json names (KCF1-7)')
+        if (f6.get('session') or {}).get('sha256') != ses_sha:
+            raise KCError('hieu_chuan_neo.json: session sha256 is not the one of lan_lap.json (KCF1-7)')
         hc_rec = dict(file=os.path.abspath(hc['file']), sha256=sha6)
         for k, w in enumerate(f6.get('cua_so') or []):
             if not isinstance(w, dict) or w.get('Ph') is None:
