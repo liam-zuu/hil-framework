@@ -75,6 +75,10 @@ L131 = ('L131, Liam 19/11 phien CODE local_e6d36dbe: "Dung so, ghi gioi han (Rec
         'G3B-2 (sai camera dang R(psi) a khong tach khoi q), G3B-3 (sai nhu nhau tren ca mien cham bi hap thu)')
 L132 = ('L132, Liam 19/11 phien CODE local_e6d36dbe: "Dung B buoi 1 ke ca troi (Recommended)"; gioi han: khong tach '
         'troi ga voi sai camera')
+L136 = ('L136, Liam 20/11 phien CODE local_c29a2de2: "Ap L132 cho F08 (Recommended)": F08 dung khung B doc lai cua '
+        'DOCNHOE (hil feat/c8-doc-nhoe c47afaf, 05_DATA/results/C8/2026-11-18_run01/C1_docnhoe/B_ghep/frames.csv) ke ca '
+        'troi; gioi han: khong tach troi ga voi sai camera; 5 P2 + 4 P3 DEFERRED cua DOCNHOE (tham dinh '
+        '03_CODE/docs/review/2026-11-19_Tham_dinh_CODE_DOCNHOE_code_vong3.md); G5 F08 van chi bao cao (L130)')
 
 
 BRANCHES = ('bo_tick', 'giu_tick')
@@ -191,7 +195,8 @@ def can_quay(tb, level):
         return dict(p_m=None, psi_deg=None, trang_thai='thieu', ly_do=why,
                     he_qua='J v6 muc 12(b): G2, G3, G5 so 8 chi bao cao; G4 khung dong khong xac dinh; muc khong khoa '
                            'duoc; CAN LIAM QUYET bo muc hay cho')
-    lim = [L131] + ([L132] if tb.get('b_dung_ke_ca_troi') else []) + list(tb.get('gioi_han') or [])
+    lim = [L131] + ([L132] if tb.get('b_dung_ke_ca_troi') else []) \
+        + ([L136] if tb.get('b_dung_ke_ca_troi') and level == 'O1-F08' else []) + list(tb.get('gioi_han') or [])
     return dict(p_m=LE * p, psi_deg=LE * s, p_truoc_le_m=p, psi_truoc_le_deg=s, trang_thai='gioi_han', ly_do=[],
                 gioi_han=lim, b_dung_ke_ca_troi=bool(tb.get('b_dung_ke_ca_troi')))
 

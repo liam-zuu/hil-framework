@@ -26,6 +26,18 @@ def test_margin_once_and_limits():
     assert cq['trang_thai'] == 'gioi_han' and cq['gioi_han'][0].startswith('L131') and cq['gioi_han'][1].startswith('L132')
 
 
+def test_l136_f08_with_drift():
+    # L136 (Liam 20/11 at CODE "Ap L132 cho F08 (Recommended)"): F08 from the DOCNHOE frames, same L132 formula
+    # (x 1.25), the L136 limit written; G5 F08 still report only
+    k = K.build({'O1-F08': _tb('O1-F08', p=0.002405, s=0.7088)})
+    cq = k['muc']['O1-F08']['can_quay']
+    assert cq['p_m'] == pytest.approx(1.25 * 0.002405) and cq['psi_deg'] == pytest.approx(1.25 * 0.7088)
+    assert [g[:4] for g in cq['gioi_han'][:3]] == ['L131', 'L132', 'L136']
+    assert k['muc']['O1-F08']['chi_bao_cao'] == ['g5']
+    k5 = K.build({'O1-F05': _tb('O1-F05')})
+    assert not any(g.startswith('L136') for g in k5['muc']['O1-F05']['can_quay']['gioi_han'])
+
+
 def test_level_without_turning_bound_is_null_with_the_consequence():
     k = K.build({'O1-F08': _tb('O1-F08', dung=False)})
     cq = k['muc']['O1-F08']['can_quay']
