@@ -1987,9 +1987,15 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
     if R is None:
         out.update(placement(tv, x, y, psi, lane))
     else:
+        # CODE 19/11 (GATE: compared with mien_da_tinh of u_moc_manifest_v1): the frames this node relies on, every
+        # frame of the union domain (cat: before t1), by frame_id and the hash of that list (c7_tuong_doi.ids_sha)
+        ids_hop = [int(r['frame_id']) for r in prow if r['mien_hop']]
+        mpp = dict(nut=None if gio is None else gio['nut'], D_s=float(offset_s), id_khung=ids_hop,
+                   id_khung_sha256=ctd.ids_sha(ids_hop))
         out.update(khung_tuong_doi=_clean(dict(rel_block(rel, R), t_som_s=out.pop('t_som_s', None),
                                                gio_sha256=None if gio is None else gio['sha256'],
-                                               esp32_sha256=cm.sha256(esp32_path))), placement_n=None)
+                                               esp32_sha256=cm.sha256(esp32_path), mien_phai_phu=mpp)),
+                   placement_n=None)
     out.update(base, version=VERSION, outcome=outcome, fail_cause=fail_cause, outcome_reasons=reasons,
                completed=g1['q'], gate_v3=gate, gate_rq3=gate_rq3, cat_t1=cat, report_only=sorted(report_only), U_t_s=u_t, U_t_parts=u_t_parts, yaw_check=yaw,
                shift_max_px=shift_max, bumped=bumped, shift_drift_px=drift,

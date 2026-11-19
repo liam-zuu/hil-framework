@@ -691,3 +691,15 @@ def test_ct1_20_cli_relative_inputs_without_the_flag(tmp_path, capsys):
     assert 'without --tuong-doi' in capsys.readouterr().err
     assert cs.main(base + ['--tuong-doi', '--cua-so', 'a', '--tham-chieu', 'b', '--out', str(tmp_path / 'o.json')]) == 2
     assert '--rows' in capsys.readouterr().err
+
+
+def test_mien_phai_phu_lists_the_union_domain_frames(tmp_path):
+    """CODE 19/11: khung_tuong_doi_v1.mien_phai_phu = the frames of the union domain at this node (GATE compares it
+    with mien_da_tinh of u_moc_manifest_v1): ids, their hash (ids_sha), node (null without the C8b grid), D."""
+    lane_rows = B.make_frames('O1-F05')
+    fl, chain = to_floor('O1-F05', lane_rows)
+    out, rows = score(tmp_path, 'O1-F05', fl, rel=rel_for('O1-F05', fl, chain))
+    m = out['khung_tuong_doi']['mien_phai_phu']
+    ids = [r['frame_id'] for r in rows if r['mien_hop']]
+    assert m['id_khung'] == ids and m['id_khung_sha256'] == ctd.ids_sha(ids) and m['nut'] is None
+    assert m['D_s'] == B.OFFSET and len(ids) > 100
