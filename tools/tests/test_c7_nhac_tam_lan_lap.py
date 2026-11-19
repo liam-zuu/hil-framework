@@ -196,6 +196,12 @@ def run(files, rows, recs, tag='a', cfg=None, a6='a6.json', truc_xe=None, xoay=N
     if truc_xe is not None:                                           # one truc_xe_v1 file per place (HIEUCHUAN)
         tx = []
         for n, blk in enumerate(truc_xe(hc)):
+            nguon = blk.setdefault('nguon', [])                       # HIEUCHUAN always lists the F6 and A6 used
+            roles = {x['vai_tro'] for x in nguon}
+            if 'hieu_chuan_neo' not in roles:
+                nguon.append({'vai_tro': 'hieu_chuan_neo', 'sha256': cm.sha256(str(d / f'hc_{tag}' / 'hieu_chuan_neo.json'))})
+            if 'c8b_a6_v2' not in roles:
+                nguon.append({'vai_tro': 'c8b_a6_v2', 'sha256': cm.sha256(str(d / a6))})
             tx.append(d / f'tx_{tag}_{n}.json')
             tx[-1].write_text(json.dumps(blk), encoding='utf-8')
     xo = None
@@ -360,8 +366,11 @@ def test_e_beta_needs_no_tag(files, monkeypatch):
         r['tag'] = None
     _, _, ll, L = run(files, rows, recs)
     x = L['L01']
-    assert x['trang_thai']['beta'] == 'dat', x['ly_do']['beta']
+    # beta itself is computed without any tag frame (anchors only) ...
     assert x['beta_deg'] == pytest.approx(true_beta(('goc', -0.02, -0.6), 'goc'), abs=2e-3)
+    # ... but without a tag the pre cannot be linked to the placement of the standard (J v6 2; LLC3-1: the post
+    # cannot stand in for the pre), so the state is not concluded
+    assert x['trang_thai']['beta'] == 'chua_ket_luan' and 'lan_lap_khong_xac_dinh' in x['ly_do']['beta']
     assert x['trang_thai']['delta_c_B'] == 'chua_ket_luan' and x['delta_a_deg'] is None
     assert any(c['luot_id'] == 'L01' for c in ll['cap_loai'])                  # its pair has no common set
 
@@ -647,12 +656,14 @@ def test_lan_lap_id_changes_when_the_plate_changes(files):
     runs[2] = ('L03', ('K2', 0.0, 0.0, dict(cB=CB_TRUE + [0.002, 0.0])), ('K2', 0.0, 0.0, dict(cB=CB_TRUE + [0.002, 0.0])))
     runs[3] = ('L04', ('goc', 0.0, 0.0, dict(cB=CB_TRUE + [0.002, 0.0])), ('goc', 0.0, 0.0, dict(cB=CB_TRUE + [0.002, 0.0])))
     _, _, _, L = run(files, *build(runs=runs))
-    assert L['L01']['lan_lap_id'] == L['L02']['lan_lap_id'] == L['L05']['lan_lap_id'] == 'L0'
-    # J v6 2: a new placement without its own 12b -> no standard, G1-G4 not concluded; each run is checked against
-    # the standard of its place itself (LLC2-2 round 2), so L05 (plate back as at the 12b) keeps its standard
-    for lid in ('L03', 'L04'):
+    assert L['L01']['lan_lap_id'] == L['L02']['lan_lap_id'] == 'L0'
+    # J v6 2: a new placement without its own 12b -> no standard, G1-G4 not concluded; after a valid doi in the group
+    # (L03) a later run that matches the standard again (L05) has no standard either: the plate may have been
+    # re-seated back (LLC3-1)
+    assert L['L05']['lan_lap_id'] is None and 'lan_lap_sau_doi' in L['L05']['ly_do']['beta']
+    for lid, why in (('L03', 'tam_doi_so_chuan'), ('L04', 'lan_lap_sau_doi')):
         assert L[lid]['lan_lap_id'] is None and L[lid]['chuan_12b'] is None
-        assert 'tam_doi_so_chuan' in L[lid]['ly_do']['beta'] and L[lid]['doi_so_chuan'] is True
+        assert why in L[lid]['ly_do']['beta'] and L[lid]['doi_so_chuan'] is True
     assert L['L01']['chuan_12b'] == '12b_goc' and L['L01']['doi_so_chuan'] is False
 
 
@@ -897,7 +908,7 @@ def test_llc1_17_q_needs_both_e_ends(files):
     assert 'thieu_xoay_v1_dat' in L['L05']['ly_do']['q']
 
 
-ARM_G = 0.05      # LLC1-19 round 2: psi' vs the raw yaw (A6 dpsi about 1e-3 rad here) moves q by about 60 um > 30 um
+ARM_G = 0.05      # LLC1-19: lever arm of the test (round 3: the tolerance below is what separates psi' from raw yaw)
 
 
 def test_g_q_with_a_tilted_plate_and_a6(files):
@@ -915,7 +926,8 @@ def test_g_q_with_a_tilted_plate_and_a6(files):
     runs = [(lid, (pre[0], pre[1], pre[2], dict(g_b=gb)), (post[0], post[1], post[2], dict(g_b=gb)))
             for lid, pre, post in default_runs()]
     _, _, _, L = run(files, *build(runs=runs, plate=dict(g_b=gb)), a6='a6g.json', xoay=xoay)
-    assert np.allclose(L['L04']['q_m'], [ARM_G, 0.0], atol=3e-5)
+    # LLC1-19 round 3: correct code 0.95 um off here, the raw yaw instead of psi' 10.3 um -> 3 um separates them
+    assert np.allclose(L['L04']['q_m'], [ARM_G, 0.0], atol=3e-6)
 
 
 
@@ -1032,10 +1044,10 @@ def test_llc2_2_undetermined_link_keeps_no_standard(files):
         if w['luot_id'] == 'L01':
             _no_anchor(recs[i])
     _, _, _, L = run(files, rows, recs)
-    for lid in ('L02', 'L03'):
+    for lid, why in (('L02', 'tam_doi_so_chuan'), ('L03', 'lan_lap_sau_doi')):
         x = L[lid]
         assert x['lan_lap_id'] is None and x['chuan_12b'] is None, lid
-        assert 'tam_doi_so_chuan' in x['ly_do']['beta'], (lid, x['ly_do']['beta'])
+        assert why in x['ly_do']['beta'], (lid, x['ly_do']['beta'])
         assert x['trang_thai']['beta'] == x['trang_thai']['delta_c_B'] == 'chua_ket_luan'
 
 
@@ -1134,6 +1146,7 @@ def test_llc1_2_round2_anchor_gate_on_the_common_set(files):
     _, _, _, L = run(files, rows, recs, cfg=dict(min_khung=5))
     x = L['L04']
     assert 'du_neo_tap_chung_vuot_r_max' in x['dau']['pre']['ly_do'], x['dau']['pre']['ly_do']
+    assert x['dau']['pre']['khung_chung']['id'] == [] and x['dau']['pre']['khung_chung_sha256'] is None   # LLC3-3
     assert x['trang_thai']['delta_c_B'] == 'chua_ket_luan' and x['delta_c_B_m'] is None
 
 
@@ -1341,3 +1354,187 @@ def test_v4_13_f15_beta_cam_replay(files):
     (files / 'f15d.json').write_text(json.dumps(o), encoding='utf-8')
     with pytest.raises(ValueError, match='hieu_chuan'):
         _again(files, rows, recs, 'f', files / 'f15d.json')
+
+
+# ---------------------------------------------------------------- Codex round 3 (LLC3-n, LLC2-1 / LLC1 rest, F15C-n)
+def test_llc3_1_doi_inside_a_run_breaks_the_group(files):
+    """L01: pre as the standard, post 2 mm off (plate moved in the run); the plate is re-seated back before L02 with
+    no new 12b: L02 matches the standard again but gets no standard."""
+    sh = dict(cB=CB_TRUE + [0.002, 0.0])
+    runs = [('L01', ('goc', 0.0, 0.0, {}), ('goc', 0.01, 0.2, sh)), ('L02', ('goc', 0.0, 0.1, {}), ('goc', 0.01, 0.3, {}))]
+    _, _, _, L = run(files, *build(runs=runs))
+    assert L['L01']['tam_doi_trong_luot'] is True and L['L01']['chuan_12b'] == '12b_goc'
+    assert L['L02']['doi_so_chuan'] is False and L['L02']['chuan_12b'] is None
+    assert 'lan_lap_sau_doi' in L['L02']['ly_do']['beta'] and L['L02']['lan_lap_id'] is None
+
+
+def test_llc2_1_round3_f7_of_another_f6_or_unlocked(files):
+    def khac_f6(hc):
+        o = truc_xe_ok(hc)
+        for b in o:
+            b['nguon'].append({'vai_tro': 'hieu_chuan_neo', 'sha256': 'khac'})
+        return o
+
+    def chua_khoa(hc):                    # LLC3-2: HIEUCHUAN writes null angles when not locked
+        o = truc_xe_ok(hc)
+        for b in o:
+            b.update(trang_thai='chua_ket_luan', a_k_deg=None, phi_hat_chuan_k_deg=None, u_phi_hat_chuan_k_deg=None)
+        return o
+    for tag, f, why in (('f6', khac_f6, 'truc_xe_khac_f6_hoac_a6'), ('ck', chua_khoa, 'truc_xe_chua_dat')):
+        _, _, _, L = run(files, *build(), truc_xe=f, tag=tag)
+        assert why in L['L01']['ly_do']['phi'] and L['L01']['trang_thai']['phi'] == 'chua_ket_luan', tag
+        assert L['L01']['trang_thai']['beta'] == 'dat', tag
+
+
+def test_llc1_7_round3_frame_list_hash_checked():
+    rows, _ = build()
+    ok = [dict(w, khung_sha256=nt.sha_ids([k['id'] for k in w['khung']])) for w in rows]
+    nt.kiem_f2(ok)
+    bad = [dict(w) for w in ok]
+    bad[3] = dict(bad[3], khung_sha256=nt.sha_ids([k['id'] + 1 for k in bad[3]['khung']]))
+    with pytest.raises(ValueError, match='khung_sha256'):
+        nt.kiem_f2(bad)
+
+
+def test_llc1_12_round3_ratio_below_one_branch():
+    """s_s / s_d < 1: the index uses max(ratio, 1) (never below the design's (H - h) x spread)."""
+    ctx, g = _ctx(), np.zeros(2)
+    s0 = ws('K1', 0.0, 0.0)
+    d1 = dict(s0, s=s0['s'] / 0.9985)                                 # s_s / s_d = 0.9985
+    _, _, u_dh = nt.u_delta_c_B(s0, d1, ctx, g, 0.0, 0.0, 0.0008, 0.0, 0.0)
+    K = H_CAM * (H_CAM - TAG_H) / H_CAM
+    assert u_dh == pytest.approx(K * 0.0008, rel=1e-9) and u_dh > K * 0.9985 * 0.0008
+
+
+def test_llc1_15_round3_raw_row_order(files):
+    """F2 rows of one clip: the post row (4 s) written before the pre row (1 s) -> order contradicted."""
+    rows, recs = build()
+    i_pre = next(i for i, w in enumerate(rows) if w['luot_id'] == 'L01' and w['loai'] == 'pre')
+    i_post = next(i for i, w in enumerate(rows) if w['luot_id'] == 'L01' and w['loai'] == 'post')
+    for i, t0 in ((i_pre, 1.0), (i_post, 4.0)):
+        rows[i]['clip_sha256'] = 'same'
+        for k, r in enumerate(recs[i]):
+            r['t'] = t0 + k / 600.0
+        rows[i]['khung'] = [{'id': r['id'], 'pts_s': r['t']} for r in recs[i]]
+    rows[i_pre], rows[i_post] = rows[i_post], rows[i_pre]
+    recs[i_pre], recs[i_post] = recs[i_post], recs[i_pre]
+    _, _, _, L = run(files, rows, recs)
+    assert all(x['lan_lap_id_ly_do'] == 'thu_tu_mau_thuan' for x in L.values())
+
+
+def _f15_hash(o):
+    import hashlib
+    o.pop('sha256', None)
+    o['sha256'] = hashlib.sha256(json.dumps(o, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+    return o
+
+
+def test_f15c_round1_checks(files):
+    rows, recs = build()
+    _, hc, ll, L = run(files, rows, recs, tag='g')
+    ctx = _ctx()
+    G, h = np.array(hc['G']), np.array(hc['h'])
+
+    # F15C-6: one case with BOTH ends moved: d beta = wrap(d alpha_pre - d alpha_standard), n = verified runs
+    def ab(cho, lid, dau, k):
+        if k == 0 and dau == 'pre':
+            return {'AB': [2e-4, 0.0]}
+        if k == 1 and dau == 'chuan':
+            return {'AB': [0.0, 3e-4]}
+        return {'AB': [0.0, 0.0]}
+    _f15(ll, ab, files / 'g1.json')
+    b = _again(files, rows, recs, 'g', files / 'g1.json')['beta_cam_replay']['goc']
+    exp, n = 0.0, 0
+    for r in ll['luot']:
+        if r['cho'] == 'goc' and r['chuan_12b'] is not None:
+            d = []
+            for dau, dP in (('chuan', [[0, 0], [0.0, 3e-4], [0, 0]]), ('pre', [[2e-4, 0.0], [0, 0], [0, 0]])):
+                P = np.array(r['dau'][dau]['Ph_neo_m'])
+                d.append(nt.wrap(nt.tu_the(G, h, P + dP, C + F_OFF, H_CAM, C, ctx.a_n)[0]
+                                 - nt.tu_the(G, h, P, C + F_OFF, H_CAM, C, ctx.a_n)[0]))
+            exp, n = max(exp, abs(nt.wrap(d[1] - d[0]))), n + 1
+    assert b['trang_thai'] == 'dat' and b['n'] == n >= 1 and b['max_abs_dbeta_rad'] == pytest.approx(exp, rel=1e-9)
+
+    def dong(cho, lid, dau, k):
+        return {'c': [1e-4, 0.0]}
+    # F15C-1: a duplicated entry (the first of another frame set) -> not dat
+    o = _f15(ll, dong, files / 'g2.json')
+    m0 = next(m for m in o['theo_cho']['goc']['muc'] if m['dau'] == 'pre')
+    o['theo_cho']['goc']['muc'].insert(0, dict(m0, khung_neo_sha256='khac'))
+    (files / 'g2.json').write_text(json.dumps(_f15_hash(o)), encoding='utf-8')
+    b = _again(files, rows, recs, 'g', files / 'g2.json')['beta_cam_replay']['goc']
+    assert b['trang_thai'] == 'chua_ket_luan' and any('muc_trung' in x for x in b['ly_do'])
+    # F15C-2: not the held-out cases / already with the margin -> error
+    for k in ('bo_H32', 'truoc_le'):
+        o = _f15(ll, dong, files / f'g3{k}.json')
+        o[k] = False
+        (files / f'g3{k}.json').write_text(json.dumps(_f15_hash(o)), encoding='utf-8')
+        with pytest.raises(ValueError, match='bo_H32'):
+            _again(files, rows, recs, 'g', files / f'g3{k}.json')
+    # F15C-3: a case vector with one component / a case missing at one anchor -> not dat, no broadcasting
+    o = _f15(ll, dong, files / 'g4.json')
+    m0 = next(m for m in o['theo_cho']['goc']['muc'] if m['dau'] == 'pre')
+    m0['neo']['A']['c'] = [2e-4]
+    (files / 'g4.json').write_text(json.dumps(_f15_hash(o)), encoding='utf-8')
+    b = _again(files, rows, recs, 'g', files / 'g4.json')['beta_cam_replay']['goc']
+    assert b['trang_thai'] == 'chua_ket_luan' and any('vec_sai' in x for x in b['ly_do'])
+    o = _f15(ll, dong, files / 'g5.json')
+    m0 = next(m for m in o['theo_cho']['goc']['muc'] if m['dau'] == 'pre')
+    del m0['neo']['B']['c']
+    (files / 'g5.json').write_text(json.dumps(_f15_hash(o)), encoding='utf-8')
+    b = _again(files, rows, recs, 'g', files / 'g5.json')['beta_cam_replay']['goc']
+    assert b['trang_thai'] == 'chua_ket_luan' and any('ca_thieu' in x for x in b['ly_do'])
+    # F15C-5: a place with runs to replay but no block -> listed, not dat
+    o = _f15(ll, dong, files / 'g6.json')
+    del o['theo_cho']['K1']
+    (files / 'g6.json').write_text(json.dumps(_f15_hash(o)), encoding='utf-8')
+    b = _again(files, rows, recs, 'g', files / 'g6.json')['beta_cam_replay']
+    assert b['K1']['trang_thai'] == 'chua_ket_luan' and 'thieu_khoi_cho' in b['K1']['ly_do']
+
+
+def test_f15c_4_only_runs_with_a_verified_standard(files):
+    sh = dict(cB=CB_TRUE + [0.002, 0.0])
+    runs = default_runs()
+    runs[3] = ('L04', ('goc', 0.0, 0.0, sh), ('goc', 0.0, 0.0, sh))          # off the standard: beta only diagnostic
+    rows, recs = build(runs=runs)
+    _, _, ll, L = run(files, rows, recs, tag='v')
+    assert L['L04']['beta_deg'] is not None and L['L04']['chuan_12b'] is None
+
+    def dong(cho, lid, dau, k):
+        return {'c': [1e-4, 0.0]}
+    _f15(ll, dong, files / 'v1.json')
+    b = _again(files, rows, recs, 'v', files / 'v1.json')['beta_cam_replay']['goc']
+    assert b['n'] == sum(1 for r in ll['luot'] if r['cho'] == 'goc' and r['chuan_12b'] is not None)
+
+
+def test_f15c_5_source_checked_without_the_anchor_shape(files):
+    (files / 'kiem.json').write_text(json.dumps(kiem_r(files / 'mau.mov', NEO_BOXES[:2])), encoding='utf-8')
+    rows, recs = build()
+    _, hc, ll, L = run(files, rows, recs, tag='ng')
+    o = dict(schema='c7_meo_dau_chan_bang_v1', chieu='held_minus_full', bo_H32=True, truoc_le=True,
+             neo_ten=ll['neo_ten'], kappa_n=H_N / ZC, lan_lap=dict(hieu_chuan_sha256='khac'), theo_cho={})
+    (files / 'n1.json').write_text(json.dumps(_f15_hash(o)), encoding='utf-8')
+    with pytest.raises(ValueError, match='hieu_chuan'):
+        _again(files, rows, recs, 'ng', files / 'n1.json')
+    o['lan_lap']['hieu_chuan_sha256'] = ll['hieu_chuan']['sha256']
+    (files / 'n2.json').write_text(json.dumps(_f15_hash(o)), encoding='utf-8')
+    b = _again(files, rows, recs, 'ng', files / 'n2.json')['beta_cam_replay']
+    assert b and all(v['trang_thai'] == 'chua_ket_luan' for v in b.values())
+
+
+def test_ct4_3_empty_or_null_window_keeps_the_run(files):
+    """CODE CT4-3: CAM writes post.khung = [] (clip too short; null in old files): the window fails, the run is still in
+    F8; the placement uses the pre; a pre without frames -> lan_lap_khong_xac_dinh."""
+    rows, recs = build()
+    idx = {(w['luot_id'], w['loai']): i for i, w in enumerate(rows)}
+    for key, val in ((('L02', 'post'), []), (('L03', 'post'), None), (('L05', 'pre'), [])):
+        i = idx[key]
+        rows[i]['khung'], rows[i]['khung_ma_hop_le'], recs[i] = val, [], []
+    nt.kiem_f2(rows)
+    _, _, ll, L = run(files, rows, recs)
+    assert sorted(L) == [f'L{j:02d}' for j in range(1, 7)]
+    assert L['L02']['chuan_12b'] is not None and L['L02']['beta_deg'] is not None        # placement from the pre
+    assert L['L02']['tam_doi_trong_luot'] is None
+    assert L['L05']['lan_lap_id'] is None and 'lan_lap_khong_xac_dinh' in L['L05']['ly_do']['beta']
+    bad = {(x['meta']['luot'], x['meta']['loai']) for x in ll['cua_so_loi']}
+    assert {('L02', 'post'), ('L03', 'post'), ('L05', 'pre')} <= bad
