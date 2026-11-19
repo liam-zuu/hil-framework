@@ -352,8 +352,13 @@ def test_us_end_cut_ticks_read_and_covering(tmp_path):
     assert checks(d)[2]['cat_pwm'] == 'khong'
     write_events(d, [start.replace('e75f708f', '0badb00f'), end.format(c=0).replace('e75f708f', '0badb00f')])
     assert checks(d)[2]['cat_pwm'] == 'chua_xac_minh'
+    # HCC2-3: blk_ticks counts the whole motor run (us_state.h): reported, not a gate of the schedule
     write_events(d, [start, end.format(c=0).replace('blk_ticks=0', 'blk_ticks=3')])
-    assert not checks(d)[0]['khong_cat_sieu_am']
+    ok, _, info = checks(d)
+    assert ok['khong_cat_sieu_am'] and info['blk_ticks'] == 3
+    # HCC2-3 (Codex): two footers of the same run that disagree (cut 5 and 0) are no evidence
+    write_events(d, [start, end.format(c=5), end.format(c=0)])
+    assert checks(d)[2]['cat_pwm'] == 'chua_xac_minh'
 
 
 # ------------------------------------------------------------------ Codex code review round 1 (HCC1-7..9)
@@ -396,7 +401,7 @@ def test_tag_off_turn_axis_does_not_make_translations(tmp_path):
     ck, info = ca.kiem(A)
     D, u_D, _ = ca.align(A['log'], info['blocks'], frames(d))
     kinds = [k for _, _, k in ca.cam_motion_events(frames(d))]
-    assert kinds == ['vx'] * 6 + ['wz'] * 2 and u_D <= ca.U_D_MAX_S
+    assert kinds == ['vx'] * 6 + ['wz+', 'wz-'] and u_D <= ca.U_D_MAX_S
 
 
 def test_short_heading_pulse_fails_dynamic_yaw(tmp_path):
@@ -541,3 +546,94 @@ def test_tinh_real_footprint_from_camera(tmp_path):
     ca.main(tinh_args(d, 'K2', '--moc', tv.MOC, '--out', out))
     r = json.load(open(out, encoding='utf-8'))
     assert r['vet_thuc'] is not None and r['cong']['vet_thuc'] and r['vet_thuc']['khe_m'] > 0.05
+
+
+# ------------------------------------------------------------------ Codex code review round 2 (HCC2-2..8)
+def test_log_cut_while_run_active_fails(tmp_path):
+    """HCC2-2 (Codex): a K2 log cut at a row with run_active=1, traj_age 7 ms and a matching summary passed."""
+    d, _ = make(tmp_path, cho='K2')
+
+    def fn(hdr, body):
+        i0, i1 = run_rows(hdr, body)
+        ages = [int(body[i][col(hdr, 'traj_age_ms')]) for i in range(i1 - 40, i1)]
+        cut = i1 - 40 + max(k for k, a in enumerate(ages) if a <= 10)
+        del body[cut + 1:]
+    edit_log(d, fn)
+    ok, ck, _ = checks(d)
+    assert not ok['het_han_firmware'], ck
+
+
+def mirror_second_turn(F, D, t_from, t_s=6.0):
+    """Camera heading of the second E direction mirrored about its start (both turns then go the same way)."""
+    G = dict(F)
+    ps = np.unwrap(F['psi'].copy())
+    m = F['t'] + D - t_s >= t_from
+    i0 = int(np.flatnonzero(m)[0])
+    ps[m] = ps[i0] - (ps[m] - ps[i0])
+    G['psi'] = (ps + np.pi) % (2 * np.pi) - np.pi
+    return G
+
+
+def test_video_E_wrong_direction_fails(tmp_path):
+    """HCC2-4 (Codex): the second turn mirrored (two turns the same way, ~+5 turns) passed with 2.50 each."""
+    d, truth = make(tmp_path, 'HC_K1_1', cho='K1')
+    import c8_hc_seq as hs
+    t2 = [s for s in hs.schedule('K1') if s['loai'] == 'xoay'][1]['t0'] - 2.0
+    ok, vk = video(d, mirror_second_turn(frames(d), truth['D'], t2))
+    assert not (ok['giong_camera_log'] and ok['phu_E']), vk
+
+
+def test_tinh_refuses_other_frames_than_f2_f5(tmp_path):
+    """HCC2-5 (Codex): F2/F5 made from frames A, tinh run on frames B (+0.25 deg) still gave khoa."""
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
+    ref, doan = run_cua_so(d)
+    neo = write_json(str(tmp_path / 'neo.json'), dict(cho=dict(K2=dict(
+        psi_chuan_k_deg=12.0, clip_sha256=ref['clip_sha256'], khung_chung_sha256=ref['khung_ma_hop_le_sha256']))))
+    fb = os.path.join(d, 'frames_B.csv')
+    with open(os.path.join(d, 'frames.csv'), encoding='utf-8') as f, open(fb, 'w', encoding='utf-8') as g:
+        g.write(f.readline())
+        for ln in f:
+            c = ln.rstrip('\n').split(',')
+            c[6] = f'{float(c[6]) + math.radians(0.25):.6f}'
+            g.write(','.join(c) + '\n')
+    args = ['tinh', '--cho', 'K2', '--cap', d, '--frames-of', f"{d}={fb},{os.path.join(d, 'track.json')}", '--neo', neo]
+    assert ca.main(args) == 2
+    # F5 edited after writing (L_m), the embedded sha256 kept: refused
+    doan['doan'][0]['L_m'] = 0.9
+    write_json(os.path.join(d, 'doan_12b_v1.json'), doan)
+    e = write_json(str(tmp_path / 'e.json'), dict(doan_12b_sha256=doan['sha256'],
+                                                  doan=[dict(i=i, e_hieu_m=0.002) for i in range(6)]))
+    assert ca.main(tinh_args(d, 'K2', '--e-hieu', e)) == 2
+
+
+def test_vet_thuc_touch_between_kept_frames():
+    """HCC2-6 (Codex): 7 frames at 30 fps, the car goes 6 mm forward and back; the middle frame touches."""
+    import c8_hc_vet as cv
+    q = cv.rect(0.0, 0.05, -0.05, 0.05)
+    tags = {1: q}
+    reach = cv.reach('340_doc')
+    x_touch = -cv.BODY_LONG / 2 - 0.0005                       # body front edge 0.5 mm past the tag edge
+    xs = x_touch - 0.006 + 0.006 * np.array([0, 1 / 3, 2 / 3, 1, 2 / 3, 1 / 3, 0])
+    t = np.arange(7) / 30.0
+    r = cv.vet_thuc_camera(t, xs, np.zeros(7), np.zeros(7), 0.0, tags, 0.0, hyps=('340_doc',), every=1)
+    assert r['khe_m'] <= 0.0
+    assert reach > 0
+
+
+def test_f5_roles_of_shared_window(tmp_path):
+    """HCC2-7 (Codex): K1 'all' labelled the end of the last short 12b leg E_dau; and khoa needs every source."""
+    d, _ = make(tmp_path, 'HC_K1_1', cho='K1')
+    _, doan = run_cua_so(d)
+    last_short = [x for x in doan['doan'] if not x['dai']][-1]
+    assert last_short['cua_so_b']['loai'] == 'dung_12b' and doan['trang_thai'] == 'chan_doan'
+
+
+def test_q_turn_term_needs_sourced_two_end_bound(tmp_path):
+    """HCC2-8 (Codex): with a stable bias inside each window the half-split spread is 0 and u_q became 0."""
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2', noise_psi_deg=0.0)
+    an = analyse(d)
+    r0 = ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.02, 0.0], du_m=0.0, neo=0.0, psi_cuc=0.0)
+    assert any('u_psi_hai_dau' in x for x in r0['ly_do']) and r0['trang_thai'] != 'khoa'
+    r1 = ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.02, 0.0], du_m=0.0, neo=0.0, psi_cuc=0.0,
+                         psi_hai_dau=math.radians(0.5))
+    assert r1['u_hang_deg']['u_q'] >= 0.019                    # |q| 2 sin(0.25 deg) / 0.50 m ~ 0.020 deg

@@ -69,6 +69,8 @@ GAP_ABORT_S = 0.100                # a gap between two sends above this aborts (
 SENDTO_MAX_S = 0.020               # one sendto longer than this aborts (HCC1-1); real socket timeout too
 READY_LEAD_S = 0.5                 # the car-ready check runs this long before the first motion packet (HCC1-3)
 READY_ROWS = 20                    # logger rows (~0.2 s at 10 ms) that must show a ready car
+READY_PRIME_K = 25                 # first ready check 0.5 s before the final one; the log must advance between
+READY_ADVANCE = 25                 # log_seq rows the stream must add between the two checks (~50 expected)
 READY_AGE_MS = 60                  # traj_age_ms in those rows (zeros are being sent at 50 Hz)
 LOCK_PATH = '/tmp/hil_tai_san.lock'  # shared floor lock (HCC1-3); tools that do not take it are seen by pgrep
 WAIT_FIRST_ROW_S = 10.0            # logger must write a data row within this
@@ -245,8 +247,8 @@ def send_schedule(ip, segs, sock, out, clock=time.monotonic, sleep=time.sleep, w
             k_now = max(st['k'], int(math.floor(now * SEND_HZ + 1e-9)))
             if last_chk is not None:                     # also when the stall jumped past the end (HCC1-1)
                 gap = now - last_chk
-                st['gap_max'] = max(st['gap_max'], gap)
-                if gap > GAP_ABORT_S:
+                if gap > GAP_ABORT_S - SENDTO_MAX_S:
+                    st['gap_max'] = max(st['gap_max'], gap + SENDTO_MAX_S)
                     raise Abort('tre_gui', k=k_now, gap_ms=f'{gap * 1000:.1f}')
             if k_now >= total:
                 st['skipped'] += total - st['k']
@@ -255,6 +257,15 @@ def send_schedule(ip, segs, sock, out, clock=time.monotonic, sleep=time.sleep, w
             st['k'] = k = k_now
             if not alive():
                 raise Abort('logger_chet', k=k)
+            if not st.get('primed') and ready is not None and k_ready >= READY_PRIME_K \
+                    and k >= k_ready - READY_PRIME_K:
+                st['primed'] = True
+                why = ready()
+                buf.append(f"#kiem_truoc_chay,k={k},lan=1,ket_qua={'dat' if why is None else 'hong'}"
+                           + ('' if why is None else ',ly_do=' + str(why).replace(',', ';')))
+                if why is not None:
+                    raise Abort('xe_chua_san_sang', k=k)
+                continue
             if not ready_done and k >= k_ready:
                 ready_done = True
                 why = ready()
@@ -276,8 +287,16 @@ def send_schedule(ip, segs, sock, out, clock=time.monotonic, sleep=time.sleep, w
                 vx = vy = wz = 0.0
             pkt = pack_packet(vx, vy, wz)
             chk = clock() - t0                           # immediately before sendto
-            if last_chk is not None and chk - last_chk > GAP_ABORT_S:
-                st['gap_max'] = max(st['gap_max'], chk - last_chk)
+            # HCC2-1: send sample k only inside the first half of its 20 ms cell; a later clock means the sample is
+            # stale: choose again (counted as skipped), so two packets are never sent closer than DT/2
+            if chk >= k * DT + DT / 2:
+                wait = t0 + (k + 1) * DT - clock()
+                if wait > 0:
+                    sleep(wait)
+                continue
+            # true gap between two packets <= (chk - chk_prev) + sendto time: keep it <= GAP_ABORT_S
+            if last_chk is not None and chk - last_chk > GAP_ABORT_S - SENDTO_MAX_S:
+                st['gap_max'] = max(st['gap_max'], chk - last_chk + SENDTO_MAX_S)
                 raise Abort('tre_gui', k=k, gap_ms=f'{(chk - last_chk) * 1000:.1f}')
             try:
                 sock.sendto(pkt, (ip, TRAJ_PORT))
@@ -286,7 +305,7 @@ def send_schedule(ip, segs, sock, out, clock=time.monotonic, sleep=time.sleep, w
             done = clock() - t0
             st['sendto_max'] = max(st['sendto_max'], done - chk)
             if last_chk is not None:
-                st['gap_max'] = max(st['gap_max'], chk - last_chk)
+                st['gap_max'] = max(st['gap_max'], done - last_chk)     # upper bound of the packet gap (HCC2-1)
             last_chk = chk
             if done - chk > SENDTO_MAX_S:
                 raise Abort('sendto_cham', k=k, ms=f'{(done - chk) * 1000:.1f}')
@@ -429,6 +448,31 @@ def car_ready(csv_path, n=READY_ROWS):
     return None
 
 
+class ReadyCheck:
+    """car_ready() called twice before the first motion packet (HCC2-1): the second call also needs the newest
+    log_seq to have moved by READY_ADVANCE since the first one (a logger alive but no longer receiving keeps
+    old rows that would pass), and the newest row read within the last 0.2 s of the Pi clock (file mtime)."""
+    def __init__(self, csv_path, clock=time.time):
+        self.csv, self.clock, self.seq = csv_path, clock, None
+
+    def __call__(self):
+        why = car_ready(self.csv)
+        if why is not None:
+            return why
+        try:
+            cols, rows = _tail_rows(self.csv)
+            seq = int(float(rows[-1].split(',')[cols.index('log_seq')]))
+            age = self.clock() - os.path.getmtime(self.csv)
+        except (OSError, ValueError, IndexError):
+            return 'log_seq khong doc duoc'
+        if age > 0.2:
+            return f'log dung {age:.2f} s'
+        prev, self.seq = self.seq, seq
+        if prev is not None and seq - prev < READY_ADVANCE:
+            return f'log_seq chi tang {seq - prev}'
+        return None
+
+
 def floor_lock(path=LOCK_PATH):
     """Exclusive non-blocking lock shared by the floor tools that take it (HCC1-3); None where fcntl is missing
     (Windows tests). Raises SeqError when another holder has it."""
@@ -558,7 +602,7 @@ def _attempt(a, segs, d, out, clock, sleep, wall, sock, popen, query, pgrep, rea
         if own:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.settimeout(SENDTO_MAX_S)                    # a blocked sendto raises (HCC1-1)
-        rd = ready or (lambda: car_ready(csv_path))
+        rd = ready or ReadyCheck(csv_path)
         try:
             moved = True
             r = send_schedule(a.ip, segs, s, say, clock, sleep, wall, alive=lambda: proc.poll() is None,

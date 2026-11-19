@@ -482,3 +482,49 @@ def test_e2e_real_logger_posix(tmp_path, ctrl_c):
     import c8_hc_seq_e2e as e2e
     code, txt, summ, esp = e2e.chay(str(tmp_path), ctrl_c_after=12.0 if ctrl_c else None)
     assert e2e.kiem(code, txt, summ, esp, ctrl_c) == []
+
+
+# ------------------------------------------------------------------ Codex code review round 2 (HCC2-1)
+def test_ready_check_needs_a_moving_log(tmp_path):
+    """HCC2-1 (Codex): 20 old ready rows kept passing; the second check needs log_seq to advance and a fresh file."""
+    p = str(tmp_path / 'log.csv')
+    cols = ('timestamp_us', 'log_seq', 'motor_on', 'run_active', 'sp_vx', 'sp_vy', 'sp_wz', 'traj_age_ms')
+    write_log(p, [(i, i, 1, 1, '0.000', '0.000', '0.000', 10) for i in range(40)], cols)
+    now = lambda: os.path.getmtime(p) + 0.05                                     # noqa: E731
+    rc = hs.ReadyCheck(p, clock=now)
+    assert rc() is None
+    assert 'chi tang' in rc()                                                   # same rows: the stream stopped
+    write_log(p, [(i, i, 1, 1, '0.000', '0.000', '0.000', 10) for i in range(80)], cols)
+    assert rc() is None
+    assert 'log dung' in hs.ReadyCheck(p, clock=lambda: os.path.getmtime(p) + 1.0)()
+
+
+def test_late_sample_is_chosen_again_not_sent_twice():
+    """HCC2-1 (Codex): a 60 ms delay after the sample was chosen sent two forward packets at the same time."""
+    segs = hs.schedule('K2')
+    clock = FakeClock()
+    sock = TimedSock(clock)
+    calls = {'n': 0}
+
+    def wall():
+        calls['n'] += 1
+        if calls['n'] == 3:                                                     # inside the loop ('#seg' of a move)
+            clock.t += 0.060
+        return 1.0e9
+    try:
+        hs.send_schedule('1.2.3.4', segs, sock, lambda s: None, clock, clock.sleep, wall)
+    except hs.Abort:
+        pass
+    gaps = [b - a for a, b in zip(sock.times[:-1], sock.times[1:])]
+    assert min(gaps) >= hs.DT / 2 - 1e-9
+
+
+def test_reported_gap_bounds_the_true_gap():
+    """HCC2-1 (Codex): a 101 ms gap between packets was reported as 99 ms (clock read before sendto)."""
+    segs = hs.schedule('K2')
+    clock = FakeClock(stall={300: 0.065})
+    sock = TimedSock(clock, delay={299: 0.015, 300: 0.015})
+    r, err, out, _ = run_send(segs, clock, sock=sock)
+    end = [ln for ln in out if ln.startswith('#seq_end')][0]
+    rep = float(end.split('gap_max_ms=')[1].split(',')[0]) / 1000
+    assert rep >= max_gap(sock) - 1e-9

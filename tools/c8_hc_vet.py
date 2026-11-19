@@ -207,11 +207,17 @@ def vet_thuc(poses, tags, hyp):
     return best
 
 
-def vet_thuc_camera(t, x, y, psi_tag, a, tags, d, hyps=HYPS, every=6):
+V_BOUND, W_BOUND = 0.6, 1.0     # m/s, rad/s: Pi limits 0.15 / 0.6 + firmware outer loop up to 0.5 / 0.5 (v4 2.3)
+
+
+def vet_thuc_camera(t, x, y, psi_tag, a, tags, d, hyps=HYPS, every=1):
     """Real footprint from the camera (HCC1-13), every `every`-th valid frame: the body heading is the tag heading
     - a, the body centre is within d of the measured centre (the chain gives the tag centre after q, not the body
     box centre), and between two used frames the car moves at most the largest step of the frames (translation +
-    reach x turn), half of which is taken off. Returns dict(khe_m, ma, buoc_m, d_m, hyp) of the worst hypothesis."""
+    reach x turn), half of which is taken off. Returns dict(khe_m, ma, buoc_m, d_m, hyp) of the worst hypothesis.
+    HCC2-6: every valid frame is used (every=1) and the step between two used frames is bounded in TIME
+    (V_BOUND dt + reach W_BOUND dt), not by the pose difference, so a touch between frames or across a gap without
+    the tag is covered (a long gap makes the gap negative: no evidence)."""
     t, x, y, psi_tag = (np.asarray(v, float) for v in (t, x, y, psi_tag))
     if len(t) < 2:
         return None
@@ -222,7 +228,9 @@ def vet_thuc_camera(t, x, y, psi_tag, a, tags, d, hyps=HYPS, every=6):
     out = None
     for hyp in hyps:
         r = reach(hyp)
-        step = np.hypot(np.diff(x[use]), np.diff(y[use])) + r * np.abs(np.diff(th[use]))
+        dt = np.diff(t[use])
+        step = np.maximum(np.hypot(np.diff(x[use]), np.diff(y[use])) + r * np.abs(np.diff(th[use])),
+                          (V_BOUND + r * W_BOUND) * dt)
         g, tid = vet_thuc(zip(x[use], y[use], th[use]), tags, hyp)
         k = g - d - (float(np.max(step)) / 2 if len(step) else 0.0)
         if out is None or k < out['khe_m']:

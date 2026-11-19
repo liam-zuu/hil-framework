@@ -266,6 +266,17 @@ def sender_domain(L, i0, i1):
         raise AError('no fresh trajectory packet inside the run')
     j_s = i0 + int(fresh[-1])
     problems = []
+    # HCC2-2: the falling edge must be in the log, the rows continuous across it, the age there >= EXPIRY_MS and
+    # the wait before it reaching EXPIRY_MS - EXPIRY_SLACK_S (a log cut while run_active is 1 is not a full run)
+    if i1 >= L['n'] - 1:
+        problems.append('khong thay canh ha run_active (log het khi run_active=1)')
+    else:
+        if L['log_seq'][i1 + 1] != L['log_seq'][i1] + 1:
+            problems.append('ho log_seq o canh ha')
+        if L['traj_age_ms'][i1 + 1] < EXPIRY_MS:
+            problems.append(f"canh ha khi traj_age {L['traj_age_ms'][i1 + 1]:.0f} ms < 200")
+    if i1 <= j_s or age[i1] < EXPIRY_MS - EXPIRY_SLACK_S * 1000:
+        problems.append(f'khong thay phan cho het han (age cuoi {age[i1]:.0f} ms)')
     if i1 > j_s:
         ex = slice(j_s + 1, i1 + 1)
         if np.any(np.diff(age[j_s:i1 + 1]) < 0):
@@ -345,6 +356,8 @@ def us_evidence(texts, boot, L, i0, i1):
         if not np.all(L['motor_on'][j0:jl + 1] > 0.5):
             why = 'motor tat giua luot #us'
             continue
+        if cover is not None and cover != e:                 # HCC2-3: two different footers both fit
+            return changes, None, '#us_end mau thuan (nhieu ban khac noi dung cung phu luot)'
         cover, why = e, ''
     return changes, cover, why
 
@@ -390,9 +403,9 @@ def kiem(A, age_r_max_ms=125.0):
         add('dinh_danh_fw_gain_log', okfw and not bad_g and bool(boot),
             f"#fw {len(fw)} #gain {len(gn)}" + (f"; #gain sai boot/first_seq: {bad_g[0]}" if bad_g else ''))
         changes, cover, why_us = us_evidence(texts, boot, L, i0, i1)
-        blk = cover is not None and (_int(cover.get('blk_ticks')) or 0) > 0
-        add('khong_cat_sieu_am', not changes and not blk, f'{len(changes)} #us change; blk_ticks '
-            f"{cover.get('blk_ticks') if cover else '-'}")
+        info['blk_ticks'] = None if cover is None else _int(cover.get('blk_ticks'))   # whole motor run: info only
+        add('khong_cat_sieu_am', not changes, f'{len(changes)} #us change; blk_ticks '
+            f"{cover.get('blk_ticks') if cover else '-'} (chi bao, ca luot motor)")
         if cover is None:
             info['cat_pwm'], info['cat_pwm_ly_do'] = 'chua_xac_minh', why_us
         else:
@@ -591,7 +604,10 @@ def cam_motion_events(F, thr_v=0.02, thr_w=math.radians(5.0), half=0.25, rot_gua
     near_rot = np.zeros(len(t), bool)
     for a, b in _intervals(t, w, thr_w, min_s=0.0, max_hole_s=0.0):
         near_rot |= (t >= a - rot_guard_s) & (t <= b + rot_guard_s)
-    ev = [(a, b, 'wz') for a, b in _intervals(t, np.where(rot, w, 0.0), thr_w)]
+    ev = []
+    for a, b in _intervals(t, np.where(rot, w, 0.0), thr_w):        # HCC2-4: kind carries the turn direction
+        ia, ib = np.searchsorted(t, a), min(np.searchsorted(t, b), len(t) - 1)
+        ev.append((a, b, 'wz+' if p[ib] - p[ia] > 0 else 'wz-'))
     ev += [(a, b, 'vx') for a, b in _intervals(t, np.where(near_rot, 0.0, v), thr_v)]
     return sorted(ev)
 
@@ -623,7 +639,8 @@ def align(L, blocks, F):
     lev = log_motion_events(L, blocks)
     if any(e is None for e in lev):
         raise AError('a schedule block without motion in the encoder log')
-    lk = [(s, e, b['truc']) for (s, e), b in zip(lev, blocks)]
+    lk = [(s, e, b['truc'] if b['truc'] == 'vx' else ('wz+' if b['tp_wz'] > 0 else 'wz-'))
+          for (s, e), b in zip(lev, blocks)]
     cev = cam_motion_events(F)
     kinds = [k for _, _, k in lk]
     best = None
@@ -707,7 +724,7 @@ def e_coverage(F, L, blocks, D):
             continue
         gaps = np.diff(np.r_[a, ts, c])
         p = np.unwrap(F['psi'][m])
-        dp = np.abs(np.diff(p))
+        dp = math.copysign(1.0, b['tp_wz']) * np.diff(p)          # HCC2-4: signed progress in the log direction
         good = np.diff(ts) <= E_GAP_MAX_S
         out.append(dict(vong=float(np.sum(dp[good]) / (2 * math.pi)), ho_s=float(np.max(gaps))))
     return out
@@ -809,7 +826,7 @@ def _deg_leg(lg):
 
 
 def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None, psi_cuc=None, cap_ok=True,
-                 cap_why=(), bao_q=False, vet=None, psi_cuc_chot=False, need_windows=None):
+                 cap_why=(), bao_q=False, vet=None, psi_cuc_chot=False, need_windows=None, psi_hai_dau=None):
     """Combine the analysed attempts of one place (F7 block). attempts = list of (thu_id, analysis or None, why).
 
     cap_ok False (the issued attempt failed kiem) -> chua_ket_luan: a is never issued from such an attempt; its legs
@@ -873,8 +890,13 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
             # ||mean R_b - mean R_a||_2 of the window rotation matrices (HCC1-12), and the turn error of q from the
             # error of the DIFFERENCE of the two end headings (both half-split errors, opposite signs, added)
             dR = math.hypot(lg['cs_b'][0] - lg['cs_a'][0], lg['cs_b'][1] - lg['cs_a'][1])
-            term = dR * du_m + (0.0 if bao_q else qn * 2 * math.sin((lg['nua_a'] + lg['nua_b']) / 2))
+            # HCC2-8: the bound of the end-heading difference comes from C8B (u_psi_hai_dau_rad); the half-split
+            # spread of the two windows only enters as a floor (window noise), never as the bound itself
+            u_hd = max(lg['nua_a'] + lg['nua_b'], psi_hai_dau or 0.0)
+            term = dR * du_m + (0.0 if bao_q else qn * 2 * math.sin(u_hd / 2))
             u_q = max(u_q, term / lg['L_m'])
+    if q is not None and not bao_q and psi_hai_dau is None:
+        res['ly_do'].append('thieu can sai hieu huong hai dau (C8B u_psi_hai_dau_rad) cho u_q')
     eps = [lg['eps'] for lg in longs]
     eps_thieu = any(not math.isfinite(x) for x in eps)            # HCC1-9: no evidence -> gate fails, not 0
     eps = [x if math.isfinite(x) else 0.0 for x in eps]
@@ -1094,14 +1116,15 @@ def cmd_cua_so(a):
     tj = json.load(open(a.track, encoding='utf-8'))
     xo = json.load(open(a.xoay, encoding='utf-8')) if a.xoay else {}
     xb = (xo.get('cho', {}).get(A['cho']) or xo) if xo else {}
-    role_of = dict(roles)
+    role_of = {k: lo for k, lo in roles if lo in ('ref_12b', 'dung_12b')}     # HCC2-7: not the E_dau alias
     nguon = [dict(vai_tro=k, duong_dan=os.path.abspath(v), sha256=sha256(v))
              for k, v in (('clip', a.clip), ('session', a.session), ('frames', a.frames), ('track', a.track),
                           ('dets', a.dets), ('log', A['log_path']), ('sender', os.path.join(a.dir, 'sender.txt')),
                           ('lich', os.path.join(a.dir, 'lich.csv')), ('cua_so_v1', out), ('a6', a.a6),
                           ('xoay', a.xoay)) if v]
+    src_ok = all((a.clip, a.session, a.dets, a.a6, a.xoay))         # HCC2-7: 'khoa' needs every source key
     doan = dict(schema='c8_hc_doan_12b_v1', thu_id=A['thu_id'], cho=A['cho'], lan_lap_id=None,
-                trang_thai=an['chuoi'], clip=a.clip, clip_sha256=clip_sha, session_sha256=ses_sha,
+                trang_thai=an['chuoi'] if src_ok else 'chan_doan', clip=a.clip, clip_sha256=clip_sha, session_sha256=ses_sha,
                 frames_sha256=sha256(a.frames), track_sha256=sha256(a.track), cua_so_v1_sha256=sha256(out),
                 esp32_sha256=sha256(A['log_path']), commit_hil=commit_hil(),
                 car_pose_cfg=dict(side_m=S.get('car_side_m'), h_m=S.get('tag_h_m'), tag_offset=tj.get('tag_offset'),
@@ -1167,6 +1190,9 @@ def read_e_hieu(path, doan_path):
     content sha256 or the file sha256; HCC1-10); else AError (code 2)."""
     j = json.load(open(path, encoding='utf-8'))
     d = json.load(open(doan_path, encoding='utf-8'))
+    body = {k: v for k, v in d.items() if k != 'sha256'}
+    if d.get('sha256') != hashlib.sha256(json.dumps(body, ensure_ascii=False, sort_keys=True).encode()).hexdigest():
+        raise AError(f'{doan_path}: sha256 noi dung khong khop (file da bi sua)')       # HCC2-5
     if j.get('doan_12b_sha256') not in (d.get('sha256'), sha256(doan_path)):
         raise AError(f'{path}: doan_12b_sha256 khac {doan_path}')
     out = {}
@@ -1178,11 +1204,37 @@ def read_e_hieu(path, doan_path):
 
 
 def read_can_c8b(path, cho):
-    """u_psi_cuc [rad] from a C8B file (name of the field not yet agreed, contract 4.5): u_psi_cuc_rad."""
+    """(u_psi_cuc [rad], u_psi_hai_dau [rad] or None, agreed) from a C8B file (names not yet agreed, contract 4.5):
+    u_psi_cuc_rad (camera heading, leg start vs reference window), u_psi_hai_dau_rad (error of the DIFFERENCE of the
+    two end headings of a leg, for the q turn term of u_q; HCC2-8)."""
     b = _block(json.load(open(path, encoding='utf-8')), cho)
     if 'u_psi_cuc_rad' not in b:
         raise AError(f'{path}: {cho} thieu u_psi_cuc_rad')
-    return float(b['u_psi_cuc_rad']), bool(b.get('chot', False))
+    hd = b.get('u_psi_hai_dau_rad')
+    return float(b['u_psi_cuc_rad']), None if hd is None else float(hd), bool(b.get('chot', False))
+
+
+def check_cap_sources(d, frames, track, log_path, a6, xoay, need):
+    """HCC2-5: the F2 rows and the F5 of the issued attempt must have been made from the very frames, track and log
+    tinh analyses now (and the same A6, xoay files); need=True (F6/F9 given) and a file missing -> AError."""
+    p2, p5 = os.path.join(d, 'cua_so_v1.jsonl'), os.path.join(d, 'doan_12b_v1.json')
+    if not (os.path.isfile(p2) and os.path.isfile(p5)):
+        if need:
+            raise AError(f'{d}: F6/F9 need cua_so_v1.jsonl and doan_12b_v1.json of this attempt (run cua_so)')
+        return
+    fs, ls = sha256(frames), sha256(log_path)
+    for r in (json.loads(x) for x in open(p2, encoding='utf-8')):
+        if r.get('frames_sha256') != fs or r.get('esp32_sha256') != ls:
+            raise AError(f'{p2}: {r.get("loai")} lam tu frames/log khac file dang tinh')
+    d5 = json.load(open(p5, encoding='utf-8'))
+    pr = f5_problems(d5)
+    if pr:
+        raise AError(f'{p5}: {pr}')
+    want = dict(frames_sha256=fs, track_sha256=sha256(track), esp32_sha256=ls, cua_so_v1_sha256=sha256(p2),
+                a6_sha256=sha256(a6) if a6 else None, xoay_sha256=sha256(xoay) if xoay else None)
+    bad = [k for k, v in want.items() if d5.get(k) != v]
+    if bad:
+        raise AError(f'{p5}: {bad} khac nguon dang tinh')
 
 
 def cmd_tinh(a):
@@ -1219,6 +1271,7 @@ def cmd_tinh(a):
             continue
         attempts.append((A['thu_id'], an, failed))
         if is_cap:
+            check_cap_sources(d, frames, track, A['log_path'], a.a6, a.xoay, need=bool(a.neo or a.e_hieu))
             cap_F, cap_A, cap_an = F, A, an
             p = os.path.join(d, 'cua_so_v1.jsonl')
             if os.path.isfile(p):
@@ -1243,9 +1296,9 @@ def cmd_tinh(a):
     if a.neo:
         neo = read_neo(a.neo, a.cho, cap_ref)
         nguon.append(dict(vai_tro='hieu_chuan_neo', duong_dan=os.path.abspath(a.neo), sha256=sha256(a.neo)))
-    psi_cuc, chot = None, False
+    psi_cuc, psi_hd, chot = None, None, False
     if a.can_c8b:
-        psi_cuc, chot = read_can_c8b(a.can_c8b, a.cho)
+        psi_cuc, psi_hd, chot = read_can_c8b(a.can_c8b, a.cho)
         nguon.append(dict(vai_tro='can_c8b', duong_dan=os.path.abspath(a.can_c8b), sha256=sha256(a.can_c8b)))
     vet = None
     if a.moc and cap_F is not None:
@@ -1264,7 +1317,7 @@ def cmd_tinh(a):
     need = sorted(k for k, lo in window_roles(load_attempt(a.cap)['segs']) if lo in ('ref_12b', 'dung_12b'))
     del roles
     r = place_result(a.cho, attempts, cap_id, e_hieu=e, q=q, du_m=du, neo=neo, psi_cuc=psi_cuc, cap_ok=cap_ok,
-                     cap_why=cap_why, bao_q=bao_q, vet=vet, psi_cuc_chot=chot, need_windows=need)
+                     cap_why=cap_why, bao_q=bao_q, vet=vet, psi_cuc_chot=chot, need_windows=need, psi_hai_dau=psi_hd)
     r = dict(schema='truc_xe_v1', version=VERSION, commit_hil=commit_hil(), nguon=nguon,
              mien_hieu_luc=dict(cho=a.cho, thu_id_cap=cap_id, lan_lap_id=None,
                                 ghi_chu='cung buoi, cung lan lap tam (lan_lap_v1 cua NHACTAM chua co: chua xac minh)'),
@@ -1328,8 +1381,9 @@ def cmd_kiem_video(a):
         raise AError('kiem: no windows')
     F = hv.sparse_frames(a.clip, a.session, stride=a.stride)
     vk, an = video_checks(A, F, info)
-    report(vk)
-    good = all(ok for _, ok, _ in vk)
+    bad_log = [c for c in ck if not c[1]]
+    report(bad_log + vk)                                   # the log checks are part of the floor decision
+    good = not bad_log and all(ok for _, ok, _ in vk)
     print('DAT' if good else 'LAM_LAI')
     return 0 if good else 1
 
