@@ -1478,8 +1478,14 @@ def tung_khung(a):
 # ---------------------------------------------------------------- F15 (a) meo_ma_ao_E, (b) meo_dau_chan_bang
 # Contract F15 (CODE 19/11, C8B confirmed the names; KIEMCHEO sets the fields): map residual field held - full of the
 # H32 floor marks, carried to points in the car_pose lifted convention (p = pix2floor(uv, 0), P = p + kappa (C - p)).
+# KCF1-1 (Codex F15 round 1): the measured points came through the camera REFITTED per frame; without the per-frame
+# detections on this branch (dets.npz of CODE_CAM, after the CAM merge) the pixels are rebuilt through the session
+# camera: both outputs are trang_thai 'chan_doan' (diagnostic), never a usable bound, until that version.
 MEO_E_SCHEMA = 'c7_meo_ma_ao_E_v1'
 MEO_BANG_SCHEMA = 'c7_meo_dau_chan_bang_v1'
+MEO_TRANG_THAI = 'chan_doan'
+MEO_LY_DO = ('pixel dung lai qua camera session, khong phai camera khop lai tu the tung khung (KCF1-1); ban day du can '
+             'dets.npz cua CAM (sau gop CAM)')
 
 
 def lift(p, kappa, C):
@@ -1501,31 +1507,48 @@ def map_residual(cam_full, cam_held, P, kappa, C):
     return d
 
 
-def held_cases(pc, marks, centre, r_xp=None):
-    """H32 hold-out cases around a footprint centre: 'bo_vung' (every mark within R_XP of it, at least the 3 nearest)
-    and 'bo_cap:s-j' for every pair of those marks. Returns [(name, ids left out, camera)]; a failed fit is skipped
-    and listed in the second return value."""
-    reg = start_regions(marks, {'x': tuple(centre)}, R_XP_M if r_xp is None else r_xp)['x']['moc']
-    cases, hong = [], []
-    for name, out in [('bo_vung', tuple(reg))] + [(f'bo_cap:{a}-{b}', (a, b)) for k, a in enumerate(reg)
-                                                   for b in reg[k + 1:]]:
+def h32_ids(marks, foot, r_xp):
+    """KCF1-4: the H32 hold-out set of a footprint: every mark within r_xp of ANY footprint point (floor points, not
+    lifted), padded to at least the 3 marks nearest to the footprint."""
+    foot = np.asarray(foot, float).reshape(-1, 2)
+    dist = {i: float(np.min(np.linalg.norm(foot - np.array(m[:2]), axis=1))) for i, m in marks.items()}
+    ids = {i for i, d in dist.items() if d <= r_xp}
+    for i in sorted(dist, key=lambda i: (dist[i], i)):
+        if len(ids) >= 3:
+            break
+        ids.add(i)
+    return sorted(ids)
+
+
+def held_cases(pc, ids):
+    """Hold-out cases: 'bo_vung' (every id of the set) and 'bo_cap:s-j' for each pair of the set. KCF1-5: every
+    planned case must fit, else KCError (no partial maximum). Returns [(name, ids left out, camera)]."""
+    plan = [('bo_vung', tuple(ids))] + [(f'bo_cap:{a}-{b}', (a, b)) for k, a in enumerate(ids) for b in ids[k + 1:]]
+    out = []
+    for name, rm in plan:
         try:
-            cases.append((name, sorted(out), pc(out)))
+            out.append((name, sorted(rm), pc(rm)))
         except Exception as e:
-            hong.append(dict(ca=name, ly_do=str(e)[:200]))
-    if not cases:
-        raise KCError('no H32 hold-out camera could be fitted')
-    return cases, hong
+            raise KCError(f'H32 case {name} (left out {sorted(rm)}) failed: {str(e)[:200]} (KCF1-5)')
+    return out
+
+
+def _hex(x, what):
+    if not isinstance(x, str) or len(x) != 64 or any(ch not in '0123456789abcdef' for ch in x):
+        raise KCError(f'{what}: {x!r} is not a sha256 (KCF1-7)')
+    return x
 
 
 def _session_ctx(path, want_sha, model):
-    """(session dict, sha, PairCams, scoring camera, kappa, C) from the bytes of the session file (sha must be
-    want_sha when given)."""
+    """(session dict, sha, marks, PairCams, scoring camera, kappa, C) from the bytes of the session file; the sha
+    must be want_sha; KCF1-4: the 32 locked floor marks (ids 1-32) only."""
     s, sha = load_json_sha(path)
-    if want_sha is not None and sha != want_sha:
+    if sha != _hex(want_sha, 'session sha256 named by the source'):
         raise KCError(f'{path}: sha256 {sha} is not the one the source names {want_sha}')
     img, mk, w, h, zc = clip_from_session(s, model)
-    for k in ('camera', 'kappa', 'plumb_xy_m'):
+    if tuple(sorted(img)) != ID_KHOA:
+        raise KCError(f'{path}: fit ids are not the locked ids 1-32 (KCF1-4)')
+    for k in ('camera', 'kappa', 'plumb_xy_m', 'tag_h_m', 'car_side_m'):
         if k not in s:
             raise KCError(f'{path}: session without {k} (car_pose convention)')
     return s, sha, mk, PairCams(img, mk, model, w, h, zc), cm.cam_from_dict(s['camera']), float(s['kappa']), \
@@ -1538,116 +1561,198 @@ def _with_sha(obj):
     return obj
 
 
+def _check_h_bar(path, h_used):
+    """KCF1-6: the tag height of the session against h-bar of the plate (c8b_a6_v2 field h_m), when given."""
+    if not path:
+        return dict(da_kiem=False, ly_do='khong co --a6: h_m cua session chua doi chieu voi h-bar cua tam')
+    d, sha = load_json_sha(path)
+    hb = d.get('h_m')
+    if isinstance(hb, bool) or not isinstance(hb, (int, float)) or abs(float(hb) - h_used) > 1e-6:
+        raise KCError(f'--a6: h_m {hb!r} is not the session tag height {h_used} (KCF1-6)')
+    return dict(da_kiem=True, file=os.path.abspath(path), sha256=sha, h_m=float(hb))
+
+
 def meo_E(a):
-    """F15 (a): for the E frames of one place (cua_so_v1 rows E_dau .. E_cuoi of the clip, valid frames of the E
-    track), the 4 virtual tag corners (ArUco order, body = c7_measure.car_corners_body) at the measured tag pose,
-    map residual held - full per H32 case."""
-    if a.cho not in CHO:
-        raise KCError(f'--cho {a.cho!r}: goc|K1|K2')
-    tr, tr_sha = load_json_sha(os.path.join(a.track, 'track.json'))
-    fp = os.path.join(a.track, 'frames.csv')
+    """F15 (a): for the E frames of one place (one E_dau and one E_cuoi window of the clip in cua_so_v1; the moving
+    frames strictly between them = E_doan, valid with a tag pose), the 4 virtual tag corners (ArUco order,
+    c7_measure.car_corners_body) at the measured tag pose, map residual held - full per H32 case. Diagnostic
+    (KCF1-1)."""
+    if a.cho not in ('goc', 'K1'):
+        raise KCError(f'--cho {a.cho!r}: goc|K1 (E places, KCF1-8)')
+    tp, fp = os.path.join(a.track, 'track.json'), os.path.join(a.track, 'frames.csv')
+    tr, tr_sha = load_json_sha(tp)
     with open(fp, 'rb') as f:
         fb = f.read()
     fr_sha = hashlib.sha256(fb).hexdigest()
-    if tr.get('frames_sha256') not in (None, fr_sha):
+    clip = _hex(tr.get('video_sha256'), 'track.video_sha256')
+    if _hex(tr.get('frames_sha256'), 'track.frames_sha256') != fr_sha:
         raise KCError('E track: frames.csv is not the one of track.json')
     s, ses_sha, mk, pc, full, kappa, C = _session_ctx(a.session, tr.get('session_sha256'), a.model)
-    rows = [json.loads(x) for x in open(a.cua_so, encoding='utf-8').read().splitlines() if x.strip()]
-    cs_sha = sha256_file(a.cua_so)
-    ew = [r for r in rows if r.get('cho') == a.cho and r.get('loai') in ('E_dau', 'E_cuoi')
-          and r.get('clip_sha256') == tr.get('video_sha256')]
-    if {r['loai'] for r in ew} != {'E_dau', 'E_cuoi'}:
-        raise KCError(f'cua_so_v1: no E_dau / E_cuoi window of {a.cho} for this clip')
-    for r in ew:
-        if r.get('frames_sha256') not in (None, fr_sha) or r.get('session_sha256') not in (None, ses_sha):
-            raise KCError('cua_so_v1: E window of another frames / session')
-    lo = min(k['id'] for r in ew if r['loai'] == 'E_dau' for k in r['khung'])
-    hi = max(k['id'] for r in ew if r['loai'] == 'E_cuoi' for k in r['khung'])
+    with open(a.cua_so, 'rb') as f:
+        cb = f.read()
+    cs_sha = hashlib.sha256(cb).hexdigest()                     # KCF1-7: hash of the bytes parsed
+    try:
+        rows = [json.loads(x) for x in cb.decode('utf-8').splitlines() if x.strip()]
+    except ValueError as e:
+        raise KCError(f'cua_so_v1: {e}')
+    ew = [r for r in rows if isinstance(r, dict) and r.get('cho') == a.cho and r.get('loai') in ('E_dau', 'E_cuoi')
+          and r.get('clip_sha256') == clip]
+    by = {k: [r for r in ew if r['loai'] == k] for k in ('E_dau', 'E_cuoi')}
+    if len(by['E_dau']) != 1 or len(by['E_cuoi']) != 1:
+        raise KCError(f'cua_so_v1: need exactly one E_dau and one E_cuoi window of {a.cho} for this clip (KCF1-8)')
+    ids = {}
+    for k, (r,) in by.items():
+        if r.get('frames_sha256') != fr_sha or r.get('session_sha256') != ses_sha:
+            raise KCError(f'cua_so_v1 {k}: another frames / session (KCF1-7)')
+        kh = r.get('khung')
+        if not isinstance(kh, list) or not kh or not all(isinstance(x, dict) and isinstance(x.get('id'), int)
+                                                         for x in kh):
+            raise KCError(f'cua_so_v1 {k}: khung missing or malformed (KCF1-8)')
+        ids[k] = [x['id'] for x in kh]
+    lo, hi = max(ids['E_dau']), min(ids['E_cuoi'])
+    if not lo < hi:
+        raise KCError('cua_so_v1: E_dau does not end before E_cuoi starts (KCF1-8)')
     import io
-    fr = [r for r in csv.DictReader(io.StringIO(fb.decode('utf-8'))) if _true(r.get('valid'))
-          and lo <= int(r['idx']) <= hi and r.get('tag_x') not in ('', None)]
-    if not fr:
-        raise KCError('no valid E frame between E_dau and E_cuoi')
+    try:
+        fr = [r for r in csv.DictReader(io.StringIO(fb.decode('utf-8'))) if _true(r.get('valid'))
+              and lo < int(r['idx']) < hi and r.get('tag_x') not in ('', None)]
+        poses = [(int(r['idx']), float(r['t_s']), float(r['tag_x']), float(r['tag_y']), float(r['psi'])) for r in fr]
+    except (KeyError, ValueError, TypeError) as e:
+        raise KCError(f'frames.csv: {e} (KCF1-8)')
+    if not poses:
+        raise KCError('no valid moving E frame between E_dau and E_cuoi (E_doan)')
+    to = tr.get('tag_offset') or [0.0, 0.0, 0.0]
     side = float(s['car_side_m'])
-    dpsi0 = float((tr.get('tag_offset') or [0.0, 0.0, 0.0])[2])
     body = cm.car_corners_body(side)
-    P_all = []
-    for r in fr:
-        c = np.array([float(r['tag_x']), float(r['tag_y'])])
-        P_all.append(body @ _rot(float(r['psi']) + dpsi0).T + c)
-    cases, hong = held_cases(pc, mk, np.mean([P.mean(axis=0) for P in P_all], axis=0), a.r_xp)
-    khung = []
-    for r, P in zip(fr, P_all):
-        khung.append(dict(frame_id=int(r['idx']), t_s=float(r['t_s']),
-                          goc_m=[[float(v) for v in x] for x in P],
-                          du_m={n: [[float(v) for v in x] for x in map_residual(full, cam, P, kappa, C)]
-                                for n, _, cam in cases}))
+    P_all = [body @ _rot(psi + float(to[2])).T + np.array([x, y]) for _, _, x, y, psi in poses]
+    foot = np.vstack([unlift(P, kappa, C) for P in P_all])                 # KCF1-4: floor footprint, not lifted
+    rx = R_XP_M if a.r_xp is None else a.r_xp
+    hid = h32_ids(mk, foot, rx)
+    cases = held_cases(pc, hid)
+    khung = [dict(frame_id=fid, t_s=t, goc_m=[[float(v) for v in x] for x in P],
+                  du_m={n: [[float(v) for v in x] for x in map_residual(full, cam, P, kappa, C)] for n, _, cam in cases})
+             for (fid, t, *_r), P in zip(poses, P_all)]
     out = _with_sha(dict(
-        schema=MEO_E_SCHEMA, cho=a.cho, chieu='held_minus_full', bo_H32=True, truoc_le=True,
+        schema=MEO_E_SCHEMA, cho=a.cho, trang_thai=MEO_TRANG_THAI, ly_do=[MEO_LY_DO], chieu='held_minus_full',
+        bo_H32=True, truoc_le=True,
         thu_tu_goc='ArUco 0..3 (c7_measure.car_corners_body: truoc-trai, truoc-phai, sau-phai, sau-trai)',
-        clip_sha256=tr.get('video_sha256'), frames_sha256=fr_sha, track_sha256=tr_sha, cua_so_v1_sha256=cs_sha,
-        ban_do=dict(phien_ban=VERSION, session_file=os.path.abspath(a.session), session_sha256=ses_sha,
-                    full='session.camera', ca=[dict(ten=n, bo_ids=ids) for n, ids, _ in cases], ca_hong=hong,
-                    R_XP_M=R_XP_M if a.r_xp is None else a.r_xp),
-        h_m=float(s['tag_h_m']), kappa=kappa, plumb_xy_m=[float(x) for x in C], Zc_m=float(s['tag_h_m']) / kappa,
+        clip_sha256=clip, nguon=[dict(vai_tro='track', duong_dan=os.path.abspath(tp), sha256=tr_sha),
+                                 dict(vai_tro='frames', duong_dan=os.path.abspath(fp), sha256=fr_sha),
+                                 dict(vai_tro='cua_so_v1', duong_dan=os.path.abspath(a.cua_so), sha256=cs_sha),
+                                 dict(vai_tro='session', duong_dan=os.path.abspath(a.session), sha256=ses_sha)],
+        mien_E=dict(sau_E_dau=lo, truoc_E_cuoi=hi, khung_dong=len(khung)),
+        ban_do=dict(phien_ban=VERSION, session_sha256=ses_sha, full='session.camera', H32_ids=hid, R_XP_M=rx,
+                    ca=[dict(ten=n, bo_ids=ids_) for n, ids_, _ in cases]),
+        h_m=float(s['tag_h_m']), h_bar=_check_h_bar(a.a6, float(s['tag_h_m'])), kappa=kappa,
+        plumb_xy_m=[float(x) for x in C], Zc_m=float(s['tag_h_m']) / kappa, tag_offset=[float(v) for v in to],
         khung=khung, commit_hil=commit_hil(),
         gioi_han=['chi so thuc nghiem truoc le; truong du ban do giua camera bo moc H32 va camera cham, trong ho mo hinh',
-                  'diem goc dung quy uoc nang cua car_pose (cung kappa, C cua session), khong do lai pixel tung khung']))
+                  MEO_LY_DO]))
     write_new(a.out, out)
-    _say(f'meo_ma_ao_E {a.cho}: {len(khung)} khung, {len(cases)} ca H32, max '
-         f'{max(math.hypot(*x) for k in khung for v in k["du_m"].values() for x in v) * 1000:.3f} mm')
+    _say(f'meo_ma_ao_E {a.cho}: {len(khung)} khung, {len(cases)} ca H32 (chan_doan)')
+
+
+def _ll_session(ll, a):
+    """KCF1-2: the session of an F8 file: --session, else F8 session_file, else F6 (hieu_chuan.file, sha checked)
+    session.file; its sha must be F8 session_sha256."""
+    if a.session:
+        return a.session
+    if ll.get('session_file'):
+        return ll['session_file']
+    hc = ll.get('hieu_chuan') or {}
+    if not hc.get('file'):
+        raise KCError('lan_lap.json: no session path (session_file, hieu_chuan.file) and no --session (KCF1-2)')
+    f6, sha6 = load_json_sha(hc['file'])
+    if sha6 != _hex(hc.get('sha256'), 'lan_lap.hieu_chuan.sha256'):
+        raise KCError('hieu_chuan_neo.json: sha256 is not the one lan_lap.json names (KCF1-7)')
+    path = (f6.get('session') or {}).get('file')
+    if not path:
+        raise KCError('hieu_chuan_neo.json: no session.file (KCF1-2)')
+    return path
 
 
 def meo_bang(a):
-    """F15 (b): for every anchor of lan_lap.json (neo_ten, Ph_neo_m of each run end, lifted with kappa_n = h_n / Z_c
-    of the session as c7_nhac_tam does), per place, map residual held - full per H32 case."""
+    """F15 (b): every anchor (neo_ten: A, B, oc*) of every run end of lan_lap.json and of every window of the anchor
+    calibration file (hieu_chuan_neo.json cua_so[*].Ph, KCF1-3), lifted with kappa_n = h_n / Z_c as c7_nhac_tam, per
+    place, map residual held - full per H32 case. Diagnostic (KCF1-1)."""
     ll, ll_sha = load_json_sha(a.lan_lap)
-    s, ses_sha, mk, pc, full, kappa_t, C = _session_ctx(ll['session_file'], ll.get('session_sha256'), a.model)
+    if not str(ll.get('schema', '')).startswith('lan_lap'):
+        raise KCError(f'lan_lap.json: schema {ll.get("schema")!r} (KCF1-7)')
+    ten = list(ll.get('neo_ten') or [])
+    if ten[:2] != ['A', 'B'] or any(not (t in ('A', 'B') or (t.startswith('oc') and t[2:].isdigit())) for t in ten) \
+            or len(set(ten)) != len(ten):
+        raise KCError(f'lan_lap.json: neo_ten {ten!r} is not A, B, oc<n> (KCF1-9)')
+    thieu_oc = not any(t.startswith('oc') for t in ten)
+    sp = _ll_session(ll, a)
+    s, ses_sha, mk, pc, full, kappa_t, C = _session_ctx(sp, ll.get('session_sha256'), a.model)
     Zc = float(s['tag_h_m']) / kappa_t
     h_n = float(ll['h_n_m'])
     kappa_n = h_n / Zc
-    ten = list(ll.get('neo_ten') or [])
-    if len(ten) < 2 or ten[:2] != ['A', 'B']:
-        raise KCError(f'lan_lap.json: neo_ten {ten!r} does not start with A, B')
-    thieu_oc = not any(t.startswith('oc') for t in ten)
-    by_cho = {}
+    items = []
     for r in ll.get('luot') or []:
         for dau, x in sorted((r.get('dau') or {}).items()):
-            if dau == 'dich' or not x or x.get('Ph_neo_m') is None:
+            if dau == 'dich' or not isinstance(x, dict) or x.get('Ph_neo_m') is None:
                 continue
-            by_cho.setdefault(x.get('cho') or r.get('cho'), []).append((r.get('luot_id'), dau, x))
-    if not by_cho:
-        raise KCError('lan_lap.json: no run end with Ph_neo_m')
+            if x.get('session_sha256') not in (None, ses_sha):
+                raise KCError(f'lan_lap.json {r.get("luot_id")} {dau}: another session (KCF1-7)')
+            items.append(dict(nguon='lan_lap', luot_id=r.get('luot_id'), dau=dau, cho=x.get('cho') or r.get('cho'),
+                              clip_sha256=x.get('clip_sha256'), khung_neo_sha256=x.get('khung_neo_sha256'),
+                              P=x['Ph_neo_m']))
+    hc = ll.get('hieu_chuan') or {}
+    hc_rec = None
+    if hc.get('file'):                                 # KCF1-3: every window of the anchor-shape calibration too
+        f6, sha6 = load_json_sha(hc['file'])
+        if sha6 != _hex(hc.get('sha256'), 'lan_lap.hieu_chuan.sha256'):
+            raise KCError('hieu_chuan_neo.json: sha256 is not the one lan_lap.json names (KCF1-7)')
+        hc_rec = dict(file=os.path.abspath(hc['file']), sha256=sha6)
+        for k, w in enumerate(f6.get('cua_so') or []):
+            if not isinstance(w, dict) or w.get('Ph') is None:
+                continue
+            m = w.get('meta') or {}
+            items.append(dict(nguon='hieu_chuan_neo', chi_so=k, loai=m.get('loai'), luot_id=m.get('luot'),
+                              cho=m.get('cho'), clip_sha256=m.get('clip_sha'), P=w['Ph']))
+    if not items:
+        raise KCError('lan_lap.json: no anchor point (Ph_neo_m / cua_so Ph)')
+    by_cho = {}
+    for it in items:
+        if it['cho'] not in CHO:
+            raise KCError(f'anchor point of place {it["cho"]!r}')
+        P = np.asarray(it['P'], float).reshape(-1, 2) if np.size(it['P']) else np.zeros((0, 2))
+        if len(P) != len(ten) or not np.all(np.isfinite(P)):
+            raise KCError(f'{it["nguon"]} {it.get("luot_id")} {it.get("dau", it.get("chi_so"))}: {len(P)} anchors, '
+                          f'neo_ten has {len(ten)}')
+        it['P'] = P
+        by_cho.setdefault(it['cho'], []).append(it)
+    rx = R_XP_M if a.r_xp is None else a.r_xp
     theo = {}
-    for cho, items in sorted(by_cho.items()):
-        if cho not in CHO:
-            raise KCError(f'lan_lap.json: place {cho!r}')
-        allP = np.vstack([np.asarray(x['Ph_neo_m'], float).reshape(-1, 2) for _, _, x in items])
-        cases, hong = held_cases(pc, mk, allP.mean(axis=0), a.r_xp)
-        muc = []
-        for lid, dau, x in items:
-            P = np.asarray(x['Ph_neo_m'], float).reshape(-1, 2)
-            if len(P) != len(ten):
-                raise KCError(f'lan_lap.json {lid} {dau}: {len(P)} anchors, neo_ten has {len(ten)}')
-            res = {n: map_residual(full, cam, P, kappa_n, C) for n, _, cam in cases}
-            muc.append(dict(luot_id=lid, dau=dau, clip_sha256=x.get('clip_sha256'),
-                            khung_neo_sha256=x.get('khung_neo_sha256'),
-                            neo={t: {n: [float(v) for v in res[n][k]] for n in res} for k, t in enumerate(ten)}))
-        theo[cho] = dict(ca=[dict(ten=n, bo_ids=ids) for n, ids, _ in cases], ca_hong=hong, muc=muc)
+    for cho, its in sorted(by_cho.items()):
+        foot = np.vstack([unlift(it['P'], kappa_n, C) for it in its])     # KCF1-4: floor footprints
+        hid = h32_ids(mk, foot, rx)
+        cases = held_cases(pc, hid)
+        muc, muc_hc = [], []                            # run ends (keyed luot_id, dau) apart from calibration windows
+        for it in its:
+            res = {n: map_residual(full, cam, it['P'], kappa_n, C) for n, _, cam in cases}
+            rec = {k: v for k, v in it.items() if k not in ('P', 'cho', 'nguon')}
+            rec['neo'] = {t: {n: [float(v) for v in res[n][k]] for n in res} for k, t in enumerate(ten)}
+            (muc if it['nguon'] == 'lan_lap' else muc_hc).append(rec)
+        theo[cho] = dict(H32_ids=hid, ca=[dict(ten=n, bo_ids=ids_) for n, ids_, _ in cases], muc=muc,
+                         muc_hieu_chuan=muc_hc)
     out = _with_sha(dict(
-        schema=MEO_BANG_SCHEMA, chieu='held_minus_full', bo_H32=True, truoc_le=True, neo_ten=ten,
-        h_neo_m=ll.get('h_neo_m'), h_n_m=h_n, kappa_n=kappa_n, Zc_m=Zc, plumb_xy_m=[float(c) for c in C],
-        thieu_oc=thieu_oc, quy_uoc='diem neo da nang car_pose (p = pix2floor(uv, 0), P = p + kappa_n (C - p)), m',
-        lan_lap=dict(file=os.path.abspath(a.lan_lap), sha256=ll_sha,
-                     hieu_chuan_sha256=(ll.get('hieu_chuan') or {}).get('sha256')),
-        ban_do=dict(phien_ban=VERSION, session_file=os.path.abspath(ll['session_file']), session_sha256=ses_sha,
-                    full='session.camera', R_XP_M=R_XP_M if a.r_xp is None else a.r_xp),
+        schema=MEO_BANG_SCHEMA, trang_thai=MEO_TRANG_THAI, ly_do=[MEO_LY_DO], chieu='held_minus_full', bo_H32=True,
+        truoc_le=True, neo_ten=ten, h_neo_m=ll.get('h_neo_m'), h_n_m=h_n, kappa_n=kappa_n, Zc_m=Zc,
+        plumb_xy_m=[float(c) for c in C], thieu_oc=thieu_oc,
+        quy_uoc='diem neo da nang car_pose (p = pix2floor(uv, 0), P = p + kappa_n (C - p)), m',
+        lan_lap=dict(file=os.path.abspath(a.lan_lap), sha256=ll_sha, hieu_chuan_sha256=hc.get('sha256')),
+        hieu_chuan_neo=hc_rec,
+        ban_do=dict(phien_ban=VERSION, session_file=os.path.abspath(sp), session_sha256=ses_sha, full='session.camera',
+                    R_XP_M=rx),
         theo_cho=theo, commit_hil=commit_hil(),
-        gioi_han=['chi so thuc nghiem truoc le; trong ho mo hinh camera; camera cham la camera session (khong khop '
-                  'lai tu the tung khung nhu c7_nhac_tam)',
-                  'moi neo nang bang kappa_n = h_n / Z_c nhu c7_nhac_tam; do cao rieng tung neo (h_neo_m) chi ghi lai']))
+        gioi_han=['chi so thuc nghiem truoc le; trong ho mo hinh camera', MEO_LY_DO,
+                  'moi neo nang bang kappa_n = h_n / Z_c nhu c7_nhac_tam; do cao rieng tung neo (h_neo_m) chi ghi lai',
+                  'NHACTAM chay lai khop hinh neo (cua_so hieu_chuan_neo) va giai beta bang cac du nay (V4-06)']))
     write_new(a.out, out)
-    _say(f"meo_dau_chan_bang: {sum(len(v['muc']) for v in theo.values())} dau, cho {sorted(theo)}, thieu_oc {thieu_oc}")
+    _say(f"meo_dau_chan_bang: {sum(len(v['muc']) for v in theo.values())} muc, cho {sorted(theo)}, thieu_oc {thieu_oc}"
+         ' (chan_doan)')
 
 
 # ---------------------------------------------------------------- CLI
@@ -2437,11 +2542,13 @@ def main(argv=None):
     m.add_argument('--track', required=True, help='E track dir (track.json, frames.csv)')
     m.add_argument('--cua-so', dest='cua_so', required=True, help='cua_so_v1.jsonl with E_dau, E_cuoi')
     m.add_argument('--r-xp', dest='r_xp', type=float)
+    m.add_argument('--a6', help='c8b_a6_v2 of the plate: h_m must be the session tag height (KCF1-6)')
     m.add_argument('--out', required=True)
     b = sub.add_parser('meo_bang', help='F15 (b) meo_dau_chan_bang from lan_lap.json')
     b.add_argument('--model', required=True)
     b.add_argument('--lan-lap', dest='lan_lap', required=True)
     b.add_argument('--r-xp', dest='r_xp', type=float)
+    b.add_argument('--session', help='session of the F8 (sha must be lan_lap.session_sha256; KCF1-2)')
     b.add_argument('--out', required=True)
     a = ap.parse_args(argv)
     try:

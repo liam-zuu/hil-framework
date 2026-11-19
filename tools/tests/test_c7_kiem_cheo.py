@@ -1895,23 +1895,64 @@ def test_closed_stdout_after_publication(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------- F15 (a) meo_ma_ao_E, (b) meo_dau_chan_bang
-def test_map_residual_lifted_convention(scene):
-    """F15: held = full -> 0; held with a map turn Q, lifted with kappa: d = (1 - kappa)(Q - I) unlift(P)."""
+class _FieldCam:
+    """A camera whose floor map is the true one plus a non-linear field f(x, y) = (0.02 x^2, -0.01 x y) (z = 0)."""
+
+    def __init__(self, cam):
+        self.cam = cam
+
+    @staticmethod
+    def f(p):
+        p = np.asarray(p, float).reshape(-1, 2)
+        return np.column_stack([0.02 * p[:, 0] ** 2, -0.01 * p[:, 0] * p[:, 1]])
+
+    def pix2floor(self, uv, z=0.0):
+        q = self.cam.pix2floor(uv, z)
+        return q + self.f(q)
+
+
+F15_C, F15_KAP = np.array([-0.4802, -0.0329]), 0.119 / ZC
+
+
+def test_map_residual_independent_oracle(scene):
+    """KCF1-9: held floor = p + f(p) -> lifted residual = (1 - kappa) f(p), p = (P - kappa C) / (1 - kappa), with C != 0
+    (closed form, not the code's unlift); held = full -> 0."""
     marks, cam, img = scene
-    C, kap = np.array([0.03, -0.02]), 0.05
-    P = np.array([[0.4, 0.1], [-0.3, 0.5], [0.0, -0.6]])
-    assert np.allclose(kc.map_residual(cam, cam, P, kap, C), 0.0, atol=1e-12)
-    Q = _rotm(0.4)
-    p = kc.unlift(P, kap, C)
-    want = (1 - kap) * (p @ Q.T - p)
-    assert np.allclose(kc.map_residual(cam, _MapCam(cam, Q), P, kap, C), want, atol=1e-10)
+    P = np.array([[0.4, 0.1], [-0.3, 0.5], [1.2, -0.6]])
+    assert np.allclose(kc.map_residual(cam, cam, P, F15_KAP, F15_C), 0.0, atol=1e-12)
+    p = (P - F15_KAP * F15_C) / (1 - F15_KAP)
+    want = (1 - F15_KAP) * _FieldCam.f(p)
+    assert np.allclose(kc.map_residual(cam, _FieldCam(cam), P, F15_KAP, F15_C), want, atol=1e-9)
+
+
+def test_h32_ids_floor_footprint_and_three_nearest():
+    """KCF1-4: marks within R of ANY footprint point; padded to 3 nearest when fewer."""
+    mk = {1: (0.1, 0.0, SIDE), 2: (0.2, 0.0, SIDE), 3: (0.61, 0.0, SIDE), 4: (5.0, 5.0, SIDE)}
+    assert kc.h32_ids(mk, [[0.0, 0.0]], 0.60) == [1, 2, 3]
+    assert kc.h32_ids(mk, [[0.0, 0.0], [1.15, 0.0]], 0.60) == [1, 2, 3]
+    assert kc.h32_ids(mk, [[4.6, 4.6]], 0.60) == [2, 3, 4]          # only mark 4 within R: padded by 3, then 2
+
+
+def test_held_cases_all_or_nothing(scene):
+    """KCF1-5: a planned hold-out case that fails stops the command (no partial set)."""
+    marks, cam, img = scene
+
+    class PC:
+        def __call__(self, out=()):
+            if len(out) > 2:
+                raise ValueError('fit failed (test)')
+            return cam
+    with pytest.raises(kc.KCError, match='KCF1-5'):
+        kc.held_cases(PC(), [1, 2, 3])
+    assert [n for n, _, _ in kc.held_cases(lambda out=(): cam, [1, 2, 3])] == ['bo_vung', 'bo_cap:1-2', 'bo_cap:1-3',
+                                                                               'bo_cap:2-3']
 
 
 def _f15_session(tmp_path, scene):
     import c7_measure as cmeas
     marks, cam, img = scene
     s = dict(kind='c7_session', model_khoa='B1', chosen='B1', width=W, height=H, zc_tape_m=ZC, car_side_m=0.1445,
-             tag_h_m=0.119, kappa=0.119 / ZC, plumb_xy_m=[0.03, -0.02], camera=cmeas.cam_to_dict(cam),
+             tag_h_m=0.119, kappa=F15_KAP, plumb_xy_m=list(F15_C), camera=cmeas.cam_to_dict(cam),
              fit_ids=sorted(img), marks={str(i): list(m) for i, m in marks.items()},
              ref_corners_px={str(i): c.tolist() for i, c in img.items()})
     sp = tmp_path / 'ses.json'
@@ -1919,59 +1960,128 @@ def _f15_session(tmp_path, scene):
     return sp
 
 
-def test_meo_E_end_to_end(tmp_path, scene):
-    """F15 (a): exact scene -> residual ~ 0 at every corner of every E frame between E_dau and E_cuoi (valid only),
-    cases bo_vung + pairs, held - full; another session than the track's -> code 2."""
-    sp = _f15_session(tmp_path, scene)
+def _field_cases(monkeypatch, scene):
+    marks, cam, img = scene
+    monkeypatch.setattr(kc, 'held_cases', lambda pc, ids: [('bo_vung', list(ids), _FieldCam(cam))])
+
+
+def _e_files(tmp_path, sp, offset=(0.0, 0.0, 0.2), track_over=None, rows_extra=()):
     td = tmp_path / 'E'
-    td.mkdir()
+    td.mkdir(exist_ok=True)
     rows = ['idx,t_s,valid,psi,tag_x,tag_y']
     for k in range(12):
         rows.append(f"{k},{k / 60!r},{0 if k == 5 else 1},{0.3 * k!r},{0.05 + 0.01 * k!r},{-0.02!r}")
     (td / 'frames.csv').write_text('\n'.join(rows) + '\n', encoding='utf-8')
     fsha = kc.sha256_file(str(td / 'frames.csv'))
-    tr = dict(video_sha256='v' * 64, session_sha256=kc.sha256_file(str(sp)), frames_sha256=fsha, tag_offset=[0, 0, 0])
+    tr = dict(video_sha256='a' * 64, session_sha256=kc.sha256_file(str(sp)), frames_sha256=fsha, tag_offset=list(offset))
+    tr.update(track_over or {})
     (td / 'track.json').write_text(json.dumps(tr), encoding='utf-8')
+
+    def w(loai, ids):
+        return json.dumps(dict(schema='cua_so_v1', cho='goc', loai=loai, clip_sha256='a' * 64, frames_sha256=fsha,
+                               session_sha256=kc.sha256_file(str(sp)), khung=[dict(id=i, pts_s=i / 60) for i in ids]))
     cs = tmp_path / 'cua_so_v1.jsonl'
-    w = lambda loai, ids: json.dumps(dict(schema='cua_so_v1', cho='goc', loai=loai, clip_sha256='v' * 64,      # noqa
-                                          frames_sha256=fsha, session_sha256=tr['session_sha256'],
-                                          khung=[dict(id=i, pts_s=i / 60) for i in ids]))
-    cs.write_text(w('E_dau', [1, 2]) + '\n' + w('E_cuoi', [8, 9]) + '\n' + w('pre', [10, 11]) + '\n', encoding='utf-8')
-    out = tmp_path / 'e.json'
-    args = ['meo_E', '--model', 'B1', '--cho', 'goc', '--session', str(sp), '--track', str(td), '--cua-so', str(cs),
-            '--r-xp', '0.3', '--out', str(out)]
-    assert kc.main(args) == 0
-    r = json.loads(out.read_text(encoding='utf-8'))
-    assert [k['frame_id'] for k in r['khung']] == [1, 2, 3, 4, 6, 7, 8, 9]
-    assert r['chieu'] == 'held_minus_full' and r['bo_H32'] is True and r['truoc_le'] is True
-    names = [c['ten'] for c in r['ban_do']['ca']]
-    assert names[0] == 'bo_vung' and any(n.startswith('bo_cap:') for n in names)
-    assert all(len(k['goc_m']) == 4 and set(k['du_m']) == set(names) for k in r['khung'])
-    assert max(math.hypot(*x) for k in r['khung'] for v in k['du_m'].values() for x in v) < 1e-6
-    assert r['sha256'] == kc._with_sha({k: v for k, v in r.items() if k != 'sha256'})['sha256']
-    tr['session_sha256'] = '1' * 64
-    (td / 'track.json').write_text(json.dumps(tr), encoding='utf-8')
-    assert kc.main(args[:-1] + [str(tmp_path / 'e2.json')]) == 2 and not (tmp_path / 'e2.json').exists()
+    cs.write_text('\n'.join([w('E_dau', [1, 2]), w('E_cuoi', [8, 9]), w('pre', [10, 11])] + [w(*x) for x in rows_extra])
+                  + '\n', encoding='utf-8')
+    return td, cs
 
 
-def test_meo_bang_end_to_end(tmp_path, scene):
-    """F15 (b): every anchor of every run end, per place, per case; A, B only -> thieu_oc; exact scene ~ 0; an anchor
-    count that is not neo_ten's -> code 2."""
+def test_meo_E_corners_order_and_lift(tmp_path, scene, monkeypatch):
+    """F15 (a), KCF1-8, KCF1-9: E_doan = valid frames strictly between E_dau and E_cuoi; each corner (ArUco order of
+    the body square turned by psi + dpsi, tag_offset != 0) carries (1 - kappa) f(p) of an independent oracle; output
+    is chan_doan with every source path + sha."""
     sp = _f15_session(tmp_path, scene)
-    end = dict(cho='goc', clip_sha256='c' * 64, khung_neo_sha256='k' * 64, Ph_neo_m=[[0.10, 0.05], [0.25, 0.05]])
-    ll = dict(schema='lan_lap_v1', session_file=str(sp), session_sha256=kc.sha256_file(str(sp)), neo_ten=['A', 'B'],
-              h_neo_m=[0.12, 0.12], h_n_m=0.12, hieu_chuan=dict(sha256='h' * 64),
-              luot=[dict(luot_id='r1', cho='goc', dau=dict(chuan=end, pre=end, post=end, dich=end))])
+    td, cs = _e_files(tmp_path, sp)
+    _field_cases(monkeypatch, scene)
+    out = tmp_path / 'e.json'
+    assert kc.main(['meo_E', '--model', 'B1', '--cho', 'goc', '--session', str(sp), '--track', str(td), '--cua-so',
+                    str(cs), '--out', str(out)]) == 0
+    r = json.loads(out.read_text(encoding='utf-8'))
+    assert [k['frame_id'] for k in r['khung']] == [3, 4, 6, 7] and r['trang_thai'] == 'chan_doan'
+    assert {x['vai_tro'] for x in r['nguon']} == {'track', 'frames', 'cua_so_v1', 'session'}
+    h = 0.1445 / 2
+    body = np.array([[h, h], [h, -h], [-h, -h], [-h, h]])
+    for k in r['khung']:
+        fid = k['frame_id']
+        a = 0.3 * fid + 0.2
+        R = np.array([[math.cos(a), -math.sin(a)], [math.sin(a), math.cos(a)]])
+        P = body @ R.T + np.array([0.05 + 0.01 * fid, -0.02])
+        assert np.allclose(k['goc_m'], P, atol=1e-12)
+        p = (P - F15_KAP * F15_C) / (1 - F15_KAP)
+        assert np.allclose(k['du_m']['bo_vung'], (1 - F15_KAP) * _FieldCam.f(p), atol=1e-9)
+    assert r['h_bar']['da_kiem'] is False
+
+
+@pytest.mark.parametrize('bad', ['K2', 'no_track_sha', 'dup_dau', 'session', 'a6_other_h'])
+def test_meo_E_refuses(tmp_path, scene, monkeypatch, bad):
+    """KCF1-6, KCF1-7, KCF1-8: wrong place, missing link sha, two E_dau, another session, h-bar of the plate not the
+    session tag height: code 2, nothing written."""
+    sp = _f15_session(tmp_path, scene)
+    over = {'no_track_sha': dict(video_sha256=None), 'session': dict(session_sha256='1' * 64)}.get(bad)
+    td, cs = _e_files(tmp_path, sp, track_over=over, rows_extra=[('E_dau', [0])] if bad == 'dup_dau' else ())
+    _field_cases(monkeypatch, scene)
+    args = ['meo_E', '--model', 'B1', '--cho', 'K2' if bad == 'K2' else 'goc', '--session', str(sp), '--track', str(td),
+            '--cua-so', str(cs), '--out', str(tmp_path / 'e.json')]
+    if bad == 'a6_other_h':
+        a6 = tmp_path / 'a6.json'
+        a6.write_text(json.dumps(dict(schema='c8b_a6_v2', h_m=0.124175)), encoding='utf-8')
+        args += ['--a6', str(a6)]
+    assert kc.main(args) == 2 and not (tmp_path / 'e.json').exists()
+
+
+def _bang_files(tmp_path, sp, ten=('A', 'B', 'oc1'), with_session_file=False):
+    end = lambda d: dict(cho='goc', clip_sha256='c' * 64, khung_neo_sha256='k' * 64,                     # noqa: E731
+                         Ph_neo_m=[[0.10 + d, 0.05], [0.25 + d, 0.05], [0.18 + d, 0.12]][:len(ten)])
+    f6 = dict(session=dict(file=str(sp), sha256=kc.sha256_file(str(sp))), neo_ten=list(ten),
+              cua_so=[dict(meta=dict(cho='goc', loai='dung_12b', luot='t12', clip_sha='d' * 64),
+                           Ph=[[0.3, 0.2], [0.45, 0.2], [0.38, 0.27]][:len(ten)])])
+    f6p = tmp_path / 'hieu_chuan_neo.json'
+    f6p.write_text(json.dumps(f6), encoding='utf-8')
+    ll = dict(schema='lan_lap_v1', session_sha256=kc.sha256_file(str(sp)), neo_ten=list(ten), h_neo_m=[0.12] * len(ten),
+              h_n_m=0.12, hieu_chuan=dict(file=str(f6p), sha256=kc.sha256_file(str(f6p))),
+              luot=[dict(luot_id='r1', cho='goc', dau=dict(chuan=end(0.0), pre=end(0.01), post=end(0.02),
+                                                           dich=end(0.01)))])
+    if with_session_file:
+        ll['session_file'] = str(sp)
     lp = tmp_path / 'lan_lap.json'
     lp.write_text(json.dumps(ll), encoding='utf-8')
+    return lp, ll
+
+
+def test_meo_bang_f8_of_f9c4b3d_and_oracle(tmp_path, scene, monkeypatch):
+    """F15 (b), KCF1-2, KCF1-3, KCF1-9: F8 without session_file (writer f9c4b3d): the session comes from F6; every
+    anchor of every run end and of every calibration window, (1 - kappa_n) f(p) per anchor; A, B, oc1 -> thieu_oc
+    false; lan_lap.hieu_chuan_sha256 kept for the NHACTAM reader."""
+    sp = _f15_session(tmp_path, scene)
+    lp, ll = _bang_files(tmp_path, sp)
+    _field_cases(monkeypatch, scene)
     out = tmp_path / 'b.json'
-    args = ['meo_bang', '--model', 'B1', '--lan-lap', str(lp), '--r-xp', '0.3', '--out', str(out)]
-    assert kc.main(args) == 0
+    assert kc.main(['meo_bang', '--model', 'B1', '--lan-lap', str(lp), '--out', str(out)]) == 0
     r = json.loads(out.read_text(encoding='utf-8'))
+    kn = 0.12 / ZC
     t = r['theo_cho']['goc']
-    assert r['thieu_oc'] is True and [m['dau'] for m in t['muc']] == ['chuan', 'post', 'pre']
-    assert set(t['muc'][0]['neo']) == {'A', 'B'} and r['kappa_n'] == pytest.approx(0.12 / ZC)
-    assert max(math.hypot(*v) for m in t['muc'] for d in m['neo'].values() for v in d.values()) < 1e-6
-    ll['luot'][0]['dau']['pre'] = dict(end, Ph_neo_m=[[0.1, 0.05]])
+    assert r['thieu_oc'] is False and r['trang_thai'] == 'chan_doan' and r['kappa_n'] == pytest.approx(kn)
+    assert r['lan_lap']['hieu_chuan_sha256'] == ll['hieu_chuan']['sha256']
+    assert [m['dau'] for m in t['muc']] == ['chuan', 'post', 'pre'] and len(t['muc_hieu_chuan']) == 1
+    for m in t['muc']:
+        P = np.asarray(ll['luot'][0]['dau'][m['dau']]['Ph_neo_m'])
+        p = (P - kn * F15_C) / (1 - kn)
+        want = (1 - kn) * _FieldCam.f(p)
+        for k, nm in enumerate(['A', 'B', 'oc1']):
+            assert np.allclose(m['neo'][nm]['bo_vung'], want[k], atol=1e-9)
+
+
+@pytest.mark.parametrize('bad', ['name_X', 'count', 'f6_sha'])
+def test_meo_bang_refuses(tmp_path, scene, monkeypatch, bad):
+    """KCF1-7, KCF1-9: an anchor name outside A, B, oc<n>, an anchor count not neo_ten's, an F6 of another sha: code 2."""
+    sp = _f15_session(tmp_path, scene)
+    lp, ll = _bang_files(tmp_path, sp, ten=('A', 'B', 'X') if bad == 'name_X' else ('A', 'B', 'oc1'),
+                         with_session_file=True)
+    if bad == 'count':
+        ll['luot'][0]['dau']['pre']['Ph_neo_m'] = [[0.1, 0.05]]
+    if bad == 'f6_sha':
+        ll['hieu_chuan']['sha256'] = 'e' * 64
     lp.write_text(json.dumps(ll), encoding='utf-8')
-    assert kc.main(args[:-1] + [str(tmp_path / 'b2.json')]) == 2
+    _field_cases(monkeypatch, scene)
+    assert kc.main(['meo_bang', '--model', 'B1', '--lan-lap', str(lp), '--out', str(tmp_path / 'b.json')]) == 2
+    assert not (tmp_path / 'b.json').exists()
