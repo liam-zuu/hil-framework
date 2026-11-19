@@ -1254,3 +1254,90 @@ def test_sha_ids_is_the_common_form():
     import hashlib
     assert nt.sha_ids([12, 3, 7]) == hashlib.sha256(b'3,7,12').hexdigest()
     assert nt.sha_ids([]) == hashlib.sha256(b'').hexdigest()
+
+
+# ---------------------------------------------------------------- v4 13: lan_lap --f15 -> beta_cam_replay
+def _f15(ll, cases, path):
+    """c7_meo_dau_chan_bang_v1 as KIEMCHEO meo_bang writes it (941d779), from a first lan_lap.json; cases(cho, lid,
+    dau, k_anchor) -> {case: [dx, dy]}."""
+    import hashlib
+    ten = ll['neo_ten']
+    theo = {}
+    for r in ll['luot']:
+        for dau, x in sorted((r.get('dau') or {}).items()):
+            if dau == 'dich' or not x or x.get('Ph_neo_m') is None:
+                continue
+            cho = x.get('cho') or r.get('cho')
+            t = theo.setdefault(cho, dict(ca=[], ca_hong=[], muc=[]))
+            t['muc'].append(dict(luot_id=r['luot_id'], dau=dau, clip_sha256=x['clip_sha256'],
+                                 khung_neo_sha256=x['khung_neo_sha256'],
+                                 neo={n: cases(cho, r['luot_id'], dau, k) for k, n in enumerate(ten)}))
+    o = dict(schema='c7_meo_dau_chan_bang_v1', chieu='held_minus_full', bo_H32=True, truoc_le=True, neo_ten=ten,
+             h_n_m=H_N, kappa_n=H_N / ZC, lan_lap=dict(file='x', sha256='y', hieu_chuan_sha256=ll['hieu_chuan']['sha256']),
+             theo_cho=theo)
+    o['sha256'] = hashlib.sha256(json.dumps(o, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+    path.write_text(json.dumps(o), encoding='utf-8')
+    return o
+
+
+def _again(files, rows, recs, tag, f15):
+    hold = {i: recs[i] for i, w in enumerate(rows) if w['loai'] in nt.LOAI_GIU}
+    d = files
+    nt.run_lan_lap(str(d / f'hc_{tag}' / 'hieu_chuan_neo.json'), str(d / f'cs_{tag}.json'), str(d / 'session.json'),
+                   str(d / f'll_{tag}_f15_{f15.stem}'), str(d / 'a6.json'), 'T1', u_beta_cam_deg=0.01, cfg=CFG,
+                   a6_mod=FakeA6Mod, _records=hold, f15=str(f15))
+    return json.load(open(d / f'll_{tag}_f15_{f15.stem}' / 'lan_lap.json', encoding='utf-8'))
+
+
+def test_v4_13_f15_beta_cam_replay(files):
+    rows, recs = build()
+    _, hc, ll, L = run(files, rows, recs, tag='f')
+    assert 'beta_cam_replay' not in ll                                          # (5) no --f15: no block
+
+    def cases(cho, lid, dau, k):
+        return {'dong': [1e-4, -5e-5], 'A_pre': [2e-4, 0.0] if (k == 0 and dau == 'pre') else [0.0, 0.0],
+                'B_chuan': [0.0, 3e-4] if (k == 1 and dau == 'chuan') else [0.0, 0.0]}
+    _f15(ll, cases, files / 'f15a.json')
+    ll2 = _again(files, rows, recs, 'f', files / 'f15a.json')
+    b = ll2['beta_cam_replay']
+    # (2) expected from a direct solve of the pre ends at goc (the standard end does not move in case A_pre)
+    ctx = _ctx()
+    G, h = np.array(hc['G']), np.array(hc['h'])
+    exp = 0.0
+    for r in ll['luot']:
+        if r['cho'] == 'goc' and r['beta_deg'] is not None:
+            for dau, dP in (('pre', [[2e-4, 0.0], [0, 0], [0, 0]]), ('chuan', [[0, 0], [0.0, 3e-4], [0, 0]])):
+                P = np.array(r['dau'][dau]['Ph_neo_m'])
+                a0 = nt.tu_the(G, h, P, C + F_OFF, H_CAM, C, ctx.a_n)[0]
+                a1 = nt.tu_the(G, h, P + dP, C + F_OFF, H_CAM, C, ctx.a_n)[0]
+                exp = max(exp, abs(nt.wrap(a1 - a0)))
+    assert exp > 1e-4
+    assert b['goc']['trang_thai'] == 'dat' and b['goc']['max_abs_dbeta_rad'] == pytest.approx(exp, rel=1e-9)
+    assert b['goc']['f15_sha256'] == cm.sha256(str(files / 'f15a.json'))
+    assert b['goc']['n'] == 3 * sum(1 for r in ll['luot'] if r['cho'] == 'goc' and r['beta_deg'] is not None)
+
+    # (1) one shift of every anchor at both ends: beta does not move (to the lift nonlinearity)
+    def dong(cho, lid, dau, k):
+        return {'dong': [1e-4, -5e-5]}
+    _f15(ll, dong, files / 'f15b.json')
+    b2 = _again(files, rows, recs, 'f', files / 'f15b.json')['beta_cam_replay']
+    assert all(v['max_abs_dbeta_rad'] < 1e-5 for v in b2.values() if v['n'])
+
+    # (4) one end of another frame set -> that place is not concluded
+    o = _f15(ll, dong, files / 'f15c.json')
+    o['theo_cho']['goc']['muc'][0]['khung_neo_sha256'] = 'khac'
+    o.pop('sha256')
+    import hashlib
+    o['sha256'] = hashlib.sha256(json.dumps(o, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+    (files / 'f15c.json').write_text(json.dumps(o), encoding='utf-8')
+    b3 = _again(files, rows, recs, 'f', files / 'f15c.json')['beta_cam_replay']
+    assert b3['goc']['trang_thai'] == 'chua_ket_luan' and any('sai_nguon' in x for x in b3['goc']['ly_do'])
+
+    # (3) F15 made from a lan_lap of another hieu_chuan -> error (code 2)
+    o = _f15(ll, dong, files / 'f15d.json')
+    o['lan_lap']['hieu_chuan_sha256'] = 'khac'
+    o.pop('sha256')
+    o['sha256'] = hashlib.sha256(json.dumps(o, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+    (files / 'f15d.json').write_text(json.dumps(o), encoding='utf-8')
+    with pytest.raises(ValueError, match='hieu_chuan'):
+        _again(files, rows, recs, 'f', files / 'f15d.json')

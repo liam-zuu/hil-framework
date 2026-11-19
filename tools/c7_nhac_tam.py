@@ -873,6 +873,7 @@ TEN = dict(
     xoay_r='r_floor_m', trang_thai='trang_thai',
     tx_phi='phi_hat_chuan_k_deg', tx_u_phi='u_phi_hat_chuan_k_deg', tx_a='a_k_deg',
     tx_mien='mien_hieu_luc', tx_thu='thu_id_cap', tx_nguon='nguon', tx_dat=('khoa',),
+    f15='c7_meo_dau_chan_bang_v1',
     a6_g='g_b', a6_eps_g='eps_g',
 )
 CHO = ('goc', 'K1', 'K2')
@@ -1953,8 +1954,70 @@ def _hai(x):
     return x.get('chung') or x.get('ma')
 
 
+def beta_cam_replay(f15_path, hc, out_l, luot, hw, fitw, doan, G, h, ctx):
+    """v4 13 (F15 b, F16): largest change of beta per place when the anchor points of BOTH ends (standard, pre) move
+    by the map residual of each held-out camera case of KIEMCHEO (c7_meo_dau_chan_bang_v1). Returns
+    {cho: {max_abs_dbeta_rad, n, trang_thai, ly_do, f15_sha256}}; a wrong source raises ValueError (code 2)."""
+    with open(f15_path, 'rb') as fh:
+        raw = fh.read()
+    o, f_sha = json.loads(raw.decode('utf-8')), hashlib.sha256(raw).hexdigest()
+    if o.get('schema') != TEN['f15']:
+        raise ValueError(f'{f15_path}: schema {o.get("schema")} is not {TEN["f15"]}')
+    body = {k: v for k, v in o.items() if k != 'sha256'}
+    if hashlib.sha256(json.dumps(body, ensure_ascii=False, sort_keys=True).encode()).hexdigest() != o.get('sha256'):
+        raise ValueError(f'{f15_path}: content sha256 does not match')
+    if (o.get('lan_lap') or {}).get('hieu_chuan_sha256') != hc['_file_sha256']:
+        raise ValueError(f'{f15_path}: made from a lan_lap of another hieu_chuan_neo.json')
+    if o.get('neo_ten') != hc.get('neo_ten') or o.get('chieu') != 'held_minus_full':
+        raise ValueError(f'{f15_path}: neo_ten / chieu differ')
+    if not abs(float(o.get('kappa_n', NAN)) - ctx.kappa_n) <= 1e-12:
+        raise ValueError(f'{f15_path}: kappa_n differs from h_n / Z_c of the session')
+    ten = o['neo_ten']
+    out = {}
+    for cho, blk in (o.get('theo_cho') or {}).items():
+        if cho not in CHO:
+            raise ValueError(f'{f15_path}: place {cho!r}')
+        hong = set(blk.get('ca_hong') or [])
+        muc = {(m.get('luot_id'), m.get('dau')): m for m in blk.get('muc') or []}
+        dbs, ly = [], []
+        for r in out_l:
+            if r.get('cho') != cho or r.get('beta_deg') is None:
+                continue
+            lid = r['luot_id']
+            j, i = doan.get(lid, {}).get('j'), luot.get(lid, {}).get('pre')
+            if j is None or i is None:
+                continue
+            ends = []
+            for dau, src, key in (('chuan', fitw[j], 'khung_neo_sha256'), ('pre', hw[i], 'khung_neo_sha256')):
+                m = muc.get((lid, dau))
+                clip = src['meta']['clip_sha']
+                if m is None:
+                    ly.append(f'{lid}:{dau}:thieu_muc')
+                elif m.get('clip_sha256') != clip or m.get(key) != src[key]:
+                    ly.append(f'{lid}:{dau}:sai_nguon')
+                    m = None
+                ends.append((m, src))
+            if any(m is None for m, _ in ends):
+                continue
+            cases = [n for n in ends[0][0]['neo'][ten[0]] if n not in hong and n in ends[1][0]['neo'][ten[0]]]
+            for n in cases:
+                da = []
+                for m, src in ends:
+                    Ph = np.asarray(src['Ph'], float) + np.array([m['neo'][t][n] for t in ten], float)
+                    a1, _, _ = tu_the(G, h, Ph, np.asarray(src['F'], float), float(src['H']), ctx.C, ctx.a_n)
+                    a0, _, _ = tu_the(G, h, np.asarray(src['Ph'], float), np.asarray(src['F'], float), float(src['H']),
+                                      ctx.C, ctx.a_n)
+                    da.append(wrap(a1 - a0))
+                dbs.append(abs(wrap(da[1] - da[0])))
+        ok = bool(dbs) and not ly and all(math.isfinite(x) for x in dbs)
+        out[cho] = dict(max_abs_dbeta_rad=max(dbs) if dbs else None, n=len(dbs),
+                        trang_thai='dat' if ok else 'chua_ket_luan',
+                        ly_do=ly + ([] if dbs else ['khong_co_cap_luot_ca']), f15_sha256=f_sha)
+    return out
+
+
 def run_lan_lap(hc_path, cua_so_path, session_path, out_dir, a6_path, tam_id, truc_xe=None, xoay=None,
-                u_beta_cam_deg=None, clip_dir=None, mau_clip=None, cfg=None, a6_mod=None, _records=None):
+                u_beta_cam_deg=None, clip_dir=None, mau_clip=None, cfg=None, a6_mod=None, _records=None, f15=None):
     """v4 0, 3-9: held-out windows -> lan_lap.json (lan_lap_v1). Exit code 0 written / 2 error."""
     hc = doc_hieu_chuan(hc_path)
     khoa_ng = {k: v for k, v in hc['nguong'].items() if k in LL_DEFAULTS}
@@ -2141,6 +2204,10 @@ def run_lan_lap(hc_path, cua_so_path, session_path, out_dir, a6_path, tam_id, tr
                trai=trai, du_giu=du_giu, giu_vt=giu_vt, tx=tx, xo=xo, u_beta_cam_deg=u_beta_cam_deg,
                nguong_cho=nguong_cho, tam_id=tam_id, a6_sha=a6.sha256, hc_sha=base['hieu_chuan']['sha256'], rows=rows)
     out_l = [_mot_luot(lid, dd, so[lid], env) for lid, dd in sorted(luot.items())]
+    if f15 is not None:                                          # v4 13: second run with KIEMCHEO's F15 (b)
+        base['beta_cam_replay'] = beta_cam_replay(f15, dict(hc, _file_sha256=base['hieu_chuan']['sha256']), out_l,
+                                                  luot, hw, fitw, doan, G, h, ctx)
+        base['f15'] = dict(file=os.path.abspath(f15), sha256=cm.sha256(f15))
     base.update(trang_thai_buoi=hc['trang_thai'], ly_do=hc.get('ly_do', []), u_beta_deg=u_beta,
                 u_beta_cach='buoi: lech lon nhat + 2 eps_neo cap + nhieu; moi luot: eps_neo cap thay bang max(eps cap, '
                             'eps chuan + eps dich) (LLC2-5)',
@@ -2559,6 +2626,7 @@ def main(argv=None):
     a5.add_argument('--u-beta-cam-deg', type=float, help='u_beta_cam (C8B), before the margin')
     a5.add_argument('--tam-id', required=True, help='plate id of the session (CAM), as in hieu_chuan')
     a5.add_argument('--mau-clip', help='path of the template clip when moved')
+    a5.add_argument('--f15', help='c7_meo_dau_chan_bang_v1 of KIEMCHEO (F15 b) -> block beta_cam_replay (v4 13)')
     a5.add_argument('--thu-muc-clip')
     a5.add_argument('--out', required=True)
     a = ap.parse_args(argv)
@@ -2570,7 +2638,7 @@ def main(argv=None):
             print(f'hieu_chuan: {o["trang_thai"]} {", ".join(o.get("ly_do", []))}')
         elif a.cmd == 'lan_lap':
             code = run_lan_lap(a.hieu_chuan, a.cua_so, a.session, a.out, a.a6, a.tam_id, a.truc_xe, a.xoay,
-                               a.u_beta_cam_deg, a.thu_muc_clip, a.mau_clip)
+                               a.u_beta_cam_deg, a.thu_muc_clip, a.mau_clip, f15=a.f15)
             o = doc_json(os.path.join(a.out, 'lan_lap.json'))
             for x in o['luot']:
                 print(f'{x["luot_id"]}: beta {x["trang_thai"]["beta"]} {x["beta_deg"]}, delta_c_B '
