@@ -885,10 +885,19 @@ def test_read_neo_khung_chung_as_nhactam(tmp_path):
     for name, obj in bad.items():
         with pytest.raises(ca.AError):
             ca.read_neo(w(name, obj), 'K2', ref)
-    p = str(tmp_path / 'null_win.json')
+    mixed = f6(ref)                                                                          # HCG2-1
+    mixed['cho']['K2'] = dict(mixed['cho']['K2'], frames_sha256='4' * 64)
+    twin = f6(ref)                                                                           # HCG2-2
+    twin['cua_so'].append(dict(twin['cua_so'][0], meta=dict(twin['cua_so'][0]['meta'], frames_sha='5' * 64)))
+    deep = '[' * 3000 + ']' * 3000
+    for name, obj in (('null_win', null_win), ('mixed', mixed), ('twin', twin)):            # HCG2-3 null entry
+        with pytest.raises(ca.AError):
+            ca.read_neo(w(name, obj), 'K2', ref)
+    p = str(tmp_path / 'deep.json')
     with open(p, 'w', encoding='utf-8') as f:
-        json.dump(null_win, f)
-    assert ca.read_neo(p, 'K2', ref) == 12.0                                                 # null entry skipped
+        f.write(deep)
+    with pytest.raises(ca.AError):
+        ca.read_neo(p, 'K2', ref)
 
 
 def test_can_hai_dau_function_feeds_u_q_and_u_psi_cuc(tmp_path):
@@ -909,18 +918,24 @@ def test_can_hai_dau_function_feeds_u_q_and_u_psi_cuc(tmp_path):
     assert len(calls) == 8 and sum(c[1] == p_ref for c in calls) >= 4
     r2 = ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.004, -0.003], du_m=0.0, neo=0.0,
                          can_hai_dau=lambda p1, p2: (None, ['p1: A3 missing in the camera file']))
-    assert r2['trang_thai'] != 'khoa' and r2['u_hang_deg']['u_psi_cuc'] == 0.0
+    assert r2['trang_thai'] != 'khoa' and r2['u_hang_deg']['u_psi_cuc'] is None and r2['u_a_k_deg'] is None
+    assert r2['u_hang_deg']['u_q'] is None and set(r2['u_hang_thieu']) == {'u_q', 'u_psi_cuc'}
     assert any('A3 missing' in w for w in r2['ly_do']) and any('thieu can huong camera' in w for w in r2['ly_do'])
     assert any('u_psi_hai_dau_rad' in w for w in r2['ly_do'])
-    with pytest.raises(ca.AError):
-        ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.0, 0.0], du_m=0.0, neo=0.0,
-                        can_hai_dau=lambda p1, p2: (4.0, []))
+    r3 = ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.0, 0.0], du_m=0.0, neo=0.0,
+                         can_hai_dau=lambda p1, p2: (4.0, []))                  # HCH1-4: missing, with reason
+    assert r3['u_a_k_deg'] is None and any('ngoai mien' in w for w in r3['ly_do'])
+    seen = []
+    r4 = ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.004, 0.0], du_m=0.0, neo=0.0, bao_q=True,
+                         can_hai_dau=lambda p1, p2: (seen.append(p2) or math.radians(0.05), []))   # HCH1-7
+    assert len(seen) == 4 and r4['u_a_k_deg'] is not None
 
 
 def test_can_hai_dau_c8b_wrapper(tmp_path, monkeypatch):
     """--kc, --tam-id need --a6; c8b_a6 not merged -> no bound (reason kept); the C8B result is passed through."""
     import types
-    kc = write_json(str(tmp_path / 'kc.json'), dict(A3=dict(max_deg=0.02)))
+    kc = write_json(str(tmp_path / 'kc.json'), dict(A3=dict(max_deg=0.02, quy_ve_ma_noc=True, du_lieu_du=True)))
+    kc_bad = write_json(str(tmp_path / 'kc_x.json'), dict(A3=dict(max_deg=0.0, quy_ve_ma_noc=False, du_lieu_du=False)))
     a6 = write_json(str(tmp_path / 'a6.json'), dict(schema='c8b_a6_v2'))
     with pytest.raises(ca.AError):
         ca.can_hai_dau_c8b(None, kc, 'T1', [])
@@ -937,3 +952,8 @@ def test_can_hai_dau_c8b_wrapper(tmp_path, monkeypatch):
     assert ca.can_hai_dau_c8b(a6, kc, 'T1', nguon)((0, 0), (1, 0)) == (0.001, [])
     assert {n['vai_tro'] for n in nguon} == {'c8_cam_u_vao', 'c8b_a6_ham'}
     assert ca.can_hai_dau_c8b(a6, kc, 'T2', [])((0, 0), (1, 0)) == (None, ['khac tam'])
+    assert ca.can_hai_dau_c8b(a6, kc_bad, 'T1', [])((0, 0), (1, 0))[0] is None             # HCH1-5
+    with pytest.raises(ca.AError):
+        ca.can_hai_dau_c8b(a6, '', '', [])                                                # HCH1-8
+    m.u_psi_hai_dau_rad = lambda *a: 1 / 0
+    assert ca.can_hai_dau_c8b(a6, kc, 'T1', [])((0, 0), (1, 0))[0] is None                 # HCH1-6
