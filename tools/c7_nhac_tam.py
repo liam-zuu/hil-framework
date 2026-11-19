@@ -39,10 +39,10 @@ Boxes are pixel boxes (left, top, width, height) in the frames of N0, each insid
 v4 (placement of the plate per run; design 2026-11-19_Thiet_ke_nhac_tam_lan_lap_v4.md, DA DUYET; CODE_NHACTAM
 local_68e19299, 19/11/2026); khung, kiem, do above unchanged:
   python tools/c7_nhac_tam.py hieu_chuan --cua-so W.json --session S/session.json --neo "A:u,v,w,h;B:...;oc1:..." \
-        --mau CLIP SESSION IDX --kiem-r R/kiem.json ... --a6 A6.json [--h-neo M] --out D
+        --mau CLIP SESSION IDX --kiem-r R/kiem.json ... --a6 A6.json --tam-id T [--h-neo M] --out D
         -> D/hieu_chuan_neo.json (F6), fit windows only (12b, E), locked before the held-out windows
   python tools/c7_nhac_tam.py lan_lap --hieu-chuan D/hieu_chuan_neo.json --cua-so W.json --session S/session.json \
-        --a6 A6.json [--truc-xe T.json] [--xoay X.json] [--u-beta-cam-deg U] [--tam-id ID] --out D2
+        --a6 A6.json --tam-id T [--truc-xe T.json] [--xoay X.json] [--u-beta-cam-deg U] --out D2
         -> D2/lan_lap.json (lan_lap_v1, F8)
 Anchor boxes are found in a window around the place predicted from the window's tag pose (median; carried from the
 previous window of the clip when the tag is lost), the template turned by the image rotation.
@@ -857,7 +857,7 @@ import datetime                                                          # noqa:
 import hashlib                                                           # noqa: E402
 import importlib                                                         # noqa: E402
 
-from scipy.optimize import least_squares, linprog                         # noqa: E402
+from scipy.optimize import least_squares, linprog, minimize_scalar        # noqa: E402
 
 LL_VERSION = 'c7_nhac_tam_lan_lap_v1'
 # Names of formats and keys owned by other sessions (hop dong du lieu C8 tuong doi v1): the ONE place to change them.
@@ -1008,7 +1008,7 @@ def khop_hinh(obs, h_n, C, a, fix_h=None, x0=None):
     sol = least_squares(resid, x0, x_scale='jac', ftol=1e-14, xtol=1e-14, gtol=1e-14, max_nfev=300)
     G, h, poses = _unpack(sol.x, n, W, h_n, fix_h)
     r = sol.fun.reshape(W, n, 2)
-    return dict(G=G, h=h, poses=poses, res=np.linalg.norm(r, axis=2), jac=sol.jac, x=sol.x,
+    return dict(G=G, h=h, poses=poses, res=np.linalg.norm(r, axis=2), jac=sol.jac, x=sol.x, hoi_tu=bool(sol.status > 0),
                 idx_h=list(range(nG, nG + nh)), m=len(sol.fun), p=len(sol.x), ssr=float(np.sum(sol.fun ** 2)))
 
 
@@ -1023,53 +1023,88 @@ def hang(fit, cfg):
     s = max(math.sqrt(fit['ssr'] / dof) if dof > 0 else NAN, cfg['s_min_m'])
     if not math.isfinite(s):
         s = cfg['s_min_m']
-    cov = s * s * np.linalg.pinv(J.T @ J, rcond=1e-15)
-    sig = np.sqrt(np.clip(np.diag(cov)[ih], 0.0, None))
     ir = [i for i in range(J.shape[1]) if i not in ih]
     Jh, Jr = J[:, ih], J[:, ir]
-    Jp = Jh - Jr @ np.linalg.lstsq(Jr, Jh, rcond=None)[0]
-    raw = np.linalg.svd(Jp, compute_uv=False)
-    ref = float(np.linalg.svd(Jh, compute_uv=False).max())         # size of the h columns before the removal
-    suy = bool(ref <= 0 or raw.min() < cfg['suy_bien_rel'] * ref or not np.all(sig > 0))
-    Jn = Jp * sig[None, :]
-    _, S, Vt = np.linalg.svd(Jn, full_matrices=False)
-    rel = S / S.max() if S.max() > 0 else np.zeros_like(S)
+    Jp = Jh - Jr @ np.linalg.lstsq(Jr, Jh, rcond=None)[0]           # h columns after removing G and the poses
+    _, S0, V0 = np.linalg.svd(Jp, full_matrices=False)
+    ref = float(np.linalg.svd(Jh, compute_uv=False).max())          # size of the h columns before the removal
+    suy = bool(ref <= 0 or not fit.get('hoi_tu', True) or S0.min() < cfg['suy_bien_rel'] * ref)
+    if suy:                                                         # LLC1-10: no finite standard error
+        n = len(ih)
+        return dict(sigma_h=np.full(n, math.inf), cov_h=np.full((n, n), math.inf), s_rel=np.zeros(n), yeu=[],
+                    suy_bien=True, s_fit_m=s)
+    cov = s * s * (V0.T @ np.diag(1.0 / S0 ** 2) @ V0)              # marginal covariance of h (Schur complement)
+    sig = np.sqrt(np.diag(cov))
+    _, S, Vt = np.linalg.svd(Jp * sig[None, :], full_matrices=False)
+    rel = S / S.max()
     yeu = [sig * Vt[k] for k in range(len(S)) if rel[k] < cfg['hang_rel']]
-    return dict(sigma_h=sig, s_rel=rel, yeu=yeu, suy_bien=suy, s_fit_m=s)
+    return dict(sigma_h=sig, cov_h=cov, s_rel=rel, yeu=yeu, suy_bien=False, s_fit_m=s)
 
 
-def eps_neo_bang(G, h, F, H, C, a, cfg, alpha=0.0, o=(0.0, 0.0)):
-    """v4 3 (LL3-3), 6b (LL5-4): single-anchor displacement test with G, h locked. For every anchor and direction
-    (unit displacement d): (dalpha / maxres, do / maxres) where maxres = largest per-anchor residual it leaves.
-    Linear: d = 1e-5 m on model-exact observations."""
+def eps_neo_bang(G, h, F, H, C, a, cfg=None):
+    """v4 3 (LL3-3), 6b (LL5-4): single-anchor displacement with G, h locked, linearised (LLC1-11): for every anchor i,
+    dalpha = a_i . d, do = B_i d, residual of anchor j = R_ij d (d the displacement of the observed point)."""
     G, h = np.asarray(G, float), np.asarray(h, float)
-    base = thuan(G, h, alpha, o, F, H, C, a)
-    d, out = 1e-5, []
+    base = thuan(G, h, 0.0, (0.0, 0.0), F, H, C, a)
+    e, out = 1e-6, []
     for i in range(len(G)):
-        for k in range(cfg['n_huong']):
-            u = np.array([math.cos(2 * math.pi * k / cfg['n_huong']), math.sin(2 * math.pi * k / cfg['n_huong'])])
+        cols = []
+        for u in (np.array([1.0, 0.0]), np.array([0.0, 1.0])):
             Ph = base.copy()
-            Ph[i] += d * u
-            ang, t, res = tu_the(G, h, Ph, F, H, C, a)
-            mr = float(res.max())
-            if mr > 0:
-                out.append((abs(wrap(ang - alpha)) / mr, (t - np.asarray(o, float)) / mr, wrap(ang - alpha) / mr))
+            Ph[i] += e * u
+            ang, t, _ = tu_the(G, h, Ph, F, H, C, a)
+            r = thuan(G, h, ang, t, F, H, C, a) - Ph
+            cols.append((wrap(ang) / e, t / e, r / e))
+        out.append(dict(a=np.array([cols[0][0], cols[1][0]]), B=np.column_stack([cols[0][1], cols[1][1]]),
+                        R=np.stack([cols[0][2], cols[1][2]], axis=-1)))          # R: (n, 2, 2)
     return out
 
 
+def _max_ti_so(b, num):
+    """Largest num(u) / (largest anchor residual R_j u) over the unit direction u (LLC1-11): dense grid (vectorised),
+    then a bounded refinement around the best grid points. num maps (2, N) directions to (N,)."""
+    th = np.linspace(0.0, 2.0 * math.pi, 3601)[:-1]
+
+    def ratio(t):
+        U = np.vstack([np.cos(t), np.sin(t)])
+        den = np.max(np.linalg.norm(np.einsum('jab,bn->jan', b['R'], U), axis=1), axis=0)
+        return np.where(den > 0, num(U) / np.where(den > 0, den, 1.0), 0.0)
+    v = ratio(th)
+    best = float(v.max())
+    for k in np.argsort(v)[-6:]:
+        r = minimize_scalar(lambda x: -float(ratio(np.array([x]))[0]), bounds=(th[k] - 0.002, th[k] + 0.002),
+                            method='bounded', options=dict(xatol=1e-10))
+        best = max(best, -float(r.fun))
+    return best
+
+
+def k_goc(bang):
+    """Largest |dalpha| / largest anchor residual over anchors and directions."""
+    return max(_max_ti_so(b, lambda U, b=b: np.abs(b['a'] @ U)) for b in bang)
+
+
 def r_max_tu(bang, cfg):
-    """r_max with 2 eps_neo = eps_tong_deg (v4 3) and eps_neo (deg, one end)."""
-    k = max(b[0] for b in bang)
+    """r_max with 2 eps_neo = eps_tong_deg (v4 3) and eps_neo (deg, one end). bang: one table or a list of tables (one
+    per window geometry: the largest ratio is used)."""
+    tabs = bang if bang and isinstance(bang[0], list) else [bang]
+    k = max(k_goc(b) for b in tabs)
     r = math.radians(cfg['eps_tong_deg'] / 2.0) / k
     return r, math.degrees(r * k)
 
 
+def eps_goc(bang, r_max):
+    """eps_neo (deg) of one end with its own geometry and the locked r_max."""
+    return math.degrees(r_max * k_goc(bang))
+
+
 def eps_vi_tri(bang, r_max, c_B):
     """LL5-4: largest error of R(-alpha)(t - o) for a tag point at c_B (body frame) from one anchor displaced with
-    residual <= r_max (pose error: origin and angle through the lever arm), one end."""
-    c_B = np.asarray(c_B, float)
-    J = np.array([[0.0, 1.0], [-1.0, 0.0]])          # d/dalpha of R(-alpha) x at alpha = 0 is J x
-    return max(float(np.linalg.norm(-b[1] + b[2] * (J @ c_B))) * r_max for b in bang)
+    residual <= r_max (origin and angle through the lever arm), one end, continuous over the direction (LLC1-11)."""
+    Jc = np.array([[0.0, 1.0], [-1.0, 0.0]]) @ np.asarray(c_B, float)    # d/dalpha of R(-alpha) x at alpha = 0
+
+    def num(U, b):
+        return np.linalg.norm(-(b['B'] @ U) + (b['a'] @ U)[None, :] * Jc[:, None], axis=0)
+    return r_max * max(_max_ti_so(b, lambda U, b=b: num(U, b)) for b in bang)
 
 
 def trong_mien(x, pts, tol=1e-9):
@@ -1187,17 +1222,27 @@ def parse_neo(s):
         out.setdefault(name, []).extend(parse_boxes(b))
     if 'A' not in out or 'B' not in out:
         raise ValueError('--neo needs anchors A and B (tape patches; gauge of v4 3)')
+    for (n1, b1), (n2, b2) in itertools.combinations(out.items(), 2):            # LLC1-9: one physical point, one name
+        for a, b in itertools.product(b1, b2):
+            if a[0] < b[0] + b[2] and b[0] < a[0] + a[2] and a[1] < b[1] + b[3] and b[1] < a[1] + a[3]:
+                raise ValueError(f'--neo: box {a} of {n1} overlaps box {b} of {n2}')
+    for n, bs in out.items():
+        if len(set(bs)) != len(bs):
+            raise ValueError(f'--neo: anchor {n} lists one box twice')
     return {k: out[k] for k in ['A', 'B'] + [k for k in out if k not in ('A', 'B')]}
 
 
-def kiem_r_neo(neo, kiem_files):
+def kiem_r_neo(neo, kiem_files, mau_clip):
     """v4 3: every anchor box must be in the vung_than_px of a v7 'kiem --rong' result that passed (clip R proves the
-    box is on the body). Returns ({name: ok}, evidence)."""
+    box is on the body) AND that was checked against the template clip itself (its 'n0', LLC1-9). Returns
+    ({name: ok}, evidence)."""
     passed, ev = [], []
     for f in kiem_files or []:
         k = doc_json(f)
-        ev.append(dict(file=os.path.basename(f), sha256=cm.sha256(f), duoc=bool(k.get('duoc')), rong=bool(k.get('rong'))))
-        if k.get('rong') and k.get('duoc'):
+        dung_mau = k.get('n0') == os.path.basename(mau_clip)
+        ev.append(dict(file=os.path.basename(f), sha256=cm.sha256(f), duoc=bool(k.get('duoc')), rong=bool(k.get('rong')),
+                       n0=k.get('n0'), dung_mau=dung_mau))
+        if k.get('rong') and k.get('duoc') and dung_mau:
             passed += [tuple(int(x) for x in b) for b in k.get('vung_than_px', [])]
     return {n: all(tuple(b) in passed for b in bs) for n, bs in neo.items()}, ev
 
@@ -1342,14 +1387,19 @@ def do_clip(clip, wins, ctx, mau):
     miss = sorted(set(want) - set(p1))
     if miss:
         raise ValueError(f'{clip}: frames {miss[:5]}... not in the clip')
-    pred, last, why = {}, None, {}
+    own, why = {}, {}
     for key, fr in wins:
         tags = [p1[i]['tag'] for i, _ in fr if p1[i]['tag'] is not None and p1[i]['cam_ok']]
-        if tags:
-            last = (np.median([[x['tag_x'], x['tag_y']] for x in tags], axis=0), circ_median([x['tag_psi'] for x in tags]))
-        elif last is not None:
-            why.setdefault(key, []).append('du_doan_tu_cua_so_truoc')
-        pred[key] = last
+        own[key] = (np.median([[x['tag_x'], x['tag_y']] for x in tags], axis=0),
+                    circ_median([x['tag_psi'] for x in tags])) if tags else None
+    pred, keys = {}, [key for key, _ in wins]                 # windows in time order
+    for j, key in enumerate(keys):
+        if own[key] is not None:
+            pred[key] = own[key]
+            continue
+        near = sorted((abs(j2 - j), j2) for j2, k2 in enumerate(keys) if own[k2] is not None)   # LLC1-16: before or after
+        pred[key] = own[keys[near[0][1]]] if near else None
+        why.setdefault(key, []).append('du_doan_tu_cua_so_gan_nhat' if near else 'khong_du_doan_neo')
     out = {key: [] for key, _ in wins}
     for k, t, g in cm.iter_frames(clip):
         if k not in want:
@@ -1384,7 +1434,7 @@ def tom_neo(recs, n_khung, cfg):
     """v4 3 (LL3-7): anchor frame set of a window: camera and anchor gates; still (95th percentile of each anchor's
     deviation <= still_neo_m); >= min_khung frames and >= min_frac of the window. The tag is NOT needed."""
     use = [r for r in recs if r['cam_ok'] and r['neo_ok']]
-    out = dict(n=len(use), n_cua_so=n_khung, ids=[r['id'] for r in use], ok=False, ly_do=[])
+    out = dict(n=len(use), n_cua_so=n_khung, ids=[r['id'] for r in use], pts=[r['t'] for r in use], ok=False, ly_do=[])
     if len(use) < cfg['min_khung'] or len(use) < cfg['min_frac'] * n_khung:
         out['ly_do'].append('thieu_khung_neo')
         return out
@@ -1399,43 +1449,53 @@ def tom_neo(recs, n_khung, cfg):
     return out
 
 
-def tom_chung(recs, ma_ids, a6, ctx, cfg, neo_ids):
-    """v4 5 (LL3-8): common frame set = anchor set AND CAM tag gate AND tag seen AND A6 ok; psi' = tag_psi - dpsi_A6.
-    Per-frame arrays for the later pose fits."""
+def tom_chung(recs, ma_ids, a6, a6_ok, ctx, cfg, neo_ids):
+    """Tag sets of a window (v4 5, 8; LLC1-13): 'ma' = anchor set AND CAM tag gate AND tag seen (no A6: centre and scale
+    comparisons); 'chung' = 'ma' AND A6 ok (psi' = tag_psi - dpsi_A6; LL3-8 ambiguous branch dropped)."""
     ids = set(neo_ids)
     use = [r for r in recs if r['id'] in ids and r['id'] in ma_ids and r['tag'] is not None]
-    out = dict(ok=False, ly_do=[], ids=[])
-    if a6 is None:
-        out['ly_do'].append('thieu_a6')
-        return out
-    if use:
-        xy = np.array([[r['tag']['x'], r['tag']['y']] for r in use])
-        dp, ok = a6.dpsi(xy, [r['tag']['psi'] for r in use], ctx.C, ctx.Zc)
-        use = [(r, d) for r, d, k in zip(use, dp, ok) if k and math.isfinite(d)]
+    out = dict(ok_ma=False, ok=False, ly_do=[], ids_ma=[], pts_ma=[], ids=[], pts=[])
     if len(use) < cfg['min_khung']:
+        out['ly_do'].append('thieu_khung_ma')
+        return out
+
+    def arrs(rs):
+        return dict(Ph=np.array([r['Ph'] for r in rs]), F=np.array([r['F'] for r in rs]), H=np.array([r['H'] for r in rs]),
+                    t=np.array([[r['tag']['x'], r['tag']['y']] for r in rs]), s=np.array([r['tag']['s'] for r in rs]))
+    out.update(ok_ma=True, ids_ma=[r['id'] for r in use], pts_ma=[r['t'] for r in use], ma=arrs(use),
+               psi_tho=np.array([r['tag']['psi'] for r in use]))
+    if a6 is None or not a6_ok:
+        out['ly_do'].append('a6_khong_ap_dung' if a6 is not None else 'thieu_a6')
+        return out
+    xy = np.array([[r['tag']['x'], r['tag']['y']] for r in use])
+    dp, ok = a6.dpsi(xy, [r['tag']['psi'] for r in use], ctx.C, ctx.Zc)
+    u2 = [(r, d) for r, d, k in zip(use, dp, ok) if k and math.isfinite(d)]
+    if len(u2) < cfg['min_khung']:
         out['ly_do'].append('thieu_khung_chung')
         return out
-    psi = np.array([wrap(r['tag']['psi'] - d) for r, d in use])
+    psi = np.array([wrap(r['tag']['psi'] - d) for r, d in u2])
     if mo_ho(psi, cfg['mo_ho_deg']):
         out['ly_do'].append('mo_ho_nhanh')
         return out
-    out.update(ok=True, ids=[r['id'] for r, _ in use], psi=psi, Ph=np.array([r['Ph'] for r, _ in use]),
-               F=np.array([r['F'] for r, _ in use]), H=np.array([r['H'] for r, _ in use]),
-               t=np.array([[r['tag']['x'], r['tag']['y']] for r, _ in use]), s=np.array([r['tag']['s'] for r, _ in use]))
+    out.update(ok=True, ids=[r['id'] for r, _ in u2], pts=[r['t'] for r, _ in u2], psi=psi, **arrs([r for r, _ in u2]))
     return out
 
 
-def tinh_chung(ch, G, h, ctx):
-    """Per-frame body poses on the common set (G, h locked) -> merged angles and means: alpha (gop), psi' (gop),
-    theta = wrap(psi' - alpha), o, tag centre, scale, camera."""
+def tinh_chung(ch, G, h, ctx, psi=None):
+    """Per-frame body poses (G, h locked) -> merged angles and means: alpha (gop), psi' (gop) and theta when psi is
+    given, o, tag centre, scale, camera."""
     al, oo = [], []
     for Ph, F, H in zip(ch['Ph'], ch['F'], ch['H']):
         a_, o_, _ = tu_the(G, h, Ph, F, H, ctx.C, ctx.a_n)
         al.append(a_)
         oo.append(o_)
-    alpha, psi = gop_goc(al), gop_goc(ch['psi'])
-    return dict(alpha=alpha, psi=psi, theta=wrap(psi - alpha), o=np.mean(oo, axis=0), t=ch['t'].mean(axis=0),
-                s=float(ch['s'].mean()), F=ch['F'].mean(axis=0), H=float(ch['H'].mean()), n=len(al))
+    alpha = gop_goc(al)
+    out = dict(alpha=alpha, o=np.mean(oo, axis=0), t=ch['t'].mean(axis=0), s=float(ch['s'].mean()),
+               F=ch['F'].mean(axis=0), H=float(ch['H'].mean()), n=len(al), psi=None, theta=None)
+    if psi is not None:
+        p = gop_goc(psi)
+        out.update(psi=p, theta=wrap(p - alpha))
+    return out
 
 
 # ---------------------------------------------------------------- v4 6b: delta_c_B (LL5-1..6)
@@ -1449,26 +1509,39 @@ def tam_ma_that(t, z, F, H, ctx, g_san=None):
     return nghich(t, z, F, H, ctx.C, ctx.a_t)[0]
 
 
+def _psi_w(w):
+    """Tag yaw used to turn g_b to the floor: psi' when A6 applied, else the raw merged yaw."""
+    return w['psi'] if w.get('psi') is not None else w['psi_tho']
+
+
 def thang_sua(s, t, g_san, ctx, H, F):
     """v4 6b: apparent tag scale with the first-order tilt part g_floor . (p - F) / (2 (H - h)) removed (ray centre
     F, H of the forward equation, LL5-1; the design's (p - C) / (Z_c - h) is the case F = C, H = Z_c)."""
     return s - float(np.dot(g_san, np.asarray(t, float) - np.asarray(F, float))) / (2.0 * (H - ctx.tag_h))
 
 
+def _s_sua(w, ctx, g_b):
+    return thang_sua(w['s'], w['t'], rot2(_psi_w(w)) @ g_b, ctx, w['H'], w['F'])
+
+
 def c_B_cua(w, ctx, g_b, dz=0.0):
     """Tag centre in the anchor frame of a window summary (v4 6, 6b): R(-alpha)(P_t - o)."""
-    g_san = rot2(w['psi']) @ g_b
-    Pt = tam_ma_that(w['t'], ctx.tag_h + dz, w['F'], w['H'], ctx, g_san)
+    Pt = tam_ma_that(w['t'], ctx.tag_h + dz, w['F'], w['H'], ctx, rot2(_psi_w(w)) @ g_b)
     return rot2(-w['alpha']) @ (Pt - w['o'])
+
+
+def _kiem_mien_so(*v):
+    if not all(math.isfinite(float(x)) for x in v):
+        raise ValueError('6b: non-finite value')
 
 
 def delta_h_uoc(ws, wd, ctx, g_b):
     """Dh estimate (v4 6b) from the scale ratio, tilt part of both scales removed (one g_b, LL5-6). With the forward
     equation (LL5-1) s = k H / (H - z): Dh = H_d - h - (s_s / s_d) H_d (H_s - h) / H_s (k, the edge bias, cancels);
     = (H - h)(1 - s_s / s_d) when H_s = H_d (the design's (Z_c - h)(1 - s_s / s_d) with Z_c read as H)."""
-    ss = thang_sua(ws['s'], ws['t'], rot2(ws['psi']) @ g_b, ctx, ws['H'], ws['F'])
-    sd = thang_sua(wd['s'], wd['t'], rot2(wd['psi']) @ g_b, ctx, wd['H'], wd['F'])
-    h = ctx.tag_h
+    ss, sd, h = _s_sua(ws, ctx, g_b), _s_sua(wd, ctx, g_b), ctx.tag_h
+    if not (ss > 0 and sd > 0 and ws['H'] > h and wd['H'] > h):
+        raise ValueError('6b: scale or H - h not positive')
     return wd['H'] - h - (ss / sd) * wd['H'] * (ws['H'] - h) / ws['H']
 
 
@@ -1479,29 +1552,81 @@ def delta_c_B(ws, wd, ctx, g_b):
     return c_B_cua(wd, ctx, g_b, dh) - cs, c_B_cua(wd, ctx, g_b) - cs, dh
 
 
-def chi_so_12b(ws12, ctx, g_b):
-    """6b indices from the 12b windows of the place (LL5-2): spread of c_B (largest pair distance) and the ratio
-    repeatability max |s_i / s_j - 1| (tilt removed)."""
+def trai_nhom(ws12, ctx, g_b):
+    """Spreads of a group of 12b windows of one placement (v4 6, 6b, 8): theta (deg; None without A6), c_B (largest
+    pair distance), scale ratio max |s_i / s_j - 1| (tilt removed, LL5-2)."""
     cs = [c_B_cua(w, ctx, g_b) for w in ws12]
-    ss = [thang_sua(w['s'], w['t'], rot2(w['psi']) @ g_b, ctx, w['H'], w['F']) for w in ws12]
-    trai_c = max((float(np.linalg.norm(a - b)) for a, b in itertools.combinations(cs, 2)), default=NAN)
-    trai_s = max((abs(a / b - 1.0) for a, b in itertools.permutations(ss, 2)), default=NAN)
-    return trai_c, trai_s
+    ss = [_s_sua(w, ctx, g_b) for w in ws12]
+    th = [w['theta'] for w in ws12]
+    return dict(theta=(max((abs(math.degrees(wrap(a - b))) for a, b in itertools.combinations(th, 2)), default=NAN)
+                       if all(x is not None for x in th) else NAN),
+                c_B=max((float(np.linalg.norm(a - b)) for a, b in itertools.combinations(cs, 2)), default=NAN),
+                s=max((abs(a / b - 1.0) for a, b in itertools.permutations(ss, 2)), default=NAN), n=len(ws12))
 
 
 def u_delta_c_B(ws, wd, ctx, g_b, eps_g, trai_c, trai_s, eps_pos, du_giu):
-    """u_delta_c_B_m before the margin (v4 6b, LL5-1..5): window noise + Dh index through the arm |P_t - F| + tilt
-    centre index at both ends + Dh x place offset + anchor position error (both ends) + held-out residual."""
-    hz = wd['H'] - ctx.tag_h
+    """u_delta_c_B_m before the margin (v4 6b, LL5-1..5, LLC1-12): window noise + Dh index propagated through the
+    ratio formula (12b ratio repeatability, eps_g of each end) times the arm |P_t - F_d| from the corrected centre +
+    tilt centre index of each end with its own H + Dh x place offset + anchor position error (both ends) + held-out."""
+    h = ctx.tag_h
+    hs, hd = ws['H'] - h, wd['H'] - h
+    ss, sd = _s_sua(ws, ctx, g_b), _s_sua(wd, ctx, g_b)
     _, _, dh = delta_c_B(ws, wd, ctx, g_b)
-    rho = lambda w: float(np.linalg.norm(np.asarray(w['t']) - np.asarray(w['F'])))     # noqa: E731
-    u_dh = hz * trai_s + eps_g * (rho(ws) + rho(wd)) / 2.0                             # LL5-2, eps_g through the scale
-    Pt = tam_ma_that(wd['t'], ctx.tag_h + dh, wd['F'], wd['H'], ctx)
-    parts = dict(nhieu=trai_c, dh=u_dh / hz * float(np.linalg.norm(Pt - wd['F'])),
-                 nghieng=2.0 * ctx.side ** 2 * eps_g / (4.0 * hz),
-                 lech_cho=abs(dh) * float(np.linalg.norm(np.asarray(wd['t']) - ws['t'])) / hz,
+    rho_s = float(np.linalg.norm(np.asarray(ws['t']) - ws['F']))
+    rho_d = float(np.linalg.norm(np.asarray(wd['t']) - wd['F']))
+    K = wd['H'] * hs / ws['H']
+    u_ratio = (ss / sd) * (trai_s + eps_g * rho_s / (2.0 * hs * ss) + eps_g * rho_d / (2.0 * hd * sd))
+    u_dh = K * u_ratio
+    Pt = tam_ma_that(wd['t'], h + dh, wd['F'], wd['H'], ctx, rot2(_psi_w(wd)) @ g_b)
+    parts = dict(nhieu=trai_c, dh=u_dh / hd * float(np.linalg.norm(Pt - wd['F'])),
+                 nghieng=ctx.side ** 2 * eps_g / 4.0 * (1.0 / hs + 1.0 / hd),
+                 lech_cho=abs(dh) * float(np.linalg.norm(np.asarray(wd['t']) - ws['t'])) / hd,
                  neo=eps_pos, giu_ngoai=du_giu)
+    _kiem_mien_so(u_dh, *parts.values())
+    if any(v < 0 for v in parts.values()):
+        raise ValueError('6b: negative index part')
     return float(sum(parts.values())), parts, u_dh
+
+
+GIOI_HAN_V4 = [
+    'Moi so la chi so thuc nghiem TRUOC le; le 1,25 do C8B nhan mot lan (C8BX-24).',
+    'LL4-1 (Liam nhan 19/11): bam neo khong co sai cung phu thuoc cho/clip qua u_beta (cap truoc-sau khong thay).',
+    'LL4-3 (Liam nhan 19/11): hai mieng bang dinh khong cung xoay quanh cum oc.',
+    'v4 6b: lech do canh cua ma nhu nhau giua hai lan lap o cung cho; mat neo khong doi do cao giua hai dau.',
+    'LL5-4 (gui CODE gom trinh Liam): ca cum neo khong dich cung chung phu thuoc cho/clip qua chi so.',
+    'LL5-5 (gui CODE gom trinh Liam): chi so giu ngoai vi tri lay tu cap cung cho co trong buoi, dung cho moi cho.',
+    'u_beta la chi so thuc nghiem trong mien da kiem (v4 11); delta_a, q, delta_h_goc chi chan doan.',
+    'Gop tam theo trung binh cua so (khong theo tung khung): lech bac hai theo dao dong goc (LLC1-18 DEFERRED).',
+]
+
+
+# ---------------------------------------------------------------- F2 checks (LLC1-7)
+def kiem_f2(rows):
+    """Structure of the window file before any measurement: unique IDs and finite increasing PTS in a window, one pre
+    and one post per run, no window given twice, no frame shared by the fit and held-out roles."""
+    seen, roles, luot = {}, {}, {}
+    for i, w in enumerate(rows):
+        fr = khung_cua(w)
+        ids, pts = [k for k, _ in fr], [p for _, p in fr]
+        if len(set(ids)) != len(ids):
+            raise ValueError(f'window {i}: frame IDs repeated')
+        if not all(math.isfinite(p) for p in pts) or any(b <= a for a, b in zip(pts, pts[1:])) \
+                or any(b <= a for a, b in zip(ids, ids[1:])):
+            raise ValueError(f'window {i}: PTS / IDs not finite and increasing')
+        key = (w[TEN['clip_sha']], tuple(ids))
+        if key in seen:
+            raise ValueError(f'window {i}: the same frames as window {seen[key]}')
+        seen[key] = i
+        role = 'khop' if w[TEN['loai']] in LOAI_KHOP else 'giu'
+        for k in ids:
+            r0 = roles.setdefault((w[TEN['clip_sha']], k), role)
+            if r0 != role:
+                raise ValueError(f'window {i}: frame {k} in both the fit and the held-out sets (D1)')
+        if role == 'giu':
+            d = luot.setdefault(w[TEN['luot']], {})
+            if w[TEN['loai']] in d:
+                raise ValueError(f'run {w[TEN["luot"]]}: two {w[TEN["loai"]]} windows')
+            d[w[TEN['loai']]] = i
 
 
 # ---------------------------------------------------------------- hieu_chuan (v4 1, 3, 9; F6)
@@ -1540,15 +1665,36 @@ def _mau(mau_args, ctx, neo):
     return NeoMau(fr[1], r['cam'], r['tag'], neo, mctx.kappa_n, mctx.C, ctx.cfg)
 
 
-def tom_cua_so(w, recs, a6, ctx, cfg):
+def tom_cua_so(w, recs, a6, a6_ok, ctx, cfg):
     fr = khung_cua(w)
     pts = [p for _, p in fr]
     nb = tom_neo(recs, len(fr), cfg)
-    ch = tom_chung(recs, khung_ma(w), a6, ctx, cfg, nb['ids']) if nb['ok'] else dict(ok=False, ly_do=['thieu_neo'], ids=[])
+    ch = tom_chung(recs, khung_ma(w), a6, a6_ok, ctx, cfg, nb['ids']) if nb['ok'] else \
+        dict(ok=False, ok_ma=False, ly_do=['thieu_neo'], ids=[], pts=[], ids_ma=[], pts_ma=[])
     canh = kiem_canh(w, pts)
+    ma = khung_ma(w)
+    giao = [r for r in recs if r['cam_ok'] and r['neo_ok'] and r['id'] in ma and r['tag'] is not None]
+    kl = w.get('ket_luan') if isinstance(w.get('ket_luan'), dict) else {}
+    cam_dung = kl.get('dung_yen', True) is not False                     # LLC1-7: CAM's stillness verdict
+    ly = nb['ly_do'] + ([] if canh else ['canh_lenh']) + ([] if cam_dung else ['cam_khong_dung_yen'])
     return dict(meta={k: w.get(TEN[k]) for k in ('luot', 'cho', 'loai', 'clip', 'clip_sha', 'session_sha')},
-                t0=min(pts) if pts else NAN, neo=nb, chung=ch, canh_ok=canh,
-                ok=bool(nb['ok'] and canh), ly_do=nb['ly_do'] + ([] if canh else ['canh_lenh']))
+                t0=min(pts) if pts else NAN, neo=nb, chung=ch, canh_ok=canh, ok=bool(nb['ok'] and canh and cam_dung),
+                ly_do=ly, giao=dict(id=[r['id'] for r in giao], pts_s=[r['t'] for r in giao]), mat_neo=not giao)
+
+
+def _tom_hai(s, G, h, ctx):
+    """'ma' and 'chung' summaries of a window (JSON-able dicts or None)."""
+    ch = s['chung']
+    ma = tinh_chung(ch['ma'], G, h, ctx) if ch.get('ok_ma') else None
+    if ma is not None:
+        ma['psi_tho'] = gop_goc(ch['psi_tho'])
+    chung = tinh_chung(ch, G, h, ctx, ch['psi']) if ch.get('ok') else None
+    return ma, chung
+
+
+def nhom_12b(cua, luot12):
+    """LLC1-4: 12b windows of one 12b run (luot_id; one run, the plate is not touched), with a common set."""
+    return [c for c in cua if c['meta']['loai'] in LOAI_12B and c['meta']['luot'] == luot12 and c['chung']]
 
 
 def khoa_hieu_chuan(wsum, ctx, cfg, a6):
@@ -1562,21 +1708,26 @@ def khoa_hieu_chuan(wsum, ctx, cfg, a6):
     obs = [dict(Ph=s['neo']['Ph'], F=s['neo']['F'], H=s['neo']['H']) for _, s in use]
     fit = khop_hinh(obs, ctx.h_n, ctx.C, ctx.a_n)
     hg = hang(fit, cfg)
-    bang = eps_neo_bang(fit['G'], fit['h'], obs[0]['F'], obs[0]['H'], ctx.C, ctx.a_n, cfg)
-    r_max, eps1 = r_max_tu(bang, cfg)
+    bangs = [eps_neo_bang(fit['G'], fit['h'], o['F'], o['H'], ctx.C, ctx.a_n) for o in obs]   # LLC1-11: every window
+    r_max, eps1 = r_max_tu(bangs, cfg)
     du = float(fit['res'].max())
     tt = 'dat'
     if du > r_max:
         tt, out['ly_do'] = 'chua_ket_luan', ['neo_khong_kha_thi']
     elif hg['suy_bien']:
         tt, out['ly_do'] = 'chua_ket_luan', ['thieu_hang']
+    g_b = a6.g_b()
     cua = []
     for (w, s), p, res in zip(use, fit['poses'], fit['res']):
-        c = dict(meta=s['meta'], t0=s['t0'], alpha=float(p[0]), o=p[1:].tolist(), Ph=s['neo']['Ph'].tolist(),
-                 F=s['neo']['F'].tolist(), H=s['neo']['H'], du_m=res.tolist(), khung_neo_sha256=sha_ids(s['neo']['ids']),
-                 n_neo=s['neo']['n'], chung=None, ly_do_chung=s['chung']['ly_do'])
-        if s['chung']['ok']:
-            c['chung'] = _jsonable(tinh_chung(s['chung'], fit['G'], fit['h'], ctx))
+        ma, chung = _tom_hai(s, fit['G'], fit['h'], ctx)
+        c = dict(meta=s['meta'], t0=s['t0'], thu_tu=s['thu_tu'], alpha=float(p[0]), o=p[1:].tolist(),
+                 Ph=s['neo']['Ph'].tolist(),
+                 F=s['neo']['F'].tolist(), H=s['neo']['H'], du_m=res.tolist(), n_neo=s['neo']['n'],
+                 khung_neo=dict(id=s['neo']['ids'], pts_s=s['neo']['pts']), khung_neo_sha256=sha_ids(s['neo']['ids']),
+                 ma=None if ma is None else _jsonable(ma), chung=None if chung is None else _jsonable(chung),
+                 ly_do_chung=s['chung']['ly_do'])
+        if chung is not None:
+            c['khung_chung'] = dict(id=s['chung']['ids'], pts_s=s['chung']['pts'])
             c['khung_chung_sha256'] = sha_ids(s['chung']['ids'])
         cua.append(c)
     # window noise (v4 4): adjacent fit windows of a clip, |wrap(dalpha - dpsi')| (alpha of the anchor set)
@@ -1586,55 +1737,75 @@ def khoa_hieu_chuan(wsum, ctx, cfg, a6):
         nh += [abs(math.degrees(wrap(wrap(b['alpha'] - a['alpha']) - wrap(b['chung']['psi'] - a['chung']['psi']))))
                for a, b in zip(cc, cc[1:])]
     nhieu = max(nh) if nh else NAN
-    cho = {}
-    for k in CHO:
-        ref = [c for c in cua if c['meta']['cho'] == k and c['meta']['loai'] == LOAI_CHUAN]
-        if len(ref) != 1 or ref[0]['chung'] is None:
-            cho[k] = dict(trang_thai='chua_ket_luan', ly_do='khong_co_cua_so_chuan' if len(ref) != 1 else 'thieu_khung_chung')
+    chuan = {}                     # J v6 2: one standard per 12b run, key 'cho|luot_id'
+    for r in [c for c in cua if c['meta']['loai'] == LOAI_CHUAN]:
+        key = f"{r['meta']['cho']}|{r['meta']['luot']}"
+        if r['chung'] is None:
+            chuan[key] = dict(trang_thai='chua_ket_luan', ly_do='thieu_khung_chung', cho=r['meta']['cho'],
+                              luot_id=r['meta']['luot'])
             continue
-        r = ref[0]
-        cho[k] = dict(trang_thai='dat', luot_id=r['meta']['luot'], clip_sha256=r['meta']['clip_sha'],
-                      khung_chung_sha256=r['khung_chung_sha256'], psi_chuan_k_deg=math.degrees(r['chung']['psi']),
-                      u_psi_chuan_k_cua_so_deg=nhieu, alpha_chuan_k_deg=math.degrees(r['alpha']),
-                      theta_chuan_k_deg=math.degrees(r['chung']['theta']))
-    out.update(trang_thai=tt, G=fit['G'], h=fit['h'], sigma_h=hg['sigma_h'], s_rel=hg['s_rel'],
-               huong_yeu=hg['yeu'], suy_bien=hg['suy_bien'], s_fit_m=hg.get('s_fit_m'), r_max_m=r_max,
-               eps_neo_deg=eps1, du_lon_nhat_m=du, nhieu_cua_so_deg=nhieu, n_cap_nhieu=len(nh), cua_so=cua, cho=cho,
-               x=fit['x'], idx_h=fit['idx_h'])
+        cw = _w_from_hc(r)
+        chuan[key] = dict(trang_thai='dat' if math.isfinite(nhieu) else 'chua_ket_luan',
+                          ly_do='' if math.isfinite(nhieu) else 'thieu_cap_nhieu', cho=r['meta']['cho'],
+                          luot_id=r['meta']['luot'], clip_sha256=r['meta']['clip_sha'],
+                          khung_chung_sha256=r['khung_chung_sha256'], psi_chuan_k_deg=math.degrees(r['chung']['psi']),
+                          u_psi_chuan_k_cua_so_deg=nhieu, alpha_chuan_k_deg=math.degrees(r['alpha']),
+                          theta_chuan_k_deg=math.degrees(r['chung']['theta']),
+                          c_B_chuan_k_m=c_B_cua(cw, ctx, g_b).tolist(),
+                          n_12b_cung_lan_lap=len(nhom_12b(cua, r['meta']['luot'])))
+    cho = {}                       # per place when the place has exactly one 12b run (F6 as agreed); else see chuan_12b
+    for k in CHO:
+        ks = [key for key, v in chuan.items() if v['cho'] == k]
+        cho[k] = chuan[ks[0]] if len(ks) == 1 else dict(
+            trang_thai='chua_ket_luan', ly_do='nhieu_12b_xem_chuan_12b' if ks else 'khong_co_cua_so_chuan', khoa=ks)
+    a_ref = cua[0]['alpha']
+    mien = [[*(rot2(-c['alpha']) @ (np.asarray(c['o']) - ctx.C)), a_ref + wrap(c['alpha'] - a_ref)] for c in cua]
+    out.update(trang_thai=tt, G=fit['G'], h=fit['h'], sigma_h=hg['sigma_h'], cov_h=hg.get('cov_h'), s_rel=hg['s_rel'],
+               huong_yeu=hg['yeu'], suy_bien=hg['suy_bien'], s_fit_m=hg.get('s_fit_m'), hoi_tu=fit['hoi_tu'],
+               r_max_m=r_max, eps_neo_deg=eps1, du_lon_nhat_m=du, nhieu_cua_so_deg=nhieu, n_cap_nhieu=len(nh), cua_so=cua,
+               cho=cho, chuan_12b=chuan, x=fit['x'], idx_h=fit['idx_h'], mien_khop=dict(dinh=mien, a_ref=a_ref,
+                                                                         cach='(R(-alpha)(o - C), alpha) moi cua so khop'))
     return out
 
 
-def run_hieu_chuan(cua_so_path, session_path, neo_spec, mau, out_dir, a6_path, kiem_r=None, h_neo=None, clip_dir=None,
-                   cfg=None, a6_mod=None, _records=None):
+def run_hieu_chuan(cua_so_path, session_path, neo_spec, mau, out_dir, a6_path, tam_id, kiem_r=None, h_neo=None,
+                   clip_dir=None, cfg=None, a6_mod=None, _records=None):
     """v4 1, 3, 9: fit windows only -> hieu_chuan_neo.json, locked (time, sha256) before any held-out window is read.
     mau = (clip, session, idx) of the template frame of the anchor boxes. Returns the exit code (0 dat, 1 written with
     chua_ket_luan, 2 error)."""
     cfg = dict(LL_DEFAULTS, **(cfg or {}))
     rows = doc_cua_so(cua_so_path)
+    kiem_f2(rows)
     ses = doc_json(session_path)
     ses_sha = cm.sha256(session_path)
     neo = parse_neo(neo_spec)
-    r_ok, r_ev = kiem_r_neo(neo, kiem_r)
+    r_ok, r_ev = kiem_r_neo(neo, kiem_r, mau[0])
     neo_dung = {k: v for k, v in neo.items() if r_ok[k]}
     ctx = LLCtx(ses, ses['tag_h_m'] if h_neo is None else h_neo, cfg)
     a6 = A6(a6_path, a6_mod)
+    a6_tt = a6.ap_dung(tam_id)
+    a6_ok = (a6_tt[0] if isinstance(a6_tt, (list, tuple)) else a6_tt) != 'chua_ket_luan'
     keys = [i for i, w in enumerate(rows) if w[TEN['loai']] in LOAI_KHOP]
     for i in keys:
         if rows[i][TEN['session_sha']] != ses_sha:
             raise ValueError(f'window {i}: session sha256 differs from {session_path}')
+    mau_sha = cm.sha256(mau[0])
+    for i, w in enumerate(rows):                         # LLC1-6: the template frame is not a held-out frame
+        if w[TEN['loai']] in LOAI_GIU and w[TEN['clip_sha']] == mau_sha and int(mau[2]) in {k for k, _ in khung_cua(w)}:
+            raise ValueError(f'template frame {mau[2]} belongs to held-out window {i}')
     cm._new_dir(out_dir)
     out = dict(schema=TEN['hieu_chuan'], version=LL_VERSION, hil=git_head(), thiet_ke='2026-11-19_Thiet_ke_nhac_tam_lan_lap_v4',
                cua_so_file=dict(file=os.path.abspath(cua_so_path), sha256=cm.sha256(cua_so_path)),
                session=dict(file=os.path.abspath(session_path), sha256=ses_sha, fit_ids=ctx.fit_ids,
                             plumb_xy_m=ctx.C.tolist(), Z_c_m=ctx.Zc, tag_h_m=ctx.tag_h),
-               a6=dict(file=os.path.abspath(a6_path), sha256=a6.sha256, schema=TEN['a6']),
+               a6=dict(file=os.path.abspath(a6_path), sha256=a6.sha256, schema=TEN['a6'], tam_id=tam_id, ap_dung=a6_tt),
                neo=[dict(ten=k, o_px=[list(b) for b in v], kiem_r=r_ok[k]) for k, v in neo.items()], kiem_r=r_ev,
-               mau=dict(clip=os.path.abspath(mau[0]), sha256=cm.sha256(mau[0]), session=os.path.abspath(mau[1]),
+               mau=dict(clip=os.path.abspath(mau[0]), sha256=mau_sha, session=os.path.abspath(mau[1]),
                         session_sha256=cm.sha256(mau[1]), idx=int(mau[2])),
                h_n_m=ctx.h_n, quy_uoc='goc G o neo A, truc x theo A->B; h_A = h_n (v4 3, LL3-2)',
                phep_gop='trung_binh_go_vong', vai_tro=dict(khop=list(LOAI_KHOP), giu_ngoai=list(LOAI_GIU),
                                                              chuan=LOAI_CHUAN, dich=LOAI_DICH),
-               nguong=dict(cfg, trang_thai=LL_THRESH_STATUS))
+               gioi_han=GIOI_HAN_V4, nguong=dict(cfg, trang_thai=LL_THRESH_STATUS))
     if len(neo_dung) < 3 or 'A' not in neo_dung or 'B' not in neo_dung:
         out.update(trang_thai='chua_ket_luan', ly_do=['thieu_neo'])
     else:
@@ -1642,7 +1813,7 @@ def run_hieu_chuan(cua_so_path, session_path, neo_spec, mau, out_dir, a6_path, k
             recs, flags, _ = _measure(rows, keys, session_path, mau, ctx, neo_dung, clip_dir)
         else:
             recs, flags = _records, {}
-        wsum = [(rows[i], tom_cua_so(rows[i], recs[i], a6, ctx, cfg)) for i in keys]
+        wsum = [(rows[i], dict(tom_cua_so(rows[i], recs[i], a6, a6_ok, ctx, cfg), thu_tu=i)) for i in keys]
         kh = khoa_hieu_chuan(wsum, ctx, cfg, a6)
         out.update(trang_thai=kh['trang_thai'], ly_do=kh['ly_do'], co_cua_so={str(k): v for k, v in flags.items()},
                    cua_so_loi=[dict(meta=s['meta'], ly_do=s['ly_do'] + s['chung']['ly_do']) for _, s in wsum if not s['ok']])
@@ -1668,28 +1839,32 @@ def doc_hieu_chuan(path):
 
 
 # ---------------------------------------------------------------- lan_lap (v4 0, 3-9; F8)
-def _w_from_hc(c):
-    """Window summary of the fit set back from hieu_chuan_neo.json (common-set means)."""
-    ch = c['chung']
-    return dict(alpha=ch['alpha'], psi=ch['psi'], theta=ch['theta'], o=np.array(ch['o']), t=np.array(ch['t']),
-                s=ch['s'], F=np.array(ch['F']), H=ch['H'], n=ch['n'])
+def _w_from_hc(c, which='chung'):
+    """Window summary of the fit set back from hieu_chuan_neo.json (means of the 'chung' or 'ma' set)."""
+    ch = c[which]
+    if ch is None:
+        return None
+    return dict(alpha=ch['alpha'], psi=ch.get('psi'), psi_tho=ch.get('psi_tho', ch.get('psi')), theta=ch.get('theta'),
+                o=np.array(ch['o']), t=np.array(ch['t']), s=ch['s'], F=np.array(ch['F']), H=ch['H'], n=ch['n'])
 
 
 def so_sanh(wa, wb, ctx, g_b, nguong):
-    """v4 8 (C8BX-18, LL4-2): post against pre (or any two windows): dtheta, dc_B, ds each with a state
-    doi / khong_doi / khong_xac_dinh (no data)."""
-    out = {}
-    if wa is None or wb is None:
-        return {k: dict(gia_tri=None, trang_thai='khong_xac_dinh') for k in ('theta', 'c_B', 's')}
-    v = dict(theta=abs(math.degrees(wrap(wb['theta'] - wa['theta']))),
-             c_B=float(np.linalg.norm(c_B_cua(wb, ctx, g_b) - c_B_cua(wa, ctx, g_b))),
-             s=abs(wb['s'] / wa['s'] - 1.0))
-    for k, x in v.items():
-        lim = nguong[k]
-        out[k] = dict(gia_tri=x, nguong=lim,
-                      trang_thai='khong_xac_dinh' if not (math.isfinite(x) and math.isfinite(lim))
-                      else ('doi' if x > lim else 'khong_doi'))
-    return out
+    """v4 8 (C8BX-18, LL4-2, LLC1-13): two windows (summaries with or without A6): theta (needs A6 at both ends),
+    c_B (Dh-corrected delta_c_B), scale (Dh / (H - h) from the ratio), each doi / khong_doi / khong_xac_dinh."""
+    def st(x, lim):
+        if x is None or not (math.isfinite(x) and math.isfinite(lim)):
+            return dict(gia_tri=x, nguong=lim, trang_thai='khong_xac_dinh')
+        return dict(gia_tri=x, nguong=lim, trang_thai='doi' if x > lim else 'khong_doi')
+    th = cb = sc = None
+    if wa is not None and wb is not None:
+        if wa.get('theta') is not None and wb.get('theta') is not None:
+            th = abs(math.degrees(wrap(wb['theta'] - wa['theta'])))
+        try:
+            dcb, _, dh = delta_c_B(wa, wb, ctx, g_b)
+            cb, sc = float(np.linalg.norm(dcb)), abs(dh) / (wb['H'] - ctx.tag_h)
+        except ValueError:
+            pass
+    return dict(theta=st(th, nguong['theta']), c_B=st(cb, nguong['c_B']), s=st(sc, nguong['s']))
 
 
 def tong_doi(ss):
@@ -1697,13 +1872,24 @@ def tong_doi(ss):
     return True if 'doi' in st else (None if 'khong_xac_dinh' in st else False)
 
 
-def run_lan_lap(hc_path, cua_so_path, session_path, out_dir, a6_path, truc_xe=None, xoay=None, u_beta_cam_deg=None,
-                clip_dir=None, mau_clip=None, tam_id=None, cfg=None, a6_mod=None, _records=None):
+def _hai(x):
+    """Best summary of a held-out window for 8: 'chung' (A6) when there, else 'ma'."""
+    if x is None:
+        return None
+    return x.get('chung') or x.get('ma')
+
+
+def run_lan_lap(hc_path, cua_so_path, session_path, out_dir, a6_path, tam_id, truc_xe=None, xoay=None,
+                u_beta_cam_deg=None, clip_dir=None, mau_clip=None, cfg=None, a6_mod=None, _records=None):
     """v4 0, 3-9: held-out windows -> lan_lap.json (lan_lap_v1). Exit code 0 written / 2 error."""
     hc = doc_hieu_chuan(hc_path)
     khoa_ng = {k: v for k, v in hc['nguong'].items() if k in LL_DEFAULTS}
-    doi_sau_khoa = sorted(k for k, v in (cfg or {}).items() if k in khoa_ng and khoa_ng[k] != v)
-    cfg = dict(LL_DEFAULTS, **dict(khoa_ng, **(cfg or {})))          # thresholds locked at hieu_chuan (v4 1)
+    doi = sorted(k for k, v in (cfg or {}).items() if k in LL_DEFAULTS and khoa_ng.get(k, LL_DEFAULTS[k]) != v)
+    if doi:                                                    # LLC1-6: thresholds are locked at hieu_chuan
+        raise ValueError(f'thresholds differ from the locked ones: {doi}')
+    cfg = dict(LL_DEFAULTS, **khoa_ng)
+    if u_beta_cam_deg is not None and not (math.isfinite(u_beta_cam_deg) and u_beta_cam_deg >= 0):
+        raise ValueError('u_beta_cam must be finite and >= 0')
     ses = doc_json(session_path)
     ses_sha = cm.sha256(session_path)
     if ses_sha != hc['session']['sha256']:
@@ -1711,32 +1897,43 @@ def run_lan_lap(hc_path, cua_so_path, session_path, out_dir, a6_path, truc_xe=No
     a6 = A6(a6_path, a6_mod)
     if a6.sha256 != hc['a6']['sha256']:
         raise ValueError('A6 file sha256 differs from hieu_chuan_neo.json')
+    if tam_id != hc['a6'].get('tam_id'):
+        raise ValueError(f'tam_id {tam_id} differs from hieu_chuan ({hc["a6"].get("tam_id")})')
+    a6_tt = a6.ap_dung(tam_id)
+    a6_ok = (a6_tt[0] if isinstance(a6_tt, (list, tuple)) else a6_tt) != 'chua_ket_luan'
+    if mau_clip is not None and cm.sha256(mau_clip) != hc['mau']['sha256']:
+        raise ValueError('--mau-clip sha256 differs from the locked template clip')
     ctx = LLCtx(ses, hc['h_n_m'], cfg)
     rows = doc_cua_so(cua_so_path)
+    kiem_f2(rows)
     keys = [i for i, w in enumerate(rows) if w[TEN['loai']] in LOAI_GIU]
+    fit_frames = {(c['meta']['clip_sha'], k) for c in hc.get('cua_so', []) for k in c['khung_neo']['id']}
     for i in keys:
         if rows[i][TEN['session_sha']] != ses_sha:
             raise ValueError(f'window {i}: session sha256 differs (each end checked against its source)')
+        if any((rows[i][TEN['clip_sha']], k) in fit_frames for k, _ in khung_cua(rows[i])):
+            raise ValueError(f'window {i}: a held-out frame is a locked fit frame (D1)')
     cm._new_dir(out_dir)
     g_b = a6.g_b()
     eps_g = a6.eps_g()
-    a6_ap = a6.ap_dung(tam_id) if tam_id is not None else None
     tx, tx_sha = doc_theo_cho(truc_xe, TEN['truc_xe']) if truc_xe else ({}, None)
     xo, xo_sha = doc_theo_cho(xoay, TEN['xoay']) if xoay else ({}, None)
-    base = dict(schema=TEN['lan_lap'], version=LL_VERSION, hil=git_head(),
+    base = dict(schema=TEN['lan_lap'], version=LL_VERSION, hil=git_head(), tam_id=tam_id,
+                neo_ten=hc.get('neo_ten'), h_neo_m=hc.get('h'), h_n_m=hc['h_n_m'],
+                Ph_neo_cach='diem neo da nang (car_pose: p = pix2floor(uv, 0), P = p + kappa_n (C - p)), m, thu tu neo_ten',
                 hieu_chuan=dict(file=os.path.abspath(hc_path), sha256=cm.sha256(hc_path),
                                 khoa_sha256=hc['khoa']['noi_dung_sha256']),
                 cua_so_v1_sha256=cm.sha256(cua_so_path), session_sha256=ses_sha, fit_ids=ctx.fit_ids,
-                a6=dict(sha256=a6.sha256, ap_dung=a6_ap), truc_xe_sha256=tx_sha, xoay_sha256=xo_sha,
-                phep_gop='trung_binh_go_vong', nguong=dict(cfg, trang_thai=LL_THRESH_STATUS),
-                nguong_doi_sau_khoa=doi_sau_khoa)
-    if hc['trang_thai'] != 'dat' and 'G' not in hc:
+                a6=dict(sha256=a6.sha256, tam_id=tam_id, ap_dung=a6_tt), truc_xe_sha256=tx_sha, xoay_sha256=xo_sha,
+                phep_gop='trung_binh_go_vong', gioi_han=GIOI_HAN_V4, nguong=dict(cfg, trang_thai=LL_THRESH_STATUS))
+    if 'G' not in hc:
         base.update(trang_thai_buoi='chua_ket_luan', ly_do=hc.get('ly_do', []), luot=[])
         _write_ll(out_dir, base)
         return 0
     G, h = np.array(hc['G'], float), np.array(hc['h'], float)
     fitw = hc['cua_so']
     obs_fit = [dict(Ph=np.array(c['Ph']), F=np.array(c['F']), H=c['H']) for c in fitw]
+    r_max = hc['r_max_m']
     # ---- held-out windows
     if _records is None:
         neo = {d['ten']: [tuple(b) for b in d['o_px']] for d in hc['neo'] if d['ten'] in hc['neo_ten']}
@@ -1747,93 +1944,110 @@ def run_lan_lap(hc_path, cua_so_path, session_path, out_dir, a6_path, truc_xe=No
         recs, flags = _records, {}
     hw = {}
     for i in keys:
-        s = tom_cua_so(rows[i], recs[i], a6, ctx, cfg)
-        d = dict(meta=s['meta'], t0=s['t0'], ok=s['ok'], ly_do=list(s['ly_do']), chung=None,
-                 khung_neo_sha256=sha_ids(s['neo']['ids']), khung_chung_sha256=None)
+        s = tom_cua_so(rows[i], recs[i], a6, a6_ok, ctx, cfg)
+        d = dict(meta=s['meta'], t0=s['t0'], ok=s['ok'], ly_do=list(s['ly_do']), chung=None, ma=None,
+                 khung_neo=dict(id=s['neo']['ids'], pts_s=s['neo']['pts']), khung_neo_sha256=sha_ids(s['neo']['ids']),
+                 khung_chung=dict(id=s['chung']['ids'], pts_s=s['chung']['pts']),
+                 khung_chung_sha256=sha_ids(s['chung']['ids']) if s['chung'].get('ok') else None, du_ok=False,
+                 khung_giao_ma_neo=s['giao'], khung_giao_sha256=sha_ids(s['giao']['id']), mat_neo=s['mat_neo'],
+                 thu_tu=i)
         if s['ok']:
             a_, o_, res = tu_the(G, h, s['neo']['Ph'], s['neo']['F'], s['neo']['H'], ctx.C, ctx.a_n)
-            d.update(alpha=a_, o=o_, du_m=res.tolist(), Ph=s['neo']['Ph'], F=s['neo']['F'], H=s['neo']['H'])
-            if s['chung']['ok']:
-                d['chung'] = tinh_chung(s['chung'], G, h, ctx)
-                d['khung_chung_sha256'] = sha_ids(s['chung']['ids'])
-            else:
-                d['ly_do'] += s['chung']['ly_do']
+            d.update(alpha=a_, o=o_, du_m=res.tolist(), Ph=s['neo']['Ph'], F=s['neo']['F'], H=s['neo']['H'],
+                     du_ok=bool(np.all(res <= r_max)))
+            d['ma'], d['chung'] = _tom_hai(s, G, h, ctx)
+            d['ly_do'] += s['chung']['ly_do']
+            if not d['du_ok']:
+                d['ly_do'].append('du_neo_vuot_r_max')
         hw[i] = d
-    # ---- per run: pre / post
     luot = {}
     for i in keys:
         w = rows[i]
         luot.setdefault(w[TEN['luot']], {})[w[TEN['loai']]] = i
-    # thresholds of 8 per place: floors, or the spread of the 12b windows of the place when larger
-    w12 = {k: [_w_from_hc(c) for c in fitw if c['meta']['cho'] == k and c['meta']['loai'] in LOAI_12B and c['chung']]
-           for k in CHO}
+    # ---- spreads of the standard 12b group of each place (LLC1-4); thresholds of 8 within each place (LLC1-13)
+    runs12 = sorted({c['meta']['luot'] for c in fitw if c['meta']['loai'] == LOAI_CHUAN})
+    cho12 = {l12: next(c['meta']['cho'] for c in fitw if c['meta']['luot'] == l12 and c['meta']['loai'] == LOAI_CHUAN)
+             for l12 in runs12}
+    nhom = {l12: [_w_from_hc(c) for c in nhom_12b(fitw, l12)] for l12 in runs12}
+    trai = {l12: trai_nhom(v, ctx, g_b) if len(v) >= 2 else None for l12, v in nhom.items()}
 
     def nguong_cho(ks):
-        ws = [w for k in ks for w in w12[k]]
-        th = [abs(math.degrees(wrap(a['theta'] - b['theta']))) for a, b in itertools.combinations(ws, 2)]
-        cb = [float(np.linalg.norm(c_B_cua(a, ctx, g_b) - c_B_cua(b, ctx, g_b))) for a, b in itertools.combinations(ws, 2)]
-        sc = [abs(a['s'] / b['s'] - 1.0) for a, b in itertools.permutations(ws, 2)]
-        return dict(theta=max([cfg['doi_theta_deg']] + th), c_B=max([cfg['doi_c_m']] + cb), s=max([cfg['doi_s']] + sc))
-    bang = eps_neo_bang(G, h, obs_fit[0]['F'], obs_fit[0]['H'], ctx.C, ctx.a_n, cfg)
-    r_max, eps1 = hc['r_max_m'], hc['eps_neo_deg']
+        def mx(key, floor):
+            v = [trai[l][key] for l in runs12 if cho12[l] in ks and trai.get(l) is not None and math.isfinite(trai[l][key])]
+            return max([floor] + v)
+        return dict(theta=mx('theta', cfg['doi_theta_deg']), c_B=mx('c_B', cfg['doi_c_m']), s=mx('s', cfg['doi_s']))
     so = {}
-    for lid, d in luot.items():
-        pre, post = hw.get(d.get('pre')), hw.get(d.get('post'))
-        ca = [x['meta']['cho'] for x in (pre, post) if x is not None]
-        so[lid] = so_sanh(pre['chung'] if pre else None, post['chung'] if post else None, ctx, g_b, nguong_cho(set(ca)))
-    # ---- u_beta (v4 4): held-out pairs, |wrap(dalpha - dpsi')|; exclusion only on independent evidence (LL4-2)
+    for lid, dd in luot.items():
+        pre, post = hw.get(dd.get('pre')), hw.get(dd.get('post'))
+        ca = {x['meta']['cho'] for x in (pre, post) if x is not None}
+        so[lid] = so_sanh(_hai(pre) if pre and pre['ok'] else None, _hai(post) if post and post['ok'] else None, ctx, g_b,
+                          nguong_cho(ca))
+    # ---- u_beta (v4 4): held-out pairs, |wrap(dalpha - dpsi')|; exclusion only on independent evidence (LL4-2, LLC1-8)
     cap, loai_cap = [], []
-    for lid, d in sorted(luot.items()):
-        pre, post = hw.get(d.get('pre')), hw.get(d.get('post'))
+    for lid, dd in sorted(luot.items()):
+        pre, post = hw.get(dd.get('pre')), hw.get(dd.get('post'))
         if pre is None or post is None or not (pre['ok'] and post['ok']):
             loai_cap.append(dict(luot_id=lid, ly_do='thieu_khung'))
-            continue
-        if pre['chung'] is None or post['chung'] is None:
+        elif not (pre['du_ok'] and post['du_ok']):
+            loai_cap.append(dict(luot_id=lid, ly_do='du_neo_vuot_r_max'))
+        elif pre['chung'] is None or post['chung'] is None:
             loai_cap.append(dict(luot_id=lid, ly_do='thieu_a6_hoac_khung_chung'))
-            continue
-        if any(so[lid][k]['trang_thai'] == 'doi' for k in ('c_B', 's')):
+        elif any(so[lid][k]['trang_thai'] == 'doi' for k in ('c_B', 's')):
             loai_cap.append(dict(luot_id=lid, ly_do='tam_doi_c_B_hoac_thang'))
-            continue
-        dd = abs(math.degrees(wrap(wrap(post['alpha'] - pre['alpha']) - wrap(post['chung']['psi'] - pre['chung']['psi']))))
-        cap.append(dict(luot_id=lid, lech_deg=dd))
+        else:
+            dd_ = abs(math.degrees(wrap(wrap(post['alpha'] - pre['alpha'])
+                                        - wrap(post['chung']['psi'] - pre['chung']['psi']))))
+            cap.append(dict(luot_id=lid, lech_deg=dd_))
     nhieu = hc['nhieu_cua_so_deg']
-    u_beta = (max(c['lech_deg'] for c in cap) + 2.0 * eps1 + (nhieu if nhieu is not None else NAN)) if cap else NAN
+    eps_end = {}
+    for i, x in hw.items():                                     # LLC1-11: eps_neo of each end with its own geometry
+        if x['ok']:
+            eps_end[i] = max(hc['eps_neo_deg'], eps_goc(eps_neo_bang(G, h, x['F'], x['H'], ctx.C, ctx.a_n), r_max))
+    eps_cap = max([2.0 * max(eps_end[luot[c['luot_id']]['pre']], eps_end[luot[c['luot_id']]['post']]) for c in cap],
+                  default=2.0 * hc['eps_neo_deg'])
+    u_beta = (max(c['lech_deg'] for c in cap) + eps_cap + (nhieu if nhieu is not None else NAN)) if cap else NAN
     u_beta_tt = []
     if len(cap) < cfg['min_cap']:
         u_beta_tt.append('thieu_giu_ngoai')
     if not (math.isfinite(u_beta) and u_beta <= cfg['u_beta_max_deg']):
         u_beta_tt.append('u_beta_vuot' if math.isfinite(u_beta) else 'u_beta_khong_tinh_duoc')
-    # ---- domain (v4 4): fit windows and the used held-out windows
+    # ---- domain (v4 4): fit windows and the used held-out ends (anchor gate passed, LLC1-8)
+    a_ref = hc['mien_khop']['a_ref']
+
     def diem(a_, o_):
-        return [*(rot2(-a_) @ (np.asarray(o_, float) - ctx.C)), a_]
-    a_ref = fitw[0]['alpha']
-    mien = [diem(a_ref + wrap(c['alpha'] - a_ref), c['o']) for c in fitw]
-    used = {c['luot_id'] for c in cap}
-    for lid in used:
+        return [*(rot2(-a_) @ (np.asarray(o_, float) - ctx.C)), a_ref + wrap(a_ - a_ref)]
+    mien = [list(p) for p in hc['mien_khop']['dinh']]
+    mien_nguon = [dict(vai_tro='khop', meta=c['meta']) for c in fitw]
+    for c in cap:
         for k in ('pre', 'post'):
-            x = hw[luot[lid][k]]
-            mien.append(diem(a_ref + wrap(x['alpha'] - a_ref), x['o']))
-    # ---- 6b held-out residual for the position (LL5-5): same-place pre / post pairs of the session
+            x = hw[luot[c['luot_id']][k]]
+            mien.append(diem(x['alpha'], x['o']))
+            mien_nguon.append(dict(vai_tro='giu_ngoai', luot_id=c['luot_id'], loai=k))
+    # ---- 6b held-out residual for the position (LL5-5, LLC1-3): every same-place pre / post pair with data
     giu_vt = []
-    for lid in used:
-        pre, post = hw[luot[lid]['pre']], hw[luot[lid]['post']]
-        if pre['meta']['cho'] == post['meta']['cho']:
-            dc, _, _ = delta_c_B(pre['chung'], post['chung'], ctx, g_b)
-            giu_vt.append(dict(luot_id=lid, lech_m=float(np.linalg.norm(dc))))
+    for lid, dd in sorted(luot.items()):
+        pre, post = hw.get(dd.get('pre')), hw.get(dd.get('post'))
+        if pre is None or post is None or pre['meta']['cho'] != post['meta']['cho']:
+            continue
+        if pre['ok'] and post['ok'] and pre['du_ok'] and post['du_ok'] and pre['chung'] and post['chung']:
+            try:
+                dc, _, _ = delta_c_B(pre['chung'], post['chung'], ctx, g_b)
+                giu_vt.append(dict(luot_id=lid, lech_m=float(np.linalg.norm(dc))))
+            except ValueError:
+                pass
     du_giu = max((g['lech_m'] for g in giu_vt), default=NAN)
     # ---- runs
-    out_l = []
-    hc_obs_cho = {k: [j for j, c in enumerate(fitw) if c['meta']['cho'] == k and c['meta']['loai'] == LOAI_CHUAN]
-                  for k in CHO}
-    for lid, d in sorted(luot.items()):
-        out_l.append(_mot_luot(lid, d, hw, hc, fitw, obs_fit, hc_obs_cho, G, h, ctx, cfg, g_b, eps_g, so[lid], u_beta,
-                               u_beta_tt, mien, a_ref, diem, bang, r_max, w12, du_giu, giu_vt, tx, xo, u_beta_cam_deg,
-                               nguong_cho))
-    _cap_lan_lap_id(out_l, so, luot, hw, ctx, g_b, nguong_cho)
+    doan = phan_doan(luot, hw, fitw, so, ctx, g_b, nguong_cho)
+    env = dict(hw=hw, hc=hc, fitw=fitw, obs_fit=obs_fit, doan=doan, G=G, h=h, ctx=ctx, cfg=cfg, g_b=g_b,
+               eps_g=eps_g, u_beta=u_beta, u_beta_tt=u_beta_tt, mien=mien, diem=diem, r_max=r_max, nhom=nhom,
+               trai=trai, du_giu=du_giu, giu_vt=giu_vt, tx=tx, xo=xo, u_beta_cam_deg=u_beta_cam_deg,
+               nguong_cho=nguong_cho, tam_id=tam_id, a6_sha=a6.sha256, hc_sha=base['hieu_chuan']['sha256'])
+    out_l = [_mot_luot(lid, dd, so[lid], env) for lid, dd in sorted(luot.items())]
     base.update(trang_thai_buoi=hc['trang_thai'], ly_do=hc.get('ly_do', []), u_beta_deg=u_beta,
                 trang_thai_u_beta='dat' if not u_beta_tt else 'chua_ket_luan', ly_do_u_beta=u_beta_tt,
-                cap_giu_ngoai=cap, cap_loai=loai_cap, eps_neo_deg=eps1, r_max_m=r_max, nhieu_cua_so_deg=nhieu,
-                giu_ngoai_vi_tri=giu_vt, cua_so_loi=[dict(meta=x['meta'], ly_do=x['ly_do']) for x in hw.values() if not x['ok']],
+                cap_giu_ngoai=cap, cap_loai=loai_cap, eps_neo_deg=hc['eps_neo_deg'], eps_cap_deg=eps_cap, r_max_m=r_max,
+                nhieu_cua_so_deg=nhieu, giu_ngoai_vi_tri=giu_vt, mien=dict(dinh=mien, nguon=mien_nguon),
+                cua_so_loi=[dict(meta=x['meta'], ly_do=x['ly_do']) for x in hw.values() if not x['ok']],
                 co_cua_so={str(k): v for k, v in flags.items()}, luot=out_l)
     _write_ll(out_dir, base)
     return 0
@@ -1846,7 +2060,7 @@ def _write_ll(out_dir, o):
 
 def _replay(G, h, hg, obs_fit, j_chuan, obs_d, ctx, cfg, beta, x_fit=None, idx_h=None):
     """v4 3 (LL4-5): largest change of beta when the shape and poses are refitted with every h_i at +-k sigma and
-    +-k normalised units along each weak direction."""
+    +-k normalised units along each weak direction; inf when a refit does not converge or a height reaches the camera."""
     steps = []
     for i, s in enumerate(hg['sigma_h']):
         e = np.zeros(len(hg['sigma_h']))
@@ -1856,6 +2070,8 @@ def _replay(G, h, hg, obs_fit, j_chuan, obs_d, ctx, cfg, beta, x_fit=None, idx_h
     worst = 0.0
     h_tran = min([w['H'] for w in obs_fit] + [obs_d['H']])
     for e in steps:
+        if not np.all(np.isfinite(e)):
+            return math.inf
         for sg in (1.0, -1.0):
             hh = h.copy()
             hh[1:] += sg * cfg['hang_k'] * e
@@ -1863,171 +2079,268 @@ def _replay(G, h, hg, obs_fit, j_chuan, obs_d, ctx, cfg, beta, x_fit=None, idx_h
                 return math.inf
             x0 = None if x_fit is None else np.delete(np.asarray(x_fit, float), idx_h)
             fit = khop_hinh(obs_fit, ctx.h_n, ctx.C, ctx.a_n, fix_h=hh, x0=x0)
+            if not fit['hoi_tu']:
+                return math.inf
             a_s = fit['poses'][j_chuan][0]
             a_d, _, _ = tu_the(fit['G'], hh, obs_d['Ph'], obs_d['F'], obs_d['H'], ctx.C, ctx.a_n)
             worst = max(worst, abs(math.degrees(wrap(wrap(a_d - a_s) - beta))))
     return worst
 
 
-def _mot_luot(lid, d, hw, hc, fitw, obs_fit, hc_obs_cho, G, h, ctx, cfg, g_b, eps_g, so, u_beta, u_beta_tt, mien, a_ref,  # noqa: E501
-              diem, bang, r_max, w12, du_giu, giu_vt, tx, xo, u_beta_cam_deg, nguong_cho):
+def _dau(x, env, loai=None, cho=None):
+    """F8 block of one end (LLC1-14)."""
+    return dict(loai=loai or x['meta']['loai'], cho=cho or x['meta']['cho'], clip=x['meta']['clip'],
+                clip_sha256=x['meta']['clip_sha'], session_sha256=x['meta']['session_sha'],
+                khung_neo=x['khung_neo'], khung_neo_sha256=x['khung_neo_sha256'],
+                khung_chung=x.get('khung_chung'), khung_chung_sha256=x.get('khung_chung_sha256'),
+                khung_giao_ma_neo=x.get('khung_giao_ma_neo'), khung_giao_sha256=x.get('khung_giao_sha256'),
+                mat_neo=x.get('mat_neo'), Ph_neo_m=x.get('Ph'), fit_ids=env['ctx'].fit_ids, a6_sha256=env['a6_sha'], hieu_chuan_sha256=env['hc_sha'], tam_id=env['tam_id'],
+                phep_gop='trung_binh_go_vong')
+
+
+def _mot_luot(lid, d, so, env):
+    hw, hc, fitw, ctx, cfg, g_b = env['hw'], env['hc'], env['fitw'], env['ctx'], env['cfg'], env['g_b']
     pre, post = hw.get(d.get('pre')), hw.get(d.get('post'))
     dich = pre
     cho = dich['meta']['cho'] if dich is not None else None
-    r = dict(schema=TEN['lan_lap'], luot_id=lid, cho=cho, beta_deg=None, u_beta_deg=None, delta_a_deg=None, q_m=None,
-             q_B_m=None, delta_c_B_m=None, u_delta_c_B_m=None, delta_h_goc_m=None, tam_doi_trong_luot=tong_doi(so),
-             so_sanh_trong_luot=so, cung_lan_lap=None, lan_lap_id=None, kiem_tich_hop_deg=None, phi_deg=None,
-             u_phi_truoc_le_deg=None,
+    r = dict(schema=TEN['lan_lap'], luot_id=lid, cho=cho, tam_id=env['tam_id'], beta_deg=None, u_beta_deg=None,
+             delta_a_deg=None, q_m=None, q_B_m=None, delta_c_B_m=None, u_delta_c_B_m=None, delta_h_goc_m=None,
+             tam_doi_trong_luot=tong_doi(so), so_sanh_trong_luot=so, cung_lan_lap=None, lan_lap_id=None,
+             kiem_tich_hop_deg=None, phi_deg=None, u_phi_truoc_le_deg=None,
              trang_thai=dict(beta='chua_ket_luan', delta_a='chua_ket_luan', q='chua_ket_luan', h='chua_ket_luan',
                              delta_c_B='chua_ket_luan', phi='chua_ket_luan'),
              ly_do=dict(beta=[], delta_a=['yaw_ma_khong_chi_so'], q=['chi_chan_doan_v4'], h=['chi_chan_doan_v4'],
                         delta_c_B=[], phi=[]),
-             dau={})
-    for nm, x in (('dich', pre), ('post', post)):
+             dau={}, khung_chung={}, khung_chung_sha256={}, tap_khung_sha256={})
+    for nm, x in (('pre', pre), ('post', post)):
         if x is not None:
-            r['dau'][nm] = dict(loai=x['meta']['loai'], cho=x['meta']['cho'], clip_sha256=x['meta']['clip_sha'],
-                                session_sha256=x['meta']['session_sha'], khung_neo_sha256=x['khung_neo_sha256'],
-                                khung_chung_sha256=x['khung_chung_sha256'])
-    lb = r['ly_do']['beta']
+            r['dau'][nm] = _dau(x, env)
+            r['khung_chung'][nm] = x.get('khung_chung')
+            r['khung_chung_sha256'][nm] = x.get('khung_chung_sha256')
+            r['tap_khung_sha256'][nm] = dict(neo=x['khung_neo_sha256'], chung=x.get('khung_chung_sha256'))
+    lneo = []                                                   # anchor-path gate shared by beta and delta_c_B
     if dich is None or not dich['ok']:
-        lb.append('cua_so_dich_loi')
+        lneo.append('cua_so_dich_loi')
+        r['ly_do']['beta'] += lneo
+        r['ly_do']['delta_c_B'] += lneo
         return r
-    js = hc_obs_cho.get(cho, [])
-    if len(js) != 1:
-        lb.append('khong_co_cua_so_chuan')
-        return r
-    j = js[0]
-    cs = fitw[j]
-    r['dau']['chuan'] = dict(loai=LOAI_CHUAN, cho=cho, clip_sha256=cs['meta']['clip_sha'],
-                             session_sha256=cs['meta']['session_sha'], khung_neo_sha256=cs['khung_neo_sha256'],
-                             khung_chung_sha256=cs.get('khung_chung_sha256'))
-    beta = math.degrees(wrap(dich['alpha'] - cs['alpha']))
-    r['beta_deg'], r['u_beta_deg'] = beta, u_beta
-    r['du_dich_m'] = dich['du_m']
     if hc['trang_thai'] != 'dat':
-        lb += hc.get('ly_do', []) or ['hieu_chuan_chua_dat']
-    if max(dich['du_m']) > r_max or max(cs['du_m']) > r_max:
-        lb.append('du_neo_vuot_r_max')
+        lneo += hc.get('ly_do', []) or ['hieu_chuan_chua_dat']
+    if hc.get('suy_bien') or not hc.get('hoi_tu', True):
+        lneo.append('thieu_hang')
+    if not dich['du_ok']:
+        lneo.append('du_neo_vuot_r_max')
+    dd = env['doan'].get(lid, {})
+    r['lan_lap_id'], r['chuan_12b'], r['doi_so_luot_truoc'] = dd.get('lan_lap_id'), dd.get('chuan_12b'), dd.get('doi_truoc')
+    if dd.get('ly_do'):
+        r['lan_lap_id_ly_do'] = dd['ly_do']
+    j = dd.get('j')
+    if j is None:                       # J v6 2: no 12b of this placement at this place (or order contradicted)
+        lneo.append(dd.get('ly_do') or 'khong_co_cua_so_chuan')
+        r['ly_do']['beta'] += lneo
+        r['ly_do']['delta_c_B'] += lneo
+        r['ly_do']['phi'] += lneo
+        return r
+    cs = fitw[j]
+    r['dau']['chuan'] = dict(loai=LOAI_CHUAN, cho=cho, clip=cs['meta']['clip'], clip_sha256=cs['meta']['clip_sha'],
+                             session_sha256=cs['meta']['session_sha'], khung_neo=cs['khung_neo'],
+                             khung_neo_sha256=cs['khung_neo_sha256'], khung_chung=cs.get('khung_chung'),
+                             khung_chung_sha256=cs.get('khung_chung_sha256'), Ph_neo_m=cs['Ph'], fit_ids=ctx.fit_ids,
+                             a6_sha256=env['a6_sha'], hieu_chuan_sha256=env['hc_sha'], tam_id=env['tam_id'])
+    beta = math.degrees(wrap(dich['alpha'] - cs['alpha']))
+    r['beta_deg'], r['u_beta_deg'] = beta, env['u_beta']
+    r['du_dich_m'] = dich['du_m']
+    if max(cs['du_m']) > env['r_max'] and 'du_neo_vuot_r_max' not in lneo:
+        lneo.append('du_neo_vuot_r_max')
     hg = dict(sigma_h=np.array(hc['sigma_h'], float), yeu=[np.array(v, float) for v in hc['huong_yeu']])
-    if hc.get('suy_bien'):
-        lb.append('thieu_hang')
-    else:
-        rp = _replay(G, h, hg, obs_fit, j, dict(Ph=dich['Ph'], F=dich['F'], H=dich['H']), ctx, cfg, math.radians(beta),
-                     hc.get('x'), hc.get('idx_h'))
+    if 'thieu_hang' not in lneo:
+        rp = _replay(env['G'], env['h'], hg, env['obs_fit'], j, dict(Ph=dich['Ph'], F=dich['F'], H=dich['H']), ctx, cfg,
+                     math.radians(beta), hc.get('x'), hc.get('idx_h'))
         r['replay_deg'] = rp
-        if rp > cfg['replay_deg']:
-            lb.append('thieu_hang')
-    if not trong_mien(diem(a_ref + wrap(dich['alpha'] - a_ref), dich['o']), mien):
-        lb.append('ngoai_mien')
-    lb += u_beta_tt
+        if not rp <= cfg['replay_deg']:
+            lneo.append('thieu_hang')
+    if not trong_mien(env['diem'](dich['alpha'], dich['o']), env['mien']):
+        lneo.append('ngoai_mien')
+    lb = r['ly_do']['beta']
+    lb += lneo + env['u_beta_tt']
     if not lb:
         r['trang_thai']['beta'] = 'dat'
-    # ---- delta_a, integration check (v4 0, 5)
-    sc, dc = cs['chung'], dich['chung']
-    if sc is not None and dc is not None:
-        sw = _w_from_hc(cs)
-        da = wrap(dc['theta'] - sw['theta'])
-        r['delta_a_deg'] = math.degrees(da)
-        r['beta_chung_deg'] = math.degrees(wrap(dc['alpha'] - sw['alpha']))
-        r['beta_chenh_tap_deg'] = wrapd(r['beta_chung_deg'] - beta)
-        t = tx.get(cho)
-        if t is not None:
-            a_k, phi_k = math.radians(t[TEN['tx_a']]), math.radians(t[TEN['tx_phi']])
-        else:
-            a_k, phi_k = 0.0, wrap(sw['psi'])
-        # v4 0 (LL4-9): algebraic identity on the common sets; a phi_hat not built from this psi_chuan_k, or a delta_a /
-        # alpha from another frame set, breaks it
-        r['kiem_tich_hop_deg'] = abs(math.degrees(wrap(phi_k + wrap(dc['alpha'] - sw['alpha']) - (dc['psi'] - a_k - da))))
-        r['kiem_tich_hop_nguon'] = 'truc_xe_v1' if t is not None else 'noi_bo (khong co truc_xe_v1)'
-        # ---- phi (v4 0, LL4-10): phi = phi_hat + beta; u = u_phi_hat + u_beta + u_beta_cam, every term or nothing
-        lp = r['ly_do']['phi']
-        if r['trang_thai']['beta'] != 'dat':
-            lp.append('beta_chua_dat')
-        if r['kiem_tich_hop_deg'] > cfg['tich_hop_deg']:
-            lp.append('loi_ghep')
-        if t is None:
-            lp.append('thieu_truc_xe')
-        elif isinstance(t.get(TEN['trang_thai']), str) and t[TEN['trang_thai']] != 'dat':
-            lp.append('truc_xe_chua_dat')
-        if u_beta_cam_deg is None:
-            lp.append('thieu_u_beta_cam')
-        if t is not None:
-            r['phi_deg'] = math.degrees(phi_k) + beta
-            if u_beta_cam_deg is not None and t.get(TEN['tx_u_phi']) is not None:
-                r['u_phi_truoc_le_deg'] = float(t[TEN['tx_u_phi']]) + u_beta + float(u_beta_cam_deg)
-        if not lp:
-            r['trang_thai']['phi'] = 'dat'
-        # ---- q (v4 6, diagnostic)
-        x = xo.get(cho)
-        rb = []
-        if x is not None and x.get(TEN['xoay_r']) is not None:
-            for c in fitw:
-                if c['meta']['cho'] == cho and c['meta']['loai'] in ('E_dau', 'E_cuoi') and c['chung']:
-                    ew = _w_from_hc(c)
-                    Pr = nghich(np.array(x[TEN['xoay_r']], float), ctx.tag_h, ew['F'], ew['H'], ctx.C, ctx.a_t)[0]
-                    rb.append(rot2(-ew['alpha']) @ (Pr - ew['o']))
-        if rb:
-            qB = c_B_cua(dc, ctx, g_b) - np.mean(rb, axis=0)
-            r['q_B_m'], r['q_m'] = qB.tolist(), (rot2(-dc['theta']) @ qB).tolist()
-        else:
-            r['ly_do']['q'].append('thieu_xoay_v1')
-        # ---- 4 corner heights (v4 7, diagnostic): g . r_i (tag frame, rotation-free) target minus standard; one g_b
-        #      per plate for both ends (LL5-6) so the tilt part is 0 here; the mean change needs kappa (none in v4)
-        g_d = g_s = g_b
-        r['delta_h_goc_m'] = [float(np.dot(g_d, ci) - np.dot(g_s, ci)) for ci in cm.car_corners_body(ctx.side)]
-        r['ly_do']['h'].append('khong_co_kappa')
-        # ---- cung_lan_lap (v4 6, information only)
-        ws12 = w12.get(cho, [])
-        if len(ws12) >= 2:                               # same comparison and thresholds as 8 (12b spread of the place)
-            cl = so_sanh(sw, dc, ctx, g_b, nguong_cho({cho}))
-            r['cung_lan_lap'] = tong_doi(cl) is False
-            r['cung_lan_lap_chi_so'] = cl
-        # ---- delta_c_B (v4 6b, LL5-1..6)
-        lc = r['ly_do']['delta_c_B']
-        dcb, raw, dh = delta_c_B(sw, dc, ctx, g_b)
-        r['delta_c_B_m'], r['delta_c_B_tho_m'], r['delta_h_uoc_m'] = dcb.tolist(), raw.tolist(), dh
-        if len(ws12) < cfg['min_12b']:
-            lc.append('thieu_12b_cung_cho')
-        else:
-            trai_c, trai_s = chi_so_12b(ws12, ctx, g_b)
-            c_s = c_B_cua(sw, ctx, g_b)
-            e_pos = eps_vi_tri(bang, r_max, c_s) + eps_vi_tri(bang, r_max, c_B_cua(dc, ctx, g_b))
-            u, parts, u_dh = u_delta_c_B(sw, dc, ctx, g_b, eps_g, trai_c, trai_s, e_pos,
-                                         du_giu if math.isfinite(du_giu) else 0.0)
-            r['u_delta_c_B_m'], r['u_delta_c_B_phan'], r['u_delta_h_m'] = u, parts, u_dh
-        if abs(dh) > cfg['dh_max_m']:
-            lc.append('dh_vuot_ngoi_chot')
-        if len(giu_vt) < cfg['min_giu_vi_tri']:
-            lc.append('thieu_giu_ngoai_vi_tri')
-        if dc['n'] < cfg['min_khung']:
-            lc.append('thieu_khung_chung')
-        if 'ngoai_mien' in lb:
-            lc.append('ngoai_mien')
-        if not lc:
-            r['trang_thai']['delta_c_B'] = 'dat'
-    else:
-        r['ly_do']['delta_c_B'].append('thieu_khung_chung_hoac_a6')
+    lc = r['ly_do']['delta_c_B']
+    lc += lneo                                                  # LLC1-2: not the yaw budget u_beta
+    sw, dc = _w_from_hc(cs), dich['chung']
+    if sw is None or dc is None:
+        lc.append('thieu_khung_chung_hoac_a6')
         r['ly_do']['phi'].append('thieu_khung_chung_hoac_a6')
         r['ly_do']['q'].append('thieu_khung_chung_hoac_a6')
+        if dich.get('ma') is not None and _w_from_hc(cs, 'ma') is not None:
+            r['cung_lan_lap'] = None
+        return r
+    # ---- delta_a, integration check (v4 0, 5)
+    da = wrap(dc['theta'] - sw['theta'])
+    r['delta_a_deg'] = math.degrees(da)
+    r['beta_chung_deg'] = math.degrees(wrap(dc['alpha'] - sw['alpha']))
+    r['beta_chenh_tap_deg'] = wrapd(r['beta_chung_deg'] - beta)
+    t = env['tx'].get(cho)
+    if t is not None:
+        a_k, phi_k = math.radians(float(t[TEN['tx_a']])), math.radians(float(t[TEN['tx_phi']]))
+    else:
+        a_k, phi_k = 0.0, wrap(sw['psi'])
+    # v4 0 (LL4-9): algebraic identity on the common sets; a phi_hat not built from this psi_chuan_k, or a delta_a /
+    # alpha from another frame set, breaks it
+    r['kiem_tich_hop_deg'] = abs(math.degrees(wrap(phi_k + wrap(dc['alpha'] - sw['alpha']) - (dc['psi'] - a_k - da))))
+    r['kiem_tich_hop_nguon'] = 'truc_xe_v1' if t is not None else 'noi_bo (khong co truc_xe_v1)'
+    # ---- phi (v4 0, LL4-10, LLC1-1): every term finite and >= 0, F7 dat, identity finite and within tol
+    lp = r['ly_do']['phi']
+    if r['trang_thai']['beta'] != 'dat':
+        lp.append('beta_chua_dat')
+    if not r['kiem_tich_hop_deg'] <= cfg['tich_hop_deg']:
+        lp.append('loi_ghep')
+    u_ph = None
+    if t is None:
+        lp.append('thieu_truc_xe')
+    else:
+        if t.get(TEN['trang_thai']) != 'dat':
+            lp.append('truc_xe_chua_dat')
+        u_ph = t.get(TEN['tx_u_phi'])
+        if u_ph is None or not (math.isfinite(float(u_ph)) and float(u_ph) >= 0):
+            lp.append('thieu_u_phi_hat')
+            u_ph = None
+        r['phi_deg'] = math.degrees(phi_k) + beta
+    ucam = env['u_beta_cam_deg']
+    if ucam is None:
+        lp.append('thieu_u_beta_cam')
+    if not math.isfinite(env['u_beta']):
+        lp.append('u_beta_khong_tinh_duoc')
+    if u_ph is not None and ucam is not None and math.isfinite(env['u_beta']):
+        r['u_phi_truoc_le_deg'] = float(u_ph) + env['u_beta'] + float(ucam)
+    if not lp and r['u_phi_truoc_le_deg'] is not None:
+        r['trang_thai']['phi'] = 'dat'
+    # ---- q (v4 6, diagnostic; LLC1-17: both E ends, xoay_v1 dat, E ends not changed)
+    x = env['xo'].get(cho)
+    ed = [c for c in fitw if c['meta']['cho'] == cho and c['meta']['loai'] in ('E_dau', 'E_cuoi') and c['chung']]
+    if x is None or x.get(TEN['xoay_r']) is None or x.get(TEN['trang_thai']) != 'dat':
+        r['ly_do']['q'].append('thieu_xoay_v1_dat')
+    elif sorted(c['meta']['loai'] for c in ed) != ['E_cuoi', 'E_dau']:
+        r['ly_do']['q'].append('thieu_hai_dau_E')
+    else:
+        e1, e2 = (_w_from_hc(c) for c in ed)
+        if tong_doi(so_sanh(e1, e2, ctx, g_b, env['nguong_cho']({cho}))) is not False:
+            r['ly_do']['q'].append('E_tam_doi_hoac_chua_xac_dinh')
+        else:
+            rb = [rot2(-ew['alpha']) @ (nghich(np.array(x[TEN['xoay_r']], float), ctx.tag_h, ew['F'], ew['H'], ctx.C,
+                                               ctx.a_t)[0] - ew['o']) for ew in (e1, e2)]
+            qB = c_B_cua(dc, ctx, g_b) - np.mean(rb, axis=0)
+            r['q_B_m'], r['q_m'] = qB.tolist(), (rot2(-dc['theta']) @ qB).tolist()
+            r['q_B_chuan_k_m'] = (c_B_cua(sw, ctx, g_b) - np.mean(rb, axis=0)).tolist()   # F16 name, diagnostic
+    r['theta_luot_rad'], r['theta_chuan_rad'] = dc['theta'], sw['theta']        # F16: tag yaw minus body (psi' - alpha)
+    # ---- 4 corner heights (v4 7, diagnostic): g . r_i (tag frame, rotation-free) target minus standard; one g_b
+    #      per plate for both ends (LL5-6) so the tilt part is 0 here; the mean change needs kappa (none in v4)
+    g_d = g_s = g_b
+    r['delta_h_goc_m'] = [float(np.dot(g_d, ci) - np.dot(g_s, ci)) for ci in cm.car_corners_body(ctx.side)]
+    r['ly_do']['h'].append('khong_co_kappa')
+    # ---- cung_lan_lap (v4 6, information only; LLC1-4: within the spread of the standard 12b group, no floor)
+    tr = env['trai'].get(cs['meta']['luot'])
+    if tr is not None and tr['n'] >= 2:
+        cl = so_sanh(sw, dc, ctx, g_b, dict(theta=tr['theta'], c_B=tr['c_B'], s=tr['s']))
+        r['cung_lan_lap'] = tong_doi(cl) is False if tong_doi(cl) is not None else None
+        r['cung_lan_lap_chi_so'] = cl
+    # ---- delta_c_B (v4 6b, LL5-1..6, LLC1-2, 3, 12)
+    try:
+        dcb, raw, dh = delta_c_B(sw, dc, ctx, g_b)
+    except ValueError as e:
+        lc.append(f'mien_so: {e}')
+        return r
+    r['delta_c_B_m'], r['delta_c_B_tho_m'], r['delta_h_uoc_m'] = dcb.tolist(), raw.tolist(), dh
+    n12 = 0 if tr is None else tr['n']
+    if n12 < cfg['min_12b']:
+        lc.append('thieu_12b_cung_lan_lap')
+    else:
+        b_s = eps_neo_bang(env['G'], env['h'], np.array(cs['F']), cs['H'], ctx.C, ctx.a_n)
+        b_d = eps_neo_bang(env['G'], env['h'], dich['F'], dich['H'], ctx.C, ctx.a_n)
+        e_pos = (eps_vi_tri(b_s, env['r_max'], c_B_cua(sw, ctx, g_b))
+                 + eps_vi_tri(b_d, env['r_max'], c_B_cua(dc, ctx, g_b, dh)))
+        try:
+            u, parts, u_dh = u_delta_c_B(sw, dc, ctx, g_b, env['eps_g'], tr['c_B'], tr['s'], e_pos,
+                                         env['du_giu'] if math.isfinite(env['du_giu']) else 0.0)
+            r['u_delta_c_B_m'], r['u_delta_c_B_phan'], r['u_delta_h_m'] = u, parts, u_dh
+        except ValueError as e:
+            lc.append(f'mien_so: {e}')
+    if abs(dh) > cfg['dh_max_m']:
+        lc.append('dh_vuot_ngoi_chot')
+    if len(env['giu_vt']) < cfg['min_giu_vi_tri']:
+        lc.append('thieu_giu_ngoai_vi_tri')
+    if dc['n'] < cfg['min_khung']:
+        lc.append('thieu_khung_chung')
+    if not lc and r['u_delta_c_B_m'] is not None:
+        r['trang_thai']['delta_c_B'] = 'dat'
     return r
 
 
-def _cap_lan_lap_id(out_l, so, luot, hw, ctx, g_b, nguong_cho):
-    """F8 (CODE 19/11): lan_lap_id by machine, consecutive runs in time order; a new id when the plate changed
-    between the post of the previous run and the pre of this one (8 comparison) or inside the previous run; the id
-    of the 12b standard (0) for the first runs that are cung_lan_lap with it."""
-    order = sorted(out_l, key=lambda x: (hw[luot[x['luot_id']]['pre']]['t0'] if 'pre' in luot[x['luot_id']] else NAN))
-    cur, prev = (0 if order and order[0].get('cung_lan_lap') else 1), None
-    for x in order:
-        if prev is not None:
-            pa = hw.get(luot[prev['luot_id']].get('post')) or hw.get(luot[prev['luot_id']].get('pre'))
-            pb = hw.get(luot[x['luot_id']].get('pre'))
-            ca = {y['meta']['cho'] for y in (pa, pb) if y is not None}
-            s = so_sanh(pa['chung'] if pa else None, pb['chung'] if pb else None, ctx, g_b, nguong_cho(ca))
-            if tong_doi(s) is not False or prev['tam_doi_trong_luot'] is not False:
-                cur += 1
-        x['lan_lap_id'] = f'L{cur}'
-        prev = x
+def phan_doan(luot, hw, fitw, so, ctx, g_b, nguong_cho):
+    """J v6 2, F8 (CODE 19/11): placements of the session by machine. Items in the order of the window file (CAM
+    writes the windows in recording order; a clip whose PTS order contradicts it -> no id, 'thu_tu_mau_thuan'): 12b
+    runs (consecutive 12b runs = one placement, J v6: 12b at the start of the session and after each new placement)
+    and car runs. A car run starts a new placement when its pre differs from the last window of the previous item
+    (8 comparison doi, between windows that passed the anchor gate) or the plate changed inside the previous run
+    (tam_doi_trong_luot true); an undetermined comparison keeps the placement and is flagged (doi_truoc = None); a
+    placement with no 12b run has no standard (G1-G4 not concluded, J v6 2).
+    Returns {luot_id: dict(lan_lap_id, chuan_12b, j, ly_do, doi_truoc)}."""
+    items = []
+    for l12 in sorted({c['meta']['luot'] for c in fitw if c['meta']['loai'] == LOAI_CHUAN}):      # a 12b run has its ref
+        ws = sorted([(c['thu_tu'], j) for j, c in enumerate(fitw) if c['meta']['luot'] == l12], key=lambda x: x[0])
+        items.append(dict(kind='12b', id=l12, pos=ws[0][0], last=ws[-1][1]))
+    for lid, d in luot.items():
+        idx = [i for i in d.values()]
+        items.append(dict(kind='luot', id=lid, pos=min(idx), pre=d.get('pre'), post=d.get('post')))
+    items.sort(key=lambda x: x['pos'])
+    by_clip = {}                                               # PTS order inside each clip must follow the file order
+    for it in items:
+        if it['kind'] == '12b':
+            c = fitw[it['last']]
+            by_clip.setdefault(c['meta']['clip_sha'], []).append((it['pos'], c['t0']))
+        elif it['pre'] is not None:
+            x = hw[it['pre']]
+            by_clip.setdefault(x['meta']['clip_sha'], []).append((it['pos'], x['t0']))
+    if any(any(b[1] <= a[1] for a, b in zip(sorted(v), sorted(v)[1:])) for v in by_clip.values()):
+        return {lid: dict(lan_lap_id=None, chuan_12b=None, j=None, ly_do='thu_tu_mau_thuan') for lid in luot}
+    ref = {(c['meta']['cho'], c['meta']['luot']): j for j, c in enumerate(fitw) if c['meta']['loai'] == LOAI_CHUAN}
+    out, seg, seg12, prev = {}, -1, {}, None
+    for it in items:
+        if it['kind'] == '12b':
+            if prev is None or prev['kind'] != '12b':
+                seg += 1
+                seg12[seg] = {}
+            cho = fitw[it['last']]['meta']['cho']
+            seg12[seg][cho] = it['id']
+            prev = dict(it, w=_w_from_hc(fitw[it['last']]) or _w_from_hc(fitw[it['last']], 'ma'), cho=cho)
+            continue
+        pre = hw.get(it['pre']) if it['pre'] is not None else None
+        w_pre = _hai(pre) if pre is not None and pre['ok'] and pre['du_ok'] else None
+        new, doi_truoc = prev is None, None
+        if not new:
+            ca = {prev['cho'], pre['meta']['cho'] if pre is not None else prev['cho']}
+            doi_truoc = tong_doi(so_sanh(prev['w'], w_pre, ctx, g_b, nguong_cho(ca)))
+            if doi_truoc is True or (prev['kind'] == 'luot' and so[prev['id']] is not None
+                                     and tong_doi(so[prev['id']]) is True):
+                new = True
+        if new:
+            seg += 1
+            seg12[seg] = {}
+        cho = pre['meta']['cho'] if pre is not None else None
+        l12 = seg12[seg].get(cho)
+        why = None
+        if not seg12[seg]:
+            why = 'khong_co_12b_cung_lan_lap'
+        elif l12 is None:
+            why = 'khong_co_cua_so_chuan'
+        out[it['id']] = dict(lan_lap_id=f'L{seg}', chuan_12b=l12, j=ref.get((cho, l12)) if l12 else None, ly_do=why,
+                             doi_truoc=doi_truoc)
+        post = hw.get(it['post']) if it['post'] is not None else None
+        good = [x for x in (post, pre) if x is not None and x['ok'] and x['du_ok']]
+        last = good[0] if good else None
+        prev = dict(it, w=_hai(last) if last is not None else None,
+                    cho=(last or pre)['meta']['cho'] if (last or pre) is not None else None)
+    return out
 
 
 def main(argv=None):
@@ -2064,6 +2377,7 @@ def main(argv=None):
     a4.add_argument('--mau', required=True, nargs=3, metavar=('CLIP', 'SESSION', 'IDX'), help='template frame of the boxes')
     a4.add_argument('--kiem-r', nargs='*', default=[], help='kiem.json of v7 "kiem --rong" (clip R) covering the boxes')
     a4.add_argument('--a6', required=True, help='c8b_a6_v2 file (C8B)')
+    a4.add_argument('--tam-id', required=True, help='plate id of the session (CAM) for ap_dung of c8b_a6_v2')
     a4.add_argument('--h-neo', type=float, help='nominal anchor height h_n (default tag_h_m of the session)')
     a4.add_argument('--thu-muc-clip')
     a4.add_argument('--out', required=True)
@@ -2075,7 +2389,7 @@ def main(argv=None):
     a5.add_argument('--truc-xe', help='truc_xe_v1 (HIEUCHUAN)')
     a5.add_argument('--xoay', help='xoay_v1 (C8B)')
     a5.add_argument('--u-beta-cam-deg', type=float, help='u_beta_cam (C8B), before the margin')
-    a5.add_argument('--tam-id', help='plate id (CAM) for ap_dung of c8b_a6_v2')
+    a5.add_argument('--tam-id', required=True, help='plate id of the session (CAM), as in hieu_chuan')
     a5.add_argument('--mau-clip', help='path of the template clip when moved')
     a5.add_argument('--thu-muc-clip')
     a5.add_argument('--out', required=True)
@@ -2083,12 +2397,12 @@ def main(argv=None):
     try:
         if a.cmd == 'hieu_chuan':
             code = run_hieu_chuan(a.cua_so, a.session, a.neo, (a.mau[0], a.mau[1], int(a.mau[2])), a.out, a.a6,
-                                  a.kiem_r, a.h_neo, a.thu_muc_clip)
+                                  a.tam_id, a.kiem_r, a.h_neo, a.thu_muc_clip)
             o = doc_json(os.path.join(a.out, 'hieu_chuan_neo.json'))
             print(f'hieu_chuan: {o["trang_thai"]} {", ".join(o.get("ly_do", []))}')
         elif a.cmd == 'lan_lap':
-            code = run_lan_lap(a.hieu_chuan, a.cua_so, a.session, a.out, a.a6, a.truc_xe, a.xoay, a.u_beta_cam_deg,
-                               a.thu_muc_clip, a.mau_clip, a.tam_id)
+            code = run_lan_lap(a.hieu_chuan, a.cua_so, a.session, a.out, a.a6, a.tam_id, a.truc_xe, a.xoay,
+                               a.u_beta_cam_deg, a.thu_muc_clip, a.mau_clip)
             o = doc_json(os.path.join(a.out, 'lan_lap.json'))
             for x in o['luot']:
                 print(f'{x["luot_id"]}: beta {x["trang_thai"]["beta"]} {x["beta_deg"]}, delta_c_B '
