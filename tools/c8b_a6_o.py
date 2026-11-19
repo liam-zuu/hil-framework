@@ -178,7 +178,7 @@ def build(rows, muc_dich, giu_ngoai_theo, khoa_sha, cho_sha, dai_u=DAI_U):
         if set(tap[a]) & set(tap[b]):
             raise OError(f'sets {a} and {b} share runs')
     return a6m.with_sha(dict(
-        schema=SCHEMA, muc_dich=muc_dich, giu_ngoai_theo=giu_ngoai_theo, truoc_le=True, khoa_truoc_sha256=khoa_sha,
+        schema=SCHEMA, version=SCHEMA, muc_dich=muc_dich, giu_ngoai_theo=giu_ngoai_theo, truoc_le=True, khoa_truoc_sha256=khoa_sha,
         a6_khop=dict(cho_sha256=list(cho_sha)), tap=tap,
         khoa_o=dict(O_M=O_M, CUNG_DEG=CUNG_DEG, DAI_U=list(dai_u), N_ID_MIN=N_ID_MIN, lan_lap='lan_lap_id',
                     quy_tac='o dat: n_id >= N_ID_MIN, n_thieu 0, moi id |d| <= U_psi + U_IMU,D o moi nut'),

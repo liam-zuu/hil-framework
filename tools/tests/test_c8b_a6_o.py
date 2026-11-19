@@ -40,7 +40,7 @@ def _all(tmp_path, kiem, extra=()):
 
 def test_cell_dat_read_by_kiem_o(tmp_path):
     o = O.build(_all(tmp_path, _rows()), 'giu_ngoai_a6', 'cho', KHOA, CHO)
-    assert o['trang_thai'] == 'dat' and len(o['o']) == 1
+    assert o['trang_thai'] == 'dat' and len(o['o']) == 1 and o['version'] == 'c8b_a6_o_v1'   # GATE reads version
     c = o['o'][0]
     assert c['n_id'] == 12 and c['n_thieu'] == 0 and c['ty_le_max'] == pytest.approx(0.4) and c['dat']
     assert c['bao_cao_controller']['PID']['max_abs'] == pytest.approx(0.002)
