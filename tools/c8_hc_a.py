@@ -431,17 +431,24 @@ def cam_motion_events(F, kind, thr_v=0.02, thr_w=math.radians(5.0), half=0.25):
     return ev
 
 
-def log_motion_events(L, blocks):
-    """(start, end) log times of real motion of each block (counts changing)."""
-    moving = np.r_[False, np.any(np.diff(L['C'], axis=0) != 0, axis=1)]
+def log_motion_events(L, blocks, thr_v=0.02, thr_w=math.radians(5.0), half=0.25):
+    """(start, end) log times of motion of each block, with the SAME speed thresholds and window as the camera
+    (cam_motion_events): translation speed from the encoder odometry, turn rate from the wheel increments. A slow
+    creep after the stop (ADRC) stays under the threshold on both sides."""
+    dx, dy, dth = body_increments(L)
+    t = L['t']
+    X, Y, TH = np.cumsum(dx), np.cumsum(dy), np.cumsum(dth)
     out = []
     for k, b in enumerate(blocks):
-        nxt = blocks[k + 1]['j0'] if k + 1 < len(blocks) else len(moving)
-        mv = np.flatnonzero(moving[b['j0']:nxt])
-        if not len(mv):
-            out.append(None)
-            continue
-        out.append((float(L['t'][b['j0'] + mv[0]]), float(L['t'][b['j0'] + mv[-1]])))
+        j0 = b['j0']
+        j1 = blocks[k + 1]['j0'] if k + 1 < len(blocks) else L['n']
+        idx = np.arange(j0, j1)
+        a = np.searchsorted(t, t[idx] - half)
+        c = np.minimum(np.searchsorted(t, t[idx] + half), L['n'] - 1)
+        dt = np.maximum(t[c] - t[a], 1e-6)
+        sp = (np.hypot(X[c] - X[a], Y[c] - Y[a]) / dt) if b['truc'] == 'vx' else (np.abs(TH[c] - TH[a]) / dt)
+        mv = np.flatnonzero(sp > (thr_v if b['truc'] == 'vx' else thr_w))
+        out.append(None if not len(mv) else (float(t[idx[mv[0]]]), float(t[idx[mv[-1]]])))
     return out
 
 
@@ -529,7 +536,7 @@ def analyse(A, F, k_info, min_frames=MIN_FRAMES_TINH):
             pc = np.unwrap(F['psi'][mk])
             ker = max(1, int(round(EPS_SMOOTH_S * F.get('fps', 60.0))))
             pcs = np.convolve(pc, np.ones(ker) / ker, 'same')
-            yi = np.interp(tc, L['t'], yaw)
+            yi = np.convolve(np.interp(tc, L['t'], yaw), np.ones(ker) / ker, 'same')   # same smoothing, same grid
             dev = (pcs - wa['psi']) - (yi - yaw[ja])
             core = slice(ker // 2, len(dev) - ker // 2) if len(dev) > ker else slice(0, len(dev))
             eps = float(np.max(np.abs(np.vectorize(wrap)(dev[core])))) if len(dev[core]) else float('nan')
