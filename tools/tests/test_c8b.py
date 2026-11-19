@@ -671,11 +671,20 @@ def test_run_nodes_with_fake_scorer(tmp_path):
 # ── c8b_3b ───────────────────────────────────────────────────────────────────────────────────
 
 def make_wheel(path, R, alpha_r=7.7e-6, wob=0.002, noise=0.0001, seed=1, drift_centre=0.0, one_way=False,
-               slow=False, with_col=True, r_drift=0.0, centre_step=0.0):
+               slow=False, with_col=True, r_drift=0.0, centre_step=0.0, tag_err=None, gap=0.0, long=False):
+    # tag_err(w): an error (ex, ey) in the tag frame added to the tag centre (rotates with the tag); gap: seconds added
+    # to t_s after 70 s (two joined clips, as ghep_3b.py)
     rng = np.random.default_rng(seed)
     T = 1 / 60
-    tt = np.arange(0, 70, T)
-    om = np.where(tt < 34, 6.0 * np.exp(-tt / 12) + 0.3, np.where(tt < 35, 0.0, -(6.0 * np.exp(-(tt - 35) / 12) + 0.3)))
+    if long:                                      # v2: a long slow tail each way (the slowest part covers > 2 rad)
+        tt = np.arange(0, 140, T)
+        om = np.where(tt < 69, 6.0 * np.exp(-tt / 6) + 0.4,
+                      np.where(tt < 70, 0.0, -(6.0 * np.exp(-(tt - 70) / 6) + 0.4)))
+    else:
+        tt = np.arange(0, 70, T)
+        om = np.where(tt < 34, 6.0 * np.exp(-tt / 12) + 0.3,
+                      np.where(tt < 35, 0.0, -(6.0 * np.exp(-(tt - 35) / 12) + 0.3)))
+    t_mid = tt[-1] / 2
     if one_way:
         om = np.abs(om)
     if slow:
@@ -683,15 +692,20 @@ def make_wheel(path, R, alpha_r=7.7e-6, wob=0.002, noise=0.0001, seed=1, drift_c
     th = np.cumsum(om) * T
     out = []
     for ti, a, w in zip(tt, th, om):
-        cx = 1.0 + drift_centre * math.sin(ti) + (centre_step if ti > 35 else 0.0)
-        Rt = R + r_drift * ti / 70
+        cx = 1.0 + drift_centre * math.sin(ti) + (centre_step if ti > t_mid else 0.0)
+        Rt = R + r_drift * ti / tt[-1]
         row = 1100 + Rt * math.sin(a) / 0.0006
         col = 1900 + Rt * math.cos(a) / 0.0006
         a2 = a + w * alpha_r * (row - 1100) + wob * math.cos(a)
         xm = cx + Rt * math.cos(a2) + rng.normal(0, noise)
         ym = 0.5 + Rt * math.sin(a2) + rng.normal(0, noise)
         psi = a2 + 0.3 + rng.normal(0, 0.0003)
-        out.append(dict(t_s=f'{ti:.6f}', valid=1, x=xm, y=ym, tag_x=xm, tag_y=ym,
+        if tag_err is not None:
+            ex, ey = tag_err(w)
+            xm += math.cos(psi) * ex - math.sin(psi) * ey
+            ym += math.sin(psi) * ex + math.cos(psi) * ey
+        ts = ti + (gap if ti > t_mid else 0.0)
+        out.append(dict(t_s=f'{ts:.6f}', valid=1, x=xm, y=ym, tag_x=xm, tag_y=ym,
                         psi=math.remainder(psi, 2 * math.pi), row_px=row, col_px=col if with_col else ''))
     with open(path, 'w', newline='') as f:
         w = csv.DictWriter(f, fieldnames=list(out[0]))
@@ -702,7 +716,7 @@ def make_wheel(path, R, alpha_r=7.7e-6, wob=0.002, noise=0.0001, seed=1, drift_c
 @pytest.fixture(scope='module')
 def wheel(tmp_path_factory):
     d = tmp_path_factory.mktemp('wheel')
-    make_wheel(str(d / 'a.csv'), 0.0005, wob=0.0)
+    make_wheel(str(d / 'a.csv'), 0.0005, wob=0.0, long=True)
     make_wheel(str(d / 'b.csv'), 0.25)
     return str(d / 'a.csv'), str(d / 'b.csv')
 
@@ -798,12 +812,12 @@ def test_3b_envelope_covers_every_check_fit(wheel, monkeypatch):
 
 def test_3b_v2_axis_offset_is_geometry_not_a_bad_setup(tmp_path):
     # the tag 1.5 mm off the axis: v1 (fixed point) fails at about 3 mm, v2 (c0 + R(psi) q) passes and finds q
-    make_wheel(str(tmp_path / 'a.csv'), 0.0015, wob=0.0)
+    make_wheel(str(tmp_path / 'a.csv'), 0.002, wob=0.0, long=True)
     make_wheel(str(tmp_path / 'b.csv'), 0.25)
     r = TB.analyse(str(tmp_path / 'a.csv'), str(tmp_path / 'b.csv'))
     A = r['A']
     assert A['ga_dev_tho_m'] > TB.GA_TOL_M and A['ga_ok'], A['ga_why']      # v1 would fail
-    assert A['q_abs_m'] == pytest.approx(0.0015, abs=1e-4) and A['q_nhan_dang']
+    assert A['q_abs_m'] == pytest.approx(0.002, abs=1e-4) and A['q_nhan_dang']
     assert A['ga_dev_m'] < 0.0006 and A['ga_dev_giu_ngoai_m'] < 0.0006
     assert A['p_dev_m'] < 0.0006 < TB.GA_TOL_M < A['p_dev_tho_m']
     assert r['version'] == 'c8b_3b_v2' and r['ga_ok']
@@ -812,7 +826,7 @@ def test_3b_v2_axis_offset_is_geometry_not_a_bad_setup(tmp_path):
 def test_3b_v2_centre_moved_between_halves_fails_held_out(tmp_path):
     # the set-up moved 2.4 mm between the two spins: the joint fit splits it (residual about 1.2 mm < 2 mm), the
     # held-out check (fit one half, check the other) sees 2.4 mm
-    make_wheel(str(tmp_path / 'a.csv'), 0.0005, wob=0.0, centre_step=0.0024)
+    make_wheel(str(tmp_path / 'a.csv'), 0.0005, wob=0.0, centre_step=0.0024, long=True)
     make_wheel(str(tmp_path / 'b.csv'), 0.25)
     A = TB.analyse(str(tmp_path / 'a.csv'), str(tmp_path / 'b.csv'))['A']
     assert A['ga_dev_m'] < 0.002 and A['ga_dev_giu_ngoai_m'] > 0.002
@@ -820,7 +834,7 @@ def test_3b_v2_centre_moved_between_halves_fails_held_out(tmp_path):
 
 
 def test_3b_v2_centre_wandering_still_fails(tmp_path):
-    make_wheel(str(tmp_path / 'a.csv'), 0.0005, wob=0.0, drift_centre=0.004)
+    make_wheel(str(tmp_path / 'a.csv'), 0.0005, wob=0.0, drift_centre=0.004, long=True)
     make_wheel(str(tmp_path / 'b.csv'), 0.25)
     A = TB.analyse(str(tmp_path / 'a.csv'), str(tmp_path / 'b.csv'))['A']
     assert not A['ga_ok'] and A['ga_why']
@@ -835,20 +849,19 @@ def test_3b_v2_q_not_identified_on_one_heading():
 
 
 def test_3b_v2_radius_drift_passes_gate_but_stays_in_radial_error(tmp_path):
-    # radius drifting 3 mm over the clip: the gate model takes the drift (set-up check passes), the radial part
-    # keeps it (an unexplained drift is not modelled away)
-    make_wheel(str(tmp_path / 'a.csv'), 0.0005, wob=0.0)
-    make_wheel(str(tmp_path / 'b.csv'), 0.25, r_drift=0.003)
+    # radius drifting 2 mm over the clip: the in-fit model takes the drift, the held-out check (no drift term) still
+    # passes at this size, the radial part keeps it (an unexplained drift is not modelled away)
+    make_wheel(str(tmp_path / 'a.csv'), 0.0005, wob=0.0, long=True)
+    make_wheel(str(tmp_path / 'b.csv'), 0.25, r_drift=0.002)
     B = TB.analyse(str(tmp_path / 'a.csv'), str(tmp_path / 'b.csv'))['B']
     assert B['ga_ok'], B['ga_why']
-    assert B['ga_dev_tho_m'] > 0.0012
-    assert B['mo_hinh_ban_kinh']['troi_m_s'] == pytest.approx(0.003 / 70, rel=0.2)
-    assert B['rad_dev_m'] > 0.001
+    assert B['theo_clip'][0]['mo_hinh_ban_kinh']['troi_m_s'] == pytest.approx(0.002 / 70, rel=0.25)
+    assert B['rad_dev_m'] > 0.0008
 
 
 def test_3b_v2_b_gate_independent_of_the_shutter_check(tmp_path):
     # a shutter reason (no col_px) must not enter the set-up check of B (first run on the real data: it did)
-    make_wheel(str(tmp_path / 'a.csv'), 0.0005, wob=0.0)
+    make_wheel(str(tmp_path / 'a.csv'), 0.0005, wob=0.0, long=True)
     make_wheel(str(tmp_path / 'b.csv'), 0.25, with_col=False)
     B = TB.analyse(str(tmp_path / 'a.csv'), str(tmp_path / 'b.csv'))['B']
     assert B['shutter']['why'] and B['ga_ok'] and B['ga_why'] == []
@@ -857,16 +870,83 @@ def test_3b_v2_b_gate_independent_of_the_shutter_check(tmp_path):
     assert not B2['ga_ok'] and isinstance(B2['ga_why'], list) and B2['ga_why']
 
 
-def test_3b_v2_cli_cross_check(tmp_path, capsys):
-    make_wheel(str(tmp_path / 'a.csv'), 0.0015, wob=0.0)
+def test_3b_v2_setup_moved_between_clips_is_per_clip_geometry(tmp_path):
+    # two joined clips (gap 10 s), the set-up moved 1.6 mm between them (as A2 of session 1): each clip has its own
+    # axis, the check passes, the move is reported (Codex G3B-1)
+    make_wheel(str(tmp_path / 'a.csv'), 0.0015, wob=0.0, centre_step=0.0016, gap=10.0, long=True)
     make_wheel(str(tmp_path / 'b.csv'), 0.25)
-    make_wheel(str(tmp_path / 'c.csv'), 0.0002, wob=0.0, seed=3)
+    A = TB.analyse(str(tmp_path / 'a.csv'), str(tmp_path / 'b.csv'))['A']
+    assert len(A['theo_clip']) == 2 and A['ga_ok'], A['ga_why']
+    assert A['doi_giua_clip'][0]['dc0_m'] == pytest.approx(0.0016, abs=2e-4)
+
+
+def _spin_F(err_k=0.0, q=(0.0005, 0.0), T_s=1 / 60):
+    """A dict F for analyse_a: each way 4 s fast then a linear slow-down 2.0 -> 0.3 rad/s over 40 s; tag centre =
+    c0 + R(psi) (q + (err_k |Omega|, 0)) (a tag-frame error growing with the rate)."""
+    seg = []
+    for sgn in (1.0, -1.0):
+        tt = np.arange(0, 164, T_s)
+        w = np.where(tt < 4, 6.0, 2.0 - 1.7 * (tt - 4) / 160)
+        seg.append(sgn * w)
+        seg.append(np.zeros(int(1 / T_s)))
+    om = np.concatenate(seg)
+    t = np.arange(len(om)) * T_s
+    psi = np.cumsum(om) * T_s
+    ex = q[0] + err_k * np.abs(om)
+    ey = q[1] + 0.0 * om
+    x = 1.0 + np.cos(psi) * ex - np.sin(psi) * ey
+    y = 0.5 + np.sin(psi) * ex + np.cos(psi) * ey
+    return dict(t=t, x=x, y=y, psi=psi)
+
+
+def test_3b_v2_speed_dependent_error_added_to_position():
+    # a tag-frame error growing with the rate (1 mm per rad/s): the slow-part q differs between the speed halves
+    # and that change is added to the position part (Codex G3B-3, J v6 section 6)
+    A = TB.analyse_a(_spin_F(err_k=0.001), 2.614)
+    dq = A['hap_thu']['dq_toc_do_max_m']
+    assert dq > 5e-5
+    A0 = TB.analyse_a(_spin_F(err_k=0.0), 2.614)
+    assert A0['hap_thu']['dq_toc_do_max_m'] < 1e-6
+    assert A['p_dev_m'] >= dq
+
+
+def test_3b_v2_direction_dependent_error_added_to_position(tmp_path):
+    # a tag-frame error of +-1 mm with the direction (blur): q of the two directions differ by about 2 mm, added
+    make_wheel(str(tmp_path / 'a.csv'), 0.0005, wob=0.0, tag_err=lambda w: (0.001 * np.sign(w), 0.0), long=True)
+    make_wheel(str(tmp_path / 'b.csv'), 0.25)
+    A = TB.analyse(str(tmp_path / 'a.csv'), str(tmp_path / 'b.csv'))['A']
+    assert A['hap_thu']['dq_chieu_m'] == pytest.approx(0.002, abs=3e-4)
+    assert A['p_dev_m'] >= 0.0017
+
+
+def test_3b_v2_one_direction_only_position_not_finite(tmp_path):
+    make_wheel(str(tmp_path / 'a.csv'), 0.0005, wob=0.0, one_way=True, long=True)
+    make_wheel(str(tmp_path / 'b.csv'), 0.25)
+    A = TB.analyse(str(tmp_path / 'a.csv'), str(tmp_path / 'b.csv'))['A']
+    assert A['p_dev_m'] is None and A['p4_why']
+
+
+def test_3b_v2_cross_check_flag_is_only_the_fit(tmp_path):
+    # Codex G3B-7: a tag 5 mm off the axis still fits the model: the flag says the model fits, nothing about the axis
+    make_wheel(str(tmp_path / 'a.csv'), 0.0005, wob=0.0, long=True)
+    make_wheel(str(tmp_path / 'b.csv'), 0.25)
+    make_wheel(str(tmp_path / 'c.csv'), 0.005, wob=0.0, seed=4, long=True)
+    r = TB.analyse(str(tmp_path / 'a.csv'), str(tmp_path / 'b.csv'), fc=str(tmp_path / 'c.csv'))
+    r0 = TB.analyse(str(tmp_path / 'a.csv'), str(tmp_path / 'b.csv'))
+    assert r['A_cheo']['khop_mo_hinh_ok'] and r['A_cheo']['q_abs_m'] == pytest.approx(0.005, abs=3e-4)
+    assert r['d_p_quay_m'] == r0['d_p_quay_m'] and r['d_psi_quay_deg'] == r0['d_psi_quay_deg']
+
+
+def test_3b_v2_cli_cross_check(tmp_path, capsys):
+    make_wheel(str(tmp_path / 'a.csv'), 0.0015, wob=0.0, long=True)
+    make_wheel(str(tmp_path / 'b.csv'), 0.25)
+    make_wheel(str(tmp_path / 'c.csv'), 0.0002, wob=0.0, seed=3, long=True)
     out = tmp_path / 'o.json'
     assert TB.main(['--frames-a', str(tmp_path / 'a.csv'), '--frames-b', str(tmp_path / 'b.csv'),
                     '--frames-a-cheo', str(tmp_path / 'c.csv'), '--out', str(out)]) == 0
     d = json.loads(out.read_text(encoding='utf-8'))
     c = d['A_cheo']
-    assert c['ga_ok'] and c['q_abs_m'] < 0.0004 and c['truc_lech_A_m'] < 0.001
+    assert c['khop_mo_hinh_ok'] and c['q_abs_m'] < 0.0004 and 'ga_ok' not in c
     assert [n['vai'] for n in d['nguon']] == ['A', 'B', 'A_cheo']
     assert '#ket_qua,ma=0,ga_ok=1' in capsys.readouterr().out
 
