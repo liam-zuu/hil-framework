@@ -2681,8 +2681,8 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
     after = live_rows(read_rows(os.path.join(ds, TUNING))) + [row]
     check_map_rows([row])
     check_c8b_rows(after)                              # GT1-8: the time file of no other run
-    if row.get('fail_cause') == KHONG_NUT:
-        check_khong_nut_rows(after, ds)                # GC9-10: the rule of the summary, old rows included
+    if any(r.get('fail_cause') == KHONG_NUT for r in after):
+        check_khong_nut_rows(after, ds)                # GC9-10: the rule of the summary on the log as it will be
     if _c8b_counted(row):
         try:
             c8b_refusals(after)

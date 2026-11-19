@@ -1227,6 +1227,27 @@ def test_gc9_10_end_applies_the_summary_rule(ds):
         rl.end(d, 'chua_ket_luan', **kw)
 
 
+def test_gc9_10_end_applies_the_summary_rule_the_other_way(ds):
+    """GC9-10 (Codex lượt chung 2): an old F11 row with an empty c8b_gio_sha256 cell names (through its H0 file) a
+    time file; a new kiem_gio_c8b row on that very file is refused by end, as the summary would."""
+    d, gf, tmp = ds
+    g = _gio(tmp, 'kn911_gio', ok=False)
+    p = _luoi(tmp, 'kn911', gio=g)
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    rl.end(d, 'chua_ket_luan', completed=1, results_dir=str(tmp), queries=rl.fake_queries(),
+           gate_sha256=rl.sha256_file(p), gate_khong_nut=True, c8b_gio=g, gate_path=p)
+    path = os.path.join(d, rl.TUNING)
+    rows = rl.read_rows(path)
+    rows[-1]['c8b_gio_sha256'] = ''
+    rl._write_all(path, rl.TUNING_COLS, rows)
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    with pytest.raises(rl.LogError, match='GC8-2'):
+        rl.end(d, 'hong_he_do', completed=1, fail_cause=rl.C8B_GIO_FAIL, c8b_gio=g, results_dir=str(tmp),
+               queries=rl.fake_queries())
+
+
 def test_gc7_3_h1_of_its_own_task_and_time_file(ds):
     """GC7-3 (Codex round 3): an H1 c8b_luoi file of another task, or naming the H0 time file, is refused."""
     d, gf, tmp = ds
