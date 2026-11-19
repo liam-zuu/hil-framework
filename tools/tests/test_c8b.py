@@ -846,6 +846,17 @@ def test_3b_v2_radius_drift_passes_gate_but_stays_in_radial_error(tmp_path):
     assert B['rad_dev_m'] > 0.001
 
 
+def test_3b_v2_b_gate_independent_of_the_shutter_check(tmp_path):
+    # a shutter reason (no col_px) must not enter the set-up check of B (first run on the real data: it did)
+    make_wheel(str(tmp_path / 'a.csv'), 0.0005, wob=0.0)
+    make_wheel(str(tmp_path / 'b.csv'), 0.25, with_col=False)
+    B = TB.analyse(str(tmp_path / 'a.csv'), str(tmp_path / 'b.csv'))['B']
+    assert B['shutter']['why'] and B['ga_ok'] and B['ga_why'] == []
+    make_wheel(str(tmp_path / 'b2.csv'), 0.25, drift_centre=0.004)
+    B2 = TB.analyse(str(tmp_path / 'a.csv'), str(tmp_path / 'b2.csv'))['B']
+    assert not B2['ga_ok'] and isinstance(B2['ga_why'], list) and B2['ga_why']
+
+
 def test_3b_v2_cli_cross_check(tmp_path, capsys):
     make_wheel(str(tmp_path / 'a.csv'), 0.0015, wob=0.0)
     make_wheel(str(tmp_path / 'b.csv'), 0.25)

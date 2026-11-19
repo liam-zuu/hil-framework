@@ -413,13 +413,13 @@ def analyse_b(F, v_max, wz_max, frame_s):
     ga_dev = float(np.max(np.abs(radius_res(r[sl], th[sl], t[sl], co, tm))))
     ga_ho, why_ho = held_out(lambda i: radius_fit(r, th, t, i),
                              lambda m, i: np.abs(radius_res(r[i], th[i], t[i], *m)), t, sl)
-    why = []
+    ga_why = []
     if ga_ho is None:
-        why.append(why_ho)
+        ga_why.append(why_ho)
     if ga_dev > GA_TOL_M:
-        why.append(f'residual {ga_dev * 1e3:.2f} mm > {GA_TOL_M * 1e3:.0f} mm')
+        ga_why.append(f'residual {ga_dev * 1e3:.2f} mm > {GA_TOL_M * 1e3:.0f} mm')
     if ga_ho is not None and ga_ho > GA_TOL_M:
-        why.append(f'held-out residual {ga_ho * 1e3:.2f} mm > {GA_TOL_M * 1e3:.0f} mm')
+        ga_why.append(f'held-out residual {ga_ho * 1e3:.2f} mm > {GA_TOL_M * 1e3:.0f} mm')
     phi = psi - th
     phi_sl = float(np.median(phi[sl]))
     v_t = np.abs(om) * R0
@@ -485,7 +485,7 @@ def analyse_b(F, v_max, wz_max, frame_s):
     env_c = max([abs(whole['alpha_c_s_px'])] + [abs(d['alpha_c_s_px']) for d in subsets]) if whole else None
     rows = F['row'][spin]
     return dict(centre=[cx, cy], R0_m=R0, slow_n=int(len(sl)), slow_rate_rad_s=float(np.median(np.abs(om[sl]))),
-                ga_dev_m=ga_dev, ga_dev_giu_ngoai_m=ga_ho, ga_ok=not why, ga_why=why, ga_dev_tho_m=ga_dev_tho,
+                ga_dev_m=ga_dev, ga_dev_giu_ngoai_m=ga_ho, ga_ok=not ga_why, ga_why=ga_why, ga_dev_tho_m=ga_dev_tho,
                 mo_hinh_ban_kinh=dict(R0_m=float(co[0]), bac1_m=float(np.hypot(co[1], co[2])),
                                       elip_m=float(np.hypot(co[3], co[4])), troi_m_s=float(co[5]),
                                       troi_phan_cham_m=float(co[5] * (np.max(t[sl]) - np.min(t[sl])))),
