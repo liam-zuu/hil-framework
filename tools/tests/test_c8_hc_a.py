@@ -689,3 +689,23 @@ def test_cua_so_refuses_clip_other_than_track(tmp_path):
     rc = ca.main(['cua_so', d, '--frames', os.path.join(d, 'frames.csv'), '--track', os.path.join(d, 'track.json'),
                   '--clip', os.path.join(d, 'lich.csv')])
     assert rc == 2
+
+
+# ------------------------------------------------------------------ Codex code review round 4 (HCC4-4)
+@pytest.mark.parametrize('dt_us,ok_expected', [(0, False), (-1, False), (30000, True)])
+def test_falling_edge_dt_integer_us(tmp_path, dt_us, ok_expected):
+    """HCC4-4 (Codex): dt 0 or -1 us across the edge passed; exactly 30000 us failed by float rounding."""
+    d, _ = make(tmp_path, cho='K2')
+
+    def fn(hdr, body):
+        i0, i1 = run_rows(hdr, body)
+        ct, ca_ = col(hdr, 'timestamp_us'), col(hdr, 'traj_age_ms')
+        shift = int(body[i1][ct]) + dt_us - int(body[i1 + 1][ct])
+        a_shift = (int(body[i1][ca_]) + dt_us // 1000) - int(body[i1 + 1][ca_]) if dt_us > 0 else 3 - (
+            int(body[i1 + 1][ca_]) - int(body[i1][ca_]))
+        for r in body[i1 + 1:]:
+            r[ct] = str(int(r[ct]) + shift)
+            r[ca_] = str(max(200, int(r[ca_]) + a_shift))
+    edit_log(d, fn)
+    ok, ck, _ = checks(d)
+    assert ok['het_han_firmware'] == ok_expected, [c for c in ck if c[0] == 'het_han_firmware']

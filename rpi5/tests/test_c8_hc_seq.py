@@ -599,3 +599,83 @@ def test_84ms_gap_then_send_is_not_aborted():
     sock = EmitSock(clock)
     r, err, out, _ = run_send(segs, clock, sock=sock)
     assert err is None and r['gap_max_ms'] <= 100.0
+
+
+# ------------------------------------------------------------------ Codex code review round 4 (HCC4-1..3)
+class BudgetSock(EmitSock):
+    """Honours settimeout like a real socket: a sendto blocked longer than the timeout raises, nothing is sent."""
+    timeout = None
+
+    def settimeout(self, v):
+        self.timeout = v
+
+    def sendto(self, pkt, addr):
+        d = self.delay.get(len(self.sent), 0.0)
+        if self.timeout is not None and d > self.timeout:
+            self.clock.t += self.timeout
+            self.delay.pop(len(self.sent))
+            import socket as _s
+            raise _s.timeout('timed out')
+        super().sendto(pkt, addr)
+
+
+def test_no_motion_packet_after_the_100ms_budget():
+    """HCC4-1 (Codex): 95 ms after a motion packet, a sendto blocked 10 ms sent another motion packet at 105 ms."""
+    segs = hs.schedule('K2')
+    k_move = hs.first_motion_k(segs)
+    clock = FakeClock(stall={k_move + 20: 0.075})                               # next check 95 ms after the last
+    sock = BudgetSock(clock, delay={k_move + 20: 0.010})                         # the packet right after the stall
+    r, err, out, _ = run_send(segs, clock, sock=sock)
+    moving = [(tm, p) for tm, p in zip(sock.times, sock.sent) if p != (0.0, 0.0, 0.0)]
+    t_prev = [tm for tm, p in moving][:k_move + 21]
+    gaps = [b - a for a, b in zip(t_prev[:-1], t_prev[1:])]
+    assert err is not None and max(gaps) <= hs.GAP_ABORT_S + 1e-9
+
+
+def test_stall_jumping_into_motion_refuses_before_moving():
+    """HCC4-2 (Codex): K2, the wake for k=199 45 ms late jumped to k=201; the car got motion and ran the schedule."""
+    segs = hs.schedule('K2')
+    k_move = hs.first_motion_k(segs)
+    clock = LateClock({k_move - 1: 0.045})
+    sock = FakeSock()
+    _, err, out, _ = run_send(segs, clock, sock=sock)
+    assert err is not None and err.why == 'tre_truoc_chay' and not err.moved
+    assert all(p == (0.0, 0.0, 0.0) for p in sock.sent)
+
+
+def test_stale_log_at_first_motion_packet_refuses():
+    """HCC4-2 (Codex): the log stopped 190 ms before the last check; the first motion packet left 290 ms later."""
+    segs = hs.schedule('K2')
+
+    class R:
+        def __call__(self):
+            return None
+
+        def stale_s(self):
+            return 0.29
+    sock = FakeSock()
+    clock = FakeClock()
+    with pytest.raises(hs.Abort) as ei:
+        hs.send_schedule('1.2.3.4', segs, sock, lambda s: None, clock, clock.sleep, lambda: 1.0e9, ready=R())
+    assert ei.value.why == 'log_cu' and all(p == (0.0, 0.0, 0.0) for p in sock.sent)
+
+
+def test_ctrl_c_right_after_first_motion_packet_is_moved():
+    """HCC4-3 (Codex): Ctrl-C at the clock read right after the first motion sendto reported 'refused' (2)."""
+    segs = hs.schedule('K2')
+    k_move = hs.first_motion_k(segs)
+
+    class C(FakeClock):
+        def __init__(self, sock):
+            super().__init__()
+            self.sock = sock
+
+        def __call__(self):
+            if any(p != (0.0, 0.0, 0.0) for p in self.sock.sent):
+                raise KeyboardInterrupt
+            return self.t
+    sock = FakeSock()
+    clock = C(sock)
+    with pytest.raises(hs.Abort) as ei:
+        hs.send_schedule('1.2.3.4', segs, sock, lambda s: None, clock, clock.sleep, lambda: 1.0e9)
+    assert ei.value.moved and k_move > 0

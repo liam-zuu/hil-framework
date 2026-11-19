@@ -69,6 +69,8 @@ GAP_ABORT_S = 0.100                # a gap between two sends above this aborts (
 SENDTO_MAX_S = 0.020               # one sendto longer than this aborts (HCC1-1); real socket timeout too
 READY_LEAD_S = 0.1                 # the final car-ready check runs this long before the first motion packet (HCC3-1)
 MIN_SPACING_S = 0.010              # DT/2 between the end of a sendto and the next one (HCC3-2)
+BUDGET_MIN_S = 0.001               # less time left than this inside the 100 ms gap budget: abort, no packet (HCC4-1)
+READY_FRESH_S = 0.20               # newest log row at most this old at the first motion packet (HCC4-2)
 READY_ROWS = 20                    # logger rows (~0.2 s at 10 ms) that must show a ready car
 READY_PRIME_K = 25                 # first ready check 0.5 s before the final one; the log must advance between
 READY_ADVANCE = 25                 # log_seq rows the stream must add between the two checks (~50 expected)
@@ -256,8 +258,9 @@ def send_schedule(ip, segs, sock, out, clock=time.monotonic, sleep=time.sleep, w
             if k_now >= total:
                 st['skipped'] += total - st['k']
                 break
-            if k_now > st['k'] and k_now <= k_move and not st['moved']:
-                # HCC3-1: a sample lost while only zeros were sent: refuse before the first motion packet (code 2)
+            if k_now > st['k'] and not st['moved']:
+                # HCC3-1, HCC4-2: a sample lost before any motion packet (also a jump INTO the motion phase):
+                # refuse before the first motion packet (code 2)
                 raise Abort('tre_truoc_chay', k=k_now, bo=k_now - st['k'])
             st['skipped'] += k_now - st['k']
             st['k'] = k = k_now
@@ -301,17 +304,27 @@ def send_schedule(ip, segs, sock, out, clock=time.monotonic, sleep=time.sleep, w
             chk = clock() - t0                           # immediately before sendto
             if chk >= (k + 1) * DT:                      # the cell of sample k is over: choose again (HCC2-1)
                 continue
-            if last_chk is not None and chk - last_chk > GAP_ABORT_S:
+            budget = SENDTO_MAX_S if last_chk is None else min(SENDTO_MAX_S, GAP_ABORT_S - (chk - last_chk))
+            if budget < BUDGET_MIN_S:
+                # HCC4-1: not enough time left to send inside 100 ms of the previous packet: zeros, never motion
                 st['gap_max'] = max(st['gap_max'], chk - last_chk)
                 raise Abort('tre_gui', k=k, gap_ms=f'{(chk - last_chk) * 1000:.1f}')
+            if k >= k_move and not st['moved']:
+                fr = getattr(ready, 'stale_s', None)
+                stale = fr() if callable(fr) else 0.0
+                buf.append(f'#log_moi_truoc_goi_dong,cu_s={stale:.3f}')
+                if stale > READY_FRESH_S:                # HCC4-2: the log must still move at the first motion packet
+                    raise Abort('log_cu', k=k, cu_s=f'{stale:.3f}')
+                st['moved'] = True                       # HCC4-3: set BEFORE the first motion sendto
             try:
+                st_to = getattr(sock, 'settimeout', None)
+                if callable(st_to):
+                    st_to(budget)                        # a sendto blocked past the budget raises: nothing sent
                 sock.sendto(pkt, (ip, TRAJ_PORT))
             except OSError as exc:
                 raise Abort('socket', k=k, loi=str(exc).replace(',', ';'))
             done = clock() - t0
             st['sendto_max'] = max(st['sendto_max'], done - chk)
-            if k >= k_move:
-                st['moved'] = True
             if done - chk > SENDTO_MAX_S:
                 raise Abort('sendto_cham', k=k, ms=f'{(done - chk) * 1000:.1f}')
             if last_chk is not None:
@@ -464,8 +477,38 @@ class ReadyCheck:
     """car_ready() called twice before the first motion packet (HCC2-1): the second call also needs the newest
     log_seq to have moved by READY_ADVANCE since the first one (a logger alive but no longer receiving keeps
     old rows that would pass), and the newest row read within the last 0.2 s of the Pi clock (file mtime)."""
-    def __init__(self, csv_path, clock=time.time):
+    def __init__(self, csv_path, clock=time.time, mono=time.monotonic, poll_s=0.02, thread=True):
         self.csv, self.clock, self.seq = csv_path, clock, None
+        self.mono, self.poll_s = mono, poll_s
+        self._last_seq, self._t_adv = None, None
+        self._stop = None
+        if thread:
+            import threading
+            self._stop = threading.Event()
+            threading.Thread(target=self._watch, daemon=True).start()
+
+    def _poll(self):
+        """One read of the newest log_seq; remembers the monotonic time it last advanced."""
+        try:
+            cols, rows = _tail_rows(self.csv, 4096)
+            seq = int(float(rows[-1].split(',')[cols.index('log_seq')]))
+        except (OSError, ValueError, IndexError):
+            return
+        if seq != self._last_seq:
+            self._last_seq, self._t_adv = seq, self.mono()
+
+    def _watch(self):
+        while not self._stop.is_set():
+            self._poll()
+            self._stop.wait(self.poll_s)
+
+    def stale_s(self):
+        """Seconds since the newest log_seq last advanced (inf before the first row); a memory read (HCC4-2)."""
+        return float('inf') if self._t_adv is None else self.mono() - self._t_adv
+
+    def close(self):
+        if self._stop is not None:
+            self._stop.set()
 
     def __call__(self):
         why = car_ready(self.csv)
@@ -615,6 +658,7 @@ def _attempt(a, segs, d, out, clock, sleep, wall, sock, popen, query, pgrep, rea
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.settimeout(SENDTO_MAX_S)                    # a blocked sendto raises (HCC1-1)
         rd = ready or ReadyCheck(csv_path)
+        own_rd = ready is None
         try:
             moved = True
             r = send_schedule(a.ip, segs, s, say, clock, sleep, wall, alive=lambda: proc.poll() is None,
@@ -626,6 +670,8 @@ def _attempt(a, segs, d, out, clock, sleep, wall, sock, popen, query, pgrep, rea
         finally:
             if own:
                 s.close()
+            if own_rd:
+                rd.close()
         qs = query(a.ip, os.path.join(d, 'gain_query_sau.txt'))
         say(f'#gain_query,when=sau,exit={qs}')
         if qs != 0:

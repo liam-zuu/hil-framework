@@ -274,11 +274,11 @@ def sender_domain(L, i0, i1):
     else:
         if L['log_seq'][i1 + 1] != L['log_seq'][i1] + 1:
             problems.append('ho log_seq o canh ha')
-        dt_e = L['t'][i1 + 1] - L['t'][i1]
-        if dt_e > 0.03:                                   # same tolerance as the windows (gap > 30 ms)
-            problems.append(f'canh ha cach {dt_e * 1000:.0f} ms (> 30 ms)')
-        if abs((age[i1 + 1] - age[i1]) - dt_e * 1000) > 11.0:
-            problems.append(f'tuoi goi qua canh ha {age[i1]:.0f}->{age[i1 + 1]:.0f} ms khong khop dt {dt_e * 1000:.0f} ms')
+        dt_us = int(L['timestamp_us'][i1 + 1]) - int(L['timestamp_us'][i1])      # HCC4-4: integer microseconds
+        if not 0 < dt_us <= 30000:                       # same tolerance as the windows (gap > 30 ms)
+            problems.append(f'canh ha cach {dt_us} us (can 0 < dt <= 30000)')
+        if abs((age[i1 + 1] - age[i1]) - dt_us / 1000.0) > 11.0:
+            problems.append(f'tuoi goi qua canh ha {age[i1]:.0f}->{age[i1 + 1]:.0f} ms khong khop dt {dt_us} us')
         if L['traj_age_ms'][i1 + 1] < EXPIRY_MS:
             problems.append(f"canh ha khi traj_age {L['traj_age_ms'][i1 + 1]:.0f} ms < 200")
     if i1 <= j_s or age[i1] < EXPIRY_MS - EXPIRY_SLACK_S * 1000:
