@@ -29,10 +29,20 @@ What it gives (names as in design 4b, C8B4R2-5, C8B4R3-3):
 Not seen (limits, design 4b): smooth errors absorbed by the fits, a common phase error in heading and tangential
 position, errors that do not change with speed (test 2), vibration and tilt of the real car.
 
-Checks (design 4b "Kiem ga"): the slowest part: (A) the centre still within GA_TOL_M (2 mm), (B) the radius constant
-within 2 mm; else the set-up must be redone (ga_ok false, numbers not used).
+Checks (design 4b "Kiem ga"; v2: after a geometric model of the slowest part, C8B design C8b tuong doi v6 section 5a,
+Liam 19/11 at CODE local_6653c962 "keu C8b lam luon di"): the residual of the slowest part after the model within
+GA_TOL_M (2 mm), both in the fit and held out (the slowest part split in two by time, each half fitted and checked
+on the other); else ga_ok false, numbers not used.
+  (A) the tag centre is c0 + R(psi) q (c0: the axis on the floor, q: the tag centre from the axis in the tag frame;
+      the tag cannot be placed on the axis to better than about 1.5 mm, so v1, which asked a fixed point, failed on
+      geometry). q must be identified: the headings of the slowest part spread (1 - |mean e^(i psi)| >= Q_SPREAD_MIN).
+      The position part p_dev is the residual after the same model (c0, q from the slowest part).
+  (B) the radius is R0 + first and second harmonics of the angle (centre offset, ellipse) + a linear drift in time.
+      The radial part rad_dev keeps the drift (model without the drift term): an unexplained drift stays in the error.
+  The v1 numbers are kept as *_tho_m. An optional clip of the tag on the axis (--frames-a-cheo, "A cu") is analysed
+  the same way as a cross-check of the axis model only (its heading oscillation is not used: jerky hand spin).
 
-  python tools/c8b_3b.py --frames-a A/frames.csv --frames-b B/frames.csv --out 3b.json
+  python tools/c8b_3b.py --frames-a A/frames.csv --frames-b B/frames.csv [--frames-a-cheo Acu/frames.csv] --out 3b.json
 Last line: #ket_qua,ma=0,ga_ok=1|0,alpha_dung=1|0 / 2 refused or error.
 """
 from __future__ import annotations
@@ -52,9 +62,10 @@ for _p in (os.path.join(HERE, '..', 'rpi5'), os.path.join(HERE, '..', 'fwsim'), 
         sys.path.insert(0, _p)
 import c8_u_imu as cu                                                    # noqa: E402
 
-VERSION = 'c8b_3b_v1'
+VERSION = 'c8b_3b_v2'
 LE = 1.25
-GA_TOL_M = 0.002            # design 4b "Kiem ga"
+GA_TOL_M = 0.002            # design 4b "Kiem ga" (kept, CODE 19/11)
+Q_SPREAD_MIN = 0.10         # [DE XUAT] (A) q is identified when 1 - |mean e^(i psi)| over the fitted frames >= 0.10
 WIN_S = 0.5                 # design 4b (A): smooth fit over 0.5 s
 SLOW_SHARE = 0.10           # the slowest part: the 10 % of the moving frames with the smallest |Omega| [DE XUAT]
 SLOW_MIN = 30               # at least 30 frames in the slowest part
@@ -135,6 +146,72 @@ def slowest(om):
     return idx[np.argsort(np.abs(om[idx]))[:k]]
 
 
+# ── geometric models of the slowest part (v2) ─────────────────────────────────────────────────────
+
+def halves(t, idx):
+    """The fitted frames split in two by time (first half, second half of idx sorted by t)."""
+    s = idx[np.argsort(t[idx])]
+    h = len(s) // 2
+    return s[:h], s[h:]
+
+
+def axis_fit(x, y, psi, idx):
+    """(A) tag centre = c0 + R(psi) q, linear least squares on the frames idx. Returns c0, q, spread
+    (1 - |mean e^(i psi)|) and whether q is identified."""
+    c, s = np.cos(psi[idx]), np.sin(psi[idx])
+    A = np.zeros((2 * len(idx), 4))
+    A[0::2, 0] = 1
+    A[1::2, 1] = 1
+    A[0::2, 2], A[0::2, 3] = c, -s
+    A[1::2, 2], A[1::2, 3] = s, c
+    b = np.empty(2 * len(idx))
+    b[0::2], b[1::2] = x[idx], y[idx]
+    th, *_ = np.linalg.lstsq(A, b, rcond=None)
+    spread = float(1.0 - abs(np.mean(np.exp(1j * psi[idx]))))
+    return th[:2], th[2:], spread, bool(spread >= Q_SPREAD_MIN)
+
+
+def axis_res(x, y, psi, c0, q):
+    """|tag centre - (c0 + R(psi) q)| per frame."""
+    c, s = np.cos(psi), np.sin(psi)
+    return np.hypot(x - (c0[0] + c * q[0] - s * q[1]), y - (c0[1] + s * q[0] + c * q[1]))
+
+
+def radius_design(th, t, tm, drift=True):
+    cols = [np.ones_like(th), np.cos(th), np.sin(th), np.cos(2 * th), np.sin(2 * th)]
+    if drift:
+        cols.append(t - tm)
+    return np.column_stack(cols)
+
+
+def radius_fit(r, th, t, idx):
+    """(B) radius = R0 + harmonics 1, 2 of the angle + a linear drift in time, on the frames idx."""
+    tm = float(np.mean(t[idx]))
+    co, *_ = np.linalg.lstsq(radius_design(th[idx], t[idx], tm), r[idx], rcond=None)
+    return co, tm
+
+
+def radius_res(r, th, t, co, tm, drift=True):
+    if drift:
+        return r - radius_design(th, t, tm) @ co
+    return r - radius_design(th, t, tm, drift=False) @ co[:5]
+
+
+def held_out(fit, res, t, idx):
+    """Largest residual of each half of idx when the model is fitted on the other half; None when a half is too
+    small (< SLOW_MIN / 2) or (A) its q is not identified."""
+    a, b = halves(t, idx)
+    if min(len(a), len(b)) < SLOW_MIN // 2:
+        return None, 'a half of the slowest part has too few frames'
+    worst = 0.0
+    for f_, e_ in ((a, b), (b, a)):
+        m = fit(f_)
+        if m is None:
+            return None, 'q not identified on a half of the slowest part'
+        worst = max(worst, float(np.max(res(m, e_))))
+    return worst, ''
+
+
 # ── (A) tag centre on the axis ────────────────────────────────────────────────────────────────────
 
 def analyse_a(F, wz_max):
@@ -142,8 +219,26 @@ def analyse_a(F, wz_max):
     om = rate(t, psi)
     sl = slowest(om)
     px, py = float(np.median(x[sl])), float(np.median(y[sl]))
-    dev_sl = float(np.max(np.hypot(x[sl] - px, y[sl] - py)))
-    dev = np.hypot(x - px, y - py)
+    dev_tho = float(np.max(np.hypot(x[sl] - px, y[sl] - py)))          # v1 check (fixed point), kept for reference
+    dev_tho_all = np.hypot(x - px, y - py)
+    c0, q, spread, q_ok = axis_fit(x, y, psi, sl)
+    dev_sl = float(np.max(axis_res(x[sl], y[sl], psi[sl], c0, q)))
+
+    def _fit(i):
+        c_, q_, _, ok_ = axis_fit(x, y, psi, i)
+        return (c_, q_) if ok_ else None
+    dev_ho, why_ho = held_out(_fit, lambda m, i: axis_res(x[i], y[i], psi[i], *m), t, sl)
+    why = []
+    if not q_ok:
+        why.append(f'q not identified: heading spread {spread:.3f} < {Q_SPREAD_MIN}')
+    if dev_ho is None:
+        why.append(why_ho)
+    if dev_sl > GA_TOL_M:
+        why.append(f'residual {dev_sl * 1e3:.2f} mm > {GA_TOL_M * 1e3:.0f} mm')
+    if dev_ho is not None and dev_ho > GA_TOL_M:
+        why.append(f'held-out residual {dev_ho * 1e3:.2f} mm > {GA_TOL_M * 1e3:.0f} mm')
+    ga_ok = not why
+    dev = axis_res(x, y, psi, c0, q)
     use = np.isfinite(om) & (np.abs(om) > MOVE_RAD_S) & (np.abs(om) <= CAP * wz_max)
     # heading residual after a quadratic over every 0.5 s window (step a quarter window)
     res_max, bands, n_win, win_rates = 0.0, [], 0, []
@@ -166,11 +261,16 @@ def analyse_a(F, wz_max):
         t0 += WIN_S / 4
     cov_h = coverage(np.array(win_rates), wz_max)           # the heading windows used, each direction
     cov_p = coverage(om[use], wz_max)                        # the position frames used, each direction
-    return dict(fixed_point=[px, py], slow_n=int(len(sl)), slow_rate_rad_s=float(np.median(np.abs(om[sl]))),
-                ga_dev_m=dev_sl, ga_ok=bool(dev_sl <= GA_TOL_M), du_phu=cov_h['ok'] and cov_p['ok'],
+    return dict(fixed_point=[float(c0[0]), float(c0[1])], q_m=[float(q[0]), float(q[1])],
+                q_abs_m=float(np.hypot(*q)), q_spread=spread, q_nhan_dang=q_ok,
+                slow_n=int(len(sl)), slow_rate_rad_s=float(np.median(np.abs(om[sl]))),
+                ga_dev_m=dev_sl, ga_dev_giu_ngoai_m=dev_ho, ga_ok=ga_ok, ga_why=why,
+                ga_dev_tho_m=dev_tho, fixed_point_tho=[px, py],
+                du_phu=cov_h['ok'] and cov_p['ok'],
                 phu=dict(huong=cov_h, vi_tri=cov_p), n_win=n_win,
                 psi_osc_deg=math.degrees(res_max) if n_win else None,
                 p_dev_m=float(np.max(dev[use])) if use.any() else None,
+                p_dev_tho_m=float(np.max(dev_tho_all[use])) if use.any() else None,
                 rate_max_rad_s=float(np.nanmax(np.abs(om))), n_used=int(use.sum()),
                 by_rate=_binned(bands))
 
@@ -308,13 +408,27 @@ def analyse_b(F, v_max, wz_max, frame_s):
     th = np.unwrap(np.arctan2(y - cy, x - cx))
     om = rate(t, th)
     r = np.hypot(x - cx, y - cy)
-    ga_dev = float(np.max(np.abs(r[sl] - R0)))
+    ga_dev_tho = float(np.max(np.abs(r[sl] - R0)))                     # v1 check, kept for reference
+    co, tm = radius_fit(r, th, t, sl)
+    ga_dev = float(np.max(np.abs(radius_res(r[sl], th[sl], t[sl], co, tm))))
+    ga_ho, why_ho = held_out(lambda i: radius_fit(r, th, t, i),
+                             lambda m, i: np.abs(radius_res(r[i], th[i], t[i], *m)), t, sl)
+    why = []
+    if ga_ho is None:
+        why.append(why_ho)
+    if ga_dev > GA_TOL_M:
+        why.append(f'residual {ga_dev * 1e3:.2f} mm > {GA_TOL_M * 1e3:.0f} mm')
+    if ga_ho is not None and ga_ho > GA_TOL_M:
+        why.append(f'held-out residual {ga_ho * 1e3:.2f} mm > {GA_TOL_M * 1e3:.0f} mm')
     phi = psi - th
     phi_sl = float(np.median(phi[sl]))
     v_t = np.abs(om) * R0
     use_p = np.isfinite(om) & (np.abs(om) > MOVE_RAD_S) & (v_t <= CAP * v_max)
     cov = coverage(om[use_p] * R0, v_max)          # the frames used: tangential speed up to v_max, each direction
-    rad_dev = float(np.max(np.abs(r[use_p] - R0))) if use_p.any() else None
+    # radial part after the circle + harmonics, the drift left in (an unexplained drift stays in the error)
+    rad_err = np.abs(radius_res(r, th, t, co, tm, drift=False))
+    rad_dev = float(np.max(rad_err[use_p])) if use_p.any() else None
+    rad_dev_tho = float(np.max(np.abs(r[use_p] - R0))) if use_p.any() else None
     hp_dev = float(np.max(np.abs(phi[use_p] - phi_sl))) if use_p.any() else None
     # rolling shutter: one alpha over all spinning frames, and one per speed band x direction (pieces and
     # harmonics shared: within one band the rate hardly changes, so a band alone cannot tell the shutter term from
@@ -371,7 +485,11 @@ def analyse_b(F, v_max, wz_max, frame_s):
     env_c = max([abs(whole['alpha_c_s_px'])] + [abs(d['alpha_c_s_px']) for d in subsets]) if whole else None
     rows = F['row'][spin]
     return dict(centre=[cx, cy], R0_m=R0, slow_n=int(len(sl)), slow_rate_rad_s=float(np.median(np.abs(om[sl]))),
-                ga_dev_m=ga_dev, ga_ok=bool(ga_dev <= GA_TOL_M), du_phu=cov['ok'], phu=cov, rad_dev_m=rad_dev,
+                ga_dev_m=ga_dev, ga_dev_giu_ngoai_m=ga_ho, ga_ok=not why, ga_why=why, ga_dev_tho_m=ga_dev_tho,
+                mo_hinh_ban_kinh=dict(R0_m=float(co[0]), bac1_m=float(np.hypot(co[1], co[2])),
+                                      elip_m=float(np.hypot(co[3], co[4])), troi_m_s=float(co[5]),
+                                      troi_phan_cham_m=float(co[5] * (np.max(t[sl]) - np.min(t[sl])))),
+                du_phu=cov['ok'], phu=cov, rad_dev_m=rad_dev, rad_dev_tho_m=rad_dev_tho,
                 hp_dev_deg=math.degrees(hp_dev) if hp_dev is not None else None,
                 rate_max_rad_s=float(np.nanmax(np.abs(om))), v_t_max_m_s=float(np.nanmax(v_t)),
                 row_span_px=[float(np.nanmin(rows)), float(np.nanmax(rows))] if len(rows) else None,
@@ -384,7 +502,20 @@ def analyse_b(F, v_max, wz_max, frame_s):
                              mot_khung_s=frame_s))
 
 
-def analyse(fa, fb, task='O1-F08'):
+def cross_check(fc, a, wz_max):
+    """The tag on the axis ("A cu"): the same axis model, as a check of the model only (q small, residual within
+    GA_TOL_M); its heading oscillation and position parts are not used. Axis distance to A: information only (the
+    set-up may have moved between the clips)."""
+    c = analyse_a(read(fc), wz_max)
+    return dict(file=os.path.basename(fc), q_abs_m=c['q_abs_m'], q_nhan_dang=c['q_nhan_dang'], ga_dev_m=c['ga_dev_m'],
+                ga_dev_giu_ngoai_m=c['ga_dev_giu_ngoai_m'], ga_dev_tho_m=c['ga_dev_tho_m'], ga_ok=c['ga_ok'],
+                ga_why=c['ga_why'], fixed_point=c['fixed_point'],
+                truc_lech_A_m=float(np.hypot(c['fixed_point'][0] - a['fixed_point'][0],
+                                             c['fixed_point'][1] - a['fixed_point'][1])),
+                ghi_chu='kiem cheo mo hinh truc; khong dung lam can huong hay vi tri')
+
+
+def analyse(fa, fb, task='O1-F08', fc=None):
     from o1_feasibility import Schedule
     from o1_tasks import FIG8
     import o1_gate
@@ -394,6 +525,7 @@ def analyse(fa, fb, task='O1-F08'):
     frame_s = float(np.median(np.diff(B['t'])))
     a = analyse_a(A, wz_max)
     b = analyse_b(B, v_max, wz_max, frame_s)
+    cheo = cross_check(fc, a, wz_max) if fc else None
     ga_ok = a['ga_ok'] and b['ga_ok']
     # C8BS-10: every part measured over the required rates and both ways, else no number (nothing replaced by 0)
     parts_psi = [a['psi_osc_deg'], b['hp_dev_deg']]
@@ -402,7 +534,8 @@ def analyse(fa, fb, task='O1-F08'):
                                 ('A dao dong huong', parts_psi[0] is not None), ('B huong-vi tri', parts_psi[1] is not None),
                                 ('A vi tri', parts_p[0] is not None), ('B ban kinh', parts_p[1] is not None)) if not ok_]
     usable = ga_ok and not thieu
-    return dict(version=VERSION, task_rates=task, v_max=v_max, wz_max=wz_max, A=a, B=b, ga_ok=ga_ok, thieu=thieu,
+    return dict(version=VERSION, task_rates=task, v_max=v_max, wz_max=wz_max, A=a, B=b, A_cheo=cheo,
+                ga_ok=ga_ok, thieu=thieu,
                 dung_duoc=usable,
                 d_psi_quay_deg=max(parts_psi) if usable else None,
                 d_p_quay_m=max(parts_p) if usable else None,
@@ -428,12 +561,14 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--frames-a', required=True)
     ap.add_argument('--frames-b', required=True)
+    ap.add_argument('--frames-a-cheo', default=None, help='tag on the axis ("A cu"): cross-check of the axis model')
     ap.add_argument('--task', default='O1-F08', help='level whose command peaks limit the rates (design 4b: F08)')
     ap.add_argument('--out', required=True)
     a = ap.parse_args(argv)
     try:
-        out = analyse(a.frames_a, a.frames_b, a.task)
-        out['nguon'] = [dict(file=os.path.basename(p), sha256=cu.sha256(p)) for p in (a.frames_a, a.frames_b)]
+        out = analyse(a.frames_a, a.frames_b, a.task, a.frames_a_cheo)
+        out['nguon'] = [dict(vai=v, file=os.path.basename(p), sha256=cu.sha256(p))
+                        for v, p in (('A', a.frames_a), ('B', a.frames_b), ('A_cheo', a.frames_a_cheo)) if p]
         out['script'] = cu.script_state()
         cu.check_path(a.out)
         with open(a.out, 'x', encoding='utf-8') as f:
@@ -443,8 +578,12 @@ def main(argv=None):
         print('#ket_qua,ma=2')
         return 2
     sh = out['B']['shutter']
-    print(f'ga_ok {out["ga_ok"]}; thieu {out["thieu"]}; d_psi_quay {out["d_psi_quay_deg"]} deg; d_p_quay {out["d_p_quay_m"]} m; '
+    print(f'ga_ok {out["ga_ok"]} (A {out["A"]["ga_why"] or "dat"}; B {out["B"]["ga_why"] or "dat"}); '
+          f'thieu {out["thieu"]}; d_psi_quay {out["d_psi_quay_deg"]} deg; d_p_quay {out["d_p_quay_m"]} m; '
           f'alpha {"dung" if sh["use_alpha"] else "khong dung: " + sh["why"]}')
+    if out['A_cheo'] is not None:
+        c = out['A_cheo']
+        print(f'A cheo: ga_ok {c["ga_ok"]}, |q| {c["q_abs_m"] * 1e3:.2f} mm, ga_dev {c["ga_dev_m"] * 1e3:.2f} mm')
     print(f'#ket_qua,ma=0,ga_ok={int(out["ga_ok"])},alpha_dung={int(sh["use_alpha"])}')
     return 0
 
