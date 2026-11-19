@@ -265,24 +265,35 @@ def test_check_moc_refuses(scene, bad):
 
 
 def _own():
-    return dict(P1=dict(bo_nhom_max_m=0.0034, tung_khung_max_m=0.003), moc_dich=dict(nguong_m=0.001, u_so_m=0.0003),
+    return dict(P1=dict(bo_nhom_max_m=0.0034, tung_khung_max_m=0.003),
                 A3=dict(max_deg=0.15, rms_deg=0.07), P7=dict(lech_max_m=0.0006), A5=dict(lech_max_deg=0.4),
                 _src=('kc.json', 'a' * 64))
+
+
+def _moc_dich(**over):
+    """The U_moc block of CODE_CAM as c8b_u v3 (198d2e9) reads it."""
+    b = dict(U_moc_xy_m=0.0012, U_moc_psi_deg=0.05, phuong_phap_duyet='Liam 19/11 (test)', tien_de_buoi='dat',
+             nguon=dict(frames={'r1': 'a' * 64}, lich='1' * 64, tap_moc='2' * 64, u_so='5' * 64, session='0' * 64,
+                        car_pose=dict(tag_offset=None, side_m=0.1445, h_m=0.12), bo_lay_mau='c7_u_moc_test'))
+    b.update(over)
+    return b
 
 
 def _parts():
     blocks = dict(P3=dict(vi_tri_max_m=0.001), A2=dict(goc_max_deg=0.3), than_dich=dict(ghi='thong tin'),
                   day_doi=dict(dn_m=0.01, dzc_m=0.02, kappa=0.12 / 2.632), do_cao=dict(rho_max_m=1.6, H_m=2.632, h_m=0.12),
-                  bo_cham=dict(tag_offset=None, side_m=0.1445))
+                  bo_cham=dict(tag_offset=None, side_m=0.1445), moc_dich=_moc_dich())
     return {n: (b, f'{n}.json', 'b' * 64) for n, b in blocks.items()}
 
 
 def test_build_cam_u_ok():
     out = kc.build_cam_u(_own(), _parts())
-    assert out['version'] == 'c8_cam_u_vao_v2'
+    assert out['version'] == 'c8_cam_u_vao_v3'
+    assert out['moc_dich']['nguon']['u_so'] == '5' * 64            # CAM's sources are kept, not replaced
     assert set(out) - {'version', 'nguon'} == set(kc.CAM_BLOCKS)
     assert {n['khoi'] for n in out['nguon']} == set(kc.CAM_BLOCKS)
     assert all('nguon' in out[b] for b in kc.CAM_BLOCKS)
+    assert 'moc_dich' not in kc.OWN_BLOCKS
     assert out['bo_cham']['tag_offset'] is None
 
 
@@ -337,7 +348,7 @@ def test_c8b_u_reads_the_export():
     xo = {"version": "c8b_xoay_v1", "q_tag_m": [0.003, -0.004], "du_m": 0.0007}
     tb = dict(ga_ok=True, d_p_quay_m=0.0007, d_psi_quay_deg=0.25)
     up, p, upsi, s = CU.u_p_u_psi(cam, tb, tk, xo)
-    assert p['P1_anh_san'] == pytest.approx(max(0.0034, 0.003) + 0.001 + 2 * 0.0003)
+    assert p['P1_anh_san'] == pytest.approx(max(0.0034, 0.003) + 0.0012)          # v3: + U_moc_xy_m of CODE_CAM
     assert s['A3_huong_vung'] == pytest.approx(0.16) and s['A5_nhieu_khung'] == pytest.approx(0.4)
     assert p['P7_nhieu_khung'] == pytest.approx(0.0006)
 
@@ -402,6 +413,7 @@ def test_regression_trial_16_11():
 def _kc_file(tmp_path, **over):
     kcres = dict(version=kc.VERSION, buoi='C8_x', model='B1', nhom=[[1, 5], [2, 6]], thu=False,
                  sessions={n: dict(file=n, sha256='0' * 64) for n in kc.CLIPS_REQUIRED},
+                 moc_dich=dict(nguong_m=0.001, u_so_m=0.0003, buoi='C8_x'),
                  **{b: dict(blk, buoi='C8_x') for b, blk in _own().items() if b != '_src'})
     kcres.update(u_so_sha256='5' * 64, moc=[dict(file='moc.csv', sha256='6' * 64)], hang_so_sha256='4' * 64)
     kcres.update(over)
@@ -410,16 +422,26 @@ def _kc_file(tmp_path, **over):
     return p
 
 
-def _xuat_args(tmp_path, kcp, tk_over=None, part_buoi='C8_x', buoi='C8_x'):
+def _xuat_args(tmp_path, kcp, tk_over=None, part_buoi='C8_x', buoi='C8_x', td_over=None, md_over=None):
     tk = dict(version=kc.TUNG_KHUNG_VERSION, buoi='C8_x', model='B1', nhom=[[1, 5], [2, 6]], cham_lai=True,
               tung_khung_max_m=0.003, kiem_cheo_sha256=kc.sha256_file(str(kcp)), u_so_sha256='5' * 64,
               session_sha256='0' * 64, moc=[dict(file='moc.csv', sha256='6' * 64)], hang_so_sha256='4' * 64,
-              hoan_tat=True, luot_chua_co=[], mau_thuan=[], luot_thieu=['r3'])
+              hoan_tat=True, luot_chua_co=[], mau_thuan=[], luot_thieu=['r3'], luot_thieu_neo=[])
     tk.update(tk_over or {})
     tkp = tmp_path / 'tk.json'
     tkp.write_text(json.dumps(tk), encoding='utf-8')
-    args = ['xuat', '--buoi', buoi, '--kiem-cheo', str(kcp), '--tung-khung', str(tkp), '--out', str(tmp_path / 'o.json')]
+    td = dict(format='tien_de_buoi_v1', session_id='C8_x', ket_qua='dat',
+              sha256=dict(kiem_cheo=kc.sha256_file(str(kcp)), u_so='5' * 64))
+    td.update(td_over or {})
+    tdp = tmp_path / 'td.json'
+    tdp.write_text(json.dumps(td), encoding='utf-8')
+    mdp = tmp_path / 'md.json'
+    mdp.write_text(json.dumps(dict(_moc_dich(**(md_over or {})), buoi='C8_x')), encoding='utf-8')
+    args = ['xuat', '--buoi', buoi, '--kiem-cheo', str(kcp), '--tung-khung', str(tkp), '--out', str(tmp_path / 'o.json'),
+            '--tien-de', str(tdp), '--moc-dich', str(mdp)]
     for n, (blk, _, _) in _parts().items():
+        if n == 'moc_dich':
+            continue
         q = tmp_path / f'{n}.json'
         q.write_text(json.dumps(dict(blk, buoi=part_buoi)), encoding='utf-8')
         args += ['--phan', f'{n}={q}']
@@ -429,8 +451,26 @@ def _xuat_args(tmp_path, kcp, tk_over=None, part_buoi='C8_x', buoi='C8_x'):
 def test_xuat_ok(tmp_path):
     assert kc.main(_xuat_args(tmp_path, _kc_file(tmp_path))) == 0
     out = json.loads((tmp_path / 'o.json').read_text(encoding='utf-8'))
-    assert out['P1']['tung_khung_max_m'] == 0.003 and out['version'] == 'c8_cam_u_vao_v2'
+    assert out['P1']['tung_khung_max_m'] == 0.003 and out['version'] == 'c8_cam_u_vao_v3'
     assert out['P1']['luot_thieu_kiem'] == ['r3']                     # KCC1-11: runs short of checks stay marked
+    md = out['moc_dich']                                             # S8-6: CAM's U_moc + tien_de, u_so as information
+    assert md['U_moc_xy_m'] == 0.0012 and md['tien_de_buoi'] == 'dat' and md['u_so_kiem_cheo']['u_so_m'] == 0.0003
+
+
+@pytest.mark.parametrize('bad', ['td_format', 'td_session', 'td_kc_sha', 'td_u_so', 'md_u_so', 'md_no_lich',
+                                 'md_tien_de_other', 'md_no_method', 'tk_thieu_neo'])
+def test_xuat_v3_moc_dich_must_chain(tmp_path, bad):
+    """S8-6: the tien_de and the U_moc block must be of this kiem_cheo result; anchors missing in a run refused."""
+    kcp = _kc_file(tmp_path)
+    td = {'td_format': dict(format='x'), 'td_session': dict(session_id='C8_y'), 'td_kc_sha': dict(sha256=dict(
+        kiem_cheo='f' * 64, u_so='5' * 64)), 'td_u_so': dict(sha256=dict(kiem_cheo=kc.sha256_file(str(kcp)), u_so='7' * 64))}
+    md = {'md_u_so': dict(nguon=dict(_moc_dich()['nguon'], u_so='7' * 64)),
+          'md_no_lich': dict(nguon={k: v for k, v in _moc_dich()['nguon'].items() if k != 'lich'}),
+          'md_tien_de_other': dict(tien_de_buoi='thieu_du_lieu'), 'md_no_method': dict(phuong_phap_duyet=None)}
+    args = _xuat_args(tmp_path, kcp, tk_over=dict(luot_thieu_neo=['r2']) if bad == 'tk_thieu_neo' else None,
+                      td_over=td.get(bad), md_over=md.get(bad))
+    assert kc.main(args) == 2
+    assert not (tmp_path / 'o.json').exists()
 
 
 @pytest.mark.parametrize('bad', ['thu', 'no_Hm', 'tk_buoi', 'tk_nhom', 'tk_model', 'tk_sha', 'tk_not_rescored',
@@ -645,7 +685,7 @@ def test_tung_khung_contradiction_at_a_later_clip(tmp_path):
     args, out = _tk_setup(tmp_path, theo={'H_m': dict(rieng_m={'5': 0.0020, '6': 0.0005})})
     assert kc.main(args) == 0
     t = json.loads(out.read_text(encoding='utf-8'))
-    assert t['mau_thuan'] == [dict(clip='H_m', moc=5)] and not t['hoan_tat']
+    assert t['mau_thuan'] == [dict(luot='r1', clip='H_m', moc=5)] and not t['hoan_tat']
 
 
 def test_session_groups_must_partition_the_fit_marks():
@@ -732,7 +772,7 @@ def test_tung_khung_contradiction_needs_the_chain_xe_schedule(tmp_path):
     (d / 'track.json').write_text(json.dumps(tr), encoding='utf-8')
     assert kc.main(args) == 0
     t = json.loads(out.read_text(encoding='utf-8'))
-    assert t['mau_thuan'] == [dict(clip='H_m', moc=5)]
+    assert t['mau_thuan'] == [dict(luot='r1', clip='H_m', moc=5)]
 
 
 def _fake_session(tmp_path, name, img, marks, video):
@@ -945,7 +985,7 @@ def test_phan_tich_writes_the_converted_a3(tmp_path, scene, monkeypatch):
     monkeypatch.setattr(kc, 'clip_dets', lambda v, ids, max_frames=None: ([k / 60 for k in range(20)], [img] * 20))
     assert kc.main(_phan_tich_args(tmp_path, scene)) == 0
     r = json.loads((tmp_path / 'kc' / 'kiem_cheo.json').read_text(encoding='utf-8'))
-    assert r['A3']['quy_ve_ma_noc'] is True and 'gap_max_deg' in r['A3'] and r['version'] == 'c7_kiem_cheo_v6'
+    assert r['A3']['quy_ve_ma_noc'] is True and 'gap_max_deg' in r['A3'] and r['version'] == 'c7_kiem_cheo_v7'
     head = (tmp_path / 'kc' / 'a3_cap.csv').read_text(encoding='utf-8').splitlines()[0]
     assert 'quy_deg' in head and 'gap_deg' in head
 
@@ -1012,3 +1052,404 @@ def test_xuat_converted_a3_ok_and_flag_only_after_approval(tmp_path, monkeypatch
     monkeypatch.setattr(kc, 'A3_QUY_DUYET', True)
     kcp = _kc_file(t2, A3=dict(_a3_conv(quy_ve_ma_noc=True), buoi='C8_x'))
     assert kc.main(_xuat_args(t2, kcp)) == 0
+
+
+# ---------------------------------------------------------------- design v6 S8 (CODE_KIEMCHEO phien 3, 19/11)
+class _MapCam:
+    """A camera whose floor map is the true one followed by xy -> A xy + t (a map error with the tape fixed)."""
+
+    def __init__(self, cam, A, t=(0.0, 0.0)):
+        self.cam, self.A, self.t = cam, np.asarray(A, float), np.asarray(t, float)
+
+    def pix2floor(self, uv, z=0.0):
+        return self.cam.pix2floor(uv, z) @ self.A.T + self.t
+
+    def project(self, P):
+        P = np.array(P, float)
+        P[:, :2] = (P[:, :2] - self.t) @ np.linalg.inv(self.A).T
+        return self.cam.project(P)
+
+
+class _FakePC:
+    """PairCams stand-in: the full camera for (), `held` for any left-out set."""
+
+    def __init__(self, img, full, held):
+        self.img, self.ids, self.full, self.held = img, sorted(img), full, held
+
+    def __call__(self, out=()):
+        return self.full if not out else self.held
+
+
+def _rotm(deg):
+    a = math.radians(deg)
+    return np.array([[math.cos(a), -math.sin(a)], [math.sin(a), math.cos(a)]])
+
+
+def test_read_plan_events_and_runs(tmp_path):
+    """TD2-2: events keep the clips H, runs do not; order shape checked (TD1-3)."""
+    p = tmp_path / 'plan.txt'
+    p.write_text('# ke hoach\nluot\nH_a\nH_b\nR1\nH_m\nR2\nH_z\n', encoding='utf-8')
+    ev, runs = kc.read_plan(str(p))
+    assert ev == ['H_a', 'H_b', 'R1', 'H_m', 'R2', 'H_z'] and runs == ['R1', 'R2']
+    assert kc.plan_order_problems(ev) == []
+    assert kc.plan_order_problems(['H_a', 'R1', 'H_b', 'H_m', 'R2', 'H_z'])
+    assert kc.plan_order_problems(['H_a', 'H_b', 'H_m', 'R1', 'R2', 'H_z'])           # H_m not between runs
+    assert kc.plan_order_problems(['H_a', 'H_b', 'R1', 'H_m', 'H_z', 'R2'])
+    assert kc.plan_order_problems(['H_a', 'H_b', 'R1', 'R2', 'H_z']) == ['thieu H_m']
+    p.write_text('H_a\nH_b\n', encoding='utf-8')
+    with pytest.raises(kc.KCError):
+        kc.read_plan(str(p))
+
+
+def _tk_two(tmp_path, r2_frames=None, r1_loai=None, same_dir=False, theo=None):
+    """Two runs r1, r2 of one plan, the shared kiem_cheo / u_so of _tk_setup."""
+    args, out = _tk_setup(tmp_path, theo=theo)
+    plan = tmp_path / 'plan.txt'
+    plan.write_text('H_a\nH_b\nr1\nH_m\nr2\nH_z\n', encoding='utf-8')
+    d1 = tmp_path / 'r1'
+    tr = json.loads((d1 / 'track.json').read_text(encoding='utf-8'))
+    if r1_loai:
+        tr.update(moc_loai=r1_loai, cham_lai=2)
+        (d1 / 'track.json').write_text(json.dumps(tr), encoding='utf-8')
+    d2 = tmp_path / 'r2'
+    d2.mkdir()
+    _write_csv(d2 / 'frames.csv', r2_frames if r2_frames is not None else _frames(invalid={7}))
+    _write_csv(d2 / 'kiem_cheo_khung.csv', _khung())
+    tr2 = dict(tr, moc_loai=[], cham_lai=1, frames_sha256=kc.sha256_file(str(d2 / 'frames.csv')),
+               kiem_cheo_khung_sha256=kc.sha256_file(str(d2 / 'kiem_cheo_khung.csv')))
+    (d2 / 'track.json').write_text(json.dumps(tr2), encoding='utf-8')
+    args += ['--luot', f'r2={d1 if same_dir else d2}']
+    return args, out
+
+
+def test_tung_khung_contradiction_is_per_run(tmp_path):
+    """TD1-2: r1 excluded mark 5 (chain xe) from its first frame, r2 kept it as an anchor: only r2 contradicts; the
+    exclusion of one run does not clear another."""
+    args, out = _tk_two(tmp_path, r1_loai=[dict(chuoi='xe', id=5, t_bd=0.0)],
+                        theo={'H_z': dict(rieng_m={'5': 0.0020, '6': 0.0005})})
+    assert kc.main(args) == 0
+    t = json.loads(out.read_text(encoding='utf-8'))
+    assert t['mau_thuan'] == [dict(luot='r2', clip='H_z', moc=5)] and not t['hoan_tat']
+    assert t['ke_hoach']['su_kien'][0] == 'H_a' and t['ke_hoach']['luot'] == ['r1', 'r2']
+    assert os.path.isabs(t['luot']['r2']['duong_dan']['frames']) and t['version'] == 'c7_tung_khung_v4'
+    # a run that excluded the mark only later still used it before: a contradiction
+    assert kc.run_contradictions(_frames(), dict(moc_loai=[dict(chuoi='xe', id=5, t_bd=0.5)]), {5}) == [5]
+
+
+def test_tung_khung_unique_frames_and_dirs(tmp_path):
+    """TD1-6: the same directory or the same frames.csv for two runs is refused."""
+    args, out = _tk_two(tmp_path, same_dir=True)
+    assert kc.main(args) == 2 and not out.exists()
+    t2 = tmp_path / 'b'
+    t2.mkdir()
+    args, out = _tk_two(t2, r2_frames=_frames())                     # byte-identical to r1's frames.csv
+    assert kc.main(args) == 2 and not out.exists()
+
+
+def test_tung_khung_missing_anchor_columns_is_data_missing(tmp_path):
+    """TD2-1: frames.csv without moc_neo columns: the run is written with thieu_du_lieu_neo, not refused."""
+    fr = [{k: v for k, v in r.items() if not k.startswith('moc_')} for r in _frames(invalid={9})]
+    args, out = _tk_two(tmp_path, r2_frames=fr)
+    assert kc.main(args) == 0
+    t = json.loads(out.read_text(encoding='utf-8'))
+    assert t['luot']['r2']['thieu_du_lieu_neo'] and t['luot_thieu_neo'] == ['r2'] and not t['hoan_tat']
+
+
+# ---- tien_de
+def _td_inputs():
+    sess = {n: dict(file=f'/x/{n}.json', sha256=str(k) * 64, video=f'/x/{n}.mov', video_sha256=str(k + 4) * 64)
+            for k, n in enumerate(kc.CLIPS_REQUIRED)}
+    kcr = dict(version=kc.VERSION, buoi='S1', model='B1', nhom=GR, thu=False, sessions=sess, moc=[],
+               hang_so_sha256='c' * 64, u_so_sha256='d' * 64,
+               kiem_h={n: dict(ti_le_cung_luc=1.0) for n in kc.CLIPS_REQUIRED})
+    us = dict(version=kc.U_SO_VERSION, buoi='S1', chuoi=_chains())
+    for c in us['chuoi'].values():
+        c.update(u_so_m=0.0002, u_so_tho_m=0.0003)
+    run = dict(thieu=False, thieu_du_lieu_neo=False, tap_chua_tinh=[], max_m=0.002,
+               nguon=dict(track_sha256='e' * 64, frames_sha256='f' * 64, kiem_cheo_khung_sha256='a' * 64))
+    r2 = copy.deepcopy(run)
+    r2['nguon']['frames_sha256'] = '9' * 64
+    tk = dict(version=kc.TUNG_KHUNG_VERSION, buoi='S1', model='B1', nhom=GR, moc=[], hang_so_sha256='c' * 64,
+              u_so_sha256='d' * 64, session_sha256=sess['H_a']['sha256'], cham_lai=True, kiem_cheo_sha256='k' * 64,
+              ke_hoach=dict(file='/x/plan', sha256='b' * 64, luot=['R1', 'R2'],
+                            su_kien=['H_a', 'H_b', 'R1', 'H_m', 'R2', 'H_z']),
+              luot={'R1': copy.deepcopy(run), 'R2': r2}, luot_chua_co=[], mau_thuan=[])
+    return kcr, us, tk
+
+
+def _grade(f=None, tk_none=False):
+    kcr, us, tk = _td_inputs()
+    if f:
+        f(kcr, us, tk)
+    return kc.tien_de_eval(kcr, us, None if tk_none else tk, 'k' * 64, 'd' * 64, 'g' * 64)
+
+
+@pytest.mark.parametrize('case, ket, why', [
+    (None, 'dat', None),
+    (lambda k, u, t: k.update(thu=True), 'thieu_du_lieu', 'thu'),
+    (lambda k, u, t: k['sessions'].pop('H_z'), 'thieu_du_lieu', 'thieu_clip:H_z'),
+    (lambda k, u, t: k['kiem_h']['H_m'].update(ti_le_cung_luc=0.9), 'thieu_du_lieu', 'kiem_h:H_m'),
+    (lambda k, u, t: u['chuoi']['2'].update(khong_tinh_duoc=[dict(moc=3)]), 'thieu_du_lieu', 'u_so_khong_tinh:2'),
+    ('no_tk', 'thieu_du_lieu', 'khong_co_tung_khung'),
+    (lambda k, u, t: t.update(luot_chua_co=['R3']), 'thieu_du_lieu', 'luot_chua_co:R3'),
+    (lambda k, u, t: t['luot']['R1'].update(thieu=True, tap_chua_tinh=[dict(chuoi='xe')]), 'thieu_du_lieu',
+     'tap_neo_chua_tinh:R1'),
+    (lambda k, u, t: t['luot']['R2'].update(thieu=True, thieu_du_lieu_neo=True), 'thieu_du_lieu', 'thieu_neo:R2'),
+    (lambda k, u, t: t.update(mau_thuan=[dict(luot='R1', clip='H_m', moc=5)]), 'khong_dat', 'mau_thuan:R1:H_m:5'),
+    (lambda k, u, t: t['ke_hoach'].update(su_kien=['H_b', 'H_a', 'R1', 'H_m', 'R2', 'H_z']), 'thieu_du_lieu', None),
+])
+def test_tien_de_grades_each_row(case, ket, why):
+    """S6-4: one case per row; ket_qua and the reason; TD1-7 schema keys always there."""
+    r = _grade(tk_none=True) if case == 'no_tk' else _grade(case)
+    assert r['ket_qua'] == ket
+    if why:
+        assert why in r['ly_do']
+    assert set(r['clip_h']) == set(kc.CLIPS_REQUIRED) and r['h1_ho_tro'] is False and r['format'] == 'tien_de_buoi_v1'
+    if case == 'no_tk':
+        assert r['sha256']['tung_khung'] is None or r['sha256']['luot'] is None
+        assert r['luot'] == [] and r['luot_thieu_kiem'] == [] and r['mau_thuan'] == []
+    if case is None:
+        assert r['luot'] == ['R1', 'R2'] and r['ly_do'] == [] and r['u_so_m'] == pytest.approx(0.0003)
+
+
+def test_tien_de_short_coverage_lowers_only_the_run_and_worst_wins():
+    """TD1-5 (B): a run short of checks (no uncomputed set) only goes to luot_thieu_kiem; several reasons: the worst."""
+    r = _grade(lambda k, u, t: t['luot']['R2'].update(thieu=True))
+    assert r['ket_qua'] == 'dat' and r['luot_thieu_kiem'] == ['R2'] and set(r['luot_thieu_kiem']) <= set(r['luot'])
+    r = _grade(lambda k, u, t: (k.update(thu=True), t.update(mau_thuan=[dict(luot='R1', clip='H_z', moc=2)])))
+    assert r['ket_qua'] == 'khong_dat' and 'thu' in r['ly_do']
+    r = _grade(lambda k, u, t: u['chuoi']['xe'].update(khong_tinh_duoc=[dict(moc=1)]))
+    assert r['u_so_m'] is None and r['u_so_chuoi'] is None and r['sha256']['u_so'] == 'd' * 64
+
+
+@pytest.mark.parametrize('f', [
+    lambda k, u, t: u.update(buoi='S2'), lambda k, u, t: t.update(nhom=[[1], [2]]),
+    lambda k, u, t: t.update(kiem_cheo_sha256='z' * 64), lambda k, u, t: t.update(u_so_sha256='y' * 64),
+    lambda k, u, t: k['sessions']['H_b'].update(video_sha256=k['sessions']['H_a']['video_sha256']),
+    lambda k, u, t: t['luot']['R2']['nguon'].update(frames_sha256='f' * 64), lambda k, u, t: t.update(version='v3')])
+def test_tien_de_identity_faults_raise(f):
+    """S6-3, TD1-3, TD1-6: another session, grouping, source sha, a repeated clip H or frames: code 2."""
+    with pytest.raises(kc.KCError):
+        _grade(f)
+
+
+def _distinct_videos(tmp_path, args):
+    for n in 'abmz':                                                # a distinct video per clip H (TD1-3)
+        v = tmp_path / f'clip_{n}.mov'
+        v.write_bytes(f'video {n}'.encode())
+        i = args.index(f'--video-{n}')
+        args[i + 1] = str(v)
+        sp = tmp_path / f'{n}.json'
+        s = json.loads(sp.read_text(encoding='utf-8'))
+        s['video_sha256'] = kc.sha256_file(str(v))
+        sp.write_text(json.dumps(s), encoding='utf-8')
+    return args
+
+
+def test_tien_de_cli_writes_once_and_rehashes(tmp_path, scene, monkeypatch):
+    """End to end on a phan_tich output: written (thieu_du_lieu without tung_khung), never replaced; another session
+    id, a bad date, a source changed after the fact (TD3-2): code 2."""
+    marks, cam, img = scene
+    monkeypatch.setattr(kc, 'clip_dets', lambda v, ids, max_frames=None: ([k / 60 for k in range(20)], [img] * 20))
+    assert kc.main(_distinct_videos(tmp_path, _phan_tich_args(tmp_path, scene))) == 0
+    kcp, usp = tmp_path / 'kc' / 'kiem_cheo.json', tmp_path / 'kc' / 'u_so.json'
+    out = tmp_path / 'td.json'
+    base = ['tien_de', '--session-id', 'C8_x', '--ngay', '2026-11-20', '--kiem-cheo', str(kcp), '--u-so', str(usp)]
+    assert kc.main(base + ['--out', str(out)]) == 0
+    r = json.loads(out.read_text(encoding='utf-8'))
+    assert r['ket_qua'] == 'thieu_du_lieu' and r['ly_do'] == ['khong_co_tung_khung'] and r['ngay'] == '2026-11-20'
+    assert {x['vai_tro'] for x in r['nguon']} >= {'u_so', 'session_H_a', 'clip_H_z'}
+    assert r['sha256']['u_so'] == kc.sha256_file(str(usp))
+    assert kc.main(base + ['--out', str(out)]) == 2                  # never replaced
+    assert kc.main(['tien_de', '--session-id', 'C8_y'] + base[3:] + ['--out', str(tmp_path / 'o_x.json')]) == 2
+    bad_date = list(base)
+    bad_date[4] = '2026-13-01'
+    assert kc.main(bad_date + ['--out', str(tmp_path / 'o_y.json')]) == 2
+    (tmp_path / 'clip_m.mov').write_bytes(b'changed')                 # TD3-2: evidence no longer matches
+    assert kc.main(base + ['--out', str(tmp_path / 'o_z.json')]) == 2
+    assert not any((tmp_path / n).exists() for n in ('o_x.json', 'o_y.json', 'o_z.json'))
+
+
+# ---- S7 geometry
+def test_p1_rel_exact_scene_and_rigid_map_error(scene):
+    """S7-8, KS7-1: exact cameras give d and chuyen ~ 0; a held camera with a rigid map error Q (tape fixed) gives
+    d_sj = (Q - I)(x_j - x_s) and d_he_dau ~ 0 (the common turn is removed)."""
+    marks, cam, img = scene
+    regions = kc.start_regions(marks, {'goc': (0.0, 0.0)}, 0.3)
+    assert regions['goc']['vung_mo_rong'] and len(regions['goc']['moc']) == 3
+    pc = _FakePC(img, cam, cam)
+    rows, pairs, hong = kc.p1_rel_clip('H_a', pc, marks, regions, (0.1445, 0.119), 0.119 / ZC, (0.0, 0.0),
+                                       phis=(0.0, 45.0))
+    assert not hong and max(p['d_m'] for p in pairs) < 2e-4 and max(p['chuyen_m'] for p in pairs) < 1e-9
+    Q = _rotm(0.5)
+    pc = _FakePC(img, cam, _MapCam(cam, Q, (0.004, -0.003)))
+    rows, pairs, hong = kc.p1_rel_clip('H_a', pc, marks, regions, (0.1445, 0.119), 0.119 / ZC, (0.0, 0.0), phis=(0.0,))
+    for r in rows:
+        v = np.array(marks[r['j']][:2]) - np.array(marks[r['s']][:2])
+        assert np.allclose([r['d_x'], r['d_y']], (Q - np.eye(2)) @ v, atol=3e-4)
+        assert math.hypot(r['dh_x'], r['dh_y']) < 3e-4
+    assert {r['nhin'] for r in rows} == {'full', 'held'}
+
+
+def test_p1_rel_moved_far_mark(scene):
+    """S7-8, KS7-7: the true far mark j moved 2 mm (tape old): pairs holding j show d = +2 mm (measured - tape)."""
+    marks, cam, _ = scene
+    j = 7
+    true = dict(marks)
+    true[j] = (marks[j][0] + 0.002, marks[j][1], SIDE)
+    img = image_of(cam, true)
+    real = kc.PairCams(img, marks, 'B1', W, H, ZC)
+    pc = _FakePC(img, None, None)
+    pc.ids = [30, j, 12]                                            # three pairs only (speed); fits use every mark
+    pc.__class__ = type('_Sub', (_FakePC,), {'__call__': lambda self, out=(): real(out)})
+    regions = {'goc': dict(moc=[30], vung_mo_rong=False)}
+    rows, pairs, _ = kc.p1_rel_clip('H_a', pc, marks, regions, (0.1445, 0.119), 0.119 / ZC, (0.0, 0.0), phis=(0.0,))
+    pj = [r for r in rows if r['j'] == j]
+    assert pj and all(abs(r['d_x'] - 0.002) < 1e-4 and abs(r['d_y']) < 1e-4 for r in pj)
+    assert all(math.hypot(r['d_x'], r['d_y']) < 3e-4 for r in rows if r['j'] != j)
+
+
+def test_chuyen_pair_rotation_on_the_floor(scene):
+    """S8-4 (2): tag on the floor (h = 0, kappa 0), held camera with a map turn Q: chuyen = held - full of the
+    difference = (Q - I)(b - a), heading difference 0; the same camera: 0."""
+    marks, cam, _ = scene
+    Q = _rotm(0.3)
+    pa, pb = (0.2, -0.3), (1.1, 0.4)
+    v = np.array(pb) - pa
+    want = {'full': (Q - np.eye(2)) @ v, 'held': (np.eye(2) - Q.T) @ v}   # imaged by the held camera: true = Q^-1 P
+    rows = kc.chuyen_pair(cam, _MapCam(cam, Q), pa, pb, 0.4, 0.4, 0.1445, 0.0, 0.0, (0.0, 0.0))
+    assert [r[0] for r in rows] == ['full', 'held']
+    for nhin, dx, dy, dpsi in rows:
+        assert np.allclose([dx, dy], want[nhin], atol=1e-9) and abs(dpsi) < 1e-9
+    same = kc.chuyen_pair(cam, cam, pa, pb, 0.1, 0.2, 0.1445, 0.119, 0.05, (0.3, 0.1))
+    assert all(abs(x) < 1e-12 for r in same for x in r[1:])
+
+
+def test_region_cover_flags():
+    """S7-12.3, S7-14.3: inside the hull, near marks, two A3 directions: no flag; outside: ngoai_suy; one direction:
+    mot_phuong (directions mod 180); far marks: khoang_trong."""
+    mk = {1: (0.0, 0.0, SIDE), 2: (0.4, 0.0, SIDE), 3: (0.4, 0.4, SIDE), 4: (0.0, 0.4, SIDE)}
+    rows = [dict(i=1, j=2, L_m=0.4, huong_deg=0.0), dict(i=1, j=4, L_m=0.4, huong_deg=90.0)]
+    r = kc.region_cover([1, 2, 3, 4], mk, (0.2, 0.2), rows)
+    assert not r['ngoai_suy'] and not r['mot_phuong'] and r['ly_do'] == []
+    r = kc.region_cover([1, 2, 3, 4], mk, (0.2, -0.15), rows)
+    assert r['ngoai_suy'] and 'mien_ngoai_bao_loi' in r['ly_do']
+    r = kc.region_cover([1, 2, 3, 4], mk, (0.2, 0.2), [dict(i=1, j=2, L_m=0.4, huong_deg=10.0),
+                                                       dict(i=4, j=3, L_m=0.4, huong_deg=230.0)])
+    assert r['mot_phuong']                                           # 10 and 230 = 50 mod 180: 40 deg apart
+    far = {1: (0.0, 0.0, SIDE), 2: (2.0, 0.0, SIDE), 3: (2.0, 2.0, SIDE), 4: (0.0, 2.0, SIDE)}
+    assert 'khoang_trong' in kc.region_cover([1, 2, 3, 4], far, (1.0, 1.0), rows)['ly_do']
+
+
+def test_a3_rel_per_clip():
+    """S7-4, KS7-3: A3loc per mark, start region and far end in the same clip."""
+    rows = [dict(i=1, j=2, quy_deg=0.10), dict(i=2, j=3, quy_deg=0.30), dict(i=4, j=5, quy_deg=0.05)]
+    r = kc.a3_rel_clip(rows, {'goc': dict(moc=[1]), 'K1': dict(moc=[9])})
+    assert r['A3loc'] == {1: 0.10, 2: 0.30, 3: 0.30, 4: 0.05, 5: 0.05}
+    assert r['A3_xp'] == {'goc': 0.10, 'K1': None} and r['max_deg'] == pytest.approx(0.40)
+
+
+def test_affine_mark_sees_stretch_and_shear(scene):
+    """S7-5, KS7-4: exact camera ~ 0; a floor map stretched 1 % along x: one principal stretch 0.01; a shear: cat."""
+    marks, cam, img = scene
+    i = 17
+    r = kc.affine_mark(cam, img[i], SIDE)
+    assert max(abs(g) for g in r['gian']) < 1e-4 and r['du_mm'] < 1e-3
+    st = _MapCam(cam, np.diag([1.01, 1.0]))
+    r = kc.affine_mark(st, img[i], SIDE)
+    assert max(r['gian']) == pytest.approx(0.01, abs=2e-4) and abs(r['cat_deg']) < 0.05
+    sh = _MapCam(cam, np.array([[1.0, 0.02], [0.0, 1.0]]))
+    assert abs(kc.affine_mark(sh, img[i], SIDE)['cat_deg']) == pytest.approx(math.degrees(math.atan(0.02)), abs=0.02)
+
+
+def test_meo_summary_threshold_is_repeatability_plus_print():
+    """S7-12.2: threshold = |q(H_a) - q(H_b)| + tolerance per size; the flag is diagnostic only."""
+    def m(g, du):
+        return dict(gian=[g, 0.0], cat_deg=0.0, du_mm=du, canh_m=SIDE)
+    out = kc.meo_summary({'H_a': {1: m(0.001, 0.1)}, 'H_b': {1: m(0.0015, 0.1)}, 'H_m': {1: m(0.0024, 0.1)}})
+    assert out['nguong_lap_HaHb']['96.4']['gian'] == pytest.approx(0.0005 + kc.DUNG_SAI_IN_GIAN)
+    assert out['bien_dang_hinh'] is False and out['chi_chan_doan'] is True
+    out = kc.meo_summary({'H_a': {1: m(0.001, 0.1)}, 'H_b': {1: m(0.0015, 0.1)}, 'H_m': {1: m(0.003, 0.1)}})
+    assert out['bien_dang_hinh'] is True
+    assert kc.meo_summary({'H_a': {1: m(0.001, 0.1)}})['bien_dang_hinh'] is None
+
+
+def test_time_check_reports_common_turn(scene):
+    """C8BX-06: the per-clip pose refit absorbs a rigid turn of the whole image (a camera move): xoay_chung_deg ~ 0;
+    a turn of the target marks only (the floor plate moved under a still camera) is seen."""
+    marks, cam, img = scene
+    groups = kc.make_groups(sorted(img))
+    gc = kc.GroupCams(img, marks, groups, 'B1', W, H, ZC)
+    Q = _rotm(0.2)
+    turned = {i: (*(Q @ np.array(m[:2])), m[2]) for i, m in marks.items()}
+    r = kc.time_check([img] * 3, image_of(cam, turned), marks, groups, gc)
+    assert abs(r['xoay_chung_deg']) < 0.01 and abs(r['gian_chung']) < 1e-3
+    half = {i: (turned[i] if i in groups[0] else marks[i]) for i in marks}
+    r = kc.time_check([img] * 3, image_of(cam, half), marks, groups, gc)
+    assert abs(r['xoay_chung_deg']) > 0.01 and 'xoay_chung_deg' in r
+
+
+def test_phan_tich_writes_s7(tmp_path, scene, monkeypatch):
+    """Production path with --xuat-phat, --plumb: S7 blocks, cap_tuong_doi.csv with its sha, constants and ids."""
+    marks, cam, img = scene
+    monkeypatch.setattr(kc, 'clip_dets', lambda v, ids, max_frames=None: ([k / 60 for k in range(20)], [img] * 20))
+    monkeypatch.setattr(kc, 'R_XP_M', 0.3)
+    assert kc.main(_phan_tich_args(tmp_path, scene) + ['--xuat-phat', 'goc=0,0', '--plumb', '0.03,-0.02']) == 0
+    r = json.loads((tmp_path / 'kc' / 'kiem_cheo.json').read_text(encoding='utf-8'))
+    p = r['P1_tuong_doi']
+    assert p['max_m'] < 5e-4 and p['theo_vung']['goc']['vung_mo_rong'] and p['cap_hong'] == []
+    assert p['cap_csv']['sha256'] == kc.sha256_file(p['cap_csv']['file'])
+    assert r['A3_tuong_doi']['A3_xp_deg']['goc'] is not None and r['hang_so_s7']['R_XP_M'] == 0.3
+    assert r['id_khoa'] == sorted(img) and r['meo_cuc_bo']['bien_dang_hinh'] is False
+    assert os.path.isabs(r['sessions']['H_a']['video']) and 'theo_co' in r['P7']
+    t2 = tmp_path / 'x'
+    t2.mkdir()
+    assert kc.main(_phan_tich_args(t2, scene) + ['--xuat-phat', 'goc=0,0']) == 2          # needs --plumb
+
+
+def test_e_hieu_reads_f5_and_writes_f9(tmp_path, scene):
+    """S7-17, S8-5: (i) from kiem_cheo, (ii) on the F5 session (exact scene ~ 0), (iii) missing -> chan_doan; a leg
+    without p_m: only (i); an edited F5: code 2; the output is what c8_hc_a.read_e_hieu reads."""
+    marks, cam, img = scene
+    video = tmp_path / 'v.mov'
+    video.write_bytes(b'v')
+    sp = _fake_session(tmp_path, 'hc', img, marks, video)
+    kcr = dict(version=kc.VERSION, thu=False, model='B1',
+               hang_so_s7=dict(xuat_phat=dict(goc=[0.0, 0.0]), R_XP_M=0.6, L_MAX_M=1.05, plumb=[0.03, -0.02]),
+               P1_tuong_doi=dict(theo_vung=dict(goc=dict(trong_vung_max_m=0.0007))))
+    kcp = tmp_path / 'kc.json'
+    kcp.write_text(json.dumps(kcr), encoding='utf-8')
+
+    def win(p, psi):
+        return dict(loai='dung_12b', chi_so=0, khung_id=[1], khung_pts_s=[0.0], khung_sha256='a' * 64, p_m=p,
+                    psi_rad=psi)
+    doan = dict(schema='c8_hc_doan_12b_v1', cho='goc', trang_thai='chan_doan', session_sha256=kc.sha256_file(str(sp)),
+                car_pose_cfg=dict(side_m=0.1445, h_m=0.119, tag_offset=None, q_m=None, du_m=None),
+                nguon=[dict(vai_tro='session', duong_dan=str(sp), sha256=kc.sha256_file(str(sp)))],
+                doan=[dict(i=0, trang_thai='hop_le', cua_so_a=win([-0.2, 0.0], 0.0), cua_so_b=win([0.3, 0.1], 0.02)),
+                      dict(i=1, trang_thai='hop_le', cua_so_a=win(None, None), cua_so_b=win([0.3, 0.1], 0.0))])
+    doan['sha256'] = kc.doan_body_sha(doan)
+    dp = tmp_path / 'doan_12b_v1.json'
+    dp.write_text(json.dumps(doan), encoding='utf-8')
+    out = tmp_path / 'e.json'
+    assert kc.main(['e_hieu', '--kiem-cheo', str(kcp), '--doan', str(dp), '--out', str(out)]) == 0
+    e = json.loads(out.read_text(encoding='utf-8'))
+    assert e['doan_12b_sha256'] == doan['sha256'] and e['bao_q_xoay'] is False and e['trang_thai'] == 'chan_doan'
+    legs = {x['i']: x for x in e['doan']}
+    assert legs[0]['phan_ii_m'] < 1e-6 and legs[0]['e_hieu_m'] == pytest.approx(0.0007)
+    assert legs[1]['phan_ii_m'] is None and any('chi (i)' in w for w in legs[1]['ly_do'])
+    assert all(isinstance(x['e_hieu_m'], float) for x in e['doan'])
+    doan['doan'][0]['dai'] = 9                                        # edited after its sha
+    dp.write_text(json.dumps(doan), encoding='utf-8')
+    assert kc.main(['e_hieu', '--kiem-cheo', str(kcp), '--doan', str(dp), '--out', str(tmp_path / 'e2.json')]) == 2
+
+
+def test_c8b_u_reads_the_cli_export(tmp_path):
+    """S8-6: the file the xuat CLI writes (U_moc of CAM + tien_de + u_so information) passes c8b_u v3 check_cam
+    (runs where c8b_u v3 is importable; skipped before)."""
+    CU = pytest.importorskip('c8b_u')
+    if getattr(CU, 'CAM_VERSION', None) != kc.CAM_U_VERSION or not hasattr(CU, 'check_cam'):
+        pytest.skip('c8b_u of another camera-file version')
+    kcp = _kc_file(tmp_path, A3=dict(_a3_conv(quy_ve_ma_noc=True), buoi='C8_x'))
+    assert kc.main(_xuat_args(tmp_path, kcp)) == 0
+    CU.check_cam(json.loads((tmp_path / 'o.json').read_text(encoding='utf-8')))
