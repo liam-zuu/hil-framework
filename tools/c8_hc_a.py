@@ -57,7 +57,9 @@ EPS_SMOOTH_S = 1.0             # smoothing of the camera heading in the dynamic 
 MIN_FRAMES_TINH, MIN_FRAMES_VIDEO = 120, 30
 WIN_MIN_S, STILL_MIN_S = 2.5, 3.0
 U_D_MAX_S = 0.10
-TRAJ_AGE_MAX_MS = 60.0
+TRAJ_AGE_MAX_MS = 60.0           # while the sender sends (50 Hz); not over the firmware timeout wait (HCC1-4)
+EXPIRY_MS = 200.0               # firmware TRAJ_TIMEOUT_US (main.c 45): run_active ends when the newest packet is this old
+EXPIRY_SLACK_S = 0.03
 RV_STALL_S = 0.15               # 3 report periods at 20 Hz
 E_CORR_MIN = 0.9
 SP_INT_TOL_M, SP_INT_TOL_RAD = 0.003, math.radians(0.5)
@@ -250,17 +252,123 @@ def plan_moves(segs):
     return [s for s in segs if s['loai'] in ('tien', 'xoay')]
 
 
+def sender_domain(L, i0, i1):
+    """(j_s, problems). j_s = last row of the run with a fresh packet (0 <= traj_age_ms <= TRAJ_AGE_MAX_MS): up to
+    there the sender was sending. Rows j_s+1..i1 are the firmware waiting for its 200 ms timeout after the last
+    (zero) packet (main.c 524-525; HCC1-4): there no new packet may arrive (age only grows), the age stays under
+    EXPIRY_MS, the wait is not longer than EXPIRY_MS (+ slack) and the command is 0 on every axis."""
+    age = L['traj_age_ms']
+    fresh = np.flatnonzero((age[i0:i1 + 1] >= 0) & (age[i0:i1 + 1] <= TRAJ_AGE_MAX_MS))
+    if not len(fresh):
+        raise AError('no fresh trajectory packet inside the run')
+    j_s = i0 + int(fresh[-1])
+    problems = []
+    if i1 > j_s:
+        ex = slice(j_s + 1, i1 + 1)
+        if np.any(np.diff(age[j_s:i1 + 1]) < 0):
+            problems.append('goi moi trong phan het han')
+        if age[i1] >= EXPIRY_MS:
+            problems.append(f'traj_age {age[i1]:.0f} ms with run_active')
+        if L['t'][i1] - L['t'][j_s] > EXPIRY_MS / 1000.0 + EXPIRY_SLACK_S:
+            problems.append(f"het han {L['t'][i1] - L['t'][j_s]:.3f} s")
+        if any(np.any(np.abs(L[c][ex]) > SP_EPS) for c in ('sp_vx', 'sp_vy', 'sp_wz')):
+            problems.append('lenh khac 0 khi het han')
+    return j_s, problems
+
+
+def read_events_unique(path):
+    """'#' texts of the logger events file, receive time dropped, identical copies (the firmware sends #us/#us_end
+    3 times) kept once, in order; [] when there is no file."""
+    import gain_line_check as glc
+    ev = glc.read_events(path) or []
+    seen, out = set(), []
+    for line in ev:
+        _, txt = glc.split_event(line)
+        txt = txt.strip()
+        if txt not in seen:
+            seen.add(txt)
+            out.append(txt)
+    return out
+
+
+def _int(v):
+    try:
+        return int(str(v))
+    except (TypeError, ValueError):
+        return None
+
+
+def logger_summary_problem(log_path):
+    """None, or why the agv_logger summary does not prove a closed run of this very CSV (HCC1-6)."""
+    try:
+        s = json.load(open(log_path + '.summary.json', encoding='utf-8'))
+    except (OSError, ValueError) as exc:
+        return f'summary: {type(exc).__name__}'
+    if s.get('status') != 'closed':
+        return f"summary status {s.get('status')}"
+    if ((s.get('files') or {}).get('csv') or {}).get('sha256') != sha256(log_path):
+        return 'summary csv sha256 khac log.csv'
+    return None
+
+
+def us_evidence(texts, boot, L, i0, i1):
+    """(changes inside the log, covering #us_end or None, why) from the #us / #us_end lines (us_state.h (c); HCC1-6).
+    A #us_end covers the run when its boot is the boot of the gain questions, its lượt starts at or before the run
+    (#us,ev=start of that boot with first_seq <= log_seq[i0], or no start line and motor_on = 1 from the first log
+    row) and ends at or after it (log_seq[i1] <= last_data_seq <= last log_seq) with motor_on = 1 in between."""
+    seq = L['log_seq']
+    s0, s_i0, s_i1, s_end = seq[0], seq[i0], seq[i1], seq[-1]
+    us = [(t.split(',', 1)[0], parse_fields(t)) for t in texts if t.startswith('#us,') or t.startswith('#us_end,')]
+    changes = [f for k, f in us if k == '#us' and f.get('ev') == 'change'
+               and _int(f.get('first_seq')) is not None and s0 <= _int(f.get('first_seq')) <= s_end]
+    starts = [f for k, f in us if k == '#us' and f.get('ev') == 'start' and f.get('boot', '').lower() == boot]
+    ends = [f for k, f in us if k == '#us_end' and f.get('boot', '').lower() == boot]
+    cover, why = None, 'khong co #us_end cung boot trong log'
+    for e in ends:
+        last = _int(e.get('last_data_seq'))
+        if last is None or not (s_i1 <= last <= s_end):
+            why = f'#us_end last_data_seq {e.get("last_data_seq")} ngoai [{s_i1:.0f}, {s_end:.0f}]'
+            continue
+        jl = int(np.searchsorted(seq, last, side='right')) - 1
+        st = [s for s in starts if _int(s.get('first_seq')) is not None and _int(s.get('first_seq')) <= s_i0
+              and (_int(e.get('ticks')) is None or _int(e.get('ticks')) == last - _int(s.get('first_seq')) + 1)]
+        if st:
+            j0 = max(0, int(np.searchsorted(seq, _int(st[-1].get('first_seq')))))
+        elif not starts and np.all(L['motor_on'][:i0 + 1] > 0.5):
+            j0 = 0
+        else:
+            why = '#us,ev=start khong khop luot'
+            continue
+        if not np.all(L['motor_on'][j0:jl + 1] > 0.5):
+            why = 'motor tat giua luot #us'
+            continue
+        cover, why = e, ''
+    return changes, cover, why
+
+
 def kiem(A, age_r_max_ms=125.0):
-    """Log-side checks of one attempt (design 2.6). Returns (checks list of (name, ok, detail), info)."""
+    """Log-side checks of one attempt (design 2.6; Codex code review round 1 HCC1-4..6). Returns (checks list of
+    (name, ok, detail), info)."""
     L, segs = A['log'], A['segs']
     ck = []
 
     def add(name, ok, detail=''):
         ck.append((name, bool(ok), str(detail)))
     se = A['seq_end'] or {}
-    add('sender_hoan_tat', se.get('complete') == '1' and se.get('n_bo') == '0' and not A['huy'],
-        f"complete={se.get('complete')} n_bo={se.get('n_bo')} huy={len(A['huy'])}")
+    add('sender_hoan_tat', se.get('complete') == '1' and se.get('n_bo') == '0' and not A['huy']
+        and A['ket_qua'].get('ma') == '0',
+        f"complete={se.get('complete')} n_bo={se.get('n_bo')} huy={len(A['huy'])} ket_qua={A['ket_qua'].get('ma')}")
     add('logger_dong_sach', A['logger_dong'].get('ma') == '0', f"ma={A['logger_dong'].get('ma')}")
+    why = logger_summary_problem(A['log_path'])
+    add('logger_summary', why is None, why or 'closed, sha256 khop')
+    info = dict(cat_pwm='chua_xac_minh')
+    try:
+        i0, i1 = run_range(L)
+    except AError as exc:
+        add('mot_canh_run_active', False, exc)
+        return ck, info
+    add('mot_canh_run_active', True, f'rows {i0}-{i1}')
+    seq = L['log_seq']
     try:
         import gain_line_check as glc
         qb = glc.read_query(os.path.join(A['dir'], 'gain_query_truoc.txt'))
@@ -268,60 +376,79 @@ def kiem(A, age_r_max_ms=125.0):
         why = glc.query_problem(qb, qa, check_run_boot=False)
         same = why is None and all((qb or {}).get(k) == (qa or {}).get(k) for k in ('sha', 'env', 'applied_n'))
         add('dinh_danh_gain', same, why or '')
-        ev = glc.read_events(A['events_path']) or []
-        fw = [parse_fields(t) for _, t in map(glc.split_event, ev) if t.startswith('#fw,')]
-        gn = [parse_fields(t) for _, t in map(glc.split_event, ev) if t.startswith('#gain,')]
-        okfw = all(f.get('sha', '')[:7] == (qb or {}).get('sha', '')[:7] and f.get('env') == (qb or {}).get('env') for f in fw)
-        okgn = all((g.get('boot') in (None, '') or g.get('boot', '').lower() == (qb or {}).get('boot', '').lower()) for g in gn)
-        add('dinh_danh_fw_gain_log', okfw and okgn, f'#fw {len(fw)} #gain {len(gn)}')
-        us = [t for _, t in map(glc.split_event, ev) if t.startswith('#us,') and 'ev=change' in t]
-        add('khong_cat_sieu_am', not us, f'{len(us)} #us change')
-        cat = [t for _, t in map(glc.split_event, ev) if t.startswith('#us_end')]
-        cat_pwm = 'chua_xac_minh' if not cat else ('khong' if all(parse_fields(t).get('cut', '0') in ('0', '') for t in cat) else 'co')
+        boot = (qb or {}).get('boot', '').lower()
+        texts = read_events_unique(A['events_path'])
+        fw = [parse_fields(t) for t in texts if t.startswith('#fw,')]
+        gn = [parse_fields(t) for t in texts if t.startswith('#gain,')]
+        okfw = all(f.get('sha', '')[:7] == (qb or {}).get('sha', '')[:7] and f.get('env') == (qb or {}).get('env')
+                   for f in fw)
+        bad_g = [g for g in gn if g.get('boot', '').lower() != boot or _int(g.get('first_seq')) is None
+                 or not (seq[0] <= _int(g.get('first_seq')) <= seq[i0])]
+        add('dinh_danh_fw_gain_log', okfw and not bad_g and bool(boot),
+            f"#fw {len(fw)} #gain {len(gn)}" + (f"; #gain sai boot/first_seq: {bad_g[0]}" if bad_g else ''))
+        changes, cover, why_us = us_evidence(texts, boot, L, i0, i1)
+        blk = cover is not None and (_int(cover.get('blk_ticks')) or 0) > 0
+        add('khong_cat_sieu_am', not changes and not blk, f'{len(changes)} #us change; blk_ticks '
+            f"{cover.get('blk_ticks') if cover else '-'}")
+        if cover is None:
+            info['cat_pwm'], info['cat_pwm_ly_do'] = 'chua_xac_minh', why_us
+        else:
+            ct = _int(cover.get('cut_ticks'))
+            info['cat_pwm'] = 'chua_xac_minh' if ct is None else ('khong' if ct == 0 else 'co')
+            info['cat_pwm_ly_do'] = f"cut_ticks={cover.get('cut_ticks')}"
     except ImportError:
         add('dinh_danh_gain', False, 'gain_line_check not importable')
-        cat_pwm = 'chua_xac_minh'
-    info = dict(cat_pwm=cat_pwm)
-    try:
-        i0, i1 = run_range(L)
-    except AError as exc:
-        add('mot_canh_run_active', False, exc)
-        return ck, info
-    add('mot_canh_run_active', True, f'rows {i0}-{i1}')
     rng = slice(i0, i1 + 1)
     add('motor_on', np.all(L['motor_on'][rng] > 0.5))
     add('pos_reset_tang_1', i0 > 0 and L['pos_reset_n'][i1] - L['pos_reset_n'][i0 - 1] == 1
         and L['pos_reset_n'][i0] == L['pos_reset_n'][i1],
         f"{L['pos_reset_n'][max(i0 - 1, 0)]:.0f}->{L['pos_reset_n'][i1]:.0f}")
-    add('log_seq_lien', np.all(np.diff(L['log_seq'][rng]) == 1))
+    add('log_seq_lien', np.all(np.diff(seq[rng]) == 1))
     add('so_dem_hop_le', not np.any(L['bad'][rng]))
-    add('traj_age', np.nanmax(L['traj_age_ms'][rng]) <= TRAJ_AGE_MAX_MS, f"max {np.nanmax(L['traj_age_ms'][rng]):.0f} ms")
-    blocks = sp_blocks(L, i0, i1)
+    try:
+        j_s, exp_prob = sender_domain(L, i0, i1)
+    except AError as exc:
+        add('traj_age', False, exc)
+        return ck, info
+    age_max = float(np.nanmax(L['traj_age_ms'][i0:j_s + 1]))
+    add('traj_age', age_max <= TRAJ_AGE_MAX_MS and age_max >= 0, f'max {age_max:.0f} ms (mien phat {i0}-{j_s})')
+    add('het_han_firmware', not exp_prob, '; '.join(exp_prob) or f"{L['t'][i1] - L['t'][j_s]:.3f} s, lenh 0")
+    # every non-zero command row of the WHOLE log (HCC1-5): inside the sender domain and matching the schedule
+    blocks_all = sp_blocks(L, 0, L['n'] - 1)
+    blocks = [b for b in blocks_all if i0 <= b['j0'] and b['j1'] <= j_s]
+    out = [b for b in blocks_all if b not in blocks]
+    add('khong_goi_muon', not out, '' if not out else
+        f"{len(out)} khoi lenh khac 0 ngoai mien phat, dau tien dong {out[0]['j0']} (t {out[0]['t0']:.2f} s)")
     moves = plan_moves(segs)
+    t_run = float(L['t'][i0])
     ok_b = len(blocks) == len(moves)
     detail = f'{len(blocks)} blocks vs {len(moves)} planned'
     if ok_b:
-        x = th = 0.0
         for b, m in zip(blocks, moves):
-            dur = m['t1'] - m['t0']
+            dur, want = m['t1'] - m['t0'], m['toi'] - m['tu']
+            sl = slice(b['j0'], b['j1'] + 1)
             if m['loai'] == 'tien':
-                x = m['toi']
-                good = (b['truc'] == 'vx' and not b['vy_any'] and abs(b['tp_vx'] - (m['toi'] - m['tu'])) <= SP_INT_TOL_M
-                        and abs(b['tp_wz']) <= SP_INT_TOL_RAD)
-                jr = b['j1']
-                good = good and abs(L['pos_x_ref'][jr] - x) <= REF_TOL_M
+                main, others, tp = L['sp_vx'][sl], ('sp_vy', 'sp_wz'), b['tp_vx']
+                good = abs(tp - want) <= SP_INT_TOL_M and abs(L['pos_x_ref'][b['j1']] - m['toi']) <= REF_TOL_M
             else:
-                th = m['toi']
-                good = b['truc'] == 'wz' and abs(b['tp_wz'] - (m['toi'] - m['tu'])) <= SP_INT_TOL_RAD and abs(b['tp_vx']) <= SP_INT_TOL_M
-            good = good and abs((b['t1'] - b['t0']) - dur) <= DUR_TOL_S
-            if not good:
+                main, others, tp = L['sp_wz'][sl], ('sp_vx', 'sp_vy'), b['tp_wz']
+                good = abs(tp - want) <= SP_INT_TOL_RAD
+            pure = all(np.all(np.abs(L[c][sl]) <= SP_EPS) for c in others)
+            one_sign = np.all(np.sign(main[np.abs(main) > SP_EPS]) == math.copysign(1.0, want))
+            t_ok = abs((b['t0'] - t_run) - m['t0']) <= DUR_TOL_S and abs((b['t1'] - b['t0']) - dur) <= DUR_TOL_S
+            if not (good and pure and one_sign and t_ok):
                 ok_b = False
-                detail = f"block {b['j0']}: truc {b['truc']} vx {b['tp_vx']:.4f} wz {b['tp_wz']:.4f} dur {b['t1'] - b['t0']:.2f} vs {m}"
+                detail = (f"block {b['j0']}: {m['loai']} tich phan {tp:.4f} vs {want:.4f}, truc khac 0 "
+                          f"{not pure}, doi dau {not one_sign}, bat dau {b['t0'] - t_run:.2f} vs {m['t0']:.2f} s, "
+                          f"dai {b['t1'] - b['t0']:.2f} vs {dur:.2f} s")
                 break
+        if ok_b:                                 # the zero tail: hold + TAIL_S sent whole up to the last packet
+            n_pk = hs.n_samples(segs) + int(math.ceil(hs.TAIL_S * hs.SEND_HZ - 1e-9))
+            span = float(L['t'][j_s]) - t_run
+            if abs(span - (n_pk - 1) / hs.SEND_HZ) > DUR_TOL_S:
+                ok_b = False
+                detail = f'mien phat {span:.2f} s vs lich {(n_pk - 1) / hs.SEND_HZ:.2f} s (duoi goi 0)'
     add('lenh_nhan_khop_lich', ok_b, detail)
-    if ok_b:
-        nz_after = (np.abs(L['sp_vx'][blocks[-1]['j1'] + 1:i1 + 1]) > SP_EPS) | (np.abs(L['sp_wz'][blocks[-1]['j1'] + 1:i1 + 1]) > SP_EPS)
-        add('khong_goi_muon', not np.any(nz_after))
     # IMU
     ok_imu = np.all(L['r_valid'][rng] > 0.5) and np.nanmax(L['age_r_ms'][rng]) <= age_r_max_ms
     ok_imu = ok_imu and L['reset_n'][i0] == L['reset_n'][i1] and L['psi_reset_count'][i0] == L['psi_reset_count'][i1]
@@ -348,7 +475,7 @@ def kiem(A, age_r_max_ms=125.0):
             corr = float(np.corrcoef(a1, a2)[0, 1]) if np.std(a1) > 0 and np.std(a2) > 0 else 0.0
             sign_ok = np.sign(yaw[b['j1']] - yaw[b['j0']]) == np.sign(b['tp_wz'])
             add('imu_e_tuong_quan', corr >= E_CORR_MIN and sign_ok, f'corr {corr:.3f}')
-        wins = still_windows(L, blocks, i0, i1)
+        wins = still_windows(L, blocks, i0, j_s)
         add('cua_so_dung_du', all(w.get('still_s', 0) >= STILL_MIN_S and not w.get('ho') for w in wins),
             ', '.join(f"{w.get('still_s', 0):.2f}" for w in wins))
         # odometry stop vs plan (catches a PWM cut with a correct reference)
@@ -364,7 +491,7 @@ def kiem(A, age_r_max_ms=125.0):
                 bad.append(f'stop {k}: {odo[j, 0]:.4f} vs {stops[k]}')
             k += 1
         add('diem_dung_odo', not bad, '; '.join(bad))
-        info.update(i0=i0, i1=i1, blocks=blocks, windows=wins)
+        info.update(i0=i0, i1=i1, j_s=j_s, blocks=blocks, windows=wins)
     return ck, info
 
 

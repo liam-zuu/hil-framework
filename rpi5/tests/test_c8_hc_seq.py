@@ -3,12 +3,15 @@ schedule of 12b and E, the 50 Hz sender with abort, and one attempt owning the l
 import math
 import os
 import struct
+import sys
 import types
 
 import pytest
 
-import c8_hc_seq as hs
-import pc_sender as ps
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # rpi5/, from any cwd
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))                    # c8_hc_seq_e2e
+import c8_hc_seq as hs  # noqa: E402
+import pc_sender as ps  # noqa: E402
 
 
 def decode(pkt):

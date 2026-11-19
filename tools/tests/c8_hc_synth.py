@@ -28,9 +28,16 @@ def query_text(t0, boot='e75f708f'):
             f'applied_n=0,ctrl=PID,kp_xy=1.5,ki_xy=0.05,kp_wz=1,ki_wz=0.05,pos_kp=6,pos_ki=3,k_psi=1\n#ket_qua,ma=0\n')
 
 
+def write_summary(csv_path, status='closed'):
+    """The agv_logger summary of a closed run (status, files.csv sha256), as agv_logger.main writes it."""
+    h = hashlib.sha256(open(csv_path, 'rb').read()).hexdigest()
+    with open(csv_path + '.summary.json', 'w', encoding='utf-8') as f:
+        json.dump(dict(status=status, files=dict(csv=dict(file=os.path.basename(csv_path), sha256=h))), f)
+
+
 def make(d, cho='K1', phan='all', a_true_deg=0.7, q=(0.004, -0.003), lag=0.15, D=50.0, seed=1, noise_p=0.0003,
          noise_psi_deg=0.22, yaw_bias=None, cam_bias=None, cut=None, second_edge=False, rv_freeze=None,
-         wiggle=None, boot_after='e75f708f'):
+         wiggle=None, boot_after='e75f708f', rx_latency=0.003):
     """Write one attempt folder; returns dict of the truth. Options:
     yaw_bias(t) rad added to the IMU yaw; cam_bias(t) rad added to the camera heading; cut=(t_from, t_to) zeroes
     sp_vx (ultrasonic cut before integration: the reference loses the distance); rv_freeze=(t_from, t_to) holds yaw;
@@ -58,16 +65,21 @@ def make(d, cho='K1', phan='all', a_true_deg=0.7, q=(0.004, -0.003), lag=0.15, D
     t_end = t_s + T_sched + 0.2 + 6.0
     t = np.arange(0.0, t_end, 0.01)
     n = len(t)
-    k = np.floor((t - t_s) * hs.SEND_HZ + 1e-9).astype(int)
     nk = hs.n_samples(segs)
+    total = nk + int(math.ceil(hs.TAIL_S * hs.SEND_HZ - 1e-9))
+    # packets k = 0..total-1 received at t_s + k/50 + latency; the firmware keeps the newest one, run_active while
+    # its age < 200 ms (main.c 524-525, 611), traj_age_ms = tick time - receive time (main.c 529-541; HCC1-4)
+    t_rx = t_s + np.arange(total) / hs.SEND_HZ + rx_latency
+    last = np.searchsorted(t_rx, t, side='right') - 1                   # newest packet received by row i
+    age = np.where(last >= 0, np.floor((t - t_rx[np.maximum(last, 0)]) * 1000.0 + 1e-9), -1.0)
+    run = (last >= 0) & (age < 200.0)
     sp = np.zeros((n, 3))
     for i in range(n):
-        if 0 <= k[i] < nk:
-            sp[i] = hs.sample(segs, int(k[i]))
+        if run[i] and last[i] < nk:
+            sp[i] = hs.sample(segs, int(last[i]))
     if cut:
         m = (t >= cut[0] + t_s) & (t < cut[1] + t_s)
         sp[m, 0] = 0.0
-    run = (t >= t_s) & (t < t_s + T_sched + 0.2)
     # firmware reference = integral of the received sp; the car follows it with a lag
     xr = np.cumsum(sp[:, 0] * 0.01)
     thr = np.cumsum(sp[:, 2] * 0.01)
@@ -91,15 +103,16 @@ def make(d, cho='K1', phan='all', a_true_deg=0.7, q=(0.004, -0.003), lag=0.15, D
     ra = run.astype(float)
     if second_edge:
         ra[(t >= t_s + 20.0) & (t < t_s + 20.05)] = 0.0
-    pos_reset = np.where(t >= t_s, 4.0, 3.0)
+    pos_reset = np.where(np.arange(n) >= int(np.argmax(run)), 4.0, 3.0)     # +1 at the run_active edge
     with open(os.path.join(d, 'log.csv'), 'w', encoding='utf-8', newline='') as f:
         w = csv.writer(f)
         w.writerow(LOG_HDR)
         for i in range(n):
             w.writerow([int(round(t[i] * 1e6)) + 100000000, *counts[i].tolist(), f'{sp[i, 0]:.6f}', f'{sp[i, 1]:.6f}',
                         f'{sp[i, 2]:.6f}', f'{math.atan2(math.sin(yaw[i]), math.cos(yaw[i])):.6f}', int(ra[i]), 1,
-                        int(pos_reset[i]), 1000 + i, 1, int(rv_n[i]), (i % 5) * 10, 3, 0, 10 if run[i] else -1,
+                        int(pos_reset[i]), 1000 + i, 1, int(rv_n[i]), (i % 5) * 10, 3, 0, int(age[i]),
                         f'{xr[i]:.6f}', '0.000000'])
+    write_summary(os.path.join(d, 'log.csv'))
     # camera
     x0, y0, h0 = START[cho]
     h0 = math.radians(h0)

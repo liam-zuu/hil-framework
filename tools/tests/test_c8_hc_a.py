@@ -187,3 +187,159 @@ def test_kiem_video_with_injected_sparse_frames(tmp_path, monkeypatch):
     import c8_hc_video as hv
     monkeypatch.setattr(hv, 'sparse_frames', lambda clip, session, stride=3: sub)
     assert ca.main(['kiem_video', d, '--clip', 'x.MOV', '--session', 's.json']) == 0
+
+
+# ------------------------------------------------------------------ Codex code review round 1 (HCC1-4..6)
+def edit_log(d, fn):
+    """Rewrite log.csv through fn(header, rows) (rows: lists of str) and refresh the logger summary."""
+    import csv
+    p = os.path.join(d, 'log.csv')
+    with open(p, newline='', encoding='utf-8') as f:
+        rows = list(csv.reader(f))
+    hdr, body = rows[0], rows[1:]
+    fn(hdr, body)
+    with open(p, 'w', newline='', encoding='utf-8') as f:
+        csv.writer(f).writerows([hdr] + body)
+    sy.write_summary(p)
+
+
+def col(hdr, name):
+    return hdr.index(name)
+
+
+def run_rows(hdr, body):
+    ra = [i for i, r in enumerate(body) if r[col(hdr, 'run_active')] == '1']
+    return ra[0], ra[-1]
+
+
+def test_firmware_timeout_wait_is_not_a_sender_gap(tmp_path):
+    """HCC1-4: after the last zero packet the firmware keeps run_active up to 200 ms (real logs 193-197 ms); that
+    wait is checked on its own and does not fail the 60 ms sender gate."""
+    d, _ = make(tmp_path, cho='K2')
+    ok, ck, info = checks(d)
+    L = ca.load_attempt(d)['log']
+    assert L['traj_age_ms'][info['i1']] >= 180 and info['j_s'] < info['i1']
+    assert ok['traj_age'] and ok['het_han_firmware'], ck
+
+
+def test_new_packet_during_timeout_wait_fails(tmp_path):
+    d, _ = make(tmp_path, cho='K2')
+
+    def fn(hdr, body):
+        i0, i1 = run_rows(hdr, body)
+        body[i1 - 5][col(hdr, 'traj_age_ms')] = '5'                          # a packet inside the wait, not fresh-gated
+        body[i1 - 5][col(hdr, 'sp_vx')] = '0.000000'
+    edit_log(d, fn)
+    ok, ck, _ = checks(d)
+    assert not (ok['traj_age'] and ok['het_han_firmware'])
+
+
+def test_late_packets_after_run_active_falls_fail(tmp_path):
+    """HCC1-5 (Codex): sp_vx 0.10 m/s on 10 rows after run_active fell passed every gate before."""
+    d, _ = make(tmp_path, cho='K2')
+
+    def fn(hdr, body):
+        i0, i1 = run_rows(hdr, body)
+        for r in body[i1 + 3:i1 + 13]:
+            r[col(hdr, 'sp_vx')] = '0.100000'
+    edit_log(d, fn)
+    ok, ck, _ = checks(d)
+    assert not ok['khong_goi_muon']
+
+
+def test_vy_during_turn_fails(tmp_path):
+    d, _ = make(tmp_path, cho='K1')
+
+    def fn(hdr, body):
+        jw = [i for i, r in enumerate(body) if abs(float(r[col(hdr, 'sp_wz')])) > 0.1]
+        for i in jw[50:60]:
+            body[i][col(hdr, 'sp_vy')] = '0.020000'
+    edit_log(d, fn)
+    ok, ck, _ = checks(d)
+    assert not ok['lenh_nhan_khop_lich']
+
+
+def test_cancelling_wz_pulses_in_translation_fail(tmp_path):
+    d, _ = make(tmp_path, cho='K2')
+
+    def fn(hdr, body):
+        jv = [i for i, r in enumerate(body) if abs(float(r[col(hdr, 'sp_vx')])) > 0.05]
+        body[jv[30]][col(hdr, 'sp_wz')] = '0.300000'
+        body[jv[31]][col(hdr, 'sp_wz')] = '-0.300000'
+    edit_log(d, fn)
+    ok, ck, _ = checks(d)
+    assert not ok['lenh_nhan_khop_lich']
+
+
+def test_block_shifted_in_time_fails(tmp_path):
+    """HCC1-5: same integral and duration, 0.3 s late (a shorter 4 s hold before it)."""
+    d, _ = make(tmp_path, cho='K2')
+
+    def fn(hdr, body):
+        c = col(hdr, 'sp_vx')
+        nz = [i for i, r in enumerate(body) if abs(float(r[c])) > 1e-6]
+        blocks, cur = [], [nz[0]]
+        for i in nz[1:]:
+            if i == cur[-1] + 1:
+                cur.append(i)
+            else:
+                blocks.append(cur)
+                cur = [i]
+        blocks.append(cur)
+        b = blocks[2]
+        vals = [body[i][c] for i in b]
+        for i in b:
+            body[i][c] = '0.000000'
+        for k, i in enumerate(b):
+            body[i + 30][c] = vals[k]
+    edit_log(d, fn)
+    ok, ck, _ = checks(d)
+    assert not ok['lenh_nhan_khop_lich']
+
+
+def test_missing_or_wrong_summary_fails(tmp_path):
+    d, _ = make(tmp_path, cho='K2')
+    os.remove(os.path.join(d, 'log.csv.summary.json'))
+    assert not checks(d)[0]['logger_summary']
+    sy.write_summary(os.path.join(d, 'log.csv'))
+    with open(os.path.join(d, 'log.csv'), 'a', encoding='utf-8') as f:
+        f.write('\n')
+    assert not checks(d)[0]['logger_summary']
+
+
+def write_events(d, lines):
+    with open(os.path.join(d, 'log.csv.events.txt'), 'w', encoding='utf-8') as f:
+        for ln in lines:
+            for _ in range(3):
+                f.write(f'2026-11-19T10:00:00.000000+00:00 {ln}\n')
+
+
+def test_gain_event_first_seq_outside_log_fails(tmp_path):
+    """HCC1-6 (Codex): '#gain' of the right boot with first_seq 999999 outside the log passed before."""
+    d, _ = make(tmp_path, cho='K2')
+    write_events(d, ['#gain,id=0,applied_n=0,ctrl=PID,first_seq=999999,line_drop=0,boot=e75f708f'])
+    assert not checks(d)[0]['dinh_danh_fw_gain_log']
+    write_events(d, ['#gain,id=0,applied_n=0,ctrl=PID,first_seq=1005,line_drop=0,boot=e75f708f'])
+    assert checks(d)[0]['dinh_danh_fw_gain_log']
+    write_events(d, ['#gain,id=0,applied_n=0,ctrl=PID,first_seq=1005,line_drop=0,boot=0badb00f'])
+    assert not checks(d)[0]['dinh_danh_fw_gain_log']
+
+
+def test_us_end_cut_ticks_read_and_covering(tmp_path):
+    """HCC1-6: the firmware field is cut_ticks (us_state.c 48); 'co'/'khong' only when the #us_end covers the run."""
+    d, _ = make(tmp_path, cho='K2')
+    L = ca.load_attempt(d)['log']
+    last = int(L['log_seq'][-1])
+    first = int(L['log_seq'][0])
+    start = f'#us,ev=start,boot=e75f708f,on=0,swb=-1,first_seq={first},line_drop=0'
+    end = (f'#us_end,boot=e75f708f,on=0,swb=-1,changes=0,blk_ticks=0,cut_ticks={{c}},ticks={last - first + 1},'
+           f'last_data_seq={last},line_drop=0')
+    write_events(d, [start, end.format(c=6)])
+    _, _, info = checks(d)
+    assert info['cat_pwm'] == 'co'
+    write_events(d, [start, end.format(c=0)])
+    assert checks(d)[2]['cat_pwm'] == 'khong'
+    write_events(d, [start.replace('e75f708f', '0badb00f'), end.format(c=0).replace('e75f708f', '0badb00f')])
+    assert checks(d)[2]['cat_pwm'] == 'chua_xac_minh'
+    write_events(d, [start, end.format(c=0).replace('blk_ticks=0', 'blk_ticks=3')])
+    assert not checks(d)[0]['khong_cat_sieu_am']
