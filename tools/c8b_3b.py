@@ -75,7 +75,8 @@ VERSION = 'c8b_3b_v2'
 LE = 1.25
 GA_TOL_M = 0.002            # design 4b "Kiem ga" (kept, CODE 19/11)
 Q_SPREAD_MIN = 0.10         # [DE XUAT] (A) q is identified when 1 - |mean e^(i psi)| over the fitted frames >= 0.10
-CLIP_GAP_S = 2.0            # a time gap > 2 s in frames.csv separates two joined clips (ghep_3b.py leaves 10 s)
+CLIP_GAP_S = 8.0            # a time gap > 8 s separates two joined clips (ghep_3b.py leaves 10 s; a lost stretch inside
+                            # one clip of a few seconds must not cut it: first run 9dd8b22 cut IMG_3601 at a 2-s loss)
 WIN_S = 0.5                 # design 4b (A): smooth fit over 0.5 s
 SLOW_SHARE = 0.10           # the slowest part: the 10 % of the moving frames with the smallest |Omega| [DE XUAT]
 SLOW_MIN = 30               # at least 30 frames in the slowest part
