@@ -1910,6 +1910,15 @@ class _FieldCam:
         q = self.cam.pix2floor(uv, z)
         return q + self.f(q)
 
+    def project(self, X):
+        """Inverse of the floor map for the xy part (q + f(q) = X, fixed point), height kept: the per-case A3 sees
+        through this camera too (CODE 20/11)."""
+        X = np.asarray(X, float).reshape(-1, 3)
+        q = X[:, :2].copy()
+        for _ in range(60):
+            q = X[:, :2] - self.f(q)
+        return self.cam.project(np.column_stack([q, X[:, 2]]))
+
 
 F15_C, F15_KAP = np.array([-0.4802, -0.0329]), 0.119 / ZC
 
@@ -2011,6 +2020,8 @@ def test_meo_E_corners_order_and_lift(tmp_path, scene, monkeypatch):
         p = (P - F15_KAP * F15_C) / (1 - F15_KAP)
         assert np.allclose(k['du_m']['bo_vung'], (1 - F15_KAP) * _FieldCam.f(p), atol=1e-9)
     assert r['h_bar']['da_kiem'] is False
+    a3 = r['ban_do']['ca'][0]['A3']                                      # CODE 20/11: A3 per H32 case
+    assert a3['cam_full'] == 'session.camera' and a3['L_max_m'] == kc.L_MAX_M and a3['n_cap'] == len(a3['cap'])
 
 
 @pytest.mark.parametrize('bad', ['K2', 'no_track_sha', 'dup_dau', 'session', 'a6_other_h', 'a6_nan', 'a6_schema',
@@ -2170,3 +2181,87 @@ def test_meo_bang_accepts_plain_oc(tmp_path, scene, monkeypatch):
     lp, ll = _bang_files(tmp_path, sp, ten=('A', 'B', 'oc'), with_session_file=True)
     _field_cases(monkeypatch, scene)
     assert kc.main(['meo_bang', '--model', 'B1', '--lan-lap', str(lp), '--out', str(tmp_path / 'b.json')]) == 0
+
+
+# ---------------------------------------------------------------- F15 (a): A3 per H32 case (CODE 20/11)
+def test_a3_held_case_sees_a_moved_mark_through_the_case_camera(scene):
+    """Mark 30 truly 2 mm off its tape across the pair 30-32; case bo:30-31-32 (camera fitted without all three):
+    only the pairs of the set with L <= L_max, dtheta of 30-32 = -atan(2 mm / L) (independent of the code), quy =
+    |dtheta| + gap, quy_max the largest; the pair case bo:30-32 uses the same camera as a3_clip for that pair."""
+    marks, cam, _ = scene
+    m, j = 30, 32
+    vt = np.array(marks[j][:2]) - np.array(marks[m][:2])
+    n = np.array([-vt[1], vt[0]]) / np.linalg.norm(vt)
+    true = dict(marks)
+    true[m] = (marks[m][0] + 0.002 * n[0], marks[m][1] + 0.002 * n[1], SIDE)
+    img = image_of(cam, true)
+    pc = kc.PairCams(img, marks, 'B1', W, H, ZC)
+    tag = (0.1445, 0.119)
+    out = kc.a3_held_case('bo:30-31-32', img, marks, cam, pc((30, 31, 32)), (32, 30, 31), tag, l_max=0.8)
+    rows = {(r['i'], r['j']): r for r in out['cap']}
+    assert set(rows) == {(30, 32), (31, 32)} and out['n_cap'] == 2          # 30-31 is 1.0 m > L_max
+    L = float(np.linalg.norm(vt))
+    assert rows[(m, j)]['dtheta_deg'] == pytest.approx(-math.degrees(math.atan2(0.002, L)), abs=2e-3)
+    for r in rows.values():
+        assert r['quy_deg'] == pytest.approx(abs(r['dtheta_deg']) + r['gap_deg']) and r['gap_deg'] >= 0
+    assert out['quy_max_deg'] == max(r['quy_deg'] for r in rows.values()) and out['cam_full'] == 'session.camera'
+    pair = kc.a3_held_case('bo:30-32', img, marks, cam, pc((30, 32)), (30, 32), tag, l_max=0.8)['cap'][0]
+    ref = {(r['i'], r['j']): r for r in kc.a3_clip(img, marks, 'B1', W, H, ZC, l_max=0.8, pc=pc)}[(m, j)]
+    assert pair['dtheta_deg'] == ref['dtheta_deg']                         # same name, same camera (KCF1-3)
+
+
+def test_a3_held_case_without_pair_and_failing(scene):
+    """No pair of the set within L_max: quy_max_deg null with the reason; a failing conversion fails the case
+    (KCF1-5)."""
+    marks, cam, img = scene
+    out = kc.a3_held_case('bo:30-31', img, marks, cam, cam, (30, 31), (0.1445, 0.119), l_max=0.8)
+    assert out['cap'] == [] and out['quy_max_deg'] is None and 'L_max' in out['ly_do']
+
+    class Bad:
+        def pix2floor(self, uv, z=0.0):
+            return np.full((len(np.atleast_2d(uv)), 2), np.nan)
+
+        def project(self, X):
+            return cam.project(X)
+    with pytest.raises(kc.KCError, match='KCF1-5'):
+        kc.a3_held_case('bo:30-32', img, marks, cam, Bad(), (30, 32), (0.1445, 0.119), l_max=0.8)
+
+
+def test_meo_E_a3_per_case_on_real_fits(tmp_path, scene):
+    """Production path, no stub: every H32 case carries A3 over exactly the pairs of its left-out set with L <=
+    L_max; exact scene (session camera = true camera) -> every quy_deg near 0."""
+    sp = _f15_session(tmp_path, scene)
+    td, cs = _e_files(tmp_path, sp)
+    out = tmp_path / 'e.json'
+    assert kc.main(['meo_E', '--model', 'B1', '--cho', 'goc', '--session', str(sp), '--track', str(td), '--cua-so',
+                    str(cs), '--r-xp', '0.3', '--out', str(out)]) == 0
+    r = json.loads(out.read_text(encoding='utf-8'))
+    marks = scene[0]
+    assert len(r['ban_do']['ca']) == 1 + math.comb(len(r['ban_do']['H32_ids']), 2)
+    for ca in r['ban_do']['ca']:
+        ids_ = ca['bo_ids']
+        want = {(a, b) for k, a in enumerate(ids_) for b in ids_[k + 1:]
+                if math.dist(marks[a][:2], marks[b][:2]) <= kc.L_MAX_M}
+        assert {(p['i'], p['j']) for p in ca['A3']['cap']} == want and ca['A3']['cam_ca'] == ca['ten']
+        assert all(p['quy_deg'] < 2e-3 for p in ca['A3']['cap'])
+
+
+def test_meo_E_a3_failure_is_code_2(tmp_path, scene, monkeypatch):
+    """A non-finite A3 sample of a case: code 2, nothing written (KCF1-5)."""
+    sp = _f15_session(tmp_path, scene)
+    td, cs = _e_files(tmp_path, sp)
+    _field_cases(monkeypatch, scene)
+
+    def nan_gap(*a, **k):
+        raise ValueError('non-finite tag / pair angle sample')
+    monkeypatch.setattr(kc, 'a3_tag_gap', nan_gap)
+    assert kc.main(['meo_E', '--model', 'B1', '--cho', 'goc', '--session', str(sp), '--track', str(td), '--cua-so',
+                    str(cs), '--out', str(tmp_path / 'e.json')]) == 2 and not (tmp_path / 'e.json').exists()
+    monkeypatch.undo()                                                  # real conversion again: only L_max is bad
+    _field_cases(monkeypatch, scene)
+    for bad in ('nan', '0', '-1'):
+        assert kc.main(['meo_E', '--model', 'B1', '--cho', 'goc', '--session', str(sp), '--track', str(td),
+                        '--cua-so', str(cs), '--L-max', bad, '--out', str(tmp_path / 'e.json')]) == 2
+    assert not (tmp_path / 'e.json').exists()
+    assert kc.main(['meo_E', '--model', 'B1', '--cho', 'goc', '--session', str(sp), '--track', str(td), '--cua-so',
+                    str(cs), '--out', str(tmp_path / 'e.json')]) == 0            # the same inputs pass otherwise

@@ -1540,6 +1540,39 @@ def held_cases(pc, ids):
     return out
 
 
+def a3_held_case(name, img, marks, cam_full, cam_ca, rm, tag, l_max=L_MAX_M):
+    """A3 of one H32 hold-out case (CODE 20/11, F15 a): every pair (i < j) of the left-out set rm with tape distance
+    <= l_max, measured on the session image through the camera of THE CASE (fitted without all of rm, not only without
+    the pair): dtheta_deg = pair angle through cam_ca minus the tape angle, gap_deg = a3_tag_gap(cam_full, cam_ca)
+    (both directions), quy_deg = |dtheta| + gap (as a3_clip). cam_full = the scoring camera (session.camera, the one
+    of du_m). A non-finite sample or a failed conversion fails the case: KCError (KCF1-5, code 2)."""
+    rows = []
+    rm = sorted(rm)
+    for a in range(len(rm)):
+        for b in range(a + 1, len(rm)):
+            i, j = rm[a], rm[b]
+            vt = np.array(marks[j][:2], float) - np.array(marks[i][:2], float)
+            L = float(np.linalg.norm(vt))
+            if L > l_max:
+                continue
+            try:
+                vc = centre_floor(cam_ca, img[j]) - centre_floor(cam_ca, img[i])
+                g, dpsi, dp = a3_tag_gap(cam_full, cam_ca, marks[i], marks[j], *tag)
+                r = dict(i=i, j=j, L_m=L, dtheta_deg=signed_angle_deg(vt, vc), gap_deg=g, dpsi_ma_max_deg=dpsi,
+                         dtheta_hai_cam_deg=dp)
+                r['quy_deg'] = abs(r['dtheta_deg']) + g
+                if not all(math.isfinite(v) for v in r.values()):
+                    raise ValueError('non-finite result')
+            except Exception as e:
+                raise KCError(f'H32 case {name}: A3 of pair {i}-{j} failed: {str(e)[:200]} (KCF1-5)')
+            rows.append(r)
+    out = dict(cam_full='session.camera', cam_ca=name, L_max_m=float(l_max), n_cap=len(rows), cap=rows,
+               quy_max_deg=max((r['quy_deg'] for r in rows), default=None))
+    if not rows:
+        out['ly_do'] = 'khong co cap moc bo nao trong L_max'
+    return out
+
+
 def _hex(x, what):
     if not isinstance(x, str) or len(x) != 64 or any(ch not in '0123456789abcdef' for ch in x):
         raise KCError(f'{what}: {x!r} is not a sha256 (KCF1-7)')
@@ -1604,9 +1637,12 @@ def meo_E(a):
     """F15 (a): for the E frames of one place (one E_dau and one E_cuoi window of the clip in cua_so_v1; the moving
     frames strictly between them = E_doan, valid with a tag pose), the 4 virtual tag corners (ArUco order,
     c7_measure.car_corners_body) at the measured tag pose, map residual held - full per H32 case. Diagnostic
-    (KCF1-1)."""
+    (KCF1-1). Each case also carries its A3 (a3_held_case, CODE 20/11) on the session of the E clip."""
     if a.cho not in ('goc', 'K1'):
         raise KCError(f'--cho {a.cho!r}: goc|K1 (E places, KCF1-8)')
+    l_max = L_MAX_M if getattr(a, 'L_max', None) is None else a.L_max
+    if not (math.isfinite(l_max) and l_max > 0):
+        raise KCError(f'--L-max {l_max!r}: a finite length > 0')
     tp, fp = os.path.join(a.track, 'track.json'), os.path.join(a.track, 'frames.csv')
     tr, tr_sha = load_json_sha(tp)
     with open(fp, 'rb') as f:
@@ -1672,6 +1708,8 @@ def meo_E(a):
     rx = R_XP_M if a.r_xp is None else a.r_xp
     hid = h32_ids(mk, foot, rx)
     cases = held_cases(pc, hid)
+    a3_ca = {n: a3_held_case(n, pc.img, mk, full, cam, ids_, (side, float(s['tag_h_m'])), l_max)
+             for n, ids_, cam in cases}
     khung = [dict(frame_id=fid, t_s=t, goc_m=[[float(v) for v in x] for x in P],
                   du_m={n: [[float(v) for v in x] for x in map_residual(full, cam, P, kappa, C)] for n, _, cam in cases})
              for (fid, t, *_r), P in zip(poses, P_all)]
@@ -1685,14 +1723,19 @@ def meo_E(a):
                                  dict(vai_tro='session', duong_dan=os.path.abspath(a.session), sha256=ses_sha)],
         mien_E=dict(sau_E_dau=lo, truoc_E_cuoi=hi, khung_dong=len(khung)),
         ban_do=dict(phien_ban=VERSION, session_sha256=ses_sha, full='session.camera', H32_ids=hid, R_XP_M=rx,
-                    ca=[dict(ten=n, bo_ids=ids_) for n, ids_, _ in cases]),
+                    ca=[dict(ten=n, bo_ids=ids_, A3=a3_ca[n]) for n, ids_, _ in cases]),
         h_m=float(s['tag_h_m']), h_bar=_check_h_bar(a.a6, float(s['tag_h_m']), C, float(s['tag_h_m']) / kappa), kappa=kappa,
         plumb_xy_m=[float(x) for x in C], Zc_m=float(s['tag_h_m']) / kappa, tag_offset=[float(v) for v in to],
         khung=khung, commit_hil=commit_hil(),
         gioi_han=['chi so thuc nghiem truoc le; truong du ban do giua camera bo moc H32 va camera cham, trong ho mo hinh',
+                  'ban_do.ca[*].A3 (CODE 20/11): moi cap moc trong tap bo cua ca, L <= L_max, do tren anh session qua '
+                  'camera cua ca (khop khong co ca tap bo), gap qua a3_tag_gap voi camera cham session.camera; '
+                  'quy_deg = |dtheta| + gap_deg nhu a3_clip; quy_max_deg = max cac cap (null khi khong co cap)',
                   MEO_LY_DO]))
     write_new(a.out, out)
-    _say(f'meo_ma_ao_E {a.cho}: {len(khung)} khung, {len(cases)} ca H32 (chan_doan)')
+    _say(f'meo_ma_ao_E {a.cho}: {len(khung)} khung, {len(cases)} ca H32 (chan_doan), A3 quy_max_deg theo ca: '
+         + ', '.join(f'{n}={v["quy_max_deg"]:.4f}' if v['quy_max_deg'] is not None else f'{n}=khong_cap'
+                     for n, v in a3_ca.items()))
 
 
 def _ll_session(ll, a):
@@ -2602,6 +2645,7 @@ def main(argv=None):
     m.add_argument('--cua-so', dest='cua_so', required=True, help='cua_so_v1.jsonl with E_dau, E_cuoi')
     m.add_argument('--r-xp', dest='r_xp', type=float)
     m.add_argument('--a6', help='c8b_a6_v2 of the plate: h_m must be the session tag height (KCF1-6)')
+    m.add_argument('--L-max', dest='L_max', type=float, default=L_MAX_M, help='pair length of the per-case A3')
     m.add_argument('--out', required=True)
     b = sub.add_parser('meo_bang', help='F15 (b) meo_dau_chan_bang from lan_lap.json')
     b.add_argument('--model', required=True)
