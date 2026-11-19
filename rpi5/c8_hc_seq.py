@@ -28,7 +28,16 @@ then E (goc, K1 only; always after 12b): +2.5 turns, stop, -2.5 turns, stop, wz 
 Output DIR/sender.txt ('#seq_start', '#seg' per segment at its first packet, '#seq_end'), DIR/lich.csv (its sha256 in
 '#seq_start'), the logger files, logger_stdout.txt. complete=1 only says the SENDER sent every sample (n_bo = 0); what
 the car received is checked by tools/c8_hc_a.py kiem.
-Last line: #ket_qua,ma=0 sent / 2 refused before sending / 3 aborted.
+Last line: #ket_qua,ma=0 sent whole + question after + logger summary closed / 2 refused before any motion
+packet / 3 aborted or not usable (',ly_do=...').
+
+Codex code review round 1 (HCC1-1..3, 19/11): no write between the clock check and sendto ('#seg' kept in memory),
+sendto bounded (SENDTO_MAX_S), any error after sending started sends the zeros first, '#ket_qua' 0 only with
+complete=1, question after 0 and a closed logger summary whose CSV sha256 matches; --src-ip must equal --ip; floor
+lock (LOCK_PATH, fcntl) + pgrep before and after (pgrep failing refuses); 0.5 s before the first motion packet the
+last 20 logger rows must show motor_on = 1, run_active = 1 (AUTO: SWC not in MANUAL), sp_* = 0, traj_age_ms <= 60.
+Condition, not checked here: the car is not wired to the H7 (no UART trajectory source); this tool is the only UDP
+sender (pgrep snapshot + lock; a sender started after the check that does not take the lock is not seen live).
 """
 from __future__ import annotations
 
@@ -57,6 +66,11 @@ E_TURN = 5.0 * math.pi             # 2.5 turns each way (HC1-6)
 TAIL_S = 2.5                       # zeros after the schedule (as O1_TAIL_S)
 ABORT_ZERO_S = 0.5                 # zeros sent on an abort
 GAP_ABORT_S = 0.100                # a gap between two sends above this aborts (half the firmware 200 ms timeout)
+SENDTO_MAX_S = 0.020               # one sendto longer than this aborts (HCC1-1); real socket timeout too
+READY_LEAD_S = 0.5                 # the car-ready check runs this long before the first motion packet (HCC1-3)
+READY_ROWS = 20                    # logger rows (~0.2 s at 10 ms) that must show a ready car
+READY_AGE_MS = 60                  # traj_age_ms in those rows (zeros are being sent at 50 Hz)
+LOCK_PATH = '/tmp/hil_tai_san.lock'  # shared floor lock (HCC1-3); tools that do not take it are seen by pgrep
 WAIT_FIRST_ROW_S = 10.0            # logger must write a data row within this
 STILL_BEFORE_S = 6.0               # still time after the first log row before the schedule (CODE 19/11)
 STILL_AFTER_S = 6.0                # logger kept after the schedule
@@ -189,105 +203,171 @@ class Abort(Exception):
         self.why, self.kv = why, kv
 
 
+def first_motion_k(segs) -> int:
+    """Index of the first packet that is not (0, 0, 0)."""
+    for k in range(n_samples(segs)):
+        if sample(segs, k) != (0.0, 0.0, 0.0):
+            return k
+    return n_samples(segs)
+
+
 def send_schedule(ip, segs, sock, out, clock=time.monotonic, sleep=time.sleep, wall=time.time,
-                  alive=lambda: True, cho='', phan='', thu_id='', lich_sha=''):
-    """Send the schedule then TAIL_S of zeros on the 50 Hz grid; returns a dict of counters. Raises Abort (after the
-    abort zeros) on a gap > GAP_ABORT_S, a socket error, or alive() false; KeyboardInterrupt is turned into Abort."""
+                  alive=lambda: True, ready=None, cho='', phan='', thu_id='', lich_sha=''):
+    """Send the schedule then TAIL_S of zeros on the 50 Hz grid; returns a dict of counters.
+
+    Timing (HCC1-1): nothing that writes or prints runs between the clock check and sendto; the '#seg' lines are
+    kept in memory and written by out() after the last packet (or after the abort zeros). The clock is read
+    immediately before each sendto: a gap from the previous pre-send check above GAP_ABORT_S, or a sendto that
+    takes longer than SENDTO_MAX_S, aborts. So two packets are never further apart than GAP_ABORT_S + SENDTO_MAX_S
+    (120 ms, under the 200 ms firmware timeout), and a stall that jumps past the end of the schedule is checked too.
+    ready() (HCC1-3) is called once, READY_LEAD_S before the first motion packet (zeros are being sent): None or
+    the reason the car is not ready (logger rows: motor_on, run_active, sp_* = 0) -> abort before any motion.
+
+    Any exception once sending has started (HCC1-2: Abort, a socket error, KeyboardInterrupt, an error writing
+    the log) sends the abort zeros first, then tries to write '#seq_end' and '#seq_huy', then raises Abort."""
     n_plan = n_samples(segs)
     n_tail = int(math.ceil(TAIL_S * SEND_HZ - 1e-9))
-    e0 = wall()
-    out(f"#seq_start,ver={VERSION},cho={cho},phan={phan},thu_id={thu_id},t_epoch={e0:.3f},"
-        f"iso={time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(e0))},duration_s={duration(segs):.3f},"
-        f"send_hz={SEND_HZ},tail_s={TAIL_S},dst={ip}:{TRAJ_PORT},lich_sha256={lich_sha}")
-    t0 = clock()
-    last_send, k, sent, skipped, gap_max = None, 0, 0, 0, 0.0
-    seg_done = set()
-    first_s = last_s = None
     total = n_plan + n_tail
+    k_move = first_motion_k(segs)
+    k_ready = max(0, k_move - int(round(READY_LEAD_S * SEND_HZ)))
+    e0 = wall()
+    buf = [f"#seq_start,ver={VERSION},cho={cho},phan={phan},thu_id={thu_id},t_epoch={e0:.3f},"
+           f"iso={time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(e0))},duration_s={duration(segs):.3f},"
+           f"send_hz={SEND_HZ},tail_s={TAIL_S},dst={ip}:{TRAJ_PORT},lich_sha256={lich_sha}"]
+    st = dict(k=0, sent=0, skipped=0, gap_max=0.0, sendto_max=0.0, first_s=None, last_s=None)
+    seg_done = set()
+    ready_done = ready is None
+    t0 = clock()
+    last_chk = None
     try:
-        while k < total:
+        while True:
             now = clock() - t0
-            k_now = max(k, int(math.floor(now * SEND_HZ + 1e-9)))
-            if k_now >= total:
-                break
-            if k_now > k:
-                skipped += k_now - k
-            k = k_now
-            if last_send is not None:
-                gap = now - last_send
-                gap_max = max(gap_max, gap)
+            k_now = max(st['k'], int(math.floor(now * SEND_HZ + 1e-9)))
+            if last_chk is not None:                     # also when the stall jumped past the end (HCC1-1)
+                gap = now - last_chk
+                st['gap_max'] = max(st['gap_max'], gap)
                 if gap > GAP_ABORT_S:
-                    raise Abort('tre_gui', k=k, gap_ms=f'{gap * 1000:.1f}')
+                    raise Abort('tre_gui', k=k_now, gap_ms=f'{gap * 1000:.1f}')
+            if k_now >= total:
+                st['skipped'] += total - st['k']
+                break
+            st['skipped'] += k_now - st['k']
+            st['k'] = k = k_now
             if not alive():
                 raise Abort('logger_chet', k=k)
+            if not ready_done and k >= k_ready:
+                ready_done = True
+                why = ready()
+                buf.append(f"#kiem_truoc_chay,k={k},ket_qua={'dat' if why is None else 'hong'}"
+                           + ('' if why is None else ',ly_do=' + str(why).replace(',', ';')))
+                if why is not None:
+                    raise Abort('xe_chua_san_sang', k=k)
+                continue                                  # the check took time: read the clock again
             if k < n_plan:
                 vx, vy, wz = sample(segs, k)
                 i = seg_at(segs, k * DT)
                 if i not in seg_done:
                     seg_done.add(i)
                     s = segs[i]
-                    out(f"#seg,i={i},loai={s['loai']},t_plan_s={s['t0']:.3f},t_sent_s={now:.6f},t_epoch={wall():.3f},"
-                        f"truc={s['truc']},tu={s['tu']:.6f},toi={s['toi']:.6f},v={s['v']:g},a={s['a']:g}")
+                    buf.append(f"#seg,i={i},loai={s['loai']},t_plan_s={s['t0']:.3f},t_sent_s={now:.6f},"
+                               f"t_epoch={wall():.3f},truc={s['truc']},tu={s['tu']:.6f},toi={s['toi']:.6f},"
+                               f"v={s['v']:g},a={s['a']:g}")
             else:
                 vx = vy = wz = 0.0
+            pkt = pack_packet(vx, vy, wz)
+            chk = clock() - t0                           # immediately before sendto
+            if last_chk is not None and chk - last_chk > GAP_ABORT_S:
+                st['gap_max'] = max(st['gap_max'], chk - last_chk)
+                raise Abort('tre_gui', k=k, gap_ms=f'{(chk - last_chk) * 1000:.1f}')
             try:
-                sock.sendto(pack_packet(vx, vy, wz), (ip, TRAJ_PORT))
+                sock.sendto(pkt, (ip, TRAJ_PORT))
             except OSError as exc:
                 raise Abort('socket', k=k, loi=str(exc).replace(',', ';'))
-            last_send = clock() - t0
+            done = clock() - t0
+            st['sendto_max'] = max(st['sendto_max'], done - chk)
+            if last_chk is not None:
+                st['gap_max'] = max(st['gap_max'], chk - last_chk)
+            last_chk = chk
+            if done - chk > SENDTO_MAX_S:
+                raise Abort('sendto_cham', k=k, ms=f'{(done - chk) * 1000:.1f}')
             if k == 0:
-                first_s = last_send
+                st['first_s'] = chk
             if k == n_plan - 1:
-                last_s = last_send
-            sent += 1
-            k += 1
-            wait = t0 + k * DT - clock()
+                st['last_s'] = chk
+            st['sent'] += 1
+            st['k'] = k + 1
+            if st['k'] >= total:
+                break
+            wait = t0 + st['k'] * DT - clock()
             if wait > 0:
                 sleep(wait)
-    except KeyboardInterrupt:
-        exc = Abort('ctrl_c', k=k)
+    except BaseException as exc:                         # noqa: B902  (HCC1-2: zeros before any write)
+        ab = exc if isinstance(exc, Abort) else Abort(
+            'ctrl_c' if isinstance(exc, KeyboardInterrupt) else 'loi_' + type(exc).__name__, k=st['k'])
         _abort_zeros(ip, sock, sleep)
-        _end(out, wall, sent, total, skipped, gap_max, first_s, last_s, complete=0)
-        out(f"#seq_huy,ly_do={exc.why},k={k}")
-        raise exc
-    except Abort as exc:
-        _abort_zeros(ip, sock, sleep)
-        _end(out, wall, sent, total, skipped, gap_max, first_s, last_s, complete=0)
-        out('#seq_huy,ly_do=' + exc.why + ''.join(f',{a}={b}' for a, b in exc.kv.items()))
-        raise
-    complete = int(sent == total and skipped == 0)
-    _end(out, wall, sent, total, skipped, gap_max, first_s, last_s, complete)
-    return dict(sent=sent, planned=total, n_bo=skipped, gap_max_ms=gap_max * 1000, complete=complete)
+        _flush(out, buf)
+        _end(out, wall, st, total, complete=0)
+        out('#seq_huy,ly_do=' + ab.why + ''.join(f',{a}={b}' for a, b in ab.kv.items()))
+        raise ab from (None if exc is ab else exc)
+    complete = int(st['sent'] == total and st['skipped'] == 0)
+    _flush(out, buf)
+    _end(out, wall, st, total, complete)
+    return dict(sent=st['sent'], planned=total, n_bo=st['skipped'], gap_max_ms=st['gap_max'] * 1000,
+                complete=complete)
+
+
+def _flush(out, buf):
+    """Write the lines kept in memory during sending; an error here is reported after the zeros were sent."""
+    while buf:
+        try:
+            out(buf.pop(0))
+        except Exception:                                 # noqa: BLE001  the zeros are already out
+            buf.clear()
+            raise
 
 
 def _abort_zeros(ip, sock, sleep):
+    """ABORT_ZERO_S of zero packets; nothing here may stop the zeros (Ctrl-C again, socket errors)."""
     for _ in range(int(round(ABORT_ZERO_S * SEND_HZ))):
         try:
             sock.sendto(pack_packet(0.0, 0.0, 0.0), (ip, TRAJ_PORT))
-        except OSError:
+        except (OSError, ValueError):
             pass
-        sleep(DT)
+        try:
+            sleep(DT)
+        except KeyboardInterrupt:
+            pass
 
 
-def _end(out, wall, sent, total, skipped, gap_max, first_s, last_s, complete):
+def _end(out, wall, st, total, complete):
     f = lambda v: '' if v is None else f'{v:.6f}'           # noqa: E731
-    out(f"#seq_end,t_epoch={wall():.3f},sent={sent},planned={total},n_bo={skipped},gap_max_ms={gap_max * 1000:.1f},"
-        f"complete={complete},sched_first_s={f(first_s)},sched_last_s={f(last_s)}")
+    out(f"#seq_end,t_epoch={wall():.3f},sent={st['sent']},planned={total},n_bo={st['skipped']},"
+        f"gap_max_ms={st['gap_max'] * 1000:.1f},sendto_max_ms={st['sendto_max'] * 1000:.1f},"
+        f"complete={complete},sched_first_s={f(st['first_s'])},sched_last_s={f(st['last_s'])}")
 
 
 # ---------------------------------------------------------------- one attempt
-def others_running(pgrep=None, me=None):
-    """Names of other sender / logger processes (pgrep -af); [] when pgrep is missing (Windows tests)."""
-    me = os.getpid() if me is None else me
-    run = pgrep or (lambda: subprocess.run(['pgrep', '-af', 'python'], capture_output=True, text=True).stdout)
+def _pgrep_default():
+    """pgrep -af python: its text; exit 1 = no process (''), any other failure raises SeqError (HCC1-3)."""
     try:
-        txt = run()
-    except (OSError, FileNotFoundError):
-        return []
+        p = subprocess.run(['pgrep', '-af', 'python'], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SeqError(f'pgrep could not run ({exc}): cannot prove no other sender/logger runs')
+    if p.returncode not in (0, 1):
+        raise SeqError(f'pgrep exit {p.returncode}: cannot prove no other sender/logger runs')
+    return p.stdout if p.returncode == 0 else ''
+
+
+def others_running(pgrep=None, me=None, exclude=()):
+    """Names of other sender / logger processes (pgrep -af). pgrep missing or failing refuses (SeqError), it is
+    never read as 'nothing runs' (HCC1-3). A snapshot: tools started later are not seen (the floor lock covers
+    other c8_hc_seq runs; the check is repeated after the schedule)."""
+    me = os.getpid() if me is None else me
+    txt = (pgrep or _pgrep_default)()
     found = []
     for line in (txt or '').splitlines():
         parts = line.split(None, 1)
-        if not parts or not parts[0].isdigit() or int(parts[0]) == me:
+        if not parts or not parts[0].isdigit() or int(parts[0]) == me or int(parts[0]) in exclude:
             continue
         cmd = parts[1] if len(parts) > 1 else ''
         found += [f'{parts[0]}:{n}' for n in OTHERS if n in cmd]
@@ -304,14 +384,99 @@ def data_rows(path) -> int:
     return max(0, len(rows) - 1)
 
 
-def start_logger(d, src_ip, popen=subprocess.Popen):
+def _tail_rows(path, nbytes=16384):
+    """(header, last data rows) of the logger CSV: header from the first line, rows from the last nbytes."""
+    with open(path, 'rb') as f:
+        head = f.readline().decode('utf-8', 'replace').strip()
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        f.seek(max(0, size - nbytes))
+        tail = f.read().decode('utf-8', 'replace').splitlines()
+    if size > nbytes:
+        tail = tail[1:]                                  # first line may be cut
+    rows = [ln.strip() for ln in tail if ln.strip() and not ln.startswith('#') and ln.strip() != head]
+    return head.split(','), rows
+
+
+def car_ready(csv_path, n=READY_ROWS):
+    """None when the last n logger rows show the car ready for motion (HCC1-3): motor_on = 1 (not the 10 Hz
+    motor-off line), run_active = 1 (MODE_AUTO with fresh packets: SWC not in MANUAL), sp_vx = sp_vy = sp_wz = 0
+    (only our zeros are applied), 0 <= traj_age_ms <= READY_AGE_MS; else the reason."""
+    try:
+        cols, rows = _tail_rows(csv_path)
+    except OSError as exc:
+        return f'log: {exc}'
+    need = ('motor_on', 'run_active', 'sp_vx', 'sp_vy', 'sp_wz', 'traj_age_ms')
+    if any(c not in cols for c in need):
+        return 'log thieu cot ' + '/'.join(c for c in need if c not in cols)
+    if len(rows) < n:
+        return f'chi {len(rows)} dong log'
+    ix = {c: cols.index(c) for c in need}
+    for ln in rows[-n:]:
+        f = ln.split(',')
+        try:
+            v = {c: float(f[ix[c]]) for c in need}
+        except (ValueError, IndexError):
+            return 'dong log hong'
+        if v['motor_on'] != 1:
+            return 'motor_on=0'
+        if v['run_active'] != 1:
+            return 'run_active=0 (MANUAL/SWC hay khong nhan goi)'
+        if v['sp_vx'] != 0 or v['sp_vy'] != 0 or v['sp_wz'] != 0:
+            return 'sp_khac_0 (co nguon lenh khac)'
+        if not 0 <= v['traj_age_ms'] <= READY_AGE_MS:
+            return f"traj_age_ms={v['traj_age_ms']:g}"
+    return None
+
+
+def floor_lock(path=LOCK_PATH):
+    """Exclusive non-blocking lock shared by the floor tools that take it (HCC1-3); None where fcntl is missing
+    (Windows tests). Raises SeqError when another holder has it."""
+    try:
+        import fcntl
+    except ImportError:
+        return None
+    f = open(path, 'a+')
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        raise SeqError(f'floor lock {path} held by another run')
+    return f
+
+
+def summary_check(csv_path):
+    """(ok, text) of the logger summary (HCC1-2): status closed and the CSV sha256 of its manifest equals the
+    file on disk."""
+    sp = csv_path + '.summary.json'
+    try:
+        import json
+        with open(sp, encoding='utf-8') as f:
+            s = json.load(f)
+        h = hashlib.sha256()
+        with open(csv_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(1 << 20), b''):
+                h.update(chunk)
+    except (OSError, ValueError) as exc:
+        return False, f'summary: {type(exc).__name__}'
+    man = (s.get('files') or {}).get('csv') or {}
+    ok = s.get('status') == 'closed' and man.get('sha256') == h.hexdigest()
+    return ok, f"status={s.get('status')},csv_sha256={h.hexdigest()},khop={int(man.get('sha256') == h.hexdigest())}"
+
+
+def start_logger(d, src_ip, popen=subprocess.Popen, logger=None, extra=()):
     out = open(os.path.join(d, 'logger_stdout.txt'), 'x', encoding='utf-8')
     kw = dict(stdout=out, stderr=subprocess.STDOUT)
     if os.name == 'posix':
         kw['start_new_session'] = True          # Ctrl-C at the terminal does not reach the logger (HC3-2)
     else:
         kw['creationflags'] = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
-    p = popen([sys.executable, LOGGER, '--strict', '--src-ip', src_ip, '--out', os.path.join(d, 'log.csv')], **kw)
+    try:
+        p = popen([sys.executable, logger or LOGGER, '--strict', '--src-ip', src_ip, '--out', os.path.join(d, 'log.csv'),
+                   *extra], **kw)
+    except BaseException:
+        out.close()
+        raise
     return p, out
 
 
@@ -331,15 +496,30 @@ def stop_logger(p, timeout=LOGGER_CLOSE_S):
 
 
 def run_attempt(a, out=print, clock=time.monotonic, sleep=time.sleep, wall=time.time, sock=None, popen=subprocess.Popen,
-                query=gain_query_file, pgrep=None) -> int:
+                query=gain_query_file, pgrep=None, ready=None, lock=floor_lock, logger=None, logger_extra=()) -> int:
+    """One attempt (design 2.3). Exit 0 only when the schedule was sent whole (complete=1), the gain question
+    after the schedule answered (exit 0), no other sender/logger appeared, and the logger exited 0 with a
+    closed summary whose CSV sha256 matches the file (HCC1-2); 2 refused before any motion packet; 3 aborted or
+    the attempt is not usable (reasons in '#ket_qua')."""
     segs = schedule(a.cho, a.phan)
+    if a.src_ip != a.ip:                                  # HCC1-3: logger, questions and packets: one ESP32
+        raise SeqError(f'--src-ip {a.src_ip} != --ip {a.ip}: logger, gain questions and packets must be one ESP32')
     d = a.thu_muc
     if os.path.lexists(d):
         raise SeqError(f'--thu-muc {d} already exists: use a new folder for each attempt')
-    busy = others_running(pgrep)
-    if busy:
-        raise SeqError(f'other sender/logger processes running: {busy}')
-    os.makedirs(d)
+    held = lock()
+    try:
+        busy = others_running(pgrep)
+        if busy:
+            raise SeqError(f'other sender/logger processes running: {busy}')
+        os.makedirs(d)
+        return _attempt(a, segs, d, out, clock, sleep, wall, sock, popen, query, pgrep, ready, logger, logger_extra)
+    finally:
+        if held is not None:
+            held.close()
+
+
+def _attempt(a, segs, d, out, clock, sleep, wall, sock, popen, query, pgrep, ready, logger, logger_extra):
     thu_id = os.path.basename(os.path.normpath(d))
     lich = lich_csv(segs)
     with open(os.path.join(d, 'lich.csv'), 'x', encoding='utf-8', newline='\n') as f:
@@ -350,12 +530,16 @@ def run_attempt(a, out=print, clock=time.monotonic, sleep=time.sleep, wall=time.
     def say(line):
         txt.write(line + '\n')
         txt.flush()
-        out(line)
+        try:
+            out(line)
+        except (OSError, ValueError):                     # terminal gone: the file is the record
+            pass
 
-    proc, lout = start_logger(d, a.src_ip, popen)
-    code = 0
+    csv_path = os.path.join(d, 'log.csv')
+    proc = lout = None
+    code, why, moved = 0, [], False
     try:
-        csv_path = os.path.join(d, 'log.csv')
+        proc, lout = start_logger(d, a.src_ip, popen, logger, logger_extra)
         t_start = clock()
         while data_rows(csv_path) < 1:
             if proc.poll() is not None:
@@ -370,30 +554,67 @@ def run_attempt(a, out=print, clock=time.monotonic, sleep=time.sleep, wall=time.
         if qcode != 0:
             raise SeqError('gain question before the schedule failed (gain_query_truoc.txt): nothing sent')
         own = sock is None
-        s = sock or socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s = sock
+        if own:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(SENDTO_MAX_S)                    # a blocked sendto raises (HCC1-1)
+        rd = ready or (lambda: car_ready(csv_path))
         try:
-            send_schedule(a.ip, segs, s, say, clock, sleep, wall, alive=lambda: proc.poll() is None,
-                          cho=a.cho, phan=a.phan, thu_id=thu_id, lich_sha=lich_sha)
-        except Abort:
-            code = 3
+            moved = True
+            r = send_schedule(a.ip, segs, s, say, clock, sleep, wall, alive=lambda: proc.poll() is None,
+                              ready=rd, cho=a.cho, phan=a.phan, thu_id=thu_id, lich_sha=lich_sha)
+            if not r['complete']:
+                code, why = 3, why + ['complete=0']
+        except Abort as exc:
+            code, why = (2 if exc.why == 'xe_chua_san_sang' else 3), why + ['huy_' + exc.why]
         finally:
             if own:
                 s.close()
-        say(f"#gain_query,when=sau,exit={query(a.ip, os.path.join(d, 'gain_query_sau.txt'))}")
+        qs = query(a.ip, os.path.join(d, 'gain_query_sau.txt'))
+        say(f'#gain_query,when=sau,exit={qs}')
+        if qs != 0:
+            code, why = max(code, 3), why + ['gain_sau']
+        busy = others_running(pgrep, exclude=(getattr(proc, 'pid', None),))
+        say(f"#pgrep_sau,khac={'/'.join(busy) or '-'}")
+        if busy:
+            code, why = max(code, 3), why + ['tien_trinh_khac']
         sleep(STILL_AFTER_S)
     except SeqError as exc:
         say(f'#tu_choi,ly_do={str(exc).replace(",", ";")}')
-        code = 2
-    except KeyboardInterrupt:
-        say('#seq_huy,ly_do=ctrl_c_ngoai_lich')
-        code = 3
+        code, why = (3 if moved else 2), why + ['tu_choi']
+    except BaseException as exc:                          # noqa: B902  Ctrl-C, a write error: still close the logger
+        if moved:
+            code, why = 3, why + ['loi_' + type(exc).__name__]
+        else:
+            code, why = max(code, 2), why + ['loi_' + type(exc).__name__]
+        try:
+            say(f'#seq_huy,ly_do=ngoai_lich_{type(exc).__name__}')
+        except Exception:                                 # noqa: BLE001
+            pass
     finally:
-        rc = stop_logger(proc)
-        lout.close()
-        say(f'#logger_dong,ma={rc}')
-        say(f'#ket_qua,ma={code}')
+        rc = stop_logger(proc) if proc is not None else 'khong_chay'
+        if lout is not None:
+            lout.close()
+        ok, stxt = summary_check(csv_path) if proc is not None else (False, 'khong_chay')
+        say(f'#logger_dong,ma={rc},{stxt}')
+        if code == 0 and (rc != 0 or not ok):
+            code, why = 3, why + ['logger']
+        say(f"#ket_qua,ma={code}" + (f",ly_do={'/'.join(why)}" if why else ''))
         txt.close()
     return code
+
+
+def _hangup_as_interrupt():
+    """SIGHUP (the SSH session drops) and SIGTERM take the same path as Ctrl-C: zeros, question after, logger
+    closed (HCC1-2). The firmware 200 ms timeout stays the last stop if the process is killed outright."""
+    def h(sig, frame):
+        raise KeyboardInterrupt
+    for name in ('SIGHUP', 'SIGTERM'):
+        if hasattr(signal, name):
+            try:
+                signal.signal(getattr(signal, name), h)
+            except (OSError, ValueError):
+                pass
 
 
 def main(argv=None) -> int:
@@ -414,6 +635,7 @@ def main(argv=None) -> int:
             return 0
         if not (a.ip and a.src_ip and a.thu_muc):
             ap.error('--ip, --src-ip and --thu-muc are needed to send')
+        _hangup_as_interrupt()
         return run_attempt(a)
     except SeqError as exc:
         print(f'#tu_choi,ly_do={exc}')

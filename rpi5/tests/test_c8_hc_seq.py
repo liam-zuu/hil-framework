@@ -187,8 +187,12 @@ def test_ctrl_c_sends_zeros_and_aborts():
 
 # ------------------------------------------------------------------ one attempt
 class FakeProc:
-    def __init__(self, csv_path, rows=3, die_after=None):
+    """Logger stand-in: writes CSV rows; SIGINT writes a closed summary whose CSV sha256 matches (as agv_logger)."""
+    pid = 4242
+
+    def __init__(self, csv_path, rows=3, die_after=None, summary='ok', rc=0):
         self.csv, self.returncode, self.rows, self.die_after, self.polls = csv_path, None, rows, die_after, 0
+        self.summary, self.rc = summary, rc
         with open(csv_path, 'w', encoding='utf-8') as f:
             f.write('timestamp_us,fl_count\n' + ''.join(f'{i},0\n' for i in range(rows)))
 
@@ -199,35 +203,47 @@ class FakeProc:
         return self.returncode
 
     def send_signal(self, sig):
-        self.returncode = 0
+        self.returncode = self.rc
+        if self.summary is None:
+            return
+        import hashlib
+        import json
+        sha = hashlib.sha256(open(self.csv, 'rb').read()).hexdigest()
+        if self.summary == 'sai_sha':
+            sha = '0' * 64
+        with open(self.csv + '.summary.json', 'w', encoding='utf-8') as f:
+            json.dump(dict(status='closed', files=dict(csv=dict(sha256=sha))), f)
 
     def wait(self, timeout=None):
         return self.returncode
 
 
-def fake_popen(rows=3, die_after=None):
+def fake_popen(rows=3, die_after=None, summary='ok', rc=0):
     made = {}
 
     def popen(cmd, **kw):
         out = cmd[cmd.index('--out') + 1]
         assert '--strict' in cmd and cmd[cmd.index('--src-ip') + 1] == '1.2.3.4'
-        made['p'] = FakeProc(out, rows, die_after)
+        made['p'] = FakeProc(out, rows, die_after, summary, rc)
         return made['p']
     return popen, made
 
 
-def args(d, cho='K2', phan='all'):
-    return types.SimpleNamespace(ip='1.2.3.4', src_ip='1.2.3.4', cho=cho, phan=phan, thu_muc=str(d))
+def args(d, cho='K2', phan='all', src_ip='1.2.3.4'):
+    return types.SimpleNamespace(ip='1.2.3.4', src_ip=src_ip, cho=cho, phan=phan, thu_muc=str(d))
 
 
 def attempt(tmp_path, **kw):
-    clock = FakeClock()
-    popen, made = fake_popen(kw.pop('rows', 3), kw.pop('die_after', None))
+    clock = FakeClock(stall=kw.pop('stall', None))
+    popen, made = fake_popen(kw.pop('rows', 3), kw.pop('die_after', None), kw.pop('summary', 'ok'), kw.pop('rc', 0))
     q = kw.pop('query', lambda ip, path: open(path, 'x').write('#ket_qua,ma=0\n') and 0)
+    ready = kw.pop('ready', lambda: None)
+    pgrep = kw.pop('pgrep', lambda: '')
     sock = FakeSock()
     out, say = lines()
     code = hs.run_attempt(args(tmp_path / 'HC_K2_1', **kw), out=say, clock=clock, sleep=clock.sleep,
-                          wall=lambda: 1.0e9, sock=sock, popen=popen, query=q, pgrep=lambda: '')
+                          wall=lambda: 1.0e9, sock=sock, popen=popen, query=q, pgrep=pgrep, ready=ready,
+                          lock=lambda: None)
     return code, out, sock, tmp_path / 'HC_K2_1'
 
 
@@ -273,3 +289,193 @@ def test_imports_exist_in_pc_sender():
     for n in ('SEND_HZ', 'TRAJ_PORT', 'gain_query_file', 'pack_packet'):
         assert hasattr(ps, n)
     assert os.path.isfile(hs.LOGGER)
+
+
+# ------------------------------------------------------------------ Codex code review round 1 (HCC1-1..3, 14)
+class TimedSock(FakeSock):
+    """Records (time, packet); delay[n] moves the clock forward inside the n-th sendto (a blocked socket)."""
+    def __init__(self, clock, delay=None):
+        super().__init__()
+        self.clock, self.delay, self.times = clock, delay or {}, []
+
+    def sendto(self, pkt, addr):
+        n = len(self.sent)
+        self.times.append(self.clock.t)
+        super().sendto(pkt, addr)
+        self.clock.t += self.delay.get(n, 0.0)
+
+
+def max_gap(sock):
+    return max(b - a for a, b in zip(sock.times[:-1], sock.times[1:]))
+
+
+def test_slow_seg_write_does_not_delay_packets():
+    """HCC1-1: '#seg' writes take 150 ms each (slow SD card): nothing is written between check and send, the lines
+    come after the schedule, every packet keeps the 20 ms grid."""
+    segs = hs.schedule('K2')
+    clock = FakeClock()
+    sock = TimedSock(clock)
+    out = []
+
+    def slow(line):
+        if line.startswith('#seg'):
+            clock.t += 0.150
+        out.append(line)
+    r = hs.send_schedule('1.2.3.4', segs, sock, slow, clock, clock.sleep, lambda: 1.0e9)
+    assert r['complete'] == 1 and max_gap(sock) <= 0.0201
+    assert sum(1 for ln in out if ln.startswith('#seg')) == len(segs)
+
+
+def test_blocked_sendto_aborts_before_next_motion_packet():
+    """HCC1-1: a sendto that takes 150 ms aborts at once (no further motion packet)."""
+    segs = hs.schedule('K2')
+    clock = FakeClock()
+    k_move = hs.first_motion_k(segs)
+    sock = TimedSock(clock, delay={k_move + 10: 0.150})
+    _, err, out, _ = run_send(segs, clock, sock=sock)
+    assert err is not None and err.why == 'sendto_cham'
+    assert all(p == (0.0, 0.0, 0.0) for p in sock.sent[k_move + 11:])            # only abort zeros after it
+
+
+def test_stall_jumping_past_the_end_is_still_a_gap():
+    """HCC1-1: a stall on the last wait that jumps past the end of the schedule is checked before leaving."""
+    segs = hs.schedule('K2')
+    total = hs.n_samples(segs) + int(math.ceil(hs.TAIL_S * hs.SEND_HZ - 1e-9))
+    r, err, out, sock = run_send(segs, FakeClock(stall={total - 1: 0.30}))
+    assert err is not None and err.why == 'tre_gui'
+
+
+def test_write_error_keeps_zero_tail():
+    """HCC1-2: the log write fails (broken pipe) for the motion -> stop line: the packets already ended in zeros."""
+    segs = hs.schedule('K2')
+    clock = FakeClock()
+    sock = FakeSock()
+
+    def broken(line):
+        if line.startswith('#seg,i=2'):
+            raise BrokenPipeError('pipe')
+    with pytest.raises(BrokenPipeError):
+        hs.send_schedule('1.2.3.4', segs, sock, broken, clock, clock.sleep, lambda: 1.0e9)
+    assert sock.sent[-1] == (0.0, 0.0, 0.0)
+    assert len(sock.sent) == hs.n_samples(segs) + int(math.ceil(hs.TAIL_S * hs.SEND_HZ - 1e-9))
+
+
+def test_unexpected_error_in_loop_sends_zeros_first():
+    """HCC1-2: any exception once sending started (here from ready()) sends the abort zeros before re-raising."""
+    segs = hs.schedule('K2')
+
+    def boom():
+        raise OSError('disk')
+    sock = FakeSock()
+    clock = FakeClock()
+    with pytest.raises(hs.Abort) as ei:
+        hs.send_schedule('1.2.3.4', segs, sock, lambda s: None, clock, clock.sleep, lambda: 1.0e9, ready=boom)
+    assert ei.value.why == 'loi_OSError'
+    assert sock.sent and all(p == (0.0, 0.0, 0.0) for p in sock.sent)
+
+
+def test_car_not_ready_aborts_before_any_motion():
+    """HCC1-3: the check 0.5 s before the first motion packet fails -> no motion packet, reason in the log."""
+    segs = hs.schedule('K2')
+    sock = FakeSock()
+    clock = FakeClock()
+    got = []
+    with pytest.raises(hs.Abort) as ei:
+        hs.send_schedule('1.2.3.4', segs, sock, got.append, clock, clock.sleep, lambda: 1.0e9,
+                         ready=lambda: 'run_active=0 (MANUAL)')
+    assert ei.value.why == 'xe_chua_san_sang'
+    assert all(p == (0.0, 0.0, 0.0) for p in sock.sent)
+    assert any(ln.startswith('#kiem_truoc_chay') and 'ket_qua=hong' in ln for ln in got)
+
+
+def write_log(path, rows, cols=('timestamp_us', 'motor_on', 'run_active', 'sp_vx', 'sp_vy', 'sp_wz', 'traj_age_ms')):
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(','.join(cols) + '\n')
+        for r in rows:
+            f.write(','.join(str(x) for x in r) + '\n')
+
+
+def test_car_ready_rows(tmp_path):
+    p = str(tmp_path / 'log.csv')
+    good = [(i, 1, 1, '0.000', '0.000', '0.000', 15) for i in range(40)]
+    write_log(p, good)
+    assert hs.car_ready(p) is None
+    for bad, word in [((1, 0, 1, '0.000', '0.000', '0.000', 15), 'motor_on'),
+                      ((1, 1, 0, '0.000', '0.000', '0.000', 15), 'run_active'),
+                      ((1, 1, 1, '0.100', '0.000', '0.000', 15), 'sp_khac_0'),
+                      ((1, 1, 1, '0.000', '0.000', '0.000', 190), 'traj_age')]:
+        write_log(p, good + [bad] + good[:5])
+        assert word in hs.car_ready(p)
+    write_log(p, good[:5])
+    assert 'dong log' in hs.car_ready(p)
+    write_log(p, good, cols=('timestamp_us', 'motor_on'))
+    assert 'thieu cot' in hs.car_ready(p)
+
+
+def test_attempt_refuses_src_ip_other_than_ip(tmp_path):
+    with pytest.raises(hs.SeqError):
+        attempt(tmp_path, src_ip='9.9.9.9')
+
+
+def test_attempt_not_ready_is_code_2_without_motion(tmp_path):
+    code, out, sock, d = attempt(tmp_path, ready=lambda: 'motor_on=0')
+    assert code == 2 and all(p == (0.0, 0.0, 0.0) for p in sock.sent)
+    assert '#ket_qua,ma=2,ly_do=huy_xe_chua_san_sang' in (d / 'sender.txt').read_text(encoding='utf-8')
+
+
+def _q_after_fails(ip, path):
+    if 'truoc' in path:
+        open(path, 'x').write('#ket_qua,ma=0\n')
+        return 0
+    return 1
+
+
+@pytest.mark.parametrize('kw,why', [
+    (dict(stall={500: 0.05}), 'complete=0'),
+    (dict(query=_q_after_fails), 'gain_sau'),
+    (dict(rc=3), 'logger'),
+    (dict(summary=None), 'logger'),
+    (dict(summary='sai_sha'), 'logger'),
+])
+def test_attempt_success_needs_every_part(tmp_path, kw, why):
+    """HCC1-2: '#ket_qua,ma=0' only with complete=1, the question after, logger exit 0 and a matching summary."""
+    code, out, sock, d = attempt(tmp_path, **kw)
+    last = (d / 'sender.txt').read_text(encoding='utf-8').strip().splitlines()[-1]
+    assert code == 3 and why in last, last
+
+
+def test_attempt_other_process_after_schedule(tmp_path):
+    calls = {'n': 0}
+
+    def pg():
+        calls['n'] += 1
+        return '' if calls['n'] == 1 else '77 python3 rpi5/pc_sender.py --ip x'
+    code, out, sock, d = attempt(tmp_path, pgrep=pg)
+    assert code == 3 and 'tien_trinh_khac' in (d / 'sender.txt').read_text(encoding='utf-8')
+
+
+def test_pgrep_failure_refuses(monkeypatch):
+    def bad(*a, **k):
+        raise FileNotFoundError('pgrep')
+    monkeypatch.setattr(hs.subprocess, 'run', bad)
+    with pytest.raises(hs.SeqError):
+        hs.others_running()
+    monkeypatch.setattr(hs.subprocess, 'run', lambda *a, **k: types.SimpleNamespace(returncode=2, stdout=''))
+    with pytest.raises(hs.SeqError):
+        hs.others_running()
+    monkeypatch.setattr(hs.subprocess, 'run', lambda *a, **k: types.SimpleNamespace(returncode=1, stdout=''))
+    assert hs.others_running() == []
+
+
+def test_others_running_excludes_own_logger():
+    txt = '12 python3 tools/agv_logger.py --strict\n13 python3 tools/agv_logger.py --strict'
+    assert hs.others_running(lambda: txt, me=99, exclude=(12,)) == ['13:agv_logger.py']
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='real logger + SIGINT: Linux (Pi, WSL)')
+@pytest.mark.parametrize('ctrl_c', [False, True])
+def test_e2e_real_logger_posix(tmp_path, ctrl_c):
+    """HCC1-14: the real agv_logger.py as a child (own session, SIGINT, summary), real clock and sockets."""
+    import c8_hc_seq_e2e as e2e
+    code, txt, summ, esp = e2e.chay(str(tmp_path), ctrl_c_after=12.0 if ctrl_c else None)
+    assert e2e.kiem(code, txt, summ, esp, ctrl_c) == []
