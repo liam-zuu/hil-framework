@@ -94,6 +94,8 @@ PHU_FRAC = 1.0              # C8BS-10 round 3: a part counts as measured up to t
                             # reach the peak itself in each direction (design 4b: (A) spin above wz peak 2.61 rad/s,
                             # 0.42 turn/s; (B) above v peak / R, 0.74 turn/s at 25 cm)
 RUN_JUMP_RAD_S = 0.5        # [DE XUAT] a rise of the smoothed rate this far above the run's lowest starts a new spin
+RUN_GAP_JUMP_RAD_S = 0.1    # [DE XUAT] across such a stretch any rise above the rate noise is a re-spin (Codex G3B-1 r3)
+TAM_TOL_M = 0.001            # [DE XUAT] centres of two parts within 1 mm: the held-out gap is a radius change
 RUN_GAP_S = 2.0             # [DE XUAT] a rise across a stretch this long without spinning frames is a re-spin
 RUN_SMOOTH = 31            # spinning frames in the running median of the rate for the runs (0.5 s at 60 frames/s)
 TURN_BINS = 12              # [DE XUAT] a full turn: every 30 degree sector ...
@@ -276,7 +278,7 @@ def spin_runs(t, om):
     for j, i in enumerate(sp):
         # a rise across a stretch without spinning frames (> RUN_GAP_S) is a re-spin too, even when the frames
         # before it were still rising (a slow start, then the set-up spun by hand while the frames were lost)
-        regap = j > 0 and t[i] - t[sp[j - 1]] > RUN_GAP_S and sm[j] > sm[j - 1] + RUN_JUMP_RAD_S
+        regap = j > 0 and t[i] - t[sp[j - 1]] > RUN_GAP_S and sm[j] > sm[j - 1] + RUN_GAP_JUMP_RAD_S
         if sg[j] != s0 or regap or (not rising and sm[j] > lo + RUN_JUMP_RAD_S):
             run, lo, s0, rising = run + 1, math.inf, sg[j], True
         if rising and j > 0 and lab[sp[j - 1]] == run and sm[j] < sm[j - 1]:
@@ -295,11 +297,14 @@ def held_out_runs(fit, res, slk, runs_ci, run):
     why, worst, unchecked = [], None, []
     if len(runs_ci) < 2:
         return None, why, unchecked
-    for r_ in runs_ci:
+    unchecked = [int(r_) for r_ in runs_ci if not np.any(run[slk] == r_)]
+    with_slow = [r_ for r_ in runs_ci if int(r_) not in unchecked]
+    if len(with_slow) < 2:
+        # Codex G3B-1 round 3: one spin with slow frames, the others not used: nothing to hold out between spins (the
+        # time halves still check the one spin); not a failure
+        return None, why, unchecked
+    for r_ in with_slow:
         own = slk[run[slk] == r_]
-        if not len(own):
-            unchecked.append(int(r_))
-            continue
         other = slk[run[slk] != r_]
         if len(other) < SLOW_MIN // 2:
             why.append(f'run {r_}: held-out by run: fewer than {SLOW_MIN // 2} slow frames in the other runs')
@@ -311,6 +316,21 @@ def held_out_runs(fit, res, slk, runs_ci, run):
         e = float(np.max(res(m, own)))
         worst = e if worst is None else max(worst, e)
     return worst, why, unchecked
+
+
+def split_kind(x, y, ia, ib):
+    """Codex G3B3-1: a failed held-out comparison between two parts of the slow frames (ia, ib): circle of each part
+    (identified when it covers a full turn about its own circle); centre shift and radius change between them; kind
+    'ban_kinh' (radius change, centres within TAM_TOL_M), 'tam' (centre moved) or 'khong_nhan_dang' (a part under a
+    turn: the circle is not fixed, the cause not told)."""
+    out = []
+    for i in (ia, ib):
+        cx_, cy_, R_ = circle_fit(x[i], y[i])
+        out.append((cx_, cy_, R_, full_turn(np.arctan2(y[i] - cy_, x[i] - cx_))))
+    (ax, ay, aR, aok), (bx, by, bR, bok) = out
+    dc, dr = float(math.hypot(bx - ax, by - ay)), float(bR - aR)
+    kind = 'khong_nhan_dang' if not (aok and bok) else ('ban_kinh' if dc <= TAM_TOL_M else 'tam')
+    return dict(kieu=kind, dich_tam_m=dc, doi_ban_kinh_m=dr, n=[int(len(ia)), int(len(ib))])
 
 
 def full_turn(ang):
@@ -707,10 +727,12 @@ def analyse_b(F, v_max, wz_max, frame_s):
         ho_t, why_t = held_out(_bfit, _bres, t, slk)
         tam_chung = bool(ctx.get('tam_chung'))
         khong_hai_hoa = bool(ctx.get('khong_hai_hoa'))
+        kieu = []                       # Codex G3B3-1: what a failed held-out check saw (radius change or centre move)
         if ho_t is None:
             ga_why.append(f'clip {k}: held-out by time: {why_t}')
         elif ho_t > GA_TOL_M:
             ga_why.append(f'clip {k}: held-out by time residual {ho_t * 1e3:.2f} mm > {GA_TOL_M * 1e3:.0f} mm')
+            kieu.append(dict(phep='thoi_gian', **split_kind(x, y, *halves(t, slk))))
         if dk > GA_TOL_M:
             ga_why.append(f'clip {k}: residual {dk * 1e3:.2f} mm > {GA_TOL_M * 1e3:.0f} mm')
         # set-up moved between two spins of the clip (Codex G3B-1 round 2)
@@ -721,11 +743,19 @@ def analyse_b(F, v_max, wz_max, frame_s):
         ga_why += [f'clip {k}: {w}' for w in why_r]
         if ho_r is not None and ho_r > GA_TOL_M:
             ga_why.append(f'clip {k}: held-out by run residual {ho_r * 1e3:.2f} mm > {GA_TOL_M * 1e3:.0f} mm')
+            for r_ in runs_ci:
+                own = slk[run[slk] == r_]
+                if len(own) and r_ not in unchecked:
+                    kieu.append(dict(phep=f'luot {r_}', **split_kind(x, y, own, slk[run[slk] != r_])))
         not_checked = ci[np.isin(run[ci], unchecked)]
         use_p[not_checked] = False
-        # radial part: |r - R| about this clip's circle from a slow part covering a full turn, harmonics and drift
-        # NOT removed (Codex G3B-5: a drift in step with the phase must not be taken away)
-        rad_err[ci] = np.abs(np.hypot(x[ci] - cxk, y[ci] - cyk) - Rk)
+        # radial part (Codex G3B-5 round 3): the true radius of the set-up is one unknown constant within the clip, so
+        # the error of a frame can be as large as the PEAK-TO-PEAK of the measured radius over the frames used (a drift
+        # is not halved by taking the deviation from the mean); harmonics and drift not removed
+        rk = np.hypot(x[ci] - cxk, y[ci] - cyk)
+        rad_err[ci] = np.abs(rk - Rk)
+        uk = use_p[ci] & np.isfinite(rk)
+        rad_ptp_k = float(np.ptp(rk[uk])) if uk.any() else None
         # heading against the radius: the tag may sit at another angle on the set-up in each clip
         phi_k = psi[ci] - th[ci]
         hp_err[ci] = np.abs(np.angle(np.exp(1j * (phi_k - np.median(psi[slk] - th[slk])))))
@@ -734,7 +764,7 @@ def analyse_b(F, v_max, wz_max, frame_s):
                              ga_giu_ngoai_thoi_gian_m=ho_t, giu_ngoai_tam_chung=tam_chung,
                              giu_ngoai_khong_hai_hoa=khong_hai_hoa,
                              n_luot_quay=len(runs_ci), ga_giu_ngoai_luot_m=ho_r, luot_khong_kiem=unchecked,
-                             n_khung_khong_kiem=int(len(not_checked)),
+                             n_khung_khong_kiem=int(len(not_checked)), kieu_lech=kieu, ban_kinh_dinh_dinh_m=rad_ptp_k,
                              v_t_max_m_s=float(np.nanmax(v_t[ci])) if np.isfinite(v_t[ci]).any() else None,
                              mo_hinh_ban_kinh=dict(bac1_m=float(np.hypot(co_k[1], co_k[2])),
                                                    elip_m=float(np.hypot(co_k[3], co_k[4])), troi_m_s=float(co_k[5]))))
@@ -746,7 +776,9 @@ def analyse_b(F, v_max, wz_max, frame_s):
     # the frames used: tangential speed of each frame from its own clip's radius, up to v_max, each direction
     cov = coverage(np.sign(om[use_p]) * v_t[use_p], v_max)
     use_r = use_p & np.isfinite(rad_err)
-    rad_dev = float(np.max(rad_err[use_r])) if use_r.any() else None
+    rad_lech_tb = float(np.max(rad_err[use_r])) if use_r.any() else None      # deviation from the mean (information)
+    ptps = [d['ban_kinh_dinh_dinh_m'] for d in ok_clips]
+    rad_dev = max(ptps) if ptps and all(v is not None for v in ptps) else None
     rad_dev_tho = float(np.max(np.abs(r[use_p] - R0))) if use_p.any() else None
     use_h = use_p & np.isfinite(hp_err)
     hp_dev = float(np.max(hp_err[use_h])) if use_h.any() else None
@@ -807,7 +839,8 @@ def analyse_b(F, v_max, wz_max, frame_s):
     return dict(centre=[cx, cy], R0_m=R0, slow_n=int(len(sl)), slow_rate_rad_s=float(np.median(np.abs(om[sl]))),
                 ga_dev_m=ga_dev, ga_dev_giu_ngoai_m=max(hos) if hos else None, ga_ok=not ga_why, ga_why=ga_why,
                 ga_dev_tho_m=ga_dev_tho, theo_clip=per_clip,
-                du_phu=cov['ok'], phu=cov, rad_dev_m=rad_dev, rad_dev_tho_m=rad_dev_tho,
+                du_phu=cov['ok'], phu=cov, rad_dev_m=rad_dev, rad_dev_tho_m=rad_dev_tho, rad_lech_tb_m=rad_lech_tb,
+                rad_kieu='dinh-dinh ban kinh tren khung dung, tung clip (Codex G3B-5 vong 3)',
                 tiep_tuyen='khong do: thieu chuan pha doc lap (Codex G3B-6); P4 cua B chi gom ban kinh',
                 hp_dev_deg=math.degrees(hp_dev) if hp_dev is not None else None,
                 rate_max_rad_s=float(np.nanmax(np.abs(om))), v_t_max_m_s=float(np.nanmax(v_t)),
@@ -834,10 +867,17 @@ def cross_check(fc, a, wz_max):
 
 
 def b_troi_only(b):
-    """L132: every reason B failed the set-up check is a held-out residual by time or by spin (a drift of the radius),
-    not a residual in the fit, a part of a turn, too few frames or q not identified."""
+    """L132: every reason B failed the set-up check is a held-out residual by time or by spin, not a residual in the
+    fit, a part of a turn, too few frames or q not identified; AND no failed held-out comparison IDENTIFIES a moved
+    centre (both parts' circles fixed by a full turn and their centres more than TAM_TOL_M apart: the set-up moving,
+    Codex G3B3-1). A comparison that cannot tell (a part under a turn, 'khong_nhan_dang') does not block: the radial
+    part is the peak-to-peak radius over the frames used (G3B-5 round 3), so the unexplained gap is counted in it as an
+    error (the safe side; 2 slow frames at the start of B IMG_3602 of session 1 are this case)."""
     w = b['ga_why']
-    return bool(w) and all(re.search(r'held-out by (time|run) residual [0-9.]+ mm > ', x) for x in w)
+    if not w or not all(re.search(r'held-out by (time|run) residual [0-9.]+ mm > ', x) for x in w):
+        return False
+    ks = [kk for d in b.get('theo_clip', []) for kk in d.get('kieu_lech') or []]
+    return bool(ks) and not any(kk['kieu'] == 'tam' for kk in ks)
 
 
 def analyse(fa, fb, task='O1-F08', fc=None, b_ke_ca_troi=False):

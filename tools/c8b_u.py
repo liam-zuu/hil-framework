@@ -488,7 +488,10 @@ def u_p_u_psi(cam, tb, tk, xo, info=None):
     extra = sorted(set(xo) - XOAY_KEYS)
     if extra:
         raise UError(f'turning-in-place input: unknown top-level fields {extra}')
-    if tb.get('ga_ok') is not True:                     # C8BU-R1-9: a real boolean, not a truthy string
+    # C8BU-R1-9: a real boolean, not a truthy string; L132 (Liam 19/11 at CODE, "Dung B buoi 1 ke ca troi
+    # (Recommended)"; Codex G3B3-2): a 3b file usable by that choice (dung_duoc true, b_dung_ke_ca_troi true) is taken
+    l132 = tb.get('dung_duoc') is True and tb.get('b_dung_ke_ca_troi') is True
+    if tb.get('ga_ok') is not True and not l132:
         raise UError('test 3b: ga_ok not true (set-up not within 2 mm at the slowest part): redo 3b, numbers not used')
     dpq = _num(tb.get('d_p_quay_m'), '3b d_p_quay_m')
     dsq = _num(tb.get('d_psi_quay_deg'), '3b d_psi_quay_deg')

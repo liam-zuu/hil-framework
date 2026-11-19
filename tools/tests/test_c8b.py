@@ -1181,14 +1181,15 @@ def test_3b_v3_direction_between_clips_only_one_way_clips():
     assert any('direction' in w for w in A['p4_why'])
 
 
-def _wheel_F(parts, R_of_clip, T_s=1 / 60, r_drift=None):
+def _wheel_F(parts, R_of_clip, T_s=1 / 60, r_drift=None, c_step=None):
     t, om = _segs(parts, T_s)
     th = _psi_of(t, om)
     clip = np.concatenate([[0], np.cumsum(np.diff(t) > TB.CLIP_GAP_S)])
     R = np.array([R_of_clip[c] for c in clip], float)
     if r_drift is not None:
         R = R + r_drift(t)
-    x, y = 1.0 + R * np.cos(th), 0.5 + R * np.sin(th)
+    cx = 1.0 + (0.0 if c_step is None else np.where(t >= c_step[0], c_step[1], 0.0))
+    x, y = cx + R * np.cos(th), 0.5 + R * np.sin(th)
     return dict(t=t, x=x, y=y, psi=th + 0.3, row=1100 + R * np.sin(th) / 0.0006,
                 col=1900 + R * np.cos(th) / 0.0006, clip=clip)
 
@@ -1248,6 +1249,67 @@ def test_3b_v3_cli_cross_check_null_fields(tmp_path, capsys):
     assert rc == 0, o.err
     d = json.loads(out.read_text(encoding='utf-8'))
     assert d['A_cheo']['q_abs_m'] is None and '|q| null' in o.out
+
+
+def test_3b_v4_one_spin_with_slow_frames_is_not_a_failure():
+    # Codex G3B-1 round 3: only one spin has slow frames (the other is not used): the set-up still passes (control)
+    A0 = TB.analyse_a(_axis_F([(4, 3.0, 0.35, 40, 0.0), (4, 3.0, 1.4, 40, 0.0)]), 2.614)
+    c = A0['theo_clip'][0]
+    assert A0['ga_ok'], A0['ga_why']
+    assert c['luot_khong_kiem'] == [1] and c['ga_giu_ngoai_luot_m'] is None
+
+
+def test_3b_v4_small_rise_across_a_stop_is_a_new_spin():
+    # Codex G3B-1 round 3: 3 -> 1.4 rad/s, 3 s without frames, 1.8 -> 0.45 rad/s (a rise of 0.4 only), set-up moved 3 mm:
+    # two spins; the first has no slow frame, so its frames are not used and the move cannot enter the position part
+    F = _axis_F([(4, 3.0, 1.4, 40, 3.0), (0, 1.8, 0.45, 40, 0.0)], step_at=46.0, step=0.003)
+    A = TB.analyse_a(F, 2.614)
+    c = A['theo_clip'][0]
+    assert c['n_luot_quay'] == 2 and c['luot_khong_kiem'] == [0], c
+    t, om = _segs([(4, 3.0, 1.4, 40, 3.0), (0, 1.8, 0.45, 40, 0.0)])
+    lab = TB.spin_runs(t, om)
+    assert set(lab[lab >= 0]) == {0, 1}
+
+
+def test_3b_v4_radius_drift_peak_to_peak():
+    # Codex G3B-5 round 3: two clips each way, 4.5 rad/s for 4 s then down to 0.35 over 40 s, the radius growing 5.94 mm
+    # over each clip about a fixed centre: the radial part is the peak-to-peak radius over the frames used, not the
+    # deviation from the mean
+    parts = [(4, 4.5, 0.35, 40, 10.0), (4, -4.5, -0.35, 40, 0.0)]
+    t, _ = _segs(parts)
+    t1 = t[np.flatnonzero(np.diff(t) > 5)[0] + 1]
+    F = _wheel_F(parts, {0: 0.25, 1: 0.25}, r_drift=lambda tt: 0.00594 * np.where(tt < t1, tt / 44.0, (tt - t1) / 44.0))
+    B = TB.analyse_b(F, 0.2915, 0.6536, 1 / 60)
+    assert B['rad_dev_m'] >= B['rad_lech_tb_m'] and B['rad_dev_m'] > 0.00109
+    assert B['rad_kieu'].startswith('dinh-dinh')
+
+
+def test_3b_v4_l132_blocked_by_an_identified_centre_move():
+    # Codex G3B3-1: two full spins of one clip, radius 250 mm, the centre moved 2.6 mm at the turnaround: a moved
+    # set-up, not a drift of the radius; L132 does not open
+    F = _wheel_F([(4, 4.0, 0.35, 40, 0.0), (4, -4.0, -0.35, 40, 0.0)], {0: 0.25}, c_step=(44.05, 0.0026))
+    B = TB.analyse_b(F, 0.2915, 0.6536, 1 / 60)
+    kinds = [k['kieu'] for c in B['theo_clip'] for k in c['kieu_lech']]
+    # the property kept: a moved centre is never under the published radial part. Either the check fails and L132 is
+    # blocked when the move is identified, or the peak-to-peak radius over the frames used covers the move
+    assert (not B['ga_ok'] and 'tam' in kinds and not TB.b_troi_only(B)) or B['rad_dev_m'] >= 0.0026
+    # the identified case itself (each part a full turn, centres 2.6 mm apart)
+    th = np.linspace(0, 4 * math.pi, 800)
+    x = np.r_[1.0 + 0.25 * np.cos(th), 1.0026 + 0.25 * np.cos(th)]
+    y = np.r_[0.5 + 0.25 * np.sin(th), 0.5 + 0.25 * np.sin(th)]
+    k = TB.split_kind(x, y, np.arange(800), np.arange(800, 1600))
+    assert k['kieu'] == 'tam' and k['dich_tam_m'] == pytest.approx(0.0026, abs=1e-6)
+    Bk = dict(ga_why=['clip 0: held-out by run residual 2.60 mm > 2 mm'], theo_clip=[dict(kieu_lech=[dict(k)])])
+    assert not TB.b_troi_only(Bk)
+    Bk['theo_clip'][0]['kieu_lech'][0]['kieu'] = 'khong_nhan_dang'
+    assert TB.b_troi_only(Bk)
+    # a radius step of 2.6 mm at the same place (centre kept): a radius change, L132 may open
+    F2 = _wheel_F([(4, 4.0, 0.35, 40, 0.0), (4, -4.0, -0.35, 40, 0.0)], {0: 0.25},
+                  r_drift=lambda tt: np.where(tt >= 44.05, 0.0026, 0.0))
+    B2 = TB.analyse_b(F2, 0.2915, 0.6536, 1 / 60)
+    if not B2['ga_ok']:
+        assert all(k['kieu'] != 'tam' for c in B2['theo_clip'] for k in c['kieu_lech']) and TB.b_troi_only(B2)
+        assert B2['rad_dev_m'] >= 0.0026 - 2e-4
 
 
 def test_3b_v3_l132_b_used_with_its_drift(tmp_path):
