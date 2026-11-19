@@ -502,7 +502,7 @@ def test_inj_table_rules():
     tab = dn.inj_table(rows)
     assert tab['P_2.0']['dat'] and tab['P_2.0']['cu']['nhan_sai'] == 1 and tab['P_2.0']['moi']['sai_that'] == 2
     assert not tab['P_3.0']['dat'] and 'nhan_sai' in tab['P_3.0']['ly_do']
-    assert not tab['S_1.0']['dat'] and tab['S_1.0']['ly_do'] == ['max_tam', 'max_huong']      # no tolerance (DNC1-05)
+    assert tab['S_1.0']['dat'] and tab['S_1.0']['bao_cao_max']['tam_vuot']    # the max is reported only (v5 8)
     assert tab['S_1.0']['moi_co_i']['nhan'] == 0
     assert tab['P_4.0']['n'] == 0 and tab['P_4.0']['dat']
     assert tab['P_2.0']['dieu_kien'] and not tab['S_1.0']['dieu_kien'] and not tab['PS_2.0_1.0']['dieu_kien']
@@ -578,3 +578,16 @@ def test_cong_refuses_flag_against_tables(tmp_path):
     rc = dn.main(['cong', '--khoa', str(k), '--c1', 'a', 'b', '--c2', 'c', 'd', '--session', 's', '--cu', 'u',
                   '--ghep', 'g', '--frames-a', 'f', '--out', str(tmp_path / 'o')])
     assert rc == 2 and not (tmp_path / 'o').exists()
+
+
+def test_inj_table_paired_only_new_wrong():
+    """design v5 8: a wrong fault only the new gate accepts, with no such fault for the old gate, fails the family."""
+    acc = dict(tang='nhan', loi_tam_m=0.8e-3, loi_huong_deg=0.1)
+    rej = dict(tang='truot_2a', loi_tam_m=0.8e-3, loi_huong_deg=0.1)
+    ok = dict(tang='nhan', loi_tam_m=0.1e-3, loi_huong_deg=0.01)
+    rows = [dict(ho='P', do_lon=3.0, cu=rej, moi=acc), dict(ho='P', do_lon=3.0, cu=acc, moi=acc),
+            dict(ho='P', do_lon=3.0, cu=acc, moi=ok)]
+    d = dn.inj_table(rows)['P_3.0']
+    assert d['cu']['nhan_sai'] == 2 and d['moi']['nhan_sai'] == 2
+    assert d['theo_cap']['chi_moi_nhan_sai'] == 1 and d['theo_cap']['chi_cu_nhan_sai'] == 0
+    assert not d['dat'] and d['ly_do'] == ['chi_moi_nhan_sai']

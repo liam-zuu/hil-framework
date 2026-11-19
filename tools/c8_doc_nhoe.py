@@ -114,8 +114,10 @@ FAMILIES = (('P', 2.0), ('P', 3.0), ('P', 4.0), ('P', 5.0), ('Od', 6), ('Od', 10
 REPORT_FAMS = ('S', 'PS')  # whole-tag shift: no one-frame gate sees it (old gate neither, DN4-01): report only (design v5
 #                            7, Liam 19/11 "Sua, ghi ro (Recommended)", changed AFTER the trial run of khoa)
 BAD_C_M, BAD_P_DEG = 0.5e-3, 0.25    # "accepted wrong": centre > 0.5 mm or heading > 0.25 deg vs the original read
-# v5 2.3: largest accepted centre and heading errors of the new gate <= those of the old gate, no tolerance
-# (DNC1-05: the 0.05 mm of v4 3.3 and a 0.025 deg added by the author are dropped)
+# hard condition per family (design v5 8, Liam 19/11 "Dem loi sai (Recommended)", changed AFTER the run of 784fad7):
+# accepted-wrong of the new gate <= of the old gate, and in pairs: wrong accepted only by the new gate <= only by the
+# old gate. The largest accepted errors (centre, heading) are reported only (the envelope measures the largest
+# error a gate admits). No tolerance anywhere (DNC1-05).
 ENV_N, ENV_DIRS, ENV_BISECT, ENV_MAX_MM = 60, 24, 14, 15.0
 HEALTH_MAX = 0.001          # v5 2.5: old valid frames failing the new gate <= 0.1 % of those that can be scored
 CLUSTER_L = (6, 15, 29)     # cluster families (DN5-01, report only)
@@ -1250,12 +1252,7 @@ def inj_table(rows):
         d['dieu_kien'] = fam not in REPORT_FAMS
         if d['moi']['nhan_sai'] > d['cu']['nhan_sai']:
             why.append('nhan_sai')
-        if d['moi']['max_tam_nhan_m'] > d['cu']['max_tam_nhan_m']:
-            why.append('max_tam')
-        if d['moi']['max_huong_nhan_deg'] > d['cu']['max_huong_nhan_deg']:
-            why.append('max_huong')
-        d['dat'], d['ly_do'] = not why, why
-        # paired view (report): pairs both gates accept, centre error new minus old; faults only one gate accepts
+        # paired view: pairs both gates accept, centre error new minus old; wrong faults only one gate accepts
         both = [(r['cu']['loi_tam_m'], r['moi']['loi_tam_m']) for r in R
                 if r['cu']['tang'] == 'nhan' and r['moi']['tang'] == 'nhan']
         d['theo_cap'] = dict(ca_hai_nhan=len(both), hieu_tam_m=_stat(np.array([b - a for a, b in both])),
@@ -1263,6 +1260,11 @@ def inj_table(rows):
                                                   r['cu']['tang'] != 'nhan' and _bad(r['moi'])),
                              chi_cu_nhan_sai=sum(1 for r in R if r['cu']['tang'] == 'nhan' and
                                                  r['moi']['tang'] != 'nhan' and _bad(r['cu'])))
+        if d['theo_cap']['chi_moi_nhan_sai'] > d['theo_cap']['chi_cu_nhan_sai']:
+            why.append('chi_moi_nhan_sai')
+        d['bao_cao_max'] = dict(tam_vuot=d['moi']['max_tam_nhan_m'] > d['cu']['max_tam_nhan_m'],
+                                huong_vuot=d['moi']['max_huong_nhan_deg'] > d['cu']['max_huong_nhan_deg'])
+        d['dat'], d['ly_do'] = not why, why
         tab[key] = d
     return tab
 
