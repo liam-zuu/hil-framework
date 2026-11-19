@@ -40,6 +40,7 @@ import json
 import math
 import os
 import sys
+from decimal import Decimal
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -53,6 +54,7 @@ YAW0_DEG = 30.0                   # yaw of the standing car (any value: psi0 tak
 YAW_STEP_DEG = 0.01               # report n carries yaw YAW0_DEG + n * YAW_STEP_DEG: tells which report psi0 took
 EDGE_US = T0_US + 2_000_000       # run_active rises on the first tick at or after this time
 RUN_US = 3_000_000
+T_AGE_US = RV_PERIOD_US * 5 // 2    # imu_fusion.h t_age_us at 20 Hz: the firmware's own validity limit
 SP_RUN = (0.0, 0.0, 0.3)          # wz_ref during the run, so psi_ref integrates (counts stay 0: car held)
 
 # Columns as logger.c names them; formats as logger.c prints them
@@ -64,12 +66,14 @@ FMT = {'age_r_ms': '{:.1f}', 'psi_ref': '{:.4f}', 'e_psi': '{:.4f}', 'yaw_rad': 
 class Case:
     """Schedule of one case: which game-RV reports are dropped, chip resets, run_active stretches."""
 
-    def __init__(self, name, drop=(), resets=(), run=((EDGE_US, EDGE_US + RUN_US),), mode_at=()):
+    def __init__(self, name, drop=(), resets=(), run=((EDGE_US, EDGE_US + RUN_US),), mode_at=(),
+                 extra_rv=()):
         self.name = name
-        self.drop = drop          # [(t0, t1)): no RV/gyro report with t in the window
+        self.drop = drop          # [(t0, t1)): no RV/gyro/accel report with t in the window
         self.resets = resets      # chip reset times (fwsim_imu_reset)
         self.run = run            # [(t0, t1)): run_active = 1 on ticks in a window
-        self.mode_at = mode_at    # tick times after which vel_ctrl_set_mode() runs (gain set, main.c 10a)
+        self.mode_at = mode_at    # tick times after which vel_ctrl_set_mode() is injected (fwsim only)
+        self.extra_rv = extra_rv  # extra report times besides the 20 Hz grid
 
     def run_active(self, t):
         return any(a <= t < b for a, b in self.run)
@@ -107,6 +111,8 @@ def simulate(fw, case):
         ev.append((t + RV_PHASE_US, 'rv'))
     for tr in case.resets:
         ev.append((tr, 'reset'))
+    for tx in case.extra_rv:
+        ev.append((tx, 'rv'))
     ev.sort()
     k = 0
     rows = []
@@ -127,7 +133,7 @@ def simulate(fw, case):
         ra = case.run_active(t)
         fw.set_run(ra)
         fw.tick(t, (0, 0, 0, 0), SP_RUN if ra else (0.0, 0.0, 0.0))
-        if t in case.mode_at:                 # main.c: gain set after vel_ctrl_step, seen next tick
+        if t in case.mode_at:                 # injected event, seen by vel_ctrl_step on the next tick
             fw.set_mode('ADRC' if fw.ctrl_mode == 'PID' else 'PID')
         m = dict(zip(fwsim.IMU_COLS, fw.imu_last()))
         p = dict(zip(fwsim.POS_COLS, fw.pos_last()))
@@ -158,38 +164,59 @@ def _num(r, k):
     return v if math.isfinite(v) else None
 
 
-def ref_cond1(rows, age_max_ms, end_seq=None):
+def ref_cond1(rows, age_max_ms, end_seq=None, edge_seq=None):
     """Reference reading of J v6 section 5 command-path condition (1) on the log rows of one run (one boot,
-    sorted by log_seq). Not the scorer: the scorer has its own edge, end anchor and failure order (J section
-    5: operator first; a boot inside the run is an operator failure before this check).
-    Returns (bad, reasons, info); when bad, info['loai'] is 'he_do' (measurement-system failure: the row
-    just before the edge is missing, O1 v11.41 v8 line 94) or 'duong_lenh'.
+    sorted by log_seq; the caller checks the boot and duplicate log_seq). Not the scorer: the scorer has its
+    own edge, end anchor and failure order (J section 5: operator first; a boot inside the run is an
+    operator failure before this check).
+    Returns (bad, reasons, info); when bad, info['loai'] is 'he_do' (measurement-system failure: no edge
+    evidence, i.e. the row just before the edge missing or unreadable, or the log not reaching end_seq;
+    O1 v11.41 v8 line 94) or 'duong_lenh'.
 
-    Window: the edge to end_seq (the scorer's end anchor; default the last run_active = 1 row), every row
-    in it, run_active = 0 stretches included; counters are compared with their value on the edge row.
-    Edge row: r_valid = 1, head_on = 1, psi_ref = 0 (O1 v8 line 94), and rv_n > 0 (J line 127).
-    Yaw age at the latch (J line 127), in integer microseconds: age_r_ms as printed (0.1 ms) + 50 us
-    (half print step) + gap to the next row (tick start -> latch <= gap, T9 doc section 2) + 3 us (1 us
-    clock steps at three stamps, float conversion); only when the edge row shows the latch (r_valid = 1,
-    rv_n > 0, head_on = 1) and the next row has log_seq + 1 and a later timestamp; otherwise not
-    determinable, which J counts as bad. Bad when the bound exceeds age_max_ms."""
+    Edge: edge_seq if the caller gives it (verified edge), else the first row with run_active = 1 whose
+    previous row has run_active = 0. The previous row must be log_seq - 1 with run_active exactly 0.
+    Window: the edge to end_seq (the scorer's end anchor, must be a row of the log at or after the edge;
+    default: the last run_active = 1 row), every row in it, run_active = 0 stretches included; counters
+    compared with their value on the edge row.
+    Edge row: r_valid = 1, rv_n > 0, head_on = 1, psi_ref = 0 (O1 v8 line 94; J line 127).
+    Yaw age at the latch (J line 127), integer microseconds: age_r_ms as printed (0.1 ms) + 50 us (half
+    print step) + gap to the next row (tick start -> latch <= gap, T9 doc section 2.1) + 3 us (1 us clock
+    steps at three stamps, float conversion), only when the edge row meets every condition above, the next
+    row is log_seq + 1 with a later timestamp, and the logged age lies in the proven domain
+    [-gap - 0.05 ms, t_age + 0.05 ms] (t_age = 125 ms at 20 Hz; outside it the flags and the age disagree);
+    otherwise not determinable, which J counts as bad. Bad when the bound exceeds age_max_ms (exact
+    decimal comparison, no rounding of the threshold)."""
     reasons, info = [], {}
     seq = [_num(r, 'log_seq') for r in rows]
     ra = [_num(r, 'run_active') for r in rows]
-    i_edge = next((i for i in range(1, len(rows)) if ra[i] == 1 and ra[i - 1] != 1), None)
-    if i_edge is None:
-        return True, ['no_edge'], {'loai': 'duong_lenh'}
+    if edge_seq is not None:
+        i_edge = next((i for i in range(len(rows)) if seq[i] == edge_seq), None)
+        if i_edge is None or ra[i_edge] != 1:
+            return True, ['khong_co_dong_canh'], {'edge_seq': edge_seq, 'loai': 'he_do'}
+    else:
+        i_edge = next((i for i in range(1, len(rows)) if ra[i] == 1 and ra[i - 1] == 0), None)
+        if i_edge is None:
+            first = next((i for i in range(len(rows)) if ra[i] == 1), None)
+            if first is None:
+                return True, ['no_edge'], {'loai': 'duong_lenh'}
+            i_edge = first                    # active without a readable 0 -> 1 change: no edge evidence
     e = rows[i_edge]
     info['edge_seq'] = seq[i_edge]
-    if seq[i_edge] is None or seq[i_edge - 1] != seq[i_edge] - 1:
+    if (i_edge == 0 or seq[i_edge] is None or seq[i_edge - 1] != seq[i_edge] - 1
+            or ra[i_edge - 1] != 0):
         return True, ['thieu_dong_truoc_canh'], dict(info, loai='he_do')
-    latched = _num(e, 'r_valid') == 1 and (_num(e, 'rv_n') or 0) > 0 and _num(e, 'head_on') == 1
-    if not (latched and _num(e, 'psi_ref') == 0.0):
-        reasons.append('edge_not_latched')
     if end_seq is None:
         i_end = max(i for i in range(len(rows)) if ra[i] == 1)
     else:
-        i_end = max(i for i in range(len(rows)) if seq[i] is not None and seq[i] <= end_seq)
+        if end_seq < seq[i_edge]:
+            raise ValueError(f'end_seq {end_seq} before the edge {seq[i_edge]}')
+        i_end = next((i for i in range(len(rows)) if seq[i] == end_seq), None)
+        if i_end is None:
+            return True, ['log_khong_phu_moc_cuoi'], dict(info, loai='he_do')
+    latched = (_num(e, 'r_valid') == 1 and (_num(e, 'rv_n') or 0) > 0 and _num(e, 'head_on') == 1
+               and _num(e, 'psi_ref') == 0.0)
+    if not latched:
+        reasons.append('edge_not_latched')
     win = rows[i_edge:i_end + 1]
     for c in ('psi_reset_count', 'reset_n', 'pos_reset_n'):
         base = _num(e, c)
@@ -204,12 +231,14 @@ def ref_cond1(rows, age_max_ms, end_seq=None):
         t0, t1 = _num(e, 'timestamp_us'), _num(nxt, 'timestamp_us')
         if t0 is not None and t1 is not None and t1 > t0:
             gap_us = int(t1 - t0)
-    if not latched or age is None or gap_us is None:
+    age_us = None if age is None else int(round(age * 10)) * 100
+    if (not latched or age_us is None or gap_us is None
+            or not (-gap_us - 50 <= age_us <= T_AGE_US + 50)):
         reasons.append('age_bound_undetermined')
     else:
-        bound_us = int(round(age * 10)) * 100 + 50 + gap_us + 3
+        bound_us = age_us + 50 + gap_us + 3
         info.update(age_r_ms=age, gap_ms=gap_us / 1000, age_bound_ms=bound_us / 1000)
-        if bound_us > int(round(age_max_ms * 1000)):
+        if Decimal(bound_us) > Decimal(str(age_max_ms)) * 1000:
             reasons.append('age_bound_over')
     if reasons:
         info['loai'] = 'duong_lenh'

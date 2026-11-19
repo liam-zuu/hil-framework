@@ -267,3 +267,81 @@ def test_missing_counter_in_the_window_is_bad(where):
         rows = trio() + [dict(row(), log_seq=12, timestamp_us=20_000, reset_n='')]
     bad, why, _ = T.ref_cond1(rows, AGE_MAX)
     assert bad and any(w.endswith('_changed') for w in why)
+
+
+# ---- after Codex Sol round 2 (T9-1, T9-4, T9-7, T9-10, T9R-1 .. T9R-3) ----
+
+def test_psi0_is_from_the_edge_tick_not_the_tick_before(fw):
+    """T9-10: a report lands between the tick before the edge and the edge tick; psi0 must take it."""
+    case = T.Case('ok_bao_moi', extra_rv=(T.EDGE_US - 5_000,))
+    r = T.simulate(fw, case)
+    i = edge_index(r)
+    assert r[i]['rv_n'] == r[i - 1]['rv_n'] + 1                     # the new report is held on the edge tick
+    n0 = r[i]['rv_n']
+    j = next(k for k in range(i + 1, len(r)) if r[k]['rv_n'] == n0 + 1)
+    # psi0 = yaw of report n0: the next report moves psi_imu by one step (from the tick before: two)
+    assert r[j]['_psi_imu'] == pytest.approx(math.radians(T.YAW_STEP_DEG), rel=1e-3)
+    assert not T.ref_cond1(T.as_logged(r), AGE_MAX)[0]
+
+
+def test_log_starting_active_has_no_edge_evidence():
+    """T9-1: the first rows already active, no row before: measurement failure, not 'no edge'."""
+    bad, why, info = T.ref_cond1(trio()[1:], AGE_MAX)
+    assert bad and why == ['thieu_dong_truoc_canh'] and info['loai'] == 'he_do'
+
+
+def test_edge_seq_from_the_caller():
+    rows = trio()
+    assert not T.ref_cond1(rows, AGE_MAX, edge_seq=10)[0]
+    bad, why, info = T.ref_cond1(rows, AGE_MAX, edge_seq=12)
+    assert bad and why == ['khong_co_dong_canh'] and info['loai'] == 'he_do'
+
+
+@pytest.mark.parametrize('pre_ra', ['', None, 'x'])
+def test_unreadable_run_active_before_the_edge_is_no_evidence(pre_ra):
+    """T9R-2: a missing / unreadable run_active on the row before is not a 0 -> 1 change."""
+    pre = dict(row(), log_seq=9, head_on=0, timestamp_us=-10_000, run_active=pre_ra)
+    bad, why, info = T.ref_cond1(trio(pre=pre), AGE_MAX)
+    assert bad and why == ['thieu_dong_truoc_canh'] and info['loai'] == 'he_do'
+
+
+def test_end_seq_must_be_a_logged_row_at_or_after_the_edge():
+    """T9R-3."""
+    rows = trio()
+    with pytest.raises(ValueError):
+        T.ref_cond1(rows, AGE_MAX, end_seq=8)
+    bad, why, info = T.ref_cond1(rows, AGE_MAX, end_seq=13)
+    assert bad and why == ['log_khong_phu_moc_cuoi'] and info['loai'] == 'he_do'
+    assert not T.ref_cond1(rows, AGE_MAX, end_seq=11)[0]
+
+
+def test_no_age_bound_without_the_full_latch():
+    """T9-4: psi_ref not 0 (or missing): edge not latched and no age bound reported."""
+    for e in (row(psi_ref=0.0002), {k: v for k, v in row().items() if k != 'psi_ref'}):
+        bad, why, info = T.ref_cond1(trio(edge=e), AGE_MAX)
+        assert why == ['edge_not_latched', 'age_bound_undetermined'] and 'age_bound_ms' not in info
+
+
+@pytest.mark.parametrize('age', [-33555.1, -10.1, 125.1, 9999.0])
+def test_age_outside_the_proven_domain_is_undetermined(age):
+    """T9-7: with r_valid = 1 the firmware age lies in (-gap, t_age]; outside it the bound is not given."""
+    bad, why, info = T.ref_cond1(trio(edge=row(age_r_ms=age)), 1e9)
+    assert bad and why == ['age_bound_undetermined'] and 'age_bound_ms' not in info
+
+
+def test_age_domain_edges_are_kept():
+    assert not T.ref_cond1(trio(edge=row(age_r_ms=-10.0)), AGE_MAX)[0]
+    assert not T.ref_cond1(trio(edge=row(age_r_ms=125.0)), 1e9)[0]
+
+
+def test_threshold_is_not_rounded():
+    """T9R-1: bound 14.000 ms against 13.9996 ms is over."""
+    rows = trio(edge=row(age_r_ms=8.3), nxt=dict(row(), log_seq=11, timestamp_us=5_647))
+    assert T.ref_cond1(rows, 13.9996)[1] == ['age_bound_over']
+    assert not T.ref_cond1(rows, 14.0)[0]
+
+
+def test_edge_seq_on_an_inactive_row_is_refused():
+    rows = [dict(row(), log_seq=8, run_active=0, head_on=0, timestamp_us=-20_000)] + trio()
+    bad, why, info = T.ref_cond1(rows, AGE_MAX, edge_seq=9)
+    assert bad and why == ['khong_co_dong_canh'] and info['loai'] == 'he_do'
