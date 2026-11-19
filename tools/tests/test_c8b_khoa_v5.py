@@ -116,7 +116,7 @@ def test_m5b_bands_closed_terms_branch_and_state(tmp_path):
     # every term there (the other sessions' sources filled in by hand here): khoa
     ng = [dict(vai='ke_hoach_c8', file='kh.json', sha256='cd' * 32)]
     k2 = K.build({'O1-F05': _tb('O1-F05')}, nguon=ng, a_m=a, nhanh_tick='giu_tick', muc_kha_thi=['O1-F05'],
-                 nguong=NG, a6=_a6(), ses=SES, cam=CAMF)
+                 nguong=NG, a6=_a6(), ses=SES, cam=CAMF, lan_lap=_f8())
     k2['muc']['O1-F05']['hang_dong'].update(hang_m=0.004, he_so_r=0.002, u_phi_rad=0.001, hang_rad=0.01)
     assert K.trang_thai_khoa(k2, ['O1-F05']) == ('khoa', None)
     # no tag side: no band, not lockable
@@ -139,9 +139,43 @@ def test_m5b_cli_plan_branch(tmp_path):
     assert K.main(base + ['--muc', 'O1-F99', '--out', str(tmp_path / 'k3.json')]) == 2
 
 
-def _a6(dat=True):
-    return dict(schema='c8b_a6_v2', h_goc_m=[0.1250, 0.1236, 0.1232, 0.1246], u_h_goc_m=[0.0012] * 4,
-                trang_thai=dict(a6='thieu', h='dat' if dat else 'thieu'))
+def _a6(dat=True, **lan):
+    return dict(schema='c8b_a6_v2', tam_id='T1', h_goc_m=[0.1250, 0.1236, 0.1232, 0.1246], u_h_goc_m=[0.0012] * 4,
+                trang_thai=dict(a6='thieu', h='dat' if dat else 'thieu'),
+                lan_lap_cho=lan or dict(goc=dict(lan_lap_id='L0', luot_id_E='Eg'),
+                                        K1=dict(lan_lap_id='L0', luot_id_E='Ek')))
+
+
+def _f8(rows=None, tam='T1'):
+    """F8 lan_lap_v1 (NHACTAM): one record per run with pre / post windows; the E clips usually have none."""
+    return dict(schema='lan_lap_v1', tam_id=tam, luot=rows if rows is not None else [
+        dict(luot_id='r1', cho='goc', lan_lap_id='L0'), dict(luot_id='r2', cho='goc', lan_lap_id=None),
+        dict(luot_id='r3', cho='K1', lan_lap_id='L0')])
+
+
+def test_a6c1_7_lan_lap_E_against_f8():
+    # CODE 20/11 (data contract ~05:00): an F8 run of the E clip must agree; else every non-null F8 mounting of the
+    # place one value equal to the declared one; else chua_ket_luan lan_lap_E_khong_doi_chieu
+    r, st, why = K.lan_lap_E(_a6(), _f8())
+    assert st == 'dat' and r['goc']['trang_thai'] == 'dat' and r['K1']['trang_thai'] == 'dat', why
+    r, st, _ = K.lan_lap_E(_a6(), _f8(_f8()['luot'] + [dict(luot_id='Eg', cho='goc', lan_lap_id='L0')]))
+    assert st == 'dat'
+    with pytest.raises(K.KhoaError):                                       # the E run in F8 with another mounting
+        K.lan_lap_E(_a6(), _f8(_f8()['luot'] + [dict(luot_id='Eg', cho='goc', lan_lap_id='L1')]))
+    r, st, _ = K.lan_lap_E(_a6(), _f8(_f8()['luot'] + [dict(luot_id='Eg', cho='goc', lan_lap_id=None)]))
+    assert st == 'chua_ket_luan' and r['goc']['trang_thai'] == 'chua_ket_luan'
+    r, st, why = K.lan_lap_E(_a6(), _f8(_f8()['luot'] + [dict(luot_id='r4', cho='goc', lan_lap_id='L1')]))
+    assert st == 'chua_ket_luan' and r['goc']['trang_thai'] == 'chua_ket_luan' and r['K1']['trang_thai'] == 'dat'
+    assert K.LL_E_LY_DO in r['goc']['ly_do'] and any('goc' in w for w in why)
+    r, st, _ = K.lan_lap_E(_a6(), _f8([dict(luot_id='r1', cho='goc', lan_lap_id='L5')]))   # one value, not declared
+    assert r['goc']['trang_thai'] == 'chua_ket_luan' and r['K1']['trang_thai'] == 'chua_ket_luan'  # K1: no F8 value
+    assert K.lan_lap_E(_a6(), None)[1] == 'chua_ket_luan'
+    assert K.lan_lap_E(dict(_a6(), lan_lap_cho=None), _f8())[1] == 'chua_ket_luan'
+    assert K.lan_lap_E(_a6(goc=dict(lan_lap_id='L0', luot_id_E=None)), _f8())[1] == 'chua_ket_luan'
+    with pytest.raises(K.KhoaError):
+        K.lan_lap_E(_a6(), _f8(tam='T2'))
+    k = K.build({'O1-F05': _tb('O1-F05')}, a6=_a6(), lan_lap=_f8([dict(luot_id='r4', cho='goc', lan_lap_id='L1')]))
+    assert k['lan_lap_E_trang_thai'] == 'chua_ket_luan' and 'lan_lap_E' in k['ly_do_chua_khoa']
 
 
 SES = dict(car_side_m=0.1445, tag_h_m=0.124175, kappa=0.124175 / 2.632, car_pose_version='car_pose_v2')

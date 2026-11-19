@@ -64,7 +64,7 @@ Reader functions (data contract F3 2026-11-19 section 2.C, CAM / HIEUCHUAN / NHA
 Every number before the margin 1.25 (C8B applies it once, in c8b_khoa_v5). Constants marked [DE XUAT] are proposals.
 
   python tools/c8b_a6.py do --frames E/frames.csv --session session.json --f15 meo_E_goc.json --cho goc \
-      --tam-id T --lan-lap-id L --out a6_goc.json
+      --tam-id T --lan-lap-id L --luot-id-E E_RUN --out a6_goc.json
   python tools/c8b_a6.py gop --cho-file a6_goc.json --cho-file a6_K1.json --tam-id T --tam-cal-id T \
       [--lan-lap-cal-id L] [--lap lap.json] [--dong dong.json] [--giu-ngoai o.json] [--u-h-chung uh.json] \
       [--khoa-truoc khoa.json] --out c8b_a6_v2.json
@@ -146,8 +146,8 @@ GIOI_HAN = [
     'dau: khong triet dau A3-A6 trong mot ca); khong thi cong hai bao rieng (du phong, lon hon)',
     'A6C1-12: hang/cot man trap tu camera session (chieu nguoc), chua kiem voi cot pixel goc cua CAM (cho CAM xuat)',
     'U_cal: venh nhua tach bang tham so v trong phep giai 4 goc (mode s_i truc giao do doc), khong cong them',
-    'A6C1-7 (DEFERRED): lan_lap_id cua clip E khai o CLI do; doi chieu voi lan_lap_v1 (F8) theo luot_id cua so E lam '
-    'o noi doc ca hai (F8 tinh tu g_b cua chinh file A6 nay: vong phu thuoc)',
+    'A6C1-7 (CODE 20/11): lan_lap_id cua clip E khai o CLI do (F8 tinh tu g_b cua chinh file A6 nay: vong phu thuoc); '
+    'c8b_khoa_v5 doi chieu voi lan_lap_v1 (F8) theo luot_id_E',
     'A6C1-2 (P2 theo L138): clip E, cua so E chi buoc co sha nguon track, cua_so_v1 trong F15; chua doi chieu noi dung',
 ]
 
@@ -575,8 +575,9 @@ def shutter_fields(P, t, uv):
 
 # ── do: one place ────────────────────────────────────────────────────────────────────────────────
 
-def do_place(cho, idx, t, P, ses, f15, cam, tam_id, lan_lap_id):
-    """g_E, SE_E, U_meo_E, s_E of one place; trang_thai 'dat' / 'thieu' with the reasons."""
+def do_place(cho, idx, t, P, ses, f15, cam, tam_id, lan_lap_id, luot_id_E=None):
+    """g_E, SE_E, U_meo_E, s_E of one place; trang_thai 'dat' / 'thieu' with the reasons. luot_id_E: the run id of
+    the E clip windows (F2 E_dau / E_cuoi), kept so c8b_khoa_v5 checks lan_lap_id against F8 (A6C1-7, CODE 20/11)."""
     if cho not in CHO:
         raise A6Error(f'cho {cho!r}: goc | K1')
     if not isinstance(tam_id, str) or not tam_id or not isinstance(lan_lap_id, str) or not lan_lap_id:
@@ -599,7 +600,8 @@ def do_place(cho, idx, t, P, ses, f15, cam, tam_id, lan_lap_id):
     i1 = np.flatnonzero(sel)
     setup = dict(C=list(map(float, C)), H_m=H, h_m=hb, side_m=side, kappa=ses['kappa'], session_sha256=ses['sha256'],
                  cam_tam_m=[float(x) for x in np.asarray(getattr(cam, 'centre', (math.nan,) * 3), float)])
-    base = dict(schema=SCHEMA_CHO, cho=cho, tam_id=tam_id, lan_lap_id=lan_lap_id, n_khung_E=n_e, set_up=setup,
+    base = dict(schema=SCHEMA_CHO, cho=cho, tam_id=tam_id, lan_lap_id=lan_lap_id, luot_id_E=luot_id_E, n_khung_E=n_e,
+                set_up=setup,
                 f15=dict(schema=f15['schema'], trang_thai=f15['trang_thai'], file=f15['file'], sha256=f15['sha256'],
                          sha256_file=f15.get('sha256_file'), clip_sha256=f15['clip_sha256'], ca=f15['ca']),
                 omega=dict(nguon='kabsch tung khung, khop bac hai +-%d khung tren gio that, khong qua khoang trong'
@@ -1117,7 +1119,11 @@ def gop(places, tam_id, tam_cal_id, lap=None, dong=None, giu_ngoai=None, u_h=Non
     h_goc = [float(hb + ri @ g_hat) for ri in r] if st_h == 'dat' else None
     u_h_goc = [float(u_hc + np.linalg.norm(ri) * eps + V_MAX_M) for ri in r] if st_h == 'dat' else None
     lans = sorted({p.get('lan_lap_id') for p in places})
+    # A6C1-7 (CODE 20/11, hop dong ~05:00): the declared mounting and the E run of every place; c8b_khoa_v5 checks them
+    # against F8 lan_lap_v1 (F8 is computed from this file's g_b, so it cannot be read here)
+    lan_cho = {p['cho']: dict(lan_lap_id=p.get('lan_lap_id'), luot_id_E=p.get('luot_id_E')) for p in places}
     return dict(schema=SCHEMA, tam_id=tam_id, tam_cal_id=tam_cal_id, lan_lap_goc_id=lans[0] if len(lans) == 1 else lans,
+                lan_lap_cho=lan_cho,
                 g_b=None if g_hat is None else [float(x) for x in g_hat],
                 quy_tac_g_b='trung binh trong so 1/|s_E|^2 cac cho dat (khoa truoc)',
                 g_E_cho={p['cho']: p['g_E'] for p in places}, eps_g=eps, eps_g_khong_dong=eps0, s_E=s_norm,
@@ -1526,6 +1532,7 @@ def main(argv=None):
     a1.add_argument('--f15', required=True)
     a1.add_argument('--tam-id', required=True)
     a1.add_argument('--lan-lap-id', required=True)
+    a1.add_argument('--luot-id-E', required=True, help='run id (luot_id) of the E clip windows E_dau / E_cuoi (F2)')
     a1.add_argument('--out', required=True)
     a2 = sub.add_parser('gop')
     a2.add_argument('--cho-file', action='append', required=True)
@@ -1545,7 +1552,7 @@ def main(argv=None):
             idx, t, P, t_all = read_e_frames(a.frames)
             fsha = cu.sha256(a.frames)
             f15 = read_f15(a.f15, ses, fsha, t_all)
-            out = do_place(a.cho, idx, t, P, ses, f15, camera_of(ses), a.tam_id, a.lan_lap_id)
+            out = do_place(a.cho, idx, t, P, ses, f15, camera_of(ses), a.tam_id, a.lan_lap_id, a.luot_id_E)
             out.update(nguon=[dict(vai='frames', file=os.path.abspath(a.frames), sha256=fsha),
                               dict(vai='session', file=ses['file'], sha256=ses['sha256']),
                               dict(vai='f15', file=f15['file'], sha256=f15['sha256_file']),

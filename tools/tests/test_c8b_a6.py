@@ -502,11 +502,13 @@ def test_cli_do_gop_and_f15_file(tmp_path, monkeypatch):
     f15p.write_text(json.dumps(f15), encoding='utf-8')
     monkeypatch.setattr(A, 'camera_of', lambda ses: TopCam())
     out = tmp_path / 'goc.json'
-    args = ['do', '--frames', str(fp), '--session', str(sp), '--cho', 'goc', '--tam-id', 'T1', '--lan-lap-id', 'L1']
+    args = ['do', '--frames', str(fp), '--session', str(sp), '--cho', 'goc', '--tam-id', 'T1', '--lan-lap-id', 'L1',
+            '--luot-id-E', 'E_goc_1']
     assert A.main(args + ['--f15', str(f15p), '--out', str(out)]) == 0
     d = json.loads(out.read_text(encoding='utf-8'))
     assert d['schema'] == A.SCHEMA_CHO and d['trang_thai'] == 'dat' and len(d['nguon']) == 4
     assert d['A3_theo_ca_deg'] == {c: 0.1 for c in CASES}
+    assert d['luot_id_E'] == 'E_goc_1'
     for bad, n in ((dict(f15, plumb_xy_m=[0.0, 0.0]), 'plumb'),                      # session set-up
                    (dict(f15, nguon=[dict(vai_tro='frames', sha256='e' * 64), f15['nguon'][1]]), 'frames'),
                    (dict(f15, thu_tu_goc='other'), 'order'), (dict(f15, mien_E=None), 'window'),
@@ -529,6 +531,7 @@ def test_cli_do_gop_and_f15_file(tmp_path, monkeypatch):
     assert a6['trang_thai']['a6'] == 'thieu' and a6['schema'] == 'c8b_a6_v2'
     assert a6['h_m'] == HB and a6['plumb_xy_m'] == pytest.approx(list(C)) and a6['H_m'] == pytest.approx(H)
     assert a6['commit'] is not None and a6['so_tay'] == A.SO_TAY
+    assert a6['lan_lap_cho'] == {'goc': dict(lan_lap_id='L1', luot_id_E='E_goc_1')}
 
 
 def test_u_psi_joint_replay_per_case(places):

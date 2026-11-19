@@ -40,8 +40,14 @@ Per level (O1-F02, O1-F05, O1-F08; the K tasks take the F05 3b numbers only for 
                 derived, no new margin (Z_c = tag_h_m / kappa of the session, dzc = day_doi.dzc_m of the camera file,
                 L125); side_m = session car_side_m; phien_ban = session car_pose_version (CAM adds it after session 2);
                 any part missing -> null values, trang_thai thieu.
+  lan_lap_E     {cho: {lan_lap_id, luot_id_E, trang_thai dat | chua_ket_luan, ly_do}} (A6C1-7, CODE 20/11, data contract
+                ~05:00): the mounting declared at c8b_a6 do (lan_lap_cho of c8b_a6_v2) checked against F8 lan_lap_v1
+                (--lan-lap): an F8 run with the luot_id of the E clip must carry that lan_lap_id (another value ->
+                refused, exit 2); no such run -> dat only when every non-null lan_lap_id of the F8 runs of that place is
+                one value equal to the declared one; else chua_ket_luan, ly_do lan_lap_E_khong_doi_chieu. F8 of another
+                plate -> refused.
   trang_thai    'khoa' only when every level of --muc has hang_dong all numbers, a band, the plan and its branch
-                named, eps_H and mien_car_pose there; else 'chua_khoa' with ly_do_chua_khoa.
+                named, eps_H, mien_car_pose and lan_lap_E dat there; else 'chua_khoa' with ly_do_chua_khoa.
 khoa_truoc: SHA-256 of every input and of this script (commit, dirty) and the time, written before any held-out part
 is looked at (design 0.3); the C8 plan with vai 'ke_hoach_c8' (GATE GC6-1).
 
@@ -152,8 +158,54 @@ def mien_car_pose(a6, ses, cam):
     return dict(side_m=side, phien_ban=ver, h_m=h_m, kappa=kap, trang_thai='dat' if not why else 'thieu', ly_do=why)
 
 
+LL_E_LY_DO = 'lan_lap_E_khong_doi_chieu'
+
+
+def lan_lap_E(a6, lan_lap):
+    """A6C1-7 (CODE 20/11): the E-clip mounting of every place of the A6 file against F8 lan_lap_v1.
+    Returns ({cho: dict(lan_lap_id, luot_id_E, trang_thai, ly_do)}, trang_thai, reasons); KhoaError on a contradiction."""
+    if not isinstance(a6, dict) or not isinstance(a6.get('lan_lap_cho'), dict) or not a6['lan_lap_cho']:
+        return {}, 'chua_ket_luan', [f'{LL_E_LY_DO}: c8b_a6_v2 without lan_lap_cho (--a6)']
+    rows = (lan_lap or {}).get('luot') if isinstance(lan_lap, dict) else None
+    if not isinstance(rows, list):
+        return ({c: dict(v, trang_thai='chua_ket_luan', ly_do=f'{LL_E_LY_DO}: no F8 lan_lap_v1 (--lan-lap)')
+                 for c, v in a6['lan_lap_cho'].items()}, 'chua_ket_luan', [f'{LL_E_LY_DO}: no F8 (--lan-lap)'])
+    if lan_lap.get('tam_id') != a6.get('tam_id'):
+        raise KhoaError(f'F8 lan_lap of plate {lan_lap.get("tam_id")!r}, A6 of {a6.get("tam_id")!r}')
+    out, why = {}, []
+    for cho, v in a6['lan_lap_cho'].items():
+        lid, le = (v or {}).get('lan_lap_id'), (v or {}).get('luot_id_E')
+        r = dict(lan_lap_id=lid, luot_id_E=le, trang_thai='chua_ket_luan', ly_do=None)
+        if not isinstance(lid, str) or not lid or not isinstance(le, str) or not le:
+            r['ly_do'] = f'{LL_E_LY_DO}: lan_lap_id / luot_id_E of {cho} not declared in the A6 file'
+        else:
+            same = [x for x in rows if isinstance(x, dict) and x.get('luot_id') == le]
+            if same:
+                bad = [x.get('lan_lap_id') for x in same if x.get('lan_lap_id') not in (None, lid)]
+                if bad:
+                    raise KhoaError(f'{cho}: F8 run {le} has lan_lap_id {bad[0]!r}, the A6 file declares {lid!r}')
+                if all(x.get('lan_lap_id') == lid for x in same):
+                    r['trang_thai'] = 'dat'
+                else:
+                    r['ly_do'] = f'{LL_E_LY_DO}: F8 run {le} has no lan_lap_id (not determined)'
+            else:
+                vals = {x.get('lan_lap_id') for x in rows if isinstance(x, dict) and x.get('cho') == cho
+                        and x.get('lan_lap_id') is not None}
+                if vals == {lid}:
+                    r['trang_thai'] = 'dat'
+                else:
+                    r['ly_do'] = (f'{LL_E_LY_DO}: no F8 run {le}; the F8 runs at {cho} carry lan_lap_id '
+                                  f'{sorted(map(str, vals))}, not only the declared {lid!r}')
+        if r['trang_thai'] != 'dat':
+            why.append(f'{cho}: {r["ly_do"]}')
+        out[cho] = r
+    return out, ('dat' if not why else 'chua_ket_luan'), why
+
+
 def trang_thai_khoa(out, muc_kha_thi):
     why = []
+    if out.get('lan_lap_E_trang_thai') != 'dat':
+        why.append('lan_lap_E: ' + ('; '.join(out.get('lan_lap_E_ly_do') or []) or 'thieu'))
     if out.get('eps_H') is None:
         why.append(f'eps_H: {out.get("eps_H_ly_do") or "thieu"}')
     mc = out.get('mien_car_pose')
@@ -258,7 +310,8 @@ def build(tbs, lan_lap=None, nguon=None, script=None, a_m=None, nhanh_tick=None,
                 raise KhoaError(f'alpha branch for {key} without its 3b source')
             bang[key]['nguon_3b'] = dict(duong_dan=n.get('duong_dan', n['file']), sha256=n['sha256'])
     eh, ehw = eps_h_of(nguong)
-    out = dict(version=VERSION, le=LE, muc=muc, bang_man_trap=bang, u_beta_cam_deg=ub, u_beta_cam_trang_thai=ust,
+    lle, lle_st, lle_why = lan_lap_E(a6, lan_lap)
+    out = dict(lan_lap_E=lle, lan_lap_E_trang_thai=lle_st, lan_lap_E_ly_do=lle_why, version=VERSION, le=LE, muc=muc, bang_man_trap=bang, u_beta_cam_deg=ub, u_beta_cam_trang_thai=ust,
                u_beta_cam_ly_do=uwhy, nhanh_tick=nhanh_tick, muc_kha_thi=list(muc_kha_thi),
                eps_H=eh, eps_H_ly_do=ehw, mien_car_pose=mien_car_pose(a6, ses, cam),
                khoa_truoc=dict(nguon=nguon or [], script=script,
