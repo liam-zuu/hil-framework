@@ -504,7 +504,7 @@ def nodes(c, h, step=STEP_S):
         k += 1
 
 
-def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S):
+def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S, thao_tac=()):
     F = read_frames(frames_path)
     rows, n_dup = read_log(log_path)
     tl = np.array([float(r['timestamp_us']) for r in rows]) * 1e-6
@@ -592,7 +592,7 @@ def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S):
     if any(kenh[c]['D_s'] is None for c in CHANNELS):
         out.update(ok=False, ly_do=hong + fails, ly_do_hong=hong, ly_do_chua=fails, nodes_s=[],
                    ket_luan='hong_he_do' if hong else 'chua_ket_luan')
-        out.update(f11(out, kenh, kiem, loai, fails, khoa, None))
+        out.update(f11(out, kenh, kiem, loai, fails, khoa, None, thao_tac))
         return out, F, None
     L_ch = max(LOWER, key=lambda c: kenh[c]['D_s'])
     U_ch = min(UPPER, key=lambda c: kenh[c]['D_s'])
@@ -670,11 +670,14 @@ def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S):
         kiem['c8_range'] = 'khong kiem (luot C8 hay chua khoa)'
     out.update(ok=not (fails or hong), ly_do=hong + fails, ly_do_hong=hong, ly_do_chua=fails,
                ket_luan='hong_he_do' if hong else ('chua_ket_luan' if fails else 'ok'))
-    out.update(f11(out, kenh, kiem, loai, fails, khoa, cw))
+    out.update(f11(out, kenh, kiem, loai, fails, khoa, cw, thao_tac))
     return out, F, dict(tm=tm, vel=vel, tg=tg, gz=gz, tr=tr, yr=yr)
 
 
-def f11(out, kenh, kiem, loai, fails, khoa, cw):
+THAO_TAC = ('boot', 'khoa_sieu_am', 'loi_nap_gain')    # J v6 section 5: runs lost to an operation
+
+
+def f11(out, kenh, kiem, loai, fails, khoa, cw, thao_tac=()):
     """c8b_gio_v1 F11 blocks (design C8B v7 section 7a; O1 v11.37 D1 line 342: the per-run clock check is only
     L <= U~, every channel matched, and the C8 range of the level). ket_luan is kept for compatibility.
     M2 (J v6 section 5, item 12(e) approved, J5-9): a run with a firmware restart (boot) does not count as a failed
@@ -696,7 +699,15 @@ def f11(out, kenh, kiem, loai, fails, khoa, cw):
     du = bool(co_boot and cw is not None and cw[1] < t_boot)       # the whole check window lies before the boot
     truoc = dict(co_boot=co_boot, t_boot_log_s=t_boot, du_cua_so=du,
                  trang_thai=(st if du else 'khong_kiem') if co_boot else None)
-    dem = st == 'truot' and (not co_boot or (du and truoc['trang_thai'] == 'truot'))
+    # CODE 19/11 (J v6 section 5 'do thao tac' + M2, J5-9): a run lost to ANY operation (boot found in the log, or a
+    # sonar lock / gain load error the caller gives) does not count, except a boot whose check failed on the rows
+    # before it over its whole window
+    tt = sorted(set(thao_tac) | ({'boot'} if co_boot else set()))
+    bad_tt = [x for x in tt if x not in THAO_TAC]
+    if bad_tt:
+        raise GioError(f'unknown operation {bad_tt}: one of {THAO_TAC}')
+    truoc['thao_tac'] = tt
+    dem = st == 'truot' and (not tt or (co_boot and du and truoc['trang_thai'] == 'truot'))
     return dict(
         kiem_gio_d1=dict(trang_thai=st, L_le_U=l_le_u, ghep_ok=ghep_ok, trong_dai_c8=dai, ly_do=list(loai['kiem_gio_d1']),
                          truoc_boot=truoc),
@@ -729,13 +740,15 @@ def main(argv=None):
     ap.add_argument('--out', required=True)
     ap.add_argument('--khoa', default=None, help='C8 lock file of c8b_u.py (drift rate, C8 ranges per level)')
     ap.add_argument('--startup-s', type=float, default=STARTUP_S)
+    ap.add_argument('--thao-tac', action='append', choices=THAO_TAC,
+                    help='the run is lost to this operation (rq3_log facts; boot is also found from reset_n)')
     a = ap.parse_args(argv)
     try:
         khoa = None
         if a.khoa:
             with open(a.khoa, encoding='utf-8') as f:
                 khoa = json.load(f)
-        out, _, _ = analyse(a.frames, a.esp32, a.task, khoa, a.startup_s)
+        out, _, _ = analyse(a.frames, a.esp32, a.task, khoa, a.startup_s, a.thao_tac or ())
         ctrl, ev = controller_of(a.esp32)
         out['controller'] = ctrl
         # contract of c7_score --gio-c8b (CODE 17/11, VG1-1): the clock file names the log and frames of ITS run

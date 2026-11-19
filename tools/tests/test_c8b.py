@@ -240,12 +240,12 @@ def test_f11_hole_is_ho_log_not_d1(tmp_path):
     assert out['ly_do_theo_loai']['ho_log'] and not any('log hole' in x for x in out['ly_do_theo_loai']['kiem_gio_d1'])
 
 
-def _f11_case(st_fail, t_boot, cw_end):
+def _f11_case(st_fail, t_boot, cw_end, tt=()):
     kenh = {c: dict(D_s=0.01, ok=not st_fail) for c in G.CHANNELS}
     out = dict(L_s=0.0, U_s=0.02)
     kiem = dict(pairs_valid_share=1.0, log_hole_max_s=0.02, t_boot_log_s=t_boot)
     loai = dict(kiem_gio_d1=['x'] if st_fail else [], cap_dem=[], ho_log=[], khac=[])
-    return G.f11(out, kenh, kiem, loai, [], None, [0.0, cw_end])
+    return G.f11(out, kenh, kiem, loai, [], None, [0.0, cw_end], tt)
 
 
 @pytest.mark.parametrize('fail,t_boot,cw_end,dem,truoc', [
@@ -258,6 +258,16 @@ def test_m2_boot_and_the_clock_check_count(fail, t_boot, cw_end, dem, truoc):
     r = _f11_case(fail, t_boot, cw_end)
     assert r['kiem_gio_d1']['trang_thai'] == ('truot' if fail else 'dat')
     assert r['kiem_gio_d1']['truoc_boot']['trang_thai'] == truoc and r['dem_truot_kiem_gio'] is dem
+
+
+@pytest.mark.parametrize('tt', ['khoa_sieu_am', 'loi_nap_gain'])
+def test_m2_any_operation_run_not_counted(tt):
+    # CODE 19/11 (J v6 section 5 'do thao tac'): a sonar lock or gain load error with a failed clock check: not counted
+    r = _f11_case(True, None, 10.0, (tt,))
+    assert r['kiem_gio_d1']['trang_thai'] == 'truot' and r['dem_truot_kiem_gio'] is False
+    assert r['kiem_gio_d1']['truoc_boot']['thao_tac'] == [tt]
+    with pytest.raises(G.GioError):
+        _f11_case(True, None, 10.0, ('bam_tay',))
 
 
 def test_m2_boot_found_in_the_log(tmp_path):
