@@ -1207,44 +1207,65 @@ def _meta(m, k):
 
 def read_neo(path, cho, ref_row):
     """psi_chuan_k_deg of F6 (NHACTAM hieu_chuan_neo_v1) after checking it was made on the ref_12b window of the
-    issued attempt (contract F6; HCC1-10; NHACTAM 19/11 via CODE). khung_chung of NHACTAM is (frames through the
-    anchor gate) & khung_ma_hop_le & (A6 valid), so it equals neither khung_sha256 nor khung_ma_hop_le_sha256 of the
-    window; the check is: the place block cho[cho] is 'dat'; its clip_sha256 and frames_sha256 equal those of the
-    ref_12b row; the ref_12b window of that run in cua_so[*] (meta loai, cho, luot, clip_sha) carries the same
-    khung_chung_sha256; its khung_chung.id are inside khung_ma_hop_le of the ref_12b row; sha256 of the sorted IDs
-    joined by commas ("1,2,...") = khung_chung_sha256. Else AError (code 2)."""
-    j = json.load(open(path, encoding='utf-8'))
-    b = (j.get('cho') or {}).get(cho)
-    if not isinstance(b, dict):
-        raise AError(f'{path}: thieu khoi cho {cho}')
-    if b.get('trang_thai') != 'dat':
-        raise AError(f"{path}: {cho} trang_thai {b.get('trang_thai')!r} ({b.get('ly_do', '')})")
-    for k in ('psi_chuan_k_deg', 'clip_sha256', 'khung_chung_sha256', 'frames_sha256'):
-        if not b.get(k) and b.get(k) != 0:
-            raise AError(f'{path}: {cho} thieu {k}')
+    issued attempt (contract F6; HCC1-10; NHACTAM 19/11 via CODE; Codex HCG1-1..6). khung_chung of NHACTAM is
+    (frames through the anchor gate) & khung_ma_hop_le & (A6 valid), so it equals neither khung_sha256 nor
+    khung_ma_hop_le_sha256 of the window. The check: the file trang_thai is 'dat'; the standard of THIS run is
+    chuan_12b['<cho>|<luot_id of the ref_12b row>'] (or cho[cho] when it names that run), 'dat', with cho and
+    luot_id of the run; its clip_sha256 and frames_sha256 equal those of the ref_12b row; exactly one ref_12b window
+    in cua_so[*] with meta cho, luot, clip_sha, frames_sha of the run carries the same khung_chung_sha256; its
+    khung_chung.id are distinct integers inside khung_ma_hop_le of the ref_12b row; sha256 of the sorted IDs joined
+    by commas ("1,2,...") = khung_chung_sha256; psi finite. Anything else, malformed files included: AError (code 2)."""
     if ref_row is None:
         raise AError('F6 needs the ref_12b row of cua_so_v1.jsonl of the issued attempt (run cua_so first)')
+    try:
+        return _read_neo(path, cho, ref_row)
+    except AError:
+        raise
+    except (AttributeError, TypeError, ValueError, OverflowError, KeyError) as exc:      # HCG1-6
+        raise AError(f'{path}: F6 sai dang ({type(exc).__name__}: {exc})')
+
+
+def _read_neo(path, cho, ref_row):
+    j = json.load(open(path, encoding='utf-8'))
+    if not isinstance(j, dict) or j.get('trang_thai') != 'dat':                          # HCG1-4
+        raise AError(f"{path}: trang_thai toan file {j.get('trang_thai') if isinstance(j, dict) else None!r}")
+    luot = ref_row.get('luot_id')
+    if not luot:
+        raise AError('ref_12b row without luot_id')
+    b = (j.get('chuan_12b') or {}).get(f'{cho}|{luot}')                                    # HCG1-1
+    if b is None:
+        c = (j.get('cho') or {}).get(cho)
+        b = c if isinstance(c, dict) and c.get('luot_id') == luot else None
+    if not isinstance(b, dict):
+        raise AError(f'{path}: khong co ban ghi chuan cua {cho}|{luot}')
+    if b.get('trang_thai') != 'dat':
+        raise AError(f"{path}: {cho}|{luot} trang_thai {b.get('trang_thai')!r} ({b.get('ly_do', '')})")
+    if b.get('cho') != cho or b.get('luot_id') != luot:                                     # HCG1-2
+        raise AError(f"{path}: ban ghi chuan cua {b.get('cho')}|{b.get('luot_id')}, can {cho}|{luot}")
+    for k in ('psi_chuan_k_deg', 'clip_sha256', 'khung_chung_sha256', 'frames_sha256'):
+        if b.get(k) is None or b.get(k) == '':
+            raise AError(f'{path}: {cho}|{luot} thieu {k}')
     if b['clip_sha256'] != ref_row.get('clip_sha256'):
         raise AError(f'{path}: clip_sha256 khac cua so ref_12b')
     if b['frames_sha256'] != ref_row.get('frames_sha256'):
         raise AError(f'{path}: frames_sha256 khac cua so ref_12b')
-    wins = [c for c in j.get('cua_so') or [] if isinstance(c.get('meta'), dict)
+    wins = [c for c in j.get('cua_so') or [] if isinstance(c, dict) and isinstance(c.get('meta'), dict)
             and c['meta'].get('loai') == 'ref_12b' and c['meta'].get('cho') == cho
-            and _meta(c['meta'], 'clip_sha') == b['clip_sha256']
-            and (b.get('luot_id') is None or c['meta'].get('luot') == b['luot_id'])
+            and c['meta'].get('luot') == luot                                                 # HCG1-2
+            and _meta(c['meta'], 'clip_sha') == ref_row.get('clip_sha256')
+            and _meta(c['meta'], 'frames_sha') == ref_row.get('frames_sha256')               # HCG1-3
             and c.get('khung_chung_sha256') == b['khung_chung_sha256']]
     if len(wins) != 1:
-        raise AError(f'{path}: {len(wins)} cua so ref_12b mang khung_chung_sha256 cua {cho} (can dung 1)')
+        raise AError(f'{path}: {len(wins)} cua so ref_12b cua {cho}|{luot} mang khung_chung_sha256 (can dung 1)')
     ids = (wins[0].get('khung_chung') or {}).get('id')
-    try:
-        ids = sorted(int(i) for i in ids)
-    except (TypeError, ValueError):
-        raise AError(f'{path}: khung_chung.id hong')
-    if not ids:
-        raise AError(f'{path}: khung_chung rong')
-    if not set(ids) <= {int(i) for i in ref_row.get('khung_ma_hop_le') or []}:
+    if (not isinstance(ids, list) or not ids
+            or not all(isinstance(i, int) and not isinstance(i, bool) for i in ids)       # HCG1-5
+            or len(set(ids)) != len(ids)):
+        raise AError(f'{path}: khung_chung.id phai la danh sach so nguyen phan biet, khong rong')
+    ok_ids = ref_row.get('khung_ma_hop_le') or []
+    if not set(ids) <= {int(i) for i in ok_ids}:
         raise AError(f'{path}: khung_chung khong nam trong khung_ma_hop_le cua ref_12b')
-    if hashlib.sha256(','.join(str(i) for i in ids).encode()).hexdigest() != b['khung_chung_sha256']:
+    if hashlib.sha256(','.join(str(i) for i in sorted(ids)).encode()).hexdigest() != b['khung_chung_sha256']:
         raise AError(f'{path}: sha256 cua khung_chung.id khac khung_chung_sha256')
     v = float(b['psi_chuan_k_deg'])
     if not math.isfinite(v):

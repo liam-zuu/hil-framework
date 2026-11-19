@@ -463,19 +463,31 @@ def test_tinh_refuses_cap_that_failed_kiem(tmp_path, capsys):
     assert r['trang_thai'] == 'chua_ket_luan' and 'dinh_danh_gain' in r['ly_do'][0] and r['a_k_deg'] is None
 
 
-def f6(ref, cho='K2', ids=None, **kw):
-    """F6 hieu_chuan_neo_v1 as NHACTAM writes it (feat/c8-lan-lap e7b8428): place block + the ref_12b window with
-    khung_chung = a subset of khung_ma_hop_le (anchor gate & A6), sha256 of the sorted IDs joined by commas."""
+def f6(ref, cho='K2', ids=None, n_luot=1, top='dat', win=None, **kw):
+    """F6 hieu_chuan_neo_v1 as NHACTAM writes it (feat/c8-lan-lap e7b8428): file trang_thai, chuan_12b keyed
+    'cho|luot_id', the place block (the record itself with one 12b run there, else chua_ket_luan), and the ref_12b
+    windows with khung_chung = a subset of khung_ma_hop_le (anchor gate & A6), sha256 of the sorted IDs."""
     import hashlib
     ids = sorted(ref['khung_ma_hop_le'][1:-1] if ids is None else ids)
-    sha = hashlib.sha256(','.join(str(i) for i in ids).encode()).hexdigest()
-    blk = dict(trang_thai='dat', ly_do='', cho=cho, luot_id=ref['luot_id'], clip_sha256=ref['clip_sha256'],
-               khung_chung_sha256=sha, psi_chuan_k_deg=12.0, frames_sha256=ref['frames_sha256'])
-    blk.update(kw)
-    win = dict(meta=dict(luot=ref['luot_id'], cho=cho, loai='ref_12b', clip=ref.get('clip'),
-                         clip_sha=ref['clip_sha256'], frames_sha=ref['frames_sha256']),
-               khung_chung=dict(id=ids, pts_s=[]), khung_chung_sha256=sha)
-    return dict(schema='hieu_chuan_neo_v1', cho={cho: blk}, cua_so=[win])
+    sha = hashlib.sha256(','.join(str(i) for i in sorted(ids)).encode()).hexdigest()
+    chuan, wins = {}, []
+    for n in range(n_luot):
+        luot = ref['luot_id'] if n == 0 else f"{ref['luot_id']}_{n + 1}"
+        clip = ref['clip_sha256'] if n == 0 else f'{n}' * 64
+        rec = dict(trang_thai='dat', ly_do='', cho=cho, luot_id=luot, clip_sha256=clip, khung_chung_sha256=sha,
+                   psi_chuan_k_deg=12.0, frames_sha256=ref['frames_sha256'])
+        if n == 0:
+            rec.update(kw)
+        chuan[f'{cho}|{luot}'] = rec
+        w = dict(meta=dict(luot=luot, cho=cho, loai='ref_12b', clip=ref.get('clip'), clip_sha=clip,
+                           frames_sha=ref['frames_sha256']),
+                 khung_chung=dict(id=list(ids), pts_s=[]), khung_chung_sha256=sha)
+        if n == 0 and win:
+            w['meta'].update(win)
+        wins.append(w)
+    blk = next(iter(chuan.values())) if n_luot == 1 else dict(
+        trang_thai='chua_ket_luan', ly_do='nhieu_12b_xem_chuan_12b', khoa=list(chuan))
+    return dict(schema='hieu_chuan_neo_v1', trang_thai=top, cho={cho: blk}, chuan_12b=chuan, cua_so=wins)
 
 
 def test_tinh_checks_f6_and_f9_sources(tmp_path):
@@ -829,19 +841,51 @@ def test_read_e_hieu_refuses_diagnostic_f9(tmp_path):
 
 def test_read_neo_khung_chung_as_nhactam(tmp_path):
     """NHACTAM 19/11 (via CODE): khung_chung_sha256 is the sha of the common set (anchor gate & khung_ma_hop_le &
-    A6), not khung_sha256 / khung_ma_hop_le_sha256 of the window: the old check always refused (code 2)."""
+    A6), not khung_sha256 / khung_ma_hop_le_sha256 of the window: the old check always refused (code 2).
+    Codex HCG1-1..6: two 12b runs at the place, another run, frames_sha of the window, file trang_thai, ID types,
+    malformed files."""
+    import hashlib
     d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
     ref, _ = run_cua_so(d)
-    assert ca.read_neo(write_json(str(tmp_path / 'ok.json'), f6(ref)), 'K2', ref) == 12.0
+    w = lambda name, obj: write_json(str(tmp_path / f'{name}.json'), obj)                  # noqa: E731
+    assert ca.read_neo(w('ok', f6(ref)), 'K2', ref) == 12.0
+    assert ca.read_neo(w('hai_luot', f6(ref, n_luot=2)), 'K2', ref) == 12.0               # HCG1-1
     outside = max(ref['khung_ma_hop_le']) + 100000
+    ids = ref['khung_ma_hop_le'][1:-1]
+    frac = f6(ref)
+    frac['cua_so'][0]['khung_chung']['id'][0] = ids[0] + 0.75                                # HCG1-5
+    dup = f6(ref, ids=ids + [ids[0]])
+    other = f6(ref)                                                                          # HCG1-2: both ends moved
+    rec = other['chuan_12b'].pop(f"K2|{ref['luot_id']}")
+    rec['luot_id'] = 'HC_K2_9'
+    other['chuan_12b']['K2|HC_K2_9'] = rec
+    other['cho']['K2'] = rec
+    other['cua_so'][0]['meta']['luot'] = 'HC_K2_9'
+    no_luot = f6(ref)
+    no_luot['chuan_12b'] = {}
+    del no_luot['cho']['K2']['luot_id']
+    null_win = f6(ref)
+    null_win['cua_so'].insert(0, None)                                                       # HCG1-6
     bad = {
         'chua_ket_luan': f6(ref, trang_thai='chua_ket_luan'),
+        'toan_file': f6(ref, top='chua_ket_luan'),                                           # HCG1-4
         'frames': f6(ref, frames_sha256='2' * 64),
+        'frames_cua_so': f6(ref, win=dict(frames_sha='2' * 64)),                             # HCG1-3
+        'frames_cua_so_thieu': f6(ref, win=dict(frames_sha=None)),
         'ngoai_tap': f6(ref, ids=ref['khung_ma_hop_le'][1:3] + [outside]),
         'sha_sai': f6(ref, khung_chung_sha256='3' * 64),
         'khong_cua_so': dict(f6(ref), cua_so=[]),
-        'luot_khac': f6(ref, luot_id='HC_K2_9'),
+        'luot_khac': other,
+        'khong_luot': no_luot,
+        'id_le': frac,
+        'id_lap': dup,
+        'psi_tran': f6(ref, psi_chuan_k_deg=10 ** 400),
+        'psi_nan': f6(ref, psi_chuan_k_deg=float('nan')),
     }
     for name, obj in bad.items():
         with pytest.raises(ca.AError):
-            ca.read_neo(write_json(str(tmp_path / f'{name}.json'), obj), 'K2', ref)
+            ca.read_neo(w(name, obj), 'K2', ref)
+    p = str(tmp_path / 'null_win.json')
+    with open(p, 'w', encoding='utf-8') as f:
+        json.dump(null_win, f)
+    assert ca.read_neo(p, 'K2', ref) == 12.0                                                 # null entry skipped
