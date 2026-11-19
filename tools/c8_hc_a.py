@@ -1359,22 +1359,41 @@ def read_e_hieu(path, doan_path):
     return out, bool(j.get('bao_q_xoay', False))
 
 
+def _phan_ok(r):
+    """HCH2-5: the parts of a C8B bound are finite, >= 0 and add up to u_rad, for the two ways C8B combines them:
+    cong_rieng (A3 and A6 residual at both ends) and replay_chung_theo_ca (worst H32 case + A6 residual without
+    U_meo_E at both ends, design 2b). Any other form: not accepted."""
+    ph = r.get('phan') if isinstance(r.get('phan'), dict) else {}
+    g = r.get('ghep')
+    if g == 'cong_rieng':
+        parts = list(ph.get('A3_rad') or []) + list(ph.get('A6du_rad') or [])
+        n = 4
+    elif g == 'replay_chung_theo_ca':
+        parts = [ph.get('ca_rad')] + list(ph.get('A6du_khong_meo_rad') or [])
+        n = 3
+    else:
+        return False
+    if len(parts) != n or not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+                                  and v >= 0 for v in parts):
+        return False
+    u = float(r['u_rad'])
+    return abs(sum(parts) - u) <= 1e-12 * max(1.0, abs(u))
+
+
 def can_hai_dau_c8b(a6_path, kc_path, tam_id, nguon):
-    """(p1, p2) -> (u [rad] or None, reasons) from c8b_a6.u_psi_hai_dau_rad (C8B, CODE 19/11: A3(p1) + A3(p2) of
-    KIEMCHEO c8_cam_u_vao + A6 residual at both points, before the margin; 'thieu' until its inputs exist). Needs
-    --a6, --kc, --tam-id together (else AError, code 2). c8b_a6 not merged yet, or the A6 file refused: every call
-    gives None with the reason (the result stays chan_doan). Positions: floor frame, m (frames chain)."""
+    """(p1, p2) -> (u [rad] or None, reasons) from c8b_a6.u_psi_hai_dau_rad (C8B hil feat/c8b-3b-ga 2539ee8; CODE
+    20/11 local_c29a2de2): kc = KIEMCHEO kiem_cheo.json (c7_kiem_cheo_v7, --xuat-phat); C8B checks A3 INSIDE the
+    function (version, quy_ve_ma_noc, ma_ao, du_lieu_du, plumb, per place mot_phuong / ngoai_suy / cap_hong) and
+    returns thieu with reasons, so there is no A3 gate here (CODE 20/11; replaces HCH1-5, HCH2-2). p1, p2 = tag
+    centres on the floor (car_pose frame, m). luot, dai = None: the largest U_chuyen.dong over runs and bands
+    (the 12b windows are still windows of calibration attempts, not C8 target runs; [CACH HIEU], conservative).
+    Needs --a6, --kc, --tam-id together, non-empty (else AError, code 2). c8b_a6 not merged yet, the A6 file refused,
+    an error inside the function or parts that do not add up: every call gives None with the reason (the result stays
+    chan_doan, the term null)."""
     if not (a6_path and kc_path and tam_id):
         raise AError('--kc, --tam-id can di cung --a6 (ham can hai dau cua C8B), khong rong')
     kc = json.load(open(kc_path, encoding='utf-8'))
-    nguon.append(dict(vai_tro='c8_cam_u_vao', duong_dan=os.path.abspath(kc_path), sha256=sha256(kc_path)))
-    a3 = kc.get('A3') if isinstance(kc, dict) else None
-    # HCH1-5: the rules of the KIEMCHEO writer (check_cam_v3, KCJ1-4, KCJ2-1): A3 carried to the car tag, over the
-    # full planned pair set; else no bound
-    if not isinstance(a3, dict) or a3.get('quy_ve_ma_noc') is not True or a3.get('du_lieu_du') is not True \
-            or a3.get('cap_hong'):
-        why = 'A3 cua KIEMCHEO chua du (quy_ve_ma_noc, du_lieu_du, cap_hong)'
-        return lambda p1, p2: (None, [why])
+    nguon.append(dict(vai_tro='kiem_cheo', duong_dan=os.path.abspath(kc_path), sha256=sha256(kc_path)))
     try:
         import c8b_a6 as c8a                                     # CODE_C8B, after the common merge
         a6o = c8a.load_a6(a6_path)
@@ -1387,17 +1406,14 @@ def can_hai_dau_c8b(a6_path, kc_path, tam_id, nguon):
 
     def fn(p1, p2):
         try:
-            r = c8a.u_psi_hai_dau_rad(a6o, kc, [float(v) for v in p1], [float(v) for v in p2], tam_id)
+            r = c8a.u_psi_hai_dau_rad(a6o, kc, [float(v) for v in p1], [float(v) for v in p2], tam_id,
+                                      luot=None, dai=None)
         except Exception as exc:                                 # noqa: BLE001  HCH1-6: a bad A6 file is no bound
             return None, [f'ham C8B loi ({type(exc).__name__}: {exc})']
         if not isinstance(r, dict) or r.get('trang_thai') != 'dat' or r.get('u_rad') is None:
             return None, [str(w) for w in ((r or {}).get('ly_do') or ['trang_thai khac dat'])]
-        # HCH2-5: every part (A3, A6 residual at both ends) finite and >= 0, and the total their sum
-        ph = r.get('phan') if isinstance(r.get('phan'), dict) else {}
-        parts = list(ph.get('A3_rad') or []) + list(ph.get('A6du_rad') or [])
-        if len(parts) != 4 or not all(isinstance(v, (int, float)) and math.isfinite(v) and v >= 0 for v in parts) \
-                or abs(sum(parts) - float(r['u_rad'])) > 1e-12 * max(1.0, abs(float(r['u_rad']))):
-            return None, [f"thanh phan can C8B khong hop le: {ph}"]
+        if not _phan_ok(r):
+            return None, [f"thanh phan can C8B khong hop le ({r.get('ghep')}): {r.get('phan')}"]
         return float(r['u_rad']), []
     return fn
 
@@ -1638,7 +1654,7 @@ def main(argv=None):
     t.add_argument('--neo', default=None, help='hieu_chuan_neo.json of NHACTAM (F6)')
     t.add_argument('--e-hieu', default=None, help='e_hieu_m of KIEMCHEO (F9)')
     t.add_argument('--can-c8b', default=None, help='C8B file with u_psi_cuc_rad (two-end camera heading bound)')
-    t.add_argument('--kc', default=None, help='KIEMCHEO c8_cam_u_vao (A3) for c8b_a6.u_psi_hai_dau_rad')
+    t.add_argument('--kc', default=None, help='KIEMCHEO kiem_cheo.json (c7_kiem_cheo_v7) for c8b_a6.u_psi_hai_dau_rad')
     t.add_argument('--tam-id', default=None, help='plate id for c8b_a6.u_psi_hai_dau_rad (A6 applies to one plate)')
     t.add_argument('--moc', default=None, help='moc_san_do_32.csv: real swept footprint (vet thuc)')
     t.add_argument('--vien-mm', type=float, default=10.0)

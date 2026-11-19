@@ -932,10 +932,11 @@ def test_can_hai_dau_function_feeds_u_q_and_u_psi_cuc(tmp_path):
 
 
 def test_can_hai_dau_c8b_wrapper(tmp_path, monkeypatch):
-    """--kc, --tam-id need --a6; c8b_a6 not merged -> no bound (reason kept); the C8B result is passed through."""
+    """Interface of C8B 2539ee8 (CODE 20/11): kc = kiem_cheo.json passed through, A3 checked inside C8B (no gate here),
+    luot = dai = None; --kc, --tam-id need --a6; c8b_a6 not merged -> no bound (reason kept); parts checked for both
+    ways C8B combines them."""
     import types
-    kc = write_json(str(tmp_path / 'kc.json'), dict(A3=dict(max_deg=0.02, quy_ve_ma_noc=True, du_lieu_du=True)))
-    kc_bad = write_json(str(tmp_path / 'kc_x.json'), dict(A3=dict(max_deg=0.0, quy_ve_ma_noc=False, du_lieu_du=False)))
+    kc = write_json(str(tmp_path / 'kc.json'), dict(version='c7_kiem_cheo_v7', A3=dict(quy_ve_ma_noc=True)))
     a6 = write_json(str(tmp_path / 'a6.json'), dict(schema='c8b_a6_v2'))
     with pytest.raises(ca.AError):
         ca.can_hai_dau_c8b(None, kc, 'T1', [])
@@ -944,27 +945,35 @@ def test_can_hai_dau_c8b_wrapper(tmp_path, monkeypatch):
     m = types.ModuleType('c8b_a6')
     m.__file__ = a6
     m.load_a6 = lambda p: dict(tam_id='T1')
-    m.u_psi_hai_dau_rad = lambda a6o, kc_, p1, p2, tam: (
-        dict(u_rad=0.001, trang_thai='dat', ly_do=[], phan=dict(A3_rad=[0.0003, 0.0003], A6du_rad=[0.0002, 0.0002]))
-        if tam == a6o['tam_id'] and kc_['A3']['max_deg'] == 0.02
-        else dict(u_rad=None, trang_thai='thieu', ly_do=['khac tam']))
+    got = {}
+
+    def f(a6o, kc_, p1, p2, tam, luot=None, dai=None):
+        got.update(kc=kc_, luot=luot, dai=dai)
+        if tam != a6o['tam_id']:
+            return dict(u_rad=None, trang_thai='thieu', ly_do=['khac tam'])
+        return dict(u_rad=0.001, trang_thai='dat', ly_do=[], ghep='cong_rieng',
+                    phan=dict(A3_rad=[0.0003, 0.0003], A6du_rad=[0.0002, 0.0002]))
+    m.u_psi_hai_dau_rad = f
     monkeypatch.setitem(sys.modules, 'c8b_a6', m)
     nguon = []
     assert ca.can_hai_dau_c8b(a6, kc, 'T1', nguon)((0, 0), (1, 0)) == (0.001, [])
-    assert {n['vai_tro'] for n in nguon} == {'c8_cam_u_vao', 'c8b_a6_ham'}
+    assert got['kc'] == json.load(open(kc, encoding='utf-8')) and got['luot'] is None and got['dai'] is None
+    assert {n['vai_tro'] for n in nguon} == {'kiem_cheo', 'c8b_a6_ham'}
     assert ca.can_hai_dau_c8b(a6, kc, 'T2', [])((0, 0), (1, 0)) == (None, ['khac tam'])
-    assert ca.can_hai_dau_c8b(a6, kc_bad, 'T1', [])((0, 0), (1, 0))[0] is None             # HCH1-5
     with pytest.raises(ca.AError):
         ca.can_hai_dau_c8b(a6, '', '', [])                                                # HCH1-8
-    m.u_psi_hai_dau_rad = lambda *a: 1 / 0
+    m.u_psi_hai_dau_rad = lambda *a, **k: 1 / 0
     assert ca.can_hai_dau_c8b(a6, kc, 'T1', [])((0, 0), (1, 0))[0] is None                 # HCH1-6
-    m.u_psi_hai_dau_rad = lambda *a: dict(u_rad=0.0015, trang_thai='dat', ly_do=[],          # HCH2-5: A6 < 0
-                                          phan=dict(A3_rad=[0.001, 0.001], A6du_rad=[-0.0003, -0.0002]))
-    assert ca.can_hai_dau_c8b(a6, kc, 'T1', [])((0, 0), (1, 0))[0] is None
-    for a3 in (dict(max_deg=0.0, quy_ve_ma_noc=True), dict(max_deg=0.0, quy_ve_ma_noc=True, du_lieu_du=None),
-               dict(max_deg=0.0, quy_ve_ma_noc=True, du_lieu_du=0)):                     # HCH2-2
-        k2 = write_json(str(tmp_path / 'kc_2.json'), dict(A3=a3))
-        assert ca.can_hai_dau_c8b(a6, k2, 'T1', [])((0, 0), (1, 0))[0] is None
+    bad = [dict(ghep='cong_rieng', phan=dict(A3_rad=[0.001, 0.001], A6du_rad=[-0.0003, -0.0002])),   # HCH2-5
+           dict(ghep='cong_rieng', phan=dict(A3_rad=[0.001, 0.001], A6du_rad=[0.0002, 0.0002])),     # sum off
+           dict(ghep='replay_chung_theo_ca', phan=dict(ca_rad=-0.001, A6du_khong_meo_rad=[0.001, 0.0015])),
+           dict(ghep='khac', phan={})]
+    for b in bad:
+        m.u_psi_hai_dau_rad = lambda *a, b=b, **k: dict(u_rad=0.0015, trang_thai='dat', ly_do=[], **b)
+        assert ca.can_hai_dau_c8b(a6, kc, 'T1', [])((0, 0), (1, 0))[0] is None
+    m.u_psi_hai_dau_rad = lambda *a, **k: dict(u_rad=0.0035, trang_thai='dat', ly_do=[], ghep='replay_chung_theo_ca',
+                                               phan=dict(ca_rad=0.001, A6du_khong_meo_rad=[0.001, 0.0015]))
+    assert ca.can_hai_dau_c8b(a6, kc, 'T1', [])((0, 0), (1, 0)) == (0.0035, [])
 
 
 def test_can_hai_dau_round2(tmp_path):
@@ -999,7 +1008,7 @@ def test_tinh_prints_null_u_a(tmp_path, monkeypatch, capsys):
     m = types.ModuleType('c8b_a6')
     m.__file__ = a6
     m.load_a6 = lambda p: dict(tam_id='T1')
-    m.u_psi_hai_dau_rad = lambda *a: dict(u_rad=None, trang_thai='thieu', ly_do=['A6 thieu'])
+    m.u_psi_hai_dau_rad = lambda *a, **k: dict(u_rad=None, trang_thai='thieu', ly_do=['A6 thieu'])
     monkeypatch.setitem(sys.modules, 'c8b_a6', m)
     out = str(tmp_path / 'f7.json')
     code = ca.main(tinh_args(d, 'K2', '--a6', a6, '--kc', kc, '--tam-id', 'T1', '--out', out))
