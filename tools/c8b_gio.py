@@ -740,6 +740,10 @@ def main(argv=None):
     ap.add_argument('--out', required=True)
     ap.add_argument('--khoa', default=None, help='C8 lock file of c8b_u.py (drift rate, C8 ranges per level)')
     ap.add_argument('--startup-s', type=float, default=STARTUP_S)
+    ap.add_argument('--so-bo', default=None,
+                    help='the preliminary clock file the reference window (cua_so_v1, F2) was built from; its SHA-256 is '
+                         'written as luoi_so_bo_sha256 so that the window stays tied to this final file (CAM CT2-7)')
+    ap.add_argument('--cua-so', default=None, help='cua_so_v1 file built from --so-bo (SHA-256 written as cua_so_v1_sha256)')
     ap.add_argument('--thao-tac', action='append', choices=THAO_TAC,
                     help='the run is lost to this operation (rq3_log facts; boot is also found from reset_n)')
     a = ap.parse_args(argv)
@@ -755,6 +759,11 @@ def main(argv=None):
         out['sha256'] = dict(esp32=cu.sha256(a.esp32), frames=cu.sha256(a.frames))
         out['nguon'] = [dict(file=os.path.basename(p), sha256=cu.sha256(p)) for p in (a.frames, a.esp32)
                         + ((a.khoa,) if a.khoa else ()) + ((ev,) if ev else ())]
+        # CAM CT2-7 (CODE 19/11): the final clock file names the preliminary grid and the window built from it
+        out['luoi_so_bo_sha256'] = cu.sha256(a.so_bo) if a.so_bo else None
+        out['cua_so_v1_sha256'] = cu.sha256(a.cua_so) if a.cua_so else None
+        if a.cua_so and not a.so_bo:
+            raise GioError('--cua-so needs --so-bo (the preliminary grid it was built from)')
         out['script'] = repo_state()
         cu.check_path(a.out)
         with open(a.out, 'x', encoding='utf-8') as f:

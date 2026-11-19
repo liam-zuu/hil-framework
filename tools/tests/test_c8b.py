@@ -401,6 +401,21 @@ def test_cli_writes_once(tmp_path, base_run):
     import c8_u_imu
     assert d['sha256'] == dict(esp32=c8_u_imu.sha256(base_run[2]), frames=c8_u_imu.sha256(base_run[1]))
     assert G.main(args) == 2                                   # never overwritten
+    assert d['luoi_so_bo_sha256'] is None and d['cua_so_v1_sha256'] is None
+
+
+def test_cli_ties_the_preliminary_grid_and_window(tmp_path, base_run):
+    # CAM CT2-7: the final clock file names the preliminary grid and the reference window built from it
+    sb, cs = tmp_path / 'so_bo.json', tmp_path / 'cua_so.json'
+    sb.write_text('{"format": "c8b_gio_v1"}', encoding='utf-8')
+    cs.write_text('{"schema": "cua_so_v1"}', encoding='utf-8')
+    base = ['--frames', base_run[1], '--esp32', base_run[2], '--task', 'O1-F05']
+    out_p = str(tmp_path / 'gio.json')
+    assert G.main(base + ['--so-bo', str(sb), '--cua-so', str(cs), '--out', out_p]) == 0
+    d = json.load(open(out_p, encoding='utf-8'))
+    import c8_u_imu
+    assert d['luoi_so_bo_sha256'] == c8_u_imu.sha256(str(sb)) and d['cua_so_v1_sha256'] == c8_u_imu.sha256(str(cs))
+    assert G.main(base + ['--cua-so', str(cs), '--out', str(tmp_path / 'g2.json')]) == 2
 
 
 def test_sealed_path_refused(tmp_path, base_run):
