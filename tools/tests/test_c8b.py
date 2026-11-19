@@ -1329,6 +1329,47 @@ def test_3b_v4_l132_blocked_by_an_identified_centre_move():
         assert B2['rad_dev_m'] >= 0.0026 - 2e-4
 
 
+def test_3b_v6_centre_move_between_two_groups_of_spins():
+    # Codex G3B5-1 (round 5): four spins alternating, 4 rad/s for 2 s then down to 0.35 over 27 / 25 / 101 / 143 s, 1 s
+    # apart; radius 250 mm, the centre moved 2.6 mm between spin 1 and spin 2. The first two spins alone are under a
+    # turn, and each spin against the rest mixes two centres: only a cut between the two groups sees the move. The
+    # searched cut finds it, L132 closes
+    parts = [(2, 4.0, 0.35, 27, 1.0), (2, -4.0, -0.35, 25, 1.0), (2, 4.0, 0.35, 101, 1.0), (2, -4.0, -0.35, 143, 0.0)]
+    t, _ = _segs(parts)
+    starts = [t[0]] + list(t[1:][np.diff(t) > 0.5])
+    tc = float(starts[2]) - 0.5
+    B = TB.analyse_b(_wheel_F(parts, {0: 0.25}, c_step=(tc, 0.0026)), 0.2915, 0.6536, 1 / 60)
+    by = {k['phep']: k for k in B['theo_clip'][0]['kieu_lech']}
+    assert not B['ga_ok'] and B['du_phu']
+    d = by['diem_chia khung_dung']
+    assert d['kieu'] == 'tam' and d['dich_tam_m'] == pytest.approx(0.0026, abs=5e-5)
+    assert d['t_chia_s'] > tc            # the first frame used after the move (spin 2 is used only once it slows down)
+    assert not TB.b_troi_only(B)
+
+
+def test_3b_v6_linear_radius_drift_is_not_a_centre_move():
+    # Codex G3B5-2 (round 5, a regression of round 4's fix): fixed centre, the radius growing 250 -> 262 mm over the
+    # clip; two spins each way, 4.5 rad/s for 4 s then down to 0.35 over 62 / 75 s. A fixed-radius circle on each time
+    # half moved its centre 1.1 mm and was taken for a centre move ('tam' blocked L132; c0c47ea published P4). With a
+    # drifting radius in each part every split says 'ban_kinh'; L132 opens and the drift stays in rad_dev
+    parts = [(4, 4.5, 0.35, 62, 0.0), (4, -4.5, -0.35, 75, 0.0)]
+    t, _ = _segs(parts)
+    F = _wheel_F(parts, {0: 0.25}, r_drift=lambda tt: 0.012 * (tt - t[0]) / (t[-1] - t[0]))
+    B = TB.analyse_b(F, 0.2915, 0.6536, 1 / 60)
+    kl = B['theo_clip'][0]['kieu_lech']
+    assert not B['ga_ok'] and B['du_phu'] and kl
+    assert all(k['kieu'] == 'ban_kinh' and k['dich_tam_m'] < 1e-4 for k in kl), kl
+    assert TB.b_troi_only(B) and B['rad_dev_m'] > 0.009
+    # the drifting circle itself: centre and both radii back
+    th = np.linspace(0, 6 * math.pi, 900)
+    tt = np.linspace(0, 30, 900)
+    R = 0.25 + 0.0004 * tt
+    x, y = 1.0 + R * np.cos(th), 0.5 + R * np.sin(th)
+    cx, cy, R0, R1 = TB.circle_drift_fit(x, y, tt, np.arange(900))
+    assert (cx, cy) == (pytest.approx(1.0, abs=1e-9), pytest.approx(0.5, abs=1e-9))
+    assert R1 == pytest.approx(0.0004, rel=1e-6) and R0 == pytest.approx(0.25 + 0.0004 * 15, abs=1e-9)
+
+
 def test_3b_v5_clip_without_frames_used_does_not_void_rad_dev():
     # Codex G3B4-2 (round 4): two B clips covering F02, then a third clip at 3 -> 2 rad/s on 250 mm (0.50 m/s and more,
     # above the band used 1.1 x 0.2915 m/s): it has a slow part but no frame used; rad_dev stays the larger of the two

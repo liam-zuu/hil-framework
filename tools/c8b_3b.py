@@ -96,6 +96,7 @@ PHU_FRAC = 1.0              # C8BS-10 round 3: a part counts as measured up to t
 RUN_JUMP_RAD_S = 0.5        # [DE XUAT] a rise of the smoothed rate this far above the run's lowest starts a new spin
 RUN_GAP_JUMP_RAD_S = 0.1    # [DE XUAT] across such a stretch any rise above the rate noise is a re-spin (Codex G3B-1 r3)
 TAM_TOL_M = 0.001            # [DE XUAT] centres of two parts within 1 mm: the held-out gap is a radius change
+SPLIT_STEP = 0.05           # [DE XUAT] cut search (Codex G3B5-1): every 5 % of the frames in time, plus spin boundaries
 RUN_GAP_S = 2.0             # [DE XUAT] a rise across a stretch this long without spinning frames is a re-spin
 RUN_SMOOTH = 31            # spinning frames in the running median of the rate for the runs (0.5 s at 60 frames/s)
 TURN_BINS = 12              # [DE XUAT] a full turn: every 30 degree sector ...
@@ -318,19 +319,69 @@ def held_out_runs(fit, res, slk, runs_ci, run):
     return worst, why, unchecked
 
 
-def split_kind(x, y, ia, ib):
-    """Codex G3B3-1: a failed held-out comparison between two parts of the slow frames (ia, ib): circle of each part
-    (identified when it covers a full turn about its own circle); centre shift and radius change between them; kind
-    'ban_kinh' (radius change, centres within TAM_TOL_M), 'tam' (centre moved) or 'khong_nhan_dang' (a part under a
-    turn: the circle is not fixed, the cause not told)."""
+def circle_drift_fit(x, y, t, idx, iters=30):
+    """Codex G3B5-2: circle whose radius drifts linearly in time, |p - c| = R0 + R1 (t - tm), least squares on the
+    frames idx (Gauss-Newton from the algebraic circle). A fixed-radius circle fitted to a drifting radius moves its
+    centre (1.1 mm for 250 -> 262 mm over two halves); the drift term is the same in every direction, so it cannot take
+    a centre move. Returns cx, cy, R0 (radius at the mean time of idx), R1 (m/s)."""
+    cx_, cy_, R_ = circle_fit(x[idx], y[idx])
+    tm = float(np.mean(t[idx]))
+    th = np.array([cx_, cy_, R_, 0.0])
+    xi, yi, ti = x[idx], y[idx], t[idx] - tm
+    for _ in range(iters):
+        dx, dy = xi - th[0], yi - th[1]
+        d = np.hypot(dx, dy)
+        d = np.where(d > 0, d, 1e-12)
+        res = d - (th[2] + th[3] * ti)
+        J = np.column_stack([-dx / d, -dy / d, -np.ones_like(d), -ti])
+        step, *_ = np.linalg.lstsq(J, -res, rcond=None)
+        th = th + step
+        if float(np.max(np.abs(step[:3]))) < 1e-10:
+            break
+    return float(th[0]), float(th[1]), float(th[2]), float(th[3])
+
+
+def split_kind(x, y, ia, ib, t=None):
+    """Codex G3B3-1: a failed held-out comparison between two parts of the frames (ia, ib): circle of each part
+    (identified when it covers a full turn about its own circle; with t, the radius of each part may drift linearly in
+    time, Codex G3B5-2); centre shift and radius change between them; kind 'ban_kinh' (radius change, centres within
+    TAM_TOL_M), 'tam' (centre moved) or 'khong_nhan_dang' (a part under a turn: the circle is not fixed, the cause
+    not told)."""
     out = []
     for i in (ia, ib):
-        cx_, cy_, R_ = circle_fit(x[i], y[i])
+        if t is not None and len(i) >= 4:
+            cx_, cy_, R_, _ = circle_drift_fit(x, y, t, i)
+        else:
+            cx_, cy_, R_ = circle_fit(x[i], y[i])
         out.append((cx_, cy_, R_, full_turn(np.arctan2(y[i] - cy_, x[i] - cx_))))
     (ax, ay, aR, aok), (bx, by, bR, bok) = out
     dc, dr = float(math.hypot(bx - ax, by - ay)), float(bR - aR)
     kind = 'khong_nhan_dang' if not (aok and bok) else ('ban_kinh' if dc <= TAM_TOL_M else 'tam')
     return dict(kieu=kind, dich_tam_m=dc, doi_ban_kinh_m=dr, n=[int(len(ia)), int(len(ib))])
+
+
+def split_search(x, y, t, sel, run=None):
+    """Codex G3B5-1: a centre move at an unknown time. Every cut of the frames sel in time order (each boundary between
+    spins, and every SPLIT_STEP of the frames) gives two parts, before and after; split_kind with the drifting radius on
+    each. Returns the pair with the largest centre shift among those whose two parts cover a full turn (the cut nearest
+    the move: a part mixing two centres shows a smaller shift), or the first pair when none does ('khong_nhan_dang')."""
+    s = sel[np.argsort(t[sel])]
+    n = len(s)
+    if n < 2:
+        return None
+    cuts = {int(round(q * n)) for q in np.arange(SPLIT_STEP, 1.0 - 1e-9, SPLIT_STEP)}
+    if run is not None:
+        rs = run[s]
+        cuts |= {int(j) for j in np.flatnonzero(rs[1:] != rs[:-1]) + 1}
+    best, first = None, None
+    for c in sorted(j for j in cuts if 0 < j < n):
+        k = split_kind(x, y, s[:c], s[c:], t)
+        k['t_chia_s'] = float(t[s[c]])
+        if first is None:
+            first = k
+        if k['kieu'] != 'khong_nhan_dang' and (best is None or k['dich_tam_m'] > best['dich_tam_m']):
+            best = k
+    return best or first
 
 
 def full_turn(ang):
@@ -753,13 +804,17 @@ def analyse_b(F, v_max, wz_max, frame_s):
             used_k = ci[use_p[ci]]
             for nm, sel in (('', slk), (' khung_dung', used_k)):
                 if len(sel) >= 2:
-                    kieu.append(dict(phep='thoi_gian' + nm, **split_kind(x, y, *halves(t, sel))))
+                    kieu.append(dict(phep='thoi_gian' + nm, **split_kind(x, y, *halves(t, sel), t=t)))
                 for r_ in runs_ci:
                     if r_ in unchecked:
                         continue
                     own, oth = sel[run[sel] == r_], sel[(run[sel] != r_) & ~np.isin(run[sel], unchecked)]
                     if len(own) and len(oth):
-                        kieu.append(dict(phep=f'luot {r_}{nm}', **split_kind(x, y, own, oth)))
+                        kieu.append(dict(phep=f'luot {r_}{nm}', **split_kind(x, y, own, oth, t=t)))
+                # Codex G3B5-1: the move between two groups of spins, or at any time: the cut searched in time
+                ss = split_search(x, y, t, sel[~np.isin(run[sel], unchecked)], run)
+                if ss is not None:
+                    kieu.append(dict(phep='diem_chia' + nm, **ss))
         # radial part (Codex G3B-5 round 3): the true radius of the set-up is one unknown constant within the clip, so
         # the error of a frame can be as large as the PEAK-TO-PEAK of the measured radius over the frames used (a drift
         # is not halved by taking the deviation from the mean); harmonics and drift not removed
