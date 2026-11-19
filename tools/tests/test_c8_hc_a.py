@@ -914,7 +914,7 @@ def test_can_hai_dau_function_feeds_u_q_and_u_psi_cuc(tmp_path):
     r = ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.004, -0.003], du_m=0.0, neo=0.0, can_hai_dau=fn)
     assert r['u_hang_deg']['u_psi_cuc'] == pytest.approx(0.05)
     assert not any('thieu can' in w or 'can C8B' in w for w in r['ly_do'])
-    p_ref = tuple(an['windows'][0]['p'])
+    p_ref = tuple(an['windows'][0]['p_tag'])
     assert len(calls) == 8 and sum(c[1] == p_ref for c in calls) >= 4
     r2 = ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.004, -0.003], du_m=0.0, neo=0.0,
                          can_hai_dau=lambda p1, p2: (None, ['p1: A3 missing in the camera file']))
@@ -945,7 +945,8 @@ def test_can_hai_dau_c8b_wrapper(tmp_path, monkeypatch):
     m.__file__ = a6
     m.load_a6 = lambda p: dict(tam_id='T1')
     m.u_psi_hai_dau_rad = lambda a6o, kc_, p1, p2, tam: (
-        dict(u_rad=0.001, trang_thai='dat', ly_do=[]) if tam == a6o['tam_id'] and kc_['A3']['max_deg'] == 0.02
+        dict(u_rad=0.001, trang_thai='dat', ly_do=[], phan=dict(A3_rad=[0.0003, 0.0003], A6du_rad=[0.0002, 0.0002]))
+        if tam == a6o['tam_id'] and kc_['A3']['max_deg'] == 0.02
         else dict(u_rad=None, trang_thai='thieu', ly_do=['khac tam']))
     monkeypatch.setitem(sys.modules, 'c8b_a6', m)
     nguon = []
@@ -957,3 +958,51 @@ def test_can_hai_dau_c8b_wrapper(tmp_path, monkeypatch):
         ca.can_hai_dau_c8b(a6, '', '', [])                                                # HCH1-8
     m.u_psi_hai_dau_rad = lambda *a: 1 / 0
     assert ca.can_hai_dau_c8b(a6, kc, 'T1', [])((0, 0), (1, 0))[0] is None                 # HCH1-6
+    m.u_psi_hai_dau_rad = lambda *a: dict(u_rad=0.0015, trang_thai='dat', ly_do=[],          # HCH2-5: A6 < 0
+                                          phan=dict(A3_rad=[0.001, 0.001], A6du_rad=[-0.0003, -0.0002]))
+    assert ca.can_hai_dau_c8b(a6, kc, 'T1', [])((0, 0), (1, 0))[0] is None
+    for a3 in (dict(max_deg=0.0, quy_ve_ma_noc=True), dict(max_deg=0.0, quy_ve_ma_noc=True, du_lieu_du=None),
+               dict(max_deg=0.0, quy_ve_ma_noc=True, du_lieu_du=0)):                     # HCH2-2
+        k2 = write_json(str(tmp_path / 'kc_2.json'), dict(A3=a3))
+        assert ca.can_hai_dau_c8b(a6, k2, 'T1', [])((0, 0), (1, 0))[0] is None
+
+
+def test_can_hai_dau_round2(tmp_path):
+    """HCH2-3: the F9 replay (bao_q) covers the issued run only: legs of another run keep the q turn term.
+    HCH2-4: the reference end is the tag centre given for the F6 frame set. HCH2-6: F7 legs keep p_a/p_b as before."""
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
+    an = analyse(d)
+    d2, _ = make(tmp_path, 'HC_K2_2', cho='K2')
+    an2 = analyse(d2)
+    seen = []
+    u = math.radians(0.05)
+
+    def fn(p1, p2):
+        seen.append((tuple(p1), tuple(p2)))
+        return u, []
+    r = ca.place_result('K2', [('x', an), ('y', an2)], 'x', e_hieu=E(0.0), q=[0.02, 0.0], du_m=0.0, neo=0.0,
+                        bao_q=True, can_hai_dau=fn, p_ref_tag=np.array([0.123, 0.456]))
+    ends = [c for c in seen if c[1] != (0.123, 0.456)]
+    refs = [c for c in seen if c[1] == (0.123, 0.456)]
+    assert len(ends) == 4 and len(refs) == 8                         # two-end calls only for the other run
+    assert r['u_hang_deg']['u_q'] > 0.0 and r['u_hang_deg']['u_psi_cuc'] == pytest.approx(0.05)
+    leg = r['luot_thu'][0]['doan'][0]
+    assert 'p_tag_a' not in leg and leg['p_a'] == pytest.approx(an['legs'][0]['p_a'].tolist())
+
+
+def test_tinh_prints_null_u_a(tmp_path, monkeypatch, capsys):
+    """HCH2-1 (Codex): u_a null (bound missing) made the CLI print fail after the JSON was written."""
+    import types
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
+    kc = write_json(str(tmp_path / 'kc.json'), dict(A3=dict(max_deg=0.02, quy_ve_ma_noc=True, du_lieu_du=True)))
+    a6 = write_json(str(tmp_path / 'a6.json'), dict(schema='c8b_a6_v2'))
+    m = types.ModuleType('c8b_a6')
+    m.__file__ = a6
+    m.load_a6 = lambda p: dict(tam_id='T1')
+    m.u_psi_hai_dau_rad = lambda *a: dict(u_rad=None, trang_thai='thieu', ly_do=['A6 thieu'])
+    monkeypatch.setitem(sys.modules, 'c8b_a6', m)
+    out = str(tmp_path / 'f7.json')
+    code = ca.main(tinh_args(d, 'K2', '--a6', a6, '--kc', kc, '--tam-id', 'T1', '--out', out))
+    txt = capsys.readouterr().out
+    assert code in (0, 1) and 'u_a = null' in txt
+    assert json.load(open(out, encoding='utf-8'))['u_a_k_deg'] is None

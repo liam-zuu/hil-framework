@@ -821,7 +821,8 @@ def analyse(A, F, k_info, min_frames=MIN_FRAMES_TINH):
         leg.update(trang_thai='hop_le', dp=dp, ds=ds, L_m=float(np.hypot(*dp)), Ls_m=float(np.hypot(*ds)),
                    ti_le=float(np.hypot(*dp) / np.hypot(*ds)), theta_a=th_a, a_l=a_l, eps=eps, path=path, sum_dth=dth,
                    chieu='toi' if ds[0] > 0 else 'lui', R_a=wa['psi'], R_b=wb['psi'], cs_a=wa['cs'], cs_b=wb['cs'],
-                   nua_a=wa['psi_nua'], nua_b=wb['psi_nua'], p_a=wa['p_tag'], p_b=wb['p_tag'])
+                   nua_a=wa['psi_nua'], nua_b=wb['psi_nua'], p_a=wa['p'], p_b=wb['p'],
+                   p_tag_a=wa['p_tag'], p_tag_b=wb['p_tag'])
         legs.append(leg)
     return dict(D=D, u_D=u_D, diffs=diffs, windows=W, legs=legs, chuoi=F['chuoi'])
 
@@ -839,7 +840,7 @@ def _deg_leg(lg):
     """One leg for F7: angles in degrees with _deg names (HCC1-12), arrays as lists, internal fields dropped."""
     out = {}
     for k, v in lg.items():
-        if k in ('R_a', 'R_b', 'cs_a', 'cs_b', 'nua_a', 'nua_b'):
+        if k in ('R_a', 'R_b', 'cs_a', 'cs_b', 'nua_a', 'nua_b', 'p_tag_a', 'p_tag_b'):
             continue
         if k in ('a_l', 'theta_a', 'eps'):
             out[k + '_deg'] = None if v is None or not math.isfinite(v) else math.degrees(v)
@@ -850,7 +851,7 @@ def _deg_leg(lg):
 
 def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None, psi_cuc=None, cap_ok=True,
                  cap_why=(), bao_q=False, vet=None, psi_cuc_chot=False, need_windows=None, psi_hai_dau=None,
-                 can_hai_dau=None):
+                 can_hai_dau=None, p_ref_tag=None):
     for v in (psi_cuc, psi_hai_dau):                       # HCC3-6: never let max()/sin() hide a bad bound
         if v is not None and not (math.isfinite(v) and 0.0 <= v <= math.pi):
             raise AError(f'can ngoai mien [0, pi]: {v}')
@@ -925,6 +926,7 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
     # HCH1-3: with the C8B function the max runs over the long legs of every attempt of the place (as the
     # deviation term), not only the issued one
     legs_u = all_long if can_hai_dau is not None else longs
+    cap_legs = {id(lg) for lg in longs}                    # HCH2-3: the F9 replay (bao_q) covers the issued run only
     if q is None or du_m is None:
         res['ly_do'].append('thieu q, du_m (xoay_v1)')
         thieu_hang.append('u_q')
@@ -933,8 +935,9 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
         qn = math.hypot(*q)
         u_q = 0.0
         for lg in legs_u:
-            if can_hai_dau is not None and not bao_q:      # HCH1-7: F9 replay holds the q turn term: not needed
-                v = can(lg['p_a'], lg['p_b'])
+            bao = bao_q and id(lg) in cap_legs
+            if can_hai_dau is not None and not bao:        # HCH1-7: F9 replay holds the q turn term: not needed
+                v = can(lg['p_tag_a'], lg['p_tag_b'])
                 hd_thieu = hd_thieu or v is None
                 psi_hai_dau = None if v is None else v
             # ||mean R_b - mean R_a||_2 of the window rotation matrices (HCC1-12), and the turn error of q from the
@@ -943,9 +946,10 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
             # HCC2-8: the bound of the end-heading difference comes from C8B (u_psi_hai_dau_rad); the half-split
             # spread of the two windows only enters as a floor (window noise), never as the bound itself
             u_hd = max(lg['nua_a'] + lg['nua_b'], psi_hai_dau or 0.0)
-            term = dR * du_m + (0.0 if bao_q else qn * 2 * math.sin(u_hd / 2))
+            term = dR * du_m + (0.0 if (bao_q and id(lg) in cap_legs) else qn * 2 * math.sin(u_hd / 2))
             u_q = max(u_q, term / lg['L_m'])
-    if q is not None and du_m is not None and not bao_q and (psi_hai_dau is None or hd_thieu):
+    if q is not None and du_m is not None and (not bao_q or len(legs_u) > len(longs)) \
+            and (psi_hai_dau is None or hd_thieu):
         res['ly_do'].append('thieu can sai hieu huong hai dau (C8B u_psi_hai_dau_rad) cho u_q')
         thieu_hang.append('u_q')
     eps = [lg['eps'] for lg in longs]
@@ -955,8 +959,9 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
     if can_hai_dau is not None:
         # design v4 3.3: u_psi_cuc = max over the long legs of the bound between the start window of the leg (at
         # the extreme, where a takes psi') and the reference window (where psi_chuan_k is taken)
-        p_ref = cap['windows'][0].get('p_tag')
-        vals = [None if p_ref is None else can(lg['p_a'], p_ref) for lg in legs_u]
+        # HCH2-4: the reference end is the tag centre of the F6 frame set (khung_chung) when given
+        p_ref = p_ref_tag if p_ref_tag is not None else cap['windows'][0].get('p_tag')
+        vals = [None if p_ref is None else can(lg['p_tag_a'], p_ref) for lg in legs_u]
         if any(v is None for v in vals):
             psi_cuc = None
         else:
@@ -1250,7 +1255,7 @@ def _meta(m, k):
     return m.get(k, m.get(k + '256'))
 
 
-def read_neo(path, cho, ref_row):
+def read_neo(path, cho, ref_row, want_ids=False):
     """psi_chuan_k_deg of F6 (NHACTAM hieu_chuan_neo_v1) after checking it was made on the ref_12b window of the
     issued attempt (contract F6; HCC1-10; NHACTAM 19/11 via CODE; Codex HCG1-1..6). khung_chung of NHACTAM is
     (frames through the anchor gate) & khung_ma_hop_le & (A6 valid), so it equals neither khung_sha256 nor
@@ -1263,7 +1268,8 @@ def read_neo(path, cho, ref_row):
     if ref_row is None:
         raise AError('F6 needs the ref_12b row of cua_so_v1.jsonl of the issued attempt (run cua_so first)')
     try:
-        return _read_neo(path, cho, ref_row)
+        v, ids = _read_neo(path, cho, ref_row)
+        return (v, ids) if want_ids else v
     except AError:
         raise
     except (AttributeError, TypeError, ValueError, OverflowError, KeyError, RecursionError) as exc:  # HCG1-6
@@ -1327,7 +1333,7 @@ def _read_neo(path, cho, ref_row):
     v = float(b['psi_chuan_k_deg'])
     if not math.isfinite(v):
         raise AError(f'{path}: psi_chuan_k_deg khong huu han')
-    return v
+    return v, sorted(ids)
 
 
 def read_e_hieu(path, doan_path):
@@ -1365,7 +1371,7 @@ def can_hai_dau_c8b(a6_path, kc_path, tam_id, nguon):
     a3 = kc.get('A3') if isinstance(kc, dict) else None
     # HCH1-5: the rules of the KIEMCHEO writer (check_cam_v3, KCJ1-4, KCJ2-1): A3 carried to the car tag, over the
     # full planned pair set; else no bound
-    if not isinstance(a3, dict) or a3.get('quy_ve_ma_noc') is not True or a3.get('du_lieu_du') is False \
+    if not isinstance(a3, dict) or a3.get('quy_ve_ma_noc') is not True or a3.get('du_lieu_du') is not True \
             or a3.get('cap_hong'):
         why = 'A3 cua KIEMCHEO chua du (quy_ve_ma_noc, du_lieu_du, cap_hong)'
         return lambda p1, p2: (None, [why])
@@ -1386,6 +1392,12 @@ def can_hai_dau_c8b(a6_path, kc_path, tam_id, nguon):
             return None, [f'ham C8B loi ({type(exc).__name__}: {exc})']
         if not isinstance(r, dict) or r.get('trang_thai') != 'dat' or r.get('u_rad') is None:
             return None, [str(w) for w in ((r or {}).get('ly_do') or ['trang_thai khac dat'])]
+        # HCH2-5: every part (A3, A6 residual at both ends) finite and >= 0, and the total their sum
+        ph = r.get('phan') if isinstance(r.get('phan'), dict) else {}
+        parts = list(ph.get('A3_rad') or []) + list(ph.get('A6du_rad') or [])
+        if len(parts) != 4 or not all(isinstance(v, (int, float)) and math.isfinite(v) and v >= 0 for v in parts) \
+                or abs(sum(parts) - float(r['u_rad'])) > 1e-12 * max(1.0, abs(float(r['u_rad']))):
+            return None, [f"thanh phan can C8B khong hop le: {ph}"]
         return float(r['u_rad']), []
     return fn
 
@@ -1483,8 +1495,15 @@ def cmd_tinh(a):
     if a.a6:
         nguon.append(dict(vai_tro='c8b_a6_v2', duong_dan=os.path.abspath(a.a6), sha256=sha256(a.a6)))
     neo = None
+    p_ref_tag = None
     if a.neo:
-        neo = read_neo(a.neo, a.cho, cap_ref)
+        neo, neo_ids = read_neo(a.neo, a.cho, cap_ref, want_ids=True)
+        if cap_F is not None:                              # HCH2-4: tag centre over the F6 common frames
+            m = np.isin(cap_F['idx'], neo_ids)
+            tx, ty = cap_F.get('tx', cap_F['x'])[m], cap_F.get('ty', cap_F['y'])[m]
+            ok = np.isfinite(tx) & np.isfinite(ty)
+            if ok.any():
+                p_ref_tag = np.array([tx[ok].mean(), ty[ok].mean()])
         nguon.append(dict(vai_tro='hieu_chuan_neo', duong_dan=os.path.abspath(a.neo), sha256=sha256(a.neo)))
     psi_cuc, psi_hd, chot = None, None, False
     if a.can_c8b:
@@ -1515,7 +1534,7 @@ def cmd_tinh(a):
     del roles
     r = place_result(a.cho, attempts, cap_id, e_hieu=e, q=q, du_m=du, neo=neo, psi_cuc=psi_cuc, cap_ok=cap_ok,
                      cap_why=cap_why, bao_q=bao_q, vet=vet, psi_cuc_chot=chot, need_windows=need, psi_hai_dau=psi_hd,
-                     can_hai_dau=can_fn)
+                     can_hai_dau=can_fn, p_ref_tag=p_ref_tag)
     r = dict(schema='truc_xe_v1', version=VERSION, commit_hil=commit_hil(), nguon=nguon,
              mien_hieu_luc=dict(cho=a.cho, thu_id_cap=cap_id, lan_lap_id=None,
                                 ghi_chu='cung buoi, cung lan lap tam (lan_lap_v1 cua NHACTAM chua co: chua xac minh)'),
@@ -1527,7 +1546,9 @@ def cmd_tinh(a):
     if r['a_k_deg'] is None:
         print(f"{a.cho}: trang_thai {r['trang_thai']} {r['ly_do']}")
     else:
-        print(f"{a.cho}: a = {r['a_k_deg']:+.3f} deg, u_a = {r['u_a_k_deg']:.3f} deg, do tan {r['do_tan_deg']:.3f} deg, "
+        ua = (f"{r['u_a_k_deg']:.3f}" if r['u_a_k_deg'] is not None
+              else 'null (' + ','.join(r.get('u_hang_thieu') or []) + ')')      # HCH2-1
+        print(f"{a.cho}: a = {r['a_k_deg']:+.3f} deg, u_a = {ua} deg, do tan {r['do_tan_deg']:.3f} deg, "
               f"trang_thai {r['trang_thai']} {r['ly_do']}")
     return 0 if r['trang_thai'] in ('khoa', 'chan_doan') and all(r['cong'].values()) else 1
 
