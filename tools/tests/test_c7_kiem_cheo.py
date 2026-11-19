@@ -1877,3 +1877,18 @@ def test_tien_de_cli_checks_the_plan_content(tmp_path, id8):
     assert r['ket_qua'] == 'dat' and r['luot'] == ['R1', 'R2'] and r['sha256']['ke_hoach'] == kc.sha256_file(str(plan))
     plan.write_text('H_a\nH_b\nR1\nH_m\nR2\nR3\nH_z\n', encoding='utf-8')
     assert kc.main(base + ['--out', str(tmp_path / 'td2.json')]) == 2 and not (tmp_path / 'td2.json').exists()
+
+
+def test_closed_stdout_after_publication(tmp_path, monkeypatch):
+    """KCJ1-6 (round 4): stdout whose write and flush fail: code 0, the file published, stdout replaced so the
+    interpreter does not fail again at exit."""
+    class Dead:
+        def write(self, *a):
+            raise BrokenPipeError('closed (test)')
+
+        def flush(self):
+            raise BrokenPipeError('closed (test)')
+    dead = Dead()
+    monkeypatch.setattr(sys, 'stdout', dead)
+    assert kc.main(_xuat_args(tmp_path, _kc_file(tmp_path))) == 0
+    assert (tmp_path / 'o.json').exists() and sys.stdout is not dead

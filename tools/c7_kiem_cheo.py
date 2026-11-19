@@ -2265,8 +2265,12 @@ def main(argv=None):
         return 2
     try:                                              # KCJ1-6: a closed stdout after publication keeps code 0
         print('#ket_qua,ma=0')
+        sys.stdout.flush()
     except (OSError, ValueError):
-        pass
+        try:                                          # no second flush attempt at interpreter exit (exit code 120)
+            sys.stdout = open(os.devnull, 'w')
+        except OSError:
+            pass
     return 0
 
 
