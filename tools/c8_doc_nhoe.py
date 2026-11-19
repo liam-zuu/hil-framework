@@ -1132,9 +1132,12 @@ def _pick(rng, idx, n):
     return idx if len(idx) <= n else np.sort(rng.choice(idx, n, replace=False))
 
 
-# the frame camera must give the track row back within the resolution of frames.csv: res_m, res_sim_m, scale are
-# written with 10 decimals (half a unit 5e-11, tolerance 1e-10), tag_x, tag_y, psi with 6 (5e-7, tolerance 6e-7)
-FRAME_CAM_TOL = dict(res_m=1e-10, res_sim_m=1e-10, scale=1e-10, tag_x=6e-7, tag_y=6e-7, psi=6e-7)
+# the frame camera must give the track row back: tag_x, tag_y, psi within the resolution of frames.csv (6 decimals,
+# half a unit 5e-7, tolerance 6e-7); res_m, res_sim_m, scale (10 decimals) within 1e-8, the convergence of the pose
+# refit (least_squares tolerances 1e-8): restarted from the session camera or from the previous frame the refit gives
+# scale differences up to 4e-10 on IMG_3601 (frames 1406, 5514, 5820, checked 19/11). A fault landing within about
+# 1e-9 of the (2a) or (2b) threshold may therefore be judged differently from cong (limitation, DNC2-01)
+FRAME_CAM_TOL = dict(res_m=1e-8, res_sim_m=1e-8, scale=1e-8, tag_x=6e-7, tag_y=6e-7, psi=6e-7)
 
 
 def frame_cameras(video, need, sess, C, pose):
