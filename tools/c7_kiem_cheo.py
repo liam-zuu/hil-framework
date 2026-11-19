@@ -76,7 +76,8 @@ CHO = ('goc', 'K1', 'K2')                    # place names of every file (CODE 1
 R_XP_M = 0.6                                 # marks of a start region: within R_XP of the start point
 R_TRONG_M = 0.35                             # every sample of the start domain within R_TRONG of a region mark
 MIEN_XP_M = 0.10                             # start domain before the session: disc about the nominal point (by eye)
-MIEN_XP_N = 16                               #   sampled at its centre and N points on the rim
+MIEN_XP_BUOC_M = 0.005                       #   grid step of the coverage test (KCJ1-11: 1-Lipschitz margin added)
+ID_KHOA = tuple(range(1, 33))                # KS7-7, KCJ1-10: the floor marks of the official path (0 = car tag)
 HAI_PHUONG_DEG = 60.0                        # two A3 pair directions (mod 180) at least this apart, else mot_phuong
 DUNG_SAI_IN_GIAN = 0.002                     # print tolerance of the mark square: stretch
 DUNG_SAI_IN_DU_MM = 0.3                      #   non-affine residual [mm]
@@ -143,6 +144,8 @@ def clip_from_session(s, model, thu=False):
                       'choice used every mark, a held-out mark would have entered it)')
     marks = {int(i): tuple(float(v) for v in m) for i, m in s['marks'].items()}
     ids = [int(i) for i in s['fit_ids']]
+    if len(ids) != len(set(ids)):
+        raise KCError(f'session fit_ids repeat an id: {sorted(i for i in set(ids) if ids.count(i) > 1)} (KCJ1-10)')
     img = {i: np.asarray(s['ref_corners_px'][str(i)], float) for i in ids}
     if any(c.shape != (4, 2) for c in img.values()):
         raise KCError('ref_corners_px: not 4 corners per mark')
@@ -157,6 +160,8 @@ def load_moc(paths):
         with open(p, newline='', encoding='utf-8') as f:
             for r in csv.DictReader(f):
                 if r.get('id', '').strip().isdigit():
+                    if int(r['id']) in rows:
+                        raise KCError(f'{p}: mark id {r["id"]} repeated (KCJ1-10)')
                     rows[int(r['id'])] = r
     return rows
 
@@ -209,6 +214,12 @@ def centre_floor(cam, corners):
     """Mark centre on the floor: the MEAN OF THE 4 IMAGE CORNERS back-projected to z = 0, as c7_measure.calibrate
     and CODE_CAM design v2 1 (KCC1-1; the mean of the projected corners differs under perspective and distortion)."""
     return cam.pix2floor(np.asarray(corners, float).mean(axis=0, keepdims=True), 0.0)[0]
+
+
+def centre_floor4(cam, corners):
+    """S7 centre (KS7-7, KCJ1-9; the definition C33-6 brings to every path with cm.mark_centre_floor): the MEAN of the
+    4 corners back-projected to z = 0 (the square's centre for an exact camera, whatever the perspective)."""
+    return cam.pix2floor(np.asarray(corners, float), 0.0).mean(axis=0)
 
 
 def signed_angle_deg(v_ref, v):
@@ -309,10 +320,11 @@ class PairCams:
         return self.cache[key]
 
 
-def a3_clip(img, marks, model, w, h, zc, l_max=L_MAX_M, sigma=None, tag=None, pc=None):
+def a3_clip(img, marks, model, w, h, zc, l_max=L_MAX_M, sigma=None, tag=None, pc=None, hong=None):
     """Rows per pair (i < j, tape distance <= l_max), both left out of the fit. tag = (car_side_m, tag_h_m): each
     row also gets the conversion to the car tag (design v5 S5-1): gap_deg (b), quy_deg = |dtheta| + gap_deg.
-    pc: a PairCams of the same clip (shared fits), or None."""
+    pc: a PairCams of the same clip (shared fits), or None. hong: a list; a pair whose fit or conversion fails is
+    appended to it (KCJ1-13) instead of stopping the run; without it the error is raised."""
     ids = sorted(img)
     rows = []
     pc = pc or PairCams(img, marks, model, w, h, zc)
@@ -324,7 +336,13 @@ def a3_clip(img, marks, model, w, h, zc, l_max=L_MAX_M, sigma=None, tag=None, pc
             L = float(np.linalg.norm(vt))
             if L > l_max:
                 continue
-            cam = pc((i, j))
+            try:
+                cam = pc((i, j))
+            except Exception as e:
+                if hong is None:
+                    raise
+                hong.append(dict(i=i, j=j, L_m=L, ly_do=str(e)[:200]))
+                continue
             vc = centre_floor(cam, img[j]) - centre_floor(cam, img[i])
             r = dict(i=i, j=j, L_m=L, dtheta_deg=signed_angle_deg(vt, vc),
                      mid_x=float((marks[i][0] + marks[j][0]) / 2), mid_y=float((marks[i][1] + marks[j][1]) / 2),
@@ -729,23 +747,38 @@ def _hull(pts):
     return lo[:-1] + up[:-1]
 
 
-def in_hull(p, hull, tol=1e-12):
-    """p inside or on the convex polygon hull (counter-clockwise); a hull of fewer than 3 points contains nothing."""
+def disc_in_hull(c, r, hull):
+    """KCJ1-11: the WHOLE disc (centre c, radius r) inside the convex polygon hull (counter-clockwise): the centre is at
+    least r inside every edge line. A hull of fewer than 3 points contains nothing."""
     if len(hull) < 3:
         return False
     n = len(hull)
     for k in range(n):
-        a, b = hull[k], hull[(k + 1) % n]
-        if (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]) < -tol:
+        a, b = np.array(hull[k]), np.array(hull[(k + 1) % n])
+        e = b - a
+        L = float(np.linalg.norm(e))
+        if L == 0.0:
+            continue
+        if (e[0] * (c[1] - a[1]) - e[1] * (c[0] - a[0])) / L < r - 1e-12:
             return False
     return True
 
 
-def domain_samples(c, r=MIEN_XP_M, n=MIEN_XP_N):
-    """Samples of the start domain (disc of radius r about c): the centre and n points on the rim."""
+def disc_max_gap(c, r, pts, step=MIEN_XP_BUOC_M):
+    """KCJ1-11: an upper bound of max over the disc (centre c, radius r) of the distance to the nearest point of pts:
+    the largest distance over a square grid of the disc (step) and 720 rim points, plus step * sqrt(2) + pi r / 720
+    (the distance function is 1-Lipschitz; a disc point lies in a grid cell: a corner of it inside the disc is within
+    step * sqrt(2), and when no corner is inside, the rim crosses the cell, so a rim sample is within step * sqrt(2) +
+    half the rim spacing)."""
     c = np.asarray(c, float)
-    ang = np.linspace(0.0, 2 * math.pi, n, endpoint=False)
-    return np.vstack([c, c + r * np.column_stack([np.cos(ang), np.sin(ang)])])
+    g = np.arange(-r, r + step / 2, step)
+    X, Y = np.meshgrid(g, g)
+    P = np.column_stack([X.ravel(), Y.ravel()])
+    P = P[np.hypot(P[:, 0], P[:, 1]) <= r]
+    ang = np.linspace(0.0, 2 * math.pi, 720, endpoint=False)
+    P = np.vstack([P, r * np.column_stack([np.cos(ang), np.sin(ang)])]) + c
+    d = np.min(np.linalg.norm(P[:, None, :] - np.asarray(pts, float)[None, :, :], axis=2), axis=1)
+    return float(d.max()) + step * math.sqrt(2) + math.pi * r / 720
 
 
 def start_regions(marks, xp, r_xp=R_XP_M):
@@ -762,25 +795,29 @@ def start_regions(marks, xp, r_xp=R_XP_M):
     return out
 
 
-def region_cover(region_ids, marks, c, a3_rows, r_trong=R_TRONG_M, two_deg=HAI_PHUONG_DEG):
+def region_cover(region_ids, marks, c, a3_rows, r_trong=R_TRONG_M, two_deg=HAI_PHUONG_DEG, l_max=L_MAX_M):
     """S7-12.3, S7-14.3: ngoai_suy when a sample of the start domain is outside the convex hull of the region marks
     or farther than r_trong from the nearest of them; mot_phuong when the valid A3 pairs of the clip (L <= L_MAX_M,
     at least one end in the region) do not have two directions (mod 180) at least two_deg apart."""
     pts = np.array([marks[i][:2] for i in region_ids], float)
     hull = _hull(pts)
     why = []
-    for p in domain_samples(c):
-        if not in_hull(p, hull):
-            why.append('mien_ngoai_bao_loi')
-            break
-    for p in domain_samples(c):
-        if float(np.min(np.linalg.norm(pts - p, axis=1))) > r_trong:
-            why.append('khoang_trong')
-            break
+    if not disc_in_hull(c, MIEN_XP_M, hull):                     # KCJ1-11: the whole disc, not samples
+        why.append('mien_ngoai_bao_loi')
+    if disc_max_gap(c, MIEN_XP_M, pts) > r_trong:                # KCJ1-11: guaranteed upper bound over the disc
+        why.append('khoang_trong')
     zs = set(region_ids)
-    dirs = [r['huong_deg'] % 180.0 for r in a3_rows if (r['i'] in zs or r['j'] in zs) and r['L_m'] <= L_MAX_M]
+    use = [r for r in a3_rows if (r['i'] in zs or r['j'] in zs) and r['L_m'] <= l_max]   # KCJ1-12: the A3 pairs
+    dirs = [r['huong_deg'] % 180.0 for r in use]
     two = any(min(abs(a - b), 180.0 - abs(a - b)) >= two_deg for a in dirs for b in dirs)
-    return dict(ngoai_suy=bool(why), mot_phuong=not two, ly_do=why + ([] if two else ['mot_phuong']))
+    held = {m for r in use for m in (r['i'], r['j'])}
+    lone = sorted(m for m in zs if m not in held)              # KCJ1-12: a region mark in no A3 pair of the clip
+    mp = []
+    if not two:
+        mp.append('mot_phuong')
+    if lone:
+        mp.append(f'moc_khong_co_A3loc:{lone}')
+    return dict(ngoai_suy=bool(why), mot_phuong=bool(mp), ly_do=why + mp)
 
 
 def _rot(a):
@@ -830,14 +867,14 @@ def p1_rel_clip(clip, pc, marks, regions, tag, kappa, plumb, l_max=L_MAX_M, phis
                     continue
                 try:
                     cam = pc((s, j))
-                except Exception as e:                      # KS7-7: a failed fit is listed, never dropped silently
+                    xs, xj = np.array(marks[s][:2]), np.array(marks[j][:2])
+                    cs, cj = centre_floor4(cam, pc.img[s]), centre_floor4(cam, pc.img[j])     # KCJ1-9
+                except Exception as e:                      # KS7-7, KCJ1-13: listed, never dropped silently
                     hong.append(dict(clip=clip, vung=k, s=s, j=j, ly_do=str(e)[:200]))
                     continue
-                xs, xj = np.array(marks[s][:2]), np.array(marks[j][:2])
-                cs, cj = centre_floor(cam, pc.img[s]), centre_floor(cam, pc.img[j])
                 d = (cj - cs) - (xj - xs)
                 train = [i for i in pc.ids if i not in (s, j)]
-                src = np.array([centre_floor(cam, pc.img[i]) for i in train])
+                src = np.array([centre_floor4(cam, pc.img[i]) for i in train])
                 dst = np.array([marks[i][:2] for i in train], float)
                 ang = cm.rigid_fit(src, dst)[0]
                 dh = _rot(ang) @ (cj - cs) - (xj - xs)
@@ -909,25 +946,27 @@ def meo_summary(by_clip):
     out = dict(phan_du_max_mm=max(r['du_mm'] for _, _, r in allv),
                gian_chinh_max=max(max(abs(g) for g in r['gian']) for _, _, r in allv),
                cat_max_deg=max(abs(r['cat_deg']) for _, _, r in allv), chi_chan_doan=True)
-    sizes = sorted({r['canh_m'] for _, _, r in allv})
+    def key(r):                                       # KCJ1-15: one size rule for grouping, thresholds, flag, JSON
+        return f"{r['canh_m'] * 1000:.1f}"
+    sizes = sorted({key(r) for _, _, r in allv})
     ng, flag, co = {}, None, {}
     for sd in sizes:
-        sel = [(c, i, r) for c, i, r in allv if r['canh_m'] == sd]
-        co[f'{sd * 1000:.1f}'] = dict(phan_du_max_mm=max(r['du_mm'] for _, _, r in sel),
+        sel = [(c, i, r) for c, i, r in allv if key(r) == sd]
+        co[sd] = dict(phan_du_max_mm=max(r['du_mm'] for _, _, r in sel),
                                      gian_chinh_max=max(max(abs(g) for g in r['gian']) for _, _, r in sel),
                                      cat_max_deg=max(abs(r['cat_deg']) for _, _, r in sel))
     if 'H_a' in by_clip and 'H_b' in by_clip:
         flag = False
         for sd in sizes:
-            com = [i for i in by_clip['H_a'] if i in by_clip['H_b'] and by_clip['H_a'][i]['canh_m'] == sd]
+            com = [i for i in by_clip['H_a'] if i in by_clip['H_b'] and key(by_clip['H_a'][i]) == sd]
             if not com:
                 continue
             lg = max(max(abs(x - y) for x, y in zip(by_clip['H_a'][i]['gian'], by_clip['H_b'][i]['gian'])) for i in com)
             ld = max(abs(by_clip['H_a'][i]['du_mm'] - by_clip['H_b'][i]['du_mm']) for i in com)
             n = dict(gian=lg + DUNG_SAI_IN_GIAN, du_mm=ld + DUNG_SAI_IN_DU_MM)
-            ng[f'{sd * 1000:.1f}'] = n
+            ng[sd] = n
             for c, i, r in allv:
-                if r['canh_m'] == sd and (max(abs(g) for g in r['gian']) > n['gian'] or r['du_mm'] > n['du_mm']):
+                if key(r) == sd and (max(abs(g) for g in r['gian']) > n['gian'] or r['du_mm'] > n['du_mm']):
                     flag = True
     out.update(nguong_lap_HaHb=ng or None, bien_dang_hinh=flag, theo_co=co,
                dung_sai_in=dict(gian=DUNG_SAI_IN_GIAN, du_mm=DUNG_SAI_IN_DU_MM),
@@ -943,22 +982,33 @@ def thang_clip(p1, marks):
     src = np.array([marks[i][:2] for i in ids], float)
     dst = src + np.array([p1[i] for i in ids])
     ang, _, sc, _ = cm.rigid_fit(src, dst, with_scale=True)
-    return dict(ti_le_tru_1=float(sc - 1.0), xoay_deg=math.degrees(ang))
+    return dict(ti_le_tru_1=float(sc - 1.0), xoay_deg=math.degrees(ang),
+                chieu='thuoc -> tam giu ngoai (ti_le = camera / thuoc; C8BX-03, KCJ1-16)')
 
 
-def s7_summary(rel, a3rel, cover, regions):
-    """Blocks P1_tuong_doi, A3_tuong_doi of kiem_cheo.json (S8-4 (2), (3)) from the per-clip results."""
+def s7_summary(rel, a3rel, cover, regions, a3_hong=None):
+    """Blocks P1_tuong_doi, A3_tuong_doi of kiem_cheo.json (S8-4 (2), (3)) from the per-clip results. KCJ1-13: the
+    expected pairs are counted against the computed ones; a broken pair (P1 or A3) touching a region sets its
+    cap_hong flag and du_lieu_du false: the maxima are then OBSERVED maxima, not a full-data result."""
     pairs = [p for c in rel.values() for p in c['pairs']]
     if not pairs:
         raise KCError('S7: no pair of a start region')
     worst = max(pairs, key=lambda p: p['d_m'])
+    hong_p1 = [h for c in rel.values() for h in c['hong']]
+    hong_a3 = [dict(h, clip=c) for c, v in (a3_hong or {}).items() for h in v]
+
+    def mx(v):
+        v = list(v)
+        return max(v) if v else None
     tv = {}
     for k, reg in regions.items():
         pk = [p for p in pairs if p['vung'] == k]
         pin = [p for p in pk if p['trong_vung']]
-        tv[k] = dict(max_m=max(p['d_m'] for p in pk), d_sj_he_dau_max_m=max(p['dh_m'] for p in pk),
-                     chuyen_max_m=max(p['chuyen_m'] for p in pk),
-                     chuyen_psi_max_deg=max(p['chuyen_psi_deg'] for p in pk),
+        zs = set(reg['moc'])
+        hk = [h for h in hong_p1 if h['vung'] == k] + [h for h in hong_a3 if h['i'] in zs or h['j'] in zs]
+        tv[k] = dict(max_m=mx(p['d_m'] for p in pk), d_sj_he_dau_max_m=mx(p['dh_m'] for p in pk),
+                     chuyen_max_m=mx(p['chuyen_m'] for p in pk), cap_hong=bool(hk),
+                     chuyen_psi_max_deg=mx(p['chuyen_psi_deg'] for p in pk),
                      trong_vung_max_m=max([max(p['d_m'], p['dh_m']) for p in pin], default=None),
                      trong_vung_n_cap=len(pin), moc_vung=reg['moc'], n_cap=len(pk), vung_mo_rong=reg['vung_mo_rong'],
                      ngoai_suy=any(cover[c][k]['ngoai_suy'] for c in cover),
@@ -968,14 +1018,16 @@ def s7_summary(rel, a3rel, cover, regions):
              chuyen_max_m=max(p['chuyen_m'] for p in pairs),
              chuyen_psi_max_deg=max(p['chuyen_psi_deg'] for p in pairs), theo_vung=tv,
              cap_lon_nhat=dict(clip=worst['clip'], vung=worst['vung'], s=worst['s'], j=worst['j'], d_m=worst['d_m']),
-             cap_hong=[h for c in rel.values() for h in c['hong']],
+             cap_hong=hong_p1, cap_hong_A3=hong_a3,
+             n_cap={c: dict(du_kien=v['n_du_kien'], tinh=len(v['pairs'])) for c, v in rel.items()},
+             du_lieu_du=not hong_p1 and not hong_a3 and all(len(v['pairs']) == v['n_du_kien'] for v in rel.values()),
              he_truc=('d_sj: he san; d_sj_he_dau: sau khi bo xoay chung uoc tu ID huan luyen; chuyen_sj: hieu ma ao '
                       'j - s do qua car_pose, he san'),
              chieu_tru='d_sj = do - thuoc; chuyen_sj = held - full (camera bo cap tru camera cham)',
              loai='chi so thuc nghiem truoc le (Liam 19/11 "Uoc luong thuc nghiem"), khong phai can',
              gioi_han=['(a) thuoc cua s, j vao d_sj o ca hai dau', '(b) chi lay mau tai moc',
                        '(c) sai chung cua moi goc anh hieu chuan khong lo ra', '(d) camera clip H, khong phai tung khung',
-                       '(e) A3 tuong doi la cong hai can vi tri, bao thu, khong chung minh',
+                       '(e) A3 tuong doi la tong hai chi so thuc nghiem tung dau (truoc le), khong phai can',
                        '(f) diem xuat phat danh dinh, mien bat dinh MIEN_XP_M',
                        '(g) truong sai giua mau, o do cao ma, ngoai ho mo hinh khong bi chan; khong tuyen bo '
                        'd_sj + chuyen_sj la sai ma noc so chuan'])
@@ -992,6 +1044,7 @@ def s7_summary(rel, a3rel, cover, regions):
              A3loc_max_deg=max(loc.values()) if loc else None,
              mot_phuong={k: tv[k]['mot_phuong'] or ax[k] is None for k in regions},
              ngoai_suy={k: tv[k]['ngoai_suy'] for k in regions},
+             cap_hong={k: tv[k]['cap_hong'] for k in regions}, du_lieu_du=P['du_lieu_du'],
              theo_clip={c: dict(max_deg=a3rel[c]['max_deg'], A3_xp_deg=a3rel[c]['A3_xp']) for c in a3rel},
              loai='chi so kiem cheo gop hai dau (KS7-3), trong tung clip; truoc le')
     return P, A
@@ -1071,14 +1124,94 @@ def build_cam_u(own, parts, ghi_chu=None):
     out['nguon'] = nguon
     if ghi_chu:
         out['ghi_chu'] = ghi_chu
+    check_cam_v3(out)
     return out
 
 
-def write_new(path, obj):
+def _hex64(x, what):
+    if not isinstance(x, str) or len(x) != 64 or any(ch not in '0123456789abcdef' for ch in x):
+        raise KCError(f'{what}: {x!r} is not a SHA-256 (64 lowercase hex)')
+
+
+def _same_num(a, b):
+    if a is None or b is None:
+        return a is None and b is None
+    if isinstance(a, list) or isinstance(b, list):
+        return isinstance(a, list) and isinstance(b, list) and len(a) == len(b) and all(map(_same_num, a, b))
+    if isinstance(a, bool) or isinstance(b, bool) or not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
+        return False
+    return math.isclose(float(a), float(b), rel_tol=1e-12, abs_tol=0.0)
+
+
+def check_cam_v3(out):
+    """KCJ1-4: the writer refuses what the pinned reader (c8b_u v3 198d2e9 check_cam) refuses: top-level keys, the
+    numbers, A3 carried to the tag (quy_ve_ma_noc true), H > h, H - dzc > h, kappa = h / H, the moc_dich block
+    (approval and premise strings, nguon: frames {run: sha} non-empty, lich, tap_moc, u_so, session sha, bo_lay_mau,
+    car_pose exactly {tag_offset, side_m, h_m} equal to bo_cham / do_cao)."""
+    extra = sorted(set(out) - set(CAM_BLOCKS) - {'version', 'nguon', 'ghi_chu'})
+    if out.get('version') != CAM_U_VERSION or extra:
+        raise KCError(f'camera file: version {out.get("version")!r} / unknown top-level keys {extra}')
+    if out['A3'].get('quy_ve_ma_noc') is not True:
+        raise KCError('A3.quy_ve_ma_noc must be true for c8b_u v3 (A3 carried to the car tag and approved)')
+    H, h, dzc, kap = out['do_cao']['H_m'], out['do_cao']['h_m'], out['day_doi']['dzc_m'], out['day_doi']['kappa']
+    if not H > h or not H - dzc > h:
+        raise KCError(f'do_cao / day_doi: H {H} m, dzc {dzc} m, h {h} m (H - dzc must be above h)')
+    if abs(kap - h / H) > 1e-6 * (h / H):
+        raise KCError(f'day_doi.kappa {kap} is not do_cao.h_m / do_cao.H_m = {h / H}')
+    md = out['moc_dich']
+    for k in ('phuong_phap_duyet', 'tien_de_buoi'):
+        if not isinstance(md.get(k), str):
+            raise KCError(f'moc_dich.{k} missing or not a string')
+    ng = md.get('nguon')
+    if not isinstance(ng, dict) or set(MOC_NGUON_KEYS) - set(ng):
+        raise KCError('moc_dich.nguon incomplete')
+    if not isinstance(ng['frames'], dict) or not ng['frames']:
+        raise KCError('moc_dich.nguon.frames: {RUN_ID: sha256} of every run needed')
+    for rid, x in ng['frames'].items():
+        _hex64(x, f'moc_dich.nguon.frames.{rid}')
+    for k in ('lich', 'tap_moc', 'u_so', 'session'):
+        _hex64(ng[k], f'moc_dich.nguon.{k}')
+    if not isinstance(ng['bo_lay_mau'], str) or not ng['bo_lay_mau'].strip():
+        raise KCError('moc_dich.nguon.bo_lay_mau empty')
+    cp_ = ng['car_pose']
+    if not isinstance(cp_, dict) or set(cp_) != {'tag_offset', 'side_m', 'h_m'}:
+        raise KCError('moc_dich.nguon.car_pose needs exactly tag_offset, side_m, h_m')
+    for k, w in (('tag_offset', out['bo_cham']['tag_offset']), ('side_m', out['bo_cham']['side_m']), ('h_m', h)):
+        if not _same_num(cp_[k], w):
+            raise KCError(f'moc_dich.nguon.car_pose.{k} {cp_[k]!r} is not the one of this camera file {w!r}')
+
+
+def publish_new(path, write):
+    """KCJ1-6: write(f) fills a temporary file in the same directory; the result is published under path only when
+    complete, never over an existing file (rename on Windows refuses an existing target; link elsewhere); on any error
+    the temporary file is removed and nothing new stays."""
     if os.path.exists(path):
         raise KCError(f'{path} exists: not replaced')
-    with open(path, 'x', encoding='utf-8') as f:
-        json.dump(obj, f, indent=1, ensure_ascii=False)
+    tmp = f'{path}.tmp{os.getpid()}'
+    try:
+        with open(tmp, 'x', newline='', encoding='utf-8') as f:
+            write(f)
+        if os.name == 'nt':
+            os.rename(tmp, path)
+        else:
+            os.link(tmp, path)
+            os.unlink(tmp)
+    except FileExistsError:
+        raise KCError(f'{path} exists: not replaced')
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def write_new(path, obj):
+    publish_new(path, lambda f: json.dump(obj, f, indent=1, ensure_ascii=False))
+
+
+def load_json_sha(path):
+    """(object, sha256) from ONE read of the bytes (KCJ1-6: the sha is that of the bytes used)."""
+    with open(path, 'rb') as f:
+        b = f.read()
+    return json.loads(b.decode('utf-8')), hashlib.sha256(b).hexdigest()
 
 
 # ---------------------------------------------------------------- frame-by-frame P1 and coverage (tung_khung)
@@ -1118,7 +1251,7 @@ def run_frame_check(frames, khung, track, groups, u_so_chains, max_thieu=COVER_M
     if not frames or not base <= set(frames[0]):
         raise KCError(f'frames.csv: missing columns {sorted(base - set(frames[0] if frames else ()))}')
     need = {'moc_thay'} | {f'moc_neo_{c}' for c in comp}
-    if not need <= set(frames[0]):
+    if not need <= set(frames[0]) or any(r.get(k) is None for r in frames for k in need):   # KCJ1-5: short rows
         return dict(max_m=None, n_valid=sum(1 for r in frames if _true(r['valid'])), ti_le_thieu=1.0,
                     khoang_mat_max_s=None, thieu=True, thieu_du_lieu_neo=True, tap_chua_tinh=[],
                     ly_do=[f'frames.csv thieu cot neo {sorted(need - set(frames[0]))} (TD2-1)'])
@@ -1195,9 +1328,12 @@ def run_contradictions(frames, track, marks_over):
             j = int(m['id'])
             t_bd[j] = min(t_bd.get(j, math.inf), float(m['t_bd']))
     used = set()
-    for r in frames:
-        t = float(r['t_s'])
-        for i in _ids(r['moc_neo_xe']):
+    for r in frames:                                  # KCJ1-5: rows without a usable chain-xe anchor cell are skipped
+        try:                                          #   here (the run is thieu_du_lieu_neo anyway)
+            t, A = float(r['t_s']), _ids(r['moc_neo_xe'])
+        except (KeyError, ValueError, TypeError):
+            continue
+        for i in A:
             if i in marks_over and t < t_bd.get(i, math.inf):
                 used.add(i)
     return sorted(used)
@@ -1290,7 +1426,7 @@ def tung_khung(a):
                           kiem_cheo_khung_sha256=tr['kiem_cheo_khung_sha256'])
         r['duong_dan'] = dict(track=os.path.abspath(tp), frames=os.path.abspath(fp),       # TD3-2
                               kiem_cheo_khung=os.path.abspath(kp))
-        if not r['thieu_du_lieu_neo']:
+        if frows and 'moc_neo_xe' in frows[0]:      # KCJ1-5: known contradictions kept even when other anchors lack
             for i in run_contradictions(frows, tr, set(over)):
                 mau += [dict(luot=rid, clip=n, moc=i) for n in over[i]]
         luot[rid] = r
@@ -1355,6 +1491,47 @@ def commit_hil():
         return None
 
 
+KHOA_S7_SCHEMA = 'c7_khoa_s7_v1'
+
+
+def manifest_git(path):
+    """dict(commit, time, sach) of the last git commit touching path in its own repository; sach = the file has no
+    change against that commit; None outside git or when never committed."""
+    import subprocess
+    d, f = os.path.split(os.path.abspath(path))
+    try:
+        log = subprocess.run(['git', 'log', '-1', '--format=%H %cI', '--', f], cwd=d, capture_output=True, text=True,
+                             check=True).stdout.strip()
+        st = subprocess.run(['git', 'status', '--porcelain', '--', f], cwd=d, capture_output=True, text=True,
+                            check=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    if not log:
+        return None
+    c, t = log.split(' ', 1)
+    return dict(commit=c, time=t, sach=not st)
+
+
+def check_khoa_s7(path, hang_so_s7, ch):
+    """KCJ1-14 (S7-16, J v6 6 (1)): the manifest {schema c7_khoa_s7_v1, hang_so_s7, commit_hil} must equal the
+    constants in force and the code commit of this run (clean tree), and be itself committed unchanged in git (its
+    commit time is the lock time C8B compares with the data). Returns the record written into kiem_cheo.json."""
+    m, sha = load_json_sha(path)
+    want = json.loads(json.dumps(hang_so_s7))
+    got = m.get('hang_so_s7') or {}
+    if m.get('schema') != KHOA_S7_SCHEMA:
+        raise KCError(f'--khoa-s7: schema is not {KHOA_S7_SCHEMA}')
+    if got != want:
+        diff = sorted(k for k in set(want) | set(got) if got.get(k) != want.get(k))
+        raise KCError(f'--khoa-s7: constants differ from those in force {diff}; in force: {json.dumps(want)}')
+    if ch is None or ch.get('dirty') or m.get('commit_hil') != ch.get('sha'):
+        raise KCError(f'--khoa-s7: commit_hil {m.get("commit_hil")!r} is not the clean code commit of this run {ch!r}')
+    g = manifest_git(path)
+    if g is None or not g['sach']:
+        raise KCError('--khoa-s7: the manifest is not committed unchanged in git (lock before the data, S7-16)')
+    return dict(file=os.path.abspath(path), sha256=sha, git_commit=g['commit'], git_time=g['time'])
+
+
 def thu_flag(thu, max_frames):
     """KCC1-10: a result made from a cut clip (--max-frames) is a trial, never exported."""
     return bool(thu or max_frames)
@@ -1390,24 +1567,48 @@ def phan_tich(a):
             raise KCError(f'clips H fit different mark ids than H_a: {diff} (KS7-7)')
         if need and set(ids_a) != need:
             raise KCError(f'fit ids {ids_a} are not the measured floor marks {sorted(need)} (KS7-7)')
+        if tuple(ids_a) != ID_KHOA:                   # KCJ1-10: the official path is the 32-mark floor, ids 1-32
+            raise KCError(f'fit ids {ids_a} are not the locked ids 1-32 (KS7-7; old 24-mark sessions: --thu)')
     xp = parse_xp(a.xuat_phat)
     plumb = parse_xy(a.plumb, '--plumb') if a.plumb else None
     if xp and plumb is None:
         raise KCError('--xuat-phat needs --plumb (the car_pose plumb point of the scoring, S7 chuyen_sj)')
     groups = session_groups(raw['H_a'], ids_a, a.groups)
+    # KCJ1-14 (S7-16, J v6 6 (1)): the S7 constants in force, checked against a manifest locked (committed) BEFORE
+    # the held-out data are looked at; recorded with its sha and commit
+    tag = session_tag(raw)
+    hang_so_s7 = dict(R_XP_M=R_XP_M, R_TRONG_M=R_TRONG_M, MIEN_XP_M=MIEN_XP_M, MIEN_XP_BUOC_M=MIEN_XP_BUOC_M,
+                      HAI_PHUONG_DEG=HAI_PHUONG_DEG, DUNG_SAI_IN_GIAN=DUNG_SAI_IN_GIAN,
+                      DUNG_SAI_IN_DU_MM=DUNG_SAI_IN_DU_MM, L_MAX_M=a.L_max, A3_TAG_T=list(A3_TAG_T),
+                      A3_TAG_PHI_DEG=list(A3_TAG_PHI_DEG), xuat_phat={k: list(v) for k, v in sorted(xp.items())},
+                      plumb=None if plumb is None else list(plumb), car_side_m=tag[0], tag_h_m=tag[1], model=a.model,
+                      nhom=groups, id_khoa=ids_a)
+    ch = commit_hil()
+    khoa = None
+    if a.khoa_s7:
+        khoa = check_khoa_s7(a.khoa_s7, hang_so_s7, ch)
+    elif xp and not a.thu:
+        raise KCError('--khoa-s7 needed with --xuat-phat (S7-16: constants locked before phan_tich, KCJ1-14)')
     tap = None
     if a.tap_moc:                                    # {chain: [[ids]...]}, every pass of KC2-1 merged (KCC1-2)
         tap = {str(c): [sorted(int(i) for i in S) for S in v] for c, v in _load_json(a.tap_moc).items()}
     a.thu = thu_flag(a.thu, a.max_frames)
     if not a.thu and not a.hang_so:
         raise KCError('--hang-so needed (KCC1-9)')
+    # KCJ1-6: every output name is free before anything is computed or written
+    outs = ['u_so.json', 'kiem_cheo.json', 'a3_cap.csv'] + (['cap_tuong_doi.csv'] if xp else [])
+    busy = [n for n in outs if os.path.exists(os.path.join(a.out, n))]
+    if busy:
+        raise KCError(f'{a.out}: {busy} exist: not replaced')
     # A3 over every clip H, carried to the car tag of the sessions (design v5 S5-1)
-    tag = session_tag(raw)
     pcs = {n: PairCams(img, mk, a.model, w, h, zc) for n, (img, mk, w, h, zc) in clips.items()}
-    a3 = {n: a3_clip(img, mk, a.model, w, h, zc, a.L_max, sig, tag=tag, pc=pcs[n])
+    a3_hong = {}
+    a3 = {n: a3_clip(img, mk, a.model, w, h, zc, a.L_max, sig, tag=tag, pc=pcs[n], hong=a3_hong.setdefault(n, []))
           for n, (img, mk, w, h, zc) in clips.items()}
     roles = {i: r.get('vai_tro', '') for i, r in moc_rows.items()}
     A3 = a3_summary(a3, [i for i in ids_a if roles.get(i) == 'moc_giua'], tag=tag)
+    A3['cap_hong'] = [dict(h, clip=n) for n, v in a3_hong.items() for h in v]      # KCJ1-13: never dropped silently
+    A3['du_lieu_du'] = not A3['cap_hong']
     # P1 at clip H; group cameras of every clip
     cams, p1 = {}, {}
     for n, (img, mk, w, h, zc) in clips.items():
@@ -1447,24 +1648,21 @@ def phan_tich(a):
                 raise KCError(f'{n}: session without zc_tape_m (kappa of car_pose)')
             rows, pairs, hong = p1_rel_clip(n, pcs[n], mk, regions, tag, tag[1] / zc, plumb, a.L_max)
             cap_rows += rows
-            rel[n] = dict(pairs=pairs, hong=hong)
+            rel[n] = dict(pairs=pairs, hong=hong, n_du_kien=sum(len(r['moc']) * (len(pcs[n].ids) - 1)
+                                                                for r in regions.values()))
             a3rel[n] = a3_rel_clip(a3[n], regions)
-            cover[n] = {k: region_cover(regions[k]['moc'], mk, xp[k], a3[n], R_TRONG_M, HAI_PHUONG_DEG) for k in regions}
-        s7['P1_tuong_doi'], s7['A3_tuong_doi'] = s7_summary(rel, a3rel, cover, regions)
+            cover[n] = {k: region_cover(regions[k]['moc'], mk, xp[k], a3[n], R_TRONG_M, HAI_PHUONG_DEG, a.L_max)
+                        for k in regions}
+        s7['P1_tuong_doi'], s7['A3_tuong_doi'] = s7_summary(rel, a3rel, cover, regions, a3_hong)
     else:
         s7['P1_tuong_doi'] = s7['A3_tuong_doi'] = None
-    hang_so_s7 = dict(R_XP_M=R_XP_M, R_TRONG_M=R_TRONG_M, MIEN_XP_M=MIEN_XP_M, MIEN_XP_N=MIEN_XP_N,
-                      HAI_PHUONG_DEG=HAI_PHUONG_DEG, DUNG_SAI_IN_GIAN=DUNG_SAI_IN_GIAN,
-                      DUNG_SAI_IN_DU_MM=DUNG_SAI_IN_DU_MM, L_MAX_M=a.L_max, A3_TAG_T=list(A3_TAG_T),
-                      A3_TAG_PHI_DEG=list(A3_TAG_PHI_DEG), xuat_phat={k: list(v) for k, v in xp.items()},
-                      plumb=None if plumb is None else list(plumb), car_side_m=tag[0], tag_h_m=tag[1])
-    sess = {n: dict(file=os.path.abspath(p), sha256=sha256_file(p), video=os.path.abspath(clips_in[n][1]),
+    sess ={n: dict(file=os.path.abspath(p), sha256=sha256_file(p), video=os.path.abspath(clips_in[n][1]),
                     video_sha256=raw[n].get('video_sha256')) for n, (p, _) in clips_in.items()}   # TD3-2, TD1-3
     common = dict(buoi=a.buoi, model=a.model, nhom=groups, sessions=sess, thu=bool(a.thu),
                   moc=[dict(file=os.path.abspath(p), sha256=sha256_file(p)) for p in a.moc or ()],
                   hang_so_sha256=sha256_file(a.hang_so) if a.hang_so else None)
     res = dict(version=VERSION, **common, L_max_m=a.L_max, id_khoa=ids_a, hang_so_s7=hang_so_s7,
-               commit_hil=commit_hil(), **s7,
+               commit_hil=ch, khoa_s7=khoa, **s7,
                A3=dict(A3, buoi=a.buoi),
                P1=dict(bo_nhom_max_m=worst[2], tung_khung_max_m=None, max_clip=worst[0], max_id=worst[1], buoi=a.buoi,
                        tung_khung='tu file tung_khung (lenh tung_khung, track sau cham lai cua CODE_CAM)',
@@ -1484,30 +1682,44 @@ def phan_tich(a):
                theo_thoi_gian={n: time_check(dets['H_a'][1], clips[n][0], mk_a, groups, gc)
                                for n in clips if n != 'H_a'})
     os.makedirs(a.out, exist_ok=True)
-    up = os.path.join(a.out, 'u_so.json')
-    write_new(up, dict(version=U_SO_VERSION, buoi=a.buoi, model=a.model, nhom=groups, chuoi=chuoi, chi_tiet=uso_info,
-                       sessions=sess, tao_luc=datetime.datetime.now().isoformat(timespec='seconds')))
-    res['u_so_sha256'] = sha256_file(up)              # KC1-10: the final track must say it used this file
+    us_obj = dict(version=U_SO_VERSION, buoi=a.buoi, model=a.model, nhom=groups, chuoi=chuoi, chi_tiet=uso_info,
+                  sessions=sess, tao_luc=datetime.datetime.now().isoformat(timespec='seconds'))
+    us_bytes = json.dumps(us_obj, indent=1, ensure_ascii=False)
+    res['u_so_sha256'] = hashlib.sha256(us_bytes.encode('utf-8')).hexdigest()   # KC1-10: the track must name it
     res['kiem_h'] = {n: kiem_h(dets[n][1], clips[n][0]) for n in clips}
-    if res['P1_tuong_doi'] is not None:               # KS7B-2: the signed numbers per pair, beside the JSON
-        cp_path = os.path.join(a.out, 'cap_tuong_doi.csv')
-        cols = ['clip', 'vung', 's', 'j', 'L_m', 'd_x', 'd_y', 'dh_x', 'dh_y', 'phi_deg', 'nhin', 'chuyen_x', 'chuyen_y',
-                'chuyen_psi_deg']
-        with open(cp_path, 'x', newline='', encoding='utf-8') as f:
-            wr = csv.DictWriter(f, fieldnames=cols)
-            wr.writeheader()
-            for r in cap_rows:
-                wr.writerow({k: (repr(v) if isinstance(v, float) else v) for k, v in r.items()})
-        res['P1_tuong_doi']['cap_csv'] = dict(file=os.path.abspath(cp_path), sha256=sha256_file(cp_path))
-    write_new(os.path.join(a.out, 'kiem_cheo.json'), res)
-    with open(os.path.join(a.out, 'a3_cap.csv'), 'x', newline='', encoding='utf-8') as f:
-        cols = ['clip', 'i', 'j', 'L_m', 'dtheta_deg', 'sigma_thuoc_deg', 'mid_x', 'mid_y', 'huong_deg', 'gap_deg',
-                'quy_deg', 'dpsi_ma_max_deg', 'dtheta_hai_cam_deg']
+
+    def csv_text(cols, rows):
+        import io
+        f = io.StringIO(newline='')
         wr = csv.DictWriter(f, fieldnames=cols)
         wr.writeheader()
-        for n, rows in a3.items():
-            for r in rows:
-                wr.writerow(dict({k: r.get(k, '') for k in cols[1:]}, clip=n))
+        for r in rows:
+            wr.writerow(r)
+        return f.getvalue()
+    files = {'u_so.json': us_bytes}
+    if res['P1_tuong_doi'] is not None:               # KS7B-2: the signed numbers per pair, beside the JSON
+        cols = ['clip', 'vung', 's', 'j', 'L_m', 'd_x', 'd_y', 'dh_x', 'dh_y', 'phi_deg', 'nhin', 'chuyen_x', 'chuyen_y',
+                'chuyen_psi_deg']
+        txt = csv_text(cols, [{k: (repr(v) if isinstance(v, float) else v) for k, v in r.items()} for r in cap_rows])
+        files['cap_tuong_doi.csv'] = txt
+        res['P1_tuong_doi']['cap_csv'] = dict(file=os.path.abspath(os.path.join(a.out, 'cap_tuong_doi.csv')),
+                                              sha256=hashlib.sha256(txt.encode('utf-8')).hexdigest())
+    cols = ['clip', 'i', 'j', 'L_m', 'dtheta_deg', 'sigma_thuoc_deg', 'mid_x', 'mid_y', 'huong_deg', 'gap_deg',
+            'quy_deg', 'dpsi_ma_max_deg', 'dtheta_hai_cam_deg']
+    files['a3_cap.csv'] = csv_text(cols, [dict({k: r.get(k, '') for k in cols[1:]}, clip=n)
+                                          for n, rows in a3.items() for r in rows])
+    files['kiem_cheo.json'] = json.dumps(res, indent=1, ensure_ascii=False)
+    done = []                                         # KCJ1-6: all or nothing
+    try:
+        for name in ('u_so.json', 'cap_tuong_doi.csv', 'a3_cap.csv', 'kiem_cheo.json'):
+            if name in files:
+                p = os.path.join(a.out, name)
+                publish_new(p, lambda f, t=files[name]: f.write(t))
+                done.append(p)
+    except BaseException:
+        for p in done:
+            os.unlink(p)
+        raise
     print(f"A3: {A3['n_cap']} cap, quy ve ma noc max {A3['max_deg']:.3f} deg (cap {A3['max_deg_cap']:.3f}, gap "
           f"{A3['gap_max_deg']:.3f}; quy_ve_ma_noc {A3['quy_ve_ma_noc']}), RMS cap {A3['rms_deg']:.3f} deg; "
           f"P1 clip H: max {worst[2] * 1000:.2f} mm (moc {worst[1]}, {worst[0]}); u_so xe {uso * 1000:.2f} mm "
@@ -1552,7 +1764,7 @@ def check_compat(kc, tk):
     return float(v)
 
 
-def moc_dich_block(a, kc):
+def moc_dich_block(a, kc, tk):
     """Block moc_dich of c8_cam_u_vao_v3 (c8b_u v3 198d2e9; design v6 S8-6): the U_moc block of CODE_CAM (--moc-dich:
     U_moc_xy_m, U_moc_psi_deg, phuong_phap_duyet, nguon {frames, lich, tap_moc, u_so, session, car_pose, bo_lay_mau})
     plus tien_de_buoi = ket_qua of this session's tien_de_buoi_v1 (--tien-de). Both must be of this kiem_cheo result:
@@ -1564,6 +1776,8 @@ def moc_dich_block(a, kc):
     sh = td.get('sha256') or {}
     if sh.get('kiem_cheo') != sha256_file(a.kiem_cheo) or sh.get('u_so') != kc.get('u_so_sha256'):
         raise KCError('--tien-de: made from another kiem_cheo / u_so result (sha256)')
+    if sh.get('tung_khung') is None or sh.get('tung_khung') != sha256_file(a.tung_khung):   # KCJ1-3
+        raise KCError('--tien-de: made from another tung_khung (another scoring) than --tung-khung (sha256)')
     md = _load_json(a.moc_dich)
     if not isinstance(md, dict) or md.get('buoi') != a.buoi:
         raise KCError(f'--moc-dich: buoi {md.get("buoi") if isinstance(md, dict) else None!r} is not {a.buoi!r}')
@@ -1572,6 +1786,11 @@ def moc_dich_block(a, kc):
         raise KCError(f'--moc-dich: nguon lacks {sorted(set(MOC_NGUON_KEYS) - set(ng or {}))} (c8b_u v3)')
     if ng.get('u_so') != kc.get('u_so_sha256'):
         raise KCError('--moc-dich: nguon.u_so is not the u_so.json of this kiem_cheo result')
+    if ng.get('session') != kc['sessions']['H_a']['sha256']:                       # KCJ1-3: same scoring chain
+        raise KCError('--moc-dich: nguon.session is not the H_a session of this kiem_cheo result')
+    fr_tk = sorted(v['nguon']['frames_sha256'] for v in tk['luot'].values())
+    if not isinstance(ng.get('frames'), dict) or sorted(ng['frames'].values()) != fr_tk:
+        raise KCError('--moc-dich: nguon.frames are not the frames of the runs of --tung-khung (KCJ1-3)')
     if not isinstance(md.get('phuong_phap_duyet'), str):
         raise KCError('--moc-dich: phuong_phap_duyet missing (c8b_u v3)')
     if 'tien_de_buoi' in md and md['tien_de_buoi'] != td.get('ket_qua'):
@@ -1613,6 +1832,9 @@ def tien_de_eval(kc, us, tk, sha_kc, sha_us, sha_tk):
         fr = [v['nguon']['frames_sha256'] for v in tk['luot'].values()]
         if len(set(fr)) != len(fr):
             raise KCError('tung_khung.json: two runs with the same frames (TD1-6)')
+        plan = tk['ke_hoach'].get('luot') or []      # KCJ1-2: the runs written + the runs missing = the plan
+        if sorted(set(tk['luot']) | set(tk.get('luot_chua_co') or [])) != sorted(plan) or                 set(tk['luot']) & set(tk.get('luot_chua_co') or []):
+            raise KCError('tung_khung.json: runs and missing runs do not make up the plan (KCJ1-2)')
     why, worst = [], 'dat'
 
     def bad(level, reason):
@@ -1627,17 +1849,36 @@ def tien_de_eval(kc, us, tk, sha_kc, sha_us, sha_tk):
         if n not in sess:
             bad('thieu_du_lieu', f'thieu_clip:{n}')
     for n, r in (kc.get('kiem_h') or {}).items():
-        if r.get('ti_le_cung_luc', 0.0) < KIEM_H_MIN:
+        v = r.get('ti_le_cung_luc')                 # KCJ1-2: NaN, missing or not a number fails too
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not v >= KIEM_H_MIN:
             bad('thieu_du_lieu', f'kiem_h:{n}')
     for n in sess:
         if n not in (kc.get('kiem_h') or {}):
             bad('thieu_du_lieu', f'kiem_h:{n}')
     chains = us.get('chuoi') or {}
     khong = sorted(c for c, v in chains.items() if v.get('khong_tinh_duoc'))
+    # KCJ1-2: every comparator chain of the groups, with finite numbers and computed sets
+    need_c = set(comparators(kc.get('nhom') or []))
+    for c in sorted(need_c | set(chains)):
+        v = chains.get(c)
+        nums = ('u_so_m', 'u_so_tho_m', 'nguong_m', 'nguong_tho_m')
+        if c not in need_c or v is None or any(isinstance(v.get(k), bool) or not isinstance(v.get(k), (int, float))
+                                               or not math.isfinite(v.get(k)) for k in nums)                 or not v.get('tap_tinh'):
+            if c not in khong:
+                khong.append(c)
+    khong.sort()
     for c in khong:
         bad('thieu_du_lieu', f'u_so_khong_tinh:{c}')
-    if 'xe' not in chains:
-        bad('thieu_du_lieu', 'u_so_khong_tinh:xe')
+    # KCJ1-1 (J v6 J4-12, M3): the comparison at H_m and H_z must exist for EVERY locked mark with a finite own part;
+    # a missing or partial comparison is missing data for the premise (not 'no contradiction seen')
+    ids = [str(i) for i in kc.get('id_khoa') or []]
+    for n in ('H_m', 'H_z'):
+        if n not in sess:
+            continue
+        rm = ((kc.get('theo_thoi_gian') or {}).get(n) or {}).get('rieng_m') or {}
+        lack = [i for i in ids if not isinstance(rm.get(i), (int, float)) or not math.isfinite(rm[i])]
+        if not ids or lack:
+            bad('thieu_du_lieu', f'so_{n}_thieu:{lack[:8] if ids else "id_khoa"}')
     luot, thieu_kiem, mau = [], [], []
     if tk is None:
         bad('thieu_du_lieu', 'khong_co_tung_khung')
@@ -1659,7 +1900,7 @@ def tien_de_eval(kc, us, tk, sha_kc, sha_us, sha_tk):
         for m in mau:
             bad('khong_dat', f"mau_thuan:{m['luot']}:{m['clip']}:{m['moc']}")
     xe = chains.get('xe')
-    num_ok = xe is not None and not khong
+    num_ok = xe is not None and not khong and set(chains) == need_c
     clip_h = {n: (dict(session=sess[n]['file'], sha256=sess[n]['sha256'], video=sess[n].get('video'),
                        video_sha256=sess[n].get('video_sha256'), kiem_h=(kc.get('kiem_h') or {}).get(n))
                   if n in sess else None) for n in CLIPS_REQUIRED}
@@ -1692,15 +1933,13 @@ def tien_de_eval(kc, us, tk, sha_kc, sha_us, sha_tk):
 def tien_de(a):
     if not re_date(a.ngay):
         raise KCError(f'--ngay {a.ngay!r}: YYYY-MM-DD (S6-10)')
-    kc = _load_json(a.kiem_cheo)
+    kc, sha_kc = load_json_sha(a.kiem_cheo)         # KCJ1-6: the sha of the bytes read
     if kc.get('version') != VERSION or kc.get('buoi') != a.session_id:
         raise KCError(f'{a.kiem_cheo}: not a {VERSION} result of session {a.session_id} (TD1-4)')
-    us = _load_json(a.u_so)
-    tk = _load_json(a.tung_khung) if a.tung_khung else None
+    us, sha_us = load_json_sha(a.u_so)
+    tk, sha_tk = load_json_sha(a.tung_khung) if a.tung_khung else (None, None)
     if tk is not None and tk.get('buoi') != a.session_id:
         raise KCError(f'{a.tung_khung}: buoi {tk.get("buoi")!r} is not {a.session_id!r} (TD1-4)')
-    sha_kc, sha_us = sha256_file(a.kiem_cheo), sha256_file(a.u_so)
-    sha_tk = sha256_file(a.tung_khung) if a.tung_khung else None
     out = tien_de_eval(kc, us, tk, sha_kc, sha_us, sha_tk)
     # TD3-2: every hashed source by its path, SHA from the evidence that made the result, re-hashed to check
     nguon = [dict(vai_tro='kiem_cheo', duong_dan=os.path.abspath(a.kiem_cheo), sha256=sha_kc),
@@ -1765,7 +2004,18 @@ def e_hieu(a):
     elif side is None or h_m is None:
         why_ii.append('car_pose_cfg thieu side_m / h_m')
     else:
+        if ses.get('sha256') != d.get('session_sha256'):
+            raise KCError('F5: nguon session sha256 is not session_sha256 (KCJ1-8)')
         _rehash(ses['duong_dan'], d.get('session_sha256'), 'session_F5')
+        # KCJ1-8: the leg ends come from frames / track of the SAME session: chain F5 -> track -> session, frames
+        src = {x.get('vai_tro'): x for x in d.get('nguon') or []}
+        if 'track' not in src or 'frames' not in src:
+            raise KCError('F5: nguon without track / frames (the leg ends cannot be tied to the session, KCJ1-8)')
+        _rehash(src['track'].get('duong_dan'), d.get('track_sha256'), 'track_F5')
+        _rehash(src['frames'].get('duong_dan'), d.get('frames_sha256'), 'frames_F5')
+        tr = _load_json(src['track']['duong_dan'])
+        if tr.get('session_sha256') != d.get('session_sha256') or tr.get('frames_sha256') != d.get('frames_sha256'):
+            raise KCError('F5: the track was not made from this session / these frames (KCJ1-8)')
         s = _load_json(ses['duong_dan'])
         img, mk, w, h, zc = clip_from_session(s, kc['model'])
         pc = PairCams(img, mk, kc['model'], w, h, zc)
@@ -1800,22 +2050,26 @@ def e_hieu(a):
                                                     float(side), float(h_m), kappa, plumb, tuple(to)):
                     ii_m, ii_psi = max(ii_m, math.hypot(dx, dy)), max(ii_psi, abs(dpsi))
         vals = [v for v in (part_i, ii_m) if v is not None]
-        legs.append(dict(i=g.get('i'), e_hieu_m=max(vals) if vals else None, e_hieu_psi_rad=ii_psi, phan_i_m=part_i,
+        if not vals:
+            raise KCError('e_hieu_m: a leg with neither (i) nor (ii) (start region without in-region pairs)')
+        # KCJ1-7: a diagnostic number is NOT written under e_hieu_m (the key the reader turns into a usable value);
+        # e_hieu_m appears only when (iii) is there and the leg is not chan_doan
+        legs.append(dict(i=g.get('i'), e_hieu_m_chan_doan=max(vals), e_hieu_psi_rad=ii_psi, phan_i_m=part_i,
                          phan_ii_m=ii_m, phan_iii_m=None, trang_thai='chan_doan', ly_do=why))
-    if any(x['e_hieu_m'] is None for x in legs):
-        raise KCError('e_hieu_m: a leg with neither (i) nor (ii) (start region without in-region pairs)')
     out = dict(schema=E_HIEU_SCHEMA, cho=cho, doan_12b_sha256=d['sha256'], bao_q_xoay=False,
                trang_thai='chan_doan', doan=legs, hang_so_s7=hs,
                loai='chi so thuc nghiem truoc le (S7-17); (iii) replay neo chua co: chan_doan',
                nguon=[dict(vai_tro='kiem_cheo', duong_dan=os.path.abspath(a.kiem_cheo), sha256=sha256_file(a.kiem_cheo)),
-                      dict(vai_tro='doan_12b_v1', duong_dan=os.path.abspath(a.doan), sha256=sha256_file(a.doan))],
+                      dict(vai_tro='doan_12b_v1', duong_dan=os.path.abspath(a.doan), sha256=sha256_file(a.doan))]
+               + ([dict(vai_tro='session_ii', duong_dan=ses['duong_dan'], sha256=d.get('session_sha256'))]
+                  if ses and not why_ii else []),
                gioi_han=['(i) cap moc dai hon doan: khong thay meo o thang doan ngan hon khoang cach moc',
                          '(ii) chi trong ho mo hinh; tam ma dat tai p_m, lech q bo qua',
                          '(iii) chua tinh (can dets.npz, load_dets, dets_fp cua CAM)'],
                commit_hil=commit_hil())
     write_new(a.out, out)
-    print(f"e_hieu {cho}: {len(legs)} doan, max {max(x['e_hieu_m'] for x in legs) * 1000 if legs else 0:.2f} mm "
-          f"(chan_doan)")
+    print(f"e_hieu {cho}: {len(legs)} doan, max {max(x['e_hieu_m_chan_doan'] for x in legs) * 1000 if legs else 0:.2f}"
+          " mm (chan_doan: chua co e_hieu_m dung duoc)")
 
 
 def xuat(a):
@@ -1844,7 +2098,7 @@ def xuat(a):
             raise KCError(f'--phan {name}: buoi {blk.get("buoi") if isinstance(blk, dict) else None!r} is not '
                           f'{a.buoi!r} (KC1-10)')
         parts[name] = (blk, path, sha256_file(path))
-    parts['moc_dich'] = moc_dich_block(a, kc)
+    parts['moc_dich'] = moc_dich_block(a, kc, tk)
     out = build_cam_u(own, parts, a.ghi_chu)
     out['ghi_chu'] = (out.get('ghi_chu', '') + f' buoi={a.buoi}').strip()
     write_new(a.out, out)
@@ -1887,6 +2141,7 @@ def main(argv=None):
     p.add_argument('--xuat-phat', dest='xuat_phat', action='append',
                    help='goc|K1|K2=X,Y start point of the place (floor m, from the plan; S7, design v6 S8-4)')
     p.add_argument('--plumb', help='X,Y plumb point of car_pose (the scoring one, L125), needed with --xuat-phat')
+    p.add_argument('--khoa-s7', dest='khoa_s7', help='c7_khoa_s7_v1 manifest committed before the run (KCJ1-14)')
     p.add_argument('--out', required=True)
     x = sub.add_parser('xuat')
     x.add_argument('--buoi', required=True)

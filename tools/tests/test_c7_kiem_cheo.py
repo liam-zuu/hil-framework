@@ -264,10 +264,10 @@ def test_check_moc_refuses(scene, bad):
         kc.check_moc(rows, marks, sorted(marks))
 
 
-def _own():
+def _own(a3=None):
     return dict(P1=dict(bo_nhom_max_m=0.0034, tung_khung_max_m=0.003),
-                A3=dict(max_deg=0.15, rms_deg=0.07), P7=dict(lech_max_m=0.0006), A5=dict(lech_max_deg=0.4),
-                _src=('kc.json', 'a' * 64))
+                A3=a3 or _a3_conv(max_deg=0.15, quy_ve_ma_noc=True), P7=dict(lech_max_m=0.0006),
+                A5=dict(lech_max_deg=0.4), _src=('kc.json', 'a' * 64))
 
 
 def _moc_dich(**over):
@@ -333,12 +333,11 @@ def test_c8b_u_reads_the_export():
     branch), skipped before. (1) Our export is refused while A3 is not carried to the car tag (no quy_ve_ma_noc);
     (2) with the flag set here ONLY to reach the formula, the mark-shift part of P1 is nguong + 2 u_so (u 0.3 mm:
     1.6 mm, not 1.3 mm)."""
+    with pytest.raises(kc.KCError, match='quy_ve_ma_noc'):              # KCJ1-4: the writer refuses it first
+        kc.build_cam_u(_own(dict(max_deg=0.15, rms_deg=0.07)), _parts())
     CU = pytest.importorskip('c8b_u')
     if getattr(CU, 'CAM_VERSION', None) != kc.CAM_U_VERSION or not hasattr(CU, 'check_cam'):
         pytest.skip('c8b_u of another camera-file version (before d338af4)')
-    cam = json.loads(json.dumps(kc.build_cam_u(_own(), _parts())))
-    with pytest.raises(CU.UError, match='quy_ve_ma_noc'):              # a pair angle not carried to the tag
-        CU.check_cam(cam)
     own = dict(_own(), A3=_a3_conv(quy_ve_ma_noc=True))                  # approved (Liam 18/11): the real export path
     cam = json.loads(json.dumps(kc.build_cam_u(own, _parts())))
     CU.check_cam(cam)
@@ -426,12 +425,13 @@ def _xuat_args(tmp_path, kcp, tk_over=None, part_buoi='C8_x', buoi='C8_x', td_ov
     tk = dict(version=kc.TUNG_KHUNG_VERSION, buoi='C8_x', model='B1', nhom=[[1, 5], [2, 6]], cham_lai=True,
               tung_khung_max_m=0.003, kiem_cheo_sha256=kc.sha256_file(str(kcp)), u_so_sha256='5' * 64,
               session_sha256='0' * 64, moc=[dict(file='moc.csv', sha256='6' * 64)], hang_so_sha256='4' * 64,
-              hoan_tat=True, luot_chua_co=[], mau_thuan=[], luot_thieu=['r3'], luot_thieu_neo=[])
+              hoan_tat=True, luot_chua_co=[], mau_thuan=[], luot_thieu=['r3'], luot_thieu_neo=[],
+              luot={'r1': dict(nguon=dict(frames_sha256='a' * 64))})
     tk.update(tk_over or {})
     tkp = tmp_path / 'tk.json'
     tkp.write_text(json.dumps(tk), encoding='utf-8')
     td = dict(format='tien_de_buoi_v1', session_id='C8_x', ket_qua='dat',
-              sha256=dict(kiem_cheo=kc.sha256_file(str(kcp)), u_so='5' * 64))
+              sha256=dict(kiem_cheo=kc.sha256_file(str(kcp)), u_so='5' * 64, tung_khung=kc.sha256_file(str(tkp))))
     td.update(td_over or {})
     tdp = tmp_path / 'td.json'
     tdp.write_text(json.dumps(td), encoding='utf-8')
@@ -457,14 +457,20 @@ def test_xuat_ok(tmp_path):
     assert md['U_moc_xy_m'] == 0.0012 and md['tien_de_buoi'] == 'dat' and md['u_so_kiem_cheo']['u_so_m'] == 0.0003
 
 
-@pytest.mark.parametrize('bad', ['td_format', 'td_session', 'td_kc_sha', 'td_u_so', 'md_u_so', 'md_no_lich',
-                                 'md_tien_de_other', 'md_no_method', 'tk_thieu_neo'])
+@pytest.mark.parametrize('bad', ['td_format', 'td_session', 'td_kc_sha', 'td_u_so', 'td_tk_sha', 'md_u_so', 'md_no_lich',
+                                 'md_tien_de_other', 'md_no_method', 'tk_thieu_neo', 'md_frames', 'md_session',
+                                 'md_no_bo_lay_mau', 'md_car_pose_h'])
 def test_xuat_v3_moc_dich_must_chain(tmp_path, bad):
     """S8-6: the tien_de and the U_moc block must be of this kiem_cheo result; anchors missing in a run refused."""
     kcp = _kc_file(tmp_path)
     td = {'td_format': dict(format='x'), 'td_session': dict(session_id='C8_y'), 'td_kc_sha': dict(sha256=dict(
-        kiem_cheo='f' * 64, u_so='5' * 64)), 'td_u_so': dict(sha256=dict(kiem_cheo=kc.sha256_file(str(kcp)), u_so='7' * 64))}
+        kiem_cheo='f' * 64, u_so='5' * 64)), 'td_u_so': dict(sha256=dict(kiem_cheo=kc.sha256_file(str(kcp)), u_so='7' * 64)),
+        'td_tk_sha': dict(sha256=dict(kiem_cheo=kc.sha256_file(str(kcp)), u_so='5' * 64, tung_khung='e' * 64))}
     md = {'md_u_so': dict(nguon=dict(_moc_dich()['nguon'], u_so='7' * 64)),
+          'md_frames': dict(nguon=dict(_moc_dich()['nguon'], frames={'r1': 'b' * 64})),
+          'md_session': dict(nguon=dict(_moc_dich()['nguon'], session='9' * 64)),
+          'md_no_bo_lay_mau': dict(nguon=dict(_moc_dich()['nguon'], bo_lay_mau=' ')),
+          'md_car_pose_h': dict(nguon=dict(_moc_dich()['nguon'], car_pose=dict(tag_offset=None, side_m=0.1445, h_m=0.10))),
           'md_no_lich': dict(nguon={k: v for k, v in _moc_dich()['nguon'].items() if k != 'lich'}),
           'md_tien_de_other': dict(tien_de_buoi='thieu_du_lieu'), 'md_no_method': dict(phuong_phap_duyet=None)}
     args = _xuat_args(tmp_path, kcp, tk_over=dict(luot_thieu_neo=['r2']) if bad == 'tk_thieu_neo' else None,
@@ -1045,8 +1051,8 @@ def test_xuat_refuses_unapproved_flag_and_other_tag(tmp_path, case, monkeypatch)
 def test_xuat_converted_a3_ok_and_flag_only_after_approval(tmp_path, monkeypatch):
     monkeypatch.setattr(kc, 'A3_QUY_DUYET', False)
     kcp = _kc_file(tmp_path, A3=dict(_a3_conv(), buoi='C8_x'))
-    assert kc.main(_xuat_args(tmp_path, kcp)) == 0
-    assert json.loads((tmp_path / 'o.json').read_text(encoding='utf-8'))['A3']['quy_ve_ma_noc'] is False
+    assert kc.main(_xuat_args(tmp_path, kcp)) == 2                   # KCJ1-4: c8b_u v3 refuses it, so does the writer
+    assert not (tmp_path / 'o.json').exists()
     t2 = tmp_path / 'b'
     t2.mkdir()
     monkeypatch.setattr(kc, 'A3_QUY_DUYET', True)
@@ -1178,10 +1184,7 @@ def _td_inputs():
 
 
 def _grade(f=None, tk_none=False):
-    kcr, us, tk = _td_inputs()
-    if f:
-        f(kcr, us, tk)
-    return kc.tien_de_eval(kcr, us, None if tk_none else tk, 'k' * 64, 'd' * 64, 'g' * 64)
+    return _td_full(f, tk_none)                     # KCJ1-1: the fixture carries the H_m / H_z comparison
 
 
 @pytest.mark.parametrize('case, ket, why', [
@@ -1191,7 +1194,8 @@ def _grade(f=None, tk_none=False):
     (lambda k, u, t: k['kiem_h']['H_m'].update(ti_le_cung_luc=0.9), 'thieu_du_lieu', 'kiem_h:H_m'),
     (lambda k, u, t: u['chuoi']['2'].update(khong_tinh_duoc=[dict(moc=3)]), 'thieu_du_lieu', 'u_so_khong_tinh:2'),
     ('no_tk', 'thieu_du_lieu', 'khong_co_tung_khung'),
-    (lambda k, u, t: t.update(luot_chua_co=['R3']), 'thieu_du_lieu', 'luot_chua_co:R3'),
+    (lambda k, u, t: (t.update(luot_chua_co=['R3']), t['ke_hoach']['luot'].append('R3')), 'thieu_du_lieu',
+     'luot_chua_co:R3'),
     (lambda k, u, t: t['luot']['R1'].update(thieu=True, tap_chua_tinh=[dict(chuoi='xe')]), 'thieu_du_lieu',
      'tap_neo_chua_tinh:R1'),
     (lambda k, u, t: t['luot']['R2'].update(thieu=True, thieu_du_lieu_neo=True), 'thieu_du_lieu', 'thieu_neo:R2'),
@@ -1280,7 +1284,8 @@ def test_p1_rel_exact_scene_and_rigid_map_error(scene):
     pc = _FakePC(img, cam, cam)
     rows, pairs, hong = kc.p1_rel_clip('H_a', pc, marks, regions, (0.1445, 0.119), 0.119 / ZC, (0.0, 0.0),
                                        phis=(0.0, 45.0))
-    assert not hong and max(p['d_m'] for p in pairs) < 2e-4 and max(p['chuyen_m'] for p in pairs) < 1e-9
+    # KCJ1-9: the centre is the mean of the back-projected corners: exact for an exact camera
+    assert not hong and max(p['d_m'] for p in pairs) < 1e-9 and max(p['chuyen_m'] for p in pairs) < 1e-9
     Q = _rotm(0.5)
     pc = _FakePC(img, cam, _MapCam(cam, Q, (0.004, -0.003)))
     rows, pairs, hong = kc.p1_rel_clip('H_a', pc, marks, regions, (0.1445, 0.119), 0.119 / ZC, (0.0, 0.0), phis=(0.0,))
@@ -1329,7 +1334,8 @@ def test_region_cover_flags():
     """S7-12.3, S7-14.3: inside the hull, near marks, two A3 directions: no flag; outside: ngoai_suy; one direction:
     mot_phuong (directions mod 180); far marks: khoang_trong."""
     mk = {1: (0.0, 0.0, SIDE), 2: (0.4, 0.0, SIDE), 3: (0.4, 0.4, SIDE), 4: (0.0, 0.4, SIDE)}
-    rows = [dict(i=1, j=2, L_m=0.4, huong_deg=0.0), dict(i=1, j=4, L_m=0.4, huong_deg=90.0)]
+    rows = [dict(i=1, j=2, L_m=0.4, huong_deg=0.0), dict(i=1, j=4, L_m=0.4, huong_deg=90.0),
+            dict(i=2, j=3, L_m=0.4, huong_deg=90.0)]
     r = kc.region_cover([1, 2, 3, 4], mk, (0.2, 0.2), rows)
     assert not r['ngoai_suy'] and not r['mot_phuong'] and r['ly_do'] == []
     r = kc.region_cover([1, 2, 3, 4], mk, (0.2, -0.15), rows)
@@ -1394,8 +1400,14 @@ def test_phan_tich_writes_s7(tmp_path, scene, monkeypatch):
     marks, cam, img = scene
     monkeypatch.setattr(kc, 'clip_dets', lambda v, ids, max_frames=None: ([k / 60 for k in range(20)], [img] * 20))
     monkeypatch.setattr(kc, 'R_XP_M', 0.3)
-    assert kc.main(_phan_tich_args(tmp_path, scene) + ['--xuat-phat', 'goc=0,0', '--plumb', '0.03,-0.02']) == 0
+    monkeypatch.setattr(kc, 'commit_hil', lambda: dict(sha='c' * 40, dirty=False))
+    monkeypatch.setattr(kc, 'manifest_git', lambda p: dict(commit='m' * 40, time='2026-11-19T19:00:00+07:00', sach=True))
+    mf = _khoa_manifest(tmp_path, scene)
+    assert kc.main(_phan_tich_args(tmp_path, scene) + ['--xuat-phat', 'goc=0,0', '--plumb', '0.03,-0.02',
+                                                       '--khoa-s7', str(mf)]) == 0
     r = json.loads((tmp_path / 'kc' / 'kiem_cheo.json').read_text(encoding='utf-8'))
+    assert r['khoa_s7']['sha256'] == kc.sha256_file(str(mf)) and r['khoa_s7']['git_commit'] == 'm' * 40
+    assert r['P1_tuong_doi']['du_lieu_du'] is True and r['A3']['du_lieu_du'] is True
     p = r['P1_tuong_doi']
     assert p['max_m'] < 5e-4 and p['theo_vung']['goc']['vung_mo_rong'] and p['cap_hong'] == []
     assert p['cap_csv']['sha256'] == kc.sha256_file(p['cap_csv']['file'])
@@ -1414,6 +1426,11 @@ def test_e_hieu_reads_f5_and_writes_f9(tmp_path, scene):
     video = tmp_path / 'v.mov'
     video.write_bytes(b'v')
     sp = _fake_session(tmp_path, 'hc', img, marks, video)
+    frp = tmp_path / 'frames.csv'
+    frp.write_text('idx,t_s\n0,0.0\n', encoding='utf-8')
+    trp = tmp_path / 'track.json'
+    trp.write_text(json.dumps(dict(session_sha256=kc.sha256_file(str(sp)), frames_sha256=kc.sha256_file(str(frp)))),
+                   encoding='utf-8')
     kcr = dict(version=kc.VERSION, thu=False, model='B1',
                hang_so_s7=dict(xuat_phat=dict(goc=[0.0, 0.0]), R_XP_M=0.6, L_MAX_M=1.05, plumb=[0.03, -0.02]),
                P1_tuong_doi=dict(theo_vung=dict(goc=dict(trong_vung_max_m=0.0007))))
@@ -1424,8 +1441,11 @@ def test_e_hieu_reads_f5_and_writes_f9(tmp_path, scene):
         return dict(loai='dung_12b', chi_so=0, khung_id=[1], khung_pts_s=[0.0], khung_sha256='a' * 64, p_m=p,
                     psi_rad=psi)
     doan = dict(schema='c8_hc_doan_12b_v1', cho='goc', trang_thai='chan_doan', session_sha256=kc.sha256_file(str(sp)),
+                track_sha256=kc.sha256_file(str(trp)), frames_sha256=kc.sha256_file(str(frp)),
                 car_pose_cfg=dict(side_m=0.1445, h_m=0.119, tag_offset=None, q_m=None, du_m=None),
-                nguon=[dict(vai_tro='session', duong_dan=str(sp), sha256=kc.sha256_file(str(sp)))],
+                nguon=[dict(vai_tro='session', duong_dan=str(sp), sha256=kc.sha256_file(str(sp))),
+                       dict(vai_tro='track', duong_dan=str(trp), sha256=kc.sha256_file(str(trp))),
+                       dict(vai_tro='frames', duong_dan=str(frp), sha256=kc.sha256_file(str(frp)))],
                 doan=[dict(i=0, trang_thai='hop_le', cua_so_a=win([-0.2, 0.0], 0.0), cua_so_b=win([0.3, 0.1], 0.02)),
                       dict(i=1, trang_thai='hop_le', cua_so_a=win(None, None), cua_so_b=win([0.3, 0.1], 0.0))])
     doan['sha256'] = kc.doan_body_sha(doan)
@@ -1436,9 +1456,18 @@ def test_e_hieu_reads_f5_and_writes_f9(tmp_path, scene):
     e = json.loads(out.read_text(encoding='utf-8'))
     assert e['doan_12b_sha256'] == doan['sha256'] and e['bao_q_xoay'] is False and e['trang_thai'] == 'chan_doan'
     legs = {x['i']: x for x in e['doan']}
-    assert legs[0]['phan_ii_m'] < 1e-6 and legs[0]['e_hieu_m'] == pytest.approx(0.0007)
+    assert legs[0]['phan_ii_m'] < 1e-6 and legs[0]['e_hieu_m_chan_doan'] == pytest.approx(0.0007)
     assert legs[1]['phan_ii_m'] is None and any('chi (i)' in w for w in legs[1]['ly_do'])
-    assert all(isinstance(x['e_hieu_m'], float) for x in e['doan'])
+    # KCJ1-7: no usable e_hieu_m while chan_doan (c8_hc_a.read_e_hieu refuses a row without it: F9 cannot unlock khoa)
+    assert all('e_hieu_m' not in x for x in e['doan'])
+    tr = json.loads(trp.read_text(encoding='utf-8'))                  # KCJ1-8: a track of another session: code 2
+    trp.write_text(json.dumps(dict(tr, session_sha256='1' * 64)), encoding='utf-8')
+    d2 = dict(doan, track_sha256=kc.sha256_file(str(trp)))
+    d2['nguon'] = [dict(x, sha256=kc.sha256_file(str(trp))) if x['vai_tro'] == 'track' else x for x in doan['nguon']]
+    d2['sha256'] = kc.doan_body_sha(d2)
+    dp2 = tmp_path / 'doan2.json'
+    dp2.write_text(json.dumps(d2), encoding='utf-8')
+    assert kc.main(['e_hieu', '--kiem-cheo', str(kcp), '--doan', str(dp2), '--out', str(tmp_path / 'e3.json')]) == 2
     doan['doan'][0]['dai'] = 9                                        # edited after its sha
     dp.write_text(json.dumps(doan), encoding='utf-8')
     assert kc.main(['e_hieu', '--kiem-cheo', str(kcp), '--doan', str(dp), '--out', str(tmp_path / 'e2.json')]) == 2
@@ -1453,3 +1482,209 @@ def test_c8b_u_reads_the_cli_export(tmp_path):
     kcp = _kc_file(tmp_path, A3=dict(_a3_conv(quy_ve_ma_noc=True), buoi='C8_x'))
     assert kc.main(_xuat_args(tmp_path, kcp)) == 0
     CU.check_cam(json.loads((tmp_path / 'o.json').read_text(encoding='utf-8')))
+
+
+# ---------------------------------------------------------------- Codex round 1 of the J round (KCJ1-1 ... KCJ1-16)
+def _td_full(f=None, tk_none=False):
+    """_td_inputs with the comparison at H_m / H_z present for every locked id (KCJ1-1)."""
+    kcr, us, tk = _td_inputs()
+    kcr['id_khoa'] = ALL8
+    kcr['theo_thoi_gian'] = {n: dict(rieng_m={str(i): 0.0002 for i in ALL8}) for n in ('H_b', 'H_m', 'H_z')}
+    if f:
+        f(kcr, us, tk)
+    return kc.tien_de_eval(kcr, us, None if tk_none else tk, 'k' * 64, 'd' * 64, 'g' * 64)
+
+
+@pytest.mark.parametrize('case, why', [
+    (lambda k, u, t: k.pop('theo_thoi_gian'), 'so_H_m_thieu'),
+    (lambda k, u, t: k['theo_thoi_gian']['H_z']['rieng_m'].pop('3'), 'so_H_z_thieu'),
+    (lambda k, u, t: k['theo_thoi_gian']['H_m']['rieng_m'].update({'4': float('nan')}), 'so_H_m_thieu'),
+    (lambda k, u, t: u['chuoi'].pop('2'), 'u_so_khong_tinh:2'),
+    (lambda k, u, t: u['chuoi']['1'].update(tap_tinh=[]), 'u_so_khong_tinh:1'),
+    (lambda k, u, t: u['chuoi']['xe'].pop('nguong_m'), 'u_so_khong_tinh:xe'),
+    (lambda k, u, t: k['kiem_h']['H_m'].update(ti_le_cung_luc=float('nan')), 'kiem_h:H_m'),
+])
+def test_tien_de_missing_required_data_is_not_dat(case, why):
+    """KCJ1-1, KCJ1-2 (J v6 J4-12, M3): a missing comparison at H_m / H_z, a missing chain or set, a NaN: data
+    missing, never dat."""
+    assert _td_full()['ket_qua'] == 'dat'
+    r = _td_full(case)
+    assert r['ket_qua'] == 'thieu_du_lieu' and any(x.startswith(why) for x in r['ly_do'])
+
+
+def test_tien_de_runs_must_make_up_the_plan():
+    """KCJ1-2: runs written + runs missing must be the plan (an emptied luot is refused, code 2)."""
+    with pytest.raises(kc.KCError, match='KCJ1-2'):
+        _td_full(lambda k, u, t: t.update(luot={}))
+
+
+def test_tung_khung_contradiction_kept_when_another_anchor_column_lacks(tmp_path):
+    """KCJ1-5: moc_neo_1 missing but moc_neo_xe present: the run is thieu_du_lieu_neo AND its contradiction stays."""
+    fr = [{k: v for k, v in r.items() if k != 'moc_neo_1'} for r in _frames(invalid={9})]
+    args, out = _tk_two(tmp_path, r2_frames=fr, theo={'H_z': dict(rieng_m={'5': 0.0020})})
+    assert kc.main(args) == 0
+    t = json.loads(out.read_text(encoding='utf-8'))
+    assert t['luot']['r2']['thieu_du_lieu_neo'] and dict(luot='r2', clip='H_z', moc=5) in t['mau_thuan']
+
+
+def test_phan_tich_existing_output_leaves_nothing_new(tmp_path, scene, monkeypatch):
+    """KCJ1-6: an a3_cap.csv already there: code 2 before anything is written (no u_so.json, kiem_cheo.json)."""
+    marks, cam, img = scene
+    monkeypatch.setattr(kc, 'clip_dets', lambda v, ids, max_frames=None: ([k / 60 for k in range(20)], [img] * 20))
+    (tmp_path / 'kc').mkdir()
+    (tmp_path / 'kc' / 'a3_cap.csv').write_text('x', encoding='utf-8')
+    assert kc.main(_phan_tich_args(tmp_path, scene)) == 2
+    assert sorted(p.name for p in (tmp_path / 'kc').iterdir()) == ['a3_cap.csv']
+
+
+def test_publish_new_leaves_no_partial_file(tmp_path):
+    """KCJ1-6: a writer that fails half way leaves neither the target nor its temporary file."""
+    p = tmp_path / 'x.json'
+
+    def boom(f):
+        f.write('{"half": ')
+        raise OSError('disk')
+    with pytest.raises(OSError):
+        kc.publish_new(str(p), boom)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_repeated_ids_are_refused(tmp_path):
+    """KCJ1-10: a repeated id in the session fit or in the marker CSV is refused, not merged; ids 1-32 locked."""
+    s = dict(kind='c7_session', model_khoa='B1', chosen='B1', width=W, height=H, zc_tape_m=ZC, marks={'1': [0, 0, SIDE]},
+             fit_ids=[1, 1], ref_corners_px={'1': [[0, 0]] * 4})
+    with pytest.raises(kc.KCError, match='KCJ1-10'):
+        kc.clip_from_session(s, 'B1')
+    p = tmp_path / 'm.csv'
+    p.write_text('id,x_cm\n3,1\n3,2\n', encoding='utf-8')
+    with pytest.raises(kc.KCError, match='repeated'):
+        kc.load_moc([str(p)])
+    assert kc.ID_KHOA == tuple(range(1, 33))
+
+
+def test_disc_tests_are_exact_or_conservative():
+    """KCJ1-11: a hull edge 0.099 m from the centre of a 0.10 m disc is caught (16 rim samples missed it); the gap
+    bound is never below a fine brute force over the disc."""
+    c = np.array([0.0, 0.0])
+    a = math.radians(11.25)
+    nrm = np.array([math.cos(a), math.sin(a)])
+    t = np.array([-nrm[1], nrm[0]])
+    p0 = 0.099 * nrm
+    hull = kc._hull(np.array([p0 + 5 * t, p0 - 5 * t, -3 * nrm + 5 * t, -3 * nrm - 5 * t]))
+    assert not kc.disc_in_hull(c, 0.10, hull) and kc.disc_in_hull(c, 0.098, hull)
+    pts = np.array([[0.3, 0.05], [-0.2, 0.31], [-0.1, -0.33], [0.25, -0.24]])
+    g = np.linspace(-0.1, 0.1, 401)
+    X, Y = np.meshgrid(g, g)
+    P = np.column_stack([X.ravel(), Y.ravel()])
+    P = P[np.hypot(P[:, 0], P[:, 1]) <= 0.1]
+    brute = float(np.max(np.min(np.linalg.norm(P[:, None] - pts[None], axis=2), axis=1)))
+    assert brute <= kc.disc_max_gap(c, 0.10, pts) <= brute + 0.009
+
+
+def test_mot_phuong_flags_a_region_mark_without_a3loc_and_uses_l_max():
+    """KCJ1-12: a fifth region mark in no A3 pair raises mot_phuong; the pair length limit is the run's L_max."""
+    mk = {1: (0.0, 0.0, SIDE), 2: (0.4, 0.0, SIDE), 3: (0.4, 0.4, SIDE), 4: (0.0, 0.4, SIDE), 5: (0.2, 0.6, SIDE)}
+    rows = [dict(i=1, j=2, L_m=0.4, huong_deg=0.0), dict(i=1, j=4, L_m=0.4, huong_deg=90.0)]
+    r = kc.region_cover([1, 2, 3, 4, 5], mk, (0.2, 0.2), rows)
+    assert r['mot_phuong'] and any('moc_khong_co_A3loc' in w for w in r['ly_do'])
+    long_rows = [dict(i=1, j=3, L_m=1.10, huong_deg=45.0), dict(i=2, j=4, L_m=1.10, huong_deg=135.0),
+                 dict(i=3, j=4, L_m=1.10, huong_deg=0.0)]
+    assert kc.region_cover([1, 2, 3, 4], mk, (0.2, 0.2), long_rows, l_max=1.20)['ly_do'] == []
+    assert kc.region_cover([1, 2, 3, 4], mk, (0.2, 0.2), long_rows, l_max=1.05)['mot_phuong']
+
+
+def test_broken_pairs_are_listed_and_mark_the_region(scene):
+    """KCJ1-13: a failing A3 pair is listed (hong), not fatal; a broken P1 pair marks its region and du_lieu_du."""
+    marks, cam, img = scene
+    bad = frozenset((30, 31))
+
+    class PC(kc.PairCams):
+        def __call__(self, out=()):
+            if frozenset(out) == bad:
+                raise kc.KCError('fit failed (test)')
+            return super().__call__(out)
+    pc = PC(img, marks, 'B1', W, H, ZC)
+    hong = []
+    rows = kc.a3_clip(img, marks, 'B1', W, H, ZC, l_max=1.05, pc=pc, hong=hong)
+    assert [(h['i'], h['j']) for h in hong] == [(30, 31)] and all((r['i'], r['j']) != (30, 31) for r in rows)
+    regions = {'goc': dict(moc=[30], vung_mo_rong=False)}
+    few = _FakePC(img, None, None)
+    few.ids = [30, 31, 12]                                         # two pairs only (speed); fits use every mark
+    few.__class__ = type('_Sub2', (_FakePC,), {'__call__': lambda self, out=(): pc(out)})
+    r_rows, pairs, p_hong = kc.p1_rel_clip('H_a', few, marks, regions, (0.1445, 0.119), 0.119 / ZC, (0.0, 0.0),
+                                           phis=(0.0,))
+    rel = {'H_a': dict(pairs=pairs, hong=p_hong, n_du_kien=2)}
+    cov = {'H_a': {'goc': dict(ngoai_suy=False, mot_phuong=False, ly_do=[])}}
+    P, A = kc.s7_summary(rel, {'H_a': kc.a3_rel_clip([dict(i=30, j=12, quy_deg=0.1)], regions)}, cov, regions)
+    assert p_hong and P['theo_vung']['goc']['cap_hong'] and P['du_lieu_du'] is False and A['cap_hong']['goc']
+
+
+def test_meo_sizes_one_rule():
+    """KCJ1-15: 96.36 and 96.44 mm share the key 96.4: its maximum is the overall one, one threshold."""
+    m = lambda g, sd: dict(gian=[g, 0.0], cat_deg=0.0, du_mm=0.1, canh_m=sd)       # noqa: E731
+    out = kc.meo_summary({'H_a': {1: m(0.012, 0.09636), 2: m(0.0, 0.09644)},
+                          'H_b': {1: m(0.012, 0.09636), 2: m(0.0, 0.09644)}})
+    assert list(out['theo_co']) == ['96.4'] and out['theo_co']['96.4']['gian_chinh_max'] == pytest.approx(0.012)
+
+
+def test_thang_direction_is_tape_to_camera():
+    """KCJ1-16: held-out centres 1.01 x the tape: ti_le - 1 = +0.01, direction written."""
+    marks = {1: (0.0, 0.0, SIDE), 2: (1.0, 0.0, SIDE), 3: (0.0, 1.0, SIDE)}
+    p1 = {i: 0.01 * np.array(m[:2]) for i, m in marks.items()}
+    r = kc.thang_clip(p1, marks)
+    assert r['ti_le_tru_1'] == pytest.approx(0.01) and 'thuoc -> tam' in r['chieu']
+
+
+def test_a3_relative_never_mixes_clips():
+    """KS7-3 (Codex J1): H_a has the bad start, H_b the bad far end: the index is the worst SAME-clip sum (0.6), not
+    the mixed 0.3 + 0.35."""
+    regions = {'goc': dict(moc=[1], vung_mo_rong=False)}
+    a3rel = {'H_a': kc.a3_rel_clip([dict(i=1, j=5, quy_deg=0.3), dict(i=3, j=4, quy_deg=0.1)], regions),
+             'H_b': kc.a3_rel_clip([dict(i=1, j=5, quy_deg=0.1), dict(i=3, j=4, quy_deg=0.35)], regions)}
+    rel = {c: dict(pairs=[dict(clip=c, vung='goc', s=1, j=2, L_m=0.5, trong_vung=False, d_m=0.0, dh_m=0.0,
+                               chuyen_m=0.0, chuyen_psi_deg=0.0)], hong=[], n_du_kien=1) for c in a3rel}
+    cov = {c: {'goc': dict(ngoai_suy=False, mot_phuong=False, ly_do=[])} for c in a3rel}
+    _, A = kc.s7_summary(rel, a3rel, cov, regions)
+    assert A['max_deg'] == pytest.approx(0.6) and A['A3_xp_deg']['goc'] == pytest.approx(0.3)
+
+
+def _khoa_manifest(tmp_path, scene, **over):
+    marks, cam, img = scene
+    ids = sorted(img)
+    hs = dict(R_XP_M=0.3, R_TRONG_M=kc.R_TRONG_M, MIEN_XP_M=kc.MIEN_XP_M, MIEN_XP_BUOC_M=kc.MIEN_XP_BUOC_M,
+              HAI_PHUONG_DEG=kc.HAI_PHUONG_DEG, DUNG_SAI_IN_GIAN=kc.DUNG_SAI_IN_GIAN,
+              DUNG_SAI_IN_DU_MM=kc.DUNG_SAI_IN_DU_MM, L_MAX_M=0.6, A3_TAG_T=list(kc.A3_TAG_T),
+              A3_TAG_PHI_DEG=list(kc.A3_TAG_PHI_DEG), xuat_phat={'goc': [0.0, 0.0]}, plumb=[0.03, -0.02],
+              car_side_m=0.1445, tag_h_m=0.119, model='B1', nhom=kc.make_groups(ids), id_khoa=ids)
+    hs.update(over)
+    p = tmp_path / 'khoa_s7.json'
+    p.write_text(json.dumps(dict(schema='c7_khoa_s7_v1', hang_so_s7=hs, commit_hil='c' * 40)), encoding='utf-8')
+    return p
+
+
+def test_phan_tich_s7_needs_the_locked_manifest(tmp_path, scene, monkeypatch):
+    """KCJ1-14: --xuat-phat without --khoa-s7 refused; a manifest with another constant, or a dirty code tree, or a
+    manifest not committed: refused; the right one is recorded with its sha and commit."""
+    marks, cam, img = scene
+    monkeypatch.setattr(kc, 'clip_dets', lambda v, ids, max_frames=None: ([k / 60 for k in range(20)], [img] * 20))
+    monkeypatch.setattr(kc, 'R_XP_M', 0.3)
+    monkeypatch.setattr(kc, 'A3_TAG_PHI_DEG', (0.0,))
+    monkeypatch.setattr(kc, 'commit_hil', lambda: dict(sha='c' * 40, dirty=False))
+    monkeypatch.setattr(kc, 'manifest_git', lambda p: dict(commit='m' * 40, time='2026-11-19T19:00:00+07:00', sach=True))
+    xp = ['--xuat-phat', 'goc=0,0', '--plumb', '0.03,-0.02']
+    for k, over in enumerate([None, dict(L_MAX_M=1.05)]):
+        d = tmp_path / f'w{k}'
+        d.mkdir()
+        args = _phan_tich_args(d, scene) + xp
+        if over is not None:
+            args += ['--khoa-s7', str(_khoa_manifest(d, scene, **over))]
+        assert kc.main(args) == 2 and not (d / 'kc' / 'kiem_cheo.json').exists()
+    monkeypatch.setattr(kc, 'commit_hil', lambda: dict(sha='c' * 40, dirty=True))
+    d = tmp_path / 'w2'
+    d.mkdir()
+    assert kc.main(_phan_tich_args(d, scene) + xp + ['--khoa-s7', str(_khoa_manifest(d, scene))]) == 2
+    monkeypatch.setattr(kc, 'commit_hil', lambda: dict(sha='c' * 40, dirty=False))
+    monkeypatch.setattr(kc, 'manifest_git', lambda p: dict(commit='m' * 40, time='t', sach=False))
+    d = tmp_path / 'w3'
+    d.mkdir()
+    assert kc.main(_phan_tich_args(d, scene) + xp + ['--khoa-s7', str(_khoa_manifest(d, scene))]) == 2
