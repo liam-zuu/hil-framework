@@ -72,33 +72,59 @@ def ids_sha(ids):
     return hashlib.sha256(','.join(str(int(i)) for i in ids).encode()).hexdigest()
 
 
-def sha_ids_json(ids):
-    """sha256 of an ID list as NHACTAM writes khung_chung_sha256 (c7_nhac_tam.sha_ids of hil f9c4b3d: sorted ints,
-    compact JSON '[1,2]'); CODE 19/11 fixed sha256('1,2') (ids_sha) for the ID lists: both accepted when reading.
-    TODO (CODE 19/11): when NHACTAM moves sha_ids to '1,2' (CODE asked it), accept ids_sha only."""
-    return hashlib.sha256(json.dumps(sorted(int(i) for i in ids), separators=(',', ':')).encode()).hexdigest()
+def _check_sha(ids, sh, what):
+    """Codex CT1-3, CT2-1: the sha written beside an ID set must hash exactly the IDs read; one hash form, ids_sha
+    ('1,2'; CODE 19/11, NHACTAM sha_ids since hil e7b8428)."""
+    if sh is not None and sh != ids_sha(ids):
+        raise ValueError(f'lan_lap_v1 {what}: the sha256 is not ids_sha of its ids (contract F8)')
 
 
-def _check_sha(ids, sh, end):
-    """Codex CT1-3, CT2-1: khung_chung_sha256 (when written) must hash exactly the IDs read."""
-    if sh is not None and sh not in (sha_ids_json(ids), ids_sha(ids)):
-        raise ValueError(f'lan_lap_v1 khung_chung_sha256.{end} is not the sha256 of khung_chung.{end} (contract F8)')
+def _id_pts(v, what):
+    """(ids, pts) of an F8 frame set {id: [...], pts_s: [...]}; ValueError when malformed."""
+    ids, pts = v.get('id'), v.get('pts_s')
+    if not isinstance(ids, list) or not isinstance(pts, list) or len(ids) != len(pts):
+        raise ValueError(f'lan_lap_v1 {what}: id and pts_s lists of the same length (contract F8)')
+    try:
+        ids = [int(i) for i in ids]
+        pts = [float(p) for p in pts]
+    except (TypeError, ValueError):
+        raise ValueError(f'lan_lap_v1 {what}: integer ids, numeric pts_s (contract F8)')
+    if not all(math.isfinite(p) for p in pts):
+        raise ValueError(f'lan_lap_v1 {what}: pts_s not finite')
+    return ids, pts
 
 
 def neo_of(lan_lap, end='pre'):
-    """The anchor frames of one end of lan_lap_v1 (F8 khung_chung[end]), normalised (Codex CT2-1): (ids or None,
-    pts or None, sha or None, dang). NHACTAM writes {id: [...], pts_s: [...]} (c7_nhac_tam _mot_luot, hil f9c4b3d), the
-    sha in khung_chung_sha256[end] (or dau[end].khung_chung_sha256); dang 'id_pts' for that form, 'danh_sach' for a
-    bare ID list (earlier synthetic form, no PTS, no sha needed). Missing end: (None, None, None, None). A malformed
-    entry (lengths differ, not integers / finite PTS): ValueError."""
+    """The anchor frames of one end of lan_lap_v1, normalised: dict(ids, pts, sha, nguon, mat_neo) or None when the
+    end is missing. ValueError on a malformed set or a sha that does not hash its ids.
+      nguon 'giao_ma_neo' (Codex CT3-1): dau[end].khung_giao_ma_neo {id, pts_s} + khung_giao_sha256, the set of J v6 2
+            (CAM tag gate AND body anchors, c7_nhac_tam.tom_cua_so, hil e7b8428); dau[end].mat_neo must say whether
+            it is empty (an empty set with mat_neo not true, or a non-empty one with mat_neo true: ValueError);
+      nguon 'khung_chung' (Codex CT2-1; when the run has no khung_giao_ma_neo): khung_chung[end] {id, pts_s} + its sha
+            (khung_chung_sha256[end] or dau[end].khung_chung_sha256); NHACTAM leaves it empty with a null sha when its
+            own gate on that set failed, so an empty set with a null sha is NOT a loss of every anchor (mat_neo None);
+      nguon 'danh_sach': a bare ID list (earlier synthetic form, no PTS)."""
     if lan_lap is None:
-        return None, None, None, None
+        return None
+    d = (lan_lap.get('dau') or {}).get(end) if isinstance(lan_lap.get('dau'), dict) else None
+    if isinstance(d, dict) and d.get('khung_giao_ma_neo') is not None:
+        g = d['khung_giao_ma_neo']
+        if not isinstance(g, dict):
+            raise ValueError(f'lan_lap_v1 dau.{end}.khung_giao_ma_neo: {{id, pts_s}} expected (contract F8)')
+        ids, pts = _id_pts(g, f'dau.{end}.khung_giao_ma_neo')
+        sh = d.get('khung_giao_sha256')
+        if sh is None:
+            raise ValueError(f'lan_lap_v1 dau.{end}.khung_giao_sha256 missing (contract F8)')
+        _check_sha(ids, sh, f'dau.{end}.khung_giao_sha256')
+        mn = d.get('mat_neo')
+        if (mn is True) != (not ids):
+            raise ValueError(f'lan_lap_v1 dau.{end}: mat_neo {mn!r} with {len(ids)} intersection frames (contract F8)')
+        return dict(ids=ids, pts=pts, sha=sh, nguon='giao_ma_neo', mat_neo=not ids)
     kc = lan_lap.get('khung_chung')
     v = kc.get(end) if isinstance(kc, dict) else None
     if v is None:
-        return None, None, None, None
+        return None
     top = lan_lap.get('khung_chung_sha256')
-    d = (lan_lap.get('dau') or {}).get(end) if isinstance(lan_lap.get('dau'), dict) else None
     if isinstance(top, dict) and end in top:
         sh = top[end]
         if isinstance(d, dict) and 'khung_chung_sha256' in d and d['khung_chung_sha256'] != sh:
@@ -106,22 +132,13 @@ def neo_of(lan_lap, end='pre'):
     else:
         sh = d.get('khung_chung_sha256') if isinstance(d, dict) else None
     if isinstance(v, dict):
-        ids, pts = v.get('id'), v.get('pts_s')
-        if not isinstance(ids, list) or not isinstance(pts, list) or len(ids) != len(pts):
-            raise ValueError(f'lan_lap_v1 khung_chung.{end}: id and pts_s lists of the same length (contract F8)')
-        try:
-            ids = [int(i) for i in ids]
-            pts = [float(p) for p in pts]
-        except (TypeError, ValueError):
-            raise ValueError(f'lan_lap_v1 khung_chung.{end}: integer ids, numeric pts_s (contract F8)')
-        if not all(math.isfinite(p) for p in pts):
-            raise ValueError(f'lan_lap_v1 khung_chung.{end}: pts_s not finite')
-        _check_sha(ids, sh, end)
-        return ids, pts, sh, 'id_pts'
+        ids, pts = _id_pts(v, f'khung_chung.{end}')
+        _check_sha(ids, sh, f'khung_chung_sha256.{end}')
+        return dict(ids=ids, pts=pts, sha=sh, nguon='khung_chung', mat_neo=None if sh is None else not ids)
     if isinstance(v, list):
         ids = [int(i) for i in v]
-        _check_sha(ids, sh, end)
-        return ids, None, sh, 'danh_sach'
+        _check_sha(ids, sh, f'khung_chung_sha256.{end}')
+        return dict(ids=ids, pts=None, sha=sh, nguon='danh_sach', mat_neo=not ids)
     raise ValueError(f'lan_lap_v1 khung_chung.{end}: {type(v).__name__}, expected {{id, pts_s}} (contract F8)')
 
 
@@ -375,21 +392,23 @@ def tham_chieu(pre, chain, lan_lap, kt, t_trong, dt, extra=None):
     by = {c['frame_id']: c for c in chain}
     ma = [int(i) for i in (pre.get('khung_ma_hop_le') or [])]
     why, tap = [], 'giao'
-    neo, _, neo_sha, dang = neo_of(lan_lap, 'pre')
-    if neo is None:
+    nb = neo_of(lan_lap, 'pre')
+    if nb is None:
         # Codex CT1-3: a MISSING anchor list is not a confirmed loss of every anchor (mat_neo needs an empty list):
         # no set of J v6 2 can be formed, the reference is not concluded (G1-G5)
         ids, tap = ma, 'thieu_neo'
         why.append('thieu_lan_lap' if lan_lap is None else 'lan_lap_thieu_khung_chung_pre')
-    elif dang == 'id_pts' and neo and neo_sha is None:
-        # Codex CT2-1: NHACTAM leaves khung_chung_sha256 null when its anchor set did not pass (c7_nhac_tam: sha only
-        # when s['chung'] ok): those anchors are not confirmed, no set of J v6 2 (not a loss of every anchor either)
+    elif nb['mat_neo'] is None:
+        # Codex CT2-1, CT3-1: an empty khung_chung with a null sha is NHACTAM's own gate failing, not a loss of every
+        # anchor (that needs the intersection itself, khung_giao_ma_neo, empty): no set of J v6 2
         ids, tap = ma, 'thieu_neo'
-        why.append('khung_chung_sha256.pre null: neo chua xac nhan (NHACTAM)')
+        why.append('khung_chung.pre rong, sha null: neo chua xac nhan (NHACTAM), khong co khung_giao_ma_neo')
     else:
-        s = set(int(i) for i in neo)
+        s = set(nb['ids'])
         ids = [i for i in ma if i in s]
         if not ids:
+            # J v6 2: only an EMPTY intersection (every anchor lost) falls back to the tag-gate frames, flag mat_neo;
+            # an intersection with frames but too few is a window loss (sample gate below; Codex CT3-1)
             ids, tap = ma, 'ma_mat_neo'
             why.append('mat_neo')
     trang = 'dat'

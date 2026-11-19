@@ -779,43 +779,79 @@ def test_ct1_19_age_bound_example():
 
 
 # ---------------------------------------------------------------- Codex round 2 (CT2-*, CT1-* residual): fail on fe7f802
-FIX_LL = os.path.join(os.path.dirname(__file__), 'data', 'lan_lap_v1_nhactam_f9c4b3d.json')
+FIX_LL = os.path.join(os.path.dirname(__file__), 'data', 'lan_lap_v1_nhactam_e7b8428.json')
 
 
 def _real_ll():
-    """Run L01 of a lan_lap.json written by NHACTAM c7_nhac_tam.run_lan_lap (hil f9c4b3d; fixture data/...json) as
-    c7_chuoi_khung.doc_lan_lap gives it (file keys copied in), and the pre row of the window file NHACTAM read."""
+    """Run L01 of a lan_lap.json written by NHACTAM c7_nhac_tam.run_lan_lap (hil e7b8428; fixture data/...json) as
+    c7_chuoi_khung.doc_lan_lap gives it (file keys copied in), and the pre / post rows of the window file NHACTAM
+    read."""
     with open(FIX_LL, encoding='utf-8') as f:
         fx = json.load(f)
     ll = dict(fx['luot'])
     for k, v in fx['lan_lap_file'].items():
         ll.setdefault(k, v)
-    return ll, dict(fx['cua_so_pre'])
+    return ll, dict(fx['cua_so_pre']), dict(fx['cua_so_post'])
 
 
-def test_ct2_1_reads_khung_chung_as_nhactam_writes_it():
-    """CT2-1: khung_chung.pre = {id, pts_s} (NHACTAM output): bound to the window (ids, PTS, sha); the reference
-    uses its ids; PTS or sha changed: refused; sha null (anchors not confirmed): thieu_neo, not mat_neo."""
-    ll, pre = _real_ll()
-    neo = ll['khung_chung']['pre']['id']
-    cs.bind_lan_lap(ll, pre, ll['cua_so_v1_sha256'], 'O1-F05')
+def _chain_of(pre):
+    return [dict(frame_id=int(f['id']), t_cam=float(f['pts_s']), q_ok=True, a6_ok=True, p_x=0.5, p_y=0.1,
+                 psi_ma_p=0.3) for f in pre['khung']]
+
+
+def test_ct2_1_reads_the_sets_as_nhactam_writes_them():
+    """CT2-1, CT3-1: the anchor-tag intersection dau.pre.khung_giao_ma_neo {id, pts_s} + khung_giao_sha256 (NHACTAM
+    output) and khung_chung bound to the pre and post windows (ids, PTS, sha of the one form '1,2'); the reference uses
+    the intersection; a PTS or sha changed, on either end: refused."""
+    ll, pre, post = _real_ll()
+    cs.bind_lan_lap(ll, pre, ll['cua_so_v1_sha256'], 'O1-F05', post)
+    for end, row in (('pre', pre), ('post', post)):
+        bad = json.loads(json.dumps(ll))
+        bad['dau'][end]['khung_giao_ma_neo']['pts_s'][3] += 0.01
+        with pytest.raises(ValueError, match='pts_s'):
+            cs.bind_lan_lap(bad, pre, ll['cua_so_v1_sha256'], 'O1-F05', post)
+        bad = json.loads(json.dumps(ll))
+        bad['khung_chung'][end]['pts_s'][3] += 0.01
+        with pytest.raises(ValueError, match='pts_s'):
+            cs.bind_lan_lap(bad, pre, ll['cua_so_v1_sha256'], 'O1-F05', post)
     bad = json.loads(json.dumps(ll))
-    bad['khung_chung']['pre']['pts_s'][3] += 0.01
-    with pytest.raises(ValueError, match='pts_s'):
+    bad['dau']['pre']['khung_giao_sha256'] = '0' * 64
+    with pytest.raises(ValueError, match='ids_sha'):
         cs.bind_lan_lap(bad, pre, ll['cua_so_v1_sha256'], 'O1-F05')
-    bad = json.loads(json.dumps(ll))
-    bad['khung_chung_sha256']['pre'] = bad['dau']['pre']['khung_chung_sha256'] = '0' * 64
-    with pytest.raises(ValueError, match='is not the sha256'):
-        cs.bind_lan_lap(bad, pre, ll['cua_so_v1_sha256'], 'O1-F05')
-    chain = [dict(frame_id=int(f['id']), t_cam=float(f['pts_s']), q_ok=True, a6_ok=True, p_x=0.5, p_y=0.1,
-                  psi_ma_p=0.3) for f in pre['khung']]
+    old = json.loads(json.dumps(ll))                 # the earlier hash form '[1,2]' is no longer accepted
+    ids = old['dau']['pre']['khung_giao_ma_neo']['id']
+    import hashlib
+    old['dau']['pre']['khung_giao_sha256'] = hashlib.sha256(json.dumps(sorted(ids), separators=(',', ':'))
+                                                            .encode()).hexdigest()
+    with pytest.raises(ValueError, match='ids_sha'):
+        ctd.neo_of(old, 'pre')
     pre2 = dict(pre, t_ref=pre['khung'][-1]['pts_s'] + 0.05, ket_luan=dict(dat=True, ly_do=[]))
-    tc = ctd.tham_chieu(pre2, chain, ll, dict(ctd.KHUNG_TC_DE_XUAT, nguon='t'), 0.10, 1 / 60)
-    assert tc['tap'] == 'giao' and tc['ids'] == [i for i in pre['khung_ma_hop_le'] if i in set(neo)]
-    nul = json.loads(json.dumps(ll))
-    nul['khung_chung_sha256']['pre'] = nul['dau']['pre']['khung_chung_sha256'] = None
-    tc = ctd.tham_chieu(pre2, chain, nul, dict(ctd.KHUNG_TC_DE_XUAT, nguon='t'), 0.10, 1 / 60)
-    assert tc['tap'] == 'thieu_neo' and not tc['mat_neo'] and tc['trang_thai'] != 'dat'      # 12 frames: too few
+    tc = ctd.tham_chieu(pre2, _chain_of(pre), ll, dict(ctd.KHUNG_TC_DE_XUAT, nguon='t'), 0.10, 1 / 60)
+    giao = set(ll['dau']['pre']['khung_giao_ma_neo']['id'])
+    assert tc['tap'] == 'giao' and tc['ids'] == [i for i in pre['khung_ma_hop_le'] if i in giao]
+
+
+def test_ct3_1_intersection_with_few_frames_is_not_mat_neo():
+    """CT3-1 (Codex example): NHACTAM leaves khung_chung.pre empty with a null sha when its own set gate fails, while
+    the anchor-tag intersection has frames (mat_neo false): the reference is on that intersection (window lost for too
+    few frames), never the tag-gate frames with mat_neo; mat_neo only for an EMPTY intersection flagged so."""
+    ll, pre, _ = _real_ll()
+    pre2 = dict(pre, t_ref=pre['khung'][-1]['pts_s'] + 0.05, ket_luan=dict(dat=True, ly_do=[]))
+    kt = dict(ctd.KHUNG_TC_DE_XUAT, nguon='t')
+    few = json.loads(json.dumps(ll))
+    few['khung_chung']['pre'] = dict(id=[], pts_s=[])
+    few['khung_chung_sha256']['pre'] = few['dau']['pre']['khung_chung_sha256'] = None
+    few['dau']['pre']['khung_chung'] = dict(id=[], pts_s=[])
+    tc = ctd.tham_chieu(pre2, _chain_of(pre), few, kt, 0.10, 1 / 60)
+    assert tc['tap'] == 'giao' and not tc['mat_neo'] and tc['trang_thai'] == 'hong_cua_so_tc' and tc['n'] == 12
+    lost = json.loads(json.dumps(few))
+    lost['dau']['pre'].update(khung_giao_ma_neo=dict(id=[], pts_s=[]), khung_giao_sha256=ctd.ids_sha([]),
+                              mat_neo=True)
+    tc = ctd.tham_chieu(pre2, _chain_of(pre), lost, kt, 0.10, 1 / 60)
+    assert tc['tap'] == 'ma_mat_neo' and tc['mat_neo']
+    lost['dau']['pre']['mat_neo'] = False
+    with pytest.raises(ValueError, match='mat_neo'):
+        ctd.neo_of(lost, 'pre')
 
 
 def test_ct2_2_missing_q_keeps_t_som_at_the_still_time(tmp_path):
@@ -976,7 +1012,7 @@ def test_ct1_13_operator_cause_first(tmp_path, case):
     out, _ = cs.score(fl, log, 'O1-F05', hs, offset_s=B.OFFSET, offset_reason='t', offset_anchor_s=0.0,
                       offset_err_s=0.0, rel=rel)
     assert out['outcome'] == 'hong_he_do' and out['fail_cause'] == 'thao_tac'
-    assert out['thao_tac'] == (['sieu_am'] if case == 'blk' else ['boot'])
+    assert out['thao_tac'] == (['khoa_sieu_am'] if case == 'blk' else ['boot'])
     if case == 'window_and_boot':
         assert out['hong_cua_so_tc'] is False and any('cua so' in w for w in out['ly_do_khac'])
 
@@ -1031,3 +1067,137 @@ def test_ct1_20_g5_after_t_som_before_a_gap_is_lost(tmp_path):
     out, rows = score(tmp_path, 'O1-F05', fl, rel=rel_for('O1-F05', fl, chain, truc=False),
                       log_kw=dict(post=5.0, yaw_err=lambda t: math.radians(12.0) if t >= t_late else 0.0))
     assert not out['cat_t1'] and out['outcome'] == 'hong_he_do' and out['fail_cause'] == cs.FAIL_MEAS
+
+
+# ---------------------------------------------------------------- Codex round 3 (CT3-*, residuals): fail on 7e8b291
+def test_ct3_2_only_g5_of_f08_is_exempt(tmp_path):
+    """CT3-2: in the relative mode a caller mask beyond G5 of F08 (here G3) is refused, it cannot borrow the J sha."""
+    lane_rows = B.make_frames('O1-F08')
+    fl, chain = to_floor('O1-F08', lane_rows)
+    with pytest.raises(ValueError, match='only g5'):
+        score(tmp_path, 'O1-F08', fl, rel=rel_for('O1-F08', fl, chain), report_only={'g3', 'g5'})
+
+
+def _gio(log, fsha, final=True):
+    return dict(file='gio.json', sha256='a' * 64, nut=0, D=B.OFFSET, win_log_s=[B.T0 - 3.0, B.T0 - 1.0], step_s=0.0,
+                n_nodes=1, vao=dict(esp32=cs.cm.sha256(str(log)), frames=fsha),
+                luoi_so_bo_sha256='b' * 64 if final else None, cua_so_v1_sha256='c' * 64 if final else None)
+
+
+@pytest.mark.parametrize('final', [False, True])
+def test_ct3_3_c8_result_needs_the_final_grid_and_locked_constants(tmp_path, final):
+    """CT3-3: cham_c8 needs a FINAL grid (luoi_so_bo_sha256 and cua_so_v1_sha256) and constants locked for C8."""
+    lane_rows = B.make_frames('O1-F05')
+    fl, chain = to_floor('O1-F05', lane_rows)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    hs = B.hs_file(tmp_path)
+    log = latch_cols(B.make_log(tmp_path / 'esp32.csv', 'O1-F05', (0.0, 0.0, 0.0)))
+    out, _ = cs.score(fl, log, 'O1-F05', hs, rel=rel_for('O1-F05', fl, chain), frames_sha256='f' * 64,
+                      gio=_gio(log, 'f' * 64, final))
+    assert out['cham_c8'] is False and 'chua khoa' in out['cham_c8_ly_do']
+    assert ('khong phai file gio cuoi' in out['cham_c8_ly_do']) is (not final)
+
+
+def test_ct3_4_operator_evidence_without_an_edge(tmp_path):
+    """CT3-4: a '#gain_ack ok=0' with no run_active edge: the run is lost to the operator (loi_nap_gain), not a tool
+    error; the same from the log alone when the relative inputs cannot be built (operator_loss)."""
+    lane_rows = B.make_frames('O1-F05')
+    fl, chain = to_floor('O1-F05', lane_rows)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    log = B.make_log(tmp_path / 'esp32.csv', 'O1-F05', (0.0, 0.0, 0.0))
+    us_events(str(log) + '.events.txt', 0, 10,
+              extra='2026-11-19T10:00:40 #gain_ack,tx=1,req_id=1,ok=0,err=crc,sha=x,env=e,mac=m,boot=00000001\n')
+
+    def no_edge(rows, i):
+        for r in rows:
+            r['run_active'] = '0'
+    latch_cols(log, no_edge)
+    out, _ = cs.score(fl, log, 'O1-F05', B.hs_file(tmp_path), offset_s=B.OFFSET, offset_reason='t',
+                      offset_anchor_s=0.0, offset_err_s=0.0, rel=rel_for('O1-F05', fl, chain))
+    assert out['fail_cause'] == 'thao_tac' and out['thao_tac'] == ['loi_nap_gain']
+    op = cs.operator_loss(str(log), None, 'O1-F05', 'x')
+    assert op['fail_cause'] == 'thao_tac' and 'loi_nap_gain' in op['thao_tac']
+
+
+@pytest.mark.parametrize('case', ['past_motor_off', 'ticks'])
+def test_ct3_5_ultrasonic_summary_tied_to_the_run(case):
+    """CT3-5 (Codex examples): first_seq 10, edge 11, motor off at 12, '#us_end' last_data_seq 20: not this run's
+    summary (khoa_sieu_am, no T9 bound from it); first_seq 10, last 20, ticks 1: contradicting (khoa_sieu_am)."""
+    mo = (lambda q: q != 12) if case == 'past_motor_off' else (lambda q: True)
+    rows = [dict(_seq=q, _mo=mo(q)) for q in range(10, 21)]
+    ticks = 1 if case == 'ticks' else 11
+    ev = ['#us,ev=start,boot=00000001,on=0,swb=0,first_seq=10,line_drop=0',
+          f'#us_end,boot=00000001,on=0,swb=0,changes=0,blk_ticks=0,cut_ticks=0,ticks={ticks},last_data_seq=20,'
+          'line_drop=0']
+    kinds, why = cs.thao_tac_of(rows, ev, 1)
+    assert kinds == ['khoa_sieu_am']
+    assert not cs.run_us(rows, ev, 1)['ok']
+
+
+def test_ct3_7_absolute_no_frame_before_the_events(tmp_path):
+    """CT3-7: absolute mode, no valid frame and an events file with undecodable bytes: hong_he_do (921e839 order)."""
+    lane_rows = [dict(r, valid=False) for r in B.make_frames('O1-F05')]
+    hs = B.hs_file(tmp_path)
+    log = B.make_log(tmp_path / 'esp32.csv', 'O1-F05', (0.0, 0.0, 0.0))
+    with open(str(log) + '.events.txt', 'wb') as f:
+        f.write(b'\xff\xfe\x00#us bad\n')
+    out, _ = cs.score(lane_rows, log, 'O1-F05', hs, offset_s=B.OFFSET, offset_reason='t', offset_anchor_s=0.0,
+                      offset_err_s=0.0)
+    assert out['outcome'] == 'hong_he_do' and out['fail_cause'] == cs.FAIL_MEAS
+
+
+def test_ct3_8_align_set_named_on_early_exit(tmp_path):
+    """CT3-8: align_ref given, no IMU sample: not compared, the source is still tham_chieu_ids."""
+    hs = B.hs_file(tmp_path)
+    log = B.make_log(tmp_path / 'esp32.csv', 'O1-K1', (0.0, 0.0, 0.0), no_imu=True)
+    t = np.array([B.T0 - 1.0, B.T0 - 0.5])
+    _, rep = cs.yaw_bounds(t, np.zeros(2), np.zeros(2), np.zeros(2), B.T0, hs, 'O1-K1', log, B.T0 + 7.0,
+                           align_ref=(t, np.zeros(2)))
+    assert not rep['compared'] and rep['align_set'] == 'tham_chieu_ids'
+
+
+def test_ct2_4_long_a6_loss_with_video_is_not_a_tracking_error(tmp_path):
+    """CT2-4 residual (Codex example): K1, A6 undefined 4.0-5.0 s, video continuous: undefined frames, no tracking
+    error at the reconnect, the run not lost."""
+    lane_rows = B.make_frames('O1-K1')
+    fl, chain = to_floor('O1-K1', lane_rows)
+    rel = rel_for('O1-K1', fl, chain)
+    for c, f in zip(chain, fl):
+        if 4.0 <= f['t_s'] + B.OFFSET - B.T0 < 5.0:
+            c.update(a6_ok=False, psi_ma_p=float('nan'), p_x=float('nan'), p_y=float('nan'))
+    out, _ = score(tmp_path, 'O1-K1', fl, rel=rel, allow_final_set=True)
+    assert out['outcome'] != 'hong_he_do' and out['t1_kind'] not in ('loi_theo_doi', 'khoang_trong')
+
+
+def test_ct1_3_window_gates_bound_at_scoring():
+    """CT1-3 residual: a window gated with scale_rel 0.035 is refused when the scoring gates (track.json) say 0.011."""
+    g = dict(cs.cm.DEFAULT_GATES, scale_rel=0.035)
+    pre = dict(cong_khung=g)
+    hs = dict(trang_thai='de_xuat')
+    cs.bind_gates(pre, hs, dict(frames_sha256='f' * 64, gates=g), 'f' * 64)
+    with pytest.raises(ValueError, match='cong_khung'):
+        cs.bind_gates(pre, hs, dict(frames_sha256='f' * 64, gates=dict(g, scale_rel=0.011)), 'f' * 64)
+
+
+def test_ct1_14_track_gates_need_the_frames_sha():
+    """CT1-14 residual: track.json gates without frames_sha256 are not used, also before C8; defaults named mac_dinh."""
+    hs = dict(trang_thai='de_xuat')
+    with pytest.raises(ValueError, match='frames_sha256'):
+        cs.window_gates(hs, dict(gates=dict(cs.cm.DEFAULT_GATES)), 'f' * 64)
+    assert cs.window_gates(hs, None, 'f' * 64)[1] == 'mac_dinh'
+
+
+def test_ct1_20_t_som_wz_uses_the_stencil(tmp_path, monkeypatch):
+    """CT1-20 residual: the t_som case takes the usability of wz from the yaw flags over the derivative stencil
+    (ctd.wz_usable with the half width of c7_measure.sg_derivative), not from the central frame alone."""
+    seen = []
+    real = ctd.wz_usable
+
+    def spy(yaw_ok, half):
+        seen.append((len(yaw_ok), half))
+        return real(yaw_ok, half)
+    monkeypatch.setattr(ctd, 'wz_usable', spy)
+    lane_rows = B.make_frames('O1-F05')
+    fl, chain = to_floor('O1-F05', lane_rows)
+    score(tmp_path, 'O1-F05', fl, rel=rel_for('O1-F05', fl, chain, truc=False))
+    assert seen and all(h == cs.cm.SG_HALF and n > 100 for n, h in seen)
