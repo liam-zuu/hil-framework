@@ -86,6 +86,7 @@ KE_HOACH_FORMAT = 'ke_hoach_c8_v1'
 GIO_FORMAT = 'c8b_gio_v1'
 TIEN_DE_FORMAT = 'tien_de_buoi_v1'
 MANIFEST_FORMAT = 'u_moc_manifest_v1'
+LUOI_STATES = ('cham', 'chua_ket_luan_khong_nut', 'hong_he_do')     # c8b_luoi trang_thai_luot (F11, CODE_C8B)
 MOC_KEYS = ('U_moc_dong_xy_m', 'U_moc_tham_xy_m', 'U_moc_dong_psi_rad', 'U_moc_tham_psi_rad')
 
 TOP_KEYS = ('format', 'levels', 'muc_kha_thi', 'muc_bo_theo_liam', 'quyet_liam', 'u_t_branch', 'lich_doi_chieu',
@@ -489,7 +490,8 @@ def level_block(level: str, a_m: float, u_p: dict, u_psi: dict, runs: list, quye
 # ── chains, runs, evidence (design sections 6, 7) ──────────────────────────────────────────────────────────────
 
 def _chain_entry(x, w: str) -> dict:
-    _obj(x, ('run_id', 'ket_qua', 'loai_hong', 'kiem_gio_d1', 'dem_truot_kiem_gio', 'file_cham', 'file_gio'), w)
+    _obj(x, ('run_id', 'ket_qua', 'loai_hong', 'kiem_gio_d1', 'dem_truot_kiem_gio', 'file_cham', 'file_gio',
+             'file_chung_cu'), w)
     _text(x['run_id'], f'{w}.run_id')
     if x['ket_qua'] not in OUTCOMES:
         raise GateFileError(f'{w}.ket_qua {x["ket_qua"]!r}: one of {OUTCOMES}')
@@ -510,6 +512,8 @@ def _chain_entry(x, w: str) -> dict:
         raise GateFileError(f'{w}: a time check slip not counted (dem_truot_kiem_gio false) on a run not lost by '
                             'operation (M2 exempts only runs lost by operation without independent evidence)')
     _ref(x['file_cham'], f'{w}.file_cham')
+    if x['file_chung_cu'] is not None:
+        _ref(x['file_chung_cu'], f'{w}.file_chung_cu')
     if x['file_gio'] is None:
         if x['kiem_gio_d1'] != 'khong_kiem' or x['ket_qua'] != 'hong':
             raise GateFileError(f'{w}.file_gio null only for a lost run whose time check did not run (khong_kiem)')
@@ -641,8 +645,12 @@ def _check_runs(d: dict, cells: list) -> Dict[str, list]:
         if set(got) != set(exp):
             raise GateFileError(f'{w}: runs {sorted(got)} but the eligible runs of the cells (last run of each co_luot '
                                 f'cell) are {sorted(exp)}: no run left out, none added (RT2-3)')
+        last = {x['run_id']: x for _, x in want[lv]}
         for rid, r in got.items():
             c = exp[rid]
+            if last[rid]['file_gio'] is None or last[rid]['file_chung_cu'] is None:
+                raise GateFileError(f'{w} {rid}: an eligible run carries its time file (h_s) and its evidence file '
+                                    '(chung_cu_c8, c8b_edo chung-cu; F17)')
             if r['controller'] != c['controller'] or r['o'] != c['o']:
                 raise GateFileError(f'{w} {rid}: controller / cell {r["controller"]!r} / {r["o"]!r}, the cell says '
                                     f'{c["controller"]!r} / {c["o"]!r}')
@@ -933,17 +941,34 @@ def check_nguon(d: dict, goc: str) -> dict:
     have = [(c['o'], c['muc'], c['controller']) for c in d['o_c8']]
     if sorted(plan) != sorted(have) or len(set(plan)) != len(plan):
         raise GateFileError(f'o_c8 cells {sorted(have)}: the plan locked before C8 has {sorted(plan)} (each once)')
-    cham_sha, cham_of = {}, {}
+    cham_sha, cham_of, chung_of = {}, {}, {}
     for c in d['o_c8']:
         for x in c['chuoi']:
             w = f'cell {c["o"]} run {x["run_id"]}'
+            # F17 (CODE 19/11; CODE_C8B 47726c1): the scoring file is the c8b_luoi output luoi.json (outcome,
+            # trang_thai_luot, gio_sha256 of its time file, u_max_s); it carries no run id, so it is tied to the run
+            # through its time file (one time file per run)
             fc = _open_ref(goc, x['file_cham'], f'{w}: file_cham')
-            if fc.get('run_id') != x['run_id'] or fc.get('ket_qua') != x['ket_qua'] \
-                    or fc.get('loai_hong', []) != x['loai_hong']:
-                raise GateFileError(f'{w}: the scoring file says run_id {fc.get("run_id")!r}, ket_qua '
-                                    f'{fc.get("ket_qua")!r}, loai_hong {fc.get("loai_hong", [])!r}; the gate differs')
+            if fc.get('trang_thai_luot') not in LUOI_STATES:
+                raise GateFileError(f'{w}: file_cham is not a c8b_luoi output (trang_thai_luot one of {LUOI_STATES})')
+            if x['ket_qua'] != 'hong' and (fc.get('outcome') != x['ket_qua'] or fc['trang_thai_luot'] == 'hong_he_do'):
+                raise GateFileError(f'{w}: ket_qua {x["ket_qua"]!r}, the scoring file says outcome '
+                                    f'{fc.get("outcome")!r} ({fc["trang_thai_luot"]})')
+            if fc['trang_thai_luot'] == 'hong_he_do' and x['ket_qua'] != 'hong':
+                raise GateFileError(f'{w}: the scoring file lost every node (hong_he_do), the gate says {x["ket_qua"]!r}')
+            if x['file_gio'] is not None and fc.get('gio_sha256') != x['file_gio']['sha256']:
+                raise GateFileError(f'{w}: the scoring file was made from another time file (gio_sha256)')
+            if x['file_gio'] is None and fc.get('gio_sha256') is not None:
+                raise GateFileError(f'{w}: file_gio null but the scoring file names a time file')
             cham_sha[x['file_cham']['sha256']] = fc
             cham_of[x['run_id']] = fc
+            if x['file_chung_cu'] is not None:
+                cc = _open_ref(goc, x['file_chung_cu'], f'{w}: file_chung_cu')
+                src = {s.get('sha256') for s in cc.get('nguon') or [] if isinstance(s, dict)}
+                if not isinstance(cc.get('chung_cu_c8'), dict) or x['file_cham']['sha256'] not in src:
+                    raise GateFileError(f'{w}: file_chung_cu is a c8b_edo chung-cu output (chung_cu_c8) made from this '
+                                        'scoring file (its sha256 in nguon; F17)')
+                chung_of[x['run_id']] = cc['chung_cu_c8']
             if x['file_gio'] is None:
                 continue
             fg = _open_ref(goc, x['file_gio'], f'{w}: file_gio')
@@ -958,15 +983,11 @@ def check_nguon(d: dict, goc: str) -> dict:
                                     f'{fg.get("dem_truot_kiem_gio")!r} (F11, M2; CODE_C8B design v7 7a)')
             if c['chuoi'][-1] is x and c['trang_thai'] == 'co_luot':
                 r = next(r for r in d['runs_c8'][c['muc']] if r['run_id'] == x['run_id'])
-                if not _close(fg.get('h_s'), r['h_s']) or not _close(fg.get('u_max_s'), r['u_max_s']):
-                    raise GateFileError(f'{w}: h_s / u_max_s {r["h_s"]!r} / {r["u_max_s"]!r}, the time file says '
-                                        f'{fg.get("h_s")!r} / {fg.get("u_max_s")!r}')
-                if fc.get('chung_cu_c8') != r['chung_cu']:
-                    raise GateFileError(f'{w}: chung_cu differs from chung_cu_c8 of the scoring file')
-    for lv, rs in d['runs_c8'].items():
-        for r in rs:
-            if r['run_id'] in cham_of and cham_of[r['run_id']].get('chung_cu_c8') != r['chung_cu']:
-                raise GateFileError(f'runs_c8.{lv} {r["run_id"]}: chung_cu differs from the scoring file')
+                if not _close(fg.get('h_s'), r['h_s']) or not _close(fc.get('u_max_s'), r['u_max_s']):
+                    raise GateFileError(f'{w}: h_s / u_max_s {r["h_s"]!r} / {r["u_max_s"]!r}, the time file says h_s '
+                                        f'{fg.get("h_s")!r}, the scoring file u_max_s {fc.get("u_max_s")!r} (F17)')
+                if chung_of.get(x['run_id']) != r['chung_cu']:
+                    raise GateFileError(f'{w}: chung_cu differs from chung_cu_c8 of its evidence file (F17)')
     # U standard (design section 8)
     cu = d['chuan_u']
     hs = _open_ref(goc, cu['ho_so_c8'], 'chuan_u.ho_so_c8')
@@ -982,7 +1003,10 @@ def check_nguon(d: dict, goc: str) -> dict:
     if not isinstance(gn, list) or not gn or any(g not in cham_of for g in gn):
         raise GateFileError('chuan_u.ho_so_c8: giu_ngoai, the held-out runs, a non-empty list of C8 run ids')
     t_lock = _iso_time(hs.get('khoa_kiem_luc'), 'chuan_u.ho_so_c8.khoa_kiem_luc')
-    first = min(_iso_time(cham_of[g].get('cham_luc'), f'held-out run {g}: cham_luc') for g in gn)
+    cl = hs.get('cham_luc')                       # F17: GATE assembles the scoring times of the held-out runs
+    if not isinstance(cl, dict) or set(cl) != set(gn):
+        raise GateFileError('chuan_u.ho_so_c8: cham_luc {run id: ISO time of its first scoring} for exactly giu_ngoai')
+    first = min(_iso_time(cl[g], f'held-out run {g}: cham_luc') for g in gn)
     if not t_lock < first:
         raise GateFileError(f'chuan_u: the check was locked at {t_lock.isoformat()}, not before the first scoring of a '
                             f'held-out run ({first.isoformat()}; J v6 section 6 condition (1))')
@@ -1201,8 +1225,8 @@ def fake_gate(levels=('O1-F05',), u_p_m=0.002, u_psi_deg=2.0, u_t_s=0.010) -> di
             rid = f'FAKE_{name}_{ctrl}'
             cells.append(dict(o=f'{name}_{ctrl}', muc=name, controller=ctrl, trang_thai='co_luot',
                               chuoi=[dict(run_id=rid, ket_qua='dat', loai_hong=[], kiem_gio_d1='dat',
-                                          dem_truot_kiem_gio=False, file_cham=ref(f'{rid}_cham.json'),
-                                          file_gio=ref(f'{rid}_gio.json'))]))
+                                          dem_truot_kiem_gio=False, file_cham=ref(f'{rid}_luoi.json'),
+                                          file_gio=ref(f'{rid}_gio.json'), file_chung_cu=ref(f'{rid}_chung_cu.json'))]))
             runs[name].append(dict(run_id=rid, controller=ctrl, o=f'{name}_{ctrl}', h_s=u / 2.0, u_max_s=u / 2.0,
                                    u_t_s=u / 2.0 + u / 2.0, chung_cu=json.loads(json.dumps(ev))))
         t = fake_terms(u_p_m, u_psi_deg)
@@ -1229,3 +1253,47 @@ def fake_gate(levels=('O1-F05',), u_p_m=0.002, u_psi_deg=2.0, u_t_s=0.010) -> di
                                       g4={c: [f'FAKE_{k}_{c}'] for c in CONTROLLERS}) for k in lv},
                 dieu_2b=dict(thresholds={c: o1_gate.THRESHOLDS[c] for c in MASKABLE}, per_level=per),
                 camera=cam)
+
+
+# ── ke_hoach_c8_v1 (F17: GATE writes it; CODE 19/11) ───────────────────────────────────────────────────────────
+
+KE_HOACH_NGUON = ('CLAUDE_THESIS 03_CODE/docs/2026-11-18_Huong_dan_tung_buoc_C8_Liam.md, phan F (PID: C8-P-F02-1, '
+                  'C8-P-F05-1, C8-P-F08-1, C8-P-F02-2, C8-P-F05-2, C8-P-F08-2) and phan G (LADRC: C8-L-...), the run '
+                  'list locked before the session (buoi 2, ban 6)')
+KE_HOACH_CTRL = (('P', 'PID'), ('L', 'LADRC'))
+KE_HOACH_REPS = (1, 2)
+
+
+def ke_hoach_c8(levels=('O1-F02', 'O1-F05', 'O1-F08')) -> dict:
+    """The plan of the C8 cells (format ke_hoach_c8_v1): one cell per locked figure-8 run of the session guide (run
+    id C8-<P|L>-<F02|F05|F08>-<1|2>, a rerun keeps its cell); the K1, K2 runs are not cells of rule 2b (G1-G5 of the
+    K tasks always decide)."""
+    o = []
+    for ch, ctrl in KE_HOACH_CTRL:
+        for rep in KE_HOACH_REPS:
+            for lv in levels:
+                if lv not in FIG8:
+                    raise GateFileError(f'{lv}: not a figure-8 task')
+                o.append(dict(o=f'C8-{ch}-{lv.split("-")[1]}-{rep}', muc=lv, controller=ctrl))
+    return dict(format=KE_HOACH_FORMAT, nguon=KE_HOACH_NGUON, o=o)
+
+
+def main(argv=None) -> int:
+    import argparse
+    ap = argparse.ArgumentParser(description='gate_c8: write the C8 plan file ke_hoach_c8_v1 (F17)')
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    kh = sub.add_parser('ke-hoach', help='the plan of the C8 cells from the locked run list of the session guide')
+    kh.add_argument('--out', required=True, help='new file (never replaced), under the C8 folder')
+    a = ap.parse_args(argv)
+    try:
+        with open(a.out, 'x', encoding='utf-8', newline='\n') as f:
+            f.write(json.dumps(ke_hoach_c8(), indent=1, ensure_ascii=False) + '\n')
+    except (OSError, GateFileError) as exc:
+        print(f'gate_c8: {exc}', file=sys.stderr)
+        return 1
+    print('ke_hoach', a.out, sha256_file(a.out))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

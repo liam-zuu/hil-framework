@@ -602,14 +602,18 @@ def read_luoi_khong_nut(path: str) -> bool:
     if not isinstance(d, dict) or 'trang_thai_luot' not in d:
         return False
     st, n = d['trang_thai_luot'], d.get('n_nut_cham')
-    if st not in ('cham', KHONG_NUT) or isinstance(n, bool) or not isinstance(n, int) or n < 0:
-        raise LogError(f'--gate-json {path!r}: trang_thai_luot {st!r} (cham or {KHONG_NUT}) with n_nut_cham a whole '
-                       f'number, got {n!r} (F11)')
+    if st not in ('cham', KHONG_NUT, 'hong_he_do') or isinstance(n, bool) or not isinstance(n, int) or n < 0:
+        raise LogError(f'--gate-json {path!r}: trang_thai_luot {st!r} (cham, {KHONG_NUT} or hong_he_do) with '
+                       f'n_nut_cham a whole number, got {n!r} (F11)')
     if not _hex64(d.get('gio_sha256')):
         raise LogError(f'--gate-json {path!r}: a c8b_luoi file carries the gio_sha256 of the run time file (F11)')
     if st == 'cham':
         if n < 1 or not isinstance(d.get('gate_v3'), dict):
             raise LogError(f'--gate-json {path!r}: trang_thai_luot cham needs n_nut_cham >= 1 and its gate_v3 (F11)')
+        return False
+    if st == 'hong_he_do':                 # every node lost: a run lost to the measurement (rerun), gate_v3 null
+        if n != 0 or d.get('gate_v3') is not None:
+            raise LogError(f'--gate-json {path!r}: hong_he_do needs n_nut_cham 0 and gate_v3 null (F11)')
         return False
     if n != 0 or d.get('gate_v3') is not None:
         raise LogError(f'--gate-json {path!r}: {KHONG_NUT} needs n_nut_cham 0 and gate_v3 null (F11)')

@@ -478,6 +478,9 @@ def test_f11_no_scored_node_closes_the_run_chua_ket_luan(ds):
         with pytest.raises(rl.LogError, match='F11'):
             rl.read_luoi_khong_nut(_luoi(tmp, 'bad', **bad))
     assert rl.read_luoi_khong_nut(_luoi(tmp, 'ch', st='cham', n=2, gate={'version': 'gate_v3.3'})) is False
+    assert rl.read_luoi_khong_nut(_luoi(tmp, 'lost', st='hong_he_do')) is False     # every node lost (CODE_C8B 9890e41)
+    with pytest.raises(rl.LogError, match='hong_he_do needs'):
+        rl.read_luoi_khong_nut(_luoi(tmp, 'lost2', st='hong_he_do', n=1))
 
 
 def test_c8b_check_only_on_the_floor_lost(ds):

@@ -224,7 +224,7 @@ def _e(rid, kq='dat', lh=(), d1='dat', dl=None, gio=True):
     if dl is None:                       # the C8b rule (design v7 7a): a slip counts unless lost by a boot
         dl = d1 == 'truot' and 'thao_tac' not in lh
     return dict(run_id=rid, ket_qua=kq, loai_hong=list(lh), kiem_gio_d1=d1, dem_truot_kiem_gio=dl, file_cham=ref,
-                file_gio=ref if gio else None)
+                file_gio=ref if gio else None, file_chung_cu=None if kq == 'hong' else ref)
 
 
 def _slip(rid, op=False, dl=None):
@@ -477,14 +477,15 @@ def build_c8(tmp_path, levels=LEVELS, u_t=0.014):
     cells, runs, mans = [], {lv: [] for lv in levels}, []
     for x in plan:
         rid = 'R_' + x['o']
-        fc = _jw(goc, f'luot/{rid}/cham.json', dict(run_id=rid, ket_qua='dat', chung_cu_c8=ev, mien_phai_phu=mien,
-                                                    cham_luc='2026-11-21T10:00:00+07:00'))
         fg = _jw(goc, f'luot/{rid}/gio.json', dict(format=GC.GIO_FORMAT, kiem_gio_d1=dict(trang_thai='dat'),
-                                                   dem_truot_kiem_gio=False,
-                                                   h_s=u_t / 2, u_max_s=u_t / 2))
+                                                   dem_truot_kiem_gio=False, h_s=u_t / 2))
+        fc = _jw(goc, f'luot/{rid}/luoi.json', dict(trang_thai_luot='cham', outcome='dat', gio_sha256=fg['sha256'],
+                                                    u_max_s=u_t / 2, mien_phai_phu=mien))
+        cc = _jw(goc, f'luot/{rid}/chung_cu.json', dict(chung_cu_c8=ev, nguon=[dict(file='luoi.json',
+                                                                                    sha256=fc['sha256'])]))
         cells.append(dict(o=x['o'], muc=x['muc'], controller=x['controller'], trang_thai='co_luot',
                           chuoi=[dict(run_id=rid, ket_qua='dat', loai_hong=[], kiem_gio_d1='dat',
-                                      dem_truot_kiem_gio=False, file_cham=fc, file_gio=fg)]))
+                                      dem_truot_kiem_gio=False, file_cham=fc, file_gio=fg, file_chung_cu=cc)]))
         runs[x['muc']].append(dict(run_id=rid, controller=x['controller'], o=x['o'], h_s=u_t / 2, u_max_s=u_t / 2,
                                    u_t_s=u_t / 2 + u_t / 2, chung_cu=copy.deepcopy(ev)))
         mans.append(_jw(goc, f'luot/{rid}/u_moc_manifest.json',
@@ -495,6 +496,7 @@ def build_c8(tmp_path, levels=LEVELS, u_t=0.014):
     hs = _jw(goc, 'chuan_u/ho_so_c8.json', dict(bang_chung={k: v['sha256'] for k, v in bc.items()},
                                                 ke_hoach_c8_sha256=kh['sha256'],
                                                 giu_ngoai=[runs[levels[0]][0]['run_id']],
+                                                cham_luc={runs[levels[0]][0]['run_id']: '2026-11-21T10:00:00+07:00'},
                                                 khoa_kiem_luc='2026-11-21T09:00:00+07:00'))
     clips = [_jw(goc, f'clip_h/H{i}.json', dict(FAKE=i)) for i in range(4)]
     td = _jw(goc, 'tien_de_c8.json', dict(format=GC.TIEN_DE_FORMAT, ket_qua='dat',
@@ -529,7 +531,8 @@ def test_write_gate_without_folder_only_for_fake(tmp_path):
     GC.write_gate(str(tmp_path / 'f.json'), _good())
 
 
-@pytest.mark.parametrize('target', ['ke_hoach_c8.json', 'luot/R_O1-F05_PID/cham.json', 'luot/R_O1-F05_PID/gio.json',
+@pytest.mark.parametrize('target', ['ke_hoach_c8.json', 'luot/R_O1-F05_PID/luoi.json', 'luot/R_O1-F05_PID/gio.json',
+                                    'luot/R_O1-F05_PID/chung_cu.json',
                                     'chuan_u/kiem_vi_tri_rieng.json', 'clip_h/H2.json', 'tien_de_c8.json',
                                     'luot/R_O1-F08_LADRC/u_moc_manifest.json'])
 def test_rt2_2_a_changed_byte_is_refused_and_not_written(tmp_path, target):
@@ -553,24 +556,77 @@ def _rewrite(goc, ref, edit):
     ref['sha256'] = GC.sha256_file(p)
 
 
+def _relink(goc, x):
+    """After a time or scoring file was rewritten: tie luoi.json to the time file and chung_cu.json to luoi.json."""
+    _rewrite(goc, x['file_cham'], lambda y: y.update(gio_sha256=x['file_gio']['sha256']))
+    _rewrite(goc, x['file_chung_cu'], lambda y: y.update(nguon=[dict(file='luoi.json', sha256=x['file_cham']['sha256'])]))
+
+
 def test_check_nguon_compares_contents(tmp_path):
     d, goc = build_c8(tmp_path / 'a')
     _rewrite(goc, d['o_c8'][2]['chuoi'][0]['file_gio'], lambda x: x['kiem_gio_d1'].update(trang_thai='khong_kiem'))
+    _relink(goc, d['o_c8'][2]['chuoi'][0])
     with pytest.raises(GC.GateFileError, match='kiem_gio_d1'):
         GC.check_nguon(d, goc)
     d, goc = build_c8(tmp_path / 'm2')
     _rewrite(goc, d['o_c8'][2]['chuoi'][0]['file_gio'], lambda x: x.pop('dem_truot_kiem_gio'))
+    _relink(goc, d['o_c8'][2]['chuoi'][0])
     with pytest.raises(GC.GateFileError, match='dem_truot_kiem_gio'):
         GC.check_nguon(d, goc)
     d, goc = build_c8(tmp_path / 'b')
     _rewrite(goc, d['o_c8'][2]['chuoi'][0]['file_gio'], lambda x: x.update(h_s=1.0))
+    _relink(goc, d['o_c8'][2]['chuoi'][0])
     with pytest.raises(GC.GateFileError, match='h_s'):
         GC.check_nguon(d, goc)
     d, goc = build_c8(tmp_path / 'c')
-    _rewrite(goc, d['o_c8'][2]['chuoi'][0]['file_cham'],
+    _rewrite(goc, d['o_c8'][2]['chuoi'][0]['file_chung_cu'],
              lambda x: x['chung_cu_c8']['bo_so'][0].update(g4_can_huu_han_mien_hop_moi_nut=False))
     with pytest.raises(GC.GateFileError, match='chung_cu'):
         GC.check_nguon(d, goc)
+
+
+def test_check_nguon_f17_scoring_file_ties(tmp_path):
+    """F17: luoi.json (outcome, gio_sha256, u_max_s) tied to the run's time file; chung_cu.json made from it."""
+    cell = lambda d: d['o_c8'][2]['chuoi'][0]                          # noqa: E731
+    d, goc = build_c8(tmp_path / 'a')
+    _rewrite(goc, cell(d)['file_cham'], lambda x: x.update(u_max_s=1.0))
+    _relink(goc, cell(d))
+    with pytest.raises(GC.GateFileError, match='u_max_s'):
+        GC.check_nguon(d, goc)
+    d, goc = build_c8(tmp_path / 'b')
+    _rewrite(goc, cell(d)['file_cham'], lambda x: x.update(gio_sha256='0' * 64))
+    with pytest.raises(GC.GateFileError, match='another time file'):
+        GC.check_nguon(d, goc)
+    d, goc = build_c8(tmp_path / 'c')
+    _rewrite(goc, cell(d)['file_cham'], lambda x: x.update(outcome='khong_dat'))
+    _relink(goc, cell(d))
+    with pytest.raises(GC.GateFileError, match='outcome'):
+        GC.check_nguon(d, goc)
+    d, goc = build_c8(tmp_path / 'd')
+    _rewrite(goc, cell(d)['file_chung_cu'], lambda x: x.update(nguon=[]))
+    with pytest.raises(GC.GateFileError, match='made from this'):
+        GC.check_nguon(d, goc)
+    d, goc = build_c8(tmp_path / 'e')
+    _rewrite(goc, cell(d)['file_cham'], lambda x: x.update(trang_thai_luot='x'))
+    with pytest.raises(GC.GateFileError, match='c8b_luoi output'):
+        GC.check_nguon(d, goc)
+
+
+def test_eligible_run_needs_its_evidence_file():
+    d = _good()
+    d['o_c8'][0]['chuoi'][-1]['file_chung_cu'] = None
+    with pytest.raises(GC.GateFileError, match='evidence file'):
+        GC.check(d)
+
+
+def test_ke_hoach_c8_from_the_locked_run_list(tmp_path):
+    kh = GC.ke_hoach_c8()
+    assert kh['format'] == GC.KE_HOACH_FORMAT and len(kh['o']) == 12
+    assert kh['o'][0] == dict(o='C8-P-F02-1', muc='O1-F02', controller='PID')
+    assert {(x['muc'], x['controller']) for x in kh['o']} == {(lv, c) for lv in LEVELS for c in GC.CONTROLLERS}
+    p = str(tmp_path / 'kh.json')
+    assert GC.main(['ke-hoach', '--out', p]) == 0 and json.load(open(p, encoding='utf-8')) == kh
+    assert GC.main(['ke-hoach', '--out', p]) == 1                       # never replaced
 
 
 def test_check_nguon_plan_and_premise(tmp_path):
@@ -596,6 +652,10 @@ def test_check_nguon_u_standard(tmp_path):
     d, goc = build_c8(tmp_path / 'b')
     _rewrite(goc, d['chuan_u']['ho_so_c8'], lambda x: x.update(khoa_kiem_luc='2026-11-21T11:00:00+07:00'))
     with pytest.raises(GC.GateFileError, match='not before the first scoring'):
+        GC.check_nguon(d, goc)
+    d, goc = build_c8(tmp_path / 'c')
+    _rewrite(goc, d['chuan_u']['ho_so_c8'], lambda x: x.update(cham_luc={}))
+    with pytest.raises(GC.GateFileError, match='cham_luc'):
         GC.check_nguon(d, goc)
 
 
