@@ -18,8 +18,10 @@ the 4-corner distortion; the camera-IMU agreement is a check only).
   do    one place (goc | K1): g_E, SE_E (block jackknife over time), U_meo_E (the map residual held - full of KIEMCHEO
         F15 (a) c7_meo_ma_ao_E_v1 at the four corners of every frame used, refitted per H32 case; max change of each
         component), s_E = 2 SE_E + U_meo_E, identifiability (a change of g above |g_E| -> not identified). Frames: the
-        moving E frames (F15 mien_E: after E_dau, before E_cuoi) whose shutter effect on g is below SHUTTER_SHARE of SE_E
-        (design 2b; |alpha| <= ALPHA_MAX_S_PX, the largest seen at 3b).
+        moving E frames (F15 mien_E: after E_dau, before E_cuoi) with |omega| <= OMEGA_MAX_RAD_S; the rolling-shutter
+        displacement alpha_r (row - mean row) v + alpha_c (col - mean col) v fitted as a nuisance with g (L133, Liam via
+        CODE 20/11, "Khop alpha (Recommended)"; replaces the rule 'shutter effect on g below 10 % of SE_E' of design 2b).
+        SE_E with and without alpha and the largest alpha-g correlation are reported.
   gop   the A6 file c8b_a6_v2 from the places: compare g_cal (4 caliper heights of the first mounting, design 2c),
         eps_g = max(|s_E|, |g_E - g_cal| + U_cal) + U_chuyen (lap + cho + dong, each once; vector norms, design 2c),
         e_bc (exact lift against the model over the domain, grid refined until the maximum changes < 10 %),
@@ -79,8 +81,8 @@ E_CAL_M = 0.0001                                           # caliper error per c
 RHO_MAX_M = 1.6                                            # [DE XUAT] design 2a
 NGHIENG_MAX_RAD = math.radians(1.5)                        # [DE XUAT]
 V_MAX_M = 0.001                                            # [DE XUAT] design 3 (twice the first plate's 0.475 mm)
-ALPHA_MAX_S_PX = 4.53e-6                                   # largest |alpha| seen at 3b (design 2b, V5-03)
-SHUTTER_SHARE = 0.10                                       # design 2b: shutter effect on g below 10 % of SE_E
+OMEGA_MAX_RAD_S = 1.0                                      # [DE XUAT] L133 (1): frames used for the fit with alpha
+                                                           # (simulation: 0.3 rad/s g off by about 0.4 SE, 1.0 by 1.1 SE)
 N_MIN = 200                                                # [DE XUAT] frames used at least
 N_BLOCK = 10                                               # [DE XUAT] jackknife blocks in time
 EBC_TOL = 0.10                                             # design 2a: refine until the maximum changes < 10 %
@@ -142,10 +144,12 @@ def dpsi_model(g, t_xy, psi, C, H, hbar):
 
 # ── fit of g on the E frames ─────────────────────────────────────────────────────────────────────
 
-def fit_g(P, C, H, hbar, side, iters=20):
+def fit_g(P, C, H, hbar, side, iters=20, fields=()):
     """g (2), sigma, per-frame (T, psi) and the corner residual RMS [m] from lifted corners P (n, 4, 2): Gauss-Newton on
-    P_i = T + R(psi)(1 + sigma) r_i + (g.r_i) d_i, d_i = (P_i - C)/(H - hbar) (exact for the lift, given P), the per-frame
-    pose eliminated in each step (Schur complement)."""
+    P_i = T + R(psi)(1 + sigma) r_i + (g.r_i + v s_i) d_i + sum_k alpha_k F_k,i, d_i = (P_i - C)/(H - hbar) (exact for
+    the lift, given P), the per-frame pose eliminated in each step (Schur complement). v, sigma and alpha_k (fields F_k
+    (n, 4, 2): the rolling-shutter displacement per unit alpha, L133) are nuisance parameters, alpha not bounded in sign
+    (alpha_r was negative at slow rates, design v6 2). Returns also the normal matrix of (g, v, sigma, alpha)."""
     P = np.asarray(P, float)
     n = len(P)
     if n < 3:
@@ -153,23 +157,29 @@ def fit_g(P, C, H, hbar, side, iters=20):
     r = body(side)
     C = np.asarray(C, float)
     d = (P - C) / (H - hbar)                                          # (n, 4, 2), fixed: built from the measured P
-    g, sig = np.zeros(2), 0.0
+    F = [np.asarray(f, float) for f in fields]
+    K = len(F)
+    g, sig, vv, al = np.zeros(2), 0.0, 0.0, np.zeros(K)
     psi = np.array([kabsch_psi(P[f], side) for f in range(n)])
     T = np.array([P[f].mean(0) - (r @ _rot(psi[f]).T).mean(0) for f in range(n)])
     Bg = np.stack([(r[:, 0][:, None] * d).reshape(n, 8), (r[:, 1][:, None] * d).reshape(n, 8),
-                   (S_PATTERN[:, None] * d).reshape(n, 8)], axis=2)                                    # (n, 8, 3)
-    vv = 0.0
+                   (S_PATTERN[:, None] * d).reshape(n, 8)] + [x.reshape(n, 8) for x in F], axis=2)   # (n, 8, 3 + K)
+    ix = [0, 1, 2] + [4 + k for k in range(K)]                        # columns of Bg in the parameter order
+    M = None
     for _ in range(iters):
-        M, b = np.zeros((4, 4)), np.zeros(4)
+        M, b = np.zeros((4 + K, 4 + K)), np.zeros(4 + K)
         per = []
         for f in range(n):
             R = _rot(psi[f])
             Rr = r @ R.T
-            e = (P[f] - T[f] - (1.0 + sig) * Rr - (r @ g + vv * S_PATTERN)[:, None] * d[f]).reshape(-1)
+            e = (P[f] - T[f] - (1.0 + sig) * Rr - (r @ g + vv * S_PATTERN)[:, None] * d[f]
+                 - sum(al[k] * F[k][f] for k in range(K))).reshape(-1)
             A = np.zeros((8, 3))
             A[0::2, 0], A[1::2, 1] = 1.0, 1.0
             A[:, 2] = ((1.0 + sig) * Rr @ np.array([[0.0, 1.0], [-1.0, 0.0]])).reshape(-1)   # d(R r)/dpsi = (-y, x)
-            B = np.column_stack([Bg[f], Rr.reshape(-1)])
+            B = np.zeros((8, 4 + K))
+            B[:, ix] = Bg[f]
+            B[:, 3] = Rr.reshape(-1)
             AtA_inv = np.linalg.inv(A.T @ A)
             Q = np.eye(8) - A @ AtA_inv @ A.T
             M += B.T @ Q @ B
@@ -183,14 +193,28 @@ def fit_g(P, C, H, hbar, side, iters=20):
         g = g + dgam[:2]
         vv += dgam[2]
         sig += dgam[3]
-        if np.max(np.abs(dgam)) < 1e-12:
+        al = al + dgam[4:]
+        if np.max(np.abs(dgam[:4])) < 1e-12 and (K == 0 or np.max(np.abs(dgam[4:])) < 1e-15):
             break
-    res = P - T[:, None, :] - (1.0 + sig) * np.einsum('ij,fkj->fik', r, np.stack([_rot(a) for a in psi]))         - (r @ g + vv * S_PATTERN)[None, :, None] * d
-    return dict(g=g, sigma=float(sig), v_phu=float(vv), T=T, psi=psi,
+    Rs = np.stack([_rot(a) for a in psi])
+    res = P - T[:, None, :] - (1.0 + sig) * np.einsum('ij,fkj->fik', r, Rs) - (r @ g + vv * S_PATTERN)[None, :, None] * d
+    for k in range(K):
+        res = res - al[k] * F[k]
+    return dict(g=g, sigma=float(sig), v_phu=float(vv), alpha=[float(x) for x in al], T=T, psi=psi, M=M,
                 res_rms_m=float(np.sqrt(np.mean(np.sum(res ** 2, axis=2)))))
 
 
-def se_jackknife(P, C, H, hbar, side, nb=N_BLOCK):
+def corr_alpha_g(M):
+    """Largest |correlation| between a component of g and an alpha in the least-squares covariance (M^-1, the noise
+    scale cancels): the price of fitting alpha with g (L133 (2))."""
+    if M is None or M.shape[0] <= 4:
+        return None
+    cov = np.linalg.inv(M)
+    sd = np.sqrt(np.diag(cov))
+    return float(max(abs(cov[i, j] / (sd[i] * sd[j])) for i in (0, 1) for j in range(4, M.shape[0])))
+
+
+def se_jackknife(P, C, H, hbar, side, nb=N_BLOCK, fields=()):
     """Block jackknife SE of g over nb blocks of consecutive frames (frames are not independent in time)."""
     n = len(P)
     nb = min(nb, n // 3)
@@ -200,7 +224,7 @@ def se_jackknife(P, C, H, hbar, side, nb=N_BLOCK):
     gs = []
     for k in range(nb):
         keep = np.r_[0:edges[k], edges[k + 1]:n]
-        gs.append(fit_g(P[keep], C, H, hbar, side, iters=4)['g'])
+        gs.append(fit_g(P[keep], C, H, hbar, side, iters=6, fields=[f[keep] for f in fields])['g'])
     gs = np.array(gs)
     return np.sqrt((nb - 1) / nb * np.sum((gs - gs.mean(0)) ** 2, axis=0))
 
@@ -301,25 +325,6 @@ def shutter_fields(P, t, cam, C, kappa):
     return fr, fc
 
 
-def shutter_select(t, P, C, H, hbar, side, cam, kappa, keep_share=0.8):
-    """design 2b: frames whose shutter sensitivity of g, over the largest |alpha| seen (alpha_r and alpha_c, each
-    ALPHA_MAX_S_PX), is below SHUTTER_SHARE x SE_E on the set used: start with every frame and drop the fastest
-    (1 - keep_share) until it holds. Returns (index of the frames kept or None, sensitivity, SE_E)."""
-    w = np.abs(omega_of(t, P, side))
-    fr, fc = shutter_fields(P, t, cam, C, kappa)
-    keep = np.argsort(w)
-    while len(keep) >= N_MIN:
-        k = np.sort(keep)
-        g0 = fit_g(P[k], C, H, hbar, side)['g']
-        se = se_jackknife(P[k], C, H, hbar, side)
-        sens = max(float(np.linalg.norm(fit_g(P[k] + ALPHA_MAX_S_PX * f[k], C, H, hbar, side)['g'] - g0))
-                   for f in (fr, fc))
-        if sens <= SHUTTER_SHARE * float(np.min(se)):
-            return k, sens, se
-        keep = keep[:int(len(keep) * keep_share)]
-    return None, None, None
-
-
 # ── do: one place ────────────────────────────────────────────────────────────────────────────────
 
 def do_place(cho, idx, t, P, ses, f15=None, cam=None):
@@ -334,18 +339,23 @@ def do_place(cho, idx, t, P, ses, f15=None, cam=None):
             sel &= (idx > lo) & (idx < hi)                                 # the moving E frames of F15 (E_doan)
     if sel.sum() < N_MIN:
         raise A6Error(f'{cho}: {int(sel.sum())} E frames < {N_MIN}')
-    i0 = np.flatnonzero(sel)
     if cam is None:
-        raise A6Error('no session camera: the shutter check of the frames cannot be made (design 2b)')
-    ksel, sens, se = shutter_select(t[i0], P[i0], C, H, hb, side, cam, ses['kappa'])
-    if ksel is None:
-        why.append(f'fewer than {N_MIN} E frames with a shutter sensitivity of g below {SHUTTER_SHARE:.0%} of SE_E '
-                   f'(design 2b): g not taken')
+        raise A6Error('no session camera: the rolling-shutter fields cannot be built (L133)')
+    n_e = int(sel.sum())
+    w = np.abs(omega_of(t, P, side))
+    sel &= w <= OMEGA_MAX_RAD_S                                        # L133 (1): the domain of the alpha fit
+    i1 = np.flatnonzero(sel)
+    if len(i1) < N_MIN:
+        why.append(f'{len(i1)} E frames with |omega| <= {OMEGA_MAX_RAD_S} rad/s (< {N_MIN}): g not taken (L133)')
         return dict(schema=SCHEMA_CHO, cho=cho, g_E=None, SE_E=None, U_meo_E=None, s_E=None, s_E_norm=None,
-                    n_khung=0, n_khung_E=int(len(i0)), trang_thai='thieu', ly_do=why,
+                    n_khung=int(len(i1)), trang_thai='thieu', ly_do=why,
                     set_up=dict(C=list(map(float, C)), H_m=H, h_m=hb, side_m=side, session_sha256=ses['sha256']))
-    i1 = i0[ksel]
-    fit = fit_g(P[i1], C, H, hb, side)
+    fr, fc = shutter_fields(P, t, cam, C, ses['kappa'])
+    fl = [fr[i1], fc[i1]]
+    fit = fit_g(P[i1], C, H, hb, side, fields=fl)
+    se = se_jackknife(P[i1], C, H, hb, side, fields=fl)
+    fit0 = fit_g(P[i1], C, H, hb, side)                                # L133 (2): the same frames without alpha
+    se0 = se_jackknife(P[i1], C, H, hb, side)
     g = fit['g']
     um = None
     if f15 is None:
@@ -367,7 +377,7 @@ def do_place(cho, idx, t, P, ses, f15=None, cam=None):
             D = np.array([f15['du'][int(k)].get(nm, np.full((4, 2), np.nan)) for k in idx[i1]])
             if not np.all(np.isfinite(D)):
                 raise A6Error(f'F15 case {nm} missing at some frame used')
-            gk = fit_g(P[i1] + D, C, H, hb, side, iters=4)['g']
+            gk = fit_g(P[i1] + D, C, H, hb, side, iters=6, fields=fl)['g']
             dmax = np.maximum(dmax, np.abs(gk - g))
         um = dmax
         if np.linalg.norm(dmax) > np.linalg.norm(g):
@@ -379,8 +389,11 @@ def do_place(cho, idx, t, P, ses, f15=None, cam=None):
                 U_meo_E=None if um is None else list(map(float, um)),
                 s_E=None if sE is None else list(map(float, sE)),
                 s_E_norm=None if sE is None else float(np.linalg.norm(sE)),
-                res_rms_m=fit['res_rms_m'], n_khung=int(len(i1)), n_khung_E=int(len(i0)),
-                man_trap=dict(alpha_max_s_px=ALPHA_MAX_S_PX, ty_le=SHUTTER_SHARE, do_nhay_g=sens),
+                res_rms_m=fit['res_rms_m'], n_khung=int(len(i1)), n_khung_E=n_e,
+                man_trap=dict(cach='khop alpha_r, alpha_c lam tham so phu cung g (L133)',
+                              alpha_r_s_px=fit['alpha'][0], alpha_c_s_px=fit['alpha'][1],
+                              omega_max_rad_s=OMEGA_MAX_RAD_S, tuong_quan_alpha_g_max=corr_alpha_g(fit['M']),
+                              g_khong_alpha=list(map(float, fit0['g'])), SE_E_khong_alpha=list(map(float, se0))),
                 rho_max_m=float(np.max(np.linalg.norm(P[i1].mean(1) - C, axis=1))),
                 f15=None if f15 is None else dict(schema=f15['schema'], trang_thai=f15['trang_thai'],
                                                  file=f15['file'], sha256=f15['sha256']),

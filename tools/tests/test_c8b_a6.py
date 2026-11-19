@@ -26,13 +26,6 @@ class TopCam:
                                 1080 + 1700 * (P[:, 1] - C[1]) / (H - P[:, 2])])
 
 
-@pytest.fixture
-def small_alpha(monkeypatch):
-    """The 'dat' path: at the largest alpha seen at 3b (4.53 us/px) the shutter rule of design 2b (sensitivity of g
-    below 10 % of SE_E) fails already at 0.05 rad/s (ratio 0.24; 0.3 rad/s: 1.2), so these tests take a small alpha."""
-    monkeypatch.setattr(A, 'ALPHA_MAX_S_PX', 1e-7)
-
-
 def _ses():
     return dict(C=C, H=H, hbar=HB, side=SIDE, kappa=HB / H, sha256='0' * 64, file='s.json', camera=None)
 
@@ -81,24 +74,24 @@ def test_fit_g_recovers_the_tilt_and_v_does_not_bias_it():
     assert f2['g'] == pytest.approx(GC, abs=1e-6) and f2['v_phu'] == pytest.approx(-0.000475, abs=1e-7)
 
 
-def test_do_place_full_f15_identified_and_shutter_selection(small_alpha):
+def test_do_place_full_f15_identified_and_shutter_selection():
     idx, t, P = _clip()
     r = A.do_place('goc', idx, t, P, _ses(), _f15(idx), cam=TopCam())
     assert r['trang_thai'] == 'dat', r['ly_do']
     assert np.linalg.norm(np.array(r['g_E']) - GC) < 4 * np.linalg.norm(r['SE_E'])
     assert all(u > 0 for u in r['U_meo_E']) and r['s_E'] == pytest.approx(list(2 * np.array(r['SE_E'])
                                                                               + np.array(r['U_meo_E'])))
-    assert r['man_trap']['do_nhay_g'] <= A.SHUTTER_SHARE * min(r['SE_E']) and r['n_khung'] >= A.N_MIN
+    assert r['n_khung'] >= A.N_MIN
 
 
-def test_do_place_diagnostic_f15_is_not_a_bound(small_alpha):
+def test_do_place_diagnostic_f15_is_not_a_bound():
     # KIEMCHEO 02dea17 (CODE 19/11): the diagnostic F15 never gives a usable U_meo_E: A6 not lockable, the reason kept
     idx, t, P = _clip()
     r = A.do_place('goc', idx, t, P, _ses(), _f15(idx, schema=A.F15_DIAG, trang_thai='chan_doan'), cam=TopCam())
     assert r['trang_thai'] == 'thieu' and any('chan_doan' in w for w in r['ly_do'])
 
 
-def test_do_place_map_noise_larger_than_g_is_not_identified(small_alpha):
+def test_do_place_map_noise_larger_than_g_is_not_identified():
     idx, t, P = _clip()
     rng = np.random.default_rng(5)
     f = _f15(idx)
@@ -110,7 +103,7 @@ def test_do_place_map_noise_larger_than_g_is_not_identified(small_alpha):
     del rng
 
 
-def test_do_place_needs_the_frames_of_f15_and_a_camera(small_alpha):
+def test_do_place_needs_the_frames_of_f15_and_a_camera():
     idx, t, P = _clip()
     f = _f15(idx[:-50])
     f['mien_E'] = dict(sau_E_dau=int(idx[0]) - 1, truoc_E_cuoi=int(idx[-1]) + 1)
@@ -120,11 +113,40 @@ def test_do_place_needs_the_frames_of_f15_and_a_camera(small_alpha):
         A.do_place('goc', idx, t, P, _ses(), _f15(idx), cam=None)
 
 
-def test_shutter_rule_at_the_alpha_seen():
-    # design 2b at alpha 4.53 us/px: an E clip turning 0.3 rad/s fails (g sensitivity 1.2 x SE_E > 10 %)
-    idx, t, P = _clip(rate=0.3)
+def _shuttered(alpha_r, alpha_c, rate=0.3, **kw):
+    """A clip whose corners carry a rolling-shutter displacement alpha_r (row - mean row) v + alpha_c (col - mean) v."""
+    idx, t, P = _clip(rate=rate, **kw)
+    fr, fc = A.shutter_fields(P, t, TopCam(), C, HB / H)
+    return idx, t, P + alpha_r * fr + alpha_c * fc
+
+
+def test_l133_alpha_fitted_with_its_sign():
+    # L133 (Liam via CODE 20/11 "Khop alpha (Recommended)"): alpha_r, alpha_c nuisance with g; alpha_r may be negative
+    # (-0.72 us/px seen at slow rates, design v6 2): not clamped
+    idx, t, P = _shuttered(-0.72e-6, 2.0e-6, noise=0.00002)          # low noise: alpha itself is checked
+    r = A.do_place('goc', idx, t, P, _ses(), _f15(idx, scale=0.00002), cam=TopCam())
+    assert r['trang_thai'] == 'dat', r['ly_do']
+    mt = r['man_trap']
+    assert mt['alpha_r_s_px'] == pytest.approx(-0.72e-6, abs=0.25e-6) and mt['alpha_r_s_px'] < 0
+    assert mt['alpha_c_s_px'] == pytest.approx(2.0e-6, abs=0.25e-6)
+    assert np.linalg.norm(np.array(r['g_E']) - GC) < 3 * np.linalg.norm(r['SE_E'])
+    assert len(mt['SE_E_khong_alpha']) == 2 and 0 <= mt['tuong_quan_alpha_g_max'] < 1
+    assert mt['omega_max_rad_s'] == A.OMEGA_MAX_RAD_S
+
+
+def test_l133_alpha_removes_the_shutter_bias():
+    # a strong shutter (4.5 us/px both ways) at 1 rad/s: the fit with alpha stays within 3 SE of the truth
+    idx, t, P = _shuttered(4.5e-6, 4.5e-6, rate=1.0, n=900)
     r = A.do_place('goc', idx, t, P, _ses(), _f15(idx), cam=TopCam())
-    assert r['trang_thai'] == 'thieu' and r['g_E'] is None and any('shutter' in w for w in r['ly_do'])
+    assert r['trang_thai'] == 'dat', r['ly_do']
+    assert np.linalg.norm(np.array(r['g_E']) - GC) < 3 * np.linalg.norm(r['SE_E'])
+
+
+def test_l133_omega_domain():
+    # every frame above OMEGA_MAX_RAD_S: g not taken, the reason kept
+    idx, t, P = _clip(rate=1.5, n=600, fps=60.0)
+    r = A.do_place('goc', idx, t, P, _ses(), _f15(idx), cam=TopCam())
+    assert r['trang_thai'] == 'thieu' and r['g_E'] is None and any('omega' in w for w in r['ly_do'])
 
 
 def _place(cho, g=GC, seed=0, centre=(0.6, 0.4)):
@@ -132,7 +154,7 @@ def _place(cho, g=GC, seed=0, centre=(0.6, 0.4)):
     return A.do_place(cho, idx, t, P, _ses(), _f15(idx, cho=cho), cam=TopCam())
 
 
-def test_gop_dat_and_eps_g(small_alpha):
+def test_gop_dat_and_eps_g():
     pg, pk = _place('goc'), _place('K1', seed=3, centre=(-0.5, 0.7))
     out = A.gop([pg, pk], 'T1', u_lap=0.0005, u_dong=0.0007, giu_ngoai=dict(trang_thai='dat'), u_h_chung=0.0003)
     assert out['trang_thai'] == dict(a6='dat', h='dat'), out['ly_do']
@@ -154,14 +176,14 @@ def test_gop_dat_and_eps_g(small_alpha):
     assert o1['trang_thai']['a6'] == 'thieu' and any('one place' in w for w in o1['ly_do'])
 
 
-def test_gop_g_cal_inconsistent(small_alpha):
+def test_gop_g_cal_inconsistent():
     far = GC + np.array([0.01, -0.01])
     pg, pk = _place('goc', g=far), _place('K1', g=far, seed=3, centre=(-0.5, 0.7))
     o = A.gop([pg, pk], 'T1', 0.0005, 0.0007, dict(trang_thai='dat'), 0.0003, with_ebc=False)
     assert o['nhat_quan'] is False and o['trang_thai']['a6'] == 'thieu' and any('g_cal_bat_nhat' in w for w in o['ly_do'])
 
 
-def test_readers_and_u_psi_two_ends(small_alpha):
+def test_readers_and_u_psi_two_ends():
     pg, pk = _place('goc'), _place('K1', seed=3, centre=(-0.5, 0.7))
     a6 = A.gop([pg, pk], 'T1', 0.0005, 0.0007, dict(trang_thai='dat'), 0.0003)
     T, psi = C + np.array([0.7, 0.2]), 1.0
@@ -191,7 +213,7 @@ def _write_frames(path, idx, t, P):
             w.writerow([int(k), f'{tt:.6f}', 1] + [f'{v:.9f}' for v in p.reshape(-1)])
 
 
-def test_cli_do_gop_and_f15_set_up(tmp_path, monkeypatch, small_alpha):
+def test_cli_do_gop_and_f15_set_up(tmp_path, monkeypatch):
     idx, t, P = _clip()
     fp = tmp_path / 'frames.csv'
     _write_frames(fp, idx, t, P)
