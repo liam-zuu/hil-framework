@@ -937,6 +937,22 @@ def test_3b_v2_cross_check_flag_is_only_the_fit(tmp_path):
     assert r['d_p_quay_m'] == r0['d_p_quay_m'] and r['d_psi_quay_deg'] == r0['d_psi_quay_deg']
 
 
+def test_3b_v2_clip_from_all_rows_not_valid_gaps(tmp_path):
+    # a long stretch of rejected frames inside one clip is not a joint between clips (B IMG_3602 of session 1)
+    make_wheel(str(tmp_path / 'a.csv'), 0.0005, wob=0.0, long=True)
+    with open(tmp_path / 'a.csv', newline='') as f:
+        rows = list(csv.DictReader(f))
+    for r in rows:
+        if 20.0 < float(r['t_s']) < 40.0:
+            r['valid'] = '0'
+    with open(tmp_path / 'a2.csv', 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    F = TB.read(str(tmp_path / 'a2.csv'))
+    assert len(TB.clips(F['t'], F['clip'])) == 1 and len(TB.clips(F['t'])) == 2
+
+
 def test_3b_v2_cli_cross_check(tmp_path, capsys):
     make_wheel(str(tmp_path / 'a.csv'), 0.0015, wob=0.0, long=True)
     make_wheel(str(tmp_path / 'b.csv'), 0.25)

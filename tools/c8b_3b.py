@@ -75,8 +75,8 @@ VERSION = 'c8b_3b_v2'
 LE = 1.25
 GA_TOL_M = 0.002            # design 4b "Kiem ga" (kept, CODE 19/11)
 Q_SPREAD_MIN = 0.10         # [DE XUAT] (A) q is identified when 1 - |mean e^(i psi)| over the fitted frames >= 0.10
-CLIP_GAP_S = 8.0            # a time gap > 8 s separates two joined clips (ghep_3b.py leaves 10 s; a lost stretch inside
-                            # one clip of a few seconds must not cut it: first run 9dd8b22 cut IMG_3601 at a 2-s loss)
+CLIP_GAP_S = 8.0            # a gap > 8 s between ROWS (valid or not) separates two joined clips (ghep_3b.py leaves 10 s);
+                            # gaps of valid frames are not used (B IMG_3602: 88 s of rejected fast frames, run 9dd8b22)
 WIN_S = 0.5                 # design 4b (A): smooth fit over 0.5 s
 SLOW_SHARE = 0.10           # the slowest part: the 10 % of the moving frames with the smallest |Omega| [DE XUAT]
 SLOW_MIN = 30               # at least 30 frames in the slowest part
@@ -119,6 +119,10 @@ def read(path):
         return np.array([float(r[c]) if c in r and r[c] not in ('', 'nan', None) else np.nan for r in fr])
     v = np.array([r['valid'] == '1' for r in fr])
     F = dict(t=g('t_s'), x=g(xs), y=g(ys), psi=g('psi'), row=g('row_px'), col=g('col_px'))
+    # clip of every row from the gaps of ALL rows (valid or not): a long stretch of rejected frames inside a clip is
+    # not a joint between clips (ghep_3b.py leaves CLIP_GAP_S+ between the last row of a clip and the next)
+    ta = F['t']
+    F['clip'] = np.concatenate([[0], np.cumsum(np.diff(ta) > CLIP_GAP_S)]) if len(ta) else np.zeros(0, int)
     k = v & np.isfinite(F['x']) & np.isfinite(F['y']) & np.isfinite(F['psi'])
     F = {c: a[k] for c, a in F.items()}
     if len(F['t']) < 50:
@@ -223,11 +227,14 @@ def held_out(fit, res, t, idx, split=None):
     return worst, ''
 
 
-def clips(t):
+def clips(t, clip=None):
     """Frame index arrays of the clips joined in one frames.csv (ghep_3b.py leaves a gap > CLIP_GAP_S): the set-up
-    may be moved between clips (re-spun by hand), so each clip has its own geometry (Codex G3B-1)."""
-    cut = np.flatnonzero(np.diff(t) > CLIP_GAP_S) + 1
-    return np.split(np.arange(len(t)), cut)
+    may be moved between clips (re-spun by hand), so each clip has its own geometry (Codex G3B-1). clip: the clip
+    of each frame from read() (all rows); without it, the gaps of t."""
+    if clip is None:
+        cut = np.flatnonzero(np.diff(t) > CLIP_GAP_S) + 1
+        return np.split(np.arange(len(t)), cut)
+    return [np.flatnonzero(clip == c) for c in np.unique(clip)]
 
 
 def slowest_in(om, idx):
@@ -267,7 +274,7 @@ def analyse_a(F, wz_max):
         return axis_res(x[i], y[i], psi[i], *m)
     why, p4_why, per_clip = [], [], []
     dev = np.full(len(t), np.nan)                     # residual of each frame against the geometry of its own clip
-    for k, ci in enumerate(clips(t)):
+    for k, ci in enumerate(clips(t, F.get('clip'))):
         slk = slowest_in(om, ci)
         if slk is None:
             if (use[ci]).any():
@@ -560,7 +567,7 @@ def analyse_b(F, v_max, wz_max, frame_s):
         return np.abs(radius_res(r_, th_, t[i], co_, tm_))
     ga_why, per_clip = [], []
     rad_err = np.full(len(t), np.nan)
-    for k, ci in enumerate(clips(t)):
+    for k, ci in enumerate(clips(t, F.get('clip'))):
         slk = slowest_in(om, ci)
         if slk is None:
             if use_p[ci].any():
