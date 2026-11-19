@@ -1431,6 +1431,9 @@ def test_phan_tich_writes_s7(tmp_path, scene, monkeypatch):
     assert kc.main(_phan_tich_args(t2, scene) + ['--xuat-phat', 'goc=0,0']) == 2          # needs --plumb
 
 
+_HS_DUONG = dict(DUONG_12B={k: list(v) for k, v in kc.DUONG_12B.items()}, R_XP_DUONG_M=kc.R_XP_DUONG_M)
+
+
 def test_e_hieu_reads_f5_and_writes_f9(tmp_path, scene):
     """S7-17, S8-5: (i) from kiem_cheo, (ii) on the F5 session (exact scene ~ 0), (iii) missing -> chan_doan; a leg
     without p_m: only (i); an edited F5: code 2; the output is what c8_hc_a.read_e_hieu reads."""
@@ -1444,7 +1447,7 @@ def test_e_hieu_reads_f5_and_writes_f9(tmp_path, scene):
     trp.write_text(json.dumps(dict(session_sha256=kc.sha256_file(str(sp)), frames_sha256=kc.sha256_file(str(frp)))),
                    encoding='utf-8')
     kcr = dict(version=kc.VERSION, thu=False, model='B1',
-               hang_so_s7=dict(xuat_phat=dict(goc=[0.0, 0.0]), R_XP_M=0.6, L_MAX_M=1.05, plumb=[0.03, -0.02]),
+               hang_so_s7=dict(xuat_phat=dict(goc=[0.0, 0.0]), R_XP_M=0.6, L_MAX_M=1.05, plumb=[0.03, -0.02], **_HS_DUONG),
                P1_tuong_doi=dict(theo_vung=dict(goc=dict(trong_vung_max_m=0.0007))))
     kcp = tmp_path / 'kc.json'
     kcp.write_text(json.dumps(kcr), encoding='utf-8')
@@ -1470,6 +1473,16 @@ def test_e_hieu_reads_f5_and_writes_f9(tmp_path, scene):
     legs = {x['i']: x for x in e['doan']}
     assert legs[0]['phan_ii_m'] < 1e-6 and legs[0]['e_hieu_m_chan_doan'] == pytest.approx(0.0007)
     assert legs[1]['phan_ii_m'] is None and any('chi (i)' in w for w in legs[1]['ly_do'])
+    # CODE 20/11 (HCV3-2): (ii) on the pairs of the 12b corridor marks of the place, independent recomputation
+    a_, b_ = kc.duong_12b((0.0, 0.0), kc.DUONG_12B['goc'])
+    want = sorted(i for i, m in marks.items() if kc.seg_dist(m[:2], a_, b_) <= kc.R_XP_DUONG_M)
+    assert e['mien_ii'] == dict(loai='duong_12b', moc=want) and len(want) >= 3
+    kc2 = tmp_path / 'kc2.json'                                       # no corridor constants: only (i), with the reason
+    kc2.write_text(json.dumps(dict(kcr, hang_so_s7={k: v for k, v in kcr['hang_so_s7'].items() if k != 'DUONG_12B'})),
+                   encoding='utf-8')
+    assert kc.main(['e_hieu', '--kiem-cheo', str(kc2), '--doan', str(dp), '--out', str(tmp_path / 'e4.json')]) == 0
+    e4 = json.loads((tmp_path / 'e4.json').read_text(encoding='utf-8'))
+    assert all(x['phan_ii_m'] is None and any('hanh lang 12b' in w for w in x['ly_do']) for x in e4['doan'])
     # KCJ1-7: no usable e_hieu_m while chan_doan (c8_hc_a.read_e_hieu refuses a row without it: F9 cannot unlock khoa)
     assert all('e_hieu_m' not in x for x in e['doan'])
     tr = json.loads(trp.read_text(encoding='utf-8'))                  # KCJ1-8: a track of another session: code 2
@@ -1762,7 +1775,7 @@ def test_e_hieu_refuses_f5_without_legs_and_unchained_track(tmp_path, scene):
     trp.write_text(json.dumps(dict(session_sha256=kc.sha256_file(str(sp)), frames_sha256=kc.sha256_file(str(frp)))),
                    encoding='utf-8')
     kcr = dict(version=kc.VERSION, thu=False, model='B1',
-               hang_so_s7=dict(xuat_phat=dict(goc=[0.0, 0.0]), R_XP_M=0.6, L_MAX_M=1.05, plumb=[0.03, -0.02]),
+               hang_so_s7=dict(xuat_phat=dict(goc=[0.0, 0.0]), R_XP_M=0.6, L_MAX_M=1.05, plumb=[0.03, -0.02], **_HS_DUONG),
                P1_tuong_doi=dict(theo_vung=dict(goc=dict(trong_vung_max_m=0.0007))))
     kcp = tmp_path / 'kc.json'
     kcp.write_text(json.dumps(kcr), encoding='utf-8')

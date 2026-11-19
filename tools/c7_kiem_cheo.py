@@ -2600,13 +2600,18 @@ def e_hieu(a):
     side, h_m = cfg.get('side_m'), cfg.get('h_m')
     to = cfg.get('tag_offset') or (0.0, 0.0, 0.0)
     plumb = hs.get('plumb')
-    # (ii) cameras of the session of the F5 file (the scoring session): the pairs of the region, L <= L_max
+    # (ii) cameras of the session of the F5 file (the scoring session): the pairs of the 12b CORRIDOR marks of the
+    # place, L <= L_max. (ii) is the error of the difference between the two windows of a 12b leg, both on the 12b
+    # segment, so its marks are those of A3_tuong_doi.duong_12b (CODE 20/11, HCV3-2), not of the start disc
     ses = next((x for x in d.get('nguon') or [] if x.get('vai_tro') == 'session'), None)
-    cams, why_ii = [], []
+    cams, why_ii, reg = [], [], None
+    duong = hs.get('DUONG_12B')
     if ses is None or not ses.get('duong_dan'):
         why_ii.append('F5 khong co nguon session')
     elif side is None or h_m is None:
         why_ii.append('car_pose_cfg thieu side_m / h_m')
+    elif not isinstance(duong, dict) or cho not in duong or not isinstance(hs.get('R_XP_DUONG_M'), (int, float)):
+        why_ii.append('kiem_cheo khong co hanh lang 12b (hang_so_s7.DUONG_12B, R_XP_DUONG_M)')
     else:
         if ses.get('sha256') != d.get('session_sha256'):
             raise KCError('F5: nguon session sha256 is not session_sha256 (KCJ1-8)')
@@ -2629,7 +2634,8 @@ def e_hieu(a):
             raise KCError('F5: session file changed (sha256, KCJ1-8)')
         img, mk, w, h, zc = clip_from_session(s, kc['model'])
         pc = PairCams(img, mk, kc['model'], w, h, zc)
-        reg = start_regions(mk, {cho: hs['xuat_phat'][cho]}, hs.get('R_XP_M', R_XP_M))[cho]['moc']
+        reg = duong_regions(mk, {cho: hs['xuat_phat'][cho]}, float(hs['R_XP_DUONG_M']),
+                            {cho: tuple(duong[cho])})[cho]['moc']
         L_max = hs.get('L_MAX_M', L_MAX_M)
         for x in range(len(reg)):
             for y in range(x + 1, len(reg)):
@@ -2669,6 +2675,7 @@ def e_hieu(a):
         legs.append(dict(i=g.get('i'), e_hieu_m_chan_doan=max(vals), e_hieu_psi_rad=ii_psi, phan_i_m=part_i,
                          phan_ii_m=ii_m, phan_iii_m=None, trang_thai='chan_doan', ly_do=why))
     out = dict(schema=E_HIEU_SCHEMA, cho=cho, doan_12b_sha256=d['sha256'], bao_q_xoay=False,
+               mien_ii=dict(loai='duong_12b', moc=reg),
                trang_thai='chan_doan', doan=legs, hang_so_s7=hs,
                loai='chi so thuc nghiem truoc le (S7-17); (iii) replay neo chua co: chan_doan',
                nguon=[dict(vai_tro='kiem_cheo', duong_dan=os.path.abspath(a.kiem_cheo), sha256=sha256_file(a.kiem_cheo)),
@@ -2676,7 +2683,8 @@ def e_hieu(a):
                + ([dict(vai_tro='session_ii', duong_dan=ses['duong_dan'], sha256=d.get('session_sha256'))]
                   if ses and not why_ii else []),
                gioi_han=['(i) cap moc dai hon doan: khong thay meo o thang doan ngan hon khoang cach moc',
-                         '(ii) chi trong ho mo hinh; tam ma dat tai p_m, lech q bo qua',
+                         '(ii) chi trong ho mo hinh; tam ma dat tai p_m, lech q bo qua; cap moc cua hanh lang 12b '
+                         '(A3_tuong_doi.duong_12b), (i) van la cap trong dia xuat phat (P1_tuong_doi.theo_vung)',
                          '(iii) chua tinh (can dets.npz, load_dets, dets_fp cua CAM)'],
                commit_hil=commit_hil())
     write_new(a.out, out)
