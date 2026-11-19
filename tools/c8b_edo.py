@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""
+c8b_edo.py: reader of e_do,perp (diagnostic, not a run condition) for the relative scoring, J v6 (O1 v11.41 appendix
+06_SPECS/2026-11-19_Spec_O1_v11.41_Phu_luc_J_v6.md) section 3 "e_do", section 4 "Loai muc theo e_do", section 5
+(i)-(ii), item 12(a), (d); design C8B v7 section 9 item 6. Written by CODE_C8B local_07e5654d on feat/c8b-3b-ga,
+19/11/2026 (CODE work order 19/11; Liam at CODE: "duyet ca 8, giao viec cac phien phu theo cach nhanh",
+"Code ngay (Recommended)").
+
+e_do,perp of a frame = n_Gamma(s)^T [b - z_f(t_log)], both in the lane frame of the task:
+  b     the camera centre of the frame, the rows x, y of the scorer node (lane frame after the rigid change of
+        c7_score relative mode, CAM v5 section 0.1, data contract F13);
+  z_f   the firmware pose pos_x, pos_y of EVERY log row as logged (the edge row too, never set to 0), changed to the lane
+        frame by the same rigid change: p_dd + R(psi_dd) z (F13 bien_doi);
+  s     the projection candidates: the scorer's s_perp, both ends of its search window [w_lo, w_hi], and the projection
+        of every firmware sample inside the window (several branches, ends; J v6 design section 9.4).
+Clock (per node i of the c8b_gio file): a camera frame at t_cam maps to the log interval
+  [t_cam + D_i - u_plus, t_cam + D_i + u_minus]  (log = camera + D; u_minus / u_plus of the node: u_cham_minus_s,
+  u_cham_plus_s when the clock file has them, else half the node step each side [CACH HIEU, stated]);
+z_f is interpolated at both ends and taken at every log row inside; an interval reaching a log hole > LOG_HOLE_S or a
+reset is undefined for that frame.
+Bounds of a frame at node i: lo = max(0, min over (s, z) |e| - U_p_k), hi = max |e| + U_p_k (U_p_k of the row: the
+position bound of the difference; a sign change inside the set gives min |e| = 0).
+Run: "vuot moi nut" (the lower bound above D at every node) by the cell rule of J v6 section 5: every cell (two
+adjacent nodes) has ONE frame with lo > D at both nodes of the cell (the frame may differ between cells); one node:
+any frame. "can_xac_dinh_moi_nut": every node scored and every scored frame of every node bounded.
+Not concluded for the run (no evidence): khung_tuong_doi_v1 missing; phi_ok false; ca_t_som (q, delta_c_B, beta,
+plate changed or not known); mat_neo; log without the rising edge of run_active, a second reset in the run, a log
+hole in the run window.
+
+  python tools/c8b_edo.py luot --gio gio.json --luoi-dir DIR --esp32 log.csv --out edo.json
+  python tools/c8b_edo.py muc --luot edo1.json [--luot ...] --out edo_muc.json
+Last line: #ket_qua,ma=0 written / 2 refused or error.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import os
+import sys
+
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import c8_u_imu as cu                                                    # noqa: E402
+
+VERSION = 'c8b_edo_v1'
+VERSION_MUC = 'c8b_edo_muc_v1'
+D_M = 0.10                 # J v6 section 4: D
+LOG_HOLE_S = 0.100         # as c8b_gio [DE XUAT]
+
+
+class EdoError(Exception):
+    pass
+
+
+def _f(x):
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return math.nan
+    return v
+
+
+def read_log(path):
+    cu.check_path(path)
+    with open(path, newline='', encoding='utf-8') as f:
+        rows = [r for r in csv.DictReader(l for l in f if not l.startswith('#'))]
+    rows = [r for r in rows if r.get('timestamp_us') not in (None, '')]
+    need = ('timestamp_us', 'pos_x', 'pos_y', 'run_active', 'reset_n')
+    if not rows or any(c not in rows[0] for c in need):
+        raise EdoError(f'{path}: no data line or no column {[c for c in need if not rows or c not in rows[0]]}')
+    t = np.array([_f(r['timestamp_us']) for r in rows]) * 1e-6
+    if np.any(np.diff(t) <= 0):
+        raise EdoError(f'{path}: timestamp_us does not increase')
+    return dict(t=t, x=np.array([_f(r['pos_x']) for r in rows]), y=np.array([_f(r['pos_y']) for r in rows]),
+                run=np.array([r['run_active'] == '1' for r in rows]), reset=[r['reset_n'] for r in rows])
+
+
+def log_checks(L):
+    """Reasons the run's e_do is not concluded from the log (J v6 section 3): no rising edge, more than one, a second
+    reset in the run window, a hole in the run window."""
+    why = []
+    ra = L['run']
+    edges = [i for i in range(1, len(ra)) if ra[i] and not ra[i - 1]]
+    if len(edges) != 1:
+        why.append(f'{len(edges)} rising edges of run_active (need exactly 1)')
+        return why, None
+    i0 = edges[0]
+    i1 = i0 + int(np.argmax(~ra[i0:])) if (~ra[i0:]).any() else len(ra)
+    if len({L['reset'][k] for k in range(i0, i1)}) != 1:
+        why.append('reset_n changes in the run window (a second reset)')
+    tw = L['t'][i0:i1]
+    if len(tw) > 1 and float(np.max(np.diff(tw))) > LOG_HOLE_S:
+        why.append(f'log hole {float(np.max(np.diff(tw))) * 1e3:.1f} ms > {LOG_HOLE_S * 1e3:.0f} ms in the run')
+    if not (np.isfinite(L['x'][i0:i1]).all() and np.isfinite(L['y'][i0:i1]).all()):
+        why.append('pos_x / pos_y not finite in the run window')
+    return why, i0
+
+
+def fw_samples(L, a, b):
+    """Firmware poses over the log interval [a, b]: both ends interpolated and every row inside; None when the
+    interval leaves the log, meets a hole > LOG_HOLE_S or a reset."""
+    t = L['t']
+    if a < t[0] or b > t[-1] or b < a:
+        return None
+    i = int(np.searchsorted(t, a, side='right')) - 1
+    j = int(np.searchsorted(t, b, side='left'))
+    j = min(j, len(t) - 1)
+    seg = slice(max(i, 0), j + 1)
+    ts = t[seg]
+    if len(ts) > 1 and float(np.max(np.diff(ts))) > LOG_HOLE_S:
+        return None
+    if len({L['reset'][k] for k in range(seg.start, seg.stop)}) != 1:
+        return None
+    xs = [float(np.interp(a, t, L['x'])), float(np.interp(b, t, L['x']))]
+    ys = [float(np.interp(a, t, L['y'])), float(np.interp(b, t, L['y']))]
+    inside = (t > a) & (t < b)
+    xs += list(L['x'][inside])
+    ys += list(L['y'][inside])
+    return np.array(xs), np.array(ys)
+
+
+def to_lane(zx, zy, p_dd, psi_dd):
+    c, s = math.cos(psi_dd), math.sin(psi_dd)
+    return p_dd[0] + c * zx - s * zy, p_dd[1] + s * zx + c * zy
+
+
+def heading_at(lane, s):
+    """Lane heading at arc length s (the sampled lane of c7_score: Path8 or o1_lanes.Lane, unwrapped)."""
+    P = lane.path
+    if not hasattr(lane, '_edo_hu'):
+        lane._edo_hu = np.unwrap(np.asarray(P.head, float))
+    return float(np.interp(s, P.s, lane._edo_hu))
+
+
+def frame_bounds(lane, bx, by, zx, zy, s_perp, w_lo, w_hi, up):
+    """(lo, hi) of |e_do,perp| of one frame over the projection candidates and firmware samples."""
+    ss = [s_perp, w_lo, w_hi]
+    for x_, y_ in zip(zx, zy):
+        ss.append(lane.project(float(x_), float(y_), w_lo, w_hi)[0])
+    es = []
+    for s_ in ss:
+        hd = heading_at(lane, min(max(s_, 0.0), lane.S))
+        nx, ny = -math.sin(hd), math.cos(hd)
+        es.extend(nx * (bx - zx) + ny * (by - zy))
+    es = np.array(es)
+    if not np.isfinite(es).all():
+        return 0.0, math.inf
+    amin = 0.0 if (es.min() <= 0.0 <= es.max()) else float(np.min(np.abs(es)))
+    return max(0.0, amin - up), float(np.max(np.abs(es))) + up
+
+
+def lane_of(task):
+    import c7_score
+    return c7_score.Fig8Task(task) if task in c7_score.FIG8 else c7_score.KTask(task, (0.0, 0.0, 0.0))
+
+
+def node_frames(score, rows):
+    """Frames of one node: key (frame_id, else t_cam_s), x, y, s_perp, w_lo, w_hi, U_p_k, t_cam_s; scored only."""
+    out = {}
+    for r in rows:
+        if str(r.get('scored', '1')) not in ('1', 'True', 'true'):
+            continue
+        k = r.get('frame_id') or r.get('t_cam_s')
+        out[str(k)] = {c: _f(r.get(c)) for c in ('x', 'y', 's_perp', 'w_lo', 'w_hi', 'U_p_k', 't_cam_s')}
+    return out
+
+
+def run_reasons(kt):
+    why = []
+    if not isinstance(kt, dict) or kt.get('schema') != 'khung_tuong_doi_v1':
+        return ['no khung_tuong_doi_v1 block (F13)']
+    if not kt.get('phi_ok'):
+        why.append('phi_ok false (beta path not valid)')
+    if kt.get('t_som_s') is not None or kt.get('ca_t_som'):
+        why.append(f'ca t_som: {kt.get("ca_t_som")}')
+    if kt.get('tam_doi') not in (None, 'khong_doi'):
+        why.append(f'tam_doi {kt.get("tam_doi")}')
+    if kt.get('mat_neo'):
+        why.append('mat_neo')
+    return why
+
+
+def cell_rule(per_node, thr=D_M):
+    """J v6 section 5: every cell (adjacent nodes) has one frame with a finite lo > thr at both nodes; one node: any."""
+    n = len(per_node)
+    if n == 0:
+        return False
+    if n == 1:
+        return any(math.isfinite(v[0]) and v[0] > thr for v in per_node[0].values())
+    for a, b in zip(per_node[:-1], per_node[1:]):
+        if not any(k in b and math.isfinite(a[k][0]) and math.isfinite(b[k][0]) and a[k][0] > thr and b[k][0] > thr
+                   for k in a):
+            return False
+    return True
+
+
+def analyse_run(gio, nodes, L, task, thr=D_M):
+    """nodes: list of (score dict, rows list) per node in the order of gio['nodes_s'] (None: node not scored)."""
+    why = []
+    lw, _ = log_checks(L)
+    why += lw
+    lane = lane_of(task)
+    step = float(gio.get('step_s') or 0.0)
+    u_m = gio.get('u_cham_minus_s') or [step / 2] * len(gio['nodes_s'])
+    u_p = gio.get('u_cham_plus_s') or [step / 2] * len(gio['nodes_s'])
+    per_node, theo_nut, all_bounded = [], [], True
+    for i, D in enumerate(gio['nodes_s']):
+        nd = nodes[i] if i < len(nodes) else None
+        if nd is None:
+            all_bounded = False
+            per_node.append({})
+            theo_nut.append(dict(i=i, cham=False))
+            continue
+        sc, rows = nd
+        kt = sc.get('khung_tuong_doi')
+        rr = run_reasons(kt)
+        why += [f'node {i}: {w}' for w in rr if f'node {i}: {w}' not in why]
+        bd = kt.get('bien_doi') if isinstance(kt, dict) else None
+        if rr or not isinstance(bd, dict):
+            all_bounded = False
+            per_node.append({})
+            theo_nut.append(dict(i=i, cham=False, ly_do=rr or ['no bien_doi']))
+            continue
+        p_dd, psi_dd = bd.get('p_dd') or [0.0, 0.0], float(bd.get('psi_dd') or 0.0)
+        res, n_undef = {}, 0
+        for k, fr in node_frames(sc, rows).items():
+            if not all(math.isfinite(fr[c]) for c in ('x', 'y', 's_perp', 'w_lo', 'w_hi', 'U_p_k', 't_cam_s')):
+                res[k] = (math.nan, math.inf)
+                n_undef += 1
+                continue
+            zs = fw_samples(L, fr['t_cam_s'] + D - u_p[i], fr['t_cam_s'] + D + u_m[i])
+            if zs is None:
+                res[k] = (math.nan, math.inf)
+                n_undef += 1
+                continue
+            zx, zy = to_lane(zs[0], zs[1], p_dd, psi_dd)
+            res[k] = frame_bounds(lane, fr['x'], fr['y'], np.asarray(zx), np.asarray(zy), fr['s_perp'], fr['w_lo'],
+                                  fr['w_hi'], fr['U_p_k'])
+        if n_undef or not res:
+            all_bounded = False
+        per_node.append(res)
+        los = [v[0] for v in res.values() if math.isfinite(v[0])]
+        his = [v[1] for v in res.values()]
+        theo_nut.append(dict(i=i, D_s=D, cham=True, n_khung=len(res), n_undef=n_undef,
+                             lo_max_m=max(los) if los else None, hi_max_m=max(his) if his else None,
+                             khung_vuot=sorted(k for k, v in res.items() if math.isfinite(v[0]) and v[0] > thr)))
+    if why:
+        return dict(version=VERSION, task=task, trang_thai='chua_ket_luan', ly_do=why, theo_nut=theo_nut,
+                    vuot_moi_nut=False, can_xac_dinh_moi_nut=False, nguong_m=thr)
+    return dict(version=VERSION, task=task, trang_thai='dat', ly_do=[], theo_nut=theo_nut,
+                vuot_moi_nut=cell_rule(per_node, thr), can_xac_dinh_moi_nut=bool(all_bounded), nguong_m=thr)
+
+
+def muc(runs):
+    """c8b_edo_muc_v1, J v6 section 4 and section 5 (i)-(ii), item 12(a), (d), J5-7. runs: list of dicts, each an
+    c8b_edo_v1 run file plus the run facts the gate supplies: muc, controller, danh_sach (bool: in the list fixed before
+    C8, 2b), hong (bool: lost, any kind), ban_cham ('cuoi' or 'tam'), lan_cham (list of the run's edo results: one, or
+    two when scored again with the two calibrations)."""
+    out = {}
+    for r in runs:
+        key = (r['muc'], r['controller'])
+        e = out.setdefault(key, dict(muc=r['muc'], controller=r['controller'], luot_chung_cu=[], luot_du_can=[],
+                                     n_luot=0))
+        if not r.get('danh_sach') or r.get('hong') or r.get('ban_cham') != 'cuoi':
+            continue                                     # not evidence (J v6: list, not lost, final scoring)
+        e['n_luot'] += 1
+        lc = r.get('lan_cham') or []
+        ok = [x for x in lc if x.get('trang_thai') == 'dat']
+        if lc and len(ok) == len(lc) and all(x['vuot_moi_nut'] for x in lc):
+            e['luot_chung_cu'].append(r['luot_id'])      # over D at every node at every scoring (12(d))
+        if lc and len(ok) == len(lc) and all(x['can_xac_dinh_moi_nut'] for x in lc):
+            e['luot_du_can'].append(r['luot_id'])
+    levels = {}
+    for (m, c), e in out.items():
+        lv = levels.setdefault(m, dict(muc=m, loai_muc=False, controller={}))
+        lv['controller'][c] = dict(luot_chung_cu=e['luot_chung_cu'], du_bang_chung=bool(e['luot_du_can']),
+                                   n_luot=e['n_luot'])
+        if e['luot_chung_cu']:
+            lv['loai_muc'] = True                        # one run of any controller is enough (12(a))
+    for lv in levels.values():
+        if lv['loai_muc']:
+            lv['trang_thai'] = 'loai_muc'
+        elif all(v['du_bang_chung'] for v in lv['controller'].values()):
+            lv['trang_thai'] = 'giu_muc'
+        else:
+            lv['trang_thai'] = 'giu_muc_rui_ro'
+            lv['c8_chua_xong'] = [c for c, v in lv['controller'].items() if not v['du_bang_chung'] and v['n_luot'] > 0
+                                  ] + [c for c, v in lv['controller'].items() if v['n_luot'] == 0]
+    return dict(version=VERSION_MUC, muc=sorted(levels.values(), key=lambda v: v['muc']), nguong_m=D_M)
+
+
+def _load_nodes(gio, d):
+    nodes = []
+    for k in range(len(gio['nodes_s'])):
+        sp, rp = os.path.join(d, f'nut_{k:03d}.json'), os.path.join(d, f'nut_{k:03d}_rows.csv')
+        try:
+            with open(sp, encoding='utf-8') as f:
+                sc = json.load(f)
+            with open(rp, newline='', encoding='utf-8') as f:
+                rows = list(csv.DictReader(f))
+        except (OSError, ValueError):
+            nodes.append(None)
+            continue
+        nodes.append((sc, rows))
+    return nodes
+
+
+def _clean(o):
+    if isinstance(o, dict):
+        return {k: _clean(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_clean(v) for v in o]
+    if isinstance(o, float):
+        return o if math.isfinite(o) else None
+    return o
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    a1 = sub.add_parser('luot')
+    a1.add_argument('--gio', required=True)
+    a1.add_argument('--luoi-dir', required=True)
+    a1.add_argument('--esp32', required=True)
+    a1.add_argument('--out', required=True)
+    a2 = sub.add_parser('muc')
+    a2.add_argument('--luot', action='append', required=True, help='json: run facts + lan_cham (see muc())')
+    a2.add_argument('--out', required=True)
+    a = ap.parse_args(argv)
+    try:
+        cu.check_path(a.out)
+        if a.cmd == 'luot':
+            with open(a.gio, encoding='utf-8') as f:
+                gio = json.load(f)
+            if gio.get('format') != 'c8b_gio_v1':
+                raise EdoError(f'{a.gio}: not a c8b_gio_v1 file')
+            res = analyse_run(gio, _load_nodes(gio, a.luoi_dir), read_log(a.esp32), gio['task'])
+            res.update(gio_sha256=cu.sha256(a.gio), esp32_sha256=cu.sha256(a.esp32))
+        else:
+            runs = []
+            for p in a.luot:
+                with open(p, encoding='utf-8') as f:
+                    runs.append(json.load(f))
+            res = muc(runs)
+        with open(a.out, 'x', encoding='utf-8') as f:
+            f.write(json.dumps(_clean(res), indent=1, ensure_ascii=False, allow_nan=False))
+    except (EdoError, cu.InputError, OSError, ValueError, KeyError) as exc:
+        print(f'c8b_edo: {exc}', file=sys.stderr)
+        print('#ket_qua,ma=2')
+        return 2
+    print('#ket_qua,ma=0')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
