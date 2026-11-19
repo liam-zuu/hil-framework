@@ -545,15 +545,43 @@ def frames_basic(frames_csv, track_json):
     return F
 
 
+def a6_tam_id(a6_path):
+    """The plate of an A6 file: c8b_a6_v2.tam_id (top-level key; CODE 20/11 A6C1-7: declared once in the A6 file,
+    other sessions only compare). None without a path, a readable JSON object, or a non-empty string tam_id."""
+    if not a6_path:
+        return None
+    try:
+        with open(a6_path, encoding='utf-8') as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return None
+    t = d.get('tam_id') if isinstance(d, dict) else None
+    return t if isinstance(t, str) and t else None
+
+
+def _accepts(fn, name):
+    try:
+        import inspect
+        return name in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def frames_chain(frames_csv, a6, xoay, lan_lap=None, track=None, cho=None):
     """F1 of CAM when importable: frame_id, t_cam, p_x, p_y, psi_ma_p, cong_ok, a6_ok, q_ok, trang_thai.
     None (caller falls back to frames_basic, chain 'chan_doan') when CAM or C8B (c8b_a6) is not merged yet, when
     the chain refuses its inputs (ValueError: schema, track tag_offset), or when no frame has A6 AND q applied
     (e.g. xoay_v1 without a6_sha256 or of another A6: CAM gives q None, p NaN). A frame is used only when its gate,
-    A6 and q are all ok (cong_ok alone would let NaN centres through). 'khoa' needs every gated frame A6 + q ok."""
+    A6 and q are all ok (cong_ok alone would let NaN centres through). 'khoa' needs every gated frame A6 + q ok.
+    HCV3-1 (CODE 20/11, contract log): without lan_lap the plate is c8b_a6_v2.tam_id of the A6 file, passed as
+    tam_id= to CAM chuoi_khung once CAM has that parameter (CAM adds it after session 2; before that the call is the
+    old one and CAM's A6 plate check refuses, so the chain stays chan_doan). No lan_lap is ever built here."""
     try:
         import c7_chuoi_khung as ck                                       # CAM, after its merge
-        rows = ck.chuoi_khung(frames_csv, ck.doc_a6(a6), xoay, lan_lap=lan_lap, track=track, cho=cho)
+        kw = dict(lan_lap=lan_lap, track=track, cho=cho)
+        if lan_lap is None and _accepts(ck.chuoi_khung, 'tam_id'):
+            kw['tam_id'] = a6_tam_id(a6)
+        rows = ck.chuoi_khung(frames_csv, ck.doc_a6(a6), xoay, **kw)
     except (ImportError, ValueError):
         return None
     if not rows:
@@ -1403,11 +1431,12 @@ def can_hai_dau_c8b(a6_path, kc_path, tam_id, nguon):
     returns thieu with reasons, so there is no A3 gate here (CODE 20/11; replaces HCH1-5, HCH2-2). p1, p2 = tag
     centres on the floor (car_pose frame, m). luot, dai = None: the largest U_chuyen.dong over runs and bands
     (the 12b windows are still windows of calibration attempts, not C8 target runs; [CACH HIEU], conservative).
-    Needs --a6, --kc, --tam-id together, non-empty (else AError, code 2). c8b_a6 not merged yet, the A6 file refused,
+    Needs --a6 and --kc together, non-empty, and an A6 file with tam_id (else AError, code 2); tam_id = c8b_a6_v2.tam_id
+    (HCV3-1, CODE 20/11), --tam-id optional and only compared to it. c8b_a6 not merged yet, the A6 file refused,
     an error inside the function or parts that do not add up: every call gives None with the reason (the result stays
     chan_doan, the term null)."""
     if not (a6_path and kc_path and tam_id):
-        raise AError('--kc, --tam-id can di cung --a6 (ham can hai dau cua C8B), khong rong')
+        raise AError('--kc can di cung --a6 co tam_id (ham can hai dau cua C8B), khong rong')
     kc = json.load(open(kc_path, encoding='utf-8'))
     nguon.append(dict(vai_tro='kiem_cheo', duong_dan=os.path.abspath(kc_path), sha256=sha256(kc_path)))
     try:
@@ -1545,7 +1574,10 @@ def cmd_tinh(a):
         nguon.append(dict(vai_tro='can_c8b', duong_dan=os.path.abspath(a.can_c8b), sha256=sha256(a.can_c8b)))
     can_fn = None
     if a.kc is not None or a.tam_id is not None:                 # HCH1-8: an empty value is not 'absent'
-        can_fn = can_hai_dau_c8b(a.a6, a.kc, a.tam_id, nguon)
+        tam = a6_tam_id(a.a6)                                    # HCV3-1: the plate is c8b_a6_v2.tam_id
+        if a.tam_id is not None and a.tam_id != tam:
+            raise AError(f'--tam-id {a.tam_id!r} khac tam_id cua A6 {tam!r} (tam_id khai mot lan trong c8b_a6_v2)')
+        can_fn = can_hai_dau_c8b(a.a6, a.kc, tam, nguon)
     vet = None
     if a.moc and cap_F is not None:
         import c8_hc_vet as cv
@@ -1673,7 +1705,8 @@ def main(argv=None):
     t.add_argument('--e-hieu', default=None, help='e_hieu_m of KIEMCHEO (F9)')
     t.add_argument('--can-c8b', default=None, help='C8B file with u_psi_cuc_rad (two-end camera heading bound)')
     t.add_argument('--kc', default=None, help='KIEMCHEO kiem_cheo.json (c7_kiem_cheo_v7) for c8b_a6.u_psi_hai_dau_rad')
-    t.add_argument('--tam-id', default=None, help='plate id for c8b_a6.u_psi_hai_dau_rad (A6 applies to one plate)')
+    t.add_argument('--tam-id', default=None, help='optional check: must equal c8b_a6_v2.tam_id of --a6 (the plate '
+                                                  'used for CAM and c8b_a6.u_psi_hai_dau_rad comes from the A6 file)')
     t.add_argument('--moc', default=None, help='moc_san_do_32.csv: real swept footprint (vet thuc)')
     t.add_argument('--vien-mm', type=float, default=10.0)
     t.add_argument('--d-vet-mm', type=float, default=20.0, help='tag centre to body box centre bound [de xuat]')

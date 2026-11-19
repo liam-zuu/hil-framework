@@ -1004,7 +1004,7 @@ def test_tinh_prints_null_u_a(tmp_path, monkeypatch, capsys):
     import types
     d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
     kc = write_json(str(tmp_path / 'kc.json'), dict(A3=dict(max_deg=0.02, quy_ve_ma_noc=True, du_lieu_du=True)))
-    a6 = write_json(str(tmp_path / 'a6.json'), dict(schema='c8b_a6_v2'))
+    a6 = write_json(str(tmp_path / 'a6.json'), dict(schema='c8b_a6_v2', tam_id='T1'))
     m = types.ModuleType('c8b_a6')
     m.__file__ = a6
     m.load_a6 = lambda p: dict(tam_id='T1')
@@ -1015,6 +1015,72 @@ def test_tinh_prints_null_u_a(tmp_path, monkeypatch, capsys):
     txt = capsys.readouterr().out
     assert code in (0, 1) and 'u_a = null' in txt
     assert json.load(open(out, encoding='utf-8'))['u_a_k_deg'] is None
+
+
+def test_a6_tam_id(tmp_path):
+    """HCV3-1 (CODE 20/11): the plate is c8b_a6_v2.tam_id of the A6 file; nothing else counts as a plate."""
+    w = lambda name, obj: write_json(str(tmp_path / f'{name}.json'), obj)                  # noqa: E731
+    assert ca.a6_tam_id(w('ok', dict(schema='c8b_a6_v2', tam_id='T1'))) == 'T1'
+    for name, obj in (('none', dict(schema='c8b_a6_v2')), ('empty', dict(tam_id='')), ('num', dict(tam_id=1)),
+                      ('list', [dict(tam_id='T1')])):
+        assert ca.a6_tam_id(w(name, obj)) is None, name
+    assert ca.a6_tam_id(None) is None and ca.a6_tam_id(str(tmp_path / 'missing.json')) is None
+    bad = tmp_path / 'bad.json'
+    bad.write_text('{not json', encoding='utf-8')
+    assert ca.a6_tam_id(str(bad)) is None
+
+
+def test_frames_chain_passes_a6_plate_when_no_lan_lap(tmp_path, monkeypatch):
+    """HCV3-1: without lan_lap, frames_chain passes tam_id = c8b_a6_v2.tam_id to CAM chuoi_khung once CAM has the
+    parameter; with lan_lap it does not (CAM takes the plate from lan_lap); an older CAM without the parameter gets the
+    old call (no tam_id keyword, so no TypeError)."""
+    import types
+    a6 = write_json(str(tmp_path / 'a6.json'), dict(schema='c8b_a6_v2', tam_id='T1'))
+    m = types.ModuleType('c7_chuoi_khung')
+    seen = {}
+
+    def chuoi_khung(frames_csv, a6_, xoay, lan_lap=None, track=None, cho=None, tam_id=None):
+        seen.update(tam_id=tam_id, lan_lap=lan_lap, cho=cho)
+        return [_row(0), _row(1), _row(2)]
+    m.doc_a6, m.chuoi_khung = (lambda p: dict(sha256='x')), chuoi_khung
+    monkeypatch.setitem(sys.modules, 'c7_chuoi_khung', m)
+    F = ca.frames_chain('f.csv', a6, 'xoay.json', cho='K2')
+    assert seen == dict(tam_id='T1', lan_lap=None, cho='K2') and F['chuoi'] == 'khoa'
+    seen.clear()
+    ca.frames_chain('f.csv', a6, 'xoay.json', lan_lap=dict(_sha256='x', tam_id='T2'), cho='K2')
+    assert seen['tam_id'] is None and seen['lan_lap']['tam_id'] == 'T2'
+    seen.clear()
+    ca.frames_chain('f.csv', str(tmp_path / 'missing.json'), 'xoay.json')
+    assert 'tam_id' in seen and seen['tam_id'] is None                     # no plate: CAM's A6 check refuses
+    old = _fake_ck(monkeypatch, rows=[_row(0), _row(1)])                    # CAM 3625211: no tam_id parameter
+    assert ca.frames_chain('f.csv', a6, 'xoay.json', cho='K1')['chuoi'] == 'khoa' and old['cho'] == 'K1'
+
+
+def test_tinh_plate_from_a6(tmp_path, monkeypatch, capsys):
+    """HCV3-1: tinh takes the plate for c8b_a6.u_psi_hai_dau_rad from c8b_a6_v2.tam_id; --tam-id is optional and must
+    equal it; an A6 file without tam_id cannot give the two-end bound (code 2)."""
+    import types
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
+    kc = write_json(str(tmp_path / 'kc.json'), dict(A3=dict(quy_ve_ma_noc=True)))
+    a6 = write_json(str(tmp_path / 'a6.json'), dict(schema='c8b_a6_v2', tam_id='T1'))
+    a6_no = write_json(str(tmp_path / 'a6_no.json'), dict(schema='c8b_a6_v2'))
+    m = types.ModuleType('c8b_a6')
+    m.__file__ = a6
+    m.load_a6 = lambda p: json.load(open(p, encoding='utf-8'))
+    tams = []
+    m.u_psi_hai_dau_rad = lambda a6o, kc_, p1, p2, tam, **k: (tams.append(tam) or
+                                                               dict(u_rad=None, trang_thai='thieu', ly_do=['x']))
+    monkeypatch.setitem(sys.modules, 'c8b_a6', m)
+    out = lambda n: str(tmp_path / f'f7_{n}.json')                                           # noqa: E731
+    assert ca.main(tinh_args(d, 'K2', '--a6', a6, '--kc', kc, '--out', out(0))) in (0, 1)
+    assert tams and set(tams) == {'T1'}
+    assert ca.main(tinh_args(d, 'K2', '--a6', a6, '--kc', kc, '--tam-id', 'T1', '--out', out(1))) in (0, 1)
+    tams.clear()
+    assert ca.main(tinh_args(d, 'K2', '--a6', a6, '--kc', kc, '--tam-id', 'T2', '--out', out(2))) == 2
+    assert 'khac tam_id cua A6' in capsys.readouterr().out and not tams
+    assert ca.main(tinh_args(d, 'K2', '--a6', a6_no, '--kc', kc, '--out', out(3))) == 2
+    assert ca.main(tinh_args(d, 'K2', '--a6', a6_no, '--kc', kc, '--tam-id', 'T1', '--out', out(4))) == 2
+    capsys.readouterr()
 
 
 def test_round_v3_small_fixes(tmp_path):
