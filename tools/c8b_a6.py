@@ -4,7 +4,9 @@ c8b_a6.py: A6, the heading error of the car tag from its tilt, measured on the E
 for the relative scoring (design C8B v7 section 2, 3, 10: c8b_a6_v2; J v6 = 06_SPECS/2026-11-19_Spec_O1_v11.41_Phu_luc_J_v6.md).
 Written by CODE_C8B on feat/c8b-3b-ga, 19-20/11/2026 (M4; CODE order 19/11, Liam at CODE "duyet ca 8, giao viec cac
 phien phu theo cach nhanh"; Liam at CODE_C8B 19/11: "Lam M4 o day"). Round 1/2 of Codex (A6C1-1..15, thamdinh
-03_CODE/docs/review/2026-11-20_Tham_dinh_c8b_a6_M4.md) fixed 20/11 (CODE_C8B local_f64f609e).
+03_CODE/docs/review/2026-11-20_Tham_dinh_c8b_a6_M4.md) fixed 20/11 (CODE_C8B local_f64f609e); the ACCEPTED points of
+round 2/2 (A6C2-2..10, rest of A6C1-1, A6C1-2) fixed 20/11 (CODE_C8B local_d24e5a74; Liam at CODE_C8B: "Sua ngay, Codex
+sau (Recommended)": no round 3 now, one Codex pass after the data of session 2, L138).
 
 Model (exact for the lifted points of car_pose): a corner at height h_i = hbar + g.r_i + v s_i (r_i the corner in the
 tag frame, car_corners_body order ArUco 0..3, s = (+1, -1, +1, -1)) lifted with ONE height hbar lands at
@@ -55,9 +57,10 @@ Reader functions (data contract F3 2026-11-19 section 2.C, CAM / HIEUCHUAN / NHA
                                                     of place k takes A3_tuong_doi.A3_xp_deg[k] when every flag of k is
                                                     off (A3_tuong_doi mot_phuong / ngoai_suy / cap_hong, P1_tuong_doi
                                                     theo_vung[k]); a flag on, or an end outside every checked disc ->
-                                                    thieu (A6C1-10, CODE 20/11). A3 and A6du are added as two separate
-                                                    bounds, NOT one joint replay of design 2b (CODE 20/11, A6C1-3): the
-                                                    sum is the larger side; limit written in the output.
+                                                    thieu (A6C1-10, CODE 20/11). Both ends at the same place with A3
+                                                    per H32 case: the joint replay of design 2b per case (CODE 20/11
+                                                    changed decision, A6C1-3); else A3 and A6du added as two separate
+                                                    bounds (fallback, larger side); named in 'ghep'.
 Every number before the margin 1.25 (C8B applies it once, in c8b_khoa_v5). Constants marked [DE XUAT] are proposals.
 
   python tools/c8b_a6.py do --frames E/frames.csv --session session.json --f15 meo_E_goc.json --cho goc \
@@ -123,11 +126,17 @@ RES_FLOOR_M = 1e-5                                         # [DE XUAT] corner no
 CONV_M = 1e-10                                             # convergence: largest displacement of a step [m]
 FIT_ITERS = 40
 EBC_TOL = 0.10                                             # design 2a: refine until the maximum changes < 10 %
-EBC_K0, EBC_KMAX = 2, 16                                   # [DE XUAT] grid levels 2, 4, 8, 16; not converged -> thieu
+EBC_K0, EBC_KMAX = 4, 16                                   # [DE XUAT] grid levels 4, 8, 16 (A6C2-9: every dimension
+                                                           # refined from k = 4); not converged -> thieu
 LAP_HUONG_MAX_DEG = 5.0                                    # [DE XUAT] design 2c: same image footprint
 LAP_VUNG_M = 0.25                                          # [DE XUAT]
 O_N_ID_MIN = 10                                            # [DE XUAT] design 7c: frame ids per cell
 TOL_SETUP = 1e-9
+# L125 (Liam 19/11, 03_CODE/CLAUDE.md "Phep do va viec giao Liam"): the plumb point and Z_c of 16/11 for EVERY session
+PLUMB_L125 = (-0.4802, -0.0329)
+ZC_L125 = 2.632
+TOL_L125 = 1e-6                                            # the session numbers are these constants (float rounding)
+U_H_HANG_M = 0.0001                                        # design 3: the 0.1 mm term of u_h_chung
 HEX64 = re.compile(r'^[0-9a-f]{64}$')
 GIOI_HAN = [
     'A6C1-14: sai che do chung cua ban do (F15) va do nghieng lan nhau hoan toan; SE_E, U_meo_E khong bat duoc phan '
@@ -137,6 +146,9 @@ GIOI_HAN = [
     'dau: khong triet dau A3-A6 trong mot ca); khong thi cong hai bao rieng (du phong, lon hon)',
     'A6C1-12: hang/cot man trap tu camera session (chieu nguoc), chua kiem voi cot pixel goc cua CAM (cho CAM xuat)',
     'U_cal: venh nhua tach bang tham so v trong phep giai 4 goc (mode s_i truc giao do doc), khong cong them',
+    'A6C1-7 (DEFERRED): lan_lap_id cua clip E khai o CLI do; doi chieu voi lan_lap_v1 (F8) theo luot_id cua so E lam '
+    'o noi doc ca hai (F8 tinh tu g_b cua chinh file A6 nay: vong phu thuoc)',
+    'A6C1-2 (P2 theo L138): clip E, cua so E chi buoc co sha nguon track, cua_so_v1 trong F15; chua doi chieu noi dung',
 ]
 
 
@@ -288,14 +300,17 @@ def fit_g(P, C, H, hbar, side, iters=FIT_ITERS, fields=()):
             b = np.einsum('fij,fik,fk->j', B, Q, e)
             dgam = np.linalg.solve(M, b)
         except np.linalg.LinAlgError:
-            return dict(g=g, sigma=float(sig), v_phu=float(vv), alpha=[float(x) for x in al], T=T, psi=psi, M=M,
-                        res_rms_m=math.nan, hoi_tu=False, so_vong=it, cond=math.inf)
+            # A6C2-8: a singular step keeps every key (se_alpha inf, M None): the caller reports thieu, not a crash
+            return dict(g=g, sigma=float(sig), v_phu=float(vv), alpha=[float(x) for x in al], T=T, psi=psi, M=None,
+                        res_rms_m=math.nan, hoi_tu=False, so_vong=it, cond=math.inf, se_alpha=[math.inf] * K,
+                        sigma_toa_do_m=math.nan, bac_tu_do=None)
         dn = np.einsum('fij,fkj,fk->fi', Ai, A, e - np.einsum('fij,j->fi', B, dgam))
         T = T + dn[:, :2]
         psi = psi + dn[:, 2]
         g, vv, sig, al = g + dgam[:2], vv + dgam[2], sig + dgam[3], al + dgam[4:]
-        step = max(float(np.max(np.abs(dgam) * np.max(np.abs(B), axis=(0, 1)))),
-                   float(np.max(np.abs(dn[:, :2]))), float(np.max(np.abs(dn[:, 2]))) * side)
+        # A6C2-10: the step is the largest TOTAL displacement of a corner (pose and common parameters together)
+        mv = (np.einsum('fij,fj->fi', A, dn) + np.einsum('fij,j->fi', B, dgam)).reshape(n, 4, 2)
+        step = float(np.max(np.linalg.norm(mv, axis=2)))
         if step < CONV_M:
             ok = True
             break
@@ -304,16 +319,21 @@ def fit_g(P, C, H, hbar, side, iters=FIT_ITERS, fields=()):
     for k in range(K):
         res = res - al[k] * F[k]
     rms = float(np.sqrt(np.mean(np.sum(res ** 2, axis=2))))
+    # A6C2-10: per-coordinate noise from the residual sum over the degrees of freedom: 8 n coordinates - 3 n pose
+    # parameters - (4 + K) common parameters (g 2, v, sigma, alpha K)
+    dof = 8 * n - 3 * n - (4 + K)
+    s_xy = float(math.sqrt(np.sum(res ** 2) / dof)) if dof > 0 else math.inf
     se_al = [math.inf] * K
     if M is not None and K:
         try:
             dg = np.diag(np.linalg.inv(M))
-            se_al = [float(math.sqrt(x) * max(rms, RES_FLOOR_M)) if x > 0 else math.inf for x in dg[4:]]
+            se_al = [float(math.sqrt(x) * max(s_xy, RES_FLOOR_M)) if x > 0 and math.isfinite(x) else math.inf
+                     for x in dg[4:]]
         except np.linalg.LinAlgError:
             pass
     return dict(g=g, sigma=float(sig), v_phu=float(vv), alpha=[float(x) for x in al], T=T, psi=psi, M=M,
                 res_rms_m=rms, hoi_tu=ok, so_vong=it, cond=_cond_scaled(M) if M is not None else math.inf,
-                se_alpha=se_al)
+                se_alpha=se_al, sigma_toa_do_m=s_xy, bac_tu_do=dof)
 
 
 def fit_ok(f):
@@ -328,8 +348,14 @@ def corr_alpha_g(M):
     of fitting alpha with g (L133 (2))."""
     if M is None or M.shape[0] <= 4:
         return None
-    cov = np.linalg.inv(M)
-    sd = np.sqrt(np.diag(cov))
+    try:
+        cov = np.linalg.inv(M)
+    except np.linalg.LinAlgError:                                        # A6C2-8: singular -> no number
+        return None
+    dg = np.diag(cov)
+    if not np.all(np.isfinite(cov)) or np.any(dg <= 0):
+        return None
+    sd = np.sqrt(dg)
     return float(max(abs(cov[i, j] / (sd[i] * sd[j])) for i in (0, 1) for j in range(4, M.shape[0])))
 
 
@@ -396,8 +422,18 @@ def read_session(path):
     if not (all(math.isfinite(x) for x in (k, h, side)) and 0 < k < 1 and h > 0 and side > 0 and C.shape == (2,)
             and np.all(np.isfinite(C))):
         raise A6Error(f'{path}: car_pose numbers not finite or out of range')
+    _check_l125(C, h / k, path)
     return dict(C=C, H=h / k, hbar=h, side=side, kappa=k, sha256=cu.sha256(path), file=os.path.abspath(path),
                 camera=s.get('camera'))
+
+
+def _check_l125(C, zc, what):
+    """A6C2-6: the set-up is anchored to the plumb point and Z_c of 16/11 (L125), not only consistent between files."""
+    C = np.asarray(C, float)
+    if C.shape != (2,) or not np.all(np.isfinite(C)) or not math.isfinite(float(zc)) \
+            or not np.max(np.abs(C - np.array(PLUMB_L125))) <= TOL_L125 or not abs(float(zc) - ZC_L125) <= TOL_L125:
+        raise A6Error(f'{what}: plumb {C.tolist()} / Z_c {zc} are not the 16/11 set-up {list(PLUMB_L125)}, {ZC_L125} '
+                      f'(L125)')
 
 
 def camera_of(ses):
@@ -436,7 +472,18 @@ def read_f15(path, ses, frames_sha, t_all):
         raise A6Error(f'{path}: nguon session sha256 is not the session given')
     if not isinstance(d.get('clip_sha256'), str) or not HEX64.match(d['clip_sha256']):
         raise A6Error(f'{path}: clip_sha256 missing')
+    for v in ('track', 'cua_so_v1'):                 # A6C1-2: the E clip and window tied to their sources (sha only)
+        if not isinstance((src.get(v) or {}).get('sha256'), str) or not HEX64.match(src[v]['sha256']):
+            raise A6Error(f'{path}: nguon {v} sha256 missing (the E window must come from track / cua_so_v1)')
     ca_l = [x for x in ((d.get('ban_do') or {}).get('ca') or []) if isinstance(x, dict)]
+    hid = (d.get('ban_do') or {}).get('H32_ids')
+    if not isinstance(hid, list) or not hid:
+        raise A6Error(f'{path}: ban_do.H32_ids missing')
+    bo = [x.get('bo_ids') for x in ca_l]
+    if any(not isinstance(b, list) or not b or not set(b) <= set(hid) for b in bo):
+        raise A6Error(f'{path}: a case bo_ids empty or not within H32_ids')
+    if set(hid) - set().union(*map(set, bo)):
+        raise A6Error(f'{path}: H32 ids {sorted(set(hid) - set().union(*map(set, bo)))} left out by no case (A6C1-2)')
     ca = [x.get('ten') for x in ca_l]
     a3_ca = {x.get('ten'): (x.get('A3') or {}).get('quy_max_deg') for x in ca_l if isinstance(x.get('A3'), dict)}
     khung = []
@@ -444,7 +491,8 @@ def read_f15(path, ses, frames_sha, t_all):
         fid, ts = k.get('frame_id'), k.get('t_s')
         if isinstance(fid, bool) or not isinstance(fid, int) or fid not in t_all:
             raise A6Error(f'{path}: frame_id {fid!r} not a frame of the frames.csv')
-        if isinstance(ts, bool) or not isinstance(ts, (int, float)) or abs(float(ts) - t_all[fid]) > 1e-6:
+        if isinstance(ts, bool) or not isinstance(ts, (int, float)) or not math.isfinite(float(ts)) \
+                or not abs(float(ts) - t_all[fid]) <= 1e-6:
             raise A6Error(f'{path}: frame {fid} t_s {ts!r} is not the time of the frames.csv ({t_all[fid]})')
         gm = np.asarray(k.get('goc_m'), float)
         if gm.shape != (4, 2) or not np.all(np.isfinite(gm)):
@@ -628,19 +676,22 @@ def do_place(cho, idx, t, P, ses, f15, cam, tam_id, lan_lap_id):
 def _ebc_level(g_hat, eps_g, C, H, hbar, side, cam_c, rho_max, v_max, k, chunk=400_000):
     """Largest |heading error after the correction - truth| on one grid: tag centre at k + 1 radii in [0, rho_max -
     side / sqrt 2] (every corner within rho_max) x 2k directions, 2k tag headings, g = g_hat + eps_g r (cos, sin) for
-    r in {0} and max(1, k // 4) radii x max(4, k) directions, v in max(3, k // 2 + 1) levels of [-v_max, v_max].
+    r in {0} and k // 2 radii x k directions, v in k // 2 + 1 levels of [-v_max, v_max] (A6C2-9: from k = 4 every
+    dimension is refined at every level).
     Real car_pose path (A6C1-9): ray from the camera centre cam_c = (x, y, z) through the corner at its height to the
     floor, lift with kappa = hbar / H about C, Kabsch; the model evaluated at the MEASURED centre and heading."""
     C = np.asarray(C, float)
     r_in = max(0.0, rho_max - side / math.sqrt(2.0))
     rhos = np.linspace(0.0, r_in, k + 1)
     angs = np.linspace(0.0, 2 * math.pi, 2 * k, endpoint=False)
-    nr, nd = max(1, k // 4), max(4, k)
+    if k < 4:
+        raise A6Error(f'e_bc grid level k = {k} < 4 (A6C2-9)')
+    nr, nd = k // 2, k
     gd = np.linspace(0.0, 2 * math.pi, nd, endpoint=False)
     gs = [np.asarray(g_hat, float)] + [np.asarray(g_hat, float) + eps_g * (j / nr) * np.array([math.cos(a), math.sin(a)])
                                        for j in range(1, nr + 1) for a in gd]
     gs = np.array(gs)
-    vs = np.linspace(-v_max, v_max, max(3, k // 2 + 1))
+    vs = np.linspace(-v_max, v_max, k // 2 + 1)
     grids = np.meshgrid(np.arange(len(rhos)), np.arange(len(angs)), np.arange(len(angs)), np.arange(len(gs)),
                         np.arange(len(vs)), indexing='ij')
     flat = [x.ravel() for x in grids]
@@ -685,7 +736,7 @@ def dpsi_model_vec(g, t, psi, C, H, hbar):
 
 
 def e_bc(g_hat, eps_g, C, H, hbar, side, cam_c, rho_max=RHO_MAX_M, v_max=V_MAX_M):
-    """design 2a: the grid is halved (k = 2, 4, 8, 16) until the maximum changes by < EBC_TOL; an index, no claim
+    """design 2a: the grid is halved (k = 4, 8, 16) until the maximum changes by < EBC_TOL; an index, no claim
     between the nodes. Returns (value or None when not converged by EBC_KMAX, [[k, maximum], ...]) (A6C1-9)."""
     lv, k = [], EBC_K0
     while k <= EBC_KMAX:
@@ -713,10 +764,11 @@ def _load(path, schema):
 def kiem_lap(d, tam_id):
     """U_chuyen.lap from a c8b_a6_lap_v1: pairs of windows of DIFFERENT mountings of the plate on the same image
     footprint (heading within LAP_HUONG_MAX_DEG, centres within LAP_VUNG_M); u = max over pairs |g_a - g_b| +
-    2 sqrt(|SE_a|^2 + |SE_b|^2) (noise added, not removed, as dong [DE XUAT]). Returns (u or None, reasons)."""
+    2 sqrt(|SE_a|^2 + |SE_b|^2) (noise added, not removed, as dong [DE XUAT]). Returns (u or None, reasons, {frozenset
+    (mounting a, mounting b): u of that pair} for the per-place cross-check, A6C2-3)."""
     if d is None:
         return None, ['U_chuyen.lap missing (c8b_a6_lap_v1: two windows of different mountings on the same image '
-                      'footprint, design 2c)']
+                      'footprint, design 2c)'], {}
     why = []
     if d.get('tam_id') != tam_id:
         why.append(f'lap: plate {d.get("tam_id")!r}, not {tam_id!r}')
@@ -725,8 +777,8 @@ def kiem_lap(d, tam_id):
     cap = d.get('cap')
     if not isinstance(cap, list) or not cap:
         why.append('lap: no pair')
-        return None, why
-    us = []
+        return None, why, {}
+    us, per = [], {}
     for i, c in enumerate(cap):
         try:
             if not isinstance(c, dict):
@@ -741,11 +793,13 @@ def kiem_lap(d, tam_id):
             ga, gb = _vec(c.get('g_a'), 2, 'g_a'), _vec(c.get('g_b'), 2, 'g_b')
             sa, sb = _vec(c.get('SE_a'), 2, 'SE_a', 0.0), _vec(c.get('SE_b'), 2, 'SE_b', 0.0)
             us.append(float(np.linalg.norm(ga - gb) + 2.0 * math.sqrt(sa @ sa + sb @ sb)))
+            key = frozenset((a_, b_))
+            per[key] = max(per.get(key, 0.0), us[-1])
         except A6Error as e:
             why.append(f'lap pair {i}: {e}')
     if why:
-        return None, why
-    return max(us), []
+        return None, why, {}
+    return max(us), [], per
 
 
 def kiem_dong(d, tam_id, g_hat):
@@ -761,9 +815,14 @@ def kiem_dong(d, tam_id, g_hat):
         why.append(f'dong: trang_thai {d.get("trang_thai")!r}')
     dn = d.get('dai_dinh_nghia')
     names = [x.get('ten') for x in dn] if isinstance(dn, list) and all(isinstance(x, dict) for x in dn) else []
-    if not names or len(set(names)) != len(names) or not any(x.get('nua') is True for x in dn) \
-            or not any(x.get('nua') is False for x in dn):
+    if not names or len(set(names)) != len(names) or not all(isinstance(x, str) and x for x in names) \
+            or not any(x.get('nua') is True for x in dn) or not any(x.get('nua') is False for x in dn):
         why.append('dong: dai_dinh_nghia needs unique bands, full and half bands')
+    else:
+        try:
+            nua_cua = _dong_halves(dn)
+        except A6Error as e:
+            why.append(f'dong: {e}')
     luot = d.get('luot')
     if not isinstance(luot, dict) or not luot:
         why.append('dong: no target run')
@@ -772,15 +831,20 @@ def kiem_dong(d, tam_id, g_hat):
     theo, thieu = {}, []
     for lid, x in luot.items():
         bo = (x or {}).get('bo_luot')
-        if not isinstance(bo, list) or not bo or lid in bo:
-            why.append(f'dong {lid}: bo_luot {bo!r} must list the other runs and not the target run')
+        # A6C2-4: the fit leaves out the target run only: it uses EVERY other target run of the file
+        if not isinstance(bo, list) or len(set(bo)) != len(bo) or set(bo) != set(luot) - {lid}:
+            why.append(f'dong {lid}: bo_luot {bo!r} must be every other run of the file ({sorted(set(luot) - {lid})})')
             continue
         theo[lid] = {}
         for nm in names:
             b = ((x or {}).get('dai') or {}).get(nm)
             try:
-                if b is None:
+                if not bo:
+                    raise A6Error('no other run')
+                if not isinstance(b, dict):
                     raise A6Error('band missing')
+                if b.get('trang_thai', 'dat') != 'dat':
+                    raise A6Error(f'trang_thai {b.get("trang_thai")!r}')
                 n = b.get('n_khung')
                 if isinstance(n, bool) or not isinstance(n, int) or n < N_MIN:
                     raise A6Error(f'{n!r} frames < {N_MIN}')
@@ -794,17 +858,74 @@ def kiem_dong(d, tam_id, g_hat):
     vals = [v for t in theo.values() for v in t.values() if v is not None]
     if not vals:
         return None, ['dong: no band with data']
-    return dict(theo_luot=theo, max=max(vals), thieu=thieu, dai_dinh_nghia=dn), []
+    return dict(theo_luot=theo, max=max(vals), thieu=thieu, dai_dinh_nghia=dn,
+                nua_cua={k: list(v) for k, v in nua_cua.items()}), []
 
 
-def kiem_o(d, cho_sha, khoa_sha):
+def _dong_halves(dn):
+    """A6C2-4: every full band [a_lo, a_hi] has exactly its two half bands [a_lo, mid], [mid, a_hi] (mid the middle),
+    every half band belongs to one full band; edges finite, a_lo < a_hi. Returns {full band: (low half, high half)}."""
+    eg = {}
+    for x in dn:
+        lo, hi = _num(x.get('a_lo'), f'band {x.get("ten")} a_lo'), _num(x.get('a_hi'), f'band {x.get("ten")} a_hi')
+        if not lo < hi or not isinstance(x.get('nua'), bool):
+            raise A6Error(f'band {x.get("ten")}: a_lo < a_hi and nua true / false needed')
+        eg[x['ten']] = (lo, hi, x['nua'])
+    full = {k: v for k, v in eg.items() if not v[2]}
+    half = {k: v for k, v in eg.items() if v[2]}
+    out, used = {}, set()
+    for k, (lo, hi, _) in full.items():
+        mid = 0.5 * (lo + hi)
+        tol = 1e-12 * max(1.0, abs(hi))
+        a = [h for h, (l2, h2, _) in half.items() if abs(l2 - lo) <= tol and abs(h2 - mid) <= tol]
+        b = [h for h, (l2, h2, _) in half.items() if abs(l2 - mid) <= tol and abs(h2 - hi) <= tol]
+        if len(a) != 1 or len(b) != 1:
+            raise A6Error(f'full band {k} [{lo}, {hi}] without exactly its two half bands')
+        out[k] = (a[0], b[0])
+        used |= {a[0], b[0]}
+    if set(half) - used:
+        raise A6Error(f'half bands {sorted(set(half) - used)} of no full band')
+    return out
+
+
+def _json_eq(a, b):
+    return json.dumps(a, sort_keys=True, ensure_ascii=False) == json.dumps(b, sort_keys=True, ensure_ascii=False)
+
+
+def kiem_o(d, cho_sha, khoa_sha, rows=None, khoa=None):
     """The held-out camera-IMU check (design 2b) from a c8b_a6_o_v1: the place fits it used (cho_sha256) are files
-    given to gop, locked before (khoa_truoc_sha256 = the lock of gop), three disjoint sets (khop, kiem, dich), and in
-    EVERY cell of the test set n_id >= O_N_ID_MIN, n_thieu 0 and |d|max <= U_psi + U_IMU,D (absolute, before the
-    margin), recomputed here. Returns (dat, reasons) (A6C1-4)."""
+    given to gop, locked before (khoa_truoc_sha256 = the lock of gop), three disjoint NON-EMPTY sets (khop, kiem,
+    dich) equal to the sets of the lock (khoa: the parsed lock JSON with 'tap' {khop, kiem, dich}), the cells REBUILT
+    here from the rows (c8b_a6_o.read_rows of the rows file named in its nguon; the CLI checks that file's sha256) with
+    c8b_a6_o.build and equal to the file (no cell can be dropped, A6C2-2), and in EVERY cell of the test set
+    n_id >= O_N_ID_MIN, n_thieu 0 and |d|max <= U_psi + U_IMU,D (absolute, before the margin). Returns (dat, reasons)
+    (A6C1-4, A6C2-2)."""
     if d is None:
         return False, ['no camera-IMU held-out check (c8b_a6_o_v1, design 2b): A6 not checked']
     why = []
+    if d.get('muc_dich') != 'giu_ngoai_a6':
+        why.append(f'giu_ngoai: muc_dich {d.get("muc_dich")!r}, not giu_ngoai_a6')
+    tap0 = d.get('tap') or {}
+    if not all(isinstance(tap0.get(k), list) and tap0.get(k) for k in ('khop', 'kiem', 'dich')):
+        why.append('giu_ngoai: tap khop, kiem, dich must all be non-empty lists (A6C2-2)')
+    kt = (khoa or {}).get('tap') if isinstance(khoa, dict) else None
+    if not isinstance(kt, dict) or any(not isinstance(kt.get(k), list) or sorted(kt[k]) != sorted(tap0.get(k) or [])
+                                       for k in ('khop', 'kiem', 'dich')):
+        why.append('giu_ngoai: tap is not the three sets of the lock (khoa_truoc.tap) (A6C2-2)')
+    if rows is None:
+        why.append('giu_ngoai: rows of the cells not given: cells not rebuilt (A6C2-2)')
+    else:
+        import c8b_a6_o as om
+        try:
+            rb = om.build(rows, d.get('muc_dich'), d.get('giu_ngoai_theo'), d.get('khoa_truoc_sha256'),
+                          (d.get('a6_khop') or {}).get('cho_sha256') or [],
+                          tuple((d.get('khoa_o') or {}).get('DAI_U') or ()))
+            rb = json.loads(json.dumps(rb, ensure_ascii=False))
+            bad = [k for k in ('o', 'tap', 'trang_thai', 'khoa_o', 'n_ngoai_dai_u') if not _json_eq(rb.get(k), d.get(k))]
+            if bad:
+                why.append(f'giu_ngoai: {bad} differ from the cells rebuilt from the rows (A6C2-2)')
+        except (ValueError, TypeError, KeyError) as e:
+            why.append(f'giu_ngoai: cells not rebuilt from the rows ({e}) (A6C2-2)')
     if d.get('truoc_le') is not True:
         why.append('giu_ngoai: truoc_le true needed')
     if khoa_sha is None or d.get('khoa_truoc_sha256') != khoa_sha:
@@ -846,8 +967,10 @@ def kiem_o(d, cho_sha, khoa_sha):
     return not why, why
 
 
-def kiem_u_h(d, tam_id):
-    """u_h_chung from a c8b_u_h_chung_v1 (design 3: spread of the held-out jigs + |h_video - caliper| + 0.1 mm)."""
+def kiem_u_h(d, tam_id, h_m=None):
+    """u_h_chung from a c8b_u_h_chung_v1 (design 3, A6C2-5): the three parts phan = {do_trai_ba_ga_m (spread of the
+    held-out jigs, n_ga_giu_ngoai >= 3), lech_video_so_tay_m (|h_bar video - caliper|), hang_m (= 0.1 mm)}, each finite
+    >= 0; u_h_chung_m their sum recomputed here; h_m of the file = the h of the run (the car_pose tag_h_m)."""
     if d is None:
         return None, ['u_h_chung missing (c8b_u_h_chung_v1, video multi-height, design 3)']
     why = []
@@ -855,8 +978,25 @@ def kiem_u_h(d, tam_id):
         why.append(f'u_h_chung: plate {d.get("tam_id")!r}, not {tam_id!r}')
     if d.get('trang_thai') != 'dat':
         why.append(f'u_h_chung: trang_thai {d.get("trang_thai")!r}')
+    v = None
     try:
+        ph = d.get('phan')
+        if not isinstance(ph, dict):
+            raise A6Error('u_h_chung: phan {do_trai_ba_ga_m, lech_video_so_tay_m, hang_m} missing')
+        parts = [_num(ph.get(k), f'u_h_chung phan.{k}', 0.0) for k in ('do_trai_ba_ga_m', 'lech_video_so_tay_m',
+                                                                       'hang_m')]
+        if abs(parts[2] - U_H_HANG_M) > 1e-12:
+            raise A6Error(f'u_h_chung phan.hang_m {parts[2]} is not {U_H_HANG_M} m (design 3)')
+        n = d.get('n_ga_giu_ngoai')
+        if isinstance(n, bool) or not isinstance(n, int) or n < 3:
+            raise A6Error(f'u_h_chung: n_ga_giu_ngoai {n!r} < 3 (three held-out jigs, design 3)')
         v = _num(d.get('u_h_chung_m'), 'u_h_chung_m', 0.0)
+        if abs(v - sum(parts)) > 1e-12:
+            raise A6Error(f'u_h_chung_m {v} is not the sum of its three parts {sum(parts)}')
+        if h_m is not None:
+            hf = _num(d.get('h_m'), 'u_h_chung h_m', 0.0)
+            if abs(hf - float(h_m)) > TOL_SETUP:
+                raise A6Error(f'u_h_chung h_m {hf} is not the h of the run {h_m}')
     except A6Error as e:
         why.append(str(e))
         v = None
@@ -872,8 +1012,9 @@ def _deg_rad(v):
 
 
 def gop(places, tam_id, tam_cal_id, lap=None, dong=None, giu_ngoai=None, u_h=None, khoa_truoc_sha256=None,
-        script=None, cho_sha=(), nguon=(), with_ebc=True, lan_lap_cal_id=None):
-    """c8b_a6_v2 of one plate from the place results (design 2c, 3, 10); the sources are parsed dicts (CLI: files)."""
+        script=None, cho_sha=(), nguon=(), with_ebc=True, lan_lap_cal_id=None, giu_ngoai_rows=None, khoa=None):
+    """c8b_a6_v2 of one plate from the place results (design 2c, 3, 10); the sources are parsed dicts (CLI: files);
+    giu_ngoai_rows the rows of the held-out cells (c8b_a6_o.read_rows), khoa the parsed lock JSON (A6C2-2)."""
     why = []
     if not places:
         raise A6Error('no place')
@@ -884,6 +1025,7 @@ def gop(places, tam_id, tam_cal_id, lap=None, dong=None, giu_ngoai=None, u_h=Non
         raise A6Error(f'a place of another plate than {tam_id!r} (A6C1-7)')
     s0 = places[0]['set_up']
     C, H, hb, side = np.array(s0['C']), s0['H_m'], s0['h_m'], s0['side_m']
+    _check_l125(C, H, 'gop set_up')                                       # A6C2-6
     for p in places:
         if p['trang_thai'] != 'dat':
             why += [f'{p["cho"]}: {w}' for w in p['ly_do']] or [f'{p["cho"]}: trang_thai {p["trang_thai"]}']
@@ -899,16 +1041,17 @@ def gop(places, tam_id, tam_cal_id, lap=None, dong=None, giu_ngoai=None, u_h=Non
         w = [1.0 / max(p['s_E_norm'], 1e-12) ** 2 for p in ok]
         g_hat = np.sum([wi * np.array(p['g_E']) for wi, p in zip(w, ok)], axis=0) / sum(w)
         s_norm = max(p['s_E_norm'] for p in ok)
-    u_lap, w_lap = kiem_lap(lap, tam_id)
+    u_lap, w_lap, lap_cap = kiem_lap(lap, tam_id)
     why += w_lap
-    gp = {p['cho']: np.array(p['g_E']) for p in places if p['g_E'] is not None}
+    # A6C1-1: U_chuyen.cho only from places with a usable bound (full F15 dat), never from a diagnostic g_E
+    gp = {p['cho']: np.array(p['g_E']) for p in ok}
     u_cho = None
     if len(gp) == 2:
         u_cho = float(np.linalg.norm(gp['goc'] - gp['K1']))
     elif len(places) == 1:
         why.append('one place only: U_chuyen.cho (goc - K1) not measured')
     else:
-        why.append('a place without g: U_chuyen.cho not measured')
+        why.append('a place without a usable g (F15 full dat): U_chuyen.cho not measured')
     dong_b, w_dong = kiem_dong(dong, tam_id, g_hat)
     why += w_dong
     u_dong = None if dong_b is None else dong_b['max']
@@ -917,9 +1060,15 @@ def gop(places, tam_id, tam_cal_id, lap=None, dong=None, giu_ngoai=None, u_h=Non
     if not tam_moi:
         for p in ok:
             dist_p = float(np.linalg.norm(np.array(p['g_E']) - gc))
-            lim = p['s_E_norm'] + uc_norm + (u_lap if (u_lap is not None and p.get('lan_lap_id') != lan_lap_cal_id)
-                                             else 0.0)
-            nq[p['cho']] = dict(khoang=dist_p, nguong=lim, dat=bool(dist_p <= lim))
+            # A6C2-3: widened only by a pair joining the caliper mounting and the mounting of this place's E clip;
+            # no --lan-lap-cal-id or no such pair -> not widened
+            lp = p.get('lan_lap_id')
+            u_pair = None
+            if isinstance(lan_lap_cal_id, str) and lan_lap_cal_id and isinstance(lp, str) and lp != lan_lap_cal_id:
+                u_pair = lap_cap.get(frozenset((lan_lap_cal_id, lp)))
+            lim = p['s_E_norm'] + uc_norm + (u_pair or 0.0)
+            nq[p['cho']] = dict(khoang=dist_p, nguong=lim, dat=bool(dist_p <= lim), u_lap_cap=u_pair,
+                                lan_lap_id=lp, lan_lap_cal_id=lan_lap_cal_id)
             if dist_p > lim:
                 why.append(f'g_cal_bat_nhat at {p["cho"]}: |g_E - g_cal| {dist_p:.5f} > s_E + U_cal + dg_lap {lim:.5f}'
                            f' (design 2c)')
@@ -937,7 +1086,7 @@ def gop(places, tam_id, tam_cal_id, lap=None, dong=None, giu_ngoai=None, u_h=Non
         a3c = p.get('A3_theo_ca_deg') or {}
         ca_cho[p['cho']] = {nm: dict(dg=dg, dg_norm=float(np.linalg.norm(dg)), A3_rad=_deg_rad(a3c.get(nm)))
                             for nm, dg in (p.get('U_meo_E_theo_ca') or {}).items()}
-    o_ok, w_o = kiem_o(giu_ngoai, cho_sha, khoa_truoc_sha256)
+    o_ok, w_o = kiem_o(giu_ngoai, cho_sha, khoa_truoc_sha256, giu_ngoai_rows, khoa)
     why += w_o
     if khoa_truoc_sha256 is None:
         why.append('khoa_truoc_sha256 missing (the lock before the checks, design 0.3, A6C1-4)')
@@ -961,7 +1110,7 @@ def gop(places, tam_id, tam_cal_id, lap=None, dong=None, giu_ngoai=None, u_h=Non
             why.append(f'outside the A6 domain: tilt {math.degrees(tilt):.2f} deg (<= 1.5) or a corner at rho '
                        f'{rho:.3f} m (<= {RHO_MAX_M})')
     st_a6 = 'dat' if (not why and eps is not None and ebc is not None and o_ok) else 'thieu'
-    u_hc, w_h = kiem_u_h(u_h, tam_id)
+    u_hc, w_h = kiem_u_h(u_h, tam_id, hb)
     r = body(side)
     why_h = list(w_h) + ([] if st_a6 == 'dat' else ['A6 not dat: h_goc_m from g_b not usable (A6C1-7)'])
     st_h = 'dat' if not why_h else 'thieu'
@@ -991,7 +1140,8 @@ def gop(places, tam_id, tam_cal_id, lap=None, dong=None, giu_ngoai=None, u_h=Non
                 ghep_A3_A6=dict(cach='replay chung theo ca H32 (2b) khi hai dau cung mot cho co A3 tung ca; '
                                      'khong thi cong rieng (du phong)', theo_cho=ca_cho),
                 trang_thai=dict(a6=st_a6, h=st_h), ly_do=why, ly_do_h=why_h, gioi_han=list(GIOI_HAN),
-                khoa_truoc_sha256=khoa_truoc_sha256, commit=(script or {}).get('commit'),
+                khoa_truoc_sha256=khoa_truoc_sha256, khoa_truoc_sha=khoa_truoc_sha256,      # F3 2.C name (alias)
+                commit=(script or {}).get('commit'),
                 commit_dirty=(script or {}).get('dirty'), nguon=list(nguon), so_tay=SO_TAY, truoc_le=True)
 
 
@@ -1003,13 +1153,53 @@ def load_a6(path):
         d = json.load(f)
     if not isinstance(d, dict) or d.get('schema') != SCHEMA:
         raise A6Error(f'{path}: not a {SCHEMA} file')
+    bad = _a6_loi(d)
+    if bad:
+        raise A6Error(f'{path}: {bad} (A6C2-6)')
     d['_sha256'] = cu.sha256(path)
     return d
 
 
+def _a6_loi(a6):
+    """A6C2-6: the reason the numbers of an A6 dict are not usable, or None: set-up (plumb, Z_c of 16/11 L125, H > h >
+    0, side > 0, rho_max > 0) finite; every bound present finite and >= 0; g_b two finite numbers."""
+    def fin(x, lo=None):
+        return not isinstance(x, bool) and isinstance(x, (int, float)) and math.isfinite(x) and (lo is None or x >= lo)
+    try:
+        pl = a6.get('plumb_xy_m')
+        if not (isinstance(pl, list) and len(pl) == 2 and all(fin(v) for v in pl)):
+            return 'plumb_xy_m not two finite numbers'
+        H, h, side = a6.get('H_m'), a6.get('h_m'), a6.get('side_m')
+        if not (fin(H) and fin(h) and fin(side) and H > h > 0 and side > 0):
+            return 'H_m > h_m > 0 and side_m > 0 needed'
+        _check_l125(pl, H, 'A6 file')
+        if not fin((a6.get('mien') or {}).get('rho_max_m', RHO_MAX_M), 0.0):
+            return 'mien.rho_max_m not finite >= 0'
+        for k in ('eps_g', 'eps_g_khong_dong', 'eps_g_khong_meo', 'eps_g_khong_meo_khong_dong', 'e_bc_rad'):
+            if a6.get(k) is not None and not fin(a6[k], 0.0):
+                return f'{k} {a6.get(k)!r} not finite >= 0'
+        g = a6.get('g_b')
+        if g is not None and not (isinstance(g, list) and len(g) == 2 and all(fin(v) for v in g)):
+            return 'g_b not two finite numbers'
+        dg = a6.get('dong')
+        if isinstance(dg, dict):
+            if dg.get('max') is not None and not fin(dg['max'], 0.0):
+                return 'dong.max not finite >= 0'
+            for tl in (dg.get('theo_luot') or {}).values():
+                if any(v is not None and not fin(v, 0.0) for v in (tl or {}).values()):
+                    return 'dong.theo_luot value not finite >= 0'
+        for cases in ((a6.get('ghep_A3_A6') or {}).get('theo_cho') or {}).values():
+            for c in (cases or {}).values():
+                if not fin(c.get('dg_norm'), 0.0) or (c.get('A3_rad') is not None and not fin(c['A3_rad'], 0.0)):
+                    return 'ghep_A3_A6 case numbers not finite >= 0'
+    except (A6Error, AttributeError, TypeError) as e:
+        return str(e)
+    return None
+
+
 def _a6_dat(a6):
     return isinstance(a6, dict) and (a6.get('trang_thai') or {}).get('a6') == 'dat' and a6.get('g_b') is not None \
-        and a6.get('eps_g') is not None and a6.get('e_bc_rad') is not None
+        and a6.get('eps_g') is not None and a6.get('e_bc_rad') is not None and _a6_loi(a6) is None
 
 
 def ap_dung(a6, tam_id):
@@ -1027,8 +1217,14 @@ def ap_dung(a6, tam_id):
 
 
 def _same_setup(a6, plumb_xy_m, zc_m):
-    if np.max(np.abs(np.asarray(plumb_xy_m, float) - np.asarray(a6['plumb_xy_m'], float))) > TOL_SETUP \
-            or not abs(float(zc_m) - float(a6['H_m'])) <= TOL_SETUP:
+    try:
+        pl = np.asarray(plumb_xy_m, float)
+        same = bool(pl.shape == (2,) and np.all(np.isfinite(pl))
+                    and np.max(np.abs(pl - np.asarray(a6['plumb_xy_m'], float))) <= TOL_SETUP
+                    and abs(float(zc_m) - float(a6['H_m'])) <= TOL_SETUP)          # NaN never passes (A6C2-6)
+    except (TypeError, ValueError, KeyError):
+        same = False
+    if not same:
         raise A6Error('plumb point / Z_c are not the car_pose set-up of the A6 file')
 
 
@@ -1080,6 +1276,11 @@ def _u_dong(a6, luot, dai):
         if any(v is None for v in tl.values()):
             return None, f'dong: run {luot!r} has thieu bands, band of the frame not given'
         return max(tl.values()), ''
+    # A6C2-4: the frame's full band AND its half band (by the edges of dai_dinh_nghia), nothing else
+    nua = b.get('nua_cua') or {}
+    full = [nm for nm in names if nm in nua]
+    if len(names) != 2 or len(full) != 1 or (set(names) - set(full)).pop() not in nua[full[0]]:
+        return None, f'dong: bands {names} are not one full band and one of its half bands'
     vals = [tl.get(nm) for nm in names]
     if any(v is None for v in vals):
         return None, f'dong: band {names} of run {luot!r} thieu'
@@ -1115,8 +1316,11 @@ def _flag_on(v):
 
 def _a3_rad(kc, p_xy, plumb):
     """(A3 [rad] or None, reason, place k) of the camera at the floor point p from KIEMCHEO kiem_cheo.json
-    (c7_kiem_cheo_v7, S7): A3 carried to the car tag, over the full pair set (du_lieu_du), then an end inside the checked start disc (MIEN_XP_M about hang_so_s7.xuat_phat[k]) of place k with every
-    flag of k off takes A3_tuong_doi.A3_xp_deg[k]; else thieu (A6C1-10, CODE 20/11)."""
+    (c7_kiem_cheo_v7, S7): A3 carried to the car tag, over the full pair set (du_lieu_du); then every checked region
+    holding the end: the 12b corridor of place k (A3_tuong_doi.duong_12b, KIEMCHEO d21f149, HCV3-2: within ban_kinh_m of
+    doan_m[k], its A3 flags off -> A3_deg[k]; no P1 flag for a corridor) and the start disc of place k (MIEN_XP_M about
+    hang_so_s7.xuat_phat[k], every A3 and P1 flag of k off -> A3_tuong_doi.A3_xp_deg[k]); the largest usable A3 of
+    them; a region with a flag on is not usable; no usable region -> thieu (A6C1-10, CODE 20/11)."""
     if not isinstance(kc, dict) or kc.get('version') != KC_VERSION or kc.get('thu'):
         return None, f'kiem_cheo.json not {KC_VERSION} (or a trial)', None
     a3 = kc.get('A3') or {}
@@ -1127,32 +1331,85 @@ def _a3_rad(kc, p_xy, plumb):
     hs = kc.get('hang_so_s7') or {}
     xp, r_xp = hs.get('xuat_phat'), hs.get('MIEN_XP_M')
     pl = hs.get('plumb')
-    if not isinstance(xp, dict) or isinstance(r_xp, bool) or not isinstance(r_xp, (int, float)):
-        return None, 'kiem_cheo.json without S7 start regions (--xuat-phat)', None
-    if not isinstance(pl, list) or len(pl) != 2 or np.max(np.abs(np.asarray(pl, float) - np.asarray(plumb))) > TOL_SETUP:
+    if not isinstance(xp, dict) or not xp or isinstance(r_xp, bool) or not isinstance(r_xp, (int, float)) \
+            or not math.isfinite(r_xp) or not r_xp > 0:
+        return None, 'kiem_cheo.json without S7 start regions (--xuat-phat) or MIEN_XP_M not finite > 0', None
+    for k, c in xp.items():                          # A6C2-7: a NaN centre would let a far end pass the disc test
+        try:
+            cc = np.asarray(c, float)
+        except (TypeError, ValueError):
+            cc = np.full(1, np.nan)
+        if cc.shape != (2,) or not np.all(np.isfinite(cc)):
+            return None, f'kiem_cheo.json xuat_phat[{k}] not two finite numbers', None
+    try:
+        pl_ok = isinstance(pl, list) and len(pl) == 2 \
+            and bool(np.max(np.abs(np.asarray(pl, float) - np.asarray(plumb, float))) <= TOL_SETUP)
+    except (TypeError, ValueError):
+        pl_ok = False
+    if not pl_ok:
         return None, 'kiem_cheo.json plumb is not the car_pose plumb of the A6 file', None
     p = np.asarray(p_xy, float)
     if p.shape != (2,) or not np.all(np.isfinite(p)):
         return None, 'end point not finite', None
     at = kc.get('A3_tuong_doi') or {}
     tv = (kc.get('P1_tuong_doi') or {}).get('theo_vung') or {}
-    for k, c in xp.items():
-        try:
-            if np.linalg.norm(p - np.asarray(c, float)) > float(r_xp) + 1e-12:
+    cand, bad = [], []                                   # (A3 deg, place, region) usable; reasons of regions hit
+    # HCV3-2 (KIEMCHEO d21f149, CODE 20/11): the 12b corridor of place k = every point within ban_kinh_m of the segment
+    # doan_m[k]; only the A3 flags of the corridor (no P1 pair is computed there); tried first
+    du = at.get('duong_12b')
+    if du is not None:
+        if not isinstance(du, dict):
+            return None, 'A3_tuong_doi.duong_12b not a block', None
+        rk = du.get('ban_kinh_m')
+        if isinstance(rk, bool) or not isinstance(rk, (int, float)) or not math.isfinite(rk) or not rk > 0:
+            return None, f'A3_tuong_doi.duong_12b.ban_kinh_m {rk!r} not finite > 0', None
+        for k, seg in (du.get('doan_m') or {}).items():
+            try:
+                ab = np.asarray(seg, float)
+            except (TypeError, ValueError):
+                ab = np.full(1, np.nan)
+            if ab.shape != (2, 2) or not np.all(np.isfinite(ab)):
+                return None, f'duong_12b.doan_m[{k}] not two finite points', None
+            if not _dist_seg(p, ab[0], ab[1]) <= float(rk) + 1e-12:
                 continue
-        except (TypeError, ValueError):
+            flags = [f'duong_12b.{n}[{k}]' for n in ('mot_phuong', 'ngoai_suy', 'cap_hong')
+                     if _flag_on((du.get(n) or {}).get(k))]
+            v = (du.get('A3_deg') or {}).get(k)
+            if flags:
+                bad.append(f'A3 at corridor {k}: flag on {flags}')
+            elif isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0:
+                bad.append(f'duong_12b.A3_deg[{k}] {v!r}')
+            else:
+                cand.append((float(v), k, 'duong_12b'))
+    for k, c in xp.items():
+        if not np.linalg.norm(p - np.asarray(c, float)) <= float(r_xp) + 1e-12:
             continue
         flags = [f'A3_tuong_doi.{n}[{k}]' for n in ('mot_phuong', 'ngoai_suy', 'cap_hong')
                  if _flag_on((at.get(n) or {}).get(k))]
         flags += [f'P1_tuong_doi.theo_vung.{k}.{n}' for n in ('mot_phuong', 'ngoai_suy', 'cap_hong')
                   if _flag_on((tv.get(k) or {}).get(n))]
-        if flags:
-            return None, f'A3 at {k}: flag on {flags}', None
         v = (at.get('A3_xp_deg') or {}).get(k)
-        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0:
-            return None, f'A3_xp_deg[{k}] {v!r}', None
-        return math.radians(float(v)), '', k
-    return None, 'end outside every checked start disc: A3 by position not computed (A3loc needs the mark table)', None
+        if flags:
+            bad.append(f'A3 at {k}: flag on {flags}')
+        elif isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0:
+            bad.append(f'A3_xp_deg[{k}] {v!r}')
+        else:
+            cand.append((float(v), k, 'dia'))
+    if cand:                                             # several checked regions hold the point: the largest A3
+        v, k, _ = max(cand)
+        return math.radians(v), '', k
+    if bad:
+        return None, '; '.join(bad), None
+    return None, ('end outside every checked start disc and 12b corridor: A3 by position not computed (A3loc needs '
+                  'the mark table)'), None
+
+
+def _dist_seg(p, a, b):
+    """Distance from p to the segment a-b."""
+    ab = b - a
+    L2 = float(ab @ ab)
+    s = 0.0 if L2 == 0 else min(1.0, max(0.0, float((p - a) @ ab) / L2))
+    return float(np.linalg.norm(p - (a + s * ab)))
 
 
 def u_psi_hai_dau_rad(a6, kc, p1_xy_m, p2_xy_m, tam_id, luot=None, dai=None):
@@ -1163,7 +1420,8 @@ def u_psi_hai_dau_rad(a6, kc, p1_xy_m, p2_xy_m, tam_id, luot=None, dai=None):
                 tag_h_m / kappa, tag_h_m).
       kc        KIEMCHEO kiem_cheo.json (c7_kiem_cheo_v7, run with --xuat-phat); A3 is checked HERE (version, trial,
                 quy_ve_ma_noc, ma_ao, du_lieu_du, plumb, per place mot_phuong / ngoai_suy / cap_hong of A3_tuong_doi
-                and P1_tuong_doi.theo_vung): a failed check -> thieu with the reason; the caller needs no gate of its own.
+                and P1_tuong_doi.theo_vung; the 12b corridor A3_tuong_doi.duong_12b with its A3 flags only): a failed
+                check -> thieu with the reason; the caller needs no gate of its own.
       p1, p2    tag centres [m] on the floor of the two ends (car_pose tag_x, tag_y of the windows; the caller's p_tag),
                 in the car_pose frame of the A6 file.
       tam_id    the plate of the run (lan_lap_v1.tam_id of NHACTAM); another plate -> thieu.
@@ -1316,13 +1574,30 @@ def main(argv=None):
                 src[key] = _load(path, sch) if path else None
                 if path:
                     nguon.append(dict(vai=key, file=os.path.abspath(path), sha256=cu.sha256(path)))
-            khoa = None
+            khoa, khoa_d = None, None
             if a.khoa_truoc:
                 cu.check_path(a.khoa_truoc)
                 khoa = cu.sha256(a.khoa_truoc)
                 nguon.append(dict(vai='khoa_truoc', file=os.path.abspath(a.khoa_truoc), sha256=khoa))
+                try:
+                    with open(a.khoa_truoc, encoding='utf-8') as f:
+                        khoa_d = json.load(f)
+                except ValueError:
+                    khoa_d = None                                       # not JSON: kiem_o reports no sets
+            rows = None
+            if src['giu_ngoai'] is not None:                            # A6C2-2: the rows the cells were built from
+                rn = [x for x in src['giu_ngoai'].get('nguon') or [] if isinstance(x, dict) and x.get('vai') == 'rows']
+                if len(rn) != 1 or not isinstance(rn[0].get('file'), str):
+                    raise A6Error(f'{a.giu_ngoai}: nguon has no single rows file')
+                cu.check_path(rn[0]['file'])
+                if cu.sha256(rn[0]['file']) != rn[0].get('sha256'):
+                    raise A6Error(f'{rn[0]["file"]}: sha256 is not the one in {a.giu_ngoai} (rows edited)')
+                import c8b_a6_o as om
+                rows = om.read_rows(rn[0]['file'])
+                nguon.append(dict(vai='giu_ngoai rows', file=os.path.abspath(rn[0]['file']), sha256=rn[0]['sha256']))
             out = gop(places, a.tam_id, a.tam_cal_id, src['lap'], src['dong'], src['giu_ngoai'], src['u_h'], khoa,
-                      script_state(), shas, nguon, lan_lap_cal_id=a.lan_lap_cal_id)
+                      script_state(), shas, nguon, lan_lap_cal_id=a.lan_lap_cal_id, giu_ngoai_rows=rows,
+                      khoa=khoa_d)
             out.update(script=script_state(), luc=datetime.datetime.now().astimezone().isoformat(timespec='seconds'))
             _write(a.out, out)
             print(f'A6 {out["trang_thai"]}; g_b {out["g_b"]} eps_g {out["eps_g"]} e_bc {out["e_bc_rad"]}; '

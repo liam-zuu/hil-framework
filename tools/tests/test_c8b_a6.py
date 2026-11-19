@@ -114,7 +114,7 @@ def test_ebc_refined_and_not_converged_is_refused(monkeypatch):
         return 1e-4 * 2 ** len(calls)
     monkeypatch.setattr(A, '_ebc_level', doubling)
     v2, lv2 = A.e_bc(GC, 0.003, C, H, HB, SIDE, [C[0], C[1], H])
-    assert v2 is None and [x[0] for x in lv2] == [2, 4, 8, 16]
+    assert v2 is None and [x[0] for x in lv2] == [4, 8, 16]
 
 
 def test_fit_g_recovers_the_tilt_and_v_does_not_bias_it():
@@ -259,17 +259,32 @@ def _dong(g_hat, luot=('r1', 'r2'), n=500, **kw):
     return A.with_sha(d)
 
 
-def _o(cho_sha, **kw):
-    d = dict(schema=A.SCHEMA_O, truoc_le=True, khoa_truoc_sha256=KHOA, a6_khop=dict(cho_sha256=[cho_sha[0]]),
-             tap=dict(khop=['c1'], kiem=['c2'], dich=['r1', 'r2']), giu_ngoai_theo='cho', trang_thai='dat',
-             o=[dict(o_id=f'o{i}', tap='kiem', n_id=12, n_thieu=0, d_max_rad=0.004, U_psi_rad=0.003,
-                     U_imu_rad=0.002, dat=True) for i in range(3)])
+def _rows_o(d=0.002, up=0.003, ui=0.002):
+    """Parsed rows (c8b_a6_o.read_rows) of the held-out check: three cells of the test set, khop c1, dich r1, r2."""
+    out = []
+    for luot, tap, n, xs in (('c2', 'kiem', 12, (0.1, 0.7, 1.3)), ('c1', 'khop', 3, (0.1,)), ('r1', 'dich', 3, (0.1,)),
+                             ('r2', 'dich', 3, (0.1,))):
+        for j, x in enumerate(xs):
+            for i in range(n):
+                for nd in ('0', '1'):
+                    out.append(dict(luot=luot, tap=tap, id=1000 * j + i, nut=nd, x=x, y=0.2, psi=0.3, u=0.4, lan='L1',
+                                    d=d if nd == '0' else -d / 2, up=up, ui=ui, ctrl='PID'))
+    return out
+
+
+def _o(cho_sha, rows=None, **kw):
+    import c8b_a6_o as O
+    d = O.build(_rows_o() if rows is None else rows, 'giu_ngoai_a6', 'cho', KHOA, [cho_sha[0]])
     d.update(kw)
     return A.with_sha(d)
 
 
+LOCK = dict(tap=dict(khop=['c1'], kiem=['c2'], dich=['r1', 'r2']))
+
+
 def _uh(**kw):
-    d = dict(schema=A.SCHEMA_UH, tam_id='T1', trang_thai='dat', u_h_chung_m=0.0003)
+    d = dict(schema=A.SCHEMA_UH, tam_id='T1', trang_thai='dat', u_h_chung_m=0.0003, h_m=HB, n_ga_giu_ngoai=3,
+             phan=dict(do_trai_ba_ga_m=0.0001, lech_video_so_tay_m=0.0001, hang_m=0.0001))
     d.update(kw)
     return A.with_sha(d)
 
@@ -283,7 +298,7 @@ def _gop(pl, **kw):
     sha = ['a' * 64, 'b' * 64]
     g_hat = np.mean([p['g_E'] for p in pl], axis=0)
     base = dict(lap=_lap(), dong=_dong(g_hat), giu_ngoai=_o(sha), u_h=_uh(), khoa_truoc_sha256=KHOA, script=SCRIPT,
-                cho_sha=sha, with_ebc=True, lan_lap_cal_id='L1')
+                cho_sha=sha, with_ebc=True, lan_lap_cal_id='L1', giu_ngoai_rows=_rows_o(), khoa=LOCK)
     base.update(kw)
     return A.gop(list(pl), 'T1', base.pop('tam_cal_id', 'T1'), **base)
 
@@ -307,6 +322,7 @@ def test_gop_dat_and_eps_g(places):
     assert out['h_goc_m'] == pytest.approx([HB + ri @ g_hat for ri in A.body(SIDE)])
     assert out['u_h_goc_m'][0] == pytest.approx(0.0003 + np.linalg.norm(A.body(SIDE)[0]) * out['eps_g'] + A.V_MAX_M)
     assert out['khoa_truoc_sha256'] == KHOA and out['commit'] == 'abc' and out['nhat_quan'] is True
+    assert out['khoa_truoc_sha'] == KHOA                                  # F3 2.C name
 
 
 @pytest.mark.parametrize('kw,txt', [
@@ -335,9 +351,13 @@ def test_gop_sources_checked(places):
     d = _dong(g_hat)
     d['luot']['r1']['bo_luot'] = ['r1', 'r2']
     o = _gop(places, dong=A.with_sha(d))
-    assert o['trang_thai']['a6'] == 'thieu' and any('target run' in w for w in o['ly_do'])
+    assert o['trang_thai']['a6'] == 'thieu' and any('every other run' in w for w in o['ly_do'])
+    d = _dong(g_hat)
+    d['luot']['r1']['bo_luot'] = ['unrelated']                          # A6C2-4: not the other runs of the file
+    o = _gop(places, dong=A.with_sha(d))
+    assert o['trang_thai']['a6'] == 'thieu' and any('every other run' in w for w in o['ly_do'])
     # held-out check: a cell over U, overlapping sets, another lock, a fit file not given -> thieu
-    for gn, txt in ((_o(sha, o=[dict(_o(sha)['o'][0], d_max_rad=0.006)]), 'U_psi'),
+    for gn, txt in ((_o(sha, rows=_rows_o(d=0.006)), 'U_psi'),
                     (_o(sha, o=[dict(_o(sha)['o'][0], n_id=5)]), 'n_id'),
                     (_o(sha, tap=dict(khop=['c1'], kiem=['c1'], dich=['r1'])), 'disjoint'),
                     (_o(sha, khoa_truoc_sha256='z' * 64), 'khoa'),
@@ -471,9 +491,11 @@ def test_cli_do_gop_and_f15_file(tmp_path, monkeypatch):
     f15 = A.with_sha(dict(
         schema=A.F15_FULL, trang_thai='dat', cho='goc', chieu='held_minus_full', bo_H32=True, truoc_le=True,
         thu_tu_goc='ArUco 0..3 (c7_measure.car_corners_body)', clip_sha256='c' * 64,
-        nguon=[dict(vai_tro='frames', sha256=cu.sha256(fp)), dict(vai_tro='session', sha256=cu.sha256(sp))],
+        nguon=[dict(vai_tro='frames', sha256=cu.sha256(fp)), dict(vai_tro='session', sha256=cu.sha256(sp)),
+               dict(vai_tro='track', sha256='d' * 64), dict(vai_tro='cua_so_v1', sha256='e' * 64)],
         kappa=HB / H, Zc_m=H, h_m=HB, plumb_xy_m=list(C), mien_E=f['mien_E'],
-        ban_do=dict(ca=[dict(ten=c, A3=dict(quy_max_deg=0.1)) for c in CASES]),
+        ban_do=dict(H32_ids=[18, 19, 30], ca=[dict(ten=c, bo_ids=[int(x) for x in c[3:].split('-')],
+                                                 A3=dict(quy_max_deg=0.1)) for c in CASES]),
         khung=[dict(frame_id=int(k), t_s=float(tt), goc_m=f['du'][int(k)][CASES[0]].tolist(),
                     du_m={c: v.tolist() for c, v in f['du'][int(k)].items()}) for k, tt in zip(idx, t)]))
     f15p = tmp_path / 'f15.json'
@@ -487,7 +509,11 @@ def test_cli_do_gop_and_f15_file(tmp_path, monkeypatch):
     assert d['A3_theo_ca_deg'] == {c: 0.1 for c in CASES}
     for bad, n in ((dict(f15, plumb_xy_m=[0.0, 0.0]), 'plumb'),                      # session set-up
                    (dict(f15, nguon=[dict(vai_tro='frames', sha256='e' * 64), f15['nguon'][1]]), 'frames'),
-                   (dict(f15, thu_tu_goc='other'), 'order'), (dict(f15, mien_E=None), 'window')):
+                   (dict(f15, thu_tu_goc='other'), 'order'), (dict(f15, mien_E=None), 'window'),
+                   (dict(f15, nguon=f15['nguon'][:3]), 'cua_so'),                       # A6C1-2: E window source
+                   (dict(f15, ban_do=dict(f15['ban_do'], H32_ids=[18, 19, 30, 31])), 'h32'),   # id in no case
+                   (dict(f15, plumb_xy_m=list(C + 0.002)), 'l125'),
+                   (dict(f15, khung=[dict(f15['khung'][0], t_s=float('nan'))] + f15['khung'][1:]), 'tnan')):
         bp = tmp_path / f'bad_{n}.json'
         bp.write_text(json.dumps(A.with_sha(dict(bad))), encoding='utf-8')
         assert A.main(args + ['--f15', str(bp), '--out', str(tmp_path / f'x_{n}.json')]) == 2, n
@@ -530,3 +556,164 @@ def test_u_psi_joint_replay_per_case(places):
     r = A.u_psi_hai_dau_rad(a6b, _kc(), p1, p2, 'T1')
     assert r['ghep'] == 'cong_rieng' and 'without A3' in r['ly_do_ghep']
     assert r['u_rad'] == pytest.approx(2 * math.radians(0.15) + A.a6du_rad(a6b, r1) + A.a6du_rad(a6b, r2))
+
+
+# ── Codex round 2/2 (A6C2-2..10), fixed 20/11 (Liam at CODE_C8B: "Sua ngay, Codex sau") ──────────────────────
+
+def test_a6c2_3_lap_pair_must_join_the_caliper_mounting(places):
+    # the E clips on L2, the caliper numbers on L1: only an L1-L2 pair widens; an unrelated pair or no cal id: not
+    pg, pk = places
+    a, b = dict(pg, lan_lap_id='L2'), dict(pk, lan_lap_id='L2')
+    far = np.linalg.norm(np.array(a['g_E']) - GC)
+    rel = _lap(cap=[dict(_lap()['cap'][0], lan_lap_a='L1', lan_lap_b='L2')])
+    unrel = _lap(cap=[dict(_lap()['cap'][0], lan_lap_a='L7', lan_lap_b='L8')])
+    o1 = _gop((a, b), lap=rel)
+    o2 = _gop((a, b), lap=unrel)
+    o3 = _gop((a, b), lap=rel, lan_lap_cal_id=None)
+    assert o1['nhat_quan_cho']['goc']['u_lap_cap'] == pytest.approx(o1['U_chuyen']['lap'])
+    assert o2['nhat_quan_cho']['goc']['u_lap_cap'] is None and o3['nhat_quan_cho']['goc']['u_lap_cap'] is None
+    assert o2['nhat_quan_cho']['goc']['nguong'] == pytest.approx(pg['s_E_norm'] + A.u_cal()[1])
+    assert o1['nhat_quan_cho']['goc']['nguong'] > o2['nhat_quan_cho']['goc']['nguong'] and far > 0
+
+
+def test_a6c2_4_half_bands_and_the_reader(places):
+    g_hat = np.mean([p['g_E'] for p in places], axis=0)
+    d = _dong(g_hat)
+    d['dai_dinh_nghia'] = d['dai_dinh_nghia'][:2]                         # a0_hi not defined
+    o = _gop(places, dong=A.with_sha(d))
+    assert o['trang_thai']['a6'] == 'thieu' and any('two half bands' in w for w in o['ly_do'])
+    d = _dong(g_hat)
+    d['luot']['r1']['dai']['a0_lo']['trang_thai'] = 'thieu'               # a cell thieu with its numbers
+    o = _gop(places, dong=A.with_sha(d))
+    assert ['r1', 'a0_lo'] == o['dong']['thieu'][0][:2]
+    o = _gop(places)
+    r = 0.5
+    assert A.a6du_rad(o, r, 'r1', ['a0', 'a0_hi']) is not None
+    for bad in ('a0', ['a0'], ['a0_lo', 'a0_hi'], ['a0', 'a0', ], ['a0', 'a0_lo', 'a0_hi']):
+        assert A.a6du_rad(o, r, 'r1', bad) is None, bad
+
+
+def test_a6c2_5_u_h_three_parts(places):
+    for uh, txt in ((_uh(u_h_chung_m=0.0), 'sum'), (_uh(phan=dict(do_trai_ba_ga_m=0.0, lech_video_so_tay_m=0.0,
+                                                                   hang_m=0.0), u_h_chung_m=0.0), 'hang_m'),
+                    (_uh(phan=None), 'phan'), (_uh(n_ga_giu_ngoai=2), 'n_ga'), (_uh(h_m=HB + 0.001), 'h of the run')):
+        o = _gop(places, u_h=uh)
+        assert o['trang_thai'] == dict(a6='dat', h='thieu') and any(txt in w for w in o['ly_do_h']), (txt, o['ly_do_h'])
+
+
+def test_a6c2_6_readers_refuse_bad_numbers_and_setup(places, tmp_path):
+    a6 = _gop(places)
+    T, psi = np.array([C + [0.7, 0.2]]), np.array([1.0])
+    with pytest.raises(ValueError):
+        A.delta_psi_a6(a6, T, psi, [math.nan, C[1]], H)
+    bad = dict(a6, eps_g=-0.01)
+    assert A.a6du_rad(bad, 1.0) is None and A.ap_dung(bad, 'T1')[0] == 'chua_ket_luan'
+    p = tmp_path / 'a6.json'
+    p.write_text(json.dumps(A._clean(bad), allow_nan=False), encoding='utf-8')
+    with pytest.raises(A.A6Error, match='eps_g'):
+        A.load_a6(str(p))
+    with pytest.raises(A.A6Error, match='L125'):
+        A.gop([dict(pl, set_up=dict(pl['set_up'], H_m=H + 0.01)) for pl in places], 'T1', 'T1')
+    ses = tmp_path / 's.json'
+    ses.write_text(json.dumps(dict(kappa=HB / (H + 0.01), tag_h_m=HB, car_side_m=SIDE, plumb_xy_m=list(C))),
+                   encoding='utf-8')
+    with pytest.raises(A.A6Error, match='L125'):
+        A.read_session(str(ses))
+
+
+def test_a6c2_7_nan_disc_does_not_widen_a3(places):
+    # each guard named: a NaN radius, a NaN centre, a NaN plumb of kiem_cheo.json -> thieu with that reason
+    a6 = _gop(places)
+    p1, p2 = C + np.array([1.03, 0.02]), C + np.array([0.0, 1.15])           # both inside their discs
+    for kc, txt in ((dict(_kc(), hang_so_s7=dict(_kc()['hang_so_s7'], MIEN_XP_M=float('nan'))), 'MIEN_XP_M'),
+                    (dict(_kc(), hang_so_s7=dict(_kc()['hang_so_s7'], xuat_phat=dict(goc=[float('nan'), 0.0],
+                                                                                    K1=list(C + [0.0, 1.2])))),
+                     'xuat_phat[goc]'),
+                    (dict(_kc(), hang_so_s7=dict(_kc()['hang_so_s7'], plumb=[float('nan'), C[1]])), 'plumb')):
+        r = A.u_psi_hai_dau_rad(a6, kc, p1, p2, 'T1')
+        assert r['trang_thai'] == 'thieu' and any(txt in w for w in r['ly_do']), (txt, r)
+    assert A.u_psi_hai_dau_rad(a6, _kc(), p1, p2, 'T1')['trang_thai'] == 'dat'
+
+
+def test_a6c2_8_degenerate_fit_reports_thieu():
+    # the same four corners in every frame: no rate, alpha columns zero -> singular, thieu (not a KeyError)
+    P = np.repeat(A.lifted_corners(C + [0.6, 0.4], 0.3, GC, 0.0, C, H, HB, SIDE)[None], 300, axis=0)
+    t = np.arange(300) / 32.0
+    fl = list(A.shutter_fields(P, t, A.uv_of(P, TopCam(), C, HB / H)))
+    f = A.fit_g(P, C, H, HB, SIDE, fields=fl)
+    assert 'se_alpha' in f and not A.fit_ok(f)
+    assert A.corr_alpha_g(f['M']) is None or math.isfinite(A.corr_alpha_g(f['M']))
+    assert A.corr_alpha_g(np.zeros((6, 6))) is None
+
+
+def test_a6c2_10_se_alpha_degrees_of_freedom():
+    idx, t, P = _shuttered(-0.72e-6, 2.0e-6, noise=0.0001)
+    fl = list(A.shutter_fields(P, t, A.uv_of(P, TopCam(), C, HB / H)))
+    f = A.fit_g(P, C, H, HB, SIDE, fields=fl)
+    n = len(P)
+    assert f['bac_tu_do'] == 5 * n - 6
+    res2 = f['res_rms_m'] ** 2 * 4 * n                                   # the residual sum
+    assert f['sigma_toa_do_m'] == pytest.approx(math.sqrt(res2 / (5 * n - 6)))
+    dg = np.diag(np.linalg.inv(f['M']))[4:]
+    assert f['se_alpha'] == pytest.approx([math.sqrt(x) * f['sigma_toa_do_m'] for x in dg])
+
+
+def test_a6c2_9_grid_refines_every_dimension(monkeypatch):
+    seen = []
+    real = A.ebc_errors
+
+    def spy(T, S, g, v, *a):
+        seen.append((len(np.unique(np.round(g, 12), axis=0)), len(np.unique(np.round(v, 12)))))
+        return real(T, S, g, v, *a)
+    monkeypatch.setattr(A, 'ebc_errors', spy)
+    lv = {}
+    for k in (4, 8):
+        seen.clear()
+        A._ebc_level(GC, 0.003, C, H, HB, SIDE, [C[0], C[1], H], A.RHO_MAX_M, A.V_MAX_M, k, chunk=10 ** 9)
+        lv[k] = seen[0]
+    assert lv[8][0] > lv[4][0] and lv[8][1] > lv[4][1]
+    with pytest.raises(A.A6Error):
+        A._ebc_level(GC, 0.003, C, H, HB, SIDE, [C[0], C[1], H], A.RHO_MAX_M, A.V_MAX_M, 2)
+
+
+def test_a6c1_1_diagnostic_place_gives_no_u_cho(places):
+    pg, pk = places
+    diag = dict(pk, U_meo_E=None, s_E=None, s_E_norm=None, trang_thai='thieu', ly_do=['diagnostic'])
+    o = _gop((pg, diag))
+    assert o['U_chuyen']['cho'] is None and o['eps_g'] is None and o['trang_thai']['a6'] == 'thieu'
+
+
+def _kc_duong(**kw):
+    """kiem_cheo.json with the 12b corridors (KIEMCHEO d21f149): goc segment through its start point."""
+    d = _kc()
+    du = dict(A3_deg=dict(goc=0.3, K1=0.25), mot_phuong=dict(goc=False, K1=False), ngoai_suy=dict(goc=False, K1=False),
+              cap_hong=dict(goc=False, K1=False), ban_kinh_m=0.10,
+              doan_m=dict(goc=[list(C + [1.0 - 0.35, -0.35]), list(C + [1.0 + 0.35, 0.35])],
+                          K1=[list(C + [0.0, 0.95]), list(C + [0.0, 1.45])]))
+    du.update(kw)
+    d['A3_tuong_doi'] = dict(d['A3_tuong_doi'], duong_12b=du)
+    return d
+
+
+def test_hcv3_2_a3_over_the_12b_corridor(places):
+    a6 = _gop(places)
+    pc = C + np.array([1.0 + 0.30, 0.31])                 # on the goc corridor, outside the goc start disc (0.10 m)
+    p2 = C + np.array([0.0, 1.15])                         # K1 disc and K1 corridor
+    r = A.u_psi_hai_dau_rad(a6, _kc_duong(), pc, p2, 'T1')
+    assert r['trang_thai'] == 'dat', r
+    want = math.radians(0.3) + math.radians(0.25) + A.a6du_rad(a6, np.linalg.norm(pc - C))         + A.a6du_rad(a6, np.linalg.norm(p2 - C))
+    assert r['u_rad'] == pytest.approx(want)               # K1: corridor 0.25 > disc 0.2: the larger
+    assert A.u_psi_hai_dau_rad(a6, _kc(), pc, p2, 'T1')['trang_thai'] == 'thieu'      # no corridor block
+    # no P1 flag asked for the corridor; an A3 flag of the corridor on -> that region not usable
+    k = _kc_duong()
+    k['P1_tuong_doi']['theo_vung']['goc']['mot_phuong'] = True
+    assert A.u_psi_hai_dau_rad(a6, k, pc, p2, 'T1')['trang_thai'] == 'dat'
+    for kw, txt in ((dict(ngoai_suy=dict(goc=True, K1=False)), 'corridor goc'),
+                    (dict(cap_hong=dict(K1=False)), 'corridor goc'),                    # missing flag = on
+                    (dict(A3_deg=dict(goc=float('nan'), K1=0.25)), 'A3_deg[goc]'),
+                    (dict(ban_kinh_m=float('nan')), 'ban_kinh_m'),
+                    (dict(doan_m=dict(goc=[[float('nan'), 0.0], [1.0, 1.0]], K1=[[0, 0], [0, 1]])), 'doan_m[goc]')):
+        r = A.u_psi_hai_dau_rad(a6, _kc_duong(**kw), pc, p2, 'T1')
+        assert r['trang_thai'] == 'thieu' and any(txt in w for w in r['ly_do']), (txt, r['ly_do'])
+    assert A._dist_seg(np.array([0.0, 1.0]), np.array([-1.0, 0.0]), np.array([1.0, 0.0])) == pytest.approx(1.0)
+    assert A._dist_seg(np.array([3.0, 0.0]), np.array([-1.0, 0.0]), np.array([1.0, 0.0])) == pytest.approx(2.0)
