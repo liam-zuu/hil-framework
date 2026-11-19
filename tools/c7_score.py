@@ -725,24 +725,26 @@ def run_tracker(t, x, y, lane, push, t_mat, t_start=0.0, cam_cover=None):
     (suspects) get e_perp only (module docstring). Returns per-frame dicts. at_end (a G4 condition, SC-4): the
     projection of the two-sided window sits on an end of that window AFTER the cut at 0 and S (CS1-3; the cut only
     exempts the run start and end from the TRACKING-error rule, not from the G4 formula conditions).
-    cam_cover(a, b) (relative mode, Codex CT2-4 round 3): True when the CAMERA frames cover [a, b] with no hole above
-    t_trong; a stretch longer than t_mat between two frames with a centre that the camera covers (frames without A6
-    or q: undefined frames, J v6 0, 6) is not a loss of the car: the window grows with the whole time (not capped at
-    t_mat) and no tracking error is set, unless that window would pass CAP (the reopened-window bound: the progress
-    over the stretch is then ambiguous, a tracking error as before)."""
+    cam_cover(a, b) (relative mode, Codex CT2-4; CODE 19/11 after round 4: J wins over the O1 tracker there): True
+    when the CAMERA frames cover [a, b] with no hole above t_trong; a stretch longer than t_mat between two frames with
+    a centre that the camera covers (frames without A6 or q: undefined frames, J v6 0, 6) is no loss of the car and no
+    tracking error: the window grows with the whole time; when it passes CAP the progress is ambiguous (the lane can
+    cross itself): from that frame on 'prog_undef' (progress not determined; the caller leaves G2, G4 undefined and
+    G1 not concluded unless completed before). A tracking error there only on its own evidence: the projection on
+    the upper end of that grown window (more progress than the car could make)."""
     path = lane.path
     s_prev, t_last = 0.0, t_start
-    out, chain_err = [], False
+    out, chain_err, undef = [], False, False
     for k in range(len(t)):
         dt = float(t[k] - t_last)
-        covered = bool(push[k] and dt > t_mat and cam_cover is not None and cam_cover(t_last, float(t[k]))
-                       and 1.5 * lane.vmax * dt + DELTA <= CAP)
+        covered = bool(push[k] and dt > t_mat and cam_cover is not None and cam_cover(t_last, float(t[k])))
         miss = dt > t_mat and not covered
         dk = 1.5 * lane.vmax * (dt if covered else min(dt, t_mat)) + DELTA
+        undef = undef or bool(covered and dk > CAP)
         hi = s_prev + dk
         s_star, _, _, upper = path.nearest(x[k], y[k], s_prev - DELTA, hi)
         reopen = False
-        if upper:
+        if upper and not (covered and dk >= CAP):
             reopen, hi = True, s_prev + CAP
             s_star, _, _, upper = path.nearest(x[k], y[k], s_prev - DELTA, hi)
         w_lo = s_prev - dk
@@ -750,7 +752,8 @@ def run_tracker(t, x, y, lane, push, t_mat, t_start=0.0, cam_cover=None):
         c_lo, c_hi = max(w_lo, 0.0), min(hi, lane.S)
         at_end = bool(s_two <= c_lo + lane.end_tol or s_two >= c_hi - lane.end_tol)
         r = dict(e_perp=float(e_perp), s_perp=float(s_two), head=float(head), w_lo=w_lo, w_hi=hi, reopen=reopen,
-                 at_end=at_end, back=False, trk=False, miss=bool(miss), scored=True)
+                 at_end=at_end, back=False, trk=False, miss=bool(miss), scored=True, prog_undef=undef,
+                 noi_khong_tam=covered)
         if push[k]:
             chain_err = False
             r['back'] = bool(s_two < s_prev - DELTA - 1e-12)
@@ -1204,6 +1207,12 @@ def evaluate(t, x, y, psi, speed, wz, lane, hs, upsi_k, u_t, upk_add=None, rel_m
             l4, h4 = g4_bounds_jk(lane, xw[j], yw[j], pw[j], r['w_lo'], r['w_hi'], up, us)
             lo['g4'][j] = min(l4, e_bao) if (math.isfinite(us) or not rel_mode) else -math.inf
             hi['g4'][j] = max(h4, e_bao) if math.isfinite(us) else math.inf
+        pu = bool(rel_mode and (r['prog_undef'] or way1[j]['prog_undef']))
+        if pu:
+            # CODE 19/11 after Codex round 4 (CT2-4): progress not determined after a long centre-less stretch: the
+            # projection (G2, G4) is undefined; G3 (distance to the commanded point) does not use the progress
+            for c in ('g2', 'g4'):
+                lo[c][j], hi[c][j] = -math.inf, math.inf
         if clamp and sus[j]:
             # O1 3.3 (B81-7): the C8 check of the suspect assumption failed or is missing: the frame gives chua ket
             # luan only, never khong dat (lo clamped at the threshold, CS1-18) and never dat (hi not finite: the frame
@@ -1222,6 +1231,7 @@ def evaluate(t, x, y, psi, speed, wz, lane, hs, upsi_k, u_t, upk_add=None, rel_m
                          w_lo=float(r['w_lo']), w_hi=float(r['w_hi']),
                          track_err=int(r['trk']), miss=int(r['miss']), back=int(r['back']), reopen=int(r['reopen']),
                          at_end=int(r['at_end']), scored=int(r['scored']), g4_formula=int(formula),
+                         tien_do_chua_xd=int(pu), noi_khong_tam=int(bool(r['noi_khong_tam'])),
                          **{f'{b}_{c}': d[c][j] for c in o1_gate.MEASURED for b, d in (('lo', lo), ('hi', hi))}))
     summ = dict(task=lane.task, v=lane.v, T_cmd=lane.Tcmd, t_deadline=deadline, t_done_way1=td1, t_done_way2=td2,
                 t_end_common=end_c, t_end_union=end_u, n_suspect_pos=int(sus.sum()),
@@ -1233,7 +1243,9 @@ def evaluate(t, x, y, psi, speed, wz, lane, hs, upsi_k, u_t, upk_add=None, rel_m
                 gap_max=float(max(glen)), t_gap_long=long_gap, t1=t1, t1_kind=t1_kind, frames_window=n,
                 gia_dinh_nghi_vi_tri=hs.get('gia_dinh_nghi_vi_tri', 'chua_kiem'),
                 n_no_pred=int(np.sum(~np.isfinite(pred))), n_suspect_no_pred=int(np.sum(sus & ~np.isfinite(pred))),
-                U_t_used_s=float(u_t), U_t_scope=u_scope)
+                U_t_used_s=float(u_t), U_t_scope=u_scope,
+                t_tien_do_chua_xd=next((float(tw[j]) for j in range(n) if rel_mode
+                                        and (main[j]['prog_undef'] or way1[j]['prog_undef'])), None))
     return summ, rows, dict(q=q, lo=lo, hi=hi, t=tw, scored=np.array([r['scored'] for r in main]), gaps=glen)
 
 
@@ -1600,6 +1612,28 @@ def run_us(rows, events, i_edge):
                   if e.startswith('#us_end') and 'last_data_seq' in ocp._kv(e))
     end = next((k for L, _, k in ends if L >= seq and boot is not None and k.get('boot') == boot), None)
     last = None if end is None else int(end['last_data_seq'])
+    # Codex CT3-5 (round 4): copies of one event differing in content are a contradiction (O1 line 163: the logger
+    # sends identical copies); every field the rule reads must be there; the run's '#gain' of the same first_seq
+    # (and boot when it carries one) must exist (O1 line 163: first_seq equal to the '#gain' line of the run)
+    if len(st) > 1:
+        why.append(f'{len(st)} ban #us,ev=start khac noi dung cho first_seq {f0}')
+    if end is not None:
+        same = [k for L, _, k in ends if L == last and k.get('boot') == boot]
+        if len(same) > 1:
+            why.append(f'{len(same)} ban #us_end khac noi dung cho last_data_seq {last}')
+        miss_e = [f for f in ('on', 'changes', 'blk_ticks', 'ticks', 'last_data_seq', 'boot') if f not in end]
+        if miss_e:
+            why.append(f'#us_end thieu truong {miss_e}')
+    for k in st:
+        miss_s = [f for f in ('on', 'boot', 'first_seq') if f not in k]
+        if miss_s:
+            why.append(f'#us,ev=start thieu truong {miss_s}')
+            break
+    if f0 is not None:
+        gains = [ocp._kv(e) for e in uniq if e.startswith('#gain,')]
+        gk = [k for k in gains if k.get('first_seq') == str(f0) and k.get('boot', boot) == boot]
+        if not gk:
+            why.append(f'khong co #gain cua luot (first_seq {f0}, boot {boot})')
     if f0 is not None:
         prev = rows[lo - 1]['_seq'] if lo > 0 else -1
         if not prev < f0 <= rows[lo]['_seq']:
@@ -1658,6 +1692,32 @@ def thao_tac_of(rows, events, i_edge):
         kinds.append('loi_nap_gain')
         why.append(f'loi nap gain: {len(bad)} #gain_ack ok=0 ({ocp._kv(bad[0]).get("err")})')
     return kinds, why
+
+
+def cham_c8_why(rel, gio, hs, task):
+    """Reasons (empty: a C8 result) why a relative scoring is not a C8 result (CODE 19/11 after Codex round 2, CT2-7;
+    Codex CT3-3 rounds 3, 4): time only from a FINAL c8b_gio_v1 (it names its preliminary grid and the window file),
+    the window the one built from that preliminary grid (rel['chuoi_gio_c8'] from bind_clock), constants locked for C8
+    with every locked part the relative mode reads (shutter branch table, khung_tc F14, tuoi_yaw_max_ms; J v6 7)."""
+    why_c8 = []
+    if gio is None:
+        why_c8.append('gio khong tu c8b_gio_v1: chi chan doan (CODE 19/11)')
+    elif not (_hex64(gio.get('luoi_so_bo_sha256')) and _hex64(gio.get('cua_so_v1_sha256'))):
+        why_c8.append('c8b_gio_v1 khong phai file gio cuoi (thieu luoi_so_bo_sha256 / cua_so_v1_sha256)')
+    elif rel.get('chuoi_gio_c8') is not True:
+        # Codex CT3-3 (round 4): the window must be the one the final grid names, built from its preliminary grid
+        why_c8.append('cua_so_v1 khong dung tu luoi so bo ma file gio cuoi ghi (chuoi so bo -> F2 -> gio cuoi)')
+    if hs['trang_thai'] != 'khoa_c8':
+        why_c8.append(f'hang so {hs["trang_thai"]!r}, chua khoa C8 (J v6 7)')
+    else:
+        # the locked parts of the scorer checked BEFORE the flag (Codex CT3-3: also on an early exit)
+        for chk in (lambda: man_trap_of(hs, task, rel=True), lambda: khung_tc_of(hs),
+                    lambda: tuoi_yaw_max_of(hs)):
+            try:
+                chk()
+            except ValueError as exc:
+                why_c8.append(f'khoa C8 thieu: {exc}')
+    return why_c8
 
 
 def operator_loss(esp32_path, events, task, other):
@@ -1969,13 +2029,7 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
         # CODE 19/11 after Codex round 2 (CT2-7): the relative scoring of C8 takes its time ONLY from the C8b grid
         # (c8b_gio_v1); C7b and --offset-s are diagnostics. Codex CT3-3: only a FINAL grid (it names its preliminary
         # grid and the window file built from it) and a scorer locked before C8 (J v6 7: khoa_c8, F14) give a C8 result
-        why_c8 = []
-        if gio is None:
-            why_c8.append('gio khong tu c8b_gio_v1: chi chan doan (CODE 19/11)')
-        elif not (_hex64(gio.get('luoi_so_bo_sha256')) and _hex64(gio.get('cua_so_v1_sha256'))):
-            why_c8.append('c8b_gio_v1 khong phai file gio cuoi (thieu luoi_so_bo_sha256 / cua_so_v1_sha256)')
-        if hs['trang_thai'] != 'khoa_c8':
-            why_c8.append(f'hang so {hs["trang_thai"]!r}, chua khoa C8 (J v6 7)')
+        why_c8 = cham_c8_why(rel, gio, hs, task)
         base.update(cham_c8=not why_c8, cham_c8_ly_do='; '.join(why_c8) or None)
     i_edge, later, probs = ocp.find_edge(rows)
     # Codex CT3-7: the absolute mode reads the events after its early exits, as at 921e839
@@ -2022,7 +2076,7 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
         # operator cause the run is that loss and does not count as a window loss (J v6 5 J2-11)
         return lost('cua so tham chieu: ' + '; '.join(rel['tc']['ly_do']), FAIL_MEAS,
                     hong_cua_so_tc=not thao, ly_do_khac=['duong lenh: ' + f for f in cmd_flags],
-                    khung_tuong_doi=_clean(rel_block(rel, None))), []
+                    khung_tuong_doi_v1=_clean(rel_block(rel, None))), []
     if not any(r['valid'] for r in frames):
         return lost('no valid camera frame in the clip', FAIL_MEAS), []
     t_cam = np.array([r['t_s'] for r in frames])
@@ -2112,7 +2166,10 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
                              mode=ymode, align_ref=ar)
     psi_imu_al = yaw.pop('_psi_imu_al', None)
     so_duoc, nghi_yaw = yaw.pop('_so_duoc'), yaw.pop('_nghi_ngo')
-    tsom_case = R is not None and not R['can_cu']
+    # CODE 19/11 (CT2-4): no frame with a centre in the run window (A6 or q lost over the whole domain, video there):
+    # G1-G4 not concluded (the path of the t_som case, G5 where the heading is known), never 'no frame' lost
+    no_centre = R is not None and not np.any(R['pos_def'] & (tv >= 0.0) & (tv < lane.Tcmd + T_LATE - 1e-12))
+    tsom_case = R is not None and (not R['can_cu'] or no_centre)
     if R is not None:
         upsi_k = np.where(R['yaw_def'], upsi_k, np.inf)
         yaw_ok = R['yaw_def'] & so_duoc & ~nghi_yaw
@@ -2200,6 +2257,13 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
                       False)
         if tsom_case:                    # J v6 5: G1-G4 not concluded without the position basis
             g1 = dict(g1, state='chua_ket_luan', q='inconclusive')
+        t_pu = out.get('t_tien_do_chua_xd')
+        if t_pu is not None and any(td is None or td > t_pu + 1e-12
+                                    for td in (out['t_done_way1'], out['t_done_way2'])):
+            # CODE 19/11 (CT2-4): the progress is not determined from t_pu: a completion not shown before it is not
+            # concluded either way; gate_v3.g1.tien_do_chua_xd_tu_s names it (rq3_log cannot recompute this state
+            # from t_done yet: not checked by rq3_log, gate_rq3 says so, as in the t_som case)
+            g1 = dict(g1, state='chua_ket_luan', q='inconclusive', tien_do_chua_xd_tu_s=float(t_pu))
         if out['t_gap_long'] is not None:
             reasons.append(f'khoang trong > t_trong {hs["t_trong_s"]:g} s tu t = {out["t_gap_long"]:.3f} s')
         if out['t_first_track_err'] is not None:
@@ -2228,7 +2292,9 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
                       FAIL_CMD if cmd_lost and not bumped and t1 is None else FAIL_MEAS)
     else:
         outcome = gate['outcome_decide']
-    if tsom_case:
+    if 'tien_do_chua_xd_tu_s' in gate['g1'] and not tsom_case:
+        gate_rq3 = 'chua_kiem: g1 tien_do_chua_xd_tu_s (CT2-4, CODE 19/11) chua co trong rq3_log'
+    elif tsom_case:
         # J v6 5 t_som case: G1 not concluded without the position basis. Fields fixed by CODE_GATE 19/11 in
         # gate_v3.g1: ca_t_som true, t_som_s (end of the common domain of G5), t_done [null, null]; rq3_log reads them
         # from feat/rq3-tuong-doi (not merged here yet): the gate is not checked by rq3_log here, gate_rq3 says so
@@ -2277,7 +2343,7 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
         ids_hop = [int(r['frame_id']) for r in prow if r['mien_hop']]
         mpp = dict(nut=None if gio is None else gio['nut'], D_s=float(offset_s), id_khung=ids_hop,
                    id_khung_sha256=ctd.ids_sha(ids_hop))
-        out.update(khung_tuong_doi=_clean(dict(rel_block(rel, R), t_som_s=out.pop('t_som_s', None),
+        out.update(khung_tuong_doi_v1=_clean(dict(rel_block(rel, R), t_som_s=out.pop('t_som_s', None),
                                                gio_sha256=None if gio is None else gio['sha256'],
                                                esp32_sha256=cm.sha256(esp32_path), mien_phai_phu=mpp,
                                                chot_yaw=chot_yaw)),
@@ -2443,6 +2509,16 @@ def _bind_sets(ll, end, row):
     """Every F8 frame set of one end (the anchor-tag intersection read by ctd.neo_of, and khung_chung when written as
     {id, pts_s}) inside the F2 row of that end WITH its PTS (Codex CT2-1, CT3-1)."""
     sets = []
+    d = (ll.get('dau') or {}).get(end) if isinstance(ll.get('dau'), dict) else None
+    top = ll.get('khung_chung_sha256')
+    if isinstance(d, dict) and isinstance(top, dict) and end in top and 'khung_chung_sha256' in d             and d['khung_chung_sha256'] != top[end]:
+        # Codex CT4-1: the two copies of the khung_chung sha (top level and dau.<end>) must agree
+        raise ValueError(f'lan_lap_v1 khung_chung_sha256.{end} differs from dau.{end}.khung_chung_sha256')
+    if isinstance(d, dict) and row is not None:
+        # Codex CT2-1 (round 4): the end is of the window row of that end (frames, clip), when both name one
+        for k in ('frames_sha256', 'clip_sha256'):
+            if d.get(k) and row.get(k) and d[k] != row[k]:
+                raise ValueError(f'lan_lap_v1 dau.{end}.{k} differs from cua_so_v1 {end} {k}')
     nb = ctd.neo_of(ll, end)
     if nb is not None:
         sets.append((nb['nguon'], nb['ids'], nb['pts']))
@@ -2454,7 +2530,7 @@ def _bind_sets(ll, end, row):
         sets.append(('khung_chung', ids, pts))
     if not sets:
         return
-    if row is None or row.get('khung') is None:
+    if row is None or not row.get('khung'):
         if any(ids for _, ids, _ in sets):
             raise ValueError(f'lan_lap_v1 {end} frames without a {end} window in cua_so_v1')
         return
@@ -2482,11 +2558,8 @@ def bind_lan_lap(ll, pre, cua_sha, task, post=None):
     if ll.get('cua_so_v1_sha256') != cua_sha:
         raise ValueError('lan_lap_v1 cua_so_v1_sha256 is not the window file given (NHACTAM read another file)')
     _bind_sets(ll, 'pre', pre)
-    if post is not None:
-        _bind_sets(ll, 'post', post)
-    dpre = (ll.get('dau') or {}).get('pre') if isinstance(ll.get('dau'), dict) else None
-    if isinstance(dpre, dict) and dpre.get('clip_sha256') and pre.get('clip_sha256')             and dpre['clip_sha256'] != pre['clip_sha256']:
-        raise ValueError('lan_lap_v1 dau.pre clip_sha256 differs from the clip of cua_so_v1')
+    # Codex CT2-1 (round 4): the post end always (no post row: a non-empty post set of F8 is refused)
+    _bind_sets(ll, 'post', post)
 
 
 HANG_SO_F2 = ('u_t_ghep_s', 'troi_ppm', 't_trong_s')    # constants that enter cua_so_v1 (u_ref,i, sample gate)
@@ -2495,6 +2568,7 @@ HANG_SO_F2 = ('u_t_ghep_s', 'troi_ppm', 't_trong_s')    # constants that enter c
 def bind_clock(pre, a, hs):
     """Codex CT1-3: the window was built with the time source and the gates the run is scored with (the C8b grid file
     by sha256, or the same --offset-s, --offset-err-s, --offset-anchor-s; nguong = khung_tc of the constants)."""
+    chuoi = False
     if a.gio_c8b:
         # Codex CT2-7 (CODE 19/11; C8B c8b_gio --so-bo / --cua-so, hil feat/c8b-3b-ga faa8160): the window is built
         # from the preliminary grid; the final grid names it (luoi_so_bo_sha256) and the window file built from it
@@ -2507,6 +2581,7 @@ def bind_clock(pre, a, hs):
         if not (same or chain_ok):
             raise ValueError('cua_so_v1 was built with another time grid: gio_sha256 is neither --gio-c8b nor its '
                              'luoi_so_bo_sha256 (with cua_so_v1_sha256 = this window file)')
+        chuoi = bool(chain_ok)
     else:
         want = dict(offset_s=a.offset_s, offset_err_s=a.offset_err_s, offset_anchor_s=a.offset_anchor_s)
         if pre.get('gio_sha256') is not None or pre.get('offset_cfg') != want:
@@ -2521,6 +2596,8 @@ def bind_clock(pre, a, hs):
     if not isinstance(used, dict) or any(used.get(k) != hs[k] for k in HANG_SO_F2):
         raise ValueError(f'cua_so_v1 hang_so_dung {used!r} differ from the constants of the scoring '
                          f'{ {k: hs[k] for k in HANG_SO_F2} } (or missing)')
+    # Codex CT3-3 (round 4): True only for the C8 chain preliminary grid -> F2 (this file) -> final grid
+    return chuoi
 
 
 def main_rel(argv):
@@ -2622,7 +2699,7 @@ def load_rel(a, frames, track, fsha, esha, task, hs):
     pre = _pre_of(cua, a.luot_id)
     if pre.get('frames_sha256') != fsha or pre.get('esp32_sha256') != esha:
         raise ValueError('cua_so_v1 was made from another frames.csv or ESP32 log')
-    bind_clock(pre, a, hs)
+    chuoi_gio = bind_clock(pre, a, hs)
     bind_gates(pre, hs, track, fsha)
     tcf = ctd.read_json(a.tham_chieu)
     if tcf.get('schema') != ctd.THAM_CHIEU_SCHEMA or tcf.get('cua_so_v1_sha256') != cm.sha256(a.cua_so):
@@ -2658,7 +2735,9 @@ def load_rel(a, frames, track, fsha, esha, task, hs):
     src = {k: dict(duong_dan=os.path.abspath(v), sha256=cm.sha256(v)) for k, v in
            (('cua_so_v1', a.cua_so), ('tham_chieu_v1', a.tham_chieu), ('truc_xe_v1', a.truc_xe),
             ('lan_lap_v1', a.lan_lap), ('c8b_a6_v2', a.a6), ('xoay_v1', a.xoay), ('c8b_khoa_v5', a.c8b_khoa)) if v}
-    return build_rel(task, chain, tc, truc, ll, ubc, src)
+    rel = build_rel(task, chain, tc, truc, ll, ubc, src)
+    rel['chuoi_gio_c8'] = chuoi_gio
+    return rel
 
 
 def main(argv=None):
@@ -2705,14 +2784,22 @@ def main(argv=None):
         fsha = cm.sha256(a.frames)
         if (a.gio_c8b is None) != (a.nut is None):
             raise ValueError('--gio-c8b and --nut go together')
-        gio = load_gio(a.gio_c8b, a.nut, cm.sha256(a.esp32), fsha) if a.gio_c8b else None
+        out_op = None
+        try:
+            gio = load_gio(a.gio_c8b, a.nut, cm.sha256(a.esp32), fsha) if a.gio_c8b else None
+        except (ValueError, OSError) as exc:
+            # Codex CT3-4 (round 4): a grid file refused (ok false, ...) does not hide an operator loss
+            if not a.tuong_doi:
+                raise
+            gio, out_op = None, operator_loss(a.esp32, a.events, a.task, f'file gio: {exc}')
+            if out_op is None:
+                raise
         # Codex CC1-3: the events file actually read (given, or the default beside the log), by name and sha256
         evp = a.events or (a.esp32 + '.events.txt')
         evp = evp if os.path.exists(evp) else None
         frames = cm.read_frames(a.frames)
         rel = None
-        out_op = None
-        if a.tuong_doi:
+        if a.tuong_doi and out_op is None:
             if not (a.out and a.rows):
                 raise ValueError('--tuong-doi needs --out and --rows (F13: the frame rows go with score.json, named '
                                  'there by sha256; Codex CT1-16)')
@@ -2720,8 +2807,9 @@ def main(argv=None):
                 if not (a.cua_so and a.tham_chieu):
                     raise ValueError('--tuong-doi needs --cua-so and --tham-chieu')
                 rel = load_rel(a, frames, track_info, fsha, cm.sha256(a.esp32), a.task, hs)
-            except ValueError as exc:
-                # Codex CT3-4: a run with operator evidence (no edge, so no cua_so_v1, ...) is recorded as that loss
+            except (ValueError, OSError) as exc:
+                # Codex CT3-4: a run with operator evidence (no edge, so no cua_so_v1, ...) is recorded as that loss;
+                # a window file never written (FileNotFoundError) too (round 4)
                 out_op = operator_loss(a.esp32, a.events, a.task, f'dau vao tuong doi: {exc}')
                 if out_op is None:
                     raise
@@ -2748,9 +2836,9 @@ def main(argv=None):
             w = csv.DictWriter(f, fieldnames=cols)
             w.writeheader()
             w.writerows(rows)
-        if isinstance(out.get('khung_tuong_doi'), dict):
+        if isinstance(out.get('khung_tuong_doi_v1'), dict):
             # Codex CT1-16: the full path (--rows and --out may be in different folders)
-            out['khung_tuong_doi'].update(rows_file=os.path.abspath(a.rows), rows_sha256=cm.sha256(a.rows))
+            out['khung_tuong_doi_v1'].update(rows_file=os.path.abspath(a.rows), rows_sha256=cm.sha256(a.rows))
     if a.tuong_doi:
         # Codex CT1-16: the whole score.json without Infinity / NaN in the relative mode (not finite -> null)
         text = json.dumps(_clean(cm._json(out)), indent=1, ensure_ascii=False, allow_nan=False)

@@ -380,7 +380,10 @@ def cua_so(frames, chain, log_rows, t0_us, nodes, u_nodes, kt, t_trong, t_cmd_en
                         khung_ma_hop_le_sha256=ids_sha(ids[mo2]),
                         ket_luan=dict(du_mau=s2, dung_yen=d2, dat=not why2, ly_do=why2, so_dung_yen=n2)))
     else:
-        out.append(dict(base, loai='post', t_canh_s=t_end, khung=None, khung_ma_hop_le=None,
+        # CODE 19/11 after Codex round 4 (CT4-3): an empty list with the reason, never null (NHACTAM reads [] as a
+        # failed window and still writes F8 for the run)
+        out.append(dict(base, loai='post', t_canh_s=t_end, khung=[], khung_sha256=ids_sha([]), khung_ma_hop_le=[],
+                        khung_ma_hop_le_sha256=ids_sha([]), ly_do=['clip khong co du w_s khung sau khi het lenh'],
                         ket_luan=dict(dat=False, ly_do=['clip khong co du w_s khung sau khi het lenh'])))
     return out
 

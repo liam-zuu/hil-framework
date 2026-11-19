@@ -112,7 +112,8 @@ def latch_cols(path, edit=None):
 def us_events(ev, first, last, boot='00000001', on='0', changes='0', blk='0', extra=''):
     """'#us,ev=start' / '#us_end' of one run as the firmware writes them (AGV 5bde4c5 us_state.c), events file."""
     with open(ev, 'w', encoding='utf-8') as f:
-        f.write(f'2026-11-19T10:00:00 #us,ev=start,boot={boot},on={on},swb=0,first_seq={first},line_drop=0\n'
+        f.write(f'2026-11-19T10:00:00 #gain,id=0,applied_n=1,ctrl=pid,first_seq={first},line_drop=0,boot={boot}\n'
+                f'2026-11-19T10:00:00 #us,ev=start,boot={boot},on={on},swb=0,first_seq={first},line_drop=0\n'
                 f'2026-11-19T10:00:30 #us_end,boot={boot},on={on},swb=0,changes={changes},blk_ticks={blk},'
                 f'cut_ticks=0,ticks={last - first + 1},last_data_seq={last},line_drop=0\n' + extra)
 
@@ -150,7 +151,7 @@ def test_relative_equals_absolute_under_rigid_motion(tmp_path, task, lateral):
     for c in ('g2', 'g3', 'g4', 'g5'):
         assert abs(gr[c]['q'] - ga[c]['q']) < 1e-6, c
     assert gr['g1']['state'] == ga['g1']['state']
-    k = out_r['khung_tuong_doi']
+    k = out_r['khung_tuong_doi_v1']
     assert k['can_cu_vi_tri'] and k['phi_ok'] and abs(k['phi_rad'] - PHI0) < 1e-12
     assert all({'x_fw', 'dpsi_ma', 'frame_id', 'q_ok', 'nghi_ngo_vi_tri', 'U_p_noi_m', 'nghi_ngo_yaw'} <= set(r)
                for r in rows_r)
@@ -215,7 +216,7 @@ def test_t_som_case_g1_g4_not_concluded_g5_scored(tmp_path, why):
     assert all(g[c]['state'] == 'chua_ket_luan' for c in ('g2', 'g3', 'g4')) and g['g1']['state'] == 'chua_ket_luan'
     assert g['g5']['state'] == 'dat' and out['outcome'] == 'chua_ket_luan'
     assert g['g1']['t_som_s'] >= out['T_cmd'] - 1e-9 and g['g1']['t_done'] == [None, None]
-    assert 't_som_s' not in out and out['khung_tuong_doi']['t_som_s'] == g['g1']['t_som_s']
+    assert 't_som_s' not in out and out['khung_tuong_doi_v1']['t_som_s'] == g['g1']['t_som_s']
     assert all(g[c]['n_undef'] > 0 for c in ('g2', 'g3', 'g4'))
 
 
@@ -678,7 +679,7 @@ def test_ct1_16_json_without_infinity(tmp_path):
     lane_rows = B.make_frames('O1-F05')
     fl, chain = to_floor('O1-F05', lane_rows)
     out, rows = score(tmp_path, 'O1-F05', fl, rel=rel_for('O1-F05', fl, chain, u_beta_cam=None))
-    k = out['khung_tuong_doi']
+    k = out['khung_tuong_doi_v1']
     assert k['u_phi_rad'] is None and k['u_phi_trang_thai'] == 'thieu_u_beta_cam' and 'psi_dd' in k['bien_doi']
     json.dumps(cs.cm._json(k), allow_nan=False)
     assert all(r['U_phi_k'] is None for r in rows)
@@ -731,7 +732,7 @@ def test_mien_phai_phu_lists_the_union_domain_frames(tmp_path):
     lane_rows = B.make_frames('O1-F05')
     fl, chain = to_floor('O1-F05', lane_rows)
     out, rows = score(tmp_path, 'O1-F05', fl, rel=rel_for('O1-F05', fl, chain))
-    m = out['khung_tuong_doi']['mien_phai_phu']
+    m = out['khung_tuong_doi_v1']['mien_phai_phu']
     ids = [r['frame_id'] for r in rows if r['mien_hop']]
     assert m['id_khung'] == ids and m['id_khung_sha256'] == ctd.ids_sha(ids) and m['nut'] is None
     assert m['D_s'] == B.OFFSET and len(ids) > 100
@@ -755,7 +756,7 @@ def test_ct1_19_yaw_latch_at_the_edge(tmp_path, case):
     lane_rows = B.make_frames('O1-F05')
     fl, chain = to_floor('O1-F05', lane_rows)
     out, _ = score(tmp_path, 'O1-F05', fl, rel=rel_for('O1-F05', fl, chain), latch=edit)
-    c = out['khung_tuong_doi']['chot_yaw'] if out.get('khung_tuong_doi') else None
+    c = out['khung_tuong_doi_v1']['chot_yaw'] if out.get('khung_tuong_doi_v1') else None
     if case in ('ok', 'no_next_row_lien'):
         assert out['outcome'] != 'hong_he_do' and c['chot_dung'] and c['can_tuoi_ms'] <= 125.0
         assert c['dong_ke_lien'] is (case == 'ok')
@@ -1201,3 +1202,156 @@ def test_ct1_20_t_som_wz_uses_the_stencil(tmp_path, monkeypatch):
     fl, chain = to_floor('O1-F05', lane_rows)
     score(tmp_path, 'O1-F05', fl, rel=rel_for('O1-F05', fl, chain, truc=False))
     assert seen and all(h == cs.cm.SG_HALF and n > 100 for n, h in seen)
+
+
+# ---------------------------------------------------------------- Codex round 4 (CT3-* residual, CT4-*): fail on ed1d020
+def test_ct2_4_progress_undefined_after_a_long_centre_less_stretch(tmp_path):
+    """CT2-4 (CODE 19/11: J wins in the relative mode): K1, A6 undefined 4.0-5.8 s with continuous video: no tracking
+    error, the progress is not determined from the reconnect (G2, G4 undefined there), G1 not concluded."""
+    lane_rows = B.make_frames('O1-K1', post=4.0)
+    fl, chain = to_floor('O1-K1', lane_rows)
+    rel = rel_for('O1-K1', fl, chain)
+    for c, f in zip(chain, fl):
+        if 4.0 <= f['t_s'] + B.OFFSET - B.T0 < 5.8:
+            c.update(a6_ok=False, psi_ma_p=float('nan'), p_x=float('nan'), p_y=float('nan'))
+    out, rows = score(tmp_path, 'O1-K1', fl, rel=rel, allow_final_set=True, log_kw=dict(post=5.0))
+    g = out['gate_v3']
+    assert out['outcome'] == 'chua_ket_luan' and out['t1_kind'] not in ('loi_theo_doi', 'khoang_trong')
+    assert g['g1']['state'] == 'chua_ket_luan' and any(r.get('tien_do_chua_xd') == 1 for r in rows)
+    assert all(not math.isfinite(r['hi_g2']) for r in rows if r.get('tien_do_chua_xd') == 1)
+
+
+def test_ct2_4_centre_lost_over_the_whole_domain(tmp_path):
+    """CT2-4 (CODE 19/11): no frame with a centre in the run window, video there: G1-G4 not concluded, never lost
+    'no valid camera frame'."""
+    lane_rows = B.make_frames('O1-F05')
+    fl, chain = to_floor('O1-F05', lane_rows)
+    rel = rel_for('O1-F05', fl, chain)
+    for c, f in zip(chain, fl):
+        if f['t_s'] + B.OFFSET - B.T0 >= 0.0:
+            c.update(q_ok=False, p_x=float('nan'), p_y=float('nan'))
+    out, _ = score(tmp_path, 'O1-F05', fl, rel=rel)
+    g = out['gate_v3']
+    assert out['outcome'] != 'hong_he_do' and all(g[c]['state'] == 'chua_ket_luan' for c in ('g1', 'g2', 'g3', 'g4'))
+
+
+def test_ct4_3_post_window_missing_is_an_empty_list():
+    """CT4-3 (CODE 19/11): a clip without w_s of frames after the command: post khung [] with the reason, never null."""
+    frames, chain = _still_chain(n=420)
+    kt = dict(ctd.KHUNG_TC_DE_XUAT, nguon='t')
+    rows = ctd.cua_so(frames, chain, _log(0.0, -1.0, 12.0), 6.2e6, [0.0], [0.05], kt, 0.10, 2.0, 'O1-F05')
+    post = rows[1]
+    assert post['loai'] == 'post' and post['khung'] == [] and post['khung_ma_hop_le'] == [] and post['ly_do']
+
+
+def _hs_locked():
+    return dict(trang_thai='khoa_c8', man_trap=dict(nhanh={'O1-F02': 'mot_khung', 'O1-F05': 'mot_khung',
+                                                            'O1-F08': 'mot_khung', 'K': 'mot_khung'}),
+                khung_tc=dict(n_min=120, frac_min=0.6, p_dung_m=0.003, psi_dung_deg=0.3), tuoi_yaw_max_ms=125.0)
+
+
+def test_ct3_3_c8_flag_needs_the_chain_and_the_locks():
+    """CT3-3 (round 4): a final grid AND the window of its chain AND locked constants: a C8 result; a window built
+    straight from the final grid (no chain), or a locked file without the branch table: not."""
+    fin = dict(luoi_so_bo_sha256='b' * 64, cua_so_v1_sha256='c' * 64)
+    hs = _hs_locked()
+    assert cs.cham_c8_why(dict(chuoi_gio_c8=True), fin, hs, 'O1-F05') == []
+    assert any('chuoi' in w for w in cs.cham_c8_why(dict(chuoi_gio_c8=False), fin, hs, 'O1-F05'))
+    assert any('nhanh' in w for w in cs.cham_c8_why(dict(chuoi_gio_c8=True), fin, dict(hs, man_trap=None), 'O1-F05'))
+    assert any('cuoi' in w for w in cs.cham_c8_why(dict(chuoi_gio_c8=True), dict(luoi_so_bo_sha256=None), hs,
+                                                    'O1-F05'))
+
+
+def test_ct3_3_bind_clock_same_file_is_no_chain(tmp_path):
+    """CT3-3 (round 4): a window built straight from the final grid binds (diagnostic) but is not the C8 chain."""
+    fin = tmp_path / 'gio.json'
+    fin.write_text(json.dumps(dict(schema='c8b_gio_v1', luoi_so_bo_sha256='b' * 64, cua_so_v1_sha256='c' * 64)),
+                   encoding='utf-8')
+    hs = dict(khung_tc=dict(ctd.KHUNG_TC_DE_XUAT, nguon='t'), trang_thai='de_xuat', u_t_ghep_s=0.0, troi_ppm=436.0,
+              t_trong_s=0.1)
+    pre = dict(gio_sha256=cs.cm.sha256(str(fin)), nguong={k: ctd.KHUNG_TC_DE_XUAT[k] for k in ctd.KHUNG_TC_DE_XUAT},
+               hang_so_dung=dict(u_t_ghep_s=0.0, troi_ppm=436.0, t_trong_s=0.1))
+
+    class A:
+        gio_c8b, cua_so = str(fin), str(fin)
+    assert cs.bind_clock(pre, A, hs) is False
+
+
+def test_ct3_4_cli_operator_loss_without_the_window_file(tmp_path, capsys):
+    """CT3-4 (round 4): --cua-so names a file never written (no edge) and the events hold '#gain_ack ok=0': exit 0 with
+    the operator loss in score.json, not a tool error."""
+    lane_rows = B.make_frames('O1-F05')
+    p = tmp_path / 'frames.csv'
+    cs.cm.write_frames(str(p), lane_rows)
+    B.hs_file(tmp_path)
+    log = B.make_log(tmp_path / 'esp32.csv', 'O1-F05', (0.0, 0.0, 0.0))
+    us_events(str(log) + '.events.txt', 0, 10,
+              extra='2026-11-19T10:00:40 #gain_ack,tx=1,req_id=1,ok=0,err=crc,sha=x,env=e,mac=m,boot=00000001\n')
+    out = tmp_path / 'score.json'
+    rc = cs.main(['--frames', str(p), '--esp32', str(log), '--task', 'O1-F05', '--hang-so',
+                  str(tmp_path / 'hang_so.json'), '--offset-s', str(B.OFFSET), '--offset-reason', 't',
+                  '--offset-anchor-s', '0', '--offset-err-s', '0', '--tuong-doi', '--cua-so', str(tmp_path / 'no.jsonl'),
+                  '--tham-chieu', str(tmp_path / 'no.json'), '--out', str(out), '--rows', str(tmp_path / 'rows.csv')])
+    assert rc == 0
+    d = json.loads(out.read_text(encoding='utf-8'))
+    assert d['fail_cause'] == 'thao_tac' and 'loi_nap_gain' in d['thao_tac']
+
+
+def test_ct3_5_contradicting_copies_and_missing_fields():
+    """CT3-5 (round 4, Codex example): two '#us_end' of the same boot and last_data_seq, blk_ticks 0 and 1: a
+    contradiction (khoa_sieu_am, no T9 bound); a start without 'on': missing evidence."""
+    rows = [dict(_seq=q, _mo=True) for q in range(10, 21)]
+    gain = '#gain,id=0,applied_n=1,ctrl=pid,first_seq=10,line_drop=0,boot=00000001'
+    st = '#us,ev=start,boot=00000001,on=0,swb=0,first_seq=10,line_drop=0'
+    e0 = '#us_end,boot=00000001,on=0,swb=0,changes=0,blk_ticks=0,cut_ticks=0,ticks=11,last_data_seq=20,line_drop=0'
+    assert cs.run_us(rows, [gain, st, e0], 1)['ok']
+    k, _ = cs.thao_tac_of(rows, [gain, st, e0, e0.replace('blk_ticks=0', 'blk_ticks=1')], 1)
+    assert k == ['khoa_sieu_am']
+    assert not cs.run_us(rows, [gain, st.replace('on=0,', ''), e0], 1)['ok']
+    assert not cs.run_us(rows, [st, e0], 1)['ok']                       # no '#gain' of the run
+
+
+def test_ct3_5_score_gives_no_t9_bound_from_an_untied_summary(tmp_path, monkeypatch):
+    """CT1-20 / CT3-5: score itself does not take seq_max from a summary run_us did not confirm."""
+    monkeypatch.setattr(cs, 'run_us', lambda rows, ev, i: dict(ok=False, why=['x'], boot=None, start=[], end=None,
+                                                               last=10 ** 9, blk=None))
+    monkeypatch.setattr(cs, 'thao_tac_of', lambda rows, ev, i: ([], []))
+    lane_rows = B.make_frames('O1-F05')
+    fl, chain = to_floor('O1-F05', lane_rows)
+    out, _ = score(tmp_path, 'O1-F05', fl, rel=rel_for('O1-F05', fl, chain))
+    c = out['khung_tuong_doi_v1']['chot_yaw']
+    assert c['seq_max_cung_boot'] is None and c['can_tuoi_ms'] is None
+
+
+def test_ct2_1_post_end_identity_and_presence():
+    """CT2-1 (round 4): a non-empty F8 post set without the post window is refused; dau.post frames / clip of another
+    source than the F2 post row: refused."""
+    ll, pre, post = _real_ll()
+    with pytest.raises(ValueError, match='post'):
+        cs.bind_lan_lap(ll, pre, ll['cua_so_v1_sha256'], 'O1-F05', None)
+    bad = json.loads(json.dumps(ll))
+    bad['dau']['post']['frames_sha256'] = 'z' * 64
+    with pytest.raises(ValueError, match='frames_sha256'):
+        cs.bind_lan_lap(bad, pre, ll['cua_so_v1_sha256'], 'O1-F05', post)
+
+
+def test_ct4_1_both_khung_chung_sha_copies():
+    """CT4-1: dau.pre.khung_chung_sha256 changed alone (top copy and intersection kept): refused."""
+    ll, pre, post = _real_ll()
+    bad = json.loads(json.dumps(ll))
+    bad['dau']['pre']['khung_chung_sha256'] = '0' * 64
+    with pytest.raises(ValueError, match='differs'):
+        cs.bind_lan_lap(bad, pre, ll['cua_so_v1_sha256'], 'O1-F05', post)
+
+
+def test_ct1_20_t_som_follows_the_stencil_result(tmp_path, monkeypatch):
+    """CT1-20 (round 4): t_som uses the RESULT of ctd.wz_usable: no usable wz at all moves t_som no later than the
+    real flags (a mutation that calls it and keeps the central flag would give the same t_som)."""
+    lane_rows = B.make_frames('O1-F05', post=4.0)
+    fl, chain = to_floor('O1-F05', lane_rows)
+    for c in chain:                                  # no q: the speed is undefined, only wz can rule completion out
+        c.update(q_ok=False, p_x=float('nan'), p_y=float('nan'))
+    a, _ = score(tmp_path / 'a', 'O1-F05', fl, rel=rel_for('O1-F05', fl, chain), log_kw=dict(post=5.0))
+    monkeypatch.setattr(ctd, 'wz_usable', lambda yaw_ok, half: np.zeros(len(yaw_ok), bool))
+    b, _ = score(tmp_path / 'b', 'O1-F05', fl, rel=rel_for('O1-F05', fl, chain), log_kw=dict(post=5.0))
+    assert b['gate_v3']['g1']['t_som_s'] < a['gate_v3']['g1']['t_som_s']
