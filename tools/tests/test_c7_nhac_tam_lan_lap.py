@@ -1538,3 +1538,17 @@ def test_ct4_3_empty_or_null_window_keeps_the_run(files):
     assert L['L05']['lan_lap_id'] is None and 'lan_lap_khong_xac_dinh' in L['L05']['ly_do']['beta']
     bad = {(x['meta']['luot'], x['meta']['loai']) for x in ll['cua_so_loi']}
     assert {('L02', 'post'), ('L03', 'post'), ('L05', 'pre')} <= bad
+
+
+def test_f15_diagnostic_state_is_not_dat(files):
+    """CODE 19/11 (KIEMCHEO 02dea17): an F15 (b) in state chan_doan is not locked -> every place chua_ket_luan."""
+    rows, recs = build()
+    _, _, ll, _ = run(files, rows, recs, tag='cd')
+
+    def dong(cho, lid, dau, k):
+        return {'c': [1e-4, 0.0]}
+    o = _f15(ll, dong, files / 'cd1.json')
+    o['trang_thai'] = 'chan_doan'
+    (files / 'cd1.json').write_text(json.dumps(_f15_hash(o)), encoding='utf-8')
+    b = _again(files, rows, recs, 'cd', files / 'cd1.json')['beta_cam_replay']
+    assert b and all(v['trang_thai'] == 'chua_ket_luan' and 'f15_chan_doan' in v['ly_do'] for v in b.values())

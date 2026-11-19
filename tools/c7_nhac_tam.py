@@ -2000,6 +2000,8 @@ def beta_cam_replay(f15_path, hc, out_l, luot, hw, fitw, doan, G, h, ctx):
     Returns {cho: {max_abs_dbeta_rad, n, trang_thai, ly_do, f15_sha256}}."""
     o, f_sha = doc_f15(f15_path, hc, ctx)
     ten = o['neo_ten']
+    tt15 = o.get('trang_thai')
+    ly15 = [f'f15_{tt15}'] if tt15 in ('chan_doan', 'chua_ket_luan') else []   # CODE 19/11: not locked -> not dat
     can = {}
     for r in out_l:
         lid = r['luot_id']
@@ -2048,6 +2050,7 @@ def beta_cam_replay(f15_path, hc, out_l, luot, hw, fitw, doan, G, h, ctx):
                     a0, _, _ = tu_the(G, h, P0, F, H, ctx.C, ctx.a_n)
                     da.append(wrap(a1 - a0))
                 dbs.append(abs(wrap(da[1] - da[0])))
+        ly = ly15 + ly
         ok = bool(dbs) and not ly and all(math.isfinite(x) for x in dbs)
         out[cho] = dict(max_abs_dbeta_rad=max(dbs) if dbs else None, n=len(dbs),
                         trang_thai='dat' if ok else 'chua_ket_luan',
