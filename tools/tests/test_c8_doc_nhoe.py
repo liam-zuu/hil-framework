@@ -1,4 +1,4 @@
-"""Tests of tools/c8_doc_nhoe.py (design 03_CODE/docs/2026-11-19_Thiet_ke_CODE_DOCNHOE_v2.md section 7)."""
+"""Tests of tools/c8_doc_nhoe.py (design 03_CODE/docs/2026-11-19_Thiet_ke_CODE_DOCNHOE_v5.md; tests of v3 6 and v4 6)."""
 import csv
 import json
 import math
@@ -136,7 +136,7 @@ def test_cong_refuses_without_sensitive_khoa(tmp_path):
 
 def test_cong_refuses_existing_out(tmp_path, monkeypatch):
     k = tmp_path / 'khoa.json'
-    k.write_text(json.dumps(dict(version=dn.VERSION, du_nhay=True, cu_sha256='x', session_sha256='y', gate_2a_m=0.0015, clips={})), encoding='utf-8')
+    k.write_text(json.dumps(dict(version=dn.VERSION, du_nhay=True, cu_sha256='x', session_sha256='y', gate_2a_m=0.0015, clips={}, gates=dn._clean(dict(cm.DEFAULT_GATES)))), encoding='utf-8')
     monkeypatch.setattr(dn, 'read_cu', lambda p: dict(sha256='x', R0_m=0.25))
     monkeypatch.setattr(dn, 'load_session', lambda p: (dict(car_side_m=SIDE, rms_px_H=1.0), 'y'))
     (tmp_path / 'o').mkdir()
@@ -225,13 +225,6 @@ def test_huber_pattern_robust():
     assert np.percentile(e[good], 99) < 0.6e-3
 
 
-def test_phase_refs_min_count():
-    sh = np.tile(dn.norm_shape(_quad()), (20, 1, 1))
-    cell = np.array([0] * 4 + [1] * 16)
-    ref, n = dn.phase_refs(sh, cell, np.ones(20, bool))
-    assert np.isnan(ref[0]).all() and np.isfinite(ref[1]).all() and n[1] == 16
-
-
 # ── v3: old frames keep the track's verdict (DN2-06) ─────────────────────────────────────────────
 
 def test_combine_old_frames_keep_run_a():
@@ -260,3 +253,227 @@ def test_cong_refuses_wrong_version(tmp_path):
     rc = dn.main(['cong', '--khoa', str(k), '--c1', 'a', 'b', '--c2', 'c', 'd', '--session', 's', '--cu', 'u',
                   '--ghep', 'g', '--frames-a', 'f', '--out', str(tmp_path / 'o')])
     assert rc == 2 and not (tmp_path / 'o').exists()
+
+
+# ── v5: synthetic tag image ──────────────────────────────────────────────────────────────────────
+
+import cv2                                                               # noqa: E402
+
+CACHE = os.environ.get('C8_DOC_NHOE_CACHE', '')                         # prefix of a real crop cache (optional)
+
+
+def _synth(ang=0.2, side=92.0, c=(110.0, 110.0), blur=1.0, bg=200):
+    canvas, can = dn.template()
+    h = side / 2
+    q = np.array([[-h, -h], [h, -h], [h, h], [-h, h]])
+    R = np.array([[math.cos(ang), -math.sin(ang)], [math.sin(ang), math.cos(ang)]])
+    q = q @ R.T + np.asarray(c)
+    H = cv2.getPerspectiveTransform(can, q.astype(np.float32))
+    img = cv2.warpPerspective(canvas, H, (220, 220), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
+                              borderValue=float(bg))
+    img = cv2.GaussianBlur(img, (0, 0), blur)
+    return np.clip(img, 0, 255).astype(np.uint8), q
+
+
+def test_refine_edges_diag_same_corners_synthetic():
+    det = cm.make_detector()
+    for ang in (0.0, 0.3, 1.1):
+        img, q = _synth(ang=ang)
+        ref = cm.detect_refined(det, img)
+        qd, dg = dn.detect_diag(det, img)
+        assert cm.CAR_ID in ref and qd is not None
+        assert np.array_equal(ref[cm.CAR_ID], qd)
+        assert len(dg) == 4 and all(d['kept'] >= dn.KEPT_MIN and d['rms_px'] < 0.2 for d in dg)
+        assert np.max(np.abs(qd - q)) < 0.3
+
+
+@pytest.mark.skipif(not (CACHE and os.path.exists(CACHE + '.npz')), reason='no real crop cache (C8_DOC_NHOE_CACHE)')
+def test_refine_edges_diag_same_corners_real_crops():
+    crops = np.load(CACHE + '.npz')['crops']                 # decompressed once
+    det = cm.make_detector()
+    n = 0
+    for j in range(0, len(crops), max(1, len(crops) // 300)):
+        g = crops[j]
+        ref = cm.detect_refined(det, g)
+        qd, _ = dn.detect_diag(det, g)
+        if cm.CAR_ID in ref:
+            assert qd is not None and np.array_equal(ref[cm.CAR_ID], qd)
+            n += 1
+        else:
+            assert qd is None
+    assert n > 100
+
+
+def _det_q(img):
+    q, dg = dn.detect_diag(cm.make_detector(), img)
+    return q
+
+
+def test_injection_families_synthetic():
+    img, _ = _synth(ang=0.25)
+    q0 = _det_q(img)
+    ppm = dn.side_px(q0) / SIDE
+    base = dict(goc=1, huong=0.7, giua=False, o=(2, 3), huong2=2.0)
+    ref = dn.norm_shape(q0)
+    B0 = np.zeros((2, 8))
+    # P: one corner moved 5 mm shows in the shape
+    q = _det_q(dn.inject(img, q0, ppm, dict(base, fam='P', mag=5.0)))
+    assert q is not None and dn.e_hinh(dn.shape_dev(dn.norm_shape(q), ref, SIDE), 0.0, B0)[0] > 2e-3
+    # S: the whole tag shifted 3 mm, shape unchanged
+    q = _det_q(dn.inject(img, q0, ppm, dict(base, fam='S', mag=3.0)))
+    sh = (q - q0).mean(axis=0)
+    assert np.linalg.norm(sh) / ppm == pytest.approx(3e-3, abs=0.1e-3)
+    assert dn.e_hinh(dn.shape_dev(dn.norm_shape(q), ref, SIDE), 0.0, B0)[0] < 0.3e-3
+    # PS: a corner and a shift
+    q = _det_q(dn.inject(img, q0, ppm, dict(base, fam='PS', mag=(3.0, 3.0))))
+    assert q is not None and np.linalg.norm((q - q0).mean(axis=0)) > 2.0
+    # B: one inner cell flipped: the car tag is lost
+    assert _det_q(dn.inject(img, q0, ppm, dict(base, fam='B', mag=1))) is None
+    # Od, Ob, E: the reading changes (or the tag is lost)
+    for fam, mag in (('Od', 15), ('Ob', 15), ('E', 3)):
+        q = _det_q(dn.inject(img, q0, ppm, dict(base, fam=fam, mag=mag)))
+        assert q is None or np.max(np.abs(q - q0)) > 0.05
+
+
+def test_draw_params_paired_and_deterministic():
+    a = [dn.draw_params(f, m, np.random.default_rng(1)) for f, m in dn.FAMILIES]
+    b = [dn.draw_params(f, m, np.random.default_rng(1)) for f, m in dn.FAMILIES]
+    assert a == b
+
+
+# ── v5: phase references from other passes (DN3-04) ─────────────────────────────────────────────
+
+def test_refset_other_passes_only():
+    sq = dn.norm_shape(_quad())
+    sk = np.zeros((4, 2))
+    sk[0] = [0.02 * 92, 0.0]
+    odd = dn.norm_shape(_quad(skew=sk))
+    angs = np.r_[np.full(6, 0.01), np.full(6, 0.01 + 2 * math.pi)]   # 6 frames on each of two passes, cell 0
+    shapes = np.r_[np.tile(odd, (6, 1, 1)), np.tile(sq, (6, 1, 1))]
+    rs = dn.RefSet(np.arange(12), np.zeros(12, int), angs, shapes)
+    assert np.allclose(rs.ref(0, 0.01), sq)                   # its own pass left out
+    assert np.allclose(rs.ref(0, 0.01 + 2 * math.pi), odd)
+    rs2 = dn.RefSet(np.arange(8), np.zeros(8, int), np.r_[np.full(4, 0.0), np.full(4, 2 * math.pi)],
+                    np.tile(sq, (8, 1, 1)))
+    assert rs2.ref(0, 0.0) is None                             # 4 < PHASE_MIN on the other pass
+    assert rs.ref(-1, 0.0) is None and rs.ref(5, 0.0) is None
+
+
+# ── v5: the main gate (b), (f), (g), (h) ─────────────────────────────────────────────────────────
+
+def _gate(noise=0.0, vmax=10.0, n=240):
+    rng = np.random.default_rng(5)
+    t = np.arange(n) / 60.0
+    ang = 4.0 * t + 0.3 * t ** 2 + rng.normal(0, noise, n)
+    seen = np.ones(n, bool)
+    om, pred, win, ts, an = dn.loo_all(t, ang, seen)
+    sq = dn.norm_shape(_quad())
+    A = dict(vt=np.abs(om) * 0.25, cell=dn.phase_cell(pred), ang=ang, win=win, ts=ts, an=an, R0=0.25)
+    ra = np.array([c * 2 * math.pi / 72 + 0.01 + p * 2 * math.pi for p in range(-3, 6) for c in range(72)
+                   for _ in range(6)])
+    rs = dn.RefSet(np.arange(len(ra)), dn.phase_cell(ra), ra, np.tile(sq, (len(ra), 1, 1)))
+    G = dn.Gate(A, rs, np.zeros((2, 8)), np.zeros((3, 8)), vmax, 1e-3, 0.3, SIDE)
+    return G, A, sq
+
+
+def _F4(kept=24, rms=0.1):
+    return np.array([[kept, rms, 50.0, 1.5]] * 4, float)
+
+
+def test_gate_passes_clean_and_res_sim_quant():
+    G, A, sq = _gate()
+    k = 120
+    assert G.judge(k, sq, np.zeros(8), _F4(), 1e-3)[0] == ''
+    assert G.judge(k, sq, np.zeros(8), _F4(), dn.RES_SIM_CAP_M - 4e-11)[0] == 'res_sim_vuot_tran'
+    assert G.judge(k, sq, np.zeros(8), _F4(), dn.RES_SIM_CAP_M - 6e-11)[0] == ''
+    assert G.judge(k, sq, np.zeros(8), _F4(kept=19), 1e-3)[0] == 'canh_co_ban'
+    assert G.judge(k, sq, np.zeros(8), _F4(rms=0.6), 1e-3)[0] == 'canh_co_ban'
+    assert G.judge(k, sq, np.full(8, 0.5), _F4(), 1e-3)[0] == 'r_canh_vuot'
+
+
+def test_gate_vt_stable_leave_each_neighbour_out():
+    G, A, sq = _gate(noise=0.004)
+    k = 120
+    vt = A['vt'][k]
+    dr = G.drops(k)
+    assert len(dr) == A['win'][k][2] - A['win'][k][1] - 1
+    hi = max(d[0] for d in dr if d is not None)
+    assert hi > vt                                         # some neighbour left out raises v_t
+    G2, _, _ = _gate(noise=0.004, vmax=0.5 * (vt + hi))    # the frame is in range, one leave-out is not
+    assert G2.judge(k, sq, np.zeros(8), _F4(), 1e-3)[0] == 'vt_khong_ben'
+    G3, _, _ = _gate(noise=0.004, vmax=hi + 1e-9)
+    assert G3.judge(k, sq, np.zeros(8), _F4(), 1e-3)[0] == ''
+
+
+def test_gate_moved_corner_fails_shape():
+    G, A, sq = _gate()
+    sk = np.zeros((4, 2))
+    sk[2] = [3e-3 * 92 / SIDE, 0.0]
+    assert G.judge(120, dn.norm_shape(_quad(skew=sk)), np.zeros(8), _F4(), 1e-3)[0] == 'e_hinh_vuot'
+
+
+# ── v5: temporal check (i) ───────────────────────────────────────────────────────────────────────
+
+def _circle_clip(n=300, R=0.25, w=4.0):
+    t = np.arange(n) / 60.0
+    th = w * t + 0.4 * t ** 2
+    return dict(t=t, x=R * np.cos(th), y=R * np.sin(th), psi=th + 0.3, seen=np.ones(n, bool)), R
+
+
+def test_temporal_one_smooth_and_shift():
+    C, R = _circle_clip()
+    nidx = np.arange(len(C['t']))
+    r = dn.temporal_one(C['t'], C['x'], C['y'], C['psi'], nidx, 150, (0.0, 0.0), R)
+    assert max(abs(r[0]), abs(r[1]), abs(r[2])) < 1e-5
+    assert r[3] == pytest.approx(R * (4.0 + 0.8 * C['t'][150]), rel=1e-3)
+    x = C['x'].copy()
+    x[150] += 2e-3
+    r = dn.temporal_one(C['t'], x, C['y'], C['psi'], nidx, 150, (0.0, 0.0), R)
+    assert math.hypot(r[0], r[1]) == pytest.approx(2e-3, rel=0.05)
+    # DN5-04: the target pi off on the heading does not change the neighbours' unwrap
+    psi = C['psi'].copy()
+    psi[150] += math.pi
+    r = dn.temporal_one(C['t'], C['x'], C['y'], psi, nidx, 150, (0.0, 0.0), R)
+    assert abs(abs(r[2]) - math.pi) < 1e-4
+    assert dn.temporal_one(C['t'], C['x'], C['y'], C['psi'], nidx, 0, (0.0, 0.0), R) is None
+
+
+def test_temporal_two_passes_bad_neighbour():
+    C, R = _circle_clip()
+    C['x'] = C['x'].copy()
+    C['x'][150] += 3e-3                                     # one bad frame of N
+    old = np.ones(len(C['t']), bool)
+    TH = dict(a_m=0.2e-3, b_s=0.5e-3, T_phap_m=0.3e-3, T_huong_rad=math.radians(0.3))
+    res, qua, ok, _, N2 = dn.temporal_check(C, old, np.zeros(len(C['t']), bool), (0.0, 0.0), R, TH)
+    assert ok[150] and not qua[150] and not N2[150]
+    assert all(qua[k] for k in range(140, 161) if k != 150 and ok[k])
+
+
+# ── v5: injection table ──────────────────────────────────────────────────────────────────────────
+
+def test_inj_table_rules():
+    def r(fam, mag, cu, moi):
+        return dict(ho=fam, do_lon=mag, cu=cu, moi=moi)
+
+    def acc(c, p, **kw):
+        return dict(tang='nhan', loi_tam_m=c, loi_huong_deg=p, **kw)
+    rej = dict(tang='truot_hinh', loi_tam_m=3e-3, loi_huong_deg=1.0)
+    rows = [r('P', 2.0, acc(0.6e-3, 0.1), acc(0.52e-3, 0.1)), r('P', 2.0, rej, rej),
+            r('P', 3.0, acc(0.1e-3, 0.1), acc(0.7e-3, 0.1)),
+            r('S', 1.0, acc(1.0e-3, 0.01), acc(1.04e-3, 0.02, qua_i=False))]
+    tab = dn.inj_table(rows)
+    assert tab['P_2.0']['dat'] and tab['P_2.0']['cu']['nhan_sai'] == 1 and tab['P_2.0']['moi']['sai_that'] == 2
+    assert not tab['P_3.0']['dat'] and 'nhan_sai' in tab['P_3.0']['ly_do']
+    assert tab['S_1.0']['dat'] and tab['S_1.0']['moi_co_i']['nhan'] == 0
+    assert tab['P_4.0']['n'] == 0 and tab['P_4.0']['dat']
+    assert tab['P_2.0']['dieu_kien'] and not tab['S_1.0']['dieu_kien'] and not tab['PS_2.0_1.0']['dieu_kien']
+    assert tab['P_2.0']['theo_cap']['ca_hai_nhan'] == 1
+
+
+def test_gate_vt_lost_when_leaving_out_is_its_own_reason():
+    """design v5 7: a leave-one-out that makes v_t undefined is 'vt_mat_khi_bo' (not taken; health: cannot score)."""
+    G, A, sq = _gate()
+    k = 120
+    j, a, b = A['win'][k]
+    G._drops[k] = [None] + G.drops(k)[1:]
+    assert G.judge(k, sq, np.zeros(8), _F4(), 1e-3)[0] == 'vt_mat_khi_bo'
