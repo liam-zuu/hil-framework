@@ -159,11 +159,15 @@ def script_state():
         c = subprocess.run(['git', '-C', HERE, 'rev-parse', 'HEAD'], capture_output=True, text=True, timeout=10)
         s = subprocess.run(['git', '-C', HERE, 'status', '--porcelain', '--', os.path.basename(__file__)],
                            capture_output=True, text=True, timeout=10)
-        return dict(commit=c.stdout.strip(), dirty=bool(s.stdout.strip()), version=VERSION,
-                    sha256=sha256(__file__), c7_measure_sha256=sha256(cm.__file__))
+        return dict(commit=c.stdout.strip(), dirty=bool(s.stdout.strip()), version=VERSION, **_dep_sha())
     except (OSError, subprocess.SubprocessError):
-        return dict(commit='', dirty=None, version=VERSION, sha256=sha256(__file__),
-                    c7_measure_sha256=sha256(cm.__file__))
+        return dict(commit='', dirty=None, version=VERSION, **_dep_sha())
+
+
+def _dep_sha():
+    """sha256 of this file and of the modules it imports to score (DNC2-04)."""
+    return dict(sha256=sha256(__file__), c7_measure_sha256=sha256(cm.__file__), c7_clip_probe_sha256=sha256(cp.__file__),
+                c8b_3b_sha256=sha256(os.path.join(HERE, 'c8b_3b.py')))
 
 
 def low_priority():
@@ -955,14 +959,19 @@ def inject(crop, qc, ppm, p):
 
 
 class Pose:
-    """car_pose with the static session camera; injected poses are the track pose plus the static-camera change."""
+    """car_pose of c7_measure: with the static session camera (envelope, shape part only) or with the camera of the
+    frame (injection, DNC2-01)."""
 
     def __init__(self, sess):
         self.cam = cm.cam_from_dict(sess['camera'])
         self.side, self.kappa, self.plumb = float(sess['car_side_m']), sess['kappa'], sess['plumb_xy_m']
+        self.off = tuple(sess.get('tag_offset') or (0.0, 0.0, 0.0))
 
-    def __call__(self, q):
-        p = cm.car_pose(self.cam, q, self.side, self.kappa, self.plumb)
+    def full(self, q, cam=None):
+        return cm.car_pose(self.cam if cam is None else cam, q, self.side, self.kappa, self.plumb, self.off)
+
+    def __call__(self, q, cam=None):
+        p = self.full(q, cam)
         return np.array([p['tag_x'], p['tag_y']]), p['tag_psi'], p['res_sim_m'], p['scale']
 
 
@@ -1015,7 +1024,8 @@ def _other(name):
 
 def health(C, A, G):
     """v5 2.5: every old valid frame through (a)-(h): passes / fails ((a) included, DNC1-08) / cannot be scored (no
-    v_t, v_t undefined with a neighbour left out (v5 7), no phase reference, outside the pattern range)."""
+    v_t, v_t undefined with a neighbour left out (v5 7), no phase reference, and, by the same token, outside the range
+    of the pattern (no pattern defined there; convention stated for DNC2-09, counted apart in 'dem')."""
     cnt = Counter()
     fails = []
     for k in np.flatnonzero(C['valid_old']):
@@ -1122,70 +1132,158 @@ def _pick(rng, idx, n):
     return idx if len(idx) <= n else np.sort(rng.choice(idx, n, replace=False))
 
 
-def _injected(src, pose, p):
-    crop, off, q0, p0 = src
+# the frame camera must give the track row back within the resolution of frames.csv: res_m, res_sim_m, scale are
+# written with 10 decimals (half a unit 5e-11, tolerance 1e-10), tag_x, tag_y, psi with 6 (5e-7, tolerance 6e-7)
+FRAME_CAM_TOL = dict(res_m=1e-10, res_sim_m=1e-10, scale=1e-10, tag_x=6e-7, tag_y=6e-7, psi=6e-7)
+
+
+def frame_cameras(video, need, sess, C, pose):
+    """The camera of each frame in `need`, as c7_measure.track fits it: floor marks of the full frame, pose refit
+    (refit_pose) started from the session camera (track starts from the previous frame; the Huber minimum is the same
+    within the tolerance, checked). Each camera must give the track row back: car_pose of the full-frame car tag equals
+    res_m, res_sim_m, scale, tag_x, tag_y, psi of frames.csv within the resolution of the file (FRAME_CAM_TOL,
+    DNC2-01). Returns {k: (camera or None, why, largest deviation relative to its tolerance)}."""
+    marks = {int(i): tuple(v) for i, v in sess['marks'].items()}
+    fl = cm.session_floor_ids(sess)
+    cam0 = cm.cam_from_dict(sess['camera'])
+    det = detector()
+    want = set(int(k) for k in need)
+    out = {}
+    last = max(want) if want else -1
+    for k, t, g in cm.iter_frames(video):
+        if k > last:
+            break
+        if k not in want:
+            continue
+        if abs(t - C['t'][k]) > 1e-6:
+            raise DnError(f'frame {k}: PTS {t:.6f} != t_s {C["t"][k]:.6f}')
+        d = cm.detect_refined(det, g)
+        obj, img, used = cm.floor_obs(d, marks, fl)
+        if len(used) < 4 or CAR_ID not in d:
+            out[k] = (None, 'thieu_moc_hay_ma', None)
+            continue
+        cam, _ = cm.refit_pose(cam0, obj, img)
+        p = pose.full(d[CAR_ID], cam)
+        row = C['rows'][k]
+        dev = max(abs(float(cm.cp_wrap(p[c] - row[c])) if c == 'psi' else p[c] - row[c]) / tol
+                  for c, tol in FRAME_CAM_TOL.items())
+        out[k] = (cam, '' if dev <= 1.0 else 'lech_track', float(dev))
+    return out
+
+
+def _injected(src, pose, p, cam):
+    crop, off, q0 = src
     ppm = side_px(q0) / pose.side
     q, dg = detect_diag(detector(), inject(crop, q0 - off, ppm, p))
     if q is None:
         return None, None, None
     q = q + off
-    return q, dg, pose(q)
+    return q, dg, pose.full(q, cam)
 
 
-def score_old(C, k, src, pose, p, gates, p12a):
-    """Old gate on a slow old valid frame, as cong treats a frame that is not taken: (2a) on the track residual
-    moved by the static-camera change, (2b) against the run-A pool. lost ID / (2a) / (2b) / accepted."""
-    p0 = src[3]
-    q, _, p1 = _injected(src, pose, p)
+def _row_with(C, k, pf, q):
+    """The track row of frame k with the injected reading (pose of the frame camera, full precision): the row cong
+    would gate if the image were this one; (a) holds by construction (the row comes from this reading)."""
+    r = copy.deepcopy(C['rows'][k])
+    for c in ('x', 'y', 'psi', 'tag_x', 'tag_y', 'res_m', 'res_sim_m', 'scale'):
+        r[c] = float(pf[c])
+    r['col_px'], r['row_px'] = float(q[:, 0].mean()), float(q[:, 1].mean())
+    for c in ('_res_sim_lo', '_res_sim_hi'):
+        r.pop(c, None)
+    r['_dec'] = {}
+    return r
+
+
+def gate_verdict(C, k, row_k, take_k, take, rms_h, gates):
+    """valid, why of frame k as cong gives it (combine: run A when not taken, run B when taken; c7_measure.apply_gates
+    with QUANT), on the rows with row k replaced. Only the rows within +-(scale_win_s + 0.05) s can change the verdict
+    of k ((1), (2a) are per row; (2b) uses the neighbours' (1), (2a)), so the run is made on that slice."""
+    t = C['t']
+    a = int(np.searchsorted(t, t[k] - gates['scale_win_s'] - 0.05, 'left'))
+    b = int(np.searchsorted(t, t[k] + gates['scale_win_s'] + 0.05, 'right'))
+    rows = [C['rows'][j] if j != k else row_k for j in range(a, b)]
+    tk = take[a:b].copy()
+    tk[k - a] = take_k
+    r = regate_with(rows, tk, rms_h, gates)[k - a] if take_k else \
+        regate_with(rows, np.zeros(b - a, bool), rms_h, gates)[k - a]
+    return bool(r['valid']), list(r['why'])
+
+
+def temporal_local(C, x, y, psi, N, k, centre, R0, TH):
+    """(i) for frame k exactly as the two passes of temporal_check give it on the chain with frame k replaced
+    (DNC2-02): pass 1 on the neighbours of k (their own residuals with N), those that fail leave N, pass 2 on k."""
+    nidx = np.flatnonzero(N)
+    t = C['t']
+    nb = [int(j) for j in nidx if j != k and abs(t[j] - t[k]) <= T_WIN_S + 1e-9]
+    drop = set()
+    for j in nb:
+        r = temporal_one(t, x, y, psi, nidx, j, centre, R0)
+        if r is not None and temporal_fail(np.array([r]), TH)[0][0]:
+            drop.add(j)
+    n2 = np.array([j for j in nidx if j not in drop], int)
+    r = temporal_one(t, x, y, psi, n2, k, centre, R0)
+    return None if r is None else not bool(temporal_fail(np.array([r]), TH)[0][0])
+
+
+def _tang(why, route):
+    if not why:
+        return 'nhan'
+    if 'xe_meo' in why or 'can_track_lai' in why:
+        return 'truot_2a'
+    if 'ti_le' in why or 'ti_le_it_lan_can' in why:
+        return 'truot_2b'
+    return 'truot_1'
+
+
+def score_old(C, k, src, cam, pose, p, gates, rms_h):
+    """Old gate on a slow old valid frame: the injected row (frame camera) gated by the track's own rule (run A,
+    apply_gates with QUANT). lost ID / (2a) / (2b) / accepted, with the pose error."""
+    q, _, pf = _injected(src, pose, p, cam)
     if q is None:
         return dict(tang='mat_id')
+    p0 = pose(src[2], cam)
+    p1 = (np.array([pf['tag_x'], pf['tag_y']]), pf['tag_psi'])
     ec, ep = _err(pose, p0, p1)
-    out = dict(loi_tam_m=ec, loi_huong_deg=ep)
-    if not C['res_sim'][k] + (p1[2] - p0[2]) <= gates['car_res_sim_m']:
-        out['tang'] = 'truot_2a'
-        return out
-    ok, w = scale_check(C, p12a, k, C['scale'][k] + (p1[3] - p0[3]), gates)
-    out['tang'] = 'nhan' if ok else 'truot_2b'
-    return out
+    ok, why = gate_verdict(C, k, _row_with(C, k, pf, q), False, np.zeros(len(C['t']), bool), rms_h, gates)
+    return dict(tang=_tang([] if ok else why, 'cu'), loi_tam_m=ec, loi_huong_deg=ep, res_sim_m=pf['res_sim_m'])
 
 
-def score_new(C, A, G, k, src, pose, p, gates, p12a, p12b, tctx):
-    """A fast candidate through the decision path of cong (DNC1-03): the injected residual and scale are the track
-    values moved by the static-camera change; a residual that passes (2a) routes the frame as an old one ((2b)
-    against the run-A pool); otherwise (b)-(h) of the new gate, then (2b) against the run-B pool. (a) does not apply
-    (the injected image differs from the track by construction). The temporal check (i) is recorded on its own
-    (qua_i, one pass with the pass-2 neighbour set N2)."""
-    p0 = src[3]
-    q, dg, p1 = _injected(src, pose, p)
+def score_new(C, A, G, k, src, cam, pose, p, gates, rms_h, take, tctx):
+    """A fast candidate on the decision path of cong (DNC2-01): the injected row (frame camera, full precision); a
+    residual that passes (2a) (cong: candidate only when not res_sim <= gate) leaves the frame to run A; otherwise
+    (b)-(h) of the new gate, and a frame taken gets run B; (2a), (2b) by apply_gates with QUANT on the real
+    neighbours, the other frames taken as cong takes them. (i) only for a frame the new route takes, two passes on
+    the chain with the frame replaced (DNC2-02)."""
+    q, dg, pf = _injected(src, pose, p, cam)
     if q is None:
         return dict(tang='mat_id')
+    p0 = pose(src[2], cam)
+    p1 = (np.array([pf['tag_x'], pf['tag_y']]), pf['tag_psi'])
     ec, ep = _err(pose, p0, p1)
-    rs = C['res_sim'][k] + (p1[2] - p0[2])
-    sc = C['scale'][k] + (p1[3] - p0[3])
-    out = dict(loi_tam_m=ec, loi_huong_deg=ep)
-    cx, cy, R0, TH, N2 = tctx
-    x, y, ps = C['x'].copy(), C['y'].copy(), C['psi'].copy()
-    x[k] += p1[0][0] - p0[0][0]
-    y[k] += p1[0][1] - p0[0][1]
-    ps[k] += float(wrap(p1[1] - p0[1]))
-    tr = temporal_one(C['t'], x, y, ps, np.flatnonzero(N2), k, (cx, cy), R0)
-    out['qua_i'] = None if tr is None else not bool(temporal_fail(np.array([tr]), TH)[0][0])
-    if rs <= gates['car_res_sim_m']:
+    out = dict(loi_tam_m=ec, loi_huong_deg=ep, res_sim_m=pf['res_sim_m'], qua_i=None)
+    row = _row_with(C, k, pf, q)
+    if pf['res_sim_m'] <= gates['car_res_sim_m']:
         out['tuyen'] = 'cu'
-        ok, _ = scale_check(C, p12a, k, sc, gates)
-        out['tang'] = 'nhan' if ok else 'truot_2b'
+        ok, why = gate_verdict(C, k, row, False, take, rms_h, gates)
+        out['tang'] = _tang([] if ok else why, 'cu')
         return out
     out['tuyen'] = 'moi'
     F4 = np.array([[d['kept'], d['rms_px'], d['contrast'], d['width_px']] for d in dg])
-    why, e, r = G.judge(k, norm_shape(q), edge_vec(dg), F4, rs)
+    why, e, r = G.judge(k, norm_shape(q), edge_vec(dg), F4, pf['res_sim_m'])
     out.update(e_hinh_m=e, r_canh=r)
     if why:
         out['tang'] = {'canh_co_ban': 'truot_canh', 'r_canh_vuot': 'truot_canh', 'vt_khong_ben': 'truot_vt',
                        'vt_mat_khi_bo': 'truot_vt', 'res_sim_vuot_tran': 'truot_tran'}.get(why, 'truot_hinh')
         out['ly_do'] = why
         return out
-    ok, _ = scale_check(C, p12b, k, sc, gates)
-    out['tang'] = 'nhan' if ok else 'truot_2b'
+    ok, w = gate_verdict(C, k, row, True, take, rms_h, gates)
+    out['tang'] = _tang([] if ok else w, 'moi')
+    cx, cy, R0, TH, valid_old = tctx
+    x, y, ps = C['x'].copy(), C['y'].copy(), C['psi'].copy()
+    x[k], y[k], ps[k] = pf['tag_x'], pf['tag_y'], pf['psi']
+    N = valid_old | take
+    N[k] = True
+    out['qua_i'] = temporal_local(C, x, y, ps, N, k, (cx, cy), R0, TH)
     return out
 
 
@@ -1193,10 +1291,9 @@ def _bad(r, kc=1.0, kp=1.0):
     return r.get('loi_tam_m') is not None and (r['loi_tam_m'] > kc * BAD_C_M or r['loi_huong_deg'] > kp * BAD_P_DEG)
 
 
-def injection(C, A, G, cache, pose, fast_pool, gates, p12a, p12b, tctx, rng):
+def pick_pairs(C, A, fast_pool, rng):
     """Pairs (slow old valid frame, fast scorable candidate) of the same predicted phase cell, each slow frame used
-    once; the same fault (family, corner, direction, size) on both; old gate on the slow frame, decision path of cong
-    on the fast one. The fast pool does not depend on the verdict of the new gate (DNC1-04)."""
+    once; drawn by their own generator (DNC2-03). The fast pool does not depend on the verdict of the new gate."""
     slow = np.flatnonzero(C['valid_old'] & A['qok'] & np.isfinite(A['vt']) & (A['vt'] <= SLOW_VT) & (A['cell'] >= 0))
     used = set()
     pairs = []
@@ -1208,20 +1305,30 @@ def injection(C, A, G, cache, pose, fast_pool, gates, p12a, p12b, tctx, rng):
             pairs.append((ks, int(k)))
         if len(pairs) >= INJ_PAIRS:
             break
-    rows = []
-    for ks, kf in pairs:
+    return pairs
+
+
+def injection(C, A, G, cache, pose, pairs, cams, gates, rms_h, take, tctx, ci):
+    """The same fault (family, corner, direction, size) on both frames of each pair, drawn by a generator of its own
+    per (clip, pair, family) (DNC2-03); old gate on the slow frame, the decision path of cong on the fast one, both
+    with the camera of their frame. A pair whose frame camera does not give the track row back is not scored
+    (counted)."""
+    rows, skipped = [], []
+    for pi, (ks, kf) in enumerate(pairs):
+        if cams.get(ks, (None,))[0] is None or cams[ks][1] or cams.get(kf, (None,))[0] is None or cams[kf][1]:
+            skipped.append((ks, kf))
+            continue
         src = {}
         for kk in (ks, kf):
             j = cache['pos'][kk]
-            off = np.array([cache['x0'][j], cache['y0'][j]], float)
-            src[kk] = (cache['crops'][j], off, A['Q'][kk], pose(A['Q'][kk]))
-        for fam, mag in FAMILIES:
-            p = draw_params(fam, mag, rng)
-            o = score_old(C, ks, src[ks], pose, p, gates, p12a)
-            nw = score_new(C, A, G, kf, src[kf], pose, p, gates, p12a, p12b, tctx)
+            src[kk] = (cache['crops'][j], np.array([cache['x0'][j], cache['y0'][j]], float), A['Q'][kk])
+        for fi, (fam, mag) in enumerate(FAMILIES):
+            p = draw_params(fam, mag, np.random.default_rng([INJ_SEED, ci, 4, pi, fi]))
+            o = score_old(C, ks, src[ks], cams[ks][0], pose, p, gates, rms_h)
+            nw = score_new(C, A, G, kf, src[kf], cams[kf][0], pose, p, gates, rms_h, take, tctx)
             rows.append(dict(ho=fam, do_lon=mag, cham=ks, nhanh=kf, o_pha=int(A['cell'][kf]),
                              goc=p['goc'], huong_rad=p['huong'], cu=o, moi=nw))
-    return pairs, rows
+    return rows, skipped
 
 
 def inj_table(rows):
@@ -1230,9 +1337,9 @@ def inj_table(rows):
     REPORT_FAMS (report only, design v5 7)."""
     tab = {}
     for fam, mag in FAMILIES:
-        R = [r for r in rows if r['ho'] == fam and r['do_lon'] == mag]
+        R = [r for r in rows if r['ho'] == fam and _clean(r['do_lon']) == _clean(mag)]
         key = f'{fam}_{mag if not isinstance(mag, tuple) else "_".join(str(v) for v in mag)}'
-        d = dict(n=len(R))
+        d = dict(n=len(R), n_cap=len({(r.get('cham'), r.get('nhanh')) for r in R}))
         for g in ('cu', 'moi'):
             acc = [r[g] for r in R if r[g]['tang'] == 'nhan']
             bad = [r[g] for r in R if _bad(r[g])]
@@ -1244,7 +1351,8 @@ def inj_table(rows):
                         max_tam_nhan_m=max((x['loi_tam_m'] for x in acc), default=0.0),
                         max_huong_nhan_deg=max((x['loi_huong_deg'] for x in acc), default=0.0),
                         tang=dict(Counter(r[g]['tang'] for r in R)))
-        acc_i = [r['moi'] for r in R if r['moi']['tang'] == 'nhan' and r['moi'].get('qua_i')]
+        acc_i = [r['moi'] for r in R if r['moi']['tang'] == 'nhan' and
+                 (r['moi'].get('tuyen') == 'cu' or r['moi'].get('qua_i'))]   # (i) applies to the new route only
         d['moi_co_i'] = dict(nhan=len(acc_i), nhan_sai=sum(1 for x in acc_i if _bad(x)),
                              max_tam_nhan_m=max((x['loi_tam_m'] for x in acc_i), default=0.0),
                              max_huong_nhan_deg=max((x['loi_huong_deg'] for x in acc_i), default=0.0))
@@ -1274,13 +1382,15 @@ def cluster_report(C, A, take, centre, R0, TH, N2, rng):
     shifted together by d mm (one direction) on the pose chain; share of the run frames the temporal check (i)
     catches."""
     nidx = np.flatnonzero(N2)
-    starts = np.flatnonzero(take & (A['vt'] >= FAST_BAND[0]) & (A['vt'] <= FAST_BAND[1]))
+    starts = np.flatnonzero(take & N2 & (A['vt'] >= FAST_BAND[0]) & (A['vt'] <= FAST_BAND[1]))   # DNC2-06
     out = []
     for L in CLUSTER_L:
         for d in CLUSTER_MM:
             caught, tot = 0, 0
             for k0 in _pick(rng, starts, CLUSTER_N):
                 j0 = int(np.searchsorted(nidx, k0))
+                if j0 >= len(nidx) or nidx[j0] != k0:
+                    continue
                 run = nidx[j0:j0 + L]
                 if len(run) < L or run[-1] - run[0] != L - 1:
                     continue
@@ -1445,40 +1555,29 @@ def cmd_khoa(a):
     for ci, (name, C) in enumerate(clips.items()):
         A, Gn = An[name], G[name]
         take, info = decide(C, A, Gn, G0)
-        _, ra, rb, _ = combine(C['rows'], take, sess['rms_px_H'], gates)
-        p12a, p12b = p12_mask(ra), p12_mask(rb)
         r2, qua, ok2, TH, N2 = temporal_check(C, C['valid_old'], take, cu['centre'], cu['R0_m'])
-        tctx = (cu['centre'][0], cu['centre'][1], cu['R0_m'], TH, N2)
         H = health(C, A, Gn)
         # one generator per use, so a report-only change cannot move a hard sample (DNC1-04)
-        rng_env, rng_inj, rng_clu = (np.random.default_rng([INJ_SEED, ci, u]) for u in (1, 2, 3))
+        rng_env, rng_pair, rng_clu = (np.random.default_rng([INJ_SEED, ci, u]) for u in (1, 2, 3))
         slow_idx = np.flatnonzero(C['valid_old'] & A['qok'] & np.isfinite(A['vt']) & (A['vt'] <= SLOW_VT))
         fast_pool = scorable(C, A, Gn, G0)
         env_old = envelope(C, A, Gn, pose, slow_idx, 'old', G0, rng_env)
         env_new = envelope(C, A, Gn, pose, fast_pool, 'new', G0, rng_env)
-        pairs, inj = injection(C, A, Gn, caches[name], pose, fast_pool, gates, p12a, p12b, tctx, rng_inj)
+        pairs = pick_pairs(C, A, fast_pool, rng_pair)
+        video = a.v1 if name == 'c1' else a.v2
+        if sha256(video) != caches[name]['meta']['video_sha256']:
+            raise DnError(f'{video}: not the video of the crops of {name}')
+        cams = frame_cameras(video, sorted({k for p in pairs for k in p}), sess, C, pose)
+        tctx = (cu['centre'][0], cu['centre'][1], cu['R0_m'], TH, C['valid_old'])
+        inj, skipped = injection(C, A, Gn, caches[name], pose, pairs, cams, gates, sess['rms_px_H'], take, tctx,
+                                 ci)
         tab = inj_table(inj)
         clus = cluster_report(C, A, take, cu['centre'], cu['R0_m'], TH, N2, rng_clu)
         tp = template_params(C, A, caches[name], side)
-        why = []
         t = th[name]
-        if t['e_max_m'] > E_MAX_CEIL_M:
-            why.append(f'e_max {t["e_max_m"] * 1e3:.3f} mm > {E_MAX_CEIL_M * 1e3:.0f} mm')
-        if t['r_max'] > R_MAX_CEIL:
-            why.append(f'r_max {t["r_max"]:.3f} > {R_MAX_CEIL}')
-        if env_old is None or env_new is None:
-            why.append('bao: khong du khung')
-        else:
-            for key in ('tam_m', 'huong_deg'):
-                if any(n > o for n, o in zip(env_new[key], env_old[key])):
-                    why.append(f'bao {key}: moi {env_new[key]} > cu {env_old[key]}')
-        if len(pairs) < INJ_PAIRS:
-            why.append(f'bom loi: {len(pairs)} cap < {INJ_PAIRS}')
-        for key, d in tab.items():
-            if d['dieu_kien'] and not d['dat']:
-                why.append(f'bom loi {key}: {d["ly_do"]}')
-        if not H['dat']:
-            why.append(f'suc khoe: truot {H["truot"]} / {H["cham_duoc"]}')
+        rec = dict(e_max_m=t['e_max_m'], r_max=t['r_max'], suc_khoe=H, bao_cu_cham=env_old, bao_moi_nhanh=env_new,
+                   bom_loi=dict(cap=pairs, khong_cham_cap=skipped, chi_tiet=inj))
+        why = clip_verdict(rec)
         du = du and not why
         cm_meta = caches[name]['meta']
         out['clips'][name] = dict(
@@ -1490,18 +1589,53 @@ def cmd_khoa(a):
             dung_kieu_cua=_other(name),
             **{k: v for k, v in t.items() if k != 'e_own'},
             nguong_thoi_gian=TH, suc_khoe=H, bao_cu_cham=env_old, bao_moi_nhanh=env_new,
-            bom_loi=dict(cap=pairs, n_ung_vien_nhanh=len(fast_pool), bang=tab, chi_tiet=inj), ho_cum=clus,
-            doc_hai=tp,
+            bom_loi=dict(cap=pairs, khong_cham_cap=skipped, n_ung_vien_nhanh=len(fast_pool), bang=tab, chi_tiet=inj,
+                         camera_khung={str(k): dict(ly_do=v[1], lech_m=v[2]) for k, v in cams.items()}),
+            ho_cum=clus, doc_hai=tp,
             du_doan_nhan=int(take.sum()), du_doan_ly_do=dict(Counter(d.get('ly_do') for d in info
                                                                        if d.get('cong') == 'ung_vien')),
             du_nhay=not why, ly_do=why)
-        print(f'khoa {name}: e_max {t["e_max_m"] * 1e3:.3f} mm, r_max {t["r_max"]:.3f}; bao cu {env_old} moi {env_new}; '
-              f'suc khoe {H["truot"]}/{H["cham_duoc"]}; cap {len(pairs)}; du_nhay {not why} {why}')
+        print(f'khoa {name}: e_max {t["e_max_m"] * 1e3:.3f} mm, r_max {t["r_max"]:.3f}; bao tam cu '
+              f'{env_old and env_old["tam_m"]} moi {env_new and env_new["tam_m"]}; suc khoe {H["truot"]}/'
+              f'{H["cham_duoc"]}; cap {len(pairs)} (khong cham {len(skipped)}); camera khung lech max '
+              f'{max((v[2] for v in cams.values() if v[2] is not None), default=None)}; du_nhay {not why} {why}')
     out['du_nhay'] = du
     out['script'] = script_state()
     write_json_new(a.out, out)
     if not du:
         print('khoa: tieu chi (2) KHONG dat; cong se tu choi')
+
+
+def clip_verdict(K):
+    """The reasons criterion (2) fails for one clip, recomputed from the stored numbers and the injection DETAIL (so
+    cong can recompute them, DNC2-04): e_max, r_max ceilings; envelope new <= old at p50, p90, max for centre and
+    heading; INJ_PAIRS pairs all scored, every hard family with INJ_PAIRS pairs and its counts (design v5 8); health."""
+    why = []
+    if K['e_max_m'] > E_MAX_CEIL_M:
+        why.append(f'e_max {K["e_max_m"] * 1e3:.3f} mm > {E_MAX_CEIL_M * 1e3:.0f} mm')
+    if K['r_max'] > R_MAX_CEIL:
+        why.append(f'r_max {K["r_max"]:.3f} > {R_MAX_CEIL}')
+    eo, en = K['bao_cu_cham'], K['bao_moi_nhanh']
+    if eo is None or en is None:
+        why.append('bao: khong du khung')
+    else:
+        for key in ('tam_m', 'huong_deg'):
+            if any(n > o for n, o in zip(en[key], eo[key])):
+                why.append(f'bao {key}: moi {en[key]} > cu {eo[key]}')
+    B = K['bom_loi']
+    if len(B['cap']) < INJ_PAIRS or B['khong_cham_cap']:
+        why.append(f'bom loi: {len(B["cap"])} cap, khong cham {len(B["khong_cham_cap"])}')
+    for key, d in inj_table(B['chi_tiet']).items():
+        if not d['dieu_kien']:
+            continue
+        if d['n_cap'] < INJ_PAIRS:
+            why.append(f'bom loi {key}: {d["n_cap"]} cap')
+        if not d['dat']:
+            why.append(f'bom loi {key}: {d["ly_do"]}')
+    H = K['suc_khoe']
+    if not (H['cham_duoc'] and H['truot'] <= HEALTH_MAX * H['cham_duoc']):
+        why.append(f'suc khoe: truot {H["truot"]} / {H["cham_duoc"]}')
+    return why
 
 
 def _constants():
@@ -1560,11 +1694,11 @@ def scale_nb_report(C, take, rb, gates):
                 so_lang_gieng_cu=dict(bins), ti_le_chi_lang_gieng_cu=dict(cnt))
 
 
-def same_clip_report(C, A, info, e_own, e_max):
+def same_clip_report(C, A, info, e_own, e_max, vmax_own):
     """DN3-04 (report, DNC1-10): candidates scored by both patterns (the other clip's, used, and this clip's), by v_t
     band: (e) verdict with each pattern and how many differ; candidates outside the range of the other clip's pattern
     counted apart. Only the shape condition (e) is compared, not the whole gate."""
-    out = dict(ngoai_mien=0, theo_dai=[])
+    out = dict(ngoai_mien=0, ngoai_mien_kieu_cung_clip=0, theo_dai=[])
     rows = []
     for k in np.flatnonzero(C['seen']):
         d = info[k]
@@ -1574,6 +1708,9 @@ def same_clip_report(C, A, info, e_own, e_max):
             out['ngoai_mien'] += 1
             continue
         if d.get('e_hinh_m') is None or not np.isfinite(e_own[k]):
+            continue
+        if not A['vt'][k] <= vmax_own:                     # DNC2-05: outside the range of this clip's pattern
+            out['ngoai_mien_kieu_cung_clip'] += 1
             continue
         rows.append((A['vt'][k], d['e_hinh_m'] <= e_max, e_own[k] <= e_max))
     for lo, hi in zip(BANDS_VT[:-1], BANDS_VT[1:]):
@@ -1652,10 +1789,16 @@ def cmd_cong(a):
     if sorted(KH.get('clips', {})) != ['c1', 'c2'] or not all(
             c.get('du_nhay') is True and c.get('ly_do') == [] for c in KH['clips'].values()):
         raise DnError(f'{a.khoa}: du_nhay true but a clip verdict is not met: refused')
+    for nm, c in KH['clips'].items():                      # DNC2-04: recomputed from the stored detail
+        w = clip_verdict(c)
+        if w:
+            raise DnError(f'{a.khoa}: {nm} recomputed from its tables fails: {w}: refused')
     me = script_state()
     ks = KH.get('script') or {}
-    if ks.get('sha256') != me['sha256'] or ks.get('c7_measure_sha256') != me['c7_measure_sha256'] or ks.get('dirty'):
-        raise DnError(f'{a.khoa}: made by another code (sha256 of c8_doc_nhoe / c7_measure) or a dirty tree: refused')
+    if any(ks.get(c) != me[c] for c in ('sha256', 'c7_measure_sha256', 'c7_clip_probe_sha256', 'c8b_3b_sha256')) \
+            or ks.get('dirty'):
+        raise DnError(f'{a.khoa}: made by another code (sha256 of c8_doc_nhoe, c7_measure, c7_clip_probe, c8b_3b) or '
+                      f'a dirty tree: refused')
     cu = read_cu(a.cu)
     if KH['cu_sha256'] != cu['sha256']:
         raise DnError('khoa.json was made with another old 3b result')
@@ -1734,7 +1877,7 @@ def cmd_cong(a):
                                  cu_truot_i_idx=np.flatnonzero(old_t & ~tqua).tolist()[:200],
                                  bien_the_n_valid=int(vnew_i.sum())),
                   lang_gieng_2b=scale_nb_report(C, take, rb, gates), cum_dai=long_runs(C, take),
-                  kieu_cung_clip=same_clip_report(C, A, info, e_own, K['e_max_m']),
+                  kieu_cung_clip=same_clip_report(C, A, info, e_own, K['e_max_m'], K['mien_vt']),
                   doc_hai=dict(n=len(doc2), ok=sum(1 for r in doc2.values() if r.get('ok'))))
         write_json_new(os.path.join(d, 'doc_nhoe.json'), dict(js, script=script_state()))
         summary['clips'][name] = js
@@ -2139,6 +2282,9 @@ def main(argv=None):
         p.add_argument('--session', required=True)
         p.add_argument('--cu', required=True, help='old c8b_3b json (B centre, R0)')
         p.add_argument('--out', required=True)
+        if nm == 'khoa':
+            p.add_argument('--v1', required=True, help='video of clip 1 (frame cameras of the injected frames)')
+            p.add_argument('--v2', required=True, help='video of clip 2')
         if nm == 'cong':
             p.add_argument('--khoa', required=True)
             p.add_argument('--ghep', required=True, help='C1/ghep_3b.py')

@@ -591,3 +591,54 @@ def test_inj_table_paired_only_new_wrong():
     assert d['cu']['nhan_sai'] == 2 and d['moi']['nhan_sai'] == 2
     assert d['theo_cap']['chi_moi_nhan_sai'] == 1 and d['theo_cap']['chi_cu_nhan_sai'] == 0
     assert not d['dat'] and d['ly_do'] == ['chi_moi_nhan_sai']
+
+
+# ── round 2 fixes ────────────────────────────────────────────────────────────────────────────────
+
+def test_gate_verdict_equals_combine():
+    """DNC2-01: the verdict of one frame from the slice run equals cong's combine on the whole clip."""
+    rows = _rows(n=200, res=1.0e-3)
+    take = np.zeros(200, bool)
+    for k in range(80, 120):
+        rows[k]['res_sim_m'] = 2.5e-3
+        take[k] = k % 3 != 0
+    for k in (100, 101):
+        rows[k]['scale'] = 0.99
+    tr = _track(rows)
+    out, ra, rb, _ = dn.combine(tr, take, 1.0, dict(cm.DEFAULT_GATES))
+    C = dict(t=np.array([r['t_s'] for r in tr]), rows=tr)
+    for k in range(200):
+        ok, why = dn.gate_verdict(C, k, tr[k], bool(take[k]), take, 1.0, dict(cm.DEFAULT_GATES))
+        assert ok == out[k]['valid'] and why == out[k]['why'], k
+
+
+def test_temporal_local_equals_two_passes():
+    """DNC2-02: (i) of one frame from the local two passes equals temporal_check on the whole chain."""
+    C, R = _circle_clip()
+    C['x'] = C['x'].copy()
+    C['x'][148] += 3e-3                                     # a bad neighbour of 150 (dropped in pass 1)
+    C['x'][150] += 0.25e-3                                  # the frame itself, slightly off
+    TH = dict(a_m=0.2e-3, b_s=0.5e-3, T_phap_m=0.3e-3, T_huong_rad=math.radians(0.3))
+    old = np.ones(len(C['t']), bool)
+    res, qua, ok, _, _ = dn.temporal_check(C, old, np.zeros(len(C['t']), bool), (0.0, 0.0), R, TH)
+    for k in (140, 147, 149, 150, 151, 160):
+        q = dn.temporal_local(C, C['x'], C['y'], C['psi'], old, k, (0.0, 0.0), R, TH)
+        assert q == (bool(qua[k]) if ok[k] else None), k
+
+
+def test_clip_verdict_from_tables():
+    """DNC2-04: the clip verdict is recomputed from the stored detail."""
+    env = dict(tam_m=[1.0, 1.1, 1.2], huong_deg=[0.4, 0.5, 0.6])
+    env_old = dict(tam_m=[1.3, 1.4, 1.5], huong_deg=[0.7, 0.8, 0.9])
+    acc = dict(tang='nhan', loi_tam_m=0.1e-3, loi_huong_deg=0.01)
+    det = [dict(ho=f, do_lon=m, cham=i, nhanh=100 + i, cu=acc, moi=acc) for f, m in dn.FAMILIES
+           for i in range(dn.INJ_PAIRS)]
+    K = dict(e_max_m=1.3e-3, r_max=0.35, bao_cu_cham=env_old, bao_moi_nhanh=env,
+             bom_loi=dict(cap=[[i, 100 + i] for i in range(dn.INJ_PAIRS)], khong_cham_cap=[], chi_tiet=det),
+             suc_khoe=dict(cham_duoc=5000, truot=2))
+    assert dn.clip_verdict(K) == []
+    bad = dict(tang='nhan', loi_tam_m=0.8e-3, loi_huong_deg=0.01)
+    K2 = dict(K, bom_loi=dict(K['bom_loi'], chi_tiet=det[:1] + [dict(det[1], moi=bad)] + det[2:]))
+    assert any('P_2.0' in w for w in dn.clip_verdict(K2))
+    K3 = dict(K, bao_moi_nhanh=dict(env, tam_m=[1.0, 1.1, 1.6]))
+    assert any('bao tam_m' in w for w in dn.clip_verdict(K3))
