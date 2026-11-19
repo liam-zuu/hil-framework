@@ -53,8 +53,11 @@ SPREAD_VIDEO_DEG = 0.25         # floor decision on the raw sparse video (design
 RATIO_LO, RATIO_HI, RATIO_SPREAD = 0.98, 1.02, 0.005
 PERP_MAX_M = 0.005
 EPS_YAW_MAX_DEG = 0.30
-EPS_SMOOTH_S = 1.0             # smoothing of the camera heading in the dynamic yaw check
-MIN_FRAMES_TINH, MIN_FRAMES_VIDEO = 120, 30
+EPS_SMOOTH_S = 0.5             # smoothing of camera heading and IMU yaw in the dynamic yaw check (v4 3.2 step 6)
+MIN_FRAMES_TINH, MIN_FRAMES_VIDEO = 120, 60
+VIDEO_STRIDE = 2               # floor read of the whole clip (decode dominates: 1/10 0.9x, 1/2 1.33x real time, 19/11)
+E_COVER_TURNS, E_GAP_MAX_S = 1.5, 2.0   # E coverage per turn direction (v4 2.7)
+RV_REPEAT_W = 0.1              # rad/s: while the wheels turn faster than this an RV report must change the yaw
 WIN_MIN_S, STILL_MIN_S = 2.5, 3.0
 U_D_MAX_S = 0.10
 TRAJ_AGE_MAX_MS = 60.0           # while the sender sends (50 Hz); not over the firmware timeout wait (HCC1-4)
@@ -474,7 +477,13 @@ def kiem(A, age_r_max_ms=125.0):
             a1, a2 = np.convolve(w_imu, k, 'valid'), np.convolve(w_enc, k, 'valid')
             corr = float(np.corrcoef(a1, a2)[0, 1]) if np.std(a1) > 0 and np.std(a2) > 0 else 0.0
             sign_ok = np.sign(yaw[b['j1']] - yaw[b['j0']]) == np.sign(b['tp_wz'])
-            add('imu_e_tuong_quan', corr >= E_CORR_MIN and sign_ok, f'corr {corr:.3f}')
+            # HCC1-9: a repeated RV value while the wheels turn (a 0.15 s repeat kept corr ~0.95)
+            rate = np.convolve(np.abs(dth[sl]) / np.maximum(np.r_[np.diff(t), 0.01], 1e-3), k, 'same')
+            ch = np.flatnonzero(np.diff(L['rv_n'][sl]) != 0) + 1
+            ysl = L['yaw_rad'][sl]
+            same = [j for j0_, j in zip(ch[:-1], ch[1:]) if rate[j] > RV_REPEAT_W and abs(ysl[j] - ysl[j0_]) < 1e-6]
+            add('imu_e_tuong_quan', corr >= E_CORR_MIN and sign_ok and not same,
+                f'corr {corr:.3f}, RV lap luc quay {len(same)}')
         wins = still_windows(L, blocks, i0, j_s)
         add('cua_so_dung_du', all(w.get('still_s', 0) >= STILL_MIN_S and not w.get('ho') for w in wins),
             ', '.join(f"{w.get('still_s', 0):.2f}" for w in wins))
@@ -530,72 +539,178 @@ def frames_chain(frames_csv, a6, xoay, lan_lap=None):
     return F
 
 
-def cam_motion_events(F, kind, thr_v=0.02, thr_w=math.radians(5.0), half=0.25):
-    """(start, end) camera times of motion intervals: kind 'vx' from the tag centre speed, 'wz' from the heading rate."""
+def _rate(t, x, y, p, half):
+    """Centred time-difference speeds over +-half (s): translation (m/s) and heading rate (rad/s) per sample."""
+    a = np.searchsorted(t, t - half)
+    b = np.minimum(np.searchsorted(t, t + half, side='right') - 1, len(t) - 1)
+    dt = t[b] - t[a]
+    ok = (b > a) & (dt > 0)
+    dt = np.where(ok, dt, 1.0)
+    v = np.where(ok, np.hypot(x[b] - x[a], y[b] - y[a]) / dt, 0.0)
+    w = np.where(ok, np.abs(p[b] - p[a]) / dt, 0.0)
+    return v, w
+
+
+def _intervals(t, s, thr, min_s=0.5, max_hole_s=0.2):
+    """[(start, end)] where s > thr, edges by linear interpolation of the crossing between samples; holes shorter
+    than max_hole_s are bridged, intervals shorter than min_s dropped."""
+    mv = s > thr
+    out, i, n = [], 0, len(t)
+    while i < n:
+        if not mv[i]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and mv[j + 1]:
+            j += 1
+
+        def cross(k0, k1):
+            if k0 < 0 or k1 >= n or s[k1] == s[k0]:
+                return float(t[max(min(k1, n - 1), 0)])
+            f = (thr - s[k0]) / (s[k1] - s[k0])
+            return float(t[k0] + f * (t[k1] - t[k0]))
+        st, en = cross(i - 1, i), cross(j, j + 1) if j + 1 < n else float(t[j])
+        if out and st - out[-1][1] < max_hole_s:
+            out[-1] = (out[-1][0], en)
+        else:
+            out.append((st, en))
+        i = j + 1
+    return [(a, b) for a, b in out if b - a > min_s]
+
+
+def cam_motion_events(F, thr_v=0.02, thr_w=math.radians(5.0), half=0.25, rot_guard_s=0.5):
+    """[(start, end, kind)] camera motion intervals in time order (HCC1-8): 'wz' where the tag heading turns,
+    'vx' where the tag centre moves while the heading does NOT turn (within rot_guard_s of a turn): the centre of a
+    tag off the turning axis moves during E and must not count as a translation."""
     m = F['ok']
     t, x, y, p = F['t'][m], F['x'][m], F['y'][m], np.unwrap(F['psi'][m])
     if len(t) < 10:
         return []
-    sp = np.full(len(t), 0.0)
-    for i in range(len(t)):
-        a = np.searchsorted(t, t[i] - half)
-        b = min(np.searchsorted(t, t[i] + half), len(t) - 1)
-        if b > a and t[b] > t[a]:
-            sp[i] = (math.hypot(x[b] - x[a], y[b] - y[a]) / (t[b] - t[a]) if kind == 'vx'
-                     else abs(p[b] - p[a]) / (t[b] - t[a]))
-    mv = sp > (thr_v if kind == 'vx' else thr_w)
-    ev, i = [], 0
-    while i < len(t):
-        if mv[i]:
-            j = i
-            while j + 1 < len(t) and mv[j + 1]:
-                j += 1
-            if t[j] - t[i] > 0.5:
-                ev.append((float(t[i]), float(t[j])))
-            i = j + 1
-        else:
-            i += 1
-    return ev
+    v, w = _rate(t, x, y, p, half)
+    rot = w > thr_w
+    near_rot = np.zeros(len(t), bool)
+    for a, b in _intervals(t, w, thr_w, min_s=0.0, max_hole_s=0.0):
+        near_rot |= (t >= a - rot_guard_s) & (t <= b + rot_guard_s)
+    ev = [(a, b, 'wz') for a, b in _intervals(t, np.where(rot, w, 0.0), thr_w)]
+    ev += [(a, b, 'vx') for a, b in _intervals(t, np.where(near_rot, 0.0, v), thr_v)]
+    return sorted(ev)
 
 
 def log_motion_events(L, blocks, thr_v=0.02, thr_w=math.radians(5.0), half=0.25):
-    """(start, end) log times of motion of each block, with the SAME speed thresholds and window as the camera
-    (cam_motion_events): translation speed from the encoder odometry, turn rate from the wheel increments. A slow
-    creep after the stop (ADRC) stays under the threshold on both sides."""
+    """(start, end) log times of motion of each block, with the SAME speed thresholds, window and interpolated
+    edges as the camera: translation speed from the encoder odometry, turn rate from the wheel increments."""
     dx, dy, dth = body_increments(L)
     t = L['t']
     X, Y, TH = np.cumsum(dx), np.cumsum(dy), np.cumsum(dth)
+    v, w = _rate(t, X, Y, TH, half)
     out = []
     for k, b in enumerate(blocks):
-        j0 = b['j0']
+        j0 = blocks[k - 1]['j1'] + 1 if k else 0
         j1 = blocks[k + 1]['j0'] if k + 1 < len(blocks) else L['n']
-        idx = np.arange(j0, j1)
-        a = np.searchsorted(t, t[idx] - half)
-        c = np.minimum(np.searchsorted(t, t[idx] + half), L['n'] - 1)
-        dt = np.maximum(t[c] - t[a], 1e-6)
-        sp = (np.hypot(X[c] - X[a], Y[c] - Y[a]) / dt) if b['truc'] == 'vx' else (np.abs(TH[c] - TH[a]) / dt)
-        mv = np.flatnonzero(sp > (thr_v if b['truc'] == 'vx' else thr_w))
-        out.append(None if not len(mv) else (float(t[idx[mv[0]]]), float(t[idx[mv[-1]]])))
+        sl = slice(j0, j1)
+        s = v[sl] if b['truc'] == 'vx' else w[sl]
+        iv = _intervals(t[sl], s, thr_v if b['truc'] == 'vx' else thr_w)
+        inside = [e for e in iv if e[1] >= L['t'][b['j0']] - 0.5 and e[0] <= L['t'][b['j1']] + 2.0]
+        out.append(None if not inside else (inside[0][0], inside[-1][1]))
     return out
 
 
 def align(L, blocks, F):
-    """D = t_log - t_cam from the motion edges of translation and turning; returns (D, u_D, pairs)."""
+    """D = t_log - t_cam from the motion edges (HCC1-8): the camera intervals are matched to the log blocks IN
+    ORDER and BY KIND (translation of 12b, turns of E); extra camera intervals before or after (the car placed by
+    hand) are skipped by choosing the consecutive run of camera intervals with the same kinds and the smallest
+    spread. Returns (D, u_D, diffs)."""
     lev = log_motion_events(L, blocks)
-    diffs = []
-    for kind in ('vx', 'wz'):
-        cev = cam_motion_events(F, kind)
-        lk = [e for e, b in zip(lev, blocks) if b['truc'] == kind and e is not None]
-        if not lk:
+    if any(e is None for e in lev):
+        raise AError('a schedule block without motion in the encoder log')
+    lk = [(s, e, b['truc']) for (s, e), b in zip(lev, blocks)]
+    cev = cam_motion_events(F)
+    kinds = [k for _, _, k in lk]
+    best = None
+    for o in range(len(cev) - len(lk) + 1):
+        cand = cev[o:o + len(lk)]
+        if [k for _, _, k in cand] != kinds:
             continue
-        if len(cev) != len(lk):
-            raise AError(f'{kind}: {len(cev)} camera motion intervals vs {len(lk)} in the log')
-        for (cs, ce), (ls, le) in zip(cev, lk):
+        diffs = []
+        for (cs, ce, _), (ls, le, _) in zip(cand, lk):
             diffs += [ls - cs, le - ce]
-    if not diffs:
-        raise AError('no motion edge to align camera and log')
-    D = float(np.median(diffs))
-    return D, float(np.max(np.abs(np.array(diffs) - D))), diffs
+        D = float(np.median(diffs))
+        u = float(np.max(np.abs(np.array(diffs) - D)))
+        if best is None or u < best[1]:
+            best = (D, u, diffs)
+    if best is None:
+        raise AError(f"camera intervals {[k for _, _, k in cev]} do not contain the log sequence {kinds}")
+    return best
+
+
+def rv_samples(L):
+    """(t, yaw) of the rotation-vector reports: rows where rv_n changes, timed at row time - age_r_ms (HCC1-9)."""
+    rv = L['rv_n']
+    j = np.r_[0, np.flatnonzero(np.diff(rv) != 0) + 1]
+    t = L['t'][j] - L['age_r_ms'][j] * 1e-3
+    yaw = np.unwrap(L['yaw_rad'][j])
+    keep = np.r_[True, np.diff(t) > 0]
+    return t[keep], yaw[keep]
+
+
+def leg_eps(F, L, ja, jb, D, psi_a, yaw_a, smooth_s=None, rv=None):
+    """Largest |camera heading change - IMU yaw change| over the leg (HCC1-9): both relative to window a (window
+    means psi_a, yaw_a), both averaged over the same +-smooth_s/2 time window on the camera frame times, the IMU
+    interpolated in the RV report times (not the log row times). NaN (no evidence) when an RV gap > RV_STALL_S, a
+    camera gap > smooth_s, or fewer than 80 % of the leg time is covered."""
+    smooth_s = EPS_SMOOTH_S if smooth_s is None else smooth_s
+    t_rv, y_rv = rv if rv is not None else rv_samples(L)
+    ta, tb = float(L['t'][ja]), float(L['t'][jb])
+    mk = F['ok'] & (F['t'] + D >= ta) & (F['t'] + D <= tb)
+    if mk.sum() < 10:
+        return float('nan')
+    tc = F['t'][mk] + D
+    if np.max(np.diff(np.r_[ta, tc, tb])) > smooth_s:
+        return float('nan')
+    r0, r1 = np.searchsorted(t_rv, ta), np.searchsorted(t_rv, tb)
+    seg = t_rv[max(r0 - 1, 0):min(r1 + 1, len(t_rv))]
+    if len(seg) < 2 or np.max(np.diff(seg)) > RV_STALL_S:
+        return float('nan')
+    pc = psi_a + np.vectorize(wrap)(np.unwrap(F['psi'][mk]) - psi_a)
+    yi = np.interp(tc, t_rv, y_rv)
+    h = smooth_s / 2
+    a = np.searchsorted(tc, tc - h)
+    b = np.searchsorted(tc, tc + h, side='right')
+    cs_p, cs_y = np.r_[0.0, np.cumsum(pc)], np.r_[0.0, np.cumsum(yi)]
+    n = b - a
+    full = (tc - h >= ta) & (tc + h <= tb) & (n >= 3)
+    if full.sum() < 3 or (tc[full][-1] - tc[full][0]) < 0.8 * (tb - ta - smooth_s):
+        return float('nan')
+    ps = (cs_p[b] - cs_p[a]) / np.maximum(n, 1)
+    ys = (cs_y[b] - cs_y[a]) / np.maximum(n, 1)
+    dev = (ps - psi_a) - (ys - yaw_a)
+    return float(np.max(np.abs(np.vectorize(wrap)(dev[full]))))
+
+
+def e_coverage(F, L, blocks, D):
+    """Per turn block of E (HCC1-7): useful turns seen by the camera (sum of |heading change| between consecutive
+    tag samples no further apart than E_GAP_MAX_S) and the largest gap without the tag, over the turning interval
+    of the log mapped to the camera."""
+    lev = log_motion_events(L, blocks)
+    out = []
+    for b, e in zip(blocks, lev):
+        if b['truc'] != 'wz':
+            continue
+        if e is None:
+            out.append(dict(vong=0.0, ho_s=float('inf')))
+            continue
+        a, c = e[0] - D, e[1] - D
+        m = F['ok'] & (F['t'] >= a) & (F['t'] <= c)
+        ts = F['t'][m]
+        if len(ts) < 2:
+            out.append(dict(vong=0.0, ho_s=c - a))
+            continue
+        gaps = np.diff(np.r_[a, ts, c])
+        p = np.unwrap(F['psi'][m])
+        dp = np.abs(np.diff(p))
+        good = np.diff(ts) <= E_GAP_MAX_S
+        out.append(dict(vong=float(np.sum(dp[good]) / (2 * math.pi)), ho_s=float(np.max(gaps))))
+    return out
 
 
 def cam_window(F, w, D, u_D, fps=60.0):
@@ -638,6 +753,7 @@ def analyse(A, F, k_info, min_frames=MIN_FRAMES_TINH):
             rec['psi_nua'] = abs(wrap(mean_unwrapped(F['psi'][idx[:h]]) - mean_unwrapped(F['psi'][idx[h:]])))
         W.append(rec)
     dx, dy, _ = body_increments(L)
+    rvs = rv_samples(L)
     legs = []
     for (ia, ib), dai in ([] if n12 == 0 else [(lg, True) for lg in LONG_LEGS] + [(lg, False) for lg in SHORT_LEGS]):
         wa, wb = W[ia], W[ib]
@@ -647,26 +763,15 @@ def analyse(A, F, k_info, min_frames=MIN_FRAMES_TINH):
             legs.append(leg)
             continue
         ja, jb = wa['jc'], wb['jc']
-        ref = yaw[ja]
-        mid = 0.5 * (yaw[ja + 1:jb + 1] + yaw[ja:jb]) - ref
+        mid = 0.5 * (yaw[ja + 1:jb + 1] + yaw[ja:jb]) - wa['yaw']           # HCC1-12: window mean, as v4 3.2 step 3
         c, s = np.cos(mid), np.sin(mid)
         ds = np.array([np.sum(c * dx[ja + 1:jb + 1] - s * dy[ja + 1:jb + 1]),
                        np.sum(s * dx[ja + 1:jb + 1] + c * dy[ja + 1:jb + 1])])
         dp = wb['p'] - wa['p']
         th_a = wrap(math.atan2(dp[1], dp[0]) - math.atan2(ds[1], ds[0]))
         a_l = wrap(wa['psi'] - th_a)
-        # dynamic yaw check over the leg: camera heading (smoothed) vs IMU, both relative to window a
-        mk = F['ok'] & (F['t'] + D >= L['t'][ja]) & (F['t'] + D <= L['t'][jb])
-        eps = float('nan')
-        if mk.sum() >= 10:
-            tc = F['t'][mk] + D
-            pc = np.unwrap(F['psi'][mk])
-            ker = max(1, int(round(EPS_SMOOTH_S * F.get('fps', 60.0))))
-            pcs = np.convolve(pc, np.ones(ker) / ker, 'same')
-            yi = np.convolve(np.interp(tc, L['t'], yaw), np.ones(ker) / ker, 'same')   # same smoothing, same grid
-            dev = (pcs - wa['psi']) - (yi - yaw[ja])
-            core = slice(ker // 2, len(dev) - ker // 2) if len(dev) > ker else slice(0, len(dev))
-            eps = float(np.max(np.abs(np.vectorize(wrap)(dev[core])))) if len(dev[core]) else float('nan')
+        # dynamic yaw check over the leg (HCC1-9): 0.5 s, RV report times, gaps -> NaN (no evidence)
+        eps = leg_eps(F, L, ja, jb, D, wa['psi'], wa['yaw'], rv=rvs)
         path = float(np.sum(np.hypot(dx[ja + 1:jb + 1], dy[ja + 1:jb + 1])))
         dth = float(np.sum(np.abs(np.diff(yaw[ja:jb + 1]))))
         leg.update(trang_thai='hop_le', dp=dp, ds=ds, L_m=float(np.hypot(*dp)), Ls_m=float(np.hypot(*ds)),
@@ -711,9 +816,8 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
     else:
         u_q = max((abs(2 * math.sin(wrap(lg['R_b'] - lg['R_a']) / 2)) * du_m) / lg['L_m'] for lg in longs)
     eps = [lg['eps'] for lg in longs]
-    if any(not math.isfinite(x) for x in eps):
-        res['ly_do'].append('thieu kiem yaw dong')
-        eps = [x if math.isfinite(x) else 0.0 for x in eps]
+    eps_thieu = any(not math.isfinite(x) for x in eps)            # HCC1-9: no evidence -> gate fails, not 0
+    eps = [x if math.isfinite(x) else 0.0 for x in eps]
     u_yaw = max(math.asin(min(2 * math.sin(e_ / 2) * lg['path'] / lg['Ls_m'], 1.0)) for e_, lg in zip(eps, longs))
     if psi_cuc is None:
         res['ly_do'].append('thieu can huong camera hai dau (C8B)')
@@ -726,7 +830,7 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
         ti_le=all(RATIO_LO <= lg['ti_le'] <= RATIO_HI for lg in longs)
         and (max(lg['ti_le'] for lg in longs) - min(lg['ti_le'] for lg in longs)) <= RATIO_SPREAD,
         thang_hang=perp_offsets(cap['windows'][:7]) <= PERP_MAX_M,      # the 7 stops of 12b only
-        yaw_dong=all(x <= math.radians(EPS_YAW_MAX_DEG) for x in eps),
+        yaw_dong=not eps_thieu and all(x <= math.radians(EPS_YAW_MAX_DEG) for x in eps),
     )
     shorts = [lg for lg in cap['legs'] if not lg['dai'] and lg['trang_thai'] == 'hop_le']
     giu_ngoai = []
@@ -899,22 +1003,56 @@ def cmd_tinh(a):
     return 0 if r['trang_thai'] in ('khoa', 'chan_doan') and all(r['cong'].values()) else 1
 
 
+def video_checks(A, F, info):
+    """Floor decision on the whole-clip read (design 2.7; HCC1-7): phases from the attempt manifest (lich.csv of
+    '#seq_start'), alignment, >= MIN_FRAMES_VIDEO samples in every window that is used, 12b: four long legs,
+    raw spread <= SPREAD_VIDEO_DEG, dynamic yaw with evidence; E: each turn direction >= E_COVER_TURNS useful
+    turns and no tag gap > E_GAP_MAX_S. Returns (checks, analysis or None)."""
+    ck = []
+
+    def add(name, ok, detail=''):
+        ck.append((name, bool(ok), str(detail)))
+    moves = plan_moves(A['segs'])
+    has12 = any(m['loai'] == 'tien' for m in moves)
+    hasE = any(m['loai'] == 'xoay' for m in moves)
+    try:
+        an = analyse(A, F, info, min_frames=MIN_FRAMES_VIDEO)
+    except AError as exc:
+        add('giong_camera_log', False, exc)
+        return ck, None
+    add('giong_camera_log', an['u_D'] <= U_D_MAX_S, f"D {an['D']:.3f} s, u_D {an['u_D']:.3f} s")
+    need = [k for k, _ in window_roles(A['segs'])]
+    few = [(k, an['windows'][k]['n']) for k in need if an['windows'][k]['n'] < MIN_FRAMES_VIDEO]
+    add('mau_moi_cua_so', not few, f'>= {MIN_FRAMES_VIDEO}; thieu {few}' if few else
+        f"min {min(an['windows'][k]['n'] for k in need)}")
+    if has12:
+        longs = [lg for lg in an['legs'] if lg['dai'] and lg['trang_thai'] == 'hop_le']
+        ok4 = len(longs) == 4
+        spread = max(abs(wrap(x['a_l'] - y['a_l'])) for x in longs for y in longs) if ok4 else float('nan')
+        add('bon_doan_dai', ok4, f'{len(longs)}/4')
+        add('do_tan_tho', ok4 and spread <= math.radians(SPREAD_VIDEO_DEG), f'{math.degrees(spread):.3f} deg')
+        eps = [lg['eps'] for lg in longs]
+        add('yaw_dong', ok4 and all(math.isfinite(x) and x <= math.radians(EPS_YAW_MAX_DEG) for x in eps),
+            ', '.join('thieu' if not math.isfinite(x) else f'{math.degrees(x):.3f}' for x in eps))
+    if hasE:
+        cov = e_coverage(F, A['log'], info['blocks'], an['D'])
+        add('phu_E', len(cov) == 2 and all(c['vong'] >= E_COVER_TURNS and c['ho_s'] <= E_GAP_MAX_S for c in cov),
+            '; '.join(f"{c['vong']:.2f} vong, ho {c['ho_s']:.2f} s" for c in cov))
+    return ck, an
+
+
 def cmd_kiem_video(a):
-    import c8_hc_video as hv                       # sparse video reader (separate module, cv2)
+    import c8_hc_video as hv                       # whole-clip reader (separate module, cv2)
     A = load_attempt(a.dir)
     ck, info = kiem(A)
     if 'windows' not in info:
         report(ck)
         raise AError('kiem: no windows')
     F = hv.sparse_frames(a.clip, a.session, stride=a.stride)
-    an = analyse(A, F, info, min_frames=MIN_FRAMES_VIDEO)
-    longs = [lg for lg in an['legs'] if lg['dai'] and lg['trang_thai'] == 'hop_le']
-    ok = len(longs) == 4
-    spread = max(abs(wrap(x['a_l'] - y['a_l'])) for x in longs for y in longs) if ok else float('nan')
-    eps_ok = ok and all(math.isfinite(lg['eps']) and lg['eps'] <= math.radians(EPS_YAW_MAX_DEG) for lg in longs)
-    print(f"D={an['D']:.3f} s; {len(longs)}/4 doan dai; do tan tho {math.degrees(spread):.3f} deg; yaw dong {'dat' if eps_ok else 'HONG'}")
-    good = ok and spread <= math.radians(SPREAD_VIDEO_DEG) and eps_ok
-    print('LAM_LAI' if not good else 'DAT')
+    vk, an = video_checks(A, F, info)
+    report(vk)
+    good = all(ok for _, ok, _ in vk)
+    print('DAT' if good else 'LAM_LAI')
     return 0 if good else 1
 
 
@@ -928,7 +1066,7 @@ def main(argv=None):
     v.add_argument('dir')
     v.add_argument('--clip', required=True)
     v.add_argument('--session', required=True)
-    v.add_argument('--stride', type=int, default=3)
+    v.add_argument('--stride', type=int, default=VIDEO_STRIDE)
     c = sub.add_parser('cua_so')
     c.add_argument('dir')
     c.add_argument('--frames', required=True)

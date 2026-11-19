@@ -343,3 +343,77 @@ def test_us_end_cut_ticks_read_and_covering(tmp_path):
     assert checks(d)[2]['cat_pwm'] == 'chua_xac_minh'
     write_events(d, [start, end.format(c=0).replace('blk_ticks=0', 'blk_ticks=3')])
     assert not checks(d)[0]['khong_cat_sieu_am']
+
+
+# ------------------------------------------------------------------ Codex code review round 1 (HCC1-7..9)
+def frames(d):
+    return ca.frames_basic(os.path.join(d, 'frames.csv'), os.path.join(d, 'track.json'))
+
+
+def drop(F, t_from, t_to, D, t_s=6.0):
+    """Mark camera frames invalid between sender times t_from..t_to (camera time = sender + t_s - D)."""
+    G = dict(F)
+    G['ok'] = F['ok'] & ~((F['t'] + D - t_s >= t_from) & (F['t'] + D - t_s <= t_to))
+    return G
+
+
+def video(d, F):
+    A = ca.load_attempt(d)
+    ck, info = ca.kiem(A)
+    vk, an = ca.video_checks(A, F, info)
+    return {n: ok for n, ok, _ in vk}, vk
+
+
+def test_video_E_only_with_all_frames_passes(tmp_path):
+    """HCC1-7 (Codex): an E-only attempt with every frame returned LAM_LAI (0/4 long legs)."""
+    d, _ = make(tmp_path, 'HC_K1_E', cho='K1', phan='E')
+    ok, vk = video(d, frames(d))
+    assert all(ok.values()), vk
+
+
+def test_video_E_gap_of_3_s_fails(tmp_path):
+    """HCC1-7 (Codex): 3 s without the tag inside the first turn direction passed DAT."""
+    d, truth = make(tmp_path, 'HC_K1_1', cho='K1')
+    ok, vk = video(d, drop(frames(d), 65.0, 68.0, truth['D']))
+    assert not ok['phu_E'] and ok['giong_camera_log'], vk
+
+
+def test_tag_off_turn_axis_does_not_make_translations(tmp_path):
+    """HCC1-8 (Codex): tag centre 50 mm off the turning axis: E made 8 camera translation blocks vs 6 in the log."""
+    d, _ = make(tmp_path, 'HC_goc_1', cho='goc', q=(0.05, 0.0))
+    A = ca.load_attempt(d)
+    ck, info = ca.kiem(A)
+    D, u_D, _ = ca.align(A['log'], info['blocks'], frames(d))
+    kinds = [k for _, _, k in ca.cam_motion_events(frames(d))]
+    assert kinds == ['vx'] * 6 + ['wz'] * 2 and u_D <= ca.U_D_MAX_S
+
+
+def test_short_heading_pulse_fails_dynamic_yaw(tmp_path):
+    """HCC1-9 (Codex): a 0.40 deg camera-IMU difference for 0.6 s in a long leg gave 0.24 deg with a 1 s window."""
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2', noise_psi_deg=0.02,
+                cam_bias=lambda t: math.radians(0.40) if 12.0 <= t <= 12.6 else 0.0)
+    an = analyse(d)
+    leg = [lg for lg in an['legs'] if lg['dai']][0]
+    assert math.degrees(leg['eps']) >= 0.35
+    r = result(d, 'K2')
+    assert not r['cong']['yaw_dong'] and r['trang_thai'] == 'chua_ket_luan'
+
+
+def test_camera_gap_in_leg_is_no_evidence(tmp_path):
+    """HCC1-9: a 1 s camera gap inside a long leg: eps cannot be computed -> the gate fails (not counted as 0)."""
+    d, truth = make(tmp_path, 'HC_K2_1', cho='K2', noise_psi_deg=0.02)
+    A = ca.load_attempt(d)
+    ck, info = ca.kiem(A)
+    an = ca.analyse(A, drop(frames(d), 12.0, 13.0, truth['D']), info)
+    leg = [lg for lg in an['legs'] if lg['dai']][0]
+    assert not math.isfinite(leg['eps'])
+    r = ca.place_result('K2', [('x', an)], 'x', e_hieu=[0.0], q=[0, 0], du_m=0.0, neo=0.0, psi_cuc=0.0)
+    assert not r['cong']['yaw_dong']
+
+
+def test_rv_repeat_015s_during_turn_fails(tmp_path):
+    """HCC1-9 (Codex): RV repeating 0.15 s while turning still gave corr 0.945."""
+    d, _ = make(tmp_path, cho='K1', rv_freeze=(62.0, 62.15))
+    ok, ck, _ = checks(d)
+    e = [c for c in ck if c[0] == 'imu_e_tuong_quan']
+    assert not e[0][1], e
