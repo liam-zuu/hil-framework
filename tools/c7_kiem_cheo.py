@@ -74,7 +74,16 @@ DOAN_SCHEMA = 'c8_hc_doan_12b_v1'            # F5 (CODE_HIEUCHUAN), confirmed 19
 CHO = ('goc', 'K1', 'K2')                    # place names of every file (CODE 19/11)
 # S7 constants (design v6 S8-4; [DE XUAT], locked by commit + SHA before phan_tich runs on the real clips H, S7-16)
 R_XP_M = 0.6                                 # marks of a start region: within R_XP of the start point
-R_TRONG_M = 0.35                             # every sample of the start domain within R_TRONG of a region mark
+R_TRONG_M = 0.55                             # every sample of the start domain within R_TRONG of a region mark
+#   0.35 -> 0.55: Liam 20/11/2026 at CODE_KIEMCHEO (local_599d3188), choice box, verbatim: "Nang len 0,55 m
+#   (Recommended)" -- on the locked 32-mark floor (grid ~0.7 m) the largest distance to the nearest mark is 0.47-0.51 m
+#   at goc / K1 / K2 (start discs and 12b corridors), so 0.35 always flagged khoang_trong (HCV3-2, CODE 20/11)
+# 12b corridor of every place (HCV3-2, CODE 20/11): the car moves along its axis between these stops [m] from the start
+# point, nose at this floor heading [deg]; source rpi5/c8_hc_seq.py PLACES and its docstring (hil 8c2aa2e)
+DUONG_12B = {'goc': (45.0, -0.50, 0.50), 'K1': (90.0, -0.25, 0.25), 'K2': (0.0, -0.35, 0.15)}
+R_XP_DUONG_M = 0.8                           # [DE XUAT] marks of a 12b corridor: within this of the 12b segment (the
+                                             #   smallest 0.05 step with every corridor inside its region hull on the
+                                             #   32-mark floor; 0.6 / 0.7 leave goc or K1 outside)
 MIEN_XP_M = 0.10                             # start domain before the session: disc about the nominal point (by eye)
 MIEN_XP_BUOC_M = 0.005                       #   grid step of the coverage test (KCJ1-11: 1-Lipschitz margin added)
 ID_KHOA = tuple(range(1, 33))                # KS7-7, KCJ1-10: the floor marks of the official path (0 = car tag)
@@ -805,6 +814,109 @@ def start_regions(marks, xp, r_xp=R_XP_M):
     return out
 
 
+def seg_dist(p, a, b):
+    """Distance from the point p to the segment a-b (a == b: to the point)."""
+    p, a, b = (np.asarray(v, float) for v in (p, a, b))
+    ab = b - a
+    L2 = float(ab @ ab)
+    t = 0.0 if L2 == 0.0 else min(1.0, max(0.0, float((p - a) @ ab) / L2))
+    return float(np.linalg.norm(p - (a + t * ab)))
+
+
+def duong_12b(xp, spec):
+    """(a, b) floor ends of the 12b segment of a place: start point xp, spec = (nose heading deg, lo, hi) of
+    DUONG_12B."""
+    ang, lo, hi = spec
+    u = np.array([math.cos(math.radians(ang)), math.sin(math.radians(ang))])
+    c = np.asarray(xp, float)
+    return c + lo * u, c + hi * u
+
+
+def capsule_in_hull(a, b, r, hull):
+    """The whole capsule (segment a-b widened by r) inside the convex polygon hull: the capsule is the convex hull of
+    its two end discs, so it is inside a convex polygon exactly when both end discs are (disc_in_hull)."""
+    return disc_in_hull(a, r, hull) and disc_in_hull(b, r, hull)
+
+
+def capsule_max_gap(a, b, r, pts, step=MIEN_XP_BUOC_M):
+    """Upper bound of max over the capsule (segment a-b widened by r) of the distance to the nearest point of pts, as
+    disc_max_gap: largest distance over a square grid of the capsule (step) and its rim (two half circles and two
+    sides, spacing h <= step), plus step * sqrt(2) + h / 2 (1-Lipschitz; a capsule point lies in a grid cell whose
+    corner is inside, or the rim crosses the cell)."""
+    pts = np.asarray(pts, float).reshape(-1, 2)
+    if not len(pts) or not step > 0 or not r > 0:
+        raise KCError('capsule_max_gap: no mark, or a step / radius out of range')
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    o = (a + b) / 2                                   # relative coordinates
+    pts, a, b = pts - o, a - o, b - o
+    lo, hi = np.minimum(a, b) - r, np.maximum(a, b) + r
+    gx, gy = np.arange(lo[0], hi[0] + step / 2, step), np.arange(lo[1], hi[1] + step / 2, step)
+    X, Y = np.meshgrid(gx, gy)
+    P = np.column_stack([X.ravel(), Y.ravel()])
+    ab = b - a
+    L = float(np.linalg.norm(ab))
+    t = np.clip(((P - a) @ ab) / (L * L), 0.0, 1.0) if L > 0 else np.zeros(len(P))
+    P = P[np.linalg.norm(P - (a + t[:, None] * ab), axis=1) <= r]
+    n_arc = max(720, int(math.ceil(math.pi * r / step)))
+    h = math.pi * r / n_arc
+    u = ab / L if L > 0 else np.array([1.0, 0.0])
+    nrm = np.array([-u[1], u[0]])
+    th = np.linspace(-math.pi / 2, math.pi / 2, n_arc + 1)
+    rim = [b + r * (np.outer(np.cos(th), u) + np.outer(np.sin(th), nrm)),
+           a - r * (np.outer(np.cos(th), u) + np.outer(np.sin(th), nrm))]
+    if L > 0:
+        s = np.linspace(0.0, 1.0, max(2, int(math.ceil(L / h)) + 1))[:, None]
+        rim += [a + r * nrm + s * ab, a - r * nrm + s * ab]
+    P = np.vstack([P] + rim)
+    d = np.min(np.linalg.norm(P[:, None, :] - pts[None, :, :], axis=2), axis=1)
+    return float(d.max()) + step * math.sqrt(2) + h / 2
+
+
+def duong_regions(marks, xp, r=R_XP_DUONG_M, duong=None):
+    """{k: dict(doan_m, moc, vung_mo_rong)} of every start point xp {k: (x, y)} with a 12b segment (DUONG_12B): the
+    marks within r of the segment; fewer than 2 -> the 3 nearest (vung_mo_rong), as start_regions."""
+    duong = DUONG_12B if duong is None else duong
+    out = {}
+    for k, c in xp.items():
+        if k not in duong:
+            continue
+        a, b = duong_12b(c, duong[k])
+        d = {i: seg_dist(m[:2], a, b) for i, m in marks.items()}
+        z = sorted(i for i, v in d.items() if v <= r)
+        wide = len(z) < 2
+        if wide:
+            z = sorted(sorted(d, key=lambda i: (d[i], i))[:3])
+        out[k] = dict(doan_m=[[float(v) for v in a], [float(v) for v in b]], moc=z, vung_mo_rong=wide)
+    return out
+
+
+def _a3_dir_flags(region_ids, a3_rows, two_deg, l_max):
+    """mot_phuong reasons of a region (S7-14.3, KCJ1-12): no two A3 pair directions (mod 180) two_deg apart among the
+    valid pairs with an end in the region, and region marks in no A3 pair of the clip."""
+    zs = set(region_ids)
+    use = [r for r in a3_rows if (r['i'] in zs or r['j'] in zs) and r['L_m'] <= l_max]
+    dirs = [r['huong_deg'] % 180.0 for r in use]
+    two = any(min(abs(a - b), 180.0 - abs(a - b)) >= two_deg for a in dirs for b in dirs)
+    held = {m for r in use for m in (r['i'], r['j'])}
+    lone = sorted(m for m in zs if m not in held)
+    return (['mot_phuong'] if not two else []) + ([f'moc_khong_co_A3loc:{lone}'] if lone else [])
+
+
+def duong_cover(region_ids, marks, a, b, a3_rows, r_trong=R_TRONG_M, two_deg=HAI_PHUONG_DEG, l_max=L_MAX_M):
+    """region_cover for a 12b corridor (segment a-b widened by MIEN_XP_M): ngoai_suy when the capsule is not inside
+    the hull of the region marks or a capsule point is farther than r_trong from the nearest of them (guaranteed
+    upper bound); mot_phuong as region_cover. Also returns the bound itself (khoang_trong_max_m)."""
+    pts = np.array([marks[i][:2] for i in region_ids], float)
+    why = []
+    if not capsule_in_hull(a, b, MIEN_XP_M, _hull(pts)):
+        why.append('mien_ngoai_bao_loi')
+    gap = capsule_max_gap(a, b, MIEN_XP_M, pts)
+    if gap > r_trong:
+        why.append('khoang_trong')
+    mp = _a3_dir_flags(region_ids, a3_rows, two_deg, l_max)
+    return dict(ngoai_suy=bool(why), mot_phuong=bool(mp), ly_do=why + mp, khoang_trong_max_m=gap)
+
+
 def region_cover(region_ids, marks, c, a3_rows, r_trong=R_TRONG_M, two_deg=HAI_PHUONG_DEG, l_max=L_MAX_M):
     """S7-12.3, S7-14.3: ngoai_suy when a sample of the start domain is outside the convex hull of the region marks
     or farther than r_trong from the nearest of them; mot_phuong when the valid A3 pairs of the clip (L <= L_MAX_M,
@@ -1064,6 +1176,39 @@ def s7_summary(rel, a3rel, cover, regions, a3_hong=None):
              theo_clip={c: dict(max_deg=a3rel[c]['max_deg'], A3_xp_deg=a3rel[c]['A3_xp']) for c in a3rel},
              loai='chi so kiem cheo gop hai dau (KS7-3), trong tung clip; truoc le')
     return P, A
+
+
+def duong_summary(dregs, dcover, a3rel, a3_hong=None):
+    """Block A3_tuong_doi.duong_12b (HCV3-2, CODE 20/11): A3 by position over the 12b corridor of each place (segment
+    doan_m widened by ban_kinh_m), keyed like A3_tuong_doi: A3_deg[k] = largest A3loc of the corridor marks over the
+    clips (None when no corridor mark is in a pair: mot_phuong), with the flags ngoai_suy (capsule outside the hull
+    of the corridor marks or farther than R_TRONG_M from them), mot_phuong, cap_hong (a broken A3 pair touching a
+    corridor mark). Only A3: no P1 pair is computed for the corridor."""
+    hong = [dict(h, clip=c) for c, v in (a3_hong or {}).items() for h in v]
+    A, mp, ns, ch, ly, gap, moc, doan, wide, tc = {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+    for k, r in dregs.items():
+        per = {}
+        for c in a3rel:
+            v = [a3rel[c]['A3loc'][m] for m in r['moc'] if m in a3rel[c]['A3loc']]
+            per[c] = max(v) if v else None
+        vals = [v for v in per.values() if v is not None]
+        A[k] = max(vals) if vals else None
+        ns[k] = any(dcover[c][k]['ngoai_suy'] for c in dcover)
+        mp[k] = any(dcover[c][k]['mot_phuong'] for c in dcover) or A[k] is None
+        zs = set(r['moc'])
+        ch[k] = any(h['i'] in zs or h['j'] in zs for h in hong)
+        ly[k] = {c: dcover[c][k]['ly_do'] for c in dcover if dcover[c][k]['ly_do']}
+        gap[k] = max(dcover[c][k]['khoang_trong_max_m'] for c in dcover)
+        moc[k], doan[k], wide[k], tc[k] = r['moc'], r['doan_m'], r['vung_mo_rong'], per
+    return dict(A3_deg=A, mot_phuong=mp, ngoai_suy=ns, cap_hong=ch, ly_do=ly, khoang_trong_max_m=gap, moc=moc,
+                doan_m=doan, ban_kinh_m=MIEN_XP_M, vung_mo_rong=wide, theo_clip=tc, R_TRONG_M=R_TRONG_M,
+                R_XP_DUONG_M=R_XP_DUONG_M,
+                nguon_doan='rpi5/c8_hc_seq.py PLACES (hil 8c2aa2e): diem dung theo truc xe tu diem xuat phat, huong mui',
+                loai='chi so kiem cheo A3 theo vi tri tren hanh lang 12b (doan 12b noi rong ban_kinh_m), trong tung '
+                     'clip roi lay lon nhat; truoc le; chi A3, khong co P1 cho hanh lang',
+                gioi_han=['(a) A3 lay tai moc, khong tai diem cua doan; moc cach diem xa nhat toi khoang_trong_max_m',
+                          '(b) doan 12b theo lich Pi danh dinh; xe lech khoi doan hon ban_kinh_m thi ra ngoai mien',
+                          '(c) tam ma noc lay bang diem xuat phat (lech tam ma bo qua, nhu dia xuat phat)'])
 
 
 # ---------------------------------------------------------------- export
@@ -1994,7 +2139,9 @@ def phan_tich(a):
     hang_so_s7 = dict(R_XP_M=R_XP_M, R_TRONG_M=R_TRONG_M, MIEN_XP_M=MIEN_XP_M, MIEN_XP_BUOC_M=MIEN_XP_BUOC_M,
                       HAI_PHUONG_DEG=HAI_PHUONG_DEG, DUNG_SAI_IN_GIAN=DUNG_SAI_IN_GIAN,
                       DUNG_SAI_IN_DU_MM=DUNG_SAI_IN_DU_MM, L_MAX_M=a.L_max, A3_TAG_T=list(A3_TAG_T),
-                      A3_TAG_PHI_DEG=list(A3_TAG_PHI_DEG), xuat_phat={k: list(v) for k, v in sorted(xp.items())},
+                      A3_TAG_PHI_DEG=list(A3_TAG_PHI_DEG), R_XP_DUONG_M=R_XP_DUONG_M,
+                      DUONG_12B={k: list(v) for k, v in sorted(DUONG_12B.items())},
+                      xuat_phat={k: list(v) for k, v in sorted(xp.items())},
                       plumb=None if plumb is None else list(plumb), car_side_m=tag[0], tag_h_m=tag[1], model=a.model,
                       nhom=groups, id_khoa=ids_a)
     ch = commit_hil()
@@ -2068,6 +2215,10 @@ def phan_tich(a):
             cover[n] = {k: region_cover(regions[k]['moc'], mk, xp[k], a3[n], R_TRONG_M, HAI_PHUONG_DEG, a.L_max)
                         for k in regions}
         s7['P1_tuong_doi'], s7['A3_tuong_doi'] = s7_summary(rel, a3rel, cover, regions, a3_hong)
+        dregs = duong_regions(mk_a, xp, R_XP_DUONG_M)                       # HCV3-2: the 12b corridor of each place
+        dcover = {n: {k: duong_cover(r['moc'], clips[n][1], *r['doan_m'], a3[n], R_TRONG_M, HAI_PHUONG_DEG, a.L_max)
+                      for k, r in dregs.items()} for n in clips}
+        s7['A3_tuong_doi']['duong_12b'] = duong_summary(dregs, dcover, a3rel, a3_hong)
     else:
         s7['P1_tuong_doi'] = s7['A3_tuong_doi'] = None
     sess = {n: dict(file=os.path.abspath(p), sha256=ses_sha[n], video=os.path.abspath(clips_in[n][1]),

@@ -1419,6 +1419,11 @@ def test_phan_tich_writes_s7(tmp_path, scene, monkeypatch):
     assert p['max_m'] < 5e-4 and p['theo_vung']['goc']['vung_mo_rong'] and p['cap_hong'] == []
     assert p['cap_csv']['sha256'] == kc.sha256_file(p['cap_csv']['file'])
     assert r['A3_tuong_doi']['A3_xp_deg']['goc'] is not None and r['hang_so_s7']['R_XP_M'] == 0.3
+    d = r['A3_tuong_doi']['duong_12b']                                   # HCV3-2: the 12b corridor of goc
+    assert np.allclose(d['doan_m']['goc'], [[-0.5 / 2 ** 0.5] * 2, [0.5 / 2 ** 0.5] * 2])
+    assert d['A3_deg']['goc'] is not None and d['A3_deg']['goc'] < 2e-3 and d['cap_hong']['goc'] is False
+    assert set(d['moc']['goc']) >= set(r['P1_tuong_doi']['theo_vung']['goc']['moc_vung']) - {0}
+    assert r['hang_so_s7']['DUONG_12B']['goc'] == [45.0, -0.5, 0.5] and r['hang_so_s7']['R_TRONG_M'] == 0.55
     assert r['id_khoa'] == sorted(img) and r['meo_cuc_bo']['bien_dang_hinh'] is False
     assert os.path.isabs(r['sessions']['H_a']['video']) and 'theo_co' in r['P7']
     t2 = tmp_path / 'x'
@@ -1661,7 +1666,9 @@ def _khoa_manifest(tmp_path, scene, **over):
     hs = dict(R_XP_M=0.3, R_TRONG_M=kc.R_TRONG_M, MIEN_XP_M=kc.MIEN_XP_M, MIEN_XP_BUOC_M=kc.MIEN_XP_BUOC_M,
               HAI_PHUONG_DEG=kc.HAI_PHUONG_DEG, DUNG_SAI_IN_GIAN=kc.DUNG_SAI_IN_GIAN,
               DUNG_SAI_IN_DU_MM=kc.DUNG_SAI_IN_DU_MM, L_MAX_M=0.6, A3_TAG_T=list(kc.A3_TAG_T),
-              A3_TAG_PHI_DEG=list(kc.A3_TAG_PHI_DEG), xuat_phat={'goc': [0.0, 0.0]}, plumb=[0.03, -0.02],
+              A3_TAG_PHI_DEG=list(kc.A3_TAG_PHI_DEG), R_XP_DUONG_M=kc.R_XP_DUONG_M,
+              DUONG_12B={k: list(v) for k, v in sorted(kc.DUONG_12B.items())},
+              xuat_phat={'goc': [0.0, 0.0]}, plumb=[0.03, -0.02],
               car_side_m=0.1445, tag_h_m=0.119, model='B1', nhom=kc.make_groups(ids), id_khoa=ids)
     hs.update(over)
     p = tmp_path / 'khoa_s7.json'
@@ -2265,3 +2272,67 @@ def test_meo_E_a3_failure_is_code_2(tmp_path, scene, monkeypatch):
     assert not (tmp_path / 'e.json').exists()
     assert kc.main(['meo_E', '--model', 'B1', '--cho', 'goc', '--session', str(sp), '--track', str(td), '--cua-so',
                     str(cs), '--out', str(tmp_path / 'e.json')]) == 0            # the same inputs pass otherwise
+
+
+# ---------------------------------------------------------------- HCV3-2: A3 over the 12b corridor (CODE 20/11)
+# the locked 32-mark floor of C8 (centres of session 2026-11-18_run01/H0a/calib, rounded to 1 mm)
+MARKS32 = {1: (-1.402, 0.9), 2: (-0.701, 0.902), 3: (-0.001, 0.901), 4: (0.698, 0.901), 5: (1.4, 0.899),
+           6: (-1.401, 0.001), 7: (1.401, 0.0), 8: (-1.4, -0.901), 9: (-0.699, -0.901), 10: (0.0, -0.9),
+           11: (0.699, -0.901), 12: (1.408, -0.9), 13: (-1.944, 1.452), 14: (-0.97, 1.459), 15: (0.001, 1.451),
+           16: (0.972, 1.45), 17: (1.954, 1.45), 18: (-1.949, -0.001), 19: (1.95, -0.001), 20: (-1.952, -1.451),
+           21: (-0.97, -1.452), 22: (0.001, -1.449), 23: (0.972, -1.45), 24: (1.949, -1.449), 25: (0.499, 0.0),
+           26: (-0.501, 0.0), 27: (-0.001, 0.499), 28: (-0.002, -0.501), 29: (1.252, 0.551), 30: (1.246, -0.551),
+           31: (-1.25, 0.55), 32: (-1.249, -0.554)}
+XP_C8 = {'goc': (0.0, 0.0), 'K1': (1.0, 0.0), 'K2': (-0.5, -0.5)}
+
+
+def test_capsule_max_gap_brackets_the_true_maximum():
+    """Independent oracles: one mark at the start of a 1 m capsule (r 0.1): max = 1.1 at the far rim; marks at both
+    ends: max = hypot(0.5, 0.1) at the side midpoints; the bound is >= the truth and within its stated margin."""
+    step = kc.MIEN_XP_BUOC_M
+    for pts, true in (([[0.0, 0.0]], 1.1), ([[0.0, 0.0], [1.0, 0.0]], math.hypot(0.5, 0.1))):
+        g = kc.capsule_max_gap((0.0, 0.0), (1.0, 0.0), 0.1, pts, step)
+        assert true <= g <= true + step * math.sqrt(2) + math.pi * 0.1 / 720 + 1e-12
+    g0 = kc.capsule_max_gap((0.3, 0.2), (0.3, 0.2), 0.1, [[0.3, 0.2]], step)       # zero length: a disc
+    assert 0.1 <= g0 <= 0.1 + step * math.sqrt(2) + 1e-3
+
+
+def test_capsule_in_hull_needs_both_end_discs():
+    sq = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+    assert kc.capsule_in_hull((-0.8, 0.0), (0.8, 0.0), 0.1, sq)
+    assert not kc.capsule_in_hull((-0.8, 0.0), (0.8, 0.0), 0.25, sq)
+    assert not kc.capsule_in_hull((0.0, 0.0), (0.0, 0.95), 0.1, sq)
+
+
+def test_duong_12b_ends_follow_the_pi_schedule():
+    a, b = kc.duong_12b(XP_C8['goc'], kc.DUONG_12B['goc'])
+    assert np.allclose(a, [-0.5 / 2 ** 0.5] * 2) and np.allclose(b, [0.5 / 2 ** 0.5] * 2)
+    assert np.allclose(kc.duong_12b(XP_C8['K1'], kc.DUONG_12B['K1']), [[1.0, -0.25], [1.0, 0.25]])
+    assert np.allclose(kc.duong_12b(XP_C8['K2'], kc.DUONG_12B['K2']), [[-0.85, -0.5], [-0.35, -0.5]])
+    for ang, lo, hi in kc.DUONG_12B.values():
+        assert lo <= 0.0 <= hi                     # the start point is on its corridor
+
+
+def test_duong_cover_on_the_c8_floor():
+    """The 32-mark floor: every 12b corridor inside its region hull and within R_TRONG_M = 0.55 of a mark (Liam
+    20/11), while 0.35 flags khoang_trong at every place (HCV3-2); no A3 row -> mot_phuong only."""
+    mk = {i: (x, y, SIDE) for i, (x, y) in MARKS32.items()}
+    reg = kc.duong_regions(mk, XP_C8)
+    assert set(reg) == {'goc', 'K1', 'K2'}
+    for k, r in reg.items():
+        ok = kc.duong_cover(r['moc'], mk, *r['doan_m'], [], 0.55)
+        assert ok['ngoai_suy'] is False and ok['ly_do'][0] == 'mot_phuong' and ok['khoang_trong_max_m'] < 0.55
+        assert 0.44 < ok['khoang_trong_max_m']
+        bad = kc.duong_cover(r['moc'], mk, *r['doan_m'], [], 0.35)
+        assert 'khoang_trong' in bad['ly_do']
+
+
+def test_duong_summary_takes_the_largest_corridor_a3():
+    regs = {'goc': dict(doan_m=[[0, 0], [1, 0]], moc=[1, 2], vung_mo_rong=False)}
+    a3rel = {'H_a': dict(A3loc={1: 0.2, 2: 0.4, 3: 9.0}), 'H_b': dict(A3loc={1: 0.5})}
+    cov = {c: {'goc': dict(ngoai_suy=False, mot_phuong=False, ly_do=[], khoang_trong_max_m=0.3)} for c in a3rel}
+    s = kc.duong_summary(regs, cov, a3rel, {'H_b': [dict(i=2, j=7, L_m=0.5, ly_do='x')]})
+    assert s['A3_deg']['goc'] == 0.5 and s['theo_clip']['goc'] == {'H_a': 0.4, 'H_b': 0.5}   # mark 3 not in it
+    assert s['cap_hong']['goc'] is True and s['mot_phuong']['goc'] is False and s['ban_kinh_m'] == kc.MIEN_XP_M
+    s2 = kc.duong_summary(regs, cov, {'H_a': dict(A3loc={3: 1.0})})
+    assert s2['A3_deg']['goc'] is None and s2['mot_phuong']['goc'] is True
