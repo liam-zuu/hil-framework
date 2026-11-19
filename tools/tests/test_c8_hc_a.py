@@ -637,3 +637,55 @@ def test_q_turn_term_needs_sourced_two_end_bound(tmp_path):
     r1 = ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.02, 0.0], du_m=0.0, neo=0.0, psi_cuc=0.0,
                          psi_hai_dau=math.radians(0.5))
     assert r1['u_hang_deg']['u_q'] >= 0.019                    # |q| 2 sin(0.25 deg) / 0.50 m ~ 0.020 deg
+
+
+# ------------------------------------------------------------------ Codex code review round 3 (HCC3-3..6)
+def test_falling_edge_with_500ms_hole_fails(tmp_path):
+    """HCC3-3 (Codex): 500 ms inserted at the first run_active=0 row (log_seq kept continuous) still passed."""
+    d, _ = make(tmp_path, cho='K2')
+
+    def fn(hdr, body):
+        i0, i1 = run_rows(hdr, body)
+        ct, ca_ = col(hdr, 'timestamp_us'), col(hdr, 'traj_age_ms')
+        for r in body[i1 + 1:]:
+            r[ct] = str(int(r[ct]) + 500000)
+            r[ca_] = str(int(r[ca_]) + 500)
+    edit_log(d, fn)
+    ok, ck, _ = checks(d)
+    assert not ok['het_han_firmware'], ck
+
+
+def test_diagnosis_not_blocked_by_old_f2_f5(tmp_path):
+    """HCC3-4 (Codex): old F2/F5 blocked a diagnostic tinh that uses neither F6 nor F9."""
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
+    run_cua_so(d)
+    fb = os.path.join(d, 'frames_B.csv')
+    import shutil
+    shutil.copy(os.path.join(d, 'frames.csv'), fb)
+    with open(fb, 'a', encoding='utf-8') as f:
+        f.write('')
+    with open(fb, 'ab') as f:
+        f.write(b'\n')
+    args = ['tinh', '--cho', 'K2', '--cap', d, '--frames-of', f"{d}={fb},{os.path.join(d, 'track.json')}"]
+    assert ca.main(args) in (0, 1)
+
+
+def test_c8b_bound_outside_domain_refused(tmp_path):
+    """HCC3-6 (Codex): -1, NaN and 2 pi rad as the two-end bound gave khoa with u_q ~ 0."""
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
+    an = analyse(d)
+    for v in (-1.0, float('nan'), 2 * math.pi):
+        with pytest.raises(ca.AError):
+            ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.02, 0.0], du_m=0.0, neo=0.0, psi_cuc=0.0,
+                            psi_hai_dau=v)
+        p = write_json(str(tmp_path / 'c8b.json'), dict(u_psi_cuc_rad=0.001, u_psi_hai_dau_rad=v))
+        assert ca.main(tinh_args(d, 'K2', '--can-c8b', p)) == 2
+
+
+def test_cua_so_refuses_clip_other_than_track(tmp_path):
+    """HCC2-5 (round 3, Codex): the track declares clip A, cua_so --clip B was accepted."""
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
+    write_json(os.path.join(d, 'track.json'), dict(tag_offset=[0.0, 0.0, 0.0], video_sha256='a' * 64))
+    rc = ca.main(['cua_so', d, '--frames', os.path.join(d, 'frames.csv'), '--track', os.path.join(d, 'track.json'),
+                  '--clip', os.path.join(d, 'lich.csv')])
+    assert rc == 2

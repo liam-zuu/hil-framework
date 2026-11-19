@@ -67,7 +67,8 @@ TAIL_S = 2.5                       # zeros after the schedule (as O1_TAIL_S)
 ABORT_ZERO_S = 0.5                 # zeros sent on an abort
 GAP_ABORT_S = 0.100                # a gap between two sends above this aborts (half the firmware 200 ms timeout)
 SENDTO_MAX_S = 0.020               # one sendto longer than this aborts (HCC1-1); real socket timeout too
-READY_LEAD_S = 0.5                 # the car-ready check runs this long before the first motion packet (HCC1-3)
+READY_LEAD_S = 0.1                 # the final car-ready check runs this long before the first motion packet (HCC3-1)
+MIN_SPACING_S = 0.010              # DT/2 between the end of a sendto and the next one (HCC3-2)
 READY_ROWS = 20                    # logger rows (~0.2 s at 10 ms) that must show a ready car
 READY_PRIME_K = 25                 # first ready check 0.5 s before the final one; the log must advance between
 READY_ADVANCE = 25                 # log_seq rows the stream must add between the two checks (~50 expected)
@@ -222,8 +223,11 @@ def send_schedule(ip, segs, sock, out, clock=time.monotonic, sleep=time.sleep, w
     immediately before each sendto: a gap from the previous pre-send check above GAP_ABORT_S, or a sendto that
     takes longer than SENDTO_MAX_S, aborts. So two packets are never further apart than GAP_ABORT_S + SENDTO_MAX_S
     (120 ms, under the 200 ms firmware timeout), and a stall that jumps past the end of the schedule is checked too.
-    ready() (HCC1-3) is called once, READY_LEAD_S before the first motion packet (zeros are being sent): None or
-    the reason the car is not ready (logger rows: motor_on, run_active, sp_* = 0) -> abort before any motion.
+    ready() (HCC1-3, HCC2-1) is called twice, READY_LEAD_S + 0.5 s and READY_LEAD_S before the first motion packet
+    (zeros are being sent): None or the reason the car is not ready -> abort before any motion. A sample lost
+    before the first motion packet also aborts there (HCC3-1; exit 2: nothing moved). Sample k is sent anywhere in
+    its 20 ms cell, but never closer than MIN_SPACING_S to the end of the previous sendto (HCC3-2); the reported
+    gap is the upper bound (end of this sendto - check before the previous one) and aborts above GAP_ABORT_S.
 
     Any exception once sending has started (HCC1-2: Abort, a socket error, KeyboardInterrupt, an error writing
     the log) sends the abort zeros first, then tries to write '#seq_end' and '#seq_huy', then raises Abort."""
@@ -236,36 +240,37 @@ def send_schedule(ip, segs, sock, out, clock=time.monotonic, sleep=time.sleep, w
     buf = [f"#seq_start,ver={VERSION},cho={cho},phan={phan},thu_id={thu_id},t_epoch={e0:.3f},"
            f"iso={time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(e0))},duration_s={duration(segs):.3f},"
            f"send_hz={SEND_HZ},tail_s={TAIL_S},dst={ip}:{TRAJ_PORT},lich_sha256={lich_sha}"]
-    st = dict(k=0, sent=0, skipped=0, gap_max=0.0, sendto_max=0.0, first_s=None, last_s=None)
+    st = dict(k=0, sent=0, skipped=0, gap_max=0.0, sendto_max=0.0, first_s=None, last_s=None, moved=False,
+              primed=False)
     seg_done = set()
     ready_done = ready is None
     t0 = clock()
-    last_chk = None
+    last_chk = last_done = None
     try:
         while True:
             now = clock() - t0
             k_now = max(st['k'], int(math.floor(now * SEND_HZ + 1e-9)))
-            if last_chk is not None:                     # also when the stall jumped past the end (HCC1-1)
-                gap = now - last_chk
-                if gap > GAP_ABORT_S - SENDTO_MAX_S:
-                    st['gap_max'] = max(st['gap_max'], gap + SENDTO_MAX_S)
-                    raise Abort('tre_gui', k=k_now, gap_ms=f'{gap * 1000:.1f}')
+            if last_chk is not None and now - last_chk > GAP_ABORT_S:   # also a stall past the end (HCC1-1)
+                st['gap_max'] = max(st['gap_max'], now - last_chk)
+                raise Abort('tre_gui', k=k_now, gap_ms=f'{(now - last_chk) * 1000:.1f}')
             if k_now >= total:
                 st['skipped'] += total - st['k']
                 break
+            if k_now > st['k'] and k_now <= k_move and not st['moved']:
+                # HCC3-1: a sample lost while only zeros were sent: refuse before the first motion packet (code 2)
+                raise Abort('tre_truoc_chay', k=k_now, bo=k_now - st['k'])
             st['skipped'] += k_now - st['k']
             st['k'] = k = k_now
             if not alive():
                 raise Abort('logger_chet', k=k)
-            if not st.get('primed') and ready is not None and k_ready >= READY_PRIME_K \
-                    and k >= k_ready - READY_PRIME_K:
+            if not st['primed'] and ready is not None and k_ready >= READY_PRIME_K and k >= k_ready - READY_PRIME_K:
                 st['primed'] = True
                 why = ready()
                 buf.append(f"#kiem_truoc_chay,k={k},lan=1,ket_qua={'dat' if why is None else 'hong'}"
                            + ('' if why is None else ',ly_do=' + str(why).replace(',', ';')))
                 if why is not None:
                     raise Abort('xe_chua_san_sang', k=k)
-                continue
+                continue                                  # the check took time: read the clock again
             if not ready_done and k >= k_ready:
                 ready_done = True
                 why = ready()
@@ -273,7 +278,7 @@ def send_schedule(ip, segs, sock, out, clock=time.monotonic, sleep=time.sleep, w
                            + ('' if why is None else ',ly_do=' + str(why).replace(',', ';')))
                 if why is not None:
                     raise Abort('xe_chua_san_sang', k=k)
-                continue                                  # the check took time: read the clock again
+                continue
             if k < n_plan:
                 vx, vy, wz = sample(segs, k)
                 i = seg_at(segs, k * DT)
@@ -286,17 +291,18 @@ def send_schedule(ip, segs, sock, out, clock=time.monotonic, sleep=time.sleep, w
             else:
                 vx = vy = wz = 0.0
             pkt = pack_packet(vx, vy, wz)
+            # HCC3-2: never closer than DT/2 to the END of the previous sendto (a packet leaves at the latest when
+            # sendto returns), so two packets cannot go out together even when a sendto blocked
+            if last_done is not None:
+                w = last_done + MIN_SPACING_S - (clock() - t0)
+                if w > 0:
+                    sleep(w)
+                    continue
             chk = clock() - t0                           # immediately before sendto
-            # HCC2-1: send sample k only inside the first half of its 20 ms cell; a later clock means the sample is
-            # stale: choose again (counted as skipped), so two packets are never sent closer than DT/2
-            if chk >= k * DT + DT / 2:
-                wait = t0 + (k + 1) * DT - clock()
-                if wait > 0:
-                    sleep(wait)
+            if chk >= (k + 1) * DT:                      # the cell of sample k is over: choose again (HCC2-1)
                 continue
-            # true gap between two packets <= (chk - chk_prev) + sendto time: keep it <= GAP_ABORT_S
-            if last_chk is not None and chk - last_chk > GAP_ABORT_S - SENDTO_MAX_S:
-                st['gap_max'] = max(st['gap_max'], chk - last_chk + SENDTO_MAX_S)
+            if last_chk is not None and chk - last_chk > GAP_ABORT_S:
+                st['gap_max'] = max(st['gap_max'], chk - last_chk)
                 raise Abort('tre_gui', k=k, gap_ms=f'{(chk - last_chk) * 1000:.1f}')
             try:
                 sock.sendto(pkt, (ip, TRAJ_PORT))
@@ -304,11 +310,16 @@ def send_schedule(ip, segs, sock, out, clock=time.monotonic, sleep=time.sleep, w
                 raise Abort('socket', k=k, loi=str(exc).replace(',', ';'))
             done = clock() - t0
             st['sendto_max'] = max(st['sendto_max'], done - chk)
-            if last_chk is not None:
-                st['gap_max'] = max(st['gap_max'], done - last_chk)     # upper bound of the packet gap (HCC2-1)
-            last_chk = chk
+            if k >= k_move:
+                st['moved'] = True
             if done - chk > SENDTO_MAX_S:
                 raise Abort('sendto_cham', k=k, ms=f'{(done - chk) * 1000:.1f}')
+            if last_chk is not None:
+                ub = done - last_chk                     # upper bound of the gap between the two packets
+                st['gap_max'] = max(st['gap_max'], ub)
+                if ub > GAP_ABORT_S:
+                    raise Abort('tre_gui', k=k, gap_ms=f'{ub * 1000:.1f}')
+            last_chk, last_done = chk, done
             if k == 0:
                 st['first_s'] = chk
             if k == n_plan - 1:
@@ -323,6 +334,7 @@ def send_schedule(ip, segs, sock, out, clock=time.monotonic, sleep=time.sleep, w
     except BaseException as exc:                         # noqa: B902  (HCC1-2: zeros before any write)
         ab = exc if isinstance(exc, Abort) else Abort(
             'ctrl_c' if isinstance(exc, KeyboardInterrupt) else 'loi_' + type(exc).__name__, k=st['k'])
+        ab.moved = st['moved']                           # no motion packet sent yet -> the attempt is refused (2)
         _abort_zeros(ip, sock, sleep)
         _flush(out, buf)
         _end(out, wall, st, total, complete=0)
@@ -610,7 +622,7 @@ def _attempt(a, segs, d, out, clock, sleep, wall, sock, popen, query, pgrep, rea
             if not r['complete']:
                 code, why = 3, why + ['complete=0']
         except Abort as exc:
-            code, why = (2 if exc.why == 'xe_chua_san_sang' else 3), why + ['huy_' + exc.why]
+            code, why = (3 if getattr(exc, 'moved', True) else 2), why + ['huy_' + exc.why]
         finally:
             if own:
                 s.close()

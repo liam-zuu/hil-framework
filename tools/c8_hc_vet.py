@@ -207,10 +207,12 @@ def vet_thuc(poses, tags, hyp):
     return best
 
 
-V_BOUND, W_BOUND = 0.6, 1.0     # m/s, rad/s: Pi limits 0.15 / 0.6 + firmware outer loop up to 0.5 / 0.5 (v4 2.3)
+# command-side bounds when no measured bound is given (HCC3-5): |v| <= hypot(0.15 + 0.50, 0.50) (Pi vx + firmware
+# per-axis correction pos_ctrl.h), |wz| <= 0.6 + 0.5 rad/s; tinh passes bounds from the encoder log of the run
+V_BOUND, W_BOUND = 0.82, 1.1
 
 
-def vet_thuc_camera(t, x, y, psi_tag, a, tags, d, hyps=HYPS, every=1):
+def vet_thuc_camera(t, x, y, psi_tag, a, tags, d, hyps=HYPS, every=1, v_bound=None, w_bound=None, nguon_can=None):
     """Real footprint from the camera (HCC1-13), every `every`-th valid frame: the body heading is the tag heading
     - a, the body centre is within d of the measured centre (the chain gives the tag centre after q, not the body
     box centre), and between two used frames the car moves at most the largest step of the frames (translation +
@@ -230,11 +232,13 @@ def vet_thuc_camera(t, x, y, psi_tag, a, tags, d, hyps=HYPS, every=1):
         r = reach(hyp)
         dt = np.diff(t[use])
         step = np.maximum(np.hypot(np.diff(x[use]), np.diff(y[use])) + r * np.abs(np.diff(th[use])),
-                          (V_BOUND + r * W_BOUND) * dt)
+                          ((v_bound or V_BOUND) + r * (w_bound or W_BOUND)) * dt)
         g, tid = vet_thuc(zip(x[use], y[use], th[use]), tags, hyp)
         k = g - d - (float(np.max(step)) / 2 if len(step) else 0.0)
         if out is None or k < out['khe_m']:
-            out = dict(khe_m=k, ma=tid, buoc_m=float(np.max(step)) if len(step) else 0.0, d_m=d, hyp=hyp)
+            out = dict(khe_m=k, ma=tid, buoc_m=float(np.max(step)) if len(step) else 0.0, d_m=d, hyp=hyp,
+                       v_bound=v_bound or V_BOUND, w_bound=w_bound or W_BOUND,
+                       nguon_can=nguon_can or 'gioi han lenh Pi + hieu chinh firmware')
     return out
 
 

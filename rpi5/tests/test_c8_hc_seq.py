@@ -277,7 +277,9 @@ def test_attempt_no_data_row(tmp_path):
 
 
 def test_attempt_logger_dies_during_schedule(tmp_path):
-    code, out, sock, d = attempt(tmp_path, die_after=200)
+    code, out, sock, d = attempt(tmp_path, die_after=200)                       # before the first motion packet
+    assert code == 2 and all(p == (0.0, 0.0, 0.0) for p in sock.sent)
+    code, out, sock, d = attempt(tmp_path / 'b', die_after=600)                 # while moving
     assert code == 3
     assert '#seq_huy,ly_do=logger_chet' in (d / 'sender.txt').read_text(encoding='utf-8')
 
@@ -528,3 +530,72 @@ def test_reported_gap_bounds_the_true_gap():
     end = [ln for ln in out if ln.startswith('#seq_end')][0]
     rep = float(end.split('gap_max_ms=')[1].split(',')[0]) / 1000
     assert rep >= max_gap(sock) - 1e-9
+
+
+# ------------------------------------------------------------------ Codex code review round 3 (HCC3-1, HCC3-2)
+class EmitSock(FakeSock):
+    """The packet leaves at the END of a slow sendto (delay[n] s blocked before emission); records leave times."""
+    def __init__(self, clock, delay=None):
+        super().__init__()
+        self.clock, self.delay, self.times = clock, delay or {}, []
+
+    def sendto(self, pkt, addr):
+        self.clock.t += self.delay.get(len(self.sent), 0.0)
+        self.times.append(self.clock.t)
+        super().sendto(pkt, addr)
+
+
+class LateClock(FakeClock):
+    """sleep() returns late by late[n] s on the n-th sleep."""
+    def __init__(self, late):
+        super().__init__()
+        self.late = late
+
+    def sleep(self, d):
+        super().sleep(d)
+        self.t += self.late.get(self.n, 0.0)
+
+
+def test_slow_ready_checks_do_not_drop_samples():
+    """HCC3-1 (Codex): two 12 ms ready checks dropped two zero packets and the attempt ended complete=0."""
+    segs = hs.schedule('K2')
+    clock = FakeClock()
+
+    def slow_ready():
+        clock.t += 0.012
+        return None
+    sock = FakeSock()
+    r = hs.send_schedule('1.2.3.4', segs, sock, lambda s: None, clock, clock.sleep, lambda: 1.0e9, ready=slow_ready)
+    assert r['complete'] == 1 and r['n_bo'] == 0
+
+
+@pytest.mark.parametrize('late', [0.009, 0.011, 0.019])
+def test_late_sleep_inside_the_cell_keeps_the_sample(late):
+    """HCC3-1 (Codex): a sleep 11 ms late in the motion phase lost a packet although still inside its 20 ms cell."""
+    segs = hs.schedule('K2')
+    clock = LateClock({hs.first_motion_k(segs) + 30: late})
+    sock = EmitSock(clock)
+    r = hs.send_schedule('1.2.3.4', segs, sock, lambda s: None, clock, clock.sleep, lambda: 1.0e9)
+    assert r['complete'] == 1 and r['n_bo'] == 0
+    gaps = [b - a for a, b in zip(sock.times[:-1], sock.times[1:])]
+    assert min(gaps) >= hs.MIN_SPACING_S - 1e-9
+
+
+def test_blocked_sendto_cannot_send_two_packets_together():
+    """HCC3-2 (Codex): a sendto blocked 19 ms before emission, the next packet 1 ms later, complete=1."""
+    segs = hs.schedule('K2')
+    clock = FakeClock()
+    k_move = hs.first_motion_k(segs)
+    sock = EmitSock(clock, delay={k_move: 0.019})
+    hs.send_schedule('1.2.3.4', segs, sock, lambda s: None, clock, clock.sleep, lambda: 1.0e9)
+    gaps = [b - a for a, b in zip(sock.times[:-1], sock.times[1:])]
+    assert min(gaps) >= hs.MIN_SPACING_S - 1e-9
+
+
+def test_84ms_gap_then_send_is_not_aborted():
+    """HCC3-2 (Codex): an 84 ms gap with an immediate next send was aborted by the fixed 20 ms deduction."""
+    segs = hs.schedule('K2')
+    clock = FakeClock(stall={400: 0.064})
+    sock = EmitSock(clock)
+    r, err, out, _ = run_send(segs, clock, sock=sock)
+    assert err is None and r['gap_max_ms'] <= 100.0

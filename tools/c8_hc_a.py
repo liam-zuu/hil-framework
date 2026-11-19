@@ -57,6 +57,7 @@ EPS_SMOOTH_S = 0.5             # smoothing of camera heading and IMU yaw in the 
 MIN_FRAMES_TINH, MIN_FRAMES_VIDEO = 120, 60
 VIDEO_STRIDE = 2               # floor read of the whole clip (decode dominates: 1/10 0.9x, 1/2 1.33x real time, 19/11)
 E_COVER_TURNS, E_GAP_MAX_S = 1.5, 2.0   # E coverage per turn direction (v4 2.7)
+VET_MARGIN = 1.5               # on the encoder speed bounds of the real footprint (wheel slip at these speeds)
 RV_REPEAT_W = 0.1              # rad/s: while the wheels turn faster than this an RV report must change the yaw
 WIN_MIN_S, STILL_MIN_S = 2.5, 3.0
 U_D_MAX_S = 0.10
@@ -273,6 +274,11 @@ def sender_domain(L, i0, i1):
     else:
         if L['log_seq'][i1 + 1] != L['log_seq'][i1] + 1:
             problems.append('ho log_seq o canh ha')
+        dt_e = L['t'][i1 + 1] - L['t'][i1]
+        if dt_e > 0.03:                                   # same tolerance as the windows (gap > 30 ms)
+            problems.append(f'canh ha cach {dt_e * 1000:.0f} ms (> 30 ms)')
+        if abs((age[i1 + 1] - age[i1]) - dt_e * 1000) > 11.0:
+            problems.append(f'tuoi goi qua canh ha {age[i1]:.0f}->{age[i1 + 1]:.0f} ms khong khop dt {dt_e * 1000:.0f} ms')
         if L['traj_age_ms'][i1 + 1] < EXPIRY_MS:
             problems.append(f"canh ha khi traj_age {L['traj_age_ms'][i1 + 1]:.0f} ms < 200")
     if i1 <= j_s or age[i1] < EXPIRY_MS - EXPIRY_SLACK_S * 1000:
@@ -827,6 +833,9 @@ def _deg_leg(lg):
 
 def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None, psi_cuc=None, cap_ok=True,
                  cap_why=(), bao_q=False, vet=None, psi_cuc_chot=False, need_windows=None, psi_hai_dau=None):
+    for v in (psi_cuc, psi_hai_dau):                       # HCC3-6: never let max()/sin() hide a bad bound
+        if v is not None and not (math.isfinite(v) and 0.0 <= v <= math.pi):
+            raise AError(f'can ngoai mien [0, pi]: {v}')
     """Combine the analysed attempts of one place (F7 block). attempts = list of (thu_id, analysis or None, why).
 
     cap_ok False (the issued attempt failed kiem) -> chua_ket_luan: a is never issued from such an attempt; its legs
@@ -1083,6 +1092,11 @@ def cmd_cua_so(a):
     F = frames_of(a, A)
     an = analyse(A, F, info)
     clip_sha = sha256(a.clip) if a.clip else None
+    tj0 = json.load(open(a.track, encoding='utf-8'))
+    for k_t, v in (('video_sha256', clip_sha), ('session_sha256', sha256(a.session) if a.session else None),
+                   ('frames_sha256', sha256(a.frames))):
+        if tj0.get(k_t) and v and tj0[k_t] != v:          # HCC2-5 (round 3): the track was made from another file
+            raise AError(f'{a.track}: {k_t} khac file dua vao cua_so')
     S = json.load(open(a.session, encoding='utf-8')) if a.session else {}
     ses_sha = sha256(a.session) if a.session else a.session_sha256
     pos = stop_positions(A['segs'])
@@ -1122,7 +1136,11 @@ def cmd_cua_so(a):
                           ('dets', a.dets), ('log', A['log_path']), ('sender', os.path.join(a.dir, 'sender.txt')),
                           ('lich', os.path.join(a.dir, 'lich.csv')), ('cua_so_v1', out), ('a6', a.a6),
                           ('xoay', a.xoay)) if v]
-    src_ok = all((a.clip, a.session, a.dets, a.a6, a.xoay))         # HCC2-7: 'khoa' needs every source key
+    # HCC2-7: 'khoa' needs every source file AND the keys made from them (dets_fp; lan_lap_id of NHACTAM, not
+    # available yet: F5 stays chan_doan until the F8 lan_lap_v1 contract is wired)
+    lan_lap_id = None
+    src_ok = (all((a.clip, a.session, a.dets, a.a6, a.xoay)) and dets_fingerprint(a.dets) is not None
+              and lan_lap_id is not None)
     doan = dict(schema='c8_hc_doan_12b_v1', thu_id=A['thu_id'], cho=A['cho'], lan_lap_id=None,
                 trang_thai=an['chuoi'] if src_ok else 'chan_doan', clip=a.clip, clip_sha256=clip_sha, session_sha256=ses_sha,
                 frames_sha256=sha256(a.frames), track_sha256=sha256(a.track), cua_so_v1_sha256=sha256(out),
@@ -1211,17 +1229,20 @@ def read_can_c8b(path, cho):
     if 'u_psi_cuc_rad' not in b:
         raise AError(f'{path}: {cho} thieu u_psi_cuc_rad')
     hd = b.get('u_psi_hai_dau_rad')
-    return float(b['u_psi_cuc_rad']), None if hd is None else float(hd), bool(b.get('chot', False))
+    vals = [float(b['u_psi_cuc_rad'])] + ([] if hd is None else [float(hd)])
+    if not all(math.isfinite(v) and 0.0 <= v <= math.pi for v in vals):   # HCC3-6
+        raise AError(f'{path}: can C8B ngoai mien [0, pi]: {vals}')
+    return vals[0], None if hd is None else vals[1], bool(b.get('chot', False))
 
 
 def check_cap_sources(d, frames, track, log_path, a6, xoay, need):
     """HCC2-5: the F2 rows and the F5 of the issued attempt must have been made from the very frames, track and log
     tinh analyses now (and the same A6, xoay files); need=True (F6/F9 given) and a file missing -> AError."""
     p2, p5 = os.path.join(d, 'cua_so_v1.jsonl'), os.path.join(d, 'doan_12b_v1.json')
-    if not (os.path.isfile(p2) and os.path.isfile(p5)):
-        if need:
-            raise AError(f'{d}: F6/F9 need cua_so_v1.jsonl and doan_12b_v1.json of this attempt (run cua_so)')
+    if not need:                                          # HCC3-4: diagnosis from the current sources only
         return
+    if not (os.path.isfile(p2) and os.path.isfile(p5)):
+        raise AError(f'{d}: F6/F9 need cua_so_v1.jsonl and doan_12b_v1.json of this attempt (run cua_so)')
     fs, ls = sha256(frames), sha256(log_path)
     for r in (json.loads(x) for x in open(p2, encoding='utf-8')):
         if r.get('frames_sha256') != fs or r.get('esp32_sha256') != ls:
@@ -1310,8 +1331,12 @@ def cmd_tinh(a):
         m = cap_F['ok'] & (cap_F['t'] + D >= L['t'][i0]) & (cap_F['t'] + D <= L['t'][i1])
         a_cap = circmean([lg['a_l'] for lg in cap_an['legs'] if lg['dai'] and lg['trang_thai'] == 'hop_le'] or [0.0])
         x0, y0, _ = cv.START[a.cho]
+        rim = np.abs(np.diff(L['C'][i0:i1 + 2], axis=0)) * COUNT_M / np.maximum(np.diff(L['t'][i0:i1 + 2]), 1e-3)[:, None]
+        v_b = VET_MARGIN * math.sqrt(2) * float(np.max(rim))     # mecanum: |vx|, |vy| <= max wheel rim speed
+        w_b = VET_MARGIN * float(np.max(rim)) / LXY              # |wz| <= max rim speed / (lx + ly)
         vet = cv.vet_thuc_camera(cap_F['t'][m], cap_F['x'][m], cap_F['y'][m], cap_F['psi'][m], a_cap, tags,
-                                 a.d_vet_mm / 1000)
+                                 a.d_vet_mm / 1000, v_bound=v_b, w_bound=w_b,
+                                 nguon_can=f'encoder luot cap x {VET_MARGIN} (khong truot)')
         nguon.append(dict(vai_tro='moc_32', duong_dan=os.path.abspath(a.moc), sha256=sha256(a.moc)))
     roles = dict((lo, k) for k, lo in window_roles(load_attempt(a.cap)['segs']))
     need = sorted(k for k, lo in window_roles(load_attempt(a.cap)['segs']) if lo in ('ref_12b', 'dung_12b'))
