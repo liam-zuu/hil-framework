@@ -267,7 +267,7 @@ def pi_period(t_send_ns, k_first, k_last, period_us):
 
 
 def score(path, task, allow_final_set=False, esp_log=None, allow_pre_b81_15=False, gate_file=None, stage='',
-          campaign=''):
+          campaign='', gate_file_fake=False):
     if task not in FIG8 and task not in FINAL_SET:
         raise ValueError(f'task {task!r}: one of {tuple(FIG8) + FINAL_SET}')
     if task in FINAL_SET and not allow_final_set:
@@ -325,6 +325,8 @@ def score(path, task, allow_final_set=False, esp_log=None, allow_pre_b81_15=Fals
                                                              v_cap=v_max, wz_cap=wz_max)
     if gate_file:
         gf = gate_c8.read_gate_c8(gate_file)
+        if (gf.fake or gf.fake_sign) and not (gf.fake and gate_file_fake):      # GC6-14 (round 4): as rq3_log reads it
+            raise ValueError(f'--gate-file {gate_file!r}: a FAKE content or FAKE marks (tests, demo), not a C8 gate')
         extra.update(report_only=gf.run_report_only(task, 'HIL', stage, campaign), level=task,
                      gate_file_sha256=gf.sha256)
         out['gate_file'] = os.path.basename(gate_file)
@@ -368,6 +370,7 @@ def main(argv=None) -> int:
                     'conditions of the level (HIL candidate check of B: --stage hil_check --campaign B-PID / B-LADRC)')
     ap.add_argument('--stage', default='', help='rq3_log stage of the run (with --gate-file)')
     ap.add_argument('--campaign', default='', help='rq3_log campaign of the run (with --gate-file)')
+    ap.add_argument('--gate-file-fake', action='store_true', help='accept a wholly FAKE gate file (tests, demo; GC6-14)')
     ap.add_argument('--pre-b81-15', action='store_true',
                     help='score a frame log from before the Pi plant-state check (development only, O1 3.5)')
     a = ap.parse_args(argv)
@@ -375,7 +378,7 @@ def main(argv=None) -> int:
         if (a.stage or a.campaign) and not a.gate_file:
             raise ValueError('--stage / --campaign only with --gate-file')
         out = _json_safe(score(a.frame_log, a.task, a.allow_final_set, a.esp_log or None, a.pre_b81_15,
-                               a.gate_file or None, a.stage, a.campaign))
+                               a.gate_file or None, a.stage, a.campaign, a.gate_file_fake))
     except (ValueError, KeyError, OSError) as exc:
         print('hil_o1_score:', exc, file=sys.stderr)
         print('#ket_qua,ma=2')

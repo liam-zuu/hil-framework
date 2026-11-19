@@ -583,6 +583,12 @@ def read_gate_json(path: str, allow_null: bool = False) -> Optional[dict]:
             d = json.load(f)
     except (OSError, ValueError) as exc:
         raise LogError(f'--gate-json {path!r}: {exc}')
+    return gate_of(d, path, allow_null)
+
+
+def gate_of(d, path: str, allow_null: bool = False) -> Optional[dict]:
+    """The gate block of a scorer output already read (read_gate_json; GC9-11: the CLI end parses it from the bytes
+    it hashed)."""
     if allow_null and isinstance(d, dict) and 'gate_v3' in d and d['gate_v3'] is None:
         return None
     g = d.get('gate_v3', d) if isinstance(d, dict) else None
@@ -2675,6 +2681,8 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
     after = live_rows(read_rows(os.path.join(ds, TUNING))) + [row]
     check_map_rows([row])
     check_c8b_rows(after)                              # GT1-8: the time file of no other run
+    if row.get('fail_cause') == KHONG_NUT:
+        check_khong_nut_rows(after, ds)                # GC9-10: the rule of the summary, old rows included
     if _c8b_counted(row):
         try:
             c8b_refusals(after)
@@ -3802,12 +3810,16 @@ def main(argv=None) -> int:
                 raise LogError(f'--gate-json {a.gate_json!r} is an output of c7_calib_drift.py gop (block calib_drift): '
                                'end logs the provisional outcome with the H0 scoring (score.json of the run), then '
                                'so-h --run-uid <run> --score-final <this file> after the clip H comparison')
-            lu, gj_sha = read_luoi_sha(a.gate_json) if a.gate_json else (None, '')           # F11, GC6-12
+            gj, gj_sha = read_json_sha(a.gate_json, '--gate-json') if a.gate_json else (None, '')   # GC9-11: one read
+            lu = None
+            if isinstance(gj, dict) and 'trang_thai_luot' in gj:                                  # F11, GC6-12
+                check_luoi_dict(gj, f'--gate-json {a.gate_json!r}')
+                lu = gj
             kn = lu is not None and lu['trang_thai_luot'] == KHONG_NUT
             if kn and not a.c8b_gio:
                 raise LogError('a c8b_luoi file without a scored node needs --c8b-gio (the time file of the run)')
             row = end(ds, a.outcome, a.completed, a.e_perp_max, a.fail_cause, a.results_dir, a.notes,
-                      gate=(None if kn else read_gate_json(a.gate_json, allow_null=a.outcome == 'hong_he_do'))
+                      gate=(None if kn else gate_of(gj, a.gate_json, allow_null=a.outcome == 'hong_he_do'))
                       if a.gate_json else None, gate_khong_nut=kn,
                       gate_sha256=gj_sha,
                       gate_path=a.gate_json if kn else '',

@@ -183,12 +183,27 @@ def _f08_log(tmp_path, monkeypatch):
     return p
 
 
+def test_gc6_14_hil_scorer_refuses_fake_marks(tmp_path, monkeypatch):
+    """GC6-14 (round 4): hil_o1_score reads the gate as rq3_log does: a FAKE gate only with the flag, FAKE marks never."""
+    p = _f08_log(tmp_path, monkeypatch)
+    g = _good()
+    gp = _write(tmp_path, g)
+    with pytest.raises(ValueError, match='FAKE'):
+        H.score(p, 'O1-F08', esp_log='esp.csv', gate_file=gp, stage='hil_check', campaign='B-PID')
+    g['c8_dir'] = 'C8'
+    gp2 = str(tmp_path / 'g2.json')
+    with open(gp2, 'w', encoding='utf-8') as f:
+        json.dump(g, f)
+    with pytest.raises(ValueError, match='FAKE'):
+        H.score(p, 'O1-F08', esp_log='esp.csv', gate_file=gp2, gate_file_fake=True, stage='hil_check', campaign='B-PID')
+
+
 def test_hil_score_with_and_without_the_gate_file(tmp_path, monkeypatch):
     p = _f08_log(tmp_path, monkeypatch)
     gp = _write(tmp_path, _good())
     plain = H.score(p, 'O1-F08', esp_log='esp.csv')['gate_v3']
-    b = H.score(p, 'O1-F08', esp_log='esp.csv', gate_file=gp, stage='hil_check', campaign='B-PID')['gate_v3']
-    fin = H.score(p, 'O1-F08', esp_log='esp.csv', gate_file=gp, stage='final_hil', campaign='RQ2')['gate_v3']
+    b = H.score(p, 'O1-F08', esp_log='esp.csv', gate_file=gp, gate_file_fake=True, stage='hil_check', campaign='B-PID')['gate_v3']
+    fin = H.score(p, 'O1-F08', esp_log='esp.csv', gate_file=gp, gate_file_fake=True, stage='final_hil', campaign='RQ2')['gate_v3']
     assert plain['version'] == b['version'] == fin['version'] == 'gate_v3.3'   # per-frame U (U_t known)
     assert plain['u_mode'] == 'khung' and plain['gate_file_sha256'] is None and plain['report_only'] == []
     assert b['report_only'] == ['g5'] and b['decide'] == ['g1', 'g2', 'g3', 'g4'] and b['complete'] is True
@@ -206,7 +221,7 @@ def test_hil_score_with_and_without_the_gate_file(tmp_path, monkeypatch):
 def test_hil_score_gate_accepted_by_rq3_log(tmp_path, monkeypatch):
     p = _f08_log(tmp_path, monkeypatch)
     gp = _write(tmp_path, _good())
-    g = rl._plain(H._json_safe(H.score(p, 'O1-F08', esp_log='esp.csv', gate_file=gp, stage='hil_check',
+    g = rl._plain(H._json_safe(H.score(p, 'O1-F08', esp_log='esp.csv', gate_file=gp, gate_file_fake=True, stage='hil_check',
                                        campaign='B-PID')['gate_v3']))
     req = rl.read_gate_file(gp, allow_fake=True).required('O1-F08', 'HIL', 'hil_check', 'B-PID')
     ev = rl.validate_gate(g, 'HIL', req)
@@ -1189,6 +1204,27 @@ def test_gc8_2_one_time_file_one_run_checked_on_the_sources(ds):
     rl._write_all(path, rl.TUNING_COLS, rows + [dict(rows[-1], run_uid=rows[-1]['run_uid'] + '_dup')])
     with pytest.raises(rl.LogError, match='GC8-2'):
         rl.summary(d)
+
+
+def test_gc9_10_end_applies_the_summary_rule(ds):
+    """GC9-10 (Codex round 4): an old F11 row with an empty c8b_gio_sha256 cell; end of a new run on the same H0 file
+    and time file is refused (the summary would refuse the log just written)."""
+    d, gf, tmp = ds
+    g = _gio(tmp, 'kn910_gio', ok=True)
+    p = _luoi(tmp, 'kn910', gio=g)
+    kw = dict(completed=1, results_dir=str(tmp), queries=rl.fake_queries(), gate_sha256=rl.sha256_file(p),
+              gate_khong_nut=True, c8b_gio=g, gate_path=p)
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    rl.end(d, 'chua_ket_luan', **kw)
+    path = os.path.join(d, rl.TUNING)
+    rows = rl.read_rows(path)
+    rows[-1]['c8b_gio_sha256'] = ''
+    rl._write_all(path, rl.TUNING_COLS, rows)
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    with pytest.raises(rl.LogError, match='GC8-2'):
+        rl.end(d, 'chua_ket_luan', **kw)
 
 
 def test_gc7_3_h1_of_its_own_task_and_time_file(ds):

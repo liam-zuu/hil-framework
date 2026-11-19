@@ -571,7 +571,8 @@ def _luoi(goc, rid, cell, fg, u_max, outcome='dat', clip=None, fg_obj=None, ops=
              script=dict(commit='c' * 40, dirty=False, luc_chay=LUC_CHAM), nodes_ok=[not lost, not lost],
              scorer=None if lost else dict(commit='5' * 40, dirty=False, nut=[]),
              nums=dict(g4=dict(hi=0.01, n_undef=0)), states={c: 'dat' for c in o1_gate.CONDS},
-             file_so_h=None, file_cham_h1=None, file_gio_h1=None)
+             file_so_h=None, file_cham_h1=None, file_gio_h1=None,
+             loai_hong=(['thao_tac'] if ops else ['he_do']) if lost else [])
     x.update(kw)
     return _jw(goc, f'luot/{rid}/luoi.json', x), mpp
 
@@ -605,8 +606,18 @@ def _git_commit(goc, rel, when):
     return c, run('show', '-s', '--format=%cI', c).stdout.decode().strip()
 
 
-SESSION = dict(marks={'1': [0.0, 0.0], '2': [1.0, 0.0], '3': [0.0, 1.0]}, fit_ids=[1, 2, 3],
+SESSION = dict(width=1920, height=1080, chosen='rational', model_khoa='rational',
+               marks={'1': [0.0, 0.0], '2': [1.0, 0.0], '3': [0.0, 1.0]}, fit_ids=[1, 2, 3],
                ref_corners_px={str(i): [[0, 0], [1, 0], [1, 1], [0, 1]] for i in (1, 2, 3)})
+
+
+def _drift(two, levels, clips, **kw):
+    x = dict(kind=GC.DRIFT_KIND, version=GC.DRIFT_VERSION, vuot=two, thieu_H1=False, tasks=list(levels) + ['O1-K1'],
+             trang_thai_vi_tri='so', trang_thai_huong='so', D_H_vi_tri_mm=3.0 if two else 0.5, D_H_huong_deg=0.1,
+             D_H_mm=3.0 if two else 0.5, eps_H_mm=1.0, eps_H_huong_deg=0.2, vuot_do_thieu=False,
+             s0_session_sha256=clips[0]['sha256'], s1_session_sha256=clips[2]['sha256'])
+    x.update(kw)
+    return x
 
 
 def build_c8(tmp_path, levels=LEVELS, u_t=0.014, two=False):
@@ -620,9 +631,7 @@ def build_c8(tmp_path, levels=LEVELS, u_t=0.014, two=False):
     clips = [_jw(goc, f'clip_h/{n}.json', dict(kind=GC.SESSION_KIND, ten=n, video=f'{n}_0{i}_IMG_900{i}.MOV',
                                                video_sha256=_h('video ' + n), **SESSION))
              for i, n in enumerate(names)]
-    dr = _jw(goc, 'drift.json', dict(kind=GC.DRIFT_KIND, vuot=two, thieu_H1=False, tasks=list(levels) + ['O1-K1'],
-                                     D_H_mm=3.0 if two else 1.0, eps_H_mm=2.0, s0_session_sha256=clips[0]['sha256'],
-                                     s1_session_sha256=clips[2]['sha256']))
+    dr = _jw(goc, 'drift.json', _drift(two, levels, clips))
     ev = dict(phan_loai_du=True, ban_cham_cuoi=True,
               bo_so=[dict(e_do_lo_vuot_D_moi_nut=False, e_do_xac_dinh_moi_nut=True,
                           g4_can_huu_han_mien_hop_moi_nut=True)] * (2 if two else 1))
@@ -1072,7 +1081,7 @@ def _add_lost(goc, d, ci, tag, lh, luoi_kw=None, gio_kw=None, gio=True, d1='dat'
     c['chuoi'].insert(0, dict(run_id=rid, clip='IMG_' + rid, ket_qua='hong', loai_hong=list(lh), kiem_gio_d1=d1,
                               dem_truot_kiem_gio=dem, file_cham=fc, file_gio=fg, file_chung_cu=None, file_so_h=None,
                               file_cham_h1=None, file_gio_h1=None, file_edo=None, file_edo_h1=None,
-                              file_log=_log(goc, rid) if gio else None, file_thao_tac=tt))
+                              file_log=_log(goc, rid), file_thao_tac=tt))
     _write_csv(goc, d)
     _fix_ho_so(goc, d)
     return c['chuoi'][0]
@@ -1098,11 +1107,11 @@ def test_gc6_1_chain_against_the_clip_log(tmp_path):
     _add_lost(goc, d, 0, 1, ['he_do'], luoi_kw=dict(loai_hong=['he_do']))
     GC.check_nguon(d, goc)                                             # a lost run then its rerun: passes
     _csv_edit(goc, d, lambda ls: ls[:2] + [ls[3], ls[2]] + ls[4:])      # rerun logged before the lost run
-    with pytest.raises(GC.GateFileError, match='in that order'):
+    with pytest.raises(GC.GateFileError, match='in that order|GC9-4'):
         GC.check_nguon(d, goc)
     d, goc = build_c8(tmp_path / 'b')                                  # a physical run left out of the chain
     _csv_edit(goc, d, lambda ls: ls[:2] + [f'IMG_X,{d["o_c8"][0]["o"]},,,,X.csv,'] + ls[2:])
-    with pytest.raises(GC.GateFileError, match='none left out'):
+    with pytest.raises(GC.GateFileError, match='none left out|GC9-4'):
         GC.check_nguon(d, goc)
     d, goc = build_c8(tmp_path / 'c')                                  # a figure-8 run outside the plan
     _csv_edit(goc, d, lambda ls: ls + ['IMG_Y,C8-P-F05-3,,,,Y.csv,'])
@@ -1110,7 +1119,7 @@ def test_gc6_1_chain_against_the_clip_log(tmp_path):
         GC.check_nguon(d, goc)
     d, goc = build_c8(tmp_path / 'd')                                  # the time file reads another log
     _csv_edit(goc, d, lambda ls: [ls[0], ls[1], ls[2].replace('.csv,', '_other.csv,')] + ls[3:])
-    with pytest.raises(GC.GateFileError, match='ESP32 log'):
+    with pytest.raises(GC.GateFileError, match='ESP32 log|thu_tu_clip.csv names'):
         GC.check_nguon(d, goc)
 
 
@@ -1158,16 +1167,13 @@ def test_gc6_5_the_c8b_lock(tmp_path):
 
 
 def test_gc6_2_lost_kinds_from_the_sources(tmp_path):
-    # a scoring lost at every node without its kinds: the counters cannot be recounted
-    d, goc = build_c8(tmp_path / 'a')
-    _add_lost(goc, d, 0, 1, ['he_do'])
-    with pytest.raises(GC.GateFileError, match='names no lost kind'):
-        GC.check_nguon(d, goc)
-    # kinds of the gate other than those of the sources (a reference-window loss declared as he_do: not counted)
-    d, goc = build_c8(tmp_path / 'b')
-    _add_lost(goc, d, 0, 1, ['he_do'], luoi_kw=dict(loai_hong=['cua_so_tham_chieu']))
-    with pytest.raises(GC.GateFileError, match='sources show'):
-        GC.check_nguon(d, goc)
+    # GC9-5 (round 4): luoi.json loai_hong recomputed from its node scores (c8b_luoi rule): none named on a grid lost at
+    # every node, or another kind than the node scores give, is refused
+    for name, lh in (('a', []), ('b', ['cua_so_tham_chieu'])):
+        d, goc = build_c8(tmp_path / name)
+        _add_lost(goc, d, 0, 1, ['he_do'], luoi_kw=dict(loai_hong=lh))
+        with pytest.raises(GC.GateFileError, match='c8b_luoi rule'):
+            GC.check_nguon(d, goc)
     # a run the sources show valid, declared lost (removed from the evidence)
     d, goc = build_c8(tmp_path / 'c')
     _add_lost(goc, d, 0, 1, ['cua_so_tham_chieu'], luoi_kw=dict(outcome='dat'))
@@ -1175,7 +1181,7 @@ def test_gc6_2_lost_kinds_from_the_sources(tmp_path):
         GC.check_nguon(d, goc)
     d, goc = build_c8(tmp_path / 'c2')                                 # Codex round 2: kinds on a scored grid
     _add_lost(goc, d, 0, 1, ['cua_so_tham_chieu'], luoi_kw=dict(outcome='dat', loai_hong=['cua_so_tham_chieu']))
-    with pytest.raises(GC.GateFileError, match='exactly when'):
+    with pytest.raises(GC.GateFileError, match='c8b_luoi rule'):
         GC.check_nguon(d, goc)
     # an operation the time file states that score.json does not (score.json wins, CODE 19/11)
     d, goc = build_c8(tmp_path / 'd')
@@ -1193,32 +1199,33 @@ def test_gc6_2_lost_kinds_from_the_sources(tmp_path):
     # Codex round 3: the grid names thao_tac, score.json and the time file none
     d, goc = build_c8(tmp_path / 'd3')
     _add_lost(goc, d, 0, 1, ['thao_tac', 'he_do'], luoi_kw=dict(loai_hong=['thao_tac', 'he_do']))
-    with pytest.raises(GC.GateFileError, match='disagrees with the operations of score.json'):
+    with pytest.raises(GC.GateFileError, match='c8b_luoi rule'):
         GC.check_nguon(d, goc)
     # a node score with other operations than score.json
     d, goc = build_c8(tmp_path / 'd4')
-    x = _add_lost(goc, d, 0, 1, ['thao_tac', 'he_do'], ops=('boot',), luoi_kw=dict(loai_hong=['thao_tac', 'he_do']))
+    x = _add_lost(goc, d, 0, 1, ['thao_tac'], ops=('boot',))
     GC.check_nguon(d, goc)
     lu = json.load(open(os.path.join(goc, x['file_cham']['duong_dan']), encoding='utf-8'))
     r = dict(duong_dan=lu['nguon_nut'][0]['duong_dan'], sha256=lu['nguon_nut'][0]['sha256'])
     _rewrite(goc, r, lambda y: y.update(thao_tac=[]))
     lu['nguon_nut'][0]['sha256'] = r['sha256']
     _rewrite(goc, x['file_cham'], lambda y: y.update(nguon_nut=lu['nguon_nut']))
-    with pytest.raises(GC.GateFileError, match='node score states other operations'):
+    with pytest.raises(GC.GateFileError, match='node score states other operations|c8b_luoi rule'):
         GC.check_nguon(d, goc)
-    # the time file lost (ok false, hong_he_do): the scoring file still names its kinds (round 2)
-    d, goc = build_c8(tmp_path / 'e')
-    _add_lost(goc, d, 0, 1, ['he_do'], gio_kw=dict(ok=False, ket_luan='hong_he_do'))
-    with pytest.raises(GC.GateFileError, match='names no lost kind'):
-        GC.check_nguon(d, goc)
+    # the time file lost (ok false, hong_he_do): he_do for the run
     d, goc = build_c8(tmp_path / 'e2')
-    _add_lost(goc, d, 0, 1, ['he_do'], gio_kw=dict(ok=False, ket_luan='hong_he_do'), luoi_kw=dict(loai_hong=['he_do']))
+    _add_lost(goc, d, 0, 1, ['he_do'], gio_kw=dict(ok=False, ket_luan='hong_he_do'))
     GC.check_nguon(d, goc)
+    # GC9-6 (round 4): a scored grid with a lost node carries that node's kind (c8b_luoi), the run is not lost
+    fc = dict(trang_thai_luot='cham', loai_hong=['he_do'])
+    assert GC._lost_kinds(fc, None, [], [dict(outcome='dat'), dict(outcome='hong_he_do')], 'x') == set()
+    with pytest.raises(GC.GateFileError, match='c8b_luoi rule'):
+        GC._lost_kinds(dict(fc, loai_hong=[]), None, [], [dict(outcome='dat'), dict(outcome='hong_he_do')], 'x')
     # M2 counted on a gain load error without a boot (Codex round 2)
-    lk = dict(loai_hong=['thao_tac', 'he_do'])
+    lk = dict(loai_hong=['thao_tac'])
     for name, ops, tb, dem, msg in [
             ('e3', ('loi_nap_gain',), dict(co_boot=False, t_boot_log_s=None, du_cua_so=True, trang_thai='truot',
-                                           thao_tac=['loi_nap_gain']), True, 'M2'),
+                                           thao_tac=['loi_nap_gain']), True, 'M2|GC6-2'),
             # a slip counted on a boot run needs the locked check run before the boot over its whole window
             ('f', ('boot',), dict(co_boot=True, t_boot_log_s=5.0, du_cua_so=False, trang_thai='khong_kiem',
                                   thao_tac=['boot']), True, 'M2'),
@@ -1227,7 +1234,10 @@ def test_gc6_2_lost_kinds_from_the_sources(tmp_path):
                                    thao_tac=['boot']), True, 'co_boot'),
             # an independent slip before the boot not counted: refused too (the counter is recomputed both ways)
             ('f3', ('boot',), dict(co_boot=True, t_boot_log_s=5.0, du_cua_so=True, trang_thai='truot',
-                                   thao_tac=['boot']), False, 'M2')]:
+                                   thao_tac=['boot']), False, 'M2'),
+            # Codex round 4: a boot without its time in the log, the whole window claimed before it
+            ('f4', ('boot',), dict(co_boot=True, t_boot_log_s=None, du_cua_so=True, trang_thai='truot',
+                                   thao_tac=['boot']), True, 'without a boot time')]:
         d, goc = build_c8(tmp_path / name)
         _add_lost(goc, d, 0, 1, ['thao_tac', 'he_do'], d1='truot', dem=dem, ops=ops, luoi_kw=lk,
                   gio_kw=dict(ok=False, ket_luan='hong_he_do', dem_truot_kiem_gio=dem,
@@ -1255,7 +1265,7 @@ def _ops(goc, d, x, ops):
         _rewrite(goc, r, lambda y: y.update(thao_tac=list(ops)))
         e['sha256'] = r['sha256']
     old = x['file_cham']['sha256']
-    _rewrite(goc, x['file_cham'], lambda y: y.update(nguon_nut=lu['nguon_nut']))
+    _rewrite(goc, x['file_cham'], lambda y: y.update(nguon_nut=lu['nguon_nut'], loai_hong=['thao_tac'] if ops else []))
     _relink(goc, d, x, old)
 
 
@@ -1268,7 +1278,7 @@ def test_gc6_3_two_scorings(tmp_path):
     # H0 dat, H1 khong_dat: the final outcome is chua_ket_luan (calib_drift_split), not dat
     d, goc = build_c8(tmp_path / 'b', two=True)
     x = d['o_c8'][0]['chuoi'][0]
-    _rewrite(goc, x['file_cham_h1'], lambda y: y.update(outcome='khong_dat'))
+    _rewrite(goc, x['file_cham_h1'], lambda y: (y.update(outcome='khong_dat'), y['states'].update(g2='khong_dat')))
     _rewrite(goc, x['file_chung_cu'], lambda y: y.update(nguon=[dict(file='luoi.json', sha256=x['file_cham']['sha256']),
                                                                dict(file='luoi.json', sha256=x['file_cham_h1']['sha256'])]))
     with pytest.raises(GC.GateFileError, match="outcome is 'chua_ket_luan'"):
@@ -1282,7 +1292,7 @@ def test_gc6_3_two_scorings(tmp_path):
         GC.check_nguon(d, goc)
     # the comparison says two scorings, the chain gives one
     d, goc = build_c8(tmp_path / 'd')
-    _rewrite(goc, d['o_c8'][0]['chuoi'][0]['file_so_h'], lambda y: y.update(vuot=True, D_H_mm=3.0))
+    _rewrite(goc, d['o_c8'][0]['chuoi'][0]['file_so_h'], lambda y: y.update(vuot=True, D_H_vi_tri_mm=3.0))
     for c in d['o_c8']:
         c['chuoi'][0]['file_so_h']['sha256'] = d['o_c8'][0]['chuoi'][0]['file_so_h']['sha256']
     with pytest.raises(GC.GateFileError, match='two scorings'):
@@ -1348,7 +1358,7 @@ def test_round3_evidence_g4_and_classification_from_the_grid(tmp_path):
     old = x['file_cham']['sha256']
     _rewrite(goc, x['file_cham'], lambda y: y['states'].pop('g4'))
     _relink(goc, d, x, old)
-    with pytest.raises(GC.GateFileError, match='recomputed from the scorings'):
+    with pytest.raises(GC.GateFileError, match='recomputed from the scorings|GC9-5'):
         GC.check_nguon(d, goc)
 
 
@@ -1576,11 +1586,23 @@ def test_gc6_3_the_drift_of_the_run_part(tmp_path):
         GC.check_nguon(d, goc)
     _csv_edit(goc, d, lambda ls: ls[:2] + [ls[-1]] + ls[2:-1])         # now every run is after it
     GC.check_nguon(d, goc)
-    d, goc = build_c8(tmp_path / 'b')                                 # vuot false with D_H above eps_H
-    _rewrite(goc, d['o_c8'][0]['chuoi'][0]['file_so_h'], lambda y: y.update(D_H_mm=100.0))
+    # GC9-3 (round 4): vuot recomputed with the gate thresholds (eps_H 1.0 mm, 0.2 deg), position and heading, never the
+    # threshold the drift file states; a missing quantity is vuot (TC3-10)
+    for name, edit in [('b', dict(D_H_vi_tri_mm=100.0)),
+                       ('b2', dict(D_H_vi_tri_mm=3.0, eps_H_mm=4.0)),          # Codex: 3 mm under the drift's 4 mm
+                       ('b3', dict(D_H_huong_deg=0.5)),                        # the heading branch of J section 5
+                       ('b4', dict(trang_thai_huong='thieu', D_H_huong_deg=None))]:
+        d, goc = build_c8(tmp_path / name)
+        _rewrite(goc, d['o_c8'][0]['chuoi'][0]['file_so_h'], lambda y: y.update(edit))
+        for c in d['o_c8']:
+            c['chuoi'][0]['file_so_h']['sha256'] = d['o_c8'][0]['chuoi'][0]['file_so_h']['sha256']
+        with pytest.raises(GC.GateFileError, match='GC9-3|vuot_do_thieu'):
+            GC.check_nguon(d, goc)
+    d, goc = build_c8(tmp_path / 'c')                                 # an old drift file (v1) is refused
+    _rewrite(goc, d['o_c8'][0]['chuoi'][0]['file_so_h'], lambda y: y.pop('version'))
     for c in d['o_c8']:
         c['chuoi'][0]['file_so_h']['sha256'] = d['o_c8'][0]['chuoi'][0]['file_so_h']['sha256']
-    with pytest.raises(GC.GateFileError, match='vuot = D_H > eps_H'):
+    with pytest.raises(GC.GateFileError, match='c7_calib_drift_v2'):
         GC.check_nguon(d, goc)
 
 
@@ -1679,8 +1701,7 @@ def _ghep(goc, ho_so='chuan_u/ho_so_ghep.json', **kw):
 def test_ghep_rebuilds_the_gate_from_its_sources(tmp_path, two, lost):
     d, goc = build_c8(tmp_path, two=two)
     if lost:                                       # a run lost to an operation (boot), then its rerun
-        _add_lost(goc, d, 0, 1, ['thao_tac', 'he_do'], ops=('boot',), luoi_kw=dict(loai_hong=['thao_tac', 'he_do']))
-        d['o_c8'][0]['chuoi'][1]['run_id'] = d['o_c8'][0]['o'] + '_lai1'    # ghep names a run by its buoc
+        _add_lost(goc, d, 0, 1, ['thao_tac'], ops=('boot',))
     for c in d['o_c8']:                            # ghep names a run by the buoc of its row
         for j, x in enumerate(c['chuoi']):
             x['run_id'] = c['o'] + (f'_lai{j}' if j else '')
@@ -1737,12 +1758,183 @@ def test_ghep_cli_and_refusals(tmp_path):
         _ghep(goc)
     # above eps_H without the second scoring
     d, goc = build_c8(tmp_path / 'f')
-    _rewrite(goc, d['o_c8'][0]['chuoi'][0]['file_so_h'], lambda y: y.update(vuot=True, D_H_mm=3.0))
+    _rewrite(goc, d['o_c8'][0]['chuoi'][0]['file_so_h'], lambda y: y.update(vuot=True, D_H_vi_tri_mm=3.0))
     old = d['o_c8'][0]['chuoi'][0]['file_cham']['sha256']
     _rewrite(goc, d['o_c8'][0]['chuoi'][0]['file_cham'],
              lambda y: y.update(file_so_h=d['o_c8'][0]['chuoi'][0]['file_so_h']))
     with pytest.raises(GC.GateFileError, match='second scoring is due'):
         _ghep(goc)
+
+
+# ── round 4 (Codex lượt chung 01a1f4d8; Liam qua CODE 20/11 "sửa phần độc lập ngay") ─────────────────────────────
+
+def _relink_nodes(goc, d, x, lu, **luoi_kw):
+    """luoi.json of run x rewritten with its node list lu['nguon_nut'] (and luoi_kw); evidence file and manifest tied."""
+    old = x['file_cham']['sha256']
+    _rewrite(goc, x['file_cham'], lambda y: y.update(nguon_nut=lu['nguon_nut'], **luoi_kw))
+    _rewrite(goc, x['file_chung_cu'], lambda y: y['nguon'][0].update(sha256=x['file_cham']['sha256']))
+    for m in d['camera']['c8b']['moc_dich']['nguon']['manifests']:
+        if json.load(open(os.path.join(goc, m['duong_dan']), encoding='utf-8'))['file_cham_sha256'] == old:
+            _rewrite(goc, m, lambda y: y.update(file_cham_sha256=x['file_cham']['sha256']))
+
+
+def test_round4_c8b_absolute_paths_and_missing_node_scores(tmp_path):
+    """GC9-1: c8b_luoi names node scores by absolute path (inside the C8 folder: accepted) and only the nodes with a
+    score file; a path outside the folder is still refused."""
+    d, goc = build_c8(tmp_path / 'a')
+    x = d['o_c8'][0]['chuoi'][0]
+    lu = json.load(open(os.path.join(goc, x['file_cham']['duong_dan']), encoding='utf-8'))
+    for e in lu['nguon_nut']:
+        e['duong_dan'] = os.path.abspath(os.path.join(goc, e['duong_dan']))
+    _relink_nodes(goc, d, x, lu)
+    GC.check_nguon(d, goc)
+    d, goc = build_c8(tmp_path / 'b')                                  # node 1 without a score file: not scored
+    x = d['o_c8'][0]['chuoi'][0]
+    lu = json.load(open(os.path.join(goc, x['file_cham']['duong_dan']), encoding='utf-8'))
+    lu['nguon_nut'] = lu['nguon_nut'][:1]
+    _relink_nodes(goc, d, x, lu, nodes_ok=[True, False])
+    for m in d['camera']['c8b']['moc_dich']['nguon']['manifests']:
+        if json.load(open(os.path.join(goc, m['duong_dan']), encoding='utf-8'))['file_cham_sha256'] == x['file_cham']['sha256']:
+            _rewrite(goc, m, lambda y: y.update(mien_da_tinh=y['mien_da_tinh'][:1]))
+    with pytest.raises(GC.GateFileError, match='finite G4|recomputed'):     # passes the node checks; G4 not finite
+        GC.check_nguon(d, goc)
+    d, goc = build_c8(tmp_path / 'c')
+    x = d['o_c8'][0]['chuoi'][0]
+    lu = json.load(open(os.path.join(goc, x['file_cham']['duong_dan']), encoding='utf-8'))
+    outside = tmp_path / 'c' / 'nut_out.json'
+    outside.write_text(json.dumps(json.load(open(os.path.join(goc, lu['nguon_nut'][0]['duong_dan']), encoding='utf-8'))),
+                       encoding='utf-8')
+    lu['nguon_nut'][0].update(duong_dan=str(outside), sha256=GC.sha256_file(str(outside)))
+    _relink_nodes(goc, d, x, lu)
+    with pytest.raises(GC.GateFileError, match='inside it'):
+        GC.check_nguon(d, goc)
+
+
+def test_round4_c8b_nguon_3b_absolute_path(tmp_path):
+    d, goc = build_c8(tmp_path)
+    src = _jw(goc, '3b/3b_F05.json', dict(version='c8b_3b'))
+    d['bo_cham']['bang_man_trap']['O1-F05'] = dict(nhanh='alpha', nguon_3b=dict(src))
+    _rewrite_khoa(goc, d, lambda k: k['bang_man_trap'].update({'O1-F05': dict(
+        nhanh='alpha', nguon_3b=dict(duong_dan=os.path.abspath(os.path.join(goc, src['duong_dan'])),
+                                     sha256=src['sha256']))}))
+    GC.check_nguon(d, goc)
+
+
+def test_round4_scoring_times_from_the_node_scorer_states(tmp_path):
+    """GC6-1 (C8B 19/11 khuya): a run is first scored when its first node is (scorer.nut[k].luc_chay), not when
+    luoi.json is written; a node scored before the C8b lock is refused."""
+    d, goc = build_c8(tmp_path)
+    x = d['o_c8'][0]['chuoi'][0]
+    old = x['file_cham']['sha256']
+    _rewrite(goc, x['file_cham'], lambda y: y['scorer'].update(
+        nut=[dict(commit='5' * 40, dirty=False, luc_chay='2026-11-21T07:30:00+07:00')]))
+    _relink(goc, d, x, old)
+    with pytest.raises(GC.GateFileError, match='not before the first scoring of a C8 run'):
+        GC.check_nguon(d, goc)
+
+
+def test_round4_node_without_score_not_ok_and_lost_run_log(tmp_path):
+    """GC6-6: a node without a score file kept as ok is refused; GC6-1 (round 4): a lost run without a time file still
+    carries the log thu_tu_clip.csv names."""
+    d, goc = build_c8(tmp_path / 'a')
+    x = d['o_c8'][0]['chuoi'][0]
+    lu = json.load(open(os.path.join(goc, x['file_cham']['duong_dan']), encoding='utf-8'))
+    lu['nguon_nut'] = lu['nguon_nut'][:1]
+    _relink_nodes(goc, d, x, lu)                                       # nodes_ok stays [True, True]
+    with pytest.raises(GC.GateFileError, match='no score file'):
+        GC.check_nguon(d, goc)
+    d, goc = build_c8(tmp_path / 'b')
+    x = _add_lost(goc, d, 0, 1, ['he_do'], gio=False, d1='khong_kiem')
+    GC.check_nguon(d, goc)
+    x['file_log'] = None
+    with pytest.raises(GC.GateFileError, match='carries it'):
+        GC.check_nguon(d, goc)
+
+
+def test_round4_held_out_is_every_run(tmp_path):
+    d, goc = build_c8(tmp_path)
+    _rewrite(goc, d['chuan_u']['ho_so_c8'], lambda y: y.update(giu_ngoai=y['giu_ngoai'][1:]))
+    with pytest.raises(GC.GateFileError, match='GC9-2'):
+        GC.check_nguon(d, goc)
+
+
+def test_round4_chain_starts_with_the_run_itself(tmp_path):
+    """GC9-4 (Codex): a cell whose only row is <run>_lai2 is refused."""
+    d, goc = build_c8(tmp_path)
+    _csv_edit(goc, d, lambda ls: [ls[0], ls[1], ls[2].replace(',O1-F02_PID,', ',O1-F02_PID_lai2,')] + ls[3:])
+    with pytest.raises(GC.GateFileError, match='GC9-4'):
+        GC.check_nguon(d, goc)
+
+
+def test_round4_grid_outcome_from_its_states(tmp_path):
+    """GC9-5 (Codex): five states dat but outcome khong_dat is refused; report_only conditions do not decide."""
+    d, goc = build_c8(tmp_path / 'a')
+    x = d['o_c8'][0]['chuoi'][0]
+    old = x['file_cham']['sha256']
+    _rewrite(goc, x['file_cham'], lambda y: y.update(outcome='khong_dat'))
+    _relink(goc, d, x, old)
+    with pytest.raises(GC.GateFileError, match='GC9-5'):
+        GC.check_nguon(d, goc)
+    fc = dict(trang_thai_luot='cham', outcome='dat', report_only=['g5'],
+              states=dict(g1='dat', g2='dat', g3='dat', g4='dat', g5='khong_dat'))
+    GC._grid_outcome(fc, [], 'x')
+    with pytest.raises(GC.GateFileError, match='GC9-5'):
+        GC._grid_outcome(dict(fc, report_only=[]), [], 'x')
+
+
+def test_round4_lost_node_offset_and_nodes_ok(tmp_path):
+    """GC6-6 (round 4): a lost node score with the node time of another node, or a lost node kept as ok, is refused."""
+    for name, edit, ok, msg in [('a', lambda y: y.update(offset_s=0.0), [True, False], 'offset_s'),
+                                ('b', lambda y: None, [True, True], 'nodes_ok')]:
+        d, goc = build_c8(tmp_path / name)
+        x = d['o_c8'][0]['chuoi'][0]
+        lu = json.load(open(os.path.join(goc, x['file_cham']['duong_dan']), encoding='utf-8'))
+        r = dict(duong_dan=lu['nguon_nut'][1]['duong_dan'], sha256=lu['nguon_nut'][1]['sha256'])
+        _rewrite(goc, r, lambda y: (y.pop('khung_tuong_doi_v1'), y.update(outcome='hong_he_do'), edit(y)))
+        lu['nguon_nut'][1]['sha256'] = r['sha256']
+        _relink_nodes(goc, d, x, lu, hong_nut=[False, True], nodes_ok=ok, loai_hong=['he_do'])
+        with pytest.raises(GC.GateFileError, match=msg):
+            GC.check_nguon(d, goc)
+
+
+def test_round4_session_fields_kiemcheo_reads(tmp_path):
+    """GC6-4 (round 4): width, height, chosen = model_khoa, as c7_kiem_cheo reads the session."""
+    for name, edit in [('a', lambda s: s.pop('width')), ('b', lambda s: s.update(model_khoa='other')),
+                       ('c', lambda s: s.pop('chosen'))]:
+        d, goc = build_c8(tmp_path / name)
+        m = d['tien_de_c8']['clip_h']['dau'][1]
+        _rewrite(goc, m, edit)
+        _rewrite(goc, d['tien_de_c8']['file'], lambda x: x['sha256']['sessions'].update(H_b=m['sha256']))
+        with pytest.raises(GC.GateFileError, match='camera session file'):
+            GC.check_nguon(d, goc)
+
+
+def test_round4_ghep_ignores_copies_and_cleans_its_dossier(tmp_path):
+    """GC9-7: a second e_do of the same time file and a copy of the S7 manifest do not change the gate; GC9-8: the
+    dossier path is checked before writing and taken back when the gate is refused."""
+    d, goc = build_c8(tmp_path / 'a')
+    x = d['o_c8'][0]['chuoi'][0]
+    e = json.load(open(os.path.join(goc, x['file_edo']['duong_dan']), encoding='utf-8'))
+    _jw(goc, 'aaa/edo_copy.json', dict(e, trang_thai='chua_ket_luan'))
+    with open(os.path.join(goc, 'khoa_s7.json'), 'rb') as f:
+        raw = f.read()
+    os.makedirs(os.path.join(goc, 'aaa'), exist_ok=True)
+    with open(os.path.join(goc, 'aaa', 'khoa_s7_copy.json'), 'wb') as f:
+        f.write(raw)
+    _rewrite(goc, dict(duong_dan='kiem_cheo.json', sha256=GC.sha256_file(os.path.join(goc, 'kiem_cheo.json'))),
+             lambda y: y['khoa_s7'].update(file=os.path.abspath(os.path.join(goc, 'khoa_s7.json'))))
+    g = _ghep(goc)
+    assert g['o_c8'][0]['chuoi'][0]['file_edo'] == x['file_edo']
+    GC.write_gate(str(tmp_path / 'g.json'), g, goc)
+    d, goc = build_c8(tmp_path / 'b')
+    with pytest.raises(GC.GateFileError, match='inside it'):
+        _ghep(goc, ho_so='../outside.json')
+    assert not os.path.exists(os.path.join(goc, '..', 'outside.json'))
+    _rewrite(goc, d['tien_de_c8']['file'], lambda y: y.update(ket_qua='khong_dat'))     # the gate is refused
+    with pytest.raises(GC.GateFileError, match='CAN LIAM QUYET'):
+        GC.ghep_va_ghi(str(tmp_path / 'b.json'), goc, 'ke_hoach_c8.json', 'thu_tu_clip.csv', 'c8b_khoa_v5.json',
+                       'tien_de_c8.json', 'kiem_cheo.json', dict(BANG_CHUNG), 'chuan_u/ho_so_new.json')
+    assert not os.path.exists(os.path.join(goc, 'chuan_u', 'ho_so_new.json'))
 
 
 def test_round3_log_hashed_and_named(tmp_path):
