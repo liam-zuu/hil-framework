@@ -4,13 +4,19 @@ vel_ctrl.c (AGV 5bde4c5 when the DLL is built from it), plus a normal run as the
 
 Cases (car standing still, as before every O1 run; the cases test the firmware's logic, not dynamics):
   ok          yaw valid at the rising edge of run_active: latched at the edge (control, must pass)
-  mat_yaw     yaw lost at the edge (no game-RV report for > t_age), never back during the run
-  chot_muon   late latch: (a) yaw lost at the edge, back 300 ms later, psi0 latched then;
-              (b) yaw valid but old at the edge (no report for 90 ms < t_age 125 ms)
+  mat_yaw     yaw lost at the edge (no IMU report, RV, gyro and accel alike, from 200 ms before the edge:
+              older than t_age 125 ms), never back during the run
+  chot_muon   late latch: (a) no report from 200 ms before to 300 ms after the edge, psi0 latched on the
+              first tick after the next report (+310 ms); (b) no report for 90 ms before the edge: the last
+              one is 96.3 ms old (< t_age), the firmware latches it on the edge tick
   reset_giua  reset in the middle of the run: (a) chip reset (SH2 reset, reset_n + 1);
-              (b) yaw lost for 1 s while wz_ref turns psi_ref, back with |e| > e_psi_reset;
-              (c) run_active drops for 300 ms (trajectory timeout) and comes back
-  canh_doi_mode  extra: PID <-> LADRC change on the tick before the edge (yaw valid, latch 1 tick late)
+              (b) no report for 1 s while wz_ref turns psi_ref (r_valid 0 from +1.08 s), back at
+              +2.01 s with |e| > e_psi_reset; (c) run_active forced to 0 for 300 ms (as a trajectory
+              timeout would): the controller's reaction
+  canh_doi_mode  extra, injected: a controller-mode event (vel_ctrl_set_mode) on the tick before the edge;
+              checks heading.c's priority of reset_event over the start of the run. Not reachable on the
+              car at 5bde4c5: nothing outside vel_ctrl.c calls vel_ctrl_set_mode and gain_set.c refuses
+              a gain set for the other controller (GAIN_ERR_CTRL)
 
 Each case writes the log rows the firmware would push (main.c push_log, logger.c columns of the same
 name and print format) and judges them with ref_cond1(): a reference reading of J section 5 (1) for
@@ -19,9 +25,12 @@ is only for the demo and is not a proposal.
 
   python fwsim/t9_heading_cases.py --out <dir> [--age-max-ms 60]
 
-rv_n and reset_n are the counters the firmware copies from imu_data_t (main.c push_log: imu->rv_n,
-imu->reset_n); fw_sim.c keeps them in the same struct but does not export them, so this script
-counts the reports and resets it hands to the DLL (same increments as fw_sim.c).
+The rows are built here from the controller outputs of the DLL (fw_sim.c does not compile main.c,
+logger.c, imu.cpp); column names and print formats as logger.c. rv_n and reset_n are the counters the
+firmware copies from imu_data_t (main.c push_log: imu->rv_n, imu->reset_n); fw_sim.c keeps them in the
+same struct but does not export them, so this script counts the reports and resets it hands to the DLL
+(same increments as fw_sim.c). Report n carries yaw YAW0_DEG + n * YAW_STEP_DEG, so a test can tell
+which report psi0 took.
 """
 from __future__ import annotations
 
@@ -41,6 +50,7 @@ RV_PERIOD_US = 50_000             # IMU_REPORT_PERIOD_US of the main env and lad
 RV_PHASE_US = 3_700               # report phase against the tick grid (any value not on the grid)
 T0_US = 1_000_000
 YAW0_DEG = 30.0                   # yaw of the standing car (any value: psi0 takes it)
+YAW_STEP_DEG = 0.01               # report n carries yaw YAW0_DEG + n * YAW_STEP_DEG: tells which report psi0 took
 EDGE_US = T0_US + 2_000_000       # run_active rises on the first tick at or after this time
 RUN_US = 3_000_000
 SP_RUN = (0.0, 0.0, 0.3)          # wz_ref during the run, so psi_ref integrates (counts stay 0: car held)
@@ -78,8 +88,8 @@ def cases():
         Case('reset_giua_a', resets=(e + 1_000_000,)),
         Case('reset_giua_b', drop=((e + 1_000_000, e + 2_000_000),)),
         Case('reset_giua_c', run=((e, e + 1_000_000), (e + 1_300_000, e + RUN_US))),
-        # extra: PID <-> LADRC change applied on the tick just before the edge (gain set, motor off):
-        # reset_event on the edge tick, yaw valid, latch one tick late
+        # extra, injected: mode event on the tick just before the edge (not reachable on the car, see
+        # the module docstring): reset_event on the edge tick, yaw valid, latch one tick late
         Case('canh_doi_mode', mode_at=(e - TICK_US,)),
     ]
 
@@ -112,8 +122,8 @@ def simulate(fw, case):
             elif not case.dropped(te):
                 fw.imu_report('gyro', te, 0.0)
                 fw.imu_report('accel', te, (0.0, 0.0, 9.80665))
-                fw.imu_report('rv', te, YAW0_DEG)
                 rv_n += 1
+                fw.imu_report('rv', te, YAW0_DEG + rv_n * YAW_STEP_DEG)
         ra = case.run_active(t)
         fw.set_run(ra)
         fw.tick(t, (0, 0, 0, 0), SP_RUN if ra else (0.0, 0.0, 0.0))
@@ -126,7 +136,7 @@ def simulate(fw, case):
                      'r_valid': int(m['r_valid']), 'age_r_ms': m['age_r_ms'], 'rv_n': rv_n, 'reset_n': reset_n,
                      'head_on': int(m['head_on']), 'psi_ref': m['psi_ref'], 'e_psi': m['e_psi'],
                      'psi_reset_count': int(m['psi_reset_count']), 'pos_reset_n': int(p['pos_reset_n']),
-                     'yaw_rad': m['yaw'], 'wz_cmd': m['wz_cmd']})
+                     'yaw_rad': m['yaw'], 'wz_cmd': m['wz_cmd'], '_psi_imu': m['psi_imu']})
         t += TICK_US
     return rows
 
@@ -139,43 +149,70 @@ def as_logged(rows):
     return out
 
 
-def ref_cond1(rows, age_max_ms):
-    """Reference reading of J v6 section 5 command-path condition (1) on log rows of one run (sorted by
-    log_seq). Returns (bad, reasons, info). The run window here: the first run_active rising edge to the
-    last row with run_active = 1 (the scorer uses its own end anchor); a run_active drop inside it is a
-    firmware pose reset (pos_reset_n changes on the re-edge).
+def _num(r, k):
+    """Field as a finite number, or None (missing, empty, not a number, NaN/inf)."""
+    try:
+        v = float(r.get(k))
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
 
-    Edge row (O1 v11.41 v8, T9 rule): r_valid = 1, head_on = 1, psi_ref = 0.
-    Whole window: psi_reset_count, reset_n, pos_reset_n constant.
-    Yaw age at the latch (J section 5 (1)): upper bound = age_r_ms (log, 0.1 ms) + 0.05 ms + gap to the
-    next row (rigorous bound of tick start -> latch, T9 doc section 2); missing next row (log_seq not +1),
-    missing age or flags -> not determinable -> bad."""
-    reasons = []
-    info = {}
-    i_edge = next((i for i in range(1, len(rows))
-                   if rows[i]['run_active'] == 1 and rows[i - 1]['run_active'] != 1), None)
+
+def ref_cond1(rows, age_max_ms, end_seq=None):
+    """Reference reading of J v6 section 5 command-path condition (1) on the log rows of one run (one boot,
+    sorted by log_seq). Not the scorer: the scorer has its own edge, end anchor and failure order (J section
+    5: operator first; a boot inside the run is an operator failure before this check).
+    Returns (bad, reasons, info); when bad, info['loai'] is 'he_do' (measurement-system failure: the row
+    just before the edge is missing, O1 v11.41 v8 line 94) or 'duong_lenh'.
+
+    Window: the edge to end_seq (the scorer's end anchor; default the last run_active = 1 row), every row
+    in it, run_active = 0 stretches included; counters are compared with their value on the edge row.
+    Edge row: r_valid = 1, head_on = 1, psi_ref = 0 (O1 v8 line 94), and rv_n > 0 (J line 127).
+    Yaw age at the latch (J line 127), in integer microseconds: age_r_ms as printed (0.1 ms) + 50 us
+    (half print step) + gap to the next row (tick start -> latch <= gap, T9 doc section 2) + 3 us (1 us
+    clock steps at three stamps, float conversion); only when the edge row shows the latch (r_valid = 1,
+    rv_n > 0, head_on = 1) and the next row has log_seq + 1 and a later timestamp; otherwise not
+    determinable, which J counts as bad. Bad when the bound exceeds age_max_ms."""
+    reasons, info = [], {}
+    seq = [_num(r, 'log_seq') for r in rows]
+    ra = [_num(r, 'run_active') for r in rows]
+    i_edge = next((i for i in range(1, len(rows)) if ra[i] == 1 and ra[i - 1] != 1), None)
     if i_edge is None:
-        return True, ['no_edge'], info
+        return True, ['no_edge'], {'loai': 'duong_lenh'}
     e = rows[i_edge]
-    info['edge_seq'] = e['log_seq']
-    if not (e['r_valid'] == 1 and e['head_on'] == 1 and e['psi_ref'] == 0.0):
+    info['edge_seq'] = seq[i_edge]
+    if seq[i_edge] is None or seq[i_edge - 1] != seq[i_edge] - 1:
+        return True, ['thieu_dong_truoc_canh'], dict(info, loai='he_do')
+    latched = _num(e, 'r_valid') == 1 and (_num(e, 'rv_n') or 0) > 0 and _num(e, 'head_on') == 1
+    if not (latched and _num(e, 'psi_ref') == 0.0):
         reasons.append('edge_not_latched')
-    i_end = max(i for i in range(len(rows)) if rows[i]['run_active'] == 1)
+    if end_seq is None:
+        i_end = max(i for i in range(len(rows)) if ra[i] == 1)
+    else:
+        i_end = max(i for i in range(len(rows)) if seq[i] is not None and seq[i] <= end_seq)
     win = rows[i_edge:i_end + 1]
     for c in ('psi_reset_count', 'reset_n', 'pos_reset_n'):
-        vals = sorted({r[c] for r in win})
-        if len(vals) > 1:
+        base = _num(e, c)
+        vals = {_num(r, c) for r in win}
+        if base is None or vals != {base}:
             reasons.append(f'{c}_changed')
-            info[c] = vals
+            info[c] = sorted(vals, key=lambda v: (v is None, v))
+    age = _num(e, 'age_r_ms')
     nxt = rows[i_edge + 1] if i_edge + 1 < len(rows) else None
-    if nxt is None or nxt['log_seq'] != e['log_seq'] + 1 or e['r_valid'] != 1 or not math.isfinite(e['age_r_ms']):
+    gap_us = None
+    if nxt is not None and seq[i_edge + 1] == seq[i_edge] + 1:
+        t0, t1 = _num(e, 'timestamp_us'), _num(nxt, 'timestamp_us')
+        if t0 is not None and t1 is not None and t1 > t0:
+            gap_us = int(t1 - t0)
+    if not latched or age is None or gap_us is None:
         reasons.append('age_bound_undetermined')
     else:
-        gap_ms = (nxt['timestamp_us'] - e['timestamp_us']) / 1000.0
-        bound = e['age_r_ms'] + 0.05 + gap_ms
-        info.update(age_r_ms=e['age_r_ms'], gap_ms=gap_ms, age_bound_ms=round(bound, 3))
-        if bound > age_max_ms:
+        bound_us = int(round(age * 10)) * 100 + 50 + gap_us + 3
+        info.update(age_r_ms=age, gap_ms=gap_us / 1000, age_bound_ms=bound_us / 1000)
+        if bound_us > int(round(age_max_ms * 1000)):
             reasons.append('age_bound_over')
+    if reasons:
+        info['loai'] = 'duong_lenh'
     return bool(reasons), reasons, info
 
 

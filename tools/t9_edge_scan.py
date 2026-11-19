@@ -1,10 +1,13 @@
 """T9 (J v6 section 5 (1), section 7): read ESP32 logs for the heading-loop latch and the tick start ->
 latch interval. Analysis only, nothing is written next to the data.
 
-  edges <log.csv ...>   every run_active rising edge in agv_logger CSVs: edge-row r_valid, head_on,
-                        psi_ref, age_r_ms; counters on the run_active stretch; gap to the next row
-                        (rigorous bound of tick start -> latch, see below) and age bound
-                        age_r_ms + 0.05 + gap; plus all motor-on consecutive-row gaps
+  edges <log.csv ...>   every run_active rising edge in agv_logger CSVs (one boot per file assumed):
+                        edge-row r_valid, rv_n, head_on, psi_ref, pos_reset_n, age_r_ms; counters from the
+                        edge to the last run_active row before the next rising edge; gap to the next row
+                        (bound of tick start -> latch, see below) and, only when the row before the edge
+                        is log_seq - 1, the edge shows the latch (r_valid 1, rv_n > 0, head_on 1) and the
+                        gap is > 0, the age bound age_r_ms + 50 us + gap + 3 us (integer us, as ref_cond1
+                        of fwsim/t9_heading_cases.py); plus all motor-on consecutive-row gaps
   s06 <run_dir ...>     S06 runs (env s06_load, pi/esp/esp32_data.txt + esp32_events.txt): P line
                         t_before (first compare write of the tick, after vel_ctrl_step) minus t_now of
                         the same tick (latest data row timestamp_us <= t_before, next row log_seq + 1)
@@ -53,20 +56,28 @@ def edges(paths):
             if not (rs[i]['run_active'] == '1' and rs[i - 1]['run_active'] != '1'):
                 continue
             e = rs[i]
+            # stretch of this edge: up to the row before the next rising edge (run_active = 0 rows inside
+            # included), so a reset during a drop shows; the scorer uses its own end anchor
             j = i
-            while j + 1 < len(rs) and rs[j + 1]['run_active'] == '1':
+            while j + 1 < len(rs) and not (rs[j + 1]['run_active'] == '1' and rs[j]['run_active'] != '1'):
                 j += 1
+            while j > i and rs[j]['run_active'] != '1':       # trailing motor-off / idle rows are not the run
+                j -= 1
             ch = {k: sorted({r[k] for r in rs[i:j + 1]}) for k in ('psi_reset_count', 'reset_n', 'pos_reset_n')}
             ch = {k: v for k, v in ch.items() if len(v) > 1}
+            dseq_prev = int(e['log_seq']) - int(rs[i - 1]['log_seq'])
+            latched = e['r_valid'] == '1' and int(e['rv_n']) > 0 and e['head_on'] == '1'
             nxt = rs[i + 1] if i + 1 < len(rs) else None
-            gap = ((int(nxt['timestamp_us']) - int(e['timestamp_us'])) / 1000
-                   if nxt and int(nxt['log_seq']) == int(e['log_seq']) + 1 else None)
-            bound = float(e['age_r_ms']) + 0.05 + gap if gap is not None else None
-            if bound is not None:
+            gap_us = (int(nxt['timestamp_us']) - int(e['timestamp_us'])
+                      if nxt and int(nxt['log_seq']) == int(e['log_seq']) + 1 else None)
+            bound = None
+            if dseq_prev == 1 and latched and gap_us is not None and gap_us > 0:
+                bound = (round(float(e['age_r_ms']) * 10) * 100 + 50 + gap_us + 3) / 1000
                 bounds.append(bound)
-            print(f"{os.path.relpath(path)}: seq={e['log_seq']} dseq_prev={int(e['log_seq']) - int(rs[i - 1]['log_seq'])} "
-                  f"r_valid={e['r_valid']} head_on={e['head_on']} psi_ref={e['psi_ref']} e_psi={e['e_psi']} "
-                  f"age_r_ms={e['age_r_ms']} gap_ms={gap} bound_ms={None if bound is None else round(bound, 2)} "
+            print(f"{os.path.relpath(path)}: seq={e['log_seq']} dseq_prev={dseq_prev} "
+                  f"r_valid={e['r_valid']} rv_n={e['rv_n']} head_on={e['head_on']} psi_ref={e['psi_ref']} "
+                  f"e_psi={e['e_psi']} pos_reset_n={e['pos_reset_n']} age_r_ms={e['age_r_ms']} "
+                  f"gap_ms={None if gap_us is None else gap_us / 1000} bound_ms={bound} "
                   f"rows={j - i + 1} changed={ch}")
     if bounds:
         b = sorted(bounds)
