@@ -1475,6 +1475,181 @@ def tung_khung(a):
           f"{thieu_luot}; thieu neo: {thieu_neo}; mau thuan: {mau}; hoan tat: {out['hoan_tat']}")
 
 
+# ---------------------------------------------------------------- F15 (a) meo_ma_ao_E, (b) meo_dau_chan_bang
+# Contract F15 (CODE 19/11, C8B confirmed the names; KIEMCHEO sets the fields): map residual field held - full of the
+# H32 floor marks, carried to points in the car_pose lifted convention (p = pix2floor(uv, 0), P = p + kappa (C - p)).
+MEO_E_SCHEMA = 'c7_meo_ma_ao_E_v1'
+MEO_BANG_SCHEMA = 'c7_meo_dau_chan_bang_v1'
+
+
+def lift(p, kappa, C):
+    return np.asarray(p, float) + kappa * (np.asarray(C, float) - np.asarray(p, float))
+
+
+def unlift(P, kappa, C):
+    return (np.asarray(P, float) - kappa * np.asarray(C, float)) / (1.0 - kappa)
+
+
+def map_residual(cam_full, cam_held, P, kappa, C):
+    """Lifted points P (n, 2) of the scoring convention: the pixel the scoring (full) camera gives them, measured back
+    through the held camera, lifted the same way: P_held - P [m] (held - full)."""
+    P = np.asarray(P, float).reshape(-1, 2)
+    uv = cam_full.project(np.column_stack([unlift(P, kappa, C), np.zeros(len(P))]))
+    d = lift(cam_held.pix2floor(uv, 0.0), kappa, C) - P
+    if not np.all(np.isfinite(d)):
+        raise KCError('non-finite map residual')
+    return d
+
+
+def held_cases(pc, marks, centre, r_xp=None):
+    """H32 hold-out cases around a footprint centre: 'bo_vung' (every mark within R_XP of it, at least the 3 nearest)
+    and 'bo_cap:s-j' for every pair of those marks. Returns [(name, ids left out, camera)]; a failed fit is skipped
+    and listed in the second return value."""
+    reg = start_regions(marks, {'x': tuple(centre)}, R_XP_M if r_xp is None else r_xp)['x']['moc']
+    cases, hong = [], []
+    for name, out in [('bo_vung', tuple(reg))] + [(f'bo_cap:{a}-{b}', (a, b)) for k, a in enumerate(reg)
+                                                   for b in reg[k + 1:]]:
+        try:
+            cases.append((name, sorted(out), pc(out)))
+        except Exception as e:
+            hong.append(dict(ca=name, ly_do=str(e)[:200]))
+    if not cases:
+        raise KCError('no H32 hold-out camera could be fitted')
+    return cases, hong
+
+
+def _session_ctx(path, want_sha, model):
+    """(session dict, sha, PairCams, scoring camera, kappa, C) from the bytes of the session file (sha must be
+    want_sha when given)."""
+    s, sha = load_json_sha(path)
+    if want_sha is not None and sha != want_sha:
+        raise KCError(f'{path}: sha256 {sha} is not the one the source names {want_sha}')
+    img, mk, w, h, zc = clip_from_session(s, model)
+    for k in ('camera', 'kappa', 'plumb_xy_m'):
+        if k not in s:
+            raise KCError(f'{path}: session without {k} (car_pose convention)')
+    return s, sha, mk, PairCams(img, mk, model, w, h, zc), cm.cam_from_dict(s['camera']), float(s['kappa']), \
+        np.asarray(s['plumb_xy_m'], float)
+
+
+def _with_sha(obj):
+    obj['sha256'] = hashlib.sha256(json.dumps({k: v for k, v in obj.items() if k != 'sha256'}, ensure_ascii=False,
+                                              sort_keys=True).encode()).hexdigest()
+    return obj
+
+
+def meo_E(a):
+    """F15 (a): for the E frames of one place (cua_so_v1 rows E_dau .. E_cuoi of the clip, valid frames of the E
+    track), the 4 virtual tag corners (ArUco order, body = c7_measure.car_corners_body) at the measured tag pose,
+    map residual held - full per H32 case."""
+    if a.cho not in CHO:
+        raise KCError(f'--cho {a.cho!r}: goc|K1|K2')
+    tr, tr_sha = load_json_sha(os.path.join(a.track, 'track.json'))
+    fp = os.path.join(a.track, 'frames.csv')
+    with open(fp, 'rb') as f:
+        fb = f.read()
+    fr_sha = hashlib.sha256(fb).hexdigest()
+    if tr.get('frames_sha256') not in (None, fr_sha):
+        raise KCError('E track: frames.csv is not the one of track.json')
+    s, ses_sha, mk, pc, full, kappa, C = _session_ctx(a.session, tr.get('session_sha256'), a.model)
+    rows = [json.loads(x) for x in open(a.cua_so, encoding='utf-8').read().splitlines() if x.strip()]
+    cs_sha = sha256_file(a.cua_so)
+    ew = [r for r in rows if r.get('cho') == a.cho and r.get('loai') in ('E_dau', 'E_cuoi')
+          and r.get('clip_sha256') == tr.get('video_sha256')]
+    if {r['loai'] for r in ew} != {'E_dau', 'E_cuoi'}:
+        raise KCError(f'cua_so_v1: no E_dau / E_cuoi window of {a.cho} for this clip')
+    for r in ew:
+        if r.get('frames_sha256') not in (None, fr_sha) or r.get('session_sha256') not in (None, ses_sha):
+            raise KCError('cua_so_v1: E window of another frames / session')
+    lo = min(k['id'] for r in ew if r['loai'] == 'E_dau' for k in r['khung'])
+    hi = max(k['id'] for r in ew if r['loai'] == 'E_cuoi' for k in r['khung'])
+    import io
+    fr = [r for r in csv.DictReader(io.StringIO(fb.decode('utf-8'))) if _true(r.get('valid'))
+          and lo <= int(r['idx']) <= hi and r.get('tag_x') not in ('', None)]
+    if not fr:
+        raise KCError('no valid E frame between E_dau and E_cuoi')
+    side = float(s['car_side_m'])
+    dpsi0 = float((tr.get('tag_offset') or [0.0, 0.0, 0.0])[2])
+    body = cm.car_corners_body(side)
+    P_all = []
+    for r in fr:
+        c = np.array([float(r['tag_x']), float(r['tag_y'])])
+        P_all.append(body @ _rot(float(r['psi']) + dpsi0).T + c)
+    cases, hong = held_cases(pc, mk, np.mean([P.mean(axis=0) for P in P_all], axis=0), a.r_xp)
+    khung = []
+    for r, P in zip(fr, P_all):
+        khung.append(dict(frame_id=int(r['idx']), t_s=float(r['t_s']),
+                          goc_m=[[float(v) for v in x] for x in P],
+                          du_m={n: [[float(v) for v in x] for x in map_residual(full, cam, P, kappa, C)]
+                                for n, _, cam in cases}))
+    out = _with_sha(dict(
+        schema=MEO_E_SCHEMA, cho=a.cho, chieu='held_minus_full', bo_H32=True, truoc_le=True,
+        thu_tu_goc='ArUco 0..3 (c7_measure.car_corners_body: truoc-trai, truoc-phai, sau-phai, sau-trai)',
+        clip_sha256=tr.get('video_sha256'), frames_sha256=fr_sha, track_sha256=tr_sha, cua_so_v1_sha256=cs_sha,
+        ban_do=dict(phien_ban=VERSION, session_file=os.path.abspath(a.session), session_sha256=ses_sha,
+                    full='session.camera', ca=[dict(ten=n, bo_ids=ids) for n, ids, _ in cases], ca_hong=hong,
+                    R_XP_M=R_XP_M if a.r_xp is None else a.r_xp),
+        h_m=float(s['tag_h_m']), kappa=kappa, plumb_xy_m=[float(x) for x in C], Zc_m=float(s['tag_h_m']) / kappa,
+        khung=khung, commit_hil=commit_hil(),
+        gioi_han=['chi so thuc nghiem truoc le; truong du ban do giua camera bo moc H32 va camera cham, trong ho mo hinh',
+                  'diem goc dung quy uoc nang cua car_pose (cung kappa, C cua session), khong do lai pixel tung khung']))
+    write_new(a.out, out)
+    _say(f'meo_ma_ao_E {a.cho}: {len(khung)} khung, {len(cases)} ca H32, max '
+         f'{max(math.hypot(*x) for k in khung for v in k["du_m"].values() for x in v) * 1000:.3f} mm')
+
+
+def meo_bang(a):
+    """F15 (b): for every anchor of lan_lap.json (neo_ten, Ph_neo_m of each run end, lifted with kappa_n = h_n / Z_c
+    of the session as c7_nhac_tam does), per place, map residual held - full per H32 case."""
+    ll, ll_sha = load_json_sha(a.lan_lap)
+    s, ses_sha, mk, pc, full, kappa_t, C = _session_ctx(ll['session_file'], ll.get('session_sha256'), a.model)
+    Zc = float(s['tag_h_m']) / kappa_t
+    h_n = float(ll['h_n_m'])
+    kappa_n = h_n / Zc
+    ten = list(ll.get('neo_ten') or [])
+    if len(ten) < 2 or ten[:2] != ['A', 'B']:
+        raise KCError(f'lan_lap.json: neo_ten {ten!r} does not start with A, B')
+    thieu_oc = not any(t.startswith('oc') for t in ten)
+    by_cho = {}
+    for r in ll.get('luot') or []:
+        for dau, x in sorted((r.get('dau') or {}).items()):
+            if dau == 'dich' or not x or x.get('Ph_neo_m') is None:
+                continue
+            by_cho.setdefault(x.get('cho') or r.get('cho'), []).append((r.get('luot_id'), dau, x))
+    if not by_cho:
+        raise KCError('lan_lap.json: no run end with Ph_neo_m')
+    theo = {}
+    for cho, items in sorted(by_cho.items()):
+        if cho not in CHO:
+            raise KCError(f'lan_lap.json: place {cho!r}')
+        allP = np.vstack([np.asarray(x['Ph_neo_m'], float).reshape(-1, 2) for _, _, x in items])
+        cases, hong = held_cases(pc, mk, allP.mean(axis=0), a.r_xp)
+        muc = []
+        for lid, dau, x in items:
+            P = np.asarray(x['Ph_neo_m'], float).reshape(-1, 2)
+            if len(P) != len(ten):
+                raise KCError(f'lan_lap.json {lid} {dau}: {len(P)} anchors, neo_ten has {len(ten)}')
+            res = {n: map_residual(full, cam, P, kappa_n, C) for n, _, cam in cases}
+            muc.append(dict(luot_id=lid, dau=dau, clip_sha256=x.get('clip_sha256'),
+                            khung_neo_sha256=x.get('khung_neo_sha256'),
+                            neo={t: {n: [float(v) for v in res[n][k]] for n in res} for k, t in enumerate(ten)}))
+        theo[cho] = dict(ca=[dict(ten=n, bo_ids=ids) for n, ids, _ in cases], ca_hong=hong, muc=muc)
+    out = _with_sha(dict(
+        schema=MEO_BANG_SCHEMA, chieu='held_minus_full', bo_H32=True, truoc_le=True, neo_ten=ten,
+        h_neo_m=ll.get('h_neo_m'), h_n_m=h_n, kappa_n=kappa_n, Zc_m=Zc, plumb_xy_m=[float(c) for c in C],
+        thieu_oc=thieu_oc, quy_uoc='diem neo da nang car_pose (p = pix2floor(uv, 0), P = p + kappa_n (C - p)), m',
+        lan_lap=dict(file=os.path.abspath(a.lan_lap), sha256=ll_sha,
+                     hieu_chuan_sha256=(ll.get('hieu_chuan') or {}).get('sha256')),
+        ban_do=dict(phien_ban=VERSION, session_file=os.path.abspath(ll['session_file']), session_sha256=ses_sha,
+                    full='session.camera', R_XP_M=R_XP_M if a.r_xp is None else a.r_xp),
+        theo_cho=theo, commit_hil=commit_hil(),
+        gioi_han=['chi so thuc nghiem truoc le; trong ho mo hinh camera; camera cham la camera session (khong khop '
+                  'lai tu the tung khung nhu c7_nhac_tam)',
+                  'moi neo nang bang kappa_n = h_n / Z_c nhu c7_nhac_tam; do cao rieng tung neo (h_neo_m) chi ghi lai']))
+    write_new(a.out, out)
+    _say(f"meo_dau_chan_bang: {sum(len(v['muc']) for v in theo.values())} dau, cho {sorted(theo)}, thieu_oc {thieu_oc}")
+
+
 # ---------------------------------------------------------------- CLI
 def _load_json(p):
     with open(p, encoding='utf-8') as f:
@@ -2255,10 +2430,23 @@ def main(argv=None):
     e.add_argument('--kiem-cheo', dest='kiem_cheo', required=True)
     e.add_argument('--doan', required=True, help='doan_12b_v1.json of CODE_HIEUCHUAN (F5)')
     e.add_argument('--out', required=True)
+    m = sub.add_parser('meo_E', help='F15 (a) meo_ma_ao_E of one place')
+    m.add_argument('--model', required=True)
+    m.add_argument('--cho', required=True)
+    m.add_argument('--session', required=True, help='scoring session of the E clip (sha = track.session_sha256)')
+    m.add_argument('--track', required=True, help='E track dir (track.json, frames.csv)')
+    m.add_argument('--cua-so', dest='cua_so', required=True, help='cua_so_v1.jsonl with E_dau, E_cuoi')
+    m.add_argument('--r-xp', dest='r_xp', type=float)
+    m.add_argument('--out', required=True)
+    b = sub.add_parser('meo_bang', help='F15 (b) meo_dau_chan_bang from lan_lap.json')
+    b.add_argument('--model', required=True)
+    b.add_argument('--lan-lap', dest='lan_lap', required=True)
+    b.add_argument('--r-xp', dest='r_xp', type=float)
+    b.add_argument('--out', required=True)
     a = ap.parse_args(argv)
     try:
         {'phan_tich': phan_tich, 'xuat': xuat, 'kiem_h': kiem_h_cli, 'tung_khung': tung_khung, 'tien_de': tien_de,
-         'e_hieu': e_hieu}[a.cmd](a)
+         'e_hieu': e_hieu, 'meo_E': meo_E, 'meo_bang': meo_bang}[a.cmd](a)
     except (KCError, OSError, ValueError, KeyError) as e:
         print(f'loi: {e}')
         print('#ket_qua,ma=2')
