@@ -202,8 +202,7 @@ def test_log_hole_small_seq_jump_lost(tmp_path):
     assert out['ket_luan'] == 'hong_he_do' and any('log hole' in x for x in out['ly_do_hong'])
 
 
-@pytest.mark.parametrize('col,val,txt', [('reset_n', 4, 'reset_n'), ('g_valid', 0, 'g_valid'), ('r_valid', 0, 'r_valid'),
-                                         ('age_g_ms', '-2.5', 'IMU age')])
+@pytest.mark.parametrize('col,val,txt', [('reset_n', 4, 'reset_n'), ('g_valid', 0, 'g_valid'), ('r_valid', 0, 'r_valid')])
 def test_blocking_checks_not_concluded(tmp_path, col, val, txt):
     def m(rows):
         rows[1200][col] = val
@@ -212,12 +211,69 @@ def test_blocking_checks_not_concluded(tmp_path, col, val, txt):
     assert out['ket_luan'] == 'chua_ket_luan' and any(txt in x for x in out['ly_do_chua'])
 
 
-def test_negative_age_down_to_2ms_ok(tmp_path):
+@pytest.mark.parametrize('age', ['-1.9', '-2.5', '-7.0'])
+def test_negative_age_has_no_limit(tmp_path, age):
+    # J v6 section 5 (J4-14, item 12(f)): no negative age limit; an invalid sample is told by r_valid / rv_n
     def m(rows):
-        rows[1200]['age_g_ms'] = '-1.9'
+        rows[1200]['age_g_ms'] = age
     fp, lp = make_run(str(tmp_path), mutate=m)
     out, _, _ = G.analyse(fp, lp, 'O1-F05')
-    assert out['ok'] and out['kiem']['n_age_neg'] >= 1
+    assert out['ok'] and out['kiem']['n_age_neg'] >= 1 and out['kiem']['age_min_ms'] == pytest.approx(float(age))
+
+
+def test_f11_blocks_on_a_good_run(tmp_path):
+    fp, lp = make_run(str(tmp_path))
+    out, _, _ = G.analyse(fp, lp, 'O1-F05')
+    k = out['kiem_gio_d1']
+    assert k['trang_thai'] == 'dat' and k['L_le_U'] and k['ghep_ok'] and k['trong_dai_c8'] is None
+    assert k['truoc_boot']['co_boot'] is False and k['truoc_boot']['trang_thai'] is None
+    assert not out['cap_dem']['truot'] and not out['ho_log']['truot'] and out['dem_truot_kiem_gio'] is False
+
+
+def test_f11_hole_is_ho_log_not_d1(tmp_path):
+    def m(rows):
+        for r in rows[1000:]:
+            r['timestamp_us'] = int(r['timestamp_us']) + 110000
+    fp, lp = make_run(str(tmp_path), mutate=m)
+    out, _, _ = G.analyse(fp, lp, 'O1-F05')
+    assert out['ket_luan'] == 'hong_he_do' and out['ho_log']['truot']
+    assert out['ly_do_theo_loai']['ho_log'] and not any('log hole' in x for x in out['ly_do_theo_loai']['kiem_gio_d1'])
+
+
+def _f11_case(st_fail, t_boot, cw_end):
+    kenh = {c: dict(D_s=0.01, ok=not st_fail) for c in G.CHANNELS}
+    out = dict(L_s=0.0, U_s=0.02)
+    kiem = dict(pairs_valid_share=1.0, log_hole_max_s=0.02, t_boot_log_s=t_boot)
+    loai = dict(kiem_gio_d1=['x'] if st_fail else [], cap_dem=[], ho_log=[], khac=[])
+    return G.f11(out, kenh, kiem, loai, [], None, [0.0, cw_end])
+
+
+@pytest.mark.parametrize('fail,t_boot,cw_end,dem,truoc', [
+    (True, None, 10.0, True, None),               # failed, no boot: counts
+    (True, 12.0, 10.0, True, 'truot'),            # failed on rows all before the boot (whole window before): counts
+    (True, 8.0, 10.0, False, 'khong_kiem'),       # the window reaches past the boot: not independent, not counted
+    (False, 12.0, 10.0, False, 'dat'),
+])
+def test_m2_boot_and_the_clock_check_count(fail, t_boot, cw_end, dem, truoc):
+    r = _f11_case(fail, t_boot, cw_end)
+    assert r['kiem_gio_d1']['trang_thai'] == ('truot' if fail else 'dat')
+    assert r['kiem_gio_d1']['truoc_boot']['trang_thai'] == truoc and r['dem_truot_kiem_gio'] is dem
+
+
+def test_m2_boot_found_in_the_log(tmp_path):
+    def m(rows):
+        for r in rows[1200:]:
+            r['reset_n'] = 4
+    fp, lp = make_run(str(tmp_path), mutate=m)
+    out, _, _ = G.analyse(fp, lp, 'O1-F05')
+    tb = out['kiem_gio_d1']['truoc_boot']
+    assert tb['co_boot'] and tb['t_boot_log_s'] is not None and out['dem_truot_kiem_gio'] is False
+
+
+def test_f11_missing_c8_range_is_not_checked(tmp_path):
+    fp, lp = make_run(str(tmp_path))
+    out, _, _ = G.analyse(fp, lp, 'O1-F05', khoa=dict(dai={}))
+    assert out['kiem_gio_d1']['trong_dai_c8'] is None and out['kiem_gio_d1']['trang_thai'] == 'khong_kiem'
 
 
 def test_repeated_log_seq_refused(tmp_path):
@@ -604,6 +660,58 @@ def test_node_files_and_gop_only(tmp_path):
     os.remove(os.path.join(d, 'luoi.json'))
     os.remove(os.path.join(d, 'nut_001_nguon.json'))                                # C8BS-16: no record, refused
     assert LU.main(['--gio', gp, '--out-dir', d, '--gop-only']) == 2
+
+
+def _luoi_dir(tmp_path, n=2):
+    d = str(tmp_path / 'luoi')
+    os.makedirs(d)
+    gio = dict(format='c8b_gio_v1', task='O1-F05', ok=True, nodes_s=[1.0 + 0.001 * k for k in range(n)])
+    gp = str(tmp_path / 'gio.json')
+    json.dump(gio, open(gp, 'w', encoding='utf-8'))
+    import c8_u_imu
+    for k in range(n):
+        with open(os.path.join(d, f'nut_{k:03d}_nguon.json'), 'w', encoding='utf-8') as f:
+            json.dump(dict(scorer=dict(commit='abc1234', dirty=False), gio_sha256=c8_u_imu.sha256(gp),
+                           D_s=gio['nodes_s'][k]), f)
+    return d, gp
+
+
+def test_f11_luoi_no_node_scored(tmp_path):
+    # F11: every node a tool error (no score file): no gate block, the run closed not concluded, the clock file SHA kept
+    d, gp = _luoi_dir(tmp_path)
+    assert LU.main(['--gio', gp, '--out-dir', d, '--gop-only']) == 0
+    r = json.load(open(os.path.join(d, 'luoi.json'), encoding='utf-8'))
+    assert r['gate_v3'] is None and r['n_nut_cham'] == 0 and r['trang_thai_luot'] == 'chua_ket_luan_khong_nut'
+    assert r['outcome'] == 'chua_ket_luan' and len(r['ly_do_nut']) == 2 and all(r['ly_do_nut'])
+    import c8_u_imu
+    assert r['gio_sha256'] == c8_u_imu.sha256(gp)
+
+
+def test_f11_luoi_every_node_lost(tmp_path):
+    d, gp = _luoi_dir(tmp_path)
+    for k in range(2):
+        with open(os.path.join(d, f'nut_{k:03d}.json'), 'w', encoding='utf-8') as f:
+            json.dump(dict(outcome='hong_he_do', fail_cause='he_do', reasons=['gap']), f)
+        open(os.path.join(d, f'nut_{k:03d}_rows.csv'), 'w').close()
+    assert LU.main(['--gio', gp, '--out-dir', d, '--gop-only']) == 0
+    r = json.load(open(os.path.join(d, 'luoi.json'), encoding='utf-8'))
+    assert r['trang_thai_luot'] == 'hong_he_do' and r['outcome'] == 'hong_he_do' and r['gate_v3'] is None
+
+
+def test_f11_luoi_scored_and_not_bounded(tmp_path):
+    d, gp = _luoi_dir(tmp_path)
+    for k in range(2):
+        _write_node(d, k, ['dat'] * 5, [(10.000001, 1, [0.05, 0.05, 0.05, 1.0])])
+    assert LU.main(['--gio', gp, '--out-dir', d, '--gop-only']) == 0
+    r = json.load(open(os.path.join(d, 'luoi.json'), encoding='utf-8'))
+    assert r['trang_thai_luot'] == 'cham' and r['n_nut_cham'] == 2 and r['gate_v3'] is not None
+    gp2 = str(tmp_path / 'gio2.json')
+    json.dump(dict(format='c8b_gio_v1', task='O1-F05', ok=False, ket_luan='chua_ket_luan', nodes_s=[]),
+              open(gp2, 'w', encoding='utf-8'))
+    d2 = str(tmp_path / 'l2')
+    assert LU.main(['--gio', gp2, '--out-dir', d2]) == 0
+    r2 = json.load(open(os.path.join(d2, 'luoi.json'), encoding='utf-8'))
+    assert r2['trang_thai_luot'] == 'chua_ket_luan_khong_nut' and r2['n_nut_cham'] == 0 and r2['gio_sha256']
 
 
 def test_node_rows_without_c8b_columns_is_error(tmp_path):

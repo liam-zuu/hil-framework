@@ -458,6 +458,8 @@ def main(argv=None):
         prov_scorer = None
         if not gio.get('ok'):
             res = not_bounded(gio)
+            res.update(n_nut_cham=0, trang_thai_luot=('hong_he_do' if res['outcome'] == 'hong_he_do'
+                                                       else 'chua_ket_luan_khong_nut'))
         else:
             if not a.gop_only:
                 if not all((a.frames, a.esp32, a.hang_so)):
@@ -473,10 +475,21 @@ def main(argv=None):
                                           and all(x.get('dirty') is False for x in prov)),
                                nut=prov)
             res = combine(nodes, ro)
-            bad = [c for c in MEASURED if not res['bieu_dien'][c]]
-            if bad and any(x['ok'] for x in nodes):
-                raise LuoiError(f'combined numbers do not give the grid state for {bad} (C8BS-9): not written')
-            res['gate_v3'] = gate_block(nodes, res, gio, cu.sha256(a.gio), task, gsha)
+            n_cham = sum(1 for x in res['nodes_ok'] if x)
+            res['n_nut_cham'] = n_cham
+            if n_cham == 0:
+                # F11 (design C8B v7 section 7a): no node scored. Every node lost -> run lost (rerun); otherwise (tool
+                # errors) the run is closed not concluded by GATE: no gate block, the reason of every node kept
+                lost = all(res['hong_nut'])
+                res.update(gate_v3=None, trang_thai_luot='hong_he_do' if lost else 'chua_ket_luan_khong_nut',
+                           outcome='hong_he_do' if lost else 'chua_ket_luan', fail_cause='he_do' if lost else '',
+                           ly_do_nut=[x.get('why') or x.get('fail_cause') for x in nodes])
+            else:
+                bad = [c for c in MEASURED if not res['bieu_dien'][c]]
+                if bad:
+                    raise LuoiError(f'combined numbers do not give the grid state for {bad} (C8BS-9): not written')
+                res['trang_thai_luot'] = 'cham'
+                res['gate_v3'] = gate_block(nodes, res, gio, cu.sha256(a.gio), task, gsha)
         import c8b_gio
         res.update(version=VERSION, task=task, nodes_s=gio.get('nodes_s', []), gio_sha256=cu.sha256(a.gio),
                    gate_file_sha256=gsha, script=c8b_gio.repo_state(), scorer=prov_scorer)

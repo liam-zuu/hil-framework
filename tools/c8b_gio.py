@@ -30,7 +30,9 @@ checks of section 3: a channel fit not ok (correlation, start / end thirds, o1_t
 start-up estimate not meeting the scoring interval, and, with a C8 lock file, the width U~ - L or the gyro - RV
 difference outside the range of the C8 runs of the same level (at C8 itself only the first two). No finite clock
 bound (ket_luan chua_ket_luan: G1-G5 not concluded; design 7): reset_n not constant, g_valid or r_valid 0 in the log
-window, an IMU age below AGE_NEG_LIM_MS (-2 ms [DE XUAT]), a lock file without the range of the level. Refused
+window, a lock file without the range of the level (no negative age limit: J v6 J4-14, item 12(f); the ages
+are recorded only). F11 (design C8B v7 section 7a): kiem_gio_d1 / cap_dem / ho_log split the lost-run reasons;
+M2 (J v6 J5-9): kiem_gio_d1.truoc_boot and dem_truot_kiem_gio say whether a failed clock check counts. Refused
 (exit 2): duplicate log lines not marked by the logger segments file (a repeated log_seq, L92), a log_seq jump in the
 run window (o1_time_sync.log_window), times not increasing.
 Start-up check (F5; C8B4R2-3; a consistency check only, never narrows the interval): from standstill, over the
@@ -79,7 +81,6 @@ IMU_GAP_S = 2 * IMU_P + 0.010   # section 7: no bridging across a larger IMU rep
 LOG_P = 0.010              # s, control / log tick of the campaign firmware (10 ms)
 LOG_GAP_S = 2 * LOG_P + 0.010   # section 7: a count pair over a larger time gap is not used (C8BS-2), even with
                                 # consecutive log_seq; the whole run is lost only above LOG_HOLE_S
-AGE_NEG_LIM_MS = -2.0      # [DE XUAT] section 7: a negative age down to -2 ms is valid (design 2), below is an error
 PAIR_MIN = 0.95            # [DE XUAT] section 7
 LOG_HOLE_S = 0.100         # [DE XUAT] section 7
 LE = 1.25                  # half-width margin, author's convention (design 3, as U_IMU v11.26)
@@ -534,18 +535,25 @@ def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S):
     ag = ag[np.isfinite(ag)]
     kiem['age_min_ms'] = float(ag.min()) if len(ag) else None
     kiem['n_age_neg'] = int(np.sum(ag < 0))
-    if len(ag) and ag.min() < AGE_NEG_LIM_MS:
-        fails.append(f'IMU age {ag.min():.2f} ms < {AGE_NEG_LIM_MS} ms')
+    # J v6 section 5 (J4-14, item 12(f)): no negative age limit any more; an invalid IMU sample is told by the flags of
+    # the same row (r_valid, g_valid above), not by the age value. The ages are recorded only.
+    # first change of reset_n inside the log window: a firmware restart (boot) during the run (J v6 M2, J5-9)
+    rn_w = [rows[k]['reset_n'] for k in np.flatnonzero(inw)]
+    tw = tl[inw]
+    kiem['t_boot_log_s'] = next((float(tw[j]) for j in range(1, len(rn_w)) if rn_w[j] != rn_w[j - 1]), None)
     tm, rate, br, pair_ok, ip = count_pairs(rows, tl)
     pw = inw[1:] & inw[:-1]
     kiem['pairs_window'] = int(pw.sum())
     kiem['pairs_valid_share'] = float(pair_ok[pw].mean()) if pw.any() else 0.0
+    loai = dict(kiem_gio_d1=[], cap_dem=[], ho_log=[], khac=[])      # F11: the kind of every lost-run reason
     if kiem['pairs_valid_share'] < PAIR_MIN:
         hong.append(f'valid count pairs {kiem["pairs_valid_share"]:.3f} < {PAIR_MIN} in the log window')
+        loai['cap_dem'].append(hong[-1])
     hole = float(np.max(np.diff(tl[inw]))) if inw.sum() > 1 else math.inf
     kiem['log_hole_max_s'] = hole
     if hole > LOG_HOLE_S:
         hong.append(f'log hole {hole * 1e3:.1f} ms > {LOG_HOLE_S * 1e3:.0f} ms in the log window')
+        loai['ho_log'].append(hong[-1])
     vel = fk(rate)
     # channels
     tg, gz, _ = imu_reports(rows, tl, 'gyro_n', 'age_g_ms', 'gz_fused')
@@ -578,11 +586,13 @@ def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S):
             kenh[ch] = dict(D_s=None, ok=False, why=str(exc))
         if not kenh[ch]['ok']:
             hong.append(f'{ch}: {kenh[ch]["why"]}')
+            loai['kiem_gio_d1'].append(hong[-1])
     out = dict(format=FORMAT, task=task, t0_log_s=t0, window_log_s=list(win), coarse_s=coarse, kenh=kenh, kiem=kiem,
                moc_mau=True, step_s=STEP_S, le=LE)
     if any(kenh[c]['D_s'] is None for c in CHANNELS):
         out.update(ok=False, ly_do=hong + fails, ly_do_hong=hong, ly_do_chua=fails, nodes_s=[],
                    ket_luan='hong_he_do' if hong else 'chua_ket_luan')
+        out.update(f11(out, kenh, kiem, loai, fails, khoa, None))
         return out, F, None
     L_ch = max(LOWER, key=lambda c: kenh[c]['D_s'])
     U_ch = min(UPPER, key=lambda c: kenh[c]['D_s'])
@@ -592,6 +602,7 @@ def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S):
                gyro_minus_rv_s=kenh['gyro_rx']['D_s'] - kenh['rv_rx']['D_s'])
     if L > U:
         hong.append(f'L {L * 1e3:.1f} ms > U~ {U * 1e3:.1f} ms')
+        loai['kiem_gio_d1'].append(hong[-1])
         out['nodes_s'] = []
     else:
         out['nodes_s'] = nodes(c, h)
@@ -640,6 +651,7 @@ def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S):
         st['ket_qua'] = 'nhat_quan' if meet else 'khong_nhat_quan'
         if not meet:
             hong.append('start-up estimate does not meet the scoring interval')
+            loai['khac'].append(hong[-1])
     out['khoi_dong'] = st
     # C8 range of the same level (campaign runs)
     if khoa is not None:
@@ -653,11 +665,46 @@ def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S):
                 kiem[f'{k_}_in_c8_range'] = inr
                 if not inr:
                     hong.append(f'{k_} {v_ * 1e3:.1f} ms outside the C8 range [{lo_ * 1e3:.1f}, {hi_ * 1e3:.1f}] ms')
+                    loai['kiem_gio_d1'].append(hong[-1])
     else:
         kiem['c8_range'] = 'khong kiem (luot C8 hay chua khoa)'
     out.update(ok=not (fails or hong), ly_do=hong + fails, ly_do_hong=hong, ly_do_chua=fails,
                ket_luan='hong_he_do' if hong else ('chua_ket_luan' if fails else 'ok'))
+    out.update(f11(out, kenh, kiem, loai, fails, khoa, cw))
     return out, F, dict(tm=tm, vel=vel, tg=tg, gz=gz, tr=tr, yr=yr)
+
+
+def f11(out, kenh, kiem, loai, fails, khoa, cw):
+    """c8b_gio_v1 F11 blocks (design C8B v7 section 7a; O1 v11.37 D1 line 342: the per-run clock check is only
+    L <= U~, every channel matched, and the C8 range of the level). ket_luan is kept for compatibility.
+    M2 (J v6 section 5, item 12(e) approved, J5-9): a run with a firmware restart (boot) does not count as a failed
+    clock check unless the check failed on log rows before the boot and its whole window lies before the boot."""
+    have_d = all(kenh[c].get('D_s') is not None for c in CHANNELS)
+    L, U = out.get('L_s'), out.get('U_s')
+    l_le_u = None if L is None or U is None else bool(L <= U)
+    ghep_ok = all(bool(kenh[c].get('ok')) for c in CHANNELS)
+    keys = [k for k in ('width_s_in_c8_range', 'gyro_minus_rv_s_in_c8_range') if k in kiem]
+    dai = None if khoa is None or len(keys) < 2 else all(kiem[k] for k in keys)
+    if l_le_u is False or (have_d and not ghep_ok) or dai is False:
+        st = 'truot'                    # the check ran and failed (a failure found is kept even if a part is missing)
+    elif not have_d or (khoa is not None and dai is None):
+        st = 'khong_kiem'               # no data to check, or a lock file without the C8 range of the level
+    else:
+        st = 'dat'
+    t_boot = kiem.get('t_boot_log_s')
+    co_boot = t_boot is not None
+    du = bool(co_boot and cw is not None and cw[1] < t_boot)       # the whole check window lies before the boot
+    truoc = dict(co_boot=co_boot, t_boot_log_s=t_boot, du_cua_so=du,
+                 trang_thai=(st if du else 'khong_kiem') if co_boot else None)
+    dem = st == 'truot' and (not co_boot or (du and truoc['trang_thai'] == 'truot'))
+    return dict(
+        kiem_gio_d1=dict(trang_thai=st, L_le_U=l_le_u, ghep_ok=ghep_ok, trong_dai_c8=dai, ly_do=list(loai['kiem_gio_d1']),
+                         truoc_boot=truoc),
+        cap_dem=dict(pairs_valid_share=kiem.get('pairs_valid_share'), nguong=PAIR_MIN, truot=bool(loai['cap_dem'])),
+        ho_log=dict(log_hole_max_s=kiem.get('log_hole_max_s'), nguong_s=LOG_HOLE_S, truot=bool(loai['ho_log'])),
+        ly_do_theo_loai=dict(kiem_gio_d1=list(loai['kiem_gio_d1']), cap_dem=list(loai['cap_dem']),
+                             ho_log=list(loai['ho_log']), khac=list(loai['khac']), chua=list(fails)),
+        dem_truot_kiem_gio=bool(dem))
 
 
 def _clean(o):
