@@ -1481,8 +1481,9 @@ def tung_khung(a):
 # KCF1-1 (Codex F15 round 1): the measured points came through the camera REFITTED per frame; without the per-frame
 # detections on this branch (dets.npz of CODE_CAM, after the CAM merge) the pixels are rebuilt through the session
 # camera: both outputs are trang_thai 'chan_doan' (diagnostic), never a usable bound, until that version.
-MEO_E_SCHEMA = 'c7_meo_ma_ao_E_v1'
-MEO_BANG_SCHEMA = 'c7_meo_dau_chan_bang_v1'
+MEO_E_SCHEMA = 'c7_meo_ma_ao_E_v1_chan_doan'          # KCF1-1 (round 2): the full schema c7_meo_ma_ao_E_v1 and
+MEO_BANG_SCHEMA = 'c7_meo_dau_chan_bang_v1_chan_doan'  # c7_meo_dau_chan_bang_v1 only with per-frame cameras: readers
+                                                       # of the full schema refuse these diagnostic files by name
 MEO_TRANG_THAI = 'chan_doan'
 MEO_LY_DO = ('pixel dung lai qua camera session, khong phai camera khop lai tu the tung khung (KCF1-1); ban day du can '
              'dets.npz cua CAM (sau gop CAM)')
@@ -1520,10 +1521,16 @@ def h32_ids(marks, foot, r_xp):
     return sorted(ids)
 
 
+def _ca_ten(ids):
+    """KCF1-3: a hold-out case is named by its left-out id set ('bo:18-19-30'), the same name meaning the same camera
+    in every place and file."""
+    return 'bo:' + '-'.join(str(i) for i in sorted(ids))
+
+
 def held_cases(pc, ids):
     """Hold-out cases: 'bo_vung' (every id of the set) and 'bo_cap:s-j' for each pair of the set. KCF1-5: every
     planned case must fit, else KCError (no partial maximum). Returns [(name, ids left out, camera)]."""
-    plan = [('bo_vung', tuple(ids))] + [(f'bo_cap:{a}-{b}', (a, b)) for k, a in enumerate(ids) for b in ids[k + 1:]]
+    plan = [(_ca_ten(ids), tuple(ids))] + [(_ca_ten((a, b)), (a, b)) for k, a in enumerate(ids) for b in ids[k + 1:]]
     out = []
     for name, rm in plan:
         try:
@@ -1561,13 +1568,23 @@ def _with_sha(obj):
     return obj
 
 
+def _ids_sha_forms(ids):
+    """sha256 of a frame-ID list in the two forms the F8 writers used (c7_nhac_tam sha_ids: '1,2' since 1cfe26e,
+    compact JSON '[1,2]' at f9c4b3d)."""
+    v = sorted(int(i) for i in ids)
+    return {hashlib.sha256(','.join(str(i) for i in v).encode()).hexdigest(),
+            hashlib.sha256(json.dumps(v, separators=(',', ':')).encode()).hexdigest()}
+
+
 def _check_h_bar(path, h_used):
     """KCF1-6: the tag height of the session against h-bar of the plate (c8b_a6_v2 field h_m), when given."""
     if not path:
         return dict(da_kiem=False, ly_do='khong co --a6: h_m cua session chua doi chieu voi h-bar cua tam')
     d, sha = load_json_sha(path)
+    if d.get('schema') != 'c8b_a6_v2':
+        raise KCError(f'--a6: schema {d.get("schema")!r} is not c8b_a6_v2 (KCF1-6)')
     hb = d.get('h_m')
-    if isinstance(hb, bool) or not isinstance(hb, (int, float)) or abs(float(hb) - h_used) > 1e-6:
+    if isinstance(hb, bool) or not isinstance(hb, (int, float)) or not math.isfinite(hb) or abs(float(hb) - h_used) > 1e-6:
         raise KCError(f'--a6: h_m {hb!r} is not the session tag height {h_used} (KCF1-6)')
     return dict(da_kiem=True, file=os.path.abspath(path), sha256=sha, h_m=float(hb))
 
@@ -1600,19 +1617,27 @@ def meo_E(a):
     by = {k: [r for r in ew if r['loai'] == k] for k in ('E_dau', 'E_cuoi')}
     if len(by['E_dau']) != 1 or len(by['E_cuoi']) != 1:
         raise KCError(f'cua_so_v1: need exactly one E_dau and one E_cuoi window of {a.cho} for this clip (KCF1-8)')
+    if by['E_dau'][0].get('luot_id') != by['E_cuoi'][0].get('luot_id'):
+        raise KCError('cua_so_v1: E_dau and E_cuoi of different runs (KCF1-8)')
+    import io
+    try:
+        t_of = {int(r['idx']): float(r['t_s']) for r in csv.DictReader(io.StringIO(fb.decode('utf-8')))}
+    except (KeyError, ValueError, TypeError) as e:
+        raise KCError(f'frames.csv: {e} (KCF1-8)')
     ids = {}
     for k, (r,) in by.items():
         if r.get('frames_sha256') != fr_sha or r.get('session_sha256') != ses_sha:
             raise KCError(f'cua_so_v1 {k}: another frames / session (KCF1-7)')
         kh = r.get('khung')
-        if not isinstance(kh, list) or not kh or not all(isinstance(x, dict) and isinstance(x.get('id'), int)
-                                                         for x in kh):
-            raise KCError(f'cua_so_v1 {k}: khung missing or malformed (KCF1-8)')
+        if not isinstance(kh, list) or not kh or not all(
+                isinstance(x, dict) and isinstance(x.get('id'), int) and not isinstance(x.get('id'), bool)
+                and x['id'] in t_of and isinstance(x.get('pts_s'), (int, float))
+                and abs(float(x['pts_s']) - t_of[x['id']]) <= 1e-6 for x in kh):
+            raise KCError(f'cua_so_v1 {k}: khung missing, malformed or not the frames of the track (KCF1-8)')
         ids[k] = [x['id'] for x in kh]
     lo, hi = max(ids['E_dau']), min(ids['E_cuoi'])
     if not lo < hi:
         raise KCError('cua_so_v1: E_dau does not end before E_cuoi starts (KCF1-8)')
-    import io
     try:
         fr = [r for r in csv.DictReader(io.StringIO(fb.decode('utf-8'))) if _true(r.get('valid'))
               and lo < int(r['idx']) < hi and r.get('tag_x') not in ('', None)]
@@ -1621,7 +1646,11 @@ def meo_E(a):
         raise KCError(f'frames.csv: {e} (KCF1-8)')
     if not poses:
         raise KCError('no valid moving E frame between E_dau and E_cuoi (E_doan)')
-    to = tr.get('tag_offset') or [0.0, 0.0, 0.0]
+    to = tr.get('tag_offset')
+    to = [0.0, 0.0, 0.0] if to is None else to
+    if not isinstance(to, list) or len(to) != 3 or not all(
+            isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in to):
+        raise KCError(f'track.tag_offset {to!r}: null or [dx_m, dy_m, dpsi_rad] (KCF1-8)')
     side = float(s['car_side_m'])
     body = cm.car_corners_body(side)
     P_all = [body @ _rot(psi + float(to[2])).T + np.array([x, y]) for _, _, x, y, psi in poses]
@@ -1676,12 +1705,12 @@ def meo_bang(a):
     calibration file (hieu_chuan_neo.json cua_so[*].Ph, KCF1-3), lifted with kappa_n = h_n / Z_c as c7_nhac_tam, per
     place, map residual held - full per H32 case. Diagnostic (KCF1-1)."""
     ll, ll_sha = load_json_sha(a.lan_lap)
-    if not str(ll.get('schema', '')).startswith('lan_lap'):
-        raise KCError(f'lan_lap.json: schema {ll.get("schema")!r} (KCF1-7)')
+    if ll.get('schema') != 'lan_lap_v1':
+        raise KCError(f'lan_lap.json: schema {ll.get("schema")!r} is not lan_lap_v1 (KCF1-7)')
     ten = list(ll.get('neo_ten') or [])
-    if ten[:2] != ['A', 'B'] or any(not (t in ('A', 'B') or (t.startswith('oc') and t[2:].isdigit())) for t in ten) \
-            or len(set(ten)) != len(ten):
-        raise KCError(f'lan_lap.json: neo_ten {ten!r} is not A, B, oc<n> (KCF1-9)')
+    if ten[:2] != ['A', 'B'] or any(not (t in ('A', 'B') or (isinstance(t, str) and t.startswith('oc') and len(t) > 2))
+                                    for t in ten) or len(set(ten)) != len(ten):
+        raise KCError(f'lan_lap.json: neo_ten {ten!r} is not A, B, oc* (F15, KCF2-1)')
     thieu_oc = not any(t.startswith('oc') for t in ten)
     sp = _ll_session(ll, a)
     s, ses_sha, mk, pc, full, kappa_t, C = _session_ctx(sp, ll.get('session_sha256'), a.model)
@@ -1693,8 +1722,13 @@ def meo_bang(a):
         for dau, x in sorted((r.get('dau') or {}).items()):
             if dau == 'dich' or not isinstance(x, dict) or x.get('Ph_neo_m') is None:
                 continue
-            if x.get('session_sha256') not in (None, ses_sha):
-                raise KCError(f'lan_lap.json {r.get("luot_id")} {dau}: another session (KCF1-7)')
+            if x.get('session_sha256') != ses_sha:
+                raise KCError(f'lan_lap.json {r.get("luot_id")} {dau}: session sha missing or another (KCF1-7)')
+            _hex(x.get('khung_neo_sha256'), f'lan_lap.json {r.get("luot_id")} {dau} khung_neo_sha256')
+            kn = x.get('khung_neo') or {}
+            if not isinstance(kn, dict) or not isinstance(kn.get('id'), list) \
+                    or x['khung_neo_sha256'] not in _ids_sha_forms(kn['id']):
+                raise KCError(f'lan_lap.json {r.get("luot_id")} {dau}: khung_neo_sha256 is not its frame set (KCF1-7)')
             items.append(dict(nguon='lan_lap', luot_id=r.get('luot_id'), dau=dau, cho=x.get('cho') or r.get('cho'),
                               clip_sha256=x.get('clip_sha256'), khung_neo_sha256=x.get('khung_neo_sha256'),
                               P=x['Ph_neo_m']))
@@ -1724,11 +1758,17 @@ def meo_bang(a):
         it['P'] = P
         by_cho.setdefault(it['cho'], []).append(it)
     rx = R_XP_M if a.r_xp is None else a.r_xp
+    hids = {cho: h32_ids(mk, np.vstack([unlift(it['P'], kappa_n, C) for it in its]), rx)    # KCF1-4: floor
+            for cho, its in by_cho.items()}
+    cases, seen = [], set()                           # KCF1-3: the cases of every place, applied to every place
+    for cho in sorted(hids):
+        for n, ids_, cam in held_cases(pc, hids[cho]):
+            if n not in seen:
+                seen.add(n)
+                cases.append((n, ids_, cam))
     theo = {}
     for cho, its in sorted(by_cho.items()):
-        foot = np.vstack([unlift(it['P'], kappa_n, C) for it in its])     # KCF1-4: floor footprints
-        hid = h32_ids(mk, foot, rx)
-        cases = held_cases(pc, hid)
+        hid = hids[cho]
         muc, muc_hc = [], []                            # run ends (keyed luot_id, dau) apart from calibration windows
         for it in its:
             res = {n: map_residual(full, cam, it['P'], kappa_n, C) for n, _, cam in cases}
@@ -1737,6 +1777,7 @@ def meo_bang(a):
             (muc if it['nguon'] == 'lan_lap' else muc_hc).append(rec)
         theo[cho] = dict(H32_ids=hid, ca=[dict(ten=n, bo_ids=ids_) for n, ids_, _ in cases], muc=muc,
                          muc_hieu_chuan=muc_hc)
+    # every place carries the same case list (names = left-out id sets); H32_ids is the place's own set
     out = _with_sha(dict(
         schema=MEO_BANG_SCHEMA, trang_thai=MEO_TRANG_THAI, ly_do=[MEO_LY_DO], chieu='held_minus_full', bo_H32=True,
         truoc_le=True, neo_ten=ten, h_neo_m=ll.get('h_neo_m'), h_n_m=h_n, kappa_n=kappa_n, Zc_m=Zc,

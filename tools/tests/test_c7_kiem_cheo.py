@@ -1944,8 +1944,8 @@ def test_held_cases_all_or_nothing(scene):
             return cam
     with pytest.raises(kc.KCError, match='KCF1-5'):
         kc.held_cases(PC(), [1, 2, 3])
-    assert [n for n, _, _ in kc.held_cases(lambda out=(): cam, [1, 2, 3])] == ['bo_vung', 'bo_cap:1-2', 'bo_cap:1-3',
-                                                                               'bo_cap:2-3']
+    assert [n for n, _, _ in kc.held_cases(lambda out=(): cam, [1, 2, 3])] == ['bo:1-2-3', 'bo:1-2', 'bo:1-3',
+                                                                               'bo:2-3']      # KCF1-3: by id set
 
 
 def _f15_session(tmp_path, scene):
@@ -2012,26 +2012,41 @@ def test_meo_E_corners_order_and_lift(tmp_path, scene, monkeypatch):
     assert r['h_bar']['da_kiem'] is False
 
 
-@pytest.mark.parametrize('bad', ['K2', 'no_track_sha', 'dup_dau', 'session', 'a6_other_h'])
+@pytest.mark.parametrize('bad', ['K2', 'no_track_sha', 'dup_dau', 'session', 'a6_other_h', 'a6_nan', 'a6_schema',
+                                 'offset_short', 'other_run', 'frame_not_in_track'])
 def test_meo_E_refuses(tmp_path, scene, monkeypatch, bad):
     """KCF1-6, KCF1-7, KCF1-8: wrong place, missing link sha, two E_dau, another session, h-bar of the plate not the
     session tag height: code 2, nothing written."""
     sp = _f15_session(tmp_path, scene)
-    over = {'no_track_sha': dict(video_sha256=None), 'session': dict(session_sha256='1' * 64)}.get(bad)
+    over = {'no_track_sha': dict(video_sha256=None), 'session': dict(session_sha256='1' * 64),
+            'offset_short': dict(tag_offset=[0])}.get(bad)
     td, cs = _e_files(tmp_path, sp, track_over=over, rows_extra=[('E_dau', [0])] if bad == 'dup_dau' else ())
+    if bad in ('other_run', 'frame_not_in_track'):
+        rows = [json.loads(x) for x in cs.read_text(encoding='utf-8').splitlines()]
+        for r_ in rows:
+            if r_['loai'] == 'E_cuoi':
+                if bad == 'other_run':
+                    r_['luot_id'] = 'E2'
+                else:
+                    r_['khung'].append(dict(id=-99, pts_s=900.0))
+        cs.write_text('\n'.join(json.dumps(r_) for r_ in rows) + '\n', encoding='utf-8')
     _field_cases(monkeypatch, scene)
     args = ['meo_E', '--model', 'B1', '--cho', 'K2' if bad == 'K2' else 'goc', '--session', str(sp), '--track', str(td),
             '--cua-so', str(cs), '--out', str(tmp_path / 'e.json')]
-    if bad == 'a6_other_h':
+    if bad.startswith('a6'):
         a6 = tmp_path / 'a6.json'
-        a6.write_text(json.dumps(dict(schema='c8b_a6_v2', h_m=0.124175)), encoding='utf-8')
+        h_ = dict(a6_other_h=0.124175, a6_nan=float('nan'), a6_schema=0.119)[bad]
+        a6.write_text(json.dumps(dict(schema='other' if bad == 'a6_schema' else 'c8b_a6_v2', h_m=h_)), encoding='utf-8')
         args += ['--a6', str(a6)]
     assert kc.main(args) == 2 and not (tmp_path / 'e.json').exists()
 
 
 def _bang_files(tmp_path, sp, ten=('A', 'B', 'oc1'), with_session_file=False):
-    end = lambda d: dict(cho='goc', clip_sha256='c' * 64, khung_neo_sha256='k' * 64,                     # noqa: E731
-                         Ph_neo_m=[[0.10 + d, 0.05], [0.25 + d, 0.05], [0.18 + d, 0.12]][:len(ten)])
+    import hashlib as _h
+    ses = kc.sha256_file(str(sp))
+    end = lambda d, cho='goc': dict(cho=cho, clip_sha256='c' * 64, session_sha256=ses, khung_neo=dict(id=[3, 1, 2]),  # noqa
+                                    khung_neo_sha256=_h.sha256(b'1,2,3').hexdigest(),
+                                    Ph_neo_m=[[0.10 + d, 0.05], [0.25 + d, 0.05], [0.18 + d, 0.12]][:len(ten)])
     f6 = dict(session=dict(file=str(sp), sha256=kc.sha256_file(str(sp))), neo_ten=list(ten),
               cua_so=[dict(meta=dict(cho='goc', loai='dung_12b', luot='t12', clip_sha='d' * 64),
                            Ph=[[0.3, 0.2], [0.45, 0.2], [0.38, 0.27]][:len(ten)])])
@@ -2040,7 +2055,8 @@ def _bang_files(tmp_path, sp, ten=('A', 'B', 'oc1'), with_session_file=False):
     ll = dict(schema='lan_lap_v1', session_sha256=kc.sha256_file(str(sp)), neo_ten=list(ten), h_neo_m=[0.12] * len(ten),
               h_n_m=0.12, hieu_chuan=dict(file=str(f6p), sha256=kc.sha256_file(str(f6p))),
               luot=[dict(luot_id='r1', cho='goc', dau=dict(chuan=end(0.0), pre=end(0.01), post=end(0.02),
-                                                           dich=end(0.01)))])
+                                                           dich=end(0.01))),
+                    dict(luot_id='r2', cho='K1', dau=dict(chuan=end(1.0, 'K1'), pre=end(1.01, 'K1')))])
     if with_session_file:
         ll['session_file'] = str(sp)
     lp = tmp_path / 'lan_lap.json'
@@ -2061,6 +2077,8 @@ def test_meo_bang_f8_of_f9c4b3d_and_oracle(tmp_path, scene, monkeypatch):
     kn = 0.12 / ZC
     t = r['theo_cho']['goc']
     assert r['thieu_oc'] is False and r['trang_thai'] == 'chan_doan' and r['kappa_n'] == pytest.approx(kn)
+    assert r['schema'] == 'c7_meo_dau_chan_bang_v1_chan_doan'          # KCF1-1: readers of the full schema refuse it
+    assert r['theo_cho']['goc']['ca'] == r['theo_cho']['K1']['ca']   # KCF1-3: one case list for every place
     assert r['lan_lap']['hieu_chuan_sha256'] == ll['hieu_chuan']['sha256']
     assert [m['dau'] for m in t['muc']] == ['chuan', 'post', 'pre'] and len(t['muc_hieu_chuan']) == 1
     for m in t['muc']:
@@ -2071,7 +2089,7 @@ def test_meo_bang_f8_of_f9c4b3d_and_oracle(tmp_path, scene, monkeypatch):
             assert np.allclose(m['neo'][nm]['bo_vung'], want[k], atol=1e-9)
 
 
-@pytest.mark.parametrize('bad', ['name_X', 'count', 'f6_sha'])
+@pytest.mark.parametrize('bad', ['name_X', 'count', 'f6_sha', 'schema', 'no_khung_sha', 'khung_sha_other', 'end_session'])
 def test_meo_bang_refuses(tmp_path, scene, monkeypatch, bad):
     """KCF1-7, KCF1-9: an anchor name outside A, B, oc<n>, an anchor count not neo_ten's, an F6 of another sha: code 2."""
     sp = _f15_session(tmp_path, scene)
@@ -2081,7 +2099,34 @@ def test_meo_bang_refuses(tmp_path, scene, monkeypatch, bad):
         ll['luot'][0]['dau']['pre']['Ph_neo_m'] = [[0.1, 0.05]]
     if bad == 'f6_sha':
         ll['hieu_chuan']['sha256'] = 'e' * 64
+    if bad == 'schema':
+        ll['schema'] = 'lan_lap_wrong'
+    if bad == 'no_khung_sha':
+        ll['luot'][0]['dau']['pre'].pop('khung_neo_sha256')
+    if bad == 'khung_sha_other':
+        ll['luot'][0]['dau']['pre']['khung_neo'] = dict(id=[1, 2])
+    if bad == 'end_session':
+        ll['luot'][0]['dau']['post'].pop('session_sha256')
     lp.write_text(json.dumps(ll), encoding='utf-8')
     _field_cases(monkeypatch, scene)
     assert kc.main(['meo_bang', '--model', 'B1', '--lan-lap', str(lp), '--out', str(tmp_path / 'b.json')]) == 2
     assert not (tmp_path / 'b.json').exists()
+
+
+def test_meo_bang_accepts_oc_names_of_the_contract(tmp_path, scene, monkeypatch):
+    """KCF2-1: F15 allows oc* (oc_trai of c7_nhac_tam parse_neo), not only oc<n>."""
+    sp = _f15_session(tmp_path, scene)
+    lp, ll = _bang_files(tmp_path, sp, ten=('A', 'B', 'oc_trai'), with_session_file=True)
+    _field_cases(monkeypatch, scene)
+    assert kc.main(['meo_bang', '--model', 'B1', '--lan-lap', str(lp), '--out', str(tmp_path / 'b.json')]) == 0
+
+
+def test_meo_E_schema_is_diagnostic(tmp_path, scene, monkeypatch):
+    """KCF1-1: the E output carries the diagnostic schema name."""
+    sp = _f15_session(tmp_path, scene)
+    td, cs = _e_files(tmp_path, sp)
+    _field_cases(monkeypatch, scene)
+    out = tmp_path / 'e.json'
+    assert kc.main(['meo_E', '--model', 'B1', '--cho', 'goc', '--session', str(sp), '--track', str(td), '--cua-so',
+                    str(cs), '--out', str(out)]) == 0
+    assert json.loads(out.read_text(encoding='utf-8'))['schema'] == 'c7_meo_ma_ao_E_v1_chan_doan'
