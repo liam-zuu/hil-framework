@@ -732,7 +732,6 @@ def analyse_b(F, v_max, wz_max, frame_s):
             ga_why.append(f'clip {k}: held-out by time: {why_t}')
         elif ho_t > GA_TOL_M:
             ga_why.append(f'clip {k}: held-out by time residual {ho_t * 1e3:.2f} mm > {GA_TOL_M * 1e3:.0f} mm')
-            kieu.append(dict(phep='thoi_gian', **split_kind(x, y, *halves(t, slk))))
         if dk > GA_TOL_M:
             ga_why.append(f'clip {k}: residual {dk * 1e3:.2f} mm > {GA_TOL_M * 1e3:.0f} mm')
         # set-up moved between two spins of the clip (Codex G3B-1 round 2)
@@ -743,12 +742,24 @@ def analyse_b(F, v_max, wz_max, frame_s):
         ga_why += [f'clip {k}: {w}' for w in why_r]
         if ho_r is not None and ho_r > GA_TOL_M:
             ga_why.append(f'clip {k}: held-out by run residual {ho_r * 1e3:.2f} mm > {GA_TOL_M * 1e3:.0f} mm')
-            for r_ in runs_ci:
-                own = slk[run[slk] == r_]
-                if len(own) and r_ not in unchecked:
-                    kieu.append(dict(phep=f'luot {r_}', **split_kind(x, y, own, slk[run[slk] != r_])))
         not_checked = ci[np.isin(run[ci], unchecked)]
         use_p[not_checked] = False
+        # Codex G3B3-1, G3B4-1: a failed held-out check (by time or by run) is classified on EVERY split of the clip,
+        # on the slow frames and on the frames used (up to CAP x v_max, the spins checked): two time halves, and each
+        # checked spin against the other checked spins. A split whose two parts each cover a full turn fixes both
+        # circles, so a moved centre is identified ('tam') whenever any split can see it; 'khong_nhan_dang' is left
+        # only when every split has a part under a turn
+        if (ho_t is not None and ho_t > GA_TOL_M) or (ho_r is not None and ho_r > GA_TOL_M):
+            used_k = ci[use_p[ci]]
+            for nm, sel in (('', slk), (' khung_dung', used_k)):
+                if len(sel) >= 2:
+                    kieu.append(dict(phep='thoi_gian' + nm, **split_kind(x, y, *halves(t, sel))))
+                for r_ in runs_ci:
+                    if r_ in unchecked:
+                        continue
+                    own, oth = sel[run[sel] == r_], sel[(run[sel] != r_) & ~np.isin(run[sel], unchecked)]
+                    if len(own) and len(oth):
+                        kieu.append(dict(phep=f'luot {r_}{nm}', **split_kind(x, y, own, oth)))
         # radial part (Codex G3B-5 round 3): the true radius of the set-up is one unknown constant within the clip, so
         # the error of a frame can be as large as the PEAK-TO-PEAK of the measured radius over the frames used (a drift
         # is not halved by taking the deviation from the mean); harmonics and drift not removed
@@ -777,8 +788,10 @@ def analyse_b(F, v_max, wz_max, frame_s):
     cov = coverage(np.sign(om[use_p]) * v_t[use_p], v_max)
     use_r = use_p & np.isfinite(rad_err)
     rad_lech_tb = float(np.max(rad_err[use_r])) if use_r.any() else None      # deviation from the mean (information)
-    ptps = [d['ban_kinh_dinh_dinh_m'] for d in ok_clips]
-    rad_dev = max(ptps) if ptps and all(v is not None for v in ptps) else None
+    # Codex G3B4-2: a clip with no frame in the band used gives no frame to the position part, so it adds no radius
+    # (its None does not void the clips that have frames used); None only when no clip has a frame used
+    ptps = [d['ban_kinh_dinh_dinh_m'] for d in ok_clips if d['ban_kinh_dinh_dinh_m'] is not None]
+    rad_dev = max(ptps) if ptps else None
     rad_dev_tho = float(np.max(np.abs(r[use_p] - R0))) if use_p.any() else None
     use_h = use_p & np.isfinite(hp_err)
     hp_dev = float(np.max(hp_err[use_h])) if use_h.any() else None
@@ -870,7 +883,8 @@ def b_troi_only(b):
     """L132: every reason B failed the set-up check is a held-out residual by time or by spin, not a residual in the
     fit, a part of a turn, too few frames or q not identified; AND no failed held-out comparison IDENTIFIES a moved
     centre (both parts' circles fixed by a full turn and their centres more than TAM_TOL_M apart: the set-up moving,
-    Codex G3B3-1). A comparison that cannot tell (a part under a turn, 'khong_nhan_dang') does not block: the radial
+    Codex G3B3-1; every split of the clip is tried, on the slow frames and on the frames used, Codex G3B4-1). A
+    comparison that cannot tell (a part under a turn, 'khong_nhan_dang') does not block: the radial
     part is the peak-to-peak radius over the frames used (G3B-5 round 3), so the unexplained gap is counted in it as an
     error (the safe side; 2 slow frames at the start of B IMG_3602 of session 1 are this case)."""
     w = b['ga_why']

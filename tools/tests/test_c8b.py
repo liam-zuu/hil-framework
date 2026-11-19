@@ -1287,12 +1287,29 @@ def test_3b_v4_radius_drift_peak_to_peak():
 def test_3b_v4_l132_blocked_by_an_identified_centre_move():
     # Codex G3B3-1: two full spins of one clip, radius 250 mm, the centre moved 2.6 mm at the turnaround: a moved
     # set-up, not a drift of the radius; L132 does not open
-    F = _wheel_F([(4, 4.0, 0.35, 40, 0.0), (4, -4.0, -0.35, 40, 0.0)], {0: 0.25}, c_step=(44.05, 0.0026))
+    # Codex G3B4-1 (round 4): 5 rad/s for 4 s, then down to 0.35 over 85 s, each way; the slow frames of each spin are
+    # under a turn (time halves and spins on the slow frames: 'khong_nhan_dang'), the frames used of each spin cover
+    # many turns: the move is identified there and L132 closes. Strict: no branch through rad_dev >= 2.60 mm
+    parts = [(4, 5.0, 0.35, 85, 0.0), (4, -5.0, -0.35, 85, 0.0)]
+    t, om = _segs(parts)
+    tc = t[np.flatnonzero(np.sign(om[1:]) != np.sign(om[:-1]))[0] + 1]
+    F = _wheel_F(parts, {0: 0.25}, c_step=(tc, 0.0026))
     B = TB.analyse_b(F, 0.2915, 0.6536, 1 / 60)
-    kinds = [k['kieu'] for c in B['theo_clip'] for k in c['kieu_lech']]
-    # the property kept: a moved centre is never under the published radial part. Either the check fails and L132 is
-    # blocked when the move is identified, or the peak-to-peak radius over the frames used covers the move
-    assert (not B['ga_ok'] and 'tam' in kinds and not TB.b_troi_only(B)) or B['rad_dev_m'] >= 0.0026
+    kl = B['theo_clip'][0]['kieu_lech']
+    assert not B['ga_ok'] and B['theo_clip'][0]['ga_giu_ngoai_thoi_gian_m'] > TB.GA_TOL_M
+    by = {k['phep']: k for k in kl}
+    assert by['thoi_gian']['kieu'] == 'khong_nhan_dang' and by['luot 0']['kieu'] == 'khong_nhan_dang'
+    assert by['luot 0 khung_dung']['kieu'] == 'tam'
+    assert by['luot 0 khung_dung']['dich_tam_m'] == pytest.approx(0.0026, abs=5e-5)
+    assert not TB.b_troi_only(B)
+    # control: a radius step of 2.6 mm at the same turnaround (centre kept): every split that can tell says
+    # 'ban_kinh', none 'tam'; L132 may open, the step stays in the radial part
+    F3 = _wheel_F(parts, {0: 0.25}, r_drift=lambda tt: np.where(tt >= tc, 0.0026, 0.0))
+    B3 = TB.analyse_b(F3, 0.2915, 0.6536, 1 / 60)
+    assert not B3['ga_ok']
+    k3 = [k['kieu'] for k in B3['theo_clip'][0]['kieu_lech']]
+    assert 'ban_kinh' in k3 and 'tam' not in k3 and TB.b_troi_only(B3)
+    assert B3['rad_dev_m'] >= 0.0026 - 2e-4
     # the identified case itself (each part a full turn, centres 2.6 mm apart)
     th = np.linspace(0, 4 * math.pi, 800)
     x = np.r_[1.0 + 0.25 * np.cos(th), 1.0026 + 0.25 * np.cos(th)]
@@ -1310,6 +1327,37 @@ def test_3b_v4_l132_blocked_by_an_identified_centre_move():
     if not B2['ga_ok']:
         assert all(k['kieu'] != 'tam' for c in B2['theo_clip'] for k in c['kieu_lech']) and TB.b_troi_only(B2)
         assert B2['rad_dev_m'] >= 0.0026 - 2e-4
+
+
+def test_3b_v5_clip_without_frames_used_does_not_void_rad_dev():
+    # Codex G3B4-2 (round 4): two B clips covering F02, then a third clip at 3 -> 2 rad/s on 250 mm (0.50 m/s and more,
+    # above the band used 1.1 x 0.2915 m/s): it has a slow part but no frame used; rad_dev stays the larger of the two
+    # first clips (it was null, so P4 was lost)
+    two = [(4, 4.0, 0.35, 40, 10.0), (4, -4.0, -0.35, 40, 10.0)]
+    F2 = _wheel_F(two, {0: 0.25, 1: 0.25, 2: 0.25}, r_drift=lambda tt: 0.0008 * np.sin(0.3 * tt))
+    B2 = TB.analyse_b(F2, 0.2915, 0.6536, 1 / 60)
+    F3 = _wheel_F(two + [(2, 3.0, 2.0, 10, 0.0)], {0: 0.25, 1: 0.25, 2: 0.25},
+                  r_drift=lambda tt: 0.0008 * np.sin(0.3 * tt))
+    B3 = TB.analyse_b(F3, 0.2915, 0.6536, 1 / 60)
+    c3 = B3['theo_clip'][2]
+    assert c3['slow_n'] > 0 and c3['ban_kinh_dinh_dinh_m'] is None
+    assert B2['du_phu'] and B3['du_phu']
+    assert B2['rad_dev_m'] is not None and B3['rad_dev_m'] == pytest.approx(B2['rad_dev_m'])
+    assert B3['rad_dev_m'] == max(c['ban_kinh_dinh_dinh_m'] for c in B3['theo_clip'][:2])
+    # no clip with a frame used: still null
+    Fh = _wheel_F([(2, 3.0, 2.0, 10, 0.0)], {0: 0.25})
+    assert TB.analyse_b(Fh, 0.2915, 0.6536, 1 / 60)['rad_dev_m'] is None
+
+
+def test_khoa_takes_a_3b_file_usable_by_l132():
+    # Codex round 4 note (G3B3-2): positive test of the L132 read path of c8b_u; the 3b numbers are used as given
+    base = KH()
+    l132 = dict(TBD, ga_ok=False, dung_duoc=True, b_dung_ke_ca_troi=True)
+    k = KH(tb=l132)
+    assert k['U_p_phan_m'] == base['U_p_phan_m'] and k['U_psi_phan_deg'] == base['U_psi_phan_deg']
+    for bad in (dict(l132, b_dung_ke_ca_troi=False), dict(l132, dung_duoc='true'), dict(l132, b_dung_ke_ca_troi=1)):
+        with pytest.raises(CU.UError, match='ga_ok'):
+            KH(tb=bad)
 
 
 def test_3b_v3_l132_b_used_with_its_drift(tmp_path):
