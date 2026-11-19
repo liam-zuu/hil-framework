@@ -1552,3 +1552,85 @@ def test_f15_diagnostic_state_is_not_dat(files):
     (files / 'cd1.json').write_text(json.dumps(_f15_hash(o)), encoding='utf-8')
     b = _again(files, rows, recs, 'cd', files / 'cd1.json')['beta_cam_replay']
     assert b and all(v['trang_thai'] == 'chua_ket_luan' and 'f15_chan_doan' in v['ly_do'] for v in b.values())
+
+
+# ---------------------------------------------------------------- Codex round 4 (LLC3-1/3, LLC1-7, LLC2-1, LLC4-1, F15C-3/6, F15C2-1)
+def test_llc3_1_round4_doi_at_a_place_without_standard_breaks_the_group(files):
+    """No standard at K1 in the group; L01 at K1 has its plate moved 2 mm inside the run (doi): L02 at goc, back on
+    the standard, still gets no standard; L03 at goc with an empty pre -> lan_lap_khong_xac_dinh (LLC4-1, CT4-3)."""
+    sh = dict(cB=CB_TRUE + [0.002, 0.0])
+    runs = [('L01', ('K1', 0.0, 0.0, {}), ('K1', 0.01, 0.2, sh)), ('L02', ('goc', 0.0, 0.1, {}), ('goc', 0.01, 0.3, {})),
+            ('L03', ('goc', 0.0, 0.2, {}), ('goc', 0.01, 0.1, {}))]
+    rows, recs = build(runs=runs, fit_places=('goc', 'K2'), e_places=('goc',))
+    i = next(i for i, w in enumerate(rows) if w['luot_id'] == 'L03' and w['loai'] == 'pre')
+    rows[i]['khung'], rows[i]['khung_ma_hop_le'], recs[i] = [], [], []
+    _, _, _, L = run(files, rows, recs)
+    assert L['L01']['tam_doi_trong_luot'] is True and 'khong_co_cua_so_chuan' in L['L01']['ly_do']['beta']
+    assert L['L02']['chuan_12b'] is None and 'lan_lap_sau_doi' in L['L02']['ly_do']['beta']
+    assert L['L03']['lan_lap_id_ly_do'] == 'lan_lap_khong_xac_dinh'
+
+
+def test_llc3_3_round4_common_set_of_a_failed_window_not_exported(files):
+    rows, recs = build()
+    i = next(i for i, w in enumerate(rows) if w['luot_id'] == 'L04' and w['loai'] == 'pre')
+    rows[i]['ket_luan'] = {'dung_yen': False}
+    _, _, _, L = run(files, rows, recs)
+    x = L['L04']['dau']['pre']
+    assert x['khung_chung']['id'] == [] and x['khung_chung_sha256'] is None
+    assert len(x['khung_giao_ma_neo']['id']) == 12                    # the tag-anchor intersection is kept (J 2)
+
+
+def test_llc2_1_round4_f7_of_another_a6(files):
+    def khac_a6(hc):
+        o = truc_xe_ok(hc)
+        for b in o:
+            b['nguon'].append({'vai_tro': 'c8b_a6_v2', 'sha256': 'khac'})
+        return o
+    _, _, _, L = run(files, *build(), truc_xe=khac_a6, tag='a6x')
+    assert 'truc_xe_khac_f6_hoac_a6' in L['L01']['ly_do']['phi'] and L['L01']['trang_thai']['phi'] == 'chua_ket_luan'
+
+
+def test_llc1_7_round4_tag_list_hash_on_the_raw_list():
+    rows, _ = build()
+    ok = [dict(w, khung_ma_hop_le_sha256=nt.sha_ids(w['khung_ma_hop_le'])) for w in rows]
+    nt.kiem_f2(ok)
+    bad = [dict(w) for w in ok]
+    lst = bad[3]['khung_ma_hop_le'] + [bad[3]['khung_ma_hop_le'][0]]          # one ID twice, hash of the set
+    bad[3] = dict(bad[3], khung_ma_hop_le=lst, khung_ma_hop_le_sha256=nt.sha_ids(sorted(set(lst))))
+    with pytest.raises(ValueError, match='khung_ma_hop_le_sha256'):
+        nt.kiem_f2(bad)
+
+
+def test_f15c_round2_declared_cases_structure_and_missing_entry(files):
+    rows, recs = build()
+    _, _, ll, _ = run(files, rows, recs, tag='h')
+
+    def dong(cho, lid, dau, k):
+        return {'c': [1e-4, 0.0]}
+    # F15C-3: a declared case missing at the run ends (its vectors deleted) -> ca_thieu, not dat
+    o = _f15(ll, dong, files / 'h1.json')
+    o['theo_cho']['goc']['ca'] = [{'ten': 'c', 'bo_ids': [1]}, {'ten': 'lon', 'bo_ids': [2]}]
+    (files / 'h1.json').write_text(json.dumps(_f15_hash(o)), encoding='utf-8')
+    b = _again(files, rows, recs, 'h', files / 'h1.json')['beta_cam_replay']['goc']
+    assert b['trang_thai'] == 'chua_ket_luan' and any('lon:ca_thieu' in x for x in b['ly_do'])
+    # ca_hong written as dicts by KIEMCHEO held_cases: the case is excluded, no TypeError
+    o = _f15(ll, dong, files / 'h2.json')
+    o['theo_cho']['goc']['ca'] = [{'ten': 'c', 'bo_ids': [1]}, {'ten': 'lon', 'bo_ids': [2]}]
+    o['theo_cho']['goc']['ca_hong'] = [{'ten': 'lon', 'ly_do': 'it_moc'}]
+    (files / 'h2.json').write_text(json.dumps(_f15_hash(o)), encoding='utf-8')
+    b = _again(files, rows, recs, 'h', files / 'h2.json')['beta_cam_replay']['goc']
+    assert b['trang_thai'] == 'dat', b['ly_do']
+    full = b['n']
+    # F15C2-1: neo[t] not a {case: vector} mapping -> listed, not dat, no exception
+    o = _f15(ll, dong, files / 'h3.json')
+    m0 = next(m for m in o['theo_cho']['goc']['muc'] if m['dau'] == 'pre')
+    m0['neo']['B'] = [0.0, 0.0]
+    (files / 'h3.json').write_text(json.dumps(_f15_hash(o)), encoding='utf-8')
+    b = _again(files, rows, recs, 'h', files / 'h3.json')['beta_cam_replay']['goc']
+    assert b['trang_thai'] == 'chua_ket_luan' and any('neo_sai_cau_truc' in x for x in b['ly_do'])
+    # F15C-6: one used entry removed (L01/pre) -> thieu_muc, n one run less, not dat
+    o = _f15(ll, dong, files / 'h4.json')
+    o['theo_cho']['goc']['muc'] = [m for m in o['theo_cho']['goc']['muc'] if (m['luot_id'], m['dau']) != ('L01', 'pre')]
+    (files / 'h4.json').write_text(json.dumps(_f15_hash(o)), encoding='utf-8')
+    b = _again(files, rows, recs, 'h', files / 'h4.json')['beta_cam_replay']['goc']
+    assert b['trang_thai'] == 'chua_ket_luan' and 'L01:pre:thieu_muc' in b['ly_do'] and b['n'] == full - 1

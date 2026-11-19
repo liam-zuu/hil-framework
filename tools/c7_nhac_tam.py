@@ -1659,7 +1659,8 @@ def kiem_f2(rows):
         if not all(math.isfinite(p) for p in pts) or any(b <= a for a, b in zip(pts, pts[1:])) \
                 or any(b <= a for a, b in zip(ids, ids[1:])):
             raise ValueError(f'window {i}: PTS / IDs not finite and increasing')
-        for kk, lst in ((TEN['k_sha'], ids), (TEN['ma_sha'], sorted(khung_ma(w)))):
+        ma_tho = [int(k[TEN['k_id']]) if isinstance(k, dict) else int(k) for k in (w.get(TEN['khung_ma']) or [])]
+        for kk, lst in ((TEN['k_sha'], ids), (TEN['ma_sha'], ma_tho)):
             if w.get(kk) is not None and w[kk] != sha_ids(lst):
                 raise ValueError(f'window {i}: {kk} is not sha_ids of its frame list')
         key = (w[TEN['clip_sha']], tuple(ids))
@@ -1690,6 +1691,11 @@ def _measure(cs_rows, keys, session_path, mau_args, ctx, neo, clip_dir):
         w = cs_rows[i]
         fr = khung_cua(w)
         if not fr:                                     # CT4-3: no frame -> no record (the window fails, run kept)
+            if w.get(TEN['clip']):                     # LLC4-2: its declared clip is still checked
+                path = w[TEN['clip']] if os.path.isabs(w[TEN['clip']]) or clip_dir is None else \
+                    os.path.join(clip_dir, w[TEN['clip']])
+                if cm.sha256(path) != w[TEN['clip_sha']]:
+                    raise ValueError(f'{w[TEN["clip"]]}: sha256 differs from the window file')
             recs[i] = []
             continue
         by_clip.setdefault(w[TEN['clip']], []).append((i, fr))
@@ -2015,7 +2021,8 @@ def beta_cam_replay(f15_path, hc, out_l, luot, hw, fitw, doan, G, h, ctx):
         if blk is None:
             ly.append('thieu_khoi_cho')
             blk = {}
-        hong = set(blk.get('ca_hong') or [])
+        hong = {x.get('ten') if isinstance(x, dict) else x for x in blk.get('ca_hong') or []}
+        khai = {x.get('ten') if isinstance(x, dict) else x for x in blk.get('ca') or []} - hong   # declared cases
         muc = {}
         for m in blk.get('muc') or []:
             k = (m.get('luot_id'), m.get('dau'))
@@ -2034,9 +2041,16 @@ def beta_cam_replay(f15_path, hc, out_l, luot, hw, fitw, doan, G, h, ctx):
                 ends.append((m, src))
             if any(m is None for m, _ in ends):
                 continue
-            keys = [set((((m.get('neo') or {}).get(t)) or {}).keys()) for m, _ in ends for t in ten]
+            keys = []
+            for m, _ in ends:
+                for t in ten:
+                    v = (m.get('neo') if isinstance(m.get('neo'), dict) else {}).get(t)
+                    if not isinstance(v, dict):                     # F15C2-1: not a {case: vector} mapping
+                        ly.append(f'{lid}:{m.get("dau")}:{t}:neo_sai_cau_truc')
+                        v = {}
+                    keys.append(set(v))
             chung = set.intersection(*keys) - hong
-            for n in sorted(set.union(*keys) - hong - chung):
+            for n in sorted((set.union(*keys) | khai) - hong - chung):   # F15C-3: every declared case at both ends
                 ly.append(f'{lid}:{n}:ca_thieu')
             for n in sorted(chung):
                 if not all(_vec2(m['neo'][t][n]) for m, _ in ends for t in ten):
@@ -2169,10 +2183,10 @@ def run_lan_lap(hc_path, cua_so_path, session_path, out_dir, a6_path, tam_id, tr
                      du_ok=bool(np.all(res <= r_max)))
             d['ma'], d['chung'], ly_du = _tom_hai(s, G, h, ctx, r_max)
             d['ly_do'] += s['chung']['ly_do'] + ly_du
-            if d['chung'] is None:                              # LLC3-3: the exported common set is the one used
-                d['khung_chung'], d['khung_chung_sha256'] = dict(id=[], pts_s=[]), None
             if not d['du_ok']:
                 d['ly_do'].append('du_neo_vuot_r_max')
+        if d['chung'] is None:                                  # LLC3-3: the exported common set is the one used
+            d['khung_chung'], d['khung_chung_sha256'] = dict(id=[], pts_s=[]), None
         hw[i] = d
     # ---- spreads of the standard 12b group of each place (LLC1-4); thresholds of 8 within each place (LLC1-13)
     runs12 = sorted({c['meta']['luot'] for c in fitw if c['meta']['loai'] == LOAI_CHUAN})
@@ -2618,26 +2632,27 @@ def phan_doan(rows, luot, hw, fitw, so, ctx, g_b, nguong_cho):
         out[it['id']] = o
         if seg < 0:
             o['ly_do'] = 'khong_co_12b_cung_lan_lap'
-            continue
-        if cho not in seg12[seg]:
+        elif cho not in seg12[seg]:
             o['ly_do'] = 'khong_co_cua_so_chuan'
-            continue
-        l12 = seg12[seg][cho]
-        if l12 is None:
+        elif seg12[seg][cho] is None:
             o['ly_do'] = '12b_cung_lan_lap_khong_hop_le'
-            continue
-        o['ung_vien'], o['j'] = l12, ref[(cho, l12)]
-        sw = _w_bat_ky(fitw[o['j']])
-        wx = _hai(pre) if pre['ok'] and pre['du_ok'] else None
-        d = tong_doi(so_sanh(sw, wx, ctx, g_b, nguong_cho({cho})))
-        o['doi_so_chuan'] = d
-        if gay:
-            o['ly_do'] = 'lan_lap_sau_doi'
-        elif d is False:
-            o['lan_lap_id'], o['chuan_12b'] = f'L{seg}', l12
         else:
-            o['ly_do'] = 'tam_doi_so_chuan' if d is True else 'lan_lap_khong_xac_dinh'
-        if d is True or tong_doi(so[it['id']]) is True:         # LLC3-1: a valid doi breaks the group
+            l12 = seg12[seg][cho]
+            o['ung_vien'], o['j'] = l12, ref[(cho, l12)]
+            sw = _w_bat_ky(fitw[o['j']])
+            pre_ok = pre['ok'] and pre['du_ok']
+            d = tong_doi(so_sanh(sw, _hai(pre) if pre_ok else None, ctx, g_b, nguong_cho({cho})))
+            o['doi_so_chuan'] = d
+            if not pre_ok:                                      # LLC4-1, CT4-3: a failed pre -> not determined
+                o['ly_do'] = 'lan_lap_khong_xac_dinh'
+            elif gay:
+                o['ly_do'] = 'lan_lap_sau_doi'
+            elif d is False:
+                o['lan_lap_id'], o['chuan_12b'] = f'L{seg}', l12
+            else:
+                o['ly_do'] = 'tam_doi_so_chuan' if d is True else 'lan_lap_khong_xac_dinh'
+        # LLC3-1 (round 4): a valid doi breaks the group, also from a run whose place has no standard
+        if o['doi_so_chuan'] is True or tong_doi(so[it['id']]) is True:
             gay = True
     return out
 
