@@ -136,18 +136,35 @@ def _trang_thai(d, key):
     return tt.get(key) if isinstance(tt, dict) else None
 
 
-def q_luot(xoay, lan_lap):
+def q_luot(xoay, lan_lap, cho=None):
     """(q [x, y] or None, u_q [m] or None, ly_do) of the run. Same mounting as the E clip (lan_lap absent: the
-    calibration clips of the same session, 12b / E; or cung_lan_lap true): q of xoay_v1. Another mounting needs the q
-    composed by CODE_C8B (q_B,dich = q_B,chuan,k + delta_c_B, CODE 19/11) with delta_c_B 'dat'; its signature is not
-    agreed yet, so another mounting has no q (position through q not concluded) until it is."""
+    calibration clips of the same session, 12b / E; or cung_lan_lap true): q of xoay_v1. Another mounting: the q
+    composed by CODE_C8B, c8b_xoay.ghep_q(lan_lap, cho) -> {q_m, u_q_m, trang_thai, ly_do} (contract F16: q_m =
+    R(-theta_luot) (q_B_chuan_k + delta_c_B), before the margin); not 'dat', not importable or no place: no q (the
+    position through q is not concluded)."""
     if not xoay['ok']:
         return None, None, xoay['ly_do']
     if lan_lap is None or lan_lap.get('cung_lan_lap') is True:
         return list(xoay['q']), float(xoay['u_q']), ('khong_kiem_lan_lap' if lan_lap is None else '')
     if _trang_thai(lan_lap, 'delta_c_B') != 'dat':
         return None, None, 'thieu_delta_c_B'
-    return None, None, 'cho_ham_ghep_q_C8B'
+    if cho is None:
+        return None, None, 'thieu_cho_cho_ghep_q'
+    try:
+        import c8b_xoay                                   # CODE_C8B, contract F16
+        g = c8b_xoay.ghep_q
+    except (ImportError, AttributeError):
+        return None, None, 'cho_ham_ghep_q_C8B'
+    r = g({k: v for k, v in lan_lap.items() if not k.startswith('_')}, cho)
+    if not isinstance(r, dict) or r.get('trang_thai') != 'dat':
+        return None, None, 'ghep_q_' + str((r or {}).get('trang_thai')) + ':' + str((r or {}).get('ly_do', ''))
+    try:
+        q, u = [float(r['q_m'][0]), float(r['q_m'][1])], float(r['u_q_m'])
+    except (KeyError, TypeError, ValueError, IndexError):
+        return None, None, 'ghep_q_sai_dinh_dang'
+    if not all(math.isfinite(v) for v in q + [u]) or u < 0.0:
+        return None, None, 'ghep_q_khong_huu_han'
+    return q, u, ''
 
 
 # ---------------------------------------------------------------- frames
@@ -177,10 +194,11 @@ def _tag_heading_source(rows, frames_path, track):
     return 'psi'
 
 
-def chuoi_khung(frames_csv, a6, xoay, lan_lap=None, plumb=PLUMB_16_11, zc=ZC_16_11, track=None):
+def chuoi_khung(frames_csv, a6, xoay, lan_lap=None, plumb=PLUMB_16_11, zc=ZC_16_11, track=None, cho=None):
     """Rows (dicts with ROW_KEYS) of every frame of frames.csv (module docstring). a6: doc_a6(...) or None; xoay: path,
     dict or doc_xoay(...) result; lan_lap: path, dict or doc_lan_lap(...) result, or None (calibration clips of the
-    session of E: same mounting). Angles in rad, positions in m."""
+    session of E: same mounting); cho: place k of the run (goc, K1, K2) for the C8B q composition of another
+    mounting. Angles in rad, positions in m."""
     rows, fpath = _frames(frames_csv)
     xo = xoay if (isinstance(xoay, dict) and 'ok' in xoay and 'q' in xoay) else doc_xoay(xoay)
     ll = lan_lap if (lan_lap is None or '_sha256' in lan_lap) else doc_lan_lap(lan_lap)
@@ -214,7 +232,7 @@ def chuoi_khung(frames_csv, a6, xoay, lan_lap=None, plumb=PLUMB_16_11, zc=ZC_16_
                     if not a6ok[k]:
                         why_a6[k] = f'a6_khung:{why[j]}'
     psi_p = np.where(a6ok, tp - np.nan_to_num(dps), np.nan)
-    q, uq, why_q = q_luot(xo, ll)
+    q, uq, why_q = q_luot(xo, ll, cho)
     if q is not None:
         c, s = np.cos(psi_p), np.sin(psi_p)
         px = tx - (c * q[0] - s * q[1])

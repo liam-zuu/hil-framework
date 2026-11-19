@@ -109,13 +109,29 @@ def test_other_plate_refuses_a6(fake_a6, tmp_path):
                for r in out)
 
 
-def test_another_mounting_waits_for_the_c8b_composition(fake_a6, tmp_path):
+def test_another_mounting_uses_the_c8b_composition(fake_a6, tmp_path, monkeypatch):
     a6p, _ = fake_a6
     ll = dict(schema='lan_lap_v1', tam_id='T1', cung_lan_lap=False, trang_thai={'delta_c_B': 'dat'})
     out = ck.chuoi_khung(spin_rows(), ck.doc_a6(a6p), xoay_file(tmp_path), lan_lap=ll, track=TRACK0)
-    assert all(r['a6_ok'] and not r['q_ok'] and 'cho_ham_ghep_q_C8B' in r['ly_do'] for r in out)
+    assert all(r['a6_ok'] and not r['q_ok'] and 'thieu_cho_cho_ghep_q' in r['ly_do'] for r in out)
+    seen = {}
+    mod = types.ModuleType('c8b_xoay')
+
+    def ghep_q(lan_lap, cho):                          # contract F16 (C8B), q of the other mounting
+        seen.update(lan_lap=lan_lap, cho=cho)
+        return dict(q_m=[0.02, 0.015], u_q_m=0.0007, trang_thai=lan_lap.get('st_thu', 'dat'), ly_do='')
+    mod.ghep_q = ghep_q
+    monkeypatch.setitem(sys.modules, 'c8b_xoay', mod)
+    rows = spin_rows(q=(0.02, 0.015))
+    out = ck.chuoi_khung(rows, ck.doc_a6(a6p), xoay_file(tmp_path), lan_lap=ll, track=TRACK0, cho='K1')
+    assert seen['cho'] == 'K1' and all(r['q_ok'] and r['u_q_m'] == 0.0007 for r in out)
+    px, py = np.array([r['p_x'] for r in out]), np.array([r['p_y'] for r in out])
+    assert np.max(np.hypot(px - 0.4, py + 0.2)) < 1e-6
+    ll['st_thu'] = 'chua_ket_luan'
+    out = ck.chuoi_khung(rows, ck.doc_a6(a6p), xoay_file(tmp_path), lan_lap=ll, track=TRACK0, cho='K1')
+    assert all(not r['q_ok'] and 'ghep_q_chua_ket_luan' in r['ly_do'] for r in out)
     ll['trang_thai'] = {'delta_c_B': 'chua_ket_luan'}
-    out = ck.chuoi_khung(spin_rows(), ck.doc_a6(a6p), xoay_file(tmp_path), lan_lap=ll, track=TRACK0)
+    out = ck.chuoi_khung(rows, ck.doc_a6(a6p), xoay_file(tmp_path), lan_lap=ll, track=TRACK0, cho='K1')
     assert all('thieu_delta_c_B' in r['ly_do'] for r in out)
 
 
