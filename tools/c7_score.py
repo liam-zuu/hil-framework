@@ -299,6 +299,9 @@ def load_hang_so(path):
     # J v6 2, 4; contract F14 (CAM v5 3.2): checked when present; required only by the relative mode (khung_tc_of,
     # Codex CT1-15: a locked file of the absolute mode without it still loads)
     out['khung_tc'] = None if d.get('khung_tc') is None else ctd.check_khung_tc(d['khung_tc'], locked)
+    # F14 (CODE 19/11 after T9): the yaw-latch age threshold of J v6 5 (1), relative mode only (tuoi_yaw_max_of)
+    out['tuoi_yaw_max_ms'] = (None if d.get('tuoi_yaw_max_ms') is None
+                              else _num(d, 'tuoi_yaw_max_ms', 1.0, 1000.0, 'hang_so'))
     md = imu.get('mien_dong')
     if md is None and locked:
         raise ValueError('hang_so imu mien_dong: the locked range of U_IMU per level is required when khoa_c8')
@@ -1432,6 +1435,70 @@ def add_undefined(prow, gi, tv, idx, deadline, R):
     return [allr[i] for i in order], out
 
 
+TUOI_YAW_MAX_DE_XUAT_MS = 125.0     # CODE 19/11 (T9): the firmware's own validity limit at 20 Hz [DE XUAT, khoa o C8]
+T_AGE_US = 125000                   # imu_fusion t_age_us at 20 Hz: the proven domain of the logged age (T9 doc 2.1)
+
+
+def tuoi_yaw_max_of(hs):
+    """The age threshold of the yaw latch [ms] (contract F14 tuoi_yaw_max_ms): the constants, or the proposal before
+    C8; a locked file without it is refused here (relative mode only)."""
+    v = hs.get('tuoi_yaw_max_ms')
+    if v is None:
+        if hs['trang_thai'] == 'khoa_c8':
+            raise ValueError('hang_so tuoi_yaw_max_ms: the yaw-latch age threshold is required when khoa_c8 (F14)')
+        return TUOI_YAW_MAX_DE_XUAT_MS
+    return float(v)
+
+
+def _cell(r, k):
+    try:
+        v = float(r.get(k))
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+def yaw_latch_flags(rows, i_edge, age_max_ms):
+    """J v6 5 (1), heading latch at the command edge (Codex CT1-19; CODE 19/11 after T9, reference
+    fwsim/t9_heading_cases.ref_cond1 of hil d400759, T9 doc 2.1, 4, 7): the edge row has r_valid = 1, rv_n > 0,
+    head_on = 1, psi_ref = 0; the upper bound of the yaw age at the latch, integer us, = age_r_ms as printed + 50 us
+    (half print step) + gap to the next row + 3 us, needs the logged age inside [-gap - 0.05 ms, 125.05 ms]; the next
+    row is log_seq + 1 (dong_ke_lien) or, when that one is missing, the next later row of the log with a larger
+    log_seq and time (a looser bound, dong_ke_lien false, CODE 19/11); no such row, or a cell missing: not
+    determinable. A bound above age_max_ms (exact decimal comparison), not latched or not determinable: lost to the
+    command path. Returns (flags, info)."""
+    from decimal import Decimal
+    e = rows[i_edge]
+    info = dict(tuoi_yaw_max_ms=age_max_ms)
+    flags = []
+    latched = (_cell(e, 'r_valid') == 1 and (_cell(e, 'rv_n') or 0) > 0 and _cell(e, 'head_on') == 1
+               and _cell(e, 'psi_ref') == 0.0)
+    info['chot_dung'] = bool(latched)
+    if not latched:
+        flags.append('vong huong khong chot dung o canh (r_valid, rv_n, head_on, psi_ref; J v6 5 (1))')
+    seq0, t0 = _cell(e, 'log_seq'), _cell(e, 'timestamp_us')
+    nxt, lien = None, False
+    for r in rows[i_edge + 1:]:
+        sq, tt = _cell(r, 'log_seq'), _cell(r, 'timestamp_us')
+        if sq is not None and seq0 is not None and tt is not None and t0 is not None and sq > seq0 and tt > t0:
+            nxt, lien = r, sq == seq0 + 1
+            break
+    age = _cell(e, 'age_r_ms')
+    age_us = None if age is None else int(round(age * 10)) * 100
+    gap_us = None if nxt is None else int(_cell(nxt, 'timestamp_us') - t0)
+    info.update(dong_ke_lien=lien if nxt is not None else None, age_r_ms=age,
+                gap_ms=None if gap_us is None else gap_us / 1000)
+    if not latched or age_us is None or gap_us is None or not (-gap_us - 50 <= age_us <= T_AGE_US + 50):
+        info['can_tuoi_ms'] = None
+        flags.append('can tren tuoi yaw luc chot khong xac dinh (J v6 5 (1))')
+    else:
+        bound = age_us + 50 + gap_us + 3
+        info['can_tuoi_ms'] = bound / 1000
+        if Decimal(bound) > Decimal(str(age_max_ms)) * 1000:
+            flags.append(f'can tren tuoi yaw luc chot {bound / 1000:.3f} ms > {age_max_ms:g} ms (J v6 5 (1))')
+    return flags, info
+
+
 def psi_reset_flags(rows, i_edge, t0_us, t_end_s):
     """J v6 5 (1) (Codex CT1-19, part): psi_reset_count or reset_n changing inside the run window [t0, t0 + t_end]
     (the heading reference reset, or the IMU chip reset, mid-run) is a run lost to the command path; neither column
@@ -1870,8 +1937,11 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
     sh = sh[np.isfinite(sh)]
     shift_max = float(sh.max()) if len(sh) else float('nan')
     bumped = bool(len(sh) and shift_max > hs['bump_px'])
+    chot_yaw = None
     if R is not None:
         cmd_flags += psi_reset_flags(rows, i_edge, t0_us, t_end_u)
+        fl_y, chot_yaw = yaw_latch_flags(rows, i_edge, tuoi_yaw_max_of(hs))
+        cmd_flags += fl_y
     cmd_lost = bool(cmd_flags)
     # outcome (O1 3.5)
     t1 = out['t1']
@@ -1994,7 +2064,8 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
                    id_khung_sha256=ctd.ids_sha(ids_hop))
         out.update(khung_tuong_doi=_clean(dict(rel_block(rel, R), t_som_s=out.pop('t_som_s', None),
                                                gio_sha256=None if gio is None else gio['sha256'],
-                                               esp32_sha256=cm.sha256(esp32_path), mien_phai_phu=mpp)),
+                                               esp32_sha256=cm.sha256(esp32_path), mien_phai_phu=mpp,
+                                               chot_yaw=chot_yaw)),
                    placement_n=None)
     out.update(base, version=VERSION, outcome=outcome, fail_cause=fail_cause, outcome_reasons=reasons,
                completed=g1['q'], gate_v3=gate, gate_rq3=gate_rq3, cat_t1=cat, report_only=sorted(report_only), U_t_s=u_t, U_t_parts=u_t_parts, yaw_check=yaw,

@@ -87,10 +87,29 @@ def rel_for(task, frames, chain, truc=True, beta_ok=True, tam=False, neo=None, u
     return cs.build_rel(task, chain, tc, tx, ll, u_beta_cam)
 
 
-def score(tmp_path, task, frames, rel=None, log_kw=None, **kw):
+def latch_cols(path, edit=None):
+    """Add the heading-latch columns of the firmware log (head_on 1, psi_ref 0) to a make_log CSV; edit(rows, i_edge)
+    may change rows (i_edge: first run_active = 1 row)."""
+    import csv
+    with open(path, encoding='utf-8') as f:
+        head = f.readline()
+        rows = list(csv.DictReader(f))
+    for r in rows:
+        r.update(head_on='1', psi_ref='0.0000')
+    if edit:
+        edit(rows, next(i for i, r in enumerate(rows) if r['run_active'] == '1'))
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        f.write(head)
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    return path
+
+
+def score(tmp_path, task, frames, rel=None, log_kw=None, latch=None, **kw):
     tmp_path.mkdir(parents=True, exist_ok=True)
     hs = B.hs_file(tmp_path)
-    log = B.make_log(tmp_path / 'esp32.csv', task, (0.0, 0.0, 0.0), **(log_kw or {}))
+    log = latch_cols(B.make_log(tmp_path / 'esp32.csv', task, (0.0, 0.0, 0.0), **(log_kw or {})), latch)
     return cs.score(frames, log, task, hs, offset_s=B.OFFSET, offset_reason='test', offset_anchor_s=0.0,
                     offset_err_s=0.0, rel=rel, **kw)
 
@@ -222,8 +241,8 @@ def test_plate_moved_imu_certain_violation_is_khong_dat(tmp_path):
     lane_rows = B.make_frames('O1-K1')
     fl, chain = to_floor('O1-K1', lane_rows)
     hs = B.hs_file(tmp_path)
-    log = B.make_log(tmp_path / 'esp32.csv', 'O1-K1', (0.0, 0.0, 0.0),
-                     yaw_err=lambda t: math.radians(10.0) if 2.0 <= t <= 3.0 else 0.0)
+    log = latch_cols(B.make_log(tmp_path / 'esp32.csv', 'O1-K1', (0.0, 0.0, 0.0),
+                                yaw_err=lambda t: math.radians(10.0) if 2.0 <= t <= 3.0 else 0.0))
     out, _ = cs.score(fl, log, 'O1-K1', hs, offset_s=B.OFFSET, offset_reason='test', offset_anchor_s=0.0,
                       offset_err_s=0.0, allow_final_set=True, rel=rel_for('O1-K1', fl, chain, tam=True))
     g = gate_ok(out)
@@ -470,7 +489,7 @@ def test_ct1_6_yaw_suspect_flag_from_the_comparison(tmp_path):
     fl, chain = to_floor('O1-F05', lane_rows, psi_extra=off)
     tmp_path.mkdir(parents=True, exist_ok=True)
     hs = B.hs_file(tmp_path, U_psi_deg=5.0, yaw_nghi_deg=1.0)
-    log = B.make_log(tmp_path / 'esp32.csv', 'O1-F05', (0.0, 0.0, 0.0))
+    log = latch_cols(B.make_log(tmp_path / 'esp32.csv', 'O1-F05', (0.0, 0.0, 0.0)))
     out, rows = cs.score(fl, log, 'O1-F05', hs, offset_s=B.OFFSET, offset_reason='test', offset_anchor_s=0.0,
                          offset_err_s=0.0, rel=rel_for('O1-F05', fl, chain))
     mid = [r for r in rows if 2.1 <= r['t'] <= 2.9]
@@ -703,3 +722,44 @@ def test_mien_phai_phu_lists_the_union_domain_frames(tmp_path):
     ids = [r['frame_id'] for r in rows if r['mien_hop']]
     assert m['id_khung'] == ids and m['id_khung_sha256'] == ctd.ids_sha(ids) and m['nut'] is None
     assert m['D_s'] == B.OFFSET and len(ids) > 100
+
+
+@pytest.mark.parametrize('case', ['ok', 'not_latched', 'age_over', 'no_next_row_lien', 'no_column'])
+def test_ct1_19_yaw_latch_at_the_edge(tmp_path, case):
+    """CT1-19 (T9, CODE 19/11): the edge row latched (r_valid, rv_n, head_on, psi_ref 0) and the age bound
+    age + 0.05 ms + gap + 0.003 ms <= tuoi_yaw_max_ms; the next row not log_seq + 1: a later row, dong_ke_lien false;
+    a latch column missing: not determinable, a command-path loss."""
+    def edit(rows, i):
+        if case == 'not_latched':
+            rows[i]['psi_ref'] = '0.0100'
+        elif case == 'age_over':
+            rows[i]['age_r_ms'] = '124.9'
+        elif case == 'no_next_row_lien':
+            rows[i + 1]['timestamp_us'] = rows[i]['timestamp_us']       # log_seq + 1 not later: not usable
+        elif case == 'no_column':
+            for r in rows:
+                del r['head_on']
+    lane_rows = B.make_frames('O1-F05')
+    fl, chain = to_floor('O1-F05', lane_rows)
+    out, _ = score(tmp_path, 'O1-F05', fl, rel=rel_for('O1-F05', fl, chain), latch=edit)
+    c = out['khung_tuong_doi']['chot_yaw'] if out.get('khung_tuong_doi') else None
+    if case in ('ok', 'no_next_row_lien'):
+        assert out['outcome'] != 'hong_he_do' and c['chot_dung'] and c['can_tuoi_ms'] <= 125.0
+        assert c['dong_ke_lien'] is (case == 'ok')
+        if case == 'no_next_row_lien':
+            assert c['gap_ms'] > 15.0                                    # two log periods: a looser bound
+    else:
+        assert out['outcome'] == 'hong_he_do' and out['fail_cause'] == cs.FAIL_CMD
+        assert any('J v6 5 (1)' in w for w in out['outcome_reasons'])
+
+
+def test_ct1_19_age_bound_example():
+    """J v6 5 example: true age 8.04 ms printed 8.0, latch gap 2.00 ms -> bound 10.053 ms, above a 10 ms threshold."""
+    rows = [dict(log_seq='10', timestamp_us='1000000', run_active='0'),
+            dict(log_seq='11', timestamp_us='1010000', run_active='1', r_valid='1', rv_n='3', head_on='1',
+                 psi_ref='0.0000', age_r_ms='8.0'),
+            dict(log_seq='12', timestamp_us='1012000', run_active='1')]
+    fl, info = cs.yaw_latch_flags(rows, 1, 10.0)
+    assert abs(info['can_tuoi_ms'] - 10.053) < 1e-9 and fl and info['dong_ke_lien'] is True
+    fl, info = cs.yaw_latch_flags(rows, 1, 10.06)
+    assert not fl
