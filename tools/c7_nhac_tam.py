@@ -1643,6 +1643,8 @@ GIOI_HAN_V4 = [
     'LLC1-13, LLC2-3: chua co phep so thang chi bang ma (khong neo); mat neo -> so thang khong_xac_dinh (DEFERRED, '
     'gui CODE).',
     'LLC1-16: cua so mat ma chi du doan neo tu cua so gan nhat cung clip; khong du doan -> cua so hong (an toan).',
+    'v4 13 (CODE chot tam 19/11, phuong an b): beta_cam_replay doi diem neo hai dau voi G, h da khoa; u_beta_cam khong '
+    'gom phan sai ban do di qua khop lai hinh neo (G, h).',
 ]
 
 
