@@ -80,13 +80,14 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import hashlib
 import json
 import math
 import os
 import random
 import sys
 from collections import defaultdict
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DATASET = os.path.normpath(os.path.join(HERE, '..', '..', '..', '05_DATA', 'M7_dataset'))
@@ -618,18 +619,43 @@ def check_luoi_dict(d, what: str) -> str:
     return st
 
 
+def read_json_sha(path: str, what: str) -> Tuple[object, str]:
+    """GC6-12 (round 3): a JSON file read once; its content and the sha256 of the very bytes parsed."""
+    try:
+        with open(path, 'rb') as f:
+            raw = f.read()
+        return json.loads(raw.decode('utf-8')), hashlib.sha256(raw).hexdigest()
+    except (OSError, ValueError) as exc:
+        raise LogError(f'{what} {path!r}: {exc}')
+
+
+def read_luoi_sha(path: str) -> Tuple[Optional[dict], str]:
+    """(the content of a scorer file when it is a c8b_luoi output, checked (check_luoi_dict), else None; the sha256 of
+    the bytes parsed): hashed and parsed from one read (GC6-12)."""
+    d, sha = read_json_sha(path, '--gate-json')
+    if not isinstance(d, dict) or 'trang_thai_luot' not in d:
+        return None, sha
+    check_luoi_dict(d, f'--gate-json {path!r}')
+    return d, sha
+
+
 def read_luoi(path: str) -> Optional[dict]:
     """The content of a scorer file when it is a c8b_luoi output (it has trang_thai_luot), checked (check_luoi_dict);
     None for another scorer file."""
-    try:
-        with open(path, 'rb') as f:
-            d = json.loads(f.read().decode('utf-8'))
-    except (OSError, ValueError) as exc:
-        raise LogError(f'--gate-json {path!r}: {exc}')
-    if not isinstance(d, dict) or 'trang_thai_luot' not in d:
-        return None
-    check_luoi_dict(d, f'--gate-json {path!r}')
-    return d
+    return read_luoi_sha(path)[0]
+
+
+def khong_nut_sources(lu: dict, lu_sha: str, tg, tg_sha: str, task: str, what: str) -> None:
+    """GC6-12 (round 3): the one rule 'end' and the summary apply to a run without a scored node: its c8b_luoi file
+    (KHONG_NUT, of the run's task) was made from the time file given (gio_sha256 = the sha256 of the bytes read), a
+    c8b_gio_v1 file of that task naming its ESP32 log."""
+    if check_luoi_dict(lu, f'{what}: H0 file') != KHONG_NUT or lu.get('task', task) != task or not _hex64(lu_sha):
+        raise LogError(f'{what}: the H0 file is not a c8b_luoi file of task {task!r} without a scored node (F11)')
+    if tg_sha != lu['gio_sha256']:
+        raise LogError(f'{what}: the time file is not the one its c8b_luoi file was made from (gio_sha256; GC6-12)')
+    if not isinstance(tg, dict) or tg.get('format') != 'c8b_gio_v1' or tg.get('task') != task \
+            or not isinstance(tg.get('sha256'), dict) or not _hex64(tg['sha256'].get('esp32')):
+        raise LogError(f'{what}: the time file is not a c8b_gio_v1 file of task {task!r} naming its ESP32 log (GC6-12)')
 
 
 def read_luoi_khong_nut(path: str) -> bool:
@@ -1308,6 +1334,11 @@ def check_score_final(r: dict, path: str, ds: str) -> tuple:
         if h1_kn and o1 != 'chua_ket_luan':
             raise LogError(f'run {uid}: an H1 c8b_luoi file without a scored node is chua_ket_luan, not {o1!r}')
         if h1_kn:                                                                          # GC7-3
+            # round 3: the H1 scoring is of the run's task and has its own time file (not that of H0)
+            if h1.get('task') != r.get('trajectory') or h1['gio_sha256'] == h0.get('gio_sha256'):
+                raise LogError(f'run {uid}: the H1 c8b_luoi file is of task {h1.get("task")!r} (the run is '
+                               f'{r.get("trajectory")!r}) or names the time file of the H0 scoring: H1 has its own '
+                               '(GC7-3)')
             g1f = _time_file_of(rd, h1['gio_sha256'], r.get('trajectory'), f'run {uid}: H1 time file')
             if 'trang_thai_luot' in h0:
                 esp0 = _time_file_of(rd, h0.get('gio_sha256'), r.get('trajectory'),
@@ -1903,15 +1934,14 @@ def _file_by_sha(folder: str, sha: str) -> Optional[str]:
 
 
 def _time_file_of(rd: str, sha: str, task: str, what: str) -> dict:
-    """The c8b_gio_v1 time file under rd whose sha256 is sha, of task (GC6-12, GC7-3, GC7-4)."""
+    """The c8b_gio_v1 time file under rd whose sha256 is sha, of task (GC6-12, GC7-3, GC7-4); parsed from the bytes
+    hashed (round 3)."""
     q = _file_by_sha(rd, sha) if _hex64(sha) else None
     if q is None:
         raise LogError(f'{what}: no time file with sha256 {str(sha)[:12]}... under {rd}')
-    try:
-        with open(q, encoding='utf-8') as f:
-            g = json.load(f)
-    except (OSError, ValueError) as exc:
-        raise LogError(f'{what}: {q}: {exc}')
+    g, got = read_json_sha(q, what)
+    if got != sha:
+        raise LogError(f'{what}: {q} changed while it was read')
     if not isinstance(g, dict) or g.get('format') != 'c8b_gio_v1' or g.get('task') != task \
             or not isinstance(g.get('sha256'), dict) or not _hex64(g['sha256'].get('esp32')):
         raise LogError(f'{what}: {q} is not a c8b_gio_v1 file of task {task!r} naming its ESP32 log')
@@ -1921,22 +1951,32 @@ def _time_file_of(rd: str, sha: str, task: str, what: str) -> dict:
 def check_khong_nut_rows(tun: List[dict], ds: str) -> None:
     """GC6-12, GC7-4: a KHONG_NUT row read again from its sources: its H0 file (gate_json_sha256 under results_dir) is
     a c8b_luoi file without a scored node, and the time file it names is under results_dir, of the row's task; the
-    row's c8b_gio_sha256 is that file (empty on a row of the writer before GC6-12, then checked the same way)."""
+    row's c8b_gio_sha256 is that file (empty on a row of the writer before GC6-12, then checked the same way). Round 3:
+    the rule of 'end' (khong_nut_sources) on the bytes hashed; GC8-2: no two rows on one H0 file or one time file,
+    compared on the SHA read back from the sources (an empty c8b_gio_sha256 cell included), and against the
+    c8b_gio_sha256 of the other rows."""
+    seen = {r.get('c8b_gio_sha256'): r.get('run_uid') for r in tun
+            if r.get('fail_cause') != KHONG_NUT and r.get('c8b_gio_sha256')}
+    seen_h0 = {}
     for r in tun:
         if r.get('fail_cause') != KHONG_NUT:
             continue
         uid = r.get('run_uid')
         h0 = h0_file(r, ds)
-        try:
-            with open(h0, 'rb') as f:
-                d = json.loads(f.read().decode('utf-8'))
-        except (OSError, ValueError) as exc:
-            raise LogError(f'{uid}: {h0}: {exc}')
-        if check_luoi_dict(d, f'{uid}: H0 file {h0}') != KHONG_NUT:
+        d, h0_sha = read_json_sha(h0, f'{uid}: H0 file')
+        if h0_sha != r.get('gate_json_sha256'):
+            raise LogError(f'{uid}: {h0} changed while it was read')
+        if not isinstance(d, dict) or check_luoi_dict(d, f'{uid}: H0 file {h0}') != KHONG_NUT:
             raise LogError(f'{uid}: fail cause {KHONG_NUT} but its H0 file is not a c8b_luoi file without a scored node')
         if r.get('c8b_gio_sha256') not in ('', d['gio_sha256']):
             raise LogError(f'{uid}: c8b_gio_sha256 is not the time file its c8b_luoi file was made from (GC6-12)')
-        _time_file_of(_results_dir(r, ds), d['gio_sha256'], r.get('trajectory'), f'{uid}')
+        g = _time_file_of(_results_dir(r, ds), d['gio_sha256'], r.get('trajectory'), f'{uid}')
+        khong_nut_sources(d, h0_sha, g, d['gio_sha256'], r.get('trajectory'), f'{uid}')
+        for sha, book, kind in ((d['gio_sha256'], seen, 'time file'), (h0_sha, seen_h0, 'H0 file')):
+            if sha in book:
+                raise LogError(f'{uid}: the {kind} {sha[:12]}... is that of another run ({book[sha]}): one per run '
+                               '(GT1-8, GC8-2)')
+            book[sha] = uid
 
 
 def check_c8b_rows(tun: List[dict]) -> None:
@@ -2561,21 +2601,16 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
         if not c8b_gio or not os.path.isdir(results_dir) or not _inside(c8b_gio, results_dir):          # GC6-12
             raise LogError('a c8b_luoi file without a scored node needs the time file of the run (--c8b-gio, under '
                            '--results-dir): the file it was made from (GC6-12)')
-        lu = read_luoi(gate_path) if gate_path else None
-        if lu is None or lu['trang_thai_luot'] != KHONG_NUT or sha256_file(gate_path) != gate_sha256:
+        # GC8-1 (round 3): the H0 file is where the summary looks for it (under results_dir), checked before writing
+        if not gate_path or not _inside(gate_path, results_dir):
+            raise LogError('a run without a scored node: end reads its c8b_luoi file (--gate-json) under --results-dir, '
+                           'where the summary reads it again (C9D-1, GC6-12, GC8-1)')
+        lu, lu_sha = read_luoi_sha(gate_path)              # GC6-12 (round 3): hashed and parsed from one read
+        if lu is None or lu_sha != gate_sha256:
             raise LogError('a run without a scored node: end reads its c8b_luoi file (gate_path, sha256 = gate_sha256, '
                            f'trang_thai_luot {KHONG_NUT}; GC6-12)')
-        c8b_sha = sha256_file(c8b_gio)
-        if c8b_sha != lu['gio_sha256']:
-            raise LogError(f'--c8b-gio {c8b_gio!r}: not the time file the c8b_luoi file was made from (gio_sha256; '
-                           'GC6-12)')
-        try:
-            with open(c8b_gio, encoding='utf-8') as f:
-                tg = json.load(f)
-        except (OSError, ValueError) as exc:
-            raise LogError(f'--c8b-gio {c8b_gio!r}: {exc}')
-        if not isinstance(tg, dict) or tg.get('format') != 'c8b_gio_v1' or tg.get('task') != run['row'].get('trajectory'):
-            raise LogError(f'--c8b-gio {c8b_gio!r}: a c8b_gio_v1 file of task {run["row"].get("trajectory")!r} (GC6-12)')
+        tg, c8b_sha = read_json_sha(c8b_gio, '--c8b-gio')
+        khong_nut_sources(lu, lu_sha, tg, c8b_sha, run['row'].get('trajectory'), f'--c8b-gio {c8b_gio!r}')
         fail_cause = KHONG_NUT
     elif fail_cause == KHONG_NUT:
         raise LogError(f'fail cause {KHONG_NUT} only with its c8b_luoi file (F11)')
@@ -2892,13 +2927,13 @@ _SAME_CONDITION = ('campaign', 'platform', 'stage', 'trajectory', 'speed_mps', '
 def read_gate_file(path: str, allow_fake: bool = False):
     """EA-9, O1 v11.33: the locked C8 gate file (tools/gate_c8.py: levels, report-only conditions per level), never
     typed again; a gate_c8.GateC8 (its sha256 is that of the file bytes). GC6-14: a FAKE content (tests, demo) only
-    with allow_fake."""
+    with allow_fake; (round 3) any FAKE mark on a content that is not wholly FAKE is refused even with allow_fake."""
     try:
         gf = gate_c8.read_gate_c8(path)
     except gate_c8.GateFileError as exc:
         raise LogError(str(exc))
-    if gf.fake and not allow_fake:
-        raise LogError(f'gate file {path!r}: a FAKE content (tests, demo), not a C8 gate (GC6-14)')
+    if (gf.fake or gf.fake_sign) and not (gf.fake and allow_fake):
+        raise LogError(f'gate file {path!r}: a FAKE content or FAKE marks (tests, demo), not a C8 gate (GC6-14)')
     return gf
 
 
@@ -3767,14 +3802,14 @@ def main(argv=None) -> int:
                 raise LogError(f'--gate-json {a.gate_json!r} is an output of c7_calib_drift.py gop (block calib_drift): '
                                'end logs the provisional outcome with the H0 scoring (score.json of the run), then '
                                'so-h --run-uid <run> --score-final <this file> after the clip H comparison')
-            lu = read_luoi(a.gate_json) if a.gate_json else None                             # F11, GC6-12
+            lu, gj_sha = read_luoi_sha(a.gate_json) if a.gate_json else (None, '')           # F11, GC6-12
             kn = lu is not None and lu['trang_thai_luot'] == KHONG_NUT
             if kn and not a.c8b_gio:
                 raise LogError('a c8b_luoi file without a scored node needs --c8b-gio (the time file of the run)')
             row = end(ds, a.outcome, a.completed, a.e_perp_max, a.fail_cause, a.results_dir, a.notes,
                       gate=(None if kn else read_gate_json(a.gate_json, allow_null=a.outcome == 'hong_he_do'))
                       if a.gate_json else None, gate_khong_nut=kn,
-                      gate_sha256=sha256_file(a.gate_json) if a.gate_json else '',
+                      gate_sha256=gj_sha,
                       gate_path=a.gate_json if kn else '',
                       gate_file=read_gate_file(a.gate_file, a.gate_file_fake) if a.gate_file else None, c8b_gio=a.c8b_gio or None,
                       **boots)

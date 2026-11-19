@@ -455,7 +455,7 @@ def _luoi(tmp, name, st='chua_ket_luan_khong_nut', n=0, gate=None, gio=None):
     p = os.path.join(str(tmp), f'{name}.json')
     out = {'cham': 'dat', 'hong_he_do': 'hong_he_do'}.get(st, 'chua_ket_luan')
     with open(p, 'w', encoding='utf-8') as f:
-        json.dump(dict(FAKE=True, name=name, trang_thai_luot=st, n_nut_cham=n,
+        json.dump(dict(FAKE=True, name=name, trang_thai_luot=st, n_nut_cham=n, task='O1-F05',
                        gio_sha256=rl.sha256_file(gio) if gio else 'c' * 64, gate_v3=gate, outcome=out,
                        ly_do=['khong_cham_duoc']), f)
     return p
@@ -1157,6 +1157,60 @@ def test_gc6_12_end_reads_the_luoi_file_itself(ds):
     for path in (other, ''):                                            # a judged grid file / no file: the flag alone
         with pytest.raises(rl.LogError, match='GC6-12'):
             rl.end(d, 'chua_ket_luan', gate_path=path, **kw)
+
+
+def test_gc8_1_end_needs_the_h0_file_under_results_dir(ds, tmp_path_factory):
+    """GC8-1 (Codex round 3): the luoi file outside --results-dir (time file inside): refused before the row is
+    written (the summary would not find it)."""
+    d, gf, tmp = ds
+    g = _gio(tmp, 'kn81_gio', ok=True)
+    out = tmp_path_factory.mktemp('outside')
+    p = _luoi(out, 'kn81', gio=g)
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    with pytest.raises(rl.LogError, match='GC8-1'):
+        rl.end(d, 'chua_ket_luan', completed=1, results_dir=str(tmp), queries=rl.fake_queries(),
+               gate_sha256=rl.sha256_file(p), gate_khong_nut=True, c8b_gio=g, gate_path=p)
+
+
+def test_gc8_2_one_time_file_one_run_checked_on_the_sources(ds):
+    """GC8-2 (Codex round 3): two rows on one H0 file and one time file, both c8b_gio_sha256 cells empty (rows of the
+    writer before GC6-12): the summary compares the SHA read back from the sources."""
+    d, gf, tmp = ds
+    g = _gio(tmp, 'kn82_gio', ok=True)
+    p = _luoi(tmp, 'kn82', gio=g)
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    rl.end(d, 'chua_ket_luan', completed=1, results_dir=str(tmp), queries=rl.fake_queries(),
+           gate_sha256=rl.sha256_file(p), gate_khong_nut=True, c8b_gio=g, gate_path=p)
+    path = os.path.join(d, rl.TUNING)
+    rows = rl.read_rows(path)
+    rows[-1]['c8b_gio_sha256'] = ''
+    rl._write_all(path, rl.TUNING_COLS, rows + [dict(rows[-1], run_uid=rows[-1]['run_uid'] + '_dup')])
+    with pytest.raises(rl.LogError, match='GC8-2'):
+        rl.summary(d)
+
+
+def test_gc7_3_h1_of_its_own_task_and_time_file(ds):
+    """GC7-3 (Codex round 3): an H1 c8b_luoi file of another task, or naming the H0 time file, is refused."""
+    d, gf, tmp = ds
+    folder = str(tmp / 'kn73')
+    os.makedirs(folder)
+    g = _gio(folder, 'gio_a', ok=True)
+    p = _luoi(folder, 'score', gio=g)
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    row = rl.end(d, 'chua_ket_luan', completed=1, results_dir=folder, queries=rl.fake_queries(),
+                 gate_sha256=rl.sha256_file(p), gate_khong_nut=True, c8b_gio=g, gate_path=p)
+    h1_same = dict(json.load(open(p, encoding='utf-8')))                  # the H0 time file
+    with pytest.raises(rl.LogError, match='GC7-3'):
+        rl.so_h(d, row['run_uid'], rl.fake_score_final(folder, 3.0, h1=h1_same, name='sf_a.json'))
+    gh = dict(json.load(open(g, encoding='utf-8')), name='gio_a_h1')
+    gph = os.path.join(folder, 'gio_a_h1.json')
+    json.dump(gh, open(gph, 'w', encoding='utf-8'))
+    h1_task = dict(json.load(open(p, encoding='utf-8')), gio_sha256=rl.sha256_file(gph), task='O1-F08')
+    with pytest.raises(rl.LogError, match='GC7-3'):
+        rl.so_h(d, row['run_uid'], rl.fake_score_final(folder, 3.0, h1=h1_task, name='sf_b.json'))
 
 
 def test_gc6_14_a_fake_gate_is_no_c8_gate(ds):
