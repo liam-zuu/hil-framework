@@ -889,3 +889,51 @@ def test_read_neo_khung_chung_as_nhactam(tmp_path):
     with open(p, 'w', encoding='utf-8') as f:
         json.dump(null_win, f)
     assert ca.read_neo(p, 'K2', ref) == 12.0                                                 # null entry skipped
+
+
+def test_can_hai_dau_function_feeds_u_q_and_u_psi_cuc(tmp_path):
+    """Design v4 3.3 with c8b_a6.u_psi_hai_dau_rad (C8B, CODE 20/11): the same two-end bound gives u_psi_cuc
+    (start window of each long leg vs the reference window) and the end-difference term of u_q (both ends of each
+    leg); a missing bound keeps the result chan_doan with the reasons of C8B, never a bound of 0."""
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
+    an = analyse(d)
+    calls = []
+
+    def fn(p1, p2):
+        calls.append((tuple(p1), tuple(p2)))
+        return math.radians(0.05), []
+    r = ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.004, -0.003], du_m=0.0, neo=0.0, can_hai_dau=fn)
+    assert r['u_hang_deg']['u_psi_cuc'] == pytest.approx(0.05)
+    assert not any('thieu can' in w or 'can C8B' in w for w in r['ly_do'])
+    p_ref = tuple(an['windows'][0]['p'])
+    assert len(calls) == 8 and sum(c[1] == p_ref for c in calls) >= 4
+    r2 = ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.004, -0.003], du_m=0.0, neo=0.0,
+                         can_hai_dau=lambda p1, p2: (None, ['p1: A3 missing in the camera file']))
+    assert r2['trang_thai'] != 'khoa' and r2['u_hang_deg']['u_psi_cuc'] == 0.0
+    assert any('A3 missing' in w for w in r2['ly_do']) and any('thieu can huong camera' in w for w in r2['ly_do'])
+    assert any('u_psi_hai_dau_rad' in w for w in r2['ly_do'])
+    with pytest.raises(ca.AError):
+        ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.0, 0.0], du_m=0.0, neo=0.0,
+                        can_hai_dau=lambda p1, p2: (4.0, []))
+
+
+def test_can_hai_dau_c8b_wrapper(tmp_path, monkeypatch):
+    """--kc, --tam-id need --a6; c8b_a6 not merged -> no bound (reason kept); the C8B result is passed through."""
+    import types
+    kc = write_json(str(tmp_path / 'kc.json'), dict(A3=dict(max_deg=0.02)))
+    a6 = write_json(str(tmp_path / 'a6.json'), dict(schema='c8b_a6_v2'))
+    with pytest.raises(ca.AError):
+        ca.can_hai_dau_c8b(None, kc, 'T1', [])
+    monkeypatch.setitem(sys.modules, 'c8b_a6', None)                       # import fails (not merged)
+    assert ca.can_hai_dau_c8b(a6, kc, 'T1', [])((0, 0), (1, 0)) == (None, ['c8b_a6 chua gop'])
+    m = types.ModuleType('c8b_a6')
+    m.__file__ = a6
+    m.load_a6 = lambda p: dict(tam_id='T1')
+    m.u_psi_hai_dau_rad = lambda a6o, kc_, p1, p2, tam: (
+        dict(u_rad=0.001, trang_thai='dat', ly_do=[]) if tam == a6o['tam_id'] and kc_['A3']['max_deg'] == 0.02
+        else dict(u_rad=None, trang_thai='thieu', ly_do=['khac tam']))
+    monkeypatch.setitem(sys.modules, 'c8b_a6', m)
+    nguon = []
+    assert ca.can_hai_dau_c8b(a6, kc, 'T1', nguon)((0, 0), (1, 0)) == (0.001, [])
+    assert {n['vai_tro'] for n in nguon} == {'c8_cam_u_vao', 'c8b_a6_ham'}
+    assert ca.can_hai_dau_c8b(a6, kc, 'T2', [])((0, 0), (1, 0)) == (None, ['khac tam'])

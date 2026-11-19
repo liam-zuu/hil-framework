@@ -817,7 +817,7 @@ def analyse(A, F, k_info, min_frames=MIN_FRAMES_TINH):
         leg.update(trang_thai='hop_le', dp=dp, ds=ds, L_m=float(np.hypot(*dp)), Ls_m=float(np.hypot(*ds)),
                    ti_le=float(np.hypot(*dp) / np.hypot(*ds)), theta_a=th_a, a_l=a_l, eps=eps, path=path, sum_dth=dth,
                    chieu='toi' if ds[0] > 0 else 'lui', R_a=wa['psi'], R_b=wb['psi'], cs_a=wa['cs'], cs_b=wb['cs'],
-                   nua_a=wa['psi_nua'], nua_b=wb['psi_nua'])
+                   nua_a=wa['psi_nua'], nua_b=wb['psi_nua'], p_a=wa['p'], p_b=wb['p'])
         legs.append(leg)
     return dict(D=D, u_D=u_D, diffs=diffs, windows=W, legs=legs, chuoi=F['chuoi'])
 
@@ -845,10 +845,23 @@ def _deg_leg(lg):
 
 
 def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None, psi_cuc=None, cap_ok=True,
-                 cap_why=(), bao_q=False, vet=None, psi_cuc_chot=False, need_windows=None, psi_hai_dau=None):
+                 cap_why=(), bao_q=False, vet=None, psi_cuc_chot=False, need_windows=None, psi_hai_dau=None,
+                 can_hai_dau=None):
     for v in (psi_cuc, psi_hai_dau):                       # HCC3-6: never let max()/sin() hide a bad bound
         if v is not None and not (math.isfinite(v) and 0.0 <= v <= math.pi):
             raise AError(f'can ngoai mien [0, pi]: {v}')
+    can_why = []
+
+    def can(p1, p2):
+        """Two-end camera heading bound of C8B (c8b_a6.u_psi_hai_dau_rad, design v4 3.3) for two window
+        positions, or None (its reasons kept: the result is then chan_doan, never a bound of 0)."""
+        u, why = can_hai_dau(p1, p2)
+        if u is None:
+            can_why.extend(w for w in why if w not in can_why)
+            return None
+        if not (math.isfinite(u) and 0.0 <= u <= math.pi):
+            raise AError(f'can C8B ngoai mien [0, pi]: {u}')
+        return float(u)
     """Combine the analysed attempts of one place (F7 block). attempts = list of (thu_id, analysis or None, why).
 
     cap_ok False (the issued attempt failed kiem) -> chua_ket_luan: a is never issued from such an attempt; its legs
@@ -902,6 +915,7 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
     u_map = math.asin(e / Lmin) if e < Lmin else math.pi / 2
     r_enc = COUNT_M * (2 + max(lg['sum_dth'] for lg in longs)) / Lsmin
     u_enc = math.asin(r_enc) if r_enc < 1 else math.pi / 2
+    hd_thieu = False
     if q is None or du_m is None:
         res['ly_do'].append('thieu q, du_m (xoay_v1)')
         u_q = 0.0
@@ -909,6 +923,10 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
         qn = math.hypot(*q)
         u_q = 0.0
         for lg in longs:
+            if can_hai_dau is not None:                    # the C8B function per leg (both ends of this leg)
+                v = can(lg['p_a'], lg['p_b'])
+                hd_thieu = hd_thieu or v is None
+                psi_hai_dau = None if v is None else v
             # ||mean R_b - mean R_a||_2 of the window rotation matrices (HCC1-12), and the turn error of q from the
             # error of the DIFFERENCE of the two end headings (both half-split errors, opposite signs, added)
             dR = math.hypot(lg['cs_b'][0] - lg['cs_a'][0], lg['cs_b'][1] - lg['cs_a'][1])
@@ -917,12 +935,21 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
             u_hd = max(lg['nua_a'] + lg['nua_b'], psi_hai_dau or 0.0)
             term = dR * du_m + (0.0 if bao_q else qn * 2 * math.sin(u_hd / 2))
             u_q = max(u_q, term / lg['L_m'])
-    if q is not None and not bao_q and psi_hai_dau is None:
+    if q is not None and du_m is not None and not bao_q and (psi_hai_dau is None or hd_thieu):
         res['ly_do'].append('thieu can sai hieu huong hai dau (C8B u_psi_hai_dau_rad) cho u_q')
     eps = [lg['eps'] for lg in longs]
     eps_thieu = any(not math.isfinite(x) for x in eps)            # HCC1-9: no evidence -> gate fails, not 0
     eps = [x if math.isfinite(x) else 0.0 for x in eps]
     u_yaw = max(math.asin(min(2 * math.sin(e_ / 2) * lg['path'] / lg['Ls_m'], 1.0)) for e_, lg in zip(eps, longs))
+    if can_hai_dau is not None:
+        # design v4 3.3: u_psi_cuc = max over the long legs of the bound between the start window of the leg (at
+        # the extreme, where a takes psi') and the reference window (where psi_chuan_k is taken)
+        p_ref = cap['windows'][0].get('p')
+        vals = [None if p_ref is None else can(lg['p_a'], p_ref) for lg in longs]
+        if any(v is None for v in vals):
+            psi_cuc = None
+        else:
+            psi_cuc, psi_cuc_chot = max(vals), True
     if psi_cuc is None:
         res['ly_do'].append('thieu can huong camera hai dau (C8B)')
         u_cuc = 0.0
@@ -959,7 +986,7 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
     if neo is None:
         res['ly_do'].append('thieu psi_chuan_k (F6)')
     failed = [k for k, v in gates.items() if not v]
-    res['ly_do'] += bad
+    res['ly_do'] += bad + [f'can C8B: {w}' for w in can_why]
     if failed:
         res['trang_thai'] = 'chua_ket_luan'
         res['ly_do'] += failed
@@ -1296,6 +1323,33 @@ def read_e_hieu(path, doan_path):
     return out, bool(j.get('bao_q_xoay', False))
 
 
+def can_hai_dau_c8b(a6_path, kc_path, tam_id, nguon):
+    """(p1, p2) -> (u [rad] or None, reasons) from c8b_a6.u_psi_hai_dau_rad (C8B, CODE 19/11: A3(p1) + A3(p2) of
+    KIEMCHEO c8_cam_u_vao + A6 residual at both points, before the margin; 'thieu' until its inputs exist). Needs
+    --a6, --kc, --tam-id together (else AError, code 2). c8b_a6 not merged yet, or the A6 file refused: every call
+    gives None with the reason (the result stays chan_doan). Positions: floor frame, m (frames chain)."""
+    if not (a6_path and kc_path and tam_id):
+        raise AError('--kc, --tam-id can di cung --a6 (ham can hai dau cua C8B)')
+    kc = json.load(open(kc_path, encoding='utf-8'))
+    nguon.append(dict(vai_tro='c8_cam_u_vao', duong_dan=os.path.abspath(kc_path), sha256=sha256(kc_path)))
+    try:
+        import c8b_a6 as c8a                                     # CODE_C8B, after the common merge
+        a6o = c8a.load_a6(a6_path)
+    except ImportError:
+        return lambda p1, p2: (None, ['c8b_a6 chua gop'])
+    except Exception as exc:                                     # noqa: BLE001  A6Error / bad file: no bound
+        why = f'A6 khong doc duoc ({type(exc).__name__}: {exc})'
+        return lambda p1, p2: (None, [why])
+    nguon.append(dict(vai_tro='c8b_a6_ham', duong_dan=os.path.abspath(c8a.__file__), sha256=sha256(c8a.__file__)))
+
+    def fn(p1, p2):
+        r = c8a.u_psi_hai_dau_rad(a6o, kc, [float(v) for v in p1], [float(v) for v in p2], tam_id)
+        if not isinstance(r, dict) or r.get('trang_thai') != 'dat' or r.get('u_rad') is None:
+            return None, [str(w) for w in ((r or {}).get('ly_do') or ['trang_thai khac dat'])]
+        return float(r['u_rad']), []
+    return fn
+
+
 def read_can_c8b(path, cho):
     """(u_psi_cuc [rad], u_psi_hai_dau [rad] or None, agreed) from a C8B file (names not yet agreed, contract 4.5):
     u_psi_cuc_rad (camera heading, leg start vs reference window), u_psi_hai_dau_rad (error of the DIFFERENCE of the
@@ -1396,6 +1450,9 @@ def cmd_tinh(a):
     if a.can_c8b:
         psi_cuc, psi_hd, chot = read_can_c8b(a.can_c8b, a.cho)
         nguon.append(dict(vai_tro='can_c8b', duong_dan=os.path.abspath(a.can_c8b), sha256=sha256(a.can_c8b)))
+    can_fn = None
+    if a.kc or a.tam_id:
+        can_fn = can_hai_dau_c8b(a.a6, a.kc, a.tam_id, nguon)
     vet = None
     if a.moc and cap_F is not None:
         import c8_hc_vet as cv
@@ -1417,7 +1474,8 @@ def cmd_tinh(a):
     need = sorted(k for k, lo in window_roles(load_attempt(a.cap)['segs']) if lo in ('ref_12b', 'dung_12b'))
     del roles
     r = place_result(a.cho, attempts, cap_id, e_hieu=e, q=q, du_m=du, neo=neo, psi_cuc=psi_cuc, cap_ok=cap_ok,
-                     cap_why=cap_why, bao_q=bao_q, vet=vet, psi_cuc_chot=chot, need_windows=need, psi_hai_dau=psi_hd)
+                     cap_why=cap_why, bao_q=bao_q, vet=vet, psi_cuc_chot=chot, need_windows=need, psi_hai_dau=psi_hd,
+                     can_hai_dau=can_fn)
     r = dict(schema='truc_xe_v1', version=VERSION, commit_hil=commit_hil(), nguon=nguon,
              mien_hieu_luc=dict(cho=a.cho, thu_id_cap=cap_id, lan_lap_id=None,
                                 ghi_chu='cung buoi, cung lan lap tam (lan_lap_v1 cua NHACTAM chua co: chua xac minh)'),
@@ -1519,6 +1577,8 @@ def main(argv=None):
     t.add_argument('--neo', default=None, help='hieu_chuan_neo.json of NHACTAM (F6)')
     t.add_argument('--e-hieu', default=None, help='e_hieu_m of KIEMCHEO (F9)')
     t.add_argument('--can-c8b', default=None, help='C8B file with u_psi_cuc_rad (two-end camera heading bound)')
+    t.add_argument('--kc', default=None, help='KIEMCHEO c8_cam_u_vao (A3) for c8b_a6.u_psi_hai_dau_rad')
+    t.add_argument('--tam-id', default=None, help='plate id for c8b_a6.u_psi_hai_dau_rad (A6 applies to one plate)')
     t.add_argument('--moc', default=None, help='moc_san_do_32.csv: real swept footprint (vet thuc)')
     t.add_argument('--vien-mm', type=float, default=10.0)
     t.add_argument('--d-vet-mm', type=float, default=20.0, help='tag centre to body box centre bound [de xuat]')
