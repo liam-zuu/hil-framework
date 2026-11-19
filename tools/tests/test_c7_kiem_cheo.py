@@ -1162,6 +1162,11 @@ def test_tung_khung_missing_anchor_columns_is_data_missing(tmp_path):
 
 
 # ---- tien_de
+@pytest.fixture
+def id8(monkeypatch):
+    monkeypatch.setattr(kc, 'ID_KHOA', tuple(ALL8))
+
+
 def _td_inputs():
     sess = {n: dict(file=f'/x/{n}.json', sha256=str(k) * 64, video=f'/x/{n}.mov', video_sha256=str(k + 4) * 64)
             for k, n in enumerate(kc.CLIPS_REQUIRED)}
@@ -1194,7 +1199,8 @@ def _grade(f=None, tk_none=False):
     (lambda k, u, t: k['kiem_h']['H_m'].update(ti_le_cung_luc=0.9), 'thieu_du_lieu', 'kiem_h:H_m'),
     (lambda k, u, t: u['chuoi']['2'].update(khong_tinh_duoc=[dict(moc=3)]), 'thieu_du_lieu', 'u_so_khong_tinh:2'),
     ('no_tk', 'thieu_du_lieu', 'khong_co_tung_khung'),
-    (lambda k, u, t: (t.update(luot_chua_co=['R3']), t['ke_hoach']['luot'].append('R3')), 'thieu_du_lieu',
+    (lambda k, u, t: (t.update(luot_chua_co=['R3']), t['ke_hoach']['luot'].append('R3'),
+                      t['ke_hoach']['su_kien'].insert(-1, 'R3')), 'thieu_du_lieu',
      'luot_chua_co:R3'),
     (lambda k, u, t: t['luot']['R1'].update(thieu=True, tap_chua_tinh=[dict(chuoi='xe')]), 'thieu_du_lieu',
      'tap_neo_chua_tinh:R1'),
@@ -1202,13 +1208,14 @@ def _grade(f=None, tk_none=False):
     (lambda k, u, t: t.update(mau_thuan=[dict(luot='R1', clip='H_m', moc=5)]), 'khong_dat', 'mau_thuan:R1:H_m:5'),
     (lambda k, u, t: t['ke_hoach'].update(su_kien=['H_b', 'H_a', 'R1', 'H_m', 'R2', 'H_z']), 'thieu_du_lieu', None),
 ])
-def test_tien_de_grades_each_row(case, ket, why):
+def test_tien_de_grades_each_row(case, ket, why, id8):
     """S6-4: one case per row; ket_qua and the reason; TD1-7 schema keys always there."""
     r = _grade(tk_none=True) if case == 'no_tk' else _grade(case)
     assert r['ket_qua'] == ket
     if why:
         assert why in r['ly_do']
     assert set(r['clip_h']) == set(kc.CLIPS_REQUIRED) and r['h1_ho_tro'] is False and r['format'] == 'tien_de_buoi_v1'
+    assert r['vai_tro_clip_h'] == dict(H_a='dau1', H_b='dau2', H_m='giua', H_z='cuoi')     # F18 (GATE GC6-4)
     if case == 'no_tk':
         assert r['sha256']['tung_khung'] is None or r['sha256']['luot'] is None
         assert r['luot'] == [] and r['luot_thieu_kiem'] == [] and r['mau_thuan'] == []
@@ -1216,7 +1223,7 @@ def test_tien_de_grades_each_row(case, ket, why):
         assert r['luot'] == ['R1', 'R2'] and r['ly_do'] == [] and r['u_so_m'] == pytest.approx(0.0003)
 
 
-def test_tien_de_short_coverage_lowers_only_the_run_and_worst_wins():
+def test_tien_de_short_coverage_lowers_only_the_run_and_worst_wins(id8):
     """TD1-5 (B): a run short of checks (no uncomputed set) only goes to luot_thieu_kiem; several reasons: the worst."""
     r = _grade(lambda k, u, t: t['luot']['R2'].update(thieu=True))
     assert r['ket_qua'] == 'dat' and r['luot_thieu_kiem'] == ['R2'] and set(r['luot_thieu_kiem']) <= set(r['luot'])
@@ -1231,7 +1238,7 @@ def test_tien_de_short_coverage_lowers_only_the_run_and_worst_wins():
     lambda k, u, t: t.update(kiem_cheo_sha256='z' * 64), lambda k, u, t: t.update(u_so_sha256='y' * 64),
     lambda k, u, t: k['sessions']['H_b'].update(video_sha256=k['sessions']['H_a']['video_sha256']),
     lambda k, u, t: t['luot']['R2']['nguon'].update(frames_sha256='f' * 64), lambda k, u, t: t.update(version='v3')])
-def test_tien_de_identity_faults_raise(f):
+def test_tien_de_identity_faults_raise(f, id8):
     """S6-3, TD1-3, TD1-6: another session, grouping, source sha, a repeated clip H or frames: code 2."""
     with pytest.raises(kc.KCError):
         _grade(f)
@@ -1504,7 +1511,7 @@ def _td_full(f=None, tk_none=False):
     (lambda k, u, t: u['chuoi']['xe'].pop('nguong_m'), 'u_so_khong_tinh:xe'),
     (lambda k, u, t: k['kiem_h']['H_m'].update(ti_le_cung_luc=float('nan')), 'kiem_h:H_m'),
 ])
-def test_tien_de_missing_required_data_is_not_dat(case, why):
+def test_tien_de_missing_required_data_is_not_dat(case, why, id8):
     """KCJ1-1, KCJ1-2 (J v6 J4-12, M3): a missing comparison at H_m / H_z, a missing chain or set, a NaN: data
     missing, never dat."""
     assert _td_full()['ket_qua'] == 'dat'
@@ -1512,7 +1519,7 @@ def test_tien_de_missing_required_data_is_not_dat(case, why):
     assert r['ket_qua'] == 'thieu_du_lieu' and any(x.startswith(why) for x in r['ly_do'])
 
 
-def test_tien_de_runs_must_make_up_the_plan():
+def test_tien_de_runs_must_make_up_the_plan(id8):
     """KCJ1-2: runs written + runs missing must be the plan (an emptied luot is refused, code 2)."""
     with pytest.raises(kc.KCError, match='KCJ1-2'):
         _td_full(lambda k, u, t: t.update(luot={}))
@@ -1688,3 +1695,121 @@ def test_phan_tich_s7_needs_the_locked_manifest(tmp_path, scene, monkeypatch):
     d = tmp_path / 'w3'
     d.mkdir()
     assert kc.main(_phan_tich_args(d, scene) + xp + ['--khoa-s7', str(_khoa_manifest(d, scene))]) == 2
+
+
+# ---------------------------------------------------------------- Codex round 2 of the J round (KCJ2-1, 2; residuals)
+def test_xuat_refuses_a3_over_a_partial_pair_set():
+    """KCJ2-1: an A3 block with broken pairs is not exported (its maximum is not over the planned pairs)."""
+    with pytest.raises(kc.KCError, match='broken pairs'):
+        kc.build_cam_u(_own(_a3_conv(max_deg=0.15, quy_ve_ma_noc=True, cap_hong=[dict(i=1, j=2)], du_lieu_du=False)),
+                       _parts())
+
+
+def test_xuat_frames_by_run_id(tmp_path):
+    """KCJ2-2, KCJ1-3: CAM may leave out a clock-failed run (r2), but each run it declares must carry that run's own
+    frames sha; swapped shas are refused."""
+    kcp = _kc_file(tmp_path)
+    two = dict(luot={'r1': dict(nguon=dict(frames_sha256='a' * 64)), 'r2': dict(nguon=dict(frames_sha256='b' * 64))})
+    assert kc.main(_xuat_args(tmp_path, kcp, tk_over=two)) == 0
+    t2 = tmp_path / 's'
+    t2.mkdir()
+    kcp = _kc_file(t2)
+    sw = dict(nguon=dict(_moc_dich()['nguon'], frames={'r1': 'b' * 64, 'r2': 'a' * 64}))
+    assert kc.main(_xuat_args(t2, kcp, tk_over=two, md_over=sw)) == 2
+
+
+@pytest.mark.parametrize('case, why', [
+    (lambda k, u, t: k['theo_thoi_gian']['H_z']['rieng_m'].update({'3': False}), 'so_H_z_thieu'),
+    (lambda k, u, t: k['theo_thoi_gian']['H_m']['rieng_m'].update({'3': -0.001}), 'so_H_m_thieu'),
+    (lambda k, u, t: k['kiem_h']['H_b'].update(ti_le_cung_luc=float('inf')), 'kiem_h:H_b'),
+    (lambda k, u, t: u['chuoi']['2'].update(tap_tinh=u['chuoi']['2']['tap_tinh'][:1]), 'u_so_khong_tinh:2'),
+])
+def test_tien_de_residuals_round2(case, why, id8):
+    """KCJ1-1 (bool, negative), KCJ1-2 (inf, a chain without its full-set fits)."""
+    r = _td_full(case)
+    assert r['ket_qua'] == 'thieu_du_lieu' and any(x.startswith(why) for x in r['ly_do'])
+
+
+def test_tien_de_plan_runs_come_from_the_events(id8):
+    """KCJ1-2: a run removed from tk.luot AND ke_hoach.luot but still in su_kien: refused (code 2)."""
+    def f(k, u, t):
+        t['luot'].pop('R2')
+        t['ke_hoach']['luot'] = ['R1']
+    with pytest.raises(kc.KCError, match='su_kien'):
+        _td_full(f)
+
+
+def test_tien_de_premise_locks_ids_1_32():
+    """KCJ1-10 at the premise: a result with ids 1-8 (not 1-32) is not dat."""
+    r = _td_full()
+    assert r['ket_qua'] == 'thieu_du_lieu' and 'id_khoa_khong_phai_1_32' in r['ly_do']
+
+
+def test_e_hieu_refuses_f5_without_legs_and_unchained_track(tmp_path, scene):
+    """KCJ1-7: F5 with no leg -> code 2; KCJ1-8: nguon track sha not the top-level track_sha256 -> code 2."""
+    marks, cam, img = scene
+    sp = _fake_session(tmp_path, 'hc', img, marks, tmp_path / 'v.mov') if (tmp_path / 'v.mov').write_bytes(b'v') else None
+    frp = tmp_path / 'frames.csv'
+    frp.write_text('idx,t_s\n0,0.0\n', encoding='utf-8')
+    trp = tmp_path / 'track.json'
+    trp.write_text(json.dumps(dict(session_sha256=kc.sha256_file(str(sp)), frames_sha256=kc.sha256_file(str(frp)))),
+                   encoding='utf-8')
+    kcr = dict(version=kc.VERSION, thu=False, model='B1',
+               hang_so_s7=dict(xuat_phat=dict(goc=[0.0, 0.0]), R_XP_M=0.6, L_MAX_M=1.05, plumb=[0.03, -0.02]),
+               P1_tuong_doi=dict(theo_vung=dict(goc=dict(trong_vung_max_m=0.0007))))
+    kcp = tmp_path / 'kc.json'
+    kcp.write_text(json.dumps(kcr), encoding='utf-8')
+    win = dict(loai='dung_12b', chi_so=0, khung_id=[1], khung_pts_s=[0.0], khung_sha256='a' * 64, p_m=[0.0, 0.0],
+               psi_rad=0.0)
+    base = dict(schema='c8_hc_doan_12b_v1', cho='goc', trang_thai='chan_doan', session_sha256=kc.sha256_file(str(sp)),
+                track_sha256=kc.sha256_file(str(trp)), frames_sha256=kc.sha256_file(str(frp)),
+                car_pose_cfg=dict(side_m=0.1445, h_m=0.119, tag_offset=None, q_m=None, du_m=None),
+                nguon=[dict(vai_tro='session', duong_dan=str(sp), sha256=kc.sha256_file(str(sp))),
+                       dict(vai_tro='track', duong_dan=str(trp), sha256=kc.sha256_file(str(trp))),
+                       dict(vai_tro='frames', duong_dan=str(frp), sha256=kc.sha256_file(str(frp)))])
+    for k, d in enumerate([dict(base, doan=[]),
+                           dict(base, doan=[dict(i=0, trang_thai='hop_le', cua_so_a=win, cua_so_b=win)],
+                                nguon=[x if x['vai_tro'] != 'track' else dict(x, sha256='f' * 64) for x in base['nguon']])]):
+        d['sha256'] = kc.doan_body_sha(d)
+        dp = tmp_path / f'd{k}.json'
+        dp.write_text(json.dumps(d), encoding='utf-8')
+        assert kc.main(['e_hieu', '--kiem-cheo', str(kcp), '--doan', str(dp), '--out', str(tmp_path / f'e{k}.json')]) == 2
+        assert not (tmp_path / f'e{k}.json').exists()
+
+
+def test_a3_conversion_failure_is_a_broken_pair(scene, monkeypatch):
+    """KCJ1-13: a failure after the fit (tag conversion) is listed for that pair, the run goes on."""
+    marks, cam, img = scene
+    real = kc.a3_tag_gap
+
+    def gap(F, c, mi, mj, side, h):
+        if mi == marks[30] and mj == marks[31]:
+            raise ValueError('conversion failed (test)')
+        return real(F, c, mi, mj, side, h)
+    monkeypatch.setattr(kc, 'a3_tag_gap', gap)
+    hong = []
+    rows = kc.a3_clip(img, marks, 'B1', W, H, ZC, l_max=1.05, tag=(0.1445, 0.119), hong=hong)
+    assert [(h['i'], h['j']) for h in hong] == [(30, 31)] and rows
+
+
+def test_summary_print_failure_after_publication_keeps_code_0(tmp_path, monkeypatch):
+    """KCJ1-6: the summary line after the file is published cannot turn the result into code 2."""
+    import builtins
+    real = builtins.print
+
+    def flaky(*a, **k):
+        if a and str(a[0]).startswith('#ket_qua'):
+            return real(*a, **k)
+        raise OSError('stdout closed (test)')
+    monkeypatch.setattr(builtins, 'print', flaky)
+    assert kc.main(_xuat_args(tmp_path, _kc_file(tmp_path))) == 0
+    assert (tmp_path / 'o.json').exists()
+
+
+def test_geometry_guards_outside_the_floor_domain():
+    """KCJ1-11 (round 2 note): repeated vertices make no hull; far coordinates keep the bound; no mark refused."""
+    assert not kc.disc_in_hull((0.0, 0.0), 0.1, [(0.0, 0.0)] * 3)
+    c = (1e16, 1e16)
+    assert kc.disc_max_gap(c, 1.0, [c]) >= 1.0
+    with pytest.raises(kc.KCError):
+        kc.disc_max_gap((0.0, 0.0), 0.1, [])
