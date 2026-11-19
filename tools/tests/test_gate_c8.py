@@ -590,6 +590,8 @@ def _write_csv(goc, d):
         for j, x in enumerate(c['chuoi']):
             b = c['o'] + (f'_lai{j}' if j else '')                    # a rerun row: <run code>_lai<n> (CODE 19/11)
             lines.append(f'{x["clip"]},{b},,,,{x["run_id"]}.csv,')
+    for x in d.get('luot_k') or []:                                  # GC9-2: the K runs (no log for them here)
+        lines.append(f'{x["clip"]},{x["run_id"]},,,,,')
     lines.append('IMG_9002,H_m,,,,,clip H giua')
     p = os.path.join(goc, 'thu_tu_clip.csv')
     with open(p, 'w', encoding='utf-8', newline='\n') as f:
@@ -2140,6 +2142,49 @@ def test_round5_ghep_log_of_a_lost_run_copies_and_out_folder(tmp_path):
         GC.ghep_va_ghi(str(tmp_path / 'b' / 'no_such' / 'g.json'), goc, 'ke_hoach_c8.json', 'thu_tu_clip.csv',
                        'c8b_khoa_v5.json', 'tien_de_c8.json', 'kiem_cheo.json', dict(BANG_CHUNG), 'chuan_u/ho_so_new.json')
     assert not os.path.exists(os.path.join(goc, 'chuan_u', 'ho_so_new.json'))
+
+
+def _add_k(goc, d, run_id='C8-P-K1-1', luc=LUC_CHAM):
+    """A K run of C8 (its grid only: GC9-2), written in thu_tu_clip.csv and the dossier."""
+    cell = dict(muc='O1-' + run_id.split('-')[2], controller='PID')
+    rid = run_id.replace('-', '_')
+    fk, _ = _luoi(goc, 'K_' + rid, cell, None, 0.005, clip='IMG_' + rid,
+                  script=dict(commit='c' * 40, dirty=False, luc_chay=luc))
+    d['luot_k'].append(dict(run_id=run_id, clip='IMG_' + rid, file_cham=fk, file_cham_h1=None))
+    _write_csv(goc, d)
+    runs = [x['run_id'] for c in d['o_c8'] for x in c['chuoi']] + [x['run_id'] for x in d['luot_k']]
+    cl = {r: LUC_CHAM for r in runs}
+    cl[run_id] = luc
+    _rewrite(goc, d['chuan_u']['ho_so_c8'], lambda y: y.update(giu_ngoai=runs, cham_luc=cl))
+    return d['luot_k'][-1]
+
+
+def test_round5_k_runs_held_out(tmp_path):
+    """GC9-2 (CODE 20/11: every C8 run is held out, K runs too; C8B: one luoi.json per K run)."""
+    d, goc = build_c8(tmp_path / 'a')
+    _add_k(goc, d)
+    GC.check_nguon(d, goc)
+    g = _ghep(goc)                                                    # ghep finds it
+    assert [x['run_id'] for x in g['luot_k']] == ['C8-P-K1-1'] and 'C8-P-K1-1' in json.load(open(
+        os.path.join(goc, 'chuan_u/ho_so_ghep.json'), encoding='utf-8'))['giu_ngoai']
+    GC.write_gate(str(tmp_path / 'g.json'), g, goc)
+    d['luot_k'] = []                                                  # left out of the gate
+    with pytest.raises(GC.GateFileError, match='GC9-2'):
+        GC.check_nguon(d, goc)
+    d, goc = build_c8(tmp_path / 'b')                                 # Codex: a K run scored before the S7 commit
+    _add_k(goc, d, luc='2026-11-21T08:30:00+07:00')
+    with pytest.raises(GC.GateFileError, match='not before the first scoring of a held-out run'):
+        GC.check_nguon(d, goc)
+    d, goc = build_c8(tmp_path / 'c')                                 # a K grid of another task
+    x = _add_k(goc, d)
+    _rewrite(goc, x['file_cham'], lambda y: y.update(task='O1-K2'))
+    with pytest.raises(GC.GateFileError, match='task O1-K1'):
+        GC.check_nguon(d, goc)
+    d, goc = build_c8(tmp_path / 'd')                                 # a K grid of another clip
+    x = _add_k(goc, d)
+    _rewrite(goc, x['file_cham'], lambda y: y['clip'].update(ten='IMG_other'))
+    with pytest.raises(GC.GateFileError, match='task O1-K1 for clip'):
+        GC.check_nguon(d, goc)
 
 
 def test_round3_log_hashed_and_named(tmp_path):
