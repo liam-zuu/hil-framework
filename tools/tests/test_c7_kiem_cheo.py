@@ -1798,9 +1798,7 @@ def test_summary_print_failure_after_publication_keeps_code_0(tmp_path, monkeypa
     real = builtins.print
 
     def flaky(*a, **k):
-        if a and str(a[0]).startswith('#ket_qua'):
-            return real(*a, **k)
-        raise OSError('stdout closed (test)')
+        raise OSError('stdout closed (test)')         # also the last status line (round 3)
     monkeypatch.setattr(builtins, 'print', flaky)
     assert kc.main(_xuat_args(tmp_path, _kc_file(tmp_path))) == 0
     assert (tmp_path / 'o.json').exists()
@@ -1813,3 +1811,69 @@ def test_geometry_guards_outside_the_floor_domain():
     assert kc.disc_max_gap(c, 1.0, [c]) >= 1.0
     with pytest.raises(kc.KCError):
         kc.disc_max_gap((0.0, 0.0), 0.1, [])
+
+
+# ---------------------------------------------------------------- Codex round 3 of the J round (Liam: "Vong 3 hep")
+def test_non_finite_samples_are_refused_before_the_maxima(scene, monkeypatch):
+    """KCJ1-13: a NaN sample of the tag conversion or of the virtual tag difference raises (the pair becomes broken),
+    it is never hidden by max()."""
+    marks, cam, img = scene
+    monkeypatch.setattr(kc, 'tag_heading_diff', lambda *a, **k: float('nan'))
+    with pytest.raises(ValueError):
+        kc.a3_tag_gap(cam, cam, marks[30], marks[31], 0.1445, 0.119)
+    monkeypatch.undo()
+    with pytest.raises(ValueError):
+        kc.chuyen_pair(cam, _MapCam(cam, np.array([[float('nan'), 0.0], [0.0, 1.0]])), (0.0, 0.0), (0.5, 0.0), 0.0, 0.0,
+                       0.1445, 0.119, 0.05, (0.0, 0.0))
+
+
+def test_xuat_writes_the_scored_runs_for_khoa(tmp_path):
+    """KCJ3-1 (writer side): moc_dich carries every scored run with its frames sha and the runs without U_moc
+    sources, so khoa (C8B) can require their clock-failure evidence."""
+    kcp = _kc_file(tmp_path)
+    two = dict(luot={'r1': dict(nguon=dict(frames_sha256='a' * 64)), 'r2': dict(nguon=dict(frames_sha256='b' * 64))})
+    assert kc.main(_xuat_args(tmp_path, kcp, tk_over=two)) == 0
+    md = json.loads((tmp_path / 'o.json').read_text(encoding='utf-8'))['moc_dich']
+    assert md['luot_cham'] == {'r1': 'a' * 64, 'r2': 'b' * 64} and md['luot_vang_u_moc'] == ['r2']
+
+
+def test_tien_de_cli_checks_the_plan_content(tmp_path, id8):
+    """KCJ1-2 (round 3): end to end on files; the plan file is parsed and hashed from the same bytes, its events must
+    be those tung_khung recorded; a plan edited afterwards is refused (code 2), nothing written."""
+    kcr, us, tk = _td_inputs()
+    for n in kc.CLIPS_REQUIRED:
+        sp, vp = tmp_path / f'{n}.json', tmp_path / f'{n}.mov'
+        sp.write_text('{"s": "%s"}' % n, encoding='utf-8')
+        vp.write_bytes(n.encode())
+        kcr['sessions'][n] = dict(file=str(sp), sha256=kc.sha256_file(str(sp)), video=str(vp),
+                                  video_sha256=kc.sha256_file(str(vp)))
+    kcr.update(id_khoa=ALL8, buoi='S1',
+               theo_thoi_gian={n: dict(rieng_m={str(i): 0.0002 for i in ALL8}) for n in ('H_b', 'H_m', 'H_z')})
+    usp = tmp_path / 'u_so.json'
+    usp.write_text(json.dumps(us), encoding='utf-8')
+    kcr['u_so_sha256'] = kc.sha256_file(str(usp))
+    kcp = tmp_path / 'kc.json'
+    kcp.write_text(json.dumps(kcr), encoding='utf-8')
+    plan = tmp_path / 'plan.txt'
+    plan.write_text('H_a\nH_b\nR1\nH_m\nR2\nH_z\n', encoding='utf-8')
+    tk.update(u_so_sha256=kcr['u_so_sha256'], session_sha256=kcr['sessions']['H_a']['sha256'],
+              kiem_cheo_sha256=kc.sha256_file(str(kcp)))
+    tk['ke_hoach'].update(file=str(plan), sha256=kc.sha256_file(str(plan)))
+    for rid, v in tk['luot'].items():
+        dd = {}
+        for role, key in (('track', 'track_sha256'), ('frames', 'frames_sha256'), ('kiem_cheo_khung',
+                                                                                  'kiem_cheo_khung_sha256')):
+            f = tmp_path / f'{rid}_{role}'
+            f.write_text(f'{rid} {role}', encoding='utf-8')
+            dd[role] = str(f)
+            v['nguon'][key] = kc.sha256_file(str(f))
+        v['duong_dan'] = dd
+    tkp = tmp_path / 'tk.json'
+    tkp.write_text(json.dumps(tk), encoding='utf-8')
+    base = ['tien_de', '--session-id', 'S1', '--ngay', '2026-11-20', '--kiem-cheo', str(kcp), '--u-so', str(usp),
+            '--tung-khung', str(tkp)]
+    assert kc.main(base + ['--out', str(tmp_path / 'td.json')]) == 0
+    r = json.loads((tmp_path / 'td.json').read_text(encoding='utf-8'))
+    assert r['ket_qua'] == 'dat' and r['luot'] == ['R1', 'R2'] and r['sha256']['ke_hoach'] == kc.sha256_file(str(plan))
+    plan.write_text('H_a\nH_b\nR1\nH_m\nR2\nR3\nH_z\n', encoding='utf-8')
+    assert kc.main(base + ['--out', str(tmp_path / 'td2.json')]) == 2 and not (tmp_path / 'td2.json').exists()

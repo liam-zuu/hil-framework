@@ -285,6 +285,8 @@ def a3_tag_gap(cam_full, cam_ij, mi, mj, side, tag_h, ts=A3_TAG_T, phis=A3_TAG_P
             x, y = (1.0 - t) * pi + t * pj
             for ph in phis:
                 d = tag_heading_diff(see, meas, x, y, math.radians(ph), side, tag_h)
+                if not (math.isfinite(d) and math.isfinite(dp)):        # KCJ1-13: each sample before the max
+                    raise ValueError('non-finite tag / pair angle sample')
                 gap, dpsi = max(gap, abs(d - dp)), max(dpsi, abs(d))
     return math.degrees(gap), math.degrees(dpsi), math.degrees(pair_angle_diff(cam_full, cam_ij, mi, mj))
 
@@ -855,6 +857,8 @@ def chuyen_pair(cam_full, cam_held, pa, pb, psi_a, psi_b, side, tag_h, kappa, pl
         ha, fa = tag_pose(see, (cam_held, cam_full), pa[0], pa[1], psi_a, side, tag_h, kappa, plumb, tag_offset)
         hb, fb = tag_pose(see, (cam_held, cam_full), pb[0], pb[1], psi_b, side, tag_h, kappa, plumb, tag_offset)
         d = (hb - ha) - (fb - fa)
+        if not np.all(np.isfinite(d)):                # KCJ1-13: each sample finite before any maximum
+            raise ValueError('non-finite virtual tag sample')
         out.append((nhin, float(d[0]), float(d[1]), float(cm.cp_wrap(d[2]))))
     return out
 
@@ -1357,16 +1361,22 @@ def read_plan(path):
     """(events, runs) of the session plan (TD2-2): one id per line (or the first CSV column), '#' lines and a header
     word ignored (KCC1-11). events = every line in order, clips H included (H_a, H_b, H_m, H_z); runs = the lines
     that are not clip H names. Empty, repeated ids, or no run: refused."""
+    return read_plan_sha(path)[:2]
+
+
+def read_plan_sha(path):
+    """read_plan plus the sha256 of the very bytes parsed (KCJ1-2, KCJ1-6: no second read between parse and hash)."""
+    with open(path, 'rb') as f:
+        b = f.read()
     ev = []
-    with open(path, encoding='utf-8') as f:
-        for line in f:
-            s = line.strip().split(',')[0].strip()
-            if s and not s.startswith('#') and s.lower() not in ('luot', 'slot', 'run'):
-                ev.append(s)
+    for line in b.decode('utf-8').splitlines():
+        s = line.strip().split(',')[0].strip()
+        if s and not s.startswith('#') and s.lower() not in ('luot', 'slot', 'run'):
+            ev.append(s)
     runs = [s for s in ev if s not in CLIPS_REQUIRED]
     if not runs or len(ev) != len(set(ev)):
         raise KCError(f'{path}: empty, repeated ids or no run')
-    return ev, runs
+    return ev, runs, hashlib.sha256(b).hexdigest()
 
 
 def plan_order_problems(ev):
@@ -1400,7 +1410,7 @@ def tung_khung(a):
     chains = us['chuoi']
     sha_ha = kc['sessions']['H_a']['sha256']
     want_ng = {c: dict(nguong_m=v['nguong_m'], nguong_tho_m=v['nguong_tho_m']) for c, v in chains.items()}
-    ev, plan = read_plan(a.ke_hoach)
+    ev, plan, plan_sha = read_plan_sha(a.ke_hoach)
     # TD1-2 (KCC1-12 per run): marks whose own shift at H_m / H_z is above the chain-xe threshold (KCC2-1: H_b not)
     ng = chains['xe']['nguong_m']
     over = {}
@@ -1452,7 +1462,7 @@ def tung_khung(a):
     out = dict(version=TUNG_KHUNG_VERSION, buoi=a.buoi, model=kc['model'], nhom=groups, moc=kc.get('moc'),
                hang_so_sha256=kc.get('hang_so_sha256'), kiem_cheo_sha256=sha256_file(a.kiem_cheo), u_so_sha256=sha_u,
                session_sha256=sha_ha, cham_lai=True,
-               ke_hoach=dict(file=os.path.abspath(a.ke_hoach), sha256=sha256_file(a.ke_hoach), luot=plan, su_kien=ev),
+               ke_hoach=dict(file=os.path.abspath(a.ke_hoach), sha256=plan_sha, luot=plan, su_kien=ev),
                tung_khung_max_m=e_all, luot=luot, luot_thieu=sorted(r for r, v in luot.items() if v['thieu']),
                luot_chua_co=thieu_luot, luot_thieu_neo=thieu_neo, mau_thuan=mau,
                moc_vuot_sau=[dict(moc=i, clip=c) for i in sorted(over) for c in over[i]],
@@ -1823,6 +1833,8 @@ def moc_dich_block(a, kc, tk):
     blk = dict(md)
     blk['tien_de_buoi'] = td.get('ket_qua')
     blk['tien_de_nguon'] = dict(file=os.path.abspath(a.tien_de), sha256=sha256_file(a.tien_de))
+    blk['luot_cham'] = {r: v['nguon']['frames_sha256'] for r, v in sorted(tk['luot'].items())}    # KCJ3-1
+    blk['luot_vang_u_moc'] = sorted(set(tk['luot']) - set(fr))   # must be clock-failed runs: khoa checks (C8B)
     blk['u_so_kiem_cheo'] = dict(u_so_m=kc['moc_dich'].get('u_so_m'), nguong_m=kc['moc_dich'].get('nguong_m'))
     return blk, a.moc_dich, sha256_file(a.moc_dich)
 
@@ -2005,7 +2017,10 @@ def tien_de(a):
         nguon.append(_rehash(s.get('video'), s.get('video_sha256'), f'clip_{n}'))
     if tk is not None:
         nguon.append(dict(vai_tro='tung_khung', duong_dan=os.path.abspath(a.tung_khung), sha256=sha_tk))
-        nguon.append(_rehash(tk['ke_hoach']['file'], tk['ke_hoach']['sha256'], 'ke_hoach'))
+        ev, runs, sh = read_plan_sha(tk['ke_hoach']['file'])                     # KCJ1-2: the verified content
+        if sh != tk['ke_hoach']['sha256'] or ev != tk['ke_hoach'].get('su_kien') or runs != tk['ke_hoach'].get('luot'):
+            raise KCError('ke_hoach: the file is not the plan tung_khung read (sha256 / events, KCJ1-2)')
+        nguon.append(dict(vai_tro='ke_hoach', duong_dan=os.path.abspath(tk['ke_hoach']['file']), sha256=sh))
         for rid, v in sorted(tk['luot'].items()):
             dd = v.get('duong_dan') or {}
             nguon.append(_rehash(dd.get('track'), v['nguon']['track_sha256'], f'track_{rid}'))
@@ -2248,7 +2263,10 @@ def main(argv=None):
         print(f'loi: {e}')
         print('#ket_qua,ma=2')
         return 2
-    print('#ket_qua,ma=0')
+    try:                                              # KCJ1-6: a closed stdout after publication keeps code 0
+        print('#ket_qua,ma=0')
+    except (OSError, ValueError):
+        pass
     return 0
 
 
