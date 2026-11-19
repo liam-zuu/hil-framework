@@ -1688,7 +1688,12 @@ def kiem_f2(rows):
 def _measure(cs_rows, keys, session_path, mau_args, ctx, neo, clip_dir):
     """Records of the windows `keys` (indices into cs_rows), clip by clip."""
     mau = _mau(mau_args, ctx, neo)
-    by_clip, recs, flags = {}, {}, {}
+    by_clip, recs, flags, shas = {}, {}, {}, {}
+
+    def _sha(p):                                       # LLC5-1: each clip hashed once
+        if p not in shas:
+            shas[p] = cm.sha256(p)
+        return shas[p]
     for i in keys:
         w = cs_rows[i]
         fr = khung_cua(w)
@@ -1696,14 +1701,14 @@ def _measure(cs_rows, keys, session_path, mau_args, ctx, neo, clip_dir):
             if w.get(TEN['clip']):                     # LLC4-2: its declared clip is still checked
                 path = w[TEN['clip']] if os.path.isabs(w[TEN['clip']]) or clip_dir is None else \
                     os.path.join(clip_dir, w[TEN['clip']])
-                if cm.sha256(path) != w[TEN['clip_sha']]:
+                if _sha(path) != w[TEN['clip_sha']]:
                     raise ValueError(f'{w[TEN["clip"]]}: sha256 differs from the window file')
             recs[i] = []
             continue
         by_clip.setdefault(w[TEN['clip']], []).append((i, fr))
     for clip, wins in by_clip.items():
         path = clip if os.path.isabs(clip) or clip_dir is None else os.path.join(clip_dir, clip)
-        sha = cm.sha256(path)
+        sha = _sha(path)
         for i, _ in wins:
             if cs_rows[i][TEN['clip_sha']] != sha:
                 raise ValueError(f'{clip}: sha256 differs from the window file')
@@ -2023,8 +2028,15 @@ def beta_cam_replay(f15_path, hc, out_l, luot, hw, fitw, doan, G, h, ctx):
         if blk is None:
             ly.append('thieu_khoi_cho')
             blk = {}
-        hong = {x.get('ten') if isinstance(x, dict) else x for x in blk.get('ca_hong') or []}
-        khai = {x.get('ten') if isinstance(x, dict) else x for x in blk.get('ca') or []} - hong   # declared cases
+        ds = {}
+        for kh in ('ca_hong', 'ca'):                    # F15C3-1: a case name is a non-empty string, else listed
+            v = blk.get(kh) or []
+            tens = [x.get('ten') if isinstance(x, dict) else x for x in v] if isinstance(v, list) else [None]
+            if not all(isinstance(x, str) and x for x in tens):
+                ly.append(f'{kh}:ten_ca_sai')
+            ds[kh] = {x for x in tens if isinstance(x, str) and x}
+        hong = ds['ca_hong']
+        khai = ds['ca'] - hong                          # declared cases
         muc = {}
         for m in blk.get('muc') or []:
             k = (m.get('luot_id'), m.get('dau'))
@@ -2653,6 +2665,8 @@ def phan_doan(rows, luot, hw, fitw, so, ctx, g_b, nguong_cho):
                 o['lan_lap_id'], o['chuan_12b'] = f'L{seg}', l12
             else:
                 o['ly_do'] = 'tam_doi_so_chuan' if d is True else 'lan_lap_khong_xac_dinh'
+        if pre is not None and not (pre['ok'] and pre['du_ok']):    # LLC4-1 (round 5): also where there is no standard
+            o['ly_do'] = 'lan_lap_khong_xac_dinh'
         # LLC3-1 (round 4): a valid doi breaks the group, also from a run whose place has no standard
         if o['doi_so_chuan'] is True or tong_doi(so[it['id']]) is True:
             gay = True

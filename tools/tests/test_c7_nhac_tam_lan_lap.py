@@ -1634,3 +1634,54 @@ def test_f15c_round2_declared_cases_structure_and_missing_entry(files):
     (files / 'h4.json').write_text(json.dumps(_f15_hash(o)), encoding='utf-8')
     b = _again(files, rows, recs, 'h', files / 'h4.json')['beta_cam_replay']['goc']
     assert b['trang_thai'] == 'chua_ket_luan' and 'L01:pre:thieu_muc' in b['ly_do'] and b['n'] == full - 1
+
+
+# ---------------------------------------------------------------- Codex round 5 (LLC4-1, LLC4-2, LLC5-1, F15C3-1)
+def test_round5_failed_pre_where_no_standard_is_not_determined(files):
+    """LLC4-1 (round 5): a pre without frames at a place without a standard -> lan_lap_khong_xac_dinh, not
+    khong_co_cua_so_chuan (CT4-3: a failed pre comes before every other reason)."""
+    runs = [('L01', ('goc', 0.0, 0.1, {}), ('goc', 0.01, 0.3, {})), ('L02', ('K1', 0.0, 0.0, {}), ('K1', 0.01, 0.2, {})),
+            ('L03', ('K1', 0.0, 0.0, {}), ('K1', 0.01, 0.2, {}))]
+    rows, recs = build(runs=runs, fit_places=('goc', 'K2'), e_places=('goc',))
+    i = next(i for i, w in enumerate(rows) if w['luot_id'] == 'L03' and w['loai'] == 'pre')
+    rows[i]['khung'], rows[i]['khung_ma_hop_le'], recs[i] = [], [], []
+    _, _, _, L = run(files, rows, recs)
+    assert 'khong_co_cua_so_chuan' in L['L02']['ly_do']['beta']                       # control: pre fine, no standard
+    assert L['L03']['lan_lap_id'] is None and L['L03']['lan_lap_id_ly_do'] == 'lan_lap_khong_xac_dinh'
+
+
+def test_round5_measure_empty_windows_check_the_clip_once(tmp_path, monkeypatch):
+    """LLC4-2: an empty window (CT4-3) still checks its declared clip SHA in _measure (wrong -> error; right -> no
+    record); LLC5-1: a clip shared by several windows is hashed once."""
+    clip = tmp_path / 'c.mov'
+    clip.write_bytes(b'clip bytes')
+    sha = cm.sha256(str(clip))
+    rows = [{'clip': 'c.mov', 'clip_sha256': sha, 'khung': [], 'luot_id': 'L01', 'loai': 'pre'},
+            {'clip': 'c.mov', 'clip_sha256': sha, 'khung': None, 'luot_id': 'L01', 'loai': 'post'}]
+    monkeypatch.setattr(nt, '_mau', lambda *a: 'mau')
+    calls = []
+    real = cm.sha256
+    monkeypatch.setattr(cm, 'sha256', lambda p: calls.append(p) or real(p))
+    recs, flags, mau = nt._measure(rows, [0, 1], None, None, None, None, str(tmp_path))
+    assert recs == {0: [], 1: []} and flags == {} and mau == 'mau' and len(calls) == 1
+    rows[1]['clip_sha256'] = 'khac'
+    with pytest.raises(ValueError, match='sha256 differs'):
+        nt._measure(rows, [0, 1], None, None, None, None, str(tmp_path))
+
+
+def test_round5_f15_case_names_not_strings(files):
+    """F15C3-1: a declared case name that is not a non-empty string (here the number 2 next to "lon") -> listed,
+    chua_ket_luan, no TypeError."""
+    rows, recs = build()
+    _, _, ll, _ = run(files, rows, recs, tag='h5')
+
+    def dong(cho, lid, dau, k):
+        return {'c': [0.0, 0.0]}
+    for q, (kh, val) in enumerate((('ca', [{'ten': 'c'}, {'ten': 'lon'}, {'ten': 2}]), ('ca_hong', [{'ten': ''}]),
+                                   ('ca', 'c'))):
+        f = files / f'h5_{q}.json'
+        o = _f15(ll, dong, f)
+        o['theo_cho']['goc'][kh] = val
+        f.write_text(json.dumps(_f15_hash(o)), encoding='utf-8')
+        b = _again(files, rows, recs, 'h5', f)['beta_cam_replay']['goc']
+        assert b['trang_thai'] == 'chua_ket_luan' and f'{kh}:ten_ca_sai' in b['ly_do'], (kh, b['ly_do'])
