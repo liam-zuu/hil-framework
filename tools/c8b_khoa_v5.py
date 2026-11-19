@@ -33,8 +33,15 @@ Per level (O1-F02, O1-F05, O1-F08; the K tasks take the F05 3b numbers only for 
   hang_dong     the constant closed terms the gate takes {a_m, hang_m, he_so_r, u_phi_rad, hang_rad} (names GATE
                 F19): a_m = the tag side; the others null until their sources come (hang_dong_ly_do says which).
   nhanh_tick    the U_t branch of the C8 plan (bo_tick / giu_tick), copied from it (GATE: = u_t_branch).
+  eps_H         {mm, huong_deg} copied from the C8 threshold file nguong_khoa_c8_v1 (CODE writes it when Liam fixes
+                eps_H at C8; CODE 20/11: not the CAM constant EPS_MM); SHA in khoa_truoc.nguon (vai 'nguong').
+  mien_car_pose {side_m, phien_ban, h_m [lo, hi], kappa [lo, hi]} (GATE camera.c8b; CODE 20/11): h_m = the hull of
+                the 4 corner heights of c8b_a6_v2 h_goc_m -/+ u_h_goc_m; kappa = [h_lo / (Z_c + dzc), h_hi / (Z_c - dzc)]
+                derived, no new margin (Z_c = tag_h_m / kappa of the session, dzc = day_doi.dzc_m of the camera file,
+                L125); side_m = session car_side_m; phien_ban = session car_pose_version (CAM adds it after session 2);
+                any part missing -> null values, trang_thai thieu.
   trang_thai    'khoa' only when every level of --muc has hang_dong all numbers, a band, the plan and its branch
-                named; else 'chua_khoa' with ly_do_chua_khoa.
+                named, eps_H and mien_car_pose there; else 'chua_khoa' with ly_do_chua_khoa.
 khoa_truoc: SHA-256 of every input and of this script (commit, dirty) and the time, written before any held-out part
 is looked at (design 0.3); the C8 plan with vai 'ke_hoach_c8' (GATE GC6-1).
 
@@ -96,8 +103,58 @@ def hang_theo_u(cq, level, a_m):
                  A4_deg=None if gone else cq['psi_deg'], trang_thai=cq['trang_thai'])], None
 
 
+def eps_h_of(ng):
+    """eps_H {mm, huong_deg} of nguong_khoa_c8_v1, or (None, reason)."""
+    if ng is None:
+        return None, 'thieu nguong_khoa_c8_v1 (CODE ghi khi Liam chot eps_H o C8)'
+    if not isinstance(ng, dict) or ng.get('format') != 'nguong_khoa_c8_v1':
+        raise KhoaError('--nguong: not a nguong_khoa_c8_v1 file')
+    e = ng.get('eps_H')
+    if not isinstance(e, dict) or any(_num(e.get(k)) is None or _num(e.get(k)) < 0 for k in ('mm', 'huong_deg')):
+        raise KhoaError('--nguong: eps_H {mm, huong_deg} not finite numbers >= 0')
+    return dict(mm=float(e['mm']), huong_deg=float(e['huong_deg'])), None
+
+
+def mien_car_pose(a6, ses, cam):
+    """{side_m, phien_ban, h_m, kappa, trang_thai, ly_do} (CODE 20/11)."""
+    why = []
+    side = _num((ses or {}).get('car_side_m'))
+    ver = (ses or {}).get('car_pose_version')
+    if side is None:
+        why.append('session: car_side_m missing')
+    if not isinstance(ver, str) or not ver:
+        why.append('session: car_pose_version missing (CAM adds CAR_POSE_VERSION after session 2)')
+        ver = None
+    h_m = None
+    hg, uh = (a6 or {}).get('h_goc_m'), (a6 or {}).get('u_h_goc_m')
+    if ((a6 or {}).get('trang_thai') or {}).get('h') != 'dat' or not isinstance(hg, list) or not isinstance(uh, list) \
+            or len(hg) != 4 or len(uh) != 4 or any(_num(x) is None for x in hg + uh):
+        why.append('c8b_a6_v2: h_goc_m / u_h_goc_m not dat')
+    else:
+        h_m = [min(h - u for h, u in zip(hg, uh)), max(h + u for h, u in zip(hg, uh))]
+    kap = None
+    th, k0 = _num((ses or {}).get('tag_h_m')), _num((ses or {}).get('kappa'))
+    dzc = _num(((cam or {}).get('day_doi') or {}).get('dzc_m'))
+    if th is None or k0 is None or not k0 > 0:
+        why.append('session: tag_h_m / kappa missing (Z_c = tag_h_m / kappa)')
+    if dzc is None or dzc < 0:
+        why.append('camera file: day_doi.dzc_m missing')
+    if h_m is not None and th is not None and k0 and dzc is not None and dzc >= 0:
+        zc = th / k0
+        if not zc - dzc > h_m[1]:
+            why.append('Z_c - dzc not above the highest corner')
+        else:
+            kap = [h_m[0] / (zc + dzc), h_m[1] / (zc - dzc)]
+    return dict(side_m=side, phien_ban=ver, h_m=h_m, kappa=kap, trang_thai='dat' if not why else 'thieu', ly_do=why)
+
+
 def trang_thai_khoa(out, muc_kha_thi):
     why = []
+    if out.get('eps_H') is None:
+        why.append(f'eps_H: {out.get("eps_H_ly_do") or "thieu"}')
+    mc = out.get('mien_car_pose')
+    if not isinstance(mc, dict) or mc.get('trang_thai') != 'dat':
+        why.append('mien_car_pose thieu' + (f' ({"; ".join(mc.get("ly_do") or [])})' if isinstance(mc, dict) else ''))
     if out.get('nhanh_tick') not in BRANCHES:
         why.append('nhanh_tick chua co (ke hoach C8)')
     if not any(n.get('vai') == 'ke_hoach_c8' for n in out['khoa_truoc']['nguon']):
@@ -163,7 +220,8 @@ def u_beta_cam(lan_lap):
     return out, ('dat' if not why else 'thieu'), why
 
 
-def build(tbs, lan_lap=None, nguon=None, script=None, a_m=None, nhanh_tick=None, muc_kha_thi=LEVELS):
+def build(tbs, lan_lap=None, nguon=None, script=None, a_m=None, nhanh_tick=None, muc_kha_thi=LEVELS, nguong=None,
+          a6=None, ses=None, cam=None):
     muc = {}
     for lv in LEVELS:
         tb = tbs.get(lv)
@@ -194,8 +252,10 @@ def build(tbs, lan_lap=None, nguon=None, script=None, a_m=None, nhanh_tick=None,
             if n is None:
                 raise KhoaError(f'alpha branch for {key} without its 3b source')
             bang[key]['nguon_3b'] = dict(duong_dan=n.get('duong_dan', n['file']), sha256=n['sha256'])
+    eh, ehw = eps_h_of(nguong)
     out = dict(version=VERSION, le=LE, muc=muc, bang_man_trap=bang, u_beta_cam_deg=ub, u_beta_cam_trang_thai=ust,
                u_beta_cam_ly_do=uwhy, nhanh_tick=nhanh_tick, muc_kha_thi=list(muc_kha_thi),
+               eps_H=eh, eps_H_ly_do=ehw, mien_car_pose=mien_car_pose(a6, ses, cam),
                khoa_truoc=dict(nguon=nguon or [], script=script,
                                luc=datetime.datetime.now().astimezone().isoformat(timespec='seconds')))
     st, why = trang_thai_khoa(out, muc_kha_thi)
@@ -233,6 +293,11 @@ def main(argv=None):
     ap.add_argument('--nhanh-tick', choices=BRANCHES, default=None,
                     help='U_t branch when the plan file does not carry nhanh_tick')
     ap.add_argument('--muc', default=','.join(LEVELS), help='levels of muc_kha_thi (comma separated)')
+    ap.add_argument('--nguong', default=None, help='nguong_khoa_c8_v1.json (eps_H, CODE writes it at C8)')
+    ap.add_argument('--a6', default=None, help='c8b_a6_v2 (h_goc_m, u_h_goc_m)')
+    ap.add_argument('--session', default=None, help='session.json of the scoring (car_side_m, tag_h_m, kappa, '
+                                                    'car_pose_version)')
+    ap.add_argument('--camera', default=None, help='camera file c8_cam_u_vao (day_doi.dzc_m)')
     ap.add_argument('--out', required=True)
     a = ap.parse_args(argv)
     try:
@@ -277,7 +342,15 @@ def main(argv=None):
             raise KhoaError(f'--muc {a.muc!r}: levels of {LEVELS}, once each')
         if a.canh_ma_m is not None and not (0.0 < a.canh_ma_m < 1.0):
             raise KhoaError(f'--canh-ma-m {a.canh_ma_m}: the tag side in metres')
-        out = build(tbs, ll, nguon, script_state(), a.canh_ma_m, nt, mk)
+        extra = {}
+        for key, path, vai in (('nguong', a.nguong, 'nguong'), ('a6', a.a6, 'a6'), ('ses', a.session, 'session'),
+                               ('cam', a.camera, 'camera')):
+            if path:
+                with open(path, encoding='utf-8') as f:
+                    extra[key] = json.load(f)
+                nguon.append(dict(vai=vai, file=os.path.basename(path), duong_dan=os.path.abspath(path),
+                                  sha256=cu.sha256(path)))
+        out = build(tbs, ll, nguon, script_state(), a.canh_ma_m, nt, mk, **extra)
         with open(a.out, 'x', encoding='utf-8') as f:
             f.write(json.dumps(_clean(out), indent=1, ensure_ascii=False, allow_nan=False))
     except (KhoaError, cu.InputError, OSError, ValueError) as exc:

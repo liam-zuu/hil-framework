@@ -103,7 +103,8 @@ def test_m5b_bands_closed_terms_branch_and_state(tmp_path):
     assert 'ke hoach' in k['ly_do_chua_khoa']
     # every term there (the other sessions' sources filled in by hand here): khoa
     ng = [dict(vai='ke_hoach_c8', file='kh.json', sha256='cd' * 32)]
-    k2 = K.build({'O1-F05': _tb('O1-F05')}, nguon=ng, a_m=a, nhanh_tick='giu_tick', muc_kha_thi=['O1-F05'])
+    k2 = K.build({'O1-F05': _tb('O1-F05')}, nguon=ng, a_m=a, nhanh_tick='giu_tick', muc_kha_thi=['O1-F05'],
+                 nguong=NG, a6=_a6(), ses=SES, cam=CAMF)
     k2['muc']['O1-F05']['hang_dong'].update(hang_m=0.004, he_so_r=0.002, u_phi_rad=0.001, hang_rad=0.01)
     assert K.trang_thai_khoa(k2, ['O1-F05']) == ('khoa', None)
     # no tag side: no band, not lockable
@@ -124,3 +125,45 @@ def test_m5b_cli_plan_branch(tmp_path):
     assert any(n['vai'] == 'ke_hoach_c8' and len(n['sha256']) == 64 for n in d['khoa_truoc']['nguon'])
     assert K.main(base + ['--ke-hoach', str(kh), '--nhanh-tick', 'giu_tick', '--out', str(tmp_path / 'k2.json')]) == 2
     assert K.main(base + ['--muc', 'O1-F99', '--out', str(tmp_path / 'k3.json')]) == 2
+
+
+def _a6(dat=True):
+    return dict(schema='c8b_a6_v2', h_goc_m=[0.1250, 0.1236, 0.1232, 0.1246], u_h_goc_m=[0.0012] * 4,
+                trang_thai=dict(a6='thieu', h='dat' if dat else 'thieu'))
+
+
+SES = dict(car_side_m=0.1445, tag_h_m=0.124175, kappa=0.124175 / 2.632, car_pose_version='car_pose_v2')
+CAMF = dict(day_doi=dict(dzc_m=0.01, dn_m=0.016))
+NG = dict(format='nguong_khoa_c8_v1', eps_H=dict(mm=2.0, huong_deg=0.5), quyet_liam='(gia, test)')
+
+
+def test_eps_h_and_mien_car_pose(tmp_path):
+    # CODE 20/11: eps_H from nguong_khoa_c8_v1; mien_car_pose h from the A6 corner heights, kappa derived with dzc
+    k = K.build({'O1-F05': _tb('O1-F05')}, nguong=NG, a6=_a6(), ses=SES, cam=CAMF, a_m=0.1445,
+                nhanh_tick='bo_tick', muc_kha_thi=['O1-F05'])
+    assert k['eps_H'] == dict(mm=2.0, huong_deg=0.5)
+    mc = k['mien_car_pose']
+    assert mc['trang_thai'] == 'dat' and mc['side_m'] == 0.1445 and mc['phien_ban'] == 'car_pose_v2'
+    assert mc['h_m'] == pytest.approx([0.1232 - 0.0012, 0.1250 + 0.0012])
+    assert mc['kappa'] == pytest.approx([(0.1232 - 0.0012) / (2.632 + 0.01), (0.1250 + 0.0012) / (2.632 - 0.01)])
+    # missing parts: null with the reason, not lockable
+    k2 = K.build({'O1-F05': _tb('O1-F05')}, a6=_a6(dat=False), ses=dict(SES, car_pose_version=None), cam={})
+    m2 = k2['mien_car_pose']
+    assert m2['trang_thai'] == 'thieu' and m2['h_m'] is None and m2['kappa'] is None and m2['phien_ban'] is None
+    assert any('car_pose_version' in w for w in m2['ly_do']) and any('dzc' in w for w in m2['ly_do'])
+    assert k2['eps_H'] is None and 'eps_H' in k2['ly_do_chua_khoa'] and 'mien_car_pose' in k2['ly_do_chua_khoa']
+    with pytest.raises(K.KhoaError):
+        K.build({'O1-F05': _tb('O1-F05')}, nguong=dict(NG, format='x'))
+    # CLI: the four files in khoa_truoc.nguon with their roles
+    p = tmp_path / '3b.json'
+    p.write_text(json.dumps(_tb('O1-F05')), encoding='utf-8')
+    files = {}
+    for nm, d in (('nguong', NG), ('a6', _a6()), ('session', SES), ('camera', CAMF)):
+        files[nm] = tmp_path / f'{nm}.json'
+        files[nm].write_text(json.dumps(d), encoding='utf-8')
+    out = tmp_path / 'k.json'
+    assert K.main(['--tb', f'O1-F05={p}', '--muc', 'O1-F05', '--canh-ma-m', '0.1445', '--nhanh-tick', 'bo_tick']
+                  + sum([[f'--{nm}', str(fp)] for nm, fp in files.items()], []) + ['--out', str(out)]) == 0
+    d = json.loads(out.read_text(encoding='utf-8'))
+    assert {n['vai'] for n in d['khoa_truoc']['nguon']} >= {'nguong', 'a6', 'session', 'camera'}
+    assert d['mien_car_pose']['trang_thai'] == 'dat'
