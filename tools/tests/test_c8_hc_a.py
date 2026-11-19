@@ -709,3 +709,64 @@ def test_falling_edge_dt_integer_us(tmp_path, dt_us, ok_expected):
     edit_log(d, fn)
     ok, ck, _ = checks(d)
     assert ok['het_han_firmware'] == ok_expected, [c for c in ck if c[0] == 'het_han_firmware']
+
+
+def _fake_ck(monkeypatch, rows=None, exc=None, a6_exc=None):
+    """A stand-in c7_chuoi_khung (CAM) with the F1 row keys of its 19/11 version."""
+    import types
+    m = types.ModuleType('c7_chuoi_khung')
+    seen = {}
+
+    def doc_a6(p):
+        if a6_exc:
+            raise a6_exc
+        return None if p is None else dict(sha256='x')
+
+    def chuoi_khung(frames_csv, a6, xoay, lan_lap=None, track=None):
+        seen['track'] = track
+        if exc:
+            raise exc
+        return rows
+    m.doc_a6, m.chuoi_khung = doc_a6, chuoi_khung
+    monkeypatch.setitem(sys.modules, 'c7_chuoi_khung', m)
+    return seen
+
+
+def _row(i, cong=True, a6=True, q=True):
+    ok = cong and a6 and q
+    return dict(frame_id=i, t_cam=0.1 * i, p_x=0.01 * i if ok else float('nan'), p_y=0.0,
+                psi_ma_p=0.0 if a6 else float('nan'), cong_ok=cong, a6_ok=a6, q_ok=q,
+                trang_thai='khoa' if ok else 'chan_doan')
+
+
+def test_frames_chain_without_a6_or_q_falls_back(monkeypatch):
+    # buoi 2 before xoay_v1 / A6: no q (xoay without a6_sha256) -> None, not NaN centres marked ok
+    _fake_ck(monkeypatch, rows=[_row(i, q=False) for i in range(5)])
+    assert ca.frames_chain('f.csv', 'a6.json', 'xoay.json') is None
+    _fake_ck(monkeypatch, rows=[_row(i, a6=False, q=False) for i in range(5)])
+    assert ca.frames_chain('f.csv', 'a6.json', 'xoay.json') is None
+    _fake_ck(monkeypatch, exc=ValueError('track.json tag_offset'))
+    assert ca.frames_chain('f.csv', 'a6.json', 'xoay.json') is None
+    _fake_ck(monkeypatch, a6_exc=ImportError('c8b_a6'))
+    assert ca.frames_chain('f.csv', 'a6.json', 'xoay.json') is None
+
+
+def test_frames_chain_uses_only_full_frames_and_passes_track(monkeypatch):
+    rows = [_row(0), _row(1, cong=False, a6=False, q=False), _row(2), _row(3, q=False)]
+    seen = _fake_ck(monkeypatch, rows=rows)
+    F = ca.frames_chain('f.csv', 'a6.json', 'xoay.json', track='track.json')
+    assert seen['track'] == 'track.json'
+    assert F['ok'].tolist() == [True, False, True, False] and F['chuoi'] == 'chan_doan'
+    assert np.all(np.isfinite(F['x'][F['ok']]))
+    _fake_ck(monkeypatch, rows=[_row(0), _row(1, cong=False, a6=False, q=False), _row(2)])
+    assert ca.frames_chain('f.csv', 'a6.json', 'xoay.json')['chuoi'] == 'khoa'
+
+
+def test_frames_of_without_xoay_does_not_call_chain(tmp_path, monkeypatch):
+    seen = _fake_ck(monkeypatch, exc=AssertionError('chain called'))
+    d, _ = make(tmp_path)
+
+    class A:
+        frames, track, a6, xoay = os.path.join(d, 'frames.csv'), os.path.join(d, 'track.json'), None, None
+    F = ca.frames_of(A, None)
+    assert F['chuoi'] == 'chan_doan' and 'track' not in seen

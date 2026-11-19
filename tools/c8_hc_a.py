@@ -544,17 +544,27 @@ def frames_basic(frames_csv, track_json):
     return F
 
 
-def frames_chain(frames_csv, a6, xoay, lan_lap=None):
-    """F1 of CAM when importable: frame_id, t_cam, p_x, p_y, psi_ma_p, cong_ok, trang_thai."""
+def frames_chain(frames_csv, a6, xoay, lan_lap=None, track=None):
+    """F1 of CAM when importable: frame_id, t_cam, p_x, p_y, psi_ma_p, cong_ok, a6_ok, q_ok, trang_thai.
+    None (caller falls back to frames_basic, chain 'chan_doan') when CAM or C8B (c8b_a6) is not merged yet, when
+    the chain refuses its inputs (ValueError: schema, track tag_offset), or when no frame has A6 AND q applied
+    (e.g. xoay_v1 without a6_sha256 or of another A6: CAM gives q None, p NaN). A frame is used only when its gate,
+    A6 and q are all ok (cong_ok alone would let NaN centres through). 'khoa' needs every gated frame A6 + q ok."""
     try:
         import c7_chuoi_khung as ck                                       # CAM, after its merge
-    except ImportError:
+        rows = ck.chuoi_khung(frames_csv, ck.doc_a6(a6), xoay, lan_lap=lan_lap, track=track)
+    except (ImportError, ValueError):
         return None
-    rows = ck.chuoi_khung(frames_csv, ck.doc_a6(a6), xoay, lan_lap=lan_lap)
+    if not rows:
+        return None
+    cong = np.array([bool(r['cong_ok']) for r in rows])
+    full = cong & np.array([bool(r.get('a6_ok')) and bool(r.get('q_ok')) for r in rows])
+    if not full.any():
+        return None
     F = dict(idx=np.array([r['frame_id'] for r in rows]), t=np.array([r['t_cam'] for r in rows]),
              x=np.array([r['p_x'] for r in rows]), y=np.array([r['p_y'] for r in rows]),
-             psi=np.array([r['psi_ma_p'] for r in rows]), ok=np.array([bool(r['cong_ok']) for r in rows]))
-    F['chuoi'] = 'khoa' if all(r.get('trang_thai') == 'khoa' for r in rows) else 'chan_doan'
+             psi=np.array([r['psi_ma_p'] for r in rows]), ok=full)
+    F['chuoi'] = 'khoa' if bool(np.all(full[cong])) else 'chan_doan'
     return F
 
 
@@ -1064,7 +1074,7 @@ def cmd_kiem(a):
 def frames_of(a, A):
     F = None
     if a.a6 and a.xoay:
-        F = frames_chain(a.frames, a.a6, a.xoay)
+        F = frames_chain(a.frames, a.a6, a.xoay, track=a.track)
     return F or frames_basic(a.frames, a.track)
 
 
@@ -1283,7 +1293,7 @@ def cmd_tinh(a):
             continue
         F = None
         if a.a6 and a.xoay:
-            F = frames_chain(frames, a.a6, a.xoay)
+            F = frames_chain(frames, a.a6, a.xoay, track=track)
         F = F or frames_basic(frames, track)
         try:
             an = analyse(A, F, info)
