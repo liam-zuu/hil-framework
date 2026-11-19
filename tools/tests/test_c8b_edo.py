@@ -141,3 +141,22 @@ def test_cli_luot(tmp_path):
     assert E.main(['luot', '--gio', str(gp), '--luoi-dir', str(d), '--esp32', str(lp), '--out', str(out)]) == 0
     r = json.loads(out.read_text(encoding='utf-8'))
     assert r['vuot_moi_nut'] and r['gio_sha256'] and r['esp32_sha256']
+
+
+def _luoi(ok=True, hi=0.08, nu=0, st='cham'):
+    return dict(trang_thai_luot=st, nodes_ok=[ok, True], states={c: 'dat' for c in ('g1', 'g2', 'g3', 'g4', 'g5')},
+                nums=dict(g4=dict(hi=hi, n_undef=nu)))
+
+
+def test_chung_cu_one_and_two_scorings():
+    e1 = dict(trang_thai='dat', vuot_moi_nut=True, can_xac_dinh_moi_nut=True)
+    c = E.chung_cu([_luoi()], [e1], True)
+    assert c == dict(phan_loai_du=True, ban_cham_cuoi=True, bo_so=[dict(
+        e_do_lo_vuot_D_moi_nut=True, e_do_xac_dinh_moi_nut=True, g4_can_huu_han_mien_hop_moi_nut=True)])
+    c2 = E.chung_cu([_luoi(), _luoi(hi=None)], [e1, dict(e1, trang_thai='chua_ket_luan')], False)
+    assert c2['bo_so'][1] == dict(e_do_lo_vuot_D_moi_nut=False, e_do_xac_dinh_moi_nut=False,
+                                  g4_can_huu_han_mien_hop_moi_nut=False) and c2['ban_cham_cuoi'] is False
+    assert not E.g4_finite_every_node(_luoi(ok=False)) and not E.g4_finite_every_node(_luoi(nu=1))
+    assert not E.chung_cu([_luoi(st='chua_ket_luan_khong_nut')], [e1], True)['phan_loai_du']
+    with pytest.raises(E.EdoError):
+        E.chung_cu([_luoi()], [e1, e1], True)

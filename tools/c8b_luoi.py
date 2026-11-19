@@ -491,6 +491,10 @@ def main(argv=None):
                 res['trang_thai_luot'] = 'cham'
                 res['gate_v3'] = gate_block(nodes, res, gio, cu.sha256(a.gio), task, gsha)
         import c8b_gio
+        ut = [x for x in res.get('u_t_nodes') or [] if isinstance(x, (int, float)) and not isinstance(x, bool)]
+        # F17 (GATE v6_C8 section 6): the largest node U_t (rule 2b takes h_s of the clock file + u_max_s)
+        res['u_max_s'] = (max(ut) if ut and len(ut) == len(res.get('u_t_nodes') or [])
+                          and all(math.isfinite(x) and x >= 0 for x in ut) else None)
         res.update(version=VERSION, task=task, nodes_s=gio.get('nodes_s', []), gio_sha256=cu.sha256(a.gio),
                    gate_file_sha256=gsha, script=c8b_gio.repo_state(), scorer=prov_scorer)
         os.makedirs(a.out_dir, exist_ok=True)

@@ -598,7 +598,7 @@ def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S, thao_ta
     U_ch = min(UPPER, key=lambda c: kenh[c]['D_s'])
     L, U = kenh[L_ch]['D_s'], kenh[U_ch]['D_s']
     c, h = 0.5 * (L + U), LE * 0.5 * (U - L)
-    out.update(L_s=L, U_s=U, L_kenh=L_ch, U_kenh=U_ch, width_s=U - L, center_s=c, half_s=h,
+    out.update(L_s=L, U_s=U, L_kenh=L_ch, U_kenh=U_ch, width_s=U - L, center_s=c, half_s=h, h_s=h,
                gyro_minus_rv_s=kenh['gyro_rx']['D_s'] - kenh['rv_rx']['D_s'])
     if L > U:
         hong.append(f'L {L * 1e3:.1f} ms > U~ {U * 1e3:.1f} ms')

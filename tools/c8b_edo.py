@@ -28,6 +28,7 @@ plate changed or not known); mat_neo; log without the rising edge of run_active,
 hole in the run window.
 
   python tools/c8b_edo.py luot --gio gio.json --luoi-dir DIR --esp32 log.csv --out edo.json
+  python tools/c8b_edo.py chung-cu --luoi luoi.json [--luoi luoi_H1.json] --edo edo.json [--edo ...] \n      --ban-cham-cuoi true|false --out chung_cu.json   (F17 chung_cu_c8)
   python tools/c8b_edo.py muc --luot edo1.json [--luot ...] --out edo_muc.json
 Last line: #ket_qua,ma=0 written / 2 refused or error.
 """
@@ -295,6 +296,35 @@ def muc(runs):
     return dict(version=VERSION_MUC, muc=sorted(levels.values(), key=lambda v: v['muc']), nguong_m=D_M)
 
 
+def g4_finite_every_node(luoi):
+    """G4 bound finite at every frame of the union domain at every node (J v6 section 5 "Khoa muc", J3-10): every
+    node scored and the combined G4 numbers finite with no undefined frame."""
+    nums = (luoi.get('nums') or {}).get('g4') if isinstance(luoi.get('nums'), dict) else None
+    ok = luoi.get('nodes_ok') or []
+    if not ok or not all(ok) or not isinstance(nums, dict):
+        return False
+    hi = nums.get('hi')
+    return isinstance(hi, (int, float)) and math.isfinite(hi) and nums.get('n_undef') == 0
+
+
+def chung_cu(luois, edos, ban_cham_cuoi):
+    """chung_cu_c8 of a run (data contract F17, GATE design v6_C8 section 7): one bo_so per scoring (two when scored
+    again with the two calibrations), each {e_do_lo_vuot_D_moi_nut, e_do_xac_dinh_moi_nut,
+    g4_can_huu_han_mien_hop_moi_nut}; phan_loai_du: G1-G5 classified at every scoring (before the 2b mask);
+    ban_cham_cuoi: from the calibration drift check of CAM (false when thieu_H1)."""
+    if len(luois) != len(edos) or not 1 <= len(luois) <= 2:
+        raise EdoError('one or two scorings, the same number of luoi and edo files')
+    bo, phan = [], True
+    for L, e in zip(luois, edos):
+        st = L.get('states') or {}
+        phan = phan and L.get('trang_thai_luot') == 'cham' and all(c in st for c in ('g1', 'g2', 'g3', 'g4', 'g5'))
+        okd = e.get('trang_thai') == 'dat'
+        bo.append(dict(e_do_lo_vuot_D_moi_nut=bool(okd and e.get('vuot_moi_nut')),
+                       e_do_xac_dinh_moi_nut=bool(okd and e.get('can_xac_dinh_moi_nut')),
+                       g4_can_huu_han_mien_hop_moi_nut=g4_finite_every_node(L)))
+    return dict(phan_loai_du=bool(phan), ban_cham_cuoi=bool(ban_cham_cuoi), bo_so=bo)
+
+
 def _load_nodes(gio, d):
     nodes = []
     for k in range(len(gio['nodes_s'])):
@@ -329,6 +359,11 @@ def main(argv=None):
     a1.add_argument('--luoi-dir', required=True)
     a1.add_argument('--esp32', required=True)
     a1.add_argument('--out', required=True)
+    a3 = sub.add_parser('chung-cu')
+    a3.add_argument('--luoi', action='append', required=True)
+    a3.add_argument('--edo', action='append', required=True)
+    a3.add_argument('--ban-cham-cuoi', choices=('true', 'false'), required=True)
+    a3.add_argument('--out', required=True)
     a2 = sub.add_parser('muc')
     a2.add_argument('--luot', action='append', required=True, help='json: run facts + lan_cham (see muc())')
     a2.add_argument('--out', required=True)
@@ -342,6 +377,12 @@ def main(argv=None):
                 raise EdoError(f'{a.gio}: not a c8b_gio_v1 file')
             res = analyse_run(gio, _load_nodes(gio, a.luoi_dir), read_log(a.esp32), gio['task'])
             res.update(gio_sha256=cu.sha256(a.gio), esp32_sha256=cu.sha256(a.esp32))
+        elif a.cmd == 'chung-cu':
+            def _j(p):
+                with open(p, encoding='utf-8') as f:
+                    return json.load(f)
+            res = dict(chung_cu_c8=chung_cu([_j(p) for p in a.luoi], [_j(p) for p in a.edo], a.ban_cham_cuoi == 'true'),
+                       nguon=[dict(file=os.path.basename(p), sha256=cu.sha256(p)) for p in a.luoi + a.edo])
         else:
             runs = []
             for p in a.luot:

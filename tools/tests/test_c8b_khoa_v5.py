@@ -35,7 +35,8 @@ def test_level_without_turning_bound_is_null_with_the_consequence():
 
 
 def test_shutter_branch_per_level():
-    k = K.build({'O1-F02': _tb('O1-F02', alpha=True), 'O1-F05': _tb('O1-F05')})
+    ng = [dict(vai='3b O1-F02', file='f02.json', duong_dan='D:/x/f02.json', sha256='cd' * 32)]
+    k = K.build({'O1-F02': _tb('O1-F02', alpha=True), 'O1-F05': _tb('O1-F05')}, nguon=ng)
     assert k['muc']['O1-F02']['man_trap']['nhanh'] == 'alpha' and k['muc']['O1-F02']['man_trap']['alpha_c_s_px'] == 1e-6
     mt = k['muc']['O1-F05']['man_trap']
     assert mt['nhanh'] == 'mot_khung' and mt['le'] is None and mt['mot_khung_s'] == pytest.approx(1 / 60)
@@ -66,3 +67,13 @@ def test_cli_on_session1_l132(tmp_path, capsys):
     assert d['muc']['O1-F05']['can_quay']['p_m'] == pytest.approx(1.25 * 0.0022129880449652806)
     assert d['muc']['O1-F08']['can_quay']['p_m'] is None
     assert len(d['khoa_truoc']['nguon']) == 3 and all(n['sha256'] for n in d['khoa_truoc']['nguon'])
+
+
+def test_bang_man_trap_has_k_and_alpha_source():
+    ng = [dict(vai='3b O1-F05', file='f05.json', duong_dan='D:/x/f05.json', sha256='ab' * 32)]
+    k = K.build({'O1-F05': _tb('O1-F05', alpha=True), 'O1-F02': _tb('O1-F02')}, nguon=ng)
+    b = k['bang_man_trap']
+    assert set(b) == {'O1-F02', 'O1-F05', 'O1-F08', 'K'} and b['K']['nhanh'] == 'alpha'
+    assert b['K']['nguon_3b']['sha256'] == 'ab' * 32 and b['O1-F02'] == dict(nhanh='mot_khung')
+    with pytest.raises(K.KhoaError):
+        K.build({'O1-F05': _tb('O1-F05', alpha=True)})               # alpha without its source

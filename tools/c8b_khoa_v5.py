@@ -122,7 +122,19 @@ def build(tbs, lan_lap=None, nguon=None, script=None):
                        chi_bao_cao=['g5'] if lv == 'O1-F08' else [],
                        khac={k: dict(gia_tri=None, trang_thai='thieu', ly_do='chua co nguon') for k in KHAC})
     ub, ust, uwhy = u_beta_cam(lan_lap)
-    return dict(version=VERSION, le=LE, muc=muc, u_beta_cam_deg=ub, u_beta_cam_trang_thai=ust,
+    # F17 bo_cham.bang_man_trap: each level and K one branch; alpha needs the 3b source; K (0.5 m/s, F05 speeds)
+    # takes the branch of the F05 3b (J v6 J4-13)
+    src = {n['vai'][3:]: n for n in (nguon or []) if n.get('vai', '').startswith('3b ')}
+    bang = {}
+    for lv, key in [(lv, lv) for lv in LEVELS] + [('O1-F05', 'K')]:
+        mt = muc[lv]['man_trap']
+        bang[key] = dict(nhanh=mt['nhanh'])
+        if mt['nhanh'] == 'alpha':
+            n = src.get(lv)
+            if n is None:
+                raise KhoaError(f'alpha branch for {key} without its 3b source')
+            bang[key]['nguon_3b'] = dict(duong_dan=n.get('duong_dan', n['file']), sha256=n['sha256'])
+    return dict(version=VERSION, le=LE, muc=muc, bang_man_trap=bang, u_beta_cam_deg=ub, u_beta_cam_trang_thai=ust,
                 u_beta_cam_ly_do=uwhy, trang_thai='chua_khoa',
                 ly_do_chua_khoa='cac hang khac chua co nguon (thiet ke v7 muc 1, 15)',
                 khoa_truoc=dict(nguon=nguon or [], script=script,
@@ -167,7 +179,8 @@ def main(argv=None):
                 raise KhoaError(f'--tb {s!r}: LEVEL=path, LEVEL in {LEVELS}, once each')
             with open(p, encoding='utf-8') as f:
                 tbs[lv] = json.load(f)
-            nguon.append(dict(vai=f'3b {lv}', file=os.path.basename(p), sha256=cu.sha256(p)))
+            nguon.append(dict(vai=f'3b {lv}', file=os.path.basename(p), duong_dan=os.path.abspath(p),
+                              sha256=cu.sha256(p)))
         ll = None
         if a.lan_lap:
             with open(a.lan_lap, encoding='utf-8') as f:
