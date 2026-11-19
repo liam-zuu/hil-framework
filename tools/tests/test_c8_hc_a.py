@@ -463,14 +463,27 @@ def test_tinh_refuses_cap_that_failed_kiem(tmp_path, capsys):
     assert r['trang_thai'] == 'chua_ket_luan' and 'dinh_danh_gain' in r['ly_do'][0] and r['a_k_deg'] is None
 
 
+def f6(ref, cho='K2', ids=None, **kw):
+    """F6 hieu_chuan_neo_v1 as NHACTAM writes it (feat/c8-lan-lap e7b8428): place block + the ref_12b window with
+    khung_chung = a subset of khung_ma_hop_le (anchor gate & A6), sha256 of the sorted IDs joined by commas."""
+    import hashlib
+    ids = sorted(ref['khung_ma_hop_le'][1:-1] if ids is None else ids)
+    sha = hashlib.sha256(','.join(str(i) for i in ids).encode()).hexdigest()
+    blk = dict(trang_thai='dat', ly_do='', cho=cho, luot_id=ref['luot_id'], clip_sha256=ref['clip_sha256'],
+               khung_chung_sha256=sha, psi_chuan_k_deg=12.0, frames_sha256=ref['frames_sha256'])
+    blk.update(kw)
+    win = dict(meta=dict(luot=ref['luot_id'], cho=cho, loai='ref_12b', clip=ref.get('clip'),
+                         clip_sha=ref['clip_sha256'], frames_sha=ref['frames_sha256']),
+               khung_chung=dict(id=ids, pts_s=[]), khung_chung_sha256=sha)
+    return dict(schema='hieu_chuan_neo_v1', cho={cho: blk}, cua_so=[win])
+
+
 def test_tinh_checks_f6_and_f9_sources(tmp_path):
     """HCC1-10: F6 must be made on the ref_12b window of the cap (clip, frames), F9 on its F5, by leg i."""
     d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
     ref, doan = run_cua_so(d)
-    good_neo = write_json(str(tmp_path / 'neo.json'), dict(cho=dict(K2=dict(
-        psi_chuan_k_deg=12.0, clip_sha256=ref['clip_sha256'], khung_chung_sha256=ref['khung_ma_hop_le_sha256']))))
-    bad_neo = write_json(str(tmp_path / 'neo_x.json'), dict(cho=dict(K2=dict(
-        psi_chuan_k_deg=12.0, clip_sha256='0' * 64, khung_chung_sha256=ref['khung_sha256']))))
+    good_neo = write_json(str(tmp_path / 'neo.json'), f6(ref))
+    bad_neo = write_json(str(tmp_path / 'neo_x.json'), f6(ref, clip_sha256='0' * 64))
     good_e = write_json(str(tmp_path / 'e.json'), dict(doan_12b_sha256=doan['sha256'],
                                                        doan=[dict(i=i, e_hieu_m=0.002) for i in range(6)]))
     bad_e = write_json(str(tmp_path / 'e_x.json'), dict(doan_12b_sha256='1' * 64, doan=[dict(i=0, e_hieu_m=0.002)]))
@@ -587,8 +600,7 @@ def test_tinh_refuses_other_frames_than_f2_f5(tmp_path):
     """HCC2-5 (Codex): F2/F5 made from frames A, tinh run on frames B (+0.25 deg) still gave khoa."""
     d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
     ref, doan = run_cua_so(d)
-    neo = write_json(str(tmp_path / 'neo.json'), dict(cho=dict(K2=dict(
-        psi_chuan_k_deg=12.0, clip_sha256=ref['clip_sha256'], khung_chung_sha256=ref['khung_ma_hop_le_sha256']))))
+    neo = write_json(str(tmp_path / 'neo.json'), f6(ref))
     fb = os.path.join(d, 'frames_B.csv')
     with open(os.path.join(d, 'frames.csv'), encoding='utf-8') as f, open(fb, 'w', encoding='utf-8') as g:
         g.write(f.readline())
@@ -813,3 +825,23 @@ def test_read_e_hieu_refuses_diagnostic_f9(tmp_path):
         p = write_json(str(tmp_path / 'e_bad.json'), dict(doan_12b_sha256=body['sha256'], **bad))
         with pytest.raises(ca.AError):
             ca.read_e_hieu(p, dp)
+
+
+def test_read_neo_khung_chung_as_nhactam(tmp_path):
+    """NHACTAM 19/11 (via CODE): khung_chung_sha256 is the sha of the common set (anchor gate & khung_ma_hop_le &
+    A6), not khung_sha256 / khung_ma_hop_le_sha256 of the window: the old check always refused (code 2)."""
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
+    ref, _ = run_cua_so(d)
+    assert ca.read_neo(write_json(str(tmp_path / 'ok.json'), f6(ref)), 'K2', ref) == 12.0
+    outside = max(ref['khung_ma_hop_le']) + 100000
+    bad = {
+        'chua_ket_luan': f6(ref, trang_thai='chua_ket_luan'),
+        'frames': f6(ref, frames_sha256='2' * 64),
+        'ngoai_tap': f6(ref, ids=ref['khung_ma_hop_le'][1:3] + [outside]),
+        'sha_sai': f6(ref, khung_chung_sha256='3' * 64),
+        'khong_cua_so': dict(f6(ref), cua_so=[]),
+        'luot_khac': f6(ref, luot_id='HC_K2_9'),
+    }
+    for name, obj in bad.items():
+        with pytest.raises(ca.AError):
+            ca.read_neo(write_json(str(tmp_path / f'{name}.json'), obj), 'K2', ref)
