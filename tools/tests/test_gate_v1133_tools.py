@@ -368,6 +368,7 @@ def _gio(tmp, name, ok=False, fmt='c8b_gio_v1', task='O1-F05', inputs_in=None, *
             f.write(f'FAKE,{k},{name}\n')
         sha[k] = rl.sha256_file(q)
     p = os.path.join(str(tmp), f'{name}.json')
+    extra.setdefault('ket_luan', 'ok' if ok else 'hong_he_do')       # c8b_gio.py 659: the verdict of the file
     d = dict(format=fmt, ok=ok, nodes_s=[0.01, 0.011], FAKE=True, name=name, sha256=sha, **extra)
     if task is not None:
         d['task'] = task
@@ -399,6 +400,28 @@ def test_c8b_check_needs_its_file_ok_false(ds):
     p = _gio(tmp, 'g1')
     row = rl.end(d, 'hong_he_do', fail_cause=rl.C8B_GIO_FAIL, c8b_gio=p, **kw)
     assert row['c8b_gio_sha256'] == rl.sha256_file(p)
+
+
+def test_c8b_check_counts_only_a_lost_verdict(ds):
+    # CODE_GATE 19/11, bug of e66ecd1 (CODE's order of 19/11): c8b_gio.py writes ok false with ket_luan hong_he_do
+    # (lost: run again, counted) or ket_luan chua_ket_luan (no finite clock bound: not lost, not counted,
+    # c8b_gio.py 585, 659). A file of the second kind, or one without ket_luan, is refused as a kiem_gio_c8b run, and
+    # nothing is logged: the open run stays open and the count of the level does not move.
+    d, gf, tmp = ds
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    kw = dict(completed=1, results_dir=str(tmp), queries=rl.fake_queries())
+    path = os.path.join(d, rl.TUNING)
+    before = open(path, encoding='utf-8').read() if os.path.isfile(path) else ''
+    for name, kl in (('chua', 'chua_ket_luan'), ('none', None), ('okv', 'ok')):
+        g = _gio(tmp, name, ket_luan=kl)                                 # None: written as null
+        with pytest.raises(rl.LogError, match='not hong_he_do'):
+            rl.end(d, 'hong_he_do', fail_cause=rl.C8B_GIO_FAIL, c8b_gio=g, **kw)
+    after = open(path, encoding='utf-8').read() if os.path.isfile(path) else ''
+    assert after == before
+    assert not rl.c8b_refusals(rl.live_rows(rl.read_rows(path)))
+    row = rl.end(d, 'hong_he_do', fail_cause=rl.C8B_GIO_FAIL, c8b_gio=_gio(tmp, 'lost'), **kw)
+    assert rl.c8b_refusals(rl.live_rows(rl.read_rows(path)))[rl.map_key(row)] == 1
 
 
 def test_c8b_check_only_on_the_floor_lost(ds):

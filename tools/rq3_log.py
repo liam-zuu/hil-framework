@@ -201,7 +201,7 @@ MAP_RERUNS_MAX = 3
 # (Recommended)", "Tổng (Recommended)", "Bắt buộc file (Recommended)", "Luật §4.6: 3 hỏng liên tiếp (Recommended)";
 # the code: CODE_GATE design v2 section 6, Liam 17/11 at CODE_GATE "Duyệt, code luôn (Recommended)"): a floor run
 # that fails the per-run check of the C8b time file is lost to the measurement, fail cause C8B_GIO_FAIL, with that
-# file (format c8b_gio_v1, ok false) whose sha256 goes to c8b_gio_sha256. Only these runs are counted, in total (not
+# file (format c8b_gio_v1, ok false, ket_luan hong_he_do) whose sha256 goes to c8b_gio_sha256. Only these runs are counted, in total (not
 # in a row), per campaign, gain set and level (map_key), in the order of the log, stages other than final (final:
 # S05 4.6, FINAL_LOST_N lost runs in a row, every cause); the fourth one (1 + C8B_RERUNS_MAX) makes the level of that
 # gain set chua_ket_luan, a run of it after that is refused.
@@ -1819,7 +1819,7 @@ def _hashes_under(folder: str, skip: str = '') -> set:
 
 
 def read_c8b_gio(path: str, task: Optional[str] = None, results_dir: Optional[str] = None) -> str:
-    """The C8b time file of a run that failed its check (format c8b_gio_v1, ok false); returns its sha256.
+    """The C8b time file of a run lost to its check (format c8b_gio_v1, ok false, ket_luan hong_he_do); returns its sha256.
     GT1-8 (Codex round 1 of CODE_GATE; the deferred part closed when CODE_C8B fixed c8b_gio_v1, Liam 17/11 at CODE_GATE
     "Làm, nhánh nhỏ + Codex (Recommended)"): task, the run's task, must be the 'task' of the file; with results_dir, the
     file's 'sha256' {esp32, frames} (64 lowercase hex each) must each be the sha256 of a file under the run folder, so
@@ -1832,6 +1832,14 @@ def read_c8b_gio(path: str, task: Optional[str] = None, results_dir: Optional[st
     if not isinstance(d, dict) or d.get('format') != C8B_GIO_FORMAT or d.get('ok') is not False:
         raise LogError(f'--c8b-gio {path!r}: not a {C8B_GIO_FORMAT} file with ok false (the run must have failed the '
                        'C8b time check, O1 3.5 v11.37)')
+    # CODE_GATE 19/11 (bug of e66ecd1, CODE's order of 19/11): c8b_gio.py writes ok false for two verdicts
+    # (c8b_gio.py 585, 659): ket_luan hong_he_do (lost to the measurement: run again, counted against
+    # C8B_RERUNS_MAX) and ket_luan chua_ket_luan (no finite clock bound: G1-G5 not concluded, the run is
+    # chua_ket_luan, not lost, not counted). Only the first is a kiem_gio_c8b run.
+    if d.get('ket_luan') != 'hong_he_do':
+        raise LogError(f'--c8b-gio {path!r}: ket_luan {d.get("ket_luan")!r}, not hong_he_do: only a run lost to the C8b '
+                       'time check is a kiem_gio_c8b run counted against the reruns (ket_luan chua_ket_luan: no finite '
+                       'clock bound, log the run chua_ket_luan without --c8b-gio)')
     if task is not None and d.get('task') != task:
         raise LogError(f'--c8b-gio {path!r}: the time file of task {d.get("task")!r}, the run is {task!r} (GT1-8)')
     if results_dir is not None:

@@ -500,7 +500,8 @@ def _fake_gio(folder, task, run):
         sha[k] = rl.sha256_file(q)
     p = os.path.join(folder, 'c8b_gio.json')
     with open(p, 'w', encoding='utf-8') as f:
-        json.dump(dict(format='c8b_gio_v1', ok=False, FAKE=True, run=run, task=task, sha256=sha), f)
+        json.dump(dict(format='c8b_gio_v1', ok=False, ket_luan='hong_he_do', FAKE=True, run=run, task=task, sha256=sha),
+                  f)
     return p
 
 
