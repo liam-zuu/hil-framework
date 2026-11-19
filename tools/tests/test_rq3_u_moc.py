@@ -639,7 +639,7 @@ def _final_dat(ds):
 def _table(ds, out):
     import s05_final_table as T
     os.makedirs(out)
-    assert T.main(['table', '--dataset', ds, '--out', out, '--gate-file', os.path.join(ds, 'FAKE_gate_c8.json')]) == 0
+    assert T.main(['table', '--dataset', ds, '--out', out, '--gate-file', os.path.join(ds, 'FAKE_gate_c8.json'), '--gate-file-fake']) == 0
     return {r['run_uid']: r for r in _rows_of(os.path.join(out, 'S05_final_runs.csv'))}
 
 

@@ -49,7 +49,7 @@ def demo_ds(tmp_path):
 def test_demo_final_table_runs_the_whole_chain(demo_ds, tmp_path):
     out = str(tmp_path / 'tbl')
     os.makedirs(out)
-    assert T.main(['table', '--dataset', demo_ds, '--out', out, '--gate-file', os.path.join(demo_ds, 'FAKE_gate_c8.json')]) == 0
+    assert T.main(['table', '--dataset', demo_ds, '--out', out, '--gate-file', os.path.join(demo_ds, 'FAKE_gate_c8.json'), '--gate-file-fake']) == 0
     runs = _rows(os.path.join(out, 'S05_final_runs.csv'))
     judged = [r for r in runs if r.get('outcome') in T.VALID]
     assert len(judged) == 4                                      # two final_hil, two judged car final runs
@@ -74,7 +74,7 @@ def test_demo_rows_name_their_query_files(demo_ds):
 # ── R134 (1): the summary reads the two saved answers again ───────────────────────────────────────────────────────
 def _gf(ds):
     """The FAKE C8 gate file of the demo (O1 v11.33, gate_c8_v1)."""
-    return rl.read_gate_file(os.path.join(ds, 'FAKE_gate_c8.json'))
+    return rl.read_gate_file(os.path.join(ds, 'FAKE_gate_c8.json'), allow_fake=True)
 
 
 def _summary(ds):
@@ -306,7 +306,7 @@ def test_so_h_final_car_run_lost_after_the_comparison_leaves_the_table(demo_ds, 
     rl.so_h(demo_ds, fin['run_uid'], _score_final(demo_ds, fin['run_uid'], 3.0, 'hong_he_do'))
     out = str(tmp_path / 'tbl')
     os.makedirs(out)
-    assert T.main(['table', '--dataset', demo_ds, '--out', out, '--gate-file', os.path.join(demo_ds, 'FAKE_gate_c8.json')]) == 0
+    assert T.main(['table', '--dataset', demo_ds, '--out', out, '--gate-file', os.path.join(demo_ds, 'FAKE_gate_c8.json'), '--gate-file-fake']) == 0
     runs = {r['run_uid']: r for r in _rows(os.path.join(out, 'S05_final_runs.csv'))}
     assert runs[fin['run_uid']]['outcome'] == 'hong_he_do' and runs[fin['run_uid']]['so_h_flags'] == 'calib_drift'
     assert _summary(demo_ds)
@@ -370,7 +370,7 @@ def test_b8s2_2_run_after_a_stop_seen_only_at_the_comparison(demo_ds, tmp_path):
     assert s['N_HW'] == '7'                                             # 3 tune + 3 final + the late run
     out = str(tmp_path / 'tbl')
     os.makedirs(out)
-    assert T.main(['table', '--dataset', demo_ds, '--out', out, '--gate-file', os.path.join(demo_ds, 'FAKE_gate_c8.json')]) == 0
+    assert T.main(['table', '--dataset', demo_ds, '--out', out, '--gate-file', os.path.join(demo_ds, 'FAKE_gate_c8.json'), '--gate-file-fake']) == 0
     assert late['run_uid'] not in {r['run_uid'] for r in _rows(os.path.join(out, 'S05_final_runs.csv'))}
     with pytest.raises(rl.LogError, match='lost runs in a row'):        # and no run after it any more
         rl.begin(demo_ds, 'FAKE-F2', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'final', gain_set='A-PID/G00')
@@ -430,7 +430,7 @@ def test_c9d2_final_table_stops_before_so_h_of_a_final_car_run(demo_ds, tmp_path
     _drop_so_h(demo_ds, 'FAKE-F1:3')
     out = str(tmp_path / 'tbl')
     os.makedirs(out)
-    assert T.main(['table', '--dataset', demo_ds, '--out', out, '--gate-file', os.path.join(demo_ds, 'FAKE_gate_c8.json')]) != 0
+    assert T.main(['table', '--dataset', demo_ds, '--out', out, '--gate-file', os.path.join(demo_ds, 'FAKE_gate_c8.json'), '--gate-file-fake']) != 0
     assert not os.path.exists(os.path.join(out, 'S05_final_runs.csv'))
 
 
@@ -438,7 +438,7 @@ def test_c9d2_final_table_does_not_need_so_h_of_tune_runs(demo_ds, tmp_path):
     _drop_so_h(demo_ds, 'FAKE-A1:2')                                   # screen run: counted in the summary only
     out = str(tmp_path / 'tbl')
     os.makedirs(out)
-    assert T.main(['table', '--dataset', demo_ds, '--out', out, '--gate-file', os.path.join(demo_ds, 'FAKE_gate_c8.json')]) == 0
+    assert T.main(['table', '--dataset', demo_ds, '--out', out, '--gate-file', os.path.join(demo_ds, 'FAKE_gate_c8.json'), '--gate-file-fake']) == 0
 
 
 def _confirm_block(ds, tmp_path, block, outcomes):

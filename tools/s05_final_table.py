@@ -448,7 +448,8 @@ def gain_file_of(gain_set_id, files):
 
 
 def load_runs(dataset, score_name, esp32_name, query_before_name='gain_query_before.txt',
-              query_after_name='gain_query_after.txt', gain_ack_name='gain_ack.txt', init_gain=None, gate_file=None):
+              query_after_name='gain_query_after.txt', gain_ack_name='gain_ack.txt', init_gain=None, gate_file=None,
+              gate_file_fake=False):
     path = os.path.join(dataset, 'm7_tuning_log.csv')
     with open(path, newline='', encoding='utf-8') as f:
         rows = list(csv.DictReader(f))
@@ -465,7 +466,7 @@ def load_runs(dataset, score_name, esp32_name, query_before_name='gain_query_bef
     try:
         # O1 v11.33 (CODE_GATE): the rows checked against the C8 gate file (path, --gate-file): report-only conditions
         # recomputed from it, the gate file SHA of every run (rq3_log.check_gate_rows)
-        rl.check_gate_rows(rows, rl.read_gate_file(gate_file) if gate_file else None)
+        rl.check_gate_rows(rows, rl.read_gate_file(gate_file, gate_file_fake) if gate_file else None)   # GC6-14
         rl.check_map_rows(rows)
         miss = rl.so_h_missing(rows, dataset, stages=('final',))
         if miss:          # C9D-2 (Liam 17/11 at CODE_C13 "Sửa cả 7 + vòng 2 (Recommended)"): no table before so-h
@@ -808,6 +809,7 @@ def main(argv=None):
     a2.add_argument('--init-gain', action='append', default=[], metavar='CTRL=FILE',
                     help='gain file of the initial gain RQ2-INIT-<CTRL> (PID, LADRC; R134C6-1)')
     a2.add_argument('--gate-file', default='', help='the locked C8 gate file (gate_c8_v1, O1 v11.33)')
+    a2.add_argument('--gate-file-fake', action='store_true', help='accept a FAKE gate file (tests, demo only; GC6-14)')
     a = ap.parse_args(argv)
     try:
         if a.cmd == 'tv':
@@ -826,7 +828,8 @@ def main(argv=None):
                     raise ValueError(f'--init-gain {x!r}: write CTRL=FILE, once per controller')
                 init[c] = f
             runs, problems = load_runs(a.dataset, a.score_name, a.esp32_name, a.query_before_name,
-                                       a.query_after_name, a.gain_ack_name, init, a.gate_file or None)
+                                       a.query_after_name, a.gain_ack_name, init, a.gate_file or None,
+                                       a.gate_file_fake)
             for p in problems:
                 print('CANH BAO:', p)
             write_table(runs, a.out)
