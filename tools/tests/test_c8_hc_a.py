@@ -1015,3 +1015,34 @@ def test_tinh_prints_null_u_a(tmp_path, monkeypatch, capsys):
     txt = capsys.readouterr().out
     assert code in (0, 1) and 'u_a = null' in txt
     assert json.load(open(out, encoding='utf-8'))['u_a_k_deg'] is None
+
+
+def test_round_v3_small_fixes(tmp_path):
+    """HCV3-3: a place block without luot_id / psi but other frames, or a window with frames_sha and frames_sha256
+    different, is refused. HCV3-4: F6 frames not all rebuilt -> the reference end is missing (no window-0 fallback).
+    HCV3-5: the q turn flag says whether some leg carries it."""
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
+    ref, _ = run_cua_so(d)
+    w = lambda name, obj: write_json(str(tmp_path / f'{name}.json'), obj)                  # noqa: E731
+    stripped = f6(ref)
+    blk = dict(stripped['cho']['K2'])
+    blk.pop('luot_id')
+    blk.pop('psi_chuan_k_deg')
+    blk['frames_sha256'] = '6' * 64
+    stripped['cho']['K2'] = blk
+    both = f6(ref, win=dict(frames_sha256='7' * 64))
+    for name, obj in (('stripped', stripped), ('both', both)):
+        with pytest.raises(ca.AError):
+            ca.read_neo(w(name, obj), 'K2', ref)
+    an = analyse(d)
+    fn = lambda p1, p2: (math.radians(0.05), [])                                            # noqa: E731
+    r = ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.0, 0.0], du_m=0.0, neo=0.0, can_hai_dau=fn,
+                        p_ref_tag='thieu')
+    assert r['u_hang_deg']['u_psi_cuc'] is None and any('dau chuan' in x for x in r['ly_do'])
+    d2, _ = make(tmp_path, 'HC_K2_2', cho='K2')
+    r2 = ca.place_result('K2', [('x', an), ('y', analyse(d2))], 'x', e_hieu=E(0.0), q=[0.02, 0.0], du_m=0.0, neo=0.0,
+                         bao_q=True, can_hai_dau=fn)
+    assert r2['u_q_gom_xoay_q'] is True and r2['u_q_bao_boi_f9'] == ['x']
+    r3 = ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.02, 0.0], du_m=0.0, neo=0.0, bao_q=True,
+                         can_hai_dau=fn)
+    assert r3['u_q_gom_xoay_q'] is False

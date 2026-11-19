@@ -960,7 +960,11 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
         # design v4 3.3: u_psi_cuc = max over the long legs of the bound between the start window of the leg (at
         # the extreme, where a takes psi') and the reference window (where psi_chuan_k is taken)
         # HCH2-4: the reference end is the tag centre of the F6 frame set (khung_chung) when given
-        p_ref = p_ref_tag if p_ref_tag is not None else cap['windows'][0].get('p_tag')
+        if isinstance(p_ref_tag, str):                     # HCV3-4: F6 frames not all found with a tag centre
+            can_why.append('dau chuan: khong dung lai du moi khung F6 (tam ma huu han)')
+            p_ref = None
+        else:
+            p_ref = p_ref_tag if p_ref_tag is not None else cap['windows'][0].get('p_tag')
         vals = [None if p_ref is None else can(lg['p_tag_a'], p_ref) for lg in legs_u]
         if any(v is None for v in vals):
             psi_cuc = None
@@ -1018,7 +1022,9 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
         hang[k] = None
     out = dict(res, a_k_deg=math.degrees(a), u_a_k_deg=None if rong else math.degrees(u_a),
                do_tan_deg=math.degrees(spread), u_hang_deg=hang, u_hang_thieu=sorted(set(thieu_hang)),
-               u_q_gom_xoay_q=not bao_q, cong=gates, giu_ngoai=giu_ngoai, vet_thuc=vet)
+               u_q_gom_xoay_q=(not bao_q) or len(legs_u) > len(longs),       # HCV3-5: some leg carries it
+               u_q_bao_boi_f9=sorted({tid for tid, an_, _ in attempts if tid == cap_id}) if bao_q else [],
+               cong=gates, giu_ngoai=giu_ngoai, vet_thuc=vet)
     if neo is not None:
         out['phi_hat_chuan_k_deg'] = math.degrees(wrap(math.radians(neo) - a))
         out['u_phi_hat_chuan_k_deg'] = out['u_a_k_deg']
@@ -1250,8 +1256,14 @@ def _block(j, cho):
     return (j.get('cho') or {}).get(cho) or j
 
 
+_KHAC = object()
+
+
 def _meta(m, k):
-    """A key of the window meta of NHACTAM (its internal name, e.g. clip_sha) or the contract name (clip_sha256)."""
+    """A key of the window meta of NHACTAM (its internal name, e.g. clip_sha) or the contract name (clip_sha256);
+    HCV3-3: both present and different -> a value that matches nothing (the window is refused)."""
+    if k in m and k + '256' in m and m[k] != m[k + '256']:
+        return _KHAC
     return m.get(k, m.get(k + '256'))
 
 
@@ -1294,12 +1306,16 @@ def _read_neo(path, cho, ref_row):
     if b.get('cho') != cho or b.get('luot_id') != luot:                                     # HCG1-2
         raise AError(f"{path}: ban ghi chuan cua {b.get('cho')}|{b.get('luot_id')}, can {cho}|{luot}")
     c = (j.get('cho') or {}).get(cho)
-    if isinstance(c, dict) and c is not b and ('luot_id' in c or 'psi_chuan_k_deg' in c):
-        # HCG2-1: with one 12b run at the place the writer puts the same record in cho[cho] and chuan_12b; both
-        # must agree (a record of another run there means this run is not the place standard)
-        keys = ('trang_thai', 'cho', 'luot_id', 'clip_sha256', 'frames_sha256', 'khung_chung_sha256', 'psi_chuan_k_deg')
-        if any(c.get(k) != b.get(k) for k in keys):
+    n_cho = sum(1 for k in (j.get('chuan_12b') or {}) if str(k).split('|', 1)[0] == cho)
+    keys = ('trang_thai', 'cho', 'luot_id', 'clip_sha256', 'frames_sha256', 'khung_chung_sha256', 'psi_chuan_k_deg')
+    if n_cho == 1 and c is not b:
+        # HCG2-1, HCV3-3: one 12b run at the place: the writer puts the same record in cho[cho] and chuan_12b; both
+        # must be there and agree on every key (a block without them is not that record)
+        if not isinstance(c, dict) or any(c.get(k) != b.get(k) for k in keys):
             raise AError(f'{path}: cho[{cho}] va chuan_12b[{cho}|{luot}] khac nhau')
+    elif n_cho > 1 and isinstance(c, dict) and (c.get('trang_thai') == 'dat' or 'psi_chuan_k_deg' in c):
+        # several runs: the writer leaves an aggregate block (chua_ket_luan, no psi); a record there contradicts it
+        raise AError(f'{path}: cho[{cho}] la ban ghi trong khi cho co {n_cho} luot 12b')
     for k in ('psi_chuan_k_deg', 'clip_sha256', 'khung_chung_sha256', 'frames_sha256'):
         if b.get(k) is None or b.get(k) == '':
             raise AError(f'{path}: {cho}|{luot} thieu {k}')
@@ -1514,12 +1530,14 @@ def cmd_tinh(a):
     p_ref_tag = None
     if a.neo:
         neo, neo_ids = read_neo(a.neo, a.cho, cap_ref, want_ids=True)
+        p_ref_tag = 'thieu'                                # HCV3-4: no fallback to window 0 once F6 is given
         if cap_F is not None:                              # HCH2-4: tag centre over the F6 common frames
-            m = np.isin(cap_F['idx'], neo_ids)
-            tx, ty = cap_F.get('tx', cap_F['x'])[m], cap_F.get('ty', cap_F['y'])[m]
-            ok = np.isfinite(tx) & np.isfinite(ty)
-            if ok.any():
-                p_ref_tag = np.array([tx[ok].mean(), ty[ok].mean()])
+            idx = np.asarray(cap_F['idx'])
+            tx, ty = cap_F.get('tx', cap_F['x']), cap_F.get('ty', cap_F['y'])
+            pos = [np.flatnonzero(idx == i) for i in neo_ids]
+            if all(len(k) == 1 and np.isfinite(tx[k[0]]) and np.isfinite(ty[k[0]]) for k in pos):
+                sel = np.array([k[0] for k in pos])
+                p_ref_tag = np.array([tx[sel].mean(), ty[sel].mean()])
         nguon.append(dict(vai_tro='hieu_chuan_neo', duong_dan=os.path.abspath(a.neo), sha256=sha256(a.neo)))
     psi_cuc, psi_hd, chot = None, None, False
     if a.can_c8b:
