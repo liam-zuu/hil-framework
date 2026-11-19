@@ -233,3 +233,71 @@ def test_cli_writes_once(tmp_path):
     assert d['version'] == 'c8b_xoay_v1' and 'script' in d
     assert X.main(['--cho', f'O={pO}', '--cho', f'K1={pK}', '--out', str(out)]) == 2
     assert X.main(['--cho', f'O={pO}', '--log', f'K9={pO}', '--out', str(tmp_path / 'b.json')]) == 2
+
+
+# ── ghep_q (F16, way (a), CODE 19/11; design C8B v7 section 1 step 4) ─────────────────────────────────────────────
+
+def _R(a):
+    return np.array([[math.cos(a), -math.sin(a)], [math.sin(a), math.cos(a)]])
+
+
+def _ghep_case(seed=0):
+    """A turning centre c, the tag at p with heading psi on mounting 1, anchor heading alpha (both windows), then the
+    plate taken off and put back: tag centre moved by delta (world), heading psi2. Returns inputs and the true q of the
+    run (tag frame)."""
+    rng = np.random.default_rng(seed)
+    c = rng.normal(0, 0.3, 2)
+    p = c + rng.normal(0, 0.05, 2)
+    psi, alpha = rng.uniform(-3, 3), rng.uniform(-3, 3)
+    delta = rng.normal(0, 0.003, 2)
+    psi2 = psi + rng.normal(0, 0.05)
+    q_tag = _R(-psi) @ (p - c)
+    lan_lap = dict(cho='goc', theta_chuan_rad=psi - alpha, theta_luot_rad=psi2 - alpha,
+                   delta_c_B_m=list(_R(-alpha) @ delta), u_delta_c_B_m=0.0004, trang_thai=dict(delta_c_B='dat'))
+    xoay = dict(version='xoay_v1', cho=dict(goc=dict(q_tag_m=list(q_tag), u_q_m=0.0003, trang_thai='dat')))
+    truc = dict(schema='truc_xe_v1', cho='goc', trang_thai='khoa', u_a_k_deg=0.2)
+    truth = _R(-psi2) @ (p + delta - c)
+    return lan_lap, xoay, truc, truth
+
+
+@pytest.mark.parametrize('seed', range(5))
+def test_ghep_q_geometry_and_sign(seed):
+    L, Xo, T, truth = _ghep_case(seed)
+    r = X.ghep_q(L, 'goc', Xo, T, u_psi_w_rad=0.001)
+    assert r['trang_thai'] == 'dat', r['ly_do']
+    assert np.allclose(r['q_m'], truth, atol=1e-12)
+    u_th = math.radians(0.2) + 0.001
+    assert r['u_theta_rad'] == pytest.approx(u_th)
+    assert r['u_q_m'] == pytest.approx(0.0003 + 0.0004 + (float(np.hypot(*truth)) + 0.0003) * u_th)
+    # an inverted sign (q from the run frame back with +theta) would differ by about 2|q| sin(theta) (mm level)
+    wrong = _R(+L['theta_luot_rad']) @ (_R(L['theta_chuan_rad']) @ np.array(Xo['cho']['goc']['q_tag_m'])
+                                        + np.array(L['delta_c_B_m']))
+    assert np.hypot(*(wrong - truth)) > 1e-4 or abs(L['theta_luot_rad']) < 0.05
+
+
+@pytest.mark.parametrize('break_', ['theta_luot', 'theta_chuan', 'dcb_state', 'xoay_old', 'xoay_state', 'truc',
+                                    'truc_place', 'u_w', 'place'])
+def test_ghep_q_missing_input_is_undecided(break_):
+    L, Xo, T, _ = _ghep_case(1)
+    u_w = 0.001
+    cho = 'goc'
+    if break_ == 'theta_luot':
+        L.pop('theta_luot_rad')
+    elif break_ == 'theta_chuan':
+        L['theta_chuan_rad'] = float('nan')
+    elif break_ == 'dcb_state':
+        L['trang_thai'] = dict(delta_c_B='chua_ket_luan')
+    elif break_ == 'xoay_old':
+        Xo = dict(version='c8b_xoay_v1', q_tag_m=[0.001, 0.0], du_m=0.0003)
+    elif break_ == 'xoay_state':
+        Xo['cho']['goc']['trang_thai'] = 'thieu'
+    elif break_ == 'truc':
+        T = None
+    elif break_ == 'truc_place':
+        T['cho'] = 'K1'
+    elif break_ == 'u_w':
+        u_w = None
+    elif break_ == 'place':
+        cho = 'K1'
+    r = X.ghep_q(L, cho, Xo, T, u_psi_w_rad=u_w)
+    assert r['trang_thai'] == 'chua_ket_luan' and r['q_m'] is None and r['ly_do']

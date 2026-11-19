@@ -317,6 +317,82 @@ def analyse(places, logs=None):
                 written_at=datetime.datetime.now().astimezone().isoformat(timespec='seconds'))
 
 
+CHO = ('goc', 'K1', 'K2')
+TRUC_XE_OK = ('dat', 'khoa')          # truc_xe_v1 (F7, HIEUCHUAN c8_hc_a) writes 'khoa' for a usable place
+
+
+def _num(v):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _vec2(v):
+    if not isinstance(v, (list, tuple)) or len(v) != 2:
+        return None
+    a, b = _num(v[0]), _num(v[1])
+    return None if a is None or b is None else np.array([a, b])
+
+
+def ghep_q(lan_lap, cho, xoay, truc_xe=None, u_psi_w_rad=None):
+    """F16, way (a) chosen by CODE 19/11 (data contract 03_CODE/docs/2026-11-19_Hop_dong_du_lieu_C8_tuong_doi_v1.md;
+    design C8B v7 section 1 step 4): turning centre -> tag centre in the tag frame of the run, for a run on another
+    mounting of the plate than the clip E.
+      q_B   = R(theta_chuan_rad) q_tag          (q_tag, u_q from xoay_v1 at the place, fitted on psi' after A6;
+                                                 theta_chuan_rad: tag minus anchor heading at the reference window, F8)
+      q_m   = R(-theta_luot_rad) (q_B + delta_c_B_m)          (theta_luot_rad: same at the run window, F8)
+      u_q_m = u_q + u_delta_c_B_m + (|q_m| + u_q) u_theta,   u_theta = u_a_k (F7, deg -> rad) + u_psi_w_rad
+    u_psi_w_rad: noise of the mean tag heading over the run window (the caller's W frames). Before the 1.25 margin.
+    Limit LL4-6: a heading error of the tag common to a whole clip has no index of its own.
+    Any input missing, not finite or not 'dat' -> trang_thai 'chua_ket_luan' (the scorer leaves the position through
+    q undecided), never a guess."""
+    why = []
+    if cho not in CHO:
+        raise ValueError(f'cho {cho!r} not in {CHO}')
+    L = lan_lap or {}
+    if L.get('cho') not in (None, cho):
+        why.append(f'lan_lap is for {L.get("cho")!r}, not {cho!r}')
+    th_l, th_c = _num(L.get('theta_luot_rad')), _num(L.get('theta_chuan_rad'))
+    if th_l is None:
+        why.append('lan_lap: theta_luot_rad missing')
+    if th_c is None:
+        why.append('lan_lap: theta_chuan_rad missing')
+    st = L.get('trang_thai') if isinstance(L.get('trang_thai'), dict) else {}
+    dcb, u_dcb = _vec2(L.get('delta_c_B_m')), _num(L.get('u_delta_c_B_m'))
+    if st.get('delta_c_B') != 'dat' or dcb is None or u_dcb is None:
+        why.append(f'lan_lap: delta_c_B not dat ({st.get("delta_c_B")!r}) or missing')
+    X = xoay or {}
+    c = (X.get('cho') or {}).get(cho) if isinstance(X.get('cho'), dict) else None
+    if X.get('version') != 'xoay_v1' or not isinstance(c, dict):
+        why.append(f'xoay: not xoay_v1 with place {cho!r} (version {X.get("version")!r}; the q of c8b_xoay_v1 is fitted '
+                   f'on the tag heading without A6)')
+        c = {}
+    q_tag, u_q = _vec2(c.get('q_tag_m')), _num(c.get('u_q_m'))
+    if c and (c.get('trang_thai') != 'dat' or q_tag is None or u_q is None):
+        why.append(f'xoay {cho}: q_tag_m/u_q_m missing or trang_thai {c.get("trang_thai")!r}')
+    T = truc_xe or {}
+    u_a = _num(T.get('u_a_k_deg'))
+    if T.get('schema') != 'truc_xe_v1' or T.get('cho') != cho or T.get('trang_thai') not in TRUC_XE_OK or u_a is None:
+        why.append(f'truc_xe: no usable truc_xe_v1 for {cho!r} (u_a_k_deg)')
+    u_w = _num(u_psi_w_rad)
+    if u_w is None or u_w < 0:
+        why.append('u_psi_w_rad (noise of the mean tag heading over the run window) missing')
+    if why:
+        return dict(q_m=None, u_q_m=None, u_theta_rad=None, trang_thai='chua_ket_luan', ly_do=why)
+
+    def R(a):
+        return np.array([[math.cos(a), -math.sin(a)], [math.sin(a), math.cos(a)]])
+    q_b = R(th_c) @ q_tag
+    q = R(-th_l) @ (q_b + dcb)
+    u_th = math.radians(u_a) + u_w
+    u = u_q + u_dcb + (float(np.hypot(*q)) + u_q) * u_th
+    return dict(q_m=[float(q[0]), float(q[1])], u_q_m=float(u), u_theta_rad=float(u_th), q_B_m=[float(q_b[0]),
+                float(q_b[1])], trang_thai='dat', ly_do=[],
+                gioi_han=['LL4-6: sai yaw ma chung ca clip khong co chi so rieng'])
+
+
 def script_state():
     """Commit of the repo and whether this script or c8_u_imu.py has local changes."""
     import subprocess
