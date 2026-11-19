@@ -497,30 +497,43 @@ def write_raw(path, seqs, t0=100.0, step=0.01, tail=b''):
     with open(path, 'wb') as f:
         for k, s in enumerate(seqs):
             line = f'{k},{s},1,1,0.000,0.000,0.000,10\n'.encode()
-            f.write(json.dumps(dict(t_mono_ns=int((t0 + k * step) * 1e9), ip='1.2.3.4', port=1, len=len(line),
+            f.write(json.dumps(dict(t_mono_ns=round(t0 * 1e9) + k * round(step * 1e9), ip='1.2.3.4', port=1,
+                                    len=len(line),
                                     b64=base64.b64encode(line).decode())).encode() + b'\n')
         f.write(tail)
 
 
 def test_ready_check_needs_a_moving_log(tmp_path):
-    """HCC2-1, HCC5-3, HCC5-4: freshness from the logger receive time (not from when the file is read), log_seq must
-    advance and never go back, an unfinished last datagram line is ignored."""
+    """HCC2-1, HCC5-3, HCC5-4, HCC6-6: freshness from the logger receive time (not from when the file is read),
+    log_seq must advance and never go back, an unfinished last datagram line is ignored; integer ns."""
     p = str(tmp_path / 'log.csv')
-    write_log(p, [(i, i, 1, 1, '0.000', '0.000', '0.000', 10) for i in range(40)], READY_COLS)
+    rows = lambda n: [(i, i, 1, 1, '0.000', '0.000', '0.000', 10) for i in range(n)]   # noqa: E731
+    write_log(p, rows(40), READY_COLS)
     write_raw(p + '.raw.jsonl', range(40))                                      # newest received at 100.39 s
-    rc = hs.ReadyCheck(p, mono=lambda: 100.45)
+    rc = hs.ReadyCheck(p, mono_ns=lambda: 100_450_000_000)
     assert rc() is None
     assert 'chi tang' in rc()                                                   # same datagrams: the stream stopped
+    write_log(p, rows(80), READY_COLS)
     write_raw(p + '.raw.jsonl', range(80))                                      # newest at 100.79 s
-    rc.mono = lambda: 100.85
+    rc.mono_ns = lambda: 100_850_000_000
     assert rc() is None
-    rc.mono = lambda: 101.20                                                    # read late: still 0.41 s old
-    assert rc.stale_s() > hs.READY_FRESH_S and 'log dung' in rc()
-    write_raw(p + '.raw.jsonl', list(range(80)) + [50])                         # log_seq back
-    rc.mono = lambda: 100.85
-    assert rc.stale_s() == float('inf')
+    rc.mono_ns = lambda: 101_200_000_000                                        # read late: still 0.41 s old
+    assert rc.deadline()[0] is None and 'log dung' in rc()
+    rc.mono_ns = lambda: 100_850_000_000
+    dl, age = rc.deadline()
+    assert dl == pytest.approx(100.79 + hs.READY_FRESH_S, abs=1e-9) and age == pytest.approx(0.06, abs=1e-9)
+    write_log(p, rows(80) + [(80, 50, 1, 1, '0.000', '0.000', '0.000', 10)], READY_COLS)   # log_seq back
+    write_raw(p + '.raw.jsonl', list(range(80)) + [50])
+    assert rc.deadline()[0] is None and 'lui' in rc.deadline()[1]
+    write_log(p, rows(80), READY_COLS)
     write_raw(p + '.raw.jsonl', range(80), tail=b'{"t_mono_ns": 999000000000, "b64": "MTAx')   # unfinished line
-    assert rc.stale_s() == pytest.approx(100.85 - 100.79, abs=1e-6)
+    assert rc.deadline()[1] == pytest.approx(0.06, abs=1e-9)
+    rc.mono_ns = lambda: 100_990_000_000                                        # exactly 200 ms: accepted
+    assert rc.deadline()[0] is not None
+    rc.mono_ns = lambda: 100_990_000_001
+    assert rc.deadline()[0] is None
+    rc.mono_ns = lambda: 100_780_000_000                                        # received in the future: refused
+    assert rc.deadline()[0] is None and 'tuoi log -' in rc.deadline()[1]
 
 
 def test_late_sample_is_chosen_again_not_sent_twice():
@@ -665,8 +678,9 @@ def test_abort_zeros_get_their_own_budget():
         def setblocking(self, b):
             self.blocking = b
 
-        def settimeout(self, v):
+        def settimeout(self, v):                                             # as socket: a timeout -> blocking
             self.timeout = v
+            self.blocking = v is None or v > 0
 
         def sendto(self, pkt, addr):
             if not self.blocking or self.timeout < 0.010:                    # this socket needs 10 ms to send
@@ -696,14 +710,15 @@ def test_stale_log_at_first_motion_packet_refuses():
     """HCC4-2 (Codex): the log stopped 190 ms before the last check; the first motion packet left 290 ms later."""
     segs = hs.schedule('K2')
 
+    sock = FakeSock()
+    clock = FakeClock()
+
     class R:
         def __call__(self):
             return None
 
-        def stale_s(self):
-            return 0.29
-    sock = FakeSock()
-    clock = FakeClock()
+        def deadline(self):
+            return None, 'tuoi log 0.290 s'
     with pytest.raises(hs.Abort) as ei:
         hs.send_schedule('1.2.3.4', segs, sock, lambda s: None, clock, clock.sleep, lambda: 1.0e9, ready=R())
     assert ei.value.why == 'log_cu' and all(p == (0.0, 0.0, 0.0) for p in sock.sent)
@@ -728,3 +743,127 @@ def test_ctrl_c_right_after_first_motion_packet_is_moved():
     with pytest.raises(hs.Abort) as ei:
         hs.send_schedule('1.2.3.4', segs, sock, lambda s: None, clock, clock.sleep, lambda: 1.0e9)
     assert ei.value.moved and k_move > 0
+
+
+# ------------------------------------------------------------------ Codex code review round 6 (HCC6-1..6)
+def raw_rec(t_ns, payload, ip='1.2.3.4'):
+    import base64
+    import json
+    data = payload.encode()
+    return json.dumps(dict(t_mono_ns=t_ns, ip=ip, port=1, len=len(data), b64=base64.b64encode(data).decode())) + '\n'
+
+
+def ready_log(tmp_path, n=40, extra_csv=(), extra_raw=''):
+    """CSV rows (ts = seq = i) the logger accepted, raw records at 100.00 + i*10 ms, then the extras."""
+    p = str(tmp_path / 'log.csv')
+    write_log(p, [(i, i, 1, 1, '0.000', '0.000', '0.000', 10) for i in range(n)] + list(extra_csv), READY_COLS)
+    write_raw(p + '.raw.jsonl', range(n), tail=extra_raw.encode())
+    return p
+
+
+def test_rejected_datagrams_do_not_make_the_log_fresh(tmp_path):
+    """HCC6-1 (Codex): another source, a multi-line payload or a bad type in raw.jsonl (logger rejected them) at
+    103.99 s made a log stopped at 103.71 s look 10 ms old. Only rows the logger accepted (its CSV) count."""
+    t = 100_670_000_000
+    for extra in (raw_rec(t, '40,40,1,1,0.000,0.000,0.000,10\n', ip='9.9.9.9'),
+                  raw_rec(t, '#x\n40,40,1,1,0.000,0.000,0.000,10\n'),
+                  raw_rec(t, '40,40,x,1,0.000,0.000,0.000,10\n')):
+        p = ready_log(tmp_path, extra_raw=extra)
+        rc = hs.ReadyCheck(p, mono_ns=lambda: t + 10_000_000)
+        dl, why = rc.deadline()
+        assert dl is None and 'tuoi log 0.290' in why
+
+
+def test_repeated_datagram_does_not_refresh_a_stopped_stream(tmp_path):
+    """HCC6-2 (Codex): the row seq 39 received again 280 ms later (the logger writes it again as a duplicate)
+    made the age 10 ms; the first reception counts."""
+    t = 100_670_000_000
+    p = ready_log(tmp_path, extra_csv=[(39, 39, 1, 1, '0.000', '0.000', '0.000', 10)],
+                  extra_raw=raw_rec(t, '39,39,1,1,0.000,0.000,0.000,10\n'))
+    rc = hs.ReadyCheck(p, mono_ns=lambda: t + 10_000_000)
+    dl, why = rc.deadline()
+    assert dl is None and 'tuoi log 0.290' in why
+
+
+def test_big_unrelated_datagram_does_not_hide_the_newest_row(tmp_path):
+    """HCC6-5 (Codex): a 13 KiB datagram pushed the valid row out of the 16 KiB tail ('khong co dong du lieu')."""
+    p = ready_log(tmp_path, extra_raw=raw_rec(100_395_000_000, 'z' * 13000 + '\n', ip='9.9.9.9'))
+    rc = hs.ReadyCheck(p, mono_ns=lambda: 100_450_000_000)
+    dl, age = rc.deadline()
+    assert dl is not None and age == pytest.approx(0.06, abs=1e-9)
+
+
+def test_csv_row_without_raw_record_yet_uses_the_row_before(tmp_path):
+    """Raw is written before the CSV but the files are flushed one after the other: the last CSV row may have no raw
+    record yet; the row before it is used (older, never fresher)."""
+    p = ready_log(tmp_path, extra_csv=[(40, 40, 1, 1, '0.000', '0.000', '0.000', 10)])
+    rc = hs.ReadyCheck(p, mono_ns=lambda: 100_450_000_000)
+    assert rc.deadline()[1] == pytest.approx(0.06, abs=1e-9)
+
+
+class DeadlineReady:
+    """ready() passes; deadline() as ReadyCheck on the fake clock: data `age` s old at the read, `lag` s to read."""
+    def __init__(self, clock, age, lag=0.0):
+        self.clock, self.age, self.lag, self.calls = clock, age, lag, 0
+
+    def __call__(self):
+        return None
+
+    def deadline(self):
+        self.calls += 1
+        self.clock.t += self.lag
+        return self.clock.t - self.age + hs.READY_FRESH_S, self.age
+
+
+def test_freshness_deadline_is_checked_at_the_first_motion_send():
+    """HCC6-3 (Codex): data 195 ms old at the check, the first motion packet left when it was 204 ms old."""
+    segs = hs.schedule('K2')
+    clock = FakeClock()
+    sock = FakeSock()
+    with pytest.raises(hs.Abort) as ei:
+        hs.send_schedule('1.2.3.4', segs, sock, lambda s: None, clock, clock.sleep, lambda: 1.0e9,
+                         ready=DeadlineReady(clock, 0.195))
+    assert ei.value.why == 'log_cu' and not ei.value.moved and all(p == (0.0, 0.0, 0.0) for p in sock.sent)
+
+
+def test_slow_freshness_read_does_not_refuse_a_nominal_attempt():
+    """HCC6-3 (Codex): a 24 ms read in the cell of the first motion packet jumped to k=201 and refused the attempt;
+    the read now runs in the wait after the last zero."""
+    segs = hs.schedule('K2')
+    clock = FakeClock()
+    rd = DeadlineReady(clock, 0.02, lag=0.024)
+    r, err, out, sock = None, None, [], FakeSock()
+    r = hs.send_schedule('1.2.3.4', segs, sock, out.append, clock, clock.sleep, lambda: 1.0e9, ready=rd)
+    assert r['complete'] == 1 and rd.calls == 1
+    assert any(ln.startswith('#log_moi_truoc_goi_dong,cu_s=0.020') for ln in out)
+
+
+@pytest.mark.parametrize('where', ['settimeout', 'sendto'])
+def test_second_ctrl_c_in_abort_zeros_keeps_the_zeros(where):
+    """HCC6-4 (Codex): Ctrl-C again inside the socket setting of the abort path left 0 zeros and no goi0."""
+    segs = hs.schedule('K2')
+    k_move = hs.first_motion_k(segs)
+
+    class Sock(FakeSock):
+        hit = False
+
+        def settimeout(self, v):
+            if where == 'settimeout' and not self.hit:
+                self.hit = True
+                raise KeyboardInterrupt
+
+        def sendto(self, pkt, addr):
+            moved = any(p != (0.0, 0.0, 0.0) for p in self.sent)
+            if where == 'sendto' and moved and decode(pkt) == (0.0, 0.0, 0.0) and not self.hit:
+                self.hit = True
+                raise KeyboardInterrupt
+            super().sendto(pkt, addr)
+    sock = Sock()
+    clock = FakeClock(ctrl_c_at=k_move + 5)
+    got = []
+    with pytest.raises(hs.Abort):
+        hs.send_schedule('1.2.3.4', segs, sock, got.append, clock, clock.sleep, lambda: 1.0e9)
+    n0 = int(round(hs.ABORT_ZERO_S * hs.SEND_HZ))
+    zeros_after = len(sock.sent) - [i for i, p in enumerate(sock.sent) if p != (0.0, 0.0, 0.0)][-1] - 1
+    want = n0 if where == 'settimeout' else n0 - 1
+    assert zeros_after == want and any(f'goi0={want}/{n0}' in ln for ln in got)
