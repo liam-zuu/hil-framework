@@ -9,6 +9,15 @@ keys of the earlier version. Task b of CODE_CAM (CODE schedule 4b #4): design CL
 CODE_CAM local_a806ae7e are in c7_measure.py). Earlier version (O1 v11.4): L83, Liam 11/11 CODE local_7787e22f,
 local_5e745270.
 
+Relative frame (J v6 2, 5; design CODE_CAM v5 CLAUDE_THESIS 03_CODE/docs/2026-11-19_Thiet_ke_CAM_cham_tuong_doi_v5.md)
+  c7_score.py cua-so ...      F2 cua_so_v1.jsonl (pre, post) of a run (c7_tuong_doi.cua_so)
+  c7_score.py tham-chieu ...  F12 tham_chieu_v1.json (c7_tuong_doi.tham_chieu)
+  c7_score.py --tuong-doi --cua-so F --tham-chieu F --truc-xe F --lan-lap F --a6 F --xoay F [--c8b-khoa F] ...
+      every valid frame goes through c7_chuoi_khung (A6, centre after q) and the rigid change of frame of
+      c7_tuong_doi.to_lane (lane = p_tc + R(phi) lane of the task), then the rules below run unchanged; a failed
+      reference window: run lost to the reference window (hong_cua_so_tc); no position basis (phi, q, plate check):
+      the t_som case (evaluate_t_som); G5 of O1-F08 report only (J v6 6). No --k-start.
+
 Inputs
   frames.csv   VALID frames of c7_measure (gates O1 3.3 (1), (2)); invalid frames are lost frames.
   ESP32 log    agv_logger CSV of ONE run. Duplicate lines (L92, S05 6.3; CODE 16/11 to CODE_CAM): lines the
@@ -150,7 +159,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 for _p in (os.path.join(HERE, '..', 'rpi5'), os.path.join(HERE, '..', 'fwsim'), HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
+import c7_chuoi_khung as ck                                              # noqa: E402  (F1, CAM v5)
 import c7_measure as cm                                                  # noqa: E402
+import c7_tuong_doi as ctd                                               # noqa: E402  (relative frame, CAM v5)
 import c8_u_imu as cu                                                    # noqa: E402  (read only, CODE_C13)
 import o1_cmd_path as ocp                                                # noqa: E402
 import o1_gate                                                           # noqa: E402
@@ -191,6 +202,7 @@ THRESH_KEYS = ('U_p_m', 'U_psi_deg', 'u_t_ghep_s', 'troi_ppm', 't_trong_s', 't_m
                'pred_half', 'pred_min', 'yaw_nghi_deg', 'v_d')      # the 'thresholds' block of every output
 REPORT_ONLY_OK = frozenset(('g2', 'g3', 'g5'))     # O1 v11.33 3.9 rule 2b: G1, G4 always decide
 NHANH_TICK = ('giu', 'bo')       # O1 v11.33 SC-12 (OG2-1, OG3-4): the tick part of U_t kept / dropped, locked before C8
+MAN_TRAP_NHANH = ('alpha', 'mot_khung')    # J v6 6: the shutter branch of a level (no row compensation, Liam 19/11)
 
 
 # ---------------------------------------------------------------- constants
@@ -262,8 +274,16 @@ def load_hang_so(path):
     if mt is not None:
         if not isinstance(mt, dict) or not isinstance(mt.get('nguon'), str) or not mt['nguon'].strip():
             raise ValueError('hang_so man_trap: {alpha_r_s_px, alpha_c_s_px, nguon} (C8b v4 3, phep 3b)')
+        nh = mt.get('nhanh')
         mt = {k: _num(mt, k, -1e-3, 1e-3, 'hang_so man_trap') for k in ('alpha_r_s_px', 'alpha_c_s_px')}
+        # J v6 6 (J4-13, contract F14): a branch table by level, 'alpha' (measured, inside the 3b range) or
+        # 'mot_khung'; without a table the earlier single branch (alpha for every level)
+        if nh is not None:
+            if not isinstance(nh, dict) or not all(v in MAN_TRAP_NHANH for v in nh.values()):
+                raise ValueError(f'hang_so man_trap nhanh: a table level -> one of {MAN_TRAP_NHANH}')
+            mt['nhanh'] = dict(nh)
     out['man_trap'] = mt
+    out['khung_tc'] = ctd.check_khung_tc(d.get('khung_tc'), locked)      # J v6 2, 4; contract F14 (CAM v5 3.2)
     md = imu.get('mien_dong')
     if md is None and locked:
         raise ValueError('hang_so imu mien_dong: the locked range of U_IMU per level is required when khoa_c8')
@@ -847,11 +867,13 @@ def dyn_exceed(S, t0, t_end, lim):
     return tv, key, '; '.join(notes)
 
 
-def yaw_bounds(t_log, psi_cam, wz, speed, t0, hs, level, log_path, t_end):
+def yaw_bounds(t_log, psi_cam, wz, speed, t0, hs, level, log_path, t_end, mode='thuong'):
     """Per-frame U_psi,k [rad] (inf: not compared) and the yaw check report (module docstring). t_log: frame times
     on the ESP32 clock [s]; psi_cam: camera yaw in the floor frame; wz, speed: camera rates of the frames (the
     alignment frames must be still in rotation AND translation, O1 3.3 'luc xe dung yen'; CS1-11). t_end: end of the
-    run window on the ESP32 clock (range check of U_IMU)."""
+    run window on the ESP32 clock (range check of U_IMU). mode 'khong_xac_dinh' (plate check undecided, J v6 5): every
+    compared frame takes the bound |dpsi_cam - dpsi_IMU| + U_IMU (U_IMU of the constants carries U_IMU,D of C8B).
+    rep['_psi_imu_al'] (removed by the caller before output): the IMU yaw aligned to the camera, per frame."""
     imu = hs['imu']
     n = len(psi_cam)
     rep = dict(compared=False, reason='', align_c_deg=None, align_spread_deg=None, n_align=0, n_suspect=0,
@@ -904,6 +926,9 @@ def yaw_bounds(t_log, psi_cam, wz, speed, t0, hs, level, log_path, t_end):
     upk = np.where(np.isfinite(d), u_psi, np.inf)
     sus = np.isfinite(d) & (d > math.radians(hs['yaw_nghi_deg']))
     upk[sus] = d[sus] + u_imu
+    if mode == 'khong_xac_dinh':
+        upk = np.where(np.isfinite(d), d + u_imu, np.inf)
+    rep['_psi_imu_al'] = psi_i + c
     rep.update(compared=True, n_suspect=int(sus.sum()), n_undef=int((~np.isfinite(d)).sum()),
                d_max_deg=float(np.degrees(np.nanmax(d))) if np.isfinite(d).any() else None)
     return upk, rep
@@ -959,12 +984,13 @@ def _speeds(t, x, y, psi, idx):
     return sp, w
 
 
-def evaluate(t, x, y, psi, speed, wz, lane, hs, upsi_k, u_t):
+def evaluate(t, x, y, psi, speed, wz, lane, hs, upsi_k, u_t, upk_add=None):
     """Camera rules on the VALID frames (command time t, increasing; pose in the lane frame); upsi_k [rad] per
     frame; speed, wz: those of frames.csv (reported per frame only, CS2-3). u_t: a number, or a function of the end
     of the union domain returning U_t (CS2-2: the tick evidence is needed over the domain scored, not after the run
-    ended). Returns (summary, per-frame rows, gate inputs); None without a frame in the window; (summary, None, None)
-    when U_t is not finite."""
+    ended). upk_add [m] per frame (relative frame, CAM v5 3.5: the lever arm of the phi bound; inf: the position of
+    that frame is not defined) adds to U_p,k. Returns (summary, per-frame rows, gate inputs); None without a frame in
+    the window; (summary, None, None) when U_t is not finite."""
     t, x, y, psi = (np.asarray(a, float) for a in (t, x, y, psi))
     speed, wz, upsi_k = np.asarray(speed, float), np.asarray(wz, float), np.asarray(upsi_k, float)
     deadline = lane.Tcmd + T_LATE
@@ -1032,6 +1058,8 @@ def evaluate(t, x, y, psi, speed, wz, lane, hs, upsi_k, u_t):
     cr = CmdRates(lane)                 # O1 v11.33 2: V_k, W_k over [t_k - U_t, t_k + U_t] (command time)
     # U_p,k: a suspect frame without a prediction from the final non-suspect set has no bound (CS2-10)
     upk_p = hs['U_p_m'] + np.where(sus, np.nan_to_num(pred, nan=np.inf), 0.0)
+    if upk_add is not None:
+        upk_p = upk_p + np.asarray(upk_add, float)[win]
     hg = lane.h                     # figure 8: grid step; the grid distance is >= the true one by up to h / 2 (CS1-2)
     clamp = hs.get('gia_dinh_nghi_vi_tri', 'chua_kiem') != 'dung'
     rows, n_formula = [], 0
@@ -1098,6 +1126,180 @@ def evaluate(t, x, y, psi, speed, wz, lane, hs, upsi_k, u_t):
     return summ, rows, dict(q=q, lo=lo, hi=hi, t=tw, scored=np.array([r['scored'] for r in main]), gaps=glen)
 
 
+# ---------------------------------------------------------------- relative frame (J v6 2, 5; CAM v5 3)
+def tam_doi_of(lan_lap):
+    """Plate check of the run (lan_lap_v1 tam_doi_trong_luot, J v6 5): khong_doi / doi / khong_xac_dinh; missing
+    check (no lan_lap_v1, null) -> khong_xac_dinh."""
+    if lan_lap is None:
+        return 'khong_xac_dinh'
+    v = lan_lap.get('tam_doi_trong_luot')
+    if isinstance(v, dict):
+        v = v.get('ket_qua', v.get('gia_tri'))
+    if v is False or v == 'khong_doi':
+        return 'khong_doi'
+    if v is True or v == 'doi':
+        return 'doi'
+    return 'khong_xac_dinh'
+
+
+def build_rel(task, chain, tc, truc_xe, lan_lap, u_beta_cam_deg=None, sources=None):
+    """The relative-frame inputs of score(): chain rows (c7_chuoi_khung), the reference tc (c7_tuong_doi.tham_chieu),
+    phi by the beta path, the plate check, and whether the position basis holds (else the t_som case, J v6 5)."""
+    phi, u_phi, phi_ok, phi_why = ctd.phi_beta(task, truc_xe, lan_lap, tc, u_beta_cam_deg)
+    tam = tam_doi_of(lan_lap)
+    why = []
+    if not phi_ok:
+        why += ['phi: ' + w for w in phi_why]
+    if not tc['p_ok']:
+        why.append('vi tri tham chieu qua q khong xac dinh')
+    if not tc['psi_ok']:
+        why.append('huong tham chieu sau A6 khong xac dinh')
+    if tam != 'khong_doi':
+        why.append(f'tam doi giua luot: {tam}')
+    if tc['trang_thai'] != 'dat':
+        why.append(f'tham chieu {tc["trang_thai"]}')
+    return dict(task=task, chain=chain, tc=tc, phi=phi, u_phi=u_phi, phi_ok=phi_ok, phi_why=phi_why, tam_doi=tam,
+                can_cu=not why, ly_do_can_cu=why, sources=sources or {})
+
+
+def rel_pose(frames, vi, rel, lane):
+    """Per valid frame: the pose in the nominal lane frame by the rigid change of frame (CAM v5 0.1), the floor
+    heading psi' for the yaw check, the extra position bound (lever arm of u_phi; inf where the position is not
+    defined) and the definition masks. A frame without A6 (or without q) keeps a fallback pose from the raw tag
+    (tracker continuity only) and is undefined for the conditions that need it."""
+    ch = {c['frame_id']: c for c in rel['chain']}
+    rows = [ch.get(int(frames[k]['idx'])) for k in vi]
+    if any(r is None for r in rows):
+        raise ValueError('the chain (c7_chuoi_khung) lacks valid frames of frames.csv: run it on this frames.csv')
+    a6 = np.array([r['a6_ok'] for r in rows], bool)
+    qok = np.array([r['q_ok'] for r in rows], bool)
+    tpsi = np.array([r['tag_psi'] for r in rows], float)
+    psi_p = np.where(a6, [r['psi_ma_p'] if r['a6_ok'] else 0.0 for r in rows], tpsi)
+    px = np.where(qok, [r['p_x'] if r['q_ok'] else 0.0 for r in rows], [r['tag_x'] for r in rows])
+    py = np.where(qok, [r['p_y'] if r['q_ok'] else 0.0 for r in rows], [r['tag_y'] for r in rows])
+    tc = rel['tc']
+    p_tc = tc['p_tc_m'] if tc['p_ok'] else [float(np.mean(px[:1])), float(np.mean(py[:1]))]
+    psi_tc = tc['psi_tc_rad'] if tc['psi_ok'] else float(psi_p[0])
+    psi_dd = HEAD0 if isinstance(lane, Fig8Task) else 0.0
+    x, y, psi, dpsi, bx, by = ctd.to_lane(px, py, psi_p, p_tc, psi_tc, rel['phi'], psi_dd)
+    r_k = np.hypot(bx, by)
+    pos_def = qok & a6 & bool(tc['p_ok']) & bool(rel['phi_ok'])
+    u = rel['u_phi']
+    arm = np.where(r_k > 0.0, (2.0 * r_k * math.sin(min(u, math.pi) / 2.0)) if math.isfinite(u) else np.inf, 0.0)
+    upk_add = np.where(pos_def, arm, np.inf)
+    yaw_def = a6 & bool(tc['psi_ok'])
+    return dict(x=x, y=y, psi=psi, psi_cam=psi_p, upk_add=upk_add, pos_def=pos_def, yaw_def=yaw_def, dpsi=dpsi, q_ok=qok,
+                bx=bx, by=by, r_k=r_k, px=px, py=py, psi_tc=psi_tc, psi_dd=psi_dd, tam_doi=rel['tam_doi'],
+                can_cu=rel['can_cu'], arm=arm)
+
+
+def rel_row(R, iv):
+    """Relative-frame columns of one frame row (F13 rows): floor centre, change of the tag heading, body frame at
+    start (firmware frame), lever arm and its bound."""
+    return dict(x_san=float(R['px'][iv]), y_san=float(R['py'][iv]), dpsi_ma=float(R['dpsi'][iv]),
+                x_fw=float(R['bx'][iv]), y_fw=float(R['by'][iv]), r_k=float(R['r_k'][iv]),
+                U_phi_k=float(R['arm'][iv]), vi_tri_xac_dinh=int(bool(R['pos_def'][iv])),
+                huong_xac_dinh=int(bool(R['yaw_def'][iv])))
+
+
+def rel_block(rel, R):
+    """The khung_tuong_doi_v1 block of score.json (F13)."""
+    tc = rel['tc']
+    return dict(schema=ctd.KTD_SCHEMA, phien_ban=ctd.PHIEN_BAN, chuoi_khung=ck.PHIEN_BAN,
+                nguon=rel.get('sources', {}), p_tc_m=tc['p_tc_m'], psi_tc_rad=tc['psi_tc_rad'], tap=tc['tap'],
+                mat_neo=tc['mat_neo'], phi_rad=rel['phi'], u_phi_rad=rel['u_phi'], phi_ok=rel['phi_ok'],
+                duong_phi='beta', phi_ly_do=rel['phi_why'], tam_doi=rel['tam_doi'], ca_t_som=rel['ly_do_can_cu'],
+                can_cu_vi_tri=rel['can_cu'], tham_chieu_trang_thai=tc['trang_thai'],
+                bien_doi=None if R is None else dict(p_dd=[0.0, 0.0], psi_dd_rad=R['psi_dd']))
+
+
+def evaluate_t_som(t, x, y, psi, R, lane, hs, upsi_k, u_t, psi_imu_al, level):
+    """The t_som case (J v6 5 'Thieu can cu vi tri'): G1-G4 not concluded on every frame; G5 on the common domain
+    [0, t_som] and the union [0, t_deadline]; t1 = start of the first gap above t_trong (no position tracker); the
+    plate 'doi': G5 only from the IMU heading (a certain violation, never 'dat'). Same return shape as evaluate."""
+    t, x, y, psi = (np.asarray(a, float) for a in (t, x, y, psi))
+    upsi_k = np.asarray(upsi_k, float)
+    deadline = lane.Tcmd + T_LATE
+    win = np.nonzero((t >= 0.0) & (t < deadline - 1e-12))[0]
+    if not len(win):
+        return None
+    pos_def = np.asarray(R['pos_def'], bool)
+    sp1, wz1 = _speeds(t, x, y, psi, np.arange(len(t)))
+    sus = np.zeros(len(t), bool)
+    sp2 = sp1
+    if pos_def.all():                 # positions defined (only phi missing): suspects and the second way exist
+        sus = mark_suspects(t, x, y, hs['pred_m'], hs['pred_half'], hs['pred_min'])[0]
+        sus = sus & (t >= 0.0) & (t < deadline - 1e-12)
+        if sus.any():
+            sp2 = _speeds(t, x, y, psi, np.nonzero(~sus)[0])[0]
+    u_psi = math.radians(hs['U_psi_deg'])
+    yaw_ok = np.isfinite(upsi_k) & (upsi_k <= u_psi + 1e-12)
+    wz_ok = ctd.wz_usable(yaw_ok, cm.SG_HALF)            # J5-4
+    w_d = hs['v_d'] / LSUM
+    ts1 = ctd.t_som(t, pos_def & np.isfinite(sp1), sp1, wz_ok, wz1, hs['v_d'], w_d, T_D, hs['t_trong_s'],
+                    lane.Tcmd, deadline)
+    ts2 = ctd.t_som(t, pos_def & ~sus & np.isfinite(sp2), sp2, wz_ok, wz1, hs['v_d'], w_d, T_D, hs['t_trong_s'],
+                    lane.Tcmd, deadline)
+    tsom = min(ts1, ts2)
+    tw = t[win]
+    n = len(win)
+    end_u = deadline
+    gaps, prev = [], 0.0
+    for j in range(n):
+        gaps.append((prev, float(tw[j])))
+        prev = float(tw[j])
+    gaps.append((prev, end_u))
+    glen = [b - a for a, b in gaps]
+    long_gap = next((a for a, b in gaps if b - a > hs['t_trong_s'] + 1e-12), None)
+    t1, t1_kind = (long_gap, 'khoang_trong') if long_gap is not None else (None, '')
+    u_scope = 'mien_hop'
+    if callable(u_t):
+        fn, u_t = u_t, u_t(end_u)
+        if not math.isfinite(u_t) and t1 is not None:
+            u_t1 = fn(max(0.0, t1))
+            if math.isfinite(u_t1):
+                u_t, u_scope = u_t1, 'truoc_t1'
+    if not math.isfinite(u_t):
+        return dict(t_end_union=end_u, t_done_way1=None, t_done_way2=None, t1=t1, t1_kind=t1_kind,
+                    t_som_s=tsom), None, None
+    q = {c: np.full(n, np.nan) for c in o1_gate.MEASURED}
+    lo = {c: np.full(n, -np.inf) for c in o1_gate.MEASURED}
+    hi = {c: np.full(n, np.inf) for c in o1_gate.MEASURED}
+    cr = CmdRates(lane)
+    doi = R['tam_doi'] == 'doi'
+    u_imu = math.radians(hs['imu']['U_IMU_deg'].get(level, math.inf)) if doi else 0.0
+    psi_imu_lane = None
+    if doi and psi_imu_al is not None:
+        psi_imu_lane = ctd.rel_heading(psi_imu_al, R['psi_tc'], R['psi_dd'])[0]
+    rows = []
+    for j in range(n):
+        k = int(win[j])
+        _, _, _, hc = lane.command(float(tw[j]))
+        vk, wk = cr.sup(float(tw[j]) - u_t, float(tw[j]) + u_t)
+        eth = float(lane.theta_err(psi[k], hc))
+        q5 = abs(math.degrees(eth))
+        us = float(upsi_k[k])
+        if doi:
+            pi_ = np.nan if psi_imu_lane is None else float(psi_imu_lane[k])
+            if math.isfinite(pi_) and math.isfinite(u_imu):
+                qi = abs(math.degrees(float(lane.theta_err(pi_, hc))))
+                q['g5'][j], lo['g5'][j] = qi, qi - math.degrees(u_imu + wk * u_t)
+        else:
+            q['g5'][j] = q5
+            u5 = math.degrees(us + wk * u_t) if math.isfinite(us) else math.inf
+            lo['g5'][j], hi['g5'][j] = q5 - u5, q5 + u5
+        rows.append(dict(t=float(tw[j]), iv=k, x=float(x[k]), y=float(y[k]), psi=float(psi[k]),
+                         e_theta_cmd_deg=math.degrees(eth), speed=float(sp1[k]), wz=float(wz1[k]),
+                         wz_dung_duoc=int(bool(wz_ok[k])), U_psi_k_deg=math.degrees(us), scored=1,
+                         **{f'{b}_{c}': d[c][j] for c in o1_gate.MEASURED for b, d in (('lo', lo), ('hi', hi))}))
+    summ = dict(task=lane.task, v=lane.v, T_cmd=lane.Tcmd, t_deadline=deadline, t_done_way1=None, t_done_way2=None,
+                t_end_common=tsom, t_end_union=end_u, t_som_s=tsom, t_som_way1_s=ts1, t_som_way2_s=ts2,
+                n_suspect_pos=int(sus.sum()), n_track_err=0, t_first_track_err=None, gap_max=float(max(glen)),
+                t_gap_long=long_gap, t1=t1, t1_kind=t1_kind, frames_window=n, U_t_used_s=float(u_t),
+                U_t_scope=u_scope, ca_t_som=True)
+    return summ, rows, dict(q=q, lo=lo, hi=hi, t=tw, scored=np.ones(n, bool), gaps=glen)
+
+
 def lost_output(task, reason, cause, **extra):
     return dict(task=task, version=VERSION, outcome='hong_he_do', fail_cause=cause, outcome_reasons=[reason],
                 gate_v3=None, rule=f'O1 v11.28 3.3-3.5 (camera); {VERSION}', **extra)
@@ -1123,6 +1325,15 @@ def anchor_window(anchor_s):
         raise ValueError(f'--offset-anchor-s {anchor_s!r}: T or A,B (command time [s] where --offset-s was established, '
                          'finite, B >= A) (CS2-1, C8b v4 3)')
     return v
+
+
+def man_trap_of(hs, task):
+    """The shutter constants of a level (J v6 6): with the branch table 'nhanh' a level takes 'alpha' or one frame
+    (a level not in the table: one frame); no table: man_trap as it is (earlier format)."""
+    mt = hs.get('man_trap')
+    if mt is None or 'nhanh' not in mt:
+        return mt
+    return mt if mt['nhanh'].get(task) == 'alpha' else None
 
 
 def shutter_bound(frames, mt, t_cmd, spans):
@@ -1305,7 +1516,7 @@ def old_shift_frames(frames):
 
 def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start=None, allow_final_set=False,
           sender=None, events=None, track_info=None, offset_anchor_s=None, offset_err_s=None, frames_sha256=None,
-          report_only=frozenset(), gio=None):
+          report_only=frozenset(), gio=None, rel=None):
     if task not in FIG8 and task not in FINAL_SET:
         raise ValueError(f'task {task!r}: one of {tuple(FIG8) + FINAL_SET}')
     # O1 v11.33 3.9 rule 2b: conditions only reported at the level of the run (from the C8 gate file; G1, G4 always
@@ -1316,7 +1527,7 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
         raise ValueError(f'report_only {sorted(report_only)}: only {sorted(REPORT_ONLY_OK)} can be report-only (O1 3.9 2b)')
     if task in FINAL_SET and not allow_final_set:
         raise ValueError(f'{task} is the final test set (O1 3.7): only with --allow-final-set')
-    if task in FINAL_SET and k_start is None:
+    if task in FINAL_SET and k_start is None and rel is None:
         raise ValueError(f'{task}: give --k-start X,Y,HEAD_DEG (nominal start pose, locked at C8)')
     if report_only and task not in FIG8:
         raise ValueError(f'report_only {sorted(report_only)} on {task}: K1, K2 decide on all five conditions '
@@ -1341,7 +1552,13 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
         raise ValueError('frames.csv holds the mark shift of the version before 17/11 (median of the lengths): the '
                          'camera-bumped decision needs the length of the median vector, which cannot be rebuilt from '
                          'it: run c7_measure track on the video again (CS2-4)')
-    lane = Fig8Task(task) if task in FIG8 else KTask(task, k_start)
+    if rel is not None and k_start is not None:
+        raise ValueError('--tuong-doi: no --k-start (J v6 2: the start pose is the measured reference)')
+    # relative frame (J v6 2; CAM v5 0.1): no nominal start pose; the lane frame of K is the body frame at start
+    lane = Fig8Task(task) if task in FIG8 else KTask(task, k_start if rel is None else (0.0, 0.0, 0.0))
+    if rel is not None:
+        if task == 'O1-F08':
+            report_only = report_only | {'g5'}          # J v6 6: G5 of F08 report only (Liam 19/11)
     gate_check = check_track_gates(hs, track_info, frames_sha256)
     if hs['trang_thai'] == 'khoa_c8' and task not in (hs['imu'].get('mien_dong') or {}):
         raise ValueError(f'hang_so imu mien_dong: no locked U_IMU range for {task}')
@@ -1375,6 +1592,10 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
         offset_s = sync.offset_s
     base.update(offset_s=offset_s,
                 offset_src='c8b_gio' if gio is not None else ('--offset-s' if sync is None else 'o1_time_sync'))
+    if rel is not None and rel['tc']['trang_thai'] == 'hong_cua_so_tc':
+        # J v6 5: run lost to the reference window (a kind of measurement-system loss), before every other rule
+        return lost_output(task, 'cua so tham chieu: ' + '; '.join(rel['tc']['ly_do']), FAIL_MEAS,
+                           hong_cua_so_tc=True, khung_tuong_doi=rel_block(rel, None), **base), []
     deadline = lane.Tcmd + T_LATE
     # drift up to t_deadline (SC-12); the --offset-s error at its anchor (CS2-1) adds to the C7b residual of the
     # constants [CACH HIEU: kept both, the larger bound]
@@ -1391,7 +1612,7 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
         far = max(abs(x - y) for x in win for y in (0.0, deadline))
         drift, drift_src = lim * far, f'troi_ppm x {far:.3f} s from the match window [{win[0]:.3f}, {win[1]:.3f}] s'
         ghep, off_err, luoi = 0.0, 0.0, gio['step_s']
-        shut, shut_src = shutter_bound(frames, hs.get('man_trap'), t_cam + offset_s - t0_us / 1e6,
+        shut, shut_src = shutter_bound(frames, man_trap_of(hs, task), t_cam + offset_s - t0_us / 1e6,
                                        [win, (0.0, deadline)])
         u_t_parts = dict(ghep_s=0.0, offset_err_s=0.0, luoi_s=luoi, drift_s=drift, drift_src=drift_src,
                          man_trap_s=shut, man_trap_src=shut_src)
@@ -1417,15 +1638,29 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
     vi = [k for k, r in enumerate(frames) if r['valid']]
     t_log = t_cam[vi] + offset_s
     tv = t_log - t0_us / 1e6
-    pose = [lane.to_lane(frames[k]['x'], frames[k]['y'], frames[k]['psi']) for k in vi]
-    x = np.array([p[0] for p in pose])
-    y = np.array([p[1] for p in pose])
-    psi = np.array([p[2] for p in pose])
     sp = np.array([frames[k]['speed'] for k in vi])
     wzv = np.array([frames[k]['wz'] for k in vi])
-    upsi_k, yaw = yaw_bounds(t_log, np.array([frames[k]['psi'] for k in vi]), wzv, sp, t0_us / 1e6, hs, task,
-                             esp32_path, t0_us / 1e6 + deadline)
-    res = evaluate(tv, x, y, psi, sp, wzv, lane, hs, upsi_k, u_t_of)
+    R = None
+    if rel is None:
+        pose = [lane.to_lane(frames[k]['x'], frames[k]['y'], frames[k]['psi']) for k in vi]
+        x = np.array([p[0] for p in pose])
+        y = np.array([p[1] for p in pose])
+        psi = np.array([p[2] for p in pose])
+        psi_cam, upk_add, ymode = np.array([frames[k]['psi'] for k in vi]), None, 'thuong'
+    else:
+        R = rel_pose(frames, vi, rel, lane)
+        x, y, psi, psi_cam, upk_add = R['x'], R['y'], R['psi'], R['psi_cam'], R['upk_add']
+        ymode = 'khong_xac_dinh' if R['tam_doi'] == 'khong_xac_dinh' else 'thuong'
+    upsi_k, yaw = yaw_bounds(t_log, psi_cam, wzv, sp, t0_us / 1e6, hs, task, esp32_path, t0_us / 1e6 + deadline,
+                             mode=ymode)
+    psi_imu_al = yaw.pop('_psi_imu_al', None)
+    tsom_case = R is not None and not R['can_cu']
+    if R is not None:
+        upsi_k = np.where(R['yaw_def'], upsi_k, np.inf)
+    if tsom_case:
+        res = evaluate_t_som(tv, x, y, psi, R, lane, hs, upsi_k, u_t_of, psi_imu_al, task)
+    else:
+        res = evaluate(tv, x, y, psi, sp, wzv, lane, hs, upsi_k, u_t_of, upk_add=upk_add)
     if res is None:
         return lost_output(task, 'no valid camera frame in the run window', FAIL_MEAS, **base), []
     out, prow, gi = res
@@ -1458,6 +1693,8 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
     if t1 is not None:
         gap_case = out['t1_kind'] == 'khoang_trong'
         before = sc & ((gi['t'] <= t1 + 1e-12) if gap_case else (gi['t'] < t1 - 1e-12))
+        if tsom_case:                    # J v6 5 (J3-3): the evidence must also lie in the common domain [0, t_som]
+            before = before & (gi['t'] <= out['t_som_s'] + 1e-12)
         viol_before = bool(certain_violations(gi['lo'], before, report_only))
     reasons, fail_cause = [], ''
     if bumped:
@@ -1489,18 +1726,28 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
         dom_u = sc & (gi['t'] <= t_end_u + 1e-12)
         g1 = g1_block([out['t_done_way1'], out['t_done_way2']], deadline, None if t1 is None else max(0.0, t1),
                       False)
+        if tsom_case:                    # J v6 5: G1-G4 not concluded without the position basis
+            g1 = dict(g1, state='chua_ket_luan', q='inconclusive')
         if out['t_gap_long'] is not None:
             reasons.append(f'khoang trong > t_trong {hs["t_trong_s"]:g} s tu t = {out["t_gap_long"]:.3f} s')
         if out['t_first_track_err'] is not None:
             reasons.append(f'loi theo doi tai t = {out["t_first_track_err"]:.3f} s')
-    note = (f'camera O1 v11.28; constants {hs["trang_thai"]} ({hs["file"]}); U_t = {u_t * 1e3:.1f} ms; '
+    note = (('relative frame J v6 (CAM v5); ' if R is not None else '') + f'camera O1 v11.28; constants {hs["trang_thai"]} ({hs["file"]}); U_t = {u_t * 1e3:.1f} ms; '
             f'yaw check {"on" if yaw["compared"] else "off: " + yaw["reason"]}')
     gate = build_gate(per, dom_c, dom_u, lane, u_t, hs, g1, note)
     # C8b v4 3 (CODE 17/11, interface 1): per frame its camera time (the key that joins a frame across the nodes of
     # the C8b grid) and whether it is in the common / union domain at this node (cat_t1: the part before t1)
     tcv = t_cam[vi]
     for r, mc, mu in zip(prow, dom_c, dom_u):
-        r['t_cam_s'] = float(tcv[r.pop('iv')])
+        iv = r.pop('iv')
+        r['t_cam_s'] = float(tcv[iv])
+        if R is not None:
+            # F13 rows (C8B 19/11): frame identity, q, the suspect flags and the widening of a position suspect
+            sus_p = bool(r.get('suspect', 0))
+            r.update(rel_row(R, iv), frame_id=int(frames[vi[iv]]['idx']), q_ok=int(bool(R['q_ok'][iv])),
+                     nghi_ngo_vi_tri=int(sus_p), U_p_noi_m=float(r['pred_m']) if sus_p else 0.0,
+                     nghi_ngo_yaw=int(bool(np.isfinite(upsi_k[iv])
+                                           and upsi_k[iv] > math.radians(hs['U_psi_deg']) + 1e-12)))
         r['mien_chung'], r['mien_hop'] = int(bool(mc)), int(bool(mu))
     if cat:
         outcome, fail_cause = 'khong_dat', FAIL_VIOL
@@ -1509,14 +1756,23 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
         fail_cause = FAIL_CMD if cmd_lost and not bumped and t1 is None else FAIL_MEAS
     else:
         outcome = gate['outcome_decide']
-    try:
-        rq3_log.validate_gate(gate, 'HW')
-        rq3_log.check_outcome_vs_gate(outcome, gate, 'HW', fail_cause)
-    except rq3_log.LogError as exc:
-        raise RuntimeError(f'gate block refused by rq3_log (bug of this scorer): {exc}')
+    if tsom_case:
+        # J v6 5 t_som case: G1 not concluded without the position basis. Fields fixed by CODE_GATE 19/11 in
+        # gate_v3.g1: ca_t_som true, t_som_s (end of the common domain of G5), t_done [null, null]; rq3_log reads them
+        # from feat/rq3-tuong-doi (not merged here yet): the gate is not checked by rq3_log here, gate_rq3 says so
+        gate['g1']['ca_t_som'] = True
+        gate['g1']['t_som_s'] = float(out['t_som_s'])
+        gate_rq3 = 'chua_kiem: rq3_log cua feat/rq3-tuong-doi (ca_t_som) chua gop vao nhanh nay'
+    else:
+        gate_rq3 = 'dat'
+        try:
+            rq3_log.validate_gate(gate, 'HW')
+            rq3_log.check_outcome_vs_gate(outcome, gate, 'HW', fail_cause)
+        except rq3_log.LogError as exc:
+            raise RuntimeError(f'gate block refused by rq3_log (bug of this scorer): {exc}')
     # report keys of the earlier version (s05_final_table, people): on the union domain (cat: before t1)
     pr = [r for r, m in zip(prow, dom_u) if m]
-    if pr:
+    if pr and not tsom_case:
         ep = np.array([r['e_perp'] for r in pr])
         out.update(e_perp_max=float(ep.max()), e_perp_rms=float(np.sqrt(np.mean(ep ** 2))),
                    e_trk_max=float(max(r['e_trk'] for r in pr)), e_bao_max=float(max(r['e_bao'] for r in pr)),
@@ -1540,9 +1796,14 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
         drift = float(abs(np.nanmean(sw[tsw >= tsw[-1] - 1.0]) - np.nanmean(sw[tsw <= tsw[0] + 1.0])))
     resets = sorted({r.get('pos_reset_n') for r in rows[i_edge:] if r['_t'] <= t0_us + t_end_u * 1e6 + 1e-3
                      and r.get('pos_reset_n') not in (None, '')})
-    out.update(placement(tv, x, y, psi, lane))
+    if R is None:
+        out.update(placement(tv, x, y, psi, lane))
+    else:
+        out.update(khung_tuong_doi=dict(rel_block(rel, R), t_som_s=out.pop('t_som_s', None),
+                                        gio_sha256=None if gio is None else gio['sha256'],
+                                        esp32_sha256=cm.sha256(esp32_path)), placement_n=None)
     out.update(base, version=VERSION, outcome=outcome, fail_cause=fail_cause, outcome_reasons=reasons,
-               completed=g1['q'], gate_v3=gate, cat_t1=cat, U_t_s=u_t, U_t_parts=u_t_parts, yaw_check=yaw,
+               completed=g1['q'], gate_v3=gate, gate_rq3=gate_rq3, cat_t1=cat, report_only=sorted(report_only), U_t_s=u_t, U_t_parts=u_t_parts, yaw_check=yaw,
                shift_max_px=shift_max, bumped=bumped, shift_drift_px=drift,
                shift_drift_note=('quay lai clip H truoc luot sau (design 3.6)'
                                  if drift is not None and drift > hs['drift_px'] else ''),
@@ -1569,7 +1830,8 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
                pos_reset_n_values=resets, pos_reset_mid=len(resets) > 1,
                frames_total=len(frames), frames_valid=len(vi), k_start=list(lane.start),
                thresholds={k: hs[k] for k in THRESH_KEYS},
-               rule=f'O1 v11.28 3.3-3.5, 3.7 (camera); {VERSION}')
+               rule=(f'J v6 (relative frame, CAM v5) on O1 v11.28 3.3-3.5, 3.7 (camera); {VERSION}' if R is not None
+                     else f'O1 v11.28 3.3-3.5, 3.7 (camera); {VERSION}'))
     return out, prow
 
 
@@ -1585,7 +1847,165 @@ def placement(t, x, y, psi, lane):
                 placement_heading_deg=math.degrees(wrap(mpsi - h0)), placement_xy=[mx, my])
 
 
+def _clock_nodes(a, rows, t0_us, frames, hs, w_s):
+    """(nodes D_i, u_ref,i, sha of the grid or None) for the reference window (CAM v5 3.2): the C8b grid (every node)
+    or --offset-s; the time part u = grid step or offset error + C7b residual, drift to the window, one frame, tick."""
+    fdt = ctd._frame_dt([r['t_s'] for r in frames])
+    t0 = t0_us / 1e6
+    span = (-w_s - 1.0, 1.0)                                   # command time around the edge
+    tick = tick_max_s(rows, t0_us + span[0] * 1e6, t0_us + span[1] * 1e6)
+    if not math.isfinite(tick):
+        raise ValueError('the log does not cover the reference window (no tick bound)')
+    lim = hs['troi_ppm'] * 1e-6
+    if a.gio_c8b:
+        g = load_gio(a.gio_c8b, 0, cm.sha256(a.esp32), cm.sha256(a.frames))
+        with open(a.gio_c8b, encoding='utf-8') as f:
+            nodes = [float(v) for v in json.load(f)['nodes_s']]
+        far = max(abs(w - (t0 + x)) for w in g['win_log_s'] for x in span)
+        u = g['step_s'] + lim * far + fdt + tick
+        return nodes, [u] * len(nodes), g['sha256']
+    if a.offset_s is None or a.offset_err_s is None or a.offset_anchor_s is None:
+        raise ValueError('cua-so needs --gio-c8b, or --offset-s with --offset-err-s and --offset-anchor-s')
+    anc = anchor_window(a.offset_anchor_s)
+    far = max(abs(w - x) for w in anc for x in span)
+    return [float(a.offset_s)], [float(a.offset_err_s) + hs['u_t_ghep_s'] + lim * far + fdt + tick], None
+
+
+def _track_beside(frames_path):
+    tj = os.path.join(os.path.dirname(os.path.abspath(frames_path)), 'track.json')
+    if not os.path.isfile(tj):
+        return None
+    with open(tj, encoding='utf-8') as f:
+        return json.load(f)
+
+
+def _ref_from(pre, chain, lan_lap, hs, frames, extra):
+    return ctd.tham_chieu(pre, chain, lan_lap, hs['khung_tc'], hs['t_trong_s'],
+                          ctd._frame_dt([r['t_s'] for r in frames]), extra)
+
+
+def main_rel(argv):
+    """Sub-commands cua-so and tham-chieu (module docstring, relative frame)."""
+    cmd = argv[0]
+    ap = argparse.ArgumentParser(prog=f'c7_score.py {cmd}')
+    ap.add_argument('--frames', required=True)
+    ap.add_argument('--task', required=True)
+    ap.add_argument('--hang-so', required=True)
+    ap.add_argument('--out', required=True)
+    if cmd == 'cua-so':
+        ap.add_argument('--esp32', required=True)
+        ap.add_argument('--gio-c8b', default=None)
+        ap.add_argument('--offset-s', type=float, default=None)
+        ap.add_argument('--offset-err-s', type=float, default=None)
+        ap.add_argument('--offset-anchor-s', default=None)
+        for k in ('--luot-id', '--clip', '--session', '--dets'):
+            ap.add_argument(k, default=None)
+    else:
+        ap.add_argument('--cua-so', required=True)
+        ap.add_argument('--a6', default=None)
+        ap.add_argument('--xoay', default=None)
+        ap.add_argument('--lan-lap', default=None)
+    a = ap.parse_args(argv[1:])
+    try:
+        if os.path.exists(a.out):
+            raise ValueError(f'{a.out} exists: use a new file')
+        hs = load_hang_so(a.hang_so)
+        frames = cm.read_frames(a.frames)
+        track = _track_beside(a.frames)
+        fsha = cm.sha256(a.frames)
+        lane_T = (Fig8Task(a.task) if a.task in FIG8 else KTask(a.task, (0.0, 0.0, 0.0))).Tcmd
+        if cmd == 'cua-so':
+            chain = ck.chuoi_khung(frames, None, None, track=track)       # the tag gate and tag pose only
+            rows, _, _, _ = read_esp32(a.esp32)
+            i_edge, _, probs = ocp.find_edge(rows)
+            if i_edge is None:
+                raise ValueError('; '.join(probs))
+            t0_us = float(rows[i_edge]['_t'])
+            nodes, u, gsha = _clock_nodes(a, rows, t0_us, frames, hs, hs['khung_tc']['w_s'])
+            nguon = [dict(vai_tro=k, duong_dan=os.path.abspath(v), sha256=cm.sha256(v))
+                     for k, v in (('frames', a.frames), ('esp32', a.esp32), ('gio_c8b', a.gio_c8b), ('clip', a.clip),
+                                  ('session', a.session), ('dets', a.dets)) if v]
+            extra = dict(luot_id=a.luot_id, clip=a.clip and os.path.basename(a.clip),
+                         clip_sha256=a.clip and cm.sha256(a.clip), session_sha256=a.session and cm.sha256(a.session),
+                         dets_sha256=a.dets and cm.sha256(a.dets), frames_sha256=fsha,
+                         esp32_sha256=cm.sha256(a.esp32), gio_sha256=gsha,
+                         offset_cfg=None if gsha else dict(offset_s=a.offset_s, offset_err_s=a.offset_err_s,
+                                                           offset_anchor_s=a.offset_anchor_s), nguon=nguon)
+            out = ctd.cua_so(frames, chain, rows, t0_us, nodes, u, hs['khung_tc'], hs['t_trong_s'], lane_T, a.task,
+                             extra)
+            ctd.write_jsonl(a.out, out)
+            pre = out[0]['ket_luan']
+            print(f'pre: {"dat" if pre["dat"] else "khong dat: " + "; ".join(pre["ly_do"])}')
+        else:
+            pre = next(r for r in ctd.read_jsonl(a.cua_so) if r.get('loai') == 'pre')
+            if pre.get('frames_sha256') != fsha:
+                raise ValueError('cua_so_v1 was made from another frames.csv')
+            ll = ck.doc_lan_lap(a.lan_lap)
+            a6 = ck.doc_a6(a.a6)
+            chain = ck.chuoi_khung(frames, a6, a.xoay, ll, track=track, cho=ctd.cho_of(a.task))
+            extra = dict(cua_so_v1_sha256=cm.sha256(a.cua_so), frames_sha256=fsha,
+                         a6_sha256=None if a6 is None else a6['sha256'],
+                         xoay_sha256=a.xoay and cm.sha256(a.xoay), nguon=ck.nguon(a.frames, a6, a.xoay, ll))
+            tc = _ref_from(pre, chain, ll, hs, frames, extra)
+            with open(a.out, 'x', encoding='utf-8') as f:
+                f.write(json.dumps(cm._json(tc), ensure_ascii=False, indent=1) + '\n')
+            print(f'tham chieu: {tc["trang_thai"]} tap {tc["tap"]} n {tc["n"]} {"; ".join(tc["ly_do"])}')
+    except Exception as exc:
+        print(f'c7_score {cmd}: {type(exc).__name__}: {exc}', file=sys.stderr)
+        print('#ket_qua,ma=2')
+        return 2
+    print('#ket_qua,ma=0')
+    return 0
+
+
+def load_rel(a, frames, track, fsha, esha, task, hs):
+    """The relative-frame inputs of a scoring run (--tuong-doi), every file bound to the frames and log scored and
+    to each other by sha256; the reference recomputed from them must equal tham_chieu_v1."""
+    cua = ctd.read_jsonl(a.cua_so)
+    pre = next((r for r in cua if r.get('loai') == 'pre'), None)
+    if pre is None:
+        raise ValueError(f'{a.cua_so}: no pre row')
+    if pre.get('frames_sha256') != fsha or pre.get('esp32_sha256') != esha:
+        raise ValueError('cua_so_v1 was made from another frames.csv or ESP32 log')
+    tcf = ctd.read_json(a.tham_chieu)
+    if tcf.get('schema') != ctd.THAM_CHIEU_SCHEMA or tcf.get('cua_so_v1_sha256') != cm.sha256(a.cua_so):
+        raise ValueError('tham_chieu_v1 does not name this cua_so_v1 (sha256)')
+    ll = ck.doc_lan_lap(a.lan_lap)
+    a6 = ck.doc_a6(a.a6)
+    for k, v in (('a6_sha256', None if a6 is None else a6['sha256']), ('xoay_sha256', a.xoay and cm.sha256(a.xoay)),
+                 ('lan_lap_v1_sha256', None if ll is None else ll['_sha256'])):
+        if tcf.get(k) != v:
+            raise ValueError(f'tham_chieu_v1 {k} differs from the file given')
+    cho = ctd.cho_of(task)
+    chain = ck.chuoi_khung(frames, a6, a.xoay, ll, track=track, cho=cho)
+    tc = _ref_from(pre, chain, ll, hs, frames, {k: tcf.get(k) for k in ('cua_so_v1_sha256', 'frames_sha256',
+                                                                        'a6_sha256', 'xoay_sha256')})
+    for k in ('ids_sha256', 'tap', 'trang_thai', 'p_ok', 'psi_ok'):
+        if tc[k] != tcf.get(k):
+            raise ValueError(f'tham_chieu_v1 {k} {tcf.get(k)!r} != recomputed {tc[k]!r}')
+    for k in ('p_tc_m', 'psi_tc_rad'):
+        x, y = tc[k], tcf.get(k)
+        if (x is None) != (y is None) or (x is not None and np.max(np.abs(np.subtract(x, y))) > 1e-12):
+            raise ValueError(f'tham_chieu_v1 {k} differs from the recomputed value')
+    truc = ctd.read_json(a.truc_xe) if a.truc_xe else None
+    ubc = None
+    if a.c8b_khoa:
+        kh = ctd.read_json(a.c8b_khoa)
+        st = kh.get('u_beta_cam_trang_thai')
+        st = st.get(cho) if isinstance(st, dict) else st
+        v = (kh.get('u_beta_cam_deg') or {}).get(cho)
+        if st == 'dat' and isinstance(v, (int, float)) and math.isfinite(v) and v >= 0.0:
+            ubc = float(v)                                 # already times 1.25 (contract F16)
+    src = {k: dict(duong_dan=os.path.abspath(v), sha256=cm.sha256(v)) for k, v in
+           (('cua_so_v1', a.cua_so), ('tham_chieu_v1', a.tham_chieu), ('truc_xe_v1', a.truc_xe),
+            ('lan_lap_v1', a.lan_lap), ('c8b_a6_v2', a.a6), ('xoay_v1', a.xoay), ('c8b_khoa_v5', a.c8b_khoa)) if v}
+    return build_rel(task, chain, tc, truc, ll, ubc, src)
+
+
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv and argv[0] in ('cua-so', 'tham-chieu'):
+        return main_rel(argv)
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--frames', required=True)
     ap.add_argument('--esp32', required=True, help='agv_logger CSV of the run (segments file beside it)')
@@ -1605,6 +2025,9 @@ def main(argv=None):
     ap.add_argument('--allow-final-set', action='store_true')
     ap.add_argument('--out', default='')
     ap.add_argument('--rows', default='', help='optional per-frame CSV of the window frames')
+    ap.add_argument('--tuong-doi', action='store_true', help='relative frame (J v6; CAM v5)')
+    for k in ('--cua-so', '--tham-chieu', '--truc-xe', '--lan-lap', '--a6', '--xoay', '--c8b-khoa'):
+        ap.add_argument(k, default=None)
     a = ap.parse_args(argv)
     try:
         for p in (a.out, a.rows):
@@ -1627,9 +2050,17 @@ def main(argv=None):
         # Codex CC1-3: the events file actually read (given, or the default beside the log), by name and sha256
         evp = a.events or (a.esp32 + '.events.txt')
         evp = evp if os.path.exists(evp) else None
-        out, rows = score(cm.read_frames(a.frames), a.esp32, a.task, hs, a.offset_s, a.offset_reason, ks,
+        frames = cm.read_frames(a.frames)
+        rel = None
+        if a.tuong_doi:
+            if not (a.cua_so and a.tham_chieu):
+                raise ValueError('--tuong-doi needs --cua-so and --tham-chieu')
+            rel = load_rel(a, frames, track_info, fsha, cm.sha256(a.esp32), a.task, hs)
+        elif any((a.cua_so, a.tham_chieu, a.truc_xe, a.lan_lap, a.a6, a.xoay, a.c8b_khoa)):
+            raise ValueError('relative-frame inputs without --tuong-doi')
+        out, rows = score(frames, a.esp32, a.task, hs, a.offset_s, a.offset_reason, ks,
                           a.allow_final_set, a.sender, a.events, track_info, a.offset_anchor_s, a.offset_err_s, fsha,
-                          gio=gio)
+                          gio=gio, rel=rel)
         out.update(frames_file=os.path.basename(a.frames), frames_sha256=fsha,
                    esp32_file=os.path.basename(a.esp32), esp32_sha256=cm.sha256(a.esp32),
                    sender_file=os.path.basename(a.sender) if a.sender else None,
