@@ -369,6 +369,9 @@ def _gio(tmp, name, ok=False, fmt='c8b_gio_v1', task='O1-F05', inputs_in=None, *
         sha[k] = rl.sha256_file(q)
     p = os.path.join(str(tmp), f'{name}.json')
     extra.setdefault('ket_luan', 'ok' if ok else 'hong_he_do')       # c8b_gio.py 659: the verdict of the file
+    extra.setdefault('kiem_gio_d1', dict(trang_thai='dat' if ok else 'truot', L_le_U=ok, ghep_ok=True,
+                                         trong_dai_c8=None, ly_do=[]))  # F11 (CODE_C8B design v6 7a)
+    extra.setdefault('dem_truot_kiem_gio', not ok)                  # M2 (CODE_C8B design v7 7a)
     d = dict(format=fmt, ok=ok, nodes_s=[0.01, 0.011], FAKE=True, name=name, sha256=sha, **extra)
     if task is not None:
         d['task'] = task
@@ -422,6 +425,59 @@ def test_c8b_check_counts_only_a_lost_verdict(ds):
     assert not rl.c8b_refusals(rl.live_rows(rl.read_rows(path)))
     row = rl.end(d, 'hong_he_do', fail_cause=rl.C8B_GIO_FAIL, c8b_gio=_gio(tmp, 'lost'), **kw)
     assert rl.c8b_refusals(rl.live_rows(rl.read_rows(path)))[rl.map_key(row)] == 1
+
+
+def test_f11_only_a_d1_slip_is_a_kiem_gio_c8b_run(ds):
+    """F11 (KG-1; GATE accepted 19/11): a time file lost (ket_luan hong_he_do) by the pair count or a log hole while
+    the D1 check passed or could not run (kiem_gio_d1 dat / khong_kiem) is not a kiem_gio_c8b run; a file without
+    the kiem_gio_d1 block (before F11) is refused; a D1 slip with a cap_dem fault too still counts."""
+    d, gf, tmp = ds
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    kw = dict(completed=1, results_dir=str(tmp), queries=rl.fake_queries())
+    for name, st in (('d1dat', 'dat'), ('d1kk', 'khong_kiem')):
+        g = _gio(tmp, name, kiem_gio_d1=dict(trang_thai=st), cap_dem=dict(truot=True))
+        with pytest.raises(rl.LogError, match='only a slip of the D1 time check'):
+            rl.end(d, 'hong_he_do', fail_cause=rl.C8B_GIO_FAIL, c8b_gio=g, **kw)
+    with pytest.raises(rl.LogError, match='no kiem_gio_d1 block'):
+        rl.end(d, 'hong_he_do', fail_cause=rl.C8B_GIO_FAIL, c8b_gio=_gio(tmp, 'old', kiem_gio_d1=None), **kw)
+    with pytest.raises(rl.LogError, match='dem_truot_kiem_gio false'):                     # M2: a boot slip
+        rl.end(d, 'hong_he_do', fail_cause=rl.C8B_GIO_FAIL, c8b_gio=_gio(tmp, 'boot', dem_truot_kiem_gio=False), **kw)
+    with pytest.raises(rl.LogError, match='no dem_truot_kiem_gio'):
+        rl.end(d, 'hong_he_do', fail_cause=rl.C8B_GIO_FAIL, c8b_gio=_gio(tmp, 'nodem', dem_truot_kiem_gio=None), **kw)
+    row = rl.end(d, 'hong_he_do', fail_cause=rl.C8B_GIO_FAIL,
+                 c8b_gio=_gio(tmp, 'both', cap_dem=dict(truot=True)), **kw)
+    assert rl.c8b_refusals(rl.live_rows(rl.read_rows(os.path.join(d, rl.TUNING))))[rl.map_key(row)] == 1
+
+
+def _luoi(tmp, name, st='chua_ket_luan_khong_nut', n=0, gate=None):
+    p = os.path.join(str(tmp), f'{name}.json')
+    with open(p, 'w', encoding='utf-8') as f:
+        json.dump(dict(FAKE=True, name=name, trang_thai_luot=st, n_nut_cham=n, gio_sha256='c' * 64, gate_v3=gate,
+                       ly_do=['khong_cham_duoc']), f)
+    return p
+
+
+def test_f11_no_scored_node_closes_the_run_chua_ket_luan(ds):
+    """F11 (KG-2): a c8b_luoi file where no node could be scored logs the floor run chua_ket_luan with fail cause
+    KHONG_NUT, kept by the summary; declaring it lost (or judged otherwise) with that file is refused."""
+    d, gf, tmp = ds
+    p = _luoi(tmp, 'kn')
+    assert rl.read_luoi_khong_nut(p) is True
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    kw = dict(completed=1, results_dir=str(tmp), queries=rl.fake_queries(), gate_sha256=rl.sha256_file(p),
+              gate_khong_nut=True)
+    for o, fc in (('hong_he_do', 'mat_khung_FAKE'), ('khong_dat', ''), ('dat', '')):
+        with pytest.raises(rl.LogError, match='no node could be scored'):
+            rl.end(d, o, fail_cause=fc, **kw)
+    row = rl.end(d, 'chua_ket_luan', **kw)
+    assert row['fail_cause'] == rl.KHONG_NUT and row['gate_json_sha256'] == rl.sha256_file(p)
+    rl.summary(d)
+    for bad in (dict(n=1), dict(gate={'version': 'gate_v3.3'}), dict(st='x')):
+        with pytest.raises(rl.LogError, match='F11'):
+            rl.read_luoi_khong_nut(_luoi(tmp, 'bad', **bad))
+    assert rl.read_luoi_khong_nut(_luoi(tmp, 'ch', st='cham', n=2, gate={'version': 'gate_v3.3'})) is False
 
 
 def test_c8b_check_only_on_the_floor_lost(ds):
@@ -860,3 +916,58 @@ def test_gt2_3_rows_without_campaign_are_not_checked_for_one_gain(ds):
         r.update(campaign='', gain_set_id='')
     rl._write_all(p, rl.TUNING_COLS, rows)
     rl.summary(d)
+
+
+# ── J v6 section 5, the t_som case (CODE 19/11 from CODE_CAM; names fixed by GATE with CAM) ──────────────────
+
+def _t_som_gate(t_som=8.0, g5_common_deg=9.0, g5_union_deg=9.0):
+    """A floor gate of the t_som case: no position basis (G2-G4 undefined frames), G5 on [0, t_som] / [0, t_deadline]."""
+    g = rl.floor_gate(rl.fake_gate(e_theta_deg=2.0))
+    for c in ('g2', 'g3', 'g4'):
+        blk = dict(q=None, lo=None, hi=None, n_undef=20)
+        g[c].update(blk, state='chua_ket_luan')
+        g[c]['chung'] = dict(blk)
+    lo_c, lo_u = g5_common_deg - 1.0, g5_union_deg - 1.0
+    g['g5']['chung'] = dict(q=g5_common_deg, lo=lo_c, hi=g5_common_deg + 1.0, n_undef=0)
+    g['g5'].update(q=g5_union_deg, lo=lo_u, hi=g5_union_deg + 1.0, n_undef=0)
+    g['g5']['state'] = rl.cond_state2(lo_c, lo_u, g5_union_deg + 1.0, 0, o1_gate.THRESHOLDS['g5'])
+    g['g1'].update(t_done=[None, None], ca_t_som=True, t_som_s=t_som, state='chua_ket_luan', q='inconclusive')
+    g.update(o1_gate.evaluate_outcomes(g, g['decide'], g.get('required')))
+    return g
+
+
+def test_t_som_case_g1_chua_ket_luan_g5_on_its_common_domain():
+    g = _t_som_gate()
+    ev = rl.validate_gate(g, 'HW')
+    assert g['g1']['state'] == 'chua_ket_luan' and g['g5']['state'] == 'khong_dat' and ev['outcome'] == 'khong_dat'
+    g = _t_som_gate(g5_common_deg=5.0, g5_union_deg=9.0)        # a violation after t_som only: chua_ket_luan
+    assert g['g5']['state'] == 'chua_ket_luan'
+    rl.validate_gate(g, 'HW')
+    cols = rl.gate_columns(g, 'a' * 64)
+    assert cols['g1_ca_t_som'] == 'true' and cols['g1_t_som_s'] == repr(8.0)
+    back = rl.gate_from_row(dict(cols, run_uid='X'))
+    rl._recompute(back, 'HW')                                   # the logged row recomputes the same states
+
+
+@pytest.mark.parametrize('edit, msg', [
+    (lambda g: g['g1'].update(state='khong_dat', q='false'), 'state'),
+    (lambda g: g['g1'].update(t_som_s=None), 't_som_s'),
+    (lambda g: g['g1'].update(t_som_s=25.0), 't_som_s'),
+    (lambda g: g['g1'].update(t_done=[10.0, None]), 't_done'),
+    (lambda g: g['g1'].update(ca_t_som=False), 'only with ca_t_som'),
+    (lambda g: g['g2'].update(q=0.02, lo=0.01, hi=0.03, n_undef=0, state='dat', chung=dict(q=0.02, lo=0.01, hi=0.03,
+                                                                                       n_undef=0)), 'no position basis'),
+])
+def test_t_som_case_refusals(edit, msg):
+    g = _t_som_gate()
+    edit(g)
+    g.update(o1_gate.evaluate_outcomes(g, g['decide'], g.get('required')))
+    with pytest.raises(rl.LogError, match=msg):
+        rl.validate_gate(g, 'HW')
+
+
+def test_t_som_s_without_the_case_refused():
+    g = rl.floor_gate(rl.fake_gate())
+    g['g1']['t_som_s'] = 5.0
+    with pytest.raises(rl.LogError, match='only with ca_t_som'):
+        rl.validate_gate(g, 'HW')

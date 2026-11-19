@@ -155,7 +155,11 @@ OLD_GATE_U = tuple(f'g{i}_u' for i in range(1, 6))       # gate_v3_g1235 columns
 # chua_ket_luan). States are recomputed from these (gate_g1_state, cond_state2), never trusted.
 DOMAIN_FIELDS = ('q', 'lo', 'hi', 'n_undef')
 G1_COLS = ['g1_ways', 'g1_t_deadline', 'g1_t_done_1', 'g1_t_done_2', 'g1_t1', 'g1_prog_before_t1',
-           'g1_cond25_before_deadline', 'g1_cat_t1']
+           'g1_cond25_before_deadline', 'g1_cat_t1', 'g1_ca_t_som', 'g1_t_som_s']
+# J v6 section 5 "Thieu can cu vi tri" (the t_som case: phi missing, beta invalid, q / delta c_B missing, plate
+# doi / khong_xac_dinh; CODE 19/11 from CODE_CAM, GATE fixed the names with CAM): floor gate g1.ca_t_som true with
+# g1.t_som_s in [0, t_deadline] and t_done [null, null]; G1 is chua_ket_luan (even with cat_t1), G2-G4 must come out
+# chua_ket_luan, G5 is scored on the common domain [0, t_som_s] ("chung") and the union [0, t_deadline].
 # O1 v11.33 (CODE_GATE 17/11, design 03_CODE/docs/2026-11-17_Thiet_ke_CODE_GATE_v1.md section 4; Liam 17/11 at
 # CODE_GATE "Duyệt, gửi CODE luôn (Recommended)"): gate_v3.3 rows carry the C8 gate file SHA and the report-only
 # conditions of their level (O1 3.9 rule 2b, OG2-7). The required set is recomputed from the gate file
@@ -206,6 +210,13 @@ MAP_RERUNS_MAX = 3
 # S05 4.6, FINAL_LOST_N lost runs in a row, every cause); the fourth one (1 + C8B_RERUNS_MAX) makes the level of that
 # gain set chua_ket_luan, a run of it after that is refused.
 C8B_GIO_FAIL = 'kiem_gio_c8b'
+# F11 (data contract C8 relative v1, GATE accepted 19/11; CODE_C8B design v6 7a): c8b_gio_v1 carries kiem_gio_d1
+# {trang_thai dat | truot | khong_kiem, ...}; a kiem_gio_c8b run is a time file with trang_thai truot AND ket_luan
+# hong_he_do (a run lost by cap_dem / ho_log alone is an ordinary lost run, other fail cause, not counted).
+# c8b_luoi writes trang_thai_luot chua_ket_luan_khong_nut, n_nut_cham 0, gate_v3 null when no node could be scored:
+# end logs such a run chua_ket_luan with fail cause KHONG_NUT (never hong_he_do).
+D1_STATES = ('dat', 'truot', 'khong_kiem')
+KHONG_NUT = 'chua_ket_luan_khong_nut'
 C8B_RERUNS_MAX = 3
 C8B_GIO_FORMAT = 'c8b_gio_v1'
 # R134 package (Liam 14/11 CODE_R134 local_eb9f3b5c "duyet goi sua code fix/r134-answers"):
@@ -579,6 +590,32 @@ def read_gate_json(path: str, allow_null: bool = False) -> Optional[dict]:
     return g
 
 
+def read_luoi_khong_nut(path: str) -> bool:
+    """F11 (KG-2): whether a scorer file is a c8b_luoi output of a run where no node could be scored
+    (trang_thai_luot chua_ket_luan_khong_nut, n_nut_cham 0, gate_v3 null, gio_sha256 of the run's time file). A file
+    with trang_thai_luot cham needs n_nut_cham >= 1 and its gate_v3 block. Other files: False."""
+    try:
+        with open(path, encoding='utf-8') as f:
+            d = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise LogError(f'--gate-json {path!r}: {exc}')
+    if not isinstance(d, dict) or 'trang_thai_luot' not in d:
+        return False
+    st, n = d['trang_thai_luot'], d.get('n_nut_cham')
+    if st not in ('cham', KHONG_NUT) or isinstance(n, bool) or not isinstance(n, int) or n < 0:
+        raise LogError(f'--gate-json {path!r}: trang_thai_luot {st!r} (cham or {KHONG_NUT}) with n_nut_cham a whole '
+                       f'number, got {n!r} (F11)')
+    if not _hex64(d.get('gio_sha256')):
+        raise LogError(f'--gate-json {path!r}: a c8b_luoi file carries the gio_sha256 of the run time file (F11)')
+    if st == 'cham':
+        if n < 1 or not isinstance(d.get('gate_v3'), dict):
+            raise LogError(f'--gate-json {path!r}: trang_thai_luot cham needs n_nut_cham >= 1 and its gate_v3 (F11)')
+        return False
+    if n != 0 or d.get('gate_v3') is not None:
+        raise LogError(f'--gate-json {path!r}: {KHONG_NUT} needs n_nut_cham 0 and gate_v3 null (F11)')
+    return True
+
+
 def _num(x) -> str:
     return '' if x is None or isinstance(x, bool) else (repr(float(x)) if isinstance(x, (int, float)) else str(x))
 
@@ -626,7 +663,8 @@ def _n_undef(x, what: str) -> int:
     return int(x)
 
 
-G1_KEYS = ('t_done', 't_deadline', 't1', 'prog_before_t1', 'cond25_before_deadline', 'cat_t1')
+G1_KEYS = ('t_done', 't_deadline', 't1', 'prog_before_t1', 'cond25_before_deadline', 'cat_t1', 'ca_t_som', 't_som_s')
+T_SOM_ZERO = ('g2', 'g3', 'g4')          # J v6 section 5: G1-G4 chua_ket_luan in the t_som case (G1 by its fields)
 
 
 def _opt_bool(x, what: str):
@@ -671,6 +709,18 @@ def gate_g1_fields(g1: dict, platform: Optional[str] = None) -> Optional[dict]:
     prog = _opt_bool(g1.get('prog_before_t1'), 'g1 prog_before_t1')
     c25 = _opt_bool(g1.get('cond25_before_deadline'), 'g1 cond25_before_deadline')
     cat = _opt_bool(g1.get('cat_t1'), 'g1 cat_t1')
+    ts_case = _opt_bool(g1.get('ca_t_som'), 'g1 ca_t_som')
+    t_som = _time(g1.get('t_som_s'), 'g1 t_som_s')
+    if ts_case:
+        if ways != 2:
+            raise LogError('gate g1 ca_t_som: a floor field (two ways of using the frames; J v6 section 5)')
+        if t_som is None or t_som > t_dl:
+            raise LogError(f'gate g1 t_som_s {g1.get("t_som_s")!r}: with ca_t_som, a time in [0, t_deadline '
+                           f'{t_dl!r}] (J v6 section 5)')
+        if any(t is not None for t in t_done):
+            raise LogError('gate g1: with ca_t_som (no position basis) t_done is [null, null] (J v6 section 5)')
+    elif t_som is not None:
+        raise LogError('gate g1 t_som_s: only with ca_t_som true')
     if ways == 1:
         if cat is not None:
             raise LogError('gate g1 cat_t1: a floor field (O1 3.5 R2V-4), not for one way of using the frames')
@@ -687,14 +737,14 @@ def gate_g1_fields(g1: dict, platform: Optional[str] = None) -> Optional[dict]:
         if cat and t1 is None:
             raise LogError('gate g1 cat_t1: needs t1 (O1 3.5 R2V-4)')
     return dict(ways=ways, t_deadline=t_dl, t_done=t_done, t1=t1, prog_before_t1=prog, cond25_before_deadline=c25,
-                cat_t1=bool(cat) if ways == 2 else None)
+                cat_t1=bool(cat) if ways == 2 else None, ca_t_som=bool(ts_case), t_som_s=t_som)
 
 
 def gate_g1_state(f: dict) -> str:
     """G1 recomputed from its fields (O1 v11.15 3.3 "Khung nghi ngo vi tri", 3.5 last block, R2V-4)."""
     done = [t is not None for t in f['t_done']]
     if f['ways'] == 2:                       # floor: both ways done -> dat, neither -> khong_dat, else inconclusive
-        if f['cat_t1']:
+        if f.get('ca_t_som') or f['cat_t1']:  # J v6 section 5: no position basis; R2V-4: progress after t1 not known
             return 'chua_ket_luan'           # R2V-4: progress after t1 not known
         return 'dat' if all(done) else ('khong_dat' if not any(done) else 'chua_ket_luan')
     if f['t1'] is None or f['prog_before_t1']:  # no tracking error, or progress reached before t1
@@ -704,6 +754,8 @@ def gate_g1_state(f: dict) -> str:
 
 def domains_one(f: Optional[dict]) -> bool:
     """The common and the union domain are the same frames: one way, no G1 fields, or two equal t_done."""
+    if f is not None and f.get('ca_t_som'):     # J v6 section 5: G5 common [0, t_som], union [0, t_deadline]
+        return False
     return f is None or f['ways'] == 1 or f['t_done'][0] == f['t_done'][1]
 
 
@@ -785,6 +837,8 @@ def _recompute(gate: dict, platform: Optional[str] = None, required=None) -> dic
         lb = check_luoi(gate['luoi'])
         if gate['g1']['state'] != lb['g1_state']:
             raise LogError(f'gate g1: state {gate["g1"]["state"]!r}, the grid gives {lb["g1_state"]!r} (luoi)')
+        if f1['ca_t_som'] and any(x != 'chua_ket_luan' for x in lb['g1_nut']):
+            raise LogError('gate luoi: g1.ca_t_som but a node with G1 other than chua_ket_luan (J v6 section 5: by node)')
         # GT1-1 (Codex round 1 of CODE_GATE; Liam 17/11 at CODE_GATE "Sửa theo bảng (Recommended)"): the node nut_tam
         # follows the rule of one run on its own G1 fields: lost exactly when t1 is given without the exception before
         # it (R134C4-3), the exception exactly when cat_t1 (R2V-4); so a grid of one node keeps the rule of a run
@@ -814,6 +868,9 @@ def _recompute(gate: dict, platform: Optional[str] = None, required=None) -> dic
         if st != gate[c].get('state'):
             raise LogError(f'gate {c}: state {gate[c].get("state")!r}, recomputed from lo of the common domain, '
                            f'hi and n_undef of the union: {st!r}')
+        if f1 is not None and f1['ca_t_som'] and c in T_SOM_ZERO and st != 'chua_ket_luan':
+            raise LogError(f'gate {c}: state {st!r} in the t_som case (g1.ca_t_som): G1-G4 have no position basis '
+                           'and are chua_ket_luan (undefined frames, no finite lo above the threshold; J v6 section 5)')
     return o1_gate.evaluate_outcomes(gate, decide, req)
 
 
@@ -989,7 +1046,7 @@ def gate_from_row(row: dict) -> dict:
         g['g1'].update(t_done=[num(row.get(f'g1_t_done_{i}')) for i in range(1, int(ways) + 1)],
                        t_deadline=num(row.get('g1_t_deadline')), t1=num(row.get('g1_t1')),
                        prog_before_t1=flag('g1_prog_before_t1'), cond25_before_deadline=flag('g1_cond25_before_deadline'),
-                       cat_t1=flag('g1_cat_t1'))
+                       cat_t1=flag('g1_cat_t1'), ca_t_som=flag('g1_ca_t_som'), t_som_s=num(row.get('g1_t_som_s')))
     elif any(row.get(k) for k in G1_COLS):
         raise LogError(f"{row.get('run_uid')}: G1 fields without g1_ways")
     for c in o1_gate.MEASURED:
@@ -1501,8 +1558,13 @@ def check_gate_rows(tun: List[dict], gate_file=None) -> None:
             if bbad:
                 raise LogError(f"{r.get('run_uid')}: run_outcome {r.get('run_outcome')!r} but {bbad} (S05 4.7 (iv); "
                                f'a run failed by operation is hong_he_do, {BOOT_FAIL})')
+        khong_nut = (r.get('fail_cause') == KHONG_NUT and r.get('run_outcome') == 'chua_ket_luan'
+                     and r.get('platform') == 'HW' and bool(r.get('gate_json_sha256')))       # F11 (KG-2)
+        if r.get('fail_cause') == KHONG_NUT and (not khong_nut or has_gate(r)):
+            raise LogError(f"{r.get('run_uid')}: fail cause {KHONG_NUT} only on a floor chua_ket_luan row with its "
+                           'c8b_luoi file (gate_json_sha256) and no gate columns (F11)')
         if not has_gate(r):
-            if r.get('gate_json_sha256') and r.get('run_outcome') != 'hong_he_do':                  # CC1-2
+            if r.get('gate_json_sha256') and r.get('run_outcome') != 'hong_he_do' and not khong_nut:  # CC1-2
                 raise LogError(f"{r.get('run_uid')}: a scorer file without its gate (gate_json_sha256 only) is for a "
                                'run lost to the measurement only')
             gbad = gate_file_cols_problem(r, gate_file)                                             # GT1-6
@@ -1512,7 +1574,7 @@ def check_gate_rows(tun: List[dict], gate_file=None) -> None:
             if r.get('run_outcome') == 'dat' and r.get('campaign') in CAMPAIGNS and r.get('platform') != 'HIL':
                 raise LogError(f"{r.get('run_uid')}: run_outcome 'dat' without gate columns ({NO_GATE_EVIDENCE}, "
                                'SC3-2): a campaign run is never dat without the gate')
-            if judged and camp and r.get('platform') == 'HW':                           # B8-1 B81-1
+            if judged and camp and r.get('platform') == 'HW' and not khong_nut:         # B8-1 B81-1
                 raise LogError(f"{r.get('run_uid')}: car run {r.get('run_outcome')} without gate columns (the camera "
                                'scorer output, S05 v3.20 8.1 C9 (a)): not in the summary')
             if r.get('fail_cause') == VIOL_BEFORE:
@@ -1566,8 +1628,9 @@ def gate_columns(gate: dict, gate_sha256: str = '') -> dict:
     if g1.get('t_done') is not None:                   # B81-3: the G1 fields (checked by validate_gate first)
         td = g1['t_done']
         out.update(g1_ways=str(len(td)), g1_t_deadline=cell(g1.get('t_deadline')), g1_t_done_1=cell(td[0]),
-                   g1_t_done_2=cell(td[1]) if len(td) > 1 else '', g1_t1=cell(g1.get('t1')))
-        for k in ('prog_before_t1', 'cond25_before_deadline', 'cat_t1'):
+                   g1_t_done_2=cell(td[1]) if len(td) > 1 else '', g1_t1=cell(g1.get('t1')),
+                   g1_t_som_s=cell(g1.get('t_som_s')))
+        for k in ('prog_before_t1', 'cond25_before_deadline', 'cat_t1', 'ca_t_som'):
             v = g1.get(k)
             out[f'g1_{k}'] = '' if v is None else ('true' if v else 'false')
     return out
@@ -1840,6 +1903,22 @@ def read_c8b_gio(path: str, task: Optional[str] = None, results_dir: Optional[st
         raise LogError(f'--c8b-gio {path!r}: ket_luan {d.get("ket_luan")!r}, not hong_he_do: only a run lost to the C8b '
                        'time check is a kiem_gio_c8b run counted against the reruns (ket_luan chua_ket_luan: no finite '
                        'clock bound, log the run chua_ket_luan without --c8b-gio)')
+    k1 = d.get('kiem_gio_d1')
+    if not isinstance(k1, dict) or k1.get('trang_thai') not in D1_STATES:
+        raise LogError(f'--c8b-gio {path!r}: no kiem_gio_d1 block {{trang_thai: {" | ".join(D1_STATES)}}} (F11): a time '
+                       'file without it cannot tell a slip of the D1 time check from a pair-count or log-hole fault')
+    if k1['trang_thai'] != 'truot':
+        raise LogError(f'--c8b-gio {path!r}: kiem_gio_d1 {k1["trang_thai"]!r}: only a slip of the D1 time check '
+                       f'(truot) is a {C8B_GIO_FAIL} run counted against the reruns; a run lost by cap_dem / ho_log '
+                       'alone is hong_he_do with another fail cause, not counted (F11)')
+    # M2 (J v6 5, approved; CODE_C8B design v7 7a): the time file says whether the slip counts (dem_truot_kiem_gio:
+    # not with a boot unless the locked check slipped on the whole window before it); counted by the field
+    if not isinstance(d.get('dem_truot_kiem_gio'), bool):
+        raise LogError(f'--c8b-gio {path!r}: no dem_truot_kiem_gio (true / false; F11, M2)')
+    if not d['dem_truot_kiem_gio']:
+        raise LogError(f'--c8b-gio {path!r}: dem_truot_kiem_gio false: a slip on a run lost by operation (boot) '
+                       f'without independent evidence is not a {C8B_GIO_FAIL} run (M2); log it hong_he_do with '
+                       f'{BOOT_FAIL}')
     if task is not None and d.get('task') != task:
         raise LogError(f'--c8b-gio {path!r}: the time file of task {d.get("task")!r}, the run is {task!r} (GT1-8)')
     if results_dir is not None:
@@ -1861,6 +1940,13 @@ def read_c8b_gio(path: str, task: Optional[str] = None, results_dir: Optional[st
 # session: one row per (car run, scoring) with the U file of CODE_CAM (u_moc_luot_v1), one row per session with the
 # premise file of CODE_KIEMCHEO (tien_de_buoi_v1). apply_moc (after apply_so_h) turns a dat / khong_dat car run of a
 # campaign into chua_ket_luan unless every condition of design section 5 holds; a missing file never keeps it.
+# CODE_GATE 19/11 (design v6_C8 section 10; CODE's choice (a) of 19/11, local_e6d36dbe): the C8 gate is gate_c8_v2,
+# whose shifted-anchor lock has four numbers; the campaign side below (u-moc, apply_moc) still compares the two
+# numbers of the v1 lock. Until the campaign part (design v4 section 3.2, after the C8 lock) it refuses with this one
+# text, so every place to reopen is found by grep.
+CAMPAIGN_V2_TODO = ('CAMPAIGN_V2_TODO: the campaign side of rq3_log (u-moc, apply_moc) does not run with gate_c8_v2 '
+                    'yet (four-number shifted-anchor lock; design 03_CODE/docs/2026-11-19_Thiet_ke_rq3_tuong_doi_v4.md '
+                    'section 3.2, after the C8 lock)')
 U_MOC = 'm7_u_moc.csv'
 U_MOC_COLS = ['run_uid', 'lan', 'u_file', 'u_sha256', 'gate_file', 'gate_file_sha256', 'ok', 'U_moc_xy_m',
               'U_moc_psi_deg', 'khoa_xy_m', 'khoa_psi_deg', 'khoa_sha256', 'ghi_luc']
@@ -2095,14 +2181,12 @@ def _live_run(ds: str, uid: str) -> dict:
 
 
 def _gate_lock(path: str, r: dict) -> tuple:
-    """(gate file, its moc_dich lock) for run r: the gate file the run was scored with (RM1-5)."""
+    """(gate file, its moc_dich lock) for run r: the gate file the run was scored with (RM1-5). A gate_c8_v2 lock
+    (four numbers) is not compared yet: CAMPAIGN_V2_TODO."""
     gf = read_gate_file(path)
     if gf.sha256 != r.get('gate_file_sha256'):
         raise LogError(f"run {r.get('run_uid')}: gate file {path!r} is not the one of the run (gate_file_sha256)")
-    try:
-        return gf, gate_c8.moc_dich_of(gf)
-    except gate_c8.GateFileError as exc:
-        raise LogError(str(exc))
+    raise LogError(f'gate file {path!r} ({gate_c8.FORMAT}): {CAMPAIGN_V2_TODO}')
 
 
 def u_moc(ds: str, run_uid: str, lan: str, path: str, gate_file: str) -> dict:
@@ -2311,8 +2395,10 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
         fail_cause: str = '', results_dir: str = '', notes: str = '', gate: Optional[dict] = None,
         gate_sha256: str = '', boot_before: Optional[str] = None, boot_after: Optional[str] = None,
         query_problem: Optional[str] = None, queries: Optional[tuple] = None, gate_file=None,
-        c8b_gio: Optional[str] = None) -> dict:
-    """query_problem (R134C3-3): why the two query answer files given on the command line are not two
+        c8b_gio: Optional[str] = None, gate_khong_nut: bool = False) -> dict:
+    """gate_khong_nut (F11): the scorer file (gate_sha256) is a c8b_luoi file of a run where no node could be scored
+    (read_luoi_khong_nut): only chua_ket_luan on the floor, logged with fail cause KHONG_NUT.
+    query_problem (R134C3-3): why the two query answer files given on the command line are not two
     questions before and after the run (gain_line_check.query_problem); handled as missing / different boot.
     queries (R134C4-1): the two answers as read by gain_line_check.read_query (before, after; None = missing);
     end checks them itself (query_problem, without the run's boot) and takes boot_before / boot_after from them.
@@ -2353,10 +2439,23 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
             raise LogError(f'--c8b-gio {c8b_gio!r}: the C8b time file of this run, under its --results-dir folder '
                            f'({results_dir!r}; GT1-8)')
         c8b_sha = read_c8b_gio(c8b_gio, task=run['row'].get('trajectory'), results_dir=results_dir)
+    if gate_khong_nut:                                                                       # F11 (KG-2)
+        if gate is not None or not gate_sha256 or plat != 'HW':
+            raise LogError('a c8b_luoi file without a scored node is the scorer file (gate_v3 null) of a floor run')
+        if outcome != 'chua_ket_luan':
+            raise LogError(f'outcome {outcome!r} with a c8b_luoi file where no node could be scored (trang_thai_luot '
+                           f'{KHONG_NUT}): the run is chua_ket_luan, not lost and not judged otherwise (F11)')
+        if fail_cause:
+            raise LogError(f'--fail-cause {fail_cause!r}: a run without a scored node gets fail cause {KHONG_NUT} itself')
+        if not results_dir:
+            raise LogError('--gate-json needs --results-dir (so-h looks for the H0 scorer file there, C9D-1)')
+        fail_cause = KHONG_NUT
+    elif fail_cause == KHONG_NUT:
+        raise LogError(f'fail cause {KHONG_NUT} only with its c8b_luoi file (F11)')
     if fail_cause == MAP_REFUSED and (gate is None or run['row'].get('platform') != 'HIL'):
         raise LogError(f'--fail-cause {MAP_REFUSED}: a HIL run with its scorer output (--gate-json) showing the '
                        'refused mapping (S05 v3.15 4.5 step 2)')
-    if gate is None and gate_sha256:                   # CC1-2: the scorer file of a lost run, without a gate
+    if gate is None and gate_sha256 and not gate_khong_nut:    # CC1-2: the scorer file of a lost run, no gate
         if outcome != 'hong_he_do':
             raise LogError(f'a scorer file without its gate (gate_v3 null) only for a run lost to the measurement, not '
                            f'{outcome}')
@@ -2375,7 +2474,7 @@ def end(ds: str, outcome: str, completed: Optional[int] = None, e_perp_max: Opti
     if run['row'].get('platform') == 'HIL' and outcome in VALID and gate is None:
         raise LogError(f'a HIL run judged {outcome} needs its scorer output (--gate-json): S05 v3.15 4.5 step 2 '
                        '(a run without the run_active edge mapping is a lost run)')        # Codex S315-1
-    if plat == 'HW' and outcome in VALID and gate is None:                                   # B8-1 B81-1
+    if plat == 'HW' and outcome in VALID and gate is None and not gate_khong_nut:            # B8-1 B81-1
         raise LogError(f'a car run judged {outcome} needs the camera scorer output (--gate-json, with the two frame '
                        'domains and the G1 fields of the floor; S05 v3.20 8.1 C9 (a), O1 3.3, 3.5)')
     if outcome == 'dat' and gate is None:                                                    # R134 (d) SC3-2
@@ -3295,7 +3394,8 @@ def demo(out_dir: str, seed: int = 1, levels=('O1-F05',)) -> List[dict]:
         # O1 v11.33: the C8 gate file (FAKE numbers) the scorers and end use; the summary reads it at the end
         gate_path = os.path.join(out_dir, 'FAKE_gate_c8.json')        # stands for the gate locked at C8
         gate_d = gate_c8.fake_gate(tuple(levels))
-        gate_d['camera'], moc_common = fake_moc_lock(os.path.join(out_dir, 'FAKE_moc'))   # C8b v3 §5 (CODE_GATE)
+        _, moc_common = fake_moc_lock(os.path.join(out_dir, 'FAKE_moc'))   # C8b v3 §5: the common FAKE files
+        # (the gate keeps the v2 camera block of fake_gate; CAMPAIGN_V2_TODO: no u-moc step until the campaign part)
         gate_c8.write_gate(gate_path, gate_d)
         gf = read_gate_file(gate_path)
         gain = dict(ctrl='PID', id=1, gains=dict(kp_xy=1.0, ki_xy=0.5, kp_wz=1.0, ki_wz=0.2, pos_kp=6.0, pos_ki=3.0,
@@ -3347,10 +3447,8 @@ def demo(out_dir: str, seed: int = 1, levels=('O1-F05',)) -> List[dict]:
         so_h(out_dir, a1[0]['run_uid'], fake_score_final(run_dir('a1_1'), 1.2))
         so_h(out_dir, a1[1]['run_uid'], fake_score_final(run_dir('a1_2'), 3.1, h1=dict(
             FAKE=True, outcome='dat', gate_v3=floor_gate(fake_gate(gate_file=gf, level='O1-F08', stage='screen')))))
-        # C8b v3 §5 (CODE_GATE 18/11): the U file of every judged car run, the premise file of the session
-        for k, r in enumerate(a1):
-            u_moc(out_dir, r['run_uid'], 'H0', fake_u_moc(run_dir(f'a1_{k + 1}'), r['trajectory'], moc_common),
-                  gate_path)
+        # C8b v3 §5 (CODE_GATE 18/11): the premise file of the session; the U file of each run (u-moc) is not
+        # logged with a gate_c8_v2 (CAMPAIGN_V2_TODO), so the rule lowers the judged car runs (cho_u_moc)
         tien_de(out_dir, 'FAKE-A1', fake_tien_de(
             os.path.join(out_dir, 'FAKE_moc', 'tien_de_FAKE-A1.json'), 'FAKE-A1', a1[0]['date'],
             [(f'a1_{k + 1}', os.path.join(run_dir(f'a1_{k + 1}'), 'frames.csv')) for k in range(len(a1))], moc_common))
@@ -3398,8 +3496,7 @@ def demo(out_dir: str, seed: int = 1, levels=('O1-F05',)) -> List[dict]:
             else:                                       # R134: judged with its gate, boot asked
                 fin.append(end(out_dir, o, completed=1, e_perp_max=0.10, **judged(f'f1_{o}', 'HW', o, car_gate[o])))
         for r in fin:                                   # C9D-2: clip H of the final session below eps_H
-            so_h(out_dir, r['run_uid'], fake_score_final(r['results_dir'], 0.8))
-            u_moc(out_dir, r['run_uid'], 'H0', fake_u_moc(r['results_dir'], r['trajectory'], moc_common), gate_path)
+            so_h(out_dir, r['run_uid'], fake_score_final(r['results_dir'], 0.8))   # u-moc: CAMPAIGN_V2_TODO
         tien_de(out_dir, 'FAKE-F1', fake_tien_de(
             os.path.join(out_dir, 'FAKE_moc', 'tien_de_FAKE-F1.json'), 'FAKE-F1', fin[0]['date'],
             [(os.path.basename(r['results_dir']), os.path.join(r['results_dir'], 'frames.csv')) for r in fin],
@@ -3536,8 +3633,10 @@ def main(argv=None) -> int:
                 raise LogError(f'--gate-json {a.gate_json!r} is an output of c7_calib_drift.py gop (block calib_drift): '
                                'end logs the provisional outcome with the H0 scoring (score.json of the run), then '
                                'so-h --run-uid <run> --score-final <this file> after the clip H comparison')
+            kn = read_luoi_khong_nut(a.gate_json) if a.gate_json else False                 # F11 (KG-2)
             row = end(ds, a.outcome, a.completed, a.e_perp_max, a.fail_cause, a.results_dir, a.notes,
-                      gate=read_gate_json(a.gate_json, allow_null=a.outcome == 'hong_he_do') if a.gate_json else None,
+                      gate=(None if kn else read_gate_json(a.gate_json, allow_null=a.outcome == 'hong_he_do'))
+                      if a.gate_json else None, gate_khong_nut=kn,
                       gate_sha256=sha256_file(a.gate_json) if a.gate_json else '',
                       gate_file=read_gate_file(a.gate_file) if a.gate_file else None, c8b_gio=a.c8b_gio or None,
                       **boots)

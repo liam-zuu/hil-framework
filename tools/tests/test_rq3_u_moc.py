@@ -18,6 +18,10 @@ sys.path.insert(0, os.path.join(HERE, '..'))
 import gate_c8  # noqa: E402
 import rq3_log as rl  # noqa: E402
 
+# CODE_GATE 19/11 (CODE's choice (a)): these tests build a gate_c8_v1 shifted-anchor lock, refused since the gate
+# is gate_c8_v2; they wait for the campaign part (the one text below, grep CAMPAIGN_V2_TODO).
+pytestmark = pytest.mark.skip(reason=rl.CAMPAIGN_V2_TODO)
+
 LOCK_XY, LOCK_PSI = 0.010, 0.50          # FAKE lock numbers (m, deg, before the margin)
 CP = dict(tag_offset=None, side_m=0.1445, h_m=0.20)
 
