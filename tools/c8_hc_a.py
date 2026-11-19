@@ -713,13 +713,15 @@ def e_coverage(F, L, blocks, D):
     return out
 
 
-def cam_window(F, w, D, u_D, fps=60.0):
-    """Frame mask of the camera image of log window w, shrunk by u_D and one frame each side."""
+def cam_window(F, w, D, u_D, fps=60.0, gated=True):
+    """Frame mask of the camera image of log window w, shrunk by u_D and one frame each side; gated=False keeps
+    every decoded frame of that time range (F2 'khung', HCC1-11), True only the frames passing the tag gate."""
     if w['ta'] is None:
         return np.zeros(len(F['t']), bool)
     a = w['ta'] - D + u_D + 1.0 / fps
     b = w['tb'] - D - u_D - 1.0 / fps
-    return F['ok'] & (F['t'] >= a) & (F['t'] <= b)
+    m = (F['t'] >= a) & (F['t'] <= b)
+    return F['ok'] & m if gated else m
 
 
 # ------------------------------------------------------------------ legs and a
@@ -742,10 +744,12 @@ def analyse(A, F, k_info, min_frames=MIN_FRAMES_TINH):
     for k, w in enumerate(wins):
         m = cam_window(F, w, D, u_D, F.get('fps', 60.0))
         lw = (L['t'] >= w['ta']) & (L['t'] <= w['tb']) if w['ta'] is not None else np.zeros(L['n'], bool)
-        rec = dict(chi_so=k, n=int(m.sum()), mask=m, ta=w['ta'], tb=w['tb'])
+        rec = dict(chi_so=k, n=int(m.sum()), mask=m, mask_all=cam_window(F, w, D, u_D, F.get('fps', 60.0), False),
+                   ta=w['ta'], tb=w['tb'])
         if rec['n'] >= min_frames:
             rec['p'] = np.array([F['x'][m].mean(), F['y'][m].mean()])
             rec['psi'] = mean_unwrapped(F['psi'][m])
+            rec['cs'] = (float(np.mean(np.cos(F['psi'][m]))), float(np.mean(np.sin(F['psi'][m]))))
             rec['yaw'] = float(np.mean(yaw[lw]))
             rec['jc'] = int(np.flatnonzero(lw)[len(np.flatnonzero(lw)) // 2])
             h = int(m.sum()) // 2
@@ -776,7 +780,8 @@ def analyse(A, F, k_info, min_frames=MIN_FRAMES_TINH):
         dth = float(np.sum(np.abs(np.diff(yaw[ja:jb + 1]))))
         leg.update(trang_thai='hop_le', dp=dp, ds=ds, L_m=float(np.hypot(*dp)), Ls_m=float(np.hypot(*ds)),
                    ti_le=float(np.hypot(*dp) / np.hypot(*ds)), theta_a=th_a, a_l=a_l, eps=eps, path=path, sum_dth=dth,
-                   chieu='toi' if ds[0] > 0 else 'lui', R_a=wa['psi'], R_b=wb['psi'])
+                   chieu='toi' if ds[0] > 0 else 'lui', R_a=wa['psi'], R_b=wb['psi'], cs_a=wa['cs'], cs_b=wb['cs'],
+                   nua_a=wa['psi_nua'], nua_b=wb['psi_nua'])
         legs.append(leg)
     return dict(D=D, u_D=u_D, diffs=diffs, windows=W, legs=legs, chuoi=F['chuoi'])
 
@@ -790,31 +795,86 @@ def perp_offsets(W):
     return float(np.max(np.abs((pts - c) @ vt[1])))
 
 
-def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None, psi_cuc=None):
-    """Combine the analysed attempts of one place (F7 block). attempts = list of (thu_id, analysis)."""
-    res = dict(cho=cho, trang_thai='khoa', ly_do=[], luot_thu=[])
-    cap = dict(attempts)[cap_id]
+def _deg_leg(lg):
+    """One leg for F7: angles in degrees with _deg names (HCC1-12), arrays as lists, internal fields dropped."""
+    out = {}
+    for k, v in lg.items():
+        if k in ('R_a', 'R_b', 'cs_a', 'cs_b', 'nua_a', 'nua_b'):
+            continue
+        if k in ('a_l', 'theta_a', 'eps'):
+            out[k + '_deg'] = None if v is None or not math.isfinite(v) else math.degrees(v)
+        else:
+            out[k] = v.tolist() if isinstance(v, np.ndarray) else v
+    return out
+
+
+def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None, psi_cuc=None, cap_ok=True,
+                 cap_why=(), bao_q=False, vet=None, psi_cuc_chot=False, need_windows=None):
+    """Combine the analysed attempts of one place (F7 block). attempts = list of (thu_id, analysis or None, why).
+
+    cap_ok False (the issued attempt failed kiem) -> chua_ket_luan: a is never issued from such an attempt; its legs
+    and those of every other attempt still count in the largest deviation (HCC1-10: issuing a is separate from the
+    legs of a failed attempt having enough evidence). e_hieu: {leg i: e [m]} of F9 for the issued attempt (each long
+    leg needs 0 <= e < L, HCC1-12). need_windows: window indices that must hold >= MIN_FRAMES_TINH frames (HCC1-11).
+    Every early stop returns the same keys (values None) instead of raising."""
+    attempts = [(x[0], x[1], x[2] if len(x) > 2 else ()) for x in attempts]
+    res = dict(cho=cho, trang_thai='khoa', ly_do=[], luot_thu=[], a_k_deg=None, u_a_k_deg=None, do_tan_deg=None,
+               u_hang_deg={}, cong={}, giu_ngoai=[])
+    for tid, an, why in attempts:
+        res['luot_thu'].append(dict(thu_id=tid, cap=tid == cap_id, trang_thai='thieu' if an is None else 'tinh_duoc',
+                                    ly_do=list(why) if why else [],
+                                    D_s=None if an is None else an['D'], u_D_s=None if an is None else an['u_D'],
+                                    doan=[] if an is None else [_deg_leg(lg) for lg in an['legs']]))
+    cap = {tid: an for tid, an, _ in attempts}.get(cap_id)
+
+    def stop(why):
+        return dict(res, trang_thai='chua_ket_luan', ly_do=list(why))
+    if not cap_ok:
+        return stop(['luot cap truot kiem: ' + ', '.join(cap_why)])
+    if cap is None:
+        return stop(['luot cap khong tinh duoc'])
+    if need_windows:
+        few = [(k, cap['windows'][k]['n']) for k in need_windows if cap['windows'][k]['n'] < MIN_FRAMES_TINH]
+        if few:
+            return stop([f'cua so thieu khung (< {MIN_FRAMES_TINH}): {few}'])
     longs = [lg for lg in cap['legs'] if lg['dai'] and lg['trang_thai'] == 'hop_le']
     if len(longs) != 4:
-        return dict(res, trang_thai='chua_ket_luan', ly_do=['cap: fewer than 4 long legs'])
+        return stop(['cap: fewer than 4 long legs'])
     a = circmean([lg['a_l'] for lg in longs])
     spread = max(abs(wrap(x['a_l'] - y['a_l'])) for x in longs for y in longs)
-    all_long = [(tid, lg) for tid, an in attempts for lg in an['legs'] if lg['dai'] and lg['trang_thai'] == 'hop_le']
-    dev = max(abs(wrap(lg['a_l'] - a)) for _, lg in all_long)
+    all_long = [lg for _, an, _ in attempts if an is not None for lg in an['legs']
+                if lg['dai'] and lg['trang_thai'] == 'hop_le']
+    dev = max(abs(wrap(lg['a_l'] - a)) for lg in all_long)
     Lmin = min(lg['L_m'] for lg in longs)
     Lsmin = min(lg['Ls_m'] for lg in longs)
+    bad = []
     if e_hieu is None:
         res['ly_do'].append('thieu e_hieu_m (F9)')
         e = 0.0
     else:
-        e = max(e_hieu)
-    u_map = math.asin(min(e / Lmin, 1.0))
-    u_enc = math.asin(min(COUNT_M * (2 + max(lg['sum_dth'] for lg in longs)) / Lsmin, 1.0))
+        es = []
+        for lg in longs:
+            v = e_hieu.get(lg['i'])
+            if v is None or not math.isfinite(v) or v < 0 or v >= lg['L_m']:
+                bad.append(f"e_hieu_m doan {lg['i']} = {v} (can 0 <= e < L {lg['L_m']:.3f})")
+            else:
+                es.append(v)
+        e = max(es) if es else 0.0
+    u_map = math.asin(e / Lmin) if e < Lmin else math.pi / 2
+    r_enc = COUNT_M * (2 + max(lg['sum_dth'] for lg in longs)) / Lsmin
+    u_enc = math.asin(r_enc) if r_enc < 1 else math.pi / 2
     if q is None or du_m is None:
         res['ly_do'].append('thieu q, du_m (xoay_v1)')
         u_q = 0.0
     else:
-        u_q = max((abs(2 * math.sin(wrap(lg['R_b'] - lg['R_a']) / 2)) * du_m) / lg['L_m'] for lg in longs)
+        qn = math.hypot(*q)
+        u_q = 0.0
+        for lg in longs:
+            # ||mean R_b - mean R_a||_2 of the window rotation matrices (HCC1-12), and the turn error of q from the
+            # error of the DIFFERENCE of the two end headings (both half-split errors, opposite signs, added)
+            dR = math.hypot(lg['cs_b'][0] - lg['cs_a'][0], lg['cs_b'][1] - lg['cs_a'][1])
+            term = dR * du_m + (0.0 if bao_q else qn * 2 * math.sin((lg['nua_a'] + lg['nua_b']) / 2))
+            u_q = max(u_q, term / lg['L_m'])
     eps = [lg['eps'] for lg in longs]
     eps_thieu = any(not math.isfinite(x) for x in eps)            # HCC1-9: no evidence -> gate fails, not 0
     eps = [x if math.isfinite(x) else 0.0 for x in eps]
@@ -824,6 +884,8 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
         u_cuc = 0.0
     else:
         u_cuc = float(psi_cuc)
+        if not psi_cuc_chot:
+            res['ly_do'].append('can C8B: ten truong chua chot (hop dong muc 4.5)')
     u_a = dev + u_map + u_enc + u_q + u_yaw + u_cuc
     gates = dict(
         do_tan=spread <= math.radians(SPREAD_MAX_DEG),
@@ -831,20 +893,29 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
         and (max(lg['ti_le'] for lg in longs) - min(lg['ti_le'] for lg in longs)) <= RATIO_SPREAD,
         thang_hang=perp_offsets(cap['windows'][:7]) <= PERP_MAX_M,      # the 7 stops of 12b only
         yaw_dong=not eps_thieu and all(x <= math.radians(EPS_YAW_MAX_DEG) for x in eps),
+        e_hieu_hop_le=not bad,
     )
-    shorts = [lg for lg in cap['legs'] if not lg['dai'] and lg['trang_thai'] == 'hop_le']
+    shorts = [lg for lg in cap['legs'] if not lg['dai']]
     giu_ngoai = []
     for lg in shorts:
+        if lg['trang_thai'] != 'hop_le':                       # HCC1-11: a lost held-out leg is not skipped
+            giu_ngoai.append(dict(i=lg['i'], dat=False, ly_do=lg.get('ly_do', 'thieu')))
+            continue
         u_short = math.asin(min(e / lg['L_m'], 1.0)) + math.asin(min(2 * COUNT_M / lg['Ls_m'], 1.0))
         giu_ngoai.append(dict(i=lg['i'], a_l_deg=math.degrees(lg['a_l']), lech_deg=math.degrees(abs(wrap(lg['a_l'] - a))),
                               nguong_deg=math.degrees(u_a + u_short),
                               dat=abs(wrap(lg['a_l'] - a)) <= u_a + u_short))
-    gates['giu_ngoai'] = all(g['dat'] for g in giu_ngoai)
+    gates['giu_ngoai'] = len(shorts) == len(SHORT_LEGS) and all(g['dat'] for g in giu_ngoai)
+    if vet is None:
+        res['ly_do'].append('thieu vet thuc (--moc)')
+    else:
+        gates['vet_thuc'] = vet['khe_m'] > 0.0
     if cap['chuoi'] != 'khoa':
         res['ly_do'].append('chuoi khung chua khoa (F1, A6, q)')
     if neo is None:
         res['ly_do'].append('thieu psi_chuan_k (F6)')
     failed = [k for k, v in gates.items() if not v]
+    res['ly_do'] += bad
     if failed:
         res['trang_thai'] = 'chua_ket_luan'
         res['ly_do'] += failed
@@ -853,19 +924,99 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
     out = dict(res, a_k_deg=math.degrees(a), u_a_k_deg=math.degrees(u_a), do_tan_deg=math.degrees(spread),
                u_hang_deg=dict(lech_lon_nhat=math.degrees(dev), u_map=math.degrees(u_map), u_enc=math.degrees(u_enc),
                                u_q=math.degrees(u_q), u_yaw=math.degrees(u_yaw), u_psi_cuc=math.degrees(u_cuc)),
-               cong=gates, giu_ngoai=giu_ngoai)
+               u_q_gom_xoay_q=not bao_q, cong=gates, giu_ngoai=giu_ngoai, vet_thuc=vet)
     if neo is not None:
         out['phi_hat_chuan_k_deg'] = math.degrees(wrap(math.radians(neo) - a))
         out['u_phi_hat_chuan_k_deg'] = out['u_a_k_deg']
-    for tid, an in attempts:
-        out['luot_thu'].append(dict(thu_id=tid, cap=tid == cap_id, D_s=an['D'], u_D_s=an['u_D'],
-                                    doan=[{k: (v.tolist() if isinstance(v, np.ndarray) else
-                                               (math.degrees(v) if k in ('a_l', 'theta_a', 'eps') and isinstance(v, float) else v))
-                                           for k, v in lg.items() if k not in ('R_a', 'R_b')} for lg in an['legs']]))
     return out
 
 
 # ------------------------------------------------------------------ CLI
+F2_FIELDS = ('schema', 'luot_id', 'thu_id', 'cho', 'loai', 'chi_so', 'clip', 'clip_sha256', 'session_sha256',
+             'fit_ids_nguon', 'frames_sha256', 'khung', 'khung_sha256', 'khung_ma_hop_le', 'khung_ma_hop_le_sha256',
+             'phep_gop', 't_canh_s', 'bien_cuoi', 'vi_tri_lenh_m', 'D_s', 'u_D_s', 't0_log_us', 'esp32_sha256', 'chuoi')
+F5_HEAD = ('schema', 'thu_id', 'cho', 'lan_lap_id', 'clip', 'clip_sha256', 'session_sha256', 'frames_sha256',
+           'track_sha256', 'cua_so_v1_sha256', 'esp32_sha256', 'commit_hil', 'car_pose_cfg', 'xoay_sha256',
+           'a6_sha256', 'chuoi', 'dets_sha256', 'dets_fp', 'nguon', 'doan', 'trang_thai')
+F5_WIN = ('loai', 'chi_so', 'khung_id', 'khung_pts_s', 'khung_sha256', 'p_m', 'psi_rad')
+F5_LEG = ('i', 'dai', 'chieu', 'vi_tri_lenh_m', 'cua_so_a', 'cua_so_b', 'dp_m', 'L_m', 'trang_thai', 'ly_do')
+
+
+def f2_problems(row):
+    """Missing or inconsistent fields of one F2 cua_so_v1 row (contract 2.A + HIEUCHUAN keys; HCC1-11). There is
+    no reader of the receivers yet (NHACTAM, C8B, KIEMCHEO): this is the writer-side check."""
+    p = [f'thieu {k}' for k in F2_FIELDS if k not in row]
+    if p:
+        return p
+    if row['schema'] != 'cua_so_v1':
+        p.append('schema')
+    ids = [k['id'] for k in row['khung']]
+    if any(b <= a for a, b in zip([k['pts_s'] for k in row['khung']][:-1], [k['pts_s'] for k in row['khung']][1:])):
+        p.append('khung: PTS khong tang')
+    if not set(row['khung_ma_hop_le']) <= set(ids):
+        p.append('khung_ma_hop_le khong la tap con cua khung')
+    if row['bien_cuoi'] == 'duoi_log' and row['t_canh_s'] is not None:
+        p.append('cua so cuoi: t_canh_s phai null')
+    if row['bien_cuoi'] == 'canh_lenh' and row['t_canh_s'] is None:
+        p.append('t_canh_s null khi bien_cuoi canh_lenh')
+    if row['khung_sha256'] != _ids_sha(ids) or row['khung_ma_hop_le_sha256'] != _ids_sha(row['khung_ma_hop_le']):
+        p.append('khung sha256')
+    return p
+
+
+def f5_problems(doan):
+    """Missing fields of F5 doan_12b_v1 (contract 2.D + KIEMCHEO; HCC1-11) and its content sha256."""
+    p = [f'thieu {k}' for k in F5_HEAD if k not in doan]
+    for d in doan.get('doan', []):
+        p += [f"doan {d.get('i')}: thieu {k}" for k in F5_LEG if k not in d]
+        for nm in ('cua_so_a', 'cua_so_b'):
+            p += [f"doan {d.get('i')} {nm}: thieu {k}" for k in F5_WIN if k not in (d.get(nm) or {})]
+    for k in ('side_m', 'h_m', 'tag_offset', 'q_m', 'du_m'):
+        if k not in (doan.get('car_pose_cfg') or {}):
+            p.append(f'car_pose_cfg thieu {k}')
+    body = {k: v for k, v in doan.items() if k != 'sha256'}
+    if doan.get('sha256') != hashlib.sha256(json.dumps(body, ensure_ascii=False, sort_keys=True).encode()).hexdigest():
+        p.append('sha256 noi dung')
+    return p
+
+
+def _ids_sha(ids):
+    return hashlib.sha256(','.join(str(int(i)) for i in ids).encode()).hexdigest()
+
+
+def commit_hil():
+    """'<HEAD sha>[+dirty]' of the repository holding this tool, or None."""
+    import subprocess
+    try:
+        h = subprocess.run(['git', '-C', HERE, 'rev-parse', 'HEAD'], capture_output=True, text=True, timeout=10)
+        d = subprocess.run(['git', '-C', HERE, 'status', '--porcelain', '--', '.'], capture_output=True, text=True,
+                           timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return None if h.returncode else h.stdout.strip() + ('+dirty' if d.stdout.strip() else '')
+
+
+def dets_fingerprint(path):
+    """frames_fingerprint(load_dets(path)[0]) of c7_measure (CAM; contract 2.D) or None when that version is not here."""
+    if not path:
+        return None
+    try:
+        import c7_measure as cm
+        return cm.frames_fingerprint(cm.load_dets(path)[0])
+    except (ImportError, AttributeError):
+        return None
+
+
+def stop_positions(segs):
+    """Commanded position along the car axis of every stop window (window k = the stop before move k)."""
+    x, out = 0.0, [0.0]
+    for m in plan_moves(segs):
+        if m['loai'] == 'tien':
+            x = m['toi']
+        out.append(x)
+    return out
+
+
 def report(ck):
     for name, ok, detail in ck:
         print(f"{'DAT ' if ok else 'HONG'} {name:24s} {detail}")
@@ -910,60 +1061,135 @@ def cmd_cua_so(a):
     F = frames_of(a, A)
     an = analyse(A, F, info)
     clip_sha = sha256(a.clip) if a.clip else None
+    S = json.load(open(a.session, encoding='utf-8')) if a.session else {}
+    ses_sha = sha256(a.session) if a.session else a.session_sha256
+    pos = stop_positions(A['segs'])
     rows = []
     roles = window_roles(A['segs'])
+    last_k = len(an['windows']) - 1
     for k_w, lo in roles:
         w = an['windows'][k_w]
-        idx = F['idx'][w['mask']]
-        ts = F['t'][w['mask']]
-        k_sha = hashlib.sha256(','.join(map(str, idx.tolist())).encode()).hexdigest()
+        ids_all = F['idx'][w['mask_all']]
+        ts_all = F['t'][w['mask_all']]
+        ids_ok = F['idx'][w['mask']]
+        cuoi = k_w == last_k
         rows.append(dict(schema='cua_so_v1', luot_id=A['thu_id'], thu_id=A['thu_id'], cho=A['cho'], loai=lo,
                          chi_so=w['chi_so'], clip=a.clip and os.path.basename(a.clip), clip_sha256=clip_sha,
-                         session_sha256=a.session_sha256, frames_sha256=sha256(a.frames),
-                         khung=[dict(id=int(i), pts_s=float(t)) for i, t in zip(idx, ts)], khung_sha256=k_sha,
-                         phep_gop='trung_binh_go_vong', t_canh_s=None if w['tb'] is None else w['tb'] + 0.1 - an['D'],
+                         session_sha256=ses_sha, fit_ids_nguon=S.get('fit_ids'), frames_sha256=sha256(a.frames),
+                         khung=[dict(id=int(i), pts_s=float(t)) for i, t in zip(ids_all, ts_all)],
+                         khung_sha256=_ids_sha(ids_all), khung_ma_hop_le=[int(i) for i in ids_ok],
+                         khung_ma_hop_le_sha256=_ids_sha(ids_ok), phep_gop='trung_binh_go_vong',
+                         t_canh_s=None if (cuoi or w['tb'] is None) else w['tb'] + 0.1 - an['D'],
+                         bien_cuoi='duoi_log' if cuoi else 'canh_lenh', vi_tri_lenh_m=pos[k_w],
                          D_s=an['D'], u_D_s=an['u_D'], t0_log_us=int(A['log']['timestamp_us'][0]),
                          esp32_sha256=sha256(A['log_path']), chuoi=an['chuoi']))
+    for r in rows:
+        pr = f2_problems(r)
+        if pr:
+            raise AError(f"F2 {r['loai']} {r['chi_so']}: {pr}")
     out = os.path.join(a.dir, 'cua_so_v1.jsonl')
     with open(out, 'x', encoding='utf-8') as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + '\n')
-    doan = dict(schema='c8_hc_doan_12b_v1', thu_id=A['thu_id'], cho=A['cho'], trang_thai=an['chuoi'],
-                clip=a.clip, clip_sha256=clip_sha, session_sha256=a.session_sha256, frames_sha256=sha256(a.frames),
-                track_sha256=sha256(a.track), cua_so_v1_sha256=sha256(out), esp32_sha256=sha256(A['log_path']),
-                dets_sha256=sha256(a.dets) if a.dets else None, chuoi=an['chuoi'],
-                nguon=[dict(vai_tro=k, duong_dan=os.path.abspath(v), sha256=sha256(v))
-                       for k, v in (('frames', a.frames), ('track', a.track), ('log', A['log_path']),
-                                    ('sender', os.path.join(a.dir, 'sender.txt')), ('lich', os.path.join(a.dir, 'lich.csv')),
-                                    ('cua_so_v1', out)) if v],
-                doan=[])
+    tj = json.load(open(a.track, encoding='utf-8'))
+    xo = json.load(open(a.xoay, encoding='utf-8')) if a.xoay else {}
+    xb = (xo.get('cho', {}).get(A['cho']) or xo) if xo else {}
+    role_of = dict(roles)
+    nguon = [dict(vai_tro=k, duong_dan=os.path.abspath(v), sha256=sha256(v))
+             for k, v in (('clip', a.clip), ('session', a.session), ('frames', a.frames), ('track', a.track),
+                          ('dets', a.dets), ('log', A['log_path']), ('sender', os.path.join(a.dir, 'sender.txt')),
+                          ('lich', os.path.join(a.dir, 'lich.csv')), ('cua_so_v1', out), ('a6', a.a6),
+                          ('xoay', a.xoay)) if v]
+    doan = dict(schema='c8_hc_doan_12b_v1', thu_id=A['thu_id'], cho=A['cho'], lan_lap_id=None,
+                trang_thai=an['chuoi'], clip=a.clip, clip_sha256=clip_sha, session_sha256=ses_sha,
+                frames_sha256=sha256(a.frames), track_sha256=sha256(a.track), cua_so_v1_sha256=sha256(out),
+                esp32_sha256=sha256(A['log_path']), commit_hil=commit_hil(),
+                car_pose_cfg=dict(side_m=S.get('car_side_m'), h_m=S.get('tag_h_m'), tag_offset=tj.get('tag_offset'),
+                                  q_m=xb.get('q_tag_m'), du_m=xb.get('du_m')),
+                xoay_sha256=sha256(a.xoay) if a.xoay else None, a6_sha256=sha256(a.a6) if a.a6 else None,
+                chuoi=an['chuoi'], dets_sha256=sha256(a.dets) if a.dets else None, dets_fp=dets_fingerprint(a.dets),
+                nguon=nguon, doan=[])
     for lg in an['legs']:
-        wa, wb = an['windows'][lg['a']], an['windows'][lg['b']]
-        d = dict(i=lg['i'], dai=lg['dai'], trang_thai=lg['trang_thai'], ly_do=lg.get('ly_do'))
-        for nm, w in (('cua_so_a', wa), ('cua_so_b', wb)):
-            d[nm] = dict(chi_so=w['chi_so'], khung_id=F['idx'][w['mask']].tolist(),
+        d = dict(i=lg['i'], dai=lg['dai'], trang_thai=lg['trang_thai'], ly_do=lg.get('ly_do'),
+                 chieu=lg.get('chieu') or ('toi' if pos[lg['b']] > pos[lg['a']] else 'lui'),
+                 vi_tri_lenh_m=[pos[lg['a']], pos[lg['b']]], dp_m=None, L_m=None)
+        for nm, k_w in (('cua_so_a', lg['a']), ('cua_so_b', lg['b'])):
+            w = an['windows'][k_w]
+            ids = F['idx'][w['mask']]
+            d[nm] = dict(loai=role_of.get(k_w), chi_so=w['chi_so'], khung_id=[int(i) for i in ids],
+                         khung_pts_s=[float(t) for t in F['t'][w['mask']]], khung_sha256=_ids_sha(ids),
                          p_m=w['p'].tolist() if 'p' in w else None, psi_rad=w.get('psi'))
         if lg['trang_thai'] == 'hop_le':
-            d.update(chieu=lg['chieu'], dp_m=lg['dp'].tolist(), L_m=lg['L_m'])
+            d.update(dp_m=lg['dp'].tolist(), L_m=lg['L_m'])
         doan['doan'].append(d)
     body = json.dumps(doan, ensure_ascii=False, sort_keys=True)
     doan['sha256'] = hashlib.sha256(body.encode()).hexdigest()
+    pr = f5_problems(doan)
+    if pr:
+        raise AError(f'F5: {pr}')
     with open(os.path.join(a.dir, 'doan_12b_v1.json'), 'x', encoding='utf-8') as f:
         json.dump(doan, f, ensure_ascii=False, indent=1)
     print(f"D={an['D']:.3f} s u_D={an['u_D']:.3f} s chuoi={an['chuoi']}")
     for lg in an['legs']:
         if lg['trang_thai'] == 'hop_le':
             print(f"doan {lg['i']} {'dai ' if lg['dai'] else 'ngan'} {lg['chieu']:3s} L={lg['L_m']:.3f} m "
-                  f"a_l={math.degrees(lg['a_l']):+.3f} deg ti_le={lg['ti_le']:.4f} eps={math.degrees(lg['eps']):.3f} deg")
+                  f"a_l={math.degrees(lg['a_l']):+.3f} deg ti_le={lg['ti_le']:.4f} eps="
+                  + ('thieu' if not math.isfinite(lg['eps']) else f"{math.degrees(lg['eps']):.3f} deg"))
         else:
             print(f"doan {lg['i']} {lg['trang_thai']}: {lg.get('ly_do')}")
     return 0
 
 
+def _block(j, cho):
+    """The block of one place in a file of another session: j['cho'][cho] when present, else j."""
+    return (j.get('cho') or {}).get(cho) or j
+
+
+def read_neo(path, cho, ref_row):
+    """psi_chuan_k_deg of F6 (NHACTAM) after checking it was made on the ref_12b window of the issued attempt
+    (contract F6; HCC1-10): clip_sha256 equal, khung_chung_sha256 equal to the window's khung_sha256 or
+    khung_ma_hop_le_sha256 (which of the two NHACTAM hashes is not fixed in the contract); else AError (code 2)."""
+    b = _block(json.load(open(path, encoding='utf-8')), cho)
+    for k in ('psi_chuan_k_deg', 'clip_sha256', 'khung_chung_sha256'):
+        if k not in b:
+            raise AError(f'{path}: {cho} thieu {k}')
+    if ref_row is None:
+        raise AError('F6 needs the ref_12b row of cua_so_v1.jsonl of the issued attempt (run cua_so first)')
+    if b['clip_sha256'] != ref_row.get('clip_sha256'):
+        raise AError(f'{path}: clip_sha256 khac cua so ref_12b')
+    if b['khung_chung_sha256'] not in (ref_row.get('khung_sha256'), ref_row.get('khung_ma_hop_le_sha256')):
+        raise AError(f'{path}: khung_chung_sha256 khac cua so ref_12b')
+    return float(b['psi_chuan_k_deg'])
+
+
+def read_e_hieu(path, doan_path):
+    """{leg i: e_hieu_m} of F9 (KIEMCHEO) after checking doan_12b_sha256 against the F5 of the issued attempt (its
+    content sha256 or the file sha256; HCC1-10); else AError (code 2)."""
+    j = json.load(open(path, encoding='utf-8'))
+    d = json.load(open(doan_path, encoding='utf-8'))
+    if j.get('doan_12b_sha256') not in (d.get('sha256'), sha256(doan_path)):
+        raise AError(f'{path}: doan_12b_sha256 khac {doan_path}')
+    out = {}
+    for x in j.get('doan', []):
+        if 'i' not in x or 'e_hieu_m' not in x:
+            raise AError(f'{path}: dong thieu i / e_hieu_m')
+        out[int(x['i'])] = float(x['e_hieu_m'])
+    return out, bool(j.get('bao_q_xoay', False))
+
+
+def read_can_c8b(path, cho):
+    """u_psi_cuc [rad] from a C8B file (name of the field not yet agreed, contract 4.5): u_psi_cuc_rad."""
+    b = _block(json.load(open(path, encoding='utf-8')), cho)
+    if 'u_psi_cuc_rad' not in b:
+        raise AError(f'{path}: {cho} thieu u_psi_cuc_rad')
+    return float(b['u_psi_cuc_rad']), bool(b.get('chot', False))
+
+
 def cmd_tinh(a):
-    attempts = []
-    for spec in [a.cap] + list(a.them or []):
-        d = spec
+    attempts, cap_ok, cap_why, cap_ref, cap_F = [], True, [], None, None
+    cap_id = os.path.basename(os.path.normpath(a.cap))
+    nguon = []
+    for d in [a.cap] + list(a.them or []):
         A = load_attempt(d)
         if A['cho'] != a.cho:
             raise AError(f'{d}: cho {A["cho"]} != {a.cho}')
@@ -972,34 +1198,86 @@ def cmd_tinh(a):
             raise AError(f'{d}: --frames-of {d}=FRAMES,TRACK missing')
         frames, track = fr.split(',')
         ck, info = kiem(A)
+        failed = [n for n, ok, _ in ck if not ok]
+        is_cap = A['thu_id'] == cap_id
+        if is_cap and failed:
+            cap_ok, cap_why = False, failed
+        nguon += [dict(vai_tro=f'{A["thu_id"]}:{k}', duong_dan=os.path.abspath(v), sha256=sha256(v))
+                  for k, v in (('log', A['log_path']), ('sender', os.path.join(d, 'sender.txt')),
+                               ('lich', os.path.join(d, 'lich.csv')), ('frames', frames), ('track', track))]
         if 'windows' not in info:
-            raise AError(f'{d}: kiem gave no windows')
+            attempts.append((A['thu_id'], None, failed or ['khong co cua so']))
+            continue
         F = None
         if a.a6 and a.xoay:
             F = frames_chain(frames, a.a6, a.xoay)
         F = F or frames_basic(frames, track)
-        attempts.append((A['thu_id'], analyse(A, F, info)))
+        try:
+            an = analyse(A, F, info)
+        except AError as exc:
+            attempts.append((A['thu_id'], None, failed + [str(exc)]))
+            continue
+        attempts.append((A['thu_id'], an, failed))
+        if is_cap:
+            cap_F, cap_A, cap_an = F, A, an
+            p = os.path.join(d, 'cua_so_v1.jsonl')
+            if os.path.isfile(p):
+                rows = [json.loads(x) for x in open(p, encoding='utf-8')]
+                cap_ref = next((r for r in rows if r.get('loai') == 'ref_12b'), None)
+                nguon.append(dict(vai_tro='cua_so_v1', duong_dan=os.path.abspath(p), sha256=sha256(p)))
     e = None
+    bao_q = False
     if a.e_hieu:
-        j = json.load(open(a.e_hieu, encoding='utf-8'))
-        e = [float(x['e_hieu_m']) for x in j.get('doan', []) if x.get('dai')]
+        dp = os.path.join(a.cap, 'doan_12b_v1.json')
+        e, bao_q = read_e_hieu(a.e_hieu, dp)
+        nguon += [dict(vai_tro='e_hieu_m', duong_dan=os.path.abspath(a.e_hieu), sha256=sha256(a.e_hieu)),
+                  dict(vai_tro='doan_12b_v1', duong_dan=os.path.abspath(dp), sha256=sha256(dp))]
     q = du = None
     if a.xoay:
-        x = json.load(open(a.xoay, encoding='utf-8'))
+        x = _block(json.load(open(a.xoay, encoding='utf-8')), a.cho)
         q, du = x.get('q_tag_m'), x.get('du_m')
+        nguon.append(dict(vai_tro='xoay_v1', duong_dan=os.path.abspath(a.xoay), sha256=sha256(a.xoay)))
+    if a.a6:
+        nguon.append(dict(vai_tro='c8b_a6_v2', duong_dan=os.path.abspath(a.a6), sha256=sha256(a.a6)))
     neo = None
     if a.neo:
-        nj = json.load(open(a.neo, encoding='utf-8'))
-        neo = nj.get('cho', {}).get(a.cho, {}).get('psi_chuan_k_deg', nj.get('psi_chuan_k_deg'))
-    cap_id = os.path.basename(os.path.normpath(a.cap))
-    r = place_result(a.cho, attempts, cap_id, e_hieu=e, q=q, du_m=du, neo=neo, psi_cuc=a.u_psi_cuc_rad)
-    r = dict(schema='truc_xe_v1', version=VERSION, **r)
+        neo = read_neo(a.neo, a.cho, cap_ref)
+        nguon.append(dict(vai_tro='hieu_chuan_neo', duong_dan=os.path.abspath(a.neo), sha256=sha256(a.neo)))
+    psi_cuc, chot = None, False
+    if a.can_c8b:
+        psi_cuc, chot = read_can_c8b(a.can_c8b, a.cho)
+        nguon.append(dict(vai_tro='can_c8b', duong_dan=os.path.abspath(a.can_c8b), sha256=sha256(a.can_c8b)))
+    vet = None
+    if a.moc and cap_F is not None:
+        import c8_hc_vet as cv
+        tags = cv.load_tags(a.moc, a.vien_mm / 1000)
+        L = cap_A['log']
+        i0, i1 = run_range(L)
+        D = cap_an['D']
+        m = cap_F['ok'] & (cap_F['t'] + D >= L['t'][i0]) & (cap_F['t'] + D <= L['t'][i1])
+        a_cap = circmean([lg['a_l'] for lg in cap_an['legs'] if lg['dai'] and lg['trang_thai'] == 'hop_le'] or [0.0])
+        x0, y0, _ = cv.START[a.cho]
+        vet = cv.vet_thuc_camera(cap_F['t'][m], cap_F['x'][m], cap_F['y'][m], cap_F['psi'][m], a_cap, tags,
+                                 a.d_vet_mm / 1000)
+        nguon.append(dict(vai_tro='moc_32', duong_dan=os.path.abspath(a.moc), sha256=sha256(a.moc)))
+    roles = dict((lo, k) for k, lo in window_roles(load_attempt(a.cap)['segs']))
+    need = sorted(k for k, lo in window_roles(load_attempt(a.cap)['segs']) if lo in ('ref_12b', 'dung_12b'))
+    del roles
+    r = place_result(a.cho, attempts, cap_id, e_hieu=e, q=q, du_m=du, neo=neo, psi_cuc=psi_cuc, cap_ok=cap_ok,
+                     cap_why=cap_why, bao_q=bao_q, vet=vet, psi_cuc_chot=chot, need_windows=need)
+    r = dict(schema='truc_xe_v1', version=VERSION, commit_hil=commit_hil(), nguon=nguon,
+             mien_hieu_luc=dict(cho=a.cho, thu_id_cap=cap_id, lan_lap_id=None,
+                                ghi_chu='cung buoi, cung lan lap tam (lan_lap_v1 cua NHACTAM chua co: chua xac minh)'),
+             **r)
     txt = json.dumps(r, ensure_ascii=False, indent=1, default=float)
     if a.out:
         with open(a.out, 'x', encoding='utf-8') as f:
             f.write(txt)
-    print(f"{a.cho}: a = {r['a_k_deg']:+.3f} deg, u_a = {r['u_a_k_deg']:.3f} deg, do tan {r['do_tan_deg']:.3f} deg, "
-          f"trang_thai {r['trang_thai']} {r['ly_do']}")
+    if r['a_k_deg'] is None:
+        print(f"{a.cho}: trang_thai {r['trang_thai']} {r['ly_do']}")
+    else:
+        print(f"{a.cho}: a = {r['a_k_deg']:+.3f} deg, u_a = {r['u_a_k_deg']:.3f} deg, do tan {r['do_tan_deg']:.3f} deg, "
+              f"trang_thai {r['trang_thai']} {r['ly_do']}")
     return 0 if r['trang_thai'] in ('khoa', 'chan_doan') and all(r['cong'].values()) else 1
 
 
@@ -1076,6 +1354,7 @@ def main(argv=None):
     c.add_argument('--session-sha256', default=None)
     c.add_argument('--a6', default=None)
     c.add_argument('--xoay', default=None)
+    c.add_argument('--session', default=None, help='session JSON of c7 (fit_ids, car_side_m, tag_h_m, sha256)')
     t = sub.add_parser('tinh')
     t.add_argument('--cho', required=True, choices=sorted(hs.PLACES))
     t.add_argument('--cap', required=True, help='attempt folder whose a is issued')
@@ -1085,7 +1364,10 @@ def main(argv=None):
     t.add_argument('--xoay', default=None)
     t.add_argument('--neo', default=None, help='hieu_chuan_neo.json of NHACTAM (F6)')
     t.add_argument('--e-hieu', default=None, help='e_hieu_m of KIEMCHEO (F9)')
-    t.add_argument('--u-psi-cuc-rad', type=float, default=None, help='C8B two-end camera heading bound (pending)')
+    t.add_argument('--can-c8b', default=None, help='C8B file with u_psi_cuc_rad (two-end camera heading bound)')
+    t.add_argument('--moc', default=None, help='moc_san_do_32.csv: real swept footprint (vet thuc)')
+    t.add_argument('--vien-mm', type=float, default=10.0)
+    t.add_argument('--d-vet-mm', type=float, default=20.0, help='tag centre to body box centre bound [de xuat]')
     t.add_argument('--out', default=None)
     a = ap.parse_args(argv)
     if a.cmd == 'tinh':

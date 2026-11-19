@@ -15,6 +15,11 @@ import c8_hc_a as ca  # noqa: E402
 import c8_hc_synth as sy  # noqa: E402
 
 
+def E(e):
+    """F9 e_hieu_m for the four long legs (i = 0..3)."""
+    return {i: e for i in range(4)}
+
+
 def make(tmp_path, name='HC_K1_1', **kw):
     d = str(tmp_path / name)
     truth = sy.make(d, **kw)
@@ -39,7 +44,7 @@ def test_nominal_attempt_passes_and_recovers_a(tmp_path, cho):
     ok, ck, info = checks(d)
     assert all(ok.values()), [c for c in ck if not c[1]]
     an = analyse(d)
-    r = ca.place_result(cho, [(os.path.basename(d), an)], os.path.basename(d), e_hieu=[0.002], q=[0.004, -0.003],
+    r = ca.place_result(cho, [(os.path.basename(d), an)], os.path.basename(d), e_hieu=E(0.002), q=[0.004, -0.003],
                         du_m=0.001, neo=10.0, psi_cuc=0.0)
     assert abs(math.radians(r['a_k_deg']) - truth['a_true']) <= math.radians(r['u_a_k_deg'])
     assert abs(r['a_k_deg'] - 0.7) < 0.05
@@ -67,12 +72,18 @@ def test_cua_so_writes_f2_and_f5(tmp_path):
     doan = json.load(open(os.path.join(d, 'doan_12b_v1.json'), encoding='utf-8'))
     assert doan['schema'] == 'c8_hc_doan_12b_v1' and len(doan['doan']) == 6
     assert sum(1 for x in doan['doan'] if x['dai']) == 4
+    assert all(ca.f2_problems(r) == [] for r in rows) and ca.f5_problems(doan) == []           # HCC1-11
+    assert rows[-1]['t_canh_s'] is None and rows[-1]['bien_cuoi'] == 'duoi_log'
+    assert all(r['t_canh_s'] is not None and r['bien_cuoi'] == 'canh_lenh' for r in rows[:-1])
+    assert [r['vi_tri_lenh_m'] for r in rows[:7]] == [0.0, 0.5, -0.5, 0.5, -0.5, 0.5, 0.0]
+    assert doan['doan'][0]['cua_so_a']['loai'] == 'dung_12b' and doan['doan'][4]['cua_so_a']['loai'] == 'ref_12b'
     body = dict(doan)
     sha = body.pop('sha256')
     assert sha == __import__('hashlib').sha256(json.dumps(body, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
     with pytest.raises(FileExistsError):                                        # never overwritten
         ca.cmd_cua_so(type('a', (), dict(dir=d, frames=os.path.join(d, 'frames.csv'), track=os.path.join(d, 'track.json'),
-                                         clip=None, dets=None, session_sha256=None, a6=None, xoay=None))())
+                                         clip=None, dets=None, session_sha256=None, a6=None, xoay=None,
+                                         session=None))())
 
 
 def test_phan_E_only(tmp_path):
@@ -118,7 +129,7 @@ def test_kiem_passes_nominal_pid_like_turn_lag(tmp_path):
 # ------------------------------------------------------------------ HC3-4 counter-examples
 def result(d, cho, psi_cuc=0.0, extra=()):
     ans = [(os.path.basename(d), analyse(d))] + [(os.path.basename(x), analyse(x)) for x in extra]
-    return ca.place_result(cho, ans, os.path.basename(d), e_hieu=[0.0], q=[0.0, 0.0], du_m=0.0, neo=0.0, psi_cuc=psi_cuc)
+    return ca.place_result(cho, ans, os.path.basename(d), e_hieu=E(0.0), q=[0.0, 0.0], du_m=0.0, neo=0.0, psi_cuc=psi_cuc)
 
 
 def test_camera_heading_drift_inside_index_or_flagged(tmp_path):
@@ -145,7 +156,7 @@ def test_common_camera_bias_at_both_extremes_needs_c8b_bound(tmp_path):
     def bias(t):
         return math.radians(0.15) if 6.0 < t < 60.0 else 0.0
     d, truth = make(tmp_path, cho='K1', cam_bias=bias, noise_psi_deg=0.02)
-    r0 = ca.place_result('K1', [(os.path.basename(d), analyse(d))], os.path.basename(d), e_hieu=[0.0], q=[0, 0],
+    r0 = ca.place_result('K1', [(os.path.basename(d), analyse(d))], os.path.basename(d), e_hieu=E(0.0), q=[0, 0],
                          du_m=0.0, neo=0.0, psi_cuc=None)
     assert r0['trang_thai'] in ('chan_doan', 'chua_ket_luan')
     r1 = result(d, 'K1', psi_cuc=math.radians(0.15))
@@ -407,7 +418,7 @@ def test_camera_gap_in_leg_is_no_evidence(tmp_path):
     an = ca.analyse(A, drop(frames(d), 12.0, 13.0, truth['D']), info)
     leg = [lg for lg in an['legs'] if lg['dai']][0]
     assert not math.isfinite(leg['eps'])
-    r = ca.place_result('K2', [('x', an)], 'x', e_hieu=[0.0], q=[0, 0], du_m=0.0, neo=0.0, psi_cuc=0.0)
+    r = ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0, 0], du_m=0.0, neo=0.0, psi_cuc=0.0)
     assert not r['cong']['yaw_dong']
 
 
@@ -417,3 +428,116 @@ def test_rv_repeat_015s_during_turn_fails(tmp_path):
     ok, ck, _ = checks(d)
     e = [c for c in ck if c[0] == 'imu_e_tuong_quan']
     assert not e[0][1], e
+
+
+# ------------------------------------------------------------------ Codex code review round 1 (HCC1-10..12)
+def tinh_args(d, cho, *extra):
+    return ['tinh', '--cho', cho, '--cap', d, '--frames-of',
+            f"{d}={os.path.join(d, 'frames.csv')},{os.path.join(d, 'track.json')}", *extra]
+
+
+def run_cua_so(d):
+    assert ca.main(['cua_so', d, '--frames', os.path.join(d, 'frames.csv'), '--track', os.path.join(d, 'track.json'),
+                    '--clip', os.path.join(d, 'track.json')]) == 0        # any file stands for the clip (sha only)
+    rows = [json.loads(x) for x in open(os.path.join(d, 'cua_so_v1.jsonl'), encoding='utf-8')]
+    return rows[0], json.load(open(os.path.join(d, 'doan_12b_v1.json'), encoding='utf-8'))
+
+
+def write_json(path, obj):
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(obj, f)
+    return path
+
+
+def test_tinh_refuses_cap_that_failed_kiem(tmp_path, capsys):
+    """HCC1-10 (Codex): a cap attempt failing dinh_danh_gain (boot changed) was issued 'khoa'."""
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2', boot_after='0badb00f')
+    out = str(tmp_path / 'f7.json')
+    assert ca.main(tinh_args(d, 'K2', '--out', out)) == 1
+    r = json.load(open(out, encoding='utf-8'))
+    assert r['trang_thai'] == 'chua_ket_luan' and 'dinh_danh_gain' in r['ly_do'][0] and r['a_k_deg'] is None
+
+
+def test_tinh_checks_f6_and_f9_sources(tmp_path):
+    """HCC1-10: F6 must be made on the ref_12b window of the cap (clip, frames), F9 on its F5, by leg i."""
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
+    ref, doan = run_cua_so(d)
+    good_neo = write_json(str(tmp_path / 'neo.json'), dict(cho=dict(K2=dict(
+        psi_chuan_k_deg=12.0, clip_sha256=ref['clip_sha256'], khung_chung_sha256=ref['khung_ma_hop_le_sha256']))))
+    bad_neo = write_json(str(tmp_path / 'neo_x.json'), dict(cho=dict(K2=dict(
+        psi_chuan_k_deg=12.0, clip_sha256='0' * 64, khung_chung_sha256=ref['khung_sha256']))))
+    good_e = write_json(str(tmp_path / 'e.json'), dict(doan_12b_sha256=doan['sha256'],
+                                                       doan=[dict(i=i, e_hieu_m=0.002) for i in range(6)]))
+    bad_e = write_json(str(tmp_path / 'e_x.json'), dict(doan_12b_sha256='1' * 64, doan=[dict(i=0, e_hieu_m=0.002)]))
+    only99 = write_json(str(tmp_path / 'e_99.json'), dict(doan_12b_sha256=doan['sha256'],
+                                                         doan=[dict(i=99, e_hieu_m=0.002)]))
+    assert ca.main(tinh_args(d, 'K2', '--neo', bad_neo)) == 2
+    assert ca.main(tinh_args(d, 'K2', '--e-hieu', bad_e)) == 2
+    out = str(tmp_path / 'f7_99.json')
+    assert ca.main(tinh_args(d, 'K2', '--neo', good_neo, '--e-hieu', only99, '--out', out)) == 1
+    assert not json.load(open(out, encoding='utf-8'))['cong']['e_hieu_hop_le']
+    out = str(tmp_path / 'f7.json')
+    assert ca.main(tinh_args(d, 'K2', '--neo', good_neo, '--e-hieu', good_e, '--out', out)) == 0
+    r = json.load(open(out, encoding='utf-8'))
+    assert r['phi_hat_chuan_k_deg'] == pytest.approx(12.0 - r['a_k_deg'])
+    roles = {n['vai_tro'] for n in r['nguon']}
+    assert {'hieu_chuan_neo', 'e_hieu_m', 'doan_12b_v1', 'cua_so_v1'} <= roles and r['commit_hil']
+    leg = r['luot_thu'][0]['doan'][0]
+    assert 'a_l_deg' in leg and 'theta_a_deg' in leg and 'eps_deg' in leg and 'a_l' not in leg   # HCC1-12
+
+
+def test_empty_required_window_and_lost_holdout_not_khoa(tmp_path):
+    """HCC1-11 (Codex): ref_12b without valid frames still gave 'khoa'; a lost held-out leg was skipped."""
+    d, truth = make(tmp_path, 'HC_K2_1', cho='K2')
+    A = ca.load_attempt(d)
+    ck, info = ca.kiem(A)
+    F = drop(frames(d), 0.0, 3.9, truth['D'])                     # the whole ref_12b window (before the first move)
+    an = ca.analyse(A, F, info)
+    r = ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0, 0], du_m=0.0, neo=0.0, psi_cuc=0.0,
+                        need_windows=list(range(7)))
+    assert r['trang_thai'] == 'chua_ket_luan' and 'cua so thieu khung' in r['ly_do'][0]
+    r2 = ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0, 0], du_m=0.0, neo=0.0, psi_cuc=0.0)
+    assert not r2['cong']['giu_ngoai'] and r2['trang_thai'] == 'chua_ket_luan'
+
+
+def test_missing_long_leg_is_chua_ket_luan_not_keyerror(tmp_path, capsys):
+    """HCC1-11 (Codex): no long legs printed 'loi: a_k_deg'."""
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2', noise_psi_deg=0.02)
+    with open(os.path.join(d, 'frames.csv'), encoding='utf-8') as f:
+        lines = f.readlines()
+    with open(os.path.join(d, 'frames.csv'), 'w', encoding='utf-8') as f:
+        f.write(lines[0])
+        for ln in lines[1:]:
+            c = ln.split(',')
+            t = float(c[1])
+            if 20.0 < t + 50.0 - 6.0 < 30.0:                          # the stop window between legs 1 and 2
+                c[2] = '0'
+            f.write(','.join(c))
+    rc = ca.main(tinh_args(d, 'K2'))
+    txt = capsys.readouterr().out
+    assert rc == 1 and 'loi:' not in txt and 'chua_ket_luan' in txt
+
+
+def test_e_outside_baseline_rejected_and_q_turn_term(tmp_path):
+    """HCC1-12: e >= L is refused (not clamped); u_q has the q turn term unless F9 says it is covered."""
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
+    an = analyse(d)
+    r = ca.place_result('K2', [('x', an)], 'x', e_hieu={0: 0.6, 1: 0.0, 2: 0.0, 3: 0.0}, q=[0.01, 0.0], du_m=0.0,
+                        neo=0.0, psi_cuc=0.0)
+    assert not r['cong']['e_hieu_hop_le'] and r['trang_thai'] == 'chua_ket_luan'
+    a1 = ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.05, 0.0], du_m=0.0, neo=0.0, psi_cuc=0.0)
+    a2 = ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.05, 0.0], du_m=0.0, neo=0.0, psi_cuc=0.0,
+                         bao_q=True)
+    assert a1['u_hang_deg']['u_q'] > 0.0 == a2['u_hang_deg']['u_q']
+
+
+def test_tinh_real_footprint_from_camera(tmp_path):
+    """HCC1-13: tinh computes the real footprint from the camera poses when the 32 tags are given."""
+    import test_c8_hc_vet as tv
+    if not os.path.isfile(tv.MOC):
+        pytest.skip('moc_san_do_32.csv not reachable (set C8_MOC_32)')
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
+    out = str(tmp_path / 'f7.json')
+    ca.main(tinh_args(d, 'K2', '--moc', tv.MOC, '--out', out))
+    r = json.load(open(out, encoding='utf-8'))
+    assert r['vet_thuc'] is not None and r['cong']['vet_thuc'] and r['vet_thuc']['khe_m'] > 0.05

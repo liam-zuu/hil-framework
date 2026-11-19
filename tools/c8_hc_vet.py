@@ -12,7 +12,13 @@ plus four wheel boxes (centres +-120 mm, half length 48.5 mm along x, half width
 3 sigma of the tag position (sigma_x_mm, sigma_y_mm of the CSV). Placement error: grid of +-lech mm on each floor axis
 and +-lech deg (5 points each); translation: overshoot +-qua_da along the axis and +-ngang across (fwsim); turn in
 place (E): disc of the farthest body/wheel point about the turning centre, the body centre up to d from it (C8B, tag
-centre to nominal body centre, [de xuat] 20 mm), plus the return error after 12b. Gaps before any further margin.
+centre to nominal body centre, [de xuat] 20 mm, or d_vet_m of xoay_v1 with --xoay), plus the return error after 12b
+and the drift of the turning centre during E (--troi-e-mm, default 10 mm = 2 x the fwsim largest 5.0 mm, ADRC K1,
+19/11). Gaps before any further margin.
+Continuous placement error (Codex code review HCC1-13): 12b takes the smallest gap of the grid AND of a bounded local
+minimisation (scipy, Powell) started from the five lowest grid points, so a gap between grid samples is not missed;
+E is exact: the turning centre anywhere in the square of +-(lech + tro_ve + troi_e), so the gap is the distance from
+the tag to that square minus the disc radius.
 Places and stops: rpi5/c8_hc_seq.PLACES. Also vet_thuc(): the real footprint from measured body poses (used by
 tools/c8_hc_a.py tinh).
 Last line: #ket_qua,ma=0 every gap >= --cong-mm / 1 some gap smaller / 2 error.
@@ -136,35 +142,53 @@ def grid(e):
     return (-e, -e / 2, 0.0, e / 2, e)
 
 
-def sweep_12b(cho, hyp, tags, lech, lech_deg, qua_da, ngang):
+def sweep_12b(cho, hyp, tags, lech, lech_deg, qua_da, ngang, refine=True):
+    """(nominal (gap, tag), worst (gap, tag), worst of the grid alone). worst = min of the grid and of a bounded
+    local minimisation from the five lowest grid points (HCC1-13)."""
     stops, _ = hs.PLACES[cho]
     lo, hi = min(stops) - qua_da, max(stops) + qua_da
     x0, y0, h0 = START[cho]
     shapes0 = [swept_x(p, lo, hi, ngang) for p in pieces(hyp)]
     nominal = gaps([place(s, x0, y0, h0) for s in shapes0], tags)
-    worst = (math.inf, None)
-    for dx, dy, dh in itertools.product(grid(lech), grid(lech), grid(lech_deg)):
-        g = gaps([place(s, x0 + dx, y0 + dy, h0 + dh) for s in shapes0], tags)
-        if g[0] < worst[0]:
-            worst = g
-    return nominal, worst
+    # a placement error moves every point of the shapes by at most lech*sqrt(2) + R*lech_deg (R: farthest point from
+    # the car centre), so a tag whose nominal gap exceeds the smallest one by twice that can never be the worst (exact
+    # pruning, the gap is 1-Lipschitz in the displacement)
+    R = max(float(np.max(np.hypot(s[:, 0], s[:, 1]))) for s in shapes0)
+    move = lech * math.sqrt(2) + R * math.radians(lech_deg)
+    nom = {k: gaps([place(s, x0, y0, h0) for s in shapes0], {k: q})[0] for k, q in tags.items()}
+    near = {k: tags[k] for k, g in nom.items() if g <= nominal[0] + 2 * move}
+
+    def at(v):
+        return gaps([place(s, x0 + v[0], y0 + v[1], h0 + v[2]) for s in shapes0], near)
+    pts = [(at((dx, dy, dh)), (dx, dy, dh)) for dx, dy, dh in itertools.product(grid(lech), grid(lech), grid(lech_deg))]
+    pts.sort(key=lambda z: z[0][0])
+    grid_worst = pts[0][0]
+    worst = grid_worst
+    if refine:
+        from scipy.optimize import minimize
+        bounds = [(-lech, lech), (-lech, lech), (-lech_deg, lech_deg)]
+        for g0, v0 in pts[:5]:
+            r = minimize(lambda v: at(v)[0], np.array(v0, float), method='Powell', bounds=bounds,
+                         options=dict(xtol=1e-5, ftol=1e-7, maxfev=400))
+            g = at(np.clip(r.x, [b[0] for b in bounds], [b[1] for b in bounds]))
+            if g[0] < worst[0]:
+                worst = g
+    return nominal, worst, grid_worst
 
 
 def reach(hyp):
     return max(float(np.max(np.hypot(p[:, 0], p[:, 1]))) for p in pieces(hyp))
 
 
-def sweep_E(cho, hyp, tags, lech, d, tro_ve):
+def sweep_E(cho, hyp, tags, lech, d, tro_ve, troi_e=0.0):
+    """Exact over the continuous square of centre positions (HCC1-13): gap = dist(tag, square) - (reach + 2d)."""
     x0, y0, _ = START[cho]
     r = reach(hyp)
     nominal = min((disc_dist((x0, y0), r, q), tid) for tid, q in tags.items())
-    e = lech + tro_ve
+    e = lech + tro_ve + troi_e
     rr = r + 2 * d
-    worst = (math.inf, None)
-    for dx, dy in itertools.product(grid(e), grid(e)):
-        g = min((disc_dist((x0 + dx, y0 + dy), rr, q), tid) for tid, q in tags.items())
-        if g[0] < worst[0]:
-            worst = g
+    sq = rect(x0 - e, x0 + e, y0 - e, y0 + e)
+    worst = min((max(0.0, poly_dist(sq, q) - rr), tid) for tid, q in tags.items())
     return nominal, worst, r
 
 
@@ -172,11 +196,38 @@ def vet_thuc(poses, tags, hyp):
     """Smallest gap of the real footprint: poses = iterable of (x, y, heading rad) of the BODY centre (floor)."""
     best = (math.inf, None)
     ps = pieces(hyp)
+    r = reach(hyp) + 0.05
     for x, y, th in poses:
-        g = gaps([place(p, x, y, math.degrees(th)) for p in ps], tags)
+        near = {k: q for k, q in tags.items() if np.min(np.hypot(q[:, 0] - x, q[:, 1] - y)) < r + 0.5}
+        if not near:
+            continue
+        g = gaps([place(p, x, y, math.degrees(th)) for p in ps], near)
         if g[0] < best[0]:
             best = g
     return best
+
+
+def vet_thuc_camera(t, x, y, psi_tag, a, tags, d, hyps=HYPS, every=6):
+    """Real footprint from the camera (HCC1-13), every `every`-th valid frame: the body heading is the tag heading
+    - a, the body centre is within d of the measured centre (the chain gives the tag centre after q, not the body
+    box centre), and between two used frames the car moves at most the largest step of the frames (translation +
+    reach x turn), half of which is taken off. Returns dict(khe_m, ma, buoc_m, d_m, hyp) of the worst hypothesis."""
+    t, x, y, psi_tag = (np.asarray(v, float) for v in (t, x, y, psi_tag))
+    if len(t) < 2:
+        return None
+    th = np.unwrap(psi_tag) - a
+    use = np.arange(0, len(t), every)
+    if use[-1] != len(t) - 1:
+        use = np.r_[use, len(t) - 1]
+    out = None
+    for hyp in hyps:
+        r = reach(hyp)
+        step = np.hypot(np.diff(x[use]), np.diff(y[use])) + r * np.abs(np.diff(th[use]))
+        g, tid = vet_thuc(zip(x[use], y[use], th[use]), tags, hyp)
+        k = g - d - (float(np.max(step)) / 2 if len(step) else 0.0)
+        if out is None or k < out['khe_m']:
+            out = dict(khe_m=k, ma=tid, buoc_m=float(np.max(step)) if len(step) else 0.0, d_m=d, hyp=hyp)
+    return out
 
 
 def run(a):
@@ -184,15 +235,31 @@ def run(a):
     rows = []
     for cho in ('goc', 'K1', 'K2'):
         for hyp in HYPS:
-            n, w = sweep_12b(cho, hyp, tags, a.lech_mm / 1000, a.lech_deg, a.qua_da_mm / 1000, a.ngang_mm / 1000)
+            n, w, gw = sweep_12b(cho, hyp, tags, a.lech_mm / 1000, a.lech_deg, a.qua_da_mm / 1000, a.ngang_mm / 1000)
             rows.append(dict(cho=cho, buoc='12b', gia_thuyet=hyp, khe_dung_dau_mm=n[0] * 1000, ma_dung_dau=n[1],
-                             khe_xau_nhat_mm=w[0] * 1000, ma_xau_nhat=w[1]))
+                             khe_xau_nhat_mm=w[0] * 1000, ma_xau_nhat=w[1], khe_luoi_mm=gw[0] * 1000))
             if hs.PLACES[cho][1]:
-                n, w, r = sweep_E(cho, hyp, tags, a.lech_mm / 1000, a.d_mm / 1000, a.tro_ve_mm / 1000)
+                d, d_src = d_of(a, cho)
+                n, w, r = sweep_E(cho, hyp, tags, a.lech_mm / 1000, d, a.tro_ve_mm / 1000, a.troi_e_mm / 1000)
                 rows.append(dict(cho=cho, buoc='E', gia_thuyet=hyp, ban_kinh_mm=r * 1000, khe_dung_dau_mm=n[0] * 1000,
-                                 ma_dung_dau=n[1], khe_xau_nhat_mm=w[0] * 1000, ma_xau_nhat=w[1]))
+                                 ma_dung_dau=n[1], khe_xau_nhat_mm=w[0] * 1000, ma_xau_nhat=w[1], d_mm=d * 1000,
+                                 d_nguon=d_src))
     ok = all(r['khe_xau_nhat_mm'] >= a.cong_mm for r in rows)
-    return dict(version=VERSION, moc=os.path.abspath(a.moc), tham_so=vars(a).copy(), dong=rows, dat=ok)
+    import hashlib
+    sha = hashlib.sha256(open(a.moc, 'rb').read()).hexdigest()
+    return dict(version=VERSION, moc=os.path.abspath(a.moc), moc_sha256=sha, tham_so=vars(a).copy(), dong=rows, dat=ok)
+
+
+def d_of(a, cho):
+    """(d [m], source) for the E disc: d_vet_m of xoay_v1 (C8B) for this place when --xoay is given, else --d-mm
+    ([de xuat])."""
+    if getattr(a, 'xoay', None):
+        import hashlib
+        x = json.load(open(a.xoay, encoding='utf-8'))
+        v = (x.get('cho', {}).get(cho) or {}).get('d_vet_m', x.get('d_vet_m'))
+        if v is not None:
+            return float(v), f"xoay_v1 {os.path.abspath(a.xoay)} sha256 {hashlib.sha256(open(a.xoay, 'rb').read()).hexdigest()}"
+    return a.d_mm / 1000, f'tham so --d-mm {a.d_mm:g} [de xuat]'
 
 
 def main(argv=None):
@@ -206,6 +273,8 @@ def main(argv=None):
     ap.add_argument('--ngang-mm', type=float, default=2.0)
     ap.add_argument('--d-mm', type=float, default=20.0)
     ap.add_argument('--tro-ve-mm', type=float, default=15.0)
+    ap.add_argument('--troi-e-mm', type=float, default=10.0, help='E centre drift (2 x fwsim 5.0 mm)')
+    ap.add_argument('--xoay', default=None, help='xoay_v1 of C8B: d_vet_m per place')
     ap.add_argument('--cong-mm', type=float, default=20.0)
     a = ap.parse_args(argv)
     try:

@@ -3,6 +3,7 @@ import math
 import os
 import sys
 
+import numpy as np
 import pytest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -56,12 +57,38 @@ def test_k1_040_touches_and_025_clears():
     old = cv.hs.PLACES['K1']
     try:
         cv.hs.PLACES['K1'] = ((0.0, 0.40, -0.40, 0.40, -0.40, 0.40, 0.0), True)
-        _, w = cv.sweep_12b('K1', '340_doc', tags, 0.03, 3.0, 0.01, 0.0)
+        _, w, _ = cv.sweep_12b('K1', '340_doc', tags, 0.03, 3.0, 0.01, 0.0)
         assert w[0] == 0.0 and w[1] in (29, 30)                                 # Codex HC1-5: +-0.4 m touches
     finally:
         cv.hs.PLACES['K1'] = old
-    n, w = cv.sweep_12b('K1', '340_doc', tags, 0.03, 3.0, 0.01, 0.0)
-    assert w[0] > 0.04 and n[1] == 30
+    n, w, gw = cv.sweep_12b('K1', '340_doc', tags, 0.03, 3.0, 0.01, 0.0)
+    assert w[0] > 0.04 and n[1] == 30 and w[0] <= gw[0]
+
+
+def test_continuous_placement_not_above_grid():
+    """HCC1-13: the continuous worst (local minimisation) is never above the grid worst, and for the real 32 tags
+    it finds a lower gap than the 5-point grid somewhere."""
+    tags = tags_or_skip(0.01)
+    lower = 0
+    for cho in ('goc', 'K1', 'K2'):
+        for hyp in cv.HYPS:
+            _, w, gw = cv.sweep_12b(cho, hyp, tags, 0.03, 3.0, 0.01, 0.002)
+            assert w[0] <= gw[0] + 1e-12
+            lower += w[0] < gw[0] - 1e-4
+    assert lower >= 1
+
+
+def test_E_exact_square_and_drift():
+    """HCC1-13: E gap is exact over the square of centre positions and shrinks by the E drift."""
+    tags = tags_or_skip(0.01)
+    _, w0, r = cv.sweep_E('K1', '340_doc', tags, 0.03, 0.02, 0.015, 0.0)
+    _, w1, _ = cv.sweep_E('K1', '340_doc', tags, 0.03, 0.02, 0.015, 0.010)
+    assert w1[0] <= w0[0] - 0.009
+    x0, y0, _ = cv.START['K1']
+    e = 0.045
+    brute = min(cv.disc_dist((x0 + dx, y0 + dy), r + 0.04, q) for q in tags.values()
+                for dx in np.linspace(-e, e, 31) for dy in np.linspace(-e, e, 31))
+    assert w0[0] <= brute + 1e-9 and w0[0] >= brute - 0.0035
 
 
 def test_vet_thuc_flags_a_pose_on_a_tag():
