@@ -722,8 +722,8 @@ def _fake_ck(monkeypatch, rows=None, exc=None, a6_exc=None):
             raise a6_exc
         return None if p is None else dict(sha256='x')
 
-    def chuoi_khung(frames_csv, a6, xoay, lan_lap=None, track=None):
-        seen['track'] = track
+    def chuoi_khung(frames_csv, a6, xoay, lan_lap=None, track=None, cho=None):
+        seen['track'], seen['cho'] = track, cho
         if exc:
             raise exc
         return rows
@@ -770,3 +770,46 @@ def test_frames_of_without_xoay_does_not_call_chain(tmp_path, monkeypatch):
         frames, track, a6, xoay = os.path.join(d, 'frames.csv'), os.path.join(d, 'track.json'), None, None
     F = ca.frames_of(A, None)
     assert F['chuoi'] == 'chan_doan' and 'track' not in seen
+
+
+def test_frames_chain_passes_cho_and_checks_pts(monkeypatch):
+    """HCC7-6 / CT2-10: the place is passed to CAM (xoay_v1 per place). HCC7-7: a frame with PTS NaN is not used
+    and the chain is not 'khoa'; PTS not increasing is not 'khoa' either."""
+    seen = _fake_ck(monkeypatch, rows=[_row(0), _row(1), _row(2)])
+    F = ca.frames_chain('f.csv', 'a6.json', 'xoay.json', cho='K1')
+    assert seen['cho'] == 'K1' and F['chuoi'] == 'khoa'
+    rows = [_row(0), _row(1), _row(2)]
+    rows[1]['t_cam'] = float('nan')
+    _fake_ck(monkeypatch, rows=rows)
+    F = ca.frames_chain('f.csv', 'a6.json', 'xoay.json', cho='K1')
+    assert F['ok'].tolist() == [True, False, True] and F['chuoi'] == 'chan_doan'
+    rows = [_row(0), _row(1), _row(2)]
+    rows[2]['t_cam'] = 0.05
+    _fake_ck(monkeypatch, rows=rows)
+    assert ca.frames_chain('f.csv', 'a6.json', 'xoay.json', cho='K1')['chuoi'] == 'chan_doan'
+
+
+def test_frames_basic_needs_tag_offset_zero_present(tmp_path):
+    """HCC7-8 (Codex): track.json without tag_offset was read as offset 0 (psi may not be the tag heading)."""
+    d, _ = make(tmp_path, cho='K2')
+    with open(os.path.join(d, 'track.json'), 'w') as f:
+        json.dump({}, f)
+    with pytest.raises(ca.AError):
+        ca.frames_basic(os.path.join(d, 'frames.csv'), os.path.join(d, 'track.json'))
+
+
+def test_read_e_hieu_refuses_diagnostic_f9(tmp_path):
+    """KCJ1-7: F9 'chan_doan' (KIEMCHEO writes e_hieu_m_chan_doan, no e_hieu_m) never unlocks u_map."""
+    body = dict(schema='c8_hc_doan_12b_v1', doan=[])
+    body['sha256'] = __import__('hashlib').sha256(json.dumps(body, ensure_ascii=False, sort_keys=True)
+                                                  .encode()).hexdigest()
+    dp = write_json(str(tmp_path / 'doan_12b_v1.json'), body)
+    ok = write_json(str(tmp_path / 'e_ok.json'), dict(doan_12b_sha256=body['sha256'], trang_thai='dat',
+                                                       doan=[dict(i=0, e_hieu_m=0.002)]))
+    assert ca.read_e_hieu(ok, dp)[0] == {0: 0.002}
+    for bad in (dict(trang_thai='chan_doan', doan=[dict(i=0, e_hieu_m_chan_doan=0.002)]),
+                dict(doan=[dict(i=0, e_hieu_m_chan_doan=0.002)]),
+                dict(trang_thai='chan_doan', doan=[dict(i=0, e_hieu_m=0.002)])):
+        p = write_json(str(tmp_path / 'e_bad.json'), dict(doan_12b_sha256=body['sha256'], **bad))
+        with pytest.raises(ca.AError):
+            ca.read_e_hieu(p, dp)

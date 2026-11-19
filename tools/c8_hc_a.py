@@ -527,8 +527,9 @@ def kiem(A, age_r_max_ms=125.0):
 def frames_basic(frames_csv, track_json):
     """Diagnostic chain: tag centre and raw tag heading of c7_measure track (tag_offset must be 0)."""
     tj = json.load(open(track_json, encoding='utf-8'))
-    if any(abs(float(v)) > 0 for v in tj.get('tag_offset', [0, 0, 0])):
-        raise AError(f'{track_json}: tag_offset {tj.get("tag_offset")} (track with tag_offset 0)')
+    off = tj.get('tag_offset')                       # HCC7-8: must be present and (0, 0, 0): psi is the tag heading
+    if not isinstance(off, (list, tuple)) or len(off) != 3 or any(abs(float(v)) > 0 for v in off):
+        raise AError(f'{track_json}: tag_offset {off} (track with tag_offset (0, 0, 0))')
     t, x, y, ps, ok, idx = [], [], [], [], [], []
     with open(frames_csv, newline='', encoding='utf-8') as f:
         for r in csv.DictReader(f):
@@ -544,7 +545,7 @@ def frames_basic(frames_csv, track_json):
     return F
 
 
-def frames_chain(frames_csv, a6, xoay, lan_lap=None, track=None):
+def frames_chain(frames_csv, a6, xoay, lan_lap=None, track=None, cho=None):
     """F1 of CAM when importable: frame_id, t_cam, p_x, p_y, psi_ma_p, cong_ok, a6_ok, q_ok, trang_thai.
     None (caller falls back to frames_basic, chain 'chan_doan') when CAM or C8B (c8b_a6) is not merged yet, when
     the chain refuses its inputs (ValueError: schema, track tag_offset), or when no frame has A6 AND q applied
@@ -552,19 +553,21 @@ def frames_chain(frames_csv, a6, xoay, lan_lap=None, track=None):
     A6 and q are all ok (cong_ok alone would let NaN centres through). 'khoa' needs every gated frame A6 + q ok."""
     try:
         import c7_chuoi_khung as ck                                       # CAM, after its merge
-        rows = ck.chuoi_khung(frames_csv, ck.doc_a6(a6), xoay, lan_lap=lan_lap, track=track)
+        rows = ck.chuoi_khung(frames_csv, ck.doc_a6(a6), xoay, lan_lap=lan_lap, track=track, cho=cho)
     except (ImportError, ValueError):
         return None
     if not rows:
         return None
-    cong = np.array([bool(r['cong_ok']) for r in rows])
-    full = cong & np.array([bool(r.get('a6_ok')) and bool(r.get('q_ok')) for r in rows])
+    t = np.array([float(r['t_cam']) for r in rows], float)
+    gated = np.array([bool(r['cong_ok']) for r in rows])
+    full = gated & np.isfinite(t) & np.array([bool(r.get('a6_ok')) and bool(r.get('q_ok')) for r in rows])
     if not full.any():
         return None
-    F = dict(idx=np.array([r['frame_id'] for r in rows]), t=np.array([r['t_cam'] for r in rows]),
+    F = dict(idx=np.array([r['frame_id'] for r in rows]), t=t,
              x=np.array([r['p_x'] for r in rows]), y=np.array([r['p_y'] for r in rows]),
              psi=np.array([r['psi_ma_p'] for r in rows]), ok=full)
-    F['chuoi'] = 'khoa' if bool(np.all(full[cong])) else 'chan_doan'
+    # HCC7-7: 'khoa' only when every gated frame has a finite PTS, A6 and q, and the PTS strictly increase
+    F['chuoi'] = 'khoa' if bool(np.all(full[gated])) and bool(np.all(np.diff(t[full]) > 0)) else 'chan_doan'
     return F
 
 
@@ -1074,7 +1077,8 @@ def cmd_kiem(a):
 def frames_of(a, A):
     F = None
     if a.a6 and a.xoay:
-        F = frames_chain(a.frames, a.a6, a.xoay, track=a.track)
+        F = frames_chain(a.frames, a.a6, a.xoay, track=a.track,
+                         cho=A['cho'] if A else getattr(a, 'cho', None))     # HCC7-6, CT2-10
     return F or frames_basic(a.frames, a.track)
 
 
@@ -1223,8 +1227,13 @@ def read_e_hieu(path, doan_path):
         raise AError(f'{doan_path}: sha256 noi dung khong khop (file da bi sua)')       # HCC2-5
     if j.get('doan_12b_sha256') not in (d.get('sha256'), sha256(doan_path)):
         raise AError(f'{path}: doan_12b_sha256 khac {doan_path}')
+    st = j.get('trang_thai')
+    if st is not None and st != 'dat':          # KCJ1-7: a diagnostic F9 never unlocks u_map
+        raise AError(f'{path}: F9 trang_thai {st!r} (chi nhan dat)')
     out = {}
     for x in j.get('doan', []):
+        if 'e_hieu_m_chan_doan' in x:
+            raise AError(f'{path}: F9 chi co e_hieu_m_chan_doan (chan doan, khong mo khoa u_map)')
         if 'i' not in x or 'e_hieu_m' not in x:
             raise AError(f'{path}: dong thieu i / e_hieu_m')
         out[int(x['i'])] = float(x['e_hieu_m'])
@@ -1293,7 +1302,7 @@ def cmd_tinh(a):
             continue
         F = None
         if a.a6 and a.xoay:
-            F = frames_chain(frames, a.a6, a.xoay, track=track)
+            F = frames_chain(frames, a.a6, a.xoay, track=track, cho=A['cho'])          # HCC7-6, CT2-10
         F = F or frames_basic(frames, track)
         try:
             an = analyse(A, F, info)

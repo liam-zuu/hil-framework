@@ -490,50 +490,31 @@ def test_e2e_real_logger_posix(tmp_path, ctrl_c):
 READY_COLS = ('timestamp_us', 'log_seq', 'motor_on', 'run_active', 'sp_vx', 'sp_vy', 'sp_wz', 'traj_age_ms')
 
 
-def write_raw(path, seqs, t0=100.0, step=0.01, tail=b''):
-    """<csv>.raw.jsonl as agv_logger writes it: one JSON per datagram, t_mono_ns at reception, b64 payload."""
-    import base64
-    import json
-    with open(path, 'wb') as f:
-        for k, s in enumerate(seqs):
-            line = f'{k},{s},1,1,0.000,0.000,0.000,10\n'.encode()
-            f.write(json.dumps(dict(t_mono_ns=round(t0 * 1e9) + k * round(step * 1e9), ip='1.2.3.4', port=1,
-                                    len=len(line),
-                                    b64=base64.b64encode(line).decode())).encode() + b'\n')
+def ready_rows(path, seqs, tail=''):
+    """Logger CSV with READY_COLS rows (timestamp_us = 10000 * i, log_seq from seqs), then raw text `tail`."""
+    with open(path, 'w', encoding='utf-8', newline='') as f:
+        f.write(','.join(READY_COLS) + '\n')
+        for i, s in enumerate(seqs):
+            f.write(f'{10000 * i},{s},1,1,0.000,0.000,0.000,10\n')
         f.write(tail)
 
 
 def test_ready_check_needs_a_moving_log(tmp_path):
-    """HCC2-1, HCC5-3, HCC5-4, HCC6-6: freshness from the logger receive time (not from when the file is read),
-    log_seq must advance and never go back, an unfinished last datagram line is ignored; integer ns."""
+    """HCC2-1, HCC5-4, HCC7-3: log_seq must advance between the two ready checks and never go back; an unfinished
+    last CSV line is ignored (not 'dong log hong')."""
     p = str(tmp_path / 'log.csv')
-    rows = lambda n: [(i, i, 1, 1, '0.000', '0.000', '0.000', 10) for i in range(n)]   # noqa: E731
-    write_log(p, rows(40), READY_COLS)
-    write_raw(p + '.raw.jsonl', range(40))                                      # newest received at 100.39 s
-    rc = hs.ReadyCheck(p, mono_ns=lambda: 100_450_000_000)
+    ready_rows(p, range(40))
+    rc = hs.ReadyCheck(p)
     assert rc() is None
-    assert 'chi tang' in rc()                                                   # same datagrams: the stream stopped
-    write_log(p, rows(80), READY_COLS)
-    write_raw(p + '.raw.jsonl', range(80))                                      # newest at 100.79 s
-    rc.mono_ns = lambda: 100_850_000_000
+    assert 'chi tang' in rc()                                                   # same rows: the stream stopped
+    ready_rows(p, range(80))
     assert rc() is None
-    rc.mono_ns = lambda: 101_200_000_000                                        # read late: still 0.41 s old
-    assert rc.deadline()[0] is None and 'log dung' in rc()
-    rc.mono_ns = lambda: 100_850_000_000
-    dl, age = rc.deadline()
-    assert dl == pytest.approx(100.79 + hs.READY_FRESH_S, abs=1e-9) and age == pytest.approx(0.06, abs=1e-9)
-    write_log(p, rows(80) + [(80, 50, 1, 1, '0.000', '0.000', '0.000', 10)], READY_COLS)   # log_seq back
-    write_raw(p + '.raw.jsonl', list(range(80)) + [50])
-    assert rc.deadline()[0] is None and 'lui' in rc.deadline()[1]
-    write_log(p, rows(80), READY_COLS)
-    write_raw(p + '.raw.jsonl', range(80), tail=b'{"t_mono_ns": 999000000000, "b64": "MTAx')   # unfinished line
-    assert rc.deadline()[1] == pytest.approx(0.06, abs=1e-9)
-    rc.mono_ns = lambda: 100_990_000_000                                        # exactly 200 ms: accepted
-    assert rc.deadline()[0] is not None
-    rc.mono_ns = lambda: 100_990_000_001
-    assert rc.deadline()[0] is None
-    rc.mono_ns = lambda: 100_780_000_000                                        # received in the future: refused
-    assert rc.deadline()[0] is None and 'tuoi log -' in rc.deadline()[1]
+    ready_rows(p, list(range(80)) + [50])                                       # max over the tail: still 79
+    assert 'chi tang' in rc()
+    ready_rows(p, range(30))                                                    # DUT reboot
+    assert 'lui' in rc()
+    ready_rows(p, range(120), tail='1200000,')                                  # the logger is writing a line
+    assert rc.max_row() == (119, 1190000)
 
 
 def test_late_sample_is_chosen_again_not_sent_twice():
@@ -706,24 +687,6 @@ def test_stall_jumping_into_motion_refuses_before_moving():
     assert all(p == (0.0, 0.0, 0.0) for p in sock.sent)
 
 
-def test_stale_log_at_first_motion_packet_refuses():
-    """HCC4-2 (Codex): the log stopped 190 ms before the last check; the first motion packet left 290 ms later."""
-    segs = hs.schedule('K2')
-
-    sock = FakeSock()
-    clock = FakeClock()
-
-    class R:
-        def __call__(self):
-            return None
-
-        def deadline(self):
-            return None, 'tuoi log 0.290 s'
-    with pytest.raises(hs.Abort) as ei:
-        hs.send_schedule('1.2.3.4', segs, sock, lambda s: None, clock, clock.sleep, lambda: 1.0e9, ready=R())
-    assert ei.value.why == 'log_cu' and all(p == (0.0, 0.0, 0.0) for p in sock.sent)
-
-
 def test_ctrl_c_right_after_first_motion_packet_is_moved():
     """HCC4-3 (Codex): Ctrl-C at the clock read right after the first motion sendto reported 'refused' (2)."""
     segs = hs.schedule('K2')
@@ -745,97 +708,158 @@ def test_ctrl_c_right_after_first_motion_packet_is_moved():
     assert ei.value.moved and k_move > 0
 
 
-# ------------------------------------------------------------------ Codex code review round 6 (HCC6-1..6)
-def raw_rec(t_ns, payload, ip='1.2.3.4'):
-    import base64
-    import json
-    data = payload.encode()
-    return json.dumps(dict(t_mono_ns=t_ns, ip=ip, port=1, len=len(data), b64=base64.b64encode(data).decode())) + '\n'
+# ------------------------------------------------------------------ Codex code review rounds 6-7 (HCC6, HCC7)
+class Clk:
+    def __init__(self, t=100.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
 
 
-def ready_log(tmp_path, n=40, extra_csv=(), extra_raw=''):
-    """CSV rows (ts = seq = i) the logger accepted, raw records at 100.00 + i*10 ms, then the extras."""
+def test_poll_deadline_only_when_the_accepted_log_grows(tmp_path):
+    """HCC7-1..3: freshness from the logger CSV (accepted rows) timed on the sender clock: a new largest log_seq
+    after a poll gives deadline = that poll + READY_FRESH_S; nothing else does."""
     p = str(tmp_path / 'log.csv')
-    write_log(p, [(i, i, 1, 1, '0.000', '0.000', '0.000', 10) for i in range(n)] + list(extra_csv), READY_COLS)
-    write_raw(p + '.raw.jsonl', range(n), tail=extra_raw.encode())
-    return p
+    rc, c = hs.ReadyCheck(p), Clk()
+    ready_rows(p, range(40))
+    assert rc.poll(c) is None                                                   # first poll: no earlier one
+    c.t = 100.02
+    ready_rows(p, range(42))
+    assert rc.poll(c) == pytest.approx(100.0 + hs.READY_FRESH_S)
+    c.t = 100.04
+    ready_rows(p, list(range(42)) + [41])                                       # repeated datagram written again
+    assert rc.poll(c) is None and 'khong tang' in rc.ly_do
+    c.t = 100.06
+    ready_rows(p, list(range(42)) + [41, 30])                                   # late copy of an old row
+    assert rc.poll(c) is None
+    c.t = 100.08
+    ready_rows(p, list(range(42)) + [41, 30], tail='4200000,42,1')              # row being written: not counted
+    assert rc.poll(c) is None
+    c.t = 100.10
+    ready_rows(p, list(range(42)) + [41, 30, 42])
+    assert rc.poll(c) == pytest.approx(100.08 + hs.READY_FRESH_S)
 
 
-def test_rejected_datagrams_do_not_make_the_log_fresh(tmp_path):
-    """HCC6-1 (Codex): another source, a multi-line payload or a bad type in raw.jsonl (logger rejected them) at
-    103.99 s made a log stopped at 103.71 s look 10 ms old. Only rows the logger accepted (its CSV) count."""
-    t = 100_670_000_000
-    for extra in (raw_rec(t, '40,40,1,1,0.000,0.000,0.000,10\n', ip='9.9.9.9'),
-                  raw_rec(t, '#x\n40,40,1,1,0.000,0.000,0.000,10\n'),
-                  raw_rec(t, '40,40,x,1,0.000,0.000,0.000,10\n')):
-        p = ready_log(tmp_path, extra_raw=extra)
-        rc = hs.ReadyCheck(p, mono_ns=lambda: t + 10_000_000)
-        dl, why = rc.deadline()
-        assert dl is None and 'tuoi log 0.290' in why
+def test_poll_bad_rows_and_reboot(tmp_path):
+    """HCC7-2: a badly typed row (logger would refuse it; here it is in the CSV) is skipped, no exception.
+    HCC7-3: a DUT reboot (log_seq back) is reported and never counts as fresh, even when the new boot grows."""
+    p = str(tmp_path / 'log.csv')
+    rc, c = hs.ReadyCheck(p), Clk()
+    ready_rows(p, range(40))
+    rc.poll(c)
+    c.t = 100.02
+    ready_rows(p, list(range(40)), tail='400000,inf,1,1,0.000,0.000,0.000,10\n')
+    assert rc.poll(c) is None
+    c.t = 100.04
+    ready_rows(p, range(35))                                                    # after a reboot: 0..34
+    assert rc.poll(c) is None and 'lui' in rc.ly_do
+    c.t = 100.06
+    ready_rows(p, range(37))
+    assert rc.poll(c) is None and 'lui' in rc.ly_do
 
 
-def test_repeated_datagram_does_not_refresh_a_stopped_stream(tmp_path):
-    """HCC6-2 (Codex): the row seq 39 received again 280 ms later (the logger writes it again as a duplicate)
-    made the age 10 ms; the first reception counts."""
-    t = 100_670_000_000
-    p = ready_log(tmp_path, extra_csv=[(39, 39, 1, 1, '0.000', '0.000', '0.000', 10)],
-                  extra_raw=raw_rec(t, '39,39,1,1,0.000,0.000,0.000,10\n'))
-    rc = hs.ReadyCheck(p, mono_ns=lambda: t + 10_000_000)
-    dl, why = rc.deadline()
-    assert dl is None and 'tuoi log 0.290' in why
-
-
-def test_big_unrelated_datagram_does_not_hide_the_newest_row(tmp_path):
-    """HCC6-5 (Codex): a 13 KiB datagram pushed the valid row out of the 16 KiB tail ('khong co dong du lieu')."""
-    p = ready_log(tmp_path, extra_raw=raw_rec(100_395_000_000, 'z' * 13000 + '\n', ip='9.9.9.9'))
-    rc = hs.ReadyCheck(p, mono_ns=lambda: 100_450_000_000)
-    dl, age = rc.deadline()
-    assert dl is not None and age == pytest.approx(0.06, abs=1e-9)
-
-
-def test_csv_row_without_raw_record_yet_uses_the_row_before(tmp_path):
-    """Raw is written before the CSV but the files are flushed one after the other: the last CSV row may have no raw
-    record yet; the row before it is used (older, never fresher)."""
-    p = ready_log(tmp_path, extra_csv=[(40, 40, 1, 1, '0.000', '0.000', '0.000', 10)])
-    rc = hs.ReadyCheck(p, mono_ns=lambda: 100_450_000_000)
-    assert rc.deadline()[1] == pytest.approx(0.06, abs=1e-9)
-
-
-class DeadlineReady:
-    """ready() passes; deadline() as ReadyCheck on the fake clock: data `age` s old at the read, `lag` s to read."""
-    def __init__(self, clock, age, lag=0.0):
-        self.clock, self.age, self.lag, self.calls = clock, age, lag, 0
+class PollReady:
+    """ready() passes; poll() as ReadyCheck on the fake clock: grows (deadline previous poll + 0.2 s) or not, `lag`
+    s per read, or a fixed absolute deadline."""
+    def __init__(self, clock, grow=True, lag=0.0, fixed=None):
+        self.clock, self.grow, self.lag, self.fixed = clock, grow, lag, fixed
+        self.t_prev, self.calls, self.ly_do = None, 0, 'log khong tang'
 
     def __call__(self):
         return None
 
-    def deadline(self):
+    def poll(self, clock):
         self.calls += 1
+        t = clock()
         self.clock.t += self.lag
-        return self.clock.t - self.age + hs.READY_FRESH_S, self.age
+        dl = None
+        if self.fixed is not None:
+            dl = self.fixed
+        elif self.grow and self.t_prev is not None:
+            dl = self.t_prev + hs.READY_FRESH_S
+        self.t_prev = t
+        return dl
 
 
-def test_freshness_deadline_is_checked_at_the_first_motion_send():
-    """HCC6-3 (Codex): data 195 ms old at the check, the first motion packet left when it was 204 ms old."""
+def test_stale_log_at_first_motion_packet_refuses():
+    """HCC4-2, HCC7: the log does not grow in the polls before the first motion packet: refused, nothing moved."""
     segs = hs.schedule('K2')
+    clock = FakeClock()
+    sock = FakeSock()
+    out = []
+    with pytest.raises(hs.Abort) as ei:
+        hs.send_schedule('1.2.3.4', segs, sock, out.append, clock, clock.sleep, lambda: 1.0e9,
+                         ready=PollReady(clock, grow=False))
+    assert ei.value.why == 'log_cu' and not ei.value.moved and all(p == (0.0, 0.0, 0.0) for p in sock.sent)
+    assert any(ln.startswith('#log_moi_truoc_goi_dong,ket_qua=hong') for ln in out)
+
+
+def test_nominal_polls_then_motion():
+    """The polls run after the last zeros; a growing log lets the schedule run to the end."""
+    segs = hs.schedule('K2')
+    clock = FakeClock()
+    rd = PollReady(clock)
+    out = []
+    r = hs.send_schedule('1.2.3.4', segs, FakeSock(), out.append, clock, clock.sleep, lambda: 1.0e9, ready=rd)
+    assert r['complete'] == 1 and rd.calls == hs.FRESH_POLL_K + 1
+    assert any(ln.startswith('#log_moi_truoc_goi_dong,ket_qua=dat') for ln in out)
+
+
+def test_slow_poll_does_not_refuse_a_nominal_attempt():
+    """HCC6-3, HCC7-4 (Codex): a 24 ms read in the cell of the first motion packet refused the attempt; the polls
+    now run in the wait after a zero, and a slower read than the wait still only refuses (code 2, nothing moved)."""
+    segs = hs.schedule('K2')
+    clock = FakeClock()
+    r = hs.send_schedule('1.2.3.4', segs, FakeSock(), lambda s: None, clock, clock.sleep, lambda: 1.0e9,
+                         ready=PollReady(clock, lag=0.012))
+    assert r['complete'] == 1
     clock = FakeClock()
     sock = FakeSock()
     with pytest.raises(hs.Abort) as ei:
         hs.send_schedule('1.2.3.4', segs, sock, lambda s: None, clock, clock.sleep, lambda: 1.0e9,
-                         ready=DeadlineReady(clock, 0.195))
-    assert ei.value.why == 'log_cu' and not ei.value.moved and all(p == (0.0, 0.0, 0.0) for p in sock.sent)
+                         ready=PollReady(clock, lag=0.045))
+    assert not ei.value.moved and all(p == (0.0, 0.0, 0.0) for p in sock.sent)
 
 
-def test_slow_freshness_read_does_not_refuse_a_nominal_attempt():
-    """HCC6-3 (Codex): a 24 ms read in the cell of the first motion packet jumped to k=201 and refused the attempt;
-    the read now runs in the wait after the last zero."""
+def test_deadline_passed_inside_the_first_motion_sendto_is_not_complete():
+    """HCC7-4 (Codex): preempted 2 ms between the last clock read and the syscall, the first motion packet left
+    after the freshness deadline and the attempt was reported complete=1; now it aborts (zeros, complete=0)."""
     segs = hs.schedule('K2')
+    k_move = hs.first_motion_k(segs)
     clock = FakeClock()
-    rd = DeadlineReady(clock, 0.02, lag=0.024)
-    r, err, out, sock = None, None, [], FakeSock()
-    r = hs.send_schedule('1.2.3.4', segs, sock, out.append, clock, clock.sleep, lambda: 1.0e9, ready=rd)
-    assert r['complete'] == 1 and rd.calls == 1
-    assert any(ln.startswith('#log_moi_truoc_goi_dong,cu_s=0.020') for ln in out)
+    dl = clock.t + k_move * hs.DT + 0.001                                       # just after the first motion check
+    sock = TimedSock(clock, delay={k_move: 0.002})
+    out = []
+    with pytest.raises(hs.Abort) as ei:
+        hs.send_schedule('1.2.3.4', segs, sock, out.append, clock, clock.sleep, lambda: 1.0e9,
+                         ready=PollReady(clock, fixed=dl))
+    assert ei.value.why == 'log_cu' and ei.value.moved and ei.value.kv.get('sau_gui') == 1
+    assert any('complete=0' in ln for ln in out)
+
+
+def test_sigint_handler_restored_when_interrupted_while_set(monkeypatch):
+    """HCC7-5 (Codex): Ctrl-C right after SIG_IGN was set, before signal.signal() returned: the old handler was
+    never restored and SIGINT stayed ignored."""
+    import signal as sg
+    real = sg.signal
+    before = sg.getsignal(sg.SIGINT)
+    calls = {'n': 0}
+
+    def flaky(sig, h):
+        calls['n'] += 1
+        r = real(sig, h)
+        if calls['n'] == 1:
+            raise KeyboardInterrupt
+        return r
+    monkeypatch.setattr(hs.signal, 'signal', flaky)
+    try:
+        sock = FakeSock()
+        n = hs._abort_zeros('1.2.3.4', sock, lambda d: None)
+        assert n == int(round(hs.ABORT_ZERO_S * hs.SEND_HZ))
+        assert sg.getsignal(sg.SIGINT) == before
+    finally:
+        real(sg.SIGINT, before)
 
 
 @pytest.mark.parametrize('where', ['settimeout', 'sendto'])

@@ -42,7 +42,6 @@ sender (pgrep snapshot + lock; a sender started after the check that does not ta
 from __future__ import annotations
 
 import argparse
-import base64
 import hashlib
 import io
 import json
@@ -75,10 +74,7 @@ BUDGET_MIN_S = 0.001               # less time left than this inside the 100 ms 
 # residual (HCC5-1): the process can still be preempted between the last clock read and the sendto syscall; the
 # gap is then checked right after the sendto (abort) and the firmware 200 ms timeout stays the last stop
 READY_FRESH_S = 0.20               # newest log row at most this old at the first motion packet (HCC4-2)
-READY_FRESH_NS = 200_000_000       # the same in integer ns (HCC6-6)
-RAW_SCAN0 = 16384                  # first raw.jsonl window read backwards (HCC6-5), x4 up to RAW_SCAN_MAX
-RAW_SCAN_MAX = 1 << 20
-RAW_REORDER_SEQ = 50               # a row's first reception is after every record this many samples older (1 s)
+FRESH_POLL_K = 10                  # polls of the logger CSV after the last zeros before the first motion (HCC7)
 READY_ROWS = 20                    # logger rows (~0.2 s at 10 ms) that must show a ready car
 READY_PRIME_K = 25                 # first ready check 0.5 s before the final one; the log must advance between
 READY_ADVANCE = 25                 # log_seq rows the stream must add between the two checks (~50 expected)
@@ -257,20 +253,17 @@ def send_schedule(ip, segs, sock, out, clock=time.monotonic, sleep=time.sleep, w
     t0 = clock()
     last_chk = last_done = None
 
-    def fresh():
-        """HCC4-2, HCC6-3: ready.deadline() -> (deadline on the clock of `clock` (CLOCK_MONOTONIC on the Pi), age)
-        or (None, reason); kept relative to t0 for the check before the first motion sendto."""
-        fr = getattr(ready, 'deadline', None)
-        if not callable(fr):
-            st['fresh_until'] = math.inf
-            return
-        dl, info = fr()
-        if dl is None:
-            why = str(info).replace(',', ';')
+    poll = getattr(ready, 'poll', None)
+    if not callable(poll):
+        st['fresh_until'] = math.inf                     # no logger to watch (tests without ready)
+
+    def fresh_until():
+        """HCC7-1..4: the freshness deadline (relative to t0) the polls gave, or Abort('log_cu')."""
+        if st['fresh_until'] is None:
+            why = str(getattr(ready, 'ly_do', '') or 'chua thay log tang').replace(',', ';')
             buf.append(f'#log_moi_truoc_goi_dong,ket_qua=hong,ly_do={why}')
             raise Abort('log_cu', k=st['k'], ly_do=why)
-        st['fresh_until'] = dl - t0
-        buf.append(f'#log_moi_truoc_goi_dong,cu_s={info:.3f},han_s={dl - t0:.6f}')
+        return st['fresh_until']
     try:
         while True:
             now = clock() - t0
@@ -317,10 +310,6 @@ def send_schedule(ip, segs, sock, out, clock=time.monotonic, sleep=time.sleep, w
             else:
                 vx = vy = wz = 0.0
             pkt = pack_packet(vx, vy, wz)
-            if k >= k_move and not st['moved'] and st['fresh_until'] is None:
-                # fallback only (k_move = 0): the freshness is normally read right after the sendto of k_move - 1
-                fresh()
-                continue                                  # read the clock again after the file read
             # HCC3-2: never closer than DT/2 to the END of the previous sendto (a packet leaves at the latest when
             # sendto returns), so two packets cannot go out together even when a sendto blocked
             if last_done is not None:
@@ -337,10 +326,12 @@ def send_schedule(ip, segs, sock, out, clock=time.monotonic, sleep=time.sleep, w
                 # read and the sendto; the bound is checked again from the clock after the sendto
                 st['gap_max'] = max(st['gap_max'], chk - last_chk)
                 raise Abort('tre_gui', k=k, gap_ms=f'{(chk - last_chk) * 1000:.1f}')
-            if k >= k_move and not st['moved']:
-                if chk > st['fresh_until']:
-                    # HCC6-3: the absolute freshness deadline, checked at the last clock read before the sendto
-                    raise Abort('log_cu', k=k, qua_han_ms=f"{(chk - st['fresh_until']) * 1000:.1f}")
+            first_move = k >= k_move and not st['moved']
+            if first_move:
+                fu = fresh_until()
+                if chk > fu:
+                    # HCC6-3: the freshness deadline, checked at the last clock read before the sendto
+                    raise Abort('log_cu', k=k, qua_han_ms=f'{(chk - fu) * 1000:.1f}')
                 st['moved'] = True                       # HCC4-3: set BEFORE the first motion sendto
             try:
                 sock.sendto(pkt, (ip, TRAJ_PORT))
@@ -355,6 +346,10 @@ def send_schedule(ip, segs, sock, out, clock=time.monotonic, sleep=time.sleep, w
                 st['gap_max'] = max(st['gap_max'], ub)
                 if ub > GAP_ABORT_S:
                     raise Abort('tre_gui', k=k, gap_ms=f'{ub * 1000:.1f}')
+            if first_move and done > st['fresh_until']:
+                # HCC7-4: preempted between the last clock read and the syscall: the packet may have left after
+                # the deadline -> abort (zeros, complete=0), never reported complete
+                raise Abort('log_cu', k=k, qua_han_ms=f"{(done - st['fresh_until']) * 1000:.1f}", sau_gui=1)
             last_chk, last_done = chk, done
             if k == 0:
                 st['first_s'] = chk
@@ -364,10 +359,18 @@ def send_schedule(ip, segs, sock, out, clock=time.monotonic, sleep=time.sleep, w
             st['k'] = k + 1
             if st['k'] >= total:
                 break
-            if st['k'] == k_move and not st['moved'] and st['fresh_until'] is None:
-                # HCC6-3: read the freshness in the wait after the last zero, not inside the cell of the first
-                # motion packet; the deadline it gives is checked again just before that sendto
-                fresh()
+            if callable(poll) and not st['moved'] and k_move - FRESH_POLL_K <= st['k'] <= k_move:
+                # HCC7-1..4: after each of the last zeros, one short read of the logger CSV tail in the wait (not
+                # in the cell of a packet); when the largest accepted log_seq grew, the new row was written after
+                # the previous poll, so it is at most (now - that poll) old: deadline = that poll + READY_FRESH_S
+                dl = poll(clock)
+                if dl is not None:
+                    st['fresh_until'] = dl - t0
+                    st['n_moi'] = st.get('n_moi', 0) + 1
+                if st['k'] == k_move:
+                    buf.append(f"#log_moi_truoc_goi_dong,ket_qua={'dat' if st['fresh_until'] is not None else 'hong'},"
+                               f"lan_tang={st.get('n_moi', 0)},han_s="
+                               + ('' if st['fresh_until'] is None else f"{st['fresh_until']:.6f}"))
             wait = t0 + st['k'] * DT - clock()
             if wait > 0:
                 sleep(wait)
@@ -406,12 +409,13 @@ def _abort_zeros(ip, sock, sleep):
     alone sets blocking with a timeout in one call; a failed setting still tries every zero."""
     unset = object()
     old = unset
-    try:
-        old = signal.signal(signal.SIGINT, signal.SIG_IGN)
-    except (ValueError, OSError, KeyboardInterrupt):      # not the main thread / Ctrl-C before the handler was set
-        pass
     n_ok = 0
     try:
+        try:
+            old = signal.getsignal(signal.SIGINT)         # HCC7-5: saved BEFORE the change, restored in finally
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+        except (ValueError, OSError, KeyboardInterrupt):  # not the main thread / Ctrl-C while setting it
+            pass
         try:
             sock.settimeout(SENDTO_MAX_S)
         except (AttributeError, OSError, ValueError, KeyboardInterrupt):
@@ -430,7 +434,7 @@ def _abort_zeros(ip, sock, sleep):
         if old is not unset:
             try:
                 signal.signal(signal.SIGINT, signal.default_int_handler if old is None else old)
-            except (ValueError, OSError):
+            except (ValueError, OSError, KeyboardInterrupt):
                 pass
     return n_ok
 
@@ -487,7 +491,10 @@ def _tail_rows(path, nbytes=16384):
         f.seek(0, os.SEEK_END)
         size = f.tell()
         f.seek(max(0, size - nbytes))
-        tail = f.read().decode('utf-8', 'replace').splitlines()
+        raw = f.read()
+    tail = raw.decode('utf-8', 'replace').splitlines()
+    if raw and not raw.endswith(b'\n'):
+        tail = tail[:-1]                                 # HCC7-3: the logger is still writing the last line
     if size > nbytes:
         tail = tail[1:]                                  # first line may be cut
     rows = [ln.strip() for ln in tail if ln.strip() and not ln.startswith('#') and ln.strip() != head]
@@ -526,7 +533,7 @@ def car_ready(csv_path, n=READY_ROWS):
 
 
 def _int(v):
-    """A CSV / payload cell as an int ('12' or '12.0'); ValueError otherwise."""
+    """A CSV cell as an int ('12' or '12.0'); ValueError / OverflowError otherwise."""
     try:
         return int(v)
     except ValueError:
@@ -534,103 +541,70 @@ def _int(v):
 
 
 class ReadyCheck:
-    """car_ready() called twice before the first motion packet (HCC2-1), plus the freshness of the data stream on
-    the logger's own receive time (HCC5-3). HCC6-1, HCC6-2: the sample is the newest row the logger ACCEPTED (its
-    CSV: rows from another source, multi-line or badly typed datagrams never get there), and its time is the FIRST
-    reception of that row (log_seq and timestamp_us) in <csv>.raw.jsonl (t_mono_ns = time.monotonic_ns() at
-    reception, same CLOCK_MONOTONIC as this process on the Pi), so a datagram that arrives again later does not make
-    a stopped stream fresh. HCC6-5: the raw file is scanned backwards in growing windows until a data record more
-    than RAW_REORDER_SEQ samples older (the first reception cannot be before it), up to RAW_SCAN_MAX; out of
-    window is its own reason. HCC6-6: ages in integer ns, 0 <= age <= READY_FRESH_NS (a receive time in the future
-    is refused). No background thread (HCC5-5)."""
-    def __init__(self, csv_path, clock=time.time, mono_ns=time.monotonic_ns):
-        self.csv, self.raw, self.clock, self.mono_ns = csv_path, csv_path + '.raw.jsonl', clock, mono_ns
-        self.seq = None
+    """car_ready() called twice before the first motion packet (HCC2-1) with log_seq advancing between them, and
+    the freshness of the data stream by poll() (HCC7-1..3), on rows the logger ACCEPTED only (its CSV: datagrams
+    from another source, multi-line or badly typed never get there; complete lines only), timed with the sender's
+    own clock: when the largest log_seq of the CSV tail grows between two polls, the new row was written after the
+    earlier poll began, so it is at most (now - that poll) old. No raw.jsonl and no receive time of another process:
+    a repeated datagram never raises the largest log_seq, a DUT reboot (log_seq back) never counts as fresh and is
+    reported. agv_logger writes the CSV row right after recvfrom of that datagram (main loop), so the bound holds for
+    the logger receive time up to the processing of one datagram. Assumes rows arrive in log_seq order within the
+    tail window (a row with a larger log_seq older than the whole window is not seen)."""
+    def __init__(self, csv_path, nbytes=8192):
+        self.csv, self.nbytes = csv_path, nbytes
+        self.seq = None                     # largest log_seq at the last ready check
+        self.max_seq = None                 # largest log_seq seen by poll()
+        self.t_prev = None                  # clock() at the start of the previous poll
+        self.lui = False
+        self.ly_do = ''
 
-    def _first_rx_ns(self, seq, ts, ncols, ix_s, ix_t):
-        """t_mono_ns of the first reception of the data row (seq, ts), or the reason (str)."""
-        nb = RAW_SCAN0
-        while True:
-            try:
-                with open(self.raw, 'rb') as f:
-                    f.seek(0, os.SEEK_END)
-                    size = f.tell()
-                    f.seek(max(0, size - nb))
-                    buf = f.read()
-            except OSError as exc:
-                return f'raw.jsonl: {exc}'
-            cut = size > nb
-            lines = buf.split(b'\n')
-            lines = lines[1:-1] if cut else lines[:-1]            # a cut first line, the unfinished tail
-            best, stop = None, False
-            for ln in reversed(lines):
-                try:
-                    r = json.loads(ln)
-                    t = int(r['t_mono_ns'])
-                    txt = base64.b64decode(r['b64']).decode('utf-8')
-                except (ValueError, KeyError, TypeError, UnicodeDecodeError):
-                    continue
-                txt = txt.rstrip('\r\n')
-                if '\n' in txt or '\r' in txt or txt.startswith('#'):
-                    continue
-                g = txt.split(',')
-                if len(g) != ncols:
-                    continue
-                try:
-                    s, u = _int(g[ix_s]), _int(g[ix_t])
-                except ValueError:
-                    continue
-                if s == seq and u == ts:
-                    best = t if best is None else min(best, t)
-                elif s < seq - RAW_REORDER_SEQ:
-                    stop = True
-                    break
-            if stop or not cut:
-                return best if best is not None else f'raw.jsonl: khong thay goi cua log_seq {seq}'
-            if nb >= RAW_SCAN_MAX:
-                return f'raw.jsonl: het gioi han quet {RAW_SCAN_MAX} B'
-            nb = min(nb * 4, RAW_SCAN_MAX)
-
-    def newest(self):
-        """(t_rx_ns, log_seq) of the newest accepted data row at its first reception, or the reason (str). The raw
-        record is written before the CSV row, but the files are flushed one after the other: when the last row has
-        no raw record yet, the row before it is used (older, so never fresher than the truth)."""
+    def max_row(self, nbytes=None):
+        """(largest log_seq, its timestamp_us) over the complete data rows of the CSV tail, or the reason (str)."""
         try:
-            cols, rows = _tail_rows(self.csv)
+            cols, rows = _tail_rows(self.csv, nbytes or self.nbytes)
             ix_s, ix_t = cols.index('log_seq'), cols.index('timestamp_us')
         except OSError as exc:
             return f'log: {exc}'
         except ValueError:
             return 'log thieu cot log_seq/timestamp_us'
-        if not rows:
-            return 'log: chua co dong du lieu'
-        why = 'log: chua co dong du lieu'
-        for ln in rows[-1:-3:-1]:
+        best = None
+        for ln in rows:
             f_ = ln.split(',')
+            if len(f_) != len(cols):
+                continue
             try:
-                seq, ts = _int(f_[ix_s]), _int(f_[ix_t])
-            except (ValueError, IndexError):
-                return 'dong log hong'
-            t = self._first_rx_ns(seq, ts, len(cols), ix_s, ix_t)
-            if not isinstance(t, str):
-                return t, seq
-            why = t
-        return why
+                s, u = _int(f_[ix_s]), _int(f_[ix_t])
+            except (ValueError, OverflowError):
+                continue
+            if best is None or s > best[0]:
+                best = (s, u)
+        return best if best is not None else 'log: chua co dong du lieu'
 
-    def deadline(self):
-        """(deadline [s, CLOCK_MONOTONIC], age [s]) for the first motion packet: the newest accepted row must be at
-        most READY_FRESH_S old when that packet leaves; or (None, reason). log_seq must not go back from the last
-        ready check."""
-        n = self.newest()
-        if isinstance(n, str):
-            return None, n
-        t_rx, seq = n
-        if self.seq is not None and seq < self.seq:
-            return None, f'log_seq lui {self.seq}->{seq}'
-        age = self.mono_ns() - t_rx
-        if not 0 <= age <= READY_FRESH_NS:
-            return None, f'tuoi log {age / 1e9:.3f} s (gio nhan cua logger)'
-        return (t_rx + READY_FRESH_NS) * 1e-9, age * 1e-9
+    def poll(self, clock):
+        """One short read of the CSV tail. Returns the freshness deadline [s, on `clock`] when the largest log_seq
+        grew since the previous poll (previous poll start + READY_FRESH_S), else None (reason in ly_do)."""
+        t = clock()
+        m = self.max_row()
+        dl = None
+        if isinstance(m, str):
+            self.ly_do = m
+        else:
+            if self.max_seq is not None and self.t_prev is not None:
+                if m[0] > self.max_seq:
+                    dl = self.t_prev + READY_FRESH_S
+                elif m[0] < self.max_seq:
+                    self.lui = True
+                    self.ly_do = f'log_seq lui {self.max_seq}->{m[0]} (DUT khoi dong lai?)'
+                elif not self.lui:
+                    self.ly_do = f'log khong tang tu lan doc truoc (log_seq {m[0]})'
+            if self.seq is not None and m[0] < self.seq:
+                self.lui = True
+                self.ly_do = f'log_seq lui {self.seq}->{m[0]} (DUT khoi dong lai?)'
+            if self.lui:
+                dl = None                   # a reboot before the motion: the attempt is refused, reason kept
+            self.max_seq = m[0] if self.max_seq is None else max(self.max_seq, m[0])
+        self.t_prev = t
+        return dl
 
     def close(self):
         pass
@@ -639,17 +613,14 @@ class ReadyCheck:
         why = car_ready(self.csv)
         if why is not None:
             return why
-        n = self.newest()
-        if isinstance(n, str):
-            return n
-        age = self.mono_ns() - n[0]
-        if not 0 <= age <= READY_FRESH_NS:
-            return f'log dung {age / 1e9:.3f} s (gio nhan cua logger)'
-        prev, self.seq = self.seq, n[1]
-        if prev is not None and n[1] < prev:
-            return f'log_seq lui {prev}->{n[1]}'
-        if prev is not None and n[1] - prev < READY_ADVANCE:
-            return f'log_seq chi tang {n[1] - prev}'
+        m = self.max_row()
+        if isinstance(m, str):
+            return m
+        prev, self.seq = self.seq, m[0]
+        if prev is not None and m[0] < prev:
+            return f'log_seq lui {prev}->{m[0]} (DUT khoi dong lai?)'
+        if prev is not None and m[0] - prev < READY_ADVANCE:
+            return f'log_seq chi tang {m[0] - prev}'
         return None
 
 
