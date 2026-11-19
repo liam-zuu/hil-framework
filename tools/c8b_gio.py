@@ -29,10 +29,15 @@ consecutive line pairs of the log window valid, a log hole above LOG_HOLE_S (100
 checks of section 3: a channel fit not ok (correlation, start / end thirds, o1_time_sync limits), L > U~, the
 start-up estimate not meeting the scoring interval, and, with a C8 lock file, the width U~ - L or the gyro - RV
 difference outside the range of the C8 runs of the same level (at C8 itself only the first two). No finite clock
-bound (ket_luan chua_ket_luan: G1-G5 not concluded; design 7): reset_n not constant, g_valid or r_valid 0 in the log
+bound (ket_luan chua_ket_luan: G1-G5 not concluded; design 7): reset_n not constant (the IMU chip reset count,
+AGV logger.c 147 / main.c 299, NOT a firmware boot: the IMU report counters restart; the scorer loses the run to the
+command path, J v6 5 (1)), g_valid or r_valid 0 in the log
 window, a lock file without the range of the level (no negative age limit: J v6 J4-14, item 12(f); the ages
 are recorded only). F11 (design C8B v7 section 7a): kiem_gio_d1 / cap_dem / ho_log split the lost-run reasons;
-M2 (J v6 J5-9): kiem_gio_d1.truoc_boot and dem_truot_kiem_gio say whether a failed clock check counts. Refused
+M2 (J v6 J5-9): kiem_gio_d1.truoc_boot and dem_truot_kiem_gio say whether a failed clock check counts; the operator
+kinds (boot, khoa_sieu_am, loi_nap_gain) come from ONE source, the scorer's score.json of the run (--score, field
+thao_tac; CODE 19/11, CT3-6). The log rows are of one boot (times increase), so the time of a boot is not in them:
+t_boot_log_s null, du_cua_so false, a run with a boot does not count (J5-9: no independent evidence). Refused
 (exit 2): duplicate log lines not marked by the logger segments file (a repeated log_seq, L92), a log_seq jump in the
 run window (o1_time_sync.log_window), times not increasing.
 Start-up check (F5; C8B4R2-3; a consistency check only, never narrows the interval): from standstill, over the
@@ -527,7 +532,7 @@ def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S, thao_ta
     kiem['reset_n_const'] = len(rn) == 1
     kiem['g_valid_all'] = all(rows[k]['g_valid'] == '1' for k in np.flatnonzero(inw))
     kiem['r_valid_all'] = all(rows[k]['r_valid'] == '1' for k in np.flatnonzero(inw))
-    for k_, what in (('reset_n_const', 'reset_n changes in the log window'),
+    for k_, what in (('reset_n_const', 'reset_n (IMU chip resets) changes in the log window'),
                      ('g_valid_all', 'g_valid = 0 in the log window'), ('r_valid_all', 'r_valid = 0 in the log window')):
         if not kiem[k_]:
             fails.append(what)
@@ -537,10 +542,10 @@ def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S, thao_ta
     kiem['n_age_neg'] = int(np.sum(ag < 0))
     # J v6 section 5 (J4-14, item 12(f)): no negative age limit any more; an invalid IMU sample is told by the flags of
     # the same row (r_valid, g_valid above), not by the age value. The ages are recorded only.
-    # first change of reset_n inside the log window: a firmware restart (boot) during the run (J v6 M2, J5-9)
-    rn_w = [rows[k]['reset_n'] for k in np.flatnonzero(inw)]
-    tw = tl[inw]
-    kiem['t_boot_log_s'] = next((float(tw[j]) for j in range(1, len(rn_w)) if rn_w[j] != rn_w[j - 1]), None)
+    # J v6 M2, J5-9: the time of a firmware boot in the log. reset_n is the IMU chip reset count, not a boot (CODE
+    # 19/11; the previous code took its change for a boot, an error of ours). The rows read here are of one boot (times
+    # increase, read_log), so no boot time is in them: null (a boot comes from the scorer's thao_tac only)
+    kiem['t_boot_log_s'] = None
     tm, rate, br, pair_ok, ip = count_pairs(rows, tl)
     pw = inw[1:] & inw[:-1]
     kiem['pairs_window'] = int(pw.sum())
@@ -677,6 +682,22 @@ def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S, thao_ta
 THAO_TAC = ('boot', 'khoa_sieu_am', 'loi_nap_gain')    # J v6 section 5: runs lost to an operation
 
 
+def score_thao_tac(score_path, log_path):
+    """The operator kinds of the run from the scorer's score.json (c7_score relative mode: thao_tac [kinds], absent
+    when none; esp32_sha256 must be the log given). Returns (kinds, {file, sha256})."""
+    cu.check_path(score_path)
+    with open(score_path, encoding='utf-8') as f:
+        sc = json.load(f)
+    if not isinstance(sc, dict):
+        raise GioError(f'{score_path}: not a score.json')
+    if sc.get('esp32_sha256') != cu.sha256(log_path):
+        raise GioError(f'{score_path}: esp32_sha256 is not the log given: the score of another run')
+    tt = sc.get('thao_tac') or []
+    if not isinstance(tt, list) or any(x not in THAO_TAC for x in tt):
+        raise GioError(f'{score_path}: thao_tac {tt!r}: kinds must be in {THAO_TAC} (CODE 19/11, CT3-6)')
+    return tuple(tt), dict(file=os.path.abspath(score_path), sha256=cu.sha256(score_path))
+
+
 def f11(out, kenh, kiem, loai, fails, khoa, cw, thao_tac=()):
     """c8b_gio_v1 F11 blocks (design C8B v7 section 7a; O1 v11.37 D1 line 342: the per-run clock check is only
     L <= U~, every channel matched, and the C8 range of the level). ket_luan is kept for compatibility.
@@ -694,18 +715,20 @@ def f11(out, kenh, kiem, loai, fails, khoa, cw, thao_tac=()):
         st = 'khong_kiem'               # no data to check, or a lock file without the C8 range of the level
     else:
         st = 'dat'
-    t_boot = kiem.get('t_boot_log_s')
-    co_boot = t_boot is not None
-    du = bool(co_boot and cw is not None and cw[1] < t_boot)       # the whole check window lies before the boot
-    truoc = dict(co_boot=co_boot, t_boot_log_s=t_boot, du_cua_so=du,
-                 trang_thai=(st if du else 'khong_kiem') if co_boot else None)
-    # CODE 19/11 (J v6 section 5 'do thao tac' + M2, J5-9): a run lost to ANY operation (boot found in the log, or a
-    # sonar lock / gain load error the caller gives) does not count, except a boot whose check failed on the rows
-    # before it over its whole window
-    tt = sorted(set(thao_tac) | ({'boot'} if co_boot else set()))
+    # CODE 19/11 (J v6 section 5 'do thao tac' + M2, J5-9; CT3-6): the operator kinds of the run come from the
+    # scorer's score.json only (thao_tac); a run lost to ANY operation does not count, except a boot whose check failed
+    # on the rows before it over its whole window (needs the boot time in the log: t_boot_log_s)
+    tt = sorted(set(thao_tac))
     bad_tt = [x for x in tt if x not in THAO_TAC]
     if bad_tt:
         raise GioError(f'unknown operation {bad_tt}: one of {THAO_TAC}')
+    co_boot = 'boot' in tt
+    t_boot = kiem.get('t_boot_log_s') if co_boot else None
+    du = bool(co_boot and t_boot is not None and cw is not None and cw[1] < t_boot)   # whole window before the boot
+    truoc = dict(co_boot=co_boot, t_boot_log_s=t_boot, du_cua_so=du,
+                 trang_thai=(st if du else 'khong_kiem') if co_boot else None)
+    if co_boot and t_boot is None:
+        truoc['ly_do'] = 'thoi diem boot khong co trong log (dong log cua mot boot): khong phai bang chung doc lap'
     truoc['thao_tac'] = tt
     dem = st == 'truot' and (not tt or (co_boot and du and truoc['trang_thai'] == 'truot'))
     return dict(
@@ -744,15 +767,21 @@ def main(argv=None):
                     help='the preliminary clock file the reference window (cua_so_v1, F2) was built from; its SHA-256 is '
                          'written as luoi_so_bo_sha256 so that the window stays tied to this final file (CAM CT2-7)')
     ap.add_argument('--cua-so', default=None, help='cua_so_v1 file built from --so-bo (SHA-256 written as cua_so_v1_sha256)')
-    ap.add_argument('--thao-tac', action='append', choices=THAO_TAC,
-                    help='the run is lost to this operation (rq3_log facts; boot is also found from reset_n)')
+    ap.add_argument('--score', default=None,
+                    help="the scorer's score.json of this run (any node; c7_score): its thao_tac is the one source of "
+                         'the operator kinds (CODE 19/11, CT3-6); needed for the final file (--so-bo)')
     a = ap.parse_args(argv)
     try:
         khoa = None
         if a.khoa:
             with open(a.khoa, encoding='utf-8') as f:
                 khoa = json.load(f)
-        out, _, _ = analyse(a.frames, a.esp32, a.task, khoa, a.startup_s, a.thao_tac or ())
+        thao, tt_src = score_thao_tac(a.score, a.esp32) if a.score else ((), None)
+        if a.so_bo and not a.score:
+            raise GioError('the final clock file (--so-bo) needs --score: the operator kinds of the run come from the '
+                           "scorer's score.json only (CODE 19/11)")
+        out, _, _ = analyse(a.frames, a.esp32, a.task, khoa, a.startup_s, thao)
+        out['thao_tac_nguon'] = tt_src
         ctrl, ev = controller_of(a.esp32)
         out['controller'] = ctrl
         # contract of c7_score --gio-c8b (CODE 17/11, VG1-1): the clock file names the log and frames of ITS run

@@ -17,14 +17,15 @@ Clock (per node i of the c8b_gio file): a camera frame at t_cam maps to the log 
   [t_cam + D_i - u_plus, t_cam + D_i + u_minus]  (log = camera + D; u_minus / u_plus of the node: u_cham_minus_s,
   u_cham_plus_s when the clock file has them, else half the node step each side [CACH HIEU, stated]);
 z_f is interpolated at both ends and taken at every log row inside; an interval reaching a log hole > LOG_HOLE_S or a
-reset is undefined for that frame.
+firmware restart in the log is undefined for that frame.
 Bounds of a frame at node i: lo = max(0, min over (s, z) |e| - U_p_k), hi = max |e| + U_p_k (U_p_k of the row: the
 position bound of the difference; a sign change inside the set gives min |e| = 0).
 Run: "vuot moi nut" (the lower bound above D at every node) by the cell rule of J v6 section 5: every cell (two
 adjacent nodes) has ONE frame with lo > D at both nodes of the cell (the frame may differ between cells); one node:
 any frame. "can_xac_dinh_moi_nut": every node scored and every scored frame of every node bounded.
 Not concluded for the run (no evidence): khung_tuong_doi_v1 missing; phi_ok false; ca_t_som (q, delta_c_B, beta,
-plate changed or not known); mat_neo; log without the rising edge of run_active, a second reset in the run, a log
+plate changed or not known); mat_neo; log without the rising edge of run_active, a second reset (firmware restart:
+timestamp_us falls back; not reset_n, the IMU chip reset count), a log
 hole in the run window.
 
   python tools/c8b_edo.py luot --gio gio.json --luoi-dir DIR --esp32 log.csv --out edo.json
@@ -72,20 +73,30 @@ def read_log(path):
     with open(path, newline='', encoding='utf-8') as f:
         rows = [r for r in csv.DictReader(l for l in f if not l.startswith('#'))]
     rows = [r for r in rows if r.get('timestamp_us') not in (None, '')]
-    need = ('timestamp_us', 'pos_x', 'pos_y', 'run_active', 'reset_n')
+    need = ('timestamp_us', 'pos_x', 'pos_y', 'run_active')
     if not rows or any(c not in rows[0] for c in need):
         raise EdoError(f'{path}: no data line or no column {[c for c in need if not rows or c not in rows[0]]}')
     t = np.array([_f(r['timestamp_us']) for r in rows]) * 1e-6
-    if np.any(np.diff(t) <= 0):
-        raise EdoError(f'{path}: timestamp_us does not increase')
+    d = np.diff(t)
+    if np.any(d == 0) or not np.all(np.isfinite(t)):
+        raise EdoError(f'{path}: timestamp_us repeated or not a number')
+    # a firmware restart (boot) in the file: timestamp_us counts again from the boot (esp_timer), so it falls back;
+    # the log is kept and the run's e_do is not concluded (J v6 section 3 'reset thu hai'; CODE 19/11: reset_n is the
+    # IMU chip reset count, logger.c 147, main.c 299, not a firmware boot)
     return dict(t=t, x=np.array([_f(r['pos_x']) for r in rows]), y=np.array([_f(r['pos_y']) for r in rows]),
-                run=np.array([r['run_active'] == '1' for r in rows]), reset=[r['reset_n'] for r in rows])
+                run=np.array([r['run_active'] == '1' for r in rows]),
+                restart=[int(i) + 1 for i in np.flatnonzero(d < 0)])
 
 
 def log_checks(L):
-    """Reasons the run's e_do is not concluded from the log (J v6 section 3): no rising edge, more than one, a second
-    reset in the run window, a hole in the run window."""
+    """Reasons the run's e_do is not concluded from the log (J v6 section 3): a second reset (a firmware restart in the
+    log: timestamp_us falls back), no rising edge, more than one, a hole in the run window. The log column reset_n
+    (IMU chip resets, logger.c 147) is not a firmware reset and is not a reason here (the run is lost to the command
+    path by the scorer, J v6 section 5 (1))."""
     why = []
+    if L.get('restart'):
+        why.append(f'firmware restart in the log (timestamp_us falls back at row {L["restart"][0]}): a second reset')
+        return why, None
     ra = L['run']
     edges = [i for i in range(1, len(ra)) if ra[i] and not ra[i - 1]]
     if len(edges) != 1:
@@ -93,8 +104,6 @@ def log_checks(L):
         return why, None
     i0 = edges[0]
     i1 = i0 + int(np.argmax(~ra[i0:])) if (~ra[i0:]).any() else len(ra)
-    if len({L['reset'][k] for k in range(i0, i1)}) != 1:
-        why.append('reset_n changes in the run window (a second reset)')
     tw = L['t'][i0:i1]
     if len(tw) > 1 and float(np.max(np.diff(tw))) > LOG_HOLE_S:
         why.append(f'log hole {float(np.max(np.diff(tw))) * 1e3:.1f} ms > {LOG_HOLE_S * 1e3:.0f} ms in the run')
@@ -105,9 +114,9 @@ def log_checks(L):
 
 def fw_samples(L, a, b):
     """Firmware poses over the log interval [a, b]: both ends interpolated and every row inside; None when the
-    interval leaves the log, meets a hole > LOG_HOLE_S or a reset."""
+    interval leaves the log, meets a hole > LOG_HOLE_S, or the log has a firmware restart (times not one clock)."""
     t = L['t']
-    if a < t[0] or b > t[-1] or b < a:
+    if L.get('restart') or a < t[0] or b > t[-1] or b < a:
         return None
     i = int(np.searchsorted(t, a, side='right')) - 1
     j = int(np.searchsorted(t, b, side='left'))
@@ -115,8 +124,6 @@ def fw_samples(L, a, b):
     seg = slice(max(i, 0), j + 1)
     ts = t[seg]
     if len(ts) > 1 and float(np.max(np.diff(ts))) > LOG_HOLE_S:
-        return None
-    if len({L['reset'][k] for k in range(seg.start, seg.stop)}) != 1:
         return None
     xs = [float(np.interp(a, t, L['x'])), float(np.interp(b, t, L['x']))]
     ys = [float(np.interp(a, t, L['y'])), float(np.interp(b, t, L['y']))]
@@ -219,8 +226,8 @@ def analyse_run(gio, nodes, L, task, thr=D_M):
             theo_nut.append(dict(i=i, cham=False))
             continue
         sc, rows = nd
-        kt = sc.get('khung_tuong_doi')
-        rr = run_reasons(kt)
+        kt = sc.get('khung_tuong_doi_v1')       # F13 key of the scorer (data contract; Codex CAM CT5-3: the old name
+        rr = run_reasons(kt)                     # khung_tuong_doi is not taken)
         why += [f'node {i}: {w}' for w in rr if f'node {i}: {w}' not in why]
         bd = kt.get('bien_doi') if isinstance(kt, dict) else None
         if rr or not isinstance(bd, dict):

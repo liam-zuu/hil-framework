@@ -255,7 +255,8 @@ def _f11_case(st_fail, t_boot, cw_end, tt=()):
     (False, 12.0, 10.0, False, 'dat'),
 ])
 def test_m2_boot_and_the_clock_check_count(fail, t_boot, cw_end, dem, truoc):
-    r = _f11_case(fail, t_boot, cw_end)
+    # the boot comes from the scorer's thao_tac (one source, CODE 19/11); t_boot_log_s is its time in the log
+    r = _f11_case(fail, t_boot, cw_end, ('boot',) if t_boot is not None else ())
     assert r['kiem_gio_d1']['trang_thai'] == ('truot' if fail else 'dat')
     assert r['kiem_gio_d1']['truoc_boot']['trang_thai'] == truoc and r['dem_truot_kiem_gio'] is dem
 
@@ -270,14 +271,61 @@ def test_m2_any_operation_run_not_counted(tt):
         _f11_case(True, None, 10.0, ('bam_tay',))
 
 
-def test_m2_boot_found_in_the_log(tmp_path):
+def test_m2_reset_n_is_not_a_boot(tmp_path):
+    # CODE 19/11 (CAM checked AGV logger.c 147, main.c 299): reset_n counts IMU chip resets, not firmware boots. Its
+    # change is not an operator loss (the old code took it for a boot: an error of ours); it still leaves the clock
+    # without a finite bound (IMU report counters restart)
     def m(rows):
         for r in rows[1200:]:
             r['reset_n'] = 4
     fp, lp = make_run(str(tmp_path), mutate=m)
     out, _, _ = G.analyse(fp, lp, 'O1-F05')
     tb = out['kiem_gio_d1']['truoc_boot']
-    assert tb['co_boot'] and tb['t_boot_log_s'] is not None and out['dem_truot_kiem_gio'] is False
+    assert not tb['co_boot'] and tb['t_boot_log_s'] is None and tb['thao_tac'] == []
+    assert any('reset_n' in x and 'IMU' in x for x in out['ly_do_theo_loai']['chua'])
+    # a time in kiem without 'boot' among the operator kinds is not a boot either
+    r = _f11_case(True, 12.0, 10.0)
+    assert r['kiem_gio_d1']['truoc_boot']['co_boot'] is False and r['dem_truot_kiem_gio'] is True
+
+
+def test_m2_boot_from_the_score_without_its_time_not_counted():
+    # a boot told by the scorer, its time not in the log rows (one boot per file): not independent evidence (J5-9)
+    r = _f11_case(True, None, 10.0, ('boot',))
+    tb = r['kiem_gio_d1']['truoc_boot']
+    assert tb['co_boot'] and not tb['du_cua_so'] and tb['trang_thai'] == 'khong_kiem' and 'ly_do' in tb
+    assert r['dem_truot_kiem_gio'] is False
+
+
+def _score(tmp_path, log_path, thao=None, sha=None, name='score.json'):
+    import c8_u_imu
+    d = dict(outcome='hong_he_do', fail_cause='thao_tac' if thao else 'he_do',
+             esp32_sha256=sha or c8_u_imu.sha256(log_path))
+    if thao is not None:
+        d['thao_tac'] = thao
+    p = tmp_path / name
+    p.write_text(json.dumps(d), encoding='utf-8')
+    return str(p)
+
+
+def test_cli_operator_kinds_from_the_score(tmp_path, base_run):
+    base = ['--frames', base_run[1], '--esp32', base_run[2], '--task', 'O1-F05']
+    sc = _score(tmp_path, base_run[2], ['boot', 'khoa_sieu_am'])
+    out_p = str(tmp_path / 'g.json')
+    assert G.main(base + ['--score', sc, '--out', out_p]) == 0
+    d = json.load(open(out_p, encoding='utf-8'))
+    tb = d['kiem_gio_d1']['truoc_boot']
+    assert tb['thao_tac'] == ['boot', 'khoa_sieu_am'] and tb['co_boot'] and d['dem_truot_kiem_gio'] is False
+    import c8_u_imu
+    assert d['thao_tac_nguon']['sha256'] == c8_u_imu.sha256(sc)
+    # the score of another run, or a kind outside the shared labels (CT3-6), is refused
+    assert G.main(base + ['--score', _score(tmp_path, base_run[2], ['boot'], sha='0' * 64, name='s2.json'),
+                          '--out', str(tmp_path / 'g2.json')]) == 2
+    assert G.main(base + ['--score', _score(tmp_path, base_run[2], ['sieu_am'], name='s3.json'),
+                          '--out', str(tmp_path / 'g3.json')]) == 2
+    # no operator kind in the score: none
+    assert G.main(base + ['--score', _score(tmp_path, base_run[2], None, name='s4.json'),
+                          '--out', str(tmp_path / 'g4.json')]) == 0
+    assert json.load(open(tmp_path / 'g4.json', encoding='utf-8'))['kiem_gio_d1']['truoc_boot']['thao_tac'] == []
 
 
 def test_f11_missing_c8_range_is_not_checked(tmp_path):
@@ -411,6 +459,10 @@ def test_cli_ties_the_preliminary_grid_and_window(tmp_path, base_run):
     cs.write_text('{"schema": "cua_so_v1"}', encoding='utf-8')
     base = ['--frames', base_run[1], '--esp32', base_run[2], '--task', 'O1-F05']
     out_p = str(tmp_path / 'gio.json')
+    # the final file needs the scorer's score.json (the operator kinds, one source)
+    assert G.main(base + ['--so-bo', str(sb), '--cua-so', str(cs), '--out', str(tmp_path / 'g0.json')]) == 2
+    sc = _score(tmp_path, base_run[2], None)
+    base = base + ['--score', sc]
     assert G.main(base + ['--so-bo', str(sb), '--cua-so', str(cs), '--out', out_p]) == 0
     d = json.load(open(out_p, encoding='utf-8'))
     import c8_u_imu
@@ -721,6 +773,107 @@ def test_f11_luoi_every_node_lost(tmp_path):
     assert LU.main(['--gio', gp, '--out-dir', d, '--gop-only']) == 0
     r = json.load(open(os.path.join(d, 'luoi.json'), encoding='utf-8'))
     assert r['trang_thai_luot'] == 'hong_he_do' and r['outcome'] == 'hong_he_do' and r['gate_v3'] is None
+
+
+def test_ct3_3_node_not_a_c8_scoring_is_not_taken(tmp_path):
+    # Codex CAM CT3-3: a node whose score.json says cham_c8 false (clock not from c8b_gio_v1, ...) is not scored
+    d, gp = _luoi_dir(tmp_path)
+    for k in range(2):
+        _write_node(d, k, ['dat'] * 5, [(10.000001, 1, [0.05, 0.05, 0.05, 1.0])])
+    p0 = os.path.join(d, 'nut_000.json')
+    sc = json.load(open(p0, encoding='utf-8'))
+    sc.update(cham_c8=False, cham_c8_ly_do='gio khong tu c8b_gio_v1')
+    json.dump(sc, open(p0, 'w', encoding='utf-8'))
+    assert LU.main(['--gio', gp, '--out-dir', d, '--gop-only']) == 0
+    r = json.load(open(os.path.join(d, 'luoi.json'), encoding='utf-8'))
+    assert r['nodes_ok'] == [False, True] and r['n_nut_cham'] == 1
+    assert 'cham_c8 false' in r['node_errors'][0] and 'c8b_gio_v1' in r['node_errors'][0]
+    # every node so: no node scored, the run closed not concluded
+    p1 = os.path.join(d, 'nut_001.json')
+    json.dump(sc, open(p1, 'w', encoding='utf-8'))
+    os.remove(os.path.join(d, 'luoi.json'))
+    assert LU.main(['--gio', gp, '--out-dir', d, '--gop-only']) == 0
+    r = json.load(open(os.path.join(d, 'luoi.json'), encoding='utf-8'))
+    assert r['n_nut_cham'] == 0 and r['trang_thai_luot'] == 'chua_ket_luan_khong_nut' and r['gate_v3'] is None
+
+
+def test_ct4_4_g5_of_f08_reports_only_without_a_gate_mask(tmp_path):
+    # Codex CAM CT4-4: G5 of the figure 8 at F08 is report only by the J source (J v6 section 6, L130), also when no
+    # gate file (empty mask) is given: a G5 over its threshold does not make the run khong_dat
+    d = str(tmp_path / 'luoi')
+    os.makedirs(d)
+    gio = dict(format='c8b_gio_v1', task='O1-F08', ok=True, nodes_s=[1.0, 1.001])
+    gp = str(tmp_path / 'gio.json')
+    json.dump(gio, open(gp, 'w', encoding='utf-8'))
+    import c8_u_imu
+    for k in range(2):
+        with open(os.path.join(d, f'nut_{k:03d}_nguon.json'), 'w', encoding='utf-8') as f:
+            json.dump(dict(scorer=dict(commit='abc1234', dirty=False), gio_sha256=c8_u_imu.sha256(gp),
+                           D_s=gio['nodes_s'][k]), f)
+        _write_node(d, k, ['dat', 'dat', 'dat', 'dat', 'khong_dat'], [(10.000001, 1, [0.05, 0.05, 0.05, 10.0])])
+    assert LU.main(['--gio', gp, '--out-dir', d, '--gop-only']) == 0
+    r = json.load(open(os.path.join(d, 'luoi.json'), encoding='utf-8'))
+    assert r['states']['g5'] == 'khong_dat' and r['report_only'] == ['g5'] and 'g5' not in r['decide']
+    assert r['outcome'] == 'dat'
+    assert LU.report_only_of(None, 'O1-F05') == (frozenset(), None)
+
+
+def test_f19_luoi_chain_files(tmp_path):
+    # F19 (CODE 19/11): the cell chain fields of every run's luoi.json: clip {ten, clip_sha256}; file_so_h, and with
+    # the H1 scoring file_cham_h1 + file_gio_h1 {duong_dan, sha256}
+    import c8_u_imu
+    d, gp = _luoi_dir(tmp_path)
+    for k in range(2):
+        _write_node(d, k, ['dat'] * 5, [(10.000001, 1, [0.05, 0.05, 0.05, 1.0])])
+    clip = tmp_path / 'IMG_9999.MOV'
+    clip.write_bytes(b'video')
+    so_h = tmp_path / 'drift.json'
+    so_h.write_text('{}', encoding='utf-8')
+    ch1, gh1 = tmp_path / 'cham_h1.json', tmp_path / 'gio_h1.json'
+    ch1.write_text('{"a": 1}', encoding='utf-8')
+    gh1.write_text('{"b": 2}', encoding='utf-8')
+    base = ['--gio', gp, '--out-dir', d, '--gop-only']
+    assert LU.main(base + ['--clip', str(clip), '--file-so-h', str(so_h), '--file-cham-h1', str(ch1),
+                           '--file-gio-h1', str(gh1)]) == 0
+    r = json.load(open(os.path.join(d, 'luoi.json'), encoding='utf-8'))
+    assert r['clip'] == dict(ten='IMG_9999.MOV', clip_sha256=c8_u_imu.sha256(str(clip)))
+    assert r['file_so_h'] == dict(duong_dan=str(so_h.resolve()), sha256=c8_u_imu.sha256(str(so_h)))
+    assert r['file_gio_h1']['sha256'] == c8_u_imu.sha256(str(gh1)) and r['file_cham_h1']['sha256']
+    os.remove(os.path.join(d, 'luoi.json'))
+    assert LU.main(base + ['--file-cham-h1', str(ch1)]) == 2                    # H1 needs its own clock file
+    assert LU.main(base + ['--clip', str(clip), '--clip-sha256', 'a' * 64]) == 2   # SHA not of the clip
+    assert LU.main(base) == 0                                                   # not given: null (GATE refuses)
+    r = json.load(open(os.path.join(d, 'luoi.json'), encoding='utf-8'))
+    assert r['clip'] is None and r['file_so_h'] is None and r['file_gio_h1'] is None
+
+
+def test_f19_luoi_lost_kinds_and_node_sources(tmp_path):
+    # F19 (GATE 8705918): luoi.json names the score.json of every node (path, SHA) and gathers the lost-run kinds
+    # (J v6 section 5 order: thao_tac, cua_so_tham_chieu, duong_lenh, he_do)
+    d, gp = _luoi_dir(tmp_path, 3)
+    nodes = [dict(outcome='hong_he_do', fail_cause='he_do', hong_cua_so_tc=True, outcome_reasons=['tc']),
+             dict(outcome='hong_he_do', fail_cause='thao_tac', thao_tac=['boot'], outcome_reasons=['boot']),
+             dict(outcome='hong_he_do', fail_cause='he_do', outcome_reasons=['gap'])]
+    for k, sc in enumerate(nodes):
+        with open(os.path.join(d, f'nut_{k:03d}.json'), 'w', encoding='utf-8') as f:
+            json.dump(sc, f)
+        open(os.path.join(d, f'nut_{k:03d}_rows.csv'), 'w').close()
+    assert LU.main(['--gio', gp, '--out-dir', d, '--gop-only']) == 0
+    r = json.load(open(os.path.join(d, 'luoi.json'), encoding='utf-8'))
+    assert r['loai_hong'] == ['thao_tac', 'cua_so_tham_chieu', 'he_do']
+    assert r['loai_hong_nut'] == ['cua_so_tham_chieu', 'thao_tac', 'he_do']
+    import c8_u_imu
+    assert [x['nut'] for x in r['nguon_nut']] == [0, 1, 2]
+    assert r['nguon_nut'][1]['sha256'] == c8_u_imu.sha256(os.path.join(d, 'nut_001.json'))
+    assert os.path.isabs(r['nguon_nut'][0]['duong_dan'])
+    # a scored run: no lost kind
+    for k in range(3):
+        _write_node(d, k, ['dat'] * 5, [(10.000001, 1, [0.05, 0.05, 0.05, 1.0])])
+    os.remove(os.path.join(d, 'luoi.json'))
+    assert LU.main(['--gio', gp, '--out-dir', d, '--gop-only']) == 0
+    r = json.load(open(os.path.join(d, 'luoi.json'), encoding='utf-8'))
+    assert r['loai_hong'] == [] and r['loai_hong_nut'] == [None, None, None] and len(r['nguon_nut']) == 3
+    assert LU.loai_hong_of(dict(fail_cause='duong_lenh')) == 'duong_lenh'
 
 
 def test_f11_luoi_scored_and_not_bounded(tmp_path):

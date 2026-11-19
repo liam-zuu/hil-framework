@@ -77,3 +77,50 @@ def test_bang_man_trap_has_k_and_alpha_source():
     assert b['K']['nguon_3b']['sha256'] == 'ab' * 32 and b['O1-F02'] == dict(nhanh='mot_khung')
     with pytest.raises(K.KhoaError):
         K.build({'O1-F05': _tb('O1-F05', alpha=True)})               # alpha without its source
+
+
+def test_m5b_bands_closed_terms_branch_and_state(tmp_path):
+    # M5b (GATE 8705918 GC6-5, names CODE 19/11): one band [0, v_max + wz_max a / sqrt 2] per level with P4 / A4 after
+    # the margin; thieu -> null values; hang_dong keys exactly the gate's, null until their sources; nhanh_tick from
+    # the plan; trang_thai khoa only when every term of every level of muc_kha_thi is there
+    from o1_feasibility import Schedule
+    from o1_tasks import FIG8
+    import o1_gate
+    a = 0.0964
+    k = K.build({'O1-F05': _tb('O1-F05'), 'O1-F08': _tb('O1-F08', dung=False)}, a_m=a, nhanh_tick='bo_tick')
+    v, wz = o1_gate.fig8_cmd_max(Schedule(FIG8['O1-F05']))
+    b = k['muc']['O1-F05']['hang_theo_u']
+    assert len(b) == 1 and b[0]['u_lo_m_s'] == 0.0 and b[0]['u_hi_m_s'] == pytest.approx(v + wz * a / math.sqrt(2))
+    assert b[0]['P4_m'] == pytest.approx(1.25 * 0.002213) and b[0]['A4_deg'] == pytest.approx(1.25 * 0.519)
+    assert b[0]['trang_thai'] == 'gioi_han'
+    b8 = k['muc']['O1-F08']['hang_theo_u'][0]
+    assert b8['trang_thai'] == 'thieu' and b8['P4_m'] is None and b8['A4_deg'] is None
+    hd = k['muc']['O1-F05']['hang_dong']
+    assert set(hd) == {'a_m', 'hang_m', 'he_so_r', 'u_phi_rad', 'hang_rad'} and hd['a_m'] == a
+    assert all(hd[q] is None and k['muc']['O1-F05']['hang_dong_ly_do'][q] for q in ('hang_m', 'he_so_r', 'u_phi_rad',
+                                                                                   'hang_rad'))
+    assert k['nhanh_tick'] == 'bo_tick' and k['trang_thai'] == 'chua_khoa' and 'hang_dong' in k['ly_do_chua_khoa']
+    assert 'ke hoach' in k['ly_do_chua_khoa']
+    # every term there (the other sessions' sources filled in by hand here): khoa
+    ng = [dict(vai='ke_hoach_c8', file='kh.json', sha256='cd' * 32)]
+    k2 = K.build({'O1-F05': _tb('O1-F05')}, nguon=ng, a_m=a, nhanh_tick='giu_tick', muc_kha_thi=['O1-F05'])
+    k2['muc']['O1-F05']['hang_dong'].update(hang_m=0.004, he_so_r=0.002, u_phi_rad=0.001, hang_rad=0.01)
+    assert K.trang_thai_khoa(k2, ['O1-F05']) == ('khoa', None)
+    # no tag side: no band, not lockable
+    k3 = K.build({'O1-F05': _tb('O1-F05')})
+    assert k3['muc']['O1-F05']['hang_theo_u'] == [] and k3['muc']['O1-F05']['hang_theo_u_ly_do']
+
+
+def test_m5b_cli_plan_branch(tmp_path):
+    p = tmp_path / '3b.json'
+    p.write_text(json.dumps(_tb('O1-F05')), encoding='utf-8')
+    kh = tmp_path / 'ke_hoach_c8.json'
+    kh.write_text(json.dumps(dict(format='ke_hoach_c8_v1', nhanh_tick='bo_tick', o=[])), encoding='utf-8')
+    base = ['--tb', f'O1-F05={p}', '--canh-ma-m', '0.0964', '--muc', 'O1-F05']
+    out = tmp_path / 'k.json'
+    assert K.main(base + ['--ke-hoach', str(kh), '--out', str(out)]) == 0
+    d = json.loads(out.read_text(encoding='utf-8'))
+    assert d['nhanh_tick'] == 'bo_tick' and d['muc_kha_thi'] == ['O1-F05']
+    assert any(n['vai'] == 'ke_hoach_c8' and len(n['sha256']) == 64 for n in d['khoa_truoc']['nguon'])
+    assert K.main(base + ['--ke-hoach', str(kh), '--nhanh-tick', 'giu_tick', '--out', str(tmp_path / 'k2.json')]) == 2
+    assert K.main(base + ['--muc', 'O1-F99', '--out', str(tmp_path / 'k3.json')]) == 2

@@ -301,3 +301,15 @@ def test_ghep_q_missing_input_is_undecided(break_):
         cho = 'K1'
     r = X.ghep_q(L, cho, Xo, T, u_psi_w_rad=u_w)
     assert r['trang_thai'] == 'chua_ket_luan' and r['q_m'] is None and r['ly_do']
+
+
+@pytest.mark.parametrize('ly_do', ['lan_lap_sau_doi', 'tam_doi_so_chuan', 'lan_lap_khong_xac_dinh'])
+def test_ghep_q_run_without_verified_standard_is_undecided(ly_do):
+    # NHACTAM e7b8428 / d1f6843 (F8, CODE 19/11): only a run verified on the placement of its 12b (khong_doi ->
+    # chuan_12b, lan_lap_id) gets a q; lan_lap_sau_doi (after a valid doi until the next 12b) and the others do not,
+    # even when their numbers look complete
+    L, Xo, T, _ = _ghep_case(2)
+    ok = X.ghep_q(dict(L, lan_lap_id='L0', chuan_12b='12b_1', ly_do=None), 'goc', Xo, T, u_psi_w_rad=0.001)
+    assert ok['trang_thai'] == 'dat', ok['ly_do']
+    r = X.ghep_q(dict(L, lan_lap_id=None, chuan_12b=None, ly_do=ly_do), 'goc', Xo, T, u_psi_w_rad=0.001)
+    assert r['trang_thai'] == 'chua_ket_luan' and r['q_m'] is None and any(ly_do in w for w in r['ly_do'])

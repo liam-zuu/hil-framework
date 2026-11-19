@@ -15,13 +15,14 @@ TASK = 'O1-K1'                     # lane along +y in the lane frame, S = 2 m
 
 
 def _log(t0=5.0, n=800, dt=0.01, x_off=0.0, reset_at=None, edge_pos=(0.0, 0.0)):
-    """Firmware log: run_active rises at t0; pos follows y = 0.4 (t - t0) on x = x_off (edge row as given)."""
+    """Firmware log: run_active rises at t0; pos follows y = 0.4 (t - t0) on x = x_off (edge row as given); reset_at:
+    the IMU chip reset count reset_n goes 3 -> 4 there (not a firmware restart)."""
     t = 4.0 + np.arange(n) * dt
     run = t >= t0
     y = np.where(run, 0.4 * (t - t0), 0.0) + edge_pos[1]
     x = np.full(n, x_off + edge_pos[0])
     reset = ['3' if reset_at is None or ti < reset_at else '4' for ti in t]
-    return dict(t=t, x=x, y=y, run=run, reset=reset)
+    return dict(t=t, x=x, y=y, run=run, reset=reset, restart=[])
 
 
 def _node(off, keys=None, up=0.005, D=0.0, phi_ok=True, **kt):
@@ -35,7 +36,7 @@ def _node(off, keys=None, up=0.005, D=0.0, phi_ok=True, **kt):
     blk = dict(schema='khung_tuong_doi_v1', phi_ok=phi_ok, t_som_s=None, ca_t_som=None, tam_doi='khong_doi',
                mat_neo=False, bien_doi=dict(p_dd=[0.0, 0.0], psi_dd=0.0))
     blk.update(kt)
-    return dict(khung_tuong_doi=blk, gio_c8b=dict(D=D)), rows
+    return dict(khung_tuong_doi_v1=blk, gio_c8b=dict(D=D)), rows
 
 
 GIO = dict(format='c8b_gio_v1', task=TASK, nodes_s=[0.0, 0.002], step_s=0.002)
@@ -80,9 +81,28 @@ def test_run_not_concluded(kw, txt):
     assert r['trang_thai'] == 'chua_ket_luan' and not r['vuot_moi_nut'] and any(txt in w for w in r['ly_do'])
 
 
-def test_second_reset_not_concluded():
+def test_second_reset_not_concluded(tmp_path):
+    # J v6 section 3: a second reset is a firmware restart: timestamp_us falls back in the log (CODE 19/11)
+    L = _log()
+    p = tmp_path / 'log.csv'
+    with open(p, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(['timestamp_us', 'pos_x', 'pos_y', 'run_active', 'reset_n'])
+        for i in range(len(L['t'])):
+            ts = L['t'][i] if L['t'][i] < 6.0 else L['t'][i] - 5.9       # boot at 6.0 s: the clock starts again
+            w.writerow([int(round(ts * 1e6)), L['x'][i], L['y'][i], int(L['run'][i]), '3'])
+    Lr = E.read_log(str(p))
+    assert Lr['restart'] == [200]
+    r = E.analyse_run(GIO, [_node(0.12), _node(0.12)], Lr, TASK)
+    assert r['trang_thai'] == 'chua_ket_luan' and any('second reset' in w for w in r['ly_do'])
+    assert not r['vuot_moi_nut']
+
+
+def test_imu_chip_reset_is_not_a_second_reset():
+    # CODE 19/11 (CAM checked AGV logger.c 147, main.c 299): reset_n counts IMU chip resets, not firmware boots; it
+    # is not a reason for e_do (the scorer loses the run to the command path, J v6 section 5 (1))
     r = E.analyse_run(GIO, [_node(0.12), _node(0.12)], _log(reset_at=6.0), TASK)
-    assert r['trang_thai'] == 'chua_ket_luan' and any('reset' in w for w in r['ly_do'])
+    assert r['trang_thai'] == 'dat' and r['vuot_moi_nut'] and not any('reset' in w for w in r['ly_do'])
 
 
 def test_node_not_scored_means_not_bounded_everywhere():
@@ -160,3 +180,14 @@ def test_chung_cu_one_and_two_scorings():
     assert not E.chung_cu([_luoi(st='chua_ket_luan_khong_nut')], [e1], True)['phan_loai_du']
     with pytest.raises(E.EdoError):
         E.chung_cu([_luoi()], [e1, e1], True)
+
+
+def test_ct5_3_f13_key_of_the_scorer():
+    # Codex CAM CT5-3: the scorer writes the F13 block under khung_tuong_doi_v1; the old key is not taken
+    sc, rows = _node(0.12)
+    r = E.analyse_run(GIO, [(sc, rows), (sc, rows)], _log(), TASK)
+    assert r['trang_thai'] == 'dat' and r['vuot_moi_nut']
+    old = dict(sc)
+    old['khung_tuong_doi'] = old.pop('khung_tuong_doi_v1')
+    r2 = E.analyse_run(GIO, [(old, rows), (old, rows)], _log(), TASK)
+    assert r2['trang_thai'] == 'chua_ket_luan' and any('khung_tuong_doi_v1' in w for w in r2['ly_do'])

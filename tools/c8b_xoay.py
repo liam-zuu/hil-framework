@@ -359,6 +359,11 @@ def ghep_q(lan_lap, cho, xoay, truc_xe=None, u_psi_w_rad=None):
         why.append('lan_lap: theta_luot_rad missing')
     if th_c is None:
         why.append('lan_lap: theta_chuan_rad missing')
+    # NHACTAM e7b8428 / d1f6843 (F8, CODE 19/11): a run has a standard only when its placement is VERIFIED against the
+    # 12b of its place (khong_doi -> chuan_12b, lan_lap_id); tam_doi_so_chuan, lan_lap_khong_xac_dinh, lan_lap_sau_doi
+    # (after a valid doi until the next 12b) and the others leave lan_lap_id null: no q for that run
+    if ('lan_lap_id' in L or 'chuan_12b' in L) and (L.get('lan_lap_id') is None or L.get('chuan_12b') is None):
+        why.append(f'lan_lap: no verified 12b standard for this run (ly_do {L.get("ly_do")!r})')
     st = L.get('trang_thai') if isinstance(L.get('trang_thai'), dict) else {}
     dcb, u_dcb = _vec2(L.get('delta_c_B_m')), _num(L.get('u_delta_c_B_m'))
     if st.get('delta_c_B') != 'dat' or dcb is None or u_dcb is None:
