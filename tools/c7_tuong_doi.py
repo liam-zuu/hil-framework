@@ -72,6 +72,59 @@ def ids_sha(ids):
     return hashlib.sha256(','.join(str(int(i)) for i in ids).encode()).hexdigest()
 
 
+def sha_ids_json(ids):
+    """sha256 of an ID list as NHACTAM writes khung_chung_sha256 (c7_nhac_tam.sha_ids of hil f9c4b3d: sorted ints,
+    compact JSON '[1,2]'); CODE 19/11 fixed sha256('1,2') (ids_sha) for the ID lists: both accepted when reading.
+    TODO (CODE 19/11): when NHACTAM moves sha_ids to '1,2' (CODE asked it), accept ids_sha only."""
+    return hashlib.sha256(json.dumps(sorted(int(i) for i in ids), separators=(',', ':')).encode()).hexdigest()
+
+
+def _check_sha(ids, sh, end):
+    """Codex CT1-3, CT2-1: khung_chung_sha256 (when written) must hash exactly the IDs read."""
+    if sh is not None and sh not in (sha_ids_json(ids), ids_sha(ids)):
+        raise ValueError(f'lan_lap_v1 khung_chung_sha256.{end} is not the sha256 of khung_chung.{end} (contract F8)')
+
+
+def neo_of(lan_lap, end='pre'):
+    """The anchor frames of one end of lan_lap_v1 (F8 khung_chung[end]), normalised (Codex CT2-1): (ids or None,
+    pts or None, sha or None, dang). NHACTAM writes {id: [...], pts_s: [...]} (c7_nhac_tam _mot_luot, hil f9c4b3d), the
+    sha in khung_chung_sha256[end] (or dau[end].khung_chung_sha256); dang 'id_pts' for that form, 'danh_sach' for a
+    bare ID list (earlier synthetic form, no PTS, no sha needed). Missing end: (None, None, None, None). A malformed
+    entry (lengths differ, not integers / finite PTS): ValueError."""
+    if lan_lap is None:
+        return None, None, None, None
+    kc = lan_lap.get('khung_chung')
+    v = kc.get(end) if isinstance(kc, dict) else None
+    if v is None:
+        return None, None, None, None
+    top = lan_lap.get('khung_chung_sha256')
+    d = (lan_lap.get('dau') or {}).get(end) if isinstance(lan_lap.get('dau'), dict) else None
+    if isinstance(top, dict) and end in top:
+        sh = top[end]
+        if isinstance(d, dict) and 'khung_chung_sha256' in d and d['khung_chung_sha256'] != sh:
+            raise ValueError(f'lan_lap_v1 khung_chung_sha256.{end} differs from dau.{end}.khung_chung_sha256')
+    else:
+        sh = d.get('khung_chung_sha256') if isinstance(d, dict) else None
+    if isinstance(v, dict):
+        ids, pts = v.get('id'), v.get('pts_s')
+        if not isinstance(ids, list) or not isinstance(pts, list) or len(ids) != len(pts):
+            raise ValueError(f'lan_lap_v1 khung_chung.{end}: id and pts_s lists of the same length (contract F8)')
+        try:
+            ids = [int(i) for i in ids]
+            pts = [float(p) for p in pts]
+        except (TypeError, ValueError):
+            raise ValueError(f'lan_lap_v1 khung_chung.{end}: integer ids, numeric pts_s (contract F8)')
+        if not all(math.isfinite(p) for p in pts):
+            raise ValueError(f'lan_lap_v1 khung_chung.{end}: pts_s not finite')
+        _check_sha(ids, sh, end)
+        return ids, pts, sh, 'id_pts'
+    if isinstance(v, list):
+        ids = [int(i) for i in v]
+        _check_sha(ids, sh, end)
+        return ids, None, sh, 'danh_sach'
+    raise ValueError(f'lan_lap_v1 khung_chung.{end}: {type(v).__name__}, expected {{id, pts_s}} (contract F8)')
+
+
 def check_khung_tc(d, locked):
     """The khung_tc block of the constants file (F14), or the proposed numbers when absent before C8. Only the four
     F14 keys are required when locked (khoa_c8); w_s is fixed at 3 s by J v6 2 (another value refused); bien_s,
@@ -177,12 +230,12 @@ def _max_hole(t_ok, dt, a, b):
 RATIO_WHY = ('ti_le', 'ti_le_it_lan_can')       # the (2b) verdicts of c7_measure.apply_gates (two-sided)
 
 
-def mot_phia(frames, chain, gates, quant=5e-7):
-    """Tag-gate frames of a reference window with the ONE-SIDED scale gate (contract F2; design v4 1.2; Codex CT1-14):
-    a frame whose only failures are the two-sided (2b) verdicts, or none, passes when its scale is within scale_rel
-    of the median scale of at least scale_min earlier frames of that kind within scale_win_s (the frame excluded);
-    rounded scales (quant, c7_measure.CSV_QUANT) must pass for every value in the interval. Frames after a frame never
-    change its verdict. Also needs the chain's tag gate except (2b) (car seen, finite tag)."""
+def mot_phia(frames, chain, gates, t_ref, quant=5e-7):
+    """Tag-gate frames of a reference window with the ONE-SIDED scale gate (contract F2; design v4 1.2; Codex CT1-14,
+    round 2 'sua sai'): the eligible frames (every failure, if any, a two-sided (2b) verdict; car seen, finite tag and
+    scale) give ONE reference scale_ref,tc = median scale over [t_ref - 4 s, t_ref) (the window and 1 s before it);
+    an eligible frame passes when its scale is within scale_rel of it; rounded scales (quant, c7_measure.CSV_QUANT)
+    must pass for every value in the interval. Fewer than scale_min eligible frames in that span: none passes."""
     g = gates
     t = np.array([float(r['t_s']) for r in frames], float)
     sc = np.array([ck._f(r.get('scale')) for r in frames], float)
@@ -190,16 +243,13 @@ def mot_phia(frames, chain, gates, quant=5e-7):
                      and math.isfinite(c['tag_x']) and math.isfinite(c['tag_y']) and math.isfinite(c['tag_psi'])
                      and math.isfinite(s_) for r, c, s_ in zip(frames, chain, sc)], bool)
     out = np.zeros(len(frames), bool)
-    ib = np.nonzero(base)[0]
-    for j, k in enumerate(ib):
-        prev = ib[:j]
-        nb = sc[prev][t[prev] >= t[k] - g['scale_win_s'] - 1e-9]
-        if len(nb) < g['scale_min']:
-            continue
-        ref = float(np.median(nb))
-        r_lo = (sc[k] - quant) / (ref + quant) - 1.0
-        r_hi = (sc[k] + quant) / (ref - quant) - 1.0
-        out[k] = max(abs(r_lo), abs(r_hi)) <= g['scale_rel']
+    span = base & (t >= t_ref - W_S - 1.0 - 1e-12) & (t < t_ref)
+    if int(span.sum()) < g['scale_min']:
+        return out
+    ref = float(np.median(sc[span]))
+    r_lo = (sc - quant) / (ref + quant) - 1.0
+    r_hi = (sc + quant) / (ref - quant) - 1.0
+    out = base & (np.maximum(np.abs(r_lo), np.abs(r_hi)) <= g['scale_rel'])
     return out
 
 
@@ -244,7 +294,6 @@ def cua_so(frames, chain, log_rows, t0_us, nodes, u_nodes, kt, t_trong, t_cmd_en
     if [c['frame_id'] for c in chain] != [int(i) for i in ids]:
         raise ValueError('chain and frames.csv: different frames (run c7_chuoi_khung on this frames.csv)')
     ok = np.array([bool(c['cong_ok']) for c in chain])
-    ok1 = mot_phia(frames, chain, gates) if gates is not None else ok
     tx = np.array([c['tag_x'] for c in chain], float)
     ty = np.array([c['tag_y'] for c in chain], float)
     tp = np.array([c['tag_psi'] for c in chain], float)
@@ -252,6 +301,7 @@ def cua_so(frames, chain, log_rows, t0_us, nodes, u_nodes, kt, t_trong, t_cmd_en
     t0 = t0_us / 1e6
     nodes, u_nodes = [float(v) for v in nodes], [float(v) for v in u_nodes]
     t_ref = min(t0 - D - u for D, u in zip(nodes, u_nodes))             # camera clock, earliest possible edge
+    ok1 = mot_phia(frames, chain, gates, t_ref) if gates is not None else ok
     t_max = max(t0 - D + u for D, u in zip(nodes, u_nodes))             # latest possible edge
     base = dict(schema=CUA_SO_SCHEMA, cho=cho_of(task), phep_gop='trung_binh_go_vong', t0_log_us=t0_us,
                 D_s=nodes, u_ref_minus_s=u_nodes, u_ref_plus_s=u_nodes, phien_ban=PHIEN_BAN,
@@ -275,15 +325,26 @@ def cua_so(frames, chain, log_rows, t0_us, nodes, u_nodes, kt, t_trong, t_cmd_en
     t_log0 = min(float(r['_t']) for r in log_rows) / 1e6 if log_rows else math.nan
     cho = t0 - t_log0
     cho_ok = bool(math.isfinite(cho) and cho >= CHO_LOG_S - 1e-9)
+    # Codex CT1-12 (round 2): the car STILL for 6 s before the edge, not only 6 s of log: the still gate (tag frames
+    # of the window gate) over [t_ref - 6 s, t_max] (6 s before the earliest edge to the latest), no hole above t_trong
+    a6 = t_ref - CHO_LOG_S
+    m6 = (t >= a6) & (t <= t_max) & ok1
+    d6_ok, d6_num = _stillness(t[m6], tx[m6], ty[m6], tp[m6], kt)
+    ho6 = _max_hole(t[ok1], dt, a6, t_max)
+    d6_num['ho_max_s'] = ho6
+    d6_ok = bool(d6_ok and ho6 <= t_trong + 1e-12)
     why = (s_why + ([] if d_ok else ['xe khong dung yen trong cua so hay toi canh muon nhat']) + l_why
            + ([] if noi_ok else [f'doan noi toi canh muon nhat ho {ho_max:.3f} s > t_trong {t_trong:g} s'])
-           + ([] if cho_ok else [f'cho {cho:.2f} s < {CHO_LOG_S:g} s sau dong log dau']) + list(extra_why))
+           + ([] if cho_ok else [f'cho {cho:.2f} s < {CHO_LOG_S:g} s sau dong log dau'])
+           + ([] if d6_ok else [f'xe khong dung yen du {CHO_LOG_S:g} s truoc canh (ho {ho6:.3f} s)'])
+           + list(extra_why))
     out.append(dict(base, loai='pre', t_ref=t_ref, t_max=t_max, t_canh_s=t_ref,
                     khung=[dict(id=int(i), pts_s=float(x)) for i, x in zip(ids[m], t[m])],
                     khung_sha256=ids_sha(ids[m]), khung_ma_hop_le=[int(i) for i in ids[mo]],
                     khung_ma_hop_le_sha256=ids_sha(ids[mo]), cong_ti_le='mot_phia' if gates is not None else 'hai_phia',
                     ket_luan=dict(du_mau=s_ok, dung_yen=d_ok, log_phu=l_ok, ho_noi_s=ho, ho_noi_max_s=ho_max,
-                                  noi_phu=noi_ok, cho_log_s=cho, cho_du=cho_ok, dat=not why, ly_do=why,
+                                  noi_phu=noi_ok, cho_log_s=cho, cho_du=cho_ok, dung_yen_6s=d6_ok,
+                                  so_dung_yen_6s=d6_num, dat=not why, ly_do=why,
                                   so_dung_yen=d_num, encoder_doi=enc)))
     # post: the last w_s of tag-gate frames, all after the latest possible end of the command
     t_end = max(t0 - D + u for D, u in zip(nodes, u_nodes)) + t_cmd_end
@@ -314,12 +375,17 @@ def tham_chieu(pre, chain, lan_lap, kt, t_trong, dt, extra=None):
     by = {c['frame_id']: c for c in chain}
     ma = [int(i) for i in (pre.get('khung_ma_hop_le') or [])]
     why, tap = [], 'giao'
-    neo = None if lan_lap is None else ((lan_lap.get('khung_chung') or {}).get('pre'))
+    neo, _, neo_sha, dang = neo_of(lan_lap, 'pre')
     if neo is None:
         # Codex CT1-3: a MISSING anchor list is not a confirmed loss of every anchor (mat_neo needs an empty list):
         # no set of J v6 2 can be formed, the reference is not concluded (G1-G5)
         ids, tap = ma, 'thieu_neo'
         why.append('thieu_lan_lap' if lan_lap is None else 'lan_lap_thieu_khung_chung_pre')
+    elif dang == 'id_pts' and neo and neo_sha is None:
+        # Codex CT2-1: NHACTAM leaves khung_chung_sha256 null when its anchor set did not pass (c7_nhac_tam: sha only
+        # when s['chung'] ok): those anchors are not confirmed, no set of J v6 2 (not a loss of every anchor either)
+        ids, tap = ma, 'thieu_neo'
+        why.append('khung_chung_sha256.pre null: neo chua xac nhan (NHACTAM)')
     else:
         s = set(int(i) for i in neo)
         ids = [i for i in ma if i in s]

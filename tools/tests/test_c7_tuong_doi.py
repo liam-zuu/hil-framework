@@ -103,7 +103,18 @@ def latch_cols(path, edit=None):
         w = csv.DictWriter(f, fieldnames=list(rows[0]))
         w.writeheader()
         w.writerows(rows)
+    ev = str(path) + '.events.txt'
+    if not os.path.exists(ev):           # a run not blocked (O1 'Luot khong bi chan'): no operator cause (CT1-13)
+        us_events(ev, int(rows[0]['log_seq']), int(rows[-1]['log_seq']))
     return path
+
+
+def us_events(ev, first, last, boot='00000001', on='0', changes='0', blk='0', extra=''):
+    """'#us,ev=start' / '#us_end' of one run as the firmware writes them (AGV 5bde4c5 us_state.c), events file."""
+    with open(ev, 'w', encoding='utf-8') as f:
+        f.write(f'2026-11-19T10:00:00 #us,ev=start,boot={boot},on={on},swb=0,first_seq={first},line_drop=0\n'
+                f'2026-11-19T10:00:30 #us_end,boot={boot},on={on},swb=0,changes={changes},blk_ticks={blk},'
+                f'cut_ticks=0,ticks={last - first + 1},last_data_seq={last},line_drop=0\n' + extra)
 
 
 def score(tmp_path, task, frames, rel=None, log_kw=None, latch=None, **kw):
@@ -410,7 +421,8 @@ def test_ct1_3_lan_lap_bound_to_run_window_and_clock():
     of the window than the scoring: refused when read."""
     pre = dict(luot_id='L_1', cho='K1', khung=[dict(id=i, pts_s=0.0) for i in range(10)], clip_sha256='a' * 64,
                offset_cfg=dict(offset_s=0.25, offset_err_s=0.0, offset_anchor_s='0'), gio_sha256=None,
-               nguong={k: ctd.KHUNG_TC_DE_XUAT[k] for k in ctd.KHUNG_TC_DE_XUAT})
+               nguong={k: ctd.KHUNG_TC_DE_XUAT[k] for k in ctd.KHUNG_TC_DE_XUAT},
+               hang_so_dung=dict(u_t_ghep_s=0.0, troi_ppm=436.0, t_trong_s=0.1))
     ll = ll_of('O1-K1', [1, 2], cua_so_v1_sha256='9' * 64)
     cs.bind_lan_lap(ll, pre, '9' * 64, 'O1-K1')
     for over, msg in ((dict(luot_id='L_2'), 'luot_id'), (dict(cho='K2'), 'cho'), (dict(cua_so_v1_sha256='8' * 64),
@@ -421,7 +433,8 @@ def test_ct1_3_lan_lap_bound_to_run_window_and_clock():
 
     class A:
         gio_c8b, offset_s, offset_err_s, offset_anchor_s = None, 0.25, 0.0, '0'
-    hs = dict(khung_tc=dict(ctd.KHUNG_TC_DE_XUAT, nguon='t'), trang_thai='de_xuat')
+    hs = dict(khung_tc=dict(ctd.KHUNG_TC_DE_XUAT, nguon='t'), trang_thai='de_xuat', u_t_ghep_s=0.0, troi_ppm=436.0,
+              t_trong_s=0.1)
     cs.bind_clock(pre, A, hs)
     A.offset_s = 0.30
     with pytest.raises(ValueError, match='time source'):
@@ -759,7 +772,262 @@ def test_ct1_19_age_bound_example():
             dict(log_seq='11', timestamp_us='1010000', run_active='1', r_valid='1', rv_n='3', head_on='1',
                  psi_ref='0.0000', age_r_ms='8.0'),
             dict(log_seq='12', timestamp_us='1012000', run_active='1')]
-    fl, info = cs.yaw_latch_flags(rows, 1, 10.0)
+    fl, info = cs.yaw_latch_flags(rows, 1, 10.0, seq_max=12)
     assert abs(info['can_tuoi_ms'] - 10.053) < 1e-9 and fl and info['dong_ke_lien'] is True
-    fl, info = cs.yaw_latch_flags(rows, 1, 10.06)
+    fl, info = cs.yaw_latch_flags(rows, 1, 10.06, seq_max=12)
     assert not fl
+
+
+# ---------------------------------------------------------------- Codex round 2 (CT2-*, CT1-* residual): fail on fe7f802
+FIX_LL = os.path.join(os.path.dirname(__file__), 'data', 'lan_lap_v1_nhactam_f9c4b3d.json')
+
+
+def _real_ll():
+    """Run L01 of a lan_lap.json written by NHACTAM c7_nhac_tam.run_lan_lap (hil f9c4b3d; fixture data/...json) as
+    c7_chuoi_khung.doc_lan_lap gives it (file keys copied in), and the pre row of the window file NHACTAM read."""
+    with open(FIX_LL, encoding='utf-8') as f:
+        fx = json.load(f)
+    ll = dict(fx['luot'])
+    for k, v in fx['lan_lap_file'].items():
+        ll.setdefault(k, v)
+    return ll, dict(fx['cua_so_pre'])
+
+
+def test_ct2_1_reads_khung_chung_as_nhactam_writes_it():
+    """CT2-1: khung_chung.pre = {id, pts_s} (NHACTAM output): bound to the window (ids, PTS, sha); the reference
+    uses its ids; PTS or sha changed: refused; sha null (anchors not confirmed): thieu_neo, not mat_neo."""
+    ll, pre = _real_ll()
+    neo = ll['khung_chung']['pre']['id']
+    cs.bind_lan_lap(ll, pre, ll['cua_so_v1_sha256'], 'O1-F05')
+    bad = json.loads(json.dumps(ll))
+    bad['khung_chung']['pre']['pts_s'][3] += 0.01
+    with pytest.raises(ValueError, match='pts_s'):
+        cs.bind_lan_lap(bad, pre, ll['cua_so_v1_sha256'], 'O1-F05')
+    bad = json.loads(json.dumps(ll))
+    bad['khung_chung_sha256']['pre'] = bad['dau']['pre']['khung_chung_sha256'] = '0' * 64
+    with pytest.raises(ValueError, match='is not the sha256'):
+        cs.bind_lan_lap(bad, pre, ll['cua_so_v1_sha256'], 'O1-F05')
+    chain = [dict(frame_id=int(f['id']), t_cam=float(f['pts_s']), q_ok=True, a6_ok=True, p_x=0.5, p_y=0.1,
+                  psi_ma_p=0.3) for f in pre['khung']]
+    pre2 = dict(pre, t_ref=pre['khung'][-1]['pts_s'] + 0.05, ket_luan=dict(dat=True, ly_do=[]))
+    tc = ctd.tham_chieu(pre2, chain, ll, dict(ctd.KHUNG_TC_DE_XUAT, nguon='t'), 0.10, 1 / 60)
+    assert tc['tap'] == 'giao' and tc['ids'] == [i for i in pre['khung_ma_hop_le'] if i in set(neo)]
+    nul = json.loads(json.dumps(ll))
+    nul['khung_chung_sha256']['pre'] = nul['dau']['pre']['khung_chung_sha256'] = None
+    tc = ctd.tham_chieu(pre2, chain, nul, dict(ctd.KHUNG_TC_DE_XUAT, nguon='t'), 0.10, 1 / 60)
+    assert tc['tap'] == 'thieu_neo' and not tc['mat_neo'] and tc['trang_thai'] != 'dat'      # 12 frames: too few
+
+
+def test_ct2_2_missing_q_keeps_t_som_at_the_still_time(tmp_path):
+    """CT2-2: K1 without q on every frame (video continuous, speed unknown, yaw usable), car still from T_cmd: t_som is
+    about T_cmd (completion cannot be ruled out), not t_deadline."""
+    lane_rows = B.make_frames('O1-K1', post=4.0)
+    fl, chain = to_floor('O1-K1', lane_rows)
+    for c in chain:
+        c.update(q_ok=False, p_x=float('nan'), p_y=float('nan'))
+    out, _ = score(tmp_path, 'O1-K1', fl, rel=rel_for('O1-K1', fl, chain), allow_final_set=True,
+                   log_kw=dict(post=5.0))
+    g = out['gate_v3']['g1']
+    assert g['ca_t_som'] and g['t_som_s'] < 5.0 + 0.1 and g['t_som_s'] < g['t_deadline'] - 1.0
+
+
+def test_ct2_3_imu_alignment_on_every_f12_frame(tmp_path):
+    """CT2-3: F12 frames that are not 'valid' in frames.csv (one-sided gate of the window) still align the IMU: every
+    id of tham_chieu_v1 is used (n_align = n), not the valid subset."""
+    lane_rows = B.make_frames('O1-F05')
+    fl, chain = to_floor('O1-F05', lane_rows)
+    rel = rel_for('O1-F05', fl, chain)
+    drop = set(rel['tc']['ids'][::5])
+    fl = [dict(r, valid=False) if r['idx'] in drop else r for r in fl]
+    out, _ = score(tmp_path, 'O1-F05', fl, rel=rel)
+    y = out['yaw_check']
+    assert y['compared'] and y['align_set'] == 'tham_chieu_ids' and y['n_align'] == rel['tc']['n']
+
+
+def test_ct2_4_short_a6_loss_is_undefined_frames_not_a_gap(tmp_path):
+    """CT2-4 (Codex example): video continuous, A6 undefined 4.0-4.2 s: undefined frames (n_undef), no gap of the
+    measurement system, so the run is not lost."""
+    lane_rows = B.make_frames('O1-F05')
+    fl, chain = to_floor('O1-F05', lane_rows)
+    rel = rel_for('O1-F05', fl, chain)
+    for c, f in zip(chain, fl):
+        if 4.0 <= f['t_s'] + B.OFFSET - B.T0 < 4.2:
+            c.update(a6_ok=False, psi_ma_p=float('nan'), p_x=float('nan'), p_y=float('nan'))
+    out, _ = score(tmp_path, 'O1-F05', fl, rel=rel)
+    assert out['outcome'] != 'hong_he_do' and out['t1_kind'] != 'khoang_trong'
+    assert out['gate_v3']['g2']['n_undef'] > 0
+
+
+def test_ct2_5_f08_mask_does_not_depend_on_the_call(tmp_path):
+    """CT2-5: F08 relative with a certain G5 violation: report_only={'g5'} passed by the caller gives the same gate
+    (gate_v3.3, J v6 sha) and outcome as the default call."""
+    lane_rows = B.make_frames('O1-F08')
+    bump = lambda r: math.radians(15.0) if 2.0 <= r['t_s'] + B.OFFSET - B.T0 <= 3.0 else 0.0
+    fl, chain = to_floor('O1-F08', lane_rows, psi_extra=bump)
+    kw = dict(log_kw=dict(yaw_err=lambda t: math.radians(15.0) if 2.0 <= t <= 3.0 else 0.0))
+    a, _ = score(tmp_path / 'a', 'O1-F08', fl, rel=rel_for('O1-F08', fl, chain), **kw)
+    b, _ = score(tmp_path / 'b', 'O1-F08', fl, rel=rel_for('O1-F08', fl, chain), report_only={'g5'}, **kw)
+    assert b['gate_v3']['version'] == a['gate_v3']['version'] and b['gate_v3']['gate_file_sha256'] == cs.J_V6_SHA256
+    assert b['outcome'] == a['outcome'] != 'khong_dat'
+
+
+def test_ct2_8_absolute_no_frame_before_the_sender(tmp_path):
+    """CT2-8: absolute mode, no valid frame and a sender log with two different '#test_end': hong_he_do as at 921e839
+    (the sender is not read), not an error."""
+    lane_rows = [dict(r, valid=False) for r in B.make_frames('O1-F05')]
+    hs = B.hs_file(tmp_path)
+    log = B.make_log(tmp_path / 'esp32.csv', 'O1-F05', (0.0, 0.0, 0.0))
+    snd = tmp_path / 'sender.txt'
+    snd.write_text('#test_end,test=O1-F05,t_epoch=2.000,complete=1\n#test_end,test=O1-F05,t_epoch=3.000,complete=1\n',
+                   encoding='utf-8')
+    out, _ = cs.score(lane_rows, log, 'O1-F05', hs, offset_s=B.OFFSET, offset_reason='t', offset_anchor_s=0.0,
+                      offset_err_s=0.0, sender=str(snd))
+    assert out['outcome'] == 'hong_he_do' and out['fail_cause'] == cs.FAIL_MEAS
+
+
+def test_ct2_9_next_row_same_boot_and_counter_cells():
+    """CT2-9: the next row after the run's last data line (another boot) gives no age bound; an empty counter cell in
+    the window is missing evidence."""
+    rows = [dict(log_seq='10', timestamp_us='1000000', run_active='0', _t=1000000.0, _seq=10, psi_reset_count='0'),
+            dict(log_seq='11', timestamp_us='1010000', run_active='1', r_valid='1', rv_n='3', head_on='1',
+                 psi_ref='0.0000', age_r_ms='8.0', _t=1010000.0, _seq=11, psi_reset_count='0'),
+            dict(log_seq='12', timestamp_us='1012000', run_active='1', _t=1012000.0, _seq=12, psi_reset_count='')]
+    fl, info = cs.yaw_latch_flags(rows, 1, 125.0, seq_max=11)
+    assert info['can_tuoi_ms'] is None and fl
+    assert cs.psi_reset_flags(rows, 1, 1010000.0, 1.0)
+
+
+def test_ct1_12_still_six_seconds_not_only_log():
+    """CT1-12 residual (Codex example): the car moves in the first 2 s, then still 4.2 s to the edge; the log covers
+    6.2 s: the window fails (still < 6 s)."""
+    frames, chain = [], []
+    for k in range(420):
+        tk = k / 60
+        x = 0.5 + 0.05 * min(tk, 2.0)
+        frames.append(dict(idx=k, t_s=tk))
+        chain.append(dict(frame_id=k, cong_ok=True, tag_x=x, tag_y=0.1, tag_psi=0.3))
+    kt = dict(ctd.KHUNG_TC_DE_XUAT, nguon='t')
+    rows = ctd.cua_so(frames, chain, _log(0.0, 0.0, 12.0), 6.2e6, [0.0], [0.05], kt, 0.10, 2.0, 'O1-F05')
+    k = rows[0]['ket_luan']
+    assert k['dung_yen'] and k['cho_du'] and not k['dung_yen_6s'] and not k['dat']
+
+
+def test_ct1_14_one_median_on_the_window():
+    """CT1-14 (Codex example): scale rising 1.00 -> 1.08 over 4 s, 2 %, 0.5 s neighbourhood: one median (about 1.04)
+    rejects the end of the window (a sliding median would pass it)."""
+    frames, chain = [], []
+    for k in range(420):
+        tk = k / 60
+        sc = 1.0 + 0.08 * min(max(tk - 2.2, 0.0), 4.0) / 4.0
+        frames.append(dict(idx=k, t_s=tk, car_seen=True, why=[], valid=True, scale=sc))
+        chain.append(dict(frame_id=k, cong_ok=True, tag_x=0.5, tag_y=0.1, tag_psi=0.3))
+    gates = dict(scale_min=6, scale_rel=0.02, scale_win_s=0.5)
+    ok = ctd.mot_phia(frames, chain, gates, 6.2)
+    t = np.array([f['t_s'] for f in frames])
+    assert not ok[(t > 5.9) & (t < 6.2)].any() and ok[(t > 4.1) & (t < 4.3)].all()
+
+
+def test_ct1_14_cua_so_checks_track_json(tmp_path, capsys):
+    """CT1-14: cua-so takes the gates of track.json only for the track.json of this frames.csv (sha256)."""
+    lane_rows = B.make_frames('O1-F05')
+    p = tmp_path / 'frames.csv'
+    cs.cm.write_frames(str(p), lane_rows)
+    (tmp_path / 'track.json').write_text(json.dumps(dict(frames_sha256='0' * 64, gates=dict(cs.cm.DEFAULT_GATES),
+                                                         tag_offset=[0.0, 0.0, 0.0])), encoding='utf-8')
+    B.hs_file(tmp_path)
+    log = B.make_log(tmp_path / 'esp32.csv', 'O1-F05', (0.0, 0.0, 0.0))
+    rc = cs.main(['cua-so', '--frames', str(p), '--esp32', str(log), '--task', 'O1-F05', '--hang-so',
+                  str(tmp_path / 'hang_so.json'), '--out', str(tmp_path / 'cs.jsonl'), '--offset-s', str(B.OFFSET),
+                  '--offset-err-s', '0', '--offset-anchor-s', '0'])
+    assert rc == 2 and 'frames_sha256 differs' in capsys.readouterr().err
+
+
+def test_ct1_11_locked_relative_needs_the_branch_table():
+    """CT1-11 residual: a locked constants file of the relative mode without man_trap.nhanh is refused (J v6 6, 7)."""
+    with pytest.raises(ValueError, match='nhanh'):
+        cs.man_trap_of(dict(trang_thai='khoa_c8', man_trap=None), 'O1-F05', rel=True)
+    assert cs.man_trap_of(dict(trang_thai='de_xuat', man_trap=None), 'O1-F05', rel=True) is None
+
+
+@pytest.mark.parametrize('case', ['boot', 'blk', 'window_and_boot'])
+def test_ct1_13_operator_cause_first(tmp_path, case):
+    """CT1-13 (CODE 19/11): two boot ids in the events, or an ultrasonic block tick: fail_cause thao_tac with its kind;
+    with a lost reference window too, the run is the operator loss (not counted as a window loss)."""
+    import csv as _csv
+    lane_rows = B.make_frames('O1-F05')
+    fl, chain = to_floor('O1-F05', lane_rows)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    log = B.make_log(tmp_path / 'esp32.csv', 'O1-F05', (0.0, 0.0, 0.0))
+    with open(log, encoding='utf-8') as f:
+        f.readline()
+        seqs = [int(r['log_seq']) for r in _csv.DictReader(f)]
+    extra = ('2026-11-19T10:00:40 #gain_ack,tx=1,req_id=1,ok=1,err=none,sha=x,env=e,mac=m,boot=00000002\n'
+             if case != 'blk' else '')
+    us_events(str(log) + '.events.txt', seqs[0], seqs[-1], blk='3' if case == 'blk' else '0', extra=extra)
+    latch_cols(log)
+    hs = B.hs_file(tmp_path)
+    if case == 'window_and_boot':
+        pre, ids = ref_of(fl, chain)
+        ll = ll_of('O1-F05', ids[:20])
+        tc = ctd.tham_chieu(pre, chain, ll, dict(ctd.KHUNG_TC_DE_XUAT, nguon='t'), 0.10, 1 / B.FPS)
+        rel = cs.build_rel('O1-F05', chain, tc, None, ll)
+    else:
+        rel = rel_for('O1-F05', fl, chain)
+    out, _ = cs.score(fl, log, 'O1-F05', hs, offset_s=B.OFFSET, offset_reason='t', offset_anchor_s=0.0,
+                      offset_err_s=0.0, rel=rel)
+    assert out['outcome'] == 'hong_he_do' and out['fail_cause'] == 'thao_tac'
+    assert out['thao_tac'] == (['sieu_am'] if case == 'blk' else ['boot'])
+    if case == 'window_and_boot':
+        assert out['hong_cua_so_tc'] is False and any('cua so' in w for w in out['ly_do_khac'])
+
+
+def test_ct1_3_clock_constants_and_the_preliminary_grid(tmp_path):
+    """CT1-3 residual, CT2-7: the window binds the constants it used (u_t_ghep_s changed: refused); a window built
+    from the preliminary grid binds to the final grid that names it (luoi_so_bo_sha256, cua_so_v1_sha256)."""
+    so_bo, fin, cua = tmp_path / 'so_bo.json', tmp_path / 'gio.json', tmp_path / 'cs.jsonl'
+    so_bo.write_text('{"schema": "c8b_gio_v1", "n": 1}', encoding='utf-8')
+    cua.write_text('{}\n', encoding='utf-8')
+    fin.write_text(json.dumps(dict(schema='c8b_gio_v1', luoi_so_bo_sha256=cs.cm.sha256(str(so_bo)),
+                                   cua_so_v1_sha256=cs.cm.sha256(str(cua)))), encoding='utf-8')
+    hs = dict(khung_tc=dict(ctd.KHUNG_TC_DE_XUAT, nguon='t'), trang_thai='de_xuat', u_t_ghep_s=0.0, troi_ppm=436.0,
+              t_trong_s=0.1)
+    pre = dict(gio_sha256=cs.cm.sha256(str(so_bo)), nguong={k: ctd.KHUNG_TC_DE_XUAT[k] for k in ctd.KHUNG_TC_DE_XUAT},
+               hang_so_dung=dict(u_t_ghep_s=0.0, troi_ppm=436.0, t_trong_s=0.1))
+
+    class A:
+        gio_c8b, cua_so = str(fin), str(cua)
+    cs.bind_clock(pre, A, hs)
+    with pytest.raises(ValueError, match='hang_so_dung'):
+        cs.bind_clock(pre, A, dict(hs, u_t_ghep_s=0.2))
+    A.cua_so = str(so_bo)
+    with pytest.raises(ValueError, match='time grid'):
+        cs.bind_clock(pre, A, hs)
+
+
+def test_ct2_7_relative_without_the_grid_is_diagnostic(tmp_path):
+    """CT2-7 (CODE 19/11): relative scoring with --offset-s is a diagnostic: cham_c8 false with its reason."""
+    lane_rows = B.make_frames('O1-F05')
+    fl, chain = to_floor('O1-F05', lane_rows)
+    out, _ = score(tmp_path, 'O1-F05', fl, rel=rel_for('O1-F05', fl, chain))
+    assert out['cham_c8'] is False and out['cham_c8_ly_do']
+
+
+def test_ct1_16_lost_u_t_parts_without_infinity(tmp_path):
+    """CT1-16 residual: a run lost because the log ends before the union domain: no Infinity in the output."""
+    lane_rows = B.make_frames('O1-F05')
+    fl, chain = to_floor('O1-F05', lane_rows)
+    out, _ = score(tmp_path, 'O1-F05', fl, rel=rel_for('O1-F05', fl, chain), log_kw=dict(post=-3.0))
+    assert out['outcome'] == 'hong_he_do'
+    json.dumps(cs.cm._json(out), allow_nan=False)
+
+
+def test_ct1_20_g5_after_t_som_before_a_gap_is_lost(tmp_path):
+    """CT1-20 (J5-3 example): t_som case, the only G5 violation after t_som and before t1 of a gap: no exception, the
+    run is lost to the measurement system (rerun), not khong_dat."""
+    lane_rows = B.make_frames('O1-F05', post=4.0, drop=[(13.65 + 1.6, 13.65 + 1.9)])
+    t_late = 13.65 + 1.3
+    late = lambda r: math.radians(12.0) if r['t_s'] + B.OFFSET - B.T0 >= t_late else 0.0
+    fl, chain = to_floor('O1-F05', lane_rows, psi_extra=late)
+    out, rows = score(tmp_path, 'O1-F05', fl, rel=rel_for('O1-F05', fl, chain, truc=False),
+                      log_kw=dict(post=5.0, yaw_err=lambda t: math.radians(12.0) if t >= t_late else 0.0))
+    assert not out['cat_t1'] and out['outcome'] == 'hong_he_do' and out['fail_cause'] == cs.FAIL_MEAS
