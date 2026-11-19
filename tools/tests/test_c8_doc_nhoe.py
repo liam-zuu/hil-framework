@@ -110,15 +110,24 @@ def test_check_join(tmp_path):
     with open(p2, newline='') as f:
         b = list(csv.reader(f))
     g = [a[0]] + a[1:]
+    shift = float(a[-1][1]) + dn.JOIN_GAP_S - float(b[1][1])
     for r in b[1:]:
         r = list(r)
         r[0] = str(int(r[0]) + len(a) - 1)
-        r[1] = '%.6f' % (float(r[1]) + 12.0)
+        r[1] = '%.6f' % (float(r[1]) + shift)
         g.append(r)
     pg = tmp_path / 'g.csv'
     with open(pg, 'w', newline='') as f:
         csv.writer(f).writerows(g)
     dn._check_join(str(p1), str(p2), str(pg))
+    g2 = [list(r) for r in g]                                # DNC1-15: a gap other than 10 s is refused
+    for r in g2[len(a):]:
+        r[1] = '%.6f' % (float(r[1]) + 1.0)
+    pg2 = tmp_path / 'g2.csv'
+    with open(pg2, 'w', newline='') as f:
+        csv.writer(f).writerows(g2)
+    with pytest.raises(dn.DnError):
+        dn._check_join(str(p1), str(p2), str(pg2))
     g[5][5] = '9'
     with open(pg, 'w', newline='') as f:
         csv.writer(f).writerows(g)
@@ -227,6 +236,11 @@ def test_huber_pattern_robust():
 
 # ── v3: old frames keep the track's verdict (DN2-06) ─────────────────────────────────────────────
 
+def _track(rows):
+    """The rows as the track writes them (gated once, nothing taken)."""
+    return dn.regate_with(rows, np.zeros(len(rows), bool), 1.0, dict(cm.DEFAULT_GATES))
+
+
 def test_combine_old_frames_keep_run_a():
     rows = _rows(res=1.0e-3, scale=1.000)
     take = np.zeros(len(rows), bool)
@@ -234,6 +248,7 @@ def test_combine_old_frames_keep_run_a():
         rows[k]['res_sim_m'] = 2.5e-3
         rows[k]['scale'] = 1.008
         take[k] = True
+    rows = _track(rows)
     out, ra, rb, flips = dn.combine(rows, take, 1.0, dict(cm.DEFAULT_GATES))
     for k in range(len(rows)):
         if not take[k]:
@@ -241,8 +256,31 @@ def test_combine_old_frames_keep_run_a():
     assert all(out[k]['res_sim_m'] == rows[k]['res_sim_m'] for k in range(len(rows)))
 
 
-def test_combine_nothing_taken_is_run_a():
+def _same(a, b):
+    return a == b or (isinstance(a, float) and isinstance(b, float) and math.isnan(a) and math.isnan(b))
+
+
+def test_combine_old_rows_unchanged_taken_rows_from_run_b():
+    """DNC1-01: a frame not taken keeps every field of the track row (speeds included); a taken frame gets valid,
+    why, scale_ref and the speeds of run B."""
     rows = _rows(res=1.0e-3)
+    take = np.zeros(len(rows), bool)
+    for k in range(50, 70):
+        rows[k]['res_sim_m'] = 2.5e-3
+        take[k] = True
+    rows = _track(rows)
+    out, ra, rb, flips = dn.combine(rows, take, 1.0, dict(cm.DEFAULT_GATES))
+    for k in range(len(rows)):
+        if take[k]:
+            for c in ('valid', 'why', 'scale_ref', 'vx', 'vy', 'wz', 'speed'):
+                assert _same(out[k][c], rb[k][c])
+            assert out[k]['res_sim_m'] == 2.5e-3
+        else:
+            assert all(_same(out[k][c], rows[k][c]) for c in rows[k])
+
+
+def test_combine_nothing_taken_is_run_a():
+    rows = _track(_rows(res=1.0e-3))
     out, ra, rb, flips = dn.combine(rows, np.zeros(len(rows), bool), 1.0, dict(cm.DEFAULT_GATES))
     assert [r['valid'] for r in out] == [r['valid'] for r in ra] and not flips
 
@@ -464,7 +502,8 @@ def test_inj_table_rules():
     tab = dn.inj_table(rows)
     assert tab['P_2.0']['dat'] and tab['P_2.0']['cu']['nhan_sai'] == 1 and tab['P_2.0']['moi']['sai_that'] == 2
     assert not tab['P_3.0']['dat'] and 'nhan_sai' in tab['P_3.0']['ly_do']
-    assert tab['S_1.0']['dat'] and tab['S_1.0']['moi_co_i']['nhan'] == 0
+    assert not tab['S_1.0']['dat'] and tab['S_1.0']['ly_do'] == ['max_tam', 'max_huong']      # no tolerance (DNC1-05)
+    assert tab['S_1.0']['moi_co_i']['nhan'] == 0
     assert tab['P_4.0']['n'] == 0 and tab['P_4.0']['dat']
     assert tab['P_2.0']['dieu_kien'] and not tab['S_1.0']['dieu_kien'] and not tab['PS_2.0_1.0']['dieu_kien']
     assert tab['P_2.0']['theo_cap']['ca_hai_nhan'] == 1
@@ -477,3 +516,65 @@ def test_gate_vt_lost_when_leaving_out_is_its_own_reason():
     j, a, b = A['win'][k]
     G._drops[k] = [None] + G.drops(k)[1:]
     assert G.judge(k, sq, np.zeros(8), _F4(), 1e-3)[0] == 'vt_mat_khi_bo'
+
+
+
+# ── round 1 fixes ────────────────────────────────────────────────────────────────────────────────
+
+def test_loo_gap_bridged_by_the_target_is_refused():
+    """DNC1-02: the frame's own PTS must not split a gap of the neighbours (a, b) into two halves under 50 ms."""
+    t = np.arange(120) / 60.0
+    ang = 4.0 * t
+    seen = np.ones(120, bool)
+    seen[[59, 61]] = False                                   # neighbours of 60 at -/+ 33.3 ms: a 66.7 ms hole
+    om = dn.omega_loo(t, ang, seen)
+    assert np.isnan(om[60]) and np.isfinite(om[50])
+    C = dict(t=t, x=0.25 * np.cos(ang), y=0.25 * np.sin(ang), psi=ang, seen=seen)
+    assert dn.temporal_one(t, C['x'], C['y'], C['psi'], np.flatnonzero(seen), 60, (0.0, 0.0), 0.25) is None
+
+
+def test_gate_flip_wins_over_lost_vt():
+    """DNC1-08: a leave-out with a defined v_t that flips the verdict is reported even when another leave-out has no
+    v_t."""
+    G, A, sq = _gate(vmax=10.0)
+    k = 120
+    d = list(G.drops(k))
+    d[0] = None
+    d[1] = (20.0, d[1][1])                                   # out of the pattern range: the verdict flips
+    G._drops[k] = d
+    assert G.judge(k, sq, np.zeros(8), _F4(), 1e-3)[0] == 'vt_khong_ben'
+
+
+def test_scale_check_matches_apply_gates():
+    """(2b) used to score the injected frames equals c7_measure.apply_gates on the same pool."""
+    rows = _rows(res=1.0e-3)
+    for k in (30, 31):
+        rows[k]['scale'] = 0.96
+    tr = _track(rows)
+    C = dict(t=np.array([r['t_s'] for r in tr]), scale=np.array([r['scale'] for r in tr]))
+    pool = dn.p12_mask(tr)
+    g = dict(cm.DEFAULT_GATES)
+    for k in range(len(tr)):
+        ok, why = dn.scale_check(C, pool, k, C['scale'][k], g)
+        assert ok == tr[k]['valid'], k
+
+
+def test_long_runs_by_idx():
+    """DNC1-11: a lost frame ends a run."""
+    take = np.zeros(40, bool)
+    take[5:12] = True
+    take[13:20] = True                                       # 12 is not taken (lost or old): two runs of 7
+    C = dict(seen=np.ones(40, bool))
+    r = dn.long_runs(C, take)
+    assert r['so_cum'] == 2 and r['dai_nhat'] == 7
+
+
+def test_cong_refuses_flag_against_tables(tmp_path):
+    """DNC1-09: du_nhay true with a clip verdict not met is refused."""
+    k = tmp_path / 'khoa.json'
+    k.write_text(json.dumps(dict(version=dn.VERSION, du_nhay=True, clips=dict(c1=dict(du_nhay=False, ly_do=['x']),
+                                                                                c2=dict(du_nhay=True, ly_do=[])))),
+                 encoding='utf-8')
+    rc = dn.main(['cong', '--khoa', str(k), '--c1', 'a', 'b', '--c2', 'c', 'd', '--session', 's', '--cu', 'u',
+                  '--ghep', 'g', '--frames-a', 'f', '--out', str(tmp_path / 'o')])
+    assert rc == 2 and not (tmp_path / 'o').exists()
