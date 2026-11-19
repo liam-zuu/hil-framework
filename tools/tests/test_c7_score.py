@@ -950,13 +950,11 @@ def test_cs1_19_imu_range_exceeded_is_reported(tmp_path):
 def test_cs1_khoa_c8_needs_every_locked_block(tmp_path):
     full = dict(trang_thai='khoa_c8', duong_lenh=dict(cond2_m=0.02, cond3_ms=50.0, cond4_m=0.03),
                 cong_khung=dict(cm.DEFAULT_GATES), gia_dinh_nghi_vi_tri='dung', nhanh_tick='giu',
-                khung_tc=dict(n_min=120, frac_min=0.6, p_dung_m=0.003, psi_dung_deg=0.3, w_s=3.0, bien_s=0.1,
-                              dau_cuoi_s=0.25, log_ho_s=0.2, nguon='test'),
                 imu=dict(mien_dong={m: dict(goc_quay_deg=720.0, wz_dps=200.0, alpha_dps2=2000.0)
                                     for m in ('O1-F02', 'O1-F05', 'O1-F08', 'O1-K1', 'O1-K2')}))
     hs = hs_file(tmp_path, **json.loads(json.dumps(full)))
     assert hs['trang_thai'] == 'khoa_c8' and hs['gia_dinh_nghi_vi_tri'] == 'dung'
-    for drop in ('duong_lenh', 'cong_khung', 'nhanh_tick', 'khung_tc'):   # nhanh_tick OG3-4; khung_tc J v6 4
+    for drop in ('duong_lenh', 'cong_khung', 'nhanh_tick'):          # nhanh_tick: O1 v11.33 OG3-4
         bad = json.loads(json.dumps(full))
         del bad[drop]
         with pytest.raises(ValueError, match=drop):

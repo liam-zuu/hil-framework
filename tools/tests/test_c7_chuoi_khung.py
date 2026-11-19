@@ -58,9 +58,15 @@ def fake_a6(monkeypatch, tmp_path):
     return str(p), calls
 
 
-def xoay_file(tmp_path, q=(0.03, -0.01), st='dat'):
+def xoay_file(tmp_path, q=(0.03, -0.01), st='dat', a6_sha='auto'):
+    """xoay_v1 fitted on psi' after the A6 file of tmp_path (a6_sha256 of it, contract F4); a6_sha None: no key."""
     p = tmp_path / 'xoay.json'
-    p.write_text(json.dumps(dict(schema='xoay_v1', q_tag_m=list(q), u_q_m=0.0005, trang_thai=st)), encoding='utf-8')
+    d = dict(schema='xoay_v1', q_tag_m=list(q), u_q_m=0.0005, trang_thai=st)
+    if a6_sha == 'auto' and (tmp_path / 'a6.json').exists():
+        a6_sha = ck.sha256(str(tmp_path / 'a6.json'))
+    if a6_sha not in (None, 'auto'):
+        d['a6_sha256'] = a6_sha
+    p.write_text(json.dumps(d), encoding='utf-8')
     return str(p)
 
 
@@ -117,14 +123,17 @@ def test_another_mounting_uses_the_c8b_composition(fake_a6, tmp_path, monkeypatc
     seen = {}
     mod = types.ModuleType('c8b_xoay')
 
-    def ghep_q(lan_lap, cho):                          # contract F16 (C8B), q of the other mounting
-        seen.update(lan_lap=lan_lap, cho=cho)
+    def ghep_q(lan_lap, cho, xoay, truc_xe=None, u_psi_w_rad=None):     # F16 (C8B, hil 6866824)
+        seen.update(lan_lap=lan_lap, cho=cho, xoay=xoay, truc_xe=truc_xe, u_w=u_psi_w_rad)
         return dict(q_m=[0.02, 0.015], u_q_m=0.0007, trang_thai=lan_lap.get('st_thu', 'dat'), ly_do='')
     mod.ghep_q = ghep_q
     monkeypatch.setitem(sys.modules, 'c8b_xoay', mod)
     rows = spin_rows(q=(0.02, 0.015))
-    out = ck.chuoi_khung(rows, ck.doc_a6(a6p), xoay_file(tmp_path), lan_lap=ll, track=TRACK0, cho='K1')
+    out = ck.chuoi_khung(rows, ck.doc_a6(a6p), xoay_file(tmp_path), lan_lap=ll, track=TRACK0, cho='K1',
+                         truc_xe=dict(schema='truc_xe_v1'), u_psi_w_rad=0.001)
     assert seen['cho'] == 'K1' and all(r['q_ok'] and r['u_q_m'] == 0.0007 for r in out)
+    assert seen['xoay']['q_tag_m'] == [0.03, -0.01] and seen['truc_xe'] == dict(schema='truc_xe_v1')
+    assert seen['u_w'] == 0.001
     px, py = np.array([r['p_x'] for r in out]), np.array([r['p_y'] for r in out])
     assert np.max(np.hypot(px - 0.4, py + 0.2)) < 1e-6
     ll['st_thu'] = 'chua_ket_luan'
@@ -185,3 +194,56 @@ def test_mean_unwrapped_across_pi():
 def test_wrap_half_open():
     assert ck.wrap(-math.pi) == math.pi and ck.wrap(math.pi) == math.pi
     assert abs(ck.wrap(3 * math.pi / 2) + math.pi / 2) < 1e-12
+
+
+def test_q_needs_the_a6_it_was_fitted_on(fake_a6, tmp_path):
+    """Codex CT1-3: q of xoay_v1 is fitted on psi' after ONE A6 (a6_sha256, contract F4): another A6, or no a6_sha256,
+    gives no centre."""
+    a6p, _ = fake_a6
+    for sha, why in ((None, 'xoay_thieu_a6_sha256'), ('0' * 64, 'xoay_a6_khac_a6_dang_dung')):
+        out = ck.chuoi_khung(spin_rows(), ck.doc_a6(a6p), xoay_file(tmp_path, a6_sha=sha), track=TRACK0)
+        assert not any(r['q_ok'] for r in out) and all(why in r['ly_do'] for r in out)
+        assert all(r['a6_ok'] for r in out)                      # the heading after A6 stays
+
+
+def test_blank_tag_psi_cells_are_missing_frames(fake_a6, tmp_path):
+    """Codex CT1-18: a tag_psi column (text in frames.csv) with blank cells at the start and inside: those frames have
+    no tag heading, the others keep their IDs and values; the column is used even when its first cell is blank."""
+    a6p, _ = fake_a6
+    rows = spin_rows()
+    for r in rows:
+        r['tag_psi'], r['psi'] = str(r['psi']), 99.0
+    rows[0]['tag_psi'] = ''
+    rows[50]['tag_psi'] = ''
+    out = ck.chuoi_khung(rows, ck.doc_a6(a6p), xoay_file(tmp_path))
+    assert [r['frame_id'] for r in out] == [int(r['idx']) for r in rows]
+    assert not out[0]['cong_ok'] and not out[50]['cong_ok'] and out[1]['cong_ok'] and out[51]['cong_ok']
+    assert abs(out[1]['tag_psi'] - float(rows[1]['tag_psi'])) < 1e-12
+
+
+def test_lan_lap_session_file_gives_the_run(tmp_path):
+    """Codex CT1-3: a lan_lap_v1 file of the session (c7_nhac_tam: file keys + 'luot') gives the run of luot_id with
+    the file keys copied in; several runs without luot_id: refused."""
+    d = dict(schema='lan_lap_v1', cua_so_v1_sha256='a' * 64, session_sha256='b' * 64, tam_id='T1',
+             luot=[dict(schema='lan_lap_v1', luot_id='L_1', cho='goc'), dict(schema='lan_lap_v1', luot_id='L_2')])
+    p = tmp_path / 'lan_lap.json'
+    p.write_text(json.dumps(d), encoding='utf-8')
+    r = ck.doc_lan_lap(str(p), 'L_1')
+    assert r['luot_id'] == 'L_1' and r['cua_so_v1_sha256'] == 'a' * 64 and r['_sha256'] == ck.sha256(str(p))
+    with pytest.raises(ValueError, match='2 runs'):
+        ck.doc_lan_lap(str(p))
+    with pytest.raises(ValueError, match='L_9'):
+        ck.doc_lan_lap(str(p), 'L_9')
+
+
+def test_xoay_per_place_file(fake_a6, tmp_path):
+    """xoay_v1 per place (C8B ghep_q, hil 6866824: 'version', 'cho' {place: {q_tag_m, u_q_m, trang_thai}}): the q of
+    the place of the run; another place missing: no q."""
+    a6p, _ = fake_a6
+    p = tmp_path / 'xoay_cho.json'
+    p.write_text(json.dumps(dict(version='xoay_v1', a6_sha256=ck.sha256(a6p), cho={'goc': dict(
+        q_tag_m=[0.03, -0.01], u_q_m=0.0005, trang_thai='dat')})), encoding='utf-8')
+    out = ck.chuoi_khung(spin_rows(), ck.doc_a6(a6p), str(p), track=TRACK0, cho='goc')
+    assert all(r['q_ok'] for r in out)
+    out = ck.chuoi_khung(spin_rows(), ck.doc_a6(a6p), str(p), track=TRACK0, cho='K1')
+    assert all(not r['q_ok'] and 'xoay_thieu_cho_K1' in r['ly_do'] for r in out)

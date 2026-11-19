@@ -20,6 +20,25 @@ import rq3_log  # noqa: E402
 import test_c7_score as B  # noqa: E402
 
 P_TC, PHI0, A_TAG, BETA = (0.3, -0.2), 0.4, 0.2, 0.05
+CLIP12 = 'c' * 64                     # sha of the 12b clip named on both sides (truc_xe_v1, lan_lap_v1 dau.chuan)
+
+
+def ll_of(task, ids, beta_ok=True, tam=False, **over):
+    """lan_lap_v1 of one run (NHACTAM F8), bound to the 12b run '12b_1' of placement L0 (J v6 2)."""
+    d = dict(schema='lan_lap_v1', luot_id='L_1', cho=ctd.cho_of(task), lan_lap_id='L0', chuan_12b='12b_1',
+             dau={'chuan': {'clip_sha256': CLIP12}}, beta_deg=math.degrees(BETA), u_beta_deg=0.01, cung_lan_lap=True,
+             trang_thai={'beta': 'dat' if beta_ok else 'chua_ket_luan', 'delta_c_B': 'dat'},
+             tam_doi_trong_luot=tam, khung_chung={'pre': ids})
+    d.update(over)
+    return d
+
+
+def tx_of(task, phi_hat_deg, u=0.02, **over):
+    """truc_xe_v1 of the 12b run '12b_1' (HIEUCHUAN F7)."""
+    d = dict(schema='truc_xe_v1', mien_hieu_luc=dict(cho=ctd.cho_of(task), thu_id_cap='12b_1', lan_lap_id=None),
+             clip_sha256=CLIP12, trang_thai='khoa', phi_hat_chuan_k_deg=phi_hat_deg, u_phi_hat_chuan_k_deg=u)
+    d.update(over)
+    return d
 
 
 @pytest.fixture(autouse=True)
@@ -58,15 +77,13 @@ def ref_of(frames, chain, lo=-3.2, hi=-0.2):
     return pre, ids
 
 
-def rel_for(task, frames, chain, truc=True, beta_ok=True, tam=False, neo=None, u_beta_cam=0.02, kt=None):
+def rel_for(task, frames, chain, truc=True, beta_ok=True, tam=False, neo=None, u_beta_cam=0.02, kt=None, ll_over=None,
+            tx_over=None):
     pre, ids = ref_of(frames, chain)
-    ll = dict(schema='lan_lap_v1', beta_deg=math.degrees(BETA), u_beta_deg=0.01, cung_lan_lap=True,
-              trang_thai={'beta': 'dat' if beta_ok else 'chua_ket_luan', 'delta_c_B': 'dat'},
-              tam_doi_trong_luot=tam, khung_chung={'pre': ids if neo is None else neo})
+    ll = ll_of(task, ids if neo is None else neo, beta_ok, tam, **(ll_over or {}))
     kt = kt or dict(ctd.KHUNG_TC_DE_XUAT, nguon='test')
     tc = ctd.tham_chieu(pre, chain, ll, kt, 0.10, 1 / B.FPS)
-    tx = None if not truc else dict(schema='truc_xe_v1', cho=ctd.cho_of(task), trang_thai='khoa',
-                                    phi_hat_chuan_k_deg=math.degrees(PHI0 - BETA), u_phi_hat_chuan_k_deg=0.02)
+    tx = None if not truc else tx_of(task, math.degrees(PHI0 - BETA), **(tx_over or {}))
     return cs.build_rel(task, chain, tc, tx, ll, u_beta_cam)
 
 
@@ -242,16 +259,15 @@ def test_empty_intersection_is_mat_neo_not_lost():
     assert tc['tap'] == 'ma_mat_neo' and tc['mat_neo'] and tc['trang_thai'] == 'dat' and tc['n'] == len(ids)
     assert tc['phep_gop'] == 'trung_binh_go_vong' and tc['psi_tan_rad'] >= 0.0 and tc['p_tc_m'] is not None
     assert abs(tc['t_tc_s'] - np.mean([c['t_cam'] for c in chain if c['frame_id'] in set(ids)])) < 1e-9
-    phi, u, ok, why = ctd.phi_beta('O1-F05', dict(schema='truc_xe_v1', cho='goc', trang_thai='khoa',
-                                                  phi_hat_chuan_k_deg=1.0, u_phi_hat_chuan_k_deg=0.1),
-                                   dict(beta_deg=0.0, u_beta_deg=0.0, trang_thai={'beta': 'dat'}), tc, 0.02)
+    phi, u, ok, why = ctd.phi_beta('O1-F05', tx_of('O1-F05', 1.0, 0.1),
+                                   ll_of('O1-F05', [], beta_deg=0.0, u_beta_deg=0.0), tc, 0.02)
     assert not ok and any('mat_neo' in w for w in why)                 # J 2: beta needs the anchors
 
 
 def test_phi_beta_place_and_parts():
     tc = dict(tap='giao')
-    tx = dict(schema='truc_xe_v1', cho='K1', trang_thai='khoa', phi_hat_chuan_k_deg=10.0, u_phi_hat_chuan_k_deg=0.1)
-    ll = dict(beta_deg=2.0, u_beta_deg=0.05, trang_thai={'beta': 'dat'})
+    tx = tx_of('O1-K1', 10.0, 0.1)
+    ll = ll_of('O1-K1', [], beta_deg=2.0, u_beta_deg=0.05)
     with pytest.raises(ValueError, match='place'):
         ctd.phi_beta('O1-K2', tx, ll, tc)
     phi, u, ok, why = ctd.phi_beta('O1-K1', tx, ll, tc, None)
@@ -322,3 +338,356 @@ def test_cli_relative_inputs_need_the_flag(tmp_path):
     p = tmp_path / 'frames.csv'
     cs.cm.write_frames(str(p), lane_rows) if hasattr(cs.cm, 'write_frames') else None
     assert cs.main(['--frames', str(p), '--esp32', 'x', '--task', 'O1-F05', '--hang-so', 'x', '--a6', 'y']) == 2
+
+
+# ---------------------------------------------------------------- Codex round 1 (CT1-*): each test fails on 921e839
+def test_ct1_1_f08_g5_report_only_does_not_decide(tmp_path):
+    """CT1-1, CT1-20: F08 with G1-G4 passing and a CERTAIN G5 violation (camera and IMU turn together 15 deg, so the
+    frames are not yaw-suspect): G5 keeps its numbers and lo > 7.5 deg, but the run is not 'khong_dat'; the gate
+    leaves G5 out of its decide set and passes rq3_log with that required set."""
+    lane_rows = B.make_frames('O1-F08')
+    bump = lambda r: math.radians(15.0) if 2.0 <= r['t_s'] + B.OFFSET - B.T0 <= 3.0 else 0.0
+    fl, chain = to_floor('O1-F08', lane_rows, psi_extra=bump)
+    out, _ = score(tmp_path, 'O1-F08', fl, rel=rel_for('O1-F08', fl, chain),
+                   log_kw=dict(yaw_err=lambda t: math.radians(15.0) if 2.0 <= t <= 3.0 else 0.0))
+    g = out['gate_v3']
+    assert g['g5']['lo'] > 7.5 and g['g5']['state'] == 'khong_dat'
+    assert 'g5' not in g['decide'] and g['report_only'] == ['g5'] and g['gate_file_sha256'] == cs.J_V6_SHA256
+    rq3_log.validate_gate(g, 'HW', g['required'])
+    assert out['outcome'] != 'khong_dat' and all(g[c]['state'] != 'khong_dat' for c in ('g2', 'g3', 'g4'))
+
+
+@pytest.mark.parametrize('case', ['other_12b', 'other_clip', 'no_common_key', 'no_lan_lap_id'])
+def test_ct1_2_phi_needs_the_12b_of_this_placement(case):
+    """CT1-2 (CODE 19/11): phi only from the truc_xe_v1 of the 12b that lan_lap_v1 chuan_12b names, same session
+    (an identity key on both sides, equal), with a placement id."""
+    tc = dict(tap='giao')
+    tx, ll = tx_of('O1-K1', 10.0, 0.1), ll_of('O1-K1', [], beta_deg=2.0, u_beta_deg=0.05)
+    assert ctd.phi_beta('O1-K1', tx, ll, tc, 0.03)[2]
+    if case == 'other_12b':
+        tx['mien_hieu_luc']['thu_id_cap'] = '12b_0'
+    elif case == 'other_clip':
+        tx['clip_sha256'] = 'd' * 64
+    elif case == 'no_common_key':
+        del tx['clip_sha256']
+    else:
+        ll['lan_lap_id'] = None
+    phi, u, ok, why = ctd.phi_beta('O1-K1', tx, ll, tc, 0.03)
+    assert not ok and phi is None and math.isinf(u) and why
+
+
+def test_ct1_2_frames_sha_of_the_12b_run_binds():
+    """CT1-2: the frames sha of the 12b run in truc_xe_v1 nguon ('<thu_id>:frames') binds to dau.chuan.frames_sha256."""
+    tx = tx_of('O1-K1', 10.0, 0.1, nguon=[dict(vai_tro='12b_1:frames', sha256='e' * 64)])
+    del tx['clip_sha256']
+    ll = ll_of('O1-K1', [], dau={'chuan': {'frames_sha256': 'e' * 64}})
+    assert ctd.phi_beta('O1-K1', tx, ll, dict(tap='giao'), 0.03)[2]
+    ll['dau']['chuan']['frames_sha256'] = 'f' * 64
+    assert not ctd.phi_beta('O1-K1', tx, ll, dict(tap='giao'), 0.03)[2]
+
+
+def test_ct1_3_lan_lap_bound_to_run_window_and_clock():
+    """CT1-3: lan_lap_v1 of another run / place / window file, anchors outside the window, or another time source
+    of the window than the scoring: refused when read."""
+    pre = dict(luot_id='L_1', cho='K1', khung=[dict(id=i, pts_s=0.0) for i in range(10)], clip_sha256='a' * 64,
+               offset_cfg=dict(offset_s=0.25, offset_err_s=0.0, offset_anchor_s='0'), gio_sha256=None,
+               nguong={k: ctd.KHUNG_TC_DE_XUAT[k] for k in ctd.KHUNG_TC_DE_XUAT})
+    ll = ll_of('O1-K1', [1, 2], cua_so_v1_sha256='9' * 64)
+    cs.bind_lan_lap(ll, pre, '9' * 64, 'O1-K1')
+    for over, msg in ((dict(luot_id='L_2'), 'luot_id'), (dict(cho='K2'), 'cho'), (dict(cua_so_v1_sha256='8' * 64),
+                      'cua_so_v1_sha256'), (dict(khung_chung={'pre': [99]}), 'outside'),
+                      (dict(dau={'pre': {'clip_sha256': 'b' * 64}}), 'clip_sha256')):
+        with pytest.raises(ValueError, match=msg):
+            cs.bind_lan_lap(dict(ll, **over), pre, '9' * 64, 'O1-K1')
+
+    class A:
+        gio_c8b, offset_s, offset_err_s, offset_anchor_s = None, 0.25, 0.0, '0'
+    hs = dict(khung_tc=dict(ctd.KHUNG_TC_DE_XUAT, nguon='t'), trang_thai='de_xuat')
+    cs.bind_clock(pre, A, hs)
+    A.offset_s = 0.30
+    with pytest.raises(ValueError, match='time source'):
+        cs.bind_clock(pre, A, hs)
+
+
+def test_ct1_3_missing_anchor_list_is_not_mat_neo():
+    """CT1-3: lan_lap_v1 without khung_chung.pre (or no lan_lap_v1) is not a confirmed loss of every anchor: tap
+    thieu_neo, the reference not concluded; an EMPTY list stays mat_neo."""
+    lane_rows = B.make_frames('O1-F05')
+    fl, chain = to_floor('O1-F05', lane_rows)
+    pre, ids = ref_of(fl, chain)
+    kt = dict(ctd.KHUNG_TC_DE_XUAT, nguon='t')
+    for ll in (None, dict(khung_chung={})):
+        tc = ctd.tham_chieu(pre, chain, ll, kt, 0.10, 1 / B.FPS)
+        assert tc['tap'] == 'thieu_neo' and not tc['mat_neo'] and tc['trang_thai'] == 'chua_ket_luan'
+    tc = ctd.tham_chieu(pre, chain, dict(khung_chung={'pre': []}), kt, 0.10, 1 / B.FPS)
+    assert tc['tap'] == 'ma_mat_neo' and tc['mat_neo']
+
+
+def test_ct1_4_imu_aligned_on_the_reference_set(tmp_path):
+    """CT1-4: the camera-IMU alignment uses the frames of the reference set and the circular-unwrapped means: an IMU
+    offset only before that set (inside the older still window) does not move it."""
+    task = 'O1-K1'
+    lane_rows = B.make_frames(task)
+    hs = B.hs_file(tmp_path)
+    log = B.make_log(tmp_path / 'esp32.csv', task, (0.0, 0.0, 0.0),
+                     yaw_err=lambda t: math.radians(2.0) if t < -1.5 else 0.0)
+    t_log = np.array([r['t_s'] for r in lane_rows]) + B.OFFSET
+    psi = np.array([r['psi'] for r in lane_rows])
+    tv = t_log - B.T0
+    mask = (tv >= -1.2) & (tv < -0.2)
+    z = np.zeros(len(psi))
+    _, rep_old = cs.yaw_bounds(t_log, psi, z, z, B.T0, hs, task, log, B.T0 + 7.0)
+    _, rep = cs.yaw_bounds(t_log, psi, z, z, B.T0, hs, task, log, B.T0 + 7.0, align_mask=mask)
+    assert rep['align_set'] == 'tham_chieu' and rep['compared']
+    assert abs(rep['align_c_deg'] - math.degrees(B.YAW0)) < 1e-6 and rep['align_spread_deg'] < 1e-6
+    assert abs(rep_old['align_c_deg'] - math.degrees(B.YAW0)) > 0.5          # the old window sees the offset
+
+
+def test_ct1_5_t_som_speed_without_phi(tmp_path):
+    """CT1-5 (J v6 5 example): K1 without phi, the car moving until about T_cmd: its speed (centre after A6, q) is
+    known without phi, so t_som is not T_cmd but after a still t_d."""
+    lane_rows = B.make_frames('O1-K1')
+    fl, chain = to_floor('O1-K1', lane_rows)
+    out, _ = score(tmp_path, 'O1-K1', fl, rel=rel_for('O1-K1', fl, chain, truc=False), allow_final_set=True)
+    assert out['gate_v3']['g1']['t_som_s'] > 5.9
+
+
+def test_ct1_5_moved_plate_gives_no_speed():
+    """CT1-5: a plate that moved in the run: no frame speed (the tag shift is no car motion)."""
+    lane_rows = B.make_frames('O1-K1')
+    fl, chain = to_floor('O1-K1', lane_rows)
+    rel = rel_for('O1-K1', fl, chain, tam=True)
+    vi = [k for k, r in enumerate(fl) if r['valid']]
+    R = cs.rel_pose(fl, vi, rel, cs.KTask('O1-K1', (0.0, 0.0, 0.0), end_incoming=True))
+    assert R['tam_ok'].all() and not R['speed_def'].any()
+
+
+def test_ct1_6_yaw_suspect_flag_from_the_comparison(tmp_path):
+    """CT1-6 (Codex example): U_psi 5 deg, suspect threshold 1 deg, camera 2 deg off the IMU: the frames are
+    yaw-suspect (bound 3 deg <= U_psi, so the old reading from the bound missed them)."""
+    lane_rows = B.make_frames('O1-F05')
+    off = lambda r: math.radians(2.0) if 2.0 <= r['t_s'] + B.OFFSET - B.T0 <= 3.0 else 0.0
+    fl, chain = to_floor('O1-F05', lane_rows, psi_extra=off)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    hs = B.hs_file(tmp_path, U_psi_deg=5.0, yaw_nghi_deg=1.0)
+    log = B.make_log(tmp_path / 'esp32.csv', 'O1-F05', (0.0, 0.0, 0.0))
+    out, rows = cs.score(fl, log, 'O1-F05', hs, offset_s=B.OFFSET, offset_reason='test', offset_anchor_s=0.0,
+                         offset_err_s=0.0, rel=rel_for('O1-F05', fl, chain))
+    mid = [r for r in rows if 2.1 <= r['t'] <= 2.9]
+    assert mid and all(r['nghi_ngo_yaw'] == 1 and r['so_duoc_yaw'] == 1 for r in mid)
+
+
+def test_ct1_7_frames_without_a6_are_undefined_not_raw(tmp_path):
+    """CT1-7: frames that lose A6 inside the run give no raw tag pose to the tracker or G1: they come back as
+    undefined frames (n_undef), the run cannot be 'dat'."""
+    lane_rows = B.make_frames('O1-F05')
+    fl, chain = to_floor('O1-F05', lane_rows)
+    rel = rel_for('O1-F05', fl, chain)
+    lost = set()
+    for c, f in zip(chain, fl):
+        if 2.0 <= f['t_s'] + B.OFFSET - B.T0 < 2.05:
+            c.update(a6_ok=False, psi_ma_p=float('nan'), p_x=float('nan'), p_y=float('nan'))
+            lost.add(c['frame_id'])
+    out, rows = score(tmp_path, 'O1-F05', fl, rel=rel)
+    g = gate_ok(out)
+    assert lost and all(g[c]['n_undef'] > 0 for c in ('g2', 'g3', 'g4', 'g5'))
+    assert out['outcome'] == 'chua_ket_luan'
+    lr = [r for r in rows if r['frame_id'] in lost]
+    assert len(lr) == len(lost) and all(r['khung_thieu_tam'] == 1 and r['vi_tri_xac_dinh'] == 0 for r in lr)
+    assert all(not math.isfinite(r['lo_g2']) for r in lr)
+
+
+def test_ct1_8_k2_closing_corner_takes_the_incoming_side():
+    """CT1-8 (Codex numbers): K2 at s = S, (x, y) = (0.05656854, -0.05656854) m, psi 0.127 rad, window [3.8, 4.0]:
+    G4 96.996 mm by the incoming side (relative mode), 100.364 mm by side 0 (absolute mode, O1 3.7)."""
+    x, y, psi = 0.05656854, -0.05656854, 0.127
+    vals = []
+    for inc in (True, False):
+        lane = cs.KTask('O1-K2', (0.0, 0.0, 0.0), end_incoming=inc)
+        s2, e, hd = lane.project(x, y, 3.8, 4.0)
+        psi0, al, bl = lane.nominal(hd)
+        vals.append(cs.o1_gate_eval.g4_value(e, psi, hd, psi0, al, bl))
+        heads = {round(h, 9) for _, _, h in cs.k_jk(lane, x, y, 3.8, 4.0, 0.001)}
+        if inc:
+            assert heads == {round(float(lane.poly.head[-1]), 9)}
+    assert abs(vals[0] - 0.096996) < 2e-6 and abs(vals[1] - 0.100364) < 2e-6
+
+
+def test_ct1_9_g4_without_yaw_comparison_is_undefined(tmp_path):
+    """CT1-9: no IMU yaw (frames not compared): G4 keeps q but no finite lo in the relative mode, so a lane offset
+    above D gives G2 'khong_dat' but G4 only 'chua_ket_luan'."""
+    lane_rows = B.make_frames('O1-F05', lat_fn=lambda t: 0.14 * min(1.0, max(0.0, t)))
+    fl, chain = to_floor('O1-F05', lane_rows)
+    out, _ = score(tmp_path, 'O1-F05', fl, rel=rel_for('O1-F05', fl, chain), log_kw=dict(no_imu=True))
+    g = out['gate_v3']
+    assert not out['yaw_check']['compared']
+    assert g['g2']['state'] == 'khong_dat' and g['g4']['state'] == 'chua_ket_luan' and g['g4']['q'] > 0.1
+
+
+def test_ct1_11_shutter_branch_table(tmp_path):
+    """CT1-11: a branch table of every level, all 'mot_khung', needs no alpha; a level missing: refused; the relative
+    mode with --offset-s takes the shutter term of its branch (one frame) and names the branch."""
+    for d in ('a', 'b'):
+        (tmp_path / d).mkdir()
+    hs = B.hs_file(tmp_path / 'a', man_trap=dict(nguon='t', nhanh={'O1-F02': 'mot_khung', 'O1-F05': 'mot_khung',
+                                                                     'O1-F08': 'mot_khung', 'K': 'mot_khung'}))
+    assert hs['man_trap']['alpha_r_s_px'] is None and cs.man_trap_of(hs, 'O1-K1', rel=True) is None
+    with pytest.raises(ValueError, match='missing'):
+        B.hs_file(tmp_path / 'b', man_trap=dict(nguon='t', alpha_r_s_px=0.0, alpha_c_s_px=0.0,
+                                                 nhanh={'O1-F05': 'alpha'}))
+    lane_rows = B.make_frames('O1-F05')
+    fl, chain = to_floor('O1-F05', lane_rows)
+    out, _ = score(tmp_path / 'c', 'O1-F05', fl, rel=rel_for('O1-F05', fl, chain))
+    p = out['U_t_parts']
+    assert p['man_trap_nhanh'] == 'mot_khung' and abs(p['man_trap_s'] - 1 / B.FPS) < 1e-6
+
+
+def test_ct1_12_joint_hole_and_waiting_time():
+    """CT1-12: a hole above t_trong between t_ref and t_max, or less than 6 s from the first log line to the edge:
+    the window fails (both pass the other gates)."""
+    kt = dict(ctd.KHUNG_TC_DE_XUAT, nguon='t')
+    frames, chain = _still_chain(n=420, gap=(6.05, 6.3))
+    rows = ctd.cua_so(frames, chain, _log(0.0, -1.0, 12.0), 6.2e6, [0.0], [0.2], kt, 0.10, 2.0, 'O1-F05')
+    k = rows[0]['ket_luan']
+    assert k['du_mau'] and k['dung_yen'] and not k['noi_phu'] and not k['dat']
+    frames, chain = _still_chain(n=420)
+    rows = ctd.cua_so(frames, chain, _log(0.0, 1.0, 12.0), 6.2e6, [0.0], [0.05], kt, 0.10, 2.0, 'O1-F05')
+    k = rows[0]['ket_luan']
+    assert k['du_mau'] and k['log_phu'] and not k['cho_du'] and not k['dat'] and abs(k['cho_log_s'] - 5.2) < 1e-6
+
+
+def test_ct1_12_heading_spread_on_the_reference_set():
+    """CT1-12: the heading spread gate on the set actually used (psi' after A6): 0.5 deg > 0.3 deg -> run lost to
+    the reference window."""
+    lane_rows = B.make_frames('O1-F05')
+    fl, chain = to_floor('O1-F05', lane_rows)
+    pre, ids = ref_of(fl, chain)
+    s = set(ids)
+    for j, c in enumerate(x for x in chain if x['frame_id'] in s):
+        c['psi_ma_p'] += math.radians(0.5) * (j % 2)
+    tc = ctd.tham_chieu(pre, chain, ll_of('O1-F05', ids), dict(ctd.KHUNG_TC_DE_XUAT, nguon='t'), 0.10, 1 / B.FPS)
+    assert tc['trang_thai'] == 'hong_cua_so_tc' and any('tan huong' in w for w in tc['ly_do'])
+
+
+def test_ct1_13_window_reasons_and_order(tmp_path, monkeypatch):
+    """CT1-13: the reference window lost keeps the command-path reasons of the run; a clip with no valid frame and a
+    lost window is a window loss; a log without the tick bound is a window reason, not a tool error."""
+    lane_rows = B.make_frames('O1-F05')
+    fl, chain = to_floor('O1-F05', lane_rows)
+    pre, ids = ref_of(fl, chain)
+    ll = ll_of('O1-F05', ids[:20])
+    tc = ctd.tham_chieu(pre, chain, ll, dict(ctd.KHUNG_TC_DE_XUAT, nguon='t'), 0.10, 1 / B.FPS)
+    rel = cs.build_rel('O1-F05', chain, tc, None, ll)
+    monkeypatch.setattr(cs.ocp, 'analyse', lambda *a: dict(flags=['boot giua luot'], notes=[], cond2={}, cond3={},
+                                                          cond4={}))
+    out, _ = score(tmp_path / 'a', 'O1-F05', fl, rel=rel)
+    assert out['hong_cua_so_tc'] and any('boot' in w for w in out['ly_do_khac'])
+    bad = [dict(r, valid=False) for r in fl]
+    out, _ = score(tmp_path / 'b', 'O1-F05', bad, rel=rel)
+    assert out.get('hong_cua_so_tc') is True
+
+    class A:
+        gio_c8b, offset_s, offset_err_s, offset_anchor_s = None, B.OFFSET, 0.0, '0'
+    log = B.make_log(tmp_path / 'esp32.csv', 'O1-F05', (0.0, 0.0, 0.0))
+    rows, _, _, _ = cs.read_esp32(log)
+    t0_us = float(rows[cs.ocp.find_edge(rows)[0]]['_t'])
+    hs = B.hs_file(tmp_path)
+    _, _, _, why = cs._clock_nodes(A, rows[-5:], t0_us, fl, hs, 3.0)
+    assert why and 'tick' in why[0]
+
+
+def test_ct1_14_one_sided_gate_and_full_pts():
+    """CT1-14: khung holds every PTS of the window (also one whose capture ends after t_ref); a frame that failed the
+    TWO-sided scale gate only because of later frames passes the one-sided gate; a scale jump after t_ref does not
+    change the pre set."""
+    n, dt = 420, 1 / 60
+    frames, chain = [], []
+    for k in range(n):
+        tk = k * dt
+        sc = 1.10 if tk > 6.05 else 1.0                                    # the frames after t_ref differ
+        why = ['ti_le'] if 5.9 < tk < 6.05 else []                          # two-sided verdict spoilt by them
+        frames.append(dict(idx=k, t_s=tk, car_seen=True, why=why, valid=not why, scale=sc))
+        chain.append(dict(frame_id=k, cong_ok=not why, tag_x=0.5, tag_y=0.1, tag_psi=0.3))
+    kt = dict(ctd.KHUNG_TC_DE_XUAT, nguon='t')
+    gates = dict(scale_min=6, scale_rel=0.02, scale_win_s=0.5)
+    rows = ctd.cua_so(frames, chain, _log(0.0, -1.0, 12.0), 6.2e6, [0.0], [0.055], kt, 0.10, 2.0, 'O1-F05',
+                      gates=gates)
+    pre = rows[0]
+    t_ref = pre['t_ref']
+    assert any(f['pts_s'] + dt >= t_ref for f in pre['khung'])
+    used = set(pre['khung_ma_hop_le'])
+    assert all(k in used for k in range(n) if 5.9 < k * dt < 6.05)
+    assert pre['cong_ti_le'] == 'mot_phia'
+
+
+def test_ct1_15_absolute_locked_file_without_khung_tc(tmp_path):
+    """CT1-15: a locked constants file of the absolute mode needs no khung_tc; in the relative mode the four F14 keys
+    are required and w_s is 3 s."""
+    full = dict(trang_thai='khoa_c8', duong_lenh=dict(cond2_m=0.02, cond3_ms=50.0, cond4_m=0.03),
+                cong_khung=dict(cs.cm.DEFAULT_GATES), gia_dinh_nghi_vi_tri='dung', nhanh_tick='giu',
+                imu=dict(mien_dong={m: dict(goc_quay_deg=720.0, wz_dps=200.0, alpha_dps2=2000.0)
+                                    for m in ('O1-F02', 'O1-F05', 'O1-F08', 'O1-K1', 'O1-K2')}))
+    for d in ('a', 'b', 'c'):
+        (tmp_path / d).mkdir()
+    hs = B.hs_file(tmp_path / 'a', **json.loads(json.dumps(full)))
+    assert hs['khung_tc'] is None
+    with pytest.raises(ValueError, match='khung_tc'):
+        cs.khung_tc_of(hs)
+    kt4 = dict(n_min=120, frac_min=0.6, p_dung_m=0.003, psi_dung_deg=0.3)
+    hs = B.hs_file(tmp_path / 'b', **json.loads(json.dumps(dict(full, khung_tc=kt4))))
+    assert cs.khung_tc_of(hs)['w_s'] == 3.0
+    with pytest.raises(ValueError, match='w_s'):
+        B.hs_file(tmp_path / 'c', **json.loads(json.dumps(dict(full, khung_tc=dict(kt4, w_s=4.0)))))
+
+
+def test_ct1_16_json_without_infinity(tmp_path):
+    """CT1-16: without u_beta_cam the block has u_phi_rad null with its state, no Infinity in the JSON; bien_doi
+    names psi_dd (F13)."""
+    lane_rows = B.make_frames('O1-F05')
+    fl, chain = to_floor('O1-F05', lane_rows)
+    out, rows = score(tmp_path, 'O1-F05', fl, rel=rel_for('O1-F05', fl, chain, u_beta_cam=None))
+    k = out['khung_tuong_doi']
+    assert k['u_phi_rad'] is None and k['u_phi_trang_thai'] == 'thieu_u_beta_cam' and 'psi_dd' in k['bien_doi']
+    json.dumps(cs.cm._json(k), allow_nan=False)
+    assert all(r['U_phi_k'] is None for r in rows)
+
+
+def test_ct1_19_heading_reset_mid_run_is_command_path_loss(tmp_path):
+    """CT1-19 (part): reset_n changing inside the run window: run lost to the command path (relative mode)."""
+    lane_rows = B.make_frames('O1-F05')
+    fl, chain = to_floor('O1-F05', lane_rows)
+    out, _ = score(tmp_path, 'O1-F05', fl, rel=rel_for('O1-F05', fl, chain), log_kw=dict(reset_at=4.0))
+    assert out['outcome'] == 'hong_he_do' and out['fail_cause'] == cs.FAIL_CMD
+    assert any('reset_n' in w for w in out['outcome_reasons'])
+
+
+def test_ct1_20_g5_after_t_som_real_violation_only_chua_ket_luan(tmp_path):
+    """CT1-20: a REAL G5 violation (camera and IMU turn 10 deg together, lo > 7.5 deg at known frames) after t_som
+    gives chua_ket_luan; the same evidence before t_som gives khong_dat (test above)."""
+    lane_rows = B.make_frames('O1-F05', post=4.0)
+    t_late = 13.65 + 1.3                                  # t_som is about 14.67 s here, t_deadline 15.65 s
+    late = lambda r: math.radians(12.0) if r['t_s'] + B.OFFSET - B.T0 >= t_late else 0.0
+    fl, chain = to_floor('O1-F05', lane_rows, psi_extra=late)
+    out, rows = score(tmp_path, 'O1-F05', fl, rel=rel_for('O1-F05', fl, chain, truc=False),
+                      log_kw=dict(post=5.0, yaw_err=lambda t: math.radians(12.0) if t >= t_late else 0.0))
+    g = gate_ok(out)
+    assert g['g1']['t_som_s'] < t_late
+    assert any(r['t'] > t_late + 0.2 and r['lo_g5'] > 7.5 for r in rows)
+    assert not any(r['t'] <= g['g1']['t_som_s'] and r['lo_g5'] > 7.5 for r in rows)
+    assert g['g5']['state'] == 'chua_ket_luan' and out['outcome'] == 'chua_ket_luan'
+
+
+def test_ct1_20_cli_relative_inputs_without_the_flag(tmp_path, capsys):
+    """CT1-20: valid frames, log and constants; a relative input without --tuong-doi is refused for that reason;
+    --tuong-doi without --rows is refused for its own reason."""
+    lane_rows = B.make_frames('O1-F05')
+    p = tmp_path / 'frames.csv'
+    cs.cm.write_frames(str(p), lane_rows)
+    B.hs_file(tmp_path)
+    log = B.make_log(tmp_path / 'esp32.csv', 'O1-F05', (0.0, 0.0, 0.0))
+    base = ['--frames', str(p), '--esp32', str(log), '--task', 'O1-F05', '--hang-so', str(tmp_path / 'hang_so.json'),
+            '--offset-s', str(B.OFFSET), '--offset-reason', 't', '--offset-anchor-s', '0', '--offset-err-s', '0']
+    assert cs.main(base + ['--a6', 'y']) == 2
+    assert 'without --tuong-doi' in capsys.readouterr().err
+    assert cs.main(base + ['--tuong-doi', '--cua-so', 'a', '--tham-chieu', 'b', '--out', str(tmp_path / 'o.json')]) == 2
+    assert '--rows' in capsys.readouterr().err

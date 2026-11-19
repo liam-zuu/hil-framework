@@ -90,16 +90,26 @@ def doc_a6(path):
     return dict(obj=c8b_a6.load_a6(path), mod=c8b_a6, path=os.path.abspath(path), sha256=sha256(path))
 
 
-def doc_xoay(src):
+def doc_xoay(src, cho=None):
     """xoay_v1 of CODE_C8B (contract F4): q_tag_m [x, y] (rotation centre -> tag centre, tag frame, fitted on psi'
-    after A6), u_q_m, trang_thai. Returns dict(q, u_q, ok, ly_do, path, sha256); ok False when missing or not 'dat'."""
+    after A6), u_q_m, trang_thai; per place under 'cho' {goc, K1, ...} (C8B ghep_q, hil 6866824: key 'version') or
+    flat. Returns dict(q, u_q, ok, ly_do, path, sha256, a6_sha256, raw); ok False when missing, without the place, or
+    not 'dat'. raw: the whole file, for c8b_xoay.ghep_q."""
     d, path, sha = _load_json(src, 'xoay')
-    out = dict(q=None, u_q=None, ok=False, ly_do='', path=path, sha256=sha, a6_sha256=None)
+    out = dict(q=None, u_q=None, ok=False, ly_do='', path=path, sha256=sha, a6_sha256=None, raw=d)
     if d is None:
         out['ly_do'] = 'thieu_xoay'
         return out
-    if d.get('schema') not in (None, XOAY_SCHEMA):
-        raise ValueError(f'xoay: schema {d.get("schema")!r}, expected {XOAY_SCHEMA}')
+    tag = d.get('schema', d.get('version'))
+    if tag not in (None, XOAY_SCHEMA):
+        raise ValueError(f'xoay: schema/version {tag!r}, expected {XOAY_SCHEMA}')
+    if isinstance(d.get('cho'), dict):
+        top_a6 = d.get('a6_sha256')
+        if cho is None or not isinstance(d['cho'].get(cho), dict):
+            out['ly_do'] = f'xoay_thieu_cho_{cho}'
+            return out
+        d = dict(d['cho'][cho])
+        d.setdefault('a6_sha256', top_a6)
     q = d.get('q_tag_m')
     try:
         q = [float(q[0]), float(q[1])]
@@ -119,14 +129,36 @@ def doc_xoay(src):
     return out
 
 
-def doc_lan_lap(src):
-    """lan_lap_v1 of NHACTAM (contract F8) as a dict with path and sha256; None without it."""
+LAN_LAP_FILE_KEYS = ('cua_so_v1_sha256', 'session_sha256', 'tam_id', 'hieu_chuan', 'a6')
+
+
+def doc_lan_lap(src, luot_id=None):
+    """lan_lap_v1 of NHACTAM (contract F8) as the dict of ONE run with path and sha256 (of the file); None without it.
+    The file of a session (c7_nhac_tam lan_lap: file keys + 'luot' list) gives the run whose luot_id is given, with
+    the file keys LAN_LAP_FILE_KEYS copied in when the run lacks them (Codex CT1-3: cua_so_v1_sha256, session); a
+    file of several runs without luot_id, or without that run: ValueError."""
     d, path, sha = _load_json(src, 'lan_lap')
     if d is None:
         return None
     if d.get('schema') not in (None, LAN_LAP_SCHEMA):
         raise ValueError(f'lan_lap: schema {d.get("schema")!r}, expected {LAN_LAP_SCHEMA}')
-    d = dict(d)
+    if isinstance(d.get('luot'), list):
+        runs = [r for r in d['luot'] if isinstance(r, dict)]
+        if luot_id is None:
+            if len(runs) != 1:
+                raise ValueError(f'lan_lap_v1 holds {len(runs)} runs: give the run id (luot_id of cua_so_v1 pre)')
+            pick = runs
+        else:
+            pick = [r for r in runs if r.get('luot_id') == luot_id]
+            if len(pick) != 1:
+                raise ValueError(f'lan_lap_v1: {len(pick)} runs with luot_id {luot_id!r} (need exactly one)')
+        rec = dict(pick[0])
+        for k in LAN_LAP_FILE_KEYS:
+            if k not in rec and k in d:
+                rec[k] = d[k]
+        d = rec
+    else:
+        d = dict(d)
     d['_path'], d['_sha256'] = path, sha
     return d
 
@@ -136,14 +168,21 @@ def _trang_thai(d, key):
     return tt.get(key) if isinstance(tt, dict) else None
 
 
-def q_luot(xoay, lan_lap, cho=None):
+def q_luot(xoay, lan_lap, cho=None, a6_sha256=None, truc_xe=None, u_psi_w_rad=None):
     """(q [x, y] or None, u_q [m] or None, ly_do) of the run. Same mounting as the E clip (lan_lap absent: the
     calibration clips of the same session, 12b / E; or cung_lan_lap true): q of xoay_v1. Another mounting: the q
-    composed by CODE_C8B, c8b_xoay.ghep_q(lan_lap, cho) -> {q_m, u_q_m, trang_thai, ly_do} (contract F16: q_m =
-    R(-theta_luot) (q_B_chuan_k + delta_c_B), before the margin); not 'dat', not importable or no place: no q (the
-    position through q is not concluded)."""
+    composed by CODE_C8B, c8b_xoay.ghep_q(lan_lap, cho, xoay_v1, truc_xe, u_psi_w_rad) -> {q_m, u_q_m, trang_thai,
+    ly_do} (contract F16, signature of hil 6866824: q_m = R(-theta_luot) (R(theta_chuan) q_tag + delta_c_B), before
+    the margin; u_psi_w_rad: noise of the mean tag heading over the run window, given by the caller); not 'dat', not importable or no place: no q (the
+    position through q is not concluded). a6_sha256 (the A6 file used for psi'): q was fitted on psi' after ONE A6
+    (xoay_v1 a6_sha256, contract F4); missing there or another A6: no q (Codex CT1-3)."""
     if not xoay['ok']:
         return None, None, xoay['ly_do']
+    if a6_sha256 is not None:
+        if not xoay.get('a6_sha256'):
+            return None, None, 'xoay_thieu_a6_sha256'
+        if xoay['a6_sha256'] != a6_sha256:
+            return None, None, 'xoay_a6_khac_a6_dang_dung'
     if lan_lap is None or lan_lap.get('cung_lan_lap') is True:
         return list(xoay['q']), float(xoay['u_q']), ('khong_kiem_lan_lap' if lan_lap is None else '')
     if _trang_thai(lan_lap, 'delta_c_B') != 'dat':
@@ -155,7 +194,11 @@ def q_luot(xoay, lan_lap, cho=None):
         g = c8b_xoay.ghep_q
     except (ImportError, AttributeError):
         return None, None, 'cho_ham_ghep_q_C8B'
-    r = g({k: v for k, v in lan_lap.items() if not k.startswith('_')}, cho)
+    try:
+        r = g({k: v for k, v in lan_lap.items() if not k.startswith('_')}, cho, xoay.get('raw'), truc_xe, u_psi_w_rad)
+    except TypeError:
+        return None, None, 'cho_ham_ghep_q_C8B (chu ky cu)'
+
     if not isinstance(r, dict) or r.get('trang_thai') != 'dat':
         return None, None, 'ghep_q_' + str((r or {}).get('trang_thai')) + ':' + str((r or {}).get('ly_do', ''))
     try:
@@ -177,9 +220,10 @@ def _frames(frames_csv):
 
 
 def _tag_heading_source(rows, frames_path, track):
-    """'tag_psi' when the column exists; 'psi' when track.json (given, or beside frames.csv) has tag_offset (0, 0, 0);
-    else raise (the heading of frames.csv is not the tag heading)."""
-    if rows and 'tag_psi' in rows[0] and rows[0]['tag_psi'] not in (None, ''):
+    """'tag_psi' when the column exists (whatever its cells: a blank cell is a missing value of that frame, Codex
+    CT1-18); 'psi' when track.json (given, or beside frames.csv) has tag_offset (0, 0, 0); else raise (the heading of
+    frames.csv is not the tag heading)."""
+    if rows and 'tag_psi' in rows[0]:
         return 'tag_psi'
     if track is None and frames_path is not None:
         cand = os.path.join(os.path.dirname(frames_path), 'track.json')
@@ -194,19 +238,31 @@ def _tag_heading_source(rows, frames_path, track):
     return 'psi'
 
 
-def chuoi_khung(frames_csv, a6, xoay, lan_lap=None, plumb=PLUMB_16_11, zc=ZC_16_11, track=None, cho=None):
+def _f(v):
+    """A cell as a float: a number, or NaN for a blank / non-number cell (frames.csv keeps extra columns as text)."""
+    if v is None or v == '':
+        return float('nan')
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float('nan')
+
+
+def chuoi_khung(frames_csv, a6, xoay, lan_lap=None, plumb=PLUMB_16_11, zc=ZC_16_11, track=None, cho=None,
+                truc_xe=None, u_psi_w_rad=None):
     """Rows (dicts with ROW_KEYS) of every frame of frames.csv (module docstring). a6: doc_a6(...) or None; xoay: path,
     dict or doc_xoay(...) result; lan_lap: path, dict or doc_lan_lap(...) result, or None (calibration clips of the
     session of E: same mounting); cho: place k of the run (goc, K1, K2) for the C8B q composition of another
-    mounting. Angles in rad, positions in m."""
+    mounting; truc_xe (truc_xe_v1 dict) and u_psi_w_rad: passed to the C8B q composition of another mounting. Angles
+    in rad, positions in m."""
     rows, fpath = _frames(frames_csv)
-    xo = xoay if (isinstance(xoay, dict) and 'ok' in xoay and 'q' in xoay) else doc_xoay(xoay)
+    xo = xoay if (isinstance(xoay, dict) and 'ok' in xoay and 'q' in xoay) else doc_xoay(xoay, cho)
     ll = lan_lap if (lan_lap is None or '_sha256' in lan_lap) else doc_lan_lap(lan_lap)
     src = _tag_heading_source(rows, fpath, track)
     n = len(rows)
-    tx = np.array([float(r.get('tag_x', float('nan'))) for r in rows], float)
-    ty = np.array([float(r.get('tag_y', float('nan'))) for r in rows], float)
-    tp = np.array([float(r.get(src, float('nan'))) for r in rows], float)
+    tx = np.array([_f(r.get('tag_x')) for r in rows], float)
+    ty = np.array([_f(r.get('tag_y')) for r in rows], float)
+    tp = np.array([_f(r.get(src)) for r in rows], float)
     gate = np.array([bool(r.get('valid')) and bool(r.get('car_seen')) for r in rows], bool)
     finite = np.isfinite(tx) & np.isfinite(ty) & np.isfinite(tp)
     cong = gate & finite
@@ -232,7 +288,7 @@ def chuoi_khung(frames_csv, a6, xoay, lan_lap=None, plumb=PLUMB_16_11, zc=ZC_16_
                     if not a6ok[k]:
                         why_a6[k] = f'a6_khung:{why[j]}'
     psi_p = np.where(a6ok, tp - np.nan_to_num(dps), np.nan)
-    q, uq, why_q = q_luot(xo, ll, cho)
+    q, uq, why_q = q_luot(xo, ll, cho, None if a6 is None else a6['sha256'], truc_xe, u_psi_w_rad)
     if q is not None:
         c, s = np.cos(psi_p), np.sin(psi_p)
         px = tx - (c * q[0] - s * q[1])

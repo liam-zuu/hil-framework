@@ -45,6 +45,9 @@ THAM_CHIEU_SCHEMA = 'tham_chieu_v1'
 KTD_SCHEMA = 'khung_tuong_doi_v1'
 TRUC_XE_SCHEMA = 'truc_xe_v1'
 LE = 1.25                       # margin, once (C8B multiplies the indices; here only for u_phi, contract 2.C)
+W_S = 3.0                       # J v6 2: the reference window is 3 s (not a constant of the file)
+CHO_LOG_S = 6.0                 # J v6 2: the car still >= 6 s after the logger has a line (CODE 19/11)
+KTC_F14 = ('n_min', 'frac_min', 'p_dung_m', 'psi_dung_deg')      # contract F14: the block locked at C8
 INT32_MIN = -2 ** 31
 COUNT_COLS = ('fl_count', 'fr_count', 'rl_count', 'rr_count')
 # the gates of the reference window [DE XUAT, locked at C8] (J 4 'Nguong he do'; design v5 3.2; contract F14)
@@ -70,19 +73,33 @@ def ids_sha(ids):
 
 
 def check_khung_tc(d, locked):
-    """The khung_tc block of the constants file (F14), or the proposed numbers when absent before C8."""
+    """The khung_tc block of the constants file (F14), or the proposed numbers when absent before C8. Only the four
+    F14 keys are required when locked (khoa_c8); w_s is fixed at 3 s by J v6 2 (another value refused); bien_s,
+    dau_cuoi_s, log_ho_s are code proposals (a file may set them inside their ranges). Called for the relative mode
+    only (Codex CT1-15: a locked file of the absolute mode needs no khung_tc)."""
     if d is None:
         if locked:
-            raise ValueError('hang_so khung_tc: the reference-window gates are required when khoa_c8 (J 4)')
+            raise ValueError(f'hang_so khung_tc: the reference-window gates {KTC_F14} are required when khoa_c8 '
+                             '(J 4, contract F14)')
         return dict(KHUNG_TC_DE_XUAT, nguon='de_xuat_mac_dinh (c7_tuong_doi, khoa o C8)')
     if not isinstance(d, dict):
         raise ValueError('hang_so khung_tc: a table')
+    extra = sorted(set(d) - set(KTC_RANGES) - {'nguon'})
+    if extra:
+        raise ValueError(f'hang_so khung_tc: unknown keys {extra}')
     out = {}
     for k, (lo, hi) in KTC_RANGES.items():
-        v = d.get(k, None if locked else KHUNG_TC_DE_XUAT[k])
+        if k in d:
+            v = d[k]
+        elif locked and k in KTC_F14:
+            raise ValueError(f'hang_so khung_tc {k}: required when khoa_c8 (contract F14)')
+        else:
+            v = KHUNG_TC_DE_XUAT[k]
         if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not lo <= v <= hi:
             raise ValueError(f'hang_so khung_tc {k}: {v!r} not in [{lo}, {hi}]')
         out[k] = int(v) if k == 'n_min' else float(v)
+    if out['w_s'] != W_S:
+        raise ValueError(f'hang_so khung_tc w_s {out["w_s"]!r}: J v6 2 fixes the reference window at {W_S:g} s')
     out['nguon'] = str(d.get('nguon', 'hang_so'))
     return out
 
@@ -145,6 +162,47 @@ def _uncovered(t_ok, dt, a, b):
     return float(b - a - cov)
 
 
+def _max_hole(t_ok, dt, a, b):
+    """Longest part of [a, b] not covered by the capture intervals [t, t + dt] of the frames t_ok (b - a when none)."""
+    if b <= a:
+        return 0.0
+    iv = sorted((max(a, float(t)), min(b, float(t) + dt)) for t in t_ok if t + dt > a and t < b)
+    hole, end = 0.0, a
+    for s, e in iv:
+        hole = max(hole, s - end)
+        end = max(end, e)
+    return float(max(hole, b - end))
+
+
+RATIO_WHY = ('ti_le', 'ti_le_it_lan_can')       # the (2b) verdicts of c7_measure.apply_gates (two-sided)
+
+
+def mot_phia(frames, chain, gates, quant=5e-7):
+    """Tag-gate frames of a reference window with the ONE-SIDED scale gate (contract F2; design v4 1.2; Codex CT1-14):
+    a frame whose only failures are the two-sided (2b) verdicts, or none, passes when its scale is within scale_rel
+    of the median scale of at least scale_min earlier frames of that kind within scale_win_s (the frame excluded);
+    rounded scales (quant, c7_measure.CSV_QUANT) must pass for every value in the interval. Frames after a frame never
+    change its verdict. Also needs the chain's tag gate except (2b) (car seen, finite tag)."""
+    g = gates
+    t = np.array([float(r['t_s']) for r in frames], float)
+    sc = np.array([ck._f(r.get('scale')) for r in frames], float)
+    base = np.array([bool(r.get('car_seen')) and all(w in RATIO_WHY for w in (r.get('why') or []))
+                     and math.isfinite(c['tag_x']) and math.isfinite(c['tag_y']) and math.isfinite(c['tag_psi'])
+                     and math.isfinite(s_) for r, c, s_ in zip(frames, chain, sc)], bool)
+    out = np.zeros(len(frames), bool)
+    ib = np.nonzero(base)[0]
+    for j, k in enumerate(ib):
+        prev = ib[:j]
+        nb = sc[prev][t[prev] >= t[k] - g['scale_win_s'] - 1e-9]
+        if len(nb) < g['scale_min']:
+            continue
+        ref = float(np.median(nb))
+        r_lo = (sc[k] - quant) / (ref + quant) - 1.0
+        r_hi = (sc[k] + quant) / (ref - quant) - 1.0
+        out[k] = max(abs(r_lo), abs(r_hi)) <= g['scale_rel']
+    return out
+
+
 def _log_cover(log_rows, left_s, right_s, gap_s):
     """(covered, why, encoder changed) of the log over [left_s, right_s] (ESP32 clock): a received line at or before
     the left end and one at or after the right end, no hole above gap_s between them; the wheel counts (lines with
@@ -173,15 +231,20 @@ def _log_cover(log_rows, left_s, right_s, gap_s):
     return not why, why, enc
 
 
-def cua_so(frames, chain, log_rows, t0_us, nodes, u_nodes, kt, t_trong, t_cmd_end, task, extra=None):
+def cua_so(frames, chain, log_rows, t0_us, nodes, u_nodes, kt, t_trong, t_cmd_end, task, extra=None, gates=None,
+           extra_why=()):
     """F2 rows (pre, post) of one run. frames: rows of c7_measure.read_frames; chain: rows of c7_chuoi_khung (same
     order, same idx); nodes: D_i (t_log = t_cam + D_i); u_nodes: u_ref,i [s] (the time part: grid or match error,
-    drift, one frame, tick), symmetric. t_cmd_end: T_cmd (command time). extra: identity keys (luot_id, clip...)."""
+    drift, one frame, tick), symmetric. t_cmd_end: T_cmd (command time). extra: identity keys (luot_id, clip...).
+    gates: frame-gate thresholds of the track (scale_min, scale_rel, scale_win_s; for the one-sided gate of 'pre');
+    None: the two-sided valid of frames.csv. extra_why: reasons found by the caller (log not covering the window for
+    the tick bound, Codex CT1-13): the 'pre' row fails with them (a run lost to the reference window, not exit 2)."""
     t = np.array([r['t_s'] for r in frames], float)
     ids = np.array([int(r['idx']) for r in frames])
     if [c['frame_id'] for c in chain] != [int(i) for i in ids]:
         raise ValueError('chain and frames.csv: different frames (run c7_chuoi_khung on this frames.csv)')
     ok = np.array([bool(c['cong_ok']) for c in chain])
+    ok1 = mot_phia(frames, chain, gates) if gates is not None else ok
     tx = np.array([c['tag_x'] for c in chain], float)
     ty = np.array([c['tag_y'] for c in chain], float)
     tp = np.array([c['tag_psi'] for c in chain], float)
@@ -195,21 +258,32 @@ def cua_so(frames, chain, log_rows, t0_us, nodes, u_nodes, kt, t_trong, t_cmd_en
                 M=[t0 - max(nodes) - 6.0, t0 - min(nodes) + 1.0], nguong={k: kt[k] for k in KHUNG_TC_DE_XUAT},
                 nguong_nguon=kt['nguon'], chuoi=ck.PHIEN_BAN, **(extra or {}))
     out = []
-    # pre: [t_ref - w_s, t_ref), a frame used when its latest capture time (PTS + one frame) is before t_ref
+    # pre: every decoded PTS in [t_ref - w_s, t_ref) (khung); a tag frame is used when it passes the one-sided gate and
+    # its latest capture time (PTS + one frame) is before t_ref (khung_ma_hop_le; Codex CT1-14)
     a = t_ref - kt['w_s']
-    m = (t >= a) & (t + dt < t_ref)
-    mo = m & ok
+    m = (t >= a) & (t < t_ref)
+    mo = m & ok1 & (t + dt < t_ref)
     s_ok, s_why = _samples(t[mo], a, t_ref, dt, kt, t_trong)
-    ms = (t >= a) & (t <= t_max) & ok                                  # still over the window AND the joint to t_max
+    ms = (t >= a) & (t <= t_max) & ok1                                 # still over the window AND the joint to t_max
     d_ok, d_num = _stillness(t[ms], tx[ms], ty[ms], tp[ms], kt)
     l_ok, l_why, enc = _log_cover(log_rows, a + min(nodes), t_max + max(nodes), kt['log_ho_s'])
-    ho = _uncovered(t[ok], dt, t_ref, t_max)
-    why = s_why + ([] if d_ok else ['xe khong dung yen trong cua so hay toi canh muon nhat']) + l_why
+    ho = _uncovered(t[ok1], dt, t_ref, t_max)
+    # J v6 2 'to the latest edge' (Codex CT1-12): no hole above t_trong in the tag coverage over [t_ref, t_max]
+    ho_max = _max_hole(t[ok1], dt, t_ref, t_max)
+    noi_ok = bool(ho_max <= t_trong + 1e-12)
+    # J v6 2 'waiting time': the earliest edge >= 6 s after the first log line (log clock: the edge is t0)
+    t_log0 = min(float(r['_t']) for r in log_rows) / 1e6 if log_rows else math.nan
+    cho = t0 - t_log0
+    cho_ok = bool(math.isfinite(cho) and cho >= CHO_LOG_S - 1e-9)
+    why = (s_why + ([] if d_ok else ['xe khong dung yen trong cua so hay toi canh muon nhat']) + l_why
+           + ([] if noi_ok else [f'doan noi toi canh muon nhat ho {ho_max:.3f} s > t_trong {t_trong:g} s'])
+           + ([] if cho_ok else [f'cho {cho:.2f} s < {CHO_LOG_S:g} s sau dong log dau']) + list(extra_why))
     out.append(dict(base, loai='pre', t_ref=t_ref, t_max=t_max, t_canh_s=t_ref,
                     khung=[dict(id=int(i), pts_s=float(x)) for i, x in zip(ids[m], t[m])],
                     khung_sha256=ids_sha(ids[m]), khung_ma_hop_le=[int(i) for i in ids[mo]],
-                    khung_ma_hop_le_sha256=ids_sha(ids[mo]),
-                    ket_luan=dict(du_mau=s_ok, dung_yen=d_ok, log_phu=l_ok, ho_noi_s=ho, dat=not why, ly_do=why,
+                    khung_ma_hop_le_sha256=ids_sha(ids[mo]), cong_ti_le='mot_phia' if gates is not None else 'hai_phia',
+                    ket_luan=dict(du_mau=s_ok, dung_yen=d_ok, log_phu=l_ok, ho_noi_s=ho, ho_noi_max_s=ho_max,
+                                  noi_phu=noi_ok, cho_log_s=cho, cho_du=cho_ok, dat=not why, ly_do=why,
                                   so_dung_yen=d_num, encoder_doi=enc)))
     # post: the last w_s of tag-gate frames, all after the latest possible end of the command
     t_end = max(t0 - D + u for D, u in zip(nodes, u_nodes)) + t_cmd_end
@@ -242,7 +316,9 @@ def tham_chieu(pre, chain, lan_lap, kt, t_trong, dt, extra=None):
     why, tap = [], 'giao'
     neo = None if lan_lap is None else ((lan_lap.get('khung_chung') or {}).get('pre'))
     if neo is None:
-        ids, tap = ma, 'ma_mat_neo'
+        # Codex CT1-3: a MISSING anchor list is not a confirmed loss of every anchor (mat_neo needs an empty list):
+        # no set of J v6 2 can be formed, the reference is not concluded (G1-G5)
+        ids, tap = ma, 'thieu_neo'
         why.append('thieu_lan_lap' if lan_lap is None else 'lan_lap_thieu_khung_chung_pre')
     else:
         s = set(int(i) for i in neo)
@@ -277,7 +353,11 @@ def tham_chieu(pre, chain, lan_lap, kt, t_trong, dt, extra=None):
         lpsi, tan = float(np.max(np.abs(dv))), float(np.max(dv) - np.min(dv))
     elif rows:
         why.append('huong_sau_A6_khong_xac_dinh')
-    if trang == 'dat' and not (p_ok or y_ok):
+    if y_ok and trang == 'dat' and math.degrees(tan) > kt['psi_dung_deg'] + 1e-12:
+        # J v6 2 (Codex CT1-12): the heading spread gate on the set actually used (psi' after A6)
+        trang = 'hong_cua_so_tc'
+        why.append(f'tan huong sau A6 tren tap tham chieu {math.degrees(tan):.3f} deg > {kt["psi_dung_deg"]:g} deg')
+    if trang == 'dat' and (tap == 'thieu_neo' or not (p_ok or y_ok)):
         trang = 'chua_ket_luan'
     return dict(schema=THAM_CHIEU_SCHEMA, phien_ban=PHIEN_BAN, chuoi_khung=ck.PHIEN_BAN, phep_gop='trung_binh_go_vong',
                 tap=tap, mat_neo=tap == 'ma_mat_neo', ids=ids, ids_sha256=ids_sha(ids), n=len(ids),
@@ -287,8 +367,56 @@ def tham_chieu(pre, chain, lan_lap, kt, t_trong, dt, extra=None):
 
 
 # ---------------------------------------------------------------- phi (J 2, beta path)
+DINH_DANH_12B = ('frames_sha256', 'clip_sha256', 'session_sha256')    # keys that tie truc_xe_v1 to the 12b of a run
+
+
+def _truc_ids(truc_xe):
+    """(12b run id, {identity key: sha}, lan_lap_id) of truc_xe_v1 (HIEUCHUAN c8_hc_a: mien_hieu_luc.thu_id_cap; the
+    frames sha of that run from nguon '<thu_id>:frames'; clip / session / frames sha when the file has them)."""
+    m = truc_xe.get('mien_hieu_luc') if isinstance(truc_xe.get('mien_hieu_luc'), dict) else {}
+    thu = m.get('thu_id_cap', truc_xe.get('thu_id_cap'))
+    sh = {k: m.get(k, truc_xe.get(k)) for k in DINH_DANH_12B}
+    if not sh['frames_sha256'] and thu is not None:
+        for n in truc_xe.get('nguon') or []:
+            if isinstance(n, dict) and n.get('vai_tro') == f'{thu}:frames' and n.get('sha256'):
+                sh['frames_sha256'] = n['sha256']
+    return thu, {k: v for k, v in sh.items() if v}, m.get('lan_lap_id')
+
+
+def rang_buoc_12b(truc_xe, lan_lap, k):
+    """Reasons (empty: bound) why truc_xe_v1 is not the 12b of this run's placement (J v6 2: the latest 12b of the
+    same session and the same placement; CODE 19/11 after the round-1 review: NHACTAM's lan_lap_v1 names it in
+    chuan_12b (12b run id) with lan_lap_id; the session is checked on every identity key present on BOTH sides, the
+    12b end of lan_lap_v1 dau.chuan against truc_xe_v1; no common key: not bound)."""
+    why = []
+    lid, ch = lan_lap.get('lan_lap_id'), lan_lap.get('chuan_12b')
+    if lid is None:
+        why.append('lan_lap_v1 thieu lan_lap_id' + (f" ({lan_lap['lan_lap_id_ly_do']})"
+                                                     if lan_lap.get('lan_lap_id_ly_do') else ''))
+    if ch is None:
+        why.append('lan_lap_v1 thieu chuan_12b (khong co 12b cung lan lap o cho nay)')
+    if lan_lap.get('cho') not in (None, k):
+        raise ValueError(f'lan_lap_v1 of place {lan_lap.get("cho")!r}, the task needs {k!r}')
+    thu, sh, t_lid = _truc_ids(truc_xe)
+    if ch is not None and thu != ch:
+        why.append(f'truc_xe_v1 cua 12b {thu!r} khac chuan_12b {ch!r} cua luot')
+    if t_lid is not None and lid is not None and t_lid != lid:
+        why.append(f'truc_xe_v1 lan_lap_id {t_lid!r} khac {lid!r}')
+    dau = (lan_lap.get('dau') or {}).get('chuan') if isinstance(lan_lap.get('dau'), dict) else None
+    dau = dau if isinstance(dau, dict) else {}
+    common = [x for x in DINH_DANH_12B if sh.get(x) and dau.get(x)]
+    if not common:
+        why.append('chua buoc cung buoi: truc_xe_v1 va lan_lap_v1 dau.chuan khong co dinh danh chung '
+                   f'({", ".join(DINH_DANH_12B)})')
+    for x in common:
+        if sh[x] != dau[x]:
+            why.append(f'truc_xe_v1 {x} khac lan_lap_v1 dau.chuan {x} (12b khac buoi hay khac clip)')
+    return why
+
+
 def phi_beta(task, truc_xe, lan_lap, tc, u_beta_cam_deg=None):
-    """(phi [rad] or None, u_phi [rad] (inf when a part is missing), ok, reasons). Same session only; no Delta-a path."""
+    """(phi [rad] or None, u_phi [rad] (inf when a part is missing), ok, reasons). Same session and same placement
+    only (rang_buoc_12b); no Delta-a path."""
     why = []
     k = cho_of(task)
     if truc_xe is None:
@@ -306,6 +434,7 @@ def phi_beta(task, truc_xe, lan_lap, tc, u_beta_cam_deg=None):
         ph = uph = None
     if lan_lap is None:
         return None, math.inf, False, why + ['thieu_lan_lap_v1 (beta)']
+    why += rang_buoc_12b(truc_xe, lan_lap, k)
     tt = lan_lap.get('trang_thai')
     if not (isinstance(tt, dict) and tt.get('beta') == 'dat'):
         why.append(f'beta khong hop le (trang_thai.beta {tt.get("beta") if isinstance(tt, dict) else tt!r})')
@@ -349,21 +478,25 @@ def rel_heading(psi_p, psi_tc, psi_dd):
     return ck.wrap(psi_dd + dpsi), dpsi
 
 
-def t_som(t, speed_ok, speed, wz_ok, wz, v_d, w_d, t_d, t_trong, t_cmd, t_deadline):
-    """Earliest frame time t, t_cmd <= t < t_deadline, whose window [t - t_d, t] does not rule completion out (J 5): no
-    frame with a DEFINED speed >= v_d, no frame with a USABLE |wz| >= w_d, no hole above t_trong, a frame at the window
-    start; t_deadline when there is none."""
+def t_som(t, speed_ok, speed, wz_ok, wz, v_d, w_d, t_d, t_trong, t_cmd, t_deadline, present=None):
+    """Earliest frame time t, t_cmd <= t < t_deadline, of the frames of one way of using the frames (present; None:
+    every frame), whose window [t - t_d, t] does not rule completion out (J 5): no frame with a DEFINED speed >= v_d,
+    no frame (of any way: wz comes from the tag heading, J4-10) with a USABLE |wz| >= w_d, no hole above t_trong
+    among the frames of that way (Codex CT1-5: way 2 treats the position-suspect frames as holes, like G1), a frame of
+    that way at the window start; t_deadline when there is none."""
     t = np.asarray(t, float)
+    pres = np.ones(len(t), bool) if present is None else np.asarray(present, bool)
     bad = (speed_ok & (np.nan_to_num(speed, nan=np.inf) >= v_d)) | (wz_ok & (np.abs(np.nan_to_num(wz)) >= w_d))
-    for k in np.nonzero((t >= t_cmd - 1e-9) & (t < t_deadline - 1e-12))[0]:
+    for k in np.nonzero(pres & (t >= t_cmd - 1e-9) & (t < t_deadline - 1e-12))[0]:
         lo = t[k] - t_d
-        j = np.nonzero((t >= lo - 1e-9) & (t <= t[k] + 1e-12))[0]
+        inside = (t >= lo - 1e-9) & (t <= t[k] + 1e-12)
+        j = np.nonzero(inside & pres)[0]
         if not len(j) or t[j[0]] > lo + t_trong + 1e-12:
             continue
         seg = t[j]
         if len(seg) > 1 and float(np.max(np.diff(seg))) > t_trong + 1e-12:
             continue
-        if bad[j].any():
+        if bad[inside].any():
             continue
         return float(t[k])
     return float(t_deadline)
