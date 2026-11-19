@@ -89,7 +89,7 @@ def test_ok_latches_on_the_edge_tick(runs):
     bad, why, info = T.ref_cond1(r, AGE_MAX)
     assert not bad, why
     assert info['gap_ms'] == 10.0
-    assert info['age_bound_ms'] == pytest.approx(info['age_r_ms'] + 0.05 + 10.0 + 0.003)
+    assert info['age_bound_ms'] == pytest.approx(info['age_r_ms'] + 0.05 + 10.0 + 0.004)
 
 
 def test_psi0_is_the_report_held_on_the_edge_tick(raw):
@@ -138,7 +138,7 @@ def test_chot_muon_b_stale_but_valid_yaw_caught_by_the_age_bound(runs):
     assert e['age_r_ms'] == 96.3                                        # under t_age = 2.5 x 50 ms
     bad, why, info = T.ref_cond1(r, AGE_MAX)
     assert bad and why == ['age_bound_over']
-    assert info['age_bound_ms'] == pytest.approx(96.3 + 0.05 + 10.0 + 0.003)
+    assert info['age_bound_ms'] == pytest.approx(96.3 + 0.05 + 10.0 + 0.004)
     assert not T.ref_cond1(r, 200.0)[0]                                 # the threshold decides it
 
 
@@ -203,7 +203,7 @@ def test_canh_doi_mode_injected_mode_event_on_the_edge(runs):
 def test_synthetic_good_run_passes():
     bad, why, info = T.ref_cond1(trio(), AGE_MAX)
     assert not bad, why
-    assert info['age_bound_ms'] == pytest.approx(5.0 + 0.05 + 10.0 + 0.003)
+    assert info['age_bound_ms'] == pytest.approx(5.0 + 0.05 + 10.0 + 0.004)
 
 
 @pytest.mark.parametrize('field,value', [('r_valid', 0), ('head_on', 0), ('psi_ref', 0.0001), ('rv_n', 0)])
@@ -246,14 +246,14 @@ def test_missing_or_bad_fields_never_pass(edge):
 
 def test_negative_logged_age_with_valid_flags_is_normal():
     bad, why, info = T.ref_cond1(trio(edge=row(age_r_ms=-1.2)), AGE_MAX)
-    assert not bad and info['age_bound_ms'] == pytest.approx(-1.2 + 0.05 + 10.0 + 0.003)
+    assert not bad and info['age_bound_ms'] == pytest.approx(-1.2 + 0.05 + 10.0 + 0.004)
 
 
 def test_threshold_in_integer_microseconds():
-    """T9-5: 8.3 ms + 50 us + 5647 us + 3 us = 14.000 ms exactly: not over 14 ms; 1 us more: over."""
-    ok = trio(edge=row(age_r_ms=8.3), nxt=dict(row(), log_seq=11, timestamp_us=5_647))
+    """T9-5: 8.3 ms + 50 us + 5646 us + 4 us = 14.000 ms exactly: not over 14 ms; 1 us more: over."""
+    ok = trio(edge=row(age_r_ms=8.3), nxt=dict(row(), log_seq=11, timestamp_us=5_646))
     assert not T.ref_cond1(ok, 14.0)[0]
-    over = trio(edge=row(age_r_ms=8.3), nxt=dict(row(), log_seq=11, timestamp_us=5_648))
+    over = trio(edge=row(age_r_ms=8.3), nxt=dict(row(), log_seq=11, timestamp_us=5_647))
     assert T.ref_cond1(over, 14.0)[1] == ['age_bound_over']
 
 
@@ -301,7 +301,7 @@ def test_unreadable_run_active_before_the_edge_is_no_evidence(pre_ra):
     """T9R-2: a missing / unreadable run_active on the row before is not a 0 -> 1 change."""
     pre = dict(row(), log_seq=9, head_on=0, timestamp_us=-10_000, run_active=pre_ra)
     bad, why, info = T.ref_cond1(trio(pre=pre), AGE_MAX)
-    assert bad and why == ['thieu_dong_truoc_canh'] and info['loai'] == 'he_do'
+    assert bad and why[0] in ('thieu_dong_truoc_canh', 'run_active_khong_doc_duoc') and info['loai'] == 'he_do'
 
 
 def test_end_seq_must_be_a_logged_row_at_or_after_the_edge():
@@ -335,7 +335,7 @@ def test_age_domain_edges_are_kept():
 
 def test_threshold_is_not_rounded():
     """T9R-1: bound 14.000 ms against 13.9996 ms is over."""
-    rows = trio(edge=row(age_r_ms=8.3), nxt=dict(row(), log_seq=11, timestamp_us=5_647))
+    rows = trio(edge=row(age_r_ms=8.3), nxt=dict(row(), log_seq=11, timestamp_us=5_646))
     assert T.ref_cond1(rows, 13.9996)[1] == ['age_bound_over']
     assert not T.ref_cond1(rows, 14.0)[0]
 
@@ -353,7 +353,7 @@ def test_later_row_of_the_same_boot_bounds_when_the_next_is_missing():
     """T9-6, CODE 19/11: log_seq + 1 missing, a later row with larger log_seq and later time gives the bound."""
     rows = trio(nxt=dict(row(), log_seq=12, timestamp_us=20_000))
     bad, why, info = T.ref_cond1(rows, AGE_MAX)
-    assert not bad and info['bound_seq'] == 12 and info['age_bound_ms'] == pytest.approx(25.053)
+    assert not bad and info['bound_seq'] == 12 and info['age_bound_ms'] == pytest.approx(25.054)
 
 
 def test_log_missing_the_run_start_is_not_saved_by_a_re_edge():
@@ -363,7 +363,8 @@ def test_log_missing_the_run_start_is_not_saved_by_a_re_edge():
     bad, why, info = T.ref_cond1(rows, AGE_MAX)
     assert bad and why == ['thieu_dong_truoc_canh'] and info['loai'] == 'he_do' and info['edge_seq'] == 10
     rows[0] = dict(rows[0], run_active='')                     # unreadable first row: still no evidence
-    assert T.ref_cond1(rows, AGE_MAX)[1] == ['thieu_dong_truoc_canh']
+    bad, why, info = T.ref_cond1(rows, AGE_MAX)
+    assert bad and why == ['run_active_khong_doc_duoc'] and info['loai'] == 'he_do'
 
 
 def test_float_error_grows_with_the_age():
@@ -373,10 +374,11 @@ def test_float_error_grows_with_the_age():
     assert not bad and info['age_bound_ms'] * 1000 >= -33_555_046 + 33_680_047
 
 
-@pytest.mark.parametrize('thr', ['13.9999999999999999', T.Decimal('13.9999999999999999')])
+@pytest.mark.parametrize('thr', ['13.9999999999999999', T.Decimal('13.9999999999999999'),
+                                 '13.9999999999999999999999999999'])
 def test_threshold_text_is_kept_exact(thr):
     """T9R-1: a threshold just under 14 ms given as text / Decimal is not rounded up to 14."""
-    rows = trio(edge=row(age_r_ms=8.3), nxt=dict(row(), log_seq=11, timestamp_us=5_647))
+    rows = trio(edge=row(age_r_ms=8.3), nxt=dict(row(), log_seq=11, timestamp_us=5_646))
     assert T.ref_cond1(rows, thr)[1] == ['age_bound_over']
 
 
@@ -395,3 +397,44 @@ def test_a_duplicate_of_the_edge_row_is_not_a_bound_row():
     rows = [pre, e, dict(e, timestamp_us=5_000), nxt]
     bad, why, info = T.ref_cond1(rows, AGE_MAX)
     assert info['bound_seq'] == 11 and info['gap_ms'] == 10.0
+
+
+
+# ---- after Codex Sol round 4 (T9-1, T9-7, T9U-1, T9U-2) ----
+
+def test_unreadable_run_active_before_the_first_active_row():
+    """T9-1: seq 9-13 with run_active 0, '', 0, 1, 1: row 10 may be the real edge; not known -> he_do."""
+    rows = [dict(row(), log_seq=9 + k, timestamp_us=10_000 * k, run_active=v)
+            for k, v in enumerate([0, '', 0, 1, 1])]
+    bad, why, info = T.ref_cond1(rows, AGE_MAX)
+    assert bad and why == ['run_active_khong_doc_duoc'] and info['loai'] == 'he_do'
+
+
+def test_float_error_covers_the_constant_too():
+    """T9-7 round 4: a = -550 874 977 us printed -550875.1 ms, gap 550 999 978 us: bound >= a + gap."""
+    rows = trio(edge=row(age_r_ms=-550875.1), nxt=dict(row(), log_seq=11, timestamp_us=550_999_978))
+    bad, why, info = T.ref_cond1(rows, 1e9)
+    assert not bad and info['age_bound_ms'] * 1000 >= -550_874_977 + 550_999_978
+
+
+def test_bound_row_with_time_going_back_is_undetermined():
+    """T9U-1: seq 9-12 at 90, 100, 99, 120 ms: the next row goes back in time, row 12 is not used."""
+    rows = [dict(row(), log_seq=9, run_active=0, head_on=0, timestamp_us=90_000),
+            dict(row(), log_seq=10, timestamp_us=100_000), dict(row(), log_seq=11, timestamp_us=99_000),
+            dict(row(), log_seq=12, timestamp_us=120_000)]
+    assert T.ref_cond1(rows, AGE_MAX)[1] == ['age_bound_undetermined']
+
+
+def test_summary_keeps_a_number(tmp_path, fw):
+    """T9U-2: summary.json age_max_ms stays a number; the exact text is kept beside it."""
+    import json
+    T.main(['--out', str(tmp_path), '--age-max-ms', '60'])
+    sm = json.load(open(tmp_path / 'summary.json'))
+    assert sm['age_max_ms'] == 60.0 and sm['age_max_ms_text'] == '60'
+
+
+def test_row_before_the_edge_must_be_exactly_zero():
+    """run_active 2 (or any value other than 0) on the row before is not a 0 -> 1 change."""
+    pre = dict(row(), log_seq=9, run_active=2, head_on=0, timestamp_us=-10_000)
+    bad, why, info = T.ref_cond1(trio(pre=pre), AGE_MAX)
+    assert bad and why == ['thieu_dong_truoc_canh'] and info['loai'] == 'he_do'

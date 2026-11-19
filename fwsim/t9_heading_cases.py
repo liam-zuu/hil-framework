@@ -164,9 +164,9 @@ def _num(r, k):
     return v if math.isfinite(v) else None
 
 
-def _thr_us(age_max_ms):
-    """Threshold in us as an exact decimal from its text (no float rounding); finite and > 0."""
-    d = Decimal(str(age_max_ms)) * 1000
+def _thr_ms(age_max_ms):
+    """Threshold in ms as the exact Decimal of its text (no float rounding, no arithmetic); finite, > 0."""
+    d = Decimal(str(age_max_ms))
     if not d.is_finite() or d <= 0:
         raise ValueError(f'age_max_ms {age_max_ms!r}: must be a finite number > 0')
     return d
@@ -189,9 +189,11 @@ def ref_cond1(rows, age_max_ms, end_seq=None, edge_seq=None):
     Edge row: r_valid = 1, rv_n > 0, head_on = 1, psi_ref = 0 (O1 v8 line 94; J line 127).
     Yaw age at the latch (J line 127), integer microseconds: age_r_ms as printed (0.1 ms) + 50 us (half
     print step) + gap to the bound row (tick start -> latch <= gap, T9 doc section 2.1) + 2 us (clock steps)
-    + the float32 error of the age (max(1 us, ceil(|age| / 2^23))), only when the edge row meets every
+    + the float32 error of the age (ceil(|age| / 2^22) + 1 us), only when the edge row meets every
     condition above, a bound row exists (the next data row, or the first later row with a larger log_seq
-    and a later time: CODE 19/11), and the logged age lies in the domain
+    and a later time: CODE 19/11; the first row with a larger log_seq must have a later time, else not
+    determinable), the run_active of every row before the edge is readable, and the logged age lies in
+    the domain
     [-gap - 0.05 ms, t_age + 0.05 ms] (t_age = 125 ms at 20 Hz; outside it the flags and the age disagree);
     otherwise not determinable, which J counts as bad. Bad when the bound exceeds age_max_ms (exact
     decimal comparison from the threshold's text; non-finite or <= 0 is a ValueError)."""
@@ -207,7 +209,12 @@ def ref_cond1(rows, age_max_ms, end_seq=None, edge_seq=None):
         # edge (a log that starts active is missing the run start: no edge evidence below)
         i_edge = next((i for i in range(len(rows)) if ra[i] == 1), None)
         if i_edge is None:
+            if any(v is None for v in ra):
+                return True, ['run_active_khong_doc_duoc'], {'loai': 'he_do'}
             return True, ['no_edge'], {'loai': 'duong_lenh'}
+        if any(ra[i] is None for i in range(i_edge)):
+            # a row before it could be the real edge: the edge is not known
+            return True, ['run_active_khong_doc_duoc'], {'edge_seq': seq[i_edge], 'loai': 'he_do'}
     e = rows[i_edge]
     info['edge_seq'] = seq[i_edge]
     if (i_edge == 0 or seq[i_edge] is None or seq[i_edge - 1] != seq[i_edge] - 1
@@ -238,23 +245,25 @@ def ref_cond1(rows, age_max_ms, end_seq=None, edge_seq=None):
     t0 = _num(e, 'timestamp_us')
     gap_us = None
     for k in range(i_edge + 1, len(rows)):
+        if seq[k] is None or seq[i_edge] is None or seq[k] <= seq[i_edge]:
+            continue                             # a copy of the edge row (same log_seq) is not a bound row
         t1 = _num(rows[k], 'timestamp_us')
-        if seq[k] is not None and seq[i_edge] is not None and seq[k] > seq[i_edge] and t0 is not None \
-                and t1 is not None and t1 > t0:
+        if t0 is not None and t1 is not None and t1 > t0:
             gap_us = int(t1 - t0)
             info['bound_seq'] = seq[k]
-            break
+        break                                    # first larger log_seq only: a time going back is inconsistent
     age_us = None if age is None else int(round(age * 10)) * 100
     if (not latched or age_us is None or gap_us is None
             or not (-gap_us - 50 <= age_us <= T_AGE_US + 50)):
         reasons.append('age_bound_undetermined')
     else:
         # 50 us half print step; 2 us for 1 us clock steps (t_now, rv_t_us; latch vs next stamp handled by <=
-        # plus 1 us); float32 error of a * 1e-3f: two roundings, relative 2^-23 of |a|, rounded up, at least 1 us
-        f_us = max(1, -(-abs(age_us) // (1 << 23)))
+        # plus 1 us); float32 error of a * 1e-3f (imu_fusion.c: int64 -> float, constant 1e-3f, product): each
+        # at most 2^-24 relative, so < 4 * 2^-24 = 2^-22 of |a| together; rounded up, + 1 us margin
+        f_us = -(-abs(age_us) // (1 << 22)) + 1
         bound_us = age_us + 50 + gap_us + 2 + f_us
         info.update(age_r_ms=age, gap_ms=gap_us / 1000, age_bound_ms=bound_us / 1000)
-        if Decimal(bound_us) > _thr_us(age_max_ms):
+        if Decimal(bound_us) / 1000 > _thr_ms(age_max_ms):
             reasons.append('age_bound_over')
     if reasons:
         info['loai'] = 'duong_lenh'
@@ -267,12 +276,13 @@ def main(argv=None):
     ap.add_argument('--age-max-ms', type=Decimal, default=Decimal('60'),
                     help='demo threshold for the age bound (J locks it at C8; not a proposal)')
     a = ap.parse_args(argv)
-    _thr_us(a.age_max_ms)
+    _thr_ms(a.age_max_ms)
     fw = fwsim.FirmwareSim()
     if fw.pos_cols == 0:
         sys.exit('fwsim.dll has no position loop: build it from firmware with pos_ctrl.c')
     os.makedirs(a.out, exist_ok=True)
-    summary = {'fwsim_build': fw.build_info, 'age_max_ms': str(a.age_max_ms), 'cases': {}}
+    summary = {'fwsim_build': fw.build_info, 'age_max_ms': float(a.age_max_ms),
+               'age_max_ms_text': str(a.age_max_ms), 'cases': {}}
     for c in cases():
         rows = as_logged(simulate(fw, c))
         with open(os.path.join(a.out, f'{c.name}.csv'), 'w', newline='') as f:

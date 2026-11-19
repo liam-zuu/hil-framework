@@ -14,7 +14,7 @@ anchor), boot and failure order belong to the scorer; this tool shows the edge e
                         rv_n > 0, head_on 1, psi_ref 0), a bound row exists (next data row, or the first
                         later row with larger log_seq and later time, CODE 19/11), and the logged age lies
                         in [-gap - 0.05 ms, 125.05 ms], the age bound age_r_ms + 50 us + gap + 2 us +
-                        float error (as ref_cond1 of fwsim/t9_heading_cases.py); a file with conflicting
+                        float error ceil(|age| / 2^22) + 1 us (as ref_cond1 of fwsim/t9_heading_cases.py); a file with conflicting
                         duplicates, non-increasing or unreadable times gives no bounds; plus all motor-on
                         consecutive-row gaps
   s06 <run_dir ...>     S06 runs (env s06_load, pi/esp/esp32_data.txt + esp32_events.txt): P line
@@ -112,14 +112,14 @@ def edges(paths):
             latched = (num(e, 'r_valid') == 1 and (num(e, 'rv_n') or 0) > 0 and num(e, 'head_on') == 1
                        and num(e, 'psi_ref') == 0.0)
             # bound row: next data row, or the first later row with larger log_seq and later time (CODE 19/11)
-            k = next((k for k in range(i + 1, len(rs)) if seqs[k] > seqs[i] and ts[k] > ts[i]), None)
-            gap_us = None if k is None else int(ts[k] - ts[i])
+            k = next((k for k in range(i + 1, len(rs)) if seqs[k] > seqs[i]), None)
+            gap_us = int(ts[k] - ts[i]) if k is not None and ts[k] > ts[i] else None
             age = num(e, 'age_r_ms')
             age_us = None if age is None else int(round(age * 10)) * 100
             bound = None
             if (trusted and pre_ok and latched and gap_us is not None and age_us is not None
                     and -gap_us - 50 <= age_us <= T_AGE_US + 50):
-                bound = (age_us + 50 + gap_us + 2 + max(1, -(-abs(age_us) // (1 << 23)))) / 1000
+                bound = (age_us + 50 + gap_us + 2 + -(-abs(age_us) // (1 << 22)) + 1) / 1000
                 bounds.append(bound)
             print(f"{path}: seq={e['log_seq']} pre_ok={pre_ok} "
                   f"r_valid={e.get('r_valid')} rv_n={e.get('rv_n')} head_on={e.get('head_on')} "
