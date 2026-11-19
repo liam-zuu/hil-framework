@@ -967,6 +967,175 @@ def test_3b_v2_cli_cross_check(tmp_path, capsys):
     assert '#ket_qua,ma=0,ga_ok=1' in capsys.readouterr().out
 
 
+def _segs(parts, T_s=1 / 60):
+    """Rate profile from parts: (seconds at the top, top rate, end rate of a linear slow-down, seconds of the
+    slow-down, gap after in s); returns t, Omega and the clip index of every frame (a gap > CLIP_GAP_S is a new clip)."""
+    t_l, om_l, t0 = [], [], 0.0
+    for top_s, w0, w1, down_s, gap in parts:
+        tt = np.arange(0, top_s + down_s, T_s)
+        w = np.where(tt < top_s, w0, w0 + (w1 - w0) * (tt - top_s) / down_s)
+        t_l.append(t0 + tt)
+        om_l.append(w)
+        t0 = t0 + tt[-1] + T_s + gap
+    return np.concatenate(t_l), np.concatenate(om_l)
+
+
+def _psi_of(t, om):
+    psi = np.zeros(len(t))
+    for i in range(1, len(t)):
+        dt = t[i] - t[i - 1]
+        psi[i] = psi[i - 1] + (om[i] * dt if dt < 1.0 else 0.0)
+    return psi
+
+
+def _axis_F(parts, q=(0.0005, 0.0), step_at=None, step=0.0):
+    t, om = _segs(parts)
+    psi = _psi_of(t, om)
+    cx = 1.0 + (step if step_at is None else np.where(t >= step_at, step, 0.0))
+    x = cx + np.cos(psi) * q[0] - np.sin(psi) * q[1]
+    y = 0.5 + np.sin(psi) * q[0] + np.cos(psi) * q[1]
+    return dict(t=t, x=x, y=y, psi=psi)
+
+
+def test_3b_v3_runs_split_a_clip_at_a_respin():
+    t, om = _segs([(4, 3.0, 0.35, 40, 0.0), (4, 3.0, 1.4, 40, 0.0)])
+    lab = TB.spin_runs(t, om)
+    assert set(lab[lab >= 0]) == {0, 1}
+    assert np.all(lab[t < 43] == 0) and np.all(lab[(t > 45) & (np.abs(om) > TB.MOVE_RAD_S)] == 1)
+
+
+def test_3b_v3_respin_across_a_gap_is_a_new_run():
+    # a slow start (0.5 rad/s), 5 s without frames (spun by hand), then a spin from 4 rad/s: two runs (B IMG_3602)
+    t, om = _segs([(0, 0.5, 0.45, 2, 5.0), (4, 4.0, 0.35, 40, 0.0)])
+    lab = TB.spin_runs(t, om)
+    assert set(lab[lab >= 0]) == {0, 1} and np.all(lab[t < 2.1][np.abs(om[t < 2.1]) > TB.MOVE_RAD_S] == 0)
+    # a gap inside a spin-down (frames lost at speed) is not a new run
+    t2, om2 = _segs([(4, 4.0, 2.0, 10, 3.0), (0, 1.9, 0.35, 30, 0.0)])
+    lab2 = TB.spin_runs(t2, om2)
+    assert set(lab2[lab2 >= 0]) == {0}
+
+
+def test_3b_v3_setup_moved_between_spins_of_one_clip():
+    # Codex G3B-1 round 2: one clip, two spins both down to 0.35 rad/s, the set-up moved 3 mm at the re-spin: the
+    # held-out check by spin sees it
+    F = _axis_F([(4, 3.0, 0.35, 40, 0.0), (4, -3.0, -0.35, 40, 0.0)], step_at=45.0, step=0.003)
+    A = TB.analyse_a(F, 2.614)
+    assert not A['ga_ok'] and any('held-out by run' in w for w in A['ga_why']), A['ga_why']
+    F0 = _axis_F([(4, 3.0, 0.35, 40, 0.0), (4, -3.0, -0.35, 40, 0.0)])
+    A0 = TB.analyse_a(F0, 2.614)
+    assert A0['ga_ok'], A0['ga_why']
+    assert A0['theo_clip'][0]['n_luot_quay'] == 2 and A0['theo_clip'][0]['ga_giu_ngoai_luot_m'] < 1e-4
+
+
+def test_3b_v3_spin_without_slow_frames_is_not_used():
+    # the second spin only slows to 1.4 rad/s: no slow frame, its set-up not checked, its frames not used (a move at
+    # the re-spin would otherwise pass, Codex G3B-1 round 2)
+    F = _axis_F([(4, 3.0, 0.35, 40, 0.0), (4, 3.0, 1.4, 40, 0.0)], step_at=45.0, step=0.003)
+    A = TB.analyse_a(F, 2.614)
+    c = A['theo_clip'][0]
+    assert c['luot_khong_kiem'] == [1] and c['n_khung_khong_kiem'] > 2000
+    assert A['p_dev_m'] is None or A['p_dev_m'] < 0.001          # the moved spin is not in the position part
+
+
+def test_3b_v3_direction_between_clips_only_one_way_clips():
+    # Codex G3B2-1: clip 0 has a few slow frames the other way; clip 1 is one way: the direction part is not
+    # estimated from the pair (it would read about 0), so the position part is not finite
+    F = _axis_F([(4, 3.0, 0.35, 40, 0.0), (0, -0.4, -0.4, 0.2, 12.0), (4, 3.0, 0.35, 40, 0.0)])
+    A = TB.analyse_a(F, 2.614)
+    ch = [c['chieu'] for c in A['theo_clip']]
+    assert ch[0] == [-1, 1] and ch[1] == [1], ch
+    assert A['hap_thu']['dq_chieu_m'] is None and A['p_dev_m'] is None
+    assert any('direction' in w for w in A['p4_why'])
+
+
+def _wheel_F(parts, R_of_clip, T_s=1 / 60, r_drift=None):
+    t, om = _segs(parts, T_s)
+    th = _psi_of(t, om)
+    clip = np.concatenate([[0], np.cumsum(np.diff(t) > TB.CLIP_GAP_S)])
+    R = np.array([R_of_clip[c] for c in clip], float)
+    if r_drift is not None:
+        R = R + r_drift(t)
+    x, y = 1.0 + R * np.cos(th), 0.5 + R * np.sin(th)
+    return dict(t=t, x=x, y=y, psi=th + 0.3, row=1100 + R * np.sin(th) / 0.0006,
+                col=1900 + R * np.cos(th) / 0.0006, clip=clip)
+
+
+def test_3b_v3_b_coverage_from_each_clips_radius():
+    # Codex G3B2-2: clips of 260 and 240 mm; the negative way reaches 4.1 x 0.24 = 0.984 m/s < 1.0 m/s; a joint radius
+    # (about 0.25 m) would report 1.025 m/s and cover
+    F = _wheel_F([(4, 4.5, 0.35, 40, 10.0), (4, -4.1, -0.35, 40, 0.0)], {0: 0.26, 1: 0.24})
+    B = TB.analyse_b(F, 1.0, 2.614, 1 / 60)
+    assert B['ga_ok'], B['ga_why']
+    assert [round(c['R0_m'], 3) for c in B['theo_clip']] == [0.26, 0.24]
+    assert B['theo_clip'][1]['v_t_max_m_s'] == pytest.approx(0.984, abs=0.005)
+    assert not B['du_phu'] and not B['phu']['ok']
+
+
+def test_3b_v3_full_turn():
+    a = np.linspace(0, 2 * math.pi, 200, endpoint=False)
+    assert TB.full_turn(a) and not TB.full_turn(a[:150]) and not TB.full_turn(np.array([]))
+
+
+def test_3b_v3_b_part_turn_is_not_a_circle():
+    # Codex G3B-5 round 2: a clip turning less than one turn: no circle, set-up not checked (a free circle on a part of
+    # a turn takes a drift of the radius away)
+    F = _wheel_F([(0, 0.6, 0.35, 12, 0.0)], {0: 0.25}, r_drift=lambda t: 0.006 * t / 12)
+    B = TB.analyse_b(F, 1.0, 2.614, 1 / 60)          # about 0.9 turn in all
+    assert not B['ga_ok'] and any('full turn' in w for w in B['ga_why']) and B['theo_clip'][0]['slow_n'] == 0
+    # the slowest 10 % turn about 0.4 turn: the slow part is grown to a full turn; a drift of 6 mm over the slow end
+    # stays in the radial part or fails the set-up check
+    parts = [(4, 4.5, 0.35, 40, 0.0)]
+    F2 = _wheel_F(parts, {0: 0.25}, r_drift=lambda t: np.where(t > 30, 0.006 * (t - 30) / 14, 0))
+    B2 = TB.analyse_b(F2, 1.0, 2.614, 1 / 60)
+    n_spin = int(np.sum(np.abs(_segs(parts)[1]) > TB.MOVE_RAD_S))
+    assert B2['theo_clip'][0]['slow_n'] > 1.5 * TB.SLOW_SHARE * n_spin
+    assert not B2['ga_ok'] or B2['rad_dev_m'] > 0.002
+
+
+def test_3b_v3_cli_cross_check_null_fields(tmp_path, capsys):
+    # Codex G3B-7 round 2: the cross-check with two clips too short for a slow part gives null q and residual; the CLI
+    # prints them as null (it raised TypeError)
+    make_wheel(str(tmp_path / 'a.csv'), 0.0015, wob=0.0, long=True)
+    make_wheel(str(tmp_path / 'b.csv'), 0.25)
+    rows = []
+    for c0 in (0.0, 20.0):
+        for i in range(27):
+            tt = c0 + i / 60
+            a = 2.0 * tt
+            rows.append(dict(t_s=f'{tt:.6f}', valid=1, x=1 + 0.001 * math.cos(a), y=0.5 + 0.001 * math.sin(a),
+                             psi=math.remainder(a, 2 * math.pi), row_px=1100, col_px=1900))
+    with open(tmp_path / 'c.csv', 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    out = tmp_path / 'o.json'
+    rc = TB.main(['--frames-a', str(tmp_path / 'a.csv'), '--frames-b', str(tmp_path / 'b.csv'),
+                  '--frames-a-cheo', str(tmp_path / 'c.csv'), '--out', str(out)])
+    o = capsys.readouterr()
+    assert rc == 0, o.err
+    d = json.loads(out.read_text(encoding='utf-8'))
+    assert d['A_cheo']['q_abs_m'] is None and '|q| null' in o.out
+
+
+def test_3b_v3_l132_b_used_with_its_drift(tmp_path):
+    # L132: B failing the set-up check only by the drift of its radius is used when asked; the drift stays in rad_dev
+    make_wheel(str(tmp_path / 'a.csv'), 0.0005, wob=0.0, long=True)
+    make_wheel(str(tmp_path / 'b.csv'), 0.25, r_drift=0.006)
+    r0 = TB.analyse(str(tmp_path / 'a.csv'), str(tmp_path / 'b.csv'), 'O1-F02')
+    assert not r0['B']['ga_ok'] and TB.b_troi_only(r0['B']), r0['B']['ga_why']
+    assert not r0['dung_duoc'] and not r0['b_dung_ke_ca_troi']
+    r = TB.analyse(str(tmp_path / 'a.csv'), str(tmp_path / 'b.csv'), 'O1-F02', b_ke_ca_troi=True)
+    assert r['dung_duoc'] and r['b_dung_ke_ca_troi'] and r['b_ke_ca_troi_nguon'].startswith('L132')
+    assert r['d_p_quay_m'] >= r['B']['rad_dev_m'] > 0.002
+    # another reason (centre wandering: residual in the fit) still blocks
+    make_wheel(str(tmp_path / 'b2.csv'), 0.25, drift_centre=0.006)
+    r2 = TB.analyse(str(tmp_path / 'a.csv'), str(tmp_path / 'b2.csv'), 'O1-F02', b_ke_ca_troi=True)
+    if not r2['B']['ga_ok']:
+        assert TB.b_troi_only(r2['B']) or not r2['dung_duoc']
+    assert not TB.b_troi_only(dict(ga_why=['clip 0: residual 2.50 mm > 2 mm']))
+    assert not TB.b_troi_only(dict(ga_why=['clip 0: held-out by time: a half of the slowest part has too few frames']))
+
+
 def test_3b_window_over_turnaround_not_used():
     T = 1 / 60
     tt = np.arange(0, 80, T)

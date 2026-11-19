@@ -61,6 +61,7 @@ import csv
 import json
 import math
 import os
+import re
 import sys
 
 import numpy as np
@@ -92,6 +93,11 @@ SHUTTER_MIN_RAD_S = 2.0     # [DE XUAT] shutter fit only above 2 rad/s: below, o
 PHU_FRAC = 1.0              # C8BS-10 round 3: a part counts as measured up to the F08 peak only when its used data
                             # reach the peak itself in each direction (design 4b: (A) spin above wz peak 2.61 rad/s,
                             # 0.42 turn/s; (B) above v peak / R, 0.74 turn/s at 25 cm)
+RUN_JUMP_RAD_S = 0.5        # [DE XUAT] a rise of the smoothed rate this far above the run's lowest starts a new spin
+RUN_GAP_S = 2.0             # [DE XUAT] a rise across a stretch this long without spinning frames is a re-spin
+RUN_SMOOTH = 31            # spinning frames in the running median of the rate for the runs (0.5 s at 60 frames/s)
+TURN_BINS = 12              # [DE XUAT] a full turn: every 30 degree sector ...
+TURN_BIN_MIN = 3            # ... has at least 3 frames
 CAP = 1.1                   # [DE XUAT] each part uses the data up to 1.1 x the F08 peak (a superset of the range up to
                             # the peak: the largest error over it is not below the largest up to the peak), so the
                             # hand spin, which slows down continuously, passes through the whole range up to the peak
@@ -247,6 +253,94 @@ def slowest_in(om, idx):
         return None
 
 
+def spin_runs(t, om):
+    """Run label of every frame (-1: not spinning). A run is one spin of the set-up: a new run starts when the
+    direction changes or when the rate rises by more than RUN_JUMP_RAD_S above the lowest rate of the current run
+    (a re-spin by hand, during which the set-up may be touched; Codex G3B-1 round 2). The rate is smoothed by a
+    running median over RUN_SMOOTH spinning frames so that noise does not cut a run."""
+    lab = np.full(len(om), -1)
+    sp = np.flatnonzero(np.isfinite(om) & (np.abs(om) > MOVE_RAD_S))
+    if not len(sp):
+        return lab
+    sp = sp[np.argsort(t[sp])]
+    a = np.abs(om[sp])
+    h = RUN_SMOOTH // 2
+    seg = np.concatenate([[0], np.cumsum(np.diff(t[sp]) > RUN_GAP_S)])   # the median does not reach across a gap
+    sm = np.empty(len(a))
+    for i in range(len(a)):
+        w_ = slice(max(0, i - h), i + h + 1)
+        sm[i] = np.median(a[w_][seg[w_] == seg[i]])
+    sg = np.sign(om[sp])
+    # after a start the rate may still rise (spin-up): the lowest rate is tracked only once it falls again
+    run, lo, s0, rising = 0, math.inf, sg[0], True
+    for j, i in enumerate(sp):
+        # a rise across a stretch without spinning frames (> RUN_GAP_S) is a re-spin too, even when the frames
+        # before it were still rising (a slow start, then the set-up spun by hand while the frames were lost)
+        regap = j > 0 and t[i] - t[sp[j - 1]] > RUN_GAP_S and sm[j] > sm[j - 1] + RUN_JUMP_RAD_S
+        if sg[j] != s0 or regap or (not rising and sm[j] > lo + RUN_JUMP_RAD_S):
+            run, lo, s0, rising = run + 1, math.inf, sg[j], True
+        if rising and j > 0 and lab[sp[j - 1]] == run and sm[j] < sm[j - 1]:
+            rising = False
+        if not rising:
+            lo = min(lo, sm[j])
+        lab[i] = run
+    return lab
+
+
+def held_out_runs(fit, res, slk, runs_ci, run):
+    """Codex G3B-1 round 2: a set-up moved between two spins of one clip is not seen by the time halves when the slow
+    frames come from one spin. For every run of the clip that has slow frames: fit on the slow frames of the other runs,
+    take the largest residual on its own slow frames. Returns (worst or None, reasons, runs without slow frames: their
+    geometry is not checked, so their frames are not used)."""
+    why, worst, unchecked = [], None, []
+    if len(runs_ci) < 2:
+        return None, why, unchecked
+    for r_ in runs_ci:
+        own = slk[run[slk] == r_]
+        if not len(own):
+            unchecked.append(int(r_))
+            continue
+        other = slk[run[slk] != r_]
+        if len(other) < SLOW_MIN // 2:
+            why.append(f'run {r_}: held-out by run: fewer than {SLOW_MIN // 2} slow frames in the other runs')
+            continue
+        m = fit(other)
+        if m is None:
+            why.append(f'run {r_}: held-out by run: q not identified on the other runs')
+            continue
+        e = float(np.max(res(m, own)))
+        worst = e if worst is None else max(worst, e)
+    return worst, why, unchecked
+
+
+def full_turn(ang):
+    """The angles cover every one of TURN_BINS sectors of a turn with at least TURN_BIN_MIN frames (a part of a turn
+    does not fix a circle; Codex G3B-5 round 2)."""
+    if not len(ang):
+        return False
+    k = np.floor(np.mod(ang, 2 * math.pi) / (2 * math.pi) * TURN_BINS).astype(int) % TURN_BINS
+    return bool(np.all(np.bincount(k, minlength=TURN_BINS) >= TURN_BIN_MIN))
+
+
+def slowest_turn(om, idx, x, y):
+    """slowest_in() grown by steps of 5 % of the spinning frames until the slow part covers a full turn about the
+    circle fitted to it; None when the clip never does."""
+    sp = idx[np.isfinite(om[idx]) & (np.abs(om[idx]) > MOVE_RAD_S)]
+    if len(sp) < SLOW_MIN:
+        return None
+    s = sp[np.argsort(np.abs(om[sp]))]
+    k = max(SLOW_MIN, int(SLOW_SHARE * len(s)))
+    step = max(1, len(s) // 20)
+    while True:
+        sel = s[:k]
+        cx_, cy_, _ = circle_fit(x[sel], y[sel])
+        if full_turn(np.arctan2(y[sel] - cy_, x[sel] - cx_)):
+            return sel
+        if k >= len(s):
+            return None
+        k = min(len(s), k + step)
+
+
 def speed_halves(om, idx):
     """The slowest part split by |Omega| (slower half, faster half): a geometry fitted on one speed half must
     predict the other, else a speed-dependent measurement error is being taken for geometry (Codex G3B-3)."""
@@ -274,6 +368,7 @@ def analyse_a(F, wz_max):
         return axis_res(x[i], y[i], psi[i], *m)
     why, p4_why, per_clip = [], [], []
     dev = np.full(len(t), np.nan)                     # residual of each frame against the geometry of its own clip
+    run = spin_runs(t, om)
     for k, ci in enumerate(clips(t, F.get('clip'))):
         slk = slowest_in(om, ci)
         if slk is None:
@@ -292,6 +387,13 @@ def analyse_a(F, wz_max):
             why.append(f'clip {k}: held-out by time: {why_t}')
         elif ho_t > GA_TOL_M:
             why.append(f'clip {k}: held-out by time residual {ho_t * 1e3:.2f} mm > {GA_TOL_M * 1e3:.0f} mm')
+        # set-up moved between two spins of the clip (Codex G3B-1 round 2)
+        runs_ci = [int(r_) for r_ in np.unique(run[ci]) if r_ >= 0]
+        ho_r, why_r, unchecked = held_out_runs(_fit, _res, slk, runs_ci, run)
+        why += [f'clip {k}: {w}' for w in why_r]
+        if ho_r is not None and ho_r > GA_TOL_M:
+            why.append(f'clip {k}: held-out by run residual {ho_r * 1e3:.2f} mm > {GA_TOL_M * 1e3:.0f} mm')
+        not_checked = ci[np.isin(run[ci], unchecked)]
         # speed part of an error the model takes into q (Codex G3B-3, J v6 section 6): q fitted on the slower and on
         # the faster half of the slowest part; the cross residual is a set-up check, the change of q is added to the
         # position part
@@ -313,10 +415,14 @@ def analyse_a(F, wz_max):
             if fp_ is not None and fn_ is not None:
                 dq_d = float(np.hypot(*(fp_[1] - fn_[1])))
         dev[ci] = _res((c0, q), ci) + (dq_v if dq_v is not None else 0.0)
+        dev[not_checked] = np.nan                       # a spin without slow frames: its set-up not checked, not used
+        use[not_checked] = False
         per_clip.append(dict(clip=k, slow_n=int(len(slk)), c0=[float(c0[0]), float(c0[1])],
                              q_m=[float(q[0]), float(q[1])], q_abs_m=float(np.hypot(*q)), q_spread=spread,
                              q_nhan_dang=q_ok, ga_dev_m=dk, ga_giu_ngoai_thoi_gian_m=ho_t,
                              ga_giu_ngoai_toc_do_m=ho_v, dq_toc_do_m=dq_v, dq_chieu_trong_clip_m=dq_d,
+                             n_luot_quay=len(runs_ci), ga_giu_ngoai_luot_m=ho_r,
+                             luot_khong_kiem=unchecked, n_khung_khong_kiem=int(len(not_checked)),
                              chieu=sorted({int(np.sign(v)) for v in om[slk]}),
                              slow_rate_rad_s=[float(np.min(np.abs(om[slk]))), float(np.max(np.abs(om[slk])))]))
     ok_clips = [d for d in per_clip if d['slow_n']]
@@ -324,7 +430,8 @@ def analyse_a(F, wz_max):
         why.append('no clip with a slowest part')
     ga_ok = not why
     ga_dev = max((d['ga_dev_m'] for d in ok_clips), default=None)
-    hos = [v for d in ok_clips for v in (d['ga_giu_ngoai_thoi_gian_m'], d['ga_giu_ngoai_toc_do_m']) if v is not None]
+    hos = [v for d in ok_clips for v in (d['ga_giu_ngoai_thoi_gian_m'], d['ga_giu_ngoai_toc_do_m'],
+                                         d['ga_giu_ngoai_luot_m']) if v is not None]
     doi = []
     for d1, d2 in zip(ok_clips[:-1], ok_clips[1:]):
         doi.append(dict(clip=[d1['clip'], d2['clip']],
@@ -336,7 +443,10 @@ def analyse_a(F, wz_max):
     # with the speed (dq_toc_do, per clip) or with the direction (q of the two directions in one clip, or of clips
     # spun the other way) is, and is added to the position part. Not estimable -> position part not finite.
     dq_dirs = [d['dq_chieu_trong_clip_m'] for d in ok_clips if d['dq_chieu_trong_clip_m'] is not None]
-    dq_dirs += [dd['dq_m'] for dd, (d1, d2) in zip(doi, zip(ok_clips[:-1], ok_clips[1:])) if d1['chieu'] != d2['chieu']]
+    # between two clips only when each is one-way and the ways differ (Codex G3B2-1: a clip with a few slow frames the
+    # other way is not a clip spun the other way; its direction part needs its own fit of both ways)
+    dq_dirs += [dd['dq_m'] for dd, (d1, d2) in zip(doi, zip(ok_clips[:-1], ok_clips[1:]))
+                if len(d1['chieu']) == 1 and len(d2['chieu']) == 1 and d1['chieu'] != d2['chieu']]
     dq_chieu = max(dq_dirs, default=None)
     if dq_chieu is None:
         p4_why.append('the direction part of the absorbed camera error not estimated (no slowest part of both '
@@ -525,8 +635,12 @@ def analyse_b(F, v_max, wz_max, frame_s):
     om = rate(t, th)
     r = np.hypot(x - cx, y - cy)
     ga_dev_tho = float(np.max(np.abs(r[sl] - R0)))                     # v1 check, kept for reference
-    v_t = np.abs(om) * R0
-    use_p = np.isfinite(om) & (np.abs(om) > MOVE_RAD_S) & (v_t <= CAP * v_max)
+    # per clip (Codex G3B2-2): centre, angle, rate and tangential speed from the clip's own circle; filled below
+    th = np.full(len(t), np.nan)
+    om = np.full(len(t), np.nan)
+    v_t = np.full(len(t), np.nan)
+    use_p = np.zeros(len(t), bool)
+    hp_err = np.full(len(t), np.nan)
 
     ctx = {}
 
@@ -568,12 +682,24 @@ def analyse_b(F, v_max, wz_max, frame_s):
     ga_why, per_clip = [], []
     rad_err = np.full(len(t), np.nan)
     for k, ci in enumerate(clips(t, F.get('clip'))):
-        slk = slowest_in(om, ci)
+        # rough angle about the clip's median point: only to rank the slow frames and count the sectors of a turn
+        th_r = np.unwrap(np.arctan2(y[ci] - np.median(y[ci]), x[ci] - np.median(x[ci])))
+        om_r = np.full(len(t), np.nan)
+        om_r[ci] = rate(t[ci], th_r)
+        # the slow part grown until it covers a full turn (Codex G3B-5 round 2: a free circle on a part of a turn
+        # takes a drift of the radius away)
+        slk = slowest_turn(om_r, ci, x, y)
         if slk is None:
-            if use_p[ci].any():
-                ga_why.append(f'clip {k}: fewer than {SLOW_MIN} spinning frames, its geometry not checked')
+            if (np.isfinite(om_r[ci]) & (np.abs(om_r[ci]) > MOVE_RAD_S)).any():
+                ga_why.append(f'clip {k}: no slow part covering a full turn ({TURN_BINS} sectors x {TURN_BIN_MIN} '
+                              f'frames) among {SLOW_MIN}+ spinning frames, its geometry not checked')
             per_clip.append(dict(clip=k, slow_n=0))
             continue
+        cxk, cyk, Rk = circle_fit(x[slk], y[slk])
+        th[ci] = np.unwrap(np.arctan2(y[ci] - cyk, x[ci] - cxk))
+        om[ci] = rate(t[ci], th[ci])
+        v_t[ci] = np.abs(om[ci]) * Rk
+        use_p[ci] = np.isfinite(om[ci]) & (np.abs(om[ci]) > MOVE_RAD_S) & (v_t[ci] <= CAP * v_max)
         ctx.clear()
         m = _bfit(slk)
         dk = float(np.max(_bres(m, slk)))
@@ -587,28 +713,43 @@ def analyse_b(F, v_max, wz_max, frame_s):
             ga_why.append(f'clip {k}: held-out by time residual {ho_t * 1e3:.2f} mm > {GA_TOL_M * 1e3:.0f} mm')
         if dk > GA_TOL_M:
             ga_why.append(f'clip {k}: residual {dk * 1e3:.2f} mm > {GA_TOL_M * 1e3:.0f} mm')
-        # radial part: |r - R| about this clip's circle, harmonics and drift NOT removed (Codex G3B-5: a drift
-        # in step with the phase must not be taken away as a harmonic)
-        cxk, cyk, Rk = circle_fit(x[slk], y[slk])
+        # set-up moved between two spins of the clip (Codex G3B-1 round 2)
+        run = np.full(len(t), -1)
+        run[ci] = spin_runs(t[ci], om[ci])
+        runs_ci = [int(r_) for r_ in np.unique(run[ci]) if r_ >= 0]
+        ho_r, why_r, unchecked = held_out_runs(_bfit, _bres, slk, runs_ci, run)
+        ga_why += [f'clip {k}: {w}' for w in why_r]
+        if ho_r is not None and ho_r > GA_TOL_M:
+            ga_why.append(f'clip {k}: held-out by run residual {ho_r * 1e3:.2f} mm > {GA_TOL_M * 1e3:.0f} mm')
+        not_checked = ci[np.isin(run[ci], unchecked)]
+        use_p[not_checked] = False
+        # radial part: |r - R| about this clip's circle from a slow part covering a full turn, harmonics and drift
+        # NOT removed (Codex G3B-5: a drift in step with the phase must not be taken away)
         rad_err[ci] = np.abs(np.hypot(x[ci] - cxk, y[ci] - cyk) - Rk)
+        # heading against the radius: the tag may sit at another angle on the set-up in each clip
+        phi_k = psi[ci] - th[ci]
+        hp_err[ci] = np.abs(np.angle(np.exp(1j * (phi_k - np.median(psi[slk] - th[slk])))))
         co_k = m[2]
         per_clip.append(dict(clip=k, slow_n=int(len(slk)), centre=[cxk, cyk], R0_m=Rk, ga_dev_m=dk,
                              ga_giu_ngoai_thoi_gian_m=ho_t, giu_ngoai_tam_chung=tam_chung,
                              giu_ngoai_khong_hai_hoa=khong_hai_hoa,
+                             n_luot_quay=len(runs_ci), ga_giu_ngoai_luot_m=ho_r, luot_khong_kiem=unchecked,
+                             n_khung_khong_kiem=int(len(not_checked)),
+                             v_t_max_m_s=float(np.nanmax(v_t[ci])) if np.isfinite(v_t[ci]).any() else None,
                              mo_hinh_ban_kinh=dict(bac1_m=float(np.hypot(co_k[1], co_k[2])),
                                                    elip_m=float(np.hypot(co_k[3], co_k[4])), troi_m_s=float(co_k[5]))))
     ok_clips = [d for d in per_clip if d['slow_n']]
     if not ok_clips:
         ga_why.append('no clip with a slowest part')
     ga_dev = max((d['ga_dev_m'] for d in ok_clips), default=None)
-    hos = [d['ga_giu_ngoai_thoi_gian_m'] for d in ok_clips if d['ga_giu_ngoai_thoi_gian_m'] is not None]
-    phi = psi - th
-    phi_sl = float(np.median(phi[sl]))
-    cov = coverage(om[use_p] * R0, v_max)          # the frames used: tangential speed up to v_max, each direction
+    hos = [v for d in ok_clips for v in (d['ga_giu_ngoai_thoi_gian_m'], d['ga_giu_ngoai_luot_m']) if v is not None]
+    # the frames used: tangential speed of each frame from its own clip's radius, up to v_max, each direction
+    cov = coverage(np.sign(om[use_p]) * v_t[use_p], v_max)
     use_r = use_p & np.isfinite(rad_err)
     rad_dev = float(np.max(rad_err[use_r])) if use_r.any() else None
     rad_dev_tho = float(np.max(np.abs(r[use_p] - R0))) if use_p.any() else None
-    hp_dev = float(np.max(np.abs(phi[use_p] - phi_sl))) if use_p.any() else None
+    use_h = use_p & np.isfinite(hp_err)
+    hp_dev = float(np.max(hp_err[use_h])) if use_h.any() else None
     # rolling shutter: one alpha over all spinning frames, and one per speed band x direction (pieces and
     # harmonics shared: within one band the rate hardly changes, so a band alone cannot tell the shutter term from
     # the first harmonic)
@@ -692,7 +833,14 @@ def cross_check(fc, a, wz_max):
                          'truc, khong anh huong ket qua A/B, khong dung lam can huong hay vi tri'))
 
 
-def analyse(fa, fb, task='O1-F08', fc=None):
+def b_troi_only(b):
+    """L132: every reason B failed the set-up check is a held-out residual by time or by spin (a drift of the radius),
+    not a residual in the fit, a part of a turn, too few frames or q not identified."""
+    w = b['ga_why']
+    return bool(w) and all(re.search(r'held-out by (time|run) residual [0-9.]+ mm > ', x) for x in w)
+
+
+def analyse(fa, fb, task='O1-F08', fc=None, b_ke_ca_troi=False):
     from o1_feasibility import Schedule
     from o1_tasks import FIG8
     import o1_gate
@@ -710,14 +858,21 @@ def analyse(fa, fb, task='O1-F08', fc=None):
     thieu = [nm for nm, ok_ in (('A phu toc do / hai chieu', a['du_phu']), ('B phu toc do / hai chieu', b['du_phu']),
                                 ('A dao dong huong', parts_psi[0] is not None), ('B huong-vi tri', parts_psi[1] is not None),
                                 ('A vi tri', parts_p[0] is not None), ('B ban kinh', parts_p[1] is not None)) if not ok_]
-    usable = ga_ok and not thieu
+    # L132 (Liam 19/11 at CODE, "Dung B buoi 1 ke ca troi (Recommended)"): B of session 1 used although its set-up
+    # check failed by the drift of the radius only; the drift is in rad_dev (not removed), so it counts as an error
+    b_troi = bool(b_ke_ca_troi and a['ga_ok'] and not b['ga_ok'] and b_troi_only(b))
+    usable = (ga_ok or b_troi) and not thieu
     return dict(version=VERSION, task_rates=task, v_max=v_max, wz_max=wz_max, A=a, B=b, A_cheo=cheo,
                 ga_ok=ga_ok, thieu=thieu,
+                b_ke_ca_troi_yeu_cau=bool(b_ke_ca_troi), b_dung_ke_ca_troi=b_troi,
+                b_ke_ca_troi_nguon=('L132, Liam 19/11 phien CODE local_e6d36dbe: "Dung B buoi 1 ke ca troi '
+                                    '(Recommended)"; gioi han: khong tach troi ga voi sai camera') if b_troi else None,
                 dung_duoc=usable,
                 d_psi_quay_deg=max(parts_psi) if usable else None,
                 d_p_quay_m=max(parts_p) if usable else None,
                 gioi_han=['sai tron bi khop hap thu', 'B: sai tiep tuyen khong do (thieu chuan pha)', 'sai pha chung huong va vi tri tiep tuyen', 'lech khong doi '
-                          'theo toc do (phep 2)', 'rung, nghieng xe that'])
+                          'theo toc do (phep 2)', 'rung, nghieng xe that',
+                          'doi ga trong mot luot quay khong tach duoc voi sai do theo toc do (nam trong p_dev, rad_dev)'])
 
 
 def _clean(o):
@@ -741,9 +896,11 @@ def main(argv=None):
     ap.add_argument('--frames-a-cheo', default=None, help='tag on the axis ("A cu"): cross-check of the axis model')
     ap.add_argument('--task', default='O1-F08', help='level whose command peaks limit the rates (design 4b: F08)')
     ap.add_argument('--out', required=True)
+    ap.add_argument('--b-ke-ca-troi', action='store_true',
+                    help='L132: use B although its set-up check failed by the drift of the radius only (session 1)')
     a = ap.parse_args(argv)
     try:
-        out = analyse(a.frames_a, a.frames_b, a.task, a.frames_a_cheo)
+        out = analyse(a.frames_a, a.frames_b, a.task, a.frames_a_cheo, b_ke_ca_troi=a.b_ke_ca_troi)
         out['nguon'] = [dict(vai=v, file=os.path.basename(p), sha256=cu.sha256(p))
                         for v, p in (('A', a.frames_a), ('B', a.frames_b), ('A_cheo', a.frames_a_cheo)) if p]
         out['script'] = cu.script_state()
@@ -756,12 +913,15 @@ def main(argv=None):
         return 2
     sh = out['B']['shutter']
     print(f'ga_ok {out["ga_ok"]} (A {out["A"]["ga_why"] or "dat"}; B {out["B"]["ga_why"] or "dat"}); '
-          f'thieu {out["thieu"]}; d_psi_quay {out["d_psi_quay_deg"]} deg; d_p_quay {out["d_p_quay_m"]} m; '
+          f'thieu {out["thieu"]}; b_dung_ke_ca_troi {out["b_dung_ke_ca_troi"]}; '
+          f'd_psi_quay {out["d_psi_quay_deg"]} deg; d_p_quay {out["d_p_quay_m"]} m; '
           f'alpha {"dung" if sh["use_alpha"] else "khong dung: " + sh["why"]}')
     if out['A_cheo'] is not None:
         c = out['A_cheo']
-        print(f'A cheo (chi kiem mo hinh): khop {c["khop_mo_hinh_ok"]}, |q| {c["q_abs_m"] * 1e3:.2f} mm, '
-              f'ga_dev {c["ga_dev_m"] * 1e3:.2f} mm')
+        def _mm(v):                                     # Codex G3B-7: a null field prints as such, no TypeError
+            return 'null' if v is None else f'{v * 1e3:.2f} mm'
+        print(f'A cheo (chi kiem mo hinh): khop {c["khop_mo_hinh_ok"]}, |q| {_mm(c["q_abs_m"])}, '
+              f'ga_dev {_mm(c["ga_dev_m"])}')
     print(f'#ket_qua,ma=0,ga_ok={int(out["ga_ok"])},alpha_dung={int(sh["use_alpha"])}')
     return 0
 
