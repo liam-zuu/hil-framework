@@ -13,8 +13,10 @@ the reference window).
   python tools/c8_hc_a.py kiem DIR [--age-r-max-ms 125]                    # at the floor, log only (~10 s)
   python tools/c8_hc_a.py kiem_video DIR --clip CLIP --session SESSION      # at the floor, sparse video (2-5 min)
   python tools/c8_hc_a.py cua_so DIR... --frames F --track T [--dets D]     # windows (F2) + legs (F5), per attempt
+      run 2 (T9b): ... --a6 A6 --xoay X --lan-lap lan_lap.json --ra NEW_DIR  # F5 lan_lap_id from F8 run 1
   python tools/c8_hc_a.py tinh --cho goc|K1|K2 --cap DIR [--them DIR...] --frames-of DIR=frames.csv ...
-                          [--neo hieu_chuan_neo.json] [--e-hieu e_hieu.json] [--xoay xoay.json] [--out truc_xe_v1.json]
+                          [--neo hieu_chuan_neo.json] [--e-hieu e_hieu.json [--doan NEW_DIR/doan_12b_v1.json]]
+                          [--xoay xoay.json] [--out truc_xe_v1.json]
 
 DIR is one attempt folder of c8_hc_seq.py (log.csv, sender.txt, lich.csv, gain_query_*.txt). The video side reads
 the frames CSV of c7_measure track run with tag_offset 0 (tag_x, tag_y, psi = tag heading). The common frame chain of
@@ -1197,6 +1199,14 @@ def cmd_cua_so(a):
             raise AError(f'{a.track}: {k_t} khac file dua vao cua_so')
     S = json.load(open(a.session, encoding='utf-8')) if a.session else {}
     ses_sha = sha256(a.session) if a.session else a.session_sha256
+    # F8 (T9b, CODE 20/11): lan_lap_id of this 12b from NHACTAM lan_lap_v1 run 1; read before any file is written
+    ll_id, ll_why, ll_sha = None, 'chua co --lan-lap (F8 lan_lap_v1 cua NHACTAM)', None
+    lan_lap, ra_dir = getattr(a, 'lan_lap', None), getattr(a, 'ra', None)
+    if lan_lap:
+        ll_id, ll_why, ll_sha = read_lan_lap(lan_lap, A['thu_id'], A['cho'], a.a6, clip_sha, sha256(a.frames))
+    ra = ra_dir or a.dir                     # run 2 (with --a6 --xoay --lan-lap) writes to a new folder (mode x)
+    if ra_dir:
+        os.makedirs(ra, exist_ok=True)
     pos = stop_positions(A['segs'])
     rows = []
     roles = window_roles(A['segs'])
@@ -1221,7 +1231,7 @@ def cmd_cua_so(a):
         pr = f2_problems(r)
         if pr:
             raise AError(f"F2 {r['loai']} {r['chi_so']}: {pr}")
-    out = os.path.join(a.dir, 'cua_so_v1.jsonl')
+    out = os.path.join(ra, 'cua_so_v1.jsonl')
     with open(out, 'x', encoding='utf-8') as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + '\n')
@@ -1233,13 +1243,12 @@ def cmd_cua_so(a):
              for k, v in (('clip', a.clip), ('session', a.session), ('frames', a.frames), ('track', a.track),
                           ('dets', a.dets), ('log', A['log_path']), ('sender', os.path.join(a.dir, 'sender.txt')),
                           ('lich', os.path.join(a.dir, 'lich.csv')), ('cua_so_v1', out), ('a6', a.a6),
-                          ('xoay', a.xoay)) if v]
-    # HCC2-7: 'khoa' needs every source file AND the keys made from them (dets_fp; lan_lap_id of NHACTAM, not
-    # available yet: F5 stays chan_doan until the F8 lan_lap_v1 contract is wired)
-    lan_lap_id = None
+                          ('xoay', a.xoay), ('lan_lap', lan_lap)) if v]
+    # HCC2-7: 'khoa' needs every source file AND the keys made from them (dets_fp; lan_lap_id of NHACTAM from F8)
     src_ok = (all((a.clip, a.session, a.dets, a.a6, a.xoay)) and dets_fingerprint(a.dets) is not None
-              and lan_lap_id is not None)
-    doan = dict(schema='c8_hc_doan_12b_v1', thu_id=A['thu_id'], cho=A['cho'], lan_lap_id=None,
+              and ll_id is not None)
+    doan = dict(schema='c8_hc_doan_12b_v1', thu_id=A['thu_id'], cho=A['cho'], lan_lap_id=ll_id,
+                lan_lap_v1_sha256=ll_sha, lan_lap_id_ly_do=ll_why,
                 trang_thai=an['chuoi'] if src_ok else 'chan_doan', clip=a.clip, clip_sha256=clip_sha, session_sha256=ses_sha,
                 frames_sha256=sha256(a.frames), track_sha256=sha256(a.track), cua_so_v1_sha256=sha256(out),
                 esp32_sha256=sha256(A['log_path']), commit_hil=commit_hil(),
@@ -1266,7 +1275,7 @@ def cmd_cua_so(a):
     pr = f5_problems(doan)
     if pr:
         raise AError(f'F5: {pr}')
-    with open(os.path.join(a.dir, 'doan_12b_v1.json'), 'x', encoding='utf-8') as f:
+    with open(os.path.join(ra, 'doan_12b_v1.json'), 'x', encoding='utf-8') as f:
         json.dump(doan, f, ensure_ascii=False, indent=1)
     print(f"D={an['D']:.3f} s u_D={an['u_D']:.3f} s chuoi={an['chuoi']}")
     for lg in an['legs']:
@@ -1378,6 +1387,60 @@ def _read_neo(path, cho, ref_row):
     if not math.isfinite(v):
         raise AError(f'{path}: psi_chuan_k_deg khong huu han')
     return v, sorted(ids)
+
+
+def _f2_rows(path):
+    """Window rows of a cua_so_v1 (F2) file: JSON lines, a JSON list, or {schema, cua_so|dong|windows: [...]}."""
+    txt = open(path, encoding='utf-8').read()
+    try:
+        o = json.loads(txt)
+    except ValueError:
+        o = [json.loads(s) for s in txt.splitlines() if s.strip()]
+    if isinstance(o, dict):
+        o = next((o[k] for k in ('cua_so', 'dong', 'windows') if isinstance(o.get(k), list)), None)
+    if not isinstance(o, list) or not all(isinstance(r, dict) for r in o):
+        raise AError(f'{path}: khong doc duoc danh sach cua so F2')
+    return o
+
+
+def read_lan_lap(path, thu_id, cho, a6_path, clip_sha, frames_sha):
+    """(lan_lap_id or None, reason or None, sha256 of the file) of a 12b attempt from F8 lan_lap_v1 of NHACTAM (run 1
+    of lan_lap, without --f15 / --truc-xe; CODE 20/11, sequence T9, T9b). F8 has one luot[] record per car run
+    (windows pre/post), none for a 12b attempt: the placement of the 12b is the lan_lap_id that F8 gives to the runs of
+    the same place it verified against this 12b as standard (luot[].chuan_12b = thu_id; a record with luot_id = thu_id
+    counts too). Exactly one value -> that id; none, or several -> None with the reason (F5 stays chan_doan).
+    A file that is not this session's F8 is refused (AError, code 2): schema lan_lap_v1; tam_id of the file and of every
+    record = c8b_a6_v2.tam_id of --a6; a6.sha256 = the --a6 file; its F2 file present with the sha256 it names and
+    holding the ref_12b window of this attempt (same luot_id, cho, clip_sha256, frames_sha256)."""
+    tam = a6_tam_id(a6_path)
+    if tam is None:
+        raise AError('--lan-lap can --a6 co tam_id (c8b_a6_v2.tam_id)')
+    j = json.load(open(path, encoding='utf-8'))
+    if not isinstance(j, dict) or j.get('schema') != 'lan_lap_v1':
+        raise AError(f'{path}: khong phai lan_lap_v1')
+    if j.get('tam_id') != tam:
+        raise AError(f"{path}: tam_id {j.get('tam_id')!r} khac tam_id cua A6 {tam!r}")
+    if (j.get('a6') or {}).get('sha256') != sha256(a6_path):
+        raise AError(f'{path}: a6.sha256 khac file --a6')
+    f2, f2_sha = j.get('cua_so_v1_file'), j.get('cua_so_v1_sha256')
+    if not f2 or not os.path.isfile(f2) or sha256(f2) != f2_sha:
+        raise AError(f'{path}: file F2 cua F8 ({f2}) khong co hay sha256 khac cua_so_v1_sha256')
+    if not any(r.get('luot_id') == thu_id and r.get('cho') == cho and r.get('loai') == 'ref_12b'
+               and r.get('clip_sha256') == clip_sha and r.get('frames_sha256') == frames_sha for r in _f2_rows(f2)):
+        raise AError(f'{path}: F2 cua F8 khong co cua so ref_12b cua {thu_id} ({cho}) voi cung clip, frames')
+    luot = j.get('luot')
+    if not isinstance(luot, list) or not all(isinstance(r, dict) for r in luot):
+        raise AError(f'{path}: luot phai la danh sach ban ghi')
+    if any(r.get('tam_id') != tam for r in luot):
+        raise AError(f'{path}: co luot cua tam khac {tam!r}')
+    ids = {r['lan_lap_id'] for r in luot if r.get('cho') == cho and thu_id in (r.get('chuan_12b'), r.get('luot_id'))
+           and isinstance(r.get('lan_lap_id'), str) and r['lan_lap_id']}
+    f_sha = sha256(path)
+    if len(ids) == 1:
+        return ids.pop(), None, f_sha
+    if not ids:
+        return None, f'F8 khong co luot nao cua {cho} xac minh lan lap voi 12b {thu_id} (chuan_12b)', f_sha
+    return None, f'F8 cho 12b {thu_id} nhieu lan_lap_id {sorted(ids)}', f_sha
 
 
 def read_e_hieu(path, doan_path):
@@ -1543,9 +1606,14 @@ def cmd_tinh(a):
                 nguon.append(dict(vai_tro='cua_so_v1', duong_dan=os.path.abspath(p), sha256=sha256(p)))
     e = None
     bao_q = False
+    ll_f5 = None
     if a.e_hieu:
-        dp = os.path.join(a.cap, 'doan_12b_v1.json')
+        dp = a.doan or os.path.join(a.cap, 'doan_12b_v1.json')
         e, bao_q = read_e_hieu(a.e_hieu, dp)
+        f5 = json.load(open(dp, encoding='utf-8'))
+        if f5.get('thu_id') != cap_id or f5.get('cho') != a.cho:
+            raise AError(f'{dp}: F5 cua {f5.get("thu_id")} ({f5.get("cho")}), khong phai luot cap {cap_id} ({a.cho})')
+        ll_f5 = f5.get('lan_lap_id')
         nguon += [dict(vai_tro='e_hieu_m', duong_dan=os.path.abspath(a.e_hieu), sha256=sha256(a.e_hieu)),
                   dict(vai_tro='doan_12b_v1', duong_dan=os.path.abspath(dp), sha256=sha256(dp))]
     q = du = None
@@ -1602,8 +1670,10 @@ def cmd_tinh(a):
                      cap_why=cap_why, bao_q=bao_q, vet=vet, psi_cuc_chot=chot, need_windows=need, psi_hai_dau=psi_hd,
                      can_hai_dau=can_fn, p_ref_tag=p_ref_tag)
     r = dict(schema='truc_xe_v1', version=VERSION, commit_hil=commit_hil(), nguon=nguon,
-             mien_hieu_luc=dict(cho=a.cho, thu_id_cap=cap_id, lan_lap_id=None,
-                                ghi_chu='cung buoi, cung lan lap tam (lan_lap_v1 cua NHACTAM chua co: chua xac minh)'),
+             mien_hieu_luc=dict(cho=a.cho, thu_id_cap=cap_id, lan_lap_id=ll_f5,
+                                ghi_chu='cung buoi, cung lan lap tam' + (
+                                    ' (lan_lap_id cua F5, tu F8 lan_lap_v1 luot 1 cua NHACTAM)' if ll_f5 else
+                                    ' (khong co lan_lap_id: F5 chua noi F8, chua xac minh)')),
              **r)
     txt = json.dumps(r, ensure_ascii=False, indent=1, default=float)
     if a.out:
@@ -1694,6 +1764,9 @@ def main(argv=None):
     c.add_argument('--a6', default=None)
     c.add_argument('--xoay', default=None)
     c.add_argument('--session', default=None, help='session JSON of c7 (fit_ids, car_side_m, tag_h_m, sha256)')
+    c.add_argument('--lan-lap', default=None, help='lan_lap.json of NHACTAM (F8, run 1): lan_lap_id of this 12b; '
+                                                   'needs --a6 with tam_id')
+    c.add_argument('--ra', default=None, help='output folder (default DIR); run 2 with --lan-lap: a new folder')
     t = sub.add_parser('tinh')
     t.add_argument('--cho', required=True, choices=sorted(hs.PLACES))
     t.add_argument('--cap', required=True, help='attempt folder whose a is issued')
@@ -1703,6 +1776,8 @@ def main(argv=None):
     t.add_argument('--xoay', default=None)
     t.add_argument('--neo', default=None, help='hieu_chuan_neo.json of NHACTAM (F6)')
     t.add_argument('--e-hieu', default=None, help='e_hieu_m of KIEMCHEO (F9)')
+    t.add_argument('--doan', default=None, help='F5 doan_12b_v1.json the F9 was made from (default CAP/doan_12b_v1.json;'
+                                                ' run 2 of cua_so writes it to its --ra folder)')
     t.add_argument('--can-c8b', default=None, help='C8B file with u_psi_cuc_rad (two-end camera heading bound)')
     t.add_argument('--kc', default=None, help='KIEMCHEO kiem_cheo.json (c7_kiem_cheo_v7) for c8b_a6.u_psi_hai_dau_rad')
     t.add_argument('--tam-id', default=None, help='optional check: must equal c8b_a6_v2.tam_id of --a6 (the plate '
