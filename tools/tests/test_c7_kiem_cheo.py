@@ -2727,3 +2727,27 @@ def test_e_hieu_refuses_the_f5_of_another_segment(tmp_path, scene):
     r['sessions']['H_a']['sha256'] = '7' * 64
     kcp.write_text(json.dumps(r), encoding='utf-8')
     assert kc.main(['e_hieu', '--kiem-cheo', str(kcp), '--doan', str(dop), '--out', str(tmp_path / 'e.json')]) == 2
+
+
+def test_meo_bang_reads_the_sessions_list_of_nhactam(tmp_path, scene, monkeypatch):
+    """F8 of several sessions (NHACTAM 2bf72b3): session_file / session_sha256 / fit_ids null at the root, a
+    sessions list [{file, sha256}]: without --session the files of the list are used, each item through its own; a
+    --session not in the list: code 2."""
+    sp = _f15_session(tmp_path, scene)
+    p2 = _second_session(tmp_path, sp)
+    lp, ll = _bang_files(tmp_path, sp)
+    s1, s2 = kc.sha256_file(str(sp)), kc.sha256_file(str(p2))
+    for dau in ll['luot'][1]['dau'].values():
+        dau['session_sha256'] = s2
+    ll.update(session_sha256=None, session_file=None, fit_ids=None,
+              sessions=[dict(file=str(sp), sha256=s1), dict(file=str(p2), sha256=s2)])
+    lp.write_text(json.dumps(ll), encoding='utf-8')
+    _field_cases(monkeypatch, scene)
+    out = tmp_path / 'b.json'
+    base = ['meo_bang', '--model', 'B1', '--lan-lap', str(lp)] + _bang_dets(tmp_path, scene)
+    assert kc.main(base + ['--out', str(out)]) == 0
+    r = json.loads(out.read_text(encoding='utf-8'))
+    assert {x['sha256'] for x in r['ban_do']['sessions']} == {s1, s2}
+    assert {m['session_sha256'] for m in r['theo_cho']['K1']['muc']} == {s2}
+    p3 = _second_session(tmp_path, sp, ghi_chu='khac')
+    assert kc.main(base + ['--session', str(p3), '--out', str(tmp_path / 'b2.json')]) == 2

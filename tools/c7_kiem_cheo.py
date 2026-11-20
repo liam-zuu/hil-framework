@@ -2028,7 +2028,10 @@ def meo_bang(a):
     # sessions (CODE 20/11 khuya, chain A): every item is measured through the cameras of ITS session (run end
     # session_sha256, F6 window meta.session_sha); --session repeated gives the files; without it the single session of
     # the F8 (KCF1-2). The car_pose set-up (kappa_n, Z_c, plumb) and the floor marks must be the same in every session.
-    paths = list(a.session or []) or [_ll_session(ll, a)]
+    lls = [x for x in (ll.get('sessions') or []) if isinstance(x, dict)]   # F8 of several sessions (NHACTAM 2bf72b3)
+    paths = list(a.session or []) or ([x.get('file') for x in lls] if lls else [_ll_session(ll, a)])
+    if not all(paths):
+        raise KCError('lan_lap.json sessions: a session without file (and no --session)')
     ses = {}
     for sp_ in paths:
         sd_, sha_ = load_json_sha(sp_)
@@ -2037,7 +2040,14 @@ def meo_bang(a):
         s_, _, mk_, pc_, _, kt_, C_ = _session_ctx(sp_, sha_, a.model)
         ses[sha_] = dict(file=os.path.abspath(sp_), s=s_, mk=mk_, pc=pc_, kappa_t=kt_, C=C_)
     top = ll.get('session_sha256')
-    allowed = set(top if isinstance(top, list) else [top]) if top else set(ses)
+    if lls:
+        allowed = {_hex(x.get('sha256'), 'lan_lap.sessions[].sha256') for x in lls}
+        if top is not None and top not in allowed:
+            raise KCError('lan_lap.json: session_sha256 not in sessions (KCF1-7)')
+    elif top:
+        allowed = set(top if isinstance(top, list) else [top])
+    else:
+        raise KCError('lan_lap.json: no session_sha256 / sessions (KCF1-7)')
     if not set(ses) <= allowed:
         raise KCError(f'--session {sorted(set(ses) - allowed)} not a session of lan_lap.json (KCF1-7)')
     s0 = next(iter(ses.values()))
