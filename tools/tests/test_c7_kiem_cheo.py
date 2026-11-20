@@ -1983,26 +1983,77 @@ def _f15_session(tmp_path, scene):
     s = dict(kind='c7_session', model_khoa='B1', chosen='B1', width=W, height=H, zc_tape_m=ZC, car_side_m=0.1445,
              tag_h_m=0.119, kappa=F15_KAP, plumb_xy_m=list(F15_C), camera=cmeas.cam_to_dict(cam),
              fit_ids=sorted(img), marks={str(i): list(m) for i, m in marks.items()},
-             ref_corners_px={str(i): c.tolist() for i, c in img.items()})
+             ref_corners_px={str(i): c.tolist() for i, c in img.items()},
+             zc_fit_m=float(abs(cam.centre[2])), tag_offset=[0.0, 0.0, 0.0],
+             kiem_cheo=dict(nhom=kc.make_groups(sorted(img)), cam_H={'xe': cmeas.cam_to_dict(cam)}, nen={},
+                            cond_max=1e4))
     sp = tmp_path / 'ses.json'
     sp.write_text(json.dumps(s), encoding='utf-8')
     return sp
 
 
+def _tag_px(cam, P):
+    """Pixels of tag corners whose car_pose lift (plumb F15_C, kappa F15_KAP) is exactly P (floor point unlift(P))."""
+    p = (np.asarray(P, float) - F15_KAP * F15_C) / (1 - F15_KAP)
+    return cam.project(np.column_stack([p, np.zeros(len(p))]))
+
+
+def _dets_file(path, scene, frames, video_sha, drop=None, tag=None):
+    """dets.npz of CODE_CAM (c7_measure.save_dets): every mark of the scene at each frame idx (minus drop(idx)), the
+    car tag (id 0) pixels tag(idx) when given."""
+    import c7_measure as cmeas
+    marks, cam, img = scene
+    out = []
+    for k, t in frames:
+        d = {i: c for i, c in img.items() if not (drop and i in drop(k))}
+        if tag is not None and tag(k) is not None:
+            d[0] = tag(k)
+        out.append((k, t, d))
+    cmeas.save_dets(str(path), out, video_sha, (H, W))
+    return path
+
+
 def _field_cases(monkeypatch, scene):
+    """One case 'bo_vung' whose held camera (session and PER FRAME) is the field camera over the scoring one."""
     marks, cam, img = scene
     monkeypatch.setattr(kc, 'held_cases', lambda pc, ids: [('bo_vung', list(ids), _FieldCam(cam))])
+    monkeypatch.setattr(kc.FramePoses, 'held',
+                        lambda self, rm, anchors, d, what='': _FieldCam(self.full(anchors, d, what)))
 
 
-def _e_files(tmp_path, sp, offset=(0.0, 0.0, 0.2), track_over=None, rows_extra=()):
+def _e_corners(k, offset=(0.0, 0.0, 0.2)):
+    h = 0.1445 / 2
+    body = np.array([[h, h], [h, -h], [-h, -h], [-h, h]])
+    a = 0.3 * k + offset[2]
+    R = np.array([[math.cos(a), -math.sin(a)], [math.sin(a), math.cos(a)]])
+    return body @ R.T + np.array([0.05 + 0.01 * k, -0.02])
+
+
+def _e_files(tmp_path, sp, offset=(0.0, 0.0, 0.2), track_over=None, rows_extra=(), scene=None):
+    import c7_measure as cmeas
     td = tmp_path / 'E'
     td.mkdir(exist_ok=True)
-    rows = ['idx,t_s,valid,psi,tag_x,tag_y']
+    ses = json.loads(sp.read_text(encoding='utf-8'))
+    cam = cmeas.cam_from_dict(ses['camera'])
+    sc = scene if scene is not None else (
+        {int(i): tuple(m) for i, m in ses['marks'].items()}, cam,
+        {int(i): np.asarray(c, float) for i, c in ses['ref_corners_px'].items()})
+    drop = lambda k: {1 + k % 3}                                         # noqa: E731 (anchors change per frame)
+    dp = _dets_file(td / 'dets.npz', sc, [(k, k / 60) for k in range(12)], 'a' * 64, drop,
+                    lambda k: _tag_px(cam, _e_corners(k, offset)))
+    dets = {k: d for k, _, d in cmeas.load_dets(str(dp))[0]}
+    ctx = cmeas.ChainCtx(ses)
+    rows = ['idx,t_s,valid,psi,tag_x,tag_y,moc_dung']
     for k in range(12):
-        rows.append(f"{k},{k / 60!r},{0 if k == 5 else 1},{0.3 * k!r},{0.05 + 0.01 * k!r},{-0.02!r}")
+        anc = sorted(i for i in dets[k] if i != 0)
+        c_ = ctx.pose('xe', anc, dets[k])[0]
+        r = cmeas.car_pose(c_, dets[k][0], 0.1445, ses['kappa'], ses['plumb_xy_m'], offset)
+        rows.append(f"{k},{k / 60!r},{0 if k == 5 else 1},{r['psi']!r},{r['tag_x']!r},{r['tag_y']!r},"
+                    f"{';'.join(str(i) for i in anc)}")
     (td / 'frames.csv').write_text('\n'.join(rows) + '\n', encoding='utf-8')
     fsha = kc.sha256_file(str(td / 'frames.csv'))
-    tr = dict(video_sha256='a' * 64, session_sha256=kc.sha256_file(str(sp)), frames_sha256=fsha, tag_offset=list(offset))
+    tr = dict(video_sha256='a' * 64, session_sha256=kc.sha256_file(str(sp)), frames_sha256=fsha, tag_offset=list(offset),
+              dets_sha256=kc.sha256_file(str(dp)), dets_file=str(dp))
     tr.update(track_over or {})
     (td / 'track.json').write_text(json.dumps(tr), encoding='utf-8')
 
@@ -2018,8 +2069,8 @@ def _e_files(tmp_path, sp, offset=(0.0, 0.0, 0.2), track_over=None, rows_extra=(
 
 def test_meo_E_corners_order_and_lift(tmp_path, scene, monkeypatch):
     """F15 (a), KCF1-8, KCF1-9: E_doan = valid frames strictly between E_dau and E_cuoi; each corner (ArUco order of
-    the body square turned by psi + dpsi, tag_offset != 0) carries (1 - kappa) f(p) of an independent oracle; output
-    is chan_doan with every source path + sha."""
+    the body square turned by psi + dpsi, tag_offset != 0, made the real tag pixels of dets.npz) carries (1 - kappa)
+    f(p) of an independent oracle through the per-frame cameras; output is the full schema, dat, every source + sha."""
     sp = _f15_session(tmp_path, scene)
     td, cs = _e_files(tmp_path, sp)
     _field_cases(monkeypatch, scene)
@@ -2027,16 +2078,13 @@ def test_meo_E_corners_order_and_lift(tmp_path, scene, monkeypatch):
     assert kc.main(['meo_E', '--model', 'B1', '--cho', 'goc', '--session', str(sp), '--track', str(td), '--cua-so',
                     str(cs), '--out', str(out)]) == 0
     r = json.loads(out.read_text(encoding='utf-8'))
-    assert [k['frame_id'] for k in r['khung']] == [3, 4, 6, 7] and r['trang_thai'] == 'chan_doan'
-    assert {x['vai_tro'] for x in r['nguon']} == {'track', 'frames', 'cua_so_v1', 'session'}
-    h = 0.1445 / 2
-    body = np.array([[h, h], [h, -h], [-h, -h], [-h, h]])
+    assert [k['frame_id'] for k in r['khung']] == [3, 4, 6, 7] and r['trang_thai'] == 'dat'
+    assert r['schema'] == 'c7_meo_ma_ao_E_v1'
+    assert {x['vai_tro'] for x in r['nguon']} == {'track', 'frames', 'dets', 'cua_so_v1', 'session'}
+    assert r['ban_do']['lech_phat_lai_max_m'] <= kc.TOL_REPLAY_M
     for k in r['khung']:
-        fid = k['frame_id']
-        a = 0.3 * fid + 0.2
-        R = np.array([[math.cos(a), -math.sin(a)], [math.sin(a), math.cos(a)]])
-        P = body @ R.T + np.array([0.05 + 0.01 * fid, -0.02])
-        assert np.allclose(k['goc_m'], P, atol=1e-12)
+        P = _e_corners(k['frame_id'])
+        assert np.allclose(k['goc_m'], P, atol=1e-9)
         p = (P - F15_KAP * F15_C) / (1 - F15_KAP)
         assert np.allclose(k['du_m']['bo_vung'], (1 - F15_KAP) * _FieldCam.f(p), atol=1e-9)
     assert r['h_bar']['da_kiem'] is False
@@ -2087,6 +2135,7 @@ def _bang_files(tmp_path, sp, ten=('A', 'B', 'oc1'), with_session_file=False):
                                     Ph_neo_m=[[0.10 + d, 0.05], [0.25 + d, 0.05], [0.18 + d, 0.12]][:len(ten)])
     f6 = dict(session=dict(file=str(sp), sha256=kc.sha256_file(str(sp))), neo_ten=list(ten),
               cua_so=[dict(meta=dict(cho='goc', loai='dung_12b', luot='t12', clip_sha='d' * 64),
+                           khung_neo=dict(id=[1, 2]), khung_neo_sha256=_h.sha256(b'1,2').hexdigest(),
                            Ph=[[0.3, 0.2], [0.45, 0.2], [0.38, 0.27]][:len(ten)])])
     f6p = tmp_path / 'hieu_chuan_neo.json'
     f6p.write_text(json.dumps(f6), encoding='utf-8')
@@ -2102,6 +2151,15 @@ def _bang_files(tmp_path, sp, ten=('A', 'B', 'oc1'), with_session_file=False):
     return lp, ll
 
 
+def _bang_dets(tmp_path, scene):
+    """--dets of the two clips of _bang_files (run ends 'c' * 64, calibration window 'd' * 64): frames 1-3."""
+    out = []
+    for v in ('c', 'd'):
+        out += ['--dets', str(_dets_file(tmp_path / f'dets_{v}.npz', scene, [(k, k / 60) for k in (1, 2, 3)], v * 64,
+                                         lambda k: {k + 4}))]
+    return out
+
+
 def test_meo_bang_f8_of_f9c4b3d_and_oracle(tmp_path, scene, monkeypatch):
     """F15 (b), KCF1-2, KCF1-3, KCF1-9: F8 without session_file (writer f9c4b3d): the session comes from F6; every
     anchor of every run end and of every calibration window, (1 - kappa_n) f(p) per anchor; A, B, oc1 -> thieu_oc
@@ -2110,12 +2168,14 @@ def test_meo_bang_f8_of_f9c4b3d_and_oracle(tmp_path, scene, monkeypatch):
     lp, ll = _bang_files(tmp_path, sp)
     _field_cases(monkeypatch, scene)
     out = tmp_path / 'b.json'
-    assert kc.main(['meo_bang', '--model', 'B1', '--lan-lap', str(lp), '--out', str(out)]) == 0
+    assert kc.main(['meo_bang', '--model', 'B1', '--lan-lap', str(lp), '--out', str(out)]
+                   + _bang_dets(tmp_path, scene)) == 0
     r = json.loads(out.read_text(encoding='utf-8'))
     kn = 0.12 / ZC
     t = r['theo_cho']['goc']
-    assert r['thieu_oc'] is False and r['trang_thai'] == 'chan_doan' and r['kappa_n'] == pytest.approx(kn)
-    assert r['schema'] == 'c7_meo_dau_chan_bang_v1_chan_doan'          # KCF1-1: readers of the full schema refuse it
+    assert r['thieu_oc'] is False and r['trang_thai'] == 'dat' and r['kappa_n'] == pytest.approx(kn)
+    assert r['schema'] == 'c7_meo_dau_chan_bang_v1' and len(r['dets']) == 2   # full version (CODE 20/11)
+    assert r['ban_do']['n_khung'] == 3 * 5 + 2 and r['ban_do']['trai_trong_muc_max_m'] < 1e-9
     assert r['theo_cho']['goc']['ca'] == r['theo_cho']['K1']['ca']   # KCF1-3: one case list for every place
     assert r['lan_lap']['hieu_chuan_sha256'] == ll['hieu_chuan']['sha256']
     assert [m['dau'] for m in t['muc']] == ['chuan', 'post', 'pre'] and len(t['muc_hieu_chuan']) == 1
@@ -2158,7 +2218,8 @@ def test_meo_bang_refuses(tmp_path, scene, monkeypatch, bad):
         ll['hieu_chuan']['sha256'] = kc.sha256_file(str(f6p))
     lp.write_text(json.dumps(ll), encoding='utf-8')
     _field_cases(monkeypatch, scene)
-    assert kc.main(['meo_bang', '--model', 'B1', '--lan-lap', str(lp), '--out', str(tmp_path / 'b.json')]) == 2
+    assert kc.main(['meo_bang', '--model', 'B1', '--lan-lap', str(lp), '--out', str(tmp_path / 'b.json')]
+                   + _bang_dets(tmp_path, scene)) == 2
     assert not (tmp_path / 'b.json').exists()
 
 
@@ -2167,18 +2228,19 @@ def test_meo_bang_accepts_oc_names_of_the_contract(tmp_path, scene, monkeypatch)
     sp = _f15_session(tmp_path, scene)
     lp, ll = _bang_files(tmp_path, sp, ten=('A', 'B', 'oc_trai'), with_session_file=True)
     _field_cases(monkeypatch, scene)
-    assert kc.main(['meo_bang', '--model', 'B1', '--lan-lap', str(lp), '--out', str(tmp_path / 'b.json')]) == 0
+    assert kc.main(['meo_bang', '--model', 'B1', '--lan-lap', str(lp), '--out', str(tmp_path / 'b.json')]
+                   + _bang_dets(tmp_path, scene)) == 0
 
 
-def test_meo_E_schema_is_diagnostic(tmp_path, scene, monkeypatch):
-    """KCF1-1: the E output carries the diagnostic schema name."""
+def test_meo_E_schema_is_full(tmp_path, scene, monkeypatch):
+    """Full version (CODE 20/11): the E output carries the full schema name."""
     sp = _f15_session(tmp_path, scene)
     td, cs = _e_files(tmp_path, sp)
     _field_cases(monkeypatch, scene)
     out = tmp_path / 'e.json'
     assert kc.main(['meo_E', '--model', 'B1', '--cho', 'goc', '--session', str(sp), '--track', str(td), '--cua-so',
                     str(cs), '--out', str(out)]) == 0
-    assert json.loads(out.read_text(encoding='utf-8'))['schema'] == 'c7_meo_ma_ao_E_v1_chan_doan'
+    assert json.loads(out.read_text(encoding='utf-8'))['schema'] == 'c7_meo_ma_ao_E_v1'
 
 
 def test_meo_E_with_the_plate_file(tmp_path, scene, monkeypatch):
@@ -2200,7 +2262,8 @@ def test_meo_bang_accepts_plain_oc(tmp_path, scene, monkeypatch):
     sp = _f15_session(tmp_path, scene)
     lp, ll = _bang_files(tmp_path, sp, ten=('A', 'B', 'oc'), with_session_file=True)
     _field_cases(monkeypatch, scene)
-    assert kc.main(['meo_bang', '--model', 'B1', '--lan-lap', str(lp), '--out', str(tmp_path / 'b.json')]) == 0
+    assert kc.main(['meo_bang', '--model', 'B1', '--lan-lap', str(lp), '--out', str(tmp_path / 'b.json')]
+                   + _bang_dets(tmp_path, scene)) == 0
 
 
 # ---------------------------------------------------------------- F15 (a): A3 per H32 case (CODE 20/11)
@@ -2349,3 +2412,194 @@ def test_duong_summary_takes_the_largest_corridor_a3():
     assert s['cap_hong']['goc'] is True and s['mot_phuong']['goc'] is False and s['ban_kinh_m'] == kc.MIEN_XP_M
     s2 = kc.duong_summary(regs, cov, {'H_a': dict(A3loc={3: 1.0})})
     assert s2['A3_deg']['goc'] is None and s2['mot_phuong']['goc'] is True
+
+
+# ---------------------------------------------------------------- F15 full: per-frame cameras (CODE 20/11)
+def test_meo_E_per_frame_held_camera_independent(tmp_path, scene):
+    """Tape of an H32 mark 3 mm off (session marks wrong, images true): through the per-frame cameras every case
+    residual equals an independent recomputation (held = c7_measure.refit_pose_checked from a camera fitted without
+    the case, on the frame's moc_dung without the case; full = refit from cam_H[xe] on moc_dung; real tag pixels of
+    the dets.npz), and the case holding the wrong mark is not zero."""
+    import c7_measure as cmeas
+    marks, cam, img = scene
+    sp = _f15_session(tmp_path, scene)
+    ses = json.loads(sp.read_text(encoding='utf-8'))
+    ses['marks']['30'] = [marks[30][0] + 0.003, marks[30][1], SIDE]          # mark 30 = (0.5, 0): near the E footprint
+    sp.write_text(json.dumps(ses), encoding='utf-8')
+    td, cs = _e_files(tmp_path, sp, scene=scene)
+    out = tmp_path / 'e.json'
+    assert kc.main(['meo_E', '--model', 'B1', '--cho', 'goc', '--session', str(sp), '--track', str(td), '--cua-so',
+                    str(cs), '--r-xp', '0.45', '--out', str(out)]) == 0
+    r = json.loads(out.read_text(encoding='utf-8'))
+    assert 30 in r['ban_do']['H32_ids']
+    mk = {int(i): tuple(m) for i, m in ses['marks'].items()}
+    dets = {k: d for k, _, d in cmeas.load_dets(str(td / 'dets.npz'))[0]}
+    rows = {int(x['idx']): x for x in kc._read_csv(str(td / 'frames.csv'))}
+    cam_h = cmeas.cam_from_dict(ses['kiem_cheo']['cam_H']['xe'])
+    kap, C = ses['kappa'], np.asarray(ses['plumb_xy_m'])
+
+    def refit(c0, ids, d):
+        obj = np.vstack([cp.mark_corners_floor(*mk[i]) for i in ids])
+        return cmeas.refit_pose_checked(c0, obj, np.vstack([d[i] for i in ids]), None, 1e4)[0]
+    big = 0.0
+    for k in r['khung']:
+        fid = k['frame_id']
+        d, anc = dets[fid], kc._ids_of(rows[fid]['moc_dung'])
+        full = refit(cam_h, anc, d)
+        Pf = kc.lift(full.pix2floor(d[0], 0.0), kap, C)
+        assert np.allclose(k['goc_m'], Pf, atol=1e-12)
+        for ca in r['ban_do']['ca']:
+            rm = ca['bo_ids']
+            c0 = kc.fit_without(img, mk, [i for i in sorted(img) if i not in rm], 'B1', W, H, ZC)
+            held = refit(c0, [i for i in anc if i not in rm], d)
+            want = kc.lift(held.pix2floor(d[0], 0.0), kap, C) - Pf
+            assert np.allclose(k['du_m'][ca['ten']], want, atol=1e-10)
+            if 30 in rm:
+                big = max(big, float(np.max(np.abs(want))))
+    assert big > 1e-5                                                   # the wrong tape is seen by its cases
+
+
+@pytest.mark.parametrize('bad', ['dets_sha', 'replay', 'no_tag'])
+def test_meo_E_full_refuses(tmp_path, scene, monkeypatch, bad):
+    """dets.npz not the one the track names; frames.csv tag not the replay of the scoring chain; a valid E frame
+    without the car tag in the detections: code 2, nothing written."""
+    import c7_measure as cmeas
+    sp = _f15_session(tmp_path, scene)
+    td, cs = _e_files(tmp_path, sp)
+    _field_cases(monkeypatch, scene)
+    tr = json.loads((td / 'track.json').read_text(encoding='utf-8'))
+    if bad == 'dets_sha':
+        tr['dets_sha256'] = '0' * 64
+    if bad == 'replay':
+        rows = (td / 'frames.csv').read_text(encoding='utf-8').splitlines()
+        f = rows[4].split(',')
+        f[4] = repr(float(f[4]) + 1e-4)
+        rows[4] = ','.join(f)
+        (td / 'frames.csv').write_text('\n'.join(rows) + '\n', encoding='utf-8')
+        tr['frames_sha256'] = kc.sha256_file(str(td / 'frames.csv'))
+        lines = [json.loads(x) for x in cs.read_text(encoding='utf-8').splitlines()]
+        cs.write_text('\n'.join(json.dumps(dict(x, frames_sha256=tr['frames_sha256'])) for x in lines) + '\n',
+                      encoding='utf-8')
+    if bad == 'no_tag':
+        fr = cmeas.load_dets(str(td / 'dets.npz'))[0]
+        fr = [(k, t, {i: c for i, c in d.items() if not (k == 4 and i == 0)}) for k, t, d in fr]
+        cmeas.save_dets(str(td / 'dets.npz'), fr, 'a' * 64, (H, W))
+        tr['dets_sha256'] = kc.sha256_file(str(td / 'dets.npz'))
+    (td / 'track.json').write_text(json.dumps(tr), encoding='utf-8')
+    assert kc.main(['meo_E', '--model', 'B1', '--cho', 'goc', '--session', str(sp), '--track', str(td), '--cua-so',
+                    str(cs), '--out', str(tmp_path / 'e.json')]) == 2 and not (tmp_path / 'e.json').exists()
+
+
+def test_meo_bang_needs_the_dets_of_every_clip(tmp_path, scene, monkeypatch):
+    sp = _f15_session(tmp_path, scene)
+    lp, ll = _bang_files(tmp_path, sp, with_session_file=True)
+    _field_cases(monkeypatch, scene)
+    one = _bang_dets(tmp_path, scene)[:2]                                  # only the run-end clip
+    assert kc.main(['meo_bang', '--model', 'B1', '--lan-lap', str(lp), '--out', str(tmp_path / 'b.json')] + one) == 2
+    assert not (tmp_path / 'b.json').exists()
+
+
+# ---------------------------------------------------------------- F9 (iii): replay of the real anchor sets (CODE 20/11)
+def _f5_iii(tmp_path, scene, drop_b=(), tape_off=None):
+    """A 12b clip of 12 frames (car tag standing at window a = frames 1-3, at window b = frames 8-10), dets.npz with
+    the marks of the scene minus drop_b in window b, frames.csv by the scoring chain, F5 with dets + fingerprint, and a
+    kiem_cheo result with (i) and the 12b corridor. tape_off = (id, dx): the session tape of that mark off by dx."""
+    import c7_measure as cmeas
+    marks, cam, img = scene
+    sp = _f15_session(tmp_path, scene)
+    ses = json.loads(sp.read_text(encoding='utf-8'))
+    if tape_off:
+        i, dx = tape_off
+        ses['marks'][str(i)] = [marks[i][0] + dx, marks[i][1], SIDE]
+    ses['video_sha256'] = 'b' * 64
+    sp.write_text(json.dumps(ses), encoding='utf-8')
+    Pa, Pb = _e_corners(0, (0, 0, 0)) + [-0.15, 0.0], _e_corners(0, (0, 0, 0)) + [0.30, 0.10]
+    win = {k: Pa for k in (1, 2, 3)} | {k: Pb for k in (8, 9, 10)}
+    dp = _dets_file(tmp_path / 'dets.npz', scene, [(k, k / 60) for k in range(12)], 'b' * 64,
+                    lambda k: set(drop_b) if k in (8, 9, 10) else set(), lambda k: _tag_px(cam, win[k]) if k in win else None)
+    fr = cmeas.load_dets(str(dp))[0]
+    dets = {k: d for k, _, d in fr}
+    ctx = cmeas.ChainCtx(ses)
+    rows = ['idx,t_s,valid,psi,tag_x,tag_y,moc_dung']
+    pose = {}
+    for k in range(12):
+        anc = sorted(i for i in dets[k] if i != 0)
+        tx = ty = ps = ''
+        if 0 in dets[k]:
+            r = cmeas.car_pose(ctx.pose('xe', anc, dets[k])[0], dets[k][0], 0.1445, ses['kappa'], ses['plumb_xy_m'])
+            tx, ty, ps = repr(r['tag_x']), repr(r['tag_y']), repr(r['psi'])
+            pose[k] = r
+        rows.append(f"{k},{k / 60!r},1,{ps},{tx},{ty},{';'.join(str(i) for i in anc)}")
+    frp = tmp_path / 'frames.csv'
+    frp.write_text('\n'.join(rows) + '\n', encoding='utf-8')
+    trp = tmp_path / 'track.json'
+    trp.write_text(json.dumps(dict(session_sha256=kc.sha256_file(str(sp)), frames_sha256=kc.sha256_file(str(frp)),
+                                   video_sha256='b' * 64, dets_sha256=kc.sha256_file(str(dp)), tag_offset=[0, 0, 0])),
+                   encoding='utf-8')
+    kcr = dict(version=kc.VERSION, thu=False, model='B1',
+               hang_so_s7=dict(xuat_phat=dict(goc=[0.0, 0.0]), R_XP_M=0.6, L_MAX_M=1.05, plumb=list(F15_C), **_HS_DUONG),
+               P1_tuong_doi=dict(theo_vung=dict(goc=dict(trong_vung_max_m=0.0007))))
+    kcp = tmp_path / 'kc.json'
+    kcp.write_text(json.dumps(kcr), encoding='utf-8')
+
+    def w(ids):
+        m = np.mean([[pose[k]['x'], pose[k]['y']] for k in ids], axis=0)
+        return dict(loai='dung_12b', chi_so=0, khung_id=list(ids), khung_pts_s=[k / 60 for k in ids],
+                    khung_sha256='a' * 64, p_m=m.tolist(), psi_rad=float(np.mean([pose[k]['psi'] for k in ids])))
+    doan = dict(schema='c8_hc_doan_12b_v1', cho='goc', trang_thai='khoa', session_sha256=kc.sha256_file(str(sp)),
+                track_sha256=kc.sha256_file(str(trp)), frames_sha256=kc.sha256_file(str(frp)),
+                dets_sha256=kc.sha256_file(str(dp)), dets_fp=cmeas.frames_fingerprint(fr),
+                car_pose_cfg=dict(side_m=0.1445, h_m=0.119, tag_offset=None, q_m=None, du_m=None),
+                nguon=[dict(vai_tro='session', duong_dan=str(sp), sha256=kc.sha256_file(str(sp))),
+                       dict(vai_tro='track', duong_dan=str(trp), sha256=kc.sha256_file(str(trp))),
+                       dict(vai_tro='frames', duong_dan=str(frp), sha256=kc.sha256_file(str(frp))),
+                       dict(vai_tro='dets', duong_dan=str(dp), sha256=kc.sha256_file(str(dp)))],
+                doan=[dict(i=0, trang_thai='hop_le', cua_so_a=w((1, 2, 3)), cua_so_b=w((8, 9, 10)))])
+    doan['sha256'] = kc.doan_body_sha(doan)
+    dop = tmp_path / 'doan_12b_v1.json'
+    dop.write_text(json.dumps(doan), encoding='utf-8')
+    return kcp, dop, ses, dets, frp
+
+
+def test_e_hieu_iii_zero_without_anchor_change_and_dat(tmp_path, scene):
+    """Same anchors in both windows: (iii) = 0 exactly; (i), (ii), (iii) all there and F5 not chan_doan: the leg and
+    the file are dat with e_hieu_m (the key c8_hc_a.read_e_hieu reads)."""
+    kcp, dop, *_ = _f5_iii(tmp_path, scene)
+    out = tmp_path / 'e.json'
+    assert kc.main(['e_hieu', '--kiem-cheo', str(kcp), '--doan', str(dop), '--out', str(out)]) == 0
+    e = json.loads(out.read_text(encoding='utf-8'))
+    leg = e['doan'][0]
+    assert leg['phan_iii_m'] == 0.0 and leg['phan_iii']['doi_tap'] is False and leg['trang_thai'] == 'dat'
+    assert e['trang_thai'] == 'dat' and leg['e_hieu_m'] == pytest.approx(max(0.0007, leg['phan_ii_m']))
+    assert 'e_hieu_m_chan_doan' not in leg
+
+
+def test_e_hieu_iii_sees_an_anchor_change_independent(tmp_path, scene):
+    """Mark 25 (0.5, 0) taped 3 mm off and lost in window b: (iii) = |mean_b - mean_a| of (pose on own anchors - pose
+    on the anchors common to both windows), recomputed independently with c7_measure, and > 0."""
+    import c7_measure as cmeas
+    kcp, dop, ses, dets, frp = _f5_iii(tmp_path, scene, drop_b=(25,), tape_off=(25, 0.003))
+    out = tmp_path / 'e.json'
+    assert kc.main(['e_hieu', '--kiem-cheo', str(kcp), '--doan', str(dop), '--out', str(out)]) == 0
+    leg = json.loads(out.read_text(encoding='utf-8'))['doan'][0]
+    ctx = cmeas.ChainCtx(ses)
+    rows = {int(x['idx']): x for x in kc._read_csv(str(frp))}
+    S = {k: kc._ids_of(rows[k]['moc_dung']) for k in (1, 2, 3, 8, 9, 10)}
+    ref = sorted(set.intersection(*map(set, S.values())))
+    assert 25 not in ref and 25 in S[1]
+
+    def e(k):
+        a = cmeas.car_pose(ctx.pose('xe', S[k], dets[k])[0], dets[k][0], 0.1445, ses['kappa'], ses['plumb_xy_m'])
+        b = cmeas.car_pose(ctx.pose('xe', ref, dets[k])[0], dets[k][0], 0.1445, ses['kappa'], ses['plumb_xy_m'])
+        return np.array([a['x'] - b['x'], a['y'] - b['y']])
+    want = np.linalg.norm(np.mean([e(k) for k in (8, 9, 10)], axis=0) - np.mean([e(k) for k in (1, 2, 3)], axis=0))
+    assert leg['phan_iii_m'] == pytest.approx(want, abs=1e-12) and want > 1e-5 and leg['phan_iii']['doi_tap'] is True
+
+
+def test_e_hieu_iii_refuses_other_dets(tmp_path, scene):
+    kcp, dop, *_ = _f5_iii(tmp_path, scene)
+    d = json.loads(dop.read_text(encoding='utf-8'))
+    d['dets_fp'] = '0' * 64
+    d['sha256'] = kc.doan_body_sha(d)
+    dop.write_text(json.dumps(d), encoding='utf-8')
+    assert kc.main(['e_hieu', '--kiem-cheo', str(kcp), '--doan', str(dop), '--out', str(tmp_path / 'e.json')]) == 2

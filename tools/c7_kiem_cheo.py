@@ -1623,15 +1623,74 @@ def tung_khung(a):
 # ---------------------------------------------------------------- F15 (a) meo_ma_ao_E, (b) meo_dau_chan_bang
 # Contract F15 (CODE 19/11, C8B confirmed the names; KIEMCHEO sets the fields): map residual field held - full of the
 # H32 floor marks, carried to points in the car_pose lifted convention (p = pix2floor(uv, 0), P = p + kappa (C - p)).
-# KCF1-1 (Codex F15 round 1): the measured points came through the camera REFITTED per frame; without the per-frame
-# detections on this branch (dets.npz of CODE_CAM, after the CAM merge) the pixels are rebuilt through the session
-# camera: both outputs are trang_thai 'chan_doan' (diagnostic), never a usable bound, until that version.
-MEO_E_SCHEMA = 'c7_meo_ma_ao_E_v1_chan_doan'          # KCF1-1 (round 2): the full schema c7_meo_ma_ao_E_v1 and
-MEO_BANG_SCHEMA = 'c7_meo_dau_chan_bang_v1_chan_doan'  # c7_meo_dau_chan_bang_v1 only with per-frame cameras: readers
-                                                       # of the full schema refuse these diagnostic files by name
-MEO_TRANG_THAI = 'chan_doan'
-MEO_LY_DO = ('pixel dung lai qua camera session, khong phai camera khop lai tu the tung khung (KCF1-1); ban day du can '
-             'dets.npz cua CAM (sau gop CAM)')
+# KCF1-1 (Codex F15 round 1): the measured points come through the camera REFITTED per frame. Full version (CODE
+# 20/11 after the CAM merge 3625211, Liam at CODE "Giao ngay"): per-frame cameras from the dets.npz of CODE_CAM
+# (c7_measure.load_dets), the scoring camera as the scoring makes it, the held camera of an H32 case refitted on the
+# same frame from the clip-H camera without the case, on the same anchors without the case. The diagnostic versions
+# (pixels through the session camera, schema ..._chan_doan) are gone.
+MEO_E_SCHEMA = 'c7_meo_ma_ao_E_v1'
+MEO_BANG_SCHEMA = 'c7_meo_dau_chan_bang_v1'
+MEO_TRANG_THAI = 'dat'
+TOL_REPLAY_M = 1e-6                 # replay of the scoring pose vs frames.csv tag_x / tag_y (10 decimals written)
+
+
+def _ids_of(cell):
+    """IDs of a c7_measure _ids_cell ('1;2;3'; '' = none)."""
+    s = '' if cell is None else str(cell).strip()
+    return [] if not s else sorted(int(v) for v in s.split(';'))
+
+
+def load_dets_checked(path, want_sha=None, want_fp=None, video_sha=None, what='dets.npz'):
+    """{idx: (t_s, {id: (4, 2) px})} of a CODE_CAM dets.npz (c7_measure.load_dets) with its file sha256, checked
+    against the sha / frames_fingerprint / video sha the sources name (any mismatch: KCError, code 2)."""
+    if not path:
+        raise KCError(f'{what}: no file (per-frame cameras need the detections of CODE_CAM)')
+    sha = sha256_file(path)
+    if want_sha is not None and sha != want_sha:
+        raise KCError(f'{what} {path}: sha256 {sha} is not the one its source names {want_sha}')
+    frames, vsha, _ = cm.load_dets(path)
+    if want_fp is not None and cm.frames_fingerprint(frames) != want_fp:
+        raise KCError(f'{what} {path}: frames_fingerprint is not the dets_fp its source names')
+    if video_sha is not None and vsha != video_sha:
+        raise KCError(f'{what} {path}: detections of another clip (video_sha256 {vsha})')
+    by = {}
+    for idx, t, d in frames:
+        if idx in by:
+            raise KCError(f'{what} {path}: frame {idx} twice')
+        by[idx] = (t, d)
+    return by, sha, vsha
+
+
+class FramePoses:
+    """Per-frame cameras of one session (c7_measure 33-mark chain, design v3 2): the scoring camera = pose refitted
+    from the clip-H camera cam_H[xe] on the anchors (ChainCtx.pose, trust flags); the held camera of an H32 case rm =
+    pose refitted on the same frame from the clip-H camera fitted WITHOUT rm (PairCams of the session, the same
+    fit_two_pass) on the same anchors without rm (same trust flags). A refit that is not trusted: KCError (KCF1-5)."""
+
+    def __init__(self, session, pc):
+        self.ctx = cm.ChainCtx(session)
+        self.pc = pc
+        self.marks = self.ctx.marks
+
+    def full(self, anchors, d, what=''):
+        anchors = sorted(anchors)
+        if not set(anchors) <= set(d):
+            raise KCError(f'{what}: anchors {sorted(set(anchors) - set(d))} not detected in the frame')
+        cam, rms, ok, ly, cond = self.ctx.pose(cm.CHAIN_XE, anchors, d)
+        if not ok:
+            raise KCError(f'{what}: scoring pose refit not trusted ({ly}, cond {cond:.3g})')
+        return cam
+
+    def held(self, rm, anchors, d, what=''):
+        use = [i for i in sorted(anchors) if i not in set(rm)]
+        if len(use) < MIN_TRAIN:
+            raise KCError(f'{what}: case {_ca_ten(rm)} leaves {len(use)} anchors (< {MIN_TRAIN}) (KCF1-5)')
+        obj = np.vstack([cp.mark_corners_floor(*self.marks[i]) for i in use])
+        cam, rms, ok, ly, cond = cm.refit_pose_checked(self.pc(rm), obj, np.vstack([d[i] for i in use]), None,
+                                                       self.ctx.cond_max)
+        if not ok:
+            raise KCError(f'{what}: held pose refit of case {_ca_ten(rm)} not trusted ({ly}, cond {cond:.3g}) (KCF1-5)')
+        return cam
 
 
 def lift(p, kappa, C):
@@ -1781,8 +1840,9 @@ def _check_h_bar(path, h_used, C=None, Zc=None):
 def meo_E(a):
     """F15 (a): for the E frames of one place (one E_dau and one E_cuoi window of the clip in cua_so_v1; the moving
     frames strictly between them = E_doan, valid with a tag pose), the 4 virtual tag corners (ArUco order,
-    c7_measure.car_corners_body) at the measured tag pose, map residual held - full per H32 case. Diagnostic
-    (KCF1-1). Each case also carries its A3 (a3_held_case, CODE 20/11) on the session of the E clip."""
+    c7_measure.car_corners_body) of every E_doan frame, map residual held - full per H32 case through the PER-FRAME
+    cameras of the dets.npz (FramePoses, full version CODE 20/11). Each case also carries its A3 (a3_held_case) on the
+    session of the E clip."""
     if a.cho not in ('goc', 'K1'):
         raise KCError(f'--cho {a.cho!r}: goc|K1 (E places, KCF1-8)')
     l_max = L_MAX_M if getattr(a, 'L_max', None) is None else a.L_max
@@ -1836,9 +1896,10 @@ def meo_E(a):
     try:
         fr = [r for r in csv.DictReader(io.StringIO(fb.decode('utf-8'))) if _true(r.get('valid'))
               and lo < int(r['idx']) < hi and r.get('tag_x') not in ('', None)]
-        poses = [(int(r['idx']), float(r['t_s']), float(r['tag_x']), float(r['tag_y']), float(r['psi'])) for r in fr]
+        poses = [(int(r['idx']), float(r['t_s']), float(r['tag_x']), float(r['tag_y']), _ids_of(r['moc_dung']))
+                 for r in fr]
     except (KeyError, ValueError, TypeError) as e:
-        raise KCError(f'frames.csv: {e} (KCF1-8)')
+        raise KCError(f'frames.csv: {e} (KCF1-8; the 33-mark track writes moc_dung)')
     if not poses:
         raise KCError('no valid moving E frame between E_dau and E_cuoi (E_doan)')
     to = tr.get('tag_offset')
@@ -1847,38 +1908,67 @@ def meo_E(a):
             isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in to):
         raise KCError(f'track.tag_offset {to!r}: null or [dx_m, dy_m, dpsi_rad] (KCF1-8)')
     side = float(s['car_side_m'])
-    body = cm.car_corners_body(side)
-    P_all = [body @ _rot(psi + float(to[2])).T + np.array([x, y]) for _, _, x, y, psi in poses]
-    foot = np.vstack([unlift(P, kappa, C) for P in P_all])                 # KCF1-4: floor footprint, not lifted
+    # full version (CODE 20/11): the detections of the E clip (dets.npz named by the track, sha checked)
+    dp_ = a.dets or tr.get('dets_file')
+    dets, dets_sha, _ = load_dets_checked(dp_, _hex(tr.get('dets_sha256'), 'track.dets_sha256'), None, clip,
+                                          'E dets.npz')
+    fp_ = FramePoses(s, pc)
     rx = R_XP_M if a.r_xp is None else a.r_xp
+    per, dev = [], 0.0
+    for fid, t, x, y, anc in poses:
+        if fid not in dets or cm.CAR_ID not in dets[fid][1]:
+            raise KCError(f'E frame {fid}: valid with a tag in frames.csv but not in dets.npz with the car tag')
+        d = dets[fid][1]
+        cam = fp_.full(anc, d, f'E frame {fid}')
+        r = cm.car_pose(cam, d[cm.CAR_ID], side, kappa, C, to)
+        dev = max(dev, abs(r['tag_x'] - x), abs(r['tag_y'] - y))
+        if not dev <= TOL_REPLAY_M:
+            raise KCError(f'E frame {fid}: the replayed scoring pose differs from frames.csv by {dev:.3g} m '
+                          f'(> {TOL_REPLAY_M}: another session, detections or anchors)')
+        uv = np.asarray(d[cm.CAR_ID], float)
+        per.append((fid, t, anc, d, uv, lift(cam.pix2floor(uv, 0.0), kappa, C)))
+    foot = np.vstack([unlift(P, kappa, C) for *_r, P in per])             # KCF1-4: floor footprint, not lifted
     hid = h32_ids(mk, foot, rx)
     cases = held_cases(pc, hid)
     a3_ca = {n: a3_held_case(n, pc.img, mk, full, cam, ids_, (side, float(s['tag_h_m'])), l_max)
              for n, ids_, cam in cases}
-    khung = [dict(frame_id=fid, t_s=t, goc_m=[[float(v) for v in x] for x in P],
-                  du_m={n: [[float(v) for v in x] for x in map_residual(full, cam, P, kappa, C)] for n, _, cam in cases})
-             for (fid, t, *_r), P in zip(poses, P_all)]
+    khung = []
+    for fid, t, anc, d, uv, P in per:
+        du = {}
+        for n, ids_, _ in cases:
+            ch = fp_.held(ids_, anc, d, f'E frame {fid}')
+            res = lift(ch.pix2floor(uv, 0.0), kappa, C) - P
+            if not np.all(np.isfinite(res)):
+                raise KCError(f'E frame {fid}, case {n}: non-finite residual (KCF1-5)')
+            du[n] = [[float(v) for v in xx] for xx in res]
+        khung.append(dict(frame_id=fid, t_s=t, goc_m=[[float(v) for v in xx] for xx in P], du_m=du))
     out = _with_sha(dict(
-        schema=MEO_E_SCHEMA, cho=a.cho, trang_thai=MEO_TRANG_THAI, ly_do=[MEO_LY_DO], chieu='held_minus_full',
+        schema=MEO_E_SCHEMA, cho=a.cho, trang_thai=MEO_TRANG_THAI, ly_do=[], chieu='held_minus_full',
         bo_H32=True, truoc_le=True,
-        thu_tu_goc='ArUco 0..3 (c7_measure.car_corners_body: truoc-trai, truoc-phai, sau-phai, sau-trai)',
+        thu_tu_goc='ArUco 0..3 (goc anh that cua ma noc trong dets.npz, thu tu ArUco)',
         clip_sha256=clip, nguon=[dict(vai_tro='track', duong_dan=os.path.abspath(tp), sha256=tr_sha),
                                  dict(vai_tro='frames', duong_dan=os.path.abspath(fp), sha256=fr_sha),
+                                 dict(vai_tro='dets', duong_dan=os.path.abspath(dp_), sha256=dets_sha),
                                  dict(vai_tro='cua_so_v1', duong_dan=os.path.abspath(a.cua_so), sha256=cs_sha),
                                  dict(vai_tro='session', duong_dan=os.path.abspath(a.session), sha256=ses_sha)],
         mien_E=dict(sau_E_dau=lo, truoc_E_cuoi=hi, khung_dong=len(khung)),
-        ban_do=dict(phien_ban=VERSION, session_sha256=ses_sha, full='session.camera', H32_ids=hid, R_XP_M=rx,
+        ban_do=dict(phien_ban=VERSION, session_sha256=ses_sha, full='tung_khung: ChainCtx.pose(xe, moc_dung)',
+                    held='tung_khung: refit_pose_checked tu camera clip H khop khong co ca, tren moc_dung tru ca',
+                    H32_ids=hid, R_XP_M=rx, lech_phat_lai_max_m=dev,
                     ca=[dict(ten=n, bo_ids=ids_, A3=a3_ca[n]) for n, ids_, _ in cases]),
         h_m=float(s['tag_h_m']), h_bar=_check_h_bar(a.a6, float(s['tag_h_m']), C, float(s['tag_h_m']) / kappa), kappa=kappa,
         plumb_xy_m=[float(x) for x in C], Zc_m=float(s['tag_h_m']) / kappa, tag_offset=[float(v) for v in to],
         khung=khung, commit_hil=commit_hil(),
         gioi_han=['chi so thuc nghiem truoc le; truong du ban do giua camera bo moc H32 va camera cham, trong ho mo hinh',
+                  'camera tung khung: camera cham phat lai dung chuoi xe cua track (moc_dung, cam_H[xe]), lech so voi '
+                  'frames.csv <= TOL_REPLAY_M; camera bo ca khop lai tren cung khung, cung neo tru ca; goc_m = 4 goc '
+                  'anh that cua ma noc qua camera cham, nang car_pose',
                   'ban_do.ca[*].A3 (CODE 20/11): moi cap moc trong tap bo cua ca, L <= L_max, do tren anh session qua '
                   'camera cua ca (khop khong co ca tap bo), gap qua a3_tag_gap voi camera cham session.camera; '
-                  'quy_deg = |dtheta| + gap_deg nhu a3_clip; quy_max_deg = max cac cap (null khi khong co cap)',
-                  MEO_LY_DO]))
+                  'quy_deg = |dtheta| + gap_deg nhu a3_clip; quy_max_deg = max cac cap (null khi khong co cap)']))
     write_new(a.out, out)
-    _say(f'meo_ma_ao_E {a.cho}: {len(khung)} khung, {len(cases)} ca H32 (chan_doan), A3 quy_max_deg theo ca: '
+    _say(f'meo_ma_ao_E {a.cho}: {len(khung)} khung, {len(cases)} ca H32 (camera tung khung), lech phat lai '
+         f'{dev:.2e} m, A3 quy_max_deg theo ca: '
          + ', '.join(f'{n}={v["quy_max_deg"]:.4f}' if v['quy_max_deg'] is not None else f'{n}=khong_cap'
                      for n, v in a3_ca.items()))
 
@@ -1905,7 +1995,11 @@ def _ll_session(ll, a):
 def meo_bang(a):
     """F15 (b): every anchor (neo_ten: A, B, oc*) of every run end of lan_lap.json and of every window of the anchor
     calibration file (hieu_chuan_neo.json cua_so[*].Ph, KCF1-3), lifted with kappa_n = h_n / Z_c as c7_nhac_tam, per
-    place, map residual held - full per H32 case. Diagnostic (KCF1-1)."""
+    place, map residual held - full per H32 case through the PER-FRAME cameras of the anchor frames (khung_neo) of
+    the clip (dets.npz of CODE_CAM, --dets; full version CODE 20/11): on every anchor frame the scoring camera is the
+    pose refitted on the session marks seen (as c7_nhac_tam do_khung), the anchor pixel is the lifted point brought
+    back through it, the held camera of a case is refitted on the same frame without the case; the residual of an item
+    is the mean over its anchor frames (Ph is the mean over the same frames)."""
     ll, ll_sha = load_json_sha(a.lan_lap)
     if ll.get('schema') != 'lan_lap_v1':
         raise KCError(f'lan_lap.json: schema {ll.get("schema")!r} is not lan_lap_v1 (KCF1-7)')
@@ -1935,7 +2029,7 @@ def meo_bang(a):
                 raise KCError(f'lan_lap.json {r.get("luot_id")} {dau}: khung_neo_sha256 is not its frame set (KCF1-7)')
             items.append(dict(nguon='lan_lap', luot_id=r.get('luot_id'), dau=dau, cho=x.get('cho') or r.get('cho'),
                               clip_sha256=x.get('clip_sha256'), khung_neo_sha256=x.get('khung_neo_sha256'),
-                              P=x['Ph_neo_m']))
+                              P=x['Ph_neo_m'], _khung=list(kn['id'])))
     hc = ll.get('hieu_chuan') or {}
     hc_rec = None
     if hc.get('file'):                                 # KCF1-3: every window of the anchor-shape calibration too
@@ -1949,8 +2043,13 @@ def meo_bang(a):
             if not isinstance(w, dict) or w.get('Ph') is None:
                 continue
             m = w.get('meta') or {}
+            kn = w.get('khung_neo') or {}
+            if not isinstance(kn, dict) or not isinstance(kn.get('id'), list) or not kn['id'] or not all(
+                    isinstance(v, int) and not isinstance(v, bool) for v in kn['id']):
+                raise KCError(f'hieu_chuan_neo.json cua_so[{k}]: khung_neo.id missing (per-frame cameras need it)')
             items.append(dict(nguon='hieu_chuan_neo', chi_so=k, loai=m.get('loai'), luot_id=m.get('luot'),
-                              cho=m.get('cho'), clip_sha256=m.get('clip_sha'), P=w['Ph']))
+                              cho=m.get('cho'), clip_sha256=_hex(m.get('clip_sha'), f'cua_so[{k}].meta.clip_sha'),
+                              khung_neo_sha256=w.get('khung_neo_sha256'), P=w['Ph'], _khung=list(kn['id'])))
     if not items:
         raise KCError('lan_lap.json: no anchor point (Ph_neo_m / cua_so Ph)')
     by_cho = {}
@@ -1972,34 +2071,76 @@ def meo_bang(a):
             if n not in seen:
                 seen.add(n)
                 cases.append((n, ids_, cam))
-    theo = {}
+    # full version: the detections of every clip of the items (--dets, matched by the video sha inside the file)
+    dets_by, dets_rec = {}, []
+    for pth in a.dets or []:
+        by, sha_d, vsha = load_dets_checked(pth, what='--dets')
+        if vsha in dets_by:
+            raise KCError(f'--dets: two files of clip {vsha}')
+        dets_by[vsha] = by
+        dets_rec.append(dict(duong_dan=os.path.abspath(pth), sha256=sha_d, clip_sha256=vsha))
+    fp_ = FramePoses(s, pc)
+    fit_ids = set(int(i) for i in s['fit_ids'])
+    theo, n_khung, trai = {}, 0, 0.0
     for cho, its in sorted(by_cho.items()):
         hid = hids[cho]
         muc, muc_hc = [], []                            # run ends (keyed luot_id, dau) apart from calibration windows
         for it in its:
-            res = {n: map_residual(full, cam, it['P'], kappa_n, C) for n, _, cam in cases}
-            rec = {k: v for k, v in it.items() if k not in ('P', 'cho', 'nguon')}
+            where = f"{it['nguon']} {it.get('luot_id')} {it.get('dau', it.get('chi_so'))}"
+            by = dets_by.get(it['clip_sha256'])
+            if by is None:
+                raise KCError(f'{where}: no --dets of clip {it["clip_sha256"]} (per-frame cameras)')
+            Pf = np.column_stack([unlift(it['P'], kappa_n, C), np.zeros(len(it['P']))])
+            acc = {n: [] for n, _, _ in cases}
+            for fid in it['_khung']:
+                if fid not in by:
+                    raise KCError(f'{where}: anchor frame {fid} not in the dets.npz of the clip')
+                d = by[fid][1]
+                anc = sorted(i for i in d if i in fit_ids)
+                cam = fp_.full(anc, d, f'{where} frame {fid}')
+                uv = cam.project(Pf)
+                P0 = lift(cam.pix2floor(uv, 0.0), kappa_n, C)
+                for n, ids_, _ in cases:
+                    ch = fp_.held(ids_, anc, d, f'{where} frame {fid}')
+                    r_ = lift(ch.pix2floor(uv, 0.0), kappa_n, C) - P0
+                    if not np.all(np.isfinite(r_)):
+                        raise KCError(f'{where} frame {fid}, case {n}: non-finite residual (KCF1-5)')
+                    acc[n].append(r_)
+                n_khung += 1
+            res = {}
+            for n, v in acc.items():
+                v = np.array(v)
+                res[n] = v.mean(axis=0)
+                trai = max(trai, float(np.max(np.linalg.norm(v - res[n][None], axis=2))))
+            rec = {k: v for k, v in it.items() if k not in ('P', 'cho', 'nguon', '_khung')}
+            rec['n_khung_neo'] = len(it['_khung'])
             rec['neo'] = {t: {n: [float(v) for v in res[n][k]] for n in res} for k, t in enumerate(ten)}
             (muc if it['nguon'] == 'lan_lap' else muc_hc).append(rec)
         theo[cho] = dict(H32_ids=hid, ca=[dict(ten=n, bo_ids=ids_) for n, ids_, _ in cases], muc=muc,
                          muc_hieu_chuan=muc_hc)
     # every place carries the same case list (names = left-out id sets); H32_ids is the place's own set
     out = _with_sha(dict(
-        schema=MEO_BANG_SCHEMA, trang_thai=MEO_TRANG_THAI, ly_do=[MEO_LY_DO], chieu='held_minus_full', bo_H32=True,
+        schema=MEO_BANG_SCHEMA, trang_thai=MEO_TRANG_THAI, ly_do=[], chieu='held_minus_full', bo_H32=True,
         truoc_le=True, neo_ten=ten, h_neo_m=ll.get('h_neo_m'), h_n_m=h_n, kappa_n=kappa_n, Zc_m=Zc,
         plumb_xy_m=[float(c) for c in C], thieu_oc=thieu_oc,
         quy_uoc='diem neo da nang car_pose (p = pix2floor(uv, 0), P = p + kappa_n (C - p)), m',
         lan_lap=dict(file=os.path.abspath(a.lan_lap), sha256=ll_sha, hieu_chuan_sha256=hc.get('sha256')),
         hieu_chuan_neo=hc_rec,
-        ban_do=dict(phien_ban=VERSION, session_file=os.path.abspath(sp), session_sha256=ses_sha, full='session.camera',
-                    R_XP_M=rx),
+        ban_do=dict(phien_ban=VERSION, session_file=os.path.abspath(sp), session_sha256=ses_sha,
+                    full='tung_khung: pose khop lai tren moc session thay duoc (nhu c7_nhac_tam do_khung)',
+                    held='tung_khung: refit_pose_checked tu camera clip H khop khong co ca, cung moc tru ca',
+                    R_XP_M=rx, n_khung=n_khung, trai_trong_muc_max_m=trai),
+        dets=dets_rec,
         theo_cho=theo, commit_hil=commit_hil(),
-        gioi_han=['chi so thuc nghiem truoc le; trong ho mo hinh camera', MEO_LY_DO,
+        gioi_han=['chi so thuc nghiem truoc le; trong ho mo hinh camera',
+                  'pixel neo tung khung = diem neo da nang (trung binh tren khung neo) dua nguoc qua camera cham cua '
+                  'khung; du cua muc = trung binh tren khung neo (trai_trong_muc_max_m: lech lon nhat quanh trung binh)',
+                  'camera cham tung khung khop tu cam_H[xe] co co tin cay, khong noi tiep khung truoc nhu do_khung',
                   'moi neo nang bang kappa_n = h_n / Z_c nhu c7_nhac_tam; do cao rieng tung neo (h_neo_m) chi ghi lai',
                   'NHACTAM chay lai khop hinh neo (cua_so hieu_chuan_neo) va giai beta bang cac du nay (V4-06)']))
     write_new(a.out, out)
     _say(f"meo_dau_chan_bang: {sum(len(v['muc']) for v in theo.values())} muc, cho {sorted(theo)}, thieu_oc {thieu_oc}"
-         ' (chan_doan)')
+         f', {n_khung} khung neo (camera tung khung)')
 
 
 # ---------------------------------------------------------------- CLI
@@ -2579,6 +2720,48 @@ def doan_body_sha(d):
     return hashlib.sha256(json.dumps(body, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
 
+def iii_leg(fp_, rows, dets, ids_a, ids_b, side, kappa, plumb, to):
+    """F9 (iii) (S7-17, KS7B-3 5; CODE 20/11): replay of the anchor sets REALLY used by the two windows of one 12b leg,
+    on the real frames of the leg (dets.npz) through the scoring chain: per frame f, the tag pose through the scoring
+    camera on its own anchors S_f (moc_dung) minus through the camera refitted on the anchors common to EVERY frame of
+    both windows (the reference run, defined here: same start cam_H[xe], same trust flags); (iii) = |mean over b - mean
+    over a| of that difference (position, heading). 0 when no anchor changes. Returns (m, psi_rad, reason, info)."""
+    fr = list(ids_a) + list(ids_b)
+    if not ids_a or not ids_b:
+        return None, None, 'cua so khong co khung', None
+    S = {}
+    for f in fr:
+        if f not in rows or f not in dets or cm.CAR_ID not in dets[f][1]:
+            return None, None, f'khung {f} khong co trong frames.csv / dets.npz (hay khong thay ma noc)', None
+        S[f] = _ids_of(rows[f].get('moc_dung'))
+    ref = sorted(set.intersection(*[set(v) for v in S.values()]))
+    if len(ref) < MIN_TRAIN:
+        return None, None, f'tap neo chung {len(ref)} moc (< {MIN_TRAIN})', None
+    e, dev = {}, 0.0
+    try:
+        for f in fr:
+            d = dets[f][1]
+            pS = cm.car_pose(fp_.full(S[f], d, f'khung {f}'), d[cm.CAR_ID], side, kappa, plumb, to)
+            pR = cm.car_pose(fp_.full(ref, d, f'khung {f} (tap chung)'), d[cm.CAR_ID], side, kappa, plumb, to)
+            tx, ty = rows[f].get('tag_x'), rows[f].get('tag_y')
+            if tx not in ('', None) and ty not in ('', None):
+                dev = max(dev, abs(pS['tag_x'] - float(tx)), abs(pS['tag_y'] - float(ty)))
+            e[f] = np.array([pS['x'] - pR['x'], pS['y'] - pR['y'], float(cm.cp_wrap(pS['psi'] - pR['psi']))])
+    except KCError as ex:
+        return None, None, str(ex)[:200], None
+    if not dev <= TOL_REPLAY_M:
+        raise KCError(f'(iii): the replayed scoring pose differs from frames.csv by {dev:.3g} m (another session, '
+                      'detections or anchors)')
+    ea = np.mean([e[f] for f in ids_a], axis=0)
+    eb = np.mean([e[f] for f in ids_b], axis=0)
+    dd = eb - ea
+    if not np.all(np.isfinite(dd)):
+        return None, None, 'khong huu han', None
+    info = dict(tap_chung=ref, n_khung_a=len(ids_a), n_khung_b=len(ids_b), lech_phat_lai_max_m=dev,
+                doi_tap=any(list(v) != ref for v in S.values()))
+    return float(math.hypot(dd[0], dd[1])), abs(float(cm.cp_wrap(dd[2]))), '', info
+
+
 def e_hieu(a):
     kc = _load_json(a.kiem_cheo)
     if kc.get('version') != VERSION or kc.get('thu'):
@@ -2605,6 +2788,7 @@ def e_hieu(a):
     # segment, so its marks are those of A3_tuong_doi.duong_12b (CODE 20/11, HCV3-2), not of the start disc
     ses = next((x for x in d.get('nguon') or [] if x.get('vai_tro') == 'session'), None)
     cams, why_ii, reg = [], [], None
+    why_iii, dets_iii, rows_iii, fp_iii, set_iii = [], None, None, None, None
     duong = hs.get('DUONG_12B')
     if ses is None or not ses.get('duong_dan'):
         why_ii.append('F5 khong co nguon session')
@@ -2646,11 +2830,28 @@ def e_hieu(a):
         kappa = float(h_m) / zc
         if not cams:
             why_ii.append('vung khong co cap trong L_max')
+        # (iii): the detections of the 12b clip (F5 nguon dets, dets_sha256, dets_fp) and the frames.csv rows
+        if 'dets' not in src or not src['dets'].get('duong_dan'):
+            why_iii.append('F5 khong co nguon dets (dets.npz cua CAM)')
+        elif d.get('dets_sha256') is None or d.get('dets_fp') is None:
+            why_iii.append('F5 khong co dets_sha256 / dets_fp')
+        else:
+            if src['dets'].get('sha256') not in (None, d['dets_sha256']):
+                raise KCError('F5: nguon dets sha256 is not dets_sha256')
+            dets_iii, _, _ = load_dets_checked(src['dets']['duong_dan'], d['dets_sha256'], d['dets_fp'],
+                                               tr.get('video_sha256'), 'dets_F5')
+            rows_iii = {}
+            for r_ in _read_csv(src['frames']['duong_dan']):
+                rows_iii[int(r_['idx'])] = r_
+            fp_iii = FramePoses(s, pc)
+            # the scoring chain of the track: session kappa / plumb, the track's tag offset (replay checked)
+            set_iii = (float(s['kappa']), np.asarray(s['plumb_xy_m'], float),
+                       tuple(tr.get('tag_offset') or s.get('tag_offset') or (0.0, 0.0, 0.0)))
     if not d.get('doan'):
         raise KCError('F5 without legs: nothing to write (KCJ1-7)')
     legs = []
     for g in d.get('doan') or []:
-        why = ['thieu (iii) replay neo (sau gop CAM)']
+        why = []
         if g.get('trang_thai') != 'hop_le':
             why.append(f"doan F5 {g.get('trang_thai')}")
         if d.get('trang_thai') == 'chan_doan':
@@ -2667,17 +2868,32 @@ def e_hieu(a):
                 for _, dx, dy, dpsi in chuyen_pair(full, cam, ca['p_m'], cb['p_m'], ca['psi_rad'], cb['psi_rad'],
                                                     float(side), float(h_m), kappa, plumb, tuple(to)):
                     ii_m, ii_psi = max(ii_m, math.hypot(dx, dy)), max(ii_psi, abs(dpsi))
-        vals = [v for v in (part_i, ii_m) if v is not None]
+        iii_m = iii_psi = iii_info = None
+        if fp_iii is None:
+            why += why_iii or ['(iii) khong tinh: chuoi session / track / frames cua F5 chua dung (xem ly do (ii))']
+        else:
+            iii_m, iii_psi, w3, iii_info = iii_leg(fp_iii, rows_iii, dets_iii, list(ca.get('khung_id') or []),
+                                                   list(cb.get('khung_id') or []), float(s['car_side_m']), *set_iii)
+            if w3:
+                why.append(f'(iii) {w3}')
+        vals = [v for v in (part_i, ii_m, iii_m) if v is not None]
         if not vals:
             raise KCError('e_hieu_m: a leg with neither (i) nor (ii) (start region without in-region pairs)')
+        psis = [v for v in (ii_psi, iii_psi) if v is not None]
+        rec = dict(i=g.get('i'), e_hieu_psi_rad=max(psis) if psis else None, phan_i_m=part_i, phan_ii_m=ii_m,
+                   phan_iii_m=iii_m, phan_iii_psi_rad=iii_psi, phan_iii=iii_info)
         # KCJ1-7: a diagnostic number is NOT written under e_hieu_m (the key the reader turns into a usable value);
-        # e_hieu_m appears only when (iii) is there and the leg is not chan_doan
-        legs.append(dict(i=g.get('i'), e_hieu_m_chan_doan=max(vals), e_hieu_psi_rad=ii_psi, phan_i_m=part_i,
-                         phan_ii_m=ii_m, phan_iii_m=None, trang_thai='chan_doan', ly_do=why))
+        # e_hieu_m appears only when (i), (ii), (iii) are all there and neither the leg nor F5 is chan_doan
+        if not why and part_i is not None and ii_m is not None and iii_m is not None:
+            rec.update(e_hieu_m=max(vals), trang_thai='dat', ly_do=[])
+        else:
+            rec.update(e_hieu_m_chan_doan=max(vals), trang_thai='chan_doan', ly_do=why or ['thieu mot phan'])
+        legs.append(rec)
+    all_dat = all(x['trang_thai'] == 'dat' for x in legs)
     out = dict(schema=E_HIEU_SCHEMA, cho=cho, doan_12b_sha256=d['sha256'], bao_q_xoay=False,
                mien_ii=dict(loai='duong_12b', moc=reg),
-               trang_thai='chan_doan', doan=legs, hang_so_s7=hs,
-               loai='chi so thuc nghiem truoc le (S7-17); (iii) replay neo chua co: chan_doan',
+               trang_thai='dat' if all_dat else 'chan_doan', doan=legs, hang_so_s7=hs,
+               loai='chi so thuc nghiem truoc le (S7-17): max (i), (ii), (iii) theo doan',
                nguon=[dict(vai_tro='kiem_cheo', duong_dan=os.path.abspath(a.kiem_cheo), sha256=sha256_file(a.kiem_cheo)),
                       dict(vai_tro='doan_12b_v1', duong_dan=os.path.abspath(a.doan), sha256=sha256_file(a.doan))]
                + ([dict(vai_tro='session_ii', duong_dan=ses['duong_dan'], sha256=d.get('session_sha256'))]
@@ -2685,11 +2901,14 @@ def e_hieu(a):
                gioi_han=['(i) cap moc dai hon doan: khong thay meo o thang doan ngan hon khoang cach moc',
                          '(ii) chi trong ho mo hinh; tam ma dat tai p_m, lech q bo qua; cap moc cua hanh lang 12b '
                          '(A3_tuong_doi.duong_12b), (i) van la cap trong dia xuat phat (P1_tuong_doi.theo_vung)',
-                         '(iii) chua tinh (can dets.npz, load_dets, dets_fp cua CAM)'],
+                         '(iii) phat lai tap neo that cua hai cua so tren khung that (dets.npz) qua chuoi cham, so '
+                         'voi tap neo chung cua moi khung hai cua so (doi chung dinh nghia o iii_leg); chi thay phan '
+                         'do doi tap neo, khong thay sai chung cua ca tap'],
                commit_hil=commit_hil())
     write_new(a.out, out)
-    _say(f"e_hieu {cho}: {len(legs)} doan, max {max(x['e_hieu_m_chan_doan'] for x in legs) * 1000 if legs else 0:.2f}"
-          " mm (chan_doan: chua co e_hieu_m dung duoc)")
+    top = max(x.get('e_hieu_m', x.get('e_hieu_m_chan_doan')) for x in legs)
+    _say(f"e_hieu {cho}: {len(legs)} doan, max {top * 1000:.2f} mm, "
+         f"{sum(x['trang_thai'] == 'dat' for x in legs)} doan dat; trang_thai {out['trang_thai']}")
 
 
 def xuat(a):
@@ -2804,6 +3023,7 @@ def main(argv=None):
     m.add_argument('--cua-so', dest='cua_so', required=True, help='cua_so_v1.jsonl with E_dau, E_cuoi')
     m.add_argument('--r-xp', dest='r_xp', type=float)
     m.add_argument('--a6', help='c8b_a6_v2 of the plate: h_m must be the session tag height (KCF1-6)')
+    m.add_argument('--dets', help='dets.npz of the E clip (default: track.json dets_file; sha = track.dets_sha256)')
     m.add_argument('--L-max', dest='L_max', type=float, default=L_MAX_M, help='pair length of the per-case A3')
     m.add_argument('--out', required=True)
     b = sub.add_parser('meo_bang', help='F15 (b) meo_dau_chan_bang from lan_lap.json')
@@ -2811,6 +3031,8 @@ def main(argv=None):
     b.add_argument('--lan-lap', dest='lan_lap', required=True)
     b.add_argument('--r-xp', dest='r_xp', type=float)
     b.add_argument('--session', help='session of the F8 (sha must be lan_lap.session_sha256; KCF1-2)')
+    b.add_argument('--dets', action='append', required=True,
+                   help='dets.npz of every clip of the anchor frames (run ends, calibration windows), repeated')
     b.add_argument('--out', required=True)
     a = ap.parse_args(argv)
     try:
