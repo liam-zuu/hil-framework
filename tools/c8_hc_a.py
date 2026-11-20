@@ -25,8 +25,11 @@ track, F2 rows and F5 carry its session_sha256). tinh reads the session of every
 session_sha256 (issued attempt) and session_sha256_luot to F7. The largest deviation of u_a compares a_l of every
 attempt of the place with a of the issued one: when an attempt was filmed in another session, that comparison has
 its two ends in two sessions, so the floor-frame error between the two calibrations (c7_khung_giua_session_v1 of
-CAM, du_m) enters u_a as u_khung_giua_session = asin(2 du / L) (shortest long leg of such attempts; both ends of the
-leg may be off by du); without the file of that pair the place is chua_ket_luan (gate khung_giua_session). Same
+CAM) enters u_a as u_khung_giua_session: with a phys_v1 file (CODE_KHUNG, Liam 20/11 "Truong tron phys
+(Recommended)") the deformation along the 12b corridor of the place, theo_cho[cho].hanh_lang_12b.du_bien_dang_rad
+(the rotation of the frame cancels point by point in C_l: psi_k and dp_k turn together); with an old file
+asin(2 du_m / L) (shortest long leg of such attempts); without the file of that pair, or a phys file without the
+place, the place is chua_ket_luan (gate khung_giua_session). Same
 session: nothing changes. F8 is read by lan_lap_id only (no measured quantity of two ends is compared here), its F2
 row of this 12b must carry this attempt's session when it names one. The A6 file and kiem_cheo.json are bound
 tables looked up at the tag positions of the issued attempt (plumb point and Z_c are the same in every session,
@@ -1104,11 +1107,12 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
     legs of a failed attempt having enough evidence). e_hieu: {leg i: e [m]} of F9 for the issued attempt (each long
     leg needs 0 <= e < L, HCC1-12). need_windows: window indices that must hold >= MIN_FRAMES_TINH frames (HCC1-11).
     khung (da session, CODE 20/11 khuya): dict of tinh with 'khac' (thu_id of attempts filmed in another camera
-    session than the issued one), 'du_m' (largest floor-frame error of those session pairs, c7_khung_giua_session_v1
-    of CAM; None when a pair has no file) and 'khong_ro' (attempts whose session is unknown). Attempts of 'khac' with
-    long legs add u_khung_giua_session = asin(2 du / L) to u_a (their a_l is compared with a across two sessions; L =
-    their shortest long leg); a missing pair file fails the gate khung_giua_session; an unknown session is a reason
-    (never khoa). The held-out legs (issued attempt, one session) are checked without that term.
+    session than the issued one), 'u_phys_rad' (largest theo_cho[cho].hanh_lang_12b.du_bien_dang_rad of the phys_v1
+    pair files), 'du_m' (largest du_m of the old pair files, c7_khung_giua_session_v1 of CAM), 'cap_thieu' (pairs
+    without a usable file) and 'khong_ro' (attempts whose session is unknown). Attempts of 'khac' with long legs add
+    u_khung_giua_session = max(u_phys_rad, asin(2 du_m / L)) to u_a (their a_l is compared with a across two
+    sessions; L = their shortest long leg); a missing pair fails the gate khung_giua_session; an unknown session is a
+    reason (never khoa). The held-out legs (issued attempt, one session) are checked without that term.
     Every early stop returns the same keys (values None) instead of raising."""
     attempts = [(x[0], x[1], x[2] if len(x) > 2 else ()) for x in attempts]
     res = dict(cho=cho, trang_thai='khoa', ly_do=[], luot_thu=[], a_k_deg=None, u_a_k_deg=None, do_tan_deg=None,
@@ -1151,12 +1155,20 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
               if lg['dai'] and lg['trang_thai'] == 'hop_le']
     u_khung, khung_ok, L_khung = 0.0, True, None
     if legs_k:
+        # phys_v1 pairs (Liam 20/11 at CODE_KHUNG: "Truong tron phys (Recommended)"): u = the 12b corridor deformation
+        # of the place (rotation cancels point by point: psi_k and dp_k turn together); old pair files: asin(2 du / L)
         L_khung = min(lg['L_m'] for lg in legs_k)
-        du_k = kg.get('du_m')
-        if du_k is None or not (isinstance(du_k, (int, float)) and math.isfinite(du_k) and du_k >= 0):
+        ok = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v >= 0  # noqa
+        du_k, u_p = kg.get('du_m'), kg.get('u_phys_rad')
+        parts = []
+        if du_k is not None:
+            parts.append(math.asin(min(2.0 * du_k / L_khung, 1.0)) if ok(du_k) else None)
+        if u_p is not None:
+            parts.append(float(u_p) if ok(u_p) and u_p <= math.pi else None)
+        if kg.get('cap_thieu') or not parts or any(v is None for v in parts):
             khung_ok = False
         else:
-            u_khung = math.asin(min(2.0 * du_k / L_khung, 1.0))
+            u_khung = max(parts)
     if kg.get('khong_ro'):
         res['ly_do'].append('khong ro session cua luot ' + ', '.join(sorted(kg['khong_ro'])))
     Lmin = min(lg['L_m'] for lg in longs)
@@ -1311,8 +1323,9 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
                khung_giua_session=dict({k: v for k, v in kg.items() if k not in ('khac', 'khong_ro')},
                                        luot_khac_session=sorted(khac), khong_ro=sorted(kg.get('khong_ro') or []),
                                        L_m=L_khung, u_deg=math.degrees(u_khung) if khung_ok else None,
-                                       cach='u = asin(2 du_m / L), L = doan dai ngan nhat cua cac luot khac session '
-                                            'luot cap; cung session: 0'))
+                                       cach='u = lon nhat qua cac cap session: file phys_v1 -> theo_cho[cho].'
+                                            'hanh_lang_12b.du_bien_dang_rad; file cu -> asin(2 du_m / L), L = doan '
+                                            'dai ngan nhat cua cac luot khac session luot cap; cung session: 0'))
     if neo is not None:
         out['phi_hat_chuan_k_deg'] = math.degrees(wrap(math.radians(neo) - a))
         out['u_phi_hat_chuan_k_deg'] = out['u_a_k_deg']
@@ -1841,8 +1854,10 @@ KHUNG_SCHEMA = 'c7_khung_giua_session_v1'
 def read_khung_giua_session(paths):
     """{frozenset(two session_sha256): dict(du_m, n_moc, sha256, duong_dan)} from the c7_khung_giua_session_v1 files
     of CAM (contract log 20/11 khuya, chuoi da session (A): pair of session_sha256, du_m = largest floor-frame
-    difference over the marks rebuilt by both sessions, before the margin, n_moc, sources + SHA). A malformed file, or
-    two files for the same pair: AError (code 2)."""
+    difference over the marks rebuilt by both sessions, before the margin, n_moc, sources + SHA). phys_v1 files (CODE_KHUNG
+    design 2026-11-21 v1, Liam 20/11 at CODE_KHUNG: "Truong tron phys (Recommended)") add theo_cho[cho]: the HIEUCHUAN
+    term is theo_cho[cho].hanh_lang_12b.du_bien_dang_rad, kept here as {cho: rad} (a file without theo_cho: None, the
+    old asin(2 du / L) is used). A malformed file or value, or two files for the same pair: AError (code 2)."""
     out = {}
     for p in paths or []:
         j = json.load(open(p, encoding='utf-8'))
@@ -1860,7 +1875,21 @@ def read_khung_giua_session(paths):
         k = frozenset(pair)
         if k in out:
             raise AError(f'{p}: hai file cho cung cap session')
-        out[k] = dict(du_m=float(du), n_moc=n, sha256=sha256(p), duong_dan=os.path.abspath(p))
+        tc = j.get('theo_cho')
+        hl = None
+        if tc is not None:                       # phys_v1 (CODE_KHUNG design 2026-11-21 v1 section 3)
+            if not isinstance(tc, dict):
+                raise AError(f'{p}: theo_cho phai la doi tuong theo cho')
+            hl = {}
+            for cho, b in tc.items():
+                v = ((b or {}).get('hanh_lang_12b') or {}).get('du_bien_dang_rad') if isinstance(b, dict) else None
+                if v is None:
+                    continue                     # this place has no 12b corridor value: missing for that place
+                if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not 0 <= v <= math.pi:
+                    raise AError(f'{p}: theo_cho.{cho}.hanh_lang_12b.du_bien_dang_rad {v!r} (can so huu han trong [0, pi])')
+                hl[cho] = float(v)
+        out[k] = dict(du_m=float(du), n_moc=n, sha256=sha256(p), duong_dan=os.path.abspath(p),
+                      mo_hinh=j.get('mo_hinh'), hanh_lang_12b_du_bien_dang_rad=hl)
     return out
 
 
@@ -2009,15 +2038,26 @@ def cmd_tinh(a):
     khong_ro = sorted(t for t, s in att_ses.items() if s is None) if len(att_ses) > 1 else []
     khac = sorted(t for t, s in att_ses.items() if t != cap_id and s is not None and s_cap is not None and s != s_cap)
     cap_khung, thieu_cap = [], []
+    du_tho, u_phys = [], []
     for s in sorted({att_ses[t] for t in khac}):
         f = khung_files.get(frozenset((s_cap, s)))
         if f is None:
             thieu_cap.append(s)
-        else:
-            cap_khung.append(dict(f, session_sha256=[s_cap, s]))
-            nguon.append(dict(vai_tro='khung_giua_session', duong_dan=f['duong_dan'], sha256=f['sha256']))
+            continue
+        hl = f['hanh_lang_12b_du_bien_dang_rad']
+        if hl is None:                                    # old file: the coarse asin(2 du / L) bound
+            cach = 'asin(2 du_m / L)'
+            du_tho.append(f['du_m'])
+        elif a.cho in hl:                                 # phys_v1: deformation along the 12b corridor of the place
+            cach = 'phys: theo_cho.hanh_lang_12b.du_bien_dang_rad'
+            u_phys.append(hl[a.cho])
+        else:                                             # phys file without this place: missing (design 3)
+            thieu_cap.append(s)
+            cach = f'phys: thieu theo_cho.{a.cho}.hanh_lang_12b.du_bien_dang_rad'
+        cap_khung.append(dict(f, session_sha256=[s_cap, s], cach=cach))
+        nguon.append(dict(vai_tro='khung_giua_session', duong_dan=f['duong_dan'], sha256=f['sha256']))
     kg = dict(khac=khac, khong_ro=khong_ro, cap=cap_khung, cap_thieu=thieu_cap,
-              du_m=None if thieu_cap else max((c['du_m'] for c in cap_khung), default=0.0),
+              du_m=max(du_tho) if du_tho else None, u_phys_rad=max(u_phys) if u_phys else None,
               a6_session_sha256=_sessions_named(a.a6, 'a6'), kc_session_sha256=_sessions_named(a.kc, 'kc'))
     r = place_result(a.cho, attempts, cap_id, e_hieu=e, q=q, du_m=du, neo=neo, psi_cuc=psi_cuc, cap_ok=cap_ok,
                      cap_why=cap_why, bao_q=bao_q, vet=vet, psi_cuc_chot=chot, need_windows=need, psi_hai_dau=psi_hd,

@@ -1648,6 +1648,71 @@ def test_held_out_legs_ignore_the_cross_session_term(tmp_path):
     assert r2['cong']['giu_ngoai'] is False
 
 
+def _phys(**theo_cho):
+    return dict(mo_hinh='phys_v1', k_se=3.0, rho_m=0.40, truoc_le=True,
+                theo_cho={c: dict(xy_m=[0, 0], hanh_lang_12b=dict(du_xoay_rad=1e-5, du_thang=1e-4,
+                                                                  du_bien_dang_rad=v)) for c, v in theo_cho.items()})
+
+
+def test_tinh_phys_file_uses_corridor_deformation(tmp_path):
+    """CODE_KHUNG phys_v1 (Liam 20/11 at CODE_KHUNG: "Truong tron phys (Recommended)"): the HIEUCHUAN term is
+    theo_cho[cho].hanh_lang_12b.du_bien_dang_rad of the place, not asin(2 du_m / L); a phys file without the place is
+    missing (chua_ket_luan)."""
+    A_, B_ = 'a' * 64, 'b' * 64
+    d1, d2, run = _two(tmp_path, A_, A_)
+    _, same = run('same')
+    _set_track_session(d2, B_)
+    kf = _khung(tmp_path, 'kp', (A_, B_), du=0.0005, **_phys(K2=1.0e-4, K1=3.0e-4))
+    rc, r = run('phys', '--khung-giua-session', kf)
+    k = r['khung_giua_session']
+    assert r['cong']['khung_giua_session'] is True and k['u_phys_rad'] == 1.0e-4 and k['du_m'] is None
+    assert r['u_hang_deg']['u_khung_giua_session'] == pytest.approx(math.degrees(1.0e-4))
+    assert r['u_hang_deg']['u_khung_giua_session'] < math.degrees(math.asin(2 * 0.0005 / k['L_m'])) / 10
+    assert r['u_a_k_deg'] == pytest.approx(same['u_a_k_deg'] + math.degrees(1.0e-4))
+    assert 'phys' in k['cap'][0]['cach'] and k['cap'][0]['mo_hinh'] == 'phys_v1'
+    kn = _khung(tmp_path, 'kp_no_k2', (A_, B_), du=0.0005, **_phys(K1=3.0e-4))
+    rc, r = run('phys_no_k2', '--khung-giua-session', kn)
+    assert rc == 1 and r['trang_thai'] == 'chua_ket_luan' and r['cong']['khung_giua_session'] is False
+    assert r['u_a_k_deg'] is None and r['khung_giua_session']['cap_thieu'] == [B_]
+    assert 'thieu theo_cho.K2' in r['khung_giua_session']['cap'][0]['cach']
+
+
+def test_place_result_cross_session_term_is_the_largest_pair():
+    """Old and phys pair files together: the larger term; a bad value or a missing pair: no term (gate fails)."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as t:
+        d1, _ = make(__import__('pathlib').Path(t), 'HC_K2_1', cho='K2')
+        an = analyse(d1)
+    kw = dict(e_hieu=E(0.002), q=[0.0, 0.0], du_m=0.0, neo=0.0, psi_cuc=0.0)
+    att = [('c', an), ('o', an)]
+    L = min(lg['L_m'] for lg in an['legs'] if lg['dai'] and lg['trang_thai'] == 'hop_le')
+    u_tho = math.asin(2 * 0.002 / L)
+    for u_p, want in ((1e-5, u_tho), (0.05, 0.05)):
+        r = ca.place_result('K2', att, 'c', khung=dict(khac=['o'], du_m=0.002, u_phys_rad=u_p), **kw)
+        assert math.radians(r['u_hang_deg']['u_khung_giua_session']) == pytest.approx(want)
+    r = ca.place_result('K2', att, 'c', khung=dict(khac=['o'], u_phys_rad=2e-4), **kw)
+    assert math.radians(r['u_hang_deg']['u_khung_giua_session']) == pytest.approx(2e-4)
+    for bad in (dict(u_phys_rad=-1e-4), dict(u_phys_rad=float('nan')), dict(du_m=-0.001), dict(),
+                dict(u_phys_rad=1e-4, cap_thieu=['x'])):
+        r = ca.place_result('K2', att, 'c', khung=dict(khac=['o'], **bad), **kw)
+        assert r['cong']['khung_giua_session'] is False and r['u_a_k_deg'] is None, bad
+
+
+def test_read_khung_giua_session_phys_values(tmp_path):
+    A_, B_ = 'a' * 64, 'b' * 64
+    f = ca.read_khung_giua_session([_khung(tmp_path, 'p', (A_, B_), **_phys(goc=1e-4, K1=2e-4))])[frozenset((A_, B_))]
+    assert f['hanh_lang_12b_du_bien_dang_rad'] == {'goc': 1e-4, 'K1': 2e-4} and f['mo_hinh'] == 'phys_v1'
+    assert ca.read_khung_giua_session([_khung(tmp_path, 'o', (A_, B_))])[frozenset((A_, B_))][
+        'hanh_lang_12b_du_bien_dang_rad'] is None
+    p = _khung(tmp_path, 'p2', (A_, B_), theo_cho=dict(K2=dict(xy_m=[0, 0])))        # place without the value
+    assert ca.read_khung_giua_session([p])[frozenset((A_, B_))]['hanh_lang_12b_du_bien_dang_rad'] == {}
+    for name, v in (('neg', -1e-4), ('nan', float('nan')), ('bool', True), ('str', '1e-4'), ('big', 4.0)):
+        with pytest.raises(ca.AError):
+            ca.read_khung_giua_session([_khung(tmp_path, f'b_{name}', (A_, B_), **_phys(K2=v))])
+    with pytest.raises(ca.AError):
+        ca.read_khung_giua_session([_khung(tmp_path, 'b_list', (A_, B_), theo_cho=[1, 2])])
+
+
 def test_read_khung_giua_session_refuses_bad_files(tmp_path):
     A_, B_ = 'a' * 64, 'b' * 64
     good = _khung(tmp_path, 'g', (A_, B_))
