@@ -268,9 +268,12 @@ def _median(v):
 
 def check_marks(seen, shape, sess=None):
     """Verdict on one frame. seen = {id: (x, y) centre px}, shape = (h, w). Pure (tested).
-    Returns dict(verdict 'OK' / 'CANH_BAO', reasons, counts, shift_px, missing)."""
-    floor = sorted(i for i in seen if 1 <= i <= 24)
-    check = sorted(i for i in seen if 25 <= i <= 33)
+    Returns dict(verdict 'OK' / 'CANH_BAO', reasons, counts, shift_px, missing).
+    Floor marks: the session's floor_ids when it has them (since 18/11 by vai_tro: the mid-field marks ID 25-33 taped
+    for good are floor marks, design 33 marks v3 1), else ID 1-24; check tags: ID 25-33 that are not floor marks."""
+    fl = set(int(i) for i in (sess or {}).get('floor_ids', range(1, 25)))
+    floor = sorted(i for i in seen if i in fl)
+    check = sorted(i for i in seen if 25 <= i <= 33 and i not in fl)
     out = dict(n_floor=len(floor), n_check=len(check), car_seen=0 in seen, floor_ids=floor,
                shift_px=None, missing=[], reasons=[])
     if sess is None:
