@@ -448,7 +448,8 @@ def gain_file_of(gain_set_id, files):
 
 
 def load_runs(dataset, score_name, esp32_name, query_before_name='gain_query_before.txt',
-              query_after_name='gain_query_after.txt', gain_ack_name='gain_ack.txt', init_gain=None, gate_file=None):
+              query_after_name='gain_query_after.txt', gain_ack_name='gain_ack.txt', init_gain=None, gate_file=None,
+              gate_file_fake=False):
     path = os.path.join(dataset, 'm7_tuning_log.csv')
     with open(path, newline='', encoding='utf-8') as f:
         rows = list(csv.DictReader(f))
@@ -465,13 +466,13 @@ def load_runs(dataset, score_name, esp32_name, query_before_name='gain_query_bef
     try:
         # O1 v11.33 (CODE_GATE): the rows checked against the C8 gate file (path, --gate-file): report-only conditions
         # recomputed from it, the gate file SHA of every run (rq3_log.check_gate_rows)
-        rl.check_gate_rows(rows, rl.read_gate_file(gate_file) if gate_file else None)
+        rl.check_gate_rows(rows, rl.read_gate_file(gate_file, gate_file_fake) if gate_file else None)   # GC6-14
         rl.check_map_rows(rows)
         miss = rl.so_h_missing(rows, dataset, stages=('final',))
         if miss:          # C9D-2 (Liam 17/11 at CODE_C13 "Sửa cả 7 + vòng 2 (Recommended)"): no table before so-h
             raise rl.LogError('luot xe kiem cuoi da phan chua so clip H (lenh rq3_log so-h, ca luot duoi nguong): '
                               + ', '.join(r.get('run_uid', '') for r in miss) + ' (C9D-2)')
-        rows = rl.apply_so_h(rows, dataset)                  # S05 v3.37 4.3: outcomes after the clip H comparison
+        rows = rl.apply_after(rows, dataset)    # S05 v3.37 4.3 clip H comparison, then C8b v3 §5 (rq3_log.apply_moc)
         rl._final_stops(rows)      # C9D2-3: a run after a known N = 3 stop (4.6) stops the table as the summary
     except rl.LogError as e:
         raise ValueError(f'm7_tuning_log.csv: {e}')
@@ -501,7 +502,9 @@ def load_runs(dataset, score_name, esp32_name, query_before_name='gain_query_bef
                    cat_t1=r.get('g1_cat_t1') == 'true',      # R134C4-6: O1 3.5 R2V-4, counted per cell
                    gain_set_id=r.get('gain_set_id', ''), gain_file=(gf or {}).get('file', ''),
                    gain_sha256=(gf or {}).get('sha256', ''), gain_source=(gf or {}).get('source', ''),
-                   so_h_flags=r.get('so_h_flags', ''))                 # S05 v3.37 4.3, O1 4 clip H
+                   so_h_flags=r.get('so_h_flags', ''),                 # S05 v3.37 4.3, O1 4 clip H
+                   moc_flags=r.get('moc_flags', ''), U_moc_xy_m=r.get('U_moc_xy_m', ''),
+                   U_moc_psi_deg=r.get('U_moc_psi_deg', ''))           # C8b v3 §5 (CODE_GATE design 6)
         if run['outcome'] in VALID:
             d = run['results_dir']
             score, tv = {}, dict(reason='')
@@ -754,7 +757,8 @@ def write_table(runs, out_dir):
         f.write(markdown(table))
     rcols = ['run_uid', 'platform', 'controller', 'condition', 'gain_set', 'outcome', 'flag'] + list(QUANTITIES) + \
             ['tv_reason', 'tv_d_tick', 'tv_d_seq', 'tv_end_gap_ms', 'tv_rows_dropped', 't_end_err_ms', 't_end_err_src',
-             'results_dir', 'gain_set_id', 'gain_file', 'gain_sha256', 'so_h_flags']
+             'results_dir', 'gain_set_id', 'gain_file', 'gain_sha256', 'so_h_flags', 'moc_flags', 'U_moc_xy_m',
+             'U_moc_psi_deg']
     with open(os.path.join(out_dir, 'S05_final_runs.csv'), 'w', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=rcols)
         w.writeheader()
@@ -770,7 +774,8 @@ def write_table(runs, out_dir):
                             t_end_err_src=r.get('t_end_err_src', ''),
                             results_dir=r['results_dir'], gain_set_id=r.get('gain_set_id', ''),
                             gain_file=r.get('gain_file', ''), gain_sha256=r.get('gain_sha256', ''),
-                            so_h_flags=r.get('so_h_flags', '')))
+                            so_h_flags=r.get('so_h_flags', ''), moc_flags=r.get('moc_flags', ''),
+                            U_moc_xy_m=r.get('U_moc_xy_m', ''), U_moc_psi_deg=r.get('U_moc_psi_deg', '')))
     used = sorted({(r.get('gain_set_id', '').split('/')[0] if r.get('gain_source') == '--init-gain'
                     else r.get('gain_set_id', ''), r.get('gain_file', ''), r.get('gain_sha256', ''),
                     r.get('gain_source', '')) for r in runs if r.get('gain_file')})
@@ -804,6 +809,7 @@ def main(argv=None):
     a2.add_argument('--init-gain', action='append', default=[], metavar='CTRL=FILE',
                     help='gain file of the initial gain RQ2-INIT-<CTRL> (PID, LADRC; R134C6-1)')
     a2.add_argument('--gate-file', default='', help='the locked C8 gate file (gate_c8_v1, O1 v11.33)')
+    a2.add_argument('--gate-file-fake', action='store_true', help='accept a FAKE gate file (tests, demo only; GC6-14)')
     a = ap.parse_args(argv)
     try:
         if a.cmd == 'tv':
@@ -822,7 +828,8 @@ def main(argv=None):
                     raise ValueError(f'--init-gain {x!r}: write CTRL=FILE, once per controller')
                 init[c] = f
             runs, problems = load_runs(a.dataset, a.score_name, a.esp32_name, a.query_before_name,
-                                       a.query_after_name, a.gain_ack_name, init, a.gate_file or None)
+                                       a.query_after_name, a.gain_ack_name, init, a.gate_file or None,
+                                       a.gate_file_fake)
             for p in problems:
                 print('CANH BAO:', p)
             write_table(runs, a.out)

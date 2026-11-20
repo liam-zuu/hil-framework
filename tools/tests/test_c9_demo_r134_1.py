@@ -17,6 +17,15 @@ import s05_fake_runs as fr  # noqa: E402
 GAIN = dict(ctrl='PID', id=1, gains=dict(kp_xy=1.0, ki_xy=0.5, kp_wz=1.0, ki_wz=0.2, pos_kp=6.0, pos_ki=3.0, k_psi=1.0))
 
 
+@pytest.fixture
+def no_moc(monkeypatch):
+    """C8b v3 §5 (CODE_GATE 18/11, design 03_CODE/docs/2026-11-18_Thiet_ke_rq3_u_moc_v4.md): a car run of a campaign
+    without its U / premise files is chua_ket_luan after rq3_log.apply_moc. The tests using this fixture check rules
+    written before §5 on car runs that have no such files, so the §5 rule is set aside here; it is tested, with
+    summary, freeze and s05_final_table, in test_rq3_u_moc.py."""
+    monkeypatch.setattr(rl, 'apply_moc', lambda tun, ds: tun)
+
+
 def _rows(path):
     with open(path, newline='', encoding='utf-8') as f:
         return list(csv.DictReader(f))
@@ -40,7 +49,7 @@ def demo_ds(tmp_path):
 def test_demo_final_table_runs_the_whole_chain(demo_ds, tmp_path):
     out = str(tmp_path / 'tbl')
     os.makedirs(out)
-    assert T.main(['table', '--dataset', demo_ds, '--out', out, '--gate-file', os.path.join(demo_ds, 'FAKE_gate_c8.json')]) == 0
+    assert T.main(['table', '--dataset', demo_ds, '--out', out, '--gate-file', os.path.join(demo_ds, 'FAKE_gate_c8.json'), '--gate-file-fake']) == 0
     runs = _rows(os.path.join(out, 'S05_final_runs.csv'))
     judged = [r for r in runs if r.get('outcome') in T.VALID]
     assert len(judged) == 4                                      # two final_hil, two judged car final runs
@@ -65,7 +74,7 @@ def test_demo_rows_name_their_query_files(demo_ds):
 # ── R134 (1): the summary reads the two saved answers again ───────────────────────────────────────────────────────
 def _gf(ds):
     """The FAKE C8 gate file of the demo (O1 v11.33, gate_c8_v1)."""
-    return rl.read_gate_file(os.path.join(ds, 'FAKE_gate_c8.json'))
+    return rl.read_gate_file(os.path.join(ds, 'FAKE_gate_c8.json'), allow_fake=True)
 
 
 def _summary(ds):
@@ -297,7 +306,7 @@ def test_so_h_final_car_run_lost_after_the_comparison_leaves_the_table(demo_ds, 
     rl.so_h(demo_ds, fin['run_uid'], _score_final(demo_ds, fin['run_uid'], 3.0, 'hong_he_do'))
     out = str(tmp_path / 'tbl')
     os.makedirs(out)
-    assert T.main(['table', '--dataset', demo_ds, '--out', out, '--gate-file', os.path.join(demo_ds, 'FAKE_gate_c8.json')]) == 0
+    assert T.main(['table', '--dataset', demo_ds, '--out', out, '--gate-file', os.path.join(demo_ds, 'FAKE_gate_c8.json'), '--gate-file-fake']) == 0
     runs = {r['run_uid']: r for r in _rows(os.path.join(out, 'S05_final_runs.csv'))}
     assert runs[fin['run_uid']]['outcome'] == 'hong_he_do' and runs[fin['run_uid']]['so_h_flags'] == 'calib_drift'
     assert _summary(demo_ds)
@@ -361,7 +370,7 @@ def test_b8s2_2_run_after_a_stop_seen_only_at_the_comparison(demo_ds, tmp_path):
     assert s['N_HW'] == '7'                                             # 3 tune + 3 final + the late run
     out = str(tmp_path / 'tbl')
     os.makedirs(out)
-    assert T.main(['table', '--dataset', demo_ds, '--out', out, '--gate-file', os.path.join(demo_ds, 'FAKE_gate_c8.json')]) == 0
+    assert T.main(['table', '--dataset', demo_ds, '--out', out, '--gate-file', os.path.join(demo_ds, 'FAKE_gate_c8.json'), '--gate-file-fake']) == 0
     assert late['run_uid'] not in {r['run_uid'] for r in _rows(os.path.join(out, 'S05_final_runs.csv'))}
     with pytest.raises(rl.LogError, match='lost runs in a row'):        # and no run after it any more
         rl.begin(demo_ds, 'FAKE-F2', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'final', gain_set='A-PID/G00')
@@ -421,7 +430,7 @@ def test_c9d2_final_table_stops_before_so_h_of_a_final_car_run(demo_ds, tmp_path
     _drop_so_h(demo_ds, 'FAKE-F1:3')
     out = str(tmp_path / 'tbl')
     os.makedirs(out)
-    assert T.main(['table', '--dataset', demo_ds, '--out', out, '--gate-file', os.path.join(demo_ds, 'FAKE_gate_c8.json')]) != 0
+    assert T.main(['table', '--dataset', demo_ds, '--out', out, '--gate-file', os.path.join(demo_ds, 'FAKE_gate_c8.json'), '--gate-file-fake']) != 0
     assert not os.path.exists(os.path.join(out, 'S05_final_runs.csv'))
 
 
@@ -429,7 +438,7 @@ def test_c9d2_final_table_does_not_need_so_h_of_tune_runs(demo_ds, tmp_path):
     _drop_so_h(demo_ds, 'FAKE-A1:2')                                   # screen run: counted in the summary only
     out = str(tmp_path / 'tbl')
     os.makedirs(out)
-    assert T.main(['table', '--dataset', demo_ds, '--out', out, '--gate-file', os.path.join(demo_ds, 'FAKE_gate_c8.json')]) == 0
+    assert T.main(['table', '--dataset', demo_ds, '--out', out, '--gate-file', os.path.join(demo_ds, 'FAKE_gate_c8.json'), '--gate-file-fake']) == 0
 
 
 def _confirm_block(ds, tmp_path, block, outcomes):
@@ -442,7 +451,7 @@ def _freeze_ok(ds, tmp_path, at=''):
                      fr.write_gain_file(str(tmp_path / 'FAKE_gain_L.json'), GAIN), at=at)
 
 
-def test_c9d4_freeze_needs_the_so_h_of_the_last_block(demo_ds, tmp_path):
+def test_c9d4_freeze_needs_the_so_h_of_the_last_block(demo_ds, tmp_path, no_moc):
     uids = _confirm_block(demo_ds, tmp_path, 'K1', ('dat', 'dat'))
     with pytest.raises(rl.LogError, match='without their clip H comparison'):
         _freeze_ok(demo_ds, tmp_path)
@@ -470,7 +479,7 @@ def _lost_confirm(ds, block):
     return rl.end(ds, 'hong_he_do', completed=1, fail_cause='mat_khung_FAKE')['run_uid']
 
 
-def test_c9d4_lost_runs_of_the_block_are_out_of_the_denominator(demo_ds, tmp_path):
+def test_c9d4_lost_runs_of_the_block_are_out_of_the_denominator(demo_ds, tmp_path, no_moc):
     # S05 4.3: a run lost to the measurement is replaced, out of the denominator; one lost at so-h likewise
     _lost_confirm(demo_ds, 'K1')
     uids = _confirm_block(demo_ds, tmp_path, 'K1', ('dat', 'dat', 'dat'))
@@ -491,7 +500,8 @@ def _fake_gio(folder, task, run):
         sha[k] = rl.sha256_file(q)
     p = os.path.join(folder, 'c8b_gio.json')
     with open(p, 'w', encoding='utf-8') as f:
-        json.dump(dict(format='c8b_gio_v1', ok=False, FAKE=True, run=run, task=task, sha256=sha), f)
+        json.dump(dict(format='c8b_gio_v1', ok=False, ket_luan='hong_he_do', kiem_gio_d1=dict(trang_thai='truot'), dem_truot_kiem_gio=True, FAKE=True, run=run, task=task, sha256=sha),
+                  f)
     return p
 
 
@@ -520,7 +530,7 @@ def test_gt1_2_a_level_stopped_by_the_c8b_time_check_is_not_confirmed(demo_ds, t
     assert s['stop_reason_check'] == 'mismatch' and s['san_gio_c8b_dung'] == 'A-LADRC/G01 O1-F05@0.5'
 
 
-def test_gt2_2_a_level_outside_the_block_and_the_gate_does_not_stop_the_confirmation(demo_ds, tmp_path):
+def test_gt2_2_a_level_outside_the_block_and_the_gate_does_not_stop_the_confirmation(demo_ds, tmp_path, no_moc):
     # GT2-2 (Codex round 2 of CODE_GATE; Liam 17/11 at CODE_GATE "Sửa 4 + Codex vòng 3 (Recommended)"): the gate of
     # the demo has O1-F05 only; O1-F08 of the set stopped in explore runs; the F05 block confirms
     for i in range(4):
@@ -563,7 +573,7 @@ def _summary_with_levels(ds, tmp_path, levels):
     return {r['campaign']: r for r in rl.summary(ds, gate_file=gf)}
 
 
-def test_q1_summary_needs_two_valid_runs_per_gate_level(demo_ds, tmp_path):
+def test_q1_summary_needs_two_valid_runs_per_gate_level(demo_ds, tmp_path, no_moc):
     # S05 v3.40 4.3 Q1 (Liam 17/11 at THESIS "Nhờ C13 thêm kiểm (Recommended)"): a block with one valid run per level
     # froze (freeze has no gate file), the summary with the gate file says mismatch; two valid runs say ok
     uids = _confirm_block(demo_ds, tmp_path, 'K1', ('dat',))
@@ -575,7 +585,7 @@ def test_q1_summary_needs_two_valid_runs_per_gate_level(demo_ds, tmp_path):
 
 
 @pytest.mark.parametrize('levels, want', [(('O1-F05',), 'ok'), (('O1-F05', 'O1-F08'), 'mismatch')])
-def test_q1_lost_runs_do_not_count_and_every_level_is_needed(tmp_path, levels, want):
+def test_q1_lost_runs_do_not_count_and_every_level_is_needed(tmp_path, levels, want, no_moc):
     demo_ds = str(tmp_path / 'dry')
     rl.demo(demo_ds, levels=levels)          # O1 v11.33: a gate file per level set, the runs scored with it
     _lost_confirm(demo_ds, 'K1')                                        # lost: out of the two
@@ -587,7 +597,7 @@ def test_q1_lost_runs_do_not_count_and_every_level_is_needed(tmp_path, levels, w
     assert s['stop_reason_check'] == want
 
 
-def test_q1c1_a_run_lost_from_the_start_is_not_one_of_the_two(demo_ds, tmp_path):
+def test_q1c1_a_run_lost_from_the_start_is_not_one_of_the_two(demo_ds, tmp_path, no_moc):
     # Q1C-1 (Codex Q1 round): one dat after so-h and one run logged lost, gate O1-F05 only: mismatch
     _lost_confirm(demo_ds, 'K1')
     uids = _confirm_block(demo_ds, tmp_path, 'K1', ('dat',))
@@ -596,7 +606,7 @@ def test_q1c1_a_run_lost_from_the_start_is_not_one_of_the_two(demo_ds, tmp_path)
     assert _summary_with_levels(demo_ds, tmp_path, ['O1-F05'])['A-LADRC']['stop_reason_check'] == 'mismatch'
 
 
-def test_q1c1_a_run_lost_at_so_h_is_not_one_of_the_two(demo_ds, tmp_path):
+def test_q1c1_a_run_lost_at_so_h_is_not_one_of_the_two(demo_ds, tmp_path, no_moc):
     # Q1C-1: two provisional dat, one became hong_he_do at so-h, gate O1-F05 only: mismatch
     uids = _confirm_block(demo_ds, tmp_path, 'K1', ('dat', 'dat'))
     rl.so_h(demo_ds, uids[0], _score_final(demo_ds, uids[0], 3.0, 'hong_he_do'))

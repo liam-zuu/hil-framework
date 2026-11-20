@@ -17,6 +17,15 @@ import rq3_log as rl  # noqa: E402  (R134C4-2: the table runs the log's row chec
 COLS = ['timestamp_us', 'tick', 'log_seq', 'motor_on', 'run_active'] + list(T.WHEELS)
 
 
+@pytest.fixture
+def no_moc(monkeypatch):
+    """C8b v3 §5 (CODE_GATE 18/11, design 03_CODE/docs/2026-11-18_Thiet_ke_rq3_u_moc_v4.md): a car run of a campaign
+    without its U / premise files is chua_ket_luan after rq3_log.apply_moc. The tests using this fixture check rules
+    written before §5 on car runs that have no such files, so the §5 rule is set aside here; it is tested, with
+    summary, freeze and s05_final_table, in test_rq3_u_moc.py."""
+    monkeypatch.setattr(rl, 'apply_moc', lambda tun, ds: tun)
+
+
 class Log:
     """Builds ESP32 log lines tick by tick."""
 
@@ -307,7 +316,7 @@ def write_run(base, uid, platform, stage, ctrl, task, gain_set_id, outcome, e_pe
     return row
 
 
-def test_table_cells_medians_and_reasons(tmp_path):
+def test_table_cells_medians_and_reasons(tmp_path, no_moc):
     runs = [
         write_run(tmp_path, 'r1', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'dat', 0.020),
         write_run(tmp_path, 'r2', 'HW', 'final', 'PID', 'O1-F05', 'A-PID/G07', 'khong_dat', 0.120, flag=3),

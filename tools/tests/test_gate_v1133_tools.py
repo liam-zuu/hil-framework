@@ -43,7 +43,7 @@ def ds(tmp_path):
     rl.migrate(d)
     p = str(tmp_path / 'gate_c8.json')
     GC.write_gate(p, _good())
-    return d, rl.read_gate_file(p), tmp_path
+    return d, rl.read_gate_file(p, allow_fake=True), tmp_path
 
 
 def _hil_b(d, task='O1-F08'):
@@ -87,7 +87,7 @@ def test_end_refuses_another_gate_file(ds):
     GC.write_gate(p2, GC.fake_gate(LEVELS, u_psi_deg=1.0, u_t_s=0.014))
     _hil_b(d)
     with pytest.raises(rl.LogError, match='scored with the gate file'):
-        rl.end(d, 'dat', completed=1, results_dir=str(tmp), gate=_gate(gf), gate_file=rl.read_gate_file(p2))
+        rl.end(d, 'dat', completed=1, results_dir=str(tmp), gate=_gate(gf), gate_file=rl.read_gate_file(p2, allow_fake=True))
 
 
 def test_end_refuses_a_self_declared_exemption(ds):
@@ -183,12 +183,27 @@ def _f08_log(tmp_path, monkeypatch):
     return p
 
 
+def test_gc6_14_hil_scorer_refuses_fake_marks(tmp_path, monkeypatch):
+    """GC6-14 (round 4): hil_o1_score reads the gate as rq3_log does: a FAKE gate only with the flag, FAKE marks never."""
+    p = _f08_log(tmp_path, monkeypatch)
+    g = _good()
+    gp = _write(tmp_path, g)
+    with pytest.raises(ValueError, match='FAKE'):
+        H.score(p, 'O1-F08', esp_log='esp.csv', gate_file=gp, stage='hil_check', campaign='B-PID')
+    g['c8_dir'] = 'C8'
+    gp2 = str(tmp_path / 'g2.json')
+    with open(gp2, 'w', encoding='utf-8') as f:
+        json.dump(g, f)
+    with pytest.raises(ValueError, match='FAKE'):
+        H.score(p, 'O1-F08', esp_log='esp.csv', gate_file=gp2, gate_file_fake=True, stage='hil_check', campaign='B-PID')
+
+
 def test_hil_score_with_and_without_the_gate_file(tmp_path, monkeypatch):
     p = _f08_log(tmp_path, monkeypatch)
     gp = _write(tmp_path, _good())
     plain = H.score(p, 'O1-F08', esp_log='esp.csv')['gate_v3']
-    b = H.score(p, 'O1-F08', esp_log='esp.csv', gate_file=gp, stage='hil_check', campaign='B-PID')['gate_v3']
-    fin = H.score(p, 'O1-F08', esp_log='esp.csv', gate_file=gp, stage='final_hil', campaign='RQ2')['gate_v3']
+    b = H.score(p, 'O1-F08', esp_log='esp.csv', gate_file=gp, gate_file_fake=True, stage='hil_check', campaign='B-PID')['gate_v3']
+    fin = H.score(p, 'O1-F08', esp_log='esp.csv', gate_file=gp, gate_file_fake=True, stage='final_hil', campaign='RQ2')['gate_v3']
     assert plain['version'] == b['version'] == fin['version'] == 'gate_v3.3'   # per-frame U (U_t known)
     assert plain['u_mode'] == 'khung' and plain['gate_file_sha256'] is None and plain['report_only'] == []
     assert b['report_only'] == ['g5'] and b['decide'] == ['g1', 'g2', 'g3', 'g4'] and b['complete'] is True
@@ -206,9 +221,9 @@ def test_hil_score_with_and_without_the_gate_file(tmp_path, monkeypatch):
 def test_hil_score_gate_accepted_by_rq3_log(tmp_path, monkeypatch):
     p = _f08_log(tmp_path, monkeypatch)
     gp = _write(tmp_path, _good())
-    g = rl._plain(H._json_safe(H.score(p, 'O1-F08', esp_log='esp.csv', gate_file=gp, stage='hil_check',
+    g = rl._plain(H._json_safe(H.score(p, 'O1-F08', esp_log='esp.csv', gate_file=gp, gate_file_fake=True, stage='hil_check',
                                        campaign='B-PID')['gate_v3']))
-    req = rl.read_gate_file(gp).required('O1-F08', 'HIL', 'hil_check', 'B-PID')
+    req = rl.read_gate_file(gp, allow_fake=True).required('O1-F08', 'HIL', 'hil_check', 'B-PID')
     ev = rl.validate_gate(g, 'HIL', req)
     assert ev['complete'] is True
 
@@ -368,6 +383,10 @@ def _gio(tmp, name, ok=False, fmt='c8b_gio_v1', task='O1-F05', inputs_in=None, *
             f.write(f'FAKE,{k},{name}\n')
         sha[k] = rl.sha256_file(q)
     p = os.path.join(str(tmp), f'{name}.json')
+    extra.setdefault('ket_luan', 'ok' if ok else 'hong_he_do')       # c8b_gio.py 659: the verdict of the file
+    extra.setdefault('kiem_gio_d1', dict(trang_thai='dat' if ok else 'truot', L_le_U=ok, ghep_ok=True,
+                                         trong_dai_c8=None, ly_do=[]))  # F11 (CODE_C8B design v6 7a)
+    extra.setdefault('dem_truot_kiem_gio', not ok)                  # M2 (CODE_C8B design v7 7a)
     d = dict(format=fmt, ok=ok, nodes_s=[0.01, 0.011], FAKE=True, name=name, sha256=sha, **extra)
     if task is not None:
         d['task'] = task
@@ -399,6 +418,88 @@ def test_c8b_check_needs_its_file_ok_false(ds):
     p = _gio(tmp, 'g1')
     row = rl.end(d, 'hong_he_do', fail_cause=rl.C8B_GIO_FAIL, c8b_gio=p, **kw)
     assert row['c8b_gio_sha256'] == rl.sha256_file(p)
+
+
+def test_c8b_check_counts_only_a_lost_verdict(ds):
+    # CODE_GATE 19/11, bug of e66ecd1 (CODE's order of 19/11): c8b_gio.py writes ok false with ket_luan hong_he_do
+    # (lost: run again, counted) or ket_luan chua_ket_luan (no finite clock bound: not lost, not counted,
+    # c8b_gio.py 585, 659). A file of the second kind, or one without ket_luan, is refused as a kiem_gio_c8b run, and
+    # nothing is logged: the open run stays open and the count of the level does not move.
+    d, gf, tmp = ds
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    kw = dict(completed=1, results_dir=str(tmp), queries=rl.fake_queries())
+    path = os.path.join(d, rl.TUNING)
+    before = open(path, encoding='utf-8').read() if os.path.isfile(path) else ''
+    for name, kl in (('chua', 'chua_ket_luan'), ('none', None), ('okv', 'ok')):
+        g = _gio(tmp, name, ket_luan=kl)                                 # None: written as null
+        with pytest.raises(rl.LogError, match='not hong_he_do'):
+            rl.end(d, 'hong_he_do', fail_cause=rl.C8B_GIO_FAIL, c8b_gio=g, **kw)
+    after = open(path, encoding='utf-8').read() if os.path.isfile(path) else ''
+    assert after == before
+    assert not rl.c8b_refusals(rl.live_rows(rl.read_rows(path)))
+    row = rl.end(d, 'hong_he_do', fail_cause=rl.C8B_GIO_FAIL, c8b_gio=_gio(tmp, 'lost'), **kw)
+    assert rl.c8b_refusals(rl.live_rows(rl.read_rows(path)))[rl.map_key(row)] == 1
+
+
+def test_f11_only_a_d1_slip_is_a_kiem_gio_c8b_run(ds):
+    """F11 (KG-1; GATE accepted 19/11): a time file lost (ket_luan hong_he_do) by the pair count or a log hole while
+    the D1 check passed or could not run (kiem_gio_d1 dat / khong_kiem) is not a kiem_gio_c8b run; a file without
+    the kiem_gio_d1 block (before F11) is refused; a D1 slip with a cap_dem fault too still counts."""
+    d, gf, tmp = ds
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    kw = dict(completed=1, results_dir=str(tmp), queries=rl.fake_queries())
+    for name, st in (('d1dat', 'dat'), ('d1kk', 'khong_kiem')):
+        g = _gio(tmp, name, kiem_gio_d1=dict(trang_thai=st), cap_dem=dict(truot=True))
+        with pytest.raises(rl.LogError, match='only a slip of the D1 time check'):
+            rl.end(d, 'hong_he_do', fail_cause=rl.C8B_GIO_FAIL, c8b_gio=g, **kw)
+    with pytest.raises(rl.LogError, match='no kiem_gio_d1 block'):
+        rl.end(d, 'hong_he_do', fail_cause=rl.C8B_GIO_FAIL, c8b_gio=_gio(tmp, 'old', kiem_gio_d1=None), **kw)
+    with pytest.raises(rl.LogError, match='dem_truot_kiem_gio false'):                     # M2: a boot slip
+        rl.end(d, 'hong_he_do', fail_cause=rl.C8B_GIO_FAIL, c8b_gio=_gio(tmp, 'boot', dem_truot_kiem_gio=False), **kw)
+    with pytest.raises(rl.LogError, match='no dem_truot_kiem_gio'):
+        rl.end(d, 'hong_he_do', fail_cause=rl.C8B_GIO_FAIL, c8b_gio=_gio(tmp, 'nodem', dem_truot_kiem_gio=None), **kw)
+    row = rl.end(d, 'hong_he_do', fail_cause=rl.C8B_GIO_FAIL,
+                 c8b_gio=_gio(tmp, 'both', cap_dem=dict(truot=True)), **kw)
+    assert rl.c8b_refusals(rl.live_rows(rl.read_rows(os.path.join(d, rl.TUNING))))[rl.map_key(row)] == 1
+
+
+def _luoi(tmp, name, st='chua_ket_luan_khong_nut', n=0, gate=None, gio=None):
+    """A FAKE c8b_luoi file (F11; GC6-12: every key, the outcome of its state, the gio_sha256 of the time file gio)."""
+    p = os.path.join(str(tmp), f'{name}.json')
+    out = {'cham': 'dat', 'hong_he_do': 'hong_he_do'}.get(st, 'chua_ket_luan')
+    with open(p, 'w', encoding='utf-8') as f:
+        json.dump(dict(FAKE=True, name=name, trang_thai_luot=st, n_nut_cham=n, task='O1-F05',
+                       gio_sha256=rl.sha256_file(gio) if gio else 'c' * 64, gate_v3=gate, outcome=out,
+                       ly_do=['khong_cham_duoc']), f)
+    return p
+
+
+def test_f11_no_scored_node_closes_the_run_chua_ket_luan(ds):
+    """F11 (KG-2): a c8b_luoi file where no node could be scored logs the floor run chua_ket_luan with fail cause
+    KHONG_NUT, kept by the summary; declaring it lost (or judged otherwise) with that file is refused."""
+    d, gf, tmp = ds
+    g = _gio(tmp, 'kn_gio', ok=True)
+    p = _luoi(tmp, 'kn', gio=g)
+    assert rl.read_luoi_khong_nut(p) is True
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    kw = dict(completed=1, results_dir=str(tmp), queries=rl.fake_queries(), gate_sha256=rl.sha256_file(p),
+              gate_khong_nut=True, c8b_gio=g, gate_path=p)
+    for o, fc in (('hong_he_do', 'mat_khung_FAKE'), ('khong_dat', ''), ('dat', '')):
+        with pytest.raises(rl.LogError, match='no node could be scored'):
+            rl.end(d, o, fail_cause=fc, **kw)
+    row = rl.end(d, 'chua_ket_luan', **kw)
+    assert row['fail_cause'] == rl.KHONG_NUT and row['gate_json_sha256'] == rl.sha256_file(p)
+    rl.summary(d)
+    for bad in (dict(n=1), dict(gate={'version': 'gate_v3.3'}), dict(st='x')):
+        with pytest.raises(rl.LogError, match='F11'):
+            rl.read_luoi_khong_nut(_luoi(tmp, 'bad', **bad))
+    assert rl.read_luoi_khong_nut(_luoi(tmp, 'ch', st='cham', n=2, gate={'version': 'gate_v3.3'})) is False
+    assert rl.read_luoi_khong_nut(_luoi(tmp, 'lost', st='hong_he_do')) is False     # every node lost (CODE_C8B 9890e41)
+    with pytest.raises(rl.LogError, match='hong_he_do needs'):
+        rl.read_luoi_khong_nut(_luoi(tmp, 'lost2', st='hong_he_do', n=1))
 
 
 def test_c8b_check_only_on_the_floor_lost(ds):
@@ -621,7 +722,7 @@ def test_gt1_6_a_lost_run_without_gate_keeps_its_gate_file_for_so_h(ds):
     rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F08', str(rl.FIG8['O1-F08']), 'screen', gain_set='A-PID/G01')
     rl.step(d, 'run')
     assert rl.main(['--dataset', d, 'end', '--outcome', 'hong_he_do', '--fail-cause', 'mat_khung_FAKE',
-                    '--results-dir', folder, '--gate-json', sp, '--gate-file', str(tmp / 'gate_c8.json')]) == 0
+                    '--results-dir', folder, '--gate-json', sp, '--gate-file', str(tmp / 'gate_c8.json'), '--gate-file-fake']) == 0
     row = rl.read_rows(os.path.join(d, rl.TUNING))[-1]
     assert (row['gate_file_sha256'], row['gate_report_only']) == (gf.sha256, 'g5') and not rl.has_gate(row)
     h1 = rl.floor_gate(rl.fake_gate(gate_file=gf, level='O1-F08', platform='HW', stage='screen', campaign='A-PID'))
@@ -837,3 +938,340 @@ def test_gt2_3_rows_without_campaign_are_not_checked_for_one_gain(ds):
         r.update(campaign='', gain_set_id='')
     rl._write_all(p, rl.TUNING_COLS, rows)
     rl.summary(d)
+
+
+# ── J v6 section 5, the t_som case (CODE 19/11 from CODE_CAM; names fixed by GATE with CAM) ──────────────────
+
+def _t_som_gate(t_som=8.0, g5_common_deg=9.0, g5_union_deg=9.0):
+    """A floor gate of the t_som case: no position basis (G2-G4 undefined frames), G5 on [0, t_som] / [0, t_deadline]."""
+    g = rl.floor_gate(rl.fake_gate(e_theta_deg=2.0))
+    for c in ('g2', 'g3', 'g4'):
+        blk = dict(q=None, lo=None, hi=None, n_undef=20)
+        g[c].update(blk, state='chua_ket_luan')
+        g[c]['chung'] = dict(blk)
+    lo_c, lo_u = g5_common_deg - 1.0, g5_union_deg - 1.0
+    g['g5']['chung'] = dict(q=g5_common_deg, lo=lo_c, hi=g5_common_deg + 1.0, n_undef=0)
+    g['g5'].update(q=g5_union_deg, lo=lo_u, hi=g5_union_deg + 1.0, n_undef=0)
+    g['g5']['state'] = rl.cond_state2(lo_c, lo_u, g5_union_deg + 1.0, 0, o1_gate.THRESHOLDS['g5'])
+    g['g1'].update(t_done=[None, None], ca_t_som=True, t_som_s=t_som, state='chua_ket_luan', q='inconclusive')
+    g.update(o1_gate.evaluate_outcomes(g, g['decide'], g.get('required')))
+    return g
+
+
+def test_t_som_case_g1_chua_ket_luan_g5_on_its_common_domain():
+    g = _t_som_gate()
+    ev = rl.validate_gate(g, 'HW')
+    assert g['g1']['state'] == 'chua_ket_luan' and g['g5']['state'] == 'khong_dat' and ev['outcome'] == 'khong_dat'
+    g = _t_som_gate(g5_common_deg=5.0, g5_union_deg=9.0)        # a violation after t_som only: chua_ket_luan
+    assert g['g5']['state'] == 'chua_ket_luan'
+    rl.validate_gate(g, 'HW')
+    cols = rl.gate_columns(g, 'a' * 64)
+    assert cols['g1_ca_t_som'] == 'true' and cols['g1_t_som_s'] == repr(8.0)
+    back = rl.gate_from_row(dict(cols, run_uid='X'))
+    rl._recompute(back, 'HW')                                   # the logged row recomputes the same states
+
+
+@pytest.mark.parametrize('edit, msg', [
+    (lambda g: g['g1'].update(state='khong_dat', q='false'), 'state'),
+    (lambda g: g['g1'].update(t_som_s=None), 't_som_s'),
+    (lambda g: g['g1'].update(t_som_s=25.0), 't_som_s'),
+    (lambda g: g['g1'].update(t_done=[10.0, None]), 't_done'),
+    (lambda g: g['g1'].update(ca_t_som=False), 'only with ca_t_som'),
+    (lambda g: g['g2'].update(q=0.02, lo=0.01, hi=0.03, n_undef=0, state='dat', chung=dict(q=0.02, lo=0.01, hi=0.03,
+                                                                                       n_undef=0)), 'no position basis'),
+])
+def test_t_som_case_refusals(edit, msg):
+    g = _t_som_gate()
+    edit(g)
+    g.update(o1_gate.evaluate_outcomes(g, g['decide'], g.get('required')))
+    with pytest.raises(rl.LogError, match=msg):
+        rl.validate_gate(g, 'HW')
+
+
+def test_t_som_s_without_the_case_refused():
+    g = rl.floor_gate(rl.fake_gate())
+    g['g1']['t_som_s'] = 5.0
+    with pytest.raises(rl.LogError, match='only with ca_t_som'):
+        rl.validate_gate(g, 'HW')
+
+
+# ── Codex round 1 of code v6_C8 (GC6-8, GC6-12, GC6-13, GC6-15, GC6-16) ──────────────────────────────────────
+
+def test_gc6_12_the_time_file_of_a_run_without_a_scored_node(ds):
+    d, gf, tmp = ds
+    g = _gio(tmp, 'kn12_gio', ok=True)
+    p = _luoi(tmp, 'kn12', gio=g)
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    kw = dict(completed=1, results_dir=str(tmp), queries=rl.fake_queries(), gate_sha256=rl.sha256_file(p),
+              gate_khong_nut=True, gate_path=p)
+    with pytest.raises(rl.LogError, match='GC6-12'):
+        rl.end(d, 'chua_ket_luan', **kw)                                 # no time file
+    with pytest.raises(rl.LogError, match='GC6-12'):
+        rl.end(d, 'chua_ket_luan', c8b_gio=_gio(tmp, 'other_gio', ok=True), **kw)
+    row = rl.end(d, 'chua_ket_luan', c8b_gio=g, **kw)
+    assert row['c8b_gio_sha256'] == rl.sha256_file(g)
+    rl.summary(d)
+    path = os.path.join(d, rl.TUNING)
+    rows = rl.read_rows(path)
+    rows[-1]['gate_json_sha256'] = 'x'
+    rl._write_all(path, rl.TUNING_COLS, rows)
+    with pytest.raises(rl.LogError, match='KHONG_NUT|chua_ket_luan_khong_nut'):
+        rl.summary(d)
+
+
+@pytest.mark.parametrize('edit, msg', [
+    (lambda x: x.pop('gate_v3'), 'has'),                                 # absent is not null
+    (lambda x: x.update(outcome='hong_he_do'), 'outcome'),
+    (lambda x: x.pop('outcome'), 'has'),
+])
+def test_gc6_12_one_validator_of_the_luoi_file(ds, edit, msg):
+    d, gf, tmp = ds
+    p = _luoi(tmp, 'v')
+    with open(p, encoding='utf-8') as f:
+        x = json.load(f)
+    edit(x)
+    with open(p, 'w', encoding='utf-8') as f:
+        json.dump(x, f)
+    with pytest.raises(rl.LogError, match=msg):
+        rl.read_luoi_khong_nut(p)
+
+
+def test_gc6_13_end_so_h_summary_for_a_run_without_a_scored_node(ds):
+    d, gf, tmp = ds
+    folder = str(tmp / 'kn13')
+    os.makedirs(folder)
+    g = _gio(folder, 'gio_a', ok=True)
+    p = _luoi(folder, 'score', gio=g)                                   # the H0 scorer file of the run
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    row = rl.end(d, 'chua_ket_luan', completed=1, results_dir=folder, queries=rl.fake_queries(),
+                 gate_sha256=rl.sha256_file(p), gate_khong_nut=True, c8b_gio=g, gate_path=p)
+    r = rl.so_h(d, row['run_uid'], rl.fake_score_final(folder, 0.8))      # below eps_H: outcome kept
+    assert r['outcome_sau'] == 'chua_ket_luan'
+    folder2 = str(tmp / 'kn13b')
+    os.makedirs(folder2)
+    g2 = _gio(folder2, 'gio_b', ok=True)
+    p2 = _luoi(folder2, 'score', gio=g2)
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    row2 = rl.end(d, 'chua_ket_luan', completed=1, results_dir=folder2, queries=rl.fake_queries(),
+                  gate_sha256=rl.sha256_file(p2), gate_khong_nut=True, c8b_gio=g2, gate_path=p2)
+    # GC7-3: an H1 scoring without a node whose time file is another run's (not under the run folder) is refused
+    h1_other = dict(json.load(open(p, encoding='utf-8')))
+    with pytest.raises(rl.LogError, match='no time file'):
+        rl.so_h(d, row2['run_uid'], rl.fake_score_final(folder2, 3.0, h1=h1_other, name='sf_x.json'))
+    # ... and one whose time file reads another ESP32 log
+    gx = json.load(open(g2, encoding='utf-8'))
+    gx.update(name='gio_b_h1_other', sha256=dict(gx['sha256'], esp32='9' * 64))
+    gpx = os.path.join(folder2, 'gio_b_h1_other.json')
+    json.dump(gx, open(gpx, 'w', encoding='utf-8'))
+    h1x = dict(json.load(open(p2, encoding='utf-8')), gio_sha256=rl.sha256_file(gpx))
+    with pytest.raises(rl.LogError, match='another ESP32 log'):
+        rl.so_h(d, row2['run_uid'], rl.fake_score_final(folder2, 3.0, h1=h1x, name='sf_y.json'))
+    # the H1 time file of the same run (same ESP32 log)
+    gh = json.load(open(g2, encoding='utf-8'))
+    gh.update(name='gio_b_h1')
+    gph = os.path.join(folder2, 'gio_b_h1.json')
+    json.dump(gh, open(gph, 'w', encoding='utf-8'))
+    h1 = dict(json.load(open(p2, encoding='utf-8')), gio_sha256=rl.sha256_file(gph))
+    r2 = rl.so_h(d, row2['run_uid'], rl.fake_score_final(folder2, 3.0, h1=h1))   # above eps_H, H1 without a node
+    assert r2['outcome_sau'] == 'chua_ket_luan'
+    rl.summary(d)
+    # GC6-12: the summary reads the c8b_luoi file again: another valid sha256 in c8b_gio_sha256 is refused
+    path = os.path.join(d, rl.TUNING)
+    rows = rl.read_rows(path)
+    rows[-1]['c8b_gio_sha256'] = 'a' * 64
+    rl._write_all(path, rl.TUNING_COLS, rows)
+    with pytest.raises(rl.LogError, match='GC6-12'):
+        rl.summary(d)
+    # GC7-4: a row of the writer before GC6-12 (no c8b_gio_sha256) is read again from its sources
+    rows[-1]['c8b_gio_sha256'] = ''
+    rl._write_all(path, rl.TUNING_COLS, rows)
+    rl.summary(d)
+
+
+def test_gc6_15_ca_t_som_null_refused():
+    g = _t_som_gate()
+    g['g1']['ca_t_som'] = None
+    with pytest.raises(rl.LogError, match='true or false'):
+        rl.validate_gate(g, 'HW')
+
+
+def test_gc6_8_one_g5_domain_when_t_som_is_the_deadline():
+    t_dl = _t_som_gate()['g1']['t_deadline']
+    g = _t_som_gate(t_som=t_dl, g5_common_deg=5.0, g5_union_deg=9.0)   # the same domain [0, t_deadline], two numbers
+    with pytest.raises(rl.LogError, match='differ'):
+        rl.validate_gate(g, 'HW')
+    rl.validate_gate(_t_som_gate(t_som=t_dl, g5_common_deg=9.0, g5_union_deg=9.0), 'HW')
+    rl.validate_gate(_t_som_gate(t_som=t_dl - 1.0, g5_common_deg=5.0, g5_union_deg=9.0), 'HW')
+
+
+def _t_som_grid(g1_nut, cat=None, g5_common_deg=5.0, t_som=8.0):
+    g = _t_som_gate(t_som=t_som, g5_common_deg=g5_common_deg)
+    g.update(version=o1_gate.GATE_VERSION_V1133, report_only=[], required=list(o1_gate.CONDS))  # grid: gate_v3.3
+    n = len(g1_nut)
+    g['luoi'] = dict(format='luoi_v1', gio_sha256='cd' * 32, n_nut=n, d_dau_s=0.010, d_cuoi_s=0.010 + 0.001 * (n - 1),
+                     buoc_max_s=0.001 if n > 1 else 0.0, nut_tam=n // 2, g1_nut=list(g1_nut), hong_nut=[False] * n,
+                     cat_nut=list(cat or [False] * n), g1_state=rl.luoi_g1(g1_nut))
+    g.update(o1_gate.evaluate_outcomes(g, g['decide'], g.get('required')))
+    return g
+
+
+def test_gc6_8_t_som_on_a_grid():
+    rl.validate_gate(_t_som_grid(['chua_ket_luan'] * 3), 'HW')         # G5 chua_ket_luan: the gate holds
+    with pytest.raises(rl.LogError, match='by node'):                   # every node G1 chua_ket_luan (GC6-16)
+        rl.validate_gate(_t_som_grid(['chua_ket_luan', 'dat', 'chua_ket_luan']), 'HW')
+    with pytest.raises(rl.LogError, match='F18 \\(5\\)'):                # G5 khong_dat needs the node evidence
+        rl.validate_gate(_t_som_grid(['chua_ket_luan'] * 3, g5_common_deg=9.0), 'HW')
+    with pytest.raises(rl.LogError, match='F18 \(5\)'):                # one node read as several (CODE 19/11)
+        rl.validate_gate(_t_som_grid(['chua_ket_luan'], g5_common_deg=9.0), 'HW')
+    g = _t_som_gate(g5_common_deg=5.0)                                 # no grid, an exception before t1: no evidence
+    g['g1'].update(cat_t1=True, t1=1.0)
+    with pytest.raises(rl.LogError, match='F18 \(5\)'):
+        rl.validate_gate(g, 'HW')
+    t_dl = _t_som_gate()['g1']['t_deadline']
+    with pytest.raises(rl.LogError, match='differ'):                    # one node, t_som = t_deadline: one domain
+        rl.validate_gate(_t_som_grid(['chua_ket_luan'], g5_common_deg=5.0, t_som=t_dl), 'HW')
+
+
+def test_gc6_16_an_old_log_read_after_migrate(ds):
+    """A log written before the two t_som columns: migrate adds them empty; the old floor rows read as before."""
+    d, gf, tmp = ds
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F08', '0.8', 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    g = rl.floor_gate(_gate(gf, platform='HW', stage='screen', campaign='A-PID'))
+    rl.end(d, 'dat', completed=1, e_perp_max=0.02, results_dir=str(tmp), gate=g, gate_file=gf,
+           queries=rl.fake_queries())
+    path = os.path.join(d, rl.TUNING)
+    rows = rl.read_rows(path)
+    old = [c for c in rl.TUNING_COLS if c not in ('g1_ca_t_som', 'g1_t_som_s')]
+    rl._write_all(path, old, [{k: v for k, v in r.items() if k in old} for r in rows])
+    with pytest.raises(rl.LogError):
+        rl.summary(d)                                                   # the old header is not the current one
+    assert rl.migrate(d)[rl.TUNING] == 'migrated'
+    back = rl.read_rows(path)
+    assert back[-1]['g1_ca_t_som'] == '' and back[-1]['g1_t_som_s'] == ''
+    rl.summary(d, gate_file=gf)
+
+
+def test_gc6_15_ca_t_som_checked_in_a_block_without_t_done():
+    with pytest.raises(rl.LogError, match='true or false'):
+        rl.gate_g1_fields({'ca_t_som': None}, 'HIL')
+
+
+def test_gc6_12_end_reads_the_luoi_file_itself(ds):
+    d, gf, tmp = ds
+    g = _gio(tmp, 'kn_r3_gio', ok=True)
+    p = _luoi(tmp, 'kn_r3', gio=g)
+    other = _luoi(tmp, 'kn_r3_other', gio=g, st='cham', n=1, gate={'version': 'gate_v3.3'})
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    kw = dict(completed=1, results_dir=str(tmp), queries=rl.fake_queries(), gate_sha256=rl.sha256_file(p),
+              gate_khong_nut=True, c8b_gio=g)
+    for path in (other, ''):                                            # a judged grid file / no file: the flag alone
+        with pytest.raises(rl.LogError, match='GC6-12'):
+            rl.end(d, 'chua_ket_luan', gate_path=path, **kw)
+
+
+def test_gc8_1_end_needs_the_h0_file_under_results_dir(ds, tmp_path_factory):
+    """GC8-1 (Codex round 3): the luoi file outside --results-dir (time file inside): refused before the row is
+    written (the summary would not find it)."""
+    d, gf, tmp = ds
+    g = _gio(tmp, 'kn81_gio', ok=True)
+    out = tmp_path_factory.mktemp('outside')
+    p = _luoi(out, 'kn81', gio=g)
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    with pytest.raises(rl.LogError, match='GC8-1'):
+        rl.end(d, 'chua_ket_luan', completed=1, results_dir=str(tmp), queries=rl.fake_queries(),
+               gate_sha256=rl.sha256_file(p), gate_khong_nut=True, c8b_gio=g, gate_path=p)
+
+
+def test_gc8_2_one_time_file_one_run_checked_on_the_sources(ds):
+    """GC8-2 (Codex round 3): two rows on one H0 file and one time file, both c8b_gio_sha256 cells empty (rows of the
+    writer before GC6-12): the summary compares the SHA read back from the sources."""
+    d, gf, tmp = ds
+    g = _gio(tmp, 'kn82_gio', ok=True)
+    p = _luoi(tmp, 'kn82', gio=g)
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    rl.end(d, 'chua_ket_luan', completed=1, results_dir=str(tmp), queries=rl.fake_queries(),
+           gate_sha256=rl.sha256_file(p), gate_khong_nut=True, c8b_gio=g, gate_path=p)
+    path = os.path.join(d, rl.TUNING)
+    rows = rl.read_rows(path)
+    rows[-1]['c8b_gio_sha256'] = ''
+    rl._write_all(path, rl.TUNING_COLS, rows + [dict(rows[-1], run_uid=rows[-1]['run_uid'] + '_dup')])
+    with pytest.raises(rl.LogError, match='GC8-2'):
+        rl.summary(d)
+
+
+def test_gc9_10_end_applies_the_summary_rule(ds):
+    """GC9-10 (Codex round 4): an old F11 row with an empty c8b_gio_sha256 cell; end of a new run on the same H0 file
+    and time file is refused (the summary would refuse the log just written)."""
+    d, gf, tmp = ds
+    g = _gio(tmp, 'kn910_gio', ok=True)
+    p = _luoi(tmp, 'kn910', gio=g)
+    kw = dict(completed=1, results_dir=str(tmp), queries=rl.fake_queries(), gate_sha256=rl.sha256_file(p),
+              gate_khong_nut=True, c8b_gio=g, gate_path=p)
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    rl.end(d, 'chua_ket_luan', **kw)
+    path = os.path.join(d, rl.TUNING)
+    rows = rl.read_rows(path)
+    rows[-1]['c8b_gio_sha256'] = ''
+    rl._write_all(path, rl.TUNING_COLS, rows)
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    with pytest.raises(rl.LogError, match='GC8-2'):
+        rl.end(d, 'chua_ket_luan', **kw)
+
+
+def test_gc9_10_end_applies_the_summary_rule_the_other_way(ds):
+    """GC9-10 (Codex lượt chung 2): an old F11 row with an empty c8b_gio_sha256 cell names (through its H0 file) a
+    time file; a new kiem_gio_c8b row on that very file is refused by end, as the summary would."""
+    d, gf, tmp = ds
+    g = _gio(tmp, 'kn911_gio', ok=False)
+    p = _luoi(tmp, 'kn911', gio=g)
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    rl.end(d, 'chua_ket_luan', completed=1, results_dir=str(tmp), queries=rl.fake_queries(),
+           gate_sha256=rl.sha256_file(p), gate_khong_nut=True, c8b_gio=g, gate_path=p)
+    path = os.path.join(d, rl.TUNING)
+    rows = rl.read_rows(path)
+    rows[-1]['c8b_gio_sha256'] = ''
+    rl._write_all(path, rl.TUNING_COLS, rows)
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    with pytest.raises(rl.LogError, match='GC8-2'):
+        rl.end(d, 'hong_he_do', completed=1, fail_cause=rl.C8B_GIO_FAIL, c8b_gio=g, results_dir=str(tmp),
+               queries=rl.fake_queries())
+
+
+def test_gc7_3_h1_of_its_own_task_and_time_file(ds):
+    """GC7-3 (Codex round 3): an H1 c8b_luoi file of another task, or naming the H0 time file, is refused."""
+    d, gf, tmp = ds
+    folder = str(tmp / 'kn73')
+    os.makedirs(folder)
+    g = _gio(folder, 'gio_a', ok=True)
+    p = _luoi(folder, 'score', gio=g)
+    rl.begin(d, 'S', 'A-PID', 'HW', 'PID', 'O1-F05', '0.5', 'screen', gain_set='A-PID/G01')
+    rl.step(d, 'run')
+    row = rl.end(d, 'chua_ket_luan', completed=1, results_dir=folder, queries=rl.fake_queries(),
+                 gate_sha256=rl.sha256_file(p), gate_khong_nut=True, c8b_gio=g, gate_path=p)
+    h1_same = dict(json.load(open(p, encoding='utf-8')))                  # the H0 time file
+    with pytest.raises(rl.LogError, match='GC7-3'):
+        rl.so_h(d, row['run_uid'], rl.fake_score_final(folder, 3.0, h1=h1_same, name='sf_a.json'))
+    gh = dict(json.load(open(g, encoding='utf-8')), name='gio_a_h1')
+    gph = os.path.join(folder, 'gio_a_h1.json')
+    json.dump(gh, open(gph, 'w', encoding='utf-8'))
+    h1_task = dict(json.load(open(p, encoding='utf-8')), gio_sha256=rl.sha256_file(gph), task='O1-F08')
+    with pytest.raises(rl.LogError, match='GC7-3'):
+        rl.so_h(d, row['run_uid'], rl.fake_score_final(folder, 3.0, h1=h1_task, name='sf_b.json'))
+
+
+def test_gc6_14_a_fake_gate_is_no_c8_gate(ds):
+    d, gf, tmp = ds
+    with pytest.raises(rl.LogError, match='FAKE'):
+        rl.read_gate_file(str(tmp / 'gate_c8.json'))
+    assert rl.read_gate_file(str(tmp / 'gate_c8.json'), allow_fake=True).fake

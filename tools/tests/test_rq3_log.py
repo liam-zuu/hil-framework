@@ -23,6 +23,15 @@ OLD_HW = 'ngay,session_id,chien_dich,nen_tang,thu_hong,nguyen_nhan,gio_sua,ghi_c
 
 
 @pytest.fixture
+def no_moc(monkeypatch):
+    """C8b v3 §5 (CODE_GATE 18/11, design 03_CODE/docs/2026-11-18_Thiet_ke_rq3_u_moc_v4.md): a car run of a campaign
+    without its U / premise files is chua_ket_luan after rq3_log.apply_moc. The tests using this fixture check rules
+    written before §5 on car runs that have no such files, so the §5 rule is set aside here; it is tested, with
+    summary, freeze and s05_final_table, in test_rq3_u_moc.py."""
+    monkeypatch.setattr(rl, 'apply_moc', lambda tun, ds: tun)
+
+
+@pytest.fixture
 def ds(tmp_path, monkeypatch):
     (tmp_path / rl.TUNING).write_text(OLD_TUNING, encoding='utf-8')
     (tmp_path / rl.EFFORT).write_text(OLD_EFFORT, encoding='utf-8')
@@ -85,14 +94,15 @@ def end_(d, outcome, gate=None, **kw):
 def test_migrate_adds_columns_keeps_values_and_is_idempotent(ds):
     d, _ = ds
     before = {n: rows(os.path.join(d, n)) for n in (rl.TUNING, rl.EFFORT)}
-    assert rl.migrate(d) == {rl.TUNING: 'migrated', rl.EFFORT: 'migrated', rl.HWFAIL: 'ok'}
+    assert rl.migrate(d) == {rl.TUNING: 'migrated', rl.EFFORT: 'migrated', rl.HWFAIL: 'ok',
+                             rl.U_MOC: 'created', rl.TIEN_DE: 'created'}      # C8b v3 §5 (RC1-5)
     for n, cols in ((rl.TUNING, rl.TUNING_COLS), (rl.EFFORT, rl.EFFORT_COLS)):
         after = rows(os.path.join(d, n))
         assert list(after[0]) == cols and len(after) == len(before[n])
         for b, a in zip(before[n], after):
             assert all(a[k] == v for k, v in b.items())          # every old value kept
             assert all(a[k] == '' for k in cols if k not in b)
-    assert rl.migrate(d) == {rl.TUNING: 'ok', rl.EFFORT: 'ok', rl.HWFAIL: 'ok'}
+    assert rl.migrate(d) == {rl.TUNING: 'ok', rl.EFFORT: 'ok', rl.HWFAIL: 'ok', rl.U_MOC: 'ok', rl.TIEN_DE: 'ok'}
 
 
 def test_migrate_refuses_unknown_columns(ds):
@@ -176,10 +186,10 @@ def test_refusals(ds):
 def test_effort_past_midnight(ds):
     d, _ = ds
     rl.migrate(d)
-    assert rl.effort(d, '2026-11-20', '23:30', '00:15', khoan='T_H', ghi_chu='x')['gio'] == '0.75'
+    assert rl.effort(d, '2026-11-20', '23:30', '00:15', khoan='T_H', ghi_chu='x')['gio'] == '0.7500'   # RS1-2
 
 
-def test_summary_accounts_split_caps_and_finals(ds):
+def test_summary_accounts_split_caps_and_finals(ds, no_moc):
     d, clock = ds
     rl.migrate(d)
     # A-PID: 2 tune car runs of 600 s active, one final run 100 s, 1 h hoc, 1 h other work
@@ -254,7 +264,7 @@ def test_gate_result_rule_of_4_7(outs, gate, want):
     assert rl.gate_result(outs, gate) == want
 
 
-def test_finals_gate_replacement_and_final_hil_join(ds):
+def test_finals_gate_replacement_and_final_hil_join(ds, no_moc):
     d, clock = ds
     rl.migrate(d)
     rl.freeze(d, 'A-PID', 'het_ung_vien', 'A-PID/G7', gain_file(d))   # C9D-4: no confirm block here
@@ -300,7 +310,7 @@ def test_c9_dry_run_recomputes_summary(tmp_path):
     with open(out / rl.SUMMARY, newline='', encoding='utf-8') as f:
         written = list(csv.DictReader(f))
     assert [r['campaign'] for r in written] == list(rl.SUMMARY_ROWS)
-    again = rl.summary(str(out), gate_file=rl.read_gate_file(str(out / 'FAKE_gate_c8.json')))
+    again = rl.summary(str(out), gate_file=rl.read_gate_file(str(out / 'FAKE_gate_c8.json'), allow_fake=True))
     assert [{k: v for k, v in r.items()} for r in again] == rows1
     for w, r in zip(written, rows1):
         assert all(w[k] == r.get(k, '') for k in w)
@@ -521,7 +531,7 @@ def test_ea9_task_level_and_locked_gate_file(ds, tmp_path):
         with pytest.raises(rl.LogError, match='gate file'):
             rl.read_gate(str(gp))
     gp.write_text(json.dumps(good), encoding='utf-8')
-    levels, sha = rl.read_gate(str(gp))
+    levels, sha = rl.read_gate(str(gp), allow_fake=True)
     import hashlib
     assert levels == ['O1-F05', 'O1-F08'] and sha == hashlib.sha256(gp.read_bytes()).hexdigest()
 
