@@ -2208,6 +2208,17 @@ def test_round5_runs_of_the_plan_scored_once(tmp_path):
     d['thu_tu_clip']['sha256'] = GC.sha256_file(p)
     with pytest.raises(GC.GateFileError, match='mistyped'):
         GC.check_nguon(d, goc)
+    d, goc = build_c8(tmp_path / 'a2')                                # session 2: the still clip before a K run
+    p = os.path.join(goc, 'thu_tu_clip.csv')
+    with open(p, 'a', encoding='utf-8', newline='\n') as f:
+        f.write('IMG_3637,C8-P-K1-1_khoa,,,,,clip khoa K1\n')
+    d['thu_tu_clip']['sha256'] = GC.sha256_file(p)
+    GC.check_nguon(d, goc)                                            # no run: neither a cell nor a K run
+    with open(p, 'a', encoding='utf-8', newline='\n') as f:
+        f.write('IMG_x,C8-P-F05-1_khoa,,,,,\n')                      # _khoa of a figure-8 code: no such clip
+    d['thu_tu_clip']['sha256'] = GC.sha256_file(p)
+    with pytest.raises(GC.GateFileError, match='mistyped'):
+        GC.check_nguon(d, goc)
     d, goc = build_c8(tmp_path / 'b')                                 # a copy with the same bytes is the same scoring
     x = d['o_c8'][0]['chuoi'][0]
     os.makedirs(os.path.join(goc, 'ban_sao'))

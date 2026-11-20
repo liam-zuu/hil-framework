@@ -102,9 +102,12 @@ TOP_KEYS = ('format', 'levels', 'muc_kha_thi', 'muc_bo_theo_liam', 'quyet_liam',
             'bo_cham', 'ke_hoach_c8', 'thu_tu_clip', 'khoa_c8b', 'o_c8', 'chuan_u', 'tien_de_c8', 'runs_c8',
             'muc_loai_e_do', 'chung_cu_muc', 'dieu_2b', 'camera', 'luot_k')
 THU_TU_COLS = ('clip', 'buoc', 'log_pi')                # F18 (1): thu_tu_clip.csv (C8 plan v1 line 87; CODE 19/11)
-RUN_CODE = re.compile(r'^C8-[PL]-(F02|F05|F08)-\d+$')
-RUN_CODE_K = re.compile(r'^C8-[PL]-(K1|K2)-\d+(_lai\d+)?$')   # GC9-2 (CODE 20/11): the K runs of C8, held out too    # a figure-8 run code of the session guide (cells of rule 2b);
+RUN_CODE = re.compile(r'^C8-[PL]-(F02|F05|F08)-\d+$')    # a figure-8 run code of the session guide (cells of rule 2b);
 # rows of clips H (H_*) and calibration runs (HC_*) are not runs of a cell
+RUN_CODE_K = re.compile(r'^C8-[PL]-(K1|K2)-\d+(_lai\d+)?$')   # GC9-2 (CODE 20/11): the K runs of C8, held out too
+# C8 session 2 (20/11, thu_tu_clip.csv of CAM): the still clip before a K run (car parked at the K start) is written
+# <K run code>_khoa; it is no run (no log, no scoring), so neither a cell nor a K run of the gate
+CLIP_KHOA_K = re.compile(r'^C8-[PL]-(K1|K2)-\d+_khoa$')
 KHOA_FORMAT = 'c8b_khoa_v5'                              # F18 (4): the C8b lock written before the held-out parts
 CTRL_LOG = {'PID': 'PID', 'LADRC': 'ADRC'}               # the '#gain ... ctrl=' name of the logger (c8b_gio controller)
 SESSION_KIND = 'c7_session'                              # a camera session file (c7_measure calibrate)
@@ -1591,7 +1594,7 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
         elif RUN_CODE.match(b):
             raise GateFileError(f'thu_tu_clip row {i + 2}: run {b!r} (clip {r.get("clip")!r}) is no cell of the plan '
                                 '(a figure-8 run outside the locked list)')
-        elif full.startswith('C8-') and not RUN_CODE_K.match(full):
+        elif full.startswith('C8-') and not RUN_CODE_K.match(full) and not CLIP_KHOA_K.match(full):
             # CODE 20/11 (the luot_c8 check of c8b_u cong, C8BU4-R1-3, now here): a mistyped run code would drop a run
             raise GateFileError(f'thu_tu_clip row {i + 2}: buoc {full!r} (clip {r.get("clip")!r}) reads as a C8 run '
                                 'code but is neither a run of the plan (or its _lai<n>) nor a K run: a mistyped code '
