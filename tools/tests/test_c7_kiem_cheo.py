@@ -2603,3 +2603,74 @@ def test_e_hieu_iii_refuses_other_dets(tmp_path, scene):
     d['sha256'] = kc.doan_body_sha(d)
     dop.write_text(json.dumps(d), encoding='utf-8')
     assert kc.main(['e_hieu', '--kiem-cheo', str(kcp), '--doan', str(dop), '--out', str(tmp_path / 'e.json')]) == 2
+
+
+# ---------------------------------------------------------------- camera segments (Liam 20/11 "Theo doan, bo H giua")
+def _doan(k, u, t, cuoi=True):
+    """Make the tien_de fixture a camera segment: no H_m (session, kiem_h, plan); without cuoi no H_z either."""
+    co = ['H_a', 'H_b'] + (['H_z'] if cuoi else [])
+    k['doan'] = dict(ten='doan2', vai_tro_co=co, vai_tro_vang=[n for n in kc.CLIPS_REQUIRED if n not in co])
+    for n in kc.CLIPS_REQUIRED:
+        if n not in co:
+            k['sessions'].pop(n)
+            k['kiem_h'].pop(n)
+    t['ke_hoach']['su_kien'] = ['H_a', 'H_b', 'R1', 'R2'] + (['H_z'] if cuoi else [])
+
+
+def test_segment_plan_order_and_roles():
+    seg = ('H_a', 'H_b', 'H_z')
+    assert kc.plan_order_problems(['H_a', 'H_b', 'R1', 'R2', 'H_z'], seg) == []
+    assert kc.plan_order_problems(['H_a', 'H_b', 'R1', 'H_m', 'R2', 'H_z'], seg) == ['H_m khong thuoc doan']
+    assert kc.plan_order_problems(['H_a', 'H_b', 'R1', 'H_z', 'R2'], seg) == ['H_z khong o cuoi']
+    assert kc.plan_order_problems(['H_a', 'H_b', 'R1'], ('H_a', 'H_b')) == []
+    assert kc.vai_tro({}) == kc.CLIPS_REQUIRED and kc.vai_tro(dict(doan=dict(vai_tro_co=['H_b', 'H_a']))) == ('H_a', 'H_b')
+
+
+def test_segment_tien_de_dat_without_H_m_and_three_roles(monkeypatch):
+    monkeypatch.setattr(kc, 'ID_KHOA', tuple(ALL8))                     # the 8-mark fixture
+    """A segment with H_a, H_b, H_z: dat, roles dau1, dau2, cuoi only, the limit written; the H_z comparison still
+    needed for every locked mark."""
+    r = _td_full(lambda k, u, t: _doan(k, u, t))
+    assert r['ket_qua'] == 'dat' and r['vai_tro_clip_h'] == dict(H_a='dau1', H_b='dau2', H_z='cuoi')
+    assert set(r['clip_h']) == {'H_a', 'H_b', 'H_z'} and kc.DOAN_GIOI_HAN in r['gioi_han'] and r['doan']['ten'] == 'doan2'
+    r = _td_full(lambda k, u, t: (_doan(k, u, t), k['theo_thoi_gian']['H_z']['rieng_m'].pop('3')))
+    assert r['ket_qua'] == 'thieu_du_lieu' and any(w.startswith('so_H_z_thieu') for w in r['ly_do'])
+
+
+def test_segment_without_end_clip_is_missing_data(monkeypatch):
+    monkeypatch.setattr(kc, 'ID_KHOA', tuple(ALL8))                     # the 8-mark fixture
+    r = _td_full(lambda k, u, t: _doan(k, u, t, cuoi=False))
+    assert r['ket_qua'] == 'thieu_du_lieu' and 'khong_co_clip_kiem_troi' in r['ly_do']
+    assert kc.DOAN_KHONG_CUOI in r['gioi_han'] and set(r['vai_tro_clip_h']) == {'H_a', 'H_b'}
+
+
+def test_phan_tich_segment_clips(tmp_path, scene, monkeypatch):
+    """--doan: H_a, H_b, H_z without H_m runs and records the segment; --doan with H_m, --khong-H-cuoi with H_z,
+    --khong-H-cuoi without --doan, and a missing H_z without --khong-H-cuoi: code 2."""
+    marks, cam, img = scene
+    monkeypatch.setattr(kc, 'clip_dets', lambda v, ids, max_frames=None: ([k / 60 for k in range(20)], [img] * 20))
+    base = _phan_tich_args(tmp_path, scene)
+
+    def drop(args, n):
+        out, k = [], 0
+        while k < len(args):
+            if args[k] in (f'--H-{n}', f'--video-{n}'):
+                k += 2
+                continue
+            out.append(args[k])
+            k += 1
+        return out
+    no_m = drop(base, 'm')
+    assert kc.main(no_m + ['--doan', 'doan2']) == 0
+    r = json.loads((tmp_path / 'kc' / 'kiem_cheo.json').read_text(encoding='utf-8'))
+    assert r['doan']['vai_tro_co'] == ['H_a', 'H_b', 'H_z'] and set(r['sessions']) == {'H_a', 'H_b', 'H_z'}
+    for k_, bad in enumerate([base + ['--doan', 'd'], no_m + ['--doan', 'd', '--khong-H-cuoi'],
+                              drop(no_m, 'z') + ['--khong-H-cuoi'], drop(no_m, 'z') + ['--doan', 'd']]):
+        out = tmp_path / f'o{k_}'
+        bad = [str(out) if x == str(tmp_path / 'kc') else x for x in bad]
+        assert kc.main(bad) == 2 and not (out / 'kiem_cheo.json').exists()
+    one = tmp_path / 'd1'
+    args = [str(one) if x == str(tmp_path / 'kc') else x for x in drop(no_m, 'z')]
+    assert kc.main(args + ['--doan', 'doan1', '--khong-H-cuoi']) == 0
+    r1 = json.loads((one / 'kiem_cheo.json').read_text(encoding='utf-8'))
+    assert r1['doan']['vai_tro_vang'] == ['H_m', 'H_z'] and kc.DOAN_KHONG_CUOI in r1['doan']['gioi_han']

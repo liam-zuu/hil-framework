@@ -112,6 +112,22 @@ COVER_MAX_GAP_S = 1.0                        #   and no gap without check longer
 N_SMALL_SETS = 3                             # per group: the smallest run mark sets also get the window term
 KIEM_H_MIN = 0.95                            # [DE XUAT] design v3 7 (KC2-2): share of frames with every mark at once
 CLIPS_REQUIRED = ('H_a', 'H_b', 'H_m', 'H_z')  # design v2 7: two at the start, one mid-session, one after the last run
+# Camera segments (Liam 20/11/2026 at CODE_KIEMCHEO local_599d3188, choice box, verbatim: "Theo doan, bo H giua
+# (Recommended)"): a session whose iPhone was taken off and put back is checked per camera SEGMENT (phan_tich --doan):
+# the two clips H at the start of the segment are H_a, H_b, the clip H after the last run of the segment is H_z (the
+# drift check), no H_m (a drift that happens and comes back inside the segment is not seen: limit); a segment without
+# an end clip (--khong-H-cuoi) has no drift check at all (limit 'khong co H cuoi').
+DOAN_GIOI_HAN = ('doan camera (Liam 20/11 "Theo doan, bo H giua"): khong co clip H giua; troi xay ra roi tu ve giua '
+                 'doan khong thay')
+DOAN_KHONG_CUOI = 'doan camera khong co H cuoi: khong kiem troi trong doan'
+
+
+def vai_tro(kc):
+    """Roles of the clips H a kiem_cheo result must have: the four of design v2 7, or those of its camera segment."""
+    d = (kc or {}).get('doan')
+    if not d:
+        return CLIPS_REQUIRED
+    return tuple(n for n in CLIPS_REQUIRED if n in (d.get('vai_tro_co') or ()))
 GROUPS = 4                                   # [DE XUAT] CODE_CAM design 2: ids[k::4]
 MIN_TRAIN = 4                                # 4 marks = 16 points: pose determined (as c7_measure.track)
 # blocks of c8_cam_u_vao_v2 and the numbers c8b_u.u_p_u_psi reads (CODE_C8B 18/11); other keys in a block are
@@ -1524,20 +1540,23 @@ def read_plan_sha(path):
     return ev, runs, hashlib.sha256(b).hexdigest()
 
 
-def plan_order_problems(ev):
+def plan_order_problems(ev, roles=CLIPS_REQUIRED):
     """TD1-3, TD2-2: the declared order must be H_a, H_b first and in a row, H_m with at least one run before and
     after it, H_z last. Returns the list of problems (empty = right shape); the real filming order is not checked
-    (limit (e))."""
-    p = [f'thieu {n}' for n in CLIPS_REQUIRED if n not in ev]
+    (limit (e)). roles: the clips H of the result (vai_tro: a camera segment has no H_m); a clip H of another role in
+    the plan is a problem too."""
+    p = [f'thieu {n}' for n in roles if n not in ev]
+    p += [f'{n} khong thuoc doan' for n in CLIPS_REQUIRED if n in ev and n not in roles]
     if p:
         return p
     if ev[:2] != ['H_a', 'H_b']:
         p.append('H_a, H_b khong lien nhau o dau')
-    if ev[-1] != 'H_z':
+    if 'H_z' in roles and ev[-1] != 'H_z':
         p.append('H_z khong o cuoi')
-    k = ev.index('H_m')
-    if not any(s not in CLIPS_REQUIRED for s in ev[:k]) or not any(s not in CLIPS_REQUIRED for s in ev[k + 1:]):
-        p.append('H_m khong o giua cac luot')
+    if 'H_m' in roles:
+        k = ev.index('H_m')
+        if not any(s not in CLIPS_REQUIRED for s in ev[:k]) or not any(s not in CLIPS_REQUIRED for s in ev[k + 1:]):
+            p.append('H_m khong o giua cac luot')
     return p
 
 
@@ -2241,9 +2260,22 @@ def phan_tich(a):
     clips_in = {'H_a': (a.H_a, a.video_a), 'H_b': (a.H_b, a.video_b), 'H_m': (a.H_m, a.video_m),
                 'H_z': (a.H_z, a.video_z)}
     clips_in = {n: v for n, v in clips_in.items() if v[0]}
-    missing = [n for n in CLIPS_REQUIRED if n not in clips_in]
+    doan = None
+    if getattr(a, 'doan', None):                     # camera segment (Liam 20/11 "Theo doan, bo H giua")
+        if a.H_m:
+            raise KCError('--doan: a camera segment has no H_m (Liam 20/11 "Theo doan, bo H giua")')
+        if a.khong_H_cuoi and a.H_z:
+            raise KCError('--doan --khong-H-cuoi with --H-z')
+        co = ['H_a', 'H_b'] + ([] if a.khong_H_cuoi else ['H_z'])
+        doan = dict(ten=a.doan, vai_tro_co=co, vai_tro_vang=[n for n in CLIPS_REQUIRED if n not in co],
+                    nguon='Liam 20/11, CODE_KIEMCHEO local_599d3188, hop chon: "Theo doan, bo H giua (Recommended)"',
+                    gioi_han=[DOAN_GIOI_HAN] + ([DOAN_KHONG_CUOI] if a.khong_H_cuoi else []))
+    elif getattr(a, 'khong_H_cuoi', False):
+        raise KCError('--khong-H-cuoi only with --doan')
+    need = vai_tro(dict(doan=doan))
+    missing = [n for n in need if n not in clips_in]
     if missing and not a.thu:
-        raise KCError(f'clips H missing: {missing} (design v2 7: H_a, H_b, H_m, H_z)')
+        raise KCError(f'clips H missing: {missing} (design v2 7: H_a, H_b, H_m, H_z; segment: {list(need)})')
     clips, raw, ses_sha = {}, {}, {}
     for name, (p, _) in clips_in.items():
         raw[name], ses_sha[name] = load_json_sha(p)            # KCJ1-6: the sha of the bytes used
@@ -2367,7 +2399,7 @@ def phan_tich(a):
     common = dict(buoi=a.buoi, model=a.model, nhom=groups, sessions=sess, thu=bool(a.thu),
                   moc=[dict(file=os.path.abspath(p), sha256=sha256_file(p)) for p in a.moc or ()],
                   hang_so_sha256=sha256_file(a.hang_so) if a.hang_so else None)
-    res = dict(version=VERSION, **common, L_max_m=a.L_max, id_khoa=ids_a, hang_so_s7=hang_so_s7,
+    res = dict(version=VERSION, **common, doan=doan, L_max_m=a.L_max, id_khoa=ids_a, hang_so_s7=hang_so_s7,
                commit_hil=ch, khoa_s7=khoa, **s7,
                A3=dict(A3, buoi=a.buoi),
                P1=dict(bo_nhom_max_m=worst[2], tung_khung_max_m=None, max_clip=worst[0], max_id=worst[1], buoi=a.buoi,
@@ -2458,7 +2490,7 @@ def check_compat(kc, tk):
     refused here, graded in tien_de)."""
     if kc.get('thu'):
         raise KCError('kiem_cheo result made with --thu: not exported')
-    miss = [n for n in CLIPS_REQUIRED if n not in (kc.get('sessions') or {})]
+    miss = [n for n in vai_tro(kc) if n not in (kc.get('sessions') or {})]
     if miss:
         raise KCError(f'kiem_cheo result without clips {miss}')
     check_ident(kc, tk)
@@ -2584,9 +2616,12 @@ def tien_de_eval(kc, us, tk, sha_kc, sha_us, sha_tk):
             worst = level
     if kc.get('thu'):
         bad('thieu_du_lieu', 'thu')
-    for n in CLIPS_REQUIRED:
+    roles = vai_tro(kc)
+    for n in roles:
         if n not in sess:
             bad('thieu_du_lieu', f'thieu_clip:{n}')
+    if not any(n in sess for n in ('H_m', 'H_z')):                  # camera segment without an end clip
+        bad('thieu_du_lieu', 'khong_co_clip_kiem_troi')
     for n, r in (kc.get('kiem_h') or {}).items():
         v = r.get('ti_le_cung_luc')                 # KCJ1-2: NaN, inf, missing or not a number fails too
         if not _fin01(v) or not v >= KIEM_H_MIN:
@@ -2624,7 +2659,7 @@ def tien_de_eval(kc, us, tk, sha_kc, sha_us, sha_tk):
     if tk is None:
         bad('thieu_du_lieu', 'khong_co_tung_khung')
     else:
-        for p in plan_order_problems(tk['ke_hoach'].get('su_kien') or []):
+        for p in plan_order_problems(tk['ke_hoach'].get('su_kien') or [], roles):
             bad('thieu_du_lieu', f'ke_hoach:{p}')
         for rid in tk.get('luot_chua_co') or []:
             bad('thieu_du_lieu', f'luot_chua_co:{rid}')
@@ -2644,7 +2679,7 @@ def tien_de_eval(kc, us, tk, sha_kc, sha_us, sha_tk):
     num_ok = xe is not None and not khong and set(chains) == need_c
     clip_h = {n: (dict(session=sess[n]['file'], sha256=sess[n]['sha256'], video=sess[n].get('video'),
                        video_sha256=sess[n].get('video_sha256'), kiem_h=(kc.get('kiem_h') or {}).get(n))
-                  if n in sess else None) for n in CLIPS_REQUIRED}
+                  if n in sess else None) for n in roles}
     sha = dict(u_so=sha_us, kiem_cheo=sha_kc, tung_khung=sha_tk,
                ke_hoach=None if tk is None else tk['ke_hoach']['sha256'],
                sessions={n: s['sha256'] for n, s in sess.items()},
@@ -2658,7 +2693,9 @@ def tien_de_eval(kc, us, tk, sha_kc, sha_us, sha_tk):
                                     nguong_tho_m=v['nguong_tho_m']) for c, v in chains.items()} if num_ok else None,
                 tap_neo={c: v.get('tap_tinh', []) for c, v in chains.items()}, clip_h=clip_h, luot=luot,
                 luot_thieu_kiem=thieu_kiem, mau_thuan=mau, model=kc.get('model'), nhom=kc.get('nhom'), sha256=sha,
-                vai_tro_clip_h=dict(H_a='dau1', H_b='dau2', H_m='giua', H_z='cuoi'),    # F18 (GATE GC6-4)
+                vai_tro_clip_h={n: r for n, r in (('H_a', 'dau1'), ('H_b', 'dau2'), ('H_m', 'giua'), ('H_z', 'cuoi'))
+                                if n in roles},                                   # F18 (GATE GC6-4); segment: no giua
+                doan=kc.get('doan'),
                 h1_ho_tro=False, version_cong_cu=VERSION,
                 dung_cho=('buoi ke thua U: ket_qua != dat -> moi luot ca buoi chua ket luan (J v6 §5); buoi C8: '
                           'ket_qua = dat la dieu kien khoa C8 (J v6 §5 J3-5), khong la ket qua luot'),
@@ -2669,7 +2706,9 @@ def tien_de_eval(kc, us, tk, sha_kc, sha_us, sha_tk):
                           '(e) thu tu clip H / luot la khai bao cua nguoi chay (ke hoach), khong kiem bang gio quay',
                           '(f) kiem nguon nhat quan va cung dinh danh buoi, khong chung minh nguon thuoc dung buoi vat ly',
                           '(g) C33-12 (tu choi track thu, cham_lai 2 moi luot, lich_sha256, ket_luan) chua co: ban nay '
-                          'khong dung cho buoi that (thiet ke v6 S8-3)'])
+                          'khong dung cho buoi that (thiet ke v6 S8-3)']
+                + ([DOAN_GIOI_HAN] if kc.get('doan') else [])
+                + ([DOAN_KHONG_CUOI] if kc.get('doan') and 'H_z' not in roles else []))
 
 
 def tien_de(a):
@@ -2981,6 +3020,10 @@ def main(argv=None):
                    help='goc|K1|K2=X,Y start point of the place (floor m, from the plan; S7, design v6 S8-4)')
     p.add_argument('--plumb', help='X,Y plumb point of car_pose (the scoring one, L125), needed with --xuat-phat')
     p.add_argument('--khoa-s7', dest='khoa_s7', help='c7_khoa_s7_v1 manifest committed before the run (KCJ1-14)')
+    p.add_argument('--doan', help='camera segment name (Liam 20/11 "Theo doan, bo H giua"): clips H_a, H_b, H_z of the '
+                   'segment, no H_m')
+    p.add_argument('--khong-H-cuoi', dest='khong_H_cuoi', action='store_true',
+                   help='with --doan: the segment has no clip H after its last run (no drift check; limit)')
     p.add_argument('--out', required=True)
     x = sub.add_parser('xuat')
     x.add_argument('--buoi', required=True)
