@@ -132,12 +132,24 @@ def result(d, cho, psi_cuc=0.0, extra=()):
     return ca.place_result(cho, ans, os.path.basename(d), e_hieu=E(0.0), q=[0.0, 0.0], du_m=0.0, neo=0.0, psi_cuc=psi_cuc)
 
 
-def test_camera_heading_drift_inside_index_or_flagged(tmp_path):
+def test_camera_heading_drift_needs_floor_referenced_frames(tmp_path):
+    """HCB4: a_l takes its heading from the camera only, and the dynamic check is anchored on the two leg ends, so a
+    camera heading that drifts in time (the camera turning on its mount) is NOT seen by the checks: it is excluded
+    at the source, the frames must be referenced to the floor marks (camera pose refitted: c7_measure track per
+    frame, c8_hc_video every second). Frames without that never give a locked result."""
     d, truth = make(tmp_path, 'HC_K2_1', cho='K2', cam_bias=lambda t: math.radians(0.010) * max(t, 0.0),
                     noise_psi_deg=0.02)
-    r = result(d, 'K2')
-    err = abs(math.radians(r['a_k_deg']) - truth['a_true'])
-    assert err <= math.radians(r['u_a_k_deg']) or r['trang_thai'] == 'chua_ket_luan'
+    A = ca.load_attempt(d)
+    ck, info = ca.kiem(A)
+    F = dict(frames(d), neo_san=False)
+    an = ca.analyse(A, F, info)
+    assert an['neo_san'] is False and analyse(d)['neo_san'] is True
+    r = ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.0, 0.0], du_m=0.0, neo=0.0, psi_cuc=0.0)
+    assert any('khong neo moc san' in w for w in r['ly_do']) and r['trang_thai'] != 'khoa'
+    ok, vk = video(d, F)
+    assert not ok['neo_moc_san']
+    ok, vk = video(d, frames(d))
+    assert ok['neo_moc_san']
 
 
 def test_rv_frozen_with_body_wiggle_inside_index_or_flagged(tmp_path):
@@ -174,9 +186,10 @@ def test_max_over_every_attempt(tmp_path):
 
 
 def test_spread_gate(tmp_path):
-    # one long leg with a camera heading step of 0.4 deg at its start window: spread > 0.3 deg -> chua_ket_luan
+    # the camera heading of one long leg off by 0.45 deg over its whole motion (K1, second long leg 20.3-25.7 s):
+    # that a_l moves by the path mean of the bias, spread > 0.3 deg -> chua_ket_luan
     def bias(t):
-        return math.radians(0.4) if 16.0 < t < 21.0 else 0.0
+        return math.radians(0.45) if 20.0 < t < 26.0 else 0.0
     d, _ = make(tmp_path, cho='K1', cam_bias=bias, noise_psi_deg=0.02)
     r = result(d, 'K1')
     assert not r['cong']['do_tan'] and r['trang_thai'] == 'chua_ket_luan'
@@ -1398,35 +1411,91 @@ def test_ramp_bound_pays_only_its_own_staleness(tmp_path):
 
 
 # ------------------------------------------------------------------ HCB3 (CODE 20/11): IMU drift in yaw_dong
-def test_imu_drift_taken_off_dynamic_yaw(tmp_path):
-    """HCB3 (session 2 K1/K2: IMU yaw drifting 0.03-0.05 deg/s, encoder agreeing with the camera): a linear IMU drift
-    of 0.08 deg/s gave raw eps > 0.30 deg; the line fitted against the encoder heading on the stop windows (two
-    ends of the leg left out) takes it off, the gate passes and a stays inside u_a."""
+def test_hcb4_imu_drift_does_not_touch_a(tmp_path):
+    """Session 2 K1/K2: the IMU yaw drifted 0.03-0.05 deg/s against the camera. HCB4: a_l uses the camera heading
+    and the dynamic check takes off the straight line through the two end windows of the leg: a drift of 0.08 deg/s
+    changes neither a_l nor the gate; the camera - IMU change between the leg ends is reported (diagnostic)."""
     d, truth = make(tmp_path, 'HC_K2_1', cho='K2', yaw_bias=lambda t: math.radians(0.08) * t, noise_psi_deg=0.02)
-    an = analyse(d)
-    longs = [lg for lg in an['legs'] if lg['dai']]
-    assert max(lg['eps_tho'] for lg in longs) > math.radians(ca.EPS_YAW_MAX_DEG)
+    d0, _ = make(tmp_path, 'HC_K2_0', cho='K2', noise_psi_deg=0.02)
+    an, an0 = analyse(d), analyse(d0)
+    longs, longs0 = [lg for lg in an['legs'] if lg['dai']], [lg for lg in an0['legs'] if lg['dai']]
+    assert all(x['a_l'] == pytest.approx(y['a_l'], abs=1e-12) for x, y in zip(longs, longs0))
     assert max(lg['eps'] for lg in longs) < math.radians(0.1)
-    assert all(lg['troi']['n_cua_so'] == 5 and abs(lg['troi']['toc_do_deg_s'] - 0.08) < 0.005 for lg in longs)
-    assert abs(an['troi_imu']['toc_do_deg_s'] - 0.08) < 0.005 and an['troi_imu']['n_cua_so'] == 7
+    assert all(abs(lg['cam_imu']) > math.radians(0.5) for lg in longs)          # ~0.08 deg/s x ~9.4 s
+    assert max(abs(lg['cam_imu']) for lg in longs0) < math.radians(0.05)
+    assert abs(an['troi_imu']['toc_do_deg_s'] - 0.08) < 0.005
     r = result(d, 'K2')
-    assert r['cong']['yaw_dong'] and r['troi_imu']['u_troi_max_deg'] is not None, r['cong']
+    assert r['cong']['yaw_dong'] and all(r['cong'].values())
+    assert len(r['troi_imu']['cam_imu_hai_dau_deg']) == 4
     assert abs(math.radians(r['a_k_deg']) - truth['a_true']) <= math.radians(r['u_a_k_deg'])
 
 
-def test_camera_drift_not_taken_as_imu_drift(tmp_path):
-    """HCB3 cach A: a camera heading drift (mount) of 0.05 deg/s is seen against the encoder (> 2 SE): no
-    correction, the raw check stays (eps large, gate fails or u_yaw covers it), the reason is written."""
-    d, truth = make(tmp_path, 'HC_K2_1', cho='K2', cam_bias=lambda t: math.radians(0.05) * max(t, 0.0),
-                    noise_psi_deg=0.02)
+def test_hcb4_diagonal_creep_is_compensated(tmp_path):
+    """HCB4 (session 2 20/11; Liam 20/11 "Duyet cach sua (Recommended)"): the real car creeps sigma*|dx|*(-1, +1)
+    in the body frame (the FL-RR diagonal), forwards and backwards alike; the encoders do not see it. Raw: the
+    backward legs read a + sigma, the forward ones a - sigma (spread 2 sigma > 0.30 deg), the length ratio differs
+    by 2 sigma and the stops walk sideways. Compensated: sigma is recovered from the length ratio alone, the gates
+    pass, a (mean of the RAW legs) does not move, and the largest deviation of u_a still carries the raw split."""
+    sig = 0.003
+    d, truth = make(tmp_path, 'HC_K2_1', cho='K2', sigma=sig, noise_psi_deg=0.02)
     an = analyse(d)
     longs = [lg for lg in an['legs'] if lg['dai']]
-    assert all(lg['troi'].get('ly_do') == 'camera_troi_so_encoder' for lg in longs)
-    assert all(lg['eps'] == lg['eps_tho'] for lg in longs) and max(lg['eps'] for lg in longs) > math.radians(0.2)
+    assert an['truot_cheo']['sigma'] == pytest.approx(sig, abs=2e-4)
+    assert an['thang_hang_m']['tho'] > 2 * an['thang_hang_m']['bu']
+    for lg in longs:
+        want = truth['a_true'] + (sig if lg['chieu'] == 'lui' else -sig)
+        assert lg['a_l_tho'] == pytest.approx(want, abs=math.radians(0.03))
+        assert lg['a_l'] == pytest.approx(truth['a_true'], abs=math.radians(0.03))
+        assert lg['ti_le_tho'] == pytest.approx(1 + (sig if lg['chieu'] == 'lui' else -sig), abs=3e-4)
+        assert lg['ti_le'] == pytest.approx(1.0, abs=3e-4)
+    shorts = [lg for lg in an['legs'] if not lg['dai']]      # the held-out legs get the same ratio (creep ~ distance)
+    assert all(lg['a_l'] == pytest.approx(truth['a_true'], abs=math.radians(0.12)) for lg in shorts)
     r = result(d, 'K2')
-    assert 'camera_troi_so_encoder' in r['ly_do'] and r['trang_thai'] != 'khoa'
-    err = abs(math.radians(r['a_k_deg']) - truth['a_true'])
-    assert err <= math.radians(r['u_a_k_deg']) or r['trang_thai'] == 'chua_ket_luan'
+    assert all(r['cong'].values()), r['cong']
+    assert r['do_tan_tho_deg'] > 0.30 > r['do_tan_deg'] and r['truot_cheo']['sigma'] == pytest.approx(sig, abs=2e-4)
+    assert r['thang_hang_mm']['bu'] < r['thang_hang_mm']['tho']
+    assert abs(math.radians(r['a_k_deg']) - truth['a_true']) < math.radians(0.02)
+    assert r['u_hang_deg']['lech_lon_nhat'] >= math.degrees(sig) - 0.03      # the compensation is counted as uncertain
+    leg = [x for x in r['luot_thu'][0]['doan'] if x['dai']][0]
+    assert {'a_l_deg', 'a_l_tho_deg', 'ti_le', 'ti_le_tho', 'eps_deg', 'eps_tb_deg', 'cam_imu_deg'} <= set(leg)
+    longs[0]['ti_le_tho'] = 1.03                              # the range of ti_le still covers the RAW ratio
+    assert not ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.0, 0.0], du_m=0.0, neo=0.0,
+                               psi_cuc=0.0)['cong']['ti_le']
+    # goc (1 m legs): the creep walks the seven stops 7.5 mm off their line; with the predicted drift taken off
+    # they are straight again (session 2 goc: 5.6 / 4.2 mm measured, 1.7 / 2.1 mm after)
+    dg_, truth_g = make(tmp_path, 'HC_goc_1', cho='goc', sigma=sig, noise_psi_deg=0.02)
+    rg = result(dg_, 'goc')
+    assert rg['thang_hang_mm']['tho'] > 5.0 > 1.0 > rg['thang_hang_mm']['bu'] and all(rg['cong'].values()), rg['cong']
+    d0, _ = make(tmp_path, 'HC_K2_2', cho='K2', noise_psi_deg=0.02)
+    an0 = analyse(d0)
+    assert abs(an0['truot_cheo']['sigma']) < 2e-4            # nothing to compensate: nothing changes
+    assert all(abs(lg['a_l'] - lg['a_l_tho']) < math.radians(0.015) for lg in an0['legs'] if lg['dai'])
+
+
+def test_hcb4_lateral_asymmetry_off_the_diagonal_still_fails(tmp_path):
+    """The compensation is not a forward-backward equaliser: an even drift that is LATERAL only (not on the FL-RR
+    diagonal, so the length ratio does not show it) keeps its spread and the gate fails."""
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2', lech_ngang=0.004, noise_psi_deg=0.02)
+    an = analyse(d)
+    assert abs(an['truot_cheo']['sigma']) < 3e-4
+    r = result(d, 'K2')
+    assert r['do_tan_deg'] > 0.40 and not r['cong']['do_tan'] and r['trang_thai'] == 'chua_ket_luan'
+
+
+def test_hcb4_one_direction_missing_is_not_compensated(tmp_path):
+    """sigma needs a long leg in each direction; without one the legs stay raw and the reason is written."""
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2', sigma=0.003, noise_psi_deg=0.02)
+    an = analyse(d)
+    legs = [dict(lg) for lg in an['legs']]
+    for lg in legs:
+        lg['a_l'], lg['ti_le'] = lg['a_l_tho'], lg['ti_le_tho']
+        if lg['dai'] and lg['chieu'] == 'toi':
+            lg['trang_thai'] = 'thieu'
+    tc = ca.slip_compensate(legs)
+    assert tc['sigma'] is None and '0 toi' in tc['ly_do']
+    assert all(lg['a_l'] == lg['a_l_tho'] for lg in legs)
+    th = ca.stops_straightness(an['windows'], legs, None)
+    assert th['bu'] == th['tho']
 
 
 def test_imu_drift_fit_needs_windows_and_leaves_out_leg_ends():
@@ -1448,17 +1517,18 @@ def test_imu_drift_fit_needs_windows_and_leaves_out_leg_ends():
     assert ca.imu_drift_fit(W2, L)['n'] == 4
 
 
-def test_u_yaw_adds_largest_drift_term(tmp_path):
-    """HCB3 cach A: u_yaw carries the largest per-leg drift term (2 SE + |camera-encoder slope|) x half leg + the
-    residual of the windows the line did not use; a leg without enough windows keeps the raw check and says so."""
-    d, _ = make(tmp_path, 'HC_K2_1', cho='K2', yaw_bias=lambda t: math.radians(0.03) * t, noise_psi_deg=0.02)
-    an = analyse(d)
-    r0 = ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.0, 0.0], du_m=0.0, neo=0.0, psi_cuc=0.0)
-    longs = [lg for lg in an['legs'] if lg['dai']]
-    assert all('u_troi_deg' in lg['troi'] for lg in longs), [lg['troi'] for lg in longs]
-    longs[1]['troi'] = dict(longs[1]['troi'], u_troi_deg=0.5)
-    r1 = ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.0, 0.0], du_m=0.0, neo=0.0, psi_cuc=0.0)
-    assert r1['u_hang_deg']['u_yaw'] >= 0.5 > r0['u_hang_deg']['u_yaw'] and r1['troi_imu']['u_troi_max_deg'] == 0.5
-    longs[2]['troi'] = dict(ly_do='thieu_cua_so_troi')
-    r2 = ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.0, 0.0], du_m=0.0, neo=0.0, psi_cuc=0.0)
-    assert 'thieu_cua_so_troi' in r2['ly_do'] and r2['trang_thai'] != 'khoa'
+def test_hcb4_u_yaw_is_the_path_mean_of_camera_minus_imu(tmp_path):
+    """HCB4: a camera heading error in motion turns C by its path-weighted mean. A camera - IMU difference of
+    0.2 deg over the moving part of the first long leg (K2, 9.9-15.3 s): eps (largest) ~0.2 deg < 0.30 passes the
+    gate, u_yaw (path mean) is most of it, and a stays inside u_a; without the bias u_yaw is ~0."""
+    d, truth = make(tmp_path, 'HC_K2_1', cho='K2', noise_psi_deg=0.02,
+                    cam_bias=lambda t: math.radians(0.20) if 10.3 <= t <= 15.2 else 0.0)
+    r = result(d, 'K2')
+    assert r['cong']['yaw_dong'] and 0.12 <= r['u_hang_deg']['u_yaw'] <= 0.21, r['u_hang_deg']
+    eps_max = max(x['eps_deg'] for x in r['luot_thu'][0]['doan'] if x['dai'])
+    assert r['u_hang_deg']['u_yaw'] < eps_max - 0.005 < 0.30         # the path mean, not the largest value
+    assert abs(math.radians(r['a_k_deg']) - truth['a_true']) <= math.radians(r['u_a_k_deg'])
+    d0, _ = make(tmp_path, 'HC_K2_0', cho='K2', noise_psi_deg=0.02)
+    assert result(d0, 'K2')['u_hang_deg']['u_yaw'] < 0.02
+
+

@@ -10,6 +10,14 @@ mean of the four long legs; u_a = largest |a_l - a| over every long leg of every
 (+ the conservative terms of the design: encoder, q, yaw inside the leg, camera heading between the leg start and
 the reference window).
 
+HCB4 (20/11/2026, session 2 data; design CLAUDE_THESIS 03_CODE/docs/2026-11-20_Thiet_ke_HIEUCHUAN_HCB4_truot_cheo_v1.md,
+Liam 20/11 "Duyet cach sua (Recommended)"): per leg, the camera displacement C is summed in the co-rotating tag
+frame with the CAMERA heading (no IMU in a_l) and compared with the plain body-frame encoder sum E; the car creeps
+along the FL-RR diagonal (0.15-0.30 % of the distance, the same body direction forwards and backwards), measured per
+attempt as sigma = half the backward - forward difference of |C|/|E| and taken off (E' = E + sigma |E_x| (-1, +1)) for
+the repeatability, ratio-spread and straightness gates; a = circular mean of the RAW a_l, and the largest deviation of
+u_a stays on the RAW a_l. The frames must be referenced to the floor marks ('neo_san').
+
   python tools/c8_hc_a.py kiem DIR [--age-r-max-ms 125]                    # at the floor, log only (~10 s)
   python tools/c8_hc_a.py kiem_video DIR --clip CLIP --session SESSION      # at the floor, sparse video (2-5 min)
   python tools/c8_hc_a.py cua_so DIR... --frames F --track T [--dets D]     # windows (F2) + legs (F5), per attempt
@@ -598,6 +606,7 @@ def frames_basic(frames_csv, track_json):
             t.append(vals[0]); x.append(vals[1]); y.append(vals[2]); ps.append(vals[3]); ok.append(good)
     F = dict(idx=np.array(idx), t=np.array(t), x=np.array(x), y=np.array(y), psi=np.array(ps), ok=np.array(ok, bool))
     F['chuoi'] = 'chan_doan'
+    F['neo_san'] = True          # c7_measure track refits the camera pose on the floor marks in every frame
     return F
 
 
@@ -654,6 +663,7 @@ def frames_chain(frames_csv, a6, xoay, lan_lap=None, track=None, cho=None):
              ty=np.array([float(r.get('tag_y', np.nan)) for r in rows]))
     # HCC7-7: 'khoa' only when every gated frame has a finite PTS, A6 and q, and the PTS strictly increase
     F['chuoi'] = 'khoa' if bool(np.all(full[gated])) and bool(np.all(np.diff(t[full]) > 0)) else 'chan_doan'
+    F['neo_san'] = True          # rows of c7_measure track: camera pose refitted on the floor marks per frame
     return F
 
 
@@ -775,38 +785,59 @@ def rv_samples(L):
     return t[keep], yaw[keep]
 
 
-def leg_eps(F, L, ja, jb, D, psi_a, yaw_a, smooth_s=None, rv=None):
-    """Largest |camera heading change - IMU yaw change| over the leg (HCC1-9): both relative to window a (window
-    means psi_a, yaw_a), both averaged over the same +-smooth_s/2 time window on the camera frame times, the IMU
-    interpolated in the RV report times (not the log row times). NaN (no evidence) when an RV gap > RV_STALL_S, a
-    camera gap > smooth_s, or fewer than 80 % of the leg time is covered."""
+def leg_cam(F, L, ja, jb, D, wa, wb, smooth_s=None, rv=None):
+    """HCB4: the camera side of one leg between the centres of the stop windows wa and wb (log rows ja, jb).
+    C: displacement of the centre in the CO-ROTATING tag frame = sum over the frames of R(-psi_mid) dp, from the
+    mean of window a through every gated frame to the mean of window b (camera heading only: no IMU, no exact
+    camera-log time). eps: largest |camera heading - IMU yaw| over the leg after taking off the straight line
+    through the two end windows (a steady IMU drift does not count; the encoder is no referee: session 2 K2 showed
+    its heading slips), both averaged over +-smooth_s/2 on the camera frame times, the IMU interpolated in the RV
+    report times (HCC1-9); eps_tb: the path-weighted mean of the same difference; cam_imu: the camera - IMU
+    heading change between the two windows (diagnostic: IMU drift). eps, eps_tb, cam_imu are NaN (no evidence) with
+    an RV gap > RV_STALL_S, a camera gap > smooth_s, or fewer than 80 % of the leg covered. None: < 10 frames."""
     smooth_s = EPS_SMOOTH_S if smooth_s is None else smooth_s
     t_rv, y_rv = rv if rv is not None else rv_samples(L)
     ta, tb = float(L['t'][ja]), float(L['t'][jb])
     mk = F['ok'] & (F['t'] + D >= ta) & (F['t'] + D <= tb)
     if mk.sum() < 10:
-        return float('nan')
+        return None
     tc = F['t'][mk] + D
-    if np.max(np.diff(np.r_[ta, tc, tb])) > smooth_s:
-        return float('nan')
+    p = np.unwrap(F['psi'][mk])
+    pa = p[0] + wrap(wa['psi'] - p[0])
+    pb = p[-1] + wrap(wb['psi'] - p[-1])
+    X = np.r_[wa['p'][0], F['x'][mk], wb['p'][0]]
+    Y = np.r_[wa['p'][1], F['y'][mk], wb['p'][1]]
+    pm = 0.5 * (np.r_[pa, p][:len(p) + 1] + np.r_[p, pb])              # heading at the middle of each step
+    ddx, ddy = np.diff(X), np.diff(Y)
+    c, s = np.cos(pm), np.sin(pm)
+    C = np.array([float(np.sum(c * ddx + s * ddy)), float(np.sum(-s * ddx + c * ddy))])   # R(-pm) (ddx, ddy)
+    nan = float('nan')
+    out = dict(C=C, dpsi=float(pb - pa), gap=float(np.max(np.diff(np.r_[ta, tc, tb]))), eps=nan, eps_tb=nan,
+               cam_imu=nan)
+    if out['gap'] > smooth_s:
+        return out
     r0, r1 = np.searchsorted(t_rv, ta), np.searchsorted(t_rv, tb)
     seg = t_rv[max(r0 - 1, 0):min(r1 + 1, len(t_rv))]
     if len(seg) < 2 or np.max(np.diff(seg)) > RV_STALL_S:
-        return float('nan')
-    pc = psi_a + np.vectorize(wrap)(np.unwrap(F['psi'][mk]) - psi_a)
+        return out
     yi = np.interp(tc, t_rv, y_rv)
+    d_b = wrap((pb - pa) - (wb['yaw'] - wa['yaw']))
+    lin = (p - pa) - (yi - wa['yaw']) - d_b * (tc - ta) / (tb - ta)
+    lin = (lin + math.pi) % (2 * math.pi) - math.pi
     h = smooth_s / 2
     a = np.searchsorted(tc, tc - h)
     b = np.searchsorted(tc, tc + h, side='right')
-    cs_p, cs_y = np.r_[0.0, np.cumsum(pc)], np.r_[0.0, np.cumsum(yi)]
+    cs = np.r_[0.0, np.cumsum(lin)]
     n = b - a
     full = (tc - h >= ta) & (tc + h <= tb) & (n >= 3)
     if full.sum() < 3 or (tc[full][-1] - tc[full][0]) < 0.8 * (tb - ta - smooth_s):
-        return float('nan')
-    ps = (cs_p[b] - cs_p[a]) / np.maximum(n, 1)
-    ys = (cs_y[b] - cs_y[a]) / np.maximum(n, 1)
-    dev = (ps - psi_a) - (ys - yaw_a)
-    return float(np.max(np.abs(np.vectorize(wrap)(dev[full]))))
+        return out
+    sm = (cs[b] - cs[a]) / np.maximum(n, 1)
+    w = np.hypot(np.diff(F['x'][mk]), np.diff(F['y'][mk]))
+    out['eps'] = float(np.max(np.abs(sm[full])))
+    out['eps_tb'] = float(np.sum(0.5 * (lin[1:] + lin[:-1]) * w) / np.sum(w)) if np.sum(w) > 0 else 0.0
+    out['cam_imu'] = float(d_b)
+    return out
 
 
 def e_coverage(F, L, blocks, D):
@@ -855,8 +886,11 @@ CAM_TROI_MIN_DEG_S = 0.001      # HCB3 [de xuat]: a camera-vs-encoder slope unde
 #                                 (<= 0.005 deg on a over a half leg); it still enters u_yaw (|slope| x half leg)
 
 
-def imu_drift_fit(W, L, skip=()):
-    """HCB3 cach A (Liam 20/11 at CODE, button: "Cach A"; session 2 K1/K2: the IMU yaw drifted 0.03-0.05 deg/s
+def imu_drift_fit(W, L, skip=(), trong_tai=True):
+    """DIAGNOSTIC ONLY since HCB4 (a_l does not use the IMU; analyse calls it with trong_tai=False, so the
+    IMU - camera line is reported whatever the encoder says: session 2 K2 showed the encoder heading slips while
+    the camera, referenced to the floor marks, does not turn). Kept as written for HCB3:
+    HCB3 cach A (Liam 20/11 at CODE, button: "Cach A"; session 2 K1/K2: the IMU yaw drifted 0.03-0.05 deg/s
     against the camera, the encoder agreeing with the camera). Over the 12b stop windows with a camera mean, leaving
     out the windows in skip (the two ends of the leg being checked: no self-fit), at least TROI_MIN_WIN:
       - line (2 parameters) of the IMU drift d_k = (yaw_k - yaw_0) - wrap(psi_k - psi_0) [rad] against the window
@@ -881,7 +915,7 @@ def imu_drift_fit(W, L, skip=()):
     pe = np.polyfit(tt, [e[k] for k in fit], 1)
     re = np.array([e[k] for k in fit]) - np.polyval(pe, tt)
     se = float(np.sqrt(np.sum(re ** 2) / (len(fit) - 2)) / np.sqrt(np.sum((tt - tt.mean()) ** 2)))
-    if abs(pe[0]) > 2 * se and abs(pe[0]) > math.radians(CAM_TROI_MIN_DEG_S):
+    if trong_tai and abs(pe[0]) > 2 * se and abs(pe[0]) > math.radians(CAM_TROI_MIN_DEG_S):
         return dict(ly_do='camera_troi_so_encoder', n=len(fit), doc_ce=float(pe[0]), se_ce=se)
     pf = np.polyfit(tt, [d[k] for k in fit], 1)
     res = {k: abs(d[k] - float(np.polyval(pf, t[k]))) for k in ks}
@@ -902,7 +936,7 @@ def analyse(A, F, k_info, min_frames=MIN_FRAMES_TINH):
     W = []
     yaw = np.unwrap(L['yaw_rad'])
     dx, dy, dth_ = body_increments(L)
-    th_enc = np.cumsum(dth_)                                # HCB3: encoder heading, the drift referee
+    th_enc = np.cumsum(dth_)                                # encoder heading (diagnostic doc_ce of imu_drift_fit)
     for k, w in enumerate(wins):
         m = cam_window(F, w, D, u_D, F.get('fps', 60.0))
         lw = (L['t'] >= w['ta']) & (L['t'] <= w['tb']) if w['ta'] is not None else np.zeros(L['n'], bool)
@@ -931,55 +965,81 @@ def analyse(A, F, k_info, min_frames=MIN_FRAMES_TINH):
             legs.append(leg)
             continue
         ja, jb = wa['jc'], wb['jc']
-        # HCB3 cach A: IMU drift line against the camera on the stop windows except the two ends of this leg (no
-        # self-fit), used only when the camera is stable against the encoder; it is taken off the IMU yaw used by the
-        # leg (the rotation of the encoder path in a_l AND the dynamic check): a drifting IMU rotates the path and
-        # biases a_l by about rate x (leg middle - window a) (synthetic 0.08 deg/s: 0.37 deg). Fewer than
-        # TROI_MIN_WIN windows or a camera drifting against the encoder -> the raw IMU yaw + reason
-        tr = imu_drift_fit(W, L, skip=(ia, ib))
-        if tr is None or 'pf' not in tr:
-            yaw_c, ya_c, rv_c = yaw, wa['yaw'], rvs
-            troi = dict(ly_do='thieu_cua_so_troi') if tr is None else dict(
-                ly_do=tr['ly_do'], doc_ce_deg_s=math.degrees(tr['doc_ce']), se_ce_deg_s=math.degrees(tr['se_ce']))
-        else:
-            yaw_c = yaw - np.polyval(tr['pf'], L['t'])
-            ya_c = wa['yaw'] - float(np.polyval(tr['pf'], L['t'][ja]))
-            rv_c = (rvs[0], rvs[1] - np.polyval(tr['pf'], rvs[0]))
-            du_ng = max(tr['du_ngoai'].values())
-            half = 0.5 * float(L['t'][jb] - L['t'][ja])
-            troi = dict(toc_do_deg_s=math.degrees(float(tr['pf'][0])), n_cua_so=tr['n'],
-                        du_khop_max_deg=math.degrees(tr['du_max']), du_ngoai_max_deg=math.degrees(du_ng),
-                        doc_ce_deg_s=math.degrees(tr['doc_ce']), se_ce_deg_s=math.degrees(tr['se_ce']),
-                        u_troi_deg=math.degrees((2 * tr['se_ce'] + abs(tr['doc_ce'])) * half + du_ng))
-
-        def _a_l(yw, ya):
-            mid = 0.5 * (yw[ja + 1:jb + 1] + yw[ja:jb]) - ya           # HCC1-12: window mean, as v4 3.2 step 3
-            c, s = np.cos(mid), np.sin(mid)
-            ds_ = np.array([np.sum(c * dx[ja + 1:jb + 1] - s * dy[ja + 1:jb + 1]),
-                            np.sum(s * dx[ja + 1:jb + 1] + c * dy[ja + 1:jb + 1])])
-            th = wrap(math.atan2(dp[1], dp[0]) - math.atan2(ds_[1], ds_[0]))
-            return ds_, th, wrap(wa['psi'] - th)
+        cam = leg_cam(F, L, ja, jb, D, wa, wb, rv=rvs)
+        if cam is None:
+            leg.update(trang_thai='thieu', ly_do=f'fewer than 10 frames between windows {ia} and {ib}')
+            legs.append(leg)
+            continue
+        # HCB4: both displacements in the body (co-rotating) frame. Encoder: plain sum of the firmware body
+        # increments (no yaw needed); camera: leg_cam (camera heading). a_l_tho = arg E - arg C
         dp = wb['p'] - wa['p']
-        ds, th_a, a_l = _a_l(yaw_c, ya_c)
-        a_l_tho = _a_l(yaw, wa['yaw'])[2]                               # diagnostic: without the drift line
-        # dynamic yaw check over the leg (HCC1-9): 0.5 s, RV report times, gaps -> NaN (no evidence)
-        eps_tho = leg_eps(F, L, ja, jb, D, wa['psi'], wa['yaw'], rv=rvs)
-        eps = leg_eps(F, L, ja, jb, D, wa['psi'], ya_c, rv=rv_c)
+        ds = np.array([float(np.sum(dx[ja + 1:jb + 1])), float(np.sum(dy[ja + 1:jb + 1]))])
+        dc = cam['C']
+        a_tho = wrap(math.atan2(ds[1], ds[0]) - math.atan2(dc[1], dc[0]))
+        r_tho = float(np.hypot(*dc) / np.hypot(*ds))
         path = float(np.sum(np.hypot(dx[ja + 1:jb + 1], dy[ja + 1:jb + 1])))
-        dth = float(np.sum(np.abs(np.diff(yaw[ja:jb + 1]))))
-        leg.update(trang_thai='hop_le', dp=dp, ds=ds, L_m=float(np.hypot(*dp)), Ls_m=float(np.hypot(*ds)),
-                   ti_le=float(np.hypot(*dp) / np.hypot(*ds)), theta_a=th_a, a_l=a_l, a_l_tho=a_l_tho, eps=eps, eps_tho=eps_tho,
-                   troi=troi, path=path, sum_dth=dth,
+        leg.update(trang_thai='hop_le', dp=dp, ds=ds, dc=dc, L_m=float(np.hypot(*dp)), Ls_m=float(np.hypot(*ds)),
+                   ti_le_tho=r_tho, ti_le=r_tho, a_l_tho=a_tho, a_l=a_tho, theta_a=wrap(wa['psi'] - a_tho),
+                   eps=cam['eps'], eps_tb=cam['eps_tb'], cam_imu=cam['cam_imu'], dpsi=cam['dpsi'],
+                   ho_khung_s=cam['gap'], path=path,
                    chieu='toi' if ds[0] > 0 else 'lui', R_a=wa['psi'], R_b=wb['psi'], cs_a=wa['cs'], cs_b=wb['cs'],
                    nua_a=wa['psi_nua'], nua_b=wb['psi_nua'], p_a=wa['p'], p_b=wb['p'],
                    p_tag_a=wa['p_tag'], p_tag_b=wb['p_tag'])
         legs.append(leg)
-    tr_all = imu_drift_fit(W, L) if n12 else None           # HCB3 diagnostic: the line over every stop window
+    tc = slip_compensate(legs)
+    th = stops_straightness(W, legs, tc.get('sigma')) if n12 else dict(tho=float('nan'), bu=float('nan'))
+    tr_all = imu_drift_fit(W, L, trong_tai=False) if n12 else None     # diagnostic: IMU - camera line over the stops
     troi = None if tr_all is None else (dict(ly_do=tr_all['ly_do']) if 'pf' not in tr_all else dict(
         toc_do_deg_s=math.degrees(float(tr_all['pf'][0])), n_cua_so=tr_all['n'],
         du_khop_max_deg=math.degrees(tr_all['du_max']), doc_ce_deg_s=math.degrees(tr_all['doc_ce']),
         se_ce_deg_s=math.degrees(tr_all['se_ce'])))
-    return dict(D=D, u_D=u_D, diffs=diffs, windows=W, legs=legs, chuoi=F['chuoi'], troi_imu=troi)
+    return dict(D=D, u_D=u_D, diffs=diffs, windows=W, legs=legs, chuoi=F['chuoi'], troi_imu=troi, truot_cheo=tc,
+                thang_hang_m=th, neo_san=bool(F.get('neo_san', False)))
+
+
+def slip_compensate(legs):
+    """HCB4 (design 2026-11-20_Thiet_ke_HIEUCHUAN_HCB4_truot_cheo_v1.md; Liam 20/11): the car creeps along the
+    FL-RR diagonal of the body, about 0.15-0.30 % of the distance, the SAME body direction forwards and backwards
+    (session 2: 5 attempts, direction of the even camera-encoder difference 47.0 +- 4.2 deg; the encoders do not
+    see it). sigma = (mean raw ratio |C|/|E| of the backward long legs - mean of the forward ones) / 2; every leg
+    gets E' = E + sigma*|E_x|*(-1, +1), a_l = arg E' - arg C, ti_le = |C|/|E'| (long and short legs: the creep is
+    proportional to the distance). Fewer than one long leg in each direction -> no compensation (a_l = a_l_tho)
+    and the reason. Returns dict(sigma, r_lui, r_toi, ly_do)."""
+    longs = [lg for lg in legs if lg.get('dai') and lg['trang_thai'] == 'hop_le']
+    lui = [lg['ti_le_tho'] for lg in longs if lg['chieu'] == 'lui']
+    toi = [lg['ti_le_tho'] for lg in longs if lg['chieu'] == 'toi']
+    if not lui or not toi:
+        return dict(sigma=None, r_lui=lui, r_toi=toi, ly_do=f'doan dai hop le: {len(lui)} lui, {len(toi)} toi')
+    sigma = 0.5 * (float(np.mean(lui)) - float(np.mean(toi)))
+    for lg in legs:
+        if lg['trang_thai'] != 'hop_le':
+            continue
+        s = sigma * abs(lg['ds'][0])
+        e = np.array([lg['ds'][0] - s, lg['ds'][1] + s])
+        lg['a_l'] = wrap(math.atan2(e[1], e[0]) - math.atan2(lg['dc'][1], lg['dc'][0]))
+        lg['ti_le'] = float(np.hypot(*lg['dc']) / np.hypot(*e))
+    return dict(sigma=sigma, r_lui=lui, r_toi=toi, ly_do=None)
+
+
+def stops_straightness(W, legs, sigma):
+    """Largest distance of the 12b stops from their common line [m]: 'tho' as measured, 'bu' after taking off the
+    slip drift predicted by sigma (each leg moves the car sigma*|E_x|*(-1, +1) in the body frame; cumulated along
+    the legs in time order, turned to the floor by the body heading at the leg start = tag heading - mean raw a)."""
+    ks = [k for k in range(min(STOPS_12B, len(W))) if 'p' in W[k]]
+    tho = perp_offsets([W[k] for k in ks])
+    good = [lg for lg in legs if lg['trang_thai'] == 'hop_le']
+    longs = [lg for lg in good if lg['dai']]
+    if sigma is None or not longs:
+        return dict(tho=tho, bu=tho)
+    a = circmean([lg['a_l_tho'] for lg in longs])
+    drift, acc = {}, np.zeros(2)
+    for lg in sorted(good, key=lambda g: g['a']):
+        hd = lg['R_a'] - a
+        s = sigma * abs(lg['ds'][0])
+        acc = acc + s * np.array([-math.cos(hd) - math.sin(hd), -math.sin(hd) + math.cos(hd)])
+        drift[lg['b']] = acc.copy()
+    pts = [dict(p=W[k]['p'] - drift.get(k, np.zeros(2))) for k in ks]
+    return dict(tho=tho, bu=perp_offsets(pts))
 
 
 def perp_offsets(W):
@@ -997,7 +1057,7 @@ def _deg_leg(lg):
     for k, v in lg.items():
         if k in ('R_a', 'R_b', 'cs_a', 'cs_b', 'nua_a', 'nua_b', 'p_tag_a', 'p_tag_b'):
             continue
-        if k in ('a_l', 'a_l_tho', 'theta_a', 'eps', 'eps_tho'):
+        if k in ('a_l', 'a_l_tho', 'theta_a', 'eps', 'eps_tb', 'cam_imu', 'dpsi'):
             out[k + '_deg'] = None if v is None or not math.isfinite(v) else math.degrees(v)
         else:
             out[k] = v.tolist() if isinstance(v, np.ndarray) else v
@@ -1053,11 +1113,17 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
     longs = [lg for lg in cap['legs'] if lg['dai'] and lg['trang_thai'] == 'hop_le']
     if len(longs) != 4:
         return stop(['cap: fewer than 4 long legs'])
-    a = circmean([lg['a_l'] for lg in longs])
+    # HCB4 (Liam 20/11, CODE_HIEUCHUAN p5: "Duyet cach sua (Recommended)"): a of the place = circular mean of the
+    # four RAW a_l (the spec estimator; the diagonal-slip compensation cancels in it); the repeatability gate runs
+    # on the compensated a_l; the largest deviation of u_a stays on the RAW a_l of every long leg of every attempt
+    # (the whole compensation counted as uncertain: covers a car that drifts in one direction only)
+    a = circmean([lg['a_l_tho'] for lg in longs])
     spread = max(abs(wrap(x['a_l'] - y['a_l'])) for x in longs for y in longs)
+    spread_tho = max(abs(wrap(x['a_l_tho'] - y['a_l_tho'])) for x in longs for y in longs)
+    tc = cap.get('truot_cheo') or {}
     all_long = [lg for _, an, _ in attempts if an is not None for lg in an['legs']
                 if lg['dai'] and lg['trang_thai'] == 'hop_le']
-    dev = max(abs(wrap(lg['a_l'] - a)) for lg in all_long)
+    dev = max(abs(wrap(lg['a_l_tho'] - a)) for lg in all_long)
     Lmin = min(lg['L_m'] for lg in longs)
     Lsmin = min(lg['Ls_m'] for lg in longs)
     bad = []
@@ -1074,7 +1140,7 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
                 es.append(v)
         e = max(es) if es else 0.0
     u_map = math.asin(e / Lmin) if e < Lmin else math.pi / 2
-    r_enc = COUNT_M * (2 + max(lg['sum_dth'] for lg in longs)) / Lsmin
+    r_enc = 2 * COUNT_M / Lsmin                            # HCB4: E is a plain body-frame sum (no rotation terms)
     u_enc = math.asin(r_enc) if r_enc < 1 else math.pi / 2
     hd_thieu = False
     thieu_hang = []                                        # HCH1-4: terms without a bound: exported null, not 0
@@ -1110,18 +1176,19 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
     eps = [lg['eps'] for lg in longs]
     eps_thieu = any(not math.isfinite(x) for x in eps)            # HCC1-9: no evidence -> gate fails, not 0
     eps = [x if math.isfinite(x) else 0.0 for x in eps]
-    u_yaw = max(math.asin(min(2 * math.sin(e_ / 2) * lg['path'] / lg['Ls_m'], 1.0)) for e_, lg in zip(eps, longs))
-    # HCB3: the drift line is checked on the windows it did not use (the two ends of each leg): their largest
-    # residual is added to u_yaw; a leg without enough windows keeps the raw check and says so
-    troi_legs = [lg.get('troi') or {} for lg in longs]
-    u_tr = [x['u_troi_deg'] for x in troi_legs if 'u_troi_deg' in x]
-    u_yaw += math.radians(max(u_tr)) if u_tr else 0.0
-    for why in sorted({x['ly_do'] for x in troi_legs if x.get('ly_do')}):
-        res['ly_do'].append(why)
-    res['troi_imu'] = dict(cap.get('troi_imu') or {}, u_troi_max_deg=max(u_tr) if u_tr else None,
-                           cach='troi IMU so voi camera, duong thang 2 tham so tren cua so dung 12b, bo hai dau doan; '
-                                'camera on dinh so voi encoder (2 SE); u_yaw + 2 SE (giua doan - cua so a) + du ngoai '
-                                'khop (HCB3 cach A); chi thong tin')
+    # HCB4: a_l no longer uses the IMU. A camera heading error in motion turns C by its PATH-WEIGHTED MEAN, so
+    # u_yaw = largest |eps_tb| (camera - IMU, the straight line through the two end windows taken off); the static
+    # part by position belongs to the C8B two-end bound (u_psi_cuc)
+    u_yaw = max((abs(lg['eps_tb']) for lg in longs if math.isfinite(lg['eps_tb'])), default=0.0)
+    if not cap.get('neo_san'):
+        res['ly_do'].append('khung khong neo moc san (huong camera co the troi)')
+    if tc.get('sigma') is None:
+        res['ly_do'].append('khong bu truot cheo: ' + str(tc.get('ly_do')))
+    res['troi_imu'] = dict(cap.get('troi_imu') or {},
+                           cam_imu_hai_dau_deg=[math.degrees(lg['cam_imu']) if math.isfinite(lg['cam_imu']) else None
+                                                for lg in longs],
+                           cach='chi thong tin (HCB4): a_l khong dung IMU; yaw_dong neo hai dau doan nen IMU troi deu '
+                                'khong anh huong')
     if can_hai_dau is not None:
         # design v4 3.3: u_psi_cuc = max over the long legs of the bound between the start window of the leg (at
         # the extreme, where a takes psi') and the reference window (where psi_chuan_k is taken)
@@ -1147,9 +1214,10 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
     u_a = dev + u_map + u_enc + u_q + u_yaw + u_cuc
     gates = dict(
         do_tan=spread <= math.radians(SPREAD_MAX_DEG),
-        ti_le=all(RATIO_LO <= lg['ti_le'] <= RATIO_HI for lg in longs)
+        # HCB4: range on the raw and on the compensated ratio, spread on the compensated one
+        ti_le=all(RATIO_LO <= lg[k] <= RATIO_HI for lg in longs for k in ('ti_le', 'ti_le_tho'))
         and (max(lg['ti_le'] for lg in longs) - min(lg['ti_le'] for lg in longs)) <= RATIO_SPREAD,
-        thang_hang=perp_offsets(cap['windows'][:7]) <= PERP_MAX_M,      # the 7 stops of 12b only
+        thang_hang=cap['thang_hang_m']['bu'] <= PERP_MAX_M,      # the 7 stops of 12b, slip drift taken off
         yaw_dong=not eps_thieu and all(x <= math.radians(EPS_YAW_MAX_DEG) for x in eps),
         e_hieu_hop_le=not bad,
     )
@@ -1187,7 +1255,12 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
     for k in rong:
         hang[k] = None
     out = dict(res, a_k_deg=math.degrees(a), u_a_k_deg=None if rong else math.degrees(u_a),
-               do_tan_deg=math.degrees(spread), u_hang_deg=hang, u_hang_thieu=sorted(set(thieu_hang)),
+               do_tan_deg=math.degrees(spread), do_tan_tho_deg=math.degrees(spread_tho),
+               truot_cheo=dict(tc, cach='HCB4: sigma = (tb ti_le_tho doan lui - tb ti_le_tho doan toi)/2 tren bon doan dai; '
+                                        'E bu = E + sigma*|E_x|*(-1, +1) (duong cheo FL-RR); a_k = tb vong a_l_tho; '
+                                        'lech_lon_nhat tren a_l_tho; do_tan, ti_le (tan), thang_hang tren so da bu'),
+               thang_hang_mm=dict(tho=1e3 * cap['thang_hang_m']['tho'], bu=1e3 * cap['thang_hang_m']['bu']),
+               u_hang_deg=hang, u_hang_thieu=sorted(set(thieu_hang)),
                u_q_gom_xoay_q=(not bao_q) or len(legs_u) > len(longs),       # HCV3-5: some leg carries it
                u_q_bao_boi_f9=sorted({tid for tid, an_, _ in attempts if tid == cap_id}) if bao_q else [],
                cong=gates, giu_ngoai=giu_ngoai, vet_thuc=vet)
@@ -1855,13 +1928,17 @@ def video_checks(A, F, info):
         add('do_tan_tho', ok4 and spread <= math.radians(SPREAD_VIDEO_DEG), f'{math.degrees(spread):.3f} deg')
         eps = [lg['eps'] for lg in longs]
         f3 = lambda x: 'thieu' if not math.isfinite(x) else f'{math.degrees(x):.3f}'          # noqa: E731
-        tr = an.get('troi_imu') or {}
+        tc = an.get('truot_cheo') or {}
         add('yaw_dong', ok4 and all(math.isfinite(x) and x <= math.radians(EPS_YAW_MAX_DEG) for x in eps),
-            ', '.join(f3(x) for x in eps) + ' (tru troi IMU; tho ' + ', '.join(f3(lg['eps_tho']) for lg in longs)
-            + (f"; troi {tr['toc_do_deg_s']:+.4f} deg/s tren {tr['n_cua_so']} cua so" if 'toc_do_deg_s' in tr
-               else f"; khong tru troi: {tr.get('ly_do', 'thieu_cua_so_troi')}")
-            + ''.join(f", doan {lg['i']}: {lg['troi']['ly_do']}" for lg in longs if (lg.get('troi') or {}).get('ly_do'))
-            + ')')
+            ', '.join(f3(x) for x in eps) + ' (camera - IMU, neo hai dau doan; lech hai dau '
+            + ', '.join(f3(lg['cam_imu']) for lg in longs) + ' deg)')
+        add('neo_moc_san', an.get('neo_san', False), 'khung khop lai camera theo moc san' if an.get('neo_san')
+            else 'khung KHONG neo moc san: huong camera co the troi')
+        add('thang_hang', an['thang_hang_m']['bu'] <= PERP_MAX_M,
+            f"{1e3 * an['thang_hang_m']['bu']:.2f} mm sau bu (tho {1e3 * an['thang_hang_m']['tho']:.2f})")
+        add('truot_cheo', True, (f"sigma {100 * tc['sigma']:+.3f} %, do tan chua bu "
+            f"{math.degrees(max(abs(wrap(x['a_l_tho'] - y['a_l_tho'])) for x in longs for y in longs)):.3f} deg"
+            if ok4 and tc.get('sigma') is not None else f"khong bu: {tc.get('ly_do', 'thieu doan')}"))
     if hasE:
         cov = e_coverage(F, A['log'], info['blocks'], an['D'])
         add('phu_E', len(cov) == 2 and all(c['vong'] >= E_COVER_TURNS and c['ho_s'] <= E_GAP_MAX_S for c in cov),
