@@ -2087,3 +2087,10 @@ def test_kt8_rows_domain_flags_on_the_cat_t1_branch(tmp_path):
     assert all(r['mien_chung'] == r['mien_hop'] == int(bool(r['scored']) and r['t'] <= t1 + 1e-12) for r in rows)
     assert any(r['scored'] and r['t'] > t1 and not r['mien_hop'] for r in rows)
     assert sum(r['mien_hop'] for r in rows) == out['gate_v3']['g2']['n_frames']
+
+
+def test_score_json_has_car_pose_version():
+    """CODE 20/11: score.json carries car_pose_version (C8B / GATE: phien_ban of mien_car_pose), also a lost run."""
+    out = cs.lost_output('O1-F02', 'x', 'thao_tac')
+    assert out['car_pose_version'] == cm.CAR_POSE_VERSION == 'car_pose_v2'
+    assert out['version'] == cs.VERSION

@@ -650,3 +650,25 @@ def test_c8b_frames_file_without_col_px_reads_nan(tmp_path):
     p.write_text(','.join(cols) + '\n' + ','.join(vals.get(c, '0.5') for c in cols) + '\n', encoding='utf-8')
     r = cm.read_frames(str(p))[0]
     assert math.isnan(r['col_px']) and r['row_px'] == 0.5
+
+
+# ---------------------------------------------------------------- CAR_POSE_VERSION (CODE 20/11)
+CAR_POSE_SRC_SHA = {          # sha256[:12] of the body of each function car_pose() rests on, at car_pose_v2 (the
+    'car_pose': '12fe41ef08ac', 'rigid_fit': 'a67bcd04d5bc',      # same in hil 6b96649, the build at the floor 20/11)
+    'car_corners_body': '9a3338387408', 'cp_wrap': '59ff0ca3e663'}
+
+
+def test_car_pose_version_follows_the_formula():
+    """car_pose_v2 (16/11, hil 215333a). Changing car_pose() or a function it uses makes this fail: raise
+    CAR_POSE_VERSION, then the pinned hashes."""
+    import hashlib
+    import re
+    assert cm.CAR_POSE_VERSION == 'car_pose_v2'
+    with open(cm.__file__, encoding='utf-8', newline='') as f:
+        src = f.read().replace('\r\n', '\n')
+    got = {}
+    for fn in CAR_POSE_SRC_SHA:
+        m = re.search(r'^def ' + fn + r'\(.*?\n(?=\S)', src, re.S | re.M)     # the def line and its indented body
+        assert m, fn
+        got[fn] = hashlib.sha256(m.group(0).rstrip('\n').encode()).hexdigest()[:12]
+    assert got == CAR_POSE_SRC_SHA, 'car_pose changed: raise CAR_POSE_VERSION and the pinned hashes'

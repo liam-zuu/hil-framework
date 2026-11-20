@@ -248,12 +248,26 @@ def _f(v):
         return float('nan')
 
 
+def tam_cua_luot(lan_lap, tam_id=None):
+    """(tam_id for c8b_a6.ap_dung, ly_do). The plate of the run: tam_id of lan_lap_v1 (NHACTAM); without lan_lap, or a
+    lan_lap without tam_id, the tam_id given by the caller (CODE 20/11, HIEUCHUAN HCV3-1: HIEUCHUAN reads it from
+    c8b_a6_v2.tam_id, one source, and cannot give --lan-lap because F8 is built from F7). Both given and different:
+    (None, 'a6_tam_id_khac_lan_lap'), the A6 is not applied."""
+    ll_tam = None if lan_lap is None else lan_lap.get('tam_id')
+    if ll_tam is None:
+        return tam_id, ''
+    if tam_id is not None and tam_id != ll_tam:
+        return None, 'a6_tam_id_khac_lan_lap'
+    return ll_tam, ''
+
+
 def chuoi_khung(frames_csv, a6, xoay, lan_lap=None, plumb=PLUMB_16_11, zc=ZC_16_11, track=None, cho=None,
-                truc_xe=None, u_psi_w_rad=None):
+                truc_xe=None, u_psi_w_rad=None, tam_id=None):
     """Rows (dicts with ROW_KEYS) of every frame of frames.csv (module docstring). a6: doc_a6(...) or None; xoay: path,
     dict or doc_xoay(...) result; lan_lap: path, dict or doc_lan_lap(...) result, or None (calibration clips of the
     session of E: same mounting); cho: place k of the run (goc, K1, K2) for the C8B q composition of another
-    mounting; truc_xe (truc_xe_v1 dict) and u_psi_w_rad: passed to the C8B q composition of another mounting. Angles
+    mounting; truc_xe (truc_xe_v1 dict) and u_psi_w_rad: passed to the C8B q composition of another mounting; tam_id:
+    the plate on the car, used for the A6 plate check when lan_lap is None or has no tam_id (tam_cua_luot). Angles
     in rad, positions in m."""
     rows, fpath = _frames(frames_csv)
     xo = xoay if (isinstance(xoay, dict) and 'ok' in xoay and 'q' in xoay) else doc_xoay(xoay, cho)
@@ -272,9 +286,12 @@ def chuoi_khung(frames_csv, a6, xoay, lan_lap=None, plumb=PLUMB_16_11, zc=ZC_16_
         dps, a6ok = np.full(n, np.nan), np.zeros(n, bool)
         why_a6 = ['thieu_a6'] * n
     else:
-        tam = None if ll is None else ll.get('tam_id')
-        st, ly = a6['mod'].ap_dung(a6['obj'], tam)
-        if st != 'dat' and st != 'khong_kiem_cheo_tay':
+        tam, why_tam = tam_cua_luot(ll, tam_id)
+        st, ly = (None, why_tam) if why_tam else a6['mod'].ap_dung(a6['obj'], tam)
+        if why_tam:                                   # two plates named: the A6 is not applied, every frame diagnosed
+            dps, a6ok = np.full(n, np.nan), np.zeros(n, bool)
+            why_a6 = [why_tam] * n
+        elif st != 'dat' and st != 'khong_kiem_cheo_tay':
             dps, a6ok = np.full(n, np.nan), np.zeros(n, bool)
             why_a6 = [f'a6_{st}:{ly}'] * n
         else:

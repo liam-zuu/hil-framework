@@ -372,6 +372,13 @@ def rigid_fit(src, dst, with_scale=False):
     return ang, t, sc, rms
 
 
+# Version of the car_pose() formula (CODE 20/11; C8B / GATE use it as phien_ban of mien_car_pose in gate_c8_v2).
+# car_pose_v2: the tag offset turned by the BODY heading (ang - dpsi), 16/11 (hil 215333a); v1 turned it by the tag
+# heading. Raise it every time car_pose() (or rigid_fit / car_corners_body / cp_wrap it uses) changes. Written to
+# session.json (calib) and score.json (c7_score).
+CAR_POSE_VERSION = 'car_pose_v2'
+
+
 def car_pose(cam, corners_px, side, kappa, plumb, tag_offset=(0.0, 0.0, 0.0)):
     """(x, y, psi) of the WHEEL centre on the floor, tag centre (x, y), fit residual [m], apparent
     scale of the tag after the parallax correction, from the 4 corners of the car tag (design 3.4,
@@ -1758,6 +1765,7 @@ def main(argv=None):
             s = calibrate(a.video, marks, a.zc, plumb, a.tag_h, side, a.stride, a.max_frames, floor=floor,
                           model=a.model, n_groups=a.groups, roles=cp.load_roles(a.markers))
             s['markers_csv'] = [dict(file=os.path.basename(p), sha256=sha256(p)) for p in a.markers]
+            s['car_pose_version'] = CAR_POSE_VERSION
             with open(os.path.join(a.out, 'session.json'), 'w', encoding='utf-8') as f:
                 json.dump(_json(s), f, ensure_ascii=False, indent=1)
             with open(os.path.join(a.out, 'calib_marks.csv'), 'w', newline='', encoding='utf-8') as f:

@@ -247,3 +247,48 @@ def test_xoay_per_place_file(fake_a6, tmp_path):
     assert all(r['q_ok'] for r in out)
     out = ck.chuoi_khung(spin_rows(), ck.doc_a6(a6p), str(p), track=TRACK0, cho='K1')
     assert all(not r['q_ok'] and 'xoay_thieu_cho_K1' in r['ly_do'] for r in out)
+
+
+# ---------------------------------------------------------------- tam_id= (CODE 20/11, HIEUCHUAN HCV3-1)
+def _a6_needs_plate(a6p):
+    d = json.load(open(a6p))
+    d['cho_none'] = False                     # ap_dung(a6, None) -> chua_ket_luan, as C8B does
+    open(a6p, 'w').write(json.dumps(d))
+
+
+def test_tam_cua_luot_rules():
+    assert ck.tam_cua_luot(None) == (None, '')
+    assert ck.tam_cua_luot(None, 'T1') == ('T1', '')
+    assert ck.tam_cua_luot(dict(tam_id='T1')) == ('T1', '')
+    assert ck.tam_cua_luot(dict(tam_id='T1'), 'T1') == ('T1', '')
+    assert ck.tam_cua_luot(dict(), 'T1') == ('T1', '')                 # lan_lap without tam_id
+    assert ck.tam_cua_luot(dict(tam_id='T1'), 'T2') == (None, 'a6_tam_id_khac_lan_lap')
+
+
+def test_tam_id_without_lan_lap_applies_a6(fake_a6, tmp_path):
+    a6p, calls = fake_a6
+    _a6_needs_plate(a6p)
+    out = ck.chuoi_khung(spin_rows(), ck.doc_a6(a6p), xoay_file(tmp_path), track=TRACK0)
+    assert all(not r['a6_ok'] and r['ly_do'].startswith('a6_chua_ket_luan') for r in out)   # the HCV3-1 case
+    assert calls['n'] == 0
+    out = ck.chuoi_khung(spin_rows(), ck.doc_a6(a6p), xoay_file(tmp_path), track=TRACK0, tam_id='T1')
+    assert calls['n'] == 1
+    assert all(r['trang_thai'] == 'khoa' and r['ly_do'] == '' for r in out)
+    out = ck.chuoi_khung(spin_rows(), ck.doc_a6(a6p), xoay_file(tmp_path), track=TRACK0, tam_id='T2')
+    assert all(not r['a6_ok'] and r['ly_do'].startswith('a6_chua_ket_luan') for r in out)
+
+
+def test_tam_id_and_lan_lap(fake_a6, tmp_path):
+    a6p, calls = fake_a6
+    _a6_needs_plate(a6p)
+    ll = dict(schema='lan_lap_v1', tam_id='T1', cung_lan_lap=True, trang_thai={'delta_c_B': 'dat'})
+    out = ck.chuoi_khung(spin_rows(), ck.doc_a6(a6p), xoay_file(tmp_path), lan_lap=ll, track=TRACK0, tam_id='T1')
+    assert all(r['trang_thai'] == 'khoa' for r in out)
+    n = calls['n']
+    out = ck.chuoi_khung(spin_rows(), ck.doc_a6(a6p), xoay_file(tmp_path), lan_lap=ll, track=TRACK0, tam_id='T2')
+    assert calls['n'] == n                    # A6 not applied
+    assert all(not r['a6_ok'] and r['trang_thai'] == 'chan_doan' and 'a6_tam_id_khac_lan_lap' in r['ly_do']
+               and math.isnan(r['psi_ma_p']) for r in out)
+    ll2 = dict(schema='lan_lap_v1', cung_lan_lap=True, trang_thai={'delta_c_B': 'dat'})          # no tam_id
+    out = ck.chuoi_khung(spin_rows(), ck.doc_a6(a6p), xoay_file(tmp_path), lan_lap=ll2, track=TRACK0, tam_id='T1')
+    assert all(r['trang_thai'] == 'khoa' for r in out)

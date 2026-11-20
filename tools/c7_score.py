@@ -1735,8 +1735,9 @@ def operator_loss(esp32_path, events, task, other):
 
 
 def lost_output(task, reason, cause, **extra):
-    return dict(task=task, version=VERSION, outcome='hong_he_do', fail_cause=cause, outcome_reasons=[reason],
-                gate_v3=None, rule=f'O1 v11.28 3.3-3.5 (camera); {VERSION}', **extra)
+    return dict(task=task, version=VERSION, car_pose_version=cm.CAR_POSE_VERSION, outcome='hong_he_do',
+                fail_cause=cause, outcome_reasons=[reason], gate_v3=None,
+                rule=f'O1 v11.28 3.3-3.5 (camera); {VERSION}', **extra)
 
 
 def anchor_window(anchor_s):
@@ -2348,7 +2349,8 @@ def score(frames, esp32_path, task, hs, offset_s=None, offset_reason='', k_start
                                                esp32_sha256=cm.sha256(esp32_path), mien_phai_phu=mpp,
                                                chot_yaw=chot_yaw)),
                    placement_n=None)
-    out.update(base, version=VERSION, outcome=outcome, fail_cause=fail_cause, outcome_reasons=reasons,
+    out.update(base, version=VERSION, car_pose_version=cm.CAR_POSE_VERSION, outcome=outcome, fail_cause=fail_cause,
+               outcome_reasons=reasons,
                completed=g1['q'], gate_v3=gate, gate_rq3=gate_rq3, cat_t1=cat, report_only=sorted(report_only), U_t_s=u_t, U_t_parts=u_t_parts, yaw_check=yaw,
                shift_max_px=shift_max, bumped=bumped, shift_drift_px=drift,
                shift_drift_note=('quay lai clip H truoc luot sau (design 3.6)'
