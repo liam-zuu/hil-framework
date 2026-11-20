@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-c8b_u.py: lock the C8b numbers after C8 and write the C8 gate file (C8b design v4 sections 3, 4b, 5, 9, approved:
-Liam 17/11, CODE_C8B local_cccce6cb, "Duyet (Recommended)"; CLAUDE_THESIS 03_CODE/docs/2026-11-17_Thiet_ke_C8b_v4.md;
-gate file format gate_c8_v1: 03_CODE/docs/2026-11-17_Thiet_ke_CODE_GATE_v1.md section 2; O1 v11.33 3.9 rule 2b).
-Written by CODE_C8B local_21b7debc on feat/c8b-u.
+c8b_u.py: lock the C8b numbers after C8 (C8b design v4 sections 3, 4b, 5, 9, approved: Liam 17/11, CODE_C8B
+local_cccce6cb, "Duyet (Recommended)"; CLAUDE_THESIS 03_CODE/docs/2026-11-17_Thiet_ke_C8b_v4.md).
+Written by CODE_C8B local_21b7debc on feat/c8b-u. The subcommand cong (gate file gate_c8_v1, O1 v11.33 3.9 rule 2b) was
+removed 20/11 (CODE_C8B local_d24e5a74, CODE order 20/11 after the dry merge with GATE 66978ac): gate_c8_v1 is refused
+by gate_c8 and the gate file gate_c8_v2 is assembled by `gate_c8.py ghep` of CODE_GATE, which reads the C8B files
+directly (CODE 19/11, contract with C8B); rule 2b and the run checks of cong belong to ghep.
 
 khoa (after the C8 clips are tracked and the C8 runs have their clock files):
   troi_ppm       drift rate bound [ppm] = LE x the largest |D_end - D_start| / distance of the third centres over the
@@ -60,29 +62,16 @@ khoa (after the C8 clips are tracked and the C8 runs have their clock files):
   of the file khoa is given (frames of each run, schedule, tap_moc, u_so, session), or sources that do not chain
   (frames = the clock file's frames; track.json of each run, lich.json, session.json name these same files, the
   final scoring, and the tag offset, tag side, tag height, kappa of the camera file: check_moc, C8BU4-R1-1, R1-2).
-  The lock keeps luot_c8 {RUN: gio_sha256, frames_sha256}; cong takes only those runs with those clock files
-  (C8BU4-R1-3).
+  The lock keeps luot_c8 {RUN: gio_sha256, frames_sha256} (C8BU4-R1-3: the gate takes only those runs with those
+  clock files).
   Test 5 (ruler at the stop points, dropped in v10, kept as an option) is an end-to-end check: every difference
   <= U_p, else 'xem_lai' (not widened by itself). 3b with ga_ok false: refused (set-up redone).
-cong (after every C8 figure-8 run is scored on its clock grid with the locked constants):
-  O1 3.9 rule 2b: for each gate level, the runs of the C8 plan written before C8 (slot, task, controller); a rerun
-  only replaces a lost run of its slot; runs lost to the measurement system or without a finite U_t are left out;
-  each level needs at least one PID and one LADRC run (else C8 is not finished: refused).
-  u_t_s of a run = the largest node U_t of its grid + the half width of its clock interval (design 9: so that U-hat
-  keeps the clock part the grid carries; node scoring itself uses U_t without the half width).
-  U_t,C8(level) = max u_t_s; U-hat: G2 = U_p, G3 = U_p + U_t,C8 v_cmd_max, G5 = U_psi + deg(U_t,C8 wz_cmd_max), with
-  the schedule peaks WITHOUT the upper-bound margin; report-only: U-hat > half the threshold (strict). G1, G4 always
-  decide. The level blocks come from gate_c8.level_block and the file is written with gate_c8.write_gate (CODE_GATE:
-  checked before the file is opened), then read back with gate_c8.read_gate_c8; an existing file is never replaced.
 
   python tools/c8b_u.py khoa --gio r1=gio_r1.json ... --tb 3b.json --cam-u c8_cam_u_vao.json \
       --thuoc-kep thuoc_kep.json --xoay xoay.json --moc-frames r1=frames_r1.csv ... \
       --moc-track r1=track_r1.json ... --moc-lich lich.json \
       --moc-tap-moc tap_moc.json --moc-u-so u_so.json --moc-session session.json \
       [--u-imu u_imu_dong.json] [--phep5 phep5.csv] --out c8b_khoa.json
-  python tools/c8b_u.py cong --khoa c8b_khoa.json --ke-hoach ke_hoach_c8.csv --levels O1-F02,O1-F05,O1-F08 \
-      --u-t-branch bo_tick --luot SLOT=RUN_ID,gio.json,luoi.json ... [--cam cam.json] --c8-dir 05_DATA/results/C8/<d> \
-      --out gate_c8.json
 Last line: #ket_qua,ma=0 written / 2 refused or error.
 
 c8_cam_u_vao.json (CODE_CAM / CODE_KIEMCHEO / CODE_NHACTAM; m and deg; every number used finite and >= 0; other keys
@@ -126,7 +115,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import datetime
 import json
 import math
 import os
@@ -153,9 +141,6 @@ A_PARTS = ('A1_goc_dan', 'A2_nhac_tam', 'A3_huong_vung', 'A4_quay', 'A5_nhieu_kh
 MOC_FILES = ('lich', 'tap_moc', 'u_so', 'session')      # proposal v3 section 4: files whose SHA khoa checks
 MOC_NGUON_KEYS = {'frames', 'car_pose', 'bo_lay_mau'} | set(MOC_FILES)
 LE = 1.25
-CONTROLLERS = ('PID', 'LADRC')
-MASKABLE = ('g2', 'g3', 'g5')
-BRANCHES = ('bo_tick', 'giu_tick')
 
 
 class UError(Exception):
@@ -663,223 +648,6 @@ def khoa(gios, tb, cam, tk, xo, u_imu=None, phep5=None, tb_name='', tb_sha='', m
     return out
 
 
-# ── cong (rule 2b, gate file) ─────────────────────────────────────────────────────────────────────
-
-def read_plan(path):
-    """The C8 plan written before C8: '# key=value' lines (nhanh_tick = bo_tick / giu_tick; commit_hil = the hil
-    commit of the C8b scripts and the scorer, gone through Codex, O1 v11.34 Q4: without it the branch is giu_tick),
-    then the CSV slot, task, controller."""
-    cu.check_path(path)
-    meta, body = {}, []
-    with open(path, newline='', encoding='utf-8') as f:
-        for line in f:
-            if line.startswith('#'):
-                k, _, v = line[1:].strip().partition('=')
-                meta[k.strip()] = v.strip()
-            elif line.strip():
-                body.append(line)
-    plan = {}
-    for r in csv.DictReader(body):
-        if r.get('controller') not in CONTROLLERS:
-            raise UError(f'{path}: controller {r.get("controller")!r} (PID / LADRC)')
-        if r['slot'] in plan:
-            raise UError(f'{path}: slot {r["slot"]} twice')
-        plan[r['slot']] = dict(task=r['task'], controller=r['controller'])
-    if not plan:
-        raise UError(f'{path}: empty plan')
-    return plan, meta
-
-
-def check_pair(rid, gio, luoi, gio_sha):
-    """C8BS-13: the grid result belongs to this clock file (SHA, task, nodes); C8BS-15: it was scored with all five
-    conditions deciding (the classification of rule 2b is frozen before the report-only list)."""
-    if gio.get('format') != 'c8b_gio_v1':
-        raise UError(f'run {rid}: not a c8b_gio_v1 clock file')
-    if luoi.get('version') != 'c8b_luoi_v1':
-        raise UError(f'run {rid}: not a c8b_luoi_v1 grid file')
-    if luoi.get('gio_sha256') != gio_sha:
-        raise UError(f'run {rid}: the grid file was made from another clock file (gio_sha256)')
-    if luoi.get('task') != gio.get('task'):
-        raise UError(f'run {rid}: grid task {luoi.get("task")} but clock task {gio.get("task")}')
-    if list(luoi.get('nodes_s') or []) != list(gio.get('nodes_s') or []):
-        raise UError(f'run {rid}: grid nodes differ from the clock file nodes')
-    if luoi.get('report_only'):
-        raise UError(f'run {rid}: scored with report-only conditions {luoi["report_only"]}: rule 2b needs the '
-                     f'classification with all five deciding (O1 3.9 2b, C8BS-15)')
-
-
-def run_u_t_parts(gio, luoi):
-    """(u_t_s, parts) of one C8 run for rule 2b (O1 v11.34 3.9 2b: h + u_max), or (None, why): lost, or U_t not
-    finite at every node."""
-    if not gio.get('ok') or luoi.get('outcome') == 'hong_he_do':
-        return None, 'lost to the measurement system or no finite clock bound'
-    ut = luoi.get('u_t_nodes') or []
-    if not ut or any(isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) or x < 0
-                     for x in ut):
-        return None, 'U_t not finite (or negative) at every node'
-    h = _num(gio.get('half_s'), 'half_s')
-    if len(ut) != len(gio.get('nodes_s') or []):
-        raise UError('U_t of every node needed')
-    return max(ut) + h, dict(u_max_s=max(ut), h_s=h, n_nut=len(ut))
-
-
-def run_u_t(gio, luoi):
-    return run_u_t_parts(gio, luoi)[0]
-
-
-def _lost(gio, luoi):
-    return gio.get('ket_luan') == 'hong_he_do' or luoi.get('outcome') == 'hong_he_do'
-
-
-def slot_runs(plan, luot):
-    """luot: [(slot, run_id, gio, luoi, gio_sha256)] in the order run. Returns {slot: (run_id, u_t_s or None, parts
-    or why)} with the rerun rule: a later run of a slot only after a lost one. A run (id or clock file) in two slots
-    is refused (C8BS-14)."""
-    by, seen_id, seen_sha = {}, set(), set()
-    for slot, rid, g, l, gsha in luot:
-        if slot not in plan:
-            raise UError(f'run {rid}: slot {slot} not in the C8 plan (no run added after the plan, O1 3.9 2b)')
-        if g.get('task') != plan[slot]['task']:
-            raise UError(f'run {rid}: task {g.get("task")} but slot {slot} is {plan[slot]["task"]}')
-        if g.get('controller') != plan[slot]['controller']:
-            raise UError(f'run {rid}: controller from its log {g.get("controller")!r} but slot {slot} is '
-                         f'{plan[slot]["controller"]} (C8BS-14)')
-        if rid in seen_id or gsha in seen_sha:
-            raise UError(f'run {rid}: the same run or clock file given twice (C8BS-14)')
-        seen_id.add(rid)
-        seen_sha.add(gsha)
-        check_pair(rid, g, l, gsha)
-        by.setdefault(slot, []).append((rid, g, l))
-    out = {}
-    for slot, lst in by.items():
-        chosen = None
-        for rid, g, l in lst:
-            if chosen is not None:
-                raise UError(f'slot {slot}: run {rid} after a run that was not lost (a rerun only replaces a lost run)')
-            if not _lost(g, l):
-                chosen = (rid,) + run_u_t_parts(g, l)
-        out[slot] = chosen if chosen is not None else (lst[-1][0], None, 'every run of the slot lost')
-    return out
-
-
-def check_branch(branch, meta, luot):
-    """C8BS-16 (O1 v11.34 SC-12 Q4): the branch is the one written in the plan before C8; 'bo_tick' needs the commit
-    of the scripts in the plan, and every clock and grid file made by that commit, not dirty; every scored node used
-    that branch."""
-    if meta.get('nhanh_tick') != branch:
-        raise UError(f'u_t_branch {branch} but the C8 plan says {meta.get("nhanh_tick")!r}')
-    commit = meta.get('commit_hil', '')
-    if branch == 'bo_tick' and len(commit) < 7:
-        raise UError('bo_tick needs commit_hil (the scripts gone through Codex) in the C8 plan (O1 v11.34 Q4)')
-    want = {'bo_tick': 'bo', 'giu_tick': 'giu'}[branch]
-    for slot, rid, g, l, _ in luot:
-        # C8BS-R4-1, R5-1: the nodes were scored whenever the clock file is ok, even when every node then says lost;
-        # only a run stopped at the clock check (gio not ok) has no scorer to check
-        scored = bool(g.get('ok'))
-        checks = [('clock', g.get('script')), ('grid', l.get('script'))]
-        if scored:
-            checks.append(('scorer', l.get('scorer')))
-        for nm, sc in checks:
-            sc = sc or {}
-            if commit and (not str(sc.get('commit', '')).startswith(commit) or sc.get('dirty') is not False):
-                raise UError(f'run {rid}: {nm} not from commit_hil {commit} with the C8b chain clean')
-        if not scored:
-            continue
-        # C8BS-16 round 4: every node scored by the canonical scorer of the repo, tracked and clean
-        for k, nd in enumerate((l.get('scorer') or {}).get('nut') or [None]):
-            if not nd or nd.get('file') != 'tools/c7_score.py' or nd.get('tracked') is not True                     or nd.get('dirty') is not False:
-                raise UError(f'run {rid}: node {k} not scored by the tracked, clean tools/c7_score.py (C8BS-16)')
-        if l.get('outcome') == 'hong_he_do':
-            continue                                   # every node lost: no node carries a tick branch
-        used = set(l.get('nhanh_tick') or [])
-        if used != {want}:
-            raise UError(f'run {rid}: nodes scored with tick branch {sorted(used)}, the plan says {want}')
-
-
-def cong(k, plan, luot, levels, branch, c8_dir, cam=None, written_by=None, meta=None, khoa_sha256=None):
-    """The gate file; camera.c8b is the lock itself (so camera.c8b.moc_dich carries U_moc before the margin, for the
-    later runs, CODE_GATE 18/11) plus khoa_sha256, the SHA-256 of the lock file read (None when called from code)."""
-    import gate_c8
-    import o1_gate
-    from o1_tasks import FIG8
-    check_khoa(k)                                       # C8BU-R1-7: also when called from code, not only from the CLI
-    if branch not in BRANCHES:
-        raise UError(f'u_t_branch {branch!r}: {BRANCHES}')
-    if not levels or len(set(levels)) != len(levels) or any(lv not in FIG8 for lv in levels):
-        raise UError(f'levels {levels!r}: distinct figure-8 tasks')
-    check_branch(branch, meta or {}, luot)
-    # C8BU4-R1-3: every run given (lost ones too, before the rerun rule drops any) is a C8 run of this lock with the
-    # same clock file
-    lk = k['luot_c8']
-    for slot, rid, _g, _l, gsha in luot:
-        if rid not in lk:
-            raise UError(f'run {rid} (slot {slot}) is not a C8 run of the lock: the lock was made from other runs')
-        if gsha != lk[rid]['gio_sha256']:
-            raise UError(f'run {rid}: its clock file is not the one the lock was made from (gio_sha256 differs)')
-        # C8BU4-R2-2: a run with an ok clock has its frames in the lock, the frames of that clock file
-        if _g.get('ok'):
-            g_fr = (_g.get('sha256') or {}).get('frames') if isinstance(_g.get('sha256'), dict) else None
-            if lk[rid].get('frames_sha256') is None or lk[rid]['frames_sha256'] != g_fr:
-                raise UError(f'run {rid}: the lock has no U_moc frames for it, or not the frames of its clock file '
-                             f'(sha256.frames)')
-    chosen = slot_runs(plan, luot)
-    thr = {c: o1_gate.THRESHOLDS[c] for c in MASKABLE}
-    per, parts = {}, {}
-    for lv in levels:
-        runs = []
-        for slot, p in plan.items():
-            if p['task'] != lv:
-                continue
-            if slot not in chosen:
-                raise UError(f'slot {slot} ({lv}, {p["controller"]}) has no run')
-            rid, ut, part = chosen[slot]
-            parts[rid] = dict(slot=slot, task=lv, controller=p['controller'], u_t_s=ut,
-                              **(part if isinstance(part, dict) else dict(bo_ra=part)))
-            if ut is not None:
-                runs.append(dict(run_id=rid, controller=p['controller'], u_t_s=ut))
-        ctl = {r['controller'] for r in runs}
-        if not set(CONTROLLERS) <= ctl:
-            raise UError(f'{lv}: needs a run of each controller not lost and with a finite U_t (has {sorted(ctl)}): '
-                         f'C8 not finished (O1 3.9 2b)')
-        # CODE_GATE (17/11): the level block comes from gate_c8.level_block: peaks of the schedule WITHOUT the upper-bound
-        # margin (schedule_peaks), U_t,C8 = max u_t_s, uhat, report_only by '>' on the recomputed bound
-        per[lv] = gate_c8.level_block(lv, k['U_p_m'], k['U_psi_deg'], runs)
-    return dict(format='gate_c8_v1', c8_dir=c8_dir, written_by=written_by or {},
-                written_at=datetime.datetime.now().astimezone().isoformat(timespec='seconds'),
-                levels=list(levels), u_t_branch=branch,
-                dieu_2b=dict(rule='report_only = {c in g2,g3,g5 : uhat[c] > 0.5 * threshold[c]}', thresholds=thr,
-                             u_p_m=k['U_p_m'], u_psi_deg=k['U_psi_deg'], per_level=per),
-                camera=dict(c8b=dict(k, u_t_luot_c8=parts, khoa_sha256=khoa_sha256), cam=cam or {}))
-
-
-def write_gate(path, d):
-    """Write with gate_c8.write_gate (CODE_GATE: the bytes are checked as the reader reads them before the file is
-    opened, so a file the reader refuses is never written), then read it back with read_gate_c8. An existing file is
-    never replaced (one gate file per C8, written once). Returns the GateC8 read back."""
-    try:
-        import gate_c8
-    except ImportError:
-        raise UError('tools/gate_c8.py (CODE_GATE) is not on this branch: the gate file cannot be checked, not written')
-    cu.check_path(path)
-    # C8BS-R3-1: claim the path with an exclusive create (atomic: of two writers only one gets it), then let
-    # gate_c8.write_gate (which opens 'wb') replace our own empty placeholder; refused -> placeholder removed
-    try:
-        with open(path, 'xb'):
-            pass
-    except FileExistsError:
-        raise UError(f'{path} exists: the C8 gate file is written once')
-    try:
-        sha = gate_c8.write_gate(path, d)
-        g = gate_c8.read_gate_c8(path)
-    except gate_c8.GateFileError as exc:
-        if os.path.exists(path) and os.path.getsize(path) == 0:
-            os.remove(path)
-        raise UError(f'gate_c8 refused the content: {exc}')
-    if g.sha256 != sha:
-        raise UError(f'{path}: SHA read back {g.sha256} differs from the bytes written {sha}')
-    return g
-
-
 # ── CLI ──────────────────────────────────────────────────────────────────────────────────────
 
 def _json(path):
@@ -908,7 +676,7 @@ def _clean(o):
 
 
 def check_khoa(k, name='khoa'):
-    """C8BS-R7-4: cong takes only a lock of this version whose U_p, U_psi carry exactly the parts P1-P7, A1-A7 (a v1
+    """C8BS-R7-4: a lock of this version whose U_p, U_psi carry exactly the parts P1-P7, A1-A7 (a v1
     lock has no plumb / zc part, a v2 lock the names of tests 1, 2, a v3 lock no U_moc, no A7: proposal v3 4)."""
     if k.get('version') != VERSION or set(k.get('U_p_phan_m') or {}) != set(P_PARTS) \
             or set(k.get('U_psi_phan_deg') or {}) != set(A_PARTS):
@@ -975,15 +743,6 @@ def main(argv=None):
     a1.add_argument('--u-imu')
     a1.add_argument('--phep5')
     a1.add_argument('--out', required=True)
-    a2 = sub.add_parser('cong')
-    a2.add_argument('--khoa', required=True)
-    a2.add_argument('--ke-hoach', required=True)
-    a2.add_argument('--levels', required=True)
-    a2.add_argument('--u-t-branch', required=True, choices=BRANCHES)
-    a2.add_argument('--luot', action='append', required=True, help='SLOT=RUN_ID,gio.json,luoi.json (in run order)')
-    a2.add_argument('--cam')
-    a2.add_argument('--c8-dir', required=True)
-    a2.add_argument('--out', required=True)
     a = ap.parse_args(argv)
     try:
         if a.cmd == 'khoa':
@@ -1032,24 +791,6 @@ def main(argv=None):
                 f.write(json.dumps(_clean(out), indent=1, ensure_ascii=False, allow_nan=False))
             print(f'U_p {out["U_p_m"] * 1e3:.2f} mm, U_psi {out["U_psi_deg"]:.3f} deg, troi '
                   f'{out["troi_ppm"]:.0f} ppm, man trap {out["man_trap_kieu"]}')
-        else:
-            k = _json(a.khoa)
-            check_khoa(k, a.khoa)
-            plan, meta = read_plan(a.ke_hoach)
-            luot = []
-            for s in a.luot:
-                slot, rest = s.split('=', 1)
-                rid, g, l = rest.split(',')
-                gd, gsha = _json_sha(g)                 # C8BU4-R2-4: content and SHA from the same bytes
-                luot.append((slot, rid, gd, _json(l), gsha))
-            st = cu.script_state()
-            d = cong(k, plan, luot, [x.strip() for x in a.levels.split(',')], a.u_t_branch, a.c8_dir,
-                     _json(a.cam) if a.cam else None,
-                     dict(script='tools/c8b_u.py', repo='hil-framework', commit=st.get('commit'), dirty=st.get('dirty')),
-                     meta, khoa_sha256=cu.sha256(a.khoa))
-            g = write_gate(a.out, _clean(d))
-            print(f'gate file {a.out} sha256 {g.sha256}; ' + '; '.join(
-                f'{lv}: report_only {d["dieu_2b"]["per_level"][lv]["report_only"]}' for lv in d['levels']))
     except (UError, cu.InputError, OSError, ValueError, KeyError) as exc:
         print(f'c8b_u: {exc}', file=sys.stderr)
         print('#ket_qua,ma=2')

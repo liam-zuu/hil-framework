@@ -2124,8 +2124,8 @@ def test_plumb_zc_part_bounds_car_pose():
         assert err <= b * (1 + 1e-9) + 1e-12
 
 
-def test_cong_refuses_v1_lock():
-    # C8BS-R7-4: a lock written before the plumb / zc part (c8b_khoa_v1, cc22feb) cannot make the gate file
+def test_check_khoa_refuses_old_locks():
+    # C8BS-R7-4: a lock written before the plumb / zc part (c8b_khoa_v1, cc22feb) is refused
     k = KH()
     CU.check_khoa(json.loads(json.dumps(CU._clean(k))))
     # v2: parts named after tests 1, 2 (b740f2a); v3: no U_moc, no A7 (f295020; proposal v3 section 4)
@@ -2322,8 +2322,6 @@ def test_check_khoa_moc_block():
         bad['moc_dich'][fld] = val
         with pytest.raises(CU.UError, match=txt):
             CU.check_khoa(bad)
-        with pytest.raises(CU.UError, match=txt):
-            CU.cong(bad, _plan(), _luot(), ['O1-F05'], 'bo_tick', 'x', meta=META)
 
 
 def test_khoa_phep5_and_one_frame():
@@ -2339,7 +2337,6 @@ def _plan():
             '3': dict(task='O1-F08', controller='PID'), '4': dict(task='O1-F08', controller='LADRC')}
 
 
-META = dict(nhanh_tick='bo_tick', commit_hil='abc1234')
 SCRIPT = dict(commit='abc1234ffff', dirty=False)
 SCORER = dict(commit='abc1234ffff', dirty=False, nut=[dict(commit='abc1234ffff', dirty=False, file='tools/c7_score.py',
                                                             tracked=True)])
@@ -2371,11 +2368,11 @@ def _luot(lost_first=False):
     return out
 
 
-LOCK_RUNS = ('r1', 'r2', 'r3', 'r4', 'r3a', 'r1b', 'r9', 'r1x', 'r1y')   # every run the cong tests give
+LOCK_RUNS = ('r1', 'r2', 'r3', 'r4', 'r3a', 'r1b', 'r9', 'r1x', 'r1y')
 
 
 def _lock(U_p, U_psi):
-    """A lock that check_khoa accepts (cong checks it, C8BU-R1-7): all of U_p in P1, all of U_psi in A1."""
+    """A lock that check_khoa accepts (C8BU-R1-7): all of U_p in P1, all of U_psi in A1."""
     return dict(version=CU.VERSION, le=CU.LE, U_p_m=U_p, U_psi_deg=U_psi,
                 U_p_phan_m={x: (U_p / CU.LE if x == 'P1_anh_san' else 0.0) for x in CU.P_PARTS},
                 U_psi_phan_deg={x: (U_psi / CU.LE if x == 'A1_goc_dan' else 0.0) for x in CU.A_PARTS},
@@ -2388,7 +2385,7 @@ K = _lock(0.004, 2.0)
 
 
 def test_check_khoa_totals_and_parts():
-    # C8BU-R1-7: positive parts with totals set to 0, a wrong margin, a bad part: refused, also inside cong
+    # C8BU-R1-7: positive parts with totals set to 0, a wrong margin, a bad part: refused
     CU.check_khoa(K)
     for bad in (dict(K, U_p_m=0.0), dict(K, U_psi_deg=0.0), dict(K, le=1.0),
                 dict(K, U_p_phan_m=dict(K['U_p_phan_m'], P7_nhieu_khung=-1e-4)),
@@ -2396,46 +2393,7 @@ def test_check_khoa_totals_and_parts():
         with pytest.raises(CU.UError):
             CU.check_khoa(bad)
     with pytest.raises(CU.UError, match='U_p_m'):
-        CU.cong(dict(K, U_p_m=0.0), _plan(), _luot(), ['O1-F05'], 'bo_tick', 'x', meta=META)
-
-
-def test_cong_rule_2b():
-    import gate_c8
-    import o1_gate
-    d = CU.cong(K, _plan(), _luot(lost_first=True), ['O1-F05', 'O1-F08'], 'bo_tick', 'C8/x', meta=META)
-    p8 = d['dieu_2b']['per_level']['O1-F08']
-    assert p8['u_t_c8_s'] == pytest.approx(max(0.021 + 0.009, 0.03 + 0.007))
-    v, wz = gate_c8.schedule_peaks('O1-F08')                    # peaks without the margin (CODE_GATE GC1-3)
-    assert (p8['v_cmd_max'], p8['wz_cmd_max']) == (v, wz)
-    assert p8['uhat']['g3'] == pytest.approx(0.004 + p8['u_t_c8_s'] * v)
-    assert p8['uhat']['g5'] == pytest.approx(2.0 + math.degrees(p8['u_t_c8_s'] * wz))
-    assert p8['report_only'] == [c for c in ('g2', 'g3', 'g5') if p8['uhat'][c] > 0.5 * o1_gate.THRESHOLDS[c]]
-    assert [r['run_id'] for r in p8['runs']] == ['r3', 'r4']
-    lu = d['camera']['c8b']['u_t_luot_c8']
-    assert lu['r3']['h_s'] == pytest.approx(0.009) and lu['r3']['u_max_s'] == pytest.approx(0.021)
-    assert d['format'] == 'gate_c8_v1' and d['u_t_branch'] == 'bo_tick'
-    gate_c8.check(d)                                             # the real contract of the gate file
-
-
-def test_cong_written_and_read_back_with_real_reader(tmp_path):
-    k = dict(K, version=CU.VERSION)
-    d = CU.cong(k, _plan(), _luot(), ['O1-F05', 'O1-F08'], 'bo_tick', 'C8/x', meta=META,
-                written_by=dict(script='tools/c8b_u.py', repo='hil-framework', commit='abc1234', dirty=False))
-    g = CU.write_gate(str(tmp_path / 'gate_c8.json'), CU._clean(d))
-    assert g.levels == ('O1-F05', 'O1-F08') or list(g.levels) == ['O1-F05', 'O1-F08']
-    assert tuple(g.report_only('O1-F08')) == tuple(d['dieu_2b']['per_level']['O1-F08']['report_only'])
-    with pytest.raises(CU.UError, match='written once'):
-        CU.write_gate(str(tmp_path / 'gate_c8.json'), CU._clean(d))
-    (tmp_path / 'claimed.json').write_bytes(b'')                     # C8BS-R3-1: another writer holds the path
-    with pytest.raises(CU.UError, match='written once'):
-        CU.write_gate(str(tmp_path / 'claimed.json'), CU._clean(d))
-    assert (tmp_path / 'claimed.json').read_bytes() == b''
-    bad = json.loads(json.dumps(CU._clean(d)))
-    bad['dieu_2b']['per_level']['O1-F08']['report_only'] = []    # contradicts uhat: the reader refuses, no file
-    if d['dieu_2b']['per_level']['O1-F08']['report_only']:
-        with pytest.raises(CU.UError, match='refused'):
-            CU.write_gate(str(tmp_path / 'g2.json'), bad)
-        assert not (tmp_path / 'g2.json').exists()
+        CU.check_khoa(dict(K, U_p_m=0.0))
 
 
 def _scoring(d, tag, cam, runs=('r1', 'r2', 'r3', 'r4'), body=None, clip_tag=None, reverse=False):
@@ -2503,22 +2461,10 @@ def _khoa_args(d, S, gio=None, track=None, files=None):
     return a
 
 
-def _cong_args(d, kp, S, out):
-    if not (d / 'kh.csv').exists():
-        (d / 'kh.csv').write_text('# nhanh_tick=bo_tick\n# commit_hil=abc1234\nslot,task,controller\n' + ''.join(
-            f'{s},{p["task"]},{p["controller"]}\n' for s, p in _plan().items()), encoding='utf-8')
-    a = ['cong', '--khoa', str(kp), '--ke-hoach', str(d / 'kh.csv'), '--levels', 'O1-F05,O1-F08', '--u-t-branch',
-         'bo_tick', '--c8-dir', 'C8/x', '--out', str(out)]
-    for r in sorted(S['gio']):
-        a += ['--luot', f'{S["slot"][r]}={r},{S["gio"][r]},{S["luoi"][r]}']
-    return a
-
-
-def test_moc_cli_export_lock_gate(tmp_path):
-    # C8BM-R2-4: camera file (as exported) -> khoa (CLI, real files and SHA) -> cong (CLI) -> gate file; the gate file
-    # carries the lock (camera.c8b.moc_dich before the margin) and the SHA of the lock file (CODE_GATE 18/11)
+def test_moc_cli_export_lock(tmp_path):
+    # C8BM-R2-4: camera file (as exported) -> khoa (CLI, real files and SHA); the gate file is gate_c8.py ghep's (cong
+    # removed 20/11)
     import c8_u_imu as cu
-    import gate_c8
     d = tmp_path
     S, cam = _scoring(d, 'A', sync(CAM))
     kp = d / 'khoa.json'
@@ -2527,19 +2473,11 @@ def test_moc_cli_export_lock_gate(tmp_path):
     assert k['version'] == 'c8b_khoa_v4' and k['moc_dich']['U_moc_xy_m'] == 0.0021
     assert {n['file'] for n in k['nguon']} >= {'lich.json', 'u_so.json', 'frames_r1.csv', 'track_r1.json'}
     assert k['luot_c8']['r2'] == dict(gio_sha256=cu.sha256(S['gio']['r2']), frames_sha256=cu.sha256(S['frames']['r2']))
-    gp = d / 'gate_c8.json'
-    assert CU.main(_cong_args(d, kp, S, gp)) == 0
-    g = gate_c8.read_gate_c8(str(gp))
-    raw = json.loads(gp.read_text(encoding='utf-8'))
-    c8b = raw['camera']['c8b']
-    assert c8b['khoa_sha256'] == cu.sha256(str(kp)) and g.sha256
-    assert c8b['moc_dich']['U_moc_xy_m'] == 0.0021 and c8b['moc_dich']['U_moc_psi_deg'] == 0.07
-    assert c8b['moc_dich']['nguon']['bo_lay_mau'] == cam['moc_dich']['nguon']['bo_lay_mau']
-    assert raw['dieu_2b']['u_psi_deg'] == pytest.approx(k['U_psi_deg'])
-    # a v3 lock (before this proposal) cannot make a gate file
-    (d / 'khoa_v3.json').write_text(json.dumps(dict(k, version='c8b_khoa_v3')), encoding='utf-8')
-    assert CU.main(_cong_args(d, d / 'khoa_v3.json', S, d / 'g3.json')) == 2
-    assert not (d / 'g3.json').exists()
+    assert k['moc_dich']['U_moc_psi_deg'] == 0.07
+    assert k['moc_dich']['nguon']['bo_lay_mau'] == cam['moc_dich']['nguon']['bo_lay_mau']
+    CU.check_khoa(k)
+    with pytest.raises(CU.UError, match='parts P1-P7, A1-A7'):          # a v3 lock (before this proposal) is refused
+        CU.check_khoa(dict(k, version='c8b_khoa_v3'))
 
 
 def test_moc_cli_sources_of_another_scoring_refused(tmp_path):
@@ -2577,28 +2515,6 @@ def test_moc_cli_sources_of_another_scoring_refused(tmp_path):
     # B alone is accepted
     assert CU.main(_khoa_args(d, B) + ['--out', str(d / 'kB.json')]) == 0
     assert cu.sha256(B['frames']['r1']) == json.loads((d / 'kB.json').read_text())['luot_c8']['r1']['frames_sha256']
-
-
-def test_moc_cli_gate_runs_must_be_the_lock_runs(tmp_path):
-    # C8BU4-R1-3: a lock made from scoring A cannot make the gate file of the runs of B (same run ids, other clock
-    # files), nor of a run the lock does not have
-    d = tmp_path
-    A, _ = _scoring(d, 'A', sync(CAM))
-    B, _ = _scoring(d, 'B', sync(CAM))
-    kp = d / 'kA.json'
-    assert CU.main(_khoa_args(d, A) + ['--out', str(kp)]) == 0
-    assert CU.main(_cong_args(d, kp, B, d / 'gAB.json')) == 2
-    assert not (d / 'gAB.json').exists()
-    k = json.loads(kp.read_text(encoding='utf-8'))
-    with pytest.raises(CU.UError, match='not the one the lock was made from'):
-        CU.cong(k, _plan(), [(s, r, g, l, cu_sha) for s, r, g, l, cu_sha in _luot()], ['O1-F05'], 'bo_tick', 'x',
-                meta=META)
-    k2 = json.loads(json.dumps(k))
-    del k2['luot_c8']['r1']
-    del k2['moc_dich']['nguon']['frames']['r1']
-    with pytest.raises(CU.UError, match='not a C8 run of the lock'):
-        CU.cong(k2, _plan(), _luot(), ['O1-F05'], 'bo_tick', 'x', meta=META)
-    assert CU.main(_cong_args(d, kp, A, d / 'gA.json')) == 0
 
 
 def test_moc_cli_same_schedule_body_other_clips_refused(tmp_path):
@@ -2691,9 +2607,10 @@ def test_moc_api_track_clip_in_schedule():
     KHG(gios, sync(CAM, 'ab'))
 
 
-def test_cong_lock_frames_of_ok_runs(tmp_path):
+def test_lock_frames_consistent_inside(tmp_path):
     # C8BU4-R2-2 (Codex): a lock edited by hand to drop the U_moc frames of an ok run (both copies), or to name other
-    # frames in both copies: cong refuses
+    # frames in both copies, is consistent inside (only the clock file shows it: the gate's check since cong was
+    # removed 20/11); a malformed frames sha is refused
     d = tmp_path
     A, _ = _scoring(d, 'A', sync(CAM))
     kp = d / 'kA.json'
@@ -2707,9 +2624,6 @@ def test_cong_lock_frames_of_ok_runs(tmp_path):
         else:
             b['moc_dich']['nguon']['frames']['r1'] = b['luot_c8']['r1']['frames_sha256'] = 'f' * 64
         CU.check_khoa(b)                                   # consistent inside: only the clock file shows it
-        (d / f'k_{how}.json').write_text(json.dumps(b), encoding='utf-8')
-        assert CU.main(_cong_args(d, d / f'k_{how}.json', A, d / f'g_{how}.json')) == 2, how
-        assert not (d / f'g_{how}.json').exists()
     b = json.loads(json.dumps(k))
     b['luot_c8']['r1']['frames_sha256'] = 'xyz'
     with pytest.raises(CU.UError, match='frames_sha256'):
@@ -2725,21 +2639,6 @@ def test_check_khoa_car_pose_values():
         b['moc_dich']['nguon']['car_pose'][key] = val
         with pytest.raises(CU.UError, match=f'car_pose.{key}'):
             CU.check_khoa(b)
-        with pytest.raises(CU.UError, match=f'car_pose.{key}'):
-            CU.cong(b, _plan(), _luot(), ['O1-F05'], 'bo_tick', 'x', meta=META)
-
-
-def test_cong_cli_reads_each_clock_file_once(tmp_path, monkeypatch):
-    # C8BU4-R2-4: the clock file content checked and its SHA come from one read (no separate hash of the path)
-    d = tmp_path
-    A, _ = _scoring(d, 'A', sync(CAM))
-    kp = d / 'kA.json'
-    assert CU.main(_khoa_args(d, A) + ['--out', str(kp)]) == 0
-    hashed = []
-    real = CU.cu.sha256
-    monkeypatch.setattr(CU.cu, 'sha256', lambda p: hashed.append(os.path.basename(p)) or real(p))
-    assert CU.main(_cong_args(d, kp, A, d / 'g.json')) == 0
-    assert not [h for h in hashed if h.startswith('gio_')]
 
 
 def test_check_khoa_sources_shape_and_runs():
@@ -2755,8 +2654,6 @@ def test_check_khoa_sources_shape_and_runs():
     bad['moc_dich']['nguon'] = {}
     with pytest.raises(CU.UError, match='lacks'):
         CU.check_khoa(bad)
-    with pytest.raises(CU.UError, match='lacks'):
-        CU.cong(bad, _plan(), _luot(), ['O1-F05'], 'bo_tick', 'x', meta=META)
     bad = json.loads(json.dumps(k))
     bad['moc_dich']['nguon']['lich'] = 'x' * 64
     with pytest.raises(CU.UError, match='nguon.lich'):
@@ -2806,95 +2703,6 @@ def test_moc_api_chain_links():
     KH()                                                                    # the consistent set is accepted
 
 
-def test_cong_strict_half():
-    import gate_c8
-    assert gate_c8.uhat_of(0.05, 1.0, 0.0, 1.0, 1.0)['g2'] == 0.05
-    lu = [(s, r, dict(g, half_s=0.0), dict(l, u_t_nodes=[0.001] * len(l['u_t_nodes'])), sh)
-          for s, r, g, l, sh in _luot()]
-    d = CU.cong(_lock(0.05, 1.0), _plan(), lu, ['O1-F05'], 'bo_tick', 'x', meta=META)
-    assert 'g2' not in d['dieu_2b']['per_level']['O1-F05']['report_only']      # 0.05 = half of D: still decides
-
-
-def test_cong_needs_both_controllers_and_rerun_rule():
-    lu = [x for x in _luot() if x[0] != '2']
-    with pytest.raises(CU.UError, match='no run'):
-        CU.cong(K, _plan(), lu, ['O1-F05'], 'bo_tick', 'x', meta=META)
-    g, l, s = _pair('r1b', 'O1-F05', 0.006, 'dat', [0.02, 0.02])
-    with pytest.raises(CU.UError, match='rerun only replaces'):
-        CU.cong(K, _plan(), _luot() + [('1', 'r1b', g, l, s)], ['O1-F05'], 'bo_tick', 'x', meta=META)
-    g, l, s = _pair('r9', 'O1-F05', 0.006, 'dat', [0.02, 0.02])
-    l = dict(l)
-    with pytest.raises(CU.UError, match='not in the C8 plan'):
-        CU.cong(K, _plan(), _luot() + [('9', 'r9', g, l, s)], ['O1-F05'], 'bo_tick', 'x', meta=META)
-    lu = [(sl, r, g, dict(l, u_t_nodes=[math.inf, 0.02]) if r == 'r2' else l, sh) for sl, r, g, l, sh in _luot()]
-    with pytest.raises(CU.UError, match='each controller'):
-        CU.cong(K, _plan(), lu, ['O1-F05'], 'bo_tick', 'x', meta=META)
-
-
-def test_cong_refuses_run_twice_and_foreign_grid():
-    lu = _luot()
-    dup = [lu[0], ('2', lu[0][1], dict(lu[0][2], controller='LADRC'), lu[0][3], lu[0][4])] + lu[2:]   # one run, 2 slots
-    with pytest.raises(CU.UError, match='twice'):
-        CU.cong(K, _plan(), dup, ['O1-F05'], 'bo_tick', 'x', meta=META)
-    s0, r0, g0, l0, sh0 = lu[0]
-    with pytest.raises(CU.UError, match='another clock file'):
-        CU.cong(K, _plan(), [(s0, r0, g0, dict(l0, gio_sha256='f' * 64), sh0)] + lu[1:], ['O1-F05'], 'bo_tick', 'x',
-                meta=META)
-    with pytest.raises(CU.UError, match='nodes differ'):
-        CU.cong(K, _plan(), [(s0, r0, g0, dict(l0, nodes_s=[9.0]), sh0)] + lu[1:], ['O1-F05'], 'bo_tick', 'x',
-                meta=META)
-    with pytest.raises(CU.UError, match='all five deciding'):
-        CU.cong(K, _plan(), [(s0, r0, g0, dict(l0, report_only=['g5']), sh0)] + lu[1:], ['O1-F05'], 'bo_tick',
-                'x', meta=META)
-
-
-def test_cong_branch_and_commit_from_plan():
-    lu = _luot()
-    with pytest.raises(CU.UError, match='the C8 plan says'):
-        CU.cong(K, _plan(), lu, ['O1-F05'], 'giu_tick', 'x', meta=META)
-    with pytest.raises(CU.UError, match='needs commit_hil'):
-        CU.cong(K, _plan(), lu, ['O1-F05'], 'bo_tick', 'x', meta=dict(nhanh_tick='bo_tick'))
-    s0, r0, g0, l0, sh0 = lu[0]
-    with pytest.raises(CU.UError, match='not from commit_hil'):
-        CU.cong(K, _plan(), [(s0, r0, g0, dict(l0, script=dict(commit='abc1234', dirty=True)), sh0)] + lu[1:],
-                ['O1-F05'], 'bo_tick', 'x', meta=META)
-    with pytest.raises(CU.UError, match='tick branch'):
-        CU.cong(K, _plan(), [(s0, r0, g0, dict(l0, nhanh_tick=['giu']), sh0)] + lu[1:], ['O1-F05'], 'bo_tick', 'x',
-                meta=META)
-    with pytest.raises(CU.UError, match='tick branch'):                 # no evidence of the branch: refused
-        CU.cong(K, _plan(), [(s0, r0, g0, dict(l0, nhanh_tick=[]), sh0)] + lu[1:], ['O1-F05'], 'bo_tick', 'x',
-                meta=META)
-    with pytest.raises(CU.UError, match='scorer not from commit_hil'):
-        CU.cong(K, _plan(), [(s0, r0, g0, dict(l0, scorer=dict(commit='abc1234', dirty=True)), sh0)] + lu[1:],
-                ['O1-F05'], 'bo_tick', 'x', meta=META)
-
-
-def test_cong_scorer_must_be_canonical_and_lost_run_needs_none():
-    lu = _luot()
-    s0, r0, g0, l0, sh0 = lu[0]
-    other = dict(SCORER, nut=[dict(SCORER['nut'][0], file='tools/scorer_thu.py', tracked=False)])
-    with pytest.raises(CU.UError, match='C8BS-16'):
-        CU.cong(K, _plan(), [(s0, r0, g0, dict(l0, scorer=other), sh0)] + lu[1:], ['O1-F05'], 'bo_tick', 'x', meta=META)
-    # C8BS-R4-1: slot 1 lost at the clock check (no node, scorer None), then a valid rerun: accepted
-    g, l, s = _pair('r1x', 'O1-F05', 0.006, 'chua_ket_luan', [], gio_ok=False)
-    l = dict(l, scorer=None, nhanh_tick=[], outcome='hong_he_do')
-    d = CU.cong(K, _plan(), [('1', 'r1x', g, l, s)] + lu, ['O1-F05'], 'bo_tick', 'x', meta=META)
-    assert [r['run_id'] for r in d['dieu_2b']['per_level']['O1-F05']['runs']] == ['r1', 'r2']
-
-
-def test_cong_scorer_checked_when_every_node_lost():
-    # C8BS-R5-1: clock ok, nodes scored by another commit, every node lost: the scorer is still checked
-    lu = _luot()
-    g, l, s = _pair('r1y', 'O1-F05', 0.006, 'hong_he_do', [0.02, 0.02])
-    bad = dict(SCORER, commit='bbbbbbb', nut=[dict(SCORER['nut'][0], commit='bbbbbbb')])
-    l = dict(l, scorer=bad, nhanh_tick=[])
-    with pytest.raises(CU.UError, match='scorer not from commit_hil'):
-        CU.cong(K, _plan(), [('1', 'r1y', g, l, s)] + lu, ['O1-F05'], 'bo_tick', 'x', meta=META)
-    l = dict(l, scorer=SCORER)                       # same run scored by the planned commit: lost, rerun accepted
-    d = CU.cong(K, _plan(), [('1', 'r1y', g, l, s)] + lu, ['O1-F05'], 'bo_tick', 'x', meta=META)
-    assert [r['run_id'] for r in d['dieu_2b']['per_level']['O1-F05']['runs']] == ['r1', 'r2']
-
-
 def test_repo_state_marks_untracked_scorer(tmp_path):
     p = os.path.join(HERE, '..', 'c8b_tmp_untracked_scorer.py')
     open(p, 'w').write('# temporary, untracked' + chr(10))
@@ -2906,28 +2714,3 @@ def test_repo_state_marks_untracked_scorer(tmp_path):
     st = G.repo_state(os.path.join(HERE, '..', 'c7_score.py'))
     assert st['file'] == 'tools/c7_score.py' and st['tracked'] is True
 
-
-def test_cong_controller_from_log():
-    lu = _luot()
-    s1, r1, g1, l1, h1 = lu[1]                       # slot 2 is LADRC; its log says PID
-    with pytest.raises(CU.UError, match='C8BS-14'):
-        CU.cong(K, _plan(), [lu[0], (s1, r1, dict(g1, controller='PID'), l1, h1)] + lu[2:], ['O1-F05'], 'bo_tick',
-                'x', meta=META)
-    with pytest.raises(CU.UError, match='C8BS-14'):
-        CU.cong(K, _plan(), [lu[0], (s1, r1, dict(g1, controller=None), l1, h1)] + lu[2:], ['O1-F05'], 'bo_tick',
-                'x', meta=META)
-
-
-def test_read_plan_meta(tmp_path):
-    p = tmp_path / 'ke_hoach.csv'
-    p.write_text('# nhanh_tick=bo_tick\n# commit_hil=abc1234\nslot,task,controller\n1,O1-F05,PID\n2,O1-F05,LADRC\n',
-                 encoding='utf-8')
-    plan, meta = CU.read_plan(str(p))
-    assert meta == META and plan['2'] == dict(task='O1-F05', controller='LADRC')
-
-
-def test_write_gate_needs_reader(tmp_path, monkeypatch):
-    monkeypatch.setitem(sys.modules, 'gate_c8', None)
-    with pytest.raises(CU.UError, match='gate_c8'):
-        CU.write_gate(str(tmp_path / 'g.json'), {})
-    assert not (tmp_path / 'g.json').exists()
