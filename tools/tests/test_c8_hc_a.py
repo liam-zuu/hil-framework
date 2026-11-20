@@ -1395,3 +1395,70 @@ def test_ramp_bound_pays_only_its_own_staleness(tmp_path):
     edit_log(d, fn)
     ok, ck, _ = checks(d)
     assert not ok['lenh_nhan_khop_lich'], ck
+
+
+# ------------------------------------------------------------------ HCB3 (CODE 20/11): IMU drift in yaw_dong
+def test_imu_drift_taken_off_dynamic_yaw(tmp_path):
+    """HCB3 (session 2 K1/K2: IMU yaw drifting 0.03-0.05 deg/s, encoder agreeing with the camera): a linear IMU drift
+    of 0.08 deg/s gave raw eps > 0.30 deg; the line fitted against the encoder heading on the stop windows (two
+    ends of the leg left out) takes it off, the gate passes and a stays inside u_a."""
+    d, truth = make(tmp_path, 'HC_K2_1', cho='K2', yaw_bias=lambda t: math.radians(0.08) * t, noise_psi_deg=0.02)
+    an = analyse(d)
+    longs = [lg for lg in an['legs'] if lg['dai']]
+    assert max(lg['eps_tho'] for lg in longs) > math.radians(ca.EPS_YAW_MAX_DEG)
+    assert max(lg['eps'] for lg in longs) < math.radians(0.1)
+    assert all(lg['troi']['n_cua_so'] == 5 and abs(lg['troi']['toc_do_deg_s'] - 0.08) < 0.005 for lg in longs)
+    assert abs(an['troi_imu']['toc_do_deg_s'] - 0.08) < 0.005 and an['troi_imu']['n_cua_so'] == 7
+    r = result(d, 'K2')
+    assert r['cong']['yaw_dong'] and r['troi_imu']['u_troi_max_deg'] is not None, r['cong']
+    assert abs(math.radians(r['a_k_deg']) - truth['a_true']) <= math.radians(r['u_a_k_deg'])
+
+
+def test_camera_drift_not_taken_as_imu_drift(tmp_path):
+    """HCB3 cach A: a camera heading drift (mount) of 0.05 deg/s is seen against the encoder (> 2 SE): no
+    correction, the raw check stays (eps large, gate fails or u_yaw covers it), the reason is written."""
+    d, truth = make(tmp_path, 'HC_K2_1', cho='K2', cam_bias=lambda t: math.radians(0.05) * max(t, 0.0),
+                    noise_psi_deg=0.02)
+    an = analyse(d)
+    longs = [lg for lg in an['legs'] if lg['dai']]
+    assert all(lg['troi'].get('ly_do') == 'camera_troi_so_encoder' for lg in longs)
+    assert all(lg['eps'] == lg['eps_tho'] for lg in longs) and max(lg['eps'] for lg in longs) > math.radians(0.2)
+    r = result(d, 'K2')
+    assert 'camera_troi_so_encoder' in r['ly_do'] and r['trang_thai'] != 'khoa'
+    err = abs(math.radians(r['a_k_deg']) - truth['a_true'])
+    assert err <= math.radians(r['u_a_k_deg']) or r['trang_thai'] == 'chua_ket_luan'
+
+
+def test_imu_drift_fit_needs_windows_and_leaves_out_leg_ends():
+    """HCB3: 2-parameter line on >= 4 stop windows, the two ends of the leg left out and reported apart."""
+    class _L(dict):
+        pass
+    t = np.arange(0.0, 70.0, 0.01)
+    L = _L(t=t)
+    W = [dict(psi=0.0, yaw=0.001 * 10 * k + (0.01 if k == 3 else 0.0), th_enc=0.0005 * k * (k % 2), jc=int(1000 * k))
+         for k in range(7)]                                          # encoder noise only, no camera drift
+    tr = ca.imu_drift_fit(W, L, skip=(2, 3))
+    assert tr['n'] == 5 and set(tr['du_ngoai']) == {2, 3}
+    assert tr['pf'][0] == pytest.approx(0.001, abs=1e-9) and tr['du_ngoai'][3] == pytest.approx(0.01, abs=1e-9)
+    assert tr['du_max'] < 1e-9                                       # the step at window 3 is not fitted away
+    W2 = [dict(w) for w in W]
+    for k in (0, 1, 4):
+        W2[k].pop('psi')                                             # no camera mean at three windows
+    assert ca.imu_drift_fit(W2, L, skip=(2, 3)) is None              # 2 left < 4
+    assert ca.imu_drift_fit(W2, L)['n'] == 4
+
+
+def test_u_yaw_adds_largest_drift_term(tmp_path):
+    """HCB3 cach A: u_yaw carries the largest per-leg drift term (2 SE + |camera-encoder slope|) x half leg + the
+    residual of the windows the line did not use; a leg without enough windows keeps the raw check and says so."""
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2', yaw_bias=lambda t: math.radians(0.03) * t, noise_psi_deg=0.02)
+    an = analyse(d)
+    r0 = ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.0, 0.0], du_m=0.0, neo=0.0, psi_cuc=0.0)
+    longs = [lg for lg in an['legs'] if lg['dai']]
+    assert all('u_troi_deg' in lg['troi'] for lg in longs), [lg['troi'] for lg in longs]
+    longs[1]['troi'] = dict(longs[1]['troi'], u_troi_deg=0.5)
+    r1 = ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.0, 0.0], du_m=0.0, neo=0.0, psi_cuc=0.0)
+    assert r1['u_hang_deg']['u_yaw'] >= 0.5 > r0['u_hang_deg']['u_yaw'] and r1['troi_imu']['u_troi_max_deg'] == 0.5
+    longs[2]['troi'] = dict(ly_do='thieu_cua_so_troi')
+    r2 = ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.0, 0.0], du_m=0.0, neo=0.0, psi_cuc=0.0)
+    assert 'thieu_cua_so_troi' in r2['ly_do'] and r2['trang_thai'] != 'khoa'
