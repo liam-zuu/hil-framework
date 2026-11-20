@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import sys
 
 import numpy as np
@@ -1601,6 +1602,9 @@ def test_gc6_3_the_drift_of_the_run_part(tmp_path):
                                 s1_session_sha256=d['tien_de_c8']['clip_h']['cuoi']['sha256']))
     for c in d['o_c8']:
         c['chuoi'][0]['file_so_h']['sha256'] = d['o_c8'][0]['chuoi'][0]['file_so_h']['sha256']
+        x = c['chuoi'][0]                                             # CODE 20/11: luoi.json names that drift file too
+        lu = json.load(open(os.path.join(goc, x['file_cham']['duong_dan']), encoding='utf-8'))
+        _relink_nodes(goc, d, x, lu, file_so_h=dict(x['file_so_h']))
     with pytest.raises(GC.GateFileError, match='first part'):         # every run is before the middle clip
         GC.check_nguon(d, goc)
     _csv_edit(goc, d, lambda ls: ls[:2] + [ls[-1]] + ls[2:-1])         # now every run is after it
@@ -2184,6 +2188,65 @@ def test_round5_k_runs_held_out(tmp_path):
     x = _add_k(goc, d)
     _rewrite(goc, x['file_cham'], lambda y: y['clip'].update(ten='IMG_other'))
     with pytest.raises(GC.GateFileError, match='task O1-K1 for clip'):
+        GC.check_nguon(d, goc)
+
+
+def _second_scoring(goc, ref, rel):
+    """Another first scoring of the clip of ref (other bytes: outcome khong_dat) at rel under goc."""
+    lu = json.load(open(os.path.join(goc, ref['duong_dan']), encoding='utf-8'))
+    lu['outcome'] = 'khong_dat'
+    return _jw(goc, rel, lu)
+
+
+def test_round5_runs_of_the_plan_scored_once(tmp_path):
+    """CODE 20/11 (C8B dropped c8b_u cong, 7b75fcb; its luot_c8 check C8BU4-R1-3 is the gate's): every run of the gate is
+    a run of the plan, scored once; the files of its chain are those its scoring names (so its time files too)."""
+    d, goc = build_c8(tmp_path / 'a')                                 # a mistyped run code in thu_tu_clip.csv
+    p = os.path.join(goc, 'thu_tu_clip.csv')
+    with open(p, 'a', encoding='utf-8', newline='\n') as f:
+        f.write('IMG_typo,C8-P-F05-1_lai,,,,,\n')
+    d['thu_tu_clip']['sha256'] = GC.sha256_file(p)
+    with pytest.raises(GC.GateFileError, match='mistyped'):
+        GC.check_nguon(d, goc)
+    d, goc = build_c8(tmp_path / 'b')                                 # a copy with the same bytes is the same scoring
+    x = d['o_c8'][0]['chuoi'][0]
+    os.makedirs(os.path.join(goc, 'ban_sao'))
+    shutil.copyfile(os.path.join(goc, x['file_cham']['duong_dan']), os.path.join(goc, 'ban_sao', 'luoi.json'))
+    GC.check_nguon(d, goc)
+    _second_scoring(goc, x['file_cham'], 'cham_lai/luoi.json')         # a second first scoring of that clip
+    with pytest.raises(GC.GateFileError, match=r"has 2 first scoring\(s\)"):
+        GC.check_nguon(d, goc)
+    with pytest.raises(GC.GateFileError, match='2 first scorings'):  # ghep refuses it too
+        _ghep(goc)
+    d, goc = build_c8(tmp_path / 'c')                                 # the same for a K run
+    k = _add_k(goc, d)
+    GC.check_nguon(d, goc)
+    _second_scoring(goc, k['file_cham'], 'cham_lai_k/luoi.json')
+    with pytest.raises(GC.GateFileError, match=r'K run C8-P-K1-1: .*has 2 first scoring\(s\)'):
+        GC.check_nguon(d, goc)
+    d, goc = build_c8(tmp_path / 'd')                                 # the chain names another clip H comparison
+    dr = d['o_c8'][0]['chuoi'][0]['file_so_h']
+    y = json.load(open(os.path.join(goc, dr['duong_dan']), encoding='utf-8'))
+    y['ghi_chu'] = 'ban khac'
+    dr2 = _jw(goc, 'drift_khac.json', y)
+    for c in d['o_c8']:
+        for x in c['chuoi']:
+            x['file_so_h'] = dict(dr2)
+    with pytest.raises(GC.GateFileError, match='file_so_h is not the one its scoring'):
+        GC.check_nguon(d, goc)
+    d, goc = build_c8(tmp_path / 'e', two=True)                       # a second time file its scoring does not name
+    x = d['o_c8'][0]['chuoi'][0]
+    lu = json.load(open(os.path.join(goc, x['file_cham']['duong_dan']), encoding='utf-8'))
+    y = json.load(open(os.path.join(goc, x['file_gio_h1']['duong_dan']), encoding='utf-8'))
+    y['ghi_chu'] = 'ban khac'
+    _relink_nodes(goc, d, x, lu, file_gio_h1=_jw(goc, 'gio_h1_khac.json', y))
+    with pytest.raises(GC.GateFileError, match='file_gio_h1 is not the one its scoring'):
+        GC.check_nguon(d, goc)
+    d, goc = build_c8(tmp_path / 'f', two=True)                       # its second scoring no longer named: a 2nd first
+    x = d['o_c8'][0]['chuoi'][0]
+    lu = json.load(open(os.path.join(goc, x['file_cham']['duong_dan']), encoding='utf-8'))
+    _relink_nodes(goc, d, x, lu, file_cham_h1=None, file_gio_h1=None)
+    with pytest.raises(GC.GateFileError, match=r'has 2 first scoring\(s\)'):
         GC.check_nguon(d, goc)
 
 

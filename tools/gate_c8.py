@@ -1591,6 +1591,11 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
         elif RUN_CODE.match(b):
             raise GateFileError(f'thu_tu_clip row {i + 2}: run {b!r} (clip {r.get("clip")!r}) is no cell of the plan '
                                 '(a figure-8 run outside the locked list)')
+        elif full.startswith('C8-') and not RUN_CODE_K.match(full):
+            # CODE 20/11 (the luot_c8 check of c8b_u cong, C8BU4-R1-3, now here): a mistyped run code would drop a run
+            raise GateFileError(f'thu_tu_clip row {i + 2}: buoc {full!r} (clip {r.get("clip")!r}) reads as a C8 run '
+                                'code but is neither a run of the plan (or its _lai<n>) nor a K run: a mistyped code '
+                                'would leave a run out of the gate')
         else:
             continue
         if r['clip'] in by_clip:
@@ -1794,6 +1799,21 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
                 eligible[x['file_cham']['sha256']] = mpp0
                 if fc1 is not None:
                     eligible[x['file_cham_h1']['sha256']] = scorings[1][2]
+    # CODE 20/11 (the luot_c8 check of c8b_u cong, C8BU4-R1-3, now here): each run of the plan is scored once; its
+    # scoring is the one first scoring of its clip under the C8 folder, and the clip H comparison, second scoring and
+    # second time file of the chain are those that scoring names (so its time files are those of its gio_sha256)
+    first = _first_scorings(goc)
+    for c in d['o_c8']:
+        for x in c['chuoi']:
+            w = f'cell {c["o"]} run {x["run_id"]}'
+            _one_first_scoring(first, x, w)
+            fc = _open_ref(goc, x['file_cham'], f'{w}: file_cham')
+            for k in ('file_so_h', 'file_cham_h1', 'file_gio_h1'):
+                a, b = x[k], fc.get(k)
+                if (a is None) != (b is None) or (a is not None and (not isinstance(b, dict)
+                                                                     or b.get('sha256') != a['sha256'])):
+                    raise GateFileError(f'{w}: {k} is not the one its scoring (luoi.json) names: the chain takes the '
+                                        'files of that scoring only (CODE 20/11)')
     # GC9-2: the K runs, in the order of thu_tu_clip.csv, each with its grid (scoring time and scoring code)
     k_rows = [r for r in rows if RUN_CODE_K.match((r.get('buoc') or '').strip())]
     if [(r['buoc'].strip(), r['clip']) for r in k_rows] != [(x['run_id'], x['clip']) for x in d['luot_k']]:
@@ -1830,7 +1850,45 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
                     raise GateFileError(f'{w}: luoi.json scorer: one clean commit of every node (GC10-2)')
                 scorers.add(sc.get('commit'))
         cham_luc[x['run_id']] = min(t for fk in fks for t in _scoring_times(fk, f'{w}: scoring'))
+        _one_first_scoring(first, x, w)
     return eligible, cham_luc, scorers
+
+
+def _first_scorings(goc: str) -> Dict[str, set]:
+    """{clip name: sha256 of every first scoring of it} under the C8 folder: the c8b_luoi luoi.json files (as ghep
+    finds them: named luoi.json, with trang_thai_luot) that no other luoi.json names as its second scoring
+    (file_cham_h1). Copies with the same bytes are one scoring. A file that is no UTF-8 JSON object is skipped."""
+    found, h1 = [], set()
+    for root, dirs, names in os.walk(os.path.realpath(goc)):
+        dirs.sort()
+        if 'luoi.json' not in names:
+            continue
+        try:
+            with open(os.path.join(root, 'luoi.json'), 'rb') as f:
+                raw = f.read()
+            x = json.loads(raw.decode('utf-8'))
+        except (OSError, UnicodeDecodeError, ValueError):
+            continue
+        if not isinstance(x, dict) or 'trang_thai_luot' not in x:
+            continue
+        found.append((hashlib.sha256(raw).hexdigest(), x))
+        if isinstance(x.get('file_cham_h1'), dict):
+            h1.add(x['file_cham_h1'].get('sha256'))
+    out: Dict[str, set] = {}
+    for sha, x in found:
+        cl = x.get('clip')
+        if sha not in h1 and isinstance(cl, dict) and isinstance(cl.get('ten'), str):
+            out.setdefault(cl['ten'], set()).add(sha)
+    return out
+
+
+def _one_first_scoring(first: Dict[str, set], x: dict, w: str) -> None:
+    """CODE 20/11 (the luot_c8 check of c8b_u cong): the scoring of run x is the only first scoring of its clip."""
+    have = first.get(x['clip'], set())
+    if have != {x['file_cham']['sha256']}:
+        raise GateFileError(f'{w}: clip {x["clip"]!r} has {len(have)} first scoring(s) (luoi.json) under the C8 folder'
+                            f'{"" if x["file_cham"]["sha256"] in have else ", none of them file_cham"}: a run is '
+                            'scored once and the gate takes that scoring (CODE 20/11; luot_c8 of c8b_u cong)')
 
 
 def _check_khoa_c8b(d: dict, goc: str) -> Tuple[dict, dt.datetime]:
