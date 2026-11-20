@@ -242,7 +242,10 @@ def test_new_packet_during_timeout_wait_fails(tmp_path):
         body[i1 - 5][col(hdr, 'sp_vx')] = '0.000000'
     edit_log(d, fn)
     ok, ck, _ = checks(d)
-    assert not (ok['traj_age'] and ok['het_han_firmware'])
+    # HCB2: with the 160 ms quality limit the ages of the wait before that packet pass traj_age; the packet still
+    # moves the end of the sender domain 0.15 s past the schedule, which the zero-tail span check refuses
+    assert not (ok['traj_age'] and ok['het_han_firmware'] and ok['lenh_nhan_khop_lich']), ck
+    assert not ok['lenh_nhan_khop_lich'] and 'mien phat' in dict((n, x) for n, _, x in ck)['lenh_nhan_khop_lich']
 
 
 def test_late_packets_after_run_active_falls_fail(tmp_path):
@@ -1238,3 +1241,157 @@ def test_tinh_doan_of_run2_carries_lan_lap_id(tmp_path, monkeypatch, capsys):
     capsys.readouterr()
     assert ca.main(tinh_args(d2, 'K2', '--e-hieu', f9, '--doan', dp, '--out', str(tmp_path / 'f7c.json'))) == 2
     assert 'khong phai luot cap HC_K2_2' in capsys.readouterr().out
+
+
+# ------------------------------------------------------------------ session 2 (20/11) real-data fixes HCB1, HCB2
+def test_lost_packets_on_turn_ramp_are_bounded(tmp_path):
+    """HCB2 (HC_goc_2, 20/11): Wi-Fi lost 140 ms of packets on the down ramp of a turn; the held value added
+    a age^2/2 ~ 0.0098 rad (> 0.5 deg) and traj_age 140 ms (> 60). Explained by the staleness seen in traj_age:
+    accepted; the sender-domain boundary stays at 60 ms (the zero-tail span check still passes)."""
+    d, _ = make(tmp_path, 'HC_K1_1', cho='K1', lost=[(86.95, 87.09)])          # turn 1 ramp down 86.82-87.32 s
+    ok, ck, info = checks(d)
+    det = dict((n, x) for n, _, x in ck)
+    assert all(ok.values()), [c for c in ck if not c[1]]
+    assert 'can cong them: xoay' in det['lenh_nhan_khop_lich'] and float(det['traj_age'].split()[1]) >= 130
+    L = ca.load_attempt(d)['log']
+    blk = [b for b in ca.sp_blocks(L, info['i0'], info['j_s']) if b['truc'] == 'wz'][0]
+    assert abs(blk['tp_wz'] - 5 * math.pi) > ca.SP_INT_TOL_RAD                  # the old tolerance alone fails
+
+
+def test_lost_packets_on_plateau_change_nothing(tmp_path):
+    """HCB2: 140 ms lost while the command is constant: the held value is the planned one; only traj_age shows it."""
+    d, _ = make(tmp_path, 'HC_K1_1', cho='K1', lost=[(70.0, 70.14)])
+    ok, ck, _ = checks(d)
+    assert all(ok.values()), [c for c in ck if not c[1]]
+    assert 'can cong them' not in dict((n, x) for n, _, x in ck)['lenh_nhan_khop_lich']
+
+
+def test_packets_lost_near_firmware_stop_fail(tmp_path):
+    """HCB2: traj_age within two packets of the 200 ms firmware stop (lost 165 ms; the firmware did not stop) is
+    refused."""
+    d, _ = make(tmp_path, 'HC_K1_1', cho='K1', lost=[(70.0, 70.165)])
+    ok, ck, _ = checks(d)
+    assert ok['mot_canh_run_active'] and not ok['traj_age'], ck
+
+
+def test_ramp_change_not_explained_by_age_fails(tmp_path):
+    """HCB2: a ramp value held 200 ms while traj_age stays small (not a late packet: e.g. a wrong value) is not
+    covered by the bound."""
+    d, _ = make(tmp_path, 'HC_K1_1', cho='K1')
+
+    def fn(hdr, body):
+        ct, cw = col(hdr, 'timestamp_us'), col(hdr, 'sp_wz')
+        t = np.array([int(r[ct]) for r in body]) / 1e6 - 100.0 - 6.0
+        rows = np.flatnonzero((t >= 86.90) & (t < 87.10))                      # 0.20 s: +0.02 rad
+        for i in rows:
+            body[i][cw] = body[rows[0]][cw]
+    edit_log(d, fn)
+    ok, ck, _ = checks(d)
+    assert not ok['lenh_nhan_khop_lich'], ck
+
+
+def _edit_yaw(d, g):
+    """yaw_rad := wrap(yaw0 + g(unwrapped yaw - yaw0, t))."""
+    def fn(hdr, body):
+        cy, ct = col(hdr, 'yaw_rad'), col(hdr, 'timestamp_us')
+        y = np.unwrap([float(r[cy]) for r in body])
+        t = np.array([int(r[ct]) for r in body]) / 1e6 - 100.0 - 6.0
+        z = y[0] + g(y - y[0], t)
+        for r, v in zip(body, z):
+            r[cy] = f'{math.atan2(math.sin(v), math.cos(v)):.6f}'
+    edit_log(d, fn)
+
+
+def test_imu_turn_fit_catches_scale_and_jump(tmp_path):
+    """HCB1 (session 2): the rate correlation was 0.40-0.58 on a good IMU at constant rate; the check is now the fit
+    of IMU yaw on encoder heading (k, residual). A 25 % scale error or a 0.08 rad jump inside a turn fails; the
+    synthetic IMU passes with k ~ 1."""
+    d, _ = make(tmp_path, 'HC_K1_1', cho='K1')
+    ok, ck, _ = checks(d)
+    e = [x for n, _, x in ck if n == 'imu_e_tuong_quan']
+    assert ok['imu_e_tuong_quan'] and len(e) == 2 and all(' k 0.9' in x or ' k 1.0' in x for x in e), e
+    d2, _ = make(tmp_path, 'HC_K1_2', cho='K1')
+    _edit_yaw(d2, lambda dy, t: 1.25 * dy)
+    _, ck2, _ = checks(d2)
+    assert [ok_ for n, ok_, _ in ck2 if n == 'imu_e_tuong_quan'] == [False, False], ck2
+    d3, _ = make(tmp_path, 'HC_K1_3', cho='K1')
+    _edit_yaw(d3, lambda dy, t: dy + np.where(t > 70.0, 0.08, 0.0))
+    _, ck3, _ = checks(d3)
+    assert [ok_ for n, ok_, _ in ck3 if n == 'imu_e_tuong_quan'][0] is False, ck3
+
+
+def test_imu_turn_fit_tolerates_rv_noise_at_constant_rate(tmp_path):
+    """HCB1: RV noise of 4 mrad per report (the session 2 residual was 3-4 mrad RMS) passes the fit, where the rate
+    correlation of a constant-rate turn falls under 0.9."""
+    rng = np.random.default_rng(7)
+    d, _ = make(tmp_path, 'HC_K1_1', cho='K1')
+    n_rep = {}
+
+    def g(dy, t):
+        k = np.floor(t / 0.05).astype(int)
+        for x in np.unique(k):
+            n_rep.setdefault(x, rng.normal(0, 0.004))
+        return dy + np.array([n_rep[x] for x in k])
+    _edit_yaw(d, g)
+    ok, ck, _ = checks(d)
+    assert ok['imu_e_tuong_quan'], [c for c in ck if c[0] == 'imu_e_tuong_quan']
+
+
+def test_lost_zero_packet_at_block_end_is_bounded(tmp_path):
+    """HCB2: the packets around the end of a turn lost (the zero packet late): the block ends ~0.1 s late; the
+    duration check widens by the staleness seen at the last row, the integral by the ramp bound."""
+    d, _ = make(tmp_path, 'HC_K1_1', cho='K1', lost=[(87.30, 87.44)])        # turn 1 ends 87.32 s
+    ok, ck, info = checks(d)
+    assert all(ok.values()), [c for c in ck if not c[1]]
+    L = ca.load_attempt(d)['log']
+    b = [b for b in ca.sp_blocks(L, info['i0'], info['j_s']) if b['truc'] == 'wz'][0]
+    assert (b['t1'] - b['t0']) - (87.31592653589793 - 55.4) > ca.DUR_TOL_S          # the old tolerance alone fails
+
+
+def test_plateau_staleness_does_not_cover_a_ramp_error(tmp_path):
+    """HCB2: staleness counts only on the ramps: 140 ms lost on the constant part does not pay for a ramp value
+    held 0.15 s with a small age."""
+    d, _ = make(tmp_path, 'HC_K1_1', cho='K1', lost=[(70.0, 70.14)])
+
+    def fn(hdr, body):
+        ct, cw = col(hdr, 'timestamp_us'), col(hdr, 'sp_wz')
+        t = np.array([int(r[ct]) for r in body]) / 1e6 - 100.0 - 6.0
+        rows = np.flatnonzero((t >= 86.90) & (t < 87.05))
+        for i in rows:
+            body[i][cw] = body[rows[0]][cw]
+    edit_log(d, fn)
+    ok, ck, _ = checks(d)
+    assert not ok['lenh_nhan_khop_lich'], ck
+
+
+def test_imu_turn_fit_uses_rv_updates_only(tmp_path):
+    """HCB1: the fit uses the rows where a new RV report came; between reports the yaw is held (20 Hz staircase,
+    up to 25 mrad at 0.5 rad/s), which is not an IMU error: a clean synthetic IMU leaves a residual far below it."""
+    d, _ = make(tmp_path, 'HC_K1_1', cho='K1')
+    _, ck, _ = checks(d)
+    for x in [x for n, _, x in ck if n == 'imu_e_tuong_quan']:
+        assert float(x.split('du max ')[1].split()[0]) < 5.0, x
+
+
+def test_one_repeated_rv_report_during_turn_fails(tmp_path):
+    """HCC1-9 kept with HCB1: one RV report repeating the old yaw while the wheels turn (25 mrad, under the fit
+    residual limit) still fails the check."""
+    d, _ = make(tmp_path, 'HC_K1_1', cho='K1', rv_freeze=(62.0, 62.07))          # one report (62.05 s) repeats
+    _, ck, _ = checks(d)
+    e = [c for c in ck if c[0] == 'imu_e_tuong_quan']
+    assert not e[0][1] and 'RV lap luc quay 1' in e[0][2] and float(e[0][2].split('du max ')[1].split()[0]) < 30, e
+
+
+def test_ramp_bound_pays_only_its_own_staleness(tmp_path):
+    """HCB2: a turn with the 140 ms ramp loss (bound ~0.008 rad) plus one wrong plateau row (+0.009 rad) is refused:
+    the bound covers what the staleness explains, not more."""
+    d, _ = make(tmp_path, 'HC_K1_1', cho='K1', lost=[(86.95, 87.09)])
+
+    def fn(hdr, body):
+        ct, cw = col(hdr, 'timestamp_us'), col(hdr, 'sp_wz')
+        t = np.array([int(r[ct]) for r in body]) / 1e6 - 100.0 - 6.0
+        i = int(np.flatnonzero(t >= 70.0)[0])
+        body[i][cw] = f'{float(body[i][cw]) + 0.9:.6f}'
+    edit_log(d, fn)
+    ok, ck, _ = checks(d)
+    assert not ok['lenh_nhan_khop_lich'], ck

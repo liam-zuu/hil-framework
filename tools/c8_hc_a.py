@@ -63,11 +63,20 @@ VET_MARGIN = 1.5               # on the encoder speed bounds of the real footpri
 RV_REPEAT_W = 0.1              # rad/s: while the wheels turn faster than this an RV report must change the yaw
 WIN_MIN_S, STILL_MIN_S = 2.5, 3.0
 U_D_MAX_S = 0.10
-TRAJ_AGE_MAX_MS = 60.0           # while the sender sends (50 Hz); not over the firmware timeout wait (HCC1-4)
 EXPIRY_MS = 200.0               # firmware TRAJ_TIMEOUT_US (main.c 45): run_active ends when the newest packet is this old
 EXPIRY_SLACK_S = 0.03
+# HCB2 (session 2, 20/11, HC_goc_2: Wi-Fi lost ~140 ms of packets twice around t = 108-112 s while turning): the
+# sender-domain boundary (last row with a fresh packet, HCC1-4) and the quality limit were one number, so raising the
+# limit moved the boundary into the firmware wait and broke the tail-duration check. Two numbers now:
+FRESH_AGE_MS = 60.0             # boundary of the sender domain (unchanged: 3 send periods)
+TRAJ_AGE_MAX_MS = EXPIRY_MS - 2 * 1000.0 / hs.SEND_HZ   # 160 ms [de xuat]: the firmware never came within two
+#                                 packets of its 200 ms stop; what late packets did to the command is bounded per block
 RV_STALL_S = 0.15               # 3 report periods at 20 Hz
-E_CORR_MIN = 0.9
+# HCB1 (session 2, 20/11): IMU vs encoder in a turn = linear fit of the IMU yaw (at RV updates) on the encoder heading;
+# the correlation of rates was 0.40-0.58 on good data (97 % of a turn is at constant rate: no signal variance, only the
+# 20 Hz RV staircase). Measured HC_goc_1/2: k 1.028-1.029, residual RMS 3.2-4.1 mrad, max 12.5-14.6 mrad.
+IMU_E_K_LO, IMU_E_K_HI = 0.90, 1.10          # [de xuat] IMU yaw / encoder heading (encoder under-reads ~3 %)
+IMU_E_RES_MAX_RAD = 0.030                    # [de xuat] ~2x the largest residual seen; a 0.15 s stall at 0.5 rad/s: 75
 SP_INT_TOL_M, SP_INT_TOL_RAD = 0.003, math.radians(0.5)
 REF_TOL_M, STOP_TOL_M = 0.003, 0.015
 DUR_TOL_S = 0.10
@@ -208,6 +217,31 @@ def sp_blocks(L, i0, i1):
     return out
 
 
+def _block_dt(L, b):
+    j, k = b['j0'], b['j1']
+    dt = np.diff(L['t'][j:k + 2]) if k + 1 < L['n'] else np.r_[np.diff(L['t'][j:k + 1]), 0.01]
+    return dt[:k + 1 - j]
+
+
+def stale_s(L, j):
+    """Staleness of the command at row j beyond one send period [s] (traj_age_ms - 1/SEND_HZ, >= 0); 0 outside."""
+    if j < 0 or j >= L['n']:
+        return 0.0
+    return max(float(L['traj_age_ms'][j]) / 1000.0 - 1.0 / hs.SEND_HZ, 0.0)
+
+
+def stale_bound(L, b, main_key, v_top, a):
+    """HCB2: bound of the change of the integral of one command block caused by late or lost packets (session 2,
+    20/11, HC_goc_2: six packets lost on the down ramp of a turn, 0.386 rad/s held 140 ms -> +0.0095 rad = a age^2/2).
+    A held value differs from the planned one only where the plan changes: on the ramps (logged |sp| below the plateau
+    v_top), by at most a x staleness, staleness = traj_age - one send period. Late packets that reach the car in a
+    burst carry an age that hides their delay: not covered, so such a block fails (conservative)."""
+    sl = slice(b['j0'], b['j1'] + 1)
+    ramp = np.abs(L[main_key][sl]) < v_top - SP_EPS
+    exc = np.maximum(L['traj_age_ms'][sl] / 1000.0 - 1.0 / hs.SEND_HZ, 0.0)
+    return float(a * np.sum((exc * _block_dt(L, b))[ramp]))
+
+
 def body_increments(L):
     """Per row i>=1: body-frame (dx, dy) from the count increments (kinematics_forward), and wheel-rate wz."""
     dC = np.diff(L['C'], axis=0).astype(float) * COUNT_M
@@ -259,12 +293,12 @@ def plan_moves(segs):
 
 
 def sender_domain(L, i0, i1):
-    """(j_s, problems). j_s = last row of the run with a fresh packet (0 <= traj_age_ms <= TRAJ_AGE_MAX_MS): up to
+    """(j_s, problems). j_s = last row of the run with a fresh packet (0 <= traj_age_ms <= FRESH_AGE_MS): up to
     there the sender was sending. Rows j_s+1..i1 are the firmware waiting for its 200 ms timeout after the last
     (zero) packet (main.c 524-525; HCC1-4): there no new packet may arrive (age only grows), the age stays under
     EXPIRY_MS, the wait is not longer than EXPIRY_MS (+ slack) and the command is 0 on every axis."""
     age = L['traj_age_ms']
-    fresh = np.flatnonzero((age[i0:i1 + 1] >= 0) & (age[i0:i1 + 1] <= TRAJ_AGE_MAX_MS))
+    fresh = np.flatnonzero((age[i0:i1 + 1] >= 0) & (age[i0:i1 + 1] <= FRESH_AGE_MS))
     if not len(fresh):
         raise AError('no fresh trajectory packet inside the run')
     j_s = i0 + int(fresh[-1])
@@ -448,24 +482,38 @@ def kiem(A, age_r_max_ms=125.0):
     ok_b = len(blocks) == len(moves)
     detail = f'{len(blocks)} blocks vs {len(moves)} planned'
     if ok_b:
+        ref_bound = 0.0                          # HCB2: pos_x_ref carries the late-packet changes of earlier legs
+        tre = []
         for b, m in zip(blocks, moves):
             dur, want = m['t1'] - m['t0'], m['toi'] - m['tu']
             sl = slice(b['j0'], b['j1'] + 1)
+            key = 'sp_vx' if m['loai'] == 'tien' else 'sp_wz'
+            B = stale_bound(L, b, key, m['v'], m['a'])
+            if B > 0.1 * (SP_INT_TOL_M if m['loai'] == 'tien' else SP_INT_TOL_RAD):
+                tre.append(f"{m['loai']} {B:.4f}")
             if m['loai'] == 'tien':
                 main, others, tp = L['sp_vx'][sl], ('sp_vy', 'sp_wz'), b['tp_vx']
-                good = abs(tp - want) <= SP_INT_TOL_M and abs(L['pos_x_ref'][b['j1']] - m['toi']) <= REF_TOL_M
+                ref_bound += B
+                good = (abs(tp - want) <= SP_INT_TOL_M + B
+                        and abs(L['pos_x_ref'][b['j1']] - m['toi']) <= REF_TOL_M + ref_bound)
             else:
                 main, others, tp = L['sp_wz'][sl], ('sp_vx', 'sp_vy'), b['tp_wz']
-                good = abs(tp - want) <= SP_INT_TOL_RAD
+                good = abs(tp - want) <= SP_INT_TOL_RAD + B
             pure = all(np.all(np.abs(L[c][sl]) <= SP_EPS) for c in others)
             one_sign = np.all(np.sign(main[np.abs(main) > SP_EPS]) == math.copysign(1.0, want))
-            t_ok = abs((b['t0'] - t_run) - m['t0']) <= DUR_TOL_S and abs((b['t1'] - b['t0']) - dur) <= DUR_TOL_S
+            # HCB2: a late first packet starts the block late (the zero packets before it aged), a late zero packet
+            # ends it late (the last value held): the time checks widen by the staleness seen at those rows
+            s0, s1 = stale_s(L, b['j0'] - 1), stale_s(L, b['j1'])
+            t_ok = (abs((b['t0'] - t_run) - m['t0']) <= DUR_TOL_S + s0
+                    and abs((b['t1'] - b['t0']) - dur) <= DUR_TOL_S + s0 + s1)
             if not (good and pure and one_sign and t_ok):
                 ok_b = False
-                detail = (f"block {b['j0']}: {m['loai']} tich phan {tp:.4f} vs {want:.4f}, truc khac 0 "
-                          f"{not pure}, doi dau {not one_sign}, bat dau {b['t0'] - t_run:.2f} vs {m['t0']:.2f} s, "
-                          f"dai {b['t1'] - b['t0']:.2f} vs {dur:.2f} s")
+                detail = (f"block {b['j0']}: {m['loai']} tich phan {tp:.4f} vs {want:.4f} (can goi tre {B:.4f}), "
+                          f"truc khac 0 {not pure}, doi dau {not one_sign}, bat dau {b['t0'] - t_run:.2f} vs "
+                          f"{m['t0']:.2f} s, dai {b['t1'] - b['t0']:.2f} vs {dur:.2f} s")
                 break
+        if ok_b and tre:
+            detail += f"; goi tre tren doan tang/giam toc, can cong them: {', '.join(tre)}"
         if ok_b:                                 # the zero tail: hold + TAIL_S sent whole up to the last packet
             n_pk = hs.n_samples(segs) + int(math.ceil(hs.TAIL_S * hs.SEND_HZ - 1e-9))
             span = float(L['t'][j_s]) - t_run
@@ -492,19 +540,25 @@ def kiem(A, age_r_max_ms=125.0):
             if len(t) < 60:
                 add('imu_e_tuong_quan', False, 'block too short')
                 continue
-            w_imu = np.gradient(yaw[sl], t)
-            w_enc = np.gradient(np.cumsum(dth[sl]), t)
+            # HCB1: IMU yaw at the RV updates fitted on the encoder heading (same body turn, encoder scale ~3 % low);
+            # a frozen, jumping or mis-scaled IMU leaves a slope off 1 or a residual (no need for rate variance)
+            th = np.cumsum(dth[sl])
+            upd = np.r_[True, np.diff(L['rv_n'][sl]) != 0]
+            X = np.column_stack([th[upd] - th[0], np.ones(int(upd.sum()))])
+            coef = np.linalg.lstsq(X, yaw[sl][upd], rcond=None)[0]
+            res = yaw[sl][upd] - X @ coef
+            kk, r_max, r_rms = float(coef[0]), float(np.max(np.abs(res))), float(np.sqrt(np.mean(res ** 2)))
+            fit_ok = IMU_E_K_LO <= kk <= IMU_E_K_HI and r_max <= IMU_E_RES_MAX_RAD
             k = np.ones(25) / 25
-            a1, a2 = np.convolve(w_imu, k, 'valid'), np.convolve(w_enc, k, 'valid')
-            corr = float(np.corrcoef(a1, a2)[0, 1]) if np.std(a1) > 0 and np.std(a2) > 0 else 0.0
             sign_ok = np.sign(yaw[b['j1']] - yaw[b['j0']]) == np.sign(b['tp_wz'])
             # HCC1-9: a repeated RV value while the wheels turn (a 0.15 s repeat kept corr ~0.95)
             rate = np.convolve(np.abs(dth[sl]) / np.maximum(np.r_[np.diff(t), 0.01], 1e-3), k, 'same')
             ch = np.flatnonzero(np.diff(L['rv_n'][sl]) != 0) + 1
             ysl = L['yaw_rad'][sl]
             same = [j for j0_, j in zip(ch[:-1], ch[1:]) if rate[j] > RV_REPEAT_W and abs(ysl[j] - ysl[j0_]) < 1e-6]
-            add('imu_e_tuong_quan', corr >= E_CORR_MIN and sign_ok and not same,
-                f'corr {corr:.3f}, RV lap luc quay {len(same)}')
+            add('imu_e_tuong_quan', fit_ok and sign_ok and not same,
+                f'yaw IMU = k goc encoder: k {kk:.4f}, du max {1e3 * r_max:.1f} mrad (RMS {1e3 * r_rms:.1f}), '
+                f'dung chieu {bool(sign_ok)}, RV lap luc quay {len(same)}')
         wins = still_windows(L, blocks, i0, j_s)
         add('cua_so_dung_du', all(w.get('still_s', 0) >= STILL_MIN_S and not w.get('ho') for w in wins),
             ', '.join(f"{w.get('still_s', 0):.2f}" for w in wins))
