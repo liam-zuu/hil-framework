@@ -1462,7 +1462,18 @@ def doc_kgs(paths):
         k = frozenset(pr)
         if k in out:
             raise ValueError(f'{p}: a second file for the same session pair')
-        out[k] = dict(du_m=float(du), n_moc=n, file=os.path.abspath(p), sha256=cm.sha256(p), session_sha256=list(pr))
+        tc = o.get('theo_cho')                         # v4 14 phys (Liam 20/11 23:52 at CODE_KHUNG): per place, rad
+        if tc is not None:
+            if not isinstance(tc, dict) or not set(tc) <= set(CHO):
+                raise ValueError(f'{p}: theo_cho must map places {CHO}')
+            for cho, blk in tc.items():
+                for f in KGS_PHYS:
+                    v = (blk or {}).get(f) if isinstance(blk, dict) else None
+                    if isinstance(v, bool) or not isinstance(v, (int, float)) or not (math.isfinite(v) and v >= 0):
+                        raise ValueError(f'{p}: theo_cho.{cho}.{f} must be finite and >= 0')
+            tc = {cho: {f: float(blk[f]) for f in KGS_PHYS} for cho, blk in tc.items()}
+        out[k] = dict(du_m=float(du), n_moc=n, file=os.path.abspath(p), sha256=cm.sha256(p), session_sha256=list(pr),
+                      mo_hinh=o.get('mo_hinh'), theo_cho=tc)
     return out
 
 
@@ -1476,15 +1487,49 @@ def khac_session(ctx, wa, wb):
     return True, ctx.kgs.get(frozenset((sa, sb)))
 
 
-def u_kgs(du, L_AB, side, c_B=None):
-    """v4 14: indices of the frame difference between two sessions (same rule as HIEUCHUAN, design 2026-11-20 da
-    session §2: every point of one session may be off by du from the other; a direction over a length L by
-    asin(2du/L)). Returns dict(beta_deg, theta_deg, c_B_m, s); no length -> inf."""
-    def ang(L):
-        return math.degrees(math.asin(min(1.0, 2.0 * du / L))) if L and L > 0 else math.inf
+KGS_PHYS = ('du_xoay_rad', 'du_thang', 'du_bien_dang_rad', 'xoay_bien_thien_rad')
+# v4 14 (CODE_KHUNG 21/11 sec 5): the apparent tag edge changes between camera segments (+0.56 / -0.29 / -0.85 mm on the
+# marks), so a cross-session tag scale (and the Dh / delta_c_B correction built on it) is biased beyond doi_s. Until the
+# chain chooses a way (CODE asks Liam: no scale comparison across sessions / phi apart from the plate check / edge
+# correction / new 12b per camera mount), the cross-session scale and c_B comparisons are khong_xac_dinh and a
+# cross-session delta_c_B chua_ket_luan (no dat from an uncorrected bias).
+VIEN_MA_KHAC_SESSION_CHAN = True
+
+
+def u_kgs(e, chos, L_AB, side, c_B=None):
+    """v4 14: indices (before the margin) of the frame difference between two sessions for a comparison at the places
+    chos. File with theo_cho (model phys, design 2026-11-21 sai khung giua session §3, Liam 20/11 "Truong tron phys"):
+    beta = du_xoay + du_bien_dang; theta = du_bien_dang + xoay_bien_thien; c_B = (du_thang + 2 du_bien_dang) |c_B|;
+    scale = du_thang + du_bien_dang; largest over chos; a place missing from theo_cho -> inf (chua_ket_luan).
+    File without theo_cho: the coarse rule (HIEUCHUAN da session §2: every point off by du_m, a direction over L by
+    asin(2 du / L)). Returns dict(beta_deg, theta_deg, c_B_m, s, cach)."""
     cb = float(np.linalg.norm(c_B)) if c_B is not None else 0.0
-    return dict(beta_deg=ang(L_AB), theta_deg=ang(side) + ang(L_AB),
-                c_B_m=2.0 * du + (cb * 2.0 * du / L_AB if L_AB and L_AB > 0 else math.inf), s=2.0 * du / side)
+    tc = e.get('theo_cho')
+    chos = {c for c in chos if c is not None}
+    if tc is not None and not chos:
+        return dict(beta_deg=math.inf, theta_deg=math.inf, c_B_m=math.inf, s=math.inf, cach='thieu_cho')
+    if tc is None:
+        du = e['du_m']
+
+        def ang(L):
+            return math.degrees(math.asin(min(1.0, 2.0 * du / L))) if L and L > 0 else math.inf
+        return dict(beta_deg=ang(L_AB), theta_deg=ang(side) + ang(L_AB),
+                    c_B_m=2.0 * du + (cb * 2.0 * du / L_AB if L_AB and L_AB > 0 else math.inf), s=2.0 * du / side,
+                    cach='tho_du_m')
+    out = dict(beta_deg=0.0, theta_deg=0.0, c_B_m=0.0, s=0.0, cach='phys')
+    for cho in chos:
+        p = tc.get(cho)
+        if p is None:
+            return dict(beta_deg=math.inf, theta_deg=math.inf, c_B_m=math.inf, s=math.inf, cach=f'thieu_cho_{cho}')
+        out['beta_deg'] = max(out['beta_deg'], math.degrees(p['du_xoay_rad'] + p['du_bien_dang_rad']))
+        out['theta_deg'] = max(out['theta_deg'], math.degrees(p['du_bien_dang_rad'] + p['xoay_bien_thien_rad']))
+        out['c_B_m'] = max(out['c_B_m'], (p['du_thang'] + 2.0 * p['du_bien_dang_rad']) * cb)
+        out['s'] = max(out['s'], p['du_thang'] + p['du_bien_dang_rad'])
+    return out
+
+
+def _cho_of(w):
+    return w.get('cho') if 'cho' in w else (w.get('meta') or {}).get('cho')
 
 
 def do_khung(ctx, cam_prev, g):
@@ -2042,7 +2087,7 @@ def _w_from_hc(c, which='chung'):
         return None
     return dict(alpha=ch['alpha'], psi=ch.get('psi'), psi_tho=ch.get('psi_tho', ch.get('psi')), theta=ch.get('theta'),
                 o=np.array(ch['o']), t=np.array(ch['t']), s=ch['s'], F=np.array(ch['F']), H=ch['H'], n=ch['n'],
-                ses=c['meta'].get('session_sha'))
+                ses=c['meta'].get('session_sha'), cho=c['meta'].get('cho'))
 
 
 def so_sanh(wa, wb, ctx, g_b, nguong, cmap=None):
@@ -2065,7 +2110,7 @@ def so_sanh(wa, wb, ctx, g_b, nguong, cmap=None):
             d['trang_thai'] = 'doi' if x - u > lim else ('khong_doi' if x + u <= lim else 'khong_xac_dinh')
         return d
     th = cb = sc = None
-    uk, ly = dict(theta_deg=0.0, c_B_m=0.0, s=0.0), None
+    uk, ly = dict(theta_deg=0.0, c_B_m=0.0, s=0.0), dict(theta=None, c_B=None, s=None)
     if wa is not None and wb is not None:
         if wa.get('theta') is not None and wb.get('theta') is not None:
             th = abs(math.degrees(wrap(wb['theta'] - wa['theta'])))
@@ -2077,17 +2122,23 @@ def so_sanh(wa, wb, ctx, g_b, nguong, cmap=None):
                 pass
         khac, e = khac_session(cmap, wa, wb) if cmap is not None else (False, None)
         if khac and e is None:
-            uk, ly = dict(theta_deg=math.inf, c_B_m=math.inf, s=math.inf), 'thieu_khung_giua_session'
+            uk = dict(theta_deg=math.inf, c_B_m=math.inf, s=math.inf)
+            ly = dict.fromkeys(ly, 'thieu_khung_giua_session')
         elif khac:
             try:
                 c_t = c_B_cua(wb, ctx, g_b) if g_b is not None else None
             except ValueError:
                 c_t = None
-            uk = u_kgs(e['du_m'], cmap.L_AB, ctx.side, c_t)
+            uk = u_kgs(e, {_cho_of(wa), _cho_of(wb)}, cmap.L_AB, ctx.side, c_t)
             if g_b is not None and c_t is None:
                 uk['c_B_m'] = math.inf
-    return dict(theta=st(th, nguong['theta'], uk['theta_deg'], ly), c_B=st(cb, nguong['c_B'], uk['c_B_m'], ly),
-                s=st(sc, nguong['s'], uk['s'], ly))
+            if VIEN_MA_KHAC_SESSION_CHAN:          # tag edge bias differs between sessions: scale, Dh not comparable
+                uk['c_B_m'] = uk['s'] = math.inf
+                ly.update(c_B='vien_ma_khac_session', s='vien_ma_khac_session')
+            if not math.isfinite(uk['theta_deg']):
+                ly['theta'] = uk['cach']
+    return dict(theta=st(th, nguong['theta'], uk['theta_deg'], ly['theta']),
+                c_B=st(cb, nguong['c_B'], uk['c_B_m'], ly['c_B']), s=st(sc, nguong['s'], uk['s'], ly['s']))
 
 
 def tong_doi(ss):
@@ -2335,7 +2386,7 @@ def run_lan_lap(hc_path, cua_so_path, session_path, out_dir, a6_path, tam_id, tr
             d['ma'], d['chung'], ly_du = _tom_hai(s, G, h, ctx, r_max)
             for k in ('ma', 'chung'):                           # v4 14: the session of the summary
                 if d[k] is not None:
-                    d[k]['ses'] = s['meta']['session_sha']
+                    d[k]['ses'], d[k]['cho'] = s['meta']['session_sha'], s['meta']['cho']
             d['ly_do'] += s['chung']['ly_do'] + ly_du
             if not d['du_ok']:
                 d['ly_do'].append('du_neo_vuot_r_max')
@@ -2580,7 +2631,8 @@ def _mot_luot(lid, d, so, env):
         if e_k is None:
             lneo.append('thieu_khung_giua_session')
         else:
-            uk = u_kgs(e_k['du_m'], env['cmap'].L_AB, ctx.side)
+            uk = u_kgs(e_k, {_cho_of(cs), _cho_of(dich)}, env['cmap'].L_AB, ctx.side)
+            r['khung_giua_session']['cach'] = uk['cach']
             r['khung_giua_session']['u_beta_deg'] = uk['beta_deg']
             u_beta_l += uk['beta_deg']
     r['beta_deg'], r['u_beta_deg'], r['eps_neo_luot_deg'] = beta, u_beta_l, eps_luot
@@ -2717,7 +2769,8 @@ def _mot_luot(lid, d, so, env):
         e_pos = (eps_vi_tri(b_s, env['r_max'], c_B_cua(sw, ctx, g_b))
                  + eps_vi_tri(b_d, env['r_max'], c_B_cua(dc, ctx, g_b, dh)))
         try:
-            uc = u_kgs(e_k['du_m'], env['cmap'].L_AB, ctx.side, c_B_cua(dc, ctx, g_b, dh)) if uk is not None else None
+            uc = u_kgs(e_k, {_cho_of(cs), _cho_of(dich)}, env['cmap'].L_AB, ctx.side,
+                       c_B_cua(dc, ctx, g_b, dh)) if uk is not None else None
             u, parts, u_dh = u_delta_c_B(sw, dc, ctx, g_b, env['eps_g'], tr['c_B'],
                                          tr['s'] + (uc['s'] if uc else 0.0), e_pos,          # v4 14: ratio, cross session
                                          env['du_giu'] if math.isfinite(env['du_giu']) else 0.0)
@@ -2727,6 +2780,8 @@ def _mot_luot(lid, d, so, env):
             r['u_delta_c_B_m'], r['u_delta_c_B_phan'], r['u_delta_h_m'] = u, parts, u_dh
         except ValueError as e:
             lc.append(f'mien_so: {e}')
+    if khac and VIEN_MA_KHAC_SESSION_CHAN:                      # v4 14: Dh from the scale ratio of two sessions
+        lc.append('vien_ma_khac_session')
     if abs(dh) > cfg['dh_max_m']:
         lc.append('dh_vuot_ngoi_chot')
     if len(env['giu_vt']) < cfg['min_giu_vi_tri']:

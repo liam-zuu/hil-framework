@@ -26,7 +26,7 @@ def _ses2(d, **chg):
     return p
 
 
-def run_ds(files, rows, recs, tag, s2_of, du=None, ses_ll=None):
+def run_ds(files, rows, recs, tag, s2_of, du=None, ses_ll=None, theo_cho=None):
     """As T.run with two sessions: s2_of(i, w) -> window in session 2; du: None (no CAM file) or du_m of the pair."""
     d = files
     s1, s2 = d / 'session.json', _ses2(d)
@@ -42,8 +42,10 @@ def run_ds(files, rows, recs, tag, s2_of, du=None, ses_ll=None):
     kg = []
     if du is not None:
         kg = [d / f'kgs_{tag}.json']
-        kg[0].write_text(json.dumps({'schema': 'c7_khung_giua_session_v1', 'session_sha256': [sha1, sha2], 'du_m': du,
-                                     'n_moc': 12}), encoding='utf-8')
+        o = {'schema': 'c7_khung_giua_session_v1', 'session_sha256': [sha1, sha2], 'du_m': du, 'n_moc': 12}
+        if theo_cho is not None:
+            o.update(mo_hinh='phys_v1', theo_cho=theo_cho)
+        kg[0].write_text(json.dumps(o), encoding='utf-8')
     nt.run_lan_lap(str(d / f'hc_{tag}' / 'hieu_chuan_neo.json'), str(d / f'cs_{tag}.json'),
                    ses_ll or [str(s1), str(s2)], str(d / f'll_{tag}'), str(d / 'a6.json'), 'T1', u_beta_cam_deg=0.01,
                    cfg=T.CFG, a6_mod=T.FakeA6Mod, _records=hold, khung_giua_session=[str(x) for x in kg])
@@ -75,18 +77,58 @@ def test_v4_14_same_session_pairs_as_one_session(files):
     assert L2['L03']['dau']['pre']['session_sha256'] == sha2 and 'khung_giua_session' not in L2['L03']
 
 
-def test_v4_14_cross_session_du_zero_changes_nothing(files):
-    """Every run in session 2, every fit window in session 1, du_m = 0: the band and the beta term are 0, so every
-    number equals the one-session result; the run records the pair."""
+def test_v4_14_cross_session_du_zero_changes_nothing(files, monkeypatch):
+    """Every run in session 2, every fit window in session 1, du_m = 0: the band and the beta term are 0. With the
+    tag-edge gate off every number equals the one-session result; with the gate on (default, CODE_KHUNG sec 5) the
+    scale / c_B comparisons across sessions are khong_xac_dinh: no lan_lap_id, delta_c_B chua_ket_luan."""
     rows, recs = T.build()
     _, _, _, L1 = T.run(files, rows, recs, tag='z1')
     rows, recs = T.build()
     _, _, L2, (sha1, sha2) = run_ds(files, rows, recs, 'z2', lambda i, w: w['loai'] in nt.LOAI_GIU, du=0.0)
     for lid, a in L1.items():
+        b = L2[lid]
+        assert b['beta_deg'] == a['beta_deg'] and b['u_beta_deg'] == a['u_beta_deg']
+        assert b['khung_giua_session']['u_beta_deg'] == 0.0 and b['khung_giua_session']['cach'] == 'tho_du_m'
+        assert set(b['khung_giua_session']['session_sha256']) == {sha1, sha2}
+        assert b['lan_lap_id'] is None and b['lan_lap_id_ly_do'] == 'lan_lap_khong_xac_dinh'
+        assert 'vien_ma_khac_session' in b['ly_do']['delta_c_B'] and b['trang_thai']['delta_c_B'] == 'chua_ket_luan'
+    monkeypatch.setattr(nt, 'VIEN_MA_KHAC_SESSION_CHAN', False)
+    rows, recs = T.build()
+    _, _, L3, _ = run_ds(files, rows, recs, 'z3', lambda i, w: w['loai'] in nt.LOAI_GIU, du=0.0)
+    for lid, a in L1.items():
         for k in KEYS:
-            assert a[k] == L2[lid][k], (lid, k)
-        assert L2[lid]['khung_giua_session']['u_beta_deg'] == 0.0
-        assert set(L2[lid]['khung_giua_session']['session_sha256']) == {sha1, sha2}
+            assert a[k] == L3[lid][k], (lid, k)
+
+
+PHYS = dict(du_xoay_rad=1e-4, du_thang=2e-5, du_bien_dang_rad=5e-5, xoay_bien_thien_rad=3e-5)
+
+
+def test_v4_14_phys_per_place(files, monkeypatch):
+    """theo_cho (phys, Liam 20/11 at CODE_KHUNG): beta + (du_xoay + du_bien_dang) of the run's place (not the coarse
+    asin(2 du_m / L_AB) of du_m = 0.3 mm); a place missing from theo_cho -> inf, chua_ket_luan (thieu_cho_<cho>).
+    Gate off: the small phys band keeps the placement of the one-session run (lan_lap_id given across sessions)."""
+    rows, recs = T.build()
+    _, _, _, L1 = T.run(files, rows, recs, tag='p1')
+    tc = {'goc': dict(PHYS), 'K1': dict(PHYS, du_xoay_rad=2e-4)}
+    rows, recs = T.build()
+    _, _, L2, _ = run_ds(files, rows, recs, 'p2', lambda i, w: w['loai'] in nt.LOAI_GIU, du=3e-4, theo_cho=tc)
+    for lid, a in L1.items():
+        b = L2[lid]
+        cho = b['cho']
+        if cho == 'K2':
+            assert b['khung_giua_session']['cach'] == 'thieu_cho_K2' and b['trang_thai']['beta'] == 'chua_ket_luan'
+            continue
+        ub = math.degrees(tc[cho]['du_xoay_rad'] + PHYS['du_bien_dang_rad'])
+        assert b['khung_giua_session']['cach'] == 'phys'
+        assert b['u_beta_deg'] == pytest.approx(a['u_beta_deg'] + ub, abs=1e-12)
+    monkeypatch.setattr(nt, 'VIEN_MA_KHAC_SESSION_CHAN', False)
+    rows, recs = T.build()
+    _, _, L3, _ = run_ds(files, rows, recs, 'p3', lambda i, w: w['loai'] in nt.LOAI_GIU, du=3e-4,
+                         theo_cho=dict(tc, K2=dict(PHYS)))
+    for lid, a in L1.items():
+        assert L3[lid]['lan_lap_id'] == a['lan_lap_id'] and L3[lid]['chuan_12b'] == a['chuan_12b'], lid
+        th = L3[lid]['so_sanh_trong_luot']                       # pre / post of one run: one session, no band
+        assert all('u_khung_giua_session' not in v for v in th.values())
 
 
 def test_v4_14_cross_session_index_and_missing_file(files):
@@ -182,6 +224,11 @@ def test_v4_14_read_khung_giua_session(tmp_path):
                     (6, dict(du_m=True), 'du_m')):
         with pytest.raises(ValueError, match=m):
             nt.doc_kgs([wr(n, **o)])
+    for n, tc, m in ((9, {'goc': dict(PHYS, du_thang=-1.0)}, 'du_thang'), (10, {'O': dict(PHYS)}, 'theo_cho must'),
+                     (11, {'K1': {k: v for k, v in PHYS.items() if k != 'du_bien_dang_rad'}}, 'du_bien_dang_rad')):
+        with pytest.raises(ValueError, match=m):
+            nt.doc_kgs([wr(n, theo_cho=tc)])
+    assert nt.doc_kgs([wr(12, theo_cho={'goc': PHYS})])[frozenset(('a' * 64, 'b' * 64))]['theo_cho']['goc'] == PHYS
     with pytest.raises(ValueError, match='same session pair'):
         nt.doc_kgs([wr(7), wr(8, session_sha256=['b' * 64, 'a' * 64])])
 
@@ -213,3 +260,22 @@ def test_v4_14_measure_camera_of_each_clip(tmp_path, monkeypatch):
     cmap = nt.CtxMap({'a': 'ctx_a', 'b': 'ctx_b'}, [])
     nt._measure(rows, [0, 1], None, None, cmap, None, str(tmp_path))
     assert seen == {'c1.mov': 'ctx_a', 'c2.mov': 'ctx_b'}
+
+
+def test_v4_14_so_sanh_phys_terms(monkeypatch):
+    """so_sanh across sessions with a phys file: theta band du_bien_dang + xoay_bien_thien, scale du_thang +
+    du_bien_dang of the place (gate off); gate on: scale and c_B khong_xac_dinh (vien_ma_khac_session), theta kept."""
+    e = dict(du_m=3e-4, theo_cho={'K1': dict(PHYS)})
+    cmap = nt.CtxMap({'a': None, 'b': None}, [], {frozenset(('a', 'b')): e}, L_AB=0.2)
+    ctx = type('X', (), dict(side=0.145, tag_h=0.12))()
+    w, v = dict(theta=0.0, ses='a', cho='K1'), dict(theta=math.radians(0.001), ses='b', cho='K1')
+    ng = dict(theta=0.05, c_B=2e-4, s=5e-4)
+    r = nt.so_sanh(w, v, ctx, None, ng, cmap)
+    assert r['theta']['u_khung_giua_session'] == pytest.approx(math.degrees(8e-5))
+    assert r['theta']['trang_thai'] == 'khong_doi'
+    assert r['s']['ly_do'] == 'vien_ma_khac_session' and r['c_B']['ly_do'] == 'vien_ma_khac_session'
+    monkeypatch.setattr(nt, 'VIEN_MA_KHAC_SESSION_CHAN', False)
+    r = nt.so_sanh(w, v, ctx, None, ng, cmap)
+    assert r['s']['u_khung_giua_session'] == pytest.approx(7e-5) and 'ly_do' not in r['s']
+    r = nt.so_sanh(w, dict(v, cho='K2'), ctx, None, ng, cmap)                   # K2 not in theo_cho
+    assert r['theta']['trang_thai'] == 'khong_xac_dinh' and r['theta']['ly_do'] == 'thieu_cho_K2'
