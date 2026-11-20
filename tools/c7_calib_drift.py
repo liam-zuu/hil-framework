@@ -279,7 +279,8 @@ def one_way(sa, sb, poses, tag_offset=(0.0, 0.0, 0.0)):
       4. error = that - the true pose.
     Same session (a = b): 0 by construction (the parallax step is exact for a pinhole over a plane)."""
     marks = {int(i): tuple(v) for i, v in sa['marks'].items()}
-    ids = [int(i) for i in sorted(sb['ref_corners_px'], key=int) if int(i) in marks and int(i) in cm.FLOOR_IDS]
+    fl = set(cm.session_floor_ids(sa)) & set(cm.session_floor_ids(sb))
+    ids = [int(i) for i in sorted(sb['ref_corners_px'], key=int) if int(i) in marks and int(i) in fl]
     if len(ids) < MIN_MARKS:
         raise ValueError(f'only {len(ids)} common floor marks between the two clips H (need {MIN_MARKS})')
     cam_a, cam_b = cm.cam_from_dict(sa['camera']), cm.cam_from_dict(sb['camera'])
@@ -338,7 +339,8 @@ def compare(s0, s1, tasks, k_start=None, eps_mm=EPS_MM, d_lap_mm=None, mark_px=M
     worst = pts[w_k]
     ref0 = {int(i): np.array(v, float) for i, v in s0['ref_centres_px'].items()}
     ref1 = {int(i): np.array(v, float) for i, v in s1['ref_centres_px'].items()}
-    common = [i for i in sorted(ref0) if i in ref1 and i in cm.FLOOR_IDS and str(i) in s0['ref_corners_px']
+    fl = set(cm.session_floor_ids(s0)) & set(cm.session_floor_ids(s1))
+    common = [i for i in sorted(ref0) if i in ref1 and i in fl and str(i) in s0['ref_corners_px']
               and str(i) in s1['ref_corners_px']]
     shift = {i: float(np.linalg.norm(ref1[i] - ref0[i])) for i in common}
     # a mark that moved on the floor: its own corner residual, camera of H0 refitted to H1, against the
@@ -362,8 +364,8 @@ def compare(s0, s1, tasks, k_start=None, eps_mm=EPS_MM, d_lap_mm=None, mark_px=M
                               max=max(shift.values()) if shift else None,
                               max_id=max(shift, key=shift.get) if shift else None,
                               per_mark={str(i): round(v, 3) for i, v in shift.items()}),
-                missing_in_h1=[i for i in sorted(ref0) if i in cm.FLOOR_IDS and i not in ref1],
-                missing_in_h0=[i for i in sorted(ref1) if i in cm.FLOOR_IDS and i not in ref0],
+                missing_in_h1=[i for i in sorted(ref0) if i in fl and i not in ref1],
+                missing_in_h0=[i for i in sorted(ref1) if i in fl and i not in ref0],
                 refit_rms_px=dict(h0_cam_on_h0=rms00, h0_cam_on_h1=rms01, h0_cam_on_h1_lanes=d01['rms_px'],
                                   h1_cam_on_h0_lanes=d10['rms_px']),
                 marks_grown=grow,
