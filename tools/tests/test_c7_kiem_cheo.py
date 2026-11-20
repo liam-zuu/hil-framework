@@ -1448,7 +1448,8 @@ def test_e_hieu_reads_f5_and_writes_f9(tmp_path, scene):
                    encoding='utf-8')
     kcr = dict(version=kc.VERSION, thu=False, model='B1',
                hang_so_s7=dict(xuat_phat=dict(goc=[0.0, 0.0]), R_XP_M=0.6, L_MAX_M=1.05, plumb=[0.03, -0.02], **_HS_DUONG),
-               P1_tuong_doi=dict(theo_vung=dict(goc=dict(trong_vung_max_m=0.0007))))
+               P1_tuong_doi=dict(theo_vung=dict(goc=dict(trong_vung_max_m=0.0007))),
+               sessions=dict(H_a=dict(sha256=kc.sha256_file(str(sp)))))
     kcp = tmp_path / 'kc.json'
     kcp.write_text(json.dumps(kcr), encoding='utf-8')
 
@@ -1776,7 +1777,8 @@ def test_e_hieu_refuses_f5_without_legs_and_unchained_track(tmp_path, scene):
                    encoding='utf-8')
     kcr = dict(version=kc.VERSION, thu=False, model='B1',
                hang_so_s7=dict(xuat_phat=dict(goc=[0.0, 0.0]), R_XP_M=0.6, L_MAX_M=1.05, plumb=[0.03, -0.02], **_HS_DUONG),
-               P1_tuong_doi=dict(theo_vung=dict(goc=dict(trong_vung_max_m=0.0007))))
+               P1_tuong_doi=dict(theo_vung=dict(goc=dict(trong_vung_max_m=0.0007))),
+               sessions=dict(H_a=dict(sha256=kc.sha256_file(str(sp)))))
     kcp = tmp_path / 'kc.json'
     kcp.write_text(json.dumps(kcr), encoding='utf-8')
     win = dict(loai='dung_12b', chi_so=0, khung_id=[1], khung_pts_s=[0.0], khung_sha256='a' * 64, p_m=[0.0, 0.0],
@@ -2538,7 +2540,8 @@ def _f5_iii(tmp_path, scene, drop_b=(), tape_off=None):
                    encoding='utf-8')
     kcr = dict(version=kc.VERSION, thu=False, model='B1',
                hang_so_s7=dict(xuat_phat=dict(goc=[0.0, 0.0]), R_XP_M=0.6, L_MAX_M=1.05, plumb=list(F15_C), **_HS_DUONG),
-               P1_tuong_doi=dict(theo_vung=dict(goc=dict(trong_vung_max_m=0.0007))))
+               P1_tuong_doi=dict(theo_vung=dict(goc=dict(trong_vung_max_m=0.0007))),
+               sessions=dict(H_a=dict(sha256=kc.sha256_file(str(sp)))))
     kcp = tmp_path / 'kc.json'
     kcp.write_text(json.dumps(kcr), encoding='utf-8')
 
@@ -2674,3 +2677,53 @@ def test_phan_tich_segment_clips(tmp_path, scene, monkeypatch):
     assert kc.main(args + ['--doan', 'doan1', '--khong-H-cuoi']) == 0
     r1 = json.loads((one / 'kiem_cheo.json').read_text(encoding='utf-8'))
     assert r1['doan']['vai_tro_vang'] == ['H_m', 'H_z'] and kc.DOAN_KHONG_CUOI in r1['doan']['gioi_han']
+
+
+# ---------------------------------------------------------------- several camera sessions (CODE 20/11 khuya, chain A)
+def _second_session(tmp_path, sp, **over):
+    s2 = json.loads(sp.read_text(encoding='utf-8'))
+    s2['ghi_chu'] = 'doan 2'                                            # another file, another sha
+    s2.update(over)
+    p2 = tmp_path / 'ses2.json'
+    p2.write_text(json.dumps(s2), encoding='utf-8')
+    return p2
+
+
+def test_meo_bang_items_of_two_sessions(tmp_path, scene, monkeypatch):
+    """Run r2 (K1) measured in a second session: --session of both; each item through the cameras of its own
+    session, its session sha written; the case list is the same; the second session missing, or one with another
+    plumb point: code 2."""
+    sp = _f15_session(tmp_path, scene)
+    p2 = _second_session(tmp_path, sp)
+    lp, ll = _bang_files(tmp_path, sp)
+    s1, s2 = kc.sha256_file(str(sp)), kc.sha256_file(str(p2))
+    for dau in ll['luot'][1]['dau'].values():
+        dau['session_sha256'] = s2
+    ll['session_sha256'] = [s1, s2]
+    lp.write_text(json.dumps(ll), encoding='utf-8')
+    _field_cases(monkeypatch, scene)
+    out = tmp_path / 'b.json'
+    base = ['meo_bang', '--model', 'B1', '--lan-lap', str(lp)] + _bang_dets(tmp_path, scene)
+    assert kc.main(base + ['--session', str(sp), '--session', str(p2), '--out', str(out)]) == 0
+    r = json.loads(out.read_text(encoding='utf-8'))
+    assert {x['sha256'] for x in r['ban_do']['sessions']} == {s1, s2} and r['ban_do']['session_sha256'] is None
+    assert {m['session_sha256'] for m in r['theo_cho']['K1']['muc']} == {s2}
+    assert {m['session_sha256'] for m in r['theo_cho']['goc']['muc']} == {s1}
+    assert r['theo_cho']['goc']['ca'] == r['theo_cho']['K1']['ca']
+    assert kc.main(base + ['--session', str(sp), '--out', str(tmp_path / 'b2.json')]) == 2
+    p3 = _second_session(tmp_path, sp, plumb_xy_m=[0.0, 0.0])
+    for dau in ll['luot'][1]['dau'].values():
+        dau['session_sha256'] = kc.sha256_file(str(p3))
+    ll['session_sha256'] = [s1, kc.sha256_file(str(p3))]
+    lp.write_text(json.dumps(ll), encoding='utf-8')
+    assert kc.main(['meo_bang', '--model', 'B1', '--lan-lap', str(lp)] + _bang_dets(tmp_path, scene)
+                   + ['--session', str(sp), '--session', str(p3), '--out', str(tmp_path / 'b3.json')]) == 2
+
+
+def test_e_hieu_refuses_the_f5_of_another_segment(tmp_path, scene):
+    """The F5 session is not the H_a session of the kiem_cheo result (another camera segment): code 2."""
+    kcp, dop, *_ = _f5_iii(tmp_path, scene)
+    r = json.loads(kcp.read_text(encoding='utf-8'))
+    r['sessions']['H_a']['sha256'] = '7' * 64
+    kcp.write_text(json.dumps(r), encoding='utf-8')
+    assert kc.main(['e_hieu', '--kiem-cheo', str(kcp), '--doan', str(dop), '--out', str(tmp_path / 'e.json')]) == 2
