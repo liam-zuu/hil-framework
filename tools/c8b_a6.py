@@ -35,6 +35,12 @@ squares with the per-frame pose (T, psi) eliminated (design 2b (a); the camera-I
         camera-IMU check from a c8b_a6_o_v1 file (schema, sha, the place fits it used, the lock, every cell
         |d| <= U_psi + U_IMU,D, A6C1-4), khoa_truoc_sha256 and the commit of the script (A6C1-4), the domain on the four
         corners (A6C1-8), h_goc_m / u_h_goc_m only when A6 and the c8b_u_h_chung_v1 file are dat (A6C1-7).
+        Da session (A) (contract log 20/11 khuya; session 2 has three camera sessions, CODE_C8B fix/c8b-da-session):
+        the places may come from different camera sessions when the rest of the set-up (L125 plumb, Z_c, tag_h,
+        side, kappa) is the same; g, eps_g are tag-frame numbers (no floor-frame comparison between sessions, so no
+        u_khung_giua_session); e_bc is the largest over the camera centres of the places and of --session-cham (the
+        sessions of the scored runs); the file lists them in 'session' and 'e_bc_theo_session' (cam_tam_m null when
+        more than one). Limit: the readers do not check that the scoring session is in 'session'.
 
 Reader functions (data contract F3 2026-11-19 section 2.C, CAM / HIEUCHUAN / NHACTAM):
   load_a6(path)                                     the file, schema checked, its sha256 in '_sha256'
@@ -136,6 +142,7 @@ TOL_SETUP = 1e-9
 PLUMB_L125 = (-0.4802, -0.0329)
 ZC_L125 = 2.632
 TOL_L125 = 1e-6                                            # the session numbers are these constants (float rounding)
+SU_THEO_SESSION = ('session_sha256', 'cam_tam_m')                # da session (A): set-up fields of the camera
 U_H_HANG_M = 0.0001                                        # design 3: the 0.1 mm term of u_h_chung
 HEX64 = re.compile(r'^[0-9a-f]{64}$')
 GIOI_HAN = [
@@ -1013,16 +1020,51 @@ def _deg_rad(v):
     return math.radians(float(v))
 
 
+def _su_chung(su):
+    """The set-up without the camera of the session (da session (A), contract log 20/11 khuya): plumb, Z_c, tag_h,
+    side, kappa are the L125 constants of every session; only session_sha256 and the camera centre may differ."""
+    return {k: v for k, v in su.items() if k not in SU_THEO_SESSION}
+
+
+def _cam_list(places, cam_cham, s0):
+    """Distinct cameras {session_sha256, cam_tam_m, vai} of the E places and of the scoring sessions (cam_cham, from
+    gop --session-cham; same L125 set-up as the places, else A6Error): e_bc is taken over all of them (da session)."""
+    out, seen = [], set()
+    for vai, su in [(f'E {p["cho"]}', p['set_up']) for p in places] + [('cham', c) for c in (cam_cham or ())]:
+        if json.dumps(_su_chung(dict(su)), sort_keys=True) != json.dumps(_su_chung(s0), sort_keys=True):
+            raise A6Error(f'{vai}: set-up {_su_chung(dict(su))} is not the set-up of the places (L125)')
+        key = (su.get('session_sha256'), json.dumps(su.get('cam_tam_m')))
+        if key in seen:
+            for o in out:
+                if (o['session_sha256'], json.dumps(o['cam_tam_m'])) == key and vai not in o['vai']:
+                    o['vai'].append(vai)
+            continue
+        seen.add(key)
+        out.append(dict(session_sha256=su.get('session_sha256'), cam_tam_m=su.get('cam_tam_m'), vai=[vai]))
+    return out
+
+
+def set_up_of_session(ses):
+    """The set-up dict of a session (read_session) as written by do (for gop --session-cham)."""
+    cam = camera_of(ses)
+    return dict(C=list(map(float, ses['C'])), H_m=ses['H'], h_m=ses['hbar'], side_m=ses['side'], kappa=ses['kappa'],
+                session_sha256=ses['sha256'],
+                cam_tam_m=[float(x) for x in np.asarray(getattr(cam, 'centre', (math.nan,) * 3), float)])
+
+
 def gop(places, tam_id, tam_cal_id, lap=None, dong=None, giu_ngoai=None, u_h=None, khoa_truoc_sha256=None,
-        script=None, cho_sha=(), nguon=(), with_ebc=True, lan_lap_cal_id=None, giu_ngoai_rows=None, khoa=None):
+        script=None, cho_sha=(), nguon=(), with_ebc=True, lan_lap_cal_id=None, giu_ngoai_rows=None, khoa=None,
+        cam_cham=()):
     """c8b_a6_v2 of one plate from the place results (design 2c, 3, 10); the sources are parsed dicts (CLI: files);
-    giu_ngoai_rows the rows of the held-out cells (c8b_a6_o.read_rows), khoa the parsed lock JSON (A6C2-2)."""
+    giu_ngoai_rows the rows of the held-out cells (c8b_a6_o.read_rows), khoa the parsed lock JSON (A6C2-2).
+    cam_cham: set-ups (set_up_of_session) of the sessions where the file is used for scoring; e_bc is the largest
+    over the cameras of the places and of these (da session (A)); the places may come from different sessions."""
     why = []
     if not places:
         raise A6Error('no place')
-    su = {json.dumps(p['set_up'], sort_keys=True) for p in places}
-    if len(su) != 1:
-        raise A6Error('places measured with different car_pose set-ups')
+    su = {json.dumps(_su_chung(p['set_up']), sort_keys=True) for p in places}
+    if len(su) != 1:                                                  # da session (A): only the camera may differ
+        raise A6Error('places measured with different car_pose set-ups (other than the camera of the session)')
     if any(p.get('tam_id') != tam_id for p in places):
         raise A6Error(f'a place of another plate than {tam_id!r} (A6C1-7)')
     s0 = places[0]['set_up']
@@ -1094,15 +1136,25 @@ def gop(places, tam_id, tam_cal_id, lap=None, dong=None, giu_ngoai=None, u_h=Non
         why.append('khoa_truoc_sha256 missing (the lock before the checks, design 0.3, A6C1-4)')
     if not isinstance(script, dict) or not script.get('commit') or script.get('dirty') is not False:
         why.append(f'script commit not recorded or dirty ({script!r}): no code SHA (A6C1-4)')
-    cam_c = s0.get('cam_tam_m')
-    ebc, ebc_lv = None, []
+    cams = _cam_list(places, cam_cham, s0)                            # da session (A): every camera of use
+    cam_c = cams[0]['cam_tam_m'] if len(cams) == 1 else None
+    ebc, ebc_lv, ebc_ses = None, [], []
     if g_hat is not None and with_ebc:
-        if cam_c is None or not np.all(np.isfinite(cam_c)):
-            why.append('no camera centre of the session: e_bc not computed (A6C1-9)')
+        bad = [c['session_sha256'] for c in cams
+               if c['cam_tam_m'] is None or not np.all(np.isfinite(np.asarray(c['cam_tam_m'], float)))]
+        if bad:
+            why.append(f'no camera centre of the session(s) {bad}: e_bc not computed (A6C1-9)')
         else:
-            ebc, ebc_lv = e_bc(g_hat, eps if eps is not None else (s_norm + uc_norm), C, H, hb, side, cam_c)
-            if ebc is None:
-                why.append(f'e_bc grid not converged by k = {EBC_KMAX} (maxima {ebc_lv}) (design 2a, A6C1-9)')
+            vals = []
+            for c in cams:
+                v, lv = e_bc(g_hat, eps if eps is not None else (s_norm + uc_norm), C, H, hb, side, c['cam_tam_m'])
+                ebc_ses.append(dict(c, e_bc_rad=v, e_bc_lan_chia=lv))
+                vals.append((v, lv))
+            if any(v is None for v, _ in vals):
+                why.append(f'e_bc grid not converged by k = {EBC_KMAX} (maxima '
+                           f'{[lv for v, lv in vals if v is None]}) (design 2a, A6C1-9)')
+            else:
+                ebc, ebc_lv = max(vals, key=lambda x: x[0])
     mien_ok = None
     if g_hat is not None:
         tilt = math.atan(float(np.linalg.norm(g_hat)) + (eps or 0.0))
@@ -1134,7 +1186,8 @@ def gop(places, tam_id, tam_cal_id, lap=None, dong=None, giu_ngoai=None, u_h=Non
                 h_cal_m=None if tam_moi else h_cal, U_cal=uc_norm, U_cal_thanh_phan=uc,
                 U_cal_venh='0: venh tach bang tham so v trong phep giai 4 goc (s_i truc giao do doc)',
                 khoang_g_cal=dist, nhat_quan=nhat_quan, nhat_quan_cho=nq,
-                e_bc_rad=ebc, e_bc_lan_chia=ebc_lv,
+                e_bc_rad=ebc, e_bc_lan_chia=ebc_lv, e_bc_theo_session=ebc_ses,
+                session=[dict(session_sha256=c['session_sha256'], cam_tam_m=c['cam_tam_m'], vai=c['vai']) for c in cams],
                 a6du_rad_per_m=None if eps is None else float(eps / (2.0 * (H - hb))),
                 H_m=float(H), h_m=float(hb), plumb_xy_m=[float(x) for x in C], side_m=float(side), cam_tam_m=cam_c,
                 mien=dict(rho_max_m=RHO_MAX_M, nghieng_max_rad=NGHIENG_MAX_RAD, v_max_m=V_MAX_M, dat=mien_ok,
@@ -1544,6 +1597,9 @@ def main(argv=None):
     a2.add_argument('--giu-ngoai', default=None, help=f'{SCHEMA_O} file (camera-IMU held-out check)')
     a2.add_argument('--u-h-chung', default=None, help=f'{SCHEMA_UH} file')
     a2.add_argument('--khoa-truoc', default=None, help='the lock manifest written before the checks (its sha256)')
+    a2.add_argument('--session-cham', action='append', default=[],
+                    help='session.json of a camera session where the file is used for scoring (repeat; e_bc is the '
+                         'largest over the E places and these, da session (A))')
     a2.add_argument('--out', required=True)
     a = ap.parse_args(argv)
     try:
@@ -1591,6 +1647,11 @@ def main(argv=None):
                         khoa_d = json.load(f)
                 except ValueError:
                     khoa_d = None                                       # not JSON: kiem_o reports no sets
+            cam_cham = []
+            for sp in a.session_cham:
+                ses_c = read_session(sp)
+                cam_cham.append(set_up_of_session(ses_c))
+                nguon.append(dict(vai='session_cham', file=ses_c['file'], sha256=ses_c['sha256']))
             rows = None
             if src['giu_ngoai'] is not None:                            # A6C2-2: the rows the cells were built from
                 rn = [x for x in src['giu_ngoai'].get('nguon') or [] if isinstance(x, dict) and x.get('vai') == 'rows']
@@ -1604,7 +1665,7 @@ def main(argv=None):
                 nguon.append(dict(vai='giu_ngoai rows', file=os.path.abspath(rn[0]['file']), sha256=rn[0]['sha256']))
             out = gop(places, a.tam_id, a.tam_cal_id, src['lap'], src['dong'], src['giu_ngoai'], src['u_h'], khoa,
                       script_state(), shas, nguon, lan_lap_cal_id=a.lan_lap_cal_id, giu_ngoai_rows=rows,
-                      khoa=khoa_d)
+                      khoa=khoa_d, cam_cham=cam_cham)
             out.update(script=script_state(), luc=datetime.datetime.now().astimezone().isoformat(timespec='seconds'))
             _write(a.out, out)
             print(f'A6 {out["trang_thai"]}; g_b {out["g_b"]} eps_g {out["eps_g"]} e_bc {out["e_bc_rad"]}; '

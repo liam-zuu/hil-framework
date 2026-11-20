@@ -213,3 +213,35 @@ def test_eps_h_and_mien_car_pose(tmp_path):
     d = json.loads(out.read_text(encoding='utf-8'))
     assert {n['vai'] for n in d['khoa_truoc']['nguon']} >= {'nguong', 'a6', 'session', 'camera'}
     assert d['mien_car_pose']['trang_thai'] == 'dat'
+
+
+def test_da_session_mien_car_pose(tmp_path):
+    # da session (A), contract log 20/11 khuya: three camera sessions in session 2; they agree -> one domain,
+    # dzc the largest camera file; a session that differs -> thieu with the field named
+    one = K.mien_car_pose(_a6(), SES, CAMF)
+    three = K.mien_car_pose(_a6(), [SES, dict(SES), dict(SES)],
+                            [CAMF, dict(day_doi=dict(dzc_m=0.02)), dict(day_doi=dict(dzc_m=0.005))])
+    assert three['trang_thai'] == 'dat' and three['side_m'] == one['side_m'] and three['h_m'] == one['h_m']
+    assert three['kappa'] == pytest.approx([(0.1232 - 0.0012) / (2.632 + 0.02), (0.1250 + 0.0012) / (2.632 - 0.02)])
+    assert K.mien_car_pose(_a6(), [SES], [CAMF]) == one
+    for key, val in (('car_side_m', 0.145), ('car_pose_version', 'car_pose_v3'), ('kappa', 0.05)):
+        m = K.mien_car_pose(_a6(), [SES, dict(SES, **{key: val})], [CAMF])
+        assert m['trang_thai'] == 'thieu' and any(key in w for w in m['ly_do']), (key, m['ly_do'])
+    m = K.mien_car_pose(_a6(), [SES], [CAMF, dict(day_doi={})])
+    assert m['trang_thai'] == 'thieu' and m['kappa'] is None and any('dzc' in w for w in m['ly_do'])
+    # CLI: --session, --camera repeated, every file in khoa_truoc.nguon
+    p = tmp_path / '3b.json'
+    p.write_text(json.dumps(_tb('O1-F05')), encoding='utf-8')
+    args = []
+    for i, (nm, d) in enumerate((('session', SES), ('session', SES), ('camera', CAMF),
+                                 ('camera', dict(day_doi=dict(dzc_m=0.02))), ('a6', _a6()), ('nguong', NG))):
+        f = tmp_path / f'{nm}{i}.json'
+        f.write_text(json.dumps(d), encoding='utf-8')
+        args += [f'--{nm}', str(f)]
+    out = tmp_path / 'k.json'
+    assert K.main(['--tb', f'O1-F05={p}', '--muc', 'O1-F05', '--canh-ma-m', '0.1445', '--nhanh-tick', 'bo_tick']
+                  + args + ['--out', str(out)]) == 0
+    d = json.loads(out.read_text(encoding='utf-8'))
+    assert [n['vai'] for n in d['khoa_truoc']['nguon']].count('session') == 2
+    assert [n['vai'] for n in d['khoa_truoc']['nguon']].count('camera') == 2
+    assert d['mien_car_pose']['kappa'][1] == pytest.approx((0.1250 + 0.0012) / (2.632 - 0.02))

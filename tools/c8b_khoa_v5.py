@@ -125,9 +125,29 @@ def eps_h_of(ng):
     return dict(mm=float(e['mm']), huong_deg=float(e['huong_deg'])), None
 
 
+def _mot_gia_tri(ds, key, what, why):
+    """da session (A): the one value of key over the session / camera dicts ds; differing values -> why, None."""
+    vals = [(d or {}).get(key) for d in ds]
+    if len({json.dumps(v, sort_keys=True) for v in vals}) > 1:
+        why.append(f'{what}: {key} differs between the sessions ({vals})')
+        return None
+    return vals[0] if vals else None
+
+
 def mien_car_pose(a6, ses, cam):
-    """{side_m, phien_ban, h_m, kappa, trang_thai, ly_do} (CODE 20/11)."""
+    """{side_m, phien_ban, h_m, kappa, trang_thai, ly_do} (CODE 20/11). ses, cam: one dict or a list (da session (A),
+    contract log 20/11 khuya): the sessions must agree on car_side_m, car_pose_version, tag_h_m, kappa (L125 set-up),
+    dzc is the largest of the camera files (each must have it)."""
     why = []
+    if isinstance(ses, list):
+        ss = ses
+        ses = None if not ss else dict(car_side_m=_mot_gia_tri(ss, 'car_side_m', 'session', why),
+                                       car_pose_version=_mot_gia_tri(ss, 'car_pose_version', 'session', why),
+                                       tag_h_m=_mot_gia_tri(ss, 'tag_h_m', 'session', why),
+                                       kappa=_mot_gia_tri(ss, 'kappa', 'session', why))
+    if isinstance(cam, list):
+        dz = [_num(((c or {}).get('day_doi') or {}).get('dzc_m')) for c in cam]
+        cam = None if not dz or any(x is None for x in dz) else dict(day_doi=dict(dzc_m=max(dz)))
     side = _num((ses or {}).get('car_side_m'))
     ver = (ses or {}).get('car_pose_version')
     if side is None:
@@ -353,9 +373,11 @@ def main(argv=None):
     ap.add_argument('--muc', default=','.join(LEVELS), help='levels of muc_kha_thi (comma separated)')
     ap.add_argument('--nguong', default=None, help='nguong_khoa_c8_v1.json (eps_H, CODE writes it at C8)')
     ap.add_argument('--a6', default=None, help='c8b_a6_v2 (h_goc_m, u_h_goc_m)')
-    ap.add_argument('--session', default=None, help='session.json of the scoring (car_side_m, tag_h_m, kappa, '
-                                                    'car_pose_version)')
-    ap.add_argument('--camera', default=None, help='camera file c8_cam_u_vao (day_doi.dzc_m)')
+    ap.add_argument('--session', action='append', default=None,
+                    help='session.json of the scoring (car_side_m, tag_h_m, kappa, car_pose_version); repeat once per '
+                         'camera session of the C8 session (da session (A)): they must agree, else mien thieu')
+    ap.add_argument('--camera', action='append', default=None,
+                    help='camera file c8_cam_u_vao (day_doi.dzc_m); repeatable, the largest dzc is used')
     ap.add_argument('--out', required=True)
     a = ap.parse_args(argv)
     try:
@@ -403,11 +425,15 @@ def main(argv=None):
         extra = {}
         for key, path, vai in (('nguong', a.nguong, 'nguong'), ('a6', a.a6, 'a6'), ('ses', a.session, 'session'),
                                ('cam', a.camera, 'camera')):
-            if path:
-                with open(path, encoding='utf-8') as f:
-                    extra[key] = json.load(f)
-                nguon.append(dict(vai=vai, file=os.path.basename(path), duong_dan=os.path.abspath(path),
-                                  sha256=cu.sha256(path)))
+            for pth in (path if isinstance(path, list) else [path] if path else []):   # da session (A): repeatable
+                with open(pth, encoding='utf-8') as f:
+                    d = json.load(f)
+                if key in ('ses', 'cam'):
+                    extra.setdefault(key, []).append(d)
+                else:
+                    extra[key] = d
+                nguon.append(dict(vai=vai, file=os.path.basename(pth), duong_dan=os.path.abspath(pth),
+                                  sha256=cu.sha256(pth)))
         out = build(tbs, ll, nguon, script_state(), a.canh_ma_m, nt, mk, **extra)
         with open(a.out, 'x', encoding='utf-8') as f:
             f.write(json.dumps(_clean(out), indent=1, ensure_ascii=False, allow_nan=False))

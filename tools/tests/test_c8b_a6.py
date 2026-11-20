@@ -720,3 +720,51 @@ def test_hcv3_2_a3_over_the_12b_corridor(places):
         assert r['trang_thai'] == 'thieu' and any(txt in w for w in r['ly_do']), (txt, r['ly_do'])
     assert A._dist_seg(np.array([0.0, 1.0]), np.array([-1.0, 0.0]), np.array([1.0, 0.0])) == pytest.approx(1.0)
     assert A._dist_seg(np.array([3.0, 0.0]), np.array([-1.0, 0.0]), np.array([1.0, 0.0])) == pytest.approx(2.0)
+
+
+# ── da session (A), contract log 20/11 khuya: session 2 has three camera sessions (CODE_C8B 20/11 dem) ──────────────
+
+def _ses2(pl, sha, centre_shift):
+    return dict(pl, set_up=dict(pl['set_up'], session_sha256=sha,
+                                cam_tam_m=[x + d for x, d in zip(pl['set_up']['cam_tam_m'], centre_shift)]))
+
+
+def test_da_session_places_from_two_sessions(places):
+    pg, pk = places
+    one = _gop(places)
+    two = _gop([pg, _ses2(pk, 'e' * 64, (0.01, -0.02, 0.005))])
+    assert two['trang_thai']['a6'] == 'dat' and two['g_b'] == one['g_b'] and two['eps_g'] == one['eps_g']
+    assert len(two['session']) == 2 and two['cam_tam_m'] is None and len(two['e_bc_theo_session']) == 2
+    assert two['e_bc_rad'] == max(x['e_bc_rad'] for x in two['e_bc_theo_session'])
+    assert one['e_bc_rad'] in [x['e_bc_rad'] for x in two['e_bc_theo_session']]
+    assert len(one['session']) == 1 and one['cam_tam_m'] == pg['set_up']['cam_tam_m']
+
+
+def test_da_session_other_setup_still_refused(places):
+    pg, pk = places
+    bad = _ses2(pk, 'e' * 64, (0, 0, 0))
+    bad = dict(bad, set_up=dict(bad['set_up'], side_m=bad['set_up']['side_m'] + 0.001))
+    with pytest.raises(A.A6Error, match='different car_pose set-ups'):
+        A.gop([pg, bad], 'T1', 'T1')
+
+
+def test_da_session_scoring_cameras_enter_e_bc(places):
+    pg, _ = places
+    far = dict(pg['set_up'], session_sha256='f' * 64,
+               cam_tam_m=[x + d for x, d in zip(pg['set_up']['cam_tam_m'], (0.3, 0.3, 0.0))])
+    one = _gop(places)
+    o = _gop(places, cam_cham=[far])
+    assert len(o['session']) == 2 and o['session'][1]['vai'] == ['cham']
+    assert o['e_bc_rad'] >= one['e_bc_rad']
+    assert o['e_bc_rad'] == max(x['e_bc_rad'] for x in o['e_bc_theo_session'])
+    same = _gop(places, cam_cham=[dict(pg['set_up'])])                 # a scoring session equal to a place's: merged
+    assert len(same['session']) == 1 and same['session'][0]['vai'] == ['E goc', 'E K1', 'cham']
+    with pytest.raises(A.A6Error, match='L125'):
+        _gop(places, cam_cham=[dict(far, H_m=far['H_m'] + 0.01)])
+
+
+def test_da_session_cli_session_cham(places, tmp_path):
+    ses = tmp_path / 's.json'
+    ses.write_text(json.dumps(dict(kappa=HB / H, tag_h_m=HB, car_side_m=SIDE, plumb_xy_m=list(C))), encoding='utf-8')
+    with pytest.raises(A.A6Error, match='camera'):                      # a session without camera: refused, not NaN
+        A.set_up_of_session(A.read_session(str(ses)))
