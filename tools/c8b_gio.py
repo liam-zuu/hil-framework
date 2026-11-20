@@ -29,8 +29,15 @@ consecutive line pairs of the log window valid, a log hole above LOG_HOLE_S (100
 checks of section 3: a channel fit not ok (correlation, start / end thirds, o1_time_sync limits), L > U~, the
 start-up estimate not meeting the scoring interval, and, with a C8 lock file, the width U~ - L or the gyro - RV
 difference outside the range of the C8 runs of the same level (at C8 itself only the first two). No finite clock
-bound (ket_luan chua_ket_luan: G1-G5 not concluded; design 7): reset_n not constant, g_valid or r_valid 0 in the log
-window, an IMU age below AGE_NEG_LIM_MS (-2 ms [DE XUAT]), a lock file without the range of the level. Refused
+bound (ket_luan chua_ket_luan: G1-G5 not concluded; design 7): reset_n not constant (the IMU chip reset count,
+AGV logger.c 147 / main.c 299, NOT a firmware boot: the IMU report counters restart; the scorer loses the run to the
+command path, J v6 5 (1)), g_valid or r_valid 0 in the log
+window, a lock file without the range of the level (no negative age limit: J v6 J4-14, item 12(f); the ages
+are recorded only). F11 (design C8B v7 section 7a): kiem_gio_d1 / cap_dem / ho_log split the lost-run reasons;
+M2 (J v6 J5-9): kiem_gio_d1.truoc_boot and dem_truot_kiem_gio say whether a failed clock check counts; the operator
+kinds (boot, khoa_sieu_am, loi_nap_gain) come from ONE source, the scorer's score.json of the run (--score, field
+thao_tac; CODE 19/11, CT3-6). The log rows are of one boot (times increase), so the time of a boot is not in them:
+t_boot_log_s null, du_cua_so false, a run with a boot does not count (J5-9: no independent evidence). Refused
 (exit 2): duplicate log lines not marked by the logger segments file (a repeated log_seq, L92), a log_seq jump in the
 run window (o1_time_sync.log_window), times not increasing.
 Start-up check (F5; C8B4R2-3; a consistency check only, never narrows the interval): from standstill, over the
@@ -79,7 +86,6 @@ IMU_GAP_S = 2 * IMU_P + 0.010   # section 7: no bridging across a larger IMU rep
 LOG_P = 0.010              # s, control / log tick of the campaign firmware (10 ms)
 LOG_GAP_S = 2 * LOG_P + 0.010   # section 7: a count pair over a larger time gap is not used (C8BS-2), even with
                                 # consecutive log_seq; the whole run is lost only above LOG_HOLE_S
-AGE_NEG_LIM_MS = -2.0      # [DE XUAT] section 7: a negative age down to -2 ms is valid (design 2), below is an error
 PAIR_MIN = 0.95            # [DE XUAT] section 7
 LOG_HOLE_S = 0.100         # [DE XUAT] section 7
 LE = 1.25                  # half-width margin, author's convention (design 3, as U_IMU v11.26)
@@ -503,7 +509,7 @@ def nodes(c, h, step=STEP_S):
         k += 1
 
 
-def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S):
+def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S, thao_tac=()):
     F = read_frames(frames_path)
     rows, n_dup = read_log(log_path)
     tl = np.array([float(r['timestamp_us']) for r in rows]) * 1e-6
@@ -526,7 +532,7 @@ def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S):
     kiem['reset_n_const'] = len(rn) == 1
     kiem['g_valid_all'] = all(rows[k]['g_valid'] == '1' for k in np.flatnonzero(inw))
     kiem['r_valid_all'] = all(rows[k]['r_valid'] == '1' for k in np.flatnonzero(inw))
-    for k_, what in (('reset_n_const', 'reset_n changes in the log window'),
+    for k_, what in (('reset_n_const', 'reset_n (IMU chip resets) changes in the log window'),
                      ('g_valid_all', 'g_valid = 0 in the log window'), ('r_valid_all', 'r_valid = 0 in the log window')):
         if not kiem[k_]:
             fails.append(what)
@@ -534,18 +540,25 @@ def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S):
     ag = ag[np.isfinite(ag)]
     kiem['age_min_ms'] = float(ag.min()) if len(ag) else None
     kiem['n_age_neg'] = int(np.sum(ag < 0))
-    if len(ag) and ag.min() < AGE_NEG_LIM_MS:
-        fails.append(f'IMU age {ag.min():.2f} ms < {AGE_NEG_LIM_MS} ms')
+    # J v6 section 5 (J4-14, item 12(f)): no negative age limit any more; an invalid IMU sample is told by the flags of
+    # the same row (r_valid, g_valid above), not by the age value. The ages are recorded only.
+    # J v6 M2, J5-9: the time of a firmware boot in the log. reset_n is the IMU chip reset count, not a boot (CODE
+    # 19/11; the previous code took its change for a boot, an error of ours). The rows read here are of one boot (times
+    # increase, read_log), so no boot time is in them: null (a boot comes from the scorer's thao_tac only)
+    kiem['t_boot_log_s'] = None
     tm, rate, br, pair_ok, ip = count_pairs(rows, tl)
     pw = inw[1:] & inw[:-1]
     kiem['pairs_window'] = int(pw.sum())
     kiem['pairs_valid_share'] = float(pair_ok[pw].mean()) if pw.any() else 0.0
+    loai = dict(kiem_gio_d1=[], cap_dem=[], ho_log=[], khac=[])      # F11: the kind of every lost-run reason
     if kiem['pairs_valid_share'] < PAIR_MIN:
         hong.append(f'valid count pairs {kiem["pairs_valid_share"]:.3f} < {PAIR_MIN} in the log window')
+        loai['cap_dem'].append(hong[-1])
     hole = float(np.max(np.diff(tl[inw]))) if inw.sum() > 1 else math.inf
     kiem['log_hole_max_s'] = hole
     if hole > LOG_HOLE_S:
         hong.append(f'log hole {hole * 1e3:.1f} ms > {LOG_HOLE_S * 1e3:.0f} ms in the log window')
+        loai['ho_log'].append(hong[-1])
     vel = fk(rate)
     # channels
     tg, gz, _ = imu_reports(rows, tl, 'gyro_n', 'age_g_ms', 'gz_fused')
@@ -578,20 +591,23 @@ def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S):
             kenh[ch] = dict(D_s=None, ok=False, why=str(exc))
         if not kenh[ch]['ok']:
             hong.append(f'{ch}: {kenh[ch]["why"]}')
+            loai['kiem_gio_d1'].append(hong[-1])
     out = dict(format=FORMAT, task=task, t0_log_s=t0, window_log_s=list(win), coarse_s=coarse, kenh=kenh, kiem=kiem,
                moc_mau=True, step_s=STEP_S, le=LE)
     if any(kenh[c]['D_s'] is None for c in CHANNELS):
         out.update(ok=False, ly_do=hong + fails, ly_do_hong=hong, ly_do_chua=fails, nodes_s=[],
                    ket_luan='hong_he_do' if hong else 'chua_ket_luan')
+        out.update(f11(out, kenh, kiem, loai, fails, khoa, None, thao_tac))
         return out, F, None
     L_ch = max(LOWER, key=lambda c: kenh[c]['D_s'])
     U_ch = min(UPPER, key=lambda c: kenh[c]['D_s'])
     L, U = kenh[L_ch]['D_s'], kenh[U_ch]['D_s']
     c, h = 0.5 * (L + U), LE * 0.5 * (U - L)
-    out.update(L_s=L, U_s=U, L_kenh=L_ch, U_kenh=U_ch, width_s=U - L, center_s=c, half_s=h,
+    out.update(L_s=L, U_s=U, L_kenh=L_ch, U_kenh=U_ch, width_s=U - L, center_s=c, half_s=h, h_s=h,
                gyro_minus_rv_s=kenh['gyro_rx']['D_s'] - kenh['rv_rx']['D_s'])
     if L > U:
         hong.append(f'L {L * 1e3:.1f} ms > U~ {U * 1e3:.1f} ms')
+        loai['kiem_gio_d1'].append(hong[-1])
         out['nodes_s'] = []
     else:
         out['nodes_s'] = nodes(c, h)
@@ -640,6 +656,7 @@ def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S):
         st['ket_qua'] = 'nhat_quan' if meet else 'khong_nhat_quan'
         if not meet:
             hong.append('start-up estimate does not meet the scoring interval')
+            loai['khac'].append(hong[-1])
     out['khoi_dong'] = st
     # C8 range of the same level (campaign runs)
     if khoa is not None:
@@ -653,11 +670,75 @@ def analyse(frames_path, log_path, task, khoa=None, startup_s=STARTUP_S):
                 kiem[f'{k_}_in_c8_range'] = inr
                 if not inr:
                     hong.append(f'{k_} {v_ * 1e3:.1f} ms outside the C8 range [{lo_ * 1e3:.1f}, {hi_ * 1e3:.1f}] ms')
+                    loai['kiem_gio_d1'].append(hong[-1])
     else:
         kiem['c8_range'] = 'khong kiem (luot C8 hay chua khoa)'
     out.update(ok=not (fails or hong), ly_do=hong + fails, ly_do_hong=hong, ly_do_chua=fails,
                ket_luan='hong_he_do' if hong else ('chua_ket_luan' if fails else 'ok'))
+    out.update(f11(out, kenh, kiem, loai, fails, khoa, cw, thao_tac))
     return out, F, dict(tm=tm, vel=vel, tg=tg, gz=gz, tr=tr, yr=yr)
+
+
+THAO_TAC = ('boot', 'khoa_sieu_am', 'loi_nap_gain')    # J v6 section 5: runs lost to an operation
+
+
+def score_thao_tac(score_path, log_path):
+    """The operator kinds of the run from the scorer's score.json (c7_score relative mode: thao_tac [kinds], absent
+    when none; esp32_sha256 must be the log given). Returns (kinds, {file, sha256})."""
+    cu.check_path(score_path)
+    with open(score_path, encoding='utf-8') as f:
+        sc = json.load(f)
+    if not isinstance(sc, dict):
+        raise GioError(f'{score_path}: not a score.json')
+    if sc.get('esp32_sha256') != cu.sha256(log_path):
+        raise GioError(f'{score_path}: esp32_sha256 is not the log given: the score of another run')
+    tt = sc.get('thao_tac') or []
+    if not isinstance(tt, list) or any(x not in THAO_TAC for x in tt):
+        raise GioError(f'{score_path}: thao_tac {tt!r}: kinds must be in {THAO_TAC} (CODE 19/11, CT3-6)')
+    return tuple(tt), dict(file=os.path.abspath(score_path), sha256=cu.sha256(score_path))
+
+
+def f11(out, kenh, kiem, loai, fails, khoa, cw, thao_tac=()):
+    """c8b_gio_v1 F11 blocks (design C8B v7 section 7a; O1 v11.37 D1 line 342: the per-run clock check is only
+    L <= U~, every channel matched, and the C8 range of the level). ket_luan is kept for compatibility.
+    M2 (J v6 section 5, item 12(e) approved, J5-9): a run with a firmware restart (boot) does not count as a failed
+    clock check unless the check failed on log rows before the boot and its whole window lies before the boot."""
+    have_d = all(kenh[c].get('D_s') is not None for c in CHANNELS)
+    L, U = out.get('L_s'), out.get('U_s')
+    l_le_u = None if L is None or U is None else bool(L <= U)
+    ghep_ok = all(bool(kenh[c].get('ok')) for c in CHANNELS)
+    keys = [k for k in ('width_s_in_c8_range', 'gyro_minus_rv_s_in_c8_range') if k in kiem]
+    dai = None if khoa is None or len(keys) < 2 else all(kiem[k] for k in keys)
+    if l_le_u is False or (have_d and not ghep_ok) or dai is False:
+        st = 'truot'                    # the check ran and failed (a failure found is kept even if a part is missing)
+    elif not have_d or (khoa is not None and dai is None):
+        st = 'khong_kiem'               # no data to check, or a lock file without the C8 range of the level
+    else:
+        st = 'dat'
+    # CODE 19/11 (J v6 section 5 'do thao tac' + M2, J5-9; CT3-6): the operator kinds of the run come from the
+    # scorer's score.json only (thao_tac); a run lost to ANY operation does not count, except a boot whose check failed
+    # on the rows before it over its whole window (needs the boot time in the log: t_boot_log_s)
+    tt = sorted(set(thao_tac))
+    bad_tt = [x for x in tt if x not in THAO_TAC]
+    if bad_tt:
+        raise GioError(f'unknown operation {bad_tt}: one of {THAO_TAC}')
+    co_boot = 'boot' in tt
+    t_boot = kiem.get('t_boot_log_s') if co_boot else None
+    du = bool(co_boot and t_boot is not None and cw is not None and cw[1] < t_boot)   # whole window before the boot
+    truoc = dict(co_boot=co_boot, t_boot_log_s=t_boot, du_cua_so=du,
+                 trang_thai=(st if du else 'khong_kiem') if co_boot else None)
+    if co_boot and t_boot is None:
+        truoc['ly_do'] = 'thoi diem boot khong co trong log (dong log cua mot boot): khong phai bang chung doc lap'
+    truoc['thao_tac'] = tt
+    dem = st == 'truot' and (not tt or (co_boot and du and truoc['trang_thai'] == 'truot'))
+    return dict(
+        kiem_gio_d1=dict(trang_thai=st, L_le_U=l_le_u, ghep_ok=ghep_ok, trong_dai_c8=dai, ly_do=list(loai['kiem_gio_d1']),
+                         truoc_boot=truoc),
+        cap_dem=dict(pairs_valid_share=kiem.get('pairs_valid_share'), nguong=PAIR_MIN, truot=bool(loai['cap_dem'])),
+        ho_log=dict(log_hole_max_s=kiem.get('log_hole_max_s'), nguong_s=LOG_HOLE_S, truot=bool(loai['ho_log'])),
+        ly_do_theo_loai=dict(kiem_gio_d1=list(loai['kiem_gio_d1']), cap_dem=list(loai['cap_dem']),
+                             ho_log=list(loai['ho_log']), khac=list(loai['khac']), chua=list(fails)),
+        dem_truot_kiem_gio=bool(dem))
 
 
 def _clean(o):
@@ -682,19 +763,36 @@ def main(argv=None):
     ap.add_argument('--out', required=True)
     ap.add_argument('--khoa', default=None, help='C8 lock file of c8b_u.py (drift rate, C8 ranges per level)')
     ap.add_argument('--startup-s', type=float, default=STARTUP_S)
+    ap.add_argument('--so-bo', default=None,
+                    help='the preliminary clock file the reference window (cua_so_v1, F2) was built from; its SHA-256 is '
+                         'written as luoi_so_bo_sha256 so that the window stays tied to this final file (CAM CT2-7)')
+    ap.add_argument('--cua-so', default=None, help='cua_so_v1 file built from --so-bo (SHA-256 written as cua_so_v1_sha256)')
+    ap.add_argument('--score', default=None,
+                    help="the scorer's score.json of this run (any node; c7_score): its thao_tac is the one source of "
+                         'the operator kinds (CODE 19/11, CT3-6); needed for the final file (--so-bo)')
     a = ap.parse_args(argv)
     try:
         khoa = None
         if a.khoa:
             with open(a.khoa, encoding='utf-8') as f:
                 khoa = json.load(f)
-        out, _, _ = analyse(a.frames, a.esp32, a.task, khoa, a.startup_s)
+        thao, tt_src = score_thao_tac(a.score, a.esp32) if a.score else ((), None)
+        if a.so_bo and not a.score:
+            raise GioError('the final clock file (--so-bo) needs --score: the operator kinds of the run come from the '
+                           "scorer's score.json only (CODE 19/11)")
+        out, _, _ = analyse(a.frames, a.esp32, a.task, khoa, a.startup_s, thao)
+        out['thao_tac_nguon'] = tt_src
         ctrl, ev = controller_of(a.esp32)
         out['controller'] = ctrl
         # contract of c7_score --gio-c8b (CODE 17/11, VG1-1): the clock file names the log and frames of ITS run
         out['sha256'] = dict(esp32=cu.sha256(a.esp32), frames=cu.sha256(a.frames))
         out['nguon'] = [dict(file=os.path.basename(p), sha256=cu.sha256(p)) for p in (a.frames, a.esp32)
                         + ((a.khoa,) if a.khoa else ()) + ((ev,) if ev else ())]
+        # CAM CT2-7 (CODE 19/11): the final clock file names the preliminary grid and the window built from it
+        out['luoi_so_bo_sha256'] = cu.sha256(a.so_bo) if a.so_bo else None
+        out['cua_so_v1_sha256'] = cu.sha256(a.cua_so) if a.cua_so else None
+        if a.cua_so and not a.so_bo:
+            raise GioError('--cua-so needs --so-bo (the preliminary grid it was built from)')
         out['script'] = repo_state()
         cu.check_path(a.out)
         with open(a.out, 'x', encoding='utf-8') as f:

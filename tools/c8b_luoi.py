@@ -84,6 +84,7 @@ def node_from_files(score_path, rows_path):
       kind 'ok'    scored: states{c}, nums{c}, rows{t_cam key: {mien_chung, lo_c}}, gate (the gate_v3 block), cat
       kind 'hong'  the run is lost to the measurement system at this node (outcome hong_he_do)
       kind 'loi'   the files are missing or do not hold what is needed (a tool problem, not the measurement)
+      kind 'khong_cham_c8'  the scorer marks the node cham_c8 false: not a C8 scoring, not taken (Codex CAM CT3-3)
     ok = (kind == 'ok')."""
     try:
         with open(score_path, encoding='utf-8') as f:
@@ -95,6 +96,11 @@ def node_from_files(score_path, rows_path):
                nhanh_tick=(sc.get('U_t_parts') or {}).get('nhanh_tick'))
     if out['outcome'] == 'hong_he_do':
         return dict(out, ok=False, kind='hong', why='run lost at this node: ' + '; '.join(map(str, out['reasons'])))
+    # Codex CAM CT3-3 (CODE 19/11): a node the scorer marks cham_c8 false (its clock not from c8b_gio_v1, constants not
+    # locked for C8, ...) is not a C8 scoring: the node is not scored, its result not taken, the reason kept
+    if sc.get('cham_c8') is False:
+        return dict(out, ok=False, kind='khong_cham_c8',
+                    why='cham_c8 false: ' + str(sc.get('cham_c8_ly_do') or 'khong ghi ly do'))
     gate = sc.get('gate_v3')
     if not isinstance(gate, dict):
         return dict(out, ok=False, kind='loi', why='no gate_v3 block')
@@ -422,12 +428,97 @@ def node_provenance(gio, gio_sha, out_dir):
     return out
 
 
+LOAI_HONG = ('thao_tac', 'cua_so_tham_chieu', 'duong_lenh', 'he_do')    # J v6 section 5 order (operator first)
+
+
+def loai_hong_of(score):
+    """F19 (GATE 8705918, CODE 19/11): the lost-run kind one node's score.json gives, or None (scored): thao_tac
+    (fail_cause 'thao_tac'), cua_so_tham_chieu (hong_cua_so_tc true), duong_lenh (fail_cause 'duong_lenh'), he_do (any
+    other fail_cause 'he_do'). Read from the scorer's fields only, nothing inferred."""
+    if not isinstance(score, dict):
+        return None
+    fc = score.get('fail_cause') or ''
+    if fc == 'thao_tac' or score.get('thao_tac'):
+        return 'thao_tac'
+    if score.get('hong_cua_so_tc') is True:
+        return 'cua_so_tham_chieu'
+    if fc == 'duong_lenh':
+        return 'duong_lenh'
+    if fc == 'he_do' or score.get('outcome') == 'hong_he_do':
+        return 'he_do'
+    return None
+
+
+def node_sources(gio, out_dir):
+    """F19: nguon_nut [{nut, duong_dan, sha256}] of every node score.json present, and loai_hong_nut per node."""
+    src, kinds = [], []
+    for k in range(len(gio.get('nodes_s') or [])):
+        p = os.path.join(out_dir, f'nut_{k:03d}.json')
+        if not os.path.isfile(p):
+            kinds.append(None)
+            continue
+        src.append(dict(nut=k, duong_dan=os.path.abspath(p), sha256=cu.sha256(p)))
+        try:
+            with open(p, encoding='utf-8') as f:
+                kinds.append(loai_hong_of(json.load(f)))
+        except (OSError, ValueError):
+            kinds.append(None)
+    return src, kinds
+
+
+def gio_loai_hong(gio):
+    """Lost-run kinds the clock file itself gives: thao_tac (truoc_boot.thao_tac, from the scorer's score.json, one
+    source). A clock not bounded with a measurement-system loss gives he_do through the run outcome (main)."""
+    out = []
+    tt = ((gio.get('kiem_gio_d1') or {}).get('truoc_boot') or {}).get('thao_tac')
+    if tt:
+        out.append('thao_tac')
+    return out
+
+
+J_REPORT_ONLY = {'O1-F08': frozenset({'g5'})}   # J v6 section 6, L130 (Liam 19/11 "chi bao cao, khong lam bu")
+
+
+def _file_ref(path):
+    if not path:
+        return None
+    cu.check_path(path)
+    if not os.path.isfile(path):
+        raise LuoiError(f'{path}: no such file')
+    return dict(duong_dan=os.path.abspath(path), sha256=cu.sha256(path))
+
+
+def chain_files(a):
+    """F19 (CODE 19/11): clip {ten, clip_sha256}, file_so_h, file_cham_h1, file_gio_h1 {duong_dan, sha256} of this run
+    (null when not given: GATE refuses a cell chain that lacks them)."""
+    clip = None
+    if a.clip or a.clip_sha256:
+        sha = a.clip_sha256.lower() if a.clip_sha256 else None
+        if sha is not None and (len(sha) != 64 or any(ch not in '0123456789abcdef' for ch in sha)):
+            raise LuoiError(f'--clip-sha256 {a.clip_sha256!r} is not a SHA-256')
+        if a.clip and os.path.isfile(a.clip):
+            got = cu.sha256(a.clip)
+            if sha is not None and sha != got:
+                raise LuoiError(f'--clip-sha256 is not the SHA-256 of {a.clip}')
+            sha = got
+        if sha is None:
+            raise LuoiError(f'--clip {a.clip}: no such file and no --clip-sha256')
+        clip = dict(ten=os.path.basename(a.clip) if a.clip else None, clip_sha256=sha)
+    if bool(a.file_cham_h1) != bool(a.file_gio_h1):
+        raise LuoiError('--file-cham-h1 and --file-gio-h1 go together (the H1 scoring has its own clock file)')
+    return dict(clip=clip, file_so_h=_file_ref(a.file_so_h), file_cham_h1=_file_ref(a.file_cham_h1),
+                file_gio_h1=_file_ref(a.file_gio_h1))
+
+
 def report_only_of(gate_file, task):
+    """Conditions that only report at this level: those of the J source (G5 of the figure 8 at F08, always, Codex CAM
+    CT4-4: an empty or missing gate mask must not decide it again from the grid) plus the gate file's 2b mask."""
+    j = J_REPORT_ONLY.get(task, frozenset())
     if not gate_file:
-        return frozenset(), None
+        return j, None
     import gate_c8                                       # tools/gate_c8.py of CODE_GATE (feat/gate-v1133)
     g = gate_c8.read_gate_c8(gate_file)
-    return frozenset(g.report_only(task) if task in g.levels else ()), g.sha256
+    return j | frozenset(g.report_only(task) if task in g.levels else ()), g.sha256
 
 
 def main(argv=None):
@@ -443,6 +534,14 @@ def main(argv=None):
     ap.add_argument('--scorer-arg', action='append', help='extra argument passed to c7_score (repeat)')
     ap.add_argument('--gop-only', action='store_true', help='combine the node files already in --out-dir')
     ap.add_argument('--scorer', default=None, help='scorer script (default tools/c7_score.py; tests)')
+    # F19 (CODE 19/11): the cell chain GATE builds from the luoi.json of every run and thu_tu_clip
+    ap.add_argument('--clip', default=None, help='video clip of this run (name and SHA-256 written as clip)')
+    ap.add_argument('--clip-sha256', default=None, help='SHA-256 of the clip when the file is not given')
+    ap.add_argument('--file-so-h', default=None,
+                    help='drift.json (c7_calib_drift so) of the part of the session holding this run: (H dau, H giua) '
+                         'before the middle H clip, (H giua, H cuoi) after')
+    ap.add_argument('--file-cham-h1', default=None, help='score file of the scoring again with H1 (when done)')
+    ap.add_argument('--file-gio-h1', default=None, help='clock file of the H1 scoring (H1 has its own clock file)')
     a = ap.parse_args(argv)
     try:
         for p in (a.gio, a.out_dir):
@@ -458,6 +557,8 @@ def main(argv=None):
         prov_scorer = None
         if not gio.get('ok'):
             res = not_bounded(gio)
+            res.update(n_nut_cham=0, trang_thai_luot=('hong_he_do' if res['outcome'] == 'hong_he_do'
+                                                       else 'chua_ket_luan_khong_nut'))
         else:
             if not a.gop_only:
                 if not all((a.frames, a.esp32, a.hang_so)):
@@ -473,11 +574,34 @@ def main(argv=None):
                                           and all(x.get('dirty') is False for x in prov)),
                                nut=prov)
             res = combine(nodes, ro)
-            bad = [c for c in MEASURED if not res['bieu_dien'][c]]
-            if bad and any(x['ok'] for x in nodes):
-                raise LuoiError(f'combined numbers do not give the grid state for {bad} (C8BS-9): not written')
-            res['gate_v3'] = gate_block(nodes, res, gio, cu.sha256(a.gio), task, gsha)
+            n_cham = sum(1 for x in res['nodes_ok'] if x)
+            res['n_nut_cham'] = n_cham
+            if n_cham == 0:
+                # F11 (design C8B v7 section 7a): no node scored. Every node lost -> run lost (rerun); otherwise (tool
+                # errors) the run is closed not concluded by GATE: no gate block, the reason of every node kept
+                lost = all(res['hong_nut'])
+                res.update(gate_v3=None, trang_thai_luot='hong_he_do' if lost else 'chua_ket_luan_khong_nut',
+                           outcome='hong_he_do' if lost else 'chua_ket_luan', fail_cause='he_do' if lost else '',
+                           ly_do_nut=[x.get('why') or x.get('fail_cause') for x in nodes])
+            else:
+                bad = [c for c in MEASURED if not res['bieu_dien'][c]]
+                if bad:
+                    raise LuoiError(f'combined numbers do not give the grid state for {bad} (C8BS-9): not written')
+                res['trang_thai_luot'] = 'cham'
+                res['gate_v3'] = gate_block(nodes, res, gio, cu.sha256(a.gio), task, gsha)
         import c8b_gio
+        ut = [x for x in res.get('u_t_nodes') or [] if isinstance(x, (int, float)) and not isinstance(x, bool)]
+        # F17 (GATE v6_C8 section 6): the largest node U_t (rule 2b takes h_s of the clock file + u_max_s)
+        res['u_max_s'] = (max(ut) if ut and len(ut) == len(res.get('u_t_nodes') or [])
+                          and all(math.isfinite(x) and x >= 0 for x in ut) else None)
+        # F19 (GATE 8705918): the score.json of every node (path, SHA) and the lost-run kinds gathered from them (and
+        # from the clock file), in the J v6 section 5 order; GATE takes the first as the run's kind
+        src, kinds_nut = node_sources(gio, a.out_dir) if os.path.isdir(a.out_dir) else ([], [])
+        kinds = set(gio_loai_hong(gio)) | {x for x in kinds_nut if x}
+        if res.get('outcome') == 'hong_he_do' and not kinds:
+            kinds.add('he_do')
+        res.update(nguon_nut=src, loai_hong_nut=kinds_nut, loai_hong=[x for x in LOAI_HONG if x in kinds])
+        res.update(chain_files(a))
         res.update(version=VERSION, task=task, nodes_s=gio.get('nodes_s', []), gio_sha256=cu.sha256(a.gio),
                    gate_file_sha256=gsha, script=c8b_gio.repo_state(), scorer=prov_scorer)
         os.makedirs(a.out_dir, exist_ok=True)
