@@ -132,12 +132,24 @@ def result(d, cho, psi_cuc=0.0, extra=()):
     return ca.place_result(cho, ans, os.path.basename(d), e_hieu=E(0.0), q=[0.0, 0.0], du_m=0.0, neo=0.0, psi_cuc=psi_cuc)
 
 
-def test_camera_heading_drift_inside_index_or_flagged(tmp_path):
+def test_camera_heading_drift_needs_floor_referenced_frames(tmp_path):
+    """HCB4: a_l takes its heading from the camera only, and the dynamic check is anchored on the two leg ends, so a
+    camera heading that drifts in time (the camera turning on its mount) is NOT seen by the checks: it is excluded
+    at the source, the frames must be referenced to the floor marks (camera pose refitted: c7_measure track per
+    frame, c8_hc_video every second). Frames without that never give a locked result."""
     d, truth = make(tmp_path, 'HC_K2_1', cho='K2', cam_bias=lambda t: math.radians(0.010) * max(t, 0.0),
                     noise_psi_deg=0.02)
-    r = result(d, 'K2')
-    err = abs(math.radians(r['a_k_deg']) - truth['a_true'])
-    assert err <= math.radians(r['u_a_k_deg']) or r['trang_thai'] == 'chua_ket_luan'
+    A = ca.load_attempt(d)
+    ck, info = ca.kiem(A)
+    F = dict(frames(d), neo_san=False)
+    an = ca.analyse(A, F, info)
+    assert an['neo_san'] is False and analyse(d)['neo_san'] is True
+    r = ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.0, 0.0], du_m=0.0, neo=0.0, psi_cuc=0.0)
+    assert any('khong neo moc san' in w for w in r['ly_do']) and r['trang_thai'] != 'khoa'
+    ok, vk = video(d, F)
+    assert not ok['neo_moc_san']
+    ok, vk = video(d, frames(d))
+    assert ok['neo_moc_san']
 
 
 def test_rv_frozen_with_body_wiggle_inside_index_or_flagged(tmp_path):
@@ -174,9 +186,10 @@ def test_max_over_every_attempt(tmp_path):
 
 
 def test_spread_gate(tmp_path):
-    # one long leg with a camera heading step of 0.4 deg at its start window: spread > 0.3 deg -> chua_ket_luan
+    # the camera heading of one long leg off by 0.45 deg over its whole motion (K1, second long leg 20.3-25.7 s):
+    # that a_l moves by the path mean of the bias, spread > 0.3 deg -> chua_ket_luan
     def bias(t):
-        return math.radians(0.4) if 16.0 < t < 21.0 else 0.0
+        return math.radians(0.45) if 20.0 < t < 26.0 else 0.0
     d, _ = make(tmp_path, cho='K1', cam_bias=bias, noise_psi_deg=0.02)
     r = result(d, 'K1')
     assert not r['cong']['do_tan'] and r['trang_thai'] == 'chua_ket_luan'
@@ -242,7 +255,10 @@ def test_new_packet_during_timeout_wait_fails(tmp_path):
         body[i1 - 5][col(hdr, 'sp_vx')] = '0.000000'
     edit_log(d, fn)
     ok, ck, _ = checks(d)
-    assert not (ok['traj_age'] and ok['het_han_firmware'])
+    # HCB2: with the 160 ms quality limit the ages of the wait before that packet pass traj_age; the packet still
+    # moves the end of the sender domain 0.15 s past the schedule, which the zero-tail span check refuses
+    assert not (ok['traj_age'] and ok['het_han_firmware'] and ok['lenh_nhan_khop_lich']), ck
+    assert not ok['lenh_nhan_khop_lich'] and 'mien phat' in dict((n, x) for n, _, x in ck)['lenh_nhan_khop_lich']
 
 
 def test_late_packets_after_run_active_falls_fail(tmp_path):
@@ -463,14 +479,39 @@ def test_tinh_refuses_cap_that_failed_kiem(tmp_path, capsys):
     assert r['trang_thai'] == 'chua_ket_luan' and 'dinh_danh_gain' in r['ly_do'][0] and r['a_k_deg'] is None
 
 
+def f6(ref, cho='K2', ids=None, n_luot=1, top='dat', win=None, **kw):
+    """F6 hieu_chuan_neo_v1 as NHACTAM writes it (feat/c8-lan-lap e7b8428): file trang_thai, chuan_12b keyed
+    'cho|luot_id', the place block (the record itself with one 12b run there, else chua_ket_luan), and the ref_12b
+    windows with khung_chung = a subset of khung_ma_hop_le (anchor gate & A6), sha256 of the sorted IDs."""
+    import hashlib
+    ids = sorted(ref['khung_ma_hop_le'][1:-1] if ids is None else ids)
+    sha = hashlib.sha256(','.join(str(i) for i in sorted(ids)).encode()).hexdigest()
+    chuan, wins = {}, []
+    for n in range(n_luot):
+        luot = ref['luot_id'] if n == 0 else f"{ref['luot_id']}_{n + 1}"
+        clip = ref['clip_sha256'] if n == 0 else f'{n}' * 64
+        rec = dict(trang_thai='dat', ly_do='', cho=cho, luot_id=luot, clip_sha256=clip, khung_chung_sha256=sha,
+                   psi_chuan_k_deg=12.0, frames_sha256=ref['frames_sha256'])
+        if n == 0:
+            rec.update(kw)
+        chuan[f'{cho}|{luot}'] = rec
+        w = dict(meta=dict(luot=luot, cho=cho, loai='ref_12b', clip=ref.get('clip'), clip_sha=clip,
+                           frames_sha=ref['frames_sha256']),
+                 khung_chung=dict(id=list(ids), pts_s=[]), khung_chung_sha256=sha)
+        if n == 0 and win:
+            w['meta'].update(win)
+        wins.append(w)
+    blk = next(iter(chuan.values())) if n_luot == 1 else dict(
+        trang_thai='chua_ket_luan', ly_do='nhieu_12b_xem_chuan_12b', khoa=list(chuan))
+    return dict(schema='hieu_chuan_neo_v1', trang_thai=top, cho={cho: blk}, chuan_12b=chuan, cua_so=wins)
+
+
 def test_tinh_checks_f6_and_f9_sources(tmp_path):
     """HCC1-10: F6 must be made on the ref_12b window of the cap (clip, frames), F9 on its F5, by leg i."""
     d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
     ref, doan = run_cua_so(d)
-    good_neo = write_json(str(tmp_path / 'neo.json'), dict(cho=dict(K2=dict(
-        psi_chuan_k_deg=12.0, clip_sha256=ref['clip_sha256'], khung_chung_sha256=ref['khung_ma_hop_le_sha256']))))
-    bad_neo = write_json(str(tmp_path / 'neo_x.json'), dict(cho=dict(K2=dict(
-        psi_chuan_k_deg=12.0, clip_sha256='0' * 64, khung_chung_sha256=ref['khung_sha256']))))
+    good_neo = write_json(str(tmp_path / 'neo.json'), f6(ref))
+    bad_neo = write_json(str(tmp_path / 'neo_x.json'), f6(ref, clip_sha256='0' * 64))
     good_e = write_json(str(tmp_path / 'e.json'), dict(doan_12b_sha256=doan['sha256'],
                                                        doan=[dict(i=i, e_hieu_m=0.002) for i in range(6)]))
     bad_e = write_json(str(tmp_path / 'e_x.json'), dict(doan_12b_sha256='1' * 64, doan=[dict(i=0, e_hieu_m=0.002)]))
@@ -587,8 +628,7 @@ def test_tinh_refuses_other_frames_than_f2_f5(tmp_path):
     """HCC2-5 (Codex): F2/F5 made from frames A, tinh run on frames B (+0.25 deg) still gave khoa."""
     d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
     ref, doan = run_cua_so(d)
-    neo = write_json(str(tmp_path / 'neo.json'), dict(cho=dict(K2=dict(
-        psi_chuan_k_deg=12.0, clip_sha256=ref['clip_sha256'], khung_chung_sha256=ref['khung_ma_hop_le_sha256']))))
+    neo = write_json(str(tmp_path / 'neo.json'), f6(ref))
     fb = os.path.join(d, 'frames_B.csv')
     with open(os.path.join(d, 'frames.csv'), encoding='utf-8') as f, open(fb, 'w', encoding='utf-8') as g:
         g.write(f.readline())
@@ -813,3 +853,682 @@ def test_read_e_hieu_refuses_diagnostic_f9(tmp_path):
         p = write_json(str(tmp_path / 'e_bad.json'), dict(doan_12b_sha256=body['sha256'], **bad))
         with pytest.raises(ca.AError):
             ca.read_e_hieu(p, dp)
+
+
+def test_read_neo_khung_chung_as_nhactam(tmp_path):
+    """NHACTAM 19/11 (via CODE): khung_chung_sha256 is the sha of the common set (anchor gate & khung_ma_hop_le &
+    A6), not khung_sha256 / khung_ma_hop_le_sha256 of the window: the old check always refused (code 2).
+    Codex HCG1-1..6: two 12b runs at the place, another run, frames_sha of the window, file trang_thai, ID types,
+    malformed files."""
+    import hashlib
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
+    ref, _ = run_cua_so(d)
+    w = lambda name, obj: write_json(str(tmp_path / f'{name}.json'), obj)                  # noqa: E731
+    assert ca.read_neo(w('ok', f6(ref)), 'K2', ref) == 12.0
+    assert ca.read_neo(w('hai_luot', f6(ref, n_luot=2)), 'K2', ref) == 12.0               # HCG1-1
+    outside = max(ref['khung_ma_hop_le']) + 100000
+    ids = ref['khung_ma_hop_le'][1:-1]
+    frac = f6(ref)
+    frac['cua_so'][0]['khung_chung']['id'][0] = ids[0] + 0.75                                # HCG1-5
+    dup = f6(ref, ids=ids + [ids[0]])
+    other = f6(ref)                                                                          # HCG1-2: both ends moved
+    rec = other['chuan_12b'].pop(f"K2|{ref['luot_id']}")
+    rec['luot_id'] = 'HC_K2_9'
+    other['chuan_12b']['K2|HC_K2_9'] = rec
+    other['cho']['K2'] = rec
+    other['cua_so'][0]['meta']['luot'] = 'HC_K2_9'
+    no_luot = f6(ref)
+    no_luot['chuan_12b'] = {}
+    del no_luot['cho']['K2']['luot_id']
+    null_win = f6(ref)
+    null_win['cua_so'].insert(0, None)                                                       # HCG1-6
+    bad = {
+        'chua_ket_luan': f6(ref, trang_thai='chua_ket_luan'),
+        'toan_file': f6(ref, top='chua_ket_luan'),                                           # HCG1-4
+        'frames': f6(ref, frames_sha256='2' * 64),
+        'frames_cua_so': f6(ref, win=dict(frames_sha='2' * 64)),                             # HCG1-3
+        'frames_cua_so_thieu': f6(ref, win=dict(frames_sha=None)),
+        'ngoai_tap': f6(ref, ids=ref['khung_ma_hop_le'][1:3] + [outside]),
+        'sha_sai': f6(ref, khung_chung_sha256='3' * 64),
+        'khong_cua_so': dict(f6(ref), cua_so=[]),
+        'luot_khac': other,
+        'khong_luot': no_luot,
+        'id_le': frac,
+        'id_lap': dup,
+        'psi_tran': f6(ref, psi_chuan_k_deg=10 ** 400),
+        'psi_nan': f6(ref, psi_chuan_k_deg=float('nan')),
+    }
+    for name, obj in bad.items():
+        with pytest.raises(ca.AError):
+            ca.read_neo(w(name, obj), 'K2', ref)
+    mixed = f6(ref)                                                                          # HCG2-1
+    mixed['cho']['K2'] = dict(mixed['cho']['K2'], frames_sha256='4' * 64)
+    twin = f6(ref)                                                                           # HCG2-2
+    twin['cua_so'].append(dict(twin['cua_so'][0], meta=dict(twin['cua_so'][0]['meta'], frames_sha='5' * 64)))
+    deep = '[' * 3000 + ']' * 3000
+    for name, obj in (('null_win', null_win), ('mixed', mixed), ('twin', twin)):            # HCG2-3 null entry
+        with pytest.raises(ca.AError):
+            ca.read_neo(w(name, obj), 'K2', ref)
+    p = str(tmp_path / 'deep.json')
+    with open(p, 'w', encoding='utf-8') as f:
+        f.write(deep)
+    with pytest.raises(ca.AError):
+        ca.read_neo(p, 'K2', ref)
+
+
+def test_can_hai_dau_function_feeds_u_q_and_u_psi_cuc(tmp_path):
+    """Design v4 3.3 with c8b_a6.u_psi_hai_dau_rad (C8B, CODE 20/11): the same two-end bound gives u_psi_cuc
+    (start window of each long leg vs the reference window) and the end-difference term of u_q (both ends of each
+    leg); a missing bound keeps the result chan_doan with the reasons of C8B, never a bound of 0."""
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
+    an = analyse(d)
+    calls = []
+
+    def fn(p1, p2):
+        calls.append((tuple(p1), tuple(p2)))
+        return math.radians(0.05), []
+    r = ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.004, -0.003], du_m=0.0, neo=0.0, can_hai_dau=fn)
+    assert r['u_hang_deg']['u_psi_cuc'] == pytest.approx(0.05)
+    assert not any('thieu can' in w or 'can C8B' in w for w in r['ly_do'])
+    p_ref = tuple(an['windows'][0]['p_tag'])
+    assert len(calls) == 8 and sum(c[1] == p_ref for c in calls) >= 4
+    r2 = ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.004, -0.003], du_m=0.0, neo=0.0,
+                         can_hai_dau=lambda p1, p2: (None, ['p1: A3 missing in the camera file']))
+    assert r2['trang_thai'] != 'khoa' and r2['u_hang_deg']['u_psi_cuc'] is None and r2['u_a_k_deg'] is None
+    assert r2['u_hang_deg']['u_q'] is None and set(r2['u_hang_thieu']) == {'u_q', 'u_psi_cuc'}
+    assert any('A3 missing' in w for w in r2['ly_do']) and any('thieu can huong camera' in w for w in r2['ly_do'])
+    assert any('u_psi_hai_dau_rad' in w for w in r2['ly_do'])
+    r3 = ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.0, 0.0], du_m=0.0, neo=0.0,
+                         can_hai_dau=lambda p1, p2: (4.0, []))                  # HCH1-4: missing, with reason
+    assert r3['u_a_k_deg'] is None and any('ngoai mien' in w for w in r3['ly_do'])
+    seen = []
+    r4 = ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.004, 0.0], du_m=0.0, neo=0.0, bao_q=True,
+                         can_hai_dau=lambda p1, p2: (seen.append(p2) or math.radians(0.05), []))   # HCH1-7
+    assert len(seen) == 4 and r4['u_a_k_deg'] is not None
+
+
+def test_can_hai_dau_c8b_wrapper(tmp_path, monkeypatch):
+    """Interface of C8B 2539ee8 (CODE 20/11): kc = kiem_cheo.json passed through, A3 checked inside C8B (no gate here),
+    luot = dai = None; --kc, --tam-id need --a6; c8b_a6 not merged -> no bound (reason kept); parts checked for both
+    ways C8B combines them."""
+    import types
+    kc = write_json(str(tmp_path / 'kc.json'), dict(version='c7_kiem_cheo_v7', A3=dict(quy_ve_ma_noc=True)))
+    a6 = write_json(str(tmp_path / 'a6.json'), dict(schema='c8b_a6_v2'))
+    with pytest.raises(ca.AError):
+        ca.can_hai_dau_c8b(None, kc, 'T1', [])
+    monkeypatch.setitem(sys.modules, 'c8b_a6', None)                       # import fails (not merged)
+    assert ca.can_hai_dau_c8b(a6, kc, 'T1', [])((0, 0), (1, 0)) == (None, ['c8b_a6 chua gop'])
+    m = types.ModuleType('c8b_a6')
+    m.__file__ = a6
+    m.load_a6 = lambda p: dict(tam_id='T1')
+    got = {}
+
+    def f(a6o, kc_, p1, p2, tam, luot=None, dai=None):
+        got.update(kc=kc_, luot=luot, dai=dai)
+        if tam != a6o['tam_id']:
+            return dict(u_rad=None, trang_thai='thieu', ly_do=['khac tam'])
+        return dict(u_rad=0.001, trang_thai='dat', ly_do=[], ghep='cong_rieng',
+                    phan=dict(A3_rad=[0.0003, 0.0003], A6du_rad=[0.0002, 0.0002]))
+    m.u_psi_hai_dau_rad = f
+    monkeypatch.setitem(sys.modules, 'c8b_a6', m)
+    nguon = []
+    assert ca.can_hai_dau_c8b(a6, kc, 'T1', nguon)((0, 0), (1, 0)) == (0.001, [])
+    assert got['kc'] == json.load(open(kc, encoding='utf-8')) and got['luot'] is None and got['dai'] is None
+    assert {n['vai_tro'] for n in nguon} == {'kiem_cheo', 'c8b_a6_ham'}
+    assert ca.can_hai_dau_c8b(a6, kc, 'T2', [])((0, 0), (1, 0)) == (None, ['khac tam'])
+    with pytest.raises(ca.AError):
+        ca.can_hai_dau_c8b(a6, '', '', [])                                                # HCH1-8
+    m.u_psi_hai_dau_rad = lambda *a, **k: 1 / 0
+    assert ca.can_hai_dau_c8b(a6, kc, 'T1', [])((0, 0), (1, 0))[0] is None                 # HCH1-6
+    bad = [dict(ghep='cong_rieng', phan=dict(A3_rad=[0.001, 0.001], A6du_rad=[-0.0003, -0.0002])),   # HCH2-5
+           dict(ghep='cong_rieng', phan=dict(A3_rad=[0.001, 0.001], A6du_rad=[0.0002, 0.0002])),     # sum off
+           dict(ghep='replay_chung_theo_ca', phan=dict(ca_rad=-0.001, A6du_khong_meo_rad=[0.001, 0.0015])),
+           dict(ghep='khac', phan={})]
+    for b in bad:
+        m.u_psi_hai_dau_rad = lambda *a, b=b, **k: dict(u_rad=0.0015, trang_thai='dat', ly_do=[], **b)
+        assert ca.can_hai_dau_c8b(a6, kc, 'T1', [])((0, 0), (1, 0))[0] is None
+    m.u_psi_hai_dau_rad = lambda *a, **k: dict(u_rad=0.0035, trang_thai='dat', ly_do=[], ghep='replay_chung_theo_ca',
+                                               phan=dict(ca_rad=0.001, A6du_khong_meo_rad=[0.001, 0.0015]))
+    assert ca.can_hai_dau_c8b(a6, kc, 'T1', [])((0, 0), (1, 0)) == (0.0035, [])
+
+
+def test_can_hai_dau_round2(tmp_path):
+    """HCH2-3: the F9 replay (bao_q) covers the issued run only: legs of another run keep the q turn term.
+    HCH2-4: the reference end is the tag centre given for the F6 frame set. HCH2-6: F7 legs keep p_a/p_b as before."""
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
+    an = analyse(d)
+    d2, _ = make(tmp_path, 'HC_K2_2', cho='K2')
+    an2 = analyse(d2)
+    seen = []
+    u = math.radians(0.05)
+
+    def fn(p1, p2):
+        seen.append((tuple(p1), tuple(p2)))
+        return u, []
+    r = ca.place_result('K2', [('x', an), ('y', an2)], 'x', e_hieu=E(0.0), q=[0.02, 0.0], du_m=0.0, neo=0.0,
+                        bao_q=True, can_hai_dau=fn, p_ref_tag=np.array([0.123, 0.456]))
+    ends = [c for c in seen if c[1] != (0.123, 0.456)]
+    refs = [c for c in seen if c[1] == (0.123, 0.456)]
+    assert len(ends) == 4 and len(refs) == 8                         # two-end calls only for the other run
+    assert r['u_hang_deg']['u_q'] > 0.0 and r['u_hang_deg']['u_psi_cuc'] == pytest.approx(0.05)
+    leg = r['luot_thu'][0]['doan'][0]
+    assert 'p_tag_a' not in leg and leg['p_a'] == pytest.approx(an['legs'][0]['p_a'].tolist())
+
+
+def test_tinh_prints_null_u_a(tmp_path, monkeypatch, capsys):
+    """HCH2-1 (Codex): u_a null (bound missing) made the CLI print fail after the JSON was written."""
+    import types
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
+    kc = write_json(str(tmp_path / 'kc.json'), dict(A3=dict(max_deg=0.02, quy_ve_ma_noc=True, du_lieu_du=True)))
+    a6 = write_json(str(tmp_path / 'a6.json'), dict(schema='c8b_a6_v2', tam_id='T1'))
+    m = types.ModuleType('c8b_a6')
+    m.__file__ = a6
+    m.load_a6 = lambda p: dict(tam_id='T1')
+    m.u_psi_hai_dau_rad = lambda *a, **k: dict(u_rad=None, trang_thai='thieu', ly_do=['A6 thieu'])
+    monkeypatch.setitem(sys.modules, 'c8b_a6', m)
+    out = str(tmp_path / 'f7.json')
+    code = ca.main(tinh_args(d, 'K2', '--a6', a6, '--kc', kc, '--tam-id', 'T1', '--out', out))
+    txt = capsys.readouterr().out
+    assert code in (0, 1) and 'u_a = null' in txt
+    assert json.load(open(out, encoding='utf-8'))['u_a_k_deg'] is None
+
+
+def test_a6_tam_id(tmp_path):
+    """HCV3-1 (CODE 20/11): the plate is c8b_a6_v2.tam_id of the A6 file; nothing else counts as a plate."""
+    w = lambda name, obj: write_json(str(tmp_path / f'{name}.json'), obj)                  # noqa: E731
+    assert ca.a6_tam_id(w('ok', dict(schema='c8b_a6_v2', tam_id='T1'))) == 'T1'
+    for name, obj in (('none', dict(schema='c8b_a6_v2')), ('empty', dict(tam_id='')), ('num', dict(tam_id=1)),
+                      ('list', [dict(tam_id='T1')])):
+        assert ca.a6_tam_id(w(name, obj)) is None, name
+    assert ca.a6_tam_id(None) is None and ca.a6_tam_id(str(tmp_path / 'missing.json')) is None
+    bad = tmp_path / 'bad.json'
+    bad.write_text('{not json', encoding='utf-8')
+    assert ca.a6_tam_id(str(bad)) is None
+
+
+def test_frames_chain_passes_a6_plate_when_no_lan_lap(tmp_path, monkeypatch):
+    """HCV3-1: without lan_lap, frames_chain passes tam_id = c8b_a6_v2.tam_id to CAM chuoi_khung once CAM has the
+    parameter; with lan_lap it does not (CAM takes the plate from lan_lap); an older CAM without the parameter gets the
+    old call (no tam_id keyword, so no TypeError)."""
+    import types
+    a6 = write_json(str(tmp_path / 'a6.json'), dict(schema='c8b_a6_v2', tam_id='T1'))
+    m = types.ModuleType('c7_chuoi_khung')
+    seen = {}
+
+    def chuoi_khung(frames_csv, a6_, xoay, lan_lap=None, track=None, cho=None, tam_id=None):
+        seen.update(tam_id=tam_id, lan_lap=lan_lap, cho=cho)
+        return [_row(0), _row(1), _row(2)]
+    m.doc_a6, m.chuoi_khung = (lambda p: dict(sha256='x')), chuoi_khung
+    monkeypatch.setitem(sys.modules, 'c7_chuoi_khung', m)
+    F = ca.frames_chain('f.csv', a6, 'xoay.json', cho='K2')
+    assert seen == dict(tam_id='T1', lan_lap=None, cho='K2') and F['chuoi'] == 'khoa'
+    seen.clear()
+    ca.frames_chain('f.csv', a6, 'xoay.json', lan_lap=dict(_sha256='x', tam_id='T2'), cho='K2')
+    assert seen['tam_id'] is None and seen['lan_lap']['tam_id'] == 'T2'
+    seen.clear()
+    ca.frames_chain('f.csv', str(tmp_path / 'missing.json'), 'xoay.json')
+    assert 'tam_id' in seen and seen['tam_id'] is None                     # no plate: CAM's A6 check refuses
+    old = _fake_ck(monkeypatch, rows=[_row(0), _row(1)])                    # CAM 3625211: no tam_id parameter
+    assert ca.frames_chain('f.csv', a6, 'xoay.json', cho='K1')['chuoi'] == 'khoa' and old['cho'] == 'K1'
+
+
+def test_tinh_plate_from_a6(tmp_path, monkeypatch, capsys):
+    """HCV3-1: tinh takes the plate for c8b_a6.u_psi_hai_dau_rad from c8b_a6_v2.tam_id; --tam-id is optional and must
+    equal it; an A6 file without tam_id cannot give the two-end bound (code 2)."""
+    import types
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
+    kc = write_json(str(tmp_path / 'kc.json'), dict(A3=dict(quy_ve_ma_noc=True)))
+    a6 = write_json(str(tmp_path / 'a6.json'), dict(schema='c8b_a6_v2', tam_id='T1'))
+    a6_no = write_json(str(tmp_path / 'a6_no.json'), dict(schema='c8b_a6_v2'))
+    m = types.ModuleType('c8b_a6')
+    m.__file__ = a6
+    m.load_a6 = lambda p: json.load(open(p, encoding='utf-8'))
+    tams = []
+    m.u_psi_hai_dau_rad = lambda a6o, kc_, p1, p2, tam, **k: (tams.append(tam) or
+                                                               dict(u_rad=None, trang_thai='thieu', ly_do=['x']))
+    monkeypatch.setitem(sys.modules, 'c8b_a6', m)
+    out = lambda n: str(tmp_path / f'f7_{n}.json')                                           # noqa: E731
+    assert ca.main(tinh_args(d, 'K2', '--a6', a6, '--kc', kc, '--out', out(0))) in (0, 1)
+    assert tams and set(tams) == {'T1'}
+    assert ca.main(tinh_args(d, 'K2', '--a6', a6, '--kc', kc, '--tam-id', 'T1', '--out', out(1))) in (0, 1)
+    tams.clear()
+    assert ca.main(tinh_args(d, 'K2', '--a6', a6, '--kc', kc, '--tam-id', 'T2', '--out', out(2))) == 2
+    assert 'khac tam_id cua A6' in capsys.readouterr().out and not tams
+    assert ca.main(tinh_args(d, 'K2', '--a6', a6_no, '--kc', kc, '--out', out(3))) == 2
+    assert ca.main(tinh_args(d, 'K2', '--a6', a6_no, '--kc', kc, '--tam-id', 'T1', '--out', out(4))) == 2
+    capsys.readouterr()
+
+
+def test_round_v3_small_fixes(tmp_path):
+    """HCV3-3: a place block without luot_id / psi but other frames, or a window with frames_sha and frames_sha256
+    different, is refused. HCV3-4: F6 frames not all rebuilt -> the reference end is missing (no window-0 fallback).
+    HCV3-5: the q turn flag says whether some leg carries it."""
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
+    ref, _ = run_cua_so(d)
+    w = lambda name, obj: write_json(str(tmp_path / f'{name}.json'), obj)                  # noqa: E731
+    stripped = f6(ref)
+    blk = dict(stripped['cho']['K2'])
+    blk.pop('luot_id')
+    blk.pop('psi_chuan_k_deg')
+    blk['frames_sha256'] = '6' * 64
+    stripped['cho']['K2'] = blk
+    both = f6(ref, win=dict(frames_sha256='7' * 64))
+    for name, obj in (('stripped', stripped), ('both', both)):
+        with pytest.raises(ca.AError):
+            ca.read_neo(w(name, obj), 'K2', ref)
+    an = analyse(d)
+    fn = lambda p1, p2: (math.radians(0.05), [])                                            # noqa: E731
+    r = ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.0, 0.0], du_m=0.0, neo=0.0, can_hai_dau=fn,
+                        p_ref_tag='thieu')
+    assert r['u_hang_deg']['u_psi_cuc'] is None and any('dau chuan' in x for x in r['ly_do'])
+    d2, _ = make(tmp_path, 'HC_K2_2', cho='K2')
+    r2 = ca.place_result('K2', [('x', an), ('y', analyse(d2))], 'x', e_hieu=E(0.0), q=[0.02, 0.0], du_m=0.0, neo=0.0,
+                         bao_q=True, can_hai_dau=fn)
+    assert r2['u_q_gom_xoay_q'] is True and r2['u_q_bao_boi_f9'] == ['x']
+    r3 = ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.02, 0.0], du_m=0.0, neo=0.0, bao_q=True,
+                         can_hai_dau=fn)
+    assert r3['u_q_gom_xoay_q'] is False
+
+
+# ------------------------------------------------------------------ F5 lan_lap_id from F8 (CODE 20/11, T9 / T9b)
+def _f8_setup(tmp_path, monkeypatch, cho='K2'):
+    """Run 1 of cua_so (no --a6), then the files of run 2: A6 (tam T1), xoay, session, dets; the chain is made
+    'khoa' and the dets fingerprint present, so F5 'khoa' depends only on the F8 link."""
+    d, _ = make(tmp_path, f'HC_{cho}_1', cho=cho)
+    run_cua_so(d)
+    f2 = os.path.join(d, 'cua_so_v1.jsonl')
+    w = lambda name, obj: write_json(str(tmp_path / f'{name}.json'), obj)                  # noqa: E731
+    a6 = w('a6', dict(schema='c8b_a6_v2', tam_id='T1'))
+    xoay = w('xoay', dict(q_tag_m=[0.0, 0.0], du_m=0.0))
+    ses = w('session', dict(fit_ids=[1, 2], car_side_m=0.3, tag_h_m=0.2))
+    dets = w('dets', dict(x=1))
+    monkeypatch.setattr(ca, 'dets_fingerprint', lambda p: 'fp' if p else None)
+    monkeypatch.setattr(ca, 'frames_chain', lambda fr, a6_, xo, track=None, cho=None, **k:
+                        dict(ca.frames_basic(fr, track), chuoi='khoa'))
+
+    def f8(name, luot, **top):
+        o = dict(schema='lan_lap_v1', tam_id='T1', a6=dict(sha256=ca.sha256(a6)), cua_so_v1_file=f2,
+                 cua_so_v1_sha256=ca.sha256(f2), luot=luot)
+        o.update(top)
+        return w(name, o)
+
+    def run2(ll, ra, extra=()):
+        args = ['cua_so', d, '--frames', os.path.join(d, 'frames.csv'), '--track', os.path.join(d, 'track.json'),
+                '--clip', os.path.join(d, 'track.json'), '--a6', a6, '--xoay', xoay, '--session', ses, '--dets', dets,
+                '--ra', str(tmp_path / ra), *extra] + (['--lan-lap', ll] if ll else [])
+        rc = ca.main(args)
+        p = tmp_path / ra / 'doan_12b_v1.json'
+        return rc, (json.load(open(p, encoding='utf-8')) if p.exists() else None)
+    return d, f2, a6, f8, run2
+
+
+def _rec(luot_id, cho, lan_lap_id, chuan_12b, tam='T1'):
+    return dict(schema='lan_lap_v1', luot_id=luot_id, cho=cho, tam_id=tam, lan_lap_id=lan_lap_id, chuan_12b=chuan_12b)
+
+
+def test_cua_so_run2_lan_lap_from_f8(tmp_path, monkeypatch):
+    """T9b: run 2 of cua_so (--a6 --xoay --lan-lap, new folder) takes lan_lap_id of this 12b from the F8 records of
+    the same place verified against it (chuan_12b); F5 'khoa' only then; run 1 files untouched."""
+    d, f2, a6, f8, run2 = _f8_setup(tmp_path, monkeypatch)
+    sha_before = (ca.sha256(f2), ca.sha256(os.path.join(d, 'doan_12b_v1.json')))
+    ll = f8('ll', [_rec('C8_1', 'K2', 'L0', 'HC_K2_1'), _rec('C8_2', 'K2', 'L0', 'HC_K2_1'),
+                   _rec('C8_3', 'K1', 'L1', 'HC_K1_9'), _rec('C8_4', 'K2', None, None)])
+    rc, f5 = run2(ll, 'r2')
+    assert rc == 0 and f5['lan_lap_id'] == 'L0' and f5['trang_thai'] == 'khoa' and f5['lan_lap_id_ly_do'] is None
+    assert f5['lan_lap_v1_sha256'] == ca.sha256(ll) and ca.f5_problems(f5) == []
+    assert any(n['vai_tro'] == 'lan_lap' and n['sha256'] == ca.sha256(ll) for n in f5['nguon'])
+    assert (tmp_path / 'r2' / 'cua_so_v1.jsonl').exists()
+    assert (ca.sha256(f2), ca.sha256(os.path.join(d, 'doan_12b_v1.json'))) == sha_before
+    rc, f5 = run2(f8('ll_luot', [_rec('HC_K2_1', 'K2', 'L3', None)]), 'r2b')           # a record of the 12b itself
+    assert rc == 0 and f5['lan_lap_id'] == 'L3' and f5['trang_thai'] == 'khoa'
+    assert run2(ll, 'r2')[0] == 2                                                          # never overwritten (x)
+
+
+def test_cua_so_run2_no_lan_lap_stays_chan_doan(tmp_path, monkeypatch):
+    """F8 without a verified run of this 12b, or with two ids, or no --lan-lap: F5 chan_doan with the reason."""
+    d, f2, a6, f8, run2 = _f8_setup(tmp_path, monkeypatch)
+    cases = [('none', [_rec('C8_1', 'K2', None, None), _rec('C8_2', 'K1', 'L0', 'HC_K2_1')], 'khong co luot'),
+             ('two', [_rec('C8_1', 'K2', 'L0', 'HC_K2_1'), _rec('C8_2', 'K2', 'L1', 'HC_K2_1')], 'nhieu lan_lap_id'),
+             ('empty', [_rec('C8_1', 'K2', '', 'HC_K2_1')], 'khong co luot')]
+    for name, luot, why in cases:
+        rc, f5 = run2(f8(name, luot), f'r_{name}')
+        assert rc == 0 and f5['lan_lap_id'] is None and f5['trang_thai'] == 'chan_doan', name
+        assert why in f5['lan_lap_id_ly_do'], (name, f5['lan_lap_id_ly_do'])
+    rc, f5 = run2(None, 'r_no')
+    assert rc == 0 and f5['trang_thai'] == 'chan_doan' and '--lan-lap' in f5['lan_lap_id_ly_do']
+
+
+def test_cua_so_run2_refuses_other_f8(tmp_path, monkeypatch):
+    """An F8 that is not this session's: schema, plate (file or record), A6 sha, its F2 file (missing, sha, no ref_12b
+    of this attempt with the same clip and frames), no --a6 plate -> code 2 and no file written."""
+    d, f2, a6, f8, run2 = _f8_setup(tmp_path, monkeypatch)
+    good = [_rec('C8_1', 'K2', 'L0', 'HC_K2_1')]
+    other_f2 = str(tmp_path / 'f2_other.jsonl')
+    rows = [json.loads(x) for x in open(f2, encoding='utf-8')]
+    with open(other_f2, 'w', encoding='utf-8') as f:
+        for r in rows:
+            f.write(json.dumps(dict(r, luot_id='HC_K2_9')) + '\n')
+    other_frames = str(tmp_path / 'f2_frames.jsonl')
+    with open(other_frames, 'w', encoding='utf-8') as f:
+        for r in rows:
+            f.write(json.dumps(dict(r, frames_sha256='0' * 64)) + '\n')
+    bad = [('schema', f8('b1', good, schema='lan_lap_v0')),
+           ('tam', f8('b2', good, tam_id='T2')),
+           ('tam_rec', f8('b3', good + [_rec('C8_9', 'K1', 'L0', 'x', tam='T2')])),
+           ('a6', f8('b4', good, a6=dict(sha256='1' * 64))),
+           ('f2_sha', f8('b5', good, cua_so_v1_sha256='2' * 64)),
+           ('f2_missing', f8('b6', good, cua_so_v1_file=str(tmp_path / 'nope.jsonl'))),
+           ('f2_other', f8('b7', good, cua_so_v1_file=other_f2, cua_so_v1_sha256=ca.sha256(other_f2))),
+           ('f2_frames', f8('b8', good, cua_so_v1_file=other_frames, cua_so_v1_sha256=ca.sha256(other_frames))),
+           ('luot', f8('b9', None))]
+    for name, p in bad:
+        rc, f5 = run2(p, f'rb_{name}')
+        assert rc == 2 and f5 is None and not (tmp_path / f'rb_{name}' / 'cua_so_v1.jsonl').exists(), name
+    a6_no = write_json(str(tmp_path / 'a6_no.json'), dict(schema='c8b_a6_v2'))
+    rc = ca.main(['cua_so', d, '--frames', os.path.join(d, 'frames.csv'), '--track', os.path.join(d, 'track.json'),
+                  '--a6', a6_no, '--lan-lap', f8('b10', good), '--ra', str(tmp_path / 'rb_a6no')])
+    assert rc == 2
+    # A6 and F8 both without a plate: None == None must not pass (the A6 plate is required on its own)
+    no_tam = f8('b11', [_rec('C8_1', 'K2', 'L0', 'HC_K2_1', tam=None)], tam_id=None, a6=dict(sha256=ca.sha256(a6_no)))
+    rc = ca.main(['cua_so', d, '--frames', os.path.join(d, 'frames.csv'), '--track', os.path.join(d, 'track.json'),
+                  '--clip', os.path.join(d, 'track.json'), '--a6', a6_no, '--lan-lap', no_tam,
+                  '--ra', str(tmp_path / 'rb_notam')])
+    assert rc == 2 and not (tmp_path / 'rb_notam' / 'doan_12b_v1.json').exists()
+
+
+def test_tinh_doan_of_run2_carries_lan_lap_id(tmp_path, monkeypatch, capsys):
+    """T9b: tinh --e-hieu --doan reads the F5 of run 2 (its folder), checks it is the F5 of the issued attempt and
+    writes its lan_lap_id in F7 mien_hieu_luc; another attempt's F5 is refused."""
+    d, f2, a6, f8, run2 = _f8_setup(tmp_path, monkeypatch)
+    rc, f5 = run2(f8('ll', [_rec('C8_1', 'K2', 'L0', 'HC_K2_1')]), 'r2')
+    assert rc == 0 and f5['trang_thai'] == 'khoa'
+    dp = str(tmp_path / 'r2' / 'doan_12b_v1.json')
+    f9 = write_json(str(tmp_path / 'f9.json'), dict(doan_12b_sha256=f5['sha256'], trang_thai='dat',
+                                                    doan=[dict(i=x['i'], e_hieu_m=0.0) for x in f5['doan']]))
+    out = str(tmp_path / 'f7.json')
+    assert ca.main(tinh_args(d, 'K2', '--e-hieu', f9, '--doan', dp, '--out', out)) in (0, 1)
+    assert json.load(open(out, encoding='utf-8'))['mien_hieu_luc']['lan_lap_id'] == 'L0'
+    assert ca.main(tinh_args(d, 'K2', '--e-hieu', f9, '--out', str(tmp_path / 'f7b.json'))) == 2   # run-1 F5: sha
+    d2, _ = make(tmp_path, 'HC_K2_2', cho='K2')
+    run_cua_so(d2)                                     # d2 has its own files: only the F5 attempt check refuses
+    capsys.readouterr()
+    assert ca.main(tinh_args(d2, 'K2', '--e-hieu', f9, '--doan', dp, '--out', str(tmp_path / 'f7c.json'))) == 2
+    assert 'khong phai luot cap HC_K2_2' in capsys.readouterr().out
+
+
+# ------------------------------------------------------------------ session 2 (20/11) real-data fixes HCB1, HCB2
+def test_lost_packets_on_turn_ramp_are_bounded(tmp_path):
+    """HCB2 (HC_goc_2, 20/11): Wi-Fi lost 140 ms of packets on the down ramp of a turn; the held value added
+    a age^2/2 ~ 0.0098 rad (> 0.5 deg) and traj_age 140 ms (> 60). Explained by the staleness seen in traj_age:
+    accepted; the sender-domain boundary stays at 60 ms (the zero-tail span check still passes)."""
+    d, _ = make(tmp_path, 'HC_K1_1', cho='K1', lost=[(86.95, 87.09)])          # turn 1 ramp down 86.82-87.32 s
+    ok, ck, info = checks(d)
+    det = dict((n, x) for n, _, x in ck)
+    assert all(ok.values()), [c for c in ck if not c[1]]
+    assert 'can cong them: xoay' in det['lenh_nhan_khop_lich'] and float(det['traj_age'].split()[1]) >= 130
+    L = ca.load_attempt(d)['log']
+    blk = [b for b in ca.sp_blocks(L, info['i0'], info['j_s']) if b['truc'] == 'wz'][0]
+    assert abs(blk['tp_wz'] - 5 * math.pi) > ca.SP_INT_TOL_RAD                  # the old tolerance alone fails
+
+
+def test_lost_packets_on_plateau_change_nothing(tmp_path):
+    """HCB2: 140 ms lost while the command is constant: the held value is the planned one; only traj_age shows it."""
+    d, _ = make(tmp_path, 'HC_K1_1', cho='K1', lost=[(70.0, 70.14)])
+    ok, ck, _ = checks(d)
+    assert all(ok.values()), [c for c in ck if not c[1]]
+    assert 'can cong them' not in dict((n, x) for n, _, x in ck)['lenh_nhan_khop_lich']
+
+
+def test_packets_lost_near_firmware_stop_fail(tmp_path):
+    """HCB2: traj_age within two packets of the 200 ms firmware stop (lost 165 ms; the firmware did not stop) is
+    refused."""
+    d, _ = make(tmp_path, 'HC_K1_1', cho='K1', lost=[(70.0, 70.165)])
+    ok, ck, _ = checks(d)
+    assert ok['mot_canh_run_active'] and not ok['traj_age'], ck
+
+
+def test_ramp_change_not_explained_by_age_fails(tmp_path):
+    """HCB2: a ramp value held 200 ms while traj_age stays small (not a late packet: e.g. a wrong value) is not
+    covered by the bound."""
+    d, _ = make(tmp_path, 'HC_K1_1', cho='K1')
+
+    def fn(hdr, body):
+        ct, cw = col(hdr, 'timestamp_us'), col(hdr, 'sp_wz')
+        t = np.array([int(r[ct]) for r in body]) / 1e6 - 100.0 - 6.0
+        rows = np.flatnonzero((t >= 86.90) & (t < 87.10))                      # 0.20 s: +0.02 rad
+        for i in rows:
+            body[i][cw] = body[rows[0]][cw]
+    edit_log(d, fn)
+    ok, ck, _ = checks(d)
+    assert not ok['lenh_nhan_khop_lich'], ck
+
+
+def _edit_yaw(d, g):
+    """yaw_rad := wrap(yaw0 + g(unwrapped yaw - yaw0, t))."""
+    def fn(hdr, body):
+        cy, ct = col(hdr, 'yaw_rad'), col(hdr, 'timestamp_us')
+        y = np.unwrap([float(r[cy]) for r in body])
+        t = np.array([int(r[ct]) for r in body]) / 1e6 - 100.0 - 6.0
+        z = y[0] + g(y - y[0], t)
+        for r, v in zip(body, z):
+            r[cy] = f'{math.atan2(math.sin(v), math.cos(v)):.6f}'
+    edit_log(d, fn)
+
+
+def test_imu_turn_fit_catches_scale_and_jump(tmp_path):
+    """HCB1 (session 2): the rate correlation was 0.40-0.58 on a good IMU at constant rate; the check is now the fit
+    of IMU yaw on encoder heading (k, residual). A 25 % scale error or a 0.08 rad jump inside a turn fails; the
+    synthetic IMU passes with k ~ 1."""
+    d, _ = make(tmp_path, 'HC_K1_1', cho='K1')
+    ok, ck, _ = checks(d)
+    e = [x for n, _, x in ck if n == 'imu_e_tuong_quan']
+    assert ok['imu_e_tuong_quan'] and len(e) == 2 and all(' k 0.9' in x or ' k 1.0' in x for x in e), e
+    d2, _ = make(tmp_path, 'HC_K1_2', cho='K1')
+    _edit_yaw(d2, lambda dy, t: 1.25 * dy)
+    _, ck2, _ = checks(d2)
+    assert [ok_ for n, ok_, _ in ck2 if n == 'imu_e_tuong_quan'] == [False, False], ck2
+    d3, _ = make(tmp_path, 'HC_K1_3', cho='K1')
+    _edit_yaw(d3, lambda dy, t: dy + np.where(t > 70.0, 0.08, 0.0))
+    _, ck3, _ = checks(d3)
+    assert [ok_ for n, ok_, _ in ck3 if n == 'imu_e_tuong_quan'][0] is False, ck3
+
+
+def test_imu_turn_fit_tolerates_rv_noise_at_constant_rate(tmp_path):
+    """HCB1: RV noise of 4 mrad per report (the session 2 residual was 3-4 mrad RMS) passes the fit, where the rate
+    correlation of a constant-rate turn falls under 0.9."""
+    rng = np.random.default_rng(7)
+    d, _ = make(tmp_path, 'HC_K1_1', cho='K1')
+    n_rep = {}
+
+    def g(dy, t):
+        k = np.floor(t / 0.05).astype(int)
+        for x in np.unique(k):
+            n_rep.setdefault(x, rng.normal(0, 0.004))
+        return dy + np.array([n_rep[x] for x in k])
+    _edit_yaw(d, g)
+    ok, ck, _ = checks(d)
+    assert ok['imu_e_tuong_quan'], [c for c in ck if c[0] == 'imu_e_tuong_quan']
+
+
+def test_lost_zero_packet_at_block_end_is_bounded(tmp_path):
+    """HCB2: the packets around the end of a turn lost (the zero packet late): the block ends ~0.1 s late; the
+    duration check widens by the staleness seen at the last row, the integral by the ramp bound."""
+    d, _ = make(tmp_path, 'HC_K1_1', cho='K1', lost=[(87.30, 87.44)])        # turn 1 ends 87.32 s
+    ok, ck, info = checks(d)
+    assert all(ok.values()), [c for c in ck if not c[1]]
+    L = ca.load_attempt(d)['log']
+    b = [b for b in ca.sp_blocks(L, info['i0'], info['j_s']) if b['truc'] == 'wz'][0]
+    assert (b['t1'] - b['t0']) - (87.31592653589793 - 55.4) > ca.DUR_TOL_S          # the old tolerance alone fails
+
+
+def test_plateau_staleness_does_not_cover_a_ramp_error(tmp_path):
+    """HCB2: staleness counts only on the ramps: 140 ms lost on the constant part does not pay for a ramp value
+    held 0.15 s with a small age."""
+    d, _ = make(tmp_path, 'HC_K1_1', cho='K1', lost=[(70.0, 70.14)])
+
+    def fn(hdr, body):
+        ct, cw = col(hdr, 'timestamp_us'), col(hdr, 'sp_wz')
+        t = np.array([int(r[ct]) for r in body]) / 1e6 - 100.0 - 6.0
+        rows = np.flatnonzero((t >= 86.90) & (t < 87.05))
+        for i in rows:
+            body[i][cw] = body[rows[0]][cw]
+    edit_log(d, fn)
+    ok, ck, _ = checks(d)
+    assert not ok['lenh_nhan_khop_lich'], ck
+
+
+def test_imu_turn_fit_uses_rv_updates_only(tmp_path):
+    """HCB1: the fit uses the rows where a new RV report came; between reports the yaw is held (20 Hz staircase,
+    up to 25 mrad at 0.5 rad/s), which is not an IMU error: a clean synthetic IMU leaves a residual far below it."""
+    d, _ = make(tmp_path, 'HC_K1_1', cho='K1')
+    _, ck, _ = checks(d)
+    for x in [x for n, _, x in ck if n == 'imu_e_tuong_quan']:
+        assert float(x.split('du max ')[1].split()[0]) < 5.0, x
+
+
+def test_one_repeated_rv_report_during_turn_fails(tmp_path):
+    """HCC1-9 kept with HCB1: one RV report repeating the old yaw while the wheels turn (25 mrad, under the fit
+    residual limit) still fails the check."""
+    d, _ = make(tmp_path, 'HC_K1_1', cho='K1', rv_freeze=(62.0, 62.07))          # one report (62.05 s) repeats
+    _, ck, _ = checks(d)
+    e = [c for c in ck if c[0] == 'imu_e_tuong_quan']
+    assert not e[0][1] and 'RV lap luc quay 1' in e[0][2] and float(e[0][2].split('du max ')[1].split()[0]) < 30, e
+
+
+def test_ramp_bound_pays_only_its_own_staleness(tmp_path):
+    """HCB2: a turn with the 140 ms ramp loss (bound ~0.008 rad) plus one wrong plateau row (+0.009 rad) is refused:
+    the bound covers what the staleness explains, not more."""
+    d, _ = make(tmp_path, 'HC_K1_1', cho='K1', lost=[(86.95, 87.09)])
+
+    def fn(hdr, body):
+        ct, cw = col(hdr, 'timestamp_us'), col(hdr, 'sp_wz')
+        t = np.array([int(r[ct]) for r in body]) / 1e6 - 100.0 - 6.0
+        i = int(np.flatnonzero(t >= 70.0)[0])
+        body[i][cw] = f'{float(body[i][cw]) + 0.9:.6f}'
+    edit_log(d, fn)
+    ok, ck, _ = checks(d)
+    assert not ok['lenh_nhan_khop_lich'], ck
+
+
+# ------------------------------------------------------------------ HCB3 (CODE 20/11): IMU drift in yaw_dong
+def test_hcb4_imu_drift_does_not_touch_a(tmp_path):
+    """Session 2 K1/K2: the IMU yaw drifted 0.03-0.05 deg/s against the camera. HCB4: a_l uses the camera heading
+    and the dynamic check takes off the straight line through the two end windows of the leg: a drift of 0.08 deg/s
+    changes neither a_l nor the gate; the camera - IMU change between the leg ends is reported (diagnostic)."""
+    d, truth = make(tmp_path, 'HC_K2_1', cho='K2', yaw_bias=lambda t: math.radians(0.08) * t, noise_psi_deg=0.02)
+    d0, _ = make(tmp_path, 'HC_K2_0', cho='K2', noise_psi_deg=0.02)
+    an, an0 = analyse(d), analyse(d0)
+    longs, longs0 = [lg for lg in an['legs'] if lg['dai']], [lg for lg in an0['legs'] if lg['dai']]
+    assert all(x['a_l'] == pytest.approx(y['a_l'], abs=1e-12) for x, y in zip(longs, longs0))
+    assert max(lg['eps'] for lg in longs) < math.radians(0.1)
+    assert all(abs(lg['cam_imu']) > math.radians(0.5) for lg in longs)          # ~0.08 deg/s x ~9.4 s
+    assert max(abs(lg['cam_imu']) for lg in longs0) < math.radians(0.05)
+    assert abs(an['troi_imu']['toc_do_deg_s'] - 0.08) < 0.005
+    r = result(d, 'K2')
+    assert r['cong']['yaw_dong'] and all(r['cong'].values())
+    assert len(r['troi_imu']['cam_imu_hai_dau_deg']) == 4
+    assert abs(math.radians(r['a_k_deg']) - truth['a_true']) <= math.radians(r['u_a_k_deg'])
+
+
+def test_hcb4_diagonal_creep_is_compensated(tmp_path):
+    """HCB4 (session 2 20/11; Liam 20/11 "Duyet cach sua (Recommended)"): the real car creeps sigma*|dx|*(-1, +1)
+    in the body frame (the FL-RR diagonal), forwards and backwards alike; the encoders do not see it. Raw: the
+    backward legs read a + sigma, the forward ones a - sigma (spread 2 sigma > 0.30 deg), the length ratio differs
+    by 2 sigma and the stops walk sideways. Compensated: sigma is recovered from the length ratio alone, the gates
+    pass, a (mean of the RAW legs) does not move, and the largest deviation of u_a still carries the raw split."""
+    sig = 0.003
+    d, truth = make(tmp_path, 'HC_K2_1', cho='K2', sigma=sig, noise_psi_deg=0.02)
+    an = analyse(d)
+    longs = [lg for lg in an['legs'] if lg['dai']]
+    assert an['truot_cheo']['sigma'] == pytest.approx(sig, abs=2e-4)
+    assert an['thang_hang_m']['tho'] > 2 * an['thang_hang_m']['bu']
+    for lg in longs:
+        want = truth['a_true'] + (sig if lg['chieu'] == 'lui' else -sig)
+        assert lg['a_l_tho'] == pytest.approx(want, abs=math.radians(0.03))
+        assert lg['a_l'] == pytest.approx(truth['a_true'], abs=math.radians(0.03))
+        assert lg['ti_le_tho'] == pytest.approx(1 + (sig if lg['chieu'] == 'lui' else -sig), abs=3e-4)
+        assert lg['ti_le'] == pytest.approx(1.0, abs=3e-4)
+    shorts = [lg for lg in an['legs'] if not lg['dai']]      # the held-out legs get the same ratio (creep ~ distance)
+    assert all(lg['a_l'] == pytest.approx(truth['a_true'], abs=math.radians(0.12)) for lg in shorts)
+    r = result(d, 'K2')
+    assert all(r['cong'].values()), r['cong']
+    assert r['do_tan_tho_deg'] > 0.30 > r['do_tan_deg'] and r['truot_cheo']['sigma'] == pytest.approx(sig, abs=2e-4)
+    assert r['thang_hang_mm']['bu'] < r['thang_hang_mm']['tho']
+    assert abs(math.radians(r['a_k_deg']) - truth['a_true']) < math.radians(0.02)
+    assert r['u_hang_deg']['lech_lon_nhat'] >= math.degrees(sig) - 0.03      # the compensation is counted as uncertain
+    leg = [x for x in r['luot_thu'][0]['doan'] if x['dai']][0]
+    assert {'a_l_deg', 'a_l_tho_deg', 'ti_le', 'ti_le_tho', 'eps_deg', 'eps_tb_deg', 'cam_imu_deg'} <= set(leg)
+    longs[0]['ti_le_tho'] = 1.03                              # the range of ti_le still covers the RAW ratio
+    assert not ca.place_result('K2', [('x', an)], 'x', e_hieu=E(0.0), q=[0.0, 0.0], du_m=0.0, neo=0.0,
+                               psi_cuc=0.0)['cong']['ti_le']
+    # goc (1 m legs): the creep walks the seven stops 7.5 mm off their line; with the predicted drift taken off
+    # they are straight again (session 2 goc: 5.6 / 4.2 mm measured, 1.7 / 2.1 mm after)
+    dg_, truth_g = make(tmp_path, 'HC_goc_1', cho='goc', sigma=sig, noise_psi_deg=0.02)
+    rg = result(dg_, 'goc')
+    assert rg['thang_hang_mm']['tho'] > 5.0 > 1.0 > rg['thang_hang_mm']['bu'] and all(rg['cong'].values()), rg['cong']
+    d0, _ = make(tmp_path, 'HC_K2_2', cho='K2', noise_psi_deg=0.02)
+    an0 = analyse(d0)
+    assert abs(an0['truot_cheo']['sigma']) < 2e-4            # nothing to compensate: nothing changes
+    assert all(abs(lg['a_l'] - lg['a_l_tho']) < math.radians(0.015) for lg in an0['legs'] if lg['dai'])
+
+
+def test_hcb4_lateral_asymmetry_off_the_diagonal_still_fails(tmp_path):
+    """The compensation is not a forward-backward equaliser: an even drift that is LATERAL only (not on the FL-RR
+    diagonal, so the length ratio does not show it) keeps its spread and the gate fails."""
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2', lech_ngang=0.004, noise_psi_deg=0.02)
+    an = analyse(d)
+    assert abs(an['truot_cheo']['sigma']) < 3e-4
+    r = result(d, 'K2')
+    assert r['do_tan_deg'] > 0.40 and not r['cong']['do_tan'] and r['trang_thai'] == 'chua_ket_luan'
+
+
+def test_hcb4_one_direction_missing_is_not_compensated(tmp_path):
+    """sigma needs a long leg in each direction; without one the legs stay raw and the reason is written."""
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2', sigma=0.003, noise_psi_deg=0.02)
+    an = analyse(d)
+    legs = [dict(lg) for lg in an['legs']]
+    for lg in legs:
+        lg['a_l'], lg['ti_le'] = lg['a_l_tho'], lg['ti_le_tho']
+        if lg['dai'] and lg['chieu'] == 'toi':
+            lg['trang_thai'] = 'thieu'
+    tc = ca.slip_compensate(legs)
+    assert tc['sigma'] is None and '0 toi' in tc['ly_do']
+    assert all(lg['a_l'] == lg['a_l_tho'] for lg in legs)
+    th = ca.stops_straightness(an['windows'], legs, None)
+    assert th['bu'] == th['tho']
+
+
+def test_imu_drift_fit_needs_windows_and_leaves_out_leg_ends():
+    """HCB3: 2-parameter line on >= 4 stop windows, the two ends of the leg left out and reported apart."""
+    class _L(dict):
+        pass
+    t = np.arange(0.0, 70.0, 0.01)
+    L = _L(t=t)
+    W = [dict(psi=0.0, yaw=0.001 * 10 * k + (0.01 if k == 3 else 0.0), th_enc=0.0005 * k * (k % 2), jc=int(1000 * k))
+         for k in range(7)]                                          # encoder noise only, no camera drift
+    tr = ca.imu_drift_fit(W, L, skip=(2, 3))
+    assert tr['n'] == 5 and set(tr['du_ngoai']) == {2, 3}
+    assert tr['pf'][0] == pytest.approx(0.001, abs=1e-9) and tr['du_ngoai'][3] == pytest.approx(0.01, abs=1e-9)
+    assert tr['du_max'] < 1e-9                                       # the step at window 3 is not fitted away
+    W2 = [dict(w) for w in W]
+    for k in (0, 1, 4):
+        W2[k].pop('psi')                                             # no camera mean at three windows
+    assert ca.imu_drift_fit(W2, L, skip=(2, 3)) is None              # 2 left < 4
+    assert ca.imu_drift_fit(W2, L)['n'] == 4
+
+
+def test_hcb4_u_yaw_is_the_path_mean_of_camera_minus_imu(tmp_path):
+    """HCB4: a camera heading error in motion turns C by its path-weighted mean. A camera - IMU difference of
+    0.2 deg over the moving part of the first long leg (K2, 9.9-15.3 s): eps (largest) ~0.2 deg < 0.30 passes the
+    gate, u_yaw (path mean) is most of it, and a stays inside u_a; without the bias u_yaw is ~0."""
+    d, truth = make(tmp_path, 'HC_K2_1', cho='K2', noise_psi_deg=0.02,
+                    cam_bias=lambda t: math.radians(0.20) if 10.3 <= t <= 15.2 else 0.0)
+    r = result(d, 'K2')
+    assert r['cong']['yaw_dong'] and 0.12 <= r['u_hang_deg']['u_yaw'] <= 0.21, r['u_hang_deg']
+    eps_max = max(x['eps_deg'] for x in r['luot_thu'][0]['doan'] if x['dai'])
+    assert r['u_hang_deg']['u_yaw'] < eps_max - 0.005 < 0.30         # the path mean, not the largest value
+    assert abs(math.radians(r['a_k_deg']) - truth['a_true']) <= math.radians(r['u_a_k_deg'])
+    d0, _ = make(tmp_path, 'HC_K2_0', cho='K2', noise_psi_deg=0.02)
+    assert result(d0, 'K2')['u_hang_deg']['u_yaw'] < 0.02
+
+

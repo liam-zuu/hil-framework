@@ -10,11 +10,21 @@ mean of the four long legs; u_a = largest |a_l - a| over every long leg of every
 (+ the conservative terms of the design: encoder, q, yaw inside the leg, camera heading between the leg start and
 the reference window).
 
+HCB4 (20/11/2026, session 2 data; design CLAUDE_THESIS 03_CODE/docs/2026-11-20_Thiet_ke_HIEUCHUAN_HCB4_truot_cheo_v1.md,
+Liam 20/11 "Duyet cach sua (Recommended)"): per leg, the camera displacement C is summed in the co-rotating tag
+frame with the CAMERA heading (no IMU in a_l) and compared with the plain body-frame encoder sum E; the car creeps
+along the FL-RR diagonal (0.15-0.30 % of the distance, the same body direction forwards and backwards), measured per
+attempt as sigma = half the backward - forward difference of |C|/|E| and taken off (E' = E + sigma |E_x| (-1, +1)) for
+the repeatability, ratio-spread and straightness gates; a = circular mean of the RAW a_l, and the largest deviation of
+u_a stays on the RAW a_l. The frames must be referenced to the floor marks ('neo_san').
+
   python tools/c8_hc_a.py kiem DIR [--age-r-max-ms 125]                    # at the floor, log only (~10 s)
   python tools/c8_hc_a.py kiem_video DIR --clip CLIP --session SESSION      # at the floor, sparse video (2-5 min)
   python tools/c8_hc_a.py cua_so DIR... --frames F --track T [--dets D]     # windows (F2) + legs (F5), per attempt
+      run 2 (T9b): ... --a6 A6 --xoay X --lan-lap lan_lap.json --ra NEW_DIR  # F5 lan_lap_id from F8 run 1
   python tools/c8_hc_a.py tinh --cho goc|K1|K2 --cap DIR [--them DIR...] --frames-of DIR=frames.csv ...
-                          [--neo hieu_chuan_neo.json] [--e-hieu e_hieu.json] [--xoay xoay.json] [--out truc_xe_v1.json]
+                          [--neo hieu_chuan_neo.json] [--e-hieu e_hieu.json [--doan NEW_DIR/doan_12b_v1.json]]
+                          [--xoay xoay.json] [--out truc_xe_v1.json]
 
 DIR is one attempt folder of c8_hc_seq.py (log.csv, sender.txt, lich.csv, gain_query_*.txt). The video side reads
 the frames CSV of c7_measure track run with tag_offset 0 (tag_x, tag_y, psi = tag heading). The common frame chain of
@@ -61,11 +71,20 @@ VET_MARGIN = 1.5               # on the encoder speed bounds of the real footpri
 RV_REPEAT_W = 0.1              # rad/s: while the wheels turn faster than this an RV report must change the yaw
 WIN_MIN_S, STILL_MIN_S = 2.5, 3.0
 U_D_MAX_S = 0.10
-TRAJ_AGE_MAX_MS = 60.0           # while the sender sends (50 Hz); not over the firmware timeout wait (HCC1-4)
 EXPIRY_MS = 200.0               # firmware TRAJ_TIMEOUT_US (main.c 45): run_active ends when the newest packet is this old
 EXPIRY_SLACK_S = 0.03
+# HCB2 (session 2, 20/11, HC_goc_2: Wi-Fi lost ~140 ms of packets twice around t = 108-112 s while turning): the
+# sender-domain boundary (last row with a fresh packet, HCC1-4) and the quality limit were one number, so raising the
+# limit moved the boundary into the firmware wait and broke the tail-duration check. Two numbers now:
+FRESH_AGE_MS = 60.0             # boundary of the sender domain (unchanged: 3 send periods)
+TRAJ_AGE_MAX_MS = EXPIRY_MS - 2 * 1000.0 / hs.SEND_HZ   # 160 ms [de xuat]: the firmware never came within two
+#                                 packets of its 200 ms stop; what late packets did to the command is bounded per block
 RV_STALL_S = 0.15               # 3 report periods at 20 Hz
-E_CORR_MIN = 0.9
+# HCB1 (session 2, 20/11): IMU vs encoder in a turn = linear fit of the IMU yaw (at RV updates) on the encoder heading;
+# the correlation of rates was 0.40-0.58 on good data (97 % of a turn is at constant rate: no signal variance, only the
+# 20 Hz RV staircase). Measured HC_goc_1/2: k 1.028-1.029, residual RMS 3.2-4.1 mrad, max 12.5-14.6 mrad.
+IMU_E_K_LO, IMU_E_K_HI = 0.90, 1.10          # [de xuat] IMU yaw / encoder heading (encoder under-reads ~3 %)
+IMU_E_RES_MAX_RAD = 0.030                    # [de xuat] ~2x the largest residual seen; a 0.15 s stall at 0.5 rad/s: 75
 SP_INT_TOL_M, SP_INT_TOL_RAD = 0.003, math.radians(0.5)
 REF_TOL_M, STOP_TOL_M = 0.003, 0.015
 DUR_TOL_S = 0.10
@@ -206,6 +225,31 @@ def sp_blocks(L, i0, i1):
     return out
 
 
+def _block_dt(L, b):
+    j, k = b['j0'], b['j1']
+    dt = np.diff(L['t'][j:k + 2]) if k + 1 < L['n'] else np.r_[np.diff(L['t'][j:k + 1]), 0.01]
+    return dt[:k + 1 - j]
+
+
+def stale_s(L, j):
+    """Staleness of the command at row j beyond one send period [s] (traj_age_ms - 1/SEND_HZ, >= 0); 0 outside."""
+    if j < 0 or j >= L['n']:
+        return 0.0
+    return max(float(L['traj_age_ms'][j]) / 1000.0 - 1.0 / hs.SEND_HZ, 0.0)
+
+
+def stale_bound(L, b, main_key, v_top, a):
+    """HCB2: bound of the change of the integral of one command block caused by late or lost packets (session 2,
+    20/11, HC_goc_2: six packets lost on the down ramp of a turn, 0.386 rad/s held 140 ms -> +0.0095 rad = a age^2/2).
+    A held value differs from the planned one only where the plan changes: on the ramps (logged |sp| below the plateau
+    v_top), by at most a x staleness, staleness = traj_age - one send period. Late packets that reach the car in a
+    burst carry an age that hides their delay: not covered, so such a block fails (conservative)."""
+    sl = slice(b['j0'], b['j1'] + 1)
+    ramp = np.abs(L[main_key][sl]) < v_top - SP_EPS
+    exc = np.maximum(L['traj_age_ms'][sl] / 1000.0 - 1.0 / hs.SEND_HZ, 0.0)
+    return float(a * np.sum((exc * _block_dt(L, b))[ramp]))
+
+
 def body_increments(L):
     """Per row i>=1: body-frame (dx, dy) from the count increments (kinematics_forward), and wheel-rate wz."""
     dC = np.diff(L['C'], axis=0).astype(float) * COUNT_M
@@ -257,12 +301,12 @@ def plan_moves(segs):
 
 
 def sender_domain(L, i0, i1):
-    """(j_s, problems). j_s = last row of the run with a fresh packet (0 <= traj_age_ms <= TRAJ_AGE_MAX_MS): up to
+    """(j_s, problems). j_s = last row of the run with a fresh packet (0 <= traj_age_ms <= FRESH_AGE_MS): up to
     there the sender was sending. Rows j_s+1..i1 are the firmware waiting for its 200 ms timeout after the last
     (zero) packet (main.c 524-525; HCC1-4): there no new packet may arrive (age only grows), the age stays under
     EXPIRY_MS, the wait is not longer than EXPIRY_MS (+ slack) and the command is 0 on every axis."""
     age = L['traj_age_ms']
-    fresh = np.flatnonzero((age[i0:i1 + 1] >= 0) & (age[i0:i1 + 1] <= TRAJ_AGE_MAX_MS))
+    fresh = np.flatnonzero((age[i0:i1 + 1] >= 0) & (age[i0:i1 + 1] <= FRESH_AGE_MS))
     if not len(fresh):
         raise AError('no fresh trajectory packet inside the run')
     j_s = i0 + int(fresh[-1])
@@ -446,24 +490,38 @@ def kiem(A, age_r_max_ms=125.0):
     ok_b = len(blocks) == len(moves)
     detail = f'{len(blocks)} blocks vs {len(moves)} planned'
     if ok_b:
+        ref_bound = 0.0                          # HCB2: pos_x_ref carries the late-packet changes of earlier legs
+        tre = []
         for b, m in zip(blocks, moves):
             dur, want = m['t1'] - m['t0'], m['toi'] - m['tu']
             sl = slice(b['j0'], b['j1'] + 1)
+            key = 'sp_vx' if m['loai'] == 'tien' else 'sp_wz'
+            B = stale_bound(L, b, key, m['v'], m['a'])
+            if B > 0.1 * (SP_INT_TOL_M if m['loai'] == 'tien' else SP_INT_TOL_RAD):
+                tre.append(f"{m['loai']} {B:.4f}")
             if m['loai'] == 'tien':
                 main, others, tp = L['sp_vx'][sl], ('sp_vy', 'sp_wz'), b['tp_vx']
-                good = abs(tp - want) <= SP_INT_TOL_M and abs(L['pos_x_ref'][b['j1']] - m['toi']) <= REF_TOL_M
+                ref_bound += B
+                good = (abs(tp - want) <= SP_INT_TOL_M + B
+                        and abs(L['pos_x_ref'][b['j1']] - m['toi']) <= REF_TOL_M + ref_bound)
             else:
                 main, others, tp = L['sp_wz'][sl], ('sp_vx', 'sp_vy'), b['tp_wz']
-                good = abs(tp - want) <= SP_INT_TOL_RAD
+                good = abs(tp - want) <= SP_INT_TOL_RAD + B
             pure = all(np.all(np.abs(L[c][sl]) <= SP_EPS) for c in others)
             one_sign = np.all(np.sign(main[np.abs(main) > SP_EPS]) == math.copysign(1.0, want))
-            t_ok = abs((b['t0'] - t_run) - m['t0']) <= DUR_TOL_S and abs((b['t1'] - b['t0']) - dur) <= DUR_TOL_S
+            # HCB2: a late first packet starts the block late (the zero packets before it aged), a late zero packet
+            # ends it late (the last value held): the time checks widen by the staleness seen at those rows
+            s0, s1 = stale_s(L, b['j0'] - 1), stale_s(L, b['j1'])
+            t_ok = (abs((b['t0'] - t_run) - m['t0']) <= DUR_TOL_S + s0
+                    and abs((b['t1'] - b['t0']) - dur) <= DUR_TOL_S + s0 + s1)
             if not (good and pure and one_sign and t_ok):
                 ok_b = False
-                detail = (f"block {b['j0']}: {m['loai']} tich phan {tp:.4f} vs {want:.4f}, truc khac 0 "
-                          f"{not pure}, doi dau {not one_sign}, bat dau {b['t0'] - t_run:.2f} vs {m['t0']:.2f} s, "
-                          f"dai {b['t1'] - b['t0']:.2f} vs {dur:.2f} s")
+                detail = (f"block {b['j0']}: {m['loai']} tich phan {tp:.4f} vs {want:.4f} (can goi tre {B:.4f}), "
+                          f"truc khac 0 {not pure}, doi dau {not one_sign}, bat dau {b['t0'] - t_run:.2f} vs "
+                          f"{m['t0']:.2f} s, dai {b['t1'] - b['t0']:.2f} vs {dur:.2f} s")
                 break
+        if ok_b and tre:
+            detail += f"; goi tre tren doan tang/giam toc, can cong them: {', '.join(tre)}"
         if ok_b:                                 # the zero tail: hold + TAIL_S sent whole up to the last packet
             n_pk = hs.n_samples(segs) + int(math.ceil(hs.TAIL_S * hs.SEND_HZ - 1e-9))
             span = float(L['t'][j_s]) - t_run
@@ -490,19 +548,25 @@ def kiem(A, age_r_max_ms=125.0):
             if len(t) < 60:
                 add('imu_e_tuong_quan', False, 'block too short')
                 continue
-            w_imu = np.gradient(yaw[sl], t)
-            w_enc = np.gradient(np.cumsum(dth[sl]), t)
+            # HCB1: IMU yaw at the RV updates fitted on the encoder heading (same body turn, encoder scale ~3 % low);
+            # a frozen, jumping or mis-scaled IMU leaves a slope off 1 or a residual (no need for rate variance)
+            th = np.cumsum(dth[sl])
+            upd = np.r_[True, np.diff(L['rv_n'][sl]) != 0]
+            X = np.column_stack([th[upd] - th[0], np.ones(int(upd.sum()))])
+            coef = np.linalg.lstsq(X, yaw[sl][upd], rcond=None)[0]
+            res = yaw[sl][upd] - X @ coef
+            kk, r_max, r_rms = float(coef[0]), float(np.max(np.abs(res))), float(np.sqrt(np.mean(res ** 2)))
+            fit_ok = IMU_E_K_LO <= kk <= IMU_E_K_HI and r_max <= IMU_E_RES_MAX_RAD
             k = np.ones(25) / 25
-            a1, a2 = np.convolve(w_imu, k, 'valid'), np.convolve(w_enc, k, 'valid')
-            corr = float(np.corrcoef(a1, a2)[0, 1]) if np.std(a1) > 0 and np.std(a2) > 0 else 0.0
             sign_ok = np.sign(yaw[b['j1']] - yaw[b['j0']]) == np.sign(b['tp_wz'])
             # HCC1-9: a repeated RV value while the wheels turn (a 0.15 s repeat kept corr ~0.95)
             rate = np.convolve(np.abs(dth[sl]) / np.maximum(np.r_[np.diff(t), 0.01], 1e-3), k, 'same')
             ch = np.flatnonzero(np.diff(L['rv_n'][sl]) != 0) + 1
             ysl = L['yaw_rad'][sl]
             same = [j for j0_, j in zip(ch[:-1], ch[1:]) if rate[j] > RV_REPEAT_W and abs(ysl[j] - ysl[j0_]) < 1e-6]
-            add('imu_e_tuong_quan', corr >= E_CORR_MIN and sign_ok and not same,
-                f'corr {corr:.3f}, RV lap luc quay {len(same)}')
+            add('imu_e_tuong_quan', fit_ok and sign_ok and not same,
+                f'yaw IMU = k goc encoder: k {kk:.4f}, du max {1e3 * r_max:.1f} mrad (RMS {1e3 * r_rms:.1f}), '
+                f'dung chieu {bool(sign_ok)}, RV lap luc quay {len(same)}')
         wins = still_windows(L, blocks, i0, j_s)
         add('cua_so_dung_du', all(w.get('still_s', 0) >= STILL_MIN_S and not w.get('ho') for w in wins),
             ', '.join(f"{w.get('still_s', 0):.2f}" for w in wins))
@@ -542,7 +606,30 @@ def frames_basic(frames_csv, track_json):
             t.append(vals[0]); x.append(vals[1]); y.append(vals[2]); ps.append(vals[3]); ok.append(good)
     F = dict(idx=np.array(idx), t=np.array(t), x=np.array(x), y=np.array(y), psi=np.array(ps), ok=np.array(ok, bool))
     F['chuoi'] = 'chan_doan'
+    F['neo_san'] = True          # c7_measure track refits the camera pose on the floor marks in every frame
     return F
+
+
+def a6_tam_id(a6_path):
+    """The plate of an A6 file: c8b_a6_v2.tam_id (top-level key; CODE 20/11 A6C1-7: declared once in the A6 file,
+    other sessions only compare). None without a path, a readable JSON object, or a non-empty string tam_id."""
+    if not a6_path:
+        return None
+    try:
+        with open(a6_path, encoding='utf-8') as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return None
+    t = d.get('tam_id') if isinstance(d, dict) else None
+    return t if isinstance(t, str) and t else None
+
+
+def _accepts(fn, name):
+    try:
+        import inspect
+        return name in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 def frames_chain(frames_csv, a6, xoay, lan_lap=None, track=None, cho=None):
@@ -550,10 +637,16 @@ def frames_chain(frames_csv, a6, xoay, lan_lap=None, track=None, cho=None):
     None (caller falls back to frames_basic, chain 'chan_doan') when CAM or C8B (c8b_a6) is not merged yet, when
     the chain refuses its inputs (ValueError: schema, track tag_offset), or when no frame has A6 AND q applied
     (e.g. xoay_v1 without a6_sha256 or of another A6: CAM gives q None, p NaN). A frame is used only when its gate,
-    A6 and q are all ok (cong_ok alone would let NaN centres through). 'khoa' needs every gated frame A6 + q ok."""
+    A6 and q are all ok (cong_ok alone would let NaN centres through). 'khoa' needs every gated frame A6 + q ok.
+    HCV3-1 (CODE 20/11, contract log): without lan_lap the plate is c8b_a6_v2.tam_id of the A6 file, passed as
+    tam_id= to CAM chuoi_khung once CAM has that parameter (CAM adds it after session 2; before that the call is the
+    old one and CAM's A6 plate check refuses, so the chain stays chan_doan). No lan_lap is ever built here."""
     try:
         import c7_chuoi_khung as ck                                       # CAM, after its merge
-        rows = ck.chuoi_khung(frames_csv, ck.doc_a6(a6), xoay, lan_lap=lan_lap, track=track, cho=cho)
+        kw = dict(lan_lap=lan_lap, track=track, cho=cho)
+        if lan_lap is None and _accepts(ck.chuoi_khung, 'tam_id'):
+            kw['tam_id'] = a6_tam_id(a6)
+        rows = ck.chuoi_khung(frames_csv, ck.doc_a6(a6), xoay, **kw)
     except (ImportError, ValueError):
         return None
     if not rows:
@@ -565,9 +658,12 @@ def frames_chain(frames_csv, a6, xoay, lan_lap=None, track=None, cho=None):
         return None
     F = dict(idx=np.array([r['frame_id'] for r in rows]), t=t,
              x=np.array([r['p_x'] for r in rows]), y=np.array([r['p_y'] for r in rows]),
-             psi=np.array([r['psi_ma_p'] for r in rows]), ok=full)
+             psi=np.array([r['psi_ma_p'] for r in rows]), ok=full,
+             tx=np.array([float(r.get('tag_x', np.nan)) for r in rows]),     # HCH1-2: tag centre (A6 residual)
+             ty=np.array([float(r.get('tag_y', np.nan)) for r in rows]))
     # HCC7-7: 'khoa' only when every gated frame has a finite PTS, A6 and q, and the PTS strictly increase
     F['chuoi'] = 'khoa' if bool(np.all(full[gated])) and bool(np.all(np.diff(t[full]) > 0)) else 'chan_doan'
+    F['neo_san'] = True          # rows of c7_measure track: camera pose refitted on the floor marks per frame
     return F
 
 
@@ -689,38 +785,59 @@ def rv_samples(L):
     return t[keep], yaw[keep]
 
 
-def leg_eps(F, L, ja, jb, D, psi_a, yaw_a, smooth_s=None, rv=None):
-    """Largest |camera heading change - IMU yaw change| over the leg (HCC1-9): both relative to window a (window
-    means psi_a, yaw_a), both averaged over the same +-smooth_s/2 time window on the camera frame times, the IMU
-    interpolated in the RV report times (not the log row times). NaN (no evidence) when an RV gap > RV_STALL_S, a
-    camera gap > smooth_s, or fewer than 80 % of the leg time is covered."""
+def leg_cam(F, L, ja, jb, D, wa, wb, smooth_s=None, rv=None):
+    """HCB4: the camera side of one leg between the centres of the stop windows wa and wb (log rows ja, jb).
+    C: displacement of the centre in the CO-ROTATING tag frame = sum over the frames of R(-psi_mid) dp, from the
+    mean of window a through every gated frame to the mean of window b (camera heading only: no IMU, no exact
+    camera-log time). eps: largest |camera heading - IMU yaw| over the leg after taking off the straight line
+    through the two end windows (a steady IMU drift does not count; the encoder is no referee: session 2 K2 showed
+    its heading slips), both averaged over +-smooth_s/2 on the camera frame times, the IMU interpolated in the RV
+    report times (HCC1-9); eps_tb: the path-weighted mean of the same difference; cam_imu: the camera - IMU
+    heading change between the two windows (diagnostic: IMU drift). eps, eps_tb, cam_imu are NaN (no evidence) with
+    an RV gap > RV_STALL_S, a camera gap > smooth_s, or fewer than 80 % of the leg covered. None: < 10 frames."""
     smooth_s = EPS_SMOOTH_S if smooth_s is None else smooth_s
     t_rv, y_rv = rv if rv is not None else rv_samples(L)
     ta, tb = float(L['t'][ja]), float(L['t'][jb])
     mk = F['ok'] & (F['t'] + D >= ta) & (F['t'] + D <= tb)
     if mk.sum() < 10:
-        return float('nan')
+        return None
     tc = F['t'][mk] + D
-    if np.max(np.diff(np.r_[ta, tc, tb])) > smooth_s:
-        return float('nan')
+    p = np.unwrap(F['psi'][mk])
+    pa = p[0] + wrap(wa['psi'] - p[0])
+    pb = p[-1] + wrap(wb['psi'] - p[-1])
+    X = np.r_[wa['p'][0], F['x'][mk], wb['p'][0]]
+    Y = np.r_[wa['p'][1], F['y'][mk], wb['p'][1]]
+    pm = 0.5 * (np.r_[pa, p][:len(p) + 1] + np.r_[p, pb])              # heading at the middle of each step
+    ddx, ddy = np.diff(X), np.diff(Y)
+    c, s = np.cos(pm), np.sin(pm)
+    C = np.array([float(np.sum(c * ddx + s * ddy)), float(np.sum(-s * ddx + c * ddy))])   # R(-pm) (ddx, ddy)
+    nan = float('nan')
+    out = dict(C=C, dpsi=float(pb - pa), gap=float(np.max(np.diff(np.r_[ta, tc, tb]))), eps=nan, eps_tb=nan,
+               cam_imu=nan)
+    if out['gap'] > smooth_s:
+        return out
     r0, r1 = np.searchsorted(t_rv, ta), np.searchsorted(t_rv, tb)
     seg = t_rv[max(r0 - 1, 0):min(r1 + 1, len(t_rv))]
     if len(seg) < 2 or np.max(np.diff(seg)) > RV_STALL_S:
-        return float('nan')
-    pc = psi_a + np.vectorize(wrap)(np.unwrap(F['psi'][mk]) - psi_a)
+        return out
     yi = np.interp(tc, t_rv, y_rv)
+    d_b = wrap((pb - pa) - (wb['yaw'] - wa['yaw']))
+    lin = (p - pa) - (yi - wa['yaw']) - d_b * (tc - ta) / (tb - ta)
+    lin = (lin + math.pi) % (2 * math.pi) - math.pi
     h = smooth_s / 2
     a = np.searchsorted(tc, tc - h)
     b = np.searchsorted(tc, tc + h, side='right')
-    cs_p, cs_y = np.r_[0.0, np.cumsum(pc)], np.r_[0.0, np.cumsum(yi)]
+    cs = np.r_[0.0, np.cumsum(lin)]
     n = b - a
     full = (tc - h >= ta) & (tc + h <= tb) & (n >= 3)
     if full.sum() < 3 or (tc[full][-1] - tc[full][0]) < 0.8 * (tb - ta - smooth_s):
-        return float('nan')
-    ps = (cs_p[b] - cs_p[a]) / np.maximum(n, 1)
-    ys = (cs_y[b] - cs_y[a]) / np.maximum(n, 1)
-    dev = (ps - psi_a) - (ys - yaw_a)
-    return float(np.max(np.abs(np.vectorize(wrap)(dev[full]))))
+        return out
+    sm = (cs[b] - cs[a]) / np.maximum(n, 1)
+    w = np.hypot(np.diff(F['x'][mk]), np.diff(F['y'][mk]))
+    out['eps'] = float(np.max(np.abs(sm[full])))
+    out['eps_tb'] = float(np.sum(0.5 * (lin[1:] + lin[:-1]) * w) / np.sum(w)) if np.sum(w) > 0 else 0.0
+    out['cam_imu'] = float(d_b)
+    return out
 
 
 def e_coverage(F, L, blocks, D):
@@ -763,6 +880,47 @@ def cam_window(F, w, D, u_D, fps=60.0, gated=True):
 # ------------------------------------------------------------------ legs and a
 LONG_LEGS = ((1, 2), (2, 3), (3, 4), (4, 5))
 SHORT_LEGS = ((0, 1), (5, 6))
+STOPS_12B = 7                   # windows 0..6: the stops of 12b (ref_12b, dung_12b)
+TROI_MIN_WIN = 4                # HCB3: at least 4 stop windows for the 2-parameter drift line
+CAM_TROI_MIN_DEG_S = 0.001      # HCB3 [de xuat]: a camera-vs-encoder slope under this is not called a camera drift
+#                                 (<= 0.005 deg on a over a half leg); it still enters u_yaw (|slope| x half leg)
+
+
+def imu_drift_fit(W, L, skip=(), trong_tai=True):
+    """DIAGNOSTIC ONLY since HCB4 (a_l does not use the IMU; analyse calls it with trong_tai=False, so the
+    IMU - camera line is reported whatever the encoder says: session 2 K2 showed the encoder heading slips while
+    the camera, referenced to the floor marks, does not turn). Kept as written for HCB3:
+    HCB3 cach A (Liam 20/11 at CODE, button: "Cach A"; session 2 K1/K2: the IMU yaw drifted 0.03-0.05 deg/s
+    against the camera, the encoder agreeing with the camera). Over the 12b stop windows with a camera mean, leaving
+    out the windows in skip (the two ends of the leg being checked: no self-fit), at least TROI_MIN_WIN:
+      - line (2 parameters) of the IMU drift d_k = (yaw_k - yaw_0) - wrap(psi_k - psi_0) [rad] against the window
+        centre time (camera as reference: residuals ~0.1 deg);
+      - camera stability against the encoder: slope of e_k = wrap(psi_k - psi_0) - (th_k - th_0); |slope| > 2 SE ->
+        the camera itself may drift (mount): no correction (a camera drift moved into the IMU would be hidden);
+        a slope under CAM_TROI_MIN_DEG_S is not a drift (it enters u_yaw instead).
+    Returns None (fewer windows), dict(ly_do='camera_troi_so_encoder', ...) or dict(pf, n, du_max (in-fit),
+    du_ngoai {k: |residual|} of the skipped windows, se_ce [rad/s], doc_ce [rad/s])."""
+    ks = [k for k in range(min(STOPS_12B, len(W))) if 'psi' in W[k]]
+    if not ks:
+        return None
+    k0 = ks[0]
+    t = {k: float(L['t'][W[k]['jc']]) for k in ks}
+    cam = {k: wrap(W[k]['psi'] - W[k0]['psi']) for k in ks}
+    d = {k: (W[k]['yaw'] - W[k0]['yaw']) - cam[k] for k in ks}
+    e = {k: cam[k] - (W[k]['th_enc'] - W[k0]['th_enc']) for k in ks}
+    fit = [k for k in ks if k not in skip]
+    if len(fit) < TROI_MIN_WIN:
+        return None
+    tt = np.array([t[k] for k in fit])
+    pe = np.polyfit(tt, [e[k] for k in fit], 1)
+    re = np.array([e[k] for k in fit]) - np.polyval(pe, tt)
+    se = float(np.sqrt(np.sum(re ** 2) / (len(fit) - 2)) / np.sqrt(np.sum((tt - tt.mean()) ** 2)))
+    if trong_tai and abs(pe[0]) > 2 * se and abs(pe[0]) > math.radians(CAM_TROI_MIN_DEG_S):
+        return dict(ly_do='camera_troi_so_encoder', n=len(fit), doc_ce=float(pe[0]), se_ce=se)
+    pf = np.polyfit(tt, [d[k] for k in fit], 1)
+    res = {k: abs(d[k] - float(np.polyval(pf, t[k]))) for k in ks}
+    return dict(pf=pf, n=len(fit), du_max=max(res[k] for k in fit),
+                du_ngoai={k: res[k] for k in ks if k in skip}, se_ce=se, doc_ce=float(pe[0]))
 
 
 def analyse(A, F, k_info, min_frames=MIN_FRAMES_TINH):
@@ -777,6 +935,8 @@ def analyse(A, F, k_info, min_frames=MIN_FRAMES_TINH):
         raise AError(f'{n12} translations in the schedule (12b has 6)')
     W = []
     yaw = np.unwrap(L['yaw_rad'])
+    dx, dy, dth_ = body_increments(L)
+    th_enc = np.cumsum(dth_)                                # encoder heading (diagnostic doc_ce of imu_drift_fit)
     for k, w in enumerate(wins):
         m = cam_window(F, w, D, u_D, F.get('fps', 60.0))
         lw = (L['t'] >= w['ta']) & (L['t'] <= w['tb']) if w['ta'] is not None else np.zeros(L['n'], bool)
@@ -784,15 +944,17 @@ def analyse(A, F, k_info, min_frames=MIN_FRAMES_TINH):
                    ta=w['ta'], tb=w['tb'])
         if rec['n'] >= min_frames:
             rec['p'] = np.array([F['x'][m].mean(), F['y'][m].mean()])
+            # HCH1-2: the tag centre (frames_basic: x, y are the tag centre) for the C8B two-end bound
+            rec['p_tag'] = np.array([F.get('tx', F['x'])[m].mean(), F.get('ty', F['y'])[m].mean()])
             rec['psi'] = mean_unwrapped(F['psi'][m])
             rec['cs'] = (float(np.mean(np.cos(F['psi'][m]))), float(np.mean(np.sin(F['psi'][m]))))
             rec['yaw'] = float(np.mean(yaw[lw]))
+            rec['th_enc'] = float(np.mean(th_enc[lw]))
             rec['jc'] = int(np.flatnonzero(lw)[len(np.flatnonzero(lw)) // 2])
             h = int(m.sum()) // 2
             idx = np.flatnonzero(m)
             rec['psi_nua'] = abs(wrap(mean_unwrapped(F['psi'][idx[:h]]) - mean_unwrapped(F['psi'][idx[h:]])))
         W.append(rec)
-    dx, dy, _ = body_increments(L)
     rvs = rv_samples(L)
     legs = []
     for (ia, ib), dai in ([] if n12 == 0 else [(lg, True) for lg in LONG_LEGS] + [(lg, False) for lg in SHORT_LEGS]):
@@ -803,23 +965,81 @@ def analyse(A, F, k_info, min_frames=MIN_FRAMES_TINH):
             legs.append(leg)
             continue
         ja, jb = wa['jc'], wb['jc']
-        mid = 0.5 * (yaw[ja + 1:jb + 1] + yaw[ja:jb]) - wa['yaw']           # HCC1-12: window mean, as v4 3.2 step 3
-        c, s = np.cos(mid), np.sin(mid)
-        ds = np.array([np.sum(c * dx[ja + 1:jb + 1] - s * dy[ja + 1:jb + 1]),
-                       np.sum(s * dx[ja + 1:jb + 1] + c * dy[ja + 1:jb + 1])])
+        cam = leg_cam(F, L, ja, jb, D, wa, wb, rv=rvs)
+        if cam is None:
+            leg.update(trang_thai='thieu', ly_do=f'fewer than 10 frames between windows {ia} and {ib}')
+            legs.append(leg)
+            continue
+        # HCB4: both displacements in the body (co-rotating) frame. Encoder: plain sum of the firmware body
+        # increments (no yaw needed); camera: leg_cam (camera heading). a_l_tho = arg E - arg C
         dp = wb['p'] - wa['p']
-        th_a = wrap(math.atan2(dp[1], dp[0]) - math.atan2(ds[1], ds[0]))
-        a_l = wrap(wa['psi'] - th_a)
-        # dynamic yaw check over the leg (HCC1-9): 0.5 s, RV report times, gaps -> NaN (no evidence)
-        eps = leg_eps(F, L, ja, jb, D, wa['psi'], wa['yaw'], rv=rvs)
+        ds = np.array([float(np.sum(dx[ja + 1:jb + 1])), float(np.sum(dy[ja + 1:jb + 1]))])
+        dc = cam['C']
+        a_tho = wrap(math.atan2(ds[1], ds[0]) - math.atan2(dc[1], dc[0]))
+        r_tho = float(np.hypot(*dc) / np.hypot(*ds))
         path = float(np.sum(np.hypot(dx[ja + 1:jb + 1], dy[ja + 1:jb + 1])))
-        dth = float(np.sum(np.abs(np.diff(yaw[ja:jb + 1]))))
-        leg.update(trang_thai='hop_le', dp=dp, ds=ds, L_m=float(np.hypot(*dp)), Ls_m=float(np.hypot(*ds)),
-                   ti_le=float(np.hypot(*dp) / np.hypot(*ds)), theta_a=th_a, a_l=a_l, eps=eps, path=path, sum_dth=dth,
+        leg.update(trang_thai='hop_le', dp=dp, ds=ds, dc=dc, L_m=float(np.hypot(*dp)), Ls_m=float(np.hypot(*ds)),
+                   ti_le_tho=r_tho, ti_le=r_tho, a_l_tho=a_tho, a_l=a_tho, theta_a=wrap(wa['psi'] - a_tho),
+                   eps=cam['eps'], eps_tb=cam['eps_tb'], cam_imu=cam['cam_imu'], dpsi=cam['dpsi'],
+                   ho_khung_s=cam['gap'], path=path,
                    chieu='toi' if ds[0] > 0 else 'lui', R_a=wa['psi'], R_b=wb['psi'], cs_a=wa['cs'], cs_b=wb['cs'],
-                   nua_a=wa['psi_nua'], nua_b=wb['psi_nua'])
+                   nua_a=wa['psi_nua'], nua_b=wb['psi_nua'], p_a=wa['p'], p_b=wb['p'],
+                   p_tag_a=wa['p_tag'], p_tag_b=wb['p_tag'])
         legs.append(leg)
-    return dict(D=D, u_D=u_D, diffs=diffs, windows=W, legs=legs, chuoi=F['chuoi'])
+    tc = slip_compensate(legs)
+    th = stops_straightness(W, legs, tc.get('sigma')) if n12 else dict(tho=float('nan'), bu=float('nan'))
+    tr_all = imu_drift_fit(W, L, trong_tai=False) if n12 else None     # diagnostic: IMU - camera line over the stops
+    troi = None if tr_all is None else (dict(ly_do=tr_all['ly_do']) if 'pf' not in tr_all else dict(
+        toc_do_deg_s=math.degrees(float(tr_all['pf'][0])), n_cua_so=tr_all['n'],
+        du_khop_max_deg=math.degrees(tr_all['du_max']), doc_ce_deg_s=math.degrees(tr_all['doc_ce']),
+        se_ce_deg_s=math.degrees(tr_all['se_ce'])))
+    return dict(D=D, u_D=u_D, diffs=diffs, windows=W, legs=legs, chuoi=F['chuoi'], troi_imu=troi, truot_cheo=tc,
+                thang_hang_m=th, neo_san=bool(F.get('neo_san', False)))
+
+
+def slip_compensate(legs):
+    """HCB4 (design 2026-11-20_Thiet_ke_HIEUCHUAN_HCB4_truot_cheo_v1.md; Liam 20/11): the car creeps along the
+    FL-RR diagonal of the body, about 0.15-0.30 % of the distance, the SAME body direction forwards and backwards
+    (session 2: 5 attempts, direction of the even camera-encoder difference 47.0 +- 4.2 deg; the encoders do not
+    see it). sigma = (mean raw ratio |C|/|E| of the backward long legs - mean of the forward ones) / 2; every leg
+    gets E' = E + sigma*|E_x|*(-1, +1), a_l = arg E' - arg C, ti_le = |C|/|E'| (long and short legs: the creep is
+    proportional to the distance). Fewer than one long leg in each direction -> no compensation (a_l = a_l_tho)
+    and the reason. Returns dict(sigma, r_lui, r_toi, ly_do)."""
+    longs = [lg for lg in legs if lg.get('dai') and lg['trang_thai'] == 'hop_le']
+    lui = [lg['ti_le_tho'] for lg in longs if lg['chieu'] == 'lui']
+    toi = [lg['ti_le_tho'] for lg in longs if lg['chieu'] == 'toi']
+    if not lui or not toi:
+        return dict(sigma=None, r_lui=lui, r_toi=toi, ly_do=f'doan dai hop le: {len(lui)} lui, {len(toi)} toi')
+    sigma = 0.5 * (float(np.mean(lui)) - float(np.mean(toi)))
+    for lg in legs:
+        if lg['trang_thai'] != 'hop_le':
+            continue
+        s = sigma * abs(lg['ds'][0])
+        e = np.array([lg['ds'][0] - s, lg['ds'][1] + s])
+        lg['a_l'] = wrap(math.atan2(e[1], e[0]) - math.atan2(lg['dc'][1], lg['dc'][0]))
+        lg['ti_le'] = float(np.hypot(*lg['dc']) / np.hypot(*e))
+    return dict(sigma=sigma, r_lui=lui, r_toi=toi, ly_do=None)
+
+
+def stops_straightness(W, legs, sigma):
+    """Largest distance of the 12b stops from their common line [m]: 'tho' as measured, 'bu' after taking off the
+    slip drift predicted by sigma (each leg moves the car sigma*|E_x|*(-1, +1) in the body frame; cumulated along
+    the legs in time order, turned to the floor by the body heading at the leg start = tag heading - mean raw a)."""
+    ks = [k for k in range(min(STOPS_12B, len(W))) if 'p' in W[k]]
+    tho = perp_offsets([W[k] for k in ks])
+    good = [lg for lg in legs if lg['trang_thai'] == 'hop_le']
+    longs = [lg for lg in good if lg['dai']]
+    if sigma is None or not longs:
+        return dict(tho=tho, bu=tho)
+    a = circmean([lg['a_l_tho'] for lg in longs])
+    drift, acc = {}, np.zeros(2)
+    for lg in sorted(good, key=lambda g: g['a']):
+        hd = lg['R_a'] - a
+        s = sigma * abs(lg['ds'][0])
+        acc = acc + s * np.array([-math.cos(hd) - math.sin(hd), -math.sin(hd) + math.cos(hd)])
+        drift[lg['b']] = acc.copy()
+    pts = [dict(p=W[k]['p'] - drift.get(k, np.zeros(2))) for k in ks]
+    return dict(tho=tho, bu=perp_offsets(pts))
 
 
 def perp_offsets(W):
@@ -835,9 +1055,9 @@ def _deg_leg(lg):
     """One leg for F7: angles in degrees with _deg names (HCC1-12), arrays as lists, internal fields dropped."""
     out = {}
     for k, v in lg.items():
-        if k in ('R_a', 'R_b', 'cs_a', 'cs_b', 'nua_a', 'nua_b'):
+        if k in ('R_a', 'R_b', 'cs_a', 'cs_b', 'nua_a', 'nua_b', 'p_tag_a', 'p_tag_b'):
             continue
-        if k in ('a_l', 'theta_a', 'eps'):
+        if k in ('a_l', 'a_l_tho', 'theta_a', 'eps', 'eps_tb', 'cam_imu', 'dpsi'):
             out[k + '_deg'] = None if v is None or not math.isfinite(v) else math.degrees(v)
         else:
             out[k] = v.tolist() if isinstance(v, np.ndarray) else v
@@ -845,10 +1065,24 @@ def _deg_leg(lg):
 
 
 def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None, psi_cuc=None, cap_ok=True,
-                 cap_why=(), bao_q=False, vet=None, psi_cuc_chot=False, need_windows=None, psi_hai_dau=None):
+                 cap_why=(), bao_q=False, vet=None, psi_cuc_chot=False, need_windows=None, psi_hai_dau=None,
+                 can_hai_dau=None, p_ref_tag=None):
     for v in (psi_cuc, psi_hai_dau):                       # HCC3-6: never let max()/sin() hide a bad bound
         if v is not None and not (math.isfinite(v) and 0.0 <= v <= math.pi):
             raise AError(f'can ngoai mien [0, pi]: {v}')
+    can_why = []
+
+    def can(p1, p2):
+        """Two-end camera heading bound of C8B (c8b_a6.u_psi_hai_dau_rad, design v4 3.3) for two window tag
+        positions, or None (its reasons kept: the term is then missing, never a bound of 0; HCH1-4: a bound out of
+        [0, pi] is missing too, with its reason)."""
+        u, why = can_hai_dau(p1, p2)
+        if u is not None and not (isinstance(u, (int, float)) and math.isfinite(u) and 0.0 <= u <= math.pi):
+            u, why = None, [f'can ngoai mien [0, pi]: {u}']
+        if u is None:
+            can_why.extend(w for w in why if w not in can_why)
+            return None
+        return float(u)
     """Combine the analysed attempts of one place (F7 block). attempts = list of (thu_id, analysis or None, why).
 
     cap_ok False (the issued attempt failed kiem) -> chua_ket_luan: a is never issued from such an attempt; its legs
@@ -858,7 +1092,7 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
     Every early stop returns the same keys (values None) instead of raising."""
     attempts = [(x[0], x[1], x[2] if len(x) > 2 else ()) for x in attempts]
     res = dict(cho=cho, trang_thai='khoa', ly_do=[], luot_thu=[], a_k_deg=None, u_a_k_deg=None, do_tan_deg=None,
-               u_hang_deg={}, cong={}, giu_ngoai=[])
+               u_hang_deg={}, cong={}, giu_ngoai=[], troi_imu=None)
     for tid, an, why in attempts:
         res['luot_thu'].append(dict(thu_id=tid, cap=tid == cap_id, trang_thai='thieu' if an is None else 'tinh_duoc',
                                     ly_do=list(why) if why else [],
@@ -879,11 +1113,17 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
     longs = [lg for lg in cap['legs'] if lg['dai'] and lg['trang_thai'] == 'hop_le']
     if len(longs) != 4:
         return stop(['cap: fewer than 4 long legs'])
-    a = circmean([lg['a_l'] for lg in longs])
+    # HCB4 (Liam 20/11, CODE_HIEUCHUAN p5: "Duyet cach sua (Recommended)"): a of the place = circular mean of the
+    # four RAW a_l (the spec estimator; the diagonal-slip compensation cancels in it); the repeatability gate runs
+    # on the compensated a_l; the largest deviation of u_a stays on the RAW a_l of every long leg of every attempt
+    # (the whole compensation counted as uncertain: covers a car that drifts in one direction only)
+    a = circmean([lg['a_l_tho'] for lg in longs])
     spread = max(abs(wrap(x['a_l'] - y['a_l'])) for x in longs for y in longs)
+    spread_tho = max(abs(wrap(x['a_l_tho'] - y['a_l_tho'])) for x in longs for y in longs)
+    tc = cap.get('truot_cheo') or {}
     all_long = [lg for _, an, _ in attempts if an is not None for lg in an['legs']
                 if lg['dai'] and lg['trang_thai'] == 'hop_le']
-    dev = max(abs(wrap(lg['a_l'] - a)) for lg in all_long)
+    dev = max(abs(wrap(lg['a_l_tho'] - a)) for lg in all_long)
     Lmin = min(lg['L_m'] for lg in longs)
     Lsmin = min(lg['Ls_m'] for lg in longs)
     bad = []
@@ -900,31 +1140,72 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
                 es.append(v)
         e = max(es) if es else 0.0
     u_map = math.asin(e / Lmin) if e < Lmin else math.pi / 2
-    r_enc = COUNT_M * (2 + max(lg['sum_dth'] for lg in longs)) / Lsmin
+    r_enc = 2 * COUNT_M / Lsmin                            # HCB4: E is a plain body-frame sum (no rotation terms)
     u_enc = math.asin(r_enc) if r_enc < 1 else math.pi / 2
+    hd_thieu = False
+    thieu_hang = []                                        # HCH1-4: terms without a bound: exported null, not 0
+    # HCH1-3: with the C8B function the max runs over the long legs of every attempt of the place (as the
+    # deviation term), not only the issued one
+    legs_u = all_long if can_hai_dau is not None else longs
+    cap_legs = {id(lg) for lg in longs}                    # HCH2-3: the F9 replay (bao_q) covers the issued run only
     if q is None or du_m is None:
         res['ly_do'].append('thieu q, du_m (xoay_v1)')
+        thieu_hang.append('u_q')
         u_q = 0.0
     else:
         qn = math.hypot(*q)
         u_q = 0.0
-        for lg in longs:
+        for lg in legs_u:
+            bao = bao_q and id(lg) in cap_legs
+            if can_hai_dau is not None and not bao:        # HCH1-7: F9 replay holds the q turn term: not needed
+                v = can(lg['p_tag_a'], lg['p_tag_b'])
+                hd_thieu = hd_thieu or v is None
+                psi_hai_dau = None if v is None else v
             # ||mean R_b - mean R_a||_2 of the window rotation matrices (HCC1-12), and the turn error of q from the
             # error of the DIFFERENCE of the two end headings (both half-split errors, opposite signs, added)
             dR = math.hypot(lg['cs_b'][0] - lg['cs_a'][0], lg['cs_b'][1] - lg['cs_a'][1])
             # HCC2-8: the bound of the end-heading difference comes from C8B (u_psi_hai_dau_rad); the half-split
             # spread of the two windows only enters as a floor (window noise), never as the bound itself
             u_hd = max(lg['nua_a'] + lg['nua_b'], psi_hai_dau or 0.0)
-            term = dR * du_m + (0.0 if bao_q else qn * 2 * math.sin(u_hd / 2))
+            term = dR * du_m + (0.0 if (bao_q and id(lg) in cap_legs) else qn * 2 * math.sin(u_hd / 2))
             u_q = max(u_q, term / lg['L_m'])
-    if q is not None and not bao_q and psi_hai_dau is None:
+    if q is not None and du_m is not None and (not bao_q or len(legs_u) > len(longs)) \
+            and (psi_hai_dau is None or hd_thieu):
         res['ly_do'].append('thieu can sai hieu huong hai dau (C8B u_psi_hai_dau_rad) cho u_q')
+        thieu_hang.append('u_q')
     eps = [lg['eps'] for lg in longs]
     eps_thieu = any(not math.isfinite(x) for x in eps)            # HCC1-9: no evidence -> gate fails, not 0
     eps = [x if math.isfinite(x) else 0.0 for x in eps]
-    u_yaw = max(math.asin(min(2 * math.sin(e_ / 2) * lg['path'] / lg['Ls_m'], 1.0)) for e_, lg in zip(eps, longs))
+    # HCB4: a_l no longer uses the IMU. A camera heading error in motion turns C by its PATH-WEIGHTED MEAN, so
+    # u_yaw = largest |eps_tb| (camera - IMU, the straight line through the two end windows taken off); the static
+    # part by position belongs to the C8B two-end bound (u_psi_cuc)
+    u_yaw = max((abs(lg['eps_tb']) for lg in longs if math.isfinite(lg['eps_tb'])), default=0.0)
+    if not cap.get('neo_san'):
+        res['ly_do'].append('khung khong neo moc san (huong camera co the troi)')
+    if tc.get('sigma') is None:
+        res['ly_do'].append('khong bu truot cheo: ' + str(tc.get('ly_do')))
+    res['troi_imu'] = dict(cap.get('troi_imu') or {},
+                           cam_imu_hai_dau_deg=[math.degrees(lg['cam_imu']) if math.isfinite(lg['cam_imu']) else None
+                                                for lg in longs],
+                           cach='chi thong tin (HCB4): a_l khong dung IMU; yaw_dong neo hai dau doan nen IMU troi deu '
+                                'khong anh huong')
+    if can_hai_dau is not None:
+        # design v4 3.3: u_psi_cuc = max over the long legs of the bound between the start window of the leg (at
+        # the extreme, where a takes psi') and the reference window (where psi_chuan_k is taken)
+        # HCH2-4: the reference end is the tag centre of the F6 frame set (khung_chung) when given
+        if isinstance(p_ref_tag, str):                     # HCV3-4: F6 frames not all found with a tag centre
+            can_why.append('dau chuan: khong dung lai du moi khung F6 (tam ma huu han)')
+            p_ref = None
+        else:
+            p_ref = p_ref_tag if p_ref_tag is not None else cap['windows'][0].get('p_tag')
+        vals = [None if p_ref is None else can(lg['p_tag_a'], p_ref) for lg in legs_u]
+        if any(v is None for v in vals):
+            psi_cuc = None
+        else:
+            psi_cuc, psi_cuc_chot = max(vals), True
     if psi_cuc is None:
         res['ly_do'].append('thieu can huong camera hai dau (C8B)')
+        thieu_hang.append('u_psi_cuc')
         u_cuc = 0.0
     else:
         u_cuc = float(psi_cuc)
@@ -933,9 +1214,10 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
     u_a = dev + u_map + u_enc + u_q + u_yaw + u_cuc
     gates = dict(
         do_tan=spread <= math.radians(SPREAD_MAX_DEG),
-        ti_le=all(RATIO_LO <= lg['ti_le'] <= RATIO_HI for lg in longs)
+        # HCB4: range on the raw and on the compensated ratio, spread on the compensated one
+        ti_le=all(RATIO_LO <= lg[k] <= RATIO_HI for lg in longs for k in ('ti_le', 'ti_le_tho'))
         and (max(lg['ti_le'] for lg in longs) - min(lg['ti_le'] for lg in longs)) <= RATIO_SPREAD,
-        thang_hang=perp_offsets(cap['windows'][:7]) <= PERP_MAX_M,      # the 7 stops of 12b only
+        thang_hang=cap['thang_hang_m']['bu'] <= PERP_MAX_M,      # the 7 stops of 12b, slip drift taken off
         yaw_dong=not eps_thieu and all(x <= math.radians(EPS_YAW_MAX_DEG) for x in eps),
         e_hieu_hop_le=not bad,
     )
@@ -959,16 +1241,29 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
     if neo is None:
         res['ly_do'].append('thieu psi_chuan_k (F6)')
     failed = [k for k, v in gates.items() if not v]
-    res['ly_do'] += bad
+    res['ly_do'] += bad + [f'can C8B: {w}' for w in can_why]
     if failed:
         res['trang_thai'] = 'chua_ket_luan'
         res['ly_do'] += failed
     elif res['ly_do']:
         res['trang_thai'] = 'chan_doan'
-    out = dict(res, a_k_deg=math.degrees(a), u_a_k_deg=math.degrees(u_a), do_tan_deg=math.degrees(spread),
-               u_hang_deg=dict(lech_lon_nhat=math.degrees(dev), u_map=math.degrees(u_map), u_enc=math.degrees(u_enc),
-                               u_q=math.degrees(u_q), u_yaw=math.degrees(u_yaw), u_psi_cuc=math.degrees(u_cuc)),
-               u_q_gom_xoay_q=not bao_q, cong=gates, giu_ngoai=giu_ngoai, vet_thuc=vet)
+    hang = dict(lech_lon_nhat=math.degrees(dev), u_map=math.degrees(u_map), u_enc=math.degrees(u_enc),
+                u_q=math.degrees(u_q), u_yaw=math.degrees(u_yaw), u_psi_cuc=math.degrees(u_cuc))
+    # HCH1-4: with the C8B bound function a missing bound is null, and so is the sum (the gates above used the
+    # partial sum: smaller threshold, stricter); without it the earlier output is kept (listed in u_hang_thieu)
+    rong = thieu_hang if can_hai_dau is not None else []
+    for k in rong:
+        hang[k] = None
+    out = dict(res, a_k_deg=math.degrees(a), u_a_k_deg=None if rong else math.degrees(u_a),
+               do_tan_deg=math.degrees(spread), do_tan_tho_deg=math.degrees(spread_tho),
+               truot_cheo=dict(tc, cach='HCB4: sigma = (tb ti_le_tho doan lui - tb ti_le_tho doan toi)/2 tren bon doan dai; '
+                                        'E bu = E + sigma*|E_x|*(-1, +1) (duong cheo FL-RR); a_k = tb vong a_l_tho; '
+                                        'lech_lon_nhat tren a_l_tho; do_tan, ti_le (tan), thang_hang tren so da bu'),
+               thang_hang_mm=dict(tho=1e3 * cap['thang_hang_m']['tho'], bu=1e3 * cap['thang_hang_m']['bu']),
+               u_hang_deg=hang, u_hang_thieu=sorted(set(thieu_hang)),
+               u_q_gom_xoay_q=(not bao_q) or len(legs_u) > len(longs),       # HCV3-5: some leg carries it
+               u_q_bao_boi_f9=sorted({tid for tid, an_, _ in attempts if tid == cap_id}) if bao_q else [],
+               cong=gates, giu_ngoai=giu_ngoai, vet_thuc=vet)
     if neo is not None:
         out['phi_hat_chuan_k_deg'] = math.degrees(wrap(math.radians(neo) - a))
         out['u_phi_hat_chuan_k_deg'] = out['u_a_k_deg']
@@ -1113,6 +1408,14 @@ def cmd_cua_so(a):
             raise AError(f'{a.track}: {k_t} khac file dua vao cua_so')
     S = json.load(open(a.session, encoding='utf-8')) if a.session else {}
     ses_sha = sha256(a.session) if a.session else a.session_sha256
+    # F8 (T9b, CODE 20/11): lan_lap_id of this 12b from NHACTAM lan_lap_v1 run 1; read before any file is written
+    ll_id, ll_why, ll_sha = None, 'chua co --lan-lap (F8 lan_lap_v1 cua NHACTAM)', None
+    lan_lap, ra_dir = getattr(a, 'lan_lap', None), getattr(a, 'ra', None)
+    if lan_lap:
+        ll_id, ll_why, ll_sha = read_lan_lap(lan_lap, A['thu_id'], A['cho'], a.a6, clip_sha, sha256(a.frames))
+    ra = ra_dir or a.dir                     # run 2 (with --a6 --xoay --lan-lap) writes to a new folder (mode x)
+    if ra_dir:
+        os.makedirs(ra, exist_ok=True)
     pos = stop_positions(A['segs'])
     rows = []
     roles = window_roles(A['segs'])
@@ -1137,7 +1440,7 @@ def cmd_cua_so(a):
         pr = f2_problems(r)
         if pr:
             raise AError(f"F2 {r['loai']} {r['chi_so']}: {pr}")
-    out = os.path.join(a.dir, 'cua_so_v1.jsonl')
+    out = os.path.join(ra, 'cua_so_v1.jsonl')
     with open(out, 'x', encoding='utf-8') as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + '\n')
@@ -1149,13 +1452,12 @@ def cmd_cua_so(a):
              for k, v in (('clip', a.clip), ('session', a.session), ('frames', a.frames), ('track', a.track),
                           ('dets', a.dets), ('log', A['log_path']), ('sender', os.path.join(a.dir, 'sender.txt')),
                           ('lich', os.path.join(a.dir, 'lich.csv')), ('cua_so_v1', out), ('a6', a.a6),
-                          ('xoay', a.xoay)) if v]
-    # HCC2-7: 'khoa' needs every source file AND the keys made from them (dets_fp; lan_lap_id of NHACTAM, not
-    # available yet: F5 stays chan_doan until the F8 lan_lap_v1 contract is wired)
-    lan_lap_id = None
+                          ('xoay', a.xoay), ('lan_lap', lan_lap)) if v]
+    # HCC2-7: 'khoa' needs every source file AND the keys made from them (dets_fp; lan_lap_id of NHACTAM from F8)
     src_ok = (all((a.clip, a.session, a.dets, a.a6, a.xoay)) and dets_fingerprint(a.dets) is not None
-              and lan_lap_id is not None)
-    doan = dict(schema='c8_hc_doan_12b_v1', thu_id=A['thu_id'], cho=A['cho'], lan_lap_id=None,
+              and ll_id is not None)
+    doan = dict(schema='c8_hc_doan_12b_v1', thu_id=A['thu_id'], cho=A['cho'], lan_lap_id=ll_id,
+                lan_lap_v1_sha256=ll_sha, lan_lap_id_ly_do=ll_why,
                 trang_thai=an['chuoi'] if src_ok else 'chan_doan', clip=a.clip, clip_sha256=clip_sha, session_sha256=ses_sha,
                 frames_sha256=sha256(a.frames), track_sha256=sha256(a.track), cua_so_v1_sha256=sha256(out),
                 esp32_sha256=sha256(A['log_path']), commit_hil=commit_hil(),
@@ -1182,7 +1484,7 @@ def cmd_cua_so(a):
     pr = f5_problems(doan)
     if pr:
         raise AError(f'F5: {pr}')
-    with open(os.path.join(a.dir, 'doan_12b_v1.json'), 'x', encoding='utf-8') as f:
+    with open(os.path.join(ra, 'doan_12b_v1.json'), 'x', encoding='utf-8') as f:
         json.dump(doan, f, ensure_ascii=False, indent=1)
     print(f"D={an['D']:.3f} s u_D={an['u_D']:.3f} s chuoi={an['chuoi']}")
     for lg in an['legs']:
@@ -1200,21 +1502,154 @@ def _block(j, cho):
     return (j.get('cho') or {}).get(cho) or j
 
 
-def read_neo(path, cho, ref_row):
-    """psi_chuan_k_deg of F6 (NHACTAM) after checking it was made on the ref_12b window of the issued attempt
-    (contract F6; HCC1-10): clip_sha256 equal, khung_chung_sha256 equal to the window's khung_sha256 or
-    khung_ma_hop_le_sha256 (which of the two NHACTAM hashes is not fixed in the contract); else AError (code 2)."""
-    b = _block(json.load(open(path, encoding='utf-8')), cho)
-    for k in ('psi_chuan_k_deg', 'clip_sha256', 'khung_chung_sha256'):
-        if k not in b:
-            raise AError(f'{path}: {cho} thieu {k}')
+_KHAC = object()
+
+
+def _meta(m, k):
+    """A key of the window meta of NHACTAM (its internal name, e.g. clip_sha) or the contract name (clip_sha256);
+    HCV3-3: both present and different -> a value that matches nothing (the window is refused)."""
+    if k in m and k + '256' in m and m[k] != m[k + '256']:
+        return _KHAC
+    return m.get(k, m.get(k + '256'))
+
+
+def read_neo(path, cho, ref_row, want_ids=False):
+    """psi_chuan_k_deg of F6 (NHACTAM hieu_chuan_neo_v1) after checking it was made on the ref_12b window of the
+    issued attempt (contract F6; HCC1-10; NHACTAM 19/11 via CODE; Codex HCG1-1..6). khung_chung of NHACTAM is
+    (frames through the anchor gate) & khung_ma_hop_le & (A6 valid), so it equals neither khung_sha256 nor
+    khung_ma_hop_le_sha256 of the window. The check: the file trang_thai is 'dat'; the standard of THIS run is
+    chuan_12b['<cho>|<luot_id of the ref_12b row>'] (or cho[cho] when it names that run), 'dat', with cho and
+    luot_id of the run; its clip_sha256 and frames_sha256 equal those of the ref_12b row; exactly one ref_12b window
+    in cua_so[*] with meta cho, luot, clip_sha, frames_sha of the run carries the same khung_chung_sha256; its
+    khung_chung.id are distinct integers inside khung_ma_hop_le of the ref_12b row; sha256 of the sorted IDs joined
+    by commas ("1,2,...") = khung_chung_sha256; psi finite. Anything else, malformed files included: AError (code 2)."""
     if ref_row is None:
         raise AError('F6 needs the ref_12b row of cua_so_v1.jsonl of the issued attempt (run cua_so first)')
+    try:
+        v, ids = _read_neo(path, cho, ref_row)
+        return (v, ids) if want_ids else v
+    except AError:
+        raise
+    except (AttributeError, TypeError, ValueError, OverflowError, KeyError, RecursionError) as exc:  # HCG1-6
+        raise AError(f'{path}: F6 sai dang ({type(exc).__name__}: {exc})')
+
+
+def _read_neo(path, cho, ref_row):
+    j = json.load(open(path, encoding='utf-8'))
+    if not isinstance(j, dict) or j.get('trang_thai') != 'dat':                          # HCG1-4
+        raise AError(f"{path}: trang_thai toan file {j.get('trang_thai') if isinstance(j, dict) else None!r}")
+    luot = ref_row.get('luot_id')
+    if not luot:
+        raise AError('ref_12b row without luot_id')
+    b = (j.get('chuan_12b') or {}).get(f'{cho}|{luot}')                                    # HCG1-1
+    if b is None:
+        c = (j.get('cho') or {}).get(cho)
+        b = c if isinstance(c, dict) and c.get('luot_id') == luot else None
+    if not isinstance(b, dict):
+        raise AError(f'{path}: khong co ban ghi chuan cua {cho}|{luot}')
+    if b.get('trang_thai') != 'dat':
+        raise AError(f"{path}: {cho}|{luot} trang_thai {b.get('trang_thai')!r} ({b.get('ly_do', '')})")
+    if b.get('cho') != cho or b.get('luot_id') != luot:                                     # HCG1-2
+        raise AError(f"{path}: ban ghi chuan cua {b.get('cho')}|{b.get('luot_id')}, can {cho}|{luot}")
+    c = (j.get('cho') or {}).get(cho)
+    n_cho = sum(1 for k in (j.get('chuan_12b') or {}) if str(k).split('|', 1)[0] == cho)
+    keys = ('trang_thai', 'cho', 'luot_id', 'clip_sha256', 'frames_sha256', 'khung_chung_sha256', 'psi_chuan_k_deg')
+    if n_cho == 1 and c is not b:
+        # HCG2-1, HCV3-3: one 12b run at the place: the writer puts the same record in cho[cho] and chuan_12b; both
+        # must be there and agree on every key (a block without them is not that record)
+        if not isinstance(c, dict) or any(c.get(k) != b.get(k) for k in keys):
+            raise AError(f'{path}: cho[{cho}] va chuan_12b[{cho}|{luot}] khac nhau')
+    elif n_cho > 1 and isinstance(c, dict) and (c.get('trang_thai') == 'dat' or 'psi_chuan_k_deg' in c):
+        # several runs: the writer leaves an aggregate block (chua_ket_luan, no psi); a record there contradicts it
+        raise AError(f'{path}: cho[{cho}] la ban ghi trong khi cho co {n_cho} luot 12b')
+    for k in ('psi_chuan_k_deg', 'clip_sha256', 'khung_chung_sha256', 'frames_sha256'):
+        if b.get(k) is None or b.get(k) == '':
+            raise AError(f'{path}: {cho}|{luot} thieu {k}')
     if b['clip_sha256'] != ref_row.get('clip_sha256'):
         raise AError(f'{path}: clip_sha256 khac cua so ref_12b')
-    if b['khung_chung_sha256'] not in (ref_row.get('khung_sha256'), ref_row.get('khung_ma_hop_le_sha256')):
-        raise AError(f'{path}: khung_chung_sha256 khac cua so ref_12b')
-    return float(b['psi_chuan_k_deg'])
+    if b['frames_sha256'] != ref_row.get('frames_sha256'):
+        raise AError(f'{path}: frames_sha256 khac cua so ref_12b')
+    cs = j.get('cua_so')
+    if not isinstance(cs, list) or not all(isinstance(c, dict) and isinstance(c.get('meta'), dict) for c in cs):
+        raise AError(f'{path}: cua_so phai la danh sach cua so co meta')                  # HCG2-3
+    # HCG2-2: the ref_12b window of this place and run must be unique BEFORE its sources are compared
+    wins = [c for c in cs if c['meta'].get('loai') == 'ref_12b' and c['meta'].get('cho') == cho
+            and c['meta'].get('luot') == luot]                                                # HCG1-2
+    if len(wins) != 1:
+        raise AError(f'{path}: {len(wins)} cua so ref_12b cua {cho}|{luot} (can dung 1)')
+    w0 = wins[0]
+    if _meta(w0['meta'], 'clip_sha') != ref_row.get('clip_sha256') \
+            or _meta(w0['meta'], 'frames_sha') != ref_row.get('frames_sha256') \
+            or w0.get('khung_chung_sha256') != b['khung_chung_sha256']:                       # HCG1-3
+        raise AError(f'{path}: cua so ref_12b cua {cho}|{luot}: clip, frames hay khung_chung_sha256 khac')
+    ids = (wins[0].get('khung_chung') or {}).get('id')
+    if (not isinstance(ids, list) or not ids
+            or not all(isinstance(i, int) and not isinstance(i, bool) for i in ids)       # HCG1-5
+            or len(set(ids)) != len(ids)):
+        raise AError(f'{path}: khung_chung.id phai la danh sach so nguyen phan biet, khong rong')
+    ok_ids = ref_row.get('khung_ma_hop_le') or []
+    if not set(ids) <= {int(i) for i in ok_ids}:
+        raise AError(f'{path}: khung_chung khong nam trong khung_ma_hop_le cua ref_12b')
+    if hashlib.sha256(','.join(str(i) for i in sorted(ids)).encode()).hexdigest() != b['khung_chung_sha256']:
+        raise AError(f'{path}: sha256 cua khung_chung.id khac khung_chung_sha256')
+    v = float(b['psi_chuan_k_deg'])
+    if not math.isfinite(v):
+        raise AError(f'{path}: psi_chuan_k_deg khong huu han')
+    return v, sorted(ids)
+
+
+def _f2_rows(path):
+    """Window rows of a cua_so_v1 (F2) file: JSON lines, a JSON list, or {schema, cua_so|dong|windows: [...]}."""
+    txt = open(path, encoding='utf-8').read()
+    try:
+        o = json.loads(txt)
+    except ValueError:
+        o = [json.loads(s) for s in txt.splitlines() if s.strip()]
+    if isinstance(o, dict):
+        o = next((o[k] for k in ('cua_so', 'dong', 'windows') if isinstance(o.get(k), list)), None)
+    if not isinstance(o, list) or not all(isinstance(r, dict) for r in o):
+        raise AError(f'{path}: khong doc duoc danh sach cua so F2')
+    return o
+
+
+def read_lan_lap(path, thu_id, cho, a6_path, clip_sha, frames_sha):
+    """(lan_lap_id or None, reason or None, sha256 of the file) of a 12b attempt from F8 lan_lap_v1 of NHACTAM (run 1
+    of lan_lap, without --f15 / --truc-xe; CODE 20/11, sequence T9, T9b). F8 has one luot[] record per car run
+    (windows pre/post), none for a 12b attempt: the placement of the 12b is the lan_lap_id that F8 gives to the runs of
+    the same place it verified against this 12b as standard (luot[].chuan_12b = thu_id; a record with luot_id = thu_id
+    counts too). Exactly one value -> that id; none, or several -> None with the reason (F5 stays chan_doan).
+    A file that is not this session's F8 is refused (AError, code 2): schema lan_lap_v1; tam_id of the file and of every
+    record = c8b_a6_v2.tam_id of --a6; a6.sha256 = the --a6 file; its F2 file present with the sha256 it names and
+    holding the ref_12b window of this attempt (same luot_id, cho, clip_sha256, frames_sha256)."""
+    tam = a6_tam_id(a6_path)
+    if tam is None:
+        raise AError('--lan-lap can --a6 co tam_id (c8b_a6_v2.tam_id)')
+    j = json.load(open(path, encoding='utf-8'))
+    if not isinstance(j, dict) or j.get('schema') != 'lan_lap_v1':
+        raise AError(f'{path}: khong phai lan_lap_v1')
+    if j.get('tam_id') != tam:
+        raise AError(f"{path}: tam_id {j.get('tam_id')!r} khac tam_id cua A6 {tam!r}")
+    if (j.get('a6') or {}).get('sha256') != sha256(a6_path):
+        raise AError(f'{path}: a6.sha256 khac file --a6')
+    f2, f2_sha = j.get('cua_so_v1_file'), j.get('cua_so_v1_sha256')
+    if not f2 or not os.path.isfile(f2) or sha256(f2) != f2_sha:
+        raise AError(f'{path}: file F2 cua F8 ({f2}) khong co hay sha256 khac cua_so_v1_sha256')
+    if not any(r.get('luot_id') == thu_id and r.get('cho') == cho and r.get('loai') == 'ref_12b'
+               and r.get('clip_sha256') == clip_sha and r.get('frames_sha256') == frames_sha for r in _f2_rows(f2)):
+        raise AError(f'{path}: F2 cua F8 khong co cua so ref_12b cua {thu_id} ({cho}) voi cung clip, frames')
+    luot = j.get('luot')
+    if not isinstance(luot, list) or not all(isinstance(r, dict) for r in luot):
+        raise AError(f'{path}: luot phai la danh sach ban ghi')
+    if any(r.get('tam_id') != tam for r in luot):
+        raise AError(f'{path}: co luot cua tam khac {tam!r}')
+    ids = {r['lan_lap_id'] for r in luot if r.get('cho') == cho and thu_id in (r.get('chuan_12b'), r.get('luot_id'))
+           and isinstance(r.get('lan_lap_id'), str) and r['lan_lap_id']}
+    f_sha = sha256(path)
+    if len(ids) == 1:
+        return ids.pop(), None, f_sha
+    if not ids:
+        return None, f'F8 khong co luot nao cua {cho} xac minh lan lap voi 12b {thu_id} (chuan_12b)', f_sha
+    return None, f'F8 cho 12b {thu_id} nhieu lan_lap_id {sorted(ids)}', f_sha
 
 
 def read_e_hieu(path, doan_path):
@@ -1238,6 +1673,66 @@ def read_e_hieu(path, doan_path):
             raise AError(f'{path}: dong thieu i / e_hieu_m')
         out[int(x['i'])] = float(x['e_hieu_m'])
     return out, bool(j.get('bao_q_xoay', False))
+
+
+def _phan_ok(r):
+    """HCH2-5: the parts of a C8B bound are finite, >= 0 and add up to u_rad, for the two ways C8B combines them:
+    cong_rieng (A3 and A6 residual at both ends) and replay_chung_theo_ca (worst H32 case + A6 residual without
+    U_meo_E at both ends, design 2b). Any other form: not accepted."""
+    ph = r.get('phan') if isinstance(r.get('phan'), dict) else {}
+    g = r.get('ghep')
+    if g == 'cong_rieng':
+        parts = list(ph.get('A3_rad') or []) + list(ph.get('A6du_rad') or [])
+        n = 4
+    elif g == 'replay_chung_theo_ca':
+        parts = [ph.get('ca_rad')] + list(ph.get('A6du_khong_meo_rad') or [])
+        n = 3
+    else:
+        return False
+    if len(parts) != n or not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+                                  and v >= 0 for v in parts):
+        return False
+    u = float(r['u_rad'])
+    return abs(sum(parts) - u) <= 1e-12 * max(1.0, abs(u))
+
+
+def can_hai_dau_c8b(a6_path, kc_path, tam_id, nguon):
+    """(p1, p2) -> (u [rad] or None, reasons) from c8b_a6.u_psi_hai_dau_rad (C8B hil feat/c8b-3b-ga 2539ee8; CODE
+    20/11 local_c29a2de2): kc = KIEMCHEO kiem_cheo.json (c7_kiem_cheo_v7, --xuat-phat); C8B checks A3 INSIDE the
+    function (version, quy_ve_ma_noc, ma_ao, du_lieu_du, plumb, per place mot_phuong / ngoai_suy / cap_hong) and
+    returns thieu with reasons, so there is no A3 gate here (CODE 20/11; replaces HCH1-5, HCH2-2). p1, p2 = tag
+    centres on the floor (car_pose frame, m). luot, dai = None: the largest U_chuyen.dong over runs and bands
+    (the 12b windows are still windows of calibration attempts, not C8 target runs; [CACH HIEU], conservative).
+    Needs --a6 and --kc together, non-empty, and an A6 file with tam_id (else AError, code 2); tam_id = c8b_a6_v2.tam_id
+    (HCV3-1, CODE 20/11), --tam-id optional and only compared to it. c8b_a6 not merged yet, the A6 file refused,
+    an error inside the function or parts that do not add up: every call gives None with the reason (the result stays
+    chan_doan, the term null)."""
+    if not (a6_path and kc_path and tam_id):
+        raise AError('--kc can di cung --a6 co tam_id (ham can hai dau cua C8B), khong rong')
+    kc = json.load(open(kc_path, encoding='utf-8'))
+    nguon.append(dict(vai_tro='kiem_cheo', duong_dan=os.path.abspath(kc_path), sha256=sha256(kc_path)))
+    try:
+        import c8b_a6 as c8a                                     # CODE_C8B, after the common merge
+        a6o = c8a.load_a6(a6_path)
+    except ImportError:
+        return lambda p1, p2: (None, ['c8b_a6 chua gop'])
+    except Exception as exc:                                     # noqa: BLE001  A6Error / bad file: no bound
+        why = f'A6 khong doc duoc ({type(exc).__name__}: {exc})'
+        return lambda p1, p2: (None, [why])
+    nguon.append(dict(vai_tro='c8b_a6_ham', duong_dan=os.path.abspath(c8a.__file__), sha256=sha256(c8a.__file__)))
+
+    def fn(p1, p2):
+        try:
+            r = c8a.u_psi_hai_dau_rad(a6o, kc, [float(v) for v in p1], [float(v) for v in p2], tam_id,
+                                      luot=None, dai=None)
+        except Exception as exc:                                 # noqa: BLE001  HCH1-6: a bad A6 file is no bound
+            return None, [f'ham C8B loi ({type(exc).__name__}: {exc})']
+        if not isinstance(r, dict) or r.get('trang_thai') != 'dat' or r.get('u_rad') is None:
+            return None, [str(w) for w in ((r or {}).get('ly_do') or ['trang_thai khac dat'])]
+        if not _phan_ok(r):
+            return None, [f"thanh phan can C8B khong hop le ({r.get('ghep')}): {r.get('phan')}"]
+        return float(r['u_rad']), []
+    return fn
 
 
 def read_can_c8b(path, cho):
@@ -1320,9 +1815,14 @@ def cmd_tinh(a):
                 nguon.append(dict(vai_tro='cua_so_v1', duong_dan=os.path.abspath(p), sha256=sha256(p)))
     e = None
     bao_q = False
+    ll_f5 = None
     if a.e_hieu:
-        dp = os.path.join(a.cap, 'doan_12b_v1.json')
+        dp = a.doan or os.path.join(a.cap, 'doan_12b_v1.json')
         e, bao_q = read_e_hieu(a.e_hieu, dp)
+        f5 = json.load(open(dp, encoding='utf-8'))
+        if f5.get('thu_id') != cap_id or f5.get('cho') != a.cho:
+            raise AError(f'{dp}: F5 cua {f5.get("thu_id")} ({f5.get("cho")}), khong phai luot cap {cap_id} ({a.cho})')
+        ll_f5 = f5.get('lan_lap_id')
         nguon += [dict(vai_tro='e_hieu_m', duong_dan=os.path.abspath(a.e_hieu), sha256=sha256(a.e_hieu)),
                   dict(vai_tro='doan_12b_v1', duong_dan=os.path.abspath(dp), sha256=sha256(dp))]
     q = du = None
@@ -1333,13 +1833,28 @@ def cmd_tinh(a):
     if a.a6:
         nguon.append(dict(vai_tro='c8b_a6_v2', duong_dan=os.path.abspath(a.a6), sha256=sha256(a.a6)))
     neo = None
+    p_ref_tag = None
     if a.neo:
-        neo = read_neo(a.neo, a.cho, cap_ref)
+        neo, neo_ids = read_neo(a.neo, a.cho, cap_ref, want_ids=True)
+        p_ref_tag = 'thieu'                                # HCV3-4: no fallback to window 0 once F6 is given
+        if cap_F is not None:                              # HCH2-4: tag centre over the F6 common frames
+            idx = np.asarray(cap_F['idx'])
+            tx, ty = cap_F.get('tx', cap_F['x']), cap_F.get('ty', cap_F['y'])
+            pos = [np.flatnonzero(idx == i) for i in neo_ids]
+            if all(len(k) == 1 and np.isfinite(tx[k[0]]) and np.isfinite(ty[k[0]]) for k in pos):
+                sel = np.array([k[0] for k in pos])
+                p_ref_tag = np.array([tx[sel].mean(), ty[sel].mean()])
         nguon.append(dict(vai_tro='hieu_chuan_neo', duong_dan=os.path.abspath(a.neo), sha256=sha256(a.neo)))
     psi_cuc, psi_hd, chot = None, None, False
     if a.can_c8b:
         psi_cuc, psi_hd, chot = read_can_c8b(a.can_c8b, a.cho)
         nguon.append(dict(vai_tro='can_c8b', duong_dan=os.path.abspath(a.can_c8b), sha256=sha256(a.can_c8b)))
+    can_fn = None
+    if a.kc is not None or a.tam_id is not None:                 # HCH1-8: an empty value is not 'absent'
+        tam = a6_tam_id(a.a6)                                    # HCV3-1: the plate is c8b_a6_v2.tam_id
+        if a.tam_id is not None and a.tam_id != tam:
+            raise AError(f'--tam-id {a.tam_id!r} khac tam_id cua A6 {tam!r} (tam_id khai mot lan trong c8b_a6_v2)')
+        can_fn = can_hai_dau_c8b(a.a6, a.kc, tam, nguon)
     vet = None
     if a.moc and cap_F is not None:
         import c8_hc_vet as cv
@@ -1361,10 +1876,13 @@ def cmd_tinh(a):
     need = sorted(k for k, lo in window_roles(load_attempt(a.cap)['segs']) if lo in ('ref_12b', 'dung_12b'))
     del roles
     r = place_result(a.cho, attempts, cap_id, e_hieu=e, q=q, du_m=du, neo=neo, psi_cuc=psi_cuc, cap_ok=cap_ok,
-                     cap_why=cap_why, bao_q=bao_q, vet=vet, psi_cuc_chot=chot, need_windows=need, psi_hai_dau=psi_hd)
+                     cap_why=cap_why, bao_q=bao_q, vet=vet, psi_cuc_chot=chot, need_windows=need, psi_hai_dau=psi_hd,
+                     can_hai_dau=can_fn, p_ref_tag=p_ref_tag)
     r = dict(schema='truc_xe_v1', version=VERSION, commit_hil=commit_hil(), nguon=nguon,
-             mien_hieu_luc=dict(cho=a.cho, thu_id_cap=cap_id, lan_lap_id=None,
-                                ghi_chu='cung buoi, cung lan lap tam (lan_lap_v1 cua NHACTAM chua co: chua xac minh)'),
+             mien_hieu_luc=dict(cho=a.cho, thu_id_cap=cap_id, lan_lap_id=ll_f5,
+                                ghi_chu='cung buoi, cung lan lap tam' + (
+                                    ' (lan_lap_id cua F5, tu F8 lan_lap_v1 luot 1 cua NHACTAM)' if ll_f5 else
+                                    ' (khong co lan_lap_id: F5 chua noi F8, chua xac minh)')),
              **r)
     txt = json.dumps(r, ensure_ascii=False, indent=1, default=float)
     if a.out:
@@ -1373,7 +1891,9 @@ def cmd_tinh(a):
     if r['a_k_deg'] is None:
         print(f"{a.cho}: trang_thai {r['trang_thai']} {r['ly_do']}")
     else:
-        print(f"{a.cho}: a = {r['a_k_deg']:+.3f} deg, u_a = {r['u_a_k_deg']:.3f} deg, do tan {r['do_tan_deg']:.3f} deg, "
+        ua = (f"{r['u_a_k_deg']:.3f}" if r['u_a_k_deg'] is not None
+              else 'null (' + ','.join(r.get('u_hang_thieu') or []) + ')')      # HCH2-1
+        print(f"{a.cho}: a = {r['a_k_deg']:+.3f} deg, u_a = {ua} deg, do tan {r['do_tan_deg']:.3f} deg, "
               f"trang_thai {r['trang_thai']} {r['ly_do']}")
     return 0 if r['trang_thai'] in ('khoa', 'chan_doan') and all(r['cong'].values()) else 1
 
@@ -1407,8 +1927,18 @@ def video_checks(A, F, info):
         add('bon_doan_dai', ok4, f'{len(longs)}/4')
         add('do_tan_tho', ok4 and spread <= math.radians(SPREAD_VIDEO_DEG), f'{math.degrees(spread):.3f} deg')
         eps = [lg['eps'] for lg in longs]
+        f3 = lambda x: 'thieu' if not math.isfinite(x) else f'{math.degrees(x):.3f}'          # noqa: E731
+        tc = an.get('truot_cheo') or {}
         add('yaw_dong', ok4 and all(math.isfinite(x) and x <= math.radians(EPS_YAW_MAX_DEG) for x in eps),
-            ', '.join('thieu' if not math.isfinite(x) else f'{math.degrees(x):.3f}' for x in eps))
+            ', '.join(f3(x) for x in eps) + ' (camera - IMU, neo hai dau doan; lech hai dau '
+            + ', '.join(f3(lg['cam_imu']) for lg in longs) + ' deg)')
+        add('neo_moc_san', an.get('neo_san', False), 'khung khop lai camera theo moc san' if an.get('neo_san')
+            else 'khung KHONG neo moc san: huong camera co the troi')
+        add('thang_hang', an['thang_hang_m']['bu'] <= PERP_MAX_M,
+            f"{1e3 * an['thang_hang_m']['bu']:.2f} mm sau bu (tho {1e3 * an['thang_hang_m']['tho']:.2f})")
+        add('truot_cheo', True, (f"sigma {100 * tc['sigma']:+.3f} %, do tan chua bu "
+            f"{math.degrees(max(abs(wrap(x['a_l_tho'] - y['a_l_tho'])) for x in longs for y in longs)):.3f} deg"
+            if ok4 and tc.get('sigma') is not None else f"khong bu: {tc.get('ly_do', 'thieu doan')}"))
     if hasE:
         cov = e_coverage(F, A['log'], info['blocks'], an['D'])
         add('phu_E', len(cov) == 2 and all(c['vong'] >= E_COVER_TURNS and c['ho_s'] <= E_GAP_MAX_S for c in cov),
@@ -1453,6 +1983,9 @@ def main(argv=None):
     c.add_argument('--a6', default=None)
     c.add_argument('--xoay', default=None)
     c.add_argument('--session', default=None, help='session JSON of c7 (fit_ids, car_side_m, tag_h_m, sha256)')
+    c.add_argument('--lan-lap', default=None, help='lan_lap.json of NHACTAM (F8, run 1): lan_lap_id of this 12b; '
+                                                   'needs --a6 with tam_id')
+    c.add_argument('--ra', default=None, help='output folder (default DIR); run 2 with --lan-lap: a new folder')
     t = sub.add_parser('tinh')
     t.add_argument('--cho', required=True, choices=sorted(hs.PLACES))
     t.add_argument('--cap', required=True, help='attempt folder whose a is issued')
@@ -1462,7 +1995,12 @@ def main(argv=None):
     t.add_argument('--xoay', default=None)
     t.add_argument('--neo', default=None, help='hieu_chuan_neo.json of NHACTAM (F6)')
     t.add_argument('--e-hieu', default=None, help='e_hieu_m of KIEMCHEO (F9)')
+    t.add_argument('--doan', default=None, help='F5 doan_12b_v1.json the F9 was made from (default CAP/doan_12b_v1.json;'
+                                                ' run 2 of cua_so writes it to its --ra folder)')
     t.add_argument('--can-c8b', default=None, help='C8B file with u_psi_cuc_rad (two-end camera heading bound)')
+    t.add_argument('--kc', default=None, help='KIEMCHEO kiem_cheo.json (c7_kiem_cheo_v7) for c8b_a6.u_psi_hai_dau_rad')
+    t.add_argument('--tam-id', default=None, help='optional check: must equal c8b_a6_v2.tam_id of --a6 (the plate '
+                                                  'used for CAM and c8b_a6.u_psi_hai_dau_rad comes from the A6 file)')
     t.add_argument('--moc', default=None, help='moc_san_do_32.csv: real swept footprint (vet thuc)')
     t.add_argument('--vien-mm', type=float, default=10.0)
     t.add_argument('--d-vet-mm', type=float, default=20.0, help='tag centre to body box centre bound [de xuat]')

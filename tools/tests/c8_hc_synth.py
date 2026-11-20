@@ -37,11 +37,15 @@ def write_summary(csv_path, status='closed'):
 
 def make(d, cho='K1', phan='all', a_true_deg=0.7, q=(0.004, -0.003), lag=0.15, D=50.0, seed=1, noise_p=0.0003,
          noise_psi_deg=0.22, yaw_bias=None, cam_bias=None, cut=None, second_edge=False, rv_freeze=None,
-         wiggle=None, boot_after='e75f708f', rx_latency=0.003):
+         wiggle=None, boot_after='e75f708f', rx_latency=0.003, lost=None, sigma=0.0, lech_ngang=0.0):
     """Write one attempt folder; returns dict of the truth. Options:
     yaw_bias(t) rad added to the IMU yaw; cam_bias(t) rad added to the camera heading; cut=(t_from, t_to) zeroes
     sp_vx (ultrasonic cut before integration: the reference loses the distance); rv_freeze=(t_from, t_to) holds yaw;
-    wiggle=(t_from, t_to, amp_rad) real body rotation (half sine) not seen by a frozen RV when combined."""
+    wiggle=(t_from, t_to, amp_rad) real body rotation (half sine) not seen by a frozen RV when combined;
+    lost=[(t_from, t_to), ...] schedule times whose packets never arrive (Wi-Fi, session 2 20/11): the firmware keeps
+    the newest packet it has, its traj_age grows; sigma: HCB4 creep of the real car along the FL-RR diagonal, the
+    body moves sigma*|dx|*(-1, +1) more than the wheels say, forwards and backwards alike (session 2: 0.15-0.30 %);
+    lech_ngang: an even LATERAL-only drift lech_ngang*|dx| (not on the diagonal: the length ratio does not see it)."""
     rng = np.random.default_rng(seed)
     os.makedirs(d)
     segs = hs.schedule(cho, phan)
@@ -70,7 +74,12 @@ def make(d, cho='K1', phan='all', a_true_deg=0.7, q=(0.004, -0.003), lag=0.15, D
     # packets k = 0..total-1 received at t_s + k/50 + latency; the firmware keeps the newest one, run_active while
     # its age < 200 ms (main.c 524-525, 611), traj_age_ms = tick time - receive time (main.c 529-541; HCC1-4)
     t_rx = t_s + np.arange(total) / hs.SEND_HZ + rx_latency
-    last = np.searchsorted(t_rx, t, side='right') - 1                   # newest packet received by row i
+    keep = np.ones(total, bool)
+    for a0, a1 in (lost or []):
+        keep &= ~((t_rx >= a0 + t_s) & (t_rx < a1 + t_s))
+    kept = np.flatnonzero(keep)
+    lk = np.searchsorted(t_rx[kept], t, side='right') - 1
+    last = np.where(lk >= 0, kept[np.maximum(lk, 0)], -1)               # newest packet received by row i
     age = np.where(last >= 0, np.floor((t - t_rx[np.maximum(last, 0)]) * 1000.0 + 1e-9), -1.0)
     run = (last >= 0) & (age < 200.0)
     sp = np.zeros((n, 3))
@@ -118,7 +127,8 @@ def make(d, cho='K1', phan='all', a_true_deg=0.7, q=(0.004, -0.003), lag=0.15, D
     h0 = math.radians(h0)
     tc = np.arange(0.3, t_end - 0.3, 1 / 60.0) - D
     dxa = np.r_[0.0, np.diff(xa)]                              # the car moves along its own (turning) axis
-    Xs, Ys = np.cumsum(np.cos(tha) * dxa), np.cumsum(np.sin(tha) * dxa)
+    cx, cy = dxa - sigma * np.abs(dxa), (sigma + lech_ngang) * np.abs(dxa)     # body-frame step of the real car
+    Xs, Ys = np.cumsum(np.cos(tha) * cx - np.sin(tha) * cy), np.cumsum(np.sin(tha) * cx + np.cos(tha) * cy)
     xb, yb = np.interp(tc + D, t, Xs), np.interp(tc + D, t, Ys)
     thb = np.interp(tc + D, t, tha)
     hd = h0 + thb
