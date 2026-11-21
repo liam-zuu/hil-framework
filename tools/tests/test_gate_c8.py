@@ -421,9 +421,9 @@ def test_phan_loai_du_needed():
 
 # ── premise of the C8 lock (design section 9), other blocks ───────────────────────────────────────────────────
 
-def test_premise_needs_the_middle_clip():
+def test_premise_needs_the_clip_h_at_the_end_of_the_segment():
     d = _good()
-    d['tien_de_c8']['clip_h']['giua'] = None
+    d['tien_de_c8']['doan'][0]['cuoi'] = None
     with pytest.raises(GC.GateFileError, match='CAN LIAM QUYET'):
         GC.check(d)
 
@@ -585,15 +585,17 @@ def _luoi(goc, rid, cell, fg, u_max, outcome='dat', clip=None, fg_obj=None, ops=
 
 
 def _write_csv(goc, d):
-    """thu_tu_clip.csv from the chains in order (clip, buoc = cell, log_pi = the run's log), plus one row before."""
-    lines = ['clip,buoc,gio_pc_bam_quay,gio_pc_dung_quay,created_utc,log_pi,ghi_chu', 'IMG_0001,A2_H0a,,,,,clip H']
+    """thu_tu_clip.csv from the chains in order (clip, buoc = cell, log_pi = the run's log) between the two clips H at
+    the start of the camera segment and its clip H at the end (CODE 20/11 after C8 session 2)."""
+    lines = ['clip,buoc,gio_pc_bam_quay,gio_pc_dung_quay,created_utc,log_pi,ghi_chu', 'IMG_9000,H_a,,,,,clip H dau',
+             'IMG_9001,H_b,,,,,clip H dau']
     for c in d['o_c8']:
         for j, x in enumerate(c['chuoi']):
             b = c['o'] + (f'_lai{j}' if j else '')                    # a rerun row: <run code>_lai<n> (CODE 19/11)
             lines.append(f'{x["clip"]},{b},,,,{x["run_id"]}.csv,')
     for x in d.get('luot_k') or []:                                  # GC9-2: the K runs (no log for them here)
         lines.append(f'{x["clip"]},{x["run_id"]},,,,,')
-    lines.append('IMG_9002,H_m,,,,,clip H giua')
+    lines.append('IMG_9002,H_m,,,,,clip H cuoi doan')
     p = os.path.join(goc, 'thu_tu_clip.csv')
     with open(p, 'w', encoding='utf-8', newline='\n') as f:
         f.write('\n'.join(lines) + '\n')
@@ -636,7 +638,7 @@ def build_c8(tmp_path, levels=LEVELS, u_t=0.014, two=False):
     plan = [dict(o=f'{lv}_{c}', muc=lv, controller=c) for lv in levels for c in GC.CONTROLLERS]
     kh = _jw(goc, 'ke_hoach_c8.json', dict(format=GC.KE_HOACH_FORMAT, o=plan))
     d = GC.fake_gate(levels, u_t_s=u_t)
-    names = ('H_a', 'H_b', 'H_m', 'H_z')
+    names = ('H_a', 'H_b', 'H_m')                                      # one camera segment: dau1, dau2, cuoi
     clips = [_jw(goc, f'clip_h/{n}.json', dict(kind=GC.SESSION_KIND, ten=n, video=f'{n}_0{i}_IMG_900{i}.MOV',
                                                video_sha256=_h('video ' + n), **SESSION))
              for i, n in enumerate(names)]
@@ -701,7 +703,7 @@ def build_c8(tmp_path, levels=LEVELS, u_t=0.014, two=False):
     bc = {k: bc[k] for k in GC.CHUAN_U_DK}
     ks = _jw(goc, 'khoa_s7.json', dict(schema='c7_khoa_s7_v1', hang_so_s7={}, commit_hil='d' * 40))
     commit, when = _git_commit(goc, 'khoa_s7.json', LUC_S7)
-    kc = _jw(goc, 'kiem_cheo.json', dict(version=GC.KIEM_CHEO_VERSION,
+    kc = _jw(goc, 'kiem_cheo.json', dict(version=GC.KIEM_CHEO_VERSION, doan=dict(ten='doan2'),     # one per segment
                                          khoa_s7=dict(file='khoa_s7.json', sha256=ks['sha256'], git_commit=commit,
                                                       git_time=when)))
     all_runs = [c['chuoi'][0]['run_id'] for c in cells]
@@ -711,12 +713,13 @@ def build_c8(tmp_path, levels=LEVELS, u_t=0.014, two=False):
                                                 khoa_kiem_luc=dict(kiem_cheo=kc, khoa_s7=ks, git_commit=commit,
                                                                    git_time=when)))
     td = _jw(goc, 'tien_de_c8.json', dict(format=GC.TIEN_DE_FORMAT, ket_qua='dat', session_id='C8_buoi2',
-                                          vai_tro_clip_h=dict(zip(names, GC.TD_ROLES)),
+                                          doan=dict(ten='doan2'), vai_tro_clip_h=dict(zip(names, GC.TD_ROLES)),
                                           sha256=dict(sessions={n: c['sha256'] for n, c in zip(names, clips)},
                                                       kiem_cheo=kc['sha256'])))
     d.update(c8_dir='C8', written_by=dict(script='c8b_u', commit='c' * 40, dirty=False), ke_hoach_c8=kh, khoa_c8b=kv5,
              o_c8=cells, runs_c8=runs,
-             tien_de_c8=dict(buoi='C8_buoi2', clip_h=dict(dau=clips[:2], giua=clips[2], cuoi=clips[3]), file=td))
+             tien_de_c8=dict(buoi='C8_buoi2', doan=[dict(ten='doan2', dau=clips[:2], cuoi=clips[2], file=td,
+                                                         kiem_cheo=kc)]))
     d['chuan_u'].update(ho_so_c8=hs, dieu_kien={k: dict(trang_thai='dat', bang_chung=bc[k]) for k in GC.CHUAN_U_DK})
     d['chung_cu_muc'] = {k: dict(e_do={c: [f'R_{k}_{c}'] for c in GC.CONTROLLERS},
                                  g4={c: [f'R_{k}_{c}'] for c in GC.CONTROLLERS}) for k in levels}
@@ -903,30 +906,30 @@ def test_check_nguon_plan_and_premise(tmp_path):
     with pytest.raises(GC.GateFileError, match='plan locked'):
         GC.check_nguon(d, goc)
     d, goc = build_c8(tmp_path / 'b')
-    _rewrite(goc, d['tien_de_c8']['file'], lambda x: x.update(ket_qua='khong_dat'))
+    _rewrite(goc, d['tien_de_c8']['doan'][0]['file'], lambda x: x.update(ket_qua='khong_dat'))
     with pytest.raises(GC.GateFileError, match='CAN LIAM QUYET'):
         GC.check_nguon(d, goc)
     d, goc = build_c8(tmp_path / 'c')
-    _rewrite(goc, d['tien_de_c8']['file'], lambda x: x['sha256']['sessions'].pop('H_m'))
-    with pytest.raises(GC.GateFileError, match='four roles'):
+    _rewrite(goc, d['tien_de_c8']['doan'][0]['file'], lambda x: x['sha256']['sessions'].pop('H_m'))
+    with pytest.raises(GC.GateFileError, match='gives the roles'):
         GC.check_nguon(d, goc)
 
 
 def test_gc6_4_premise_by_role_and_session(tmp_path):
-    """GC6-4: the four clips H compared role by role (dau1, dau2, giua, cuoi), of this session, readable."""
+    """GC6-4: the clips H of a segment compared role by role (dau1, dau2, cuoi), of this session, readable."""
     d, goc = build_c8(tmp_path / 'a')
-    ch = d['tien_de_c8']['clip_h']
-    ch['giua'], ch['cuoi'] = ch['cuoi'], ch['giua']                    # same bytes, roles swapped
-    with pytest.raises(GC.GateFileError, match='role giua|in the middle|part of the session'):
+    ch = d['tien_de_c8']['doan'][0]
+    ch['dau'][0], ch['cuoi'] = ch['cuoi'], ch['dau'][0]                # same bytes, roles swapped
+    with pytest.raises(GC.GateFileError, match='role dau1|session order|camera segment'):
         GC.check_nguon(d, goc)
     d, goc = build_c8(tmp_path / 'b')
-    d['tien_de_c8']['buoi'] = 'C8_buoi1'
+    d['tien_de_c8']['doan'][0]['ten'] = 'doan1'
     with pytest.raises(GC.GateFileError, match='premise of session'):
         GC.check_nguon(d, goc)
     d, goc = build_c8(tmp_path / 'c')
-    _rewrite(goc, d['tien_de_c8']['clip_h']['dau'][1], lambda x: x.pop('fit_ids'))
-    _rewrite(goc, d['tien_de_c8']['file'],
-             lambda x: x['sha256']['sessions'].update(H_b=d['tien_de_c8']['clip_h']['dau'][1]['sha256']))
+    _rewrite(goc, d['tien_de_c8']['doan'][0]['dau'][1], lambda x: x.pop('fit_ids'))
+    _rewrite(goc, d['tien_de_c8']['doan'][0]['file'],
+             lambda x: x['sha256']['sessions'].update(H_b=d['tien_de_c8']['doan'][0]['dau'][1]['sha256']))
     with pytest.raises(GC.GateFileError, match='camera session file'):
         GC.check_nguon(d, goc)
 
@@ -1117,11 +1120,11 @@ def test_gc6_1_chain_against_the_clip_log(tmp_path):
     d, goc = build_c8(tmp_path / 'a')
     _add_lost(goc, d, 0, 1, ['he_do'], luoi_kw=dict(loai_hong=['he_do']))
     GC.check_nguon(d, goc)                                             # a lost run then its rerun: passes
-    _csv_edit(goc, d, lambda ls: ls[:2] + [ls[3], ls[2]] + ls[4:])      # rerun logged before the lost run
+    _csv_edit(goc, d, lambda ls: ls[:3] + [ls[4], ls[3]] + ls[5:])      # rerun logged before the lost run
     with pytest.raises(GC.GateFileError, match='in that order|GC9-4'):
         GC.check_nguon(d, goc)
     d, goc = build_c8(tmp_path / 'b')                                  # a physical run left out of the chain
-    _csv_edit(goc, d, lambda ls: ls[:2] + [f'IMG_X,{d["o_c8"][0]["o"]},,,,X.csv,'] + ls[2:])
+    _csv_edit(goc, d, lambda ls: ls[:3] + [f'IMG_X,{d["o_c8"][0]["o"]},,,,X.csv,'] + ls[3:])
     with pytest.raises(GC.GateFileError, match='none left out|GC9-4'):
         GC.check_nguon(d, goc)
     d, goc = build_c8(tmp_path / 'c')                                  # a figure-8 run outside the plan
@@ -1129,7 +1132,7 @@ def test_gc6_1_chain_against_the_clip_log(tmp_path):
     with pytest.raises(GC.GateFileError, match='no cell of the plan'):
         GC.check_nguon(d, goc)
     d, goc = build_c8(tmp_path / 'd')                                  # the time file reads another log
-    _csv_edit(goc, d, lambda ls: [ls[0], ls[1], ls[2].replace('.csv,', '_other.csv,')] + ls[3:])
+    _csv_edit(goc, d, lambda ls: ls[:3] + [ls[3].replace('.csv,', '_other.csv,')] + ls[4:])
     with pytest.raises(GC.GateFileError, match='ESP32 log|thu_tu_clip.csv names'):
         GC.check_nguon(d, goc)
 
@@ -1388,7 +1391,7 @@ def test_round3_one_clip_h_comparison_per_part(tmp_path):
     x = d['o_c8'][1]['chuoi'][0]
     alt = _jw(goc, 'drift_b.json', dict(json.load(open(os.path.join(goc, 'drift.json'), encoding='utf-8')), D_H_mm=1.5))
     x['file_so_h'] = alt
-    with pytest.raises(GC.GateFileError, match='one per part'):
+    with pytest.raises(GC.GateFileError, match='one per segment'):
         GC.check_nguon(d, goc)
 
 
@@ -1595,20 +1598,65 @@ def test_gc6_1_one_esp32_log_per_physical_run(tmp_path):
         GC.check_nguon(d, goc)
 
 
-def test_gc6_3_the_drift_of_the_run_part(tmp_path):
-    d, goc = build_c8(tmp_path / 'a')                                 # the comparison (H in the middle, H at the end)
-    _rewrite(goc, d['o_c8'][0]['chuoi'][0]['file_so_h'],
-             lambda y: y.update(s0_session_sha256=d['tien_de_c8']['clip_h']['giua']['sha256'],
-                                s1_session_sha256=d['tien_de_c8']['clip_h']['cuoi']['sha256']))
+def _hai_doan(goc, d):
+    """C8 session 2 (CODE 20/11): a second camera segment (H_c, H_d at its start, H_z at its end) holding the LADRC
+    runs, with its own premise file and clip H comparison; the PID runs stay in the first (H_a, H_b ... H_m)."""
+    seg1 = d['tien_de_c8']['doan'][0]
+    td1 = json.load(open(os.path.join(goc, seg1['file']['duong_dan']), encoding='utf-8'))
+    names = ('H_c', 'H_d', 'H_z')
+    new = [_jw(goc, f'clip_h/{n}.json', dict(kind=GC.SESSION_KIND, ten=n, video=f'{n}_0{i}_IMG_900{i}.MOV',
+                                             video_sha256=_h('video ' + n), **SESSION))
+           for i, n in zip((4, 5, 6), names)]
+    kc1 = json.load(open(os.path.join(goc, seg1['kiem_cheo']['duong_dan']), encoding='utf-8'))
+    kc2 = _jw(goc, 'kiem_cheo_doan3.json', dict(kc1, doan=dict(ten='doan3')))   # its own result, the same S7 lock
+    td2 = _jw(goc, 'tien_de_c8_doan3.json', dict(format=GC.TIEN_DE_FORMAT, ket_qua='dat', session_id=td1['session_id'],
+                                                 doan=dict(ten='doan3'), vai_tro_clip_h=dict(zip(names, GC.TD_ROLES)),
+                                                 sha256=dict(sessions={n: c['sha256'] for n, c in zip(names, new)},
+                                                             kiem_cheo=kc2['sha256'])))
+    d['tien_de_c8']['doan'].append(dict(ten='doan3', dau=new[:2], cuoi=new[2], file=td2, kiem_cheo=kc2))
+    dr2 = _jw(goc, 'drift_doan3.json', _drift(False, LEVELS, new))
+    lines = ['clip,buoc,gio_pc_bam_quay,gio_pc_dung_quay,created_utc,log_pi,ghi_chu', 'IMG_9000,H_a,,,,,',
+             'IMG_9001,H_b,,,,,']
+    rows = {'PID': [], 'LADRC': []}
     for c in d['o_c8']:
-        c['chuoi'][0]['file_so_h']['sha256'] = d['o_c8'][0]['chuoi'][0]['file_so_h']['sha256']
-        x = c['chuoi'][0]                                             # CODE 20/11: luoi.json names that drift file too
-        lu = json.load(open(os.path.join(goc, x['file_cham']['duong_dan']), encoding='utf-8'))
-        _relink_nodes(goc, d, x, lu, file_so_h=dict(x['file_so_h']))
-    with pytest.raises(GC.GateFileError, match='first part'):         # every run is before the middle clip
+        for j, x in enumerate(c['chuoi']):
+            rows[c['controller']].append(f'{x["clip"]},{c["o"] + (f"_lai{j}" if j else "")},,,,{x["run_id"]}.csv,')
+            if c['controller'] == 'LADRC':
+                x['file_so_h'] = dict(dr2)
+                lu = json.load(open(os.path.join(goc, x['file_cham']['duong_dan']), encoding='utf-8'))
+                _relink_nodes(goc, d, x, lu, file_so_h=dict(dr2))
+    lines += rows['PID'] + ['IMG_9002,H_m,,,,,', 'IMG_9004,H_c,,,,,', 'IMG_9005,H_d,,,,,'] + rows['LADRC'] \
+        + ['IMG_9006,H_z,,,,,']
+    p = os.path.join(goc, 'thu_tu_clip.csv')
+    with open(p, 'w', encoding='utf-8', newline='\n') as f:
+        f.write('\n'.join(lines) + '\n')
+    d['thu_tu_clip'] = dict(duong_dan='thu_tu_clip.csv', sha256=GC.sha256_file(p))
+
+
+def test_gc6_3_the_drift_of_the_run_part(tmp_path):
+    """CODE 20/11 after C8 session 2 (three camera segments): each run takes the clip H comparison of its segment (a
+    clip H at its start against its clip H at the end), one premise file per segment."""
+    d, goc = build_c8(tmp_path / 's1')
+    _hai_doan(goc, d)
+    GC.check_nguon(d, goc)                                            # PID in the first segment, LADRC in the second
+    x = next(c for c in d['o_c8'] if c['controller'] == 'LADRC')['chuoi'][0]
+    dr1 = dict(d['o_c8'][0]['chuoi'][0]['file_so_h'])                 # the comparison of the first segment
+    lu = json.load(open(os.path.join(goc, x['file_cham']['duong_dan']), encoding='utf-8'))
+    _relink_nodes(goc, d, x, lu, file_so_h=dr1)
+    x['file_so_h'] = dr1
+    with pytest.raises(GC.GateFileError, match='camera segment'):
         GC.check_nguon(d, goc)
-    _csv_edit(goc, d, lambda ls: ls[:2] + [ls[-1]] + ls[2:-1])         # now every run is after it
-    GC.check_nguon(d, goc)
+    d, goc = build_c8(tmp_path / 's2')                                # the runs after the end of the only segment
+    _csv_edit(goc, d, lambda ls: ls[:3] + [ls[-1]] + ls[3:-1])
+    with pytest.raises(GC.GateFileError, match='lies in no camera segment'):
+        GC.check_nguon(d, goc)
+    d, goc = build_c8(tmp_path / 's3')                                # ghep: one premise file per segment, any order
+    _hai_doan(goc, d)
+    g = GC.ghep(goc, 'ke_hoach_c8.json', 'thu_tu_clip.csv', 'c8b_khoa_v5.json',
+                ['tien_de_c8_doan3.json', 'tien_de_c8.json'], 'kiem_cheo.json', dict(BANG_CHUNG),
+                'chuan_u/ho_so_ghep.json')
+    assert [s['ten'] for s in g['tien_de_c8']['doan']] == ['doan2', 'doan3'] and g['tien_de_c8'] == d['tien_de_c8']
+    GC.write_gate(str(tmp_path / 'g.json'), g, goc)
     # GC9-3 (round 4): vuot recomputed with the gate thresholds (eps_H 1.0 mm, 0.2 deg), position and heading, never the
     # threshold the drift file states; a missing quantity is vuot (TC3-10)
     for name, edit in [('b', dict(D_H_vi_tri_mm=100.0)),
@@ -1626,6 +1674,62 @@ def test_gc6_3_the_drift_of_the_run_part(tmp_path):
     for c in d['o_c8']:
         c['chuoi'][0]['file_so_h']['sha256'] = d['o_c8'][0]['chuoi'][0]['file_so_h']['sha256']
     with pytest.raises(GC.GateFileError, match='c7_calib_drift_v2'):
+        GC.check_nguon(d, goc)
+
+
+def test_segment_kiem_cheo_and_the_comparison_of_the_segment(tmp_path):
+    """CODE 20/11 after C8 session 2 (KIEMCHEO fix/c8-kiemcheo-doan: one kiem_cheo.json per segment): the kiem_cheo.json
+    of each segment is of that segment and carries the S7 lock of the dossier; the dossier's is one of them; a clip H
+    comparison of the segment compares a clip H at its start with its clip H at the end (not two clips at the start)."""
+    def seg2(name):
+        d, goc = build_c8(tmp_path / name)
+        _hai_doan(goc, d)
+        return d, goc, d['tien_de_c8']['doan'][1]
+    for name, edit in [('a', lambda y: y['doan'].update(ten='doan2')),                      # another segment's
+                       ('b', lambda y: y['khoa_s7'].update(git_commit='e' * 40))]:           # another S7 lock
+        d, goc, s = seg2(name)
+        _rewrite(goc, s['kiem_cheo'], edit)
+        _rewrite(goc, s['file'], lambda y: y['sha256'].update(kiem_cheo=s['kiem_cheo']['sha256']))
+        with pytest.raises(GC.GateFileError, match='KCJ1-14'):
+            GC.check_nguon(d, goc)
+    d, goc, s = seg2('c')                                             # the dossier names a kiem_cheo of no segment
+    old = d['tien_de_c8']['doan'][0]['kiem_cheo']
+    kc0 = json.load(open(os.path.join(goc, old['duong_dan']), encoding='utf-8'))
+    d['tien_de_c8']['doan'][0]['kiem_cheo'] = _jw(goc, 'kiem_cheo_doan2b.json', dict(kc0, ghi_chu='ban khac'))
+    _rewrite(goc, d['tien_de_c8']['doan'][0]['file'],
+             lambda y: y['sha256'].update(kiem_cheo=d['tien_de_c8']['doan'][0]['kiem_cheo']['sha256']))
+    with pytest.raises(GC.GateFileError, match='kiem_cheo.json of no segment'):
+        GC.check_nguon(d, goc)
+    d, goc = build_c8(tmp_path / 'd')                                 # a comparison of the two clips H at the start
+    sh = [x['sha256'] for x in d['tien_de_c8']['doan'][0]['dau']]
+    dr = d['o_c8'][0]['chuoi'][0]['file_so_h']
+    _rewrite(goc, dr, lambda y: y.update(s0_session_sha256=sh[0], s1_session_sha256=sh[1]))
+    for c in d['o_c8']:
+        x = c['chuoi'][0]
+        x['file_so_h'] = dict(dr)
+        lu = json.load(open(os.path.join(goc, x['file_cham']['duong_dan']), encoding='utf-8'))
+        _relink_nodes(goc, d, x, lu, file_so_h=dict(dr))
+    with pytest.raises(GC.GateFileError, match='camera segment'):
+        GC.check_nguon(d, goc)
+    d, goc, s = seg2('e')                                             # (H in the middle, H at the end): the old parts
+    hm = d['tien_de_c8']['doan'][0]['cuoi']['sha256']
+    dr = dict(next(c for c in d['o_c8'] if c['controller'] == 'LADRC')['chuoi'][0]['file_so_h'])
+    _rewrite(goc, dr, lambda y: y.update(s0_session_sha256=hm))
+    for c in d['o_c8']:
+        if c['controller'] == 'LADRC':
+            x = c['chuoi'][0]
+            x['file_so_h'] = dict(dr)
+            lu = json.load(open(os.path.join(goc, x['file_cham']['duong_dan']), encoding='utf-8'))
+            _relink_nodes(goc, d, x, lu, file_so_h=dict(dr))
+    with pytest.raises(GC.GateFileError, match='camera segment'):
+        GC.check_nguon(d, goc)
+    d, goc, s = seg2('f')                                             # the segments listed out of session order
+    d['tien_de_c8']['doan'].reverse()
+    with pytest.raises(GC.GateFileError, match='session order'):
+        GC.check_nguon(d, goc)
+    d, goc = build_c8(tmp_path / 'g')                                 # its clip H at the end before those at the start
+    _csv_edit(goc, d, lambda ls: [ls[0], ls[-1]] + ls[1:-1])
+    with pytest.raises(GC.GateFileError, match='session order'):
         GC.check_nguon(d, goc)
 
 
@@ -1698,9 +1802,9 @@ def test_round3_lost_node_tied_to_its_run(tmp_path, lost_score, msg):
     lambda s: s['marks'].update({'3': [0.0, None]})])
 def test_round3_session_files_as_kiemcheo_reads_them(tmp_path, edit):
     d, goc = build_c8(tmp_path)
-    m = d['tien_de_c8']['clip_h']['dau'][1]
+    m = d['tien_de_c8']['doan'][0]['dau'][1]
     _rewrite(goc, m, edit)
-    _rewrite(goc, d['tien_de_c8']['file'], lambda x: x['sha256']['sessions'].update(H_b=m['sha256']))
+    _rewrite(goc, d['tien_de_c8']['doan'][0]['file'], lambda x: x['sha256']['sessions'].update(H_b=m['sha256']))
     with pytest.raises(GC.GateFileError, match='camera session file'):
         GC.check_nguon(d, goc)
 
@@ -1884,7 +1988,7 @@ def test_round4_held_out_is_every_run(tmp_path):
 def test_round4_chain_starts_with_the_run_itself(tmp_path):
     """GC9-4 (Codex): a cell whose only row is <run>_lai2 is refused."""
     d, goc = build_c8(tmp_path)
-    _csv_edit(goc, d, lambda ls: [ls[0], ls[1], ls[2].replace(',O1-F02_PID,', ',O1-F02_PID_lai2,')] + ls[3:])
+    _csv_edit(goc, d, lambda ls: ls[:3] + [ls[3].replace(',O1-F02_PID,', ',O1-F02_PID_lai2,')] + ls[4:])
     with pytest.raises(GC.GateFileError, match='GC9-4'):
         GC.check_nguon(d, goc)
 
@@ -1925,9 +2029,9 @@ def test_round4_session_fields_kiemcheo_reads(tmp_path):
     for name, edit in [('a', lambda s: s.pop('width')), ('b', lambda s: s.update(model_khoa='other')),
                        ('c', lambda s: s.pop('chosen'))]:
         d, goc = build_c8(tmp_path / name)
-        m = d['tien_de_c8']['clip_h']['dau'][1]
+        m = d['tien_de_c8']['doan'][0]['dau'][1]
         _rewrite(goc, m, edit)
-        _rewrite(goc, d['tien_de_c8']['file'], lambda x: x['sha256']['sessions'].update(H_b=m['sha256']))
+        _rewrite(goc, d['tien_de_c8']['doan'][0]['file'], lambda x: x['sha256']['sessions'].update(H_b=m['sha256']))
         with pytest.raises(GC.GateFileError, match='camera session file'):
             GC.check_nguon(d, goc)
 
@@ -1947,7 +2051,7 @@ def test_round4_ghep_ignores_copies_and_cleans_its_dossier(tmp_path):
     _rewrite(goc, dict(duong_dan='kiem_cheo.json', sha256=GC.sha256_file(os.path.join(goc, 'kiem_cheo.json'))),
              lambda y: y['khoa_s7'].update(file=os.path.abspath(os.path.join(goc, 'khoa_s7.json'))))
     kc_sha = GC.sha256_file(os.path.join(goc, 'kiem_cheo.json'))
-    _rewrite(goc, d['tien_de_c8']['file'], lambda y: y['sha256'].update(kiem_cheo=kc_sha))
+    _rewrite(goc, d['tien_de_c8']['doan'][0]['file'], lambda y: y['sha256'].update(kiem_cheo=kc_sha))
     g = _ghep(goc)
     assert g['o_c8'][0]['chuoi'][0]['file_edo'] == x['file_edo']
     GC.write_gate(str(tmp_path / 'g.json'), g, goc)
@@ -1955,7 +2059,7 @@ def test_round4_ghep_ignores_copies_and_cleans_its_dossier(tmp_path):
     with pytest.raises(GC.GateFileError, match='inside it'):
         _ghep(goc, ho_so='../outside.json')
     assert not os.path.exists(os.path.join(goc, '..', 'outside.json'))
-    _rewrite(goc, d['tien_de_c8']['file'], lambda y: y.update(ket_qua='khong_dat'))     # the gate is refused
+    _rewrite(goc, d['tien_de_c8']['doan'][0]['file'], lambda y: y.update(ket_qua='khong_dat'))     # the gate is refused
     with pytest.raises(GC.GateFileError, match='CAN LIAM QUYET'):
         GC.ghep_va_ghi(str(tmp_path / 'b.json'), goc, 'ke_hoach_c8.json', 'thu_tu_clip.csv', 'c8b_khoa_v5.json',
                        'tien_de_c8.json', 'kiem_cheo.json', dict(BANG_CHUNG), 'chuan_u/ho_so_new.json')
@@ -1992,27 +2096,27 @@ def test_round5_h1_scoring_with_the_h1_session(tmp_path):
     """GC6-3 (CODE 20/11): the H1 node scores carry session_sha256 = s1_session_sha256 of the comparison."""
     d, goc = build_c8(tmp_path, two=True)
     x = d['o_c8'][0]['chuoi'][0]
-    s0 = d['tien_de_c8']['clip_h']['dau'][0]['sha256']
+    s0 = d['tien_de_c8']['doan'][0]['dau'][0]['sha256']
     _rewrite_nodes(goc, d, x, lambda y: y.update(session_sha256=s0), h1=True)       # the H0 calibration again
     with pytest.raises(GC.GateFileError, match='GC6-3'):
         GC.check_nguon(d, goc)
 
 
 def test_round5_one_locked_model_and_the_premise_kiem_cheo(tmp_path):
-    """GC6-4: the four clip H sessions of one model (and the premise model); GC10-5: the premise names the kiem_cheo of
+    """GC6-4: the clip H sessions of one model (and the premise model); GC10-5: the premise names the kiem_cheo of
     the dossier."""
     d, goc = build_c8(tmp_path / 'a')
-    m = d['tien_de_c8']['clip_h']['cuoi']
+    m = d['tien_de_c8']['doan'][0]['dau'][1]
     _rewrite(goc, m, lambda s: s.update(chosen='other', model_khoa='other'))
-    _rewrite(goc, d['tien_de_c8']['file'], lambda x: x['sha256']['sessions'].update(H_z=m['sha256']))
+    _rewrite(goc, d['tien_de_c8']['doan'][0]['file'], lambda x: x['sha256']['sessions'].update(H_b=m['sha256']))
     with pytest.raises(GC.GateFileError, match='GC6-3|GC6-4|part of the session'):
         GC.check_nguon(d, goc)
     d, goc = build_c8(tmp_path / 'b')
-    _rewrite(goc, d['tien_de_c8']['file'], lambda x: x.update(model='polynomial'))
+    _rewrite(goc, d['tien_de_c8']['doan'][0]['file'], lambda x: x.update(model='polynomial'))
     with pytest.raises(GC.GateFileError, match='GC6-4'):
         GC.check_nguon(d, goc)
     d, goc = build_c8(tmp_path / 'c')
-    _rewrite(goc, d['tien_de_c8']['file'], lambda x: x['sha256'].update(kiem_cheo='a' * 64))
+    _rewrite(goc, d['tien_de_c8']['doan'][0]['file'], lambda x: x['sha256'].update(kiem_cheo='a' * 64))
     with pytest.raises(GC.GateFileError, match='GC10-5'):
         GC.check_nguon(d, goc)
 
@@ -2208,6 +2312,17 @@ def test_round5_runs_of_the_plan_scored_once(tmp_path):
     d['thu_tu_clip']['sha256'] = GC.sha256_file(p)
     with pytest.raises(GC.GateFileError, match='mistyped'):
         GC.check_nguon(d, goc)
+    d, goc = build_c8(tmp_path / 'a2')                                # session 2: the still clip before a K run
+    p = os.path.join(goc, 'thu_tu_clip.csv')
+    with open(p, 'a', encoding='utf-8', newline='\n') as f:
+        f.write('IMG_3637,C8-P-K1-1_khoa,,,,,clip khoa K1\n')
+    d['thu_tu_clip']['sha256'] = GC.sha256_file(p)
+    GC.check_nguon(d, goc)                                            # no run: neither a cell nor a K run
+    with open(p, 'a', encoding='utf-8', newline='\n') as f:
+        f.write('IMG_x,C8-P-F05-1_khoa,,,,,\n')                      # _khoa of a figure-8 code: no such clip
+    d['thu_tu_clip']['sha256'] = GC.sha256_file(p)
+    with pytest.raises(GC.GateFileError, match='mistyped'):
+        GC.check_nguon(d, goc)
     d, goc = build_c8(tmp_path / 'b')                                 # a copy with the same bytes is the same scoring
     x = d['o_c8'][0]['chuoi'][0]
     os.makedirs(os.path.join(goc, 'ban_sao'))
@@ -2303,12 +2418,12 @@ def test_round3_fake_signs_refused_on_the_real_path(tmp_path):
 
 def test_gc6_4_videos_of_the_premise(tmp_path):
     d, goc = build_c8(tmp_path)
-    names = ('H_a', 'H_b', 'H_m', 'H_z')
+    names = ('H_a', 'H_b', 'H_m')
     vids = {n: json.load(open(os.path.join(goc, f'clip_h/{n}.json'), encoding='utf-8'))['video_sha256'] for n in names}
-    _rewrite(goc, d['tien_de_c8']['file'], lambda x: x['sha256'].update(clip_h=dict(vids, H_b='d' * 64)))
+    _rewrite(goc, d['tien_de_c8']['doan'][0]['file'], lambda x: x['sha256'].update(clip_h=dict(vids, H_b='d' * 64)))
     with pytest.raises(GC.GateFileError, match='video of H_b'):
         GC.check_nguon(d, goc)
-    _rewrite(goc, d['tien_de_c8']['file'], lambda x: x['sha256'].update(clip_h=vids))
+    _rewrite(goc, d['tien_de_c8']['doan'][0]['file'], lambda x: x['sha256'].update(clip_h=vids))
     GC.check_nguon(d, goc)
 
 

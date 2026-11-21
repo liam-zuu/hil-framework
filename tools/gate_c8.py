@@ -102,13 +102,18 @@ TOP_KEYS = ('format', 'levels', 'muc_kha_thi', 'muc_bo_theo_liam', 'quyet_liam',
             'bo_cham', 'ke_hoach_c8', 'thu_tu_clip', 'khoa_c8b', 'o_c8', 'chuan_u', 'tien_de_c8', 'runs_c8',
             'muc_loai_e_do', 'chung_cu_muc', 'dieu_2b', 'camera', 'luot_k')
 THU_TU_COLS = ('clip', 'buoc', 'log_pi')                # F18 (1): thu_tu_clip.csv (C8 plan v1 line 87; CODE 19/11)
-RUN_CODE = re.compile(r'^C8-[PL]-(F02|F05|F08)-\d+$')
-RUN_CODE_K = re.compile(r'^C8-[PL]-(K1|K2)-\d+(_lai\d+)?$')   # GC9-2 (CODE 20/11): the K runs of C8, held out too    # a figure-8 run code of the session guide (cells of rule 2b);
+RUN_CODE = re.compile(r'^C8-[PL]-(F02|F05|F08)-\d+$')    # a figure-8 run code of the session guide (cells of rule 2b);
 # rows of clips H (H_*) and calibration runs (HC_*) are not runs of a cell
+RUN_CODE_K = re.compile(r'^C8-[PL]-(K1|K2)-\d+(_lai\d+)?$')   # GC9-2 (CODE 20/11): the K runs of C8, held out too
+# C8 session 2 (20/11, thu_tu_clip.csv of CAM): the still clip before a K run (car parked at the K start) is written
+# <K run code>_khoa; it is no run (no log, no scoring), so neither a cell nor a K run of the gate
+CLIP_KHOA_K = re.compile(r'^C8-[PL]-(K1|K2)-\d+_khoa$')
 KHOA_FORMAT = 'c8b_khoa_v5'                              # F18 (4): the C8b lock written before the held-out parts
 CTRL_LOG = {'PID': 'PID', 'LADRC': 'ADRC'}               # the '#gain ... ctrl=' name of the logger (c8b_gio controller)
 SESSION_KIND = 'c7_session'                              # a camera session file (c7_measure calibrate)
-TD_ROLES = ('dau1', 'dau2', 'giua', 'cuoi')              # F18 (3): tien_de_buoi_v1 vai_tro_clip_h (KIEMCHEO 19/11)
+# F18 (3): tien_de_buoi_v1 vai_tro_clip_h of ONE camera segment (CODE 20/11 after C8 session 2, three segments: the
+# iPhone was taken off twice; one premise file per segment, roles dau1, dau2, cuoi; J3-5 per segment that holds runs)
+TD_ROLES = ('dau1', 'dau2', 'cuoi')
 BAND_KEYS_C8B = ('u_lo_m_s', 'u_hi_m_s', 'P4_m', 'A4_deg', 'trang_thai')   # c8b_khoa_v5 M5b (CODE 19/11)
 BAND_STATES_C8B = ('dat', 'gioi_han', 'thieu')           # C8B term states (data contract 2.G (3))
 DRIFT_KIND = 'c7_calib_drift'                            # F18 (2): drift.json of c7_calib_drift so (CODE 19/11)
@@ -933,21 +938,37 @@ def _check_luot_k(d: dict) -> list:
     return lk
 
 
-def _check_tien_de(d: dict) -> list:
-    t = _obj(d['tien_de_c8'], ('buoi', 'clip_h', 'file'), 'tien_de_c8')
+def _check_tien_de(d: dict) -> List[dict]:
+    """tien_de_c8 {buoi, doan: [{ten, dau [two clips H], cuoi, file, kiem_cheo}]}: one entry per camera segment that
+    holds C8 runs, in session order (CODE 20/11 after C8 session 2: three camera segments, each mounting with its own
+    sessions; J v6 section 5 J3-5 read per segment: two clips H at its start, one at its end; a segment without C8 runs
+    is not listed; KIEMCHEO fix/c8-kiemcheo-doan: one kiem_cheo.json and one premise per segment, its name doan.ten).
+    Returns [{ten, clips [dau1, dau2, cuoi], file, kiem_cheo}]."""
+    t = _obj(d['tien_de_c8'], ('buoi', 'doan'), 'tien_de_c8')
     _text(t['buoi'], 'tien_de_c8.buoi')                 # GC6-4: the C8 session the premise belongs to
-    ch = t['clip_h']
-    if not isinstance(ch, dict) or set(ch) != {'dau', 'giua', 'cuoi'} or not isinstance(ch['dau'], list) \
-            or len(ch['dau']) != 2 or ch['giua'] is None or ch['cuoi'] is None:
-        raise GateFileError('tien_de_c8.clip_h: two clips H at the start (dau), one in the middle (giua), one at the '
-                            'end (cuoi); missing one (even only H giua), C8 is not locked: CAN LIAM QUYET (J v6 '
-                            'section 5 J3-5, section 0b)')
-    clips = [_ref(x, f'tien_de_c8.clip_h.dau[{i}]') for i, x in enumerate(ch['dau'])]
-    clips += [_ref(ch['giua'], 'tien_de_c8.clip_h.giua'), _ref(ch['cuoi'], 'tien_de_c8.clip_h.cuoi')]
-    if len({x['sha256'] for x in clips}) != 4:
-        raise GateFileError('tien_de_c8.clip_h: four different clips')
-    _ref(t['file'], 'tien_de_c8.file')
-    return clips
+    ds = t['doan']
+    if not isinstance(ds, list) or not ds:
+        raise GateFileError('tien_de_c8.doan: a non-empty list of the camera segments that hold C8 runs')
+    out, shas, names = [], set(), set()
+    for i, s in enumerate(ds):
+        w = f'tien_de_c8.doan[{i}]'
+        _obj(s, ('ten', 'dau', 'cuoi', 'file', 'kiem_cheo'), w)
+        ten = _text(s['ten'], f'{w}.ten')
+        if ten in names:
+            raise GateFileError(f'{w}.ten {ten!r}: each segment once')
+        names.add(ten)
+        if not isinstance(s['dau'], list) or len(s['dau']) != 2 or s['cuoi'] is None:
+            raise GateFileError(f'{w}: two clips H at the start of the segment (dau), one at its end (cuoi); missing '
+                                'one, C8 is not locked: CAN LIAM QUYET (J v6 section 5 J3-5, section 0b)')
+        clips = [_ref(x, f'{w}.dau[{j}]') for j, x in enumerate(s['dau'])] + [_ref(s['cuoi'], f'{w}.cuoi')]
+        for x in clips:
+            if x['sha256'] in shas:
+                raise GateFileError(f'{w}: a clip H used twice (every clip H of the session is a different clip)')
+            shas.add(x['sha256'])
+        _ref(s['file'], f'{w}.file')
+        _ref(s['kiem_cheo'], f'{w}.kiem_cheo')
+        out.append(dict(ten=ten, clips=clips, file=s['file'], kiem_cheo=s['kiem_cheo']))
+    return out
 
 
 def car_pose_v2_of(cp, what: str) -> dict:
@@ -1464,18 +1485,32 @@ def _final_outcome(o0: str, o1: Optional[str], drift: dict) -> Optional[str]:
     return o0 if o0 == o1 else 'chua_ket_luan'
 
 
-def _giua_row(goc: str, d: dict, rows: List[dict]) -> int:
-    """The row of thu_tu_clip.csv of the clip H in the middle (GC6-3 round 2; CODE 19/11: the runs before it are
-    compared on (H at the start, H in the middle), those after on (H in the middle, H at the end)): the one row whose
-    clip name is a part of the video name of the middle session file."""
-    s = _open_ref(goc, d['tien_de_c8']['clip_h']['giua'], 'tien_de_c8 clip giua')
+def _clip_row(goc: str, ref: dict, w: str, rows: List[dict]) -> int:
+    """The row of thu_tu_clip.csv of the clip of a session file: the one row whose clip name is a part of the video
+    name of the session (GC6-3 round 2)."""
+    s = _open_ref(goc, ref, w)
     base = os.path.basename(str(s.get('video', '')).replace('\\', '/'))
     hit = [i for i, r in enumerate(rows) if (r.get('clip') or '').strip() and re.search(
         r'(^|[_.-])' + re.escape(r['clip'].strip()) + r'($|[_.-])', base)]
     if len(hit) != 1:
-        raise GateFileError(f'thu_tu_clip: the clip H in the middle (video {s.get("video")!r}) is on {len(hit)} rows, '
-                            'one needed (it splits the session into two parts; GC6-3)')
+        raise GateFileError(f'thu_tu_clip: {w} (video {s.get("video")!r}) is on {len(hit)} rows, one needed (the clips '
+                            'H bound the camera segments; GC6-3)')
     return hit[0]
+
+
+def _doan_spans(goc: str, segs: List[dict], rows: List[dict]) -> List[Tuple[int, int]]:
+    """[(row of its last clip H at the start, row of its clip H at the end)] of each camera segment (CODE 20/11 after
+    C8 session 2): its runs are the rows strictly between; the segments in session order, never overlapping."""
+    spans = []
+    for k, s in enumerate(segs):
+        w = f'tien_de_c8.doan[{k}] ({s["ten"]})'
+        lo = max(_clip_row(goc, x, f'{w} clip {r}', rows) for x, r in zip(s['clips'][:2], TD_ROLES[:2]))
+        hi = _clip_row(goc, s['clips'][2], f'{w} clip cuoi', rows)
+        if not lo < hi or (spans and not spans[-1][1] < min(_clip_row(goc, x, w, rows) for x in s['clips'][:2])):
+            raise GateFileError(f'{w}: its clips H at the start come before its clip H at the end, after the end of the '
+                                'segment before it in thu_tu_clip.csv (segments in session order, not overlapping)')
+        spans.append((lo, hi))
+    return spans
 
 
 DRIFT_VERSION = 'c7_calib_drift_v2'                       # CAM design v4 section 3 TC3-10 (CODE 20/11)
@@ -1507,7 +1542,7 @@ def _drift_vuot(dr: dict, eps: dict, w: str) -> bool:
     return out
 
 
-def _drift_file(goc: str, ref: dict, w: str, cell: dict, before_giua: bool, ses: dict, eps: dict) -> dict:
+def _drift_file(goc: str, ref: dict, w: str, cell: dict, seg: dict, eps: dict) -> dict:
     dr = _open_ref(goc, ref, w)
     if dr.get('kind') != DRIFT_KIND or dr.get('version') != DRIFT_VERSION or not isinstance(dr.get('vuot'), bool) \
             or not isinstance(dr.get('thieu_H1'), bool):
@@ -1520,17 +1555,13 @@ def _drift_file(goc: str, ref: dict, w: str, cell: dict, before_giua: bool, ses:
         if dr['vuot'] != want:
             raise GateFileError(f'{w}: vuot {dr["vuot"]!r}; from D_H (position, heading) and eps_H of the gate {eps} '
                                 f'it is {want} (GC9-3)')
-    # GC6-3 (round 2): the comparison of the run's part: before the clip H in the middle (H at the start, H in the
-    # middle), after it (H in the middle, H at the end)
+    # GC6-3 (round 2; CODE 20/11 after C8 session 2): the comparison of the run's camera segment: a clip H at its start
+    # against its clip H at the end
     s0, s1 = dr.get('s0_session_sha256'), dr.get('s1_session_sha256')
-    if before_giua:
-        ok = s0 in (ses['dau1'], ses['dau2']) and (s1 == ses['giua'] or (dr['thieu_H1'] and s1 is None))
-    else:
-        ok = s0 == ses['giua'] and (s1 == ses['cuoi'] or (dr['thieu_H1'] and s1 is None))
-    if not ok:
-        raise GateFileError(f'{w}: the clip H comparison of the {"first" if before_giua else "second"} part of the '
-                            'session compares (H at the start, H in the middle) / (H in the middle, H at the end); '
-                            f'this one compares {s0!r} / {s1!r} (GC6-3)')
+    sh = [x['sha256'] for x in seg['clips']]
+    if not (s0 in sh[:2] and (s1 == sh[2] or (dr['thieu_H1'] and s1 is None))):
+        raise GateFileError(f'{w}: the clip H comparison of the camera segment {seg["ten"]!r} of the run compares a clip '
+                            f'H at its start with its clip H at the end; this one compares {s0!r} / {s1!r} (GC6-3)')
     if not isinstance(dr.get('tasks'), list) or cell['muc'] not in dr['tasks']:
         raise GateFileError(f'{w}: the clip H comparison covers {dr.get("tasks")!r}, not the task {cell["muc"]}')
     return dr
@@ -1591,7 +1622,7 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
         elif RUN_CODE.match(b):
             raise GateFileError(f'thu_tu_clip row {i + 2}: run {b!r} (clip {r.get("clip")!r}) is no cell of the plan '
                                 '(a figure-8 run outside the locked list)')
-        elif full.startswith('C8-') and not RUN_CODE_K.match(full):
+        elif full.startswith('C8-') and not RUN_CODE_K.match(full) and not CLIP_KHOA_K.match(full):
             # CODE 20/11 (the luot_c8 check of c8b_u cong, C8BU4-R1-3, now here): a mistyped run code would drop a run
             raise GateFileError(f'thu_tu_clip row {i + 2}: buoc {full!r} (clip {r.get("clip")!r}) reads as a C8 run '
                                 'code but is neither a run of the plan (or its _lai<n>) nor a K run: a mistyped code '
@@ -1602,9 +1633,9 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
             raise GateFileError(f'thu_tu_clip: clip {r["clip"]!r} twice')
         by_clip[r['clip']] = r
     eligible, cham_luc, logs_seen, clip_shas, scorers = {}, {}, {}, {}, set()
-    giua_at = _giua_row(goc, d, rows)
-    ses = dict(zip(TD_ROLES, [r_['sha256'] for r_ in _check_tien_de(d)]))
-    part_drift = {}                                      # GC6-3 (round 3): one comparison per part of the session
+    segs = _check_tien_de(d)                             # CODE 20/11 after C8 session 2: the camera segments
+    spans = _doan_spans(goc, segs, rows)
+    part_drift = {}                                      # GC6-3 (round 3): one comparison per camera segment
     for c in d['o_c8']:
         got = [x['clip'] for x in c['chuoi']]
         if got != order[c['o']]:
@@ -1613,6 +1644,11 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
         for x in c['chuoi']:
             w = f'cell {c["o"]} run {x["run_id"]}'
             row = by_clip[x['clip']]
+            ri = rows.index(row)
+            part = next((k for k, (lo, hi) in enumerate(spans) if lo < ri < hi), None)
+            if part is None:
+                raise GateFileError(f'{w}: its row of thu_tu_clip.csv lies in no camera segment of tien_de_c8.doan '
+                                    '(between the clips H at the start and the clip H at the end of a segment; J3-5)')
             fg, log, tops = None, None, None
             if x['file_gio'] is not None:
                 fg, log, tt = _time_file(goc, x['file_gio'], f'{w}: file_gio', c)
@@ -1730,11 +1766,10 @@ def _check_runs_nguon(d: dict, goc: str) -> Tuple[Dict[str, list], Dict[str, dt.
             # GC6-3: the outcome is the one after the clip H comparison of the part of the session
             dr = None
             if x['file_so_h'] is not None:
-                part = rows.index(row) < giua_at
                 if part_drift.setdefault(part, x['file_so_h']['sha256']) != x['file_so_h']['sha256']:
-                    raise GateFileError(f'{w}: another clip H comparison than the other runs of the '
-                                        f'{"first" if part else "second"} part of the session (one per part; GC6-3)')
-                dr = _drift_file(goc, x['file_so_h'], f'{w}: file_so_h', c, part, ses, d['camera']['c8b']['eps_H'])
+                    raise GateFileError(f'{w}: another clip H comparison than the other runs of the camera segment '
+                                        f'{segs[part]["ten"]!r} (one per segment; GC6-3)')
+                dr = _drift_file(goc, x['file_so_h'], f'{w}: file_so_h', c, segs[part], d['camera']['c8b']['eps_H'])
                 for (_, ndx, _), key, tag in list(zip(scorings, ('s0_session_sha256', 's1_session_sha256'),
                                                       ('H0', 'H1')))[1:]:
                     for sc_ in ndx:
@@ -2104,43 +2139,61 @@ def check_nguon(d: dict, goc: str) -> dict:
     for k, x in d['bo_cham']['bang_man_trap'].items():
         if x['nhanh'] == 'alpha':
             _open_ref(goc, x['nguon_3b'], f'bo_cham.bang_man_trap.{k}.nguon_3b', as_json=False)
-    # premise of the C8 lock (design section 9; GC6-4: by role, of this session, readable session files)
-    clips = _check_tien_de(d)
-    for i, x in enumerate(clips):
-        _check_session(_open_ref(goc, x, f'tien_de_c8 clip {TD_ROLES[i]}'), f'tien_de_c8 clip {TD_ROLES[i]}')
-    td = _open_ref(goc, d['tien_de_c8']['file'], 'tien_de_c8.file')
-    if td.get('format') != TIEN_DE_FORMAT or td.get('ket_qua') != 'dat':
-        raise GateFileError(f'tien_de_c8.file: a {TIEN_DE_FORMAT} file with ket_qua dat, got format '
-                            f'{td.get("format")!r}, ket_qua {td.get("ket_qua")!r}: C8 is not locked, CAN LIAM QUYET '
-                            '(J v6 section 5 J3-5, section 0b)')
-    if td.get('session_id') != d['tien_de_c8']['buoi']:
-        raise GateFileError(f'tien_de_c8.file: the premise of session {td.get("session_id")!r}, the gate is of '
-                            f'{d["tien_de_c8"]["buoi"]!r} (GC6-4)')
-    vt = td.get('vai_tro_clip_h')
-    ses = td.get('sha256', {}).get('sessions') if isinstance(td.get('sha256'), dict) else None
-    if not isinstance(vt, dict) or sorted(vt.values()) != sorted(TD_ROLES) or not isinstance(ses, dict) \
-            or set(ses) != set(vt):
-        raise GateFileError(f'tien_de_c8.file: vai_tro_clip_h gives the four roles {TD_ROLES} once each, and '
-                            'sha256.sessions one session per clip of it (GC6-4)')
-    by_role = {vt[n]: ses[n] for n in vt}
-    models = {_open_ref(goc, x, f'tien_de_c8 clip {TD_ROLES[i]}').get('chosen') for i, x in enumerate(clips)}
-    if len(models) != 1 or ('model' in td and td['model'] not in models):
-        raise GateFileError(f'tien_de_c8: the four clip H sessions use the models {sorted(map(str, models))} (premise '
-                            f'model {td.get("model")!r}): one locked model (KC1-1; GC6-4)')
-    kcs = (td.get('sha256') or {}).get('kiem_cheo') if isinstance(td.get('sha256'), dict) else None
-    if kcs != hs['khoa_kiem_luc']['kiem_cheo']['sha256']:
-        raise GateFileError('tien_de_c8.file: sha256.kiem_cheo is not the kiem_cheo.json of the U standard dossier '
-                            '(khoa_kiem_luc; GC10-5)')
-    vid = td.get('sha256', {}).get('clip_h')
-    if isinstance(vid, dict):                            # GC6-4 (round 2): the videos too, when the premise names them
-        for n in vt:
-            sx = next(x for r_, x in zip(TD_ROLES, clips) if r_ == vt[n])
-            if vid.get(n) != _open_ref(goc, sx, f'tien_de_c8 clip {vt[n]}').get('video_sha256'):
-                raise GateFileError(f'tien_de_c8.file: the video of {n} ({vt[n]}) is not that of its session (GC6-4)')
-    for role, x in zip(TD_ROLES, clips):
-        if by_role[role] != x['sha256']:
-            raise GateFileError(f'tien_de_c8.clip_h: the clip of role {role} is not the session the premise gives for '
-                                'it (GC6-4)')
+    # premise of the C8 lock (design section 9; GC6-4: by role, of this session, readable session files), one premise
+    # file per camera segment that holds C8 runs (CODE 20/11 after C8 session 2; KIEMCHEO: roles dau1, dau2, cuoi)
+    models, tmods, kc_segs = set(), set(), set()
+    for k, seg in enumerate(_check_tien_de(d)):
+        w = f'tien_de_c8.doan[{k}] ({seg["ten"]})'
+        clips = seg['clips']
+        for role, x in zip(TD_ROLES, clips):
+            _check_session(_open_ref(goc, x, f'{w} clip {role}'), f'{w} clip {role}')
+        td = _open_ref(goc, seg['file'], f'{w}.file')
+        if td.get('format') != TIEN_DE_FORMAT or td.get('ket_qua') != 'dat':
+            raise GateFileError(f'{w}.file: a {TIEN_DE_FORMAT} file with ket_qua dat, got format {td.get("format")!r}, '
+                                f'ket_qua {td.get("ket_qua")!r}: C8 is not locked, CAN LIAM QUYET (J v6 section 5 J3-5, '
+                                'section 0b)')
+        dn = td.get('doan') if isinstance(td.get('doan'), dict) else {}
+        if td.get('session_id') != d['tien_de_c8']['buoi'] or dn.get('ten') != seg['ten']:
+            raise GateFileError(f'{w}.file: the premise of session {td.get("session_id")!r}, segment {dn.get("ten")!r}; '
+                                f'the gate is of {d["tien_de_c8"]["buoi"]!r}, segment {seg["ten"]!r} (GC6-4)')
+        # the kiem_cheo.json of the segment: the one its premise names, of that segment, locked by the S7 manifest and
+        # commit of the dossier (KCJ1-14; CODE 20/11 after C8 session 2: one kiem_cheo result per segment)
+        kcg = _open_ref(goc, seg['kiem_cheo'], f'{w}.kiem_cheo')
+        r7 = kcg.get('khoa_s7') if isinstance(kcg.get('khoa_s7'), dict) else {}
+        if kcg.get('version') != KIEM_CHEO_VERSION or (kcg.get('doan') or {}).get('ten') != seg['ten'] \
+                or any(r7.get(q) != rec.get(q) for q in ('sha256', 'git_commit', 'git_time')):
+            raise GateFileError(f'{w}.kiem_cheo: a {KIEM_CHEO_VERSION} file of segment {seg["ten"]!r} (doan.ten) '
+                                'whose khoa_s7 {sha256, git_commit, git_time} is that of the dossier (KCJ1-14)')
+        kc_segs.add(seg['kiem_cheo']['sha256'])
+        vt = td.get('vai_tro_clip_h')
+        ses = td.get('sha256', {}).get('sessions') if isinstance(td.get('sha256'), dict) else None
+        if not isinstance(vt, dict) or sorted(vt.values()) != sorted(TD_ROLES) or not isinstance(ses, dict) \
+                or set(ses) != set(vt):
+            raise GateFileError(f'{w}.file: vai_tro_clip_h gives the roles {TD_ROLES} once each, and sha256.sessions '
+                                'one session per clip of it (GC6-4)')
+        by_role = {vt[n]: ses[n] for n in vt}
+        models |= {_open_ref(goc, x, f'{w} clip {role}').get('chosen') for role, x in zip(TD_ROLES, clips)}
+        if 'model' in td:
+            tmods.add(td['model'])
+        kcs = (td.get('sha256') or {}).get('kiem_cheo') if isinstance(td.get('sha256'), dict) else None
+        if kcs != seg['kiem_cheo']['sha256']:
+            raise GateFileError(f'{w}.file: sha256.kiem_cheo is not the kiem_cheo.json of the segment (GC10-5)')
+        vid = td.get('sha256', {}).get('clip_h')
+        if isinstance(vid, dict):                        # GC6-4 (round 2): the videos too, when the premise names them
+            for n in vt:
+                sx = next(x for r_, x in zip(TD_ROLES, clips) if r_ == vt[n])
+                if vid.get(n) != _open_ref(goc, sx, f'{w} clip {vt[n]}').get('video_sha256'):
+                    raise GateFileError(f'{w}.file: the video of {n} ({vt[n]}) is not that of its session (GC6-4)')
+        for role, x in zip(TD_ROLES, clips):
+            if by_role[role] != x['sha256']:
+                raise GateFileError(f'{w}: the clip of role {role} is not the session the premise gives for it (GC6-4)')
+    if hs['khoa_kiem_luc']['kiem_cheo']['sha256'] not in kc_segs:
+        raise GateFileError('chuan_u.ho_so_c8: khoa_kiem_luc.kiem_cheo is the kiem_cheo.json of no segment of '
+                            'tien_de_c8.doan (GC10-5)')
+    if len(models) != 1 or not tmods <= models:
+        raise GateFileError(f'tien_de_c8: the clip H sessions of every segment use the models '
+                            f'{sorted(map(str, models))} (premise models {sorted(map(str, tmods))}): one locked model '
+                            '(KC1-1; GC6-4)')
     # shifted anchor (design section 10; GC6-6: one manifest for every scoring of every eligible run, the domain it
     # covered = the frames that scoring relies on, before the maximum is taken)
     md = d['camera']['c8b']['moc_dich']
@@ -2396,8 +2449,8 @@ def fake_gate(levels=('O1-F05',), u_p_m=0.002, u_psi_deg=2.0, u_t_s=0.010) -> di
                 bo_cham=dict(phien_ban='FAKE', bang_man_trap={k: dict(nhanh='mot_khung') for k in lv + [TASK_K]}),
                 ke_hoach_c8=ref('ke_hoach_c8.json'), thu_tu_clip=ref('thu_tu_clip.csv'),
                 khoa_c8b=ref('c8b_khoa_v5.json'), o_c8=cells, chuan_u=cu,
-                tien_de_c8=dict(buoi='FAKE', clip_h=dict(dau=[clip(1), clip(2)], giua=clip(3), cuoi=clip(4)),
-                                file=ref('tien_de_c8.json')),
+                tien_de_c8=dict(buoi='FAKE', doan=[dict(ten='FAKE', dau=[clip(1), clip(2)], cuoi=clip(3),
+                                                        file=ref('tien_de_c8.json'), kiem_cheo=ref('kiem_cheo.json'))]),
                 runs_c8=runs, muc_loai_e_do={k: [] for k in lv},
                 chung_cu_muc={k: dict(e_do={c: [f'FAKE_{k}_{c}'] for c in CONTROLLERS},
                                       g4={c: [f'FAKE_{k}_{c}'] for c in CONTROLLERS}) for k in lv},
@@ -2519,7 +2572,7 @@ def ghep_va_ghi(out: str, goc: str, *args, **kw) -> str:
         raise
 
 
-def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de: str, kiem_cheo: str,
+def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de, kiem_cheo: str,
          bang_chung: Dict[str, str], ho_so: str, muc_bo_theo_liam: Optional[dict] = None,
          quyet_liam: Optional[dict] = None) -> dict:
     """The gate content of C8 assembled from its sources under the C8 folder goc (paths relative to it; F10-F19, the
@@ -2536,7 +2589,8 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de: str,
       U standard   the four evidence files (bang_chung {condition: path}) and the dossier ho_so_c8_v1 written to ho_so
                    (cham_luc = the first scoring time of every run, _scoring_times; giu_ngoai = every C8 run, CODE
                    20/11, GC9-2; khoa_kiem_luc = the khoa_s7 record of kiem_cheo.json, its file by the path it names)
-      premise      the tien_de_buoi_v1 file and the four session files it names by sha256, by role
+      premise      one tien_de_buoi_v1 file per camera segment that holds C8 runs (tien_de: a path or a list) and
+                   the three session files each names by sha256, by role (dau1, dau2, cuoi; CODE 20/11)
       camera       khoa_sha256, mien_car_pose, eps_H of the C8b lock; the U manifests of the eligible scorings, the
                    largest of each of their four numbers and their common nguon
     The content is checked by write_gate (check and check_nguon) before anything is written; ho_so is written first
@@ -2544,8 +2598,9 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de: str,
     if _bad_rel(ho_so):                                  # GC9-8: never a file outside the C8 folder
         raise GateFileError(f'ghep: --ho-so {ho_so!r}: a path relative to the C8 folder, inside it')
     kho = _Kho(goc)
-    kh_ref, tt_ref, kc8_ref, td_ref, kcj_ref = (kho.ref(p) for p in (ke_hoach, thu_tu_clip, khoa_c8b, tien_de, kiem_cheo))
-    kh, khoa, td, kcj = kho.json(kh_ref), kho.json(kc8_ref), kho.json(td_ref), kho.json(kcj_ref)
+    kh_ref, tt_ref, kc8_ref, kcj_ref = (kho.ref(p) for p in (ke_hoach, thu_tu_clip, khoa_c8b, kiem_cheo))
+    kh, khoa, kcj = kho.json(kh_ref), kho.json(kc8_ref), kho.json(kcj_ref)
+    td_refs = [kho.ref(p) for p in ([tien_de] if isinstance(tien_de, str) else list(tien_de))]   # one per segment
     if set(bang_chung) != set(CHUAN_U_DK):
         raise GateFileError(f'ghep: bang_chung needs exactly the four conditions {CHUAN_U_DK}')
     kt = khoa.get('muc_kha_thi')
@@ -2714,13 +2769,24 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de: str,
     else:
         with open(p, 'xb') as f:
             f.write(raw)
-    # premise: the four session files by role
-    roles = td.get('vai_tro_clip_h') or {}
-    ses = (td.get('sha256') or {}).get('sessions') or {}
-    by_role = {v: n for n, v in roles.items()}
-    if sorted(by_role) != sorted(TD_ROLES):
-        raise GateFileError(f'ghep: tien_de file: vai_tro_clip_h gives {sorted(by_role)}, the four roles {TD_ROLES} needed')
-    cr = [kho.by(ses.get(by_role[role]), f'session of {role}') for role in TD_ROLES]
+    # premise: one tien_de file per camera segment, its three session files by role (CODE 20/11 after C8 session 2);
+    # the segments in session order (row of their clip H at the end in thu_tu_clip.csv)
+    doan, buoi = [], set()
+    for td_ref in td_refs:
+        td = kho.json(td_ref)
+        roles = td.get('vai_tro_clip_h') or {}
+        ses = (td.get('sha256') or {}).get('sessions') or {}
+        by_role = {v: n for n, v in roles.items()}
+        if sorted(by_role) != sorted(TD_ROLES) or len(by_role) != len(roles):
+            raise GateFileError(f'ghep: tien_de file {td_ref["duong_dan"]!r}: vai_tro_clip_h gives {sorted(roles.values())}'
+                                f', the roles {TD_ROLES} once each needed')
+        cr = [kho.by(ses.get(by_role[role]), f'session of {role} ({td_ref["duong_dan"]})') for role in TD_ROLES]
+        kcr = kho.by((td.get('sha256') or {}).get('kiem_cheo'), f'kiem_cheo.json of {td_ref["duong_dan"]}')
+        doan.append(dict(ten=(td.get('doan') or {}).get('ten'), dau=cr[:2], cuoi=cr[2], file=td_ref, kiem_cheo=kcr))
+        buoi.add(td.get('session_id'))
+    doan.sort(key=lambda s: _clip_row(kho.goc, s['cuoi'], f'ghep: clip H at the end of {s["ten"]!r}', rows))
+    if len(buoi) != 1:
+        raise GateFileError(f'ghep: the premise files are of the sessions {sorted(map(str, buoi))}; one C8 session')
     # camera: the U manifests of the eligible scorings
     mans = kho.all_json(lambda m, rel: isinstance(m, dict) and m.get('format') == MANIFEST_FORMAT
                         and m.get('file_cham_sha256') in eligible)
@@ -2753,7 +2819,7 @@ def ghep(goc: str, ke_hoach: str, thu_tu_clip: str, khoa_c8b: str, tien_de: str,
                 ke_hoach_c8=kh_ref, thu_tu_clip=tt_ref, khoa_c8b=kc8_ref, o_c8=cells,
                 chuan_u=dict(loai=CHUAN_U_LOAI, le=CHUAN_U_LE, ho_so_c8=kho.ref(ho_so),
                              dieu_kien={k: dict(trang_thai='dat', bang_chung=bc_refs[k]) for k in CHUAN_U_DK}),
-                tien_de_c8=dict(buoi=td.get('session_id'), clip_h=dict(dau=cr[:2], giua=cr[2], cuoi=cr[3]), file=td_ref),
+                tien_de_c8=dict(buoi=next(iter(buoi)), doan=doan),
                 runs_c8=runs, muc_loai_e_do=loai,
                 chung_cu_muc={k: {q: v for q, v in evidence_of(runs[k]).items() if q != 'loai'} for k in kt if not loai[k]},
                 dieu_2b=dict(thresholds={c: o1_gate.THRESHOLDS[c] for c in MASKABLE}, per_level=per), camera=cam,
@@ -2772,7 +2838,8 @@ def main(argv=None) -> int:
     g.add_argument('--ke-hoach', required=True)
     g.add_argument('--thu-tu-clip', required=True)
     g.add_argument('--khoa-c8b', required=True, help='c8b_khoa_v5')
-    g.add_argument('--tien-de', required=True, help='tien_de_buoi_v1 of KIEMCHEO')
+    g.add_argument('--tien-de', action='append', required=True,
+                   help='tien_de_buoi_v1 of KIEMCHEO, once per camera segment that holds C8 runs')
     g.add_argument('--kiem-cheo', required=True, help='kiem_cheo.json (c7_kiem_cheo_v7) with its khoa_s7 record')
     g.add_argument('--bang-chung', action='append', required=True, help='CONDITION=path, once for each of the four')
     g.add_argument('--ho-so', required=True, help='the dossier ho_so_c8_v1 to write (new, or the same bytes)')
