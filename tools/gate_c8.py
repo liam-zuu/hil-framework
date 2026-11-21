@@ -2073,6 +2073,67 @@ def _check_bang_chung(d: dict, goc: str, scorers: set) -> None:
             raise GateFileError('chuan_u.dieu_kien.kiem_vi_tri_rieng: khoa_truoc_sha256 is not the C8b lock of the gate')
 
 
+def _check_premise(d: dict, goc: str, hs: dict, rec: dict) -> None:
+    """The premise of the C8 lock, one file per camera segment (design section 9; CODE 20/11 after C8 session 2): hs the
+    dossier ho_so_c8, rec the khoa_s7 record of its kiem_cheo.json. Apart from check_nguon to be run on a session's
+    premise files before the other sources exist."""
+    # premise of the C8 lock (design section 9; GC6-4: by role, of this session, readable session files), one premise
+    # file per camera segment that holds C8 runs (CODE 20/11 after C8 session 2; KIEMCHEO: roles dau1, dau2, cuoi)
+    models, tmods, kc_segs = set(), set(), set()
+    for k, seg in enumerate(_check_tien_de(d)):
+        w = f'tien_de_c8.doan[{k}] ({seg["ten"]})'
+        clips = seg['clips']
+        for role, x in zip(TD_ROLES, clips):
+            _check_session(_open_ref(goc, x, f'{w} clip {role}'), f'{w} clip {role}')
+        td = _open_ref(goc, seg['file'], f'{w}.file')
+        if td.get('format') != TIEN_DE_FORMAT or td.get('ket_qua') != 'dat':
+            raise GateFileError(f'{w}.file: a {TIEN_DE_FORMAT} file with ket_qua dat, got format {td.get("format")!r}, '
+                                f'ket_qua {td.get("ket_qua")!r}: C8 is not locked, CAN LIAM QUYET (J v6 section 5 J3-5, '
+                                'section 0b)')
+        dn = td.get('doan') if isinstance(td.get('doan'), dict) else {}
+        if td.get('session_id') != d['tien_de_c8']['buoi'] or dn.get('ten') != seg['ten']:
+            raise GateFileError(f'{w}.file: the premise of session {td.get("session_id")!r}, segment {dn.get("ten")!r}; '
+                                f'the gate is of {d["tien_de_c8"]["buoi"]!r}, segment {seg["ten"]!r} (GC6-4)')
+        # the kiem_cheo.json of the segment: the one its premise names, of that segment, locked by the S7 manifest and
+        # commit of the dossier (KCJ1-14; CODE 20/11 after C8 session 2: one kiem_cheo result per segment)
+        kcg = _open_ref(goc, seg['kiem_cheo'], f'{w}.kiem_cheo')
+        r7 = kcg.get('khoa_s7') if isinstance(kcg.get('khoa_s7'), dict) else {}
+        if kcg.get('version') != KIEM_CHEO_VERSION or (kcg.get('doan') or {}).get('ten') != seg['ten'] \
+                or any(r7.get(q) != rec.get(q) for q in ('sha256', 'git_commit', 'git_time')):
+            raise GateFileError(f'{w}.kiem_cheo: a {KIEM_CHEO_VERSION} file of segment {seg["ten"]!r} (doan.ten) '
+                                'whose khoa_s7 {sha256, git_commit, git_time} is that of the dossier (KCJ1-14)')
+        kc_segs.add(seg['kiem_cheo']['sha256'])
+        vt = td.get('vai_tro_clip_h')
+        ses = td.get('sha256', {}).get('sessions') if isinstance(td.get('sha256'), dict) else None
+        if not isinstance(vt, dict) or sorted(vt.values()) != sorted(TD_ROLES) or not isinstance(ses, dict) \
+                or set(ses) != set(vt):
+            raise GateFileError(f'{w}.file: vai_tro_clip_h gives the roles {TD_ROLES} once each, and sha256.sessions '
+                                'one session per clip of it (GC6-4)')
+        by_role = {vt[n]: ses[n] for n in vt}
+        models |= {_open_ref(goc, x, f'{w} clip {role}').get('chosen') for role, x in zip(TD_ROLES, clips)}
+        if 'model' in td:
+            tmods.add(td['model'])
+        kcs = (td.get('sha256') or {}).get('kiem_cheo') if isinstance(td.get('sha256'), dict) else None
+        if kcs != seg['kiem_cheo']['sha256']:
+            raise GateFileError(f'{w}.file: sha256.kiem_cheo is not the kiem_cheo.json of the segment (GC10-5)')
+        vid = td.get('sha256', {}).get('clip_h')
+        if isinstance(vid, dict):                        # GC6-4 (round 2): the videos too, when the premise names them
+            for n in vt:
+                sx = next(x for r_, x in zip(TD_ROLES, clips) if r_ == vt[n])
+                if vid.get(n) != _open_ref(goc, sx, f'{w} clip {vt[n]}').get('video_sha256'):
+                    raise GateFileError(f'{w}.file: the video of {n} ({vt[n]}) is not that of its session (GC6-4)')
+        for role, x in zip(TD_ROLES, clips):
+            if by_role[role] != x['sha256']:
+                raise GateFileError(f'{w}: the clip of role {role} is not the session the premise gives for it (GC6-4)')
+    if hs['khoa_kiem_luc']['kiem_cheo']['sha256'] not in kc_segs:
+        raise GateFileError('chuan_u.ho_so_c8: khoa_kiem_luc.kiem_cheo is the kiem_cheo.json of no segment of '
+                            'tien_de_c8.doan (GC10-5)')
+    if len(models) != 1 or not tmods <= models:
+        raise GateFileError(f'tien_de_c8: the clip H sessions of every segment use the models '
+                            f'{sorted(map(str, models))} (premise models {sorted(map(str, tmods))}): one locked model '
+                            '(KC1-1; GC6-4)')
+
+
 def check_nguon(d: dict, goc: str) -> dict:
     """The sources of a checked gate content under the C8 folder goc (design sections 3, 6-10). Returns d."""
     check(d)
@@ -2139,61 +2200,7 @@ def check_nguon(d: dict, goc: str) -> dict:
     for k, x in d['bo_cham']['bang_man_trap'].items():
         if x['nhanh'] == 'alpha':
             _open_ref(goc, x['nguon_3b'], f'bo_cham.bang_man_trap.{k}.nguon_3b', as_json=False)
-    # premise of the C8 lock (design section 9; GC6-4: by role, of this session, readable session files), one premise
-    # file per camera segment that holds C8 runs (CODE 20/11 after C8 session 2; KIEMCHEO: roles dau1, dau2, cuoi)
-    models, tmods, kc_segs = set(), set(), set()
-    for k, seg in enumerate(_check_tien_de(d)):
-        w = f'tien_de_c8.doan[{k}] ({seg["ten"]})'
-        clips = seg['clips']
-        for role, x in zip(TD_ROLES, clips):
-            _check_session(_open_ref(goc, x, f'{w} clip {role}'), f'{w} clip {role}')
-        td = _open_ref(goc, seg['file'], f'{w}.file')
-        if td.get('format') != TIEN_DE_FORMAT or td.get('ket_qua') != 'dat':
-            raise GateFileError(f'{w}.file: a {TIEN_DE_FORMAT} file with ket_qua dat, got format {td.get("format")!r}, '
-                                f'ket_qua {td.get("ket_qua")!r}: C8 is not locked, CAN LIAM QUYET (J v6 section 5 J3-5, '
-                                'section 0b)')
-        dn = td.get('doan') if isinstance(td.get('doan'), dict) else {}
-        if td.get('session_id') != d['tien_de_c8']['buoi'] or dn.get('ten') != seg['ten']:
-            raise GateFileError(f'{w}.file: the premise of session {td.get("session_id")!r}, segment {dn.get("ten")!r}; '
-                                f'the gate is of {d["tien_de_c8"]["buoi"]!r}, segment {seg["ten"]!r} (GC6-4)')
-        # the kiem_cheo.json of the segment: the one its premise names, of that segment, locked by the S7 manifest and
-        # commit of the dossier (KCJ1-14; CODE 20/11 after C8 session 2: one kiem_cheo result per segment)
-        kcg = _open_ref(goc, seg['kiem_cheo'], f'{w}.kiem_cheo')
-        r7 = kcg.get('khoa_s7') if isinstance(kcg.get('khoa_s7'), dict) else {}
-        if kcg.get('version') != KIEM_CHEO_VERSION or (kcg.get('doan') or {}).get('ten') != seg['ten'] \
-                or any(r7.get(q) != rec.get(q) for q in ('sha256', 'git_commit', 'git_time')):
-            raise GateFileError(f'{w}.kiem_cheo: a {KIEM_CHEO_VERSION} file of segment {seg["ten"]!r} (doan.ten) '
-                                'whose khoa_s7 {sha256, git_commit, git_time} is that of the dossier (KCJ1-14)')
-        kc_segs.add(seg['kiem_cheo']['sha256'])
-        vt = td.get('vai_tro_clip_h')
-        ses = td.get('sha256', {}).get('sessions') if isinstance(td.get('sha256'), dict) else None
-        if not isinstance(vt, dict) or sorted(vt.values()) != sorted(TD_ROLES) or not isinstance(ses, dict) \
-                or set(ses) != set(vt):
-            raise GateFileError(f'{w}.file: vai_tro_clip_h gives the roles {TD_ROLES} once each, and sha256.sessions '
-                                'one session per clip of it (GC6-4)')
-        by_role = {vt[n]: ses[n] for n in vt}
-        models |= {_open_ref(goc, x, f'{w} clip {role}').get('chosen') for role, x in zip(TD_ROLES, clips)}
-        if 'model' in td:
-            tmods.add(td['model'])
-        kcs = (td.get('sha256') or {}).get('kiem_cheo') if isinstance(td.get('sha256'), dict) else None
-        if kcs != seg['kiem_cheo']['sha256']:
-            raise GateFileError(f'{w}.file: sha256.kiem_cheo is not the kiem_cheo.json of the segment (GC10-5)')
-        vid = td.get('sha256', {}).get('clip_h')
-        if isinstance(vid, dict):                        # GC6-4 (round 2): the videos too, when the premise names them
-            for n in vt:
-                sx = next(x for r_, x in zip(TD_ROLES, clips) if r_ == vt[n])
-                if vid.get(n) != _open_ref(goc, sx, f'{w} clip {vt[n]}').get('video_sha256'):
-                    raise GateFileError(f'{w}.file: the video of {n} ({vt[n]}) is not that of its session (GC6-4)')
-        for role, x in zip(TD_ROLES, clips):
-            if by_role[role] != x['sha256']:
-                raise GateFileError(f'{w}: the clip of role {role} is not the session the premise gives for it (GC6-4)')
-    if hs['khoa_kiem_luc']['kiem_cheo']['sha256'] not in kc_segs:
-        raise GateFileError('chuan_u.ho_so_c8: khoa_kiem_luc.kiem_cheo is the kiem_cheo.json of no segment of '
-                            'tien_de_c8.doan (GC10-5)')
-    if len(models) != 1 or not tmods <= models:
-        raise GateFileError(f'tien_de_c8: the clip H sessions of every segment use the models '
-                            f'{sorted(map(str, models))} (premise models {sorted(map(str, tmods))}): one locked model '
-                            '(KC1-1; GC6-4)')
+    _check_premise(d, goc, hs, rec)
     # shifted anchor (design section 10; GC6-6: one manifest for every scoring of every eligible run, the domain it
     # covered = the frames that scoring relies on, before the maximum is taken)
     md = d['camera']['c8b']['moc_dich']
