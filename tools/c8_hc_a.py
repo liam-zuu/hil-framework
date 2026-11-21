@@ -18,13 +18,30 @@ attempt as sigma = half the backward - forward difference of |C|/|E| and taken o
 the repeatability, ratio-spread and straightness gates; a = circular mean of the RAW a_l, and the largest deviation of
 u_a stays on the RAW a_l. The frames must be referenced to the floor marks ('neo_san').
 
+Several camera sessions in one C8 session (CODE 20/11 khuya, contract log "chuoi da session (A)"; session 2 had H0a,
+H2a, H3a): cua_so runs per attempt with the session of the camera segment holding that attempt (one --session; the
+track, F2 rows and F5 carry its session_sha256). tinh reads the session of every attempt from its track JSON
+(session_sha256 of c7_measure track), accepts several --session (each attempt's must be among them) and writes
+session_sha256 (issued attempt) and session_sha256_luot to F7. The largest deviation of u_a compares a_l of every
+attempt of the place with a of the issued one: when an attempt was filmed in another session, that comparison has
+its two ends in two sessions, so the floor-frame error between the two calibrations (c7_khung_giua_session_v1 of
+CAM) enters u_a as u_khung_giua_session: with a phys_v1 file (CODE_KHUNG, Liam 20/11 "Truong tron phys
+(Recommended)") the deformation along the 12b corridor of the place, theo_cho[cho].hanh_lang_12b.du_bien_dang_rad
+(the rotation of the frame cancels point by point in C_l: psi_k and dp_k turn together); with an old file
+asin(2 du_m / L) (shortest long leg of such attempts); without the file of that pair, or a phys file without the
+place, the place is chua_ket_luan (gate khung_giua_session). Same
+session: nothing changes. F8 is read by lan_lap_id only (no measured quantity of two ends is compared here), its F2
+row of this 12b must carry this attempt's session when it names one. The A6 file and kiem_cheo.json are bound
+tables looked up at the tag positions of the issued attempt (plumb point and Z_c are the same in every session,
+L125), not a comparison of two measured ends; their sessions are listed in F7 khung_giua_session for the record.
+
   python tools/c8_hc_a.py kiem DIR [--age-r-max-ms 125]                    # at the floor, log only (~10 s)
   python tools/c8_hc_a.py kiem_video DIR --clip CLIP --session SESSION      # at the floor, sparse video (2-5 min)
   python tools/c8_hc_a.py cua_so DIR... --frames F --track T [--dets D]     # windows (F2) + legs (F5), per attempt
       run 2 (T9b): ... --a6 A6 --xoay X --lan-lap lan_lap.json --ra NEW_DIR  # F5 lan_lap_id from F8 run 1
   python tools/c8_hc_a.py tinh --cho goc|K1|K2 --cap DIR [--them DIR...] --frames-of DIR=frames.csv ...
                           [--neo hieu_chuan_neo.json] [--e-hieu e_hieu.json [--doan NEW_DIR/doan_12b_v1.json]]
-                          [--xoay xoay.json] [--out truc_xe_v1.json]
+                          [--xoay xoay.json] [--session S...] [--khung-giua-session K...] [--out truc_xe_v1.json]
 
 DIR is one attempt folder of c8_hc_seq.py (log.csv, sender.txt, lich.csv, gain_query_*.txt). The video side reads
 the frames CSV of c7_measure track run with tag_offset 0 (tag_x, tag_y, psi = tag heading). The common frame chain of
@@ -1066,7 +1083,7 @@ def _deg_leg(lg):
 
 def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None, psi_cuc=None, cap_ok=True,
                  cap_why=(), bao_q=False, vet=None, psi_cuc_chot=False, need_windows=None, psi_hai_dau=None,
-                 can_hai_dau=None, p_ref_tag=None):
+                 can_hai_dau=None, p_ref_tag=None, khung=None):
     for v in (psi_cuc, psi_hai_dau):                       # HCC3-6: never let max()/sin() hide a bad bound
         if v is not None and not (math.isfinite(v) and 0.0 <= v <= math.pi):
             raise AError(f'can ngoai mien [0, pi]: {v}')
@@ -1089,6 +1106,13 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
     and those of every other attempt still count in the largest deviation (HCC1-10: issuing a is separate from the
     legs of a failed attempt having enough evidence). e_hieu: {leg i: e [m]} of F9 for the issued attempt (each long
     leg needs 0 <= e < L, HCC1-12). need_windows: window indices that must hold >= MIN_FRAMES_TINH frames (HCC1-11).
+    khung (da session, CODE 20/11 khuya): dict of tinh with 'khac' (thu_id of attempts filmed in another camera
+    session than the issued one), 'u_phys_rad' (largest theo_cho[cho].hanh_lang_12b.du_bien_dang_rad of the phys_v1
+    pair files), 'du_m' (largest du_m of the old pair files, c7_khung_giua_session_v1 of CAM), 'cap_thieu' (pairs
+    without a usable file) and 'khong_ro' (attempts whose session is unknown). Attempts of 'khac' with long legs add
+    u_khung_giua_session = max(u_phys_rad, asin(2 du_m / L)) to u_a (their a_l is compared with a across two
+    sessions; L = their shortest long leg); a missing pair fails the gate khung_giua_session; an unknown session is a
+    reason (never khoa). The held-out legs (issued attempt, one session) are checked without that term.
     Every early stop returns the same keys (values None) instead of raising."""
     attempts = [(x[0], x[1], x[2] if len(x) > 2 else ()) for x in attempts]
     res = dict(cho=cho, trang_thai='khoa', ly_do=[], luot_thu=[], a_k_deg=None, u_a_k_deg=None, do_tan_deg=None,
@@ -1124,6 +1148,29 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
     all_long = [lg for _, an, _ in attempts if an is not None for lg in an['legs']
                 if lg['dai'] and lg['trang_thai'] == 'hop_le']
     dev = max(abs(wrap(lg['a_l_tho'] - a)) for lg in all_long)
+    # da session (CODE 20/11 khuya): a_l of an attempt of another camera session vs a of the issued one
+    kg = khung or {}
+    khac = set(kg.get('khac') or [])
+    legs_k = [lg for tid, an, _ in attempts if tid in khac and an is not None for lg in an['legs']
+              if lg['dai'] and lg['trang_thai'] == 'hop_le']
+    u_khung, khung_ok, L_khung = 0.0, True, None
+    if legs_k:
+        # phys_v1 pairs (Liam 20/11 at CODE_KHUNG: "Truong tron phys (Recommended)"): u = the 12b corridor deformation
+        # of the place (rotation cancels point by point: psi_k and dp_k turn together); old pair files: asin(2 du / L)
+        L_khung = min(lg['L_m'] for lg in legs_k)
+        ok = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v >= 0  # noqa
+        du_k, u_p = kg.get('du_m'), kg.get('u_phys_rad')
+        parts = []
+        if du_k is not None:
+            parts.append(math.asin(min(2.0 * du_k / L_khung, 1.0)) if ok(du_k) else None)
+        if u_p is not None:
+            parts.append(float(u_p) if ok(u_p) and u_p <= math.pi else None)
+        if kg.get('cap_thieu') or not parts or any(v is None for v in parts):
+            khung_ok = False
+        else:
+            u_khung = max(parts)
+    if kg.get('khong_ro'):
+        res['ly_do'].append('khong ro session cua luot ' + ', '.join(sorted(kg['khong_ro'])))
     Lmin = min(lg['L_m'] for lg in longs)
     Lsmin = min(lg['Ls_m'] for lg in longs)
     bad = []
@@ -1211,7 +1258,8 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
         u_cuc = float(psi_cuc)
         if not psi_cuc_chot:
             res['ly_do'].append('can C8B: ten truong chua chot (hop dong muc 4.5)')
-    u_a = dev + u_map + u_enc + u_q + u_yaw + u_cuc
+    u_a_cung = dev + u_map + u_enc + u_q + u_yaw + u_cuc  # held-out legs: issued attempt, one session
+    u_a = u_a_cung + u_khung
     gates = dict(
         do_tan=spread <= math.radians(SPREAD_MAX_DEG),
         # HCB4: range on the raw and on the compensated ratio, spread on the compensated one
@@ -1229,9 +1277,11 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
             continue
         u_short = math.asin(min(e / lg['L_m'], 1.0)) + math.asin(min(2 * COUNT_M / lg['Ls_m'], 1.0))
         giu_ngoai.append(dict(i=lg['i'], a_l_deg=math.degrees(lg['a_l']), lech_deg=math.degrees(abs(wrap(lg['a_l'] - a))),
-                              nguong_deg=math.degrees(u_a + u_short),
-                              dat=abs(wrap(lg['a_l'] - a)) <= u_a + u_short))
+                              nguong_deg=math.degrees(u_a_cung + u_short),
+                              dat=abs(wrap(lg['a_l'] - a)) <= u_a_cung + u_short))
     gates['giu_ngoai'] = len(shorts) == len(SHORT_LEGS) and all(g['dat'] for g in giu_ngoai)
+    if legs_k:                                                 # da session: the pair file of CAM is needed
+        gates['khung_giua_session'] = khung_ok
     if vet is None:
         res['ly_do'].append('thieu vet thuc (--moc)')
     else:
@@ -1248,10 +1298,16 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
     elif res['ly_do']:
         res['trang_thai'] = 'chan_doan'
     hang = dict(lech_lon_nhat=math.degrees(dev), u_map=math.degrees(u_map), u_enc=math.degrees(u_enc),
-                u_q=math.degrees(u_q), u_yaw=math.degrees(u_yaw), u_psi_cuc=math.degrees(u_cuc))
+                u_q=math.degrees(u_q), u_yaw=math.degrees(u_yaw), u_psi_cuc=math.degrees(u_cuc),
+                u_khung_giua_session=math.degrees(u_khung))
+    if not khung_ok:
+        thieu_hang.append('u_khung_giua_session')
+        res['ly_do'].append('thieu c7_khung_giua_session_v1 cho cap session cua luot ' + ', '.join(sorted(khac)))
     # HCH1-4: with the C8B bound function a missing bound is null, and so is the sum (the gates above used the
     # partial sum: smaller threshold, stricter); without it the earlier output is kept (listed in u_hang_thieu)
     rong = thieu_hang if can_hai_dau is not None else []
+    if not khung_ok:                                       # a missing cross-session term is never 0 (contract A)
+        rong = sorted(set(rong) | {'u_khung_giua_session'})
     for k in rong:
         hang[k] = None
     out = dict(res, a_k_deg=math.degrees(a), u_a_k_deg=None if rong else math.degrees(u_a),
@@ -1263,7 +1319,13 @@ def place_result(cho, attempts, cap_id, e_hieu=None, q=None, du_m=None, neo=None
                u_hang_deg=hang, u_hang_thieu=sorted(set(thieu_hang)),
                u_q_gom_xoay_q=(not bao_q) or len(legs_u) > len(longs),       # HCV3-5: some leg carries it
                u_q_bao_boi_f9=sorted({tid for tid, an_, _ in attempts if tid == cap_id}) if bao_q else [],
-               cong=gates, giu_ngoai=giu_ngoai, vet_thuc=vet)
+               cong=gates, giu_ngoai=giu_ngoai, vet_thuc=vet,
+               khung_giua_session=dict({k: v for k, v in kg.items() if k not in ('khac', 'khong_ro')},
+                                       luot_khac_session=sorted(khac), khong_ro=sorted(kg.get('khong_ro') or []),
+                                       L_m=L_khung, u_deg=math.degrees(u_khung) if khung_ok else None,
+                                       cach='u = lon nhat qua cac cap session: file phys_v1 -> theo_cho[cho].'
+                                            'hanh_lang_12b.du_bien_dang_rad; file cu -> asin(2 du_m / L), L = doan '
+                                            'dai ngan nhat cua cac luot khac session luot cap; cung session: 0'))
     if neo is not None:
         out['phi_hat_chuan_k_deg'] = math.degrees(wrap(math.radians(neo) - a))
         out['u_phi_hat_chuan_k_deg'] = out['u_a_k_deg']
@@ -1402,17 +1464,20 @@ def cmd_cua_so(a):
     an = analyse(A, F, info)
     clip_sha = sha256(a.clip) if a.clip else None
     tj0 = json.load(open(a.track, encoding='utf-8'))
-    for k_t, v in (('video_sha256', clip_sha), ('session_sha256', sha256(a.session) if a.session else None),
-                   ('frames_sha256', sha256(a.frames))):
+    ses_sha = sha256(a.session) if a.session else a.session_sha256
+    # da session (CODE 20/11 khuya): one attempt = one camera segment; the session given (file or sha) must be the
+    # session the track was made with; none given -> the track's own session_sha256 goes to F2 and F5
+    for k_t, v in (('video_sha256', clip_sha), ('session_sha256', ses_sha), ('frames_sha256', sha256(a.frames))):
         if tj0.get(k_t) and v and tj0[k_t] != v:          # HCC2-5 (round 3): the track was made from another file
             raise AError(f'{a.track}: {k_t} khac file dua vao cua_so')
+    ses_sha = ses_sha or (tj0.get('session_sha256') if isinstance(tj0.get('session_sha256'), str) else None) or None
     S = json.load(open(a.session, encoding='utf-8')) if a.session else {}
-    ses_sha = sha256(a.session) if a.session else a.session_sha256
     # F8 (T9b, CODE 20/11): lan_lap_id of this 12b from NHACTAM lan_lap_v1 run 1; read before any file is written
     ll_id, ll_why, ll_sha = None, 'chua co --lan-lap (F8 lan_lap_v1 cua NHACTAM)', None
     lan_lap, ra_dir = getattr(a, 'lan_lap', None), getattr(a, 'ra', None)
     if lan_lap:
-        ll_id, ll_why, ll_sha = read_lan_lap(lan_lap, A['thu_id'], A['cho'], a.a6, clip_sha, sha256(a.frames))
+        ll_id, ll_why, ll_sha = read_lan_lap(lan_lap, A['thu_id'], A['cho'], a.a6, clip_sha, sha256(a.frames),
+                                             ses_sha=ses_sha)
     ra = ra_dir or a.dir                     # run 2 (with --a6 --xoay --lan-lap) writes to a new folder (mode x)
     if ra_dir:
         os.makedirs(ra, exist_ok=True)
@@ -1612,7 +1677,7 @@ def _f2_rows(path):
     return o
 
 
-def read_lan_lap(path, thu_id, cho, a6_path, clip_sha, frames_sha):
+def read_lan_lap(path, thu_id, cho, a6_path, clip_sha, frames_sha, ses_sha=None):
     """(lan_lap_id or None, reason or None, sha256 of the file) of a 12b attempt from F8 lan_lap_v1 of NHACTAM (run 1
     of lan_lap, without --f15 / --truc-xe; CODE 20/11, sequence T9, T9b). F8 has one luot[] record per car run
     (windows pre/post), none for a 12b attempt: the placement of the 12b is the lan_lap_id that F8 gives to the runs of
@@ -1620,7 +1685,10 @@ def read_lan_lap(path, thu_id, cho, a6_path, clip_sha, frames_sha):
     counts too). Exactly one value -> that id; none, or several -> None with the reason (F5 stays chan_doan).
     A file that is not this session's F8 is refused (AError, code 2): schema lan_lap_v1; tam_id of the file and of every
     record = c8b_a6_v2.tam_id of --a6; a6.sha256 = the --a6 file; its F2 file present with the sha256 it names and
-    holding the ref_12b window of this attempt (same luot_id, cho, clip_sha256, frames_sha256)."""
+    holding the ref_12b window of this attempt (same luot_id, cho, clip_sha256, frames_sha256 and, da session CODE
+    20/11 khuya, the session_sha256 of this attempt when the row and the caller both name one: the F2 of F8 is the
+    joined file of every camera segment). lan_lap_id is an identifier: a run of F8 verified in another session than
+    this 12b is NHACTAM's two-session comparison (its u_khung_giua_session), nothing is compared here."""
     tam = a6_tam_id(a6_path)
     if tam is None:
         raise AError('--lan-lap can --a6 co tam_id (c8b_a6_v2.tam_id)')
@@ -1635,8 +1703,9 @@ def read_lan_lap(path, thu_id, cho, a6_path, clip_sha, frames_sha):
     if not f2 or not os.path.isfile(f2) or sha256(f2) != f2_sha:
         raise AError(f'{path}: file F2 cua F8 ({f2}) khong co hay sha256 khac cua_so_v1_sha256')
     if not any(r.get('luot_id') == thu_id and r.get('cho') == cho and r.get('loai') == 'ref_12b'
-               and r.get('clip_sha256') == clip_sha and r.get('frames_sha256') == frames_sha for r in _f2_rows(f2)):
-        raise AError(f'{path}: F2 cua F8 khong co cua so ref_12b cua {thu_id} ({cho}) voi cung clip, frames')
+               and r.get('clip_sha256') == clip_sha and r.get('frames_sha256') == frames_sha
+               and (ses_sha is None or r.get('session_sha256') in (None, ses_sha)) for r in _f2_rows(f2)):
+        raise AError(f'{path}: F2 cua F8 khong co cua so ref_12b cua {thu_id} ({cho}) voi cung clip, frames, session')
     luot = j.get('luot')
     if not isinstance(luot, list) or not all(isinstance(r, dict) for r in luot):
         raise AError(f'{path}: luot phai la danh sach ban ghi')
@@ -1772,10 +1841,93 @@ def check_cap_sources(d, frames, track, log_path, a6, xoay, need):
         raise AError(f'{p5}: {bad} khac nguon dang tinh')
 
 
+def track_session(track_json):
+    """session_sha256 of a c7_measure track JSON (the session the frames were made with), or None when absent."""
+    tj = json.load(open(track_json, encoding='utf-8'))
+    s = tj.get('session_sha256') if isinstance(tj, dict) else None
+    return s if isinstance(s, str) and s else None
+
+
+KHUNG_SCHEMA = 'c7_khung_giua_session_v1'
+
+
+def read_khung_giua_session(paths):
+    """{frozenset(two session_sha256): dict(du_m, n_moc, sha256, duong_dan)} from the c7_khung_giua_session_v1 files
+    of CAM (contract log 20/11 khuya, chuoi da session (A): pair of session_sha256, du_m = largest floor-frame
+    difference over the marks rebuilt by both sessions, before the margin, n_moc, sources + SHA). phys_v1 files (CODE_KHUNG
+    design 2026-11-21 v1, Liam 20/11 at CODE_KHUNG: "Truong tron phys (Recommended)") add theo_cho[cho]: the HIEUCHUAN
+    term is theo_cho[cho].hanh_lang_12b.du_bien_dang_rad, kept here as {cho: rad} (a file without theo_cho: None, the
+    old asin(2 du / L) is used). A malformed file or value, or two files for the same pair: AError (code 2)."""
+    out = {}
+    for p in paths or []:
+        j = json.load(open(p, encoding='utf-8'))
+        if not isinstance(j, dict) or j.get('schema') != KHUNG_SCHEMA:
+            raise AError(f'{p}: khong phai {KHUNG_SCHEMA}')
+        pair = j.get('session_sha256')
+        if not (isinstance(pair, list) and len(pair) == 2 and all(isinstance(s, str) and s for s in pair)
+                and pair[0] != pair[1]):
+            raise AError(f'{p}: session_sha256 phai la hai sha khac nhau')
+        du, n = j.get('du_m'), j.get('n_moc')
+        if isinstance(du, bool) or not isinstance(du, (int, float)) or not math.isfinite(du) or du < 0:
+            raise AError(f'{p}: du_m {du!r} (can so huu han >= 0)')
+        if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+            raise AError(f'{p}: n_moc {n!r} (can so nguyen >= 1)')
+        k = frozenset(pair)
+        if k in out:
+            raise AError(f'{p}: hai file cho cung cap session')
+        tc = j.get('theo_cho')
+        hl = None
+        if tc is not None:                       # phys_v1 (CODE_KHUNG design 2026-11-21 v1 section 3)
+            if not isinstance(tc, dict):
+                raise AError(f'{p}: theo_cho phai la doi tuong theo cho')
+            hl = {}
+            for cho, b in tc.items():
+                v = ((b or {}).get('hanh_lang_12b') or {}).get('du_bien_dang_rad') if isinstance(b, dict) else None
+                if v is None:
+                    continue                     # this place has no 12b corridor value: missing for that place
+                if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not 0 <= v <= math.pi:
+                    raise AError(f'{p}: theo_cho.{cho}.hanh_lang_12b.du_bien_dang_rad {v!r} (can so huu han trong [0, pi])')
+                hl[cho] = float(v)
+        out[k] = dict(du_m=float(du), n_moc=n, sha256=sha256(p), duong_dan=os.path.abspath(p),
+                      mo_hinh=j.get('mo_hinh'), hanh_lang_12b_du_bien_dang_rad=hl)
+    return out
+
+
+def _sessions_named(path, kind):
+    """Sorted session_sha256 a source file names (for the F7 record only, never a check): A6 (c8b_a6_v2) by its
+    top-level session_sha256 and its nguon rows of role 'session'; kiem_cheo.json by sessions.*.sha256. None without
+    a path, [] when the file names none or is not readable as JSON."""
+    if not path:
+        return None
+    try:
+        j = json.load(open(path, encoding='utf-8'))
+    except (OSError, ValueError):
+        return []
+    out = set()
+    if not isinstance(j, dict):
+        return []
+    if kind == 'a6':
+        if isinstance(j.get('session_sha256'), str):
+            out.add(j['session_sha256'])
+        for n in j.get('nguon') or []:
+            if isinstance(n, dict) and 'session' in (n.get('vai'), n.get('vai_tro')) and isinstance(n.get('sha256'), str):
+                out.add(n['sha256'])
+    else:
+        for v in (j.get('sessions') or {}).values() if isinstance(j.get('sessions'), dict) else []:
+            if isinstance(v, dict) and isinstance(v.get('sha256'), str):
+                out.add(v['sha256'])
+    return sorted(out)
+
+
 def cmd_tinh(a):
     attempts, cap_ok, cap_why, cap_ref, cap_F = [], True, [], None, None
     cap_id = os.path.basename(os.path.normpath(a.cap))
     nguon = []
+    ses_files = list(getattr(a, 'session', None) or [])
+    ses_given = {sha256(p) for p in ses_files}
+    nguon += [dict(vai_tro='session', duong_dan=os.path.abspath(p), sha256=sha256(p)) for p in ses_files]
+    khung_files = read_khung_giua_session(getattr(a, 'khung_giua_session', None))
+    att_ses = {}
     for d in [a.cap] + list(a.them or []):
         A = load_attempt(d)
         if A['cho'] != a.cho:
@@ -1784,6 +1936,9 @@ def cmd_tinh(a):
         if not fr:
             raise AError(f'{d}: --frames-of {d}=FRAMES,TRACK missing')
         frames, track = fr.split(',')
+        att_ses[A['thu_id']] = s_t = track_session(track)        # da session: session of this attempt's track
+        if ses_given and s_t is not None and s_t not in ses_given:
+            raise AError(f'{track}: session_sha256 {s_t[:12]} khong nam trong cac --session')
         ck, info = kiem(A)
         failed = [n for n, ok, _ in ck if not ok]
         is_cap = A['thu_id'] == cap_id
@@ -1822,6 +1977,9 @@ def cmd_tinh(a):
         f5 = json.load(open(dp, encoding='utf-8'))
         if f5.get('thu_id') != cap_id or f5.get('cho') != a.cho:
             raise AError(f'{dp}: F5 cua {f5.get("thu_id")} ({f5.get("cho")}), khong phai luot cap {cap_id} ({a.cho})')
+        s5, s_cap = f5.get('session_sha256'), att_ses.get(cap_id)
+        if s5 and s_cap and s5 != s_cap:                  # da session: F9 of the issued attempt's own session
+            raise AError(f'{dp}: F5 session_sha256 khac session cua track luot cap')
         ll_f5 = f5.get('lan_lap_id')
         nguon += [dict(vai_tro='e_hieu_m', duong_dan=os.path.abspath(a.e_hieu), sha256=sha256(a.e_hieu)),
                   dict(vai_tro='doan_12b_v1', duong_dan=os.path.abspath(dp), sha256=sha256(dp))]
@@ -1875,10 +2033,39 @@ def cmd_tinh(a):
     roles = dict((lo, k) for k, lo in window_roles(load_attempt(a.cap)['segs']))
     need = sorted(k for k, lo in window_roles(load_attempt(a.cap)['segs']) if lo in ('ref_12b', 'dung_12b'))
     del roles
+    # da session (CODE 20/11 khuya): attempts of this place filmed in another camera session than the issued one
+    s_cap = att_ses.get(cap_id)
+    khong_ro = sorted(t for t, s in att_ses.items() if s is None) if len(att_ses) > 1 else []
+    khac = sorted(t for t, s in att_ses.items() if t != cap_id and s is not None and s_cap is not None and s != s_cap)
+    cap_khung, thieu_cap = [], []
+    du_tho, u_phys = [], []
+    for s in sorted({att_ses[t] for t in khac}):
+        f = khung_files.get(frozenset((s_cap, s)))
+        if f is None:
+            thieu_cap.append(s)
+            continue
+        hl = f['hanh_lang_12b_du_bien_dang_rad']
+        if hl is None:                                    # old file: the coarse asin(2 du / L) bound
+            cach = 'asin(2 du_m / L)'
+            du_tho.append(f['du_m'])
+        elif a.cho in hl:                                 # phys_v1: deformation along the 12b corridor of the place
+            cach = 'phys: theo_cho.hanh_lang_12b.du_bien_dang_rad'
+            u_phys.append(hl[a.cho])
+        else:                                             # phys file without this place: missing (design 3)
+            thieu_cap.append(s)
+            cach = f'phys: thieu theo_cho.{a.cho}.hanh_lang_12b.du_bien_dang_rad'
+        cap_khung.append(dict(f, session_sha256=[s_cap, s], cach=cach))
+        nguon.append(dict(vai_tro='khung_giua_session', duong_dan=f['duong_dan'], sha256=f['sha256']))
+    kg = dict(khac=khac, khong_ro=khong_ro, cap=cap_khung, cap_thieu=thieu_cap,
+              du_m=max(du_tho) if du_tho else None, u_phys_rad=max(u_phys) if u_phys else None,
+              a6_session_sha256=_sessions_named(a.a6, 'a6'), kc_session_sha256=_sessions_named(a.kc, 'kc'))
     r = place_result(a.cho, attempts, cap_id, e_hieu=e, q=q, du_m=du, neo=neo, psi_cuc=psi_cuc, cap_ok=cap_ok,
                      cap_why=cap_why, bao_q=bao_q, vet=vet, psi_cuc_chot=chot, need_windows=need, psi_hai_dau=psi_hd,
-                     can_hai_dau=can_fn, p_ref_tag=p_ref_tag)
+                     can_hai_dau=can_fn, p_ref_tag=p_ref_tag, khung=kg)
+    for x in r['luot_thu']:
+        x['session_sha256'] = att_ses.get(x['thu_id'])
     r = dict(schema='truc_xe_v1', version=VERSION, commit_hil=commit_hil(), nguon=nguon,
+             session_sha256=s_cap, session_sha256_luot=dict(sorted(att_ses.items())),
              mien_hieu_luc=dict(cho=a.cho, thu_id_cap=cap_id, lan_lap_id=ll_f5,
                                 ghi_chu='cung buoi, cung lan lap tam' + (
                                     ' (lan_lap_id cua F5, tu F8 lan_lap_v1 luot 1 cua NHACTAM)' if ll_f5 else
@@ -2004,6 +2191,11 @@ def main(argv=None):
     t.add_argument('--moc', default=None, help='moc_san_do_32.csv: real swept footprint (vet thuc)')
     t.add_argument('--vien-mm', type=float, default=10.0)
     t.add_argument('--d-vet-mm', type=float, default=20.0, help='tag centre to body box centre bound [de xuat]')
+    t.add_argument('--session', nargs='*', default=None, help='session JSON files of the camera segments (da session); '
+                                                              'each attempt track session must be one of them')
+    t.add_argument('--khung-giua-session', nargs='*', default=None,
+                   help='c7_khung_giua_session_v1 files of CAM (one per session pair; needed when an attempt of the '
+                        'place was filmed in another session than the issued one)')
     t.add_argument('--out', default=None)
     a = ap.parse_args(argv)
     if a.cmd == 'tinh':

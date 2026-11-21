@@ -1532,3 +1532,259 @@ def test_hcb4_u_yaw_is_the_path_mean_of_camera_minus_imu(tmp_path):
     assert result(d0, 'K2')['u_hang_deg']['u_yaw'] < 0.02
 
 
+# ------------------------------------------------------------------ da session (CODE 20/11 khuya, contract A)
+def _set_track_session(d, sha):
+    p = os.path.join(d, 'track.json')
+    tj = json.load(open(p, encoding='utf-8'))
+    if sha is None:
+        tj.pop('session_sha256', None)
+    else:
+        tj['session_sha256'] = sha
+    write_json(p, tj)
+
+
+def _khung(tmp_path, name, pair, du=0.002, n=24, **kw):
+    o = dict(schema='c7_khung_giua_session_v1', session_sha256=list(pair), du_m=du, n_moc=n,
+             nguon=[dict(vai_tro='session', sha256=s) for s in pair])
+    o.update(kw)
+    return write_json(str(tmp_path / f'{name}.json'), o)
+
+
+def _two(tmp_path, s1, s2):
+    d1, _ = make(tmp_path, 'HC_K2_1', cho='K2')
+    d2, _ = make(tmp_path, 'HC_K2_2', cho='K2')
+    _set_track_session(d1, s1)
+    _set_track_session(d2, s2)
+
+    def run(name, *extra):
+        out = str(tmp_path / f'{name}.json')
+        rc = ca.main(['tinh', '--cho', 'K2', '--cap', d1, '--them', d2, '--frames-of',
+                      f"{d1}={os.path.join(d1, 'frames.csv')},{os.path.join(d1, 'track.json')}",
+                      f"{d2}={os.path.join(d2, 'frames.csv')},{os.path.join(d2, 'track.json')}", '--out', out, *extra])
+        return rc, (json.load(open(out, encoding='utf-8')) if os.path.isfile(out) else None)
+    return d1, d2, run
+
+
+def test_tinh_same_session_adds_nothing_and_records_sessions(tmp_path):
+    A_, B_ = 'a' * 64, 'b' * 64
+    d1, d2, run = _two(tmp_path, A_, A_)
+    rc, r = run('same')
+    assert rc in (0, 1) and r['session_sha256'] == A_
+    assert r['session_sha256_luot'] == {'HC_K2_1': A_, 'HC_K2_2': A_}
+    assert [x['session_sha256'] for x in r['luot_thu']] == [A_, A_]
+    k = r['khung_giua_session']
+    assert k['luot_khac_session'] == [] and k['u_deg'] == 0.0 and k['L_m'] is None and k['khong_ro'] == []
+    assert r['u_hang_deg']['u_khung_giua_session'] == 0.0 and 'khung_giua_session' not in r['cong']
+    # a pair file for an unrelated pair changes nothing
+    rc2, r2 = run('same_k', '--khung-giua-session', _khung(tmp_path, 'kab', (A_, B_)))
+    assert r2['u_a_k_deg'] == r['u_a_k_deg'] and r2['khung_giua_session']['cap'] == []
+
+
+def test_tinh_other_session_needs_pair_file_and_adds_u(tmp_path):
+    A_, B_, C_ = 'a' * 64, 'b' * 64, 'c' * 64
+    d1, d2, run = _two(tmp_path, A_, A_)
+    _, same = run('same')
+    _set_track_session(d2, B_)
+    rc, r = run('miss')                                   # no pair file: chua_ket_luan, term and sum null
+    assert rc == 1 and r['trang_thai'] == 'chua_ket_luan' and r['cong']['khung_giua_session'] is False
+    assert r['u_a_k_deg'] is None and r['u_hang_deg']['u_khung_giua_session'] is None
+    assert 'u_khung_giua_session' in r['u_hang_thieu']
+    assert any('thieu c7_khung_giua_session_v1' in w and 'HC_K2_2' in w for w in r['ly_do'])
+    assert r['khung_giua_session']['luot_khac_session'] == ['HC_K2_2'] and r['khung_giua_session']['cap_thieu'] == [B_]
+    rc, r = run('wrong', '--khung-giua-session', _khung(tmp_path, 'kac', (A_, C_)))   # file of another pair
+    assert r['cong']['khung_giua_session'] is False and r['u_a_k_deg'] is None
+    kf = _khung(tmp_path, 'kba', (B_, A_), du=0.002)     # pair order does not matter
+    rc, r = run('ok', '--khung-giua-session', kf)
+    k = r['khung_giua_session']
+    assert r['cong']['khung_giua_session'] is True and k['du_m'] == 0.002 and k['cap'][0]['sha256'] == ca.sha256(kf)
+    u = math.degrees(math.asin(2 * 0.002 / k['L_m']))
+    assert k['u_deg'] == pytest.approx(u) and r['u_hang_deg']['u_khung_giua_session'] == pytest.approx(u)
+    assert 0.3 < k['L_m'] < 2.0 and u > 0.05
+    assert r['u_a_k_deg'] == pytest.approx(same['u_a_k_deg'] + u)
+    # the held-out legs of the issued attempt (one session) keep the same-session threshold
+    assert [g['nguong_deg'] for g in r['giu_ngoai']] == pytest.approx([g['nguong_deg'] for g in same['giu_ngoai']])
+    assert any(n['vai_tro'] == 'khung_giua_session' and n['sha256'] == ca.sha256(kf) for n in r['nguon'])
+    big = _khung(tmp_path, 'kbig', (A_, B_), du=0.004)
+    _, r4 = run('big', '--khung-giua-session', big)
+    assert r4['u_hang_deg']['u_khung_giua_session'] == pytest.approx(math.degrees(math.asin(2 * 0.004 / k['L_m'])))
+
+
+def test_tinh_session_files_and_unknown_session(tmp_path, capsys):
+    s1 = write_json(str(tmp_path / 'ses1.json'), dict(fit_ids=[1], car_side_m=0.3, tag_h_m=0.2))
+    s2 = write_json(str(tmp_path / 'ses2.json'), dict(fit_ids=[2], car_side_m=0.3, tag_h_m=0.2))
+    d1, d2, run = _two(tmp_path, ca.sha256(s1), ca.sha256(s2))
+    kf = _khung(tmp_path, 'k12', (ca.sha256(s1), ca.sha256(s2)))
+    rc, r = run('both', '--session', s1, s2, '--khung-giua-session', kf)
+    assert rc in (0, 1) and r['session_sha256'] == ca.sha256(s1)
+    assert sorted(n['sha256'] for n in r['nguon'] if n['vai_tro'] == 'session') == sorted([ca.sha256(s1),
+                                                                                            ca.sha256(s2)])
+    capsys.readouterr()
+    rc, r = run('one', '--session', s1, '--khung-giua-session', kf)    # HC_K2_2 filmed in a session not given
+    assert rc == 2 and r is None and 'khong nam trong cac --session' in capsys.readouterr().out
+    _set_track_session(d2, None)                                        # session unknown: never khoa
+    rc, r = run('unk')
+    assert any('khong ro session cua luot HC_K2_2' in w for w in r['ly_do']) and r['trang_thai'] != 'khoa'
+    assert r['khung_giua_session']['khong_ro'] == ['HC_K2_2'] and r['session_sha256_luot']['HC_K2_2'] is None
+
+
+def test_held_out_legs_ignore_the_cross_session_term(tmp_path):
+    """The held-out short legs belong to the issued attempt (one session): a short leg off by more than the
+    same-session threshold fails even when u_khung_giua_session makes u_a larger."""
+    d1, _ = make(tmp_path, 'HC_K2_1', cho='K2')
+    d2, _ = make(tmp_path, 'HC_K2_2', cho='K2')
+    kw = dict(e_hieu=E(0.002), q=[0.0, 0.0], du_m=0.0, neo=0.0, psi_cuc=0.0)
+    r0 = ca.place_result('K2', [('c', analyse(d1)), ('o', analyse(d2))], 'c', **kw)
+    an = analyse(d1)
+    k = dict(khac=['o'], du_m=0.02)
+    r1 = ca.place_result('K2', [('c', analyse(d1)), ('o', analyse(d2))], 'c', khung=k, **kw)
+    u_k = math.radians(r1['u_hang_deg']['u_khung_giua_session'])
+    assert u_k > math.radians(1.0)
+    g0 = r0['giu_ngoai'][0]
+    short = [lg for lg in an['legs'] if not lg['dai']][0]
+    short['a_l'] = math.radians(r0['a_k_deg'] + g0['nguong_deg']) + 0.5 * u_k     # between the two thresholds
+    r2 = ca.place_result('K2', [('c', an), ('o', analyse(d2))], 'c', khung=k, **kw)
+    g = [x for x in r2['giu_ngoai'] if x['i'] == short['i']][0]
+    assert g['nguong_deg'] == pytest.approx(g0['nguong_deg']) and g['dat'] is False
+    assert r2['cong']['giu_ngoai'] is False
+
+
+def _phys(**theo_cho):
+    return dict(mo_hinh='phys_v1', k_se=3.0, rho_m=0.40, truoc_le=True,
+                theo_cho={c: dict(xy_m=[0, 0], hanh_lang_12b=dict(du_xoay_rad=1e-5, du_thang=1e-4,
+                                                                  du_bien_dang_rad=v)) for c, v in theo_cho.items()})
+
+
+def test_tinh_phys_file_uses_corridor_deformation(tmp_path):
+    """CODE_KHUNG phys_v1 (Liam 20/11 at CODE_KHUNG: "Truong tron phys (Recommended)"): the HIEUCHUAN term is
+    theo_cho[cho].hanh_lang_12b.du_bien_dang_rad of the place, not asin(2 du_m / L); a phys file without the place is
+    missing (chua_ket_luan)."""
+    A_, B_ = 'a' * 64, 'b' * 64
+    d1, d2, run = _two(tmp_path, A_, A_)
+    _, same = run('same')
+    _set_track_session(d2, B_)
+    kf = _khung(tmp_path, 'kp', (A_, B_), du=0.0005, **_phys(K2=1.0e-4, K1=3.0e-4))
+    rc, r = run('phys', '--khung-giua-session', kf)
+    k = r['khung_giua_session']
+    assert r['cong']['khung_giua_session'] is True and k['u_phys_rad'] == 1.0e-4 and k['du_m'] is None
+    assert r['u_hang_deg']['u_khung_giua_session'] == pytest.approx(math.degrees(1.0e-4))
+    assert r['u_hang_deg']['u_khung_giua_session'] < math.degrees(math.asin(2 * 0.0005 / k['L_m'])) / 10
+    assert r['u_a_k_deg'] == pytest.approx(same['u_a_k_deg'] + math.degrees(1.0e-4))
+    assert 'phys' in k['cap'][0]['cach'] and k['cap'][0]['mo_hinh'] == 'phys_v1'
+    kn = _khung(tmp_path, 'kp_no_k2', (A_, B_), du=0.0005, **_phys(K1=3.0e-4))
+    rc, r = run('phys_no_k2', '--khung-giua-session', kn)
+    assert rc == 1 and r['trang_thai'] == 'chua_ket_luan' and r['cong']['khung_giua_session'] is False
+    assert r['u_a_k_deg'] is None and r['khung_giua_session']['cap_thieu'] == [B_]
+    assert 'thieu theo_cho.K2' in r['khung_giua_session']['cap'][0]['cach']
+
+
+def test_place_result_cross_session_term_is_the_largest_pair():
+    """Old and phys pair files together: the larger term; a bad value or a missing pair: no term (gate fails)."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as t:
+        d1, _ = make(__import__('pathlib').Path(t), 'HC_K2_1', cho='K2')
+        an = analyse(d1)
+    kw = dict(e_hieu=E(0.002), q=[0.0, 0.0], du_m=0.0, neo=0.0, psi_cuc=0.0)
+    att = [('c', an), ('o', an)]
+    L = min(lg['L_m'] for lg in an['legs'] if lg['dai'] and lg['trang_thai'] == 'hop_le')
+    u_tho = math.asin(2 * 0.002 / L)
+    for u_p, want in ((1e-5, u_tho), (0.05, 0.05)):
+        r = ca.place_result('K2', att, 'c', khung=dict(khac=['o'], du_m=0.002, u_phys_rad=u_p), **kw)
+        assert math.radians(r['u_hang_deg']['u_khung_giua_session']) == pytest.approx(want)
+    r = ca.place_result('K2', att, 'c', khung=dict(khac=['o'], u_phys_rad=2e-4), **kw)
+    assert math.radians(r['u_hang_deg']['u_khung_giua_session']) == pytest.approx(2e-4)
+    for bad in (dict(u_phys_rad=-1e-4), dict(u_phys_rad=float('nan')), dict(du_m=-0.001), dict(),
+                dict(u_phys_rad=1e-4, cap_thieu=['x'])):
+        r = ca.place_result('K2', att, 'c', khung=dict(khac=['o'], **bad), **kw)
+        assert r['cong']['khung_giua_session'] is False and r['u_a_k_deg'] is None, bad
+
+
+def test_read_khung_giua_session_phys_values(tmp_path):
+    A_, B_ = 'a' * 64, 'b' * 64
+    f = ca.read_khung_giua_session([_khung(tmp_path, 'p', (A_, B_), **_phys(goc=1e-4, K1=2e-4))])[frozenset((A_, B_))]
+    assert f['hanh_lang_12b_du_bien_dang_rad'] == {'goc': 1e-4, 'K1': 2e-4} and f['mo_hinh'] == 'phys_v1'
+    assert ca.read_khung_giua_session([_khung(tmp_path, 'o', (A_, B_))])[frozenset((A_, B_))][
+        'hanh_lang_12b_du_bien_dang_rad'] is None
+    p = _khung(tmp_path, 'p2', (A_, B_), theo_cho=dict(K2=dict(xy_m=[0, 0])))        # place without the value
+    assert ca.read_khung_giua_session([p])[frozenset((A_, B_))]['hanh_lang_12b_du_bien_dang_rad'] == {}
+    for name, v in (('neg', -1e-4), ('nan', float('nan')), ('bool', True), ('str', '1e-4'), ('big', 4.0)):
+        with pytest.raises(ca.AError):
+            ca.read_khung_giua_session([_khung(tmp_path, f'b_{name}', (A_, B_), **_phys(K2=v))])
+    with pytest.raises(ca.AError):
+        ca.read_khung_giua_session([_khung(tmp_path, 'b_list', (A_, B_), theo_cho=[1, 2])])
+
+
+def test_read_khung_giua_session_refuses_bad_files(tmp_path):
+    A_, B_ = 'a' * 64, 'b' * 64
+    good = _khung(tmp_path, 'g', (A_, B_))
+    assert ca.read_khung_giua_session([good])[frozenset((A_, B_))]['du_m'] == 0.002
+    assert ca.read_khung_giua_session(None) == {}
+    bad = [_khung(tmp_path, 'b1', (A_, B_), schema='c7_khung_v0'), _khung(tmp_path, 'b2', (A_, A_)),
+           _khung(tmp_path, 'b3', (A_,)), _khung(tmp_path, 'b4', (A_, B_), du=-0.001),
+           _khung(tmp_path, 'b5', (A_, B_), du=float('nan')), _khung(tmp_path, 'b6', (A_, B_), du=True),
+           _khung(tmp_path, 'b7', (A_, B_), n=0), _khung(tmp_path, 'b8', (A_, B_), n=2.0),
+           _khung(tmp_path, 'b9', (A_, ''))]
+    for p in bad:
+        with pytest.raises(ca.AError):
+            ca.read_khung_giua_session([p])
+    with pytest.raises(ca.AError):                                   # two files for one pair
+        ca.read_khung_giua_session([good, _khung(tmp_path, 'g2', (B_, A_), du=0.001)])
+
+
+def test_cua_so_session_from_track_and_checked(tmp_path):
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
+    _set_track_session(d, 'a' * 64)
+    base = ['cua_so', d, '--frames', os.path.join(d, 'frames.csv'), '--track', os.path.join(d, 'track.json')]
+    assert ca.main(base + ['--session-sha256', 'b' * 64, '--ra', str(tmp_path / 'x')]) == 2     # other session
+    assert not (tmp_path / 'x' / 'doan_12b_v1.json').exists()
+    assert ca.main(base) == 0                                          # none given: the track's session
+    f5 = json.load(open(os.path.join(d, 'doan_12b_v1.json'), encoding='utf-8'))
+    rows = [json.loads(x) for x in open(os.path.join(d, 'cua_so_v1.jsonl'), encoding='utf-8')]
+    assert f5['session_sha256'] == 'a' * 64 and {r['session_sha256'] for r in rows} == {'a' * 64}
+
+
+def test_cua_so_run2_f8_row_of_other_session(tmp_path, monkeypatch):
+    """The F2 of F8 is the joined file of every segment: its ref_12b row of this attempt must name this session."""
+    d, f2, a6, f8, run2 = _f8_setup(tmp_path, monkeypatch)
+    ses = str(tmp_path / 'session.json')
+    rows = [json.loads(x) for x in open(f2, encoding='utf-8')]
+
+    def f2_with(name, s):
+        p = str(tmp_path / f'{name}.jsonl')
+        with open(p, 'w', encoding='utf-8') as f:
+            for r in rows:
+                f.write(json.dumps(dict(r, session_sha256=s)) + '\n')
+        return p
+    good = [_rec('C8_1', 'K2', 'L0', 'HC_K2_1')]
+    for name, s, rc_want in (('other', 'f' * 64, 2), ('same', ca.sha256(ses), 0), ('none', None, 0)):
+        p = f2_with(f'f2_{name}', s)
+        rc, f5 = run2(f8(f'll_{name}', good, cua_so_v1_file=p, cua_so_v1_sha256=ca.sha256(p)), f'r_{name}')
+        assert rc == rc_want, name
+        if rc_want == 0:
+            assert f5['lan_lap_id'] == 'L0' and f5['session_sha256'] == ca.sha256(ses)
+
+
+def test_tinh_refuses_f5_of_other_session(tmp_path, capsys):
+    """The F5 (and so the F9) of the issued attempt must be of the session of its track."""
+    import hashlib
+    d, _ = make(tmp_path, 'HC_K2_1', cho='K2')
+    _set_track_session(d, 'a' * 64)
+    run_cua_so(d)
+    dp = os.path.join(d, 'doan_12b_v1.json')
+
+    def f5_f9(name, s):
+        f5 = json.load(open(dp, encoding='utf-8'))
+        f5['session_sha256'] = s
+        f5.pop('sha256')
+        f5['sha256'] = hashlib.sha256(json.dumps(f5, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        p5 = write_json(str(tmp_path / f'{name}_f5.json'), f5)
+        p9 = write_json(str(tmp_path / f'{name}_f9.json'), dict(doan_12b_sha256=f5['sha256'], trang_thai='dat',
+                                                                doan=[dict(i=x['i'], e_hieu_m=0.0) for x in f5['doan']]))
+        return p5, p9
+    p5, p9 = f5_f9('ok', 'a' * 64)
+    assert ca.main(tinh_args(d, 'K2', '--e-hieu', p9, '--doan', p5, '--out', str(tmp_path / 'ok.json'))) in (0, 1)
+    p5, p9 = f5_f9('bad', 'e' * 64)
+    capsys.readouterr()
+    assert ca.main(tinh_args(d, 'K2', '--e-hieu', p9, '--doan', p5, '--out', str(tmp_path / 'bad.json'))) == 2
+    assert 'F5 session_sha256 khac session' in capsys.readouterr().out
+
+
