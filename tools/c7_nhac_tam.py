@@ -876,6 +876,7 @@ TEN = dict(
     f15='c7_meo_dau_chan_bang_v1', k_sha='khung_sha256', ma_sha='khung_ma_hop_le_sha256',
     tx_f6='hieu_chuan_neo', tx_a6='c8b_a6_v2',
     a6_g='g_b', a6_eps_g='eps_g',
+    kgs='c7_khung_giua_session_v1', kgs_ses='session_sha256', kgs_du='du_m', kgs_n='n_moc',
 )
 CHO = ('goc', 'K1', 'K2')
 LOAI_KHOP = ('ref_12b', 'dung_12b', 'E_dau', 'E_cuoi')        # v4 1: fit set
@@ -1389,6 +1390,148 @@ class LLCtx:
         self.det = cm.make_detector()
 
 
+class CtxMap(dict):
+    """v4 14 (CODE 20/11, chain with several sessions): {session_sha256: LLCtx}; every window is measured and every
+    point brought back with the camera of ITS session (F2 session_sha256 of the row). kgs: {frozenset(pair): entry of
+    c7_khung_giua_session_v1}; L_AB: anchor A-B length of the locked shape (for the angle form of the term)."""
+
+    def __init__(self, ctxs, src, kgs=None, L_AB=None):
+        super().__init__(ctxs)
+        self.src, self.kgs, self.L_AB = src, kgs or {}, L_AB
+
+
+def _ses_of(w):
+    return w.get('ses') if 'ses' in w else (w.get('meta') or {}).get('session_sha', w.get(TEN['session_sha']))
+
+
+def _cx(ctx, w):
+    """Context of a window summary / row: ctx itself (one session) or the entry of the window's session."""
+    if not isinstance(ctx, CtxMap):
+        return ctx
+    sha = _ses_of(w)
+    if sha not in ctx:
+        raise ValueError(f'window session {str(sha)[:12]} is not one of the --session files')
+    return ctx[sha]
+
+
+def _mot_ctx(ctx):
+    """Any context (the session-independent values: h_n, cfg, plumb C and Z_c are the same in every session, L125)."""
+    return next(iter(ctx.values())) if isinstance(ctx, CtxMap) else ctx
+
+
+def tao_ctx(session_paths, h_n_fn, cfg):
+    """--session files -> (CtxMap, [dict(file, sha256, ...)]). Sessions must agree on every lift / geometry value:
+    plumb point C, Z_c (L125: one plumb, one z_c for every session), h_n, tag_h, car side (one tag, one plate) within
+    1e-9, else ValueError. So the geometry of v4 2-8 is the same in every session; only the measurement of a frame
+    (camera of the session, marks, fit_ids, rms gate: do_khung) and the recorded fit_ids follow the window's session."""
+    if isinstance(session_paths, str):
+        session_paths = [session_paths]
+    ctxs, src = {}, []
+    for p in session_paths:
+        ses, sha = doc_json(p), cm.sha256(p)
+        if sha in ctxs:
+            raise ValueError(f'{p}: the same session given twice')
+        c = LLCtx(ses, h_n_fn(ses), cfg)
+        ctxs[sha] = c
+        src.append(dict(file=os.path.abspath(p), sha256=sha, fit_ids=c.fit_ids, plumb_xy_m=c.C.tolist(), Z_c_m=c.Zc,
+                        tag_h_m=c.tag_h))
+    c0 = next(iter(ctxs.values()))
+    for c in ctxs.values():
+        if any(abs(x - y) > 1e-9 for x, y in ((c.h_n, c0.h_n), (c.Zc, c0.Zc), (c.tag_h, c0.tag_h), (c.side, c0.side))) \
+                or np.max(np.abs(c.C - c0.C)) > 1e-9:
+            raise ValueError('sessions differ in h_n, Z_c, tag_h, car side or the plumb point (L125: one plumb, one z_c '
+                             'for every session; one tag)')
+    return CtxMap(ctxs, src), src
+
+
+def doc_kgs(paths):
+    """c7_khung_giua_session_v1 files of CAM (v4 14): schema, two different session sha256, du_m finite >= 0, n_moc an
+    integer >= 1; a pair given twice -> ValueError. Returns {frozenset(pair): dict(du_m, n_moc, file, sha256, ...)}."""
+    out = {}
+    for p in paths or []:
+        o = doc_json(p)
+        if o.get(TEN['schema']) != TEN['kgs']:
+            raise ValueError(f'{p}: schema {o.get(TEN["schema"])} is not {TEN["kgs"]}')
+        pr, du, n = o.get(TEN['kgs_ses']), o.get(TEN['kgs_du']), o.get(TEN['kgs_n'])
+        if not (isinstance(pr, list) and len(pr) == 2 and all(isinstance(x, str) for x in pr) and pr[0] != pr[1]):
+            raise ValueError(f'{p}: {TEN["kgs_ses"]} must be two different session sha256')
+        if isinstance(du, bool) or not isinstance(du, (int, float)) or not (math.isfinite(du) and du >= 0):
+            raise ValueError(f'{p}: {TEN["kgs_du"]} must be finite and >= 0')
+        if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+            raise ValueError(f'{p}: {TEN["kgs_n"]} must be an integer >= 1')
+        k = frozenset(pr)
+        if k in out:
+            raise ValueError(f'{p}: a second file for the same session pair')
+        tc = o.get('theo_cho')                         # v4 14 phys (Liam 20/11 23:52 at CODE_KHUNG): per place, rad
+        if tc is not None:
+            if not isinstance(tc, dict) or not set(tc) <= set(CHO):
+                raise ValueError(f'{p}: theo_cho must map places {CHO}')
+            for cho, blk in tc.items():
+                for f in KGS_PHYS:
+                    v = (blk or {}).get(f) if isinstance(blk, dict) else None
+                    if isinstance(v, bool) or not isinstance(v, (int, float)) or not (math.isfinite(v) and v >= 0):
+                        raise ValueError(f'{p}: theo_cho.{cho}.{f} must be finite and >= 0')
+            tc = {cho: {f: float(blk[f]) for f in KGS_PHYS} for cho, blk in tc.items()}
+        out[k] = dict(du_m=float(du), n_moc=n, file=os.path.abspath(p), sha256=cm.sha256(p), session_sha256=list(pr),
+                      mo_hinh=o.get('mo_hinh'), theo_cho=tc)
+    return out
+
+
+def khac_session(ctx, wa, wb):
+    """v4 14: (True, entry or None) when two windows were measured in different sessions; (False, None) else."""
+    if not isinstance(ctx, CtxMap):
+        return False, None
+    sa, sb = _ses_of(wa), _ses_of(wb)
+    if sa == sb:
+        return False, None
+    return True, ctx.kgs.get(frozenset((sa, sb)))
+
+
+KGS_PHYS = ('du_xoay_rad', 'du_thang', 'du_bien_dang_rad', 'xoay_bien_thien_rad')
+# v4 14 (CODE_KHUNG 21/11 sec 5): the apparent tag edge changes between camera segments (+0.56 / -0.29 / -0.85 mm on the
+# marks), so a cross-session tag scale (and the Dh / delta_c_B correction built on it) is biased beyond doi_s. Until the
+# chain chooses a way (CODE asks Liam: no scale comparison across sessions / phi apart from the plate check / edge
+# correction / new 12b per camera mount), the cross-session scale and c_B comparisons are khong_xac_dinh and a
+# cross-session delta_c_B chua_ket_luan (no dat from an uncorrected bias).
+VIEN_MA_KHAC_SESSION_CHAN = True
+
+
+def u_kgs(e, chos, L_AB, side, c_B=None):
+    """v4 14: indices (before the margin) of the frame difference between two sessions for a comparison at the places
+    chos. File with theo_cho (model phys, design 2026-11-21 sai khung giua session §3, Liam 20/11 "Truong tron phys"):
+    beta = du_xoay + du_bien_dang; theta = du_bien_dang + xoay_bien_thien; c_B = (du_thang + 2 du_bien_dang) |c_B|;
+    scale = du_thang + du_bien_dang; largest over chos; a place missing from theo_cho -> inf (chua_ket_luan).
+    File without theo_cho: the coarse rule (HIEUCHUAN da session §2: every point off by du_m, a direction over L by
+    asin(2 du / L)). Returns dict(beta_deg, theta_deg, c_B_m, s, cach)."""
+    cb = float(np.linalg.norm(c_B)) if c_B is not None else 0.0
+    tc = e.get('theo_cho')
+    chos = {c for c in chos if c is not None}
+    if tc is not None and not chos:
+        return dict(beta_deg=math.inf, theta_deg=math.inf, c_B_m=math.inf, s=math.inf, cach='thieu_cho')
+    if tc is None:
+        du = e['du_m']
+
+        def ang(L):
+            return math.degrees(math.asin(min(1.0, 2.0 * du / L))) if L and L > 0 else math.inf
+        return dict(beta_deg=ang(L_AB), theta_deg=ang(side) + ang(L_AB),
+                    c_B_m=2.0 * du + (cb * 2.0 * du / L_AB if L_AB and L_AB > 0 else math.inf), s=2.0 * du / side,
+                    cach='tho_du_m')
+    out = dict(beta_deg=0.0, theta_deg=0.0, c_B_m=0.0, s=0.0, cach='phys')
+    for cho in chos:
+        p = tc.get(cho)
+        if p is None:
+            return dict(beta_deg=math.inf, theta_deg=math.inf, c_B_m=math.inf, s=math.inf, cach=f'thieu_cho_{cho}')
+        out['beta_deg'] = max(out['beta_deg'], math.degrees(p['du_xoay_rad'] + p['du_bien_dang_rad']))
+        out['theta_deg'] = max(out['theta_deg'], math.degrees(p['du_bien_dang_rad'] + p['xoay_bien_thien_rad']))
+        out['c_B_m'] = max(out['c_B_m'], (p['du_thang'] + 2.0 * p['du_bien_dang_rad']) * cb)
+        out['s'] = max(out['s'], p['du_thang'] + p['du_bien_dang_rad'])
+    return out
+
+
+def _cho_of(w):
+    return w.get('cho') if 'cho' in w else (w.get('meta') or {}).get('cho')
+
+
 def do_khung(ctx, cam_prev, g):
     """Pass 1 of a frame: refitted camera (session fit_ids), mark gate, tag by car_pose (v4 2)."""
     d = cm.detect_refined(ctx.det, g)
@@ -1645,6 +1788,9 @@ GIOI_HAN_V4 = [
     'LLC1-16: cua so mat ma chi du doan neo tu cua so gan nhat cung clip; khong du doan -> cua so hong (an toan).',
     'v4 13 (CODE chot tam 19/11, phuong an b): beta_cam_replay doi diem neo hai dau voi G, h da khoa; u_beta_cam khong '
     'gom phan sai ban do di qua khop lai hinh neo (G, h).',
+    'v4 14 (CODE chot 20/11, chuoi da session): moi diem cua mot session lech toi da du_m so voi session kia (file CAM '
+    'c7_khung_giua_session_v1); goc qua do dai L lech toi da asin(2 du / L); khong gia dinh truong lech tron (cach an '
+    'toan, co the lon hon sai that); cung session: hang 0.',
 ]
 
 
@@ -1686,8 +1832,9 @@ def kiem_f2(rows):
 
 # ---------------------------------------------------------------- hieu_chuan (v4 1, 3, 9; F6)
 def _measure(cs_rows, keys, session_path, mau_args, ctx, neo, clip_dir):
-    """Records of the windows `keys` (indices into cs_rows), clip by clip."""
-    mau = _mau(mau_args, ctx, neo)
+    """Records of the windows `keys` (indices into cs_rows), clip by clip; each clip with the camera of its session
+    (v4 14: ctx a CtxMap; the windows of one clip must name one session)."""
+    mau = _mau(mau_args, _mot_ctx(ctx), neo)
     by_clip, recs, flags, shas = {}, {}, {}, {}
 
     def _sha(p):                                       # LLC5-1: each clip hashed once
@@ -1712,8 +1859,10 @@ def _measure(cs_rows, keys, session_path, mau_args, ctx, neo, clip_dir):
         for i, _ in wins:
             if cs_rows[i][TEN['clip_sha']] != sha:
                 raise ValueError(f'{clip}: sha256 differs from the window file')
+        if len({cs_rows[i][TEN['session_sha']] for i, _ in wins}) != 1:      # v4 14: one clip, one camera session
+            raise ValueError(f'{clip}: its windows name several sessions')
         wins.sort(key=lambda kw: min(p for _, p in kw[1]))
-        r, f = do_clip(path, wins, ctx, mau)
+        r, f = do_clip(path, wins, _cx(ctx, cs_rows[wins[0][0]]), mau)
         recs.update(r)
         flags.update(f)
     return recs, flags, mau
@@ -1839,6 +1988,7 @@ def khoa_hieu_chuan(wsum, ctx, cfg, a6):
         chuan[key] = dict(trang_thai='dat' if math.isfinite(nhieu) else 'chua_ket_luan',
                           ly_do='' if math.isfinite(nhieu) else 'thieu_cap_nhieu', cho=r['meta']['cho'],
                           luot_id=r['meta']['luot'], clip_sha256=r['meta']['clip_sha'],
+                          session_sha256=r['meta'].get('session_sha'),
                           khung_chung_sha256=r['khung_chung_sha256'], psi_chuan_k_deg=math.degrees(r['chung']['psi']),
                           u_psi_chuan_k_cua_so_deg=nhieu, alpha_chuan_k_deg=math.degrees(r['alpha']),
                           theta_chuan_k_deg=math.degrees(r['chung']['theta']),
@@ -1868,19 +2018,18 @@ def run_hieu_chuan(cua_so_path, session_path, neo_spec, mau, out_dir, a6_path, t
     cfg = dict(LL_DEFAULTS, **(cfg or {}))
     rows = doc_cua_so(cua_so_path)
     kiem_f2(rows)
-    ses = doc_json(session_path)
-    ses_sha = cm.sha256(session_path)
     neo = parse_neo(neo_spec)
     r_ok, r_ev = kiem_r_neo(neo, kiem_r, mau[0], mau[2])
     neo_dung = {k: v for k, v in neo.items() if r_ok[k]}
-    ctx = LLCtx(ses, ses['tag_h_m'] if h_neo is None else h_neo, cfg)
+    cmap, ses_src = tao_ctx(session_path, lambda s: s['tag_h_m'] if h_neo is None else h_neo, cfg)   # v4 14
+    ctx = _mot_ctx(cmap)
     a6 = A6(a6_path, a6_mod)
     a6_tt = a6.ap_dung(tam_id)
     a6_ok = (a6_tt[0] if isinstance(a6_tt, (list, tuple)) else a6_tt) != 'chua_ket_luan'
     keys = [i for i, w in enumerate(rows) if w[TEN['loai']] in LOAI_KHOP]
     for i in keys:
-        if rows[i][TEN['session_sha']] != ses_sha:
-            raise ValueError(f'window {i}: session sha256 differs from {session_path}')
+        if rows[i][TEN['session_sha']] not in cmap:
+            raise ValueError(f'window {i}: session sha256 is not one of the --session files')
     mau_sha = cm.sha256(mau[0])
     for i, w in enumerate(rows):                         # LLC1-6: the template frame is not a held-out frame
         if w[TEN['loai']] in LOAI_GIU and w[TEN['clip_sha']] == mau_sha and int(mau[2]) in {k for k, _ in khung_cua(w)}:
@@ -1888,8 +2037,8 @@ def run_hieu_chuan(cua_so_path, session_path, neo_spec, mau, out_dir, a6_path, t
     cm._new_dir(out_dir)
     out = dict(schema=TEN['hieu_chuan'], version=LL_VERSION, hil=git_head(), thiet_ke='2026-11-19_Thiet_ke_nhac_tam_lan_lap_v4',
                cua_so_file=dict(file=os.path.abspath(cua_so_path), sha256=cm.sha256(cua_so_path)),
-               session=dict(file=os.path.abspath(session_path), sha256=ses_sha, fit_ids=ctx.fit_ids,
-                            plumb_xy_m=ctx.C.tolist(), Z_c_m=ctx.Zc, tag_h_m=ctx.tag_h),
+               session=ses_src[0] if len(ses_src) == 1 else None,     # v4 14: one session -> as before
+               sessions=ses_src,
                a6=dict(file=os.path.abspath(a6_path), sha256=a6.sha256, schema=TEN['a6'], tam_id=tam_id, ap_dung=a6_tt),
                neo=[dict(ten=k, o_px=[list(b) for b in v], kiem_r=r_ok[k]) for k, v in neo.items()], kiem_r=r_ev,
                mau=dict(clip=os.path.abspath(mau[0]), sha256=mau_sha, session=os.path.abspath(mau[1]),
@@ -1902,7 +2051,7 @@ def run_hieu_chuan(cua_so_path, session_path, neo_spec, mau, out_dir, a6_path, t
         out.update(trang_thai='chua_ket_luan', ly_do=['thieu_neo'])
     else:
         if _records is None:
-            recs, flags, _ = _measure(rows, keys, session_path, mau, ctx, neo_dung, clip_dir)
+            recs, flags, _ = _measure(rows, keys, session_path, mau, cmap, neo_dung, clip_dir)
         else:
             recs, flags = _records, {}
         wsum = [(rows[i], dict(tom_cua_so(rows[i], recs[i], a6, a6_ok, ctx, cfg), thu_tu=i)) for i in keys]
@@ -1937,19 +2086,31 @@ def _w_from_hc(c, which='chung'):
     if ch is None:
         return None
     return dict(alpha=ch['alpha'], psi=ch.get('psi'), psi_tho=ch.get('psi_tho', ch.get('psi')), theta=ch.get('theta'),
-                o=np.array(ch['o']), t=np.array(ch['t']), s=ch['s'], F=np.array(ch['F']), H=ch['H'], n=ch['n'])
+                o=np.array(ch['o']), t=np.array(ch['t']), s=ch['s'], F=np.array(ch['F']), H=ch['H'], n=ch['n'],
+                ses=c['meta'].get('session_sha'), cho=c['meta'].get('cho'))
 
 
-def so_sanh(wa, wb, ctx, g_b, nguong):
+def so_sanh(wa, wb, ctx, g_b, nguong, cmap=None):
     """v4 8 (C8BX-18, LL4-2, LLC1-13): two windows (summaries with or without A6): theta (needs A6 at both ends),
     c_B (Dh-corrected delta_c_B), scale (Dh / (H - h) from the ratio), each doi / khong_doi / khong_xac_dinh.
     g_b None (A6 does not apply to this plate, LLC2-4): the tilt of the plate is unknown, so c_B and the scale are
-    khong_xac_dinh (no correction with another plate's g_b)."""
-    def st(x, lim):
-        if x is None or not (math.isfinite(x) and math.isfinite(lim)):
-            return dict(gia_tri=x, nguong=lim, trang_thai='khong_xac_dinh')
-        return dict(gia_tri=x, nguong=lim, trang_thai='doi' if x > lim else 'khong_doi')
+    khong_xac_dinh (no correction with another plate's g_b).
+    v4 14 (cmap given, the two windows of different sessions): the frame-difference index u of the pair (u_kgs) makes a
+    band: doi when x - u > lim, khong_doi when x + u <= lim, else khong_xac_dinh; no c7_khung_giua_session_v1 file for
+    the pair -> khong_xac_dinh (thieu_khung_giua_session). Same session: u = 0, the result as before."""
+    def st(x, lim, u, ly=None):
+        d = dict(gia_tri=x, nguong=lim)
+        if u:
+            d['u_khung_giua_session'] = u
+        if ly:
+            d['ly_do'] = ly
+        if x is None or not (math.isfinite(x) and math.isfinite(lim) and math.isfinite(u)):
+            d['trang_thai'] = 'khong_xac_dinh'
+        else:
+            d['trang_thai'] = 'doi' if x - u > lim else ('khong_doi' if x + u <= lim else 'khong_xac_dinh')
+        return d
     th = cb = sc = None
+    uk, ly = dict(theta_deg=0.0, c_B_m=0.0, s=0.0), dict(theta=None, c_B=None, s=None)
     if wa is not None and wb is not None:
         if wa.get('theta') is not None and wb.get('theta') is not None:
             th = abs(math.degrees(wrap(wb['theta'] - wa['theta'])))
@@ -1959,7 +2120,25 @@ def so_sanh(wa, wb, ctx, g_b, nguong):
                 cb, sc = float(np.linalg.norm(dcb)), abs(dh) / (wb['H'] - ctx.tag_h)
             except ValueError:
                 pass
-    return dict(theta=st(th, nguong['theta']), c_B=st(cb, nguong['c_B']), s=st(sc, nguong['s']))
+        khac, e = khac_session(cmap, wa, wb) if cmap is not None else (False, None)
+        if khac and e is None:
+            uk = dict(theta_deg=math.inf, c_B_m=math.inf, s=math.inf)
+            ly = dict.fromkeys(ly, 'thieu_khung_giua_session')
+        elif khac:
+            try:
+                c_t = c_B_cua(wb, ctx, g_b) if g_b is not None else None
+            except ValueError:
+                c_t = None
+            uk = u_kgs(e, {_cho_of(wa), _cho_of(wb)}, cmap.L_AB, ctx.side, c_t)
+            if g_b is not None and c_t is None:
+                uk['c_B_m'] = math.inf
+            if VIEN_MA_KHAC_SESSION_CHAN:          # tag edge bias differs between sessions: scale, Dh not comparable
+                uk['c_B_m'] = uk['s'] = math.inf
+                ly.update(c_B='vien_ma_khac_session', s='vien_ma_khac_session')
+            if not math.isfinite(uk['theta_deg']):
+                ly['theta'] = uk['cach']
+    return dict(theta=st(th, nguong['theta'], uk['theta_deg'], ly['theta']),
+                c_B=st(cb, nguong['c_B'], uk['c_B_m'], ly['c_B']), s=st(sc, nguong['s'], uk['s'], ly['s']))
 
 
 def tong_doi(ss):
@@ -2087,8 +2266,10 @@ def beta_cam_replay(f15_path, hc, out_l, luot, hw, fitw, doan, G, h, ctx):
 
 
 def run_lan_lap(hc_path, cua_so_path, session_path, out_dir, a6_path, tam_id, truc_xe=None, xoay=None,
-                u_beta_cam_deg=None, clip_dir=None, mau_clip=None, cfg=None, a6_mod=None, _records=None, f15=None):
-    """v4 0, 3-9: held-out windows -> lan_lap.json (lan_lap_v1). Exit code 0 written / 2 error."""
+                u_beta_cam_deg=None, clip_dir=None, mau_clip=None, cfg=None, a6_mod=None, _records=None, f15=None,
+                khung_giua_session=None):
+    """v4 0, 3-9, 14: held-out windows -> lan_lap.json (lan_lap_v1). Exit code 0 written / 2 error. session_path: one
+    path or a list (v4 14: every session of hieu_chuan_neo.json plus the sessions of the held-out windows)."""
     hc = doc_hieu_chuan(hc_path)
     khoa_ng = {k: v for k, v in hc['nguong'].items() if k in LL_DEFAULTS}
     doi = sorted(k for k, v in (cfg or {}).items() if k in LL_DEFAULTS and khoa_ng.get(k, LL_DEFAULTS[k]) != v)
@@ -2097,10 +2278,11 @@ def run_lan_lap(hc_path, cua_so_path, session_path, out_dir, a6_path, tam_id, tr
     cfg = dict(LL_DEFAULTS, **khoa_ng)
     if u_beta_cam_deg is not None and not (math.isfinite(u_beta_cam_deg) and u_beta_cam_deg >= 0):
         raise ValueError('u_beta_cam must be finite and >= 0')
-    ses = doc_json(session_path)
-    ses_sha = cm.sha256(session_path)
-    if ses_sha != hc['session']['sha256']:
-        raise ValueError('session sha256 differs from hieu_chuan_neo.json')
+    cmap, ses_src = tao_ctx(session_path, lambda s: hc['h_n_m'], cfg)              # v4 14
+    hc_ses = {s['sha256'] for s in (hc.get('sessions') or [hc['session']])}
+    if not hc_ses <= set(cmap):
+        raise ValueError('a session of hieu_chuan_neo.json is not among the --session files')
+    ses_sha = ses_src[0]['sha256'] if len(ses_src) == 1 else None
     a6 = A6(a6_path, a6_mod)
     if a6.sha256 != hc['a6']['sha256']:
         raise ValueError('A6 file sha256 differs from hieu_chuan_neo.json')
@@ -2115,14 +2297,17 @@ def run_lan_lap(hc_path, cua_so_path, session_path, out_dir, a6_path, tam_id, tr
         raise ValueError('template session sha256 differs from the locked one')
     if cm.sha256(cua_so_path) != hc['cua_so_file']['sha256']:     # LLC1-6, LLC1-15 (round 2): one window file, one order
         raise ValueError('window file sha256 differs from the one locked at hieu_chuan (positions and roles are locked)')
-    ctx = LLCtx(ses, hc['h_n_m'], cfg)
+    ctx = _mot_ctx(cmap)
+    cmap.kgs = doc_kgs(khung_giua_session)
+    if 'G' in hc:
+        cmap.L_AB = float(np.linalg.norm(np.asarray(hc['G'], float)[1] - np.asarray(hc['G'], float)[0]))
     rows = doc_cua_so(cua_so_path)
     kiem_f2(rows)
     keys = [i for i, w in enumerate(rows) if w[TEN['loai']] in LOAI_GIU]
     fit_frames = {(c['meta']['clip_sha'], k) for c in hc.get('cua_so', []) for k in c['khung_neo']['id']}
     for i in keys:
-        if rows[i][TEN['session_sha']] != ses_sha:
-            raise ValueError(f'window {i}: session sha256 differs (each end checked against its source)')
+        if rows[i][TEN['session_sha']] not in cmap:
+            raise ValueError(f'window {i}: session sha256 is not one of the --session files (each end checked)')
         if any((rows[i][TEN['clip_sha']], k) in fit_frames for k, _ in khung_cua(rows[i])):
             raise ValueError(f'window {i}: a held-out frame is a locked fit frame (D1)')
     cm._new_dir(out_dir)
@@ -2139,7 +2324,10 @@ def run_lan_lap(hc_path, cua_so_path, session_path, out_dir, a6_path, tam_id, tr
                 hieu_chuan=dict(file=os.path.abspath(hc_path), sha256=cm.sha256(hc_path),
                                 khoa_sha256=hc['khoa']['noi_dung_sha256']),
                 cua_so_v1_file=os.path.abspath(cua_so_path), cua_so_v1_sha256=cm.sha256(cua_so_path),
-                session_file=os.path.abspath(session_path), session_sha256=ses_sha, fit_ids=ctx.fit_ids,
+                session_file=ses_src[0]['file'] if ses_sha else None, session_sha256=ses_sha,     # v4 14: one session
+                fit_ids=ctx.fit_ids if ses_sha else None, sessions=ses_src,
+                khung_giua_session=[dict(file=e['file'], sha256=e['sha256'], session_sha256=e['session_sha256'],
+                                         du_m=e['du_m'], n_moc=e['n_moc']) for e in cmap.kgs.values()],
                 a6=dict(file=os.path.abspath(a6_path), sha256=a6.sha256, tam_id=tam_id, ap_dung=a6_tt),
                 truc_xe=tx_src, xoay_sha256=xo_sha, xoay_file=os.path.abspath(xoay) if xoay else None,
                 phep_gop='trung_binh_go_vong', gioi_han=GIOI_HAN_V4, nguong=dict(cfg, trang_thai=LL_THRESH_STATUS))
@@ -2150,7 +2338,7 @@ def run_lan_lap(hc_path, cua_so_path, session_path, out_dir, a6_path, tam_id, tr
         # LLC2-3: no anchor shape -> still one record per run (J v6 5: the plate check runs for every run); no anchor
         # frame was measured, so the tag-anchor intersection is empty (mat_neo) and every comparison khong_xac_dinh
         hw = {i: _hw_rong(rows[i], i) for i in keys}
-        env = dict(hw=hw, hc=hc, fitw=[], ctx=ctx, cfg=cfg, g_b=g_b, doan={}, tam_id=tam_id, a6_sha=a6.sha256,
+        env = dict(hw=hw, hc=hc, fitw=[], ctx=ctx, cmap=cmap, cfg=cfg, g_b=g_b, doan={}, tam_id=tam_id, a6_sha=a6.sha256,
                    hc_sha=base['hieu_chuan']['sha256'], rows=rows)
         so0 = so_sanh(None, None, ctx, g_b_so, dict(theta=NAN, c_B=NAN, s=NAN))
         out_l = []
@@ -2178,7 +2366,7 @@ def run_lan_lap(hc_path, cua_so_path, session_path, out_dir, a6_path, tam_id, tr
     if _records is None:
         neo = {d['ten']: [tuple(b) for b in d['o_px']] for d in hc['neo'] if d['ten'] in hc['neo_ten']}
         m = hc['mau']
-        recs, flags, _ = _measure(rows, keys, session_path, (mau_clip or m['clip'], m['session'], m['idx']), ctx, neo,
+        recs, flags, _ = _measure(rows, keys, session_path, (mau_clip or m['clip'], m['session'], m['idx']), cmap, neo,
                                   clip_dir)
     else:
         recs, flags = _records, {}
@@ -2196,6 +2384,9 @@ def run_lan_lap(hc_path, cua_so_path, session_path, out_dir, a6_path, tam_id, tr
             d.update(alpha=a_, o=o_, du_m=res.tolist(), Ph=s['neo']['Ph'], F=s['neo']['F'], H=s['neo']['H'],
                      du_ok=bool(np.all(res <= r_max)))
             d['ma'], d['chung'], ly_du = _tom_hai(s, G, h, ctx, r_max)
+            for k in ('ma', 'chung'):                           # v4 14: the session of the summary
+                if d[k] is not None:
+                    d[k]['ses'], d[k]['cho'] = s['meta']['session_sha'], s['meta']['cho']
             d['ly_do'] += s['chung']['ly_do'] + ly_du
             if not d['du_ok']:
                 d['ly_do'].append('du_neo_vuot_r_max')
@@ -2219,7 +2410,8 @@ def run_lan_lap(hc_path, cua_so_path, session_path, out_dir, a6_path, tam_id, tr
         pre, post = hw.get(dd.get('pre')), hw.get(dd.get('post'))
         ca = {x['meta']['cho'] for x in (pre, post) if x is not None}
         so[lid] = so_sanh(_hai(pre) if pre and pre['ok'] and pre['du_ok'] else None,      # LLC2-4: anchor gate too
-                          _hai(post) if post and post['ok'] and post['du_ok'] else None, ctx, g_b_so, nguong_cho(ca))
+                          _hai(post) if post and post['ok'] and post['du_ok'] else None, ctx, g_b_so, nguong_cho(ca),
+                          cmap)
     # ---- u_beta (v4 4): held-out pairs, |wrap(dalpha - dpsi')|; exclusion only on independent evidence (LL4-2, LLC1-8)
     cap, loai_cap = [], []
     for lid, dd in sorted(luot.items()):
@@ -2276,8 +2468,8 @@ def run_lan_lap(hc_path, cua_so_path, session_path, out_dir, a6_path, tam_id, tr
                 pass
     du_giu = max((g['lech_m'] for g in giu_vt), default=NAN)
     # ---- runs
-    doan = phan_doan(rows, luot, hw, fitw, so, ctx, g_b_so, nguong_cho)
-    env = dict(hw=hw, hc=hc, fitw=fitw, obs_fit=obs_fit, doan=doan, G=G, h=h, ctx=ctx, cfg=cfg, g_b=g_b,
+    doan = phan_doan(rows, luot, hw, fitw, so, ctx, g_b_so, nguong_cho, cmap)
+    env = dict(hw=hw, hc=hc, fitw=fitw, obs_fit=obs_fit, doan=doan, G=G, h=h, ctx=ctx, cmap=cmap, cfg=cfg, g_b=g_b,
                eps_g=eps_g, u_beta=u_beta, u_beta_goc=u_beta_goc, eps_cap=eps_cap, eps_end=eps_end, eps_hc=eps_hc,
                u_beta_tt=u_beta_tt, mien=mien, diem=diem, r_max=r_max, nhom=nhom,
                trai=trai, du_giu=du_giu, giu_vt=giu_vt, tx=tx, xo=xo, u_beta_cam_deg=u_beta_cam_deg,
@@ -2345,7 +2537,8 @@ def _dau(x, env, loai=None, cho=None):
                 khung_neo=x['khung_neo'], khung_neo_sha256=x['khung_neo_sha256'],
                 khung_chung=x.get('khung_chung'), khung_chung_sha256=x.get('khung_chung_sha256'),
                 khung_giao_ma_neo=x.get('khung_giao_ma_neo'), khung_giao_sha256=x.get('khung_giao_sha256'),
-                mat_neo=x.get('mat_neo'), Ph_neo_m=x.get('Ph'), fit_ids=env['ctx'].fit_ids, a6_sha256=env['a6_sha'],
+                mat_neo=x.get('mat_neo'), Ph_neo_m=x.get('Ph'), fit_ids=_cx(env.get('cmap', env['ctx']), x).fit_ids,
+                a6_sha256=env['a6_sha'],
                 hieu_chuan_sha256=env['hc_sha'], tam_id=env['tam_id'], phep_gop='trung_binh_go_vong',
                 frames_sha256=x['meta'].get('frames_sha'), ly_do=list(x.get('ly_do', [])))
 
@@ -2417,7 +2610,8 @@ def _mot_luot(lid, d, so, env):
     r['dau']['chuan'] = dict(loai=LOAI_CHUAN, cho=cho, clip=cs['meta']['clip'], clip_sha256=cs['meta']['clip_sha'],
                              session_sha256=cs['meta']['session_sha'], frames_sha256=fr_sha, khung_neo=cs['khung_neo'],
                              khung_neo_sha256=cs['khung_neo_sha256'], khung_chung=cs.get('khung_chung'),
-                             khung_chung_sha256=cs.get('khung_chung_sha256'), Ph_neo_m=cs['Ph'], fit_ids=ctx.fit_ids,
+                             khung_chung_sha256=cs.get('khung_chung_sha256'), Ph_neo_m=cs['Ph'],
+                             fit_ids=_cx(env.get('cmap', ctx), cs).fit_ids,
                              a6_sha256=env['a6_sha'], hieu_chuan_sha256=env['hc_sha'], tam_id=env['tam_id'],
                              phep_gop='trung_binh_go_vong')
     beta = math.degrees(wrap(dich['alpha'] - cs['alpha']))
@@ -2426,6 +2620,21 @@ def _mot_luot(lid, d, so, env):
                                        env['r_max']))
     eps_luot = max(env['eps_cap'], eps_s + env['eps_end'].get(d.get('pre'), NAN))
     u_beta_l = env['u_beta_goc'] + eps_luot
+    # v4 14: standard and target in different camera sessions -> + frame-difference index (CAM file of the pair)
+    khac, e_k = khac_session(env['cmap'], cs, dich) if env.get('cmap') is not None else (False, None)
+    uk = None
+    if khac:
+        r['khung_giua_session'] = dict(session_sha256=[_ses_of(cs), _ses_of(dich)],
+                                       file=None if e_k is None else e_k['file'],
+                                       sha256=None if e_k is None else e_k['sha256'],
+                                       du_m=None if e_k is None else e_k['du_m'])
+        if e_k is None:
+            lneo.append('thieu_khung_giua_session')
+        else:
+            uk = u_kgs(e_k, {_cho_of(cs), _cho_of(dich)}, env['cmap'].L_AB, ctx.side)
+            r['khung_giua_session']['cach'] = uk['cach']
+            r['khung_giua_session']['u_beta_deg'] = uk['beta_deg']
+            u_beta_l += uk['beta_deg']
     r['beta_deg'], r['u_beta_deg'], r['eps_neo_luot_deg'] = beta, u_beta_l, eps_luot
     r['du_dich_m'] = dich['du_m']
     if max(cs['du_m']) > env['r_max'] and 'du_neo_vuot_r_max' not in lneo:
@@ -2524,7 +2733,7 @@ def _mot_luot(lid, d, so, env):
         r['ly_do']['q'].append('hai_dau_E_khac_clip')
     else:
         e1, e2 = (_w_from_hc(c) for c in ed)
-        if tong_doi(so_sanh(e1, e2, ctx, g_b, env['nguong_cho']({cho}))) is not False:
+        if tong_doi(so_sanh(e1, e2, ctx, g_b, env['nguong_cho']({cho}), env.get('cmap'))) is not False:
             r['ly_do']['q'].append('E_tam_doi_hoac_chua_xac_dinh')
         else:
             rb = [rot2(-ew['alpha']) @ (nghich(np.array(x[TEN['xoay_r']], float), ctx.tag_h, ew['F'], ew['H'], ctx.C,
@@ -2541,7 +2750,7 @@ def _mot_luot(lid, d, so, env):
     # ---- cung_lan_lap (v4 6, information only; LLC1-4: within the spread of the standard 12b group, no floor)
     tr = env['trai'].get(cs['meta']['luot'])
     if tr is not None and tr['n'] >= 2:
-        cl = so_sanh(sw, dc, ctx, g_b, dict(theta=tr['theta'], c_B=tr['c_B'], s=tr['s']))
+        cl = so_sanh(sw, dc, ctx, g_b, dict(theta=tr['theta'], c_B=tr['c_B'], s=tr['s']), env.get('cmap'))
         r['cung_lan_lap'] = tong_doi(cl) is False if tong_doi(cl) is not None else None
         r['cung_lan_lap_chi_so'] = cl
     # ---- delta_c_B (v4 6b, LL5-1..6, LLC1-2, 3, 12)
@@ -2560,11 +2769,19 @@ def _mot_luot(lid, d, so, env):
         e_pos = (eps_vi_tri(b_s, env['r_max'], c_B_cua(sw, ctx, g_b))
                  + eps_vi_tri(b_d, env['r_max'], c_B_cua(dc, ctx, g_b, dh)))
         try:
-            u, parts, u_dh = u_delta_c_B(sw, dc, ctx, g_b, env['eps_g'], tr['c_B'], tr['s'], e_pos,
+            uc = u_kgs(e_k, {_cho_of(cs), _cho_of(dich)}, env['cmap'].L_AB, ctx.side,
+                       c_B_cua(dc, ctx, g_b, dh)) if uk is not None else None
+            u, parts, u_dh = u_delta_c_B(sw, dc, ctx, g_b, env['eps_g'], tr['c_B'],
+                                         tr['s'] + (uc['s'] if uc else 0.0), e_pos,          # v4 14: ratio, cross session
                                          env['du_giu'] if math.isfinite(env['du_giu']) else 0.0)
+            if uc is not None:                                      # v4 14: frame difference of the two sessions
+                parts['khung_giua_session'] = uc['c_B_m']
+                u += uc['c_B_m']
             r['u_delta_c_B_m'], r['u_delta_c_B_phan'], r['u_delta_h_m'] = u, parts, u_dh
         except ValueError as e:
             lc.append(f'mien_so: {e}')
+    if khac and VIEN_MA_KHAC_SESSION_CHAN:                      # v4 14: Dh from the scale ratio of two sessions
+        lc.append('vien_ma_khac_session')
     if abs(dh) > cfg['dh_max_m']:
         lc.append('dh_vuot_ngoi_chot')
     if len(env['giu_vt']) < cfg['min_giu_vi_tri']:
@@ -2581,7 +2798,7 @@ def _w_bat_ky(c):
     return _w_from_hc(c) or _w_from_hc(c, 'ma')
 
 
-def phan_doan(rows, luot, hw, fitw, so, ctx, g_b, nguong_cho):
+def phan_doan(rows, luot, hw, fitw, so, ctx, g_b, nguong_cho, cmap=None):
     """J v6 2, F8 (CODE 19/11; round 2 LLC2-2, LLC1-15): placement of each run by machine, on the ONE window file
     locked at hieu_chuan (positions = file order; CAM writes the windows in recording order).
     12b groups: every 12b run of the file is an item (a 12b whose windows all failed too: J v6 2 '12b of that placement
@@ -2629,7 +2846,7 @@ def phan_doan(rows, luot, hw, fitw, so, ctx, g_b, nguong_cho):
             w_dau = _w_bat_ky(fitw[it['first']]) if it['first'] is not None else None
             new = prev is None or prev['kind'] != '12b'
             if not new and prev['cho'] == it['cho']:          # the same place twice in a row: the plate is checked
-                new = tong_doi(so_sanh(prev['w'], w_dau, ctx, g_b, nguong_cho({it['cho']}))) is not False
+                new = tong_doi(so_sanh(prev['w'], w_dau, ctx, g_b, nguong_cho({it['cho']}), cmap)) is not False
             if new:
                 seg += 1
                 seg12[seg] = {}
@@ -2655,7 +2872,7 @@ def phan_doan(rows, luot, hw, fitw, so, ctx, g_b, nguong_cho):
             o['ung_vien'], o['j'] = l12, ref[(cho, l12)]
             sw = _w_bat_ky(fitw[o['j']])
             pre_ok = pre['ok'] and pre['du_ok']
-            d = tong_doi(so_sanh(sw, _hai(pre) if pre_ok else None, ctx, g_b, nguong_cho({cho})))
+            d = tong_doi(so_sanh(sw, _hai(pre) if pre_ok else None, ctx, g_b, nguong_cho({cho}), cmap))
             o['doi_so_chuan'] = d
             if not pre_ok:                                      # LLC4-1, CT4-3: a failed pre -> not determined
                 o['ly_do'] = 'lan_lap_khong_xac_dinh'
@@ -2702,7 +2919,8 @@ def main(argv=None):
     a3.add_argument('--out', required=True)
     a4 = sub.add_parser('hieu_chuan', help='v4: anchors fitted on the 12b / E windows, locked (hieu_chuan_neo.json)')
     a4.add_argument('--cua-so', required=True, help='cua_so_v1 file (CAM, HIEUCHUAN)')
-    a4.add_argument('--session', required=True)
+    a4.add_argument('--session', nargs='+', required=True,
+                    help='session.json of every camera segment of the windows (v4 14; one file as before)')
     a4.add_argument('--neo', required=True, help='"A:u,v,w,h;B:u,v,w,h;oc1:u,v,w,h" boxes on the template frame')
     a4.add_argument('--mau', required=True, nargs=3, metavar=('CLIP', 'SESSION', 'IDX'), help='template frame of the boxes')
     a4.add_argument('--kiem-r', nargs='*', default=[], help='kiem.json of v7 "kiem --rong" (clip R) covering the boxes')
@@ -2714,7 +2932,8 @@ def main(argv=None):
     a5 = sub.add_parser('lan_lap', help='v4: pre / post of every run -> lan_lap.json (lan_lap_v1)')
     a5.add_argument('--hieu-chuan', required=True)
     a5.add_argument('--cua-so', required=True)
-    a5.add_argument('--session', required=True)
+    a5.add_argument('--session', nargs='+', required=True,
+                    help='session.json of every camera segment of the windows (v4 14; one file as before)')
     a5.add_argument('--a6', required=True)
     a5.add_argument('--truc-xe', nargs='*', default=[],
                     help='truc_xe_v1 files (HIEUCHUAN; one per place and 12b attempt, matched to the standard, LLC2-1)')
@@ -2722,6 +2941,8 @@ def main(argv=None):
     a5.add_argument('--u-beta-cam-deg', type=float, help='u_beta_cam (C8B), before the margin')
     a5.add_argument('--tam-id', required=True, help='plate id of the session (CAM), as in hieu_chuan')
     a5.add_argument('--mau-clip', help='path of the template clip when moved')
+    a5.add_argument('--khung-giua-session', nargs='*', default=None,
+                    help='c7_khung_giua_session_v1 files of CAM, one per session pair (v4 14)')
     a5.add_argument('--f15', help='c7_meo_dau_chan_bang_v1 of KIEMCHEO (F15 b) -> block beta_cam_replay (v4 13)')
     a5.add_argument('--thu-muc-clip')
     a5.add_argument('--out', required=True)
@@ -2734,7 +2955,8 @@ def main(argv=None):
             print(f'hieu_chuan: {o["trang_thai"]} {", ".join(o.get("ly_do", []))}')
         elif a.cmd == 'lan_lap':
             code = run_lan_lap(a.hieu_chuan, a.cua_so, a.session, a.out, a.a6, a.tam_id, a.truc_xe, a.xoay,
-                               a.u_beta_cam_deg, a.thu_muc_clip, a.mau_clip, f15=a.f15)
+                               a.u_beta_cam_deg, a.thu_muc_clip, a.mau_clip, f15=a.f15,
+                               khung_giua_session=a.khung_giua_session)
             o = doc_json(os.path.join(a.out, 'lan_lap.json'))
             for x in o['luot']:
                 print(f'{x["luot_id"]}: beta {x["trang_thai"]["beta"]} {x["beta_deg"]}, delta_c_B '
