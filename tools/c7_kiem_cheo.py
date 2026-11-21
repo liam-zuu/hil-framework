@@ -2458,7 +2458,9 @@ def phan_tich(a):
                theo_thoi_gian={n: time_check(dets['H_a'][1], clips[n][0], mk_a, groups, gc)
                                for n in clips if n != 'H_a'})
     os.makedirs(a.out, exist_ok=True)
-    us_obj = dict(version=U_SO_VERSION, buoi=a.buoi, model=a.model, nhom=groups, chuoi=chuoi, chi_tiet=uso_info,
+    # CAM 21/11 (c7_measure.check_u_so_source, Codex C33-5a): the u_so file itself says whether it is a trial
+    us_obj = dict(version=U_SO_VERSION, buoi=a.buoi, model=a.model, thu=bool(a.thu), nhom=groups, chuoi=chuoi,
+                  chi_tiet=uso_info,
                   sessions=sess, tao_luc=datetime.datetime.now().isoformat(timespec='seconds'))
     us_bytes = json.dumps(us_obj, indent=1, ensure_ascii=False)
     res['u_so_sha256'] = hashlib.sha256(us_bytes.encode('utf-8')).hexdigest()   # KC1-10: the track must name it

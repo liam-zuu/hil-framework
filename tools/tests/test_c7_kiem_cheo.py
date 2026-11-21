@@ -820,6 +820,7 @@ def test_phan_tich_cut_clip_is_a_trial_and_not_exported(tmp_path, scene, monkeyp
     assert kc.main(_phan_tich_args(tmp_path, scene, cut=True)) == 0
     r = json.loads((tmp_path / 'kc' / 'kiem_cheo.json').read_text(encoding='utf-8'))
     assert r['thu'] is True
+    assert json.loads((tmp_path / 'kc' / 'u_so.json').read_text(encoding='utf-8'))['thu'] is True     # CAM 21/11
     assert kc.main(['tung_khung', '--buoi', 'C8_x', '--kiem-cheo', str(tmp_path / 'kc' / 'kiem_cheo.json'),
                     '--u-so', str(tmp_path / 'kc' / 'u_so.json'), '--ke-hoach', str(tmp_path / 'moc.csv'),
                     '--luot', f'r1={tmp_path}', '--out', str(tmp_path / 'tk.json')]) == 2
@@ -1414,6 +1415,7 @@ def test_phan_tich_writes_s7(tmp_path, scene, monkeypatch):
                                                        '--khoa-s7', str(mf)]) == 0
     r = json.loads((tmp_path / 'kc' / 'kiem_cheo.json').read_text(encoding='utf-8'))
     assert r['khoa_s7']['sha256'] == kc.sha256_file(str(mf)) and r['khoa_s7']['git_commit'] == 'm' * 40
+    assert json.loads((tmp_path / 'kc' / 'u_so.json').read_text(encoding='utf-8'))['thu'] is False   # C33-5a (CAM 21/11)
     assert r['P1_tuong_doi']['du_lieu_du'] is True and r['A3']['du_lieu_du'] is True
     p = r['P1_tuong_doi']
     assert p['max_m'] < 5e-4 and p['theo_vung']['goc']['vung_mo_rong'] and p['cap_hong'] == []
