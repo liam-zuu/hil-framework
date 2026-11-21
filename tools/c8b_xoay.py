@@ -41,7 +41,8 @@ Outputs (c8b_xoay_v1):
   heading-dependent part).
 c8b_u.py takes q_tag_m and du_m: P2 = |(dx, dy)_scorer - R(dpsi_scorer) q_tag| + du_m + |q_tag| x A1 [rad].
 
-  python tools/c8b_xoay.py --cho O=frames_O.csv --cho K1=frames_K1.csv [--log O=log_O.csv ...] --out xoay.json
+  python tools/c8b_xoay.py --cho goc=frames_goc.csv --cho K1=frames_K1.csv [--log goc=log_goc.csv ...] --out xoay.json
+  (PLACE names as CHO = goc, K1, K2; trinh tu chuoi C8 muc 2.6: the old 'O' of this line was a docstring slip)
 Last line: #ket_qua,ma=0 written / 2 refused or error.
 """
 from __future__ import annotations
