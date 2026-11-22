@@ -249,6 +249,59 @@ def test_xoay_per_place_file(fake_a6, tmp_path):
     assert all(not r['q_ok'] and 'xoay_thieu_cho_K1' in r['ly_do'] for r in out)
 
 
+def _xoay_goc_k1(tmp_path, a6p, k1=True, k1_st='dat'):
+    cho = {'goc': dict(q_tag_m=[0.03, -0.01], u_q_m=0.0005, trang_thai='dat')}
+    if k1:
+        cho['K1'] = dict(q_tag_m=[0.02, 0.01], u_q_m=0.0004, trang_thai=k1_st)
+    p = tmp_path / 'xoay_goc_k1.json'
+    p.write_text(json.dumps(dict(version='xoay_v1', a6_sha256=ck.sha256(a6p), cho=cho)), encoding='utf-8')
+    return str(p)
+
+
+def test_k2_takes_the_block_of_a_place_with_e_on_the_same_mounting(fake_a6, tmp_path):
+    """CODE 22/11 option (A) (contract C8 section 3, "F4 cho K2"): K2 has no F4 block (no E turn); it takes the q of
+    the place with E (K1 here) only when the lan_lap_id of the two F5 (F8 run 1) are equal and given."""
+    a6p, _ = fake_a6
+    xp = _xoay_goc_k1(tmp_path, a6p)
+    rows = spin_rows(q=(0.02, 0.01))
+    out = ck.chuoi_khung(rows, ck.doc_a6(a6p), xp, track=TRACK0, cho='K2', cho_q='K1', ll_id='LL_7', ll_id_q='LL_7')
+    assert all(r['q_ok'] and r['trang_thai'] == 'khoa' for r in out)
+    px, py = np.array([r['p_x'] for r in out]), np.array([r['p_y'] for r in out])
+    assert np.max(np.hypot(px - 0.4, py + 0.2)) < 1e-6                 # the K1 q recovers the centre
+    assert all(r['u_q_m'] == 0.0004 for r in out)
+    xo = ck.doc_xoay_cung_lan_lap(xp, 'K2', 'K1', 'LL_7', 'LL_7')
+    assert xo['ok'] and xo['nguon_q'] == dict(cho='K1', lan_lap_id='LL_7',
+                                              cach='khoi F4 cua cho co E cung lan lap tam (CODE 22/11 A)')
+
+
+@pytest.mark.parametrize('ll, llq, why', [('LL_7', 'LL_8', 'khac_lan_lap_K1'), (None, 'LL_7', 'chua_xac_minh'),
+                                          ('LL_7', None, 'chua_xac_minh'), ('', '', 'chua_xac_minh')])
+def test_k2_other_or_unverified_mounting_has_no_q(fake_a6, tmp_path, ll, llq, why):
+    a6p, _ = fake_a6
+    out = ck.chuoi_khung(spin_rows(), ck.doc_a6(a6p), _xoay_goc_k1(tmp_path, a6p), track=TRACK0, cho='K2',
+                         cho_q='K1', ll_id=ll, ll_id_q=llq)
+    assert all(not r['q_ok'] and r['u_q_m'] is None and r['trang_thai'] == 'chan_doan' and why in r['ly_do']
+               for r in out)
+
+
+def test_k2_rules_the_own_block_wins_and_bad_sources_refused(fake_a6, tmp_path):
+    a6p, _ = fake_a6
+    xp = _xoay_goc_k1(tmp_path, a6p)
+    # a place with its own block uses it, whatever cho_q says
+    xo = ck.doc_xoay_cung_lan_lap(xp, 'goc', 'K1', 'LL_1', 'LL_2')
+    assert xo['ok'] and xo['q'] == [0.03, -0.01] and xo['nguon_q']['cho'] == 'goc'
+    # without cho_q: as before (no q)
+    assert ck.doc_xoay_cung_lan_lap(xp, 'K2')['ly_do'] == 'xoay_thieu_cho_K2'
+    with pytest.raises(ValueError):
+        ck.doc_xoay_cung_lan_lap(xp, 'K2', 'K2', 'LL_7', 'LL_7')
+    # the place with E has no dat block: no q
+    xp2 = _xoay_goc_k1(tmp_path, a6p, k1_st='chua_ket_luan')
+    xo = ck.doc_xoay_cung_lan_lap(xp2, 'K2', 'K1', 'LL_7', 'LL_7')
+    assert not xo['ok'] and xo['q'] is None and xo['ly_do'].startswith('cho_K1_cung_lan_lap:')
+    xp3 = _xoay_goc_k1(tmp_path, a6p, k1=False)
+    assert ck.doc_xoay_cung_lan_lap(xp3, 'K2', 'K1', 'LL_7', 'LL_7')['ly_do'].startswith('cho_K1_cung_lan_lap:')
+
+
 # ---------------------------------------------------------------- tam_id= (CODE 20/11, HIEUCHUAN HCV3-1)
 def _a6_needs_plate(a6p):
     d = json.load(open(a6p))
