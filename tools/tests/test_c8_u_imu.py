@@ -1165,3 +1165,97 @@ def test_thang_sparse_refuses_long_gyro_hole(tmp_path):
         w.writerows(rows)
     with pytest.raises(U.InputError, match='gap'):
         U.thang(q, 5, 'ccw', thua=True)
+
+
+# ── 22/11 night: the branch of a long gap from the wheel counts when the gyro has a gap there too ──────────────
+# (Liam at CODE_C8B, box: "Sua luat (Recommended)"; 03_CODE/docs/2026-11-22_Luat_ho_mau_IMU_nhanh_theo_encoder_v1.md)
+
+def add_counts(path, rate, t_start=10.0, slip=0.0, frozen=False, cols=U.COUNT_COLS, drop=None):
+    """Rewrite a make_log csv with the cumulative wheel counts of a body turning at rate(t) (pure rotation: each
+    wheel carries a quarter, signs of the firmware kinematics), slip = relative error of the counted turn; frozen:
+    the counts do not move; drop = (t0, t1): rows of that time span removed (a hole of the log)."""
+    with open(path, newline='', encoding='utf-8') as f:
+        rows = list(csv.DictReader(f))
+    fine = np.arange(t_start, float(rows[-1]['timestamp_us']) * 1e-6 + 0.01, 1e-3)
+    r = np.array([rate(x) for x in fine])
+    true = np.concatenate([[0.0], np.cumsum((r[1:] + r[:-1]) / 2 * 1e-3)])
+    out = []
+    for row in rows:
+        t = float(row['timestamp_us']) * 1e-6
+        if drop and drop[0] < t < drop[1]:
+            continue
+        n = 0 if frozen else int(round(np.interp(t, fine, true) * (1.0 + slip) / (4.0 * U.ENC_YAW_PER_COUNT)))
+        for c, sg in zip(U.COUNT_COLS, U.COUNT_SIGN):
+            if c in cols:
+                row[c] = str(int(sg) * n)
+        out.append(row)
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=COLS + [c for c in U.COUNT_COLS if c in cols])
+        w.writeheader()
+        w.writerows(out)
+
+
+def test_enc_yaw_per_count_is_the_firmware_kinematics():
+    # AGV kinematics.h / encoder.h: r 0.0485 m, lx = ly 0.12 m, 1320 counts per wheel turn; 1 count on one wheel in
+    # 10 ms is 0.024 rad/s of wz (CLAUDE.md "muc san luong tu")
+    assert U.ENC_YAW_PER_COUNT == pytest.approx(2 * math.pi / 1320 * 0.0485 / (4 * 0.24))
+    assert U.ENC_YAW_PER_COUNT / 0.01 == pytest.approx(0.024, abs=5e-4)
+    L = {'timestamp_us': np.array([0.0, 5e4, 1e5]), 'fl_count': np.array([0.0, -10, -20]),
+         'fr_count': np.array([0.0, 10, 20]), 'rl_count': np.array([0.0, -10, -20]), 'rr_count': np.array([0.0, 10, 20])}
+    assert U._enc_turn(L, 0.0, 0.1, 0.105) == pytest.approx(80 * U.ENC_YAW_PER_COUNT)      # CCW positive
+    assert U._enc_turn(L, 0.01, 0.09, 0.105) == pytest.approx(80 * U.ENC_YAW_PER_COUNT)    # the bracketing rows
+    assert U._enc_turn(L, -0.01, 0.1, 0.105) is None and U._enc_turn(L, 0.0, 0.11, 0.105) is None   # no row a side
+    assert U._enc_turn(L, 0.0, 0.1, 0.04) is None                                          # rows too far apart
+    assert U._enc_turn({k: v for k, v in L.items() if k != 'rr_count'}, 0.0, 0.1, 0.105) is None
+    assert U._enc_turn(dict(L, fl_count=np.array([0.0, np.nan, np.nan])), 0.0, 0.1, 0.105) is None
+
+
+def test_gap_standing_with_a_gyro_gap_keeps_the_yaw_by_the_counts(tmp_path):
+    """The case of C8 session 2: the car stands, one RV report and the gyro report of the same time are not caught
+    (150 ms between two reports), then the run. Without counts the yaw of the whole run is lost; with them it is kept."""
+    p = str(tmp_path / 'a.csv')
+    rate = lambda t: 0.0 if t < 13.0 else 0.8                         # noqa: E731
+    make_log(p, rate, 20.0, miss={40, 41})                             # reports of 12.00, 12.05 s never arrive
+    S = U.rv_samples(U.load_log(p), period_s=T0)
+    assert math.isfinite(S['t_break']) and S['nhanh_ho'][0]['nguon'] is None and S['nhanh_ho'][0]['gay']
+    assert np.isnan(U.interp_yaw(S, np.array([15.0]))[0])
+    add_counts(p, rate)
+    S = U.rv_samples(U.load_log(p), period_s=T0)
+    assert not math.isfinite(S['t_break']) and len(S['nhanh_ho']) == 1
+    h = S['nhanh_ho'][0]
+    assert h['nguon'] == 'encoder' and not h['gay'] and h['ho_s'] == pytest.approx(0.15, abs=0.005)
+    assert h['buoc_rad'] == pytest.approx(0.0, abs=1e-9) and h['quay_nguon_rad'] == pytest.approx(0.0, abs=1e-9)
+    v = U.interp_yaw(S, np.array([11.0, 12.03, 15.0, 19.0]))
+    assert np.isnan(v[1])                                              # inside the gap: still no interpolation
+    assert v[2] - v[0] == pytest.approx(0.8 * 2.0, abs=5e-3) and v[3] - v[0] == pytest.approx(0.8 * 6.0, abs=5e-3)
+
+
+def test_gap_with_a_gyro_gap_branch_from_the_counts_while_turning(tmp_path):
+    p = str(tmp_path / 'a.csv')
+    w = 2 * math.pi / 0.6
+    rate = lambda t: w if 12.0 <= t < 12.6 else 0.0                    # noqa: E731
+    make_log(p, rate, 14.0, miss=set(range(38, 52)))                   # one full turn inside a 0.7 s gap, no gyro
+    add_counts(p, rate, slip=0.08)                                     # the counts say 8 % more than the turn
+    S = U.rv_samples(U.load_log(p), period_s=T0)
+    assert not math.isfinite(S['t_break']) and S['nhanh_ho'][0]['nguon'] == 'encoder'
+    v = U.interp_yaw(S, np.array([11.0, 13.5]))
+    assert v[1] - v[0] == pytest.approx(2 * math.pi, abs=5e-3)         # the branch, not the slipped count
+    # with the gyro there the gyro decides, as before
+    make_log(p, rate, 14.0, miss=set(range(38, 52)), gyro_miss=set())
+    add_counts(p, rate, frozen=True)
+    S = U.rv_samples(U.load_log(p), period_s=T0)
+    assert not math.isfinite(S['t_break']) and S['nhanh_ho'][0]['nguon'] == 'gyro'
+
+
+def test_gap_with_a_gyro_gap_still_breaks_without_usable_counts(tmp_path):
+    p = str(tmp_path / 'a.csv')
+    w = 0.9 * math.pi / 0.6
+    rate = lambda t: w if 12.0 <= t < 12.6 else 0.0                    # noqa: E731
+    for kw, src in ((dict(frozen=True), 'encoder'),                    # counts say no turn, the yaw step says 2.8 rad
+                    (dict(drop=(11.9, 12.75)), None),                  # a hole of the log over the gap
+                    (dict(cols=U.COUNT_COLS[:3]), None)):              # three count columns only
+        make_log(p, rate, 14.0, miss=set(range(38, 52)))
+        add_counts(p, rate, **kw)
+        S = U.rv_samples(U.load_log(p), period_s=T0)
+        assert math.isfinite(S['t_break']) and S['nhanh_ho'][0]['gay'] and S['nhanh_ho'][0]['nguon'] == src, kw
+        assert np.isnan(U.interp_yaw(S, np.array([13.5]))[0])
